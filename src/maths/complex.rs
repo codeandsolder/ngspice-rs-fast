@@ -323,12 +323,11 @@ impl ComplexMatrix {
             return self.factorize();
         }
         let same = previous.n == self.n
-            && previous.pattern.len() == self.entries.len()
             && previous
                 .pattern
                 .iter()
-                .zip(&self.entries)
-                .all(|(p, &(r, c, _))| *p == (r, c));
+                .copied()
+                .eq(self.entries.iter().map(|&(r, c, _)| (r, c)));
         if !same {
             return self.factorize();
         }

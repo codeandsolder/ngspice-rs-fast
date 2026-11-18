@@ -23,17 +23,14 @@
 #![allow(clippy::collapsible_else_if)] // C's if/else nesting.
 #![allow(clippy::collapsible_if)] // C's if nesting.
 #![allow(clippy::double_parens)] // C's parenthesisation is kept verbatim.
-#![allow(clippy::eq_op)] // C's expressions are kept verbatim.
 #![allow(clippy::excessive_precision)] // C's literals.
 #![allow(clippy::float_cmp)] // C compares floating point exactly.
 #![allow(clippy::if_same_then_else)] // C's branches.
 #![allow(clippy::many_single_char_names)] // C's locals.
-#![allow(clippy::misrefactored_assign_op)] // C's `T0 *= T0 * 4.0e-16`.
 #![allow(clippy::manual_range_contains)] // C's range tests.
 #![allow(clippy::neg_multiply)] // C's `-1 * x` forms.
 #![allow(clippy::nonminimal_bool)] // C's conditions.
 #![allow(clippy::precedence)] // C's expressions are kept verbatim.
-#![allow(clippy::self_assignment)] // C's statements.
 #![allow(clippy::too_many_lines)] // One C function.
 #![allow(clippy::cognitive_complexity)] // One C function.
 #![allow(clippy::useless_conversion)] // Generated int-to-double conversions.
@@ -1571,7 +1568,8 @@ pub(crate) fn load(
     if Weff < 2.0e-8 {
         T0 = 1.0 / (6.0e-8 - 2.0 * Weff);
         Weff = 2.0e-8 * (4.0e-8 - Weff) * T0;
-        T0 *= T0 * 4.0e-16;
+        let correction = T0 * 4.0e-16;
+        T0 *= correction;
         dWeff_dVg *= T0;
         dWeff_dVb *= T0;
     }

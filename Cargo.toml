@@ -68,6 +68,11 @@ bin-dir = "{ name }-aarch64-unknown-linux-musl-v{ version }/{ bin }{ binary-ext 
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }.zip"
 pkg-fmt = "zip"
 
+# The BSIM4 schema is reproducibly generated from upstream bsim4def.h and
+# deliberately preserves C field names, field order, and type spellings.
+[package.metadata.rust-skills2]
+generated-lint-boundaries = ["src/devices/bsim4/fields.rs"]
+
 [workspace]
 resolver = "3"
 members = ["xtask"]

@@ -281,11 +281,13 @@ impl Bsim4 {
         let same = |p: &Prepared| {
             p.temperature == temperature
                 && p.nominal == nominal
-                && p.swept.len() == self.swept.len()
                 && p.swept
                     .iter()
-                    .zip(&self.swept)
-                    .all(|(a, b)| a.0 == b.0 && a.1.to_bits() == b.2.to_bits())
+                    .map(|&(field, value)| (field, value.to_bits()))
+                    .eq(self
+                        .swept
+                        .iter()
+                        .map(|&(field, _, value)| (field, value.to_bits())))
         };
         {
             let shared = self.borrow_shared()?;
