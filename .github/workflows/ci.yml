@@ -1,0 +1,44 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Stable Rust build, tests, lint, docs and goldens
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+    with:
+      rust-toolchain: "1.100.0"
+      rust-components: "clippy rustfmt"
+      command: |
+        cargo fmt --all -- --check
+        cargo clippy --workspace --all-targets --locked -- -D warnings
+        cargo test --workspace --locked
+        cargo xtask golden verify
+        cargo doc --workspace --no-deps --locked
+        cargo build --workspace --locked --release
+
+  msrv:
+    name: MSRV on release tags
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+    with:
+      validation-tier: release
+      rust-toolchain: "1.89.0"
+      command: cargo test --workspace --locked
+
+  strict-rust:
+    name: Strict Rust and workflow policy
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@6ab68f64fa917fa2dc4fa859dca3ecf83f54baa5 # main
+    with:
+      allow-test-panics: true

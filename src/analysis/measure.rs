@@ -429,8 +429,8 @@ impl Window {
                 ),
             ));
         }
-        for index in first..=last {
-            points.push((axis.values[index], operand.value(index)?));
+        for (offset, &axis_value) in axis.values[first..=last].iter().enumerate() {
+            points.push((axis_value, operand.value(first + offset)?));
         }
         if axis.values[last] < self.to {
             points.push((
@@ -748,7 +748,8 @@ fn extremum(
 ) -> SpiceResult<(Real, Real)> {
     let (first, last) = window.samples(axis, card)?;
     let mut best: Option<(Real, Real)> = None;
-    for index in first..=last {
+    for (offset, &axis_value) in axis.values[first..=last].iter().enumerate() {
+        let index = first + offset;
         let value = operand.value(index)?;
         let replace = match best {
             None => true,
@@ -763,7 +764,7 @@ fn extremum(
             }
         };
         if replace {
-            best = Some((value, axis.values[index]));
+            best = Some((value, axis_value));
         }
     }
     best.ok_or_else(|| {
