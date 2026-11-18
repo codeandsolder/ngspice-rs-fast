@@ -17,8 +17,8 @@ const CONST_BOLTZ: Real = 1.380_648_52e-23;
 const CONST_CHARGE: Real = 1.602_176_620_8e-19;
 const REF_TEMP: Real = 27.0 + 273.15;
 const CONST_VT0: Real = CONST_BOLTZ * REF_TEMP / CONST_CHARGE;
-#[allow(clippy::approx_constant)] // `const.h`'s CONSTsqrt2 spelling
-const CONST_ROOT2: Real = 1.414_213_562_373_095;
+// `const.h` spells this just below binary64 SQRT_2; do not change the bit pattern.
+const CONST_ROOT2: Real = Real::from_bits(0x3ff6_a09e_667f_3bcc);
 /// `b3temp.c`'s `Meter2Micron` equivalent used by the size-dependent setup.
 pub(super) const METER2MICRON: Real = 1.0e6;
 

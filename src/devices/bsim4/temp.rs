@@ -16,8 +16,7 @@ const KboQ: f64 = 8.617087e-5;
 const EPS0: f64 = 8.85418e-12;
 const EPSSI: f64 = 1.03594e-10;
 // b4temp.c's own rounded PI, not the platform's.
-#[allow(clippy::approx_constant)]
-const PI: f64 = 3.141592654;
+const PI: f64 = f64::from_bits(0x4009_21fb_5452_4550);
 const MAX_EXP: f64 = 5.834617425e14;
 const MIN_EXP: f64 = 1.713908431e-15;
 const EXP_THRESHOLD: f64 = 34.0;

@@ -10,8 +10,8 @@ use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 const EPS_OXIDE: Real = 3.453_133e-11;
 // b3set.c uses this rounded constant, not the platform's full-precision pi.
-#[allow(clippy::approx_constant)] // Match the intentionally rounded b3set.c PI.
-const SETUP_PI: Real = 3.141_592_654;
+// Preserve the exact binary64 value of b3set.c's deliberately rounded PI.
+const SETUP_PI: Real = Real::from_bits(0x4009_21fb_5452_4550);
 
 /// A model selector reset performed by `b3set.c`, with the given flag retained.
 /// Device-layer code returns diagnostics rather than printing them.

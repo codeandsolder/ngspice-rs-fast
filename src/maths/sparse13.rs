@@ -559,8 +559,10 @@ impl<T: Scalar> Sparse<T> {
             let mut another_pass = false;
             let mut swapped = false;
             // C's `StartAt` changes only take effect on the next pass.
-            #[allow(clippy::mut_range_bound)]
-            for j in start_at..=size {
+            // Snapshot the range bound so changes within the pass cannot
+            // affect its current iteration range.
+            let pass_start = start_at;
+            for j in pass_start..=size {
                 if self.diag[j] == NONE {
                     let (twins, t1, t2) = self.count_twins(j);
                     if twins == 1 {
