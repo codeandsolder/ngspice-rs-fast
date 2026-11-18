@@ -149,7 +149,7 @@ fn emit_struct(
         writeln!(out, "            {expression},").map_err(|e| e.to_string())?;
     }
     out.push_str("        ]\n    }\n\n");
-    out.push_str("    /// Stores numbers produced by [`Self::to_values`]; `values` must have\n    /// [`Self::MEMBERS`]`.len()` entries.\n    #[allow(dead_code, clippy::cast_possible_truncation)]\n    pub(crate) fn set_values(&mut self, values: &[f64]) {\n");
+    out.push_str("    /// Stores numbers produced by [`Self::to_values`]; `values` must have\n    /// `Self::MEMBERS.len()` entries.\n    #[allow(dead_code, clippy::cast_possible_truncation)]\n    pub(crate) const fn set_values(&mut self, values: &[f64]) {\n");
     for (index, field) in scalars.iter().enumerate() {
         let name = rust_name(&field.c_name);
         let expression = match field.kind {
@@ -265,7 +265,12 @@ pub(crate) fn fields(header: &str, revision: &str) -> Result<String, String> {
          // Generated field facts (C member names and scalar types), not C\n\
          // implementation code. Source: ngspice {revision}, bsim4/bsim4def.h.\n\
          // Regenerate: cargo xtask bsim4-schema --source /path/to/ngspice\n\
-         #![allow(non_snake_case, clippy::struct_excessive_bools)]\n"
+         "
+    );
+    // Only the generated schema may retain these C-field spelling and
+    // monolithic accessor patterns. The source policy verifies provenance.
+    out.push_str(
+        "#![allow(\n    non_snake_case,\n    clippy::struct_excessive_bools,\n    clippy::used_underscore_binding,\n    clippy::too_many_lines,\n    clippy::large_stack_arrays,\n    clippy::redundant_pub_crate\n)]\n",
     );
     emit_struct(&mut out, "Model", "struct sBSIM4model", &model)?;
     emit_struct(&mut out, "SizeParam", "struct bsim4SizeDependParam", &size)?;

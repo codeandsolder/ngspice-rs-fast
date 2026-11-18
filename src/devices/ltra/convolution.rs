@@ -87,7 +87,6 @@ fn intlinfunc(
 }
 
 /// `twiceintlinfunc`: `int_lo^hi int_other^tau h` for the same linear `h`.
-#[allow(clippy::too_many_arguments)]
 fn twiceintlinfunc(
     lolimit: Real,
     hilimit: Real,
@@ -201,7 +200,10 @@ pub fn rlc_h2(time: Real, t: Real, alpha: Real, beta: Real) -> Real {
 /// straight line, by comparing the triangle they span with the trapezoid area
 /// under them (`area * reltol + abstol > triangle`).
 #[must_use]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)]
 pub fn straight_line_check(
     x1: Real,
     y1: Real,
@@ -457,7 +459,10 @@ pub fn rc_coefficients(
 /// the previous window `[lolimit2, hilimit2]` with the values at `TD` and at
 /// the auxiliary time (C's commented-out `lolimit2 = T` fix is not applied).
 #[must_use]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)]
 pub fn rlc_coefficients(
     t: Real,
     alpha: Real,

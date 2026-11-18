@@ -661,7 +661,10 @@ fn junction_zero_bias(
 
 /// `b3ld.c`'s source/drain bulk junction C-V for one junction, returning
 /// `(charge, capacitance)`.
-#[allow(clippy::too_many_arguments)] // C's three junction regions.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)] // C's three junction regions.
 fn junction_cv(
     v: Real,
     czb: Real,

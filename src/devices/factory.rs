@@ -478,7 +478,10 @@ impl PortSetters {
                         location: Some(at.clone()),
                     });
                 }
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "the rounded port number is range-checked against the C i32 limits immediately above"
+                )]
                 let rounded = rounded as i64;
                 self.number = Some((rounded, at.clone()));
                 // VSRC_PORTNUM: a port needs an impedance; take 50 ohms

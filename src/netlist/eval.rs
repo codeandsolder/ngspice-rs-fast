@@ -1356,7 +1356,10 @@ fn user_call(
 }
 
 /// Evaluates one `.func` call with already evaluated arguments.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)]
 fn call(
     node: &Expr,
     root: &ParameterExpression,

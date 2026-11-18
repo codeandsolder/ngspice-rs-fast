@@ -45,7 +45,10 @@ pub(super) struct Prepared {
     /// `b4set.c`/`b4temp.c`/`b4check.c` messages, in C order. Kept for
     /// inspection: the port has no channel that reports device warnings
     /// yet (C prints them).
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "retains BSIM4 model diagnostics with their setup for a future public warning channel"
+    )]
     pub(super) warnings: Vec<String>,
 }
 
@@ -464,7 +467,6 @@ pub(super) fn reset_load(
 ///
 /// # Errors
 /// As the AC load, or a matrix position out of range.
-#[allow(clippy::too_many_arguments)] // C's load inputs.
 pub(super) fn ac_stamp(
     context: &mut LinearContext<'_>,
     nodes: &[NodeId; node::COUNT],

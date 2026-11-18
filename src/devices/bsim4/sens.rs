@@ -36,7 +36,10 @@
 //!   writes, hold what an earlier analysis's `MODEINITSMSIG` load left (zero
 //!   when none ran). Each parameter's AC load reads those, the reset's
 //!   `CKTstate0`, and the setup/temperature members of the present records.
-#![allow(non_snake_case)] // C's member names.
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)] // C's member names.
 
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -436,7 +439,14 @@ impl DeviceSensitivity for Bsim4Sensitivity<'_> {
     /// which happens once a `.sens` setup re-run has aliased it.
     fn unsetup(&self, _model: &mut Record, instance: &mut Record) -> SpiceResult<()> {
         let (mut h, size, _) = Self::instance_of(instance);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "CREATED encodes the BSIM4-local 12-node creation bitmask"
+        )]
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "CREATED contains only nonnegative node-creation bits"
+        )]
         let created = instance.value(CREATED)? as u32;
         let survives = internal_members(&h)
             .into_iter()

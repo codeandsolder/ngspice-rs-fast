@@ -601,7 +601,10 @@ fn mirror(couplings: &[Option<Coupling>], records: &mut Records, slot: usize) ->
     let instance = &mut records.instances[slot];
     instance.store("induct1", induct[0])?;
     instance.store("induct2", induct[1])?;
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "in-memory matrix row indices are stored in the C real-valued sensitivity record"
+    )]
     {
         instance.store("row1", coupling.rows[0] as Real)?;
         instance.store("row2", coupling.rows[1] as Real)

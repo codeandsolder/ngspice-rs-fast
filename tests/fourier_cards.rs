@@ -104,6 +104,17 @@ fn the_widest_accepted_harmonic_count_is_the_ports_budget() {
 }
 
 #[test]
+fn enormous_harmonic_counts_keep_the_original_value_in_the_error() {
+    let error = parse(".four 1k HARMONICS=1e30 v(out)\n").expect_err("above u32 range");
+    assert!(matches!(error, SpiceError::Unsupported { .. }), "{error}");
+    assert!(
+        error.to_string().contains("bounded Fourier budget"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("4294967295"), "{error}");
+}
+
+#[test]
 fn a_frequency_that_is_not_a_positive_literal_is_a_positioned_parse_error() {
     for body in [
         ".four\n",

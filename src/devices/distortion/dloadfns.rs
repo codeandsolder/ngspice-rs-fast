@@ -43,7 +43,6 @@ struct Im3 {
     h1m2_2: Complex,
 }
 
-#[allow(clippy::similar_names)]
 fn s2v2f12(c: Real, x: Im3, y: Im3) -> Real {
     c * (2.
         * (x.h1.re * y.h1m2_2.re - x.h1.im * y.h1m2_2.im + y.h1.re * x.h1m2_2.re
@@ -54,7 +53,6 @@ fn s2v2f12(c: Real, x: Im3, y: Im3) -> Real {
         - y.h1m2.im * x.h11.im)
 }
 
-#[allow(clippy::similar_names)]
 fn s2i2f12(c: Real, x: Im3, y: Im3) -> Real {
     c * (2.
         * (x.h1.re * y.h1m2_2.im
@@ -76,7 +74,6 @@ fn s3i3f1(c: Real, x: Complex, y: Complex, z: Complex) -> Real {
 }
 
 /// `S3v2F12`: `x`, `y`, `z` first-order, `x2`, `y2`, `z2` at `-f2`.
-#[allow(clippy::many_single_char_names)]
 fn s3v2f12(c: Real, [x, y, z]: Values, [x2, y2, z2]: Values) -> Real {
     c * ((x.re * y.re - x.im * y.im) * z2.re - (x.im * y.re + x.re * y.im) * z2.im
         + (x.re * z.re - x.im * z.im) * y2.re
@@ -86,7 +83,6 @@ fn s3v2f12(c: Real, [x, y, z]: Values, [x2, y2, z2]: Values) -> Real {
 }
 
 /// `S3i2F12`.
-#[allow(clippy::many_single_char_names)]
 fn s3i2f12(c: Real, [x, y, z]: Values, [x2, y2, z2]: Values) -> Real {
     c * ((x.re * y.re - x.im * y.im) * z2.im
         + (x.im * y.re + x.re * y.im) * z2.re
@@ -168,7 +164,6 @@ pub(super) fn f12(t: &Taylor, h1: Values, h2: Values) -> Complex {
 
 /// `DFn2F12`/`DFi2F12` (the `DpassStr` functions) with the `H1(f1)`,
 /// `H1(-f2)`, `H2(f1, f1)` and `H2(f1, -f2)` values.
-#[allow(clippy::similar_names)]
 pub(super) fn two_f1_minus_f2(
     t: &Taylor,
     h1: Values,

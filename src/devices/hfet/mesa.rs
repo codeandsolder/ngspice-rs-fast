@@ -601,7 +601,6 @@ impl Mesa {
     /// (level 4). `mesaload.c` selects between them on `model->MESAlevel`, and
     /// everything around them - the junctions, the charge storage, the load
     /// and the small-signal assembly - is shared.
-    #[allow(clippy::too_many_arguments)]
     fn channel(
         &self,
         derived: &Derived,
@@ -1057,7 +1056,6 @@ impl Mesa {
     /// `mesaacl.c`: `gm`/`gds` are re-derived at the bias with the
     /// frequency-blended `lambda`, and the gate capacitances come from the
     /// operating point.
-    #[allow(clippy::too_many_arguments)]
     fn ac_point(
         &self,
         derived: &Derived,
@@ -2046,7 +2044,6 @@ impl DeviceSensitivity for MesaSensitivity<'_> {
 
 impl MesaSensitivity<'_> {
     /// The port's MESA with the records' parameters.
-    #[allow(clippy::too_many_lines)]
     fn mesa(&self, current: RecordPair<'_>) -> SpiceResult<Mesa> {
         let (m, i) = (current.model, current.instance);
         let celsius = |record: &SensitivityRecord, keyword: &str| -> SpiceResult<Option<Real>> {

@@ -39,7 +39,6 @@ fn eval(a: Real, b: Real, c: Real, x: Real) -> Real {
 /// The loops stay index-based because this is C's row/column algorithm: the
 /// row swap uses the pivot row that partial pivoting just chose, and the
 /// elimination reads the row it is updating.
-#[allow(clippy::needless_range_loop)]
 fn eliminate(mut a: [[Real; 4]; 3], threshold: Real) -> SpiceResult<[Real; 3]> {
     for i in 0..3 {
         let mut pivot = i;

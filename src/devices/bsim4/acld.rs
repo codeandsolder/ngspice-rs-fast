@@ -1,6 +1,9 @@
 //! `b4acld.c` (`BSIM4acLoad`): the small-signal AC load, followed statement
 //! by statement over C's struct members.
-#![allow(non_snake_case)]
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)]
 use super::fields::{Instance, Model, SizeParam};
 use super::host::{SmallSignalCkt, state};
 use crate::primitives::SpiceResult;
@@ -10,7 +13,10 @@ use crate::primitives::SpiceResult;
 ///
 /// # Errors
 /// C's error returns (none: `BSIM4acLoad` always returns `OK`).
-#[allow(clippy::too_many_lines)] // One C function, kept in C's shape.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)] // One C function, kept in C's shape.
 pub(crate) fn ac_load(
     m: &Model,
     h: &Instance,

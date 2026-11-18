@@ -37,7 +37,14 @@ fn grading_power(arg: Real, grading: Real) -> Real {
 impl Mos1 {
     /// The `mos1dset.c` terms at the operating point (see the module
     /// documentation).
-    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the reference numerical routine in the original statement and rounding order"
+    )]
+    #[expect(
+        clippy::similar_names,
+        reason = "related reference equation variables retain their distinct C names"
+    )]
     pub(super) fn distortion_terms(
         &self,
         context: &DistortionContext<'_>,

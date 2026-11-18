@@ -7,7 +7,10 @@
 //! grouping differs from C: the AC NQS charge-node term
 //! `m * s->real * ScalingFactor` is the coefficient `m * ScalingFactor`
 //! times `s`, which rounds differently from C's left-to-right product.
-#![allow(non_snake_case)]
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)]
 use super::fields::{Instance, Model, SizeParam};
 use super::host::{SmallSignalCkt, state};
 use crate::primitives::SpiceResult;
@@ -17,7 +20,10 @@ use crate::primitives::SpiceResult;
 ///
 /// # Errors
 /// C's error returns (none: `BSIM4pzLoad` always returns `OK`).
-#[allow(clippy::too_many_lines)] // One C function, kept in C's shape.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)] // One C function, kept in C's shape.
 pub(crate) fn pz_load(
     m: &Model,
     h: &Instance,

@@ -498,7 +498,14 @@ impl MosLevel for Level3 {
     /// `mos3load.c`'s `moseq3` block, line for line, in the normalized device
     /// frame. The derivatives are C's: exact except where C's own expressions
     /// are approximate (see `docs/port/M4_NONLINEAR.md`).
-    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the reference numerical routine in the original statement and rounding order"
+    )]
+    #[expect(
+        clippy::similar_names,
+        reason = "related reference equation variables retain their distinct C names"
+    )]
     fn drain_current(
         &self,
         op: &Operating<Params>,

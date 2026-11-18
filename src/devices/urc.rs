@@ -172,7 +172,10 @@ impl UrcSections {
     ///
     /// # Errors
     /// The degenerate inputs listed in the module documentation.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )]
     pub fn new(
         length: Real,
         lumps: Option<i64>,
@@ -215,7 +218,14 @@ impl UrcSections {
                         )));
                     }
                     // C `(int)` truncation of a value of at least 3.
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "finite positive section count has been bounded by MAX_LUMPS immediately above"
+                    )]
+                    #[expect(
+                        clippy::cast_sign_loss,
+                        reason = "section count is clamped to a minimum of three before conversion"
+                    )]
                     let count = count as usize;
                     count
                 }
@@ -226,7 +236,10 @@ impl UrcSections {
                 "{lumps} sections exceed the port's bound of {MAX_LUMPS}"
             )));
         }
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the number of URC sections is bounded by MAX_LUMPS and represented in the C real-valued formula"
+        )]
         let n = lumps as Real;
         let r1 = (r0 * (p - 1.)) / ((2. * p.powf(n)) - 2.);
         let denominator = (p.powf(n - 1.)) * (p + 1.) - 2.;
@@ -391,7 +404,10 @@ fn integer(value: Real, at: Option<&SourceLoc>, owner: &SourceLoc) -> SpiceResul
             location: Some(at.unwrap_or(owner).clone()),
         });
     }
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "rounded input is checked against i32::MIN and i32::MAX before converting to i64"
+    )]
     Ok(rounded as i64)
 }
 
@@ -616,7 +632,10 @@ impl Device for UrcLine {
         keyword: &str,
         _context: &ModelContext,
     ) -> SpiceResult<Option<Real>> {
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "URC section count fits the bounded C real-valued parameter representation"
+        )]
         Ok(match keyword {
             "l" => Some(self.length),
             "n" => Some(self.lumps as Real),

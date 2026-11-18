@@ -3,7 +3,10 @@
 //!
 //! Ported statement by statement from BSIM4 4.8.3 (`b4check.c`, Copyright
 //! (c) 2025 University of California, Educational Community License 2.0).
-#![allow(non_snake_case)]
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)]
 
 use super::fields::{Instance, Model, SizeParam};
 use super::temp::c_g;
@@ -57,13 +60,18 @@ fn strncmp(a: &str, b: &str, n: usize) -> bool {
 ///   instance is the first one in that order; its model resets persist
 ///   into every later instance and pass, its size-dependent resets only
 ///   into instances sharing its (l, w, nf) parameter set in that pass.
-#[allow(
+#[expect(
     clippy::too_many_lines,
-    clippy::if_same_then_else,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)]
+#[expect(
     clippy::collapsible_if,
+    reason = "preserves the reference conditional order and side-effect boundaries"
+)]
+#[expect(
     clippy::collapsible_else_if,
-    unused_parens
-)] // A statement-by-statement port of C.
+    reason = "keeps the reference branches identifiable by their original conditions"
+)]
 pub(crate) fn check_model(
     m: &mut Model,
     h: &mut Instance,

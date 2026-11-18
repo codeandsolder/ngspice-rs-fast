@@ -83,7 +83,10 @@ fn depletion(cz: Real, pot: Real, m: Real, v: Real) -> (Real, Real) {
 impl Bjt {
     /// The `bjtdset.c` terms at the operating point (see the module
     /// documentation).
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the reference numerical routine in the original statement and rounding order"
+    )]
     pub(super) fn distortion_terms(
         &self,
         context: &DistortionContext<'_>,

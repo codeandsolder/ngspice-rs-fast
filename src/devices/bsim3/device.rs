@@ -63,7 +63,6 @@ mod slot {
 /// `b3ld.c`'s `gc*` equivalent charge conductances (`ag0` times the
 /// capacitance derivatives) for one mode, named as in C.
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(clippy::struct_field_names)] // C's own gc*xb names.
 struct ChargeConductances {
     gcggb: Real,
     gcgdb: Real,
@@ -269,7 +268,6 @@ impl Bsim3 {
     }
 
     /// C `b3ld.c`'s start and limiting block.
-    #[allow(clippy::too_many_arguments)] // C's mode inputs.
     fn select(
         cached: &Cached,
         states: &DeviceState<'_>,

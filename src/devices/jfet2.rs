@@ -88,7 +88,10 @@ const FX: Real = -10.0;
 /// `psmodel.c` `MX`: the largest exponential argument.
 const MX: Real = 40.0;
 /// `psmodel.c` `EMX = exp(MX)`.
-#[allow(clippy::excessive_precision)]
+#[expect(
+    clippy::excessive_precision,
+    reason = "reference C literal spelling is preserved for numerical parity"
+)]
 const EMX: Real = 2.353852668370199842e17;
 /// `psmodel.h` `FOURTH`: the relaxation filters use a quarter step.
 const FOURTH: Real = 0.25;
@@ -281,7 +284,10 @@ struct Point {
 }
 
 /// `psmodel.c` `qgg`: Statz gate charge and its partials `(q, cgs, cgd)`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)]
 fn qgg(
     vgs: Real,
     vgd: Real,
@@ -372,7 +378,10 @@ fn relaxation(tau: Real, step: Real) -> Real {
 impl Model {
     /// `psmodel.c` `PSids` at (`vgs`, `vgd`) with `vgs >= vgd`; `memory` is
     /// the accepted filter state of a transient load (`TRAN_ANAL`).
-    #[allow(clippy::many_single_char_names, clippy::similar_names)]
+    #[expect(
+        clippy::similar_names,
+        reason = "related reference equation variables retain their distinct C names"
+    )]
     fn ids(
         &self,
         op: &Operating,
@@ -532,7 +541,14 @@ impl Model {
     /// conductance `(Gm, xGm, Gds, xGds)` at angular frequency `omega` from
     /// the operating point's `gm`, `gds` and drain current `ids` (C's stored
     /// `JFET2cd`).
-    #[allow(clippy::too_many_arguments, clippy::similar_names)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )]
+    #[expect(
+        clippy::similar_names,
+        reason = "related reference equation variables retain their distinct C names"
+    )]
     fn acload(
         &self,
         op: &Operating,
@@ -1753,7 +1769,6 @@ impl DeviceSensitivity for Jfet2Sensitivity<'_> {
 
 impl Jfet2Sensitivity<'_> {
     /// The port's JFET2 with the records' parameters.
-    #[allow(clippy::too_many_lines)]
     fn jfet2(&self, current: RecordPair<'_>) -> SpiceResult<Jfet2> {
         let (m, i) = (current.model, current.instance);
         let model = Model {

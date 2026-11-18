@@ -470,7 +470,14 @@ impl MosLevel for Level2 {
     /// frame (`lvgs`, `lvds >= 0`, `lvbs`). The derivatives are C's: exact
     /// except where C's own expressions are approximate (see
     /// `docs/port/M4_NONLINEAR.md`).
-    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the reference numerical routine in the original statement and rounding order"
+    )]
+    #[expect(
+        clippy::similar_names,
+        reason = "related reference equation variables retain their distinct C names"
+    )]
     fn drain_current(
         &self,
         op: &Operating<Params>,
@@ -885,7 +892,10 @@ struct BaumInputs {
 /// (Cardano or the trigonometric form), the four candidate roots of
 /// `x^4 + a1 x^3 + b1 x^2 + c1 x + d1`, and the smallest positive one whose
 /// residual is at most `1e-6`, or `None` (C keeps the Grove-Frohman `vdsat`).
-#[allow(clippy::many_single_char_names, clippy::similar_names)]
+#[expect(
+    clippy::many_single_char_names,
+    reason = "conventional symbolic variables match the published device equations"
+)]
 fn baum_root(inputs: BaumInputs) -> Option<Real> {
     let BaumInputs {
         v1,
@@ -1143,7 +1153,6 @@ mod tests {
     }
 
     /// A card with the given NFS, VMAX, NSUB, LAMBDA, XJ, DELTA and UEXP.
-    #[allow(clippy::too_many_arguments)]
     fn card(
         nfs: Real,
         vmax: Real,

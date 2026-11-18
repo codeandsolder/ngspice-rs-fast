@@ -50,7 +50,6 @@ pub(crate) mod node {
 }
 
 /// `CKTmode` bits (`cktdefs.h`), with C's values.
-#[allow(dead_code)] // The full C set, so ported conditions read as in C.
 pub(crate) mod mode {
     /// `MODETRAN`.
     pub(crate) const MODETRAN: u32 = 0x1;
@@ -79,7 +78,6 @@ pub(crate) mod mode {
 }
 
 /// State-vector offsets (`bsim4def.h`'s `BSIM4states + n`).
-#[allow(dead_code)] // The full C layout.
 pub(crate) mod state {
     /// `BSIM4vbd`.
     pub(crate) const VBD: usize = 0;

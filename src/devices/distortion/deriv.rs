@@ -7,37 +7,59 @@
 
 // The statement-by-statement transcription (fields assigned in C's order,
 // later ones reading earlier ones) is deliberate.
-#![allow(
+#![expect(
     clippy::suspicious_operation_groupings,
-    clippy::many_single_char_names,
-    clippy::field_reassign_with_default
+    reason = "mixed partial derivatives are intentional in the source C tensor equations"
+)]
+#![expect(
+    clippy::field_reassign_with_default,
+    reason = "C derivative initialization retains its exact field-assignment sequence"
 )]
 
 use crate::primitives::Real;
 
 /// C's `Dderivs`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-#[allow(missing_docs)]
 pub(crate) struct Dderivs {
+    /// Function value at the expansion point.
     pub value: Real,
+    /// Order-1 partial derivative with respect to p.
     pub d1_p: Real,
+    /// Order-1 partial derivative with respect to q.
     pub d1_q: Real,
+    /// Order-1 partial derivative with respect to r.
     pub d1_r: Real,
+    /// Order-2 partial derivative with respect to p2.
     pub d2_p2: Real,
+    /// Order-2 partial derivative with respect to q2.
     pub d2_q2: Real,
+    /// Order-2 partial derivative with respect to r2.
     pub d2_r2: Real,
+    /// Order-2 partial derivative with respect to pq.
     pub d2_pq: Real,
+    /// Order-2 partial derivative with respect to qr.
     pub d2_qr: Real,
+    /// Order-2 partial derivative with respect to pr.
     pub d2_pr: Real,
+    /// Order-3 partial derivative with respect to p3.
     pub d3_p3: Real,
+    /// Order-3 partial derivative with respect to q3.
     pub d3_q3: Real,
+    /// Order-3 partial derivative with respect to r3.
     pub d3_r3: Real,
+    /// Order-3 partial derivative with respect to p2r.
     pub d3_p2r: Real,
+    /// Order-3 partial derivative with respect to p2q.
     pub d3_p2q: Real,
+    /// Order-3 partial derivative with respect to q2r.
     pub d3_q2r: Real,
+    /// Order-3 partial derivative with respect to pq2.
     pub d3_pq2: Real,
+    /// Order-3 partial derivative with respect to pr2.
     pub d3_pr2: Real,
+    /// Order-3 partial derivative with respect to qr2.
     pub d3_qr2: Real,
+    /// Order-3 partial derivative with respect to pqr.
     pub d3_pqr: Real,
 }
 

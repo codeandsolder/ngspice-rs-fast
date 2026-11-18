@@ -5,11 +5,21 @@
 //! The analysis owns gains, `Nintegrate` and the output columns; this file
 //! reproduces what C passes to `NevalSrc`/`NevalSrc2` and the flicker factor
 //! it multiplies the `N_GAIN` gain by, in C's order and arithmetic.
-#![allow(non_snake_case)]
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)]
 // C's member and local names.
 // C's own spellings: `x = x * y` and the two-sided `if` limits (`clamp`
 // differs on NaN).
-#![allow(clippy::assign_op_pattern, clippy::manual_clamp)]
+#![expect(
+    clippy::assign_op_pattern,
+    reason = "retains the reference calculation grouping and floating-point operation order"
+)]
+#![expect(
+    clippy::manual_clamp,
+    reason = "the explicit reference branch sequence has different NaN handling"
+)]
 
 use super::fields::{Instance, Model, SizeParam};
 use super::host::state;
@@ -90,7 +100,10 @@ fn eval_1ov_f_noise(Vds: f64, m: &Model, h: &Instance, p: &SizeParam, freq: f64,
 /// `BSIM4noise`'s `N_DENS` evaluation for one instance at `freq` (Hz):
 /// the 14 generators in [`NAMES`] order. `state0` is C's `CKTstates[0]` at
 /// the operating point, `temp` is `CKTtemp` (K).
-#[allow(clippy::too_many_lines)] // One C function, kept whole.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)] // One C function, kept whole.
 pub(crate) fn generators(
     m: &Model,
     h: &Instance,

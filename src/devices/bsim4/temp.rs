@@ -5,7 +5,14 @@
 //! Ported statement by statement from BSIM4 4.8.3 (`b4temp.c`, Copyright
 //! (c) 2025 University of California, Educational Community License 2.0);
 //! C's member and local names are kept so the port can be read against it.
-#![allow(non_snake_case, non_upper_case_globals)]
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)]
+#![expect(
+    non_upper_case_globals,
+    reason = "constant names intentionally match the reference device equations"
+)]
 
 use super::check::check_model;
 use super::fields::{Instance, Model, SizeParam};
@@ -144,17 +151,30 @@ pub(crate) struct ModelTemp {
 /// `BSIM4temp`'s model pass (everything before its instance loop) at
 /// `temperature` (`CKTtemp`, K): updates `m` as C does and returns the
 /// locals the instance loop reads. C runs it once per model per call.
-#[allow(
+#[expect(
     unused_assignments,
-    unused_parens,
+    reason = "C state-machine locals retain the reference assignment sequence"
+)]
+#[expect(
     unused_mut,
+    reason = "local mutability reflects the source C intermediate state declarations"
+)]
+#[expect(
     unused_variables,
+    reason = "C-translated intermediate variables preserve the reference layout"
+)]
+#[expect(
     clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)]
+#[expect(
     clippy::if_same_then_else,
+    reason = "preserves the C branch evaluation and state-update sequence"
+)]
+#[expect(
     clippy::assign_op_pattern,
-    clippy::collapsible_if,
-    clippy::collapsible_else_if
-)] // A statement-by-statement port of C.
+    reason = "retains the reference calculation grouping and floating-point operation order"
+)]
 pub(crate) fn temperature_model(
     m: &mut Model,
     temperature: f64,
@@ -541,20 +561,37 @@ pub(crate) fn temperature_model(
 /// # Errors
 /// C's fatal `BSIM4checkModel` result and nonpositive effective sizes
 /// (`E_BADPARM`), with C's messages.
-#[allow(
+#[expect(
     unused_assignments,
+    reason = "upstream C temperature routine assigns intermediates in original order"
+)]
+#[expect(
     unused_parens,
+    reason = "preserves C parenthesization in temperature equations"
+)]
+#[expect(
     unused_mut,
+    reason = "mutable locals retain the reference C state flow"
+)]
+#[expect(
     unused_variables,
+    reason = "reference C temperature locals are kept for statement-level comparison"
+)]
+#[expect(
     clippy::too_many_lines,
-    clippy::neg_multiply,
+    reason = "temperature model follows the upstream C routine statement by statement"
+)]
+#[expect(
     clippy::assign_op_pattern,
-    clippy::excessive_precision,
-    clippy::unnecessary_cast,
-    clippy::if_same_then_else,
+    reason = "C temperature arithmetic preserves its original evaluation order"
+)]
+#[expect(
     clippy::manual_clamp,
-    clippy::collapsible_if,
-    clippy::collapsible_else_if
+    reason = "explicit clamp branches preserve the C handling of nonfinite values"
+)]
+#[expect(
+    clippy::collapsible_else_if,
+    reason = "keeps ngspice C temperature branch topology unchanged"
 )] // A statement-by-statement port of C.
 pub(crate) fn temperature_instance(
     m: &mut Model,

@@ -4,10 +4,10 @@
 //! The model pass follows C statement by statement over C's own members,
 //! including its quirk that any VERSION beginning `4.8` selects the 4.8.3
 //! equations, because C tests `strncmp(version, "4.8", 3)` first.
-#![allow(non_snake_case)] // C's member names.
-#![allow(clippy::excessive_precision)] // C's literal spellings.
-#![allow(clippy::double_parens)] // C's parenthesised conditions, kept as written.
-#![allow(clippy::nonminimal_bool)] // C's negated given-bit tests, kept as written.
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)] // C's member names.
 
 use super::fields::{Instance, Model};
 use super::geo::rdseff_geo;
@@ -29,8 +29,14 @@ fn c_strncmp_eq(a: &str, b: &str, n: usize) -> bool {
 /// # Errors
 /// None today: C's model pass has no error return. The `Result` keeps the
 /// stage signature uniform.
-#[allow(clippy::too_many_lines)] // One C function, kept whole.
-#[allow(clippy::unnecessary_wraps)] // Uniform stage signature.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)] // One C function, kept whole.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "uniform setup stage signatures carry device errors without special cases"
+)] // Uniform stage signature.
 pub(crate) fn setup_model(
     m: &mut Model,
     nominal_temperature: f64,
@@ -2895,8 +2901,14 @@ pub(crate) fn setup_model(
 ///
 /// # Errors
 /// None today: C's only error here is `CKTmkVolt` running out of memory.
-#[allow(clippy::too_many_lines)] // One C loop body, kept whole.
-#[allow(clippy::unnecessary_wraps)] // Uniform stage signature.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)] // One C loop body, kept whole.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "uniform setup stage signatures carry device errors without special cases"
+)] // Uniform stage signature.
 pub(crate) fn setup_instance(
     m: &Model,
     h: &mut Instance,

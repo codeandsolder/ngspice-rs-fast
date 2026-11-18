@@ -989,7 +989,10 @@ pub fn solve_dc_forced(
 ///
 /// # Errors
 /// As [`solve_dc_with`], or a history that does not match the circuit.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)]
 pub fn solve_dc_from(
     circuit: &Circuit,
     context: &ModelContext,

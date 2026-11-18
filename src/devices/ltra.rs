@@ -704,7 +704,10 @@ impl LossyLine {
     /// `ltraload.c` for a transient load at `time` (C's `MODEINITPRED`
     /// computation of the coefficients and `LTRAinput1/2`, which C then keeps
     /// for the remaining iterations of the time point).
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the reference numerical routine in the original statement and rounding order"
+    )]
     fn transient_load(&self, history: &DelayHistory, time: Real) -> SpiceResult<Load> {
         let m = &self.model;
         let count = history.len();

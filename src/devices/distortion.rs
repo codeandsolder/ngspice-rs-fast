@@ -132,23 +132,38 @@ impl Control {
 /// ... + xyz x y z` beyond its linear part. Missing controls have zero
 /// coefficients.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-#[allow(missing_docs)]
 pub struct Taylor {
+    /// Coefficient of the x² monomial.
     pub xx: Real,
+    /// Coefficient of the y² monomial.
     pub yy: Real,
+    /// Coefficient of the z² monomial.
     pub zz: Real,
+    /// Coefficient of the xy monomial.
     pub xy: Real,
+    /// Coefficient of the yz monomial.
     pub yz: Real,
+    /// Coefficient of the xz monomial.
     pub xz: Real,
+    /// Coefficient of the x³ monomial.
     pub xxx: Real,
+    /// Coefficient of the y³ monomial.
     pub yyy: Real,
+    /// Coefficient of the z³ monomial.
     pub zzz: Real,
+    /// Coefficient of the x²y monomial.
     pub xxy: Real,
+    /// Coefficient of the x²z monomial.
     pub xxz: Real,
+    /// Coefficient of the xy² monomial.
     pub xyy: Real,
+    /// Coefficient of the y²z monomial.
     pub yyz: Real,
+    /// Coefficient of the xz² monomial.
     pub xzz: Real,
+    /// Coefficient of the yz² monomial.
     pub yzz: Real,
+    /// Coefficient of the xyz monomial.
     pub xyz: Real,
 }
 

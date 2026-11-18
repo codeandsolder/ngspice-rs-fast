@@ -2,7 +2,14 @@
 // Generated field facts (C member names and scalar types), not C
 // implementation code. Source: ngspice 059066b532f7073fccf4173ef269309eafdc7f0c, bsim4/bsim4def.h.
 // Regenerate: cargo xtask bsim4-schema --source /path/to/ngspice
-#![allow(non_snake_case, clippy::struct_excessive_bools)]
+#![allow(
+    non_snake_case,
+    clippy::struct_excessive_bools,
+    clippy::used_underscore_binding,
+    clippy::too_many_lines,
+    clippy::large_stack_arrays,
+    clippy::redundant_pub_crate
+)]
 
 /// `struct sBSIM4model`'s scalar members (1824 of them), in declaration order.
 #[derive(Clone, Default)]
@@ -7339,9 +7346,9 @@ impl Model {
     }
 
     /// Stores numbers produced by [`Self::to_values`]; `values` must have
-    /// [`Self::MEMBERS`]`.len()` entries.
+    /// `Self::MEMBERS.len()` entries.
     #[allow(dead_code, clippy::cast_possible_truncation)]
-    pub(crate) fn set_values(&mut self, values: &[f64]) {
+    pub(crate) const fn set_values(&mut self, values: &[f64]) {
         self.r#type = values[0] as i32;
         self.mobMod = values[1] as i32;
         self.cvchargeMod = values[2] as i32;
@@ -10092,9 +10099,9 @@ impl SizeParam {
     }
 
     /// Stores numbers produced by [`Self::to_values`]; `values` must have
-    /// [`Self::MEMBERS`]`.len()` entries.
+    /// `Self::MEMBERS.len()` entries.
     #[allow(dead_code, clippy::cast_possible_truncation)]
-    pub(crate) fn set_values(&mut self, values: &[f64]) {
+    pub(crate) const fn set_values(&mut self, values: &[f64]) {
         self.Width = values[0];
         self.Length = values[1];
         self.NFinger = values[2];
@@ -11844,9 +11851,9 @@ impl Instance {
     }
 
     /// Stores numbers produced by [`Self::to_values`]; `values` must have
-    /// [`Self::MEMBERS`]`.len()` entries.
+    /// `Self::MEMBERS.len()` entries.
     #[allow(dead_code, clippy::cast_possible_truncation)]
-    pub(crate) fn set_values(&mut self, values: &[f64]) {
+    pub(crate) const fn set_values(&mut self, values: &[f64]) {
         self.dNode = values[0] as i32;
         self.gNodeExt = values[1] as i32;
         self.sNode = values[2] as i32;

@@ -127,7 +127,10 @@ pub struct Parameter {
 }
 
 impl Parameter {
-    #[allow(clippy::too_many_arguments)] // Generated, reviewable IFparm records.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )] // Generated, reviewable IFparm records.
     pub(crate) const fn new(
         name: &'static str,
         canonical: &'static str,

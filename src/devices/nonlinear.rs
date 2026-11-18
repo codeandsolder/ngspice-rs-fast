@@ -1145,61 +1145,6 @@ fn missing_history(message: &str) -> SpiceError {
     SpiceError::circuit(message)
 }
 
-#[allow(dead_code)] // No in-tree caller since MOS1 follows mos1load.c directly.
-pub(crate) fn stamp_junction(
-    context: &mut StampContext<'_>,
-    nodes: [NodeId; 2],
-    v: Real,
-    p: JunctionPoint,
-    slot: usize,
-) -> SpiceResult<()> {
-    let mut conductance = p.conductance;
-    let mut equivalent = p.current - p.conductance * v;
-    if let Some(coefficients) = context.integration {
-        let crate::devices::AnalysisMode::Transient { dt, .. } = context.mode else {
-            return Err(SpiceError::circuit("junction companion outside transient"));
-        };
-        if dt != coefficients.dt() {
-            return Err(SpiceError::circuit("junction timestep mismatch"));
-        }
-        let mut history = crate::maths::integrator::ChargeHistory::new(p.charge);
-        for age in 1..=coefficients.charge_history_len() {
-            history.push(
-                context
-                    .states
-                    .accepted(age, slot)
-                    .ok_or_else(|| SpiceError::circuit("missing accepted junction charge"))?,
-            )?;
-        }
-        let previous = if coefficients.needs_previous_derivative() {
-            Some(
-                context
-                    .states
-                    .accepted(1, slot + 1)
-                    .ok_or_else(|| SpiceError::circuit("missing accepted junction derivative"))?,
-            )
-        } else {
-            None
-        };
-        let companion = coefficients.integrate(&history, previous, p.capacitance)?;
-        conductance += companion.conductance;
-        // For nonlinear Q, integrate()'s current is dQ/dt-a0*Q.
-        // Linearize Q around actual v: dq/dt - a0*(dQ/dv)*v.
-        equivalent += companion.derivative - companion.conductance * v;
-        context.states.set(slot + 1, companion.derivative)?;
-    } else {
-        if context.mode.is_transient() {
-            return Err(SpiceError::circuit(
-                "junction transient needs companion integration",
-            ));
-        }
-        context.states.set(slot + 1, 0.)?;
-    }
-    context.states.set(slot, p.charge)?;
-    crate::devices::linear::nodal_stamp(context.matrix, context.unknowns, nodes, conductance)?;
-    context.stamp_rhs(nodes[0], -equivalent)?;
-    context.stamp_rhs(nodes[1], equivalent)
-}
 impl Device for Diode {
     /// `diosetup.c` (without sidewall resistance or self-heating, which the
     /// port rejects); `posPrime` is the external anode when `RS = 0`.

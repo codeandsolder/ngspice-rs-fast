@@ -50,7 +50,10 @@
 
 // The `Values:` section is tab-separated, so the doc example above uses tabs.
 // They are intentional: they show the exact byte layout ngspice writes.
-#![allow(clippy::tabs_in_doc_comments)]
+#![expect(
+    clippy::tabs_in_doc_comments,
+    reason = "the ASCII ngspice rawfile documentation demonstrates literal tab separator bytes"
+)]
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};

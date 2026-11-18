@@ -225,7 +225,10 @@ impl Behavioural {
     }
 
     /// Stamps the linearised output. `rhs` is `None` for the AC Jacobian.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )]
     fn stamp_into(
         &self,
         matrix: &mut SparseMatrix,

@@ -954,7 +954,10 @@ pub(super) struct Loaded {
 /// the previous load), the `CKTstate0` writes and the current vector and Y
 /// matrix in C's order and arithmetic, every stamp scaled by `m`.
 /// `terminals` are the external d, g, s and `inner` the intrinsic d', g, s'.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)]
 pub(super) fn finish_load(
     context: &mut StampContext<'_>,
     start: Start,
@@ -1058,7 +1061,6 @@ pub(super) fn finish_load(
 
 /// The real part of `jfetacld.c`/`jfet2acld.c`: the conductances in C's
 /// order and grouping, every stamp scaled by `m`.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn ac_conductances(
     context: &mut LinearContext<'_>,
     terminals: &[NodeId],

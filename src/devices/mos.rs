@@ -371,7 +371,10 @@ impl Junction {
     /// `mos1temp.c`/`mos3temp.c`: the junction of one side from its
     /// zero-bias bottom and sidewall capacitances, with the `f2/f3/f4` linear
     /// continuation above `FC * PB` in C's arithmetic.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )]
     pub(super) fn new(
         saturation: Real,
         vcrit: Real,
@@ -1538,7 +1541,10 @@ impl<L: MosLevel> Device for Mosfet<L> {
     }
     /// `MOS1load` (`mos1load.c`; `mos3load.c` for level 3), without bypass,
     /// which ngspice disables by default, and without `.sens` perturbation.
-    #[allow(clippy::needless_range_loop)] // C's three gate charges, side by side.
+    #[expect(
+        clippy::needless_range_loop,
+        reason = "index-based traversal preserves coupling of reference state vector positions"
+    )] // C's three gate charges, side by side.
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         if context.mode.is_ac() {
             return Err(SpiceError::circuit(format!(

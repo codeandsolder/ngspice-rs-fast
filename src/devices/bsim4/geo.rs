@@ -24,7 +24,10 @@ fn num_finger_diff(nf: f64, min_sd: i32) -> (f64, f64, f64, f64) {
 /// `BSIM4PAeffGeo`: effective source/drain perimeters and areas
 /// `(Ps, Pd, As, Ad)`. An unmatched `geo` leaves them at `initial`, as C
 /// leaves its output arguments untouched.
-#[allow(clippy::too_many_arguments)] // C's own argument list.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)] // C's own argument list.
 pub(crate) fn pa_eff_geo(
     nf: f64,
     geo: i32,
@@ -135,7 +138,10 @@ pub(crate) fn pa_eff_geo(
 
 /// `BSIM4RdseffGeo`: the total source (`ty == 1`) or drain diffusion
 /// resistance. An unmatched `geo` leaves `Rend` at zero, as C does.
-#[allow(clippy::too_many_arguments)] // C's own argument list.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)] // C's own argument list.
 pub(crate) fn rdseff_geo(
     nf: f64,
     geo: i32,
@@ -282,7 +288,10 @@ pub(crate) fn rdseff_geo(
 
 /// `BSIM4RdsEndIso`: end resistance of an isolated diffusion. An unmatched
 /// `rgeo` leaves `rend` unchanged.
-#[allow(clippy::too_many_arguments)] // C's own argument list.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)] // C's own argument list.
 fn rds_end_iso(
     weffcj: f64,
     rsh: f64,
@@ -321,7 +330,10 @@ fn rds_end_iso(
 
 /// `BSIM4RdsEndSha`: end resistance of a shared diffusion. An unmatched
 /// `rgeo` leaves `rend` unchanged.
-#[allow(clippy::too_many_arguments)] // C's own argument list.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)] // C's own argument list.
 fn rds_end_sha(
     weffcj: f64,
     rsh: f64,

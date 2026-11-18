@@ -373,9 +373,15 @@ fn base2_determinant(mantissa: Complex, p: i32) -> (Cx, i32) {
     if y < z {
         y = z;
     }
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the C pole-zero rescaling algorithm stores its binary exponent in an i32"
+    )]
     let exponent = (x + y) as i32;
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the C pole-zero scaling algorithm intentionally truncates its exponent to i32"
+    )]
     let shift = 2.0_f64.powi(-(y as i32));
     (Cx::new(re * shift, im * shift), exponent)
 }
@@ -666,7 +672,10 @@ impl Search<'_> {
     }
 
     /// `CKTpzStrat`.
-    #[allow(clippy::needless_late_init)] // keeps C's branch structure
+    #[expect(
+        clippy::needless_late_init,
+        reason = "initialization position follows the original C control-flow structure"
+    )] // keeps C's branch structure
     fn strat(&mut self, set: &Set) -> SpiceResult<u8> {
         let mut new_trap = 0;
         let suggestion;

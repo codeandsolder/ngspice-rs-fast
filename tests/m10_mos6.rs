@@ -97,7 +97,6 @@ fn run(body: &str) -> SpiceResult<Vec<Plot>> {
 
 /// `mos6load.c`'s drain current in the normalized frame for the
 /// temperature-scaled `betac` (with M), `vbi` and `phi`.
-#[allow(clippy::too_many_arguments)]
 fn power_law(
     betac: f64,
     [kv, nv, nc]: [f64; 3],

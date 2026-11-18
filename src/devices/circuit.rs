@@ -543,7 +543,10 @@ impl Circuit {
                 }
                 let eigenvalues = matrix.symmetric_eigenvalues()?;
                 let largest = eigenvalues.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "in-memory system size is converted to binary64 when defining a numerical tolerance"
+                )]
                 let tolerance = 64.0 * n as Real * Real::EPSILON * largest;
                 let smallest = eigenvalues.first().copied().unwrap_or(0.0);
                 Ok((smallest, tolerance, couplings))
@@ -1566,7 +1569,10 @@ impl Circuit {
     }
 
     /// [`Circuit::load`]'s device loop: each device stamps in load order.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )]
     fn stamp_devices(
         &self,
         request: &LoadRequest<'_>,

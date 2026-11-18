@@ -345,7 +345,10 @@ pub enum PhasePolicy {
 ///
 /// # Errors
 /// As [`solve_counted_limited`].
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)]
 pub fn solve_phased(
     initial: &Vector,
     branch_rows: &[bool],
@@ -432,7 +435,10 @@ struct Phases<T, F> {
 /// the iterate that pass loaded (C's `CKTrhsOld`, within the tolerances of
 /// the new one) with that load's trial (C's `CKTstate0`); no further load
 /// is made.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)]
 fn iterate<T, F: Fn(&T) -> bool>(
     initial: &Vector,
     branch_rows: &[bool],

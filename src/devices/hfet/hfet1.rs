@@ -690,7 +690,10 @@ impl Hfet1 {
 
     /// `hfetload.c`'s `leak()`: the two-exponential gate junction, with a
     /// series resistance when one is given.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )]
     fn leak(
         gmin: Real,
         vt: Real,
@@ -736,7 +739,10 @@ impl Hfet1 {
     /// `hfeta()`: the channel, the gate currents and the `gatemod` cross
     /// terms. `vgs` is C's `vds > 0 ? vgs : vgd` argument (see the module
     /// docs); `vds` is the normalized (nonnegative) drain-source voltage.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )]
     fn hfeta(
         &self,
         derived: &Derived,
@@ -900,7 +906,10 @@ impl Hfet1 {
     /// `hfeta`'s `cgd_calc` block: with `gatemod != 0` the gate-drain and
     /// gate-source currents replace the caller's, and the `gmg`/`gmd` cross
     /// conductances exist; with `gatemod == 0` C leaves them at zero.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )]
     fn gatemod_terms(
         &self,
         derived: &Derived,
@@ -2193,7 +2202,6 @@ impl DeviceSensitivity for Hfet1Sensitivity<'_> {
 
 impl Hfet1Sensitivity<'_> {
     /// The port's HFET1 with the records' parameters.
-    #[allow(clippy::too_many_lines)]
     fn hfet1(&self, current: RecordPair<'_>) -> SpiceResult<Hfet1> {
         let (m, i) = (current.model, current.instance);
         let r = |keyword: &str| m.value(keyword);

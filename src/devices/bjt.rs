@@ -584,7 +584,10 @@ fn pbfact(t: Real) -> Real {
 }
 
 impl Model {
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the reference numerical routine in the original statement and rounding order"
+    )]
     fn thermal(
         &self,
         instance: &Instance,
@@ -1182,7 +1185,10 @@ fn c_junction(v: Real, vtn: Real, is: Real) -> (Real, Real) {
 /// `bjtload.c`'s depletion charge and capacitance of a junction with zero-bias
 /// capacitance `cz`, potential `p`, grading `xm`, linearized above `fcp` with
 /// `bjttemp.c`'s `f1`/`f2`/`f3` (`tf1..3` for BE, `tf5..7` for BC and BX).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)]
 fn c_depletion(
     v: Real,
     cz: Real,
@@ -1209,7 +1215,10 @@ fn c_depletion(
 /// `bjtload.c` from "determine dc current and derivatives" through the
 /// charge storage block, expression for expression (excess phase and
 /// quasi-saturation are rejected at elaboration).
-#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)]
 fn c_point(
     t: &Thermal,
     vbe: Real,
@@ -1652,7 +1661,10 @@ impl Device for Bjt {
     /// `cc` and `geqcb *= ag0`, then `qsub`, `qbx`; `MODEINITTRAN` copies
     /// of the charges and currents into `CKTstate1`), and the right-hand
     /// side and matrix stamps in C's sequence and expressions.
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the reference numerical routine in the original statement and rounding order"
+    )]
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         if context.mode.is_ac() {
             return Err(SpiceError::circuit("BJT AC requires small-signal assembly"));
@@ -2209,7 +2221,10 @@ impl DeviceSensitivity for BjtSensitivity<'_> {
         INSTANCE_PARAMETERS
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the reference numerical routine in the original statement and rounding order"
+    )]
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (m, i) = (&self.device.model, &self.device.instance);
         let ibe = m.ibe.unwrap_or(0.);
@@ -2514,7 +2529,10 @@ impl DeviceSensitivity for BjtSensitivity<'_> {
 
 impl BjtSensitivity<'_> {
     /// The port's BJT with the records' DC parameters.
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the reference numerical routine in the original statement and rounding order"
+    )]
     fn bjt(&self, current: RecordPair<'_>) -> SpiceResult<Bjt> {
         let (m, i) = (current.model, current.instance);
         let r = |keyword: &str| m.value(keyword);

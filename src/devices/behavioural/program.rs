@@ -678,7 +678,10 @@ fn pwr(a: Real, b: Real) -> Real {
 /// C's `MODULUS(x, limit)`: `x - (int)(x / limit) * limit` (the `int`
 /// conversion saturates, as on the reference platform).
 fn modulus(x: Real, limit: Real) -> Real {
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "C MODULUS explicitly converts the quotient to a saturating i32 on this reference platform"
+    )]
     let whole = (x / limit) as i32;
     x - Real::from(whole) * limit
 }

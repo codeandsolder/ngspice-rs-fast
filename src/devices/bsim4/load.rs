@@ -15,25 +15,54 @@
 //! - C's bypass branch (`goto line755`/`line850` when `CKTbypass` is set) is
 //!   not compiled: the port runs with `bypass = 0`, C's default, so `ByPass`
 //!   stays 0 (`NOBYPASS` path), and `NEWCONV` is defined as in C.
-#![allow(non_snake_case)] // C's member and local names.
-#![allow(unused_assignments, unused_variables, unused_mut)] // C assigns locals that some paths never read.
-#![allow(non_upper_case_globals)] // C's `Charge_q`.
-#![allow(unused_parens)] // C's parenthesisation is kept verbatim.
-#![allow(clippy::assign_op_pattern)] // `x = x * y` is kept as C writes it.
-#![allow(clippy::collapsible_else_if)] // C's if/else nesting.
-#![allow(clippy::collapsible_if)] // C's if nesting.
-#![allow(clippy::double_parens)] // C's parenthesisation is kept verbatim.
-#![allow(clippy::excessive_precision)] // C's literals.
-#![allow(clippy::float_cmp)] // C compares floating point exactly.
-#![allow(clippy::if_same_then_else)] // C's branches.
-#![allow(clippy::many_single_char_names)] // C's locals.
-#![allow(clippy::manual_range_contains)] // C's range tests.
-#![allow(clippy::neg_multiply)] // C's `-1 * x` forms.
-#![allow(clippy::nonminimal_bool)] // C's conditions.
-#![allow(clippy::precedence)] // C's expressions are kept verbatim.
-#![allow(clippy::too_many_lines)] // One C function.
-#![allow(clippy::cognitive_complexity)] // One C function.
-#![allow(clippy::useless_conversion)] // Generated int-to-double conversions.
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)] // C's member and local names.
+#![expect(
+    unused_assignments,
+    reason = "C state-machine locals retain the reference assignment sequence"
+)]
+#![expect(
+    unused_variables,
+    reason = "C-translated intermediate variables preserve the reference layout"
+)]
+#![expect(
+    unused_mut,
+    reason = "local mutability reflects the source C intermediate state declarations"
+)] // C assigns locals that some paths never read.
+#![expect(
+    non_upper_case_globals,
+    reason = "constant names intentionally match the reference device equations"
+)] // C's `Charge_q`.
+#![expect(
+    unused_parens,
+    reason = "preserves source C expression grouping during numerical port verification"
+)] // C's parenthesisation is kept verbatim.
+#![expect(
+    clippy::assign_op_pattern,
+    reason = "retains the reference calculation grouping and floating-point operation order"
+)] // `x = x * y` is kept as C writes it.
+#![expect(
+    clippy::collapsible_if,
+    reason = "preserves the reference conditional order and side-effect boundaries"
+)] // C's if nesting.
+#![expect(
+    clippy::float_cmp,
+    reason = "exact equality is part of the reference device model branch conditions"
+)] // C compares floating point exactly.
+#![expect(
+    clippy::manual_range_contains,
+    reason = "comparison spelling matches the reference C conditional sequence"
+)] // C's range tests.
+#![expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)] // One C function.
+#![expect(
+    clippy::cognitive_complexity,
+    reason = "single translated reference routine retains its checked evaluation sequence"
+)] // One C function.
 use super::fields::{Instance, Model, SizeParam};
 use super::host::{LoadCkt, mode, state};
 use crate::devices::limiting::{fetlim, limvds, pnjlim};
