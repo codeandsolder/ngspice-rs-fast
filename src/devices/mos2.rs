@@ -233,7 +233,8 @@ impl Level2 {
                 let vfb = wkfngs - self.nss.unwrap_or(0.) * 1e4 * CHARGE / cox;
                 process.vto = vfb + pol * (process.gamma * process.phi.sqrt() + process.phi);
             }
-            process.xd = ((EPSILON_SI + EPSILON_SI) / (CHARGE * density)).sqrt();
+            let twice_eps_si = EPSILON_SI + EPSILON_SI;
+            process.xd = (twice_eps_si / (CHARGE * density)).sqrt();
         }
         Ok(process)
     }

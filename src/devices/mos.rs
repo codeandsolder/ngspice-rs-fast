@@ -393,9 +393,10 @@ impl Junction {
         let f2 = bottom * (1. - fc * (1. + mj)) * sarg / arg
             + sidewall * (1. - fc * (1. + mjsw)) * sargsw / arg;
         let f3 = bottom * mj * sarg / arg / potential + sidewall * mjsw * sargsw / arg / potential;
+        let depletion_squared = depletion * depletion;
         let f4 = bottom * potential * (1. - arg * sarg) / (1. - mj)
             + sidewall * potential * (1. - arg * sargsw) / (1. - mjsw)
-            - f3 / 2. * (depletion * depletion)
+            - f3 / 2. * depletion_squared
             - depletion * f2;
         Self {
             saturation,

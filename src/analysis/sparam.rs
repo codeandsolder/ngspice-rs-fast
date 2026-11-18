@@ -387,7 +387,8 @@ fn noise_parameters(
         }
         let ycor = y11 - (get(0, 1) / c22) * y21;
         let gu = get(0, 0).re - rn * (y11 - ycor).magnitude().powi(2);
-        let ys = Complex::new((ycor.re * ycor.re + gu / rn).max(0.).sqrt(), -ycor.im);
+        let ycor_re_squared = ycor.re * ycor.re;
+        let ys = Complex::new((ycor_re_squared + gu / rn).max(0.).sqrt(), -ycor.im);
         let y0 = Complex::real(1. / ports[0].z0);
         let sopt = (y0 - ys) / (y0 + ys);
         let fmin = 1. + 2. * rn * (ycor.re + ys.re);

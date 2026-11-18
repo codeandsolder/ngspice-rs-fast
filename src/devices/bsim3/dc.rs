@@ -309,7 +309,8 @@ impl DcModel<'_> {
         let t0 = (1.0 + param("nlx") / leff).sqrt();
         let t1 = param("k1ox") * (t0 - 1.0) * param("sqrtphi")
             + (param("kt1") + param("kt1l") / leff + param("kt2") * vbseff) * temp_ratio;
-        let tmp2 = tox * phi / (param("weff") + param("w0"));
+        let effective_width_offset = param("weff") + param("w0");
+        let tmp2 = tox * phi / effective_width_offset;
 
         let t3eta = param("eta0") + param("etab") * vbseff;
         let (t3eta, t4) = if t3eta < 1.0e-4 {

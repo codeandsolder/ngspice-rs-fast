@@ -68,7 +68,7 @@ fn parsed_controlled_source_setters_match_live_c_gains() {
     let netlist = parse(CONTROLLED);
     let mut expected = BTreeMap::new();
     for device in &netlist.devices {
-        if !matches!(device.designator, 'e' | 'f' | 'g' | 'h') {
+        if !matches!(device.designator, 'e'..='h') {
             continue;
         }
         // VCCSparam/CCCSparam: a gain is scaled by an m given *before* it.

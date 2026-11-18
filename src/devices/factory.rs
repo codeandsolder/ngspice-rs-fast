@@ -203,7 +203,7 @@ pub(crate) fn instantiate(
     instance: &DeviceInstance,
     nodes: &mut NodeTable,
 ) -> SpiceResult<Box<dyn Device>> {
-    if matches!(instance.designator, 'e' | 'f' | 'g' | 'h') {
+    if matches!(instance.designator, 'e'..='h') {
         return crate::devices::controlled::instantiate(instance, nodes);
     }
     if instance.designator == 'k' {

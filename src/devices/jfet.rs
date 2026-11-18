@@ -301,7 +301,8 @@ impl Model {
             } else {
                 // Normal mode, saturation region.
                 let bfac = vgst * op.bfac;
-                let cpart = vgst * vgst * (b + bfac);
+                let vgst_squared = vgst * vgst;
+                let cpart = vgst_squared * (b + bfac);
                 Channel {
                     current: betap * cpart,
                     gm: betap * vgst * (2. * b + 3. * bfac),
@@ -328,7 +329,8 @@ impl Model {
                 // Inverse mode, saturation region.
                 let bfac = vgdt * op.bfac;
                 let gm = -betap * vgdt * (2. * b + 3. * bfac);
-                let cpart = vgdt * vgdt * (b + bfac);
+                let vgdt_squared = vgdt * vgdt;
+                let cpart = vgdt_squared * (b + bfac);
                 Channel {
                     current: -betap * cpart,
                     gm,
@@ -1486,100 +1488,6 @@ impl Device for Jfet {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn operating(b: Real) -> (Model, Operating) {
-        let model = Model {
-            pol: 1.,
-            vto: -2.,
-            beta: 1e-3,
-            lambda: 0.02,
-            rd: 0.,
-            rs: 0.,
-            cgs: 2e-12,
-            cgd: 1e-12,
-            pb: 0.8,
-            is: 1e-14,
-            n: 1.2,
-            fc: 0.5,
-            b,
-            tnom: None,
-            tcv: 0.,
-            vtotc: None,
-            bex: 0.,
-            betatce: None,
-            xti: None,
-            eg: 1.11,
-        };
-        let device = Jfet {
-            name: "j1".into(),
-            model_name: "jm".into(),
-            terminals: vec![],
-            inner: [NodeId::GROUND; 3],
-            model,
-            instance: Instance {
-                area: 1.5,
-                m: 1.,
-                temp: None,
-                dtemp: 0.,
-            },
-            initial: crate::devices::initial::InstanceInitial::default(),
-        };
-        (model, device.operating(&ModelContext::default()).unwrap())
-    }
-
-    /// gm = dI/dvgs at fixed vds and gds = dI/dvds at fixed vgs, in every
-    /// region of both modes, with and without the doping tail.
-    #[test]
-    fn channel_partials_are_the_current_derivatives() {
-        for b in [1., 0.6, 1.4] {
-            let (model, op) = operating(b);
-            let current = |vgs: Real, vds: Real| model.channel(&op, vgs, vgs - vds).current;
-            for vgs in [-2.5, -1.7, -1., 0., 0.3] {
-                for vds in [-3., -1.2, -0.4, -0.05, 0.05, 0.4, 1.2, 3.] {
-                    let c = model.channel(&op, vgs, vgs - vds);
-                    let h = 1e-6;
-                    let gm = (current(vgs + h, vds) - current(vgs - h, vds)) / (2. * h);
-                    let gds = (current(vgs, vds + h) - current(vgs, vds - h)) / (2. * h);
-                    let scale = c.gm.abs().max(c.gds.abs()).max(1e-9);
-                    assert!((gm - c.gm).abs() <= 1e-6 * scale, "b={b} {vgs} {vds}: gm");
-                    assert!(
-                        (gds - c.gds).abs() <= 1e-6 * scale,
-                        "b={b} {vgs} {vds}: gds"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_channel_is_antisymmetric_under_drain_source_exchange() {
-        let (model, op) = operating(0.8);
-        for (vgs, vgd) in [(-1., -1.5), (0.2, -2.), (-1.9, -1.95)] {
-            let forward = model.channel(&op, vgs, vgd).current;
-            let reverse = model.channel(&op, vgd, vgs).current;
-            assert!((forward + reverse).abs() <= 1e-15, "{vgs} {vgd}");
-        }
-    }
-
-    #[test]
-    fn gate_charge_is_continuous_and_its_derivative_is_the_capacitance() {
-        let (_, op) = operating(1.);
-        for v in [-5., -1., 0., 0.3, op.cor_dep_cap, 0.6, 1.] {
-            let h = 1e-7;
-            let (_, c) = op.charge(v, 2e-12);
-            let numerical = (op.charge(v + h, 2e-12).0 - op.charge(v - h, 2e-12).0) / (2. * h);
-            assert!((numerical - c).abs() <= 1e-6 * c, "{v}: {numerical} {c}");
-        }
-        let edge = op.cor_dep_cap;
-        let (below, above) = (op.charge(edge - 1e-12, 2e-12), op.charge(edge, 2e-12));
-        assert!((below.0 - above.0).abs() <= 1e-9 * above.0.abs());
-        assert!((below.1 - above.1).abs() <= 1e-9 * above.1);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // `.sens` (#164)
 // ---------------------------------------------------------------------------
@@ -1948,4 +1856,98 @@ fn celsius_instance(instance: &SensitivityRecord) -> SpiceResult<Option<Real>> {
         .then(|| instance.value("temp"))
         .transpose()?
         .map(|kelvin| kelvin - CELSIUS_TO_KELVIN))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn operating(b: Real) -> (Model, Operating) {
+        let model = Model {
+            pol: 1.,
+            vto: -2.,
+            beta: 1e-3,
+            lambda: 0.02,
+            rd: 0.,
+            rs: 0.,
+            cgs: 2e-12,
+            cgd: 1e-12,
+            pb: 0.8,
+            is: 1e-14,
+            n: 1.2,
+            fc: 0.5,
+            b,
+            tnom: None,
+            tcv: 0.,
+            vtotc: None,
+            bex: 0.,
+            betatce: None,
+            xti: None,
+            eg: 1.11,
+        };
+        let device = Jfet {
+            name: "j1".into(),
+            model_name: "jm".into(),
+            terminals: vec![],
+            inner: [NodeId::GROUND; 3],
+            model,
+            instance: Instance {
+                area: 1.5,
+                m: 1.,
+                temp: None,
+                dtemp: 0.,
+            },
+            initial: crate::devices::initial::InstanceInitial::default(),
+        };
+        (model, device.operating(&ModelContext::default()).unwrap())
+    }
+
+    /// gm = dI/dvgs at fixed vds and gds = dI/dvds at fixed vgs, in every
+    /// region of both modes, with and without the doping tail.
+    #[test]
+    fn channel_partials_are_the_current_derivatives() {
+        for b in [1., 0.6, 1.4] {
+            let (model, op) = operating(b);
+            let current = |vgs: Real, vds: Real| model.channel(&op, vgs, vgs - vds).current;
+            for vgs in [-2.5, -1.7, -1., 0., 0.3] {
+                for vds in [-3., -1.2, -0.4, -0.05, 0.05, 0.4, 1.2, 3.] {
+                    let c = model.channel(&op, vgs, vgs - vds);
+                    let h = 1e-6;
+                    let gm = (current(vgs + h, vds) - current(vgs - h, vds)) / (2. * h);
+                    let gds = (current(vgs, vds + h) - current(vgs, vds - h)) / (2. * h);
+                    let scale = c.gm.abs().max(c.gds.abs()).max(1e-9);
+                    assert!((gm - c.gm).abs() <= 1e-6 * scale, "b={b} {vgs} {vds}: gm");
+                    assert!(
+                        (gds - c.gds).abs() <= 1e-6 * scale,
+                        "b={b} {vgs} {vds}: gds"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_channel_is_antisymmetric_under_drain_source_exchange() {
+        let (model, op) = operating(0.8);
+        for (vgs, vgd) in [(-1., -1.5), (0.2, -2.), (-1.9, -1.95)] {
+            let forward = model.channel(&op, vgs, vgd).current;
+            let reverse = model.channel(&op, vgd, vgs).current;
+            assert!((forward + reverse).abs() <= 1e-15, "{vgs} {vgd}");
+        }
+    }
+
+    #[test]
+    fn gate_charge_is_continuous_and_its_derivative_is_the_capacitance() {
+        let (_, op) = operating(1.);
+        for v in [-5., -1., 0., 0.3, op.cor_dep_cap, 0.6, 1.] {
+            let h = 1e-7;
+            let (_, c) = op.charge(v, 2e-12);
+            let numerical = (op.charge(v + h, 2e-12).0 - op.charge(v - h, 2e-12).0) / (2. * h);
+            assert!((numerical - c).abs() <= 1e-6 * c, "{v}: {numerical} {c}");
+        }
+        let edge = op.cor_dep_cap;
+        let (below, above) = (op.charge(edge - 1e-12, 2e-12), op.charge(edge, 2e-12));
+        assert!((below.0 - above.0).abs() <= 1e-9 * above.0.abs());
+        assert!((below.1 - above.1).abs() <= 1e-9 * above.1);
+    }
 }

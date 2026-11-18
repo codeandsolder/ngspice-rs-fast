@@ -65,7 +65,7 @@ pub(super) fn controlled_card(input: &mut Input<'_>) -> Result<ParsedCard> {
 
 fn controlled_designator(token: &Token) -> Option<char> {
     let designator = token.text.chars().next()?.to_ascii_lowercase();
-    matches!(designator, 'e' | 'f' | 'g' | 'h').then_some(designator)
+    matches!(designator, 'e'..='h').then_some(designator)
 }
 
 fn body(input: &mut Input<'_>, instance: &Token, designator: char) -> Result<ParsedCard> {

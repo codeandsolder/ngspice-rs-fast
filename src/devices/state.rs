@@ -346,7 +346,9 @@ impl StateHistory {
         range: Range<usize>,
         delay: Option<&'a DelayHistory>,
     ) -> SpiceResult<DeviceState<'a>> {
-        if trial.values.len() != self.len || range.end > self.len || range.start > range.end {
+        let valid_length = trial.values.len() == self.len;
+        let valid_range = range.start <= range.end && range.end <= self.len;
+        if !valid_length || !valid_range {
             return Err(state_error("device state range out of bounds"));
         }
         let mut accepted: [&[Real]; ACCEPTED_DEPTH] = [&[]; ACCEPTED_DEPTH];
@@ -818,6 +820,11 @@ mod tests {
         let history = StateHistory::new(3);
         let mut trial = history.trial();
         assert!(history.device(&mut trial, 2..4).is_err());
+        assert!(
+            history
+                .device(&mut trial, std::ops::Range { start: 2, end: 1 })
+                .is_err()
+        );
         let mut short = StateHistory::new(1).trial();
         assert!(history.device(&mut short, 0..1).is_err());
         let mut device = history.device(&mut trial, 1..3).unwrap();

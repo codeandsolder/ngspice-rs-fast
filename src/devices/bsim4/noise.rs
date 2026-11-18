@@ -280,7 +280,8 @@ pub(crate) fn generators(
             // indeterminate stack value C adds to the total). The port uses
             // zero there.
             let T0 = h.ueff * h.qinv.abs();
-            let T1 = T0 * tmp + p.leff * p.leff;
+            let leff_squared = p.leff * p.leff;
+            let T1 = T0 * tmp + leff_squared;
             out[8] = Source::Thermal(h.dNodePrime, h.sNodePrime, (T0 / T1) * m.ntnoi * mult_i);
         }
         1 => {

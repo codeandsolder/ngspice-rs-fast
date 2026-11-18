@@ -291,7 +291,7 @@ fn has(device: &DeviceInstance, name: &str) -> bool {
 }
 
 fn lower_device(device: &DeviceInstance) -> SpiceResult<Vec<DeviceInstance>> {
-    if !matches!(device.designator, 'e' | 'f' | 'g' | 'h') {
+    if !matches!(device.designator, 'e'..='h') {
         return Ok(vec![device.clone()]);
     }
     if has(device, "poly") {

@@ -47,7 +47,13 @@ pub(crate) fn plot(
     let mut names: Vec<Option<(String, &str)>> = vec![None; circuit.unknown_count()];
     for node in circuit.nodes().nodes() {
         if let Some(row) = circuit.unknowns().node_row(node.id) {
-            names[row] = Some((format!("v({})", node.name), "voltage"));
+            let entry = names.get_mut(row).ok_or_else(|| {
+                SpiceError::circuit(format!(
+                    "node {} references nonexistent MNA row {row}",
+                    node.name
+                ))
+            })?;
+            *entry = Some((format!("v({})", node.name), "voltage"));
         }
     }
     for (index, device) in circuit.devices().iter().enumerate() {
@@ -56,11 +62,20 @@ pub(crate) fn plot(
         // twice, in branch order (`raw_write` strips CKTmkCur's `#branchN`
         // suffix). The MNA rows keep `#branch1`/`#branch2`
         // (`Circuit::unknown_names`), which is what solver diagnostics use.
-        let rows = circuit
-            .branch_rows(index)
-            .expect("a finalized circuit has branch rows for every device ordinal");
+        let rows = circuit.branch_rows(index).ok_or_else(|| {
+            SpiceError::circuit(format!(
+                "device {} is missing its MNA branch rows",
+                device.name()
+            ))
+        })?;
         for row in rows {
-            names[row] = Some((format!("i({})", device.name()), "current"));
+            let entry = names.get_mut(row).ok_or_else(|| {
+                SpiceError::circuit(format!(
+                    "device {} references nonexistent MNA branch row {row}",
+                    device.name()
+                ))
+            })?;
+            *entry = Some((format!("i({})", device.name()), "current"));
         }
     }
     for (name, unit) in names.into_iter().flatten() {

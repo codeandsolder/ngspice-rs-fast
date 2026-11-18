@@ -1278,189 +1278,6 @@ impl Device for Jfet2 {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn model() -> Model {
-        Model {
-            pol: 1.,
-            acgam: 0.1,
-            beta: 1.3e-3,
-            cds: 0.5e-12,
-            cgd: 1e-12,
-            cgs: 2e-12,
-            delta: 0.3,
-            hfeta: 0.02,
-            hfe1: 0.01,
-            hfe2: 0.015,
-            hfg1: 0.012,
-            hfg2: 0.008,
-            hfgam: 0.04,
-            mvst: 0.2,
-            mxi: 0.1,
-            fc: 0.5,
-            ibd: 1e-9,
-            is: 1e-14,
-            lambda: 0.03,
-            lfgam: 0.05,
-            lfg1: 0.02,
-            lfg2: 0.01,
-            n: 1.2,
-            p: 2.3,
-            pb: 0.9,
-            q: 2.1,
-            rd: 0.,
-            rs: 0.,
-            taud: 1e-7,
-            taug: 2e-7,
-            vbd: 2.,
-            vst: 0.06,
-            vto: -2.,
-            xc: 0.2,
-            xi: 8.,
-            z: 0.6,
-            tnom: None,
-        }
-    }
-
-    fn device(model: Model) -> (Jfet2, Operating) {
-        let device = Jfet2 {
-            name: "j1".into(),
-            model_name: "jm".into(),
-            terminals: vec![],
-            inner: [NodeId::GROUND; 3],
-            model,
-            instance: Instance {
-                area: 1.5,
-                m: 1.,
-                temp: None,
-                dtemp: 0.,
-            },
-            initial: crate::devices::initial::InstanceInitial::default(),
-        };
-        let op = device.operating(&ModelContext::default()).unwrap();
-        (device, op)
-    }
-
-    /// gm = dI/dvgs at fixed vds and gds = dI/dvds at fixed vgs, as well as
-    /// the diode conductances, in every region of both modes, with and
-    /// without the transient filters.
-    #[test]
-    fn ids_partials_are_the_current_derivatives() {
-        let (device, op) = device(model());
-        let memory = Memory {
-            step: 3e-8,
-            vgstrap: -0.7,
-            vgdtrap: -2.4,
-            powr: 4e-3,
-        };
-        for memory in [None, Some(&memory)] {
-            for vgs in [-3.2, -2.3, -1.9, -1., 0., 0.4] {
-                for vds in [-3., -1.2, -0.4, -0.05, 0.05, 0.4, 1.2, 3.] {
-                    let at = |vgs: Real, vds: Real| {
-                        device.point(&op, vgs, vgs - vds, 1e-12, memory).unwrap()
-                    };
-                    let c = at(vgs, vds);
-                    let h = 1e-6;
-                    let gm = (at(vgs + h, vds).channel.0 - at(vgs - h, vds).channel.0) / (2. * h);
-                    let gds = (at(vgs, vds + h).channel.0 - at(vgs, vds - h).channel.0) / (2. * h);
-                    let scale = c.channel.1.abs().max(c.channel.2.abs()).max(1e-9);
-                    let tag = format!("{vgs} {vds} {}", memory.is_some());
-                    assert!(
-                        (gm - c.channel.1).abs() <= 1e-5 * scale,
-                        "{tag}: gm {gm} {:?}",
-                        c.channel
-                    );
-                    assert!(
-                        (gds - c.channel.2).abs() <= 1e-5 * scale,
-                        "{tag}: gds {gds} {:?}",
-                        c.channel
-                    );
-                    // d igs / d vgs at fixed vgd = ggs.
-                    let ggs = (device
-                        .point(&op, vgs + h, vgs - vds, 1e-12, memory)
-                        .unwrap()
-                        .gs
-                        .0
-                        - device
-                            .point(&op, vgs - h, vgs - vds, 1e-12, memory)
-                            .unwrap()
-                            .gs
-                            .0)
-                        / (2. * h);
-                    assert!(
-                        (ggs - c.gs.1).abs() <= 1e-5 * c.gs.1.abs() + 1e-15,
-                        "{tag}: ggs"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_channel_is_antisymmetric_without_filters() {
-        let (device, op) = device(model());
-        for (vgs, vgd) in [(-1., -1.5), (0.2, -2.), (-1.9, -1.95)] {
-            let forward = device.point(&op, vgs, vgd, 0., None).unwrap().channel.0;
-            let reverse = device.point(&op, vgd, vgs, 0., None).unwrap().channel.0;
-            assert!((forward + reverse).abs() <= 1e-15, "{vgs} {vgd}");
-        }
-    }
-
-    #[test]
-    fn statz_charge_partials_are_its_derivatives() {
-        let (device, op) = device(model());
-        for vgs in [-4., -2.1, -1., 0., 0.3, 0.6, 0.85] {
-            for vgd in [-5., -2., -0.5, 0.2, 0.7] {
-                let (_, cgs, cgd) = device.model.qgg(&op, vgs, vgd);
-                let h = 1e-7;
-                let q = |a: Real, b: Real| device.model.qgg(&op, a, b).0;
-                let ngs = (q(vgs + h, vgd) - q(vgs - h, vgd)) / (2. * h);
-                let ngd = (q(vgs, vgd + h) - q(vgs, vgd - h)) / (2. * h);
-                let scale = cgs.abs().max(cgd.abs());
-                assert!(
-                    (ngs - cgs).abs() <= 1e-6 * scale,
-                    "{vgs} {vgd}: cgs {ngs} {cgs}"
-                );
-                assert!(
-                    (ngd - cgd).abs() <= 1e-6 * scale,
-                    "{vgs} {vgd}: cgd {ngd} {cgd}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn ac_load_reduces_to_the_dc_conductances_without_time_constants() {
-        let mut m = model();
-        m.taug = 0.;
-        m.taud = 0.;
-        let (device, op) = device(m);
-        let p = device.point(&op, -0.8, -3., 1e-12, None).unwrap();
-        let (gm, xgm, gds, xgds) = device.model.acload(
-            &op,
-            -0.8,
-            -3.,
-            p.channel.0 - p.gd.0,
-            1e7,
-            p.channel.1,
-            p.channel.2,
-        );
-        assert!(
-            (gm - p.channel.1).abs() <= 1e-12 * gm.abs(),
-            "{gm} {:?}",
-            p.channel
-        );
-        assert!(
-            (gds - p.channel.2).abs() <= 1e-12 * gds.abs(),
-            "{gds} {:?}",
-            p.channel
-        );
-        assert_eq!((xgm, xgds), (0., 0.));
-    }
-}
-
 // ---------------------------------------------------------------------------
 // `.sens` (#164)
 // ---------------------------------------------------------------------------
@@ -1914,5 +1731,188 @@ impl Device for ResetJfet2 {
             jfet::series_conductances(current.instance.area, current.model.rd, current.model.rs),
             [gm, gds, point.gs.1, point.gd.1],
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model() -> Model {
+        Model {
+            pol: 1.,
+            acgam: 0.1,
+            beta: 1.3e-3,
+            cds: 0.5e-12,
+            cgd: 1e-12,
+            cgs: 2e-12,
+            delta: 0.3,
+            hfeta: 0.02,
+            hfe1: 0.01,
+            hfe2: 0.015,
+            hfg1: 0.012,
+            hfg2: 0.008,
+            hfgam: 0.04,
+            mvst: 0.2,
+            mxi: 0.1,
+            fc: 0.5,
+            ibd: 1e-9,
+            is: 1e-14,
+            lambda: 0.03,
+            lfgam: 0.05,
+            lfg1: 0.02,
+            lfg2: 0.01,
+            n: 1.2,
+            p: 2.3,
+            pb: 0.9,
+            q: 2.1,
+            rd: 0.,
+            rs: 0.,
+            taud: 1e-7,
+            taug: 2e-7,
+            vbd: 2.,
+            vst: 0.06,
+            vto: -2.,
+            xc: 0.2,
+            xi: 8.,
+            z: 0.6,
+            tnom: None,
+        }
+    }
+
+    fn device(model: Model) -> (Jfet2, Operating) {
+        let device = Jfet2 {
+            name: "j1".into(),
+            model_name: "jm".into(),
+            terminals: vec![],
+            inner: [NodeId::GROUND; 3],
+            model,
+            instance: Instance {
+                area: 1.5,
+                m: 1.,
+                temp: None,
+                dtemp: 0.,
+            },
+            initial: crate::devices::initial::InstanceInitial::default(),
+        };
+        let op = device.operating(&ModelContext::default()).unwrap();
+        (device, op)
+    }
+
+    /// gm = dI/dvgs at fixed vds and gds = dI/dvds at fixed vgs, as well as
+    /// the diode conductances, in every region of both modes, with and
+    /// without the transient filters.
+    #[test]
+    fn ids_partials_are_the_current_derivatives() {
+        let (device, op) = device(model());
+        let memory = Memory {
+            step: 3e-8,
+            vgstrap: -0.7,
+            vgdtrap: -2.4,
+            powr: 4e-3,
+        };
+        for memory in [None, Some(&memory)] {
+            for vgs in [-3.2, -2.3, -1.9, -1., 0., 0.4] {
+                for vds in [-3., -1.2, -0.4, -0.05, 0.05, 0.4, 1.2, 3.] {
+                    let at = |vgs: Real, vds: Real| {
+                        device.point(&op, vgs, vgs - vds, 1e-12, memory).unwrap()
+                    };
+                    let c = at(vgs, vds);
+                    let h = 1e-6;
+                    let gm = (at(vgs + h, vds).channel.0 - at(vgs - h, vds).channel.0) / (2. * h);
+                    let gds = (at(vgs, vds + h).channel.0 - at(vgs, vds - h).channel.0) / (2. * h);
+                    let scale = c.channel.1.abs().max(c.channel.2.abs()).max(1e-9);
+                    let tag = format!("{vgs} {vds} {}", memory.is_some());
+                    assert!(
+                        (gm - c.channel.1).abs() <= 1e-5 * scale,
+                        "{tag}: gm {gm} {:?}",
+                        c.channel
+                    );
+                    assert!(
+                        (gds - c.channel.2).abs() <= 1e-5 * scale,
+                        "{tag}: gds {gds} {:?}",
+                        c.channel
+                    );
+                    // d igs / d vgs at fixed vgd = ggs.
+                    let ggs = (device
+                        .point(&op, vgs + h, vgs - vds, 1e-12, memory)
+                        .unwrap()
+                        .gs
+                        .0
+                        - device
+                            .point(&op, vgs - h, vgs - vds, 1e-12, memory)
+                            .unwrap()
+                            .gs
+                            .0)
+                        / (2. * h);
+                    assert!(
+                        (ggs - c.gs.1).abs() <= 1e-5 * c.gs.1.abs() + 1e-15,
+                        "{tag}: ggs"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_channel_is_antisymmetric_without_filters() {
+        let (device, op) = device(model());
+        for (vgs, vgd) in [(-1., -1.5), (0.2, -2.), (-1.9, -1.95)] {
+            let forward = device.point(&op, vgs, vgd, 0., None).unwrap().channel.0;
+            let reverse = device.point(&op, vgd, vgs, 0., None).unwrap().channel.0;
+            assert!((forward + reverse).abs() <= 1e-15, "{vgs} {vgd}");
+        }
+    }
+
+    #[test]
+    fn statz_charge_partials_are_its_derivatives() {
+        let (device, op) = device(model());
+        for vgs in [-4., -2.1, -1., 0., 0.3, 0.6, 0.85] {
+            for vgd in [-5., -2., -0.5, 0.2, 0.7] {
+                let (_, cgs, cgd) = device.model.qgg(&op, vgs, vgd);
+                let h = 1e-7;
+                let q = |a: Real, b: Real| device.model.qgg(&op, a, b).0;
+                let ngs = (q(vgs + h, vgd) - q(vgs - h, vgd)) / (2. * h);
+                let ngd = (q(vgs, vgd + h) - q(vgs, vgd - h)) / (2. * h);
+                let scale = cgs.abs().max(cgd.abs());
+                assert!(
+                    (ngs - cgs).abs() <= 1e-6 * scale,
+                    "{vgs} {vgd}: cgs {ngs} {cgs}"
+                );
+                assert!(
+                    (ngd - cgd).abs() <= 1e-6 * scale,
+                    "{vgs} {vgd}: cgd {ngd} {cgd}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ac_load_reduces_to_the_dc_conductances_without_time_constants() {
+        let mut m = model();
+        m.taug = 0.;
+        m.taud = 0.;
+        let (device, op) = device(m);
+        let p = device.point(&op, -0.8, -3., 1e-12, None).unwrap();
+        let (gm, xgm, gds, xgds) = device.model.acload(
+            &op,
+            -0.8,
+            -3.,
+            p.channel.0 - p.gd.0,
+            1e7,
+            p.channel.1,
+            p.channel.2,
+        );
+        assert!(
+            (gm - p.channel.1).abs() <= 1e-12 * gm.abs(),
+            "{gm} {:?}",
+            p.channel
+        );
+        assert!(
+            (gds - p.channel.2).abs() <= 1e-12 * gds.abs(),
+            "{gds} {:?}",
+            p.channel
+        );
+        assert_eq!((xgm, xgds), (0., 0.));
     }
 }

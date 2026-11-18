@@ -2996,7 +2996,8 @@ pub(crate) fn load(
         if T0 >= 0.0 {
             Vdseff = Vdsat - 0.5 * (T0 + T1);
         } else {
-            T3 = (DELTA_4 + DELTA_4) / (T1 - T0);
+            let twice_delta = DELTA_4 + DELTA_4;
+            T3 = twice_delta / (T1 - T0);
             T4 = 1.0 - T3;
             T5 = Vdsat * T3 / (T1 - T0);
             Vdseff = Vdsat * T4;
@@ -3402,7 +3403,8 @@ pub(crate) fn load(
                 dVdseffCV_dVd = 0.5 * (1.0 - dT1_dVd);
                 dVdseffCV_dVb = 0.5 * (dT0_dVb - dT1_dVb);
             } else {
-                T3 = (DELTA_4 + DELTA_4) / (T1 - T0);
+                let twice_delta = DELTA_4 + DELTA_4;
+                T3 = twice_delta / (T1 - T0);
                 T4 = 1.0 - T3;
                 T5 = VdsatCV * T3 / (T1 - T0);
                 VdseffCV = VdsatCV * T4;
@@ -3607,7 +3609,8 @@ pub(crate) fn load(
                 dVdseffCV_dVd = 0.5 * (1.0 - dT1_dVd);
                 dVdseffCV_dVb = 0.5 * (dT0_dVb - dT1_dVb);
             } else {
-                T3 = (DELTA_4 + DELTA_4) / (T1 - T0);
+                let twice_delta = DELTA_4 + DELTA_4;
+                T3 = twice_delta / (T1 - T0);
                 T4 = 1.0 - T3;
                 T5 = VdsatCV * T3 / (T1 - T0);
                 VdseffCV = VdsatCV * T4;

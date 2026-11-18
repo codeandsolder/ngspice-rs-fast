@@ -775,7 +775,7 @@ impl Writer {
             ));
         }
         if designator == 'b'
-            || (matches!(designator, 'e' | 'f' | 'g' | 'h')
+            || (matches!(designator, 'e'..='h')
                 && device
                     .parameters
                     .iter()
@@ -828,7 +828,7 @@ impl Writer {
             }
         }
         match (designator, &device.model) {
-            ('v' | 'i' | 'e' | 'f' | 'g' | 'h' | 'k' | 't', Some(_)) => {
+            ('v' | 'i' | 'e'..='h' | 'k' | 't', Some(_)) => {
                 return Err(refuse("source with a model", Some(location)));
             }
             ('d' | 'q' | 'm' | 'x' | 's' | 'w' | 'j' | 'u' | 'o' | 'z' | 'y', None) => {
@@ -854,7 +854,7 @@ impl Writer {
         match designator {
             'r' | 'c' | 'l' => passive_parameters(device, &mut parts)?,
             'v' | 'i' => source_parameters(device, &mut parts)?,
-            'e' | 'f' | 'g' | 'h' => controlled_parameters(device, &mut parts)?,
+            'e'..='h' => controlled_parameters(device, &mut parts)?,
             'k' => mutual_parameters(device, &mut parts)?,
             's' | 'w' => switch_parameters(setters, designator, &mut parts)?,
             't' => tline_parameters(device, &mut parts)?,

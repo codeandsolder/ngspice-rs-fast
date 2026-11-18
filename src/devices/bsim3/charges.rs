@@ -395,7 +395,8 @@ impl ChargeModel<'_> {
                 0.5 * (dt0_dvb - dt1_dvb0),
             )
         } else {
-            let t3 = (DELTA_4 + DELTA_4) / (t1 - t0);
+            let twice_delta = DELTA_4 + DELTA_4;
+            let t3 = twice_delta / (t1 - t0);
             let t4 = 1.0 - t3;
             let t5 = vdsat_cv * t3 / (t1 - t0);
             (

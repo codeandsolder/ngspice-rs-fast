@@ -215,10 +215,16 @@ fn qggnew(
     cgs: Real,
     cgd: Real,
 ) -> (Real, Real, Real) {
-    let veroot = ((vgs - vgd) * (vgs - vgd) + vcap * vcap).sqrt();
+    let gate_difference = vgs - vgd;
+    let gate_difference_squared = gate_difference * gate_difference;
+    let vcap_squared = vcap * vcap;
+    let veroot = (gate_difference_squared + vcap_squared).sqrt();
     let veff1 = 0.5 * (vgs + vgd + veroot);
     let veff2 = veff1 - veroot;
-    let vnroot = ((veff1 - vto) * (veff1 - vto) + DEL * DEL).sqrt();
+    let overdrive = veff1 - vto;
+    let overdrive_squared = overdrive * overdrive;
+    let delta_squared = DEL * DEL;
+    let vnroot = (overdrive_squared + delta_squared).sqrt();
     let mut vnew1 = 0.5 * (veff1 + vto + vnroot);
     let vnew3 = vnew1;
     let ext = if vnew1 < VMAX {
@@ -890,98 +896,6 @@ impl Device for Mesfet {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn device(b: Real, lambda: Real) -> (Model, Operating) {
-        let model = Model {
-            pol: 1.,
-            vto: -1.5,
-            alpha: 2.5,
-            beta: 2e-3,
-            lambda,
-            b,
-            rd: 0.,
-            rs: 0.,
-            cgs: 2e-12,
-            cgd: 0.4e-12,
-            pb: 0.8,
-            is: 1e-14,
-            kf: 0.,
-            af: 1.,
-        };
-        let device = Mesfet {
-            name: "z1".into(),
-            model_name: "zm".into(),
-            terminals: vec![],
-            inner: [NodeId::GROUND; 3],
-            model,
-            instance: Instance { area: 1.5, m: 1. },
-            initial: crate::devices::initial::InstanceInitial::default(),
-        };
-        (model, device.operating().unwrap())
-    }
-
-    /// gm = dI/dvgs at fixed vds and gds = dI/dvds at fixed vgs, in every
-    /// region of both modes.
-    #[test]
-    fn channel_partials_are_the_current_derivatives() {
-        for (b, lambda) in [(0.3, 0.), (0., 0.05), (1.2, 0.02)] {
-            let (model, op) = device(b, lambda);
-            let current = |vgs: Real, vds: Real| model.channel(&op, vgs, vgs - vds).current;
-            for vgs in [-2., -1.2, -0.5, 0., 0.4] {
-                for vds in [-3., -1.5, -0.6, -0.05, 0.05, 0.6, 1.5, 3.] {
-                    let c = model.channel(&op, vgs, vgs - vds);
-                    let h = 1e-6;
-                    let gm = (current(vgs + h, vds) - current(vgs - h, vds)) / (2. * h);
-                    let gds = (current(vgs, vds + h) - current(vgs, vds - h)) / (2. * h);
-                    let scale = c.gm.abs().max(c.gds.abs()).max(1e-9);
-                    assert!((gm - c.gm).abs() <= 1e-6 * scale, "{b} {vgs} {vds}: gm");
-                    assert!((gds - c.gds).abs() <= 1e-6 * scale, "{b} {vgs} {vds}: gds");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_channel_is_antisymmetric_under_drain_source_exchange() {
-        let (model, op) = device(0.3, 0.04);
-        for (vgs, vgd) in [(-1., -1.5), (0.2, -2.), (-1.4, -1.45), (0.3, -0.5)] {
-            let forward = model.channel(&op, vgs, vgd).current;
-            let reverse = model.channel(&op, vgd, vgs).current;
-            assert!((forward + reverse).abs() <= 1e-18, "{vgs} {vgd}");
-        }
-    }
-
-    /// `qggnew`'s capacitances are its charge's partial derivatives, on both
-    /// sides of `vmax` and in both modes.
-    #[test]
-    fn statz_capacitances_are_the_charge_partials() {
-        let (model, op) = device(0.3, 0.);
-        for vgs in [-3., -1.4, -0.5, 0., 0.3, 0.6] {
-            for vgd in [-4., -1.6, -0.2, 0.2, 0.7] {
-                let (_, cgs, cgd) = model.qgg(&op, vgs, vgd);
-                let h = 1e-7;
-                let q = |a: Real, b: Real| model.qgg(&op, a, b).0;
-                let ngs = (q(vgs + h, vgd) - q(vgs - h, vgd)) / (2. * h);
-                let ngd = (q(vgs, vgd + h) - q(vgs, vgd - h)) / (2. * h);
-                let scale = cgs.abs().max(cgd.abs());
-                assert!((ngs - cgs).abs() <= 1e-6 * scale, "{vgs} {vgd}: cgs");
-                assert!((ngd - cgd).abs() <= 1e-6 * scale, "{vgs} {vgd}: cgd");
-            }
-        }
-    }
-
-    #[test]
-    fn qggnew_needs_pb_above_vmax() {
-        let (model, op) = device(0.3, 0.);
-        let low = Model { pb: 0.4, ..model };
-        let q = low.qgg(&op, 0.8, 0.8);
-        assert!(!q.0.is_finite() || !q.1.is_finite());
-    }
-}
-
 // ---------------------------------------------------------------------------
 // `.sens` (#164)
 // ---------------------------------------------------------------------------
@@ -1251,5 +1165,97 @@ impl Device for ResetMesfet {
             jfet::series_conductances(c.instance.area, c.model.rd, c.model.rs),
             [point.channel.gm, point.channel.gds, point.gs.1, point.gd.1],
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(b: Real, lambda: Real) -> (Model, Operating) {
+        let model = Model {
+            pol: 1.,
+            vto: -1.5,
+            alpha: 2.5,
+            beta: 2e-3,
+            lambda,
+            b,
+            rd: 0.,
+            rs: 0.,
+            cgs: 2e-12,
+            cgd: 0.4e-12,
+            pb: 0.8,
+            is: 1e-14,
+            kf: 0.,
+            af: 1.,
+        };
+        let device = Mesfet {
+            name: "z1".into(),
+            model_name: "zm".into(),
+            terminals: vec![],
+            inner: [NodeId::GROUND; 3],
+            model,
+            instance: Instance { area: 1.5, m: 1. },
+            initial: crate::devices::initial::InstanceInitial::default(),
+        };
+        (model, device.operating().unwrap())
+    }
+
+    /// gm = dI/dvgs at fixed vds and gds = dI/dvds at fixed vgs, in every
+    /// region of both modes.
+    #[test]
+    fn channel_partials_are_the_current_derivatives() {
+        for (b, lambda) in [(0.3, 0.), (0., 0.05), (1.2, 0.02)] {
+            let (model, op) = device(b, lambda);
+            let current = |vgs: Real, vds: Real| model.channel(&op, vgs, vgs - vds).current;
+            for vgs in [-2., -1.2, -0.5, 0., 0.4] {
+                for vds in [-3., -1.5, -0.6, -0.05, 0.05, 0.6, 1.5, 3.] {
+                    let c = model.channel(&op, vgs, vgs - vds);
+                    let h = 1e-6;
+                    let gm = (current(vgs + h, vds) - current(vgs - h, vds)) / (2. * h);
+                    let gds = (current(vgs, vds + h) - current(vgs, vds - h)) / (2. * h);
+                    let scale = c.gm.abs().max(c.gds.abs()).max(1e-9);
+                    assert!((gm - c.gm).abs() <= 1e-6 * scale, "{b} {vgs} {vds}: gm");
+                    assert!((gds - c.gds).abs() <= 1e-6 * scale, "{b} {vgs} {vds}: gds");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_channel_is_antisymmetric_under_drain_source_exchange() {
+        let (model, op) = device(0.3, 0.04);
+        for (vgs, vgd) in [(-1., -1.5), (0.2, -2.), (-1.4, -1.45), (0.3, -0.5)] {
+            let forward = model.channel(&op, vgs, vgd).current;
+            let reverse = model.channel(&op, vgd, vgs).current;
+            assert!((forward + reverse).abs() <= 1e-18, "{vgs} {vgd}");
+        }
+    }
+
+    /// `qggnew`'s capacitances are its charge's partial derivatives, on both
+    /// sides of `vmax` and in both modes.
+    #[test]
+    fn statz_capacitances_are_the_charge_partials() {
+        let (model, op) = device(0.3, 0.);
+        for vgs in [-3., -1.4, -0.5, 0., 0.3, 0.6] {
+            for vgd in [-4., -1.6, -0.2, 0.2, 0.7] {
+                let (_, cgs, cgd) = model.qgg(&op, vgs, vgd);
+                let h = 1e-7;
+                let q = |a: Real, b: Real| model.qgg(&op, a, b).0;
+                let ngs = (q(vgs + h, vgd) - q(vgs - h, vgd)) / (2. * h);
+                let ngd = (q(vgs, vgd + h) - q(vgs, vgd - h)) / (2. * h);
+                let scale = cgs.abs().max(cgd.abs());
+                assert!((ngs - cgs).abs() <= 1e-6 * scale, "{vgs} {vgd}: cgs");
+                assert!((ngd - cgd).abs() <= 1e-6 * scale, "{vgs} {vgd}: cgd");
+            }
+        }
+    }
+
+    #[test]
+    fn qggnew_needs_pb_above_vmax() {
+        let (model, op) = device(0.3, 0.);
+        let low = Model { pb: 0.4, ..model };
+        let q = low.qgg(&op, 0.8, 0.8);
+        assert!(!q.0.is_finite() || !q.1.is_finite());
     }
 }

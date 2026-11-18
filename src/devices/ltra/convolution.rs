@@ -107,9 +107,10 @@ fn twiceintlinfunc(
     let mut dummy = lovalue
         * ((hilimit - otherlolimit) * (hilimit - otherlolimit)
             - (lolimit - otherlolimit) * (lolimit - otherlolimit));
+    let temp3_squared = temp3 * temp3;
     dummy += m
         * ((temp1 * temp1 * temp1 - temp2 * temp2 * temp2) / 3.0
-            - temp3 * temp3 * (hilimit - lolimit));
+            - temp3_squared * (hilimit - lolimit));
     dummy * 0.5
 }
 

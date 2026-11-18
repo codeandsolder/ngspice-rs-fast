@@ -191,9 +191,10 @@ impl Pade {
             + (9. * b * b + 3. * a * a) * y1 * y2
             + 0.5 * t * y3)
             / delta;
+        let y2_squared = y2 * y2;
         let y5 = (12. * a * a * y1 * y1 * y1 * y1
             + y1 * y1 * y2 * (18. * b * b - 18. * a * a)
-            + (9. * b * b + 3. * a * a) * (y2 * y2 + y1 * y3)
+            + (9. * b * b + 3. * a * a) * (y2_squared + y1 * y3)
             + (3. * b * b + a * a) * y1 * y3
             + 0.5 * t * y4)
             / delta;
@@ -209,7 +210,9 @@ impl Pade {
         }
         // exp_pade(): expansion of exp(-length*sqrt((sL+R)(sC+G))).
         let y1 = 0.5 * (a + b);
-        let y2 = a * b - y1 * y1;
+        let ab = a * b;
+        let y1_squared = y1 * y1;
+        let y2 = ab - y1_squared;
         let y3 = -3. * y1 * y2;
         let y4 = -3. * y2 * y2 - 4. * y1 * y3;
         let y5 = -5. * y1 * y4 - 10. * y2 * y3;
@@ -253,9 +256,13 @@ impl Pade {
             let mut sum = 0.;
             if pair {
                 let [u, v, w] = h.h2;
-                sum += u.c / (t.x - u.x)
-                    + 2. * (v.c * t.x - w.x * w.c - v.x * v.c)
-                        / (t.x * t.x - 2. * v.x * t.x + v.x * v.x + w.x * w.x);
+                let single_pole = u.c / (t.x - u.x);
+                let v_residue = v.c * t.x;
+                let w_residue = w.x * w.c;
+                let v_shifted_residue = v.x * v.c;
+                let pair_numerator = v_residue - w_residue - v_shifted_residue;
+                sum += single_pole
+                    + 2. * pair_numerator / (t.x * t.x - 2. * v.x * t.x + v.x * v.x + w.x * w.x);
             } else {
                 for u in h.h2 {
                     sum += u.c / (t.x - u.x);

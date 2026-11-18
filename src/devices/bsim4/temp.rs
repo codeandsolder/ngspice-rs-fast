@@ -1858,7 +1858,8 @@ pub(crate) fn temperature_instance(
             TempRatioeot = m.tempeot / m.tnom - 1.0;
             T0 = sqrt(1.0 + p.lpe0 / m.leffeot);
             T1 = p.k1ox * (T0 - 1.0) * sqrt(phieot) + (p.kt1 + p.kt1l / m.leffeot) * TempRatioeot;
-            Vth_NarrowW = toxe * phieot / (m.weffeot + p.w0);
+            let width_with_offset = m.weffeot + p.w0;
+            Vth_NarrowW = toxe * phieot / width_with_offset;
             Lpe_Vb = sqrt(1.0 + p.lpeb / m.leffeot);
             Vth = f64::from(m.r#type) * h.vth0 + (p.k1ox - p.k1) * sqrt(phieot) * Lpe_Vb
                 - Delt_vth
