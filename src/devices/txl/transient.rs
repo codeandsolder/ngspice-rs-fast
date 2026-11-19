@@ -2,6 +2,13 @@
 //! C keeps two mutable TXLine snapshots and advances one on the next load.
 //! Here each accepted sample carries the snapshot; trials are pure and a
 //! rejected trial cannot change convolutions, interpolation cursors or history.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use super::Txl;
 use super::pade::Term;
 use crate::devices::delay::{DelayContext, DelayHistory, DelayLine, DelayUpdate};

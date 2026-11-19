@@ -36,6 +36,13 @@
 //!   the card gave both; `hfet2ask.c` has no `HFET2_M` case, so C reports no
 //!   multiplier column.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::devices::initial::{InstanceInitial, split};
 use crate::devices::jfet::{BOLTZMANN, CHARGE, p};
 use crate::devices::limiting;

@@ -40,6 +40,13 @@
 //!   the model records in `sens`, including the scaled DELTA ask/raw setter
 //!   mismatch and zero columns for the three table-only model setters.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 mod sens;
 
 use crate::devices::mos::{

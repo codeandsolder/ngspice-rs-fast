@@ -19,6 +19,13 @@
 //! returned, as in C; a determinant that vanishes at every trial is C's
 //! `E_SHORT`.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::maths::Matrix;
 use crate::maths::linear::numerical;
 use crate::maths::sparse13::{Sparse, Status};

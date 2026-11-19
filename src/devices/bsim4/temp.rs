@@ -5,6 +5,12 @@
 //! Ported statement by statement from BSIM4 4.8.3 (`b4temp.c`, Copyright
 //! (c) 2025 University of California, Educational Community License 2.0);
 //! C's member and local names are kept so the port can be read against it.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
 #![expect(
     non_snake_case,
     reason = "preserves upstream C identifiers for equation-by-equation comparison"

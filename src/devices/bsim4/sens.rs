@@ -36,6 +36,12 @@
 //!   writes, hold what an earlier analysis's `MODEINITSMSIG` load left (zero
 //!   when none ran). Each parameter's AC load reads those, the reset's
 //!   `CKTstate0`, and the setup/temperature members of the present records.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
 #![expect(
     non_snake_case,
     reason = "preserves upstream C identifiers for equation-by-equation comparison"

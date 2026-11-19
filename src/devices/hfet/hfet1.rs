@@ -37,6 +37,13 @@
 //!   port's scalar schema: use the `nhfet`/`phfet` flag or the card base, which
 //!   C resolves the same way.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::devices::initial::{InstanceInitial, split};
 use crate::devices::jfet::{self, BOLTZMANN, CHARGE, p};
 use crate::devices::limiting;

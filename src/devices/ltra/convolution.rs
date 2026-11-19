@@ -16,6 +16,13 @@
 //! (`bessI0`, `bessI1`, `bessI1xOverX`); `erfc` is a separate implementation
 //! (see [`erfc`]).
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use std::f64::consts::PI;
 
 use crate::primitives::Real;

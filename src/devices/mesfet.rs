@@ -66,6 +66,13 @@
 //! `.disto` (`mesdset.c`, `mesdisto.c`) and `.sens` fail with explicit
 //! errors.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::devices::jfet::{self, BOLTZMANN, CHARGE, REFTEMP, p};
 use crate::devices::limiting;
 use crate::devices::noise::{

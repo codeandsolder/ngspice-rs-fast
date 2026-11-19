@@ -15,6 +15,12 @@
 //! - C's bypass branch (`goto line755`/`line850` when `CKTbypass` is set) is
 //!   not compiled: the port runs with `bypass = 0`, C's default, so `ByPass`
 //!   stays 0 (`NOBYPASS` path), and `NEWCONV` is defined as in C.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
 #![expect(
     non_snake_case,
     reason = "preserves upstream C identifiers for equation-by-equation comparison"

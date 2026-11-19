@@ -1,5 +1,12 @@
 //! Shared classic-MOS sensitivity lifecycle. Each level supplies its own
 //! `mosX.c` tables, model fields and `mosXtemp.c` process stores.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use super::{CELSIUS_TO_KELVIN, Common, MosLevel, Mosfet};
 use crate::devices::ModelContext;
 use crate::devices::sensitivity::{

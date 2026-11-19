@@ -91,6 +91,13 @@
 //!   as the operating point it copied into them (`ltraload.c`
 //!   `MODEINITTRAN`); the port offers no instance observations.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 pub mod convolution;
 
 use crate::devices::delay::{DelayContext, DelayHistory, DelayLine, DelayUpdate};

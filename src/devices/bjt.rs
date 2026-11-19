@@ -43,6 +43,13 @@
 //! later loads apply `DEVpnjlim`
 //! to `vbe`, `vbc` and `vsub`. C's `MODEINITPRED` extrapolation, bypass and
 //! the quasi-saturation `vbcx`/`vrci` limits (a rejected model) are not ported.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 mod disto;
 
 use crate::devices::limiting::{self, Limiter, Linearization};

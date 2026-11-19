@@ -43,6 +43,13 @@
 //! error naming `jfetnoi.c`/`jfetdist.c` rather than contributing nothing.
 //! `.sens` is ported (#164) through [`JfetSensitivity`].
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::devices::limiting;
 use crate::devices::nonlinear::{JunctionPoint, junction_companion};
 use crate::devices::schema::{

@@ -68,6 +68,13 @@
 //! `RSPERL` without `ISPERL` is accepted and has no effect, exactly as in C
 //! (it only parameterises the generated diode model).
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use std::collections::BTreeSet;
 
 use crate::devices::linear::LinearContext;

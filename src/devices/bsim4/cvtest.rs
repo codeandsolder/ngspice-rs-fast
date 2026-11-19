@@ -1,5 +1,11 @@
 //! `b4cvtest.c` (`BSIM4convTest`): the device convergence test, followed
 //! statement by statement over C's struct members.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
 #![expect(
     non_snake_case,
     reason = "preserves upstream C identifiers for equation-by-equation comparison"

@@ -63,6 +63,13 @@
 //! `.noise` (`jfet2noi.c`), `.disto` (C has no `DEVdisto` for level 2) and
 //! `.sens` fail with explicit errors.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::devices::jfet::{
     self, IC_COMPONENTS, Instance, Junctions, K_OVER_Q, Loaded, p, required,
 };

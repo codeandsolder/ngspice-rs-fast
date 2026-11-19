@@ -55,6 +55,13 @@
 //! under `uic` (`mos1ic.c`) and are zero otherwise. An `off` instance starts
 //! at zero and is held there through `MODEINITFIX`.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 pub(super) mod sens;
 
 use std::cell::OnceCell;

@@ -5,6 +5,13 @@
 //! caller-supplied list instead, which the setup stages turn into
 //! diagnostics.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 /// `BSIM4NumFingerDiff`: the numbers of interior and end source/drain
 /// diffusions `(nuIntD, nuEndD, nuIntS, nuEndS)` for `nf` fingers.
 fn num_finger_diff(nf: f64, min_sd: i32) -> (f64, f64, f64, f64) {

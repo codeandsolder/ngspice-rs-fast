@@ -7,6 +7,13 @@
 //! `2`/`3`/`6` combine the strong-inversion and weak-inversion flicker
 //! densities. Values outside 1..6 leave C's `noizDens` uninitialized, so they
 //! are refused here instead of being given a substitute law.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use super::charges::ChargeEvaluation;
 use super::dc::DcEvaluation;
 use super::defaults::ModelDefaults;

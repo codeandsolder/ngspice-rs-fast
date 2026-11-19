@@ -2,6 +2,13 @@
 //! `y_pade`, `exp_pade`, `get_h3` and `update_h1C_c`.
 //! Local arrays replace C's file-global scratch variables. Setup failures
 //! return contextual errors instead of terminating the process.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 
 #[derive(Debug, Clone, Copy, Default)]

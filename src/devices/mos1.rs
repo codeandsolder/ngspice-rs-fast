@@ -21,6 +21,13 @@
 //! by `sens` and the shared MOS record lifecycle: process-derived values and
 //! the given flags left by restoration follow `mos1set.c`/`mos1temp.c`.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 mod disto;
 mod sens;
 

@@ -7,6 +7,12 @@
 
 // The statement-by-statement transcription (fields assigned in C's order,
 // later ones reading earlier ones) is deliberate.
+// The source C derivative formulas retain their exact multiply/add order:
+// replacing them with fused operations changes the rounded Taylor terms.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "C Dderivs rounding parity requires the original multiplication and addition order"
+)]
 #![expect(
     clippy::suspicious_operation_groupings,
     reason = "mixed partial derivatives are intentional in the source C tensor equations"

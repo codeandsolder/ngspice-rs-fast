@@ -38,6 +38,13 @@
 //! one; and `SearchForSingleton` stops on a structurally missing diagonal,
 //! which is where ngspice's version either breaks or dereferences `NULL`.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::primitives::Complex;
 
 const NONE: usize = usize::MAX;

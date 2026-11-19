@@ -5,6 +5,12 @@
 //! The analysis owns gains, `Nintegrate` and the output columns; this file
 //! reproduces what C passes to `NevalSrc`/`NevalSrc2` and the flicker factor
 //! it multiplies the `N_GAIN` gain by, in C's order and arithmetic.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
 #![expect(
     non_snake_case,
     reason = "preserves upstream C identifiers for equation-by-equation comparison"

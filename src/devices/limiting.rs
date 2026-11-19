@@ -42,6 +42,13 @@
 //! The last rule of the numbered list is how limiting stays compatible with the port's
 //! physical-residual convergence test: a converged iterate is always reloaded
 //! with limiting inactive, i.e. exactly at the returned solution.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::devices::{DeviceState, IterationPhase};
 use crate::primitives::{Real, SpiceResult};
 

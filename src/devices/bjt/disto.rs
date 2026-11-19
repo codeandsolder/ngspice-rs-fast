@@ -31,6 +31,13 @@
 //! phase itself (`PTF`) is rejected at instantiation, so the delayed `vbe`
 //! control equals `vbe`.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::devices::distortion::deriv::Dderivs;
 use crate::devices::distortion::{
     Control, DeviceDistortion, DistortionContext, DistortionTerm, Response, Taylor,

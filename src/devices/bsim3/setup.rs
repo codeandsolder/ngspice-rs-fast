@@ -2,6 +2,13 @@
 //! size-dependent and temperature-dependent parameters, and `b3check.c`'s
 //! model/instance diagnostics. This is geometry and parameter setup only: no
 //! nodes are interned, no states are allocated and no load equations run.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use std::collections::BTreeMap;
 
 use super::defaults::ModelDefaults;

@@ -10,6 +10,13 @@
 //! Every output keeps C's sign convention: charges on the gate, bulk and
 //! drain and the nine `c*xb` capacitance derivatives, before the multiplicity
 //! multiplier and before the overlap-charge adjustment the caller performs.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use super::dc::{Bias, DcEvaluation};
 use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
