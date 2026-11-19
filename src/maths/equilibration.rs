@@ -217,16 +217,18 @@ const fn component_max(v: Complex) -> f64 {
 /// Exact `floor(log2(v))` of a positive finite value, including subnormal
 /// inputs; no libm rounding near powers of two can alter the chosen factors.
 fn floor_log2(v: f64, what: &str) -> SpiceResult<i32> {
-    if v == 0.0 || !v.is_finite() {
+    if v <= 0.0 || !v.is_finite() {
         return Err(numerical(
             "equilibration",
-            format!("all-zero/non-finite {what}"),
+            format!("nonpositive/non-finite {what}"),
         ));
     }
     let bits = v.to_bits();
-    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let biased = i32::try_from((bits >> 52) & 0x7ff).expect("binary64 exponent is at most 2047");
     Ok(if biased == 0 {
-        63 - (bits.leading_zeros() as i32) - 1074
+        let leading =
+            i32::try_from(bits.leading_zeros()).expect("binary64 has at most 64 leading zeros");
+        63 - leading - 1074
     } else {
         biased - 1023
     })
@@ -656,5 +658,38 @@ impl EquilibratedComplexLu {
     /// Invalid dimensions/values, residual arithmetic overflow or excessive error.
     pub fn check_residual(&self, rhs: &[Complex], x: &[Complex]) -> SpiceResult<BackwardError> {
         check_residual(self.scaling.rows.len(), &self.original, rhs, x)
+    }
+}
+
+#[cfg(test)]
+mod floor_log2_tests {
+    use super::floor_log2;
+
+    #[test]
+    fn exact_exponent_boundaries_and_invalid_signs() {
+        for (value, exponent) in [
+            (f64::from_bits(1), -1074),
+            (f64::from_bits(2), -1073),
+            (f64::from_bits(f64::MIN_POSITIVE.to_bits() - 1), -1023),
+            (f64::MIN_POSITIVE, -1022),
+            (0.5, -1),
+            (1., 0),
+            (f64::from_bits(1f64.to_bits() - 1), -1),
+            (2., 1),
+            (f64::MAX, 1023),
+        ] {
+            assert_eq!(floor_log2(value, "test").unwrap(), exponent, "{value:?}");
+        }
+        for value in [
+            0.,
+            -0.,
+            -1.,
+            -f64::MIN_POSITIVE,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert!(floor_log2(value, "test").is_err(), "{value:?}");
+        }
     }
 }
