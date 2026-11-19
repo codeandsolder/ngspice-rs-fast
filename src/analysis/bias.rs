@@ -813,6 +813,8 @@ pub(crate) fn branch_rows(circuit: &Circuit) -> Vec<bool> {
     kinds
 }
 
+/// Constraints applied to node rows during a DC operating-point solve.
+///
 /// Node rows a DC solve forces in its loads, the exact form of `cktload.c`'s
 /// `.nodeset`/`.ic` stamping: each listed row's equation is replaced by
 /// `x[row] = value * scale`, where `scale` is the source-stepping factor
@@ -949,6 +951,8 @@ pub fn solve_dc_with(
     )
 }
 
+/// Run a DC solve with initial-condition and nodeset row constraints.
+///
 /// [`solve_dc_with`] with `.ic`/`.nodeset` row forcing ([`NodeForcing`]) in
 /// every Newton load of every strategy. The returned point satisfies the
 /// forced `.ic` rows and the physical equations of every other row; the
@@ -980,6 +984,8 @@ pub fn solve_dc_forced(
     )
 }
 
+/// Continue a DC solve from an accepted previous state.
+///
 /// [`solve_dc_forced`] continuing an accepted state `history` (C `CKTstate1..`),
 /// starting the direct Newton attempt in `policy`'s phase: a DC sweep point
 /// after the first runs [`PhasePolicy::Predicted`] (`dctrcurv.c` sets

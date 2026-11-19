@@ -31,6 +31,8 @@ use crate::maths::sparse13::{Scalar, Sparse, Status};
 use crate::maths::{Matrix, Pattern, SparseMatrix, Vector};
 use crate::primitives::{SpiceError, SpiceResult};
 
+/// Sparse pivot tolerances used when ordering a circuit matrix.
+///
 /// SPARSE threshold-pivoting limits for ordering a circuit matrix: C's
 /// `CKTpivotAbsTol` (`.options pivtol`) and `CKTpivotRelTol` (`.options
 /// pivrel`), passed to every `SMPreorder`/`SMPcReorder` (`niiter.c`,
@@ -317,6 +319,8 @@ impl SparseSymbolic {
     }
 }
 
+/// Solve a sparse matrix, reusing a compatible pivot ordering.
+///
 /// Solves `matrix x = rhs`, refactoring with `ordering`'s pivots when the
 /// pattern is unchanged (`SMPluFac`) and ordering afresh otherwise
 /// (`SMPreorder`), then keeps the new factors' order for the next call. The
@@ -634,6 +638,8 @@ fn ni_step(
     result
 }
 
+/// Solve with a circuit's retained sparse matrix factors.
+///
 /// `SMPsolve` with the factors a circuit pattern's frame holds now: those of
 /// the last factorization of the circuit matrix (after `CKTop`, the last
 /// `NIiter` pass's load), as `.tf` (`tfanal.c`) solves its unit excitations.

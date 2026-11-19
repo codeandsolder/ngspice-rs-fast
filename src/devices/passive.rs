@@ -34,6 +34,7 @@ use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 /// Immutable validated input recipe, not a mutable temperature-adjusted cache.
+///
 /// Explicit instance values override model defaults; model-specific geometry
 /// precedence is preserved. Derived values are recomputed for every context.
 #[derive(Debug, Clone, PartialEq)]

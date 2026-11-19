@@ -59,6 +59,8 @@ pub struct PencilRoots {
     pub roots: Vec<Complex>,
 }
 
+/// One device's contribution to a pole-zero matrix element.
+///
 /// One device's pole-zero contribution to one matrix element, as a C
 /// `DEVpzLoad` adds it: `*elt += g + c * s.real` and `*(elt + 1) += c *
 /// s.imag` (`diopzld.c`), `*elt += g` alone (`respzld.c`) or `c * s.real`
@@ -87,6 +89,8 @@ impl PencilTerm {
     }
 }
 
+/// Construct and load the pole-zero matrix at a trial complex frequency.
+///
 /// The matrix `CKTpzSetup` builds and `CKTpzLoad` (`cktpzld.c`) loads at
 /// each trial `s`: the elements are created in order (the circuit's setup
 /// elements, then the drive), every trial clears them, adds the device

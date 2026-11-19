@@ -60,6 +60,8 @@ impl TransientTiming {
     }
 }
 
+/// Parsed PULSE fields before analysis-specific timing defaults are resolved.
+///
 /// A PULSE as written: omitted trailing fields stay `None` until an analysis
 /// supplies [`TransientTiming`]. Fields must be supplied as a contiguous prefix
 /// (`delay`, `rise`, `fall`, `width`, `period`), as in the netlist syntax.

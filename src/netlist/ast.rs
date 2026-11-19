@@ -165,6 +165,8 @@ impl SourceFunction {
     }
 }
 
+/// One parsed source-function setter and its supplied coefficients.
+///
 /// One SIN/EXP/SFFM/AM setter: its function and the supplied fields in C
 /// coefficient order. Omitted trailing fields are simply absent; defaults that
 /// depend on `.tran` (`CKTstep`, `CKTfinalTime`) belong to elaboration.
@@ -318,6 +320,8 @@ pub struct LibrarySection {
     pub closing: crate::netlist::card::RawCard,
 }
 
+/// A source-ordered .param card whose expressions remain unevaluated.
+///
 /// A `.param` card: one or more `name = expression` assignments in source
 /// order (C's `inp_split_multi_param_lines()` splits them the same way).
 /// Duplicates are kept; later assignments override earlier ones only during
@@ -965,6 +969,8 @@ impl MeasureWindow {
 /// `1..=9` (`fourier()` in `src/frontend/fourier.c`).
 pub const DEFAULT_HARMONICS: u32 = 9;
 
+/// The bounded Fourier harmonic count and associated sampling budget.
+///
 /// The port's bounded harmonic count, and with it the resampling work budget:
 /// harmonic `n` resamples the period onto `4 * max(n, 50)` subintervals, so the
 /// widest grid this port builds is `4 * MAX_HARMONICS` subintervals per vector
@@ -1009,6 +1015,8 @@ pub struct FourierCard {
     pub location: SourceLoc,
 }
 
+/// One ordered syntax card with an index into its owning scope.
+///
 /// One ordered card in its owning scope. Indexes address that scope's typed
 /// vectors, so semantic values are not duplicated. Source cards remain intact
 /// for future serializers/snapshots; neither is implemented by this storage.
@@ -1070,6 +1078,8 @@ pub enum ScopedCardKind {
     End,
 }
 
+/// A semantic deck containing scoped syntax and deferred expressions.
+///
 /// A semantic deck container. Scoped syntax and file resolution do not imply
 /// flattening, parameter evaluation or simulation. `.param` cards are parsed
 /// but unevaluated; `.option` cards are applied by `crate::analysis::RunConfig`,

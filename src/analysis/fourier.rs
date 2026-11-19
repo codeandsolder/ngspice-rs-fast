@@ -681,6 +681,7 @@ pub fn resolve_with_settings(
 }
 
 /// Evaluate the configured DFT with well-conditioned local Lagrange interpolation.
+///
 /// This library alternative avoids C's absolute-coordinate fit fallback and its
 /// stale high-degree coefficient tail; it deliberately does not reproduce that error.
 ///

@@ -3,6 +3,7 @@
 use crate::primitives::Real;
 
 /// Fits the unique polynomial through distinct finite samples in absolute coordinates.
+///
 /// Uses partial-pivot Gaussian elimination; returns `None` on zero pivots,
 /// nonfinite arithmetic, mismatched inputs or more than 17 coefficients.
 #[must_use]

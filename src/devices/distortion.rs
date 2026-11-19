@@ -126,6 +126,8 @@ impl Control {
     }
 }
 
+/// Second- and third-order coefficients of a controlled function.
+///
 /// Second- and third-order Taylor coefficients of a function of the controls
 /// `x`, `y`, `z` (C's `cxx`, ..., `cxyz` arguments of `dloadfns.c`): the
 /// function's expansion is `xx x^2 + yy y^2 + ... + xy x y + ... + xxx x^3 +

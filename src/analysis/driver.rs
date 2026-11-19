@@ -25,6 +25,8 @@ use crate::primitives::{AnalysisKind, Real, SourceLoc, SpiceError, SpiceResult};
 use crate::analysis::C_REFERENCE_ANALYSIS;
 use crate::analysis::results::{Plot, PointSink};
 
+/// One located and evaluated initial-condition or nodeset assignment.
+///
 /// One evaluated `.ic` or `.nodeset` entry, `V(node)=value`, as the analyses
 /// receive it: the canonical node name, the finite value in volts and where the
 /// entry was written. Duplicates are kept in deck order; the last entry for a

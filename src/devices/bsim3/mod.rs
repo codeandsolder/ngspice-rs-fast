@@ -1,7 +1,9 @@
 //! BSIM3v3.3 input plumbing (B3-0 foundation, #90).
 //!
-//! This is deliberately **not a simulation backend**. The generated `IFparm`
-//! interface facts cover the complete model/instance tables; the validated
+//! This is deliberately **not a simulation backend**.
+//!
+//! The generated `IFparm` interface facts cover the complete model/instance
+//! tables; the validated
 //! projection applies ordered explicit setters and preserves provenance, and
 //! [`defaults`], [`temperature`] and [`setup`] reproduce `b3set.c`/`b3temp.c`
 //! defaults and `b3check.c` diagnostics, including effective geometry. Every
@@ -55,6 +57,8 @@ fn bsim3_model_real(p: &Parameter, value: Real, location: &SourceLoc) -> SpiceRe
 }
 
 /// DC channel and junction evaluation from `b3ld.c`.
+///
+/// The module retains the native charge and junction-capacitance equations.
 pub mod charges;
 pub mod dc;
 /// Model-only setup defaults and diagnostics, before geometry/temperature setup.
@@ -67,11 +71,15 @@ pub mod noise;
 /// Generated `IFparm` order, identifiers and setter/given-field mappings.
 pub mod parameters;
 /// Effective geometry, size-dependent parameters and `b3check.c` diagnostics.
+///
+/// The module validates setup without allocating state or matrix rows.
 pub mod setup;
 mod size_data;
 /// Model-level temperature processing from `b3temp.c`.
 pub mod temperature;
 
+/// Select a BSIM3 implementation from the first VERSION token.
+///
 /// Select the BSIM3 directory from the **first** VERSION token, as
 /// `inpdomod.c`/`INPfindVer` do. The eventual string setter still has last-set
 /// precedence. Only the 3.3 family is being ported; no older model is substituted.

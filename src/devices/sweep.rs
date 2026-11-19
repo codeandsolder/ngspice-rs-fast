@@ -139,6 +139,8 @@ impl InstanceOverride {
     }
 }
 
+/// Real instance parameters that can be targets of a DC sweep.
+///
 /// Settable real instance parameters of the C devices this port elaborates,
 /// as `DCTfindInstParam` (`dctrcurv.c`) accepts them: `IF_SET | IF_REAL`
 /// entries of each device's `*pTable` (`res.c`, `cap.c`, `ind.c`, `vsrc.c`,

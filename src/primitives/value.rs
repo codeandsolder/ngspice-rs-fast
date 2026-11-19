@@ -379,6 +379,8 @@ pub fn exact_nonnegative_integer<T: TryFrom<u128>>(value: Real) -> Option<T> {
     T::try_from(value as u128).ok()
 }
 
+/// Parse numeric literals and unit suffixes accepted by numparam.
+///
 /// Parses a number inside a `.param`/`{...}` expression as numparam's
 /// `fetchnumber()` (`xpressn.c`) does: `sscanf("%lG")` (the correctly rounded
 /// decimal value, `e`/`E` exponents only) times `parseunit()`'s multiplier

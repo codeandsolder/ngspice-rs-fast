@@ -1,4 +1,5 @@
 //! Device observations from the same physical loads used by the solver.
+//!
 //! C: `frontend/outitf.c`, `spiceif.c::if_getparam`, device `*ask.c` routines.
 //! Loads are disposable; no observation accepts state or advances history.
 use crate::devices::{Circuit, Device, IterationPhase, LoadRequest, ModelContext};

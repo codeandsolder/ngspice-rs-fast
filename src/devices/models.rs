@@ -129,6 +129,8 @@ impl ModelFamily {
     }
 }
 
+/// Keep model-backend selection separate from model parameter setters.
+///
 /// Backend selection is distinct from ordered model setters. Only diode has a
 /// `level` integer setter in the initial family tables; BJT/MOS/passive `level`
 /// assignments are selector-only (inpgmod.c consumes them without setting data).
@@ -144,6 +146,8 @@ pub struct LevelSelection {
     pub applied: Option<u8>,
 }
 
+/// Immutable access to a deck's top-level model declarations.
+///
 /// Immutable lookup over one deck's top-level declarations. Duplicate names
 /// retain the *first* card as `INPmakeMod` does; all cards stay visible in the AST.
 /// No validation of a shadowed card is implied, nor any cross-deck state.

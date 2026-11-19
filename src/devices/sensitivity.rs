@@ -114,6 +114,8 @@ pub enum ParameterScope {
     Instance,
 }
 
+/// A real device parameter available to sensitivity analysis.
+///
 /// One entry of a C `IFparm` table that `set_param()` (`cktsgen.c`) accepts:
 /// flagged `IF_SET|IF_ASK|IF_REAL`, neither `IF_VECTOR`, `IF_REDUNDANT` nor
 /// `IF_NONSENSE`, and asked successfully by the device's `DEVask`. Tables list

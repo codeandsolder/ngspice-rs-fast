@@ -206,6 +206,8 @@ pub struct DelayUpdate {
     pub breakpoints: Vec<Real>,
 }
 
+/// Transient step-size history supplied to delay devices.
+///
 /// The step sizes a delay device sees, C `CKTdeltaOld[0..3]`: during a trial
 /// `[trial step, previous accepted step, the one before]`, at acceptance
 /// `[accepted step, previous accepted step, the one before]`. Steps that do

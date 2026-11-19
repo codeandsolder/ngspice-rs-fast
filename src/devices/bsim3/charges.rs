@@ -1,5 +1,7 @@
 //! BSIM3v3.3 charge (C-V) model, a port of `b3ld.c`'s charge block.
 //!
+//! The supported charge path is BSIM3 `capMod == 3`.
+//!
 //! This ports the `capMod == 3` path (C's default, the "charge thickness"
 //! model): the C-V preamble (`VbseffCV`, `CoxWL`, the `noff`/`voffcv`
 //! `Vgsteff`), the CTM charge/capacitance block, bias-dependent overlap

@@ -575,6 +575,8 @@ fn lower_table(device: &DeviceInstance) -> SpiceResult<Vec<DeviceInstance>> {
     Ok(out)
 }
 
+/// Generate SPICE2 polynomial exponents in coefficient order.
+///
 /// Exponent vectors of the SPICE2 polynomial terms in coefficient order
 /// (after the constant): total degree ascending, then lexicographically
 /// descending, which is the sequence `nxtpwr()` generates (`a`, `b`, `a²`,
@@ -728,6 +730,8 @@ fn lower_poly(device: &DeviceInstance) -> SpiceResult<DeviceInstance> {
     ))
 }
 
+/// Resolve a behavioural expression against a parameter scope.
+///
 /// Resolves a behavioural expression against a parameter scope: `.param`
 /// names become numbers, `.func` calls are expanded, numparam `{...}` values
 /// are evaluated and (outside verbatim text) literals are rounded like C's

@@ -76,6 +76,8 @@ pub fn model_name_match(reference: &str, model_name: &str) -> Option<NameMatch> 
     }
 }
 
+/// Check whether a MOS model supports model binning.
+///
 /// Whether C would consider this card for binning: an `nmos`/`pmos`/`nsoi`/
 /// `psoi` card whose first `level` rounds (as `INPfindLev`) into
 /// [`BINNABLE_MOS_LEVELS`]. A missing level is 1. Version strings are not

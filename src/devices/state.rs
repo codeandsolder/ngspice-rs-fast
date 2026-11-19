@@ -69,6 +69,8 @@ use crate::devices::delay::{DelayHistory, DelayUpdate};
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
+/// Number of accepted state vectors retained for transient integration.
+///
 /// Number of accepted state vectors retained (C `CKTstate1..CKTstate7` for
 /// `maxord=6`; `cktsetup.c` allocates `max(2, maxord) + 2` vectors): enough
 /// for Gear order-6 integration (six accepted charges) and its

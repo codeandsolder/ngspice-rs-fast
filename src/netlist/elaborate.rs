@@ -140,6 +140,8 @@ fn resolved<'a>(entries: impl Iterator<Item = &'a NodeHint>) -> Vec<ResolvedNode
         .collect()
 }
 
+/// Format an evaluated parameter for insertion back into a netlist.
+///
 /// Spell an evaluated value as numparam splices it back into the card
 /// (`double_to_string`, `xpressn.c`: `"% 23.15e"`, without the padding).
 /// Reading the text back with [`crate::primitives::parse_spice_number`]
@@ -235,6 +237,8 @@ pub fn literalize_with(
     })
 }
 
+/// Evaluate .ic and .nodeset entries without elaborating the whole deck.
+///
 /// Evaluates only the `.ic` and `.nodeset` entries against `scope`, returning
 /// literalized copies of those cards (`.ic` first, `.nodeset` second) without
 /// elaborating the rest of the deck. Order and duplicates are preserved.

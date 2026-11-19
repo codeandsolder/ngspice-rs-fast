@@ -494,6 +494,8 @@ pub const INSTANCE: &[Parameter] = &[
     Parameter::new("capbs", "capbs", 781, "BSIM3_CAPBS", None, None, InputType::Real, Access::Output, false),
 ];
 
+/// Parameters flagged `IF_UNINTERESTING` in the C interface table.
+///
 /// Entries C marks `IF_UNINTERESTING` (`IOPU`/`IOPUR`): settable and
 /// askable, but omitted from `show all`. `TABLE:keyword` pairs in table order.
 #[rustfmt::skip]

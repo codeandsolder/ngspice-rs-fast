@@ -462,6 +462,8 @@ pub fn written_selection(
     Selection::resolve(plot, kind, &selection::write_requests(&own, kind)?)
 }
 
+/// Whether a scheduled plot must be retained for later output processing.
+///
 /// Whether [`resolve_outputs`] reads more of this scheduled plot than its
 /// written selection: a `.print` card of its type (a table or an ASCII plot),
 /// or, on the last plot of its type, a `.measure` card of its type or a

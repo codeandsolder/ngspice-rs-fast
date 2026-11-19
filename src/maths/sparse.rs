@@ -83,6 +83,8 @@ struct Trace {
     starts: Vec<u32>,
 }
 
+/// Verified fixed-stamp batches for a circuit's sparse matrix.
+///
 /// One circuit's verified fixed stamp batches ([`SparseMatrix::add_fixed`]):
 /// the trace they were verified against and, per device load position, the
 /// batch length and which of its entries were stamped (0 until verified).

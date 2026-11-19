@@ -11,6 +11,8 @@ use crate::maths::linear::{PivotTolerances, check_status, numerical, order_fresh
 use crate::maths::sparse13::{Sparse, Status};
 use crate::primitives::{Complex, SpiceResult};
 
+/// Capacitive contributions grouped at a single matrix element.
+///
 /// Contributions of `E` (a range of its unfolded triplets, all at one
 /// position) that one device adds to an element as `scale * (x1 + x2 + ...)`,
 /// each `x` being `cap * CKTomega`: `mos1acld.c` adds `xgd + xgs + xgb`,

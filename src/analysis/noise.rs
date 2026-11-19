@@ -148,6 +148,8 @@ fn split_output(arguments: &[String]) -> SpiceResult<Positional> {
     })
 }
 
+/// Determine the number of plots emitted by a noise-analysis card.
+///
 /// How many plots a `.noise` card produces: two (the spectrum and the
 /// integrated noise), or one when C collapses the sweep to a single frequency
 /// (`lin` with one point, or start and stop within 3 ulps). Used by the batch

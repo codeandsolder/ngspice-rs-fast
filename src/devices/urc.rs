@@ -550,6 +550,8 @@ fn build(
     Ok(devices)
 }
 
+/// An expanded URC line instance with no direct matrix contribution.
+///
 /// The URC instance itself, as C keeps it after `URCsetup`: a device with
 /// no terminals and no load (`urcinit.c`: `DEVload`, `DEVacLoad`,
 /// `DEVpzLoad`, `DEVnoise` and `DEVdisto` are all `NULL`). It answers

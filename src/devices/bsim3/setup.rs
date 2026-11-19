@@ -1,3 +1,5 @@
+//! BSIM3 instance setup and parameter validation.
+//!
 //! Instance setup: `b3set.c`'s instance defaulting, `b3temp.c`'s
 //! size-dependent and temperature-dependent parameters, and `b3check.c`'s
 //! model/instance diagnostics. This is geometry and parameter setup only: no

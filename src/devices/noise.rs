@@ -373,6 +373,8 @@ pub struct InstanceNoise {
     pub total: bool,
 }
 
+/// Enumerate noisy devices in the same order as ngspice.
+///
 /// Every noisy instance of `circuit` at the operating point `bias`, in the
 /// order C's `CKTnoise` visits them: by device type in `DEVices[]` order
 /// ([`NoiseFamily`]), then by model in reverse order of model creation (C

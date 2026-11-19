@@ -1,4 +1,5 @@
 //! Typed bounded DC sweeps, including one outer sweep (`dctrcurv.c`).
+//!
 //! Targets are independent V/I sources, resistors (literal or model-backed,
 //! identified by physical device metadata), circuit temperature and the
 //! settable instance parameters `@inst[param]` that both C and the port
@@ -295,6 +296,8 @@ impl<'a> Written<'a> {
     }
 }
 
+/// Resolve one or two DC sweep axes against circuit devices and parameters.
+///
 /// Parse and resolve one/two axes against actual independent sources,
 /// resistors (by physical metadata, never by instance-name prefix), circuit
 /// temperature and `@instance[parameter]` targets.

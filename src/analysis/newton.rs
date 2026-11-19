@@ -46,6 +46,8 @@ pub const SKIP_DIRECT_KEY: &str = "noopiter";
 /// [`crate::analysis::bias::NgspiceStepping::adapt_iterations`]).
 pub const ADAPT_ITERATIONS_KEY: &str = "adaptiter";
 
+/// Select how Newton iterations limit voltage changes.
+///
 /// Request key selecting [`NewtonOptions::limiting`]: `limiting=device`
 /// (ngspice's per-device junction limiting, the default) or `limiting=global`
 /// (the port's bounded global voltage-step damping). A port-only key: C has
@@ -275,6 +277,8 @@ pub fn solve_counted<T>(
     solve_counted_limited(initial, branch_rows, None, options, load)
 }
 
+/// Apply voltage-step damping only to selected matrix rows.
+///
 /// [`solve_counted`] whose voltage-step damping watches only the rows marked
 /// in `limited_rows` (all non-branch rows when `None`). Devices that C never
 /// limits, such as behavioural sources (`asrcload.c` has no limiting), opt out

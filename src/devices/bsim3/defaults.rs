@@ -27,6 +27,8 @@ pub struct ModelWarning {
     pub c_reference: &'static str,
 }
 
+/// BSIM3 model defaults before geometry or temperature processing.
+///
 /// Model fields as the model-only part of `b3set.c` leaves them, not a
 /// temperature- or geometry-processed transistor. Zero-initialized but ungiven
 /// fields (such as K1/K2) remain distinguishable through [`Self::is_given`].

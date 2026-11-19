@@ -202,6 +202,8 @@ impl BBinaryOp {
     }
 }
 
+/// The XSPICE piecewise-linear code-model map for TABLE expressions.
+///
 /// The input-to-output map of the XSPICE `pwl` code model
 /// (`src/xspice/icm/analog/pwl/cfunc.mod`) with the parameters `inpcom.c`
 /// gives it for a `TABLE`: `fraction=TRUE limit=TRUE` and an
@@ -263,6 +265,8 @@ pub const BUILTIN_FUNCTIONS: &[&str] = &[
     "gauss",
 ];
 
+/// Statistical functions expanded by the ngspice netlist front end.
+///
 /// The statistical functions C replaces in B lines before parsing them
 /// (`src/frontend/inp.c` `eval_agauss()`, over the same set as
 /// `src/frontend/inpcom.c` `inp_fix_agauss_in_param()`). A user `.func` of
@@ -389,6 +393,8 @@ impl BExpr {
     }
 }
 
+/// Replicate the numeric rounding of the C B-source literal rewriter.
+///
 /// Rounds a value to the 11 significant digits that `inp_modify_exp()`
 /// (`src/frontend/inpcom.c`) keeps when it re-prints a B-source literal with
 /// `%18.10e`, then reads the printed text back the way the B-source lexer
