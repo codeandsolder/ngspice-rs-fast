@@ -350,10 +350,16 @@ pub fn parse_spice_number_prefix(input: &str) -> Option<ParsedNumber> {
 
 /// C's `INPgetValue(IF_INTEGER)` conversion (`inpgval.c`):
 /// `(int) floor(0.5 + value)`, or `None` when that is not a finite `int`.
+///
+/// The signed C range is asymmetric: `i32::MIN` is a valid result, while
+/// `-i32::MIN` is not. Check the actual bounds before the narrowing cast.
 #[must_use]
 pub fn c_integer(value: Real) -> Option<i64> {
     let rounded = (0.5 + value).floor();
-    (rounded.is_finite() && rounded.abs() <= Real::from(i32::MAX)).then_some(rounded as i64)
+    if !rounded.is_finite() || rounded < Real::from(i32::MIN) || rounded > Real::from(i32::MAX) {
+        return None;
+    }
+    Some(i64::from(rounded as i32))
 }
 
 /// Parses a number inside a `.param`/`{...}` expression as numparam's
@@ -488,8 +494,8 @@ pub fn format_spice_number(value: Real) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Complex, approx_eq, format_spice_number, parse_numparam_number_prefix, parse_spice_number,
-        parse_spice_number_prefix,
+        Complex, approx_eq, c_integer, format_spice_number, parse_numparam_number_prefix,
+        parse_spice_number, parse_spice_number_prefix,
     };
 
     #[test]
@@ -542,6 +548,19 @@ mod tests {
             parse_spice_number("-2.5D-3"),
             Some(-25.0 * 10f64.powf(-4.0))
         );
+    }
+
+    #[test]
+    fn c_integer_accepts_the_full_signed_c_int_range() {
+        assert_eq!(c_integer(f64::from(i32::MIN)), Some(i64::from(i32::MIN)));
+        assert_eq!(c_integer(f64::from(i32::MAX)), Some(i64::from(i32::MAX)));
+        assert_eq!(c_integer(f64::from(i32::MAX) + 1.0), None);
+        assert_eq!(c_integer(f64::from(i32::MIN) - 1.0), None);
+        assert_eq!(c_integer(f64::NAN), None);
+        assert_eq!(c_integer(f64::INFINITY), None);
+        assert_eq!(c_integer(f64::NEG_INFINITY), None);
+        assert_eq!(c_integer(1.5), Some(2));
+        assert_eq!(c_integer(-1.5), Some(-1));
     }
 
     #[test]

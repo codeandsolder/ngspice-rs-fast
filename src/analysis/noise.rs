@@ -103,11 +103,8 @@ fn integer(text: Option<&str>, what: &str) -> SpiceResult<i64> {
         .and_then(parse_spice_number)
         .filter(|v| v.is_finite())
         .ok_or_else(|| unsupported(format!(".noise expects an integer {what}")))?;
-    let rounded = (value + 0.5).floor();
-    if rounded.abs() > i64::from(i32::MAX) as Real {
-        return Err(unsupported(format!(".noise {what} is out of range")));
-    }
-    Ok(rounded as i64)
+    crate::primitives::c_integer(value)
+        .ok_or_else(|| unsupported(format!(".noise {what} is out of range")))
 }
 
 use crate::primitives::almost_equal_ulps;

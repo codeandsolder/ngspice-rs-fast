@@ -471,18 +471,12 @@ impl PortSetters {
         match name {
             "portnum" => {
                 // INPgetValue(IF_INTEGER): (int) floor(0.5 + value).
-                let rounded = (number + 0.5).floor();
-                if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&rounded) {
-                    return Err(SpiceError::Unsupported {
+                let rounded = crate::primitives::c_integer(number).ok_or_else(|| {
+                    SpiceError::Unsupported {
                         feature: format!("portnum {number} is outside the C integer range"),
                         location: Some(at.clone()),
-                    });
-                }
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "the rounded port number is range-checked against the C i32 limits immediately above"
-                )]
-                let rounded = rounded as i64;
+                    }
+                })?;
                 self.number = Some((rounded, at.clone()));
                 // VSRC_PORTNUM: a port needs an impedance; take 50 ohms
                 // unless a positive z0 was already set.

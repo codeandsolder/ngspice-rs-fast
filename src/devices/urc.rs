@@ -416,18 +416,10 @@ pub(crate) fn expand(
 
 /// `INPgetValue(IF_INTEGER)`: `(int) floor(0.5 + value)`, range checked.
 fn integer(value: Real, at: Option<&SourceLoc>, owner: &SourceLoc) -> SpiceResult<i64> {
-    let rounded = (value + 0.5).floor();
-    if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&rounded) {
-        return Err(SpiceError::Unsupported {
-            feature: format!("URC n={value} is outside the C integer range"),
-            location: Some(at.unwrap_or(owner).clone()),
-        });
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "rounded input is checked against i32::MIN and i32::MAX before converting to i64"
-    )]
-    Ok(rounded as i64)
+    crate::primitives::c_integer(value).ok_or_else(|| SpiceError::Unsupported {
+        feature: format!("URC n={value} is outside the C integer range"),
+        location: Some(at.unwrap_or(owner).clone()),
+    })
 }
 
 /// A scalar setter as the deck would have written it. `{:e}` is Rust's

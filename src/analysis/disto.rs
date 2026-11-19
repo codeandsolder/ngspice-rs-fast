@@ -105,11 +105,8 @@ fn integer(text: &str) -> SpiceResult<i64> {
     let value = parse_spice_number(text)
         .filter(|v| v.is_finite())
         .ok_or_else(|| unsupported(".disto expects an integer point count"))?;
-    let rounded = (value + 0.5).floor();
-    if rounded.abs() > Real::from(i32::MAX) {
-        return Err(unsupported(".disto point count is out of range"));
-    }
-    Ok(rounded as i64)
+    crate::primitives::c_integer(value)
+        .ok_or_else(|| unsupported(".disto point count is out of range"))
 }
 
 fn parse(request: &AnalysisRequest) -> SpiceResult<DistoCard> {

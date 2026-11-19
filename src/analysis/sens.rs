@@ -116,11 +116,7 @@ fn integer(text: Option<&str>) -> SpiceResult<i64> {
         .and_then(parse_spice_number)
         .filter(|v| v.is_finite())
         .ok_or_else(|| syntax("expects an integer point count"))?;
-    let rounded = (value + 0.5).floor();
-    if rounded.abs() > Real::from(i32::MAX) {
-        return Err(syntax("point count is out of range"));
-    }
-    Ok(rounded as i64)
+    crate::primitives::c_integer(value).ok_or_else(|| syntax("point count is out of range"))
 }
 
 /// Parses the arguments of a `.sens` card (`dot_sens()`).
