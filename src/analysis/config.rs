@@ -562,17 +562,28 @@ impl RunConfig {
                 )
             })
         };
-        let whole = |lowest: u32, highest: u32| -> SpiceResult<usize> {
+        // C's IF_INTEGER bounds are checked by integer_value, which yields a
+        // nonnegative u32. Keep that type for u32 options rather than
+        // narrowing from usize, and convert explicitly for iteration counts.
+        let whole = |lowest: u32, highest: u32| -> SpiceResult<u32> {
             let value = number("an integer")?;
             integer_value(value)
                 .filter(|n| (lowest..=highest).contains(n))
-                .and_then(|n| usize::try_from(n).ok())
                 .ok_or_else(|| {
                     SpiceError::parse(
                         value_location.clone(),
                         format!("option '{name}' must be an integer in {lowest}..={highest}, not {value}"),
                     )
                 })
+        };
+        let whole_usize = |lowest: u32, highest: u32| -> SpiceResult<usize> {
+            let count = whole(lowest, highest)?;
+            usize::try_from(count).map_err(|_| {
+                SpiceError::parse(
+                    value_location.clone(),
+                    format!("option '{name}' cannot fit into the platform's index width: {count}"),
+                )
+            })
         };
         if PRINT_FLAGS.contains(&name) {
             if setting.value.is_some() {
@@ -612,10 +623,10 @@ impl RunConfig {
                 )?;
                 let settings = self.fourier.get_or_insert_with(Default::default);
                 match name {
-                    "nfreqs" => settings.nfreqs = value as u32,
-                    "nperiods" => settings.nperiods = value as u32,
-                    "polydegree" => settings.polydegree = value as u32,
-                    _ => settings.gridsize = value as u32,
+                    "nfreqs" => settings.nfreqs = value,
+                    "nperiods" => settings.nperiods = value,
+                    "polydegree" => settings.polydegree = value,
+                    _ => settings.gridsize = value,
                 }
                 return Ok(());
             }
@@ -793,7 +804,7 @@ impl RunConfig {
                 // niiter.c: `if (maxIter < 100) maxIter = 100;` applies to all
                 // three (CKTop, dctrcurv and dctran call NIiter with them), so
                 // C's effective limit is never below 100.
-                let written = whole(0, crate::analysis::newton::MAX_ITERATIONS as u32)?;
+                let written = whole_usize(0, crate::analysis::newton::MAX_ITERATIONS as u32)?;
                 let count = written.max(NIITER_MIN_ITERATIONS);
                 match name {
                     "itl1" => self.dc.itl1 = Some(count),
@@ -807,10 +818,16 @@ impl RunConfig {
                 }
             }
             "srcsteps" | "itl6" => {
-                self.dc.srcsteps = Some(whole(0, crate::analysis::bias::MAX_SOURCE_STEPS as u32)?);
+                self.dc.srcsteps = Some(whole_usize(
+                    0,
+                    crate::analysis::bias::MAX_SOURCE_STEPS as u32,
+                )?);
             }
             "gminsteps" => {
-                self.dc.gminsteps = Some(whole(0, crate::analysis::bias::MAX_GMIN_STAGES as u32)?);
+                self.dc.gminsteps = Some(whole_usize(
+                    0,
+                    crate::analysis::bias::MAX_GMIN_STAGES as u32,
+                )?);
             }
             "gminfactor" => self.dc.gminfactor = Some(number("a finite number")?),
             "xmu" => {

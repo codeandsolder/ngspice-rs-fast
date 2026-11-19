@@ -632,6 +632,37 @@ fn options_c_ignores_are_documented_no_ops() {
 }
 
 #[test]
+fn integral_option_storage_preserves_the_validated_c_range() {
+    // IF_INTEGER is a signed C integer even when the accepting field is
+    // unsigned. Values above i32::MAX must not silently truncate or saturate.
+    assert!(config(".options itl3=2147483647").is_ok());
+    for outside in ["2147483648", "4294967295", "-2147483648"] {
+        assert!(
+            config(&format!(".options itl3={outside}")).is_err(),
+            "out-of-C-range value: {outside}"
+        );
+    }
+
+    let c = config(".options nfreqs=101 nperiods=100 polydegree=16 fourgridsize=100000 itl1=10000")
+        .unwrap();
+    let four = c.fourier_settings().unwrap();
+    assert_eq!(
+        (four.nfreqs, four.nperiods, four.polydegree, four.gridsize),
+        (101, 100, 16, 100_000)
+    );
+    assert_eq!(c.dc().itl1, Some(10_000));
+    for outside in [
+        "nfreqs=102",
+        "nperiods=101",
+        "polydegree=17",
+        "fourgridsize=100001",
+        "itl1=10001",
+    ] {
+        assert!(config(&format!(".options {outside}")).is_err(), "{outside}");
+    }
+}
+
+#[test]
 fn unread_frontend_variables_and_bypass_are_documented_no_ops() {
     for options in [
         ".options post",
