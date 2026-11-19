@@ -606,11 +606,16 @@ fn format_ctime(now: SystemTime) -> String {
 }
 
 /// The civil date (`year`, 1-based `month`, 1-based `day`) of a day count since
-/// 1970-01-01. Howard Hinnant's `civil_from_days`.
+/// 1970-01-01. Howard Hinnant's `civil_from_days`, for nonnegative days.
+///
+/// Split the epoch offset into complete Gregorian eras and its remainder so
+/// even a `u64::MAX` day count cannot overflow or wrap through a signed cast.
 fn civil_from_days(days: u64) -> (u64, usize, u64) {
-    let days = days as i64 + 719_468;
-    let era = days.div_euclid(146_097);
-    let day_of_era = days.rem_euclid(146_097);
+    const DAYS_PER_ERA: u64 = 146_097;
+    const EPOCH_OFFSET: u64 = 719_468;
+    let shifted = days % DAYS_PER_ERA + EPOCH_OFFSET;
+    let era = days / DAYS_PER_ERA + shifted / DAYS_PER_ERA;
+    let day_of_era = shifted % DAYS_PER_ERA;
     let year_of_era =
         (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
@@ -621,8 +626,12 @@ fn civil_from_days(days: u64) -> (u64, usize, u64) {
     } else {
         month_prime - 9
     };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    (year as u64, month as usize, day as u64)
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    (
+        year,
+        usize::try_from(month).expect("Gregorian month is between 1 and 12"),
+        day,
+    )
 }
 
 /// Renders the report printed after a successful run.
@@ -766,6 +775,12 @@ mod tests {
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         assert_eq!(civil_from_days(20_677), (2026, 8, 12));
         assert_eq!(civil_from_days(365), (1971, 1, 1));
+        // Each 400-year era is exactly 146097 days long, including leap
+        // years. The split-epoch calculation remains valid at u64::MAX.
+        let (year, month, day) = civil_from_days(u64::MAX - 146_097);
+        assert_eq!(civil_from_days(u64::MAX), (year + 400, month, day));
+        assert!((1..=12).contains(&month));
+        assert!((1..=31).contains(&day));
     }
 
     #[test]
