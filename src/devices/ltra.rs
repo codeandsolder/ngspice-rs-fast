@@ -94,10 +94,6 @@
 // C-compatible numerical expressions are kept in their reference order:
 // Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
-    clippy::float_cmp,
-    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
-)]
-#![expect(
     clippy::manual_midpoint,
     reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
 )]
@@ -124,7 +120,8 @@ use crate::devices::traits::{AnalysisMode, Device, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::primitives::{
-    NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
+    NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, almost_equal_ulps,
+    parse_spice_number,
 };
 
 /// C reference for errors.
@@ -1336,16 +1333,4 @@ impl DelayLine for LossyLine {
         }
         Ok(bound)
     }
-}
-
-/// `AlmostEqualUlps(a, b, max_ulps)` (`src/misc/equality.c`).
-fn almost_equal_ulps(a: Real, b: Real, max_ulps: i64) -> bool {
-    if a == b {
-        return true;
-    }
-    let ordered = |x: Real| {
-        let bits = x.to_bits() as i64;
-        if bits < 0 { i64::MIN - bits } else { bits }
-    };
-    (ordered(a) - ordered(b)).unsigned_abs() <= max_ulps.unsigned_abs()
 }

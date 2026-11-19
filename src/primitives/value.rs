@@ -512,8 +512,9 @@ pub fn format_spice_number(value: Real) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Complex, approx_eq, c_integer, exact_nonnegative_integer, format_spice_number,
-        parse_numparam_number_prefix, parse_spice_number, parse_spice_number_prefix,
+        Complex, almost_equal_ulps, approx_eq, c_integer, exact_nonnegative_integer,
+        format_spice_number, parse_numparam_number_prefix, parse_spice_number,
+        parse_spice_number_prefix,
     };
 
     #[test]
@@ -566,6 +567,23 @@ mod tests {
             parse_spice_number("-2.5D-3"),
             Some(-25.0 * 10f64.powf(-4.0))
         );
+    }
+
+    #[test]
+    fn ulp_comparison_uses_a_wide_difference_for_distant_floats() {
+        assert!(almost_equal_ulps(1., 1., 0));
+        assert!(almost_equal_ulps(-0., 0., 0));
+        assert!(almost_equal_ulps(1., f64::from_bits(1f64.to_bits() + 1), 1));
+        assert!(!almost_equal_ulps(
+            1.,
+            f64::from_bits(1f64.to_bits() + 2),
+            1
+        ));
+        // The old LTRA-local implementation computed this difference as i64
+        // and overflowed in debug builds for widely separated values.
+        assert!(!almost_equal_ulps(-f64::MAX, f64::MAX, 3));
+        assert!(!almost_equal_ulps(f64::NEG_INFINITY, f64::INFINITY, 3));
+        assert!(!almost_equal_ulps(-f64::MAX, f64::MAX, i64::MAX));
     }
 
     #[test]
