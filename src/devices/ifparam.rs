@@ -312,14 +312,12 @@ impl Inputs {
                 Value::Real(value)
             }
             InputType::Integer => {
-                let value = (finite_literal(p)? + 0.5).floor();
-                if !(Real::from(i32::MIN)..=Real::from(i32::MAX)).contains(&value) {
-                    return Err(SpiceError::parse(
-                        p.location.clone(),
-                        "integer setter overflows i32",
-                    ));
-                }
-                Value::Integer(value as i32)
+                let value = crate::primitives::c_integer(finite_literal(p)?)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        SpiceError::parse(p.location.clone(), "integer setter overflows i32")
+                    })?;
+                Value::Integer(value)
             }
             InputType::Flag if p.kind == ParameterKind::Flag && p.value.is_empty() => {
                 Value::Flag(true)

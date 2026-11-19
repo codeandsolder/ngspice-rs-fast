@@ -258,7 +258,15 @@ fn frequencies(sweep: &Sweep) -> SpiceResult<Vec<Real>> {
             ".sens AC sweep has more than {MAX_POINTS} frequencies"
         )));
     }
-    let count = if count <= 0. { 1 } else { count as usize };
+    // Linear counts come from a validated integer; logarithmic counts are
+    // truncated above. Avoid a saturating float-to-usize cast if those
+    // invariants change while preserving C's minimum of one frequency.
+    let count = if count <= 0. {
+        1
+    } else {
+        crate::primitives::exact_nonnegative_integer::<usize>(count)
+            .ok_or_else(|| unsupported(".sens AC sweep point count is not a valid integer"))?
+    };
     let mut frequencies = Vec::with_capacity(count);
     let mut frequency = sweep.start;
     for _ in 0..count {

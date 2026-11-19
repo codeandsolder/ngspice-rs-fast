@@ -177,6 +177,8 @@ fn malformed_nonlinear_forms_are_explicit_errors() {
     for (body, message) in [
         ("e1 o 0 poly(1) a 0", "at least one coefficient"),
         ("e1 o 0 poly(0) a 0 1", "positive integer POLY dimension"),
+        ("e1 o 0 poly(1.5) a 0 1", "positive integer POLY dimension"),
+        ("e1 o 0 poly(65) a 0 1", "positive integer POLY dimension"),
         ("e1 o 0 poly(1) a 0 1 2 m=2", "remove it"),
         ("e1 o 0 table {v(a)} = (0,0) (1)", "pairs"),
         ("e1 o 0 table (0,0) (1,1)", "in braces"),

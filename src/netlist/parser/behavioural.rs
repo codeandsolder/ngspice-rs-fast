@@ -388,22 +388,19 @@ pub(super) fn poly_form(
 ) -> Result<Vec<ParameterAssignment>> {
     let keyword = any.parse_next(input)?;
     skip_punctuation(input)?;
-    let dimension = match input.input.first() {
-        Some(token)
-            if token
-                .number()
-                .is_some_and(|v| v >= 1. && v.fract() == 0. && v <= 64.) =>
-        {
-            any.parse_next(input)?
-        }
-        _ => {
-            return Err(parse_error(
+    let count = input
+        .input
+        .first()
+        .and_then(|token| token.number())
+        .and_then(crate::primitives::exact_nonnegative_integer::<usize>)
+        .filter(|count| (1..=64).contains(count))
+        .ok_or_else(|| {
+            parse_error(
                 input,
                 "expected a positive integer POLY dimension (POLY(n), n <= 64)",
-            ));
-        }
-    };
-    let count = dimension.number().unwrap_or(1.) as usize;
+            )
+        })?;
+    let dimension = any.parse_next(input)?;
     let mut parameters = vec![ParameterAssignment {
         name: "poly".to_owned(),
         value: dimension.text.clone(),

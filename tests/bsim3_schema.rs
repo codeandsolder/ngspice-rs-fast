@@ -235,6 +235,19 @@ fn setter_conversions_follow_c_thresholds_and_integer_rounding() {
         Value::Integer(-1)
     );
     assert_eq!(instance.get("geo").unwrap().value, Value::Integer(-2));
+    // C IF_INTEGER accepts the asymmetric signed minimum; all integer
+    // setters use the same checked conversion and reject either overflow.
+    for (number, expected) in [("-2147483648", i32::MIN), ("2147483647", i32::MAX)] {
+        let (edge, _) = inputs(&format!("nqsmod={number}"), "").unwrap();
+        assert_eq!(
+            edge.inputs.get("nqsmod").unwrap().value,
+            Value::Integer(expected),
+            "nqsmod={number}"
+        );
+    }
+    for outside in ["-2147483649", "2147483648"] {
+        assert!(inputs(&format!("nqsmod={outside}"), "").is_err());
+    }
     // Keep textual literals clear of the branch boundary: INPevaluate uses
     // platform pow(10, exponent), so the spelling 1e23 can be one ulp above
     // the C binary64 threshold on GNU/Linux. Exact setter boundaries are
