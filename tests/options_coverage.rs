@@ -519,6 +519,38 @@ fn itl6_is_srcsteps() {
 }
 
 #[test]
+fn iteration_and_stepping_limits_preserve_c_integer_rounding() {
+    for (name, limit) in [
+        ("itl1", 10_000),
+        ("itl2", 10_000),
+        ("itl4", 10_000),
+        ("itl6", 1_000),
+        ("srcsteps", 1_000),
+        ("gminsteps", 100),
+    ] {
+        // A 100-step gmin ladder requires a near-unity factor to stay below
+        // MAX_GMIN; the default factor of 10 would overflow its conductance.
+        let factor = if name == "gminsteps" {
+            " gminfactor=1.01"
+        } else {
+            ""
+        };
+        for valid in [limit.to_string(), format!("{limit}.49")] {
+            assert!(
+                config(&format!(".options {name}={valid}{factor}")).is_ok(),
+                "{name}={valid}"
+            );
+        }
+        for invalid in [(limit + 1).to_string(), format!("{limit}.5")] {
+            assert!(
+                config(&format!(".options {name}={invalid}{factor}")).is_err(),
+                "{name}={invalid}"
+            );
+        }
+    }
+}
+
+#[test]
 fn existing_effective_options_are_still_applied() {
     let c = config(
         ".options temp=50 tnom=20 reltol=1e-4 vntol=2u abstol=3p chgtol=1e-13 trtol=5 \

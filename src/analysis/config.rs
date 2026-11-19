@@ -299,7 +299,7 @@ impl DcOptions {
 }
 
 /// One accepted option occurrence, kept in deck order for diagnostics.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedOption {
     /// Lowercased option name.
     pub name: String,
@@ -310,7 +310,7 @@ pub struct AppliedOption {
 }
 
 /// An accepted option occurrence that has no effect, with the C-based reason.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IgnoredOption {
     /// Lowercased option name.
     pub name: String,
@@ -383,7 +383,7 @@ impl RunConfig {
                 .flat_map(|card| &card.entries)
                 .filter_map(|entry| {
                     Some(NodeCondition {
-                        node: entry.node.to_string(),
+                        node: entry.node.clone(),
                         value: entry.literal()?,
                         location: entry.location.clone(),
                     })
@@ -512,8 +512,10 @@ impl RunConfig {
                 .iter()
                 .rev()
                 .find(|option| DC_OPTIONS.contains(&option.name.as_str()))
-                .map(|option| option.location.clone())
-                .unwrap_or_else(|| SourceLoc::new(std::path::PathBuf::from("<options>"), 0, 0));
+                .map_or_else(
+                    || SourceLoc::new(std::path::PathBuf::from("<options>"), 0, 0),
+                    |option| option.location.clone(),
+                );
             return Err(SpiceError::parse(location, error.to_string()));
         }
         let unknown = SourceLoc::new(std::path::PathBuf::from("<run overrides>"), 0, 0);
@@ -562,9 +564,9 @@ impl RunConfig {
                 )
             })
         };
-        // C's IF_INTEGER bounds are checked by integer_value, which yields a
-        // nonnegative u32. Keep that type for u32 options rather than
-        // narrowing from usize, and convert explicitly for iteration counts.
+        // C's IF_INTEGER conversion yields a nonnegative u32. Keep that type
+        // for u32 options; compare iteration bounds in their native usize
+        // domain instead of narrowing implementation limits to u32.
         let whole = |lowest: u32, highest: u32| -> SpiceResult<u32> {
             let value = number("an integer")?;
             integer_value(value)
@@ -576,14 +578,17 @@ impl RunConfig {
                     )
                 })
         };
-        let whole_usize = |lowest: u32, highest: u32| -> SpiceResult<usize> {
-            let count = whole(lowest, highest)?;
-            usize::try_from(count).map_err(|_| {
-                SpiceError::parse(
-                    value_location.clone(),
-                    format!("option '{name}' cannot fit into the platform's index width: {count}"),
-                )
-            })
+        let whole_usize = |lowest: usize, highest: usize| -> SpiceResult<usize> {
+            let value = number("an integer")?;
+            integer_value(value)
+                .and_then(|count| usize::try_from(count).ok())
+                .filter(|count| (lowest..=highest).contains(count))
+                .ok_or_else(|| {
+                    SpiceError::parse(
+                        value_location.clone(),
+                        format!("option '{name}' must be an integer in {lowest}..={highest}, not {value}"),
+                    )
+                })
         };
         if PRINT_FLAGS.contains(&name) {
             if setting.value.is_some() {
@@ -613,7 +618,7 @@ impl RunConfig {
         match name {
             "nfreqs" | "nperiods" | "polydegree" | "fourgridsize" => {
                 let value = whole(
-                    if name == "polydegree" { 0 } else { 1 },
+                    u32::from(name != "polydegree"),
                     match name {
                         "nfreqs" => 101,
                         "nperiods" => 100,
@@ -804,7 +809,7 @@ impl RunConfig {
                 // niiter.c: `if (maxIter < 100) maxIter = 100;` applies to all
                 // three (CKTop, dctrcurv and dctran call NIiter with them), so
                 // C's effective limit is never below 100.
-                let written = whole_usize(0, crate::analysis::newton::MAX_ITERATIONS as u32)?;
+                let written = whole_usize(0, crate::analysis::newton::MAX_ITERATIONS)?;
                 let count = written.max(NIITER_MIN_ITERATIONS);
                 match name {
                     "itl1" => self.dc.itl1 = Some(count),
@@ -818,16 +823,10 @@ impl RunConfig {
                 }
             }
             "srcsteps" | "itl6" => {
-                self.dc.srcsteps = Some(whole_usize(
-                    0,
-                    crate::analysis::bias::MAX_SOURCE_STEPS as u32,
-                )?);
+                self.dc.srcsteps = Some(whole_usize(0, crate::analysis::bias::MAX_SOURCE_STEPS)?);
             }
             "gminsteps" => {
-                self.dc.gminsteps = Some(whole_usize(
-                    0,
-                    crate::analysis::bias::MAX_GMIN_STAGES as u32,
-                )?);
+                self.dc.gminsteps = Some(whole_usize(0, crate::analysis::bias::MAX_GMIN_STAGES)?);
             }
             "gminfactor" => self.dc.gminfactor = Some(number("a finite number")?),
             "xmu" => {

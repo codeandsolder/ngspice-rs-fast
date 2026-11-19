@@ -31,7 +31,8 @@ pub const MAX_GMIN: Real = 1.;
 pub const DEFAULT_SOURCE_STEPS: usize = 20;
 /// Default temporary nodal gmin (S) held during source stepping.
 pub const DEFAULT_SOURCE_GMIN: Real = 1e-8;
-/// Most gmin stages accepted in one schedule.
+/// Maximum gmin steps, or explicit ladder entries. The ngspice
+/// `spice3_gmin` schedule includes both endpoints (steps + 1 entries).
 pub const MAX_GMIN_STAGES: usize = 100;
 /// Most equal source increments accepted (a schedule has one more scale).
 pub const MAX_SOURCE_STEPS: usize = 1_000;
@@ -224,7 +225,7 @@ impl NgspiceStepping {
             ladder.push(value);
             value /= self.gmin_factor;
         }
-        validate_gmin_schedule(&ladder).map_err(|_| {
+        validate_gmin_schedule(&ladder, MAX_GMIN_STAGES + 1).map_err(|_| {
             invalid(format!(
                 "gminsteps={} with gminfactor={} and gmin={gmin:e} S gives the ladder \
                  {:e}..{gmin:e} S; each value must be finite, positive, at most \
@@ -381,7 +382,7 @@ impl ContinuationPolicy {
         let schedule: Vec<Real> = (0..steps)
             .map(|k| start / factor.powi(i32::try_from(k).unwrap_or(i32::MAX)))
             .collect();
-        validate_gmin_schedule(&schedule)?;
+        validate_gmin_schedule(&schedule, MAX_GMIN_STAGES)?;
         Ok(schedule)
     }
 
@@ -429,7 +430,7 @@ impl ContinuationPolicy {
                 ));
             }
         }
-        validate_gmin_schedule(&self.gmin_schedule)?;
+        validate_gmin_schedule(&self.gmin_schedule, MAX_GMIN_STAGES)?;
         if let Some(source) = &self.source_stepping {
             source.validate()?;
         }
@@ -462,10 +463,10 @@ fn check_factor(factor: Real) -> SpiceResult<()> {
     }
 }
 
-fn validate_gmin_schedule(schedule: &[Real]) -> SpiceResult<()> {
-    if schedule.len() > MAX_GMIN_STAGES {
+fn validate_gmin_schedule(schedule: &[Real], max_entries: usize) -> SpiceResult<()> {
+    if schedule.len() > max_entries {
         return Err(invalid(format!(
-            "gmin schedule has {} stages; at most {MAX_GMIN_STAGES}",
+            "gmin schedule has {} stages; at most {max_entries}",
             schedule.len()
         )));
     }
