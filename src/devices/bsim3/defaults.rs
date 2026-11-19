@@ -55,6 +55,40 @@ impl ModelDefaults {
         self.numeric.get(&parameter.id).copied()
     }
 
+    /// Read a C IF_INTEGER model field without silently saturating a float.
+    ///
+    /// Setter values are stored in the shared numeric projection as f64, but
+    /// integer fields must remain representable in C's signed i32 domain.
+    ///
+    /// # Errors
+    /// Missing, non-integer, nonfinite or out-of-range internal model fields.
+    pub(super) fn integer(&self, name: &str) -> SpiceResult<i32> {
+        let field = descriptor(parameters::MODEL, name)
+            .filter(|field| field.input_type == InputType::Integer)
+            .ok_or_else(|| {
+                SpiceError::circuit(format!("BSIM3 model field {name} is not an integer"))
+            })?;
+        let value = self
+            .numeric
+            .get(&field.id)
+            .copied()
+            .ok_or_else(|| SpiceError::circuit(format!("BSIM3 model defaults lost {name}")))?;
+        // The IF_INTEGER setter has already applied C's floor(v + 0.5).
+        // Validate the internal field rather than rounding it a second time.
+        if value.fract() != 0. {
+            return Err(SpiceError::circuit(format!(
+                "BSIM3 integer model field {name} is fractional: {value}"
+            )));
+        }
+        crate::primitives::c_integer(value)
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| {
+                SpiceError::circuit(format!(
+                    "BSIM3 integer model field {name} is outside the C i32 range: {value}"
+                ))
+            })
+    }
+
     /// C's given-bit state, not whether the final number differs from a
     /// default. Aliases (and the two type flags) share their actual C bit.
     #[must_use]
@@ -215,5 +249,39 @@ impl ModelDefaults {
             result.set("cgbo", 2. * result.number("dwc")? * cox)?;
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integer_model_fields_validate_type_and_c_bounds() {
+        let mut model = ModelDefaults {
+            numeric: BTreeMap::new(),
+            given: BTreeSet::new(),
+            polarity: 1,
+            version: "3.3.0".into(),
+            oxide_capacitance: 0.,
+            warnings: Vec::new(),
+        };
+        for value in [i32::MIN, -1, 0, 3, i32::MAX] {
+            model.set("capmod", Real::from(value)).unwrap();
+            assert_eq!(model.integer("capmod").unwrap(), value);
+        }
+        for invalid in [
+            Real::from(i32::MIN) - 1.,
+            Real::from(i32::MAX) + 1.,
+            1.25,
+            Real::INFINITY,
+            Real::NAN,
+        ] {
+            model.set("capmod", invalid).unwrap();
+            assert!(model.integer("capmod").is_err(), "{invalid:?}");
+        }
+        assert!(model.integer("tox").is_err());
+        assert!(model.integer("missing").is_err());
+        assert!(model.integer("noimod").is_err());
     }
 }

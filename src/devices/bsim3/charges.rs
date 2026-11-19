@@ -180,11 +180,6 @@ pub struct ChargeModel<'a> {
 }
 
 impl ChargeModel<'_> {
-    /// C's `capMod` mode after `b3set.c` defaults.
-    fn cap_mod(&self) -> i32 {
-        self.model.get("capmod").unwrap_or(3.).round() as i32
-    }
-
     /// Evaluate the charge model at `bias`, reusing the DC evaluation's
     /// intermediates.
     ///
@@ -196,7 +191,7 @@ impl ChargeModel<'_> {
     /// If a field or parameter this port names is absent from the model or
     /// instance setup: a schema bug in the port, not a deck error.
     pub fn evaluate(&self, dc: &DcEvaluation, bias: Bias) -> SpiceResult<ChargeEvaluation> {
-        let cap_mod = self.cap_mod();
+        let cap_mod = self.model.integer("capmod")?;
         if cap_mod != 3 {
             return Err(SpiceError::not_yet_ported(
                 format!(

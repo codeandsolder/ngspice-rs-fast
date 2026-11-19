@@ -181,7 +181,7 @@ impl ModelSetup {
             cgdo: model_value(&defaults, "cgdo")?,
             cgso: model_value(&defaults, "cgso")?,
             cgbo: model_value(&defaults, "cgbo")?,
-            calcacm: model_int(&defaults, "calcacm")?,
+            calcacm: defaults.integer("calcacm")?,
             defaults,
             temperature,
         })
@@ -266,7 +266,7 @@ impl InstanceSetup {
             cgbo: model_cgbo,
             calcacm,
         } = shared;
-        let acm = model_int(model, "acm")?;
+        let acm = model.integer("acm")?;
         if acm != 0 {
             return Err(SpiceError::not_yet_ported(
                 format!(
@@ -327,8 +327,8 @@ impl InstanceSetup {
         } else {
             0
         };
-        let model_nqs = model_int(model, "nqsmod")?;
-        let model_acnqs = model_int(model, "acnqsmod")?;
+        let model_nqs = model.integer("nqsmod")?;
+        let model_acnqs = model.integer("acnqsmod")?;
         let resolve_selector = |name: &str,
                                 model_value: i32,
                                 label: &str,
@@ -393,7 +393,7 @@ impl InstanceSetup {
             }
         }
 
-        let bin_unit = model_int(model, "binunit")?;
+        let bin_unit = model.integer("binunit")?;
         let (inv_l, inv_w, inv_lw) = if bin_unit == 1 {
             (1.0e-6 / leff, 1.0e-6 / weff, 1.0e-12 / (leff * weff))
         } else {
@@ -705,7 +705,7 @@ impl InstanceSetup {
                     "src/spicelib/devices/bsim3/b3check.c",
                 ));
             }
-            if model_int(model, "capmod")? == 3 {
+            if model.integer("capmod")? == 3 {
                 if get!("acde") < 0.4 {
                     diagnostics.push(Diagnostic::warning(
                         format!("Warning:  Acde = {} is too small.", c_g(get!("acde"))),
@@ -719,7 +719,7 @@ impl InstanceSetup {
                     ));
                 }
             }
-            if model_int(model, "paramchk")? == 1 {
+            if model.integer("paramchk")? == 1 {
                 if get!("leff") <= 5.0e-8 {
                     diagnostics.push(Diagnostic::warning(
                         format!("Warning: Leff = {} may be too small.", c_g(get!("leff"))),
@@ -893,7 +893,7 @@ impl InstanceSetup {
         }
         // The CGDO/CGSO/CGBO resets belong to the `paramchk` block in C and
         // persist in the shared model.
-        if model_int(model, "paramchk")? == 1 {
+        if model.integer("paramchk")? == 1 {
             let reset = |value: &mut Real, name: &str, diagnostics: &mut Vec<Diagnostic>| {
                 if *value < 0.0 {
                     diagnostics.push(Diagnostic::warning(
@@ -1259,10 +1259,6 @@ fn pval(p: &BTreeMap<&'static str, Real>, model: &ModelDefaults, name: &str) -> 
         .unwrap_or_else(|| panic!("BSIM3 setup field {name} is missing"))
 }
 
-fn model_int(model: &ModelDefaults, name: &str) -> SpiceResult<i32> {
-    Ok(model_value(model, name)? as i32)
-}
-
 fn model_value(model: &ModelDefaults, name: &str) -> SpiceResult<Real> {
     model
         .get(name)
@@ -1277,7 +1273,6 @@ fn integer(inputs: &Inputs, name: &str) -> SpiceResult<i32> {
     };
     match &applied.value {
         Value::Integer(value) => Ok(*value),
-        Value::Real(value) => Ok(*value as i32),
         value => Err(SpiceError::circuit(format!(
             "BSIM3 setup expected integer {name}, found {value:?}"
         ))),

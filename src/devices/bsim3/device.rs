@@ -744,7 +744,7 @@ impl Device for Bsim3 {
         // refuses only where charges are required.
         let integration = context.integration;
         let transient = integration.is_some();
-        let cap_mod = cached.defaults.get("capmod").unwrap_or(3.).round() as i32;
+        let cap_mod = cached.defaults.integer("capmod")?;
         let charge_ready = cap_mod == 3 && cached.setup.nqs_mod == 0 && cached.setup.acnqs_mod == 0;
         let charge = if transient || charge_ready {
             Some(

@@ -69,11 +69,6 @@ pub struct NoiseModel<'a> {
 }
 
 impl NoiseModel<'_> {
-    /// C's `BSIM3noiMod`.
-    fn noi_mod(&self) -> i32 {
-        self.model.get("noimod").unwrap_or(1.).round() as i32
-    }
-
     /// Evaluate the generator laws at `dc`/`charge` and the circuit
     /// temperature `circuit_kelvin` (C `ckt->CKTtemp`).
     ///
@@ -89,7 +84,7 @@ impl NoiseModel<'_> {
         charge: &ChargeEvaluation,
         circuit_kelvin: Real,
     ) -> SpiceResult<NoiseDensities> {
-        let noi_mod = self.noi_mod();
+        let noi_mod = self.model.integer("noimod")?;
         if !(1..=6).contains(&noi_mod) {
             return Err(SpiceError::not_yet_ported(
                 format!(
