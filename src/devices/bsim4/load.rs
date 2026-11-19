@@ -18,6 +18,14 @@
 // C-compatible numerical expressions are kept in their reference order:
 // Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
+    clippy::similar_names,
+    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
+)]
+#![expect(
+    clippy::manual_midpoint,
+    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
+)]
+#![expect(
     clippy::suboptimal_flops,
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
