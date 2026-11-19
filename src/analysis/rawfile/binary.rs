@@ -158,10 +158,8 @@ impl<'a> RawFileReader<'a> {
     ///
     /// As [`RawFormat::detect`].
     pub fn format(&self) -> SpiceResult<RawFormat> {
-        match self.format {
-            Some(format) => Ok(format),
-            None => RawFormat::detect(self.bytes),
-        }
+        self.format
+            .map_or_else(|| RawFormat::detect(self.bytes), Ok)
     }
 
     /// Parses the rawfile.
@@ -370,10 +368,12 @@ fn find_section_line(bytes: &[u8], from: usize) -> Option<(usize, Section)> {
     let mut line_start = from;
     loop {
         let rest = &bytes[line_start..];
-        let (line, line_end) = match rest.iter().position(|byte| *byte == b'\n') {
-            Some(index) => (&rest[..index], line_start + index + 1),
-            None => (rest, bytes.len()),
-        };
+        let (line, line_end) = rest
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or((rest, bytes.len()), |index| {
+                (&rest[..index], line_start + index + 1)
+            });
         if let Some(colon) = line.iter().position(|byte| *byte == b':') {
             let key = line[..colon].trim_ascii();
             if key == b"Values" {

@@ -612,10 +612,11 @@ impl Hfet1 {
     fn derived(&self, temperature: Real) -> SpiceResult<Derived> {
         let model = &self.model;
         let instance = &self.instance;
-        let temp = match instance.temp {
-            Some(v) => v + CELSIUS_TO_KELVIN,
-            None => temperature + CELSIUS_TO_KELVIN + instance.dtemp,
-        };
+        let temp = instance
+            .temp
+            .map_or(temperature + CELSIUS_TO_KELVIN + instance.dtemp, |v| {
+                v + CELSIUS_TO_KELVIN
+            });
         let nominal = temperature + CELSIUS_TO_KELVIN;
         let delta = temp - nominal;
         // `hfettemp.c` multiplied the stored threshold by the type before
@@ -1282,10 +1283,11 @@ impl Hfet1 {
 
     /// The total instance temperature in kelvin, `hfettemp.c`'s rule for asks.
     fn temperature(&self, temperature: Real) -> Real {
-        match self.instance.temp {
-            Some(v) => v + CELSIUS_TO_KELVIN,
-            None => temperature + CELSIUS_TO_KELVIN + self.instance.dtemp,
-        }
+        self.instance
+            .temp
+            .map_or(temperature + CELSIUS_TO_KELVIN + self.instance.dtemp, |v| {
+                v + CELSIUS_TO_KELVIN
+            })
     }
 }
 

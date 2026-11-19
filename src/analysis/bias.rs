@@ -1136,9 +1136,11 @@ impl Engine<'_> {
             gmin,
             junction,
         } = point;
-        let describe = || match junction {
-            Some(junction) => format!("scale {scale}, junction gmin {junction:e} S"),
-            None => format!("scale {scale}, gmin {gmin:e} S"),
+        let describe = || {
+            junction.map_or_else(
+                || format!("scale {scale}, gmin {gmin:e} S"),
+                |junction| format!("scale {scale}, junction gmin {junction:e} S"),
+            )
         };
         // A Newton solve needs two passes at least (the first never
         // converges), and a failing one uses `max_iterations + 1` (NIiter

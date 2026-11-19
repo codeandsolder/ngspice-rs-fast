@@ -297,10 +297,7 @@ fn resolve_output(circuit: &Circuit, output: &Output) -> SpiceResult<(Probe, [Op
 }
 
 fn add(rhs: &mut Vector, row: Option<usize>, value: Real) -> SpiceResult<()> {
-    match row {
-        Some(row) => rhs.add_to(row, value),
-        None => Ok(()),
-    }
+    row.map_or(Ok(()), |row| rhs.add_to(row, value))
 }
 
 fn at(x: &Vector, row: Option<usize>) -> Real {

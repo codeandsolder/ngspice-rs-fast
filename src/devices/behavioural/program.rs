@@ -881,10 +881,10 @@ fn mk_ternary(condition: Tree, then: Tree, otherwise: Tree) -> Tree {
 
 /// `mkf()` for a one-argument function: a constant argument is folded.
 fn mk_unary(function: Unary, argument: Tree) -> Tree {
-    match argument.constant() {
-        Some(x) => constant(unary_value(function, x)),
-        None => Arc::new(Node::Unary(function, argument)),
-    }
+    argument.constant().map_or_else(
+        || Arc::new(Node::Unary(function, argument)),
+        |x| constant(unary_value(function, x)),
+    )
 }
 
 /// `mkf(PTF_POW/PTF_PWR, mkb(PT_COMMA, a, b))`: never folded (a comma node
@@ -1087,18 +1087,18 @@ fn differentiate(p: &Tree, variable: usize) -> Tree {
             times(slope, differentiate(u, variable))
         }
         Node::Pwl(u, values) => {
-            let slope = match u.constant() {
-                Some(x) => constant(pwl_slope(x, values)),
-                None => Arc::new(Node::PwlDerivative(u.clone(), values.clone())),
-            };
+            let slope = u.constant().map_or_else(
+                || Arc::new(Node::PwlDerivative(u.clone(), values.clone())),
+                |x| constant(pwl_slope(x, values)),
+            );
             times(slope, differentiate(u, variable))
         }
         Node::PwlDerivative(u, _) => times(zero(), differentiate(u, variable)),
         Node::Table(u, map) => {
-            let slope = match u.constant() {
-                Some(x) => constant(map.evaluate(x).1),
-                None => Arc::new(Node::TableSlope(u.clone(), map.clone())),
-            };
+            let slope = u.constant().map_or_else(
+                || Arc::new(Node::TableSlope(u.clone(), map.clone())),
+                |x| constant(map.evaluate(x).1),
+            );
             times(slope, differentiate(u, variable))
         }
         Node::TableSlope(u, _) => times(zero(), differentiate(u, variable)),

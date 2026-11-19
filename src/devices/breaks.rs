@@ -333,10 +333,7 @@ impl Request<'_> {
         } else {
             None
         };
-        match request {
-            Some(time) => table.set(now, time),
-            None => Ok(()),
-        }
+        request.map_or(Ok(()), |time| table.set(now, time))
     }
 
     /// `VSRCaccept`/`ISRCaccept`, `case PWL`: knot times `times` (as given),

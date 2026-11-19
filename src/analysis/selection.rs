@@ -358,10 +358,9 @@ impl Column {
             };
             sum = sum + *value * Complex::from(*factor);
         }
-        let value = match self.component {
-            None => sum,
-            Some(component) => component_value(component, sum),
-        };
+        let value = self
+            .component
+            .map_or(sum, |component| component_value(component, sum));
         if !value.is_finite() {
             return Err(SpiceError::Numerical {
                 context: format!("selection: {}", self.name),
