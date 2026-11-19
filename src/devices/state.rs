@@ -191,7 +191,7 @@ impl StateHistory {
 
     /// How many accepted vectors are available (at most [`ACCEPTED_DEPTH`]).
     #[must_use]
-    pub fn depth(&self) -> usize {
+    pub const fn depth(&self) -> usize {
         self.accepted.len()
     }
 
@@ -558,7 +558,7 @@ pub struct DeviceState<'a> {
 impl DeviceState<'_> {
     /// A window with no slots, for loads that track no state.
     #[must_use]
-    pub fn none() -> DeviceState<'static> {
+    pub const fn none() -> DeviceState<'static> {
         DeviceState {
             trial: &mut [],
             accepted: [&[]; ACCEPTED_DEPTH],
@@ -706,13 +706,13 @@ impl DeviceState<'_> {
 
     /// Number of slots this device owns.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.trial.len()
     }
 
     /// True when the device owns no slots.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.trial.is_empty()
     }
 

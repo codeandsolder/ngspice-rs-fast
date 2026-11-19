@@ -144,19 +144,19 @@ impl Plot {
 
     /// Number of points.
     #[must_use]
-    pub fn point_count(&self) -> usize {
+    pub const fn point_count(&self) -> usize {
         self.points.len()
     }
 
     /// Number of columns.
     #[must_use]
-    pub fn variable_count(&self) -> usize {
+    pub const fn variable_count(&self) -> usize {
         self.variables.len()
     }
 
     /// True when the plot has no columns or no points.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.variables.is_empty() || self.points.is_empty()
     }
 

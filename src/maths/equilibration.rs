@@ -210,7 +210,7 @@ impl Equilibration {
     }
 }
 
-fn component_max(v: Complex) -> f64 {
+const fn component_max(v: Complex) -> f64 {
     v.re.abs().max(v.im.abs())
 }
 
@@ -402,7 +402,7 @@ impl EquilibratedDenseLu {
 
     /// Immutable scaling metadata belonging to this factor snapshot.
     #[must_use]
-    pub fn scaling(&self) -> &Equilibration {
+    pub const fn scaling(&self) -> &Equilibration {
         &self.scaling
     }
 
@@ -481,7 +481,7 @@ impl EquilibratedSparseLu {
 
     /// Immutable scaling metadata belonging to this factor snapshot.
     #[must_use]
-    pub fn scaling(&self) -> &Equilibration {
+    pub const fn scaling(&self) -> &Equilibration {
         &self.scaling
     }
 
@@ -636,7 +636,7 @@ impl EquilibratedComplexLu {
 
     /// Immutable scaling metadata belonging to this factor snapshot.
     #[must_use]
-    pub fn scaling(&self) -> &Equilibration {
+    pub const fn scaling(&self) -> &Equilibration {
         &self.scaling
     }
 

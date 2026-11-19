@@ -122,7 +122,7 @@ impl NodeTable {
 
     /// Whether `gnd` is aliased to ground.
     #[must_use]
-    pub fn auto_gnd(&self) -> bool {
+    pub const fn auto_gnd(&self) -> bool {
         self.auto_gnd
     }
 
@@ -186,7 +186,7 @@ impl NodeTable {
 
     /// Number of nodes, including ground.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.nodes.len()
     }
 
@@ -200,7 +200,7 @@ impl NodeTable {
 
     /// True when the table holds nothing but ground.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.nodes.len() <= 1
     }
 
@@ -222,7 +222,7 @@ impl NodeTable {
 
     /// Ground.
     #[must_use]
-    pub fn ground(&self) -> NodeId {
+    pub const fn ground(&self) -> NodeId {
         NodeId::GROUND
     }
 }

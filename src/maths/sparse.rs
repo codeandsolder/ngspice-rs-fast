@@ -230,13 +230,13 @@ impl Pattern {
 
     /// Number of elements.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.positions.len()
     }
 
     /// True when the pattern has no elements.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.positions.is_empty()
     }
 
@@ -407,7 +407,7 @@ pub struct SparseMatrix {
 impl SparseMatrix {
     /// An empty `rows` by `cols` matrix.
     #[must_use]
-    pub fn new(rows: usize, cols: usize) -> Self {
+    pub const fn new(rows: usize, cols: usize) -> Self {
         Self {
             rows,
             cols,
@@ -462,7 +462,7 @@ impl SparseMatrix {
     /// singular-matrix errors name nodes as ngspice's `NIiter` does
     /// (`singular matrix:  check node ...`) instead of row numbers.
     #[must_use]
-    pub fn unknown_names(&self) -> Option<&crate::maths::UnknownNames> {
+    pub const fn unknown_names(&self) -> Option<&crate::maths::UnknownNames> {
         self.names.as_ref()
     }
 
@@ -695,7 +695,7 @@ impl SparseMatrix {
 
     /// True when duplicate positions have been folded away.
     #[must_use]
-    pub fn is_folded(&self) -> bool {
+    pub const fn is_folded(&self) -> bool {
         self.folded || self.bound.is_some()
     }
 
