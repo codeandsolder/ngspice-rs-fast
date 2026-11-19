@@ -300,11 +300,8 @@ impl Settings {
         let tran_max_iter = match request.named("tranmaxiter") {
             None => TRAN_MAX_ITER,
             Some(text) => crate::primitives::parse_spice_number(text)
-                .filter(|v| {
-                    v.fract() == 0.
-                        && (1. ..=crate::analysis::newton::MAX_ITERATIONS as Real).contains(v)
-                })
-                .map(|v| v as usize)
+                .and_then(crate::primitives::exact_usize)
+                .filter(|n| (1..=crate::analysis::newton::MAX_ITERATIONS).contains(n))
                 .ok_or_else(|| {
                     unsupported(format!(
                         "tranmaxiter must be an integer in 1..={}, not '{text}'",

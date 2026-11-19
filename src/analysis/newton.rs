@@ -136,7 +136,7 @@ impl NewtonOptions {
     /// Invalid or unimplemented convergence arguments.
     pub fn from_request(request: &crate::analysis::AnalysisRequest) -> SpiceResult<Self> {
         let mut options = Self::default();
-        let largest = MAX_ITERATIONS as f64;
+
         let mut seen = std::collections::BTreeSet::new();
         for argument in &request.arguments {
             let Some((key, text)) = argument.split_once('=') else {
@@ -165,8 +165,14 @@ impl NewtonOptions {
                 "rtol" => options.reltol = value,
                 "vntol" => options.vntol = value,
                 "abstol" => options.abstol = value,
-                "maxiter" if value.fract() == 0. && (1. ..=largest).contains(&value) => {
-                    options.max_iterations = value as usize
+                "maxiter" => {
+                    options.max_iterations = crate::primitives::exact_usize(value)
+                        .filter(|n| (1..=MAX_ITERATIONS).contains(n))
+                        .ok_or_else(|| {
+                            failure(format!(
+                                "maxiter must be an integer in 1..={MAX_ITERATIONS}"
+                            ))
+                        })?;
                 }
                 name if CONTINUATION_KEYS.contains(&name) => {
                     return Err(crate::primitives::SpiceError::Unsupported {

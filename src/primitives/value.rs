@@ -362,6 +362,23 @@ pub fn c_integer(value: Real) -> Option<i64> {
     Some(i64::from(rounded as i32))
 }
 
+/// Convert an already integral, nonnegative `f64` to `usize` without
+/// silently saturating an out-of-range value.
+///
+/// Rust's float-to-integer `as` conversion saturates at `usize::MAX` on
+/// overflow. Compare against the **exclusive** `2^usize::BITS` bound instead
+/// of `usize::MAX as f64` (which rounds up to `2^64` on 64-bit targets).
+/// This validates the integer represented by the supplied `f64`; it cannot
+/// recover digits already rounded away by parsing that floating-point value.
+#[must_use]
+pub fn exact_usize(value: Real) -> Option<usize> {
+    let exclusive_upper_bound = Real::from(usize::BITS).exp2();
+    if !value.is_finite() || value < 0. || value.fract() != 0. || value >= exclusive_upper_bound {
+        return None;
+    }
+    Some(value as usize)
+}
+
 /// Parses a number inside a `.param`/`{...}` expression as numparam's
 /// `fetchnumber()` (`xpressn.c`) does: `sscanf("%lG")` (the correctly rounded
 /// decimal value, `e`/`E` exponents only) times `parseunit()`'s multiplier
@@ -494,8 +511,8 @@ pub fn format_spice_number(value: Real) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Complex, approx_eq, c_integer, format_spice_number, parse_numparam_number_prefix,
-        parse_spice_number, parse_spice_number_prefix,
+        Complex, approx_eq, c_integer, exact_usize, format_spice_number,
+        parse_numparam_number_prefix, parse_spice_number, parse_spice_number_prefix,
     };
 
     #[test]
@@ -561,6 +578,29 @@ mod tests {
         assert_eq!(c_integer(f64::NEG_INFINITY), None);
         assert_eq!(c_integer(1.5), Some(2));
         assert_eq!(c_integer(-1.5), Some(-1));
+    }
+
+    #[test]
+    fn exact_usize_rejects_fractional_nonfinite_and_overflowing_values() {
+        let exclusive = f64::from(usize::BITS).exp2();
+        assert_eq!(exact_usize(0.0), Some(0));
+        assert_eq!(exact_usize(-0.0), Some(0));
+        assert_eq!(exact_usize(31.0), Some(31));
+        assert_eq!(exact_usize(31.5), None);
+        assert_eq!(exact_usize(-1.0), None);
+        assert_eq!(exact_usize(f64::NAN), None);
+        assert_eq!(exact_usize(f64::INFINITY), None);
+        assert_eq!(exact_usize(f64::NEG_INFINITY), None);
+        assert_eq!(exact_usize(exclusive), None);
+        assert_eq!(exact_usize(exclusive * 2.0), None);
+
+        // The largest representable float strictly below the exclusive bound
+        // is integral when a usize is at least as wide as the f64 mantissa.
+        if usize::BITS >= 53 {
+            let prior = f64::from_bits(exclusive.to_bits() - 1);
+            assert!(prior.fract() == 0.0);
+            assert_eq!(exact_usize(prior), Some(prior as usize));
+        }
     }
 
     #[test]

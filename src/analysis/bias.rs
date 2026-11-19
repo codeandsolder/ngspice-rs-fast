@@ -560,12 +560,14 @@ impl DcSettings {
                 newton::SKIP_DIRECT_KEY => (0, 1),
                 _ => (0, MAX_GMIN_STAGES),
             };
-            if value.fract() != 0. || !(lowest as Real..=limit as Real).contains(&value) {
-                return Err(invalid(format!(
-                    "option {key} must be an integer in {lowest}..={limit}, not {text}"
-                )));
-            }
-            let count = Some(value as usize);
+            let count = crate::primitives::exact_usize(value)
+                .filter(|n| (lowest..=limit).contains(n))
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "option {key} must be an integer in {lowest}..={limit}, not {text}"
+                    ))
+                })?;
+            let count = Some(count);
             match key.as_str() {
                 newton::STAGE_ITERATIONS_KEY => stage_limit = count,
                 newton::ADAPT_ITERATIONS_KEY => adapt = count,

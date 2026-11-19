@@ -466,14 +466,12 @@ impl DeviceSensitivity for MutualSensitivity<'_> {
         let factor = i.value("factor")?;
         let row = |keyword: &str| -> SpiceResult<usize> {
             let value = i.value(keyword)?;
-            if value >= 0. && value.fract() == 0. {
-                Ok(value as usize)
-            } else {
-                Err(SpiceError::circuit(format!(
+            crate::primitives::exact_usize(value).ok_or_else(|| {
+                SpiceError::circuit(format!(
                     "{}: unbound inductor branch row",
                     self.coupling.name()
-                )))
-            }
+                ))
+            })
         };
         let (row1, row2) = (row("row1")?, row("row2")?);
         let stamps = [(row1, row2), (row2, row1)]
