@@ -213,9 +213,12 @@ impl NgspiceStepping {
     /// `gmin * factor^steps` down to `gmin`, `steps + 1` values.
     ///
     /// # Errors
-    /// A ladder that is not finite, positive, at most [`MAX_GMIN`] and
-    /// strictly decreasing (e.g. a zero junction gmin).
+    /// Invalid stepping parameters, or a ladder that is not finite,
+    /// positive, at most [`MAX_GMIN`] and strictly decreasing.
     pub fn spice3_ladder(&self, gmin: Real) -> SpiceResult<Vec<Real>> {
+        // Validate before loops and capacity arithmetic: callers can construct
+        // NgspiceStepping directly, outside ContinuationPolicy's validation.
+        self.validate()?;
         let mut value = gmin;
         for _ in 0..self.gmin_steps {
             value *= self.gmin_factor;

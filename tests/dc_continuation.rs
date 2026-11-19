@@ -980,6 +980,14 @@ fn ngspice_maximum_gmin_steps_include_both_ladder_endpoints() {
     assert!(ladder.windows(2).all(|pair| pair[0] > pair[1]));
     close(ladder[0], 1e-12 * 1.01_f64.powi(100), 1e-12, 0.);
     close(*ladder.last().unwrap(), 1e-12, 1e-12, 0.);
+
+    // This public method may be invoked before ContinuationPolicy::validate.
+    // Reject an impossible count before looping or adding one to its length.
+    let bad = NgspiceStepping {
+        gmin_steps: usize::MAX,
+        ..stepping
+    };
+    assert!(bad.spice3_ladder(1e-12).is_err());
 }
 
 #[test]
