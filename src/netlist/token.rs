@@ -226,10 +226,7 @@ pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
                     index += 1;
                 }
                 let word = &text[start..index];
-                let kind = match parse_spice_number(word) {
-                    Some(value) => TokenKind::Number(value),
-                    None => TokenKind::Word,
-                };
+                let kind = parse_spice_number(word).map_or(TokenKind::Word, TokenKind::Number);
                 tokens.push(Token::new(kind, word, location));
             }
         }

@@ -339,10 +339,10 @@ impl Geometry {
     /// C's instance temperature in kelvin: `TEMP`, or `CKTtemp + DTEMP`
     /// with `CKTtemp` in kelvin.
     pub(super) fn kelvin(&self, context: &ModelContext) -> Real {
-        match self.temp {
-            Some(t) => t + CELSIUS_TO_KELVIN,
-            None => (context.temperature + CELSIUS_TO_KELVIN) + self.dtemp,
-        }
+        self.temp.map_or(
+            (context.temperature + CELSIUS_TO_KELVIN) + self.dtemp,
+            |t| t + CELSIUS_TO_KELVIN,
+        )
     }
 }
 

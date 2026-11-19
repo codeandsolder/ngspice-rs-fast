@@ -806,10 +806,11 @@ impl Hfet2 {
 
     /// The total instance temperature in kelvin.
     fn temperature(&self, temperature: Real) -> Real {
-        match self.instance.temp {
-            Some(v) => v + CELSIUS_TO_KELVIN,
-            None => temperature + CELSIUS_TO_KELVIN + self.instance.dtemp,
-        }
+        self.instance
+            .temp
+            .map_or(temperature + CELSIUS_TO_KELVIN + self.instance.dtemp, |v| {
+                v + CELSIUS_TO_KELVIN
+            })
     }
 }
 

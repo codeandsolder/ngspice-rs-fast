@@ -355,14 +355,16 @@ impl Mesa {
         // `value + CONSTCtoK`, so it is Celsius in the deck, and
         // `mesasetup.c`'s default `CKTtemp + DTEMP` is kelvin.
         let nominal_kelvin = nominal + CELSIUS_TO_KELVIN;
-        let ts = match instance.ts {
-            Some(v) => v + CELSIUS_TO_KELVIN,
-            None => temperature + CELSIUS_TO_KELVIN + instance.dtemp,
-        };
-        let td = match instance.td {
-            Some(v) => v + CELSIUS_TO_KELVIN,
-            None => temperature + CELSIUS_TO_KELVIN + instance.dtemp,
-        };
+        let ts = instance
+            .ts
+            .map_or(temperature + CELSIUS_TO_KELVIN + instance.dtemp, |v| {
+                v + CELSIUS_TO_KELVIN
+            });
+        let td = instance
+            .td
+            .map_or(temperature + CELSIUS_TO_KELVIN + instance.dtemp, |v| {
+                v + CELSIUS_TO_KELVIN
+            });
         let scalar = |resistance: Real, kelvin: Real| {
             if resistance == 0. {
                 0.
@@ -1073,14 +1075,18 @@ impl Mesa {
 
     /// The instance temperatures in kelvin, `mesatemp.c`'s rule for asks.
     fn temperatures(&self, temperature: Real) -> (Real, Real) {
-        let ts = match self.instance.ts {
-            Some(v) => v + CELSIUS_TO_KELVIN,
-            None => temperature + CELSIUS_TO_KELVIN + self.instance.dtemp,
-        };
-        let td = match self.instance.td {
-            Some(v) => v + CELSIUS_TO_KELVIN,
-            None => temperature + CELSIUS_TO_KELVIN + self.instance.dtemp,
-        };
+        let ts = self
+            .instance
+            .ts
+            .map_or(temperature + CELSIUS_TO_KELVIN + self.instance.dtemp, |v| {
+                v + CELSIUS_TO_KELVIN
+            });
+        let td = self
+            .instance
+            .td
+            .map_or(temperature + CELSIUS_TO_KELVIN + self.instance.dtemp, |v| {
+                v + CELSIUS_TO_KELVIN
+            });
         (ts, td)
     }
 

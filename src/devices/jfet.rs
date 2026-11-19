@@ -774,10 +774,10 @@ pub(super) fn temperatures(
     let tnom = tnom.unwrap_or(context.nominal_temperature) + CELSIUS_TO_KELVIN;
     // C stores TEMP in kelvin (`jfetpar.c`) and adds DTEMP to the kelvin
     // `CKTtemp` (`jfettemp.c`).
-    let temp = match instance.temp {
-        Some(t) => t + CELSIUS_TO_KELVIN,
-        None => (context.temperature + CELSIUS_TO_KELVIN) + instance.dtemp,
-    };
+    let temp = instance.temp.map_or(
+        (context.temperature + CELSIUS_TO_KELVIN) + instance.dtemp,
+        |t| t + CELSIUS_TO_KELVIN,
+    );
     if !(tnom.is_finite() && tnom > 0. && temp.is_finite() && temp > 0.) {
         return Err(SpiceError::circuit(format!(
             "{name}: invalid JFET temperature"

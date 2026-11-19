@@ -333,10 +333,9 @@ pub fn parse_spice_number_prefix(input: &str) -> Option<ParsedNumber> {
         }
     }
 
-    let (scale, suffix_width, mil) = match input[i..].chars().next() {
-        Some(letter) => scale_suffix(letter, &input[i + letter.len_utf8()..]),
-        None => (0, 0, false),
-    };
+    let (scale, suffix_width, mil) = input[i..].chars().next().map_or((0, 0, false), |letter| {
+        scale_suffix(letter, &input[i + letter.len_utf8()..])
+    });
     if mil {
         mantis *= 25.4;
     }

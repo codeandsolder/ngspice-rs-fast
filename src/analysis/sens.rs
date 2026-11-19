@@ -632,14 +632,14 @@ fn members<'a>(
             sensitivity.family(),
             sensitivity.model().map(str::to_ascii_lowercase),
         );
-        let rank = match keys.iter().position(|known| *known == key) {
-            Some(rank) => rank,
-            None => {
+        let rank = keys
+            .iter()
+            .position(|known| *known == key)
+            .unwrap_or_else(|| {
                 keys.push(key.clone());
                 models.push(model_record);
                 keys.len() - 1
-            }
-        };
+            });
         ordered.push((
             key.0,
             rank,
@@ -1357,18 +1357,20 @@ fn setup_elements(
     index: usize,
     elements: Option<Vec<(NodeId, NodeId)>>,
 ) -> SpiceResult<Vec<(usize, usize)>> {
-    match elements {
-        Some(pairs) => Ok(pairs
-            .into_iter()
-            .filter_map(|(row, col)| {
-                Some((
-                    circuit.unknowns().node_row(row)?,
-                    circuit.unknowns().node_row(col)?,
-                ))
-            })
-            .collect()),
-        None => circuit.setup_elements(index),
-    }
+    elements.map_or_else(
+        || circuit.setup_elements(index),
+        |pairs| {
+            Ok(pairs
+                .into_iter()
+                .filter_map(|(row, col)| {
+                    Some((
+                        circuit.unknowns().node_row(row)?,
+                        circuit.unknowns().node_row(col)?,
+                    ))
+                })
+                .collect())
+        },
+    )
 }
 
 /// The per-parameter loop of `sens_sens()`: setup, base load, perturbation,

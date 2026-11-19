@@ -448,13 +448,13 @@ pub fn circuit_noise(
             });
         }
         let key = (family, model);
-        let rank = match models.iter().position(|known| *known == key) {
-            Some(rank) => rank,
-            None => {
+        let rank = models
+            .iter()
+            .position(|known| *known == key)
+            .unwrap_or_else(|| {
                 models.push(key);
                 models.len() - 1
-            }
-        };
+            });
         entries.push((
             family,
             rank,

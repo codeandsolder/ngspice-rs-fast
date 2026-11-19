@@ -1622,17 +1622,17 @@ fn run(
             ));
             plan.push((
                 DcStrategy::SourceStepping,
-                match &policy.source_stepping {
-                    None => Plan::Disabled,
-                    Some(source) => Plan::Walk {
+                policy
+                    .source_stepping
+                    .as_ref()
+                    .map_or(Plan::Disabled, |source| Plan::Walk {
                         start: &zero,
                         stages: source
                             .scales
                             .iter()
                             .map(|k| Point::nodal(*k, source.gmin))
                             .collect(),
-                    },
-                },
+                    }),
             ));
         }
         ContinuationSchedule::Ngspice(stepping) => {

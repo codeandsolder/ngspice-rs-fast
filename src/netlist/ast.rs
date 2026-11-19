@@ -663,10 +663,10 @@ impl RequestedVector {
     #[must_use]
     pub fn name(&self) -> String {
         fn terminals(positive: &str, negative: Option<&str>) -> String {
-            match negative {
-                Some(negative) => format!("{positive},{negative}"),
-                None => positive.to_owned(),
-            }
+            negative.map_or_else(
+                || positive.to_owned(),
+                |negative| format!("{positive},{negative}"),
+            )
         }
         match self {
             Self::Named { name, component } => match component {
