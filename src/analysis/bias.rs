@@ -560,7 +560,7 @@ impl DcSettings {
                 newton::SKIP_DIRECT_KEY => (0, 1),
                 _ => (0, MAX_GMIN_STAGES),
             };
-            let count = crate::primitives::exact_usize(value)
+            let count = crate::primitives::exact_nonnegative_integer::<usize>(value)
                 .filter(|n| (lowest..=limit).contains(n))
                 .ok_or_else(|| {
                     invalid(format!(

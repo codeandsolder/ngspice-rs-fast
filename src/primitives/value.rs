@@ -362,21 +362,21 @@ pub fn c_integer(value: Real) -> Option<i64> {
     Some(i64::from(rounded as i32))
 }
 
-/// Convert an already integral, nonnegative `f64` to `usize` without
-/// silently saturating an out-of-range value.
+/// Convert an already integral, nonnegative `f64` to a checked integer
+/// type without silently saturating an out-of-range value.
 ///
-/// Rust's float-to-integer `as` conversion saturates at `usize::MAX` on
-/// overflow. Compare against the **exclusive** `2^usize::BITS` bound instead
-/// of `usize::MAX as f64` (which rounds up to `2^64` on 64-bit targets).
-/// This validates the integer represented by the supplied `f64`; it cannot
-/// recover digits already rounded away by parsing that floating-point value.
+/// Rust's float-to-integer `as` conversion saturates on overflow. First
+/// enforce the **exclusive** `2^128` bound, then use `TryFrom<u128>` for the
+/// actual target integer type. This works for both `usize` and the full
+/// `u32` range, even on targets whose `usize` is narrower than 32 bits.
+/// It validates the supplied `f64`, not digits already lost during parsing.
 #[must_use]
-pub fn exact_usize(value: Real) -> Option<usize> {
-    let exclusive_upper_bound = Real::from(usize::BITS).exp2();
+pub fn exact_nonnegative_integer<T: TryFrom<u128>>(value: Real) -> Option<T> {
+    let exclusive_upper_bound = Real::from(128).exp2();
     if !value.is_finite() || value < 0. || value.fract() != 0. || value >= exclusive_upper_bound {
         return None;
     }
-    Some(value as usize)
+    T::try_from(value as u128).ok()
 }
 
 /// Parses a number inside a `.param`/`{...}` expression as numparam's
@@ -511,7 +511,7 @@ pub fn format_spice_number(value: Real) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Complex, approx_eq, c_integer, exact_usize, format_spice_number,
+        Complex, approx_eq, c_integer, exact_nonnegative_integer, format_spice_number,
         parse_numparam_number_prefix, parse_spice_number, parse_spice_number_prefix,
     };
 
@@ -581,26 +581,43 @@ mod tests {
     }
 
     #[test]
-    fn exact_usize_rejects_fractional_nonfinite_and_overflowing_values() {
-        let exclusive = f64::from(usize::BITS).exp2();
-        assert_eq!(exact_usize(0.0), Some(0));
-        assert_eq!(exact_usize(-0.0), Some(0));
-        assert_eq!(exact_usize(31.0), Some(31));
-        assert_eq!(exact_usize(31.5), None);
-        assert_eq!(exact_usize(-1.0), None);
-        assert_eq!(exact_usize(f64::NAN), None);
-        assert_eq!(exact_usize(f64::INFINITY), None);
-        assert_eq!(exact_usize(f64::NEG_INFINITY), None);
-        assert_eq!(exact_usize(exclusive), None);
-        assert_eq!(exact_usize(exclusive * 2.0), None);
+    fn exact_nonnegative_integer_rejects_invalid_values_and_target_overflow() {
+        let as_usize = exact_nonnegative_integer::<usize>;
+        let usize_bound = f64::from(usize::BITS).exp2();
+        assert_eq!(as_usize(0.0), Some(0));
+        assert_eq!(as_usize(-0.0), Some(0));
+        assert_eq!(as_usize(31.0), Some(31));
+        assert_eq!(as_usize(31.5), None);
+        assert_eq!(as_usize(-1.0), None);
+        assert_eq!(as_usize(f64::NAN), None);
+        assert_eq!(as_usize(f64::INFINITY), None);
+        assert_eq!(as_usize(f64::NEG_INFINITY), None);
+        assert_eq!(as_usize(usize_bound), None);
+        assert_eq!(as_usize(usize_bound * 2.0), None);
 
-        // The largest representable float strictly below the exclusive bound
-        // is integral when a usize is at least as wide as the f64 mantissa.
+        // Validate the actual float just below the usize bound, not an
+        // unchecked float-to-usize cast used as a test oracle.
         if usize::BITS >= 53 {
-            let prior = f64::from_bits(exclusive.to_bits() - 1);
-            assert!(prior.fract() == 0.0);
-            assert_eq!(exact_usize(prior), Some(prior as usize));
+            let prior = f64::from_bits(usize_bound.to_bits() - 1);
+            let spacing = 1_usize << usize::BITS.saturating_sub(53);
+            assert_eq!(as_usize(prior), Some(usize::MAX - (spacing - 1)));
         }
+
+        // A u32-valued SPICE field must accept all of u32, regardless of
+        // whether the target's usize can represent that value.
+        let as_u32 = exact_nonnegative_integer::<u32>;
+        assert_eq!(as_u32(f64::from(u32::MAX)), Some(u32::MAX));
+        assert_eq!(as_u32(f64::from(u32::MAX) + 1.0), None);
+        assert_eq!(exact_nonnegative_integer::<u16>(65_535.0), Some(u16::MAX));
+        assert_eq!(exact_nonnegative_integer::<u16>(65_536.0), None);
+
+        // At 2^128 the conversion would saturate at u128::MAX without
+        // the independent floating-point range check.
+        let u128_bound = f64::from(128).exp2();
+        assert_eq!(exact_nonnegative_integer::<u128>(u128_bound), None);
+        let prior = f64::from_bits(u128_bound.to_bits() - 1);
+        let expected = u128::MAX - ((1_u128 << (128 - 53)) - 1);
+        assert_eq!(exact_nonnegative_integer::<u128>(prior), Some(expected));
     }
 
     #[test]

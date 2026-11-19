@@ -566,7 +566,7 @@ impl RunConfig {
             let value = number("an integer")?;
             integer_value(value)
                 .filter(|n| (lowest..=highest).contains(n))
-                .map(|n| n as usize)
+                .and_then(|n| usize::try_from(n).ok())
                 .ok_or_else(|| {
                     SpiceError::parse(
                         value_location.clone(),

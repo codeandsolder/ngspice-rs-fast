@@ -698,16 +698,17 @@ fn transition(input: &mut Input<'_>, name: &str, at: &SourceLoc) -> Result<Measu
         return Ok(MeasureTransition::Last);
     }
     let value = number(input, name, at)?;
-    if !(value >= 1.0 && value.fract() == 0.0 && value <= f64::from(u32::MAX)) {
-        return Err(fail(
-            at,
-            format!(
-                "{name}= takes a whole crossing number of at least 1, or LAST (found {})",
-                crate::primitives::format_spice_number(value)
-            ),
-        ));
-    }
-    let count = value as u32;
+    let count = crate::primitives::exact_nonnegative_integer::<u32>(value)
+        .filter(|n| *n >= 1)
+        .ok_or_else(|| {
+            fail(
+                at,
+                format!(
+                    "{name}= takes a whole crossing number of at least 1, or LAST (found {})",
+                    crate::primitives::format_spice_number(value)
+                ),
+            )
+        })?;
     Ok(match name {
         "rise" => MeasureTransition::Rise(count),
         "fall" => MeasureTransition::Fall(count),

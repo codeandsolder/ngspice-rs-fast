@@ -166,13 +166,14 @@ impl NewtonOptions {
                 "vntol" => options.vntol = value,
                 "abstol" => options.abstol = value,
                 "maxiter" => {
-                    options.max_iterations = crate::primitives::exact_usize(value)
-                        .filter(|n| (1..=MAX_ITERATIONS).contains(n))
-                        .ok_or_else(|| {
-                            failure(format!(
-                                "maxiter must be an integer in 1..={MAX_ITERATIONS}"
-                            ))
-                        })?;
+                    options.max_iterations =
+                        crate::primitives::exact_nonnegative_integer::<usize>(value)
+                            .filter(|n| (1..=MAX_ITERATIONS).contains(n))
+                            .ok_or_else(|| {
+                                failure(format!(
+                                    "maxiter must be an integer in 1..={MAX_ITERATIONS}"
+                                ))
+                            })?;
                 }
                 name if CONTINUATION_KEYS.contains(&name) => {
                     return Err(crate::primitives::SpiceError::Unsupported {

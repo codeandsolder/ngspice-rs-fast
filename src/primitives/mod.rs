@@ -23,9 +23,9 @@ pub mod value;
 pub use error::{SourceLoc, SpiceError, SpiceResult};
 pub use node::{GROUND_ALIAS, GROUND_NAME, Node, NodeId, NodeKind, NodeTable};
 pub use value::{
-    Complex, ParsedNumber, Real, almost_equal_ulps, approx_eq, c_integer, exact_usize,
-    format_spice_number, parse_numparam_number, parse_numparam_number_prefix, parse_spice_number,
-    parse_spice_number_prefix,
+    Complex, ParsedNumber, Real, almost_equal_ulps, approx_eq, c_integer,
+    exact_nonnegative_integer, format_spice_number, parse_numparam_number,
+    parse_numparam_number_prefix, parse_spice_number, parse_spice_number_prefix,
 };
 
 /// The kinds of analysis ngspice can run.

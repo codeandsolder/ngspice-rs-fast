@@ -466,7 +466,7 @@ impl DeviceSensitivity for MutualSensitivity<'_> {
         let factor = i.value("factor")?;
         let row = |keyword: &str| -> SpiceResult<usize> {
             let value = i.value(keyword)?;
-            crate::primitives::exact_usize(value).ok_or_else(|| {
+            crate::primitives::exact_nonnegative_integer::<usize>(value).ok_or_else(|| {
                 SpiceError::circuit(format!(
                     "{}: unbound inductor branch row",
                     self.coupling.name()

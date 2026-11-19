@@ -88,7 +88,7 @@ pub(super) fn frequency_grid(
         .and_then(crate::primitives::parse_spice_number)
         .and_then(crate::primitives::c_integer)
         .filter(|n| *n > 0 && *n <= 100_000)
-        .map(|n| n as usize)
+        .and_then(|n| usize::try_from(n).ok())
         .ok_or_else(|| unsupported("AC points must be in 1..=100000"))?;
     let start = number(argument(2), "start frequency")?;
     let stop = number(argument(3), "stop frequency")?;

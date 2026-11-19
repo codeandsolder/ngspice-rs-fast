@@ -157,7 +157,7 @@ impl SweepSpec {
         if steps + 1. > MAX_SWEEP_POINTS as Real {
             return Err(unsupported("DC sweep point limit exceeded"));
         }
-        let steps = crate::primitives::exact_usize(steps)
+        let steps = crate::primitives::exact_nonnegative_integer::<usize>(steps)
             .ok_or_else(|| unsupported("DC sweep point limit exceeded"))?;
         let mut values: Vec<Real> = (0..=steps).map(|i| start + (i as Real) * step).collect();
         if steps > 0 && (ratio - steps as Real).abs() <= slack {
@@ -567,7 +567,7 @@ fn sweep_settings(
                     });
                 }
                 let value = crate::primitives::parse_spice_number(text.trim())
-                    .and_then(crate::primitives::exact_usize)
+                    .and_then(crate::primitives::exact_nonnegative_integer::<usize>)
                     .filter(|n| (1..=crate::analysis::newton::MAX_ITERATIONS).contains(n))
                     .ok_or_else(|| SpiceError::Unsupported {
                         feature: format!(
