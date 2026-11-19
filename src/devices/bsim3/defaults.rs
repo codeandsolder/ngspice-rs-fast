@@ -55,7 +55,7 @@ impl ModelDefaults {
         self.numeric.get(&parameter.id).copied()
     }
 
-    /// Read a C IF_INTEGER model field without silently saturating a float.
+    /// Read a C `IF_INTEGER` model field without silently saturating a float.
     ///
     /// Setter values are stored in the shared numeric projection as f64, but
     /// integer fields must remain representable in C's signed i32 domain.
