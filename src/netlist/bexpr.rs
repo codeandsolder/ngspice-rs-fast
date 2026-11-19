@@ -281,7 +281,7 @@ pub const SPECIAL_NAMES: &[&str] = &["time", "temper", "hertz", "pi", "e"];
 
 impl BExpr {
     /// Visits every node, parents before children.
-    pub fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a BExpr)) {
+    pub fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Self)) {
         visitor(self);
         match &self.kind {
             BExprKind::Number { .. }
@@ -321,7 +321,7 @@ impl BExpr {
     }
 
     /// Visits every node mutably, parents before children.
-    pub fn visit_mut(&mut self, visitor: &mut impl FnMut(&mut BExpr)) {
+    pub fn visit_mut(&mut self, visitor: &mut impl FnMut(&mut Self)) {
         visitor(self);
         match &mut self.kind {
             BExprKind::Number { .. }

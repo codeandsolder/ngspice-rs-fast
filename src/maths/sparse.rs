@@ -819,7 +819,7 @@ impl SparseMatrix {
                 })
                 .collect();
             if !self.triplets.is_empty() {
-                let mut overflow = SparseMatrix::new(self.rows, self.cols);
+                let mut overflow = Self::new(self.rows, self.cols);
                 overflow.triplets.clone_from(&self.triplets);
                 overflow.fold_duplicates();
                 view.extend(overflow.triplets);

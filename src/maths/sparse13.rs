@@ -106,7 +106,7 @@ impl Scalar for f64 {
 }
 
 impl Scalar for Complex {
-    const ZERO: Self = Complex::ZERO;
+    const ZERO: Self = Self::ZERO;
     fn mag(self) -> f64 {
         self.re.abs() + self.im.abs()
     }
@@ -119,21 +119,21 @@ impl Scalar for Complex {
         if (den.re >= den.im && den.re > -den.im) || (den.re < den.im && den.re <= -den.im) {
             let r = den.im / den.re;
             let re = 1.0 / (den.re + r * den.im);
-            Complex::new(re, -r * re)
+            Self::new(re, -r * re)
         } else {
             let r = den.re / den.im;
             let im = -1.0 / (den.im + r * den.re);
-            Complex::new(-r * im, im)
+            Self::new(-r * im, im)
         }
     }
     fn mul(self, b: Self) -> Self {
-        Complex::new(
+        Self::new(
             self.re * b.re - self.im * b.im,
             self.re * b.im + self.im * b.re,
         )
     }
     fn mul_sub(self, a: Self, b: Self) -> Self {
-        Complex::new(
+        Self::new(
             self.re - (a.re * b.re - a.im * b.im),
             self.im - (a.re * b.im + a.im * b.re),
         )
@@ -142,7 +142,7 @@ impl Scalar for Complex {
         self.re == 0.0 && self.im == 0.0
     }
     fn add_real(self, r: f64) -> Self {
-        Complex::new(self.re + r, self.im)
+        Self::new(self.re + r, self.im)
     }
 }
 
@@ -1637,7 +1637,7 @@ impl DeterminantScale for f64 {
 
 impl DeterminantScale for Complex {
     fn one() -> Self {
-        Complex::real(1.0)
+        Self::real(1.0)
     }
     fn det_step(det: Self, inverse_pivot: Self) -> Self {
         // CMPLX_MULT_ASSIGN(det, reciprocal).
@@ -1647,7 +1647,7 @@ impl DeterminantScale for Complex {
         self.re.abs().max(self.im.abs())
     }
     fn scale(self, factor: f64) -> Self {
-        Complex::new(self.re * factor, self.im * factor)
+        Self::new(self.re * factor, self.im * factor)
     }
 }
 

@@ -166,7 +166,7 @@ pub struct ParamEntry {
 /// A resolved parameter scope.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParamScope {
-    parent: Option<Arc<ParamScope>>,
+    parent: Option<Arc<Self>>,
     entries: Vec<ParamEntry>,
     active: HashMap<String, usize>,
     functions: Option<Arc<FunctionScope>>,
@@ -252,7 +252,7 @@ impl ParamScope {
     /// # Errors
     /// As [`Self::root`].
     pub fn resolve(
-        parent: Option<Arc<ParamScope>>,
+        parent: Option<Arc<Self>>,
         bindings: &[ParamBinding],
         cards: &[ParamCard],
         budget: &mut EvalBudget,
@@ -268,7 +268,7 @@ impl ParamScope {
     /// # Errors
     /// As [`Self::root`].
     pub fn resolve_scoped(
-        parent: Option<Arc<ParamScope>>,
+        parent: Option<Arc<Self>>,
         functions: Option<Arc<FunctionScope>>,
         bindings: &[ParamBinding],
         cards: &[ParamCard],
@@ -291,7 +291,7 @@ impl ParamScope {
     /// # Errors
     /// As [`Self::root`].
     pub fn resolve_instance(
-        parent: Option<Arc<ParamScope>>,
+        parent: Option<Arc<Self>>,
         bindings: &[ParamBinding],
         cards: &[ParamCard],
         budget: &mut EvalBudget,
@@ -310,7 +310,7 @@ impl ParamScope {
     /// # Errors
     /// As [`Self::root`].
     pub fn resolve_instance_scoped(
-        parent: Option<Arc<ParamScope>>,
+        parent: Option<Arc<Self>>,
         functions: Option<Arc<FunctionScope>>,
         bindings: &[ParamBinding],
         cards: &[ParamCard],
@@ -320,7 +320,7 @@ impl ParamScope {
     }
 
     fn resolve_with(
-        parent: Option<Arc<ParamScope>>,
+        parent: Option<Arc<Self>>,
         functions: Option<Arc<FunctionScope>>,
         bindings: &[ParamBinding],
         cards: &[ParamCard],
@@ -575,7 +575,7 @@ impl ParamScope {
 
     /// The enclosing scope, if any.
     #[must_use]
-    pub const fn parent(&self) -> Option<&Arc<ParamScope>> {
+    pub const fn parent(&self) -> Option<&Arc<Self>> {
         self.parent.as_ref()
     }
 
@@ -646,7 +646,7 @@ pub struct FunctionDef {
 /// - Free names in an unused body are not checked, as in C.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionScope {
-    parent: Option<Arc<FunctionScope>>,
+    parent: Option<Arc<Self>>,
     definitions: Vec<FunctionDef>,
     active: HashMap<String, usize>,
 }
@@ -660,7 +660,7 @@ impl FunctionScope {
     /// scope's bodies), and calls in a body with the wrong number of
     /// arguments for the definition they resolve to.
     pub fn new(
-        parent: Option<Arc<FunctionScope>>,
+        parent: Option<Arc<Self>>,
         cards: &[FuncCard],
         budget: &EvalBudget,
     ) -> SpiceResult<Self> {
@@ -789,14 +789,14 @@ impl FunctionScope {
 
     /// The enclosing scope, if any.
     #[must_use]
-    pub const fn parent(&self) -> Option<&Arc<FunctionScope>> {
+    pub const fn parent(&self) -> Option<&Arc<Self>> {
         self.parent.as_ref()
     }
 
     /// The definition `name` (case-insensitive) resolves to, searching
     /// enclosing scopes, with the scope it was defined in.
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<(&FunctionDef, &FunctionScope)> {
+    pub fn get(&self, name: &str) -> Option<(&FunctionDef, &Self)> {
         let key = name.to_ascii_lowercase();
         let mut scope = self;
         loop {
@@ -1065,7 +1065,7 @@ struct Frame<'a> {
     scope: &'a FunctionScope,
     args: Vec<Real>,
     call: SourceLoc,
-    outer: Option<&'a Frame<'a>>,
+    outer: Option<&'a Self>,
 }
 
 /// What an expression is evaluated against: the site's parameter lookup and

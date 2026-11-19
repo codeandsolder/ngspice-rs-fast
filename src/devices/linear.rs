@@ -45,7 +45,7 @@ pub enum Waveform {
     /// RFSPICE PORT accumulation in `VSRCload` order. Tones are (amplitude, radians/s).
     PortSeries {
         /// Preceding non-PORT voltage source time function.
-        baseline: Box<Waveform>,
+        baseline: Box<Self>,
         /// Accumulated cosine excitations, flattened to bound recursion.
         tones: Vec<(Real, Real)>,
     },

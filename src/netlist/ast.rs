@@ -258,7 +258,7 @@ pub struct Subcircuit {
     /// Models declared in the body.
     pub models: Vec<ModelCard>,
     /// Nested definitions; names are local to this body.
-    pub subcircuits: Vec<Subcircuit>,
+    pub subcircuits: Vec<Self>,
     /// Analysis requests retained in this body, not promoted to the root.
     pub analyses: Vec<AnalysisCard>,
     /// Source directives retained in this body.
@@ -769,7 +769,7 @@ pub enum MeasureRequest {
         /// Ground-alias policy used when the card was parsed.
         auto_gnd: bool,
         /// Structurally checked request, for discovering observation operands.
-        template: Box<MeasureRequest>,
+        template: Box<Self>,
     },
     /// Scalar numparam expression, evaluated after vector measurements.
     Parameter(Box<crate::netlist::expr::ParameterExpression>),
@@ -874,7 +874,7 @@ pub enum MeasureEvent {
     /// Begin a threshold search at its own TD, independently of another event.
     Delayed {
         /// Event whose crossing count begins at TD.
-        event: Box<MeasureEvent>,
+        event: Box<Self>,
         /// Lower search bound.
         td: Real,
     },

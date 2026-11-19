@@ -460,7 +460,7 @@ trait PowTen {
 
 impl PowTen for Real {
     fn powf_c(self) -> Real {
-        Real::powf(10.0, self)
+        Self::powf(10.0, self)
     }
 }
 

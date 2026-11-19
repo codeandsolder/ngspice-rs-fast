@@ -350,7 +350,7 @@ impl Device for Resistor {
         supplied: Real,
         _context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<Real> {
-        Resistor::new(&self.name, self.terminals, supplied).map(|resistor| resistor.resistance())
+        Self::new(&self.name, self.terminals, supplied).map(|resistor| resistor.resistance())
     }
 
     /// A literal resistor: C's default resistor model and the resistance
