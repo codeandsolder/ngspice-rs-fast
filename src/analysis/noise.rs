@@ -628,12 +628,12 @@ pub(crate) fn run(
     }
     if request.squared_noise {
         for plot in &mut plots {
-            plot.plotname = if plot.plotname == SPECTRUM_PLOTNAME {
+            let name = if plot.plotname == SPECTRUM_PLOTNAME {
                 "Noise Spectral Density Curves - (V^2 or A^2)/Hz"
             } else {
                 "Integrated Noise - V^2 or A^2"
-            }
-            .to_owned();
+            };
+            name.clone_into(&mut plot.plotname);
             for (index, variable) in plot.variables.iter_mut().enumerate() {
                 if variable.name == "frequency" {
                     continue;

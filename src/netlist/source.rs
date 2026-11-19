@@ -200,7 +200,7 @@ pub fn fold_logical_lines(file: &Path, lines: &[PhysicalLine]) -> Deck {
     let Some((first, rest)) = lines.split_first() else {
         return deck;
     };
-    deck.title = first.text.trim_end().to_owned();
+    first.text.trim_end().clone_into(&mut deck.title);
 
     let mut pending: Option<LogicalLine> = None;
     let mut in_control = false;

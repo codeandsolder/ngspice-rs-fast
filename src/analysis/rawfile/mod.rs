@@ -688,9 +688,9 @@ fn parse_header(cursor: &mut Cursor<'_>) -> SpiceResult<Option<(Header, Section)
         // space, and reproducing the file byte for byte depends on keeping it.
         let value = value.strip_prefix(' ').unwrap_or(value);
         match key {
-            "Title" => title = value.to_owned(),
-            "Date" => date = value.to_owned(),
-            "Command" => command = value.to_owned(),
+            "Title" => value.clone_into(&mut title),
+            "Date" => value.clone_into(&mut date),
+            "Command" => value.clone_into(&mut command),
             "Plotname" => plotname = Some(value.to_owned()),
             "Flags" => {
                 flags = Some(PlotFlags::parse(value));

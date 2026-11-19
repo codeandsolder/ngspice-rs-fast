@@ -262,7 +262,7 @@ fn rename_occurrence(device: &mut DeviceInstance, occurrence: usize, name: &str)
         expression.root.visit_mut(&mut |node| {
             if let BExprKind::Current(source) = &mut node.kind {
                 if seen == occurrence {
-                    *source = name.to_owned();
+                    name.clone_into(source);
                 }
                 seen += 1;
             }

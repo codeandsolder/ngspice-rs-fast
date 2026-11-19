@@ -297,8 +297,8 @@ fn scope(
                 ScopedCardKind::Fourier
             }
             ParsedCard::Include(mut i) => {
-                i.resolved_path = entry.resolved_path.clone();
-                i.selected_section = entry.selected_section.clone();
+                i.resolved_path.clone_from(&entry.resolved_path);
+                i.selected_section.clone_from(&entry.selected_section);
                 result.includes.push(i);
                 ScopedCardKind::Include(result.includes.len() - 1)
             }

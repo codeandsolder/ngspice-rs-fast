@@ -233,7 +233,7 @@ impl Selection {
     pub fn header(&self, plot: &Plot) -> Plot {
         let mut selected = Plot::new(plot.name.clone(), plot.plotname.clone(), plot.flags);
         if self.full {
-            selected.variables = plot.variables.clone();
+            selected.variables.clone_from(&plot.variables);
             return selected;
         }
         for column in &self.columns {
