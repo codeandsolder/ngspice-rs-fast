@@ -180,7 +180,7 @@ pub struct MnaUnknowns {
 impl MnaUnknowns {
     /// An empty mapping.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             node_rows: Vec::new(),
             next_row: 0,

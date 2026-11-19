@@ -320,7 +320,7 @@ impl ContinuationPolicy {
 
     /// No continuation: a failed direct Newton solve is final.
     #[must_use]
-    pub fn disabled() -> Self {
+    pub const fn disabled() -> Self {
         Self {
             schedule: ContinuationSchedule::Ladder,
             gmin_schedule: Vec::new(),
@@ -837,7 +837,7 @@ pub struct NodeForcing {
 impl NodeForcing {
     /// No forced rows.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.initial.is_empty() && self.nodesets.is_empty()
     }
 

@@ -191,7 +191,7 @@ pub enum FunctionSpec {
 }
 
 impl FunctionSpec {
-    fn kind(&self) -> &'static str {
+    const fn kind(&self) -> &'static str {
         match self {
             Self::Sine(_) => "SIN",
             Self::Exp(_) => "EXP",
@@ -410,7 +410,7 @@ pub enum SourceFunction {
 }
 
 impl SourceFunction {
-    fn kind(&self) -> &'static str {
+    const fn kind(&self) -> &'static str {
         match self {
             Self::Sine(_) => "SIN",
             Self::Exp(_) => "EXP",

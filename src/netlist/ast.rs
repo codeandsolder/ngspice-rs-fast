@@ -519,7 +519,7 @@ pub enum NodeHintValue {
 impl NodeHintValue {
     /// The finite value, if this is (or was literalized to) a literal.
     #[must_use]
-    pub fn literal(&self) -> Option<Real> {
+    pub const fn literal(&self) -> Option<Real> {
         match self {
             Self::Literal { value, .. } => Some(*value),
             Self::Expression(_) => None,
@@ -530,7 +530,7 @@ impl NodeHintValue {
 impl NodeHint {
     /// The finite value, unless the entry still holds an unevaluated expression.
     #[must_use]
-    pub fn literal(&self) -> Option<Real> {
+    pub const fn literal(&self) -> Option<Real> {
         self.value.literal()
     }
 }
@@ -723,13 +723,13 @@ pub struct OutputCards {
 impl OutputCards {
     /// True when the deck has no `.save` and no `.print` card.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.saves.is_empty() && self.prints.is_empty()
     }
 
     /// Number of output cards.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.saves.len() + self.prints.len()
     }
 }
@@ -1119,7 +1119,7 @@ impl Netlist {
 
     /// Number of top-level device instances, excluding subcircuit bodies.
     #[must_use]
-    pub fn top_level_device_count(&self) -> usize {
+    pub const fn top_level_device_count(&self) -> usize {
         self.devices.len()
     }
 

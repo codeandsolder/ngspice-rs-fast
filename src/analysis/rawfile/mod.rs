@@ -119,13 +119,13 @@ impl RawFile {
 
     /// Number of plots.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.plots.len()
     }
 
     /// True when the rawfile holds no plots.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.plots.is_empty()
     }
 
@@ -341,7 +341,7 @@ impl RawFileWriter {
 
     /// The encoding this writer uses.
     #[must_use]
-    pub fn format(&self) -> RawFormat {
+    pub const fn format(&self) -> RawFormat {
         self.format
     }
 
@@ -448,13 +448,13 @@ pub struct StreamedPlot {
 impl StreamedPlot {
     /// The plot's headers and variables (it holds no points).
     #[must_use]
-    pub fn header(&self) -> &RawPlot {
+    pub const fn header(&self) -> &RawPlot {
         &self.header
     }
 
     /// How many points were pushed.
     #[must_use]
-    pub fn point_count(&self) -> usize {
+    pub const fn point_count(&self) -> usize {
         self.point_count
     }
 
@@ -509,7 +509,7 @@ fn validate_plot(plot: &Plot) -> SpiceResult<()> {
 }
 
 /// The line that ends the header in `format`.
-fn section_line(format: RawFormat) -> &'static [u8] {
+const fn section_line(format: RawFormat) -> &'static [u8] {
     match format {
         RawFormat::Ascii => b"Values:\n",
         RawFormat::Binary => b"Binary:\n",

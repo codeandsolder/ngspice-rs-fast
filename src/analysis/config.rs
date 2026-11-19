@@ -406,13 +406,13 @@ impl RunConfig {
 
     /// Explicit Fourier front-end settings.
     #[must_use]
-    pub fn fourier_settings(&self) -> Option<crate::analysis::fourier::FourierSettings> {
+    pub const fn fourier_settings(&self) -> Option<crate::analysis::fourier::FourierSettings> {
         self.fourier
     }
 
     /// Rawfile encoding selected by the front-end `set filetype` variable.
     #[must_use]
-    pub fn raw_format(&self) -> Option<crate::analysis::RawFormat> {
+    pub const fn raw_format(&self) -> Option<crate::analysis::RawFormat> {
         self.raw_format
     }
 

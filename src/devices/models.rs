@@ -717,7 +717,7 @@ fn rounded_level(raw: Real, location: &SourceLoc) -> SpiceResult<u8> {
 
 /// The C device directory `inpdomod.c` selects for an unported NMOS/PMOS
 /// level.
-fn mos_level_reference(selector: u8) -> &'static str {
+const fn mos_level_reference(selector: u8) -> &'static str {
     match selector {
         0 => "src/spicelib/parser/inpdomod.c (level 0 selects src/spicelib/devices/mos1/)",
         2 => "src/spicelib/devices/mos2/",

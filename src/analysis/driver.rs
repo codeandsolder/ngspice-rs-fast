@@ -74,7 +74,7 @@ pub struct AnalysisRequest {
 impl AnalysisRequest {
     /// A request with no arguments.
     #[must_use]
-    pub fn new(kind: AnalysisKind) -> Self {
+    pub const fn new(kind: AnalysisKind) -> Self {
         Self {
             kind,
             arguments: Vec::new(),

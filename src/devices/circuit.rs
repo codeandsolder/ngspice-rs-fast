@@ -225,13 +225,13 @@ impl Circuit {
 
     /// The node table.
     #[must_use]
-    pub fn nodes(&self) -> &NodeTable {
+    pub const fn nodes(&self) -> &NodeTable {
         &self.nodes
     }
 
     /// The MNA unknown numbering. Only valid after [`Circuit::rebuild_unknowns`].
     #[must_use]
-    pub fn unknowns(&self) -> &MnaUnknowns {
+    pub const fn unknowns(&self) -> &MnaUnknowns {
         &self.unknowns
     }
 
@@ -250,13 +250,13 @@ impl Circuit {
 
     /// Number of device instances.
     #[must_use]
-    pub fn device_count(&self) -> usize {
+    pub const fn device_count(&self) -> usize {
         self.devices.len()
     }
 
     /// Size of the MNA system.
     #[must_use]
-    pub fn unknown_count(&self) -> usize {
+    pub const fn unknown_count(&self) -> usize {
         self.unknowns.len()
     }
 

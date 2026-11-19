@@ -101,19 +101,19 @@ pub struct EvalBudget {
 impl EvalBudget {
     /// A fresh budget.
     #[must_use]
-    pub fn new(limits: EvalLimits) -> Self {
+    pub const fn new(limits: EvalLimits) -> Self {
         Self { limits, nodes: 0 }
     }
 
     /// Expression nodes evaluated so far.
     #[must_use]
-    pub fn nodes_used(&self) -> usize {
+    pub const fn nodes_used(&self) -> usize {
         self.nodes
     }
 
     /// The limits in force.
     #[must_use]
-    pub fn limits(&self) -> EvalLimits {
+    pub const fn limits(&self) -> EvalLimits {
         self.limits
     }
 }
@@ -563,7 +563,7 @@ impl ParamScope {
 
     /// The `.func` definitions visible in this scope, if any.
     #[must_use]
-    pub fn functions(&self) -> Option<&Arc<FunctionScope>> {
+    pub const fn functions(&self) -> Option<&Arc<FunctionScope>> {
         self.functions.as_ref()
     }
 

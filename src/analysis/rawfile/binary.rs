@@ -140,14 +140,14 @@ impl<'a> RawFileReader<'a> {
 
     /// Uses `format` instead of detecting it.
     #[must_use]
-    pub fn with_format(mut self, format: RawFormat) -> Self {
+    pub const fn with_format(mut self, format: RawFormat) -> Self {
         self.format = Some(format);
         self
     }
 
     /// Reads a binary payload in `byte_order`.
     #[must_use]
-    pub fn with_byte_order(mut self, byte_order: BinaryByteOrder) -> Self {
+    pub const fn with_byte_order(mut self, byte_order: BinaryByteOrder) -> Self {
         self.byte_order = byte_order;
         self
     }

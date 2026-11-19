@@ -820,7 +820,7 @@ impl SparseLu {
 
     /// Pivot order for subsequent identical-pattern assemblies.
     #[must_use]
-    pub fn symbolic(&self) -> &SparseSymbolic {
+    pub const fn symbolic(&self) -> &SparseSymbolic {
         &self.symbolic
     }
 

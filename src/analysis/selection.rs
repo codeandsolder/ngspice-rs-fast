@@ -195,7 +195,7 @@ impl Selection {
 
     /// True when the driver's whole plot is written, in the driver's order.
     #[must_use]
-    pub fn is_full(&self) -> bool {
+    pub const fn is_full(&self) -> bool {
         self.full
     }
 
