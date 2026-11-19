@@ -86,10 +86,9 @@ pub fn is_binnable(card: &ModelCard) -> bool {
         .iter()
         .any(|base| card.base.eq_ignore_ascii_case(base));
     let level = card.level.unwrap_or(1.);
-    let rounded = (level + 0.5).floor();
-    mos && level.is_finite()
-        && (0.0..=99.0).contains(&rounded)
-        && BINNABLE_MOS_LEVELS.contains(&(rounded as u8))
+    mos && crate::primitives::c_integer(level)
+        .and_then(|rounded| u8::try_from(rounded).ok())
+        .is_some_and(|rounded| BINNABLE_MOS_LEVELS.contains(&rounded))
 }
 
 /// Front-end settings that `INPgetModBin` reads from the option table.

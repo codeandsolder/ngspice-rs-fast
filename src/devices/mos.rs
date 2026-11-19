@@ -293,13 +293,14 @@ impl Common {
                 // case outside 0..=3 (the flicker density is then the bare
                 // gain), which the port rejects.
                 let raw = get("nlev").unwrap_or(2.);
-                let rounded = (raw + 0.5).floor();
-                if !(0. ..=3.).contains(&rounded) {
-                    return Err(SpiceError::circuit(format!(
-                        "{label} NLEV must round to 0..=3 ({noise_file}), got {raw}"
-                    )));
-                }
-                rounded as u8
+                crate::primitives::c_integer(raw)
+                    .and_then(|rounded| u8::try_from(rounded).ok())
+                    .filter(|rounded| *rounded <= 3)
+                    .ok_or_else(|| {
+                        SpiceError::circuit(format!(
+                            "{label} NLEV must round to 0..=3 ({noise_file}), got {raw}"
+                        ))
+                    })?
             },
             gdsnoi: get("gdsnoi").unwrap_or(1.),
         };

@@ -293,19 +293,18 @@ fn canonical<'a>(
 /// `floor(raw + 0.5)` integer selector (`inpgval.c` `IF_INTEGER`) within `0..=max`.
 fn selector(values: &ScalarValues, name: &str, max: u8, owner: &DeviceInstance) -> SpiceResult<u8> {
     let raw = value(values, name)?;
-    let rounded = (raw + 0.5).floor();
-    if (0. ..=Real::from(max)).contains(&rounded) {
-        // In range 0..=max, so the cast is exact.
-        Ok(rounded as u8)
-    } else {
-        Err(SpiceError::parse(
-            values
-                .get(name)
-                .and_then(|v| v.location.clone())
-                .unwrap_or_else(|| owner.location.clone()),
-            format!("diode {name} must round to 0..={max}, got {raw}"),
-        ))
-    }
+    crate::primitives::c_integer(raw)
+        .and_then(|rounded| u8::try_from(rounded).ok())
+        .filter(|rounded| *rounded <= max)
+        .ok_or_else(|| {
+            SpiceError::parse(
+                values
+                    .get(name)
+                    .and_then(|v| v.location.clone())
+                    .unwrap_or_else(|| owner.location.clone()),
+                format!("diode {name} must round to 0..={max}, got {raw}"),
+            )
+        })
 }
 
 /// A level-1 diode with an optional internal anode for series resistance.

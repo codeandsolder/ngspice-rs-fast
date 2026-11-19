@@ -703,16 +703,16 @@ fn family(card: &ModelCard) -> SpiceResult<ModelFamily> {
 }
 
 fn rounded_level(raw: Real, location: &SourceLoc) -> SpiceResult<u8> {
-    let rounded = (raw + 0.5).floor();
     // Stricter than INPfindLev's warning/fallback and unsafe C casts. Reject
     // negative raw/nonfinite/out-of-range values, including invalid duplicates.
-    if !raw.is_finite() || raw < 0.0 || !(0.0..=99.0).contains(&rounded) {
-        return Err(SpiceError::parse(
+    // C's shared rounding rule is separate from the model-level range.
+    match crate::primitives::c_integer(raw).and_then(|rounded| u8::try_from(rounded).ok()) {
+        Some(rounded) if raw >= 0. && rounded <= 99 => Ok(rounded),
+        _ => Err(SpiceError::parse(
             location.clone(),
             "model level must be finite, nonnegative and round into 0..=99",
-        ));
+        )),
     }
-    Ok(rounded as u8)
 }
 
 /// The C device directory `inpdomod.c` selects for an unported NMOS/PMOS
