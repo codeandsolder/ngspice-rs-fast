@@ -436,7 +436,7 @@ impl Circuit {
             replacements
                 .iter()
                 .find(|(i, _)| *i == index)
-                .map_or(self.devices[index].as_ref(), |(_, d)| d.as_ref())
+                .map_or_else(|| self.devices[index].as_ref(), |(_, d)| d.as_ref())
         };
         let mut values: std::collections::BTreeMap<usize, InductanceValue> =
             std::collections::BTreeMap::new();

@@ -594,7 +594,7 @@ impl Expander<'_> {
         let mut map: BTreeMap<String, LocalModel> = BTreeMap::new();
         for (order, card) in self.netlist.models.iter().enumerate() {
             map.entry(card.name.to_ascii_lowercase())
-                .or_insert(LocalModel {
+                .or_insert_with(|| LocalModel {
                     name: card.name.clone(),
                     card: card.clone(),
                     emitted: true,
@@ -616,7 +616,7 @@ impl Expander<'_> {
                 ..card.clone()
             };
             map.entry(card.name.to_ascii_lowercase())
-                .or_insert(LocalModel {
+                .or_insert_with(|| LocalModel {
                     name,
                     card: renamed,
                     emitted: false,

@@ -193,7 +193,7 @@ pub fn run_with_format(
     // Options are validated before anything runs, exactly as `parse` does:
     // unknown or unsupported settings are errors, never ignored.
     let config = RunConfig::from_netlist(netlist)?;
-    let format = format.or(config.raw_format()).unwrap_or_else(|| {
+    let format = format.or_else(|| config.raw_format()).unwrap_or_else(|| {
         // C uses atoi: leading signed integer, nonzero means ASCII.
         let value = std::env::var("SPICE_ASCIIRAWFILE").unwrap_or_default();
         let value = value.trim_start();

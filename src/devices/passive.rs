@@ -352,8 +352,10 @@ impl ResolvedModel<'_> {
             && (optional(&instance_values, "l").is_some()
                 || optional(&instance_values, "w").is_some())
         {
-            let length = optional(&instance_values, "l").unwrap_or(value(&model, "l", 10e-6));
-            let width = optional(&instance_values, "w").unwrap_or(value(&model, "defw", 10e-6));
+            let length =
+                optional(&instance_values, "l").unwrap_or_else(|| value(&model, "l", 10e-6));
+            let width =
+                optional(&instance_values, "w").unwrap_or_else(|| value(&model, "defw", 10e-6));
             (length - 2.0 * value(&model, "short", 0.0)).powf(value(&model, "lf", 1.0))
                 * (width - 2.0 * value(&model, "narrow", 0.0)).powf(value(&model, "wf", 1.0))
         } else {
@@ -364,8 +366,8 @@ impl ResolvedModel<'_> {
             nominal_value: base,
             temperature: optional(&instance_values, "temp"),
             nominal_temperature: optional(&model, "tnom"),
-            tc1: optional(&instance_values, "tc1").unwrap_or(value(&model, "tc1", 0.0)),
-            tc2: optional(&instance_values, "tc2").unwrap_or(value(&model, "tc2", 0.0)),
+            tc1: optional(&instance_values, "tc1").unwrap_or_else(|| value(&model, "tc1", 0.0)),
+            tc2: optional(&instance_values, "tc2").unwrap_or_else(|| value(&model, "tc2", 0.0)),
             scale: value(&instance_values, "scale", 1.0),
             multiplicity: value(&instance_values, "m", 1.0),
             initial_condition: optional(&instance_values, "ic"),
@@ -394,8 +396,8 @@ fn model_value(
             // RESsetup supplies positive default L/W (10 um); positive RSH
             // therefore takes precedence over model R, even without L/W given.
             if sheet > 0.0 {
-                let length = optional(instance, "l").unwrap_or(value(model, "l", 10e-6));
-                let width = optional(instance, "w").unwrap_or(value(model, "defw", 10e-6));
+                let length = optional(instance, "l").unwrap_or_else(|| value(model, "l", 10e-6));
+                let width = optional(instance, "w").unwrap_or_else(|| value(model, "defw", 10e-6));
                 let length = corrected(length, 2.0 * value(model, "short", 0.0), location, "effective resistor length")?;
                 let width = corrected(width, 2.0 * value(model, "narrow", 0.0), location, "effective resistor width")?;
                 let squares = finite(length / width, location, "resistor square count")?;
@@ -409,7 +411,7 @@ fn model_value(
             // CAPsetup stores DEFL but initializes missing instance length to
             // zero without applying it. Require explicit positive L instead.
             let length = optional(instance, "l").ok_or_else(|| SpiceError::parse(location.clone(), "capacitor geometry requires instance l; C setup does not apply model defl"))?;
-            let width = optional(instance, "w").unwrap_or(value(model, "defw", 10e-6));
+            let width = optional(instance, "w").unwrap_or_else(|| value(model, "defw", 10e-6));
             let length = corrected(length, value(model, "short", 0.0), location, "effective capacitor length")?;
             let width = corrected(width, value(model, "narrow", 0.0), location, "effective capacitor width")?;
             let area = finite(width * length, location, "capacitor area")?;

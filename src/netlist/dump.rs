@@ -308,7 +308,7 @@ impl Ctx<'_> {
             SpiceError::Unsupported { feature, location } => {
                 let at = location
                     .as_ref()
-                    .map_or("none".to_owned(), |l| format!("@{}", self.loc(l)));
+                    .map_or_else(|| "none".to_owned(), |l| format!("@{}", self.loc(l)));
                 out.line(indent, format!("error unsupported {at}"));
                 out.line(indent + 1, format!("feature: {}", m(feature)));
             }
@@ -508,7 +508,7 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
                 "model [{n}] name={} base={} level={} @{}",
                 quote(&model.name),
                 quote(&model.base),
-                model.level.map_or("none".to_owned(), real),
+                model.level.map_or_else(|| "none".to_owned(), real),
                 ctx.loc(&model.location)
             ),
         );
@@ -579,11 +579,11 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
                 include
                     .resolved_path
                     .as_ref()
-                    .map_or("none".to_owned(), |p| quote(&ctx.paths.map(p))),
+                    .map_or_else(|| "none".to_owned(), |p| quote(&ctx.paths.map(p))),
                 include
                     .section
                     .as_ref()
-                    .map_or("none".to_owned(), |s| quote(s)),
+                    .map_or_else(|| "none".to_owned(), |s| quote(s)),
                 ctx.loc(&include.location)
             ),
         );
@@ -659,7 +659,7 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
             let value = setting
                 .value
                 .as_ref()
-                .map_or("flag".to_owned(), |v| positioned(ctx, v));
+                .map_or_else(|| "flag".to_owned(), |v| positioned(ctx, v));
             out.line(
                 indent + 2,
                 format!(
@@ -792,7 +792,7 @@ fn write_device(ctx: &Ctx<'_>, out: &mut Out, indent: usize, n: usize, device: &
             device
                 .model
                 .as_ref()
-                .map_or("none".to_owned(), |m| quote(m))
+                .map_or_else(|| "none".to_owned(), |m| quote(m))
         ),
     );
     write_parameters(ctx, out, indent + 1, &device.parameters);
@@ -803,7 +803,7 @@ fn positioned(ctx: &Ctx<'_>, value: &PositionedValue) -> String {
 }
 
 fn optional(ctx: &Ctx<'_>, value: Option<&PositionedValue>) -> String {
-    value.map_or("none".to_owned(), |v| positioned(ctx, v))
+    value.map_or_else(|| "none".to_owned(), |v| positioned(ctx, v))
 }
 
 fn write_parameters(

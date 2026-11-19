@@ -139,9 +139,10 @@ impl Circuit {
                 let device: &dyn Device = replacements
                     .iter()
                     .find(|(i, _)| *i == index)
-                    .map_or(self.devices()[index].as_ref(), |(_, d)| d.as_ref());
+                    .map_or_else(|| self.devices()[index].as_ref(), |(_, d)| d.as_ref());
                 let power = matches!(key, "p" | "power");
-                let value = if let Some(port) = terminal(device, key).or(power.then_some(0)) {
+                let value = if let Some(port) = terminal(device, key).or_else(|| power.then_some(0))
+                {
                     if power && device.terminals().len() != 2 {
                         return Err(gap(name));
                     }
@@ -258,7 +259,7 @@ impl Circuit {
                 let device: &dyn Device = replacements
                     .iter()
                     .find(|(i, _)| *i == index)
-                    .map_or(self.devices()[index].as_ref(), |(_, d)| d.as_ref());
+                    .map_or_else(|| self.devices()[index].as_ref(), |(_, d)| d.as_ref());
                 if terminal(device, key).is_some() || matches!(key, "p" | "power") {
                     return Err(gap(&format!("{name}: AC current/power ask")));
                 }

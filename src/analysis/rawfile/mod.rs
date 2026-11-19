@@ -753,7 +753,7 @@ fn parse_header(cursor: &mut Cursor<'_>) -> SpiceResult<Option<(Header, Section)
     };
     let key = line
         .split_once(':')
-        .map_or(line.trim(), |(key, _)| key.trim());
+        .map_or_else(|| line.trim(), |(key, _)| key.trim());
     let section = match key {
         "Values" => Section::Values,
         "Binary" => Section::Binary,
