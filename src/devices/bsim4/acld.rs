@@ -31,7 +31,7 @@ use crate::primitives::SpiceResult;
     clippy::too_many_lines,
     reason = "keeps the reference numerical routine in the original statement and rounding order"
 )] // One C function, kept in C's shape.
-pub(crate) fn ac_load(
+pub(super) fn ac_load(
     m: &Model,
     h: &Instance,
     p: &SizeParam,
@@ -698,7 +698,7 @@ pub(super) mod tests {
 
     /// Records every stamp, by kind.
     #[derive(Default)]
-    pub(crate) struct Recorder {
+    pub(in crate::devices::bsim4) struct Recorder {
         pub(crate) omega: f64,
         pub(crate) state: Vec<f64>,
         pub(crate) real: Vec<(i32, i32, f64)>,
@@ -736,7 +736,7 @@ pub(super) mod tests {
     }
 
     /// An instance with node fields as `b4set.c` leaves them.
-    pub(crate) fn shaped(rgate: i32, rbody: i32, trnqs: i32) -> Instance {
+    pub(in crate::devices::bsim4) fn shaped(rgate: i32, rbody: i32, trnqs: i32) -> Instance {
         let created = rbody != 0;
         Instance {
             dNode: node::D,
@@ -762,7 +762,7 @@ pub(super) mod tests {
     }
 
     /// Every stamp lands on an element `b4set.c` allocates.
-    pub(crate) fn check_shapes(
+    pub(in crate::devices::bsim4) fn check_shapes(
         run: impl Fn(&Model, &Instance, &mut Recorder),
         expect_cap: bool,
         charge_node: bool,

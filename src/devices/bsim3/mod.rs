@@ -19,7 +19,7 @@ pub use crate::devices::ifparam::{
 };
 
 /// The BSIM3v3.3 interface descriptor the shared input plumbing uses.
-pub(crate) const DEVICE: Device = Device {
+pub(in crate::devices) const DEVICE: Device = Device {
     reference: "bsim3/b3.c",
     model: parameters::MODEL,
     instance: parameters::INSTANCE,

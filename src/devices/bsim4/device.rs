@@ -62,7 +62,7 @@ struct SetUp {
 }
 
 /// One BSIM4 instance.
-pub(crate) struct Bsim4 {
+pub(in crate::devices) struct Bsim4 {
     pub(super) name: String,
     pub(super) model_name: String,
     /// External drain, gate, source, bulk, then the internal nodes in

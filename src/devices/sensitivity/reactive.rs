@@ -75,7 +75,7 @@ const MU_ZERO: Real = 4.0 * std::f64::consts::PI * 1e-7;
 
 /// Which reactive element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReactiveKind {
+pub(in crate::devices) enum ReactiveKind {
     /// A capacitor.
     Capacitor,
     /// An inductor.
@@ -85,7 +85,7 @@ pub(crate) enum ReactiveKind {
 /// The values a capacitor or inductor card gave, `None` where it gave none
 /// (keywords as in C's tables).
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct ReactiveInputs {
+pub(in crate::devices) struct ReactiveInputs {
     /// Written instance setters: `(keyword, value)`; `temp` in Celsius.
     pub instance: Vec<(&'static str, Real)>,
     /// Written model setters: `(keyword, value)`; `tnom` in Celsius.
@@ -94,7 +94,7 @@ pub(crate) struct ReactiveInputs {
 
 /// A capacitor's or inductor's `.sens` description.
 #[derive(Debug)]
-pub(crate) struct ReactiveSensitivity {
+pub(in crate::devices) struct ReactiveSensitivity {
     kind: ReactiveKind,
     name: String,
     model: Option<String>,

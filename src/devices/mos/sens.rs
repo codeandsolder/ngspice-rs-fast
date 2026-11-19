@@ -28,7 +28,7 @@ use std::cell::OnceCell;
 
 /// Level-owned model record mapping. `derived` selects the already-stored
 /// process fields rather than recomputing them in the replacement's load.
-pub(crate) trait SensitivityLevel: MosLevel {
+pub(in crate::devices) trait SensitivityLevel: MosLevel {
     const FAMILY: SensitivityFamily;
     const MODEL: &'static [P];
     const INSTANCE: &'static [P];
@@ -49,7 +49,7 @@ pub(crate) trait SensitivityLevel: MosLevel {
 }
 
 /// `mosX.c`: levels 2/3/9 make IC voltages AC-only; level 1 does not.
-pub(crate) const INSTANCE: &[P] = &[
+pub(in crate::devices) const INSTANCE: &[P] = &[
     P::dc("m"),
     P::dc("l"),
     P::dc("w"),
@@ -67,7 +67,7 @@ pub(crate) const INSTANCE: &[P] = &[
 ];
 
 /// Common `mosXset.c` fields, retaining optional resistance flags.
-pub(crate) fn record_common(c: &Common, context: &ModelContext) -> Record {
+pub(in crate::devices) fn record_common(c: &Common, context: &ModelContext) -> Record {
     let mut record = Record::new();
     for (k, value, given) in [
         ("rd", c.rd.unwrap_or(0.), c.rd.is_some()),
@@ -105,7 +105,7 @@ pub(crate) fn record_common(c: &Common, context: &ModelContext) -> Record {
 }
 
 /// The common fields read by `mosXtemp.c` and `mosXload.c`.
-pub(crate) fn update_common(c: &mut Common, r: &Record) -> SpiceResult<()> {
+pub(in crate::devices) fn update_common(c: &mut Common, r: &Record) -> SpiceResult<()> {
     c.rd = optional(r, "rd", false)?;
     c.rs = optional(r, "rs", false)?;
     c.rsh = optional(r, "rsh", false)?;
@@ -129,14 +129,21 @@ pub(crate) fn update_common(c: &mut Common, r: &Record) -> SpiceResult<()> {
 }
 
 /// C's field value with the setter flag, or an already-derived field.
-pub(crate) fn optional(r: &Record, k: &str, derived: bool) -> SpiceResult<Option<Real>> {
+pub(in crate::devices) fn optional(
+    r: &Record,
+    k: &str,
+    derived: bool,
+) -> SpiceResult<Option<Real>> {
     (derived || r.given(k)).then(|| r.value(k)).transpose()
 }
 
 /// `mosXset.c` resets process defaults on every visit until restored/given.
 /// `gain` names the level's conductance setter default; `mos2set.c`, unlike
 /// levels 1/3/9 (`transconductance`) and 6 (`kc`), has none of its own.
-pub(crate) fn setup_process(r: &mut Record, gain: Option<(&str, Real)>) -> SpiceResult<()> {
+pub(in crate::devices) fn setup_process(
+    r: &mut Record,
+    gain: Option<(&str, Real)>,
+) -> SpiceResult<()> {
     let fields = [
         ("vto", 0.),
         (gain.map_or("", |(k, _)| k), gain.map_or(0., |(_, v)| v)),
@@ -153,7 +160,7 @@ pub(crate) fn setup_process(r: &mut Record, gain: Option<(&str, Real)>) -> Spice
 }
 
 #[derive(Debug)]
-pub(crate) struct MosSensitivity<'a, L: SensitivityLevel> {
+pub(in crate::devices) struct MosSensitivity<'a, L: SensitivityLevel> {
     pub(crate) device: &'a Mosfet<L>,
     pub(crate) context: ModelContext,
 }

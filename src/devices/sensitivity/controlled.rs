@@ -22,7 +22,7 @@ const GAIN_M: &[P] = &[P::dc("gain"), P::dc("m")];
 
 /// A controlled source's `.sens` description.
 #[derive(Debug)]
-pub(crate) struct ControlledSensitivity<'a> {
+pub(in crate::devices) struct ControlledSensitivity<'a> {
     source: &'a ControlledSource,
     coefficient: Real,
     multiplier: Option<Real>,

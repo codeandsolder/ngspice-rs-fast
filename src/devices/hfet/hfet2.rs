@@ -395,7 +395,7 @@ struct Nodes {
 
 /// HFET2, `Z` level 6.
 #[derive(Debug, Clone)]
-pub(crate) struct Hfet2 {
+pub(in crate::devices) struct Hfet2 {
     name: String,
     model_name: String,
     terminals: Vec<NodeId>,

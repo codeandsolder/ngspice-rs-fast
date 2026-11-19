@@ -12,7 +12,7 @@ use crate::maths::Vector;
 use crate::maths::complex::ComplexMatrix;
 use crate::primitives::{Complex, Real, SpiceResult};
 
-pub(crate) fn run(
+pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &crate::analysis::AnalysisContext,
@@ -58,7 +58,7 @@ pub(crate) fn run(
 /// Which C frequency loop a grid follows: `acan.c` has a special decade delta
 /// that `span.c` lacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GridKind {
+pub(super) enum GridKind {
     /// `.ac` (`ACan`).
     Ac,
     /// `.sp` (`SPan`).
@@ -76,7 +76,7 @@ pub(crate) enum GridKind {
 /// patch tests `ACnumberSteps - 1 > 1`); `.ac dec` spanning a decade or more
 /// uses `delta = exp(ln(stop/start) / floor(|log10(stop/start)| * points))`
 /// so the last point lands on `stop`.
-pub(crate) fn frequency_grid(
+pub(super) fn frequency_grid(
     arguments: &[String],
     reltol: Real,
     kind: GridKind,
@@ -147,7 +147,7 @@ pub(crate) fn frequency_grid(
 ///
 /// # Errors
 /// Invalid assembly.
-pub(crate) fn ac_matrix(
+pub(super) fn ac_matrix(
     circuit: &Circuit,
     system: &LinearSystem,
     omega: Real,
@@ -168,7 +168,7 @@ pub(crate) fn ac_matrix(
 
 /// The circuit linearized at its DC operating point, as `acan.c` and `span.c`
 /// prepare it before their frequency loops.
-pub(crate) struct SmallSignal {
+pub(super) struct SmallSignal {
     settings: crate::analysis::bias::DcSettings,
     state1: Vec<Real>,
     system: LinearSystem,

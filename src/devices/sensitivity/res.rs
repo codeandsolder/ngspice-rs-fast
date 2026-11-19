@@ -48,7 +48,7 @@ const RESMIN: Real = 1e-12;
 
 /// The values a resistor card gave, `None` where it gave none.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(crate) struct ResistorInputs {
+pub(in crate::devices) struct ResistorInputs {
     /// Instance resistance.
     pub resistance: Option<Real>,
     /// Instance `temp=` (Celsius).
@@ -82,7 +82,7 @@ pub(crate) struct ResistorInputs {
 
 /// A resistor's `.sens` description.
 #[derive(Debug)]
-pub(crate) struct ResistorSensitivity {
+pub(in crate::devices) struct ResistorSensitivity {
     name: String,
     model: Option<String>,
     terminals: [NodeId; 2],

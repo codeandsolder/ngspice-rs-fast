@@ -60,7 +60,7 @@ const DEFAULT_THRESHOLD: f64 = 1.0e-3;
 const TIES_MULTIPLIER: i64 = 5;
 
 /// Matrix entry type: `f64` for real systems, [`Complex`] for AC.
-pub(crate) trait Scalar: Copy + PartialEq + std::fmt::Debug {
+pub(super) trait Scalar: Copy + PartialEq + std::fmt::Debug {
     /// Additive identity.
     const ZERO: Self;
     /// C `ELEMENT_MAG`: `|re| + |im|`.
@@ -148,7 +148,7 @@ impl Scalar for Complex {
 /// SPARSE's error state (`spOKAY`, `spSMALL_PIVOT`, `spZERO_DIAG`,
 /// `spSINGULAR`). ngspice maps `spSMALL_PIVOT` to `OK`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Status {
+pub(super) enum Status {
     Okay,
     SmallPivot,
     ZeroDiag,
@@ -174,7 +174,7 @@ enum Slot {
 /// A SPARSE matrix frame (`struct MatrixFrame`) with 1-based internal and
 /// external indices; external index 0 (ground) is never used here.
 #[derive(Debug, Clone)]
-pub(crate) struct Sparse<T> {
+pub(super) struct Sparse<T> {
     /// Internal order (C `Size`): the rows translated so far. An external
     /// index never referenced by an element has no internal row; as in
     /// ngspice, its solution entry is left holding the right-hand side.
@@ -1607,7 +1607,7 @@ impl<T: Scalar> Sparse<T> {
 }
 
 /// Scalar operations used only by [`Sparse::determinant`].
-pub(crate) trait DeterminantScale: Scalar {
+pub(super) trait DeterminantScale: Scalar {
     /// One.
     fn one() -> Self;
     /// C's per-pivot update: real `det /= diag` (diag holds `1/pivot`), complex

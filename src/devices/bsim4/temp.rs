@@ -110,7 +110,7 @@ fn dio_ijth_vjm_eval(Nvtm: f64, Ijth: f64, Isb: f64, XExpBV: f64) -> f64 {
 }
 
 /// A C `printf("%g")` spelling for the ported messages.
-pub(crate) fn c_g(value: f64) -> String {
+pub(super) fn c_g(value: f64) -> String {
     if value == 0.0 {
         return if value.is_sign_negative() { "-0" } else { "0" }.into();
     }
@@ -149,7 +149,7 @@ fn bad_parameter(message: String) -> SpiceError {
 /// The locals `BSIM4temp`'s model pass computes and its instance loop
 /// reads (C keeps them as function locals across the loop).
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ModelTemp {
+pub(super) struct ModelTemp {
     /// C local `Temp`.
     pub(crate) Temp: f64,
     /// C local `Tnom`.
@@ -201,7 +201,7 @@ pub(crate) struct ModelTemp {
     clippy::assign_op_pattern,
     reason = "retains the reference calculation grouping and floating-point operation order"
 )]
-pub(crate) fn temperature_model(
+pub(super) fn temperature_model(
     m: &mut Model,
     temperature: f64,
     warnings: &mut Vec<String>,
@@ -619,7 +619,7 @@ pub(crate) fn temperature_model(
     clippy::collapsible_else_if,
     reason = "keeps ngspice C temperature branch topology unchanged"
 )] // A statement-by-statement port of C.
-pub(crate) fn temperature_instance(
+pub(super) fn temperature_instance(
     m: &mut Model,
     h: &mut Instance,
     locals: &ModelTemp,
@@ -1955,7 +1955,7 @@ pub(crate) fn temperature_instance(
 ///
 /// # Errors
 /// As [`temperature_instance`].
-pub(crate) fn temperature(
+pub(super) fn temperature(
     m: &mut Model,
     h: &mut Instance,
     temperature: f64,

@@ -41,7 +41,7 @@ pub struct SourceInputs {
 
 /// An independent source's `.sens` description.
 #[derive(Debug)]
-pub(crate) struct SourceSensitivity<'a> {
+pub(in crate::devices) struct SourceSensitivity<'a> {
     source: &'a IndependentSource,
     voltage: bool,
     /// The card's DC value (the function's time-zero value when not given).

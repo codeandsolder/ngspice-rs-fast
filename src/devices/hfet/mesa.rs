@@ -237,7 +237,7 @@ struct Nodes {
 
 /// MESA level 2.
 #[derive(Debug, Clone)]
-pub(crate) struct Mesa {
+pub(in crate::devices) struct Mesa {
     name: String,
     model_name: String,
     /// `mesasetup.c`/`inpdomod.c`'s level: 2 (`mesa1`), 3 (`mesa2`) or 4

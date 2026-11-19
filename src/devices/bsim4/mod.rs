@@ -58,7 +58,7 @@ pub fn literal_defaults() -> &'static [(&'static str, f64)] {
 }
 
 /// The BSIM4 interface descriptor the shared input plumbing uses.
-pub(crate) const DEVICE: Device = Device {
+pub(in crate::devices) const DEVICE: Device = Device {
     reference: "bsim4/b4.c",
     model: parameters::MODEL,
     instance: parameters::INSTANCE,

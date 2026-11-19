@@ -33,12 +33,12 @@ mod misc;
 mod reactive;
 mod res;
 mod source;
-pub(crate) use controlled::ControlledSensitivity;
-pub(crate) use misc::{BehaviouralSensitivity, MutualSensitivity, SwitchSensitivity};
-pub(crate) use reactive::{ReactiveInputs, ReactiveKind, ReactiveSensitivity};
-pub(crate) use res::{ResistorInputs, ResistorSensitivity};
+pub(super) use controlled::ControlledSensitivity;
+pub(super) use misc::{BehaviouralSensitivity, MutualSensitivity, SwitchSensitivity};
+pub(super) use reactive::{ReactiveInputs, ReactiveKind, ReactiveSensitivity};
+pub(super) use res::{ResistorInputs, ResistorSensitivity};
 pub use source::SourceInputs;
-pub(crate) use source::SourceSensitivity;
+pub(super) use source::SourceSensitivity;
 
 use crate::devices::{Device, LinearContext, StampContext};
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};

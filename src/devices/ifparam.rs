@@ -14,7 +14,7 @@ use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 ///
 /// Compared by identity: two `Inputs` are equal when they were built from the
 /// same device descriptor and carry the same applied setters.
-pub(crate) struct Device {
+pub(super) struct Device {
     /// Diagnostic reference for the C setter file, e.g. `bsim3/b3.c`.
     pub(crate) reference: &'static str,
     /// Generated model table, in C order.
@@ -219,7 +219,7 @@ pub struct Inputs {
 }
 
 impl Inputs {
-    pub(crate) fn new(device: &'static Device, is_model: bool) -> Self {
+    pub(super) fn new(device: &'static Device, is_model: bool) -> Self {
         Self {
             device,
             table: if is_model {
@@ -342,7 +342,7 @@ impl Inputs {
     }
 }
 
-pub(crate) fn descriptor(table: &'static [Parameter], name: &str) -> Option<&'static Parameter> {
+pub(super) fn descriptor(table: &'static [Parameter], name: &str) -> Option<&'static Parameter> {
     table
         .iter()
         .find(|parameter| parameter.name.eq_ignore_ascii_case(name))
@@ -354,7 +354,7 @@ fn unsupported_setter(p: &ParameterAssignment, what: &str, reference: &str) -> S
     }
 }
 
-pub(crate) fn version_text(p: &ParameterAssignment) -> SpiceResult<&str> {
+pub(super) fn version_text(p: &ParameterAssignment) -> SpiceResult<&str> {
     if !matches!(p.kind, ParameterKind::Scalar | ParameterKind::Textual)
         || p.value.is_empty()
         || !p

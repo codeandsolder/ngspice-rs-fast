@@ -55,7 +55,7 @@ const CSW: &[P] = &[P::dc("it"), P::dc("ih"), P::dc("ron"), P::dc("roff")];
 
 /// A B source's `.sens` description.
 #[derive(Debug)]
-pub(crate) struct BehaviouralSensitivity<'a> {
+pub(in crate::devices) struct BehaviouralSensitivity<'a> {
     source: &'a Behavioural,
     circuit_kelvin: Real,
 }
@@ -213,7 +213,7 @@ impl DeviceSensitivity for BehaviouralSensitivity<'_> {
 
 /// An S or W switch's `.sens` description.
 #[derive(Debug)]
-pub(crate) struct SwitchSensitivity<'a> {
+pub(in crate::devices) struct SwitchSensitivity<'a> {
     switch: &'a Switch,
     gmin: Real,
 }
@@ -378,7 +378,7 @@ impl DeviceSensitivity for SwitchSensitivity<'_> {
 /// C's `MUTfactor` (`factor`) and the mirrored inductances and branch rows
 /// of its inductors ([`DeviceSensitivity::coupled_inductors`]).
 #[derive(Debug)]
-pub(crate) struct MutualSensitivity<'a> {
+pub(in crate::devices) struct MutualSensitivity<'a> {
     coupling: &'a MutualInductance,
 }
 

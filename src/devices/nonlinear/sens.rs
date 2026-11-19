@@ -182,7 +182,7 @@ fn port_name(keyword: &str) -> &str {
 
 /// A diode's `.sens` description.
 #[derive(Debug)]
-pub(crate) struct DiodeSensitivity<'a> {
+pub(in crate::devices) struct DiodeSensitivity<'a> {
     diode: &'a Diode,
     circuit_kelvin: Real,
     nominal_kelvin: Real,

@@ -26,7 +26,7 @@ use crate::primitives::Real;
 
 /// C's `Dderivs`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(crate) struct Dderivs {
+pub(in crate::devices) struct Dderivs {
     /// Function value at the expansion point.
     pub value: Real,
     /// Order-1 partial derivative with respect to p.

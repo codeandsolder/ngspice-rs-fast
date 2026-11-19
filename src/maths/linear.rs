@@ -133,7 +133,10 @@ pub(crate) fn solver_warning(message: String) {
 
 /// Warns about circuit unknowns with no matrix entries (see the module
 /// documentation): C keeps their right-hand side as their solution.
-pub(crate) fn warn_untranslated<T: Scalar>(sparse: &Sparse<T>, names: Option<&UnknownNames>) {
+pub(in crate::maths) fn warn_untranslated<T: Scalar>(
+    sparse: &Sparse<T>,
+    names: Option<&UnknownNames>,
+) {
     if sparse.fully_translated() {
         return;
     }
@@ -164,7 +167,7 @@ fn rhs_valid(rhs: &Vector, n: usize) -> SpiceResult<()> {
 /// row: `singular matrix:  check nodes <col> and <row>`, or `check node
 /// <name>` when both name one unknown). `spSMALL_PIVOT`, which ngspice maps
 /// to `OK` without a message, is accepted with a [`solver_warning`].
-pub(crate) fn check_status<T: Scalar>(
+pub(in crate::maths) fn check_status<T: Scalar>(
     context: &str,
     status: Status,
     sparse: &Sparse<T>,
@@ -209,7 +212,7 @@ pub(crate) fn check_status<T: Scalar>(
 /// A circuit matrix (`circuit`: a bound matrix, or one carrying unknown
 /// `names`) may leave unknowns without entries, as C does; a standalone one
 /// may not.
-pub(crate) fn order_fresh<T: Scalar>(
+pub(in crate::maths) fn order_fresh<T: Scalar>(
     context: &str,
     sparse: &mut Sparse<T>,
     pivot: PivotTolerances,
@@ -363,7 +366,7 @@ fn solve_reusing(
 ///
 /// # Errors
 /// A singular matrix.
-pub(crate) fn factor_shared_complex(
+pub(in crate::maths) fn factor_shared_complex(
     pattern: &Arc<Pattern>,
     values: &[crate::primitives::Complex],
     pivot: PivotTolerances,
