@@ -122,7 +122,7 @@ impl Complex {
 
     /// True when both parts are finite.
     #[must_use]
-    pub fn is_finite(self) -> bool {
+    pub const fn is_finite(self) -> bool {
         self.re.is_finite() && self.im.is_finite()
     }
 

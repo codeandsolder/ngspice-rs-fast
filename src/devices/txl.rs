@@ -193,7 +193,7 @@ impl Txl {
         )
     }
     /// TSTALLOC order shared by setup and each load; row 0 is never ground.
-    fn positions(
+    const fn positions(
         p: Option<usize>,
         n: Option<usize>,
         a: usize,

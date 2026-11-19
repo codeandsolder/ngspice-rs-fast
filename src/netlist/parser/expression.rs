@@ -139,11 +139,11 @@ pub(super) fn ws(input: &mut In<'_>) -> Res<()> {
         .parse_next(input)
 }
 
-pub(super) fn is_ident_start(c: char) -> bool {
+pub(super) const fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
 
-pub(super) fn is_ident_continue(c: char) -> bool {
+pub(super) const fn is_ident_continue(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '.'
 }
 
@@ -171,7 +171,7 @@ fn describe(c: char) -> String {
     }
 }
 
-fn is_unsupported(c: char) -> bool {
+const fn is_unsupported(c: char) -> bool {
     matches!(
         c,
         '%' | '\\' | '!' | '<' | '>' | '=' | '&' | '|' | '?' | ':' | '\'' | '"'
@@ -202,7 +202,7 @@ fn enter(input: &mut In<'_>, remaining: usize) -> Res<()> {
     Ok(())
 }
 
-fn leave(input: &mut In<'_>) {
+const fn leave(input: &mut In<'_>) {
     input.state.depth = input.state.depth.saturating_sub(1);
 }
 

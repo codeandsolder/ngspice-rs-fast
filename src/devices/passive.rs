@@ -430,7 +430,7 @@ const fn p(name: &'static str, unit: U, domain: D, default: Option<Real>) -> Sca
         default,
     }
 }
-fn model_schema(family: ModelFamily) -> ScalarSchema<'static> {
+const fn model_schema(family: ModelFamily) -> ScalarSchema<'static> {
     const R: &[ScalarParameter] = &[
         p("r", U::Ohm, D::Positive, None),
         p("rsh", U::Ohm, D::NonNegative, Some(0.0)),

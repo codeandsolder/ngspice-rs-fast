@@ -29,7 +29,7 @@ pub(in crate::devices) struct ControlledSensitivity<'a> {
 }
 
 impl<'a> ControlledSensitivity<'a> {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         source: &'a ControlledSource,
         coefficient: Real,
         multiplier: Option<Real>,
@@ -41,7 +41,7 @@ impl<'a> ControlledSensitivity<'a> {
         }
     }
 
-    fn scaled(&self) -> bool {
+    const fn scaled(&self) -> bool {
         matches!(
             self.source.kind(),
             ControlledKind::Vccs | ControlledKind::Cccs

@@ -79,7 +79,7 @@ fn sqrt(x: f64) -> f64 {
 fn pow(x: f64, y: f64) -> f64 {
     x.powf(y)
 }
-fn fabs(x: f64) -> f64 {
+const fn fabs(x: f64) -> f64 {
     x.abs()
 }
 fn atan(x: f64) -> f64 {

@@ -112,7 +112,7 @@ impl IndependentSource {
 
     /// Selects C's PORT cosine time function, including its zero-amplitude
     /// nonport form. Values are initialized by `VSRCtemp`.
-    pub(crate) fn with_power_tone(mut self, tone: Option<(Real, Real)>) -> Self {
+    pub(crate) const fn with_power_tone(mut self, tone: Option<(Real, Real)>) -> Self {
         self.power_tone = tone;
         self
     }
@@ -121,7 +121,7 @@ impl IndependentSource {
     /// transient function, and the AC magnitude and phase (degrees) when any
     /// AC setter was written.
     #[must_use]
-    pub fn with_sensitivity_inputs(
+    pub const fn with_sensitivity_inputs(
         mut self,
         inputs: crate::devices::sensitivity::SourceInputs,
     ) -> Self {
@@ -175,7 +175,7 @@ impl IndependentSource {
     /// how pole-zero analysis treats a voltage source (`vsrcpzld.c`) and
     /// whether a `.noise` input reference is valid (`noisean.c`).
     #[must_use]
-    pub fn with_ac_given(mut self, given: bool) -> Self {
+    pub const fn with_ac_given(mut self, given: bool) -> Self {
         self.ac_given = given;
         self
     }

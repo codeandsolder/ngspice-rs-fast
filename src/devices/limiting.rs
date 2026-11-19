@@ -338,7 +338,7 @@ impl Limiter {
         self.changed(raw, limvds(raw, previous))
     }
 
-    fn changed(&mut self, _raw: Real, value: Real) -> Real {
+    const fn changed(&mut self, _raw: Real, value: Real) -> Real {
         // C flags only `DEVpnjlim` steps (`Check`) and leaves FET limiting to
         // the device convergence tests (`mos1conv.c`).
         value

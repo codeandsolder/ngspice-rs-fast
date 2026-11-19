@@ -219,7 +219,7 @@ pub struct Inputs {
 }
 
 impl Inputs {
-    pub(super) fn new(device: &'static Device, is_model: bool) -> Self {
+    pub(super) const fn new(device: &'static Device, is_model: bool) -> Self {
         Self {
             device,
             table: if is_model {

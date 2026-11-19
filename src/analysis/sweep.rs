@@ -73,7 +73,7 @@ impl SweepTarget {
     /// vectors, voltage and current names carry their `v(...)`/`i(...)`
     /// wrapping, as C's rawfile writes them.
     #[must_use]
-    pub fn scale(&self) -> (&'static str, &'static str) {
+    pub const fn scale(&self) -> (&'static str, &'static str) {
         match self {
             Self::VoltageSource(_) => ("v(v-sweep)", "voltage"),
             Self::CurrentSource(_) => ("i(i-sweep)", "current"),
@@ -92,7 +92,7 @@ impl SweepTarget {
         }
     }
     /// True when the swept value is a supplied resistance.
-    fn is_resistance(&self) -> bool {
+    const fn is_resistance(&self) -> bool {
         matches!(
             self,
             Self::Resistor(_)

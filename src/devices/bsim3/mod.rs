@@ -30,7 +30,7 @@ pub(in crate::devices) const DEVICE: Device = Device {
 
 /// C's `IF_UNINTERESTING` rows, as `TABLE:keyword` pairs.
 #[must_use]
-pub fn uninteresting() -> &'static [&'static str] {
+pub const fn uninteresting() -> &'static [&'static str] {
     DEVICE.uninteresting
 }
 

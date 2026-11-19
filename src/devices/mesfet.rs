@@ -968,7 +968,7 @@ pub(super) struct MesfetSensitivity<'a> {
 }
 
 impl<'a> MesfetSensitivity<'a> {
-    pub(super) fn new(device: &'a Mesfet) -> Self {
+    pub(super) const fn new(device: &'a Mesfet) -> Self {
         Self { device }
     }
 }

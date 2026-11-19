@@ -124,7 +124,7 @@ impl ReactiveSensitivity {
         }
     }
 
-    fn fields(&self) -> (&'static [&'static str], &'static [&'static str]) {
+    const fn fields(&self) -> (&'static [&'static str], &'static [&'static str]) {
         match self.kind {
             ReactiveKind::Capacitor => (
                 &[

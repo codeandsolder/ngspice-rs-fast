@@ -110,7 +110,7 @@ fn log(x: f64) -> f64 {
 fn sqrt(x: f64) -> f64 {
     x.sqrt()
 }
-fn fabs(x: f64) -> f64 {
+const fn fabs(x: f64) -> f64 {
     x.abs()
 }
 /// `b4ld.c`'s `DEXP(A, B, C)` macro: returns `(B, C)`.

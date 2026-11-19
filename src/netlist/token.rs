@@ -92,7 +92,7 @@ impl Token {
 
     /// The value, when this token is a number.
     #[must_use]
-    pub fn number(&self) -> Option<Real> {
+    pub const fn number(&self) -> Option<Real> {
         match self.kind {
             TokenKind::Number(value) => Some(value),
             _ => None,
@@ -108,7 +108,7 @@ impl Token {
     /// True when the token is a word or a number, i.e. something that can be
     /// used as a name.
     #[must_use]
-    pub fn is_name_like(&self) -> bool {
+    pub const fn is_name_like(&self) -> bool {
         matches!(self.kind, TokenKind::Word | TokenKind::Number(_))
     }
 }

@@ -240,7 +240,7 @@ impl Args {
 
 /// The usage text.
 #[must_use]
-pub fn usage() -> &'static str {
+pub const fn usage() -> &'static str {
     "\
 spice-rs — a Rust port of ngspice
 
@@ -560,7 +560,7 @@ pub fn analyses_text() -> String {
     out
 }
 
-pub(crate) fn kind_name(kind: Kind) -> &'static str {
+pub(crate) const fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Kind::OperatingPoint => "DC operating point",
         Kind::DcSweep => "DC sweep",

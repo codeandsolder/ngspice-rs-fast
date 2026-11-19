@@ -1167,7 +1167,7 @@ pub(super) fn series_conductances(area: Real, rd: Real, rs: Real) -> [Real; 2] {
 }
 
 /// The d-d' and s-s' ports of the series resistances.
-pub(super) fn series_ports(terminals: &[NodeId], inner: [NodeId; 3]) -> [[NodeId; 2]; 2] {
+pub(super) const fn series_ports(terminals: &[NodeId], inner: [NodeId; 3]) -> [[NodeId; 2]; 2] {
     [[terminals[0], inner[0]], [terminals[2], inner[2]]]
 }
 

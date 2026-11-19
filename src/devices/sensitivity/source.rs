@@ -50,7 +50,7 @@ pub(in crate::devices) struct SourceSensitivity<'a> {
 }
 
 impl<'a> SourceSensitivity<'a> {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         source: &'a IndependentSource,
         voltage: bool,
         level: Real,

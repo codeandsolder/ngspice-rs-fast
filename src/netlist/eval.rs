@@ -575,7 +575,7 @@ impl ParamScope {
 
     /// The enclosing scope, if any.
     #[must_use]
-    pub fn parent(&self) -> Option<&Arc<ParamScope>> {
+    pub const fn parent(&self) -> Option<&Arc<ParamScope>> {
         self.parent.as_ref()
     }
 
@@ -789,7 +789,7 @@ impl FunctionScope {
 
     /// The enclosing scope, if any.
     #[must_use]
-    pub fn parent(&self) -> Option<&Arc<FunctionScope>> {
+    pub const fn parent(&self) -> Option<&Arc<FunctionScope>> {
         self.parent.as_ref()
     }
 

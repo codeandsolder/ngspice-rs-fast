@@ -21,7 +21,7 @@ struct ModelPassive {
 const STORAGE_QUANTITY: usize = 0;
 
 impl ModelPassive {
-    fn storage_kind(&self) -> Option<StorageKind> {
+    const fn storage_kind(&self) -> Option<StorageKind> {
         match self.parameters.family() {
             ModelFamily::Capacitor => Some(StorageKind::Capacitor),
             ModelFamily::Inductor => Some(StorageKind::Inductor),

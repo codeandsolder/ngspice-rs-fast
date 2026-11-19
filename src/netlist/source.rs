@@ -71,13 +71,13 @@ pub struct Deck {
 impl Deck {
     /// The number of cards, excluding the title.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.lines.len()
     }
 
     /// True when the deck has no cards.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.lines.is_empty()
     }
 }

@@ -219,14 +219,14 @@ pub(in crate::devices) struct SwitchSensitivity<'a> {
 }
 
 impl<'a> SwitchSensitivity<'a> {
-    pub(crate) fn new(switch: &'a Switch, context: &crate::devices::ModelContext) -> Self {
+    pub(crate) const fn new(switch: &'a Switch, context: &crate::devices::ModelContext) -> Self {
         Self {
             switch,
             gmin: context.gmin,
         }
     }
 
-    fn keys(&self) -> (&'static str, &'static str) {
+    const fn keys(&self) -> (&'static str, &'static str) {
         match self.switch.kind() {
             SwitchKind::Voltage => ("vt", "vh"),
             SwitchKind::Current => ("it", "ih"),

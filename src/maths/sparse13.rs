@@ -247,7 +247,7 @@ impl<T: Scalar> Sparse<T> {
     }
 
     /// Whether every external index has been translated (no empty unknown).
-    pub(crate) fn fully_translated(&self) -> bool {
+    pub(crate) const fn fully_translated(&self) -> bool {
         self.current_size == self.ext_size
     }
 
@@ -258,7 +258,7 @@ impl<T: Scalar> Sparse<T> {
     }
 
     /// External row and column of the last singular/zero pivot.
-    pub(crate) fn where_singular(&self) -> (usize, usize) {
+    pub(crate) const fn where_singular(&self) -> (usize, usize) {
         (self.singular_row, self.singular_col)
     }
 
@@ -752,7 +752,7 @@ impl<T: Scalar> Sparse<T> {
         self.done()
     }
 
-    fn done(&mut self) -> Status {
+    const fn done(&mut self) -> Status {
         self.needs_ordering = false;
         self.factored = true;
         self.status
@@ -1150,7 +1150,7 @@ impl<T: Scalar> Sparse<T> {
         self.markowitz_row[i].saturating_mul(self.markowitz_col[i])
     }
 
-    fn track_singleton(&mut self, new: i64, old: i64) {
+    const fn track_singleton(&mut self, new: i64, old: i64) {
         if (new == 0) != (old == 0) {
             if old == 0 {
                 self.singletons -= 1;

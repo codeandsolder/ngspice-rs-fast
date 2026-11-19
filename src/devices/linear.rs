@@ -389,7 +389,7 @@ pub struct LinearSystem {
 impl LinearSystem {
     /// Empty assembly for n unknowns.
     #[must_use]
-    pub fn new(n: usize) -> Self {
+    pub const fn new(n: usize) -> Self {
         Self {
             a: SparseMatrix::new(n, n),
             e: SparseMatrix::new(n, n),

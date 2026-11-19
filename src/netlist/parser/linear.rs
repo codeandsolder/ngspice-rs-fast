@@ -57,7 +57,7 @@ fn designator(token: &Token) -> char {
         .to_ascii_lowercase()
 }
 
-fn primary_name(designator: char) -> &'static str {
+const fn primary_name(designator: char) -> &'static str {
     match designator {
         'r' => "resistance",
         'c' => "capacitance",

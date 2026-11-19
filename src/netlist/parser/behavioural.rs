@@ -137,7 +137,7 @@ pub(super) fn expression_after(
 
 /// Byte offset of a token in its card's joined text (`tokenize` columns are
 /// one-based byte offsets).
-fn raw_offset(token: &Token) -> usize {
+const fn raw_offset(token: &Token) -> usize {
     token.location.column.saturating_sub(1) as usize
 }
 

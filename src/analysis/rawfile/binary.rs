@@ -98,7 +98,7 @@ pub enum BinaryByteOrder {
 
 impl BinaryByteOrder {
     /// Decodes one stored `double`.
-    fn decode(self, bytes: [u8; DOUBLE_BYTES]) -> Real {
+    const fn decode(self, bytes: [u8; DOUBLE_BYTES]) -> Real {
         match self {
             Self::LittleEndian => Real::from_le_bytes(bytes),
             Self::BigEndian => Real::from_be_bytes(bytes),
@@ -106,7 +106,7 @@ impl BinaryByteOrder {
     }
 
     /// Encodes one `double` for storage.
-    fn encode(self, value: Real) -> [u8; DOUBLE_BYTES] {
+    const fn encode(self, value: Real) -> [u8; DOUBLE_BYTES] {
         match self {
             Self::LittleEndian => value.to_le_bytes(),
             Self::BigEndian => value.to_be_bytes(),

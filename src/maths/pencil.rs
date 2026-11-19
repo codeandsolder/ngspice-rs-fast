@@ -229,7 +229,7 @@ struct Cx {
 
 impl Cx {
     const ZERO: Self = Self { re: 0.0, im: 0.0 };
-    fn new(re: Real, im: Real) -> Self {
+    const fn new(re: Real, im: Real) -> Self {
         Self { re, im }
     }
     fn scale(self, k: Real) -> Self {

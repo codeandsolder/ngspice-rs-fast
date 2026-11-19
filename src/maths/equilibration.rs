@@ -556,7 +556,7 @@ impl EquilibratedSparseLu {
 
     /// Reusable symbolic factors for an identical assembled sparse pattern.
     #[must_use]
-    pub fn symbolic(&self) -> &SparseSymbolic {
+    pub const fn symbolic(&self) -> &SparseSymbolic {
         self.factor.symbolic()
     }
 

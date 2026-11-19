@@ -12,7 +12,7 @@ use super::fields::{Instance, Model, SizeParam};
 use super::temp::c_g;
 
 /// C `fabs`.
-fn fabs(x: f64) -> f64 {
+const fn fabs(x: f64) -> f64 {
     x.abs()
 }
 

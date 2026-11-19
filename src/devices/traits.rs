@@ -259,7 +259,7 @@ impl MnaUnknowns {
     /// Reserves `count` rows after every node row, for branch currents.
     ///
     /// Returns the first reserved row, or `None` when `count` is zero.
-    pub fn add_rows(&mut self, count: usize) -> Option<usize> {
+    pub const fn add_rows(&mut self, count: usize) -> Option<usize> {
         if count == 0 {
             return None;
         }

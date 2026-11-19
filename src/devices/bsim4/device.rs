@@ -539,7 +539,7 @@ impl Prepared {
 /// processed one: C runs `BSIM4temp` on its single struct, which rewrites
 /// the temperature-derived members and leaves these (the next load reads
 /// `BSIM4von` for `DEVfetlim`).
-fn carry_load_members(from: &Instance, to: &mut Instance) {
+const fn carry_load_members(from: &Instance, to: &mut Instance) {
     to.AbovVgst2Vtm = from.AbovVgst2Vtm;
     to.Abulk = from.Abulk;
     to.Coxeff = from.Coxeff;

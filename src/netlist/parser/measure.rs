@@ -564,7 +564,7 @@ fn event(
     Ok((event, setters.window()))
 }
 
-fn operand_is_at(event: &MeasureEvent) -> bool {
+const fn operand_is_at(event: &MeasureEvent) -> bool {
     matches!(event, MeasureEvent::At { .. })
 }
 

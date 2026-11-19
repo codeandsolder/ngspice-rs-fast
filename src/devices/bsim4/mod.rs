@@ -53,7 +53,7 @@ mod temp;
 /// Generated from `b4set.c`'s given-guarded literal assignments, which
 /// `set.rs` reproduces in C order (a unit test there checks they agree).
 #[must_use]
-pub fn literal_defaults() -> &'static [(&'static str, f64)] {
+pub const fn literal_defaults() -> &'static [(&'static str, f64)] {
     defaults_data::LITERALS
 }
 
@@ -90,7 +90,7 @@ fn bsim4_model_real(p: &Parameter, value: Real, location: &SourceLoc) -> SpiceRe
 
 /// C's `IF_UNINTERESTING` rows, as `TABLE:keyword` pairs.
 #[must_use]
-pub fn uninteresting() -> &'static [&'static str] {
+pub const fn uninteresting() -> &'static [&'static str] {
     DEVICE.uninteresting
 }
 

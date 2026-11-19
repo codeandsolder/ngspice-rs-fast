@@ -149,7 +149,7 @@ impl IntegrationMethod {
 
     /// Parses `.option method=trap|gear` together with `maxord`.
     #[must_use]
-    pub fn parse(name: &str, gear_order: u8) -> Option<Self> {
+    pub const fn parse(name: &str, gear_order: u8) -> Option<Self> {
         if name.eq_ignore_ascii_case("trap") || name.eq_ignore_ascii_case("trapezoidal") {
             Some(Self::Trapezoidal)
         } else if name.eq_ignore_ascii_case("gear") {
@@ -365,7 +365,7 @@ impl StepHistory {
     }
 
     /// Forgets every accepted step, e.g. when a run restarts.
-    pub fn clear(&mut self) {
+    pub const fn clear(&mut self) {
         *self = Self {
             fill: self.fill,
             ..Self::new()
@@ -542,7 +542,7 @@ impl Coefficients {
     /// True when [`Self::integrate`] needs the previous accepted derivative.
     #[must_use]
     #[inline]
-    pub fn needs_previous_derivative(&self) -> bool {
+    pub const fn needs_previous_derivative(&self) -> bool {
         matches!(self.method, IntegrationMethod::Trapezoidal) && self.order == 2
     }
 

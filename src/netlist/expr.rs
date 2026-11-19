@@ -46,13 +46,13 @@ pub struct SourceSpan {
 impl SourceSpan {
     /// Span length in bytes.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.end.column.saturating_sub(self.start.column) as usize
     }
 
     /// True when the span covers no bytes.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }

@@ -86,7 +86,7 @@ const INTERNAL: [i32; 8] = [
 ];
 
 /// The instance's internal node members in [`INTERNAL`] order.
-fn internal_members(h: &Instance) -> [i32; 8] {
+const fn internal_members(h: &Instance) -> [i32; 8] {
     [
         h.dNodePrime,
         h.sNodePrime,

@@ -833,7 +833,7 @@ fn stand_in<'d>(circuit: &'d Circuit, index: usize, load: &'d SensitivityLoad) -
 /// entries).
 fn blocks(matrix: &SparseMatrix) -> Vec<usize> {
     let mut parent: Vec<usize> = (0..matrix.rows()).collect();
-    fn root(parent: &mut [usize], mut x: usize) -> usize {
+    const fn root(parent: &mut [usize], mut x: usize) -> usize {
         while parent[x] != x {
             parent[x] = parent[parent[x]];
             x = parent[x];
