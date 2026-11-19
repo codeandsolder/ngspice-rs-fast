@@ -83,9 +83,9 @@ use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
 
 /// ngspice `CONSTboltz`.
-const BOLTZMANN: Real = 1.38064852e-23;
+const BOLTZMANN: Real = 1.380_648_52e-23;
 /// ngspice `CHARGE`.
-const CHARGE: Real = 1.6021766208e-19;
+const CHARGE: Real = 1.602_176_620_8e-19;
 /// ngspice `CONSTKoverQ`.
 const K_OVER_Q: Real = BOLTZMANN / CHARGE;
 /// ngspice `REFTEMP` (27 C in kelvin).
@@ -598,7 +598,7 @@ struct Thermal {
 fn pbfact(t: Real) -> Real {
     let vt = K_OVER_Q * t;
     let egfet = 1.16 - (7.02e-4 * t * t) / (t + 1108.);
-    let arg = -egfet / (2. * BOLTZMANN * t) + 1.1150877 / (BOLTZMANN * (REFTEMP + REFTEMP));
+    let arg = -egfet / (2. * BOLTZMANN * t) + 1.115_087_7 / (BOLTZMANN * (REFTEMP + REFTEMP));
     -2. * vt * (1.5 * (t / REFTEMP).ln() + CHARGE * arg)
 }
 

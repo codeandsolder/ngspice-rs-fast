@@ -82,11 +82,11 @@ use super::host::{LoadCkt, mode, state};
 use crate::devices::limiting::{fetlim, limvds, pnjlim};
 use crate::primitives::SpiceResult;
 
-const MAX_EXPL: f64 = 2.688117142e+43;
-const MIN_EXPL: f64 = 3.720075976e-44;
+const MAX_EXPL: f64 = 2.688_117_142e+43;
+const MIN_EXPL: f64 = 3.720_075_976e-44;
 const EXPL_THRESHOLD: f64 = 100.0;
-const MAX_EXP: f64 = 5.834617425e14;
-const MIN_EXP: f64 = 1.713908431e-15;
+const MAX_EXP: f64 = 5.834_617_425e14;
+const MIN_EXP: f64 = 1.713_908_431e-15;
 const EXP_THRESHOLD: f64 = 34.0;
 const EPS0: f64 = 8.85418e-12;
 const EPSSI: f64 = 1.03594e-10;
@@ -97,9 +97,9 @@ const DELTA_4: f64 = 0.02;
 /// Smoothing coefficient.
 const MM: i32 = 3;
 /// `const.h`'s `CHARGE`.
-const CHARGE: f64 = 1.6021766208e-19;
+const CHARGE: f64 = 1.602_176_620_8e-19;
 /// `CONSTvt0 = CONSTboltz * REFTEMP / CHARGE` (`main.c`), REFTEMP = 27 C.
-const CONST_VT0: f64 = 1.38064852e-23 * (27.0 + 273.15) / CHARGE;
+const CONST_VT0: f64 = 1.380_648_52e-23 * (27.0 + 273.15) / CHARGE;
 
 fn exp(x: f64) -> f64 {
     x.exp()
@@ -2439,7 +2439,7 @@ pub(super) fn load(
                 Ggidld = T3 * dT1_dVd;
                 Ggidlg = T3 * dT1_dVg;
             } else {
-                Igidl = pParam.agidl * pParam.weffCJ * 3.720075976e-44;
+                Igidl = pParam.agidl * pParam.weffCJ * 3.720_075_976e-44;
                 Ggidld = Igidl * dT1_dVd;
                 Ggidlg = Igidl * dT1_dVg;
                 Igidl *= T1;
@@ -2483,7 +2483,7 @@ pub(super) fn load(
                 Ggisls = T3 * dT1_dVd;
                 Ggislg = T3 * dT1_dVg;
             } else {
-                Igisl = pParam.agisl * pParam.weffCJ * 3.720075976e-44;
+                Igisl = pParam.agisl * pParam.weffCJ * 3.720_075_976e-44;
                 Ggisls = Igisl * dT1_dVd;
                 Ggislg = Igisl * dT1_dVg;
                 Igisl *= T1;

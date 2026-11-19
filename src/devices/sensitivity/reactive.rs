@@ -68,7 +68,7 @@ const IND_INSTANCE: &[P] = &[
 ];
 
 /// `CONSTepsZero`, `CONSTepsSiO2` (`const.h`).
-const EPS_ZERO: Real = 8.854214871e-12;
+const EPS_ZERO: Real = 8.854_214_871e-12;
 const EPS_SIO2: Real = 3.9 * EPS_ZERO;
 /// `CONSTmuZero`.
 const MU_ZERO: Real = 4.0 * std::f64::consts::PI * 1e-7;
@@ -176,13 +176,13 @@ fn lundin(length: Real, csect: Real) -> Real {
     let xx = x * x;
     let xxxx = xx * xx;
     if x < 1. {
-        let num = 1. + 0.383901 * xx + 0.017108 * xxxx;
-        let den = 1. + 0.258952 * xx;
+        let num = 1. + 0.383_901 * xx + 0.017_108 * xxxx;
+        let den = 1. + 0.258_952 * xx;
         num / den - 4. * x / (3. * std::f64::consts::PI)
     } else {
-        let num = ((4. * x).ln() - 0.5) * (1. + 0.383901 / xx + 0.017108 / xxxx);
-        let den = 1. + 0.258952 / xx;
-        let kk = 0.093842 / xx + 0.002029 / xxxx - 0.000801 / (xx * xxxx);
+        let num = ((4. * x).ln() - 0.5) * (1. + 0.383_901 / xx + 0.017_108 / xxxx);
+        let den = 1. + 0.258_952 / xx;
+        let kk = 0.093_842 / xx + 0.002_029 / xxxx - 0.000_801 / (xx * xxxx);
         2. * (num / den + kk) / (std::f64::consts::PI * x)
     }
 }

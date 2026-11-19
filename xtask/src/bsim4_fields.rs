@@ -225,12 +225,12 @@ pub(crate) fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, Stri
          // bsim4/{{b4mask.c,b4ask.c}}.\n\
          // Regenerate: cargo xtask bsim4-schema --source /path/to/ngspice\n\n\
          /// `b4mask.c`: `(model parameter ID, member)` asks that read one real member.\n\
-         #[rustfmt::skip]\npub(crate) const MODEL: &[(&str, &str)] = &[\n"
+         #[rustfmt::skip]\npub(super) const MODEL: &[(&str, &str)] = &[\n"
     );
     for (id, member) in &model {
         writeln!(out, "    (\"{id}\", \"{member}\"),").map_err(|e| e.to_string())?;
     }
-    out.push_str("];\n\n/// `b4ask.c`: `(instance parameter ID, member)` asks that read one real member.\n#[rustfmt::skip]\npub(crate) const INSTANCE: &[(&str, &str)] = &[\n");
+    out.push_str("];\n\n/// `b4ask.c`: `(instance parameter ID, member)` asks that read one real member.\n#[rustfmt::skip]\npub(super) const INSTANCE: &[(&str, &str)] = &[\n");
     for (id, member) in &instance {
         writeln!(out, "    (\"{id}\", \"{member}\"),").map_err(|e| e.to_string())?;
     }

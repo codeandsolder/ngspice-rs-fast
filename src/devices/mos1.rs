@@ -432,7 +432,7 @@ impl MosLevel for Level1 {
     fn noise_shape(&self, geometry: &Geometry, op: &Operating<Params>) -> Option<NoiseShape> {
         let cox = match self.tox.filter(|tox| *tox != 0.) {
             Some(tox) => 3.9 * EPSILON_0 / tox,
-            None => 3.9 * 8.854214871e-12 / 1e-7,
+            None => 3.9 * 8.854_214_871e-12 / 1e-7,
         };
         let cox_squared = cox * cox;
         Some(NoiseShape {

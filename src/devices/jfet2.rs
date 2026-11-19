@@ -115,7 +115,7 @@ const MX: Real = 40.0;
     clippy::excessive_precision,
     reason = "reference C literal spelling is preserved for numerical parity"
 )]
-const EMX: Real = 2.353852668370199842e17;
+const EMX: Real = 2.353_852_668_370_199_842e17;
 /// `psmodel.h` `FOURTH`: the relaxation filters use a quarter step.
 const FOURTH: Real = 0.25;
 /// `jfet2temp.c` uses a fixed 1.11 eV band gap for IS.

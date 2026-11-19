@@ -538,9 +538,9 @@ impl MosLevel for Level3 {
     ) -> DrainCurrent {
         // C's `(mode == 1 ? vgs : vgd)`, `mode * vds` and `(mode == 1 ? vbs :
         // vbd)`, named as in the normal mode.
-        const COEFF0: Real = 0.0631353e0;
-        const COEFF1: Real = 0.8013292e0;
-        const COEFF2: Real = -0.01110777e0;
+        const COEFF0: Real = 0.063_135_3e0;
+        const COEFF1: Real = 0.801_329_2e0;
+        const COEFF2: Real = -0.011_107_77e0;
         let p = &op.params;
         let (length, width) = (p.length, p.width);
         let vt = op.vt;

@@ -691,7 +691,7 @@ mod tests {
 
     fn operating(gamma: Real) -> Operating<Params> {
         Operating {
-            vt: 0.025864,
+            vt: 0.025_864,
             beta: 2e-4,
             vbi: 0.4,
             phi: 0.7,

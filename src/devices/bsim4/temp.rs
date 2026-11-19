@@ -45,22 +45,22 @@ use super::fields::{Instance, Model, SizeParam};
 use super::geo::{pa_eff_geo, rdseff_geo};
 use crate::primitives::{SpiceError, SpiceResult};
 
-const KboQ: f64 = 8.617087e-5;
+const KboQ: f64 = 8.617_087e-5;
 const EPS0: f64 = 8.85418e-12;
 const EPSSI: f64 = 1.03594e-10;
 // b4temp.c's own rounded PI, not the platform's.
 const PI: f64 = f64::from_bits(0x4009_21fb_5452_4550);
-const MAX_EXP: f64 = 5.834617425e14;
-const MIN_EXP: f64 = 1.713908431e-15;
+const MAX_EXP: f64 = 5.834_617_425e14;
+const MIN_EXP: f64 = 1.713_908_431e-15;
 const EXP_THRESHOLD: f64 = 34.0;
 const Charge_q: f64 = 1.60219e-19;
 const DELTA: f64 = 1.0E-9;
 /// `const.h` `CHARGE`.
-const CHARGE: f64 = 1.6021766208e-19;
+const CHARGE: f64 = 1.602_176_620_8e-19;
 /// `main.c`: `CONSTroot2 = CONSTsqrt2`.
 const CONSTroot2: f64 = std::f64::consts::SQRT_2;
 /// `main.c`: `CONSTvt0 = CONSTboltz * REFTEMP / CHARGE`.
-const CONSTvt0: f64 = 1.38064852e-23 * (27.0 + 273.15) / CHARGE;
+const CONSTvt0: f64 = 1.380_648_52e-23 * (27.0 + 273.15) / CHARGE;
 /// `bsim4def.h` `NMOS`.
 const NMOS: i32 = 1;
 /// `bsim4def.h` `BSIM4v48V480`.
@@ -358,7 +358,7 @@ pub(super) fn temperature_model(
             ni = 1.45e10
                 * (Tnom / 300.15)
                 * sqrt(Tnom / 300.15)
-                * exp(21.5565981 - Eg0 / (2.0 * Vtm0));
+                * exp(21.556_598_1 - Eg0 / (2.0 * Vtm0));
         } else {
             Eg0 = m.bg0sub - m.tbgasub * Tnom * Tnom / (Tnom + m.tbgbsub);
             T0 = m.bg0sub - m.tbgasub * 90090.0225 / (300.15 + m.tbgbsub);
@@ -2070,8 +2070,8 @@ mod tests {
             (0.0, "0"),
             (0.1, "0.1"),
             (-1e-9, "-1e-09"),
-            (123456.0, "123456"),
-            (1234567.0, "1.23457e+06"),
+            (123_456.0, "123456"),
+            (1_234_567.0, "1.23457e+06"),
             (1e-4, "0.0001"),
             (-2.64404e10, "-2.64404e+10"),
         ] {

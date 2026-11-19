@@ -38,11 +38,11 @@ mod sens;
 
 /// Diode state slot of the limited junction voltage (C `DIOvoltage`).
 const DIODE_VOLTAGE_SLOT: usize = 2;
-pub(crate) const K_OVER_Q: Real = 1.38064852e-23 / 1.6021766208e-19; // ngspice CONSTboltz/CHARGE
+pub(crate) const K_OVER_Q: Real = 1.380_648_52e-23 / 1.602_176_620_8e-19; // ngspice CONSTboltz/CHARGE
 /// ngspice `CONSTboltz` (J/K).
-const BOLTZMANN: Real = 1.38064852e-23;
+const BOLTZMANN: Real = 1.380_648_52e-23;
 /// ngspice `CHARGE` (C).
-const CHARGE: Real = 1.6021766208e-19;
+const CHARGE: Real = 1.602_176_620_8e-19;
 /// ngspice `REFTEMP`: 27 degrees Celsius in Kelvin.
 const REFTEMP: Real = 300.15;
 /// ngspice default `CKTepsmin` (`cktntask.c`): IS floor and knee-current cutoff.
@@ -616,9 +616,9 @@ impl DiodeParameters {
             )
         };
         let fact2 = t / REFTEMP;
-        let arg = -egfet / (2. * BOLTZMANN * t) + 1.1150877 / (BOLTZMANN * (REFTEMP + REFTEMP));
+        let arg = -egfet / (2. * BOLTZMANN * t) + 1.115_087_7 / (BOLTZMANN * (REFTEMP + REFTEMP));
         let pbfact = -2. * vt * (1.5 * fact2.ln() + CHARGE * arg);
-        let arg1 = -egfet1 / (BOLTZMANN * 2. * tn) + 1.1150877 / (2. * BOLTZMANN * REFTEMP);
+        let arg1 = -egfet1 / (BOLTZMANN * 2. * tn) + 1.115_087_7 / (2. * BOLTZMANN * REFTEMP);
         let fact1 = tn / REFTEMP;
         let pbfact1 = -2. * vtnom * (1.5 * fact1.ln() + CHARGE * arg1);
         // Depletion capacitance/potential temperature laws (TLEVC 0 or 1).

@@ -101,9 +101,9 @@ use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
 
 /// C `CONSTboltz` (J/K).
-pub(super) const BOLTZMANN: Real = 1.38064852e-23;
+pub(super) const BOLTZMANN: Real = 1.380_648_52e-23;
 /// C `CHARGE` (C).
-pub(super) const CHARGE: Real = 1.6021766208e-19;
+pub(super) const CHARGE: Real = 1.602_176_620_8e-19;
 /// C `CONSTKoverQ`.
 pub(super) const K_OVER_Q: Real = BOLTZMANN / CHARGE;
 /// C `CONSTCtoK`.
@@ -111,7 +111,7 @@ pub(super) const CELSIUS_TO_KELVIN: Real = 273.15;
 /// C `REFTEMP` (27 degrees Celsius).
 pub(super) const REFTEMP: Real = 27. + CELSIUS_TO_KELVIN;
 /// Vacuum permittivity as written in `mos1temp.c` (F/m).
-pub(super) const EPSILON_0: Real = 8.854214871e-12;
+pub(super) const EPSILON_0: Real = 8.854_214_871e-12;
 /// C `MAX_EXP_ARG`: junction exponent clamp of `mos1load.c`.
 pub(super) const MAX_EXP_ARG: Real = 709.;
 /// `DEVqmeyer`'s lower bound on the saturation voltage.
@@ -212,7 +212,7 @@ pub(super) fn band_gap(kelvin: Real) -> Real {
 pub(super) fn potential_factor(kelvin: Real) -> Real {
     let vt = kelvin * K_OVER_Q;
     let kt = BOLTZMANN * kelvin;
-    let arg = -band_gap(kelvin) / (kt + kt) + 1.1150877 / (BOLTZMANN * (REFTEMP + REFTEMP));
+    let arg = -band_gap(kelvin) / (kt + kt) + 1.115_087_7 / (BOLTZMANN * (REFTEMP + REFTEMP));
     -2. * vt * (1.5 * (kelvin / REFTEMP).ln() + CHARGE * arg)
 }
 

@@ -38,9 +38,9 @@ use crate::maths::Vector;
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
 
 /// ngspice `CONSTboltz` (J/K).
-pub const BOLTZMANN: Real = 1.38064852e-23;
+pub const BOLTZMANN: Real = 1.380_648_52e-23;
 /// ngspice `CHARGE` (C).
-pub const CHARGE: Real = 1.6021766208e-19;
+pub const CHARGE: Real = 1.602_176_620_8e-19;
 /// ngspice `CONSTCtoK`.
 pub const CELSIUS_TO_KELVIN: Real = 273.15;
 

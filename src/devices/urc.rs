@@ -743,7 +743,12 @@ mod tests {
 
     #[test]
     fn generated_setters_round_trip_exactly() {
-        for value in [1.3793103448275862e-20, 0.1 + 0.2, 1.5f64.powf(7.), 3e-3] {
+        for value in [
+            1.379_310_344_827_586_2e-20,
+            0.1 + 0.2,
+            1.5f64.powf(7.),
+            3e-3,
+        ] {
             let text = setter(
                 "x",
                 value,
