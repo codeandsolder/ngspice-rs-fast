@@ -889,18 +889,20 @@ impl<T: Scalar> Sparse<T> {
         let mut singletons = self.singletons;
         self.singletons -= 1;
         self.markowitz_prod[step - 1] = 0;
-        // `p` is C's `pMarkowitzProduct - MarkowitzProd`; it can reach -1.
-        let mut p = (size + 1) as isize;
+        // C advances a pointer *after* testing each product. Track the
+        // next index plus one instead: the first read is size + 1 and each
+        // subsequent read moves left, preserving C's sentinel and pivot
+        // priority without an isize that can become -1 at step == 1.
+        let mut cursor = size + 2;
         while singletons > 0 {
             singletons -= 1;
             loop {
-                let value = self.markowitz_prod[p as usize];
-                p -= 1;
-                if value == 0 {
+                cursor -= 1;
+                if self.markowitz_prod[cursor] == 0 {
                     break;
                 }
             }
-            let mut i = (p + 1) as usize;
+            let mut i = cursor;
             if i < step {
                 break;
             }
@@ -1673,6 +1675,26 @@ mod tests {
             .zip(b)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn singleton_scan_preserves_c_sentinel_and_reverse_order() {
+        // C places the current step's product at size+1. A singleton at
+        // step must be returned from that sentinel before scanning other
+        // positions. Otherwise the scan proceeds from the highest index.
+        let mut m = build(4, &[(1, 1, 5.), (2, 2, 2.), (3, 3, 3.), (4, 4, 4.)]);
+        m.create_internal_vectors();
+        m.markowitz_prod[1..=4].copy_from_slice(&[0, 0, 0, 0]);
+        m.singletons = 4;
+        let pivot = m.search_for_singleton(1).unwrap();
+        assert_eq!(m.elements[pivot].row, 1);
+
+        // The sentinel is not a singleton: the search selects the highest
+        // remaining zero-product diagonal, never reading a negative index.
+        m.markowitz_prod[1..=4].copy_from_slice(&[1, 1, 0, 0]);
+        m.singletons = 2;
+        let pivot = m.search_for_singleton(1).unwrap();
+        assert_eq!(m.elements[pivot].row, 4);
     }
 
     #[test]
