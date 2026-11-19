@@ -355,16 +355,7 @@ impl Mesa {
         // `value + CONSTCtoK`, so it is Celsius in the deck, and
         // `mesasetup.c`'s default `CKTtemp + DTEMP` is kelvin.
         let nominal_kelvin = nominal + CELSIUS_TO_KELVIN;
-        let ts = instance
-            .ts
-            .map_or(temperature + CELSIUS_TO_KELVIN + instance.dtemp, |v| {
-                v + CELSIUS_TO_KELVIN
-            });
-        let td = instance
-            .td
-            .map_or(temperature + CELSIUS_TO_KELVIN + instance.dtemp, |v| {
-                v + CELSIUS_TO_KELVIN
-            });
+        let (ts, td) = self.temperatures(temperature);
         let scalar = |resistance: Real, kelvin: Real| {
             if resistance == 0. {
                 0.

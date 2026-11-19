@@ -478,11 +478,7 @@ impl Hfet2 {
     fn derived(&self, temperature: Real) -> SpiceResult<Derived> {
         let model = &self.model;
         let instance = &self.instance;
-        let temp = instance
-            .temp
-            .map_or(temperature + CELSIUS_TO_KELVIN + instance.dtemp, |v| {
-                v + CELSIUS_TO_KELVIN
-            });
+        let temp = self.temperature(temperature);
         let nominal = temperature + CELSIUS_TO_KELVIN;
         let delta = temp - nominal;
         let vt = K_OVER_Q * temp;
