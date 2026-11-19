@@ -1,6 +1,6 @@
 //! BSIM3v3.3 input plumbing (B3-0 foundation, #90).
 //!
-//! This is deliberately **not a simulation backend**. The generated IFparm
+//! This is deliberately **not a simulation backend**. The generated `IFparm`
 //! interface facts cover the complete model/instance tables; the validated
 //! projection applies ordered explicit setters and preserves provenance, and
 //! [`defaults`], [`temperature`] and [`setup`] reproduce `b3set.c`/`b3temp.c`
@@ -34,7 +34,7 @@ pub fn uninteresting() -> &'static [&'static str] {
     DEVICE.uninteresting
 }
 
-/// `b3mpar.c`: TNOM adds CONSTCtoK; NPEAK/NGATE and their L/W/P
+/// `b3mpar.c`: TNOM adds `CONSTCtoK`; NPEAK/NGATE and their L/W/P
 /// coefficients use distinct thresholds before a cm^-3 conversion.
 fn bsim3_model_real(p: &Parameter, value: Real, location: &SourceLoc) -> SpiceResult<Real> {
     let threshold = match p.c_field {
@@ -64,7 +64,7 @@ mod defaults_data;
 pub mod device;
 /// BSIM3v3.3 noise generators from `b3noi.c`.
 pub mod noise;
-/// Generated IFparm order, identifiers and setter/given-field mappings.
+/// Generated `IFparm` order, identifiers and setter/given-field mappings.
 pub mod parameters;
 /// Effective geometry, size-dependent parameters and `b3check.c` diagnostics.
 pub mod setup;

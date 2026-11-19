@@ -585,7 +585,7 @@ pub trait Device: fmt::Debug {
         None
     }
 
-    /// Binds the previous voltage-source value in C VSRCload's reverse-deck
+    /// Binds the previous voltage-source value in C `VSRCload`'s reverse-deck
     /// traversal. Non-voltage devices return None; PORT adds to that value.
     /// # Errors
     /// Invalid accumulated RF excitation.

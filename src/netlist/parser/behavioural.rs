@@ -277,7 +277,7 @@ pub(super) fn value_form(
 }
 
 /// `TABLE {expr} [=] (x, y) ...` (two output nodes, E/G) or, with
-/// `control_nodes`, the LTspice `table=(x0, y0, x1, y1, ...)` after the two
+/// `control_nodes`, the `LTspice` `table=(x0, y0, x1, y1, ...)` after the two
 /// controlling nodes (E only). Points become ordered `x`/`y` setters.
 pub(super) fn table_form(
     input: &mut Input<'_>,

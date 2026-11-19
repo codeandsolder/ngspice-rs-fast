@@ -4,7 +4,7 @@
 //! or binds two signal nodes (the written reference terminals are ignored by
 //! C's Padé device). `txlsetup.c` constructs the Padé coefficients and
 //! `txlload.c` stamps DC or recursive-convolution transient equations.
-//! AC/SP are explicitly refused: C reuses TXLload with an unset delta.
+//! AC/SP are explicitly refused: C reuses `TXLload` with an unset delta.
 //! See `docs/port/TXL.md` for the compatibility boundaries.
 mod pade;
 mod transient;

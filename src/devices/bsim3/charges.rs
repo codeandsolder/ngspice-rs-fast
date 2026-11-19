@@ -2,8 +2,8 @@
 //!
 //! This ports the `capMod == 3` path (C's default, the "charge thickness"
 //! model): the C-V preamble (`VbseffCV`, `CoxWL`, the `noff`/`voffcv`
-//! `Vgsteff`), the CTM charge/capacitance block, the bias-dependent `capMod
-//! >= 2` overlap capacitances and the source/drain junction C-V. `capMod` 0,
+//! `Vgsteff`), the CTM charge/capacitance block, bias-dependent overlap
+//! capacitances for `capMod >= 2`, and source/drain junction C-V. `capMod` 0,
 //! 1 and 2 and every NQS mode are explicit refusals: each is a different
 //! equation set, not a tuning of this one.
 //!

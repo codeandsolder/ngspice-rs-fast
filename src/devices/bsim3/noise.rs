@@ -41,17 +41,17 @@ const N_MINLOG: Real = 1.0e-38;
 /// multiplicity already applied as C applies it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NoiseDensities {
-    /// Thermal conductance of the drain series resistance (C `drainConductance
-    /// * m`), injected between the drain and its prime node.
+    /// Thermal conductance of the drain series resistance
+    /// (C `drainConductance * m`), injected between the drain and its prime node.
     pub drain_conductance: Real,
     /// The same for the source.
     pub source_conductance: Real,
     /// The channel thermal source's conductance argument to `NevalSrc`
     /// (injected between the drain and source prime nodes).
     pub channel: Real,
-    /// The flicker source's bias-dependent numerator (C's `noizDens *=
-    /// <factor>` after `N_GAIN`), injected between the drain and source prime
-    /// nodes.
+    /// The flicker source's bias-dependent numerator, after the C operation
+    /// `noizDens *= <factor>` in `N_GAIN`, injected between the drain and source
+    /// prime nodes.
     pub flicker_numerator: Real,
     /// C's three frequency-law factors after `pow(f, EF)`.
     pub flicker_factors: [Real; 3],

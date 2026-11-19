@@ -42,7 +42,7 @@ fn dc() -> AnalysisRequest {
 
 /// ngspice's default Newton tolerances (`CKTreltol`, `CKTvoltTol`): two
 /// converged solutions of one circuit reached along different iterates
-/// agree only to these (NIiter stops once the update is within them).
+/// agree only to these (`NIiter` stops once the update is within them).
 const NIITER_RELTOL: f64 = 1e-3;
 const NIITER_VNTOL: f64 = 1e-6;
 

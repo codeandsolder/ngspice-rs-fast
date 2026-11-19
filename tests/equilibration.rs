@@ -306,7 +306,7 @@ fn exponent_bounds_extremes_and_subnormal_input_are_deterministic() {
 }
 
 /// The linearisation of `b o 0 v=log(v(in))` beside `vin in 0 dc 2` at a 0 V
-/// Newton start: a 1e32 slope (C's PTdivide fudge) and a -1e99 value.
+/// Newton start: a 1e32 slope (C's `PTdivide` fudge) and a -1e99 value.
 fn behavioural_zero_start() -> (SparseMatrix, Vector) {
     let mut m = SparseMatrix::new(4, 4);
     for (r, c, v) in [

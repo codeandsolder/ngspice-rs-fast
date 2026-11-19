@@ -975,7 +975,7 @@ impl DcModel<'_> {
 /// `@inst[param]` values C's `b3ask.c` reads from the instance after a load.
 impl DcEvaluation {
     /// The value of a DC operating-point ask keyword, before multiplicity.
-    /// These are C's IFparm keywords; `cbs`/`cbd` are capacitances in C and are
+    /// These are C's `IFparm` keywords; `cbs`/`cbd` are capacitances in C and are
     /// therefore absent, while `ibs`/`ibd` are the junction currents. Charge,
     /// NQS, noise and gate-current asks are not part of this core.
     #[must_use]

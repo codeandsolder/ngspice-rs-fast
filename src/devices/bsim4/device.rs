@@ -1231,7 +1231,7 @@ impl Device for Bsim4 {
         crate::devices::setup::CDeviceType::Bsim
     }
 
-    /// `BSIM4trunc`: CKTterr on qb, qg, qd, then qcdump (`trnqsMod`), qbs
+    /// `BSIM4trunc`: `CKTterr` on qb, qg, qd, then qcdump (`trnqsMod`), qbs
     /// and qbd (`rbodyMod`) and qgmid (`rgateMod == 3`).
     fn truncation_slots(&self) -> Vec<usize> {
         let Some(prepared) = self.any_setup() else {

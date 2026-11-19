@@ -50,7 +50,7 @@ pub const C_REFERENCE: &str = "src/frontend/inpcom.c (inp_compat, inp_poly_2g6_c
 
 /// The XSPICE `pwl` `input_domain` `inp_compat()` uses for a TABLE.
 pub const TABLE_DOMAIN: Real = 0.1;
-/// The `input_domain` of the four-node LTspice TABLE form.
+/// The `input_domain` of the four-node `LTspice` TABLE form.
 pub const LTSPICE_TABLE_DOMAIN: Real = 0.001;
 
 /// Largest number of nodes a resolved expression may have (a bound on

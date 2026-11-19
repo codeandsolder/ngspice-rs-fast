@@ -254,7 +254,7 @@ m1 dm g 0 0 nmos w=10u l=2u
 }
 
 /// Switches stamp their operating-point state with `swload.c`'s rules (on
-/// only for REALLY_ON/HYST_ON), not `SWacLoad`'s (any non-zero code): a
+/// only for `REALLY_ON/HYST_ON`), not `SWacLoad`'s (any non-zero code): a
 /// control voltage inside the hysteresis band, with and without the ON/OFF
 /// initial flags, and a W switch.
 #[test]

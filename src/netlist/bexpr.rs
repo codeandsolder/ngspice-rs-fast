@@ -205,7 +205,7 @@ impl BBinaryOp {
 /// The input-to-output map of the XSPICE `pwl` code model
 /// (`src/xspice/icm/analog/pwl/cfunc.mod`) with the parameters `inpcom.c`
 /// gives it for a `TABLE`: `fraction=TRUE limit=TRUE` and an
-/// `input_domain` of 0.1 (or 0.001 for the four-node LTspice form).
+/// `input_domain` of 0.1 (or 0.001 for the four-node `LTspice` form).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableTransfer {
     /// The input expression.

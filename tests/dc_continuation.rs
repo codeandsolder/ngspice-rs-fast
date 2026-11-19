@@ -30,9 +30,9 @@ const DIFFICULT: &str = "i1 0 a 1m\nd1 a 0 dm\n.model dm d(is=1m)";
 const DIFFICULT_AC: &str = "i1 0 a dc 1m ac 1\nd1 a 0 dm\n.model dm d(is=1m)";
 
 /// Relative accuracy of a converged bias of [`DIFFICULT`] under ngspice's
-/// default Newton tolerances: NIiter accepts once the update is within
+/// default Newton tolerances: `NIiter` accepts once the update is within
 /// `reltol |v| + vntol` (1e-3 relative plus 1e-6 V, 1.9e-5 V at this 18 mV
-/// bias) and returns the iterate the last load used (CKTrhsOld), so the bias
+/// bias) and returns the iterate the last load used (`CKTrhsOld`), so the bias
 /// is guaranteed only to about reltol. Measured in C ngspice (SPARSE): the
 /// direct solve misses `vt ln 2` by 1.7e-9 relative (its AC `v(a)` misses
 /// `vt / 2 mA` by 1.2e-9), but with `.options noopiter gminsteps=0
@@ -111,8 +111,8 @@ struct Cubic {
     accepted: Rc<Cell<usize>>,
 }
 impl ngspice_rs::devices::Device for Cubic {
-    /// Like a C device's DEVsetup, allocate the conductance elements even
-    /// though the load stamps zero at v = 0 (where LoadGmin then acts).
+    /// Like a C device's `DEVsetup`, allocate the conductance elements even
+    /// though the load stamps zero at v = 0 (where `LoadGmin` then acts).
     fn setup_matrix(
         &self,
         setup: &mut ngspice_rs::devices::setup::MatrixSetup<'_>,

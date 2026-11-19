@@ -1,4 +1,4 @@
-//! Source syntax from inp2v.c/inp2i.c, INPgetValue in inpgval.c and
+//! Source syntax from inp2v.c/inp2i.c, `INPgetValue` in inpgval.c and
 //! VSRCparam/ISRCparam. This is not VSRCload/ISRCload time evaluation.
 
 use winnow::Parser as _;

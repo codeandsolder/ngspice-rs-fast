@@ -69,7 +69,7 @@ pub enum ParameterKind {
     /// syntax tree and spans. Scalar consumers must treat this like any other
     /// non-scalar kind until an evaluation pass resolves it.
     Expression(Box<crate::netlist::expr::ParameterExpression>),
-    /// A bare IF_FLAG keyword: C's INPgetValue supplies integer 1 without
+    /// A bare `IF_FLAG` keyword: C's `INPgetValue` supplies integer 1 without
     /// consuming a value. Explicit `flag=0`/`flag=1` forms are not accepted.
     Flag,
     /// Q/M IC values in C setter order, with omitted components left omitted.

@@ -145,7 +145,7 @@ pub struct LevelSelection {
 }
 
 /// Immutable lookup over one deck's top-level declarations. Duplicate names
-/// retain the *first* card as INPmakeMod does; all cards stay visible in the AST.
+/// retain the *first* card as `INPmakeMod` does; all cards stay visible in the AST.
 /// No validation of a shadowed card is implied, nor any cross-deck state.
 #[derive(Debug)]
 pub struct ModelResolver<'a> {

@@ -11,7 +11,7 @@
 //! | [`integrator`] | trapezoidal and Gear companion coefficients, integration, prediction and truncation estimates | trapezoidal orders 1–2, variable-step Gear orders 1–6; trial coefficients separate from accepted step history |
 //!
 //! The C implementations are `src/maths/dense/`, `src/maths/sparse/`
-//! (SPARSE 1.3, Berkeley permissive notice), `src/maths/KLU/` (LGPLv2 — see the
+//! (SPARSE 1.3, Berkeley permissive notice), `src/maths/KLU/` (`LGPLv2` — see the
 //! licensing note in `docs/port/MAPPING.md`) and `src/maths/ni/`. The sparse LU
 //! is a Rust port of SPARSE 1.3 (`sparse13`); nothing is taken from KLU and no
 //! external solver crate is used. See `docs/port/NATIVE_SOLVER.md`.

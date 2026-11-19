@@ -7,7 +7,7 @@
 //! Nothing is mutated: source DC values (loaded as `dctrcurv.c` sets
 //! `dcValue`/`dcGiven`), temperature, resistor and instance-parameter values
 //! travel in an immutable per-point `ModelContext`, and every point runs
-//! NIiter, linear circuits included. See `docs/port/DC_SWEEPS.md`.
+//! `NIiter`, linear circuits included. See `docs/port/DC_SWEEPS.md`.
 use crate::analysis::linear::{number, plot, unsupported};
 use crate::analysis::{AnalysisContext, AnalysisRequest, Plot};
 use crate::devices::{Circuit, ModelContext};

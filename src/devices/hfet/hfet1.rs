@@ -88,7 +88,7 @@ use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
 
-/// `hfetsetup.c`'s `EPSI` default, C's spelling of the GaAs permittivity.
+/// `hfetsetup.c`'s `EPSI` default, C's spelling of the `GaAs` permittivity.
 const EPSILON_GAAS: Real = 12.244 * 8.854_18e-12;
 /// C `CONSTKoverQ`.
 const K_OVER_Q: Real = BOLTZMANN / CHARGE;

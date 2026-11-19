@@ -106,7 +106,7 @@ fn parameters(input: &mut Input<'_>, base: &str) -> Result<Vec<ParameterAssignme
     .parse_next(input)
 }
 
-/// `INPfindVer`/IF_STRING retain a bare dotted VERSION token, not a float.
+/// `INPfindVer`/`IF_STRING` retain a bare dotted VERSION token, not a float.
 /// Only MOS model VERSION sites gain this syntax; other word-valued setters
 /// keep their existing refusal. Quoted/expression versions are not substituted.
 fn version_assignment(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> {

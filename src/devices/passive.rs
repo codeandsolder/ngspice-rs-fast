@@ -95,7 +95,7 @@ impl PassiveParameters {
         })
     }
 
-    /// C's DEVparam then DEVtemperature, without rerunning DEVsetup.
+    /// C's `DEVparam` then `DEVtemperature`, without rerunning `DEVsetup`.
     pub(crate) fn swept(
         &self,
         parameter: &str,

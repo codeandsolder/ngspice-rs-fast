@@ -66,7 +66,7 @@ fn primary_name(designator: char) -> &'static str {
 }
 
 /// INP2R/C/L set a pre-model scalar before named setters. A scalar immediately
-/// after the model is INPdevParse's leading value, applied *after* named setters.
+/// after the model is `INPdevParse`'s leading value, applied *after* named setters.
 /// No scalar is injected for a model-only/geometry instance. Declared numeric
 /// names cannot steal the first numeric slot; model semantics stay in devices.
 fn passive_parameters(

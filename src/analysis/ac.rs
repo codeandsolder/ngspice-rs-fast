@@ -72,7 +72,7 @@ pub(super) enum GridKind {
 /// `delta * reltol` (linear).
 ///
 /// C quirks kept on purpose: a linear sweep of fewer than three points uses
-/// `delta = 0` and so yields only the start frequency (Richard McRoberts'
+/// `delta = 0` and so yields only the start frequency (Richard `McRoberts`'
 /// patch tests `ACnumberSteps - 1 > 1`); `.ac dec` spanning a decade or more
 /// uses `delta = exp(ln(stop/start) / floor(|log10(stop/start)| * points))`
 /// so the last point lands on `stop`.

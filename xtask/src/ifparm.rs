@@ -109,7 +109,7 @@ pub(crate) struct Entry {
     pub(crate) uninteresting: bool,
 }
 
-/// Restricted IFparm reader: one declarator per line, four comma-separated
+/// Restricted `IFparm` reader: one declarator per line, four comma-separated
 /// leading arguments. Descriptions are deliberately not copied into Rust.
 pub(crate) fn table(text: &str, name: &str) -> Result<Vec<Entry>, String> {
     let marker = format!("IFparm {name}[] = {{");
@@ -305,7 +305,7 @@ pub(crate) fn parameters(
     ] {
         let setters = setters(setter_text, spec.prefix)?;
         let mut canonical = BTreeMap::new();
-        writeln!(out, "\n/// `{name}` IFparm entries in C table order, including aliases and ask-only rows.\n#[rustfmt::skip]\npub const {name}: &[Parameter] = &[").map_err(|e| e.to_string())?;
+        writeln!(out, "\n/// `{name}` `IFparm` entries in C table order, including aliases and ask-only rows.\n#[rustfmt::skip]\npub const {name}: &[Parameter] = &[").map_err(|e| e.to_string())?;
         for entry in entries {
             let id = ids
                 .get(entry.symbol.as_str())

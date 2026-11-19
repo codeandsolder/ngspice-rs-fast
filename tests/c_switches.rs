@@ -279,7 +279,7 @@ fn nested_sweeps_restart_each_inner_sweep_from_the_flags() {
 const AC: &str = "vc c 0 2\nvin in 0 0 ac 1\nr1 in a 1k\ns1 a 0 c 0 sm\n\
     .model sm sw(vt=1 vh=0.5 ron=10 roff=1meg)\n";
 
-/// A switch that is off inside its band at the operating point (HYST_OFF), a
+/// A switch that is off inside its band at the operating point (`HYST_OFF`), a
 /// closed one, an ON-flagged one and a W, with AC on the control too.
 const AC_MIX: &str = "vc ctrl 0 dc 2 ac 1\nvdd vdd 0 dc 1 ac 1\nr1 vdd a 1k\n\
     s1 a 0 ctrl 0 sm off\nc1 a 0 1u\nr2 vdd b 1k\ns2 b 0 ctrl 0 sn on\n\

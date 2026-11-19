@@ -76,18 +76,18 @@ impl Diagnostic {
     }
 }
 
-/// The input value type declared by the C IFparm table, not a guessed unit.
+/// The input value type declared by the C `IFparm` table, not a guessed unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputType {
-    /// IF_REAL, finite in the Rust projection.
+    /// `IF_REAL`, finite in the Rust projection.
     Real,
-    /// IF_INTEGER, `floor(value + 0.5)` with checked i32 conversion.
+    /// `IF_INTEGER`, `floor(value + 0.5)` with checked i32 conversion.
     Integer,
-    /// IF_FLAG, a bare keyword (C supplies integer 1).
+    /// `IF_FLAG`, a bare keyword (C supplies integer 1).
     Flag,
-    /// IF_STRING, preserving the version spelling instead of parsing a number.
+    /// `IF_STRING`, preserving the version spelling instead of parsing a number.
     String,
-    /// IF_REALVEC, the IC vector expanded into its scalar component setters.
+    /// `IF_REALVEC`, the IC vector expanded into its scalar component setters.
     RealVector,
 }
 
@@ -110,7 +110,7 @@ pub struct Parameter {
     pub name: &'static str,
     /// First keyword with this ID; aliases share last-set precedence.
     pub canonical: &'static str,
-    /// Numeric IFparm identifier from `bsim3def.h`.
+    /// Numeric `IFparm` identifier from `bsim3def.h`.
     pub id: u16,
     /// C's symbolic identifier, for audits and future setter integration.
     pub c_id: &'static str,
@@ -191,7 +191,7 @@ pub enum Value {
     Real(Real),
     /// Checked C integer setter value.
     Integer(i32),
-    /// Bare IF_FLAG input.
+    /// Bare `IF_FLAG` input.
     Flag(bool),
     /// Unchanged bare string spelling.
     String(String),

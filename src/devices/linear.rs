@@ -42,7 +42,7 @@ pub struct Forcing {
 pub enum Waveform {
     /// Time-independent forcing.
     Constant(Real),
-    /// RFSPICE PORT accumulation in VSRCload order. Tones are (amplitude, radians/s).
+    /// RFSPICE PORT accumulation in `VSRCload` order. Tones are (amplitude, radians/s).
     PortSeries {
         /// Preceding non-PORT voltage source time function.
         baseline: Box<Waveform>,

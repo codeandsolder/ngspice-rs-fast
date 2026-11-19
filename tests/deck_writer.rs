@@ -348,7 +348,7 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// parse_file -> write -> (written next to the original) parse_file.
+/// `parse_file` -> write -> (written next to the original) `parse_file`.
 fn file_round_trip(path: &Path) -> (String, Netlist, Netlist) {
     let parser = Parser::new();
     let first = parser

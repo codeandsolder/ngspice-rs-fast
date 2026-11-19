@@ -909,7 +909,7 @@ impl Jfet2 {
     }
 }
 
-/// Rewrites `slot` with its value before this load (C leaves CKTstate0
+/// Rewrites `slot` with its value before this load (C leaves `CKTstate0`
 /// untouched there): the previous load's, else the accepted or carried one,
 /// else zero.
 fn carry(states: &mut crate::devices::DeviceState<'_>, slot: usize) -> SpiceResult<()> {

@@ -1,4 +1,4 @@
-//! Source-relative preprocessing, referencing inpcom.c's inp_readall and
+//! Source-relative preprocessing, referencing inpcom.c's `inp_readall` and
 //! library section processing. Deliberately no sourcepath/env/home expansion.
 
 use std::collections::{BTreeMap, BTreeSet};

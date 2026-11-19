@@ -111,7 +111,7 @@ impl IndependentSource {
     }
 
     /// Selects C's PORT cosine time function, including its zero-amplitude
-    /// nonport form. Values are initialized by VSRCtemp.
+    /// nonport form. Values are initialized by `VSRCtemp`.
     pub(crate) fn with_power_tone(mut self, tone: Option<(Real, Real)>) -> Self {
         self.power_tone = tone;
         self

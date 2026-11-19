@@ -1,7 +1,7 @@
-//! Initial-engine IF_FLAG table from dio.c, bjt.c, mos1.c and their setters.
-//! INPgetValue(IF_FLAG), in inpgval.c, supplies 1 without consuming a value.
+//! Initial-engine `IF_FLAG` table from dio.c, bjt.c, mos1.c and their setters.
+//! `INPgetValue(IF_FLAG)`, in inpgval.c, supplies 1 without consuming a value.
 //! Base model type tokens are not assignments; tail type flags are setters.
-//! See docs/port/FRONTEND_VALUES.md for the exhaustive supported/gap table.
+//! See `docs/port/FRONTEND_VALUES.md` for the exhaustive supported/gap table.
 
 use winnow::Parser as _;
 use winnow::token::any;

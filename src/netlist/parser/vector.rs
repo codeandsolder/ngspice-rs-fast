@@ -1,4 +1,4 @@
-//! Bounded numeric vectors for INPgetValue(IF_REALVEC), in `inpgval.c`.
+//! Bounded numeric vectors for `INPgetValue(IF_REALVEC)`, in `inpgval.c`.
 //! C gobbles punctuation permissively; this grammar deliberately requires a
 //! balanced optional outer pair and a value after every comma. Bare vectors
 //! end at the next keyword, not by swallowing an overflowing numeric value.

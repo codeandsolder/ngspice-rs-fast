@@ -60,7 +60,7 @@ pub(super) type Res<T> = ModalResult<T, Fail>;
 pub(super) struct Fail {
     pub remaining: usize,
     pub message: String,
-    /// Valid numparam outside the bounded subset (NotYetPorted, not Parse).
+    /// Valid numparam outside the bounded subset (`NotYetPorted`, not Parse).
     pub unsupported: bool,
     /// An already positioned error from a nested parse.
     pub resolved: Option<SpiceError>,

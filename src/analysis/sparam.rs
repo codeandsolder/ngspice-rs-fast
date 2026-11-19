@@ -302,7 +302,7 @@ fn port_matrices(
 
 /// C `span.c::NInspIter` / `CKTspnoise`, `nevalsrc.c`: independent generator
 /// covariances, transformed from terminated port voltages to short-circuit
-/// currents. C's N_GAIN branch does not add flicker generators to Cy.
+/// currents. C's `N_GAIN` branch does not add flicker generators to Cy.
 fn noise_parameters(
     circuit: &Circuit,
     ports: &[BoundPort],

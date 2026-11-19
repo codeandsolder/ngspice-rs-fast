@@ -1,5 +1,5 @@
 //! `txlload.c`/`txlacct.c`: recursive convolution over accepted V/I history.
-//! C keeps two mutable TXLine snapshots and advances one on the next load.
+//! C keeps two mutable `TXLine` snapshots and advances one on the next load.
 //! Here each accepted sample carries the snapshot; trials are pure and a
 //! rejected trial cannot change convolutions, interpolation cursors or history.
 // C-compatible numerical expressions are kept in their reference order:

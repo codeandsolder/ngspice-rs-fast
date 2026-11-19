@@ -1,4 +1,4 @@
-//! Opt-in live C validation. NGSPICE_BIN must name the external reference binary.
+//! Opt-in live C validation. `NGSPICE_BIN` must name the external reference binary.
 use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, RawFile, runner};
 use ngspice_rs::devices::{Circuit, IndependentSource, Waveform};
 use ngspice_rs::netlist::Parser;

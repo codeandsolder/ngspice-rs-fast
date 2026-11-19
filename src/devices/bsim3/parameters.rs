@@ -6,7 +6,7 @@ use super::{Access, InputType, Parameter};
 /// Upstream revision of the four clean generator inputs.
 pub const SOURCE_REVISION: &str = "059066b532f7073fccf4173ef269309eafdc7f0c";
 
-/// `MODEL` IFparm entries in C table order, including aliases and ask-only rows.
+/// `MODEL` `IFparm` entries in C table order, including aliases and ask-only rows.
 #[rustfmt::skip]
 pub const MODEL: &[Parameter] = &[
     Parameter::new("capmod", "capmod", 100, "BSIM3_MOD_CAPMOD", Some("BSIM3capMod"), Some("BSIM3capModGiven"), InputType::Integer, Access::ReadWrite, false),
@@ -440,7 +440,7 @@ pub const MODEL: &[Parameter] = &[
     Parameter::new("pmos", "pmos", 665, "BSIM3_MOD_PMOS", Some("BSIM3type"), Some("BSIM3typeGiven"), InputType::Flag, Access::Input, false),
 ];
 
-/// `INSTANCE` IFparm entries in C table order, including aliases and ask-only rows.
+/// `INSTANCE` `IFparm` entries in C table order, including aliases and ask-only rows.
 #[rustfmt::skip]
 pub const INSTANCE: &[Parameter] = &[
     Parameter::new("l", "l", 2, "BSIM3_L", Some("BSIM3l"), Some("BSIM3lGiven"), InputType::Real, Access::ReadWrite, false),

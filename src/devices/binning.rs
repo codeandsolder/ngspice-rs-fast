@@ -11,7 +11,7 @@
 //! - Only an `M` instance is binned, and only when no model has the exact
 //!   referenced name. A candidate is a model named `<name>.<digits>` (at least
 //!   one digit, nothing else; `nch.01` matches `nch`, `nch.a` and `nch.` do not).
-//! - Only BSIM3 (`level` 8/49), BSIM4 (14/54), HiSIM2 (68) and HiSIM-HV (73)
+//! - Only BSIM3 (`level` 8/49), BSIM4 (14/54), `HiSIM2` (68) and HiSIM-HV (73)
 //!   `nmos`/`pmos`/`nsoi`/`psoi` cards are binnable; other candidates are
 //!   skipped, so level-1 `.N` cards never bin and C reports
 //!   "could not find a valid modelname".
@@ -45,7 +45,7 @@ use crate::devices::schema::finite_literal;
 pub const BIN_TOLERANCE: Real = 1e-9;
 
 /// MOS `level` selectors whose C model type `INPgetModBin` accepts:
-/// BSIM3 (8, 49), BSIM4 (14, 54), HiSIM2 (68) and HiSIM-HV (73).
+/// BSIM3 (8, 49), BSIM4 (14, 54), `HiSIM2` (68) and HiSIM-HV (73).
 pub const BINNABLE_MOS_LEVELS: [u8; 6] = [8, 49, 14, 54, 68, 73];
 
 /// How a model name relates to a reference (`misc/string.c::model_name_match`).

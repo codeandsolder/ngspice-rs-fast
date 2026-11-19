@@ -175,7 +175,7 @@ pub struct ParamScope {
 struct Failure {
     location: SourceLoc,
     message: String,
-    /// Valid numparam outside the port's subset (NotYetPorted, not Parse).
+    /// Valid numparam outside the port's subset (`NotYetPorted`, not Parse).
     unsupported: bool,
 }
 

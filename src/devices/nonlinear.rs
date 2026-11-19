@@ -290,7 +290,7 @@ fn canonical<'a>(
     }
     Ok(out)
 }
-/// `floor(raw + 0.5)` integer selector (`inpgval.c` IF_INTEGER) within `0..=max`.
+/// `floor(raw + 0.5)` integer selector (`inpgval.c` `IF_INTEGER`) within `0..=max`.
 fn selector(values: &ScalarValues, name: &str, max: u8, owner: &DeviceInstance) -> SpiceResult<u8> {
     let raw = value(values, name)?;
     let rounded = (raw + 0.5).floor();
