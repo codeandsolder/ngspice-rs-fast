@@ -64,7 +64,7 @@ const OPEN_RESISTANCE: Real = 1e20;
 
 /// The `.tf` output variable as written on the card.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Output {
+pub(super) enum Output {
     /// `v(pos)` or `v(pos,neg)`.
     Voltage {
         /// The positive node as written.
@@ -81,7 +81,7 @@ pub(crate) enum Output {
 
 /// A parsed `.tf` card.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TransferRequest {
+pub(super) struct TransferRequest {
     /// What is measured.
     pub output: Output,
     /// The independent V or I source that is excited.
@@ -103,7 +103,7 @@ fn syntax(message: impl std::fmt::Display) -> SpiceError {
 /// # Errors
 /// [`SpiceError::Unsupported`] for anything but `v(n)`, `v(n,m)` or `i(src)`
 /// followed by exactly one input source name.
-pub(crate) fn parse(positional: &[&str]) -> SpiceResult<TransferRequest> {
+pub(super) fn parse(positional: &[&str]) -> SpiceResult<TransferRequest> {
     let name = |token: Option<&&str>, what: &str| -> SpiceResult<String> {
         match token {
             Some(text) if !matches!(*text, "(" | ")" | ",") => Ok(text.to_ascii_lowercase()),
@@ -322,7 +322,7 @@ fn resistance(current: Real) -> Real {
 /// Malformed cards, an unknown or wrong-type input source, an unknown output
 /// node or device, an output device without a findable branch, operating-point
 /// failures, and singular or non-finite small-signal solves.
-pub(crate) fn run(
+pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &AnalysisContext,

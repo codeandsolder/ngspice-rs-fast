@@ -127,7 +127,7 @@ fn DEXP(A: f64) -> (f64, f64) {
 
 /// `BSIM4polyDepletion`: the poly-gate depletion effective gate voltage and
 /// its gate derivative, `(Vgs_eff, dVgs_eff_dVg)`.
-pub(crate) fn BSIM4polyDepletion(
+pub(super) fn BSIM4polyDepletion(
     phi: f64,
     ngate: f64,
     epsgate: f64,
@@ -156,7 +156,7 @@ pub(crate) fn BSIM4polyDepletion(
 ///
 /// # Errors
 /// `NIintegrate` failures (C returns its error).
-pub(crate) fn load(
+pub(super) fn load(
     model: &Model,
     here: &mut Instance,
     pParam: &SizeParam,

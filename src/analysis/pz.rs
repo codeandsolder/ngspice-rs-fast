@@ -180,7 +180,7 @@ fn roots(load: &PencilLoad, what: &str) -> SpiceResult<Vec<Complex>> {
         })
 }
 
-pub(crate) fn run(
+pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &crate::analysis::AnalysisContext,

@@ -47,7 +47,7 @@ fn num_finger_diff(nf: f64, min_sd: i32) -> (f64, f64, f64, f64) {
     clippy::too_many_arguments,
     reason = "keeps the positional interface explicit at the reference solver or device boundary"
 )] // C's own argument list.
-pub(crate) fn pa_eff_geo(
+pub(super) fn pa_eff_geo(
     nf: f64,
     geo: i32,
     min_sd: i32,
@@ -161,7 +161,7 @@ pub(crate) fn pa_eff_geo(
     clippy::too_many_arguments,
     reason = "keeps the positional interface explicit at the reference solver or device boundary"
 )] // C's own argument list.
-pub(crate) fn rdseff_geo(
+pub(super) fn rdseff_geo(
     nf: f64,
     geo: i32,
     rgeo: i32,

@@ -38,7 +38,7 @@ use crate::primitives::SpiceResult;
     clippy::too_many_lines,
     reason = "keeps the reference numerical routine in the original statement and rounding order"
 )] // One C function, kept in C's shape.
-pub(crate) fn pz_load(
+pub(super) fn pz_load(
     m: &Model,
     h: &Instance,
     p: &SizeParam,

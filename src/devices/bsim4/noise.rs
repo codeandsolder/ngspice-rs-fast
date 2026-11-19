@@ -49,7 +49,7 @@ fn max(a: f64, b: f64) -> f64 {
 
 /// One generator, on BSIM4-local nodes.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Source {
+pub(super) enum Source {
     /// `NevalSrc(..., THERMNOISE, a, b, conductance)`.
     Thermal(i32, i32, f64),
     /// `NevalSrc(..., SHOTNOISE, a, b, current)`.
@@ -74,7 +74,7 @@ pub(crate) enum Source {
 }
 
 /// `BSIM4nNames`, in C's order (the instance total `""` follows).
-pub(crate) const NAMES: [&str; 14] = [
+pub(super) const NAMES: [&str; 14] = [
     ".rd", ".rs", ".rg", ".rbps", ".rbpd", ".rbpb", ".rbsb", ".rbdb", ".id", ".1overf", ".igs",
     ".igd", ".igb", ".corl",
 ];
@@ -118,7 +118,7 @@ fn eval_1ov_f_noise(Vds: f64, m: &Model, h: &Instance, p: &SizeParam, freq: f64,
     clippy::too_many_lines,
     reason = "keeps the reference numerical routine in the original statement and rounding order"
 )] // One C function, kept whole.
-pub(crate) fn generators(
+pub(super) fn generators(
     m: &Model,
     h: &Instance,
     p: &SizeParam,

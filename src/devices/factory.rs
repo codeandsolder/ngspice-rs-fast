@@ -16,13 +16,13 @@ use crate::primitives::{
 /// Designators [`instantiate`] builds from the card alone (the registry's
 /// `ported` entries). `tests/registry_support.rs` elaborates one instance of
 /// every designator to keep this list and [`ELABORATED`] honest.
-pub(crate) const CARD_FACTORY: &[char] =
+pub(super) const CARD_FACTORY: &[char] =
     &['r', 'c', 'l', 'v', 'i', 'e', 'f', 'g', 'h', 'b', 'k', 't'];
 
 /// Designators built only while elaborating a deck, with the subset built:
 /// D/Q/M/S/W from a resolved `.model` card ([`instantiate_with_models`]) and X
 /// by subcircuit expansion (`crate::devices::subckt`). The registry's `bounded` entries.
-pub(crate) const ELABORATED: &[(char, &str)] = &[
+pub(super) const ELABORATED: &[(char, &str)] = &[
     ('d', "junction diode (dioload.c subset)"),
     ('q', "Gummel-Poon BJT level 1 (bjtload.c)"),
     (
@@ -57,7 +57,7 @@ pub(crate) const ELABORATED: &[(char, &str)] = &[
     ),
 ];
 
-pub(crate) fn from_card(card: &RawCard, nodes: &mut NodeTable) -> SpiceResult<Box<dyn Device>> {
+pub(super) fn from_card(card: &RawCard, nodes: &mut NodeTable) -> SpiceResult<Box<dyn Device>> {
     let deck = Deck {
         path: card.location.path().to_path_buf(),
         title: String::new(),
@@ -75,7 +75,7 @@ pub(crate) fn from_card(card: &RawCard, nodes: &mut NodeTable) -> SpiceResult<Bo
 
 /// Resolve and validate before any node interning. Bounded R/C/L and M4 D/Q/M
 /// factories reject all unsupported physics before committing staged nodes.
-pub(crate) fn instantiate_with_models(
+pub(super) fn instantiate_with_models(
     instance: &DeviceInstance,
     nodes: &mut NodeTable,
     models: &crate::devices::models::ModelResolver<'_>,
@@ -199,7 +199,7 @@ pub(crate) fn instantiate_with_models(
     instantiate(instance, nodes)
 }
 
-pub(crate) fn instantiate(
+pub(super) fn instantiate(
     instance: &DeviceInstance,
     nodes: &mut NodeTable,
 ) -> SpiceResult<Box<dyn Device>> {

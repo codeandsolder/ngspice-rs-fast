@@ -29,7 +29,7 @@ fn max(a: f64, b: f64) -> f64 {
     clippy::too_many_lines,
     reason = "keeps the reference numerical routine in the original statement and rounding order"
 )] // One C function, kept in C's shape.
-pub(crate) fn conv_test(
+pub(super) fn conv_test(
     m: &Model,
     h: &Instance,
     rhs_old: &dyn Fn(i32) -> f64,

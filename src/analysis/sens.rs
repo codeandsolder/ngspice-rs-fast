@@ -56,11 +56,11 @@ use crate::primitives::{
 };
 
 /// `Sens_Delta` of `cktsens.c`: the relative perturbation.
-pub(crate) const RELATIVE_DELTA: Real = 1e-6;
+pub(super) const RELATIVE_DELTA: Real = 1e-6;
 /// `Sens_Abs_Delta` of `cktsens.c`: the perturbation of a zero parameter.
-pub(crate) const ABSOLUTE_DELTA: Real = 1e-6;
+pub(super) const ABSOLUTE_DELTA: Real = 1e-6;
 /// The plot title (`dot_sens()` names the job "Sensitivity Analysis").
-pub(crate) const PLOTNAME: &str = "Sensitivity Analysis";
+pub(super) const PLOTNAME: &str = "Sensitivity Analysis";
 /// `M_LOG2E`, which `count_steps()` divides by for octave sweeps.
 const LOG2E: Real = std::f64::consts::LOG2_E;
 /// The port's bound on the number of frequencies.
@@ -1099,7 +1099,7 @@ impl AcState<'_> {
 /// # Errors
 /// Malformed cards, unknown outputs, devices whose sensitivity is not ported,
 /// operating-point failures and singular or nonfinite solves.
-pub(crate) fn run(
+pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &AnalysisContext,

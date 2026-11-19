@@ -4,19 +4,19 @@ use crate::analysis::{AnalysisRequest, Plot};
 use crate::devices::Circuit;
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult, parse_spice_number};
 
-pub(crate) fn unsupported(feature: impl Into<String>) -> SpiceError {
+pub(super) fn unsupported(feature: impl Into<String>) -> SpiceError {
     SpiceError::Unsupported {
         feature: feature.into(),
         location: None,
     }
 }
-pub(crate) fn number(text: Option<&str>, name: &str) -> SpiceResult<Real> {
+pub(super) fn number(text: Option<&str>, name: &str) -> SpiceResult<Real> {
     text.and_then(parse_spice_number)
         .filter(|v| v.is_finite())
         .ok_or_else(|| unsupported(format!("expected finite {name}")))
 }
 
-pub(crate) fn plot(
+pub(super) fn plot(
     circuit: &Circuit,
     name: &str,
     title: &str,
@@ -87,7 +87,7 @@ pub(crate) fn plot(
     Ok(plot)
 }
 
-pub(crate) fn op(
+pub(super) fn op(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &crate::analysis::AnalysisContext,
@@ -145,7 +145,7 @@ pub(crate) fn op(
     Ok(plot)
 }
 
-pub(crate) fn dc(
+pub(super) fn dc(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &crate::analysis::AnalysisContext,

@@ -23,7 +23,7 @@
 //! ```
 
 mod device;
-pub(crate) use device::{instantiate, swept_literal};
+pub(super) use device::{instantiate, swept_literal};
 
 use crate::devices::models::{ModelContext, ModelFamily, ResolvedModel};
 use crate::devices::schema::{

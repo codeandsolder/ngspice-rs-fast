@@ -60,7 +60,7 @@ fn failure(message: impl Into<String>) -> SpiceError {
 
 /// One validated hint on an MNA node row.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RowHint {
+pub(super) struct RowHint {
     pub row: usize,
     pub node: String,
     pub value: Real,
@@ -70,7 +70,7 @@ pub(crate) struct RowHint {
 /// The request's `.ic`/`.nodeset` entries bound to matrix rows, one per node
 /// (last duplicate wins), ordered by row.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct Hints {
+pub(super) struct Hints {
     pub initial: Vec<RowHint>,
     pub nodesets: Vec<RowHint>,
 }
@@ -80,7 +80,7 @@ pub(crate) struct Hints {
 /// # Errors
 /// A node that is not part of the circuit (C: warning "IC on non-existent node
 /// ... ignored") or that is ground.
-pub(crate) fn resolve(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<Hints> {
+pub(super) fn resolve(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<Hints> {
     Ok(Hints {
         initial: bind(circuit, &request.initial_conditions, ".ic")?,
         nodesets: bind(circuit, &request.nodesets, ".nodeset")?,
@@ -126,7 +126,7 @@ fn bind(circuit: &Circuit, entries: &[NodeCondition], card: &str) -> SpiceResult
 
 /// Relative and absolute voltage tolerances (`reltol`, `vntol`).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct VoltageTolerance {
+pub(super) struct VoltageTolerance {
     pub reltol: Real,
     pub vntol: Real,
 }
@@ -283,7 +283,7 @@ impl Rigid {
 
 /// The `.ic` constraints of the initial bias, split by how they are handled.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct Constraints {
+pub(super) struct Constraints {
     /// Entries no ideal relation fixes.
     pub imposed: Vec<RowHint>,
     /// Nodes already fixed by an E/H output relation (whose value is only
@@ -299,7 +299,7 @@ impl Constraints {}
 ///
 /// # Errors
 /// An entry that contradicts the value the controlled sources force.
-pub(crate) fn check_implied(
+pub(super) fn check_implied(
     x: &Vector,
     constraints: &Constraints,
     tolerance: VoltageTolerance,
@@ -336,7 +336,7 @@ pub(crate) fn check_implied(
 /// # Errors
 /// An `.ic` value contradicting an ideal source (or two `.ic` values on nodes
 /// rigidly tied by sources). C produces a `1e10`-weighted compromise there.
-pub(crate) fn irredundant_constraints(
+pub(super) fn irredundant_constraints(
     circuit: &Circuit,
     rhs: &Vector,
     hints: &[RowHint],
@@ -385,14 +385,14 @@ pub(crate) fn irredundant_constraints(
 /// `cktload.c` loads them. A node a source or an E/H output also ties gets
 /// C's `1e10` row ([`crate::analysis::bias::NodeForcing`]); an `.ic` on the
 /// same node overrides the nodeset there, as C's later `.ic` loop does.
-pub(crate) fn forced_nodesets(nodesets: &[RowHint]) -> Vec<(usize, Real)> {
+pub(super) fn forced_nodesets(nodesets: &[RowHint]) -> Vec<(usize, Real)> {
     nodesets.iter().map(|hint| (hint.row, hint.value)).collect()
 }
 
 /// The `uic` starting point: node voltages for the first load and the charge
 /// slots whose value comes from an instance `ic=`.
 #[derive(Debug)]
-pub(crate) struct UicStart {
+pub(super) struct UicStart {
     /// Node rows from `.nodeset` then `.ic` (zero elsewhere); inductor branch
     /// rows hold their initial current.
     pub x: Vector,
@@ -404,7 +404,7 @@ pub(crate) struct UicStart {
 ///
 /// # Errors
 /// Missing state or branch bindings.
-pub(crate) fn uic_start(
+pub(super) fn uic_start(
     circuit: &Circuit,
     hints: &Hints,
     context: &ModelContext,
@@ -448,7 +448,7 @@ pub(crate) fn uic_start(
 
 /// Tolerances for the `uic` consistency check.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Tolerances {
+pub(super) struct Tolerances {
     pub reltol: Real,
     pub vntol: Real,
     pub abstol: Real,
@@ -472,7 +472,7 @@ pub(crate) struct Tolerances {
 ///
 /// # Errors
 /// An inconsistent (impulsive) or ill-posed initial state.
-pub(crate) fn check_impulse_free(
+pub(super) fn check_impulse_free(
     circuit: &Circuit,
     a: &SparseMatrix,
     rhs: &Vector,

@@ -5,7 +5,7 @@ use super::fields::{Instance, Model};
 /// The `(row, column)` local node pairs `BSIM4setup` allocates for `h`,
 /// in order. Pairs involving [`super::host::node::GROUND`] are included, as
 /// C makes (trash-can) elements for them too; the host skips them.
-pub(crate) fn matrix_elements(m: &Model, h: &Instance) -> Vec<(i32, i32)> {
+pub(super) fn matrix_elements(m: &Model, h: &Instance) -> Vec<(i32, i32)> {
     let (d, g, s, b) = (h.dNode, h.gNodeExt, h.sNode, h.bNode);
     let (dp, gp, gm, sp, bp) = (
         h.dNodePrime,

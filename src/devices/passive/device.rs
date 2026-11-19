@@ -306,7 +306,7 @@ impl Device for ModelPassive {
     }
 }
 
-pub(crate) fn instantiate(
+pub(in crate::devices) fn instantiate(
     instance: &DeviceInstance,
     nodes: &mut NodeTable,
     model: &ResolvedModel<'_>,
@@ -333,7 +333,7 @@ pub(crate) fn instantiate(
 }
 
 /// Per-point literal R/C/L replacement, retaining temperature and multiplier setters.
-pub(crate) fn swept_literal(
+pub(in crate::devices) fn swept_literal(
     name: &str,
     terminals: [NodeId; 2],
     family: ModelFamily,

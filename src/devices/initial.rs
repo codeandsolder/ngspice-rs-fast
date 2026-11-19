@@ -15,7 +15,7 @@ use crate::primitives::{Real, SpiceError, SpiceResult, parse_spice_number};
 
 /// An instance's `off` flag and initial-condition components.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct InstanceInitial {
+pub(super) struct InstanceInitial {
     /// C `*off`: the instance starts the operating point with zero junction
     /// voltages and is held there through `MODEINITFIX`.
     pub off: bool,
@@ -44,7 +44,7 @@ fn number(text: &str, location: &crate::primitives::SourceLoc, name: &str) -> Sp
 ///
 /// # Errors
 /// A nonfinite or nonliteral component value.
-pub(crate) fn split(
+pub(super) fn split(
     parameters: &[ParameterAssignment],
     components: &[&str],
 ) -> SpiceResult<(InstanceInitial, Vec<ParameterAssignment>)> {

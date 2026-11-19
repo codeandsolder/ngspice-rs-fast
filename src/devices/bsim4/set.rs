@@ -37,7 +37,7 @@ fn c_strncmp_eq(a: &str, b: &str, n: usize) -> bool {
     clippy::unnecessary_wraps,
     reason = "uniform setup stage signatures carry device errors without special cases"
 )] // Uniform stage signature.
-pub(crate) fn setup_model(
+pub(super) fn setup_model(
     m: &mut Model,
     nominal_temperature: f64,
     warnings: &mut Vec<String>,
@@ -2909,7 +2909,7 @@ pub(crate) fn setup_model(
     clippy::unnecessary_wraps,
     reason = "uniform setup stage signatures carry device errors without special cases"
 )] // Uniform stage signature.
-pub(crate) fn setup_instance(
+pub(super) fn setup_instance(
     m: &Model,
     h: &mut Instance,
     noise_analysis: bool,

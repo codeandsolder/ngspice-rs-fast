@@ -72,7 +72,7 @@ fn strncmp(a: &str, b: &str, n: usize) -> bool {
     clippy::collapsible_else_if,
     reason = "keeps the reference branches identifiable by their original conditions"
 )]
-pub(crate) fn check_model(
+pub(super) fn check_model(
     m: &mut Model,
     h: &mut Instance,
     p: &mut SizeParam,
