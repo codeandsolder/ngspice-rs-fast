@@ -32,20 +32,15 @@ fn query(name: &str) -> SpiceResult<(&str, &str)> {
 }
 
 fn terminal(device: &dyn Device, key: &str) -> Option<usize> {
+    // JFET (jfetask.c) and MESFET (mesask.c) port labels use the same
+    // terminal numbering as their corresponding device load.
     match (device.designator(), key) {
-        (_, "i" | "current") => Some(0),
-        ('d', "id") | ('q', "ic") | ('m', "id") => Some(0),
-        ('q', "ib") | ('m', "ig") => Some(1),
-        ('q', "ie") | ('m', "is") => Some(2),
+        (_, "i" | "current") | ('d', "id") | ('q', "ic") | ('m' | 'j', "id") | ('z', "cd") => {
+            Some(0)
+        }
+        ('q', "ib") | ('m', "ig") | ('j', "ig") | ('z', "cg") => Some(1),
+        ('q', "ie") | ('m' | 'j' | 'z', "is") => Some(2),
         ('m', "ib") => Some(3),
-        // jfetask.c JFET_CD, JFET_CG, JFET_CS.
-        ('j', "id") => Some(0),
-        ('j', "ig") => Some(1),
-        ('j', "is") => Some(2),
-        // mesask.c MES_CD, MES_CG, MES_CS.
-        ('z', "cd") => Some(0),
-        ('z', "cg") => Some(1),
-        ('z', "is") => Some(2),
         _ => None,
     }
 }

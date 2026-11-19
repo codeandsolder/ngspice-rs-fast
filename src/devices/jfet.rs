@@ -1649,7 +1649,6 @@ impl DeviceSensitivity for JfetSensitivity<'_> {
                     // kf/af/gdsnoi: noise inputs the DC load ignores.
                     match other {
                         "kf" => 0.,
-                        "af" => 1.,
                         _ => 1.,
                     },
                     true,

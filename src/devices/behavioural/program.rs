@@ -1093,7 +1093,6 @@ fn differentiate(p: &Tree, variable: usize) -> Tree {
             );
             times(slope, differentiate(u, variable))
         }
-        Node::PwlDerivative(u, _) => times(zero(), differentiate(u, variable)),
         Node::Table(u, map) => {
             let slope = u.constant().map_or_else(
                 || Arc::new(Node::TableSlope(u.clone(), map.clone())),
@@ -1101,7 +1100,9 @@ fn differentiate(p: &Tree, variable: usize) -> Tree {
             );
             times(slope, differentiate(u, variable))
         }
-        Node::TableSlope(u, _) => times(zero(), differentiate(u, variable)),
+        Node::PwlDerivative(u, _) | Node::TableSlope(u, _) => {
+            times(zero(), differentiate(u, variable))
+        }
     }
 }
 

@@ -96,16 +96,15 @@ impl Waveform {
                         .all(|(t, v)| t.is_finite() && *t >= 0. && v.is_finite())
                     && p.windows(2).all(|w| w[0].0 < w[1].0)
             }
-            // Pulse::new is the only constructor, so a Pulse is always valid.
-            Self::Pulse(_) => true,
             Self::PulseDefaults(spec) => {
                 // Resolve against unit timing: checks everything that does not
                 // depend on the analysis (finiteness, prefix, delay sign).
                 spec.resolve(&TransientTiming::new(1., 1.)?)?;
                 true
             }
-            // Both are only constructed through validating constructors.
-            Self::PwlSource(_) | Self::Function(_) => true,
+            // Pulse and PWL/function values are only constructed through
+            // validating constructors, so they need no further checks here.
+            Self::Pulse(_) | Self::PwlSource(_) | Self::Function(_) => true,
             Self::FunctionDefaults(spec) => {
                 spec.validate()?;
                 true

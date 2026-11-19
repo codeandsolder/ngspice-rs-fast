@@ -512,7 +512,7 @@ fn event(
     let (at_setter, val_setter) = (setters.at(), setters.val());
     let event = match (operand, at_setter, val_setter) {
         (None, Some((at, location)), None) => MeasureEvent::At { at, location },
-        (Some(_), Some((_, at)), _) => {
+        (Some(_), Some((_, at)), _) | (None, Some(_), Some((_, at))) => {
             return Err(fail(
                 &at,
                 format!("{clause} takes AT=<value> or <vector> VAL=<value>, not both"),
@@ -536,12 +536,6 @@ fn event(
             return Err(fail(
                 &card,
                 format!("{clause} needs AT=<value> or <vector> VAL=<value>"),
-            ));
-        }
-        (None, Some(_), Some((_, at))) => {
-            return Err(fail(
-                &at,
-                format!("{clause} takes AT=<value> or <vector> VAL=<value>, not both"),
             ));
         }
     };

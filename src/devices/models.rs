@@ -809,8 +809,7 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
         ModelFamily::Nmos | ModelFamily::Pmos => {
             matches!(selector, 1..=3 | 6 | 8 | 9 | 14 | 49 | 54)
         }
-        ModelFamily::Njf | ModelFamily::Pjf => true,
-        ModelFamily::Nmf | ModelFamily::Pmf => true,
+        ModelFamily::Njf | ModelFamily::Pjf | ModelFamily::Nmf | ModelFamily::Pmf => true,
         ModelFamily::Diode => applied == Some(1),
         ModelFamily::Resistor if card.base.eq_ignore_ascii_case("r") => selector <= 1,
         _ => selector == 1 && first_integer == 1,

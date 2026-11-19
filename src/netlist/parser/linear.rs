@@ -153,14 +153,14 @@ fn passive_assignment(input: &mut Input<'_>) -> Result<ParameterAssignment> {
 fn scalar_name(designator: char, text: &str) -> Option<String> {
     let name = text.to_ascii_lowercase();
     let canonical = match (designator, name.as_str()) {
-        ('r', "r" | "resistance") => primary_name(designator),
-        ('c', "c" | "cap" | "capacitance") => primary_name(designator),
-        ('l', "l" | "inductance") => primary_name(designator),
-        (_, "temp" | "dtemp" | "m" | "tc1" | "tc2" | "scale") => &name,
-        ('r' | 'c', "w" | "l" | "bv_max") => &name,
-        ('r', "ac" | "tc" | "tce" | "noisy") => &name,
-        ('c' | 'l', "ic") => &name,
-        ('l', "nt") => &name,
+        ('r', "r" | "resistance")
+        | ('c', "c" | "cap" | "capacitance")
+        | ('l', "l" | "inductance") => primary_name(designator),
+        (_, "temp" | "dtemp" | "m" | "tc1" | "tc2" | "scale")
+        | ('r' | 'c', "w" | "l" | "bv_max")
+        | ('r', "ac" | "tc" | "tce" | "noisy")
+        | ('c' | 'l', "ic")
+        | ('l', "nt") => &name,
         _ => return None,
     };
     Some(canonical.to_owned())
