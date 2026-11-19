@@ -384,7 +384,8 @@ fn floating() -> Model {
 fn coupled() -> Model {
     // E v' = [(vin - va)/R1 ; -vb/R2], E = [[c1+c12, -c12], [-c12, c2+c12]].
     let (r1, r2, c1, c12, c2) = (1e3, 1e3, 1e-6, 2e-6, 1e-6);
-    let det = (c1 + c12) * (c2 + c12) - c12 * c12;
+    let coupling_squared = c12 * c12;
+    let det = (c1 + c12) * (c2 + c12) - coupling_squared;
     let inv = [[(c2 + c12) / det, c12 / det], [c12 / det, (c1 + c12) / det]];
     Model {
         lti: Lti {

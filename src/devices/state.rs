@@ -346,9 +346,10 @@ impl StateHistory {
         range: Range<usize>,
         delay: Option<&'a DelayHistory>,
     ) -> SpiceResult<DeviceState<'a>> {
-        let valid_length = trial.values.len() == self.len;
-        let valid_range = range.start <= range.end && range.end <= self.len;
-        if !valid_length || !valid_range {
+        let complete_trial = trial.values.len() == self.len;
+        let ordered_range = range.start <= range.end;
+        let bounded_range = range.end <= self.len;
+        if !complete_trial || !ordered_range || !bounded_range {
             return Err(state_error("device state range out of bounds"));
         }
         let mut accepted: [&[Real]; ACCEPTED_DEPTH] = [&[]; ACCEPTED_DEPTH];
