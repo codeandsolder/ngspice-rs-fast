@@ -182,6 +182,56 @@ struct Element {
     next_in_col: usize,
 }
 
+/// One numeric traversal entry. Its coordinate is an internal row for
+/// column runs, or an internal column for the upper-row runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunEntry {
+    handle: usize,
+    coordinate: usize,
+}
+
+/// A column's sorted entries, partitioned at its diagonal. Every entry
+/// before the diagonal is upper triangular, every entry after it lower.
+#[derive(Debug, Clone, Copy)]
+struct ColumnRun {
+    start: usize,
+    diagonal: usize,
+    end: usize,
+}
+
+/// Packed traversal of the existing SPARSE linked topology. It is derived
+/// only after ordering succeeds: fill-ins and external/internal mappings
+/// remain authoritative in the linked structure. Numeric refactoring and
+/// solves use the original linked-list iteration order without chasing links.
+#[derive(Debug)]
+struct FactorPlan {
+    columns: Vec<ColumnRun>,
+    column_entries: Vec<RunEntry>,
+    upper_row_start: Vec<usize>,
+    upper_row_entries: Vec<RunEntry>,
+}
+
+impl FactorPlan {
+    fn column(&self, col: usize) -> &[RunEntry] {
+        let run = self.columns[col - 1];
+        &self.column_entries[run.start..run.end]
+    }
+
+    fn upper_column(&self, col: usize) -> &[RunEntry] {
+        let run = self.columns[col - 1];
+        &self.column_entries[run.start..run.diagonal]
+    }
+
+    fn lower_column(&self, col: usize) -> &[RunEntry] {
+        let run = self.columns[col - 1];
+        &self.column_entries[run.diagonal + 1..run.end]
+    }
+
+    fn upper_row(&self, row: usize) -> &[RunEntry] {
+        &self.upper_row_entries[self.upper_row_start[row - 1]..self.upper_row_start[row]]
+    }
+}
+
 /// The address of a column (or row) link: a list head or an element's link.
 #[derive(Debug, Clone, Copy)]
 enum Slot {
@@ -204,6 +254,9 @@ pub(super) struct Sparse<T> {
     /// Reordering changes links, never moves element handles.
     elements: Vec<Element>,
     values: Vec<T>,
+    /// Immutable traversal runs, shared by factor snapshots and scalar
+    /// conversions. Invalidated only when the linked topology changes.
+    plan: Option<std::sync::Arc<FactorPlan>>,
     diag: Vec<usize>,
     first_in_col: Vec<usize>,
     first_in_row: Vec<usize>,
@@ -244,6 +297,7 @@ impl<T: Scalar> Sparse<T> {
             current_size: 0,
             elements: Vec::new(),
             values: Vec::new(),
+            plan: None,
             diag: vec![NONE; size + 1],
             first_in_col: vec![NONE; size + 1],
             first_in_row: vec![NONE; size + 1],
@@ -397,6 +451,7 @@ impl<T: Scalar> Sparse<T> {
 
     /// `spcCreateElement`.
     fn create_element(&mut self, row: usize, col: usize, last: Slot, fillin: bool) -> usize {
+        self.plan = None;
         let e = self.elements.len();
         self.elements.push(Element {
             row,
@@ -499,6 +554,7 @@ impl<T: Scalar> Sparse<T> {
             current_size: self.current_size,
             values: vec![U::ZERO; self.values.len()],
             elements: self.elements,
+            plan: self.plan,
             diag: self.diag,
             first_in_col: self.first_in_col,
             first_in_row: self.first_in_row,
@@ -819,10 +875,57 @@ impl<T: Scalar> Sparse<T> {
         self.done()
     }
 
-    const fn done(&mut self) -> Status {
+    fn done(&mut self) -> Status {
+        if self.plan.is_none() {
+            self.plan = Some(std::sync::Arc::new(self.compile_plan()));
+        }
         self.needs_ordering = false;
         self.factored = true;
         self.status
+    }
+
+    fn compile_plan(&self) -> FactorPlan {
+        let mut columns = Vec::with_capacity(self.size);
+        let mut column_entries = Vec::with_capacity(self.elements.len());
+        let mut upper_row_start = Vec::with_capacity(self.size + 1);
+        let mut upper_row_entries = Vec::new();
+        upper_row_start.push(0);
+        for i in 1..=self.size {
+            let start = column_entries.len();
+            let diagonal = self.diag[i];
+            let mut diagonal_offset = None;
+            let mut e = self.first_in_col[i];
+            while e != NONE {
+                if e == diagonal {
+                    diagonal_offset = Some(column_entries.len());
+                }
+                column_entries.push(RunEntry {
+                    handle: e,
+                    coordinate: self.elements[e].row,
+                });
+                e = self.elements[e].next_in_col;
+            }
+            columns.push(ColumnRun {
+                start,
+                diagonal: diagonal_offset.expect("ordered column contains its diagonal"),
+                end: column_entries.len(),
+            });
+            let mut e = self.elements[diagonal].next_in_row;
+            while e != NONE {
+                upper_row_entries.push(RunEntry {
+                    handle: e,
+                    coordinate: self.elements[e].col,
+                });
+                e = self.elements[e].next_in_row;
+            }
+            upper_row_start.push(upper_row_entries.len());
+        }
+        FactorPlan {
+            columns,
+            column_entries,
+            upper_row_start,
+            upper_row_entries,
+        }
     }
 
     /// `spFactor`: refactor with the existing pivot order (no threshold test).
@@ -833,9 +936,8 @@ impl<T: Scalar> Sparse<T> {
         self.factored = false;
         let size = self.size;
         if size == 0 {
-            self.factored = true;
             self.status = Status::Okay;
-            return self.status;
+            return self.done();
         }
         let first = self.diag[1];
         if self.values[first].is_zero() {
@@ -849,31 +951,39 @@ impl<T: Scalar> Sparse<T> {
         self.factor_workspace.resize(size + 1, T::ZERO);
         self.factor_workspace.fill(T::ZERO);
         let dest = &mut self.factor_workspace;
+        let plan = self
+            .plan
+            .as_deref()
+            .expect("ordered sparse frame has a traversal plan");
         for step in 2..=size {
-            let mut e = self.first_in_col[step];
-            while e != NONE {
-                dest[self.elements[e].row] = self.values[e];
-                e = self.elements[e].next_in_col;
+            for &RunEntry {
+                handle,
+                coordinate: row,
+            } in plan.column(step)
+            {
+                dest[row] = self.values[handle];
             }
-            let mut column = self.first_in_col[step];
-            while self.elements[column].row < step {
-                let row = self.elements[column].row;
-                let mut e = self.diag[row];
-                let mult = dest[row].mul(self.values[e]);
-                self.values[column] = mult;
-                e = self.elements[e].next_in_col;
-                while e != NONE {
-                    let r = self.elements[e].row;
-                    dest[r] = dest[r].mul_sub(mult, self.values[e]);
-                    e = self.elements[e].next_in_col;
+            for &RunEntry {
+                handle,
+                coordinate: row,
+            } in plan.upper_column(step)
+            {
+                let mult = dest[row].mul(self.values[self.diag[row]]);
+                self.values[handle] = mult;
+                for &RunEntry {
+                    handle,
+                    coordinate: r,
+                } in plan.lower_column(row)
+                {
+                    dest[r] = dest[r].mul_sub(mult, self.values[handle]);
                 }
-                column = self.elements[column].next_in_col;
             }
-            let mut e = self.elements[self.diag[step]].next_in_col;
-            while e != NONE {
-                let value = dest[self.elements[e].row];
-                self.values[e] = value;
-                e = self.elements[e].next_in_col;
+            for &RunEntry {
+                handle,
+                coordinate: row,
+            } in plan.lower_column(step)
+            {
+                self.values[handle] = dest[row];
             }
             if dest[step].is_zero() {
                 return self.refactor_zero_pivot(step);
@@ -1264,6 +1374,7 @@ impl<T: Scalar> Sparse<T> {
         if row == step && col == step {
             return;
         }
+        self.plan = None;
         if row == col {
             self.row_exchange(step, row);
             self.col_exchange(step, col);
@@ -1662,26 +1773,32 @@ impl<T: Scalar> Sparse<T> {
     pub(super) fn solve_with_workspace(&self, rhs: &[T], x: &mut Vec<T>) -> Vec<T> {
         self.gather_rhs(rhs, x, false);
         let size = self.size;
+        let plan = self
+            .plan
+            .as_deref()
+            .expect("factored sparse frame has a traversal plan");
         for i in 1..=size {
             let mut temp = x[i];
             if !temp.is_zero() {
-                let pivot = self.diag[i];
-                temp = temp.mul(self.values[pivot]);
+                temp = temp.mul(self.values[self.diag[i]]);
                 x[i] = temp;
-                let mut e = self.elements[pivot].next_in_col;
-                while e != NONE {
-                    let r = self.elements[e].row;
-                    x[r] = x[r].mul_sub(temp, self.values[e]);
-                    e = self.elements[e].next_in_col;
+                for &RunEntry {
+                    handle,
+                    coordinate: r,
+                } in plan.lower_column(i)
+                {
+                    x[r] = x[r].mul_sub(temp, self.values[handle]);
                 }
             }
         }
         for i in (1..=size).rev() {
             let mut temp = x[i];
-            let mut e = self.elements[self.diag[i]].next_in_row;
-            while e != NONE {
-                temp = temp.mul_sub(self.values[e], x[self.elements[e].col]);
-                e = self.elements[e].next_in_row;
+            for &RunEntry {
+                handle,
+                coordinate: c,
+            } in plan.upper_row(i)
+            {
+                temp = temp.mul_sub(self.values[handle], x[c]);
             }
             x[i] = temp;
         }
@@ -1731,24 +1848,31 @@ impl<T: Scalar> Sparse<T> {
     pub(super) fn solve_transposed_with_workspace(&self, rhs: &[T], x: &mut Vec<T>) -> Vec<T> {
         let size = self.size;
         self.gather_rhs(rhs, x, true);
+        let plan = self
+            .plan
+            .as_deref()
+            .expect("factored sparse frame has a traversal plan");
         for i in 1..=size {
             let temp = x[i];
             if !temp.is_zero() {
-                let mut e = self.elements[self.diag[i]].next_in_row;
-                while e != NONE {
-                    let c = self.elements[e].col;
-                    x[c] = x[c].mul_sub(temp, self.values[e]);
-                    e = self.elements[e].next_in_row;
+                for &RunEntry {
+                    handle,
+                    coordinate: c,
+                } in plan.upper_row(i)
+                {
+                    x[c] = x[c].mul_sub(temp, self.values[handle]);
                 }
             }
         }
         for i in (1..=size).rev() {
             let pivot = self.diag[i];
             let mut temp = x[i];
-            let mut e = self.elements[pivot].next_in_col;
-            while e != NONE {
-                temp = temp.mul_sub(x[self.elements[e].row], self.values[e]);
-                e = self.elements[e].next_in_col;
+            for &RunEntry {
+                handle,
+                coordinate: row,
+            } in plan.lower_column(i)
+            {
+                temp = temp.mul_sub(x[row], self.values[handle]);
             }
             x[i] = temp.mul(self.values[pivot]);
         }
@@ -1978,6 +2102,63 @@ mod tests {
         let imag = mantissa.im * 10_f64.powi(exponent - 614);
         assert!((imag - 2.).abs() < 1e-12);
         assert!((mantissa.re * 10_f64.powi(exponent - 614)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn traversal_plan_matches_links_and_is_shared_until_topology_changes() {
+        let entries = [
+            (1, 2, 3.),
+            (2, 1, 2.),
+            (2, 2, 4.),
+            (2, 3, 1.),
+            (3, 3, 4.),
+            (3, 4, 1.),
+            (4, 4, 4.),
+            (4, 1, 1.),
+        ];
+        let mut m = Sparse::<f64>::new(4);
+        for (r, c, v) in entries {
+            m.append_original(r, c, v);
+        }
+        m.mna_preorder();
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        let plan = std::sync::Arc::clone(m.plan.as_ref().unwrap());
+        for i in 1..=m.size {
+            let mut col = Vec::new();
+            let mut e = m.first_in_col[i];
+            while e != NONE {
+                col.push(RunEntry {
+                    handle: e,
+                    coordinate: m.elements[e].row,
+                });
+                e = m.elements[e].next_in_col;
+            }
+            assert_eq!(plan.column(i), col);
+            let mut row = Vec::new();
+            let mut e = m.elements[m.diag[i]].next_in_row;
+            while e != NONE {
+                row.push(RunEntry {
+                    handle: e,
+                    coordinate: m.elements[e].col,
+                });
+                e = m.elements[e].next_in_row;
+            }
+            assert_eq!(plan.upper_row(i), row);
+        }
+        let rhs = [5., 6., 7., 8.];
+        let x = m.solve(&rhs);
+        let xt = m.solve_transposed(&rhs);
+        m.reload_originals(&entries.map(|(_, _, v)| v));
+        assert_eq!(m.factor(), Status::Okay);
+        assert_eq!(m.solve(&rhs), x);
+        assert_eq!(m.solve_transposed(&rhs), xt);
+        assert!(std::sync::Arc::ptr_eq(m.plan.as_ref().unwrap(), &plan));
+        let mut c = m.into_retyped::<Complex>();
+        assert!(std::sync::Arc::ptr_eq(c.plan.as_ref().unwrap(), &plan));
+        // Insert a missing structural entry after a completed ordering.
+        let h = c.get_element(1, 4);
+        c.set(h, Complex::real(2.));
+        assert!(c.plan.is_none());
     }
 
     #[test]
