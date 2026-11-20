@@ -21,7 +21,7 @@ const STEPS: &[(&str, &[&str])] = &[
 ];
 
 /// Runs every check in order, stopping at the first failure.
-pub(crate) fn main() -> Result<(), String> {
+pub fn main() -> Result<(), String> {
     for (program, arguments) in STEPS {
         run(program, arguments)?;
     }
