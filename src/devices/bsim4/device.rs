@@ -206,7 +206,13 @@ impl Bsim4 {
             .into_iter()
             .zip(external)
         {
-            device.nodes[local as usize] = id;
+            let index = usize::try_from(local)
+                .ok()
+                .filter(|&i| i < node::COUNT)
+                .ok_or_else(|| {
+                    SpiceError::circuit("BSIM4 setup mapped an invalid external node")
+                })?;
+            device.nodes[index] = id;
         }
         for &(local, suffix) in &created {
             let name = format!("{}#{suffix}", instance.name);
@@ -322,9 +328,8 @@ impl Bsim4 {
     /// The setup for these temperatures (and this device's swept values),
     /// rebuilt when C would re-run `BSIM4temp`.
     pub(super) fn ensure(&self, temperature: Real, nominal: Real) -> SpiceResult<Rc<Prepared>> {
-        let same = |p: &Prepared| {
-            p.temperature == temperature && p.nominal == nominal && p.swept == self.swept
-        };
+        let same =
+            |p: &Prepared| p.matches_temperatures(temperature, nominal) && p.swept == self.swept;
         {
             let shared = self.borrow_shared()?;
             if let Some(prepared) = shared.setups.iter().find(|p| same(p)) {
@@ -506,7 +511,7 @@ pub(super) fn ac_stamp(
         s0,
         error: None,
     };
-    acld::ac_load(model, h, size, &mut host)?;
+    acld::ac_load(model, h, size, &mut host);
     host.error.map_or(Ok(()), Err)
 }
 
@@ -549,6 +554,15 @@ impl Bsim4 {
 }
 
 impl Prepared {
+    /// The exact cache key for C temperature passes. Both signed zeros compare equal.
+    #[expect(
+        clippy::float_cmp,
+        reason = "reuse a prepared model only for exactly equal temperatures; retain IEEE signed-zero and NaN equality semantics"
+    )]
+    const fn matches_temperatures(&self, temperature: Real, nominal: Real) -> bool {
+        self.temperature == temperature && self.nominal == nominal
+    }
+
     /// `CKTtemp` in kelvin for the loads.
     fn model_temperature(&self) -> Real {
         self.temperature + 273.15
@@ -561,29 +575,19 @@ impl Prepared {
 /// the temperature-derived members and leaves these (the next load reads
 /// `BSIM4von` for `DEVfetlim`).
 const fn carry_load_members(from: &Instance, to: &mut Instance) {
-    to.AbovVgst2Vtm = from.AbovVgst2Vtm;
-    to.Abulk = from.Abulk;
+    carry_charge_members(from, to);
+    carry_current_members(from, to);
+}
+
+/// Charge, capacitance and charge-relaxation results left by the load.
+const fn carry_charge_members(from: &Instance, to: &mut Instance) {
     to.Coxeff = from.Coxeff;
-    to.EsatL = from.EsatL;
-    to.IdovVds = from.IdovVds;
-    to.Igb = from.Igb;
-    to.Igcd = from.Igcd;
-    to.Igcs = from.Igcs;
-    to.Igd = from.Igd;
-    to.Igidl = from.Igidl;
-    to.Igisl = from.Igisl;
-    to.Igs = from.Igs;
-    to.Vdseff = from.Vdseff;
-    to.Vgsteff = from.Vgsteff;
     to.capbd = from.capbd;
     to.capbs = from.capbs;
     to.cbbb = from.cbbb;
-    to.cbd = from.cbd;
     to.cbdb = from.cbdb;
     to.cbgb = from.cbgb;
-    to.cbs = from.cbs;
     to.cbsb = from.cbsb;
-    to.cd = from.cd;
     to.cdbb = from.cdbb;
     to.cddb = from.cddb;
     to.cdgb = from.cdgb;
@@ -602,6 +606,40 @@ const fn carry_load_members(from: &Instance, to: &mut Instance) {
     to.csdb = from.csdb;
     to.csgb = from.csgb;
     to.cssb = from.cssb;
+    to.gtau = from.gtau;
+    to.gtb = from.gtb;
+    to.gtd = from.gtd;
+    to.gtg = from.gtg;
+    to.gts = from.gts;
+    to.qbulk = from.qbulk;
+    to.qchqs = from.qchqs;
+    to.qdrn = from.qdrn;
+    to.qgate = from.qgate;
+    to.qgdo = from.qgdo;
+    to.qgso = from.qgso;
+    to.qinv = from.qinv;
+    to.qsrc = from.qsrc;
+    to.taunet = from.taunet;
+}
+
+/// Current, conductance and remaining operating-point results left by the load.
+const fn carry_current_members(from: &Instance, to: &mut Instance) {
+    to.AbovVgst2Vtm = from.AbovVgst2Vtm;
+    to.Abulk = from.Abulk;
+    to.EsatL = from.EsatL;
+    to.IdovVds = from.IdovVds;
+    to.Igb = from.Igb;
+    to.Igcd = from.Igcd;
+    to.Igcs = from.Igcs;
+    to.Igd = from.Igd;
+    to.Igidl = from.Igidl;
+    to.Igisl = from.Igisl;
+    to.Igs = from.Igs;
+    to.Vdseff = from.Vdseff;
+    to.Vgsteff = from.Vgsteff;
+    to.cbd = from.cbd;
+    to.cbs = from.cbs;
+    to.cd = from.cd;
     to.csub = from.csub;
     to.dvgd_eff_dvg = from.dvgd_eff_dvg;
     to.dvgs_eff_dvg = from.dvgs_eff_dvg;
@@ -653,23 +691,9 @@ const fn carry_load_members(from: &Instance, to: &mut Instance) {
     to.gstotd = from.gstotd;
     to.gstotg = from.gstotg;
     to.gstots = from.gstots;
-    to.gtau = from.gtau;
-    to.gtb = from.gtb;
-    to.gtd = from.gtd;
-    to.gtg = from.gtg;
-    to.gts = from.gts;
     to.mode = from.mode;
     to.noiGd0 = from.noiGd0;
     to.nstar = from.nstar;
-    to.qbulk = from.qbulk;
-    to.qchqs = from.qchqs;
-    to.qdrn = from.qdrn;
-    to.qgate = from.qgate;
-    to.qgdo = from.qgdo;
-    to.qgso = from.qgso;
-    to.qinv = from.qinv;
-    to.qsrc = from.qsrc;
-    to.taunet = from.taunet;
     to.thetavth = from.thetavth;
     to.ueff = from.ueff;
     to.vdsat = from.vdsat;
@@ -782,7 +806,9 @@ impl LoadCkt for StampHost<'_, '_> {
     fn delta(&self) -> f64 {
         // dctrcurv.c leaves CKTdelta equal to every CKTdeltaOld, so DEVpred's
         // ratio is one in a sweep.
-        self.context.integration.map_or(1., |c| c.dt())
+        self.context
+            .integration
+            .map_or(1., crate::maths::Coefficients::dt)
     }
     fn delta_old(&self, i: usize) -> f64 {
         self.context
@@ -876,6 +902,10 @@ impl LoadCkt for StampHost<'_, '_> {
 /// whatever `CKTag` the last transient left; a fresh circuit's is zero,
 /// which is what every non-transient analysis of a deck without an earlier
 /// `.tran` sees.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "preserve NIintegrate's separate multiply, sum and subtraction, including signed-zero and nonfinite behavior"
+)]
 fn zero_coefficient_integrate(cap: f64, q0: f64, q1: f64) -> (f64, f64, f64) {
     let ag = [0.0_f64; 2];
     let derivative = ag[0] * q0 + ag[1] * q1;
@@ -1084,7 +1114,7 @@ impl Bsim4 {
         if pole_zero {
             pzld::pz_load(&prepared.model, &h, &prepared.size, &mut host)?;
         } else {
-            acld::ac_load(&prepared.model, &h, &prepared.size, &mut host)?;
+            acld::ac_load(&prepared.model, &h, &prepared.size, &mut host);
         }
         host.error.map_or(Ok(()), Err)
     }
@@ -1613,17 +1643,29 @@ mod tests {
     }
 
     #[test]
+    fn temperature_cache_uses_exact_numeric_equality() {
+        let setup = prepared(1e-6);
+        assert!(setup.matches_temperatures(27., 27.));
+        assert!(!setup.matches_temperatures(27.0_f64.next_up(), 27.));
+        assert!(!setup.matches_temperatures(27., 27.0_f64.next_up()));
+        assert!(!setup.matches_temperatures(f64::NAN, 27.));
+    }
+
+    #[test]
     fn live_snapshot_changes_keep_load_members_not_geometry() {
         let first = prepared(1e-6);
         let second = prepared(2e-6);
         let mut shared = Shared::default();
-        shared.live_instance(&first).unwrap().gm = 0.123;
+        let live = shared.live_instance(&first).unwrap();
+        live.gm = 0.123;
+        live.qgate = 0.456;
         assert_eq!(
             shared.live_instance(&first).unwrap().gm.to_bits(),
             0.123_f64.to_bits()
         );
         let mut probe = shared.live_copy(&second);
         assert_eq!(probe.gm.to_bits(), 0.123_f64.to_bits());
+        assert_eq!(probe.qgate.to_bits(), 0.456_f64.to_bits());
         assert_eq!(probe.l.to_bits(), 2e-6_f64.to_bits());
         probe.gm = 0.456;
         assert_eq!(probe.gm.to_bits(), 0.456_f64.to_bits());

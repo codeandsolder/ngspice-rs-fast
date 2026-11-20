@@ -72,6 +72,10 @@ fn strncmp(a: &str, b: &str, n: usize) -> bool {
     clippy::collapsible_else_if,
     reason = "keeps the reference branches identifiable by their original conditions"
 )]
+#[expect(
+    clippy::float_cmp,
+    reason = "C checks exact singular denominators and discrete real-valued NF, NGCON and WPEMOD selectors; epsilon comparisons would change model resets and diagnostics"
+)]
 pub(super) fn check_model(
     m: &mut Model,
     h: &mut Instance,
@@ -924,6 +928,41 @@ mod tests {
         assert!(strncmp("4.7", "4.8", 3));
         assert!(strncmp("4", "4.8", 3));
         assert!(!strcmp("4.8.0", "4.8.0"));
+    }
+
+    #[test]
+    fn model_checks_use_exact_denominators_and_discrete_selectors() {
+        let mut model = Model {
+            version: "4.8.3".into(),
+            ..Model::default()
+        };
+        let mut instance = Instance {
+            ngcon: 1.0_f64.next_up(),
+            ..Instance::default()
+        };
+        let mut size = SizeParam {
+            weff: 1.0,
+            w0: -1.0,
+            b1: -1.0_f64.next_up(),
+            ..SizeParam::default()
+        };
+        let mut messages = Vec::new();
+        check_model(
+            &mut model,
+            &mut instance,
+            &mut size,
+            300.15,
+            "exact",
+            &mut messages,
+        );
+        assert!(messages.iter().any(|s| s.contains("(W0 + Weff) = 0")));
+        assert!(!messages.iter().any(|s| s.contains("(B1 + Weff) = 0")));
+        assert!(
+            messages
+                .iter()
+                .any(|s| s.contains("Ngcon must be equal to one or two"))
+        );
+        assert_eq!(instance.ngcon.to_bits(), 1.0_f64.to_bits());
     }
 
     #[test]
