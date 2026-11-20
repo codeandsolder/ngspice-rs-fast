@@ -286,8 +286,8 @@ pub(super) fn table_form(
 ) -> Result<Vec<ParameterAssignment>> {
     let keyword = any.parse_next(input)?;
     let mut parameters = Vec::new();
+    let _ = winnow::combinator::opt(equals).parse_next(input)?;
     if control_nodes {
-        let _ = winnow::combinator::opt(equals).parse_next(input)?;
         parameters.push(ParameterAssignment {
             name: "table".to_owned(),
             value: String::new(),
@@ -295,7 +295,6 @@ pub(super) fn table_form(
             location: keyword.location.clone(),
         });
     } else {
-        let _ = winnow::combinator::opt(equals).parse_next(input)?;
         let Some(token) = input
             .input
             .first()
