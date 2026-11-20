@@ -1111,14 +1111,16 @@ impl Bjt {
             Linearization::Limited => {
                 let (mut vbe, mut vbc, vbx, mut vsub) =
                     if states.phase() == crate::devices::IterationPhase::Predict {
-                        let xfact = context.integration.map_or(1., |c| c.predictor_ratio());
-                        let [vbe, vbc, vbx, vsub] = limiting::predicted_values(
+                        let xfact = context
+                            .integration
+                            .map_or(1., crate::maths::Coefficients::predictor_ratio);
+                        let predicted = limiting::predicted_values(
                             states,
                             [slot::VBE, slot::VBC, slot::VBX, slot::VSUB],
                             xfact,
                         )
                         .ok_or_else(|| SpiceError::circuit("missing accepted BJT voltages"))?;
-                        (vbe, vbc, vbx, vsub)
+                        predicted.into()
                     } else {
                         (raw.vbe, raw.vbc, raw.vbx, raw.vsub)
                     };
@@ -1212,19 +1214,16 @@ fn c_point(
     };
     gbcn += gmin;
     cbcn += gmin * vbc;
-    let (gdsub, cdsub) = match t.iss {
-        Some(iss) => {
-            let vts = vt * t.ns;
-            if vsub <= -3. * vts {
-                let (current, conductance) = cubic_reverse_junction(vsub, vts, iss);
-                (conductance + gmin, current + gmin * vsub)
-            } else {
-                let evsub = (vsub / vts).min(MAX_EXP_ARG).exp();
-                (iss * evsub / vts + gmin, iss * (evsub - 1.) + gmin * vsub)
-            }
+    let (gdsub, cdsub) = t.iss.map_or((gmin, gmin * vsub), |iss| {
+        let vts = vt * t.ns;
+        if vsub <= -3. * vts {
+            let (current, conductance) = cubic_reverse_junction(vsub, vts, iss);
+            (conductance + gmin, current + gmin * vsub)
+        } else {
+            let evsub = (vsub / vts).min(MAX_EXP_ARG).exp();
+            (iss * evsub / vts + gmin, iss * (evsub - 1.) + gmin * vsub)
         }
-        None => (gmin, gmin * vsub),
-    };
+    });
     // Base charge terms.
     let q1 = 1. / (1. - t.inv_vaf * vbc - t.inv_var * vbe);
     let (qb, dqbdve, dqbdvc);
@@ -1263,18 +1262,17 @@ fn c_point(
     let gex = gbe;
     cc = cc + (cex - cbc) / qb - cbc / t.br - cbcn;
     let cb = cbe / t.bf + cben + cbc / t.br + cbcn;
-    let mut gx = t.rbm + rbpi / qb;
-    if t.irb != 0. {
+    let gx = if t.irb == 0. {
+        t.rbm + rbpi / qb
+    } else {
         let ratio = cb / t.irb;
         // C's MAX(cb/irb, 1e-9).
-        let mut arg1 = if ratio > 1e-9 { ratio } else { 1e-9 };
+        let arg1 = if ratio > 1e-9 { ratio } else { 1e-9 };
         let arg2 = (-1. + (1. + 14.59025 * arg1).sqrt()) / 2.4317 / arg1.sqrt();
-        arg1 = arg2.tan();
-        gx = t.rbm + 3. * rbpi * (arg1 - arg2) / arg2 / arg1 / arg1;
-    }
-    if gx != 0. {
-        gx = 1. / gx;
-    }
+        let arg1 = arg2.tan();
+        t.rbm + 3. * rbpi * (arg1 - arg2) / arg2 / arg1 / arg1
+    };
+    let gx = if gx == 0. { gx } else { 1. / gx };
     let gpi = gbe / t.bf + gben;
     let gmu = gbc / t.br + gbcn;
     let go = (gbc + (cex - cbc) * dqbdvc / qb) / qb;
@@ -1292,28 +1290,30 @@ fn c_point(
     let xtf = t.xtf;
     let ovtf = t.vtf_factor;
     let xjtf = t.itf;
-    let mut geqcb = 0.;
-    if tf != 0. && vbe > 0. {
-        let mut argtf = 0.;
-        let mut arg2 = 0.;
-        let mut arg3 = 0.;
-        if xtf != 0. {
-            argtf = xtf;
-            if ovtf != 0. {
-                argtf *= (vbc * ovtf).exp();
-            }
-            arg2 = argtf;
-            if xjtf != 0. {
+    let geqcb = if tf != 0. && vbe > 0. {
+        let (argtf, arg2, arg3) = if xtf == 0. {
+            (0., 0., 0.)
+        } else {
+            let argtf = if ovtf == 0. {
+                xtf
+            } else {
+                xtf * (vbc * ovtf).exp()
+            };
+            let (argtf, arg2) = if xjtf == 0. {
+                (argtf, argtf)
+            } else {
                 let temp = cbe / (cbe + xjtf);
-                argtf = argtf * temp * temp;
-                arg2 = argtf * (3. - temp - temp);
-            }
-            arg3 = cbe * argtf * ovtf;
-        }
+                let argtf = argtf * temp * temp;
+                (argtf, argtf * (3. - temp - temp))
+            };
+            (argtf, arg2, cbe * argtf * ovtf)
+        };
         cbe = cbe * (1. + argtf) / qb;
         gbe = (gbe * (1. + arg2) - cbe * dqbdve) / qb;
-        geqcb = tf * (arg3 - cbe * dqbdvc) / qb;
-    }
+        tf * (arg3 - cbe * dqbdvc) / qb
+    } else {
+        0.
+    };
     let (qbe, capbe) = t.be.charge(vbe, czbe, Some((tf * cbe, tf * gbe)));
     let (qbc, capbc) = t.bc.charge(vbc, czbc, Some((tr * cbc, tr * gbc)));
     let (qbx, capbx) = t.bc.charge(vbx, czbx, None);
@@ -1495,12 +1495,12 @@ impl Device for Bjt {
         value: Real,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
+        use crate::devices::sweep::check_swept;
         let mut initial = self.initial.clone();
         if let Some(index) = ["icvbe", "icvce"].iter().position(|k| *k == parameter) {
-            crate::devices::sweep::check_swept(&self.name, parameter, value, true, "finite")?;
+            check_swept(&self.name, parameter, value, true, "finite")?;
             initial.values[index] = Some(value);
         }
-        use crate::devices::sweep::check_swept;
         let mut instance = self.instance;
         let positive = || check_swept(&self.name, parameter, value, value > 0., "positive");
         match parameter {

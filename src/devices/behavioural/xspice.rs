@@ -21,6 +21,7 @@ pub struct XspicePwl {
     x: Vec<Real>,
     y: Vec<Real>,
     fraction: Real,
+    midpoints: Vec<Real>,
 }
 
 impl XspicePwl {
@@ -49,52 +50,83 @@ impl XspicePwl {
         let n = points.len();
         let mut x = Vec::with_capacity(n + 2);
         let mut y = Vec::with_capacity(n + 2);
-        x.push(2. * points[0].0 - points[1].0);
+        x.push(mirrored_abscissa(points[0].0, points[1].0));
         y.push(points[0].1);
         for (px, py) in points {
             x.push(*px);
             y.push(*py);
         }
-        x.push(2. * points[n - 1].0 - points[n - 2].0);
+        x.push(mirrored_abscissa(points[n - 1].0, points[n - 2].0));
         y.push(points[n - 1].1);
-        Ok(Self { x, y, fraction })
+        let midpoints = x
+            .windows(2)
+            .map(|pair| reference_midpoint(pair[0], pair[1]))
+            .collect();
+        Ok(Self {
+            x,
+            y,
+            fraction,
+            midpoints,
+        })
     }
 
     /// The output and its derivative with respect to the input.
     #[must_use]
     pub fn evaluate(&self, input: Real) -> (Real, Real) {
-        let (x, y) = (&self.x, &self.y);
-        let size = x.len();
-        let segment = |lower: usize, at: usize| {
-            let slope = (y[lower + 1] - y[lower]) / (x[lower + 1] - x[lower]);
-            (y[at] + (input - x[at]) * slope, slope)
-        };
-        if input <= (x[0] + x[1]) / 2. {
-            return segment(0, 0);
+        let size = self.x.len();
+        // Preserve the reference's priority for the two end tests, even
+        // when mirroring or adding extreme finite abscissas overflows.
+        if input <= self.midpoints[0] {
+            return self.segment(input, 0, 0);
         }
-        if input >= (x[size - 2] + x[size - 1]) / 2. {
-            return segment(size - 2, size - 1);
+        if input >= self.midpoints[size - 2] {
+            return self.segment(input, size - 2, size - 1);
         }
-        for i in 1..size - 1 {
-            if input >= (x[i] + x[i + 1]) / 2. {
-                continue;
-            }
-            let lower = x[i] - x[i - 1];
-            let upper = x[i + 1] - x[i];
-            let domain = self.fraction * lower.min(upper);
-            if input < x[i] - domain {
-                return segment(i - 1, i);
-            }
-            if input < x[i] + domain {
-                let lower_slope = (y[i] - y[i - 1]) / lower;
-                let upper_slope = (y[i + 1] - y[i]) / upper;
-                return smooth_corner(input, x[i], y[i], domain, lower_slope, upper_slope);
-            }
-            return segment(i, i);
-        }
-        // Unreachable for finite input: the last midpoint test above caught it.
-        segment(size - 2, size - 1)
+
+        // All interior midpoints are nondecreasing: the source abscissas
+        // are finite and strictly increasing. Skip exactly the same
+        // midpoints as C's left-to-right scan, including ties. The end
+        // midpoints are excluded from the search because the mirrored
+        // abscissas may overflow.
+        let i = 1 + self.midpoints[1..size - 2].partition_point(|&midpoint| input >= midpoint);
+        self.corner(input, i)
     }
+
+    fn segment(&self, input: Real, lower: usize, at: usize) -> (Real, Real) {
+        let (x, y) = (&self.x, &self.y);
+        let slope = (y[lower + 1] - y[lower]) / (x[lower + 1] - x[lower]);
+        let offset = (input - x[at]) * slope;
+        (y[at] + offset, slope)
+    }
+
+    fn corner(&self, input: Real, i: usize) -> (Real, Real) {
+        let (x, y) = (&self.x, &self.y);
+        let lower = x[i] - x[i - 1];
+        let upper = x[i + 1] - x[i];
+        let domain = self.fraction * lower.min(upper);
+        if input < x[i] - domain {
+            return self.segment(input, i - 1, i);
+        }
+        if input < x[i] + domain {
+            let lower_slope = (y[i] - y[i - 1]) / lower;
+            let upper_slope = (y[i + 1] - y[i]) / upper;
+            return smooth_corner(input, x[i], y[i], domain, lower_slope, upper_slope);
+        }
+        self.segment(input, i, i)
+    }
+}
+
+/// C extends an endpoint as `2 * endpoint - neighbour`, without fusion.
+const fn mirrored_abscissa(endpoint: Real, neighbour: Real) -> Real {
+    let twice_endpoint = 2. * endpoint;
+    twice_endpoint - neighbour
+}
+
+/// Match the reference addition then division, including overflow and
+/// subnormal rounding. A robust floating-point midpoint changes that contract.
+const fn reference_midpoint(left: Real, right: Real) -> Real {
+    let sum = left + right;
+    sum / 2.
 }
 
 /// The parabola joining two slopes over `centre ± domain`, matching value and
@@ -108,11 +140,18 @@ fn smooth_corner(
     upper_slope: Real,
 ) -> (Real, Real) {
     let x_upper = centre + domain;
-    let y_upper = value + upper_slope * domain;
+    let upper_rise = upper_slope * domain;
+    let y_upper = value + upper_rise;
     let a = ((upper_slope - lower_slope) / 4.) * (1. / domain);
-    let b = upper_slope - 2. * a * x_upper;
-    let c = y_upper - a * x_upper * x_upper - b * x_upper;
-    (a * input * input + b * input + c, 2. * a * input + b)
+    let upper_derivative = 2. * a * x_upper;
+    let b = upper_slope - upper_derivative;
+    let upper_quadratic = a * x_upper * x_upper;
+    let upper_linear = b * x_upper;
+    let c = y_upper - upper_quadratic - upper_linear;
+    let quadratic = a * input * input;
+    let linear = b * input;
+    let derivative = 2. * a * input;
+    (quadratic + linear + c, derivative + b)
 }
 
 fn invalid(message: &str) -> SpiceError {
@@ -124,7 +163,7 @@ fn invalid(message: &str) -> SpiceError {
 
 #[cfg(test)]
 mod tests {
-    use super::XspicePwl;
+    use super::{XspicePwl, reference_midpoint};
 
     #[test]
     fn table_is_flat_outside_and_smooth_at_corners() {
@@ -158,6 +197,69 @@ mod tests {
                 "{x}: {numeric} {analytic}"
             );
             x += 0.0137;
+        }
+    }
+
+    #[test]
+    fn reference_midpoint_keeps_overflow_and_signed_zero() {
+        assert!(reference_midpoint(f64::MAX, f64::MAX).is_infinite());
+        assert_eq!(reference_midpoint(-0., -0.).to_bits(), (-0_f64).to_bits());
+        assert_eq!(
+            reference_midpoint(f64::from_bits(1), f64::from_bits(2)).to_bits(),
+            2
+        );
+    }
+
+    // Reproduce the reference's linear selection independently of the
+    // production boundary cache and binary search.
+    fn scan(map: &XspicePwl, input: f64) -> (f64, f64) {
+        let size = map.x.len();
+        let midpoint = |i| reference_midpoint(map.x[i], map.x[i + 1]);
+        if input <= midpoint(0) {
+            return map.segment(input, 0, 0);
+        }
+        if input >= midpoint(size - 2) {
+            return map.segment(input, size - 2, size - 1);
+        }
+        for i in 1..size - 1 {
+            if input >= midpoint(i) {
+                continue;
+            }
+            return map.corner(input, i);
+        }
+        map.segment(input, size - 2, size - 1)
+    }
+
+    #[test]
+    fn interior_search_preserves_reference_scan_at_every_boundary() {
+        let tables: &[&[(f64, f64)]] = &[
+            &[(-5., 3.), (-2., 0.), (0., 2.), (1., 4.), (1.25, -2.)],
+            &[(0., 0.), (2., 4.)],
+            &[(-f64::MAX, 1.), (-1., 3.), (1., -2.), (f64::MAX, 4.)],
+            &[(f64::MAX * 0.6, 1.), (f64::MAX * 0.8, 3.), (f64::MAX, 4.)],
+            &[(0., 1.), (f64::from_bits(1), 2.), (f64::from_bits(2), 3.)],
+        ];
+        for points in tables {
+            for fraction in [0.1, 0.5] {
+                let map = XspicePwl::new(points, fraction).unwrap();
+                let inputs = map
+                    .midpoints
+                    .iter()
+                    .copied()
+                    .flat_map(|value| [value.next_down(), value, value.next_up()])
+                    .chain([f64::NEG_INFINITY, -0., 0., f64::INFINITY, f64::NAN]);
+                for input in inputs {
+                    let actual = map.evaluate(input);
+                    let expected = scan(&map, input);
+                    for (actual, expected) in [(actual.0, expected.0), (actual.1, expected.1)] {
+                        if expected.is_nan() {
+                            assert!(actual.is_nan());
+                        } else {
+                            assert_eq!(actual.to_bits(), expected.to_bits(), "{input}");
+                        }
+                    }
+                }
+            }
         }
     }
 
