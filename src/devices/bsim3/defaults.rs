@@ -155,7 +155,7 @@ impl ModelDefaults {
         Ok(())
     }
 
-    fn number(&self, name: &str) -> SpiceResult<Real> {
+    pub(super) fn number(&self, name: &str) -> SpiceResult<Real> {
         self.get(name).ok_or_else(|| {
             SpiceError::circuit(format!("missing internal BSIM3 model field {name}"))
         })
@@ -202,12 +202,12 @@ impl ModelDefaults {
             result.default(name, value)?;
         }
         for name in ["nqsmod", "acnqsmod"] {
-            let value = result.number(name)?;
-            if value != 0. && value != 1. {
+            let selector = result.integer(name)?;
+            if !matches!(selector, 0 | 1) {
                 result.set(name, 0.)?;
                 result.warnings.push(ModelWarning {
                     parameter: name,
-                    supplied: value,
+                    supplied: Real::from(selector),
                     replacement: 0.,
                     c_reference: "src/spicelib/devices/bsim3/b3set.c (NQS selector reset)",
                 });
@@ -223,7 +223,7 @@ impl ModelDefaults {
         ] {
             result.default(name, if nmos { n } else { p })?;
         }
-        let mobility_three = result.number("mobmod")? == 3.;
+        let mobility_three = result.integer("mobmod")? == 3;
         result.default("uc", if mobility_three { -0.0465 } else { -0.0465e-9 })?;
         result.default("uc1", if mobility_three { -0.056 } else { -0.056e-9 })?;
         result.default(
@@ -247,30 +247,39 @@ impl ModelDefaults {
         ] {
             result.default(to, result.number(from)?)?;
         }
+        result.derive_capacitances()?;
+        Ok(result)
+    }
+
+    // Retain the C rounding order in fringe and overlap calculations.
+    fn derive_capacitances(&mut self) -> SpiceResult<()> {
         // A nonpositive TOX/TOXM or negative IJTH is reported by
         // `b3check.c` in the instance phase, with C's own message.
-        let tox = result.number("tox")?;
-        result.oxide_capacitance = EPS_OXIDE / tox;
-        if !result.is_given("cf") {
-            let fringe = 2. * EPS_OXIDE / SETUP_PI * (1. + 0.4e-6 / tox).ln();
-            result.set("cf", fringe)?;
+        let tox = self.number("tox")?;
+        self.oxide_capacitance = EPS_OXIDE / tox;
+        if !self.is_given("cf") {
+            let fringe_ratio = 0.4e-6 / tox;
+            let fringe_argument = 1. + fringe_ratio;
+            let fringe = 2. * EPS_OXIDE / SETUP_PI * fringe_argument.ln();
+            self.set("cf", fringe)?;
         }
-        let overlap_length = result.number("dlc")?;
-        let cox = result.oxide_capacitance;
+        let overlap_length = self.number("dlc")?;
+        let cox = self.oxide_capacitance;
         for (overlap, fringe) in [("cgdo", "cgdl"), ("cgso", "cgsl")] {
-            if !result.is_given(overlap) {
-                let value = if result.is_given("dlc") && overlap_length > 0. {
-                    overlap_length * cox - result.number(fringe)?
+            if !self.is_given(overlap) {
+                let value = if self.is_given("dlc") && overlap_length > 0. {
+                    let overlap_capacitance = overlap_length * cox;
+                    overlap_capacitance - self.number(fringe)?
                 } else {
-                    0.6 * result.number("xj")? * cox
+                    0.6 * self.number("xj")? * cox
                 };
-                result.set(overlap, value)?;
+                self.set(overlap, value)?;
             }
         }
-        if !result.is_given("cgbo") {
-            result.set("cgbo", 2. * result.number("dwc")? * cox)?;
+        if !self.is_given("cgbo") {
+            self.set("cgbo", 2. * self.number("dwc")? * cox)?;
         }
-        Ok(result)
+        Ok(())
     }
 }
 

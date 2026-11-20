@@ -74,10 +74,7 @@ impl NoiseModel<'_> {
     ///
     /// # Errors
     /// A `noiMod` outside 1..6, or a nonfinite result.
-    ///
-    /// # Panics
-    /// If a field or parameter this port names is absent from the model or
-    /// instance setup: a schema bug in the port, not a deck error.
+    /// Missing internal model or instance fields also return an error.
     pub fn densities(
         &self,
         dc: &DcEvaluation,
@@ -96,18 +93,16 @@ impl NoiseModel<'_> {
         }
         let p = self.setup;
         let m = self.model;
-        let number = |name: &str| -> Real {
-            m.get(name)
-                .unwrap_or_else(|| panic!("BSIM3 noise model field {name}"))
-        };
-        let param = |name: &str| -> Real {
-            p.pparam(name)
-                .unwrap_or_else(|| panic!("BSIM3 noise instance parameter {name}"))
+        let number = |name: &str| m.number(name);
+        let param = |name: &str| {
+            p.pparam(name).ok_or_else(|| {
+                SpiceError::circuit(format!("BSIM3 noise instance parameter {name} is missing"))
+            })
         };
         let multiplier = p.multiplier;
         let cox = m.oxide_capacitance;
-        let leff = param("leff");
-        let weff = param("weff");
+        let leff = param("leff")?;
+        let weff = param("weff")?;
         let ueff = dc.ueff;
         let cd = dc.ids;
 
@@ -131,7 +126,7 @@ impl NoiseModel<'_> {
             1 | 4 | 5 => {
                 let noise_current = cd.abs().max(N_MINLOG);
                 let numerator =
-                    multiplier * number("kf") * (number("af") * noise_current.ln()).exp();
+                    multiplier * number("kf")? * (number("af")? * noise_current.ln()).exp();
                 (numerator, [leff, leff, cox])
             }
             _ => {
@@ -139,15 +134,15 @@ impl NoiseModel<'_> {
                 // carry one `pow(f, EF)` in their denominators, so the blend
                 // keeps the same law and the numerator below is the
                 // frequency-free part.
-                let lintnoi = number("lintnoi");
+                let lintnoi = number("lintnoi")?;
                 let leff_noi = leff - 2.0 * lintnoi;
                 let leff_noi_sq = leff_noi * leff_noi;
                 let vgsteff = dc.vgsteff;
                 let vdseff = dc.vdseff;
                 let abulk = dc.abulk;
-                let em = number("em");
-                let vsattemp = param("vsattemp");
-                let litl = param("litl");
+                let em = number("em")?;
+                let vsattemp = param("vsattemp")?;
+                let litl = param("litl")?;
                 let esat = 2.0 * vsattemp / ueff;
                 let del_clm = if em <= 0.0 {
                     0.0
@@ -157,9 +152,9 @@ impl NoiseModel<'_> {
                 };
                 let n0 = cox * vgsteff / CHARGE;
                 let nl = cox * vgsteff * (1.0 - dc.abulk_over_vgst2vtm * vdseff) / CHARGE;
-                let noia = number("noia");
-                let noib = number("noib");
-                let noic = number("noic");
+                let noia = number("noia")?;
+                let noib = number("noib")?;
+                let noic = number("noic")?;
                 let thermal = 8.62e-5 * circuit_kelvin;
                 // `Ssi = A / pow(f,EF)`, `Swi = C / pow(f,EF)`.
                 let a = CHARGE
@@ -192,7 +187,7 @@ impl NoiseModel<'_> {
             channel,
             flicker_numerator,
             flicker_factors,
-            flicker_exponent: number("ef"),
+            flicker_exponent: number("ef")?,
         };
         for (name, value) in [
             ("drain conductance", result.drain_conductance),
