@@ -68,7 +68,9 @@ use crate::devices::limiting::{self, Limiter, Linearization};
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
-use crate::devices::nonlinear::{cubic_reverse_junction, exponential_junction};
+use crate::devices::nonlinear::{
+    DepletionLaw, cubic_reverse_junction, exponential_junction, reverse_depletion,
+};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -576,23 +578,13 @@ struct Thermal {
     vtf_factor: Real,
     itf: Real,
     cje: Real,
-    vje: Real,
-    mje: Real,
+    be: DepletionLaw,
     cjc: Real,
-    vjc: Real,
-    mjc: Real,
+    bc: DepletionLaw,
     xcjc: Real,
     cjs: Real,
     vjs: Real,
     mjs: Real,
-    fc_vje: Real,
-    fc_vjc: Real,
-    f1: Real,
-    f2: Real,
-    f3: Real,
-    f5: Real,
-    f6: Real,
-    f7: Real,
 }
 
 /// `bjttemp.c`'s silicon band-gap built-in-potential shift `pbfact` at `t`.
@@ -722,7 +714,6 @@ impl Model {
         let (cje, vje) = junction(self.cje, self.vje, mje, self.cte, self.tvje);
         let (cjc, vjc) = junction(self.cjc, self.vjc, mjc, self.ctc, self.tvjc);
         let (cjs, vjs) = junction(self.cjs, self.vjs, mjs, self.cts, self.tvjs);
-        let xfc = (1. - self.fc).ln();
         let thermal = Thermal {
             vt,
             is,
@@ -758,23 +749,13 @@ impl Model {
             },
             itf: self.itf * poly(self.titf, dt) * area,
             cje: cje * area,
-            vje,
-            mje,
+            be: DepletionLaw::new(vje, mje, self.fc),
             cjc: cjc * bc_area,
-            vjc,
-            mjc,
+            bc: DepletionLaw::new(vjc, mjc, self.fc),
             xcjc: self.xcjc,
             cjs: cjs * sub_area,
             vjs,
             mjs,
-            fc_vje: self.fc * vje,
-            fc_vjc: self.fc * vjc,
-            f1: vje * (1. - ((1. - mje) * xfc).exp()) / (1. - mje),
-            f2: ((1. + mje) * xfc).exp(),
-            f3: 1. - self.fc * (1. + mje),
-            f5: vjc * (1. - ((1. - mjc) * xfc).exp()) / (1. - mjc),
-            f6: ((1. + mjc) * xfc).exp(),
-            f7: 1. - self.fc * (1. + mjc),
         };
         thermal.validate()?;
         Ok(thermal)
@@ -836,21 +817,28 @@ impl Thermal {
             self.tr,
             self.itf,
             self.cje,
-            self.vje,
+            self.be.potential,
             self.cjc,
-            self.vjc,
+            self.bc.potential,
             self.cjs,
             self.vjs,
-            self.f1,
-            self.f2,
-            self.f3,
-            self.f5,
-            self.f6,
-            self.f7,
+            self.be.f1,
+            self.be.f2,
+            self.be.f3,
+            self.bc.f1,
+            self.bc.f2,
+            self.bc.f3,
         ];
         if values.iter().any(|v| !v.is_finite())
             || [
-                self.nf, self.nr, self.ne, self.nc, self.ns, self.vje, self.vjc, self.vjs,
+                self.nf,
+                self.nr,
+                self.ne,
+                self.nc,
+                self.ns,
+                self.be.potential,
+                self.bc.potential,
+                self.vjs,
             ]
             .iter()
             .any(|v| *v <= 0.)
@@ -1199,36 +1187,6 @@ fn c_junction(v: Real, vtn: Real, is: Real) -> (Real, Real) {
     }
 }
 
-/// `bjtload.c`'s depletion charge and capacitance of a junction with zero-bias
-/// capacitance `cz`, potential `p`, grading `xm`, linearized above `fcp` with
-/// `bjttemp.c`'s `f1`/`f2`/`f3` (`tf1..3` for BE, `tf5..7` for BC and BX).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "keeps the positional interface explicit at the reference solver or device boundary"
-)]
-fn c_depletion(
-    v: Real,
-    cz: Real,
-    p: Real,
-    xm: Real,
-    fcp: Real,
-    f1: Real,
-    f2: Real,
-    f3: Real,
-) -> (Real, Real) {
-    if v < fcp {
-        let arg = 1. - v / p;
-        let sarg = (-xm * arg.ln()).exp();
-        (p * cz * (1. - arg * sarg) / (1. - xm), cz * sarg)
-    } else {
-        let czf2 = cz / f2;
-        (
-            cz * f1 + czf2 * (f3 * (v - fcp) + (xm / (p + p)) * (v * v - fcp * fcp)),
-            czf2 * (f3 + xm * v / p),
-        )
-    }
-}
-
 /// `bjtload.c` from "determine dc current and derivatives" through the
 /// charge storage block, expression for expression (excess phase and
 /// quasi-saturation are rejected at elaboration).
@@ -1337,14 +1295,9 @@ fn c_point(
     let tf = t.tf;
     let tr = t.tr;
     let czbe = t.cje;
-    let pe = t.vje;
-    let xme = t.mje;
     let ctot = t.cjc;
     let czbc = ctot * t.xcjc;
     let czbx = ctot - czbc;
-    let pc = t.vjc;
-    let xmc = t.mjc;
-    let fcpe = t.fc_vje;
     let czsub = t.cjs;
     let ps = t.vjs;
     let xms = t.mjs;
@@ -1373,44 +1326,11 @@ fn c_point(
         gbe = (gbe * (1. + arg2) - cbe * dqbdve) / qb;
         geqcb = tf * (arg3 - cbe * dqbdvc) / qb;
     }
-    let (qbe, capbe) = if vbe < fcpe {
-        let arg = 1. - vbe / pe;
-        let sarg = (-xme * arg.ln()).exp();
-        (
-            tf * cbe + pe * czbe * (1. - arg * sarg) / (1. - xme),
-            tf * gbe + czbe * sarg,
-        )
-    } else {
-        let czbef2 = czbe / t.f2;
-        (
-            tf * cbe
-                + czbe * t.f1
-                + czbef2 * (t.f3 * (vbe - fcpe) + (xme / (pe + pe)) * (vbe * vbe - fcpe * fcpe)),
-            tf * gbe + czbef2 * (t.f3 + xme * vbe / pe),
-        )
-    };
-    let fcpc = t.fc_vjc;
-    let (qbc, capbc) = if vbc < fcpc {
-        let arg = 1. - vbc / pc;
-        let sarg = (-xmc * arg.ln()).exp();
-        (
-            tr * cbc + pc * czbc * (1. - arg * sarg) / (1. - xmc),
-            tr * gbc + czbc * sarg,
-        )
-    } else {
-        let czbcf2 = czbc / t.f6;
-        (
-            tr * cbc
-                + czbc * t.f5
-                + czbcf2 * (t.f7 * (vbc - fcpc) + (xmc / (pc + pc)) * (vbc * vbc - fcpc * fcpc)),
-            tr * gbc + czbcf2 * (t.f7 + xmc * vbc / pc),
-        )
-    };
-    let (qbx, capbx) = c_depletion(vbx, czbx, pc, xmc, fcpc, t.f5, t.f6, t.f7);
+    let (qbe, capbe) = t.be.charge(vbe, czbe, Some((tf * cbe, tf * gbe)));
+    let (qbc, capbc) = t.bc.charge(vbc, czbc, Some((tr * cbc, tr * gbc)));
+    let (qbx, capbx) = t.bc.charge(vbx, czbx, None);
     let (qsub, capsub) = if vsub < 0. {
-        let arg = 1. - vsub / ps;
-        let sarg = (-xms * arg.ln()).exp();
-        (ps * czsub * (1. - arg * sarg) / (1. - xms), czsub * sarg)
+        reverse_depletion(vsub, czsub, ps, xms)
     } else {
         (
             vsub * czsub * (1. + xms * vsub / (2. * ps)),
@@ -2947,7 +2867,7 @@ mod tests {
         let bf = 100. * ((t / tnom).ln() * 1.5).exp();
         assert!((hot.bf - bf).abs() < 1e-12 * bf);
         // The built-in potential falls and the zero-bias capacitance rises.
-        assert!(hot.vje < nominal.vje && hot.cje > nominal.cje);
+        assert!(hot.be.potential < nominal.be.potential && hot.cje > nominal.cje);
         // TLEV=1 linear beta and TLEVC=1 linear capacitance/potential.
         let linear = thermal(
             "is=1e-15 bf=100 xtb=0.01 tlev=1 tlevc=1 cje=1p cte=1m vje=0.8 tvje=2m",
@@ -2956,7 +2876,7 @@ mod tests {
         );
         assert!((linear.bf - 100. * (1. + 0.01 * 100.)).abs() < 1e-9);
         assert!((linear.cje - 1.3e-12 * 1.1).abs() < 1e-24);
-        assert!((linear.vje - 0.6).abs() < 1e-12);
+        assert!((linear.be.potential - 0.6).abs() < 1e-12);
         // Polynomial resistance and Early-voltage coefficients.
         let poly = thermal("rb=100 trb1=1m rc=10 trc2=1e-5 vaf=50 tvaf1=-1m", 77., true);
         assert!((poly.rb - 100. * 1.05 / 1.3).abs() < 1e-9);

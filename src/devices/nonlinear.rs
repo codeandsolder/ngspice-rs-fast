@@ -708,13 +708,9 @@ impl DiodeParameters {
             ikr: self.ikr.map(scale),
             ikp: self.ikp.map(perimeter),
             cjo,
-            vj,
-            grading,
-            fc: self.fc,
+            bottom: DepletionLaw::new(vj, grading, self.fc),
             cjsw,
-            vjsw,
-            mjsw: self.mjsw,
-            fcs: self.fcs,
+            sidewall: DepletionLaw::new(vjsw, self.mjsw, self.fcs),
             // diotemp.c: tt must stay positive.
             tt: self.tt * polynomial(self.ttt1, self.ttt2).max(1e-3),
             conductance,
@@ -773,13 +769,9 @@ struct Thermal {
     ikr: Option<Real>,
     ikp: Option<Real>,
     cjo: Real,
-    vj: Real,
-    grading: Real,
-    fc: Real,
+    bottom: DepletionLaw,
     cjsw: Real,
-    vjsw: Real,
-    mjsw: Real,
-    fcs: Real,
+    sidewall: DepletionLaw,
     tt: Real,
     /// Series conductance AREA*M/RS at temperature (0 without RS).
     conductance: Real,
@@ -851,10 +843,10 @@ impl Thermal {
             self.tunnel.unwrap_or(0.),
             self.tunnel_sidewall.unwrap_or(0.),
             self.cjo,
-            self.vj,
-            self.grading,
+            self.bottom.potential,
+            self.bottom.grading,
             self.cjsw,
-            self.vjsw,
+            self.sidewall.potential,
             self.tt,
             self.conductance,
         ]
@@ -866,8 +858,9 @@ impl Thermal {
         if !finite
             || self.cjo < 0.
             || self.cjsw < 0.
-            || (bottom && (self.vj <= 0. || !(0. ..1.).contains(&self.grading)))
-            || (self.cjsw != 0. && self.vjsw <= 0.)
+            || (bottom
+                && (self.bottom.potential <= 0. || !(0. ..1.).contains(&self.bottom.grading)))
+            || (self.cjsw != 0. && self.sidewall.potential <= 0.)
         {
             return Err(SpiceError::Numerical {
                 context: "diode".into(),
@@ -921,19 +914,20 @@ impl Thermal {
             let vterec = nr * self.vt;
             // dioload.c: t1 = pow(1 - vd/VJ, 2) + 0.005, gen_fac = pow(t1, M/2).
             let generation = |v: Real| {
-                let t1 = (1. - v / self.vj).powf(2.) + 0.005;
-                (t1, t1.powf(self.grading / 2.))
+                let t1 = (1. - v / self.bottom.potential).powf(2.) + 0.005;
+                (t1, t1.powf(self.bottom.grading / 2.))
             };
             if forward {
                 let evd = (vd / vterec).exp();
                 let current = crec * (evd - 1.);
                 let conductance = crec * evd / vterec;
                 let (t1, factor) = generation(vd);
-                let derivative =
-                    -self.grading * (1. - vd / self.vj) * t1.powf(self.grading / 2. - 1.);
+                let derivative = -self.bottom.grading
+                    * (1. - vd / self.bottom.potential)
+                    * t1.powf(self.bottom.grading / 2. - 1.);
                 cdb += current * factor;
                 // d/dv of the generation factor carries 1/VJ.
-                gdb += conductance * factor + current * derivative / self.vj;
+                gdb += conductance * factor + current * derivative / self.bottom.potential;
                 // dioload.c instead multiplies the already-scaled current and
                 // omits 1/VJ; its root is unaffected, its AC conductance is.
                 ac_gdb += conductance * factor + current * factor * derivative;
@@ -973,9 +967,8 @@ impl Thermal {
         let current = cdb + cdsw + gmin * vd;
         let conductance = gdb + gdsw + gmin;
         let ac_conductance = ac_gdb + gdsw + gmin;
-        let (charge, capacitance) = c_depletion(vd, self.cjo, self.vj, self.grading, self.fc);
-        let (charge_sw, capacitance_sw) =
-            c_depletion(vd, self.cjsw, self.vjsw, self.mjsw, self.fcs);
+        let (charge, capacitance) = self.bottom.charge(vd, self.cjo, None);
+        let (charge_sw, capacitance_sw) = self.sidewall.charge(vd, self.cjsw, None);
         // dioload.c, in its order: diffusion (TT times the current including
         // gmin), bottom depletion, sidewall depletion.
         let point = DiodePoint {
@@ -1117,27 +1110,66 @@ pub(super) fn junction_current(
     }
     Ok(result)
 }
-/// `dioload.c`'s depletion charge and capacitance, in C's arithmetic:
-/// `sarg = exp(-m ln(1 - v/p))` below `FC p`, and above it the linear
-/// capacitance with `diotemp.c`'s `F1 = p (1 - exp((1-m) xfc)) / (1-m)`,
-/// `F2 = exp((1+m) xfc)` and `F3 = 1 - FC (1+m)`, `xfc = ln(1 - FC)`.
-pub(crate) fn c_depletion(v: Real, czero: Real, pot: Real, m: Real, fc: Real) -> (Real, Real) {
-    let depcap = fc * pot;
-    if v < depcap {
-        let arg = 1. - v / pot;
-        let sarg = (-m * arg.ln()).exp();
-        (pot * czero * (1. - arg * sarg) / (1. - m), czero * sarg)
-    } else {
+/// Reverse depletion charge and capacitance for the logarithmic grading law
+/// in `dioload.c` and `bjtload.c` (not the MOS or JFET square-root shortcuts).
+pub(super) fn reverse_depletion(v: Real, cz: Real, pot: Real, m: Real) -> (Real, Real) {
+    let arg = 1. - v / pot;
+    let sarg = (-m * arg.ln()).exp();
+    (pot * cz * (1. - arg * sarg) / (1. - m), cz * sarg)
+}
+
+/// Temperature-adjusted depletion continuation shared by diode and BJT.
+/// C computes these coefficients in diotemp/bjttemp, before evaluating load.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DepletionLaw {
+    pub(super) potential: Real,
+    pub(super) grading: Real,
+    pub(super) threshold: Real,
+    pub(super) f1: Real,
+    pub(super) f2: Real,
+    pub(super) f3: Real,
+}
+
+impl DepletionLaw {
+    pub(super) fn new(potential: Real, grading: Real, fc: Real) -> Self {
         let xfc = (1. - fc).ln();
-        let f1 = pot * (1. - ((1. - m) * xfc).exp()) / (1. - m);
-        let f2 = ((1. + m) * xfc).exp();
-        let f3 = 1. - fc * (1. + m);
-        let czof2 = czero / f2;
-        (
-            czero * f1
-                + czof2 * (f3 * (v - depcap) + (m / (pot + pot)) * (v * v - depcap * depcap)),
-            czof2 * (f3 + m * v / pot),
-        )
+        Self {
+            potential,
+            grading,
+            threshold: fc * potential,
+            f1: potential * (1. - ((1. - grading) * xfc).exp()) / (1. - grading),
+            f2: ((1. + grading) * xfc).exp(),
+            f3: 1. - fc * (1. + grading),
+        }
+    }
+
+    /// C's BJT BE/BC charge adds diffusion first, including before the
+    /// second forward depletion term. BX and diode use depletion alone.
+    /// Absence is distinct from adding +0 (signed zero and rounding).
+    pub(super) fn charge(
+        &self,
+        v: Real,
+        cz: Real,
+        diffusion: Option<(Real, Real)>,
+    ) -> (Real, Real) {
+        let add_diffusion = |charge, capacitance| match diffusion {
+            Some((q, c)) => (q + charge, c + capacitance),
+            None => (charge, capacitance),
+        };
+        let p = self.potential;
+        let m = self.grading;
+        let fcp = self.threshold;
+        if v < fcp {
+            let (q, c) = reverse_depletion(v, cz, p, m);
+            add_diffusion(q, c)
+        } else {
+            let czf2 = cz / self.f2;
+            let (q, c) = add_diffusion(cz * self.f1, czf2 * (self.f3 + m * v / p));
+            (
+                q + czf2 * (self.f3 * (v - fcp) + (m / (p + p)) * (v * v - fcp * fcp)),
+                c,
+            )
+        }
     }
 }
 
@@ -1511,7 +1543,7 @@ impl Device for Diode {
             let g2 = -gd / 2. / vt;
             (g2, -g2 / 3. / vt, 0., 0.)
         };
-        let depletion_cap = p.fc * t.vj;
+        let depletion_cap = t.bottom.threshold;
         // `diotemp.c`: DIOtF2 = exp((1 + M(T)) ln(1 - FC)).
         let junction = |czero: Real, pot: Real, grading: Real, f2: Real| {
             if czero == 0. {
@@ -1527,9 +1559,9 @@ impl Device for Diode {
                 (czero / f2 / 2. / pot * grading, 0.)
             }
         };
-        let f2 = ((1. + t.grading) * (1. - p.fc).ln()).exp();
-        let f2_sw = ((1. + p.mjsw) * (1. - p.fcs).ln()).exp();
-        let (cjunc2, cjunc3) = junction(t.cjo, p.vj, t.grading, f2);
+        let f2 = t.bottom.f2;
+        let f2_sw = t.sidewall.f2;
+        let (cjunc2, cjunc3) = junction(t.cjo, p.vj, t.bottom.grading, f2);
         let (sw2, sw3) = junction(t.cjsw, p.vjsw, p.mjsw, f2_sw);
         let (cap2, cap3) = (cdiff2 + (cjunc2 + sw2), cdiff3 + (cjunc3 + sw3));
         let mut term = DistortionTerm::new(
@@ -1725,12 +1757,56 @@ mod tests {
     }
 
     #[test]
+    fn depletion_keeps_the_reference_diffusion_addition_order() {
+        for (p, m, fc) in [(0.7, 0.33, 0.5), (1.1, 0.5, 0.8), (0.9, 0.999, 0.2)] {
+            let law = DepletionLaw::new(p, m, fc);
+            let fcp = fc * p;
+            let xfc = (1. - fc).ln();
+            let f1 = p * (1. - ((1. - m) * xfc).exp()) / (1. - m);
+            let f2 = ((1. + m) * xfc).exp();
+            let f3 = 1. - fc * (1. + m);
+            for cz in [0., 2.3e-12, 7.7e-9] {
+                for v in [-1., -0.0, fcp.next_down(), fcp, fcp.next_up(), fcp + 0.2] {
+                    for diffusion in [None, Some((-0., -0.)), Some((-cz * f1, 1.2e-12))] {
+                        let (q0, c0) = diffusion.unwrap_or((0., 0.));
+                        let expected = if v < fcp {
+                            let arg = 1. - v / p;
+                            let sarg = (-m * arg.ln()).exp();
+                            let q = p * cz * (1. - arg * sarg) / (1. - m);
+                            let c = cz * sarg;
+                            if diffusion.is_some() {
+                                (q0 + q, c0 + c)
+                            } else {
+                                (q, c)
+                            }
+                        } else {
+                            let czf2 = cz / f2;
+                            let tail =
+                                czf2 * (f3 * (v - fcp) + (m / (p + p)) * (v * v - fcp * fcp));
+                            let c = czf2 * (f3 + m * v / p);
+                            if diffusion.is_some() {
+                                (q0 + cz * f1 + tail, c0 + c)
+                            } else {
+                                (cz * f1 + tail, c)
+                            }
+                        };
+                        let actual = law.charge(v, cz, diffusion);
+                        assert_eq!(actual.0.to_bits(), expected.0.to_bits());
+                        assert_eq!(actual.1.to_bits(), expected.1.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn charge_derivative_and_current_jacobian_are_consistent() {
+        let depletion = DepletionLaw::new(1., 0.5, 0.5);
         for v in [-1., -0.08, -0.02, 0., 0.49, 0.5, 0.51, 0.7] {
             let h = 1e-7;
-            let (q, c) = c_depletion(v, 2e-12, 1., 0.5, 0.5);
-            let derivative = (c_depletion(v + h, 2e-12, 1., 0.5, 0.5).0
-                - c_depletion(v - h, 2e-12, 1., 0.5, 0.5).0)
+            let (q, c) = depletion.charge(v, 2e-12, None);
+            let derivative = (depletion.charge(v + h, 2e-12, None).0
+                - depletion.charge(v - h, 2e-12, None).0)
                 / (2. * h);
             assert!(
                 (derivative - c).abs() < 1e-8 * c.abs(),
@@ -1855,8 +1931,8 @@ mod tests {
     fn temperature_laws_follow_diotemp() {
         // Nominal temperature leaves VJ, CJO and IS unchanged.
         let t = thermal("cjo=10p vj=0.7 m=0.4 cjsw=1p vjsw=0.6", "pj=2", 27.);
-        assert!((t.vj - 0.7).abs() < 1e-14 && (t.cjo - 10e-12).abs() < 1e-24);
-        assert!((t.vjsw - 0.6).abs() < 1e-14 && (t.cjsw - 2e-12).abs() < 1e-24);
+        assert!((t.bottom.potential - 0.7).abs() < 1e-14 && (t.cjo - 10e-12).abs() < 1e-24);
+        assert!((t.sidewall.potential - 0.6).abs() < 1e-14 && (t.cjsw - 2e-12).abs() < 1e-24);
         assert!((t.csat - 1e-14).abs() < 1e-28);
         // TLEV 0: IS(T) = IS exp((T/Tn - 1) EG/(N Vt) + XTI/N ln(T/Tn)).
         let (tk, tn) = (398.15, 300.15);
@@ -1879,11 +1955,13 @@ mod tests {
             "pj=1",
             77.,
         );
-        assert!((t.cjo - 10e-12 * 1.05).abs() < 1e-24 && (t.vj - 0.6).abs() < 1e-12);
-        assert!((t.cjsw - 1e-12 * 1.15).abs() < 1e-24 && (t.vjsw - 0.45).abs() < 1e-12);
+        assert!((t.cjo - 10e-12 * 1.05).abs() < 1e-24 && (t.bottom.potential - 0.6).abs() < 1e-12);
+        assert!(
+            (t.cjsw - 1e-12 * 1.15).abs() < 1e-24 && (t.sidewall.potential - 0.45).abs() < 1e-12
+        );
         // TLEVC 0 lowers the junction potential and raises CJO when heated.
         let hot = thermal("cjo=10p vj=0.7 m=0.4", "", 125.);
-        assert!(hot.vj < 0.7 && hot.cjo > 10e-12);
+        assert!(hot.bottom.potential < 0.7 && hot.cjo > 10e-12);
         // TLEV 2 uses the EG/GAP1/GAP2 band gap; TT/RS coefficients apply.
         let t = thermal(
             "tlev=2 eg=1.16 gap1=7.02e-4 gap2=1108 tt=1n ttt1=1m rs=10 trs1=2m",
