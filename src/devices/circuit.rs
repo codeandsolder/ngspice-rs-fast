@@ -153,14 +153,85 @@ struct MutualPair {
     coupling: usize,
     first: usize,
     second: usize,
-    coefficient: Real,
 }
 
 /// The resolved K couplings of a circuit.
 #[derive(Debug, Clone, Default)]
 struct MutualBinding {
     pairs: Vec<MutualPair>,
+    groups: Vec<CoupledGroup>,
+    setup_rows: BTreeMap<usize, Vec<(usize, usize)>>,
     error: Option<SpiceError>,
+}
+
+/// A fixed connected component of the K-card graph. Its local rows are
+/// increasing device ordinals, and edges keep original pair visitation order
+/// (including repeated and reversed couplings).
+#[derive(Debug, Clone, Default)]
+struct CoupledGroup {
+    inductors: Vec<usize>,
+    edges: Vec<GroupEdge>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GroupEdge {
+    pair: usize,
+    first_row: usize,
+    second_row: usize,
+}
+
+impl MutualBinding {
+    fn from_pairs(pairs: Vec<MutualPair>, branch_rows: &[std::ops::Range<usize>]) -> Self {
+        let inductors: Vec<_> = pairs
+            .iter()
+            .flat_map(|pair| [pair.first, pair.second])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let positions: BTreeMap<_, _> = inductors
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(position, device)| (device, position))
+            .collect();
+        let mut systems = petgraph::unionfind::UnionFind::<usize>::new(inductors.len());
+        for pair in &pairs {
+            systems.union(positions[&pair.first], positions[&pair.second]);
+        }
+        let labels = systems.into_labeling();
+        let mut groups = BTreeMap::<_, CoupledGroup>::new();
+        let mut local = vec![0; inductors.len()];
+        for (slot, (&label, &device)) in labels.iter().zip(&inductors).enumerate() {
+            let group = groups.entry(label).or_default();
+            local[slot] = group.inductors.len();
+            group.inductors.push(device);
+        }
+        for (index, pair) in pairs.iter().enumerate() {
+            let (first, second) = (positions[&pair.first], positions[&pair.second]);
+            groups
+                .entry(labels[first])
+                .or_default()
+                .edges
+                .push(GroupEdge {
+                    pair: index,
+                    first_row: local[first],
+                    second_row: local[second],
+                });
+        }
+        let mut setup_rows = BTreeMap::<_, Vec<_>>::new();
+        for pair in pairs.iter().rev() {
+            setup_rows.entry(pair.coupling).or_default().push((
+                branch_rows[pair.first].start,
+                branch_rows[pair.second].start,
+            ));
+        }
+        Self {
+            pairs,
+            groups: groups.into_values().collect(),
+            setup_rows,
+            error: None,
+        }
+    }
 }
 
 /// One device convergence test pass ([`Circuit::convergence_test`]).
@@ -370,10 +441,10 @@ impl Circuit {
             .map(|device| self.resolve_controls(device.as_ref(), names))
             .collect();
         self.mutual = match self.resolve_mutual(names) {
-            Ok(pairs) => MutualBinding { pairs, error: None },
+            Ok(pairs) => MutualBinding::from_pairs(pairs, &self.branch_rows),
             Err(error) => MutualBinding {
-                pairs: Vec::new(),
                 error: Some(error),
+                ..MutualBinding::default()
             },
         };
     }
@@ -426,7 +497,6 @@ impl Circuit {
                         coupling,
                         first: *first,
                         second: *second,
-                        coefficient: description.coefficient,
                     });
                 }
             }
@@ -539,21 +609,8 @@ impl Circuit {
         values: &std::collections::BTreeMap<usize, InductanceValue>,
         mutuals: &[Real],
     ) -> SpiceResult<()> {
-        let inductors: Vec<usize> = values.keys().copied().collect();
-        let position = |index: usize| inductors.binary_search(&index).unwrap_or(0);
-        let mut systems = petgraph::unionfind::UnionFind::<usize>::new(inductors.len());
-        for pair in &self.mutual.pairs {
-            systems.union(position(pair.first), position(pair.second));
-        }
-        let labels = systems.into_labeling();
-        let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
-            std::collections::BTreeMap::new();
-        for (slot, label) in labels.iter().enumerate() {
-            groups.entry(*label).or_default().push(slot);
-        }
-        for members in groups.values() {
-            let n = members.len();
-            let local = |slot: usize| members.iter().position(|member| *member == slot);
+        for group in &self.mutual.groups {
+            let n = group.inductors.len();
             // The smallest eigenvalue of the group's matrix normalized by
             // `diagonal` (`M_ij / sqrt(d_i d_j)` off the unit diagonal), and
             // its rounding tolerance.
@@ -562,13 +619,10 @@ impl Circuit {
                 for row in 0..n {
                     matrix.set(row, row, 1.0)?;
                 }
-                let mut couplings = Vec::new();
-                for (pair, mutual) in self.mutual.pairs.iter().zip(mutuals) {
-                    let (Some(i), Some(j)) =
-                        (local(position(pair.first)), local(position(pair.second)))
-                    else {
-                        continue;
-                    };
+                for edge in &group.edges {
+                    let pair = &self.mutual.pairs[edge.pair];
+                    let mutual = mutuals[edge.pair];
+                    let (i, j) = (edge.first_row, edge.second_row);
                     let scale =
                         (diagonal(&values[&pair.first]) * diagonal(&values[&pair.second])).sqrt();
                     // A zero inductance (accepted, as in C) couples with
@@ -577,7 +631,6 @@ impl Circuit {
                     let normalized = if scale == 0.0 { 0.0 } else { mutual / scale };
                     matrix.add_to(i, j, normalized)?;
                     matrix.add_to(j, i, normalized)?;
-                    couplings.push(pair.coupling);
                 }
                 let eigenvalues = matrix.symmetric_eigenvalues()?;
                 let largest = eigenvalues.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
@@ -587,15 +640,20 @@ impl Circuit {
                 )]
                 let tolerance = 64.0 * n as Real * Real::EPSILON * largest;
                 let smallest = eigenvalues.first().copied().unwrap_or(0.0);
-                Ok((smallest, tolerance, couplings))
+                Ok((smallest, tolerance))
             };
             // The matrix actually simulated: self-inductances as stamped
             // (`INDinduct / m`), mutuals from `INDinduct` (as C).
-            let (stamped, tolerance, mut couplings) = smallest(&|value| value.effective)?;
+            let (stamped, tolerance) = smallest(&|value| value.effective)?;
             if stamped < -tolerance {
                 // C's own check (`muttemp.c`) puts `INDinduct` (before `/m`)
                 // on the diagonal; it warns only when that matrix fails too.
-                let (c_matrix, c_tolerance, _) = smallest(&|value| value.coupling_base.abs())?;
+                let (c_matrix, c_tolerance) = smallest(&|value| value.coupling_base.abs())?;
+                let mut couplings: Vec<_> = group
+                    .edges
+                    .iter()
+                    .map(|edge| self.mutual.pairs[edge.pair].coupling)
+                    .collect();
                 couplings.sort_unstable();
                 couplings.dedup();
                 let names = |indices: &mut dyn Iterator<Item = usize>| {
@@ -604,7 +662,7 @@ impl Circuit {
                         .collect::<Vec<_>>()
                         .join(" ")
                 };
-                let inductor_names = names(&mut members.iter().map(|slot| inductors[*slot]));
+                let inductor_names = names(&mut group.inductors.iter().copied());
                 let coupling_names = names(&mut couplings.iter().copied());
                 let location = couplings.first().and_then(|index| {
                     self.devices[*index]
@@ -752,24 +810,16 @@ impl Circuit {
         pole_zero_setups: u32,
         elements: &mut Vec<(usize, usize)>,
     ) -> SpiceResult<bool> {
-        let coupled: Vec<(usize, usize)> = self
+        let coupled = self
             .mutual
-            .pairs
-            .iter()
-            .rev()
-            .filter(|pair| pair.coupling == index)
-            .map(|pair| {
-                (
-                    self.branch_rows[pair.first].start,
-                    self.branch_rows[pair.second].start,
-                )
-            })
-            .collect();
+            .setup_rows
+            .get(&index)
+            .map_or(&[][..], Vec::as_slice);
         let mut setup = crate::devices::setup::MatrixSetup {
             unknowns: &self.unknowns,
             branches: self.branch_rows[index].clone(),
             controls: self.controls(index)?,
-            coupled: &coupled,
+            coupled,
             pole_zero: pole_zero_setups > 0,
             pole_zero_setups,
             elements,
