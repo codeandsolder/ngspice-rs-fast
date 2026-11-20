@@ -1935,15 +1935,17 @@ impl<T: Scalar> Sparse<T> {
             }
             self.values[upper] = u;
             let upper_col = self.topology.elements[upper].col;
+            let mut above = upper;
             let mut sub = self.topology.elements[upper].next_in_col;
             let mut lower = self.topology.elements[pivot].next_in_col;
             while lower != NONE {
                 let row = self.topology.elements[lower].row;
                 while sub != NONE && self.topology.elements[sub].row < row {
+                    above = sub;
                     sub = self.topology.elements[sub].next_in_col;
                 }
                 if sub == NONE || self.topology.elements[sub].row > row {
-                    sub = self.create_fillin(row, upper_col);
+                    sub = self.create_fillin(row, upper_col, Slot::After(above));
                 }
                 let l = self.values[lower];
                 let value = self.values[sub].mul_sub(u, l);
@@ -1952,6 +1954,7 @@ impl<T: Scalar> Sparse<T> {
                     return;
                 }
                 self.values[sub] = value;
+                above = sub;
                 sub = self.topology.elements[sub].next_in_col;
                 lower = self.topology.elements[lower].next_in_col;
             }
@@ -1983,14 +1986,14 @@ impl<T: Scalar> Sparse<T> {
         }
     }
 
-    /// `CreateFillin`.
-    fn create_fillin(&mut self, row: usize, col: usize) -> usize {
-        let mut above = Slot::Head(col);
-        let mut e = self.topology.col_get(above);
-        while e != NONE && self.topology.elements[e].row < row {
-            above = Slot::After(e);
-            e = self.topology.col_get(above);
-        }
+    /// `CreateFillin`: the elimination merge has already located the
+    /// exact predecessor in its sorted column. Do not rescan its prefix.
+    fn create_fillin(&mut self, row: usize, col: usize, above: Slot) -> usize {
+        debug_assert!(matches!(above, Slot::After(e) if self.topology.elements[e].row < row));
+        debug_assert!({
+            let next = self.topology.col_get(above);
+            next == NONE || self.topology.elements[next].row > row
+        });
         let element = self.create_element(row, col, above, true);
         self.markowitz_row[row] += 1;
         self.markowitz_prod[row] = self.product_of(row);

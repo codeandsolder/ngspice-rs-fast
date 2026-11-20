@@ -184,37 +184,47 @@ impl ComplexMatrix {
                 "operator dimensions/frequency invalid",
             ));
         }
-        let mut assembled = std::collections::BTreeMap::new();
         let real = a
             .triplets()
             .iter()
             .map(|t| (t.row, t.col, Complex::real(t.value)));
         let imaginary = iter_dynamic_terms(e, groups, omega)
             .map(|(row, col, v)| (row, col, Complex::imaginary(v)));
-        {
-            for (row, col, v) in real.chain(imaginary) {
-                if !v.is_finite() {
-                    return Err(numerical(
-                        "complex assembly",
-                        "non-finite coefficient/overflow",
-                    ));
-                }
-                let entry = assembled.entry((row, col)).or_insert(Complex::ZERO);
-                *entry = *entry + v;
-                if !entry.is_finite() {
-                    return Err(numerical("complex assembly", "duplicate sum overflow"));
+        let mut assembled =
+            Vec::with_capacity(a.triplets().len().saturating_add(e.triplets().len()));
+        for entry in real.chain(imaginary) {
+            if !entry.2.is_finite() {
+                return Err(numerical(
+                    "complex assembly",
+                    "non-finite coefficient/overflow",
+                ));
+            }
+            assembled.push(entry);
+        }
+        // Equal coordinates must retain the original stamp order, including
+        // intermediate cancellations and the zero-initialized complex sum.
+        assembled.sort_by_key(|&(row, col, _)| (row, col));
+        let mut len = 0;
+        for read in 0..assembled.len() {
+            let (row, col, value) = assembled[read];
+            if len > 0 {
+                let last = &mut assembled[len - 1];
+                if (last.0, last.1) == (row, col) {
+                    last.2 = last.2 + value;
+                    if !last.2.is_finite() {
+                        return Err(numerical("complex assembly", "duplicate sum overflow"));
+                    }
+                    continue;
                 }
             }
+            assembled[len] = (row, col, Complex::ZERO + value);
+            len += 1;
         }
+        assembled.truncate(len);
+        assembled.retain(|&(_, _, v)| v != Complex::ZERO);
         Ok(Self {
             n: a.rows(),
-            assembly: Assembly::Standalone(
-                assembled
-                    .into_iter()
-                    .filter(|(_, v)| *v != Complex::ZERO)
-                    .map(|((r, c), v)| (r, c, v))
-                    .collect(),
-            ),
+            assembly: Assembly::Standalone(assembled),
             pivot: a.pivot_tolerances(),
             names: a.unknown_names().cloned(),
         })
@@ -550,6 +560,60 @@ impl ComplexLu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_assembly_preserves_grouped_stamp_order_and_zero_bits() {
+        let mut a = SparseMatrix::new(3, 3);
+        let mut e = SparseMatrix::new(3, 3);
+        let mut seed = 7_u64;
+        // Mixed coordinates and magnitudes plus exact cancellations.
+        for i in 0..300 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let row = ((seed >> 32) % 3) as usize;
+            let col = ((seed >> 40) % 3) as usize;
+            let v = [1e16, 1., -1e16, 0.125, -0.125][i % 5];
+            a.add(row, col, v).unwrap();
+            e.add(col, row, v * 0.5).unwrap();
+        }
+        let groups = [DynamicGroup {
+            range: 0..1,
+            terms: vec![1., -2., 0.25],
+            scale: 3.,
+            divisor: 2.,
+            prescaled: false,
+        }];
+        let omega = 0.25;
+        let mut expected = std::collections::BTreeMap::new();
+        let real = a
+            .triplets()
+            .iter()
+            .map(|t| (t.row, t.col, Complex::real(t.value)));
+        let imag =
+            iter_dynamic_terms(&e, &groups, omega).map(|(r, c, v)| (r, c, Complex::imaginary(v)));
+        for (r, c, v) in real.chain(imag) {
+            let entry = expected.entry((r, c)).or_insert(Complex::ZERO);
+            *entry = *entry + v;
+        }
+        let matrix = ComplexMatrix::from_operators_grouped(&a, &e, &groups, omega).unwrap();
+        let Assembly::Standalone(entries) = matrix.assembly else {
+            panic!("standalone matrix");
+        };
+        let actual = entries
+            .iter()
+            .map(|&(r, c, v)| ((r, c), v.re.to_bits(), v.im.to_bits()));
+        let expected = expected
+            .into_iter()
+            .filter(|(_, v)| *v != Complex::ZERO)
+            .map(|(rc, v)| (rc, v.re.to_bits(), v.im.to_bits()));
+        assert!(actual.eq(expected));
+
+        // Intermediate overflow is an error even if later terms cancel it.
+        let mut overflow = SparseMatrix::new(1, 1);
+        for v in [f64::MAX, f64::MAX, -f64::MAX] {
+            overflow.add(0, 0, v).unwrap();
+        }
+        assert!(ComplexMatrix::from_operators(&overflow, &SparseMatrix::new(1, 1), 1.).is_err());
+    }
 
     #[test]
     fn complex_workspace_is_reused_across_snapshots_and_contended_solves() {
