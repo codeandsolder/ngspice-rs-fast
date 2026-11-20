@@ -859,8 +859,7 @@ impl Jfet2 {
 
     /// Normalized `[vgs, vgd]` from physical node voltages of d', g, s'.
     fn normalized(&self, v: [Real; 3]) -> [Real; 2] {
-        let pol = self.model.pol;
-        [pol * (v[1] - v[2]), pol * (v[1] - v[0])]
+        jfet::normalized(self.model.pol, v)
     }
 
     fn numerical(&self, message: &str) -> SpiceError {
@@ -940,27 +939,7 @@ impl Device for Jfet2 {
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
     ) -> SpiceResult<bool> {
-        let [d, g, s] = [self.terminals[0], self.terminals[1], self.terminals[2]];
-        let [dp, _, sp] = self.inner;
-        for (row, col) in [
-            (d, dp),
-            (g, dp),
-            (g, sp),
-            (s, sp),
-            (dp, d),
-            (dp, g),
-            (dp, sp),
-            (sp, g),
-            (sp, s),
-            (sp, dp),
-            (d, d),
-            (g, g),
-            (s, s),
-            (dp, dp),
-            (sp, sp),
-        ] {
-            setup.nodes(row, col);
-        }
+        jfet::setup_gate_matrix(setup, &self.terminals, self.inner);
         Ok(true)
     }
     /// `jfet2ask.c` scalar asks: `area` (C reports `area * m`), `m`, `temp`,

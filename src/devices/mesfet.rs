@@ -524,8 +524,7 @@ impl Mesfet {
 
     /// Normalized `[vgs, vgd]` from physical node voltages of d', g, s'.
     fn normalized(&self, v: [Real; 3]) -> [Real; 2] {
-        let pol = self.model.pol;
-        [pol * (v[1] - v[2]), pol * (v[1] - v[0])]
+        jfet::normalized(self.model.pol, v)
     }
 
     /// Normalized `[vgs, vgd]` at a solution vector (no limiting).
@@ -586,6 +585,20 @@ impl Mesfet {
 }
 
 impl Device for Mesfet {
+    /// MES occupies its own C device type, before MESA and MOS.
+    fn c_device_type(&self) -> crate::devices::setup::CDeviceType {
+        crate::devices::setup::CDeviceType::Mes
+    }
+
+    /// messetup.c uses the same element allocation order as JFET.
+    fn setup_matrix(
+        &self,
+        setup: &mut crate::devices::setup::MatrixSetup<'_>,
+    ) -> SpiceResult<bool> {
+        jfet::setup_gate_matrix(setup, &self.terminals, self.inner);
+        Ok(true)
+    }
+
     /// `mesask.c` scalar asks: `area` (C reports `area * m`) and the given
     /// `icvds`/`icvgs`. C answers no `m` ask (`MES_M` is missing from
     /// `MESask`).

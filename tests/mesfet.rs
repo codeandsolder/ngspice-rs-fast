@@ -257,6 +257,42 @@ fn inverse_mode_mirrors_the_normal_mode_current() {
 }
 
 #[test]
+fn mes_setup_uses_the_c_device_type_and_exact_matrix_allocation_order() {
+    use ngspice_rs::devices::setup::CDeviceType;
+    let c = circuit(
+        "z1 d g s zm\nm1 d g s b mm w=10u l=2u\nv1 d 0 1\n.model zm nmf(rd=5 rs=3)\n.model mm nmos(level=1 rd=5 rs=3)"
+    ).unwrap();
+    let index = c.devices().iter().position(|d| d.name() == "z1").unwrap();
+    assert_eq!(c.devices()[index].c_device_type(), CDeviceType::Mes);
+    let row = |name: &str| c.unknowns().node_row(c.nodes().get(name).unwrap()).unwrap();
+    let [d, g, s, dp, sp] = ["d", "g", "s", "z1#drain", "z1#source"].map(row);
+    assert_eq!(
+        c.setup_elements(index).unwrap(),
+        [
+            (d, dp),
+            (g, dp),
+            (g, sp),
+            (s, sp),
+            (dp, d),
+            (dp, g),
+            (dp, sp),
+            (sp, g),
+            (sp, s),
+            (sp, dp),
+            (d, d),
+            (g, g),
+            (s, s),
+            (dp, dp),
+            (sp, sp),
+        ]
+    );
+    assert!(sp < dp);
+    assert!(dp < row("m1#source"));
+    let source = c.devices().iter().position(|d| d.name() == "v1").unwrap();
+    assert!(dp < c.branch_rows(source).unwrap().start);
+}
+
+#[test]
 fn series_resistance_creates_source_then_drain_internal_nodes() {
     let c = circuit(
         "vd d 0 3\nvg g 0 0\nz1 d g 0 zm area=2\n.model zm nmf(rd=40 rs=30)\nz2 d g 0 zn\n\
