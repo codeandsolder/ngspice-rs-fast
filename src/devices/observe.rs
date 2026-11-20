@@ -39,10 +39,8 @@ fn terminal(device: &dyn Device, key: &str) -> Option<usize> {
     // JFET (jfetask.c) and MESFET (mesask.c) port labels use the same
     // terminal numbering as their corresponding device load.
     match (device.designator(), key) {
-        (_, "i" | "current") | ('d', "id") | ('q', "ic") | ('m' | 'j', "id") | ('z', "cd") => {
-            Some(0)
-        }
-        ('q', "ib") | ('m', "ig") | ('j', "ig") | ('z', "cg") => Some(1),
+        (_, "i" | "current") | ('d' | 'm' | 'j', "id") | ('q', "ic") | ('z', "cd") => Some(0),
+        ('q', "ib") | ('m' | 'j', "ig") | ('z', "cg") => Some(1),
         ('q', "ie") | ('m' | 'j' | 'z', "is") => Some(2),
         ('m', "ib") => Some(3),
         _ => None,
@@ -73,7 +71,7 @@ pub fn unit(name: &str) -> &'static str {
 }
 
 /// Resolve observation targets once, while keeping the public column names
-/// in their original order. A caller replacing devices through devices_mut
+/// in their original order. A caller replacing devices through `devices_mut`
 /// can invalidate a hint; identity is checked before using it.
 #[derive(Default)]
 pub(super) struct ObservationPlan {
@@ -194,7 +192,7 @@ impl PointLoads<'_, '_> {
     }
 }
 
-/// Same accumulation as SparseMatrix::mul_vector, but only for terminal
+/// Same accumulation as `SparseMatrix::mul_vector`, but only for terminal
 /// rows. Preserve the unfolded contribution order, including cancellation
 /// and aliased nodes. Ground is the negative sum in terminal order, with
 /// each physical node counted once.
@@ -213,7 +211,8 @@ fn terminal_residuals(
     for triplet in matrix.triplets() {
         for (&row, current) in rows.iter().zip(&mut currents) {
             if row == Some(triplet.row) {
-                *current += triplet.value * solution.as_slice()[triplet.col];
+                let contribution = triplet.value * solution.as_slice()[triplet.col];
+                *current += contribution;
             }
         }
     }

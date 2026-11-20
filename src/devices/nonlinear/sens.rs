@@ -207,6 +207,36 @@ fn default(record: &mut SensitivityRecord, keyword: &str, value: Real) -> SpiceR
     }
 }
 
+// Geometry, multiplier and effective knee currents belong to the instance.
+fn setup_diode_instance(
+    model: &SensitivityRecord,
+    instance: &mut SensitivityRecord,
+) -> SpiceResult<()> {
+    let geometry = instance.given("w") || instance.given("l");
+    if !instance.given("area") {
+        let area = if geometry { 1. } else { model.value("area")? };
+        instance.store("area", area)?;
+    }
+    if !instance.given("pj") {
+        let pj = if geometry { 0. } else { model.value("pj")? };
+        instance.store("pj", pj)?;
+    }
+    if !instance.given("m") || instance.value("m")? <= 0. {
+        instance.store("m", 1.)?;
+    }
+    if instance.value("area")? <= 0. {
+        instance.store("area", 1.)?;
+    }
+    let (area, pj, m) = (
+        instance.value("area")?,
+        instance.value("pj")?,
+        instance.value("m")?,
+    );
+    instance.store("ikf", model.value("ikf")? * area * m)?;
+    instance.store("ikr", model.value("ikr")? * area * m)?;
+    instance.store("ikp", model.value("ikp")? * pj * m)
+}
+
 impl DeviceSensitivity for DiodeSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Diode
@@ -322,7 +352,7 @@ impl DeviceSensitivity for DiodeSensitivity<'_> {
         default(model, "nbv", n)?;
         default(model, "tlev", 0.)?;
         default(model, "tlevc", 0.)?;
-        let eg = if model.value("tlev")? == 2. {
+        let eg = if matches!(model.value("tlev")?, 2.) {
             1.16
         } else {
             1.11
@@ -377,29 +407,7 @@ impl DeviceSensitivity for DiodeSensitivity<'_> {
             0.
         };
         model.store("conductance", conductance)?;
-        let geometry = instance.given("w") || instance.given("l");
-        if !instance.given("area") {
-            let area = if geometry { 1. } else { model.value("area")? };
-            instance.store("area", area)?;
-        }
-        if !instance.given("pj") {
-            let pj = if geometry { 0. } else { model.value("pj")? };
-            instance.store("pj", pj)?;
-        }
-        if !instance.given("m") || instance.value("m")? <= 0. {
-            instance.store("m", 1.)?;
-        }
-        if instance.value("area")? <= 0. {
-            instance.store("area", 1.)?;
-        }
-        let (area, pj, m) = (
-            instance.value("area")?,
-            instance.value("pj")?,
-            instance.value("m")?,
-        );
-        instance.store("ikf", model.value("ikf")? * area * m)?;
-        instance.store("ikr", model.value("ikr")? * area * m)?;
-        instance.store("ikp", model.value("ikp")? * pj * m)
+        setup_diode_instance(model, instance)
     }
 
     /// `DIOtemp`: the instance temperature (`CKTtemp + dtemp` unless given).
