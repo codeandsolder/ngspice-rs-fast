@@ -477,7 +477,7 @@ fn measurement_rewrite_handles_many_independent_references() {
     }
     let result = lowered(&body);
     assert_eq!(result.devices.len(), 3 * 512);
-    for (index, devices) in result.devices.chunks_exact(3).enumerate() {
+    for (index, devices) in result.devices.as_chunks::<3>().0.iter().enumerate() {
         assert_eq!(devices[0].nodes[0], format!("n{index}_vmeas_{}", 2 * index));
         assert_eq!(devices[1].name, format!("v_r{index}"));
         let reference = format!("v_r{index}");
