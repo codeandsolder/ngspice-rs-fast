@@ -182,53 +182,180 @@ struct Element {
     next_in_col: usize,
 }
 
-/// One numeric traversal entry. Its coordinate is an internal row for
-/// column runs, or an internal column for the upper-row runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RunEntry {
-    handle: usize,
-    coordinate: usize,
+/// Index width of an ordered traversal plan. Most circuits fit in u32;
+/// retain usize support for larger standalone matrices, with the dispatch
+/// outside all numeric loops.
+trait PlanIndex: Copy {
+    fn pack(index: usize) -> Self;
+    fn unpack(self) -> usize;
 }
 
-/// A column's sorted entries, partitioned at its diagonal. Every entry
-/// before the diagonal is upper triangular, every entry after it lower.
+impl PlanIndex for usize {
+    fn pack(index: usize) -> Self {
+        index
+    }
+    fn unpack(self) -> usize {
+        self
+    }
+}
+
+impl PlanIndex for u32 {
+    fn pack(index: usize) -> Self {
+        u32::try_from(index).expect("compact traversal plan index fits")
+    }
+    fn unpack(self) -> usize {
+        usize::try_from(self).expect("u32 fits the index width")
+    }
+}
+
+/// A numeric traversal entry: stable element handle and internal row
+/// (column runs) or internal column (upper-row runs).
 #[derive(Debug, Clone, Copy)]
-struct ColumnRun {
-    start: usize,
-    diagonal: usize,
-    end: usize,
+struct RunEntry<I> {
+    handle: I,
+    coordinate: I,
 }
 
-/// Packed traversal of the existing SPARSE linked topology. It is derived
-/// only after ordering succeeds: fill-ins and external/internal mappings
-/// remain authoritative in the linked structure. Numeric refactoring and
-/// solves use the original linked-list iteration order without chasing links.
+impl<I: PlanIndex> RunEntry<I> {
+    fn new(handle: usize, coordinate: usize) -> Self {
+        Self {
+            handle: I::pack(handle),
+            coordinate: I::pack(coordinate),
+        }
+    }
+
+    fn indices(self) -> (usize, usize) {
+        (self.handle.unpack(), self.coordinate.unpack())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ColumnRun<I> {
+    start: I,
+    diagonal: I,
+    end: I,
+}
+
+/// Immutable packed traversal, derived from linked topology after ordering.
 #[derive(Debug)]
-struct FactorPlan {
-    columns: Vec<ColumnRun>,
-    column_entries: Vec<RunEntry>,
-    upper_row_start: Vec<usize>,
-    upper_row_entries: Vec<RunEntry>,
+struct FactorRuns<I> {
+    columns: Vec<ColumnRun<I>>,
+    column_entries: Vec<RunEntry<I>>,
+    upper_row_start: Vec<I>,
+    upper_row_entries: Vec<RunEntry<I>>,
 }
 
-impl FactorPlan {
-    fn column(&self, col: usize) -> &[RunEntry] {
+#[derive(Debug)]
+enum FactorPlan {
+    Compact(FactorRuns<u32>),
+    Wide(FactorRuns<usize>),
+}
+
+enum RefactorIssue {
+    ZeroPivot(usize),
+    NonFinite,
+}
+
+impl<I: PlanIndex> FactorRuns<I> {
+    fn column(&self, col: usize) -> &[RunEntry<I>] {
         let run = self.columns[col - 1];
-        &self.column_entries[run.start..run.end]
+        &self.column_entries[run.start.unpack()..run.end.unpack()]
     }
 
-    fn upper_column(&self, col: usize) -> &[RunEntry] {
+    fn upper_column(&self, col: usize) -> &[RunEntry<I>] {
         let run = self.columns[col - 1];
-        &self.column_entries[run.start..run.diagonal]
+        &self.column_entries[run.start.unpack()..run.diagonal.unpack()]
     }
 
-    fn lower_column(&self, col: usize) -> &[RunEntry] {
+    fn lower_column(&self, col: usize) -> &[RunEntry<I>] {
         let run = self.columns[col - 1];
-        &self.column_entries[run.diagonal + 1..run.end]
+        &self.column_entries[run.diagonal.unpack() + 1..run.end.unpack()]
     }
 
-    fn upper_row(&self, row: usize) -> &[RunEntry] {
-        &self.upper_row_entries[self.upper_row_start[row - 1]..self.upper_row_start[row]]
+    fn upper_row(&self, row: usize) -> &[RunEntry<I>] {
+        &self.upper_row_entries
+            [self.upper_row_start[row - 1].unpack()..self.upper_row_start[row].unpack()]
+    }
+
+    /// The fixed-order SPARSE scatter/gather refactor, after column one.
+    fn refactor<T: Scalar>(
+        &self,
+        values: &mut [T],
+        diag: &[usize],
+        dest: &mut [T],
+    ) -> Result<(), RefactorIssue> {
+        for step in 2..=self.columns.len() {
+            for entry in self.column(step) {
+                let (handle, row) = entry.indices();
+                dest[row] = values[handle];
+            }
+            for entry in self.upper_column(step) {
+                let (handle, row) = entry.indices();
+                let mult = dest[row].mul(values[diag[row]]);
+                values[handle] = mult;
+                for entry in self.lower_column(row) {
+                    let (handle, r) = entry.indices();
+                    dest[r] = dest[r].mul_sub(mult, values[handle]);
+                }
+            }
+            for entry in self.lower_column(step) {
+                let (handle, row) = entry.indices();
+                values[handle] = dest[row];
+            }
+            if dest[step].is_zero() {
+                return Err(RefactorIssue::ZeroPivot(step));
+            }
+            let inverse = dest[step].recip();
+            if !inverse.is_finite() || inverse.is_zero() {
+                return Err(RefactorIssue::NonFinite);
+            }
+            values[diag[step]] = inverse;
+        }
+        Ok(())
+    }
+
+    fn solve<T: Scalar>(&self, values: &[T], diag: &[usize], x: &mut [T]) {
+        let size = self.columns.len();
+        for i in 1..=size {
+            let mut temp = x[i];
+            if !temp.is_zero() {
+                temp = temp.mul(values[diag[i]]);
+                x[i] = temp;
+                for entry in self.lower_column(i) {
+                    let (handle, r) = entry.indices();
+                    x[r] = x[r].mul_sub(temp, values[handle]);
+                }
+            }
+        }
+        for i in (1..=size).rev() {
+            let mut temp = x[i];
+            for entry in self.upper_row(i) {
+                let (handle, c) = entry.indices();
+                temp = temp.mul_sub(values[handle], x[c]);
+            }
+            x[i] = temp;
+        }
+    }
+
+    fn solve_transposed<T: Scalar>(&self, values: &[T], diag: &[usize], x: &mut [T]) {
+        let size = self.columns.len();
+        for i in 1..=size {
+            let temp = x[i];
+            if !temp.is_zero() {
+                for entry in self.upper_row(i) {
+                    let (handle, c) = entry.indices();
+                    x[c] = x[c].mul_sub(temp, values[handle]);
+                }
+            }
+        }
+        for i in (1..=size).rev() {
+            let mut temp = x[i];
+            for entry in self.lower_column(i) {
+                let (handle, r) = entry.indices();
+                temp = temp.mul_sub(x[r], values[handle]);
+            }
+            x[i] = temp.mul(values[diag[i]]);
+        }
     }
 }
 
@@ -1126,11 +1253,21 @@ impl<T: Scalar> Sparse<T> {
     }
 
     fn compile_plan(&self) -> FactorPlan {
+        // Offsets include the exclusive end of the entry array, so both
+        // counts (not just the largest existing handles) must fit.
+        if u32::try_from(self.size).is_ok() && u32::try_from(self.topology.elements.len()).is_ok() {
+            FactorPlan::Compact(self.compile_runs())
+        } else {
+            FactorPlan::Wide(self.compile_runs())
+        }
+    }
+
+    fn compile_runs<I: PlanIndex>(&self) -> FactorRuns<I> {
         let mut columns = Vec::with_capacity(self.size);
         let mut column_entries = Vec::with_capacity(self.topology.elements.len());
         let mut upper_row_start = Vec::with_capacity(self.size + 1);
         let mut upper_row_entries = Vec::new();
-        upper_row_start.push(0);
+        upper_row_start.push(I::pack(0));
         for i in 1..=self.size {
             let start = column_entries.len();
             let diagonal = self.topology.diag[i];
@@ -1140,28 +1277,22 @@ impl<T: Scalar> Sparse<T> {
                 if e == diagonal {
                     diagonal_offset = Some(column_entries.len());
                 }
-                column_entries.push(RunEntry {
-                    handle: e,
-                    coordinate: self.topology.elements[e].row,
-                });
+                column_entries.push(RunEntry::new(e, self.topology.elements[e].row));
                 e = self.topology.elements[e].next_in_col;
             }
             columns.push(ColumnRun {
-                start,
-                diagonal: diagonal_offset.expect("ordered column contains its diagonal"),
-                end: column_entries.len(),
+                start: I::pack(start),
+                diagonal: I::pack(diagonal_offset.expect("ordered column contains its diagonal")),
+                end: I::pack(column_entries.len()),
             });
             let mut e = self.topology.elements[diagonal].next_in_row;
             while e != NONE {
-                upper_row_entries.push(RunEntry {
-                    handle: e,
-                    coordinate: self.topology.elements[e].col,
-                });
+                upper_row_entries.push(RunEntry::new(e, self.topology.elements[e].col));
                 e = self.topology.elements[e].next_in_row;
             }
-            upper_row_start.push(upper_row_entries.len());
+            upper_row_start.push(I::pack(upper_row_entries.len()));
         }
-        FactorPlan {
+        FactorRuns {
             columns,
             column_entries,
             upper_row_start,
@@ -1196,45 +1327,14 @@ impl<T: Scalar> Sparse<T> {
             .plan
             .as_deref()
             .expect("ordered sparse frame has a traversal plan");
-        for step in 2..=size {
-            for &RunEntry {
-                handle,
-                coordinate: row,
-            } in plan.column(step)
-            {
-                dest[row] = self.values[handle];
-            }
-            for &RunEntry {
-                handle,
-                coordinate: row,
-            } in plan.upper_column(step)
-            {
-                let mult = dest[row].mul(self.values[self.topology.diag[row]]);
-                self.values[handle] = mult;
-                for &RunEntry {
-                    handle,
-                    coordinate: r,
-                } in plan.lower_column(row)
-                {
-                    dest[r] = dest[r].mul_sub(mult, self.values[handle]);
-                }
-            }
-            for &RunEntry {
-                handle,
-                coordinate: row,
-            } in plan.lower_column(step)
-            {
-                self.values[handle] = dest[row];
-            }
-            if dest[step].is_zero() {
-                return self.refactor_zero_pivot(step);
-            }
-            let d = self.topology.diag[step];
-            let inverse = dest[step].recip();
-            if !inverse.is_finite() || inverse.is_zero() {
-                return self.nonfinite_factor();
-            }
-            self.values[d] = inverse;
+        let result = match plan {
+            FactorPlan::Compact(runs) => runs.refactor(&mut self.values, &self.topology.diag, dest),
+            FactorPlan::Wide(runs) => runs.refactor(&mut self.values, &self.topology.diag, dest),
+        };
+        match result {
+            Ok(()) => {}
+            Err(RefactorIssue::ZeroPivot(step)) => return self.refactor_zero_pivot(step),
+            Err(RefactorIssue::NonFinite) => return self.nonfinite_factor(),
         }
         // Fixed-order factorization does not compare coefficient magnitudes
         // to select pivots. Validate the stored factors in one contiguous
@@ -1801,35 +1901,13 @@ impl<T: Scalar> Sparse<T> {
     /// No factor snapshot needs mutable scratch or interior mutability.
     pub(super) fn solve_with_workspace(&self, rhs: &[T], x: &mut Vec<T>) -> Vec<T> {
         self.gather_rhs(rhs, x, false);
-        let size = self.size;
         let plan = self
             .plan
             .as_deref()
             .expect("factored sparse frame has a traversal plan");
-        for i in 1..=size {
-            let mut temp = x[i];
-            if !temp.is_zero() {
-                temp = temp.mul(self.values[self.topology.diag[i]]);
-                x[i] = temp;
-                for &RunEntry {
-                    handle,
-                    coordinate: r,
-                } in plan.lower_column(i)
-                {
-                    x[r] = x[r].mul_sub(temp, self.values[handle]);
-                }
-            }
-        }
-        for i in (1..=size).rev() {
-            let mut temp = x[i];
-            for &RunEntry {
-                handle,
-                coordinate: c,
-            } in plan.upper_row(i)
-            {
-                temp = temp.mul_sub(self.values[handle], x[c]);
-            }
-            x[i] = temp;
+        match plan {
+            FactorPlan::Compact(runs) => runs.solve(&self.values, &self.topology.diag, x),
+            FactorPlan::Wide(runs) => runs.solve(&self.values, &self.topology.diag, x),
         }
         self.scatter_solution(rhs, x, false)
     }
@@ -1875,35 +1953,16 @@ impl<T: Scalar> Sparse<T> {
     }
 
     pub(super) fn solve_transposed_with_workspace(&self, rhs: &[T], x: &mut Vec<T>) -> Vec<T> {
-        let size = self.size;
         self.gather_rhs(rhs, x, true);
         let plan = self
             .plan
             .as_deref()
             .expect("factored sparse frame has a traversal plan");
-        for i in 1..=size {
-            let temp = x[i];
-            if !temp.is_zero() {
-                for &RunEntry {
-                    handle,
-                    coordinate: c,
-                } in plan.upper_row(i)
-                {
-                    x[c] = x[c].mul_sub(temp, self.values[handle]);
-                }
+        match plan {
+            FactorPlan::Compact(runs) => {
+                runs.solve_transposed(&self.values, &self.topology.diag, x)
             }
-        }
-        for i in (1..=size).rev() {
-            let pivot = self.topology.diag[i];
-            let mut temp = x[i];
-            for &RunEntry {
-                handle,
-                coordinate: row,
-            } in plan.lower_column(i)
-            {
-                temp = temp.mul_sub(x[row], self.values[handle]);
-            }
-            x[i] = temp.mul(self.values[pivot]);
+            FactorPlan::Wide(runs) => runs.solve_transposed(&self.values, &self.topology.diag, x),
         }
         self.scatter_solution(rhs, x, true)
     }
@@ -2152,27 +2211,29 @@ mod tests {
         m.mna_preorder();
         assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
         let plan = std::sync::Arc::clone(m.plan.as_ref().unwrap());
+        let FactorPlan::Compact(runs) = plan.as_ref() else {
+            panic!("small matrix uses the compact plan");
+        };
         for i in 1..=m.size {
             let mut col = Vec::new();
             let mut e = m.topology.first_in_col[i];
             while e != NONE {
-                col.push(RunEntry {
-                    handle: e,
-                    coordinate: m.topology.elements[e].row,
-                });
+                col.push((e, m.topology.elements[e].row));
                 e = m.topology.elements[e].next_in_col;
             }
-            assert_eq!(plan.column(i), col);
+            assert!(runs.column(i).iter().map(|entry| entry.indices()).eq(col));
             let mut row = Vec::new();
             let mut e = m.topology.elements[m.topology.diag[i]].next_in_row;
             while e != NONE {
-                row.push(RunEntry {
-                    handle: e,
-                    coordinate: m.topology.elements[e].col,
-                });
+                row.push((e, m.topology.elements[e].col));
                 e = m.topology.elements[e].next_in_row;
             }
-            assert_eq!(plan.upper_row(i), row);
+            assert!(
+                runs.upper_row(i)
+                    .iter()
+                    .map(|entry| entry.indices())
+                    .eq(row)
+            );
         }
         let rhs = [5., 6., 7., 8.];
         let x = m.solve(&rhs);
@@ -2188,6 +2249,69 @@ mod tests {
         let h = c.get_element(1, 4);
         c.set(h, Complex::real(2.));
         assert!(c.plan.is_none());
+    }
+
+    #[test]
+    fn compact_and_wide_runs_preserve_factor_and_solve_bits() {
+        assert_eq!(std::mem::size_of::<RunEntry<u32>>(), 8);
+        assert_eq!(std::mem::size_of::<ColumnRun<u32>>(), 12);
+        let entries = [
+            (1, 1, 4.),
+            (1, 2, 1.),
+            (2, 2, 5.),
+            (2, 3, 2.),
+            (3, 1, -1.),
+            (3, 3, 6.),
+        ];
+        let input = entries.map(|(_, _, v)| v);
+        let mut narrow = build(3, &entries);
+        assert_eq!(narrow.order_and_factor(1e-3, 0.), Status::Okay);
+        let mut wide = narrow.clone();
+        wide.plan = Some(std::sync::Arc::new(FactorPlan::Wide(wide.compile_runs())));
+        narrow.reload_originals(&input);
+        wide.reload_originals(&input);
+        assert_eq!(narrow.factor(), Status::Okay);
+        assert_eq!(wide.factor(), Status::Okay);
+        assert!(
+            narrow
+                .values
+                .iter()
+                .map(|v| v.to_bits())
+                .eq(wide.values.iter().map(|v| v.to_bits()))
+        );
+        let rhs = [2., -0., 1.];
+        for (a, b) in [
+            (narrow.solve(&rhs), wide.solve(&rhs)),
+            (narrow.solve_transposed(&rhs), wide.solve_transposed(&rhs)),
+        ] {
+            assert!(
+                a.iter()
+                    .map(|v| v.to_bits())
+                    .eq(b.iter().map(|v| v.to_bits()))
+            );
+        }
+        let input = input.map(|v| Complex::new(v, v * 0.125));
+        let mut narrow = narrow.into_retyped::<Complex>();
+        let mut wide = wide.into_retyped::<Complex>();
+        narrow.reload_originals(&input);
+        wide.reload_originals(&input);
+        assert_eq!(narrow.factor(), Status::Okay);
+        assert_eq!(wide.factor(), Status::Okay);
+        let bits = |z: &Complex| (z.re.to_bits(), z.im.to_bits());
+        assert!(
+            narrow
+                .values
+                .iter()
+                .map(bits)
+                .eq(wide.values.iter().map(bits))
+        );
+        let rhs = rhs.map(Complex::real);
+        for (a, b) in [
+            (narrow.solve(&rhs), wide.solve(&rhs)),
+            (narrow.solve_transposed(&rhs), wide.solve_transposed(&rhs)),
+        ] {
+            assert!(a.iter().map(bits).eq(b.iter().map(bits)));
+        }
     }
 
     #[test]
