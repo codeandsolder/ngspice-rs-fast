@@ -27,7 +27,8 @@ use std::collections::BTreeMap;
 
 use ngspice_rs::analysis::{Plot, PlotFlags};
 use ngspice_rs::netlist::ast::{
-    DeviceInstance, Netlist, ParameterKind, PositionedValue, SourceWaveform, Subcircuit,
+    DeviceInstance, Netlist, ParameterKind, PositionedValue, PulseWaveform, PwlPoint,
+    SourceWaveform, Subcircuit,
 };
 use ngspice_rs::primitives::{exact_nonnegative_integer, parse_spice_number};
 
@@ -49,21 +50,21 @@ const MAX_POINTS: u32 = 2_000_000;
 /// time, and **both** plots must begin exactly there: the instant is compared as
 /// an ordinary sample, and nothing before it is interpolated or extrapolated.
 #[derive(Debug, Clone, Copy)]
-pub struct Grid {
-    pub start: f64,
-    pub stop: f64,
-    pub step: f64,
+pub(crate) struct Grid {
+    pub(crate) start: f64,
+    pub(crate) stop: f64,
+    pub(crate) step: f64,
 }
 
 /// What a successful comparison covered.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Summary {
+pub(crate) struct Summary {
     /// Interior (smooth) or end-point instants compared.
-    pub instants: usize,
+    pub(crate) instants: usize,
     /// One-sided breakpoint limits compared (two per breakpoint).
-    pub limits: usize,
+    pub(crate) limits: usize,
     /// Largest `|error| / bound` seen over every compared value (<= 1).
-    pub worst_ratio: f64,
+    pub(crate) worst_ratio: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -254,10 +255,17 @@ fn comparison_instants(
             && t < grid.stop - eps
             && !breakpoints.iter().any(|b| (b - t).abs() <= eps)
         {
+            check_event_capacity(instants.len(), 1)?;
             instants.push((t, Side::Interior));
         }
     }
+    check_event_capacity(instants.len(), 1)?;
     instants.push((grid.stop, Side::Interior));
+    let limit_count = breakpoints
+        .len()
+        .checked_mul(2)
+        .ok_or("too many breakpoint limits")?;
+    check_event_capacity(instants.len(), limit_count)?;
     for &b in breakpoints {
         instants.push((b, Side::Left));
         instants.push((b, Side::Right));
@@ -273,7 +281,7 @@ fn comparison_instants(
 /// `voltage` or `current` unit and satisfy
 /// `|got - want| <= relative*|want| + absolute(kind)` at every instant and at
 /// both limits of every breakpoint. Both plots must end at `grid.stop`.
-pub fn transient(
+pub(crate) fn transient(
     got: &Plot,
     want: &Plot,
     tolerance: TranTolerance,
@@ -371,7 +379,11 @@ fn number(value: &PositionedValue, what: &str, device: &str) -> Result<f64, Stri
 /// waveforms inside them are not enumerated. Subcircuits without such sources
 /// (e.g. an op-amp macromodel) add no breakpoints and are accepted.
 /// Expression-valued or non-numeric waveform fields are errors.
-pub fn breakpoints(netlist: &Netlist, time_step: f64, stop_time: f64) -> Result<Vec<f64>, String> {
+pub(crate) fn breakpoints(
+    netlist: &Netlist,
+    time_step: f64,
+    stop_time: f64,
+) -> Result<Vec<f64>, String> {
     if !(time_step.is_finite() && time_step > 0.0 && stop_time.is_finite() && stop_time > 0.0) {
         return Err("tstep and tstop must be finite and positive".into());
     }
@@ -401,17 +413,23 @@ pub fn breakpoints(netlist: &Netlist, time_step: f64, stop_time: f64) -> Result<
 /// `breakpoints` plus `b + offset` for every breakpoint `b` and offset (the
 /// echoes of a transmission-line deck, see `verify::Gate::Echoes`), inside
 /// `(0, stop_time)`, sorted and deduplicated like [`breakpoints`].
-pub fn echoes(breakpoints: &[f64], offsets: &[f64], stop_time: f64) -> Result<Vec<f64>, String> {
+pub(crate) fn echoes(
+    breakpoints: &[f64],
+    offsets: &[f64],
+    stop_time: f64,
+) -> Result<Vec<f64>, String> {
     if offsets.iter().any(|o| !(o.is_finite() && *o > 0.0)) {
         return Err("echo offsets must be finite and positive".into());
     }
     let eps = TIME_EPS_REL * stop_time;
+    let additional = breakpoints
+        .len()
+        .checked_mul(offsets.len())
+        .ok_or_else(|| "too many echo breakpoints".to_owned())?;
+    check_event_capacity(breakpoints.len(), additional)?;
     let mut times = breakpoints.to_vec();
     for b in breakpoints {
         times.extend(offsets.iter().map(|o| b + o));
-    }
-    if !u32::try_from(times.len()).is_ok_and(|len| len <= MAX_POINTS) {
-        return Err("too many echo breakpoints".into());
     }
     times.retain(|&t| t > eps && t < stop_time - eps);
     times.sort_by(f64::total_cmp);
@@ -455,109 +473,140 @@ fn collect(
 ) -> Result<(), String> {
     let name = device.name.as_str();
     match waveform {
-        SourceWaveform::Pwl(points) => {
-            let delay = scalar(device, "td")?.unwrap_or(0.0);
-            let knots = points
-                .iter()
-                .map(|point| number(&point.time, "PWL time", name))
-                .collect::<Result<Vec<_>, _>>()?;
-            out.extend(knots.iter().map(|t| delay + t));
-            if let Some(r) = scalar(device, "r")?.filter(|&r| r >= -0.5) {
-                let start = knots
-                    .iter()
-                    .position(|&t| t.partial_cmp(&r) == Some(Ordering::Equal))
-                    .ok_or_else(|| format!("{name}: r={r} matches no PWL time"))?;
-                let last = knots[knots.len() - 1];
-                let period = last - r;
-                if period <= 0.0
-                    || (stop_time - delay - last) / period > f64::from(MAX_POINTS) / 4.0
-                {
-                    return Err(format!(
-                        "{name}: repeated PWL would create too many breakpoints"
-                    ));
-                }
-                let mut cycle = 1_u32;
-                loop {
-                    let previous_offset = f64::from(cycle - 1) * period;
-                    let previous_end = delay + last + previous_offset;
-                    if previous_end.partial_cmp(&stop_time) != Some(Ordering::Less) {
-                        break;
-                    }
-                    if cycle > MAX_POINTS {
-                        return Err(format!(
-                            "{name}: repeated PWL would create too many breakpoints"
-                        ));
-                    }
-                    let offset = f64::from(cycle) * period;
-                    for &t in &knots[start + 1..] {
-                        out.push(delay + t + offset);
-                    }
-                    cycle += 1;
-                }
-            }
-        }
-        SourceWaveform::Pulse(pulse) => {
-            let optional = [
-                &pulse.delay,
-                &pulse.rise,
-                &pulse.fall,
-                &pulse.width,
-                &pulse.period,
-            ];
-            let given = optional.iter().take_while(|v| v.is_some()).count();
-            let get = |value: &Option<PositionedValue>, what| -> Result<Option<f64>, String> {
-                value.as_ref().map(|v| number(v, what, name)).transpose()
-            };
-            let delay = get(&pulse.delay, "PULSE delay")?.unwrap_or(0.0);
-            let rise = get(&pulse.rise, "PULSE rise")?
-                .filter(|&v| v > 0.0)
-                .unwrap_or(time_step);
-            let fall = get(&pulse.fall, "PULSE fall")?
-                .filter(|&v| v > 0.0)
-                .unwrap_or(time_step);
-            let width = if given == 3 {
-                0.0
-            } else {
-                get(&pulse.width, "PULSE width")?
-                    .filter(|&v| v >= 0.0)
-                    .unwrap_or(stop_time)
-            };
-            let period = get(&pulse.period, "PULSE period")?
-                .filter(|&v| v > 0.0)
-                .unwrap_or(stop_time);
-            let stop = get(&pulse.count, "PULSE count")?
-                .filter(|&v| v > 0.0)
-                .map(|count| count * period);
-            // Validate level spellings too: an unparseable level is an error.
-            number(&pulse.initial, "PULSE v1", name)?;
-            number(&pulse.pulsed, "PULSE v2", name)?;
-            if (stop_time - delay) / period > f64::from(MAX_POINTS) / 4.0 {
-                return Err(format!("{name}: PULSE would create too many breakpoints"));
-            }
-            let mut cycle = 0_u32;
-            loop {
-                let offset = f64::from(cycle) * period;
-                let start = delay + offset;
-                if start.partial_cmp(&stop_time) != Some(Ordering::Less) {
-                    break;
-                }
-                if cycle >= MAX_POINTS {
-                    return Err(format!("{name}: PULSE would create too many breakpoints"));
-                }
-                for corner in [0.0, rise, rise + width, rise + width + fall] {
-                    let local = offset + corner;
-                    if stop.is_none_or(|stop| local <= stop) {
-                        out.push(delay + local);
-                    }
-                }
-                cycle += 1;
-            }
-        }
+        SourceWaveform::Pwl(points) => collect_pwl(device, points, stop_time, out)?,
+        SourceWaveform::Pulse(pulse) => collect_pulse(name, pulse, time_step, stop_time, out)?,
         SourceWaveform::Function(function) => {
             for (value, field) in function.values.iter().zip(function.function.fields()) {
                 number(value, field, name)?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Bound the total event count before extending any waveform's output.
+fn check_event_capacity(existing: usize, additional: usize) -> Result<(), String> {
+    let count = existing
+        .checked_add(additional)
+        .and_then(|n| u32::try_from(n).ok());
+    if count.is_some_and(|n| n <= MAX_POINTS) {
+        Ok(())
+    } else {
+        Err("too many generated breakpoints".into())
+    }
+}
+
+fn collect_pwl(
+    device: &DeviceInstance,
+    points: &[PwlPoint],
+    stop_time: f64,
+    out: &mut Vec<f64>,
+) -> Result<(), String> {
+    let name = device.name.as_str();
+    let delay = scalar(device, "td")?.unwrap_or(0.0);
+    check_event_capacity(out.len(), points.len())?;
+    let knots = points
+        .iter()
+        .map(|point| number(&point.time, "PWL time", name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let last = *knots.last().ok_or_else(|| format!("{name}: empty PWL"))?;
+    out.extend(knots.iter().map(|t| delay + t));
+    if let Some(r) = scalar(device, "r")?.filter(|&r| r >= -0.5) {
+        let start = knots
+            .iter()
+            .position(|&t| t.partial_cmp(&r) == Some(Ordering::Equal))
+            .ok_or_else(|| format!("{name}: r={r} matches no PWL time"))?;
+        let period = last - r;
+        if period <= 0.0 || (stop_time - delay - last) / period > f64::from(MAX_POINTS) / 4.0 {
+            return Err(format!(
+                "{name}: repeated PWL would create too many breakpoints"
+            ));
+        }
+        let mut cycle = 1_u32;
+        loop {
+            let previous_offset = f64::from(cycle - 1) * period;
+            let previous_end = delay + last + previous_offset;
+            if previous_end.partial_cmp(&stop_time) != Some(Ordering::Less) {
+                break;
+            }
+            if cycle > MAX_POINTS {
+                return Err(format!(
+                    "{name}: repeated PWL would create too many breakpoints"
+                ));
+            }
+            let offset = f64::from(cycle) * period;
+            check_event_capacity(out.len(), knots.len() - start - 1)?;
+            for &t in &knots[start + 1..] {
+                out.push(delay + t + offset);
+            }
+            cycle += 1;
+        }
+    }
+    Ok(())
+}
+
+fn collect_pulse(
+    name: &str,
+    pulse: &PulseWaveform,
+    time_step: f64,
+    stop_time: f64,
+    out: &mut Vec<f64>,
+) -> Result<(), String> {
+    let optional = [
+        &pulse.delay,
+        &pulse.rise,
+        &pulse.fall,
+        &pulse.width,
+        &pulse.period,
+    ];
+    let given = optional.iter().take_while(|v| v.is_some()).count();
+    let get = |value: &Option<PositionedValue>, what| -> Result<Option<f64>, String> {
+        value.as_ref().map(|v| number(v, what, name)).transpose()
+    };
+    let delay = get(&pulse.delay, "PULSE delay")?.unwrap_or(0.0);
+    let rise = get(&pulse.rise, "PULSE rise")?
+        .filter(|&v| v > 0.0)
+        .unwrap_or(time_step);
+    let fall = get(&pulse.fall, "PULSE fall")?
+        .filter(|&v| v > 0.0)
+        .unwrap_or(time_step);
+    let width = if given == 3 {
+        0.0
+    } else {
+        get(&pulse.width, "PULSE width")?
+            .filter(|&v| v >= 0.0)
+            .unwrap_or(stop_time)
+    };
+    let period = get(&pulse.period, "PULSE period")?
+        .filter(|&v| v > 0.0)
+        .unwrap_or(stop_time);
+    let stop = get(&pulse.count, "PULSE count")?
+        .filter(|&v| v > 0.0)
+        .map(|count| count * period);
+    // Validate level spellings too: an unparseable level is an error.
+    number(&pulse.initial, "PULSE v1", name)?;
+    number(&pulse.pulsed, "PULSE v2", name)?;
+    if (stop_time - delay) / period > f64::from(MAX_POINTS) / 4.0 {
+        return Err(format!("{name}: PULSE would create too many breakpoints"));
+    }
+    let mut cycle = 0_u32;
+    loop {
+        let offset = f64::from(cycle) * period;
+        let start = delay + offset;
+        if start.partial_cmp(&stop_time) != Some(Ordering::Less) {
+            break;
+        }
+        if cycle >= MAX_POINTS {
+            return Err(format!("{name}: PULSE would create too many breakpoints"));
+        }
+        for corner in [0.0, rise, rise + width, rise + width + fall] {
+            let local = offset + corner;
+            if stop.is_none_or(|stop| local <= stop) {
+                check_event_capacity(out.len(), 1)?;
+                out.push(delay + local);
+            }
+        }
+        cycle += 1;
     }
     Ok(())
 }
@@ -623,6 +672,19 @@ mod tests {
             }
         }
         plot(&rows)
+    }
+
+    #[test]
+    fn event_capacity_is_global_and_checked_before_growth() {
+        let limit = usize::try_from(MAX_POINTS).unwrap();
+        assert!(check_event_capacity(limit - 1, 1).is_ok());
+        assert!(check_event_capacity(limit, 1).is_err());
+        assert!(check_event_capacity(usize::MAX, 1).is_err());
+        // The Cartesian product exceeds the event budget, without needing
+        // to allocate the oversized product to discover that fact.
+        let points = vec![1.0; 2_000];
+        let offsets = vec![1.0; 2_000];
+        assert!(echoes(&points, &offsets, 10.0).is_err());
     }
 
     #[test]
