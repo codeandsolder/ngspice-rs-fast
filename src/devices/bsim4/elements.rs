@@ -1,96 +1,108 @@
-//! `b4set.c`'s `TSTALLOC` sequence: the matrix elements one instance makes,
-//! in C's creation order, which fixes SPARSE's numbering and pivot ties.
+//! `b4set.c`'source `TSTALLOC` sequence: the matrix elements one instance makes,
+//! in C'source creation order, which fixes SPARSE'source numbering and pivot ties.
 use super::fields::{Instance, Model};
 
-/// The `(row, column)` local node pairs `BSIM4setup` allocates for `h`,
+/// The `(row, column)` local node pairs `BSIM4setup` allocates for `instance`,
 /// in order. Pairs involving [`super::host::node::GROUND`] are included, as
 /// C makes (trash-can) elements for them too; the host skips them.
-pub(super) fn matrix_elements(m: &Model, h: &Instance) -> Vec<(i32, i32)> {
-    let (d, g, s, b) = (h.dNode, h.gNodeExt, h.sNode, h.bNode);
-    let (dp, gp, gm, sp, bp) = (
-        h.dNodePrime,
-        h.gNodePrime,
-        h.gNodeMid,
-        h.sNodePrime,
-        h.bNodePrime,
+pub(super) fn matrix_elements(model: &Model, instance: &Instance) -> Vec<(i32, i32)> {
+    let (drain, gate, source, body) = (
+        instance.dNode,
+        instance.gNodeExt,
+        instance.sNode,
+        instance.bNode,
     );
-    let (db, sb, q) = (h.dbNode, h.sbNode, h.qNode);
+    let (drain_prime, gate_prime, gate_mid, source_prime, body_prime) = (
+        instance.dNodePrime,
+        instance.gNodePrime,
+        instance.gNodeMid,
+        instance.sNodePrime,
+        instance.bNodePrime,
+    );
+    let (drain_body, source_body, charge) = (instance.dbNode, instance.sbNode, instance.qNode);
     let mut list = vec![
-        (dp, bp),
-        (gp, bp),
-        (sp, bp),
-        (bp, dp),
-        (bp, gp),
-        (bp, sp),
-        (bp, bp),
-        (d, d),
-        (gp, gp),
-        (s, s),
-        (dp, dp),
-        (sp, sp),
-        (d, dp),
-        (gp, dp),
-        (gp, sp),
-        (s, sp),
-        (dp, sp),
-        (dp, d),
-        (dp, gp),
-        (sp, gp),
-        (sp, s),
-        (sp, dp),
-        (q, q),
-        (q, bp),
-        (q, dp),
-        (q, sp),
-        (q, gp),
-        (dp, q),
-        (sp, q),
-        (gp, q),
+        (drain_prime, body_prime),
+        (gate_prime, body_prime),
+        (source_prime, body_prime),
+        (body_prime, drain_prime),
+        (body_prime, gate_prime),
+        (body_prime, source_prime),
+        (body_prime, body_prime),
+        (drain, drain),
+        (gate_prime, gate_prime),
+        (source, source),
+        (drain_prime, drain_prime),
+        (source_prime, source_prime),
+        (drain, drain_prime),
+        (gate_prime, drain_prime),
+        (gate_prime, source_prime),
+        (source, source_prime),
+        (drain_prime, source_prime),
+        (drain_prime, drain),
+        (drain_prime, gate_prime),
+        (source_prime, gate_prime),
+        (source_prime, source),
+        (source_prime, drain_prime),
+        (charge, charge),
+        (charge, body_prime),
+        (charge, drain_prime),
+        (charge, source_prime),
+        (charge, gate_prime),
+        (drain_prime, charge),
+        (source_prime, charge),
+        (gate_prime, charge),
     ];
-    if h.rgateMod != 0 {
+    if instance.rgateMod != 0 {
         list.extend([
-            (g, g),
-            (g, gp),
-            (gp, g),
-            (g, dp),
-            (g, sp),
-            (g, bp),
-            (gm, dp),
-            (gm, gp),
-            (gm, gm),
-            (gm, g),
-            (gm, sp),
-            (gm, bp),
-            (dp, gm),
-            (gp, gm),
-            (g, gm),
-            (sp, gm),
-            (bp, gm),
+            (gate, gate),
+            (gate, gate_prime),
+            (gate_prime, gate),
+            (gate, drain_prime),
+            (gate, source_prime),
+            (gate, body_prime),
+            (gate_mid, drain_prime),
+            (gate_mid, gate_prime),
+            (gate_mid, gate_mid),
+            (gate_mid, gate),
+            (gate_mid, source_prime),
+            (gate_mid, body_prime),
+            (drain_prime, gate_mid),
+            (gate_prime, gate_mid),
+            (gate, gate_mid),
+            (source_prime, gate_mid),
+            (body_prime, gate_mid),
         ]);
     }
-    if h.rbodyMod == 1 || h.rbodyMod == 2 {
+    if instance.rbodyMod == 1 || instance.rbodyMod == 2 {
         list.extend([
-            (dp, db),
-            (sp, sb),
-            (db, dp),
-            (db, db),
-            (db, bp),
-            (db, b),
-            (bp, db),
-            (bp, b),
-            (bp, sb),
-            (sb, sp),
-            (sb, bp),
-            (sb, b),
-            (sb, sb),
-            (b, db),
-            (b, bp),
-            (b, sb),
-            (b, b),
+            (drain_prime, drain_body),
+            (source_prime, source_body),
+            (drain_body, drain_prime),
+            (drain_body, drain_body),
+            (drain_body, body_prime),
+            (drain_body, body),
+            (body_prime, drain_body),
+            (body_prime, body),
+            (body_prime, source_body),
+            (source_body, source_prime),
+            (source_body, body_prime),
+            (source_body, body),
+            (source_body, source_body),
+            (body, drain_body),
+            (body, body_prime),
+            (body, source_body),
+            (body, body),
         ]);
     }
-    if m.rdsMod != 0 {
-        list.extend([(d, gp), (d, sp), (d, bp), (s, dp), (s, gp), (s, bp)]);
+    if model.rdsMod != 0 {
+        list.extend([
+            (drain, gate_prime),
+            (drain, source_prime),
+            (drain, body_prime),
+            (source, drain_prime),
+            (source, gate_prime),
+            (source, body_prime),
+        ]);
     }
     list
 }
