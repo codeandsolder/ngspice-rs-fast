@@ -236,12 +236,6 @@ impl NodeTable {
             node.kind = kind;
         }
     }
-
-    /// Ground.
-    #[must_use]
-    pub const fn ground(&self) -> NodeId {
-        NodeId::GROUND
-    }
 }
 
 impl Default for NodeTable {
@@ -282,7 +276,7 @@ mod tests {
         let table = NodeTable::new();
         assert_eq!(table.len(), 1);
         assert!(table.is_empty());
-        assert_eq!(table.ground(), NodeId::GROUND);
+        assert_eq!(table.nodes()[0].id, NodeId::GROUND);
         assert_eq!(table.node(NodeId::GROUND).unwrap().kind, NodeKind::Ground);
         assert_eq!(table.unknown_count(), 0);
     }

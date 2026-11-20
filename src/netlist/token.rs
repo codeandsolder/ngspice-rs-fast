@@ -116,13 +116,6 @@ impl Token {
 /// Characters that end a bare word.
 const DELIMITERS: &[u8] = b"(),={}\"'";
 
-fn char_at(text: &str, index: usize) -> char {
-    text[index..]
-        .chars()
-        .next()
-        .expect("index is on a character boundary")
-}
-
 /// Splits a logical card into tokens.
 ///
 /// # Errors
@@ -186,31 +179,29 @@ pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
             }
             quote @ (b'"' | b'\'') => {
                 let quote = quote as char;
-                let mut cursor = index + 1;
+                let content_start = index + 1;
+                let mut characters = text[content_start..].char_indices();
                 let mut value = String::new();
-                let mut closed = false;
-                while cursor < text.len() {
-                    let character = char_at(text, cursor);
-                    if character == '\\' && cursor + 1 < text.len() {
-                        let escaped_at = cursor + 1;
-                        let escaped = char_at(text, escaped_at);
+                let mut end = None;
+                while let Some((offset, character)) = characters.next() {
+                    if character == '\\'
+                        && let Some((_, escaped)) = characters.next()
+                    {
                         value.push(escaped);
-                        cursor = escaped_at + escaped.len_utf8();
                         continue;
                     }
-                    cursor += character.len_utf8();
                     if character == quote {
-                        closed = true;
+                        end = Some(content_start + offset + character.len_utf8());
                         break;
                     }
                     value.push(character);
                 }
-                if !closed {
+                let Some(cursor) = end else {
                     return Err(SpiceError::parse(
                         location,
                         format!("unterminated {quote} quoted string on this card"),
                     ));
-                }
+                };
                 tokens.push(Token::new(
                     TokenKind::Quoted(value),
                     &text[index..cursor],
@@ -365,6 +356,13 @@ mod tests {
     fn escaped_quotes_survive() {
         let tokens = tokens(r#""a \" b""#);
         assert_eq!(tokens[0].kind, TokenKind::Quoted("a \" b".to_owned()));
+    }
+
+    #[test]
+    fn quoted_unicode_escape_preserves_following_token() {
+        let tokens = tokens(r#""α \β \" γ" next"#);
+        assert_eq!(tokens[0].kind, TokenKind::Quoted("α β \" γ".to_owned()));
+        assert_eq!(tokens[1].text, "next");
     }
 
     #[test]
