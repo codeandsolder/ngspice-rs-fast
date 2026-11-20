@@ -54,7 +54,7 @@ pub(crate) fn args(args: &[String], usage: &str) -> Result<Args, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--source" if source.is_none() => {
-                source = Some(PathBuf::from(args.next().ok_or(usage)?))
+                source = Some(PathBuf::from(args.next().ok_or(usage)?));
             }
             "--check" if !check => check = true,
             _ => return Err(usage.into()),
@@ -139,7 +139,7 @@ pub(crate) fn table(text: &str, name: &str) -> Result<Vec<Entry>, String> {
             other => return Err(format!("unknown IFparm macro {other}")),
         };
         let args: Vec<_> = arguments.splitn(4, ',').map(str::trim).collect();
-        if args.len() != 4 || !args[3].starts_with('"') || !line.contains(")") {
+        if args.len() != 4 || !args[3].starts_with('"') || !line.contains(')') {
             return Err(format!("unsupported IFparm declaration: {line}"));
         }
         let name = args[0]
