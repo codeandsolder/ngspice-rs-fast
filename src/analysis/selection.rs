@@ -98,7 +98,7 @@ enum Terms {
 }
 
 impl Terms {
-    fn pairs(self) -> [Option<(usize, Real)>; 2] {
+    const fn pairs(self) -> [Option<(usize, Real)>; 2] {
         match self {
             Self::Ground => [None, None],
             Self::Positive(index) => [Some((index, 1.)), None],
@@ -450,25 +450,12 @@ pub(crate) fn resolve_request(plot: &Plot, request: &VectorRequest) -> SpiceResu
             name: vector,
             component,
         } => {
-            let index = plot
-                .variable_index(vector)
-                .or_else(|| plot.variable_index(&format!("v({vector})")))
-                .or_else(|| plot.variable_index(&format!("i({vector})")))
-                // C's canonical branch-vector spelling, `<source>#branch`
-                // (`CKTmkCur`, `copynode()` in `breakp2.c`): ngspice's own
-                // decks print source currents this way, so it is accepted as
-                // an alias of `i(<source>)`. The written name stays as asked,
-                // which is what C's `.print` header shows.
-                .or_else(|| {
-                    let device = vector.strip_suffix("#branch")?;
-                    (!device.is_empty()).then(|| plot.variable_index(&format!("i({device})")))?
-                })
-                .ok_or_else(|| {
-                    unsupported(format!(
-                        "{name}: the analysis has no named vector {vector}; it carries {}",
-                        column_names(plot)
-                    ))
-                })?;
+            let index = named_vector_index(plot, vector).ok_or_else(|| {
+                unsupported(format!(
+                    "{name}: the analysis has no named vector {vector}; it carries {}",
+                    column_names(plot)
+                ))
+            })?;
             let variable = &plot.variables[index];
             let unit = match component {
                 Some(VectorComponent::Phase) => "phase".to_owned(),
@@ -551,6 +538,23 @@ pub(crate) fn resolve_request(plot: &Plot, request: &VectorRequest) -> SpiceResu
             })
         }
     }
+}
+
+/// Resolve C branch-vector aliases without changing the requested output name.
+fn named_vector_index(plot: &Plot, vector: &str) -> Option<usize> {
+    plot
+    .variable_index(vector)
+    .or_else(|| plot.variable_index(&format!("v({vector})")))
+    .or_else(|| plot.variable_index(&format!("i({vector})")))
+    // C's canonical branch-vector spelling, `<source>#branch`
+    // (`CKTmkCur`, `copynode()` in `breakp2.c`): ngspice's own
+    // decks print source currents this way, so it is accepted as
+    // an alias of `i(<source>)`. The written name stays as asked,
+    // which is what C's `.print` header shows.
+    .or_else(|| {
+        let device = vector.strip_suffix("#branch")?;
+        (!device.is_empty()).then(|| plot.variable_index(&format!("i({device})")))?
+    })
 }
 
 /// The unit of a computed AC component.

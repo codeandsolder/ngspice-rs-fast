@@ -55,6 +55,7 @@
     reason = "the ASCII ngspice rawfile documentation demonstrates literal tab separator bytes"
 )]
 
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -217,23 +218,9 @@ impl RawFile {
     /// Trailing whitespace in header values is not reproduced, because parsing
     /// trims it. [`RawFile::write`] streams the same bytes to a file without
     /// building them in memory.
-    ///
-    /// # Panics
-    /// Never in practice: writing to a `Vec<u8>` cannot fail and the text is UTF-8.
     #[must_use]
     pub fn to_ascii(&self) -> String {
-        let mut bytes = Vec::new();
-        // Writing to a `Vec` cannot fail, and every byte comes from a `str`.
-        self.write_ascii(&mut bytes)
-            .expect("writing to a Vec<u8> is infallible");
-        String::from_utf8(bytes).expect("the ASCII form is rendered from UTF-8 text")
-    }
-
-    /// Streams the ASCII form into `out`; see [`RawFile::to_ascii`].
-    fn write_ascii(&self, out: &mut impl Write) -> io::Result<()> {
-        self.plots
-            .iter()
-            .try_for_each(|raw_plot| write_plot(out, raw_plot, RawFormat::Ascii))
+        AsciiRawFile(self).to_string()
     }
 
     /// Writes the rawfile in ASCII format.
@@ -268,17 +255,15 @@ impl RawFile {
     ///
     /// # Errors
     ///
-    /// [`SpiceError::Numerical`] from [`RawFile::validate`].
-    ///
-    /// # Panics
-    /// Never in practice: writing to a `Vec<u8>` cannot fail.
+    /// [`SpiceError::Numerical`] from [`RawFile::validate`], or
+    /// [`SpiceError::Io`] if the binary renderer fails.
     pub fn to_binary_with(&self, byte_order: BinaryByteOrder) -> SpiceResult<Vec<u8>> {
         self.validate()?;
         let mut bytes = Vec::new();
         for raw_plot in &self.plots {
             render_header(&mut bytes, raw_plot, raw_plot.plot.points.len())
                 .and_then(|()| binary::write_points(&mut bytes, &raw_plot.plot, byte_order))
-                .expect("writing to a Vec<u8> is infallible");
+                .map_err(|error| SpiceError::io("<rawfile memory buffer>", &error))?;
         }
         Ok(bytes)
     }
@@ -533,6 +518,48 @@ fn write_plot(out: &mut impl Write, raw_plot: &RawPlot, format: RawFormat) -> io
     Ok(())
 }
 
+/// One text renderer serves both the streamed I/O and in-memory formatting
+/// paths without converting a byte buffer back to UTF-8.
+trait TextOutput {
+    type Error;
+
+    fn emit(&mut self, args: fmt::Arguments<'_>) -> Result<(), Self::Error>;
+}
+
+struct IoText<'a, W>(&'a mut W);
+
+impl<W: Write> TextOutput for IoText<'_, W> {
+    type Error = io::Error;
+
+    fn emit(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
+        self.0.write_fmt(args)
+    }
+}
+
+impl TextOutput for fmt::Formatter<'_> {
+    type Error = fmt::Error;
+
+    fn emit(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
+        self.write_fmt(args)
+    }
+}
+
+struct AsciiRawFile<'a>(&'a RawFile);
+
+impl fmt::Display for AsciiRawFile<'_> {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for raw_plot in &self.0.plots {
+            let plot = &raw_plot.plot;
+            render_text_header(out, raw_plot, plot.points.len())?;
+            out.emit(format_args!("Values:\n"))?;
+            for (index, point) in plot.points.iter().enumerate() {
+                render_ascii_point(out, plot, index, point)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Writes point `index` of `plot` in `format`, as `raw_write()` does: in ASCII
 /// the index, one tab-led line per value and a blank line; in binary one
 /// little-endian `double` (or `re, im` pair) per value.
@@ -544,39 +571,56 @@ fn write_point(
     point: &[Complex],
 ) -> io::Result<()> {
     match format {
-        RawFormat::Ascii => {
-            write!(out, " {index}")?;
-            for (column, value) in point.iter().enumerate() {
-                let is_real = plot
-                    .variables
-                    .get(column)
-                    .is_some_and(|variable| variable.is_real);
-                writeln!(out, "\t{}", format_value(*value, plot.flags, is_real))?;
-            }
-            out.write_all(b"\n")
-        }
+        RawFormat::Ascii => render_ascii_point(&mut IoText(out), plot, index, point),
         RawFormat::Binary => binary::write_point(out, plot, point, BinaryByteOrder::LittleEndian),
     }
 }
 
+fn render_ascii_point<O: TextOutput>(
+    out: &mut O,
+    plot: &Plot,
+    index: usize,
+    point: &[Complex],
+) -> Result<(), O::Error> {
+    out.emit(format_args!(" {index}"))?;
+    for (column, value) in point.iter().enumerate() {
+        let is_real = plot
+            .variables
+            .get(column)
+            .is_some_and(|variable| variable.is_real);
+        out.emit(format_args!(
+            "\t{}\n",
+            format_value(*value, plot.flags, is_real)
+        ))?;
+    }
+    out.emit(format_args!("\n"))
+}
+
 /// Writes the header both encodings share, up to and including the `Variables:`
 /// lines, exactly as `raw_write()` lays it out.
-///
-/// The ASCII form appends `Values:` and text; the binary form appends `Binary:`
-/// and a `double` payload. Keeping one renderer makes the two headers identical
-/// by construction.
 fn render_header(out: &mut impl Write, raw_plot: &RawPlot, point_count: usize) -> io::Result<()> {
+    render_text_header(&mut IoText(out), raw_plot, point_count)
+}
+
+fn render_text_header<O: TextOutput>(
+    out: &mut O,
+    raw_plot: &RawPlot,
+    point_count: usize,
+) -> Result<(), O::Error> {
     let plot = &raw_plot.plot;
-    writeln!(out, "Title: {}", raw_plot.title)?;
-    writeln!(out, "Date: {}", raw_plot.date)?;
-    writeln!(out, "Command: {}", raw_plot.command)?;
-    writeln!(out, "Plotname: {}", plot.plotname)?;
-    writeln!(out, "Flags: {}", plot.flags.as_rawfile())?;
-    writeln!(out, "No. Variables: {}", plot.variables.len())?;
-    writeln!(out, "No. Points: {point_count}")?;
-    writeln!(out, "Variables:")?;
+    out.emit(format_args!("Title: {}\n", raw_plot.title))?;
+    out.emit(format_args!("Date: {}\n", raw_plot.date))?;
+    out.emit(format_args!("Command: {}\n", raw_plot.command))?;
+    out.emit(format_args!("Plotname: {}\n", plot.plotname))?;
+    out.emit(format_args!("Flags: {}\n", plot.flags.as_rawfile()))?;
+    out.emit(format_args!("No. Variables: {}\n", plot.variables.len()))?;
+    out.emit(format_args!("No. Points: {point_count}\n"))?;
+    out.emit(format_args!("Variables:\n"))?;
     for (index, variable) in plot.variables.iter().enumerate() {
-        writeln!(out, "\t{index}\t{}\t{}", variable.name, variable.unit)?;
+        out.emit(format_args!(
+            "\t{index}\t{}\t{}\n",
+            variable.name, variable.unit
+        ))?;
     }
     Ok(())
 }
@@ -719,34 +763,7 @@ fn parse_header(cursor: &mut Cursor<'_>) -> SpiceResult<Option<(Header, Section)
     let plotname = plotname.ok_or_else(|| missing_header("Plotname"))?;
     let flags = flags.ok_or_else(|| missing_header("Flags"))?;
 
-    // A declared count is a header claim, not a promise, so the list grows as
-    // the lines are read: a bogus `No. Variables:` cannot ask for a huge
-    // allocation before the file has been shown to hold that many lines.
-    let mut variables = Vec::new();
-    for index in 0..variable_count {
-        let Some(line) = cursor.next() else {
-            return Err(unsupported(format!(
-                "truncated rawfile: variable {index} of {variable_count} is missing"
-            )));
-        };
-        let mut fields = line.split_whitespace();
-        let (Some(declared), Some(name)) = (fields.next(), fields.next()) else {
-            return Err(unsupported(format!(
-                "rawfile variable line with fewer than two fields: '{line}'"
-            )));
-        };
-        let declared: usize = declared.parse().map_err(|_| {
-            unsupported(format!(
-                "rawfile variable index '{declared}' is not a number"
-            ))
-        })?;
-        if declared != index {
-            return Err(unsupported(format!(
-                "rawfile variable index {declared} out of order, expected {index}"
-            )));
-        }
-        variables.push(Variable::new(name, fields.next().unwrap_or("")));
-    }
+    let variables = parse_variables(cursor, variable_count)?;
 
     let Some(line) = cursor.next() else {
         return Err(unsupported("truncated rawfile: no 'Values:' section"));
@@ -777,6 +794,39 @@ fn parse_header(cursor: &mut Cursor<'_>) -> SpiceResult<Option<(Header, Section)
         },
         section,
     )))
+}
+
+fn parse_variables(cursor: &mut Cursor<'_>, variable_count: usize) -> SpiceResult<Vec<Variable>> {
+    // A declared count is a header claim, not a promise, so the list grows as
+    // the lines are read: a bogus `No. Variables:` cannot ask for a huge
+    // allocation before the file has been shown to hold that many lines.
+    let mut variables = Vec::new();
+    for index in 0..variable_count {
+        let Some(line) = cursor.next() else {
+            return Err(unsupported(format!(
+                "truncated rawfile: variable {index} of {variable_count} is missing"
+            )));
+        };
+        let mut fields = line.split_whitespace();
+        let (Some(declared), Some(name)) = (fields.next(), fields.next()) else {
+            return Err(unsupported(format!(
+                "rawfile variable line with fewer than two fields: '{line}'"
+            )));
+        };
+        let declared: usize = declared.parse().map_err(|_| {
+            unsupported(format!(
+                "rawfile variable index '{declared}' is not a number"
+            ))
+        })?;
+        if declared != index {
+            return Err(unsupported(format!(
+                "rawfile variable index {declared} out of order, expected {index}"
+            )));
+        }
+        variables.push(Variable::new(name, fields.next().unwrap_or("")));
+    }
+
+    Ok(variables)
 }
 
 /// Parses one ASCII plot, or returns `None` at the end of the file.

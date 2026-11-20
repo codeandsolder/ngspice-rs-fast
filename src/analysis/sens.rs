@@ -64,7 +64,7 @@ pub(super) const PLOTNAME: &str = "Sensitivity Analysis";
 /// `M_LOG2E`, which `count_steps()` divides by for octave sweeps.
 const LOG2E: Real = std::f64::consts::LOG2_E;
 /// The port's bound on the number of frequencies.
-const MAX_POINTS: usize = 100_000;
+const MAX_POINTS: u32 = 100_000;
 
 /// The `.sens` output variable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +88,7 @@ enum Stepping {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Sweep {
     stepping: Stepping,
-    steps: i64,
+    steps: i32,
     start: Real,
     stop: Real,
 }
@@ -111,12 +111,14 @@ fn syntax(message: impl std::fmt::Display) -> SpiceError {
 }
 
 /// C's `INPgetValue(IF_INTEGER)`: `floor(value + 0.5)`.
-fn integer(text: Option<&str>) -> SpiceResult<i64> {
+fn integer(text: Option<&str>) -> SpiceResult<i32> {
     let value = text
         .and_then(parse_spice_number)
         .filter(|v| v.is_finite())
         .ok_or_else(|| syntax("expects an integer point count"))?;
-    crate::primitives::c_integer(value).ok_or_else(|| syntax("point count is out of range"))
+    crate::primitives::c_integer(value)
+        .and_then(|count| i32::try_from(count).ok())
+        .ok_or_else(|| syntax("point count is out of range"))
 }
 
 /// Parses the arguments of a `.sens` card (`dot_sens()`).
@@ -223,8 +225,12 @@ fn parse(arguments: &[String]) -> SpiceResult<SensCard> {
 /// `LINEAR` constant (3) instead of `SENS_LINEAR`, so a `lin` sweep
 /// *multiplies* by its step `(fstop - fstart)/pts`; and the octave count
 /// divides `ln(fstop/fstart)` by `M_LOG2E` instead of multiplying.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "preserve C count_steps and inc_freq rounding, including pow and truncation"
+)]
 fn frequencies(sweep: &Sweep) -> SpiceResult<Vec<Real>> {
-    let steps = sweep.steps.max(1) as Real;
+    let steps = Real::from(sweep.steps.max(1));
     let (mut low, mut high) = (sweep.start, sweep.stop);
     let (count, factor) = match sweep.stepping {
         Stepping::Linear => (steps, (high - low) / steps),
@@ -253,7 +259,7 @@ fn frequencies(sweep: &Sweep) -> SpiceResult<Vec<Real>> {
             )
         }
     };
-    if !count.is_finite() || count > MAX_POINTS as Real {
+    if !count.is_finite() || count > Real::from(MAX_POINTS) {
         return Err(unsupported(format!(
             ".sens AC sweep has more than {MAX_POINTS} frequencies"
         )));
@@ -729,7 +735,7 @@ fn entries(members: &[Member<'_>], ac: bool, filters: &[String]) -> Vec<Entry> {
 struct DeltaNumbering {
     internal: Vec<Option<usize>>,
     next: usize,
-    ordered: Vec<(usize, usize, Complex)>,
+    ordered: Vec<(usize, usize, usize, Complex)>,
 }
 
 impl DeltaNumbering {
@@ -758,7 +764,7 @@ impl DeltaNumbering {
         }
     }
 
-    /// SMPmultiply's row products in internal SPARSE column order. Reuse
+    /// `SMPmultiply`'s row products in internal SPARSE column order. Reuse
     /// one entry buffer across the parameter walk, visiting even empty rows
     /// so that subtraction from the RHS preserves signed-zero arithmetic.
     fn visit_products(
@@ -766,27 +772,34 @@ impl DeltaNumbering {
         elements: BTreeMap<(usize, usize), Complex>,
         x: &[Complex],
         mut visit: impl FnMut(usize, Complex),
-    ) {
+    ) -> SpiceResult<()> {
         self.ordered.clear();
-        self.ordered.extend(
-            elements
-                .into_iter()
-                .map(|((row, col), value)| (row, col, value)),
-        );
-        let internal = &self.internal;
-        self.ordered.sort_unstable_by_key(|&(row, col, _)| {
-            (row, internal[col].expect("translated perturbation column"))
-        });
+        for ((row, col), value) in elements {
+            let internal = self
+                .internal
+                .get(col)
+                .copied()
+                .flatten()
+                .filter(|_| row < x.len() && col < x.len())
+                .ok_or_else(|| SpiceError::Numerical {
+                    context: ".sens".into(),
+                    message: format!("invalid or untranslated perturbation entry ({row}, {col})"),
+                })?;
+            self.ordered.push((row, internal, col, value));
+        }
+        self.ordered
+            .sort_unstable_by_key(|&(row, internal, _, _)| (row, internal));
         let mut entries = self.ordered.iter().copied().peekable();
         for row in 0..x.len() {
             let mut sum = Complex::ZERO;
-            while let Some((_, col, a)) = entries.next_if(|entry| entry.0 == row) {
-                let b = x[col];
-                sum.re += a.re * b.re - a.im * b.im;
-                sum.im += a.re * b.im + a.im * b.re;
+            while let Some((_, _, col, a)) = entries.next_if(|entry| entry.0 == row) {
+                // Complex multiplication and addition retain C's separate
+                // products, subtraction/addition, and row accumulation.
+                sum = sum + a * x[col];
             }
             visit(row, sum);
         }
+        Ok(())
     }
 }
 
@@ -835,7 +848,6 @@ fn stand_in<'d>(circuit: &'d Circuit, index: usize, load: &'d SensitivityLoad) -
 /// The connected block of every unknown of `matrix` (union-find over its
 /// entries).
 fn blocks(matrix: &SparseMatrix) -> Vec<usize> {
-    let mut parent: Vec<usize> = (0..matrix.rows()).collect();
     const fn root(parent: &mut [usize], mut x: usize) -> usize {
         while parent[x] != x {
             parent[x] = parent[parent[x]];
@@ -843,6 +855,7 @@ fn blocks(matrix: &SparseMatrix) -> Vec<usize> {
         }
         x
     }
+    let mut parent: Vec<usize> = (0..matrix.rows()).collect();
     for triplet in matrix.triplets() {
         let (a, b) = (
             root(&mut parent, triplet.row),
@@ -1000,7 +1013,7 @@ impl DcState<'_> {
         let elements = accumulate(real_stamps(&y0), real_stamps(&y1));
         numbering.visit_products(elements, &self.solution, |row, product| {
             rhs.as_mut_slice()[row] -= product.re;
-        });
+        })?;
         // Nonfinite loads poison the entire connected block, as in C.
         // Allocate the block mask only when a nonfinite entry actually occurs.
         let mut tainted = None;
@@ -1085,7 +1098,7 @@ impl AcState<'_> {
         numbering.visit_products(elements, &self.solution, |row, product| {
             rhs[row].re -= product.re;
             rhs[row].im -= product.im;
-        });
+        })?;
         self.factors.solve(&rhs)
     }
 }
@@ -1214,7 +1227,7 @@ impl<'a> ParameterWalk<'a> {
         plot
     }
 
-    /// CKTunsetup, then CKTsetup and CKTtemp in sgen order. The reset-load
+    /// `CKTunsetup`, then `CKTsetup` and `CKTtemp` in sgen order. The reset-load
     /// snapshot survives the following in-place parameter perturbations.
     fn reset_ac(&mut self) -> SpiceResult<Records> {
         for (slot, member) in self.members.iter().enumerate() {
@@ -1455,7 +1468,7 @@ fn setup_elements(
 }
 
 impl ParameterWalk<'_> {
-    /// C sens_sens parameter lifecycle. The callback sees an already numbered
+    /// C `sens_sens` parameter lifecycle. The callback sees an already numbered
     /// perturbation and the two device loads, independent of DC/AC assembly.
     fn sweep(
         &mut self,
@@ -1565,10 +1578,27 @@ mod tests {
         );
         let x = [Complex::real(1.); 3];
         let mut result = [Complex::ZERO; 3];
-        numbering.visit_products(elements, &x, |row, sum| result[row] = sum);
+        numbering
+            .visit_products(elements, &x, |row, sum| result[row] = sum)
+            .unwrap();
         assert_eq!(result, [Complex::real(1.), Complex::ZERO, Complex::ZERO]);
-        numbering.visit_products(accumulate([], []), &x, |row, sum| result[row] = sum);
+        numbering
+            .visit_products(accumulate([], []), &x, |row, sum| result[row] = sum)
+            .unwrap();
         assert_eq!(result, [Complex::ZERO; 3]);
+    }
+
+    #[test]
+    fn perturbation_products_reject_untranslated_or_invalid_entries() {
+        use super::{DeltaNumbering, accumulate};
+        use crate::primitives::Complex;
+        let mut numbering = DeltaNumbering::new(2);
+        numbering.translate([(0, 0)]);
+        let x = [Complex::real(1.); 2];
+        for entry in [(0, 1), (0, 2), (2, 0)] {
+            let elements = accumulate([], [(entry.0, entry.1, Complex::real(1.))]);
+            assert!(numbering.visit_products(elements, &x, |_, _| {}).is_err());
+        }
     }
 
     #[test]
