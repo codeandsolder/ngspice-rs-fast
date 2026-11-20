@@ -31,10 +31,15 @@ use super::grammar::{Failure, Input, ParsedCard, Result, location};
 use super::syntax::{canonical_node, malformed, name};
 
 pub(super) fn switch_card(input: &mut Input<'_>) -> Result<ParsedCard> {
-    let instance = any
-        .verify(|token: &Token| token.is_name_like() && switch_designator(token).is_some())
+    let (instance, designator) = any
+        .verify_map(|token: &Token| {
+            if token.is_name_like() {
+                switch_designator(token).map(|designator| (token, designator))
+            } else {
+                None
+            }
+        })
         .parse_next(input)?;
-    let designator = switch_designator(instance).expect("verified designator");
     cut_err(move |input: &mut Input<'_>| body(input, instance, designator)).parse_next(input)
 }
 
