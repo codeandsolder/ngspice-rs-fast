@@ -378,12 +378,12 @@ pub fn solve_with_ordering(
 ) -> SpiceResult<Vector> {
     if let Some((pattern, _)) = matrix.bound_values() {
         // A bound matrix uses its pattern's single persistent order instead.
-        let mut cached = pattern
-            .take_ordering()
-            .map(|frame| frame.into_real(pattern));
-        let x = solve_reusing(matrix, rhs, &mut cached);
-        pattern.store_ordering(cached.map(CachedFrame::Real));
-        return x;
+        return pattern.with_ordering(|state| {
+            let mut cached = state.frame.take().map(|frame| frame.into_real(pattern));
+            let x = solve_reusing(matrix, rhs, &mut cached);
+            state.frame = cached.map(CachedFrame::Real);
+            x
+        });
     }
     solve_reusing(matrix, rhs, ordering)
 }
@@ -423,8 +423,9 @@ pub(in crate::maths) fn factor_shared_complex(
     pivot: PivotTolerances,
     names: Option<&UnknownNames>,
 ) -> SpiceResult<ComplexFactors> {
+    pattern.with_ordering(|state| {
     let n = pattern.order();
-    let (mut sparse, handles, fresh) = match pattern.take_ordering() {
+    let (mut sparse, handles, fresh) = match state.frame.take() {
         Some(CachedFrame::Real(symbolic)) if matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern))) => {
             (
                 Arc::unwrap_or_clone(symbolic.sparse).into_retyped(),
@@ -455,11 +456,11 @@ pub(in crate::maths) fn factor_shared_complex(
     };
     load(&mut sparse);
     let result = if fresh {
-        pattern.set_ac_reorder(false);
+        state.ac_reorder = false;
         order_fresh("complex sparse LU", &mut sparse, pivot, names, true)
     } else {
-        let mut status = if pattern.ac_reorder() {
-            pattern.set_ac_reorder(false);
+        let mut status = if state.ac_reorder {
+            state.ac_reorder = false;
             sparse.order_and_factor(pivot.relative, pivot.absolute)
         } else {
             sparse.factor()
@@ -475,8 +476,9 @@ pub(in crate::maths) fn factor_shared_complex(
         sparse: Arc::new(sparse),
         handles,
     };
-    pattern.store_ordering(Some(CachedFrame::Complex(factors.clone())));
+    state.frame = Some(CachedFrame::Complex(factors.clone()));
     result.map(|()| factors)
+    })
 }
 
 /// The result of one `NIiter` factor-and-solve step ([`solve_ni`]).
@@ -597,12 +599,12 @@ pub fn solve_ni(
     diag_gmin: f64,
 ) -> SpiceResult<NiStep> {
     if let Some((pattern, _)) = matrix.bound_values() {
-        let mut cached = pattern
-            .take_ordering()
-            .map(|frame| frame.into_real(pattern));
-        let step = ni_step(matrix, rhs, &mut cached, reorder, diag_gmin);
-        pattern.store_ordering(cached.map(CachedFrame::Real));
-        return step;
+        return pattern.with_ordering(|state| {
+            let mut cached = state.frame.take().map(|frame| frame.into_real(pattern));
+            let step = ni_step(matrix, rhs, &mut cached, reorder, diag_gmin);
+            state.frame = cached.map(CachedFrame::Real);
+            step
+        });
     }
     ni_step(matrix, rhs, ordering, reorder, diag_gmin)
 }
@@ -705,18 +707,17 @@ fn ni_step(
 /// # Errors
 /// An invalid RHS or a non-finite solution.
 pub fn solve_last_factors(pattern: &Arc<Pattern>, rhs: &Vector) -> SpiceResult<Option<Vector>> {
-    let cached = pattern.take_ordering();
-    let result = match &cached {
-        Some(CachedFrame::Real(symbolic))
-            if matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern)))
-                && symbolic.sparse.is_factored() =>
-        {
-            Some(symbolic.solve(rhs))
-        }
-        _ => None,
-    };
-    pattern.store_ordering(cached);
-    result.transpose()
+    pattern.with_ordering(|state| {
+        match &state.frame {
+            Some(CachedFrame::Real(symbolic))
+                if matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern)))
+                    && symbolic.sparse.is_factored() =>
+            {
+                Some(symbolic.solve(rhs))
+            }
+            _ => None,
+        }.transpose()
+    })
 }
 
 /// Owned numeric sparse LU factors.
@@ -725,10 +726,13 @@ pub struct SparseLu {
     symbolic: SparseSymbolic,
 }
 
-fn assembled(matrix: &SparseMatrix) -> SpiceResult<Cow<'_, SparseMatrix>> {
+pub(super) fn assembled_triplets<'a>(
+    matrix: &'a SparseMatrix,
+    context: &str,
+) -> SpiceResult<Cow<'a, SparseMatrix>> {
     square(matrix.rows(), matrix.cols())?;
     if matrix.triplets().iter().any(|t| !t.value.is_finite()) {
-        return Err(numerical("sparse LU assembly", "non-finite coefficient"));
+        return Err(numerical(context, "non-finite coefficient"));
     }
     if matrix.is_folded() {
         return Ok(Cow::Borrowed(matrix));
@@ -736,10 +740,7 @@ fn assembled(matrix: &SparseMatrix) -> SpiceResult<Cow<'_, SparseMatrix>> {
     let mut matrix = matrix.clone();
     matrix.fold_duplicates();
     if matrix.triplets().iter().any(|t| !t.value.is_finite()) {
-        return Err(numerical(
-            "sparse LU assembly",
-            "duplicate summation overflow",
-        ));
+        return Err(numerical(context, "duplicate summation overflow"));
     }
     Ok(Cow::Owned(matrix))
 }
@@ -758,7 +759,7 @@ fn prepare_matrix(matrix: &SparseMatrix) -> SpiceResult<Cow<'_, SparseMatrix>> {
         finite_bound(values)?;
         Ok(Cow::Borrowed(matrix))
     } else {
-        assembled(matrix)
+        assembled_triplets(matrix, "sparse LU assembly")
     }
 }
 
@@ -830,8 +831,9 @@ impl SparseLu {
     }
 
     /// `spDeterminant`: `(mantissa, decimal exponent)`.
-    #[must_use]
-    pub fn determinant(&self) -> (f64, i32) {
+    /// # Errors
+    /// Non-finite/invalid inverse factors or an out-of-range exponent.
+    pub fn determinant(&self) -> SpiceResult<(f64, i32)> {
         self.symbolic.sparse.determinant()
     }
 }
@@ -907,19 +909,19 @@ mod tests {
         };
         let first = ac(1.);
         let solution = first.solve(&rhs_complex).unwrap();
-        let first_frame = pattern.take_ordering().unwrap();
+        let first_frame = pattern.with_ordering(|state| state.frame.take()).unwrap();
         let CachedFrame::Complex(ComplexFactors { sparse, handles }) = &first_frame else {
             panic!("AC must retain a complex frame");
         };
         assert!(sparse.is_factored());
         assert_eq!(Arc::strong_count(sparse), 2);
         let handles = Arc::clone(handles);
-        pattern.store_ordering(Some(first_frame));
+        pattern.with_ordering(|state| state.frame = Some(first_frame));
         let second = ac(2.);
         assert_ne!(second.solve(&rhs_complex).unwrap(), solution);
         assert_eq!(first.solve(&rhs_complex).unwrap(), solution);
         drop(second);
-        let frame = pattern.take_ordering().unwrap();
+        let frame = pattern.with_ordering(|state| state.frame.take()).unwrap();
         let CachedFrame::Complex(ComplexFactors {
             sparse,
             handles: retained,
@@ -929,7 +931,7 @@ mod tests {
         };
         assert_eq!(Arc::strong_count(sparse), 1);
         assert!(Arc::ptr_eq(&handles, retained));
-        pattern.store_ordering(Some(frame));
+        pattern.with_ordering(|state| state.frame = Some(frame));
         assert_eq!(solve_last_factors(&pattern, &rhs).unwrap(), None);
         let NiStep::Solved(after) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
             panic!("real refactor failed");
@@ -937,7 +939,7 @@ mod tests {
         assert_eq!(real, after);
         assert_eq!(first.solve(&rhs_complex).unwrap(), solution);
         assert!(matches!(
-            pattern.take_ordering(),
+            pattern.with_ordering(|state| state.frame.take()),
             Some(CachedFrame::Real(_))
         ));
     }
@@ -1020,13 +1022,19 @@ mod tests {
     fn assembled_view_borrows_folded_storage_and_checks_overflow() {
         let mut a = SparseMatrix::new(1, 1);
         a.add(0, 0, 2.).unwrap();
-        assert!(matches!(assembled(&a).unwrap(), Cow::Owned(_)));
+        assert!(matches!(
+            assembled_triplets(&a, "sparse LU assembly").unwrap(),
+            Cow::Owned(_)
+        ));
         a.fold_duplicates();
-        assert!(matches!(assembled(&a).unwrap(), Cow::Borrowed(_)));
+        assert!(matches!(
+            assembled_triplets(&a, "sparse LU assembly").unwrap(),
+            Cow::Borrowed(_)
+        ));
         a.add(0, 0, f64::MAX).unwrap();
         a.add(0, 0, f64::MAX).unwrap();
-        assert!(assembled(&a).is_err());
+        assert!(assembled_triplets(&a, "sparse LU assembly").is_err());
         a.fold_duplicates();
-        assert!(assembled(&a).is_err());
+        assert!(assembled_triplets(&a, "sparse LU assembly").is_err());
     }
 }

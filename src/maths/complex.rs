@@ -470,8 +470,9 @@ impl ComplexLu {
 
     /// `spDeterminant`: `(mantissa, decimal exponent)`, with C's
     /// `1 <= max(|re|, |im|) < 10` normalization.
-    #[must_use]
-    pub fn determinant(&self) -> (Complex, i32) {
+    /// # Errors
+    /// Non-finite/invalid inverse factors or an out-of-range exponent.
+    pub fn determinant(&self) -> SpiceResult<(Complex, i32)> {
         self.factors.sparse.determinant()
     }
 }

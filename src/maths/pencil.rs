@@ -293,10 +293,16 @@ impl Cx {
 
 /// `C_NORM`: scale `a` into `(0.5, 1]` per component, tracking the binary
 /// exponent in `mag` (set to zero for a zero value).
-fn c_norm(a: &mut Cx, mag: &mut i32) {
+fn c_norm(a: &mut Cx, mag: &mut i32) -> SpiceResult<()> {
+    if !a.re.is_finite() || !a.im.is_finite() {
+        return Err(numerical(
+            "pole-zero search",
+            "non-finite complex normalization",
+        ));
+    }
     if a.is_zero() {
         *mag = 0;
-        return;
+        return Ok(());
     }
     while a.re.abs() > 1.0 || a.im.abs() > 1.0 {
         *mag += 1;
@@ -308,13 +314,20 @@ fn c_norm(a: &mut Cx, mag: &mut i32) {
         a.re *= 2.0;
         a.im *= 2.0;
     }
+    Ok(())
 }
 
 /// `R_NORM`.
-fn r_norm(a: &mut Real, mag: &mut i32) {
+fn r_norm(a: &mut Real, mag: &mut i32) -> SpiceResult<()> {
+    if !a.is_finite() {
+        return Err(numerical(
+            "pole-zero search",
+            "non-finite real normalization",
+        ));
+    }
     if *a == 0.0 {
         *mag = 0;
-        return;
+        return Ok(());
     }
     while a.abs() > 1.0 {
         *mag += 1;
@@ -324,10 +337,14 @@ fn r_norm(a: &mut Real, mag: &mut i32) {
         *mag -= 1;
         *a *= 2.0;
     }
+    Ok(())
 }
 
 /// `zaddeq`: `a * 2^amag = x * 2^xmag + y * 2^ymag`, normalized.
-fn zaddeq(x: Real, xmag: i32, y: Real, ymag: i32) -> (Real, i32) {
+fn zaddeq(x: Real, xmag: i32, y: Real, ymag: i32) -> SpiceResult<(Real, i32)> {
+    if !x.is_finite() || !y.is_finite() {
+        return Err(numerical("pole-zero search", "non-finite scaled sum"));
+    }
     let (mut x, mut y) = (x, y);
     let mut amag;
     if xmag > ymag {
@@ -350,19 +367,8 @@ fn zaddeq(x: Real, xmag: i32, y: Real, ymag: i32) -> (Real, i32) {
         }
     }
     let mut a = x + y;
-    if a == 0.0 {
-        amag = 0;
-    } else {
-        while a.abs() > 1.0 {
-            a /= 2.0;
-            amag += 1;
-        }
-        while a.abs() < 0.5 {
-            a *= 2.0;
-            amag -= 1;
-        }
-    }
-    (a, amag)
+    r_norm(&mut a, &mut amag)?;
+    Ok((a, amag))
 }
 
 fn sgn(x: Real) -> i32 {
@@ -467,7 +473,10 @@ impl<'a> LoadedPencil<'a> {
     }
 
     /// CKTpzLoad + SMPcReorder + SMPcDProd; no MNA preorder.
-    fn determinant_at(&mut self, s: Cx) -> Option<(Cx, i32)> {
+    fn determinant_at(&mut self, s: Cx) -> SpiceResult<Option<(Cx, i32)>> {
+        if !s.re.is_finite() || !s.im.is_finite() {
+            return Err(numerical("pole-zero search", "non-finite trial frequency"));
+        }
         let Self {
             load,
             sparse,
@@ -490,11 +499,14 @@ impl<'a> LoadedPencil<'a> {
                 sparse.set(element, Complex::new(value, im));
             }
         }
+        if !sparse.values_are_finite() {
+            return Err(numerical("pole-zero search", "non-finite trial matrix"));
+        }
         match sparse.order_and_factor(load.relative_threshold, 1.0e-30) {
-            Status::Singular | Status::ZeroDiag => None,
+            Status::Singular | Status::ZeroDiag => Ok(None),
             Status::Okay | Status::SmallPivot => {
-                let (mantissa, exponent) = sparse.determinant();
-                Some(base2_determinant(mantissa, exponent))
+                let (mantissa, exponent) = sparse.determinant()?;
+                Ok(Some(base2_determinant(mantissa, exponent)))
             }
         }
     }
@@ -591,7 +603,7 @@ impl Search<'_> {
             let new = self.run_trial(candidate, &set)?;
             let flags = self.trials[new].flags;
             if flags & ISAROOT != 0 {
-                if self.verify(new) {
+                if self.verify(new)? {
                     self.niter = 0;
                     self.reset(&mut set);
                 } else {
@@ -797,8 +809,8 @@ impl Search<'_> {
                 new_trap = 2;
                 chosen = SYM2;
             } else {
-                let (a, a_mag) = zaddeq(t1.f_def.re, t1.mag_def, -t0.f_def.re, t0.mag_def);
-                let (b, b_mag) = zaddeq(t2.f_def.re, t2.mag_def, -t1.f_def.re, t1.mag_def);
+                let (a, a_mag) = zaddeq(t1.f_def.re, t1.mag_def, -t0.f_def.re, t0.mag_def)?;
+                let (b, b_mag) = zaddeq(t2.f_def.re, t2.mag_def, -t1.f_def.re, t1.mag_def)?;
                 if self.trapped == 0 {
                     let k1 = t1.s.re - t0.s.re;
                     let k2 = t2.s.re - t1.s.re;
@@ -909,16 +921,16 @@ impl Search<'_> {
                 if root {
                     let mut diff = diff;
                     let mut diff_mag = 0;
-                    c_norm(&mut diff, &mut diff_mag);
+                    c_norm(&mut diff, &mut diff_mag)?;
                     if diff.im != 0.0 {
                         diff = diff.mag2();
                         diff_mag *= 2;
                     }
-                    c_norm(&mut diff, &mut diff_mag);
+                    c_norm(&mut diff, &mut diff_mag)?;
                     for _ in 0..self.trials[pi].multiplicity {
                         def_frac = def_frac.mul(diff);
                         def_mag += diff_mag;
-                        c_norm(&mut def_frac, &mut def_mag);
+                        c_norm(&mut def_frac, &mut def_mag)?;
                     }
                 } else if matched.is_none() {
                     matched = Some(pi);
@@ -953,7 +965,7 @@ impl Search<'_> {
             let mut f_raw = Cx::ZERO;
             let mut mag_raw = 0;
             if !pretest {
-                match self.pencil.determinant_at(self.trials[new].s) {
+                match self.pencil.determinant_at(self.trials[new].s)? {
                     Some((f, mag)) => {
                         f_raw = f;
                         mag_raw = mag;
@@ -970,7 +982,7 @@ impl Search<'_> {
                 // PZnumswaps is always 1 after SMPcReorder.
                 trial.f_def = f_raw.div(def_frac);
                 trial.mag_def = mag_raw - def_mag;
-                c_norm(&mut trial.f_def, &mut trial.mag_def);
+                c_norm(&mut trial.f_def, &mut trial.mag_def)?;
             }
             if let Some(prev) = prev {
                 let after = self.trials[prev].next;
@@ -1000,7 +1012,7 @@ impl Search<'_> {
 
     /// `CKTpzVerify`: count the root, deflate every stored non-root trial
     /// by it and drop trials too close to it (always "verified").
-    fn verify(&mut self, new: usize) -> bool {
+    fn verify(&mut self, new: usize) -> SpiceResult<bool> {
         self.nzeros += 1;
         let s = self.trials[new].s;
         if s.im != 0.0 {
@@ -1027,11 +1039,11 @@ impl Search<'_> {
             let tdiff = diff.re;
             if diff.re != 0.0 {
                 let mut diff_mag = 0;
-                c_norm(&mut diff, &mut diff_mag);
+                c_norm(&mut diff, &mut diff_mag)?;
                 diff_mag *= -1;
                 let trial = &mut self.trials[ti];
                 trial.f_def = trial.f_def.div(diff);
-                c_norm(&mut trial.f_def, &mut diff_mag);
+                c_norm(&mut trial.f_def, &mut diff_mag)?;
                 trial.mag_def += diff_mag;
             }
             if self.trials[ti].s.im != 0.0 || tdiff.abs() / (s.re.abs() + 200.0) < 0.005 {
@@ -1057,7 +1069,7 @@ impl Search<'_> {
             }
             t = next;
         }
-        true
+        Ok(true)
     }
 
     /// `pzseek`: the nearest non-root, non-minimum trial in a direction.
@@ -1260,26 +1272,26 @@ impl Search<'_> {
         let x0 = (t0.s.re + t1.s.re) / 2.0;
         let mut d2x = (t2.s.re - t0.s.re) / 2.0;
 
-        let (mut a, mut a_mag) = zaddeq(t1.f_def.re, t1.mag_def, -t0.f_def.re, t0.mag_def);
+        let (mut a, mut a_mag) = zaddeq(t1.f_def.re, t1.mag_def, -t0.f_def.re, t0.mag_def)?;
         let mut tmag = 0;
-        r_norm(&mut dx0, &mut tmag);
+        r_norm(&mut dx0, &mut tmag)?;
         a /= dx0;
         a_mag -= tmag;
-        r_norm(&mut a, &mut a_mag);
+        r_norm(&mut a, &mut a_mag)?;
 
-        let (mut b, mut b_mag) = zaddeq(t2.f_def.re, t2.mag_def, -t1.f_def.re, t1.mag_def);
+        let (mut b, mut b_mag) = zaddeq(t2.f_def.re, t2.mag_def, -t1.f_def.re, t1.mag_def)?;
         tmag = 0;
-        r_norm(&mut dx1, &mut tmag);
+        r_norm(&mut dx1, &mut tmag)?;
         b /= dx1;
         b_mag -= tmag;
-        r_norm(&mut b, &mut b_mag);
+        r_norm(&mut b, &mut b_mag)?;
 
-        let (mut c, mut c_mag) = zaddeq(b, b_mag, -a, a_mag);
+        let (mut c, mut c_mag) = zaddeq(b, b_mag, -a, a_mag)?;
         tmag = 0;
-        r_norm(&mut d2x, &mut tmag);
+        r_norm(&mut d2x, &mut tmag)?;
         c /= d2x;
         c_mag -= tmag;
-        r_norm(&mut c, &mut c_mag);
+        r_norm(&mut c, &mut c_mag)?;
 
         if c == 0.0 || ((a == 0.0 || c_mag < a_mag - 40) && (b == 0.0 || c_mag < b_mag - 40)) {
             if a == 0.0 {
@@ -1303,18 +1315,18 @@ impl Search<'_> {
         }
 
         a /= c;
-        r_norm(&mut a, &mut a_mag);
+        r_norm(&mut a, &mut a_mag)?;
         a_mag -= c_mag;
         let mut diff = t1.s.re - x0;
         tmag = 0;
-        r_norm(&mut diff, &mut tmag);
-        (a, a_mag) = zaddeq(a, a_mag, diff, tmag);
+        r_norm(&mut diff, &mut tmag)?;
+        (a, a_mag) = zaddeq(a, a_mag, diff, tmag)?;
 
         b = 2.0 * t1.f_def.re / c;
         b_mag = t1.mag_def - c_mag;
-        r_norm(&mut b, &mut b_mag);
+        r_norm(&mut b, &mut b_mag)?;
 
-        let (mut disc, mut disc_mag) = zaddeq(a * a, 2 * a_mag, -b, b_mag);
+        let (mut disc, mut disc_mag) = zaddeq(a * a, 2 * a_mag, -b, b_mag)?;
         let mut complex = false;
         if disc < 0.0 {
             disc *= -1.0;
@@ -1336,9 +1348,9 @@ impl Search<'_> {
             disc_mag = 0;
         }
         (c, c_mag) = if a * disc >= 0.0 {
-            zaddeq(a, a_mag, disc, disc_mag)
+            zaddeq(a, a_mag, disc, disc_mag)?
         } else {
-            zaddeq(a, a_mag, -disc, disc_mag)
+            zaddeq(a, a_mag, -disc, disc_mag)?
         };
         if c != 0.0 {
             b /= c;
@@ -1347,8 +1359,8 @@ impl Search<'_> {
             b = 0.0;
             b_mag = 0;
         }
-        (b, b_mag) = zaddeq(t1.s.re, 0, -b, b_mag);
-        (c, c_mag) = zaddeq(t1.s.re, 0, -c, c_mag);
+        (b, b_mag) = zaddeq(t1.s.re, 0, -b, b_mag)?;
+        (c, c_mag) = zaddeq(t1.s.re, 0, -c, c_mag)?;
         while b_mag > 0 {
             b *= 2.0;
             b_mag -= 1;
@@ -1496,6 +1508,30 @@ mod tests {
                 "{found:?} vs {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn nonfinite_trial_and_normalization_are_errors() {
+        let load = PencilLoad {
+            order: 1,
+            elements: vec![(0, 0)],
+            terms: vec![PencilTerm {
+                row: 0,
+                col: 0,
+                conductance: Some(1.),
+                capacitance: Some(2.),
+            }],
+            ..PencilLoad::default()
+        };
+        let mut compiled = LoadedPencil::new(&load);
+        assert!(compiled.determinant_at(Cx::new(f64::MAX, 0.)).is_err());
+        assert!(compiled.determinant_at(Cx::new(f64::INFINITY, 0.)).is_err());
+        assert!(c_norm(&mut Cx::new(f64::INFINITY, 0.), &mut 0).is_err());
+        let mut infinity = f64::INFINITY;
+        let mut exponent = 0;
+        assert!(r_norm(&mut infinity, &mut exponent).is_err());
+        assert!(zaddeq(f64::MAX, 0, f64::MAX, 0).is_err());
+        assert!(compiled.determinant_at(Cx::new(1., 0.)).unwrap().is_some());
     }
 
     #[test]

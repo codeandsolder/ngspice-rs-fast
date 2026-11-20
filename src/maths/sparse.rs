@@ -63,13 +63,27 @@ pub struct Pattern {
     row_start: Vec<u32>,
     row_cols: Vec<u32>,
     row_ids: Vec<u32>,
-    ordering: std::sync::Mutex<Option<crate::maths::linear::CachedFrame>>,
+    ordering: std::sync::Mutex<OrderingState>,
     /// The `(row, col, id)` sequence of the last load, replayed by bound
     /// matrices to skip lookups (ngspice's per-device element pointers).
     trace: std::sync::Mutex<Arc<Trace>>,
-    /// ngspice's `NIACSHOULDREORDER`: set when the matrix is created
-    /// (`NIreinit`), cleared by the first complex reorder.
-    ac_reorder: std::sync::atomic::AtomicBool,
+}
+
+/// The retained SPARSE frame and its AC reorder flag form one transaction.
+/// A shared pattern cannot lose its pivot history to a concurrent solve.
+#[derive(Debug)]
+pub(super) struct OrderingState {
+    pub(super) frame: Option<crate::maths::linear::CachedFrame>,
+    pub(super) ac_reorder: bool,
+}
+
+impl Default for OrderingState {
+    fn default() -> Self {
+        Self {
+            frame: None,
+            ac_reorder: true,
+        }
+    }
 }
 
 /// One recorded stamp: `(row, col, element)`.
@@ -166,9 +180,8 @@ impl Pattern {
             row_start,
             row_cols,
             row_ids: order,
-            ordering: std::sync::Mutex::new(None),
+            ordering: std::sync::Mutex::new(OrderingState::default()),
             trace: std::sync::Mutex::new(Arc::new(Trace::default())),
-            ac_reorder: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -185,26 +198,17 @@ impl Pattern {
         }
     }
 
-    /// Takes the cached pivot order (leaving none while a solve uses it).
-    pub(super) fn take_ordering(&self) -> Option<crate::maths::linear::CachedFrame> {
-        self.ordering.lock().ok().and_then(|mut slot| slot.take())
-    }
-
-    /// `NIACSHOULDREORDER`: whether the next complex factorization reorders.
-    pub(crate) fn ac_reorder(&self) -> bool {
-        self.ac_reorder.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Sets or clears `NIACSHOULDREORDER`.
-    pub(crate) fn set_ac_reorder(&self, value: bool) {
-        self.ac_reorder
-            .store(value, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Caches the pivot order for the next solve.
-    pub(super) fn store_ordering(&self, ordering: Option<crate::maths::linear::CachedFrame>) {
-        if let Ok(mut slot) = self.ordering.lock() {
-            *slot = ordering;
+    /// Serializes factor-cache updates, including scalar changes and AC
+    /// reordering. A poisoned cache is discarded rather than reused.
+    pub(super) fn with_ordering<R>(&self, f: impl FnOnce(&mut OrderingState) -> R) -> R {
+        match self.ordering.lock() {
+            Ok(mut state) => f(&mut state),
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                *state = OrderingState::default();
+                self.ordering.clear_poison();
+                f(&mut state)
+            }
         }
     }
 
@@ -680,16 +684,25 @@ impl SparseMatrix {
     /// Number of stored contributions, including duplicates.
     #[must_use]
     pub fn nnz(&self) -> usize {
-        if self.bound.is_some() {
-            return self.triplets().len();
+        match &self.bound {
+            Some(bound) if self.triplets.is_empty() => {
+                bound.values.iter().filter(|&&value| value != 0.0).count()
+            }
+            Some(_) => self.triplets().len(),
+            None => self.triplets.len(),
         }
-        self.triplets.len()
     }
 
     /// True when nothing has been stamped.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.nnz() == 0
+        match &self.bound {
+            Some(bound) if self.triplets.is_empty() => {
+                bound.values.iter().all(|&value| value == 0.0)
+            }
+            Some(_) => self.triplets().is_empty(),
+            None => self.triplets.is_empty(),
+        }
     }
 
     /// True when duplicate positions have been folded away.
@@ -746,8 +759,7 @@ impl SparseMatrix {
 
     /// The contribution at a position, summed over duplicates.
     ///
-    /// Linear in the number of stored contributions; call
-    /// [`SparseMatrix::fold_duplicates`] first if this is on a hot path.
+    /// Binary search after folding, otherwise a scan in stamp order.
     #[must_use]
     pub fn get(&self, row: usize, col: usize) -> Real {
         let bound = self.bound.as_ref().and_then(|bound| {
@@ -756,13 +768,19 @@ impl SparseMatrix {
                 .find(row, col)
                 .map(|id| bound.values[id.index()])
         });
-        bound.unwrap_or(0.0)
-            + self
-                .triplets
+        let overflow = if self.folded {
+            // Match the floating-point sum's negative-zero identity.
+            self.triplets
+                .binary_search_by_key(&(row, col), |t| (t.row, t.col))
+                .map_or(-0.0, |i| -0.0 + self.triplets[i].value)
+        } else {
+            self.triplets
                 .iter()
                 .filter(|triplet| triplet.row == row && triplet.col == col)
                 .map(|triplet| triplet.value)
                 .sum::<Real>()
+        };
+        bound.unwrap_or(0.0) + overflow
     }
 
     /// Sorts and sums duplicate positions.
@@ -893,10 +911,24 @@ impl SparseMatrix {
             });
         }
         let mut result = Vector::zeros(self.rows);
-        for triplet in self.triplets() {
-            let current = result.get(triplet.row).unwrap_or(0.0);
-            let contribution = triplet.value * vector.get(triplet.col).unwrap_or(0.0);
-            result.set(triplet.row, current + contribution)?;
+        let y = result.as_mut_slice();
+        let x = vector.as_slice();
+        if let Some(bound) = &self.bound
+            && self.triplets.is_empty()
+        {
+            // Use the same row-major accumulation as the triplet view,
+            // without materializing coordinates for the bound coefficients.
+            for id in bound.pattern.sorted() {
+                let value = bound.values[id.index()];
+                if value != 0.0 {
+                    let (row, col) = bound.pattern.position(id);
+                    y[row] += value * x[col];
+                }
+            }
+        } else {
+            for triplet in self.triplets() {
+                y[triplet.row] += triplet.value * x[triplet.col];
+            }
         }
         Ok(result)
     }
@@ -960,6 +992,44 @@ mod tests {
                 col: 2,
                 value: 1.
             }]
+        );
+    }
+
+    #[test]
+    fn bound_read_paths_do_not_materialize_triplets() {
+        let pattern = Arc::new(Pattern::new(3, [(0, 2), (0, 0), (0, 1), (2, 1)]));
+        let mut matrix = SparseMatrix::bound(pattern);
+        assert!(matrix.is_empty());
+        for (r, c, v) in [(0, 2, 1.0), (0, 0, 1e16), (0, 1, -1e16), (2, 1, -2.0)] {
+            matrix.add(r, c, v).unwrap();
+        }
+        assert_eq!(matrix.nnz(), 4);
+        assert!(!matrix.is_empty());
+        assert_eq!(matrix.get(0, 1), -1e16);
+        let x = Vector::from_slice(&[1., 1., 1.]);
+        // Creation order would lose the 1; row-major order preserves it.
+        assert_eq!(matrix.mul_vector(&x).unwrap().as_slice(), &[1., 0., -2.]);
+        assert!(matrix.bound.as_ref().unwrap().view.get().is_none());
+        matrix.add(1, 2, 3.).unwrap();
+        matrix.add(1, 2, -3.).unwrap();
+        assert_eq!(matrix.nnz(), 4);
+        assert_eq!(matrix.mul_vector(&x).unwrap().as_slice(), &[1., 0., -2.]);
+    }
+
+    #[test]
+    fn folded_lookup_preserves_ordinary_and_overflow_values() {
+        let pattern = Arc::new(Pattern::new(4, [(1, 1)]));
+        let mut matrix = SparseMatrix::bound(pattern);
+        matrix.add(1, 1, 4.).unwrap();
+        matrix.add(2, 0, 1e16).unwrap();
+        matrix.add(2, 0, -1e16).unwrap();
+        matrix.add(2, 0, 1.).unwrap();
+        matrix.add(0, 2, -2.).unwrap();
+        let values = [(1, 1), (2, 0), (0, 2), (3, 3)].map(|(r, c)| matrix.get(r, c).to_bits());
+        matrix.fold_duplicates();
+        assert_eq!(
+            values,
+            [(1, 1), (2, 0), (0, 2), (3, 3)].map(|(r, c)| matrix.get(r, c).to_bits())
         );
     }
 

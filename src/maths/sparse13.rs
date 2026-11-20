@@ -54,7 +54,7 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
-use crate::primitives::Complex;
+use crate::primitives::{Complex, SpiceResult};
 
 const NONE: usize = usize::MAX;
 const DEFAULT_THRESHOLD: f64 = 1.0e-3;
@@ -76,6 +76,8 @@ pub(super) trait Scalar: Copy + PartialEq + std::fmt::Debug {
     fn mul_sub(self, a: Self, b: Self) -> Self;
     /// Whether the value is exactly zero (`== 0.0` on every part).
     fn is_zero(self) -> bool;
+    /// Whether every scalar component is finite.
+    fn is_finite(self) -> bool;
     /// `x.Real += r`.
     fn add_real(self, r: f64) -> Self;
 }
@@ -99,6 +101,9 @@ impl Scalar for f64 {
     }
     fn is_zero(self) -> bool {
         self == 0.0
+    }
+    fn is_finite(self) -> bool {
+        f64::is_finite(self)
     }
     fn add_real(self, r: f64) -> Self {
         self + r
@@ -140,6 +145,9 @@ impl Scalar for Complex {
     }
     fn is_zero(self) -> bool {
         self.re == 0.0 && self.im == 0.0
+    }
+    fn is_finite(self) -> bool {
+        Complex::is_finite(self)
     }
     fn add_real(self, r: f64) -> Self {
         Self::new(self.re + r, self.im)
@@ -500,6 +508,12 @@ impl<T: Scalar> Sparse<T> {
         }
     }
 
+    pub(super) fn values_are_finite(&self) -> bool {
+        self.elements
+            .iter()
+            .all(|element| element.value.is_finite())
+    }
+
     /// Whether the frame holds LU factors (`Matrix->Factored`).
     pub(crate) const fn is_factored(&self) -> bool {
         self.factored
@@ -653,50 +667,53 @@ impl<T: Scalar> Sparse<T> {
         self.interchanges_odd = !self.interchanges_odd;
     }
 
-    /// `spDeterminant`: `(mantissa, exponent)` with `1 <= |mantissa| < 10`
-    /// in C's `max(|re|, |im|)` norm, or zero after a singular ordering.
-    pub(crate) fn determinant(&self) -> (T, i32)
+    /// `spDeterminant`: normalized decimal mantissa and exponent, or zero
+    /// after a singular ordering. Preserve C's multiplication/division and
+    /// decimal scaling on every representable intermediate. If an individual
+    /// step would overflow or underflow, normalize its inverse pivot first.
+    pub(super) fn determinant(&self) -> SpiceResult<(T, i32)>
     where
         T: DeterminantScale,
     {
-        let mut exponent = 0;
-        if self.status == Status::Singular {
-            return (T::ZERO, 0);
+        use crate::maths::linear::numerical;
+        if matches!(self.status, Status::Singular | Status::ZeroDiag) {
+            return Ok((T::ZERO, 0));
         }
+        if !self.factored {
+            return Err(numerical("SPARSE determinant", "matrix is not factored"));
+        }
+        let mut exponent = 0_i64;
         let mut det = T::one();
         for i in 1..=self.size {
-            det = T::det_step(det, self.elements[self.diag[i]].value);
-            let mut norm = det.norm();
-            if norm != 0.0 {
-                while norm >= 1.0e12 {
-                    det = det.scale(1.0e-12);
-                    exponent += 12;
-                    norm = det.norm();
+            let inverse = self.elements[self.diag[i]].value;
+            if !inverse.is_finite() || inverse.is_zero() {
+                return Err(numerical(
+                    "SPARSE determinant",
+                    "non-finite or zero inverse pivot",
+                ));
+            }
+            let mut next = T::det_step(det, inverse);
+            if !next.is_finite() || next.is_zero() || next.norm().is_subnormal() {
+                let mut shift = 0;
+                let normalized = normalize_decimal(inverse, &mut shift, DecimalScale::Coarse);
+                next = T::det_step(det, normalized);
+                exponent -= shift;
+                if !next.is_finite() || next.is_zero() {
+                    return Err(numerical(
+                        "SPARSE determinant",
+                        "unrepresentable determinant step",
+                    ));
                 }
-                while norm < 1.0e-12 {
-                    det = det.scale(1.0e12);
-                    exponent -= 12;
-                    norm = det.norm();
-                }
             }
+            det = normalize_decimal(next, &mut exponent, DecimalScale::Coarse);
         }
-        let mut norm = det.norm();
-        if norm != 0.0 {
-            while norm >= 10.0 {
-                det = det.scale(0.1);
-                exponent += 1;
-                norm = det.norm();
-            }
-            while norm < 1.0 {
-                det = det.scale(10.0);
-                exponent -= 1;
-                norm = det.norm();
-            }
-        }
+        det = normalize_decimal(det, &mut exponent, DecimalScale::Final);
         if self.interchanges_odd {
             det = det.scale(-1.0);
         }
-        (det, exponent)
+        let exponent = i32::try_from(exponent)
+            .map_err(|_| numerical("SPARSE determinant", "decimal exponent out of range"))?;
+        Ok((det, exponent))
     }
 
     // --- spfactor.c -----------------------------------------------------
@@ -1617,6 +1634,41 @@ impl<T: Scalar> Sparse<T> {
     }
 }
 
+/// Decimal normalization stages in C's spDeterminant. The constants and
+/// order of multiplications are intentional: replacing them with logarithms,
+/// powi, or a reciprocal changes rounding on ordinary matrices.
+#[derive(Clone, Copy)]
+enum DecimalScale {
+    Coarse,
+    Final,
+}
+
+fn normalize_decimal<T: DeterminantScale>(
+    mut value: T,
+    exponent: &mut i64,
+    scale: DecimalScale,
+) -> T {
+    debug_assert!(value.is_finite());
+    let (low, high, up, down, step) = match scale {
+        DecimalScale::Coarse => (1.0e-12, 1.0e12, 1.0e12, 1.0e-12, 12),
+        DecimalScale::Final => (1.0, 10.0, 10.0, 0.1, 1),
+    };
+    let mut norm = value.norm();
+    if norm != 0.0 {
+        while norm >= high {
+            value = value.scale(down);
+            *exponent += step;
+            norm = value.norm();
+        }
+        while norm < low {
+            value = value.scale(up);
+            *exponent -= step;
+            norm = value.norm();
+        }
+    }
+    value
+}
+
 /// Scalar operations used only by [`Sparse::determinant`].
 pub(super) trait DeterminantScale: Scalar {
     /// One.
@@ -1683,6 +1735,33 @@ mod tests {
             .zip(b)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn determinant_rescales_extreme_pivots_without_nonfinite_loops() {
+        for (a, b, expected) in [(1e307, 1e308, 615), (1e-307, 1e-308, -615)] {
+            let mut m = build(2, &[(1, 1, a), (2, 2, b)]);
+            assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+            let (mantissa, exponent) = m.determinant().unwrap();
+            assert!((mantissa * 10_f64.powi(exponent - expected) - 1.).abs() < 1e-12);
+        }
+        let mut m = build(1, &[(1, 1, f64::from_bits(1))]);
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        assert!(
+            m.determinant().is_err(),
+            "inverse pivot overflow must be explicit"
+        );
+
+        let mut m = Sparse::<Complex>::new(2);
+        for i in 1..=2 {
+            let h = m.get_element(i, i);
+            m.set(h, Complex::new(1e307, 1e307));
+        }
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        let (mantissa, exponent) = m.determinant().unwrap();
+        let imag = mantissa.im * 10_f64.powi(exponent - 614);
+        assert!((imag - 2.).abs() < 1e-12);
+        assert!((mantissa.re * 10_f64.powi(exponent - 614)).abs() < 1e-12);
     }
 
     #[test]
@@ -1810,7 +1889,7 @@ mod tests {
         assert_eq!(x[1], 7.5);
         assert!((2.0 * x[0] + x[2] - 3.0).abs() < 1e-15 && (x[0] + 4.0 * x[2] - 5.0).abs() < 1e-15);
         assert_eq!(m.solve_transposed(&[3.0, -1.0, 5.0])[1], -1.0);
-        let (mantissa, exponent) = m.determinant();
+        let (mantissa, exponent) = m.determinant().unwrap();
         assert!((mantissa * 10f64.powi(exponent) - 7.0).abs() < 1e-12);
     }
 
@@ -1833,7 +1912,7 @@ mod tests {
         assert_eq!(m.order_and_factor(1e-3, 0.0), Status::Singular);
         let mut m = build(2, &[(1, 1, 3.0), (1, 2, 1.0), (2, 1, 2.0), (2, 2, 4.0)]);
         assert_eq!(m.order_and_factor(1e-3, 0.0), Status::Okay);
-        let (mantissa, exponent) = m.determinant();
+        let (mantissa, exponent) = m.determinant().unwrap();
         assert!((mantissa * 10f64.powi(exponent) - 10.0).abs() < 1e-12);
     }
 

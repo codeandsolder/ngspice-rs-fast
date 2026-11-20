@@ -15,7 +15,7 @@
 //! or C-option parity claim.
 
 use crate::maths::complex::{ComplexLu, ComplexMatrix};
-use crate::maths::linear::{numerical, square};
+use crate::maths::linear::{assembled_triplets, numerical, square};
 use crate::maths::{DenseLu, Matrix, SparseLu, SparseMatrix, SparseSymbolic, Vector};
 use crate::primitives::{Complex, SpiceResult};
 
@@ -89,7 +89,13 @@ impl Equilibration {
         let logs: Vec<(usize, usize, f64)> = entries
             .iter()
             .filter(|(_, _, v)| component_max(*v) != 0.0)
-            .map(|&(r, c, v)| Ok((r, c, f64::from(floor_log2(component_max(v), "entry")?))))
+            .map(|&(r, c, v)| {
+                Ok((
+                    r,
+                    c,
+                    f64::from(floor_log2(component_max(v), || "entry".to_owned())?),
+                ))
+            })
             .collect::<SpiceResult<_>>()?;
         let mut counts = vec![0_usize; 2 * n];
         for &(r, c, _) in &logs {
@@ -165,17 +171,17 @@ impl Equilibration {
         })
     }
 
-    fn scale_entries(&self, entries: &[Entry]) -> SpiceResult<Vec<Entry>> {
-        entries
-            .iter()
-            .map(|&(r, c, v)| {
-                Ok((
-                    r,
-                    c,
-                    scale_complex(scale_complex(v, self.rows[r])?, self.columns[c])?,
-                ))
-            })
-            .collect()
+    fn scale_entries<'a>(
+        &'a self,
+        entries: &'a [Entry],
+    ) -> impl Iterator<Item = SpiceResult<Entry>> + 'a {
+        entries.iter().map(|&(r, c, v)| {
+            Ok((
+                r,
+                c,
+                scale_complex(scale_complex(v, self.rows[r])?, self.columns[c])?,
+            ))
+        })
     }
 
     fn transform_real(values: &Vector, factors: &[f64]) -> SpiceResult<Vector> {
@@ -185,8 +191,8 @@ impl Equilibration {
                 "vector dimension mismatch",
             ));
         }
-        Ok(Vector::from_slice(
-            &values
+        Ok(Vector::from(
+            values
                 .as_slice()
                 .iter()
                 .zip(factors)
@@ -216,11 +222,11 @@ const fn component_max(v: Complex) -> f64 {
 
 /// Exact `floor(log2(v))` of a positive finite value, including subnormal
 /// inputs; no libm rounding near powers of two can alter the chosen factors.
-fn floor_log2(v: f64, what: &str) -> SpiceResult<i32> {
+fn floor_log2(v: f64, what: impl FnOnce() -> String) -> SpiceResult<i32> {
     if v <= 0.0 || !v.is_finite() {
         return Err(numerical(
             "equilibration",
-            format!("nonpositive/non-finite {what}"),
+            format!("nonpositive/non-finite {}", what()),
         ));
     }
     let bits = v.to_bits();
@@ -239,7 +245,7 @@ fn factors(maxima: &[f64], namespace: &str) -> SpiceResult<Vec<f64>> {
         .iter()
         .enumerate()
         .map(|(i, &v)| {
-            let exponent = floor_log2(v, &format!("{namespace} {i}"))?;
+            let exponent = floor_log2(v, || format!("{namespace} {i}"))?;
             Ok(2.0_f64.powi((-exponent).clamp(-MAX_SCALING_EXPONENT, MAX_SCALING_EXPONENT)))
         })
         .collect()
@@ -258,25 +264,6 @@ fn scale(v: f64, s: f64) -> SpiceResult<f64> {
 
 fn scale_complex(v: Complex, s: f64) -> SpiceResult<Complex> {
     Ok(Complex::new(scale(v.re, s)?, scale(v.im, s)?))
-}
-
-fn assembled(matrix: &SparseMatrix) -> SpiceResult<SparseMatrix> {
-    square(matrix.rows(), matrix.cols())?;
-    if matrix.triplets().iter().any(|t| !t.value.is_finite()) {
-        return Err(numerical(
-            "equilibration assembly",
-            "non-finite coefficient",
-        ));
-    }
-    let mut snapshot = matrix.clone();
-    snapshot.fold_duplicates();
-    if snapshot.triplets().iter().any(|t| !t.value.is_finite()) {
-        return Err(numerical(
-            "equilibration assembly",
-            "duplicate summation overflow",
-        ));
-    }
-    Ok(snapshot)
 }
 
 fn real_entries(matrix: &SparseMatrix) -> Vec<Entry> {
@@ -304,10 +291,14 @@ fn dense_entries(matrix: &Matrix) -> SpiceResult<Vec<Entry>> {
         .collect())
 }
 
-fn operators(n: usize, entries: &[Entry]) -> SpiceResult<(SparseMatrix, SparseMatrix)> {
+fn operators(
+    n: usize,
+    entries: impl IntoIterator<Item = SpiceResult<Entry>>,
+) -> SpiceResult<(SparseMatrix, SparseMatrix)> {
     let mut re = SparseMatrix::new(n, n);
     let mut im = SparseMatrix::new(n, n);
-    for &(r, c, v) in entries {
+    for entry in entries {
+        let (r, c, v) = entry?;
         re.add(r, c, v.re)?;
         im.add(r, c, v.im)?;
     }
@@ -392,7 +383,8 @@ impl EquilibratedDenseLu {
         let original = dense_entries(matrix)?;
         let scaling = Equilibration::new(matrix.rows(), &original)?;
         let mut scaled = Matrix::zeros(matrix.rows(), matrix.cols());
-        for (r, c, v) in scaling.scale_entries(&original)? {
+        for entry in scaling.scale_entries(&original) {
+            let (r, c, v) = entry?;
             scaled.set(r, c, v.re)?;
         }
         Ok(Self {
@@ -447,10 +439,10 @@ impl EquilibratedSparseLu {
     /// # Errors
     /// Invalid assembly, transforms, zero rows/columns, changed pattern or rank.
     pub fn new(matrix: &SparseMatrix, reuse: Option<&SparseSymbolic>) -> SpiceResult<Self> {
-        let snapshot = assembled(matrix)?;
+        let snapshot = assembled_triplets(matrix, "equilibration assembly")?;
         let original = real_entries(&snapshot);
         let scaling = Equilibration::new(snapshot.rows(), &original)?;
-        let (scaled, _) = operators(snapshot.rows(), &scaling.scale_entries(&original)?)?;
+        let (scaled, _) = operators(snapshot.rows(), scaling.scale_entries(&original))?;
         Ok(Self {
             original,
             scaling,
@@ -470,10 +462,10 @@ impl EquilibratedSparseLu {
         matrix: &SparseMatrix,
         reuse: Option<&SparseSymbolic>,
     ) -> SpiceResult<Self> {
-        let snapshot = assembled(matrix)?;
+        let snapshot = assembled_triplets(matrix, "equilibration assembly")?;
         let original = real_entries(&snapshot);
         let scaling = Equilibration::balanced(snapshot.rows(), &original)?;
-        let (scaled, _) = operators(snapshot.rows(), &scaling.scale_entries(&original)?)?;
+        let (scaled, _) = operators(snapshot.rows(), scaling.scale_entries(&original))?;
         Ok(Self {
             original,
             scaling,
@@ -607,8 +599,8 @@ impl EquilibratedComplexLu {
     /// # Errors
     /// Invalid dimensions/frequency/coefficients, transforms, zero rows/columns or rank.
     pub fn from_operators(a: &SparseMatrix, e: &SparseMatrix, omega: f64) -> SpiceResult<Self> {
-        let a = assembled(a)?;
-        let e = assembled(e)?;
+        let a = assembled_triplets(a, "equilibration assembly")?;
+        let e = assembled_triplets(e, "equilibration assembly")?;
         if a.rows() != e.rows() || !omega.is_finite() || omega < 0.0 {
             return Err(numerical(
                 "equilibration complex assembly",
@@ -634,7 +626,7 @@ impl EquilibratedComplexLu {
             .map(|((r, c), v)| (r, c, v))
             .collect();
         let scaling = Equilibration::new(a.rows(), &original)?;
-        let (re, im) = operators(a.rows(), &scaling.scale_entries(&original)?)?;
+        let (re, im) = operators(a.rows(), scaling.scale_entries(&original))?;
         let factor = ComplexMatrix::from_operators(&re, &im, 1.0)?.factorize()?;
         Ok(Self {
             original,
@@ -685,7 +677,11 @@ mod floor_log2_tests {
             (2., 1),
             (f64::MAX, 1023),
         ] {
-            assert_eq!(floor_log2(value, "test").unwrap(), exponent, "{value:?}");
+            assert_eq!(
+                floor_log2(value, || "test".to_owned()).unwrap(),
+                exponent,
+                "{value:?}"
+            );
         }
         for value in [
             0.,
@@ -696,7 +692,10 @@ mod floor_log2_tests {
             f64::INFINITY,
             f64::NEG_INFINITY,
         ] {
-            assert!(floor_log2(value, "test").is_err(), "{value:?}");
+            assert!(
+                floor_log2(value, || "test".to_owned()).is_err(),
+                "{value:?}"
+            );
         }
     }
 }
