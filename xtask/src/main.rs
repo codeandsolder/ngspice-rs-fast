@@ -14,8 +14,8 @@ mod bsim4;
 mod bsim4_fields;
 mod ci;
 mod compare;
-mod golden;
-mod ifparm;
+pub mod golden;
+pub mod ifparm;
 mod ngspice;
 #[path = "../../conformance/reference.rs"]
 mod reference;

@@ -14,14 +14,14 @@ use crate::ngspice::{self, Ngspice};
 use crate::workspace_root;
 
 /// Where the fixture decks live, relative to the workspace root.
-pub const NETLIST_DIR: &str = "conformance/netlists";
+pub(crate) const NETLIST_DIR: &str = "conformance/netlists";
 
 /// Where the captured rawfiles live, relative to the workspace root.
 #[cfg(test)]
-pub const GOLDEN_DIR: &str = "conformance/golden";
+pub(crate) const GOLDEN_DIR: &str = "conformance/golden";
 
 /// Where instrumented decks and rawfiles are staged, relative to the workspace root.
-pub const SCRATCH_DIR: &str = "target/xtask/golden";
+pub(crate) const SCRATCH_DIR: &str = "target/xtask/golden";
 
 const USAGE: &str = "\
 usage: cargo xtask golden <capture|check|list|verify> [OPTIONS]
@@ -71,7 +71,7 @@ impl Options {
 }
 
 /// Entry point for `cargo xtask golden …`.
-pub fn main(arguments: &[String]) -> Result<(), String> {
+pub(crate) fn main(arguments: &[String]) -> Result<(), String> {
     match arguments.first().map(String::as_str) {
         Some("capture") => capture(&Options::parse(&arguments[1..])?),
         Some("check") => check(&Options::parse(&arguments[1..])?),
@@ -89,7 +89,7 @@ fn netlist_paths(only: Option<&str>) -> Result<Vec<PathBuf>, String> {
     netlist_paths_at(&workspace_root(), only)
 }
 
-pub fn netlist_paths_at(root: &Path, only: Option<&str>) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn netlist_paths_at(root: &Path, only: Option<&str>) -> Result<Vec<PathBuf>, String> {
     let directory = root.join(NETLIST_DIR);
     let mut paths: Vec<PathBuf> = fs::read_dir(&directory)
         .map_err(|error| format!("reading {}: {error}", directory.display()))?

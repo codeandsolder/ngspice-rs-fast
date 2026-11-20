@@ -14,41 +14,41 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// One model family's generator configuration.
-pub struct Spec {
+pub(crate) struct Spec {
     /// The device directory under `src/spicelib/devices`.
-    pub directory: &'static str,
+    pub(crate) directory: &'static str,
     /// The C identifier prefix, including the trailing underscore.
-    pub prefix: &'static str,
+    pub(crate) prefix: &'static str,
     /// The `cargo xtask` subcommand that regenerates these files.
-    pub command: &'static str,
+    pub(crate) command: &'static str,
     /// The interface source set named in the generated header.
-    pub interface_inputs: &'static str,
+    pub(crate) interface_inputs: &'static str,
     /// The model table's C name.
-    pub model_table: &'static str,
+    pub(crate) model_table: &'static str,
     /// The instance table's C name.
-    pub instance_table: &'static str,
+    pub(crate) instance_table: &'static str,
     /// The setup file whose literal defaults are extracted.
-    pub setup_file: &'static str,
+    pub(crate) setup_file: &'static str,
     /// The text that ends the model-default block in the setup file.
-    pub instance_boundary: &'static str,
+    pub(crate) instance_boundary: &'static str,
     /// Reviewed model-table row count; a change must be reviewed.
-    pub model_expected: usize,
+    pub(crate) model_expected: usize,
     /// Reviewed instance-table row count.
-    pub instance_expected: usize,
+    pub(crate) instance_expected: usize,
     /// Reviewed literal-default count.
-    pub literal_expected: usize,
+    pub(crate) literal_expected: usize,
 }
 
 /// A parsed `cargo xtask <dev>-schema` invocation.
-pub struct Args {
+pub(crate) struct Args {
     /// The ngspice checkout holding the C sources.
-    pub source: PathBuf,
+    pub(crate) source: PathBuf,
     /// Compare instead of writing.
-    pub check: bool,
+    pub(crate) check: bool,
 }
 
 /// Parses `--source <dir> [--check]`.
-pub fn args(args: &[String], usage: &str) -> Result<Args, String> {
+pub(crate) fn args(args: &[String], usage: &str) -> Result<Args, String> {
     let (mut source, mut check) = (None, false);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -67,7 +67,7 @@ pub fn args(args: &[String], usage: &str) -> Result<Args, String> {
 }
 
 /// The upstream Git revision of the named clean input files.
-pub fn revision(source: &Path, files: &[String]) -> Result<String, String> {
+pub(crate) fn revision(source: &Path, files: &[String]) -> Result<String, String> {
     // Only the named read inputs must be clean; unrelated reference-tree work
     // is neither inspected nor modified. Record the Git revision, not a date.
     let status = Command::new("git")
@@ -98,20 +98,20 @@ pub fn revision(source: &Path, files: &[String]) -> Result<String, String> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct Entry {
-    pub name: String,
-    pub symbol: String,
-    pub kind: String,
-    pub access: &'static str,
-    pub alias: bool,
+pub(crate) struct Entry {
+    pub(crate) name: String,
+    pub(crate) symbol: String,
+    pub(crate) kind: String,
+    pub(crate) access: &'static str,
+    pub(crate) alias: bool,
     /// C's `IF_UNINTERESTING` (`IOPU`/`IOPUR`): settable and askable but
     /// omitted from `show all`. Recorded, not dropped.
-    pub uninteresting: bool,
+    pub(crate) uninteresting: bool,
 }
 
 /// Restricted `IFparm` reader: one declarator per line, four comma-separated
 /// leading arguments. Descriptions are deliberately not copied into Rust.
-pub fn table(text: &str, name: &str) -> Result<Vec<Entry>, String> {
+pub(crate) fn table(text: &str, name: &str) -> Result<Vec<Entry>, String> {
     let marker = format!("IFparm {name}[] = {{");
     let body = text
         .split_once(&marker)
@@ -192,7 +192,7 @@ fn ids<'a>(header: &'a str, prefix: &str) -> Result<BTreeMap<&'a str, u16>, Stri
 
 /// A setter case's destination and given bit. No RHS expression, control
 /// flow, formula or source comment is emitted into the generated table.
-pub fn setters(
+pub(crate) fn setters(
     text: &str,
     prefix: &str,
 ) -> Result<BTreeMap<String, (String, Option<String>)>, String> {
@@ -254,7 +254,7 @@ pub fn setters(
 
 /// Strip C block comments without changing physical line boundaries, so that
 /// statement windows stay intact.
-pub fn strip_comments(text: &str) -> Result<String, String> {
+pub(crate) fn strip_comments(text: &str) -> Result<String, String> {
     let mut clean = String::new();
     let mut input = text.chars().peekable();
     let mut comment = false;
@@ -276,7 +276,7 @@ pub fn strip_comments(text: &str) -> Result<String, String> {
 }
 
 /// The generated `parameters.rs` text.
-pub fn parameters(
+pub(crate) fn parameters(
     spec: &Spec,
     table_text: &str,
     header: &str,
@@ -384,7 +384,7 @@ fn grouped_literal(value: f64) -> String {
 
 /// The generated `defaults_data.rs` text: the setup file's literal model
 /// defaults, in C order, as interface facts only.
-pub fn literal_defaults(
+pub(crate) fn literal_defaults(
     spec: &Spec,
     tables: &str,
     mpar: &str,
@@ -460,7 +460,7 @@ pub fn literal_defaults(
 }
 
 /// Writes or checks one generated file.
-pub fn emit(path: &str, text: &str, check: bool) -> Result<(), String> {
+pub(crate) fn emit(path: &str, text: &str, check: bool) -> Result<(), String> {
     let output = crate::workspace_root().join(path);
     if check {
         let existing =
@@ -493,7 +493,7 @@ pub fn emit(path: &str, text: &str, check: bool) -> Result<(), String> {
 }
 
 /// Reads one input file from the device directory.
-pub fn read(source: &Path, spec: &Spec, name: &str) -> Result<String, String> {
+pub(crate) fn read(source: &Path, spec: &Spec, name: &str) -> Result<String, String> {
     let path = source
         .join("src/spicelib/devices")
         .join(spec.directory)
