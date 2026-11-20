@@ -78,16 +78,20 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
+pub(super) mod bulk;
+mod charge;
 pub(super) mod sens;
+pub(super) mod surface;
 
-use std::cell::OnceCell;
+use crate::devices::nonlinear::thermal::{TemperatureCache, TemperatureKey};
+use std::cell::Ref;
 
 use crate::devices::initial::InstanceInitial;
 use crate::devices::limiting;
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
-use crate::devices::nonlinear::{JunctionPoint, junction_companion};
+use crate::devices::nonlinear::cubic_reverse_junction;
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -100,16 +104,9 @@ use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
 
-/// C `CONSTboltz` (J/K).
-pub(super) const BOLTZMANN: Real = 1.380_648_52e-23;
-/// C `CHARGE` (C).
-pub(super) const CHARGE: Real = 1.602_176_620_8e-19;
-/// C `CONSTKoverQ`.
-pub(super) const K_OVER_Q: Real = BOLTZMANN / CHARGE;
-/// C `CONSTCtoK`.
-pub(super) const CELSIUS_TO_KELVIN: Real = 273.15;
-/// C `REFTEMP` (27 degrees Celsius).
-pub(super) const REFTEMP: Real = 27. + CELSIUS_TO_KELVIN;
+pub(super) use crate::devices::nonlinear::thermal::{
+    CELSIUS_TO_KELVIN, CHARGE, K_OVER_Q, band_gap,
+};
 /// Vacuum permittivity as written in `mos1temp.c` (F/m).
 pub(super) const EPSILON_0: Real = 8.854_214_871e-12;
 /// C `MAX_EXP_ARG`: junction exponent clamp of `mos1load.c`.
@@ -119,7 +116,7 @@ const MEYER_MIN_VDSAT: Real = 0.025;
 
 /// Slots of the state vector: C's `MOS1numStates` layout (reordered so that
 /// every charge is directly followed by its derivative, as
-/// [`junction_companion`] expects), followed by the instance quantities C
+/// the charge-branch integrator expects), followed by the instance quantities C
 /// keeps in `MOS1instance` between loads. All values are device-frame
 /// (multiplied by the type), as in C.
 pub(super) mod slot {
@@ -200,20 +197,6 @@ pub(super) fn aliased(values: &ScalarValues, names: [&str; 2]) -> Option<Real> {
         .filter_map(|name| values.get(name))
         .max_by_key(|v| v.location.as_ref().map(|l| (l.line, l.column)))
         .map(|v| v.value)
-}
-
-/// Band gap of silicon at `kelvin` (`mos1temp.c`, `mos3temp.c`).
-pub(super) fn band_gap(kelvin: Real) -> Real {
-    1.16 - (7.02e-4 * kelvin * kelvin) / (kelvin + 1108.)
-}
-
-/// The `pbfact` potential correction of `mos1temp.c`/`mos3temp.c` at
-/// `kelvin`.
-pub(super) fn potential_factor(kelvin: Real) -> Real {
-    let vt = kelvin * K_OVER_Q;
-    let kt = BOLTZMANN * kelvin;
-    let arg = -band_gap(kelvin) / (kt + kt) + 1.115_087_7 / (BOLTZMANN * (REFTEMP + REFTEMP));
-    -2. * vt * (1.5 * (kelvin / REFTEMP).ln() + CHARGE * arg)
 }
 
 /// Model setters every classic level shares, read from the level's own
@@ -476,13 +459,8 @@ impl Junction {
             match self.reverse {
                 ReverseLaw::Constant => (gmin * v - self.saturation, gmin),
                 ReverseLaw::Cubic => {
-                    // C `CONSTe` is exp(1.0).
-                    let arg = 3. * vt / (v * std::f64::consts::E);
-                    let arg = arg * arg * arg;
-                    (
-                        -self.saturation * (1. + arg) + gmin * v,
-                        self.saturation * 3. * arg / v + gmin,
-                    )
+                    let (current, conductance) = cubic_reverse_junction(v, vt, self.saturation);
+                    (current + gmin * v, conductance + gmin)
                 }
             }
         } else {
@@ -605,6 +583,31 @@ pub(super) struct NoiseShape {
     pub(super) cox_squared: Real,
 }
 
+/// Where the reference device applies instance multiplicity. MOS6 keeps
+/// intrinsic state per unit device and multiplies completed matrix/RHS
+/// terms, unlike MOS1/2/3/9, which scale the operating parameters.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Multiplicity {
+    Embedded,
+    Stamp,
+}
+
+impl Multiplicity {
+    const fn storage(self, m: Real) -> Real {
+        match self {
+            Self::Embedded => m,
+            Self::Stamp => 1.,
+        }
+    }
+
+    const fn stamp(self, m: Real) -> Real {
+        match self {
+            Self::Embedded => 1.,
+            Self::Stamp => m,
+        }
+    }
+}
+
 /// What a MOS level supplies to the shared shell. See the module
 /// documentation.
 pub(super) trait MosLevel: std::fmt::Debug + Clone + Copy + Sized + 'static {
@@ -616,6 +619,8 @@ pub(super) trait MosLevel: std::fmt::Debug + Clone + Copy + Sized + 'static {
     const LABEL: &'static str;
     /// The C device type (`mos1`, `mos3`) for the setup/load order.
     const DEVICE_TYPE: CDeviceType;
+    /// Instance multiplicity placement in the reference load.
+    const MULTIPLICITY: Multiplicity = Multiplicity::Embedded;
     /// C's device type for the `.noise` visiting order, or `None` when C's
     /// level has no `mosXnoi.c` routine at all (level 6): `.noise` then
     /// refuses instead of returning zeros.
@@ -715,6 +720,18 @@ pub(super) trait MosLevel: std::fmt::Debug + Clone + Copy + Sized + 'static {
         vbx: Real,
     ) -> DrainCurrent;
 
+    /// The channel Jacobian C actually stamps, where it deliberately differs
+    /// from the mathematical derivative. Most levels have one formulation.
+    fn reference_drain_current(
+        &self,
+        op: &Operating<Self::Params>,
+        vgx: Real,
+        vdsm: Real,
+        vbx: Real,
+    ) -> DrainCurrent {
+        self.drain_current(op, vgx, vdsm, vbx)
+    }
+
     /// The `mosXnoi.c` beta, width, length and oxide capacitance factors, or
     /// `None` when C's level has no noise routine (level 6, see
     /// [`MosLevel::NOISE_FAMILY`]).
@@ -763,14 +780,6 @@ pub(super) trait MosLevel: std::fmt::Debug + Clone + Copy + Sized + 'static {
         _setters: &crate::devices::schema::ScalarValues,
     ) -> SpiceResult<()> {
         Ok(())
-    }
-
-    /// The `gmin` the bulk junctions add in a load. C's level 6
-    /// (`mos6load.c`) multiplies its whole stamp, `gmin` included, by `M`;
-    /// the other classic levels scale the currents and add `gmin` once (the
-    /// default).
-    fn junction_gmin(gmin: Real, _geometry: &Geometry) -> Real {
-        gmin
     }
 
     /// Refuses a small-signal (`"AC"`) or pole-zero (`"pole-zero"`) load the
@@ -922,10 +931,8 @@ pub(super) struct Mosfet<L: MosLevel> {
     pub(super) series: [Real; 2],
     /// `OFF` and `ICVDS`/`ICVGS`/`ICVBS` (C `MOS1off`, `MOS1icV*`).
     pub(super) initial: InstanceInitial,
-    /// The derivation at the first circuit and nominal temperature it was
-    /// asked for, which C's `MOSxtemp` computes once; it depends on nothing
-    /// else, so loads reuse it.
-    pub(super) derived: OnceCell<(Real, Real, Operating<L::Params>)>,
+    /// The most recent circuit/nominal temperature derivation.
+    pub(super) derived: TemperatureCache<Operating<L::Params>>,
 }
 
 impl<L: MosLevel> Mosfet<L> {
@@ -978,7 +985,7 @@ impl<L: MosLevel> Mosfet<L> {
             geometry,
             series,
             initial,
-            derived: OnceCell::new(),
+            derived: TemperatureCache::new(),
         };
         // Validate every derivation before interning nodes.
         device.operating(context)?;
@@ -1016,7 +1023,7 @@ impl<L: MosLevel> Mosfet<L> {
                 common.rd,
                 common.rsh,
                 geometry.nrd,
-                geometry.m,
+                L::MULTIPLICITY.storage(geometry.m),
                 "drain",
                 L::LABEL,
             )?,
@@ -1024,7 +1031,7 @@ impl<L: MosLevel> Mosfet<L> {
                 common.rs,
                 common.rsh,
                 geometry.nrs,
-                geometry.m,
+                L::MULTIPLICITY.storage(geometry.m),
                 "source",
                 L::LABEL,
             )?,
@@ -1033,37 +1040,27 @@ impl<L: MosLevel> Mosfet<L> {
 
     /// The temperature-, process- and geometry-dependent values of one load.
     pub(super) fn operating(&self, context: &ModelContext) -> SpiceResult<Operating<L::Params>> {
-        if let Some(op) = self.cached(context.temperature, context.nominal_temperature) {
-            return Ok(*op);
-        }
-        let op = self.model.operating(&self.name, &self.geometry, context)?;
-        let _ = self
-            .derived
-            .set((context.temperature, context.nominal_temperature, op));
-        Ok(op)
+        self.derived
+            .get_or_derive(TemperatureKey::context(context), || {
+                self.model.operating(&self.name, &self.geometry, context)
+            })
     }
 
-    /// The cached derivation when it was made at these circuit and nominal
-    /// temperatures.
-    #[inline]
-    fn cached(&self, temperature: Real, nominal: Real) -> Option<&Operating<L::Params>> {
-        self.derived
-            .get()
-            .filter(|(t, n, _)| {
-                t.to_bits() == temperature.to_bits() && n.to_bits() == nominal.to_bits()
-            })
-            .map(|(_, _, op)| op)
+    /// Borrow the cached derivation on the hot stamping path.
+    fn cached(&self, temperature: Real, nominal: Real) -> Option<Ref<'_, Operating<L::Params>>> {
+        self.derived.get(TemperatureKey::new(temperature, nominal))
     }
 
     /// `mos1load.c` from `vbd = vbs - vds` on, at the device-frame
     /// `[vbs, vgs, vds]`: junction currents with `gmin`, the level's
     /// channel, the depletion charges and `DEVqmeyer`, before any charge
     /// integration. Every expression keeps C's operation order.
-    pub(super) fn evaluate(
+    fn evaluate(
         &self,
         op: &Operating<L::Params>,
         [vbs, vgs, vds]: [Real; 3],
         gmin: Real,
+        reference_jacobian: bool,
     ) -> SpiceResult<Eval> {
         let vt = op.vt;
         let vbd = vbs - vds;
@@ -1073,6 +1070,9 @@ impl<L: MosLevel> Mosfet<L> {
         let (cbd, gbd) = op.drain.current(vbd, vt, gmin);
         let mode: Real = if vds >= 0. { 1. } else { -1. };
         let normal = mode == 1.;
+        let vgx = if normal { vgs } else { vgd };
+        let vdsm = vds * mode;
+        let vbx = if normal { vbs } else { vbd };
         let DrainCurrent {
             cdrain,
             gm,
@@ -1080,12 +1080,11 @@ impl<L: MosLevel> Mosfet<L> {
             gmbs,
             von,
             vdsat,
-        } = self.model.drain_current(
-            op,
-            if normal { vgs } else { vgd },
-            vds * mode,
-            if normal { vbs } else { vbd },
-        );
+        } = if reference_jacobian {
+            self.model.reference_drain_current(op, vgx, vdsm, vbx)
+        } else {
+            self.model.drain_current(op, vgx, vdsm, vbx)
+        };
         let (qbs, capbs) = op.source.charge(vbs, false);
         let (qbd, capbd) = op.drain.charge(vbd, true);
         let half = if normal {
@@ -1212,15 +1211,14 @@ impl<L: MosLevel> Mosfet<L> {
     ) -> ([Real; 3], Start, bool) {
         let pol = self.model.common().pol;
         let off = self.initial.off;
-        if states.initial_conditions() {
-            let v = if off { [0.; 3] } else { ic.map(|v| pol * v) };
-            return (v, Start::Conditions, true);
-        }
-        if !states.device_limiting() {
-            return (raw, Start::Exact, false);
-        }
-        match states.phase() {
-            IterationPhase::Junction => {
+        use limiting::Linearization;
+        match Linearization::classify(states) {
+            Linearization::InitialConditions => {
+                let v = if off { [0.; 3] } else { ic.map(|v| pol * v) };
+                return (v, Start::Conditions, true);
+            }
+            Linearization::Exact => return (raw, Start::Exact, false),
+            Linearization::Initial => {
                 let v = if off {
                     [0.; 3]
                 } else {
@@ -1231,29 +1229,21 @@ impl<L: MosLevel> Mosfet<L> {
                         v
                     }
                 };
-                (v, Start::Junction, true)
+                return (v, Start::Junction, true);
             }
+            // MOS retains DEVpred for both MODEINITTRAN and MODEINITPRED.
+            Linearization::InitialTransient | Linearization::Limited => {}
+        }
+        match states.phase() {
             IterationPhase::Fix if off => ([0.; 3], Start::HeldOff, true),
             IterationPhase::Predict => {
-                let accepted = |slot: usize| states.accepted(1, slot);
-                let predicted = |slot: usize| states.predicted(slot, xfact);
-                let (
-                    Some(vbs),
-                    Some(vgs),
-                    Some(vds),
-                    Some(old_vbs),
-                    Some(old_vgs),
-                    Some(old_vds),
-                    Some(von),
-                ) = (
-                    predicted(slot::VBS),
-                    predicted(slot::VGS),
-                    predicted(slot::VDS),
-                    accepted(slot::VBS),
-                    accepted(slot::VGS),
-                    accepted(slot::VDS),
-                    accepted(slot::VON),
-                )
+                let Some([vbs, vgs, vds]) =
+                    limiting::predicted_values(states, [slot::VBS, slot::VGS, slot::VDS], xfact)
+                else {
+                    return (raw, Start::Exact, false);
+                };
+                let Some([old_vbs, old_vgs, old_vds, von]) =
+                    limiting::previous_values(states, [slot::VBS, slot::VGS, slot::VDS, slot::VON])
                 else {
                     return (raw, Start::Exact, false);
                 };
@@ -1261,14 +1251,10 @@ impl<L: MosLevel> Mosfet<L> {
                 let (v, check) = self.limit(op, [vbs, vgs, vds], old, von);
                 (v, Start::Limited, check)
             }
-            IterationPhase::Fix | IterationPhase::Float => {
-                let previous = |slot: usize| states.iterate(slot).filter(|v| v.is_finite());
-                let (Some(old_vbs), Some(old_vbd), Some(old_vgs), Some(old_vds), Some(von)) = (
-                    previous(slot::VBS),
-                    previous(slot::VBD),
-                    previous(slot::VGS),
-                    previous(slot::VDS),
-                    previous(slot::VON),
+            _ => {
+                let Some([old_vbs, old_vbd, old_vgs, old_vds, von]) = limiting::previous_values(
+                    states,
+                    [slot::VBS, slot::VBD, slot::VGS, slot::VDS, slot::VON],
                 ) else {
                     return (raw, Start::Exact, false);
                 };
@@ -1318,7 +1304,7 @@ impl<L: MosLevel> Mosfet<L> {
         // DEVfetlim/DEVpnjlim/DEVlimvds leave an unchanged voltage alone
         // whatever `von` is.
         let (limited, _) = self.limit(op, raw, [vbs, vbs - vds, vgs, vds], 0.);
-        self.evaluate(op, limited, gmin)
+        self.evaluate(op, limited, gmin, false)
     }
 }
 
@@ -1559,17 +1545,13 @@ impl<L: MosLevel> Device for Mosfet<L> {
             geometry,
             series,
             initial,
-            derived: OnceCell::new(),
+            derived: TemperatureCache::new(),
         };
         device.operating(context)?;
         Ok(Box::new(device))
     }
     /// `MOS1load` (`mos1load.c`; `mos3load.c` for level 3), without bypass,
     /// which ngspice disables by default, and without `.sens` perturbation.
-    #[expect(
-        clippy::needless_range_loop,
-        reason = "index-based traversal preserves coupling of reference state vector positions"
-    )] // C's three gate charges, side by side.
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         if context.mode.is_ac() {
             return Err(SpiceError::circuit(format!(
@@ -1577,9 +1559,10 @@ impl<L: MosLevel> Device for Mosfet<L> {
                 L::LABEL
             )));
         }
+        let cached = self.cached(context.temperature, context.nominal_temperature);
         let fresh;
-        let op = if let Some(op) = self.cached(context.temperature, context.nominal_temperature) {
-            op
+        let op = if let Some(op) = &cached {
+            &**op
         } else {
             fresh = self.operating(&context.model_context())?;
             &fresh
@@ -1591,46 +1574,11 @@ impl<L: MosLevel> Device for Mosfet<L> {
             context.node_voltage(n)
         });
         let integration = context.integration;
-        let transient = integration.is_some();
-        let phase = context.states.phase();
         // C `xfact = CKTdelta / CKTdeltaOld[1]`; one in a `.dc` sweep.
         let xfact = integration.map_or(1., crate::maths::integrator::Coefficients::predictor_ratio);
         let (v, start, check) = self.select(op, &context.states, raw, ic, xfact);
-        let mut e = self.evaluate(op, v, L::junction_gmin(context.gmin, &self.geometry))?;
-        let states = &mut context.states;
-
-        // Bulk junction charges (C computes them in MODETRAN, MODETRANOP and
-        // MODEINITSMSIG; computing them in every load changes no stamp) and
-        // their NIintegrate companions folded into gbd/cbd/cd and gbs/cbs.
-        states.set(slot::QBD, e.qbd)?;
-        states.set(slot::QBS, e.qbs)?;
-        let mut ag0 = 0.;
-        if let Some(coefficients) = &integration {
-            ag0 = coefficients.ag()[0];
-            let companion = |context: &mut StampContext<'_>, charge, capacitance, slot| {
-                junction_companion(
-                    context,
-                    coefficients,
-                    JunctionPoint {
-                        current: 0.,
-                        conductance: 0.,
-                        charge,
-                        capacitance,
-                    },
-                    slot,
-                )
-            };
-            let (geq, ccap) = companion(context, e.qbd, e.capbd, slot::QBD)?;
-            e.gbd += geq;
-            e.cbd += ccap;
-            e.cd -= ccap;
-            let (geq, ccap) = companion(context, e.qbs, e.capbs, slot::QBS)?;
-            e.gbs += geq;
-            e.cbs += ccap;
-        } else {
-            context.states.set(slot::QBD + 1, 0.)?;
-            context.states.set(slot::QBS + 1, 0.)?;
-        }
+        let mut e = self.evaluate(op, v, context.gmin, context.states.c_jacobian())?;
+        charge::integrate_bulk(&mut e, &mut context.states, integration)?;
         let states = &mut context.states;
         // C: `if (off == 0 || !(MODEINITFIX | MODEINITSMSIG)) if (Check)
         // CKTnoncon++`; loads outside a limited solve never report.
@@ -1654,88 +1602,10 @@ impl<L: MosLevel> Device for Mosfet<L> {
             states.set(slot, value)?;
         }
 
-        // Meyer gate capacitances and charges.
-        let initial_transient =
-            transient && phase == IterationPhase::Predict && states.initial_transient();
-        let s1 = |states: &DeviceState<'_>, slot: usize| {
-            states.accepted(1, slot).ok_or_else(|| {
-                SpiceError::circuit(format!(
-                    "{}: missing accepted {} state",
-                    self.name,
-                    L::LABEL
-                ))
-            })
-        };
-        let gate = [e.vgs, e.vgd, e.vgb];
-        let mut cap = [0.; 3];
-        let mut charge = [0.; 3];
-        for k in 0..3 {
-            states.set(slot::CAPG[k], e.half[k])?;
-            cap[k] = if transient {
-                e.half[k] + s1(states, slot::CAPG[k])? + op.overlap[k]
-            } else {
-                2. * e.half[k] + op.overlap[k]
-            };
-        }
-        if transient && phase == IterationPhase::Predict {
-            for k in 0..3 {
-                charge[k] = states.predicted(slot::QG[k], xfact).ok_or_else(|| {
-                    SpiceError::circuit(format!(
-                        "{}: missing accepted {} charge",
-                        self.name,
-                        L::LABEL
-                    ))
-                })?;
-            }
-        } else if transient {
-            let vgs1 = s1(states, slot::VGS)?;
-            let gate1 = [
-                vgs1,
-                vgs1 - s1(states, slot::VDS)?,
-                vgs1 - s1(states, slot::VBS)?,
-            ];
-            for k in 0..3 {
-                charge[k] = (gate[k] - gate1[k]) * cap[k] + s1(states, slot::QG[k])?;
-            }
-        } else {
-            for k in 0..3 {
-                charge[k] = gate[k] * cap[k];
-            }
-        }
-        for k in 0..3 {
-            states.set(slot::QG[k], charge[k])?;
-        }
-        let mut gcg = [0.; 3];
-        let mut ceqg = [0.; 3];
-        match &integration {
-            Some(coefficients) if !initial_transient => {
-                for k in 0..3 {
-                    let (geq, ccap) = junction_companion(
-                        context,
-                        coefficients,
-                        JunctionPoint {
-                            current: 0.,
-                            conductance: 0.,
-                            charge: charge[k],
-                            capacitance: cap[k],
-                        },
-                        slot::QG[k],
-                    )?;
-                    gcg[k] = geq;
-                    ceqg[k] = ccap - ag0 * charge[k];
-                }
-                for k in 0..3 {
-                    ceqg[k] = ceqg[k] - gcg[k] * gate[k] + ag0 * charge[k];
-                }
-            }
-            _ => {
-                for k in 0..3 {
-                    context.states.set(slot::QG[k] + 1, 0.)?;
-                }
-            }
-        }
-        let [gcgs, gcgd, gcgb] = gcg;
-        let [ceqgs, ceqgd, ceqgb] = ceqg;
+        let charge::GateCompanions {
+            conductance: [gcgs, gcgd, gcgb],
+            equivalent: [ceqgs, ceqgd, ceqgb],
+        } = charge::integrate_gates(&e, op.overlap, states, integration, &self.name, L::LABEL)?;
 
         // What MOS1convTest and the small-signal loads read (C `here`).
         for (slot, value) in [
@@ -1755,6 +1625,7 @@ impl<L: MosLevel> Device for Mosfet<L> {
 
         // Current vector and Y matrix, in mos1load.c's order and arithmetic.
         let t = pol;
+        let m = L::MULTIPLICITY.stamp(self.geometry.m);
         let ceqbs = t * (e.cbs - e.gbs * e.vbs);
         let ceqbd = t * (e.cbd - e.gbd * e.vbd);
         let (xnrm, xrev, cdreq) = if e.mode >= 0. {
@@ -1779,34 +1650,37 @@ impl<L: MosLevel> Device for Mosfet<L> {
         let [dp, _, sp, _] = self.inner;
         let [gdr, gsr] = self.series;
         let (gm, gds, gmbs, gbd, gbs) = (e.gm, e.gds, e.gmbs, e.gbd, e.gbs);
-        context.stamp_rhs(g, -(t * (ceqgs + ceqgb + ceqgd)))?;
-        context.stamp_rhs(b, -(ceqbs + ceqbd - t * ceqgb))?;
-        context.stamp_rhs(dp, ceqbd - cdreq + t * ceqgd)?;
-        context.stamp_rhs(sp, cdreq + ceqbs + t * ceqgs)?;
-        context.stamp_fixed([
-            (d, d, gdr),
-            (g, g, gcgd + gcgs + gcgb),
-            (s, s, gsr),
-            (b, b, gbd + gbs + gcgb),
-            (dp, dp, gdr + gds + gbd + xrev * (gm + gmbs) + gcgd),
-            (sp, sp, gsr + gds + gbs + xnrm * (gm + gmbs) + gcgs),
-            (d, dp, -gdr),
-            (g, b, -gcgb),
-            (g, dp, -gcgd),
-            (g, sp, -gcgs),
-            (s, sp, -gsr),
-            (b, g, -gcgb),
-            (b, dp, -gbd),
-            (b, sp, -gbs),
-            (dp, d, -gdr),
-            (dp, g, (xnrm - xrev) * gm - gcgd),
-            (dp, b, -gbd + (xnrm - xrev) * gmbs),
-            (dp, sp, -gds - xnrm * (gm + gmbs)),
-            (sp, g, -(xnrm - xrev) * gm - gcgs),
-            (sp, s, -gsr),
-            (sp, b, -gbs - (xnrm - xrev) * gmbs),
-            (sp, dp, -gds - xrev * (gm + gmbs)),
-        ])?;
+        context.stamp_rhs(g, -(m * (t * (ceqgs + ceqgb + ceqgd))))?;
+        context.stamp_rhs(b, -(m * (ceqbs + ceqbd - t * ceqgb)))?;
+        context.stamp_rhs(dp, m * (ceqbd - cdreq + t * ceqgd))?;
+        context.stamp_rhs(sp, m * (cdreq + ceqbs + t * ceqgs))?;
+        context.stamp_fixed(
+            [
+                (d, d, gdr),
+                (g, g, gcgd + gcgs + gcgb),
+                (s, s, gsr),
+                (b, b, gbd + gbs + gcgb),
+                (dp, dp, gdr + gds + gbd + xrev * (gm + gmbs) + gcgd),
+                (sp, sp, gsr + gds + gbs + xnrm * (gm + gmbs) + gcgs),
+                (d, dp, -gdr),
+                (g, b, -gcgb),
+                (g, dp, -gcgd),
+                (g, sp, -gcgs),
+                (s, sp, -gsr),
+                (b, g, -gcgb),
+                (b, dp, -gbd),
+                (b, sp, -gbs),
+                (dp, d, -gdr),
+                (dp, g, (xnrm - xrev) * gm - gcgd),
+                (dp, b, -gbd + (xnrm - xrev) * gmbs),
+                (dp, sp, -gds - xnrm * (gm + gmbs)),
+                (sp, g, -(xnrm - xrev) * gm - gcgs),
+                (sp, s, -gsr),
+                (sp, b, -gbs - (xnrm - xrev) * gmbs),
+                (sp, dp, -gds - xrev * (gm + gmbs)),
+            ]
+            .map(|(r, c, value)| (r, c, m * value)),
+        )?;
         Ok(())
     }
     /// `MOS1convTest` (`mos1conv.c`, equal to `mos3conv.c`): the drain and
@@ -1869,14 +1743,11 @@ impl<L: MosLevel> Device for Mosfet<L> {
         if context.states.is_some() {
             L::small_signal(self, "AC")?;
         }
+        let m = L::MULTIPLICITY.stamp(self.geometry.m);
         let op = self.operating(context.model_context)?;
         let unknowns = context.unknowns;
         let voltage = |n: NodeId| unknowns.node_row(n).and_then(|r| bias.get(r)).unwrap_or(0.);
-        let e = self.small_signal_eval(
-            &op,
-            voltage,
-            L::junction_gmin(context.model_context.gmin, &self.geometry),
-        )?;
+        let e = self.small_signal_eval(&op, voltage, context.model_context.gmin)?;
         let cap: [Real; 3] = std::array::from_fn(|k| e.half[k] + e.half[k] + op.overlap[k]);
         let [capgs, capgd, capgb] = cap;
         let (xnrm, xrev) = if e.mode < 0. { (0., 1.) } else { (1., 0.) };
@@ -1906,7 +1777,7 @@ impl<L: MosLevel> Device for Mosfet<L> {
             (sp, g, &[-capgs][..]),
             (sp, b, &[-capbs][..]),
         ] {
-            context.dynamic_sum(row, col, terms)?;
+            context.scaled_dynamic_sum(row, col, terms, m)?;
         }
         for (row, col, value) in [
             (d, d, gdr),
@@ -1928,7 +1799,7 @@ impl<L: MosLevel> Device for Mosfet<L> {
             (sp, dp, -(gds + xrev * (gm + gmbs))),
         ] {
             if let (Some(r), Some(c)) = (unknowns.node_row(row), unknowns.node_row(col)) {
-                context.system.a.add(r, c, value)?;
+                context.system.a.add(r, c, m * value)?;
             }
         }
         Ok(())

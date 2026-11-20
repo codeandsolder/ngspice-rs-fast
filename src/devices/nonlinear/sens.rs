@@ -14,6 +14,7 @@
 //! `1e-14`: perturbing it turns the recombination current on, and restoring
 //! it leaves it on for every later parameter of the model).
 
+use super::thermal::TemperatureCache;
 use super::{Diode, DiodeParameters, EPSMIN};
 use crate::devices::sensitivity::{
     AcReset, CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, RecordPair, ResetStamp,
@@ -547,6 +548,7 @@ impl DiodeSensitivity<'_> {
             terminals: self.diode.terminals.clone(),
             junction: self.diode.junction,
             parameters,
+            derived: TemperatureCache::new(),
             initial: self.diode.initial.clone(),
             location: self.diode.location.clone(),
             written: self.diode.written.clone(),
@@ -591,13 +593,12 @@ impl Device for ResetDiode {
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         let model = context.model_context;
         let gspr = if self.current.parameters.rs > 0. {
-            self.current.parameters.thermal(model)?.conductance
+            self.current.thermal(model)?.conductance
         } else {
             0.
         };
         let geq = self
             .state
-            .parameters
             .thermal(model)?
             .point_unchecked(0., model.gmin)?
             .ac_conductance;

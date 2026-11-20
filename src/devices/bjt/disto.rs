@@ -374,11 +374,11 @@ impl Bjt {
             d
         };
         let czbe = t.cje * self.instance.area * m;
-        let (pe, xme) = (t.vje, t.mje);
-        let (capbe2, capbe3) = if vbe < t.fc_vje {
+        let (pe, xme) = (t.be.potential, t.be.grading);
+        let (capbe2, capbe3) = if vbe < t.be.threshold {
             depletion(czbe, pe, xme, vbe)
         } else {
-            (0.5 * xme * (czbe / t.f2) / pe, 0.)
+            (0.5 * xme * (czbe / t.be.f2) / pe, 0.)
         };
         d_qbe.d2_p2 += capbe2 * 2.;
         d_qbe.d3_p3 += capbe3 * 6.;
@@ -387,12 +387,12 @@ impl Bjt {
         let ctot = t.cjc * m;
         let czbc = ctot * t.xcjc;
         let czbx = ctot - czbc;
-        let (pc, xmc) = (t.vjc, t.mjc);
+        let (pc, xmc) = (t.bc.potential, t.bc.grading);
         let collector = |cz: Real, v: Real| {
-            if v < t.fc_vjc {
+            if v < t.bc.threshold {
                 depletion(cz, pc, xmc, v)
             } else {
-                (0.5 * xmc * (cz / t.f6) / pc, 0.)
+                (0.5 * xmc * (cz / t.bc.f2) / pc, 0.)
             }
         };
         let (capbc2, capbc3) = collector(czbc, vbc);

@@ -13,13 +13,10 @@
 //! - `bjt/bjtacld.c`: the small-signal stamp.
 //! - `bjt/bjttrunc.c`: charges taking part in truncation-error control.
 //!
-//! The Newton load stamps the *exact* Jacobian of the C equations, including
-//! the bias dependence of the base resistance. C's `bjtload.c` stamps only the
-//! conductance `gx` there; both iterations share the same fixed point.
-//! [`Device::assemble_small_signal`] deliberately reproduces C's AC stamp,
-//! which omits the `d(gx)/dV` terms, because that is what `.ac` computes; a
-//! load whose trial asks for C's matrix
-//! ([`crate::devices::DeviceState::c_jacobian`], used by `.tf`) omits them too.
+//! DC/transient Newton and AC loads retain the actual C matrix. The
+//! bias-dependent base resistance is stamped as conductance `gx` alone,
+//! without the `d(gx)/dV` terms of the mathematical Jacobian; the residual
+//! and fixed point of the Gummel-Poon equations are unchanged.
 //!
 //! Not ported, and rejected with [`SpiceError::NotYetPorted`]: excess phase
 //! (`PTF` with `TF != 0`), Kull's quasi-saturation model (`RCO`, `VO`, `GAMMA`,
@@ -68,6 +65,14 @@ use crate::devices::limiting::{self, Limiter, Linearization};
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
+use crate::devices::nonlinear::charge::ChargeBranch;
+use crate::devices::nonlinear::thermal::{
+    BOLTZMANN, CELSIUS_TO_KELVIN, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureCache,
+    TemperatureKey, band_gap, potential_shift,
+};
+use crate::devices::nonlinear::{
+    DepletionLaw, cubic_reverse_junction, exponential_junction, reverse_depletion,
+};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -82,16 +87,6 @@ use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
 
-/// ngspice `CONSTboltz`.
-const BOLTZMANN: Real = 1.380_648_52e-23;
-/// ngspice `CHARGE`.
-const CHARGE: Real = 1.602_176_620_8e-19;
-/// ngspice `CONSTKoverQ`.
-const K_OVER_Q: Real = BOLTZMANN / CHARGE;
-/// ngspice `REFTEMP` (27 C in kelvin).
-const REFTEMP: Real = 27. + CELSIUS_TO_KELVIN;
-/// ngspice `CONSTCtoK`.
-const CELSIUS_TO_KELVIN: Real = 273.15;
 /// ngspice `MAX_EXP_ARG`, the substrate exponential clamp of `bjtload.c`.
 const MAX_EXP_ARG: Real = 709.;
 
@@ -575,31 +570,21 @@ struct Thermal {
     vtf_factor: Real,
     itf: Real,
     cje: Real,
-    vje: Real,
-    mje: Real,
+    be: DepletionLaw,
     cjc: Real,
-    vjc: Real,
-    mjc: Real,
+    bc: DepletionLaw,
     xcjc: Real,
     cjs: Real,
     vjs: Real,
     mjs: Real,
-    fc_vje: Real,
-    fc_vjc: Real,
-    f1: Real,
-    f2: Real,
-    f3: Real,
-    f5: Real,
-    f6: Real,
-    f7: Real,
 }
 
 /// `bjttemp.c`'s silicon band-gap built-in-potential shift `pbfact` at `t`.
 fn pbfact(t: Real) -> Real {
     let vt = K_OVER_Q * t;
-    let egfet = 1.16 - (7.02e-4 * t * t) / (t + 1108.);
+    let egfet = band_gap(t);
     let arg = -egfet / (2. * BOLTZMANN * t) + 1.115_087_7 / (BOLTZMANN * (REFTEMP + REFTEMP));
-    -2. * vt * (1.5 * (t / REFTEMP).ln() + CHARGE * arg)
+    potential_shift(vt, t / REFTEMP, arg)
 }
 
 impl Model {
@@ -634,10 +619,8 @@ impl Model {
         };
         let dt = t - tnom;
         let vt = t * K_OVER_Q;
-        let fact1 = tnom / REFTEMP;
-        let fact2 = t / REFTEMP;
-        let pbfact1 = pbfact(tnom);
-        let pbfact = pbfact(t);
+        let nominal = PotentialTemperature::new(tnom, pbfact(tnom));
+        let actual = PotentialTemperature::new(t, pbfact(t));
         let ratlog = (t / tnom).ln();
         let ratio1 = t / tnom - 1.;
         let factlog = ratio1 * self.eg / vt + self.xti * ratlog;
@@ -709,19 +692,15 @@ impl Model {
             if self.tlevc == 1 {
                 (cap * (1. + ct * dt), pot - tv * dt)
             } else {
-                let pbo = (pot - pbfact1) / fact1;
-                let gmaold = (pot - pbo) / pbo;
-                let mut cap = cap / (1. + m * (4e-4 * (tnom - REFTEMP) - gmaold));
-                let pot = fact2 * pbo + pbfact;
-                let gmanew = (pot - pbo) / pbo;
-                cap *= 1. + m * (4e-4 * (t - REFTEMP) - gmanew);
-                (cap, pot)
+                let correction = actual.junction(&nominal, pot);
+                let mut cap = cap / correction.nominal_denominator(m);
+                cap *= correction.actual_factor(m);
+                (cap, correction.potential)
             }
         };
         let (cje, vje) = junction(self.cje, self.vje, mje, self.cte, self.tvje);
         let (cjc, vjc) = junction(self.cjc, self.vjc, mjc, self.ctc, self.tvjc);
         let (cjs, vjs) = junction(self.cjs, self.vjs, mjs, self.cts, self.tvjs);
-        let xfc = (1. - self.fc).ln();
         let thermal = Thermal {
             vt,
             is,
@@ -757,23 +736,13 @@ impl Model {
             },
             itf: self.itf * poly(self.titf, dt) * area,
             cje: cje * area,
-            vje,
-            mje,
+            be: DepletionLaw::new(vje, mje, self.fc),
             cjc: cjc * bc_area,
-            vjc,
-            mjc,
+            bc: DepletionLaw::new(vjc, mjc, self.fc),
             xcjc: self.xcjc,
             cjs: cjs * sub_area,
             vjs,
             mjs,
-            fc_vje: self.fc * vje,
-            fc_vjc: self.fc * vjc,
-            f1: vje * (1. - ((1. - mje) * xfc).exp()) / (1. - mje),
-            f2: ((1. + mje) * xfc).exp(),
-            f3: 1. - self.fc * (1. + mje),
-            f5: vjc * (1. - ((1. - mjc) * xfc).exp()) / (1. - mjc),
-            f6: ((1. + mjc) * xfc).exp(),
-            f7: 1. - self.fc * (1. + mjc),
         };
         thermal.validate()?;
         Ok(thermal)
@@ -835,21 +804,28 @@ impl Thermal {
             self.tr,
             self.itf,
             self.cje,
-            self.vje,
+            self.be.potential,
             self.cjc,
-            self.vjc,
+            self.bc.potential,
             self.cjs,
             self.vjs,
-            self.f1,
-            self.f2,
-            self.f3,
-            self.f5,
-            self.f6,
-            self.f7,
+            self.be.f1,
+            self.be.f2,
+            self.be.f3,
+            self.bc.f1,
+            self.bc.f2,
+            self.bc.f3,
         ];
         if values.iter().any(|v| !v.is_finite())
             || [
-                self.nf, self.nr, self.ne, self.nc, self.ns, self.vje, self.vjc, self.vjs,
+                self.nf,
+                self.nr,
+                self.ne,
+                self.nc,
+                self.ns,
+                self.be.potential,
+                self.bc.potential,
+                self.vjs,
             ]
             .iter()
             .any(|v| *v <= 0.)
@@ -907,6 +883,7 @@ pub struct Bjt {
     subs: Real,
     model: Model,
     instance: Instance,
+    derived: TemperatureCache<Thermal>,
     /// `OFF` and `ICVBE`/`ICVCE` (C `BJToff`, `BJTicVBE`, `BJTicVCE`).
     initial: crate::devices::initial::InstanceInitial,
 }
@@ -1041,12 +1018,16 @@ impl Bjt {
             subs,
             model: parameters,
             instance,
+            derived: TemperatureCache::from_value(TemperatureKey::context(context), thermal),
             initial,
         }))
     }
 
     fn thermal(&self, context: &ModelContext) -> SpiceResult<Thermal> {
-        self.model.thermal(&self.instance, self.subs > 0., context)
+        self.derived
+            .get_or_derive(TemperatureKey::context(context), || {
+                self.model.thermal(&self.instance, self.subs > 0., context)
+            })
     }
 
     /// `bjtload.c`'s `uic` initial bias (`MODEINITJCT` under `MODETRANOP |
@@ -1131,17 +1112,13 @@ impl Bjt {
                 let (mut vbe, mut vbc, vbx, mut vsub) =
                     if states.phase() == crate::devices::IterationPhase::Predict {
                         let xfact = context.integration.map_or(1., |c| c.predictor_ratio());
-                        let pred = |slot| {
-                            states
-                                .predicted(slot, xfact)
-                                .ok_or_else(|| SpiceError::circuit("missing accepted BJT voltages"))
-                        };
-                        (
-                            pred(slot::VBE)?,
-                            pred(slot::VBC)?,
-                            pred(slot::VBX)?,
-                            pred(slot::VSUB)?,
+                        let [vbe, vbc, vbx, vsub] = limiting::predicted_values(
+                            states,
+                            [slot::VBE, slot::VBC, slot::VBX, slot::VSUB],
+                            xfact,
                         )
+                        .ok_or_else(|| SpiceError::circuit("missing accepted BJT voltages"))?;
+                        (vbe, vbc, vbx, vsub)
                     } else {
                         (raw.vbe, raw.vbc, raw.vbx, raw.vsub)
                     };
@@ -1192,42 +1169,9 @@ struct Point {
 /// below `-3 vtn`, in C's arithmetic.
 fn c_junction(v: Real, vtn: Real, is: Real) -> (Real, Real) {
     if v >= -3. * vtn {
-        let ev = (v / vtn).exp();
-        (is * (ev - 1.), is * ev / vtn)
+        exponential_junction(v, vtn, is)
     } else {
-        let mut arg = 3. * vtn / (v * std::f64::consts::E);
-        arg = arg * arg * arg;
-        (-is * (1. + arg), is * 3. * arg / v)
-    }
-}
-
-/// `bjtload.c`'s depletion charge and capacitance of a junction with zero-bias
-/// capacitance `cz`, potential `p`, grading `xm`, linearized above `fcp` with
-/// `bjttemp.c`'s `f1`/`f2`/`f3` (`tf1..3` for BE, `tf5..7` for BC and BX).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "keeps the positional interface explicit at the reference solver or device boundary"
-)]
-fn c_depletion(
-    v: Real,
-    cz: Real,
-    p: Real,
-    xm: Real,
-    fcp: Real,
-    f1: Real,
-    f2: Real,
-    f3: Real,
-) -> (Real, Real) {
-    if v < fcp {
-        let arg = 1. - v / p;
-        let sarg = (-xm * arg.ln()).exp();
-        (p * cz * (1. - arg * sarg) / (1. - xm), cz * sarg)
-    } else {
-        let czf2 = cz / f2;
-        (
-            cz * f1 + czf2 * (f3 * (v - fcp) + (xm / (p + p)) * (v * v - fcp * fcp)),
-            czf2 * (f3 + xm * v / p),
-        )
+        cubic_reverse_junction(v, vtn, is)
     }
 }
 
@@ -1272,12 +1216,8 @@ fn c_point(
         Some(iss) => {
             let vts = vt * t.ns;
             if vsub <= -3. * vts {
-                let mut arg = 3. * vts / (vsub * std::f64::consts::E);
-                arg = arg * arg * arg;
-                (
-                    iss * 3. * arg / vsub + gmin,
-                    -iss * (1. + arg) + gmin * vsub,
-                )
+                let (current, conductance) = cubic_reverse_junction(vsub, vts, iss);
+                (conductance + gmin, current + gmin * vsub)
             } else {
                 let evsub = (vsub / vts).min(MAX_EXP_ARG).exp();
                 (iss * evsub / vts + gmin, iss * (evsub - 1.) + gmin * vsub)
@@ -1343,14 +1283,9 @@ fn c_point(
     let tf = t.tf;
     let tr = t.tr;
     let czbe = t.cje;
-    let pe = t.vje;
-    let xme = t.mje;
     let ctot = t.cjc;
     let czbc = ctot * t.xcjc;
     let czbx = ctot - czbc;
-    let pc = t.vjc;
-    let xmc = t.mjc;
-    let fcpe = t.fc_vje;
     let czsub = t.cjs;
     let ps = t.vjs;
     let xms = t.mjs;
@@ -1379,44 +1314,11 @@ fn c_point(
         gbe = (gbe * (1. + arg2) - cbe * dqbdve) / qb;
         geqcb = tf * (arg3 - cbe * dqbdvc) / qb;
     }
-    let (qbe, capbe) = if vbe < fcpe {
-        let arg = 1. - vbe / pe;
-        let sarg = (-xme * arg.ln()).exp();
-        (
-            tf * cbe + pe * czbe * (1. - arg * sarg) / (1. - xme),
-            tf * gbe + czbe * sarg,
-        )
-    } else {
-        let czbef2 = czbe / t.f2;
-        (
-            tf * cbe
-                + czbe * t.f1
-                + czbef2 * (t.f3 * (vbe - fcpe) + (xme / (pe + pe)) * (vbe * vbe - fcpe * fcpe)),
-            tf * gbe + czbef2 * (t.f3 + xme * vbe / pe),
-        )
-    };
-    let fcpc = t.fc_vjc;
-    let (qbc, capbc) = if vbc < fcpc {
-        let arg = 1. - vbc / pc;
-        let sarg = (-xmc * arg.ln()).exp();
-        (
-            tr * cbc + pc * czbc * (1. - arg * sarg) / (1. - xmc),
-            tr * gbc + czbc * sarg,
-        )
-    } else {
-        let czbcf2 = czbc / t.f6;
-        (
-            tr * cbc
-                + czbc * t.f5
-                + czbcf2 * (t.f7 * (vbc - fcpc) + (xmc / (pc + pc)) * (vbc * vbc - fcpc * fcpc)),
-            tr * gbc + czbcf2 * (t.f7 + xmc * vbc / pc),
-        )
-    };
-    let (qbx, capbx) = c_depletion(vbx, czbx, pc, xmc, fcpc, t.f5, t.f6, t.f7);
+    let (qbe, capbe) = t.be.charge(vbe, czbe, Some((tf * cbe, tf * gbe)));
+    let (qbc, capbc) = t.bc.charge(vbc, czbc, Some((tr * cbc, tr * gbc)));
+    let (qbx, capbx) = t.bc.charge(vbx, czbx, None);
     let (qsub, capsub) = if vsub < 0. {
-        let arg = 1. - vsub / ps;
-        let sarg = (-xms * arg.ln()).exp();
-        (ps * czsub * (1. - arg * sarg) / (1. - xms), czsub * sarg)
+        reverse_depletion(vsub, czsub, ps, xms)
     } else {
         (
             vsub * czsub * (1. + xms * vsub / (2. * ps)),
@@ -1458,27 +1360,6 @@ fn c_point(
     Ok(point)
 }
 
-/// The `NIintegrate` companion of the charge in `slot` with capacitance
-/// `cap`: `(geq, ccap)`, `ccap` stored in `slot + 1` (C `CKTstate0[q + 1]`).
-fn integrate(
-    context: &mut StampContext<'_>,
-    coefficients: &crate::maths::integrator::Coefficients,
-    charge: Real,
-    cap: Real,
-    slot: usize,
-) -> SpiceResult<(Real, Real)> {
-    crate::devices::nonlinear::junction_companion(
-        context,
-        coefficients,
-        crate::devices::nonlinear::JunctionPoint {
-            current: 0.,
-            conductance: 0.,
-            charge,
-            capacitance: cap,
-        },
-        slot,
-    )
-}
 impl Device for Bjt {
     /// `bjtsetup.c` without quasi-saturation (`RCO`, which the port rejects),
     /// so `collCX` is the collector prime; a three-terminal device's
@@ -1670,6 +1551,7 @@ impl Device for Bjt {
             subs: self.subs,
             model: self.model,
             instance,
+            derived: TemperatureCache::new(),
             initial,
         };
         c_point(&device.thermal(context)?, 0., 0., 0., 0., context.gmin)?;
@@ -1715,6 +1597,10 @@ impl Device for Bjt {
             let cbhat = cb + gpi * delvbe + gmu * delvbc;
             limiter.test_held(&context.states, &[(cc, cchat), (cb, cbhat)]);
         }
+        let be = ChargeBranch::new(slot::QBE, p.qbe, p.capbe);
+        let bc = ChargeBranch::new(slot::QBC, p.qbc, p.capbc);
+        let bx = ChargeBranch::new(slot::QBX, p.qbx, p.capbx);
+        let sub = ChargeBranch::new(slot::QSUB, p.qsub, p.capsub);
         let mut geqcb = 0.;
         let (mut gcsub, mut geqbx) = (0., 0.);
         let (cqsub, cqbx);
@@ -1730,28 +1616,29 @@ impl Device for Bjt {
             let initial = context.states.phase() == crate::devices::IterationPhase::Predict
                 && context.states.initial_transient();
             if initial {
-                context.states.patch_state1(slot::QBE, p.qbe)?;
-                context.states.patch_state1(slot::QBC, p.qbc)?;
-                context.states.patch_state1(slot::QBX, p.qbx)?;
-                context.states.patch_state1(slot::QSUB, p.qsub)?;
+                for branch in [be, bc, bx, sub] {
+                    branch.seed(&mut context.states)?;
+                }
             }
-            let (geq, cqbe) = integrate(context, coefficients, p.qbe, p.capbe, slot::QBE)?;
+            let be_comp = be.integrate(&mut context.states, coefficients)?;
             geqcb = p.geqcb * coefficients.ag()[0];
-            gpi += geq;
-            cb += cqbe;
-            let (geq, cqbc) = integrate(context, coefficients, p.qbc, p.capbc, slot::QBC)?;
-            gmu += geq;
-            cb += cqbc;
-            cc -= cqbc;
+            gpi += be_comp.conductance;
+            cb += be_comp.derivative;
+            let bc_comp = bc.integrate(&mut context.states, coefficients)?;
+            gmu += bc_comp.conductance;
+            cb += bc_comp.derivative;
+            cc -= bc_comp.derivative;
             if initial {
-                context.states.patch_state1(slot::QBE + 1, cqbe)?;
-                context.states.patch_state1(slot::QBC + 1, cqbc)?;
+                be.seed_derivative(&mut context.states, be_comp.derivative)?;
+                bc.seed_derivative(&mut context.states, bc_comp.derivative)?;
             }
-            (gcsub, cqsub) = integrate(context, coefficients, p.qsub, p.capsub, slot::QSUB)?;
-            (geqbx, cqbx) = integrate(context, coefficients, p.qbx, p.capbx, slot::QBX)?;
+            let sub_comp = sub.integrate(&mut context.states, coefficients)?;
+            (gcsub, cqsub) = (sub_comp.conductance, sub_comp.derivative);
+            let bx_comp = bx.integrate(&mut context.states, coefficients)?;
+            (geqbx, cqbx) = (bx_comp.conductance, bx_comp.derivative);
             if initial {
-                context.states.patch_state1(slot::QBX + 1, cqbx)?;
-                context.states.patch_state1(slot::QSUB + 1, cqsub)?;
+                bx.seed_derivative(&mut context.states, cqbx)?;
+                sub.seed_derivative(&mut context.states, cqsub)?;
             }
         } else {
             if context.mode.is_transient() {
@@ -1759,31 +1646,18 @@ impl Device for Bjt {
                     "BJT transient needs companion integration",
                 ));
             }
-            for charge in [slot::QBE, slot::QBC] {
-                context.states.set(charge + 1, 0.)?;
+            for branch in [be, bc] {
+                branch.zero_derivative(&mut context.states)?;
             }
             // C never writes `cqsub`/`cqbx` outside transient and
             // `MODEINITSMSIG`, yet reads them into `ceqsub`/`ceqbx`: a DC load
             // after a small-signal analysis of the same deck sees the
             // capacitances that analysis stored there.
-            for charge in [slot::QSUB, slot::QBX] {
-                let held = context
-                    .states
-                    .iterate(charge + 1)
-                    .or_else(|| context.states.carried(charge + 1))
-                    .unwrap_or(0.);
-                context.states.set(charge + 1, held)?;
-            }
-            cqsub = context.states.trial(slot::QSUB + 1).unwrap_or(0.);
-            cqbx = context.states.trial(slot::QBX + 1).unwrap_or(0.);
+            cqsub = sub.retain_derivative(&mut context.states)?;
+            cqbx = bx.retain_derivative(&mut context.states)?;
         }
-        for (charge, value) in [
-            (slot::QBE, p.qbe),
-            (slot::QBC, p.qbc),
-            (slot::QSUB, p.qsub),
-            (slot::QBX, p.qbx),
-        ] {
-            context.states.set(charge, value)?;
+        for branch in [be, bc, bx, sub] {
+            branch.store(&mut context.states)?;
         }
         // Load the current excitation vector and the matrix.
         let m = self.instance.multiplier;
@@ -1814,7 +1688,7 @@ impl Device for Bjt {
         context.stamp_rhs(bp, m * (-ceqbe - ceqbc))?;
         context.stamp_rhs(ep, m * (ceqbe))?;
         context.stamp_rhs(s, m * (-ceqsub))?;
-        for (row, col, value) in [
+        context.stamp_fixed([
             (c, c, m * (gcpr)),
             (b, b, m * (gx + geqbx)),
             (e, e, m * (gepr)),
@@ -1840,9 +1714,7 @@ impl Device for Bjt {
             (s, sc, m * (-geqsub)),
             (b, cp, m * (-geqbx)),
             (cp, b, m * (-geqbx)),
-        ] {
-            context.stamp(row, col, value)?;
-        }
+        ])?;
         limiter.finish(
             &mut context.states,
             &[
@@ -2657,6 +2529,7 @@ impl BjtSensitivity<'_> {
             subs: self.device.subs,
             model,
             instance,
+            derived: TemperatureCache::new(),
             initial: self.device.initial.clone(),
         };
         Ok(device)
@@ -2953,7 +2826,7 @@ mod tests {
         let bf = 100. * ((t / tnom).ln() * 1.5).exp();
         assert!((hot.bf - bf).abs() < 1e-12 * bf);
         // The built-in potential falls and the zero-bias capacitance rises.
-        assert!(hot.vje < nominal.vje && hot.cje > nominal.cje);
+        assert!(hot.be.potential < nominal.be.potential && hot.cje > nominal.cje);
         // TLEV=1 linear beta and TLEVC=1 linear capacitance/potential.
         let linear = thermal(
             "is=1e-15 bf=100 xtb=0.01 tlev=1 tlevc=1 cje=1p cte=1m vje=0.8 tvje=2m",
@@ -2962,7 +2835,7 @@ mod tests {
         );
         assert!((linear.bf - 100. * (1. + 0.01 * 100.)).abs() < 1e-9);
         assert!((linear.cje - 1.3e-12 * 1.1).abs() < 1e-24);
-        assert!((linear.vje - 0.6).abs() < 1e-12);
+        assert!((linear.be.potential - 0.6).abs() < 1e-12);
         // Polynomial resistance and Early-voltage coefficients.
         let poly = thermal("rb=100 trb1=1m rc=10 trc2=1e-5 vaf=50 tvaf1=-1m", 77., true);
         assert!((poly.rb - 100. * 1.05 / 1.3).abs() < 1e-9);

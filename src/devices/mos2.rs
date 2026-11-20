@@ -53,14 +53,6 @@
 // C-compatible numerical expressions are kept in their reference order:
 // Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
-    clippy::similar_names,
-    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
-)]
-#![expect(
-    clippy::too_many_lines,
-    reason = "a complete translated C numerical routine remains contiguous for equation parity review"
-)]
-#![expect(
     clippy::suboptimal_flops,
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
@@ -69,12 +61,14 @@ mod sens;
 
 use crate::devices::ModelContext;
 use crate::devices::ResolvedModel;
+use crate::devices::mos::bulk::{BulkJunctions, BulkLaw};
+use crate::devices::mos::surface::{Surface, SurfaceCard, SurfaceLaw};
 use crate::devices::mos::{
-    CELSIUS_TO_KELVIN, CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, Junction, K_OVER_Q,
-    MosLevel, Mosfet, NoiseShape, Operating, REFTEMP, ReverseLaw, aliased, band_gap, p,
-    potential_factor, required,
+    CELSIUS_TO_KELVIN, CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, MosLevel, Mosfet,
+    NoiseShape, Operating, aliased, p, required,
 };
 use crate::devices::noise::NoiseFamily;
+use crate::devices::nonlinear::thermal::SiliconTemperature;
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
@@ -83,9 +77,6 @@ use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// `EPSSIL` of `mos2temp.c`/`mos2load.c`: the permittivity of silicon (F/m).
 const EPSILON_SI: Real = 11.7 * EPSILON_0;
-
-/// Intrinsic carrier density of silicon used by `mos2temp.c` (m^-3).
-const INTRINSIC_DENSITY: Real = 1.45e16;
 
 /// The quartic root signs of `mos2load.c` (`sig1`, `sig2`).
 const SIG1: [Real; 4] = [1.0, -1.0, 1.0, -1.0];
@@ -146,16 +137,11 @@ const MODEL: &[P] = &[
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Level2 {
     common: Common,
-    vto: Option<Real>,
+    surface: SurfaceCard,
     kp: Option<Real>,
-    gamma: Option<Real>,
-    phi: Option<Real>,
     lambda: Real,
     tox: Real,
     u0: Option<Real>,
-    nsub: Option<Real>,
-    tpg: Option<Real>,
-    nss: Option<Real>,
     delta: Real,
     uexp: Real,
     ucrit: Real,
@@ -168,12 +154,11 @@ pub(super) struct Level2 {
 /// Process-derived model values (`mos2temp.c`, model loop).
 #[derive(Debug, Clone, Copy)]
 struct Process {
+    surface: Surface,
     cox: Real,
     kp: Real,
     u0: Real,
-    phi: Real,
-    gamma: Real,
-    vto: Real,
+
     /// C `MOS2xd` (zero without NSUB).
     xd: Real,
 }
@@ -208,50 +193,22 @@ impl Level2 {
     }
 
     fn process(&self, tnom: Real) -> SpiceResult<Process> {
-        let pol = self.common.pol;
         let cox = 3.9 * EPSILON_0 / self.tox;
         let u0 = self.u0.unwrap_or(600.);
-        let mut process = Process {
+        let surface =
+            self.surface
+                .derive(SurfaceLaw::Classic, "MOS2", tnom, self.common.pol, cox)?;
+        let xd = self.surface.nsub.map_or(0., |nsub| {
+            let twice_eps_si = EPSILON_SI + EPSILON_SI;
+            (twice_eps_si / (CHARGE * nsub * 1e6)).sqrt()
+        });
+        Ok(Process {
             cox,
             kp: self.kp.unwrap_or(u0 * 1e-4 * cox),
             u0,
-            phi: self.phi.unwrap_or(0.6),
-            gamma: self.gamma.unwrap_or(0.),
-            vto: self.vto.unwrap_or(0.),
-            xd: 0.,
-        };
-        if let Some(nsub) = self.nsub {
-            let density = nsub * 1e6;
-            if density <= INTRINSIC_DENSITY {
-                return Err(SpiceError::circuit(format!(
-                    "MOS2 NSUB={nsub} is below the intrinsic density (mos2temp.c: Nsub < Ni)"
-                )));
-            }
-            let vtnom = tnom * K_OVER_Q;
-            let egfet1 = band_gap(tnom);
-            if self.phi.is_none() {
-                process.phi = (2. * vtnom * (density / INTRINSIC_DENSITY).ln()).max(0.1);
-            }
-            let fermis = pol * 0.5 * process.phi;
-            let tpg = self.tpg.unwrap_or(1.);
-            let wkfng = if tpg == 0. {
-                3.2
-            } else {
-                let fermig = pol * tpg * 0.5 * egfet1;
-                3.25 + 0.5 * egfet1 - fermig
-            };
-            let wkfngs = wkfng - (3.25 + 0.5 * egfet1 + fermis);
-            if self.gamma.is_none() {
-                process.gamma = (2. * 11.70 * EPSILON_0 * CHARGE * density).sqrt() / cox;
-            }
-            if self.vto.is_none() {
-                let vfb = wkfngs - self.nss.unwrap_or(0.) * 1e4 * CHARGE / cox;
-                process.vto = vfb + pol * (process.gamma * process.phi.sqrt() + process.phi);
-            }
-            let twice_eps_si = EPSILON_SI + EPSILON_SI;
-            process.xd = (twice_eps_si / (CHARGE * density)).sqrt();
-        }
-        Ok(process)
+            surface,
+            xd,
+        })
     }
 }
 
@@ -276,16 +233,11 @@ impl MosLevel for Level2 {
         let common = Common::from_values(&m, resolved.family(), get("tpg"), "MOS2", "mos2noi.c")?;
         let model = Self {
             common,
-            vto: aliased(&m, ["vto", "vt0"]),
+            surface: SurfaceCard::from_values(&m),
             kp: get("kp"),
-            gamma: get("gamma"),
-            phi: get("phi"),
             lambda: required("lambda")?,
             tox: required("tox")?,
             u0: aliased(&m, ["u0", "uo"]),
-            nsub: get("nsub"),
-            tpg: get("tpg"),
-            nss: get("nss"),
             delta: required("delta")?,
             uexp: required("uexp")?,
             ucrit: required("ucrit")?,
@@ -339,70 +291,23 @@ impl MosLevel for Level2 {
             )));
         }
         let process = self.process(tnom)?;
-        let vt = temp * K_OVER_Q;
-        let vtnom = tnom * K_OVER_Q;
-        let (egfet, egfet1) = (band_gap(temp), band_gap(tnom));
-        let (fact1, fact2) = (tnom / REFTEMP, temp / REFTEMP);
-        let (pbfact, pbfact1) = (potential_factor(temp), potential_factor(tnom));
+        let nominal = SiliconTemperature::new(tnom);
+        let actual = SiliconTemperature::new(temp);
+        let vt = actual.vt;
         let ratio = temp / tnom;
         let ratio4 = ratio * ratio.sqrt();
         let kp = process.kp / ratio4;
-        let phio = (process.phi - pbfact1) / fact1;
-        let phi = fact2 * phio + pbfact;
-        let vbi = process.vto - model.pol * (process.gamma * process.phi.sqrt())
-            + 0.5 * (egfet1 - egfet)
-            + model.pol * 0.5 * (phi - process.phi);
-        let vto = vbi + model.pol * process.gamma * phi.sqrt();
-        // mos2temp.c: divide out the nominal-temperature factor, then
-        // multiply by the device-temperature one, as two steps.
-        let scale = (-egfet / vt + egfet1 / vtnom).exp();
-        let (saturation, density) = (model.is * scale, model.js * scale);
-        let pbo = (model.pb - pbfact1) / fact1;
-        let gmaold = (model.pb - pbo) / pbo;
-        let potential = fact2 * pbo + pbfact;
-        let gmanew = (potential - pbo) / pbo;
-        let factor = |grading: Real| {
-            (1. + grading * (4e-4 * (temp - REFTEMP) - gmanew))
-                / (1. + grading * (4e-4 * (tnom - REFTEMP) - gmaold))
-        };
-        let (bottom, side) = (factor(model.mj), factor(model.mjsw));
+        let (phi, vbi, vto) = process
+            .surface
+            .at_temperature(&nominal, &actual, model.pol, None);
+        let BulkJunctions {
+            drain,
+            source,
+            factors,
+        } = BulkLaw::Mos2.junctions(model, geometry, &nominal, &actual);
         let m = geometry.m;
         let length = self.length(geometry);
         let width = geometry.w;
-        let bottom_cap = |given: Option<Real>, area: Real| match (given, model.cj) {
-            (Some(c), _) => c * bottom * m,
-            (None, Some(cj)) => cj * bottom * m * area,
-            (None, None) => 0.,
-        };
-        let side_cap = |perimeter: Real| model.cjsw.map_or(0., |c| c * side * perimeter * m);
-        let root2 = std::f64::consts::SQRT_2;
-        // mos2temp.c scales the critical voltage by `MOS2m`, as mos1temp.c
-        // does.
-        let (sat_d, sat_s, vcrit_d, vcrit_s) =
-            if density == 0. || geometry.ad == 0. || geometry.as_ == 0. {
-                let vcrit = vt * (vt / (root2 * m * saturation)).ln();
-                (m * saturation, m * saturation, vcrit, vcrit)
-            } else {
-                (
-                    density * m * geometry.ad,
-                    density * m * geometry.as_,
-                    vt * (vt / (root2 * m * density * geometry.ad)).ln(),
-                    vt * (vt / (root2 * m * density * geometry.as_)).ln(),
-                )
-            };
-        let junction = |saturation, vcrit, bottom, sidewall| {
-            Junction::new(
-                saturation,
-                vcrit,
-                bottom,
-                sidewall,
-                model.mj,
-                model.mjsw,
-                potential,
-                model.fc,
-                ReverseLaw::Constant,
-            )
-        };
         let beta = kp * width * m / length;
         let unscaled_oxide = process.cox * length * width;
         let operating = Operating {
@@ -411,20 +316,10 @@ impl MosLevel for Level2 {
             vbi,
             phi,
             vto,
-            gamma: process.gamma,
+            gamma: process.surface.gamma,
             oxide: unscaled_oxide * m,
-            drain: junction(
-                sat_d,
-                vcrit_d,
-                bottom_cap(model.cbd, geometry.ad),
-                side_cap(geometry.pd),
-            ),
-            source: junction(
-                sat_s,
-                vcrit_s,
-                bottom_cap(model.cbs, geometry.as_),
-                side_cap(geometry.ps),
-            ),
+            drain,
+            source,
             overlap: [
                 model.overlap[0] * m * width,
                 model.overlap[1] * m * width,
@@ -438,8 +333,8 @@ impl MosLevel for Level2 {
                 unscaled_oxide,
                 mobility: process.u0,
                 xd: process.xd,
-                doped: self.nsub.is_some(),
-                bulk_potential: potential,
+                doped: self.surface.nsub.is_some(),
+                bulk_potential: drain.potential,
             },
         };
         let p = &operating.params;
@@ -467,11 +362,15 @@ impl MosLevel for Level2 {
         ]
         .iter()
         .all(|v| v.is_finite());
-        if !(finite && phi.is_finite() && phi > 0. && potential.is_finite() && potential > 0.)
+        if !(finite
+            && phi.is_finite()
+            && phi > 0.
+            && drain.potential.is_finite()
+            && drain.potential > 0.)
             || p.beta <= 0.
             || operating.drain.saturation <= 0.
             || operating.source.saturation <= 0.
-            || [bottom, side].iter().any(|f| !f.is_finite() || *f < 0.)
+            || factors.iter().any(|f| !f.is_finite() || *f < 0.)
         {
             return Err(SpiceError::circuit(format!(
                 "{}: MOS2 parameters are out of range at {:.2} K \
@@ -988,6 +887,14 @@ mod tests {
     /// A level-2 card without the schema.
     fn level(nfs: Real, vmax: Real, nsub: bool, lambda: Real) -> Level2 {
         Level2 {
+            surface: SurfaceCard {
+                vto: Some(0.7),
+                gamma: Some(0.5),
+                phi: Some(0.7),
+                nsub: nsub.then_some(2e16),
+                tpg: None,
+                nss: None,
+            },
             common: Common {
                 pol: 1.,
                 rd: None,
@@ -1011,16 +918,10 @@ mod tests {
                 nlev: 2,
                 gdsnoi: 1.,
             },
-            vto: Some(0.7),
             kp: Some(50e-6),
-            gamma: Some(0.5),
-            phi: Some(0.7),
             lambda,
             tox: 25e-9,
             u0: Some(500.),
-            nsub: nsub.then_some(2e16),
-            tpg: None,
-            nss: None,
             delta: 0.5,
             uexp: 0.15,
             ucrit: 2e4,
@@ -1028,6 +929,19 @@ mod tests {
             xj: 0.3e-6,
             neff: 2.,
             nfs,
+        }
+    }
+
+    #[test]
+    fn depletion_width_retains_reference_density_product_order() {
+        let mut model = level(0., 0., true, 0.);
+        for nsub in [1.23456789e14, 1.3456789e16, 9.87345e17] {
+            model.surface.nsub = Some(nsub);
+            let expected = ((EPSILON_SI + EPSILON_SI) / (CHARGE * nsub * 1e6)).sqrt();
+            assert_eq!(
+                model.process(300.).unwrap().xd.to_bits(),
+                expected.to_bits()
+            );
         }
     }
 
@@ -1253,7 +1167,7 @@ mod tests {
     #[test]
     fn biquadratic_velocity_saturation_stays_finite() {
         let mut l = card(1e11, 5e4, false, 0., 0., 0.4, 0.);
-        l.gamma = None;
+        l.surface.gamma = None;
         let op = op(&l);
         for i in 0..50 {
             for j in 1..50 {

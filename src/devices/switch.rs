@@ -60,13 +60,12 @@
 //!
 //! # AC
 //!
-//! The small-signal conductance is that of the bias point's state (codes 1
-//! and 3 on), the same rule the DC load used. This deliberately differs from
-//! C in two ways: `ACan` reloads with `MODEINITSMSIG`, which copies
-//! `CKTstate1` (still zero, "off", after a plain operating point) into
-//! `CKTstate0`, and `SWacLoad`/`CSWacLoad` then treat every non-zero code,
-//! including "off in band", as on. The port uses the converged operating-point
-//! state instead.
+//! `SWacLoad`/`CSWacLoad` and noise treat every nonzero state code,
+//! including "off in band", as on. The port applies that rule to the
+//! converged operating-point state rather than copying `CKTstate1` (still
+//! zero after a plain operating point) into `CKTstate0` as `MODEINITSMSIG`
+//! does in C. Assemblies without a supplied state use the instance flag's
+//! DC conductance instead.
 
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
@@ -146,6 +145,24 @@ impl SwitchState {
     pub const fn is_closed(self) -> bool {
         matches!(self, Self::ReallyOn | Self::HysteresisOn)
     }
+
+    /// AC, PZ and noise in C regard every nonzero state code as on.
+    const fn is_small_signal_closed(self) -> bool {
+        !matches!(self, Self::ReallyOff)
+    }
+
+    /// Enter the negative/zero hysteresis band from the accepted state.
+    /// Voltage-switch prediction swaps the outer states; the other paths
+    /// map them into the opposite inner states.
+    const fn enter_band(self, swap_outer: bool) -> Self {
+        match self {
+            Self::HysteresisOff | Self::HysteresisOn => self,
+            Self::ReallyOn if swap_outer => Self::ReallyOff,
+            Self::ReallyOff if swap_outer => Self::ReallyOn,
+            Self::ReallyOn => Self::HysteresisOff,
+            Self::ReallyOff => Self::HysteresisOn,
+        }
+    }
 }
 
 /// Validated model data at setup: thresholds and the explicit resistances.
@@ -157,6 +174,38 @@ struct SwitchModel {
     on_conductance: Real,
     /// `1/ROFF`; `None` selects the load's `gmin` (`SW_OFF_CONDUCTANCE`).
     off_conductance: Option<Real>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BandRegion {
+    Below,
+    Inside,
+    Above,
+}
+
+impl SwitchModel {
+    /// Strict comparisons: the endpoints belong to the hysteresis band.
+    /// Keep C's signed-hysteresis addition/subtraction order.
+    fn region(self, control: Real) -> BandRegion {
+        let (lower, upper) = if self.hysteresis > 0. {
+            (
+                self.threshold - self.hysteresis,
+                self.threshold + self.hysteresis,
+            )
+        } else {
+            (
+                self.threshold + self.hysteresis,
+                self.threshold - self.hysteresis,
+            )
+        };
+        if control > upper {
+            BandRegion::Above
+        } else if control < lower {
+            BandRegion::Below
+        } else {
+            BandRegion::Inside
+        }
+    }
 }
 
 const fn schema(kind: SwitchKind) -> ScalarSchema<'static> {
@@ -452,7 +501,7 @@ impl Switch {
             SwitchState::ReallyOff,
             Some(SwitchState::ReallyOff),
         )?;
-        Ok(state != SwitchState::ReallyOff)
+        Ok(state.is_small_signal_closed())
     }
 
     /// The control value at `solution`: `v(nc+) - v(nc-)` or the controlling
@@ -479,21 +528,11 @@ impl Switch {
 
     /// `SWload`/`CSWload` under `MODEINITJCT`/`MODEINITFIX`.
     fn flag_state(&self, control: Real) -> SwitchState {
-        let SwitchModel {
-            threshold: t,
-            hysteresis: h,
-            ..
-        } = self.model;
-        if self.initially_on {
-            if (h >= 0. && control > t + h) || (h < 0. && control > t - h) {
-                SwitchState::ReallyOn
-            } else {
-                SwitchState::HysteresisOn
-            }
-        } else if (h >= 0. && control < t - h) || (h < 0. && control < t + h) {
-            SwitchState::ReallyOff
-        } else {
-            SwitchState::HysteresisOff
+        match (self.initially_on, self.model.region(control)) {
+            (true, BandRegion::Above) => SwitchState::ReallyOn,
+            (true, _) => SwitchState::HysteresisOn,
+            (false, BandRegion::Below) => SwitchState::ReallyOff,
+            (false, _) => SwitchState::HysteresisOff,
         }
     }
 
@@ -507,44 +546,15 @@ impl Switch {
         accepted: SwitchState,
         iterate: Option<SwitchState>,
     ) -> SpiceResult<SwitchState> {
-        let SwitchModel {
-            threshold: t,
-            hysteresis: h,
-            ..
-        } = self.model;
-        let band = |inside: SwitchState| {
-            if h > 0. {
-                if control > t + h {
-                    SwitchState::ReallyOn
-                } else if control < t - h {
-                    SwitchState::ReallyOff
-                } else {
-                    inside
-                }
-            } else if control > t - h {
-                SwitchState::ReallyOn
-            } else if control < t + h {
-                SwitchState::ReallyOff
-            } else {
-                inside
+        // Select the state retained *inside* the band according to the
+        // solver phase, independently of the physical control thresholds.
+        let positive = self.model.hysteresis > 0.;
+        let inside = match phase {
+            IterationPhase::Junction | IterationPhase::Fix => {
+                return Ok(self.flag_state(control));
             }
-        };
-        // The `VH <= 0` band maps the accepted state; S's MODEINITPRED branch
-        // swaps really-on/really-off, every other branch enters the band.
-        let entered = |swap: bool| match accepted {
-            SwitchState::HysteresisOff | SwitchState::HysteresisOn => accepted,
-            SwitchState::ReallyOn if swap => SwitchState::ReallyOff,
-            SwitchState::ReallyOff if swap => SwitchState::ReallyOn,
-            SwitchState::ReallyOn => SwitchState::HysteresisOff,
-            SwitchState::ReallyOff => SwitchState::HysteresisOn,
-        };
-        Ok(match phase {
-            IterationPhase::Junction | IterationPhase::Fix => self.flag_state(control),
-            IterationPhase::Predict => band(if h > 0. {
-                accepted
-            } else {
-                entered(self.kind == SwitchKind::Voltage)
-            }),
+            IterationPhase::Predict if positive => accepted,
+            IterationPhase::Predict => accepted.enter_band(self.kind == SwitchKind::Voltage),
             IterationPhase::Float => {
                 let iterate = iterate.ok_or_else(|| {
                     SpiceError::circuit(format!(
@@ -552,34 +562,60 @@ impl Switch {
                         self.name
                     ))
                 })?;
-                band(if h <= 0. {
-                    entered(false)
+                if !positive {
+                    accepted.enter_band(false)
                 } else if self.kind == SwitchKind::Voltage {
                     iterate
                 } else {
                     accepted
-                })
+                }
             }
+        };
+        Ok(match self.model.region(control) {
+            BandRegion::Above => SwitchState::ReallyOn,
+            BandRegion::Below => SwitchState::ReallyOff,
+            BandRegion::Inside => inside,
         })
     }
 
-    fn conductance(&self, state: SwitchState, gmin: Real) -> Real {
-        if state.is_closed() {
+    fn conductance(&self, closed: bool, gmin: Real) -> Real {
+        if closed {
             self.model.on_conductance
         } else {
             self.model.off_conductance.unwrap_or(gmin)
         }
     }
 
+    /// Saved-state AC/noise semantics are intentionally different from the
+    /// DC initialization rule used without a solved state. Evaluate the
+    /// control lazily: a saved state needs no controlling branch lookup.
+    fn small_signal_closed(
+        &self,
+        states: Option<&[Real]>,
+        what: &str,
+        control: impl FnOnce() -> SpiceResult<Real>,
+    ) -> SpiceResult<bool> {
+        if let Some(states) = states {
+            let state = self
+                .stored(states.get(STATE).copied(), what)?
+                .ok_or_else(|| {
+                    SpiceError::circuit(format!("{}: missing {what} state", self.name))
+                })?;
+            Ok(state.is_small_signal_closed())
+        } else {
+            Ok(self.flag_state(control()?).is_closed())
+        }
+    }
+
+    fn decode(&self, code: Real, what: &str) -> SpiceResult<SwitchState> {
+        SwitchState::from_code(code).ok_or_else(|| SpiceError::Numerical {
+            context: self.name.clone(),
+            message: format!("invalid {what} switch state {code}"),
+        })
+    }
+
     fn stored(&self, value: Option<Real>, what: &str) -> SpiceResult<Option<SwitchState>> {
-        value
-            .map(|code| {
-                SwitchState::from_code(code).ok_or_else(|| SpiceError::Numerical {
-                    context: self.name.clone(),
-                    message: format!("invalid {what} switch state {code}"),
-                })
-            })
-            .transpose()
+        value.map(|code| self.decode(code, what)).transpose()
     }
 }
 
@@ -657,7 +693,7 @@ impl Device for Switch {
         }
         context.states.set(STATE, state.code())?;
         context.states.set(CONTROL, control)?;
-        let g = self.conductance(state, context.gmin);
+        let g = self.conductance(state.is_closed(), context.gmin);
         crate::devices::linear::nodal_stamp(
             context.matrix,
             context.unknowns,
@@ -681,19 +717,9 @@ impl Device for Switch {
         context: &mut LinearContext<'_>,
         bias: &Vector,
     ) -> SpiceResult<()> {
-        let closed = if let Some(states) = context.states {
-            // SWacLoad/CSWacLoad: any non-zero code, including "off in the
-            // band", stamps the on conductance.
-            self.stored(states.get(STATE).copied(), "small-signal")?
-                .ok_or_else(|| {
-                    SpiceError::circuit(format!("{}: missing small-signal state", self.name))
-                })?
-                != SwitchState::ReallyOff
-        } else {
-            // Zero-bias assemblies (forcing/breakpoint extraction) carry no
-            // solved state: use the MODEINITJCT state at `bias`.
+        let closed = self.small_signal_closed(context.states, "small-signal", || {
             let unknowns = context.unknowns;
-            let control = self.control_value(
+            self.control_value(
                 |node| {
                     unknowns
                         .node_row(node)
@@ -706,16 +732,9 @@ impl Device for Switch {
                     })
                 },
                 context.controls,
-            )?;
-            self.flag_state(control).is_closed()
-        };
-        let g = if closed {
-            self.model.on_conductance
-        } else {
-            self.model
-                .off_conductance
-                .unwrap_or(context.model_context.gmin)
-        };
+            )
+        })?;
+        let g = self.conductance(closed, context.model_context.gmin);
         context.nodal([self.terminals[0], self.terminals[1]], g, false)
     }
 
@@ -725,12 +744,8 @@ impl Device for Switch {
     /// small-signal state (any non-zero code is on, as `(int) CKTstate0` in
     /// C), or from the instance flag's `MODEINITJCT` state without one.
     fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
-        let closed = if let Some(states) = context.states {
-            self.stored(states.get(STATE).copied(), "noise")?
-                .ok_or_else(|| SpiceError::circuit(format!("{}: missing noise state", self.name)))?
-                != SwitchState::ReallyOff
-        } else {
-            let control = self.control_value(
+        let closed = self.small_signal_closed(context.states, "noise", || {
+            self.control_value(
                 |node| context.voltage(node),
                 |row| {
                     context.bias.get(row).ok_or_else(|| {
@@ -738,16 +753,9 @@ impl Device for Switch {
                     })
                 },
                 context.controls,
-            )?;
-            self.flag_state(control).is_closed()
-        };
-        let conductance = if closed {
-            self.model.on_conductance
-        } else {
-            self.model
-                .off_conductance
-                .unwrap_or(context.model_context.gmin)
-        };
+            )
+        })?;
+        let conductance = self.conductance(closed, context.model_context.gmin);
         Ok(DeviceNoise::Sources {
             family: match self.kind {
                 SwitchKind::Voltage => NoiseFamily::VoltageSwitch,
@@ -785,7 +793,8 @@ impl Device for Switch {
             ..
         } = self.model;
         // C tests `CKTstate0[SWswitchstate] == 0` (really off) only.
-        let max_change = if code == 0. {
+        let state = self.decode(code, "truncation")?;
+        let max_change = if state == SwitchState::ReallyOff {
             let reference = t + h;
             if !(control < reference && change > 0.) {
                 return Ok(None);
@@ -845,6 +854,116 @@ mod tests {
         assert_eq!(SwitchState::from_code(-1.), None);
         assert!(ReallyOn.is_closed() && HysteresisOn.is_closed());
         assert!(!ReallyOff.is_closed() && !HysteresisOff.is_closed());
+    }
+
+    #[test]
+    fn every_switch_phase_respects_the_signed_hysteresis_boundaries() {
+        let states = [ReallyOff, ReallyOn, HysteresisOff, HysteresisOn];
+        let predict_voltage = [ReallyOn, ReallyOff, HysteresisOff, HysteresisOn];
+        let enter = [HysteresisOn, HysteresisOff, HysteresisOff, HysteresisOn];
+        for kind in [SwitchKind::Voltage, SwitchKind::Current] {
+            for h in [-0.5_f64, -0., 0., 0.5] {
+                let t = 1.;
+                let low = t - h.abs();
+                let high = t + h.abs();
+                let controls = [low.next_down(), low, t, high, high.next_up()];
+                for initially_on in [false, true] {
+                    let switch = switch(kind, t, h, initially_on);
+                    for (i, accepted) in states.into_iter().enumerate() {
+                        for iterate in states {
+                            for (j, control) in controls.into_iter().enumerate() {
+                                let flag = if initially_on {
+                                    if j == 4 { ReallyOn } else { HysteresisOn }
+                                } else if j == 0 {
+                                    ReallyOff
+                                } else {
+                                    HysteresisOff
+                                };
+                                let predict = if h > 0. {
+                                    accepted
+                                } else if kind == SwitchKind::Voltage {
+                                    predict_voltage[i]
+                                } else {
+                                    enter[i]
+                                };
+                                let float = if h <= 0. {
+                                    enter[i]
+                                } else if kind == SwitchKind::Voltage {
+                                    iterate
+                                } else {
+                                    accepted
+                                };
+                                let outside = |inside| match j {
+                                    0 => ReallyOff,
+                                    4 => ReallyOn,
+                                    _ => inside,
+                                };
+                                for (phase, expected) in [
+                                    (IterationPhase::Junction, flag),
+                                    (IterationPhase::Fix, flag),
+                                    (IterationPhase::Predict, outside(predict)),
+                                    (IterationPhase::Float, outside(float)),
+                                ] {
+                                    assert_eq!(
+                                        switch
+                                            .decide(phase, control, accepted, Some(iterate))
+                                            .unwrap(),
+                                        expected,
+                                        "{kind:?}, {h}, {control}, {phase:?}, {accepted:?}, {iterate:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    assert!(
+                        switch
+                            .decide(IterationPhase::Float, high.next_up(), ReallyOff, None)
+                            .is_err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn small_signal_state_and_fallback_use_distinct_conductance_rules() {
+        for kind in [SwitchKind::Voltage, SwitchKind::Current] {
+            let mut s = switch(kind, 1., 0.5, false);
+            for state in [ReallyOff, ReallyOn, HysteresisOff, HysteresisOn] {
+                let closed = s
+                    .small_signal_closed(Some(&[state.code()]), "test", || {
+                        panic!("saved state needs no control")
+                    })
+                    .unwrap();
+                assert_eq!(closed, state != ReallyOff);
+                assert_eq!(s.conductance(closed, 1e-9), if closed { 1. } else { 1e-9 });
+            }
+            assert!(!s.small_signal_closed(None, "test", || Ok(1.)).unwrap());
+            assert!(s.small_signal_closed(Some(&[]), "test", || Ok(1.)).is_err());
+            assert!(
+                s.small_signal_closed(Some(&[4.]), "test", || Ok(1.))
+                    .is_err()
+            );
+            s.model.off_conductance = Some(1e-6);
+            assert_eq!(s.conductance(false, 1e-9), 1e-6);
+        }
+    }
+
+    #[test]
+    fn truncation_decodes_the_state_before_selecting_a_threshold() {
+        use crate::devices::{Device, TruncationContext};
+        let s = switch(SwitchKind::Voltage, 1., 0.5, false);
+        let context = |trial| TruncationContext {
+            trial,
+            accepted: Some(&[0., 0.]),
+            dt: 1.,
+        };
+        assert!(s.timestep_limit(&context(&[4., 1.])).is_err());
+        assert!(s.timestep_limit(&context(&[f64::NAN, 1.])).is_err());
+        assert!(s.timestep_limit(&context(&[0., 1.])).unwrap().is_some());
+        assert!(s.timestep_limit(&context(&[2., 1.])).unwrap().is_none());
+        let w = switch(SwitchKind::Current, 1., 0.5, false);
+        assert!(w.timestep_limit(&context(&[0., 1.])).unwrap().is_none());
     }
 
     #[test]

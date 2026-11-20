@@ -46,9 +46,6 @@
 //!   (`d qgs / d vgd`, `d qgd / d vgs`) where `mesload.c` stamps each charge
 //!   as a two-terminal capacitance `qggnew` reports at the iterate. The
 //!   equations and their solution are C's; only the iteration differs.
-//! - `mespzld.c` scales some diagonal conductances without the multiplicity
-//!   (`m * ggd + ggs`: an operator-precedence slip); the port's pole-zero
-//!   load is the AC load, every term scaled by `m`. Both agree for `m = 1`.
 //! - An unlabeled leading value on the card is refused by the parser
 //!   ([`crate::netlist`]): INP2Z only reaches the `area` setter for a
 //!   non-MES model, and none of the MESA/HFET tables has that setter, so C
@@ -77,14 +74,6 @@
     reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
 )]
 #![expect(
-    clippy::too_many_lines,
-    reason = "a complete translated C numerical routine remains contiguous for equation parity review"
-)]
-#![expect(
-    clippy::many_single_char_names,
-    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
     clippy::suboptimal_flops,
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
@@ -94,7 +83,8 @@ use crate::devices::limiting;
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
-use crate::devices::nonlinear::{JunctionPoint, junction_companion, junction_current};
+use crate::devices::nonlinear::thermal::DerivedCache;
+use crate::devices::nonlinear::{ReverseBoundary, junction_current};
 use crate::devices::schema::{
     self, ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
@@ -372,6 +362,7 @@ pub struct Mesfet {
     inner: [NodeId; 3],
     model: Model,
     instance: Instance,
+    derived: DerivedCache<(), Operating>,
     /// `OFF` and `ICVDS`/`ICVGS` (C `MESoff`, `MESicVDS`, `MESicVGS`).
     initial: crate::devices::initial::InstanceInitial,
 }
@@ -444,6 +435,7 @@ impl Mesfet {
             inner: [NodeId::GROUND; 3],
             model,
             instance,
+            derived: DerivedCache::new(),
             initial,
         };
         // Validate every derivation before interning nodes.
@@ -454,6 +446,10 @@ impl Mesfet {
 
     /// `mestemp.c` and the area scaling at the start of `mesload.c`.
     fn operating(&self) -> SpiceResult<Operating> {
+        self.derived.get_or_derive((), || self.derive_operating())
+    }
+
+    fn derive_operating(&self) -> SpiceResult<Operating> {
         let (model, area) = (&self.model, self.instance.area);
         let op = Operating {
             vcrit: limiting::critical_voltage(VT0, model.is),
@@ -485,7 +481,7 @@ impl Mesfet {
     /// The DC quantities at normalized `vgs`, `vgd` (`mesload.c`).
     fn point(&self, op: &Operating, vgs: Real, vgd: Real, gmin: Real) -> SpiceResult<Point> {
         let junction = |v: Real| -> SpiceResult<(Real, Real)> {
-            let (current, conductance) = junction_current(v, VT0, op.csat)?;
+            let (current, conductance) = junction_current(v, VT0, op.csat, ReverseBoundary::Cubic)?;
             Ok((current + gmin * v, conductance + gmin))
         };
         let point = Point {
@@ -520,9 +516,24 @@ impl Mesfet {
     }
 
     /// Normalized `[vgs, vgd]` from physical node voltages of d', g, s'.
+    fn linearization(
+        &self,
+        context: &LinearContext<'_>,
+        bias: &Vector,
+    ) -> SpiceResult<jfet::linear::GateLinearization> {
+        let op = self.operating()?;
+        let [vgs, vgd] = self.bias(context.unknowns, bias);
+        let point = self.point(&op, vgs, vgd, context.model_context.gmin)?;
+        let (_, capgs, capgd) = self.charge(&op, vgs, vgd)?;
+        Ok(jfet::linear::GateLinearization {
+            series: jfet::series_conductances(self.instance.area, self.model.rd, self.model.rs),
+            intrinsic: [point.channel.gm, point.channel.gds, point.gs.1, point.gd.1],
+            capacitances: [capgs, capgd],
+        })
+    }
+
     fn normalized(&self, v: [Real; 3]) -> [Real; 2] {
-        let pol = self.model.pol;
-        [pol * (v[1] - v[2]), pol * (v[1] - v[0])]
+        jfet::normalized(self.model.pol, v)
     }
 
     /// Normalized `[vgs, vgd]` at a solution vector (no limiting).
@@ -583,6 +594,20 @@ impl Mesfet {
 }
 
 impl Device for Mesfet {
+    /// MES occupies its own C device type, before MESA and MOS.
+    fn c_device_type(&self) -> crate::devices::setup::CDeviceType {
+        crate::devices::setup::CDeviceType::Mes
+    }
+
+    /// messetup.c uses the same element allocation order as JFET.
+    fn setup_matrix(
+        &self,
+        setup: &mut crate::devices::setup::MatrixSetup<'_>,
+    ) -> SpiceResult<bool> {
+        jfet::setup_gate_matrix(setup, &self.terminals, self.inner);
+        Ok(true)
+    }
+
     /// `mesask.c` scalar asks: `area` (C reports `area * m`) and the given
     /// `icvds`/`icvgs`. C answers no `m` ask (`MES_M` is missing from
     /// `MESask`).
@@ -683,6 +708,7 @@ impl Device for Mesfet {
             inner: self.inner,
             model: self.model,
             instance,
+            derived: DerivedCache::new(),
             initial,
         };
         device.operating()?;
@@ -721,84 +747,40 @@ impl Device for Mesfet {
             ));
         }
         let point = self.point(&op, vgs, vgd, context.gmin)?;
-        let vds = vgs - vgd;
-        let (cdrain, gm, gds) = (point.channel.current, point.channel.gm, point.channel.gds);
-        let ((cgs, ggs), (cgd, ggd)) = (point.gs, point.gd);
-        let mut l = jfet::Loaded {
-            vgs,
-            vgd,
-            vds,
-            cg: cgs + cgd,
-            cgd,
-            cd: cdrain - cgd,
-            gm,
-            gds,
-            ggs,
-            ggd,
-        };
-        // The incremental Statz charges with their capacitances: (charge,
-        // d/dvgs, d/dvgd) for qgs and qgd.
-        let (qgs, qgd, capgs, capgd) = if transient {
-            let accepted = |s: usize, what: &str| {
-                context
-                    .states
-                    .accepted(1, s)
-                    .ok_or_else(|| self.numerical(&format!("missing accepted {what}")))
-            };
-            let (vgs1, vgd1) = (accepted(slot::VGS, "vgs")?, accepted(slot::VGD, "vgd")?);
-            let (qgs1, qgd1) = (accepted(slot::QGS, "qgs")?, accepted(slot::QGD, "qgd")?);
-            let (qa, cgsna, cgdna) = self.charge(&op, vgs, vgd)?;
-            let (qb, _, _) = self.charge(&op, vgs1, vgd)?;
-            let (qc, _, _) = self.charge(&op, vgs, vgd1)?;
-            let (qd, _, _) = self.charge(&op, vgs1, vgd1)?;
-            // mesload.c takes the incremental charges from CKTstate1 and the
-            // capacitances of the *first* evaluation (`capgs = cgsna`,
-            // `capgd = cgdna`), not an average of the four calls.
-            (
-                qgs1 + 0.5 * (qa - qb + qc - qd),
-                qgd1 + 0.5 * (qa - qc + qb - qd),
-                cgsna,
-                cgdna,
-            )
+        let mut l = jfet::Loaded::from_currents(
+            [vgs, vgd],
+            (point.channel.current, point.channel.gm, point.channel.gds),
+            point.gs,
+            point.gd,
+        );
+        let gates = if transient {
+            jfet::incremental_statz(
+                &context.states,
+                [vgs, vgd],
+                jfet::StatzCapacitance::Present,
+                |what| self.numerical(&format!("missing accepted {what}")),
+                |gs, gd| self.charge(&op, gs, gd),
+            )?
         } else {
-            // Outside transient the total charge goes to both slots: what
-            // mesload.c stores in DC sweeps and the `uic` load, and what its
-            // MODEINITTRAN load writes into CKTstate1 for both charges from
-            // the operating point. CKTterr's charge tolerance (mestrunc.c)
-            // scales with |q|, so the first steps need C's offset. Nothing
-            // integrates it here, so C's NaN for a forward gate with
-            // PB <= 0.5 V is stored as zero rather than refusing a DC
-            // analysis C completes (a transient then fails in `charge`).
+            // The total charge goes to both slots outside transient so
+            // CKTterr sees C's charge offset. Preserve C's nonfinite qggnew
+            // DC fallback; transient charge() instead rejects that case.
             let q = self.model.qgg(&op, vgs, vgd).0;
             let q = if q.is_finite() { q } else { 0. };
-            (q, q, 0., 0.)
+            jfet::gate_charges(q, q, 0., 0.)
         };
         if transient {
             let coefficients = integration.ok_or_else(|| {
                 SpiceError::circuit("MESFET transient needs companion integration")
             })?;
-            let companion = |charge, capacitance| JunctionPoint {
-                current: 0.,
-                conductance: 0.,
-                charge,
-                capacitance,
-            };
-            let (geq, cqgs) =
-                junction_companion(context, coefficients, companion(qgs, capgs), slot::QGS)?;
-            l.ggs += geq;
-            l.cg += cqgs;
-            let (geq, cqgd) =
-                junction_companion(context, coefficients, companion(qgd, capgd), slot::QGD)?;
-            l.ggd += geq;
-            l.cg += cqgd;
-            l.cd -= cqgd;
-            l.cgd += cqgd;
-            context.states.set(slot::QGS, qgs)?;
-            context.states.set(slot::QGD, qgd)?;
+            l.integrate_gates(&mut context.states, coefficients, gates)?;
+            for branch in gates {
+                branch.store(&mut context.states)?;
+            }
         } else {
-            for (s, q) in [(slot::QGS, qgs), (slot::QGD, qgd)] {
-                context.states.set(s, q)?;
-                context.states.set(s + 1, 0.)?;
+            for branch in gates {
+                branch.store(&mut context.states)?;
+                branch.zero_derivative(&mut context.states)?;
             }
         }
         jfet::finish_load(
@@ -820,51 +802,27 @@ impl Device for Mesfet {
         context: &mut LinearContext<'_>,
         bias: &Vector,
     ) -> SpiceResult<()> {
-        let op = self.operating()?;
-        let [vgs, vgd] = self.bias(context.unknowns, bias);
-        let point = self.point(&op, vgs, vgd, context.model_context.gmin)?;
-        let (_, capgs, capgd) = self.charge(&op, vgs, vgd)?;
-        let m = self.instance.m;
-        for (ports, conductance) in jfet::series_ports(&self.terminals, self.inner)
-            .into_iter()
-            .zip(jfet::series_conductances(
-                self.instance.area,
-                self.model.rd,
-                self.model.rs,
-            ))
-        {
-            if conductance > 0. {
-                context.nodal(ports, m * conductance, false)?;
-            }
-        }
-        let [d, g, s] = self.inner;
-        let c = point.channel;
-        for (row, sign) in [(d, 1.), (s, -1.)] {
-            for (col, derivative) in self.inner.iter().zip([c.gds, c.gm, -c.gds - c.gm]) {
-                if let (Some(r), Some(col)) = (
-                    context.unknowns.node_row(row),
-                    context.unknowns.node_row(*col),
-                ) {
-                    context.system.a.add(r, col, sign * m * derivative)?;
-                }
-            }
-        }
-        for (ports, conductance, capacitance) in
-            [([g, s], point.gs.1, capgs), ([g, d], point.gd.1, capgd)]
-        {
-            context.nodal(ports, m * conductance, false)?;
-            context.nodal(ports, m * capacitance, true)?;
-        }
-        Ok(())
+        self.linearization(context, bias)?.assemble_ac(
+            context,
+            &self.terminals,
+            self.inner,
+            self.instance.m,
+        )
     }
-    /// `mespzld.c` is the AC load with `s` for `j omega` (see the module
-    /// docs for its multiplicity slip).
+    /// `mespzld.c`: preserve C's distinct diagonal multiplicity and
+    /// separate conductance/capacitance statements.
     fn assemble_pole_zero(
         &self,
         context: &mut LinearContext<'_>,
         bias: &Vector,
     ) -> SpiceResult<()> {
-        self.assemble_small_signal(context, bias)
+        self.linearization(context, bias)?.assemble_pole_zero(
+            context,
+            &self.terminals,
+            self.inner,
+            self.instance.m,
+            jfet::linear::GatePencil::Mesfet,
+        )
     }
     /// `mesnoise.c`: thermal noise of RD and RS (`NevalSrc`, circuit
     /// temperature), channel thermal noise `4 k T (2/3) |gm|` and flicker
@@ -1137,6 +1095,7 @@ impl MesfetSensitivity<'_> {
             inner: self.device.inner,
             model,
             instance,
+            derived: DerivedCache::new(),
             initial: self.device.initial.clone(),
         })
     }
@@ -1180,7 +1139,7 @@ impl Device for ResetMesfet {
         let [vgs, vgd] = state.normalized([0.; 3]);
         let point = state.point(&op, vgs, vgd, context.model_context.gmin)?;
         let c = &self.current;
-        jfet::ac_conductances(
+        jfet::linear::ac_conductances(
             context,
             &c.terminals,
             c.inner,
@@ -1219,6 +1178,7 @@ mod tests {
             inner: [NodeId::GROUND; 3],
             model,
             instance: Instance { area: 1.5, m: 1. },
+            derived: DerivedCache::new(),
             initial: crate::devices::initial::InstanceInitial::default(),
         };
         (model, device.operating().unwrap())

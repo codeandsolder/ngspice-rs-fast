@@ -58,16 +58,11 @@ impl SensitivityLevel for Level3 {
     ];
     const INSTANCE: &'static [P] = INSTANCE;
     fn record(&self, context: &ModelContext) -> Record {
-        let mut r = record_common(&self.common, context);
+        let mut r = self.surface.record(record_common(&self.common, context));
         for (k, value, given) in [
-            ("vto", self.vto.unwrap_or(0.), self.vto.is_some()),
             ("kp", self.kp.unwrap_or(2e-5), self.kp.is_some()),
-            ("gamma", self.gamma.unwrap_or(0.), self.gamma.is_some()),
-            ("phi", self.phi.unwrap_or(0.6), self.phi.is_some()),
             ("tox", self.tox, true),
             ("u0", self.u0.unwrap_or(600.), self.u0.is_some()),
-            ("nsub", self.nsub.unwrap_or(0.), self.nsub.is_some()),
-            ("nss", self.nss.unwrap_or(0.), self.nss.is_some()),
             ("xl", self.xl, true),
             ("wd", self.wd, true),
             ("xw", self.xw, true),
@@ -91,14 +86,10 @@ impl SensitivityLevel for Level3 {
     fn with_record(&self, r: &Record, derived: bool) -> SpiceResult<Self> {
         let mut m = *self;
         update_common(&mut m.common, r)?;
-        m.vto = optional(r, "vto", derived)?;
+        m.surface.update(r, derived)?;
         m.kp = optional(r, "kp", derived)?;
-        m.gamma = optional(r, "gamma", derived)?;
-        m.phi = optional(r, "phi", derived)?;
         m.tox = r.value("tox")?;
         m.u0 = optional(r, "u0", derived)?;
-        m.nsub = optional(r, "nsub", false)?;
-        m.nss = optional(r, "nss", false)?;
         m.xl = r.value("xl")?;
         m.wd = r.value("wd")?;
         m.xw = r.value("xw")?;
@@ -119,11 +110,9 @@ impl SensitivityLevel for Level3 {
         let process = self
             .with_record(r, false)?
             .process(r.value("tnom")?, "MOS3")?;
+        process.surface.store(r)?;
         for (k, value) in [
-            ("vto", process.vto),
             ("kp", process.kp),
-            ("gamma", process.gamma),
-            ("phi", process.phi),
             ("u0", process.u0),
             ("xd", process.depletion),
             ("alpha", process.alpha),
