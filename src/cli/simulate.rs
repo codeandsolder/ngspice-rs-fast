@@ -246,12 +246,12 @@ pub fn run_with_format(
             && names.len() == 1
             && !batch::needs_full_plot(entry, &parsed.output, &parsed.measurements, &parsed.fourier)
         {
-            let output = BatchOutput {
+            let mut output = BatchOutput {
                 parsed: &parsed,
                 config: &config,
                 scope: &scope,
                 date: &date,
-                writer: &rawfile.writer,
+                writer: &mut rawfile.writer,
                 spool: &rawfile.spool,
             };
             plots.push(output.stream(entry, names[0], &mut circuit, &request, driver.as_ref())?);
@@ -275,7 +275,7 @@ pub fn run_with_format(
             config: &config,
             scope: &scope,
             date: &date,
-            writer: &rawfile.writer,
+            writer: &mut rawfile.writer,
             spool: &rawfile.spool,
         }
         .write(entry, &produced, names, &mut plots)?;
@@ -298,13 +298,13 @@ struct BatchOutput<'a> {
     config: &'a RunConfig,
     scope: &'a ParamScope,
     date: &'a str,
-    writer: &'a RawFileWriter,
+    writer: &'a mut RawFileWriter,
     spool: &'a Path,
 }
 
 impl BatchOutput<'_> {
     fn stream(
-        &self,
+        &mut self,
         entry: &batch::ScheduledAnalysis,
         name: &str,
         circuit: &mut crate::devices::Circuit,
@@ -312,7 +312,7 @@ impl BatchOutput<'_> {
         driver: &dyn crate::analysis::Analysis,
     ) -> SpiceResult<PlotReport> {
         let mut sink = RawfileSink {
-            writer: self.writer,
+            writer: &*self.writer,
             spool: self.spool,
             entry,
             output: &self.parsed.output,
@@ -338,7 +338,7 @@ impl BatchOutput<'_> {
     }
 
     fn write(
-        &self,
+        &mut self,
         entry: &batch::ScheduledAnalysis,
         produced: &[Plot],
         names: Vec<&str>,
