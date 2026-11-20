@@ -40,12 +40,15 @@ pub(crate) mod hfet1;
 pub(crate) mod hfet2;
 pub(crate) mod mesa;
 
+use std::cell::Cell;
+
 use crate::devices::initial::{InstanceInitial, split};
 use crate::devices::jfet::{self, CHARGE, p};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
-use crate::devices::{ModelFamily, ResolvedModel};
+use crate::devices::sensitivity::{ParameterScope, RecordPair, SensitivityRecord};
+use crate::devices::{LinearContext, ModelFamily, ResolvedModel};
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
 
@@ -97,6 +100,38 @@ impl<'a> NodeSetup<'a> {
 
     fn finish(self) -> (NodeTable, Vec<NodeId>) {
         (self.staged, self.terminals)
+    }
+}
+
+/// Last successful temperature derivation for an immutable model/instance pair.
+/// Sweep and sensitivity replacements construct an empty cache. The key keeps
+/// the exact context bits (including signed zero) and never retains errors.
+#[derive(Debug, Clone)]
+struct TemperatureCache<T: Copy, const N: usize> {
+    value: Cell<Option<([u64; N], T)>>,
+}
+
+impl<T: Copy, const N: usize> TemperatureCache<T, N> {
+    const fn new() -> Self {
+        Self {
+            value: Cell::new(None),
+        }
+    }
+
+    fn get_or_compute(
+        &self,
+        temperatures: [Real; N],
+        compute: impl FnOnce() -> SpiceResult<T>,
+    ) -> SpiceResult<T> {
+        let key = temperatures.map(Real::to_bits);
+        if let Some((previous, value)) = self.value.get()
+            && previous == key
+        {
+            return Ok(value);
+        }
+        let value = compute()?;
+        self.value.set(Some((key, value)));
+        Ok(value)
     }
 }
 
@@ -159,6 +194,43 @@ impl HfetInstance {
         })
     }
 
+    fn sensitivity_record(
+        &self,
+        initial: &InstanceInitial,
+        circuit_kelvin: Real,
+    ) -> SensitivityRecord {
+        SensitivityRecord::new()
+            .with("l", self.l, true)
+            .with("w", self.w, true)
+            .with("m", self.m, true)
+            .with(
+                "icvds",
+                initial.values[0].unwrap_or(0.),
+                initial.values[0].is_some(),
+            )
+            .with(
+                "icvgs",
+                initial.values[1].unwrap_or(0.),
+                initial.values[1].is_some(),
+            )
+            .with(
+                "temp",
+                self.temperature_at_kelvin(circuit_kelvin),
+                self.temp.is_some(),
+            )
+            .with("dtemp", self.dtemp, true)
+    }
+
+    fn from_record(record: &SensitivityRecord) -> SpiceResult<Self> {
+        Ok(Self {
+            l: record.value("l")?,
+            w: record.value("w")?,
+            m: record.value("m")?,
+            temp: given_celsius(record, "temp")?,
+            dtemp: record.value("dtemp")?,
+        })
+    }
+
     /// C instance temperature in kelvin: an explicit TEMP overrides DTEMP.
     pub(super) fn temperature(&self, circuit_celsius: Real) -> Real {
         self.temperature_at_kelvin(circuit_celsius + CELSIUS_TO_KELVIN)
@@ -168,6 +240,79 @@ impl HfetInstance {
         self.temp
             .map_or(circuit_kelvin + self.dtemp, |v| v + CELSIUS_TO_KELVIN)
     }
+}
+
+/// A temperature field is stored in Kelvin, but exposed in Celsius only when given.
+fn given_celsius(record: &SensitivityRecord, keyword: &str) -> SpiceResult<Option<Real>> {
+    Ok(record
+        .given(keyword)
+        .then(|| record.value(keyword))
+        .transpose()?
+        .map(|kelvin| kelvin - CELSIUS_TO_KELVIN))
+}
+
+/// Both single-temperature HFET families expose TEMP in Celsius.
+fn ask_hfet(scope: ParameterScope, keyword: &str, records: RecordPair<'_>) -> SpiceResult<Real> {
+    match scope {
+        ParameterScope::Model => records.model.value(keyword),
+        ParameterScope::Instance if keyword == "temp" => {
+            Ok(records.instance.value(keyword)? - CELSIUS_TO_KELVIN)
+        }
+        ParameterScope::Instance => records.instance.value(keyword),
+    }
+}
+
+/// The setter reapplies the Celsius offset even on the sensitivity restore.
+fn set_hfet(
+    scope: ParameterScope,
+    keyword: &str,
+    value: Real,
+    model: &mut SensitivityRecord,
+    instance: &mut SensitivityRecord,
+) -> SpiceResult<()> {
+    match scope {
+        ParameterScope::Model => model.set(keyword, value),
+        ParameterScope::Instance if keyword == "temp" => {
+            instance.set(keyword, value + CELSIUS_TO_KELVIN)
+        }
+        ParameterScope::Instance => instance.set(keyword, value),
+    }
+}
+
+type NodeStamp = (NodeId, NodeId, Real);
+
+/// Assemble borrowed reset stamps in their original real-then-imaginary order.
+/// Validate all addends before touching the matrix, including ground entries,
+/// just as ResetStamps::new does. No temporary owned device or stamp vector.
+fn stamp_reset(
+    name: &str,
+    context: &mut LinearContext<'_>,
+    real: &[NodeStamp],
+    imaginary: &[NodeStamp],
+) -> SpiceResult<()> {
+    if let Some((_, _, value)) = real
+        .iter()
+        .chain(imaginary)
+        .find(|(_, _, value)| !value.is_finite())
+    {
+        return Err(SpiceError::Numerical {
+            context: format!("AC sensitivity of {name}"),
+            message: format!("the reset load gives a nonfinite matrix element {value}"),
+        });
+    }
+    for &(a, b, value) in real {
+        if let (Some(row), Some(col)) = (context.unknowns.node_row(a), context.unknowns.node_row(b))
+        {
+            context.system.a.add(row, col, value)?;
+        }
+    }
+    for &(a, b, value) in imaginary {
+        if let (Some(row), Some(col)) = (context.unknowns.node_row(a), context.unknowns.node_row(b))
+        {
+            context.dynamic_prescaled(row, col, value)?;
+        }
+    }
+    Ok(())
 }
 
 /// Model setters of `MESAmPTable` with `mesasetup.c`'s defaults. `vto` is the
@@ -516,6 +661,146 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_reset_stamps_match_owned_assembly_and_validate_before_mutation() {
+        use crate::devices::linear::LinearSystem;
+        use crate::devices::sensitivity::{ResetStamp, ResetStamps, StampAt, StampPart};
+        use crate::devices::traits::MnaUnknowns;
+        use crate::devices::{Device, ModelContext};
+
+        let mut nodes = NodeTable::new();
+        let a = nodes.intern("a");
+        let b = nodes.intern("b");
+        let ground = NodeId::GROUND;
+        let mut unknowns = MnaUnknowns::new();
+        unknowns.rebuild(&nodes);
+        let model_context = ModelContext::new(27., 27.);
+        let real = [
+            (a, a, 1e16),
+            (a, a, -1e16),
+            (a, a, 1.),
+            (a, b, -2.),
+            (ground, a, 5.),
+        ];
+        let imaginary = [(a, b, 3.), (a, b, -4.), (b, b, 0.), (a, ground, 6.)];
+        let owned_stamps = real
+            .into_iter()
+            .map(|(a, b, value)| ResetStamp {
+                at: StampAt::Nodes(a, b),
+                value,
+                part: StampPart::Real,
+            })
+            .chain(imaginary.into_iter().map(|(a, b, value)| ResetStamp {
+                at: StampAt::Nodes(a, b),
+                value,
+                part: StampPart::Imaginary,
+            }))
+            .collect();
+        let owned = ResetStamps::new("z1", 'z', &[a, b], owned_stamps).unwrap();
+        let mut reference = LinearSystem::new(unknowns.len());
+        let mut actual = LinearSystem::new(unknowns.len());
+        for (system, reference_path) in [(&mut reference, true), (&mut actual, false)] {
+            let mut context = LinearContext {
+                model_context: &model_context,
+                system,
+                unknowns: &unknowns,
+                branch: None,
+                controls: &[],
+                mutual: &[],
+                states: None,
+                pole_zero_statements: None,
+                pole_zero_setups: 0,
+            };
+            if reference_path {
+                owned.assemble_linear(&mut context).unwrap();
+            } else {
+                assert!(
+                    stamp_reset("z1", &mut context, &real, &[(ground, ground, Real::NAN)]).is_err()
+                );
+                assert!(context.system.a.triplets().is_empty());
+                assert!(context.system.e.triplets().is_empty());
+                stamp_reset("z1", &mut context, &real, &imaginary).unwrap();
+            }
+        }
+        assert_eq!(actual.a.triplets(), reference.a.triplets());
+        assert_eq!(actual.e.triplets(), reference.e.triplets());
+        assert_eq!(actual.e_groups, reference.e_groups);
+    }
+
+    #[test]
+    fn temperature_cache_uses_full_exact_key_and_keeps_last_success() {
+        let cache = TemperatureCache::<u32, 2>::new();
+        assert_eq!(cache.get_or_compute([27., 27.], || Ok(1)).unwrap(), 1);
+        assert_eq!(
+            cache
+                .get_or_compute([27., 27.], || panic!("unexpected recomputation"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(cache.get_or_compute([27., 28.], || Ok(2)).unwrap(), 2);
+        assert!(
+            cache
+                .get_or_compute([0., 28.], || Err(SpiceError::circuit("failed derivation")))
+                .is_err()
+        );
+        assert_eq!(
+            cache
+                .get_or_compute([27., 28.], || panic!("lost successful snapshot"))
+                .unwrap(),
+            2
+        );
+        assert_eq!(cache.get_or_compute([0., 28.], || Ok(3)).unwrap(), 3);
+        assert_eq!(cache.get_or_compute([-0., 28.], || Ok(4)).unwrap(), 4);
+    }
+
+    #[test]
+    fn hfet_sensitivity_temperature_round_trips_given_flags() {
+        let instance = HfetInstance {
+            l: 1e-6,
+            w: 20e-6,
+            m: 2.,
+            temp: None,
+            dtemp: 12.3,
+        };
+        let initial = InstanceInitial {
+            off: false,
+            values: vec![Some(0.5), None],
+        };
+        let mut record = instance.sensitivity_record(&initial, 300.15);
+        assert!(!record.given("temp"));
+        assert!(record.given("icvds"));
+        assert!(!record.given("icvgs"));
+        assert!(HfetInstance::from_record(&record).unwrap().temp.is_none());
+        let mut model = SensitivityRecord::new();
+        set_hfet(
+            ParameterScope::Instance,
+            "temp",
+            -12.5,
+            &mut model,
+            &mut record,
+        )
+        .unwrap();
+        let pair = RecordPair {
+            model: &model,
+            instance: &record,
+        };
+        assert_eq!(
+            ask_hfet(ParameterScope::Instance, "temp", pair)
+                .unwrap()
+                .to_bits(),
+            (-12.5_f64).to_bits()
+        );
+        assert_eq!(
+            HfetInstance::from_record(&record)
+                .unwrap()
+                .temp
+                .unwrap()
+                .to_bits(),
+            (-12.5_f64).to_bits()
+        );
+        assert!(record.given("temp"));
+    }
 
     #[test]
     fn failed_temperature_setup_does_not_publish_nodes() {
