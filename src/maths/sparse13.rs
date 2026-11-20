@@ -382,6 +382,79 @@ struct Topology {
 }
 
 impl Topology {
+    fn translate(
+        &mut self,
+        current_size: &mut usize,
+        ext_row: usize,
+        ext_col: usize,
+    ) -> (usize, usize) {
+        let mut int_row = self.ext_to_int_row[ext_row];
+        if int_row == NONE {
+            *current_size += 1;
+            int_row = *current_size;
+            self.ext_to_int_row[ext_row] = int_row;
+            self.ext_to_int_col[ext_row] = int_row;
+            self.int_to_ext_row[int_row] = ext_row;
+            self.int_to_ext_col[int_row] = ext_row;
+        }
+        let mut int_col = self.ext_to_int_col[ext_col];
+        if int_col == NONE {
+            *current_size += 1;
+            int_col = *current_size;
+            self.ext_to_int_row[ext_col] = int_col;
+            self.ext_to_int_col[ext_col] = int_col;
+            self.int_to_ext_row[int_col] = ext_col;
+            self.int_to_ext_col[int_col] = ext_col;
+        }
+        (int_row, int_col)
+    }
+
+    fn locate_in_col(&self, mut last: Slot, row: usize) -> (Slot, usize) {
+        let mut e = self.col_get(last);
+        while e != NONE {
+            let r = self.elements[e].row;
+            if r < row {
+                last = Slot::After(e);
+                e = self.elements[e].next_in_col;
+            } else if r == row {
+                return (last, e);
+            } else {
+                break;
+            }
+        }
+        (last, NONE)
+    }
+
+    fn create_element(&mut self, row: usize, col: usize, last: Slot, rows_linked: bool) -> usize {
+        let e = self.elements.len();
+        self.elements.push(Element {
+            row,
+            col,
+            next_in_row: NONE,
+            next_in_col: self.col_get(last),
+        });
+        if row == col {
+            self.diag[row] = e;
+        }
+        self.col_set(last, e);
+        if rows_linked {
+            let mut previous = NONE;
+            let mut p = self.first_in_row[row];
+            while p != NONE && self.elements[p].col < col {
+                previous = p;
+                p = self.elements[p].next_in_row;
+            }
+            if previous == NONE {
+                self.elements[e].next_in_row = self.first_in_row[row];
+                self.first_in_row[row] = e;
+            } else {
+                self.elements[e].next_in_row = self.elements[previous].next_in_row;
+                self.elements[previous].next_in_row = e;
+            }
+        }
+        e
+    }
+
     fn col_get(&self, slot: Slot) -> usize {
         match slot {
             Slot::Head(col) => self.first_in_col[col],
@@ -664,7 +737,6 @@ pub(super) struct Sparse<T> {
     rel_threshold: f64,
     abs_threshold: f64,
     rows_linked: bool,
-    internal_vectors: bool,
     needs_ordering: bool,
     factored: bool,
     interchanges_odd: bool,
@@ -706,7 +778,6 @@ impl<T: Scalar> Sparse<T> {
             rel_threshold: DEFAULT_THRESHOLD,
             abs_threshold: 0.0,
             rows_linked: false,
-            internal_vectors: false,
             needs_ordering: true,
             factored: false,
             interchanges_odd: false,
@@ -768,92 +839,44 @@ impl<T: Scalar> Sparse<T> {
 
     /// `Translate`: assigns internal indices in first-reference order.
     fn translate(&mut self, ext_row: usize, ext_col: usize) -> (usize, usize) {
-        let mut int_row = self.topology.ext_to_int_row[ext_row];
-        if int_row == NONE {
-            let topology = std::sync::Arc::make_mut(&mut self.topology);
-            self.current_size += 1;
-            self.size = self.current_size;
-            int_row = self.current_size;
-            topology.ext_to_int_row[ext_row] = int_row;
-            topology.ext_to_int_col[ext_row] = int_row;
-            topology.int_to_ext_row[int_row] = ext_row;
-            topology.int_to_ext_col[int_row] = ext_row;
+        let row = self.topology.ext_to_int_row[ext_row];
+        let col = self.topology.ext_to_int_col[ext_col];
+        if row != NONE && col != NONE {
+            return (row, col);
         }
-        let mut int_col = self.topology.ext_to_int_col[ext_col];
-        if int_col == NONE {
-            let topology = std::sync::Arc::make_mut(&mut self.topology);
-            self.current_size += 1;
-            self.size = self.current_size;
-            int_col = self.current_size;
-            topology.ext_to_int_row[ext_col] = int_col;
-            topology.ext_to_int_col[ext_col] = int_col;
-            topology.int_to_ext_row[int_col] = ext_col;
-            topology.int_to_ext_col[int_col] = ext_col;
-        }
-        (int_row, int_col)
+        let translated = std::sync::Arc::make_mut(&mut self.topology).translate(
+            &mut self.current_size,
+            ext_row,
+            ext_col,
+        );
+        self.size = self.current_size;
+        translated
     }
 
     /// `spcFindElementInCol`.
-    fn find_element_in_col(
-        &mut self,
-        mut last: Slot,
-        row: usize,
-        col: usize,
-        create: bool,
-    ) -> usize {
-        let mut e = self.topology.col_get(last);
-        while e != NONE {
-            let r = self.topology.elements[e].row;
-            if r < row {
-                last = Slot::After(e);
-                e = self.topology.elements[e].next_in_col;
-            } else if r == row {
-                return e;
-            } else {
-                break;
-            }
-        }
-        if create {
-            self.create_element(row, col, last, false)
+    fn find_element_in_col(&mut self, last: Slot, row: usize, col: usize, create: bool) -> usize {
+        let (last, found) = self.topology.locate_in_col(last, row);
+        if found != NONE || !create {
+            found
         } else {
-            NONE
+            self.create_element(row, col, last, false)
         }
     }
 
     /// `spcCreateElement`.
     fn create_element(&mut self, row: usize, col: usize, last: Slot, fillin: bool) -> usize {
-        let topology = std::sync::Arc::make_mut(&mut self.topology);
-        self.plan = None;
-        let e = topology.elements.len();
-        topology.elements.push(Element {
+        let e = std::sync::Arc::make_mut(&mut self.topology).create_element(
             row,
             col,
-            next_in_row: NONE,
-            next_in_col: topology.col_get(last),
-        });
+            last,
+            self.rows_linked,
+        );
+        self.plan = None;
+        self.factored = false;
+        if self.rows_linked && !fillin {
+            self.needs_ordering = true;
+        }
         self.values.push(T::ZERO);
-        if row == col {
-            topology.diag[row] = e;
-        }
-        topology.col_set(last, e);
-        if self.rows_linked {
-            if !fillin {
-                self.needs_ordering = true;
-            }
-            let mut previous = NONE;
-            let mut p = topology.first_in_row[row];
-            while p != NONE && topology.elements[p].col < col {
-                previous = p;
-                p = topology.elements[p].next_in_row;
-            }
-            if previous == NONE {
-                topology.elements[e].next_in_row = topology.first_in_row[row];
-                topology.first_in_row[row] = e;
-            } else {
-                topology.elements[e].next_in_row = topology.elements[previous].next_in_row;
-                topology.elements[previous].next_in_row = e;
-            }
-        }
         e
     }
 
@@ -887,13 +910,43 @@ impl<T: Scalar> Sparse<T> {
         self.small_pivot = None;
     }
 
-    /// Insert a unique original in assembly creation order, before any
-    /// fill-ins. Its handle is its position in the original coefficient run.
-    pub(super) fn append_original(&mut self, row: usize, col: usize, value: T) {
-        let next = self.values.len();
-        let handle = self.get_element(row, col);
-        assert_eq!(handle, next, "duplicate original sparse element");
-        self.values[handle] = value;
+    /// Build a fresh frame from unique, already assembled original
+    /// elements in reference creation order (external indices are 1-based).
+    /// Borrow the exclusively owned topology once and reserve both arenas.
+    pub(super) fn from_originals(
+        size: usize,
+        entries: impl IntoIterator<Item = (usize, usize, T)>,
+    ) -> Self {
+        let mut sparse = Self::new(size);
+        let entries = entries.into_iter();
+        let capacity = entries.size_hint().0;
+        let topology =
+            std::sync::Arc::get_mut(&mut sparse.topology).expect("new topology is unique");
+        topology.elements.reserve(capacity);
+        sparse.values.reserve(capacity);
+        for (row, col, value) in entries {
+            debug_assert!(row >= 1 && col >= 1 && row <= size && col <= size);
+            let (r, c) = topology.translate(&mut sparse.current_size, row, col);
+            let (last, found) = topology.locate_in_col(Slot::Head(c), r);
+            assert_eq!(found, NONE, "duplicate original sparse element");
+            let handle = topology.create_element(r, c, last, false);
+            debug_assert_eq!(handle, sparse.values.len());
+            sparse.values.push(value);
+        }
+        sparse.size = sparse.current_size;
+        sparse
+    }
+
+    /// A pattern already contains its unique positions in creation order.
+    pub(super) fn from_pattern(pattern: &crate::maths::Pattern, values: &[T]) -> Self {
+        debug_assert_eq!(pattern.len(), values.len());
+        Self::from_originals(
+            pattern.order(),
+            values.iter().enumerate().map(|(index, &value)| {
+                let (r, c) = pattern.position(crate::maths::sparse::element_id(index));
+                (r + 1, c + 1, value)
+            }),
+        )
     }
 
     /// Reload consecutive originals, clearing only the fill-in suffix.
@@ -936,7 +989,6 @@ impl<T: Scalar> Sparse<T> {
             rel_threshold: self.rel_threshold,
             abs_threshold: self.abs_threshold,
             rows_linked: self.rows_linked,
-            internal_vectors: self.internal_vectors,
             needs_ordering: self.needs_ordering,
             // The frame retains the order, not the numeric factors.
             factored: false,
@@ -945,6 +997,54 @@ impl<T: Scalar> Sparse<T> {
             singular_row: self.singular_row,
             singular_col: self.singular_col,
             small_pivot: self.small_pivot,
+        }
+    }
+
+    /// Fork the ordering, not the numeric payload, when a retained
+    /// snapshot prevents moving its storage. The caller reloads originals
+    /// before factoring. Markowitz and factor scratch are initialized only
+    /// if the new operation needs them.
+    pub(super) fn fork_for_reload<U: Scalar>(&self) -> Sparse<U> {
+        Sparse {
+            size: self.size,
+            ext_size: self.ext_size,
+            current_size: self.current_size,
+            topology: self.topology.clone(),
+            values: vec![U::ZERO; self.values.len()],
+            plan: self.plan.clone(),
+            markowitz_row: Vec::new(),
+            markowitz_col: Vec::new(),
+            markowitz_prod: Vec::new(),
+            factor_workspace: Vec::new(),
+            singletons: 0,
+            rel_threshold: self.rel_threshold,
+            abs_threshold: self.abs_threshold,
+            rows_linked: self.rows_linked,
+            needs_ordering: self.needs_ordering,
+            factored: false,
+            interchanges_odd: self.interchanges_odd,
+            status: self.status,
+            singular_row: self.singular_row,
+            singular_col: self.singular_col,
+            small_pivot: self.small_pivot,
+        }
+    }
+
+    /// Get mutable storage for a full coefficient reload. Unique frames
+    /// keep their numeric buffers; shared frames don't copy discarded data.
+    pub(super) fn for_reload(shared: &mut std::sync::Arc<Self>) -> &mut Self {
+        if std::sync::Arc::strong_count(shared) > 1 {
+            *shared = std::sync::Arc::new(shared.fork_for_reload());
+        }
+        std::sync::Arc::make_mut(shared)
+    }
+
+    /// Switch scalar type, moving unique storage and forking only the
+    /// ordering if another snapshot remains alive.
+    pub(super) fn retype_shared<U: Scalar>(shared: std::sync::Arc<Self>) -> Sparse<U> {
+        match std::sync::Arc::try_unwrap(shared) {
+            Ok(owned) => owned.into_retyped(),
+            Err(retained) => retained.fork_for_reload(),
         }
     }
 
@@ -1222,9 +1322,15 @@ impl<T: Scalar> Sparse<T> {
             if !self.rows_linked {
                 self.link_rows();
             }
-            if !self.internal_vectors || self.markowitz_row.len() <= self.size {
-                self.create_internal_vectors();
-            }
+        }
+        // Reordering always rebuilds all active counts. A snapshot fork
+        // needs no copy of the previous ordering's scratch arrays.
+        // Once pivot search starts, a failure can leave a partially
+        // exchanged topology and a discarded plan. Only done() publishes
+        // a reusable ordering.
+        self.needs_ordering = true;
+        if self.markowitz_row.len() <= self.size {
+            self.create_internal_vectors();
         }
         self.count_markowitz(step);
         self.markowitz_products(step);
@@ -1363,7 +1469,6 @@ impl<T: Scalar> Sparse<T> {
         self.markowitz_row = vec![0; size + 1];
         self.markowitz_col = vec![0; size + 1];
         self.markowitz_prod = vec![0; size + 2];
-        self.internal_vectors = true;
     }
 
     /// `CountMarkowitz` (no RHS).
@@ -1756,16 +1861,12 @@ impl<T: Scalar> Sparse<T> {
     /// Exchange rows in the linked topology and Markowitz counts.
     fn row_exchange(&mut self, a: usize, b: usize) {
         std::sync::Arc::make_mut(&mut self.topology).row_exchange(a, b);
-        if self.internal_vectors {
-            self.markowitz_row.swap(a, b);
-        }
+        self.markowitz_row.swap(a, b);
     }
 
     fn col_exchange(&mut self, a: usize, b: usize) {
         std::sync::Arc::make_mut(&mut self.topology).col_exchange(a, b);
-        if self.internal_vectors {
-            self.markowitz_col.swap(a, b);
-        }
+        self.markowitz_col.swap(a, b);
     }
 
     /// `RealRowColElimination` / `ComplexRowColElimination`.
@@ -2193,6 +2294,48 @@ mod tests {
     }
 
     #[test]
+    fn batched_original_builder_preserves_translation_and_creation_order() {
+        let entries = [
+            (4, 2, 2.),
+            (2, 1, 1.),
+            (1, 4, 3.),
+            (2, 2, 4.),
+            (1, 1, 5.),
+            (4, 4, 6.),
+        ];
+        let mut a = Sparse::from_originals(5, entries);
+        let mut b = build(5, &entries);
+        assert_eq!(a.size, b.size);
+        assert_eq!(a.topology.int_to_ext_row, b.topology.int_to_ext_row);
+        assert_eq!(a.topology.int_to_ext_col, b.topology.int_to_ext_col);
+        assert_eq!(a.topology.first_in_col, b.topology.first_in_col);
+        assert_eq!(a.topology.diag, b.topology.diag);
+        for (a, b) in a.topology.elements.iter().zip(&b.topology.elements) {
+            assert_eq!(
+                (a.row, a.col, a.next_in_col, a.next_in_row),
+                (b.row, b.col, b.next_in_col, b.next_in_row)
+            );
+        }
+        assert_eq!(a.values, b.values);
+        a.mna_preorder();
+        b.mna_preorder();
+        assert_eq!(a.order_and_factor(1e-3, 0.), Status::Okay);
+        assert_eq!(b.order_and_factor(1e-3, 0.), Status::Okay);
+        assert_eq!(a.topology.int_to_ext_row, b.topology.int_to_ext_row);
+        assert_eq!(a.topology.int_to_ext_col, b.topology.int_to_ext_col);
+        assert!(
+            a.values
+                .iter()
+                .map(|v| v.to_bits())
+                .eq(b.values.iter().map(|v| v.to_bits()))
+        );
+        assert_eq!(
+            a.solve(&[1., -0., 2., 3., 4.]),
+            b.solve(&[1., -0., 2., 3., 4.])
+        );
+    }
+
+    #[test]
     fn traversal_plan_matches_links_and_is_shared_until_topology_changes() {
         let entries = [
             (1, 2, 3.),
@@ -2204,10 +2347,7 @@ mod tests {
             (4, 4, 4.),
             (4, 1, 1.),
         ];
-        let mut m = Sparse::<f64>::new(4);
-        for (r, c, v) in entries {
-            m.append_original(r, c, v);
-        }
+        let mut m = Sparse::from_originals(4, entries);
         m.mna_preorder();
         assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
         let plan = std::sync::Arc::clone(m.plan.as_ref().unwrap());
@@ -2315,6 +2455,80 @@ mod tests {
     }
 
     #[test]
+    fn failed_reorder_cannot_publish_a_partial_traversal() {
+        let entries = [
+            (1, 1, 4.),
+            (1, 2, 1.),
+            (1, 3, 1.),
+            (2, 1, 1.),
+            (2, 2, 5.),
+            (2, 3, 1.),
+            (3, 1, 1.),
+            (3, 2, 1.),
+            (3, 3, 6.),
+        ];
+        let input = entries.map(|(_, _, v)| v);
+        let mut a = build(3, &entries);
+        assert_eq!(a.order_and_factor(1e-3, 0.), Status::Okay);
+        let saved = a.clone();
+        let rhs = [6., 7., 8.];
+        let expected = saved.solve(&rhs);
+        a.clear();
+        // Force a threshold failure at the first old pivot, and allow
+        // a different diagonal pivot before encountering singularity.
+        a.values[a.topology.diag[2]] = 2.;
+        assert_eq!(a.order_and_factor(1e-3, 0.), Status::Singular);
+        assert!(!a.is_factored());
+        assert!(!a.can_refactor());
+        assert!(a.plan.is_none());
+        a.reload_originals(&input);
+        assert_eq!(a.factor(), Status::Okay);
+        let x = a.solve(&rhs);
+        for v in x {
+            assert!((v - 1.).abs() < 1e-14);
+        }
+        assert_eq!(saved.solve(&rhs), expected);
+    }
+
+    #[test]
+    fn reload_fork_preserves_snapshots_without_copying_numeric_scratch() {
+        let entries = [(1, 1, 4.), (1, 2, 1.), (2, 1, 2.), (2, 2, 5.)];
+        let rhs = [5., 7.];
+        let mut a = build(2, &entries);
+        assert_eq!(a.order_and_factor(1e-3, 0.), Status::Okay);
+        a.reload_originals(&entries.map(|(_, _, v)| v));
+        assert_eq!(a.factor(), Status::Okay);
+        let saved = std::sync::Arc::new(a);
+        let expected = saved.solve(&rhs);
+        let mut changed = std::sync::Arc::clone(&saved);
+        let next = Sparse::for_reload(&mut changed);
+        assert!(next.values.iter().all(|v| *v == 0.));
+        assert!(next.markowitz_row.is_empty());
+        assert!(next.markowitz_col.is_empty());
+        assert!(next.markowitz_prod.is_empty());
+        assert!(next.factor_workspace.is_empty());
+        next.reload_originals(&[8., 1., 2., 5.]);
+        assert_eq!(next.factor(), Status::Okay);
+        assert_ne!(next.solve(&rhs), expected);
+        assert!(std::sync::Arc::ptr_eq(
+            next.plan.as_ref().unwrap(),
+            saved.plan.as_ref().unwrap()
+        ));
+        assert_eq!(saved.solve(&rhs), expected);
+        // Force threshold failure and a new pivot order: deferred counts
+        // must be allocated before searching and creating fill-ins.
+        next.reload_originals(&[0., 1., 2., 5.]);
+        assert_eq!(next.order_and_factor(1e-3, 0.), Status::Okay);
+        assert!(!next.markowitz_row.is_empty());
+        assert_eq!(saved.solve(&rhs), expected);
+        let c: Sparse<Complex> = Sparse::retype_shared(std::sync::Arc::clone(&saved));
+        assert!(c.values.iter().all(|v| *v == Complex::ZERO));
+        assert!(c.factor_workspace.is_empty());
+        assert!(c.markowitz_row.is_empty());
+        assert_eq!(saved.solve(&rhs), expected);
+    }
+
+    #[test]
     fn snapshot_topology_is_shared_until_structural_mutation() {
         let mut a = build(3, &[(1, 1, 4.), (2, 2, 5.), (1, 2, 1.)]);
         assert_eq!(a.order_and_factor(1e-3, 0.), Status::Okay);
@@ -2361,10 +2575,7 @@ mod tests {
             (4, 4, 4.),
             (4, 1, 1.),
         ];
-        let mut m = Sparse::<f64>::new(4);
-        for (r, c, v) in entries {
-            m.append_original(r, c, v);
-        }
+        let mut m = Sparse::from_originals(4, entries);
         assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
         assert!(m.values.len() > entries.len());
         let rhs = [5.; 4];

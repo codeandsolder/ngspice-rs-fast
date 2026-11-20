@@ -407,21 +407,12 @@ impl ComplexMatrix {
     }
 
     fn fresh_frame(&self) -> Sparse<Complex> {
-        let mut sparse = Sparse::new(self.n);
         match &self.assembly {
-            Assembly::Bound { pattern, values } => {
-                for (index, &v) in values.iter().enumerate() {
-                    let (r, c) = pattern.position(crate::maths::sparse::element_id(index));
-                    sparse.append_original(r + 1, c + 1, v);
-                }
-            }
+            Assembly::Bound { pattern, values } => Sparse::from_pattern(pattern, values),
             Assembly::Standalone(entries) => {
-                for &(r, c, v) in entries {
-                    sparse.append_original(r + 1, c + 1, v);
-                }
+                Sparse::from_originals(self.n, entries.iter().map(|&(r, c, v)| (r + 1, c + 1, v)))
             }
         }
-        sparse
     }
 
     fn order_key(&self) -> ComplexOrder {
@@ -446,7 +437,7 @@ impl ComplexMatrix {
         if previous.n != self.n || !previous.order.matches(entries) {
             return self.factorize();
         }
-        let mut sparse = (*previous.factors.sparse).clone();
+        let mut sparse = previous.factors.sparse.fork_for_reload();
         let load = |sparse: &mut Sparse<Complex>| {
             sparse.reload_originals_iter(entries.iter().map(|&(_, _, v)| v));
         };
