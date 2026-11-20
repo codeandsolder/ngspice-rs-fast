@@ -140,6 +140,13 @@ impl SweepSpec {
     /// # Errors
     /// [`SpiceError::Unsupported`] for any of the above.
     pub fn grid(&self) -> SpiceResult<Vec<Real>> {
+        Ok(self.exact_values()?.collect())
+    }
+
+    /// Validate the exact, index-based grid without allocating it. Resolution
+    /// needs its length only; the C-compatible accumulated grid needs the
+    /// same validation and capacity hint, but evaluates a different sequence.
+    fn exact_values(&self) -> SpiceResult<impl ExactSizeIterator<Item = Real> + Clone> {
         let (start, stop, step) = (self.start, self.stop, self.step);
         if ![start, stop, step].iter().all(|v| v.is_finite()) || step == 0. {
             return Err(unsupported(
@@ -160,11 +167,19 @@ impl SweepSpec {
         }
         let steps = crate::primitives::exact_nonnegative_integer::<usize>(steps)
             .ok_or_else(|| unsupported("DC sweep point limit exceeded"))?;
-        let mut values: Vec<Real> = (0..=steps).map(|i| start + (i as Real) * step).collect();
-        if steps > 0 && (ratio - steps as Real).abs() <= slack {
-            values[steps] = stop;
+        let snap_stop = steps > 0 && (ratio - steps as Real).abs() <= slack;
+        let values = (0..steps + 1).map(move |i| {
+            if snap_stop && i == steps {
+                stop
+            } else {
+                start + (i as Real) * step
+            }
+        });
+        let mut previous = None;
+        for value in values.clone() {
+            self.check_value(value, previous)?;
+            previous = Some(value);
         }
-        self.check_values(&values)?;
         Ok(values)
     }
 
@@ -182,7 +197,7 @@ impl SweepSpec {
     /// limits applied to the accumulated values.
     pub fn accumulated_grid(&self) -> SpiceResult<Vec<Real>> {
         // The same input validation (finite, direction, budget) as the grid.
-        self.grid()?;
+        let expected = self.exact_values()?.len();
         let offset = match self.target {
             SweepTarget::Temperature => CELSIUS_TO_KELVIN,
             _ => 0.,
@@ -190,7 +205,7 @@ impl SweepSpec {
         let tolerance = 1e3 * Real::EPSILON;
         let direction = self.step.signum();
         let mut stored = self.start + offset;
-        let mut values = Vec::new();
+        let mut values = Vec::with_capacity(expected);
         loop {
             let value = stored - offset;
             if direction * (value - self.stop) > tolerance {
@@ -199,28 +214,24 @@ impl SweepSpec {
             if values.len() >= MAX_SWEEP_POINTS {
                 return Err(unsupported("DC sweep point limit exceeded"));
             }
+            self.check_value(value, values.last().copied())?;
             values.push(value);
             stored += self.step;
         }
-        self.check_values(&values)?;
         Ok(values)
     }
 
-    fn check_values(&self, values: &[Real]) -> SpiceResult<()> {
-        let step = self.step;
-        if values.iter().any(|v| !v.is_finite()) {
+    fn check_value(&self, value: Real, previous: Option<Real>) -> SpiceResult<()> {
+        if !value.is_finite() {
             return Err(unsupported("DC sweep overflows"));
         }
-        if values
-            .windows(2)
-            .any(|w| (w[1] - w[0]) * step.signum() <= 0.)
-        {
+        if previous.is_some_and(|previous| (value - previous) * self.step.signum() <= 0.) {
             return Err(unsupported("DC sweep makes no progress"));
         }
-        if self.target == SweepTarget::Temperature && values.iter().any(|v| *v <= -273.15) {
+        if self.target == SweepTarget::Temperature && value <= -273.15 {
             return Err(unsupported("DC temperature below absolute zero"));
         }
-        if self.target.is_resistance() && values.iter().any(|v| *v == 0. || !(1. / v).is_finite()) {
+        if self.target.is_resistance() && (value == 0. || !(1. / value).is_finite()) {
             return Err(unsupported(
                 "DC resistance must be nonzero with finite conductance",
             ));
@@ -439,7 +450,7 @@ pub fn resolve(
             step: number(Some(axis[3]), "sweep step")?,
         };
         work = work
-            .checked_mul(spec.grid()?.len())
+            .checked_mul(spec.exact_values()?.len())
             .filter(|n| *n <= MAX_SWEEP_POINTS)
             .ok_or_else(|| unsupported("nested DC sweep point limit exceeded"))?;
         axes.push(spec);
@@ -768,4 +779,40 @@ pub(crate) fn run(
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod grid_tests {
+    use super::*;
+
+    #[test]
+    fn exact_and_accumulated_grids_keep_their_distinct_endpoint_arithmetic() {
+        let spec = SweepSpec {
+            target: SweepTarget::VoltageSource("v1".into()),
+            start: 0.3,
+            stop: 0.,
+            step: -0.1,
+        };
+        assert_eq!(spec.exact_values().unwrap().len(), 4);
+        let exact = spec.grid().unwrap();
+        let accumulated = spec.accumulated_grid().unwrap();
+        assert_eq!(exact.len(), accumulated.len());
+        assert_eq!(exact[3].to_bits(), 0_f64.to_bits());
+        let expected = ((spec.start + spec.step) + spec.step) + spec.step;
+        assert_eq!(accumulated[3].to_bits(), expected.to_bits());
+        assert_ne!(accumulated[3].to_bits(), exact[3].to_bits());
+    }
+
+    #[test]
+    fn kelvin_accumulation_rejects_sub_ulp_temperature_steps() {
+        let spec = SweepSpec {
+            target: SweepTarget::Temperature,
+            start: 0.,
+            stop: 1e-12,
+            step: 1e-15,
+        };
+        assert_eq!(spec.grid().unwrap().len(), 1001);
+        let error = spec.accumulated_grid().unwrap_err();
+        assert!(error.to_string().contains("makes no progress"));
+    }
 }
