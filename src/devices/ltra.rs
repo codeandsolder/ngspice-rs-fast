@@ -288,25 +288,19 @@ impl LtraModel {
             ))
         };
         // ltraset.c's classification, in C's order (later tests win).
-        let mut case = None;
-        if resist == 0. && conduct == 0. && capac != 0. && induct != 0. {
-            case = Some(LtraCase::Lc);
-        }
-        if resist != 0. && conduct == 0. && capac != 0. && induct != 0. {
-            case = Some(LtraCase::Rlc);
-        }
-        if resist != 0. && conduct == 0. && capac != 0. && induct == 0. {
-            case = Some(LtraCase::Rc);
-        }
-        if resist != 0. && conduct == 0. && capac == 0. && induct != 0. {
-            return fail("RL line not supported yet");
-        }
-        if resist != 0. && conduct != 0. && capac == 0. && induct == 0. {
-            case = Some(LtraCase::Rg);
-        }
-        if conduct != 0. && (capac != 0. || induct != 0.) {
-            return fail("Nonzero G (except RG) line not supported yet");
-        }
+        // The supported classifications are mutually exclusive. Keep the
+        // reference's explicit refusals ahead of the generic validation.
+        let case = match (resist == 0., conduct == 0., induct == 0., capac == 0.) {
+            (true, true, false, false) => Some(LtraCase::Lc),
+            (false, true, false, false) => Some(LtraCase::Rlc),
+            (false, true, true, false) => Some(LtraCase::Rc),
+            (false, true, false, true) => return fail("RL line not supported yet"),
+            (false, false, true, true) => Some(LtraCase::Rg),
+            (_, false, false, _) | (_, false, _, false) => {
+                return fail("Nonzero G (except RG) line not supported yet");
+            }
+            _ => None,
+        };
         let nonzero = [resist, conduct, induct, capac]
             .iter()
             .filter(|v| **v != 0.)
@@ -472,7 +466,7 @@ enum RealEntries {
 }
 
 impl RealEntries {
-    fn as_slice(&self) -> &[RealEntry] {
+    const fn as_slice(&self) -> &[RealEntry] {
         match self {
             Self::Dc(entries) => entries,
             Self::Rg(entries) => entries,
@@ -840,14 +834,13 @@ impl LossyLine {
                 None
             };
             for (k, value) in delayed.iter_mut().enumerate() {
-                let mut d = 0.;
-                let mut range = (0., 0.);
-                if let Some([q1, q2, q3]) = qf {
+                let (mut d, out_of_range) = if let Some([q1, q2, q3]) = qf {
                     let (a, b, c) = (sample(i - 1, k), sample(i, k), sample(i + 1, k));
-                    d = a * q1 + b * q2 + c * q3;
-                    range = (a.max(b).max(c), a.min(b).min(c));
-                }
-                let out_of_range = qf.is_some() && (d > range.0 || d < range.1);
+                    let d = a * q1 + b * q2 + c * q3;
+                    (d, d > a.max(b).max(c) || d < a.min(b).min(c))
+                } else {
+                    (0., false)
+                };
                 // C falls back to linear for lininterp, at the first sample,
                 // and for mixedinterp when the quadratic leaves the samples'
                 // range (quadinterp keeps the out-of-range value).
@@ -1320,9 +1313,8 @@ impl DelayLine for LossyLine {
         if !matches!(m.case, LtraCase::Lc | LtraCase::Rlc) {
             return Ok(None);
         }
-        let mut bound = None;
-        if m.step_limit {
-            bound = Some(m.td);
+        let mut bound = if m.step_limit {
+            Some(m.td)
         } else {
             let count = history.len();
             if count < 2 {
@@ -1346,10 +1338,8 @@ impl DelayLine for LossyLine {
             let h_old = at(index) - at(index - 1);
             let (d1, d2) = ((i1 - i2) / h, (i2 - i3) / h_old);
             let (d3, d4) = ((i4 - i5) / h, (i5 - i6) / h_old);
-            if self.slope_changed(d1, d2) || self.slope_changed(d3, d4) {
-                bound = Some(m.td);
-            }
-        }
+            (self.slope_changed(d1, d2) || self.slope_changed(d3, d4)).then_some(m.td)
+        };
         if m.case == LtraCase::Rlc && !m.trunc_dont_cut {
             // ltraset.c: compactrel/compactabs default to reltol/abstol.
             let reltol = if m.st_line_reltol == 0. {
