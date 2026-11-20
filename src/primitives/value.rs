@@ -55,9 +55,8 @@ pub fn approx_eq(a: Real, b: Real, relative_tolerance: Real) -> bool {
 /// most `max_ulps` apart.
 #[must_use]
 pub fn almost_equal_ulps(a: Real, b: Real, max_ulps: i64) -> bool {
-    if a == b {
-        return true;
-    }
+    // The ordered mapping already makes equal values, including both signed
+    // zeros, zero ULPs apart.
     // Lexicographically ordered integer representations (`INT64_MIN - bits`
     // for negative values), compared without overflow.
     let ordered = |x: Real| {
@@ -159,6 +158,10 @@ impl Sub for Complex {
 impl Mul for Complex {
     type Output = Self;
 
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "ordinary SPICE complex multiplication preserves separate product rounding"
+    )]
     fn mul(self, rhs: Self) -> Self {
         Self::new(
             self.re * rhs.re - self.im * rhs.im,
@@ -170,6 +173,10 @@ impl Mul for Complex {
 impl Div for Complex {
     type Output = Self;
 
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "the normal complex-division path uses the reference C squared denominator"
+    )]
     fn div(self, rhs: Self) -> Self {
         let denominator = rhs.re * rhs.re + rhs.im * rhs.im;
         let ac = self.re * rhs.re;
@@ -281,6 +288,12 @@ impl ScaledProduct {
     }
 }
 
+/// Extract the binary64 exponent field without a checked narrowing that can panic.
+fn biased_exponent(bits: u64) -> i32 {
+    let [high, next, ..] = bits.to_be_bytes();
+    i32::from((u16::from_be_bytes([high, next]) >> 4) & 0x07ff)
+}
+
 /// Exact unbiased exponent of a finite, nonzero binary64 magnitude,
 /// including subnormals. Returns None for zero, infinity and NaN.
 pub(crate) fn binary_exponent(value: Real) -> Option<i32> {
@@ -288,10 +301,10 @@ pub(crate) fn binary_exponent(value: Real) -> Option<i32> {
         return None;
     }
     let bits = value.abs().to_bits();
-    let biased = i32::try_from((bits >> 52) & 0x7ff).expect("11-bit exponent");
+    let biased = biased_exponent(bits);
     if biased == 0 {
-        let leading =
-            i32::try_from(bits.leading_zeros()).expect("binary64 has at most 64 leading zeros");
+        // The count is at most 64, so its signed representation is identical.
+        let leading = bits.leading_zeros().cast_signed();
         Some(63 - leading - 1074)
     } else {
         Some(biased - 1023)
@@ -302,7 +315,7 @@ pub(crate) fn binary_exponent(value: Real) -> Option<i32> {
 /// in magnitude and an unbiased exponent, including subnormals.
 fn split_power(value: Real) -> (Real, i32) {
     let bits = value.to_bits();
-    let exponent = i32::try_from((bits >> 52) & 0x7ff).expect("11-bit exponent");
+    let exponent = biased_exponent(bits);
     if exponent == 0 {
         let (mantissa, exponent) = split_power(value * 4_503_599_627_370_496.0);
         return (mantissa, exponent - 52);
@@ -329,7 +342,7 @@ fn scale_power(mut value: Real, mut exponent: i32) -> Real {
         value *= Real::MIN_POSITIVE;
         exponent += 1022;
     }
-    value * Real::from_bits(u64::try_from(exponent + 1023).expect("normal exponent") << 52)
+    value * Real::from_bits(u64::from((exponent + 1023).cast_unsigned()) << 52)
 }
 
 #[cold]
@@ -409,6 +422,20 @@ fn scale_suffix(letter: char, rest: &str) -> (i32, usize, bool) {
     }
 }
 
+/// Consume consecutive decimal digits with the reference mantissa accumulator.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "INPevaluate rounds multiplication by ten before adding the digit"
+)]
+fn scan_mantissa_digits(bytes: &[u8], index: &mut usize, mantissa: &mut Real) -> usize {
+    let start = *index;
+    while bytes.get(*index).is_some_and(u8::is_ascii_digit) {
+        *mantissa = 10.0 * *mantissa + Real::from(bytes[*index] - b'0');
+        *index += 1;
+    }
+    *index - start
+}
+
 /// Parses a literal from the start of `input`, reporting bytes consumed.
 ///
 /// Does not skip leading whitespace: the literal must begin at byte 0. Returns
@@ -446,25 +473,18 @@ pub fn parse_spice_number_prefix(input: &str) -> Option<ParsedNumber> {
     }
 
     let mut mantis: Real = 0.0;
-    let mut expo1: i32 = 0;
-    let mut mantissa_digits = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        mantis = 10.0 * mantis + Real::from(bytes[i] - b'0');
+    let integer_digits = scan_mantissa_digits(bytes, &mut i, &mut mantis);
+    let fractional_digits = if bytes.get(i) == Some(&b'.') {
         i += 1;
-        mantissa_digits += 1;
-    }
-    if bytes.get(i) == Some(&b'.') {
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            mantis = 10.0 * mantis + Real::from(bytes[i] - b'0');
-            expo1 = expo1.saturating_sub(1);
-            i += 1;
-            mantissa_digits += 1;
-        }
-    }
-    if mantissa_digits == 0 {
+        scan_mantissa_digits(bytes, &mut i, &mut mantis)
+    } else {
+        0
+    };
+    if integer_digits == 0 && fractional_digits == 0 {
         return None;
     }
+    // Match the old saturating decrement once per fractional digit.
+    let expo1 = i32::try_from(fractional_digits).map_or(i32::MIN, |count| -count);
 
     let mut expo2: i32 = 0;
     if bytes
@@ -517,6 +537,10 @@ pub fn parse_spice_number_prefix(input: &str) -> Option<ParsedNumber> {
 /// The signed C range is asymmetric: `i32::MIN` is a valid result, while
 /// `-i32::MIN` is not. Check the actual bounds before the narrowing cast.
 #[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the rounded result is integral, finite and checked against the full i32 range"
+)]
 pub fn c_integer(value: Real) -> Option<i64> {
     let rounded = (0.5 + value).floor();
     if !rounded.is_finite() || rounded < Real::from(i32::MIN) || rounded > Real::from(i32::MAX) {
@@ -534,6 +558,14 @@ pub fn c_integer(value: Real) -> Option<i64> {
 /// `u32` range, even on targets whose `usize` is narrower than 32 bits.
 /// It validates the supplied `f64`, not digits already lost during parsing.
 #[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the value is checked for integrality and bounded below 2^128 before conversion"
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "the range check rejects every negative value except signed zero"
+)]
 pub fn exact_nonnegative_integer<T: TryFrom<u128>>(value: Real) -> Option<T> {
     let exclusive_upper_bound = Real::from(128).exp2();
     if !value.is_finite() || value < 0. || value.fract() != 0. || value >= exclusive_upper_bound {
@@ -663,23 +695,22 @@ pub fn format_spice_number(value: Real) -> String {
         // `NaN`, `inf` and `-inf` have no exponent part.
         return text;
     };
-    if let Ok(exponent) = exponent.parse::<i32>() {
-        format!(
-            "{mantissa}e{}{:02}",
-            if exponent < 0 { '-' } else { '+' },
-            exponent.unsigned_abs()
-        )
-    } else {
-        text
-    }
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        return text;
+    };
+    format!(
+        "{mantissa}e{}{:02}",
+        if exponent < 0 { '-' } else { '+' },
+        exponent.unsigned_abs()
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Complex, almost_equal_ulps, approx_eq, c_integer, exact_nonnegative_integer,
-        format_spice_number, parse_numparam_number_prefix, parse_spice_number,
-        parse_spice_number_prefix,
+        Complex, almost_equal_ulps, approx_eq, binary_exponent, c_integer,
+        exact_nonnegative_integer, format_spice_number, parse_numparam_number_prefix,
+        parse_spice_number, parse_spice_number_prefix,
     };
 
     #[test]
@@ -788,6 +819,8 @@ mod tests {
     fn ulp_comparison_uses_a_wide_difference_for_distant_floats() {
         assert!(almost_equal_ulps(1., 1., 0));
         assert!(almost_equal_ulps(-0., 0., 0));
+        assert!(almost_equal_ulps(f64::INFINITY, f64::INFINITY, 0));
+        assert!(almost_equal_ulps(f64::NAN, f64::NAN, 0));
         assert!(almost_equal_ulps(1., f64::from_bits(1f64.to_bits() + 1), 1));
         assert!(!almost_equal_ulps(
             1.,
@@ -806,6 +839,25 @@ mod tests {
         assert!(almost_equal_ulps(-first_subnormal, -second_subnormal, 1));
         assert!(!almost_equal_ulps(-first_subnormal, second_subnormal, 2));
         assert!(almost_equal_ulps(-first_subnormal, first_subnormal, 2));
+    }
+
+    #[test]
+    fn binary_exponent_covers_every_finite_exponent_and_subnormal_bit() {
+        for biased in 1_u64..=2046 {
+            let value = f64::from_bits(biased << 52);
+            let expected = i32::try_from(biased).unwrap() - 1023;
+            assert_eq!(binary_exponent(value), Some(expected));
+            assert_eq!(binary_exponent(-value), Some(expected));
+        }
+        for bit in 0_u32..52 {
+            let value = f64::from_bits(1_u64 << bit);
+            let expected = i32::try_from(bit).unwrap() - 1074;
+            assert_eq!(binary_exponent(value), Some(expected));
+            assert_eq!(binary_exponent(-value), Some(expected));
+        }
+        for value in [0., -0., f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert_eq!(binary_exponent(value), None);
+        }
     }
 
     #[test]
