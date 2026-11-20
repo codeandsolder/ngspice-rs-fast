@@ -216,9 +216,12 @@ impl Pattern {
     /// independent factor snapshots. A busy or poisoned slot is optional:
     /// the solve still runs with its own scratch in exactly the same order.
     pub(super) fn with_complex_workspace<R>(&self, f: impl FnOnce(&mut Vec<Complex>) -> R) -> R {
-        match self.complex_workspace.try_lock() {
-            Ok(mut workspace) => f(&mut workspace),
-            Err(_) => f(&mut Vec::new()),
+        if let Ok(mut workspace) = self.complex_workspace.try_lock() {
+            let result = f(&mut workspace);
+            drop(workspace);
+            result
+        } else {
+            f(&mut Vec::new())
         }
     }
 
@@ -495,7 +498,7 @@ impl Bound {
 
     /// The device's next traced element when it is at `(row, col)` and this
     /// load is not recording its own trace (otherwise [`Self::element`]).
-    #[inline(always)]
+    #[inline]
     fn replay(&mut self, row: usize, col: usize) -> Option<ElementId> {
         if self.cursor >= self.end || self.recording.is_some() {
             return None;
@@ -603,7 +606,7 @@ impl SparseMatrix {
     }
 
     /// Construct an already folded stream from a trusted assembly pass.
-    /// Its coordinates are sorted and unique, as with fold_duplicates.
+    /// Its coordinates are sorted and unique, as with `fold_duplicates`.
     pub(super) fn from_assembled(rows: usize, cols: usize, mut triplets: Vec<Triplet>) -> Self {
         debug_assert!(triplets.iter().all(|t| t.row < rows && t.col < cols));
         debug_assert!(
@@ -809,7 +812,7 @@ impl SparseMatrix {
             && let (Ok(len), Ok(mask)) = (u8::try_from(len), u32::try_from(mask))
             && let Some(slot) = bound.fixed.batches.get_mut(bound.device)
         {
-            *slot = Some(VerifiedBatch { len, mask });
+            *slot = Some(VerifiedBatch { mask, len });
         }
     }
 
@@ -930,7 +933,7 @@ impl SparseMatrix {
     /// # Errors
     ///
     /// [`SpiceError::Numerical`] when the position is out of range.
-    #[inline(always)]
+    #[inline]
     pub fn add(&mut self, row: usize, col: usize, value: Real) -> SpiceResult<()> {
         // The common case: the device's next traced stamp, which lies in the
         // pattern and hence in range.
@@ -1139,12 +1142,14 @@ impl SparseMatrix {
                 let value = bound.values[id.index()];
                 if value != 0.0 {
                     let (row, col) = bound.pattern.position(id);
-                    y[row] += value * x[col];
+                    let product = value * x[col];
+                    y[row] += product;
                 }
             }
         } else {
             for triplet in self.triplets() {
-                y[triplet.row] += triplet.value * x[triplet.col];
+                let product = triplet.value * x[triplet.col];
+                y[triplet.row] += product;
             }
         }
         Ok(result)
