@@ -8,23 +8,23 @@ use std::collections::BTreeMap;
 use ngspice_rs::analysis::{Plot, PlotFlags};
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Tolerance {
+pub(super) struct Tolerance {
     relative: f64,
     absolute: f64,
 }
 
-pub(crate) const DC: Tolerance = Tolerance {
+pub(super) const DC: Tolerance = Tolerance {
     relative: 1e-12,
     absolute: 1e-15,
 };
-pub(crate) const AC: Tolerance = Tolerance {
+pub(super) const AC: Tolerance = Tolerance {
     relative: 1e-10,
     absolute: 1e-12,
 };
 
 /// Nonlinear bias/AC allow 1 ppm for independently converged bias Jacobians,
 /// plus a 1 p-unit floor. The linear LU-only tolerances remain unchanged.
-pub(crate) const NONLINEAR: Tolerance = Tolerance {
+pub(super) const NONLINEAR: Tolerance = Tolerance {
     relative: 1e-6,
     absolute: 1e-12,
 };
@@ -36,7 +36,7 @@ pub(crate) const NONLINEAR: Tolerance = Tolerance {
 /// density yet above the residue C's adjoint leaves for a generator whose
 /// transfer is exactly zero (e.g. about 2e-25 V/sqrt(Hz) for a resistor in
 /// series with the current-source input).
-pub(crate) const NOISE: Tolerance = Tolerance {
+pub(super) const NOISE: Tolerance = Tolerance {
     relative: 1e-10,
     absolute: 1e-20,
 };
@@ -44,7 +44,7 @@ pub(crate) const NOISE: Tolerance = Tolerance {
 /// `.noise` of nonlinear circuits: the nonlinear 1 ppm bias bound (the
 /// generators are evaluated at independently converged operating points)
 /// with the noise floor of [`NOISE`].
-pub(crate) const NOISE_NONLINEAR: Tolerance = Tolerance {
+pub(super) const NOISE_NONLINEAR: Tolerance = Tolerance {
     relative: 1e-6,
     absolute: 1e-20,
 };
@@ -56,7 +56,7 @@ pub(crate) const NOISE_NONLINEAR: Tolerance = Tolerance {
 /// with margin. Parameters C perturbs without effect read exactly 0 (or a
 /// rounding residue, e.g. about 4e-14 from the cosine of a 1e-6 degree AC
 /// phase), which the 1e-12 floor accepts.
-pub(crate) const SENSITIVITY: Tolerance = Tolerance {
+pub(super) const SENSITIVITY: Tolerance = Tolerance {
     relative: 1e-8,
     absolute: 1e-12,
 };
@@ -67,7 +67,7 @@ pub(crate) const SENSITIVITY: Tolerance = Tolerance {
 /// for an O(1) parameter of an O(1) V output (C's own result for a diode's
 /// `nr` moves by 3e-10 between RELTOL 1e-6 and 1e-9 for that reason), which a
 /// 1e-9 floor covers.
-pub(crate) const SENSITIVITY_NONLINEAR: Tolerance = Tolerance {
+pub(super) const SENSITIVITY_NONLINEAR: Tolerance = Tolerance {
     relative: 1e-6,
     absolute: 1e-9,
 };
@@ -84,7 +84,7 @@ pub(crate) const SENSITIVITY_NONLINEAR: Tolerance = Tolerance {
 /// other column is inside [`SENSITIVITY_NONLINEAR`]. The bound still rejects a
 /// real model difference - it is 1e-5, and the MESA `tRsi` defect this fixture
 /// family exposed sat at 1e-2..2e-1.
-pub(crate) const SENSITIVITY_CANCELLED: Tolerance = Tolerance {
+pub(super) const SENSITIVITY_CANCELLED: Tolerance = Tolerance {
     relative: 1e-5,
     absolute: 5e-8,
 };
@@ -97,7 +97,7 @@ pub(crate) const SENSITIVITY_CANCELLED: Tolerance = Tolerance {
 /// stays below every such response yet above the residue (about 1e-28) a
 /// node fixed by a voltage source keeps in the Rust LU solve where C writes
 /// an exact zero.
-pub(crate) const DISTORTION: Tolerance = Tolerance {
+pub(super) const DISTORTION: Tolerance = Tolerance {
     relative: 1e-6,
     absolute: 1e-18,
 };
@@ -107,7 +107,7 @@ pub(crate) const DISTORTION: Tolerance = Tolerance {
 /// more accurate Rust root, not its equations, causes the 0.062% last-point
 /// current difference. This bound applies only to that legacy golden; newly
 /// demonstrated DC/AC decks retain NONLINEAR's 1 ppm requirement.
-pub(crate) const LEGACY_DIODE_DC: Tolerance = Tolerance {
+pub(super) const LEGACY_DIODE_DC: Tolerance = Tolerance {
     relative: 1e-3,
     absolute: 1e-12,
 };
@@ -131,14 +131,14 @@ pub(crate) const LEGACY_DIODE_DC: Tolerance = Tolerance {
 /// `peak_relative` adds `peak_relative * max|C signal|` to the bound (0 for
 /// [`TRAN`]).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct TranTolerance {
-    pub(crate) peak_relative: f64,
-    pub(crate) relative: f64,
-    pub(crate) voltage_absolute: f64,
-    pub(crate) current_absolute: f64,
+pub(super) struct TranTolerance {
+    pub(super) peak_relative: f64,
+    pub(super) relative: f64,
+    pub(super) voltage_absolute: f64,
+    pub(super) current_absolute: f64,
 }
 
-pub(crate) const TRAN: TranTolerance = TranTolerance {
+pub(super) const TRAN: TranTolerance = TranTolerance {
     peak_relative: 0.0,
     relative: 1e-3,
     voltage_absolute: 1e-6,
@@ -165,12 +165,12 @@ pub(crate) const TRAN: TranTolerance = TranTolerance {
 /// and of perturbed multiple roots is not meaningful); never loosen these to
 /// absorb a missing or extra root, which is a count mismatch.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RootTolerance {
+pub(super) struct RootTolerance {
     relative: f64,
     scale_relative: f64,
 }
 
-pub(crate) const POLE_ZERO: RootTolerance = RootTolerance {
+pub(super) const POLE_ZERO: RootTolerance = RootTolerance {
     relative: 1e-6,
     scale_relative: 1e-9,
 };
@@ -195,7 +195,7 @@ fn root_set(plot: &Plot, kind: &str) -> Vec<(String, ngspice_rs::primitives::Com
     clippy::suboptimal_flops,
     reason = "retain the existing separately rounded pole-zero acceptance bounds; changing rounding can change golden classifications at the boundary"
 )]
-pub(crate) fn roots(got: &Plot, want: &Plot, tolerance: RootTolerance) -> Result<String, String> {
+pub(super) fn roots(got: &Plot, want: &Plot, tolerance: RootTolerance) -> Result<String, String> {
     let got_columns = validate(got, "Rust")?;
     let want_columns = validate(want, "C")?;
     check_structure(got, want, &got_columns, &want_columns)?;
@@ -255,7 +255,7 @@ pub(crate) fn roots(got: &Plot, want: &Plot, tolerance: RootTolerance) -> Result
     ))
 }
 
-pub(crate) fn validate(plot: &Plot, label: &str) -> Result<BTreeMap<String, usize>, String> {
+pub(super) fn validate(plot: &Plot, label: &str) -> Result<BTreeMap<String, usize>, String> {
     if plot.is_empty() {
         return Err(format!("{label}: empty plot"));
     }
@@ -305,7 +305,7 @@ pub(crate) fn validate(plot: &Plot, label: &str) -> Result<BTreeMap<String, usiz
 
 /// Plot name/flags, variable-name set, units and real-vector flags must match
 /// (shared by the point-wise and transient comparators).
-pub(crate) fn check_structure(
+pub(super) fn check_structure(
     got: &Plot,
     want: &Plot,
     got_columns: &BTreeMap<String, usize>,
@@ -353,7 +353,7 @@ pub(crate) fn check_structure(
     clippy::suboptimal_flops,
     reason = "retain the existing separately rounded component acceptance bounds; changing rounding can change golden classifications at the boundary"
 )]
-pub(crate) fn plots(
+pub(super) fn plots(
     got: &Plot,
     want: &Plot,
     tolerance: Tolerance,
