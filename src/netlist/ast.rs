@@ -93,7 +93,7 @@ pub enum ParameterKind {
 }
 
 /// One finite textual waveform/IC value and its byte-column position.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionedValue {
     /// Original numeric spelling, including scale/unit suffixes.
     pub text: String,
@@ -102,7 +102,7 @@ pub struct PositionedValue {
 }
 
 /// One component of a Q/M `ic` vector.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitialCondition {
     /// Canonical scalar setter: icvbe/icvce or icvds/icvgs/icvbs.
     pub name: String,
@@ -381,7 +381,7 @@ pub enum FuncSpelling {
 }
 
 /// One formal parameter of a [`FuncCard`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncParameter {
     /// Lowercased name.
     pub name: String,
@@ -545,7 +545,7 @@ impl NodeHint {
 /// lines and hands them to `com_save()` (`src/frontend/breakp2.c`), which stores
 /// them in the `dbs` save list. A `.save` set applies to **every** analysis of
 /// the deck; `.print` is analysis-specific ([`PrintCard`]).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaveCard {
     /// Requests in source order. Duplicates stay visible here; the consumer
     /// collapses them (see `crate::analysis::selection`).
@@ -559,7 +559,7 @@ pub struct SaveCard {
 /// C: `ft_savedotargs()` in `src/frontend/dotcards.c` reads the analysis name
 /// after `.print` and registers the rest of the line for that analysis through
 /// `com_save2()`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrintCard {
     /// Render a line-printer graph for `.plot`, rather than a table.
     pub ascii_plot: bool,
@@ -574,7 +574,7 @@ pub struct PrintCard {
 }
 
 /// One vector requested by a `.save` or `.print` card.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorRequest {
     /// What to write.
     pub vector: RequestedVector,
@@ -669,19 +669,21 @@ impl RequestedVector {
             )
         }
         match self {
-            Self::Named { name, component } => match component {
-                None => name.clone(),
-                Some(c) => format!(
-                    "{}({name})",
-                    match c {
-                        VectorComponent::Magnitude => "mag",
-                        VectorComponent::Phase => "ph",
-                        VectorComponent::Real => "real",
-                        VectorComponent::Imaginary => "imag",
-                        VectorComponent::Decibels => "db",
-                    }
-                ),
-            },
+            Self::Named { name, component } => component.map_or_else(
+                || name.clone(),
+                |c| {
+                    format!(
+                        "{}({name})",
+                        match c {
+                            VectorComponent::Magnitude => "mag",
+                            VectorComponent::Phase => "ph",
+                            VectorComponent::Real => "real",
+                            VectorComponent::Imaginary => "imag",
+                            VectorComponent::Decibels => "db",
+                        }
+                    )
+                },
+            ),
             Self::All => "all".to_owned(),
             Self::Voltage { positive, negative } => {
                 format!("v({})", terminals(positive, negative.as_deref()))
@@ -716,7 +718,7 @@ impl RequestedVector {
 /// describe the *output* of an analysis and never reach the device elaboration,
 /// so the netlist stays a description of the circuit. See
 /// [`crate::netlist::Parser::parse_file_with_output`] and `docs/port/OUTPUT_SELECTION.md`.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OutputCards {
     /// `.save` cards in deck order; they apply to every analysis.
     pub saves: Vec<SaveCard>,
@@ -1182,7 +1184,9 @@ impl Netlist {
                 .entry(sub.name.to_ascii_lowercase())
                 .or_insert(node);
         }
-        for node in graph.node_indices().collect::<Vec<_>>() {
+        // Edges are appended below, but the set of nodes is fixed here.
+        // NodeIndices does not require a temporary allocation.
+        for node in graph.node_indices() {
             let devices = graph[node].map_or(self.devices.as_slice(), |index| {
                 &self.subcircuits[index].devices
             });

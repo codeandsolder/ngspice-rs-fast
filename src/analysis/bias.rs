@@ -678,7 +678,7 @@ pub enum AttemptOutcome {
 }
 
 /// One strategy attempt, in the order tried.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DcAttempt {
     /// Which strategy.
     pub strategy: DcStrategy,

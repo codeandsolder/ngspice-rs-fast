@@ -61,7 +61,8 @@ pub fn almost_equal_ulps(a: Real, b: Real, max_ulps: i64) -> bool {
     // Lexicographically ordered integer representations (`INT64_MIN - bits`
     // for negative values), compared without overflow.
     let ordered = |x: Real| {
-        let bits = x.to_bits() as i64;
+        // Reinterpret the IEEE-754 sign bit, rather than numerically narrowing.
+        let bits = x.to_bits().cast_signed();
         i128::from(if bits < 0 { i64::MIN - bits } else { bits })
     };
     (ordered(a) - ordered(b)).unsigned_abs() <= u128::from(max_ulps.unsigned_abs())
@@ -584,6 +585,13 @@ mod tests {
         assert!(!almost_equal_ulps(-f64::MAX, f64::MAX, 3));
         assert!(!almost_equal_ulps(f64::NEG_INFINITY, f64::INFINITY, 3));
         assert!(!almost_equal_ulps(-f64::MAX, f64::MAX, i64::MAX));
+        // The sign-bit transformation must order adjacent negative values as
+        // well as both sides of zero without overflowing at i64::MIN.
+        let first_subnormal = f64::from_bits(1);
+        let second_subnormal = f64::from_bits(2);
+        assert!(almost_equal_ulps(-first_subnormal, -second_subnormal, 1));
+        assert!(!almost_equal_ulps(-first_subnormal, second_subnormal, 2));
+        assert!(almost_equal_ulps(-first_subnormal, first_subnormal, 2));
     }
 
     #[test]
