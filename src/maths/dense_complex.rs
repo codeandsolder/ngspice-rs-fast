@@ -201,7 +201,11 @@ impl DenseComplex {
         if scale == 0. {
             return Ok((n == 0).then(|| self.clone()));
         }
-        let threshold = 128. * f64::EPSILON * (n as f64) * scale;
+        // A real allocation of n*n complex elements bounds n well below
+        // u32::MAX on the supported address spaces. Check before converting.
+        let dimension =
+            u32::try_from(n).map_err(|_| numerical("matrix dimension exceeds rank guard range"))?;
+        let threshold = 128. * f64::EPSILON * f64::from(dimension) * scale;
         let mut b = Self::identity(n).data;
         for c in 0..n {
             let pivot_row = (c..n)
@@ -259,7 +263,7 @@ impl DenseComplex {
 }
 
 /// Disjoint rows around the pivot, preserving row-major traversal order.
-fn split_row<T>(data: &mut [T], n: usize, row: usize) -> (&mut [T], &mut [T], &mut [T]) {
+const fn split_row<T>(data: &mut [T], n: usize, row: usize) -> (&mut [T], &mut [T], &mut [T]) {
     let (before, tail) = data.split_at_mut(row * n);
     let (pivot, after) = tail.split_at_mut(n);
     (before, pivot, after)
