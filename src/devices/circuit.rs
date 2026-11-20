@@ -17,6 +17,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::maths::{Coefficients, SparseMatrix, Vector};
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
@@ -104,7 +105,7 @@ pub struct Circuit {
     pattern: std::cell::RefCell<Option<std::sync::Arc<crate::maths::Pattern>>>,
     /// C's `CKTstate0` as the analyses run so far left it (C keeps one state
     /// vector for the whole deck); see [`Circuit::inherit_from`].
-    carried_state: std::cell::RefCell<Option<Vec<Real>>>,
+    carried_state: std::cell::RefCell<Option<StateSnapshot>>,
     /// The analyses already run on this circuit, in order (C keeps one
     /// circuit, and its devices' instance fields, for the whole deck); see
     /// [`Circuit::inherit_from`].
@@ -112,7 +113,7 @@ pub struct Circuit {
     /// The last successful transient's final load, including device instance
     /// quantities stored in trial slots (MOS `capbd`/`capbs`). Kept separate
     /// from `carried_state`: a later DC load must not overwrite these fields.
-    final_transient: std::cell::RefCell<Option<FinalTransientState>>,
+    final_transient: std::cell::RefCell<Option<StateSnapshot>>,
     /// [`Circuit::unknown_names`], computed on first use after
     /// [`Circuit::rebuild_unknowns`].
     unknown_names: std::cell::RefCell<Option<crate::maths::UnknownNames>>,
@@ -121,28 +122,72 @@ pub struct Circuit {
     fixed_stamps: std::cell::RefCell<crate::maths::FixedStamps>,
 }
 
-/// A successful transient's final load and the layout that can interpret it.
+/// Device-local state has meaning only under the layout that produced it.
+/// Node IDs are circuit-local, so include the node table, not just IDs.
 #[derive(Clone)]
-struct FinalTransientState {
-    values: Vec<Real>,
+struct StateLayout {
     rows: Vec<std::ops::Range<usize>>,
-    devices: Vec<(String, char, Vec<NodeId>)>,
+    nodes: Vec<crate::primitives::Node>,
+    devices: Vec<DeviceStateLayout>,
 }
 
-impl FinalTransientState {
+#[derive(Clone)]
+struct DeviceStateLayout {
+    name: String,
+    kind: crate::devices::setup::CDeviceType,
+    designator: char,
+    terminals: Vec<NodeId>,
+}
+
+impl StateLayout {
+    fn capture(circuit: &Circuit) -> Self {
+        Self {
+            rows: circuit.state_rows.clone(),
+            nodes: circuit.nodes.nodes().to_vec(),
+            devices: circuit
+                .devices
+                .iter()
+                .map(|device| DeviceStateLayout {
+                    name: device.name().to_owned(),
+                    kind: device.c_device_type(),
+                    designator: device.designator(),
+                    terminals: device.terminals().to_vec(),
+                })
+                .collect(),
+        }
+    }
     fn matches(&self, circuit: &Circuit) -> bool {
-        self.values.len() == circuit.state_len
-            && self.rows == circuit.state_rows
+        self.rows == circuit.state_rows
+            && self.nodes == circuit.nodes.nodes()
             && self.devices.len() == circuit.devices.len()
+            && self.rows.len() == circuit.devices.len()
             && self
                 .devices
                 .iter()
                 .zip(&circuit.devices)
-                .all(|((name, kind, terminals), device)| {
-                    name == device.name()
-                        && *kind == device.designator()
-                        && terminals == device.terminals()
+                .zip(&self.rows)
+                .all(|((saved, device), range)| {
+                    saved.name == device.name()
+                        && saved.kind == device.c_device_type()
+                        && saved.designator == device.designator()
+                        && saved.terminals == device.terminals()
+                        && range.len() == device.state_count()
                 })
+    }
+}
+
+/// An immutable state vector and the layout that interprets it. Carried
+/// small-signal state and the final transient snapshot have the same
+/// ownership and compatibility rules, but remain separate values.
+#[derive(Clone)]
+struct StateSnapshot {
+    values: Arc<[Real]>,
+    layout: Arc<StateLayout>,
+}
+
+impl StateSnapshot {
+    fn matches(&self, circuit: &Circuit) -> bool {
+        self.values.len() == circuit.state_len && self.layout.matches(circuit)
     }
 }
 
@@ -1176,7 +1221,13 @@ impl Circuit {
     #[must_use]
     pub fn state_history(&self) -> StateHistory {
         StateHistory::new(self.state_len)
-            .with_carried(self.carried_state.borrow().clone())
+            .with_carried_snapshot(
+                self.carried_state
+                    .borrow()
+                    .as_ref()
+                    .filter(|snapshot| snapshot.matches(self))
+                    .map(|snapshot| Arc::clone(&snapshot.values)),
+            )
             .with_delay_lines(
                 self.devices
                     .iter()
@@ -1215,9 +1266,12 @@ impl Circuit {
         let mut state = self
             .carried_state
             .borrow()
-            .clone()
-            .filter(|vector| vector.len() == self.state_len)
-            .unwrap_or_else(|| vec![0.; self.state_len]);
+            .as_ref()
+            .filter(|snapshot| snapshot.matches(self))
+            .map_or_else(
+                || vec![0.; self.state_len],
+                |snapshot| snapshot.values.to_vec(),
+            );
         let operating = crate::devices::distortion::DistortionContext {
             model_context: context,
             unknowns: &self.unknowns,
@@ -1229,7 +1283,8 @@ impl Circuit {
                 device.small_signal_state(&operating, slots)?;
             }
         }
-        *self.carried_state.borrow_mut() = Some(state);
+        let snapshot = self.make_state_snapshot(state.into());
+        *self.carried_state.borrow_mut() = Some(snapshot);
         Ok(())
     }
 
@@ -1244,25 +1299,27 @@ impl Circuit {
         if history.len() != self.state_len {
             return Err(SpiceError::circuit("final transient state dimensions"));
         }
-        let state = history.accepted(1).ok_or_else(|| {
+        let state = history.accepted_snapshot(1).ok_or_else(|| {
             SpiceError::circuit("a completed transient has no accepted device state")
         })?;
-        *self.final_transient.borrow_mut() = Some(FinalTransientState {
-            values: state.to_vec(),
-            rows: self.state_rows.clone(),
-            devices: self
-                .devices
-                .iter()
-                .map(|device| {
-                    (
-                        device.name().to_owned(),
-                        device.designator(),
-                        device.terminals().to_vec(),
-                    )
-                })
-                .collect(),
-        });
+        let snapshot = self.make_state_snapshot(state);
+        *self.final_transient.borrow_mut() = Some(snapshot);
         Ok(())
+    }
+
+    /// Reuse the layout shared by either compatible existing snapshot.
+    fn make_state_snapshot(&self, values: Arc<[Real]>) -> StateSnapshot {
+        let carried = self.carried_state.borrow();
+        let transient = self.final_transient.borrow();
+        let layout = carried
+            .iter()
+            .chain(transient.iter())
+            .find(|snapshot| snapshot.matches(self))
+            .map_or_else(
+                || Arc::new(StateLayout::capture(self)),
+                |snapshot| Arc::clone(&snapshot.layout),
+            );
+        StateSnapshot { values, layout }
     }
 
     /// A snapshot of the last successful transient's final load state, in
@@ -1277,7 +1334,7 @@ impl Circuit {
             .borrow()
             .as_ref()
             .filter(|state| state.matches(self))
-            .map(|state| state.values.clone())
+            .map(|state| state.values.to_vec())
     }
 
     pub(super) fn check_numbering(&self) -> SpiceResult<()> {
@@ -1775,9 +1832,13 @@ impl Circuit {
             .as_ref()
             .filter(|state| state.matches(previous) && state.matches(self))
             .cloned();
-        self.carried_state
-            .borrow_mut()
-            .clone_from(&previous.carried_state.borrow());
+        let carried = previous
+            .carried_state
+            .borrow()
+            .as_ref()
+            .filter(|state| state.matches(previous) && state.matches(self))
+            .cloned();
+        *self.carried_state.borrow_mut() = carried;
         let Some(inherited) = previous.pattern.borrow().clone() else {
             return;
         };
@@ -2670,6 +2731,69 @@ mod tests {
             terminals: vec![first, second],
             branch_currents,
         }
+    }
+
+    #[test]
+    fn inherited_state_checks_node_identity_and_shares_compatible_snapshots() {
+        use crate::devices::ModelContext;
+        use crate::devices::state::StateHistory;
+        use crate::maths::Vector;
+        use std::sync::Arc;
+        // A real capacitor supplies two state slots. A programmatic caller
+        // can have an equal-size layout whose node IDs mean other nodes.
+        let build = |name: &str| {
+            let mut circuit = Circuit::new();
+            let node = circuit.add_node(name);
+            circuit
+                .add_device(Box::new(
+                    crate::devices::Capacitor::new("c1", [node, NodeId::GROUND], 1., None).unwrap(),
+                ))
+                .unwrap();
+            circuit.finalize().unwrap();
+            circuit
+        };
+        let original = build("a");
+        original
+            .record_small_signal_state(&ModelContext::default(), &Vector::zeros(1))
+            .unwrap();
+        let mut history = StateHistory::new(original.state_len());
+        let mut trial = history.trial();
+        let mut state = history.device(&mut trial, 0..2).unwrap();
+        state.set(0, 1.).unwrap();
+        state.set(1, 2.).unwrap();
+        history.commit(trial).unwrap();
+        original.record_final_transient_state(&history).unwrap();
+        let snapshot = original.final_transient.borrow();
+        let snapshot = snapshot.as_ref().unwrap();
+        assert!(Arc::ptr_eq(
+            &snapshot.values,
+            &history.accepted_snapshot(1).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &snapshot.layout,
+            &original.carried_state.borrow().as_ref().unwrap().layout
+        ));
+
+        let mut compatible = build("a");
+        compatible.inherit_from(&original);
+        assert_eq!(compatible.final_transient_state(), Some(vec![1., 2.]));
+        assert!(Arc::ptr_eq(
+            &compatible.carried_state.borrow().as_ref().unwrap().values,
+            &original.carried_state.borrow().as_ref().unwrap().values
+        ));
+        let mut foreign = build("different");
+        foreign.inherit_from(&original);
+        assert!(foreign.final_transient_state().is_none());
+        assert!(foreign.carried_state.borrow().is_none());
+        // Device mutation can invalidate a snapshot before re-finalization.
+        compatible.devices_mut()[0] = Box::new(
+            crate::devices::Capacitor::new("other", [NodeId::new(1), NodeId::GROUND], 1., None)
+                .unwrap(),
+        );
+        assert!(compatible.final_transient_state().is_none());
+        let history = compatible.state_history();
+        let mut trial = history.trial();
+        assert_eq!(history.device(&mut trial, 0..2).unwrap().carried(0), None);
     }
 
     #[test]

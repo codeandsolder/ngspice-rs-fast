@@ -135,7 +135,7 @@ pub struct StateHistory {
     /// C's `CKTstate0` as the previous analysis of the deck left it (C runs
     /// every analysis on the same state vectors), read through
     /// [`DeviceState::carried`].
-    carried: Option<Vec<Real>>,
+    carried: Option<Arc<[Real]>>,
     /// Delay histories by device ordinal (empty for circuits without delay
     /// lines).
     delays: BTreeMap<usize, DelayHistory>,
@@ -156,9 +156,22 @@ impl StateHistory {
     /// This history with `carried` as the state vector the previous analysis
     /// left behind (ignored unless it has [`Self::len`] slots).
     #[must_use]
-    pub fn with_carried(mut self, carried: Option<Vec<Real>>) -> Self {
+    pub fn with_carried(self, carried: Option<Vec<Real>>) -> Self {
+        self.with_carried_snapshot(carried.map(Into::into))
+    }
+
+    /// Share the immutable previous-analysis snapshot with its circuit owner.
+    pub(super) fn with_carried_snapshot(mut self, carried: Option<Arc<[Real]>>) -> Self {
         self.carried = carried.filter(|vector| vector.len() == self.len);
         self
+    }
+
+    /// Retain a snapshot after the history is discarded, without copying its
+    /// accepted vector. Subsequent history patches detach on mutation.
+    pub(super) fn accepted_snapshot(&self, age: usize) -> Option<Arc<[Real]>> {
+        age.checked_sub(1)
+            .and_then(|index| self.accepted.get(index))
+            .cloned()
     }
 
     /// The same history with an empty [`DelayHistory`] of `width` values per
