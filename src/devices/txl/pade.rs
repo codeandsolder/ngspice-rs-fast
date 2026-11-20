@@ -253,11 +253,13 @@ impl Pade {
         let mut bb = [0.; 6];
         bb[0] = 1.;
         bb[1] = aa[1];
-        for i in 2..6 {
+        for i in 2_u16..6 {
+            let row = usize::from(i);
             for j in 1..=i {
-                bb[i] += j as Real * aa[j] * bb[i - j];
+                let col = usize::from(j);
+                bb[row] += Real::from(j) * aa[col] * bb[row - col];
             }
-            bb[i] /= i as Real;
+            bb[row] /= Real::from(i);
         }
         let dc = (a0 - length * (r * g).sqrt()).exp();
         let (mut p, mut q) = solve_series([bb[1], bb[2], bb[3], bb[4], bb[5]], dc, 1e-28)?;
