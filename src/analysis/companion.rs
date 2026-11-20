@@ -389,6 +389,8 @@ struct Driver<'a> {
     uic: bool,
     /// `true` for rows that carry branch currents (`abstol`), else `vntol`.
     branch_row: Vec<bool>,
+    /// Global damping's watched rows, fixed by finalized device topology.
+    limited_rows: Option<Vec<bool>>,
     /// Each device's state rows and the absolute state index of every
     /// charge it hands `CKTterr` (`truncation_slots`), fixed for the run.
     truncation: Vec<(std::ops::Range<usize>, Vec<usize>)>,
@@ -482,12 +484,8 @@ fn companion(
     let timing = TransientTiming::new(settings.step, settings.stop)?;
     system.bind_transient_timing(&timing)?;
     let circuit: &Circuit = circuit;
-    let mut branch_row = vec![false; circuit.unknown_count()];
-    for index in 0..circuit.device_count() {
-        for row in circuit.branch_rows(index).unwrap_or(0..0) {
-            branch_row[row] = true;
-        }
-    }
+    let branch_row = crate::analysis::bias::branch_rows(circuit);
+    let limited_rows = crate::analysis::bias::limited_rows(circuit);
     let truncation = circuit
         .devices()
         .iter()
@@ -516,6 +514,7 @@ fn companion(
         hints,
         uic: request.uic,
         branch_row,
+        limited_rows,
         truncation,
         stats: TransientStats::default(),
     };
@@ -1023,7 +1022,6 @@ impl Driver<'_> {
             )?;
             Ok::<_, SpiceError>(state)
         };
-        let limited = crate::analysis::bias::limited_rows(self.circuit);
         // dctran.c: MODEINITTRAN (first step) or MODEINITPRED for the first
         // load of a timepoint, MODEINITFLOAT afterwards.
         let policy = if initial {
@@ -1034,7 +1032,7 @@ impl Driver<'_> {
         match crate::analysis::newton::solve_phased(
             previous,
             &self.branch_row,
-            limited.as_deref(),
+            self.limited_rows.as_deref(),
             &options,
             policy,
             None,
