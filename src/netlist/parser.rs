@@ -170,7 +170,6 @@ impl Parser {
     /// [`crate::primitives::SpiceError::NotYetPorted`] for valid numparam outside the
     /// bounded subset (other operators, functions or quoting).
     pub fn parse_expression(
-        self,
         text: &str,
         location: &crate::primitives::SourceLoc,
     ) -> SpiceResult<crate::netlist::expr::ParameterExpression> {

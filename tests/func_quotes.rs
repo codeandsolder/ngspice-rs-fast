@@ -520,9 +520,7 @@ fn function_scope_api_resolves_lexically() {
     // The scope used by literalize and RunConfig exposes the functions.
     let scope = ParamScope::for_netlist(&n).unwrap();
     assert!(scope.functions().is_some_and(|f| f.get("f").is_some()));
-    let expression = Parser::new()
-        .parse_expression("f(2)+g(2)", &n.location)
-        .unwrap();
+    let expression = Parser::parse_expression("f(2)+g(2)", &n.location).unwrap();
     assert_eq!(
         scope
             .evaluate(&expression, &mut EvalBudget::default())

@@ -79,7 +79,7 @@ pub fn generate(conformance: &Path) -> io::Result<Vec<SnapshotFile>> {
         });
         files.push(SnapshotFile {
             path: format!("ast/{stem}.ast"),
-            contents: dump_ast_file(&parser, &path, &root),
+            contents: dump_ast_file(parser, &path, &root),
         });
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));

@@ -987,17 +987,15 @@ fn node(name: &str, location: &SourceLoc) -> SpiceResult<String> {
 /// The expression text must re-parse to the stored tree, so writing the text
 /// preserves the grouping (parentheses) of the source.
 fn check_expression(expression: &ParameterExpression, location: &SourceLoc) -> SpiceResult<()> {
-    let reparsed = Parser::new()
-        .parse_expression(&expression.text, location)
-        .map_err(|error| {
-            refuse(
-                format!(
-                    "expression {:?} does not re-parse: {error}",
-                    expression.text
-                ),
-                Some(location),
-            )
-        })?;
+    let reparsed = Parser::parse_expression(&expression.text, location).map_err(|error| {
+        refuse(
+            format!(
+                "expression {:?} does not re-parse: {error}",
+                expression.text
+            ),
+            Some(location),
+        )
+    })?;
     if expr_form(&reparsed.root) != expr_form(&expression.root) {
         return Err(refuse(
             format!(

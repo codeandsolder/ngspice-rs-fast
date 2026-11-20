@@ -21,11 +21,11 @@ use crate::netlist::source::{Deck, LogicalLine, parse_deck_text, parse_fragment_
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceLimits {
     /// Maximum nested includes below the root. Values above 64 are rejected.
-    pub max_depth: usize,
+    pub depth: usize,
     /// Total file reads including the root and repeated includes.
-    pub max_files: usize,
+    pub files: usize,
     /// Total UTF-8 source bytes read, including unselected library sections.
-    pub max_bytes: usize,
+    pub bytes: usize,
     /// Total processed cards, including directives and structural terminators.
     ///
     /// C ngspice (`inpcom.c`, `inp_readall`) has no such cap; the port keeps one
@@ -33,16 +33,16 @@ pub struct SourceLimits {
     /// times the default subcircuit device budget (`SubcircuitLimits::max_devices`
     /// in the devices layer, 250,000), so a flat deck that the expansion budget
     /// accepts is not rejected here for its size.
-    pub max_cards: usize,
+    pub cards: usize,
 }
 
 impl Default for SourceLimits {
     fn default() -> Self {
         Self {
-            max_depth: 64,
-            max_files: 1024,
-            max_bytes: 16 * 1024 * 1024,
-            max_cards: 1_000_000,
+            depth: 64,
+            files: 1024,
+            bytes: 16 * 1024 * 1024,
+            cards: 1_000_000,
         }
     }
 }
@@ -63,7 +63,7 @@ pub(super) fn resolve(
     limits: SourceLimits,
 ) -> SpiceResult<(Deck, Vec<SpiceResult<InputCard>>)> {
     let location = SourceLoc::new(path.to_path_buf(), 1, 1);
-    if limits.max_depth > 64 {
+    if limits.depth > 64 {
         return Err(SpiceError::parse(
             location,
             "source depth limit must be at most 64",
@@ -94,14 +94,14 @@ pub(super) fn resolve(
 
 impl Resolver {
     fn read(&mut self, path: &Path, location: &SourceLoc) -> SpiceResult<String> {
-        if self.files >= self.limits.max_files {
+        if self.files >= self.limits.files {
             return Err(SpiceError::parse(
                 location.clone(),
                 "source file work limit exceeded",
             ));
         }
         self.files += 1;
-        let remaining = self.limits.max_bytes.saturating_sub(self.bytes);
+        let remaining = self.limits.bytes.saturating_sub(self.bytes);
         let mut bytes = Vec::new();
         let file = File::open(path).map_err(|e| SpiceError::io(path, &e))?;
         file.take(
@@ -137,12 +137,12 @@ impl Resolver {
         output: &mut Vec<SpiceResult<InputCard>>,
     ) -> SpiceResult<bool> {
         for line in lines {
-            if self.cards >= self.limits.max_cards {
+            if self.cards >= self.limits.cards {
                 return Err(SpiceError::parse(
                     line.location.clone(),
                     format!(
                         "source card work limit exceeded ({} cards, counting repeated includes)",
-                        self.limits.max_cards
+                        self.limits.cards
                     ),
                 ));
             }
@@ -168,7 +168,7 @@ impl Resolver {
             if include {
                 let parsed = grammar::parse_card(&entry.source, true, &BTreeSet::new())?;
                 if let ParsedCard::Include(directive) = parsed {
-                    if chain.len() >= self.limits.max_depth {
+                    if chain.len() >= self.limits.depth {
                         return Err(SpiceError::parse(
                             directive.location,
                             "source include depth limit exceeded",

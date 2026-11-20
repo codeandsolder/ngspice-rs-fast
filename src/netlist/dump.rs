@@ -420,7 +420,7 @@ pub fn dump_tokens_file(path: &Path, root: &Path) -> SpiceResult<String> {
 /// Parses `path` (resolving includes) and dumps the AST, or the positioned
 /// error when parsing fails; the output is deterministic either way.
 #[must_use]
-pub fn dump_ast_file(parser: &Parser, path: &Path, root: &Path) -> String {
+pub fn dump_ast_file(parser: Parser, path: &Path, root: &Path) -> String {
     let paths = PathMapper::new(root);
     match parser.parse_file(path) {
         Ok(netlist) => dump_ast(&netlist, &paths),

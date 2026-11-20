@@ -141,9 +141,8 @@ fn expression_tree_shape_agrees_with_c_numparam() {
     .into_iter()
     .enumerate()
     {
-        let parsed = Parser::new()
-            .parse_expression(text, &origin)
-            .unwrap_or_else(|e| panic!("{text}: {e}"));
+        let parsed =
+            Parser::parse_expression(text, &origin).unwrap_or_else(|e| panic!("{text}: {e}"));
         let rust = evaluate(&parsed.root, &names);
         let c = c_value(&format!("e{index}"), text);
         assert!(
@@ -161,10 +160,7 @@ fn c_rejects_the_sign_forms_the_parser_rejects() {
         .into_iter()
         .enumerate()
     {
-        assert!(
-            Parser::new().parse_expression(text, &origin).is_err(),
-            "{text}"
-        );
+        assert!(Parser::parse_expression(text, &origin).is_err(), "{text}");
         let result = std::panic::catch_unwind(|| c_value(&format!("r{index}"), text));
         assert!(result.is_err(), "C unexpectedly accepted {text}");
     }
