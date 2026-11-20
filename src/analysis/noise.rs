@@ -778,7 +778,7 @@ pub(crate) fn run(
     let mut small = crate::analysis::ac::SmallSignal::prepare(circuit, request, context, settings)?;
     let mut plots = small.retained_bias(circuit, request, context, include_bias)?;
     let mut model = context.model_context();
-    model.spice3_noise = request.spice3_noise;
+    model.spice3_noise = request.noise.spice3;
     // Generators that depend on the frequency are described at the first
     // frequency; they are re-described at every frequency below.
     let first = if small.reassembles() {
@@ -792,7 +792,7 @@ pub(crate) fn run(
             .map(Generators::new)
             .collect();
 
-    let representation = Representation::from_squared(request.squared_noise);
+    let representation = Representation::from_squared(request.noise.squared);
     let (spectrum_variables, integrated_variables) =
         plot_names(&generators, input_kind, card.summary != 0, representation);
     let mut spectrum = spectrum_plot(representation, spectrum_variables);

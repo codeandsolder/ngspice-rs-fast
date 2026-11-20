@@ -1070,8 +1070,8 @@ impl RunConfig {
     /// If the stored `method`/`maxord` pair no longer parses; deck parsing has
     /// already validated it.
     pub fn request(&self, mut request: AnalysisRequest) -> SpiceResult<AnalysisRequest> {
-        request.squared_noise |= self.squared_noise;
-        request.spice3_noise |= self.spice3_noise;
+        request.noise.squared |= self.squared_noise;
+        request.noise.spice3 |= self.spice3_noise;
         request.keep_op_info |= self.keep_op_info;
         // Deck-level hints travel with every request (explicit request entries
         // win); each driver validates them against its circuit.
