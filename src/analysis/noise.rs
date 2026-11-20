@@ -307,6 +307,83 @@ fn nintegrate(density: Real, ln_density: Real, ln_last_density: Real, step: &Ste
     }
 }
 
+/// Front-end representation of the same underlying noise powers. In C
+/// `CKTnoise` writes raw powers and only applies sqrt when sqrnoise is off.
+#[derive(Clone, Copy)]
+enum Representation {
+    Amplitude,
+    Power,
+}
+
+impl Representation {
+    fn from_squared(squared: bool) -> Self {
+        if squared {
+            Self::Power
+        } else {
+            Self::Amplitude
+        }
+    }
+
+    fn value(self, power: Real) -> Complex {
+        Complex::real(match self {
+            Self::Amplitude => power.sqrt(),
+            Self::Power => power,
+        })
+    }
+
+    const fn plotname(self, density: bool) -> &'static str {
+        match (self, density) {
+            (Self::Amplitude, true) => SPECTRUM_PLOTNAME,
+            (Self::Amplitude, false) => INTEGRATED_PLOTNAME,
+            (Self::Power, true) => "Noise Spectral Density Curves - (V^2 or A^2)/Hz",
+            (Self::Power, false) => "Integrated Noise - V^2 or A^2",
+        }
+    }
+
+    fn variable(self, name: String, kind: SourceKind, density: bool) -> Variable {
+        let unit = match (self, kind, density) {
+            (Self::Amplitude, SourceKind::Voltage, true) => "voltage-density",
+            (Self::Amplitude, SourceKind::Current, true) => "current-density",
+            (Self::Amplitude, SourceKind::Voltage, false) => "voltage",
+            (Self::Amplitude, SourceKind::Current, false) => "current",
+            (Self::Power, SourceKind::Voltage, true) => "voltage^2-density",
+            (Self::Power, SourceKind::Current, true) => "current^2-density",
+            (Self::Power, SourceKind::Voltage, false) => "voltage^2",
+            (Self::Power, SourceKind::Current, false) => "current^2",
+        };
+        let name = if matches!(self, Self::Amplitude) && !density {
+            let prefix = match kind {
+                SourceKind::Voltage => "v",
+                SourceKind::Current => "i",
+            };
+            format!("{prefix}({name})")
+        } else {
+            name
+        };
+        Variable::new(name, unit)
+    }
+}
+
+/// An output row, separate from the integration histories. No amplitude
+/// conversion ever feeds back into the integrator.
+struct NoiseRow {
+    representation: Representation,
+    values: Vec<Complex>,
+}
+
+impl NoiseRow {
+    fn new(representation: Representation, capacity: usize) -> Self {
+        Self {
+            representation,
+            values: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push_power(&mut self, power: Real) {
+        self.values.push(self.representation.value(power));
+    }
+}
+
 /// Integrated output- and input-referred noise power, in C's summation order.
 #[derive(Debug, Clone, Copy, Default)]
 struct Power {
@@ -320,8 +397,9 @@ impl Power {
         self.input += contribution.input;
     }
 
-    fn append_amplitudes(self, row: &mut Vec<Real>) {
-        row.extend([self.output.sqrt(), self.input.sqrt()]);
+    fn append(self, row: &mut NoiseRow) {
+        row.push_power(self.output);
+        row.push_power(self.input);
     }
 }
 
@@ -439,7 +517,7 @@ impl Generators {
         sample: &NoiseSample,
         difference: impl Fn([NodeId; 2]) -> Complex,
         integrated: &mut Power,
-        mut summary_row: Option<&mut Vec<Real>>,
+        mut summary_row: Option<&mut NoiseRow>,
     ) -> Real {
         let mut density_sum = 0.;
         if sample.reset
@@ -461,23 +539,23 @@ impl Generators {
                 }
             }
             if let Some(row) = summary_row.as_deref_mut() {
-                row.push(density.sqrt());
+                row.push_power(density);
             }
         }
         if self.total.is_some()
             && let Some(row) = summary_row
         {
-            row.push(density_sum.sqrt());
+            row.push_power(density_sum);
         }
         density_sum
     }
 
-    fn append_integrated(&self, row: &mut Vec<Real>) {
+    fn append_integrated(&self, row: &mut NoiseRow) {
         for history in &self.history {
-            history.integrated.append_amplitudes(row);
+            history.integrated.append(row);
         }
         if let Some(total) = self.total {
-            total.append_amplitudes(row);
+            total.append(row);
         }
     }
 }
@@ -488,13 +566,13 @@ fn plot_names(
     generators: &[Generators],
     input_kind: SourceKind,
     summary: bool,
+    representation: Representation,
 ) -> (Vec<Variable>, Vec<Variable>) {
-    let (input_density, input_unit, input_prefix) = match input_kind {
-        SourceKind::Voltage => ("voltage-density", "voltage", "v"),
-        SourceKind::Current => ("current-density", "current", "i"),
-    };
     let mut spectrum = vec![Variable::new("frequency", "frequency")];
     let mut integrated = Vec::new();
+    let output =
+        |name: String, density| representation.variable(name, SourceKind::Voltage, density);
+    let input = |name: String, density| representation.variable(name, input_kind, density);
     for g in generators.iter().filter(|_| summary) {
         let suffixes = g
             .instance
@@ -504,21 +582,15 @@ fn plot_names(
             .chain(g.instance.total.then_some(""));
         for suffix in suffixes {
             let name = format!("{}{suffix}", g.instance.name);
-            spectrum.push(Variable::new(format!("onoise_{name}"), "voltage-density"));
-            integrated.push(Variable::new(format!("v(onoise_total_{name})"), "voltage"));
-            integrated.push(Variable::new(
-                format!("{input_prefix}(inoise_total_{name})"),
-                input_unit,
-            ));
+            spectrum.push(output(format!("onoise_{name}"), true));
+            integrated.push(output(format!("onoise_total_{name}"), false));
+            integrated.push(input(format!("inoise_total_{name}"), false));
         }
     }
-    spectrum.push(Variable::new("onoise_spectrum", "voltage-density"));
-    spectrum.push(Variable::new("inoise_spectrum", input_density));
-    integrated.push(Variable::new("v(onoise_total)", "voltage"));
-    integrated.push(Variable::new(
-        format!("{input_prefix}(inoise_total)"),
-        input_unit,
-    ));
+    spectrum.push(output("onoise_spectrum".into(), true));
+    spectrum.push(input("inoise_spectrum".into(), true));
+    integrated.push(output("onoise_total".into(), false));
+    integrated.push(input("inoise_total".into(), false));
     (spectrum, integrated)
 }
 
@@ -609,9 +681,10 @@ pub(crate) fn run(
             .map(Generators::new)
             .collect();
 
+    let representation = Representation::from_squared(request.squared_noise);
     let (spectrum_variables, integrated_variables) =
-        plot_names(&generators, input.kind, card.summary != 0);
-    let mut spectrum = Plot::new("noise1", SPECTRUM_PLOTNAME, PlotFlags::Real);
+        plot_names(&generators, input.kind, card.summary != 0, representation);
+    let mut spectrum = Plot::new("noise1", representation.plotname(true), PlotFlags::Real);
     for variable in spectrum_variables {
         spectrum.push_variable(variable);
     }
@@ -673,7 +746,14 @@ pub(crate) fn run(
         let sample = NoiseSample::new(freq, last, gain_sq_inv, card.start, card.summary != 0);
         let print_summary = card.summary != 0 && step.is_multiple_of(card.summary);
         let mut out_density = 0.;
-        let mut row = vec![freq];
+        let emit = card.summary == 0 || print_summary;
+        let mut row = NoiseRow::new(
+            representation,
+            if emit { spectrum.variables.len() } else { 0 },
+        );
+        if emit {
+            row.values.push(Complex::real(freq));
+        }
         for g in &mut generators {
             out_density += g.accumulate(
                 &sample,
@@ -682,10 +762,10 @@ pub(crate) fn run(
                 print_summary.then_some(&mut row),
             );
         }
-        if card.summary == 0 || print_summary {
-            row.push(out_density.sqrt());
-            row.push((out_density * gain_sq_inv).sqrt());
-            spectrum.push_point(row.into_iter().map(Complex::real).collect())?;
+        if emit {
+            row.push_power(out_density);
+            row.push_power(out_density * gain_sq_inv);
+            spectrum.push_point(row.values)?;
         }
         last = freq;
     }
@@ -697,8 +777,8 @@ pub(crate) fn run(
     }
     let mut plots = vec![spectrum];
     if card.start != card.stop {
-        let mut integrated = Plot::new("noise2", INTEGRATED_PLOTNAME, PlotFlags::Real);
-        let mut values = Vec::new();
+        let mut integrated = Plot::new("noise2", representation.plotname(false), PlotFlags::Real);
+        let mut values = NoiseRow::new(representation, integrated_variables.len());
         for variable in integrated_variables {
             integrated.push_variable(variable);
         }
@@ -707,8 +787,8 @@ pub(crate) fn run(
                 g.append_integrated(&mut values);
             }
         }
-        integrated_power.append_amplitudes(&mut values);
-        integrated.push_point(values.into_iter().map(Complex::real).collect())?;
+        integrated_power.append(&mut values);
+        integrated.push_point(values.values)?;
         if !integrated.is_finite() {
             return Err(SpiceError::Numerical {
                 context: ".noise".into(),
@@ -717,46 +797,15 @@ pub(crate) fn run(
         }
         plots.push(integrated);
     }
-    if request.squared_noise {
-        for plot in &mut plots {
-            let name = if plot.plotname == SPECTRUM_PLOTNAME {
-                "Noise Spectral Density Curves - (V^2 or A^2)/Hz"
-            } else {
-                "Integrated Noise - V^2 or A^2"
-            };
-            name.clone_into(&mut plot.plotname);
-            for (index, variable) in plot.variables.iter_mut().enumerate() {
-                if variable.name == "frequency" {
-                    continue;
-                }
-                if let Some(inner) = variable
-                    .name
-                    .strip_prefix("v(")
-                    .or_else(|| variable.name.strip_prefix("i("))
-                    .and_then(|n| n.strip_suffix(')'))
-                {
-                    variable.name = inner.to_owned();
-                }
-                variable.unit = match variable.unit.as_str() {
-                    "voltage-density" => "voltage^2-density",
-                    "current-density" => "current^2-density",
-                    "voltage" => "voltage^2",
-                    "current" => "current^2",
-                    other => other,
-                }
-                .to_owned();
-                for point in &mut plot.points {
-                    point[index].re *= point[index].re;
-                }
-            }
-        }
-    }
     Ok(plots)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Generators, NoiseSample, Power, Step, almost_equal_ulps, nintegrate, plot_count};
+    use super::{
+        Generators, NoiseRow, NoiseSample, Power, Representation, Step, almost_equal_ulps,
+        nintegrate, plot_count,
+    };
     use crate::devices::noise::{InstanceNoise, NoiseKind, NoiseSource};
     use crate::primitives::{Complex, NodeId};
 
@@ -788,14 +837,17 @@ mod tests {
     fn noise_history_is_bound_to_named_slots_not_frequency_local_values() {
         let mut generators = Generators::new(instance());
         let mut integrated = Power::default();
-        let mut row = Vec::new();
+        let mut row = NoiseRow::new(Representation::Amplitude, 6);
         let transfer = |_| Complex::real(1.);
         let first = NoiseSample::new(10., 10., 0.25, 10., true);
         assert_eq!(
             generators.accumulate(&first, transfer, &mut integrated, Some(&mut row)),
             5.
         );
-        assert_eq!(row, [2_f64.sqrt(), 3_f64.sqrt(), 5_f64.sqrt()]);
+        assert_eq!(
+            row.values,
+            [2_f64.sqrt(), 3_f64.sqrt(), 5_f64.sqrt()].map(Complex::real)
+        );
         let mut fresh = instance();
         fresh.sources[0].kind = NoiseKind::Gain { factor: 2. };
         fresh.sources[0].nodes = [NodeId::new(2), NodeId::GROUND];
@@ -808,10 +860,10 @@ mod tests {
         );
         assert_eq!(integrated.output, 50.);
         assert_eq!(integrated.input, 12.5);
-        row.clear();
+        row.values.clear();
         generators.append_integrated(&mut row);
         assert_eq!(
-            row,
+            row.values,
             [
                 20_f64.sqrt(),
                 5_f64.sqrt(),
@@ -820,6 +872,29 @@ mod tests {
                 50_f64.sqrt(),
                 12.5_f64.sqrt()
             ]
+            .map(Complex::real)
+        );
+    }
+
+    #[test]
+    fn squared_noise_preserves_original_powers_in_every_slot() {
+        let mut generators = Generators::new(instance());
+        let mut integrated = Power::default();
+        let mut row = NoiseRow::new(Representation::Power, 6);
+        let transfer = |_| Complex::real(1.);
+        let first = NoiseSample::new(10., 10., 0.25, 10., true);
+        generators.accumulate(&first, transfer, &mut integrated, Some(&mut row));
+        // sqrt(2)^2 != 2 in binary64: the former rendering lost this bit.
+        assert_ne!(2_f64.sqrt().powi(2), 2.);
+        assert_eq!(row.values, [2., 3., 5.].map(Complex::real));
+        let second = NoiseSample::new(20., 10., 0.25, 10., true);
+        generators.accumulate(&second, transfer, &mut integrated, None);
+        row.values.clear();
+        generators.append_integrated(&mut row);
+        integrated.append(&mut row);
+        assert_eq!(
+            row.values,
+            [20., 5., 30., 7.5, 50., 12.5, 50., 12.5].map(Complex::real)
         );
     }
 
