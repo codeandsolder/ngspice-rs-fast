@@ -78,6 +78,22 @@ fn field(value: Option<Real>, default: Real) -> (Real, bool) {
     value.map_or((default, false), |value| (value, true))
 }
 
+/// Sheet resistance scaled by the corrected aspect ratio.
+const fn sheet_resistance(
+    length: Real,
+    width: Real,
+    short: Real,
+    narrow: Real,
+    sheet: Real,
+) -> Real {
+    (length - 2. * short) / (width - 2. * narrow) * sheet
+}
+
+/// `REStemp`'s Horner-form polynomial differs from the capacitor/inductor form.
+const fn resistance_temperature_factor(tc1: Real, tc2: Real, difference: Real) -> Real {
+    ((tc2 * difference) + tc1) * difference + 1.0
+}
+
 impl DeviceSensitivity for ResistorSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Resistor
@@ -264,8 +280,13 @@ impl DeviceSensitivity for ResistorSensitivity<'_> {
             let (length, width) = (instance.value("l")?, instance.value("w")?);
             let sheet = model.value("rsh")?;
             let resist = if length * width * sheet > 0. {
-                (length - 2. * model.value("short")?) / (width - 2. * model.value("narrow")?)
-                    * sheet
+                sheet_resistance(
+                    length,
+                    width,
+                    model.value("short")?,
+                    model.value("narrow")?,
+                    sheet,
+                )
             } else if model.given("r") {
                 model.value("r")?
             } else {
@@ -288,7 +309,7 @@ impl DeviceSensitivity for ResistorSensitivity<'_> {
         let factor = if instance.given("tce") || model.given("tce") {
             1.01_f64.powf(tce * difference)
         } else {
-            ((tc2 * difference) + tc1) * difference + 1.0
+            resistance_temperature_factor(tc1, tc2, difference)
         };
         if !instance.given("scale") {
             instance.store("scale", 1.)?;

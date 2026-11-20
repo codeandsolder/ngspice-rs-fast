@@ -156,6 +156,10 @@ impl<'a> ReactiveSensitivity<'a> {
 }
 
 /// `Lundin()` of `indsetup.c`: Lundin's geometry correction of a solenoid.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "indsetup.c Lundin correction evaluates the original separately rounded polynomial"
+)]
 fn lundin(length: Real, csect: Real) -> Real {
     if csect < 1e-12 || length < 1e-6 {
         return 1.;
@@ -173,6 +177,21 @@ fn lundin(length: Real, csect: Real) -> Real {
         let kk = 0.093_842 / xx + 0.002_029 / xxxx - 0.000_801 / (xx * xxxx);
         2. * (num / den + kk) / (std::f64::consts::PI * x)
     }
+}
+
+/// Area and perimeter contributions after model geometry corrections.
+const fn geometry_capacitance(
+    width: Real,
+    length: Real,
+    area_density: Real,
+    sidewall_density: Real,
+) -> Real {
+    area_density * width * length + sidewall_density * 2. * (length + width)
+}
+
+/// The temperature factor shared by `CAPtemp` and `INDtemp`.
+const fn reactive_temperature_factor(tc1: Real, tc2: Real, difference: Real) -> Real {
+    1.0 + tc1 * difference + tc2 * difference * difference
 }
 
 impl DeviceSensitivity for ReactiveSensitivity<'_> {
@@ -397,8 +416,12 @@ impl DeviceSensitivity for ReactiveSensitivity<'_> {
                 } else {
                     let (w, l) = (instance.value("w")?, instance.value("l")?);
                     let (narrow, short) = (model.value("narrow")?, model.value("short")?);
-                    model.value("cj")? * (w - narrow) * (l - short)
-                        + model.value("cjsw")? * 2. * ((l - short) + (w - narrow))
+                    geometry_capacitance(
+                        w - narrow,
+                        l - short,
+                        model.value("cj")?,
+                        model.value("cjsw")?,
+                    )
                 }
             }
             ReactiveKind::Inductor => {
@@ -425,7 +448,7 @@ impl DeviceSensitivity for ReactiveSensitivity<'_> {
             }
         };
         let (tc1, tc2) = (pick("tc1")?, pick("tc2")?);
-        let factor = 1.0 + tc1 * difference + tc2 * difference * difference;
+        let factor = reactive_temperature_factor(tc1, tc2, difference);
         let value = base * factor * instance.value("scale")?;
         match self.kind {
             ReactiveKind::Capacitor => instance.store("capac", value),

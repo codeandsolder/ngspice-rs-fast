@@ -96,7 +96,7 @@ impl DeviceSensitivity for BehaviouralSensitivity<'_> {
             .with("dtemp", scale.dtemp, scale.dtemp != 0.)
             .with("tc1", scale.tc1, scale.tc1 != 0.)
             .with("tc2", scale.tc2, scale.tc2 != 0.)
-            .with("m", scale.m, scale.m != 1.);
+            .with("m", scale.m, !matches!(scale.m, 1.));
         let mut model = SensitivityRecord::new();
         self.temperature(&mut model, &mut instance)?;
         Ok((model, instance))
@@ -303,8 +303,7 @@ impl DeviceSensitivity for SwitchSensitivity<'_> {
         model: &mut SensitivityRecord,
         _instance: &mut SensitivityRecord,
     ) -> SpiceResult<()> {
-        let (threshold, hysteresis) = self.keys();
-        for keyword in [threshold, hysteresis] {
+        for keyword in <[&str; 2]>::from(self.keys()) {
             if !model.given(keyword) {
                 model.store(keyword, 0.)?;
             }
