@@ -160,6 +160,34 @@ fn repeated_and_diamond_includes_are_not_cycles_or_deduplicated() {
 }
 
 #[test]
+fn empty_and_adjacent_library_sections_retain_exact_boundaries() {
+    let f = Files::new();
+    f.write(
+        "main.cir",
+        "title\n.lib 'process.lib' empty\n.lib 'process.lib' used\n.end\n",
+    );
+    f.write("process.lib", ".lib empty\n.endl empty\n.lib used\nR1 a 0\n+ 1k\n.endl used\n.lib other\nmalformed {\n.endl other\n");
+    let n = f.parse("main.cir").unwrap();
+    assert_eq!(n.devices.len(), 1);
+    assert_eq!(n.devices[0].name, "r1");
+    assert_eq!(n.devices[0].location.line, 4);
+    for (include, start, end) in [(&n.includes[0], 1, 2), (&n.includes[1], 3, 6)] {
+        let boundary = include.selected_section.as_ref().unwrap();
+        assert_eq!(boundary.opening.location.line, start);
+        assert_eq!(boundary.closing.location.line, end);
+    }
+    assert_eq!(n.cards[2].include_chain.len(), 1);
+    assert_eq!(n.cards[2].include_chain[0].line, 3);
+
+    // Boundary validation must continue beyond the selected section.
+    f.write(
+        "process.lib",
+        ".lib empty\n.endl empty\n.lib other\n.endl wrong\n",
+    );
+    let error = f.parse("main.cir").unwrap_err();
+    assert!(error.to_string().contains("mismatched .endl"), "{error}");
+}
+#[test]
 fn canonical_file_and_section_dependencies_detect_cycles() {
     let f = Files::new();
     f.write("main.cir", "title\n.include a.inc\n");
