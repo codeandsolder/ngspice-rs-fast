@@ -17,7 +17,8 @@ pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &crate::analysis::AnalysisContext,
-) -> SpiceResult<Plot> {
+    include_bias: bool,
+) -> SpiceResult<Vec<Plot>> {
     let settings = crate::analysis::bias::DcSettings::from_request(request)?;
     let positional: Vec<String> = request
         .arguments
@@ -30,6 +31,7 @@ pub(super) fn run(
     }
     let grid = frequency_grid(&positional, settings.newton.reltol, GridKind::Ac)?;
     let mut small_signal = SmallSignal::prepare(circuit, request, context, settings)?;
+    let mut plots = small_signal.retained_bias(circuit, request, context, include_bias)?;
     let mut plot = plot(
         circuit,
         "ac1",
@@ -53,7 +55,8 @@ pub(super) fn run(
         point.extend(circuit.observe_parameters(&context.model_context().with_frequency(f))?);
         plot.push_point(point)?;
     }
-    Ok(plot)
+    plots.push(plot);
+    Ok(plots)
 }
 
 /// Which C frequency loop a grid follows: `acan.c` has a special decade delta
@@ -230,6 +233,34 @@ impl SmallSignal {
         })
     }
 
+    /// Publish the original bias of this analysis, not a second CKTop.
+    /// Only the multi-plot interface requests the optional retained plot.
+    pub(super) fn retained_bias(
+        &self,
+        circuit: &Circuit,
+        request: &AnalysisRequest,
+        context: &crate::analysis::AnalysisContext,
+        include: bool,
+    ) -> SpiceResult<Vec<Plot>> {
+        if !include {
+            return Ok(Vec::new());
+        }
+        let title = match request.kind {
+            crate::primitives::AnalysisKind::Noise => "NOISE Operating Point",
+            crate::primitives::AnalysisKind::Distortion
+            | crate::primitives::AnalysisKind::PoleZero => "Distortion Operating Point",
+            _ => "AC Operating Point",
+        };
+        let mut plot = plot(circuit, "op1", title, None, false)?;
+        let mut point = Vec::with_capacity(plot.variables.len());
+        point.extend(self.bias().as_slice().iter().copied().map(Complex::real));
+        // Spectral observations support scalar instance parameters. Include
+        // them in the bias row as well; its header already names them.
+        point.extend(circuit.observe_parameters(&context.model_context())?);
+        plot.push_point(point)?;
+        Ok(vec![plot])
+    }
+
     /// The system linearized at the operating point (re-solved at the last
     /// requested frequency for a `hertz`-dependent circuit).
     pub(crate) const fn system(&self) -> &LinearSystem {
@@ -329,6 +360,38 @@ mod tests {
         let expected = carried(&same_bias);
         assert!(expected.iter().flatten().any(|value| *value > 0.));
         assert_eq!(carried(&circuit), expected);
+    }
+
+    #[test]
+    fn retained_bias_contains_observations_without_changing_the_sweep() {
+        let netlist = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("retained-bias.cir"),
+                "AC with retained bias\nv1 in 0 dc 2 ac 1\nr1 in out 1k\nr2 out 0 1k\n.end\n",
+            ))
+            .unwrap();
+        let mut circuit = Circuit::from_netlist(&netlist).unwrap();
+        let mut other = Circuit::from_netlist(&netlist).unwrap();
+        let observations = ["@r1[resistance]".to_owned()];
+        circuit.set_observations(&observations).unwrap();
+        other.set_observations(&observations).unwrap();
+        let context = AnalysisContext::default();
+        let mut request =
+            AnalysisRequest::with_arguments(AnalysisKind::Ac, ["lin", "3", "100", "300"]);
+        request.keep_op_info = true;
+        let driver = crate::analysis::runner(AnalysisKind::Ac).unwrap();
+        let plots = driver.run_plots(&mut circuit, &request, &context).unwrap();
+        assert_eq!(plots.len(), 2);
+        assert_eq!(plots[0].plotname, "AC Operating Point");
+        assert_eq!(plots[0].value("v(out)", 0), Some(Complex::real(1.)));
+        assert_eq!(
+            plots[0].value("@r1[resistance]", 0),
+            Some(Complex::real(1000.))
+        );
+        assert_eq!(
+            plots[1],
+            driver.run(&mut other, &request, &context).unwrap()
+        );
     }
 
     #[test]

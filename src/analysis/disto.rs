@@ -282,6 +282,7 @@ pub(crate) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &AnalysisContext,
+    include_bias: bool,
 ) -> SpiceResult<Vec<Plot>> {
     let settings = crate::analysis::bias::DcSettings::from_request(request)?;
     let reltol = match request.named("rtol") {
@@ -292,6 +293,7 @@ pub(crate) fn run(
     let card = parse(request)?;
     let grid = frequencies(&card, reltol)?;
     let small = crate::analysis::ac::SmallSignal::prepare(circuit, request, context, settings)?;
+    let mut retained = small.retained_bias(circuit, request, context, include_bias)?;
     if small.varies() {
         return Err(unsupported(
             ".disto of a circuit with a `hertz`-dependent device (distoan.c linearizes once, \
@@ -408,7 +410,8 @@ pub(crate) fn run(
             message: "nonfinite distortion response".into(),
         });
     }
-    Ok(plots)
+    retained.extend(plots);
+    Ok(retained)
 }
 
 #[cfg(test)]

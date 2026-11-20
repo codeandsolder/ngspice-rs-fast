@@ -633,6 +633,7 @@ pub(crate) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &AnalysisContext,
+    include_bias: bool,
 ) -> SpiceResult<Vec<Plot>> {
     let settings = crate::analysis::bias::DcSettings::from_request(request)?;
     let reltol = match request.named("rtol") {
@@ -666,6 +667,7 @@ pub(crate) fn run(
     // them (`noisean.c`: `CKTop`, then a `MODEINITSMSIG` load; a
     // `hertz`-dependent circuit is re-solved at every frequency).
     let mut small = crate::analysis::ac::SmallSignal::prepare(circuit, request, context, settings)?;
+    let mut plots = small.retained_bias(circuit, request, context, include_bias)?;
     let mut model = context.model_context();
     model.spice3_noise = request.spice3_noise;
     // Generators that depend on the frequency are described at the first
@@ -775,7 +777,7 @@ pub(crate) fn run(
             message: "nonfinite noise density".into(),
         });
     }
-    let mut plots = vec![spectrum];
+    plots.push(spectrum);
     if card.start != card.stop {
         let mut integrated = Plot::new("noise2", representation.plotname(false), PlotFlags::Real);
         let mut values = NoiseRow::new(representation, integrated_variables.len());
