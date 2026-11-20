@@ -1314,9 +1314,7 @@ impl Device for Hfet1 {
         }))
     }
     fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
-        ["l", "w", "m", "temp", "dtemp"]
-            .into_iter()
-            .find(|name| name.eq_ignore_ascii_case(keyword))
+        Instance::sweep_parameter(keyword)
     }
     /// `HFETAparam` with the instance schema's domains: a swept temperature is
     /// re-derived by the next load.
@@ -1324,46 +1322,9 @@ impl Device for Hfet1 {
         &self,
         parameter: &str,
         value: Real,
-        _context: &ModelContext,
+        context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        let check = |ok: bool, what: &str| -> SpiceResult<()> {
-            if ok {
-                Ok(())
-            } else {
-                Err(SpiceError::circuit(format!(
-                    "{}: HFET1 {} must be {what}, got {value}",
-                    self.name, parameter
-                )))
-            }
-        };
-        let mut instance = self.instance;
-        let mut initial = self.initial.clone();
-        match parameter {
-            "l" | "w" | "m" => {
-                check(value > 0., "positive")?;
-                match parameter {
-                    "l" => instance.l = value,
-                    "w" => instance.w = value,
-                    _ => instance.m = value,
-                }
-            }
-            "temp" => {
-                check(value.is_finite(), "finite")?;
-                instance.temp = Some(value);
-            }
-            "dtemp" => {
-                check(value.is_finite(), "finite")?;
-                instance.dtemp = value;
-            }
-            _ => {
-                // `off`, `icvds` and `icvgs` are the initial-condition setters.
-                let _ = &mut initial;
-                return Err(SpiceError::circuit(format!(
-                    "{}: HFET1 cannot sweep {parameter}",
-                    self.name
-                )));
-            }
-        }
+        let instance = self.instance.swept(&self.name, parameter, value)?;
         let device = Self {
             name: self.name.clone(),
             model_name: self.model_name.clone(),
@@ -1371,10 +1332,10 @@ impl Device for Hfet1 {
             nodes: self.nodes,
             model: self.model,
             instance,
-            initial,
+            initial: self.initial.clone(),
             temperature_cache: TemperatureCache::new(),
         };
-        device.derived(_context.temperature)?;
+        device.derived(context.temperature)?;
         Ok(Box::new(device))
     }
 

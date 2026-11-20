@@ -828,9 +828,7 @@ impl Device for Hfet2 {
         }))
     }
     fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
-        ["l", "w", "m", "temp", "dtemp"]
-            .into_iter()
-            .find(|name| name.eq_ignore_ascii_case(keyword))
+        Instance::sweep_parameter(keyword)
     }
     fn with_instance_parameter(
         &self,
@@ -838,41 +836,7 @@ impl Device for Hfet2 {
         value: Real,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        let check = |ok: bool, what: &str| -> SpiceResult<()> {
-            if ok {
-                Ok(())
-            } else {
-                Err(SpiceError::circuit(format!(
-                    "{}: HFET2 {} must be {what}, got {value}",
-                    self.name, parameter
-                )))
-            }
-        };
-        let mut instance = self.instance;
-        match parameter {
-            "l" | "w" | "m" => {
-                check(value > 0., "positive")?;
-                match parameter {
-                    "l" => instance.l = value,
-                    "w" => instance.w = value,
-                    _ => instance.m = value,
-                }
-            }
-            "temp" => {
-                check(value.is_finite(), "finite")?;
-                instance.temp = Some(value);
-            }
-            "dtemp" => {
-                check(value.is_finite(), "finite")?;
-                instance.dtemp = value;
-            }
-            _ => {
-                return Err(SpiceError::circuit(format!(
-                    "{}: HFET2 cannot sweep {parameter}",
-                    self.name
-                )));
-            }
-        }
+        let instance = self.instance.swept(&self.name, parameter, value)?;
         let device = Self {
             name: self.name.clone(),
             model_name: self.model_name.clone(),
