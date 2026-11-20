@@ -161,8 +161,15 @@ pub(super) fn resolve_refs_with_scope<'a>(
                 ),
             ));
         }
-        let resolved = crate::netlist::parser::resolve_measure_card(card, &scope, &mut budget)?;
-        let card = &resolved;
+        // Only deferred numeric setter expressions need a newly parsed card.
+        // All other cards are already resolved and can be borrowed as-is.
+        let resolved;
+        let card = if matches!(card.request, MeasureRequest::Deferred { .. }) {
+            resolved = crate::netlist::parser::resolve_measure_card(card, &scope, &mut budget)?;
+            &resolved
+        } else {
+            card
+        };
         let result = if let MeasureRequest::Parameter(expression) = &card.request {
             Measurement {
                 name: card.name.clone(),
@@ -406,43 +413,50 @@ impl Window {
     /// Enhancement-302 does, so `AVG` over `[from, to]` equals
     /// `INTEG/(to - from)` exactly. The bracket always has positive width here:
     /// a zero-width bracket is a jump and its value *is* the boundary.
-    fn clipped(
+    fn clipped<'a>(
         &self,
-        axis: &Axis,
-        operand: &Operand<'_>,
+        axis: &'a Axis,
+        operand: &'a Operand<'_>,
         card: &MeasureCard,
-    ) -> SpiceResult<Vec<(Real, Real)>> {
+    ) -> SpiceResult<impl Iterator<Item = SpiceResult<(Real, Real)>> + 'a> {
         let (first, last) = self.samples(axis, card)?;
-        let mut points = Vec::with_capacity(last - first + 3);
-        if axis.values[first] > self.from {
-            points.push((
-                self.from,
-                interpolate_value(
-                    axis.values[first - 1],
-                    operand.value(first - 1)?,
-                    axis.values[first],
-                    operand.value(first)?,
-                    self.from,
-                ),
-            ));
-        }
-        for (offset, &axis_value) in axis.values[first..=last].iter().enumerate() {
-            points.push((axis_value, operand.value(first + offset)?));
-        }
-        if axis.values[last] < self.to {
-            points.push((
-                self.to,
-                interpolate_value(
-                    axis.values[last],
-                    operand.value(last)?,
-                    axis.values[last + 1],
-                    operand.value(last + 1)?,
-                    self.to,
-                ),
-            ));
-        }
-        Ok(points)
+        let before = (axis.values[first] > self.from)
+            .then_some(self.from)
+            .into_iter()
+            .map(move |x| clipped_boundary(axis, operand, first - 1, first, x));
+        let interior = (first..=last).map(move |index| {
+            operand
+                .value(index)
+                .map(|value| (axis.values[index], value))
+        });
+        let after = (axis.values[last] < self.to)
+            .then_some(self.to)
+            .into_iter()
+            .map(move |x| clipped_boundary(axis, operand, last, last + 1, x));
+        Ok(before.chain(interior).chain(after))
     }
+}
+
+/// The interpolation order at a clipped boundary is the same as the
+/// materialized-window implementation. Only strictly interior brackets
+/// reach this function.
+fn clipped_boundary(
+    axis: &Axis,
+    operand: &Operand<'_>,
+    left: usize,
+    right: usize,
+    x: Real,
+) -> SpiceResult<(Real, Real)> {
+    Ok((
+        x,
+        interpolate_value(
+            axis.values[left],
+            operand.value(left)?,
+            axis.values[right],
+            operand.value(right)?,
+            x,
+        ),
+    ))
 }
 
 /// One measurement operand: the column a `.measure` vector resolves to, plus the
@@ -583,28 +597,25 @@ fn evaluate(plot: &Plot, axis: &Axis, card: &MeasureCard) -> SpiceResult<Measure
                     (value, Some(at), None)
                 }
                 MeasureStatistic::MinAt | MeasureStatistic::MaxAt => {
-                    let (_, at) = extremum(
-                        axis,
-                        &operand,
-                        &window,
-                        *statistic == MeasureStatistic::MaxAt,
-                        card,
-                    )?;
+                    let extrema = extrema(axis, &operand, &window, card)?;
+                    let (_, at) = if *statistic == MeasureStatistic::MaxAt {
+                        extrema.max
+                    } else {
+                        extrema.min
+                    };
                     (at, None, None)
                 }
                 MeasureStatistic::PeakToPeak => {
-                    let (min, _) = extremum(axis, &operand, &window, false, card)?;
-                    let (max, _) = extremum(axis, &operand, &window, true, card)?;
-                    (max - min, None, None)
+                    let extrema = extrema(axis, &operand, &window, card)?;
+                    (extrema.max.0 - extrema.min.0, None, None)
                 }
                 MeasureStatistic::Min | MeasureStatistic::Max => {
-                    let (value, at) = extremum(
-                        axis,
-                        &operand,
-                        &window,
-                        *statistic == MeasureStatistic::Max,
-                        card,
-                    )?;
+                    let extrema = extrema(axis, &operand, &window, card)?;
+                    let (value, at) = if *statistic == MeasureStatistic::Max {
+                        extrema.max
+                    } else {
+                        extrema.min
+                    };
                     (value, Some(at), None)
                 }
                 MeasureStatistic::Avg | MeasureStatistic::Rms | MeasureStatistic::Integ => {
@@ -619,9 +630,9 @@ fn evaluate(plot: &Plot, axis: &Axis, card: &MeasureCard) -> SpiceResult<Measure
                     let points = window.clipped(axis, &operand, card)?;
                     let squared = *statistic == MeasureStatistic::Rms;
                     let area = if *statistic == MeasureStatistic::Avg {
-                        integral(&points, false, card)?
+                        trapezoid_integral(points, card)?
                     } else {
-                        simpson_integral(&points, squared, card)?
+                        simpson_integral(points, squared, card)?
                     };
                     let mean = if *statistic == MeasureStatistic::Integ {
                         area
@@ -716,58 +727,52 @@ fn check_range(axis: &Axis, x: Real, card: &MeasureCard, what: &str) -> SpiceRes
     Ok(())
 }
 
-/// The axis value of the window's smallest (or largest) operand sample.
-fn extremum(
+/// Extremal sample values and their axis locations. A peak-to-peak
+/// measurement gets both extrema in one traversal.
+struct Extrema {
+    min: (Real, Real),
+    max: (Real, Real),
+}
+
+fn extrema(
     axis: &Axis,
     operand: &Operand<'_>,
     window: &Window,
-    largest: bool,
     card: &MeasureCard,
-) -> SpiceResult<(Real, Real)> {
+) -> SpiceResult<Extrema> {
     let (first, last) = window.samples(axis, card)?;
-    let mut best: Option<(Real, Real)> = None;
-    for (offset, &axis_value) in axis.values[first..=last].iter().enumerate() {
-        let index = first + offset;
-        let value = operand.value(index)?;
-        let replace = match best {
-            None => true,
-            // C's `value <= mValue` / `value >= mValue`: ties keep the last
-            // sample that attained the extremum.
-            Some((current, _)) => {
-                if largest {
-                    value >= current
-                } else {
-                    value <= current
-                }
-            }
-        };
-        if replace {
-            best = Some((value, axis_value));
+    let initial = (operand.value(first)?, axis.values[first]);
+    let mut extrema = Extrema {
+        min: initial,
+        max: initial,
+    };
+    for (offset, &location) in axis.values[first + 1..=last].iter().enumerate() {
+        let value = operand.value(first + 1 + offset)?;
+        // C's <= / >= comparisons keep the last sample on ties.
+        if value <= extrema.min.0 {
+            extrema.min = (value, location);
+        }
+        if value >= extrema.max.0 {
+            extrema.max = (value, location);
         }
     }
-    best.ok_or_else(|| {
-        unsupported(
-            card,
-            format!(".measure {}: the window covers no sample", card.name),
-        )
-    })
+    Ok(extrema)
 }
 
-/// The trapezoidal integral of the window's samples, or of their squares.
-///
-/// The trapezoid rule integrates linear data exactly and is the rule C's
-/// `measure_minMaxAvg()` uses for `AVG`; the port uses it for `INTEG` and `RMS`
-/// as well, where C mixes in Simpson's rules **only** for uniformly spaced
-/// samples (`AlmostEqualUlps(width[i], width[i+1], 100)` in
-/// `measure_rms_integral()`), which an adaptive transient grid essentially
-/// never satisfies.
-fn integral(points: &[(Real, Real)], square: bool, card: &MeasureCard) -> SpiceResult<Real> {
-    let mut area = 0.0;
-    for pair in points.windows(2) {
-        let (x0, y0) = pair[0];
-        let (x1, y1) = pair[1];
-        let (y0, y1) = if square { (y0 * y0, y1 * y1) } else { (y0, y1) };
-        area += 0.5 * (y0 + y1) * (x1 - x0);
+/// C measure_minMaxAvg uses the trapezoidal integral for AVG. Only the
+/// preceding sample is needed; keep exactly the original grouping.
+fn trapezoid_integral(
+    points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
+    card: &MeasureCard,
+) -> SpiceResult<Real> {
+    let mut previous = None;
+    let mut area = 0.;
+    for point in points {
+        let (x1, y1) = point?;
+        if let Some((x0, y0)) = previous {
+            area += 0.5 * (y0 + y1) * (x1 - x0);
+        }
+        previous = Some((x1, y1));
     }
     if !area.is_finite() {
         return Err(nonfinite(
@@ -779,36 +784,49 @@ fn integral(points: &[(Real, Real)], square: bool, card: &MeasureCard) -> SpiceR
     Ok(area)
 }
 
-/// C `measure_rms_integral`: greedy Simpson 3/8, then 1/3, then trapezoid.
-/// Only positive widths within 100 ULPs share a Simpson panel.
+/// C measure_rms_integral: greedy Simpson 3/8, then 1/3, then trapezoid.
+/// Four samples are sufficient to select a panel; retain an overlapping
+/// endpoint and refill only consumed slots. Only positive widths within
+/// 100 ULPs share a Simpson panel. Duplicate coordinates use trapezoids.
 fn simpson_integral(
-    points: &[(Real, Real)],
+    points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
     square: bool,
     card: &MeasureCard,
 ) -> SpiceResult<Real> {
-    let y = |i: usize| {
-        if square {
-            points[i].1 * points[i].1
-        } else {
-            points[i].1
-        }
-    };
-    let width = |i: usize| points[i + 1].0 - points[i].0;
-    let equal = |a: Real, b: Real| a > 0. && b > 0. && a.to_bits().abs_diff(b.to_bits()) <= 100;
+    let mut points = points.fuse();
+    let mut panel = [(0., 0.); 4];
+    let mut count = 0;
     let mut area = 0.;
-    let mut i = 0;
-    while i + 1 < points.len() {
-        let h = width(i);
-        if i + 3 < points.len() && equal(h, width(i + 1)) && equal(h, width(i + 2)) {
-            area += 3. * h * (y(i) + 3. * (y(i + 1) + y(i + 2)) + y(i + 3)) / 8.;
-            i += 3;
-        } else if i + 2 < points.len() && equal(h, width(i + 1)) {
-            area += h * (y(i) + 4. * y(i + 1) + y(i + 2)) / 3.;
-            i += 2;
-        } else {
-            area += h * (y(i) + y(i + 1)) / 2.;
-            i += 1;
+    let equal = |a: Real, b: Real| a > 0. && b > 0. && a.to_bits().abs_diff(b.to_bits()) <= 100;
+    loop {
+        for slot in &mut panel[count..] {
+            let Some(point) = points.next() else {
+                break;
+            };
+            *slot = point?;
+            count += 1;
         }
+        if count < 2 {
+            break;
+        }
+        let y = |index: usize| {
+            let value = panel[index].1;
+            if square { value * value } else { value }
+        };
+        let width = |index: usize| panel[index + 1].0 - panel[index].0;
+        let h = width(0);
+        let consumed = if count == 4 && equal(h, width(1)) && equal(h, width(2)) {
+            area += 3. * h * (y(0) + 3. * (y(1) + y(2)) + y(3)) / 8.;
+            3
+        } else if count >= 3 && equal(h, width(1)) {
+            area += h * (y(0) + 4. * y(1) + y(2)) / 3.;
+            2
+        } else {
+            area += h * (y(0) + y(1)) / 2.;
+            1
+        };
+        panel.copy_within(consumed..count, 0);
+        count -= consumed;
     }
     if !area.is_finite() {
         return Err(nonfinite(
@@ -1259,6 +1277,39 @@ mod tests {
             value,
             value_location: loc(),
             transition,
+        }
+    }
+
+    #[test]
+    fn streaming_simpson_panels_keep_greedy_selection_and_rounding() {
+        let points: [(Real, Real); 9] = [
+            (0., 0.1),
+            (1., -0.2),
+            (2., 1.3),
+            (3., 0.4),
+            (4., 0.5),
+            (5., -0.6),
+            (7., 2.7),
+            (7., -0.8),
+            (8., 0.9),
+        ];
+        let card = card("m", request(MeasureStatistic::Integ, None, None));
+        for square in [false, true] {
+            let y = |i: usize| {
+                if square {
+                    points[i].1 * points[i].1
+                } else {
+                    points[i].1
+                }
+            };
+            let h = |i: usize| points[i + 1].0 - points[i].0;
+            let mut expected = 3. * h(0) * (y(0) + 3. * (y(1) + y(2)) + y(3)) / 8.;
+            expected += h(3) * (y(3) + 4. * y(4) + y(5)) / 3.;
+            for i in 5..8 {
+                expected += h(i) * (y(i) + y(i + 1)) / 2.;
+            }
+            let got = super::simpson_integral(points.into_iter().map(Ok), square, &card).unwrap();
+            assert_eq!(got.to_bits(), expected.to_bits());
         }
     }
 
