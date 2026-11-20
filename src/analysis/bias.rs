@@ -925,16 +925,19 @@ impl OperatingPointStart {
         model: &ModelContext,
         settings: &DcSettings,
     ) -> SpiceResult<NewtonSolution<TrialState>> {
-        Ok(solve_dc_forced(
-            circuit,
-            model,
-            settings,
-            &[],
-            Some(&self.seed),
-            None,
-            &self.nodes,
-        )?
-        .solution)
+        self.solve_from(circuit, model, settings, &self.seed)
+    }
+
+    /// Another operating point in the same analysis: keep MODEINITJCT and
+    /// MODEINITFIX node forcing, but warm-start from the previous solution.
+    pub(super) fn solve_from(
+        &self,
+        circuit: &Circuit,
+        model: &ModelContext,
+        settings: &DcSettings,
+        seed: &Vector,
+    ) -> SpiceResult<NewtonSolution<TrialState>> {
+        Ok(solve_dc_forced(circuit, model, settings, &[], Some(seed), None, &self.nodes)?.solution)
     }
 }
 

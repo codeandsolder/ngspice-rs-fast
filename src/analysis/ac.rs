@@ -170,6 +170,7 @@ pub(super) fn ac_matrix(
 /// prepare it before their frequency loops.
 pub(super) struct SmallSignal {
     settings: crate::analysis::bias::DcSettings,
+    start: crate::analysis::bias::OperatingPointStart,
     state1: Vec<Real>,
     system: LinearSystem,
     /// A `hertz`-dependent device forces a new operating point per frequency.
@@ -190,11 +191,8 @@ impl SmallSignal {
         settings: crate::analysis::bias::DcSettings,
     ) -> SpiceResult<Self> {
         circuit.finalize()?;
-        let solved = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?.solve(
-            circuit,
-            &context.model_context(),
-            &settings,
-        )?;
+        let start = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?;
+        let solved = start.solve(circuit, &context.model_context(), &settings)?;
         // The MODEINITSMSIG load's state writes outlive the analysis (C keeps
         // one CKTstate0 per deck): later analyses read them back.
         circuit.record_small_signal_state(&context.model_context(), &solved.values)?;
@@ -225,6 +223,7 @@ impl SmallSignal {
             .any(|device| device.small_signal_depends_on_frequency());
         Ok(Self {
             settings,
+            start,
             state1,
             system,
             varies,
@@ -300,16 +299,10 @@ impl SmallSignal {
     ) -> SpiceResult<R> {
         if self.varies {
             let model = context.model_context().with_frequency(f);
-            self.previous = crate::analysis::bias::solve_dc_with(
-                circuit,
-                &model,
-                &self.settings,
-                &[],
-                Some(&self.previous),
-                None,
-            )?
-            .solution
-            .values;
+            self.previous = self
+                .start
+                .solve_from(circuit, &model, &self.settings, &self.previous)?
+                .values;
             // C repeats MODEINITSMSIG after every frequency-dependent CKTop.
             // Preserve its carried device slots for the next bias and analysis.
             circuit.record_small_signal_state(&model, &self.previous)?;
@@ -392,6 +385,35 @@ mod tests {
             plots[1],
             driver.run(&mut other, &request, &context).unwrap()
         );
+    }
+
+    #[test]
+    fn frequency_dependent_rebias_reapplies_nodesets_like_c() {
+        // At 100 Hz the negative bias offset leaves only the negative branch.
+        // At 150 Hz the positive branch exists again. C's next MODEINITJCT
+        // forces the same nodeset, selecting that branch despite the warm start.
+        // Multiplication by the unit AC input exposes the DC bias as gain.
+        let netlist = Parser::new().parse_deck(&parse_deck_text(
+            Path::new("rebias-nodeset.cir"),
+            "hertz latch\nr1 a 0 1k\nb1 0 a i=(2*tanh(4*v(a))-2.5*exp(-((hertz-100)/20)^2)+v(in))/1000\nvin in 0 dc 0 ac 1\nb2 out 0 v=v(a)*v(in)\nr2 out 0 1k\n.nodeset v(a)=2\n.ac lin 3 100 200\n.end\n",
+        )).unwrap();
+        let config = crate::analysis::RunConfig::from_netlist(&netlist).unwrap();
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let request = config.request_for(&netlist.analyses[0]).unwrap();
+        let plot = crate::analysis::runner(request.kind)
+            .unwrap()
+            .run(&mut circuit, &request, &config.context())
+            .unwrap();
+        for (row, reference) in [-4.5, 1.9951733971375833, 1.9999995498230105]
+            .into_iter()
+            .enumerate()
+        {
+            let gain = plot.value("v(out)", row).unwrap().re;
+            assert!(
+                (gain - reference).abs() < 1e-6,
+                "row {row}: {gain} vs C {reference}"
+            );
+        }
     }
 
     #[test]
