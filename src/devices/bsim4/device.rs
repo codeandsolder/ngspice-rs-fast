@@ -1112,7 +1112,7 @@ impl Bsim4 {
             error: None,
         };
         if pole_zero {
-            pzld::pz_load(&prepared.model, &h, &prepared.size, &mut host)?;
+            pzld::pz_load(&prepared.model, &h, &prepared.size, &mut host);
         } else {
             acld::ac_load(&prepared.model, &h, &prepared.size, &mut host);
         }

@@ -78,11 +78,12 @@ mod size_data;
 /// Model-level temperature processing from `b3temp.c`.
 pub mod temperature;
 
-/// Select a BSIM3 implementation from the first VERSION token.
+/// Select the BSIM3 version, using the first `VERSION` token.
 ///
-/// Select the BSIM3 directory from the **first** VERSION token, as
-/// `inpdomod.c`/`INPfindVer` do. The eventual string setter still has last-set
-/// precedence. Only the 3.3 family is being ported; no older model is substituted.
+/// Directory selection follows `inpdomod.c`/`INPfindVer`. The eventual
+/// string setter uses last-set precedence.
+///
+/// Only the 3.3 family is supported; no older model is substituted.
 ///
 /// # Errors
 /// Unsupported versions, or nonliteral version input.

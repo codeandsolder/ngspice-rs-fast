@@ -27,23 +27,17 @@
 )]
 use super::fields::{Instance, Model, SizeParam};
 use super::host::{SmallSignalCkt, state};
-use crate::primitives::SpiceResult;
 
 /// `BSIM4pzLoad` for one instance, from the values the `MODEINITSMSIG`
 /// load left on `h`.
 ///
-/// # Errors
-/// C's error returns (none: `BSIM4pzLoad` always returns `OK`).
+/// Like C's always-successful kernel, this cannot fail itself; the caller
+/// checks the host's recorded stamping error.
 #[expect(
     clippy::too_many_lines,
     reason = "keeps the reference numerical routine in the original statement and rounding order"
 )] // One C function, kept in C's shape.
-pub(super) fn pz_load(
-    m: &Model,
-    h: &Instance,
-    p: &SizeParam,
-    ckt: &mut dyn SmallSignalCkt,
-) -> SpiceResult<()> {
+pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn SmallSignalCkt) {
     let ScalingFactor = 1.0e-9;
     let cgso = h.cgso;
     let cgdo = h.cgdo;
@@ -699,7 +693,6 @@ pub(super) fn pz_load(
         ckt.real(q, bp, mm * xgtb);
         ckt.real(q, sp, mm * xgts);
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -710,7 +703,7 @@ mod tests {
     #[test]
     fn pz_stamps_land_on_allocated_elements() {
         check_shapes(
-            |m, h, ckt| super::pz_load(m, h, &SizeParam::default(), ckt).unwrap(),
+            |m, h, ckt| super::pz_load(m, h, &SizeParam::default(), ckt),
             true,
             false,
         );
