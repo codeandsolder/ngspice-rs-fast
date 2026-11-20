@@ -88,15 +88,15 @@ pub(super) fn frequency_grid(
     let argument = |index: usize| arguments.get(index).map(String::as_str);
     let mode = argument(0).unwrap_or_default().to_ascii_lowercase();
     // ACnumberSteps is IF_INTEGER: floor(0.5 + value).
-    let points: usize = argument(1)
+    let points = argument(1)
         .and_then(crate::primitives::parse_spice_number)
         .and_then(crate::primitives::c_integer)
         .filter(|n| *n > 0 && *n <= 100_000)
-        .and_then(|n| usize::try_from(n).ok())
+        .and_then(|n| u32::try_from(n).ok())
         .ok_or_else(|| unsupported("AC points must be in 1..=100000"))?;
     let start = number(argument(2), "start frequency")?;
     let stop = number(argument(3), "stop frequency")?;
-    let steps = points as Real;
+    let steps = Real::from(points);
     let logarithmic = mode != "lin";
     if logarithmic && start <= 0. {
         // acan.c/span.c: "ERROR: AC startfreq <= 0", E_PARMVAL.
@@ -110,7 +110,7 @@ pub(super) fn frequency_grid(
             let num_steps = ((stop / start).log10().abs() * steps).floor();
             ((stop / start).ln() / num_steps).exp()
         }
-        "dec" if stop == start && kind == GridKind::Ac => 1.,
+        "dec" if stop <= start && kind == GridKind::Ac => 1.,
         "dec" => (10f64.ln() / steps).exp(),
         "oct" => (2f64.ln() / steps).exp(),
         "lin" if points - 1 > 1 => (stop - start) / (steps - 1.),
@@ -123,15 +123,15 @@ pub(super) fn frequency_grid(
         delta * reltol
     };
     let advance = if logarithmic {
-        if delta == 1. {
-            Advance::Single
-        } else {
-            Advance::Multiply(delta)
+        match delta {
+            1. => Advance::Single,
+            _ => Advance::Multiply(delta),
         }
-    } else if delta == 0. {
-        Advance::Single
     } else {
-        Advance::Add(delta)
+        match delta {
+            0. => Advance::Single,
+            _ => Advance::Add(delta),
+        }
     };
     let analysis = match kind {
         GridKind::Ac => ".ac",
@@ -232,7 +232,7 @@ impl SmallSignal {
         })
     }
 
-    /// Publish the original bias of this analysis, not a second CKTop.
+    /// Publish the original bias of this analysis, not a second `CKTop`.
     /// Only the multi-plot interface requests the optional retained plot.
     pub(super) fn retained_bias(
         &self,
@@ -326,6 +326,28 @@ mod tests {
     use crate::netlist::{Parser, source::parse_deck_text};
     use crate::primitives::AnalysisKind;
     use std::path::Path;
+
+    fn grid(mode: &str, points: &str, start: &str, stop: &str, kind: GridKind) -> Vec<f64> {
+        frequency_grid(
+            &[mode.into(), points.into(), start.into(), stop.into()],
+            1e-3,
+            kind,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn singleton_sweeps_keep_reference_exactness() {
+        assert_eq!(grid("dec", "10", "42", "42", GridKind::Ac), [42.]);
+        assert_eq!(grid("lin", "2", "1", "100", GridKind::Ac), [1.]);
+        assert_eq!(grid("lin", "3", "42", "42", GridKind::Sp), [42.]);
+    }
+
+    #[test]
+    fn linear_grid_keeps_repeated_addition_and_inclusive_endpoint() {
+        assert_eq!(grid("lin", "3", "1", "3", GridKind::Ac), [1., 2., 3.]);
+        assert_eq!(grid("lin", "3", "1", "3", GridKind::Sp), [1., 2., 3.]);
+    }
 
     fn carried(circuit: &Circuit) -> Vec<Option<Real>> {
         let history = circuit.state_history();

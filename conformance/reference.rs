@@ -1,11 +1,13 @@
-//! C-reference selection shared by conformance tests and xtask, never by the
-//! simulator. Most fixtures use one golden; explicitly documented libm-sensitive
+//! C-reference selection for conformance tests and xtask.
+//!
+//! Most fixtures use one golden; explicitly documented libm-sensitive
 //! fixtures may have an independently captured platform variant. Missing data
 //! is an error at the caller, not permission to fall back to another platform.
 
 use std::path::{Path, PathBuf};
 
-/// The C golden for `name` on the target running the verifier/capture tool.
+/// The C golden for `name` on the verifier/capture target.
+///
 /// Capture, drift checks and numerical verification must use the same path.
 pub(crate) fn golden_path(root: &Path, name: &str) -> PathBuf {
     path_for(
