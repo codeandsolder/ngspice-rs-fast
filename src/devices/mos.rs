@@ -87,7 +87,7 @@ use crate::devices::limiting;
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
-use crate::devices::nonlinear::{JunctionPoint, junction_companion};
+use crate::devices::nonlinear::{JunctionPoint, cubic_reverse_junction, junction_companion};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -476,13 +476,8 @@ impl Junction {
             match self.reverse {
                 ReverseLaw::Constant => (gmin * v - self.saturation, gmin),
                 ReverseLaw::Cubic => {
-                    // C `CONSTe` is exp(1.0).
-                    let arg = 3. * vt / (v * std::f64::consts::E);
-                    let arg = arg * arg * arg;
-                    (
-                        -self.saturation * (1. + arg) + gmin * v,
-                        self.saturation * 3. * arg / v + gmin,
-                    )
+                    let (current, conductance) = cubic_reverse_junction(v, vt, self.saturation);
+                    (current + gmin * v, conductance + gmin)
                 }
             }
         } else {

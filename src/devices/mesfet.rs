@@ -94,7 +94,9 @@ use crate::devices::limiting;
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
-use crate::devices::nonlinear::{JunctionPoint, junction_companion, junction_current};
+use crate::devices::nonlinear::{
+    JunctionPoint, ReverseBoundary, junction_companion, junction_current,
+};
 use crate::devices::schema::{
     self, ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
@@ -485,7 +487,7 @@ impl Mesfet {
     /// The DC quantities at normalized `vgs`, `vgd` (`mesload.c`).
     fn point(&self, op: &Operating, vgs: Real, vgd: Real, gmin: Real) -> SpiceResult<Point> {
         let junction = |v: Real| -> SpiceResult<(Real, Real)> {
-            let (current, conductance) = junction_current(v, VT0, op.csat)?;
+            let (current, conductance) = junction_current(v, VT0, op.csat, ReverseBoundary::Cubic)?;
             Ok((current + gmin * v, conductance + gmin))
         };
         let point = Point {

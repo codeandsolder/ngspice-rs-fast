@@ -68,6 +68,7 @@ use crate::devices::limiting::{self, Limiter, Linearization};
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
+use crate::devices::nonlinear::{cubic_reverse_junction, exponential_junction};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -1192,12 +1193,9 @@ struct Point {
 /// below `-3 vtn`, in C's arithmetic.
 fn c_junction(v: Real, vtn: Real, is: Real) -> (Real, Real) {
     if v >= -3. * vtn {
-        let ev = (v / vtn).exp();
-        (is * (ev - 1.), is * ev / vtn)
+        exponential_junction(v, vtn, is)
     } else {
-        let mut arg = 3. * vtn / (v * std::f64::consts::E);
-        arg = arg * arg * arg;
-        (-is * (1. + arg), is * 3. * arg / v)
+        cubic_reverse_junction(v, vtn, is)
     }
 }
 
@@ -1272,12 +1270,8 @@ fn c_point(
         Some(iss) => {
             let vts = vt * t.ns;
             if vsub <= -3. * vts {
-                let mut arg = 3. * vts / (vsub * std::f64::consts::E);
-                arg = arg * arg * arg;
-                (
-                    iss * 3. * arg / vsub + gmin,
-                    -iss * (1. + arg) + gmin * vsub,
-                )
+                let (current, conductance) = cubic_reverse_junction(vsub, vts, iss);
+                (conductance + gmin, current + gmin * vsub)
             } else {
                 let evsub = (vsub / vts).min(MAX_EXP_ARG).exp();
                 (iss * evsub / vts + gmin, iss * (evsub - 1.) + gmin * vsub)

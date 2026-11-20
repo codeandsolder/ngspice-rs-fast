@@ -63,7 +63,9 @@
 )]
 
 use crate::devices::limiting;
-use crate::devices::nonlinear::{JunctionPoint, junction_companion};
+use crate::devices::nonlinear::{
+    JunctionPoint, cubic_reverse_junction, exponential_junction, junction_companion,
+};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -282,14 +284,12 @@ struct Eval {
 /// One gate diode of `jfetload.c`: current and conductance at `v`, with
 /// C's cubic reverse continuation below `-3 vt_temp` and `gmin`.
 fn gate_diode(v: Real, vt_temp: Real, csat: Real, gmin: Real) -> (Real, Real) {
-    if v < -3. * vt_temp {
-        let mut arg = 3. * vt_temp / (v * std::f64::consts::E);
-        arg = arg * arg * arg;
-        (-csat * (1. + arg) + gmin * v, csat * 3. * arg / v + gmin)
+    let (current, conductance) = if v < -3. * vt_temp {
+        cubic_reverse_junction(v, vt_temp, csat)
     } else {
-        let ev = (v / vt_temp).exp();
-        (csat * (ev - 1.) + gmin * v, csat * ev / vt_temp + gmin)
-    }
+        exponential_junction(v, vt_temp, csat)
+    };
+    (current + gmin * v, conductance + gmin)
 }
 
 impl Model {
@@ -918,7 +918,7 @@ pub(super) fn select_junctions(
     let [Some(vgs), Some(vgd)] = new else {
         return (raw, Start::Exact);
     };
-    let previous: Option<Vec<Real>> = [
+    let previous = [
         slot::VGS,
         slot::VGD,
         slot::CG,
@@ -928,10 +928,18 @@ pub(super) fn select_junctions(
         slot::GGS,
         slot::GGD,
     ]
-    .into_iter()
-    .map(|slot| old(slot).filter(|v| v.is_finite()))
-    .collect();
-    let Some(&[vgs0, vgd0, cg0, cd0, gm0, gds0, ggs0, ggd0]) = previous.as_deref() else {
+    .map(|slot| old(slot).filter(|v| v.is_finite()));
+    let [
+        Some(vgs0),
+        Some(vgd0),
+        Some(cg0),
+        Some(cd0),
+        Some(gm0),
+        Some(gds0),
+        Some(ggs0),
+        Some(ggd0),
+    ] = previous
+    else {
         return ([vgs, vgd], Start::Exact);
     };
     let delvgs = vgs - vgs0;

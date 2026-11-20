@@ -1014,7 +1014,7 @@ fn characteristic(
             Ok(result)
         }
         _ if sat == 0. => Ok((0., 0.)),
-        _ => junction_current(v, vte, sat),
+        _ => junction_current(v, vte, sat, ReverseBoundary::Exponential),
     }
 }
 
@@ -1066,14 +1066,48 @@ impl JunctionPoint {
         Ok(())
     }
 }
-/// The C reverse-bias continuation joins the exponential at -3*Vt.
-pub(crate) fn junction_current(v: Real, vt: Real, is: Real) -> SpiceResult<(Real, Real)> {
-    let result = if v >= -3. * vt {
-        let exp = (v / vt).exp();
-        (is * (exp - 1.), is * exp / vt)
+/// C's cubic reverse-bias continuation argument, with multiplication
+/// grouped exactly as in dioload, bjtload, jfetload, mesload and mos3load.
+pub(super) fn cubic_reverse_argument(v: Real, vt: Real) -> Real {
+    let arg = 3. * vt / (v * std::f64::consts::E);
+    arg * arg * arg
+}
+
+/// Current and conductance without gmin in the cubic reverse region.
+pub(super) fn cubic_reverse_junction(v: Real, vt: Real, is: Real) -> (Real, Real) {
+    let arg = cubic_reverse_argument(v, vt);
+    (-is * (1. + arg), is * 3. * arg / v)
+}
+
+/// Current and conductance without gmin or an exponential clamp.
+pub(super) fn exponential_junction(v: Real, vt: Real, is: Real) -> (Real, Real) {
+    let exp = (v / vt).exp();
+    (is * (exp - 1.), is * exp / vt)
+}
+
+/// Which region owns the exact -3 Vt boundary in the reference load.
+#[derive(Clone, Copy)]
+pub(super) enum ReverseBoundary {
+    Exponential,
+    Cubic,
+}
+
+/// Checked junction current for diode and MESFET loads. The reference
+/// models differ in their comparison at the reverse continuation boundary.
+pub(super) fn junction_current(
+    v: Real,
+    vt: Real,
+    is: Real,
+    boundary: ReverseBoundary,
+) -> SpiceResult<(Real, Real)> {
+    let forward = match boundary {
+        ReverseBoundary::Exponential => v >= -3. * vt,
+        ReverseBoundary::Cubic => v > -3. * vt,
+    };
+    let result = if forward {
+        exponential_junction(v, vt, is)
     } else {
-        let arg = (3. * vt / (v * std::f64::consts::E)).powi(3);
-        (-is * (1. + arg), is * 3. * arg / v)
+        cubic_reverse_junction(v, vt, is)
     };
     if [is, vt, result.0, result.1].iter().any(|v| !v.is_finite()) || vt <= 0. || is <= 0. {
         return Err(SpiceError::Numerical {
@@ -1466,8 +1500,7 @@ impl Device for Diode {
             let g3 = g2 / 3. / vte;
             (g2, g3, g2 * tt, g3 * tt)
         } else if breakdown.is_none_or(|bv| vd >= -bv) {
-            let arg = 3. * vte / (vd * std::f64::consts::E);
-            let arg = arg * arg * arg;
+            let arg = cubic_reverse_argument(vd, vte);
             let gd = csat * 3. * arg / vd;
             let g2 = -4. * gd / vd;
             (g2, 5. * g2 / vd, 0., 0.)
@@ -1664,6 +1697,34 @@ mod tests {
     }
 
     #[test]
+    fn junction_boundary_follows_each_reference_model() {
+        for vt in [0.018_f64, 0.026, 0.04] {
+            let is = 1.3e-14;
+            let edge = -3. * vt;
+            for (v, boundary, reverse) in [
+                (edge.next_down(), ReverseBoundary::Exponential, true),
+                (edge, ReverseBoundary::Exponential, false),
+                (edge.next_up(), ReverseBoundary::Exponential, false),
+                (edge.next_down(), ReverseBoundary::Cubic, true),
+                (edge, ReverseBoundary::Cubic, true),
+                (edge.next_up(), ReverseBoundary::Cubic, false),
+            ] {
+                let expected = if reverse {
+                    let arg = 3. * vt / (v * std::f64::consts::E);
+                    let arg = arg * arg * arg;
+                    (-is * (1. + arg), is * 3. * arg / v)
+                } else {
+                    let ev = (v / vt).exp();
+                    (is * (ev - 1.), is * ev / vt)
+                };
+                let actual = junction_current(v, vt, is, boundary).unwrap();
+                assert_eq!(actual.0.to_bits(), expected.0.to_bits());
+                assert_eq!(actual.1.to_bits(), expected.1.to_bits());
+            }
+        }
+    }
+
+    #[test]
     fn charge_derivative_and_current_jacobian_are_consistent() {
         for v in [-1., -0.08, -0.02, 0., 0.49, 0.5, 0.51, 0.7] {
             let h = 1e-7;
@@ -1675,9 +1736,13 @@ mod tests {
                 (derivative - c).abs() < 1e-8 * c.abs(),
                 "{v}: {q} {derivative} {c}"
             );
-            let (i, g) = junction_current(v, 0.026, 1e-14).unwrap();
-            let derivative = (junction_current(v + h, 0.026, 1e-14).unwrap().0
-                - junction_current(v - h, 0.026, 1e-14).unwrap().0)
+            let (i, g) = junction_current(v, 0.026, 1e-14, ReverseBoundary::Exponential).unwrap();
+            let derivative = (junction_current(v + h, 0.026, 1e-14, ReverseBoundary::Exponential)
+                .unwrap()
+                .0
+                - junction_current(v - h, 0.026, 1e-14, ReverseBoundary::Exponential)
+                    .unwrap()
+                    .0)
                 / (2. * h);
             assert!(
                 (derivative - g).abs() < 1e-7 * g.abs() + 4. * f64::EPSILON * 1e-14 / h,
