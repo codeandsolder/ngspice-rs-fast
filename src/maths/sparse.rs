@@ -50,6 +50,16 @@ impl ElementId {
     }
 }
 
+/// Immutable row index and stable creation-order positions.
+#[derive(Debug, Clone)]
+struct PatternIndex {
+    n: usize,
+    positions: Vec<(u32, u32)>,
+    row_start: Vec<u32>,
+    row_cols: Vec<u32>,
+    row_ids: Vec<u32>,
+}
+
 /// The element positions of a square matrix, numbered in creation order, with
 /// a per-row sorted index for `(row, col) -> ElementId` lookup.
 ///
@@ -58,11 +68,7 @@ impl ElementId {
 /// Newton solves and timepoints.
 #[derive(Debug)]
 pub struct Pattern {
-    n: usize,
-    positions: Vec<(u32, u32)>,
-    row_start: Vec<u32>,
-    row_cols: Vec<u32>,
-    row_ids: Vec<u32>,
+    index: PatternIndex,
     ordering: std::sync::Mutex<OrderingState>,
     /// The `(row, col, id)` sequence of the last load, replayed by bound
     /// matrices to skip lookups (ngspice's per-device element pointers).
@@ -145,13 +151,13 @@ const FIXED_MAX: usize = u32::BITS as usize;
 impl Clone for Pattern {
     /// A copy without the cached pivot order.
     fn clone(&self) -> Self {
-        Self::index(self.n, self.positions.clone())
+        Self::with_index(self.index.clone())
     }
 }
 
 impl PartialEq for Pattern {
     fn eq(&self, other: &Self) -> bool {
-        self.n == other.n && self.positions == other.positions
+        self.index.n == other.index.n && self.index.positions == other.index.positions
     }
 }
 
@@ -177,8 +183,7 @@ impl Pattern {
     }
 
     fn index(n: usize, positions: Vec<(u32, u32)>) -> Self {
-        let mut order: Vec<u32> = (0..to_u32(positions.len())).collect();
-        order.sort_unstable_by_key(|&id| positions[id as usize]);
+        let len = to_u32(positions.len());
         let mut row_start = vec![0_u32; n + 1];
         for &(row, _) in &positions {
             row_start[row as usize + 1] += 1;
@@ -186,13 +191,41 @@ impl Pattern {
         for row in 0..n {
             row_start[row + 1] += row_start[row];
         }
-        let row_cols = order.iter().map(|&id| positions[id as usize].1).collect();
-        Self {
+        let row_ids = if positions.windows(2).all(|pair| pair[0] < pair[1]) {
+            // Already row-major and unique: element handles are the index.
+            (0..len).collect()
+        } else {
+            // Bucket handles by row in linear time, then sort only within
+            // rows. The original positions and handle numbering never move.
+            let mut order = vec![0_u32; positions.len()];
+            for (id, &(row, _)) in (0..len).zip(&positions) {
+                let cursor = &mut row_start[row as usize];
+                order[*cursor as usize] = id;
+                *cursor += 1;
+            }
+            // Each write cursor is now the following row's start. Recover
+            // the prefix offsets in place rather than allocate another n-vector.
+            row_start.copy_within(..n, 1);
+            row_start[0] = 0;
+            for bounds in row_start.windows(2) {
+                order[bounds[0] as usize..bounds[1] as usize]
+                    .sort_unstable_by_key(|&id| positions[id as usize].1);
+            }
+            order
+        };
+        let row_cols = row_ids.iter().map(|&id| positions[id as usize].1).collect();
+        Self::with_index(PatternIndex {
             n,
             positions,
             row_start,
             row_cols,
-            row_ids: order,
+            row_ids,
+        })
+    }
+
+    fn with_index(index: PatternIndex) -> Self {
+        Self {
+            index,
             ordering: std::sync::Mutex::new(OrderingState::default()),
             trace: std::sync::Mutex::new(Arc::new(Trace::default())),
             complex_workspace: std::sync::Mutex::new(Vec::new()),
@@ -244,11 +277,11 @@ impl Pattern {
     /// element count exceeds the representable handle range.
     #[must_use]
     pub fn extended(&self, extra: impl IntoIterator<Item = (usize, usize)>) -> Self {
-        let mut positions = self.positions.clone();
+        let mut positions = self.index.positions.clone();
         let mut appended = std::collections::HashSet::new();
         for (row, col) in extra {
             assert!(
-                row < self.n && col < self.n,
+                row < self.index.n && col < self.index.n,
                 "pattern position out of range"
             );
             if self.find(row, col).is_none() {
@@ -258,59 +291,59 @@ impl Pattern {
                 }
             }
         }
-        Self::index(self.n, positions)
+        Self::index(self.index.n, positions)
     }
 
     /// Order of the matrix.
     #[must_use]
     pub const fn order(&self) -> usize {
-        self.n
+        self.index.n
     }
 
     /// Number of elements.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.positions.len()
+        self.index.positions.len()
     }
 
     /// True when the pattern has no elements.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.positions.is_empty()
+        self.index.positions.is_empty()
     }
 
     /// `(row, col)` of an element.
     #[must_use]
     pub fn position(&self, id: ElementId) -> (usize, usize) {
-        let (row, col) = self.positions[id.index()];
+        let (row, col) = self.index.positions[id.index()];
         (row as usize, col as usize)
     }
 
     /// The element at `(row, col)`, if the pattern has one.
     #[must_use]
     pub fn find(&self, row: usize, col: usize) -> Option<ElementId> {
-        if row >= self.n {
+        if row >= self.index.n {
             return None;
         }
         let (start, end) = self.row_bounds(row);
         let col = u32::try_from(col).ok()?;
-        self.row_cols[start..end]
+        self.index.row_cols[start..end]
             .binary_search(&col)
             .ok()
-            .map(|offset| ElementId(self.row_ids[start + offset]))
+            .map(|offset| ElementId(self.index.row_ids[start + offset]))
     }
 
     /// Index interval of one row within the row-major handle array.
     fn row_bounds(&self, row: usize) -> (usize, usize) {
         (
-            self.row_start[row] as usize,
-            self.row_start[row + 1] as usize,
+            self.index.row_start[row] as usize,
+            self.index.row_start[row + 1] as usize,
         )
     }
 
     /// Element ids in row-major position order.
     fn sorted(&self) -> impl Iterator<Item = ElementId> + '_ {
-        self.row_ids.iter().map(|&id| ElementId(id))
+        self.index.row_ids.iter().map(|&id| ElementId(id))
     }
 }
 
@@ -844,9 +877,9 @@ impl SparseMatrix {
         {
             bound.view.take();
             let (start, end) = bound.pattern.row_bounds(row);
-            for (&id, &col) in bound.pattern.row_ids[start..end]
+            for (&id, &col) in bound.pattern.index.row_ids[start..end]
                 .iter()
-                .zip(&bound.pattern.row_cols[start..end])
+                .zip(&bound.pattern.index.row_cols[start..end])
             {
                 if keep(col as usize) {
                     kept = true;
@@ -1194,6 +1227,44 @@ impl SparseMatrix {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn bucketed_pattern_index_matches_global_sort_and_clone_resets_cache() {
+        let mut seed = 17_u64;
+        let mut positions = Vec::new();
+        for _ in 0..1000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let row = ((seed >> 32) % 101) as usize;
+            let col = ((seed >> 40) % 101) as usize;
+            if !row.is_multiple_of(3) {
+                positions.push((row, col));
+            }
+        }
+        let pattern = Pattern::new(101, positions);
+        let mut expected: Vec<_> = (0..pattern.len()).map(element_id).collect();
+        expected.sort_unstable_by_key(|&id| pattern.position(id));
+        assert!(pattern.sorted().eq(expected.iter().copied()));
+        for id in expected {
+            let (r, c) = pattern.position(id);
+            assert_eq!(pattern.find(r, c), Some(id));
+        }
+        assert!(pattern.find(0, 1).is_none());
+        assert!(pattern.find(99, 1).is_none());
+        pattern.with_ordering(|state| state.ac_reorder = false);
+        let copy = pattern.clone();
+        assert_eq!(copy, pattern);
+        assert!(copy.with_ordering(|state| state.ac_reorder));
+        assert!(!pattern.with_ordering(|state| state.ac_reorder));
+        assert_eq!(copy.index.row_start, pattern.index.row_start);
+        assert_eq!(copy.index.row_ids, pattern.index.row_ids);
+        assert_eq!(copy.index.row_cols, pattern.index.row_cols);
+
+        let empty = Pattern::new(0, []);
+        assert_eq!(empty.index.row_start, [0]);
+        let monotonic = Pattern::new(5, [(1, 0), (1, 3), (3, 3)]);
+        assert_eq!(monotonic.index.row_start, [0, 0, 2, 2, 3, 3]);
+        assert_eq!(monotonic.index.row_ids, [0, 1, 2]);
+    }
+
+    #[test]
     fn indexed_edits_preserve_overflow_and_standalone_stamp_order() {
         let pattern = Arc::new(Pattern::new(4, [(0, 0), (1, 1), (2, 2), (3, 3)]));
         let mut a = SparseMatrix::bound(pattern);
@@ -1354,7 +1425,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use super::{FixedStamps, Pattern, SparseMatrix, Triplet};
+    use super::{FixedStamps, Pattern, SparseMatrix, Triplet, element_id};
     use crate::maths::dense::Vector;
 
     /// One device's load of `stamps` into a fresh matrix bound to `pattern`,
