@@ -308,3 +308,25 @@ fn pole_zero_and_sensitivity_are_explicitly_refused() {
     );
     assert!(plot.is_ok(), "{plot:?}");
 }
+
+#[test]
+fn programmatic_urc_terminal_spelling_does_not_change_setup_numbering() {
+    // AST callers need not have normalized external node spellings. In
+    // particular, external terminals must never be treated as ladder nodes.
+    let mut parsed =
+        parse("u1 a b ref m l=1m n=3\nv1 a 0 1\nr1 b 0 1k\nvr ref 0 0\n.model m urc").unwrap();
+    let canonical = Circuit::from_netlist(&parsed).unwrap();
+    parsed.devices[0].nodes = vec!["A".into(), "B".into(), "REF".into()];
+    let mixed = Circuit::from_netlist(&parsed).unwrap();
+    assert_eq!(canonical.unknowns(), mixed.unknowns());
+    assert_eq!(
+        canonical.unknown_names().as_ref(),
+        mixed.unknown_names().as_ref()
+    );
+    for index in 0..canonical.device_count() {
+        assert_eq!(
+            canonical.setup_elements(index).unwrap(),
+            mixed.setup_elements(index).unwrap()
+        );
+    }
+}

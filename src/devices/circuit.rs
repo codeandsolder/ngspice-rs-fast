@@ -14,7 +14,8 @@
 //! [`Circuit::finalize`], which validates the graph and rebuilds the numbering
 //! in one go.
 
-use std::collections::BTreeSet;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::maths::{Coefficients, SparseMatrix, Vector};
@@ -47,6 +48,26 @@ pub enum CircuitVertex {
 /// Graph indices are snapshot-local handles, not SPICE node IDs or MNA rows.
 /// Connectivity is structural, not proof of a conductive DC path or solvability.
 pub type CircuitGraph = UnGraph<CircuitVertex, usize, usize>;
+
+/// A transient setup index, rebuilt from the current devices. No cache
+/// survives a topology change or a caller's use of devices_mut.
+#[derive(Default)]
+struct DeviceNames(BTreeMap<String, usize>);
+
+impl DeviceNames {
+    fn insert(&mut self, name: &str, index: usize) {
+        self.0.entry(name.to_ascii_lowercase()).or_insert(index);
+    }
+
+    fn get(&self, name: &str) -> Option<usize> {
+        let name = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(name.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(name)
+        };
+        self.0.get(name.as_ref()).copied()
+    }
+}
 
 /// A circuit under construction, or ready to be simulated.
 #[derive(Default)]
@@ -276,15 +297,24 @@ impl Circuit {
     /// numbered in device order, in a separate namespace.
     pub fn rebuild_unknowns(&mut self) {
         let order = self.setup_order();
-        self.rebuild_unknowns_in_order(&order);
+        let mut names = DeviceNames::default();
+        for (index, device) in self.devices.iter().enumerate() {
+            names.insert(device.name(), index);
+        }
+        self.rebuild_unknowns_in_order(&order, &names);
     }
 
-    fn rebuild_unknowns_in_order(&mut self, order: &[usize]) {
+    fn rebuild_unknowns_in_order(&mut self, order: &[usize], names: &DeviceNames) {
         self.unknown_names.get_mut().take();
         self.fixed_stamps.get_mut().forget();
-        let owned: BTreeSet<NodeId> = self.internal_nodes.iter().flatten().copied().collect();
+        let mut owned = vec![false; self.nodes.len()];
+        for node in self.internal_nodes.iter().flatten() {
+            if let Some(slot) = owned.get_mut(node.index()) {
+                *slot = true;
+            }
+        }
         self.unknowns
-            .rebuild_deferring(&self.nodes, |node| owned.contains(&node));
+            .rebuild_deferring(&self.nodes, |node| owned[node.index()]);
         use crate::devices::setup::CDeviceType;
         self.branch_rows = vec![0..0; self.devices.len()];
         // `CKTmkCur` runs once per device: in its own DEVsetup, or earlier
@@ -293,15 +323,15 @@ impl Circuit {
         // branch on demand), so a controlling source's branch is numbered
         // where its first user is set up.
         let mut made = vec![false; self.devices.len()];
-        let make = |circuit: &mut Self, made: &mut [bool], index: usize| {
+        let mut make = |unknowns: &mut MnaUnknowns, index: usize| {
             if made[index] {
                 return;
             }
             made[index] = true;
-            let count = circuit.devices[index].branch_currents();
-            let start = circuit.unknowns.len();
-            circuit.unknowns.add_rows(count);
-            circuit.branch_rows[index] = start..start + count;
+            let count = self.devices[index].branch_currents();
+            let start = unknowns.len();
+            unknowns.add_rows(count);
+            self.branch_rows[index] = start..start + count;
         };
         for &index in order {
             let kind = self.devices[index].c_device_type();
@@ -310,27 +340,21 @@ impl Circuit {
             let branches_first = matches!(kind, CDeviceType::Vsrc | CDeviceType::Ccvs)
                 || (kind == CDeviceType::Asrc && self.devices[index].branch_currents() > 0);
             if branches_first {
-                make(self, &mut made, index);
+                make(&mut self.unknowns, index);
             }
             // cccsset.c, ccvsset.c, cswsetup.c and asrcset.c call
             // CKTfndBranch for each controlling source, in order.
-            let found: Vec<usize> = self.devices[index]
-                .controlling_sources()
-                .iter()
-                .filter_map(|control| {
-                    self.devices.iter().position(|other| {
-                        other.name().eq_ignore_ascii_case(&control.name)
-                            && other.findable_branch().is_some()
-                    })
-                })
-                .collect();
-            for target in found {
-                make(self, &mut made, target);
+            for control in self.devices[index].controlling_sources() {
+                if let Some(target) = names.get(&control.name)
+                    && self.devices[target].findable_branch().is_some()
+                {
+                    make(&mut self.unknowns, target);
+                }
             }
             for &node in &self.internal_nodes[index] {
                 self.unknowns.assign_deferred(node);
             }
-            make(self, &mut made, index);
+            make(&mut self.unknowns, index);
         }
         self.state_rows.clear();
         self.state_len = 0;
@@ -343,9 +367,9 @@ impl Circuit {
         self.control_rows = self
             .devices
             .iter()
-            .map(|device| self.resolve_controls(device.as_ref()))
+            .map(|device| self.resolve_controls(device.as_ref(), names))
             .collect();
-        self.mutual = match self.resolve_mutual() {
+        self.mutual = match self.resolve_mutual(names) {
             Ok(pairs) => MutualBinding { pairs, error: None },
             Err(error) => MutualBinding {
                 pairs: Vec::new(),
@@ -358,7 +382,7 @@ impl Circuit {
     /// inductors up with `CKTfndDev`; a card with more than two inductors
     /// couples every pair, as `inp_compat()` expands it). Names are matched
     /// case-insensitively after subcircuit renaming.
-    fn resolve_mutual(&self) -> Result<Vec<MutualPair>, SpiceError> {
+    fn resolve_mutual(&self, names: &DeviceNames) -> Result<Vec<MutualPair>, SpiceError> {
         let mut pairs = Vec::new();
         for (coupling, device) in self.devices.iter().enumerate() {
             let Some(description) = device.mutual_coupling() else {
@@ -370,11 +394,7 @@ impl Circuit {
                     Some(location) => SpiceError::parse(location.clone(), message),
                     None => SpiceError::circuit(message),
                 };
-                let Some(index) = self
-                    .devices
-                    .iter()
-                    .position(|other| other.name().eq_ignore_ascii_case(&reference.name))
-                else {
+                let Some(index) = names.get(&reference.name) else {
                     return Err(failure(format!(
                         "{}: coupling to non-existent inductor {}",
                         device.name(),
@@ -618,7 +638,11 @@ impl Circuit {
     /// device is known, so a controlling source may follow its user in the
     /// deck. Only devices with a [`Device::findable_branch`] qualify: C finds
     /// V, E, H (and B) branches, but not inductor currents.
-    fn resolve_controls(&self, device: &dyn Device) -> Result<Vec<usize>, SpiceError> {
+    fn resolve_controls(
+        &self,
+        device: &dyn Device,
+        names: &DeviceNames,
+    ) -> Result<Vec<usize>, SpiceError> {
         device
             .controlling_sources()
             .iter()
@@ -627,11 +651,7 @@ impl Circuit {
                     Some(location) => SpiceError::parse(location.clone(), message),
                     None => SpiceError::circuit(message),
                 };
-                let Some(index) = self
-                    .devices
-                    .iter()
-                    .position(|other| other.name().eq_ignore_ascii_case(&control.name))
-                else {
+                let Some(index) = names.get(&control.name) else {
                     return Err(failure(format!(
                         "{}: unknown controlling source {}",
                         device.name(),
@@ -695,9 +715,9 @@ impl Circuit {
                 previous_dc = dc;
             }
         }
-        self.topology()?;
+        let names = self.validate_topology()?;
         let order = self.setup_order();
-        self.rebuild_unknowns_in_order(&order);
+        self.rebuild_unknowns_in_order(&order, &names);
         for index in 0..self.devices.len() {
             self.controls(index)?;
         }
@@ -957,6 +977,7 @@ impl Circuit {
     /// [`SpiceError::Circuit`] for dangling terminals or duplicate names, as in
     /// [`Circuit::finalize`]. No circuit state is changed on failure.
     pub fn topology(&self) -> SpiceResult<CircuitGraph> {
+        self.validate_topology()?;
         let mut graph = CircuitGraph::default();
         let node_vertices: Vec<_> = self
             .nodes
@@ -964,26 +985,48 @@ impl Circuit {
             .iter()
             .map(|node| graph.add_node(CircuitVertex::Node(node.id)))
             .collect();
-        let mut seen = BTreeSet::new();
         for (index, device) in self.devices.iter().enumerate() {
             let vertex = graph.add_node(CircuitVertex::Device(index));
             for (port, terminal) in device.terminals().iter().enumerate() {
-                let Some(node_vertex) = node_vertices.get(terminal.index()) else {
+                graph.add_edge(vertex, node_vertices[terminal.index()], port);
+            }
+        }
+        Ok(graph)
+    }
+
+    /// Validate exactly the incidence constraints enforced by topology(),
+    /// without constructing a graph just to discard it. Build the lookup index
+    /// in the same pass. Keep the existing Unicode duplicate-name rule as
+    /// well as ASCII case-insensitive reference resolution.
+    fn validate_topology(&self) -> SpiceResult<DeviceNames> {
+        let mut names = DeviceNames::default();
+        let mut unicode = self
+            .devices
+            .iter()
+            .any(|d| !d.name().is_ascii())
+            .then(BTreeSet::new);
+        for (index, device) in self.devices.iter().enumerate() {
+            for terminal in device.terminals() {
+                if self.nodes.node(*terminal).is_none() {
                     return Err(SpiceError::circuit(format!(
                         "device {} refers to {terminal}, which is not in the node table",
                         device.name()
                     )));
-                };
-                graph.add_edge(vertex, *node_vertex, port);
+                }
             }
-            if !seen.insert(device.name().to_lowercase()) {
+            let duplicate = match &mut unicode {
+                Some(seen) => !seen.insert(device.name().to_lowercase()),
+                None => names.get(device.name()).is_some(),
+            };
+            if duplicate {
                 return Err(SpiceError::circuit(format!(
                     "duplicate instance name '{}'",
                     device.name()
                 )));
             }
+            names.insert(device.name(), index);
         }
-        Ok(graph)
+        Ok(names)
     }
 
     /// Adds a device, checking that its terminals are already in the node table
@@ -2321,9 +2364,10 @@ impl Circuit {
                     context,
                     &deck_nodes,
                 )?;
-                let created: Vec<&crate::primitives::Node> = nodes.nodes()[first..]
+                let parsed_terminals: BTreeSet<_> = instance
+                    .nodes
                     .iter()
-                    .filter(|node| !instance.nodes.contains(&node.name))
+                    .filter_map(|name| nodes.get(name))
                     .collect();
                 let line = base + staged.len();
                 let lower = instance.name.to_lowercase();
@@ -2341,9 +2385,12 @@ impl Circuit {
                         // URCsetup's CKTmkVolt calls: the ladder nodes are
                         // numbered at the URC line's own setup.
                         internal.push(
-                            created
+                            nodes.nodes()[first..]
                                 .iter()
-                                .filter(|node| node.kind != NodeKind::Internal)
+                                .filter(|node| {
+                                    node.kind != NodeKind::Internal
+                                        && !parsed_terminals.contains(&node.id)
+                                })
                                 .map(|node| node.id)
                                 .collect(),
                         );
@@ -2357,9 +2404,11 @@ impl Circuit {
                                 .iter()
                                 .copied()
                                 .filter(|id| {
-                                    created.iter().any(|node| {
-                                        node.id == *id && node.kind == NodeKind::Internal
-                                    })
+                                    id.index() >= first
+                                        && !parsed_terminals.contains(id)
+                                        && nodes
+                                            .node(*id)
+                                            .is_some_and(|node| node.kind == NodeKind::Internal)
                                 })
                                 .collect(),
                         );
