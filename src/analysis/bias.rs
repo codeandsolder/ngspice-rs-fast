@@ -27,7 +27,7 @@ pub const MAX_GMIN_FACTOR: Real = 1e6;
 /// Largest scheduled artificial nodal gmin (S).
 pub const MAX_GMIN: Real = 1.;
 /// Default number of equal source increments.
-pub const DEFAULT_SOURCE_STEPS: usize = 20;
+pub const DEFAULT_SOURCE_STEPS: u32 = 20;
 /// Default temporary nodal gmin (S) held during source stepping.
 pub const DEFAULT_SOURCE_GMIN: Real = 1e-8;
 /// Maximum gmin steps, or explicit ladder entries. The ngspice
@@ -37,6 +37,10 @@ pub const MAX_GMIN_STAGES: usize = 100;
 pub const MAX_SOURCE_STEPS: usize = 1_000;
 /// Largest explicit total Newton-iteration budget.
 pub const MAX_TOTAL_ITERATIONS: usize = 10_000_000;
+
+fn uniform_scales(steps: u32) -> impl Iterator<Item = Real> {
+    (0..=steps).map(move |step| Real::from(step) / Real::from(steps))
+}
 
 fn invalid(message: impl Into<String>) -> SpiceError {
     SpiceError::Numerical {
@@ -70,8 +74,9 @@ impl SourceStepping {
                 "source steps must be in 1..={MAX_SOURCE_STEPS}, not {steps}"
             )));
         }
+        let steps = u32::try_from(steps).map_err(|_| invalid("source step count exceeds u32"))?;
         let stepping = Self {
-            scales: (0..=steps).map(|k| k as Real / steps as Real).collect(),
+            scales: uniform_scales(steps).collect(),
             gmin,
         };
         stepping.validate()?;
@@ -312,9 +317,7 @@ impl ContinuationPolicy {
         Self {
             gmin_schedule: DEFAULT_GMIN_SCHEDULE.to_vec(),
             source_stepping: Some(SourceStepping {
-                scales: (0..=DEFAULT_SOURCE_STEPS)
-                    .map(|k| k as Real / DEFAULT_SOURCE_STEPS as Real)
-                    .collect(),
+                scales: uniform_scales(DEFAULT_SOURCE_STEPS).collect(),
                 gmin: DEFAULT_SOURCE_GMIN,
             }),
             ..Self::disabled()
@@ -574,7 +577,7 @@ impl DcSettings {
             match key.as_str() {
                 newton::STAGE_ITERATIONS_KEY => stage_limit = count,
                 newton::ADAPT_ITERATIONS_KEY => adapt = count,
-                newton::SKIP_DIRECT_KEY => skip_direct = value == 1.,
+                newton::SKIP_DIRECT_KEY => skip_direct = count == Some(1),
                 "srcsteps" => source = count,
                 _ => gmin_steps = count,
             }
@@ -661,7 +664,9 @@ impl DcStage {
     /// solution is ever returned.
     #[must_use]
     pub fn is_unregularized(&self) -> bool {
-        self.source_scale == 1. && self.gmin == 0. && self.junction_gmin.is_none()
+        self.source_scale.to_bits() == 1.0_f64.to_bits()
+            && self.gmin == 0.
+            && self.junction_gmin.is_none()
     }
 }
 
@@ -1635,9 +1640,10 @@ impl Engine<'_> {
         report: &mut DcReport,
         steps: usize,
     ) -> Result<NewtonSolution<TrialState>, Halt> {
+        let steps = u32::try_from(steps)
+            .map_err(|_| Halt::Retry("source step count exceeds u32".into()))?;
         let mut last: Option<NewtonSolution<TrialState>> = None;
-        for step in 0..=steps {
-            let scale = step as Real / steps as Real;
+        for scale in uniform_scales(steps) {
             last = Some(self.step(
                 report,
                 DcStrategy::SourceStepping,
