@@ -35,7 +35,7 @@
 use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
-use crate::primitives::{Real, SpiceResult};
+use crate::primitives::{Real, SpiceError, SpiceResult};
 
 const EXP_THRESHOLD: Real = 34.0;
 const MIN_EXP: Real = 1.713_908_431e-15;
