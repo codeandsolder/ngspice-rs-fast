@@ -326,7 +326,7 @@ type NodeStamp = (NodeId, NodeId, Real);
 
 /// Assemble borrowed reset stamps in their original real-then-imaginary order.
 /// Validate all addends before touching the matrix, including ground entries,
-/// just as ResetStamps::new does. No temporary owned device or stamp vector.
+/// just as `ResetStamps::new` does. No temporary owned device or stamp vector.
 fn stamp_reset(
     name: &str,
     context: &mut LinearContext<'_>,

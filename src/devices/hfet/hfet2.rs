@@ -960,9 +960,9 @@ impl Device for Hfet2 {
             cg,
             cd,
             cgd,
+            gds,
             ggs,
             ggd,
-            gds,
             ..point
         };
         let nonconvergent = match start {
