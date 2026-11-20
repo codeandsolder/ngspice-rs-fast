@@ -442,7 +442,7 @@ impl ComplexMatrix {
             sparse.reload_originals_iter(entries.iter().map(|&(_, _, v)| v));
         };
         load(&mut sparse);
-        let mut status = sparse.factor();
+        let mut status = sparse.factor_with_workspace(&mut Vec::new());
         if status == Status::ZeroDiag {
             load(&mut sparse);
             status = sparse.order_and_factor(self.pivot.relative, self.pivot.absolute);

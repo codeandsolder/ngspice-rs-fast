@@ -415,7 +415,9 @@ fn solve_reusing(
     let previous = ordering.take();
     let matrix = prepare_matrix(matrix)?;
     let factor = match previous {
-        Some(previous) if previous.matches(&matrix) => SparseLu::refactor(previous, &matrix)?,
+        Some(previous) if previous.matches(&matrix) => {
+            SparseLu::refactor(previous, &matrix, workspace)?
+        }
         _ => SparseLu::factor_prepared(&matrix)?,
     };
     let result = factor.symbolic.solve_with_workspace(rhs, workspace);
@@ -464,7 +466,7 @@ pub(in crate::maths) fn factor_shared_complex(
             state.ac_reorder = false;
             numeric.order_and_factor(pivot.relative, pivot.absolute)
         } else {
-            numeric.factor()
+            pattern.with_complex_workspace(|workspace| numeric.factor_with_workspace(workspace))
         };
         if status == Status::ZeroDiag {
             // NIacIter: E_SINGULAR sets NIACSHOULDREORDER and retries.
@@ -675,7 +677,7 @@ fn ni_step(
     let status = if fresh || reorder {
         sparse.order_and_factor(pivot.relative, pivot.absolute)
     } else {
-        sparse.factor()
+        sparse.factor_with_workspace(workspace)
     };
     // spZERO_DIAG and spSINGULAR are both E_SINGULAR to NIiter.
     let zero_pivot = !fresh && !reorder && matches!(status, Status::ZeroDiag | Status::Singular);
@@ -787,7 +789,7 @@ impl SparseLu {
                     "assembled CSC pattern changed",
                 ));
             }
-            return Self::refactor(previous.clone(), &matrix);
+            return Self::refactor(previous.clone(), &matrix, &mut Vec::new());
         }
         Self::factor_prepared(&matrix)
     }
@@ -808,10 +810,14 @@ impl SparseLu {
 
     /// `SMPluFac` with `previous`'s pivots on a matching matrix, reordering
     /// after a zero pivot as `NIiter` does after `E_SINGULAR`.
-    fn refactor(previous: SparseSymbolic, matrix: &SparseMatrix) -> SpiceResult<Self> {
+    fn refactor(
+        previous: SparseSymbolic,
+        matrix: &SparseMatrix,
+        workspace: &mut Vec<f64>,
+    ) -> SpiceResult<Self> {
         let mut frame = LoadedFrame::from_symbolic(previous);
         frame.reload(matrix);
-        let mut status = Arc::make_mut(&mut frame.sparse).factor();
+        let mut status = Arc::make_mut(&mut frame.sparse).factor_with_workspace(workspace);
         if status == Status::ZeroDiag {
             frame.reload(matrix);
             let pivot = matrix.pivot_tolerances();

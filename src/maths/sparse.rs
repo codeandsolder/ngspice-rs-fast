@@ -67,7 +67,7 @@ pub struct Pattern {
     /// The `(row, col, id)` sequence of the last load, replayed by bound
     /// matrices to skip lookups (ngspice's per-device element pointers).
     trace: std::sync::Mutex<Arc<Trace>>,
-    /// Scratch shared across successive AC snapshots, independently of
+    /// Numeric factor/solve scratch shared across successive AC snapshots, independently of
     /// pivot-order transactions. Concurrent solves may use local scratch.
     complex_workspace: std::sync::Mutex<Vec<Complex>>,
 }
@@ -78,7 +78,7 @@ pub struct Pattern {
 pub(super) struct OrderingState {
     pub(super) frame: Option<crate::maths::linear::CachedFrame>,
     pub(super) ac_reorder: bool,
-    /// Reused real triangular-solve scratch, owned by the circuit
+    /// Reused real factor/triangular-solve scratch, owned by the circuit
     /// transaction rather than by an immutable factor snapshot.
     pub(super) solve_workspace: Vec<Real>,
 }
@@ -212,7 +212,7 @@ impl Pattern {
         }
     }
 
-    /// Reuse the circuit's complex solve scratch without serializing
+    /// Reuse the circuit's complex factor/solve scratch without serializing
     /// independent factor snapshots. A busy or poisoned slot is optional:
     /// the solve still runs with its own scratch in exactly the same order.
     pub(super) fn with_complex_workspace<R>(&self, f: impl FnOnce(&mut Vec<Complex>) -> R) -> R {
