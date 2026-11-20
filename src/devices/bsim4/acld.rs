@@ -20,23 +20,14 @@
 )]
 use super::fields::{Instance, Model, SizeParam};
 use super::host::{SmallSignalCkt, state};
-use crate::primitives::SpiceResult;
 
 /// `BSIM4acLoad` for one instance, from the values the `MODEINITSMSIG`
 /// load left on `h`.
-///
-/// # Errors
-/// C's error returns (none: `BSIM4acLoad` always returns `OK`).
 #[expect(
     clippy::too_many_lines,
     reason = "keeps the reference numerical routine in the original statement and rounding order"
 )] // One C function, kept in C's shape.
-pub(super) fn ac_load(
-    m: &Model,
-    h: &Instance,
-    p: &SizeParam,
-    ckt: &mut dyn SmallSignalCkt,
-) -> SpiceResult<()> {
+pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn SmallSignalCkt) {
     let omega = ckt.omega();
     let cgso = h.cgso;
     let cgdo = h.cgdo;
@@ -145,7 +136,7 @@ pub(super) fn ac_load(
     let (xcdgmb, xcsgmb, xcbgmb, xcggbr, xcgdbr, xcgsbr, xcgbbr, xcdgbr, xcsgbr, xcbgb);
     let (xcddbr, xcdsbr, xcsdbr, xcssbr, xcdbbr, xcsbbr, xcbdb, xcbsb, xcdbdb, xcbbb);
     let (xcdgbi, xcsgbi, xcddbi, xcdsbi, xcsdbi, xcssbi, xcdbbi, xcsbbi);
-    let (xcggbi, xcgdbi, xcgsbi, xcgbbi);
+    let (xcggbi, xcgdbi, xcgsbi);
     if h.mode >= 0 {
         Gmr = gmr;
         Gmbsr = gmbsr;
@@ -281,7 +272,6 @@ pub(super) fn ac_load(
         xcggbi = Cggi;
         xcgdbi = Cgdi;
         xcgsbi = Cgsi;
-        xcgbbi = Cgbi;
     } else {
         // Reverse mode
         Gmr = -gmr;
@@ -419,8 +409,9 @@ pub(super) fn ac_load(
         xcggbi = Cggi;
         xcgdbi = Cgsi;
         xcgsbi = Cgdi;
-        xcgbbi = Cgbi;
     }
+
+    let xcgbbi = Cgbi;
 
     let (gstot, gstotd, gstotg, gstots, gstotb);
     let (gdtot, gdtotd, gdtotg, gdtots, gdtotb);
@@ -687,7 +678,6 @@ pub(super) fn ac_load(
         ckt.real(sp, q, 0.0);
         ckt.real(gp, q, 0.0);
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -809,7 +799,7 @@ pub(super) mod tests {
     #[test]
     fn ac_stamps_land_on_allocated_elements() {
         check_shapes(
-            |m, h, ckt| super::ac_load(m, h, &SizeParam::default(), ckt).unwrap(),
+            |m, h, ckt| super::ac_load(m, h, &SizeParam::default(), ckt),
             false,
             true,
         );
@@ -824,7 +814,7 @@ pub(super) mod tests {
             omega: 1e6,
             ..Recorder::default()
         };
-        super::ac_load(&Model::default(), &h, &SizeParam::default(), &mut ckt).unwrap();
+        super::ac_load(&Model::default(), &h, &SizeParam::default(), &mut ckt);
         let gg = ckt
             .imag
             .iter()

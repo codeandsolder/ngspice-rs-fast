@@ -112,12 +112,12 @@ impl TemperatureModel {
         let vtm = KB_OVER_Q * temp;
         let eg = 1.16 - 7.02e-4 * temp * temp / (temp + 1108.0);
 
-        let (jct_temp_sat_cur, jct_sidewall_temp_sat_cur) = if temp != tnom {
+        let (jct_temp_sat_cur, jct_sidewall_temp_sat_cur) = if temp == tnom {
+            (number("js")?, number("jsw")?)
+        } else {
             let exponent = eg0 / vtm0 - eg / vtm + number("xti")? * (temp / tnom).ln();
             let scale = (exponent / number("nj")?).exp();
             (number("js")? * scale, number("jsw")? * scale)
-        } else {
-            (number("js")?, number("jsw")?)
         };
         values.insert("jct_temp_sat_cur_density", jct_temp_sat_cur.max(0.));
         values.insert(
