@@ -305,7 +305,7 @@ fn unsupported(card: &FourierCard, feature: String) -> SpiceError {
 }
 
 /// A value the transform would have to use but cannot.
-fn nonfinite(context: String, message: String) -> SpiceError {
+fn nonfinite(context: &str, message: String) -> SpiceError {
     SpiceError::Numerical {
         context: format!(".four {context}"),
         message,
@@ -382,15 +382,12 @@ impl TimeAxis {
         for (index, point) in plot.points.iter().enumerate() {
             let Some(value) = point.get(column) else {
                 return Err(nonfinite(
-                    "time".to_owned(),
+                    "time",
                     format!("point {index} has no time value"),
                 ));
             };
             if !value.is_finite() {
-                return Err(nonfinite(
-                    "time".to_owned(),
-                    format!("point {index} is not finite"),
-                ));
+                return Err(nonfinite("time", format!("point {index} is not finite")));
             }
             values.push(value.re);
         }
@@ -438,7 +435,7 @@ impl<'a> Trace<'a> {
     fn value(&self, index: usize) -> SpiceResult<Real> {
         let Some(point) = self.plot.points.get(index) else {
             return Err(nonfinite(
-                self.name().to_owned(),
+                self.name(),
                 format!("the plot has no point {index}"),
             ));
         };
@@ -446,7 +443,7 @@ impl<'a> Trace<'a> {
             .value(point)
             .map_err(|error| match error {
                 SpiceError::Numerical { message, .. } => {
-                    nonfinite(format!("{}: {}", self.name(), self.column.name()), message)
+                    nonfinite(&format!("{}: {}", self.name(), self.column.name()), message)
                 }
                 other => other,
             })
@@ -541,12 +538,13 @@ fn evaluate(
         let phase = (scale * cosine).atan2(scale * sine);
         if !amplitude.is_finite() || !phase.is_finite() {
             return Err(nonfinite(
-                trace.name().to_owned(),
+                trace.name(),
                 format!("harmonic {k} is not finite"),
             ));
         }
         tabulated.push(Harmonic {
-            order: u32::try_from(k).unwrap_or(u32::MAX),
+            order: u32::try_from(k)
+                .map_err(|_| unsupported(card, format!("harmonic index {k} exceeds u32")))?,
             frequency: k as Real * card.fundamental,
             amplitude,
             phase,
@@ -558,7 +556,7 @@ fn evaluate(
     // refuses the transform instead of producing a spurious denominator.
     if fundamental_amplitude <= NOISE_ULPS * f64::EPSILON * magnitude {
         return Err(nonfinite(
-            trace.name().to_owned(),
+            trace.name(),
             format!(
                 "the fundamental amplitude ({}) is at or below the quadrature's own rounding \
                  noise, so the total harmonic distortion has no denominator",
@@ -574,7 +572,7 @@ fn evaluate(
         .sqrt();
     if !dc.is_finite() || !thd.is_finite() {
         return Err(nonfinite(
-            trace.name().to_owned(),
+            trace.name(),
             "the DC component or the total harmonic distortion is not finite".to_owned(),
         ));
     }
@@ -799,7 +797,7 @@ fn resolve_settings(
                         }
                         if !value.is_finite() {
                             return Err(nonfinite(
-                                trace.name().into(),
+                                trace.name(),
                                 "nonfinite stable polynomial interpolation".into(),
                             ));
                         }
@@ -825,7 +823,9 @@ fn resolve_settings(
                     cosine += y * phase.cos();
                 }
                 tabulated.push(Harmonic {
-                    order: k as u32,
+                    order: u32::try_from(k).map_err(|_| {
+                        unsupported(card, format!("harmonic index {k} exceeds u32"))
+                    })?,
                     frequency: k as Real * card.fundamental,
                     amplitude: 2. * sine.hypot(cosine) / n as Real,
                     phase: cosine.atan2(sine),
@@ -835,7 +835,7 @@ fn resolve_settings(
             let magnitude = values.iter().map(|v| v.abs()).sum::<Real>() / n as Real;
             if fundamental <= NOISE_ULPS * f64::EPSILON * magnitude {
                 return Err(nonfinite(
-                    trace.name().into(),
+                    trace.name(),
                     "fundamental at rounding noise; undefined THD".into(),
                 ));
             }
@@ -851,10 +851,7 @@ fn resolve_settings(
                     !h.frequency.is_finite() || !h.amplitude.is_finite() || !h.phase.is_finite()
                 })
             {
-                return Err(nonfinite(
-                    trace.name().into(),
-                    "nonfinite Fourier result".into(),
-                ));
+                return Err(nonfinite(trace.name(), "nonfinite Fourier result".into()));
             }
             results.push(FourierAnalysis {
                 vector: trace.name().into(),
@@ -1271,6 +1268,15 @@ mod tests {
             error.to_string().contains("transforms a .tran result"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn largest_supported_harmonic_uses_its_exact_order() {
+        let plot = tran(&sweep(0.0, PERIOD, 800, sine(1.0, 1, 0.0)));
+        let result = analyze(&plot, &[out()], MAX_HARMONICS).remove(0);
+        assert_eq!(result.harmonics.len(), MAX_HARMONICS as usize);
+        assert_eq!(result.harmonics.first().unwrap().order, 1);
+        assert_eq!(result.harmonics.last().unwrap().order, MAX_HARMONICS);
     }
 
     #[test]
