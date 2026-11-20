@@ -180,10 +180,6 @@ fn lundin(length: Real, csect: Real) -> Real {
 }
 
 /// Area and perimeter contributions after model geometry corrections.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "CAPtemp evaluates the area product before adding the separately rounded sidewall term"
-)]
 const fn geometry_capacitance(
     width: Real,
     length: Real,
@@ -194,10 +190,6 @@ const fn geometry_capacitance(
 }
 
 /// The temperature factor shared by `CAPtemp` and `INDtemp`.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "CAPtemp and INDtemp retain the unfused left-associated thermal polynomial"
-)]
 const fn reactive_temperature_factor(tc1: Real, tc2: Real, difference: Real) -> Real {
     1.0 + tc1 * difference + tc2 * difference * difference
 }

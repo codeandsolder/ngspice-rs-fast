@@ -79,10 +79,6 @@ fn field(value: Option<Real>, default: Real) -> (Real, bool) {
 }
 
 /// Sheet resistance scaled by the corrected aspect ratio.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "REStemp subtracts separately rounded twice-short and twice-narrow dimensions"
-)]
 const fn sheet_resistance(
     length: Real,
     width: Real,
@@ -93,11 +89,7 @@ const fn sheet_resistance(
     (length - 2. * short) / (width - 2. * narrow) * sheet
 }
 
-/// REStemp's Horner-form polynomial differs from the capacitor/inductor form.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "REStemp evaluates the Horner polynomial with separate multiplications and additions"
-)]
+/// `REStemp`'s Horner-form polynomial differs from the capacitor/inductor form.
 const fn resistance_temperature_factor(tc1: Real, tc2: Real, difference: Real) -> Real {
     ((tc2 * difference) + tc1) * difference + 1.0
 }
