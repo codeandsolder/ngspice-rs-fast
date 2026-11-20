@@ -16,7 +16,7 @@
 
 use crate::maths::complex::{ComplexLu, ComplexMatrix};
 use crate::maths::linear::{assembled_triplets, numerical, square};
-use crate::maths::{DenseLu, Matrix, SparseLu, SparseMatrix, SparseSymbolic, Vector};
+use crate::maths::{DenseLu, Matrix, SparseLu, SparseMatrix, SparseSymbolic, Triplet, Vector};
 use crate::primitives::{Complex, SpiceResult};
 
 /// Largest absolute exponent of any row or column factor (`2^±512`).
@@ -26,7 +26,51 @@ pub const MAX_SCALING_EXPONENT: i32 = 512;
 /// behind [`EquilibratedSparseLu::new_balanced`].
 pub const MAX_BALANCING_ITERATIONS: usize = 64;
 
-type Entry = (usize, usize, Complex);
+type Entry<T> = (usize, usize, T);
+
+/// Scaling and residual arithmetic is generic over the original numeric
+/// domain. Real systems need neither complex snapshots nor promoted RHSs.
+trait ScaleValue:
+    Copy + std::ops::Add<Output = Self> + std::ops::Sub<Output = Self> + std::ops::Mul<Output = Self>
+{
+    const ZERO: Self;
+    fn component_max(self) -> f64;
+    fn magnitude(self) -> f64;
+    fn finite(self) -> bool;
+    fn scaled(self, factor: f64) -> SpiceResult<Self>;
+}
+
+impl ScaleValue for f64 {
+    const ZERO: Self = 0.0;
+    fn component_max(self) -> f64 {
+        self.abs()
+    }
+    fn magnitude(self) -> f64 {
+        self.abs()
+    }
+    fn finite(self) -> bool {
+        self.is_finite()
+    }
+    fn scaled(self, factor: f64) -> SpiceResult<Self> {
+        scale(self, factor)
+    }
+}
+
+impl ScaleValue for Complex {
+    const ZERO: Self = Self::ZERO;
+    fn component_max(self) -> f64 {
+        self.re.abs().max(self.im.abs())
+    }
+    fn magnitude(self) -> f64 {
+        Complex::magnitude(self)
+    }
+    fn finite(self) -> bool {
+        self.is_finite()
+    }
+    fn scaled(self, factor: f64) -> SpiceResult<Self> {
+        Ok(Self::new(scale(self.re, factor)?, scale(self.im, factor)?))
+    }
+}
 
 /// Immutable positive power-of-two factors for `R M C`.
 ///
@@ -54,15 +98,15 @@ impl Equilibration {
         &self.columns
     }
 
-    fn new(n: usize, entries: &[Entry]) -> SpiceResult<Self> {
+    fn new<T: ScaleValue>(n: usize, entries: &[Entry<T>]) -> SpiceResult<Self> {
         let mut rows = vec![0.0_f64; n];
         for &(r, _, v) in entries {
-            rows[r] = rows[r].max(component_max(v));
+            rows[r] = rows[r].max(v.component_max());
         }
         let rows = factors(&rows, "row")?;
         let mut columns = vec![0.0_f64; n];
         for &(r, c, v) in entries {
-            columns[c] = columns[c].max(component_max(scale_complex(v, rows[r])?));
+            columns[c] = columns[c].max(v.scaled(rows[r])?.component_max());
         }
         Ok(Self {
             rows,
@@ -85,15 +129,15 @@ impl Equilibration {
     /// is A. R. Curtis and J. K. Reid, "On the automatic scaling of matrices
     /// for Gaussian elimination", J. Inst. Maths Applics 10 (1972); it is a
     /// heuristic, so callers keep every rank and residual guard.
-    fn balanced(n: usize, entries: &[Entry]) -> SpiceResult<Self> {
+    fn balanced(n: usize, entries: &[Entry<f64>]) -> SpiceResult<Self> {
         let logs: Vec<(usize, usize, f64)> = entries
             .iter()
-            .filter(|(_, _, v)| component_max(*v) != 0.0)
+            .filter(|(_, _, v)| v.abs() != 0.0)
             .map(|&(r, c, v)| {
                 Ok((
                     r,
                     c,
-                    f64::from(floor_log2(component_max(v), || "entry".to_owned())?),
+                    f64::from(floor_log2(v.component_max(), || "entry".to_owned())?),
                 ))
             })
             .collect::<SpiceResult<_>>()?;
@@ -171,57 +215,38 @@ impl Equilibration {
         })
     }
 
-    fn scale_entries<'a>(
+    fn scale_entries<'a, T: ScaleValue + 'a>(
         &'a self,
-        entries: &'a [Entry],
-    ) -> impl Iterator<Item = SpiceResult<Entry>> + 'a {
-        entries.iter().map(|&(r, c, v)| {
-            Ok((
-                r,
-                c,
-                scale_complex(scale_complex(v, self.rows[r])?, self.columns[c])?,
-            ))
-        })
+        entries: &'a [Entry<T>],
+    ) -> impl Iterator<Item = SpiceResult<Entry<T>>> + 'a {
+        entries
+            .iter()
+            .map(|&(r, c, v)| Ok((r, c, v.scaled(self.rows[r])?.scaled(self.columns[c])?)))
     }
 
     fn transform_real(values: &Vector, factors: &[f64]) -> SpiceResult<Vector> {
-        if values.len() != factors.len() {
-            return Err(numerical(
-                "equilibration transform",
-                "vector dimension mismatch",
-            ));
-        }
-        Ok(Vector::from(
-            values
-                .as_slice()
-                .iter()
-                .zip(factors)
-                .map(|(&v, &s)| scale(v, s))
-                .collect::<SpiceResult<Vec<_>>>()?,
-        ))
+        transform(values.as_slice(), factors).map(Vector::from)
     }
 
     fn transform_complex(values: &[Complex], factors: &[f64]) -> SpiceResult<Vec<Complex>> {
-        if values.len() != factors.len() {
-            return Err(numerical(
-                "equilibration transform",
-                "vector dimension mismatch",
-            ));
-        }
-        values
-            .iter()
-            .zip(factors)
-            .map(|(&v, &s)| scale_complex(v, s))
-            .collect()
+        transform(values, factors)
     }
 }
 
-const fn component_max(v: Complex) -> f64 {
-    v.re.abs().max(v.im.abs())
+fn transform<T: ScaleValue>(values: &[T], factors: &[f64]) -> SpiceResult<Vec<T>> {
+    if values.len() != factors.len() {
+        return Err(numerical(
+            "equilibration transform",
+            "vector dimension mismatch",
+        ));
+    }
+    values
+        .iter()
+        .zip(factors)
+        .map(|(&v, &s)| v.scaled(s))
+        .collect()
 }
 
-/// Exact `floor(log2(v))` of a positive finite value, including subnormal
-/// inputs; no libm rounding near powers of two can alter the chosen factors.
 fn floor_log2(v: f64, what: impl FnOnce() -> String) -> SpiceResult<i32> {
     if v <= 0.0 || !v.is_finite() {
         return Err(numerical(
@@ -255,19 +280,15 @@ fn scale(v: f64, s: f64) -> SpiceResult<f64> {
     Ok(out)
 }
 
-fn scale_complex(v: Complex, s: f64) -> SpiceResult<Complex> {
-    Ok(Complex::new(scale(v.re, s)?, scale(v.im, s)?))
-}
-
-fn real_entries(matrix: &SparseMatrix) -> Vec<Entry> {
+fn real_entries(matrix: &SparseMatrix) -> Vec<Entry<f64>> {
     matrix
         .triplets()
         .iter()
-        .map(|t| (t.row, t.col, Complex::real(t.value)))
+        .map(|t| (t.row, t.col, t.value))
         .collect()
 }
 
-fn dense_entries(matrix: &Matrix) -> SpiceResult<Vec<Entry>> {
+fn dense_entries(matrix: &Matrix) -> SpiceResult<Vec<Entry<f64>>> {
     square(matrix.rows(), matrix.cols())?;
     if matrix.data().iter().any(|v| !v.is_finite()) {
         return Err(numerical(
@@ -279,23 +300,49 @@ fn dense_entries(matrix: &Matrix) -> SpiceResult<Vec<Entry>> {
         .data()
         .iter()
         .enumerate()
-        .filter(|(_, v)| **v != 0.0)
-        .map(|(i, &v)| (i / matrix.cols(), i % matrix.cols(), Complex::real(v)))
+        .filter(|(_, v)| **v != 0.)
+        .map(|(i, &v)| (i / matrix.cols(), i % matrix.cols(), v))
         .collect())
 }
 
-fn operators(
+fn real_operator(
     n: usize,
-    entries: impl IntoIterator<Item = SpiceResult<Entry>>,
-) -> SpiceResult<(SparseMatrix, SparseMatrix)> {
-    let mut re = SparseMatrix::new(n, n);
-    let mut im = SparseMatrix::new(n, n);
-    for entry in entries {
-        let (r, c, v) = entry?;
-        re.add(r, c, v.re)?;
-        im.add(r, c, v.im)?;
+    entries: impl Iterator<Item = SpiceResult<Entry<f64>>>,
+) -> SpiceResult<SparseMatrix> {
+    let triplets = entries
+        .map(|entry| {
+            let (row, col, value) = entry?;
+            Ok(Triplet { row, col, value })
+        })
+        .collect::<SpiceResult<Vec<_>>>()?;
+    Ok(SparseMatrix::from_assembled(n, n, triplets))
+}
+
+/// Merge two folded row-major operators without a coordinate tree or
+/// any change in the original single-element scaling operation.
+fn complex_entries(a: &[Triplet], e: &[Triplet], omega: f64) -> SpiceResult<Vec<Entry<Complex>>> {
+    let mut a = a.iter().peekable();
+    let mut e = e.iter().peekable();
+    let key = |t: &Triplet| (t.row, t.col);
+    let mut entries = Vec::new();
+    while a.peek().is_some() || e.peek().is_some() {
+        let (row, col) = match (a.peek(), e.peek()) {
+            (Some(a), Some(e)) => key(a).min(key(e)),
+            (Some(a), None) => key(a),
+            (None, Some(e)) => key(e),
+            (None, None) => break,
+        };
+        let re = a.next_if(|t| key(t) == (row, col)).map_or(0., |t| t.value);
+        let im = match e.next_if(|t| key(t) == (row, col)) {
+            Some(t) if omega != 0. => scale(t.value, omega)?,
+            _ => 0.,
+        };
+        let v = Complex::new(re, im);
+        if v != Complex::ZERO {
+            entries.push((row, col, v));
+        }
     }
-    Ok((re, im))
+    Ok(entries)
 }
 
 /// Original-unit row residual magnitudes and unchanged LU backward-error bounds.
@@ -310,20 +357,20 @@ pub struct BackwardError {
     pub row_bounds: Vec<f64>,
 }
 
-fn check_residual(
+fn check_residual<T: ScaleValue>(
     n: usize,
-    entries: &[Entry],
-    rhs: &[Complex],
-    x: &[Complex],
+    entries: &[Entry<T>],
+    rhs: &[T],
+    x: &[T],
 ) -> SpiceResult<BackwardError> {
-    if rhs.len() != n || x.len() != n || rhs.iter().chain(x).any(|v| !v.is_finite()) {
+    if rhs.len() != n || x.len() != n || rhs.iter().chain(x).any(|v| !v.finite()) {
         return Err(numerical(
             "equilibration original residual",
             "invalid RHS/solution dimensions or values",
         ));
     }
     let max_x = x.iter().fold(0.0_f64, |m, v| m.max(v.magnitude()));
-    let mut ax = vec![Complex::ZERO; n];
+    let mut ax = vec![T::ZERO; n];
     let mut bounds: Vec<_> = rhs.iter().map(|v| v.magnitude()).collect();
     for &(r, c, v) in entries {
         ax[r] = ax[r] + v * x[c];
@@ -352,18 +399,10 @@ fn check_residual(
     })
 }
 
-fn as_complex(values: &Vector) -> Vec<Complex> {
-    values
-        .as_slice()
-        .iter()
-        .map(|&v| Complex::real(v))
-        .collect()
-}
-
 /// Owned opt-in dense LU of `R M C` plus original-unit diagnostics.
 #[derive(Debug)]
 pub struct EquilibratedDenseLu {
-    original: Vec<Entry>,
+    original: Vec<Entry<f64>>,
     scaling: Equilibration,
     factor: DenseLu,
 }
@@ -378,7 +417,7 @@ impl EquilibratedDenseLu {
         let mut scaled = Matrix::zeros(matrix.rows(), matrix.cols());
         for entry in scaling.scale_entries(&original) {
             let (r, c, v) = entry?;
-            scaled.set(r, c, v.re)?;
+            scaled.set(r, c, v)?;
         }
         Ok(Self {
             original,
@@ -411,8 +450,8 @@ impl EquilibratedDenseLu {
         check_residual(
             self.scaling.rows.len(),
             &self.original,
-            &as_complex(rhs),
-            &as_complex(x),
+            rhs.as_slice(),
+            x.as_slice(),
         )
     }
 }
@@ -420,7 +459,7 @@ impl EquilibratedDenseLu {
 /// Owned opt-in sparse LU with exact assembled-pattern symbolic reuse.
 #[derive(Debug)]
 pub struct EquilibratedSparseLu {
-    original: Vec<Entry>,
+    original: Vec<Entry<f64>>,
     scaling: Equilibration,
     factor: SparseLu,
 }
@@ -435,7 +474,7 @@ impl EquilibratedSparseLu {
         let snapshot = assembled_triplets(matrix, "equilibration assembly")?;
         let original = real_entries(&snapshot);
         let scaling = Equilibration::new(snapshot.rows(), &original)?;
-        let (scaled, _) = operators(snapshot.rows(), scaling.scale_entries(&original))?;
+        let scaled = real_operator(snapshot.rows(), scaling.scale_entries(&original))?;
         Ok(Self {
             original,
             scaling,
@@ -458,7 +497,7 @@ impl EquilibratedSparseLu {
         let snapshot = assembled_triplets(matrix, "equilibration assembly")?;
         let original = real_entries(&snapshot);
         let scaling = Equilibration::balanced(snapshot.rows(), &original)?;
-        let (scaled, _) = operators(snapshot.rows(), scaling.scale_entries(&original))?;
+        let scaled = real_operator(snapshot.rows(), scaling.scale_entries(&original))?;
         Ok(Self {
             original,
             scaling,
@@ -486,7 +525,8 @@ impl EquilibratedSparseLu {
     /// As [`EquilibratedSparseLu::solve`], for the first solve; failing
     /// corrections end refinement and keep the best solution so far.
     pub fn solve_refined(&self, rhs: &Vector, steps: usize) -> SpiceResult<Vector> {
-        let mut x = self.solve(rhs)?;
+        let mut workspace = Vec::new();
+        let mut x = self.solve_in(rhs, &mut workspace)?;
         let mut residual = rhs.clone();
         let mut scale = vec![0.0; rhs.len()];
         let mut error = self.componentwise_error(rhs, &x, &mut residual, &mut scale);
@@ -499,7 +539,7 @@ impl EquilibratedSparseLu {
             if !residual.is_finite() {
                 break;
             }
-            let Ok(mut candidate) = self.solve(&residual) else {
+            let Ok(mut candidate) = self.solve_in(&residual, &mut workspace) else {
                 break;
             };
             for (delta, value) in candidate.as_mut_slice().iter_mut().zip(x.as_slice()) {
@@ -533,7 +573,7 @@ impl EquilibratedSparseLu {
             *s = v.abs();
         }
         for &(r, c, v) in &self.original {
-            let term = v.re * x.as_slice()[c];
+            let term = v * x.as_slice()[c];
             residual[r] -= term;
             scale[r] += term.abs();
         }
@@ -558,8 +598,12 @@ impl EquilibratedSparseLu {
     /// # Errors
     /// Invalid RHS, failed transforms, checked solve or original-unit residual.
     pub fn solve(&self, rhs: &Vector) -> SpiceResult<Vector> {
+        self.solve_in(rhs, &mut Vec::new())
+    }
+
+    fn solve_in(&self, rhs: &Vector, workspace: &mut Vec<f64>) -> SpiceResult<Vector> {
         let scaled_rhs = Equilibration::transform_real(rhs, &self.scaling.rows)?;
-        let y = self.factor.solve(&scaled_rhs)?;
+        let y = self.factor.solve_with_workspace(&scaled_rhs, workspace)?;
         let x = Equilibration::transform_real(&y, &self.scaling.columns)?;
         self.check_residual(rhs, &x)?;
         Ok(x)
@@ -572,8 +616,8 @@ impl EquilibratedSparseLu {
         check_residual(
             self.scaling.rows.len(),
             &self.original,
-            &as_complex(rhs),
-            &as_complex(x),
+            rhs.as_slice(),
+            x.as_slice(),
         )
     }
 }
@@ -581,7 +625,7 @@ impl EquilibratedSparseLu {
 /// Owned opt-in complex LU of the assembled `A + j omega E` snapshot.
 #[derive(Debug)]
 pub struct EquilibratedComplexLu {
-    original: Vec<Entry>,
+    original: Vec<Entry<Complex>>,
     scaling: Equilibration,
     factor: ComplexLu,
 }
@@ -600,27 +644,12 @@ impl EquilibratedComplexLu {
                 "operator dimensions/frequency invalid",
             ));
         }
-        let mut entries = std::collections::BTreeMap::new();
-        for t in a.triplets() {
-            entries.insert((t.row, t.col), Complex::real(t.value));
-        }
-        for t in e.triplets() {
-            // omega=0 intentionally removes the dynamic part, not underflow.
-            let im = if omega == 0.0 {
-                0.0
-            } else {
-                scale(t.value, omega)?
-            };
-            entries.entry((t.row, t.col)).or_insert(Complex::ZERO).im = im;
-        }
-        let original: Vec<_> = entries
-            .into_iter()
-            .filter(|(_, v)| *v != Complex::ZERO)
-            .map(|((r, c), v)| (r, c, v))
-            .collect();
+        let original = complex_entries(a.triplets(), e.triplets(), omega)?;
         let scaling = Equilibration::new(a.rows(), &original)?;
-        let (re, im) = operators(a.rows(), scaling.scale_entries(&original))?;
-        let factor = ComplexMatrix::from_operators(&re, &im, 1.0)?.factorize()?;
+        let scaled = scaling
+            .scale_entries(&original)
+            .collect::<SpiceResult<Vec<_>>>()?;
+        let factor = ComplexMatrix::from_assembled(a.rows(), scaled).factorize()?;
         Ok(Self {
             original,
             scaling,
@@ -656,6 +685,69 @@ impl EquilibratedComplexLu {
 #[cfg(test)]
 mod floor_log2_tests {
     use super::floor_log2;
+
+    #[test]
+    fn assembled_scaled_operator_preserves_zero_elision() {
+        use super::*;
+        let scaled =
+            real_operator(2, [(0, 0, 2.), (0, 1, -0.), (1, 1, 3.)].into_iter().map(Ok)).unwrap();
+        assert!(scaled.is_folded());
+        assert_eq!(scaled.nnz(), 2);
+        assert_eq!(scaled.get(0, 1), 0.);
+    }
+
+    #[test]
+    fn real_residual_matches_complex_promotion_and_merge_preserves_order() {
+        use super::*;
+        let real = [(0, 0, 2.), (0, 1, -1.), (1, 0, 1.), (1, 1, 4.)];
+        let complex = real.map(|(r, c, v)| (r, c, Complex::real(v)));
+        let x = [1.25, -0.5];
+        let b = [3., -0.75];
+        assert_eq!(
+            check_residual(2, &real, &b, &x).unwrap(),
+            check_residual(2, &complex, &b.map(Complex::real), &x.map(Complex::real)).unwrap()
+        );
+        assert_eq!(
+            Equilibration::new(2, &real).unwrap(),
+            Equilibration::new(2, &complex).unwrap()
+        );
+        let a = [
+            Triplet {
+                row: 0,
+                col: 0,
+                value: 2.,
+            },
+            Triplet {
+                row: 1,
+                col: 0,
+                value: -1.,
+            },
+        ];
+        let e = [
+            Triplet {
+                row: 0,
+                col: 0,
+                value: 0.5,
+            },
+            Triplet {
+                row: 0,
+                col: 1,
+                value: -2.,
+            },
+        ];
+        assert_eq!(
+            complex_entries(&a, &e, 2.).unwrap(),
+            [
+                (0, 0, Complex::new(2., 1.)),
+                (0, 1, Complex::imaginary(-4.)),
+                (1, 0, Complex::real(-1.))
+            ]
+        );
+        assert_eq!(
+            complex_entries(&a, &e, 0.).unwrap(),
+            [(0, 0, Complex::real(2.)), (1, 0, Complex::real(-1.))]
+        );
+    }
 
     #[test]
     fn exact_exponent_boundaries_and_invalid_signs() {

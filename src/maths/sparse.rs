@@ -602,6 +602,25 @@ impl SparseMatrix {
         }
     }
 
+    /// Construct an already folded stream from a trusted assembly pass.
+    /// Its coordinates are sorted and unique, as with fold_duplicates.
+    pub(super) fn from_assembled(rows: usize, cols: usize, mut triplets: Vec<Triplet>) -> Self {
+        debug_assert!(triplets.iter().all(|t| t.row < rows && t.col < cols));
+        debug_assert!(
+            triplets
+                .windows(2)
+                .all(|w| (w[0].row, w[0].col) < (w[1].row, w[1].col))
+        );
+        // The ordinary stamp path drops zeros even when they were present
+        // in a previous folded matrix whose row was cleared.
+        triplets.retain(|t| t.value != 0.);
+        Self {
+            triplets,
+            folded: true,
+            ..Self::new(rows, cols)
+        }
+    }
+
     /// An all-zero matrix bound to `pattern`, accumulating by element.
     #[must_use]
     pub fn bound(pattern: Arc<Pattern>) -> Self {

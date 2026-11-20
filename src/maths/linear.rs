@@ -329,9 +329,14 @@ fn solve_real(
     n: usize,
     rhs: &Vector,
     workspace: &mut Vec<f64>,
+    transposed: bool,
 ) -> SpiceResult<Vector> {
     rhs_valid(rhs, n)?;
-    let x = Vector::from(sparse.solve_with_workspace(rhs.as_slice(), workspace));
+    let x = Vector::from(if transposed {
+        sparse.solve_transposed_with_workspace(rhs.as_slice(), workspace)
+    } else {
+        sparse.solve_with_workspace(rhs.as_slice(), workspace)
+    });
     if !x.is_finite() {
         return Err(numerical(
             "LU solve",
@@ -347,7 +352,7 @@ impl SparseSymbolic {
     }
 
     fn solve_with_workspace(&self, rhs: &Vector, workspace: &mut Vec<f64>) -> SpiceResult<Vector> {
-        solve_real(&self.sparse, self.n, rhs, workspace)
+        solve_real(&self.sparse, self.n, rhs, workspace, false)
     }
 
     /// Whether a matrix has exactly this assembled pattern.
@@ -839,6 +844,35 @@ impl SparseLu {
         self.symbolic.solve(rhs)
     }
 
+    /// Solves with this immutable snapshot and caller-owned numeric scratch.
+    /// # Errors
+    /// Invalid RHS or non-finite solution.
+    pub fn solve_with_workspace(
+        &self,
+        rhs: &Vector,
+        workspace: &mut Vec<f64>,
+    ) -> SpiceResult<Vector> {
+        self.symbolic.solve_with_workspace(rhs, workspace)
+    }
+
+    /// Solves the transposed system `A^T x = b` with the same factors.
+    /// # Errors
+    /// Invalid RHS or non-finite solution.
+    pub fn solve_transposed(&self, rhs: &Vector) -> SpiceResult<Vector> {
+        self.solve_transposed_with_workspace(rhs, &mut Vec::new())
+    }
+
+    /// Transposed solve with caller-owned scratch.
+    /// # Errors
+    /// Invalid RHS or non-finite solution.
+    pub fn solve_transposed_with_workspace(
+        &self,
+        rhs: &Vector,
+        workspace: &mut Vec<f64>,
+    ) -> SpiceResult<Vector> {
+        solve_real(&self.symbolic.sparse, self.symbolic.n, rhs, workspace, true)
+    }
+
     /// `spDeterminant`: `(mantissa, decimal exponent)`.
     /// # Errors
     /// Non-finite/invalid inverse factors or an out-of-range exponent.
@@ -893,7 +927,36 @@ impl DenseLu {
     /// # Errors
     /// Invalid RHS or non-finite solution.
     pub fn solve(&self, rhs: &Vector) -> SpiceResult<Vector> {
-        solve_real(&self.sparse, self.n, rhs, &mut Vec::new())
+        self.solve_with_workspace(rhs, &mut Vec::new())
+    }
+
+    /// Solves with caller-owned numeric scratch.
+    /// # Errors
+    /// Invalid RHS or non-finite solution.
+    pub fn solve_with_workspace(
+        &self,
+        rhs: &Vector,
+        workspace: &mut Vec<f64>,
+    ) -> SpiceResult<Vector> {
+        solve_real(&self.sparse, self.n, rhs, workspace, false)
+    }
+
+    /// Solves the transposed system with the same factors.
+    /// # Errors
+    /// Invalid RHS or non-finite solution.
+    pub fn solve_transposed(&self, rhs: &Vector) -> SpiceResult<Vector> {
+        self.solve_transposed_with_workspace(rhs, &mut Vec::new())
+    }
+
+    /// Transposed solve with caller-owned numeric scratch.
+    /// # Errors
+    /// Invalid RHS or non-finite solution.
+    pub fn solve_transposed_with_workspace(
+        &self,
+        rhs: &Vector,
+        workspace: &mut Vec<f64>,
+    ) -> SpiceResult<Vector> {
+        solve_real(&self.sparse, self.n, rhs, workspace, true)
     }
 }
 
@@ -901,6 +964,40 @@ impl DenseLu {
 mod tests {
     use super::*;
     use crate::maths::complex::ComplexMatrix;
+
+    #[test]
+    fn dense_and_sparse_transposed_solves_share_workspace_and_preserve_order() {
+        let mut dense = Matrix::zeros(2, 2);
+        let mut sparse = SparseMatrix::new(2, 2);
+        for (r, c, v) in [(0, 0, 2.), (0, 1, 1.), (1, 0, 3.), (1, 1, 4.)] {
+            dense.set(r, c, v).unwrap();
+            sparse.add(r, c, v).unwrap();
+        }
+        let dense = DenseLu::new(&dense).unwrap();
+        let sparse = SparseLu::new(&sparse, None).unwrap();
+        let rhs = Vector::from_slice(&[5., 5.]);
+        let mut workspace = Vec::new();
+        let x = sparse
+            .solve_transposed_with_workspace(&rhs, &mut workspace)
+            .unwrap();
+        assert!((x.get(0).unwrap() - 1.).abs() < 1e-14);
+        assert!((x.get(1).unwrap() - 1.).abs() < 1e-14);
+        let storage = workspace.as_ptr();
+        assert_eq!(
+            dense
+                .solve_transposed_with_workspace(&rhs, &mut workspace)
+                .unwrap(),
+            x
+        );
+        assert_eq!(sparse.solve_transposed(&rhs).unwrap(), x);
+        assert_eq!(dense.solve_transposed(&rhs).unwrap(), x);
+        assert_eq!(
+            sparse.solve_with_workspace(&rhs, &mut workspace).unwrap(),
+            sparse.solve(&rhs).unwrap()
+        );
+        assert_eq!(workspace.as_ptr(), storage);
+        assert!(dense.solve_transposed(&Vector::zeros(1)).is_err());
+    }
 
     #[test]
     fn bound_solves_reuse_scratch_and_keep_valid_factors_on_rhs_failure() {

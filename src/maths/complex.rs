@@ -128,6 +128,37 @@ pub struct ComplexMatrix {
     names: Option<crate::maths::UnknownNames>,
 }
 impl ComplexMatrix {
+    /// A trusted sorted, unique assembly pass already produced complex
+    /// values. Do not split them back into two real operators and reassemble.
+    pub(super) fn from_assembled(n: usize, mut entries: Vec<(usize, usize, Complex)>) -> Self {
+        debug_assert!(
+            entries
+                .iter()
+                .all(|&(r, c, v)| r < n && c < n && v.is_finite())
+        );
+        debug_assert!(
+            entries
+                .windows(2)
+                .all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1))
+        );
+        entries.retain(|&(_, _, v)| v != Complex::ZERO);
+        for (_, _, v) in &mut entries {
+            // Ordinary assembly drops zero real or imaginary stamps.
+            if v.re == 0. {
+                v.re = 0.;
+            }
+            if v.im == 0. {
+                v.im = 0.;
+            }
+        }
+        Self {
+            n,
+            assembly: Assembly::Standalone(entries),
+            pivot: PivotTolerances::DEFAULT,
+            names: None,
+        }
+    }
+
     /// Assembles `A + j omega E`, preserving cancellations and checking
     /// overflow. The pivot tolerances are `a`'s.
     /// # Errors

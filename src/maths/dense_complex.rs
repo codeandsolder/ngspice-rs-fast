@@ -150,6 +150,11 @@ impl DenseComplex {
     /// Mismatched dimensions or a non-finite result.
     pub fn mul(&self, other: &Self) -> SpiceResult<Self> {
         self.same_dimension(other)?;
+        // Skipping a zero multiplier is valid only for finite operands:
+        // otherwise zero times infinity/NaN would be silently swallowed.
+        if self.data.iter().chain(&other.data).any(|v| !v.is_finite()) {
+            return Err(numerical("non-finite entry"));
+        }
         let n = self.n;
         let mut out = Self::zeros(n);
         if n != 0 {
@@ -277,6 +282,17 @@ mod tests {
             m.set(index / n, index % n, Complex::new(*re, *im)).unwrap();
         }
         m
+    }
+
+    #[test]
+    fn zero_multiplier_does_not_hide_nonfinite_input() {
+        let a = DenseComplex::zeros(1);
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut b = DenseComplex::zeros(1);
+            b.set(0, 0, Complex::real(invalid)).unwrap();
+            assert!(a.mul(&b).is_err());
+            assert!(b.mul(&a).is_err());
+        }
     }
 
     #[test]
