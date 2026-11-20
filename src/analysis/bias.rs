@@ -1141,7 +1141,7 @@ const fn uses_direct_limit(strategy: DcStrategy, closing: bool) -> bool {
 
 impl Plan<'_> {
     /// Upper bound on the number of solves at ITL1 and ITL2 respectively.
-    fn solve_counts(&self, strategy: DcStrategy) -> (usize, usize) {
+    const fn solve_counts(&self, strategy: DcStrategy) -> (usize, usize) {
         match self {
             Self::Disabled => (0, 0),
             Self::Walk { stages, .. } => {
@@ -1244,7 +1244,7 @@ impl ContinuationPolicy {
     }
 }
 
-/// NIiter may take its configured limit plus the failing extra pass.
+/// `NIiter` may take its configured limit plus the failing extra pass.
 /// The implicit budget covers every enabled strategy's worst-case work.
 fn iteration_budget(plan: &[(DcStrategy, Plan<'_>)], direct: usize, stage: usize) -> usize {
     plan.iter().fold(0_usize, |total, (strategy, planned)| {
