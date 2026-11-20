@@ -713,10 +713,10 @@ impl Mesa {
         let capgd = derived.cf + 2. / 3. * cgc * (1. - c);
         let delvgtevgt = 0.5 * (1. + t / q);
         let delidvds0 = gch / h;
-        let delidvds1 = if vds != 0. {
-            cdrain * (vds / vsate).powf(model.m - 1.) / vsate / (1. + g)
-        } else {
+        let delidvds1 = if vds == 0. {
             0.
+        } else {
+            cdrain * (vds / vsate).powf(model.m - 1.) / vsate / (1. + g)
         };
         let delidvds = delidvds0 * (1. + 2. * lambda * vds) - delidvds1;
         let delgchgchi = 1. / (1. + gchi * rt) / (1. + gchi * rt);
@@ -917,10 +917,10 @@ impl Mesa {
         };
         let delvgtevgt = 0.5 * (1. + u / t);
         let delidvds0 = gch / h;
-        let delidvds1 = if vds != 0. {
-            cdrain * (vds / vsate).powf(m - 1.) / (vsate * (1. + g))
-        } else {
+        let delidvds1 = if vds == 0. {
             0.
+        } else {
+            cdrain * (vds / vsate).powf(m - 1.) / (vsate * (1. + g))
         };
         let delidvds = delidvds0 * (1. + 2. * lambda * vds) - delidvds1;
         let delidvsate = cdrain * g / (vsate * (1. + g));
@@ -951,7 +951,9 @@ impl Mesa {
         let dvsatevds = delvsateisat
             * (delisatisata * disatavds + delisatisatb * disatbvgt * sigma)
             + delvsategch * w;
-        let (gmmadd, gdsmadd) = if model.alpha != 0. {
+        let (gmmadd, gdsmadd) = if model.alpha == 0. {
+            (0., 0.)
+        } else {
             let gmmadd = if vds == 0. {
                 0.
             } else {
@@ -961,8 +963,6 @@ impl Mesa {
                     * delvgtevgt
             };
             (gmmadd, gmmadd * sigma)
-        } else {
-            (0., 0.)
         };
         let g = delidgch * p + delidvsate * dvsatevgt;
         let gm = (g + gmmadd) * dvgtvgs;
@@ -1466,7 +1466,7 @@ impl Device for Mesa {
         }
         // The convergence test compares the predicted currents with the
         // integrated ones (C's `cg`/`cd` after the charge block).
-        let point = Point { cg, cd, ..point };
+        let point = Point { cd, cg, ..point };
         let nonconvergent = match start {
             Start::Fixed => true,
             Start::Conditions | Start::Exact => false,

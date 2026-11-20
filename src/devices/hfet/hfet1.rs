@@ -673,10 +673,10 @@ impl Hfet1 {
                     iseff * ((v / vteff).exp() - 1.),
                 )
             };
-            let iaprox = if iaprox1 * iaprox2 != 0. {
-                1. / (1. / iaprox1 + 1. / iaprox2)
-            } else {
+            let iaprox = if iaprox1 * iaprox2 == 0. {
                 0.5 * (iaprox1 + iaprox2)
+            } else {
+                1. / (1. / iaprox1 + 1. / iaprox2)
             };
             let dvdi0 = rs + vt1 / (iaprox + is1) + vt2 / (iaprox + is2);
             let mut v0 = rs * iaprox;
@@ -1516,8 +1516,8 @@ impl Device for Hfet1 {
             }
         }
         point = Point {
-            cg,
             cd,
+            cg,
             gds,
             ..point
         };
