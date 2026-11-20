@@ -906,3 +906,139 @@ fn ac_conductance_and_capacitance_stamps_preserve_c_grouping() {
         }
     }
 }
+
+#[test]
+fn gate_pencils_keep_reference_diagonal_scaling_and_statement_order() {
+    let context = ModelContext::default();
+    let parse = |s: &str| ngspice_rs::primitives::parse_spice_number(s).unwrap();
+    for (instance, family) in [("z1", "nmf"), ("j1", "njf")] {
+        for (rd, rs) in [("43", "37"), ("0", "0")] {
+            for multiplier in ["1", "1.7"] {
+                let c = circuit(&format!(
+                    "{instance} d g s model area=1.37 m={multiplier}\n\
+                     .model model {family}(vto=-1.8 beta=2.3m lambda=0.027\n\
+                     + rd={rd} rs={rs} is=1.1e-14 cgs=2.3p cgd=0.61p pb=0.83)"
+                ))
+                .unwrap();
+                let row = |name: &str| c.unknowns().node_row(c.nodes().get(name).unwrap()).unwrap();
+                let [d, g, s] = ["d", "g", "s"].map(row);
+                let dp = if rd == "0" {
+                    d
+                } else {
+                    row(&format!("{instance}#drain"))
+                };
+                let sp = if rs == "0" {
+                    s
+                } else {
+                    row(&format!("{instance}#source"))
+                };
+                let n = c.unknown_count();
+                let mut bias = Vector::zeros(n);
+                for (r, v) in [(d, 1.71), (g, -0.21), (s, 0.12), (dp, 1.6), (sp, 0.)] {
+                    bias.as_mut_slice()[r] = v;
+                }
+                let history = c.state_history();
+                let mut trial = history.trial();
+                c.load_device(
+                    0,
+                    c.devices()[0].as_ref(),
+                    &LoadRequest {
+                        mode: AnalysisMode::OperatingPoint,
+                        solution: &bias,
+                        model_context: &context,
+                        integration: None,
+                        history: &history,
+                        forcing: None,
+                    },
+                    &mut SparseMatrix::new(n, n),
+                    &mut Vector::zeros(n),
+                    &mut trial,
+                )
+                .unwrap();
+                let state = trial.values();
+                let (gm, gds, ggs, ggd) = (state[5], state[6], state[7], state[8]);
+                let m = parse(multiplier);
+                let area = parse("1.37");
+                let series = |r| {
+                    let r = parse(r);
+                    if r == 0. { 0. } else { (1. / r) * area }
+                };
+                let (gdpr, gspr) = (series(rd), series(rs));
+                let ac = c.small_signal_system(&context, &bias).unwrap();
+                let group = ac
+                    .e_groups
+                    .iter()
+                    .find(|group| {
+                        let t = &ac.e.triplets()[group.range.start];
+                        (t.row, t.col) == (g, g)
+                    })
+                    .unwrap();
+                let [capgd, capgs] = group.terms.as_slice() else {
+                    panic!("gate capacitance pair")
+                };
+                let (capgd, capgs) = (*capgd, *capgs);
+                let (gg, dd, ss) = if family == "nmf" {
+                    (
+                        m * ggd + ggs,
+                        m * gdpr + gds + ggd,
+                        m * gspr + gds + gm + ggs,
+                    )
+                } else {
+                    (
+                        m * (ggd + ggs),
+                        m * (gdpr + gds + ggd),
+                        m * (gspr + gds + gm + ggs),
+                    )
+                };
+                // Independent literal statement order from mespzld.c / jfetpzld.c.
+                let expected = [
+                    (d, d, m * gdpr, None),
+                    (g, g, gg, Some(m * (capgd + capgs))),
+                    (s, s, m * gspr, None),
+                    (dp, dp, dd, Some(m * capgd)),
+                    (sp, sp, ss, Some(m * capgs)),
+                    (d, dp, -(m * gdpr), None),
+                    (g, dp, -(m * ggd), Some(-(m * capgd))),
+                    (g, sp, -(m * ggs), Some(-(m * capgs))),
+                    (s, sp, -(m * gspr), None),
+                    (dp, d, -(m * gdpr), None),
+                    (dp, g, m * (-ggd + gm), Some(-(m * capgd))),
+                    (dp, sp, m * (-gds - gm), None),
+                    (sp, g, m * (-ggs - gm), Some(-(m * capgs))),
+                    (sp, s, -(m * gspr), None),
+                    (sp, dp, -(m * gds), None),
+                ];
+                let expected = expected
+                    .into_iter()
+                    .flat_map(|(r, c, g, cap)| {
+                        std::iter::once((r, c, Some(g.to_bits()), None))
+                            .chain(cap.map(|v| (r, c, None, Some(v.to_bits()))))
+                    })
+                    .collect::<Vec<_>>();
+                let actual = c.pole_zero_terms_at(&context, &bias, None, 1).unwrap();
+                let actual = actual
+                    .iter()
+                    .map(|term| {
+                        (
+                            term.row,
+                            term.col,
+                            term.conductance.map(f64::to_bits),
+                            term.capacitance.map(f64::to_bits),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual, expected,
+                    "{instance}, RD={rd}, RS={rs}, M={multiplier}"
+                );
+                // At M=1 both PZ diagonals match AC, but nonunit MES M must
+                // retain C's distinct expression rather than AC scaling.
+                let pz = c.pole_zero_system_at(&context, &bias, None).unwrap();
+                assert_eq!(entry(&pz.a, g, g).to_bits(), gg.to_bits());
+                if family == "nmf" && multiplier != "1" {
+                    assert_ne!(entry(&ac.a, g, g).to_bits(), gg.to_bits());
+                }
+            }
+        }
+    }
+}

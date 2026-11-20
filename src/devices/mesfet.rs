@@ -46,9 +46,6 @@
 //!   (`d qgs / d vgd`, `d qgd / d vgs`) where `mesload.c` stamps each charge
 //!   as a two-terminal capacitance `qggnew` reports at the iterate. The
 //!   equations and their solution are C's; only the iteration differs.
-//! - `mespzld.c` scales some diagonal conductances without the multiplicity
-//!   (`m * ggd + ggs`: an operator-precedence slip); the port's pole-zero
-//!   load is the AC load, every term scaled by `m`. Both agree for `m = 1`.
 //! - An unlabeled leading value on the card is refused by the parser
 //!   ([`crate::netlist`]): INP2Z only reaches the `area` setter for a
 //!   non-MES model, and none of the MESA/HFET tables has that setter, so C
@@ -519,6 +516,22 @@ impl Mesfet {
     }
 
     /// Normalized `[vgs, vgd]` from physical node voltages of d', g, s'.
+    fn linearization(
+        &self,
+        context: &LinearContext<'_>,
+        bias: &Vector,
+    ) -> SpiceResult<jfet::linear::GateLinearization> {
+        let op = self.operating()?;
+        let [vgs, vgd] = self.bias(context.unknowns, bias);
+        let point = self.point(&op, vgs, vgd, context.model_context.gmin)?;
+        let (_, capgs, capgd) = self.charge(&op, vgs, vgd)?;
+        Ok(jfet::linear::GateLinearization {
+            series: jfet::series_conductances(self.instance.area, self.model.rd, self.model.rs),
+            intrinsic: [point.channel.gm, point.channel.gds, point.gs.1, point.gd.1],
+            capacitances: [capgs, capgd],
+        })
+    }
+
     fn normalized(&self, v: [Real; 3]) -> [Real; 2] {
         jfet::normalized(self.model.pol, v)
     }
@@ -789,29 +802,27 @@ impl Device for Mesfet {
         context: &mut LinearContext<'_>,
         bias: &Vector,
     ) -> SpiceResult<()> {
-        let op = self.operating()?;
-        let [vgs, vgd] = self.bias(context.unknowns, bias);
-        let point = self.point(&op, vgs, vgd, context.model_context.gmin)?;
-        let (_, capgs, capgd) = self.charge(&op, vgs, vgd)?;
-        let m = self.instance.m;
-        jfet::ac_gate_capacitances(context, self.inner, m, capgs, capgd)?;
-        jfet::ac_conductances(
+        self.linearization(context, bias)?.assemble_ac(
             context,
             &self.terminals,
             self.inner,
-            m,
-            jfet::series_conductances(self.instance.area, self.model.rd, self.model.rs),
-            [point.channel.gm, point.channel.gds, point.gs.1, point.gd.1],
+            self.instance.m,
         )
     }
-    /// `mespzld.c` is the AC load with `s` for `j omega` (see the module
-    /// docs for its multiplicity slip).
+    /// `mespzld.c`: preserve C's distinct diagonal multiplicity and
+    /// separate conductance/capacitance statements.
     fn assemble_pole_zero(
         &self,
         context: &mut LinearContext<'_>,
         bias: &Vector,
     ) -> SpiceResult<()> {
-        self.assemble_small_signal(context, bias)
+        self.linearization(context, bias)?.assemble_pole_zero(
+            context,
+            &self.terminals,
+            self.inner,
+            self.instance.m,
+            jfet::linear::GatePencil::Mesfet,
+        )
     }
     /// `mesnoise.c`: thermal noise of RD and RS (`NevalSrc`, circuit
     /// temperature), channel thermal noise `4 k T (2/3) |gm|` and flicker
@@ -1128,7 +1139,7 @@ impl Device for ResetMesfet {
         let [vgs, vgd] = state.normalized([0.; 3]);
         let point = state.point(&op, vgs, vgd, context.model_context.gmin)?;
         let c = &self.current;
-        jfet::ac_conductances(
+        jfet::linear::ac_conductances(
             context,
             &c.terminals,
             c.inner,

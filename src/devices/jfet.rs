@@ -35,9 +35,9 @@
 //! - The AC and pole-zero loads evaluate the `MODEINITSMSIG` conductances
 //!   and capacitances at the bias point, which equals C's `CKTstate0`
 //!   voltages when the converged load limited nothing (as for the BJT and
-//!   MOS1). `jfetpzld.c` adds the conductance and `s` times the
-//!   capacitance to the real part in two steps; the port's pole-zero load
-//!   reuses the AC grouping.
+//!   MOS1). `jfetpzld.c` adds conductance and the `s` term in separate
+//!   statements, retained by the pencil loader. For non-unit M the pencil
+//!   coefficient applies M before s rather than after the product.
 //!
 //! `.noise` and `.disto` of a JFET are not ported and fail with an explicit
 //! error naming `jfetnoi.c`/`jfetdist.c` rather than contributing nothing.
@@ -62,6 +62,9 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
+pub(super) mod linear;
+
+use self::linear::{GateLinearization, GatePencil, ac_conductances};
 use crate::devices::limiting;
 use crate::devices::nonlinear::charge::ChargeBranch;
 use crate::devices::nonlinear::thermal::{SiliconTemperature, TemperatureCache, TemperatureKey};
@@ -588,6 +591,23 @@ impl Jfet {
     }
 
     /// Normalized `[vgs, vgd]` from physical node voltages of d', g, s'.
+    fn linearization(
+        &self,
+        context: &LinearContext<'_>,
+        bias: &Vector,
+    ) -> SpiceResult<GateLinearization> {
+        let op = self.operating(context.model_context)?;
+        let unknowns = context.unknowns;
+        let voltage = |n: NodeId| unknowns.node_row(n).and_then(|r| bias.get(r)).unwrap_or(0.);
+        let [vgs, vgd] = self.normalized(self.inner.map(voltage));
+        let e = self.evaluate(&op, vgs, vgd, context.model_context.gmin)?;
+        Ok(GateLinearization {
+            series: [op.gdpr, op.gspr],
+            intrinsic: [e.load.gm, e.load.gds, e.load.ggs, e.load.ggd],
+            capacitances: e.gates.map(|branch| branch.capacitance),
+        })
+    }
+
     fn normalized(&self, v: [Real; 3]) -> [Real; 2] {
         normalized(self.model.pol, v)
     }
@@ -1172,69 +1192,6 @@ pub(super) fn finish_load(
     Ok(())
 }
 
-/// The real part of `jfetacld.c`/`jfet2acld.c`: the conductances in C's
-/// order and grouping, every stamp scaled by `m`.
-pub(super) fn ac_conductances(
-    context: &mut LinearContext<'_>,
-    terminals: &[NodeId],
-    inner: [NodeId; 3],
-    m: Real,
-    [gdpr, gspr]: [Real; 2],
-    [gm, gds, ggs, ggd]: [Real; 4],
-) -> SpiceResult<()> {
-    let [d, g, s] = [0, 1, 2].map(|k| terminals[k]);
-    let [dp, _, sp] = inner;
-    for (row, col, value) in [
-        (d, d, m * gdpr),
-        (g, g, m * (ggd + ggs)),
-        (s, s, m * gspr),
-        (dp, dp, m * (gdpr + gds + ggd)),
-        (sp, sp, m * (gspr + gds + gm + ggs)),
-        (d, dp, -(m * gdpr)),
-        (g, dp, -(m * ggd)),
-        (g, sp, -(m * ggs)),
-        (s, sp, -(m * gspr)),
-        (dp, d, -(m * gdpr)),
-        (dp, g, m * (-ggd + gm)),
-        (dp, sp, m * (-gds - gm)),
-        (sp, g, m * (-ggs - gm)),
-        (sp, s, -(m * gspr)),
-        (sp, dp, -(m * gds)),
-    ] {
-        if let (Some(r), Some(c)) = (
-            context.unknowns.node_row(row),
-            context.unknowns.node_row(col),
-        ) {
-            context.system.a.add(r, c, value)?;
-        }
-    }
-    Ok(())
-}
-
-/// The gate capacitances' imaginary part of `jfetacld.c`/`jfet2acld.c`
-/// (`xgs = capgs * omega`, `xgd = capgd * omega`), in C's order.
-pub(super) fn ac_gate_capacitances(
-    context: &mut LinearContext<'_>,
-    inner: [NodeId; 3],
-    m: Real,
-    capgs: Real,
-    capgd: Real,
-) -> SpiceResult<()> {
-    let [dp, g, sp] = inner;
-    for (row, col, terms, scale) in [
-        (g, g, &[capgd, capgs][..], m),
-        (dp, dp, &[capgd][..], m),
-        (sp, sp, &[capgs][..], m),
-        (g, dp, &[capgd][..], -m),
-        (g, sp, &[capgs][..], -m),
-        (dp, g, &[capgd][..], -m),
-        (sp, g, &[capgs][..], -m),
-    ] {
-        context.scaled_dynamic_sum(row, col, terms, scale)?;
-    }
-    Ok(())
-}
-
 /// The `uic` initial conditions `[IC-VDS, IC-VGS]`: unset components are
 /// the external terminal voltages of the solution (`jfetic.c`,
 /// `jfet2ic.c`).
@@ -1510,35 +1467,27 @@ impl Device for Jfet {
         context: &mut LinearContext<'_>,
         bias: &Vector,
     ) -> SpiceResult<()> {
-        let op = self.operating(context.model_context)?;
-        let unknowns = context.unknowns;
-        let voltage = |n: NodeId| unknowns.node_row(n).and_then(|r| bias.get(r)).unwrap_or(0.);
-        let [vgs, vgd] = self.normalized(self.inner.map(voltage));
-        let e = self.evaluate(&op, vgs, vgd, context.model_context.gmin)?;
-        let m = self.instance.m;
-        ac_gate_capacitances(
-            context,
-            self.inner,
-            m,
-            e.gates[0].capacitance,
-            e.gates[1].capacitance,
-        )?;
-        ac_conductances(
+        self.linearization(context, bias)?.assemble_ac(
             context,
             &self.terminals,
             self.inner,
-            m,
-            [op.gdpr, op.gspr],
-            [e.load.gm, e.load.gds, e.load.ggs, e.load.ggd],
+            self.instance.m,
         )
     }
-    /// `jfetpzld.c` equals the AC load with `s` for `j omega`.
+    /// `jfetpzld.c`: the same physical terms as the AC load, but with
+    /// separate conductance and s*C statements.
     fn assemble_pole_zero(
         &self,
         context: &mut LinearContext<'_>,
         bias: &Vector,
     ) -> SpiceResult<()> {
-        self.assemble_small_signal(context, bias)
+        self.linearization(context, bias)?.assemble_pole_zero(
+            context,
+            &self.terminals,
+            self.inner,
+            self.instance.m,
+            GatePencil::Jfet,
+        )
     }
     fn noise(
         &self,

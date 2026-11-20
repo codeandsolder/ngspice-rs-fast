@@ -1227,8 +1227,8 @@ impl Device for Jfet2 {
                 context.scaled_dynamic_sum(row, col, &[op.capds], scale)?;
             }
         }
-        jfet::ac_gate_capacitances(context, self.inner, m, capgs, capgd)?;
-        jfet::ac_conductances(
+        jfet::linear::ac_gate_capacitances(context, self.inner, m, capgs, capgd)?;
+        jfet::linear::ac_conductances(
             context,
             &self.terminals,
             self.inner,
@@ -1702,7 +1702,7 @@ impl Device for ResetJfet2 {
             .collect();
         ResetStamps::new(&current.name, 'j', &current.terminals, stamps)?
             .assemble_linear(context)?;
-        jfet::ac_conductances(
+        jfet::linear::ac_conductances(
             context,
             &current.terminals,
             current.inner,
