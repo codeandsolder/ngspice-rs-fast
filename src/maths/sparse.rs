@@ -214,13 +214,22 @@ impl Pattern {
 
     /// This pattern plus new positions appended in order (existing ids keep
     /// their numbers).
+    ///
+    /// # Panics
+    /// If any new position is outside the pattern's dimensions, or the
+    /// element count exceeds the representable handle range.
     #[must_use]
     pub fn extended(&self, extra: impl IntoIterator<Item = (usize, usize)>) -> Self {
         let mut positions = self.positions.clone();
+        let mut appended = std::collections::HashSet::new();
         for (row, col) in extra {
+            assert!(
+                row < self.n && col < self.n,
+                "pattern position out of range"
+            );
             if self.find(row, col).is_none() {
                 let position = (to_u32(row), to_u32(col));
-                if !positions[self.positions.len()..].contains(&position) {
+                if appended.insert(position) {
                     positions.push(position);
                 }
             }
@@ -259,15 +268,20 @@ impl Pattern {
         if row >= self.n {
             return None;
         }
-        let (start, end) = (
-            self.row_start[row] as usize,
-            self.row_start[row + 1] as usize,
-        );
+        let (start, end) = self.row_bounds(row);
         let col = u32::try_from(col).ok()?;
         self.row_cols[start..end]
             .binary_search(&col)
             .ok()
             .map(|offset| ElementId(self.row_ids[start + offset]))
+    }
+
+    /// Index interval of one row within the row-major handle array.
+    fn row_bounds(&self, row: usize) -> (usize, usize) {
+        (
+            self.row_start[row] as usize,
+            self.row_start[row + 1] as usize,
+        )
     }
 
     /// Element ids in row-major position order.
@@ -626,18 +640,22 @@ impl SparseMatrix {
     /// Zeroes every element of `row` whose column `keep` rejects, keeping it
     /// in the structure (C `ZeroNoncurRow` in `cktload.c` stores `0.0`
     /// through `SMPfindElt`). Returns whether a kept column holds an element.
+    /// The predicate is a column selection, independent of traversal order.
     pub fn zero_row(&mut self, row: usize, keep: impl Fn(usize) -> bool) -> bool {
         let mut kept = false;
-        if let Some(bound) = &mut self.bound {
+        if let Some(bound) = &mut self.bound
+            && row < bound.pattern.order()
+        {
             bound.view.take();
-            for (index, value) in bound.values.iter_mut().enumerate() {
-                let (r, c) = bound.pattern.position(ElementId(to_u32(index)));
-                if r == row {
-                    if keep(c) {
-                        kept = true;
-                    } else {
-                        *value = 0.0;
-                    }
+            let (start, end) = bound.pattern.row_bounds(row);
+            for (&id, &col) in bound.pattern.row_ids[start..end]
+                .iter()
+                .zip(&bound.pattern.row_cols[start..end])
+            {
+                if keep(col as usize) {
+                    kept = true;
+                } else {
+                    bound.values[id as usize] = 0.0;
                 }
             }
         }
@@ -882,12 +900,21 @@ impl SparseMatrix {
         for row in 0..self.rows {
             graph.add_node(row);
         }
+        if let Some((pattern, values)) = self.bound_values() {
+            for id in pattern.sorted() {
+                let (row, col) = pattern.position(id);
+                if row != col && values[id.index()] != 0.0 {
+                    graph.add_edge(row, col, ());
+                }
+            }
+            return Ok(graph);
+        }
         let mut assembled = Cow::Borrowed(self);
         if !self.is_folded() {
             assembled.to_mut().fold_duplicates();
         }
         for triplet in assembled.triplets() {
-            if triplet.row != triplet.col {
+            if triplet.row != triplet.col && triplet.value != 0.0 {
                 graph.add_edge(triplet.row, triplet.col, ());
             }
         }
@@ -1031,6 +1058,50 @@ mod tests {
             values,
             [(1, 1), (2, 0), (0, 2), (3, 3)].map(|(r, c)| matrix.get(r, c).to_bits())
         );
+    }
+
+    #[test]
+    fn pattern_extension_preserves_old_handles_and_new_creation_order() {
+        let old = Pattern::new(4, [(3, 1), (0, 0)]);
+        let new = old.extended([(0, 0), (2, 3), (1, 2), (2, 3), (0, 1)]);
+        assert_eq!(new.len(), 5);
+        for (i, (r, c)) in [(3, 1), (0, 0), (2, 3), (1, 2), (0, 1)]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(new.find(r, c).unwrap().index(), i);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "pattern position out of range")]
+    fn extension_rejects_out_of_range_columns() {
+        let _ = Pattern::new(1, [(0, 0)]).extended([(0, 1)]);
+    }
+
+    #[test]
+    fn row_clearing_and_graph_use_current_nonzero_values() {
+        let mut plain = SparseMatrix::new(3, 3);
+        let pattern = Arc::new(Pattern::new(3, [(2, 0), (1, 2), (1, 0), (1, 1)]));
+        let mut bound = SparseMatrix::bound(pattern);
+        for (r, c, value) in [(2, 0, 7.), (1, 2, 4.), (1, 0, 3.), (1, 1, 2.)] {
+            plain.add(r, c, value).unwrap();
+            bound.add(r, c, value).unwrap();
+        }
+        plain.fold_duplicates();
+        for matrix in [&mut plain, &mut bound] {
+            assert!(matrix.zero_row(1, |col| col == 1));
+            assert!(!matrix.zero_row(9, |_| true));
+            assert_eq!(matrix.get(1, 1), 2.);
+            assert_eq!(matrix.get(1, 0), 0.);
+            assert_eq!(matrix.get(1, 2), 0.);
+            assert_eq!(matrix.get(2, 0), 7.);
+            let graph = matrix.coupling_graph().unwrap();
+            assert_eq!(graph.node_count(), 3);
+            assert_eq!(graph.edge_count(), 1);
+            assert!(graph.contains_edge(2, 0));
+        }
+        assert!(bound.bound.as_ref().unwrap().view.get().is_none());
     }
 
     use std::sync::Arc;

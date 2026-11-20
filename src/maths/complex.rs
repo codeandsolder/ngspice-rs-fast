@@ -264,17 +264,38 @@ impl ComplexMatrix {
                 }
             }
         }
-        for (row, col, v) in iter_dynamic_terms(e, groups, omega) {
-            let Some(id) = pattern.find(row, col) else {
-                return Ok(None);
-            };
-            let value = &mut values[id.index()];
-            value.im += v;
-            if !value.is_finite() {
-                return Err(numerical(
-                    "complex assembly",
-                    "non-finite coefficient/overflow",
-                ));
+        if groups.is_empty()
+            && let Some((_, dynamic)) = e
+                .bound_values()
+                .filter(|(source, _)| Arc::ptr_eq(source, pattern))
+        {
+            // An already accumulated E has only one coefficient per
+            // element. Preserve the previous zero-initialized addition,
+            // including the sign of an underflowed imaginary term.
+            for (value, &coefficient) in values.iter_mut().zip(dynamic) {
+                if coefficient != 0.0 {
+                    value.im += omega * coefficient;
+                    if !value.is_finite() {
+                        return Err(numerical(
+                            "complex assembly",
+                            "non-finite coefficient/overflow",
+                        ));
+                    }
+                }
+            }
+        } else {
+            for (row, col, v) in iter_dynamic_terms(e, groups, omega) {
+                let Some(id) = pattern.find(row, col) else {
+                    return Ok(None);
+                };
+                let value = &mut values[id.index()];
+                value.im += v;
+                if !value.is_finite() {
+                    return Err(numerical(
+                        "complex assembly",
+                        "non-finite coefficient/overflow",
+                    ));
+                }
             }
         }
         Ok(Some(Self {
@@ -480,6 +501,36 @@ impl ComplexLu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_dynamic_coefficients_match_triplet_path_bit_for_bit() {
+        let pattern = Arc::new(Pattern::new(2, [(1, 1), (0, 0), (0, 1), (1, 0)]));
+        let a = SparseMatrix::bound(Arc::clone(&pattern));
+        let mut e = SparseMatrix::bound(Arc::clone(&pattern));
+        e.set(1, 1, 0.5).unwrap();
+        e.set(0, 0, 1e-300).unwrap();
+        e.set(0, 1, -0.).unwrap();
+        e.set(1, 0, -1e-200).unwrap();
+        let mut plain = SparseMatrix::new(2, 2);
+        for t in e.triplets() {
+            plain.add(t.row, t.col, t.value).unwrap();
+        }
+        let bits = |e: &SparseMatrix, omega| {
+            let matrix = ComplexMatrix::from_operators_on(&pattern, &a, e, omega)
+                .unwrap()
+                .unwrap();
+            let Assembly::Bound { values, .. } = matrix.assembly else {
+                panic!("expected bound matrix");
+            };
+            values
+                .iter()
+                .map(|v| (v.re.to_bits(), v.im.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        for omega in [-2., 0., 1e-30, 1e200] {
+            assert_eq!(bits(&e, omega), bits(&plain, omega));
+        }
+    }
 
     #[test]
     fn bound_and_standalone_assembly_follow_stamp_order() {
