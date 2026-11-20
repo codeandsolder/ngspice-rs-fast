@@ -51,10 +51,6 @@
     reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
 )]
 #![expect(
-    clippy::too_many_lines,
-    reason = "a complete translated C numerical routine remains contiguous for equation parity review"
-)]
-#![expect(
     clippy::imprecise_flops,
     reason = "the original C floating-point algorithm and libm operation sequence must remain intact"
 )]
@@ -65,9 +61,10 @@
 
 mod sens;
 
+use crate::devices::mos::bulk::{BulkJunctions, BulkLaw};
 use crate::devices::mos::{
-    CELSIUS_TO_KELVIN, CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, Junction, K_OVER_Q,
-    MosLevel, Mosfet, NoiseShape, Operating, ReverseLaw, aliased, band_gap, p, required,
+    CELSIUS_TO_KELVIN, CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, K_OVER_Q, MosLevel,
+    Mosfet, NoiseShape, Operating, aliased, band_gap, p, required,
 };
 use crate::devices::noise::NoiseFamily;
 use crate::devices::nonlinear::thermal::SiliconTemperature;
@@ -274,7 +271,7 @@ impl Level3 {
         let process = self.process(tnom, label)?;
         let nominal = SiliconTemperature::new(tnom);
         let actual = SiliconTemperature::new(temp);
-        let (vt, vtnom) = (actual.vt, nominal.vt);
+        let vt = actual.vt;
         let (egfet, egfet1) = (actual.gap, nominal.gap);
         let ratio = temp / tnom;
         let ratio4 = ratio * ratio.sqrt();
@@ -285,52 +282,13 @@ impl Level3 {
             + 0.5 * (egfet1 - egfet)
             + model.pol * 0.5 * (phi - process.phi);
         let vto = vbi + model.pol * process.gamma * phi.sqrt();
-        let scale = (-egfet / vt + egfet1 / vtnom).exp();
-        let (saturation, density) = (model.is * scale, model.js * scale);
-        let correction = actual.potential.junction(&nominal.potential, model.pb);
-        let potential = correction.potential;
-        let (bottom, side) = (correction.factors(model.mj), correction.factors(model.mjsw));
+        let BulkJunctions {
+            drain,
+            source,
+            factors,
+        } = BulkLaw::Mos3.junctions(model, geometry, &nominal, &actual);
         let m = geometry.m;
         let (length, width) = self.effective(geometry);
-        // MOS3tCbd/MOS3tCbs/MOS3tCj and MOS3tCjsw; mos3temp.c multiplies
-        // `tCj * area * m` (mos1temp.c: `tCj * m * area`).
-        let scaled = |c: Real, factor: [Real; 2]| c * factor[0] * factor[1];
-        let bottom_cap = |given: Option<Real>, area: Real| match (given, model.cj) {
-            (Some(c), _) => scaled(c, bottom) * m,
-            (None, Some(cj)) => scaled(cj, bottom) * area * m,
-            (None, None) => 0.,
-        };
-        let side_cap = |perimeter: Real| model.cjsw.map_or(0., |c| scaled(c, side) * perimeter * m);
-        let root2 = std::f64::consts::SQRT_2;
-        // mos3temp.c tests the model's JS for the critical voltages,
-        // mos3load.c the scaled density for the saturation currents.
-        let (vcrit_d, vcrit_s) = if model.js == 0. || geometry.ad == 0. || geometry.as_ == 0. {
-            let vcrit = vt * (vt / (root2 * m * saturation)).ln();
-            (vcrit, vcrit)
-        } else {
-            (
-                vt * (vt / (root2 * m * density * geometry.ad)).ln(),
-                vt * (vt / (root2 * m * density * geometry.as_)).ln(),
-            )
-        };
-        let (sat_d, sat_s) = if density == 0. || geometry.ad == 0. || geometry.as_ == 0. {
-            (m * saturation, m * saturation)
-        } else {
-            (m * density * geometry.ad, m * density * geometry.as_)
-        };
-        let junction = |saturation, vcrit, bottom, sidewall| {
-            Junction::new(
-                saturation,
-                vcrit,
-                bottom,
-                sidewall,
-                model.mj,
-                model.mjsw,
-                potential,
-                model.fc,
-                ReverseLaw::Cubic,
-            )
-        };
         let oxide = process.cox * length * m * width;
         let csonco = if self.nfs == 0. {
             0.
@@ -345,18 +303,8 @@ impl Level3 {
             vto,
             gamma: process.gamma,
             oxide,
-            drain: junction(
-                sat_d,
-                vcrit_d,
-                bottom_cap(model.cbd, geometry.ad),
-                side_cap(geometry.pd),
-            ),
-            source: junction(
-                sat_s,
-                vcrit_s,
-                bottom_cap(model.cbs, geometry.as_),
-                side_cap(geometry.ps),
-            ),
+            drain,
+            source,
             overlap: [
                 model.overlap[0] * m * width,
                 model.overlap[1] * m * width,
@@ -380,7 +328,7 @@ impl Level3 {
             label,
             temp,
             &[p.mobility, p.eta, p.narrow, p.alpha, p.depletion, p.csonco],
-            &[bottom[0], bottom[1], side[0], side[1]],
+            &factors,
         )?;
         if p.mobility <= 0. {
             return Err(SpiceError::circuit(format!(

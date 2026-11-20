@@ -1114,17 +1114,13 @@ impl Bjt {
                 let (mut vbe, mut vbc, vbx, mut vsub) =
                     if states.phase() == crate::devices::IterationPhase::Predict {
                         let xfact = context.integration.map_or(1., |c| c.predictor_ratio());
-                        let pred = |slot| {
-                            states
-                                .predicted(slot, xfact)
-                                .ok_or_else(|| SpiceError::circuit("missing accepted BJT voltages"))
-                        };
-                        (
-                            pred(slot::VBE)?,
-                            pred(slot::VBC)?,
-                            pred(slot::VBX)?,
-                            pred(slot::VSUB)?,
+                        let [vbe, vbc, vbx, vsub] = limiting::predicted_values(
+                            states,
+                            [slot::VBE, slot::VBC, slot::VBX, slot::VSUB],
+                            xfact,
                         )
+                        .ok_or_else(|| SpiceError::circuit("missing accepted BJT voltages"))?;
+                        (vbe, vbc, vbx, vsub)
                     } else {
                         (raw.vbe, raw.vbc, raw.vbx, raw.vsub)
                     };

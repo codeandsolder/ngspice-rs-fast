@@ -35,9 +35,10 @@
 mod disto;
 mod sens;
 
+use crate::devices::mos::bulk::{BulkJunctions, BulkLaw};
 use crate::devices::mos::{
-    CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, Junction, K_OVER_Q, MosLevel, Mosfet,
-    NoiseShape, Operating, ReverseLaw, aliased, band_gap, p, required,
+    CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, K_OVER_Q, MosLevel, Mosfet, NoiseShape,
+    Operating, aliased, band_gap, p, required,
 };
 use crate::devices::noise::NoiseFamily;
 use crate::devices::nonlinear::thermal::SiliconTemperature;
@@ -265,7 +266,7 @@ impl MosLevel for Level1 {
         let process = self.process(tnom)?;
         let nominal = SiliconTemperature::new(tnom);
         let actual = SiliconTemperature::new(temp);
-        let (vt, vtnom) = (actual.vt, nominal.vt);
+        let vt = actual.vt;
         let (egfet, egfet1) = (actual.gap, nominal.gap);
         let ratio = temp / tnom;
         let kp = process.kp / (ratio * ratio.sqrt());
@@ -274,47 +275,13 @@ impl MosLevel for Level1 {
             + 0.5 * (egfet1 - egfet)
             + model.pol * 0.5 * (phi - process.phi);
         let vto = vbi + model.pol * process.gamma * phi.sqrt();
-        let scale = (-egfet / vt + egfet1 / vtnom).exp();
-        let (saturation, density) = (model.is * scale, model.js * scale);
-        let correction = actual.potential.junction(&nominal.potential, model.pb);
-        let potential = correction.potential;
-        let (bottom, side) = (correction.factors(model.mj), correction.factors(model.mjsw));
+        let BulkJunctions {
+            drain,
+            source,
+            factors,
+        } = BulkLaw::Mos1.junctions(model, geometry, &nominal, &actual);
         let m = geometry.m;
         let length = self.length(geometry);
-        // MOS1tCbd/MOS1tCbs/MOS1tCj and MOS1tCjsw.
-        let scaled = |c: Real, factor: [Real; 2]| c * factor[0] * factor[1];
-        let bottom_cap = |given: Option<Real>, area: Real| match (given, model.cj) {
-            (Some(c), _) => scaled(c, bottom) * m,
-            (None, Some(cj)) => scaled(cj, bottom) * m * area,
-            (None, None) => 0.,
-        };
-        let side_cap = |perimeter: Real| model.cjsw.map_or(0., |c| scaled(c, side) * perimeter * m);
-        let root2 = std::f64::consts::SQRT_2;
-        let (sat_d, sat_s, vcrit_d, vcrit_s) =
-            if density == 0. || geometry.ad == 0. || geometry.as_ == 0. {
-                let vcrit = vt * (vt / (root2 * m * saturation)).ln();
-                (m * saturation, m * saturation, vcrit, vcrit)
-            } else {
-                (
-                    density * m * geometry.ad,
-                    density * m * geometry.as_,
-                    vt * (vt / (root2 * m * density * geometry.ad)).ln(),
-                    vt * (vt / (root2 * m * density * geometry.as_)).ln(),
-                )
-            };
-        let junction = |saturation, vcrit, bottom, sidewall| {
-            Junction::new(
-                saturation,
-                vcrit,
-                bottom,
-                sidewall,
-                model.mj,
-                model.mjsw,
-                potential,
-                model.fc,
-                ReverseLaw::Constant,
-            )
-        };
         let operating = Operating {
             vt,
             beta: kp * m * geometry.w / length,
@@ -323,18 +290,8 @@ impl MosLevel for Level1 {
             vto,
             gamma: process.gamma,
             oxide: process.cox * length * m * geometry.w,
-            drain: junction(
-                sat_d,
-                vcrit_d,
-                bottom_cap(model.cbd, geometry.ad),
-                side_cap(geometry.pd),
-            ),
-            source: junction(
-                sat_s,
-                vcrit_s,
-                bottom_cap(model.cbs, geometry.as_),
-                side_cap(geometry.ps),
-            ),
+            drain,
+            source,
             overlap: [
                 model.overlap[0] * m * geometry.w,
                 model.overlap[1] * m * geometry.w,
@@ -344,13 +301,7 @@ impl MosLevel for Level1 {
                 lambda: self.lambda,
             },
         };
-        operating.check(
-            name,
-            "MOS1",
-            temp,
-            &[],
-            &[bottom[0], bottom[1], side[0], side[1]],
-        )?;
+        operating.check(name, "MOS1", temp, &[], &factors)?;
         Ok(operating)
     }
 

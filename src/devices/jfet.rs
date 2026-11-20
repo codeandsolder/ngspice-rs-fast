@@ -872,63 +872,51 @@ pub(super) fn select_junctions(
     ic: [Real; 2],
     xfact: Real,
 ) -> ([Real; 2], Start) {
-    if states.initial_conditions() {
-        let vds = j.pol * ic[0];
-        let vgs = j.pol * ic[1];
-        return ([vgs, vgs - vds], Start::Conditions);
-    }
-    if !states.device_limiting() {
-        return (raw, Start::Exact);
-    }
-    let phase = states.phase();
-    let new = match phase {
-        IterationPhase::Junction => {
+    use limiting::Linearization;
+    match Linearization::classify(states) {
+        Linearization::InitialConditions => {
+            let vds = j.pol * ic[0];
+            let vgs = j.pol * ic[1];
+            return ([vgs, vgs - vds], Start::Conditions);
+        }
+        Linearization::Exact => return (raw, Start::Exact),
+        Linearization::Initial => {
             let v = if j.off { 0. } else { -1. };
             return ([v, v], Start::Fixed);
         }
-        IterationPhase::Fix if j.off => return ([0.; 2], Start::HeldOff { raw }),
-        IterationPhase::Predict if states.initial_transient() => {
+        Linearization::InitialTransient => {
             let state1 = |slot: usize, fallback: Real| states.accepted(1, slot).unwrap_or(fallback);
             return (
                 [state1(slot::VGS, raw[0]), state1(slot::VGD, raw[1])],
                 Start::Fixed,
             );
         }
-        IterationPhase::Predict => [
-            states.predicted(slot::VGS, xfact),
-            states.predicted(slot::VGD, xfact),
+        Linearization::Limited => {}
+    }
+    let [vgs, vgd] = match states.phase() {
+        IterationPhase::Fix if j.off => return ([0.; 2], Start::HeldOff { raw }),
+        IterationPhase::Predict => {
+            let Some(predicted) = limiting::predicted_values(states, [slot::VGS, slot::VGD], xfact)
+            else {
+                return (raw, Start::Exact);
+            };
+            predicted
+        }
+        _ => raw,
+    };
+    let Some([vgs0, vgd0, cg0, cd0, gm0, gds0, ggs0, ggd0]) = limiting::previous_values(
+        states,
+        [
+            slot::VGS,
+            slot::VGD,
+            slot::CG,
+            slot::CD,
+            slot::GM,
+            slot::GDS,
+            slot::GGS,
+            slot::GGD,
         ],
-        IterationPhase::Fix | IterationPhase::Float => raw.map(Some),
-    };
-    let old = |slot: usize| match phase {
-        IterationPhase::Predict => states.accepted(1, slot),
-        _ => states.iterate(slot),
-    };
-    let [Some(vgs), Some(vgd)] = new else {
-        return (raw, Start::Exact);
-    };
-    let previous = [
-        slot::VGS,
-        slot::VGD,
-        slot::CG,
-        slot::CD,
-        slot::GM,
-        slot::GDS,
-        slot::GGS,
-        slot::GGD,
-    ]
-    .map(|slot| old(slot).filter(|v| v.is_finite()));
-    let [
-        Some(vgs0),
-        Some(vgd0),
-        Some(cg0),
-        Some(cd0),
-        Some(gm0),
-        Some(gds0),
-        Some(ggs0),
-        Some(ggd0),
-    ] = previous
-    else {
+    ) else {
         return ([vgs, vgd], Start::Exact);
     };
     let delvgs = vgs - vgs0;

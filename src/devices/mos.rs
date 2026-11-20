@@ -78,6 +78,7 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
+pub(super) mod bulk;
 pub(super) mod sens;
 
 use crate::devices::nonlinear::thermal::{TemperatureCache, TemperatureKey};
@@ -1174,15 +1175,14 @@ impl<L: MosLevel> Mosfet<L> {
     ) -> ([Real; 3], Start, bool) {
         let pol = self.model.common().pol;
         let off = self.initial.off;
-        if states.initial_conditions() {
-            let v = if off { [0.; 3] } else { ic.map(|v| pol * v) };
-            return (v, Start::Conditions, true);
-        }
-        if !states.device_limiting() {
-            return (raw, Start::Exact, false);
-        }
-        match states.phase() {
-            IterationPhase::Junction => {
+        use limiting::Linearization;
+        match Linearization::classify(states) {
+            Linearization::InitialConditions => {
+                let v = if off { [0.; 3] } else { ic.map(|v| pol * v) };
+                return (v, Start::Conditions, true);
+            }
+            Linearization::Exact => return (raw, Start::Exact, false),
+            Linearization::Initial => {
                 let v = if off {
                     [0.; 3]
                 } else {
@@ -1193,29 +1193,21 @@ impl<L: MosLevel> Mosfet<L> {
                         v
                     }
                 };
-                (v, Start::Junction, true)
+                return (v, Start::Junction, true);
             }
+            // MOS retains DEVpred for both MODEINITTRAN and MODEINITPRED.
+            Linearization::InitialTransient | Linearization::Limited => {}
+        }
+        match states.phase() {
             IterationPhase::Fix if off => ([0.; 3], Start::HeldOff, true),
             IterationPhase::Predict => {
-                let accepted = |slot: usize| states.accepted(1, slot);
-                let predicted = |slot: usize| states.predicted(slot, xfact);
-                let (
-                    Some(vbs),
-                    Some(vgs),
-                    Some(vds),
-                    Some(old_vbs),
-                    Some(old_vgs),
-                    Some(old_vds),
-                    Some(von),
-                ) = (
-                    predicted(slot::VBS),
-                    predicted(slot::VGS),
-                    predicted(slot::VDS),
-                    accepted(slot::VBS),
-                    accepted(slot::VGS),
-                    accepted(slot::VDS),
-                    accepted(slot::VON),
-                )
+                let Some([vbs, vgs, vds]) =
+                    limiting::predicted_values(states, [slot::VBS, slot::VGS, slot::VDS], xfact)
+                else {
+                    return (raw, Start::Exact, false);
+                };
+                let Some([old_vbs, old_vgs, old_vds, von]) =
+                    limiting::previous_values(states, [slot::VBS, slot::VGS, slot::VDS, slot::VON])
                 else {
                     return (raw, Start::Exact, false);
                 };
@@ -1223,14 +1215,10 @@ impl<L: MosLevel> Mosfet<L> {
                 let (v, check) = self.limit(op, [vbs, vgs, vds], old, von);
                 (v, Start::Limited, check)
             }
-            IterationPhase::Fix | IterationPhase::Float => {
-                let previous = |slot: usize| states.iterate(slot).filter(|v| v.is_finite());
-                let (Some(old_vbs), Some(old_vbd), Some(old_vgs), Some(old_vds), Some(von)) = (
-                    previous(slot::VBS),
-                    previous(slot::VBD),
-                    previous(slot::VGS),
-                    previous(slot::VDS),
-                    previous(slot::VON),
+            _ => {
+                let Some([old_vbs, old_vbd, old_vgs, old_vds, von]) = limiting::previous_values(
+                    states,
+                    [slot::VBS, slot::VBD, slot::VGS, slot::VDS, slot::VON],
                 ) else {
                     return (raw, Start::Exact, false);
                 };

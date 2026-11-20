@@ -63,10 +63,6 @@
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
 )]
 #![expect(
-    clippy::too_many_lines,
-    reason = "a complete translated C numerical routine remains contiguous for equation parity review"
-)]
-#![expect(
     clippy::suboptimal_flops,
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
@@ -75,9 +71,10 @@ mod sens;
 
 use crate::devices::ModelContext;
 use crate::devices::ResolvedModel;
+use crate::devices::mos::bulk::{BulkJunctions, BulkLaw};
 use crate::devices::mos::{
-    CELSIUS_TO_KELVIN, CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, Junction, K_OVER_Q,
-    MosLevel, Mosfet, Operating, ReverseLaw, aliased, band_gap, p, required,
+    CELSIUS_TO_KELVIN, CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, K_OVER_Q, MosLevel,
+    Mosfet, Operating, aliased, band_gap, p, required,
 };
 use crate::devices::nonlinear::thermal::SiliconTemperature;
 use crate::devices::schema::{
@@ -372,7 +369,7 @@ impl MosLevel for Level6 {
         let process = self.process(tnom)?;
         let nominal = SiliconTemperature::new(tnom);
         let actual = SiliconTemperature::new(temp);
-        let (vt, vtnom) = (actual.vt, nominal.vt);
+        let vt = actual.vt;
         let (egfet, egfet1) = (actual.gap, nominal.gap);
         let ratio = temp / tnom;
         let kc = process.kc / (ratio * ratio.sqrt());
@@ -381,54 +378,13 @@ impl MosLevel for Level6 {
             + 0.5 * (egfet1 - egfet)
             + model.pol * 0.5 * (phi - process.phi);
         let vto = vbi + model.pol * process.gamma * phi.sqrt();
-        // mos6temp.c: divide out the nominal-temperature factor, then
-        // multiply by the device-temperature one, as two steps.
-        let scale = (-egfet / vt + egfet1 / vtnom).exp();
-        let (saturation, density) = (model.is * scale, model.js * scale);
-        let correction = actual.potential.junction(&nominal.potential, model.pb);
-        let potential = correction.potential;
-        let (bottom, side) = (correction.factors(model.mj), correction.factors(model.mjsw));
+        let BulkJunctions {
+            drain,
+            source,
+            factors,
+        } = BulkLaw::Mos6.junctions(model, geometry, &nominal, &actual);
         let m = geometry.m;
         let length = self.length(geometry);
-        // C stores the nominal-scaled capacitance, then multiplies by
-        // the actual factor; area precedes M for derived CJ.
-        let scaled = |c: Real, factor: [Real; 2]| c * factor[0] * factor[1];
-        let bottom_cap = |given: Option<Real>, area: Real| match (given, model.cj) {
-            (Some(c), _) => scaled(c, bottom) * m,
-            (None, Some(cj)) => scaled(cj, bottom) * area * m,
-            (None, None) => 0.,
-        };
-        let side_cap = |perimeter: Real| model.cjsw.map_or(0., |c| scaled(c, side) * perimeter * m);
-        let root2 = std::f64::consts::SQRT_2;
-        // mos6temp.c derives `vcrit` from the per-unit-device saturation
-        // current -- its expression has no `MOS6m`, where mos1temp.c scales
-        // by `MOS1m` -- while the stamped saturation keeps the `M` factor of
-        // mos6load.c's whole-stamp multiplication.
-        let (sat_d, sat_s, vcrit_d, vcrit_s) =
-            if density == 0. || geometry.ad == 0. || geometry.as_ == 0. {
-                let vcrit = vt * (vt / (root2 * saturation)).ln();
-                (m * saturation, m * saturation, vcrit, vcrit)
-            } else {
-                (
-                    density * m * geometry.ad,
-                    density * m * geometry.as_,
-                    vt * (vt / (root2 * density * geometry.ad)).ln(),
-                    vt * (vt / (root2 * density * geometry.as_)).ln(),
-                )
-            };
-        let junction = |saturation, vcrit, bottom, sidewall| {
-            Junction::new(
-                saturation,
-                vcrit,
-                bottom,
-                sidewall,
-                model.mj,
-                model.mjsw,
-                potential,
-                model.fc,
-                ReverseLaw::Constant,
-            )
-        };
         let betac = kc * m * geometry.w / length;
         let operating = Operating {
             vt,
@@ -438,18 +394,8 @@ impl MosLevel for Level6 {
             vto,
             gamma: process.gamma,
             oxide: process.cox * length * m * geometry.w,
-            drain: junction(
-                sat_d,
-                vcrit_d,
-                bottom_cap(model.cbd, geometry.ad),
-                side_cap(geometry.pd),
-            ),
-            source: junction(
-                sat_s,
-                vcrit_s,
-                bottom_cap(model.cbs, geometry.as_),
-                side_cap(geometry.ps),
-            ),
+            drain,
+            source,
             overlap: [
                 model.overlap[0] * m * geometry.w,
                 model.overlap[1] * m * geometry.w,
@@ -487,13 +433,15 @@ impl MosLevel for Level6 {
         ]
         .iter()
         .all(|v| v.is_finite());
-        if !(finite && phi.is_finite() && phi > 0. && potential.is_finite() && potential > 0.)
+        if !(finite
+            && phi.is_finite()
+            && phi > 0.
+            && drain.potential.is_finite()
+            && drain.potential > 0.)
             || operating.params.betac < 0.
             || operating.drain.saturation <= 0.
             || operating.source.saturation <= 0.
-            || [bottom[0], bottom[1], side[0], side[1]]
-                .iter()
-                .any(|f| !f.is_finite() || *f < 0.)
+            || factors.iter().any(|f| !f.is_finite() || *f < 0.)
         {
             return Err(SpiceError::circuit(format!(
                 "{}: MOS6 parameters are out of range at {:.2} K \
@@ -629,7 +577,7 @@ impl MosLevel for Level6 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devices::mos::Junction;
+    use crate::devices::mos::{Junction, ReverseLaw};
 
     fn junction() -> Junction {
         // Saturation, vcrit, bottom, sidewall, mj, mjsw, potential, fc,
