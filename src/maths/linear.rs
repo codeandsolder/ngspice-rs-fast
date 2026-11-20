@@ -285,7 +285,7 @@ impl CachedFrame {
             Self::Complex(ComplexFactors { sparse }) => SparseSymbolic {
                 n: pattern.order(),
                 key: Key::Pattern(Arc::downgrade(pattern)),
-                sparse: Arc::new(Arc::unwrap_or_clone(sparse).into_retyped()),
+                sparse: Arc::new(Sparse::retype_shared(sparse)),
                 factored: None,
             },
         }
@@ -444,22 +444,17 @@ pub(in crate::maths) fn factor_shared_complex(
     names: Option<&UnknownNames>,
 ) -> SpiceResult<ComplexFactors> {
     pattern.with_ordering(|state| {
-    let n = pattern.order();
     let (mut sparse, fresh) = match state.frame.take() {
         Some(CachedFrame::Real(symbolic)) if matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern))) => {
-            (Arc::new(Arc::unwrap_or_clone(symbolic.sparse).into_retyped()), false)
+            (Arc::new(Sparse::retype_shared(symbolic.sparse)), false)
         }
         Some(CachedFrame::Complex(ComplexFactors { sparse })) => (sparse, false),
         _ => {
-            let mut sparse = Sparse::<Complex>::new(n);
-            for (index, &value) in values.iter().enumerate() {
-                let (row, col) = pattern.position(crate::maths::sparse::element_id(index));
-                sparse.append_original(row + 1, col + 1, value);
-            }
+            let sparse=Sparse::from_pattern(pattern,values);
             (Arc::new(sparse), true)
         }
     };
-    let numeric = Arc::make_mut(&mut sparse);
+    let numeric = Sparse::for_reload(&mut sparse);
     if !fresh { numeric.reload_originals(values); }
     let result = if fresh {
         state.ac_reorder = false;
@@ -516,7 +511,7 @@ impl LoadedFrame {
 
     /// Reload coefficients in handle order, keeping fill-ins and pivot order.
     fn reload(&mut self, matrix: &SparseMatrix) {
-        let sparse = Arc::make_mut(&mut self.sparse);
+        let sparse = Sparse::for_reload(&mut self.sparse);
         if let Some((_, values)) = matrix.bound_values() {
             sparse.reload_originals(values);
         } else {
@@ -555,11 +550,7 @@ impl LoadedFrame {
 /// Build the initial frame from a validated, assembled matrix.
 fn fresh_frame(matrix: &SparseMatrix) -> LoadedFrame {
     if let Some((pattern, values)) = matrix.bound_values() {
-        let mut sparse = Sparse::new(pattern.order());
-        for (index, &value) in values.iter().enumerate() {
-            let (row, col) = pattern.position(crate::maths::sparse::element_id(index));
-            sparse.append_original(row + 1, col + 1, value);
-        }
+        let sparse = Sparse::from_pattern(pattern, values);
         return LoadedFrame {
             sparse: Arc::new(sparse),
             key: Key::Pattern(Arc::downgrade(pattern)),
@@ -568,10 +559,13 @@ fn fresh_frame(matrix: &SparseMatrix) -> LoadedFrame {
     }
     let n = matrix.rows();
     let pattern: Vec<_> = matrix.triplets().iter().map(|t| (t.row, t.col)).collect();
-    let mut sparse = Sparse::new(n);
-    for t in matrix.triplets() {
-        sparse.append_original(t.row + 1, t.col + 1, t.value);
-    }
+    let sparse = Sparse::from_originals(
+        n,
+        matrix
+            .triplets()
+            .iter()
+            .map(|t| (t.row + 1, t.col + 1, t.value)),
+    );
     LoadedFrame {
         sparse: Arc::new(sparse),
         key: Key::Triplets(Arc::new(pattern)),
@@ -900,18 +894,19 @@ impl DenseLu {
             return Err(numerical("dense LU", "non-finite coefficient"));
         }
         let n = matrix.rows();
-        let mut sparse = Sparse::new(n);
-        // The input already has one coefficient per position in row-major
-        // order. Build the frame in exactly the old folded-triplet element
-        // creation order; no temporary triplets, sort, key, handles or Arc.
-        for (row, values) in matrix.data().chunks_exact(n).enumerate() {
-            for (col, &value) in values.iter().enumerate() {
-                if value != 0.0 {
-                    let element = sparse.get_element(row + 1, col + 1);
-                    sparse.set(element, value);
-                }
-            }
-        }
+        // Unique nonzero entries in the same folded row-major creation order.
+        let entries = matrix
+            .data()
+            .chunks_exact(n)
+            .enumerate()
+            .flat_map(|(row, values)| {
+                values
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| **v != 0.)
+                    .map(move |(col, &v)| (row + 1, col + 1, v))
+            });
+        let mut sparse = Sparse::from_originals(n, entries);
         order_fresh(
             "dense LU",
             &mut sparse,
