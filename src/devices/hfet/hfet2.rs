@@ -67,6 +67,7 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
+use super::NodeSetup;
 use super::{CELSIUS_TO_KELVIN, HFET_INSTANCE as INSTANCE, HfetInstance as Instance};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{BOLTZMANN, CHARGE, p};
@@ -86,7 +87,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
 
 /// C `CONSTKoverQ`.
 const K_OVER_Q: Real = BOLTZMANN / CHARGE;
@@ -369,39 +370,12 @@ impl Hfet2 {
         let (model, model_defaults) = Model::resolve(resolved)?;
         let (initial, setters) = Instance::resolve(i)?;
         let instance = Instance::validate(&model_defaults, &setters, &i.location)?;
-        let mut staged = nodes.clone();
-        let external: Vec<NodeId> = i.nodes.iter().map(|n| staged.intern(n)).collect();
-        let mut terminals = external.clone();
-        let mut nodes_of = Nodes {
-            d: external[0],
-            g: external[1],
-            s: external[2],
-            sp: external[2],
-            dp: external[0],
-        };
-        // `hfet2setup.c` creates `#source` for RS and `#drain` for RD, in that
-        // order, and falls back to the external node when a resistance is
-        // zero. There is no gate or prime-prime node at this level.
-        let mut create = |resistance: Real, suffix: &str, target: &mut NodeId| -> SpiceResult<()> {
-            if resistance == 0. {
-                return Ok(());
-            }
-            let name = format!("{}#{suffix}", i.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "{}: HFET2 internal-node name collision: {name}",
-                    i.name
-                )));
-            }
-            let internal = staged.intern(&name);
-            staged.set_kind(internal, NodeKind::Internal);
-            terminals.push(internal);
-            *target = internal;
-            Ok(())
-        };
-        create(model.rs, "source", &mut nodes_of.sp)?;
-        create(model.rd, "drain", &mut nodes_of.dp)?;
-        *nodes = staged;
+        let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "HFET2");
+        // C creates source and drain primes in this order.
+        let sp = topology.prime(model.rs, "source", s)?;
+        let dp = topology.prime(model.rd, "drain", d)?;
+        let nodes_of = Nodes { d, g, s, sp, dp };
+        let (staged, terminals) = topology.finish();
         let device = Self {
             name: i.name.clone(),
             model_name: resolved.card().name.clone(),
@@ -412,6 +386,7 @@ impl Hfet2 {
             initial,
         };
         device.derived(context.temperature)?;
+        *nodes = staged;
         Ok(Box::new(device))
     }
 

@@ -47,7 +47,58 @@ use crate::devices::schema::{
 };
 use crate::devices::{ModelFamily, ResolvedModel};
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
+
+/// Staged node setup common to the three MESA/HFET levels.
+/// The caller publishes the table only after temperature derivation succeeds.
+struct NodeSetup<'a> {
+    staged: NodeTable,
+    terminals: Vec<NodeId>,
+    name: &'a str,
+    family: &'static str,
+}
+
+impl<'a> NodeSetup<'a> {
+    fn new(
+        nodes: &NodeTable,
+        instance: &'a DeviceInstance,
+        family: &'static str,
+    ) -> (Self, [NodeId; 3]) {
+        let mut staged = nodes.clone();
+        let external = std::array::from_fn(|i| staged.intern(&instance.nodes[i]));
+        (
+            Self {
+                staged,
+                terminals: external.to_vec(),
+                name: &instance.name,
+                family,
+            },
+            external,
+        )
+    }
+
+    /// C creates a prime only for a nonzero resistance; otherwise it aliases the parent.
+    fn prime(&mut self, resistance: Real, suffix: &str, parent: NodeId) -> SpiceResult<NodeId> {
+        if resistance == 0. {
+            return Ok(parent);
+        }
+        let name = format!("{}#{suffix}", self.name);
+        if self.staged.get(&name).is_some() {
+            return Err(SpiceError::circuit(format!(
+                "{}: {} internal-node name collision: {name}",
+                self.name, self.family
+            )));
+        }
+        let internal = self.staged.intern(&name);
+        self.staged.set_kind(internal, NodeKind::Internal);
+        self.terminals.push(internal);
+        Ok(internal)
+    }
+
+    fn finish(self) -> (NodeTable, Vec<NodeId>) {
+        (self.staged, self.terminals)
+    }
+}
 
 /// C `CONSTCtoK`.
 pub(super) const CELSIUS_TO_KELVIN: Real = 273.15;
@@ -465,6 +516,63 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_temperature_setup_does_not_publish_nodes() {
+        use crate::devices::models::ModelResolver;
+        use crate::devices::{Device, ModelContext};
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use std::path::Path;
+
+        type Instantiate = fn(
+            &DeviceInstance,
+            &mut NodeTable,
+            &ResolvedModel<'_>,
+            &ModelContext,
+        ) -> SpiceResult<Box<dyn Device>>;
+        for (base, level, instantiate) in [
+            ("nmf", 2, mesa::Mesa::instantiate as Instantiate),
+            ("nhfet", 5, hfet1::Hfet1::instantiate as Instantiate),
+            ("nhfet", 6, hfet2::Hfet2::instantiate as Instantiate),
+        ] {
+            let deck = Parser::new().parse_deck(&parse_deck_text(
+                Path::new("hfet-setup.cir"),
+                &format!("Setup transaction\nz1 drain gate source test\n.model test {base} level={level} rs=10 rd=20\n.end\n"),
+            )).unwrap();
+            let instance = &deck.devices[0];
+            let resolver = ModelResolver::new(&deck.models).unwrap();
+            let resolved = resolver.resolve(instance).unwrap().unwrap();
+            let mut nodes = NodeTable::new();
+            let existing = nodes.intern("existing");
+            let count = nodes.len();
+            let Err(error) = instantiate(
+                instance,
+                &mut nodes,
+                &resolved,
+                &ModelContext::new(-CELSIUS_TO_KELVIN, 27.),
+            ) else {
+                panic!("invalid temperature accepted for level {level}");
+            };
+            assert!(
+                error.to_string().contains("temperature derivation"),
+                "{error}"
+            );
+            assert_eq!(nodes.len(), count);
+            assert_eq!(nodes.get("existing"), Some(existing));
+            assert_eq!(nodes.get("drain"), None);
+            assert_eq!(nodes.get("z1#source"), None);
+            let device = instantiate(
+                instance,
+                &mut nodes,
+                &resolved,
+                &ModelContext::new(27., 27.),
+            )
+            .unwrap();
+            assert_eq!(device.terminals().len(), 5);
+            assert_eq!(device.terminals()[3], nodes.get("z1#source").unwrap());
+            assert_eq!(device.terminals()[4], nodes.get("z1#drain").unwrap());
+        }
+    }
 
     #[test]
     fn hfet_temperature_uses_explicit_value_or_circuit_offset_in_c_order() {

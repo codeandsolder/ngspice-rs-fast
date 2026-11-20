@@ -52,6 +52,7 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
+use super::NodeSetup;
 use crate::devices::hfet::{Instance, Model};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{BOLTZMANN, CHARGE};
@@ -68,7 +69,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
 
 /// `mesaload.c`'s `#define EPSILONGAAS (12.244*8.85418e-12)`, the same value
 /// `mesasetup.c` defaults `MESAepsi` to. The modern `eps0`
@@ -279,56 +280,26 @@ impl Mesa {
         let (model, model_defaults) = Model::resolve(resolved)?;
         let (initial, setters) = Instance::resolve(i)?;
         let instance = Instance::validate(&model_defaults, &setters, &i.location)?;
-        let mut staged = nodes.clone();
-        let external: Vec<NodeId> = i.nodes.iter().map(|n| staged.intern(n)).collect();
-        let mut terminals = external.clone();
-        let mut nodes_of = Nodes {
-            d: external[0],
-            g: external[1],
-            s: external[2],
-            sp: external[2],
-            dp: external[0],
-            gp: external[1],
-            spp: external[2],
-            dpp: external[0],
+        let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "MESA");
+        // C creates source and drain primes in this order.
+        // Gate and prime-prime nodes follow, aliasing the corresponding prime
+        // when RG, RI or RF is zero. RDI/RSI do not create nodes.
+        let sp = topology.prime(model.rs, "source", s)?;
+        let dp = topology.prime(model.rd, "drain", d)?;
+        let gp = topology.prime(model.rg, "gate", g)?;
+        let spp = topology.prime(model.ri, "gs", sp)?;
+        let dpp = topology.prime(model.rf, "gd", dp)?;
+        let nodes_of = Nodes {
+            d,
+            g,
+            s,
+            sp,
+            dp,
+            gp,
+            spp,
+            dpp,
         };
-        // `mesasetup.c` creates `#source` for RS, `#drain` for RD, `#gate` for
-        // RG, `#gs` for RI and `#gd` for RF, in that order, and falls back to
-        // the unfurled node when a resistance is zero: the prime-prime pair
-        // becomes the prime pair. `rdi`/`rsi` create no node at all;
-        // `mesatemp.c` folds them into the channel's series terms. The
-        // reference binary's rawfile omits `#source`/`#drain` (`outitf.c`'s
-        // skip list), not the model: `show` reports `dprimenode`/`sprimenode`
-        // and `rd=1e6 rs=1e6` collapses the current to `0.5/(rd+rs)`.
-        let mut create = |resistance: Real, suffix: &str, target: &mut NodeId| -> SpiceResult<()> {
-            if resistance == 0. {
-                return Ok(());
-            }
-            let name = format!("{}#{suffix}", i.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "{}: MESA internal-node name collision: {name}",
-                    i.name
-                )));
-            }
-            let internal = staged.intern(&name);
-            staged.set_kind(internal, NodeKind::Internal);
-            terminals.push(internal);
-            *target = internal;
-            Ok(())
-        };
-        create(model.rs, "source", &mut nodes_of.sp)?;
-        create(model.rd, "drain", &mut nodes_of.dp)?;
-        create(model.rg, "gate", &mut nodes_of.gp)?;
-        create(model.ri, "gs", &mut nodes_of.spp)?;
-        if model.ri == 0. {
-            nodes_of.spp = nodes_of.sp;
-        }
-        create(model.rf, "gd", &mut nodes_of.dpp)?;
-        if model.rf == 0. {
-            nodes_of.dpp = nodes_of.dp;
-        }
-        *nodes = staged;
+        let (staged, terminals) = topology.finish();
         let device = Self {
             name: i.name.clone(),
             model_name: resolved.card().name.clone(),
@@ -341,6 +312,7 @@ impl Mesa {
         };
         // Validate the derivations before the device joins the circuit.
         device.derived(context.temperature, context.nominal_temperature)?;
+        *nodes = staged;
         Ok(Box::new(device))
     }
 
