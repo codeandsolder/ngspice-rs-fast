@@ -413,24 +413,18 @@ fn zaddeq(x: Real, xmag: i64, y: Real, ymag: i64) -> SpiceResult<(Real, i64)> {
 }
 
 fn sgn(x: Real) -> i32 {
-    if x < 0.0 {
-        -1
-    } else if x == 0.0 {
-        0
-    } else {
-        1
-    }
+    if x < 0.0 { -1 } else { i32::from(x != 0.0) }
 }
 
 /// C `logb`: the unbiased binary exponent of a nonzero finite value.
-fn logb(x: Real) -> Real {
-    Real::from(
-        crate::primitives::value::binary_exponent(x).expect("finite nonzero determinant component"),
-    )
+fn logb(x: Real) -> SpiceResult<Real> {
+    crate::primitives::value::binary_exponent(x)
+        .map(Real::from)
+        .ok_or_else(|| numerical("pole-zero search", "invalid determinant component exponent"))
 }
 
 /// `SMPcDProd`: SPARSE's `mantissa * 10^p` as a base-2 mantissa/exponent.
-fn base2_determinant(mantissa: Complex, p: i32) -> (Cx, i64) {
+fn base2_determinant(mantissa: Complex, p: i32) -> SpiceResult<(Cx, i64)> {
     let (mut re, mut im) = (mantissa.re, mantissa.im);
     let mut y = Real::from(p) * std::f64::consts::LN_10 / std::f64::consts::LN_2;
     let x = y.trunc();
@@ -438,13 +432,10 @@ fn base2_determinant(mantissa: Complex, p: i32) -> (Cx, i64) {
     let z = 2.0_f64.powf(y);
     re *= z;
     im *= z;
-    let (mut y, z) = if re != 0.0 {
-        (logb(re), if im != 0.0 { logb(im) } else { 0.0 })
-    } else if im != 0.0 {
-        (0.0, logb(im))
-    } else {
-        (0.0, 0.0)
-    };
+    // C treats a zero component as exponent zero, even when the other
+    // component has a negative exponent. Do not drop that convention.
+    let mut y = if re == 0.0 { 0.0 } else { logb(re)? };
+    let z = if im == 0.0 { 0.0 } else { logb(im)? };
     if y < z {
         y = z;
     }
@@ -458,7 +449,7 @@ fn base2_determinant(mantissa: Complex, p: i32) -> (Cx, i64) {
         reason = "the C pole-zero scaling algorithm intentionally truncates its exponent to i32"
     )]
     let shift = 2.0_f64.powi(-(y as i32));
-    (Cx::new(re * shift, im * shift), exponent)
+    Ok((Cx::new(re * shift, im * shift), exponent))
 }
 
 #[derive(Debug, Clone)]
@@ -510,7 +501,7 @@ impl<'a> LoadedPencil<'a> {
         }
     }
 
-    /// CKTpzLoad + SMPcReorder + SMPcDProd; no MNA preorder.
+    /// `CKTpzLoad` + `SMPcReorder` + `SMPcDProd`; no MNA preorder.
     fn determinant_at(&mut self, s: Cx) -> SpiceResult<Option<(Cx, i64)>> {
         if !s.re.is_finite() || !s.im.is_finite() {
             return Err(numerical("pole-zero search", "non-finite trial frequency"));
@@ -548,7 +539,7 @@ impl<'a> LoadedPencil<'a> {
             )),
             Status::Okay | Status::SmallPivot => {
                 let (mantissa, exponent) = sparse.determinant()?;
-                Ok(Some(base2_determinant(mantissa, exponent)))
+                base2_determinant(mantissa, exponent).map(Some)
             }
         }
     }
@@ -620,8 +611,19 @@ pub fn pencil_load_roots(load: &PencilLoad) -> SpiceResult<PencilRoots> {
 }
 
 impl Search<'_> {
-    fn s(&self, i: Option<usize>) -> Cx {
-        self.trials[i.expect("C dereferences this neighborhood entry")].s
+    fn neighborhood_trial(&self, index: Option<usize>) -> SpiceResult<&Trial> {
+        index
+            .and_then(|index| self.trials.get(index))
+            .ok_or_else(|| {
+                numerical(
+                    "pole-zero search",
+                    "missing neighborhood trial for search strategy",
+                )
+            })
+    }
+
+    fn s(&self, index: Option<usize>) -> SpiceResult<Cx> {
+        self.neighborhood_trial(index).map(|trial| trial.s)
     }
 
     /// `CKTpzFindZeros`.
@@ -649,7 +651,7 @@ impl Search<'_> {
                     self.niter = 0;
                     self.reset(&mut set);
                 } else {
-                    self.update_set(&mut set, new);
+                    self.update_set(&mut set, new)?;
                 }
             } else if flags & ISANABERRATION != 0 {
                 self.reset(&mut set);
@@ -657,13 +659,13 @@ impl Search<'_> {
             } else if flags & ISAMINIMA != 0 {
                 set = [None, Some(new), None];
             } else {
-                self.update_set(&mut set, new);
+                self.update_set(&mut set, new)?;
             }
             let spread = self.high_guess - self.low_guess;
             let open = set[0].is_none()
                 || set[2].is_none()
                 || self.trapped != 0
-                || self.s(set[2]).re - self.s(set[0]).re < 1e22;
+                || self.s(set[2])?.re - self.s(set[0])?.re < 1e22;
             if !(spread < 1e40
                 && self.nzeros < self.max_zeros
                 && self.niter < NITER_LIM
@@ -752,7 +754,7 @@ impl Search<'_> {
             }
             SYM | SYM2 => {
                 trial.s = Cx::new(self.sym2(set)?, 0.0);
-                let (s0, s1) = (self.s(set[0]), self.s(set[1]));
+                let (s0, s1) = (self.s(set[0])?, self.s(set[1])?);
                 match self.trapped {
                     1 => {
                         if trial.s.re < s0.re || trial.s.re > s1.re {
@@ -760,13 +762,13 @@ impl Search<'_> {
                         }
                     }
                     2 => {
-                        let s2 = self.s(set[2]);
+                        let s2 = self.s(set[2])?;
                         if trial.s.re < s1.re || trial.s.re > s2.re {
                             trial.s.re = (s1.re + s2.re) / 2.0;
                         }
                     }
                     3 => {
-                        let s2 = self.s(set[2]);
+                        let s2 = self.s(set[2])?;
                         if trial.s.re <= s0.re
                             || (trial.s.re == s1.re && trial.s.im == s1.im)
                             || trial.s.re >= s2.re
@@ -786,7 +788,7 @@ impl Search<'_> {
                 }
             }
             COMPLEX_INIT => {
-                trial.s.re = self.s(set[1]).re;
+                trial.s.re = self.s(set[1])?.re;
                 if self.pz_k != 0.0 && self.pz_k_mag > -10 {
                     trial.s.im = materialize_power(self.pz_k, self.pz_k_mag);
                 } else {
@@ -796,15 +798,15 @@ impl Search<'_> {
                 self.pz_k_mag = 0;
             }
             COMPLEX_GUESS => {
-                trial.s.re = self.s(set[0]).re;
+                trial.s.re = self.s(set[0])?.re;
                 trial.s.im = if set[2].is_none() { 1.0e8 } else { 1.0e12 };
             }
             MULLER => trial.s = self.muller(set)?,
             SPLIT_LEFT => {
-                trial.s.re = (self.s(set[0]).re + 2.0 * self.s(set[1]).re) / 3.0;
+                trial.s.re = (self.s(set[0])?.re + 2.0 * self.s(set[1])?.re) / 3.0;
             }
             SPLIT_RIGHT => {
-                trial.s.re = (self.s(set[2]).re + 2.0 * self.s(set[1]).re) / 3.0;
+                trial.s.re = (self.s(set[2])?.re + 2.0 * self.s(set[1])?.re) / 3.0;
             }
             _ => return Err(numerical("pole-zero search", "Step type unknown")),
         }
@@ -835,9 +837,9 @@ impl Search<'_> {
         } else if set.iter().any(Option::is_none) {
             suggestion = INIT;
         } else {
-            let t0 = &self.trials[set[0].unwrap_or_default()];
-            let t1 = &self.trials[set[1].unwrap_or_default()];
-            let t2 = &self.trials[set[2].unwrap_or_default()];
+            let t0 = self.neighborhood_trial(set[0])?;
+            let t1 = self.neighborhood_trial(set[1])?;
+            let t2 = self.neighborhood_trial(set[2])?;
             let mut chosen;
             if sgn(t0.f_def.re) != sgn(t1.f_def.re) {
                 new_trap = 1;
@@ -1131,7 +1133,7 @@ impl Search<'_> {
     }
 
     /// `CKTpzUpdateSet`.
-    fn update_set(&mut self, set: &mut Set, new: usize) {
+    fn update_set(&mut self, set: &mut Set, new: usize) -> SpiceResult<()> {
         let mut this_move = 0;
         let trial = self.trials[new].clone();
         let n = trial.s;
@@ -1141,19 +1143,19 @@ impl Search<'_> {
             set[0] = Some(new);
         } else if set[1].is_none() {
             set[1] = Some(new);
-        } else if set[2].is_none() && n.re > self.s(set[1]).re {
+        } else if set[2].is_none() && n.re > self.s(set[1])?.re {
             set[2] = Some(new);
         } else if set[0].is_none() {
             set[0] = Some(new);
         } else if trial.flags & ISAMINIMA != 0 {
             set[1] = Some(new);
-        } else if n.re < self.s(set[0]).re {
+        } else if n.re < self.s(set[0])?.re {
             set[2] = set[1];
             set[1] = set[0];
             set[0] = Some(new);
             this_move = FAR_LEFT;
         } else {
-            let middle = &self.trials[set[1].unwrap_or_default()];
+            let middle = self.neighborhood_trial(set[1])?;
             let better = self.trapped == 0
                 || trial.mag_def < middle.mag_def
                 || (trial.mag_def == middle.mag_def
@@ -1167,7 +1169,7 @@ impl Search<'_> {
                     set[0] = Some(new);
                     this_move = NEAR_LEFT;
                 }
-            } else if set[2].is_some() && n.re < self.s(set[2]).re {
+            } else if set[2].is_some() && n.re < self.s(set[2])?.re {
                 if better {
                     set[0] = set[1];
                     set[1] = Some(new);
@@ -1189,6 +1191,7 @@ impl Search<'_> {
             self.consec_moves = 0;
         }
         self.last_move = this_move;
+        Ok(())
     }
 
     /// `check_flat`.
@@ -1302,8 +1305,9 @@ impl Search<'_> {
 
     /// `NIpzSym2`: deflated quadratic fit through three real trials.
     fn sym2(&mut self, set: &Set) -> SpiceResult<Real> {
-        let t = |i: Option<usize>| self.trials[i.unwrap_or_default()].clone();
-        let (t0, t1, t2) = (t(set[0]), t(set[1]), t(set[2]));
+        let t0 = self.neighborhood_trial(set[0])?.clone();
+        let t1 = self.neighborhood_trial(set[1])?.clone();
+        let t2 = self.neighborhood_trial(set[2])?.clone();
         let mut dx0 = t1.s.re - t0.s.re;
         let mut dx1 = t2.s.re - t1.s.re;
         let x0 = (t0.s.re + t1.s.re) / 2.0;
@@ -1355,10 +1359,9 @@ impl Search<'_> {
         r_norm(&mut b, &mut b_mag)?;
 
         let (mut disc, mut disc_mag) = zaddeq(a * a, 2 * a_mag, -b, b_mag)?;
-        let mut complex = false;
-        if disc < 0.0 {
+        let complex = disc < 0.0;
+        if complex {
             disc *= -1.0;
-            complex = true;
         }
         if disc_mag % 2 == 0 {
             disc = disc.sqrt();
@@ -1380,12 +1383,12 @@ impl Search<'_> {
         } else {
             zaddeq(a, a_mag, -disc, disc_mag)?
         };
-        if c != 0.0 {
-            b /= c;
-            b_mag -= c_mag;
-        } else {
+        if c == 0.0 {
             b = 0.0;
             b_mag = 0;
+        } else {
+            b /= c;
+            b_mag -= c_mag;
         }
         (b, b_mag) = zaddeq(t1.s.re, 0, -b, b_mag)?;
         (c, c_mag) = zaddeq(t1.s.re, 0, -c, c_mag)?;
@@ -1420,7 +1423,11 @@ impl Search<'_> {
 
     /// `NIpzMuller`.
     fn muller(&self, set: &Set) -> SpiceResult<Cx> {
-        let t: [&Trial; 3] = std::array::from_fn(|i| &self.trials[set[i].unwrap_or_default()]);
+        let t = [
+            self.neighborhood_trial(set[0])?,
+            self.neighborhood_trial(set[1])?,
+            self.neighborhood_trial(set[2])?,
+        ];
         let mut min = -999_999;
         let mut count = 0;
         let mut total = 0;
@@ -1515,8 +1522,11 @@ mod tests {
             materialize_power(-1.0, i64::MIN).to_bits(),
             (-0.0_f64).to_bits()
         );
-        let (_, high) = base2_determinant(Complex::real(1.), i32::MAX);
-        let (_, low) = base2_determinant(Complex::real(1.), i32::MIN);
+        let (_, high) = base2_determinant(Complex::real(1.), i32::MAX).unwrap();
+        let (_, low) = base2_determinant(Complex::real(1.), i32::MIN).unwrap();
+        assert!(logb(0.).is_err());
+        assert!(logb(f64::INFINITY).is_err());
+        assert!(base2_determinant(Complex::real(f64::NAN), 0).is_err());
         assert!(high > i64::from(i32::MAX));
         assert!(low < i64::from(i32::MIN));
         let (_, mag) = zaddeq(0.75, high, 0.75, low).unwrap();
@@ -1530,9 +1540,9 @@ mod tests {
         assert_eq!(c, Cx::new(0.0625, 0.));
         c.re = f64::INFINITY;
         assert!(normalize_muller(&mut a, &mut b, &mut c).is_err());
-        assert_eq!(logb(f64::from_bits(1)), -1074.);
+        assert_eq!(logb(f64::from_bits(1)).unwrap(), -1074.);
         assert_eq!(
-            logb(f64::from_bits(f64::MIN_POSITIVE.to_bits() - 1)),
+            logb(f64::from_bits(f64::MIN_POSITIVE.to_bits() - 1)).unwrap(),
             -1023.
         );
     }

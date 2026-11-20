@@ -9,62 +9,65 @@ const MAX_COEFFICIENTS: usize = 17;
 /// Uses partial-pivot Gaussian elimination; returns `None` on zero pivots,
 /// nonfinite arithmetic, mismatched inputs or more than 17 coefficients.
 #[must_use]
-pub fn fit_power_basis(x: &[Real], y: &[Real]) -> Option<Vec<Real>> {
-    let n = x.len();
-    if !(2..=MAX_COEFFICIENTS).contains(&n)
-        || n != y.len()
-        || x.iter().chain(y).any(|v| !v.is_finite())
+pub fn fit_power_basis(abscissas: &[Real], ordinates: &[Real]) -> Option<Vec<Real>> {
+    let count = abscissas.len();
+    if !(2..=MAX_COEFFICIENTS).contains(&count)
+        || count != ordinates.len()
+        || abscissas.iter().chain(ordinates).any(|v| !v.is_finite())
     {
         return None;
     }
-    if n == 2 {
-        let dx = x[1] - x[0];
+    if count == 2 {
+        let dx = abscissas[1] - abscissas[0];
         if dx == 0.0 || !dx.is_finite() {
             return None;
         }
-        let result = vec![x[1].mul_add(y[0], -x[0] * y[1]) / dx, (y[1] - y[0]) / dx];
+        let result = vec![
+            abscissas[1].mul_add(ordinates[0], -abscissas[0] * ordinates[1]) / dx,
+            (ordinates[1] - ordinates[0]) / dx,
+        ];
         return result.iter().all(|v| v.is_finite()).then_some(result);
     }
     let mut storage = [[0.; MAX_COEFFICIENTS]; MAX_COEFFICIENTS];
-    let a = &mut storage[..n];
+    let matrix = &mut storage[..count];
     let mut rhs = [0.; MAX_COEFFICIENTS];
-    let b = &mut rhs[..n];
-    b.copy_from_slice(y);
-    for (row, t) in a.iter_mut().zip(x) {
+    let values = &mut rhs[..count];
+    values.copy_from_slice(ordinates);
+    for (row, abscissa) in matrix.iter_mut().zip(abscissas) {
         let mut power = 1.;
-        for value in &mut row[..n] {
+        for value in &mut row[..count] {
             *value = power;
-            power *= t;
+            power *= abscissa;
         }
     }
-    for col in 0..n {
+    for col in 0..count {
         let mut pivot = col;
-        for row in col..n {
-            if a[row][col].abs() > a[pivot][col].abs() {
+        for row in col..count {
+            if matrix[row][col].abs() > matrix[pivot][col].abs() {
                 pivot = row;
             }
         }
-        a.swap(col, pivot);
-        b.swap(col, pivot);
-        if a[col][col] == 0. {
+        matrix.swap(col, pivot);
+        values.swap(col, pivot);
+        if matrix[col][col] == 0. {
             return None;
         }
-        let (head, tail) = a.split_at_mut(col + 1);
-        let pivot = &head[col][..n];
-        let (before, after) = b.split_at_mut(col + 1);
+        let (head, tail) = matrix.split_at_mut(col + 1);
+        let pivot = &head[col][..count];
+        let (before, after) = values.split_at_mut(col + 1);
         for (row, rhs) in tail.iter_mut().zip(after) {
-            eliminate(&mut row[..n], pivot, col, rhs, before[col]);
+            eliminate(&mut row[..count], pivot, col, rhs, before[col]);
         }
     }
-    for col in (1..n).rev() {
-        let (head, tail) = a.split_at_mut(col);
-        let pivot = &tail[0][..n];
-        let (before, after) = b.split_at_mut(col);
+    for col in (1..count).rev() {
+        let (head, tail) = matrix.split_at_mut(col);
+        let pivot = &tail[0][..count];
+        let (before, after) = values.split_at_mut(col);
         for (row, rhs) in head.iter_mut().zip(before).rev() {
-            eliminate(&mut row[..n], pivot, col, rhs, after[0]);
+            eliminate(&mut row[..count], pivot, col, rhs, after[0]);
         }
     }
-    let result: Vec<_> = (0..n).map(|i| b[i] / a[i][i]).collect();
+    let result: Vec<_> = (0..count).map(|i| values[i] / matrix[i][i]).collect();
     result.iter().all(|v| v.is_finite()).then_some(result)
 }
 
