@@ -125,6 +125,10 @@ impl DeviceSensitivity for SourceSensitivity<'_> {
     }
 
     /// `VSRCtemp`/`ISRCtemp`: the AC defaults, the phasor and the default `m`.
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "VSRCtemp and ISRCtemp convert phase by multiplying by pi before dividing by 180"
+    )]
     fn temperature(
         &self,
         _model: &mut SensitivityRecord,
