@@ -1214,19 +1214,16 @@ fn c_point(
     };
     gbcn += gmin;
     cbcn += gmin * vbc;
-    let (gdsub, cdsub) = t.iss.map_or_else(
-        || (gmin, gmin * vsub),
-        |iss| {
-            let vts = vt * t.ns;
-            if vsub <= -3. * vts {
-                let (current, conductance) = cubic_reverse_junction(vsub, vts, iss);
-                (conductance + gmin, current + gmin * vsub)
-            } else {
-                let evsub = (vsub / vts).min(MAX_EXP_ARG).exp();
-                (iss * evsub / vts + gmin, iss * (evsub - 1.) + gmin * vsub)
-            }
-        },
-    );
+    let (gdsub, cdsub) = t.iss.map_or((gmin, gmin * vsub), |iss| {
+        let vts = vt * t.ns;
+        if vsub <= -3. * vts {
+            let (current, conductance) = cubic_reverse_junction(vsub, vts, iss);
+            (conductance + gmin, current + gmin * vsub)
+        } else {
+            let evsub = (vsub / vts).min(MAX_EXP_ARG).exp();
+            (iss * evsub / vts + gmin, iss * (evsub - 1.) + gmin * vsub)
+        }
+    });
     // Base charge terms.
     let q1 = 1. / (1. - t.inv_vaf * vbc - t.inv_var * vbe);
     let (qb, dqbdve, dqbdvc);
