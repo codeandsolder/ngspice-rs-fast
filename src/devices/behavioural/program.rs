@@ -1027,6 +1027,69 @@ fn differentiate_power(rule: PowerRule, a: &Tree, b: &Tree, variable: usize) -> 
     )
 }
 
+/// The outer derivative of a unary function, constructed with C's tree
+/// helpers. The chain rule is applied once by the main differentiator.
+fn unary_slope(function: Unary, u: &Tree) -> Tree {
+    let one = || constant(1.);
+    match function {
+        Unary::Abs => mk_unary(Unary::Sgn, u.clone()),
+        Unary::Acos => over(
+            constant(-1.),
+            mk_unary(Unary::Sqrt, mk_operator(Operator::Minus, one(), squared(u))),
+        ),
+        Unary::Acosh => over(
+            one(),
+            mk_unary(Unary::Sqrt, mk_operator(Operator::Minus, squared(u), one())),
+        ),
+        Unary::Asin => over(
+            one(),
+            mk_unary(Unary::Sqrt, mk_operator(Operator::Minus, one(), squared(u))),
+        ),
+        Unary::Asinh => over(
+            one(),
+            mk_unary(Unary::Sqrt, mk_operator(Operator::Plus, squared(u), one())),
+        ),
+        Unary::Atan => over(one(), mk_operator(Operator::Plus, squared(u), one())),
+        Unary::Atanh => over(one(), mk_operator(Operator::Minus, one(), squared(u))),
+        Unary::Cos => mk_unary(Unary::Uminus, mk_unary(Unary::Sin, u.clone())),
+        Unary::Cosh => mk_unary(Unary::Sinh, u.clone()),
+        Unary::Exp => mk_unary(Unary::Exp, u.clone()),
+        Unary::Log => over(one(), u.clone()),
+        Unary::Log10 => over(constant(std::f64::consts::LOG10_E), u.clone()),
+        Unary::Sin => mk_unary(Unary::Cos, u.clone()),
+        Unary::Sinh => mk_unary(Unary::Cosh, u.clone()),
+        Unary::Sqrt => over(one(), times(constant(2.), mk_unary(Unary::Sqrt, u.clone()))),
+        Unary::Tan => mk_operator(
+            Operator::Plus,
+            one(),
+            squared(&mk_unary(Unary::Tan, u.clone())),
+        ),
+        Unary::Tanh => mk_operator(
+            Operator::Minus,
+            one(),
+            squared(&mk_unary(Unary::Tanh, u.clone())),
+        ),
+        Unary::Uramp => mk_unary(Unary::Ustep, u.clone()),
+        Unary::Ustep2 => mk_operator(
+            Operator::Minus,
+            mk_unary(Unary::Ustep, u.clone()),
+            mk_unary(Unary::Ustep, mk_operator(Operator::Minus, u.clone(), one())),
+        ),
+        Unary::Uminus => constant(-1.),
+        Unary::Sgn
+        | Unary::Ustep
+        | Unary::Eq0
+        | Unary::Ne0
+        | Unary::Gt0
+        | Unary::Lt0
+        | Unary::Ge0
+        | Unary::Le0
+        | Unary::Floor
+        | Unary::Ceil
+        | Unary::Nint => zero(),
+    }
+}
+
 /// `PTdifferentiate` (`inpptree.c`): the derivative tree of `p` with respect
 /// to quantity `variable`, built with C's `mkb`/`mkf` simplifications so its
 /// evaluation is C's operation for operation. The PSPICE/HSPICE/LTspice
@@ -1078,67 +1141,7 @@ fn differentiate(p: &Tree, variable: usize) -> Tree {
             )
         }
         Node::Binary(Binary::Pwr, a, b) => differentiate_power(PowerRule::Signed, a, b, variable),
-        Node::Unary(function, u) => {
-            let one = || constant(1.);
-            let slope = match function {
-                Unary::Abs => mk_unary(Unary::Sgn, u.clone()),
-                Unary::Acos => over(
-                    constant(-1.),
-                    mk_unary(Unary::Sqrt, mk_operator(Operator::Minus, one(), squared(u))),
-                ),
-                Unary::Acosh => over(
-                    one(),
-                    mk_unary(Unary::Sqrt, mk_operator(Operator::Minus, squared(u), one())),
-                ),
-                Unary::Asin => over(
-                    one(),
-                    mk_unary(Unary::Sqrt, mk_operator(Operator::Minus, one(), squared(u))),
-                ),
-                Unary::Asinh => over(
-                    one(),
-                    mk_unary(Unary::Sqrt, mk_operator(Operator::Plus, squared(u), one())),
-                ),
-                Unary::Atan => over(one(), mk_operator(Operator::Plus, squared(u), one())),
-                Unary::Atanh => over(one(), mk_operator(Operator::Minus, one(), squared(u))),
-                Unary::Cos => mk_unary(Unary::Uminus, mk_unary(Unary::Sin, u.clone())),
-                Unary::Cosh => mk_unary(Unary::Sinh, u.clone()),
-                Unary::Exp => mk_unary(Unary::Exp, u.clone()),
-                Unary::Log => over(one(), u.clone()),
-                Unary::Log10 => over(constant(std::f64::consts::LOG10_E), u.clone()),
-                Unary::Sin => mk_unary(Unary::Cos, u.clone()),
-                Unary::Sinh => mk_unary(Unary::Cosh, u.clone()),
-                Unary::Sqrt => over(one(), times(constant(2.), mk_unary(Unary::Sqrt, u.clone()))),
-                Unary::Tan => mk_operator(
-                    Operator::Plus,
-                    one(),
-                    squared(&mk_unary(Unary::Tan, u.clone())),
-                ),
-                Unary::Tanh => mk_operator(
-                    Operator::Minus,
-                    one(),
-                    squared(&mk_unary(Unary::Tanh, u.clone())),
-                ),
-                Unary::Uramp => mk_unary(Unary::Ustep, u.clone()),
-                Unary::Ustep2 => mk_operator(
-                    Operator::Minus,
-                    mk_unary(Unary::Ustep, u.clone()),
-                    mk_unary(Unary::Ustep, mk_operator(Operator::Minus, u.clone(), one())),
-                ),
-                Unary::Uminus => constant(-1.),
-                Unary::Sgn
-                | Unary::Ustep
-                | Unary::Eq0
-                | Unary::Ne0
-                | Unary::Gt0
-                | Unary::Lt0
-                | Unary::Ge0
-                | Unary::Le0
-                | Unary::Floor
-                | Unary::Ceil
-                | Unary::Nint => zero(),
-            };
-            times(slope, differentiate(u, variable))
-        }
+        Node::Unary(function, u) => times(unary_slope(*function, u), differentiate(u, variable)),
         Node::Pwl(u, table) => {
             let slope = u.constant().map_or_else(
                 || Arc::new(Node::PwlDerivative(Arc::clone(u), Arc::clone(table))),

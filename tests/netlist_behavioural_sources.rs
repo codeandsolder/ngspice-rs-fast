@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ngspice_rs::netlist::ast::{DeviceInstance, Netlist, ParameterKind};
-use ngspice_rs::netlist::behavioural::{lower_nonlinear_sources, poly_exponents};
+use ngspice_rs::netlist::behavioural::lower_nonlinear_sources;
 use ngspice_rs::netlist::bexpr::{BExpr, BExprKind, BehaviouralExpression};
 use ngspice_rs::netlist::elaborate::literalize;
 use ngspice_rs::netlist::eval::{EvalBudget, ParamScope};
@@ -407,10 +407,6 @@ fn poly_forms_lower_onto_spice2poly_in_spice2_term_order() {
     assert_eq!(
         shape(&expression(&netlist.devices[1], "i").root),
         "(0 + (2 * i(vx)))"
-    );
-    assert_eq!(
-        poly_exponents(2, 3),
-        vec![vec![1, 0], vec![0, 1], vec![2, 0]]
     );
 }
 

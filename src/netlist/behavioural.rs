@@ -580,50 +580,40 @@ fn lower_table(device: &DeviceInstance) -> SpiceResult<Vec<DeviceInstance>> {
     Ok(out)
 }
 
-/// Generate SPICE2 polynomial exponents in coefficient order.
+/// In-place SPICE2 monomial sequence (`nxtpwr` in
+/// `src/xspice/icm/spice2poly/icm_spice2poly/cfunc.mod`).
 ///
-/// Exponent vectors of the SPICE2 polynomial terms in coefficient order
-/// (after the constant): total degree ascending, then lexicographically
-/// descending, which is the sequence `nxtpwr()` generates (`a`, `b`, `a²`,
-/// `ab`, `b²`, `a³`, ...). Returns `count` vectors of `dimension` entries.
-#[must_use]
-pub fn poly_exponents(dimension: usize, count: usize) -> Vec<Vec<u32>> {
-    let mut out = Vec::with_capacity(count);
-    let mut degree = 1u32;
-    while out.len() < count {
-        let mut current = vec![0u32; dimension];
-        compositions(&mut current, 0, degree, &mut out, count);
-        degree += 1;
-    }
-    out
+/// Starts at the constant term. Each advance visits the next composition
+/// in increasing total degree, then decreasing lexicographic order.
+/// A single vector is sufficient to lower every coefficient.
+struct PolyPowers {
+    powers: Vec<u32>,
 }
 
-/// All exponent vectors of total `remaining` from `index` on, the largest
-/// leading exponent first.
-fn compositions(
-    current: &mut [u32],
-    index: usize,
-    remaining: u32,
-    out: &mut Vec<Vec<u32>>,
-    count: usize,
-) {
-    if out.len() >= count {
-        return;
+impl PolyPowers {
+    fn new(dimension: usize) -> Option<Self> {
+        (dimension != 0).then(|| Self {
+            powers: vec![0; dimension],
+        })
     }
-    if index + 1 == current.len() {
-        current[index] = remaining;
-        out.push(current.to_vec());
-        current[index] = 0;
-        return;
-    }
-    for value in (0..=remaining).rev() {
-        current[index] = value;
-        compositions(current, index + 1, remaining - value, out, count);
-        if out.len() >= count {
-            break;
+
+    fn advance(&mut self) -> Option<&[u32]> {
+        let last = self.powers.len() - 1;
+        if let Some(index) = self.powers[..last].iter().rposition(|&power| power != 0) {
+            // Move one power from the rightmost nonzero prefix element,
+            // along with all remaining powers, to its next neighbour.
+            let tail = self.powers[last];
+            self.powers[last] = 0;
+            self.powers[index] -= 1;
+            self.powers[index + 1] = tail + 1;
+        } else {
+            // The previous degree is exhausted, or this is the constant term.
+            let degree = self.powers[last].checked_add(1)?;
+            self.powers[last] = 0;
+            self.powers[0] = degree;
         }
+        Some(&self.powers)
     }
-    current[index] = 0;
 }
 
 /// A parameter value as the B-source parser sees it: numparam splices the
@@ -674,14 +664,13 @@ fn lower_poly(device: &DeviceInstance) -> SpiceResult<DeviceInstance> {
             ));
         }
     }
-    let coefficients: Vec<&ParameterAssignment> = device
-        .parameters
-        .iter()
-        .filter(|p| p.name == "coef")
-        .collect();
-    let Some((first, rest)) = coefficients.split_first() else {
-        return Err(malformed(device, "POLY needs at least one coefficient"));
-    };
+    let mut coefficients = device.parameters.iter().filter(|p| p.name == "coef");
+    let first = coefficients
+        .next()
+        .ok_or_else(|| malformed(device, "POLY needs at least one coefficient"))?;
+    let mut powers = PolyPowers::new(dimension)
+        .ok_or_else(|| malformed(device, "POLY needs a positive integer dimension"))?;
+    let mut coefficient_count = 1;
     let node = |kind: BExprKind| quantity(kind, location);
     let binary = |op, lhs: BExpr, rhs: BExpr| {
         node(BExprKind::Binary {
@@ -691,7 +680,11 @@ fn lower_poly(device: &DeviceInstance) -> SpiceResult<DeviceInstance> {
         })
     };
     let mut sum = point(first)?;
-    for (exponents, coefficient) in poly_exponents(dimension, rest.len()).iter().zip(rest) {
+    for coefficient in coefficients {
+        coefficient_count += 1;
+        let exponents = powers
+            .advance()
+            .ok_or_else(|| malformed(device, "POLY degree exceeds supported range"))?;
         let mut product: Option<BExpr> = None;
         for (control, power) in controls.iter().zip(exponents) {
             for _ in 0..*power {
@@ -714,10 +707,7 @@ fn lower_poly(device: &DeviceInstance) -> SpiceResult<DeviceInstance> {
     } else {
         "i"
     };
-    let text = format!(
-        "spice2poly({dimension}) with {} coefficient(s)",
-        coefficients.len()
-    );
+    let text = format!("spice2poly({dimension}) with {coefficient_count} coefficient(s)");
     let mut parameters = vec![ParameterAssignment {
         name: output.to_owned(),
         value: text.clone(),
@@ -1041,7 +1031,71 @@ fn circuit_quantity(name: &str, arguments: &[Expr]) -> Option<BExprKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::poly_exponents;
+    use super::PolyPowers;
+
+    fn poly_exponents(dimension: usize, count: usize) -> Vec<Vec<u32>> {
+        let mut powers = PolyPowers::new(dimension).unwrap();
+        (0..count)
+            .map(|_| powers.advance().unwrap().to_vec())
+            .collect()
+    }
+
+    /// Independent recursive composition enumerator, limited to the tiny
+    /// reference cases; the production lowering never allocates these lists.
+    fn reference_terms(dimension: usize, count: usize) -> Vec<Vec<u32>> {
+        fn compose(
+            prefix: &mut Vec<u32>,
+            remaining: u32,
+            dimension: usize,
+            out: &mut Vec<Vec<u32>>,
+            count: usize,
+        ) {
+            if out.len() == count {
+                return;
+            }
+            if prefix.len() + 1 == dimension {
+                prefix.push(remaining);
+                out.push(prefix.clone());
+                prefix.pop();
+            } else {
+                for power in (0..=remaining).rev() {
+                    prefix.push(power);
+                    compose(prefix, remaining - power, dimension, out, count);
+                    prefix.pop();
+                    if out.len() == count {
+                        break;
+                    }
+                }
+            }
+        }
+        let mut result = Vec::new();
+        let mut degree = 1;
+        while result.len() < count {
+            compose(&mut Vec::new(), degree, dimension, &mut result, count);
+            degree += 1;
+        }
+        result
+    }
+
+    #[test]
+    fn poly_power_cursor_matches_compositions() {
+        for dimension in [1, 2, 3, 4, 5, 6, 64] {
+            assert_eq!(
+                poly_exponents(dimension, 300),
+                reference_terms(dimension, 300)
+            );
+        }
+        assert!(PolyPowers::new(0).is_none());
+        let mut overflow = PolyPowers {
+            powers: vec![u32::MAX],
+        };
+        assert!(overflow.advance().is_none());
+        let mut limit = PolyPowers {
+            powers: vec![1, u32::MAX - 1],
+        };
+        assert_eq!(limit.advance(), Some([0, u32::MAX].as_slice()));
+        assert!(limit.advance().is_none());
+    }
 
     #[test]
     fn poly_terms_follow_the_spice2_order() {
