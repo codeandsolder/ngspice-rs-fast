@@ -95,7 +95,7 @@ use crate::devices::{
     SourceKind, TransientTiming, TrialState,
 };
 use crate::maths::integrator::{DEFAULT_XMU, TruncationTolerances};
-use crate::maths::{Coefficients, IntegrationMethod, SparseMatrix, StepHistory, Vector};
+use crate::maths::{Coefficients, IntegrationMethod, StepHistory, Vector};
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult, almost_equal_ulps};
 
 use crate::analysis::initial::{self, Hints, VoltageTolerance};
@@ -979,7 +979,6 @@ impl Driver<'_> {
         previous: &Vector,
         initial: bool,
     ) -> SpiceResult<Trial> {
-        let n = self.circuit.unknown_count();
         let tolerance = &self.settings.tolerances;
         let options = crate::analysis::newton::NewtonOptions {
             max_iterations: self.settings.tran_max_iter,
@@ -989,39 +988,6 @@ impl Driver<'_> {
             limiting: self.bias.newton.limiting,
             ..crate::analysis::newton::NewtonOptions::default()
         };
-        let load = |guess: &Vector,
-                    matrix: &mut SparseMatrix,
-                    rhs: &mut Vector,
-                    phase: crate::devices::IterationPhase,
-                    previous: Option<&TrialState>| {
-            let mut state = self
-                .history
-                .trial_in(phase, previous)?
-                .with_device_limiting(options.limiting.is_device())
-                .with_convergence_tolerances(options.reltol, options.abstol)
-                .with_initial_transient(initial && phase == crate::devices::IterationPhase::Predict)
-                .with_uic(self.uic);
-            self.circuit.load(
-                &LoadRequest {
-                    mode: AnalysisMode::Transient {
-                        time,
-                        dt: coefficients.dt(),
-                    },
-                    solution: guess,
-                    model_context: &self.model_context,
-                    integration: Some(coefficients),
-                    history: &self.history,
-                    forcing: Some(Forcing {
-                        limit,
-                        timing: self.timing,
-                    }),
-                },
-                matrix,
-                rhs,
-                &mut state,
-            )?;
-            Ok::<_, SpiceError>(state)
-        };
         // dctran.c: MODEINITTRAN (first step) or MODEINITPRED for the first
         // load of a timepoint, MODEINITFLOAT afterwards.
         let policy = if initial {
@@ -1029,33 +995,26 @@ impl Driver<'_> {
         } else {
             crate::analysis::newton::PhasePolicy::Predicted
         };
-        match crate::analysis::newton::solve_phased(
-            previous,
-            &self.branch_row,
-            self.limited_rows.as_deref(),
-            &options,
-            policy,
-            None,
-            |x, phase, last| {
-                let mut matrix = self.circuit.new_matrix();
-                let mut rhs = Vector::zeros(n);
-                let state = load(x, &mut matrix, &mut rhs, phase, last)?;
-                Ok((matrix, rhs, state))
+        use crate::analysis::newton::{CircuitLoad, CircuitNewton};
+        let solved = CircuitNewton {
+            circuit: self.circuit,
+            context: &self.model_context,
+            history: &self.history,
+            branch_rows: &self.branch_row,
+            limited_rows: self.limited_rows.as_deref(),
+            options: &options,
+            load: CircuitLoad::Transient {
+                time,
+                coefficients,
+                forcing: Forcing {
+                    limit,
+                    timing: self.timing,
+                },
+                uic: self.uic,
             },
-            |new, old, trial| {
-                self.circuit
-                    .convergence_test(&crate::devices::ConvergenceRequest {
-                        solution: new,
-                        previous: old,
-                        trial,
-                        model_context: &self.model_context,
-                        time,
-                        reltol: options.reltol,
-                        abstol: options.abstol,
-                        vntol: options.vntol,
-                    })
-            },
-        ) {
+        }
+        .solve(previous, policy, None, |_, _, _| Ok(()));
+        match solved {
             Ok(solved) => Ok(Trial::Converged {
                 x: solved.values,
                 state: solved.trial,

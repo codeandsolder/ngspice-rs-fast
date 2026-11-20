@@ -620,6 +620,15 @@ pub(crate) fn run(
         }
         crate::analysis::bias::ContinuationSchedule::Ladder => None,
     });
+    // The direct warm-start policy is invariant across sweep points. Build it
+    // once; only the previous accepted solution and model overrides change.
+    let warm_settings = point_iterations.map(|limit| crate::analysis::bias::DcSettings {
+        newton: crate::analysis::newton::NewtonOptions {
+            max_iterations: limit,
+            ..settings.newton
+        },
+        continuation: crate::analysis::bias::ContinuationPolicy::disabled(),
+    });
     // The values `dctrcurv.c` visits (`value += step`, C's absolute stop
     // test), not `start + i step`: the last bits reach every device and the
     // output scale.
@@ -651,7 +660,6 @@ pub(crate) fn run(
     // CKTstate1 is the previous point's state (the first point's own state is
     // copied in after it). Only devices with discrete state (switches) read it.
     let mut history = circuit.state_history();
-    let mut first;
     for hint in hints.nodesets {
         previous.as_mut_slice()[hint.row] = hint.value;
     }
@@ -661,7 +669,7 @@ pub(crate) fn run(
         // so the first point of every inner sweep is decided from the
         // instance flags like the very first point, and its converged state
         // then becomes the accepted history (C's `firstTime` memcpy).
-        first = true;
+        let mut first = true;
         for inner_value in inner {
             let (model, overrides) = point_context(
                 circuit,
@@ -670,24 +678,17 @@ pub(crate) fn run(
                 context.model_context(),
             )?;
             // dctrcurv.c runs NIiter at every point, linear circuits included.
-            let (x, solved_state) = {
+            let solution = {
                 // dctrcurv.c: every point after the first first tries a plain
                 // warm-started Newton bounded by `itl2` (CKTdcTrcvMaxIter) and
                 // only on failure falls back to the full operating-point solve.
-                let warm = match point_iterations.filter(|_| !first) {
+                let warm = match warm_settings.as_ref().filter(|_| !first) {
                     None => None,
-                    Some(limit) => {
-                        let direct = crate::analysis::bias::DcSettings {
-                            newton: crate::analysis::newton::NewtonOptions {
-                                max_iterations: limit,
-                                ..settings.newton
-                            },
-                            continuation: crate::analysis::bias::ContinuationPolicy::disabled(),
-                        };
+                    Some(direct) => {
                         match crate::analysis::bias::solve_dc_from(
                             circuit,
                             &model,
-                            &direct,
+                            direct,
                             &overrides,
                             Some(&previous),
                             &history,
@@ -708,7 +709,7 @@ pub(crate) fn run(
                         }
                     }
                 };
-                let solution = match warm {
+                match warm {
                     Some(solution) => solution,
                     None => {
                         crate::analysis::bias::solve_dc_from(
@@ -730,9 +731,10 @@ pub(crate) fn run(
                         )?
                         .solution
                     }
-                };
-                (solution.values, Some(solution.trial))
+                }
             };
+            let x = solution.values;
+            let trial = solution.trial;
             let first_point = std::mem::replace(&mut first, false);
             // Only a solved point is accepted; a failure above returns before
             // any accept hook runs for it. A nonlinear point's state becomes the
@@ -748,7 +750,7 @@ pub(crate) fn run(
                 },
                 &overrides,
                 None,
-                solved_state.as_ref(),
+                Some(&trial),
             )?;
             // dctrcurv.c `firstTime`: after the first point of an inner
             // sweep C copies CKTstate0 into CKTstate1, so after the next
@@ -757,10 +759,7 @@ pub(crate) fn run(
             if first_point {
                 history.clear();
             }
-            match solved_state {
-                Some(trial) => circuit.accept_point(&x, None, &mut history, trial)?,
-                None => circuit.accept_solution(&x, None)?,
-            }
+            circuit.accept_point(&x, None, &mut history, trial)?;
             let mut point = vec![Complex::real(*inner_value)];
             point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));
             point.extend(observed);

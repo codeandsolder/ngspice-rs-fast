@@ -14,8 +14,11 @@
 //! ([`IterationPhase`], `niiter.c`), hands it the previous load's trial (C's
 //! `CKTstate0` survives between iterations) and refuses to converge on a load
 //! a device marked nonconvergent (C `CKTnoncon`), as the S/W switches need.
-use crate::devices::{IterationPhase, TrialState};
-use crate::maths::{SparseMatrix, Vector};
+use crate::devices::{
+    AnalysisMode, Circuit, ConvergenceRequest, Forcing, IterationPhase, LoadRequest, ModelContext,
+    StateHistory, TrialState,
+};
+use crate::maths::{Coefficients, SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// Largest accepted per-solve Newton iteration limit (`maxiter`, deck `itl1`).
@@ -394,6 +397,119 @@ pub fn solve_phased(
         },
         device_test,
     )
+}
+
+/// The two circuit-load modes driven by the real Newton solver. Keeping
+/// transient-only state together prevents DC callers from accidentally
+/// providing integration coefficients or the transient convergence time.
+pub(super) enum CircuitLoad<'a> {
+    Bias {
+        forcing: Option<Forcing>,
+    },
+    Transient {
+        time: Real,
+        coefficients: &'a Coefficients,
+        forcing: Forcing,
+        uic: bool,
+    },
+}
+
+/// The shared device-backed Newton driver. Each iteration creates its trial
+/// from accepted history and the previous disposable trial, stamps the circuit,
+/// and runs device convergence tests with the same options that loaded it.
+/// Acceptance is deliberately left to the outer analysis.
+pub(super) struct CircuitNewton<'a> {
+    pub circuit: &'a Circuit,
+    pub context: &'a ModelContext,
+    pub history: &'a StateHistory,
+    pub branch_rows: &'a [bool],
+    pub limited_rows: Option<&'a [bool]>,
+    pub options: &'a NewtonOptions,
+    pub load: CircuitLoad<'a>,
+}
+
+impl CircuitNewton<'_> {
+    /// The bias point may add forcing rows after the circuit load; ordinary
+    /// transient trials pass a no-op postload. The phase sequence and device
+    /// state never escape the common driver until Newton has converged.
+    pub(super) fn solve(
+        &self,
+        initial: &Vector,
+        policy: PhasePolicy,
+        continued: Option<TrialState>,
+        mut after_load: impl FnMut(IterationPhase, &mut SparseMatrix, &mut Vector) -> SpiceResult<()>,
+    ) -> Result<NewtonSolution<TrialState>, NewtonFailure> {
+        let (mode, integration, forcing, time) = match self.load {
+            CircuitLoad::Bias { forcing } => (AnalysisMode::OperatingPoint, None, forcing, 0.),
+            CircuitLoad::Transient {
+                time,
+                coefficients,
+                forcing,
+                ..
+            } => (
+                AnalysisMode::Transient {
+                    time,
+                    dt: coefficients.dt(),
+                },
+                Some(coefficients),
+                Some(forcing),
+                time,
+            ),
+        };
+        let options = self.options;
+        solve_phased(
+            initial,
+            self.branch_rows,
+            self.limited_rows,
+            options,
+            policy,
+            continued,
+            |guess, phase, previous| {
+                let mut matrix = self.circuit.new_matrix();
+                let mut rhs = Vector::zeros(self.circuit.unknown_count());
+                let mut trial = self
+                    .history
+                    .trial_in(phase, previous)?
+                    .with_device_limiting(options.limiting.is_device())
+                    .with_convergence_tolerances(options.reltol, options.abstol);
+                if let CircuitLoad::Transient { uic, .. } = self.load {
+                    trial = trial
+                        .with_initial_transient(
+                            policy == PhasePolicy::InitialTransient
+                                && phase == IterationPhase::Predict,
+                        )
+                        .with_uic(uic);
+                }
+                self.circuit.load(
+                    &LoadRequest {
+                        mode,
+                        solution: guess,
+                        model_context: self.context,
+                        integration,
+                        history: self.history,
+                        forcing,
+                    },
+                    &mut matrix,
+                    &mut rhs,
+                    &mut trial,
+                )?;
+                after_load(phase, &mut matrix, &mut rhs)?;
+                Ok((matrix, rhs, trial))
+            },
+            |new, old, trial| {
+                self.circuit.convergence_test(&ConvergenceRequest {
+                    solution: new,
+                    previous: old,
+                    trial,
+                    model_context: self.context,
+                    time,
+                    reltol: options.reltol,
+                    abstol: options.abstol,
+                    vntol: options.vntol,
+                })
+            },
+        )
+    }
 }
 
 struct Phases<T, F> {
