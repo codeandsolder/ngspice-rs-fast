@@ -228,15 +228,18 @@ impl Pattern {
     /// Serializes factor-cache updates, including scalar changes and AC
     /// reordering. A poisoned cache is discarded rather than reused.
     pub(super) fn with_ordering<R>(&self, f: impl FnOnce(&mut OrderingState) -> R) -> R {
-        match self.ordering.lock() {
-            Ok(mut state) => f(&mut state),
+        let mut state = match self.ordering.lock() {
+            Ok(state) => state,
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
                 *state = OrderingState::default();
                 self.ordering.clear_poison();
-                f(&mut state)
+                state
             }
-        }
+        };
+        let result = f(&mut state);
+        drop(state);
+        result
     }
 
     /// This pattern plus new positions appended in order (existing ids keep
@@ -1179,6 +1182,30 @@ impl SparseMatrix {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn poisoned_ordering_discards_cache_and_unlocks_after_recovery() {
+        let pattern = Pattern::new(1, [(0, 0)]);
+        std::thread::scope(|scope| {
+            let result = scope
+                .spawn(|| {
+                    pattern.with_ordering(|state| {
+                        state.ac_reorder = false;
+                        state.solve_workspace.push(42.);
+                        panic!("interrupted ordering transaction");
+                    })
+                })
+                .join();
+            assert!(result.is_err());
+        });
+        pattern.with_ordering(|state| {
+            assert!(state.ac_reorder);
+            assert!(state.solve_workspace.is_empty());
+            state.ac_reorder = false;
+        });
+        assert!(!pattern.ordering.is_poisoned());
+        assert!(!pattern.with_ordering(|state| state.ac_reorder));
+    }
+
     #[test]
     fn folding_compacts_in_place_in_stable_stamp_order() {
         let mut matrix = SparseMatrix::new(3, 3);
