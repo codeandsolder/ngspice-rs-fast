@@ -42,6 +42,7 @@ use thermal::{
 };
 
 /// Diode state slot of the limited junction voltage (C `DIOvoltage`).
+const DIODE_CHARGE_SLOT: usize = 0;
 const DIODE_VOLTAGE_SLOT: usize = 2;
 /// ngspice default `CKTepsmin` (`cktntask.c`): IS floor and knee-current cutoff.
 const EPSMIN: Real = 1e-28;
@@ -1410,6 +1411,8 @@ impl Device for Diode {
             0.
         };
         let (mut gd, mut cd) = (p.junction.conductance, p.junction.current);
+        let branch =
+            charge::ChargeBranch::new(DIODE_CHARGE_SLOT, p.junction.charge, p.junction.capacitance);
         if let Some(coefficients) = context.integration {
             let crate::devices::AnalysisMode::Transient { dt, .. } = context.mode else {
                 return Err(SpiceError::circuit("junction companion outside transient"));
@@ -1417,30 +1420,32 @@ impl Device for Diode {
             if dt != coefficients.dt() {
                 return Err(SpiceError::circuit("junction timestep mismatch"));
             }
-            let (geq, ccap) = junction_companion(context, coefficients, p.junction, 0)?;
-            gd += geq;
-            cd += ccap;
+            let companion = branch.integrate(&mut context.states, coefficients)?;
+            gd += companion.conductance;
+            cd += companion.derivative;
         } else {
             if context.mode.is_transient() {
                 return Err(SpiceError::circuit(
                     "junction transient needs companion integration",
                 ));
             }
-            context.states.set(1, 0.)?;
+            branch.zero_derivative(&mut context.states)?;
         }
-        context.states.set(0, p.junction.charge)?;
+        branch.store(&mut context.states)?;
         let cdeq = cd - gd * v;
         let [pos, neg] = [self.terminals[0], self.terminals[1]];
         let prime = self.junction[0];
         context.stamp_rhs(neg, cdeq)?;
         context.stamp_rhs(prime, -cdeq)?;
-        context.stamp(pos, pos, gspr)?;
-        context.stamp(neg, neg, gd)?;
-        context.stamp(prime, prime, gd + gspr)?;
-        context.stamp(pos, prime, -gspr)?;
-        context.stamp(neg, prime, -gd)?;
-        context.stamp(prime, pos, -gspr)?;
-        context.stamp(prime, neg, -gd)?;
+        context.stamp_fixed([
+            (pos, pos, gspr),
+            (neg, neg, gd),
+            (prime, prime, gd + gspr),
+            (pos, prime, -gspr),
+            (neg, prime, -gd),
+            (prime, pos, -gspr),
+            (prime, neg, -gd),
+        ])?;
         limiter.finish(&mut context.states, &[(DIODE_VOLTAGE_SLOT, v)])
     }
     /// `dioacld.c`: series conductance, C's small-signal junction conductance

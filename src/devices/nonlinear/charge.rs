@@ -47,6 +47,22 @@ impl ChargeBranch {
         states.set(self.slot + 1, 0.)
     }
 
+    /// Retain a derivative/current slot that the C device does not update
+    /// in this mode, including a small-signal capacitance carried across
+    /// analyses. A newer Newton iterate takes precedence over carried state.
+    pub(in crate::devices) fn retain_derivative(
+        self,
+        states: &mut DeviceState<'_>,
+    ) -> SpiceResult<Real> {
+        let slot = self.slot + 1;
+        let value = states
+            .iterate(slot)
+            .or_else(|| states.carried(slot))
+            .unwrap_or(0.);
+        states.set(slot, value)?;
+        Ok(value)
+    }
+
     /// NIintegrate stores the derivative, but does not advance accepted
     /// history or write the charge slot. The device owns those operations.
     #[inline]
@@ -123,6 +139,28 @@ mod tests {
         assert_eq!(history.accepted(1), Some(&[2., 0.][..]));
         drop(trial);
         assert_eq!(history.accepted(1), Some(&[2., 0.][..]));
+    }
+
+    #[test]
+    fn retained_derivative_prefers_iterate_then_carried_state() {
+        let branch = ChargeBranch::new(0, 2., 3.);
+        let history = StateHistory::new(2).with_carried(Some(vec![1., 4.]));
+        let mut first = history.trial();
+        {
+            let mut states = history.device(&mut first, 0..2).unwrap();
+            assert_eq!(branch.retain_derivative(&mut states).unwrap(), 4.);
+            states.set(1, 7.).unwrap();
+        }
+        let mut trial = history
+            .trial_in(IterationPhase::Float, Some(&first))
+            .unwrap();
+        let mut states = history.device(&mut trial, 0..2).unwrap();
+        assert_eq!(branch.retain_derivative(&mut states).unwrap(), 7.);
+        assert_eq!(states.trial(1), Some(7.));
+        let empty = StateHistory::new(2);
+        let mut fresh = empty.trial();
+        let mut states = empty.device(&mut fresh, 0..2).unwrap();
+        assert_eq!(branch.retain_derivative(&mut states).unwrap(), 0.);
     }
 
     #[test]

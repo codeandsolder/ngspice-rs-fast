@@ -140,8 +140,25 @@ fn load(
     context: &ModelContext,
     coefficients: Option<&Coefficients>,
 ) -> (SparseMatrix, Vector, Vec<f64>) {
+    load_on(
+        c,
+        x,
+        history,
+        context,
+        coefficients,
+        SparseMatrix::new(c.unknown_count(), c.unknown_count()),
+    )
+}
+
+fn load_on(
+    c: &Circuit,
+    x: &Vector,
+    history: &StateHistory,
+    context: &ModelContext,
+    coefficients: Option<&Coefficients>,
+    mut a: SparseMatrix,
+) -> (SparseMatrix, Vector, Vec<f64>) {
     let n = c.unknown_count();
-    let mut a = SparseMatrix::new(n, n);
     let mut b = Vector::zeros(n);
     let mut trial = history.trial();
     let (mode, forcing) = match coefficients {
@@ -544,4 +561,60 @@ fn sensitivity_matches_the_reference_on_the_fixture_card() {
         );
     }
     assert_eq!(column(&plot, "v(q1:rco)"), 0., "sens_setp skips RCO");
+}
+
+#[test]
+fn bipolar_and_diode_fixed_stamps_replay_the_unbound_matrix() {
+    let full = format!(
+        "{FULL}\nd1 b e dm area=1.7 m=2.3\nd2 c 0 dm\n.model dm d(is=1e-14 rs=3 cjo=1.2p tt=0.5n)"
+    );
+    let aliases = "vc c 0 2.5\nvb b 0 0.63\nq1 c b 0 qm m=1.7\nd1 b 0 dm m=2.3\n\
+                   .model qm npn(bf=120 is=1e-15 cje=3p cjc=2p tf=0.3n)\n\
+                   .model dm d(is=1e-14 cjo=1.2p tt=0.5n)";
+    for body in [&full, aliases] {
+        let c = circuit(body);
+        let context = ModelContext::default();
+        let (bias, history) = solved(&c, &context);
+        let coeff = StepHistory::new()
+            .trial(IntegrationMethod::Trapezoidal, 1, 0.7e-9, DEFAULT_XMU)
+            .unwrap();
+        // Repeated loads exercise learning, verification and replay. Using
+        // several voltages and alternating DC/transient changes every stamp
+        // value without changing device topology.
+        for step in 0..6 {
+            let mut x = bias.clone();
+            for (k, element) in x.as_mut_slice().iter_mut().enumerate() {
+                *element += 0.0001 * (f64::from(step) + 1.) * ((k % 3) as f64 - 1.);
+            }
+            let integration = (step % 2 != 0).then_some(&coeff);
+            let (plain, rhs, state) = load(&c, &x, &history, &context, integration);
+            let (bound, bound_rhs, bound_state) =
+                load_on(&c, &x, &history, &context, integration, c.new_matrix());
+            assert!(bound.bound_values().is_some());
+            for r in 0..c.unknown_count() {
+                for col in 0..c.unknown_count() {
+                    assert_eq!(
+                        plain.get(r, col).to_bits(),
+                        bound.get(r, col).to_bits(),
+                        "step {step}, matrix ({r},{col})"
+                    );
+                }
+            }
+            assert_eq!(
+                rhs.as_slice()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                bound_rhs
+                    .as_slice()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                state.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                bound_state.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
 }

@@ -13,13 +13,10 @@
 //! - `bjt/bjtacld.c`: the small-signal stamp.
 //! - `bjt/bjttrunc.c`: charges taking part in truncation-error control.
 //!
-//! The Newton load stamps the *exact* Jacobian of the C equations, including
-//! the bias dependence of the base resistance. C's `bjtload.c` stamps only the
-//! conductance `gx` there; both iterations share the same fixed point.
-//! [`Device::assemble_small_signal`] deliberately reproduces C's AC stamp,
-//! which omits the `d(gx)/dV` terms, because that is what `.ac` computes; a
-//! load whose trial asks for C's matrix
-//! ([`crate::devices::DeviceState::c_jacobian`], used by `.tf`) omits them too.
+//! DC/transient Newton and AC loads retain the actual C matrix. The
+//! bias-dependent base resistance is stamped as conductance `gx` alone,
+//! without the `d(gx)/dV` terms of the mathematical Jacobian; the residual
+//! and fixed point of the Gummel-Poon equations are unchanged.
 //!
 //! Not ported, and rejected with [`SpiceError::NotYetPorted`]: excess phase
 //! (`PTF` with `TF != 0`), Kull's quasi-saturation model (`RCO`, `VO`, `GAMMA`,
@@ -1656,16 +1653,8 @@ impl Device for Bjt {
             // `MODEINITSMSIG`, yet reads them into `ceqsub`/`ceqbx`: a DC load
             // after a small-signal analysis of the same deck sees the
             // capacitances that analysis stored there.
-            for charge in [slot::QSUB, slot::QBX] {
-                let held = context
-                    .states
-                    .iterate(charge + 1)
-                    .or_else(|| context.states.carried(charge + 1))
-                    .unwrap_or(0.);
-                context.states.set(charge + 1, held)?;
-            }
-            cqsub = context.states.trial(slot::QSUB + 1).unwrap_or(0.);
-            cqbx = context.states.trial(slot::QBX + 1).unwrap_or(0.);
+            cqsub = sub.retain_derivative(&mut context.states)?;
+            cqbx = bx.retain_derivative(&mut context.states)?;
         }
         for branch in [be, bc, bx, sub] {
             branch.store(&mut context.states)?;
@@ -1699,7 +1688,7 @@ impl Device for Bjt {
         context.stamp_rhs(bp, m * (-ceqbe - ceqbc))?;
         context.stamp_rhs(ep, m * (ceqbe))?;
         context.stamp_rhs(s, m * (-ceqsub))?;
-        for (row, col, value) in [
+        context.stamp_fixed([
             (c, c, m * (gcpr)),
             (b, b, m * (gx + geqbx)),
             (e, e, m * (gepr)),
@@ -1725,9 +1714,7 @@ impl Device for Bjt {
             (s, sc, m * (-geqsub)),
             (b, cp, m * (-geqbx)),
             (cp, b, m * (-geqbx)),
-        ] {
-            context.stamp(row, col, value)?;
-        }
+        ])?;
         limiter.finish(
             &mut context.states,
             &[
