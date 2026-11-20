@@ -524,6 +524,12 @@ impl<T: Scalar> Sparse<T> {
             .all(|element| element.value.is_finite())
     }
 
+    /// True only when a direct numerical refactor can use the established
+    /// pivot order, rather than implicitly running the ordering algorithm.
+    pub(super) const fn can_refactor(&self) -> bool {
+        !self.needs_ordering
+    }
+
     /// Whether the frame holds LU factors (`Matrix->Factored`).
     pub(crate) const fn is_factored(&self) -> bool {
         self.factored

@@ -353,6 +353,7 @@ impl StepHistory {
             history: self.len,
             filled: self.fill.is_some(),
             ag,
+            truncation: TruncationSpans::new(&deltas, usize::from(order)),
         })
     }
 
@@ -430,6 +431,72 @@ fn gear_corrector(deltas: &[Real; HISTORY_LEN + 1], order: usize) -> [Real; HIST
     ag
 }
 
+/// Packed triangular table of CKTterr's divided-difference denominators.
+const SPAN_COUNT: usize = (HISTORY_LEN + 1) * (HISTORY_LEN + 2) / 2;
+
+#[derive(Debug, Clone, PartialEq)]
+struct TruncationSpans {
+    /// Widest row first, then progressively shorter rows. The same trial
+    /// coefficients are used by every charge-storage device.
+    values: [Real; SPAN_COUNT],
+    /// Keep unavailable history or overflowing spans from rejecting a
+    /// legitimate integration trial that never requests truncation.
+    error: Option<&'static str>,
+}
+
+impl TruncationSpans {
+    fn new(deltas: &[Real; HISTORY_LEN + 1], order: usize) -> Self {
+        let mut values = [0.0; SPAN_COUNT];
+        let mut span = [0.0; HISTORY_LEN + 1];
+        span[..=order].copy_from_slice(&deltas[..=order]);
+        if span[..=order]
+            .iter()
+            .any(|dt| !dt.is_finite() || *dt <= 0.0)
+        {
+            return Self {
+                values,
+                error: Some("truncation-error steps must be positive and finite"),
+            };
+        }
+        let mut offset = 0;
+        for width in (1..=order + 1).rev() {
+            values[offset..offset + width].copy_from_slice(&span[..width]);
+            offset += width;
+            // Preserve C's exact order: span[i + 1] + delta[i], not a
+            // prefix-sum subtraction or an algebraically reassociated sum.
+            for i in 0..width - 1 {
+                span[i] = span[i + 1] + deltas[i];
+                if !span[i].is_finite() {
+                    return Self {
+                        values,
+                        error: Some("truncation-error span is not finite"),
+                    };
+                }
+            }
+        }
+        Self {
+            values,
+            error: None,
+        }
+    }
+
+    fn divided_difference(&self, charge: &[Real], order: usize) -> SpiceResult<Real> {
+        if let Some(error) = self.error {
+            return Err(cold_numerical(error));
+        }
+        let mut diff = [0.0; HISTORY_LEN + 2];
+        diff[..order + 2].copy_from_slice(&charge[..order + 2]);
+        let mut offset = 0;
+        for width in (1..=order + 1).rev() {
+            for (i, &span) in self.values[offset..offset + width].iter().enumerate() {
+                diff[i] = finite((diff[i] - diff[i + 1]) / span, "charge divided difference")?;
+            }
+            offset += width;
+        }
+        Ok(diff[0])
+    }
+}
+
 /// Immutable coefficients for one trial step.
 ///
 /// `ag()[0]` multiplies the present charge; the rest follow C `CKTag`. They
@@ -445,6 +512,7 @@ pub struct Coefficients {
     /// Older steps are placeholders (see [`StepHistory::with_fill`]).
     filled: bool,
     ag: [Real; HISTORY_LEN + 1],
+    truncation: TruncationSpans,
 }
 
 /// One integrated charge-storage element in companion form, as
@@ -705,45 +773,17 @@ impl Coefficients {
         if charge.iter().chain(&derivative).any(|v| !v.is_finite()) {
             return Err(numerical("nonfinite truncation-error history"));
         }
-        if self.deltas[..=order]
-            .iter()
-            .any(|dt| !dt.is_finite() || *dt <= 0.0)
-        {
-            return Err(numerical(
-                "truncation-error steps must be positive and finite",
-            ));
-        }
         let volttol = tol.abstol + tol.reltol * derivative[0].abs().max(derivative[1].abs());
         let chargetol =
             tol.reltol * charge[0].abs().max(charge[1].abs()).max(tol.chgtol) / self.dt();
         let tolerance = finite(volttol.max(chargetol), "truncation tolerance")?;
-        // Divided differences over the trial and accepted points.
-        let mut diff = [0.0; HISTORY_LEN + 2];
-        diff[..order + 2].copy_from_slice(&charge[..order + 2]);
-        let mut span = [0.0; HISTORY_LEN + 1];
-        span[..=order].copy_from_slice(&self.deltas[..=order]);
-        let mut j = order;
-        loop {
-            for i in 0..=j {
-                diff[i] = finite(
-                    (diff[i] - diff[i + 1]) / span[i],
-                    "charge divided difference",
-                )?;
-            }
-            if j == 0 {
-                break;
-            }
-            j -= 1;
-            for i in 0..=j {
-                span[i] = finite(span[i + 1] + self.deltas[i], "truncation-error span")?;
-            }
-        }
+        let difference = self.truncation.divided_difference(charge, order)?;
         // cktterr.c gearCoeff/trapCoeff (trial() guarantees the index).
         let factor = match self.method {
             IntegrationMethod::Trapezoidal => TRAP_ERROR_CONSTANTS[order - 1],
             IntegrationMethod::Gear { .. } => GEAR_ERROR_CONSTANTS[order - 1],
         };
-        let del = tol.trtol * tolerance / tol.abstol.max(factor * diff[0].abs());
+        let del = tol.trtol * tolerance / tol.abstol.max(factor * difference.abs());
         let del = match order {
             1 => del,
             2 => del.sqrt(),
@@ -777,6 +817,42 @@ mod tests {
     }
 
     /// Frozen binary64 results of the original unpivoted C-order corrector.
+    #[test]
+    fn prepared_truncation_spans_preserve_c_order_for_every_supported_order() {
+        let mut history = StepHistory::new();
+        for dt in [0.071, 0.143, 0.211, 0.137, 0.293, 0.019] {
+            history.accept(&history.trial(TRAP, 1, dt, DEFAULT_XMU).unwrap());
+        }
+        for order in 1..=6 {
+            let c = history
+                .trial(
+                    IntegrationMethod::Gear { order: 6 },
+                    order,
+                    0.079,
+                    DEFAULT_XMU,
+                )
+                .unwrap();
+            let order = usize::from(order);
+            for charge in [
+                [0.31, 0.24, 0.97, -0.35, 0.19, 0.463, 0.291, -0.44],
+                [1e18, -1e18, 0.01, 0.04, 0.06, -0.03, 0.07, 0.1],
+            ] {
+                let mut diff = charge;
+                let mut span = c.deltas;
+                for j in (0..=order).rev() {
+                    for i in 0..=j {
+                        diff[i] = (diff[i] - diff[i + 1]) / span[i];
+                    }
+                    for i in 0..j {
+                        span[i] = span[i + 1] + c.deltas[i];
+                    }
+                }
+                let actual = c.truncation.divided_difference(&charge, order).unwrap();
+                assert_eq!(actual.to_bits(), diff[0].to_bits(), "order {order}");
+            }
+        }
+    }
+
     #[test]
     fn gear_corrector_preserves_reference_operation_order() {
         let deltas = [0.125, 0.25, 0.1875, 0.375, 0.125, 0.3125, 0.0625];
