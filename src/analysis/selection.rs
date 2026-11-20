@@ -141,18 +141,26 @@ impl Selection {
         kind: AnalysisKind,
         requests: &[VectorRequest],
     ) -> SpiceResult<Self> {
-        if requests.is_empty() {
+        Self::resolve_refs(plot, kind, requests.iter())
+    }
+
+    /// Resolve borrowed requests, including routed batch cards, without
+    /// cloning their vector names or source locations.
+    pub(super) fn resolve_refs<'a>(
+        plot: &Plot,
+        kind: AnalysisKind,
+        requests: impl IntoIterator<Item = &'a VectorRequest>,
+    ) -> SpiceResult<Self> {
+        let mut requests = requests.into_iter().peekable();
+        if requests.peek().is_none() {
             return Ok(Self {
                 full: true,
                 columns: driver_columns(plot),
             });
         }
-        // `all` widens the written plot to the driver's whole set, but every
-        // other request is still resolved, so an unresolvable vector is an error
-        // rather than being dropped because an `all` happened to be present.
-        let full = requests
-            .iter()
-            .any(|request| request.vector == RequestedVector::All);
+        // All widens the output but must not suppress validation of the other
+        // requests, irrespective of its position in the source deck.
+        let mut full = false;
         let mut columns: Vec<Column> = Vec::new();
         // C's `beginPlot()` pass 0: the reference vector is always written first.
         if kind != AnalysisKind::OperatingPoint
@@ -168,6 +176,7 @@ impl Selection {
         }
         for request in requests {
             if request.vector == RequestedVector::All {
+                full = true;
                 continue;
             }
             let column = resolve_request(plot, request)?;

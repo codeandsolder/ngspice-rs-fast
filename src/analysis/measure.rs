@@ -121,20 +121,29 @@ pub fn resolve_with_scope(
     cards: &[MeasureCard],
     scope: &crate::netlist::eval::ParamScope,
 ) -> SpiceResult<Vec<Measurement>> {
-    if cards.is_empty() {
+    resolve_refs_with_scope(plot, kind, cards.iter(), scope)
+}
+
+pub(super) fn resolve_refs_with_scope<'a>(
+    plot: &Plot,
+    kind: AnalysisKind,
+    cards: impl Iterator<Item = &'a MeasureCard> + Clone,
+    scope: &crate::netlist::eval::ParamScope,
+) -> SpiceResult<Vec<Measurement>> {
+    let count = cards.clone().count();
+    if count == 0 {
         return Ok(Vec::new());
     }
     let axis = Axis::of(plot, kind)?;
-    let mut results = Vec::with_capacity(cards.len());
+    let mut results = Vec::with_capacity(count);
     let mut scope = std::sync::Arc::new(scope.clone());
     let mut budget = crate::netlist::eval::EvalBudget::default();
     for (index, card) in cards
-        .iter()
+        .clone()
         .enumerate()
         .filter(|(_, card)| !matches!(card.request, MeasureRequest::Parameter(_)))
         .chain(
             cards
-                .iter()
                 .enumerate()
                 .filter(|(_, card)| matches!(card.request, MeasureRequest::Parameter(_))),
         )
