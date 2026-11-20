@@ -759,6 +759,123 @@ impl Topology {
     }
 }
 
+/// Cached summaries of contiguous Markowitz-product blocks. They permit
+/// skipping ranges that cannot contain the next reference-order candidate.
+/// Dirty blocks are rebuilt on demand, never changing the candidate order.
+#[derive(Debug, Clone, Copy)]
+struct ProductSummary {
+    min: i64,
+    zeros: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PivotProducts {
+    values: Vec<i64>,
+    summaries: Vec<Option<ProductSummary>>,
+}
+
+impl PivotProducts {
+    const BLOCK: usize = u64::BITS as usize;
+    // For a short search, walking the contiguous products is cheaper
+    // than maintaining summaries. Amortize them over longer scans.
+    const MIN_INDEXED_PRODUCTS: usize = Self::BLOCK * 8 + 2;
+
+    fn new(len: usize) -> Self {
+        Self {
+            values: vec![0; len],
+            summaries: if len > Self::MIN_INDEXED_PRODUCTS {
+                vec![None; len.div_ceil(Self::BLOCK)]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn set(&mut self, i: usize, value: i64) {
+        if self.summaries.is_empty() {
+            self.values[i] = value;
+        } else if self.values[i] != value {
+            self.values[i] = value;
+            self.summaries[i / Self::BLOCK] = None;
+        }
+    }
+
+    fn swap(&mut self, a: usize, b: usize) {
+        let (x, y) = (self.values[a], self.values[b]);
+        self.set(a, y);
+        self.set(b, x);
+    }
+
+    fn summary(&mut self, block: usize) -> ProductSummary {
+        *self.summaries[block].get_or_insert_with(|| {
+            let start = block * Self::BLOCK;
+            let values = &self.values[start..(start + Self::BLOCK).min(self.values.len())];
+            let mut min = i64::MAX;
+            let mut zeros = 0;
+            for (i, &v) in values.iter().enumerate() {
+                min = min.min(v);
+                if v == 0 {
+                    zeros |= 1_u64 << i;
+                }
+            }
+            ProductSummary { min, zeros }
+        })
+    }
+
+    /// Greatest index strictly before the cursor with product below limit.
+    /// Sentinels ensure the search has a match in the C pivot routine.
+    fn previous_below(&mut self, mut before: usize, limit: i64) -> Option<usize> {
+        if self.summaries.is_empty() {
+            return self.values[..before].iter().rposition(|&v| v < limit);
+        }
+        while before != 0 {
+            let block = (before - 1) / Self::BLOCK;
+            let start = block * Self::BLOCK;
+            if (before - start != Self::BLOCK || self.summary(block).min < limit)
+                && let Some(pos) = self.values[start..before].iter().rposition(|&v| v < limit)
+            {
+                return Some(start + pos);
+            }
+            before = start;
+        }
+        None
+    }
+
+    /// Greatest zero-product index strictly before the cursor.
+    fn previous_zero(&mut self, mut before: usize) -> Option<usize> {
+        if self.summaries.is_empty() {
+            return self.values[..before].iter().rposition(|&v| v == 0);
+        }
+        while before != 0 {
+            let block = (before - 1) / Self::BLOCK;
+            let start = block * Self::BLOCK;
+            let len = before - start;
+            if len == Self::BLOCK {
+                let mask = self.summary(block).zeros;
+                if mask != 0 {
+                    return Some(start + (u64::BITS - 1 - mask.leading_zeros()) as usize);
+                }
+            } else if let Some(pos) = self.values[start..before].iter().rposition(|&v| v == 0) {
+                return Some(start + pos);
+            }
+            before = start;
+        }
+        None
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
+impl std::ops::Index<usize> for PivotProducts {
+    type Output = i64;
+    fn index(&self, index: usize) -> &i64 {
+        &self.values[index]
+    }
+}
+
 /// A SPARSE matrix frame (`struct MatrixFrame`) with 1-based internal and
 /// external indices; external index 0 (ground) is never used here.
 #[derive(Debug, Clone)]
@@ -778,7 +895,7 @@ pub(super) struct Sparse<T> {
     plan: Option<std::sync::Arc<FactorPlan>>,
     markowitz_row: Vec<i64>,
     markowitz_col: Vec<i64>,
-    markowitz_prod: Vec<i64>,
+    markowitz_prod: PivotProducts,
     singletons: i64,
     rel_threshold: f64,
     abs_threshold: f64,
@@ -817,7 +934,7 @@ impl<T: Scalar> Sparse<T> {
             plan: None,
             markowitz_row: Vec::new(),
             markowitz_col: Vec::new(),
-            markowitz_prod: Vec::new(),
+            markowitz_prod: PivotProducts::default(),
             singletons: 0,
             rel_threshold: DEFAULT_THRESHOLD,
             abs_threshold: 0.0,
@@ -1048,7 +1165,7 @@ impl<T: Scalar> Sparse<T> {
             plan: self.plan.clone(),
             markowitz_row: Vec::new(),
             markowitz_col: Vec::new(),
-            markowitz_prod: Vec::new(),
+            markowitz_prod: PivotProducts::default(),
             singletons: 0,
             rel_threshold: self.rel_threshold,
             abs_threshold: self.abs_threshold,
@@ -1512,7 +1629,7 @@ impl<T: Scalar> Sparse<T> {
         let size = self.size;
         self.markowitz_row = vec![0; size + 1];
         self.markowitz_col = vec![0; size + 1];
-        self.markowitz_prod = vec![0; size + 2];
+        self.markowitz_prod = PivotProducts::new(size + 2);
     }
 
     /// `CountMarkowitz` (no RHS).
@@ -1548,7 +1665,7 @@ impl<T: Scalar> Sparse<T> {
         self.singletons = 0;
         for i in step..=self.size {
             let product = self.markowitz_row[i].saturating_mul(self.markowitz_col[i]);
-            self.markowitz_prod[i] = product;
+            self.markowitz_prod.set(i, product);
             if product == 0 {
                 self.singletons += 1;
             }
@@ -1580,10 +1697,10 @@ impl<T: Scalar> Sparse<T> {
     /// `SearchForSingleton`.
     fn search_for_singleton(&mut self, step: usize) -> Option<usize> {
         let size = self.size;
-        self.markowitz_prod[size + 1] = self.markowitz_prod[step];
+        self.markowitz_prod.set(size + 1, self.markowitz_prod[step]);
         let mut singletons = self.singletons;
         self.singletons -= 1;
-        self.markowitz_prod[step - 1] = 0;
+        self.markowitz_prod.set(step - 1, 0);
         // C advances a pointer *after* testing each product. Track the
         // next index plus one instead: the first read is size + 1 and each
         // subsequent read moves left, preserving C's sentinel and pivot
@@ -1591,12 +1708,10 @@ impl<T: Scalar> Sparse<T> {
         let mut cursor = size + 2;
         while singletons > 0 {
             singletons -= 1;
-            loop {
-                cursor -= 1;
-                if self.markowitz_prod[cursor] == 0 {
-                    break;
-                }
-            }
+            cursor = self
+                .markowitz_prod
+                .previous_zero(cursor)
+                .expect("singleton sentinel");
             let mut i = cursor;
             if i < step {
                 break;
@@ -1623,16 +1738,14 @@ impl<T: Scalar> Sparse<T> {
         let size = self.size;
         let mut chosen = NONE;
         let mut min = i64::MAX;
-        self.markowitz_prod[size + 1] = self.markowitz_prod[step];
-        self.markowitz_prod[step - 1] = -1;
+        self.markowitz_prod.set(size + 1, self.markowitz_prod[step]);
+        self.markowitz_prod.set(step - 1, -1);
         let mut p = size + 2;
         loop {
-            loop {
-                p -= 1;
-                if self.markowitz_prod[p] < min {
-                    break;
-                }
-            }
+            p = self
+                .markowitz_prod
+                .previous_below(p, min)
+                .expect("diagonal sentinel");
             let mut i = p;
             if i < step {
                 break;
@@ -1700,7 +1813,7 @@ impl<T: Scalar> Sparse<T> {
         let mut min = i64::MAX;
         let mut ties = 0;
         let mut accepted_ratio = 0.0;
-        self.markowitz_prod[size + 1] = self.markowitz_prod[step];
+        self.markowitz_prod.set(size + 1, self.markowitz_prod[step]);
         for j in (step + 1..=size + 1).rev() {
             let product = self.markowitz_prod[j];
             if product > min {
@@ -1880,13 +1993,13 @@ impl<T: Scalar> Sparse<T> {
             if row != step {
                 self.row_exchange(step, row);
                 self.interchanges_odd = !self.interchanges_odd;
-                self.markowitz_prod[row] = self.product_of(row);
+                self.markowitz_prod.set(row, self.product_of(row));
                 self.track_singleton(self.markowitz_prod[row], old_row);
             }
             if col != step {
                 self.col_exchange(step, col);
                 self.interchanges_odd = !self.interchanges_odd;
-                self.markowitz_prod[col] = self.product_of(col);
+                self.markowitz_prod.set(col, self.product_of(col));
                 self.track_singleton(self.markowitz_prod[col], old_col);
                 std::sync::Arc::make_mut(&mut self.topology).diag[col] =
                     self.find_element_in_col(Slot::Head(col), col, col, false);
@@ -1897,7 +2010,7 @@ impl<T: Scalar> Sparse<T> {
             }
             std::sync::Arc::make_mut(&mut self.topology).diag[step] =
                 self.find_element_in_col(Slot::Head(step), step, step, false);
-            self.markowitz_prod[step] = self.product_of(step);
+            self.markowitz_prod.set(step, self.product_of(step));
             self.track_singleton(self.markowitz_prod[step], old_step);
         }
     }
@@ -1968,7 +2081,7 @@ impl<T: Scalar> Sparse<T> {
         while e != NONE {
             let row = self.topology.elements[e].row;
             self.markowitz_row[row] -= 1;
-            self.markowitz_prod[row] = self.product_of(row);
+            self.markowitz_prod.set(row, self.product_of(row));
             if self.markowitz_row[row] == 0 {
                 self.singletons += 1;
             }
@@ -1978,7 +2091,7 @@ impl<T: Scalar> Sparse<T> {
         while e != NONE {
             let col = self.topology.elements[e].col;
             self.markowitz_col[col] -= 1;
-            self.markowitz_prod[col] = self.product_of(col);
+            self.markowitz_prod.set(col, self.product_of(col));
             if self.markowitz_col[col] == 0 && self.markowitz_row[col] != 0 {
                 self.singletons += 1;
             }
@@ -1996,12 +2109,12 @@ impl<T: Scalar> Sparse<T> {
         });
         let element = self.create_element(row, col, above, true);
         self.markowitz_row[row] += 1;
-        self.markowitz_prod[row] = self.product_of(row);
+        self.markowitz_prod.set(row, self.product_of(row));
         if self.markowitz_row[row] == 1 && self.markowitz_col[row] != 0 {
             self.singletons -= 1;
         }
         self.markowitz_col[col] += 1;
-        self.markowitz_prod[col] = self.product_of(col);
+        self.markowitz_prod.set(col, self.product_of(col));
         if self.markowitz_row[col] != 0 && self.markowitz_col[col] == 1 {
             self.singletons -= 1;
         }
@@ -2217,6 +2330,29 @@ mod tests {
             .zip(b)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn pivot_product_summaries_match_reference_reverse_searches() {
+        for size in [1, 63, 64, 323, 514, 515, 1027] {
+            let mut products = PivotProducts::new(size);
+            let mut seed = 71_u64;
+            for i in 0..6000 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let at = ((seed >> 32) as usize) % size;
+                let v = ((seed >> 48) % 17) as i64 - 2;
+                products.set(at, v);
+                if i % 11 == 0 {
+                    products.swap(at, (at + 99) % size);
+                }
+                let before = ((seed >> 16) as usize) % (size + 1);
+                let limit = ((seed >> 40) % 20) as i64 - 3;
+                let expect = products.values[..before].iter().rposition(|&v| v < limit);
+                assert_eq!(products.previous_below(before, limit), expect);
+                let expect = products.values[..before].iter().rposition(|&v| v == 0);
+                assert_eq!(products.previous_zero(before), expect);
+            }
+        }
     }
 
     #[test]
@@ -2706,14 +2842,18 @@ mod tests {
         // positions. Otherwise the scan proceeds from the highest index.
         let mut m = build(4, &[(1, 1, 5.), (2, 2, 2.), (3, 3, 3.), (4, 4, 4.)]);
         m.create_internal_vectors();
-        m.markowitz_prod[1..=4].copy_from_slice(&[0, 0, 0, 0]);
+        for i in 1..=4 {
+            m.markowitz_prod.set(i, 0);
+        }
         m.singletons = 4;
         let pivot = m.search_for_singleton(1).unwrap();
         assert_eq!(m.topology.elements[pivot].row, 1);
 
         // The sentinel is not a singleton: the search selects the highest
         // remaining zero-product diagonal, never reading a negative index.
-        m.markowitz_prod[1..=4].copy_from_slice(&[1, 1, 0, 0]);
+        for (i, v) in [1, 1, 0, 0].into_iter().enumerate() {
+            m.markowitz_prod.set(i + 1, v);
+        }
         m.singletons = 2;
         let pivot = m.search_for_singleton(1).unwrap();
         assert_eq!(m.topology.elements[pivot].row, 4);

@@ -855,7 +855,14 @@ impl SparseMatrix {
                 }
             }
         }
-        for triplet in self.triplets.iter_mut().filter(|t| t.row == row) {
+        let triplets = if self.folded {
+            let start = self.triplets.partition_point(|t| t.row < row);
+            let end = start + self.triplets[start..].partition_point(|t| t.row == row);
+            &mut self.triplets[start..end]
+        } else {
+            &mut self.triplets[..]
+        };
+        for triplet in triplets.iter_mut().filter(|t| t.row == row) {
             if keep(triplet.col) {
                 kept = true;
             } else {
@@ -872,14 +879,26 @@ impl SparseMatrix {
     ///
     /// [`SpiceError::Numerical`] when the position is out of range.
     pub fn set(&mut self, row: usize, col: usize, value: Real) -> SpiceResult<()> {
-        self.triplets.retain(|t| t.row != row || t.col != col);
         if let Some(bound) = &mut self.bound
             && let Some(id) = bound.pattern.find(row, col)
         {
+            // Overflow coordinates are disjoint from the pattern.
             bound.view.take();
             bound.values[id.index()] = value;
             return Ok(());
         }
+        if self.folded {
+            if let Ok(i) = self
+                .triplets
+                .binary_search_by_key(&(row, col), |t| (t.row, t.col))
+            {
+                self.triplets.remove(i);
+            }
+        } else {
+            self.triplets.retain(|t| t.row != row || t.col != col);
+        }
+        // Preserve the unbound stamp sequence: replacement is appended,
+        // rather than moved into the folded row-major run.
         self.add(row, col, value)
     }
 
@@ -1174,6 +1193,45 @@ impl SparseMatrix {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn indexed_edits_preserve_overflow_and_standalone_stamp_order() {
+        let pattern = Arc::new(Pattern::new(4, [(0, 0), (1, 1), (2, 2), (3, 3)]));
+        let mut a = SparseMatrix::bound(pattern);
+        a.add(1, 3, 2.).unwrap();
+        a.add(1, 3, 1.).unwrap();
+        a.set(1, 1, 4.).unwrap();
+        assert_eq!(
+            a.triplets()
+                .iter()
+                .map(|t| (t.row, t.col, t.value))
+                .collect::<Vec<_>>(),
+            [(1, 1, 4.), (1, 3, 3.)]
+        );
+        a.set(1, 1, 5.).unwrap();
+        assert_eq!(a.get(1, 3), 3.);
+        assert_eq!(a.triplets()[0].value, 5.);
+        a.fold_duplicates();
+        a.zero_row(1, |c| c == 1);
+        assert_eq!(a.get(1, 3), 0.);
+        assert_eq!(a.get(1, 1), 5.);
+
+        let mut plain = SparseMatrix::new(4, 4);
+        for (r, c, v) in [(3, 3, 9.), (1, 3, 2.), (1, 1, 4.), (0, 0, 1.)] {
+            plain.add(r, c, v).unwrap();
+        }
+        plain.fold_duplicates();
+        assert!(plain.zero_row(1, |c| c == 1));
+        assert_eq!(plain.triplets()[2].value, 0.);
+        plain.set(1, 1, 7.).unwrap();
+        let positions = plain
+            .triplets()
+            .iter()
+            .map(|t| (t.row, t.col, t.value))
+            .collect::<Vec<_>>();
+        assert_eq!(positions, [(0, 0, 1.), (1, 3, 0.), (3, 3, 9.), (1, 1, 7.)]);
+        assert_eq!(plain.get(1, 1), 7.);
+    }
+
     #[test]
     fn folding_compacts_in_place_in_stable_stamp_order() {
         let mut matrix = SparseMatrix::new(3, 3);
