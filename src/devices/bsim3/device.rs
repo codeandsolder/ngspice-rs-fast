@@ -29,17 +29,18 @@
 )]
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
-use super::{ModelParameters, Value, charges, dc};
+use super::{Inputs, ModelParameters, Value, charges, dc};
 use crate::devices::models::{ModelContext, ResolvedModel};
 use crate::devices::nonlinear::{JunctionPoint, junction_companion};
 use crate::devices::state::{DeviceState, IterationPhase};
 use crate::devices::traits::{Device, StampContext};
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// State slots. The first block is `b3ld.c`'s DC state; the charge block
 /// follows C's `bsim3def.h` order, with each integrated charge immediately
@@ -132,11 +133,12 @@ pub struct Bsim3 {
     /// Drain/source prime nodes, present when C's series conductance is nonzero.
     primes: [Option<NodeId>; 2],
     params: ModelParameters,
-    instance: DeviceInstance,
+    inputs: Inputs,
+    location: SourceLoc,
     polarity: Real,
     off: bool,
     ic: [Option<Real>; 3],
-    cache: RefCell<Option<Cached>>,
+    cache: RefCell<Option<Rc<Cached>>>,
 }
 
 impl std::fmt::Debug for Bsim3 {
@@ -212,23 +214,25 @@ impl Bsim3 {
             primes,
             polarity: Real::from(setup.polarity),
             params,
-            instance: instance.clone(),
+            inputs,
+            location: instance.location.clone(),
             off,
             ic,
-            cache: RefCell::new(Some(Cached {
+            cache: RefCell::new(Some(Rc::new(Cached {
                 temperature: context.temperature,
                 nominal: context.nominal_temperature,
                 defaults,
                 temperature_model,
                 setup,
-            })),
+            }))),
         };
         Ok(Box::new(device))
     }
 
     /// The setup for these temperatures, rebuilt when C would re-run
-    /// `BSIM3temp`. A snapshot is returned so no borrow outlives the call.
-    fn ensure(&self, temperature: Real, nominal: Real) -> SpiceResult<Cached> {
+    /// `BSIM3temp`. Share the immutable snapshot so no cell borrow outlives
+    /// the call and repeated loads do not clone the parameter tables.
+    fn ensure(&self, temperature: Real, nominal: Real) -> SpiceResult<Rc<Cached>> {
         let mut cache = self
             .cache
             .try_borrow_mut()
@@ -239,31 +243,18 @@ impl Bsim3 {
         if !matches {
             let context = ModelContext::new(temperature, nominal);
             let defaults = self.params.model_defaults(&context)?;
-            let temperature_model =
-                defaults.at_temperature(temperature, &self.instance.location)?;
-            let inputs = self.params.instance_parameters(&self.instance, 1.)?;
-            let setup = InstanceSetup::new(
-                &defaults,
-                &temperature_model,
-                &inputs,
-                &self.instance.location,
-            )?;
-            *cache = Some(Cached {
+            let temperature_model = defaults.at_temperature(temperature, &self.location)?;
+            let setup =
+                InstanceSetup::new(&defaults, &temperature_model, &self.inputs, &self.location)?;
+            *cache = Some(Rc::new(Cached {
                 temperature,
                 nominal,
                 defaults,
                 temperature_model,
                 setup,
-            });
+            }));
         }
-        let cached = cache.as_ref().expect("present");
-        Ok(Cached {
-            temperature: cached.temperature,
-            nominal: cached.nominal,
-            defaults: cached.defaults.clone(),
-            temperature_model: cached.temperature_model.clone(),
-            setup: cached.setup.clone(),
-        })
+        Ok(Rc::clone(cache.as_ref().expect("present")))
     }
 
     /// C `b3getic.c`: under `uic`, unset IC components are the terminal

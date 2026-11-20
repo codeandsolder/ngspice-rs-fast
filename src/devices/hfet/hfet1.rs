@@ -68,7 +68,8 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
-use crate::devices::initial::{InstanceInitial, split};
+use super::{CELSIUS_TO_KELVIN, HFET_INSTANCE as INSTANCE, HfetInstance as Instance};
+use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{self, BOLTZMANN, CHARGE, p};
 use crate::devices::limiting;
 use crate::devices::nonlinear::{JunctionPoint, junction_companion};
@@ -92,8 +93,6 @@ use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResu
 const EPSILON_GAAS: Real = 12.244 * 8.854_18e-12;
 /// C `CONSTKoverQ`.
 const K_OVER_Q: Real = BOLTZMANN / CHARGE;
-/// C `CONSTCtoK`.
-const CELSIUS_TO_KELVIN: Real = 273.15;
 /// `hfeta`'s carrier-density cutoff (`nsm < 1.0e-38` turns the channel off).
 const N_MIN: Real = 1e-38;
 
@@ -200,18 +199,6 @@ const MODEL: &[P] = &[
     p("kvto", U::Dimensionless, D::Finite, Some(0.)),
     p("level", U::Dimensionless, D::Finite, Some(5.)),
 ];
-
-/// `HFETApTable`'s scalar instance setters (`hfetparam.c`).
-const INSTANCE: &[P] = &[
-    p("l", U::Metre, D::Positive, Some(1e-6)),
-    p("w", U::Metre, D::Positive, Some(20e-6)),
-    p("m", U::Dimensionless, D::Positive, Some(1.)),
-    p("temp", U::Celsius, D::Temperature, None),
-    p("dtemp", U::Dimensionless, D::Finite, Some(0.)),
-];
-
-/// The `IC` vector components (`hfetparam.c`): `ICVDS`, then `ICVGS`.
-pub(super) const IC_COMPONENTS: [&str; 2] = ["icvds", "icvgs"];
 
 /// The validated model card.
 #[derive(Debug, Clone, Copy)]
@@ -405,51 +392,6 @@ impl Model {
     }
 }
 
-/// Validated instance setters (`hfetparam.c`).
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Instance {
-    pub(super) l: Real,
-    pub(super) w: Real,
-    pub(super) m: Real,
-    /// Celsius as written (`hfetparam.c` adds 273.15); `None` is
-    /// `CKTtemp + dtemp`, used as kelvin.
-    pub(super) temp: Option<Real>,
-    pub(super) dtemp: Real,
-}
-
-impl Instance {
-    pub(super) fn resolve(
-        i: &DeviceInstance,
-    ) -> SpiceResult<(
-        InstanceInitial,
-        Vec<crate::netlist::ast::ParameterAssignment>,
-    )> {
-        split(&i.parameters, &IC_COMPONENTS)
-    }
-
-    pub(super) fn validate(
-        defaults: &[&crate::netlist::ast::ParameterAssignment],
-        setters: &[crate::netlist::ast::ParameterAssignment],
-        owner: &crate::primitives::SourceLoc,
-    ) -> SpiceResult<Self> {
-        let values = crate::devices::schema::with_defaults(
-            &ScalarSchema {
-                parameters: INSTANCE,
-            },
-            defaults,
-            setters.iter(),
-            owner,
-        )?;
-        Ok(Self {
-            l: jfet::required(&values, "l")?,
-            w: jfet::required(&values, "w")?,
-            m: jfet::required(&values, "m")?,
-            temp: values.get("temp").map(|v| v.value),
-            dtemp: jfet::required(&values, "dtemp")?,
-        })
-    }
-}
-
 /// `hfettemp.c`'s per-instance quantities.
 #[derive(Debug, Clone, Copy)]
 struct Derived {
@@ -612,7 +554,7 @@ impl Hfet1 {
     fn derived(&self, temperature: Real) -> SpiceResult<Derived> {
         let model = &self.model;
         let instance = &self.instance;
-        let temp = self.temperature(temperature);
+        let temp = self.instance.temperature(temperature);
         let nominal = temperature + CELSIUS_TO_KELVIN;
         let delta = temp - nominal;
         // `hfettemp.c` multiplied the stored threshold by the type before
@@ -1276,15 +1218,6 @@ impl Hfet1 {
             gmd: channel.gmd,
         })
     }
-
-    /// The total instance temperature in kelvin, `hfettemp.c`'s rule for asks.
-    fn temperature(&self, temperature: Real) -> Real {
-        self.instance
-            .temp
-            .map_or(temperature + CELSIUS_TO_KELVIN + self.instance.dtemp, |v| {
-                v + CELSIUS_TO_KELVIN
-            })
-    }
 }
 
 impl Device for Hfet1 {
@@ -1338,7 +1271,7 @@ impl Device for Hfet1 {
             "m" => Some(self.instance.m),
             "icvds" => self.initial.values[0],
             "icvgs" => self.initial.values[1],
-            "temp" => Some(self.temperature(context.temperature) - CELSIUS_TO_KELVIN),
+            "temp" => Some(self.instance.temperature(context.temperature) - CELSIUS_TO_KELVIN),
             "dtemp" => Some(self.instance.dtemp),
             _ => None,
         })
@@ -2099,8 +2032,7 @@ impl DeviceSensitivity for Hfet1Sensitivity<'_> {
             // `hfetparam.c` stores `temp` in kelvin.
             (
                 "temp",
-                i.temp
-                    .map_or(self.circuit_kelvin + i.dtemp, |c| c + CELSIUS_TO_KELVIN),
+                i.temperature_at_kelvin(self.circuit_kelvin),
                 i.temp.is_some(),
             ),
             ("dtemp", i.dtemp, true),

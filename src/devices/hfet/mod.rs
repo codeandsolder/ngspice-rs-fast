@@ -40,12 +40,84 @@ pub(crate) mod hfet1;
 pub(crate) mod hfet2;
 pub(crate) mod mesa;
 
+use crate::devices::initial::{InstanceInitial, split};
 use crate::devices::jfet::{self, CHARGE, p};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::{ModelFamily, ResolvedModel};
+use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{Real, SpiceError, SpiceResult};
+
+/// C `CONSTCtoK`.
+pub(super) const CELSIUS_TO_KELVIN: Real = 273.15;
+
+/// Common HFET1/HFET2 scalar instance setters.
+pub(super) const HFET_INSTANCE: &[P] = &[
+    p("l", U::Metre, D::Positive, Some(1e-6)),
+    p("w", U::Metre, D::Positive, Some(20e-6)),
+    p("m", U::Dimensionless, D::Positive, Some(1.)),
+    p("temp", U::Celsius, D::Temperature, None),
+    p("dtemp", U::Dimensionless, D::Finite, Some(0.)),
+];
+
+/// The `IC` vector components (`hfetparam.c`): `ICVDS`, then `ICVGS`.
+const HFET_IC_COMPONENTS: [&str; 2] = ["icvds", "icvgs"];
+
+/// Validated HFET1/HFET2 instance setters (not MESA).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct HfetInstance {
+    pub(super) l: Real,
+    pub(super) w: Real,
+    pub(super) m: Real,
+    /// Celsius as written (`hfetparam.c` adds 273.15); `None` is
+    /// `CKTtemp + dtemp`, used as kelvin.
+    pub(super) temp: Option<Real>,
+    pub(super) dtemp: Real,
+}
+
+impl HfetInstance {
+    pub(super) fn resolve(
+        i: &DeviceInstance,
+    ) -> SpiceResult<(
+        InstanceInitial,
+        Vec<crate::netlist::ast::ParameterAssignment>,
+    )> {
+        split(&i.parameters, &HFET_IC_COMPONENTS)
+    }
+
+    pub(super) fn validate(
+        defaults: &[&crate::netlist::ast::ParameterAssignment],
+        setters: &[crate::netlist::ast::ParameterAssignment],
+        owner: &crate::primitives::SourceLoc,
+    ) -> SpiceResult<Self> {
+        let values = crate::devices::schema::with_defaults(
+            &ScalarSchema {
+                parameters: HFET_INSTANCE,
+            },
+            defaults,
+            setters.iter(),
+            owner,
+        )?;
+        Ok(Self {
+            l: jfet::required(&values, "l")?,
+            w: jfet::required(&values, "w")?,
+            m: jfet::required(&values, "m")?,
+            temp: values.get("temp").map(|v| v.value),
+            dtemp: jfet::required(&values, "dtemp")?,
+        })
+    }
+
+    /// C instance temperature in kelvin: an explicit TEMP overrides DTEMP.
+    pub(super) fn temperature(&self, circuit_celsius: Real) -> Real {
+        self.temperature_at_kelvin(circuit_celsius + CELSIUS_TO_KELVIN)
+    }
+
+    pub(super) fn temperature_at_kelvin(&self, circuit_kelvin: Real) -> Real {
+        self.temp
+            .map_or(circuit_kelvin + self.dtemp, |v| v + CELSIUS_TO_KELVIN)
+    }
+}
 
 /// Model setters of `MESAmPTable` with `mesasetup.c`'s defaults. `vto` is the
 /// cardinal spelling and `vt0` its `IOPR` alias; `phib1`/`tphib`,
@@ -387,5 +459,40 @@ impl Instance {
             ts: values.get("ts").map(|v| v.value),
             dtemp: jfet::required(&values, "dtemp")?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hfet_temperature_uses_explicit_value_or_circuit_offset_in_c_order() {
+        let mut instance = HfetInstance {
+            l: 1e-6,
+            w: 20e-6,
+            m: 1.,
+            temp: None,
+            dtemp: 12.3,
+        };
+        let circuit_celsius: Real = 37.1;
+        let circuit_kelvin = circuit_celsius + CELSIUS_TO_KELVIN;
+        assert_eq!(
+            instance.temperature(circuit_celsius).to_bits(),
+            (circuit_kelvin + instance.dtemp).to_bits()
+        );
+        assert_eq!(
+            instance.temperature_at_kelvin(circuit_kelvin).to_bits(),
+            instance.temperature(circuit_celsius).to_bits()
+        );
+        instance.temp = Some(-11.7);
+        assert_eq!(
+            instance.temperature(circuit_celsius).to_bits(),
+            (-11.7 + CELSIUS_TO_KELVIN).to_bits()
+        );
+        assert_eq!(
+            instance.temperature_at_kelvin(circuit_kelvin).to_bits(),
+            instance.temperature(circuit_celsius).to_bits()
+        );
     }
 }

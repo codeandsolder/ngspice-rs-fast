@@ -142,8 +142,13 @@ impl Bsim4 {
             swept: Vec::new(),
             shared: Rc::new(RefCell::new(Shared::default())),
         };
-        device.created = device.setup(context.nominal_temperature)?.created;
-        let prepared = device.prepare(context.temperature, context.nominal_temperature)?;
+        let mut setup = device.setup(context.nominal_temperature)?;
+        device.created = std::mem::take(&mut setup.created);
+        let prepared = device.prepare(
+            context.temperature,
+            context.nominal_temperature,
+            Some(setup),
+        )?;
         let mut staged = nodes.clone();
         let external: Vec<NodeId> = instance.nodes.iter().map(|n| staged.intern(n)).collect();
         device.terminals.clone_from(&external);
@@ -210,34 +215,25 @@ impl Bsim4 {
     /// first call's model and instance, apply the swept values, and run the
     /// temperature pass unchecked. (The first call's nominal temperature is
     /// the one setup used; C does not re-run setup either.)
-    fn prepare(&self, temperature: Real, nominal: Real) -> SpiceResult<Prepared> {
-        let first = self
-            .shared
-            .try_borrow()
-            .ok()
-            .and_then(|shared| shared.setups.first().cloned());
-        let (mut model, mut instance, mut warnings, check) = match first {
-            None => {
-                let SetUp {
-                    model,
-                    instance,
-                    warnings,
-                    created,
-                } = self.setup(nominal)?;
-                if created != self.created && !self.created.is_empty() {
-                    return Err(SpiceError::circuit(format!(
-                        "{}: BSIM4 internal nodes changed between setups",
-                        self.name
-                    )));
-                }
-                (model, instance, warnings, true)
-            }
-            Some(first) => (
+    fn prepare(
+        &self,
+        temperature: Real,
+        nominal: Real,
+        initial: Option<SetUp>,
+    ) -> SpiceResult<Prepared> {
+        let (mut model, mut instance, mut warnings, check) = if let Some(setup) = initial {
+            (setup.model, setup.instance, setup.warnings, true)
+        } else {
+            let shared = self.borrow_shared()?;
+            let first = shared.setups.first().ok_or_else(|| {
+                SpiceError::circuit(format!("{}: missing initial BSIM4 setup", self.name))
+            })?;
+            (
                 first.model.clone(),
                 first.instance.clone(),
                 Vec::new(),
                 false,
-            ),
+            )
         };
         for &(field, given, value) in &self.swept {
             let slot = instance.real_mut(field).ok_or_else(|| {
@@ -298,7 +294,7 @@ impl Bsim4 {
                 return Ok(Rc::clone(prepared));
             }
         }
-        let prepared = Rc::new(self.prepare(temperature, nominal)?);
+        let prepared = Rc::new(self.prepare(temperature, nominal, None)?);
         let mut shared = self.borrow_shared_mut()?;
         // The first setup is C's struct as `BSIM4setup` and the checked
         // `BSIM4temp` left it; later passes start from it, so keep it.
