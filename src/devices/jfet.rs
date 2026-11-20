@@ -1917,7 +1917,10 @@ mod tests {
                 |_| panic!("all history exists"),
                 |x, y| {
                     calls.push([x, y]);
-                    Ok((x * x + x * y + y * y, 2. * x + y, x + 2. * y))
+                    let x_squared = x * x;
+                    let cross = x * y;
+                    let y_squared = y * y;
+                    Ok((x_squared + cross + y_squared, 2. * x + y, x + 2. * y))
                 },
             )
             .unwrap();
