@@ -165,10 +165,29 @@ pub struct InstanceSetup {
 pub struct ModelSetup {
     defaults: ModelDefaults,
     temperature: TemperatureModel,
+    checks: ModelChecks,
+}
+
+/// Only these four model fields are mutated by the instance check pass.
+/// A standalone instance needs its own copy of these scalars, not a clone
+/// of the immutable defaulted model and temperature tables.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ModelChecks {
     cgdo: Real,
     cgso: Real,
     cgbo: Real,
     calcacm: i32,
+}
+
+impl ModelChecks {
+    fn new(defaults: &ModelDefaults) -> SpiceResult<Self> {
+        Ok(Self {
+            cgdo: model_value(defaults, "cgdo")?,
+            cgso: model_value(defaults, "cgso")?,
+            cgbo: model_value(defaults, "cgbo")?,
+            calcacm: defaults.integer("calcacm")?,
+        })
+    }
 }
 
 impl ModelSetup {
@@ -178,10 +197,7 @@ impl ModelSetup {
     /// Missing internal model fields.
     pub fn new(defaults: ModelDefaults, temperature: TemperatureModel) -> SpiceResult<Self> {
         Ok(Self {
-            cgdo: model_value(&defaults, "cgdo")?,
-            cgso: model_value(&defaults, "cgso")?,
-            cgbo: model_value(&defaults, "cgbo")?,
-            calcacm: defaults.integer("calcacm")?,
+            checks: ModelChecks::new(&defaults)?,
             defaults,
             temperature,
         })
@@ -209,7 +225,13 @@ impl ModelSetup {
         instance: &Inputs,
         location: &SourceLoc,
     ) -> SpiceResult<InstanceSetup> {
-        InstanceSetup::with_model(self, instance, location)
+        InstanceSetup::with_model(
+            &self.defaults,
+            &self.temperature,
+            &mut self.checks,
+            instance,
+            location,
+        )
     }
 }
 
@@ -249,23 +271,23 @@ impl InstanceSetup {
         instance: &Inputs,
         location: &SourceLoc,
     ) -> SpiceResult<Self> {
-        let mut shared = ModelSetup::new(model.clone(), temperature.clone())?;
-        Self::with_model(&mut shared, instance, location)
+        let mut checks = ModelChecks::new(model)?;
+        Self::with_model(model, temperature, &mut checks, instance, location)
     }
 
     fn with_model(
-        shared: &mut ModelSetup,
+        model: &ModelDefaults,
+        temperature: &TemperatureModel,
+        checks: &mut ModelChecks,
         instance: &Inputs,
         location: &SourceLoc,
     ) -> SpiceResult<Self> {
-        let ModelSetup {
-            defaults: model,
-            temperature,
+        let ModelChecks {
             cgdo: model_cgdo,
             cgso: model_cgso,
             cgbo: model_cgbo,
             calcacm,
-        } = shared;
+        } = checks;
         let acm = model.integer("acm")?;
         if acm != 0 {
             return Err(SpiceError::not_yet_ported(

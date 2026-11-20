@@ -263,18 +263,19 @@ pub fn select_bin<'a>(
     instance: &DeviceInstance,
     options: &BinOptions,
 ) -> SpiceResult<BinOutcome<'a>> {
-    let binnable: Vec<&'a ModelCard> = candidates
+    let mut binnable = candidates
         .iter()
+        .rev()
         .copied()
         .filter(|card| is_binnable(card))
-        .collect();
-    if binnable.is_empty() {
+        .peekable();
+    if binnable.peek().is_none() {
         return Ok(BinOutcome::NoBinnableCandidate);
     }
     let Some(geometry) = BinGeometry::from_instance(instance, options)? else {
         return Ok(BinOutcome::MissingGeometry);
     };
-    for card in binnable.into_iter().rev() {
+    for card in binnable {
         if BinBounds::from_card(card)?.is_some_and(|bounds| bounds.contains(geometry)) {
             return Ok(BinOutcome::Selected(card));
         }
@@ -513,6 +514,29 @@ mod tests {
             ..options
         };
         assert!(BinGeometry::from_instance(&mos(&base), &bad_scale).is_err());
+    }
+
+    #[test]
+    fn selection_keeps_error_precedence_and_stops_at_first_matching_bin() {
+        let unsupported = card("n.1", "nmos", 1., &[]);
+        let malformed = bsim3("n.2", ("x", "2u"), ("0.5u", "5u"));
+        let good = bsim3("n.3", ("0.5u", "2u"), ("0.5u", "5u"));
+        let instance = mos(&[("l", "1u"), ("w", "1u")]);
+        let options = BinOptions::default();
+        let invalid_options = BinOptions {
+            scale: 0.,
+            ..options
+        };
+        assert_eq!(
+            select_bin(&[&unsupported], &instance, &invalid_options).unwrap(),
+            BinOutcome::NoBinnableCandidate
+        );
+        assert!(select_bin(&[&good], &instance, &invalid_options).is_err());
+        assert_eq!(
+            selected(select_bin(&[&malformed, &good, &unsupported], &instance, &options).unwrap()),
+            "n.3"
+        );
+        assert!(select_bin(&[&good, &malformed], &instance, &options).is_err());
     }
 
     #[test]

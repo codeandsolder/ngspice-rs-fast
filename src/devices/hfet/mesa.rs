@@ -52,6 +52,7 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
+use super::{NodeSetup, TemperatureCache, given_celsius, stamp_reset};
 use crate::devices::hfet::{Instance, Model};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{BOLTZMANN, CHARGE};
@@ -68,7 +69,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
 
 /// `mesaload.c`'s `#define EPSILONGAAS (12.244*8.85418e-12)`, the same value
 /// `mesasetup.c` defaults `MESAepsi` to. The modern `eps0`
@@ -254,6 +255,7 @@ pub(in crate::devices) struct Mesa {
     model: Model,
     instance: Instance,
     initial: InstanceInitial,
+    temperature_cache: TemperatureCache<Derived, 2>,
 }
 
 impl Mesa {
@@ -279,56 +281,26 @@ impl Mesa {
         let (model, model_defaults) = Model::resolve(resolved)?;
         let (initial, setters) = Instance::resolve(i)?;
         let instance = Instance::validate(&model_defaults, &setters, &i.location)?;
-        let mut staged = nodes.clone();
-        let external: Vec<NodeId> = i.nodes.iter().map(|n| staged.intern(n)).collect();
-        let mut terminals = external.clone();
-        let mut nodes_of = Nodes {
-            d: external[0],
-            g: external[1],
-            s: external[2],
-            sp: external[2],
-            dp: external[0],
-            gp: external[1],
-            spp: external[2],
-            dpp: external[0],
+        let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "MESA");
+        // C creates source and drain primes in this order.
+        // Gate and prime-prime nodes follow, aliasing the corresponding prime
+        // when RG, RI or RF is zero. RDI/RSI do not create nodes.
+        let sp = topology.prime(model.rs, "source", s)?;
+        let dp = topology.prime(model.rd, "drain", d)?;
+        let gp = topology.prime(model.rg, "gate", g)?;
+        let spp = topology.prime(model.ri, "gs", sp)?;
+        let dpp = topology.prime(model.rf, "gd", dp)?;
+        let nodes_of = Nodes {
+            d,
+            g,
+            s,
+            sp,
+            dp,
+            gp,
+            spp,
+            dpp,
         };
-        // `mesasetup.c` creates `#source` for RS, `#drain` for RD, `#gate` for
-        // RG, `#gs` for RI and `#gd` for RF, in that order, and falls back to
-        // the unfurled node when a resistance is zero: the prime-prime pair
-        // becomes the prime pair. `rdi`/`rsi` create no node at all;
-        // `mesatemp.c` folds them into the channel's series terms. The
-        // reference binary's rawfile omits `#source`/`#drain` (`outitf.c`'s
-        // skip list), not the model: `show` reports `dprimenode`/`sprimenode`
-        // and `rd=1e6 rs=1e6` collapses the current to `0.5/(rd+rs)`.
-        let mut create = |resistance: Real, suffix: &str, target: &mut NodeId| -> SpiceResult<()> {
-            if resistance == 0. {
-                return Ok(());
-            }
-            let name = format!("{}#{suffix}", i.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "{}: MESA internal-node name collision: {name}",
-                    i.name
-                )));
-            }
-            let internal = staged.intern(&name);
-            staged.set_kind(internal, NodeKind::Internal);
-            terminals.push(internal);
-            *target = internal;
-            Ok(())
-        };
-        create(model.rs, "source", &mut nodes_of.sp)?;
-        create(model.rd, "drain", &mut nodes_of.dp)?;
-        create(model.rg, "gate", &mut nodes_of.gp)?;
-        create(model.ri, "gs", &mut nodes_of.spp)?;
-        if model.ri == 0. {
-            nodes_of.spp = nodes_of.sp;
-        }
-        create(model.rf, "gd", &mut nodes_of.dpp)?;
-        if model.rf == 0. {
-            nodes_of.dpp = nodes_of.dp;
-        }
-        *nodes = staged;
+        let (staged, terminals) = topology.finish();
         let device = Self {
             name: i.name.clone(),
             model_name: resolved.card().name.clone(),
@@ -338,9 +310,11 @@ impl Mesa {
             model,
             instance,
             initial,
+            temperature_cache: TemperatureCache::new(),
         };
         // Validate the derivations before the device joins the circuit.
         device.derived(context.temperature, context.nominal_temperature)?;
+        *nodes = staged;
         Ok(Box::new(device))
     }
 
@@ -348,6 +322,13 @@ impl Mesa {
     /// (`CKTtemp`/`CKTnomTemp`), while the instance temperatures are kelvin
     /// after `mesaparam.c`'s conversion.
     fn derived(&self, temperature: Real, nominal: Real) -> SpiceResult<Derived> {
+        self.temperature_cache
+            .get_or_compute([temperature, nominal], || {
+                self.compute_derived(temperature, nominal)
+            })
+    }
+
+    fn compute_derived(&self, temperature: Real, nominal: Real) -> SpiceResult<Derived> {
         let model = &self.model;
         let instance = &self.instance;
         // C's `CKTtemp`/`CKTnomTemp` are kelvin; the port's `ModelContext`
@@ -1326,6 +1307,7 @@ impl Device for Mesa {
             model: self.model,
             instance,
             initial,
+            temperature_cache: TemperatureCache::new(),
         }))
     }
     /// `MESAload`'s DC path.
@@ -2074,13 +2056,6 @@ impl MesaSensitivity<'_> {
     /// The port's MESA with the records' parameters.
     fn mesa(&self, current: RecordPair<'_>) -> SpiceResult<Mesa> {
         let (m, i) = (current.model, current.instance);
-        let celsius = |record: &SensitivityRecord, keyword: &str| -> SpiceResult<Option<Real>> {
-            Ok(record
-                .given(keyword)
-                .then(|| record.value(keyword))
-                .transpose()?
-                .map(|kelvin| kelvin - CELSIUS_TO_KELVIN))
-        };
         let model = Model {
             threshold: m.value("vto")?,
             lambda: m.value("lambda")?,
@@ -2138,7 +2113,7 @@ impl MesaSensitivity<'_> {
             xtm2: m.value("xtm2")?,
             ks: m.value("ks")?,
             vsg: m.value("vsg")?,
-            tf: celsius(m, "tf")?,
+            tf: given_celsius(m, "tf")?,
             flo: m.value("flo")?,
             delfo: m.value("delfo")?,
             ag: m.value("ag")?,
@@ -2150,8 +2125,8 @@ impl MesaSensitivity<'_> {
             l: i.value("l")?,
             w: i.value("w")?,
             m: i.value("m")?,
-            td: celsius(i, "td")?,
-            ts: celsius(i, "ts")?,
+            td: given_celsius(i, "td")?,
+            ts: given_celsius(i, "ts")?,
             dtemp: i.value("dtemp")?,
         };
         // `MESAmParam` writes the level straight into C's `double` field, so a
@@ -2167,6 +2142,7 @@ impl MesaSensitivity<'_> {
             model,
             instance,
             initial: self.device.initial.clone(),
+            temperature_cache: TemperatureCache::new(),
         })
     }
 }
@@ -2204,7 +2180,6 @@ impl Device for ResetMesa {
 
     /// `mesaacl.c`'s real stamps in its order; `xgs`/`xgd` are zero.
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
-        use crate::devices::sensitivity::{ResetStamp, ResetStamps, StampAt, StampPart};
         let model_context = context.model_context;
         let (temperature, nominal) = (model_context.temperature, model_context.nominal_temperature);
         let state = &self.state;
@@ -2252,14 +2227,7 @@ impl Device for ResetMesa {
             (n.dpp, n.dp, -(m * tgf)),
             (n.gp, n.dpp, -(m * ggdpp)),
             (n.dpp, n.gp, -(m * ggdpp)),
-        ]
-        .into_iter()
-        .map(|(a, b, value)| ResetStamp {
-            at: StampAt::Nodes(a, b),
-            value,
-            part: StampPart::Real,
-        })
-        .collect();
-        ResetStamps::new(&current.name, 'z', &current.terminals, stamps)?.assemble_linear(context)
+        ];
+        stamp_reset(&current.name, context, &stamps, &[])
     }
 }

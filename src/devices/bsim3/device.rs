@@ -1,10 +1,8 @@
-//! BSIM3v3.3 device: the DC load of `b3ld.c` wired into the MNA solver.
+//! BSIM3v3.3 device: C-derived DC, charge, small-signal and noise loading.
 //!
-//! Charges, NQS, AC, noise, distortion, sensitivity and pole-zero are not
-//! ported, so those analyses fail explicitly instead of loading zero. The
-//! ACM geometry model and RSH/NRD/NRS internal nodes are refused; every
-//! accepted instance therefore has drain/source primes equal to its external
-//! nodes, as C's default geometry does.
+//! Conditional drain/source primes implement external sheet resistance.
+//! ACM geometry, NQS and unsupported analysis combinations are refused
+//! explicitly rather than silently producing incomplete stamps.
 // C-compatible numerical expressions are kept in their reference order:
 // Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
@@ -29,17 +27,18 @@
 )]
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
-use super::{ModelParameters, Value, charges, dc};
+use super::{Inputs, ModelParameters, Value, charges, dc};
 use crate::devices::models::{ModelContext, ResolvedModel};
 use crate::devices::nonlinear::{JunctionPoint, junction_companion};
 use crate::devices::state::{DeviceState, IterationPhase};
 use crate::devices::traits::{Device, StampContext};
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// State slots. The first block is `b3ld.c`'s DC state; the charge block
 /// follows C's `bsim3def.h` order, with each integrated charge immediately
@@ -117,7 +116,7 @@ enum Start {
 struct Cached {
     temperature: Real,
     nominal: Real,
-    defaults: ModelDefaults,
+    defaults: Rc<ModelDefaults>,
     temperature_model: TemperatureModel,
     setup: InstanceSetup,
 }
@@ -132,11 +131,12 @@ pub struct Bsim3 {
     /// Drain/source prime nodes, present when C's series conductance is nonzero.
     primes: [Option<NodeId>; 2],
     params: ModelParameters,
-    instance: DeviceInstance,
+    inputs: Inputs,
+    location: SourceLoc,
     polarity: Real,
     off: bool,
     ic: [Option<Real>; 3],
-    cache: RefCell<Option<Cached>>,
+    cache: RefCell<Rc<Cached>>,
 }
 
 impl std::fmt::Debug for Bsim3 {
@@ -161,6 +161,15 @@ impl Bsim3 {
         model: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
+        Ok(Box::new(Self::build(instance, nodes, model, context)?))
+    }
+
+    fn build(
+        instance: &DeviceInstance,
+        nodes: &mut NodeTable,
+        model: &ResolvedModel<'_>,
+        context: &ModelContext,
+    ) -> SpiceResult<Self> {
         if instance.nodes.len() != 4 {
             return Err(SpiceError::parse(
                 instance.location.clone(),
@@ -169,7 +178,7 @@ impl Bsim3 {
         }
         let params = super::model_parameters(model)?;
         let inputs = params.instance_parameters(instance, 1.)?;
-        let defaults = params.model_defaults(context)?;
+        let defaults = Rc::new(params.model_defaults(context)?);
         let temperature_model = defaults.at_temperature(context.temperature, &instance.location)?;
         let setup = InstanceSetup::new(&defaults, &temperature_model, &inputs, &instance.location)?;
         let off = inputs
@@ -212,10 +221,11 @@ impl Bsim3 {
             primes,
             polarity: Real::from(setup.polarity),
             params,
-            instance: instance.clone(),
+            inputs,
+            location: instance.location.clone(),
             off,
             ic,
-            cache: RefCell::new(Some(Cached {
+            cache: RefCell::new(Rc::new(Cached {
                 temperature: context.temperature,
                 nominal: context.nominal_temperature,
                 defaults,
@@ -223,32 +233,31 @@ impl Bsim3 {
                 setup,
             })),
         };
-        Ok(Box::new(device))
+        Ok(device)
     }
 
     /// The setup for these temperatures, rebuilt when C would re-run
-    /// `BSIM3temp`. A snapshot is returned so no borrow outlives the call.
-    fn ensure(&self, temperature: Real, nominal: Real) -> SpiceResult<Cached> {
+    /// `BSIM3temp`. Share the immutable snapshot so no cell borrow outlives
+    /// the call and repeated loads do not clone the parameter tables.
+    fn ensure(&self, temperature: Real, nominal: Real) -> SpiceResult<Rc<Cached>> {
         let mut cache = self
             .cache
             .try_borrow_mut()
             .map_err(|_| SpiceError::circuit(format!("{}: reentrant BSIM3 load", self.name)))?;
-        let matches = cache
-            .as_ref()
-            .is_some_and(|c| c.temperature == temperature && c.nominal == nominal);
-        if !matches {
+        if cache.temperature != temperature || cache.nominal != nominal {
             let context = ModelContext::new(temperature, nominal);
-            let defaults = self.params.model_defaults(&context)?;
-            let temperature_model =
-                defaults.at_temperature(temperature, &self.instance.location)?;
-            let inputs = self.params.instance_parameters(&self.instance, 1.)?;
-            let setup = InstanceSetup::new(
-                &defaults,
-                &temperature_model,
-                &inputs,
-                &self.instance.location,
-            )?;
-            *cache = Some(Cached {
+            // Only the nominal temperature affects model-only defaults.
+            // Keep context validation at the model location even on reuse.
+            let defaults = if cache.nominal == nominal {
+                context.validate(&self.params.location)?;
+                Rc::clone(&cache.defaults)
+            } else {
+                Rc::new(self.params.model_defaults(&context)?)
+            };
+            let temperature_model = defaults.at_temperature(temperature, &self.location)?;
+            let setup =
+                InstanceSetup::new(&defaults, &temperature_model, &self.inputs, &self.location)?;
+            *cache = Rc::new(Cached {
                 temperature,
                 nominal,
                 defaults,
@@ -256,14 +265,7 @@ impl Bsim3 {
                 setup,
             });
         }
-        let cached = cache.as_ref().expect("present");
-        Ok(Cached {
-            temperature: cached.temperature,
-            nominal: cached.nominal,
-            defaults: cached.defaults.clone(),
-            temperature_model: cached.temperature_model.clone(),
-            setup: cached.setup.clone(),
-        })
+        Ok(Rc::clone(&cache))
     }
 
     /// C `b3getic.c`: under `uic`, unset IC components are the terminal
@@ -1299,4 +1301,53 @@ fn stamp_charge(
         ceqq = ceqq.map(|value| -value);
     }
     Ok((ceqq, gc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::models::ModelResolver;
+    use crate::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+
+    #[test]
+    fn temperature_change_reuses_defaults_and_failed_setup_preserves_snapshot() {
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("bsim3-cache.cir"),
+                "BSIM3 cache\nm1 d g s 0 model l=1u w=10u\n.model model nmos level=8\n.end\n",
+            ))
+            .unwrap();
+        let resolver = ModelResolver::new(&deck.models).unwrap();
+        let inst = &deck.devices[0];
+        let resolved = resolver.resolve(inst).unwrap().unwrap();
+        let device = Bsim3::build(
+            inst,
+            &mut NodeTable::new(),
+            &resolved,
+            &ModelContext::new(27., 27.),
+        )
+        .unwrap();
+        let initial = device.ensure(27., 27.).unwrap();
+        assert!(Rc::ptr_eq(&initial, &device.ensure(27., 27.).unwrap()));
+        let hot = device.ensure(127., 27.).unwrap();
+        assert!(!Rc::ptr_eq(&initial, &hot));
+        assert!(Rc::ptr_eq(&initial.defaults, &hot.defaults));
+        assert_ne!(initial.setup.u0temp.to_bits(), hot.setup.u0temp.to_bits());
+        assert!(device.ensure(-273.15, 27.).is_err());
+        assert!(Rc::ptr_eq(&hot, &device.ensure(127., 27.).unwrap()));
+        let new_nominal = device.ensure(127., 42.).unwrap();
+        assert!(!Rc::ptr_eq(&hot.defaults, &new_nominal.defaults));
+        let fresh = Bsim3::build(
+            inst,
+            &mut NodeTable::new(),
+            &resolved,
+            &ModelContext::new(127., 42.),
+        )
+        .unwrap();
+        let fresh = fresh.ensure(127., 42.).unwrap();
+        assert_eq!(new_nominal.defaults, fresh.defaults);
+        assert_eq!(new_nominal.setup, fresh.setup);
+        assert_eq!(new_nominal.temperature_model, fresh.temperature_model);
+    }
 }
