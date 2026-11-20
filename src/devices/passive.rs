@@ -217,6 +217,13 @@ impl PassiveParameters {
     #[must_use]
     pub fn resistor_noise(&self, model: &str) -> crate::devices::ResistorNoise {
         crate::devices::ResistorNoise {
+            model: Some(model.to_owned()),
+            ..self.resistor_noise_parameters()
+        }
+    }
+
+    fn resistor_noise_parameters(&self) -> crate::devices::ResistorNoise {
+        crate::devices::ResistorNoise {
             noisy: self.noisy,
             kf: self.kf,
             af: self.af,
@@ -224,7 +231,7 @@ impl PassiveParameters {
             area: self.noise_area,
             multiplicity: self.multiplicity,
             temperature: self.temperature,
-            model: Some(model.to_owned()),
+            model: None,
         }
     }
 
@@ -238,7 +245,20 @@ impl PassiveParameters {
     /// Invalid context, nonpositive/nonfinite factor, overflow, underflow to
     /// zero, or nonfinite resistor conductance. No cache/state is mutated.
     pub fn effective_value(&self, context: &ModelContext) -> SpiceResult<Real> {
-        let scaled = self.scaled_value(context)?;
+        self.effective_value_for(self.nominal_value, context)
+    }
+
+    fn effective_value_with_nominal(
+        &self,
+        nominal: Real,
+        context: &ModelContext,
+    ) -> SpiceResult<Real> {
+        valid_value(self.family, nominal, &self.location)?;
+        self.effective_value_for(nominal, context)
+    }
+
+    fn effective_value_for(&self, nominal: Real, context: &ModelContext) -> SpiceResult<Real> {
+        let scaled = self.scaled_value_for(nominal, context)?;
         let value = if self.family == ModelFamily::Capacitor {
             scaled * self.multiplicity
         } else {
@@ -262,6 +282,10 @@ impl PassiveParameters {
     }
 
     fn scaled_value(&self, context: &ModelContext) -> SpiceResult<Real> {
+        self.scaled_value_for(self.nominal_value, context)
+    }
+
+    fn scaled_value_for(&self, nominal_value: Real, context: &ModelContext) -> SpiceResult<Real> {
         context.validate(&self.location)?;
         let temperature = temperature_kelvin(
             self.temperature.unwrap_or(context.temperature),
@@ -286,7 +310,7 @@ impl PassiveParameters {
         };
         positive(factor, &self.location, "temperature factor")?;
         let adjusted = finite(
-            self.nominal_value * factor,
+            nominal_value * factor,
             &self.location,
             "temperature-adjusted value",
         )?;

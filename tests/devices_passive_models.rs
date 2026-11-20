@@ -469,6 +469,38 @@ fn model_backed_capacitors_and_inductors_own_companion_state() {
     close(matrix.get(1, 1), -1e-3 / 1e-6);
 }
 
+#[test]
+fn modeled_noise_uses_the_same_resistor_kernel_and_model_identity() {
+    use ngspice_rs::devices::noise::{DeviceNoise, NoiseContext};
+    use ngspice_rs::devices::{Device, Resistor};
+
+    let n = deck(
+        "r1 a 0 rm m=2 w=4 l=2 temp=50\nr2 a 0 rm noisy=0\nc1 a 0 cm\nl1 a 0 lm\n.model rm r(r=8 kf=0.25 af=2 ef=1.5)\n.model cm c(cap=1u)\n.model lm l(ind=1m)",
+    );
+    let circuit = Circuit::from_netlist(&n).unwrap();
+    let model = ModelContext::new(77., 27.);
+    let bias = Vector::from_slice(&[2., 0.]);
+    let unknowns = circuit.unknowns();
+    let context = NoiseContext {
+        model_context: &model,
+        unknowns,
+        bias: &bias,
+        states: None,
+        controls: &[],
+    };
+    let p = parameters(&n, 0).unwrap();
+    let literal = Resistor::new("r1", [NodeId::new(1), NodeId::GROUND], 4.)
+        .unwrap()
+        .with_noise(p.resistor_noise("rm"));
+    assert_eq!(
+        circuit.devices()[0].noise(&context).unwrap(),
+        literal.noise(&context).unwrap()
+    );
+    for device in &circuit.devices()[1..] {
+        assert_eq!(device.noise(&context).unwrap(), DeviceNoise::Noiseless);
+    }
+}
+
 /// C accepts these (`resparam.c` raises a resistance in `[0, RESMIN)` to
 /// `RESMIN = 1e-12` with a warning, a later setter replacing it; zero
 /// capacitance and inductance are legal values, and a geometry capacitor

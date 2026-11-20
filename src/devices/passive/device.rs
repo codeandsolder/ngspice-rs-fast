@@ -2,9 +2,12 @@
 use super::PassiveParameters;
 use crate::devices::models::{ModelContext, ModelFamily, ResolvedModel};
 use crate::devices::noise::{DeviceNoise, NoiseContext};
+use crate::devices::rlc::{
+    QUANTITY, REACTIVE_STATE_COUNT, ReactiveLoad, assemble_resistor, resistor_noise, stamp_resistor,
+};
 use crate::devices::{
-    Capacitor, Device, InductanceValue, Inductor, LinearContext, Resistor, ResistorMetadata,
-    ResistorOrigin, StampContext, StorageElement, StorageKind,
+    Device, InductanceValue, LinearContext, ResistorMetadata, ResistorOrigin, StampContext,
+    StorageElement, StorageKind,
 };
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
@@ -17,8 +20,6 @@ struct ModelPassive {
     terminals: [NodeId; 2],
     parameters: PassiveParameters,
 }
-/// The charge/flux slot of the delegated scalar [`Capacitor`]/[`Inductor`].
-const STORAGE_QUANTITY: usize = 0;
 
 impl ModelPassive {
     const fn storage_kind(&self) -> Option<StorageKind> {
@@ -28,19 +29,13 @@ impl ModelPassive {
             _ => None,
         }
     }
-    fn scalar(&self, context: &ModelContext) -> SpiceResult<Box<dyn Device>> {
-        let value = self.parameters.effective_value(context)?;
-        let ic = self.parameters.initial_condition();
-        Ok(match self.parameters.family() {
-            ModelFamily::Resistor => Box::new(
-                Resistor::new(&self.name, self.terminals, value)?
-                    .with_noise(self.parameters.resistor_noise(&self.model)),
-            ),
-            ModelFamily::Capacitor => {
-                Box::new(Capacitor::new(&self.name, self.terminals, value, ic)?)
-            }
-            _ => Box::new(Inductor::new(&self.name, self.terminals, value, ic)?),
-        })
+    fn reactive_load(&self, value: Real) -> ReactiveLoad<'_> {
+        ReactiveLoad {
+            name: &self.name,
+            terminals: self.terminals,
+            value,
+            initial: self.parameters.initial_condition(),
+        }
     }
 }
 impl Device for ModelPassive {
@@ -142,14 +137,14 @@ impl Device for ModelPassive {
     }
     fn state_count(&self) -> usize {
         match self.parameters.family() {
-            ModelFamily::Capacitor | ModelFamily::Inductor => 2,
+            ModelFamily::Capacitor | ModelFamily::Inductor => REACTIVE_STATE_COUNT,
             _ => 0,
         }
     }
     /// The scalar capacitor/inductor's charge/flux slot (`captrunc.c`,
     /// `indtrunc.c`): the state layout is the delegated scalar device's.
     fn truncation_slot(&self) -> Option<usize> {
-        self.storage_kind().map(|_| STORAGE_QUANTITY)
+        self.storage_kind().map(|_| QUANTITY)
     }
     /// The effective (temperature/TC/scale/`m`-adjusted) value and the
     /// instance `ic=`, so `uic` seeds model-backed C/L exactly as literal ones.
@@ -166,20 +161,40 @@ impl Device for ModelPassive {
         )
     }
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        self.scalar(&ModelContext::new(
+        let value = self.parameters.effective_value(&ModelContext::new(
             context.temperature,
             context.nominal_temperature,
-        ))?
-        .stamp(context)
+        ))?;
+        match self.parameters.family() {
+            ModelFamily::Resistor => stamp_resistor(self.terminals, value, context),
+            ModelFamily::Capacitor => self.reactive_load(value).stamp_capacitor(context),
+            _ => self.reactive_load(value).stamp_inductor(context),
+        }
     }
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
-        self.scalar(context.model_context)?.assemble_linear(context)
+        let value = self.parameters.effective_value(context.model_context)?;
+        match self.parameters.family() {
+            ModelFamily::Resistor => assemble_resistor(self.terminals, value, context),
+            ModelFamily::Capacitor => self.reactive_load(value).assemble_capacitor(context),
+            _ => self.reactive_load(value).assemble_inductor(context),
+        }
     }
-    /// The delegated scalar's noise: `resnoise.c` for a resistor (with the
-    /// model's KF/AF/EF, the instance noise area, `m`, `temp=` and `noisy`),
-    /// noiseless for C and L (`DEVnoise = NULL`).
+    /// `resnoise.c` for a resistor (including geometry, multiplier and temp);
+    /// C and L have no noise generators. Validate the effective value in
+    /// every family, as for stamps and linear assembly.
     fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
-        self.scalar(context.model_context)?.noise(context)
+        let value = self.parameters.effective_value(context.model_context)?;
+        Ok(if self.parameters.family() == ModelFamily::Resistor {
+            resistor_noise(
+                self.terminals,
+                value,
+                &self.parameters.resistor_noise_parameters(),
+                Some(&self.model),
+                context,
+            )
+        } else {
+            DeviceNoise::Noiseless
+        })
     }
     fn inductance(&self, context: &ModelContext) -> Option<SpiceResult<InductanceValue>> {
         (self.parameters.family() == ModelFamily::Inductor).then(|| {
@@ -205,8 +220,7 @@ impl Device for ModelPassive {
             )));
         }
         self.parameters
-            .with_nominal_value(supplied)?
-            .effective_value(context)
+            .effective_value_with_nominal(supplied, context)
     }
 
     /// `.sens`: C's passive records from the card's model and instance
@@ -264,13 +278,12 @@ pub(in crate::devices) fn instantiate(
     context: &ModelContext,
 ) -> SpiceResult<Box<dyn Device>> {
     let parameters = model.passive_parameters(instance)?;
-    // Evaluate before interning, then stage construction so both schema and
-    // existing scalar-constructor failures preserve the caller's table.
+    // The schema validates the IC and effective_value validates the scalar
+    // before any terminals are interned.
     parameters.effective_value(context)?;
-    let mut staged = nodes.clone();
     let terminals = [
-        staged.intern(&instance.nodes[0]),
-        staged.intern(&instance.nodes[1]),
+        nodes.intern(&instance.nodes[0]),
+        nodes.intern(&instance.nodes[1]),
     ];
     let device = ModelPassive {
         name: instance.name.clone(),
@@ -278,8 +291,6 @@ pub(in crate::devices) fn instantiate(
         terminals,
         parameters,
     };
-    device.scalar(context)?;
-    *nodes = staged;
     Ok(Box::new(device))
 }
 
