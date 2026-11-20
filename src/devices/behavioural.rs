@@ -103,7 +103,9 @@ impl BehaviouralScale {
     pub fn factor(&self, circuit: Real) -> Real {
         let kelvin = self.temperature.unwrap_or(circuit) + 273.15;
         let difference = kelvin + self.dtemp - 300.15;
-        let mut factor = 1. + self.tc1 * difference + self.tc2 * difference * difference;
+        let linear_temperature = self.tc1 * difference;
+        let quadratic_temperature = self.tc2 * difference * difference;
+        let mut factor = 1. + linear_temperature + quadratic_temperature;
         if self.reciprocal_tc {
             factor = 1. / factor;
         }
@@ -353,7 +355,8 @@ impl Device for Behavioural {
             BehaviouralOutput::Voltage => context.vntol,
             BehaviouralOutput::Current => context.abstol,
         };
-        let tol = context.reltol * rhs.abs().max(prev.abs()) + absolute;
+        let relative = context.reltol * rhs.abs().max(prev.abs());
+        let tol = relative + absolute;
         Ok((prev - rhs).abs() > tol)
     }
 
@@ -621,19 +624,10 @@ fn literal(text: &str, location: &SourceLoc, what: &str) -> SpiceResult<Real> {
         .ok_or_else(|| unsupported(location, format!("non-finite or nonliteral {what}={text}")))
 }
 
-/// Builds a B source (or a front-end generated XSPICE `a` instance) from its
-/// literalized AST instance, binding nodes in `nodes` only on success.
-pub(crate) fn instantiate(
+fn parse_parameters(
     instance: &DeviceInstance,
-    nodes: &mut NodeTable,
-) -> SpiceResult<Box<dyn Device>> {
+) -> SpiceResult<(BehaviouralOutput, &BehaviouralExpression, BehaviouralScale)> {
     let location = &instance.location;
-    if instance.model.is_some() || instance.nodes.len() != 2 {
-        return Err(unsupported(
-            location,
-            format!("{} needs two nodes and no model", instance.name),
-        ));
-    }
     let mut expression: Option<(BehaviouralOutput, &BehaviouralExpression)> = None;
     let mut scale = BehaviouralScale::default();
     let mut temperature_given = false;
@@ -670,8 +664,10 @@ pub(crate) fn instantiate(
                         dtemp_given = true;
                     }
                     // IF_INTEGER flags: only the value 1 selects the reciprocal.
-                    "reciproctc" => scale.reciprocal_tc = value.round() == 1.,
-                    "reciprocm" => scale.reciprocal_m = value.round() == 1.,
+                    "reciproctc" => {
+                        scale.reciprocal_tc = value.round().to_bits() == 1_f64.to_bits();
+                    }
+                    "reciprocm" => scale.reciprocal_m = value.round().to_bits() == 1_f64.to_bits(),
                     other => {
                         return Err(unsupported(
                             at,
@@ -716,6 +712,23 @@ pub(crate) fn instantiate(
             ),
         ));
     };
+    Ok((output, tree, scale))
+}
+
+/// Builds a B source (or a front-end generated XSPICE `a` instance) from its
+/// literalized AST instance, binding nodes in `nodes` only on success.
+pub(crate) fn instantiate(
+    instance: &DeviceInstance,
+    nodes: &mut NodeTable,
+) -> SpiceResult<Box<dyn Device>> {
+    let location = &instance.location;
+    if instance.model.is_some() || instance.nodes.len() != 2 {
+        return Err(unsupported(
+            location,
+            format!("{} needs two nodes and no model", instance.name),
+        ));
+    }
+    let (output, tree, scale) = parse_parameters(instance)?;
     let program = Program::compile(&tree.root)?;
     let mark = nodes.len();
     let positive = nodes.intern(&instance.nodes[0]);

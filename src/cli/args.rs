@@ -5,12 +5,12 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::analysis::{AnalysisSupport, DRIVERS};
 use crate::devices::{DeviceSupport, Registry};
 use crate::netlist::{Deck, RawCard, classify_deck, load};
-use crate::primitives::{AnalysisKind as Kind, SpiceResult};
+use crate::primitives::{AnalysisKind as Kind, SpiceError, SpiceResult};
 
 /// Process exit codes. See the crate documentation.
 pub mod exit_code {
@@ -279,39 +279,27 @@ EXIT STATUS:
 /// parser's current subset, mapped to [`exit_code::NOT_YET_PORTED`].
 /// `simulate` adds the run and rawfile failures of [`crate::cli::simulate::run`].
 ///
-/// # Panics
-/// For `simulate` without a netlist, which [`Args::parse`] rules out.
+/// Returns an unsupported-command error for missing required arguments.
 pub fn run(args: &Args) -> SpiceResult<()> {
     match args.command {
         Command::Help => {
             println!("{}", usage());
-            Ok(())
         }
         Command::Version => {
             println!("spice-rs {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
         }
         Command::Devices => {
             print!("{}", devices_text(&Registry::with_builtins()));
-            Ok(())
         }
         Command::Analyses => {
             print!("{}", analyses_text());
-            Ok(())
         }
         Command::Simulate => {
-            let deck = args
-                .netlist
-                .as_ref()
-                .expect("Args::parse guarantees a netlist");
-            let output = args
-                .output
-                .as_ref()
-                .expect("Args::parse guarantees --output for 'simulate'");
+            let deck = required_path(args, args.netlist.as_deref(), "netlist")?;
+            let output = required_path(args, args.output.as_deref(), "--output")?;
             let report =
                 crate::cli::simulate::run_with_format(deck, output, args.auto_gnd, args.format)?;
             print!("{}", crate::cli::simulate::report_text(&report));
-            Ok(())
         }
         Command::Summary | Command::Cards | Command::Tokens => {
             let deck = load_deck(args)?;
@@ -322,13 +310,9 @@ pub fn run(args: &Args) -> SpiceResult<()> {
                 _ => summary_text(&deck, &cards, args.auto_gnd),
             };
             print!("{text}");
-            Ok(())
         }
         Command::Parse => {
-            let path = args
-                .netlist
-                .as_ref()
-                .expect("Args::parse guarantees a netlist");
+            let path = required_path(args, args.netlist.as_deref(), "netlist")?;
             let parser = crate::netlist::Parser::with_auto_gnd(args.auto_gnd);
             let netlist = parser.parse_file(path)?;
             // Options are validated before reporting success: unknown or
@@ -372,16 +356,20 @@ pub fn run(args: &Args) -> SpiceResult<()> {
                     names.join(", ")
                 );
             }
-            Ok(())
         }
     }
+    Ok(())
+}
+
+fn required_path<'a>(args: &Args, path: Option<&'a Path>, name: &str) -> SpiceResult<&'a Path> {
+    path.ok_or_else(|| SpiceError::Unsupported {
+        feature: format!("{} requires {name}", args.command.name()),
+        location: None,
+    })
 }
 
 fn load_deck(args: &Args) -> SpiceResult<Deck> {
-    let path = args
-        .netlist
-        .as_ref()
-        .expect("Args::parse guarantees a netlist for this command");
+    let path = required_path(args, args.netlist.as_deref(), "netlist")?;
     load(path)
 }
 
@@ -468,7 +456,7 @@ pub fn cards_text(_deck: &Deck, cards: &[RawCard]) -> String {
             crate::netlist::CardKind::DotCommand(command) => command.card_name(),
             crate::netlist::CardKind::Unknown => "?".to_owned(),
         };
-        let _ = writeln!(out, "{:>5}  {:<16} {}", card.location.line, kind, card.raw);
+        let _ = writeln!(out, "{:>5}  {kind:<16} {}", card.location.line, card.raw);
     }
     out
 }
@@ -576,6 +564,34 @@ pub(crate) const fn kind_name(kind: Kind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{Args, Command, analyses_text, cards_text, devices_text, summary_text};
+
+    #[test]
+    fn incomplete_public_args_return_an_error_instead_of_panicking() {
+        for command in [
+            Command::Summary,
+            Command::Cards,
+            Command::Tokens,
+            Command::Parse,
+            Command::Simulate,
+        ] {
+            let args = Args {
+                command,
+                ..Args::default()
+            };
+            assert!(super::run(&args).is_err());
+        }
+        let args = Args {
+            command: Command::Simulate,
+            netlist: Some("missing.cir".into()),
+            ..Args::default()
+        };
+        assert!(
+            super::run(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("--output")
+        );
+    }
     use crate::devices::Registry;
     use crate::netlist::classify_deck;
     use crate::netlist::source::parse_deck_text;
