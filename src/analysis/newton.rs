@@ -202,6 +202,9 @@ impl NewtonOptions {
     }
 
     /// Validate tolerances and bounded work before the first load.
+    ///
+    /// # Errors
+    /// Returns a numerical error for invalid tolerances, damping limits, or iteration budgets.
     pub fn validate(&self) -> SpiceResult<()> {
         if !(1..=MAX_ITERATIONS).contains(&self.max_iterations)
             || [self.reltol, self.vntol, self.abstol, self.voltage_step]
@@ -332,7 +335,7 @@ pub enum PhasePolicy {
 /// [`solve_counted`] for device trials with C's Newton phases.
 ///
 /// `load(x, phase, previous)` must build its trial with
-/// [`crate::devices::StateHistory::trial_in`]`(phase, previous)`. A load whose
+/// [`StateHistory::trial_in(phase, previous)`](crate::devices::StateHistory::trial_in). A load whose
 /// trial [`TrialState::is_nonconvergent`] never ends the solve (C: `CKTnoncon`
 /// set by a device). Otherwise `NIconvTest` compares successive iterates and
 /// then calls `device_test(new, old, trial)`, the devices' convergence tests
@@ -746,13 +749,13 @@ fn converged(new: &Vector, old: &Vector, branch: &[bool], options: &NewtonOption
         .zip(old.as_slice())
         .zip(branch)
         .all(|((new, old), branch)| {
-            (new - old).abs()
-                <= options.reltol * new.abs().max(old.abs())
-                    + if *branch {
-                        options.abstol
-                    } else {
-                        options.vntol
-                    }
+            let relative_tolerance = options.reltol * new.abs().max(old.abs());
+            let absolute_tolerance = if *branch {
+                options.abstol
+            } else {
+                options.vntol
+            };
+            (new - old).abs() <= relative_tolerance + absolute_tolerance
         })
 }
 fn failure(message: impl Into<String>) -> SpiceError {
