@@ -329,19 +329,20 @@ impl StepHistory {
             deltas[self.len + 1..].fill(fill);
         }
         // nicomcof.c
-        let mut ag = [0.0; HISTORY_LEN + 1];
-        match (method, order) {
+        let ag = match (method, order) {
             (IntegrationMethod::Trapezoidal, 1) => {
+                let mut ag = [0.0; HISTORY_LEN + 1];
                 ag[..2].copy_from_slice(&[1.0 / dt, -1.0 / dt]);
+                ag
             }
             (IntegrationMethod::Trapezoidal, _) => {
+                let mut ag = [0.0; HISTORY_LEN + 1];
                 ag[..2].copy_from_slice(&[1.0 / dt / (1.0 - xmu), xmu / (1.0 - xmu)]);
+                ag
             }
             // nicomcof.c: Gear order 1 falls through to the general case.
-            (IntegrationMethod::Gear { .. }, _) => {
-                gear_corrector(&deltas, usize::from(order), &mut ag);
-            }
-        }
+            (IntegrationMethod::Gear { .. }, _) => gear_corrector(&deltas, usize::from(order)),
+        };
         for value in ag {
             finite(value, "integration coefficient")?;
         }
@@ -359,7 +360,8 @@ impl StepHistory {
     /// (C keeps `CKTdeltaOld[0..=6]`; the oldest step drops out).
     /// This is the only operation that advances the history.
     pub fn accept(&mut self, coefficients: &Coefficients) {
-        self.accepted.copy_within(0..HISTORY_LEN - 1, 1);
+        let retained = self.len.min(HISTORY_LEN - 1);
+        self.accepted.copy_within(0..retained, 1);
         self.accepted[0] = coefficients.dt();
         self.len = (self.len + 1).min(HISTORY_LEN);
     }
@@ -381,38 +383,35 @@ impl StepHistory {
 /// corrector follows the reference's unpivoted LU elimination and
 /// substitution, preserving operation order rather than evaluating the
 /// algebraically equivalent Lagrange derivative in closed form.
-fn gear_corrector(
-    deltas: &[Real; HISTORY_LEN + 1],
-    order: usize,
-    ag: &mut [Real; HISTORY_LEN + 1],
-) {
+fn gear_corrector(deltas: &[Real; HISTORY_LEN + 1], order: usize) -> [Real; HISTORY_LEN + 1] {
     // nicomcof.c, `case GEAR`, verbatim: the corrector matrix built from
     // (sum of h)/h, LU-decomposed without pivoting (its first column is
     // 1 0 0 ...), then forward and backward substitution on CKTag.
     let delta = deltas[0];
     let mut mat = [[0.0; HISTORY_LEN + 1]; HISTORY_LEN + 1];
-    *ag = [0.0; HISTORY_LEN + 1];
+    let mut ag = [0.0; HISTORY_LEN + 1];
     ag[1] = -1. / delta;
     for entry in mat[0].iter_mut().take(order + 1) {
         *entry = 1.;
     }
-    for row in mat.iter_mut().take(order + 1).skip(1) {
-        row[0] = 0.;
-    }
     let mut arg = 0.;
     for i in 1..=order {
         arg += deltas[i - 1];
+        let normalized = arg / delta;
         let mut arg1 = 1.;
         for row in mat.iter_mut().take(order + 1).skip(1) {
-            arg1 *= arg / delta;
+            arg1 *= normalized;
             row[i] = arg1;
         }
     }
     for i in 1..=order {
-        for j in i + 1..=order {
-            mat[j][i] /= mat[i][i];
-            for k in i + 1..=order {
-                mat[j][k] -= mat[j][i] * mat[i][k];
+        let (head, tail) = mat[..=order].split_at_mut(i + 1);
+        let pivot = &head[i];
+        for row in tail {
+            row[i] /= pivot[i];
+            let multiplier = row[i];
+            for (entry, &p) in row[i + 1..=order].iter_mut().zip(&pivot[i + 1..=order]) {
+                *entry -= multiplier * p;
             }
         }
     }
@@ -428,6 +427,7 @@ fn gear_corrector(
         }
         ag[i] /= mat[i][i];
     }
+    ag
 }
 
 /// Immutable coefficients for one trial step.
@@ -763,6 +763,72 @@ mod tests {
             history.accept(&coefficients);
         }
         history
+    }
+
+    /// Frozen binary64 results of the original unpivoted C-order corrector.
+    #[test]
+    fn gear_corrector_preserves_reference_operation_order() {
+        let deltas = [0.125, 0.25, 0.1875, 0.375, 0.125, 0.3125, 0.0625];
+        let expected = [
+            [
+                0x4020_0000_0000_0000,
+                0xc020_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+            ],
+            [
+                0x4025_5555_5555_5555,
+                0xc028_0000_0000_0000,
+                0x3ff5_5555_5555_5555,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+            ],
+            [
+                0x4028_e38e_38e3_8e39,
+                0xc02e_db6d_b6db_6db7,
+                0x4010_0000_0000_0000,
+                0xbff0_4104_1041_0410,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+            ],
+            [
+                0x402b_05b0_5b05_b05b,
+                0xc031_cd5c_d5cd_5cd6,
+                0x401a_aaaa_aaaa_aaab,
+                0xc004_5145_1451_4514,
+                0x3fc5_0150_1501_5015,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+            ],
+            [
+                0x402c_e792_3ce7_923b,
+                0xc034_2d02_d02d_02cf,
+                0x4024_9b26_c9b2_6c9b,
+                0xc015_9659_6596_5966,
+                0x3ff6_5165_1651_6516,
+                0xbfe2_7b35_63ef_927b,
+                0x0000_0000_0000_0000,
+            ],
+            [
+                0x402e_5bef_542d_63b8,
+                0xc036_3183_1831_831d,
+                0x402c_5555_5555_5559,
+                0xc022_4424_4244_2444,
+                0x4011_8918_9189_1892,
+                0xc004_5454_5454_5454,
+                0x3fc1_9ba5_5d3e_8e17,
+            ],
+        ];
+        for (order, expected) in (1..=6).zip(expected) {
+            let ag = super::gear_corrector(&deltas, order);
+            assert_eq!(ag.map(f64::to_bits), expected, "order {order}");
+        }
     }
 
     #[test]
@@ -1175,17 +1241,9 @@ mod tests {
             assert!(close6(companion.derivative, df(times[0])), "order {order}");
             assert!(close6(c.predict(&q[1..]).unwrap(), q[0]), "order {order}");
             let reference = vandermonde_ag(&c.deltas, usize::from(order));
-            // The general Lagrange form also reproduces the order-1 and the
-            // closed-form order-2 coefficients.
-            let mut general = [0.0; 7];
-            super::gear_corrector(&c.deltas, usize::from(order), &mut general);
-            for ((a, b), g) in c.ag().iter().zip(&reference).zip(general) {
+            for (a, b) in c.ag().iter().zip(&reference) {
                 assert!(
                     (a - b).abs() <= 1e-10 * b.abs().max(1.0 / TRIAL_STEP),
-                    "order {order}"
-                );
-                assert!(
-                    (a - g).abs() <= 1e-12 * g.abs().max(1.0 / TRIAL_STEP),
                     "order {order}"
                 );
             }

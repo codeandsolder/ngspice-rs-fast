@@ -26,11 +26,17 @@ pub struct DenseComplex {
 
 impl DenseComplex {
     /// The `n x n` zero matrix.
+    /// # Panics
+    /// If the matrix dimension overflows the addressable element count.
     #[must_use]
     pub fn zeros(n: usize) -> Self {
         Self {
             n,
-            data: vec![Complex::ZERO; n * n],
+            data: vec![
+                Complex::ZERO;
+                n.checked_mul(n)
+                    .expect("dense complex matrix dimensions overflow")
+            ],
         }
     }
 
@@ -146,14 +152,15 @@ impl DenseComplex {
         self.same_dimension(other)?;
         let n = self.n;
         let mut out = Self::zeros(n);
-        for i in 0..n {
-            for k in 0..n {
-                let a = self.data[i * n + k];
-                if a == Complex::ZERO {
-                    continue;
-                }
-                for j in 0..n {
-                    out.data[i * n + j] = out.data[i * n + j] + a * other.data[k * n + j];
+        if n != 0 {
+            for (a_row, out_row) in self.data.chunks_exact(n).zip(out.data.chunks_exact_mut(n)) {
+                for (&a, b_row) in a_row.iter().zip(other.data.chunks_exact(n)) {
+                    if a == Complex::ZERO {
+                        continue;
+                    }
+                    for (out, &b) in out_row.iter_mut().zip(b_row) {
+                        *out = *out + a * b;
+                    }
                 }
             }
         }
@@ -196,29 +203,52 @@ impl DenseComplex {
                 return Ok(None);
             }
             if pivot_row != c {
-                for j in 0..n {
-                    a.swap(c * n + j, pivot_row * n + j);
-                    b.swap(c * n + j, pivot_row * n + j);
-                }
+                swap_rows(&mut a, n, c, pivot_row);
+                swap_rows(&mut b, n, c, pivot_row);
             }
-            let inverse_pivot = Complex::real(1.) / a[c * n + c];
-            for j in 0..n {
-                a[c * n + j] = a[c * n + j] * inverse_pivot;
-                b[c * n + j] = b[c * n + j] * inverse_pivot;
+            let (a_before, a_pivot, a_after) = split_row(&mut a, n, c);
+            let (b_before, b_pivot, b_after) = split_row(&mut b, n, c);
+            let inverse_pivot = Complex::real(1.) / a_pivot[c];
+            for (a_value, b_value) in a_pivot.iter_mut().zip(b_pivot.iter_mut()) {
+                *a_value = *a_value * inverse_pivot;
+                *b_value = *b_value * inverse_pivot;
             }
-            for i in 0..n {
-                let factor = a[i * n + c];
-                if i == c || factor == Complex::ZERO {
+            let a_rows = a_before
+                .chunks_exact_mut(n)
+                .chain(a_after.chunks_exact_mut(n));
+            let b_rows = b_before
+                .chunks_exact_mut(n)
+                .chain(b_after.chunks_exact_mut(n));
+            for (a_row, b_row) in a_rows.zip(b_rows) {
+                let factor = a_row[c];
+                if factor == Complex::ZERO {
                     continue;
                 }
-                for j in 0..n {
-                    a[i * n + j] = a[i * n + j] - factor * a[c * n + j];
-                    b[i * n + j] = b[i * n + j] - factor * b[c * n + j];
+                for ((a_value, b_value), (&a_p, &b_p)) in a_row
+                    .iter_mut()
+                    .zip(b_row)
+                    .zip(a_pivot.iter().zip(b_pivot.iter()))
+                {
+                    *a_value = *a_value - factor * a_p;
+                    *b_value = *b_value - factor * b_p;
                 }
             }
         }
         Self { n, data: b }.checked().map(Some)
     }
+}
+
+/// Disjoint rows around the pivot, preserving row-major traversal order.
+fn split_row<T>(data: &mut [T], n: usize, row: usize) -> (&mut [T], &mut [T], &mut [T]) {
+    let (before, tail) = data.split_at_mut(row * n);
+    let (pivot, after) = tail.split_at_mut(n);
+    (before, pivot, after)
+}
+
+fn swap_rows<T>(data: &mut [T], n: usize, first: usize, second: usize) {
+    debug_assert!(first < second);
+    let (before, after) = data.split_at_mut(second * n);
+    before[first * n..(first + 1) * n].swap_with_slice(&mut after[..n]);
 }
 
 #[cfg(test)]
@@ -232,6 +262,38 @@ mod tests {
             m.set(index / n, index % n, Complex::new(*re, *im)).unwrap();
         }
         m
+    }
+
+    #[test]
+    fn zero_order_product_and_row_accumulation() {
+        assert_eq!(
+            DenseComplex::zeros(0).mul(&DenseComplex::zeros(0)).unwrap(),
+            DenseComplex::zeros(0)
+        );
+        // Preserve k order across cancellation, even with a sparse row.
+        let a = matrix(
+            3,
+            &[
+                (1e16, 0.),
+                (-1e16, 0.),
+                (1., 0.),
+                (0., 0.),
+                (0., 0.),
+                (0., 0.),
+                (0., 0.),
+                (0., 0.),
+                (0., 0.),
+            ],
+        );
+        let b = matrix(3, &[(1., 0.); 9]);
+        let out = a.mul(&b).unwrap();
+        assert_eq!(&out.data()[..3], &[Complex::real(1.); 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "dense complex matrix dimensions overflow")]
+    fn dimensions_cannot_wrap() {
+        let _ = DenseComplex::zeros(usize::MAX);
     }
 
     #[test]

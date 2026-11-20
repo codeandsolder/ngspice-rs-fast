@@ -518,7 +518,9 @@ impl EquilibratedSparseLu {
                 break;
             };
             for (delta, value) in candidate.as_mut_slice().iter_mut().zip(x.as_slice()) {
-                *delta = *value + *delta;
+                // Both operands are finite here; binary64 addition is
+                // commutative, including signed zeros.
+                *delta += *value;
             }
             let candidate_error =
                 self.componentwise_error(rhs, &candidate, &mut residual, &mut scale);

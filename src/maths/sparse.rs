@@ -63,7 +63,7 @@ pub struct Pattern {
     row_start: Vec<u32>,
     row_cols: Vec<u32>,
     row_ids: Vec<u32>,
-    ordering: std::sync::Mutex<Option<crate::maths::SparseSymbolic>>,
+    ordering: std::sync::Mutex<Option<crate::maths::linear::CachedFrame>>,
     /// The `(row, col, id)` sequence of the last load, replayed by bound
     /// matrices to skip lookups (ngspice's per-device element pointers).
     trace: std::sync::Mutex<Arc<Trace>>,
@@ -186,7 +186,7 @@ impl Pattern {
     }
 
     /// Takes the cached pivot order (leaving none while a solve uses it).
-    pub(crate) fn take_ordering(&self) -> Option<crate::maths::SparseSymbolic> {
+    pub(super) fn take_ordering(&self) -> Option<crate::maths::linear::CachedFrame> {
         self.ordering.lock().ok().and_then(|mut slot| slot.take())
     }
 
@@ -202,7 +202,7 @@ impl Pattern {
     }
 
     /// Caches the pivot order for the next solve.
-    pub(crate) fn store_ordering(&self, ordering: Option<crate::maths::SparseSymbolic>) {
+    pub(super) fn store_ordering(&self, ordering: Option<crate::maths::linear::CachedFrame>) {
         if let Ok(mut slot) = self.ordering.lock() {
             *slot = ordering;
         }

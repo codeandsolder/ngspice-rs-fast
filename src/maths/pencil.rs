@@ -431,13 +431,78 @@ struct Trial {
 
 type Set = [Option<usize>; 3];
 
-/// The SPARSE matrix, its element per term and its drive elements.
-type Loaded = (Sparse<Complex>, Vec<usize>, [Option<usize>; 2]);
+/// One compiled pencil load, retaining element handles and the SPARSE
+/// pivot frame between trials. The root-search state does not own matrix
+/// assembly or depend on the order of the handle vectors.
+struct LoadedPencil<'a> {
+    load: &'a PencilLoad,
+    sparse: Sparse<Complex>,
+    handles: Vec<usize>,
+    drive: [Option<usize>; 2],
+}
+
+impl<'a> LoadedPencil<'a> {
+    fn new(load: &'a PencilLoad) -> Self {
+        let mut sparse = Sparse::new(load.order);
+        for &(row, col) in &load.elements {
+            sparse.get_element(row + 1, col + 1);
+        }
+        let handles = load
+            .terms
+            .iter()
+            .map(|t| sparse.get_element(t.row + 1, t.col + 1))
+            .collect();
+        let drive = load.solution.map_or([None, None], |col| {
+            load.drive
+                .map(|row| row.map(|row| sparse.get_element(row + 1, col + 1)))
+        });
+        // As in C, external rows not referenced by elements do not enter
+        // the determinant.
+        Self {
+            load,
+            sparse,
+            handles,
+            drive,
+        }
+    }
+
+    /// CKTpzLoad + SMPcReorder + SMPcDProd; no MNA preorder.
+    fn determinant_at(&mut self, s: Cx) -> Option<(Cx, i32)> {
+        let Self {
+            load,
+            sparse,
+            handles,
+            drive,
+        } = self;
+        sparse.clear();
+        for (term, &handle) in load.terms.iter().zip(handles.iter()) {
+            sparse.add(handle, term.at(s));
+        }
+        if let Some(solution) = load.solution {
+            if let Some(balance) = load.balance {
+                sparse.add_col(balance + 1, solution + 1);
+            }
+            sparse.zero_col(solution + 1);
+        }
+        for (element, value) in drive.iter().zip([1.0, -1.0]) {
+            if let Some(element) = *element {
+                let im = sparse.value(element).im;
+                sparse.set(element, Complex::new(value, im));
+            }
+        }
+        match sparse.order_and_factor(load.relative_threshold, 1.0e-30) {
+            Status::Singular | Status::ZeroDiag => None,
+            Status::Okay | Status::SmallPivot => {
+                let (mantissa, exponent) = sparse.determinant();
+                Some(base2_determinant(mantissa, exponent))
+            }
+        }
+    }
+}
 
 /// One `CKTpzFindZeros` run with its file-scope state.
 struct Search<'a> {
-    load: &'a PencilLoad,
-    sparse: Option<Loaded>,
+    pencil: LoadedPencil<'a>,
     trials: Vec<Trial>,
     head: Option<usize>,
     zero_trial: Option<usize>,
@@ -478,8 +543,7 @@ pub fn pencil_load_roots(load: &PencilLoad) -> SpiceResult<PencilRoots> {
     load.validate()?;
     let n = load.order;
     let mut search = Search {
-        load,
-        sparse: None,
+        pencil: LoadedPencil::new(load),
         trials: Vec::new(),
         head: None,
         zero_trial: None,
@@ -793,59 +857,6 @@ impl Search<'_> {
         Ok(suggestion)
     }
 
-    /// Loads the matrix at `s` and returns SPARSE's determinant
-    /// (`CKTpzLoad`, `SMPcReorder(1e-30, 0)`, `SMPcDProd`), or `None` when
-    /// singular. The matrix is created on the first trial, unordered (C
-    /// runs no `SMPpreOrder` for SPARSE), and keeps its pivot order between
-    /// trials while the pivots pass the threshold test.
-    fn determinant_at(&mut self, s: Cx) -> Option<(Cx, i32)> {
-        let load = self.load;
-        if self.sparse.is_none() {
-            let mut sparse = Sparse::new(load.order);
-            for &(row, col) in &load.elements {
-                sparse.get_element(row + 1, col + 1);
-            }
-            let handles = load
-                .terms
-                .iter()
-                .map(|t| sparse.get_element(t.row + 1, t.col + 1))
-                .collect();
-            let drive = load.solution.map_or([None, None], |col| {
-                load.drive
-                    .map(|row| row.map(|row| sparse.get_element(row + 1, col + 1)))
-            });
-            // An external row no element references has no internal row:
-            // SPARSE leaves it out of the matrix and its determinant, as a
-            // `DEVpzSetup` that drops an internal node (`b4set.c` re-run)
-            // leaves it in C.
-            self.sparse = Some((sparse, handles, drive));
-        }
-        let (sparse, handles, drive) = self.sparse.as_mut()?;
-        sparse.clear();
-        for (term, &handle) in load.terms.iter().zip(handles.iter()) {
-            sparse.add(handle, term.at(s));
-        }
-        if let Some(solution) = load.solution {
-            if let Some(balance) = load.balance {
-                sparse.add_col(balance + 1, solution + 1);
-            }
-            sparse.zero_col(solution + 1);
-        }
-        for (element, value) in drive.iter().zip([1.0, -1.0]) {
-            if let Some(element) = *element {
-                let im = sparse.value(element).im;
-                sparse.set(element, Complex::new(value, im));
-            }
-        }
-        match sparse.order_and_factor(load.relative_threshold, 1.0e-30) {
-            Status::Singular | Status::ZeroDiag => None,
-            Status::Okay | Status::SmallPivot => {
-                let (mantissa, exponent) = sparse.determinant();
-                Some(base2_determinant(mantissa, exponent))
-            }
-        }
-    }
-
     /// `CKTpzRunTrial`: evaluates (or merges) a trial and links it into the
     /// sorted list. Returns the trial now standing for it.
     fn run_trial(&mut self, candidate: usize, set: &Set) -> SpiceResult<usize> {
@@ -942,7 +953,7 @@ impl Search<'_> {
             let mut f_raw = Cx::ZERO;
             let mut mag_raw = 0;
             if !pretest {
-                match self.determinant_at(self.trials[new].s) {
+                match self.pencil.determinant_at(self.trials[new].s) {
                     Some((f, mag)) => {
                         f_raw = f;
                         mag_raw = mag;

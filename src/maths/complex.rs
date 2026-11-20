@@ -6,9 +6,11 @@
 //! singular pivots and non-finite solutions are errors.
 use std::sync::Arc;
 
-use crate::maths::SparseMatrix;
-use crate::maths::linear::{PivotTolerances, check_status, numerical, order_fresh, square};
+use crate::maths::linear::{
+    ComplexFactors, PivotTolerances, check_status, numerical, order_fresh, square,
+};
 use crate::maths::sparse13::{Sparse, Status};
+use crate::maths::{Pattern, SparseMatrix};
 use crate::primitives::{Complex, SpiceResult};
 
 /// Capacitive contributions grouped at a single matrix element.
@@ -45,17 +47,24 @@ pub(crate) fn dynamic_terms(
     groups: &[DynamicGroup],
     omega: f64,
 ) -> Vec<(usize, usize, f64)> {
+    iter_dynamic_terms(e, groups, omega).collect()
+}
+
+fn iter_dynamic_terms<'a>(
+    e: &'a SparseMatrix,
+    groups: &'a [DynamicGroup],
+    omega: f64,
+) -> impl Iterator<Item = (usize, usize, f64)> + 'a {
     let triplets = e.triplets();
-    let mut out = Vec::with_capacity(triplets.len());
     let mut groups = groups.iter().peekable();
     let mut i = 0;
-    while i < triplets.len() {
+    std::iter::from_fn(move || {
+        let t = triplets.get(i)?;
         while groups
             .next_if(|g| g.range.end <= i || g.range.is_empty())
             .is_some()
         {}
-        let t = &triplets[i];
-        match groups.peek() {
+        let value = match groups.peek() {
             Some(g) if g.range.start == i && g.range.end <= triplets.len() => {
                 let mut terms = g
                     .terms
@@ -65,29 +74,58 @@ pub(crate) fn dynamic_terms(
                 for term in terms {
                     sum += term;
                 }
-                out.push((t.row, t.col, g.scale * sum / g.divisor));
                 i = g.range.end;
+                g.scale * sum / g.divisor
             }
             _ => {
-                out.push((t.row, t.col, omega * t.value));
                 i += 1;
+                omega * t.value
             }
+        };
+        Some((t.row, t.col, value))
+    })
+}
+
+/// An assembled circuit matrix stores only coefficients in element-ID
+/// order; standalone matrices retain their sorted coordinate triples.
+#[derive(Debug, Clone)]
+enum Assembly {
+    Bound {
+        pattern: Arc<Pattern>,
+        values: Vec<Complex>,
+    },
+    Standalone(Vec<(usize, usize, Complex)>),
+}
+
+/// The coordinate order of a factor snapshot, shared without duplicating a
+/// circuit pattern's positions. Standalone reuse can still compare against
+/// either kind of previous snapshot.
+#[derive(Debug, Clone)]
+enum ComplexOrder {
+    Bound(Arc<Pattern>),
+    Standalone(Arc<Vec<(usize, usize)>>),
+}
+
+impl ComplexOrder {
+    fn matches(&self, entries: &[(usize, usize, Complex)]) -> bool {
+        let positions = entries.iter().map(|&(r, c, _)| (r, c));
+        match self {
+            Self::Bound(pattern) => (0..pattern.len())
+                .map(|i| pattern.position(crate::maths::sparse::element_id(i)))
+                .eq(positions),
+            Self::Standalone(previous) => previous.iter().copied().eq(positions),
         }
     }
-    out
 }
 
 /// Complex assembled sparse matrix, independent of real stamping storage.
 #[derive(Debug, Clone)]
 pub struct ComplexMatrix {
     n: usize,
-    entries: Vec<(usize, usize, Complex)>,
+    assembly: Assembly,
     pivot: PivotTolerances,
     /// The circuit unknowns' names (from the real operator), for diagnostics.
     names: Option<crate::maths::UnknownNames>,
-    /// The circuit pattern whose elements `entries` are (one per element,
-    /// in element order), or `None` for a standalone matrix.
-    bound: Option<Arc<crate::maths::Pattern>>,
 }
 impl ComplexMatrix {
     /// Assembles `A + j omega E`, preserving cancellations and checking
@@ -120,8 +158,7 @@ impl ComplexMatrix {
             .triplets()
             .iter()
             .map(|t| (t.row, t.col, Complex::real(t.value)));
-        let imaginary = dynamic_terms(e, groups, omega)
-            .into_iter()
+        let imaginary = iter_dynamic_terms(e, groups, omega)
             .map(|(row, col, v)| (row, col, Complex::imaginary(v)));
         {
             for (row, col, v) in real.chain(imaginary) {
@@ -140,14 +177,15 @@ impl ComplexMatrix {
         }
         Ok(Self {
             n: a.rows(),
-            entries: assembled
-                .into_iter()
-                .filter(|(_, v)| *v != Complex::ZERO)
-                .map(|((r, c), v)| (r, c, v))
-                .collect(),
+            assembly: Assembly::Standalone(
+                assembled
+                    .into_iter()
+                    .filter(|(_, v)| *v != Complex::ZERO)
+                    .map(|((r, c), v)| (r, c, v))
+                    .collect(),
+            ),
             pivot: a.pivot_tolerances(),
             names: a.unknown_names().cloned(),
-            bound: None,
         })
     }
 
@@ -191,21 +229,33 @@ impl ComplexMatrix {
             return Err(numerical("complex assembly", "frequency invalid"));
         }
         let mut values = vec![Complex::ZERO; pattern.len()];
-        let real = a.triplets().iter().map(|t| (t.row, t.col, t.value, false));
-        let imaginary = dynamic_terms(e, groups, omega)
-            .into_iter()
-            .map(|(row, col, v)| (row, col, v, true));
+        // The bound real operator already has one accumulated value for
+        // each element. Skip the row-major view and coordinate lookups if
+        // it is bound to this exact pattern. Zero (including -0) was
+        // omitted by the old triplet view, so keep the zero initialization.
+        if let Some((source, real)) = a
+            .bound_values()
+            .filter(|(source, _)| Arc::ptr_eq(source, pattern))
         {
-            for (row, col, v, dynamic) in real.chain(imaginary) {
-                let Some(id) = pattern.find(row, col) else {
+            debug_assert_eq!(source.len(), values.len());
+            for (value, &re) in values.iter_mut().zip(real) {
+                if !re.is_finite() {
+                    return Err(numerical(
+                        "complex assembly",
+                        "non-finite coefficient/overflow",
+                    ));
+                }
+                if re != 0.0 {
+                    value.re = re;
+                }
+            }
+        } else {
+            for t in a.triplets() {
+                let Some(id) = pattern.find(t.row, t.col) else {
                     return Ok(None);
                 };
                 let value = &mut values[id.index()];
-                if dynamic {
-                    value.im += v;
-                } else {
-                    value.re += v;
-                }
+                value.re += t.value;
                 if !value.is_finite() {
                     return Err(numerical(
                         "complex assembly",
@@ -214,19 +264,27 @@ impl ComplexMatrix {
                 }
             }
         }
+        for (row, col, v) in iter_dynamic_terms(e, groups, omega) {
+            let Some(id) = pattern.find(row, col) else {
+                return Ok(None);
+            };
+            let value = &mut values[id.index()];
+            value.im += v;
+            if !value.is_finite() {
+                return Err(numerical(
+                    "complex assembly",
+                    "non-finite coefficient/overflow",
+                ));
+            }
+        }
         Ok(Some(Self {
             n,
-            entries: values
-                .into_iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    let (row, col) = pattern.position(crate::maths::sparse::element_id(index));
-                    (row, col, value)
-                })
-                .collect(),
+            assembly: Assembly::Bound {
+                pattern: Arc::clone(pattern),
+                values,
+            },
             pivot: a.pivot_tolerances(),
             names: a.unknown_names().cloned(),
-            bound: Some(Arc::clone(pattern)),
         }))
     }
 
@@ -240,19 +298,10 @@ impl ComplexMatrix {
     /// # Errors
     /// Structurally or numerically singular matrix.
     pub fn factorize_new_matrix(&self) -> SpiceResult<ComplexLu> {
-        let mut sparse = Sparse::new(self.n);
-        let handles: Vec<_> = self
-            .entries
-            .iter()
-            .map(|&(r, c, v)| {
-                let handle = sparse.get_element(r + 1, c + 1);
-                sparse.set(handle, v);
-                handle
-            })
-            .collect();
+        let (mut sparse, handles) = self.fresh_frame();
         if !sparse.fully_translated() {
             // A circuit's matrix follows C (see `maths::linear`).
-            if self.names.is_none() && self.bound.is_none() {
+            if self.names.is_none() && matches!(self.assembly, Assembly::Standalone(_)) {
                 return Err(numerical(
                     "complex sparse LU",
                     "singular matrix: an unknown has no matrix entries",
@@ -264,9 +313,11 @@ impl ComplexMatrix {
         check_status("complex sparse LU", status, &sparse, self.names.as_ref())?;
         Ok(ComplexLu {
             n: self.n,
-            pattern: Arc::new(self.entries.iter().map(|&(r, c, _)| (r, c)).collect()),
-            handles: Arc::new(handles),
-            sparse,
+            order: self.order_key(),
+            factors: ComplexFactors {
+                handles: Arc::new(handles),
+                sparse: Arc::new(sparse),
+            },
         })
     }
 
@@ -274,9 +325,8 @@ impl ComplexMatrix {
     /// # Errors
     /// Structurally or numerically singular matrix.
     pub fn factorize(&self) -> SpiceResult<ComplexLu> {
-        if let Some(pattern) = &self.bound {
-            let values = self.entries.iter().map(|&(_, _, v)| v);
-            let (sparse, handles) = crate::maths::linear::factor_shared_complex(
+        if let Assembly::Bound { pattern, values } = &self.assembly {
+            let factors = crate::maths::linear::factor_shared_complex(
                 pattern,
                 values,
                 self.pivot,
@@ -284,21 +334,11 @@ impl ComplexMatrix {
             )?;
             return Ok(ComplexLu {
                 n: self.n,
-                pattern: Arc::new(self.entries.iter().map(|&(r, c, _)| (r, c)).collect()),
-                handles,
-                sparse,
+                order: self.order_key(),
+                factors,
             });
         }
-        let mut sparse = Sparse::new(self.n);
-        let handles: Vec<_> = self
-            .entries
-            .iter()
-            .map(|&(r, c, v)| {
-                let handle = sparse.get_element(r + 1, c + 1);
-                sparse.set(handle, v);
-                handle
-            })
-            .collect();
+        let (mut sparse, handles) = self.fresh_frame();
         order_fresh(
             "complex sparse LU",
             &mut sparse,
@@ -308,10 +348,44 @@ impl ComplexMatrix {
         )?;
         Ok(ComplexLu {
             n: self.n,
-            pattern: Arc::new(self.entries.iter().map(|&(r, c, _)| (r, c)).collect()),
-            handles: Arc::new(handles),
-            sparse,
+            order: self.order_key(),
+            factors: ComplexFactors {
+                handles: Arc::new(handles),
+                sparse: Arc::new(sparse),
+            },
         })
+    }
+
+    fn fresh_frame(&self) -> (Sparse<Complex>, Vec<usize>) {
+        let mut sparse = Sparse::new(self.n);
+        let mut insert = |r, c, v| {
+            let handle = sparse.get_element(r + 1, c + 1);
+            sparse.set(handle, v);
+            handle
+        };
+        let handles = match &self.assembly {
+            Assembly::Bound { pattern, values } => values
+                .iter()
+                .enumerate()
+                .map(|(index, &v)| {
+                    let (r, c) = pattern.position(crate::maths::sparse::element_id(index));
+                    insert(r, c, v)
+                })
+                .collect(),
+            Assembly::Standalone(entries) => {
+                entries.iter().map(|&(r, c, v)| insert(r, c, v)).collect()
+            }
+        };
+        (sparse, handles)
+    }
+
+    fn order_key(&self) -> ComplexOrder {
+        match &self.assembly {
+            Assembly::Bound { pattern, .. } => ComplexOrder::Bound(Arc::clone(pattern)),
+            Assembly::Standalone(entries) => ComplexOrder::Standalone(Arc::new(
+                entries.iter().map(|&(r, c, _)| (r, c)).collect(),
+            )),
+        }
     }
 
     /// Refactors with the pivot order of `previous` when the pattern is
@@ -320,23 +394,17 @@ impl ComplexMatrix {
     /// # Errors
     /// Structurally or numerically singular matrix.
     pub fn factorize_reusing(&self, previous: &ComplexLu) -> SpiceResult<ComplexLu> {
-        if self.bound.is_some() {
+        let Assembly::Standalone(entries) = &self.assembly else {
             // The circuit pattern carries the pivot order itself.
             return self.factorize();
-        }
-        let same = previous.n == self.n
-            && previous
-                .pattern
-                .iter()
-                .copied()
-                .eq(self.entries.iter().map(|&(r, c, _)| (r, c)));
-        if !same {
+        };
+        if previous.n != self.n || !previous.order.matches(entries) {
             return self.factorize();
         }
-        let mut sparse = previous.sparse.clone();
+        let mut sparse = (*previous.factors.sparse).clone();
         let load = |sparse: &mut Sparse<Complex>| {
             sparse.clear();
-            for (handle, &(_, _, v)) in previous.handles.iter().zip(&self.entries) {
+            for (handle, &(_, _, v)) in previous.factors.handles.iter().zip(entries) {
                 sparse.set(*handle, v);
             }
         };
@@ -349,9 +417,11 @@ impl ComplexMatrix {
         check_status("complex sparse LU", status, &sparse, self.names.as_ref())?;
         Ok(ComplexLu {
             n: self.n,
-            pattern: Arc::clone(&previous.pattern),
-            handles: Arc::clone(&previous.handles),
-            sparse,
+            order: previous.order.clone(),
+            factors: ComplexFactors {
+                handles: Arc::clone(&previous.factors.handles),
+                sparse: Arc::new(sparse),
+            },
         })
     }
 }
@@ -360,9 +430,8 @@ impl ComplexMatrix {
 #[derive(Debug)]
 pub struct ComplexLu {
     n: usize,
-    pattern: Arc<Vec<(usize, usize)>>,
-    handles: Arc<Vec<usize>>,
-    sparse: Sparse<Complex>,
+    order: ComplexOrder,
+    factors: ComplexFactors,
 }
 impl ComplexLu {
     /// Solves `A x = b` (`SMPcSolve`).
@@ -386,9 +455,9 @@ impl ComplexLu {
             return Err(numerical("complex solve", "invalid RHS"));
         }
         let x = if transposed {
-            self.sparse.solve_transposed(rhs)
+            self.factors.sparse.solve_transposed(rhs)
         } else {
-            self.sparse.solve(rhs)
+            self.factors.sparse.solve(rhs)
         };
         if x.iter().any(|v| !v.is_finite()) {
             return Err(numerical(
@@ -403,6 +472,66 @@ impl ComplexLu {
     /// `1 <= max(|re|, |im|) < 10` normalization.
     #[must_use]
     pub fn determinant(&self) -> (Complex, i32) {
-        self.sparse.determinant()
+        self.factors.sparse.determinant()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bound_and_standalone_assembly_follow_stamp_order() {
+        let pattern = Arc::new(Pattern::new(2, [(1, 1), (0, 1), (0, 0), (1, 0)]));
+        let mut bound = SparseMatrix::bound(Arc::clone(&pattern));
+        let mut triplets = SparseMatrix::new(2, 2);
+        for (r, c, v) in [(0, 0, 3.), (1, 1, 4.), (0, 1, -0.), (1, 0, 2.), (0, 0, 1.)] {
+            bound.add(r, c, v).unwrap();
+            triplets.add(r, c, v).unwrap();
+        }
+        let mut e = SparseMatrix::new(2, 2);
+        for v in [1e16, -1e16, 1.] {
+            e.add(0, 1, v).unwrap();
+        }
+        e.add(1, 1, 0.5).unwrap();
+        let groups = [
+            DynamicGroup {
+                range: 0..3,
+                terms: vec![1e16, -1e16, 1.],
+                scale: 3.,
+                divisor: 2.,
+                prescaled: true,
+            },
+            DynamicGroup {
+                range: 3..4,
+                terms: vec![0.5],
+                scale: 1.,
+                divisor: 1.,
+                prescaled: false,
+            },
+        ];
+        let values = |a: &SparseMatrix| {
+            let matrix = ComplexMatrix::from_operators_grouped_on(&pattern, a, &e, &groups, -2.)
+                .unwrap()
+                .unwrap();
+            let Assembly::Bound { values, .. } = matrix.assembly else {
+                panic!("expected bound values")
+            };
+            values
+        };
+        assert_eq!(values(&bound), values(&triplets));
+        assert_eq!(
+            values(&bound),
+            [
+                Complex::new(4., -1.),
+                Complex::imaginary(1.5),
+                Complex::real(4.),
+                Complex::real(2.)
+            ]
+        );
+        let mut overflow = SparseMatrix::new(2, 2);
+        overflow.add(0, 0, f64::MAX).unwrap();
+        overflow.add(0, 0, f64::MAX).unwrap();
+        assert!(ComplexMatrix::from_operators_on(&pattern, &overflow, &e, 1.).is_err());
     }
 }

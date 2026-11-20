@@ -439,16 +439,17 @@ impl<T: Scalar> Sparse<T> {
     /// The same matrix frame holding another scalar type, every element
     /// zero: ngspice switches one frame between real and complex
     /// (`spSetReal`/`spSetComplex`), keeping its internal numbering, row and
-    /// column exchanges, pivot order, fill-ins and flags. Loads start with
+    /// column exchanges, pivot order, fill-ins and flags. Only scalar storage is rebuilt;
+    /// the structural index buffers move unchanged. Loads start with
     /// `spClear`, so the values carried over do not matter.
-    pub(crate) fn retyped<U: Scalar>(&self) -> Sparse<U> {
+    pub(crate) fn into_retyped<U: Scalar>(self) -> Sparse<U> {
         Sparse {
             size: self.size,
             ext_size: self.ext_size,
             current_size: self.current_size,
             elements: self
                 .elements
-                .iter()
+                .into_iter()
                 .map(|e| Element {
                     value: U::ZERO,
                     row: e.row,
@@ -457,16 +458,16 @@ impl<T: Scalar> Sparse<T> {
                     next_in_col: e.next_in_col,
                 })
                 .collect(),
-            diag: self.diag.clone(),
-            first_in_col: self.first_in_col.clone(),
-            first_in_row: self.first_in_row.clone(),
-            ext_to_int_row: self.ext_to_int_row.clone(),
-            ext_to_int_col: self.ext_to_int_col.clone(),
-            int_to_ext_row: self.int_to_ext_row.clone(),
-            int_to_ext_col: self.int_to_ext_col.clone(),
-            markowitz_row: self.markowitz_row.clone(),
-            markowitz_col: self.markowitz_col.clone(),
-            markowitz_prod: self.markowitz_prod.clone(),
+            diag: self.diag,
+            first_in_col: self.first_in_col,
+            first_in_row: self.first_in_row,
+            ext_to_int_row: self.ext_to_int_row,
+            ext_to_int_col: self.ext_to_int_col,
+            int_to_ext_row: self.int_to_ext_row,
+            int_to_ext_col: self.int_to_ext_col,
+            markowitz_row: self.markowitz_row,
+            markowitz_col: self.markowitz_col,
+            markowitz_prod: self.markowitz_prod,
             factor_workspace: Vec::new(),
             singletons: self.singletons,
             rel_threshold: self.rel_threshold,
@@ -1682,6 +1683,25 @@ mod tests {
             .zip(b)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn scalar_transition_moves_structural_allocations() {
+        let mut real = build(2, &[(1, 1, 2.), (1, 2, 1.), (2, 1, 3.), (2, 2, 4.)]);
+        assert_eq!(real.order_and_factor(1e-3, 0.), Status::Okay);
+        let diagonal = real.diag.as_ptr();
+        let rows = real.int_to_ext_row.as_ptr();
+        let columns = real.int_to_ext_col.as_ptr();
+        let complex = real.into_retyped::<Complex>();
+        assert_eq!(complex.diag.as_ptr(), diagonal);
+        assert_eq!(complex.int_to_ext_row.as_ptr(), rows);
+        assert_eq!(complex.int_to_ext_col.as_ptr(), columns);
+        assert!(!complex.is_factored());
+        assert!(complex.elements.iter().all(|e| e.value.is_zero()));
+        let real = complex.into_retyped::<f64>();
+        assert_eq!(real.diag.as_ptr(), diagonal);
+        assert_eq!(real.int_to_ext_row.as_ptr(), rows);
+        assert_eq!(real.int_to_ext_col.as_ptr(), columns);
     }
 
     #[test]
