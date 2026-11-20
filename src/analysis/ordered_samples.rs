@@ -70,13 +70,18 @@ pub(super) fn linear_sample(
     }
     let right = axis.partition_point(|t| *t < x);
     let mut get = |index| value(index).map_err(SampleError::Operand);
-    if axis[right] == x {
+    if axis[right] <= x {
+        // The lower bound is already >= x, so this is the exact coordinate,
+        // including either encoding of zero. Find the entire duplicate group.
         let first = get(right)?;
-        for (index, &time) in axis.iter().enumerate().skip(right + 1) {
-            if time != x {
-                break;
-            }
-            if get(index)? != first {
+        for (index, _) in axis
+            .iter()
+            .enumerate()
+            .skip(right + 1)
+            .take_while(|(_, time)| **time <= x)
+        {
+            // An unordered operand is not an agreement either.
+            if get(index)?.partial_cmp(&first) != Some(std::cmp::Ordering::Equal) {
                 return Err(SampleError::Discontinuous);
             }
         }
@@ -94,4 +99,38 @@ pub(super) fn linear_sample(
 
 pub(super) fn interpolate(x0: Real, y0: Real, x1: Real, y1: Real, x: Real) -> Real {
     y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SampleError, linear_sample};
+
+    #[test]
+    fn duplicate_coordinates_use_exact_equality_including_signed_zero() {
+        let axis = [-1., -0., 0., 1.];
+        let values = [-1., -0., 0., 1.];
+        assert!(matches!(
+            linear_sample(&axis, 0., |index| Ok(values[index])),
+            Ok(value) if value.to_bits() == (-0_f64).to_bits()
+        ));
+        let distinct = f64::from_bits(1);
+        assert!(matches!(
+            linear_sample(&axis, -0., |index| Ok(if index == 2 {
+                distinct
+            } else {
+                values[index]
+            })),
+            Err(SampleError::Discontinuous)
+        ));
+    }
+
+    #[test]
+    fn adjacent_representable_coordinates_are_not_duplicates() {
+        let adjacent = f64::from_bits(1_f64.to_bits() + 1);
+        let axis = [1., adjacent];
+        assert!(matches!(
+            linear_sample(&axis, adjacent, |index| Ok(if index == 0 { 2. } else { 3. })),
+            Ok(value) if value.to_bits() == 3_f64.to_bits()
+        ));
+    }
 }
