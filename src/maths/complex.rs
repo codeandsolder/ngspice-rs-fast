@@ -305,7 +305,8 @@ impl ComplexMatrix {
             // including the sign of an underflowed imaginary term.
             for (value, &coefficient) in values.iter_mut().zip(dynamic) {
                 if coefficient != 0.0 {
-                    value.im += omega * coefficient;
+                    let contribution = omega * coefficient;
+                    value.im += contribution;
                     if !value.is_finite() {
                         return Err(numerical(
                             "complex assembly",

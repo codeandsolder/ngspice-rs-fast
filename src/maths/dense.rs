@@ -224,7 +224,9 @@ impl Matrix {
         let n = self.rows;
         for row in 0..n {
             for col in 0..row {
-                if self.data[row * n + col] != self.data[col * n + row] {
+                if self.data[row * n + col].partial_cmp(&self.data[col * n + row])
+                    != Some(std::cmp::Ordering::Equal)
+                {
                     return Err(error(format!(
                         "entries ({row}, {col}) and ({col}, {row}) differ"
                     )));
@@ -272,52 +274,70 @@ pub(super) fn extreme_norm_scale(max: Real) -> Option<Real> {
 
 /// Cyclic Jacobi eigenvalues of the symmetric row-major `a` (n x n), sorted.
 /// `None` if the off-diagonal mass fails to vanish within the sweep budget.
-fn jacobi_eigenvalues(mut a: Vec<Real>, n: usize) -> Option<Vec<Real>> {
-    let off = |a: &[Real]| -> Real {
+fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> Option<Vec<Real>> {
+    let off_diagonal_norm = |data: &[Real]| -> Real {
         let mut sum = 0.0;
-        for row in 0..n {
-            for col in 0..n {
+        for row in 0..order {
+            for col in 0..order {
                 if row != col {
-                    sum += a[row * n + col] * a[row * n + col];
+                    let entry = data[row * order + col];
+                    let squared = entry * entry;
+                    sum += squared;
                 }
             }
         }
         sum
     };
-    let total: Real = a.iter().map(|v| v * v).sum();
+    let total: Real = data.iter().map(|value| value * value).sum();
     for _sweep in 0..100 {
-        if off(&a) <= Real::EPSILON * Real::EPSILON * total {
-            let mut values: Vec<Real> = (0..n).map(|i| a[i * n + i]).collect();
+        if off_diagonal_norm(&data) <= Real::EPSILON * Real::EPSILON * total {
+            let mut values: Vec<Real> = (0..order)
+                .map(|index| data[index * order + index])
+                .collect();
             values.sort_by(Real::total_cmp);
             return Some(values);
         }
-        for p in 0..n {
-            for q in p + 1..n {
-                let apq = a[p * n + q];
-                if apq == 0.0 {
+        for first in 0..order {
+            for second in first + 1..order {
+                let coupling = data[first * order + second];
+                if coupling == 0.0 {
                     continue;
                 }
-                let theta = (a[q * n + q] - a[p * n + p]) / (2.0 * apq);
-                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
-                let t = if theta == 0.0 { 1.0 } else { t };
-                let c = 1.0 / (t * t + 1.0).sqrt();
-                let s = t * c;
-                for k in 0..n {
-                    let akp = a[k * n + p];
-                    let akq = a[k * n + q];
-                    a[k * n + p] = c * akp - s * akq;
-                    a[k * n + q] = s * akp + c * akq;
+                let theta = (data[second * order + second] - data[first * order + first])
+                    / (2.0 * coupling);
+                let theta_squared = theta * theta;
+                let tangent = theta.signum() / (theta.abs() + (theta_squared + 1.0).sqrt());
+                let tangent = if theta == 0.0 { 1.0 } else { tangent };
+                let tangent_squared = tangent * tangent;
+                let cosine = 1.0 / (tangent_squared + 1.0).sqrt();
+                let sine = tangent * cosine;
+                for index in 0..order {
+                    let first_slot = index * order + first;
+                    let second_slot = index * order + second;
+                    let (left, right) =
+                        rotate_pair(data[first_slot], data[second_slot], cosine, sine);
+                    data[first_slot] = left;
+                    data[second_slot] = right;
                 }
-                for k in 0..n {
-                    let apk = a[p * n + k];
-                    let aqk = a[q * n + k];
-                    a[p * n + k] = c * apk - s * aqk;
-                    a[q * n + k] = s * apk + c * aqk;
+                for index in 0..order {
+                    let first_slot = first * order + index;
+                    let second_slot = second * order + index;
+                    let (left, right) =
+                        rotate_pair(data[first_slot], data[second_slot], cosine, sine);
+                    data[first_slot] = left;
+                    data[second_slot] = right;
                 }
             }
         }
     }
     None
+}
+
+// Round the products separately, preserving the original rotation arithmetic.
+const fn rotate_pair(first: Real, second: Real, cosine: Real, sine: Real) -> (Real, Real) {
+    let direct = (cosine * first, cosine * second);
+    let crossed = (sine * second, sine * first);
+    (direct.0 - crossed.0, crossed.1 + direct.1)
 }
 
 /// A dense real vector, used for the MNA right-hand side and the solution.
@@ -393,7 +413,7 @@ impl Vector {
     /// # Errors
     ///
     /// [`SpiceError::Numerical`] when the index is out of range.
-    #[inline(always)]
+    #[inline]
     pub fn add_to(&mut self, index: usize, value: Real) -> SpiceResult<()> {
         match self.data.get_mut(index) {
             Some(slot) => {
@@ -517,6 +537,9 @@ mod tests {
         assert!(matrix.symmetric_eigenvalues().unwrap()[0] < 0.0);
         matrix.set(1, 0, 2.0).unwrap();
         assert!(matrix.symmetric_eigenvalues().is_err());
+        let mut signed_zero = Matrix::zeros(2, 2);
+        signed_zero.set(0, 1, -0.0).unwrap();
+        assert!(signed_zero.symmetric_eigenvalues().is_ok());
         assert!(Matrix::zeros(2, 3).symmetric_eigenvalues().is_err());
         assert!(Matrix::zeros(0, 0).symmetric_eigenvalues().is_err());
         let mut nonfinite = Matrix::zeros(1, 1);
