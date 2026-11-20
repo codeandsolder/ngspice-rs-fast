@@ -8,7 +8,8 @@
     clippy::used_underscore_binding,
     clippy::too_many_lines,
     clippy::large_stack_arrays,
-    clippy::redundant_pub_crate
+    clippy::redundant_pub_crate,
+    reason = "generated C schema preserves member spelling, layout and uniform positional accessors"
 )]
 
 /// `struct sBSIM4model`'s scalar members (1824 of them), in declaration order.
@@ -1843,7 +1844,7 @@ pub(crate) struct Model {
 #[rustfmt::skip]
 impl Model {
     /// The `f64` member named `c_name` in C, if there is one.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "uniform generated schema accessors may be unused by a particular device path")]
     pub(crate) fn real_mut(&mut self, c_name: &str) -> Option<&mut f64> {
         Some(match c_name {
             "BSIM4eot" => &mut self.eot,
@@ -2756,7 +2757,7 @@ impl Model {
         })
     }
     /// The `i32` member named `c_name` in C, if there is one.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "uniform generated schema accessors may be unused by a particular device path")]
     pub(crate) fn int_mut(&mut self, c_name: &str) -> Option<&mut i32> {
         Some(match c_name {
             "BSIM4type" => &mut self.r#type,
@@ -2787,7 +2788,7 @@ impl Model {
         })
     }
     /// The `bool` member named `c_name` in C, if there is one.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "uniform generated schema accessors may be unused by a particular device path")]
     pub(crate) fn flag_mut(&mut self, c_name: &str) -> Option<&mut bool> {
         Some(match c_name {
             "BSIM4mobModGiven" => &mut self.mobModGiven,
@@ -3687,7 +3688,7 @@ impl Model {
         })
     }
     /// C member names of the scalar members, in declaration order.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "uniform generated schema accessors may be unused by a particular device path")]
     pub(crate) const MEMBERS: &[&str] = &[
         "BSIM4type",
         "BSIM4mobMod",
@@ -5516,7 +5517,7 @@ impl Model {
 
     /// The scalar members as numbers, in [`Self::MEMBERS`] order (`i32` exactly,
     /// a given bit as 0 or 1).
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "uniform generated schema accessors may be unused by a particular device path")]
     pub(crate) fn to_values(&self) -> Vec<f64> {
         vec![
             f64::from(self.r#type),
@@ -7347,7 +7348,7 @@ impl Model {
 
     /// Stores numbers produced by [`Self::to_values`]; `values` must have
     /// `Self::MEMBERS.len()` entries.
-    #[allow(dead_code, clippy::cast_possible_truncation)]
+    #[allow(dead_code, clippy::cast_possible_truncation, reason = "generated numeric snapshots round-trip exact i32 fields and may be unused for some record types")]
     pub(crate) const fn set_values(&mut self, values: &[f64]) {
         self.r#type = values[0] as i32;
         self.mobMod = values[1] as i32;
@@ -9407,7 +9408,7 @@ pub(crate) struct SizeParam {
 #[rustfmt::skip]
 impl SizeParam {
     /// The `f64` member named `c_name` in C, if there is one.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "uniform generated schema accessors may be unused by a particular device path")]
     pub(crate) fn real_mut(&mut self, c_name: &str) -> Option<&mut f64> {
         Some(match c_name {
             "Width" => &mut self.Width,
@@ -9638,7 +9639,7 @@ impl SizeParam {
         })
     }
     /// C member names of the scalar members, in declaration order.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "uniform generated schema accessors may be unused by a particular device path")]
     pub(crate) const MEMBERS: &[&str] = &[
         "Width",
         "Length",
@@ -9868,7 +9869,7 @@ impl SizeParam {
 
     /// The scalar members as numbers, in [`Self::MEMBERS`] order (`i32` exactly,
     /// a given bit as 0 or 1).
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "uniform generated schema accessors may be unused by a particular device path")]
     pub(crate) fn to_values(&self) -> Vec<f64> {
         vec![
             self.Width,
@@ -10100,7 +10101,7 @@ impl SizeParam {
 
     /// Stores numbers produced by [`Self::to_values`]; `values` must have
     /// `Self::MEMBERS.len()` entries.
-    #[allow(dead_code, clippy::cast_possible_truncation)]
+    #[allow(dead_code, clippy::cast_possible_truncation, reason = "generated numeric snapshots round-trip exact i32 fields and may be unused for some record types")]
     pub(crate) const fn set_values(&mut self, values: &[f64]) {
         self.Width = values[0];
         self.Length = values[1];
@@ -10707,7 +10708,7 @@ pub(crate) struct Instance {
 #[rustfmt::skip]
 impl Instance {
     /// The `f64` member named `c_name` in C, if there is one.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "uniform generated schema accessors may be unused by a particular device path")]
     pub(crate) fn real_mut(&mut self, c_name: &str) -> Option<&mut f64> {
         Some(match c_name {
             "BSIM4ueff" => &mut self.ueff,
@@ -11021,7 +11022,7 @@ impl Instance {
         })
     }
     /// The `i32` member named `c_name` in C, if there is one.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "uniform generated schema accessors may be unused by a particular device path")]
     pub(crate) fn int_mut(&mut self, c_name: &str) -> Option<&mut i32> {
         Some(match c_name {
             "BSIM4dNode" => &mut self.dNode,
@@ -11050,7 +11051,7 @@ impl Instance {
         })
     }
     /// The `bool` member named `c_name` in C, if there is one.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "uniform generated schema accessors may be unused by a particular device path")]
     pub(crate) fn flag_mut(&mut self, c_name: &str) -> Option<&mut bool> {
         Some(match c_name {
             "BSIM4lGiven" => &mut self.lGiven,
@@ -11098,7 +11099,7 @@ impl Instance {
         })
     }
     /// C member names of the scalar members, in declaration order.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "uniform generated schema accessors may be unused by a particular device path")]
     pub(crate) const MEMBERS: &[&str] = &[
         "BSIM4dNode",
         "BSIM4gNodeExt",
@@ -11474,7 +11475,7 @@ impl Instance {
 
     /// The scalar members as numbers, in [`Self::MEMBERS`] order (`i32` exactly,
     /// a given bit as 0 or 1).
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "uniform generated schema accessors may be unused by a particular device path")]
     pub(crate) fn to_values(&self) -> Vec<f64> {
         vec![
             f64::from(self.dNode),
@@ -11852,7 +11853,7 @@ impl Instance {
 
     /// Stores numbers produced by [`Self::to_values`]; `values` must have
     /// `Self::MEMBERS.len()` entries.
-    #[allow(dead_code, clippy::cast_possible_truncation)]
+    #[allow(dead_code, clippy::cast_possible_truncation, reason = "generated numeric snapshots round-trip exact i32 fields and may be unused for some record types")]
     pub(crate) const fn set_values(&mut self, values: &[f64]) {
         self.dNode = values[0] as i32;
         self.gNodeExt = values[1] as i32;
