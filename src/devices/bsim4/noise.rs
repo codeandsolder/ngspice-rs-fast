@@ -242,21 +242,10 @@ pub(super) fn generators(
         let epsilon = (T7 - T7 * T7 * T7 / 3.0) / (6.0 * T6);
         let mut T8 = h.Vgsteff / h.EsatL;
         T8 *= T8;
+        let npart_c = m.rnoic * (1.0 + T8 * m.tnoic * Leff);
         if m.v48intVersion <= 480 {
-            let npart_c = m.rnoic * (1.0 + T8 * m.tnoic * Leff);
             ctnoi = epsilon / (gamma * delta).sqrt() * (2.5316 * npart_c);
-
-            npart_beta = m.rnoia * (1.0 + T8 * m.tnoia * Leff);
-            npart_theta = m.rnoib * (1.0 + T8 * m.tnoib * Leff);
-            gamma = gamma * (3.0 * npart_beta * npart_beta);
-            delta = delta * (3.75 * npart_theta * npart_theta);
-
-            GammaGd0 = gamma * h.noiGd0;
-            let C0 = h.Coxeff * p.weffCV * h.nf * p.leffCV;
-            let T0 = C0 / h.noiGd0;
-            sigrat = T0 * (delta / gamma).sqrt();
         } else {
-            let npart_c = m.rnoic * (1.0 + T8 * m.tnoic * Leff);
             // Limits added for rnoia..tnoic in BSIM4.8.1.
             let T9 = gamma * delta;
             ctnoi = if T9 > 0.0 {
@@ -270,22 +259,22 @@ pub(super) fn generators(
             if ctnoi < 0.0 {
                 ctnoi = 0.0;
             }
-
-            npart_beta = m.rnoia * (1.0 + T8 * m.tnoia * Leff);
-            npart_theta = m.rnoib * (1.0 + T8 * m.tnoib * Leff);
-            gamma = gamma * (3.0 * npart_beta * npart_beta);
-            delta = delta * (3.75 * npart_theta * npart_theta);
-
-            GammaGd0 = gamma * h.noiGd0;
-            let C0 = h.Coxeff * p.weffCV * h.nf * p.leffCV;
-            let T0 = C0 / h.noiGd0;
-
-            sigrat = if gamma > 0.0 && delta > 0.0 {
-                T0 * (delta / gamma).sqrt()
-            } else {
-                0.0
-            };
         }
+
+        npart_beta = m.rnoia * (1.0 + T8 * m.tnoia * Leff);
+        npart_theta = m.rnoib * (1.0 + T8 * m.tnoib * Leff);
+        gamma = gamma * (3.0 * npart_beta * npart_beta);
+        delta = delta * (3.75 * npart_theta * npart_theta);
+
+        GammaGd0 = gamma * h.noiGd0;
+        let C0 = h.Coxeff * p.weffCV * h.nf * p.leffCV;
+        let T0 = C0 / h.noiGd0;
+        // Earlier models did not guard the ratio, including nonfinite inputs.
+        sigrat = if m.v48intVersion <= 480 || (gamma > 0.0 && delta > 0.0) {
+            T0 * (delta / gamma).sqrt()
+        } else {
+            0.0
+        };
     }
     match m.tnoiMod {
         0 => {

@@ -253,7 +253,7 @@ fn instance_table() -> &'static [P] {
 }
 
 /// One BSIM4 instance as `.sens` sees it.
-pub(crate) struct Bsim4Sensitivity<'a> {
+pub(super) struct Bsim4Sensitivity<'a> {
     device: &'a Bsim4,
     context: ModelContext,
     /// The model's VERSION string (not a numeric member).
@@ -574,7 +574,7 @@ impl DeviceSensitivity for Bsim4Sensitivity<'_> {
             // model pass stands, the instance keeps its members, and its
             // `pParam` is the freshly allocated (zeroed) set with only the
             // geometry assigned before the failing check.
-            Err(SpiceError::NotYetPorted { .. }) | Err(SpiceError::Unsupported { .. }) => {
+            Err(SpiceError::NotYetPorted { .. } | SpiceError::Unsupported { .. }) => {
                 return Err(SpiceError::circuit(format!(
                     "{}: BSIM4 temperature pass failed under .sens",
                     self.device.name
