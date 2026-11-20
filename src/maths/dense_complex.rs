@@ -181,15 +181,22 @@ impl DenseComplex {
         if self.data.iter().any(|value| !value.is_finite()) {
             return Err(numerical("non-finite entry"));
         }
-        let scale = self
-            .data
+        let mut a = self.data.clone();
+        let max_component = a
             .iter()
-            .fold(0_f64, |m, value| m.max(value.magnitude()));
+            .fold(0.0_f64, |m, v| m.max(v.re.abs()).max(v.im.abs()));
+        let normalization = super::dense::extreme_norm_scale(max_component);
+        if let Some(scale) = normalization {
+            for value in &mut a {
+                value.re /= scale;
+                value.im /= scale;
+            }
+        }
+        let scale = a.iter().fold(0_f64, |m, value| m.max(value.magnitude()));
         if scale == 0. {
             return Ok((n == 0).then(|| self.clone()));
         }
         let threshold = 128. * f64::EPSILON * (n as f64) * scale;
-        let mut a = self.data.clone();
         let mut b = Self::identity(n).data;
         for c in 0..n {
             let pivot_row = (c..n)
@@ -232,6 +239,14 @@ impl DenseComplex {
                     *a_value = *a_value - factor * a_p;
                     *b_value = *b_value - factor * b_p;
                 }
+            }
+        }
+        // If A was scaled down by s, A'^{-1} = s A^{-1}.
+        // Undo that scale in the returned inverse, not the pivot policy.
+        if let Some(scale) = normalization {
+            for value in &mut b {
+                value.re /= scale;
+                value.im /= scale;
             }
         }
         Self { n, data: b }.checked().map(Some)
@@ -323,6 +338,31 @@ mod tests {
                 assert!(value.im.abs() < 1e-14, "{i},{j}: {value}");
             }
         }
+    }
+
+    #[test]
+    fn inverse_normalizes_extreme_complex_pivots() {
+        for scale in [1e-300, 1e300, 1e308] {
+            let a =
+                DenseComplex::diagonal(&[Complex::new(scale, scale), Complex::new(scale, -scale)]);
+            let inverse = a
+                .inverse()
+                .unwrap()
+                .expect("well-conditioned even at extreme scale");
+            let identity = a.mul(&inverse).unwrap();
+            for i in 0..2 {
+                for j in 0..2 {
+                    let expected = if i == j { 1. } else { 0. };
+                    let v = identity.get(i, j).unwrap();
+                    assert!((v.re - expected).abs() < 1e-14 && v.im.abs() < 1e-14);
+                }
+            }
+        }
+        assert!(
+            DenseComplex::diagonal(&[Complex::real(f64::from_bits(1))])
+                .inverse()
+                .is_err()
+        );
     }
 
     #[test]

@@ -237,18 +237,12 @@ impl Matrix {
         // threshold) can overflow or underflow, falsely reporting convergence.
         // Normalize by a power of two only outside the safe norm range.
         let max = data.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-        let scale = if max > 0.0 && !(2.0_f64.powi(-450)..=2.0_f64.powi(450)).contains(&max) {
-            // The exponent bits yield the leading power of two. Subnormal
-            // inputs use MIN_POSITIVE, so the smallest ratio is 2^-52.
-            let exponent = f64::from_bits(max.to_bits() & 0x7ff0_0000_0000_0000);
-            let scale = exponent.max(f64::MIN_POSITIVE);
+        let scale = extreme_norm_scale(max);
+        if let Some(scale) = scale {
             for value in &mut data {
                 *value /= scale;
             }
-            Some(scale)
-        } else {
-            None
-        };
+        }
         let mut values = jacobi_eigenvalues(data, n)
             .ok_or_else(|| error("Jacobi rotations did not converge".to_owned()))?;
         if let Some(scale) = scale {
@@ -261,6 +255,19 @@ impl Matrix {
         }
         Ok(values)
     }
+}
+
+/// A power-of-two normalization for finite nonnegative maximum components,
+/// only when squaring unscaled values risks overflow or underflow. Keep
+/// ordinary matrices on their reference-compatible arithmetic path.
+pub(super) fn extreme_norm_scale(max: Real) -> Option<Real> {
+    if max == 0.0 || (2.0_f64.powi(-450)..=2.0_f64.powi(450)).contains(&max) {
+        return None;
+    }
+    // The exponent bits yield the leading power of two. Subnormal inputs
+    // use MIN_POSITIVE, so the smallest ratio remains 2^-52.
+    let exponent = f64::from_bits(max.to_bits() & 0x7ff0_0000_0000_0000);
+    Some(exponent.max(f64::MIN_POSITIVE))
 }
 
 /// Cyclic Jacobi eigenvalues of the symmetric row-major `a` (n x n), sorted.

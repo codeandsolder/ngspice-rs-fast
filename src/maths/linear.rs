@@ -324,17 +324,21 @@ impl FactoredInputs {
     }
 }
 
+fn solve_real(sparse: &Sparse<f64>, n: usize, rhs: &Vector) -> SpiceResult<Vector> {
+    rhs_valid(rhs, n)?;
+    let x = Vector::from(sparse.solve(rhs.as_slice()));
+    if !x.is_finite() {
+        return Err(numerical(
+            "LU solve",
+            "non-finite solution (singular system)",
+        ));
+    }
+    Ok(x)
+}
+
 impl SparseSymbolic {
     fn solve(&self, rhs: &Vector) -> SpiceResult<Vector> {
-        rhs_valid(rhs, self.n)?;
-        let x = Vector::from(self.sparse.solve(rhs.as_slice()));
-        if !x.is_finite() {
-            return Err(numerical(
-                "LU solve",
-                "non-finite solution (singular system)",
-            ));
-        }
-        Ok(x)
+        solve_real(&self.sparse, self.n, rhs)
     }
 
     /// Whether a matrix has exactly this assembled pattern.
@@ -842,7 +846,8 @@ impl SparseLu {
 /// dense simulator solve); zero entries are not stored, as with SPARSE.
 #[derive(Debug)]
 pub struct DenseLu {
-    factor: SparseLu,
+    sparse: Sparse<f64>,
+    n: usize,
 }
 
 impl DenseLu {
@@ -855,20 +860,27 @@ impl DenseLu {
         if matrix.data().iter().any(|a| !a.is_finite()) {
             return Err(numerical("dense LU", "non-finite coefficient"));
         }
-        let mut sparse = SparseMatrix::new(matrix.rows(), matrix.cols());
-        for row in 0..matrix.rows() {
-            for col in 0..matrix.cols() {
-                let value = matrix.get(row, col).unwrap_or(0.0);
+        let n = matrix.rows();
+        let mut sparse = Sparse::new(n);
+        // The input already has one coefficient per position in row-major
+        // order. Build the frame in exactly the old folded-triplet element
+        // creation order; no temporary triplets, sort, key, handles or Arc.
+        for (row, values) in matrix.data().chunks_exact(n).enumerate() {
+            for (col, &value) in values.iter().enumerate() {
                 if value != 0.0 {
-                    sparse.add(row, col, value)?;
+                    let element = sparse.get_element(row + 1, col + 1);
+                    sparse.set(element, value);
                 }
             }
         }
-        let factor = SparseLu::new(&sparse, None).map_err(|error| match error {
-            SpiceError::Numerical { message, .. } => numerical("dense LU", message),
-            other => other,
-        })?;
-        Ok(Self { factor })
+        order_fresh(
+            "dense LU",
+            &mut sparse,
+            PivotTolerances::DEFAULT,
+            None,
+            false,
+        )?;
+        Ok(Self { sparse, n })
     }
 
     /// Solves against the stored factors.
@@ -876,7 +888,7 @@ impl DenseLu {
     /// # Errors
     /// Invalid RHS or non-finite solution.
     pub fn solve(&self, rhs: &Vector) -> SpiceResult<Vector> {
-        self.factor.solve(rhs)
+        solve_real(&self.sparse, self.n, rhs)
     }
 }
 
@@ -884,6 +896,41 @@ impl DenseLu {
 mod tests {
     use super::*;
     use crate::maths::complex::ComplexMatrix;
+
+    #[test]
+    fn dense_direct_frame_matches_folded_sparse_order_bit_for_bit() {
+        let mut dense = Matrix::zeros(4, 4);
+        let mut sparse = SparseMatrix::new(4, 4);
+        for (r, c, value) in [
+            (0, 1, 3.),
+            (1, 0, -2.),
+            (1, 2, 1.),
+            (2, 1, 0.5),
+            (2, 2, 4.),
+            (2, 3, -1.),
+            (3, 2, 2.),
+            (3, 3, 5.),
+        ] {
+            dense.set(r, c, value).unwrap();
+            sparse.add(r, c, value).unwrap();
+        }
+        let rhs = Vector::from_slice(&[1.25, -2.5, 3.75, -4.25]);
+        let direct = DenseLu::new(&dense).unwrap();
+        let previous = SparseLu::new(&sparse, None).unwrap();
+        let bits = |x: Vector| x.as_slice().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(direct.solve(&rhs).unwrap()),
+            bits(previous.solve(&rhs).unwrap())
+        );
+        assert_eq!(
+            direct.sparse.determinant().unwrap().0.to_bits(),
+            previous.determinant().unwrap().0.to_bits()
+        );
+        assert_eq!(
+            direct.sparse.determinant().unwrap().1,
+            previous.determinant().unwrap().1
+        );
+    }
 
     #[test]
     fn complex_cache_keeps_snapshots_and_changes_scalar_only_at_boundary() {
