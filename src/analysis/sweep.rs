@@ -337,44 +337,24 @@ pub fn resolve(
             ".dc requires one or two target/start/stop/step axes",
         ));
     }
-    // Resolve the first point's resistor/temperature/parameter settings before
-    // assembly: the original resistance may overflow at a swept temperature
-    // even though every requested replacement is valid. Physical resistor
-    // metadata needs no equation assembly, and source kinds come from the
-    // resulting system.
+    // Targets are physical metadata, not an AC matrix. Do not require an
+    // otherwise DC-capable device to implement a small-signal load merely to
+    // discover which name denotes an independent source.
     let mut names = std::collections::BTreeSet::new();
-    let mut probe = context.model_context();
     let mut written = Vec::new();
     for axis in args.as_chunks::<4>().0 {
         let target = Written::classify(circuit, axis[0])?;
         if !names.insert(target.key()) {
             return Err(unsupported("duplicate nested DC target"));
         }
-        let start = number(Some(axis[1]), "sweep start")?;
-        match target {
-            Written::Temperature => probe.temperature = start,
-            Written::Name(name) | Written::Resistance(name) if circuit.resistor(name).is_some() => {
-                probe = probe.with_resistor_override(circuit.resistor_override(name, start)?)?;
-            }
-            _ => {}
-        }
         written.push(target);
     }
-    // Instance parameters are validated at the probe temperature.
-    for (axis, target) in args.as_chunks::<4>().0.iter().zip(&written) {
-        if let Written::Device(name, parameter) = target {
-            let start = number(Some(axis[1]), "sweep start")?;
-            probe = probe.with_instance_override(
-                circuit.instance_override(name, parameter, start, &probe)?,
-            )?;
-        }
-    }
-    let system = circuit.small_signal_system(&probe, &Vector::zeros(circuit.unknown_count()))?;
     let source = |name: &str| {
-        system
-            .sources
-            .iter()
-            .find(|s| s.name.eq_ignore_ascii_case(name))
+        circuit.device(name).and_then(|device| {
+            device
+                .input_source()
+                .map(|source| (device.name(), source.kind))
+        })
     };
     let instance_name = |index: usize| circuit.devices()[index].name().to_owned();
     let parameter = |instance: String, parameter: &str, route| SweepTarget::InstanceParameter {
@@ -389,13 +369,13 @@ pub fn resolve(
         let target = match written {
             Written::Temperature => SweepTarget::Temperature,
             Written::Name(name) => {
-                if let Some(source) = source(name) {
-                    match source.kind {
+                if let Some((name, kind)) = source(name) {
+                    match kind {
                         crate::devices::SourceKind::Voltage => {
-                            SweepTarget::VoltageSource(source.name.clone())
+                            SweepTarget::VoltageSource(name.to_owned())
                         }
                         crate::devices::SourceKind::Current => {
-                            SweepTarget::CurrentSource(source.name.clone())
+                            SweepTarget::CurrentSource(name.to_owned())
                         }
                     }
                 } else if let Some((index, _)) = circuit.resistor(name) {
@@ -422,16 +402,15 @@ pub fn resolve(
                 match source(name) {
                     // vsrc.c/isrc.c: `dc` (isrc alias `c`) is the DC value
                     // that `.dc v1` sweeps.
-                    Some(source)
+                    Some((name, kind))
                         if keyword == "dc"
-                            || (keyword == "c"
-                                && source.kind == crate::devices::SourceKind::Current) =>
+                            || (keyword == "c" && kind == crate::devices::SourceKind::Current) =>
                     {
-                        let route = match source.kind {
+                        let route = match kind {
                             crate::devices::SourceKind::Voltage => ParameterRoute::VoltageSource,
                             crate::devices::SourceKind::Current => ParameterRoute::CurrentSource,
                         };
-                        parameter(source.name.clone(), "dc", route)
+                        parameter(name.to_owned(), "dc", route)
                     }
                     // Explicit NotYetPorted/Unsupported with the C reference.
                     _ => {
@@ -455,7 +434,25 @@ pub fn resolve(
             .ok_or_else(|| unsupported("nested DC sweep point limit exceeded"))?;
         axes.push(spec);
     }
+    // Validate the first point's actual replacements at its temperature.
+    // The run's preflight validates the remaining physical contexts.
+    let start = [axes[0].start, axes.get(1).map_or(0., |axis| axis.start)];
+    point_context(circuit, &axes, start, context.model_context())?;
     Ok(axes)
+}
+
+/// Independent source values fit in C's two-axis sweep layout. No heap
+/// allocation is required per point.
+struct PointContext<'a> {
+    model: ModelContext,
+    sources: [(&'a str, Real); 2],
+    source_count: usize,
+}
+
+impl PointContext<'_> {
+    fn source_values(&self) -> &[(&str, Real)] {
+        &self.sources[..self.source_count]
+    }
 }
 
 /// The per-point model context and source values of one Cartesian point:
@@ -465,12 +462,14 @@ fn point_context<'a>(
     axes: &'a [SweepSpec],
     values: [Real; 2],
     base: ModelContext,
-) -> SpiceResult<(ModelContext, Vec<(&'a str, Real)>)> {
+) -> SpiceResult<PointContext<'a>> {
     let mut model = base;
-    let mut sources = vec![];
+    let mut sources = [("", 0.); 2];
+    let mut source_count = 0;
     for (axis, value) in axes.iter().zip(values) {
         if let Some(name) = axis.target.source() {
-            sources.push((name, value));
+            sources[source_count] = (name, value);
+            source_count += 1;
             continue;
         }
         match &axis.target {
@@ -501,8 +500,52 @@ fn point_context<'a>(
             )?;
         }
     }
-    Ok((model, sources))
+    Ok(PointContext {
+        model,
+        sources,
+        source_count,
+    })
 }
+
+/// The same Cartesian traversal serves validation and execution. Source-only
+/// axes do not affect the small-signal validation matrix: project those axes
+/// onto one representative value during preflight.
+struct GridPair<'a> {
+    inner: &'a [Real],
+    outer: &'a [Real],
+}
+
+impl<'a> GridPair<'a> {
+    fn new(grids: &'a [Vec<Real>]) -> Self {
+        Self {
+            inner: &grids[0],
+            outer: grids.get(1).map_or(&[0.][..], Vec::as_slice),
+        }
+    }
+
+    fn physical_contexts(self, axes: &[SweepSpec]) -> Self {
+        let unique = |grid: &'a [Real], axis: &SweepSpec| {
+            if axis.target.source().is_some() {
+                &grid[..grid.len().min(1)]
+            } else {
+                grid
+            }
+        };
+        Self {
+            inner: unique(self.inner, &axes[0]),
+            outer: axes
+                .get(1)
+                .map_or(self.outer, |axis| unique(self.outer, axis)),
+        }
+    }
+
+    fn points(&self) -> impl Iterator<Item = [Real; 2]> + '_ {
+        self.outer
+            .iter()
+            .flat_map(|&outer| self.inner.iter().map(move |&inner| [inner, outer]))
+    }
+}
+
 /// Reject every point the run would later fail on for *input* reasons: a swept
 /// resistance whose effective value is invalid at some swept temperature, or a
 /// circuit that cannot be assembled at some swept temperature. Convergence
@@ -527,18 +570,10 @@ fn preflight(
                 }
         )
     }) {
-        let single = [0.];
-        let outer = grids.get(1).map_or(&single[..], Vec::as_slice);
-        for outer_value in outer {
-            for inner_value in &grids[0] {
-                let (model, _) = point_context(
-                    circuit,
-                    axes,
-                    [*inner_value, *outer_value],
-                    context.model_context(),
-                )?;
-                circuit.small_signal_system(&model, &zero)?;
-            }
+        let contexts = GridPair::new(grids).physical_contexts(axes);
+        for values in contexts.points() {
+            let point = point_context(circuit, axes, values, context.model_context())?;
+            circuit.small_signal_system(&point.model, &zero)?;
         }
         return Ok(());
     }
@@ -655,9 +690,7 @@ pub(crate) fn run(
         .ok_or_else(|| unsupported("nested DC sweep point limit exceeded"))?;
     preflight(circuit, &axes, &grids, context)?;
     // C order: the first axis is the inner (fast) loop, the second the outer.
-    let inner = &grids[0];
-    let single = [0.];
-    let outer: &[Real] = grids.get(1).map_or(&single[..], Vec::as_slice);
+    let GridPair { inner, outer } = GridPair::new(&grids);
     let mut result = plot(
         circuit,
         "dc1",
@@ -682,12 +715,14 @@ pub(crate) fn run(
         // then becomes the accepted history (C's `firstTime` memcpy).
         let mut first = true;
         for inner_value in inner {
-            let (model, overrides) = point_context(
+            let point_context = point_context(
                 circuit,
                 &axes,
                 [*inner_value, *outer_value],
                 context.model_context(),
             )?;
+            let model = point_context.model;
+            let overrides = point_context.source_values();
             // dctrcurv.c runs NIiter at every point, linear circuits included.
             let solution = {
                 // dctrcurv.c: every point after the first first tries a plain
@@ -700,7 +735,7 @@ pub(crate) fn run(
                             circuit,
                             &model,
                             direct,
-                            &overrides,
+                            overrides,
                             Some(&previous),
                             &history,
                             crate::analysis::newton::PhasePolicy::Predicted,
@@ -727,7 +762,7 @@ pub(crate) fn run(
                             circuit,
                             &model,
                             &settings,
-                            &overrides,
+                            overrides,
                             Some(&previous),
                             &history,
                             // Without a warm-start limit the full solve's
@@ -759,7 +794,7 @@ pub(crate) fn run(
                     history: &history,
                     forcing: None,
                 },
-                &overrides,
+                overrides,
                 None,
                 Some(&trial),
             )?;
@@ -801,6 +836,42 @@ mod grid_tests {
         let expected = ((spec.start + spec.step) + spec.step) + spec.step;
         assert_eq!(accumulated[3].to_bits(), expected.to_bits());
         assert_ne!(accumulated[3].to_bits(), exact[3].to_bits());
+    }
+
+    #[test]
+    fn preflight_projects_only_source_axes_out_of_the_physical_grid() {
+        let make = |target| SweepSpec {
+            target,
+            start: 1.,
+            stop: 3.,
+            step: 1.,
+        };
+        let grids = [vec![1., 2., 3.], vec![10., 20.]];
+        let source = make(SweepTarget::VoltageSource("v1".into()));
+        let temperature = make(SweepTarget::Temperature);
+        let axes = [source.clone(), temperature.clone()];
+        let full = GridPair::new(&grids);
+        assert_eq!(full.points().count(), 6);
+        assert_eq!(
+            full.physical_contexts(&axes).points().collect::<Vec<_>>(),
+            [[1., 10.], [1., 20.]]
+        );
+        let axes = [temperature.clone(), source];
+        assert_eq!(
+            GridPair::new(&grids)
+                .physical_contexts(&axes)
+                .points()
+                .collect::<Vec<_>>(),
+            [[1., 10.], [2., 10.], [3., 10.]]
+        );
+        let axes = [temperature, make(SweepTarget::Resistor("r1".into()))];
+        assert_eq!(
+            GridPair::new(&grids)
+                .physical_contexts(&axes)
+                .points()
+                .count(),
+            6
+        );
     }
 
     #[test]
