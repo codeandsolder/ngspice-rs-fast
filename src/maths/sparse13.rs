@@ -239,24 +239,12 @@ enum Slot {
     After(usize),
 }
 
-/// A SPARSE matrix frame (`struct MatrixFrame`) with 1-based internal and
-/// external indices; external index 0 (ground) is never used here.
+/// Linked topology and maps are immutable between structural edits.
+/// Numeric snapshots and scalar transitions share these allocations;
+/// ordering that changes their structure detaches only the writer.
 #[derive(Debug, Clone)]
-pub(super) struct Sparse<T> {
-    /// Internal order (C `Size`): the rows translated so far. An external
-    /// index never referenced by an element has no internal row; as in
-    /// ngspice, its solution entry is left holding the right-hand side.
-    size: usize,
-    /// External order (C `ExtSize`, here fixed by [`Self::new`]).
-    ext_size: usize,
-    current_size: usize,
-    /// Stable handles index topology and numeric storage independently.
-    /// Reordering changes links, never moves element handles.
+struct Topology {
     elements: Vec<Element>,
-    values: Vec<T>,
-    /// Immutable traversal runs, shared by factor snapshots and scalar
-    /// conversions. Invalidated only when the linked topology changes.
-    plan: Option<std::sync::Arc<FactorPlan>>,
     diag: Vec<usize>,
     first_in_col: Vec<usize>,
     first_in_row: Vec<usize>,
@@ -264,1226 +252,38 @@ pub(super) struct Sparse<T> {
     ext_to_int_col: Vec<usize>,
     int_to_ext_row: Vec<usize>,
     int_to_ext_col: Vec<usize>,
-    markowitz_row: Vec<i64>,
-    markowitz_col: Vec<i64>,
-    markowitz_prod: Vec<i64>,
-    /// Numeric column workspace for repeated `spFactor` calls.
-    factor_workspace: Vec<T>,
-    singletons: i64,
-    rel_threshold: f64,
-    abs_threshold: f64,
-    rows_linked: bool,
-    internal_vectors: bool,
-    needs_ordering: bool,
-    factored: bool,
-    interchanges_odd: bool,
-    status: Status,
-    singular_row: usize,
-    singular_col: usize,
-    /// External row and column of the first pivot `SearchEntireMatrix`
-    /// accepted below the thresholds (`spSMALL_PIVOT`), since the last
-    /// ordering.
-    small_pivot: Option<(usize, usize)>,
 }
 
-impl<T: Scalar> Sparse<T> {
-    /// `spCreate(size)`.
-    pub(crate) fn new(size: usize) -> Self {
-        let mut ext_to_int = vec![NONE; size + 1];
-        ext_to_int[0] = 0;
-        Self {
-            size: 0,
-            ext_size: size,
-            current_size: 0,
-            elements: Vec::new(),
-            values: Vec::new(),
-            plan: None,
-            diag: vec![NONE; size + 1],
-            first_in_col: vec![NONE; size + 1],
-            first_in_row: vec![NONE; size + 1],
-            ext_to_int_row: ext_to_int.clone(),
-            ext_to_int_col: ext_to_int,
-            int_to_ext_row: (0..=size).collect(),
-            int_to_ext_col: (0..=size).collect(),
-            markowitz_row: Vec::new(),
-            markowitz_col: Vec::new(),
-            markowitz_prod: Vec::new(),
-            factor_workspace: Vec::new(),
-            singletons: 0,
-            rel_threshold: DEFAULT_THRESHOLD,
-            abs_threshold: 0.0,
-            rows_linked: false,
-            internal_vectors: false,
-            needs_ordering: true,
-            factored: false,
-            interchanges_odd: false,
-            status: Status::Okay,
-            singular_row: 0,
-            singular_col: 0,
-            small_pivot: None,
-        }
-    }
-
-    /// Whether every external index has been translated (no empty unknown).
-    pub(crate) const fn fully_translated(&self) -> bool {
-        self.current_size == self.ext_size
-    }
-
-    /// External indices (1-based) that no element references, so have no
-    /// internal row (C leaves them out of the matrix; see [`Self::solve_with_workspace`]).
-    pub(crate) fn untranslated(&self) -> impl Iterator<Item = usize> + '_ {
-        (1..=self.ext_size).filter(|&ext| self.ext_to_int_row[ext] == NONE)
-    }
-
-    /// External row and column of the last singular/zero pivot.
-    pub(crate) const fn where_singular(&self) -> (usize, usize) {
-        (self.singular_row, self.singular_col)
-    }
-
-    /// External row and column of the first small pivot of the last
-    /// ordering (status [`Status::SmallPivot`]), if any.
-    pub(crate) const fn small_pivot(&self) -> Option<(usize, usize)> {
-        self.small_pivot
-    }
-
+impl Topology {
     fn col_get(&self, slot: Slot) -> usize {
         match slot {
             Slot::Head(col) => self.first_in_col[col],
             Slot::After(e) => self.elements[e].next_in_col,
         }
     }
+
     fn col_set(&mut self, slot: Slot, value: usize) {
         match slot {
             Slot::Head(col) => self.first_in_col[col] = value,
             Slot::After(e) => self.elements[e].next_in_col = value,
         }
     }
+
     fn row_get(&self, slot: Slot) -> usize {
         match slot {
             Slot::Head(row) => self.first_in_row[row],
             Slot::After(e) => self.elements[e].next_in_row,
         }
     }
+
     fn row_set(&mut self, slot: Slot, value: usize) {
         match slot {
             Slot::Head(row) => self.first_in_row[row] = value,
             Slot::After(e) => self.elements[e].next_in_row = value,
         }
     }
-    fn mag(&self, e: usize) -> f64 {
-        self.values[e].mag()
-    }
 
-    // --- spbuild.c ------------------------------------------------------
-
-    /// `spGetElement(ext_row, ext_col)`: the element handle, created if
-    /// missing. Indices are external and 1-based.
-    pub(crate) fn get_element(&mut self, row: usize, col: usize) -> usize {
-        debug_assert!(row >= 1 && col >= 1 && row <= self.ext_size && col <= self.ext_size);
-        let (row, col) = self.translate(row, col);
-        if row == col && self.diag[row] != NONE {
-            return self.diag[row];
-        }
-        self.find_element_in_col(Slot::Head(col), row, col, true)
-    }
-
-    /// Adds to an element obtained from [`Self::get_element`]
-    /// (`*element += value`).
-    pub(crate) fn add(&mut self, element: usize, value: T)
-    where
-        T: std::ops::Add<Output = T>,
-    {
-        let v = &mut self.values[element];
-        *v = *v + value;
-    }
-
-    /// `Translate`: assigns internal indices in first-reference order.
-    fn translate(&mut self, ext_row: usize, ext_col: usize) -> (usize, usize) {
-        let mut int_row = self.ext_to_int_row[ext_row];
-        if int_row == NONE {
-            self.current_size += 1;
-            self.size = self.current_size;
-            int_row = self.current_size;
-            self.ext_to_int_row[ext_row] = int_row;
-            self.ext_to_int_col[ext_row] = int_row;
-            self.int_to_ext_row[int_row] = ext_row;
-            self.int_to_ext_col[int_row] = ext_row;
-        }
-        let mut int_col = self.ext_to_int_col[ext_col];
-        if int_col == NONE {
-            self.current_size += 1;
-            self.size = self.current_size;
-            int_col = self.current_size;
-            self.ext_to_int_row[ext_col] = int_col;
-            self.ext_to_int_col[ext_col] = int_col;
-            self.int_to_ext_row[int_col] = ext_col;
-            self.int_to_ext_col[int_col] = ext_col;
-        }
-        (int_row, int_col)
-    }
-
-    /// `spcFindElementInCol`.
-    fn find_element_in_col(
-        &mut self,
-        mut last: Slot,
-        row: usize,
-        col: usize,
-        create: bool,
-    ) -> usize {
-        let mut e = self.col_get(last);
-        while e != NONE {
-            let r = self.elements[e].row;
-            if r < row {
-                last = Slot::After(e);
-                e = self.elements[e].next_in_col;
-            } else if r == row {
-                return e;
-            } else {
-                break;
-            }
-        }
-        if create {
-            self.create_element(row, col, last, false)
-        } else {
-            NONE
-        }
-    }
-
-    /// `spcCreateElement`.
-    fn create_element(&mut self, row: usize, col: usize, last: Slot, fillin: bool) -> usize {
-        self.plan = None;
-        let e = self.elements.len();
-        self.elements.push(Element {
-            row,
-            col,
-            next_in_row: NONE,
-            next_in_col: self.col_get(last),
-        });
-        self.values.push(T::ZERO);
-        if row == col {
-            self.diag[row] = e;
-        }
-        self.col_set(last, e);
-        if self.rows_linked {
-            if !fillin {
-                self.needs_ordering = true;
-            }
-            let mut previous = NONE;
-            let mut p = self.first_in_row[row];
-            while p != NONE && self.elements[p].col < col {
-                previous = p;
-                p = self.elements[p].next_in_row;
-            }
-            if previous == NONE {
-                self.elements[e].next_in_row = self.first_in_row[row];
-                self.first_in_row[row] = e;
-            } else {
-                self.elements[e].next_in_row = self.elements[previous].next_in_row;
-                self.elements[previous].next_in_row = e;
-            }
-        }
-        e
-    }
-
-    /// `spcLinkRows`.
-    fn link_rows(&mut self) {
-        for col in (1..=self.size).rev() {
-            let mut e = self.first_in_col[col];
-            while e != NONE {
-                let row = self.elements[e].row;
-                self.elements[e].col = col;
-                self.elements[e].next_in_row = self.first_in_row[row];
-                self.first_in_row[row] = e;
-                e = self.elements[e].next_in_col;
-            }
-        }
-        self.rows_linked = true;
-    }
-
-    /// `spClear`: zero every value, keeping structure and pivot order.
-    pub(crate) fn clear(&mut self) {
-        self.values.fill(T::ZERO);
-        self.reset_numeric_status();
-    }
-
-    fn reset_numeric_status(&mut self) {
-        self.status = Status::Okay;
-        self.factored = false;
-        self.singular_row = 0;
-        self.singular_col = 0;
-        self.small_pivot = None;
-    }
-
-    /// Insert a unique original in assembly creation order, before any
-    /// fill-ins. Its handle is its position in the original coefficient run.
-    pub(super) fn append_original(&mut self, row: usize, col: usize, value: T) {
-        let next = self.values.len();
-        let handle = self.get_element(row, col);
-        assert_eq!(handle, next, "duplicate original sparse element");
-        self.values[handle] = value;
-    }
-
-    /// Reload consecutive originals, clearing only the fill-in suffix.
-    pub(super) fn reload_originals(&mut self, values: &[T]) {
-        let (originals, fillins) = self.values.split_at_mut(values.len());
-        originals.copy_from_slice(values);
-        fillins.fill(T::ZERO);
-        self.reset_numeric_status();
-    }
-
-    /// Reload from a folded stream without a temporary numeric vector.
-    pub(super) fn reload_originals_iter(&mut self, values: impl ExactSizeIterator<Item = T>) {
-        let (originals, fillins) = self.values.split_at_mut(values.len());
-        for (out, value) in originals.iter_mut().zip(values) {
-            *out = value;
-        }
-        fillins.fill(T::ZERO);
-        self.reset_numeric_status();
-    }
-
-    /// The same matrix frame holding another scalar type, every element
-    /// zero: ngspice switches one frame between real and complex
-    /// (`spSetReal`/`spSetComplex`), keeping its internal numbering, row and
-    /// column exchanges, pivot order, fill-ins and flags. Only scalar storage is rebuilt;
-    /// the structural index buffers move unchanged. Loads start with
-    /// `spClear`, so the values carried over do not matter.
-    pub(crate) fn into_retyped<U: Scalar>(self) -> Sparse<U> {
-        Sparse {
-            size: self.size,
-            ext_size: self.ext_size,
-            current_size: self.current_size,
-            values: vec![U::ZERO; self.values.len()],
-            elements: self.elements,
-            plan: self.plan,
-            diag: self.diag,
-            first_in_col: self.first_in_col,
-            first_in_row: self.first_in_row,
-            ext_to_int_row: self.ext_to_int_row,
-            ext_to_int_col: self.ext_to_int_col,
-            int_to_ext_row: self.int_to_ext_row,
-            int_to_ext_col: self.int_to_ext_col,
-            markowitz_row: self.markowitz_row,
-            markowitz_col: self.markowitz_col,
-            markowitz_prod: self.markowitz_prod,
-            factor_workspace: Vec::new(),
-            singletons: self.singletons,
-            rel_threshold: self.rel_threshold,
-            abs_threshold: self.abs_threshold,
-            rows_linked: self.rows_linked,
-            internal_vectors: self.internal_vectors,
-            needs_ordering: self.needs_ordering,
-            // The frame retains the order, not the numeric factors.
-            factored: false,
-            interchanges_odd: self.interchanges_odd,
-            status: self.status,
-            singular_row: self.singular_row,
-            singular_col: self.singular_col,
-            small_pivot: self.small_pivot,
-        }
-    }
-
-    /// `LoadGmin` (`spsmp.c`): adds `gmin` to the real part of every
-    /// internal diagonal element (after the MNA preorder's column swaps, so a
-    /// voltage source's twin can be one), from the last row to the first.
-    pub(crate) fn load_gmin(&mut self, gmin: f64) {
-        if gmin == 0.0 {
-            return;
-        }
-        for i in (1..=self.size).rev() {
-            let diag = self.diag[i];
-            if diag != NONE {
-                self.values[diag] = self.values[diag].add_real(gmin);
-            }
-        }
-    }
-
-    pub(super) fn values_are_finite(&self) -> bool {
-        self.values.iter().all(|value| value.is_finite())
-    }
-
-    /// True only when a direct numerical refactor can use the established
-    /// pivot order, rather than implicitly running the ordering algorithm.
-    pub(super) const fn can_refactor(&self) -> bool {
-        !self.needs_ordering
-    }
-
-    /// Whether the frame holds LU factors (`Matrix->Factored`).
-    pub(crate) const fn is_factored(&self) -> bool {
-        self.factored
-    }
-
-    /// Overwrites one element's value (`*element = value`).
-    pub(crate) fn set(&mut self, element: usize, value: T) {
-        self.values[element] = value;
-    }
-
-    /// One element's value.
-    pub(crate) fn value(&self, element: usize) -> T {
-        self.values[element]
-    }
-
-    /// `SMPcAddCol` (`spsmp.c`): adds every element of external column
-    /// `addend` (fill-ins included) to the same row of column `accum`,
-    /// creating the missing elements there as originals (which, once rows
-    /// are linked, forces the next factorization to reorder). Untranslated
-    /// columns are left alone.
-    pub(crate) fn add_col(&mut self, accum: usize, addend: usize)
-    where
-        T: std::ops::Add<Output = T>,
-    {
-        let (Some(&accum), Some(&addend)) = (
-            self.ext_to_int_col.get(accum),
-            self.ext_to_int_col.get(addend),
-        ) else {
-            return;
-        };
-        if accum == NONE || addend == NONE {
-            return;
-        }
-        let mut next = self.first_in_col[addend];
-        let mut prev = Slot::Head(accum);
-        let mut acc = self.col_get(prev);
-        while next != NONE {
-            let row = self.elements[next].row;
-            while acc != NONE && self.elements[acc].row < row {
-                prev = Slot::After(acc);
-                acc = self.elements[acc].next_in_col;
-            }
-            if acc == NONE || self.elements[acc].row > row {
-                acc = self.create_element(row, accum, prev, false);
-            }
-            let value = self.values[next];
-            self.add(acc, value);
-            next = self.elements[next].next_in_col;
-        }
-    }
-
-    /// `SMPcZeroCol` (`spsmp.c`): zeroes every element of external column
-    /// `col`, keeping them in the structure.
-    pub(crate) fn zero_col(&mut self, col: usize) {
-        let Some(&col) = self.ext_to_int_col.get(col) else {
-            return;
-        };
-        if col == NONE {
-            return;
-        }
-        let mut e = self.first_in_col[col];
-        while e != NONE {
-            self.values[e] = T::ZERO;
-            e = self.elements[e].next_in_col;
-        }
-    }
-
-    // --- sputils.c ------------------------------------------------------
-
-    /// `spMNA_Preorder`: swap columns so structural `±1` twins from voltage
-    /// sources land on the diagonal before ordering.
-    pub(crate) fn mna_preorder(&mut self) {
-        if self.rows_linked {
-            return;
-        }
-        let size = self.size;
-        let mut start_at = 1;
-        loop {
-            let mut another_pass = false;
-            let mut swapped = false;
-            // C's `StartAt` changes only take effect on the next pass.
-            // Snapshot the range bound so changes within the pass cannot
-            // affect its current iteration range.
-            let pass_start = start_at;
-            for j in pass_start..=size {
-                if self.diag[j] == NONE {
-                    let (twins, t1, t2) = self.count_twins(j);
-                    if twins == 1 {
-                        self.swap_cols(t1, t2);
-                        swapped = true;
-                    } else if twins > 1 && !another_pass {
-                        another_pass = true;
-                        start_at = j;
-                    }
-                }
-            }
-            if another_pass {
-                let mut j = start_at;
-                while !swapped && j <= size {
-                    if self.diag[j] == NONE {
-                        let (_, t1, t2) = self.count_twins(j);
-                        self.swap_cols(t1, t2);
-                        swapped = true;
-                    }
-                    j += 1;
-                }
-            }
-            if !another_pass {
-                break;
-            }
-        }
-    }
-
-    /// `CountTwins`: the twin pair found is the last one before a second.
-    fn count_twins(&mut self, col: usize) -> (usize, usize, usize) {
-        let mut twins = 0;
-        let (mut out1, mut out2) = (NONE, NONE);
-        let mut t1 = self.first_in_col[col];
-        while t1 != NONE {
-            if self.values[t1].real().abs() == 1.0 {
-                let row = self.elements[t1].row;
-                let mut t2 = self.first_in_col[row];
-                while t2 != NONE && self.elements[t2].row != col {
-                    t2 = self.elements[t2].next_in_col;
-                }
-                if t2 != NONE && self.values[t2].real().abs() == 1.0 {
-                    twins += 1;
-                    if twins >= 2 {
-                        return (twins, out1, out2);
-                    }
-                    self.elements[t1].col = col;
-                    self.elements[t2].col = row;
-                    out1 = t1;
-                    out2 = t2;
-                }
-            }
-            t1 = self.elements[t1].next_in_col;
-        }
-        (twins, out1, out2)
-    }
-
-    /// `SwapCols`.
-    fn swap_cols(&mut self, t1: usize, t2: usize) {
-        let (c1, c2) = (self.elements[t1].col, self.elements[t2].col);
-        self.first_in_col.swap(c1, c2);
-        self.int_to_ext_col.swap(c1, c2);
-        self.ext_to_int_col[self.int_to_ext_col[c2]] = c2;
-        self.ext_to_int_col[self.int_to_ext_col[c1]] = c1;
-        self.diag[c1] = t2;
-        self.diag[c2] = t1;
-        self.interchanges_odd = !self.interchanges_odd;
-    }
-
-    /// `spDeterminant`: normalized decimal mantissa and exponent, or zero
-    /// after a singular ordering. Preserve C's multiplication/division and
-    /// decimal scaling on every representable intermediate. If an individual
-    /// step would overflow or underflow, normalize its inverse pivot first.
-    pub(super) fn determinant(&self) -> SpiceResult<(T, i32)>
-    where
-        T: DeterminantScale,
-    {
-        use crate::maths::linear::numerical;
-        if matches!(self.status, Status::Singular | Status::ZeroDiag) {
-            return Ok((T::ZERO, 0));
-        }
-        if !self.factored {
-            return Err(numerical("SPARSE determinant", "matrix is not factored"));
-        }
-        let mut exponent = 0_i64;
-        let mut det = T::one();
-        for i in 1..=self.size {
-            let inverse = self.values[self.diag[i]];
-            if !inverse.is_finite() || inverse.is_zero() {
-                return Err(numerical(
-                    "SPARSE determinant",
-                    "non-finite or zero inverse pivot",
-                ));
-            }
-            let mut next = T::det_step(det, inverse);
-            if !next.is_finite() || next.is_zero() || next.norm().is_subnormal() {
-                let mut shift = 0;
-                let normalized = normalize_decimal(inverse, &mut shift, DecimalScale::Coarse);
-                next = T::det_step(det, normalized);
-                exponent -= shift;
-                if !next.is_finite() || next.is_zero() {
-                    return Err(numerical(
-                        "SPARSE determinant",
-                        "unrepresentable determinant step",
-                    ));
-                }
-            }
-            det = normalize_decimal(next, &mut exponent, DecimalScale::Coarse);
-        }
-        det = normalize_decimal(det, &mut exponent, DecimalScale::Final);
-        if self.interchanges_odd {
-            det = det.scale(-1.0);
-        }
-        let exponent = i32::try_from(exponent)
-            .map_err(|_| numerical("SPARSE determinant", "decimal exponent out of range"))?;
-        Ok((det, exponent))
-    }
-
-    // --- spfactor.c -----------------------------------------------------
-
-    /// `spOrderAndFactor(Matrix, NULL, rel, abs, DiagPivoting = YES)`.
-    pub(crate) fn order_and_factor(&mut self, rel_threshold: f64, abs_threshold: f64) -> Status {
-        self.status = Status::Okay;
-        self.small_pivot = None;
-        self.factored = false;
-        if !self.values_are_finite() {
-            return self.nonfinite_factor();
-        }
-        let size = self.size;
-        if rel_threshold > 0.0 && rel_threshold <= 1.0 {
-            self.rel_threshold = rel_threshold;
-        }
-        if abs_threshold >= 0.0 {
-            self.abs_threshold = abs_threshold;
-        }
-        let mut step = 1;
-        let mut reorder = false;
-        if !self.needs_ordering {
-            while step <= size {
-                let pivot = self.diag[step];
-                if pivot == NONE {
-                    reorder = true;
-                    break;
-                }
-                let largest = self.find_largest_in_col(self.elements[pivot].next_in_col);
-                if largest * self.rel_threshold < self.mag(pivot) {
-                    self.row_col_elimination(pivot);
-                    if matches!(self.status, Status::Singular | Status::NonFinite) {
-                        return self.status;
-                    }
-                } else {
-                    reorder = true;
-                    break;
-                }
-                step += 1;
-            }
-            if !reorder {
-                return self.done();
-            }
-        } else {
-            if !self.rows_linked {
-                self.link_rows();
-            }
-            if !self.internal_vectors {
-                self.create_internal_vectors();
-            }
-        }
-        self.count_markowitz(step);
-        self.markowitz_products(step);
-        while step <= size {
-            let Some(pivot) = self.search_for_pivot(step) else {
-                return self.matrix_is_singular(step);
-            };
-            self.exchange_rows_and_cols(pivot, step);
-            self.row_col_elimination(pivot);
-            if matches!(self.status, Status::Singular | Status::NonFinite) {
-                return self.status;
-            }
-            self.update_markowitz_numbers(pivot);
-            step += 1;
-        }
-        self.done()
-    }
-
-    fn done(&mut self) -> Status {
-        if self.plan.is_none() {
-            self.plan = Some(std::sync::Arc::new(self.compile_plan()));
-        }
-        self.needs_ordering = false;
-        self.factored = true;
-        self.status
-    }
-
-    fn compile_plan(&self) -> FactorPlan {
-        let mut columns = Vec::with_capacity(self.size);
-        let mut column_entries = Vec::with_capacity(self.elements.len());
-        let mut upper_row_start = Vec::with_capacity(self.size + 1);
-        let mut upper_row_entries = Vec::new();
-        upper_row_start.push(0);
-        for i in 1..=self.size {
-            let start = column_entries.len();
-            let diagonal = self.diag[i];
-            let mut diagonal_offset = None;
-            let mut e = self.first_in_col[i];
-            while e != NONE {
-                if e == diagonal {
-                    diagonal_offset = Some(column_entries.len());
-                }
-                column_entries.push(RunEntry {
-                    handle: e,
-                    coordinate: self.elements[e].row,
-                });
-                e = self.elements[e].next_in_col;
-            }
-            columns.push(ColumnRun {
-                start,
-                diagonal: diagonal_offset.expect("ordered column contains its diagonal"),
-                end: column_entries.len(),
-            });
-            let mut e = self.elements[diagonal].next_in_row;
-            while e != NONE {
-                upper_row_entries.push(RunEntry {
-                    handle: e,
-                    coordinate: self.elements[e].col,
-                });
-                e = self.elements[e].next_in_row;
-            }
-            upper_row_start.push(upper_row_entries.len());
-        }
-        FactorPlan {
-            columns,
-            column_entries,
-            upper_row_start,
-            upper_row_entries,
-        }
-    }
-
-    /// `spFactor`: refactor with the existing pivot order (no threshold test).
-    pub(crate) fn factor(&mut self) -> Status {
-        if self.needs_ordering {
-            return self.order_and_factor(0.0, 0.0);
-        }
-        self.factored = false;
-        let size = self.size;
-        if size == 0 {
-            self.status = Status::Okay;
-            return self.done();
-        }
-        let first = self.diag[1];
-        if self.values[first].is_zero() {
-            return self.refactor_zero_pivot(1);
-        }
-        let inverse = self.values[first].recip();
-        if !inverse.is_finite() || inverse.is_zero() {
-            return self.nonfinite_factor();
-        }
-        self.values[first] = inverse;
-        self.factor_workspace.resize(size + 1, T::ZERO);
-        self.factor_workspace.fill(T::ZERO);
-        let dest = &mut self.factor_workspace;
-        let plan = self
-            .plan
-            .as_deref()
-            .expect("ordered sparse frame has a traversal plan");
-        for step in 2..=size {
-            for &RunEntry {
-                handle,
-                coordinate: row,
-            } in plan.column(step)
-            {
-                dest[row] = self.values[handle];
-            }
-            for &RunEntry {
-                handle,
-                coordinate: row,
-            } in plan.upper_column(step)
-            {
-                let mult = dest[row].mul(self.values[self.diag[row]]);
-                self.values[handle] = mult;
-                for &RunEntry {
-                    handle,
-                    coordinate: r,
-                } in plan.lower_column(row)
-                {
-                    dest[r] = dest[r].mul_sub(mult, self.values[handle]);
-                }
-            }
-            for &RunEntry {
-                handle,
-                coordinate: row,
-            } in plan.lower_column(step)
-            {
-                self.values[handle] = dest[row];
-            }
-            if dest[step].is_zero() {
-                return self.refactor_zero_pivot(step);
-            }
-            let d = self.diag[step];
-            let inverse = dest[step].recip();
-            if !inverse.is_finite() || inverse.is_zero() {
-                return self.nonfinite_factor();
-            }
-            self.values[d] = inverse;
-        }
-        // Fixed-order factorization does not compare coefficient magnitudes
-        // to select pivots. Validate the stored factors in one contiguous
-        // pass, including the untouched subdiagonal entries of column one.
-        // Every computed entry is stored; a nonfinite pivot is rejected above.
-        if !self.values_are_finite() {
-            return self.nonfinite_factor();
-        }
-        self.factored = true;
-        self.status = Status::Okay;
-        self.status
-    }
-
-    fn refactor_zero_pivot(&mut self, step: usize) -> Status {
-        // Preserve the distinction between singular and nonfinite input
-        // even when an early zero pivot stops the factorization.
-        if !self.values_are_finite() {
-            return self.nonfinite_factor();
-        }
-        self.zero_pivot(step)
-    }
-
-    /// `spcCreateInternalVectors`.
-    fn create_internal_vectors(&mut self) {
-        let size = self.size;
-        self.markowitz_row = vec![0; size + 1];
-        self.markowitz_col = vec![0; size + 1];
-        self.markowitz_prod = vec![0; size + 2];
-        self.internal_vectors = true;
-    }
-
-    /// `CountMarkowitz` (no RHS).
-    fn count_markowitz(&mut self, step: usize) {
-        for i in step..=self.size {
-            let mut count = -1;
-            let mut e = self.first_in_row[i];
-            while e != NONE && self.elements[e].col < step {
-                e = self.elements[e].next_in_row;
-            }
-            while e != NONE {
-                count += 1;
-                e = self.elements[e].next_in_row;
-            }
-            self.markowitz_row[i] = count;
-        }
-        for i in step..=self.size {
-            let mut count = -1;
-            let mut e = self.first_in_col[i];
-            while e != NONE && self.elements[e].row < step {
-                e = self.elements[e].next_in_col;
-            }
-            while e != NONE {
-                count += 1;
-                e = self.elements[e].next_in_col;
-            }
-            self.markowitz_col[i] = count;
-        }
-    }
-
-    /// `MarkowitzProducts`.
-    fn markowitz_products(&mut self, step: usize) {
-        self.singletons = 0;
-        for i in step..=self.size {
-            let product = self.markowitz_row[i].saturating_mul(self.markowitz_col[i]);
-            self.markowitz_prod[i] = product;
-            if product == 0 {
-                self.singletons += 1;
-            }
-        }
-    }
-
-    /// `SearchForPivot` with diagonal pivoting.
-    fn search_for_pivot(&mut self, step: usize) -> Option<usize> {
-        if self.singletons != 0
-            && let Some(pivot) = self.search_for_singleton(step)
-        {
-            return Some(pivot);
-        }
-        if let Some(pivot) = self.quickly_search_diagonal(step) {
-            return Some(pivot);
-        }
-        if let Some(pivot) = self.search_diagonal(step) {
-            return Some(pivot);
-        }
-        self.search_entire_matrix(step)
-    }
-
-    fn acceptable(&self, pivot: usize, step: usize) -> bool {
-        let mag = self.mag(pivot);
-        mag > self.abs_threshold
-            && mag > self.rel_threshold * self.find_biggest_in_col_exclude(pivot, step)
-    }
-
-    /// `SearchForSingleton`.
-    fn search_for_singleton(&mut self, step: usize) -> Option<usize> {
-        let size = self.size;
-        self.markowitz_prod[size + 1] = self.markowitz_prod[step];
-        let mut singletons = self.singletons;
-        self.singletons -= 1;
-        self.markowitz_prod[step - 1] = 0;
-        // C advances a pointer *after* testing each product. Track the
-        // next index plus one instead: the first read is size + 1 and each
-        // subsequent read moves left, preserving C's sentinel and pivot
-        // priority without an isize that can become -1 at step == 1.
-        let mut cursor = size + 2;
-        while singletons > 0 {
-            singletons -= 1;
-            loop {
-                cursor -= 1;
-                if self.markowitz_prod[cursor] == 0 {
-                    break;
-                }
-            }
-            let mut i = cursor;
-            if i < step {
-                break;
-            }
-            if i > size {
-                i = step;
-            }
-            let diag = self.diag[i];
-            if diag == NONE {
-                // ngspice's off-diagonal singleton branches `break` (or would
-                // dereference NULL) when no diagonal exists.
-                break;
-            }
-            if self.acceptable(diag, step) {
-                return Some(diag);
-            }
-        }
-        self.singletons += 1;
-        None
-    }
-
-    /// `QuicklySearchDiagonal` (without `MODIFIED_MARKOWITZ`).
-    fn quickly_search_diagonal(&mut self, step: usize) -> Option<usize> {
-        let size = self.size;
-        let mut chosen = NONE;
-        let mut min = i64::MAX;
-        self.markowitz_prod[size + 1] = self.markowitz_prod[step];
-        self.markowitz_prod[step - 1] = -1;
-        let mut p = size + 2;
-        loop {
-            loop {
-                p -= 1;
-                if self.markowitz_prod[p] < min {
-                    break;
-                }
-            }
-            let mut i = p;
-            if i < step {
-                break;
-            }
-            if i > size {
-                i = step;
-            }
-            let diag = self.diag[i];
-            if diag == NONE {
-                continue;
-            }
-            let magnitude = self.mag(diag);
-            if magnitude <= self.abs_threshold {
-                continue;
-            }
-            if self.markowitz_prod[p] == 1 {
-                let mut other_row = self.elements[diag].next_in_row;
-                let mut other_col = self.elements[diag].next_in_col;
-                if other_row == NONE && other_col == NONE {
-                    other_row = self.first_in_row[i];
-                    while other_row != NONE {
-                        let c = self.elements[other_row].col;
-                        if c >= step && c != i {
-                            break;
-                        }
-                        other_row = self.elements[other_row].next_in_row;
-                    }
-                    other_col = self.first_in_col[i];
-                    while other_col != NONE {
-                        let r = self.elements[other_col].row;
-                        if r >= step && r != i {
-                            break;
-                        }
-                        other_col = self.elements[other_col].next_in_col;
-                    }
-                }
-                if other_row != NONE
-                    && other_col != NONE
-                    && self.elements[other_row].col == self.elements[other_col].row
-                {
-                    let largest_off = self.mag(other_row).max(self.mag(other_col));
-                    if magnitude >= largest_off {
-                        return Some(diag);
-                    }
-                }
-            }
-            min = self.markowitz_prod[p];
-            chosen = diag;
-        }
-        if chosen != NONE {
-            let largest = self.find_biggest_in_col_exclude(chosen, step);
-            if self.mag(chosen) <= self.rel_threshold * largest {
-                return None;
-            }
-            return Some(chosen);
-        }
-        None
-    }
-
-    /// `SearchDiagonal`.
-    fn search_diagonal(&mut self, step: usize) -> Option<usize> {
-        let size = self.size;
-        let mut chosen = NONE;
-        let mut min = i64::MAX;
-        let mut ties = 0;
-        let mut accepted_ratio = 0.0;
-        self.markowitz_prod[size + 1] = self.markowitz_prod[step];
-        for j in (step + 1..=size + 1).rev() {
-            let product = self.markowitz_prod[j];
-            if product > min {
-                continue;
-            }
-            let i = if j > size { step } else { j };
-            let diag = self.diag[i];
-            if diag == NONE {
-                continue;
-            }
-            let magnitude = self.mag(diag);
-            if magnitude <= self.abs_threshold {
-                continue;
-            }
-            let largest = self.find_biggest_in_col_exclude(diag, step);
-            if magnitude <= self.rel_threshold * largest {
-                continue;
-            }
-            if product < min {
-                chosen = diag;
-                min = product;
-                accepted_ratio = largest / magnitude;
-                ties = 0;
-            } else {
-                ties += 1;
-                let ratio = largest / magnitude;
-                if ratio < accepted_ratio {
-                    chosen = diag;
-                    accepted_ratio = ratio;
-                }
-                if ties >= min.saturating_mul(TIES_MULTIPLIER) {
-                    return Some(chosen);
-                }
-            }
-        }
-        (chosen != NONE).then_some(chosen)
-    }
-
-    /// `SearchEntireMatrix`. Sets `SmallPivot`/`Singular` like C.
-    fn search_entire_matrix(&mut self, step: usize) -> Option<usize> {
-        let mut chosen = NONE;
-        let mut largest_element = NONE;
-        let mut largest_mag = 0.0;
-        let mut min = i64::MAX;
-        let mut ties = 0;
-        let mut accepted_ratio = 0.0;
-        for i in step..=self.size {
-            let mut e = self.first_in_col[i];
-            while e != NONE && self.elements[e].row < step {
-                e = self.elements[e].next_in_col;
-            }
-            let largest_in_col = self.find_largest_in_col(e);
-            if largest_in_col == 0.0 {
-                continue;
-            }
-            while e != NONE {
-                let magnitude = self.mag(e);
-                if magnitude > largest_mag {
-                    largest_mag = magnitude;
-                    largest_element = e;
-                }
-                let element = &self.elements[e];
-                let product =
-                    self.markowitz_row[element.row].saturating_mul(self.markowitz_col[element.col]);
-                if product <= min
-                    && magnitude > self.rel_threshold * largest_in_col
-                    && magnitude > self.abs_threshold
-                {
-                    if product < min {
-                        chosen = e;
-                        min = product;
-                        accepted_ratio = largest_in_col / magnitude;
-                        ties = 0;
-                    } else {
-                        ties += 1;
-                        let ratio = largest_in_col / magnitude;
-                        if ratio < accepted_ratio {
-                            chosen = e;
-                            accepted_ratio = ratio;
-                        }
-                        if ties >= min.saturating_mul(TIES_MULTIPLIER) {
-                            return Some(chosen);
-                        }
-                    }
-                }
-                e = self.elements[e].next_in_col;
-            }
-        }
-        if chosen != NONE {
-            return Some(chosen);
-        }
-        if largest_mag == 0.0 {
-            self.status = Status::Singular;
-            return None;
-        }
-        self.status = Status::SmallPivot;
-        if self.small_pivot.is_none() {
-            let element = &self.elements[largest_element];
-            self.small_pivot = Some((
-                self.int_to_ext_row[element.row],
-                self.int_to_ext_col[element.col],
-            ));
-        }
-        Some(largest_element)
-    }
-
-    /// `FindLargestInCol` from `e` downwards.
-    fn find_largest_in_col(&self, mut e: usize) -> f64 {
-        let mut largest = 0.0;
-        while e != NONE {
-            let magnitude = self.mag(e);
-            if magnitude > largest {
-                largest = magnitude;
-            }
-            e = self.elements[e].next_in_col;
-        }
-        largest
-    }
-
-    /// `FindBiggestInColExclude`.
-    fn find_biggest_in_col_exclude(&self, pivot: usize, step: usize) -> f64 {
-        let row = self.elements[pivot].row;
-        let col = self.elements[pivot].col;
-        let mut e = self.first_in_col[col];
-        while e != NONE && self.elements[e].row < step {
-            e = self.elements[e].next_in_col;
-        }
-        let mut largest = if self.elements[e].row != row {
-            self.mag(e)
-        } else {
-            0.0
-        };
-        e = self.elements[e].next_in_col;
-        while e != NONE {
-            let magnitude = self.mag(e);
-            if magnitude > largest && self.elements[e].row != row {
-                largest = magnitude;
-            }
-            e = self.elements[e].next_in_col;
-        }
-        largest
-    }
-
-    fn product_of(&self, i: usize) -> i64 {
-        self.markowitz_row[i].saturating_mul(self.markowitz_col[i])
-    }
-
-    const fn track_singleton(&mut self, new: i64, old: i64) {
-        if (new == 0) != (old == 0) {
-            if old == 0 {
-                self.singletons -= 1;
-            } else {
-                self.singletons += 1;
-            }
-        }
-    }
-
-    /// `ExchangeRowsAndCols`.
-    fn exchange_rows_and_cols(&mut self, pivot: usize, step: usize) {
-        let row = self.elements[pivot].row;
-        let col = self.elements[pivot].col;
-        if row == step && col == step {
-            return;
-        }
-        self.plan = None;
-        if row == col {
-            self.row_exchange(step, row);
-            self.col_exchange(step, col);
-            self.markowitz_prod.swap(step, row);
-            self.diag.swap(row, step);
-        } else {
-            let old_step = self.markowitz_prod[step];
-            let old_row = self.markowitz_prod[row];
-            let old_col = self.markowitz_prod[col];
-            if row != step {
-                self.row_exchange(step, row);
-                self.interchanges_odd = !self.interchanges_odd;
-                self.markowitz_prod[row] = self.product_of(row);
-                self.track_singleton(self.markowitz_prod[row], old_row);
-            }
-            if col != step {
-                self.col_exchange(step, col);
-                self.interchanges_odd = !self.interchanges_odd;
-                self.markowitz_prod[col] = self.product_of(col);
-                self.track_singleton(self.markowitz_prod[col], old_col);
-                self.diag[col] = self.find_element_in_col(Slot::Head(col), col, col, false);
-            }
-            if row != step {
-                self.diag[row] = self.find_element_in_col(Slot::Head(row), row, row, false);
-            }
-            self.diag[step] = self.find_element_in_col(Slot::Head(step), step, step, false);
-            self.markowitz_prod[step] = self.product_of(step);
-            self.track_singleton(self.markowitz_prod[step], old_step);
-        }
-    }
-
-    /// `spcRowExchange`.
-    fn row_exchange(&mut self, mut row1: usize, mut row2: usize) {
-        if row1 > row2 {
-            std::mem::swap(&mut row1, &mut row2);
-        }
-        let mut p1 = self.first_in_row[row1];
-        let mut p2 = self.first_in_row[row2];
-        while p1 != NONE || p2 != NONE {
-            let (column, e1, e2);
-            if p1 == NONE {
-                column = self.elements[p2].col;
-                (e1, e2) = (NONE, p2);
-                p2 = self.elements[p2].next_in_row;
-            } else if p2 == NONE || self.elements[p1].col < self.elements[p2].col {
-                column = self.elements[p1].col;
-                (e1, e2) = (p1, NONE);
-                p1 = self.elements[p1].next_in_row;
-            } else if self.elements[p1].col > self.elements[p2].col {
-                column = self.elements[p2].col;
-                (e1, e2) = (NONE, p2);
-                p2 = self.elements[p2].next_in_row;
-            } else {
-                column = self.elements[p1].col;
-                (e1, e2) = (p1, p2);
-                p1 = self.elements[p1].next_in_row;
-                p2 = self.elements[p2].next_in_row;
-            }
-            self.exchange_col_elements(row1, e1, row2, e2, column);
-        }
-        if self.internal_vectors {
-            self.markowitz_row.swap(row1, row2);
-        }
-        self.first_in_row.swap(row1, row2);
-        self.int_to_ext_row.swap(row1, row2);
-        self.ext_to_int_row[self.int_to_ext_row[row1]] = row1;
-        self.ext_to_int_row[self.int_to_ext_row[row2]] = row2;
-    }
-
-    /// `spcColExchange`.
-    fn col_exchange(&mut self, mut col1: usize, mut col2: usize) {
-        if col1 > col2 {
-            std::mem::swap(&mut col1, &mut col2);
-        }
-        let mut p1 = self.first_in_col[col1];
-        let mut p2 = self.first_in_col[col2];
-        while p1 != NONE || p2 != NONE {
-            let (row, e1, e2);
-            if p1 == NONE {
-                row = self.elements[p2].row;
-                (e1, e2) = (NONE, p2);
-                p2 = self.elements[p2].next_in_col;
-            } else if p2 == NONE || self.elements[p1].row < self.elements[p2].row {
-                row = self.elements[p1].row;
-                (e1, e2) = (p1, NONE);
-                p1 = self.elements[p1].next_in_col;
-            } else if self.elements[p1].row > self.elements[p2].row {
-                row = self.elements[p2].row;
-                (e1, e2) = (NONE, p2);
-                p2 = self.elements[p2].next_in_col;
-            } else {
-                row = self.elements[p1].row;
-                (e1, e2) = (p1, p2);
-                p1 = self.elements[p1].next_in_col;
-                p2 = self.elements[p2].next_in_col;
-            }
-            self.exchange_row_elements(col1, e1, col2, e2, row);
-        }
-        if self.internal_vectors {
-            self.markowitz_col.swap(col1, col2);
-        }
-        self.first_in_col.swap(col1, col2);
-        self.int_to_ext_col.swap(col1, col2);
-        self.ext_to_int_col[self.int_to_ext_col[col1]] = col1;
-        self.ext_to_int_col[self.int_to_ext_col[col2]] = col2;
-    }
-
-    /// `ExchangeColElements`: move `e1`/`e2` between rows `row1 < row2` of
-    /// one column's list.
+    /// Exchange elements in one column, preserving its row order.
     fn exchange_col_elements(
         &mut self,
         row1: usize,
@@ -1561,7 +361,7 @@ impl<T: Scalar> Sparse<T> {
         }
     }
 
-    /// `ExchangeRowElements`: the row-list mirror of the above.
+    /// Row-list counterpart of the column exchange.
     fn exchange_row_elements(
         &mut self,
         col1: usize,
@@ -1639,10 +439,1239 @@ impl<T: Scalar> Sparse<T> {
         }
     }
 
+    /// `spcRowExchange` (topology only).
+    fn row_exchange(&mut self, mut row1: usize, mut row2: usize) {
+        if row1 > row2 {
+            std::mem::swap(&mut row1, &mut row2);
+        }
+        let mut p1 = self.first_in_row[row1];
+        let mut p2 = self.first_in_row[row2];
+        while p1 != NONE || p2 != NONE {
+            let (column, e1, e2);
+            if p1 == NONE {
+                column = self.elements[p2].col;
+                (e1, e2) = (NONE, p2);
+                p2 = self.elements[p2].next_in_row;
+            } else if p2 == NONE || self.elements[p1].col < self.elements[p2].col {
+                column = self.elements[p1].col;
+                (e1, e2) = (p1, NONE);
+                p1 = self.elements[p1].next_in_row;
+            } else if self.elements[p1].col > self.elements[p2].col {
+                column = self.elements[p2].col;
+                (e1, e2) = (NONE, p2);
+                p2 = self.elements[p2].next_in_row;
+            } else {
+                column = self.elements[p1].col;
+                (e1, e2) = (p1, p2);
+                p1 = self.elements[p1].next_in_row;
+                p2 = self.elements[p2].next_in_row;
+            }
+            self.exchange_col_elements(row1, e1, row2, e2, column);
+        }
+        self.first_in_row.swap(row1, row2);
+        self.int_to_ext_row.swap(row1, row2);
+        self.ext_to_int_row[self.int_to_ext_row[row1]] = row1;
+        self.ext_to_int_row[self.int_to_ext_row[row2]] = row2;
+    }
+
+    /// `spcColExchange` (topology only).
+    fn col_exchange(&mut self, mut col1: usize, mut col2: usize) {
+        if col1 > col2 {
+            std::mem::swap(&mut col1, &mut col2);
+        }
+        let mut p1 = self.first_in_col[col1];
+        let mut p2 = self.first_in_col[col2];
+        while p1 != NONE || p2 != NONE {
+            let (row, e1, e2);
+            if p1 == NONE {
+                row = self.elements[p2].row;
+                (e1, e2) = (NONE, p2);
+                p2 = self.elements[p2].next_in_col;
+            } else if p2 == NONE || self.elements[p1].row < self.elements[p2].row {
+                row = self.elements[p1].row;
+                (e1, e2) = (p1, NONE);
+                p1 = self.elements[p1].next_in_col;
+            } else if self.elements[p1].row > self.elements[p2].row {
+                row = self.elements[p2].row;
+                (e1, e2) = (NONE, p2);
+                p2 = self.elements[p2].next_in_col;
+            } else {
+                row = self.elements[p1].row;
+                (e1, e2) = (p1, p2);
+                p1 = self.elements[p1].next_in_col;
+                p2 = self.elements[p2].next_in_col;
+            }
+            self.exchange_row_elements(col1, e1, col2, e2, row);
+        }
+        self.first_in_col.swap(col1, col2);
+        self.int_to_ext_col.swap(col1, col2);
+        self.ext_to_int_col[self.int_to_ext_col[col1]] = col1;
+        self.ext_to_int_col[self.int_to_ext_col[col2]] = col2;
+    }
+}
+
+/// A SPARSE matrix frame (`struct MatrixFrame`) with 1-based internal and
+/// external indices; external index 0 (ground) is never used here.
+#[derive(Debug, Clone)]
+pub(super) struct Sparse<T> {
+    /// Internal order (C `Size`): the rows translated so far. An external
+    /// index never referenced by an element has no internal row; as in
+    /// ngspice, its solution entry is left holding the right-hand side.
+    size: usize,
+    /// External order (C `ExtSize`, here fixed by [`Self::new`]).
+    ext_size: usize,
+    current_size: usize,
+    /// Stable handles index topology and numeric storage independently.
+    /// Reordering changes links, never moves element handles.
+    topology: std::sync::Arc<Topology>,
+    values: Vec<T>,
+    /// Immutable traversal runs, shared by factor snapshots and scalar
+    /// conversions. Invalidated only when the linked topology changes.
+    plan: Option<std::sync::Arc<FactorPlan>>,
+    markowitz_row: Vec<i64>,
+    markowitz_col: Vec<i64>,
+    markowitz_prod: Vec<i64>,
+    /// Numeric column workspace for repeated `spFactor` calls.
+    factor_workspace: Vec<T>,
+    singletons: i64,
+    rel_threshold: f64,
+    abs_threshold: f64,
+    rows_linked: bool,
+    internal_vectors: bool,
+    needs_ordering: bool,
+    factored: bool,
+    interchanges_odd: bool,
+    status: Status,
+    singular_row: usize,
+    singular_col: usize,
+    /// External row and column of the first pivot `SearchEntireMatrix`
+    /// accepted below the thresholds (`spSMALL_PIVOT`), since the last
+    /// ordering.
+    small_pivot: Option<(usize, usize)>,
+}
+
+impl<T: Scalar> Sparse<T> {
+    /// `spCreate(size)`.
+    pub(crate) fn new(size: usize) -> Self {
+        let mut ext_to_int = vec![NONE; size + 1];
+        ext_to_int[0] = 0;
+        Self {
+            size: 0,
+            ext_size: size,
+            current_size: 0,
+            topology: std::sync::Arc::new(Topology {
+                elements: Vec::new(),
+                diag: vec![NONE; size + 1],
+                first_in_col: vec![NONE; size + 1],
+                first_in_row: vec![NONE; size + 1],
+                ext_to_int_row: ext_to_int.clone(),
+                ext_to_int_col: ext_to_int,
+                int_to_ext_row: (0..=size).collect(),
+                int_to_ext_col: (0..=size).collect(),
+            }),
+            values: Vec::new(),
+            plan: None,
+            markowitz_row: Vec::new(),
+            markowitz_col: Vec::new(),
+            markowitz_prod: Vec::new(),
+            factor_workspace: Vec::new(),
+            singletons: 0,
+            rel_threshold: DEFAULT_THRESHOLD,
+            abs_threshold: 0.0,
+            rows_linked: false,
+            internal_vectors: false,
+            needs_ordering: true,
+            factored: false,
+            interchanges_odd: false,
+            status: Status::Okay,
+            singular_row: 0,
+            singular_col: 0,
+            small_pivot: None,
+        }
+    }
+
+    /// Whether every external index has been translated (no empty unknown).
+    pub(crate) const fn fully_translated(&self) -> bool {
+        self.current_size == self.ext_size
+    }
+
+    /// External indices (1-based) that no element references, so have no
+    /// internal row (C leaves them out of the matrix; see [`Self::solve_with_workspace`]).
+    pub(crate) fn untranslated(&self) -> impl Iterator<Item = usize> + '_ {
+        (1..=self.ext_size).filter(|&ext| self.topology.ext_to_int_row[ext] == NONE)
+    }
+
+    /// External row and column of the last singular/zero pivot.
+    pub(crate) const fn where_singular(&self) -> (usize, usize) {
+        (self.singular_row, self.singular_col)
+    }
+
+    /// External row and column of the first small pivot of the last
+    /// ordering (status [`Status::SmallPivot`]), if any.
+    pub(crate) const fn small_pivot(&self) -> Option<(usize, usize)> {
+        self.small_pivot
+    }
+
+    fn mag(&self, e: usize) -> f64 {
+        self.values[e].mag()
+    }
+
+    // --- spbuild.c ------------------------------------------------------
+
+    /// `spGetElement(ext_row, ext_col)`: the element handle, created if
+    /// missing. Indices are external and 1-based.
+    pub(crate) fn get_element(&mut self, row: usize, col: usize) -> usize {
+        debug_assert!(row >= 1 && col >= 1 && row <= self.ext_size && col <= self.ext_size);
+        let (row, col) = self.translate(row, col);
+        if row == col && self.topology.diag[row] != NONE {
+            return self.topology.diag[row];
+        }
+        self.find_element_in_col(Slot::Head(col), row, col, true)
+    }
+
+    /// Adds to an element obtained from [`Self::get_element`]
+    /// (`*element += value`).
+    pub(crate) fn add(&mut self, element: usize, value: T)
+    where
+        T: std::ops::Add<Output = T>,
+    {
+        let v = &mut self.values[element];
+        *v = *v + value;
+    }
+
+    /// `Translate`: assigns internal indices in first-reference order.
+    fn translate(&mut self, ext_row: usize, ext_col: usize) -> (usize, usize) {
+        let mut int_row = self.topology.ext_to_int_row[ext_row];
+        if int_row == NONE {
+            let topology = std::sync::Arc::make_mut(&mut self.topology);
+            self.current_size += 1;
+            self.size = self.current_size;
+            int_row = self.current_size;
+            topology.ext_to_int_row[ext_row] = int_row;
+            topology.ext_to_int_col[ext_row] = int_row;
+            topology.int_to_ext_row[int_row] = ext_row;
+            topology.int_to_ext_col[int_row] = ext_row;
+        }
+        let mut int_col = self.topology.ext_to_int_col[ext_col];
+        if int_col == NONE {
+            let topology = std::sync::Arc::make_mut(&mut self.topology);
+            self.current_size += 1;
+            self.size = self.current_size;
+            int_col = self.current_size;
+            topology.ext_to_int_row[ext_col] = int_col;
+            topology.ext_to_int_col[ext_col] = int_col;
+            topology.int_to_ext_row[int_col] = ext_col;
+            topology.int_to_ext_col[int_col] = ext_col;
+        }
+        (int_row, int_col)
+    }
+
+    /// `spcFindElementInCol`.
+    fn find_element_in_col(
+        &mut self,
+        mut last: Slot,
+        row: usize,
+        col: usize,
+        create: bool,
+    ) -> usize {
+        let mut e = self.topology.col_get(last);
+        while e != NONE {
+            let r = self.topology.elements[e].row;
+            if r < row {
+                last = Slot::After(e);
+                e = self.topology.elements[e].next_in_col;
+            } else if r == row {
+                return e;
+            } else {
+                break;
+            }
+        }
+        if create {
+            self.create_element(row, col, last, false)
+        } else {
+            NONE
+        }
+    }
+
+    /// `spcCreateElement`.
+    fn create_element(&mut self, row: usize, col: usize, last: Slot, fillin: bool) -> usize {
+        let topology = std::sync::Arc::make_mut(&mut self.topology);
+        self.plan = None;
+        let e = topology.elements.len();
+        topology.elements.push(Element {
+            row,
+            col,
+            next_in_row: NONE,
+            next_in_col: topology.col_get(last),
+        });
+        self.values.push(T::ZERO);
+        if row == col {
+            topology.diag[row] = e;
+        }
+        topology.col_set(last, e);
+        if self.rows_linked {
+            if !fillin {
+                self.needs_ordering = true;
+            }
+            let mut previous = NONE;
+            let mut p = topology.first_in_row[row];
+            while p != NONE && topology.elements[p].col < col {
+                previous = p;
+                p = topology.elements[p].next_in_row;
+            }
+            if previous == NONE {
+                topology.elements[e].next_in_row = topology.first_in_row[row];
+                topology.first_in_row[row] = e;
+            } else {
+                topology.elements[e].next_in_row = topology.elements[previous].next_in_row;
+                topology.elements[previous].next_in_row = e;
+            }
+        }
+        e
+    }
+
+    /// `spcLinkRows`.
+    fn link_rows(&mut self) {
+        let topology = std::sync::Arc::make_mut(&mut self.topology);
+        for col in (1..=self.size).rev() {
+            let mut e = topology.first_in_col[col];
+            while e != NONE {
+                let row = topology.elements[e].row;
+                topology.elements[e].col = col;
+                topology.elements[e].next_in_row = topology.first_in_row[row];
+                topology.first_in_row[row] = e;
+                e = topology.elements[e].next_in_col;
+            }
+        }
+        self.rows_linked = true;
+    }
+
+    /// `spClear`: zero every value, keeping structure and pivot order.
+    pub(crate) fn clear(&mut self) {
+        self.values.fill(T::ZERO);
+        self.reset_numeric_status();
+    }
+
+    fn reset_numeric_status(&mut self) {
+        self.status = Status::Okay;
+        self.factored = false;
+        self.singular_row = 0;
+        self.singular_col = 0;
+        self.small_pivot = None;
+    }
+
+    /// Insert a unique original in assembly creation order, before any
+    /// fill-ins. Its handle is its position in the original coefficient run.
+    pub(super) fn append_original(&mut self, row: usize, col: usize, value: T) {
+        let next = self.values.len();
+        let handle = self.get_element(row, col);
+        assert_eq!(handle, next, "duplicate original sparse element");
+        self.values[handle] = value;
+    }
+
+    /// Reload consecutive originals, clearing only the fill-in suffix.
+    pub(super) fn reload_originals(&mut self, values: &[T]) {
+        let (originals, fillins) = self.values.split_at_mut(values.len());
+        originals.copy_from_slice(values);
+        fillins.fill(T::ZERO);
+        self.reset_numeric_status();
+    }
+
+    /// Reload from a folded stream without a temporary numeric vector.
+    pub(super) fn reload_originals_iter(&mut self, values: impl ExactSizeIterator<Item = T>) {
+        let (originals, fillins) = self.values.split_at_mut(values.len());
+        for (out, value) in originals.iter_mut().zip(values) {
+            *out = value;
+        }
+        fillins.fill(T::ZERO);
+        self.reset_numeric_status();
+    }
+
+    /// The same matrix frame holding another scalar type, every element
+    /// zero: ngspice switches one frame between real and complex
+    /// (`spSetReal`/`spSetComplex`), keeping its internal numbering, row and
+    /// column exchanges, pivot order, fill-ins and flags. Only scalar storage is rebuilt;
+    /// the structural index buffers move unchanged. Loads start with
+    /// `spClear`, so the values carried over do not matter.
+    pub(crate) fn into_retyped<U: Scalar>(self) -> Sparse<U> {
+        Sparse {
+            size: self.size,
+            ext_size: self.ext_size,
+            current_size: self.current_size,
+            values: vec![U::ZERO; self.values.len()],
+            topology: self.topology,
+            plan: self.plan,
+            markowitz_row: self.markowitz_row,
+            markowitz_col: self.markowitz_col,
+            markowitz_prod: self.markowitz_prod,
+            factor_workspace: Vec::new(),
+            singletons: self.singletons,
+            rel_threshold: self.rel_threshold,
+            abs_threshold: self.abs_threshold,
+            rows_linked: self.rows_linked,
+            internal_vectors: self.internal_vectors,
+            needs_ordering: self.needs_ordering,
+            // The frame retains the order, not the numeric factors.
+            factored: false,
+            interchanges_odd: self.interchanges_odd,
+            status: self.status,
+            singular_row: self.singular_row,
+            singular_col: self.singular_col,
+            small_pivot: self.small_pivot,
+        }
+    }
+
+    /// `LoadGmin` (`spsmp.c`): adds `gmin` to the real part of every
+    /// internal diagonal element (after the MNA preorder's column swaps, so a
+    /// voltage source's twin can be one), from the last row to the first.
+    pub(crate) fn load_gmin(&mut self, gmin: f64) {
+        if gmin == 0.0 {
+            return;
+        }
+        for i in (1..=self.size).rev() {
+            let diag = self.topology.diag[i];
+            if diag != NONE {
+                self.values[diag] = self.values[diag].add_real(gmin);
+            }
+        }
+    }
+
+    pub(super) fn values_are_finite(&self) -> bool {
+        self.values.iter().all(|value| value.is_finite())
+    }
+
+    /// True only when a direct numerical refactor can use the established
+    /// pivot order, rather than implicitly running the ordering algorithm.
+    pub(super) const fn can_refactor(&self) -> bool {
+        !self.needs_ordering
+    }
+
+    /// Whether the frame holds LU factors (`Matrix->Factored`).
+    pub(crate) const fn is_factored(&self) -> bool {
+        self.factored
+    }
+
+    /// Overwrites one element's value (`*element = value`).
+    pub(crate) fn set(&mut self, element: usize, value: T) {
+        self.values[element] = value;
+    }
+
+    /// One element's value.
+    pub(crate) fn value(&self, element: usize) -> T {
+        self.values[element]
+    }
+
+    /// `SMPcAddCol` (`spsmp.c`): adds every element of external column
+    /// `addend` (fill-ins included) to the same row of column `accum`,
+    /// creating the missing elements there as originals (which, once rows
+    /// are linked, forces the next factorization to reorder). Untranslated
+    /// columns are left alone.
+    pub(crate) fn add_col(&mut self, accum: usize, addend: usize)
+    where
+        T: std::ops::Add<Output = T>,
+    {
+        let (Some(&accum), Some(&addend)) = (
+            self.topology.ext_to_int_col.get(accum),
+            self.topology.ext_to_int_col.get(addend),
+        ) else {
+            return;
+        };
+        if accum == NONE || addend == NONE {
+            return;
+        }
+        let mut next = self.topology.first_in_col[addend];
+        let mut prev = Slot::Head(accum);
+        let mut acc = self.topology.col_get(prev);
+        while next != NONE {
+            let row = self.topology.elements[next].row;
+            while acc != NONE && self.topology.elements[acc].row < row {
+                prev = Slot::After(acc);
+                acc = self.topology.elements[acc].next_in_col;
+            }
+            if acc == NONE || self.topology.elements[acc].row > row {
+                acc = self.create_element(row, accum, prev, false);
+            }
+            let value = self.values[next];
+            self.add(acc, value);
+            next = self.topology.elements[next].next_in_col;
+        }
+    }
+
+    /// `SMPcZeroCol` (`spsmp.c`): zeroes every element of external column
+    /// `col`, keeping them in the structure.
+    pub(crate) fn zero_col(&mut self, col: usize) {
+        let Some(&col) = self.topology.ext_to_int_col.get(col) else {
+            return;
+        };
+        if col == NONE {
+            return;
+        }
+        let mut e = self.topology.first_in_col[col];
+        while e != NONE {
+            self.values[e] = T::ZERO;
+            e = self.topology.elements[e].next_in_col;
+        }
+    }
+
+    // --- sputils.c ------------------------------------------------------
+
+    /// `spMNA_Preorder`: swap columns so structural `±1` twins from voltage
+    /// sources land on the diagonal before ordering.
+    pub(crate) fn mna_preorder(&mut self) {
+        if self.rows_linked {
+            return;
+        }
+        let size = self.size;
+        let mut start_at = 1;
+        loop {
+            let mut another_pass = false;
+            let mut swapped = false;
+            // C's `StartAt` changes only take effect on the next pass.
+            // Snapshot the range bound so changes within the pass cannot
+            // affect its current iteration range.
+            let pass_start = start_at;
+            for j in pass_start..=size {
+                if self.topology.diag[j] == NONE {
+                    let (twins, t1, t2) = self.count_twins(j);
+                    if twins == 1 {
+                        self.swap_cols(t1, t2);
+                        swapped = true;
+                    } else if twins > 1 && !another_pass {
+                        another_pass = true;
+                        start_at = j;
+                    }
+                }
+            }
+            if another_pass {
+                let mut j = start_at;
+                while !swapped && j <= size {
+                    if self.topology.diag[j] == NONE {
+                        let (_, t1, t2) = self.count_twins(j);
+                        self.swap_cols(t1, t2);
+                        swapped = true;
+                    }
+                    j += 1;
+                }
+            }
+            if !another_pass {
+                break;
+            }
+        }
+    }
+
+    /// `CountTwins`: the twin pair found is the last one before a second.
+    fn count_twins(&mut self, col: usize) -> (usize, usize, usize) {
+        let topology = std::sync::Arc::make_mut(&mut self.topology);
+        let mut twins = 0;
+        let (mut out1, mut out2) = (NONE, NONE);
+        let mut t1 = topology.first_in_col[col];
+        while t1 != NONE {
+            if self.values[t1].real().abs() == 1.0 {
+                let row = topology.elements[t1].row;
+                let mut t2 = topology.first_in_col[row];
+                while t2 != NONE && topology.elements[t2].row != col {
+                    t2 = topology.elements[t2].next_in_col;
+                }
+                if t2 != NONE && self.values[t2].real().abs() == 1.0 {
+                    twins += 1;
+                    if twins >= 2 {
+                        return (twins, out1, out2);
+                    }
+                    topology.elements[t1].col = col;
+                    topology.elements[t2].col = row;
+                    out1 = t1;
+                    out2 = t2;
+                }
+            }
+            t1 = topology.elements[t1].next_in_col;
+        }
+        (twins, out1, out2)
+    }
+
+    /// `SwapCols`.
+    fn swap_cols(&mut self, t1: usize, t2: usize) {
+        let topology = std::sync::Arc::make_mut(&mut self.topology);
+        let (c1, c2) = (topology.elements[t1].col, topology.elements[t2].col);
+        topology.first_in_col.swap(c1, c2);
+        topology.int_to_ext_col.swap(c1, c2);
+        topology.ext_to_int_col[topology.int_to_ext_col[c2]] = c2;
+        topology.ext_to_int_col[topology.int_to_ext_col[c1]] = c1;
+        topology.diag[c1] = t2;
+        topology.diag[c2] = t1;
+        self.interchanges_odd = !self.interchanges_odd;
+    }
+
+    /// `spDeterminant`: normalized decimal mantissa and exponent, or zero
+    /// after a singular ordering. Preserve C's multiplication/division and
+    /// decimal scaling on every representable intermediate. If an individual
+    /// step would overflow or underflow, normalize its inverse pivot first.
+    pub(super) fn determinant(&self) -> SpiceResult<(T, i32)>
+    where
+        T: DeterminantScale,
+    {
+        use crate::maths::linear::numerical;
+        if matches!(self.status, Status::Singular | Status::ZeroDiag) {
+            return Ok((T::ZERO, 0));
+        }
+        if !self.factored {
+            return Err(numerical("SPARSE determinant", "matrix is not factored"));
+        }
+        let mut exponent = 0_i64;
+        let mut det = T::one();
+        for i in 1..=self.size {
+            let inverse = self.values[self.topology.diag[i]];
+            if !inverse.is_finite() || inverse.is_zero() {
+                return Err(numerical(
+                    "SPARSE determinant",
+                    "non-finite or zero inverse pivot",
+                ));
+            }
+            let mut next = T::det_step(det, inverse);
+            if !next.is_finite() || next.is_zero() || next.norm().is_subnormal() {
+                let mut shift = 0;
+                let normalized = normalize_decimal(inverse, &mut shift, DecimalScale::Coarse);
+                next = T::det_step(det, normalized);
+                exponent -= shift;
+                if !next.is_finite() || next.is_zero() {
+                    return Err(numerical(
+                        "SPARSE determinant",
+                        "unrepresentable determinant step",
+                    ));
+                }
+            }
+            det = normalize_decimal(next, &mut exponent, DecimalScale::Coarse);
+        }
+        det = normalize_decimal(det, &mut exponent, DecimalScale::Final);
+        if self.interchanges_odd {
+            det = det.scale(-1.0);
+        }
+        let exponent = i32::try_from(exponent)
+            .map_err(|_| numerical("SPARSE determinant", "decimal exponent out of range"))?;
+        Ok((det, exponent))
+    }
+
+    // --- spfactor.c -----------------------------------------------------
+
+    /// `spOrderAndFactor(Matrix, NULL, rel, abs, DiagPivoting = YES)`.
+    pub(crate) fn order_and_factor(&mut self, rel_threshold: f64, abs_threshold: f64) -> Status {
+        self.status = Status::Okay;
+        self.small_pivot = None;
+        self.factored = false;
+        if !self.values_are_finite() {
+            return self.nonfinite_factor();
+        }
+        let size = self.size;
+        if rel_threshold > 0.0 && rel_threshold <= 1.0 {
+            self.rel_threshold = rel_threshold;
+        }
+        if abs_threshold >= 0.0 {
+            self.abs_threshold = abs_threshold;
+        }
+        let mut step = 1;
+        let mut reorder = false;
+        if !self.needs_ordering {
+            while step <= size {
+                let pivot = self.topology.diag[step];
+                if pivot == NONE {
+                    reorder = true;
+                    break;
+                }
+                let largest = self.find_largest_in_col(self.topology.elements[pivot].next_in_col);
+                if largest * self.rel_threshold < self.mag(pivot) {
+                    self.row_col_elimination(pivot);
+                    if matches!(self.status, Status::Singular | Status::NonFinite) {
+                        return self.status;
+                    }
+                } else {
+                    reorder = true;
+                    break;
+                }
+                step += 1;
+            }
+            if !reorder {
+                return self.done();
+            }
+        } else {
+            if !self.rows_linked {
+                self.link_rows();
+            }
+            if !self.internal_vectors || self.markowitz_row.len() <= self.size {
+                self.create_internal_vectors();
+            }
+        }
+        self.count_markowitz(step);
+        self.markowitz_products(step);
+        while step <= size {
+            let Some(pivot) = self.search_for_pivot(step) else {
+                return self.matrix_is_singular(step);
+            };
+            self.exchange_rows_and_cols(pivot, step);
+            self.row_col_elimination(pivot);
+            if matches!(self.status, Status::Singular | Status::NonFinite) {
+                return self.status;
+            }
+            self.update_markowitz_numbers(pivot);
+            step += 1;
+        }
+        self.done()
+    }
+
+    fn done(&mut self) -> Status {
+        if self.plan.is_none() {
+            self.plan = Some(std::sync::Arc::new(self.compile_plan()));
+        }
+        self.needs_ordering = false;
+        self.factored = true;
+        self.status
+    }
+
+    fn compile_plan(&self) -> FactorPlan {
+        let mut columns = Vec::with_capacity(self.size);
+        let mut column_entries = Vec::with_capacity(self.topology.elements.len());
+        let mut upper_row_start = Vec::with_capacity(self.size + 1);
+        let mut upper_row_entries = Vec::new();
+        upper_row_start.push(0);
+        for i in 1..=self.size {
+            let start = column_entries.len();
+            let diagonal = self.topology.diag[i];
+            let mut diagonal_offset = None;
+            let mut e = self.topology.first_in_col[i];
+            while e != NONE {
+                if e == diagonal {
+                    diagonal_offset = Some(column_entries.len());
+                }
+                column_entries.push(RunEntry {
+                    handle: e,
+                    coordinate: self.topology.elements[e].row,
+                });
+                e = self.topology.elements[e].next_in_col;
+            }
+            columns.push(ColumnRun {
+                start,
+                diagonal: diagonal_offset.expect("ordered column contains its diagonal"),
+                end: column_entries.len(),
+            });
+            let mut e = self.topology.elements[diagonal].next_in_row;
+            while e != NONE {
+                upper_row_entries.push(RunEntry {
+                    handle: e,
+                    coordinate: self.topology.elements[e].col,
+                });
+                e = self.topology.elements[e].next_in_row;
+            }
+            upper_row_start.push(upper_row_entries.len());
+        }
+        FactorPlan {
+            columns,
+            column_entries,
+            upper_row_start,
+            upper_row_entries,
+        }
+    }
+
+    /// `spFactor`: refactor with the existing pivot order (no threshold test).
+    pub(crate) fn factor(&mut self) -> Status {
+        if self.needs_ordering {
+            return self.order_and_factor(0.0, 0.0);
+        }
+        self.factored = false;
+        let size = self.size;
+        if size == 0 {
+            self.status = Status::Okay;
+            return self.done();
+        }
+        let first = self.topology.diag[1];
+        if self.values[first].is_zero() {
+            return self.refactor_zero_pivot(1);
+        }
+        let inverse = self.values[first].recip();
+        if !inverse.is_finite() || inverse.is_zero() {
+            return self.nonfinite_factor();
+        }
+        self.values[first] = inverse;
+        self.factor_workspace.resize(size + 1, T::ZERO);
+        self.factor_workspace.fill(T::ZERO);
+        let dest = &mut self.factor_workspace;
+        let plan = self
+            .plan
+            .as_deref()
+            .expect("ordered sparse frame has a traversal plan");
+        for step in 2..=size {
+            for &RunEntry {
+                handle,
+                coordinate: row,
+            } in plan.column(step)
+            {
+                dest[row] = self.values[handle];
+            }
+            for &RunEntry {
+                handle,
+                coordinate: row,
+            } in plan.upper_column(step)
+            {
+                let mult = dest[row].mul(self.values[self.topology.diag[row]]);
+                self.values[handle] = mult;
+                for &RunEntry {
+                    handle,
+                    coordinate: r,
+                } in plan.lower_column(row)
+                {
+                    dest[r] = dest[r].mul_sub(mult, self.values[handle]);
+                }
+            }
+            for &RunEntry {
+                handle,
+                coordinate: row,
+            } in plan.lower_column(step)
+            {
+                self.values[handle] = dest[row];
+            }
+            if dest[step].is_zero() {
+                return self.refactor_zero_pivot(step);
+            }
+            let d = self.topology.diag[step];
+            let inverse = dest[step].recip();
+            if !inverse.is_finite() || inverse.is_zero() {
+                return self.nonfinite_factor();
+            }
+            self.values[d] = inverse;
+        }
+        // Fixed-order factorization does not compare coefficient magnitudes
+        // to select pivots. Validate the stored factors in one contiguous
+        // pass, including the untouched subdiagonal entries of column one.
+        // Every computed entry is stored; a nonfinite pivot is rejected above.
+        if !self.values_are_finite() {
+            return self.nonfinite_factor();
+        }
+        self.factored = true;
+        self.status = Status::Okay;
+        self.status
+    }
+
+    fn refactor_zero_pivot(&mut self, step: usize) -> Status {
+        // Preserve the distinction between singular and nonfinite input
+        // even when an early zero pivot stops the factorization.
+        if !self.values_are_finite() {
+            return self.nonfinite_factor();
+        }
+        self.zero_pivot(step)
+    }
+
+    /// `spcCreateInternalVectors`.
+    fn create_internal_vectors(&mut self) {
+        let size = self.size;
+        self.markowitz_row = vec![0; size + 1];
+        self.markowitz_col = vec![0; size + 1];
+        self.markowitz_prod = vec![0; size + 2];
+        self.internal_vectors = true;
+    }
+
+    /// `CountMarkowitz` (no RHS).
+    fn count_markowitz(&mut self, step: usize) {
+        for i in step..=self.size {
+            let mut count = -1;
+            let mut e = self.topology.first_in_row[i];
+            while e != NONE && self.topology.elements[e].col < step {
+                e = self.topology.elements[e].next_in_row;
+            }
+            while e != NONE {
+                count += 1;
+                e = self.topology.elements[e].next_in_row;
+            }
+            self.markowitz_row[i] = count;
+        }
+        for i in step..=self.size {
+            let mut count = -1;
+            let mut e = self.topology.first_in_col[i];
+            while e != NONE && self.topology.elements[e].row < step {
+                e = self.topology.elements[e].next_in_col;
+            }
+            while e != NONE {
+                count += 1;
+                e = self.topology.elements[e].next_in_col;
+            }
+            self.markowitz_col[i] = count;
+        }
+    }
+
+    /// `MarkowitzProducts`.
+    fn markowitz_products(&mut self, step: usize) {
+        self.singletons = 0;
+        for i in step..=self.size {
+            let product = self.markowitz_row[i].saturating_mul(self.markowitz_col[i]);
+            self.markowitz_prod[i] = product;
+            if product == 0 {
+                self.singletons += 1;
+            }
+        }
+    }
+
+    /// `SearchForPivot` with diagonal pivoting.
+    fn search_for_pivot(&mut self, step: usize) -> Option<usize> {
+        if self.singletons != 0
+            && let Some(pivot) = self.search_for_singleton(step)
+        {
+            return Some(pivot);
+        }
+        if let Some(pivot) = self.quickly_search_diagonal(step) {
+            return Some(pivot);
+        }
+        if let Some(pivot) = self.search_diagonal(step) {
+            return Some(pivot);
+        }
+        self.search_entire_matrix(step)
+    }
+
+    fn acceptable(&self, pivot: usize, step: usize) -> bool {
+        let mag = self.mag(pivot);
+        mag > self.abs_threshold
+            && mag > self.rel_threshold * self.find_biggest_in_col_exclude(pivot, step)
+    }
+
+    /// `SearchForSingleton`.
+    fn search_for_singleton(&mut self, step: usize) -> Option<usize> {
+        let size = self.size;
+        self.markowitz_prod[size + 1] = self.markowitz_prod[step];
+        let mut singletons = self.singletons;
+        self.singletons -= 1;
+        self.markowitz_prod[step - 1] = 0;
+        // C advances a pointer *after* testing each product. Track the
+        // next index plus one instead: the first read is size + 1 and each
+        // subsequent read moves left, preserving C's sentinel and pivot
+        // priority without an isize that can become -1 at step == 1.
+        let mut cursor = size + 2;
+        while singletons > 0 {
+            singletons -= 1;
+            loop {
+                cursor -= 1;
+                if self.markowitz_prod[cursor] == 0 {
+                    break;
+                }
+            }
+            let mut i = cursor;
+            if i < step {
+                break;
+            }
+            if i > size {
+                i = step;
+            }
+            let diag = self.topology.diag[i];
+            if diag == NONE {
+                // ngspice's off-diagonal singleton branches `break` (or would
+                // dereference NULL) when no diagonal exists.
+                break;
+            }
+            if self.acceptable(diag, step) {
+                return Some(diag);
+            }
+        }
+        self.singletons += 1;
+        None
+    }
+
+    /// `QuicklySearchDiagonal` (without `MODIFIED_MARKOWITZ`).
+    fn quickly_search_diagonal(&mut self, step: usize) -> Option<usize> {
+        let size = self.size;
+        let mut chosen = NONE;
+        let mut min = i64::MAX;
+        self.markowitz_prod[size + 1] = self.markowitz_prod[step];
+        self.markowitz_prod[step - 1] = -1;
+        let mut p = size + 2;
+        loop {
+            loop {
+                p -= 1;
+                if self.markowitz_prod[p] < min {
+                    break;
+                }
+            }
+            let mut i = p;
+            if i < step {
+                break;
+            }
+            if i > size {
+                i = step;
+            }
+            let diag = self.topology.diag[i];
+            if diag == NONE {
+                continue;
+            }
+            let magnitude = self.mag(diag);
+            if magnitude <= self.abs_threshold {
+                continue;
+            }
+            if self.markowitz_prod[p] == 1 {
+                let mut other_row = self.topology.elements[diag].next_in_row;
+                let mut other_col = self.topology.elements[diag].next_in_col;
+                if other_row == NONE && other_col == NONE {
+                    other_row = self.topology.first_in_row[i];
+                    while other_row != NONE {
+                        let c = self.topology.elements[other_row].col;
+                        if c >= step && c != i {
+                            break;
+                        }
+                        other_row = self.topology.elements[other_row].next_in_row;
+                    }
+                    other_col = self.topology.first_in_col[i];
+                    while other_col != NONE {
+                        let r = self.topology.elements[other_col].row;
+                        if r >= step && r != i {
+                            break;
+                        }
+                        other_col = self.topology.elements[other_col].next_in_col;
+                    }
+                }
+                if other_row != NONE
+                    && other_col != NONE
+                    && self.topology.elements[other_row].col
+                        == self.topology.elements[other_col].row
+                {
+                    let largest_off = self.mag(other_row).max(self.mag(other_col));
+                    if magnitude >= largest_off {
+                        return Some(diag);
+                    }
+                }
+            }
+            min = self.markowitz_prod[p];
+            chosen = diag;
+        }
+        if chosen != NONE {
+            let largest = self.find_biggest_in_col_exclude(chosen, step);
+            if self.mag(chosen) <= self.rel_threshold * largest {
+                return None;
+            }
+            return Some(chosen);
+        }
+        None
+    }
+
+    /// `SearchDiagonal`.
+    fn search_diagonal(&mut self, step: usize) -> Option<usize> {
+        let size = self.size;
+        let mut chosen = NONE;
+        let mut min = i64::MAX;
+        let mut ties = 0;
+        let mut accepted_ratio = 0.0;
+        self.markowitz_prod[size + 1] = self.markowitz_prod[step];
+        for j in (step + 1..=size + 1).rev() {
+            let product = self.markowitz_prod[j];
+            if product > min {
+                continue;
+            }
+            let i = if j > size { step } else { j };
+            let diag = self.topology.diag[i];
+            if diag == NONE {
+                continue;
+            }
+            let magnitude = self.mag(diag);
+            if magnitude <= self.abs_threshold {
+                continue;
+            }
+            let largest = self.find_biggest_in_col_exclude(diag, step);
+            if magnitude <= self.rel_threshold * largest {
+                continue;
+            }
+            if product < min {
+                chosen = diag;
+                min = product;
+                accepted_ratio = largest / magnitude;
+                ties = 0;
+            } else {
+                ties += 1;
+                let ratio = largest / magnitude;
+                if ratio < accepted_ratio {
+                    chosen = diag;
+                    accepted_ratio = ratio;
+                }
+                if ties >= min.saturating_mul(TIES_MULTIPLIER) {
+                    return Some(chosen);
+                }
+            }
+        }
+        (chosen != NONE).then_some(chosen)
+    }
+
+    /// `SearchEntireMatrix`. Sets `SmallPivot`/`Singular` like C.
+    fn search_entire_matrix(&mut self, step: usize) -> Option<usize> {
+        let mut chosen = NONE;
+        let mut largest_element = NONE;
+        let mut largest_mag = 0.0;
+        let mut min = i64::MAX;
+        let mut ties = 0;
+        let mut accepted_ratio = 0.0;
+        for i in step..=self.size {
+            let mut e = self.topology.first_in_col[i];
+            while e != NONE && self.topology.elements[e].row < step {
+                e = self.topology.elements[e].next_in_col;
+            }
+            let largest_in_col = self.find_largest_in_col(e);
+            if largest_in_col == 0.0 {
+                continue;
+            }
+            while e != NONE {
+                let magnitude = self.mag(e);
+                if magnitude > largest_mag {
+                    largest_mag = magnitude;
+                    largest_element = e;
+                }
+                let element = &self.topology.elements[e];
+                let product =
+                    self.markowitz_row[element.row].saturating_mul(self.markowitz_col[element.col]);
+                if product <= min
+                    && magnitude > self.rel_threshold * largest_in_col
+                    && magnitude > self.abs_threshold
+                {
+                    if product < min {
+                        chosen = e;
+                        min = product;
+                        accepted_ratio = largest_in_col / magnitude;
+                        ties = 0;
+                    } else {
+                        ties += 1;
+                        let ratio = largest_in_col / magnitude;
+                        if ratio < accepted_ratio {
+                            chosen = e;
+                            accepted_ratio = ratio;
+                        }
+                        if ties >= min.saturating_mul(TIES_MULTIPLIER) {
+                            return Some(chosen);
+                        }
+                    }
+                }
+                e = self.topology.elements[e].next_in_col;
+            }
+        }
+        if chosen != NONE {
+            return Some(chosen);
+        }
+        if largest_mag == 0.0 {
+            self.status = Status::Singular;
+            return None;
+        }
+        self.status = Status::SmallPivot;
+        if self.small_pivot.is_none() {
+            let element = &self.topology.elements[largest_element];
+            self.small_pivot = Some((
+                self.topology.int_to_ext_row[element.row],
+                self.topology.int_to_ext_col[element.col],
+            ));
+        }
+        Some(largest_element)
+    }
+
+    /// `FindLargestInCol` from `e` downwards.
+    fn find_largest_in_col(&self, mut e: usize) -> f64 {
+        let mut largest = 0.0;
+        while e != NONE {
+            let magnitude = self.mag(e);
+            if magnitude > largest {
+                largest = magnitude;
+            }
+            e = self.topology.elements[e].next_in_col;
+        }
+        largest
+    }
+
+    /// `FindBiggestInColExclude`.
+    fn find_biggest_in_col_exclude(&self, pivot: usize, step: usize) -> f64 {
+        let row = self.topology.elements[pivot].row;
+        let col = self.topology.elements[pivot].col;
+        let mut e = self.topology.first_in_col[col];
+        while e != NONE && self.topology.elements[e].row < step {
+            e = self.topology.elements[e].next_in_col;
+        }
+        let mut largest = if self.topology.elements[e].row != row {
+            self.mag(e)
+        } else {
+            0.0
+        };
+        e = self.topology.elements[e].next_in_col;
+        while e != NONE {
+            let magnitude = self.mag(e);
+            if magnitude > largest && self.topology.elements[e].row != row {
+                largest = magnitude;
+            }
+            e = self.topology.elements[e].next_in_col;
+        }
+        largest
+    }
+
+    fn product_of(&self, i: usize) -> i64 {
+        self.markowitz_row[i].saturating_mul(self.markowitz_col[i])
+    }
+
+    const fn track_singleton(&mut self, new: i64, old: i64) {
+        if (new == 0) != (old == 0) {
+            if old == 0 {
+                self.singletons -= 1;
+            } else {
+                self.singletons += 1;
+            }
+        }
+    }
+
+    /// `ExchangeRowsAndCols`.
+    fn exchange_rows_and_cols(&mut self, pivot: usize, step: usize) {
+        let row = self.topology.elements[pivot].row;
+        let col = self.topology.elements[pivot].col;
+        if row == step && col == step {
+            return;
+        }
+        self.plan = None;
+        if row == col {
+            self.row_exchange(step, row);
+            self.col_exchange(step, col);
+            self.markowitz_prod.swap(step, row);
+            std::sync::Arc::make_mut(&mut self.topology)
+                .diag
+                .swap(row, step);
+        } else {
+            let old_step = self.markowitz_prod[step];
+            let old_row = self.markowitz_prod[row];
+            let old_col = self.markowitz_prod[col];
+            if row != step {
+                self.row_exchange(step, row);
+                self.interchanges_odd = !self.interchanges_odd;
+                self.markowitz_prod[row] = self.product_of(row);
+                self.track_singleton(self.markowitz_prod[row], old_row);
+            }
+            if col != step {
+                self.col_exchange(step, col);
+                self.interchanges_odd = !self.interchanges_odd;
+                self.markowitz_prod[col] = self.product_of(col);
+                self.track_singleton(self.markowitz_prod[col], old_col);
+                std::sync::Arc::make_mut(&mut self.topology).diag[col] =
+                    self.find_element_in_col(Slot::Head(col), col, col, false);
+            }
+            if row != step {
+                std::sync::Arc::make_mut(&mut self.topology).diag[row] =
+                    self.find_element_in_col(Slot::Head(row), row, row, false);
+            }
+            std::sync::Arc::make_mut(&mut self.topology).diag[step] =
+                self.find_element_in_col(Slot::Head(step), step, step, false);
+            self.markowitz_prod[step] = self.product_of(step);
+            self.track_singleton(self.markowitz_prod[step], old_step);
+        }
+    }
+
+    /// Exchange rows in the linked topology and Markowitz counts.
+    fn row_exchange(&mut self, a: usize, b: usize) {
+        std::sync::Arc::make_mut(&mut self.topology).row_exchange(a, b);
+        if self.internal_vectors {
+            self.markowitz_row.swap(a, b);
+        }
+    }
+
+    fn col_exchange(&mut self, a: usize, b: usize) {
+        std::sync::Arc::make_mut(&mut self.topology).col_exchange(a, b);
+        if self.internal_vectors {
+            self.markowitz_col.swap(a, b);
+        }
+    }
+
     /// `RealRowColElimination` / `ComplexRowColElimination`.
     fn row_col_elimination(&mut self, pivot: usize) {
         if self.values[pivot].mag() == 0.0 {
-            let row = self.elements[pivot].row;
+            let row = self.topology.elements[pivot].row;
             self.matrix_is_singular(row);
             return;
         }
@@ -1652,7 +1681,7 @@ impl<T: Scalar> Sparse<T> {
             return;
         }
         self.values[pivot] = inverse;
-        let mut upper = self.elements[pivot].next_in_row;
+        let mut upper = self.topology.elements[pivot].next_in_row;
         while upper != NONE {
             let u = self.values[upper].mul(inverse);
             if !u.is_finite() {
@@ -1660,15 +1689,15 @@ impl<T: Scalar> Sparse<T> {
                 return;
             }
             self.values[upper] = u;
-            let upper_col = self.elements[upper].col;
-            let mut sub = self.elements[upper].next_in_col;
-            let mut lower = self.elements[pivot].next_in_col;
+            let upper_col = self.topology.elements[upper].col;
+            let mut sub = self.topology.elements[upper].next_in_col;
+            let mut lower = self.topology.elements[pivot].next_in_col;
             while lower != NONE {
-                let row = self.elements[lower].row;
-                while sub != NONE && self.elements[sub].row < row {
-                    sub = self.elements[sub].next_in_col;
+                let row = self.topology.elements[lower].row;
+                while sub != NONE && self.topology.elements[sub].row < row {
+                    sub = self.topology.elements[sub].next_in_col;
                 }
-                if sub == NONE || self.elements[sub].row > row {
+                if sub == NONE || self.topology.elements[sub].row > row {
                     sub = self.create_fillin(row, upper_col);
                 }
                 let l = self.values[lower];
@@ -1678,44 +1707,44 @@ impl<T: Scalar> Sparse<T> {
                     return;
                 }
                 self.values[sub] = value;
-                sub = self.elements[sub].next_in_col;
-                lower = self.elements[lower].next_in_col;
+                sub = self.topology.elements[sub].next_in_col;
+                lower = self.topology.elements[lower].next_in_col;
             }
-            upper = self.elements[upper].next_in_row;
+            upper = self.topology.elements[upper].next_in_row;
         }
     }
 
     /// `UpdateMarkowitzNumbers`.
     fn update_markowitz_numbers(&mut self, pivot: usize) {
-        let mut e = self.elements[pivot].next_in_col;
+        let mut e = self.topology.elements[pivot].next_in_col;
         while e != NONE {
-            let row = self.elements[e].row;
+            let row = self.topology.elements[e].row;
             self.markowitz_row[row] -= 1;
             self.markowitz_prod[row] = self.product_of(row);
             if self.markowitz_row[row] == 0 {
                 self.singletons += 1;
             }
-            e = self.elements[e].next_in_col;
+            e = self.topology.elements[e].next_in_col;
         }
-        let mut e = self.elements[pivot].next_in_row;
+        let mut e = self.topology.elements[pivot].next_in_row;
         while e != NONE {
-            let col = self.elements[e].col;
+            let col = self.topology.elements[e].col;
             self.markowitz_col[col] -= 1;
             self.markowitz_prod[col] = self.product_of(col);
             if self.markowitz_col[col] == 0 && self.markowitz_row[col] != 0 {
                 self.singletons += 1;
             }
-            e = self.elements[e].next_in_row;
+            e = self.topology.elements[e].next_in_row;
         }
     }
 
     /// `CreateFillin`.
     fn create_fillin(&mut self, row: usize, col: usize) -> usize {
         let mut above = Slot::Head(col);
-        let mut e = self.col_get(above);
-        while e != NONE && self.elements[e].row < row {
+        let mut e = self.topology.col_get(above);
+        while e != NONE && self.topology.elements[e].row < row {
             above = Slot::After(e);
-            e = self.col_get(above);
+            e = self.topology.col_get(above);
         }
         let element = self.create_element(row, col, above, true);
         self.markowitz_row[row] += 1;
@@ -1743,16 +1772,16 @@ impl<T: Scalar> Sparse<T> {
 
     /// `MatrixIsSingular`.
     fn matrix_is_singular(&mut self, step: usize) -> Status {
-        self.singular_row = self.int_to_ext_row[step];
-        self.singular_col = self.int_to_ext_col[step];
+        self.singular_row = self.topology.int_to_ext_row[step];
+        self.singular_col = self.topology.int_to_ext_col[step];
         self.status = Status::Singular;
         self.status
     }
 
     /// `ZeroPivot`.
     fn zero_pivot(&mut self, step: usize) -> Status {
-        self.singular_row = self.int_to_ext_row[step];
-        self.singular_col = self.int_to_ext_col[step];
+        self.singular_row = self.topology.int_to_ext_row[step];
+        self.singular_col = self.topology.int_to_ext_col[step];
         self.status = Status::ZeroDiag;
         self.status
     }
@@ -1780,7 +1809,7 @@ impl<T: Scalar> Sparse<T> {
         for i in 1..=size {
             let mut temp = x[i];
             if !temp.is_zero() {
-                temp = temp.mul(self.values[self.diag[i]]);
+                temp = temp.mul(self.values[self.topology.diag[i]]);
                 x[i] = temp;
                 for &RunEntry {
                     handle,
@@ -1810,9 +1839,9 @@ impl<T: Scalar> Sparse<T> {
     fn gather_rhs(&self, rhs: &[T], x: &mut Vec<T>, transposed: bool) {
         debug_assert!(self.factored && rhs.len() == self.ext_size);
         let indices = if transposed {
-            &self.int_to_ext_col
+            &self.topology.int_to_ext_col
         } else {
-            &self.int_to_ext_row
+            &self.topology.int_to_ext_row
         };
         x.clear();
         x.reserve(self.size + 1);
@@ -1824,9 +1853,9 @@ impl<T: Scalar> Sparse<T> {
     /// exactly their original RHS bits, including signed zeros.
     fn scatter_solution(&self, rhs: &[T], x: &[T], transposed: bool) -> Vec<T> {
         let indices = if transposed {
-            &self.ext_to_int_row
+            &self.topology.ext_to_int_row
         } else {
-            &self.ext_to_int_col
+            &self.topology.ext_to_int_col
         };
         rhs.iter()
             .zip(&indices[1..])
@@ -1865,7 +1894,7 @@ impl<T: Scalar> Sparse<T> {
             }
         }
         for i in (1..=size).rev() {
-            let pivot = self.diag[i];
+            let pivot = self.topology.diag[i];
             let mut temp = x[i];
             for &RunEntry {
                 handle,
@@ -2125,23 +2154,23 @@ mod tests {
         let plan = std::sync::Arc::clone(m.plan.as_ref().unwrap());
         for i in 1..=m.size {
             let mut col = Vec::new();
-            let mut e = m.first_in_col[i];
+            let mut e = m.topology.first_in_col[i];
             while e != NONE {
                 col.push(RunEntry {
                     handle: e,
-                    coordinate: m.elements[e].row,
+                    coordinate: m.topology.elements[e].row,
                 });
-                e = m.elements[e].next_in_col;
+                e = m.topology.elements[e].next_in_col;
             }
             assert_eq!(plan.column(i), col);
             let mut row = Vec::new();
-            let mut e = m.elements[m.diag[i]].next_in_row;
+            let mut e = m.topology.elements[m.topology.diag[i]].next_in_row;
             while e != NONE {
                 row.push(RunEntry {
                     handle: e,
-                    coordinate: m.elements[e].col,
+                    coordinate: m.topology.elements[e].col,
                 });
-                e = m.elements[e].next_in_row;
+                e = m.topology.elements[e].next_in_row;
             }
             assert_eq!(plan.upper_row(i), row);
         }
@@ -2159,6 +2188,41 @@ mod tests {
         let h = c.get_element(1, 4);
         c.set(h, Complex::real(2.));
         assert!(c.plan.is_none());
+    }
+
+    #[test]
+    fn snapshot_topology_is_shared_until_structural_mutation() {
+        let mut a = build(3, &[(1, 1, 4.), (2, 2, 5.), (1, 2, 1.)]);
+        assert_eq!(a.order_and_factor(1e-3, 0.), Status::Okay);
+        let saved = a.clone();
+        assert!(std::sync::Arc::ptr_eq(&a.topology, &saved.topology));
+        let rhs = [5., 5., -0.];
+        let answer = saved.solve(&rhs);
+        a.reload_originals(&[6., 5., 1.]);
+        assert_eq!(a.factor(), Status::Okay);
+        assert!(std::sync::Arc::ptr_eq(&a.topology, &saved.topology));
+        assert_ne!(a.solve(&rhs), answer);
+        let mut complex = a.into_retyped::<Complex>();
+        assert!(std::sync::Arc::ptr_eq(&complex.topology, &saved.topology));
+        // Lookup of an already allocated element does not detach.
+        complex.get_element(1, 1);
+        assert!(std::sync::Arc::ptr_eq(&complex.topology, &saved.topology));
+        // Add a previously untranslated unknown after successful ordering.
+        let h = complex.get_element(3, 3);
+        assert!(!std::sync::Arc::ptr_eq(&complex.topology, &saved.topology));
+        complex.clear();
+        for i in 1..=3 {
+            let h = complex.get_element(i, i);
+            complex.set(h, Complex::real(i as f64));
+        }
+        complex.set(h, Complex::real(3.));
+        assert_eq!(complex.order_and_factor(1e-3, 0.), Status::Okay);
+        assert_eq!(
+            complex.solve(&[Complex::real(1.), Complex::real(2.), Complex::real(3.)]),
+            [Complex::real(1.); 3]
+        );
+        assert_eq!(saved.solve(&rhs), answer);
+        assert_eq!(saved.untranslated().collect::<Vec<_>>(), [3]);
     }
 
     #[test]
@@ -2182,7 +2246,7 @@ mod tests {
         let rhs = [5.; 4];
         let before = m.solve(&rhs);
         let ptr = m.values.as_ptr();
-        let topology = m.elements.as_ptr();
+        let topology = m.topology.elements.as_ptr();
         let input = entries.map(|(_, _, v)| v);
         m.reload_originals(&input);
         assert!(!m.is_factored());
@@ -2191,7 +2255,7 @@ mod tests {
         assert_eq!(m.factor(), Status::Okay);
         assert_eq!(m.solve(&rhs), before);
         assert_eq!(m.values.as_ptr(), ptr);
-        assert_eq!(m.elements.as_ptr(), topology);
+        assert_eq!(m.topology.elements.as_ptr(), topology);
         m.reload_originals_iter(input.into_iter());
         assert_eq!(m.factor(), Status::Okay);
         assert_eq!(m.solve(&rhs), before);
@@ -2201,22 +2265,22 @@ mod tests {
     fn scalar_transition_moves_structural_allocations() {
         let mut real = build(2, &[(1, 1, 2.), (1, 2, 1.), (2, 1, 3.), (2, 2, 4.)]);
         assert_eq!(real.order_and_factor(1e-3, 0.), Status::Okay);
-        let elements = real.elements.as_ptr();
-        let diagonal = real.diag.as_ptr();
-        let rows = real.int_to_ext_row.as_ptr();
-        let columns = real.int_to_ext_col.as_ptr();
+        let elements = real.topology.elements.as_ptr();
+        let diagonal = real.topology.diag.as_ptr();
+        let rows = real.topology.int_to_ext_row.as_ptr();
+        let columns = real.topology.int_to_ext_col.as_ptr();
         let complex = real.into_retyped::<Complex>();
-        assert_eq!(complex.elements.as_ptr(), elements);
-        assert_eq!(complex.diag.as_ptr(), diagonal);
-        assert_eq!(complex.int_to_ext_row.as_ptr(), rows);
-        assert_eq!(complex.int_to_ext_col.as_ptr(), columns);
+        assert_eq!(complex.topology.elements.as_ptr(), elements);
+        assert_eq!(complex.topology.diag.as_ptr(), diagonal);
+        assert_eq!(complex.topology.int_to_ext_row.as_ptr(), rows);
+        assert_eq!(complex.topology.int_to_ext_col.as_ptr(), columns);
         assert!(!complex.is_factored());
         assert!(complex.values.iter().all(|v| v.is_zero()));
         let real = complex.into_retyped::<f64>();
-        assert_eq!(real.elements.as_ptr(), elements);
-        assert_eq!(real.diag.as_ptr(), diagonal);
-        assert_eq!(real.int_to_ext_row.as_ptr(), rows);
-        assert_eq!(real.int_to_ext_col.as_ptr(), columns);
+        assert_eq!(real.topology.elements.as_ptr(), elements);
+        assert_eq!(real.topology.diag.as_ptr(), diagonal);
+        assert_eq!(real.topology.int_to_ext_row.as_ptr(), rows);
+        assert_eq!(real.topology.int_to_ext_col.as_ptr(), columns);
     }
 
     #[test]
@@ -2229,14 +2293,14 @@ mod tests {
         m.markowitz_prod[1..=4].copy_from_slice(&[0, 0, 0, 0]);
         m.singletons = 4;
         let pivot = m.search_for_singleton(1).unwrap();
-        assert_eq!(m.elements[pivot].row, 1);
+        assert_eq!(m.topology.elements[pivot].row, 1);
 
         // The sentinel is not a singleton: the search selects the highest
         // remaining zero-product diagonal, never reading a negative index.
         m.markowitz_prod[1..=4].copy_from_slice(&[1, 1, 0, 0]);
         m.singletons = 2;
         let pivot = m.search_for_singleton(1).unwrap();
-        assert_eq!(m.elements[pivot].row, 4);
+        assert_eq!(m.topology.elements[pivot].row, 4);
     }
 
     #[test]
