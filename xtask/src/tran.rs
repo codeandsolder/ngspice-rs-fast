@@ -22,13 +22,14 @@
 //! spacing is small against the circuit time constants; that is the caller's
 //! fixture design responsibility and is not hidden by a looser tolerance.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use ngspice_rs::analysis::{Plot, PlotFlags};
 use ngspice_rs::netlist::ast::{
     DeviceInstance, Netlist, ParameterKind, PositionedValue, SourceWaveform, Subcircuit,
 };
-use ngspice_rs::primitives::parse_spice_number;
+use ngspice_rs::primitives::{exact_nonnegative_integer, parse_spice_number};
 
 use crate::compare::{self, TranTolerance};
 
@@ -37,7 +38,7 @@ use crate::compare::{self, TranTolerance};
 /// `td + n*per + corner` sums.
 const TIME_EPS_REL: f64 = 1e-9;
 /// Upper bound on comparison instants and generated breakpoints.
-const MAX_POINTS: usize = 2_000_000;
+const MAX_POINTS: u32 = 2_000_000;
 
 /// The shared output grid: `start, step, 2*step, ... , stop` (each time is
 /// `i*step`, not an accumulated sum). Breakpoints inside `(start, stop)` are
@@ -48,21 +49,21 @@ const MAX_POINTS: usize = 2_000_000;
 /// time, and **both** plots must begin exactly there: the instant is compared as
 /// an ordinary sample, and nothing before it is interpolated or extrapolated.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Grid {
-    pub(crate) start: f64,
-    pub(crate) stop: f64,
-    pub(crate) step: f64,
+pub struct Grid {
+    pub start: f64,
+    pub stop: f64,
+    pub step: f64,
 }
 
 /// What a successful comparison covered.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Summary {
+pub struct Summary {
     /// Interior (smooth) or end-point instants compared.
-    pub(crate) instants: usize,
+    pub instants: usize,
     /// One-sided breakpoint limits compared (two per breakpoint).
-    pub(crate) limits: usize,
+    pub limits: usize,
     /// Largest `|error| / bound` seen over every compared value (<= 1).
-    pub(crate) worst_ratio: f64,
+    pub worst_ratio: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -211,7 +212,9 @@ impl<'a> Series<'a> {
             ));
         }
         let fraction = (t - t0) / (t1 - t0);
-        Ok((1.0 - fraction) * at(upper - 1) + fraction * at(upper))
+        let left = (1.0 - fraction) * at(upper - 1);
+        let right = fraction * at(upper);
+        Ok(left + right)
     }
 }
 
@@ -227,9 +230,11 @@ fn comparison_instants(
         return Err("grid start must be finite and lie in [0, stop)".into());
     }
     let count = (grid.stop / grid.step + 1e-9).floor();
-    if count >= MAX_POINTS as f64 {
+    if count >= f64::from(MAX_POINTS) {
         return Err(format!("grid needs more than {MAX_POINTS} points"));
     }
+    let count = exact_nonnegative_integer::<u32>(count)
+        .ok_or_else(|| "invalid grid point count".to_owned())?;
     let mut previous = grid.start;
     for &b in breakpoints {
         if !(b.is_finite() && b > eps && b < grid.stop - eps && b > previous + eps) {
@@ -243,8 +248,8 @@ fn comparison_instants(
     // The first instant is `start` itself (0 for an ordinary run); grid times
     // before it do not exist in either plot.
     instants.push((grid.start, Side::Interior));
-    for index in 0..=(count as usize) {
-        let t = index as f64 * grid.step;
+    for index in 0..=count {
+        let t = f64::from(index) * grid.step;
         if t > grid.start + eps
             && t < grid.stop - eps
             && !breakpoints.iter().any(|b| (b - t).abs() <= eps)
@@ -268,7 +273,7 @@ fn comparison_instants(
 /// `voltage` or `current` unit and satisfy
 /// `|got - want| <= relative*|want| + absolute(kind)` at every instant and at
 /// both limits of every breakpoint. Both plots must end at `grid.stop`.
-pub(crate) fn transient(
+pub fn transient(
     got: &Plot,
     want: &Plot,
     tolerance: TranTolerance,
@@ -293,7 +298,8 @@ pub(crate) fn transient(
         let peak = (0..want.point_count())
             .map(|row| want.points[row][column].re.abs())
             .fold(0.0, f64::max);
-        let absolute = absolute + tolerance.peak_relative * peak;
+        let peak_allowance = tolerance.peak_relative * peak;
+        let absolute = absolute + peak_allowance;
         signals.push((name, rust.columns[name], column, absolute));
     }
     let mut summary = Summary {
@@ -313,7 +319,8 @@ pub(crate) fn transient(
         for &(name, got_column, want_column, absolute) in &signals {
             let actual = rust.value(got_column, t, side)?;
             let expected = c.value(want_column, t, side)?;
-            let limit = tolerance.relative * expected.abs() + absolute;
+            let relative_allowance = tolerance.relative * expected.abs();
+            let limit = relative_allowance + absolute;
             let error = (actual - expected).abs();
             let ratio = error / limit;
             summary.worst_ratio = summary.worst_ratio.max(ratio);
@@ -364,14 +371,14 @@ fn number(value: &PositionedValue, what: &str, device: &str) -> Result<f64, Stri
 /// waveforms inside them are not enumerated. Subcircuits without such sources
 /// (e.g. an op-amp macromodel) add no breakpoints and are accepted.
 /// Expression-valued or non-numeric waveform fields are errors.
-pub(crate) fn breakpoints(netlist: &Netlist, tstep: f64, tstop: f64) -> Result<Vec<f64>, String> {
-    if !(tstep.is_finite() && tstep > 0.0 && tstop.is_finite() && tstop > 0.0) {
+pub fn breakpoints(netlist: &Netlist, time_step: f64, stop_time: f64) -> Result<Vec<f64>, String> {
+    if !(time_step.is_finite() && time_step > 0.0 && stop_time.is_finite() && stop_time > 0.0) {
         return Err("tstep and tstop must be finite and positive".into());
     }
     if netlist.subcircuits.iter().any(has_waveform_source) {
         return Err("breakpoints: subcircuit waveforms are not enumerated".into());
     }
-    let eps = TIME_EPS_REL * tstop;
+    let eps = TIME_EPS_REL * stop_time;
     let mut times = Vec::new();
     for device in &netlist.devices {
         if !matches!(device.designator, 'v' | 'i') {
@@ -382,10 +389,10 @@ pub(crate) fn breakpoints(netlist: &Netlist, tstep: f64, tstop: f64) -> Result<V
             _ => None,
         });
         if let Some(waveform) = waveform {
-            collect(device, waveform, tstep, tstop, &mut times)?;
+            collect(device, waveform, time_step, stop_time, &mut times)?;
         }
     }
-    times.retain(|&t| t > eps && t < tstop - eps);
+    times.retain(|&t| t > eps && t < stop_time - eps);
     times.sort_by(f64::total_cmp);
     times.dedup_by(|b, a| (*b - *a).abs() <= eps);
     Ok(times)
@@ -393,20 +400,20 @@ pub(crate) fn breakpoints(netlist: &Netlist, tstep: f64, tstop: f64) -> Result<V
 
 /// `breakpoints` plus `b + offset` for every breakpoint `b` and offset (the
 /// echoes of a transmission-line deck, see `verify::Gate::Echoes`), inside
-/// `(0, tstop)`, sorted and deduplicated like [`breakpoints`].
-pub(crate) fn echoes(breakpoints: &[f64], offsets: &[f64], tstop: f64) -> Result<Vec<f64>, String> {
+/// `(0, stop_time)`, sorted and deduplicated like [`breakpoints`].
+pub fn echoes(breakpoints: &[f64], offsets: &[f64], stop_time: f64) -> Result<Vec<f64>, String> {
     if offsets.iter().any(|o| !(o.is_finite() && *o > 0.0)) {
         return Err("echo offsets must be finite and positive".into());
     }
-    let eps = TIME_EPS_REL * tstop;
+    let eps = TIME_EPS_REL * stop_time;
     let mut times = breakpoints.to_vec();
     for b in breakpoints {
         times.extend(offsets.iter().map(|o| b + o));
     }
-    if times.len() > MAX_POINTS {
+    if !u32::try_from(times.len()).is_ok_and(|len| len <= MAX_POINTS) {
         return Err("too many echo breakpoints".into());
     }
-    times.retain(|&t| t > eps && t < tstop - eps);
+    times.retain(|&t| t > eps && t < stop_time - eps);
     times.sort_by(f64::total_cmp);
     times.dedup_by(|b, a| (*b - *a).abs() <= eps);
     Ok(times)
@@ -442,8 +449,8 @@ fn scalar(device: &DeviceInstance, name: &str) -> Result<Option<f64>, String> {
 fn collect(
     device: &DeviceInstance,
     waveform: &SourceWaveform,
-    tstep: f64,
-    tstop: f64,
+    time_step: f64,
+    stop_time: f64,
     out: &mut Vec<f64>,
 ) -> Result<(), String> {
     let name = device.name.as_str();
@@ -458,21 +465,34 @@ fn collect(
             if let Some(r) = scalar(device, "r")?.filter(|&r| r >= -0.5) {
                 let start = knots
                     .iter()
-                    .position(|&t| t == r)
+                    .position(|&t| t.partial_cmp(&r) == Some(Ordering::Equal))
                     .ok_or_else(|| format!("{name}: r={r} matches no PWL time"))?;
                 let last = knots[knots.len() - 1];
                 let period = last - r;
-                if period <= 0.0 || (tstop - delay - last) / period > MAX_POINTS as f64 / 4.0 {
+                if period <= 0.0
+                    || (stop_time - delay - last) / period > f64::from(MAX_POINTS) / 4.0
+                {
                     return Err(format!(
                         "{name}: repeated PWL would create too many breakpoints"
                     ));
                 }
-                let mut cycle = 1.0;
-                while delay + last + (cycle - 1.0) * period < tstop {
-                    for &t in &knots[start + 1..] {
-                        out.push(delay + t + cycle * period);
+                let mut cycle = 1_u32;
+                loop {
+                    let previous_offset = f64::from(cycle - 1) * period;
+                    let previous_end = delay + last + previous_offset;
+                    if previous_end.partial_cmp(&stop_time) != Some(Ordering::Less) {
+                        break;
                     }
-                    cycle += 1.0;
+                    if cycle > MAX_POINTS {
+                        return Err(format!(
+                            "{name}: repeated PWL would create too many breakpoints"
+                        ));
+                    }
+                    let offset = f64::from(cycle) * period;
+                    for &t in &knots[start + 1..] {
+                        out.push(delay + t + offset);
+                    }
+                    cycle += 1;
                 }
             }
         }
@@ -491,38 +511,46 @@ fn collect(
             let delay = get(&pulse.delay, "PULSE delay")?.unwrap_or(0.0);
             let rise = get(&pulse.rise, "PULSE rise")?
                 .filter(|&v| v > 0.0)
-                .unwrap_or(tstep);
+                .unwrap_or(time_step);
             let fall = get(&pulse.fall, "PULSE fall")?
                 .filter(|&v| v > 0.0)
-                .unwrap_or(tstep);
+                .unwrap_or(time_step);
             let width = if given == 3 {
                 0.0
             } else {
                 get(&pulse.width, "PULSE width")?
                     .filter(|&v| v >= 0.0)
-                    .unwrap_or(tstop)
+                    .unwrap_or(stop_time)
             };
             let period = get(&pulse.period, "PULSE period")?
                 .filter(|&v| v > 0.0)
-                .unwrap_or(tstop);
+                .unwrap_or(stop_time);
             let stop = get(&pulse.count, "PULSE count")?
                 .filter(|&v| v > 0.0)
                 .map(|count| count * period);
             // Validate level spellings too: an unparseable level is an error.
             number(&pulse.initial, "PULSE v1", name)?;
             number(&pulse.pulsed, "PULSE v2", name)?;
-            if (tstop - delay) / period > MAX_POINTS as f64 / 4.0 {
+            if (stop_time - delay) / period > f64::from(MAX_POINTS) / 4.0 {
                 return Err(format!("{name}: PULSE would create too many breakpoints"));
             }
-            let mut cycle = 0.0;
-            while delay + cycle * period < tstop {
+            let mut cycle = 0_u32;
+            loop {
+                let offset = f64::from(cycle) * period;
+                let start = delay + offset;
+                if start.partial_cmp(&stop_time) != Some(Ordering::Less) {
+                    break;
+                }
+                if cycle >= MAX_POINTS {
+                    return Err(format!("{name}: PULSE would create too many breakpoints"));
+                }
                 for corner in [0.0, rise, rise + width, rise + width + fall] {
-                    let local = cycle * period + corner;
+                    let local = offset + corner;
                     if stop.is_none_or(|stop| local <= stop) {
                         out.push(delay + local);
                     }
                 }
-                cycle += 1.0;
+                cycle += 1;
             }
         }
         SourceWaveform::Function(function) => {
