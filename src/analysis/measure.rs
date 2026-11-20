@@ -562,7 +562,7 @@ fn evaluate(plot: &Plot, axis: &Axis, card: &MeasureCard) -> SpiceResult<Measure
             statistic,
             operand,
             window,
-        } => evaluate_statistic(plot, axis, card, statistic, operand, window),
+        } => evaluate_statistic(plot, axis, card, *statistic, operand, window),
         MeasureRequest::TrigTarg { trig, targ, window } => {
             let window = Window::resolve(window, axis, card)?;
             let trig = event_at(plot, axis, trig, &window, card)?;
@@ -591,7 +591,7 @@ fn evaluate_statistic(
     plot: &Plot,
     axis: &Axis,
     card: &MeasureCard,
-    statistic: &MeasureStatistic,
+    statistic: MeasureStatistic,
     operand: &VectorRequest,
     window: &MeasureWindow,
 ) -> SpiceResult<Measurement> {
@@ -603,14 +603,14 @@ fn evaluate_statistic(
                 axis,
                 &operand,
                 &window,
-                *statistic == MeasureStatistic::PhaseMargin,
+                statistic == MeasureStatistic::PhaseMargin,
                 card,
             )?;
             (value, Some(at), None)
         }
         MeasureStatistic::MinAt | MeasureStatistic::MaxAt => {
             let extrema = extrema(axis, &operand, &window, card)?;
-            let (_, at) = if *statistic == MeasureStatistic::MaxAt {
+            let (_, at) = if statistic == MeasureStatistic::MaxAt {
                 extrema.max
             } else {
                 extrema.min
@@ -623,7 +623,7 @@ fn evaluate_statistic(
         }
         MeasureStatistic::Min | MeasureStatistic::Max => {
             let extrema = extrema(axis, &operand, &window, card)?;
-            let (value, at) = if *statistic == MeasureStatistic::Max {
+            let (value, at) = if statistic == MeasureStatistic::Max {
                 extrema.max
             } else {
                 extrema.min
@@ -640,13 +640,13 @@ fn evaluate_statistic(
             // failure rather than a division by zero.
             let width = span_width(span, card)?;
             let points = window.clipped(axis, &operand, card)?;
-            let squared = *statistic == MeasureStatistic::Rms;
-            let area = if *statistic == MeasureStatistic::Avg {
+            let squared = statistic == MeasureStatistic::Rms;
+            let area = if statistic == MeasureStatistic::Avg {
                 trapezoid_integral(points, card)?
             } else {
                 simpson_integral(points, squared, card)?
             };
-            let mean = if *statistic == MeasureStatistic::Integ {
+            let mean = if statistic == MeasureStatistic::Integ {
                 area
             } else {
                 area / width
@@ -665,7 +665,7 @@ fn evaluate_statistic(
     Ok(Measurement {
         name: card.name.clone(),
         value,
-        unit: statistic_unit(*statistic, &operand, axis),
+        unit: statistic_unit(statistic, &operand, axis),
         at,
         window: span,
         events: None,
