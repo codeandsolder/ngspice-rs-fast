@@ -108,14 +108,13 @@ impl Equilibration {
             ));
         }
         // Unknowns: row exponents 0..n, then column exponents n..2n.
-        let laplacian = |x: &[f64]| {
-            let mut y = vec![0.0; 2 * n];
+        let laplacian = |x: &[f64], y: &mut [f64]| {
+            y.fill(0.0);
             for &(r, c, _) in &logs {
                 let sum = x[r] + x[n + c];
                 y[r] += sum;
                 y[n + c] += sum;
             }
-            y
         };
         let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(a, b)| a * b).sum::<f64>();
         let mut rhs = vec![0.0; 2 * n];
@@ -124,8 +123,9 @@ impl Equilibration {
             rhs[n + c] -= l;
         }
         let mut x = vec![0.0; 2 * n];
-        let mut residual = rhs.clone();
+        let mut residual = rhs;
         let mut direction = residual.clone();
+        let mut image = vec![0.0; 2 * n];
         let mut norm = dot(&residual, &residual);
         // Rounding to integer exponents needs far less than this accuracy.
         let tolerance = 1e-12 * norm.max(1.0);
@@ -133,7 +133,7 @@ impl Equilibration {
             if norm <= tolerance {
                 break;
             }
-            let image = laplacian(&direction);
+            laplacian(&direction, &mut image);
             let curvature = dot(&direction, &image);
             if !(curvature.is_finite() && curvature > 0.0) {
                 break;
@@ -502,30 +502,26 @@ impl EquilibratedSparseLu {
     /// corrections end refinement and keep the best solution so far.
     pub fn solve_refined(&self, rhs: &Vector, steps: usize) -> SpiceResult<Vector> {
         let mut x = self.solve(rhs)?;
-        let mut error = self.componentwise_error(rhs, &x);
+        let mut residual = rhs.clone();
+        let mut scale = vec![0.0; rhs.len()];
+        let mut error = self.componentwise_error(rhs, &x, &mut residual, &mut scale);
         for _ in 0..steps {
             if error == 0.0 {
                 break;
             }
-            let mut residual = rhs.clone();
-            for &(r, c, v) in &self.original {
-                residual.as_mut_slice()[r] -= v.re * x.as_slice()[c];
-            }
+            // The error calculation leaves the physical residual in the
+            // workspace for the correction solve.
             if !residual.is_finite() {
                 break;
             }
-            let Ok(correction) = self.solve(&residual) else {
+            let Ok(mut candidate) = self.solve(&residual) else {
                 break;
             };
-            let mut candidate = x.clone();
-            for (value, delta) in candidate
-                .as_mut_slice()
-                .iter_mut()
-                .zip(correction.as_slice())
-            {
-                *value += delta;
+            for (delta, value) in candidate.as_mut_slice().iter_mut().zip(x.as_slice()) {
+                *delta = *value + *delta;
             }
-            let candidate_error = self.componentwise_error(rhs, &candidate);
+            let candidate_error =
+                self.componentwise_error(rhs, &candidate, &mut residual, &mut scale);
             let improves = candidate_error.partial_cmp(&error) == Some(std::cmp::Ordering::Less);
             if !improves || self.check_residual(rhs, &candidate).is_err() {
                 break;
@@ -536,10 +532,19 @@ impl EquilibratedSparseLu {
         Ok(x)
     }
 
-    fn componentwise_error(&self, rhs: &Vector, x: &Vector) -> f64 {
+    fn componentwise_error(
+        &self,
+        rhs: &Vector,
+        x: &Vector,
+        residual: &mut Vector,
+        scale: &mut [f64],
+    ) -> f64 {
         let b = rhs.as_slice();
-        let mut residual: Vec<f64> = b.to_vec();
-        let mut scale: Vec<f64> = b.iter().map(|v| v.abs()).collect();
+        let residual = residual.as_mut_slice();
+        residual.copy_from_slice(b);
+        for (s, v) in scale.iter_mut().zip(b) {
+            *s = v.abs();
+        }
         for &(r, c, v) in &self.original {
             let term = v.re * x.as_slice()[c];
             residual[r] -= term;
@@ -547,7 +552,7 @@ impl EquilibratedSparseLu {
         }
         residual
             .iter()
-            .zip(&scale)
+            .zip(scale.iter())
             .map(|(r, s)| match (r.abs(), *s) {
                 (0.0, _) => 0.0,
                 (r, s) if s > 0.0 => r / s,

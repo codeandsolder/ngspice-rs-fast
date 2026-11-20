@@ -377,18 +377,10 @@ impl StepHistory {
 /// `t_{n+1} - s_i`, `s_0 = 0`, `s_i = deltas[0] + ... + deltas[i - 1]`.
 ///
 /// `nicomcof.c` solves the Vandermonde system `sum_i ag_i (s_i/h)^j =
-/// -delta_{j1}/h`, `j = 0..=order`, in step-normalized form (its "SPICE2
-/// difference warning"). The solution is the derivative at `t_{n+1}` of the
-/// Lagrange basis polynomials, which this evaluates in closed form on the same
-/// normalized abscissae `sigma_i = s_i / h`, so no matrix (and no pivot-free
-/// elimination) is involved:
-///
-/// * `ag_0 = (1/h) sum_{j >= 1} 1/sigma_j`,
-/// * `ag_i = (1/h) prod_{j != 0, i} sigma_j / (-sigma_i prod_{j != 0, i} (sigma_j - sigma_i))`.
-///
-/// The two agree to rounding; the result is exact for polynomials of degree
-/// `order` (tested), which is what defines the C coefficients.
-// Kept index-for-index with nicomcof.c so the arithmetic matches it.
+/// -delta_{j1}/h`, `j = 0..=order`, in step-normalized form. The
+/// corrector follows the reference's unpivoted LU elimination and
+/// substitution, preserving operation order rather than evaluating the
+/// algebraically equivalent Lagrange derivative in closed form.
 fn gear_corrector(
     deltas: &[Real; HISTORY_LEN + 1],
     order: usize,
@@ -514,7 +506,8 @@ impl Coefficients {
     }
 
     /// C `CKTdeltaOld[index]`: index 0 is the trial step (`CKTdelta`), 1 the
-    /// last accepted step, and so on; `None` beyond the recorded history.
+    /// last accepted step, and so on. Unfilled older slots hold zero,
+    /// or the configured placeholder; `None` beyond the retained capacity.
     #[must_use]
     pub fn delta_old(&self, index: usize) -> Option<Real> {
         self.deltas.get(index).copied()

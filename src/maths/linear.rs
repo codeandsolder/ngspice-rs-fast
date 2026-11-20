@@ -294,6 +294,18 @@ impl FactoredInputs {
 }
 
 impl SparseSymbolic {
+    fn solve(&self, rhs: &Vector) -> SpiceResult<Vector> {
+        rhs_valid(rhs, self.n)?;
+        let x = Vector::from(self.sparse.solve(rhs.as_slice()));
+        if !x.is_finite() {
+            return Err(numerical(
+                "LU solve",
+                "non-finite solution (singular system)",
+            ));
+        }
+        Ok(x)
+    }
+
     /// Whether a matrix has exactly this assembled pattern.
     pub fn matches(&self, matrix: &SparseMatrix) -> bool {
         if matrix.rows() != self.n || matrix.cols() != self.n {
@@ -309,12 +321,11 @@ impl SparseSymbolic {
                 if !matrix.is_folded() {
                     folded.to_mut().fold_duplicates();
                 }
-                folded.triplets().len() == pattern.len()
-                    && folded
-                        .triplets()
-                        .iter()
-                        .zip(pattern.iter())
-                        .all(|(t, &(row, col))| t.row == row && t.col == col)
+                folded
+                    .triplets()
+                    .iter()
+                    .map(|t| (t.row, t.col))
+                    .eq(pattern.iter().copied())
             }
         }
     }
@@ -349,9 +360,11 @@ fn solve_reusing(
     rhs: &Vector,
     ordering: &mut Option<SparseSymbolic>,
 ) -> SpiceResult<Vector> {
-    let factor = match ordering.take() {
-        Some(previous) if previous.matches(matrix) => SparseLu::refactor(previous, matrix)?,
-        _ => SparseLu::new(matrix, None)?,
+    let previous = ordering.take();
+    let matrix = prepare_matrix(matrix)?;
+    let factor = match previous {
+        Some(previous) if previous.matches(&matrix) => SparseLu::refactor(previous, &matrix)?,
+        _ => SparseLu::factor_prepared(&matrix)?,
     };
     let x = factor.solve(rhs)?;
     *ordering = Some(factor.symbolic);
@@ -452,6 +465,33 @@ struct LoadedFrame {
 }
 
 impl LoadedFrame {
+    /// Recover an owned mutable frame, copying only if another factor
+    /// snapshot still owns the same SPARSE storage.
+    fn from_symbolic(previous: SparseSymbolic) -> Self {
+        Self {
+            sparse: Arc::unwrap_or_clone(previous.sparse),
+            key: previous.key,
+            handles: previous.handles,
+        }
+    }
+
+    /// Reload coefficients in handle order, keeping fill-ins and pivot order.
+    fn reload(&mut self, matrix: &SparseMatrix) {
+        self.sparse.clear();
+        if let Some((_, values)) = matrix.bound_values() {
+            debug_assert_eq!(self.handles.len(), values.len());
+            for (&handle, &value) in self.handles.iter().zip(values) {
+                self.sparse.set(handle, value);
+            }
+        } else {
+            let triplets = matrix.triplets();
+            debug_assert_eq!(self.handles.len(), triplets.len());
+            for (&handle, triplet) in self.handles.iter().zip(triplets) {
+                self.sparse.set(handle, triplet.value);
+            }
+        }
+    }
+
     fn into_symbolic(self, n: usize, factored: Option<Arc<FactoredInputs>>) -> SparseSymbolic {
         SparseSymbolic {
             n,
@@ -463,10 +503,9 @@ impl LoadedFrame {
     }
 }
 
-fn fresh_frame(matrix: &SparseMatrix) -> SpiceResult<LoadedFrame> {
+/// Build the initial frame from a validated, assembled matrix.
+fn fresh_frame(matrix: &SparseMatrix) -> LoadedFrame {
     if let Some((pattern, values)) = matrix.bound_values() {
-        square(matrix.rows(), matrix.cols())?;
-        finite_bound(values)?;
         let mut sparse = Sparse::new(pattern.order());
         let handles: Vec<_> = (0..pattern.len())
             .map(|index| {
@@ -477,13 +516,12 @@ fn fresh_frame(matrix: &SparseMatrix) -> SpiceResult<LoadedFrame> {
                 handle
             })
             .collect();
-        return Ok(LoadedFrame {
+        return LoadedFrame {
             sparse,
             key: Key::Pattern(Arc::downgrade(pattern)),
             handles: Arc::new(handles),
-        });
+        };
     }
-    let matrix = assembled(matrix)?;
     let n = matrix.rows();
     let pattern: Vec<_> = matrix.triplets().iter().map(|t| (t.row, t.col)).collect();
     let mut sparse = Sparse::new(n);
@@ -496,11 +534,11 @@ fn fresh_frame(matrix: &SparseMatrix) -> SpiceResult<LoadedFrame> {
             handle
         })
         .collect();
-    Ok(LoadedFrame {
+    LoadedFrame {
         sparse,
         key: Key::Triplets(Arc::new(pattern)),
         handles: Arc::new(handles),
-    })
+    }
 }
 
 /// One `NIiter` step on `matrix`: the factorization ngspice performs after a
@@ -541,7 +579,7 @@ fn ni_step(
     diag_gmin: f64,
 ) -> SpiceResult<NiStep> {
     let pivot = matrix.pivot_tolerances();
-    let previous = ordering.take().filter(|previous| previous.matches(matrix));
+    let previous = ordering.take();
     // spFactor of the very inputs the frame's factors came from, with the
     // same pivot order, recomputes them bit for bit: solve with them as they
     // are (a linear circuit's later Newton iterations and sweep points, a
@@ -549,36 +587,28 @@ fn ni_step(
     let reuse = !reorder
         && matrix.bound_values().is_some_and(|(_, values)| {
             previous.as_ref().is_some_and(|previous| {
-                previous
-                    .factored
-                    .as_ref()
-                    .is_some_and(|inputs| inputs.matches(values, diag_gmin, pivot))
+                previous.matches(matrix)
+                    && previous
+                        .factored
+                        .as_ref()
+                        .is_some_and(|inputs| inputs.matches(values, diag_gmin, pivot))
             })
         });
     if reuse && let Some(previous) = previous {
-        let lu = SparseLu { symbolic: previous };
-        let result = lu.solve(rhs).map(NiStep::Solved);
-        *ordering = Some(lu.symbolic);
+        let result = previous.solve(rhs).map(NiStep::Solved);
+        *ordering = Some(previous);
         return result;
     }
+    // The bit-identical fast path above needs no additional coefficient
+    // scan. All remaining paths validate and assemble exactly once.
+    let matrix = prepare_matrix(matrix)?;
+    let previous = previous.filter(|previous| previous.matches(&matrix));
     let (mut frame, fresh) = if let Some(previous) = previous {
-        let mut sparse =
-            Arc::try_unwrap(previous.sparse).unwrap_or_else(|shared| (*shared).clone());
-        let values = matrix_values(matrix)?;
-        sparse.clear();
-        for (handle, value) in previous.handles.iter().zip(values.iter()) {
-            sparse.set(*handle, *value);
-        }
-        (
-            LoadedFrame {
-                sparse,
-                key: previous.key,
-                handles: previous.handles,
-            },
-            false,
-        )
+        let mut frame = LoadedFrame::from_symbolic(previous);
+        frame.reload(&matrix);
+        (frame, false)
     } else {
-        let mut frame = fresh_frame(matrix)?;
+        let mut frame = fresh_frame(&matrix);
         if !frame.sparse.fully_translated() {
             // A circuit's matrix (bound, or carrying unknown names)
             // follows C: an unknown without entries stays untranslated
@@ -623,10 +653,7 @@ fn ni_step(
         if zero_pivot {
             return Ok(NiStep::ZeroPivot);
         }
-        let lu = SparseLu {
-            symbolic: factored.clone(),
-        };
-        lu.solve(rhs).map(NiStep::Solved)
+        factored.solve(rhs).map(NiStep::Solved)
     });
     *ordering = Some(factored);
     result
@@ -648,12 +675,7 @@ pub fn solve_last_factors(pattern: &Arc<Pattern>, rhs: &Vector) -> SpiceResult<O
             if matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern)))
                 && symbolic.sparse.is_factored() =>
         {
-            Some(
-                SparseLu {
-                    symbolic: symbolic.clone(),
-                }
-                .solve(rhs),
-            )
+            Some(symbolic.solve(rhs))
         }
         _ => None,
     };
@@ -693,20 +715,14 @@ fn finite_bound(values: &[f64]) -> SpiceResult<()> {
     Ok(())
 }
 
-/// Share the bound-value and folded-triplet extraction path between sparse
-/// refactorizations, borrowing an existing matrix view where possible.
-fn matrix_values(matrix: &SparseMatrix) -> SpiceResult<Cow<'_, [f64]>> {
+/// Prepare once for symbolic matching, fresh ordering and numeric refactoring.
+fn prepare_matrix(matrix: &SparseMatrix) -> SpiceResult<Cow<'_, SparseMatrix>> {
     if let Some((_, values)) = matrix.bound_values() {
+        square(matrix.rows(), matrix.cols())?;
         finite_bound(values)?;
-        Ok(Cow::Borrowed(values))
+        Ok(Cow::Borrowed(matrix))
     } else {
-        Ok(Cow::Owned(
-            assembled(matrix)?
-                .triplets()
-                .iter()
-                .map(|t| t.value)
-                .collect(),
-        ))
+        assembled(matrix)
     }
 }
 
@@ -717,16 +733,21 @@ impl SparseLu {
     /// # Errors
     /// Invalid dimensions, coefficients, changed pattern, or a singular matrix.
     pub fn new(matrix: &SparseMatrix, reuse: Option<&SparseSymbolic>) -> SpiceResult<Self> {
+        let matrix = prepare_matrix(matrix)?;
         if let Some(previous) = reuse {
-            if !previous.matches(matrix) {
+            if !previous.matches(&matrix) {
                 return Err(numerical(
                     "sparse symbolic LU",
                     "assembled CSC pattern changed",
                 ));
             }
-            return Self::refactor(previous.clone(), matrix);
+            return Self::refactor(previous.clone(), &matrix);
         }
-        let mut frame = fresh_frame(matrix)?;
+        Self::factor_prepared(&matrix)
+    }
+
+    fn factor_prepared(matrix: &SparseMatrix) -> SpiceResult<Self> {
+        let mut frame = fresh_frame(matrix);
         order_fresh(
             "sparse LU",
             &mut frame.sparse,
@@ -742,37 +763,19 @@ impl SparseLu {
     /// `SMPluFac` with `previous`'s pivots on a matching matrix, reordering
     /// after a zero pivot as `NIiter` does after `E_SINGULAR`.
     fn refactor(previous: SparseSymbolic, matrix: &SparseMatrix) -> SpiceResult<Self> {
-        let SparseSymbolic {
-            n,
-            key,
-            handles,
-            sparse,
-            factored: _,
-        } = previous;
-        let mut sparse = Arc::try_unwrap(sparse).unwrap_or_else(|shared| (*shared).clone());
-        let values = matrix_values(matrix)?;
-        let load = |sparse: &mut Sparse<f64>| {
-            sparse.clear();
-            for (handle, value) in handles.iter().zip(values.iter()) {
-                sparse.set(*handle, *value);
-            }
-        };
-        load(&mut sparse);
-        let mut status = sparse.factor();
+        let mut frame = LoadedFrame::from_symbolic(previous);
+        frame.reload(matrix);
+        let mut status = frame.sparse.factor();
         if status == Status::ZeroDiag {
-            load(&mut sparse);
+            frame.reload(matrix);
             let pivot = matrix.pivot_tolerances();
-            status = sparse.order_and_factor(pivot.relative, pivot.absolute);
+            status = frame
+                .sparse
+                .order_and_factor(pivot.relative, pivot.absolute);
         }
-        check_status("sparse LU", status, &sparse, matrix.unknown_names())?;
+        check_status("sparse LU", status, &frame.sparse, matrix.unknown_names())?;
         Ok(Self {
-            symbolic: SparseSymbolic {
-                n,
-                key,
-                handles,
-                sparse: Arc::new(sparse),
-                factored: None,
-            },
+            symbolic: frame.into_symbolic(matrix.rows(), None),
         })
     }
 
@@ -787,15 +790,7 @@ impl SparseLu {
     /// # Errors
     /// Invalid RHS or non-finite solution.
     pub fn solve(&self, rhs: &Vector) -> SpiceResult<Vector> {
-        rhs_valid(rhs, self.symbolic.n)?;
-        let x = Vector::from(self.symbolic.sparse.solve(rhs.as_slice()));
-        if !x.is_finite() {
-            return Err(numerical(
-                "LU solve",
-                "non-finite solution (singular system)",
-            ));
-        }
-        Ok(x)
+        self.symbolic.solve(rhs)
     }
 
     /// `spDeterminant`: `(mantissa, decimal exponent)`.
@@ -851,6 +846,41 @@ impl DenseLu {
 mod tests {
     use super::*;
     use crate::maths::complex::ComplexMatrix;
+
+    #[test]
+    fn unfolded_symbolic_reuse_shares_handles_and_keeps_snapshots() {
+        let mut a = SparseMatrix::new(2, 2);
+        a.add(1, 1, 3.).unwrap();
+        a.add(0, 0, 2.).unwrap();
+        a.add(0, 1, 1.).unwrap();
+        let rhs = Vector::from_slice(&[6., 6.]);
+        let original = SparseLu::new(&a, None).unwrap();
+        a.add(0, 0, 2.).unwrap();
+        a.add(1, 0, 9.).unwrap();
+        a.add(1, 0, -9.).unwrap();
+        let reused = SparseLu::new(&a, Some(original.symbolic())).unwrap();
+        assert!(Arc::ptr_eq(
+            &original.symbolic.handles,
+            &reused.symbolic.handles
+        ));
+        assert_eq!(original.solve(&rhs).unwrap().as_slice(), &[2., 2.]);
+        assert_eq!(reused.solve(&rhs).unwrap().as_slice(), &[1., 2.]);
+
+        let mut ordering = Some(original.symbolic().clone());
+        assert_eq!(
+            solve_with_ordering(&a, &rhs, &mut ordering)
+                .unwrap()
+                .as_slice(),
+            &[1., 2.]
+        );
+        let NiStep::Solved(x) = solve_ni(&a, &rhs, &mut ordering, false, 0.).unwrap() else {
+            panic!("unexpected zero pivot");
+        };
+        assert_eq!(x.as_slice(), &[1., 2.]);
+        a.add(0, 0, f64::MAX).unwrap();
+        a.add(0, 0, f64::MAX).unwrap();
+        assert!(solve_ni(&a, &rhs, &mut ordering, false, 0.).is_err());
+    }
 
     #[test]
     fn complex_frame_retains_order_but_not_real_factors() {

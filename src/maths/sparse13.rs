@@ -194,6 +194,8 @@ pub(super) struct Sparse<T> {
     markowitz_row: Vec<i64>,
     markowitz_col: Vec<i64>,
     markowitz_prod: Vec<i64>,
+    /// Numeric column workspace for repeated `spFactor` calls.
+    factor_workspace: Vec<T>,
     singletons: i64,
     rel_threshold: f64,
     abs_threshold: f64,
@@ -231,6 +233,7 @@ impl<T: Scalar> Sparse<T> {
             markowitz_row: Vec::new(),
             markowitz_col: Vec::new(),
             markowitz_prod: Vec::new(),
+            factor_workspace: Vec::new(),
             singletons: 0,
             rel_threshold: DEFAULT_THRESHOLD,
             abs_threshold: 0.0,
@@ -464,6 +467,7 @@ impl<T: Scalar> Sparse<T> {
             markowitz_row: self.markowitz_row.clone(),
             markowitz_col: self.markowitz_col.clone(),
             markowitz_prod: self.markowitz_prod.clone(),
+            factor_workspace: Vec::new(),
             singletons: self.singletons,
             rel_threshold: self.rel_threshold,
             abs_threshold: self.abs_threshold,
@@ -775,7 +779,9 @@ impl<T: Scalar> Sparse<T> {
             return self.zero_pivot(1);
         }
         self.elements[first].value = self.elements[first].value.recip();
-        let mut dest = vec![T::ZERO; size + 1];
+        self.factor_workspace.resize(size + 1, T::ZERO);
+        self.factor_workspace.fill(T::ZERO);
+        let dest = &mut self.factor_workspace;
         for step in 2..=size {
             let mut e = self.first_in_col[step];
             while e != NONE {
@@ -1738,6 +1744,35 @@ mod tests {
         assert!((4.0 * x[0] + x[1] - 5.0).abs() < 1e-14);
         m.clear();
         assert_eq!(m.factor(), Status::ZeroDiag);
+    }
+
+    #[test]
+    fn refactor_workspace_survives_success_and_singularity() {
+        let entries = [(1, 1, 3.), (1, 2, 1.), (2, 1, 1.), (2, 2, 4.)];
+        let mut m = build(2, &entries);
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        let handles: Vec<_> = entries
+            .iter()
+            .map(|&(r, c, _)| m.get_element(r, c))
+            .collect();
+        let load = |m: &mut Sparse<f64>, values: &[f64]| {
+            m.clear();
+            for (&h, &v) in handles.iter().zip(values) {
+                m.set(h, v);
+            }
+        };
+        load(&mut m, &[3., 1., 1., 4.]);
+        assert_eq!(m.factor(), Status::Okay);
+        let initial = m.solve(&[4., 5.]);
+        let address = m.factor_workspace.as_ptr();
+        let capacity = m.factor_workspace.capacity();
+        load(&mut m, &[1., 1., 1., 1.]);
+        assert_eq!(m.factor(), Status::ZeroDiag);
+        load(&mut m, &[3., 1., 1., 4.]);
+        assert_eq!(m.factor(), Status::Okay);
+        assert_eq!(m.factor_workspace.as_ptr(), address);
+        assert_eq!(m.factor_workspace.capacity(), capacity);
+        assert_eq!(m.solve(&[4., 5.]), initial);
     }
 
     /// External row 2 has no element: as with ngspice's `Translate`, the
