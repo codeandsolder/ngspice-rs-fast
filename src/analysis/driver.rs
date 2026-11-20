@@ -41,6 +41,22 @@ pub struct NodeCondition {
     pub location: SourceLoc,
 }
 
+/// Noise representation and model compatibility settings for spectral analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NoiseOptions {
+    /// Front-end `set sqrnoise`: report power densities and integrated powers.
+    pub squared: bool,
+    /// SPICE3-compatible MOS1 flicker law (`newcompat.s3`).
+    pub spice3: bool,
+}
+
+impl NoiseOptions {
+    const DEFAULT: Self = Self {
+        squared: false,
+        spice3: false,
+    };
+}
+
 /// A request to run an analysis.
 ///
 /// Arguments are kept as written. Their grammar differs per analysis — `.tran 1u
@@ -65,10 +81,8 @@ pub struct AnalysisRequest {
     /// DC operating points. They cannot change the unique solution of a linear
     /// circuit; under transient `uic` C reuses them as initial node voltages.
     pub nodesets: Vec<NodeCondition>,
-    /// Front-end `set sqrnoise`: report power densities and integrated powers.
-    pub squared_noise: bool,
-    /// SPICE3-compatible MOS1 flicker law (`newcompat.s3`).
-    pub spice3_noise: bool,
+    /// Noise-specific representation and compatibility settings.
+    pub noise: NoiseOptions,
     /// Retain the small-signal operating-point plot before spectral output.
     pub keep_op_info: bool,
 }
@@ -83,8 +97,7 @@ impl AnalysisRequest {
             uic: false,
             initial_conditions: Vec::new(),
             nodesets: Vec::new(),
-            squared_noise: false,
-            spice3_noise: false,
+            noise: NoiseOptions::DEFAULT,
             keep_op_info: false,
         }
     }
@@ -96,14 +109,8 @@ impl AnalysisRequest {
         arguments: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         Self {
-            kind,
             arguments: arguments.into_iter().map(Into::into).collect(),
-            uic: false,
-            initial_conditions: Vec::new(),
-            nodesets: Vec::new(),
-            squared_noise: false,
-            spice3_noise: false,
-            keep_op_info: false,
+            ..Self::new(kind)
         }
     }
 
@@ -142,14 +149,9 @@ impl From<&AnalysisCard> for AnalysisRequest {
             }
         }
         Self {
-            kind: card.kind,
             arguments,
             uic: card.uic,
-            initial_conditions: Vec::new(),
-            nodesets: Vec::new(),
-            squared_noise: false,
-            spice3_noise: false,
-            keep_op_info: false,
+            ..Self::new(card.kind)
         }
     }
 }
