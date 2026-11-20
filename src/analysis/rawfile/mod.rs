@@ -397,8 +397,14 @@ impl RawFileWriter {
     /// # Errors
     ///
     /// [`SpiceError::Io`] when the spool cannot be read back or the rawfile
-    /// cannot be written.
+    /// cannot be written; [`SpiceError::Unsupported`] when the spool encoding
+    /// differs from this writer's encoding.
     pub fn finish_plot(&mut self, mut plot: StreamedPlot) -> SpiceResult<()> {
+        if plot.format != self.format {
+            return Err(unsupported(
+                "streamed plot encoding differs from rawfile writer",
+            ));
+        }
         let spool_error = |error: io::Error| SpiceError::io(&plot.path, &error);
         let Some(spool) = plot.spool.take() else {
             return Ok(());
@@ -575,30 +581,24 @@ fn render_header(out: &mut impl Write, raw_plot: &RawPlot, point_count: usize) -
     Ok(())
 }
 
-/// A line cursor over rawfile text.
+/// A constant-size line cursor over rawfile text, with one-line lookahead.
 struct Cursor<'a> {
-    lines: Vec<&'a str>,
-    index: usize,
+    lines: std::iter::Peekable<std::str::Lines<'a>>,
 }
 
 impl<'a> Cursor<'a> {
     fn new(text: &'a str) -> Self {
         Self {
-            lines: text.lines().collect(),
-            index: 0,
+            lines: text.lines().peekable(),
         }
     }
 
-    fn peek(&self) -> Option<&'a str> {
-        self.lines.get(self.index).copied()
+    fn peek(&mut self) -> Option<&'a str> {
+        self.lines.peek().copied()
     }
 
     fn next(&mut self) -> Option<&'a str> {
-        let line = self.peek();
-        if line.is_some() {
-            self.index += 1;
-        }
-        line
+        self.lines.next()
     }
 }
 
@@ -729,8 +729,8 @@ fn parse_header(cursor: &mut Cursor<'_>) -> SpiceResult<Option<(Header, Section)
                 "truncated rawfile: variable {index} of {variable_count} is missing"
             )));
         };
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let (Some(declared), Some(name)) = (fields.first(), fields.get(1)) else {
+        let mut fields = line.split_whitespace();
+        let (Some(declared), Some(name)) = (fields.next(), fields.next()) else {
             return Err(unsupported(format!(
                 "rawfile variable line with fewer than two fields: '{line}'"
             )));
@@ -745,7 +745,7 @@ fn parse_header(cursor: &mut Cursor<'_>) -> SpiceResult<Option<(Header, Section)
                 "rawfile variable index {declared} out of order, expected {index}"
             )));
         }
-        variables.push(Variable::new(*name, fields.get(2).copied().unwrap_or("")));
+        variables.push(Variable::new(name, fields.next().unwrap_or("")));
     }
 
     let Some(line) = cursor.next() else {
@@ -800,55 +800,50 @@ fn parse_plot(cursor: &mut Cursor<'_>) -> SpiceResult<Option<RawPlot>> {
     } = header;
     let variable_count = variables.len();
 
-    let mut points: Vec<Vec<Complex>> = Vec::with_capacity(point_count);
-    let mut row: Vec<Complex> = Vec::with_capacity(variable_count);
-    // `raw_write()` writes the `re,0.0` short form only for vectors it has
-    // flagged real, so the spelling in the file recovers the flag. In a real
-    // plot every vector is real; in a complex plot a vector is real unless one
-    // of its values used the full `re,im` spelling.
-    let mut column_is_real: Vec<bool> = vec![true; variable_count];
-
-    for flat_index in 0..point_count * variable_count {
-        // `raw_write()` emits a blank line after every point.
-        while cursor.peek().is_some_and(|line| line.trim().is_empty()) {
-            cursor.next();
-        }
-        let Some(line) = cursor.next() else {
-            return Err(unsupported(format!(
-                "truncated rawfile: expected {point_count} point(s) of {variable_count} value(s)"
-            )));
-        };
-        let expected_point = flat_index / variable_count.max(1);
-        let column = flat_index % variable_count.max(1);
-        let (declared_point, value_text) = split_index_and_value(line);
-        if column == 0 {
-            if let Some(declared_point) = declared_point
-                && declared_point != expected_point
-            {
-                return Err(unsupported(format!(
-                    "rawfile point index {declared_point} out of order, expected {expected_point}"
-                )));
-            }
-            if !row.is_empty() {
-                points.push(std::mem::take(&mut row));
-            }
-        }
-        let parsed = parse_value(value_text)?;
-        // A real plot carries no commas at all, so the flag is only meaningful
-        // for a complex plot.
-        if flags.is_complex()
-            && !parsed.real_short_form
-            && let Some(is_real) = column_is_real.get_mut(column)
-        {
-            *is_real = false;
-        }
-        row.push(parsed.value);
+    if point_count.checked_mul(variable_count).is_none() {
+        return Err(unsupported(format!(
+            "ASCII rawfile declares No. Variables: {variable_count} and No. Points: {point_count}, whose value count overflows a usize"
+        )));
     }
-    if !row.is_empty() {
-        points.push(row);
+    // Header counts are claims, not trusted allocation sizes. Grow the point
+    // list only after decoding each complete row; a truncated file with a
+    // huge count must not reserve memory in proportion to the claim.
+    let mut points = Vec::new();
+    // The real short form recovers the column flag, as for raw_write().
+    let mut column_is_real = vec![true; variable_count];
+    if variable_count != 0 {
+        for expected_point in 0..point_count {
+            let mut row = Vec::with_capacity(variable_count);
+            for (column, is_real) in column_is_real.iter_mut().enumerate() {
+                // raw_write emits a blank line after every point.
+                while cursor.peek().is_some_and(|line| line.trim().is_empty()) {
+                    cursor.next();
+                }
+                let Some(line) = cursor.next() else {
+                    return Err(unsupported(format!(
+                        "truncated rawfile: expected {point_count} point(s) of {variable_count} value(s)"
+                    )));
+                };
+                let (declared_point, value_text) = split_index_and_value(line);
+                if column == 0
+                    && let Some(declared_point) = declared_point
+                    && declared_point != expected_point
+                {
+                    return Err(unsupported(format!(
+                        "rawfile point index {declared_point} out of order, expected {expected_point}"
+                    )));
+                }
+                let parsed = parse_value(value_text)?;
+                if flags.is_complex() && !parsed.real_short_form {
+                    *is_real = false;
+                }
+                row.push(parsed.value);
+            }
+            points.push(row);
+        }
     }
-    for (index, variable) in variables.iter_mut().enumerate() {
-        variable.is_real = column_is_real.get(index).copied().unwrap_or(true);
+    for (variable, is_real) in variables.iter_mut().zip(column_is_real) {
+        variable.is_real = is_real;
     }
 
     let mut plot = Plot::new(plotname.clone(), plotname, flags);
@@ -1058,6 +1053,49 @@ Values:
         let mut text = OP_RAWFILE.to_owned();
         text.truncate(text.len() - 30);
         assert!(RawFile::parse(&text).is_err());
+    }
+
+    #[test]
+    fn declared_ascii_counts_do_not_drive_allocations() {
+        let overflow = OP_RAWFILE.replace("No. Points: 1", &format!("No. Points: {}", usize::MAX));
+        assert!(
+            RawFile::parse(&overflow)
+                .unwrap_err()
+                .to_string()
+                .contains("overflows a usize")
+        );
+        // This multiplication fits, but reserving a row for every declared
+        // point would overflow an allocation before reading the actual data.
+        let count = usize::MAX / 3;
+        let truncated = OP_RAWFILE.replace("No. Points: 1", &format!("No. Points: {count}"));
+        assert!(
+            RawFile::parse(&truncated)
+                .unwrap_err()
+                .to_string()
+                .contains("truncated rawfile")
+        );
+    }
+
+    #[test]
+    fn finishing_a_spool_with_the_wrong_encoding_is_rejected_and_cleans_up() {
+        use std::fs;
+        let dir =
+            std::env::temp_dir().join(format!("spice-rs-spool-encoding-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let source = dir.join("source.raw");
+        let dest = dir.join("dest.raw");
+        let spool = dir.join("spool");
+        let header = RawFile::parse(OP_RAWFILE).unwrap().plots.remove(0);
+        let origin = super::RawFileWriter::create(&source, super::RawFormat::Binary).unwrap();
+        let stream = origin.begin_plot(header, &spool).unwrap();
+        let mut writer = super::RawFileWriter::create(&dest, super::RawFormat::Ascii).unwrap();
+        let error = writer.finish_plot(stream).unwrap_err();
+        assert!(error.to_string().contains("encoding differs"));
+        writer.finish().unwrap();
+        origin.finish().unwrap();
+        assert!(!spool.exists());
+        assert_eq!(fs::metadata(&dest).unwrap().len(), 0);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
