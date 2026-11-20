@@ -515,3 +515,123 @@ fn new_m7_fixtures_parse_write_parse_with_a_fixed_point() {
         assert_eq!(text, ngspice_rs::netlist::write_netlist(&round).unwrap());
     }
 }
+
+#[test]
+fn meyer_predictor_preserves_history_and_initial_transient_omits_gate_companions() {
+    use ngspice_rs::devices::IterationPhase;
+
+    let c = circuit(
+        "m1 d g s b mm w=10u l=2u\n\
+         .model mm nmos(vto=0.8 kp=50u tox=20n phi=0.7)",
+    );
+    let n = c.unknown_count();
+    let context = ModelContext::default();
+    let mut history = c.state_history();
+    let point = |vg, vd, vb| {
+        let mut x = Vector::zeros(n);
+        for (terminal, value) in [("g", vg), ("d", vd), ("s", 0.), ("b", vb)] {
+            x.as_mut_slice()[row(&c, terminal)] = value;
+        }
+        x
+    };
+    let mut steps = StepHistory::new();
+    for (vg, vd, vb, dt) in [(0.2, 0.3, -0.1, 0.7e-9), (2.1, 0.5, -0.2, 1.1e-9)] {
+        let x = point(vg, vd, vb);
+        let mut a = SparseMatrix::new(n, n);
+        let mut b = Vector::zeros(n);
+        let mut trial = history.trial();
+        c.load_device(
+            0,
+            c.devices()[0].as_ref(),
+            &LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &x,
+                model_context: &context,
+                integration: None,
+                history: &history,
+                forcing: None,
+            },
+            &mut a,
+            &mut b,
+            &mut trial,
+        )
+        .unwrap();
+        history.commit(trial).unwrap();
+        let coefficients = steps
+            .trial(IntegrationMethod::Trapezoidal, 1, dt, DEFAULT_XMU)
+            .unwrap();
+        steps.accept(&coefficients);
+    }
+    let past = [
+        history.accepted(1).unwrap().to_vec(),
+        history.accepted(2).unwrap().to_vec(),
+    ];
+    let x = point(1.7, 0.9, -0.3);
+    let dt = 0.9e-9;
+    for method in [
+        IntegrationMethod::Trapezoidal,
+        IntegrationMethod::Gear { order: 2 },
+    ] {
+        let coefficients = steps.trial(method, 2, dt, DEFAULT_XMU).unwrap();
+        let ratio = coefficients.predictor_ratio();
+        for initial in [true, false] {
+            let mut a = SparseMatrix::new(n, n);
+            let mut b = Vector::zeros(n);
+            let mut trial = history
+                .trial_in(IterationPhase::Predict, None)
+                .unwrap()
+                .with_device_limiting(false)
+                .with_initial_transient(initial);
+            c.load_device(
+                0,
+                c.devices()[0].as_ref(),
+                &LoadRequest {
+                    mode: AnalysisMode::Transient { time: dt, dt },
+                    solution: &x,
+                    model_context: &context,
+                    integration: Some(&coefficients),
+                    history: &history,
+                    forcing: None,
+                },
+                &mut a,
+                &mut b,
+                &mut trial,
+            )
+            .unwrap();
+            let state = mos_states(&c, trial.values());
+            let mut conductance = [0.; 3];
+            for (k, slot) in [4, 6, 8].into_iter().enumerate() {
+                let q1 = past[0][slot];
+                let q2 = past[1][slot];
+                let q = (1. + ratio) * q1 - ratio * q2;
+                assert_eq!(state[slot].to_bits(), q.to_bits());
+                let cap = state[14 + k] + past[0][14 + k] + 0.;
+                let expected = coefficients
+                    .integrate(&[q, q1, q2], Some(past[0][slot + 1]), cap)
+                    .unwrap();
+                assert_eq!(
+                    state[slot + 1].to_bits(),
+                    if initial {
+                        0_f64.to_bits()
+                    } else {
+                        expected.derivative.to_bits()
+                    }
+                );
+                if !initial {
+                    conductance[k] = expected.conductance;
+                }
+            }
+            let g = row(&c, "g");
+            let diagonal = conductance[1] + conductance[0] + conductance[2];
+            if diagonal == 0. {
+                // SparseMatrix omits zero stamps; an empty f64 sum is -0.
+                assert_eq!(entry(&a, g, g), 0.);
+            } else {
+                assert_eq!(entry(&a, g, g).to_bits(), diagonal.to_bits());
+            }
+            // An uncommitted predictor does not change either accepted vector.
+            assert_eq!(history.accepted(1).unwrap(), past[0]);
+            assert_eq!(history.accepted(2).unwrap(), past[1]);
+        }
+    }
+}

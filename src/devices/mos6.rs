@@ -43,8 +43,8 @@
 //!   port refuses that combination rather than silently dropping RSH. An
 //!   explicit zero NRD/NRS with RSH is refused as for level 1.
 //! - In forward body bias with `sarg` clamped to zero C stamps a body
-//!   transconductance without the `GAMMA1` term; the port uses the exact
-//!   derivative (the converged point is the same).
+//!   transconductance without the `GAMMA1` term. Reference loads retain
+//!   that Jacobian; exact-Jacobian loads retain the mathematical derivative.
 //! - NVTH and PS are settable in C but unused by `mos6load.c`; they are
 //!   accepted and, as in C, have no effect. C warns and continues for
 //!   `L - 2 LD <= 0` or a nonpositive temperature-adjusted PHI/PB; here those
@@ -203,6 +203,78 @@ impl Level6 {
                 cox,
             )?,
         })
+    }
+}
+
+impl Level6 {
+    /// `mos6load.c`'s n-th power law block in the normalized device frame
+    /// (`vbs` is C's `vbsvbd`, `vds` its `vdshere`), with C's derivatives.
+    fn channel(
+        &self,
+        op: &Operating<Params>,
+        vgs: Real,
+        vds: Real,
+        vbs: Real,
+        reference_jacobian: bool,
+    ) -> DrainCurrent {
+        let pol = self.common.pol;
+        let p = &op.params;
+        let gamma = op.gamma;
+        let root = op.phi.sqrt();
+        let sarg = if vbs <= 0. {
+            (op.phi - vbs).sqrt()
+        } else {
+            (root - vbs / (root + root)).max(0.)
+        };
+        let von = op.vbi * pol + gamma * sarg - p.gamma1 * vbs - p.sigma * vds;
+        let vgon = vgs - von;
+        if vgon <= 0. {
+            return DrainCurrent {
+                cdrain: 0.,
+                gm: 0.,
+                gds: 0.,
+                gmbs: 0.,
+                von,
+                vdsat: 0.,
+            };
+        }
+        // C leaves vonbm at its initial zero on the clamped branch.
+        // Exact differentiation retains GAMMA1, since von still uses it.
+        let vonbm = if sarg <= 0. {
+            if reference_jacobian { 0. } else { p.gamma1 }
+        } else if vbs <= 0. {
+            p.gamma1 + gamma / (sarg + sarg)
+        } else {
+            p.gamma1 + gamma / 2. / root
+        };
+        let log = vgon.ln();
+        let vdsat = p.kv * (log * p.nv).exp();
+        let idsat = p.betac * (log * p.nc).exp();
+        let lambda = p.lambda0 - p.lambda1 * vbs;
+        // Saturation.
+        let mut current = idsat * (1. + lambda * vds);
+        let mut gm = current * p.nc / vgon;
+        let mut gds = gm * p.sigma + idsat * lambda;
+        let mut gmbs = gm * vonbm - idsat * p.lambda1 * vds;
+        if vdsat > vds {
+            // Linear region.
+            let vdst = vds / vdsat;
+            let vdst2 = (2. - vdst) * vdst;
+            let vdstg = -vdst * p.nv / vgon;
+            let ivdst1 = current * (2. - vdst - vdst);
+            current *= vdst2;
+            gm = gm * vdst2 + ivdst1 * vdstg;
+            gds = gds * vdst2 + ivdst1 * (1. / vdsat + vdstg * p.sigma);
+            gmbs = gmbs * vdst2 + ivdst1 * vdstg * vonbm;
+        }
+        DrainCurrent {
+            cdrain: current,
+            gm,
+            gds,
+            gmbs,
+            von,
+            vdsat,
+        }
     }
 }
 
@@ -404,8 +476,6 @@ impl MosLevel for Level6 {
         Ok(operating)
     }
 
-    /// `mos6load.c`'s n-th power law block in the normalized device frame
-    /// (`vbs` is C's `vbsvbd`, `vds` its `vdshere`), with C's derivatives.
     fn drain_current(
         &self,
         op: &Operating<Params>,
@@ -413,64 +483,17 @@ impl MosLevel for Level6 {
         vds: Real,
         vbs: Real,
     ) -> DrainCurrent {
-        let pol = self.common.pol;
-        let p = &op.params;
-        let gamma = op.gamma;
-        let root = op.phi.sqrt();
-        let sarg = if vbs <= 0. {
-            (op.phi - vbs).sqrt()
-        } else {
-            (root - vbs / (root + root)).max(0.)
-        };
-        let von = op.vbi * pol + gamma * sarg - p.gamma1 * vbs - p.sigma * vds;
-        let vgon = vgs - von;
-        if vgon <= 0. {
-            return DrainCurrent {
-                cdrain: 0.,
-                gm: 0.,
-                gds: 0.,
-                gmbs: 0.,
-                von,
-                vdsat: 0.,
-            };
-        }
-        // `-d von / d vbs`. C drops the GAMMA1 term when `sarg` is clamped
-        // to zero; this is the exact derivative.
-        let vonbm = if sarg <= 0. {
-            p.gamma1
-        } else if vbs <= 0. {
-            p.gamma1 + gamma / (sarg + sarg)
-        } else {
-            p.gamma1 + gamma / 2. / root
-        };
-        let log = vgon.ln();
-        let vdsat = p.kv * (log * p.nv).exp();
-        let idsat = p.betac * (log * p.nc).exp();
-        let lambda = p.lambda0 - p.lambda1 * vbs;
-        // Saturation.
-        let mut current = idsat * (1. + lambda * vds);
-        let mut gm = current * p.nc / vgon;
-        let mut gds = gm * p.sigma + idsat * lambda;
-        let mut gmbs = gm * vonbm - idsat * p.lambda1 * vds;
-        if vdsat > vds {
-            // Linear region.
-            let vdst = vds / vdsat;
-            let vdst2 = (2. - vdst) * vdst;
-            let vdstg = -vdst * p.nv / vgon;
-            let ivdst1 = current * (2. - vdst - vdst);
-            current *= vdst2;
-            gm = gm * vdst2 + ivdst1 * vdstg;
-            gds = gds * vdst2 + ivdst1 * (1. / vdsat + vdstg * p.sigma);
-            gmbs = gmbs * vdst2 + ivdst1 * vdstg * vonbm;
-        }
-        DrainCurrent {
-            cdrain: current,
-            gm,
-            gds,
-            gmbs,
-            von,
-            vdsat,
-        }
+        self.channel(op, vgs, vds, vbs, false)
+    }
+
+    fn reference_drain_current(
+        &self,
+        op: &Operating<Params>,
+        vgs: Real,
+        vds: Real,
+        vbs: Real,
+    ) -> DrainCurrent {
+        self.channel(op, vgs, vds, vbs, true)
     }
 
     /// `mos6init.c` registers neither `DEVacLoad` nor `DEVpzLoad`: C's level

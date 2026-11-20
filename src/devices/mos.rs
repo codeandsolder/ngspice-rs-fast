@@ -79,6 +79,7 @@
 )]
 
 pub(super) mod bulk;
+mod charge;
 pub(super) mod sens;
 pub(super) mod surface;
 
@@ -90,7 +91,6 @@ use crate::devices::limiting;
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
-use crate::devices::nonlinear::charge::ChargeBranch;
 use crate::devices::nonlinear::cubic_reverse_junction;
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
@@ -116,7 +116,7 @@ const MEYER_MIN_VDSAT: Real = 0.025;
 
 /// Slots of the state vector: C's `MOS1numStates` layout (reordered so that
 /// every charge is directly followed by its derivative, as
-/// [`junction_companion`] expects), followed by the instance quantities C
+/// the charge-branch integrator expects), followed by the instance quantities C
 /// keeps in `MOS1instance` between loads. All values are device-frame
 /// (multiplied by the type), as in C.
 pub(super) mod slot {
@@ -720,6 +720,18 @@ pub(super) trait MosLevel: std::fmt::Debug + Clone + Copy + Sized + 'static {
         vbx: Real,
     ) -> DrainCurrent;
 
+    /// The channel Jacobian C actually stamps, where it deliberately differs
+    /// from the mathematical derivative. Most levels have one formulation.
+    fn reference_drain_current(
+        &self,
+        op: &Operating<Self::Params>,
+        vgx: Real,
+        vdsm: Real,
+        vbx: Real,
+    ) -> DrainCurrent {
+        self.drain_current(op, vgx, vdsm, vbx)
+    }
+
     /// The `mosXnoi.c` beta, width, length and oxide capacitance factors, or
     /// `None` when C's level has no noise routine (level 6, see
     /// [`MosLevel::NOISE_FAMILY`]).
@@ -1043,11 +1055,12 @@ impl<L: MosLevel> Mosfet<L> {
     /// `[vbs, vgs, vds]`: junction currents with `gmin`, the level's
     /// channel, the depletion charges and `DEVqmeyer`, before any charge
     /// integration. Every expression keeps C's operation order.
-    pub(super) fn evaluate(
+    fn evaluate(
         &self,
         op: &Operating<L::Params>,
         [vbs, vgs, vds]: [Real; 3],
         gmin: Real,
+        reference_jacobian: bool,
     ) -> SpiceResult<Eval> {
         let vt = op.vt;
         let vbd = vbs - vds;
@@ -1057,6 +1070,9 @@ impl<L: MosLevel> Mosfet<L> {
         let (cbd, gbd) = op.drain.current(vbd, vt, gmin);
         let mode: Real = if vds >= 0. { 1. } else { -1. };
         let normal = mode == 1.;
+        let vgx = if normal { vgs } else { vgd };
+        let vdsm = vds * mode;
+        let vbx = if normal { vbs } else { vbd };
         let DrainCurrent {
             cdrain,
             gm,
@@ -1064,12 +1080,11 @@ impl<L: MosLevel> Mosfet<L> {
             gmbs,
             von,
             vdsat,
-        } = self.model.drain_current(
-            op,
-            if normal { vgs } else { vgd },
-            vds * mode,
-            if normal { vbs } else { vbd },
-        );
+        } = if reference_jacobian {
+            self.model.reference_drain_current(op, vgx, vdsm, vbx)
+        } else {
+            self.model.drain_current(op, vgx, vdsm, vbx)
+        };
         let (qbs, capbs) = op.source.charge(vbs, false);
         let (qbd, capbd) = op.drain.charge(vbd, true);
         let half = if normal {
@@ -1289,7 +1304,7 @@ impl<L: MosLevel> Mosfet<L> {
         // DEVfetlim/DEVpnjlim/DEVlimvds leave an unchanged voltage alone
         // whatever `von` is.
         let (limited, _) = self.limit(op, raw, [vbs, vbs - vds, vgs, vds], 0.);
-        self.evaluate(op, limited, gmin)
+        self.evaluate(op, limited, gmin, false)
     }
 }
 
@@ -1537,10 +1552,6 @@ impl<L: MosLevel> Device for Mosfet<L> {
     }
     /// `MOS1load` (`mos1load.c`; `mos3load.c` for level 3), without bypass,
     /// which ngspice disables by default, and without `.sens` perturbation.
-    #[expect(
-        clippy::needless_range_loop,
-        reason = "index-based traversal preserves coupling of reference state vector positions"
-    )] // C's three gate charges, side by side.
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         if context.mode.is_ac() {
             return Err(SpiceError::circuit(format!(
@@ -1563,35 +1574,11 @@ impl<L: MosLevel> Device for Mosfet<L> {
             context.node_voltage(n)
         });
         let integration = context.integration;
-        let transient = integration.is_some();
-        let phase = context.states.phase();
         // C `xfact = CKTdelta / CKTdeltaOld[1]`; one in a `.dc` sweep.
         let xfact = integration.map_or(1., crate::maths::integrator::Coefficients::predictor_ratio);
         let (v, start, check) = self.select(op, &context.states, raw, ic, xfact);
-        let mut e = self.evaluate(op, v, context.gmin)?;
-        let states = &mut context.states;
-
-        // Bulk junction charges (C computes them in MODETRAN, MODETRANOP and
-        // MODEINITSMSIG; computing them in every load changes no stamp) and
-        // their NIintegrate companions folded into gbd/cbd/cd and gbs/cbs.
-        let drain = ChargeBranch::new(slot::QBD, e.qbd, e.capbd);
-        let source = ChargeBranch::new(slot::QBS, e.qbs, e.capbs);
-        drain.store(states)?;
-        source.store(states)?;
-        let mut ag0 = 0.;
-        if let Some(coefficients) = &integration {
-            ag0 = coefficients.ag()[0];
-            let companion = drain.integrate(&mut context.states, coefficients)?;
-            e.gbd += companion.conductance;
-            e.cbd += companion.derivative;
-            e.cd -= companion.derivative;
-            let companion = source.integrate(&mut context.states, coefficients)?;
-            e.gbs += companion.conductance;
-            e.cbs += companion.derivative;
-        } else {
-            drain.zero_derivative(&mut context.states)?;
-            source.zero_derivative(&mut context.states)?;
-        }
+        let mut e = self.evaluate(op, v, context.gmin, context.states.c_jacobian())?;
+        charge::integrate_bulk(&mut e, &mut context.states, integration)?;
         let states = &mut context.states;
         // C: `if (off == 0 || !(MODEINITFIX | MODEINITSMSIG)) if (Check)
         // CKTnoncon++`; loads outside a limited solve never report.
@@ -1615,79 +1602,10 @@ impl<L: MosLevel> Device for Mosfet<L> {
             states.set(slot, value)?;
         }
 
-        // Meyer gate capacitances and charges.
-        let initial_transient =
-            transient && phase == IterationPhase::Predict && states.initial_transient();
-        let s1 = |states: &DeviceState<'_>, slot: usize| {
-            states.accepted(1, slot).ok_or_else(|| {
-                SpiceError::circuit(format!(
-                    "{}: missing accepted {} state",
-                    self.name,
-                    L::LABEL
-                ))
-            })
-        };
-        let gate = [e.vgs, e.vgd, e.vgb];
-        let mut cap = [0.; 3];
-        let mut charge = [0.; 3];
-        for k in 0..3 {
-            states.set(slot::CAPG[k], e.half[k])?;
-            cap[k] = if transient {
-                e.half[k] + s1(states, slot::CAPG[k])? + op.overlap[k]
-            } else {
-                2. * e.half[k] + op.overlap[k]
-            };
-        }
-        if transient && phase == IterationPhase::Predict {
-            for k in 0..3 {
-                charge[k] = states.predicted(slot::QG[k], xfact).ok_or_else(|| {
-                    SpiceError::circuit(format!(
-                        "{}: missing accepted {} charge",
-                        self.name,
-                        L::LABEL
-                    ))
-                })?;
-            }
-        } else if transient {
-            let vgs1 = s1(states, slot::VGS)?;
-            let gate1 = [
-                vgs1,
-                vgs1 - s1(states, slot::VDS)?,
-                vgs1 - s1(states, slot::VBS)?,
-            ];
-            for k in 0..3 {
-                charge[k] = (gate[k] - gate1[k]) * cap[k] + s1(states, slot::QG[k])?;
-            }
-        } else {
-            for k in 0..3 {
-                charge[k] = gate[k] * cap[k];
-            }
-        }
-        for k in 0..3 {
-            states.set(slot::QG[k], charge[k])?;
-        }
-        let mut gcg = [0.; 3];
-        let mut ceqg = [0.; 3];
-        match &integration {
-            Some(coefficients) if !initial_transient => {
-                for k in 0..3 {
-                    let companion = ChargeBranch::new(slot::QG[k], charge[k], cap[k])
-                        .integrate(&mut context.states, coefficients)?;
-                    gcg[k] = companion.conductance;
-                    ceqg[k] = companion.derivative - ag0 * charge[k];
-                }
-                for k in 0..3 {
-                    ceqg[k] = ceqg[k] - gcg[k] * gate[k] + ag0 * charge[k];
-                }
-            }
-            _ => {
-                for k in 0..3 {
-                    context.states.set(slot::QG[k] + 1, 0.)?;
-                }
-            }
-        }
-        let [gcgs, gcgd, gcgb] = gcg;
-        let [ceqgs, ceqgd, ceqgb] = ceqg;
+        let charge::GateCompanions {
+            conductance: [gcgs, gcgd, gcgb],
+            equivalent: [ceqgs, ceqgd, ceqgb],
+        } = charge::integrate_gates(&e, op.overlap, states, integration, &self.name, L::LABEL)?;
 
         // What MOS1convTest and the small-signal loads read (C `here`).
         for (slot, value) in [

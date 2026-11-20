@@ -569,3 +569,81 @@ fn multiplicity_scales_completed_stamps_not_intrinsic_state() {
         }
     }
 }
+
+#[test]
+fn reference_jacobian_omits_gamma1_only_on_the_clamped_body_branch() {
+    for (family, pol) in [("nmos", 1.), ("pmos", -1.)] {
+        let c = circuit(&format!(
+            "m1 d g s b mm w=10u l=2u\n\
+             .model mm {family}(level=6 vto={} kc=37u gamma=0.5 phi=0.2 gamma1=0.13\n\
+             + kv=1.6 nv=0.8 nc=1.3 sigma=0.02 lambda0=0.037 lambda1=0 is=1e-50)",
+            pol * 0.7
+        ));
+        let n = c.unknown_count();
+        let context = ModelContext::default();
+        let history = c.state_history();
+        for vd in [0.3_f64, 3.0, -0.3, -3.0] {
+            for vb in [-0.2, 0.1, 0.65] {
+                let mut x = Vector::zeros(n);
+                let source = vd.min(0_f64);
+                for (terminal, voltage) in [
+                    ("d", vd),
+                    ("s", 0.),
+                    ("g", 2.0 + source),
+                    ("b", vb + source),
+                ] {
+                    x.as_mut_slice()[row(&c, terminal)] = pol * voltage;
+                }
+                let load = |reference| {
+                    let mut a = SparseMatrix::new(n, n);
+                    let mut b = Vector::zeros(n);
+                    let mut trial = history.trial().with_c_jacobian(reference);
+                    c.load_device(
+                        0,
+                        c.devices()[0].as_ref(),
+                        &LoadRequest {
+                            mode: AnalysisMode::OperatingPoint,
+                            solution: &x,
+                            model_context: &context,
+                            integration: None,
+                            history: &history,
+                            forcing: None,
+                        },
+                        &mut a,
+                        &mut b,
+                        &mut trial,
+                    )
+                    .unwrap();
+                    let state = trial.values();
+                    // Shared MOS state: channel current, GM, GDS, GMBS.
+                    (a, b, [state[20], state[23], state[24], state[25]])
+                };
+                let (exact, exact_rhs, e) = load(false);
+                let (reference, reference_rhs, r) = load(true);
+                assert_eq!(e[..3], r[..3]);
+                if vb > 0.4 {
+                    assert_eq!(r[3], 0.);
+                    assert!(e[3] > 0.);
+                    let drain = row(&c, if vd > 0. { "d" } else { "s" });
+                    let bulk = row(&c, "b");
+                    close(
+                        entry(&exact, drain, bulk) - entry(&reference, drain, bulk),
+                        e[3],
+                        1e-12,
+                        1e-16,
+                    );
+                } else {
+                    assert_eq!(e, r);
+                }
+                // Matrix selection must not alter the load's fixed point.
+                for (a, b) in residual(&exact, &exact_rhs, &x).into_iter().zip(residual(
+                    &reference,
+                    &reference_rhs,
+                    &x,
+                )) {
+                    close(a, b, 1e-12, 1e-15);
+                }
+            }
+        }
+    }
+}
