@@ -330,3 +330,17 @@ fn programmatic_urc_terminal_spelling_does_not_change_setup_numbering() {
         );
     }
 }
+
+#[test]
+fn generated_urc_terminal_collision_is_case_insensitive_for_future_cards() {
+    let mut parsed = parse("u1 in out 0 m l=1m n=2\nr1 u1#hi1 0 1k\n.model m urc").unwrap();
+    parsed.devices[1].nodes[0] = "U1#HI1".into();
+    let models = ngspice_rs::devices::ModelResolver::new(&parsed.models).unwrap();
+    let mut circuit = Circuit::new();
+    let error = circuit
+        .add_instances(&parsed.devices, &models, &ModelContext::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("collision"), "{error}");
+    assert_eq!(circuit.device_count(), 0);
+    assert_eq!(circuit.nodes().len(), 1);
+}

@@ -326,7 +326,7 @@ pub(crate) fn expand(
     nodes: &mut NodeTable,
     models: &ModelResolver<'_>,
     context: &ModelContext,
-    deck_nodes: &BTreeSet<&str>,
+    deck_nodes: &BTreeSet<String>,
 ) -> SpiceResult<Vec<Box<dyn Device>>> {
     context.validate(&instance.location)?;
     if instance.nodes.len() != 3 {
@@ -444,7 +444,7 @@ fn build(
     model_location: &SourceLoc,
     nodes: &mut NodeTable,
     context: &ModelContext,
-    deck_nodes: &BTreeSet<&str>,
+    deck_nodes: &BTreeSet<String>,
 ) -> SpiceResult<Vec<Box<dyn Device>>> {
     let name = &instance.name;
     crate::devices::factory::append_nodes(nodes, |nodes| {
@@ -456,7 +456,9 @@ fn build(
             let node = format!("{name}#{suffix}");
             // C's CKTmkVolt fails (E_EXISTS) on a name the deck already uses,
             // whichever card comes first.
-            if staged.get(&node).is_some() || deck_nodes.contains(node.as_str()) {
+            if staged.get(&node).is_some()
+                || deck_nodes.contains(&NodeTable::canonical_name(&node, staged.auto_gnd()))
+            {
                 return Err(SpiceError::circuit(format!(
                     "URC internal-node name collision: {node}"
                 )));

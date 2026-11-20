@@ -110,7 +110,7 @@ pub(crate) fn fallback(
     instance: &DeviceInstance,
     nodes: &mut NodeTable,
     models: &ModelResolver<'_>,
-    deck_nodes: &BTreeSet<&str>,
+    deck_nodes: &BTreeSet<String>,
 ) -> SpiceResult<Option<Vec<Box<dyn Device>>>> {
     let resolved = models
         .resolve(instance)?
@@ -124,7 +124,9 @@ pub(crate) fn fallback(
         let mut line = [terminals[0], NodeId::GROUND, NodeId::GROUND, terminals[2]];
         for (k, node) in line.iter_mut().enumerate().take(3).skip(1) {
             let name = format!("txlnd{k}{}", instance.name);
-            if nodes.get(&name).is_some() || deck_nodes.contains(name.as_str()) {
+            if nodes.get(&name).is_some()
+                || deck_nodes.contains(&NodeTable::canonical_name(&name, nodes.auto_gnd()))
+            {
                 return Err(SpiceError::circuit(format!(
                     "TXL generated-node collision: {name}"
                 )));

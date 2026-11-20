@@ -70,6 +70,23 @@ impl DeviceNames {
     }
 }
 
+/// Elaborated provenance of a device, kept as one record rather than three
+/// independently extended lists. Its ordinal indexes the device slice.
+#[derive(Default)]
+struct DeviceOrigin {
+    /// The parsed model name (lowercase), or C's default model.
+    model: Option<String>,
+    /// Nodes this device creates in its DEVsetup, in creation order.
+    internal_nodes: Vec<NodeId>,
+    /// The URC setup which generated this device and its model.
+    generated_by: Option<usize>,
+}
+
+struct PendingDevice {
+    device: Box<dyn Device>,
+    origin: DeviceOrigin,
+}
+
 /// A circuit under construction, or ready to be simulated.
 #[derive(Default)]
 pub struct Circuit {
@@ -77,15 +94,7 @@ pub struct Circuit {
     nodes: NodeTable,
     unknowns: MnaUnknowns,
     devices: Vec<Box<dyn Device>>,
-    /// Per device, the model name it was parsed with (lowercase), or `None`
-    /// for its type's default model: C's model list membership.
-    models: Vec<Option<String>>,
-    /// Per device, the internal nodes its factory created, in creation order:
-    /// the nodes C's `DEVsetup` makes with `CKTmkVolt`.
-    internal_nodes: Vec<Vec<NodeId>>,
-    /// Per device, the ordinal of the URC line whose `URCsetup` created it
-    /// (and its model), or `None` for a parsed device.
-    generated_by: Vec<Option<usize>>,
+    origins: Vec<DeviceOrigin>,
     /// Device ordinals in C's `CKTsetup`/`CKTload` order
     /// ([`crate::devices::setup`]), computed by `finalize`.
     order: Vec<usize>,
@@ -424,7 +433,11 @@ impl Circuit {
         self.unknown_names.get_mut().take();
         self.fixed_stamps.get_mut().forget();
         let mut owned = vec![false; self.nodes.len()];
-        for node in self.internal_nodes.iter().flatten() {
+        for node in self
+            .origins
+            .iter()
+            .flat_map(|origin| &origin.internal_nodes)
+        {
             if let Some(slot) = owned.get_mut(node.index()) {
                 *slot = true;
             }
@@ -467,7 +480,7 @@ impl Circuit {
                     make(&mut self.unknowns, target);
                 }
             }
-            for &node in &self.internal_nodes[index] {
+            for &node in &self.origins[index].internal_nodes {
                 self.unknowns.assign_deferred(node);
             }
             make(&mut self.unknowns, index);
@@ -839,8 +852,8 @@ impl Circuit {
             .enumerate()
             .map(|(index, device)| crate::devices::setup::SetupKey {
                 device_type: device.c_device_type(),
-                model: self.models.get(index).and_then(Option::as_deref),
-                generated_by: self.generated_by.get(index).copied().flatten(),
+                model: self.origins[index].model.as_deref(),
+                generated_by: self.origins[index].generated_by,
             })
             .collect();
         crate::devices::setup::setup_order(&keys)
@@ -954,7 +967,8 @@ impl Circuit {
         for index in self.setup_order() {
             if self.declare_elements(index, setups, &mut elements)? {
                 private.extend(
-                    self.internal_nodes[index]
+                    self.origins[index]
+                        .internal_nodes
                         .iter()
                         .filter_map(|&node| self.unknowns.node_row(node)),
                 );
@@ -1157,9 +1171,10 @@ impl Circuit {
             })
             .collect();
         self.devices.push(device);
-        self.models.push(None);
-        self.internal_nodes.push(internal);
-        self.generated_by.push(None);
+        self.origins.push(DeviceOrigin {
+            internal_nodes: internal,
+            ..DeviceOrigin::default()
+        });
         Ok(())
     }
 
@@ -2404,13 +2419,11 @@ impl Circuit {
 
     /// Elaborate several AST instances atomically, in order.
     ///
-    /// Every device is built against one staged copy of the node table, and the
-    /// nodes and devices are committed together only once the whole batch has
-    /// succeeded. A failure at any point — a duplicate name, an unavailable
-    /// factory, an invalid parameter — therefore leaves the caller's node table,
-    /// devices and branch rows untouched, which is what subcircuit expansion
-    /// (#18) needs when it hands over a flattened deck. As with
-    /// [`Circuit::add_instance`], finalize after successful additions.
+    /// Builtin factories extend the node table under an append-only
+    /// transaction. Devices and their origins are staged as pairs; the new
+    /// node suffix and all devices are published only if the entire batch
+    /// succeeds. A failed batch does not change existing nodes, devices or
+    /// numbering. Finalize after adding instances.
     ///
     /// # Errors
     /// [`SpiceError::Circuit`] on a duplicate instance name (against the
@@ -2422,23 +2435,44 @@ impl Circuit {
         models: &crate::devices::models::ModelResolver<'_>,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<()> {
-        let mut seen: BTreeSet<String> = self
+        let seen: BTreeSet<String> = self
             .devices
             .iter()
             .map(|device| device.name().to_lowercase())
             .collect();
-        let mut nodes = self.nodes.clone();
-        let mut staged: Vec<Box<dyn Device>> = Vec::with_capacity(instances.len());
-        let mut internal: Vec<Vec<NodeId>> = Vec::with_capacity(instances.len());
-        let mut model_names: Vec<Option<String>> = Vec::with_capacity(instances.len());
-        let mut generated_by: Vec<Option<usize>> = Vec::with_capacity(instances.len());
-        // Node names written on the batch's cards, which URC-generated
-        // internal nodes must not reuse (crate::devices::urc::expand).
-        let deck_nodes: BTreeSet<&str> = instances
-            .iter()
-            .flat_map(|instance| instance.nodes.iter().map(String::as_str))
-            .collect();
         let base = self.devices.len();
+        let staged = crate::devices::factory::append_nodes(&mut self.nodes, |nodes| {
+            Self::elaborate_batch(instances, models, context, nodes, base, seen)
+        })?;
+        self.devices.reserve(staged.len());
+        self.origins.reserve(staged.len());
+        for pending in staged {
+            self.devices.push(pending.device);
+            self.origins.push(pending.origin);
+        }
+        self.fixed_stamps.get_mut().forget();
+        Ok(())
+    }
+
+    /// Build each device and its provenance in deck order. All node mutations
+    /// are append-only, as required by the surrounding transaction.
+    fn elaborate_batch(
+        instances: &[crate::netlist::ast::DeviceInstance],
+        models: &crate::devices::models::ModelResolver<'_>,
+        context: &ModelContext,
+        nodes: &mut NodeTable,
+        base: usize,
+        mut seen: BTreeSet<String>,
+    ) -> SpiceResult<Vec<PendingDevice>> {
+        let mark = nodes.len();
+        let mut staged = Vec::with_capacity(instances.len());
+        // C parses every external node before DEVsetup creates private nodes:
+        // canonicalize future names as well as those already interned.
+        let deck_nodes: BTreeSet<String> = instances
+            .iter()
+            .flat_map(|instance| &instance.nodes)
+            .map(|name| NodeTable::canonical_name(name, nodes.auto_gnd()))
+            .collect();
         for instance in instances {
             if !seen.insert(instance.name.to_lowercase()) {
                 return Err(SpiceError::circuit(format!(
@@ -2449,7 +2483,7 @@ impl Circuit {
             let first = nodes.len();
             if instance.designator == 'y'
                 && let Some(expanded) =
-                    crate::devices::txl::fallback(instance, &mut nodes, models, &deck_nodes)?
+                    crate::devices::txl::fallback(instance, nodes, models, &deck_nodes)?
             {
                 for device in expanded {
                     if !seen.insert(device.name().to_ascii_lowercase()) {
@@ -2458,23 +2492,16 @@ impl Circuit {
                             device.name()
                         )));
                     }
-                    staged.push(device);
-                    internal.push(Vec::new());
-                    model_names.push(None);
-                    generated_by.push(None);
+                    staged.push(PendingDevice {
+                        device,
+                        origin: DeviceOrigin::default(),
+                    });
                 }
                 continue;
             }
-            // A URC line is expanded into its generated R/C/D elements
-            // (urcsetup.c), which take its place under their own names.
             if instance.designator == 'u' {
-                let expanded = crate::devices::urc::expand(
-                    instance,
-                    &mut nodes,
-                    models,
-                    context,
-                    &deck_nodes,
-                )?;
+                let expanded =
+                    crate::devices::urc::expand(instance, nodes, models, context, &deck_nodes)?;
                 let parsed_terminals: BTreeSet<_> = instance
                     .nodes
                     .iter()
@@ -2483,7 +2510,6 @@ impl Circuit {
                 let line = base + staged.len();
                 let lower = instance.name.to_lowercase();
                 for device in expanded {
-                    // The URC instance itself keeps its (already checked) name.
                     let is_line = device.name().eq_ignore_ascii_case(&instance.name);
                     if !is_line && !seen.insert(device.name().to_lowercase()) {
                         return Err(SpiceError::circuit(format!(
@@ -2492,11 +2518,10 @@ impl Circuit {
                             instance.name
                         )));
                     }
-                    if is_line {
-                        // URCsetup's CKTmkVolt calls: the ladder nodes are
-                        // numbered at the URC line's own setup.
-                        internal.push(
-                            nodes.nodes()[first..]
+                    let origin = if is_line {
+                        // URCsetup's own ladder nodes: defer until the URC's setup.
+                        DeviceOrigin {
+                            internal_nodes: nodes.nodes()[first..]
                                 .iter()
                                 .filter(|node| {
                                     node.kind != NodeKind::Internal
@@ -2504,60 +2529,65 @@ impl Circuit {
                                 })
                                 .map(|node| node.id)
                                 .collect(),
-                        );
-                        model_names.push(instance.model.as_ref().map(|m| m.to_ascii_lowercase()));
-                        generated_by.push(None);
+                            model: instance.model.as_ref().map(|m| m.to_ascii_lowercase()),
+                            generated_by: None,
+                        }
                     } else {
-                        // A generated diode's own prime node (diosetup.c).
-                        internal.push(
-                            device
-                                .terminals()
-                                .iter()
-                                .copied()
-                                .filter(|id| {
-                                    id.index() >= first
-                                        && !parsed_terminals.contains(id)
-                                        && nodes
-                                            .node(*id)
-                                            .is_some_and(|node| node.kind == NodeKind::Internal)
-                                })
-                                .collect(),
-                        );
-                        // URCsetup's CKTmodCrt models `<name>#resmod`,
-                        // `#capmod` and `#diodemod`.
+                        // The generated diode's prime node belongs to diosetup.
+                        let internal_nodes = device
+                            .terminals()
+                            .iter()
+                            .copied()
+                            .filter(|id| {
+                                id.index() >= first
+                                    && !parsed_terminals.contains(id)
+                                    && nodes
+                                        .node(*id)
+                                        .is_some_and(|node| node.kind == NodeKind::Internal)
+                            })
+                            .collect();
                         let suffix = match device.c_device_type() {
                             crate::devices::setup::CDeviceType::Res => "resmod",
                             crate::devices::setup::CDeviceType::Cap => "capmod",
                             _ => "diodemod",
                         };
-                        model_names.push(Some(format!("{lower}#{suffix}")));
-                        generated_by.push(Some(line));
-                    }
-                    staged.push(device);
+                        DeviceOrigin {
+                            internal_nodes,
+                            model: Some(format!("{lower}#{suffix}")),
+                            generated_by: Some(line),
+                        }
+                    };
+                    staged.push(PendingDevice { device, origin });
                 }
                 continue;
             }
-            // Builtin factories bind terminals in this staged table. Nothing
-            // fallible remains after committing the containers together.
-            staged.push(crate::devices::factory::instantiate_with_models(
-                instance, &mut nodes, models, context,
-            )?);
-            internal.push(
-                nodes.nodes()[first..]
+            let device =
+                crate::devices::factory::instantiate_with_models(instance, nodes, models, context)?;
+            let origin = DeviceOrigin {
+                internal_nodes: nodes.nodes()[first..]
                     .iter()
                     .filter(|node| node.kind == NodeKind::Internal)
                     .map(|node| node.id)
                     .collect(),
-            );
-            model_names.push(instance.model.as_ref().map(|m| m.to_ascii_lowercase()));
-            generated_by.push(None);
+                model: instance.model.as_ref().map(|m| m.to_ascii_lowercase()),
+                generated_by: None,
+            };
+            staged.push(PendingDevice { device, origin });
         }
-        self.nodes = nodes;
-        self.devices.extend(staged);
-        self.internal_nodes.extend(internal);
-        self.models.extend(model_names);
-        self.generated_by.extend(generated_by);
-        Ok(())
+        // Factories already reject existing names. Check private nodes which
+        // were created before a later parsed card could introduce its name.
+        // This includes semiconductor and transmission-line setup, not just
+        // the explicit URC/TXL expansions.
+        if let Some(collision) = nodes.nodes()[mark..]
+            .iter()
+            .find(|node| node.kind == NodeKind::Internal && deck_nodes.contains(&node.name))
+        {
+            return Err(SpiceError::circuit(format!(
+                "internal-node name collision: {}",
+                collision.name
+            )));
+        }
+        Ok(staged)
     }
 
     /// Elaborate literal (or top-level `.param`/`{expr}`-literalized) R/C/L/V/I and

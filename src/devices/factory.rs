@@ -82,7 +82,10 @@ pub(super) fn from_card(card: &RawCard, nodes: &mut NodeTable) -> SpiceResult<Bo
 }
 
 /// Resolve and validate before any node interning. Bounded R/C/L and M4 D/Q/M
-/// factories reject all unsupported physics before committing staged nodes.
+/// factories reject unsupported physics before committing staged nodes.
+/// Every builtin must honor the append-only node contract: intern nodes and
+/// change only the kinds of newly created nodes. Circuit batch elaboration
+/// uses that contract to roll back an entire failed batch.
 pub(super) fn instantiate_with_models(
     instance: &DeviceInstance,
     nodes: &mut NodeTable,
