@@ -237,27 +237,7 @@ pub fn run_with_format(
             }
             circuit
         };
-        let observations = crate::analysis::observations::requests(
-            entry.kind,
-            &parsed.output,
-            &parsed.measurements,
-            &parsed.fourier,
-        );
-        circuit.set_observations(&observations)?;
-        if !circuit.observations().is_empty()
-            && !matches!(
-                entry.kind,
-                crate::primitives::AnalysisKind::OperatingPoint
-                    | crate::primitives::AnalysisKind::DcSweep
-                    | crate::primitives::AnalysisKind::Ac
-                    | crate::primitives::AnalysisKind::Transient
-            )
-        {
-            return Err(SpiceError::not_yet_ported(
-                "device observations for this analysis",
-                "src/frontend/outitf.c (OUTpData)",
-            ));
-        }
+        prepare_observations(&mut circuit, entry.kind, &parsed)?;
         let names: Vec<&str> = entry.plot_names().collect();
         // A `.tran` plot that only gets written streams its accepted points
         // into the rawfile as they are accepted, as C's batch output does, so
@@ -266,29 +246,15 @@ pub fn run_with_format(
             && names.len() == 1
             && !batch::needs_full_plot(entry, &parsed.output, &parsed.measurements, &parsed.fourier)
         {
-            let mut sink = RawfileSink {
+            let output = BatchOutput {
+                parsed: &parsed,
+                config: &config,
+                scope: &scope,
+                date: &date,
                 writer: &rawfile.writer,
                 spool: &rawfile.spool,
-                entry,
-                output: &parsed.output,
-                title: &netlist.title,
-                date: &date,
-                plot: None,
             };
-            driver.run_into(&mut circuit, &request, &config.context(), &mut sink)?;
-            let Some((_, streamed)) = sink.plot else {
-                return Err(SpiceError::Numerical {
-                    context: format!(".{} analysis", entry.kind.as_str()),
-                    message: "the driver produced no plot".to_owned(),
-                });
-            };
-            plots.push(PlotReport::written(
-                names[0],
-                entry.kind,
-                &streamed.header().plot,
-                streamed.point_count(),
-            ));
-            rawfile.writer.finish_plot(streamed)?;
+            plots.push(output.stream(entry, names[0], &mut circuit, &request, driver.as_ref())?);
             circuit.note_completed(entry.kind);
             previous_circuit = Some(circuit);
             continue;
@@ -304,6 +270,80 @@ pub fn run_with_format(
                 ),
             });
         }
+        BatchOutput {
+            parsed: &parsed,
+            config: &config,
+            scope: &scope,
+            date: &date,
+            writer: &rawfile.writer,
+            spool: &rawfile.spool,
+        }
+        .write(entry, &produced, names, &mut plots)?;
+        circuit.note_completed(entry.kind);
+        previous_circuit = Some(circuit);
+    }
+
+    rawfile.publish()?;
+    Ok(Report {
+        deck: netlist.path.clone(),
+        title: netlist.title.trim().to_owned(),
+        output: output.to_path_buf(),
+        format,
+        plots,
+    })
+}
+
+struct BatchOutput<'a> {
+    parsed: &'a ParsedDeck,
+    config: &'a RunConfig,
+    scope: &'a ParamScope,
+    date: &'a str,
+    writer: &'a RawFileWriter,
+    spool: &'a Path,
+}
+
+impl BatchOutput<'_> {
+    fn stream(
+        &self,
+        entry: &batch::ScheduledAnalysis,
+        name: &str,
+        circuit: &mut crate::devices::Circuit,
+        request: &crate::analysis::AnalysisRequest,
+        driver: &dyn crate::analysis::Analysis,
+    ) -> SpiceResult<PlotReport> {
+        let mut sink = RawfileSink {
+            writer: self.writer,
+            spool: self.spool,
+            entry,
+            output: &self.parsed.output,
+            title: &self.parsed.netlist.title,
+            date: self.date,
+            plot: None,
+        };
+        driver.run_into(circuit, request, &self.config.context(), &mut sink)?;
+        let Some((_, streamed)) = sink.plot else {
+            return Err(SpiceError::Numerical {
+                context: format!(".{} analysis", entry.kind.as_str()),
+                message: "the driver produced no plot".to_owned(),
+            });
+        };
+        let report = PlotReport::written(
+            name,
+            entry.kind,
+            &streamed.header().plot,
+            streamed.point_count(),
+        );
+        self.writer.finish_plot(streamed)?;
+        Ok(report)
+    }
+
+    fn write(
+        &self,
+        entry: &batch::ScheduledAnalysis,
+        produced: &[Plot],
+        names: Vec<&str>,
+        plots: &mut Vec<PlotReport>,
+    ) -> SpiceResult<()> {
         for (plot, name) in produced.iter().zip(names) {
             // The selection, the measurements and the Fourier cards are
             // resolved against the **full** plot and before anything is
@@ -312,23 +352,27 @@ pub fn run_with_format(
             let mut outputs = batch::resolve_outputs_with_scope(
                 plot,
                 entry,
-                &parsed.output,
-                &parsed.measurements,
-                if config.fourier_settings().is_some() {
+                &self.parsed.output,
+                &self.parsed.measurements,
+                if self.config.fourier_settings().is_some() {
                     &[]
                 } else {
-                    &parsed.fourier
+                    &self.parsed.fourier
                 },
-                &scope,
+                self.scope,
             )?;
             if entry.last_of_kind
                 && entry.kind == AnalysisKind::Transient
-                && let Some(settings) = config.fourier_settings()
+                && let Some(settings) = self.config.fourier_settings()
             {
-                outputs.fourier =
-                    fourier::resolve_with_settings(plot, entry.kind, &parsed.fourier, settings)?;
+                outputs.fourier = fourier::resolve_with_settings(
+                    plot,
+                    entry.kind,
+                    &self.parsed.fourier,
+                    settings,
+                )?;
             }
-            let raw_plot = raw_plot_for(&netlist.title, outputs.written, &date);
+            let raw_plot = raw_plot_for(&self.parsed.netlist.title, outputs.written, self.date);
             let mut report = PlotReport::written(
                 name,
                 entry.kind,
@@ -343,20 +387,39 @@ pub fn run_with_format(
                 (!outputs.fourier.is_empty()).then(|| fourier::to_text(&outputs.fourier));
             report.fourier_results = outputs.fourier;
             plots.push(report);
-            rawfile.writer.write_plot(&raw_plot)?;
+            self.writer.write_plot(&raw_plot)?;
         }
-        circuit.note_completed(entry.kind);
-        previous_circuit = Some(circuit);
+        Ok(())
     }
+}
 
-    rawfile.publish()?;
-    Ok(Report {
-        deck: netlist.path.clone(),
-        title: netlist.title.trim().to_owned(),
-        output: output.to_path_buf(),
-        format,
-        plots,
-    })
+fn prepare_observations(
+    circuit: &mut crate::devices::Circuit,
+    kind: AnalysisKind,
+    parsed: &ParsedDeck,
+) -> SpiceResult<()> {
+    let observations = crate::analysis::observations::requests(
+        kind,
+        &parsed.output,
+        &parsed.measurements,
+        &parsed.fourier,
+    );
+    circuit.set_observations(&observations)?;
+    if !circuit.observations().is_empty()
+        && !matches!(
+            kind,
+            crate::primitives::AnalysisKind::OperatingPoint
+                | crate::primitives::AnalysisKind::DcSweep
+                | crate::primitives::AnalysisKind::Ac
+                | crate::primitives::AnalysisKind::Transient
+        )
+    {
+        return Err(SpiceError::not_yet_ported(
+            "device observations for this analysis",
+            "src/frontend/outitf.c (OUTpData)",
+        ));
+    }
+    Ok(())
 }
 
 /// Prepare frontend requests and the top-level scope once. Expanding
@@ -387,7 +450,7 @@ fn prepare_deck(deck: &Path, auto_gnd: bool) -> SpiceResult<(ParsedDeck, Arc<Par
     Ok((parsed, scope))
 }
 
-/// C uses atoi on SPICE_ASCIIRAWFILE; preserve the existing signed prefix
+/// C uses `atoi` on `SPICE_ASCIIRAWFILE`; preserve the existing signed prefix
 /// and overflow policy without allocating a second string.
 fn raw_format_from_env(value: &str) -> RawFormat {
     let value = value.trim_start();

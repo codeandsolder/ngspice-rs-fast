@@ -31,7 +31,7 @@
 //! are not modelled: the reference binary runs without a compatibility mode.
 
 use crate::netlist::bexpr::{BBinaryOp, BExpr, BExprKind, BUnaryOp, STATISTICAL_FUNCTIONS};
-use crate::primitives::{Real, SpiceError, SpiceResult};
+use crate::primitives::{Real, SpiceError, SpiceResult, almost_equal_ulps};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -399,38 +399,7 @@ fn compile<'a>(expr: &'a BExpr, compiler: &mut Compiler<'a>) -> SpiceResult<Node
         BExprKind::Binary { op, lhs, rhs } => {
             let lhs = boxed(lhs, compiler)?;
             let rhs = boxed(rhs, compiler)?;
-            let difference = |lhs, rhs| Arc::new(Node::Operator(Operator::Minus, lhs, rhs));
-            match op {
-                BBinaryOp::Add => Node::Operator(Operator::Plus, lhs, rhs),
-                BBinaryOp::Sub => Node::Operator(Operator::Minus, lhs, rhs),
-                BBinaryOp::Mul => Node::Operator(Operator::Times, lhs, rhs),
-                BBinaryOp::Div => Node::Operator(Operator::Divide, lhs, rhs),
-                BBinaryOp::Pow => Node::Operator(Operator::Power, lhs, rhs),
-                BBinaryOp::Eq => Node::Unary(Unary::Eq0, difference(lhs, rhs)),
-                BBinaryOp::Ne => Node::Unary(Unary::Ne0, difference(lhs, rhs)),
-                BBinaryOp::Lt => Node::Unary(Unary::Lt0, difference(lhs, rhs)),
-                BBinaryOp::Gt => Node::Unary(Unary::Gt0, difference(lhs, rhs)),
-                BBinaryOp::Le => Node::Unary(Unary::Le0, difference(lhs, rhs)),
-                BBinaryOp::Ge => Node::Unary(Unary::Ge0, difference(lhs, rhs)),
-                // inpptree-parser.y: a && b is eq0(eq0(a) + eq0(b)), a || b is
-                // ne0(ne0(a) + ne0(b)).
-                BBinaryOp::And => Node::Unary(
-                    Unary::Eq0,
-                    Arc::new(Node::Operator(
-                        Operator::Plus,
-                        Arc::new(Node::Unary(Unary::Eq0, lhs)),
-                        Arc::new(Node::Unary(Unary::Eq0, rhs)),
-                    )),
-                ),
-                BBinaryOp::Or => Node::Unary(
-                    Unary::Ne0,
-                    Arc::new(Node::Operator(
-                        Operator::Plus,
-                        Arc::new(Node::Unary(Unary::Ne0, lhs)),
-                        Arc::new(Node::Unary(Unary::Ne0, rhs)),
-                    )),
-                ),
-            }
+            compile_binary(*op, lhs, rhs)
         }
         BExprKind::Ternary {
             condition,
@@ -462,6 +431,42 @@ fn compile<'a>(expr: &'a BExpr, compiler: &mut Compiler<'a>) -> SpiceResult<Node
             Node::Table(boxed(&table.input, compiler)?, Arc::new(map))
         }
     })
+}
+
+/// Lower a binary expression after compiling its operands in source order.
+fn compile_binary(op: BBinaryOp, lhs: Tree, rhs: Tree) -> Node {
+    let difference = |lhs, rhs| Arc::new(Node::Operator(Operator::Minus, lhs, rhs));
+    match op {
+        BBinaryOp::Add => Node::Operator(Operator::Plus, lhs, rhs),
+        BBinaryOp::Sub => Node::Operator(Operator::Minus, lhs, rhs),
+        BBinaryOp::Mul => Node::Operator(Operator::Times, lhs, rhs),
+        BBinaryOp::Div => Node::Operator(Operator::Divide, lhs, rhs),
+        BBinaryOp::Pow => Node::Operator(Operator::Power, lhs, rhs),
+        BBinaryOp::Eq => Node::Unary(Unary::Eq0, difference(lhs, rhs)),
+        BBinaryOp::Ne => Node::Unary(Unary::Ne0, difference(lhs, rhs)),
+        BBinaryOp::Lt => Node::Unary(Unary::Lt0, difference(lhs, rhs)),
+        BBinaryOp::Gt => Node::Unary(Unary::Gt0, difference(lhs, rhs)),
+        BBinaryOp::Le => Node::Unary(Unary::Le0, difference(lhs, rhs)),
+        BBinaryOp::Ge => Node::Unary(Unary::Ge0, difference(lhs, rhs)),
+        // inpptree-parser.y: a && b is eq0(eq0(a) + eq0(b)), a || b is
+        // ne0(ne0(a) + ne0(b)).
+        BBinaryOp::And => Node::Unary(
+            Unary::Eq0,
+            Arc::new(Node::Operator(
+                Operator::Plus,
+                Arc::new(Node::Unary(Unary::Eq0, lhs)),
+                Arc::new(Node::Unary(Unary::Eq0, rhs)),
+            )),
+        ),
+        BBinaryOp::Or => Node::Unary(
+            Unary::Ne0,
+            Arc::new(Node::Operator(
+                Operator::Plus,
+                Arc::new(Node::Unary(Unary::Ne0, lhs)),
+                Arc::new(Node::Unary(Unary::Ne0, rhs)),
+            )),
+        ),
+    }
 }
 
 /// A literal number, possibly parenthesised and/or signed once
@@ -678,20 +683,6 @@ impl PwlTable {
     }
 }
 
-/// Dawson's ULP comparison (`AlmostEqualUlps`, `src/maths/misc/equality.c`).
-fn almost_equal_ulps(a: Real, b: Real, max_ulps: i64) -> bool {
-    if a == b {
-        return true;
-    }
-    let ordered = |value: Real| {
-        let bits = i64::from_ne_bytes(value.to_bits().to_ne_bytes());
-        if bits < 0 { i64::MIN - bits } else { bits }
-    };
-    ordered(a)
-        .checked_sub(ordered(b))
-        .is_some_and(|difference| difference.abs() <= max_ulps)
-}
-
 /// `PTpowerH` without a compatibility mode (the `^` operator).
 fn power_h(a: Real, b: Real) -> Real {
     if a >= 0. {
@@ -729,7 +720,8 @@ fn modulus(x: Real, limit: Real) -> Real {
         reason = "C MODULUS explicitly converts the quotient to a saturating i32 on this reference platform"
     )]
     let whole = (x / limit) as i32;
-    x - Real::from(whole) * limit
+    let multiple = Real::from(whole) * limit;
+    x - multiple
 }
 
 const TWO_PI: Real = 2. * std::f64::consts::PI;
@@ -915,10 +907,10 @@ fn mk_operator(op: Operator, left: Tree, right: Tree) -> Tree {
 /// `mkb(PT_TERN, condition, mkb(PT_COMMA, then, otherwise))`.
 fn mk_ternary(condition: Tree, then: Tree, otherwise: Tree) -> Tree {
     if let Some(condition) = condition.constant() {
-        return if condition != 0. { then } else { otherwise };
+        return if condition == 0. { otherwise } else { then };
     }
     if let (Some(a), Some(b)) = (then.constant(), otherwise.constant())
-        && a == b
+        && a.partial_cmp(&b) == Some(std::cmp::Ordering::Equal)
     {
         return then;
     }
@@ -1240,10 +1232,10 @@ impl Evaluator<'_> {
                 value
             }
             Node::Ternary(condition, then, otherwise) => {
-                if self.eval(condition)? != 0. {
-                    self.eval(then)?
-                } else {
+                if self.eval(condition)? == 0. {
                     self.eval(otherwise)?
+                } else {
+                    self.eval(then)?
                 }
             }
             Node::Pwl(argument, table) => table.value(self.eval(argument)?),
