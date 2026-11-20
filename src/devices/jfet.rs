@@ -484,10 +484,11 @@ impl Jfet {
         let mut tcgd = model.cgd * cjfact;
         tcgs *= cjfact1;
         tcgd *= cjfact1;
-        let vto = model.vtotc.map_or_else(
-            || model.vto - model.tcv * (temp - tnom),
-            |vtotc| model.vto + vtotc * (temp - tnom),
-        );
+        let vto = model
+            .vtotc
+            .map_or(model.vto - model.tcv * (temp - tnom), |vtotc| {
+                model.vto + vtotc * (temp - tnom)
+            });
         let beta = model.betatce.map_or_else(
             || model.beta * (temp / tnom).powf(model.bex),
             |betatce| model.beta * 1.01_f64.powf(betatce * (temp - tnom)),
