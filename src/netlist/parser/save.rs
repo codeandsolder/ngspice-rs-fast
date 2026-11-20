@@ -189,6 +189,16 @@ pub(super) fn request(input: &mut Input<'_>) -> Result<VectorRequest> {
             ),
         ));
     }
+    terminal_request(input, &head.text, &name, location)
+}
+
+/// Voltage/current and component functions with one or two terminal arguments.
+fn terminal_request(
+    input: &mut Input<'_>,
+    spelling: &str,
+    name: &str,
+    location: SourceLoc,
+) -> Result<VectorRequest> {
     if !input
         .input
         .first()
@@ -196,26 +206,22 @@ pub(super) fn request(input: &mut Input<'_>) -> Result<VectorRequest> {
     {
         return Err(fail(
             &location,
-            format!(
-                "'{}' needs a parenthesised argument ({SUPPORTED})",
-                head.text
-            ),
+            format!("'{spelling}' needs a parenthesised argument ({SUPPORTED})"),
         ));
     }
     any.parse_next(input)?;
-    let (positive, negative) = terminals(input, &location, &name)?;
+    let (positive, negative) = terminals(input, &location, name)?;
     if let Some(negative) = &negative
         && *negative == positive
     {
         return Err(fail(
             &location,
             format!(
-                "{}({positive},{negative}) is identically zero; leave out the repeated node",
-                name
+                "{name}({positive},{negative}) is identically zero; leave out the repeated node"
             ),
         ));
     }
-    let vector = match name.as_str() {
+    let vector = match name {
         "v" => RequestedVector::Voltage { positive, negative },
         "i" => {
             if negative.is_some() {

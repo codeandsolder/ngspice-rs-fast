@@ -50,6 +50,39 @@ struct Scope {
     cards: Vec<ScopedCard>,
 }
 
+impl Scope {
+    fn into_definition(self, mut definition: Subcircuit) -> SpiceResult<Subcircuit> {
+        definition.end_location = self
+            .cards
+            .last()
+            .ok_or_else(|| {
+                SpiceError::parse(
+                    definition.location.clone(),
+                    "closed subcircuit has no .ends card",
+                )
+            })?
+            .source
+            .location
+            .clone();
+        definition.devices = self.devices;
+        definition.models = self.models;
+        definition.subcircuits = self.subcircuits;
+        definition.analyses = self.analyses;
+        definition.includes = self.includes;
+        definition.params = self.params;
+        definition.functions = self.functions;
+        definition.options = self.options;
+        definition.globals = self.globals;
+        definition.initial_conditions = self.initial_conditions;
+        definition.nodesets = self.nodesets;
+        definition.output = self.output;
+        definition.measurements = self.measurements;
+        definition.fourier = self.fourier;
+        definition.cards = self.cards;
+        Ok(definition)
+    }
+}
+
 pub(super) fn assemble(
     deck: &Deck,
     cards: &[SpiceResult<InputCard>],
@@ -115,6 +148,115 @@ fn model_names(
     names
 }
 
+#[derive(Default, PartialEq, Eq)]
+enum ControlPhase {
+    #[default]
+    Outside,
+    BeforeRun,
+    AfterRun,
+    Quit,
+}
+
+#[derive(Default)]
+struct ControlScript {
+    phase: ControlPhase,
+    deck_ran: bool,
+}
+
+impl ControlScript {
+    /// Parse a normal card, a supported control command, or a block delimiter.
+    /// A consumed command/delimiter has no typed card, but remains in deck order.
+    fn parse(
+        &mut self,
+        card: &RawCard,
+        in_body: bool,
+        auto_gnd: bool,
+        declared: &BTreeSet<String>,
+    ) -> SpiceResult<Option<ParsedCard>> {
+        if matches!(
+            card.dot_command(),
+            Some(DotCommand::Control | DotCommand::Endc)
+        ) {
+            let begin = card.dot_command() == Some(&DotCommand::Control);
+            if in_body || card.tokens.len() != 1 || begin == (self.phase != ControlPhase::Outside) {
+                return Err(SpiceError::parse(
+                    card.location.clone(),
+                    "invalid or nested .control/.endc settings block",
+                ));
+            }
+            self.phase = if begin {
+                ControlPhase::BeforeRun
+            } else {
+                ControlPhase::Outside
+            };
+            return Ok(None);
+        }
+        if self.phase == ControlPhase::Outside {
+            return grammar::parse_card(card, auto_gnd, declared).map(Some);
+        }
+        if self.phase == ControlPhase::Quit {
+            return Err(SpiceError::not_yet_ported(
+                format!("{}: commands after quit", card.location),
+                "src/frontend/control.c",
+            ));
+        }
+        if let Some(head) = card.tokens.first()
+            && (head.is_keyword("run") || head.is_keyword("quit"))
+        {
+            if card.tokens.len() != 1 || (head.is_keyword("run") && self.deck_ran) {
+                return Err(SpiceError::not_yet_ported(
+                    format!(
+                        "{}: repeated or argument-bearing control run/quit",
+                        card.location
+                    ),
+                    "src/frontend/runcoms.c",
+                ));
+            }
+            if head.is_keyword("run") {
+                self.phase = ControlPhase::AfterRun;
+                self.deck_ran = true;
+            } else {
+                if self.phase != ControlPhase::AfterRun {
+                    return Err(SpiceError::not_yet_ported(
+                        format!("{}: quit before run", card.location),
+                        "src/frontend/inp.c, src/frontend/control.c",
+                    ));
+                }
+                self.phase = ControlPhase::Quit;
+            }
+            return Ok(None);
+        }
+        if card.tokens.first().is_some_and(|t| t.is_keyword("fourier")) {
+            if self.phase != ControlPhase::AfterRun {
+                return Err(SpiceError::parse(
+                    card.location.clone(),
+                    "fourier needs a preceding run in this control block",
+                ));
+            }
+            let mut converted = card.clone();
+            converted.tokens[0].text = ".four".into();
+            converted.kind = crate::netlist::card::CardKind::DotCommand(DotCommand::Analysis(
+                crate::primitives::AnalysisKind::Fourier,
+            ));
+            let mut parsed = grammar::parse_card(&converted, auto_gnd, declared)?;
+            if let ParsedCard::Fourier(card) = &mut parsed {
+                card.frontend_command = true;
+            }
+            return Ok(Some(parsed));
+        }
+        if self.deck_ran && card.tokens.first().is_some_and(|t| t.is_keyword("set")) {
+            return Err(SpiceError::not_yet_ported(
+                format!(
+                    "{}: set after run; set Fourier variables before run",
+                    card.location
+                ),
+                "src/frontend/variable.c",
+            ));
+        }
+        grammar::parse_frontend_setting(card, auto_gnd, declared).map(Some)
+    }
+}
+
 fn scope(
     cards: &[SpiceResult<InputCard>],
     cursor: &mut usize,
@@ -126,98 +268,14 @@ fn scope(
     let declared = model_names(cards, *cursor, inherited);
     let mut result = Scope::default();
     let mut definitions = BTreeSet::new();
-    let mut control = false;
-    let mut control_ran = false;
-    let mut control_quit = false;
-    let mut deck_ran = false;
+    let mut control = ControlScript::default();
     while let Some(entry) = cards.get(*cursor) {
         let entry = entry.as_ref().map_err(Clone::clone)?;
         *cursor += 1;
         let card = &entry.source;
-        if matches!(
-            card.dot_command(),
-            Some(DotCommand::Control | DotCommand::Endc)
-        ) {
-            let begin = card.dot_command() == Some(&DotCommand::Control);
-            if opening.is_some() || card.tokens.len() != 1 || begin == control {
-                return Err(SpiceError::parse(
-                    card.location.clone(),
-                    "invalid or nested .control/.endc settings block",
-                ));
-            }
-            control = begin;
-            if begin {
-                control_ran = false;
-                control_quit = false;
-            }
+        let Some(parsed) = control.parse(card, opening.is_some(), auto_gnd, &declared)? else {
             result.cards.push(ordered(entry, ScopedCardKind::Output));
             continue;
-        }
-        if control {
-            if control_quit {
-                return Err(SpiceError::not_yet_ported(
-                    format!("{}: commands after quit", card.location),
-                    "src/frontend/control.c",
-                ));
-            }
-            if let Some(head) = card.tokens.first()
-                && (head.is_keyword("run") || head.is_keyword("quit"))
-            {
-                if card.tokens.len() != 1 || (head.is_keyword("run") && deck_ran) {
-                    return Err(SpiceError::not_yet_ported(
-                        format!(
-                            "{}: repeated or argument-bearing control run/quit",
-                            card.location
-                        ),
-                        "src/frontend/runcoms.c",
-                    ));
-                }
-                if head.is_keyword("run") {
-                    control_ran = true;
-                    deck_ran = true;
-                } else {
-                    if !control_ran {
-                        return Err(SpiceError::not_yet_ported(
-                            format!("{}: quit before run", card.location),
-                            "src/frontend/inp.c, src/frontend/control.c",
-                        ));
-                    }
-                    control_quit = true;
-                }
-                result.cards.push(ordered(entry, ScopedCardKind::Output));
-                continue;
-            }
-        }
-        let parsed = if control && card.tokens.first().is_some_and(|t| t.is_keyword("fourier")) {
-            if !control_ran {
-                return Err(SpiceError::parse(
-                    card.location.clone(),
-                    "fourier needs a preceding run in this control block",
-                ));
-            }
-            let mut converted = card.clone();
-            converted.tokens[0].text = ".four".into();
-            converted.kind = crate::netlist::card::CardKind::DotCommand(DotCommand::Analysis(
-                crate::primitives::AnalysisKind::Fourier,
-            ));
-            let mut parsed = grammar::parse_card(&converted, auto_gnd, &declared)?;
-            if let ParsedCard::Fourier(card) = &mut parsed {
-                card.frontend_command = true;
-            }
-            parsed
-        } else if control {
-            if deck_ran && card.tokens.first().is_some_and(|t| t.is_keyword("set")) {
-                return Err(SpiceError::not_yet_ported(
-                    format!(
-                        "{}: set after run; set Fourier variables before run",
-                        card.location
-                    ),
-                    "src/frontend/variable.c",
-                ));
-            }
-            grammar::parse_frontend_setting(card, auto_gnd, &declared)?
-        } else {
-            grammar::parse_card(card, auto_gnd, &declared)?
         };
         let kind = match parsed {
             ParsedCard::Device(d) => {
@@ -302,7 +360,7 @@ fn scope(
                 result.includes.push(i);
                 ScopedCardKind::Include(result.includes.len() - 1)
             }
-            ParsedCard::Subckt(mut s) => {
+            ParsedCard::Subckt(s) => {
                 if !definitions.insert(s.name.clone()) {
                     return Err(SpiceError::parse(
                         s.location,
@@ -323,28 +381,7 @@ fn scope(
                     Some((&s.name, &s.location)),
                     depth + 1,
                 )?;
-                s.end_location = body
-                    .cards
-                    .last()
-                    .expect("closed scope has .ends")
-                    .source
-                    .location
-                    .clone();
-                s.devices = body.devices;
-                s.models = body.models;
-                s.subcircuits = body.subcircuits;
-                s.analyses = body.analyses;
-                s.includes = body.includes;
-                s.params = body.params;
-                s.functions = body.functions;
-                s.options = body.options;
-                s.globals = body.globals;
-                s.initial_conditions = body.initial_conditions;
-                s.nodesets = body.nodesets;
-                s.output = body.output;
-                s.measurements = body.measurements;
-                s.fourier = body.fourier;
-                s.cards = body.cards;
+                let s = body.into_definition(s)?;
                 result.subcircuits.push(s);
                 ScopedCardKind::Subcircuit(result.subcircuits.len() - 1)
             }
@@ -380,7 +417,7 @@ fn scope(
         };
         result.cards.push(ordered(entry, kind));
     }
-    if control {
+    if control.phase != ControlPhase::Outside {
         return Err(SpiceError::circuit("missing .endc for settings block"));
     }
     if let Some((name, location)) = opening {
