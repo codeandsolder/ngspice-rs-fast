@@ -308,27 +308,177 @@ fn nintegrate(density: Real, ln_density: Real, ln_last_density: Real, step: &Ste
     }
 }
 
-/// Per-generator integration history (C `<dev>nVar`).
+/// Integrated output- and input-referred noise power, in C's summation order.
 #[derive(Debug, Clone, Copy, Default)]
-struct History {
-    ln_last: Real,
+struct Power {
     output: Real,
     input: Real,
 }
 
-/// One instance's generators and their history; the last history entry is
-/// the instance total when the instance reports one.
+impl Power {
+    fn add(&mut self, contribution: Self) {
+        self.output += contribution.output;
+        self.input += contribution.input;
+    }
+
+    fn append_amplitudes(self, row: &mut Vec<Real>) {
+        row.extend([self.output.sqrt(), self.input.sqrt()]);
+    }
+}
+
+/// Frequency-local data shared by every generator.
+struct NoiseSample {
+    frequency: Real,
+    step: Step,
+    gain_sq_inv: Real,
+    ln_gain_inv: Real,
+    reset: bool,
+    summary: bool,
+}
+
+impl NoiseSample {
+    fn new(frequency: Real, previous: Real, gain_sq_inv: Real, start: Real, summary: bool) -> Self {
+        let ln_freq = frequency.max(N_MINLOG).ln();
+        let ln_last_freq = previous.max(N_MINLOG).ln();
+        Self {
+            frequency,
+            step: Step {
+                del_freq: frequency - previous,
+                ln_freq,
+                ln_last_freq,
+                del_ln_freq: ln_freq - ln_last_freq,
+            },
+            gain_sq_inv,
+            ln_gain_inv: gain_sq_inv.ln(),
+            reset: frequency == start,
+            summary,
+        }
+    }
+}
+
+/// Per-generator integration history (C `<dev>nVar`). The optional instance
+/// total only accumulates power: it never enters the logarithmic integrator.
+#[derive(Debug, Clone, Copy, Default)]
+struct History {
+    ln_last: Real,
+    integrated: Power,
+}
+
+impl History {
+    fn advance(&mut self, density: Real, sample: &NoiseSample) -> Power {
+        let ln_density = density.max(N_MINLOG).ln();
+        if sample.step.del_freq == 0. {
+            self.ln_last = ln_density;
+            if sample.reset {
+                self.integrated = Power::default();
+            }
+            return Power::default();
+        }
+        let contribution = Power {
+            output: nintegrate(density, ln_density, self.ln_last, &sample.step),
+            input: nintegrate(
+                density * sample.gain_sq_inv,
+                ln_density + sample.ln_gain_inv,
+                self.ln_last + sample.ln_gain_inv,
+                &sample.step,
+            ),
+        };
+        self.ln_last = ln_density;
+        if sample.summary {
+            self.integrated.add(contribution);
+        }
+        contribution
+    }
+}
+
+/// One instance's fixed ordered output slots and their integration history.
 struct Generators {
     instance: InstanceNoise,
     history: Vec<History>,
+    total: Option<Power>,
 }
 
 impl Generators {
     fn new(instance: InstanceNoise) -> Self {
-        let count = instance.sources.len() + usize::from(instance.total);
+        let history = vec![History::default(); instance.sources.len()];
+        let total = instance.total.then(Power::default);
         Self {
             instance,
-            history: vec![History::default(); count],
+            history,
+            total,
+        }
+    }
+
+    /// Frequency-dependent devices may change their laws and transfer nodes,
+    /// but cannot change the named slots that own integration history and columns.
+    fn refresh(&mut self, instance: InstanceNoise) -> SpiceResult<()> {
+        let old = &self.instance;
+        if old.device != instance.device
+            || old.name != instance.name
+            || old.total != instance.total
+            || old.sources.len() != instance.sources.len()
+            || old
+                .sources
+                .iter()
+                .zip(&instance.sources)
+                .any(|(a, b)| a.suffix != b.suffix)
+        {
+            return Err(SpiceError::circuit(format!(
+                "noise generator layout changed between frequencies for {}",
+                old.name
+            )));
+        }
+        self.instance = instance;
+        Ok(())
+    }
+
+    /// Evaluate and integrate each source once, without allocating a density
+    /// vector. Accumulate global totals per source, never per instance, to
+    /// preserve the reference addition order.
+    fn accumulate(
+        &mut self,
+        sample: &NoiseSample,
+        difference: impl Fn([NodeId; 2]) -> Complex,
+        integrated: &mut Power,
+        mut summary_row: Option<&mut Vec<Real>>,
+    ) -> Real {
+        let mut density_sum = 0.;
+        if sample.reset
+            && sample.step.del_freq == 0.
+            && let Some(total) = &mut self.total
+        {
+            *total = Power::default();
+        }
+        for (source, history) in self.instance.sources.iter().zip(&mut self.history) {
+            let density = source.output_density(&difference, sample.frequency);
+            density_sum += density;
+            let contribution = history.advance(density, sample);
+            if sample.step.del_freq != 0. {
+                integrated.add(contribution);
+                if sample.summary
+                    && let Some(total) = &mut self.total
+                {
+                    total.add(contribution);
+                }
+            }
+            if let Some(row) = summary_row.as_deref_mut() {
+                row.push(density.sqrt());
+            }
+        }
+        if self.total.is_some()
+            && let Some(row) = summary_row
+        {
+            row.push(density_sum.sqrt());
+        }
+        density_sum
+    }
+
+    fn append_integrated(&self, row: &mut Vec<Real>) {
+        for history in &self.history {
+            history.integrated.append_amplitudes(row);
+        }
+        if let Some(total) = self.total {
+            total.append_amplitudes(row);
         }
     }
 }
@@ -485,7 +635,7 @@ pub(crate) fn run(
         Stepping::Decade | Stepping::Octave => delta * card.stop * reltol,
         Stepping::Linear => delta * reltol,
     };
-    let (mut out_noise, mut in_noise) = (0., 0.);
+    let mut integrated_power = Power::default();
     let mut freq = card.start;
     let mut last = freq;
     let mut step = 0_usize;
@@ -517,67 +667,21 @@ pub(crate) fn run(
                 ));
             }
             for (g, instance) in generators.iter_mut().zip(fresh) {
-                g.instance = instance;
+                g.refresh(instance)?;
             }
         }
         let gain_sq_inv = 1. / gain(circuit, &forward, output).max(N_MINGAIN);
-        let ln_gain_inv = gain_sq_inv.ln();
-        let data = Step {
-            del_freq: freq - last,
-            ln_freq: freq.max(N_MINLOG).ln(),
-            ln_last_freq: last.max(N_MINLOG).ln(),
-            del_ln_freq: freq.max(N_MINLOG).ln() - last.max(N_MINLOG).ln(),
-        };
+        let sample = NoiseSample::new(freq, last, gain_sq_inv, card.start, card.summary != 0);
         let print_summary = card.summary != 0 && step.is_multiple_of(card.summary);
         let mut out_density = 0.;
         let mut row = vec![freq];
         for g in &mut generators {
-            let mut densities = Vec::with_capacity(g.history.len());
-            for source in &g.instance.sources {
-                densities.push(
-                    source.output_density(|nodes| difference(circuit, &adjoint, nodes), freq),
-                );
-            }
-            let total: Real = densities.iter().sum();
-            if g.instance.total {
-                densities.push(total);
-            }
-            out_density += total;
-            let generators_only = g.instance.sources.len();
-            for (index, density) in densities.iter().enumerate() {
-                let ln_density = density.max(N_MINLOG).ln();
-                let history = &mut g.history[index];
-                if data.del_freq == 0. {
-                    history.ln_last = ln_density;
-                    if freq == card.start {
-                        history.output = 0.;
-                        history.input = 0.;
-                    }
-                } else if index < generators_only {
-                    let out = nintegrate(*density, ln_density, history.ln_last, &data);
-                    let inp = nintegrate(
-                        density * gain_sq_inv,
-                        ln_density + ln_gain_inv,
-                        history.ln_last + ln_gain_inv,
-                        &data,
-                    );
-                    history.ln_last = ln_density;
-                    out_noise += out;
-                    in_noise += inp;
-                    if card.summary != 0 {
-                        history.output += out;
-                        history.input += inp;
-                        if g.instance.total {
-                            let total = &mut g.history[generators_only];
-                            total.output += out;
-                            total.input += inp;
-                        }
-                    }
-                }
-            }
-            if print_summary {
-                row.extend(densities.iter().map(|d| d.sqrt()));
-            }
+            out_density += g.accumulate(
+                &sample,
+                |nodes| difference(circuit, &adjoint, nodes),
+                &mut integrated_power,
+                print_summary.then_some(&mut row),
+            );
         }
         if card.summary == 0 || print_summary {
             row.push(out_density.sqrt());
@@ -609,14 +713,10 @@ pub(crate) fn run(
         }
         if card.summary != 0 {
             for g in &generators {
-                for history in &g.history {
-                    values.push(history.output.sqrt());
-                    values.push(history.input.sqrt());
-                }
+                g.append_integrated(&mut values);
             }
         }
-        values.push(out_noise.sqrt());
-        values.push(in_noise.sqrt());
+        integrated_power.append_amplitudes(&mut values);
         integrated.push_point(values.into_iter().map(Complex::real).collect())?;
         if !integrated.is_finite() {
             return Err(SpiceError::Numerical {
@@ -665,10 +765,92 @@ pub(crate) fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{Step, almost_equal_ulps, nintegrate, plot_count};
+    use super::{Generators, NoiseSample, Power, Step, almost_equal_ulps, nintegrate, plot_count};
+    use crate::devices::noise::{InstanceNoise, NoiseKind, NoiseSource};
+    use crate::primitives::{Complex, NodeId};
 
     fn args(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_owned).collect()
+    }
+
+    fn instance() -> InstanceNoise {
+        InstanceNoise {
+            device: 3,
+            name: "test".into(),
+            sources: vec![
+                NoiseSource::new(
+                    "_a",
+                    [NodeId::new(1), NodeId::GROUND],
+                    NoiseKind::Gain { factor: 2. },
+                ),
+                NoiseSource::new(
+                    "_b",
+                    [NodeId::new(1), NodeId::GROUND],
+                    NoiseKind::Gain { factor: 3. },
+                ),
+            ],
+            total: true,
+        }
+    }
+
+    #[test]
+    fn noise_history_is_bound_to_named_slots_not_frequency_local_values() {
+        let mut generators = Generators::new(instance());
+        let mut integrated = Power::default();
+        let mut row = Vec::new();
+        let transfer = |_| Complex::real(1.);
+        let first = NoiseSample::new(10., 10., 0.25, 10., true);
+        assert_eq!(
+            generators.accumulate(&first, transfer, &mut integrated, Some(&mut row)),
+            5.
+        );
+        assert_eq!(row, [2_f64.sqrt(), 3_f64.sqrt(), 5_f64.sqrt()]);
+        let mut fresh = instance();
+        fresh.sources[0].kind = NoiseKind::Gain { factor: 2. };
+        fresh.sources[0].nodes = [NodeId::new(2), NodeId::GROUND];
+        generators.refresh(fresh).unwrap();
+        let second = NoiseSample::new(20., 10., 0.25, 10., true);
+        // Integrate even when this frequency has no printed summary row.
+        assert_eq!(
+            generators.accumulate(&second, transfer, &mut integrated, None),
+            5.
+        );
+        assert_eq!(integrated.output, 50.);
+        assert_eq!(integrated.input, 12.5);
+        row.clear();
+        generators.append_integrated(&mut row);
+        assert_eq!(
+            row,
+            [
+                20_f64.sqrt(),
+                5_f64.sqrt(),
+                30_f64.sqrt(),
+                7.5_f64.sqrt(),
+                50_f64.sqrt(),
+                12.5_f64.sqrt()
+            ]
+        );
+    }
+
+    #[test]
+    fn refreshed_noise_slots_reject_changed_identity_order_and_shape() {
+        let mut generators = Generators::new(instance());
+        let mut changed = instance();
+        changed.sources.swap(0, 1);
+        assert!(generators.refresh(changed).is_err());
+        let mut changed = instance();
+        changed.sources.pop();
+        assert!(generators.refresh(changed).is_err());
+        let mut changed = instance();
+        changed.total = false;
+        assert!(generators.refresh(changed).is_err());
+        let mut changed = instance();
+        changed.device = 4;
+        assert!(generators.refresh(changed).is_err());
+        let mut changed = instance();
+        changed.name = "other".into();
+        assert!(generators.refresh(changed).is_err());
+        assert!(generators.refresh(instance()).is_ok());
     }
 
     #[test]

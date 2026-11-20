@@ -254,8 +254,8 @@ pub fn solve<T>(
 pub struct NewtonFailure {
     /// Why the solve failed (unchanged from [`solve`]).
     pub error: SpiceError,
-    /// Iterations started before the failure, at most
-    /// [`NewtonOptions::max_iterations`]; zero when settings were rejected.
+    /// Load attempts, including a failed load. C checks the iteration limit
+    /// after a solve, so an exhausted solve includes the over-limit pass.
     pub iterations: usize,
     /// At the iteration limit: the iterate the last load used. `NIiter`
     /// returns `E_ITERLIM` before swapping `CKTrhs` and `CKTrhsOld`, so this is
@@ -294,8 +294,6 @@ pub fn solve_counted_limited<T>(
     options: &NewtonOptions,
     mut load: impl FnMut(&Vector) -> SpiceResult<(SparseMatrix, Vector, T)>,
 ) -> Result<NewtonSolution<T>, NewtonFailure> {
-    let mut iterations = 0;
-    let mut last_iterate = None;
     iterate(
         initial,
         branch_rows,
@@ -311,14 +309,7 @@ pub fn solve_counted_limited<T>(
         },
         |x: &Vector, _, _: Option<&T>| load(x),
         |_: &Vector, _: &Vector, _: &T| Ok(false),
-        &mut iterations,
-        &mut last_iterate,
     )
-    .map_err(|error| NewtonFailure {
-        error,
-        iterations,
-        last_iterate,
-    })
 }
 
 /// How a phased solve starts (C `NIiter`'s initial `MODEINITF`).
@@ -374,8 +365,6 @@ pub fn solve_phased(
     ) -> SpiceResult<(SparseMatrix, Vector, TrialState)>,
     device_test: impl FnMut(&Vector, &Vector, &TrialState) -> SpiceResult<bool>,
 ) -> Result<NewtonSolution<TrialState>, NewtonFailure> {
-    let mut iterations = 0;
-    let mut last_iterate = None;
     let first = match (policy, &continued) {
         (_, Some(_)) => IterationPhase::Float,
         (PhasePolicy::OperatingPoint, None) => IterationPhase::Junction,
@@ -404,14 +393,7 @@ pub fn solve_phased(
             Ok(loaded)
         },
         device_test,
-        &mut iterations,
-        &mut last_iterate,
     )
-    .map_err(|error| NewtonFailure {
-        error,
-        iterations,
-        last_iterate,
-    })
 }
 
 struct Phases<T, F> {
@@ -426,6 +408,40 @@ struct Phases<T, F> {
     /// `MODEDC` with nodesets (`CKThadNodeset`): the first `MODEINITFLOAT`
     /// iterate after `MODEINITFIX` never converges (`ipass`).
     nodesets: bool,
+}
+
+/// Counts load attempts and owns the retry iterate for all Newton entry points.
+#[derive(Default)]
+struct Progress {
+    iterations: usize,
+    last_iterate: Option<Vector>,
+}
+
+fn iterate<T, F: Fn(&T) -> bool>(
+    initial: &Vector,
+    branch_rows: &[bool],
+    limited_rows: Option<&[bool]>,
+    options: &NewtonOptions,
+    phases: Phases<T, F>,
+    load: impl FnMut(&Vector, IterationPhase, Option<&T>) -> SpiceResult<(SparseMatrix, Vector, T)>,
+    device_test: impl FnMut(&Vector, &Vector, &T) -> SpiceResult<bool>,
+) -> Result<NewtonSolution<T>, NewtonFailure> {
+    let mut progress = Progress::default();
+    iterate_inner(
+        initial,
+        branch_rows,
+        limited_rows,
+        options,
+        phases,
+        load,
+        device_test,
+        &mut progress,
+    )
+    .map_err(|error| NewtonFailure {
+        error,
+        iterations: progress.iterations,
+        last_iterate: progress.last_iterate,
+    })
 }
 
 /// C `NIiter` (`niiter.c`, the SPARSE path) over disposable loads.
@@ -450,7 +466,7 @@ struct Phases<T, F> {
     clippy::too_many_arguments,
     reason = "keeps the positional interface explicit at the reference solver or device boundary"
 )]
-fn iterate<T, F: Fn(&T) -> bool>(
+fn iterate_inner<T, F: Fn(&T) -> bool>(
     initial: &Vector,
     branch_rows: &[bool],
     limited_rows: Option<&[bool]>,
@@ -458,8 +474,7 @@ fn iterate<T, F: Fn(&T) -> bool>(
     phases: Phases<T, F>,
     mut load: impl FnMut(&Vector, IterationPhase, Option<&T>) -> SpiceResult<(SparseMatrix, Vector, T)>,
     mut device_test: impl FnMut(&Vector, &Vector, &T) -> SpiceResult<bool>,
-    started: &mut usize,
-    last_iterate: &mut Option<Vector>,
+    progress: &mut Progress,
 ) -> SpiceResult<NewtonSolution<T>> {
     options.validate()?;
     let n = initial.len();
@@ -478,11 +493,11 @@ fn iterate<T, F: Fn(&T) -> bool>(
     let mut ordering = None;
     let mut reorder = phases.initial_transient;
     let mut ipass = false;
-    let mut iterno = 0;
     loop {
+        // NIiter increments before checking the CKTload return code.
+        progress.iterations += 1;
+        let iterno = progress.iterations;
         let (mut matrix, rhs, trial) = load(&guess, phase, previous.as_ref())?;
-        iterno += 1;
-        *started = iterno;
         let flagged = (phases.nonconvergent)(&trial);
         check(&matrix, &rhs, n)?;
         matrix.fold_duplicates();
@@ -515,7 +530,7 @@ fn iterate<T, F: Fn(&T) -> bool>(
             return Err(failure("nonfinite Newton iterate"));
         }
         if iterno > options.max_iterations {
-            *last_iterate = Some(guess);
+            progress.last_iterate = Some(guess);
             return Err(failure(format!(
                 "Newton iteration limit ({}) reached",
                 options.max_iterations
@@ -687,6 +702,31 @@ mod tests {
         let failure = solve_counted(&far, &[false], &rejected, identity).unwrap_err();
         assert_eq!(failure.iterations, 0);
     }
+    #[test]
+    fn failed_load_is_charged_to_the_attempt_budget() {
+        let mut loads = 0;
+        let error = failure("device load failed");
+        let failed = solve_counted(
+            &Vector::zeros(1),
+            &[false],
+            &NewtonOptions::default(),
+            |_| {
+                loads += 1;
+                if loads == 2 {
+                    return Err(error.clone());
+                }
+                let mut matrix = SparseMatrix::new(1, 1);
+                matrix.add(0, 0, 1.)?;
+                Ok((matrix, Vector::zeros(1), ()))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failed.error, error);
+        assert_eq!(loads, 2);
+        assert_eq!(failed.iterations, loads);
+        assert!(failed.last_iterate.is_none());
+    }
+
     #[test]
     fn rejects_singular_homogeneous_system_and_invalid_settings() {
         assert!(
