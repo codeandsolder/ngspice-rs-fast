@@ -169,7 +169,7 @@ fn emit_struct(
 fn real_asks(source: &str, prefix: &str) -> Result<Vec<(String, String)>, String> {
     let source = crate::ifparm::strip_comments(source)?;
     let mut asks: Vec<(String, String)> = Vec::new();
-    let mut pending: Vec<String> = Vec::new();
+    let mut pending: Vec<&str> = Vec::new();
     // The asks recorded for the last case group, dropped again when C goes
     // on to scale the value (`value->rValue *= ...`).
     let mut last = 0..0;
@@ -185,7 +185,7 @@ fn real_asks(source: &str, prefix: &str) -> Result<Vec<(String, String)>, String
             if !id.starts_with("BSIM4_") {
                 return Err(format!("ask: unexpected case `{line}`"));
             }
-            pending.push(id.into());
+            pending.push(id);
         } else if let Some(rest) = line.strip_prefix("value->rValue = ") {
             if let Some(member) = rest
                 .strip_suffix(';')
@@ -194,8 +194,8 @@ fn real_asks(source: &str, prefix: &str) -> Result<Vec<(String, String)>, String
                 .filter(|m| m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
             {
                 let start = asks.len();
-                for id in pending.drain(..) {
-                    asks.push((id, member.into()));
+                for &id in &pending {
+                    asks.push((id.into(), member.into()));
                 }
                 last = start..asks.len();
             }
@@ -209,7 +209,7 @@ fn real_asks(source: &str, prefix: &str) -> Result<Vec<(String, String)>, String
 
 /// The generated `asks.rs` text: the real asks of `b4mask.c` and `b4ask.c`
 /// that read a member directly (`sens_getp()` succeeds only for these).
-pub(crate) fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, String> {
+pub(super) fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, String> {
     let model = real_asks(mask, "model->")?;
     let instance = real_asks(ask, "here->")?;
     if model.len() != 869 || instance.len() != 40 {
@@ -239,7 +239,7 @@ pub(crate) fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, Stri
 }
 
 /// The generated `fields.rs` text.
-pub(crate) fn fields(header: &str, revision: &str) -> Result<String, String> {
+pub(super) fn fields(header: &str, revision: &str) -> Result<String, String> {
     let header = crate::ifparm::strip_comments(header)?;
     let instance = members(
         &header,
@@ -276,4 +276,34 @@ pub(crate) fn fields(header: &str, revision: &str) -> Result<String, String> {
     emit_struct(&mut out, "SizeParam", "struct bsim4SizeDependParam", &size)?;
     emit_struct(&mut out, "Instance", "struct sBSIM4instance", &instance)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::real_asks;
+
+    #[test]
+    fn real_asks_keeps_case_aliases_and_discards_scaled_values() {
+        let source = "
+            case BSIM4_A:
+            case BSIM4_ALIAS:
+                value->rValue = model->BSIM4a;
+                return OK;
+            case BSIM4_SCALED:
+                value->rValue = model->BSIM4b;
+                value->rValue *= 2;
+                return OK;
+            case BSIM4_C:
+                value->rValue = model->BSIM4c;
+                return OK;
+        ";
+        assert_eq!(
+            real_asks(source, "model->").unwrap(),
+            [
+                ("BSIM4_A".to_owned(), "BSIM4a".to_owned()),
+                ("BSIM4_ALIAS".to_owned(), "BSIM4a".to_owned()),
+                ("BSIM4_C".to_owned(), "BSIM4c".to_owned()),
+            ]
+        );
+    }
 }
