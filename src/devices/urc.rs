@@ -215,46 +215,43 @@ impl UrcSections {
         let r0 = length * rperl;
         let c0 = length * cperl;
         let i0 = isperl.map(|isperl| length * isperl);
-        let lumps = match lumps {
-            Some(given) => {
-                if given < 1 {
+        let lumps = if let Some(given) = lumps {
+            if given < 1 {
+                return Err(invalid(format!(
+                    "n={given} builds no sections (C leaves the terminals unconnected)"
+                )));
+            }
+            usize::try_from(given)
+                .ok()
+                .filter(|&n| n <= MAX_LUMPS)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "n={given} sections exceed the port's bound of {MAX_LUMPS}"
+                    ))
+                })?
+        } else {
+            let wnorm = fmax * r0 * c0 * 2.0 * std::f64::consts::PI;
+            if wnorm < 35. {
+                3
+            } else {
+                let ratio = (p - 1.) / p;
+                let count = 3.0_f64.max((wnorm * (ratio * ratio)).ln() / p.ln());
+                if !count.is_finite() || count > MAX_LUMPS as Real {
                     return Err(invalid(format!(
-                        "n={given} builds no sections (C leaves the terminals unconnected)"
+                        "FMAX={fmax} needs {count} sections, more than {MAX_LUMPS}"
                     )));
                 }
-                usize::try_from(given)
-                    .ok()
-                    .filter(|&n| n <= MAX_LUMPS)
-                    .ok_or_else(|| {
-                        invalid(format!(
-                            "n={given} sections exceed the port's bound of {MAX_LUMPS}"
-                        ))
-                    })?
-            }
-            None => {
-                let wnorm = fmax * r0 * c0 * 2.0 * std::f64::consts::PI;
-                if wnorm < 35. {
-                    3
-                } else {
-                    let ratio = (p - 1.) / p;
-                    let count = 3.0_f64.max((wnorm * (ratio * ratio)).ln() / p.ln());
-                    if !count.is_finite() || count > MAX_LUMPS as Real {
-                        return Err(invalid(format!(
-                            "FMAX={fmax} needs {count} sections, more than {MAX_LUMPS}"
-                        )));
-                    }
-                    // C `(int)` truncation of a value of at least 3.
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "finite positive section count has been bounded by MAX_LUMPS immediately above"
-                    )]
-                    #[expect(
-                        clippy::cast_sign_loss,
-                        reason = "section count is clamped to a minimum of three before conversion"
-                    )]
-                    let count = count as usize;
-                    count
-                }
+                // C `(int)` truncation of a value of at least 3.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "finite positive section count has been bounded by MAX_LUMPS immediately above"
+                )]
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "section count is clamped to a minimum of three before conversion"
+                )]
+                let count = count as usize;
+                count
             }
         };
         if lumps > MAX_LUMPS {

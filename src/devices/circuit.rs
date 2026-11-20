@@ -2051,20 +2051,21 @@ impl Circuit {
             }
             let first = terms.len();
             let slot = |terms: &mut Vec<crate::maths::pencil::PencilTerm>, row, col| {
-                if let Some(i) = terms[first..]
+                let existing = terms[first..]
                     .iter()
-                    .position(|t: &crate::maths::pencil::PencilTerm| t.row == row && t.col == col)
-                {
-                    first + i
-                } else {
-                    terms.push(crate::maths::pencil::PencilTerm {
-                        row,
-                        col,
-                        conductance: None,
-                        capacitance: None,
-                    });
-                    terms.len() - 1
-                }
+                    .position(|t: &crate::maths::pencil::PencilTerm| t.row == row && t.col == col);
+                existing.map_or_else(
+                    || {
+                        terms.push(crate::maths::pencil::PencilTerm {
+                            row,
+                            col,
+                            conductance: None,
+                            capacitance: None,
+                        });
+                        terms.len() - 1
+                    },
+                    |i| first + i,
+                )
             };
             for t in &a[a_range] {
                 let i = slot(&mut terms, t.row, t.col);
@@ -2074,20 +2075,20 @@ impl Circuit {
             let mut index = e_range.start;
             while index < e_range.end {
                 let t = &e[index];
-                let (value, next) = match system
+                let (value, next) = system
                     .e_groups
                     .iter()
                     .find(|g| g.range.start == index && g.range.end <= e_range.end)
-                {
-                    Some(group) => {
-                        let mut sum = group.terms.first().copied().unwrap_or(0.);
-                        for term in group.terms.iter().skip(1) {
-                            sum += term;
-                        }
-                        (group.scale * sum, group.range.end.max(index + 1))
-                    }
-                    None => (t.value, index + 1),
-                };
+                    .map_or_else(
+                        || (t.value, index + 1),
+                        |group| {
+                            let mut sum = group.terms.first().copied().unwrap_or(0.);
+                            for term in group.terms.iter().skip(1) {
+                                sum += term;
+                            }
+                            (group.scale * sum, group.range.end.max(index + 1))
+                        },
+                    );
                 let i = slot(&mut terms, t.row, t.col);
                 let c = &mut terms[i].capacitance;
                 *c = Some(c.map_or(value, |c| c + value));

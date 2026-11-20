@@ -759,24 +759,23 @@ impl Device for Bsim3 {
             None
         };
         let vgb = vgs - vbs;
-        let (ceqq, gc) = match charge {
-            Some(charge) => stamp_charge(pol, context, charge, e.mode, vgb, vbd, vbs)?,
-            None => {
-                for slot in [
-                    slot::QB,
-                    slot::CQB,
-                    slot::QG,
-                    slot::CQG,
-                    slot::QD,
-                    slot::CQD,
-                    slot::QBS,
-                    slot::QBD,
-                    slot::QINV,
-                ] {
-                    context.states.set(slot, 0.)?;
-                }
-                ([0.; 3], ChargeConductances::default())
+        let (ceqq, gc) = if let Some(charge) = charge {
+            stamp_charge(pol, context, charge, e.mode, vgb, vbd, vbs)?
+        } else {
+            for slot in [
+                slot::QB,
+                slot::CQB,
+                slot::QG,
+                slot::CQG,
+                slot::QD,
+                slot::CQD,
+                slot::QBS,
+                slot::QBD,
+                slot::QINV,
+            ] {
+                context.states.set(slot, 0.)?;
             }
+            ([0.; 3], ChargeConductances::default())
         };
 
         // C `b3ld.c`'s RHS and Y terms. The series conductances connect the

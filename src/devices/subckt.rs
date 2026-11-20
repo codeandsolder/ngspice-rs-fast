@@ -607,7 +607,7 @@ impl Expander<'_> {
     /// One frame's literalized models, renamed to `<path>.<name>`. They stay
     /// out of the flattened deck until a device in this frame or a descendant
     /// frame references one, so unused declarations are not invented.
-    fn local_models(&self, cards: &[ModelCard], path: &str) -> BTreeMap<String, LocalModel> {
+    fn local_models(cards: &[ModelCard], path: &str) -> BTreeMap<String, LocalModel> {
         let mut map: BTreeMap<String, LocalModel> = BTreeMap::new();
         for (order, card) in cards.iter().enumerate() {
             let name = format!("{path}.{}", card.name);
@@ -831,7 +831,7 @@ impl Expander<'_> {
             format!("{path}.{}", instance.name)
         };
         let body = self.literalize_body(definition, &scope)?;
-        locals.push(self.local_models(&body.models, &child_path));
+        locals.push(Self::local_models(&body.models, &child_path));
         let result = self.expand_body(
             &child_path,
             depth + 1,

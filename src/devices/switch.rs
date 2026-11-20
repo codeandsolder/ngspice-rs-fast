@@ -681,36 +681,33 @@ impl Device for Switch {
         context: &mut LinearContext<'_>,
         bias: &Vector,
     ) -> SpiceResult<()> {
-        let closed = match context.states {
+        let closed = if let Some(states) = context.states {
             // SWacLoad/CSWacLoad: any non-zero code, including "off in the
             // band", stamps the on conductance.
-            Some(states) => {
-                self.stored(states.get(STATE).copied(), "small-signal")?
-                    .ok_or_else(|| {
-                        SpiceError::circuit(format!("{}: missing small-signal state", self.name))
-                    })?
-                    != SwitchState::ReallyOff
-            }
+            self.stored(states.get(STATE).copied(), "small-signal")?
+                .ok_or_else(|| {
+                    SpiceError::circuit(format!("{}: missing small-signal state", self.name))
+                })?
+                != SwitchState::ReallyOff
+        } else {
             // Zero-bias assemblies (forcing/breakpoint extraction) carry no
             // solved state: use the MODEINITJCT state at `bias`.
-            None => {
-                let unknowns = context.unknowns;
-                let control = self.control_value(
-                    |node| {
-                        unknowns
-                            .node_row(node)
-                            .and_then(|row| bias.get(row))
-                            .unwrap_or(0.)
-                    },
-                    |row| {
-                        bias.get(row).ok_or_else(|| {
-                            SpiceError::circuit("bias row out of range for a switch control")
-                        })
-                    },
-                    context.controls,
-                )?;
-                self.flag_state(control).is_closed()
-            }
+            let unknowns = context.unknowns;
+            let control = self.control_value(
+                |node| {
+                    unknowns
+                        .node_row(node)
+                        .and_then(|row| bias.get(row))
+                        .unwrap_or(0.)
+                },
+                |row| {
+                    bias.get(row).ok_or_else(|| {
+                        SpiceError::circuit("bias row out of range for a switch control")
+                    })
+                },
+                context.controls,
+            )?;
+            self.flag_state(control).is_closed()
         };
         let g = if closed {
             self.model.on_conductance
@@ -728,26 +725,21 @@ impl Device for Switch {
     /// small-signal state (any non-zero code is on, as `(int) CKTstate0` in
     /// C), or from the instance flag's `MODEINITJCT` state without one.
     fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
-        let closed = match context.states {
-            Some(states) => {
-                self.stored(states.get(STATE).copied(), "noise")?
-                    .ok_or_else(|| {
-                        SpiceError::circuit(format!("{}: missing noise state", self.name))
-                    })?
-                    != SwitchState::ReallyOff
-            }
-            None => {
-                let control = self.control_value(
-                    |node| context.voltage(node),
-                    |row| {
-                        context.bias.get(row).ok_or_else(|| {
-                            SpiceError::circuit("bias row out of range for a switch control")
-                        })
-                    },
-                    context.controls,
-                )?;
-                self.flag_state(control).is_closed()
-            }
+        let closed = if let Some(states) = context.states {
+            self.stored(states.get(STATE).copied(), "noise")?
+                .ok_or_else(|| SpiceError::circuit(format!("{}: missing noise state", self.name)))?
+                != SwitchState::ReallyOff
+        } else {
+            let control = self.control_value(
+                |node| context.voltage(node),
+                |row| {
+                    context.bias.get(row).ok_or_else(|| {
+                        SpiceError::circuit("bias row out of range for a switch control")
+                    })
+                },
+                context.controls,
+            )?;
+            self.flag_state(control).is_closed()
         };
         let conductance = if closed {
             self.model.on_conductance

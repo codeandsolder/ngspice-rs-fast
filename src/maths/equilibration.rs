@@ -178,7 +178,7 @@ impl Equilibration {
             .collect()
     }
 
-    fn transform_real(&self, values: &Vector, factors: &[f64]) -> SpiceResult<Vector> {
+    fn transform_real(values: &Vector, factors: &[f64]) -> SpiceResult<Vector> {
         if values.len() != factors.len() {
             return Err(numerical(
                 "equilibration transform",
@@ -195,7 +195,7 @@ impl Equilibration {
         ))
     }
 
-    fn transform_complex(&self, values: &[Complex], factors: &[f64]) -> SpiceResult<Vec<Complex>> {
+    fn transform_complex(values: &[Complex], factors: &[f64]) -> SpiceResult<Vec<Complex>> {
         if values.len() != factors.len() {
             return Err(numerical(
                 "equilibration transform",
@@ -412,9 +412,9 @@ impl EquilibratedDenseLu {
     /// # Errors
     /// Invalid RHS, failed transforms, checked solve or original-unit residual.
     pub fn solve(&self, rhs: &Vector) -> SpiceResult<Vector> {
-        let scaled_rhs = self.scaling.transform_real(rhs, &self.scaling.rows)?;
+        let scaled_rhs = Equilibration::transform_real(rhs, &self.scaling.rows)?;
         let y = self.factor.solve(&scaled_rhs)?;
-        let x = self.scaling.transform_real(&y, &self.scaling.columns)?;
+        let x = Equilibration::transform_real(&y, &self.scaling.columns)?;
         self.check_residual(rhs, &x)?;
         Ok(x)
     }
@@ -566,9 +566,9 @@ impl EquilibratedSparseLu {
     /// # Errors
     /// Invalid RHS, failed transforms, checked solve or original-unit residual.
     pub fn solve(&self, rhs: &Vector) -> SpiceResult<Vector> {
-        let scaled_rhs = self.scaling.transform_real(rhs, &self.scaling.rows)?;
+        let scaled_rhs = Equilibration::transform_real(rhs, &self.scaling.rows)?;
         let y = self.factor.solve(&scaled_rhs)?;
-        let x = self.scaling.transform_real(&y, &self.scaling.columns)?;
+        let x = Equilibration::transform_real(&y, &self.scaling.columns)?;
         self.check_residual(rhs, &x)?;
         Ok(x)
     }
@@ -646,9 +646,9 @@ impl EquilibratedComplexLu {
     /// # Errors
     /// Invalid RHS, failed transforms, checked solve or original-unit residual.
     pub fn solve(&self, rhs: &[Complex]) -> SpiceResult<Vec<Complex>> {
-        let scaled_rhs = self.scaling.transform_complex(rhs, &self.scaling.rows)?;
+        let scaled_rhs = Equilibration::transform_complex(rhs, &self.scaling.rows)?;
         let y = self.factor.solve(&scaled_rhs)?;
-        let x = self.scaling.transform_complex(&y, &self.scaling.columns)?;
+        let x = Equilibration::transform_complex(&y, &self.scaling.columns)?;
         self.check_residual(rhs, &x)?;
         Ok(x)
     }

@@ -645,7 +645,7 @@ fn evaluate(plot: &Plot, axis: &Axis, card: &MeasureCard) -> SpiceResult<Measure
             Ok(Measurement {
                 name: card.name.clone(),
                 value,
-                unit: statistic_unit(statistic, &operand, axis),
+                unit: statistic_unit(*statistic, &operand, axis),
                 at,
                 window: span,
                 events: None,
@@ -1157,7 +1157,7 @@ fn crossing_samples(
 }
 
 /// The unit of a statistic's result.
-fn statistic_unit(statistic: &MeasureStatistic, operand: &Operand<'_>, axis: &Axis) -> String {
+fn statistic_unit(statistic: MeasureStatistic, operand: &Operand<'_>, axis: &Axis) -> String {
     match statistic {
         MeasureStatistic::PhaseMargin => "degrees".into(),
         MeasureStatistic::GainMargin => "db".into(),

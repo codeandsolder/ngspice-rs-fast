@@ -25,6 +25,7 @@
 //! SPARSE's internal numbering. ngspice instead creates them in device setup
 //! order, so pivot choices can differ from C where Markowitz ties occur.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::maths::sparse13::{Scalar, Sparse, Status};
@@ -381,22 +382,21 @@ pub(in crate::maths) fn factor_shared_complex(
     let cached = pattern.take_ordering().filter(|symbolic| {
         matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern)))
     });
-    let (mut sparse, handles, fresh) = match cached {
-        Some(symbolic) => (
+    let (mut sparse, handles, fresh) = if let Some(symbolic) = cached {
+        (
             symbolic.sparse.retyped::<Complex>(),
             symbolic.handles,
             false,
-        ),
-        None => {
-            let mut sparse = Sparse::<Complex>::new(n);
-            let handles: Vec<_> = (0..pattern.len())
-                .map(|index| {
-                    let (row, col) = pattern.position(crate::maths::sparse::element_id(index));
-                    sparse.get_element(row + 1, col + 1)
-                })
-                .collect();
-            (sparse, Arc::new(handles), true)
-        }
+        )
+    } else {
+        let mut sparse = Sparse::<Complex>::new(n);
+        let handles: Vec<_> = (0..pattern.len())
+            .map(|index| {
+                let (row, col) = pattern.position(crate::maths::sparse::element_id(index));
+                sparse.get_element(row + 1, col + 1)
+            })
+            .collect();
+        (sparse, Arc::new(handles), true)
     };
     let load = |sparse: &mut Sparse<Complex>| {
         sparse.clear();
@@ -549,54 +549,37 @@ fn ni_step(
         *ordering = Some(lu.symbolic);
         return result;
     }
-    let (mut sparse, symbolic, fresh) = match previous {
-        Some(previous) => {
-            let mut sparse =
-                Arc::try_unwrap(previous.sparse).unwrap_or_else(|shared| (*shared).clone());
-            let owned: Vec<f64>;
-            let values: &[f64] = match matrix.bound_values() {
-                Some((_, values)) => {
-                    finite_bound(values)?;
-                    values
-                }
-                None => {
-                    owned = assembled(matrix)?
-                        .triplets()
-                        .iter()
-                        .map(|t| t.value)
-                        .collect();
-                    &owned
-                }
-            };
-            sparse.clear();
-            for (handle, value) in previous.handles.iter().zip(values) {
-                sparse.set(*handle, *value);
-            }
-            let symbolic = SparseSymbolic {
-                sparse: Arc::new(Sparse::new(0)),
-                factored: None,
-                ..previous
-            };
-            (sparse, symbolic, false)
+    let (mut sparse, symbolic, fresh) = if let Some(previous) = previous {
+        let mut sparse =
+            Arc::try_unwrap(previous.sparse).unwrap_or_else(|shared| (*shared).clone());
+        let values = matrix_values(matrix)?;
+        sparse.clear();
+        for (handle, value) in previous.handles.iter().zip(values.iter()) {
+            sparse.set(*handle, *value);
         }
-        None => {
-            let (mut sparse, symbolic) = fresh_frame(matrix)?;
-            if !sparse.fully_translated() {
-                // A circuit's matrix (bound, or carrying unknown names)
-                // follows C: an unknown without entries stays untranslated
-                // and its solution entry holds the RHS. A standalone one
-                // is rejected.
-                if matrix.unknown_names().is_none() && matrix.bound_values().is_none() {
-                    return Err(numerical(
-                        "sparse LU",
-                        "singular matrix: an unknown has no matrix entries",
-                    ));
-                }
-                warn_untranslated(&sparse, matrix.unknown_names());
+        let symbolic = SparseSymbolic {
+            sparse: Arc::new(Sparse::new(0)),
+            factored: None,
+            ..previous
+        };
+        (sparse, symbolic, false)
+    } else {
+        let (mut sparse, symbolic) = fresh_frame(matrix)?;
+        if !sparse.fully_translated() {
+            // A circuit's matrix (bound, or carrying unknown names)
+            // follows C: an unknown without entries stays untranslated
+            // and its solution entry holds the RHS. A standalone one
+            // is rejected.
+            if matrix.unknown_names().is_none() && matrix.bound_values().is_none() {
+                return Err(numerical(
+                    "sparse LU",
+                    "singular matrix: an unknown has no matrix entries",
+                ));
             }
-            sparse.mna_preorder();
-            (sparse, symbolic, true)
+            warn_untranslated(&sparse, matrix.unknown_names());
         }
+        sparse.mna_preorder();
+        (sparse, symbolic, true)
     };
     sparse.load_gmin(diag_gmin);
     let status = if fresh || reorder {
@@ -696,6 +679,23 @@ fn finite_bound(values: &[f64]) -> SpiceResult<()> {
     Ok(())
 }
 
+/// Share the bound-value and folded-triplet extraction path between sparse
+/// refactorizations, borrowing an existing matrix view where possible.
+fn matrix_values(matrix: &SparseMatrix) -> SpiceResult<Cow<'_, [f64]>> {
+    if let Some((_, values)) = matrix.bound_values() {
+        finite_bound(values)?;
+        Ok(Cow::Borrowed(values))
+    } else {
+        Ok(Cow::Owned(
+            assembled(matrix)?
+                .triplets()
+                .iter()
+                .map(|t| t.value)
+                .collect(),
+        ))
+    }
+}
+
 impl SparseLu {
     /// Factors a snapshot, optionally refactoring with the pivot order of an
     /// identical earlier pattern.
@@ -787,24 +787,10 @@ impl SparseLu {
             factored: _,
         } = previous;
         let mut sparse = Arc::try_unwrap(sparse).unwrap_or_else(|shared| (*shared).clone());
-        let owned: Vec<f64>;
-        let values: &[f64] = match matrix.bound_values() {
-            Some((_, values)) => {
-                finite_bound(values)?;
-                values
-            }
-            None => {
-                owned = assembled(matrix)?
-                    .triplets()
-                    .iter()
-                    .map(|t| t.value)
-                    .collect();
-                &owned
-            }
-        };
+        let values = matrix_values(matrix)?;
         let load = |sparse: &mut Sparse<f64>| {
             sparse.clear();
-            for (handle, value) in handles.iter().zip(values) {
+            for (handle, value) in handles.iter().zip(values.iter()) {
                 sparse.set(*handle, *value);
             }
         };
