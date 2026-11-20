@@ -1,14 +1,10 @@
-//! BSIM3v3.3 input plumbing (B3-0 foundation, #90).
+//! BSIM3v3.3 device backend and validated parameter interface.
 //!
-//! This is deliberately **not a simulation backend**.
-//!
-//! The generated `IFparm` interface facts cover the complete model/instance
-//! tables; the validated
-//! projection applies ordered explicit setters and preserves provenance, and
-//! [`defaults`], [`temperature`] and [`setup`] reproduce `b3set.c`/`b3temp.c`
-//! defaults and `b3check.c` diagnostics, including effective geometry. Every
-//! factory call still returns `NotYetPorted` after validation, before interning
-//! nodes, allocating states or loading DC/AC/charge terms.
+//! Generated `IFparm` facts describe model and instance setters. The input
+//! projection retains ordered setters and provenance; defaults, temperature
+//! and setup implement model checks and effective geometry before device
+//! loading. DC, charge, small-signal and noise equations use the prepared
+//! instance, with explicit errors for unsupported combinations.
 
 use crate::devices::ifparam::{Device, descriptor, version_text};
 use crate::devices::models::{ModelFamily, ResolvedModel};

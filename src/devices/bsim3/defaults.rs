@@ -1,9 +1,10 @@
 //! Model-only default processing from `b3set.c::BSIM3setup`, before instance
 //! geometry, state/node allocation, temperature scaling or effective-size
 //! `b3check.c` diagnostics. Keep this phase distinct from raw explicit inputs.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::OnceLock;
 
-use super::{InputType, ModelParameters, Value, defaults_data, descriptor, parameters};
+use super::{InputType, ModelParameters, Parameter, Value, defaults_data, descriptor, parameters};
 use crate::devices::ModelContext;
 use crate::devices::schema::temperature_kelvin;
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
@@ -12,6 +13,27 @@ const EPS_OXIDE: Real = 3.453_133e-11;
 // b3set.c uses this rounded constant, not the platform's full-precision pi.
 // Preserve the exact binary64 value of b3set.c's deliberately rounded PI.
 const SETUP_PI: Real = Real::from_bits(0x4009_21fb_5452_4550);
+
+/// The generated descriptor remains authoritative; index its canonical
+/// spelling and aliases once instead of scanning hundreds of rows at every
+/// model-field access in setup and the numerical load. Mixed-case external
+/// input retains the shared descriptor's ASCII-insensitive semantics.
+fn model_descriptor(name: &str) -> Option<&'static Parameter> {
+    static INDEX: OnceLock<HashMap<&'static str, &'static Parameter>> = OnceLock::new();
+    let index = INDEX.get_or_init(|| {
+        let mut index = HashMap::with_capacity(parameters::MODEL.len());
+        for parameter in parameters::MODEL {
+            index.entry(parameter.name).or_insert(parameter);
+        }
+        index
+    });
+    index.get(name).copied().or_else(|| {
+        name.bytes()
+            .any(|b| b.is_ascii_uppercase())
+            .then(|| descriptor(parameters::MODEL, name))
+            .flatten()
+    })
+}
 
 /// A model selector reset performed by `b3set.c`, with the given flag retained.
 /// Device-layer code returns diagnostics rather than printing them.
@@ -51,7 +73,7 @@ impl ModelDefaults {
     /// Flags and VERSION are exposed separately; aliases use the same C ID.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Real> {
-        let parameter = descriptor(parameters::MODEL, name)?;
+        let parameter = model_descriptor(name)?;
         self.numeric.get(&parameter.id).copied()
     }
 
@@ -63,7 +85,7 @@ impl ModelDefaults {
     /// # Errors
     /// Missing, non-integer, nonfinite or out-of-range internal model fields.
     pub(super) fn integer(&self, name: &str) -> SpiceResult<i32> {
-        let field = descriptor(parameters::MODEL, name)
+        let field = model_descriptor(name)
             .filter(|field| field.input_type == InputType::Integer)
             .ok_or_else(|| {
                 SpiceError::circuit(format!("BSIM3 model field {name} is not an integer"))
@@ -93,7 +115,7 @@ impl ModelDefaults {
     /// default. Aliases (and the two type flags) share their actual C bit.
     #[must_use]
     pub fn is_given(&self, name: &str) -> bool {
-        descriptor(parameters::MODEL, name)
+        model_descriptor(name)
             .and_then(|p| p.c_given)
             .is_some_and(|flag| self.given.contains(flag))
     }
@@ -111,7 +133,7 @@ impl ModelDefaults {
     }
 
     fn set(&mut self, name: &str, value: Real) -> SpiceResult<()> {
-        let p = descriptor(parameters::MODEL, name)
+        let p = model_descriptor(name)
             .ok_or_else(|| SpiceError::circuit(format!("unknown internal BSIM3 default {name}")))?;
         // Dependent defaults may legitimately be nonfinite when a given TOX is
         // not positive; `b3check.c` reports that in the instance phase, as C
@@ -255,6 +277,30 @@ impl ModelDefaults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_model_descriptor_matches_generated_order_and_aliases() {
+        for parameter in parameters::MODEL {
+            assert!(
+                parameter
+                    .name
+                    .bytes()
+                    .all(|byte| !byte.is_ascii_uppercase())
+            );
+            for name in [
+                parameter.name.to_owned(),
+                parameter.name.to_ascii_uppercase(),
+            ] {
+                assert_eq!(
+                    model_descriptor(&name),
+                    descriptor(parameters::MODEL, &name),
+                    "{name}"
+                );
+            }
+        }
+        assert_eq!(model_descriptor("missing"), None);
+        assert_eq!(model_descriptor("MISSING"), None);
+    }
 
     #[test]
     fn integer_model_fields_validate_type_and_c_bounds() {
