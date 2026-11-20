@@ -64,6 +64,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::devices::delay::{DelayHistory, DelayUpdate};
 
@@ -96,11 +97,41 @@ fn state_error(message: impl Into<String>) -> SpiceError {
     }
 }
 
+/// MODEINITTRAN writes into CKTstate1 during a solve. A sparse, immutable
+/// snapshot is shared by subsequent Newton trials until another write. Each
+/// absolute slot keeps only its latest value.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct State1Patches(Option<Arc<BTreeMap<usize, Real>>>);
+
+impl State1Patches {
+    fn get(&self, slot: usize) -> Option<Real> {
+        self.0.as_deref()?.get(&slot).copied()
+    }
+
+    fn set(&mut self, slot: usize, value: Real) {
+        Arc::make_mut(self.0.get_or_insert_with(Default::default)).insert(slot, value);
+    }
+
+    fn apply(&self, accepted: &mut [Arc<[Real]>]) {
+        let Some(patches) = self.0.as_deref() else {
+            return;
+        };
+        // C copies the first step's patched state1 into state2 and state3
+        // before rotation. Do not detach older or unmodified vectors.
+        for vector in accepted.iter_mut().take(3) {
+            let values = Arc::make_mut(vector);
+            for (&slot, &value) in patches {
+                values[slot] = value;
+            }
+        }
+    }
+}
+
 /// Accepted device state vectors, most recent first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateHistory {
     len: usize,
-    accepted: Vec<Vec<Real>>,
+    accepted: Vec<Arc<[Real]>>,
     /// C's `CKTstate0` as the previous analysis of the deck left it (C runs
     /// every analysis on the same state vectors), read through
     /// [`DeviceState::carried`].
@@ -154,29 +185,57 @@ impl StateHistory {
     /// [`SpiceError::Numerical`] for a device without a delay history or an
     /// update [`DelayHistory::check`] rejects.
     pub fn check_delays(&self, updates: &[(usize, DelayUpdate)]) -> SpiceResult<()> {
+        self.prepare_delays(updates).map(drop)
+    }
+
+    /// Validate one update per history and retain the verified association.
+    /// The map is private to the acceptance transaction, so no history can
+    /// change between this check and publication.
+    fn prepare_delays<'a>(
+        &self,
+        updates: &'a [(usize, DelayUpdate)],
+    ) -> SpiceResult<BTreeMap<usize, &'a DelayUpdate>> {
+        let mut checked = BTreeMap::new();
         for (device, update) in updates {
             self.delays
                 .get(device)
                 .ok_or_else(|| state_error(format!("device {device} has no delay history")))?
                 .check(update)?;
-        }
-        Ok(())
-    }
-
-    /// Applies delay updates that [`Self::check_delays`] accepted; nothing
-    /// changes on error.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::check_delays`].
-    pub(crate) fn apply_delays(&mut self, updates: &[(usize, DelayUpdate)]) -> SpiceResult<()> {
-        self.check_delays(updates)?;
-        for (device, update) in updates {
-            if let Some(history) = self.delays.get_mut(device) {
-                history.apply(update)?;
+            if checked.insert(*device, update).is_some() {
+                return Err(state_error(format!(
+                    "duplicate delay update for device {device}"
+                )));
             }
         }
-        Ok(())
+        Ok(checked)
+    }
+
+    /// Commit fixed state and delay histories as one transaction. The
+    /// preparation callback cannot mutate history; the last fallible step
+    /// is the circuit's accept hooks. Breakpoints retain the original
+    /// device visitation order, not the map's ordinal order.
+    pub(super) fn accept_transaction(
+        &mut self,
+        trial: TrialState,
+        prepare: impl FnOnce(&Self, &TrialState) -> SpiceResult<Vec<(usize, DelayUpdate)>>,
+        before_commit: impl FnOnce(&TrialState) -> SpiceResult<()>,
+    ) -> SpiceResult<Vec<Real>> {
+        self.check(&trial)?;
+        let updates = prepare(self, &trial)?;
+        let checked = self.prepare_delays(&updates)?;
+        before_commit(&trial)?;
+        self.commit_validated(trial);
+        if !checked.is_empty() {
+            for (device, history) in &mut self.delays {
+                if let Some(update) = checked.get(device) {
+                    history.apply_validated(update);
+                }
+            }
+        }
+        Ok(updates
+            .into_iter()
+            .flat_map(|(_, update)| update.breakpoints)
+            .collect())
     }
 
     /// Number of state slots per vector.
@@ -202,7 +261,7 @@ impl StateHistory {
     pub fn accepted(&self, age: usize) -> Option<&[Real]> {
         age.checked_sub(1)
             .and_then(|index| self.accepted.get(index))
-            .map(Vec::as_slice)
+            .map(AsRef::as_ref)
     }
 
     /// A fresh trial in [`IterationPhase::Junction`] with no previous
@@ -212,7 +271,7 @@ impl StateHistory {
     #[must_use]
     pub fn trial(&self) -> TrialState {
         TrialState {
-            values: vec![Real::NAN; self.len],
+            values: std::iter::repeat_n(Real::NAN, self.len).collect(),
             phase: IterationPhase::Junction,
             previous: None,
             nonconvergent: false,
@@ -222,7 +281,7 @@ impl StateHistory {
             tolerances: None,
             initial_transient: false,
             uic: false,
-            patches: Vec::new(),
+            patches: State1Patches::default(),
         }
     }
 
@@ -244,9 +303,9 @@ impl StateHistory {
             return Err(state_error("previous iterate does not match the history"));
         }
         Ok(TrialState {
-            values: vec![Real::NAN; self.len],
+            values: std::iter::repeat_n(Real::NAN, self.len).collect(),
             phase,
-            previous: previous.map(|previous| previous.values.clone()),
+            previous: previous.map(|previous| Arc::clone(&previous.values)),
             nonconvergent: false,
             device_limiting: true,
             initial_conditions: false,
@@ -291,18 +350,14 @@ impl StateHistory {
     /// As [`Self::check`].
     pub fn commit(&mut self, trial: TrialState) -> SpiceResult<()> {
         self.check(&trial)?;
-        // dctran.c: the first step's MODEINITTRAN writes into CKTstate1, which
-        // is then copied into CKTstate2 and CKTstate3 before the rotation.
-        for vector in self.accepted.iter_mut().take(3) {
-            for &(slot, value) in &trial.patches {
-                if let Some(target) = vector.get_mut(slot) {
-                    *target = value;
-                }
-            }
-        }
+        self.commit_validated(trial);
+        Ok(())
+    }
+
+    fn commit_validated(&mut self, trial: TrialState) {
+        trial.patches.apply(&mut self.accepted);
         self.accepted.insert(0, trial.values);
         self.accepted.truncate(ACCEPTED_DEPTH);
-        Ok(())
     }
 
     /// Forgets every accepted vector and delay sample, e.g. when a run
@@ -372,11 +427,11 @@ impl StateHistory {
             patches,
         } = trial;
         let carried = self.carried.as_deref().map(|vector| &vector[range.clone()]);
-        let previous: Option<&'a [Real]> = previous.as_ref().map(|vector| &vector[range.clone()]);
+        let previous = previous.as_deref().map(|vector| &vector[range.clone()]);
         Ok(DeviceState {
             previous,
             carried,
-            trial: &mut values[range.clone()],
+            trial: &mut Arc::make_mut(values)[range.clone()],
             accepted,
             depth: self.accepted.len(),
             phase: *phase,
@@ -416,12 +471,14 @@ pub enum IterationPhase {
     Float,
 }
 
-/// The trial state vector (C `CKTstate0`) for one load.
+/// The trial state vector (C `CKTstate0`) for one load. Newton iterations
+/// share read-only snapshots of the preceding load instead of copying all
+/// its state slots; mutating a cloned trial detaches its own vector.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrialState {
-    values: Vec<Real>,
+    values: Arc<[Real]>,
     phase: IterationPhase,
-    previous: Option<Vec<Real>>,
+    previous: Option<Arc<[Real]>>,
     nonconvergent: bool,
     device_limiting: bool,
     initial_conditions: bool,
@@ -432,7 +489,7 @@ pub struct TrialState {
     /// `MODEINITTRAN` writes into `CKTstate1` (absolute slot, value), seen by
     /// the later loads of the same solve and applied when the trial is
     /// committed ([`DeviceState::patch_state1`]).
-    patches: Vec<(usize, Real)>,
+    patches: State1Patches,
 }
 
 impl TrialState {
@@ -547,7 +604,7 @@ pub struct DeviceState<'a> {
     uic: bool,
     /// This window's first absolute slot.
     offset: usize,
-    patches: Option<&'a mut Vec<(usize, Real)>>,
+    patches: Option<&'a mut State1Patches>,
     delay: Option<&'a DelayHistory>,
 }
 
@@ -586,7 +643,7 @@ impl DeviceState<'_> {
             return Err(state_error("invalid CKTstate1 write"));
         }
         if let Some(patches) = self.patches.as_deref_mut() {
-            patches.push((self.offset + slot, value));
+            patches.set(self.offset + slot, value);
         }
         Ok(())
     }
@@ -745,12 +802,14 @@ impl DeviceState<'_> {
     #[must_use]
     #[inline(always)]
     pub fn accepted(&self, age: usize, slot: usize) -> Option<Real> {
+        // Validate the local index before translating it into an absolute
+        // slot: a patch in another device's window is never visible here.
+        if slot >= self.trial.len() {
+            return None;
+        }
         if age == 1
             && let Some(patches) = self.patches.as_deref()
-            && let Some(&(_, value)) = patches
-                .iter()
-                .rev()
-                .find(|(at, _)| *at == self.offset + slot)
+            && let Some(value) = patches.get(self.offset + slot)
         {
             return Some(value);
         }
@@ -837,6 +896,129 @@ mod tests {
         assert_eq!(none.accepted(1, 0), None);
         assert_eq!(none.iterate(0), None);
         assert!(none.report_nonconvergence().is_err());
+    }
+
+    #[test]
+    fn duplicate_delay_updates_never_commit_fixed_or_delay_state() {
+        use crate::devices::delay::DelayUpdate;
+
+        let mut history = StateHistory::new(1).with_delay_lines([(0, 1), (1, 1)]);
+        let mut trial = history.trial();
+        history
+            .device(&mut trial, 0..1)
+            .unwrap()
+            .set(0, 42.)
+            .unwrap();
+        let original = history.clone();
+        let update = |time, breakpoint| DelayUpdate {
+            append: Some((time, vec![time])),
+            breakpoints: vec![breakpoint],
+            ..DelayUpdate::default()
+        };
+        let mut hook_ran = false;
+        let error = history
+            .accept_transaction(
+                trial.clone(),
+                |_, _| Ok(vec![(0, update(1., 3.)), (0, update(2., 4.))]),
+                |_| {
+                    hook_ran = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate delay update"));
+        assert!(!hook_ran);
+        assert_eq!(history, original);
+
+        let updates = || vec![(1, update(1., 4.)), (0, update(1., 3.))];
+        assert!(
+            history
+                .accept_transaction(
+                    trial.clone(),
+                    |_, _| Ok(updates()),
+                    |_| Err(super::state_error("hook refused")),
+                )
+                .is_err()
+        );
+        assert_eq!(history, original);
+        let breaks = history
+            .accept_transaction(trial, |_, _| Ok(updates()), |_| Ok(()))
+            .unwrap();
+        assert_eq!(breaks, vec![4., 3.]);
+        assert_eq!(history.accepted(1), Some(&[42.][..]));
+        for device in [0, 1] {
+            assert_eq!(history.delay(device).unwrap().last_time(), Some(1.));
+        }
+    }
+
+    #[test]
+    fn state1_patches_are_local_last_write_wins_and_transactional() {
+        let mut history = StateHistory::new(4);
+        for step in 0..4 {
+            let mut trial = history.trial();
+            let mut device = history.device(&mut trial, 0..4).unwrap();
+            for slot in 0..4 {
+                device.set(slot, f64::from(step)).unwrap();
+            }
+            history.commit(trial).unwrap();
+        }
+        let original = history.clone();
+        let mut trial = history.trial();
+        {
+            let mut first = history.device(&mut trial, 0..2).unwrap();
+            first.set(0, 7.).unwrap();
+            first.set(1, 8.).unwrap();
+        }
+        {
+            let mut second = history.device(&mut trial, 2..4).unwrap();
+            second.patch_state1(0, 10.).unwrap();
+            second.patch_state1(0, 11.).unwrap();
+            second.patch_state1(1, 12.).unwrap();
+            second.set(0, 9.).unwrap();
+            second.set(1, 10.).unwrap();
+            assert_eq!(second.accepted(1, 0), Some(11.));
+            assert_eq!(second.accepted(1, usize::MAX), None);
+        }
+        {
+            let first = history.device(&mut trial, 0..2).unwrap();
+            assert_eq!(first.accepted(1, 0), Some(3.));
+            assert_eq!(first.accepted(1, 2), None);
+            assert_eq!(first.accepted(1, usize::MAX), None);
+        }
+        let mut next = history
+            .trial_in(IterationPhase::Float, Some(&trial))
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            next.previous.as_ref().unwrap(),
+            &trial.values
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            next.patches.0.as_ref().unwrap(),
+            trial.patches.0.as_ref().unwrap()
+        ));
+        {
+            let mut device = history.device(&mut next, 2..4).unwrap();
+            assert_eq!(device.iterate(0), Some(9.));
+            device.patch_state1(0, 20.).unwrap();
+            assert_eq!(device.accepted(1, 0), Some(20.));
+        }
+        // Rejecting the second load leaves the first trial and original
+        // history untouched. A cloned trial's value writes detach too.
+        let mut rejected = trial.clone();
+        {
+            let mut device = history.device(&mut rejected, 2..4).unwrap();
+            device.set(0, 99.).unwrap();
+        }
+        assert_eq!(trial.values()[2], 9.);
+        assert_eq!(trial.patches.get(2), Some(11.));
+        assert_eq!(history, original);
+        history.commit(trial).unwrap();
+        assert_eq!(history.accepted(1), Some(&[7., 8., 9., 10.][..]));
+        for (age, value) in [(2, 3.), (3, 2.), (4, 1.)] {
+            assert_eq!(history.accepted(age), Some(&[value, value, 11., 12.][..]));
+        }
+        assert_eq!(history.accepted(5), Some(&[0., 0., 0., 0.][..]));
+        assert_eq!(original.accepted(1), Some(&[3., 3., 3., 3.][..]));
     }
 
     #[test]

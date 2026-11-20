@@ -1777,9 +1777,13 @@ impl Circuit {
                 "state history does not match the circuit numbering",
             ));
         }
-        history.check(&trial)?;
-        self.run_accept_hooks(solution, time, Some(&trial))?;
-        history.commit(trial)
+        history
+            .accept_transaction(
+                trial,
+                |_, _| Ok(Vec::new()),
+                |trial| self.run_accept_hooks(solution, time, Some(trial)),
+            )
+            .map(drop)
     }
 
     /// Accepts a companion-transient point: [`Self::accept_point`] plus the
@@ -1811,7 +1815,22 @@ impl Circuit {
                 "state history does not match the circuit numbering",
             ));
         }
-        history.check(&trial)?;
+        history.accept_transaction(
+            trial,
+            |history, trial| self.delay_updates(solution, time, history, trial, delay),
+            |trial| self.run_accept_hooks(solution, Some(time), Some(trial)),
+        )
+    }
+
+    /// Compute delay updates in C's load order without modifying history.
+    fn delay_updates(
+        &self,
+        solution: &Vector,
+        time: Real,
+        history: &StateHistory,
+        trial: &TrialState,
+        delay: &DelayAcceptance,
+    ) -> SpiceResult<Vec<(usize, crate::devices::delay::DelayUpdate)>> {
         let mut updates = Vec::new();
         // TRAaccept walks C's model/instance lists: the load order.
         for index in self.load_order() {
@@ -1856,14 +1875,7 @@ impl Circuit {
             };
             updates.push((index, update));
         }
-        history.check_delays(&updates)?;
-        self.run_accept_hooks(solution, Some(time), Some(&trial))?;
-        history.commit(trial)?;
-        history.apply_delays(&updates)?;
-        Ok(updates
-            .into_iter()
-            .flat_map(|(_, update)| update.breakpoints)
-            .collect())
+        Ok(updates)
     }
 
     /// The tightest step bound of every delay line for a converged transient

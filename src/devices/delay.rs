@@ -88,7 +88,7 @@ impl DelayHistory {
     /// Value `component` of sample `index`.
     #[must_use]
     pub fn value(&self, index: usize, component: usize) -> Option<Real> {
-        if component >= self.width {
+        if index >= self.len() || component >= self.width {
             return None;
         }
         self.values.get(index * self.width + component).copied()
@@ -157,13 +157,18 @@ impl DelayHistory {
         Ok(())
     }
 
-    /// Applies an update [`Self::check`] accepted.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::check`]; nothing changes on error.
+    /// Checked standalone application for line-model unit tests. Production
+    /// updates are committed together by StateHistory::accept_transaction.
+    #[cfg(test)]
     pub(crate) fn apply(&mut self, update: &DelayUpdate) -> SpiceResult<()> {
         self.check(update)?;
+        self.apply_validated(update);
+        Ok(())
+    }
+
+    /// Publish an update preflighted by the owning state transaction.
+    /// No fallible validation remains after fixed state has been committed.
+    pub(super) fn apply_validated(&mut self, update: &DelayUpdate) {
         if let Some(reset) = &update.reset {
             self.times.clear();
             self.values.clear();
@@ -179,7 +184,6 @@ impl DelayHistory {
             self.times.push_back(*time);
             self.values.extend(values.iter().copied());
         }
-        Ok(())
     }
 
     /// Forgets every sample (a restarted run).
@@ -314,6 +318,8 @@ mod tests {
         assert_eq!(history.time(0), Some(-2.));
         assert_eq!(history.value(2, 1), Some(-1.));
         assert_eq!(history.value(2, 2), None);
+        assert_eq!(history.value(usize::MAX, 0), None);
+        assert_eq!(history.value(usize::MAX / 2 + 1, 0), None);
         history
             .apply(&DelayUpdate {
                 drop_front: 1,
