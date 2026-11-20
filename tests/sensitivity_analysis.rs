@@ -142,6 +142,69 @@ fn resistor_records_preserve_given_flags_aliases_and_geometry() {
     close(instance.value("conduct").unwrap(), 0.004, 1e-12);
 }
 
+/// Initial records preserve explicit zero ICs, modeled geometry, written
+/// defaults and the distinct C capacitance/inductance multiplier semantics.
+#[test]
+fn reactive_records_preserve_literal_and_modeled_inputs() {
+    use ngspice_rs::devices::{Circuit, ModelContext};
+
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("reactive-records.cir"),
+            "reactive records\nc1 a 0 2u ic=0\nl1 b 0 3m ic=-1\nc2 c 0 cm l=4u m=2 scale=1 tc1=0 temp=50\nl2 d 0 lm m=3 scale=2 tc1=0 temp=50\n.model cm c cj=0.5 defw=2u tc1=0.01 tnom=20\n.model lm l ind=4m tc1=0.01 tnom=20\n.end\n",
+        ))
+        .unwrap();
+    let circuit = Circuit::from_netlist(&netlist).unwrap();
+    let describe = |name| {
+        circuit
+            .devices()
+            .iter()
+            .find(|device| device.name() == name)
+            .unwrap()
+            .sensitivity(&ModelContext::default())
+            .unwrap()
+    };
+
+    for (name, principal, value, ic) in [
+        ("c1", "capacitance", 2e-6, 0.),
+        ("l1", "inductance", 3e-3, -1.),
+    ] {
+        let literal = describe(name);
+        assert!(literal.model().is_none());
+        let (model, instance) = literal.records().unwrap();
+        assert!(!model.given("tnom"));
+        assert!(instance.given(principal) && instance.given("ic"));
+        assert!(!instance.given("temp") && !instance.given("m") && !instance.given("scale"));
+        close(instance.value(principal).unwrap(), value, 1e-12);
+        close(instance.value("ic").unwrap(), ic, 1e-12);
+    }
+
+    let capacitor = describe("c2");
+    assert_eq!(capacitor.model(), Some("cm"));
+    let (model, instance) = capacitor.records().unwrap();
+    assert!(model.given("cj") && model.given("defw") && model.given("tnom"));
+    assert!(!model.given("cap") && !model.given("cjsw"));
+    assert!(instance.given("l") && instance.given("m") && instance.given("scale"));
+    assert!(instance.given("tc1") && instance.given("temp"));
+    assert!(!instance.given("capacitance") && !instance.given("w") && !instance.given("ic"));
+    close(instance.value("w").unwrap(), 2e-6, 1e-12);
+    assert_eq!(
+        instance.value("capac").unwrap().to_bits(),
+        (0.5_f64 * 2e-6 * 4e-6).to_bits()
+    );
+    close(instance.value("temp").unwrap(), 323.15, 1e-12);
+
+    let inductor = describe("l2");
+    assert_eq!(inductor.model(), Some("lm"));
+    let (model, instance) = inductor.records().unwrap();
+    assert!(model.given("ind") && model.given("tc1") && model.given("tnom"));
+    assert!(!model.given("csect") && !model.given("nt"));
+    assert!(instance.given("m") && instance.given("scale") && instance.given("tc1"));
+    assert!(!instance.given("inductance") && !instance.given("ic") && !instance.given("nt"));
+    close(instance.value("induct").unwrap(), 8e-3, 1e-12);
+    close(instance.value("m").unwrap(), 3., 1e-12);
+}
+
 /// C's `sgen` order and names: device types in `DEVices[]` order, later
 /// models and instances first, model parameters `inst:kw`, the first
 /// principal instance parameter `inst`, the rest `inst_kw`.

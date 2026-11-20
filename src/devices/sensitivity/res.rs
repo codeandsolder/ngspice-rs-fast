@@ -3,11 +3,10 @@
 //! `resload.c` (`RESload`, `RESacload`).
 
 use super::{
-    CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, RecordPair, SensitivityConductance,
-    SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
-    SensitivityRecord, written,
+    CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, PassiveInputs, RecordPair,
+    SensitivityConductance, SensitivityFamily, SensitivityLoad, SensitivityMode,
+    SensitivityParameter as P, SensitivityRecord,
 };
-use crate::devices::schema::ScalarValues;
 use crate::primitives::{NodeId, Real, SpiceResult};
 
 /// `RESmPTable` entries `set_param()` accepts (`defw`, `l` and `tnom` are
@@ -47,36 +46,6 @@ const INSTANCE: &[P] = &[
 /// `RESMIN` of `resparam.c`.
 const RESMIN: Real = 1e-12;
 
-/// Where the given resistor parameters come from. A literal has no model
-/// card and only its resistance given; a modeled device already holds its
-/// validated instance and model setters, including the schema defaults.
-#[derive(Debug)]
-pub(in crate::devices) enum ResistorInputs<'a> {
-    Literal(Real),
-    Modeled {
-        name: &'a str,
-        model: &'a ScalarValues,
-        instance: &'a ScalarValues,
-    },
-}
-
-impl ResistorInputs<'_> {
-    fn model_value(&self, keyword: &str) -> Option<Real> {
-        match self {
-            Self::Literal(_) => None,
-            Self::Modeled { model, .. } => written(model, keyword),
-        }
-    }
-
-    fn instance_value(&self, keyword: &str) -> Option<Real> {
-        match self {
-            Self::Literal(resistance) if keyword == "resistance" => Some(*resistance),
-            Self::Literal(_) => None,
-            Self::Modeled { instance, .. } => written(instance, keyword),
-        }
-    }
-}
-
 /// A resistor's `.sens` description, borrowing the device's immutable card.
 #[derive(Debug)]
 pub(in crate::devices) struct ResistorSensitivity<'a> {
@@ -85,14 +54,14 @@ pub(in crate::devices) struct ResistorSensitivity<'a> {
     /// `CKTtemp`, `CKTnomTemp` in kelvin.
     circuit_kelvin: Real,
     nominal_kelvin: Real,
-    inputs: ResistorInputs<'a>,
+    inputs: PassiveInputs<'a>,
 }
 
 impl<'a> ResistorSensitivity<'a> {
     pub(crate) fn new(
         name: &'a str,
         terminals: [NodeId; 2],
-        inputs: ResistorInputs<'a>,
+        inputs: PassiveInputs<'a>,
         context: &crate::devices::ModelContext,
     ) -> Self {
         Self {
@@ -115,10 +84,7 @@ impl DeviceSensitivity for ResistorSensitivity<'_> {
     }
 
     fn model(&self) -> Option<&str> {
-        match &self.inputs {
-            ResistorInputs::Literal(_) => None,
-            ResistorInputs::Modeled { name, .. } => Some(name),
-        }
+        self.inputs.model_name()
     }
 
     fn model_parameters(&self) -> &'static [P] {
@@ -131,6 +97,7 @@ impl DeviceSensitivity for ResistorSensitivity<'_> {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let i = &self.inputs;
+        let instance_value = |keyword| i.instance_value("resistance", keyword);
         let entry = |record: SensitivityRecord, keyword, value: Option<Real>, default| {
             let (value, given) = field(value, default);
             record.with(keyword, value, given)
@@ -154,19 +121,19 @@ impl DeviceSensitivity for ResistorSensitivity<'_> {
         model = entry(model, "wf", i.model_value("wf"), 0.);
         model = entry(model, "ef", i.model_value("ef"), 0.);
         let mut instance = SensitivityRecord::new();
-        instance = entry(instance, "resistance", i.instance_value("resistance"), 0.);
+        instance = entry(instance, "resistance", instance_value("resistance"), 0.);
         instance = entry(instance, "ac", None, 0.);
-        let (temp, temp_given) = field(i.instance_value("temp").map(|t| t + CELSIUS_TO_KELVIN), 0.);
+        let (temp, temp_given) = field(instance_value("temp").map(|t| t + CELSIUS_TO_KELVIN), 0.);
         instance = instance.with("temp", temp, temp_given);
         instance = entry(instance, "dtemp", None, 0.);
-        instance = entry(instance, "l", i.instance_value("l"), 0.);
-        instance = entry(instance, "w", i.instance_value("w"), 0.);
-        instance = entry(instance, "m", i.instance_value("m"), 0.);
-        instance = entry(instance, "tc", i.instance_value("tc1"), 0.);
-        instance = entry(instance, "tc2", i.instance_value("tc2"), 0.);
+        instance = entry(instance, "l", instance_value("l"), 0.);
+        instance = entry(instance, "w", instance_value("w"), 0.);
+        instance = entry(instance, "m", instance_value("m"), 0.);
+        instance = entry(instance, "tc", instance_value("tc1"), 0.);
+        instance = entry(instance, "tc2", instance_value("tc2"), 0.);
         instance = entry(instance, "tce", None, 0.);
         instance = entry(instance, "bv_max", None, 0.);
-        instance = entry(instance, "scale", i.instance_value("scale"), 0.);
+        instance = entry(instance, "scale", instance_value("scale"), 0.);
         instance = instance
             .with("conduct", 0., false)
             .with("acconduct", 0., false);

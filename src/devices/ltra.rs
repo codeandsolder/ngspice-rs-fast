@@ -120,7 +120,7 @@ use crate::devices::traits::{AnalysisMode, Device, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::primitives::{
-    NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, almost_equal_ulps,
+    NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, almost_equal_ulps,
     parse_spice_number,
 };
 
@@ -458,6 +458,40 @@ struct Load {
     inputs: [Real; 2],
 }
 
+/// The real stamp layouts differ by analysis and line case, but each is a
+/// fixed-size batch. Keep them on the stack without padding or changing the
+/// order in which C's load adds the individual terms.
+type RealEntry = (NodeId, NodeId, Real);
+
+enum RealEntries {
+    Dc([RealEntry; 9]),
+    Rg([RealEntry; 13]),
+    Lc([RealEntry; 10]),
+    Rlc([RealEntry; 14]),
+    Rc([RealEntry; 16]),
+}
+
+impl RealEntries {
+    fn as_slice(&self) -> &[RealEntry] {
+        match self {
+            Self::Dc(entries) => entries,
+            Self::Rg(entries) => entries,
+            Self::Lc(entries) => entries,
+            Self::Rlc(entries) => entries,
+            Self::Rc(entries) => entries,
+        }
+    }
+
+    fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
+        // Do not cache these positions as one fixed layout: DC and transient
+        // have different layouts for the same line.
+        for &(row, col, value) in self.as_slice() {
+            context.stamp(row, col, value)?;
+        }
+        Ok(())
+    }
+}
+
 impl LossyLine {
     /// Builds the line from its instance card and `ltra` model, interning
     /// the four terminals and the two current unknowns (nothing is interned
@@ -546,23 +580,12 @@ impl LossyLine {
                 }
             }
         }
-        let mut staged = nodes.clone();
-        let mut terminals = [NodeId::GROUND; 6];
-        for (slot, node) in instance.nodes.iter().enumerate() {
-            terminals[slot] = staged.intern(node);
-        }
-        for (slot, suffix) in INTERNAL_SUFFIXES.iter().enumerate() {
-            let name = format!("{}#{suffix}", instance.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "lossy-line internal-node name collision: {name}"
-                )));
-            }
-            let node = staged.intern(&name);
-            staged.set_kind(node, NodeKind::Internal);
-            terminals[4 + slot] = node;
-        }
-        *nodes = staged;
+        let terminals = crate::devices::factory::line_terminals::<6>(
+            instance,
+            nodes,
+            &INTERNAL_SUFFIXES,
+            "lossy-line",
+        )?;
         Ok(Box::new(Self {
             name: instance.name.clone(),
             terminals,
@@ -604,7 +627,7 @@ impl LossyLine {
     }
 
     /// The DC entries (`ltraload.c`, `MODEDC`) with C's `gmin`.
-    fn dc_entries(&self, gmin: Real) -> Vec<(NodeId, NodeId, Real)> {
+    fn dc_entries(&self, gmin: Real) -> RealEntries {
         let m = &self.model;
         let (p1, n1, p2, n2, b1, b2) = (
             self.pos1(),
@@ -615,7 +638,7 @@ impl LossyLine {
             self.ibr2(),
         );
         match m.case {
-            LtraCase::Rg => vec![
+            LtraCase::Rg => RealEntries::Rg([
                 (b1, p1, 1.0),
                 (b1, n1, -1.0),
                 (b1, p2, -m.cosh_root_gr),
@@ -629,8 +652,8 @@ impl LossyLine {
                 (n1, b1, -1.0),
                 (p2, b2, 1.0),
                 (n2, b2, -1.0),
-            ],
-            LtraCase::Lc | LtraCase::Rlc | LtraCase::Rc => vec![
+            ]),
+            LtraCase::Lc | LtraCase::Rlc | LtraCase::Rc => RealEntries::Dc([
                 (p1, b1, 1.0),
                 (n1, b1, -1.0),
                 (p2, b2, 1.0),
@@ -640,13 +663,13 @@ impl LossyLine {
                 (b2, p1, 1.0),
                 (b2, p2, -1.0),
                 (b2, b1, -m.resist * m.length),
-            ],
+            ]),
         }
     }
 
     /// The transient matrix entries (`ltraload.c`, all non-DC cases but RG)
     /// given the first convolution coefficients.
-    fn transient_entries(&self, first: [Real; 3]) -> Vec<(NodeId, NodeId, Real)> {
+    fn transient_entries(&self, first: [Real; 3], gmin: Real) -> RealEntries {
         let m = &self.model;
         let (p1, n1, p2, n2, b1, b2) = (
             self.pos1(),
@@ -656,14 +679,9 @@ impl LossyLine {
             self.ibr1(),
             self.ibr2(),
         );
-        let mut entries = Vec::with_capacity(20);
         match m.case {
             LtraCase::Lc | LtraCase::Rlc => {
-                if m.case == LtraCase::Rlc {
-                    let d = m.admit * first[0];
-                    entries.extend([(b1, p1, d), (b1, n1, -d), (b2, p2, d), (b2, n2, -d)]);
-                }
-                entries.extend([
+                let lc = [
                     (b1, p1, m.admit),
                     (b1, n1, -m.admit),
                     (b1, b1, -1.0),
@@ -674,11 +692,32 @@ impl LossyLine {
                     (b2, b2, -1.0),
                     (p2, b2, 1.0),
                     (n2, b2, -1.0),
-                ]);
+                ];
+                if m.case == LtraCase::Rlc {
+                    let d = m.admit * first[0];
+                    RealEntries::Rlc([
+                        (b1, p1, d),
+                        (b1, n1, -d),
+                        (b2, p2, d),
+                        (b2, n2, -d),
+                        lc[0],
+                        lc[1],
+                        lc[2],
+                        lc[3],
+                        lc[4],
+                        lc[5],
+                        lc[6],
+                        lc[7],
+                        lc[8],
+                        lc[9],
+                    ])
+                } else {
+                    RealEntries::Lc(lc)
+                }
             }
             LtraCase::Rc => {
                 let [h1, h2, h3] = first;
-                entries.extend([
+                RealEntries::Rc([
                     (b1, b1, -1.0),
                     (p1, b1, 1.0),
                     (n1, b1, -1.0),
@@ -695,11 +734,10 @@ impl LossyLine {
                     (b1, n2, h3),
                     (b2, p1, -h3),
                     (b2, n1, h3),
-                ]);
+                ])
             }
-            LtraCase::Rg => {}
+            LtraCase::Rg => self.dc_entries(gmin),
         }
-        entries
     }
 
     /// `[v1, i1, v2, i2]` of a solution: the port voltages and the current
@@ -738,9 +776,7 @@ impl LossyLine {
             )));
         }
         let index = count - 1;
-        let times: Vec<Real> = (0..count)
-            .map(|i| history.time(i).unwrap_or(Real::NAN))
-            .collect();
+        let times = history.contiguous_times();
         let sample = |i: usize, k: usize| history.value(i, k).unwrap_or(Real::NAN);
         // The operating point C copies into LTRAinitVolt/Cur at MODEINITTRAN
         // is the t = 0 sample.
@@ -958,7 +994,7 @@ impl LossyLine {
 
     /// `ltraacld.c`: the complex entries at angular frequency `omega > 0`, as
     /// `(row, column, re, im)`.
-    fn ac_entries(&self, omega: Real) -> Vec<(NodeId, NodeId, Real, Real)> {
+    fn ac_entries(&self, omega: Real) -> Option<[(NodeId, NodeId, Real, Real); 16]> {
         let m = &self.model;
         let (y0_r, y0_i, lambda_r, lambda_i) = match m.case {
             LtraCase::Lc => (m.admit, 0.0, 0.0, (m.induct * m.capac).sqrt() * omega),
@@ -977,7 +1013,7 @@ impl LossyLine {
                 (y, y, l, l)
             }
             // RG lines stamp their DC load instead (stamp_small_signal).
-            LtraCase::Rg => return Vec::new(),
+            LtraCase::Rg => return None,
         };
         let exparg_r = -lambda_r * m.length;
         let exparg_i = -lambda_i * m.length;
@@ -993,7 +1029,7 @@ impl LossyLine {
             self.ibr1(),
             self.ibr2(),
         );
-        vec![
+        Some([
             (b1, p1, y0_r, y0_i),
             (b1, n1, -y0_r, -y0_i),
             (b1, b1, -1.0, 0.0),
@@ -1010,7 +1046,7 @@ impl LossyLine {
             (n1, b1, -1.0, 0.0),
             (p2, b2, 1.0, 0.0),
             (n2, b2, -1.0, 0.0),
-        ]
+        ])
     }
 
     /// Small-signal assembly: the DC form at frequency zero (and always for
@@ -1033,7 +1069,7 @@ impl LossyLine {
             ));
         }
         if dc || frequency == 0. || self.model.case == LtraCase::Rg {
-            for (r, c, value) in self.dc_entries(context.model_context.gmin) {
+            for &(r, c, value) in self.dc_entries(context.model_context.gmin).as_slice() {
                 if let (Some(r), Some(c)) = (row(r), row(c)) {
                     context.system.a.add(r, c, value)?;
                 }
@@ -1041,7 +1077,10 @@ impl LossyLine {
             return Ok(());
         }
         let omega = 2. * std::f64::consts::PI * frequency;
-        for (r, c, re, im) in self.ac_entries(omega) {
+        for (r, c, re, im) in self
+            .ac_entries(omega)
+            .ok_or_else(|| self.internal("RG line requires DC matrix entries"))?
+        {
             if !(re.is_finite() && im.is_finite()) {
                 return Err(self.internal(format!(
                     "nonfinite AC coefficient at {frequency:e} Hz (ltraacld.c)"
@@ -1098,16 +1137,12 @@ impl Device for LossyLine {
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         match context.mode {
             AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => {
-                for (r, c, value) in self.dc_entries(context.gmin) {
-                    context.stamp(r, c, value)?;
-                }
+                self.dc_entries(context.gmin).stamp(context)?;
             }
             AnalysisMode::Transient { time, .. } => {
                 if self.model.case == LtraCase::Rg {
                     // ltraload.c loads RG lines with their DC two-port always.
-                    for (r, c, value) in self.dc_entries(context.gmin) {
-                        context.stamp(r, c, value)?;
-                    }
+                    self.dc_entries(context.gmin).stamp(context)?;
                     return Ok(());
                 }
                 let history = context.states.delay_history().ok_or_else(|| {
@@ -1117,9 +1152,8 @@ impl Device for LossyLine {
                     ))
                 })?;
                 let load = self.transient_load(history, time)?;
-                for (r, c, value) in self.transient_entries(load.first) {
-                    context.stamp(r, c, value)?;
-                }
+                self.transient_entries(load.first, context.gmin)
+                    .stamp(context)?;
                 context.stamp_rhs(self.ibr1(), load.inputs[0])?;
                 context.stamp_rhs(self.ibr2(), load.inputs[1])?;
             }

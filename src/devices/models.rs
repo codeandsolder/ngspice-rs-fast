@@ -268,7 +268,11 @@ impl<'a> ModelResolver<'a> {
     /// Raw first declaration by case-insensitive name; no ground aliasing.
     #[must_use]
     pub fn model(&self, name: &str) -> Option<&'a ModelCard> {
-        self.definitions.get(&name.to_ascii_lowercase()).copied()
+        if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            self.definitions.get(&name.to_ascii_lowercase()).copied()
+        } else {
+            self.definitions.get(name).copied()
+        }
     }
 
     /// Resolve an instance reference and validate its family and selector.

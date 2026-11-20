@@ -228,6 +228,8 @@ fn loads_validate_dimensions_and_stale_numbering() {
     assert!(load(&circuit, &history, &[f64::NAN, 1.0, 0.0]).is_err());
     assert!(load(&circuit, &StateHistory::new(1), &[1.0, 1.0, 0.0]).is_err());
     let c = circuit.add_node("c");
+    let error = load(&circuit, &history, &[1.0, 1.0, 0.0]).unwrap_err();
+    assert!(error.to_string().contains("stale"), "{error}");
     circuit
         .add_device(Box::new(
             Resistor::new("r1", [c, NodeId::GROUND], 1.0).unwrap(),

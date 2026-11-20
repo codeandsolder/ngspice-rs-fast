@@ -423,3 +423,27 @@ fn the_deck_writer_round_trips_o_cards_and_ltra_models() {
     assert_eq!(shape(&again), shape(&parsed));
     assert_eq!(shape(&parsed), ["v1=1", "ic=v1:2,i1:3"]);
 }
+
+#[test]
+fn generated_node_collision_rolls_back_just_appended_nodes() {
+    use ngspice_rs::devices::{ModelContext, ModelResolver, ltra::LossyLine};
+    use ngspice_rs::primitives::{NodeKind, NodeTable};
+    let parsed = netlist("o1 a 0 b 0 m\n.model m ltra l=2.5e-7 c=1e-10 len=1").unwrap();
+    let models = ModelResolver::new(&parsed.models).unwrap();
+    let mut nodes = NodeTable::default();
+    let collision = nodes.intern("o1#i2");
+    nodes.set_kind(collision, NodeKind::Internal);
+    let before = nodes.nodes().to_vec();
+    let err = LossyLine::instantiate(
+        &parsed.devices[0],
+        &mut nodes,
+        &models,
+        &ModelContext::default(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("collision"));
+    assert_eq!(nodes.nodes(), before);
+    for name in ["a", "b", "o1#i1"] {
+        assert!(nodes.get(name).is_none());
+    }
+}

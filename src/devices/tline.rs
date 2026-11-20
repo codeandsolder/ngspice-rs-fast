@@ -55,7 +55,7 @@ use crate::devices::traits::{AnalysisMode, Device, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::primitives::{
-    NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
+    NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
 };
 
 /// C reference for errors.
@@ -211,23 +211,12 @@ impl TransmissionLine {
                 format!("{}: rel and abs must not be negative", instance.name),
             ));
         }
-        let mut staged = nodes.clone();
-        let mut terminals = [NodeId::GROUND; 8];
-        for (slot, node) in instance.nodes.iter().enumerate() {
-            terminals[slot] = staged.intern(node);
-        }
-        for (slot, suffix) in INTERNAL_SUFFIXES.iter().enumerate() {
-            let name = format!("{}#{suffix}", instance.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "transmission-line internal-node name collision: {name}"
-                )));
-            }
-            let node = staged.intern(&name);
-            staged.set_kind(node, NodeKind::Internal);
-            terminals[4 + slot] = node;
-        }
-        *nodes = staged;
+        let terminals = crate::devices::factory::line_terminals::<8>(
+            instance,
+            nodes,
+            &INTERNAL_SUFFIXES,
+            "transmission-line",
+        )?;
         Ok(Box::new(Self {
             name: instance.name.clone(),
             terminals,

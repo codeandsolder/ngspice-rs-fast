@@ -28,7 +28,8 @@ use crate::devices::traits::{AnalysisMode, Device, StampContext};
 
 /// State slots of a capacitor (`CAPqcap`, `CAPccap`) or inductor
 /// (`INDflux`, `INDvolt`): the integrated quantity and its derivative.
-const QUANTITY: usize = 0;
+pub(super) const QUANTITY: usize = 0;
+pub(super) const REACTIVE_STATE_COUNT: usize = 2;
 const DERIVATIVE: usize = 1;
 
 /// The coefficients of a companion transient load, checked against the mode.
@@ -72,7 +73,7 @@ fn integrate(
     capacitance: Real,
     name: &str,
 ) -> SpiceResult<Companion> {
-    if context.states.len() != 2 {
+    if context.states.len() != REACTIVE_STATE_COUNT {
         return Err(SpiceError::circuit(format!(
             "{name}: companion load without its two state slots"
         )));
@@ -172,6 +173,15 @@ pub(crate) fn res_resist(name: &str, value: Real) -> Real {
     clamped
 }
 
+fn validate_resistance(name: &str, resistance: Real) -> SpiceResult<()> {
+    if !resistance.is_finite() || resistance == 0.0 || !(1.0 / resistance).is_finite() {
+        return Err(SpiceError::circuit(format!(
+            "resistor {name}: resistance must be finite and nonzero with finite conductance"
+        )));
+    }
+    Ok(())
+}
+
 /// A resistor, `r1 n1 n2 <value> [tc1=… tc2=…]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resistor {
@@ -196,11 +206,7 @@ impl Resistor {
         resistance: Real,
     ) -> SpiceResult<Self> {
         let name = name.into();
-        if !resistance.is_finite() || resistance == 0.0 || !(1.0 / resistance).is_finite() {
-            return Err(SpiceError::circuit(format!(
-                "resistor {name}: resistance must be finite and nonzero with finite conductance"
-            )));
-        }
+        validate_resistance(&name, resistance)?;
         Ok(Self {
             name,
             terminals,
@@ -284,15 +290,14 @@ impl Device for Resistor {
         value: Real,
         context: &crate::devices::ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        crate::devices::passive::swept_literal(
-            &self.name,
-            self.terminals,
-            crate::devices::ModelFamily::Resistor,
-            self.resistance,
-            None,
-            (parameter, value),
-            context,
-        )
+        if parameter == "resistance" {
+            validate_resistance(&self.name, value)?;
+            return Ok(Box::new(Self {
+                resistance: value,
+                ..self.clone()
+            }));
+        }
+        crate::devices::passive::swept_resistor(self, (parameter, value), context)
     }
 
     /// Linear in `.disto`: C gives this device no distortion routine
@@ -318,21 +323,13 @@ impl Device for Resistor {
     }
 
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        if context.mode.is_ac() {
-            return Err(SpiceError::circuit("use complex equation assembly for AC"));
-        }
-        crate::devices::linear::nodal_stamp(
-            context.matrix,
-            context.unknowns,
-            self.terminals,
-            self.conductance(),
-        )
+        stamp_resistor(self.terminals, self.resistance, context)
     }
     fn assemble_linear(
         &self,
         context: &mut crate::devices::linear::LinearContext<'_>,
     ) -> SpiceResult<()> {
-        context.nodal(self.terminals, self.conductance(), false)
+        assemble_resistor(self.terminals, self.resistance, context)
     }
 
     fn resistor_metadata(&self) -> Option<crate::devices::sweep::ResistorMetadata> {
@@ -350,7 +347,8 @@ impl Device for Resistor {
         supplied: Real,
         _context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<Real> {
-        Self::new(&self.name, self.terminals, supplied).map(|resistor| resistor.resistance())
+        validate_resistance(&self.name, supplied)?;
+        Ok(supplied)
     }
 
     /// A literal resistor: C's default resistor model and the resistance
@@ -363,7 +361,10 @@ impl Device for Resistor {
             crate::devices::sensitivity::ResistorSensitivity::new(
                 &self.name,
                 self.terminals,
-                crate::devices::sensitivity::ResistorInputs::Literal(self.resistance),
+                crate::devices::sensitivity::PassiveInputs::Literal {
+                    value: self.resistance,
+                    initial_condition: None,
+                },
                 context,
             ),
         ))
@@ -382,45 +383,236 @@ impl Device for Resistor {
     /// and the flicker law of [`ResistorNoise`], driven by the operating-point
     /// current (C `REScurrent`). `noisy=0` is noiseless.
     fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
-        let n = &self.noise;
-        if !n.noisy {
-            return Ok(DeviceNoise::Noiseless);
+        Ok(resistor_noise(
+            self.terminals,
+            self.resistance,
+            &self.noise,
+            self.noise.model.as_deref(),
+            context,
+        ))
+    }
+}
+
+/// The four real nodal stamps in the existing load order. Their positions
+/// never change for this two-terminal element, so a bound matrix can reuse
+/// the verified batch instead of repeating per-node/element lookup.
+fn stamp_nodal(
+    context: &mut StampContext<'_>,
+    [p, n]: [NodeId; 2],
+    value: Real,
+) -> SpiceResult<()> {
+    context.stamp_fixed([(p, p, value), (p, n, -value), (n, p, -value), (n, n, value)])
+}
+
+pub(super) fn stamp_resistor(
+    terminals: [NodeId; 2],
+    resistance: Real,
+    context: &mut StampContext<'_>,
+) -> SpiceResult<()> {
+    if context.mode.is_ac() {
+        return Err(SpiceError::circuit("use complex equation assembly for AC"));
+    }
+    stamp_nodal(context, terminals, 1.0 / resistance)
+}
+pub(super) fn assemble_resistor(
+    terminals: [NodeId; 2],
+    resistance: Real,
+    context: &mut crate::devices::linear::LinearContext<'_>,
+) -> SpiceResult<()> {
+    context.nodal(terminals, 1.0 / resistance, false)
+}
+
+/// Evaluate the resistor's generators at the operating point.
+pub(super) fn resistor_noise(
+    terminals: [NodeId; 2],
+    resistance: Real,
+    n: &ResistorNoise,
+    model: Option<&str>,
+    context: &NoiseContext<'_>,
+) -> DeviceNoise {
+    if !n.noisy {
+        return DeviceNoise::Noiseless;
+    }
+    let conductance = 1.0 / resistance;
+    let current = (context.voltage(terminals[0]) - context.voltage(terminals[1])) * conductance;
+    let temperature = n
+        .temperature
+        .map_or_else(|| context.circuit_kelvin(), |t| t + CELSIUS_TO_KELVIN);
+    // resnoise.c: `RESm * RESfNcoef * pow(fabs(REScurrent / RESm), RESfNexp)
+    // / (RESeffNoiseArea * pow(freq, RESef))`.
+    let numerator = n.multiplicity * n.kf * (current / n.multiplicity).abs().powf(n.af);
+    DeviceNoise::Sources {
+        family: NoiseFamily::Resistor,
+        model: model.map(str::to_owned),
+        total: true,
+        sources: vec![
+            NoiseSource::new(
+                "_thermal",
+                terminals,
+                NoiseKind::Thermal {
+                    conductance,
+                    temperature,
+                },
+            ),
+            NoiseSource::new(
+                "_1overf",
+                terminals,
+                NoiseKind::Flicker {
+                    numerator,
+                    law: FlickerLaw::Area {
+                        area: n.area,
+                        exponent: n.ef,
+                    },
+                },
+            ),
+        ],
+    }
+}
+
+/// Borrowed inputs to the charge/flux equation kernels. The owning device
+/// supplies a validated effective value and IC; no identity or history is
+/// allocated here. The two families keep their distinct C stamp ordering.
+pub(super) struct ReactiveLoad<'a> {
+    pub(super) name: &'a str,
+    pub(super) terminals: [NodeId; 2],
+    pub(super) value: Real,
+    pub(super) initial: Option<Real>,
+}
+
+impl ReactiveLoad<'_> {
+    /// Perform NIintegrate and publish the trial charge/flux and derivative.
+    /// MODEINITTRAN patches state1 before integration and its derivative
+    /// afterwards; the trial owns those patches until acceptance.
+    fn companion(
+        &self,
+        context: &mut StampContext<'_>,
+        coefficients: &Coefficients,
+        quantity: Real,
+        initial: bool,
+    ) -> SpiceResult<Companion> {
+        if initial {
+            context.states.patch_state1(QUANTITY, quantity)?;
         }
-        let conductance = self.conductance();
-        let current =
-            (context.voltage(self.terminals[0]) - context.voltage(self.terminals[1])) * conductance;
-        let temperature = n
-            .temperature
-            .map_or_else(|| context.circuit_kelvin(), |t| t + CELSIUS_TO_KELVIN);
-        // resnoise.c: `RESm * RESfNcoef * pow(fabs(REScurrent / RESm), RESfNexp)
-        // / (RESeffNoiseArea * pow(freq, RESef))`.
-        let numerator = n.multiplicity * n.kf * (current / n.multiplicity).abs().powf(n.af);
-        Ok(DeviceNoise::Sources {
-            family: NoiseFamily::Resistor,
-            model: n.model.clone(),
-            total: true,
-            sources: vec![
-                NoiseSource::new(
-                    "_thermal",
-                    self.terminals,
-                    NoiseKind::Thermal {
-                        conductance,
-                        temperature,
-                    },
-                ),
-                NoiseSource::new(
-                    "_1overf",
-                    self.terminals,
-                    NoiseKind::Flicker {
-                        numerator,
-                        law: FlickerLaw::Area {
-                            area: n.area,
-                            exponent: n.ef,
-                        },
-                    },
-                ),
-            ],
-        })
+        let companion = integrate(context, coefficients, quantity, self.value, self.name)?;
+        if initial {
+            context
+                .states
+                .patch_state1(DERIVATIVE, companion.derivative)?;
+        }
+        context.states.set(QUANTITY, quantity)?;
+        context.states.set(DERIVATIVE, companion.derivative)?;
+        Ok(companion)
+    }
+
+    pub(super) fn stamp_capacitor(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
+        let [positive, negative] = self.terminals;
+        let v = context.node_voltage(positive) - context.node_voltage(negative);
+        let charge = self.value * v;
+        if context.mode.is_dc() {
+            return record_dc_state(context, charge);
+        }
+        if context.mode.is_ac() {
+            return Err(SpiceError::circuit("use complex equation assembly for AC"));
+        }
+        let coefficients = companion_coefficients(context, self.name)?;
+        // capload.c: MODEINITPRED keeps CKTstate1's charge; MODEINITTRAN
+        // copies the charge, then the integrated current, into CKTstate1.
+        let (initial, predicting) = transient_phase(context);
+        let charge = if predicting {
+            context
+                .states
+                .accepted(1, QUANTITY)
+                .ok_or_else(|| SpiceError::circuit(format!("{}: no accepted charge", self.name)))?
+        } else if initial && context.states.uic() {
+            // cond1 (MODEUIC && MODEINITTRAN): vcap = CAPinitCond, which
+            // CAPgetic defaults to the node voltages of the uic start vector
+            // (the .ic values), the point this load sees.
+            self.value * self.initial.unwrap_or(v)
+        } else {
+            charge
+        };
+        let companion = self.companion(context, coefficients, charge, initial)?;
+        stamp_nodal(context, self.terminals, companion.conductance)?;
+        context.stamp_rhs(positive, -companion.current)?;
+        context.stamp_rhs(negative, companion.current)
+    }
+    pub(super) fn assemble_capacitor(
+        &self,
+        context: &mut crate::devices::linear::LinearContext<'_>,
+    ) -> SpiceResult<()> {
+        context.system.has_initial_conditions |= self.initial.is_some();
+        context.nodal(self.terminals, self.value, true)
+    }
+
+    pub(super) fn stamp_inductor(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
+        let row = context.branch(0)?;
+        let mut flux = self.value * context.row_value(row)?;
+        for term in context.mutual {
+            flux += term.inductance * context.row_value(term.row)?;
+        }
+        if context.mode.is_dc() {
+            record_dc_state(context, flux)?;
+            return crate::devices::linear::branch_stamp(
+                context.matrix,
+                context.unknowns,
+                self.terminals,
+                row,
+            );
+        }
+        if context.mode.is_ac() {
+            return Err(SpiceError::circuit("use complex equation assembly for AC"));
+        }
+        let coefficients = companion_coefficients(context, self.name)?;
+        // indload.c: MODEINITPRED keeps CKTstate1's flux (the mutual flux
+        // is not added); MODEINITTRAN copies the flux, then the integrated
+        // voltage, into CKTstate1.
+        let (initial, predicting) = transient_phase(context);
+        let flux = if predicting {
+            context
+                .states
+                .accepted(1, QUANTITY)
+                .ok_or_else(|| SpiceError::circuit(format!("{}: no accepted flux", self.name)))?
+        } else if initial && context.states.uic() {
+            // MODEUIC && MODEINITTRAN: INDinduct/m * INDinitCond, plus each
+            // MUTfactor * the coupled inductor's INDinitCond.
+            // INDgetic defaults INDinitCond to the uic start vector's value.
+            let mut flux = self.value * self.initial.unwrap_or(context.row_value(row)?);
+            for term in context.mutual {
+                flux += term.inductance * term.initial;
+            }
+            flux
+        } else {
+            flux
+        };
+        let companion = self.companion(context, coefficients, flux, initial)?;
+        crate::devices::linear::branch_stamp(
+            context.matrix,
+            context.unknowns,
+            self.terminals,
+            row,
+        )?;
+        context.matrix.add(row, row, -companion.conductance)?;
+        let ag0 = coefficients.ag()[0];
+        for term in context.mutual {
+            context.matrix.add(row, term.row, -ag0 * term.inductance)?;
+        }
+        context.rhs.add_to(row, companion.current)
+    }
+    /// `v+ - v- - L di/dt - sum(M di_k/dt) = 0`: the mutual terms are
+    /// off-diagonal `E` entries between branch rows (`mutacld.c` stamps
+    /// `-j omega M` there in AC).
+    pub(super) fn assemble_inductor(
+        &self,
+        context: &mut crate::devices::linear::LinearContext<'_>,
+    ) -> SpiceResult<()> {
+        let branch = context.branch(self.terminals)?;
+        // v+ - v- - L di/dt = 0, i positive from + to -.
+        context.system.e.add(branch, branch, -self.value)?;
+        for term in context.mutual {
+            context.system.e.add(branch, term.row, -term.inductance)?;
+        }
+        context.system.has_initial_conditions |= self.initial.is_some();
+        Ok(())
     }
 }
 
@@ -463,6 +655,15 @@ impl Capacitor {
             capacitance,
             initial_voltage,
         })
+    }
+
+    fn load(&self) -> ReactiveLoad<'_> {
+        ReactiveLoad {
+            name: &self.name,
+            terminals: self.terminals,
+            value: self.capacitance,
+            initial: self.initial_voltage,
+        }
     }
 
     /// The capacitance in farads.
@@ -531,7 +732,7 @@ impl Device for Capacitor {
         crate::devices::passive::swept_literal(
             &self.name,
             self.terminals,
-            crate::devices::ModelFamily::Capacitor,
+            crate::devices::passive::PassiveKind::Capacitor,
             self.capacitance,
             self.initial_voltage,
             (parameter, value),
@@ -577,7 +778,7 @@ impl Device for Capacitor {
 
     /// Charge `q = C v` and current `dq/dt` (C `CAPqcap`/`CAPccap`).
     fn state_count(&self) -> usize {
-        2
+        REACTIVE_STATE_COUNT
     }
 
     fn truncation_slot(&self) -> Option<usize> {
@@ -600,58 +801,13 @@ impl Device for Capacitor {
     /// from current from the first terminal to the second. `ic=` is not
     /// applied here; initial-condition policy belongs to the analysis.
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        let [positive, negative] = self.terminals;
-        let v = context.node_voltage(positive) - context.node_voltage(negative);
-        let charge = self.capacitance * v;
-        if context.mode.is_dc() {
-            return record_dc_state(context, charge);
-        }
-        if context.mode.is_ac() {
-            return Err(SpiceError::circuit("use complex equation assembly for AC"));
-        }
-        let coefficients = companion_coefficients(context, &self.name)?;
-        // capload.c: MODEINITPRED keeps CKTstate1's charge; MODEINITTRAN
-        // copies the charge, then the integrated current, into CKTstate1.
-        let (initial, predicting) = transient_phase(context);
-        let charge = if predicting {
-            context
-                .states
-                .accepted(1, QUANTITY)
-                .ok_or_else(|| SpiceError::circuit(format!("{}: no accepted charge", self.name)))?
-        } else if initial && context.states.uic() {
-            // cond1 (MODEUIC && MODEINITTRAN): vcap = CAPinitCond, which
-            // CAPgetic defaults to the node voltages of the uic start vector
-            // (the .ic values), the point this load sees.
-            self.capacitance * self.initial_voltage.unwrap_or(v)
-        } else {
-            charge
-        };
-        if initial {
-            context.states.patch_state1(QUANTITY, charge)?;
-        }
-        let companion = integrate(context, coefficients, charge, self.capacitance, &self.name)?;
-        if initial {
-            context
-                .states
-                .patch_state1(DERIVATIVE, companion.derivative)?;
-        }
-        context.states.set(QUANTITY, charge)?;
-        context.states.set(DERIVATIVE, companion.derivative)?;
-        crate::devices::linear::nodal_stamp(
-            context.matrix,
-            context.unknowns,
-            self.terminals,
-            companion.conductance,
-        )?;
-        context.stamp_rhs(positive, -companion.current)?;
-        context.stamp_rhs(negative, companion.current)
+        self.load().stamp_capacitor(context)
     }
     fn assemble_linear(
         &self,
         context: &mut crate::devices::linear::LinearContext<'_>,
     ) -> SpiceResult<()> {
-        context.system.has_initial_conditions |= self.initial_voltage.is_some();
-        context.nodal(self.terminals, self.capacitance, true)
+        self.load().assemble_capacitor(context)
     }
 
     /// `.sens`: C's capacitor records with the default model
@@ -660,17 +816,14 @@ impl Device for Capacitor {
         &self,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
-        use crate::devices::sensitivity::{ReactiveInputs, ReactiveKind, ReactiveSensitivity};
-        let mut instance = vec![("capacitance", self.capacitance)];
-        instance.extend(self.initial_voltage.map(|ic| ("ic", ic)));
+        use crate::devices::sensitivity::{PassiveInputs, ReactiveKind, ReactiveSensitivity};
         Ok(Box::new(ReactiveSensitivity::new(
             ReactiveKind::Capacitor,
             &self.name,
-            None,
             self.terminals,
-            ReactiveInputs {
-                instance,
-                model: Vec::new(),
+            PassiveInputs::Literal {
+                value: self.capacitance,
+                initial_condition: self.initial_voltage,
             },
             context,
         )))
@@ -730,6 +883,15 @@ impl Inductor {
         })
     }
 
+    fn load(&self) -> ReactiveLoad<'_> {
+        ReactiveLoad {
+            name: &self.name,
+            terminals: self.terminals,
+            value: self.inductance,
+            initial: self.initial_current,
+        }
+    }
+
     /// The inductance in henries.
     #[must_use]
     pub const fn inductance(&self) -> Real {
@@ -785,7 +947,7 @@ impl Device for Inductor {
         crate::devices::passive::swept_literal(
             &self.name,
             self.terminals,
-            crate::devices::ModelFamily::Inductor,
+            crate::devices::passive::PassiveKind::Inductor,
             self.inductance,
             self.initial_current,
             (parameter, value),
@@ -830,7 +992,7 @@ impl Device for Inductor {
 
     /// Flux `L i` and voltage `dflux/dt` (C `INDflux`/`INDvolt`).
     fn state_count(&self) -> usize {
-        2
+        REACTIVE_STATE_COUNT
     }
 
     fn truncation_slot(&self) -> Option<usize> {
@@ -871,85 +1033,13 @@ impl Device for Inductor {
     /// veq`, with `veq` from the integrated coupled flux. At DC the coupled
     /// inductors stay shorts.
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        let row = context.branch(0)?;
-        let mut flux = self.inductance * context.row_value(row)?;
-        for term in context.mutual {
-            flux += term.inductance * context.row_value(term.row)?;
-        }
-        if context.mode.is_dc() {
-            record_dc_state(context, flux)?;
-            return crate::devices::linear::branch_stamp(
-                context.matrix,
-                context.unknowns,
-                self.terminals,
-                row,
-            );
-        }
-        if context.mode.is_ac() {
-            return Err(SpiceError::circuit("use complex equation assembly for AC"));
-        }
-        let coefficients = companion_coefficients(context, &self.name)?;
-        // indload.c: MODEINITPRED keeps CKTstate1's flux (the mutual flux
-        // is not added); MODEINITTRAN copies the flux, then the integrated
-        // voltage, into CKTstate1.
-        let (initial, predicting) = transient_phase(context);
-        let flux = if predicting {
-            context
-                .states
-                .accepted(1, QUANTITY)
-                .ok_or_else(|| SpiceError::circuit(format!("{}: no accepted flux", self.name)))?
-        } else if initial && context.states.uic() {
-            // MODEUIC && MODEINITTRAN: INDinduct/m * INDinitCond, plus each
-            // MUTfactor * the coupled inductor's INDinitCond.
-            // INDgetic defaults INDinitCond to the uic start vector's value.
-            let mut flux =
-                self.inductance * self.initial_current.unwrap_or(context.row_value(row)?);
-            for term in context.mutual {
-                flux += term.inductance * term.initial;
-            }
-            flux
-        } else {
-            flux
-        };
-        if initial {
-            context.states.patch_state1(QUANTITY, flux)?;
-        }
-        let companion = integrate(context, coefficients, flux, self.inductance, &self.name)?;
-        if initial {
-            context
-                .states
-                .patch_state1(DERIVATIVE, companion.derivative)?;
-        }
-        context.states.set(QUANTITY, flux)?;
-        context.states.set(DERIVATIVE, companion.derivative)?;
-        crate::devices::linear::branch_stamp(
-            context.matrix,
-            context.unknowns,
-            self.terminals,
-            row,
-        )?;
-        context.matrix.add(row, row, -companion.conductance)?;
-        let ag0 = coefficients.ag()[0];
-        for term in context.mutual {
-            context.matrix.add(row, term.row, -ag0 * term.inductance)?;
-        }
-        context.rhs.add_to(row, companion.current)
+        self.load().stamp_inductor(context)
     }
-    /// `v+ - v- - L di/dt - sum(M di_k/dt) = 0`: the mutual terms are
-    /// off-diagonal `E` entries between branch rows (`mutacld.c` stamps
-    /// `-j omega M` there in AC).
     fn assemble_linear(
         &self,
         context: &mut crate::devices::linear::LinearContext<'_>,
     ) -> SpiceResult<()> {
-        let branch = context.branch(self.terminals)?;
-        // v+ - v- - L di/dt = 0, i positive from + to -.
-        context.system.e.add(branch, branch, -self.inductance)?;
-        for term in context.mutual {
-            context.system.e.add(branch, term.row, -term.inductance)?;
-        }
-        context.system.has_initial_conditions |= self.initial_current.is_some();
-        Ok(())
+        self.load().assemble_inductor(context)
     }
 
     /// `.sens`: C's inductor records with the default model
@@ -958,17 +1048,14 @@ impl Device for Inductor {
         &self,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
-        use crate::devices::sensitivity::{ReactiveInputs, ReactiveKind, ReactiveSensitivity};
-        let mut instance = vec![("inductance", self.inductance)];
-        instance.extend(self.initial_current.map(|ic| ("ic", ic)));
+        use crate::devices::sensitivity::{PassiveInputs, ReactiveKind, ReactiveSensitivity};
         Ok(Box::new(ReactiveSensitivity::new(
             ReactiveKind::Inductor,
             &self.name,
-            None,
             self.terminals,
-            ReactiveInputs {
-                instance,
-                model: Vec::new(),
+            PassiveInputs::Literal {
+                value: self.inductance,
+                initial_condition: self.initial_current,
             },
             context,
         )))

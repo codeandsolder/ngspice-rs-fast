@@ -1,9 +1,12 @@
 //! Contextual input wrapper delegates effective values to existing R/C/L stamps.
-use super::PassiveParameters;
-use crate::devices::models::{ModelContext, ModelFamily, ResolvedModel};
+use super::{PassiveKind, PassiveParameters};
+use crate::devices::models::{ModelContext, ResolvedModel};
 use crate::devices::noise::{DeviceNoise, NoiseContext};
+use crate::devices::rlc::{
+    QUANTITY, REACTIVE_STATE_COUNT, ReactiveLoad, assemble_resistor, resistor_noise, stamp_resistor,
+};
 use crate::devices::{
-    Capacitor, Device, InductanceValue, Inductor, LinearContext, Resistor, ResistorMetadata,
+    Device, InductanceValue, LinearContext, Resistor, ResistorMetadata, ResistorNoise,
     ResistorOrigin, StampContext, StorageElement, StorageKind,
 };
 use crate::netlist::ast::DeviceInstance;
@@ -13,34 +16,28 @@ use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
 struct ModelPassive {
     name: String,
     /// The model card's name, for C's `.noise` visiting order.
-    model: String,
+    model: Option<String>,
+    // Programmatic literal resistors may carry an independent noise recipe.
+    literal_noise: Option<Box<ResistorNoise>>,
     terminals: [NodeId; 2],
     parameters: PassiveParameters,
 }
-/// The charge/flux slot of the delegated scalar [`Capacitor`]/[`Inductor`].
-const STORAGE_QUANTITY: usize = 0;
 
 impl ModelPassive {
     const fn storage_kind(&self) -> Option<StorageKind> {
-        match self.parameters.family() {
-            ModelFamily::Capacitor => Some(StorageKind::Capacitor),
-            ModelFamily::Inductor => Some(StorageKind::Inductor),
-            _ => None,
+        match self.parameters.kind {
+            PassiveKind::Capacitor => Some(StorageKind::Capacitor),
+            PassiveKind::Inductor => Some(StorageKind::Inductor),
+            PassiveKind::Resistor => None,
         }
     }
-    fn scalar(&self, context: &ModelContext) -> SpiceResult<Box<dyn Device>> {
-        let value = self.parameters.effective_value(context)?;
-        let ic = self.parameters.initial_condition();
-        Ok(match self.parameters.family() {
-            ModelFamily::Resistor => Box::new(
-                Resistor::new(&self.name, self.terminals, value)?
-                    .with_noise(self.parameters.resistor_noise(&self.model)),
-            ),
-            ModelFamily::Capacitor => {
-                Box::new(Capacitor::new(&self.name, self.terminals, value, ic)?)
-            }
-            _ => Box::new(Inductor::new(&self.name, self.terminals, value, ic)?),
-        })
+    fn reactive_load(&self, value: Real) -> ReactiveLoad<'_> {
+        ReactiveLoad {
+            name: &self.name,
+            terminals: self.terminals,
+            value,
+            initial: self.parameters.initial_condition(),
+        }
     }
 }
 impl Device for ModelPassive {
@@ -50,11 +47,11 @@ impl Device for ModelPassive {
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
     ) -> SpiceResult<bool> {
         let [positive, negative] = self.terminals;
-        match self.parameters.family() {
-            ModelFamily::Resistor | ModelFamily::Capacitor => {
+        match self.parameters.kind {
+            PassiveKind::Resistor | PassiveKind::Capacitor => {
                 setup.conductance(positive, negative);
             }
-            _ => {
+            PassiveKind::Inductor => {
                 let branch = setup.branch(0)?;
                 setup.inductor(positive, negative, branch);
             }
@@ -68,16 +65,14 @@ impl Device for ModelPassive {
     ) -> SpiceResult<Option<Real>> {
         let p = &self.parameters;
         Ok(match keyword {
-            "r" | "resistance" if p.family == ModelFamily::Resistor => {
-                Some(p.scaled_value(context)?)
-            }
-            "g" | "conductance" if p.family == ModelFamily::Resistor => {
+            "r" | "resistance" if p.kind == PassiveKind::Resistor => Some(p.scaled_value(context)?),
+            "g" | "conductance" if p.kind == PassiveKind::Resistor => {
                 Some(1. / p.effective_value(context)?)
             }
-            "c" | "cap" | "capacitance" if p.family == ModelFamily::Capacitor => {
+            "c" | "cap" | "capacitance" if p.kind == PassiveKind::Capacitor => {
                 Some(p.effective_value(context)?)
             }
-            "l" | "inductance" if p.family == ModelFamily::Inductor => {
+            "l" | "inductance" if p.kind == PassiveKind::Inductor => {
                 Some(p.coupling_value(context)?)
             }
             "m" => Some(p.multiplicity),
@@ -90,19 +85,17 @@ impl Device for ModelPassive {
         })
     }
     fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
-        let primary = match self.parameters.family() {
-            ModelFamily::Resistor => "resistance",
-            ModelFamily::Capacitor => "capacitance",
-            _ => "inductance",
+        let keyword = if keyword.eq_ignore_ascii_case("r") {
+            "resistance"
+        } else if keyword.eq_ignore_ascii_case("c") || keyword.eq_ignore_ascii_case("cap") {
+            "capacitance"
+        } else {
+            keyword
         };
-        let keyword = match keyword.to_ascii_lowercase().as_str() {
-            "r" => "resistance".to_owned(),
-            "c" | "cap" => "capacitance".to_owned(),
-            other => other.to_owned(),
-        };
-        super::instance_schema(self.parameters.family(), primary)
+        super::instance_schema(self.parameters.kind)
+            .parameters
             .iter()
-            .find(|d| d.name == keyword)
+            .find(|d| d.name != "noisy" && d.name.eq_ignore_ascii_case(keyword))
             .map(|d| d.name)
     }
 
@@ -112,10 +105,16 @@ impl Device for ModelPassive {
         value: Real,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        Ok(Box::new(Self {
-            parameters: self.parameters.swept(parameter, value, context)?,
-            ..self.clone()
-        }))
+        let mut replacement = self.clone();
+        replacement.parameters = self.parameters.swept(parameter, value, context)?;
+        if let Some(noise) = replacement.literal_noise.as_deref_mut() {
+            match parameter {
+                "temp" => noise.temperature = Some(value),
+                "m" => noise.multiplicity = value,
+                _ => {}
+            }
+        }
+        Ok(Box::new(replacement))
     }
 
     /// Linear in `.disto`: C gives this device no distortion routine
@@ -138,18 +137,18 @@ impl Device for ModelPassive {
         &self.terminals
     }
     fn branch_currents(&self) -> usize {
-        usize::from(self.parameters.family() == ModelFamily::Inductor)
+        usize::from(self.parameters.kind == PassiveKind::Inductor)
     }
     fn state_count(&self) -> usize {
-        match self.parameters.family() {
-            ModelFamily::Capacitor | ModelFamily::Inductor => 2,
-            _ => 0,
+        match self.parameters.kind {
+            PassiveKind::Capacitor | PassiveKind::Inductor => REACTIVE_STATE_COUNT,
+            PassiveKind::Resistor => 0,
         }
     }
     /// The scalar capacitor/inductor's charge/flux slot (`captrunc.c`,
     /// `indtrunc.c`): the state layout is the delegated scalar device's.
     fn truncation_slot(&self) -> Option<usize> {
-        self.storage_kind().map(|_| STORAGE_QUANTITY)
+        self.storage_kind().map(|_| QUANTITY)
     }
     /// The effective (temperature/TC/scale/`m`-adjusted) value and the
     /// instance `ic=`, so `uic` seeds model-backed C/L exactly as literal ones.
@@ -166,23 +165,50 @@ impl Device for ModelPassive {
         )
     }
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        self.scalar(&ModelContext::new(
+        let value = self.parameters.effective_value(&ModelContext::new(
             context.temperature,
             context.nominal_temperature,
-        ))?
-        .stamp(context)
+        ))?;
+        match self.parameters.kind {
+            PassiveKind::Resistor => stamp_resistor(self.terminals, value, context),
+            PassiveKind::Capacitor => self.reactive_load(value).stamp_capacitor(context),
+            PassiveKind::Inductor => self.reactive_load(value).stamp_inductor(context),
+        }
     }
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
-        self.scalar(context.model_context)?.assemble_linear(context)
+        let value = self.parameters.effective_value(context.model_context)?;
+        match self.parameters.kind {
+            PassiveKind::Resistor => assemble_resistor(self.terminals, value, context),
+            PassiveKind::Capacitor => self.reactive_load(value).assemble_capacitor(context),
+            PassiveKind::Inductor => self.reactive_load(value).assemble_inductor(context),
+        }
     }
-    /// The delegated scalar's noise: `resnoise.c` for a resistor (with the
-    /// model's KF/AF/EF, the instance noise area, `m`, `temp=` and `noisy`),
-    /// noiseless for C and L (`DEVnoise = NULL`).
+    /// `resnoise.c` for a resistor (including geometry, multiplier and temp);
+    /// C and L have no noise generators. Validate the effective value in
+    /// every family, as for stamps and linear assembly.
     fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
-        self.scalar(context.model_context)?.noise(context)
+        let value = self.parameters.effective_value(context.model_context)?;
+        Ok(if self.parameters.kind == PassiveKind::Resistor {
+            let derived;
+            let noise = if let Some(noise) = self.literal_noise.as_deref() {
+                noise
+            } else {
+                derived = self.parameters.resistor_noise_parameters();
+                &derived
+            };
+            resistor_noise(
+                self.terminals,
+                value,
+                noise,
+                self.model.as_deref().or(noise.model.as_deref()),
+                context,
+            )
+        } else {
+            DeviceNoise::Noiseless
+        })
     }
     fn inductance(&self, context: &ModelContext) -> Option<SpiceResult<InductanceValue>> {
-        (self.parameters.family() == ModelFamily::Inductor).then(|| {
+        (self.parameters.kind == PassiveKind::Inductor).then(|| {
             Ok(InductanceValue {
                 effective: self.parameters.effective_value(context)?,
                 coupling_base: self.parameters.coupling_value(context)?,
@@ -191,85 +217,59 @@ impl Device for ModelPassive {
         })
     }
     fn resistor_metadata(&self) -> Option<ResistorMetadata> {
-        (self.parameters.family() == ModelFamily::Resistor).then(|| ResistorMetadata {
-            origin: ResistorOrigin::ModelBacked,
+        (self.parameters.kind == PassiveKind::Resistor).then(|| ResistorMetadata {
+            origin: if self.model.is_some() {
+                ResistorOrigin::ModelBacked
+            } else {
+                ResistorOrigin::Literal
+            },
             supplied: self.parameters.nominal_value(),
             multiplicity: self.parameters.multiplicity(),
         })
     }
     fn resistor_effective(&self, supplied: Real, context: &ModelContext) -> SpiceResult<Real> {
-        if self.parameters.family() != ModelFamily::Resistor {
+        if self.parameters.kind != PassiveKind::Resistor {
             return Err(SpiceError::circuit(format!(
                 "{} is not a resistor",
                 self.name
             )));
         }
         self.parameters
-            .with_nominal_value(supplied)?
-            .effective_value(context)
+            .effective_value_with_nominal(supplied, context)
     }
 
-    /// `.sens`: C's resistor records from the card's model and instance
+    /// `.sens`: C's passive records from the card's model and instance
     /// setters ([`crate::devices::sensitivity`]).
     fn sensitivity(
         &self,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
-        use crate::devices::sensitivity::{ResistorInputs, ResistorSensitivity, written};
-        let (m, i) = (
-            self.parameters.model_values(),
-            self.parameters.instance_values(),
-        );
-        match self.parameters.family() {
-            ModelFamily::Resistor => Ok(Box::new(ResistorSensitivity::new(
+        use crate::devices::sensitivity::{
+            PassiveInputs, ReactiveKind, ReactiveSensitivity, ResistorSensitivity,
+        };
+        let inputs = PassiveInputs::Validated {
+            name: self.model.as_deref(),
+            model: self.parameters.model_values(),
+            instance: self.parameters.instance_values(),
+        };
+        match self.parameters.kind {
+            PassiveKind::Resistor => Ok(Box::new(ResistorSensitivity::new(
                 &self.name,
                 self.terminals,
-                ResistorInputs::Modeled {
-                    name: &self.model,
-                    model: m,
-                    instance: i,
-                },
+                inputs,
                 context,
             ))),
-            family => {
-                use crate::devices::sensitivity::{
-                    ReactiveInputs, ReactiveKind, ReactiveSensitivity,
-                };
-                type Keys = &'static [&'static str];
-                let (kind, value, instance_keys, model_keys): (_, _, Keys, Keys) = if family
-                    == ModelFamily::Capacitor
-                {
-                    (
-                        ReactiveKind::Capacitor,
-                        "capacitance",
-                        &["ic", "temp", "w", "l", "m", "tc1", "tc2", "scale"],
-                        &[
-                            "cap", "cj", "cjsw", "defw", "narrow", "short", "tc1", "tc2", "tnom",
-                        ],
-                    )
+            kind @ (PassiveKind::Capacitor | PassiveKind::Inductor) => {
+                let kind = if kind == PassiveKind::Capacitor {
+                    ReactiveKind::Capacitor
                 } else {
-                    (
-                        ReactiveKind::Inductor,
-                        "inductance",
-                        &["ic", "temp", "m", "tc1", "tc2", "scale"],
-                        &["ind", "tc1", "tc2", "tnom"],
-                    )
+                    ReactiveKind::Inductor
                 };
-                let mut instance: Vec<(&'static str, Real)> = Vec::new();
-                instance.extend(written(i, value).map(|v| (value, v)));
-                for key in instance_keys {
-                    instance.extend(written(i, key).map(|v| (*key, v)));
-                }
-                let mut model = Vec::new();
-                for key in model_keys {
-                    model.extend(written(m, key).map(|v| (*key, v)));
-                }
                 Ok(Box::new(ReactiveSensitivity::new(
                     kind,
                     &self.name,
-                    Some(&self.model),
                     self.terminals,
-                    ReactiveInputs { instance, model },
+                    inputs,
                     context,
                 )))
             }
@@ -293,22 +293,20 @@ pub(in crate::devices) fn instantiate(
     context: &ModelContext,
 ) -> SpiceResult<Box<dyn Device>> {
     let parameters = model.passive_parameters(instance)?;
-    // Evaluate before interning, then stage construction so both schema and
-    // existing scalar-constructor failures preserve the caller's table.
+    // The schema validates the IC and effective_value validates the scalar
+    // before any terminals are interned.
     parameters.effective_value(context)?;
-    let mut staged = nodes.clone();
     let terminals = [
-        staged.intern(&instance.nodes[0]),
-        staged.intern(&instance.nodes[1]),
+        nodes.intern(&instance.nodes[0]),
+        nodes.intern(&instance.nodes[1]),
     ];
     let device = ModelPassive {
         name: instance.name.clone(),
-        model: model.card().name.clone(),
+        model: Some(model.card().name.clone()),
+        literal_noise: None,
         terminals,
         parameters,
     };
-    device.scalar(context)?;
-    *nodes = staged;
     Ok(Box::new(device))
 }
 
@@ -316,7 +314,7 @@ pub(in crate::devices) fn instantiate(
 pub(in crate::devices) fn swept_literal(
     name: &str,
     terminals: [NodeId; 2],
-    family: ModelFamily,
+    kind: PassiveKind,
     value: Real,
     ic: Option<Real>,
     change: (&str, Real),
@@ -324,9 +322,36 @@ pub(in crate::devices) fn swept_literal(
 ) -> SpiceResult<Box<dyn Device>> {
     Ok(Box::new(ModelPassive {
         name: name.to_owned(),
-        model: String::new(),
+        model: None,
+        literal_noise: None,
         terminals,
-        parameters: PassiveParameters::literal(family, value, ic)?
+        parameters: PassiveParameters::literal(kind, value, ic)?
+            .swept(change.0, change.1, context)?,
+    }))
+}
+
+/// A literal resistor can acquire contextual setters in a sweep without
+/// losing the noise description of the original device.
+pub(in crate::devices) fn swept_resistor(
+    resistor: &Resistor,
+    change: (&str, Real),
+    context: &ModelContext,
+) -> SpiceResult<Box<dyn Device>> {
+    let [positive, negative] = resistor.terminals() else {
+        return Err(SpiceError::circuit("invalid resistor terminals"));
+    };
+    let mut noise = resistor.noise_parameters().clone();
+    match change.0 {
+        "temp" => noise.temperature = Some(change.1),
+        "m" => noise.multiplicity = change.1,
+        _ => {}
+    }
+    Ok(Box::new(ModelPassive {
+        name: resistor.name().to_owned(),
+        model: None,
+        literal_noise: Some(Box::new(noise)),
+        terminals: [*positive, *negative],
+        parameters: PassiveParameters::literal(PassiveKind::Resistor, resistor.resistance(), None)?
             .swept(change.0, change.1, context)?,
     }))
 }
