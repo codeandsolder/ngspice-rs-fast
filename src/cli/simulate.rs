@@ -681,8 +681,7 @@ fn format_ctime(now: SystemTime) -> String {
     // 1970-01-01 was a Thursday, index 4 in `WEEKDAYS`.
     let weekday = WEEKDAYS[((days + 4) % 7) as usize];
     format!(
-        "{weekday} {} {day:2} {:02}:{:02}:{:02} {year}",
-        month_name,
+        "{weekday} {month_name} {day:2} {:02}:{:02}:{:02} {year}",
         time_of_day / 3600,
         time_of_day % 3600 / 60,
         time_of_day % 60,
