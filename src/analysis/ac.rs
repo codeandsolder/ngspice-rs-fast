@@ -294,6 +294,9 @@ impl SmallSignal {
             )?
             .solution
             .values;
+            // C repeats MODEINITSMSIG after every frequency-dependent CKTop.
+            // Preserve its carried device slots for the next bias and analysis.
+            circuit.record_small_signal_state(&model, &self.previous)?;
             self.system =
                 circuit.small_signal_system_at(&model, &self.previous, Some(&self.state1))?;
         } else if self.reassemble {
@@ -304,5 +307,46 @@ impl SmallSignal {
                 circuit.small_signal_system_at(&model, &self.previous, Some(&self.state1))?;
         }
         with(&self.system)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::AnalysisContext;
+    use crate::netlist::{Parser, source::parse_deck_text};
+    use crate::primitives::AnalysisKind;
+    use std::path::Path;
+
+    fn carried(circuit: &Circuit) -> Vec<Option<Real>> {
+        let history = circuit.state_history();
+        let mut trial = history.trial();
+        let state = history.device(&mut trial, 0..history.len()).unwrap();
+        (0..history.len()).map(|slot| state.carried(slot)).collect()
+    }
+
+    #[test]
+    fn frequency_dependent_rebias_refreshes_carried_small_signal_state() {
+        let netlist = Parser::new().parse_deck(&parse_deck_text(
+            Path::new("rebias.cir"),
+            "frequency dependent BJT bias\nb1 c 0 v=5+hertz/100\nvbase b 0 dc 0.3 ac 1\nq1 c b 0 qmod\n.model qmod npn (is=1e-15 bf=100 rb=100 cjc=2p xcjc=0.5 cjs=3p)\n.end\n",
+        )).unwrap();
+        let mut circuit = Circuit::from_netlist(&netlist).unwrap();
+        let context = AnalysisContext::default();
+        let request = AnalysisRequest::with_arguments(AnalysisKind::Ac, ["lin", "3", "100", "300"]);
+        let settings = crate::analysis::bias::DcSettings::from_request(&request).unwrap();
+        let mut small = SmallSignal::prepare(&mut circuit, &request, &context, settings).unwrap();
+        assert!(small.varies());
+        let initial = carried(&circuit);
+        small
+            .at_frequency(&circuit, &context, 300., |_| Ok(()))
+            .unwrap();
+        let actual = carried(&circuit);
+        circuit
+            .record_small_signal_state(&context.model_context().with_frequency(300.), small.bias())
+            .unwrap();
+        let expected = carried(&circuit);
+        assert_ne!(initial, expected);
+        assert_eq!(actual, expected);
     }
 }
