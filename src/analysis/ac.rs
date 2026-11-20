@@ -4,6 +4,7 @@
 //! ([`SmallSignal`]) are shared with the `.sp` driver
 //! (`crate::analysis::sparam`), because `span.c` steps frequencies and
 //! prepares its operating point exactly as `acan.c` does.
+use crate::analysis::frequency::{Advance, FrequencyGrid};
 use crate::analysis::linear::{number, plot, unsupported};
 use crate::analysis::{AnalysisRequest, Plot};
 use crate::devices::Circuit;
@@ -118,26 +119,22 @@ pub(super) fn frequency_grid(
     } else {
         delta * reltol
     };
-    let mut grid = Vec::new();
-    let mut freq = start;
-    while freq <= stop + tolerance {
-        if grid.len() >= 100_000 {
-            return Err(unsupported("AC sample limit exceeded"));
-        }
-        grid.push(freq);
-        if logarithmic {
-            freq *= delta;
-            if delta == 1. {
-                break;
-            }
+    let advance = if logarithmic {
+        if delta == 1. {
+            Advance::Single
         } else {
-            freq += delta;
-            if delta == 0. {
-                break;
-            }
+            Advance::Multiply(delta)
         }
-    }
-    Ok(grid)
+    } else if delta == 0. {
+        Advance::Single
+    } else {
+        Advance::Add(delta)
+    };
+    let analysis = match kind {
+        GridKind::Ac => ".ac",
+        GridKind::Sp => ".sp",
+    };
+    FrequencyGrid::new(start, stop, tolerance, advance, analysis)?.collect()
 }
 
 /// `CKTacLoad`: the small-signal system at `omega` loaded into the circuit's

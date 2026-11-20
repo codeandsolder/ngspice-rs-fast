@@ -39,6 +39,7 @@ pub mod config;
 pub mod disto;
 pub mod driver;
 pub mod fourier;
+mod frequency;
 mod initial;
 mod linear;
 pub mod measure;

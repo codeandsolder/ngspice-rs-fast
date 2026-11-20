@@ -51,6 +51,7 @@
 //! ported. `.option keepopinfo`'s extra operating-point plot is not produced
 //! (the option is not accepted by the port).
 
+use crate::analysis::frequency::{Advance, FrequencyGrid, MAX_POINTS};
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{Plot, PlotFlags, Variable};
 use crate::analysis::{AnalysisContext, AnalysisRequest};
@@ -69,8 +70,6 @@ const N_INTUSELOG: Real = 1e-10;
 /// C's default `CKTreltol`, the frequency-loop tolerance without `.option
 /// reltol`.
 const DEFAULT_RELTOL: Real = 1e-3;
-/// The port's bound on the number of frequency points.
-const MAX_POINTS: usize = 100_000;
 /// The spectrum plot's title (`noisean.c`, without `sqrnoise`).
 pub const SPECTRUM_PLOTNAME: &str = "Noise Spectral Density Curves";
 /// The integrated plot's title (`noisean.c`, without `sqrnoise`).
@@ -635,16 +634,16 @@ pub(crate) fn run(
         Stepping::Decade | Stepping::Octave => delta * card.stop * reltol,
         Stepping::Linear => delta * reltol,
     };
+    let advance = match card.stepping {
+        Stepping::Decade | Stepping::Octave => Advance::Multiply(delta),
+        Stepping::Linear if card.steps == 1 => Advance::Single,
+        Stepping::Linear => Advance::Add(delta),
+    };
+    let frequencies = FrequencyGrid::new(card.start, card.stop, tolerance, advance, ".noise")?;
     let mut integrated_power = Power::default();
-    let mut freq = card.start;
-    let mut last = freq;
-    let mut step = 0_usize;
-    while freq <= card.stop + tolerance {
-        if step >= MAX_POINTS {
-            return Err(unsupported(format!(
-                ".noise frequency loop exceeded {MAX_POINTS} points"
-            )));
-        }
+    let mut last = card.start;
+    for (step, frequency) in frequencies.enumerate() {
+        let freq = frequency?;
         let input_name = card.input.as_str();
         let (forward, adjoint) = small.at_frequency(circuit, context, freq, |system| {
             let matrix =
@@ -689,14 +688,6 @@ pub(crate) fn run(
             spectrum.push_point(row.into_iter().map(Complex::real).collect())?;
         }
         last = freq;
-        match card.stepping {
-            Stepping::Decade | Stepping::Octave => freq *= delta,
-            Stepping::Linear => freq += delta,
-        }
-        step += 1;
-        if card.steps == 1 && card.stepping == Stepping::Linear {
-            break;
-        }
     }
     if !spectrum.is_finite() {
         return Err(SpiceError::Numerical {
