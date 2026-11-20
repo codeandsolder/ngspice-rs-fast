@@ -94,6 +94,7 @@ use crate::devices::limiting;
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
+use crate::devices::nonlinear::thermal::DerivedCache;
 use crate::devices::nonlinear::{
     JunctionPoint, ReverseBoundary, junction_companion, junction_current,
 };
@@ -374,6 +375,7 @@ pub struct Mesfet {
     inner: [NodeId; 3],
     model: Model,
     instance: Instance,
+    derived: DerivedCache<(), Operating>,
     /// `OFF` and `ICVDS`/`ICVGS` (C `MESoff`, `MESicVDS`, `MESicVGS`).
     initial: crate::devices::initial::InstanceInitial,
 }
@@ -446,6 +448,7 @@ impl Mesfet {
             inner: [NodeId::GROUND; 3],
             model,
             instance,
+            derived: DerivedCache::new(),
             initial,
         };
         // Validate every derivation before interning nodes.
@@ -456,6 +459,10 @@ impl Mesfet {
 
     /// `mestemp.c` and the area scaling at the start of `mesload.c`.
     fn operating(&self) -> SpiceResult<Operating> {
+        self.derived.get_or_derive((), || self.derive_operating())
+    }
+
+    fn derive_operating(&self) -> SpiceResult<Operating> {
         let (model, area) = (&self.model, self.instance.area);
         let op = Operating {
             vcrit: limiting::critical_voltage(VT0, model.is),
@@ -685,6 +692,7 @@ impl Device for Mesfet {
             inner: self.inner,
             model: self.model,
             instance,
+            derived: DerivedCache::new(),
             initial,
         };
         device.operating()?;
@@ -1139,6 +1147,7 @@ impl MesfetSensitivity<'_> {
             inner: self.device.inner,
             model,
             instance,
+            derived: DerivedCache::new(),
             initial: self.device.initial.clone(),
         })
     }
@@ -1221,6 +1230,7 @@ mod tests {
             inner: [NodeId::GROUND; 3],
             model,
             instance: Instance { area: 1.5, m: 1. },
+            derived: DerivedCache::new(),
             initial: crate::devices::initial::InstanceInitial::default(),
         };
         (model, device.operating().unwrap())

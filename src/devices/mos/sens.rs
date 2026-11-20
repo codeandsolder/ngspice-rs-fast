@@ -17,6 +17,7 @@
 
 use super::{CELSIUS_TO_KELVIN, Common, MosLevel, Mosfet};
 use crate::devices::ModelContext;
+use crate::devices::nonlinear::thermal::TemperatureCache;
 use crate::devices::sensitivity::{
     AcReset, DeviceSensitivity, ParameterScope, RecordPair, ResetStamp, ResetStamps,
     SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
@@ -24,7 +25,6 @@ use crate::devices::sensitivity::{
 };
 use crate::devices::{Device, LinearContext, StampContext};
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
-use std::cell::OnceCell;
 
 /// Level-owned model record mapping. `derived` selects the already-stored
 /// process fields rather than recomputing them in the replacement's load.
@@ -332,7 +332,7 @@ impl<L: SensitivityLevel> MosSensitivity<'_, L> {
             geometry: d.geometry,
             series: d.series,
             initial: d.initial.clone(),
-            derived: OnceCell::new(),
+            derived: TemperatureCache::new(),
         }
     }
 
@@ -377,7 +377,7 @@ impl<L: SensitivityLevel> MosSensitivity<'_, L> {
             geometry,
             series,
             initial: self.device.initial.clone(),
-            derived: OnceCell::new(),
+            derived: TemperatureCache::new(),
         })
     }
 }

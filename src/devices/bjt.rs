@@ -68,6 +68,7 @@ use crate::devices::limiting::{self, Limiter, Linearization};
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
+use crate::devices::nonlinear::thermal::{TemperatureCache, TemperatureKey};
 use crate::devices::nonlinear::{
     DepletionLaw, cubic_reverse_junction, exponential_junction, reverse_depletion,
 };
@@ -896,6 +897,7 @@ pub struct Bjt {
     subs: Real,
     model: Model,
     instance: Instance,
+    derived: TemperatureCache<Thermal>,
     /// `OFF` and `ICVBE`/`ICVCE` (C `BJToff`, `BJTicVBE`, `BJTicVCE`).
     initial: crate::devices::initial::InstanceInitial,
 }
@@ -1030,12 +1032,16 @@ impl Bjt {
             subs,
             model: parameters,
             instance,
+            derived: TemperatureCache::from_value(TemperatureKey::context(context), thermal),
             initial,
         }))
     }
 
     fn thermal(&self, context: &ModelContext) -> SpiceResult<Thermal> {
-        self.model.thermal(&self.instance, self.subs > 0., context)
+        self.derived
+            .get_or_derive(TemperatureKey::context(context), || {
+                self.model.thermal(&self.instance, self.subs > 0., context)
+            })
     }
 
     /// `bjtload.c`'s `uic` initial bias (`MODEINITJCT` under `MODETRANOP |
@@ -1584,6 +1590,7 @@ impl Device for Bjt {
             subs: self.subs,
             model: self.model,
             instance,
+            derived: TemperatureCache::new(),
             initial,
         };
         c_point(&device.thermal(context)?, 0., 0., 0., 0., context.gmin)?;
@@ -2571,6 +2578,7 @@ impl BjtSensitivity<'_> {
             subs: self.device.subs,
             model,
             instance,
+            derived: TemperatureCache::new(),
             initial: self.device.initial.clone(),
         };
         Ok(device)

@@ -90,6 +90,7 @@ use crate::devices::jfet::{
     self, IC_COMPONENTS, Instance, Junctions, K_OVER_Q, Loaded, p, required,
 };
 use crate::devices::limiting;
+use crate::devices::nonlinear::thermal::{TemperatureCache, TemperatureKey};
 use crate::devices::nonlinear::{JunctionPoint, junction_companion};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
@@ -640,6 +641,7 @@ pub struct Jfet2 {
     inner: [NodeId; 3],
     model: Model,
     instance: Instance,
+    derived: TemperatureCache<Operating>,
     /// `OFF` and `IC-VDS`/`IC-VGS` (C `JFET2off`, `JFET2icVDS`, `JFET2icVGS`).
     initial: crate::devices::initial::InstanceInitial,
 }
@@ -723,6 +725,7 @@ impl Jfet2 {
             inner: [NodeId::GROUND; 3],
             model,
             instance,
+            derived: TemperatureCache::new(),
             initial,
         };
         // Validate every derivation before interning nodes.
@@ -734,6 +737,13 @@ impl Jfet2 {
     /// `jfet2temp.c` and `PSinstanceinit` for this instance, with
     /// `psmodel.c`'s area scaling.
     fn operating(&self, context: &ModelContext) -> SpiceResult<Operating> {
+        self.derived
+            .get_or_derive(TemperatureKey::context(context), || {
+                self.derive_operating(context)
+            })
+    }
+
+    fn derive_operating(&self, context: &ModelContext) -> SpiceResult<Operating> {
         let (model, instance) = (&self.model, &self.instance);
         let (tnom, temp) = jfet::temperatures(&self.name, model.tnom, instance, context)?;
         let junction = jfet::gate_junction(model.pb, tnom, temp);
@@ -1032,6 +1042,7 @@ impl Device for Jfet2 {
             inner: self.inner,
             model: self.model,
             instance,
+            derived: TemperatureCache::new(),
             initial,
         };
         device.operating(context)?;
@@ -1667,6 +1678,7 @@ impl Jfet2Sensitivity<'_> {
             inner: self.device.inner,
             model,
             instance,
+            derived: TemperatureCache::new(),
             initial: self.device.initial.clone(),
         })
     }
@@ -1812,6 +1824,7 @@ mod tests {
                 temp: None,
                 dtemp: 0.,
             },
+            derived: TemperatureCache::new(),
             initial: crate::devices::initial::InstanceInitial::default(),
         };
         let op = device.operating(&ModelContext::default()).unwrap();

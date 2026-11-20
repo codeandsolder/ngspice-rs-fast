@@ -80,7 +80,8 @@
 
 pub(super) mod sens;
 
-use std::cell::OnceCell;
+use crate::devices::nonlinear::thermal::{TemperatureCache, TemperatureKey};
+use std::cell::Ref;
 
 use crate::devices::initial::InstanceInitial;
 use crate::devices::limiting;
@@ -917,10 +918,8 @@ pub(super) struct Mosfet<L: MosLevel> {
     pub(super) series: [Real; 2],
     /// `OFF` and `ICVDS`/`ICVGS`/`ICVBS` (C `MOS1off`, `MOS1icV*`).
     pub(super) initial: InstanceInitial,
-    /// The derivation at the first circuit and nominal temperature it was
-    /// asked for, which C's `MOSxtemp` computes once; it depends on nothing
-    /// else, so loads reuse it.
-    pub(super) derived: OnceCell<(Real, Real, Operating<L::Params>)>,
+    /// The most recent circuit/nominal temperature derivation.
+    pub(super) derived: TemperatureCache<Operating<L::Params>>,
 }
 
 impl<L: MosLevel> Mosfet<L> {
@@ -973,7 +972,7 @@ impl<L: MosLevel> Mosfet<L> {
             geometry,
             series,
             initial,
-            derived: OnceCell::new(),
+            derived: TemperatureCache::new(),
         };
         // Validate every derivation before interning nodes.
         device.operating(context)?;
@@ -1028,26 +1027,15 @@ impl<L: MosLevel> Mosfet<L> {
 
     /// The temperature-, process- and geometry-dependent values of one load.
     pub(super) fn operating(&self, context: &ModelContext) -> SpiceResult<Operating<L::Params>> {
-        if let Some(op) = self.cached(context.temperature, context.nominal_temperature) {
-            return Ok(*op);
-        }
-        let op = self.model.operating(&self.name, &self.geometry, context)?;
-        let _ = self
-            .derived
-            .set((context.temperature, context.nominal_temperature, op));
-        Ok(op)
+        self.derived
+            .get_or_derive(TemperatureKey::context(context), || {
+                self.model.operating(&self.name, &self.geometry, context)
+            })
     }
 
-    /// The cached derivation when it was made at these circuit and nominal
-    /// temperatures.
-    #[inline]
-    fn cached(&self, temperature: Real, nominal: Real) -> Option<&Operating<L::Params>> {
-        self.derived
-            .get()
-            .filter(|(t, n, _)| {
-                t.to_bits() == temperature.to_bits() && n.to_bits() == nominal.to_bits()
-            })
-            .map(|(_, _, op)| op)
+    /// Borrow the cached derivation on the hot stamping path.
+    fn cached(&self, temperature: Real, nominal: Real) -> Option<Ref<'_, Operating<L::Params>>> {
+        self.derived.get(TemperatureKey::new(temperature, nominal))
     }
 
     /// `mos1load.c` from `vbd = vbs - vds` on, at the device-frame
@@ -1554,7 +1542,7 @@ impl<L: MosLevel> Device for Mosfet<L> {
             geometry,
             series,
             initial,
-            derived: OnceCell::new(),
+            derived: TemperatureCache::new(),
         };
         device.operating(context)?;
         Ok(Box::new(device))
@@ -1572,9 +1560,10 @@ impl<L: MosLevel> Device for Mosfet<L> {
                 L::LABEL
             )));
         }
+        let cached = self.cached(context.temperature, context.nominal_temperature);
         let fresh;
-        let op = if let Some(op) = self.cached(context.temperature, context.nominal_temperature) {
-            op
+        let op = if let Some(op) = &cached {
+            &**op
         } else {
             fresh = self.operating(&context.model_context())?;
             &fresh

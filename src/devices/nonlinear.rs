@@ -35,6 +35,8 @@ use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 
 mod sens;
+pub(super) mod thermal;
+use thermal::{TemperatureCache, TemperatureKey};
 
 /// Diode state slot of the limited junction voltage (C `DIOvoltage`).
 const DIODE_VOLTAGE_SLOT: usize = 2;
@@ -317,6 +319,7 @@ pub struct Diode {
     terminals: Vec<NodeId>,
     junction: [NodeId; 2],
     parameters: DiodeParameters,
+    derived: TemperatureCache<Thermal>,
     /// `off` and the instance `ic` (C `DIOoff`, `DIOinitCond`). The `ic`
     /// value is validated and kept but, exactly as in C, never used: see
     /// the `uic` start in `stamp`.
@@ -394,6 +397,13 @@ struct DiodeParameters {
     af: Real,
 }
 impl Diode {
+    fn thermal(&self, context: &ModelContext) -> SpiceResult<Thermal> {
+        self.derived
+            .get_or_derive(TemperatureKey::context(context), || {
+                self.parameters.thermal(context)
+            })
+    }
+
     pub(crate) fn instantiate(
         instance: &DeviceInstance,
         nodes: &mut NodeTable,
@@ -426,7 +436,8 @@ impl Diode {
             &instance.location,
         )?;
         let p = DiodeParameters::new(&m, &i, instance)?;
-        p.thermal(context)?.point(0., context.gmin)?; // validate before interning
+        let thermal = p.thermal(context)?;
+        thermal.point(0., context.gmin)?; // validate before interning
         let mut staged = nodes.clone();
         let external = [
             staged.intern(&instance.nodes[0]),
@@ -453,6 +464,7 @@ impl Diode {
             terminals,
             junction: [positive, external[1]],
             parameters: p,
+            derived: TemperatureCache::from_value(TemperatureKey::context(context), thermal),
             initial,
             location: instance.location.clone(),
             written: std::rc::Rc::new((m, i)),
@@ -1353,13 +1365,15 @@ impl Device for Diode {
             }
         }
         p.check(&self.location)?;
-        p.thermal(context)?.point(0., context.gmin)?;
+        let thermal = p.thermal(context)?;
+        thermal.point(0., context.gmin)?;
         Ok(Box::new(Self {
             name: self.name.clone(),
             model: self.model.clone(),
             terminals: self.terminals.clone(),
             junction: self.junction,
             parameters: p,
+            derived: TemperatureCache::from_value(TemperatureKey::context(context), thermal),
             initial,
             location: self.location.clone(),
             written: self.written.clone(),
@@ -1378,7 +1392,7 @@ impl Device for Diode {
             return Err(SpiceError::circuit("diode AC needs small-signal assembly"));
         }
         let model = context.model_context();
-        let thermal = self.parameters.thermal(&model)?;
+        let thermal = self.thermal(&model)?;
         let mut limiter = Limiter::new(&context.states);
         // dioload.c: MODEINITPRED extrapolates the junction voltage
         // (`DEVpred`) before limiting it; otherwise the iterate's. Outside
@@ -1472,7 +1486,7 @@ impl Device for Diode {
                 .and_then(|r| bias.get(r))
                 .unwrap_or(0.)
         };
-        let thermal = self.parameters.thermal(context.model_context)?;
+        let thermal = self.thermal(context.model_context)?;
         let p = thermal.point(
             v(self.junction[0]) - v(self.junction[1]),
             context.model_context.gmin,
@@ -1518,7 +1532,7 @@ impl Device for Diode {
             Control, DeviceDistortion, DistortionTerm, Response, Taylor,
         };
         let p = &self.parameters;
-        let t = p.thermal(context.model_context)?;
+        let t = self.thermal(context.model_context)?;
         let vd = context.voltage(self.junction[0]) - context.voltage(self.junction[1]);
         let csat = t.csat + t.csatsw.unwrap_or(0.);
         let vt = t.vt;
@@ -1586,7 +1600,7 @@ impl Device for Diode {
     /// a separate sidewall (RSW, not ported) are zero, as C's are without RSW.
     fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
         let p = &self.parameters;
-        let thermal = p.thermal(context.model_context)?;
+        let thermal = self.thermal(context.model_context)?;
         let vd = context.voltage(self.junction[0]) - context.voltage(self.junction[1]);
         let cd = thermal
             .point(vd, context.model_context.gmin)?
