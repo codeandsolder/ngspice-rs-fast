@@ -194,7 +194,7 @@ impl Level6 {
             cox,
             kc: self
                 .kc
-                .unwrap_or(0.5 * self.u0.unwrap_or(600.) * cox * 1e-4),
+                .unwrap_or_else(|| 0.5 * self.u0.unwrap_or(600.) * cox * 1e-4),
             surface: self.surface.derive(
                 SurfaceLaw::Classic,
                 "MOS6",
@@ -468,9 +468,8 @@ impl MosLevel for Level6 {
             || factors.iter().any(|f| !f.is_finite() || *f < 0.)
         {
             return Err(SpiceError::circuit(format!(
-                "{}: MOS6 parameters are out of range at {:.2} K \
-                 (nonfinite value, or nonpositive PHI/PB/IS after temperature scaling)",
-                name, temp
+                "{name}: MOS6 parameters are out of range at {temp:.2} K \
+                 (nonfinite value, or nonpositive PHI/PB/IS after temperature scaling)"
             )));
         }
         Ok(operating)
