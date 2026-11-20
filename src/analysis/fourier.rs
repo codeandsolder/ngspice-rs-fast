@@ -330,15 +330,14 @@ fn check_budget(card: &FourierCard) -> SpiceResult<()> {
         ));
     }
     if card.harmonics == 0 || card.harmonics > MAX_HARMONICS {
+        let harmonics = card.harmonics;
+        let max_divisions = 4 * MAX_HARMONICS;
         return Err(unsupported(
             card,
             format!(
-                ".four: HARMONICS={} is outside this port's bounded resampling budget of 1..={} \
-                 harmonics ({} grid subintervals per vector); C has no such bound \
-                 (docs/port/FOURIER.md)",
-                card.harmonics,
-                MAX_HARMONICS,
-                4 * MAX_HARMONICS
+                ".four: HARMONICS={harmonics} is outside this port's bounded resampling budget of 1..={MAX_HARMONICS} \
+                 harmonics ({max_divisions} grid subintervals per vector); C has no such bound \
+                 (docs/port/FOURIER.md)"
             ),
         ));
     }
@@ -461,54 +460,78 @@ fn evaluate(
         return Err(unsupported(
             card,
             format!(
-                ".four {}: the final period [{}, {}] covers only {} sample(s); {} harmonics need \
-                 at least {} (two per cycle of the highest harmonic, plus the endpoint) to be \
+                ".four {}: the final period [{}, {}] covers only {samples} sample(s); {harmonics} harmonics need \
+                 at least {needed} (two per cycle of the highest harmonic, plus the endpoint) to be \
                  well posed",
                 trace.name(),
                 crate::primitives::format_spice_number(from),
-                crate::primitives::format_spice_number(to),
-                samples,
-                harmonics,
-                needed
+                crate::primitives::format_spice_number(to)
             ),
         ));
     }
-    let divisions = 4 * card.harmonics.max(GRID_FLOOR) as usize;
-    let step = period / divisions as Real;
-    let mut values = Vec::with_capacity(divisions + 1);
+    let divisions = 4 * card.harmonics.max(GRID_FLOOR);
+    let step = period / Real::from(divisions);
+    let mut values = Vec::with_capacity(divisions as usize + 1);
     for i in 0..=divisions {
         // The closing point is the window's upper bound exactly, so the grid
         // ends on the plot's own last sample instead of on accumulated rounding.
         let x = if i == divisions {
             to
         } else {
-            from + (i as Real) * step
+            let offset = Real::from(i) * step;
+            from + offset
         };
         values.push(sample(axis, &trace, x, card)?);
     }
 
+    let (dc, tabulated, thd) = closed_grid_spectrum(&values, divisions, card, &trace)?;
+    Ok(FourierAnalysis {
+        vector: trace.name().to_owned(),
+        unit: trace.unit().to_owned(),
+        fundamental: card.fundamental,
+        dc,
+        harmonics: tabulated,
+        thd,
+        window: FourierWindow { from, to },
+        divisions: divisions as usize,
+        samples,
+    })
+}
+
+/// Non-fused projection on the legacy closed grid, preserving its summation order.
+fn closed_grid_spectrum(
+    values: &[Real],
+    divisions: u32,
+    card: &FourierCard,
+    trace: &Trace<'_>,
+) -> SpiceResult<(Real, Vec<Harmonic>, Real)> {
+    let harmonics = card.harmonics as usize;
     let mut sine = vec![0.0; harmonics + 1];
     let mut cosine = vec![0.0; harmonics + 1];
-    for (i, y) in values.iter().enumerate() {
+    let divisor = Real::from(divisions);
+    for (i, y) in (0..=divisions).zip(values) {
         let weight = if i == 0 || i == divisions { 0.5 } else { 1.0 };
         let weighted = weight * y;
-        let phase = i as Real / divisions as Real;
-        for k in 0..=harmonics {
-            let angle = std::f64::consts::TAU * (k as Real) * phase;
-            sine[k] += weighted * angle.sin();
-            cosine[k] += weighted * angle.cos();
+        let phase = Real::from(i) / divisor;
+        for (k, (sine, cosine)) in (0..=card.harmonics).zip(sine.iter_mut().zip(&mut cosine)) {
+            let angle = std::f64::consts::TAU * Real::from(k) * phase;
+            let sine_term = weighted * angle.sin();
+            let cosine_term = weighted * angle.cos();
+            *sine += sine_term;
+            *cosine += cosine_term;
         }
     }
-    let scale = 2.0 / divisions as Real;
-    let dc = cosine[0] / divisions as Real;
+    let scale = 2.0 / divisor;
+    let dc = cosine[0] / divisor;
     // The trace's own magnitude, from the same sums: the noise floor the
     // fundamental amplitude is compared against below.
-    let magnitude = values.iter().enumerate().fold(0.0, |sum, (i, y)| {
+    let magnitude = (0..=divisions).zip(values).fold(0.0, |sum, (i, y)| {
         let weight = if i == 0 || i == divisions { 0.5 } else { 1.0 };
-        sum + weight * y.abs()
-    }) / divisions as Real;
+        let term = weight * y.abs();
+        sum + term
+    }) / divisor;
     let mut tabulated = Vec::with_capacity(harmonics);
-    for (k, (sine, cosine)) in sine.iter().zip(&cosine).enumerate().skip(1) {
+    for (k, (sine, cosine)) in (1..=card.harmonics).zip(sine.iter().zip(&cosine).skip(1)) {
         let amplitude = (scale * sine).hypot(scale * cosine);
         let phase = (scale * cosine).atan2(scale * sine);
         if !amplitude.is_finite() || !phase.is_finite() {
@@ -518,9 +541,8 @@ fn evaluate(
             ));
         }
         tabulated.push(Harmonic {
-            order: u32::try_from(k)
-                .map_err(|_| unsupported(card, format!("harmonic index {k} exceeds u32")))?,
-            frequency: k as Real * card.fundamental,
+            order: k,
+            frequency: Real::from(k) * card.fundamental,
             amplitude,
             phase,
         });
@@ -551,17 +573,7 @@ fn evaluate(
             "the DC component or the total harmonic distortion is not finite".to_owned(),
         ));
     }
-    Ok(FourierAnalysis {
-        vector: trace.name().to_owned(),
-        unit: trace.unit().to_owned(),
-        fundamental: card.fundamental,
-        dc,
-        harmonics: tabulated,
-        thd,
-        window: FourierWindow { from, to },
-        divisions,
-        samples,
-    })
+    Ok((dc, tabulated, thd))
 }
 
 /// The vector's value at one physical time, with `.measure`'s sample model.
@@ -642,7 +654,7 @@ pub fn resolve_with_stable_settings(
 struct ConfiguredPlan {
     window: FourierWindow,
     periods: u32,
-    harmonics: usize,
+    harmonics: u32,
     grid: Option<Vec<Real>>,
     degree: usize,
 }
@@ -652,7 +664,7 @@ impl ConfiguredPlan {
         axis: &TimeAxis,
         card: &FourierCard,
         settings: FourierSettings,
-        count: usize,
+        count: u32,
     ) -> SpiceResult<Self> {
         let to = *axis
             .values
@@ -670,9 +682,9 @@ impl ConfiguredPlan {
             ));
         }
         let harmonics = if card.harmonics_location.is_some() {
-            card.harmonics as usize
+            card.harmonics
         } else {
-            settings.nfreqs.saturating_sub(1) as usize
+            settings.nfreqs.saturating_sub(1)
         };
         if harmonics == 0 {
             return Err(unsupported(
@@ -683,22 +695,27 @@ impl ConfiguredPlan {
         let n = if settings.polydegree == 0 {
             axis.values.len()
         } else {
-            count
+            count as usize
         };
         if n > 100_000 {
             return Err(unsupported(card, "Fourier sample budget exceeded".into()));
         }
         // The kth harmonic occupies DFT bin k * nperiods, not bin k.
         // A real signal's highest requested bin must be strictly below Nyquist.
-        if n <= 2 * harmonics * settings.nperiods as usize {
+        if n <= (2 * harmonics * settings.nperiods) as usize {
             return Err(unsupported(
                 card,
                 "Fourier grid undersamples requested harmonics".into(),
             ));
         }
         let grid = (settings.polydegree != 0).then(|| {
-            let step = (to - from) / count as Real;
-            (0..count).map(|i| from + i as Real * step).collect()
+            let step = (to - from) / Real::from(count);
+            (0..count)
+                .map(|i| {
+                    let offset = Real::from(i) * step;
+                    from + offset
+                })
+                .collect()
         });
         Ok(Self {
             window: FourierWindow { from, to },
@@ -736,28 +753,33 @@ impl ConfiguredPlan {
         values: &[Real],
         samples: usize,
     ) -> SpiceResult<FourierAnalysis> {
-        let n = values.len();
+        let n = u32::try_from(values.len())
+            .map_err(|_| unsupported(card, "Fourier sample count exceeds u32".into()))?;
+        let divisor = Real::from(n);
         let periods = Real::from(self.periods);
-        let dc = values.iter().sum::<Real>() / n as Real;
-        let mut tabulated = Vec::with_capacity(self.harmonics);
+        let dc = values.iter().sum::<Real>() / divisor;
+        let mut tabulated = Vec::with_capacity(self.harmonics as usize);
         for k in 1..=self.harmonics {
             let mut sine = 0.;
             let mut cosine = 0.;
-            for (i, y) in values.iter().enumerate() {
-                let phase = std::f64::consts::TAU * k as Real * periods * i as Real / n as Real;
-                sine += y * phase.sin();
-                cosine += y * phase.cos();
+            for (i, y) in (0..n).zip(values) {
+                let phase =
+                    std::f64::consts::TAU * Real::from(k) * periods * Real::from(i) / divisor;
+                // C's projection rounds the product before adding it to the accumulator.
+                let sine_term = y * phase.sin();
+                let cosine_term = y * phase.cos();
+                sine += sine_term;
+                cosine += cosine_term;
             }
             tabulated.push(Harmonic {
-                order: u32::try_from(k)
-                    .map_err(|_| unsupported(card, format!("harmonic index {k} exceeds u32")))?,
-                frequency: k as Real * card.fundamental,
-                amplitude: 2. * sine.hypot(cosine) / n as Real,
+                order: k,
+                frequency: Real::from(k) * card.fundamental,
+                amplitude: 2. * sine.hypot(cosine) / divisor,
                 phase: cosine.atan2(sine),
             });
         }
         let fundamental = tabulated[0].amplitude;
-        let magnitude = values.iter().map(|v| v.abs()).sum::<Real>() / n as Real;
+        let magnitude = values.iter().map(|v| v.abs()).sum::<Real>() / divisor;
         if fundamental <= NOISE_ULPS * f64::EPSILON * magnitude {
             return Err(nonfinite(
                 trace.name(),
@@ -786,7 +808,7 @@ impl ConfiguredPlan {
             harmonics: tabulated,
             thd,
             window: self.window,
-            divisions: n,
+            divisions: n as usize,
             samples,
         })
     }
@@ -800,7 +822,7 @@ fn stable_resample(
     card: &FourierCard,
     name: &str,
 ) -> SpiceResult<Vec<Real>> {
-    if axis.values.len() <= degree || axis.values.windows(2).any(|w| w[0] == w[1]) {
+    if axis.values.len() <= degree || axis.values.windows(2).any(|w| w[0] >= w[1]) {
         return Err(unsupported(
             card,
             "stable polynomial interpolation needs distinct samples".into(),
@@ -821,7 +843,8 @@ fn stable_resample(
                         / (axis.values[start + k] - axis.values[start + j]);
                 }
             }
-            value += weight * samples[start + k];
+            let term = weight * samples[start + k];
+            value += term;
         }
         if !value.is_finite() {
             return Err(nonfinite(
@@ -855,8 +878,9 @@ fn resolve_settings(
             "invalid Fourier settings or analysis".into(),
         ));
     }
-    let count = (settings.gridsize as usize)
-        .checked_mul(settings.nperiods as usize)
+    let count = settings
+        .gridsize
+        .checked_mul(settings.nperiods)
         .filter(|n| *n <= 100_000)
         .ok_or_else(|| unsupported(first, "Fourier grid exceeds 100000 samples".into()))?;
     let mut results = Vec::new();
