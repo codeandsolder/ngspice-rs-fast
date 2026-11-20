@@ -229,15 +229,8 @@ fn floor_log2(v: f64, what: impl FnOnce() -> String) -> SpiceResult<i32> {
             format!("nonpositive/non-finite {}", what()),
         ));
     }
-    let bits = v.to_bits();
-    let biased = i32::try_from((bits >> 52) & 0x7ff).expect("binary64 exponent is at most 2047");
-    Ok(if biased == 0 {
-        let leading =
-            i32::try_from(bits.leading_zeros()).expect("binary64 has at most 64 leading zeros");
-        63 - leading - 1074
-    } else {
-        biased - 1023
-    })
+    crate::primitives::value::binary_exponent(v)
+        .ok_or_else(|| numerical("equilibration", "invalid binary exponent"))
 }
 
 fn factors(maxima: &[f64], namespace: &str) -> SpiceResult<Vec<f64>> {

@@ -75,6 +75,9 @@ pub struct Pattern {
 pub(super) struct OrderingState {
     pub(super) frame: Option<crate::maths::linear::CachedFrame>,
     pub(super) ac_reorder: bool,
+    /// Reused real triangular-solve scratch, owned by the circuit
+    /// transaction rather than by an immutable factor snapshot.
+    pub(super) solve_workspace: Vec<Real>,
 }
 
 impl Default for OrderingState {
@@ -82,6 +85,7 @@ impl Default for OrderingState {
         Self {
             frame: None,
             ac_reorder: true,
+            solve_workspace: Vec::new(),
         }
     }
 }

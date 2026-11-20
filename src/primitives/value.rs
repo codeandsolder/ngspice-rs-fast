@@ -179,15 +179,15 @@ impl Div for Complex {
         let result = Self::new((ac + bd) / denominator, (bc - ad) / denominator);
         // Keep the C operation order on the ordinary path. Only use the
         // scaled path when a product or sum loses its representable range.
-        if self.is_finite()
+        if (!denominator.is_normal()
+            || !result.is_finite()
+            || lost_product(ac, self.re, rhs.re)
+            || lost_product(bd, self.im, rhs.im)
+            || lost_product(bc, self.im, rhs.re)
+            || lost_product(ad, self.re, rhs.im))
+            && self.is_finite()
             && rhs.is_finite()
             && rhs != Self::ZERO
-            && (!denominator.is_normal()
-                || !result.is_finite()
-                || lost_product(ac, self.re, rhs.re)
-                || lost_product(bd, self.im, rhs.im)
-                || lost_product(bc, self.im, rhs.re)
-                || lost_product(ad, self.re, rhs.im))
         {
             return scaled_complex_div(self, rhs);
         }
@@ -199,55 +199,102 @@ fn lost_product(product: Real, a: Real, b: Real) -> bool {
     !product.is_normal() && a != 0.0 && b != 0.0
 }
 
-/// A product represented without overflowing or underflowing binary64's
-/// exponent range. Keep each numerator component independent: normalizing
-/// the entire complex numerator by its largest component can erase a tiny
-/// component whose quotient is still representable.
+/// A number represented outside the native binary64 exponent range.
 #[derive(Clone, Copy)]
-struct ScaledProduct {
+struct ScaledNumber {
     mantissa: Real,
     exponent: i32,
+}
+
+impl ScaledNumber {
+    fn divide(self, rhs: Self) -> Real {
+        scale_power(self.mantissa / rhs.mantissa, self.exponent - rhs.exponent)
+    }
+}
+
+/// An exponent-scaled product with its exact rounding residual. Keeping
+/// products independent preserves each quotient component even with a
+/// very large dynamic range between the real and imaginary inputs. The
+/// residual also recovers cancellation between two products that round
+/// to the same significand.
+#[derive(Clone, Copy)]
+struct ScaledProduct {
+    value: ScaledNumber,
+    roundoff: Real,
 }
 
 impl ScaledProduct {
     fn product(a: Real, b: Real) -> Self {
         if a == 0.0 || b == 0.0 {
             return Self {
-                mantissa: a * b,
-                exponent: 0,
+                value: ScaledNumber {
+                    mantissa: a * b,
+                    exponent: 0,
+                },
+                roundoff: 0.0,
             };
         }
         let (a, ae) = split_power(a);
         let (b, be) = split_power(b);
+        let mantissa = a * b;
         Self {
-            mantissa: a * b,
-            exponent: ae + be,
+            value: ScaledNumber {
+                mantissa,
+                exponent: ae + be,
+            },
+            // Both scaled factors have magnitude in [1, 2), so this
+            // error-free product cannot overflow or underflow.
+            roundoff: a.mul_add(b, -mantissa),
         }
     }
 
-    fn add(self, other: Self) -> Self {
-        if self.mantissa == 0.0 && other.mantissa == 0.0 {
-            return Self {
-                mantissa: self.mantissa + other.mantissa,
+    fn add(self, other: Self) -> ScaledNumber {
+        let x = self.value;
+        let y = other.value;
+        if x.mantissa == 0.0 && y.mantissa == 0.0 {
+            return ScaledNumber {
+                mantissa: x.mantissa + y.mantissa,
                 exponent: 0,
             };
         }
-        if self.mantissa == 0.0 {
-            return other;
+        if x.mantissa == 0.0 {
+            return y;
         }
-        if other.mantissa == 0.0 {
-            return self;
+        if y.mantissa == 0.0 {
+            return x;
         }
-        let exponent = self.exponent.max(other.exponent);
-        Self {
-            mantissa: scale_power(self.mantissa, self.exponent - exponent)
-                + scale_power(other.mantissa, other.exponent - exponent),
+        let exponent = x.exponent.max(y.exponent);
+        let a = scale_power(x.mantissa, x.exponent - exponent);
+        let b = scale_power(y.mantissa, y.exponent - exponent);
+        let sum = a + b;
+        // Knuth's TwoSum: keep the addition rounding residual too. This
+        // is strictly on the exceptional path, never ordinary C arithmetic.
+        let virtual_b = sum - a;
+        let residual = (a - (sum - virtual_b)) + (b - virtual_b);
+        let roundoff = residual
+            + scale_power(self.roundoff, x.exponent - exponent)
+            + scale_power(other.roundoff, y.exponent - exponent);
+        ScaledNumber {
+            mantissa: sum + roundoff,
             exponent,
         }
     }
+}
 
-    fn divide(self, rhs: Self) -> Real {
-        scale_power(self.mantissa / rhs.mantissa, self.exponent - rhs.exponent)
+/// Exact unbiased exponent of a finite, nonzero binary64 magnitude,
+/// including subnormals. Returns None for zero, infinity and NaN.
+pub(crate) fn binary_exponent(value: Real) -> Option<i32> {
+    if !value.is_finite() || value == 0.0 {
+        return None;
+    }
+    let bits = value.abs().to_bits();
+    let biased = i32::try_from((bits >> 52) & 0x7ff).expect("11-bit exponent");
+    if biased == 0 {
+        let leading =
+            i32::try_from(bits.leading_zeros()).expect("binary64 has at most 64 leading zeros");
+        Some(63 - leading - 1074)
+    } else {
+        Some(biased - 1023)
     }
 }
 
@@ -634,6 +681,21 @@ mod tests {
         format_spice_number, parse_numparam_number_prefix, parse_spice_number,
         parse_spice_number_prefix,
     };
+
+    #[test]
+    fn scaled_division_recovers_product_cancellation_below_one_ulp() {
+        let epsilon = f64::EPSILON;
+        for scale in [2_f64.powi(-700), 2_f64.powi(700)] {
+            let a = Complex::new((1. + epsilon) * scale, -scale);
+            let b = Complex::new((1. - epsilon) * scale, scale);
+            let quotient = a / b;
+            // Exact real numerator is -epsilon^2 * scale^2, even though
+            // the two rounded products cancel. It must not become zero.
+            let expected = -(epsilon * epsilon) / ((1. - epsilon) * (1. - epsilon) + 1.);
+            assert!((quotient.re / expected - 1.).abs() < 1e-14);
+            assert!((quotient.im + 1.).abs() < 1e-14);
+        }
+    }
 
     #[test]
     fn complex_division_preserves_normal_rounding_and_extreme_components() {

@@ -328,9 +328,14 @@ impl FactoredInputs {
     }
 }
 
-fn solve_real(sparse: &Sparse<f64>, n: usize, rhs: &Vector) -> SpiceResult<Vector> {
+fn solve_real(
+    sparse: &Sparse<f64>,
+    n: usize,
+    rhs: &Vector,
+    workspace: &mut Vec<f64>,
+) -> SpiceResult<Vector> {
     rhs_valid(rhs, n)?;
-    let x = Vector::from(sparse.solve(rhs.as_slice()));
+    let x = Vector::from(sparse.solve_with_workspace(rhs.as_slice(), workspace));
     if !x.is_finite() {
         return Err(numerical(
             "LU solve",
@@ -342,7 +347,11 @@ fn solve_real(sparse: &Sparse<f64>, n: usize, rhs: &Vector) -> SpiceResult<Vecto
 
 impl SparseSymbolic {
     fn solve(&self, rhs: &Vector) -> SpiceResult<Vector> {
-        solve_real(&self.sparse, self.n, rhs)
+        self.solve_with_workspace(rhs, &mut Vec::new())
+    }
+
+    fn solve_with_workspace(&self, rhs: &Vector, workspace: &mut Vec<f64>) -> SpiceResult<Vector> {
+        solve_real(&self.sparse, self.n, rhs, workspace)
     }
 
     /// Whether a matrix has exactly this assembled pattern.
@@ -388,18 +397,19 @@ pub fn solve_with_ordering(
         // A bound matrix uses its pattern's single persistent order instead.
         return pattern.with_ordering(|state| {
             let mut cached = state.frame.take().map(|frame| frame.into_real(pattern));
-            let x = solve_reusing(matrix, rhs, &mut cached);
+            let x = solve_reusing(matrix, rhs, &mut cached, &mut state.solve_workspace);
             state.frame = cached.map(CachedFrame::Real);
             x
         });
     }
-    solve_reusing(matrix, rhs, ordering)
+    solve_reusing(matrix, rhs, ordering, &mut Vec::new())
 }
 
 fn solve_reusing(
     matrix: &SparseMatrix,
     rhs: &Vector,
     ordering: &mut Option<SparseSymbolic>,
+    workspace: &mut Vec<f64>,
 ) -> SpiceResult<Vector> {
     let previous = ordering.take();
     let matrix = prepare_matrix(matrix)?;
@@ -407,9 +417,10 @@ fn solve_reusing(
         Some(previous) if previous.matches(&matrix) => SparseLu::refactor(previous, &matrix)?,
         _ => SparseLu::factor_prepared(&matrix)?,
     };
-    let x = factor.solve(rhs)?;
+    let result = factor.symbolic.solve_with_workspace(rhs, workspace);
+    // An invalid RHS does not invalidate the matrix's newly computed LU.
     *ordering = Some(factor.symbolic);
-    Ok(x)
+    result
 }
 
 /// `NIacIter`'s factorization (`niaciter.c`) of a complex system loaded into
@@ -630,12 +641,19 @@ pub fn solve_ni(
     if let Some((pattern, _)) = matrix.bound_values() {
         return pattern.with_ordering(|state| {
             let mut cached = state.frame.take().map(|frame| frame.into_real(pattern));
-            let step = ni_step(matrix, rhs, &mut cached, reorder, diag_gmin);
+            let step = ni_step(
+                matrix,
+                rhs,
+                &mut cached,
+                reorder,
+                diag_gmin,
+                &mut state.solve_workspace,
+            );
             state.frame = cached.map(CachedFrame::Real);
             step
         });
     }
-    ni_step(matrix, rhs, ordering, reorder, diag_gmin)
+    ni_step(matrix, rhs, ordering, reorder, diag_gmin, &mut Vec::new())
 }
 
 fn ni_step(
@@ -644,6 +662,7 @@ fn ni_step(
     ordering: &mut Option<SparseSymbolic>,
     reorder: bool,
     diag_gmin: f64,
+    workspace: &mut Vec<f64>,
 ) -> SpiceResult<NiStep> {
     let pivot = matrix.pivot_tolerances();
     let previous = ordering.take();
@@ -662,7 +681,9 @@ fn ni_step(
             })
         });
     if reuse && let Some(previous) = previous {
-        let result = previous.solve(rhs).map(NiStep::Solved);
+        let result = previous
+            .solve_with_workspace(rhs, workspace)
+            .map(NiStep::Solved);
         *ordering = Some(previous);
         return result;
     }
@@ -721,7 +742,9 @@ fn ni_step(
         if zero_pivot {
             return Ok(NiStep::ZeroPivot);
         }
-        factored.solve(rhs).map(NiStep::Solved)
+        factored
+            .solve_with_workspace(rhs, workspace)
+            .map(NiStep::Solved)
     });
     *ordering = Some(factored);
     result
@@ -743,7 +766,7 @@ pub fn solve_last_factors(pattern: &Arc<Pattern>, rhs: &Vector) -> SpiceResult<O
                 if matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern)))
                     && symbolic.sparse.is_factored() =>
             {
-                Some(symbolic.solve(rhs))
+                Some(symbolic.solve_with_workspace(rhs, &mut state.solve_workspace))
             }
             _ => None,
         }.transpose()
@@ -913,7 +936,7 @@ impl DenseLu {
     /// # Errors
     /// Invalid RHS or non-finite solution.
     pub fn solve(&self, rhs: &Vector) -> SpiceResult<Vector> {
-        solve_real(&self.sparse, self.n, rhs)
+        solve_real(&self.sparse, self.n, rhs, &mut Vec::new())
     }
 }
 
@@ -921,6 +944,27 @@ impl DenseLu {
 mod tests {
     use super::*;
     use crate::maths::complex::ComplexMatrix;
+
+    #[test]
+    fn bound_solves_reuse_scratch_and_keep_valid_factors_on_rhs_failure() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        for (r, c, v) in [(0, 0, 3.), (0, 1, 1.), (1, 0, 1.), (1, 1, 4.)] {
+            a.set(r, c, v).unwrap();
+        }
+        let rhs = Vector::from_slice(&[4., 5.]);
+        let first = solve_with_ordering(&a, &rhs, &mut None).unwrap();
+        let storage = pattern.with_ordering(|state| state.solve_workspace.as_ptr());
+        let second = solve_with_ordering(&a, &rhs, &mut None).unwrap();
+        assert_eq!(first, second);
+        assert!(solve_with_ordering(&a, &Vector::zeros(1), &mut None).is_err());
+        let retained = solve_last_factors(&pattern, &rhs).unwrap().unwrap();
+        assert_eq!(retained, first);
+        assert_eq!(
+            storage,
+            pattern.with_ordering(|state| state.solve_workspace.as_ptr())
+        );
+    }
 
     #[test]
     fn unique_refactors_keep_frame_and_input_allocations() {

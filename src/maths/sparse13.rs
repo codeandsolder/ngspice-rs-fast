@@ -810,9 +810,6 @@ impl<T: Scalar> Sparse<T> {
             return self.order_and_factor(0.0, 0.0);
         }
         self.factored = false;
-        if !self.values_are_finite() {
-            return self.nonfinite_factor();
-        }
         let size = self.size;
         if size == 0 {
             self.factored = true;
@@ -821,7 +818,7 @@ impl<T: Scalar> Sparse<T> {
         }
         let first = self.diag[1];
         if self.elements[first].value.is_zero() {
-            return self.zero_pivot(1);
+            return self.refactor_zero_pivot(1);
         }
         let inverse = self.elements[first].value.recip();
         if !inverse.is_finite() || inverse.is_zero() {
@@ -842,9 +839,6 @@ impl<T: Scalar> Sparse<T> {
                 let row = self.elements[column].row;
                 let mut e = self.diag[row];
                 let mult = dest[row].mul(self.elements[e].value);
-                if !mult.is_finite() {
-                    return self.nonfinite_factor();
-                }
                 self.elements[column].value = mult;
                 e = self.elements[e].next_in_col;
                 while e != NONE {
@@ -857,14 +851,11 @@ impl<T: Scalar> Sparse<T> {
             let mut e = self.elements[self.diag[step]].next_in_col;
             while e != NONE {
                 let value = dest[self.elements[e].row];
-                if !value.is_finite() {
-                    return self.nonfinite_factor();
-                }
                 self.elements[e].value = value;
                 e = self.elements[e].next_in_col;
             }
             if dest[step].is_zero() {
-                return self.zero_pivot(step);
+                return self.refactor_zero_pivot(step);
             }
             let d = self.diag[step];
             let inverse = dest[step].recip();
@@ -873,9 +864,25 @@ impl<T: Scalar> Sparse<T> {
             }
             self.elements[d].value = inverse;
         }
+        // Fixed-order factorization does not compare coefficient magnitudes
+        // to select pivots. Validate the stored factors in one contiguous
+        // pass, including the untouched subdiagonal entries of column one.
+        // Every computed entry is stored; a nonfinite pivot is rejected above.
+        if !self.values_are_finite() {
+            return self.nonfinite_factor();
+        }
         self.factored = true;
         self.status = Status::Okay;
         self.status
+    }
+
+    fn refactor_zero_pivot(&mut self, step: usize) -> Status {
+        // Preserve the distinction between singular and nonfinite input
+        // even when an early zero pivot stops the factorization.
+        if !self.values_are_finite() {
+            return self.nonfinite_factor();
+        }
+        self.zero_pivot(step)
     }
 
     /// `spcCreateInternalVectors`.
@@ -1625,12 +1632,14 @@ impl<T: Scalar> Sparse<T> {
     /// `RHS` as both right-hand side and solution), so an external index with
     /// no internal row keeps its right-hand-side value.
     pub(crate) fn solve(&self, rhs: &[T]) -> Vec<T> {
-        debug_assert!(self.factored && rhs.len() == self.ext_size);
+        self.solve_with_workspace(rhs, &mut Vec::new())
+    }
+
+    /// The same triangular solve using a caller-owned numeric workspace.
+    /// No factor snapshot needs mutable scratch or interior mutability.
+    pub(super) fn solve_with_workspace(&self, rhs: &[T], x: &mut Vec<T>) -> Vec<T> {
+        self.gather_rhs(rhs, x, false);
         let size = self.size;
-        let mut x = vec![T::ZERO; size + 1];
-        for i in (1..=size).rev() {
-            x[i] = rhs[self.int_to_ext_row[i] - 1];
-        }
         for i in 1..=size {
             let mut temp = x[i];
             if !temp.is_zero() {
@@ -1654,22 +1663,48 @@ impl<T: Scalar> Sparse<T> {
             }
             x[i] = temp;
         }
-        let mut solution = rhs.to_vec();
-        for i in (1..=size).rev() {
-            solution[self.int_to_ext_col[i] - 1] = x[i];
-        }
-        solution
+        self.scatter_solution(rhs, x, false)
+    }
+
+    /// Gather directly into the internal 1-based work vector without
+    /// first zero-initializing every translated entry.
+    fn gather_rhs(&self, rhs: &[T], x: &mut Vec<T>, transposed: bool) {
+        debug_assert!(self.factored && rhs.len() == self.ext_size);
+        let indices = if transposed {
+            &self.int_to_ext_col
+        } else {
+            &self.int_to_ext_row
+        };
+        x.clear();
+        x.reserve(self.size + 1);
+        x.push(T::ZERO);
+        x.extend(indices[1..=self.size].iter().map(|&ext| rhs[ext - 1]));
+    }
+
+    /// Emit external-order values sequentially. Untranslated unknowns keep
+    /// exactly their original RHS bits, including signed zeros.
+    fn scatter_solution(&self, rhs: &[T], x: &[T], transposed: bool) -> Vec<T> {
+        let indices = if transposed {
+            &self.ext_to_int_row
+        } else {
+            &self.ext_to_int_col
+        };
+        rhs.iter()
+            .zip(&indices[1..])
+            .map(
+                |(&value, &internal)| {
+                    if internal == NONE { value } else { x[internal] }
+                },
+            )
+            .collect()
     }
 
     /// `spSolveTransposed`: `A^T x = b` with the same factors (in place like
     /// [`Self::solve`]).
     pub(crate) fn solve_transposed(&self, rhs: &[T]) -> Vec<T> {
-        debug_assert!(self.factored && rhs.len() == self.ext_size);
         let size = self.size;
-        let mut x = vec![T::ZERO; size + 1];
-        for i in (1..=size).rev() {
-            x[i] = rhs[self.int_to_ext_col[i] - 1];
-        }
+        let mut x = Vec::new();
+        self.gather_rhs(rhs, &mut x, true);
         for i in 1..=size {
             let temp = x[i];
             if !temp.is_zero() {
@@ -1691,11 +1726,7 @@ impl<T: Scalar> Sparse<T> {
             }
             x[i] = temp.mul(self.elements[pivot].value);
         }
-        let mut solution = rhs.to_vec();
-        for i in (1..=size).rev() {
-            solution[self.int_to_ext_row[i] - 1] = x[i];
-        }
-        solution
+        self.scatter_solution(rhs, &x, true)
     }
 }
 
@@ -1803,6 +1834,31 @@ mod tests {
     }
 
     #[test]
+    fn solve_workspace_reuses_storage_and_keeps_external_permutation() {
+        // Nodes 2 and 4 are deliberately absent, and the remaining two
+        // have a zero diagonal forcing MNA/pivot exchange.
+        let mut m = build(4, &[(3, 1, 2.), (1, 3, 4.), (3, 3, 1.)]);
+        m.mna_preorder();
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        let rhs = [8., -0., 6., -17.];
+        let mut workspace = Vec::new();
+        let first = m.solve_with_workspace(&rhs, &mut workspace);
+        let storage = workspace.as_ptr();
+        assert_eq!(first[0], 2.);
+        assert_eq!(first[2], 2.);
+        assert_eq!(first[1].to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(first[3], -17.);
+        let second = m.solve_with_workspace(&[4., 3., 4., 7.], &mut workspace);
+        assert_eq!(storage, workspace.as_ptr());
+        assert_eq!(second, [1.5, 3., 1., 7.]);
+        let transposed = m.solve_transposed(&rhs);
+        assert_eq!(transposed[0], 0.5);
+        assert_eq!(transposed[2], 4.);
+        assert_eq!(transposed[1].to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(transposed[3], -17.);
+    }
+
+    #[test]
     fn extreme_complex_reciprocals_and_invalid_factor_recovery() {
         let mut c = Sparse::<Complex>::new(1);
         let handle = c.get_element(1, 1);
@@ -1831,6 +1887,43 @@ mod tests {
         }
         assert_eq!(m.factor(), Status::Okay);
         assert_eq!(m.solve(&[3., 3.]), [1., 1.]);
+    }
+
+    #[test]
+    fn fixed_order_checks_every_stored_factor_and_early_zero_pivot() {
+        let entries = [(1, 1, 2.), (1, 2, 1.), (2, 1, 1.), (2, 2, 2.)];
+        let mut m = build(2, &entries);
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        for (bad_row, bad_col, bad_value) in [
+            (2, 1, f64::INFINITY),
+            (1, 2, f64::NAN),
+            (2, 2, f64::NEG_INFINITY),
+        ] {
+            m.clear();
+            for (r, c, v) in entries {
+                let h = m.get_element(r, c);
+                m.set(
+                    h,
+                    if (r, c) == (bad_row, bad_col) {
+                        bad_value
+                    } else {
+                        v
+                    },
+                );
+            }
+            assert_eq!(m.factor(), Status::NonFinite);
+            assert!(!m.is_factored());
+            m.clear();
+            for (r, c, v) in entries {
+                let h = m.get_element(r, c);
+                m.set(h, v);
+            }
+            assert_eq!(m.factor(), Status::Okay);
+        }
+        m.clear();
+        let h = m.get_element(2, 2);
+        m.set(h, f64::NAN);
+        assert_eq!(m.factor(), Status::NonFinite);
     }
 
     #[test]

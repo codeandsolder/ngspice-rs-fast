@@ -256,11 +256,11 @@ impl Cx {
     }
     /// `C_DIV` / `C_DIVEQ`.
     fn div(self, b: Self) -> Self {
-        let mag = b.re * b.re + b.im * b.im;
-        Self::new(
-            (self.re * b.re + self.im * b.im) / mag,
-            (-self.re * b.im + self.im * b.re) / mag,
-        )
+        // The C numerator's imaginary sum is the same finite binary64
+        // operation as Complex::div (including signed zeros). Share its
+        // exceptional exponent-scaled path as well.
+        let quotient = Complex::new(self.re, self.im) / Complex::new(b.re, b.im);
+        Self::new(quotient.re, quotient.im)
     }
     /// `C_MAG2`: squared modulus as the real part.
     fn mag2(self) -> Self {
@@ -293,7 +293,7 @@ impl Cx {
 
 /// `C_NORM`: scale `a` into `(0.5, 1]` per component, tracking the binary
 /// exponent in `mag` (set to zero for a zero value).
-fn c_norm(a: &mut Cx, mag: &mut i32) -> SpiceResult<()> {
+fn c_norm(a: &mut Cx, mag: &mut i64) -> SpiceResult<()> {
     if !a.re.is_finite() || !a.im.is_finite() {
         return Err(numerical(
             "pole-zero search",
@@ -318,7 +318,7 @@ fn c_norm(a: &mut Cx, mag: &mut i32) -> SpiceResult<()> {
 }
 
 /// `R_NORM`.
-fn r_norm(a: &mut Real, mag: &mut i32) -> SpiceResult<()> {
+fn r_norm(a: &mut Real, mag: &mut i64) -> SpiceResult<()> {
     if !a.is_finite() {
         return Err(numerical(
             "pole-zero search",
@@ -340,8 +340,49 @@ fn r_norm(a: &mut Real, mag: &mut i32) -> SpiceResult<()> {
     Ok(())
 }
 
+/// Materialize a scaled real in C's repeated doubling/halving order.
+/// Stopping once zero or infinity is reached keeps the work bounded by
+/// binary64's exponent range, even for enormous determinant exponents.
+fn materialize_power(mut value: Real, exponent: i64) -> Real {
+    for _ in 0..exponent.unsigned_abs() {
+        if value == 0.0 || !value.is_finite() {
+            break;
+        }
+        if exponent > 0 {
+            value *= 2.0;
+        } else {
+            value /= 2.0;
+        }
+    }
+    value
+}
+
+fn normalize_muller(a: &mut Cx, b: &mut Cx, c: &mut Cx) -> SpiceResult<()> {
+    if [*a, *b, *c]
+        .iter()
+        .any(|z| !z.re.is_finite() || !z.im.is_finite())
+    {
+        return Err(numerical(
+            "pole-zero search",
+            "non-finite Muller coefficients",
+        ));
+    }
+    while a.re.abs() > 1.0
+        || a.im.abs() > 1.0
+        || b.re.abs() > 1.0
+        || b.im.abs() > 1.0
+        || c.re.abs() > 1.0
+        || c.im.abs() > 1.0
+    {
+        *a = a.scale(0.5);
+        *b = b.scale(0.5);
+        *c = c.scale(0.5);
+    }
+    Ok(())
+}
+
 /// `zaddeq`: `a * 2^amag = x * 2^xmag + y * 2^ymag`, normalized.
-fn zaddeq(x: Real, xmag: i32, y: Real, ymag: i32) -> SpiceResult<(Real, i32)> {
+fn zaddeq(x: Real, xmag: i64, y: Real, ymag: i64) -> SpiceResult<(Real, i64)> {
     if !x.is_finite() || !y.is_finite() {
         return Err(numerical("pole-zero search", "non-finite scaled sum"));
     }
@@ -383,16 +424,13 @@ fn sgn(x: Real) -> i32 {
 
 /// C `logb`: the unbiased binary exponent of a nonzero finite value.
 fn logb(x: Real) -> Real {
-    let exponent = ((x.abs().to_bits() >> 52) & 0x7ff) as i32;
-    if exponent == 0 {
-        x.abs().log2().floor()
-    } else {
-        Real::from(exponent - 1023)
-    }
+    Real::from(
+        crate::primitives::value::binary_exponent(x).expect("finite nonzero determinant component"),
+    )
 }
 
 /// `SMPcDProd`: SPARSE's `mantissa * 10^p` as a base-2 mantissa/exponent.
-fn base2_determinant(mantissa: Complex, p: i32) -> (Cx, i32) {
+fn base2_determinant(mantissa: Complex, p: i32) -> (Cx, i64) {
     let (mut re, mut im) = (mantissa.re, mantissa.im);
     let mut y = Real::from(p) * std::f64::consts::LN_10 / std::f64::consts::LN_2;
     let x = y.trunc();
@@ -412,9 +450,9 @@ fn base2_determinant(mantissa: Complex, p: i32) -> (Cx, i32) {
     }
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "the C pole-zero rescaling algorithm stores its binary exponent in an i32"
+        reason = "the decimal exponent is i32, so its base-2 conversion fits exactly in i64"
     )]
-    let exponent = (x + y) as i32;
+    let exponent = (x + y) as i64;
     #[expect(
         clippy::cast_possible_truncation,
         reason = "the C pole-zero scaling algorithm intentionally truncates its exponent to i32"
@@ -427,7 +465,7 @@ fn base2_determinant(mantissa: Complex, p: i32) -> (Cx, i32) {
 struct Trial {
     s: Cx,
     f_def: Cx,
-    mag_def: i32,
+    mag_def: i64,
     multiplicity: u32,
     flags: u8,
     count: u32,
@@ -473,7 +511,7 @@ impl<'a> LoadedPencil<'a> {
     }
 
     /// CKTpzLoad + SMPcReorder + SMPcDProd; no MNA preorder.
-    fn determinant_at(&mut self, s: Cx) -> SpiceResult<Option<(Cx, i32)>> {
+    fn determinant_at(&mut self, s: Cx) -> SpiceResult<Option<(Cx, i64)>> {
         if !s.re.is_finite() || !s.im.is_finite() {
             return Err(numerical("pole-zero search", "non-finite trial frequency"));
         }
@@ -535,7 +573,7 @@ struct Search<'a> {
     aberr_num: usize,
     trapped: u8,
     pz_k: Real,
-    pz_k_mag: i32,
+    pz_k_mag: i64,
 }
 
 /// Roots of `det(A + s E)` found by ngspice's pole-zero search
@@ -750,15 +788,7 @@ impl Search<'_> {
             COMPLEX_INIT => {
                 trial.s.re = self.s(set[1]).re;
                 if self.pz_k != 0.0 && self.pz_k_mag > -10 {
-                    while self.pz_k_mag > 0 {
-                        self.pz_k *= 2.0;
-                        self.pz_k_mag -= 1;
-                    }
-                    while self.pz_k_mag < 0 {
-                        self.pz_k /= 2.0;
-                        self.pz_k_mag += 1;
-                    }
-                    trial.s.im = self.pz_k;
+                    trial.s.im = materialize_power(self.pz_k, self.pz_k_mag);
                 } else {
                     trial.s.im = 10000.0;
                 }
@@ -769,7 +799,7 @@ impl Search<'_> {
                 trial.s.re = self.s(set[0]).re;
                 trial.s.im = if set[2].is_none() { 1.0e8 } else { 1.0e12 };
             }
-            MULLER => trial.s = self.muller(set),
+            MULLER => trial.s = self.muller(set)?,
             SPLIT_LEFT => {
                 trial.s.re = (self.s(set[0]).re + 2.0 * self.s(set[1]).re) / 3.0;
             }
@@ -777,6 +807,9 @@ impl Search<'_> {
                 trial.s.re = (self.s(set[2]).re + 2.0 * self.s(set[1]).re) / 3.0;
             }
             _ => return Err(numerical("pole-zero search", "Step type unknown")),
+        }
+        if !trial.s.re.is_finite() || !trial.s.im.is_finite() {
+            return Err(numerical("pole-zero search", "non-finite trial frequency"));
         }
         self.trials.push(trial);
         Ok(self.trials.len() - 1)
@@ -1305,16 +1338,7 @@ impl Search<'_> {
             if a == 0.0 {
                 return Ok(t1.s.re);
             }
-            let mut s = -t1.f_def.re / a;
-            a_mag -= t1.mag_def;
-            while a_mag > 0 {
-                s /= 2.0;
-                a_mag -= 1;
-            }
-            while a_mag < 0 {
-                s *= 2.0;
-                a_mag += 1;
-            }
+            let s = materialize_power(-t1.f_def.re / a, t1.mag_def - a_mag);
             return Ok(s + t1.s.re);
         }
 
@@ -1365,22 +1389,8 @@ impl Search<'_> {
         }
         (b, b_mag) = zaddeq(t1.s.re, 0, -b, b_mag)?;
         (c, c_mag) = zaddeq(t1.s.re, 0, -c, c_mag)?;
-        while b_mag > 0 {
-            b *= 2.0;
-            b_mag -= 1;
-        }
-        while b_mag < 0 {
-            b /= 2.0;
-            b_mag += 1;
-        }
-        while c_mag > 0 {
-            c *= 2.0;
-            c_mag -= 1;
-        }
-        while c_mag < 0 {
-            c /= 2.0;
-            c_mag += 1;
-        }
+        b = materialize_power(b, b_mag);
+        c = materialize_power(c, c_mag);
         let outside = |x: Real| x < t0.s.re || x > t2.s.re;
         Ok(if outside(b) {
             if outside(c) {
@@ -1409,7 +1419,7 @@ impl Search<'_> {
     }
 
     /// `NIpzMuller`.
-    fn muller(&self, set: &Set) -> Cx {
+    fn muller(&self, set: &Set) -> SpiceResult<Cx> {
         let t: [&Trial; 3] = std::array::from_fn(|i| &self.trials[set[i].unwrap_or_default()]);
         let mut min = -999_999;
         let mut count = 0;
@@ -1429,19 +1439,12 @@ impl Search<'_> {
         }
         let mut scale = [1.0; 3];
         for (i, trial) in t.iter().enumerate() {
-            let mut mag = trial.mag_def - magx;
-            while mag > 0 {
-                scale[i] *= 2.0;
-                mag -= 1;
-            }
-            if mag < -90 {
-                scale[i] = 0.0;
+            let mag = trial.mag_def - magx;
+            scale[i] = if mag < -90 {
+                0.0
             } else {
-                while mag < 0 {
-                    scale[i] /= 2.0;
-                    mag += 1;
-                }
-            }
+                materialize_power(1.0, mag)
+            };
         }
         let f: [Cx; 3] = std::array::from_fn(|i| t[i].f_def.scale(scale[i]));
         let h0 = t[0].s.sub(t[1].s);
@@ -1467,17 +1470,7 @@ impl Search<'_> {
 
         c = delta.mul(f[0]);
 
-        while a.re.abs() > 1.0
-            || a.im.abs() > 1.0
-            || b.re.abs() > 1.0
-            || b.im.abs() > 1.0
-            || c.re.abs() > 1.0
-            || c.im.abs() > 1.0
-        {
-            a = a.scale(0.5);
-            b = b.scale(0.5);
-            c = c.scale(0.5);
-        }
+        normalize_muller(&mut a, &mut b, &mut c)?;
         let mut d = b.mul(b);
         let e = a.scale(4.0).mul(c);
         d = d.sub(e);
@@ -1485,7 +1478,7 @@ impl Search<'_> {
         let q = b.re * d.re + b.im * d.im;
         b = if q > 0.0 { b.add(d) } else { b.sub(d) };
         c = c.div(b.scale(-0.5));
-        h0.mul(c).add(t[0].s)
+        Ok(h0.mul(c).add(t[0].s))
     }
 }
 
@@ -1512,6 +1505,36 @@ mod tests {
                 "{found:?} vs {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn huge_scaled_exponents_and_muller_coefficients_are_bounded() {
+        assert!(materialize_power(1.0, i64::MAX).is_infinite());
+        assert_eq!(materialize_power(1.0, i64::MIN), 0.0);
+        assert_eq!(
+            materialize_power(-1.0, i64::MIN).to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        let (_, high) = base2_determinant(Complex::real(1.), i32::MAX);
+        let (_, low) = base2_determinant(Complex::real(1.), i32::MIN);
+        assert!(high > i64::from(i32::MAX));
+        assert!(low < i64::from(i32::MIN));
+        let (_, mag) = zaddeq(0.75, high, 0.75, low).unwrap();
+        assert_eq!(mag, high);
+        let mut a = Cx::new(2., -1.);
+        let mut b = Cx::new(-4., 0.);
+        let mut c = Cx::new(0.25, 0.);
+        normalize_muller(&mut a, &mut b, &mut c).unwrap();
+        assert_eq!(a, Cx::new(0.5, -0.25));
+        assert_eq!(b, Cx::new(-1., 0.));
+        assert_eq!(c, Cx::new(0.0625, 0.));
+        c.re = f64::INFINITY;
+        assert!(normalize_muller(&mut a, &mut b, &mut c).is_err());
+        assert_eq!(logb(f64::from_bits(1)), -1074.);
+        assert_eq!(
+            logb(f64::from_bits(f64::MIN_POSITIVE.to_bits() - 1)),
+            -1023.
+        );
     }
 
     #[test]
