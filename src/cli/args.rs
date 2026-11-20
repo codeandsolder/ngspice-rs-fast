@@ -188,17 +188,14 @@ impl Args {
                 other => {
                     // The first positional argument may be a subcommand. A deck
                     // named after a subcommand has to be written as `./tokens`.
-                    match (command_seen, Command::parse(other)) {
-                        (false, Some(command)) => {
-                            args.command = command;
-                            command_seen = true;
+                    if let (false, Some(command)) = (command_seen, Command::parse(other)) {
+                        args.command = command;
+                        command_seen = true;
+                    } else {
+                        if args.netlist.is_some() {
+                            return Err(format!("unexpected argument '{other}'"));
                         }
-                        _ => {
-                            if args.netlist.is_some() {
-                                return Err(format!("unexpected argument '{other}'"));
-                            }
-                            args.netlist = Some(PathBuf::from(other));
-                        }
+                        args.netlist = Some(PathBuf::from(other));
                     }
                 }
             }

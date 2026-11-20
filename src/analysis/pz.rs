@@ -234,8 +234,7 @@ pub(super) fn run(
     };
     let order = circuit.unknown_count();
     let input = [in_pos, in_neg];
-    let mut poles = Vec::new();
-    if card.poles {
+    let mut poles = if card.poles {
         setups += 1;
         let (terms, elements) = pencil(setups)?;
         let output = match card.input {
@@ -244,16 +243,19 @@ pub(super) fn run(
         };
         let mut load = modified_load(order, &elements, &terms, input, output);
         load.relative_threshold = context.pivot.relative;
-        poles = roots(&load, "poles")?;
-    }
-    let mut zeros = Vec::new();
-    if card.zeros {
+        roots(&load, "poles")?
+    } else {
+        Vec::new()
+    };
+    let zeros = if card.zeros {
         setups += 1;
         let (terms, elements) = pencil(setups)?;
         let mut load = modified_load(order, &elements, &terms, input, Some([out_pos, out_neg]));
         load.relative_threshold = context.pivot.relative;
-        zeros = roots(&load, "zeros")?;
-    }
+        roots(&load, "zeros")?
+    } else {
+        Vec::new()
+    };
     let flags = if poles.is_empty() && zeros.is_empty() {
         PlotFlags::Real
     } else {

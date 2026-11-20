@@ -222,7 +222,14 @@ impl UrcSections {
                         "n={given} builds no sections (C leaves the terminals unconnected)"
                     )));
                 }
-                usize::try_from(given).unwrap_or(usize::MAX)
+                usize::try_from(given)
+                    .ok()
+                    .filter(|&n| n <= MAX_LUMPS)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "n={given} sections exceed the port's bound of {MAX_LUMPS}"
+                        ))
+                    })?
             }
             None => {
                 let wnorm = fmax * r0 * c0 * 2.0 * std::f64::consts::PI;
@@ -718,6 +725,7 @@ mod tests {
         assert!(base(1.5, Some(0), 1e-12).is_err());
         assert!(base(1.5, Some(-2), 1e-12).is_err());
         assert!(base(1.5, Some(MAX_LUMPS as i64 + 1), 1e-12).is_err());
+        assert!(base(1.5, Some(i64::MAX), 1e-12).is_err());
         assert!(base(1.5, None, 0.).is_err());
         // A huge ratio overflows p^n: refused, never a zero resistor.
         assert!(base(1e300, Some(5), 1e-12).is_err());

@@ -310,20 +310,17 @@ impl Bound {
         if let Some(recording) = &mut self.recording {
             recording.starts.push(to_u32(recording.entries.len()));
         }
-        match (
+        if let (Some(&start), Some(&end)) = (
             self.trace.starts.get(index),
             self.trace.starts.get(index + 1),
         ) {
-            (Some(&start), Some(&end)) => {
-                self.start = start as usize;
-                self.cursor = start as usize;
-                self.end = end as usize;
-            }
-            _ => {
-                self.start = 0;
-                self.cursor = 0;
-                self.end = 0;
-            }
+            self.start = start as usize;
+            self.cursor = start as usize;
+            self.end = end as usize;
+        } else {
+            self.start = 0;
+            self.cursor = 0;
+            self.end = 0;
         }
     }
 

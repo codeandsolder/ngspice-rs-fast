@@ -355,18 +355,15 @@ impl Request<'_> {
             return Ok(());
         };
         if time > end {
-            match repeat {
-                Some(index) => {
-                    let start = times[index];
-                    let period = end - start;
-                    time -= start;
-                    time -= period * (time / period).floor();
-                    time += start;
-                }
-                None => {
-                    *break_time = self.timing.final_time();
-                    return Ok(());
-                }
+            if let Some(index) = repeat {
+                let start = times[index];
+                let period = end - start;
+                time -= start;
+                time -= period * (time / period).floor();
+                time += start;
+            } else {
+                *break_time = self.timing.final_time();
+                return Ok(());
             }
         }
         let min_break = table.min_break();

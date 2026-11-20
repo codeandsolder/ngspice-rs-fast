@@ -73,15 +73,16 @@ pub(super) fn run(
     if !matches!(positional.len(), 4 | 5) {
         return Err(unsupported(".sp lin|dec|oct points start stop [donoise]"));
     }
-    let mut donoise = false;
-    if let Some(flag) = positional.get(4) {
+    let donoise = if let Some(flag) = positional.get(4) {
         // dot_sp() reads donoise as IF_INTEGER, (int) floor(0.5 + value), and
         // SPsetParm enables noise only for exactly 1.
         let value = parse_spice_number(flag)
             .filter(|v| v.is_finite())
             .ok_or_else(|| unsupported(format!(".sp donoise must be an integer, found {flag}")))?;
-        donoise = (value + 0.5).floor() == 1.;
-    }
+        (value + 0.5).floor() == 1.
+    } else {
+        false
+    };
 
     let grid = frequency_grid(&positional, settings.newton.reltol, GridKind::Sp)?;
     circuit.finalize()?;

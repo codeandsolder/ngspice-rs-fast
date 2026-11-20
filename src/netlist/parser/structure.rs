@@ -207,15 +207,14 @@ fn library(input: &mut Input<'_>) -> Result<ParsedCard> {
     keyword(".lib").parse_next(input)?;
     cut_err(|input: &mut Input<'_>| {
         let (first, second) = (path, opt(path)).parse_next(input)?;
-        match second {
-            Some(section) => directive(input, first, Some(section)),
-            None => {
-                let section = path_value(first).to_ascii_lowercase();
-                if section.is_empty() {
-                    return Err(malformed(input, "library section cannot be empty"));
-                }
-                Ok(ParsedCard::LibStart(section))
+        if let Some(section) = second {
+            directive(input, first, Some(section))
+        } else {
+            let section = path_value(first).to_ascii_lowercase();
+            if section.is_empty() {
+                return Err(malformed(input, "library section cannot be empty"));
             }
+            Ok(ParsedCard::LibStart(section))
         }
     })
     .parse_next(input)
