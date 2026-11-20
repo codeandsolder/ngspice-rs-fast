@@ -52,11 +52,11 @@ struct Scope {
 
 pub(super) fn assemble(
     deck: &Deck,
-    cards: Vec<SpiceResult<InputCard>>,
+    cards: &[SpiceResult<InputCard>],
     auto_gnd: bool,
 ) -> SpiceResult<(Netlist, OutputCards, Vec<MeasureCard>, Vec<FourierCard>)> {
     let mut cursor = 0;
-    let scope = scope(&cards, &mut cursor, auto_gnd, &BTreeSet::new(), None, 0)?;
+    let scope = scope(cards, &mut cursor, auto_gnd, &BTreeSet::new(), None, 0)?;
     Ok((
         Netlist {
             title: deck.title.clone(),

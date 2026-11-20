@@ -1126,7 +1126,7 @@ fn snippet<'a>(root: &'a ParameterExpression, node: &Expr) -> &'a str {
     root.text.get(s..e).unwrap_or(root.text.as_str())
 }
 
-fn fail(node: &Expr, root: &ParameterExpression, message: String) -> Failure {
+fn fail(node: &Expr, root: &ParameterExpression, message: impl std::fmt::Display) -> Failure {
     Failure {
         location: node.span.start.clone(),
         message: format!("{message} in `{}`", snippet(root, node)),
@@ -1148,7 +1148,7 @@ fn checked(
         } else {
             "overflow or pole (result is infinite)"
         };
-        Err(fail(node, root, format!("{}: {kind}", what())))
+        Err(fail(node, root, format_args!("{}: {kind}", what())))
     }
 }
 
@@ -1209,7 +1209,7 @@ fn too_deep(node: &Expr, root: &ParameterExpression, env: Env<'_>, max: usize) -
     fail(
         node,
         root,
-        format!("expression deeper than {max} levels{note}"),
+        format_args!("expression deeper than {max} levels{note}"),
     )
 }
 
@@ -1219,7 +1219,7 @@ fn over_budget(node: &Expr, root: &ParameterExpression, max: usize) -> Failure {
     fail(
         node,
         root,
-        format!("evaluation exceeded the budget of {max} expression nodes"),
+        format_args!("evaluation exceeded the budget of {max} expression nodes"),
     )
 }
 
@@ -1345,7 +1345,7 @@ fn user_call(
         return Err(fail(
             node,
             root,
-            format!("undefined function '{name}' (no .func definition is in scope)"),
+            format_args!("undefined function '{name}' (no .func definition is in scope)"),
         ));
     };
     let mut args = Vec::with_capacity(arguments.len());
@@ -1374,7 +1374,7 @@ fn call(
         return Err(fail(
             node,
             root,
-            format!(
+            format_args!(
                 "function '{}' (defined at {}) takes {} argument(s), found {}",
                 def.name,
                 def.location,
@@ -1391,7 +1391,7 @@ fn call(
             return Err(fail(
                 node,
                 root,
-                format!(
+                format_args!(
                     "recursive call of function '{}' (defined at {})",
                     def.name, def.location
                 ),

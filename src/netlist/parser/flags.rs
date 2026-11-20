@@ -59,7 +59,7 @@ pub(super) fn model(input: &mut Input<'_>, base: &str) -> Result<ParameterAssign
     flag(input, token)
 }
 
-fn flag(input: &mut Input<'_>, token: &Token) -> Result<ParameterAssignment> {
+fn flag(input: &Input<'_>, token: &Token) -> Result<ParameterAssignment> {
     if input.input.first().is_some_and(|next| {
         next.kind == TokenKind::Equals
             || next.number().is_some()

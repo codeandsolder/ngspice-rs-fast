@@ -235,7 +235,7 @@ fn unsupported(card: &MeasureCard, feature: String) -> SpiceError {
 }
 
 /// A non-finite value the measurement would have to use.
-fn nonfinite(card: &MeasureCard, context: String, message: String) -> SpiceError {
+fn nonfinite(card: &MeasureCard, context: &str, message: String) -> SpiceError {
     SpiceError::Numerical {
         context: format!("measure {}: {context}", card.name),
         message,
@@ -638,7 +638,7 @@ fn evaluate(plot: &Plot, axis: &Axis, card: &MeasureCard) -> SpiceResult<Measure
             if !value.is_finite() {
                 return Err(nonfinite(
                     card,
-                    statistic.name().to_owned(),
+                    statistic.name(),
                     "the computed result is not finite".to_owned(),
                 ));
             }
@@ -659,7 +659,7 @@ fn evaluate(plot: &Plot, axis: &Axis, card: &MeasureCard) -> SpiceResult<Measure
             if !value.is_finite() {
                 return Err(nonfinite(
                     card,
-                    "TRIG/TARG".to_owned(),
+                    "TRIG/TARG",
                     "the computed distance is not finite".to_owned(),
                 ));
             }
@@ -794,7 +794,7 @@ fn integral(points: &[(Real, Real)], square: bool, card: &MeasureCard) -> SpiceR
     if !area.is_finite() {
         return Err(nonfinite(
             card,
-            "INTEG".to_owned(),
+            "INTEG",
             "the integrated value is not finite".to_owned(),
         ));
     }
@@ -835,7 +835,7 @@ fn simpson_integral(
     if !area.is_finite() {
         return Err(nonfinite(
             card,
-            "INTEG/RMS".into(),
+            "INTEG/RMS",
             "the integrated value is not finite".into(),
         ));
     }
@@ -874,11 +874,7 @@ fn margin(
         let phase = raw + offset;
         let frequency = axis.values[i];
         if !db.is_finite() {
-            return Err(nonfinite(
-                card,
-                "margin".into(),
-                "zero or nonfinite gain".into(),
-            ));
+            return Err(nonfinite(card, "margin", "zero or nonfinite gain".into()));
         }
         if let Some((f0, db0, p0)) = previous {
             let (a, b, target) = if phase_margin {
@@ -952,11 +948,7 @@ fn derivative_at(
         }
     };
     if !value.is_finite() {
-        return Err(nonfinite(
-            card,
-            "DERIV".into(),
-            "nonfinite derivative".into(),
-        ));
+        return Err(nonfinite(card, "DERIV", "nonfinite derivative".into()));
     }
     Ok(value)
 }
@@ -1028,11 +1020,7 @@ fn event_at(
                 |index| {
                     let difference = lhs.value(index)? - rhs.value(index)?;
                     if !difference.is_finite() {
-                        return Err(nonfinite(
-                            card,
-                            "WHEN".into(),
-                            "vector difference overflow".into(),
-                        ));
+                        return Err(nonfinite(card, "WHEN", "vector difference overflow".into()));
                     }
                     Ok(difference)
                 },
@@ -1118,7 +1106,7 @@ fn crossing_samples(
         if !x.is_finite() {
             return Err(nonfinite(
                 card,
-                "WHEN/TRIG/TARG".into(),
+                "WHEN/TRIG/TARG",
                 "nonfinite crossing position".into(),
             ));
         }

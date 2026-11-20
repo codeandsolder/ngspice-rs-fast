@@ -198,7 +198,7 @@ enum Probe {
     Current { device: usize, row: usize },
 }
 
-fn not_found(message: String) -> SpiceError {
+fn not_found(message: impl std::fmt::Display) -> SpiceError {
     SpiceError::Circuit {
         message: format!("{message} (C: TFanal in tfanal.c)"),
     }
@@ -209,14 +209,14 @@ fn node_row(circuit: &Circuit, name: &str) -> SpiceResult<(String, Option<usize>
     let id = circuit
         .nodes()
         .get(&canonical)
-        .ok_or_else(|| not_found(format!(".tf output node {name} is not in the circuit")))?;
+        .ok_or_else(|| not_found(format_args!(".tf output node {name} is not in the circuit")))?;
     let row = circuit.unknowns().node_row(id);
     let is_ground = circuit
         .nodes()
         .node(id)
         .is_some_and(|node| node.kind == NodeKind::Ground);
     if row.is_none() && !is_ground {
-        return Err(not_found(format!(
+        return Err(not_found(format_args!(
             ".tf output node {name} has no matrix row"
         )));
     }
@@ -231,15 +231,18 @@ fn device_index(circuit: &Circuit, name: &str) -> Option<usize> {
 }
 
 fn resolve_input(circuit: &Circuit, name: &str) -> SpiceResult<Input> {
-    let index = device_index(circuit, name)
-        .ok_or_else(|| not_found(format!("Transfer function source {name} not in circuit")))?;
+    let index = device_index(circuit, name).ok_or_else(|| {
+        not_found(format_args!(
+            "Transfer function source {name} not in circuit"
+        ))
+    })?;
     let device = &circuit.devices()[index];
     match device.designator() {
         'v' => {
             let branch = circuit
                 .branch_rows(index)
                 .and_then(|mut rows| rows.next())
-                .ok_or_else(|| not_found(format!("{name}: missing branch row")))?;
+                .ok_or_else(|| not_found(format_args!("{name}: missing branch row")))?;
             Ok(Input::Voltage { branch })
         }
         'i' => {
@@ -248,7 +251,7 @@ fn resolve_input(circuit: &Circuit, name: &str) -> SpiceResult<Input> {
                     .terminals()
                     .get(terminal)
                     .copied()
-                    .ok_or_else(|| not_found(format!("{name}: missing terminal")))
+                    .ok_or_else(|| not_found(format_args!("{name}: missing terminal")))
                     .map(|node| circuit.unknowns().node_row(node))
             };
             Ok(Input::Current {
@@ -256,7 +259,7 @@ fn resolve_input(circuit: &Circuit, name: &str) -> SpiceResult<Input> {
                 minus: row(1)?,
             })
         }
-        _ => Err(not_found(format!(
+        _ => Err(not_found(format_args!(
             "Transfer function source {name} not of proper type (an independent V or I \
              source is required)"
         ))),
@@ -278,7 +281,9 @@ fn resolve_output(circuit: &Circuit, output: &Output) -> SpiceResult<(Probe, [Op
         }
         Output::Current { source } => {
             let device = device_index(circuit, source).ok_or_else(|| {
-                not_found(format!(".tf output source {source} is not in the circuit"))
+                not_found(format_args!(
+                    ".tf output source {source} is not in the circuit"
+                ))
             })?;
             let branch = circuit.devices()[device].findable_branch().ok_or_else(|| {
                 unsupported(format!(
@@ -290,7 +295,7 @@ fn resolve_output(circuit: &Circuit, output: &Output) -> SpiceResult<(Probe, [Op
             let row = circuit
                 .branch_rows(device)
                 .and_then(|mut rows| rows.nth(branch))
-                .ok_or_else(|| not_found(format!("{source}: missing branch row")))?;
+                .ok_or_else(|| not_found(format_args!("{source}: missing branch row")))?;
             Ok((Probe::Current { device, row }, [None, None]))
         }
     }

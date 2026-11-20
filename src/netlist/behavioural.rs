@@ -843,7 +843,7 @@ impl Resolver<'_> {
         })
     }
 
-    fn name(&mut self, expr: &BExpr, name: &str) -> SpiceResult<BExpr> {
+    fn name(&self, expr: &BExpr, name: &str) -> SpiceResult<BExpr> {
         if SPECIAL_NAMES.contains(&name) {
             return Ok(expr.clone());
         }

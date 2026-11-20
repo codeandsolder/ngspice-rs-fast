@@ -335,7 +335,7 @@ impl Probe {
     }
 }
 
-fn not_found(message: String) -> SpiceError {
+fn not_found(message: impl std::fmt::Display) -> SpiceError {
     SpiceError::Circuit {
         message: format!("{message} (C: sens_sens in cktsens.c)"),
     }
@@ -343,17 +343,18 @@ fn not_found(message: String) -> SpiceError {
 
 fn node_row(circuit: &Circuit, name: &str) -> SpiceResult<Option<usize>> {
     let canonical = NodeTable::canonical_name(name, circuit.nodes().auto_gnd());
-    let id = circuit
-        .nodes()
-        .get(&canonical)
-        .ok_or_else(|| not_found(format!(".sens output node {name} is not in the circuit")))?;
+    let id = circuit.nodes().get(&canonical).ok_or_else(|| {
+        not_found(format_args!(
+            ".sens output node {name} is not in the circuit"
+        ))
+    })?;
     let row = circuit.unknowns().node_row(id);
     let ground = circuit
         .nodes()
         .node(id)
         .is_some_and(|node| node.kind == NodeKind::Ground);
     if row.is_none() && !ground {
-        return Err(not_found(format!(
+        return Err(not_found(format_args!(
             ".sens output node {name} has no matrix row"
         )));
     }
@@ -375,7 +376,7 @@ fn resolve_output(circuit: &Circuit, output: &Output) -> SpiceResult<Probe> {
                 .iter()
                 .position(|device| device.name().eq_ignore_ascii_case(source))
                 .ok_or_else(|| {
-                    not_found(format!(
+                    not_found(format_args!(
                         ".sens output source {source} is not in the circuit"
                     ))
                 })?;
@@ -389,7 +390,7 @@ fn resolve_output(circuit: &Circuit, output: &Output) -> SpiceResult<Probe> {
             let row = circuit
                 .branch_rows(device)
                 .and_then(|mut rows| rows.nth(branch))
-                .ok_or_else(|| not_found(format!("{source}: missing branch row")))?;
+                .ok_or_else(|| not_found(format_args!("{source}: missing branch row")))?;
             Ok(Probe::Current { row })
         }
     }

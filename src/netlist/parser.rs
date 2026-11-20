@@ -159,7 +159,7 @@ impl Parser {
     /// The same failures as [`Parser::parse_deck`].
     pub fn parse_deck_with_output(&self, deck: &Deck) -> SpiceResult<ParsedDeck> {
         let (netlist, output, measurements, fourier) =
-            scopes::assemble(deck, prepare_cards(deck), self.auto_gnd)?;
+            scopes::assemble(deck, &prepare_cards(deck), self.auto_gnd)?;
         Ok(ParsedDeck {
             netlist,
             output,
@@ -255,7 +255,7 @@ impl Parser {
     ) -> SpiceResult<ParsedDeck> {
         let (deck, cards) = resolution::resolve(path.as_ref(), limits)?;
         let (netlist, output, measurements, fourier) =
-            scopes::assemble(&deck, cards, self.auto_gnd)?;
+            scopes::assemble(&deck, &cards, self.auto_gnd)?;
         Ok(ParsedDeck {
             netlist,
             output,
