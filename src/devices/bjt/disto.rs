@@ -334,36 +334,36 @@ impl Bjt {
             d_cbe.d1_p = gbe;
             d_cbe.d2_p2 = gbe2;
             d_cbe.d3_p3 = gbe3;
-            let d_tff = if xtf != 0. {
-                let d_dummy = if ovtf != 0. {
+            let d_tff = if xtf == 0. {
+                Dderivs {
+                    value: tf,
+                    ..Dderivs::default()
+                }
+            } else {
+                let d_dummy = if ovtf == 0. {
+                    Dderivs {
+                        value: 1.,
+                        ..Dderivs::default()
+                    }
+                } else {
                     let mut d = d_q;
                     d.value = vbc * ovtf;
                     d.d1_q = ovtf;
                     d.exp()
-                } else {
-                    let mut d = d_p;
-                    d.value = 1.0;
-                    d.d1_p = 0.0;
-                    d
                 };
-                let d_dummy2 = if xjtf != 0. {
+                let d_dummy2 = if xjtf == 0. {
+                    Dderivs {
+                        value: 1.,
+                        ..Dderivs::default()
+                    }
+                } else {
                     let mut d = d_cbe;
                     d.value += xjtf;
                     let d = d_cbe.div(&d);
                     d.mul(&d)
-                } else {
-                    let mut d = d_p;
-                    d.value = 1.0;
-                    d.d1_p = 0.0;
-                    d
                 };
                 let mut d = d_dummy.mul(&d_dummy2).times(tf * xtf);
                 d.value += tf;
-                d
-            } else {
-                let mut d = d_p;
-                d.value = tf;
-                d.d1_p = 0.0;
                 d
             };
             d_tff.div(&d_qb).mul(&d_cbe)

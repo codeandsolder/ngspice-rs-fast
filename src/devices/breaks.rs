@@ -298,7 +298,8 @@ impl Request<'_> {
                 Some(basetime + tr + tshift)
             } else if same(tr + pw + tf, time) {
                 Some(basetime + per + tshift)
-            } else if time == -tshift {
+            } else if time.partial_cmp(&-tshift) == Some(std::cmp::Ordering::Equal) {
+                // C's exact delay boundary; signed zero compares equal.
                 Some(basetime + tshift)
             } else if same(per, time) {
                 Some(basetime + tshift + tr + per)
@@ -355,7 +356,9 @@ impl Request<'_> {
                 let start = knots[index].0;
                 let period = end - start;
                 time -= start;
-                time -= period * (time / period).floor();
+                let elapsed_periods = (time / period).floor();
+                let elapsed_time = period * elapsed_periods;
+                time -= elapsed_time;
                 time += start;
             } else {
                 *break_time = self.timing.final_time();
