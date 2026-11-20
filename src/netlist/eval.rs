@@ -54,6 +54,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
@@ -215,6 +216,193 @@ fn source_text(expression: &ParameterExpression) -> String {
     }
 }
 
+struct ScopeDefinitions<'a> {
+    entries: Vec<ParamEntry>,
+    exprs: Vec<Option<&'a ParameterExpression>>,
+    active: HashMap<String, usize>,
+    binding_count: usize,
+}
+
+fn collect_definitions<'a>(
+    bindings: &[ParamBinding],
+    cards: &'a [ParamCard],
+    limits: EvalLimits,
+    policy: Bindings,
+) -> SpiceResult<ScopeDefinitions<'a>> {
+    let mut entries: Vec<ParamEntry> = Vec::new();
+    let mut exprs: Vec<Option<&ParameterExpression>> = Vec::new();
+    let mut active: HashMap<String, usize> = HashMap::new();
+    for binding in bindings {
+        if !binding.value.is_finite() {
+            return Err(SpiceError::parse(
+                binding.location.clone(),
+                format!("binding '{}' is not finite", binding.name),
+            ));
+        }
+        if let Some(&old) = active.get(&binding.name) {
+            entries[old].state = ParamState::Superseded {
+                by: binding.location.clone(),
+            };
+        }
+        active.insert(binding.name.clone(), entries.len());
+        entries.push(ParamEntry {
+            name: binding.name.clone(),
+            location: binding.location.clone(),
+            source: None,
+            state: ParamState::Resolved(binding.value),
+        });
+        exprs.push(None);
+    }
+    let binding_count = entries.len();
+
+    for assignment in cards.iter().flat_map(|card| &card.assignments) {
+        let location = assignment.name_span.start.clone();
+        if entries.len() - binding_count >= limits.max_definitions {
+            return Err(SpiceError::parse(
+                location,
+                format!(
+                    "more than {} parameter definitions in one scope",
+                    limits.max_definitions
+                ),
+            ));
+        }
+        if let Some(&old) = active.get(&assignment.name) {
+            if old < binding_count {
+                let bound = entries[old].location.clone();
+                if policy == Bindings::Reject {
+                    return Err(SpiceError::parse(
+                        location,
+                        format!(
+                            "parameter '{}' redefines a bound value (defined at {bound}); \
+                                 use ParamScope::resolve_instance for subcircuit scopes",
+                            assignment.name
+                        ),
+                    ));
+                }
+                // The instance value wins, so the card is dropped unevaluated.
+                let e = &assignment.expression;
+                entries.push(ParamEntry {
+                    name: assignment.name.clone(),
+                    location,
+                    source: Some(source_text(e)),
+                    state: ParamState::Superseded { by: bound },
+                });
+                exprs.push(None);
+                continue;
+            }
+            entries[old].state = ParamState::Superseded {
+                by: location.clone(),
+            };
+        }
+        active.insert(assignment.name.clone(), entries.len());
+        let e = &assignment.expression;
+        entries.push(ParamEntry {
+            name: assignment.name.clone(),
+            location,
+            source: Some(source_text(e)),
+            // Placeholder until evaluated; replaced below.
+            state: ParamState::Resolved(0.0),
+        });
+        exprs.push(Some(e));
+    }
+
+    Ok(ScopeDefinitions {
+        entries,
+        exprs,
+        active,
+        binding_count,
+    })
+}
+
+type DependencyGraph = (DiGraph<usize, ()>, HashMap<usize, NodeIndex>);
+
+impl ScopeDefinitions<'_> {
+    fn dependency_graph(
+        &self,
+        live: &[usize],
+        scope_parent: Option<&ParamScope>,
+        scope_functions: Option<&FunctionScope>,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<DependencyGraph> {
+        let Self {
+            entries,
+            exprs,
+            active,
+            binding_count,
+        } = self;
+        let binding_count = *binding_count;
+        // Dependency graph: edge a -> b means "a references b".
+        let mut graph: DiGraph<usize, ()> = DiGraph::new();
+        let mut node_of: HashMap<usize, NodeIndex> = HashMap::new();
+        for &i in live {
+            node_of.insert(i, graph.add_node(i));
+        }
+        let mut undefined: Option<(usize, &str, &SourceLoc)> = None;
+        let mut scan = RefScan {
+            use_site: scope_functions,
+            budget: &mut *budget,
+            memo: HashMap::new(),
+            stack: Vec::new(),
+            cuts: 0,
+        };
+        for &i in live {
+            let Some(expr) = exprs[i] else { continue };
+            let mut refs = Vec::new();
+            scan.refs(&expr.root, 0, &mut refs).map_err(|f| {
+                f.context(|| {
+                    format!(
+                        "while collecting the dependencies of parameter '{}' defined at {}",
+                        entries[i].name, entries[i].location
+                    )
+                })
+                .into_error()
+            })?;
+            for (name, loc) in refs {
+                let known = |n: &str| {
+                    active.get(n).is_some_and(|&j| j < binding_count)
+                        || scope_parent.is_some_and(|p| p.get(n).is_some())
+                };
+                if name != entries[i].name
+                    && let Some(&j) = active.get(name)
+                    && j >= binding_count
+                {
+                    let (a, b) = (node_of[&i], node_of[&j]);
+                    if !graph.contains_edge(a, b) {
+                        graph.add_edge(a, b, ());
+                    }
+                } else if !known(name) && undefined.is_none() {
+                    undefined = Some((i, name, loc));
+                }
+            }
+        }
+        if let Some((i, name, loc)) = undefined {
+            let mut message = format!(
+                "undefined parameter '{name}' (in the definition of '{}' at {})",
+                entries[i].name, entries[i].location
+            );
+            let mut seen = vec![i];
+            let mut at = i;
+            while let Some(next) = graph
+                .neighbors_directed(node_of[&at], Direction::Incoming)
+                .map(|n| graph[n])
+                .filter(|j| !seen.contains(j))
+                .min()
+            {
+                let _ = write!(
+                    message,
+                    "\n  required by parameter '{}' defined at {}",
+                    entries[next].name, entries[next].location
+                );
+                seen.push(next);
+                at = next;
+            }
+            return Err(SpiceError::parse(loc.clone(), message));
+        }
+
+        Ok((graph, node_of))
+    }
+}
+
 impl ParamScope {
     /// Resolve top-level `.param` cards with default limits.
     ///
@@ -328,83 +516,14 @@ impl ParamScope {
         budget: &mut EvalBudget,
         policy: Bindings,
     ) -> SpiceResult<Self> {
-        let mut entries: Vec<ParamEntry> = Vec::new();
-        let mut exprs: Vec<Option<&ParameterExpression>> = Vec::new();
-        let mut active: HashMap<String, usize> = HashMap::new();
-        for binding in bindings {
-            if !binding.value.is_finite() {
-                return Err(SpiceError::parse(
-                    binding.location.clone(),
-                    format!("binding '{}' is not finite", binding.name),
-                ));
-            }
-            if let Some(&old) = active.get(&binding.name) {
-                entries[old].state = ParamState::Superseded {
-                    by: binding.location.clone(),
-                };
-            }
-            active.insert(binding.name.clone(), entries.len());
-            entries.push(ParamEntry {
-                name: binding.name.clone(),
-                location: binding.location.clone(),
-                source: None,
-                state: ParamState::Resolved(binding.value),
-            });
-            exprs.push(None);
-        }
-        let binding_count = entries.len();
-        let limits = budget.limits;
-        for assignment in cards.iter().flat_map(|card| &card.assignments) {
-            let location = assignment.name_span.start.clone();
-            if entries.len() - binding_count >= limits.max_definitions {
-                return Err(SpiceError::parse(
-                    location,
-                    format!(
-                        "more than {} parameter definitions in one scope",
-                        limits.max_definitions
-                    ),
-                ));
-            }
-            if let Some(&old) = active.get(&assignment.name) {
-                if old < binding_count {
-                    let bound = entries[old].location.clone();
-                    if policy == Bindings::Reject {
-                        return Err(SpiceError::parse(
-                            location,
-                            format!(
-                                "parameter '{}' redefines a bound value (defined at {bound}); \
-                                 use ParamScope::resolve_instance for subcircuit scopes",
-                                assignment.name
-                            ),
-                        ));
-                    }
-                    // The instance value wins, so the card is dropped unevaluated.
-                    let e = &assignment.expression;
-                    entries.push(ParamEntry {
-                        name: assignment.name.clone(),
-                        location,
-                        source: Some(source_text(e)),
-                        state: ParamState::Superseded { by: bound },
-                    });
-                    exprs.push(None);
-                    continue;
-                }
-                entries[old].state = ParamState::Superseded {
-                    by: location.clone(),
-                };
-            }
-            active.insert(assignment.name.clone(), entries.len());
-            let e = &assignment.expression;
-            entries.push(ParamEntry {
-                name: assignment.name.clone(),
-                location,
-                source: Some(source_text(e)),
-                // Placeholder until evaluated; replaced below.
-                state: ParamState::Resolved(0.0),
-            });
-            exprs.push(Some(e));
-        }
-
+        let defs = collect_definitions(bindings, cards, budget.limits, policy)?;
+        let ScopeDefinitions {
+            entries,
+            exprs,
+            active,
+            binding_count,
+        } = &defs;
+        let binding_count = *binding_count;
         let scope_parent = parent.as_deref();
         let scope_functions = functions.as_deref();
         let is_active_def = |i: usize| {
@@ -414,86 +533,17 @@ impl ParamScope {
             .filter(|&i| is_active_def(i))
             .collect();
 
-        // Dependency graph: edge a -> b means "a references b".
-        let mut graph: DiGraph<usize, ()> = DiGraph::new();
-        let mut node_of: HashMap<usize, NodeIndex> = HashMap::new();
-        for &i in &live {
-            node_of.insert(i, graph.add_node(i));
-        }
-        let mut undefined: Option<(usize, &str, &SourceLoc)> = None;
-        let mut scan = RefScan {
-            use_site: scope_functions,
-            budget: &mut *budget,
-            memo: HashMap::new(),
-            stack: Vec::new(),
-            cuts: 0,
-        };
-        for &i in &live {
-            let Some(expr) = exprs[i] else { continue };
-            let mut refs = Vec::new();
-            scan.refs(&expr.root, 0, &mut refs).map_err(|f| {
-                f.context(|| {
-                    format!(
-                        "while collecting the dependencies of parameter '{}' defined at {}",
-                        entries[i].name, entries[i].location
-                    )
-                })
-                .into_error()
-            })?;
-            for (name, loc) in refs {
-                let known = |n: &str| {
-                    active.get(n).is_some_and(|&j| j < binding_count)
-                        || scope_parent.is_some_and(|p| p.get(n).is_some())
-                };
-                if name != entries[i].name
-                    && let Some(&j) = active.get(name)
-                    && j >= binding_count
-                {
-                    let (a, b) = (node_of[&i], node_of[&j]);
-                    if !graph.contains_edge(a, b) {
-                        graph.add_edge(a, b, ());
-                    }
-                } else if !known(name) && undefined.is_none() {
-                    undefined = Some((i, name, loc));
-                }
-            }
-        }
-        if let Some((i, name, loc)) = undefined {
-            let mut message = format!(
-                "undefined parameter '{name}' (in the definition of '{}' at {})",
-                entries[i].name, entries[i].location
-            );
-            let mut seen = vec![i];
-            let mut at = i;
-            while let Some(next) = graph
-                .neighbors_directed(node_of[&at], Direction::Incoming)
-                .map(|n| graph[n])
-                .filter(|j| !seen.contains(j))
-                .min()
-            {
-                message.push_str(&format!(
-                    "\n  required by parameter '{}' defined at {}",
-                    entries[next].name, entries[next].location
-                ));
-                seen.push(next);
-                at = next;
-            }
-            return Err(SpiceError::parse(loc.clone(), message));
-        }
-
+        let (graph, node_of) =
+            defs.dependency_graph(&live, scope_parent, scope_functions, budget)?;
+        let ScopeDefinitions {
+            mut entries,
+            exprs,
+            active,
+            binding_count,
+        } = defs;
         // Cycles: report the one containing the earliest definition.
-        let mut cyclic: Vec<Vec<NodeIndex>> = tarjan_scc(&graph)
-            .into_iter()
-            .filter(|c| c.len() > 1)
-            .collect();
-        if !cyclic.is_empty() {
-            cyclic.sort_by_key(|c| c.iter().map(|&n| graph[n]).min());
-            let component = &cyclic[0];
-            let start = *component
-                .iter()
-                .min_by_key(|&&n| graph[n])
-                .expect("non-empty component");
-            let path = shortest_cycle(&graph, component, start);
+        if let Some((component, start)) = earliest_cycle(&graph, false) {
+            let path = shortest_cycle(&graph, &component, start);
             let chain: Vec<String> = path
                 .iter()
                 .map(|&n| {
@@ -510,7 +560,12 @@ impl ParamScope {
         }
 
         // Evaluate by (dependency level, deck order) like inp_sort_params.
-        let order = toposort(&graph, None).expect("acyclic after SCC check");
+        let order = toposort(&graph, None).map_err(|cycle| {
+            SpiceError::parse(
+                entries[graph[cycle.node_id()]].location.clone(),
+                "circular parameter definition",
+            )
+        })?;
         let mut level: HashMap<NodeIndex, usize> = HashMap::new();
         for &n in order.iter().rev() {
             let l = graph
@@ -552,7 +607,10 @@ impl ParamScope {
             values[i] = Some(value);
         }
         for &i in &live {
-            entries[i].state = ParamState::Resolved(values[i].expect("evaluated"));
+            let value = values[i].ok_or_else(|| {
+                SpiceError::circuit(format!("parameter '{}' was not evaluated", entries[i].name))
+            })?;
+            entries[i].state = ParamState::Resolved(value);
         }
         Ok(Self {
             parent,
@@ -738,12 +796,11 @@ impl FunctionScope {
                     return Err(SpiceError::parse(
                         location.clone(),
                         format!(
-                            "function '{}' (defined at {}) takes {} argument(s), found {} \
+                            "function '{}' (defined at {}) takes {} argument(s), found {arguments} \
                              (in the body of function '{}' defined at {})",
                             callee.name,
                             callee.location,
                             callee.parameters.len(),
-                            arguments,
                             def.name,
                             def.location
                         ),
@@ -757,20 +814,10 @@ impl FunctionScope {
                 }
             }
         }
-        let mut cyclic: Vec<Vec<NodeIndex>> = tarjan_scc(&graph)
-            .into_iter()
-            .filter(|c| c.len() > 1 || graph.contains_edge(c[0], c[0]))
-            .collect();
-        if cyclic.is_empty() {
+        let Some((component, start)) = earliest_cycle(&graph, true) else {
             return Ok(());
-        }
-        cyclic.sort_by_key(|c| c.iter().map(|&n| graph[n]).min());
-        let component = &cyclic[0];
-        let start = *component
-            .iter()
-            .min_by_key(|&&n| graph[n])
-            .expect("non-empty component");
-        let path = shortest_cycle(&graph, component, start);
+        };
+        let path = shortest_cycle(&graph, &component, start);
         let chain: Vec<String> = path
             .iter()
             .map(|&n| {
@@ -1033,6 +1080,20 @@ fn call_name(kind: &ExprKind) -> &str {
 }
 
 /// Shortest cycle through `start` inside `component` (BFS), as `start .. start`.
+fn earliest_cycle(
+    graph: &DiGraph<usize, ()>,
+    include_self: bool,
+) -> Option<(Vec<NodeIndex>, NodeIndex)> {
+    tarjan_scc(graph)
+        .into_iter()
+        .filter_map(|component| {
+            let start = *component.iter().min_by_key(|&&node| graph[node])?;
+            (component.len() > 1 || (include_self && graph.contains_edge(start, start)))
+                .then_some((component, start))
+        })
+        .min_by_key(|(_, start)| graph[*start])
+}
+
 fn shortest_cycle(
     graph: &DiGraph<usize, ()>,
     component: &[NodeIndex],
@@ -1218,7 +1279,7 @@ fn eval(
 #[inline(never)]
 #[cold]
 fn too_deep(node: &Expr, root: &ParameterExpression, env: Env<'_>, max: usize) -> Failure {
-    let note = if env.frame.is_some() {
+    let call_depth_note = if env.frame.is_some() {
         CALL_DEPTH_NOTE
     } else {
         ""
@@ -1226,7 +1287,7 @@ fn too_deep(node: &Expr, root: &ParameterExpression, env: Env<'_>, max: usize) -
     fail(
         node,
         root,
-        format_args!("expression deeper than {max} levels{note}"),
+        format_args!("expression deeper than {max} levels{call_depth_note}"),
     )
 }
 
