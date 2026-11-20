@@ -21,7 +21,7 @@ fn parse(body: &str) -> Result<Netlist, SpiceError> {
 
 /// Expression text at line 5, column 10 so offsets are visible in columns.
 fn expression(text: &str) -> Result<ParameterExpression, SpiceError> {
-    Parser::new().parse_expression(
+    Parser::parse_expression(
         text,
         &SourceLoc::new(Path::new("e.cir").to_path_buf(), 5, 10),
     )

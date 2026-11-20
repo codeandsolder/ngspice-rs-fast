@@ -274,42 +274,42 @@ fn file_depth_byte_and_card_work_limits_include_repeated_sources() {
     for (limits, message) in [
         (
             SourceLimits {
-                max_depth: 0,
+                depth: 0,
                 ..defaults
             },
             "depth limit",
         ),
         (
             SourceLimits {
-                max_files: 2,
+                files: 2,
                 ..defaults
             },
             "file work limit",
         ),
         (
             SourceLimits {
-                max_bytes: 36,
+                bytes: 36,
                 ..defaults
             },
             "byte work limit",
         ),
         (
             SourceLimits {
-                max_cards: 3,
+                cards: 3,
                 ..defaults
             },
             "card work limit",
         ),
         (
             SourceLimits {
-                max_depth: 65,
+                depth: 65,
                 ..defaults
             },
             "at most 64",
         ),
         (
             SourceLimits {
-                max_files: 0,
+                files: 0,
                 ..defaults
             },
             "file work limit",
@@ -321,10 +321,10 @@ fn file_depth_byte_and_card_work_limits_include_repeated_sources() {
         assert!(e.to_string().contains(message), "{e}");
     }
     let limits = SourceLimits {
-        max_depth: 1,
-        max_files: 3,
-        max_bytes: 56,
-        max_cards: 4,
+        depth: 1,
+        files: 3,
+        bytes: 56,
+        cards: 4,
     };
     assert_eq!(
         Parser::new()
@@ -340,7 +340,7 @@ fn file_depth_byte_and_card_work_limits_include_repeated_sources() {
         .parse_file_with_limits(
             f.0.join("main.cir"),
             SourceLimits {
-                max_depth: 1,
+                depth: 1,
                 ..defaults
             },
         )
@@ -353,7 +353,7 @@ fn file_depth_byte_and_card_work_limits_include_repeated_sources() {
         .parse_file_with_limits(
             unicode,
             SourceLimits {
-                max_bytes: 7,
+                bytes: 7,
                 ..defaults
             },
         )

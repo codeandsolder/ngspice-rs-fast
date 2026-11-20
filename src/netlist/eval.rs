@@ -74,20 +74,20 @@ pub const C_REFERENCE: &str = "src/frontend/numparam/xpressn.c (formula, operate
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvalLimits {
     /// Maximum number of `name=expression` definitions in one scope.
-    pub max_definitions: usize,
+    pub definitions: usize,
     /// Maximum expression nodes evaluated by one [`EvalBudget`].
-    pub max_nodes: usize,
+    pub nodes: usize,
     /// Maximum expression tree depth (left-associative chains nest without
     /// parentheses, so the parser's nesting bound alone is not enough).
-    pub max_depth: usize,
+    pub depth: usize,
 }
 
 impl Default for EvalLimits {
     fn default() -> Self {
         Self {
-            max_definitions: 100_000,
-            max_nodes: 4_000_000,
-            max_depth: 1024,
+            definitions: 100_000,
+            nodes: 4_000_000,
+            depth: 1024,
         }
     }
 }
@@ -257,12 +257,12 @@ fn collect_definitions<'a>(
 
     for assignment in cards.iter().flat_map(|card| &card.assignments) {
         let location = assignment.name_span.start.clone();
-        if entries.len() - binding_count >= limits.max_definitions {
+        if entries.len() - binding_count >= limits.definitions {
             return Err(SpiceError::parse(
                 location,
                 format!(
                     "more than {} parameter definitions in one scope",
-                    limits.max_definitions
+                    limits.definitions
                 ),
             ));
         }
@@ -717,7 +717,7 @@ impl FunctionScope {
     /// Collects and checks one scope's `.func` cards.
     ///
     /// # Errors
-    /// More definitions than [`EvalLimits::max_definitions`], recursive
+    /// More definitions than [`EvalLimits::definitions`], recursive
     /// definitions (a cycle among the lexically resolved calls of this
     /// scope's bodies), and calls in a body with the wrong number of
     /// arguments for the definition they resolve to.
@@ -726,7 +726,7 @@ impl FunctionScope {
         cards: &[FuncCard],
         budget: &EvalBudget,
     ) -> SpiceResult<Self> {
-        let limit = budget.limits.max_definitions;
+        let limit = budget.limits.definitions;
         if let Some(card) = cards.get(limit) {
             return Err(SpiceError::parse(
                 card.name_span.start.clone(),
@@ -908,7 +908,7 @@ impl<'a> FreeNames<'a> {
 ///
 /// The work is bounded like evaluation: every visited `.func` body node is
 /// charged to the [`EvalBudget`], the walk is cut at
-/// [`EvalLimits::max_depth`] levels (expression nesting plus call nesting,
+/// [`EvalLimits::depth`] levels (expression nesting plus call nesting,
 /// counted as in [`eval`]), and the free names
 /// of each definition are computed once per scope (memoized), so a DAG of
 /// functions costs linear rather than exponential work.
@@ -934,12 +934,12 @@ impl<'a> RefScan<'a, '_> {
     /// scan is linear and evaluation charges them anyway.
     fn charge(&mut self, node: &Expr, depth: usize, in_body: bool) -> Result<(), Failure> {
         let limits = self.budget.limits;
-        if depth > limits.max_depth {
+        if depth > limits.depth {
             return Err(Failure {
                 location: node.span.start.clone(),
                 message: format!(
                     "expression deeper than {} levels{}",
-                    limits.max_depth,
+                    limits.depth,
                     if in_body { CALL_DEPTH_NOTE } else { "" }
                 ),
                 unsupported: false,
@@ -949,13 +949,13 @@ impl<'a> RefScan<'a, '_> {
             return Ok(());
         }
         self.budget.nodes += 1;
-        if self.budget.nodes > limits.max_nodes {
+        if self.budget.nodes > limits.nodes {
             return Err(Failure {
                 location: node.span.start.clone(),
                 message: format!(
                     "evaluation exceeded the budget of {} expression nodes \
                      (while collecting the names used through .func calls)",
-                    limits.max_nodes
+                    limits.nodes
                 ),
                 unsupported: false,
             });
@@ -1129,10 +1129,10 @@ fn shortest_cycle(
 }
 
 /// Depth units a `.func` call adds before its body, against
-/// [`EvalLimits::max_depth`]. A call nests several evaluator frames, so it is
+/// [`EvalLimits::depth`]. A call nests several evaluator frames, so it is
 /// charged more than one level of expression nesting; this keeps the stack
 /// used by the deepest accepted input within that of a plain expression of
-/// [`EvalLimits::max_depth`] levels (a 2 MiB thread stack, unoptimized).
+/// [`EvalLimits::depth`] levels (a 2 MiB thread stack, unoptimized).
 const CALL_DEPTH: usize = 4;
 
 const CALL_DEPTH_NOTE: &str = " (each nested .func call counts as 4 levels)";
@@ -1232,7 +1232,7 @@ fn checked(
 
 /// The recursive evaluator. Kept to a small dispatch (every diagnostic and
 /// call is built in a separate, non-inlined function) so that one level of
-/// nesting costs little stack even unoptimized: [`EvalLimits::max_depth`]
+/// nesting costs little stack even unoptimized: [`EvalLimits::depth`]
 /// levels must fit a 2 MiB thread stack.
 fn eval(
     node: &Expr,
@@ -1241,12 +1241,12 @@ fn eval(
     budget: &mut EvalBudget,
     depth: usize,
 ) -> Result<Real, Failure> {
-    if depth > budget.limits.max_depth {
-        return Err(too_deep(node, root, env, budget.limits.max_depth));
+    if depth > budget.limits.depth {
+        return Err(too_deep(node, root, env, budget.limits.depth));
     }
     budget.nodes += 1;
-    if budget.nodes > budget.limits.max_nodes {
-        return Err(over_budget(node, root, budget.limits.max_nodes));
+    if budget.nodes > budget.limits.nodes {
+        return Err(over_budget(node, root, budget.limits.nodes));
     }
     match &node.kind {
         ExprKind::Number { value, .. } => Ok(*value),
