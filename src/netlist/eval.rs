@@ -52,7 +52,8 @@
 //! unbounded expansion. [`ParamScope::for_netlist`] is the entry point for
 //! evaluating anything against a deck's top-level parameters and functions.
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
@@ -419,7 +420,7 @@ impl ParamScope {
         for &i in &live {
             node_of.insert(i, graph.add_node(i));
         }
-        let mut undefined: Option<(usize, String, SourceLoc)> = None;
+        let mut undefined: Option<(usize, &str, &SourceLoc)> = None;
         let mut scan = RefScan {
             use_site: scope_functions,
             budget: &mut *budget,
@@ -445,14 +446,14 @@ impl ParamScope {
                         || scope_parent.is_some_and(|p| p.get(n).is_some())
                 };
                 if name != entries[i].name
-                    && let Some(&j) = active.get(name.as_str())
+                    && let Some(&j) = active.get(name)
                     && j >= binding_count
                 {
                     let (a, b) = (node_of[&i], node_of[&j]);
                     if !graph.contains_edge(a, b) {
                         graph.add_edge(a, b, ());
                     }
-                } else if !known(&name) && undefined.is_none() {
+                } else if !known(name) && undefined.is_none() {
                     undefined = Some((i, name, loc));
                 }
             }
@@ -477,7 +478,7 @@ impl ParamScope {
                 seen.push(next);
                 at = next;
             }
-            return Err(SpiceError::parse(loc, message));
+            return Err(SpiceError::parse(loc.clone(), message));
         }
 
         // Cycles: report the one containing the earliest definition.
@@ -582,13 +583,16 @@ impl ParamScope {
     /// The value of `name` (case-insensitive), searching enclosing scopes.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Real> {
-        let key = name.to_ascii_lowercase();
-        if let Some(&i) = self.active.get(&key)
-            && let ParamState::Resolved(v) = self.entries[i].state
-        {
-            return Some(v);
+        let key = canonical_lookup(name);
+        let mut scope = self;
+        loop {
+            if let Some(&i) = scope.active.get(key.as_ref())
+                && let ParamState::Resolved(v) = scope.entries[i].state
+            {
+                return Some(v);
+            }
+            scope = scope.parent.as_deref()?;
         }
-        self.parent.as_ref().and_then(|p| p.get(&key))
     }
 
     /// Evaluate a site expression against this scope, drawing on `budget`.
@@ -718,9 +722,7 @@ impl FunctionScope {
         }
         for &i in &live {
             let def = &self.definitions[i];
-            let mut calls = Vec::new();
-            collect_calls(&def.body.root, &mut calls);
-            for (name, arguments, location) in calls {
+            for (name, arguments, location) in collect_calls(&def.body.root) {
                 let local = self.active.get(name).copied();
                 let callee = local.map_or_else(
                     || {
@@ -734,7 +736,7 @@ impl FunctionScope {
                 let Some(callee) = callee else { continue };
                 if callee.parameters.len() != arguments {
                     return Err(SpiceError::parse(
-                        location,
+                        location.clone(),
                         format!(
                             "function '{}' (defined at {}) takes {} argument(s), found {} \
                              (in the body of function '{}' defined at {})",
@@ -798,10 +800,10 @@ impl FunctionScope {
     /// enclosing scopes, with the scope it was defined in.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<(&FunctionDef, &Self)> {
-        let key = name.to_ascii_lowercase();
+        let key = canonical_lookup(name);
         let mut scope = self;
         loop {
-            if let Some(&i) = scope.active.get(&key) {
+            if let Some(&i) = scope.active.get(key.as_ref()) {
                 return Some((&scope.definitions[i], scope));
             }
             scope = scope.parent.as_deref()?;
@@ -809,24 +811,45 @@ impl FunctionScope {
     }
 }
 
-/// `(name, argument count, location)` of every call in `expr`.
-fn collect_calls<'a>(expr: &'a Expr, out: &mut Vec<(&'a str, usize, SourceLoc)>) {
-    match &expr.kind {
-        ExprKind::Number { .. } | ExprKind::Identifier(_) => {}
-        ExprKind::Unary { operand, .. } | ExprKind::Group(operand) => collect_calls(operand, out),
-        ExprKind::Binary { lhs, rhs, .. } => {
-            collect_calls(lhs, out);
-            collect_calls(rhs, out);
-        }
+/// Parser-produced names are already canonical. Public lookups also accept
+/// mixed ASCII case, without allocating for the common canonical path.
+fn canonical_lookup(name: &str) -> Cow<'_, str> {
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+/// Borrowed call descriptors in preorder, preserving the first arity error.
+fn collect_calls(expr: &Expr) -> impl Iterator<Item = (&str, usize, &SourceLoc)> {
+    expr.preorder().filter_map(|node| match &node.kind {
         ExprKind::Call { arguments, .. } | ExprKind::UserCall { arguments, .. } => {
-            out.push((
-                call_name(&expr.kind),
-                arguments.len(),
-                expr.span.start.clone(),
-            ));
-            for a in arguments {
-                collect_calls(a, out);
-            }
+            Some((call_name(&node.kind), arguments.len(), &node.span.start))
+        }
+        _ => None,
+    })
+}
+
+/// First-use order of a function's free names. Its formals are already
+/// present in `seen`, so captured names and repeated references are filtered
+/// as they arrive, rather than copied into an intermediate list.
+struct FreeNames<'a> {
+    seen: HashSet<&'a str>,
+    ordered: Vec<&'a str>,
+}
+
+impl<'a> FreeNames<'a> {
+    fn new(formals: &'a [String]) -> Self {
+        Self {
+            seen: formals.iter().map(String::as_str).collect(),
+            ordered: Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, name: &'a str) {
+        if self.seen.insert(name) {
+            self.ordered.push(name);
         }
     }
 }
@@ -849,7 +872,7 @@ struct RefScan<'a, 'b> {
     budget: &'b mut EvalBudget,
     /// Free names per definition (keyed by address; definitions live in the
     /// scope chain for the whole scan).
-    memo: HashMap<*const FunctionDef, Arc<[String]>>,
+    memo: HashMap<*const FunctionDef, Arc<[&'a str]>>,
     /// Definitions being expanded, to cut a cycle formed through the
     /// call-site fallback (evaluation reports it).
     stack: Vec<*const FunctionDef>,
@@ -898,12 +921,12 @@ impl<'a> RefScan<'a, '_> {
         &mut self,
         expr: &'a Expr,
         depth: usize,
-        out: &mut Vec<(String, SourceLoc)>,
+        out: &mut Vec<(&'a str, &'a SourceLoc)>,
     ) -> Result<(), Failure> {
         self.charge(expr, depth, false)?;
         match &expr.kind {
             ExprKind::Number { .. } => {}
-            ExprKind::Identifier(name) => out.push((name.clone(), expr.span.start.clone())),
+            ExprKind::Identifier(name) => out.push((name, &expr.span.start)),
             ExprKind::Unary { operand, .. } | ExprKind::Group(operand) => {
                 self.refs(operand, depth + 1, out)?;
             }
@@ -918,9 +941,7 @@ impl<'a> RefScan<'a, '_> {
                 let name = call_name(&expr.kind);
                 if let Some((def, scope)) = self.use_site.and_then(|f| f.get(name)) {
                     let free = self.free_names(def, scope, depth)?;
-                    for name in free.iter() {
-                        out.push((name.clone(), expr.span.start.clone()));
-                    }
+                    out.extend(free.iter().map(|&name| (name, &expr.span.start)));
                 }
             }
         }
@@ -941,7 +962,7 @@ impl<'a> RefScan<'a, '_> {
         def: &'a FunctionDef,
         scope: &'a FunctionScope,
         depth: usize,
-    ) -> Result<Arc<[String]>, Failure> {
+    ) -> Result<Arc<[&'a str]>, Failure> {
         let key = std::ptr::from_ref(def);
         if let Some(free) = self.memo.get(&key) {
             return Ok(Arc::clone(free));
@@ -953,17 +974,11 @@ impl<'a> RefScan<'a, '_> {
         }
         let cuts = self.cuts;
         self.stack.push(key);
-        let mut names = Vec::new();
+        let mut names = FreeNames::new(&def.parameters);
         let result = self.body_names(&def.body.root, scope, depth + CALL_DEPTH, &mut names);
         self.stack.pop();
         result?;
-        let mut free: Vec<String> = Vec::new();
-        for name in names {
-            if !def.parameters.contains(&name) && !free.contains(&name) {
-                free.push(name);
-            }
-        }
-        let free: Arc<[String]> = free.into();
+        let free: Arc<[&str]> = names.ordered.into();
         if self.cuts == cuts {
             self.memo.insert(key, Arc::clone(&free));
         }
@@ -975,12 +990,12 @@ impl<'a> RefScan<'a, '_> {
         expr: &'a Expr,
         scope: &'a FunctionScope,
         depth: usize,
-        out: &mut Vec<String>,
+        out: &mut FreeNames<'a>,
     ) -> Result<(), Failure> {
         self.charge(expr, depth, true)?;
         match &expr.kind {
             ExprKind::Number { .. } => {}
-            ExprKind::Identifier(name) => out.push(name.clone()),
+            ExprKind::Identifier(name) => out.insert(name),
             ExprKind::Unary { operand, .. } | ExprKind::Group(operand) => {
                 self.body_names(operand, scope, depth + 1, out)?;
             }
@@ -998,7 +1013,9 @@ impl<'a> RefScan<'a, '_> {
                     .or_else(|| self.use_site.and_then(|u| u.get(name)));
                 if let Some((callee, callee_scope)) = callee {
                     let free = self.free_names(callee, callee_scope, depth)?;
-                    out.extend(free.iter().cloned());
+                    for &name in free.iter() {
+                        out.insert(name);
+                    }
                 }
             }
         }

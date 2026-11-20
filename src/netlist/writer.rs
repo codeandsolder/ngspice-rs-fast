@@ -110,8 +110,7 @@ use crate::netlist::Parser;
 use crate::netlist::ast::{
     AnalysisCard, DeviceInstance, FuncCard, FuncSpelling, GlobalCard, IncludeDirective, ModelCard,
     Netlist, NodeHintCard, NodeHintValue, OptionCard, ParamCard, ParameterAssignment,
-    ParameterKind, PositionedValue, ScopedCard, ScopedCardKind, SourceFunction, SourceWaveform,
-    Subcircuit,
+    ParameterKind, PositionedValue, ScopedCard, ScopedCardKind, SourceWaveform, Subcircuit,
 };
 use crate::netlist::expr::ParameterExpression;
 use crate::netlist::semantic::{bexpr_form, expr_form};
@@ -1085,12 +1084,12 @@ fn named_value(parameter: &ParameterAssignment, text_ok: bool) -> SpiceResult<St
     ))
 }
 
-fn positioned_number(value: &PositionedValue, location: &SourceLoc) -> SpiceResult<String> {
+fn positioned_number<'a>(value: &'a PositionedValue, location: &SourceLoc) -> SpiceResult<&'a str> {
     match single_token(&value.text, location) {
         Some(Token {
             kind: TokenKind::Number(v),
             ..
-        }) if v.is_finite() => Ok(value.text.clone()),
+        }) if v.is_finite() => Ok(&value.text),
         _ => Err(refuse(
             format!(
                 "vector component {:?} is not a finite numeric literal",
@@ -1099,6 +1098,26 @@ fn positioned_number(value: &PositionedValue, location: &SourceLoc) -> SpiceResu
             Some(location),
         )),
     }
+}
+
+/// Write validated positioned numeric literals without intermediate owned
+/// strings, shared by waveform and initial-condition vectors.
+fn numeric_vector_text<'a>(
+    prefix: &str,
+    fields: impl IntoIterator<Item = &'a PositionedValue>,
+    separator: char,
+    location: &SourceLoc,
+) -> SpiceResult<String> {
+    let mut text = String::from(prefix);
+    text.push('(');
+    for (index, field) in fields.into_iter().enumerate() {
+        if index != 0 {
+            text.push(separator);
+        }
+        text.push_str(positioned_number(field, location)?);
+    }
+    text.push(')');
+    Ok(text)
 }
 
 fn passive_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceResult<()> {
@@ -1215,11 +1234,12 @@ fn line_parameters(
                 {
                     return Err(refuse("malformed ic vector", Some(location)));
                 }
-                let mut texts = Vec::new();
-                for component in components {
-                    texts.push(positioned_number(&component.value, location)?);
-                }
-                parts.push(format!("ic=({})", texts.join(",")));
+                parts.push(numeric_vector_text(
+                    "ic=",
+                    components.iter().map(|component| &component.value),
+                    ',',
+                    location,
+                )?);
             }
             ParameterKind::Scalar | ParameterKind::Expression(_)
                 if scalars.contains(&parameter.name.as_str()) =>
@@ -1644,7 +1664,9 @@ fn waveform_text(
     name: &str,
     location: &SourceLoc,
 ) -> SpiceResult<String> {
-    let (keyword, fields) = match waveform {
+    let kind = waveform.kind();
+    let keyword = kind.keyword(name);
+    let fields = match waveform {
         SourceWaveform::Pulse(pulse) => {
             let optional = [
                 &pulse.delay,
@@ -1668,32 +1690,26 @@ fn waveform_text(
                     None => omitted = true,
                 }
             }
-            ("pulse", fields)
+            fields
         }
         SourceWaveform::Pwl(points) => {
-            if points.is_empty() || points.len() > 2048 {
+            if points.is_empty() || points.len() > kind.maximum_fields() / 2 {
                 return Err(refuse("PWL needs 1 to 2048 points", Some(location)));
             }
-            (
-                "pwl",
-                points.iter().flat_map(|p| [&p.time, &p.value]).collect(),
-            )
+            points.iter().flat_map(|p| [&p.time, &p.value]).collect()
         }
         SourceWaveform::Function(function) => {
-            let fields = function.function.fields().len();
-            if function.values.len() < 2 || function.values.len() > fields {
+            let maximum = kind.maximum_fields();
+            if !(2..=maximum).contains(&function.values.len()) {
                 return Err(refuse(
-                    format!("{} needs 2 to {fields} fields", function.function.keyword()),
+                    format!(
+                        "{} needs 2 to {maximum} fields",
+                        function.function.keyword()
+                    ),
                     Some(location),
                 ));
             }
-            // `sine` is C's alias of `sin`; keep the spelling that was parsed.
-            let keyword = if function.function == SourceFunction::Sin && name == "sine" {
-                "sine"
-            } else {
-                function.function.keyword()
-            };
-            (keyword, function.values.iter().collect())
+            function.values.iter().collect()
         }
     };
     if name != keyword {
@@ -1702,11 +1718,7 @@ fn waveform_text(
             Some(location),
         ));
     }
-    let mut texts = Vec::new();
-    for field in fields {
-        texts.push(positioned_number(field, location)?);
-    }
-    Ok(format!("{keyword}({})", texts.join(" ")))
+    numeric_vector_text(keyword, fields, ' ', location)
 }
 
 fn transistor_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceResult<()> {
@@ -1751,11 +1763,12 @@ fn transistor_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> Sp
                 {
                     return Err(refuse("malformed ic vector", Some(location)));
                 }
-                let mut texts = Vec::new();
-                for component in components {
-                    texts.push(positioned_number(&component.value, location)?);
-                }
-                parts.push(format!("ic=({})", texts.join(",")));
+                parts.push(numeric_vector_text(
+                    "ic=",
+                    components.iter().map(|component| &component.value),
+                    ',',
+                    location,
+                )?);
             }
             ParameterKind::Scalar | ParameterKind::Expression(_)
                 if scalars.contains(&parameter.name.as_str()) =>

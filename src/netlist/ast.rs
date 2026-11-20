@@ -125,6 +125,59 @@ pub enum SourceWaveform {
     Function(Box<FunctionWaveform>),
 }
 
+/// Shared lexical classification for parsing and serializing waveform
+/// setters. Runtime default resolution is independent of these field limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WaveformKind {
+    Pulse,
+    Pwl,
+    Function(SourceFunction),
+}
+
+impl WaveformKind {
+    pub(super) fn from_keyword(keyword: &str) -> Option<Self> {
+        [
+            ("pulse", Self::Pulse),
+            ("pwl", Self::Pwl),
+            ("sin", Self::Function(SourceFunction::Sin)),
+            ("sine", Self::Function(SourceFunction::Sin)),
+            ("exp", Self::Function(SourceFunction::Exp)),
+            ("sffm", Self::Function(SourceFunction::Sffm)),
+            ("am", Self::Function(SourceFunction::Am)),
+        ]
+        .into_iter()
+        .find_map(|(name, kind)| keyword.eq_ignore_ascii_case(name).then_some(kind))
+    }
+
+    pub(super) const fn maximum_fields(self) -> usize {
+        match self {
+            Self::Pulse => 8,
+            Self::Pwl => 4096,
+            Self::Function(function) => function.fields().len(),
+        }
+    }
+
+    /// Keep the accepted `sine` spelling; otherwise use the canonical keyword.
+    pub(super) fn keyword(self, spelling: &str) -> &'static str {
+        match self {
+            Self::Pulse => "pulse",
+            Self::Pwl => "pwl",
+            Self::Function(SourceFunction::Sin) if spelling == "sine" => "sine",
+            Self::Function(function) => function.keyword(),
+        }
+    }
+}
+
+impl SourceWaveform {
+    pub(super) fn kind(&self) -> WaveformKind {
+        match self {
+            Self::Pulse(_) => WaveformKind::Pulse,
+            Self::Pwl(_) => WaveformKind::Pwl,
+            Self::Function(function) => WaveformKind::Function(function.function),
+        }
+    }
+}
+
 /// The analytic transient functions of `vsrcload.c`/`isrcload.c` that share
 /// one "required pair plus optional prefix" vector shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

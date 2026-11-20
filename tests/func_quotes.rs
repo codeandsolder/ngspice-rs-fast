@@ -278,6 +278,22 @@ fn calls_bind_formals_by_value_and_free_names_at_the_call_site() {
 }
 
 #[test]
+fn free_names_keep_first_reference_order_and_capture_formals() {
+    let source = ".func inner(y) {y+captured+first+second+first}\n\
+                  .func outer(captured) {inner(1)+second+inner(2)}\n\
+                  .param p={outer(3)}";
+    let error = scope_error(source).to_string();
+    assert!(error.contains("undefined parameter 'first'"), "{error}");
+    assert!(error.contains("f.cir:4:11"), "{error}");
+    let error = scope_error(&format!("{source}\n.param first=7")).to_string();
+    assert!(error.contains("undefined parameter 'second'"), "{error}");
+    assert_eq!(
+        value(&format!("{source}\n.param FIRST=7 SECOND=11"), "p"),
+        70.
+    );
+}
+
+#[test]
 fn formals_may_reuse_built_in_function_names() {
     // C's numparam binds a bare use to the formal (values checked against
     // the C binary; see c_func_eval.rs).

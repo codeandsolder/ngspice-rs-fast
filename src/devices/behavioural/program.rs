@@ -33,6 +33,7 @@
 use crate::netlist::bexpr::{BBinaryOp, BExpr, BExprKind, BUnaryOp, STATISTICAL_FUNCTIONS};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::xspice::XspicePwl;
@@ -242,6 +243,7 @@ pub struct Program {
     root: Tree,
     derivatives: Vec<Tree>,
     quantities: Vec<Quantity>,
+    uses_frequency: bool,
 }
 
 fn unsupported(expr: &BExpr, message: impl Into<String>) -> SpiceError {
@@ -267,35 +269,23 @@ impl Program {
     /// the statistical functions (`agauss`, `gauss`, `aunif`, `unif`,
     /// `limit`; normally already rejected by the front end).
     pub fn compile(expr: &BExpr) -> SpiceResult<Self> {
-        let mut quantities = Vec::new();
-        let root = Arc::new(compile(expr, &mut quantities)?);
-        let derivatives = (0..quantities.len())
+        let mut compiler = Compiler::default();
+        let root = Arc::new(compile(expr, &mut compiler)?);
+        let derivatives = (0..compiler.quantities.len())
             .map(|variable| differentiate(&root, variable))
             .collect();
         Ok(Self {
             root,
             derivatives,
-            quantities,
+            quantities: compiler.quantities,
+            uses_frequency: compiler.uses_frequency,
         })
     }
 
     /// True when the expression reads `hertz`.
     #[must_use]
-    pub fn uses_frequency(&self) -> bool {
-        fn walk(node: &Node) -> bool {
-            match node {
-                Node::Frequency => true,
-                Node::Constant(_) | Node::Variable(_) | Node::Time | Node::Temperature => false,
-                Node::Unary(_, a)
-                | Node::Pwl(a, _)
-                | Node::PwlDerivative(a, _)
-                | Node::Table(a, _)
-                | Node::TableSlope(a, _) => walk(a),
-                Node::Operator(_, a, b) | Node::Binary(_, a, b) => walk(a) || walk(b),
-                Node::Ternary(a, b, c) => walk(a) || walk(b) || walk(c),
-            }
-        }
-        walk(&self.root)
+    pub const fn uses_frequency(&self) -> bool {
+        self.uses_frequency
     }
 
     /// The circuit quantities the expression reads, in variable order.
@@ -330,22 +320,42 @@ impl Program {
     }
 }
 
-fn variable(quantities: &mut Vec<Quantity>, quantity: Quantity) -> Node {
-    let index = quantities
-        .iter()
-        .position(|q| *q == quantity)
-        .unwrap_or_else(|| {
-            quantities.push(quantity);
-            quantities.len() - 1
+/// Borrowed AST names are scoped to compilation, not the resulting program.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum QuantityKey<'a> {
+    Node(&'a str),
+    Branch(&'a str),
+}
+
+/// Intern circuit quantities in first-use order and collect expression-wide
+/// metadata in the same traversal. The lookup index is discarded after
+/// lowering; only the ordered owned quantities survive in the program.
+#[derive(Default)]
+struct Compiler<'a> {
+    indices: HashMap<QuantityKey<'a>, usize>,
+    quantities: Vec<Quantity>,
+    uses_frequency: bool,
+}
+
+impl<'a> Compiler<'a> {
+    fn variable(&mut self, key: QuantityKey<'a>) -> Node {
+        let index = *self.indices.entry(key).or_insert_with(|| {
+            let index = self.quantities.len();
+            self.quantities.push(match key {
+                QuantityKey::Node(name) => Quantity::Node(name.to_owned()),
+                QuantityKey::Branch(name) => Quantity::Branch(name.to_owned()),
+            });
+            index
         });
-    Node::Variable(index)
+        Node::Variable(index)
+    }
 }
 
-fn boxed(expr: &BExpr, quantities: &mut Vec<Quantity>) -> SpiceResult<Tree> {
-    compile(expr, quantities).map(Arc::new)
+fn boxed<'a>(expr: &'a BExpr, compiler: &mut Compiler<'a>) -> SpiceResult<Tree> {
+    compile(expr, compiler).map(Arc::new)
 }
 
-fn compile(expr: &BExpr, quantities: &mut Vec<Quantity>) -> SpiceResult<Node> {
+fn compile<'a>(expr: &'a BExpr, compiler: &mut Compiler<'a>) -> SpiceResult<Node> {
     Ok(match &expr.kind {
         BExprKind::Number { value, .. } => Node::Constant(*value),
         BExprKind::Name(name) => match name.as_str() {
@@ -353,7 +363,10 @@ fn compile(expr: &BExpr, quantities: &mut Vec<Quantity>) -> SpiceResult<Node> {
             "temper" => Node::Temperature,
             "pi" => Node::Constant(std::f64::consts::PI),
             "e" => Node::Constant(std::f64::consts::E),
-            "hertz" => Node::Frequency,
+            "hertz" => {
+                compiler.uses_frequency = true;
+                Node::Frequency
+            }
             other => {
                 return Err(parse_error(
                     expr,
@@ -365,18 +378,18 @@ fn compile(expr: &BExpr, quantities: &mut Vec<Quantity>) -> SpiceResult<Node> {
             }
         },
         BExprKind::Voltage { positive, negative } => {
-            let plus = variable(quantities, Quantity::Node(positive.clone()));
+            let plus = compiler.variable(QuantityKey::Node(positive));
             match negative {
                 None => plus,
                 Some(negative) => {
-                    let minus = variable(quantities, Quantity::Node(negative.clone()));
+                    let minus = compiler.variable(QuantityKey::Node(negative));
                     Node::Operator(Operator::Minus, Arc::new(plus), Arc::new(minus))
                 }
             }
         }
-        BExprKind::Current(name) => variable(quantities, Quantity::Branch(name.clone())),
+        BExprKind::Current(name) => compiler.variable(QuantityKey::Branch(name)),
         BExprKind::Unary { op, operand } => {
-            let operand = boxed(operand, quantities)?;
+            let operand = boxed(operand, compiler)?;
             match op {
                 BUnaryOp::Plus => Arc::unwrap_or_clone(operand),
                 BUnaryOp::Minus => Node::Unary(Unary::Uminus, operand),
@@ -384,8 +397,8 @@ fn compile(expr: &BExpr, quantities: &mut Vec<Quantity>) -> SpiceResult<Node> {
             }
         }
         BExprKind::Binary { op, lhs, rhs } => {
-            let lhs = boxed(lhs, quantities)?;
-            let rhs = boxed(rhs, quantities)?;
+            let lhs = boxed(lhs, compiler)?;
+            let rhs = boxed(rhs, compiler)?;
             let difference = |lhs, rhs| Arc::new(Node::Operator(Operator::Minus, lhs, rhs));
             match op {
                 BBinaryOp::Add => Node::Operator(Operator::Plus, lhs, rhs),
@@ -424,12 +437,12 @@ fn compile(expr: &BExpr, quantities: &mut Vec<Quantity>) -> SpiceResult<Node> {
             then,
             otherwise,
         } => Node::Ternary(
-            boxed(condition, quantities)?,
-            boxed(then, quantities)?,
-            boxed(otherwise, quantities)?,
+            boxed(condition, compiler)?,
+            boxed(then, compiler)?,
+            boxed(otherwise, compiler)?,
         ),
-        BExprKind::Group(inner) => compile(inner, quantities)?,
-        BExprKind::Call { name, arguments } => call(expr, name, arguments, quantities)?,
+        BExprKind::Group(inner) => compile(inner, compiler)?,
+        BExprKind::Call { name, arguments } => call(expr, name, arguments, compiler)?,
         BExprKind::Value(_) => {
             return Err(parse_error(
                 expr,
@@ -446,7 +459,7 @@ fn compile(expr: &BExpr, quantities: &mut Vec<Quantity>) -> SpiceResult<Node> {
                 SpiceError::Unsupported { feature, .. } => unsupported(expr, feature),
                 other => other,
             })?;
-            Node::Table(boxed(&table.input, quantities)?, Arc::new(map))
+            Node::Table(boxed(&table.input, compiler)?, Arc::new(map))
         }
     })
 }
@@ -486,11 +499,11 @@ fn not_literal(expr: &BExpr) -> SpiceError {
     )
 }
 
-fn call(
+fn call<'a>(
     expr: &BExpr,
     name: &str,
-    arguments: &[BExpr],
-    quantities: &mut Vec<Quantity>,
+    arguments: &'a [BExpr],
+    compiler: &mut Compiler<'a>,
 ) -> SpiceResult<Node> {
     let arity = |expected: usize| -> SpiceResult<()> {
         if arguments.len() == expected {
@@ -507,30 +520,30 @@ fn call(
     };
     if let Some(function) = Unary::from_name(name) {
         arity(1)?;
-        return Ok(Node::Unary(function, boxed(&arguments[0], quantities)?));
+        return Ok(Node::Unary(function, boxed(&arguments[0], compiler)?));
     }
-    let two = |function: Binary, quantities: &mut Vec<Quantity>| -> SpiceResult<Node> {
+    let two = |function: Binary, compiler: &mut Compiler<'a>| -> SpiceResult<Node> {
         arity(2)?;
         Ok(Node::Binary(
             function,
-            boxed(&arguments[0], quantities)?,
-            boxed(&arguments[1], quantities)?,
+            boxed(&arguments[0], compiler)?,
+            boxed(&arguments[1], compiler)?,
         ))
     };
     match name {
-        "pow" => two(Binary::Pow, quantities),
-        "pwr" => two(Binary::Pwr, quantities),
-        "min" => two(Binary::Min, quantities),
-        "max" => two(Binary::Max, quantities),
+        "pow" => two(Binary::Pow, compiler),
+        "pwr" => two(Binary::Pwr, compiler),
+        "min" => two(Binary::Min, compiler),
+        "max" => two(Binary::Max, compiler),
         "ternary_fcn" => {
             arity(3)?;
             Ok(Node::Ternary(
-                boxed(&arguments[0], quantities)?,
-                boxed(&arguments[1], quantities)?,
-                boxed(&arguments[2], quantities)?,
+                boxed(&arguments[0], compiler)?,
+                boxed(&arguments[1], compiler)?,
+                boxed(&arguments[2], compiler)?,
             ))
         }
-        "pwl" => pwl(expr, arguments, quantities),
+        "pwl" => pwl(expr, arguments, compiler),
         "ddt" => Err(SpiceError::not_yet_ported(
             format!(
                 "{}: ddt() in a behavioural source (a stateful time derivative of \
@@ -560,7 +573,7 @@ fn call(
     }
 }
 
-fn pwl(expr: &BExpr, arguments: &[BExpr], quantities: &mut Vec<Quantity>) -> SpiceResult<Node> {
+fn pwl<'a>(expr: &BExpr, arguments: &'a [BExpr], compiler: &mut Compiler<'a>) -> SpiceResult<Node> {
     let Some((input, points)) = arguments.split_first() else {
         return Err(parse_error(expr, "pwl() needs an input and points"));
     };
@@ -587,7 +600,7 @@ fn pwl(expr: &BExpr, arguments: &[BExpr], quantities: &mut Vec<Quantity>) -> Spi
              (C: prepare_PTF_PWL)",
         )
     })?;
-    Ok(Node::Pwl(boxed(input, quantities)?, Arc::new(table)))
+    Ok(Node::Pwl(boxed(input, compiler)?, Arc::new(table)))
 }
 
 /// `PTpwl` supports both orders, but `PTpwl_derivative` always performs an

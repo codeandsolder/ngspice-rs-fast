@@ -72,6 +72,12 @@ fn shape(text: &str) -> String {
 }
 
 #[test]
+fn reference_traversal_retains_duplicates_and_argument_order() {
+    let parsed = expression("f(A, b + g(c, a)) + (-d) * max(e, f(b))").unwrap();
+    assert_eq!(parsed.references(), ["a", "b", "c", "a", "d", "e", "b"]);
+}
+
+#[test]
 fn precedence_and_associativity_follow_c_numparam() {
     for (text, expected) in [
         ("1+2*3", "(+ 1 (* 2 3))"),
