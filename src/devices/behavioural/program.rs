@@ -926,6 +926,61 @@ fn general_power(outer: Tree, a: &Tree, b: &Tree, variable: usize) -> Tree {
     )
 }
 
+/// The derivative's two power modes, separate from general binary
+/// functions: `^` and `pow()` have the ordinary rule, `pwr()` the signed rule.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PowerRule {
+    Ordinary,
+    Signed,
+}
+
+impl PowerRule {
+    const fn value_kernel(self) -> Binary {
+        match self {
+            Self::Ordinary => Binary::Pow,
+            Self::Signed => Binary::Pwr,
+        }
+    }
+
+    const fn exponent_kernel(self) -> Binary {
+        match self {
+            Self::Ordinary => Binary::Pwr,
+            Self::Signed => Binary::Pow,
+        }
+    }
+}
+
+/// The three C power syntaxes share a derivative rule, but use different
+/// function kernels when the exponent is constant.  `^` and `pow()` use
+/// `pwr(a, b - 1)`; `pwr()` instead uses `pow(a, b - 1)`.
+///
+/// For variable exponents, only the `pow`/ `^` rule has C's special
+/// constant-base case.  Keep the original mkb/mkf tree construction order;
+/// it affects the values and the rounding of the evaluated Jacobian.
+fn differentiate_power(rule: PowerRule, a: &Tree, b: &Tree, variable: usize) -> Tree {
+    b.constant().map_or_else(
+        || {
+            if rule == PowerRule::Ordinary && a.constant().is_some() {
+                times(
+                    mk_binary(Binary::Pow, a, b.clone()),
+                    times(differentiate(b, variable), log_abs(a)),
+                )
+            } else {
+                general_power(mk_binary(rule.value_kernel(), a, b.clone()), a, b, variable)
+            }
+        },
+        |exponent| {
+            times(
+                times(
+                    constant(exponent),
+                    mk_binary(rule.exponent_kernel(), a, constant(exponent - 1.)),
+                ),
+                differentiate(a, variable),
+            )
+        },
+    )
+}
+
 /// `PTdifferentiate` (`inpptree.c`): the derivative tree of `p` with respect
 /// to quantity `variable`, built with C's `mkb`/`mkf` simplifications so its
 /// evaluation is C's operation for operation. The PSPICE/HSPICE/LTspice
@@ -952,25 +1007,8 @@ fn differentiate(p: &Tree, variable: usize) -> Tree {
             ),
             squared(b),
         ),
-        Node::Operator(Operator::Power, a, b) => {
-            if let Some(exponent) = b.constant() {
-                // b * pwr(a, b - 1) * d(a)
-                times(
-                    times(
-                        constant(exponent),
-                        mk_binary(Binary::Pwr, a, constant(exponent - 1.)),
-                    ),
-                    differentiate(a, variable),
-                )
-            } else if a.constant().is_some() {
-                // pow(a, b) * (d(b) * log(abs(a)))
-                times(
-                    mk_binary(Binary::Pow, a, b.clone()),
-                    times(differentiate(b, variable), log_abs(a)),
-                )
-            } else {
-                general_power(mk_binary(Binary::Pow, a, b.clone()), a, b, variable)
-            }
+        Node::Operator(Operator::Power, a, b) | Node::Binary(Binary::Pow, a, b) => {
+            differentiate_power(PowerRule::Ordinary, a, b, variable)
         }
         Node::Ternary(condition, then, otherwise) => mk_ternary(
             condition.clone(),
@@ -993,38 +1031,7 @@ fn differentiate(p: &Tree, variable: usize) -> Tree {
                 differentiate(b, variable),
             )
         }
-        Node::Binary(Binary::Pow, a, b) => {
-            if let Some(exponent) = b.constant() {
-                times(
-                    times(
-                        constant(exponent),
-                        mk_binary(Binary::Pwr, a, constant(exponent - 1.)),
-                    ),
-                    differentiate(a, variable),
-                )
-            } else if a.constant().is_some() {
-                times(
-                    mk_binary(Binary::Pow, a, b.clone()),
-                    times(differentiate(b, variable), log_abs(a)),
-                )
-            } else {
-                general_power(mk_binary(Binary::Pow, a, b.clone()), a, b, variable)
-            }
-        }
-        Node::Binary(Binary::Pwr, a, b) => {
-            if let Some(exponent) = b.constant() {
-                // b * pow(a, b - 1) * d(a)
-                times(
-                    times(
-                        constant(exponent),
-                        mk_binary(Binary::Pow, a, constant(exponent - 1.)),
-                    ),
-                    differentiate(a, variable),
-                )
-            } else {
-                general_power(mk_binary(Binary::Pwr, a, b.clone()), a, b, variable)
-            }
-        }
+        Node::Binary(Binary::Pwr, a, b) => differentiate_power(PowerRule::Signed, a, b, variable),
         Node::Unary(function, u) => {
             let one = || constant(1.);
             let slope = match function {

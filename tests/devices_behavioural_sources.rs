@@ -147,6 +147,38 @@ fn every_function_has_a_derivative_matching_finite_differences() {
     }
 }
 
+/// The `^` operator and `pow()` produce the same C derivative tree, even
+/// though their value functions diverge at a zero base. This covers constant
+/// exponents, variable exponents and the special constant-base rule.
+#[test]
+fn caret_and_pow_share_identical_derivative_values() {
+    let cases = [
+        ("(v(a) + 3)^2.5", "pow(v(a) + 3, 2.5)"),
+        ("(v(a) - 3)^3", "pow(v(a) - 3, 3)"),
+        ("(v(a) + 3)^(v(b) + 1)", "pow(v(a) + 3, v(b) + 1)"),
+        ("2^(v(a) - v(b))", "pow(2, v(a) - v(b))"),
+    ];
+    for (caret, function) in cases {
+        let left = program(caret);
+        let right = program(function);
+        assert_eq!(left.quantities(), right.quantities());
+        for point in POINTS {
+            let names: BTreeMap<&str, Real> = point.iter().copied().collect();
+            let x = values(&left, &names);
+            let lhs = left.evaluate(&environment(&x)).unwrap();
+            let rhs = right.evaluate(&environment(&x)).unwrap();
+            assert_eq!(lhs.gradient.len(), rhs.gradient.len(), "{caret}");
+            for (a, b) in lhs.gradient.iter().zip(&rhs.gradient) {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{caret} vs {function} at {point:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn values_follow_the_c_functions() {
     let at = |text: &str| value(text, &[("a", 0.)]);
