@@ -30,6 +30,7 @@
 //!    `* xtask-codemodels: <name>...` comment; the scratch directory then gets
 //!    a `.spiceinit` with just those `codemodel` commands.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -332,13 +333,17 @@ fn write_codemodel_init(ngspice: &Ngspice, netlist: &str, directory: &Path) -> R
     let init = directory.join(".spiceinit");
     let models = requested_codemodels(netlist);
     if models.is_empty() {
-        let _ = fs::remove_file(&init);
-        return Ok(());
+        return match fs::remove_file(&init) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("removing stale {}: {error}", init.display())),
+        };
     }
     let mut text = String::new();
     for name in &models {
         let path = codemodel_path(ngspice, name)?;
-        text.push_str(&format!("codemodel {}\n", path.display()));
+        writeln!(text, "codemodel {}", path.display())
+            .map_err(|error| format!("formatting {}: {error}", init.display()))?;
     }
     fs::write(&init, text).map_err(|error| format!("writing {}: {error}", init.display()))
 }
