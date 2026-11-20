@@ -178,6 +178,10 @@ pub(in crate::maths) fn check_status<T: Scalar>(
 ) -> SpiceResult<()> {
     match status {
         Status::Okay => Ok(()),
+        Status::NonFinite => Err(numerical(
+            context,
+            "non-finite or unrepresentable LU factor",
+        )),
         Status::SmallPivot => {
             if let Some((row, col)) = sparse.small_pivot() {
                 let (col, row) = (unknown_label(names, col), unknown_label(names, row));
@@ -896,6 +900,31 @@ impl DenseLu {
 mod tests {
     use super::*;
     use crate::maths::complex::ComplexMatrix;
+
+    #[test]
+    fn unrepresentable_bound_factor_never_enters_retained_solves() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        for (r, c, v) in [(0, 0, 2.), (0, 1, 1.), (1, 0, 1.), (1, 1, 2.)] {
+            a.set(r, c, v).unwrap();
+        }
+        let rhs = Vector::from_slice(&[3., 3.]);
+        for _ in 0..2 {
+            assert!(matches!(
+                solve_ni(&a, &rhs, &mut None, false, 0.).unwrap(),
+                NiStep::Solved(_)
+            ));
+        }
+        assert!(solve_last_factors(&pattern, &rhs).unwrap().is_some());
+        a.set(0, 0, f64::from_bits(1)).unwrap();
+        assert!(solve_ni(&a, &rhs, &mut None, false, 0.).is_err());
+        assert!(solve_last_factors(&pattern, &rhs).unwrap().is_none());
+        a.set(0, 0, 2.).unwrap();
+        let NiStep::Solved(x) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
+            panic!("factor recovery failed")
+        };
+        assert_eq!(x.as_slice(), &[1., 1.]);
+    }
 
     #[test]
     fn dense_direct_frame_matches_folded_sparse_order_bit_for_bit() {

@@ -504,6 +504,10 @@ impl<'a> LoadedPencil<'a> {
         }
         match sparse.order_and_factor(load.relative_threshold, 1.0e-30) {
             Status::Singular | Status::ZeroDiag => Ok(None),
+            Status::NonFinite => Err(numerical(
+                "pole-zero search",
+                "non-finite or unrepresentable LU factor",
+            )),
             Status::Okay | Status::SmallPivot => {
                 let (mantissa, exponent) = sparse.determinant()?;
                 Ok(Some(base2_determinant(mantissa, exponent)))

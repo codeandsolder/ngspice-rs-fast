@@ -121,14 +121,22 @@ impl Scalar for Complex {
     fn recip(self) -> Self {
         // CMPLX_RECIPROCAL (spdefs.h).
         let den = self;
-        if (den.re >= den.im && den.re > -den.im) || (den.re < den.im && den.re <= -den.im) {
-            let r = den.im / den.re;
-            let re = 1.0 / (den.re + r * den.im);
-            Self::new(re, -r * re)
+        let result =
+            if (den.re >= den.im && den.re > -den.im) || (den.re < den.im && den.re <= -den.im) {
+                let r = den.im / den.re;
+                let re = 1.0 / (den.re + r * den.im);
+                Self::new(re, -r * re)
+            } else {
+                let r = den.re / den.im;
+                let im = -1.0 / (den.im + r * den.re);
+                Self::new(-r * im, im)
+            };
+        if !result.is_finite() || result == Self::ZERO {
+            // The C ratio formula can overflow its denominator even for
+            // a finite pivot with a representable reciprocal.
+            Self::real(1.0) / den
         } else {
-            let r = den.re / den.im;
-            let im = -1.0 / (den.im + r * den.re);
-            Self::new(-r * im, im)
+            result
         }
     }
     fn mul(self, b: Self) -> Self {
@@ -162,6 +170,8 @@ pub(super) enum Status {
     SmallPivot,
     ZeroDiag,
     Singular,
+    /// The factorization produced an unrepresentable numeric value.
+    NonFinite,
 }
 
 #[derive(Debug, Clone)]
@@ -722,6 +732,10 @@ impl<T: Scalar> Sparse<T> {
     pub(crate) fn order_and_factor(&mut self, rel_threshold: f64, abs_threshold: f64) -> Status {
         self.status = Status::Okay;
         self.small_pivot = None;
+        self.factored = false;
+        if !self.values_are_finite() {
+            return self.nonfinite_factor();
+        }
         let size = self.size;
         if rel_threshold > 0.0 && rel_threshold <= 1.0 {
             self.rel_threshold = rel_threshold;
@@ -741,6 +755,9 @@ impl<T: Scalar> Sparse<T> {
                 let largest = self.find_largest_in_col(self.elements[pivot].next_in_col);
                 if largest * self.rel_threshold < self.mag(pivot) {
                     self.row_col_elimination(pivot);
+                    if matches!(self.status, Status::Singular | Status::NonFinite) {
+                        return self.status;
+                    }
                 } else {
                     reorder = true;
                     break;
@@ -766,7 +783,7 @@ impl<T: Scalar> Sparse<T> {
             };
             self.exchange_rows_and_cols(pivot, step);
             self.row_col_elimination(pivot);
-            if self.status == Status::Singular {
+            if matches!(self.status, Status::Singular | Status::NonFinite) {
                 return self.status;
             }
             self.update_markowitz_numbers(pivot);
@@ -786,6 +803,10 @@ impl<T: Scalar> Sparse<T> {
         if self.needs_ordering {
             return self.order_and_factor(0.0, 0.0);
         }
+        self.factored = false;
+        if !self.values_are_finite() {
+            return self.nonfinite_factor();
+        }
         let size = self.size;
         if size == 0 {
             self.factored = true;
@@ -796,7 +817,11 @@ impl<T: Scalar> Sparse<T> {
         if self.elements[first].value.is_zero() {
             return self.zero_pivot(1);
         }
-        self.elements[first].value = self.elements[first].value.recip();
+        let inverse = self.elements[first].value.recip();
+        if !inverse.is_finite() || inverse.is_zero() {
+            return self.nonfinite_factor();
+        }
+        self.elements[first].value = inverse;
         self.factor_workspace.resize(size + 1, T::ZERO);
         self.factor_workspace.fill(T::ZERO);
         let dest = &mut self.factor_workspace;
@@ -811,6 +836,9 @@ impl<T: Scalar> Sparse<T> {
                 let row = self.elements[column].row;
                 let mut e = self.diag[row];
                 let mult = dest[row].mul(self.elements[e].value);
+                if !mult.is_finite() {
+                    return self.nonfinite_factor();
+                }
                 self.elements[column].value = mult;
                 e = self.elements[e].next_in_col;
                 while e != NONE {
@@ -822,14 +850,22 @@ impl<T: Scalar> Sparse<T> {
             }
             let mut e = self.elements[self.diag[step]].next_in_col;
             while e != NONE {
-                self.elements[e].value = dest[self.elements[e].row];
+                let value = dest[self.elements[e].row];
+                if !value.is_finite() {
+                    return self.nonfinite_factor();
+                }
+                self.elements[e].value = value;
                 e = self.elements[e].next_in_col;
             }
             if dest[step].is_zero() {
                 return self.zero_pivot(step);
             }
             let d = self.diag[step];
-            self.elements[d].value = dest[step].recip();
+            let inverse = dest[step].recip();
+            if !inverse.is_finite() || inverse.is_zero() {
+                return self.nonfinite_factor();
+            }
+            self.elements[d].value = inverse;
         }
         self.factored = true;
         self.status = Status::Okay;
@@ -1466,10 +1502,18 @@ impl<T: Scalar> Sparse<T> {
             return;
         }
         let inverse = self.elements[pivot].value.recip();
+        if !inverse.is_finite() || inverse.is_zero() {
+            self.nonfinite_factor();
+            return;
+        }
         self.elements[pivot].value = inverse;
         let mut upper = self.elements[pivot].next_in_row;
         while upper != NONE {
             let u = self.elements[upper].value.mul(inverse);
+            if !u.is_finite() {
+                self.nonfinite_factor();
+                return;
+            }
             self.elements[upper].value = u;
             let upper_col = self.elements[upper].col;
             let mut sub = self.elements[upper].next_in_col;
@@ -1483,7 +1527,12 @@ impl<T: Scalar> Sparse<T> {
                     sub = self.create_fillin(row, upper_col);
                 }
                 let l = self.elements[lower].value;
-                self.elements[sub].value = self.elements[sub].value.mul_sub(u, l);
+                let value = self.elements[sub].value.mul_sub(u, l);
+                if !value.is_finite() {
+                    self.nonfinite_factor();
+                    return;
+                }
+                self.elements[sub].value = value;
                 sub = self.elements[sub].next_in_col;
                 lower = self.elements[lower].next_in_col;
             }
@@ -1535,6 +1584,16 @@ impl<T: Scalar> Sparse<T> {
             self.singletons -= 1;
         }
         element
+    }
+
+    /// A partially eliminated frame cannot serve retained solves or continue
+    /// using its possibly incomplete ordering. A later clear/reload may
+    /// safely restart ordering with its existing structure.
+    fn nonfinite_factor(&mut self) -> Status {
+        self.status = Status::NonFinite;
+        self.factored = false;
+        self.needs_ordering = true;
+        self.status
     }
 
     /// `MatrixIsSingular`.
@@ -1738,6 +1797,37 @@ mod tests {
     }
 
     #[test]
+    fn extreme_complex_reciprocals_and_invalid_factor_recovery() {
+        let mut c = Sparse::<Complex>::new(1);
+        let handle = c.get_element(1, 1);
+        c.set(handle, Complex::new(f64::MAX, f64::MAX));
+        assert!(matches!(
+            c.order_and_factor(1e-3, 0.),
+            Status::Okay | Status::SmallPivot
+        ));
+        let x = c.solve(&[Complex::real(1.)])[0];
+        assert!(x.re > 0. && x.im < 0.);
+        assert!((x.re * f64::MAX - 0.5).abs() < 1e-14);
+        let mut m = build(2, &[(1, 1, 2.), (1, 2, 1.), (2, 1, 1.), (2, 2, 2.)]);
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        m.clear();
+        for (r, c, v) in [(1, 1, 1.), (1, 2, f64::MAX), (2, 1, f64::MAX), (2, 2, 1.)] {
+            let h = m.get_element(r, c);
+            m.set(h, v);
+        }
+        assert_eq!(m.factor(), Status::NonFinite);
+        assert!(!m.is_factored());
+        assert!(m.determinant().is_err());
+        m.clear();
+        for (r, c, v) in [(1, 1, 2.), (1, 2, 1.), (2, 1, 1.), (2, 2, 2.)] {
+            let h = m.get_element(r, c);
+            m.set(h, v);
+        }
+        assert_eq!(m.factor(), Status::Okay);
+        assert_eq!(m.solve(&[3., 3.]), [1., 1.]);
+    }
+
+    #[test]
     fn determinant_rescales_extreme_pivots_without_nonfinite_loops() {
         for (a, b, expected) in [(1e307, 1e308, 615), (1e-307, 1e-308, -615)] {
             let mut m = build(2, &[(1, 1, a), (2, 2, b)]);
@@ -1746,7 +1836,8 @@ mod tests {
             assert!((mantissa * 10_f64.powi(exponent - expected) - 1.).abs() < 1e-12);
         }
         let mut m = build(1, &[(1, 1, f64::from_bits(1))]);
-        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::NonFinite);
+        assert!(!m.is_factored());
         assert!(
             m.determinant().is_err(),
             "inverse pivot overflow must be explicit"
