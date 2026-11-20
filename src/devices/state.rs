@@ -285,15 +285,9 @@ impl StateHistory {
     pub fn trial(&self) -> TrialState {
         TrialState {
             values: std::iter::repeat_n(Real::NAN, self.len).collect(),
-            phase: IterationPhase::Junction,
+            mode: LoadMode::EXACT,
             previous: None,
             nonconvergent: false,
-            device_limiting: false,
-            initial_conditions: false,
-            c_jacobian: false,
-            tolerances: None,
-            initial_transient: false,
-            uic: false,
             patches: State1Patches::default(),
         }
     }
@@ -317,16 +311,9 @@ impl StateHistory {
         }
         Ok(TrialState {
             values: std::iter::repeat_n(Real::NAN, self.len).collect(),
-            phase,
+            mode: LoadMode::newton(phase),
             previous: previous.map(|previous| Arc::clone(&previous.values)),
             nonconvergent: false,
-            device_limiting: true,
-            initial_conditions: false,
-            // NIiter factors C's DEVload matrix.
-            c_jacobian: true,
-            tolerances: None,
-            initial_transient: false,
-            uic: false,
             patches: previous
                 .map(|previous| previous.patches.clone())
                 .unwrap_or_default(),
@@ -428,15 +415,9 @@ impl StateHistory {
         }
         let TrialState {
             values,
-            phase,
+            mode,
             previous,
             nonconvergent,
-            device_limiting,
-            initial_conditions,
-            c_jacobian,
-            tolerances,
-            initial_transient,
-            uic,
             patches,
         } = trial;
         let carried = self.carried.as_deref().map(|vector| &vector[range.clone()]);
@@ -447,14 +428,8 @@ impl StateHistory {
             trial: &mut Arc::make_mut(values)[range.clone()],
             accepted,
             depth: self.accepted.len(),
-            phase: *phase,
+            mode: *mode,
             nonconvergent: Some(nonconvergent),
-            device_limiting: *device_limiting,
-            initial_conditions: *initial_conditions,
-            c_jacobian: *c_jacobian,
-            tolerances: *tolerances,
-            initial_transient: *initial_transient,
-            uic: *uic,
             offset: range.start,
             patches: Some(patches),
             delay,
@@ -484,21 +459,66 @@ pub enum IterationPhase {
     Float,
 }
 
+/// The independent C load-mode switches. Keep convergence reporting
+/// separate: it is mutable output of a load, not an input mode.
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum LoadFlag {
+    DeviceLimiting = 1 << 0,
+    InitialConditions = 1 << 1,
+    ReferenceJacobian = 1 << 2,
+    InitialTransient = 1 << 3,
+    Uic = 1 << 4,
+}
+
+/// Immutable metadata copied from the Newton trial into each device window.
+/// A new Newton load starts with fresh options; only iterate values and
+/// staged state1 patches are inherited from the preceding trial.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LoadMode {
+    phase: IterationPhase,
+    flags: u8,
+    tolerances: Option<(Real, Real)>,
+}
+
+impl LoadMode {
+    const EXACT: Self = Self {
+        phase: IterationPhase::Junction,
+        flags: 0,
+        tolerances: None,
+    };
+
+    const fn newton(phase: IterationPhase) -> Self {
+        // NIiter factors C's DEVload matrix.
+        Self {
+            phase,
+            flags: LoadFlag::DeviceLimiting as u8 | LoadFlag::ReferenceJacobian as u8,
+            tolerances: None,
+        }
+    }
+
+    const fn enabled(self, flag: LoadFlag) -> bool {
+        self.flags & flag as u8 != 0
+    }
+
+    const fn set(&mut self, flag: LoadFlag, enabled: bool) {
+        if enabled {
+            self.flags |= flag as u8;
+        } else {
+            self.flags &= !(flag as u8);
+        }
+    }
+}
+
 /// The trial state vector (C `CKTstate0`) for one load. Newton iterations
 /// share read-only snapshots of the preceding load instead of copying all
 /// its state slots; mutating a cloned trial detaches its own vector.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrialState {
     values: Arc<[Real]>,
-    phase: IterationPhase,
+    mode: LoadMode,
     previous: Option<Arc<[Real]>>,
     nonconvergent: bool,
-    device_limiting: bool,
-    initial_conditions: bool,
-    c_jacobian: bool,
-    tolerances: Option<(Real, Real)>,
-    initial_transient: bool,
-    uic: bool,
     /// `MODEINITTRAN` writes into `CKTstate1` (absolute slot, value), seen by
     /// the later loads of the same solve and applied when the trial is
     /// committed ([`DeviceState::patch_state1`]).
@@ -511,7 +531,7 @@ impl TrialState {
     /// `NIconvTest`) use; see [`DeviceState::convergence_tolerances`].
     #[must_use]
     pub const fn with_convergence_tolerances(mut self, reltol: Real, abstol: Real) -> Self {
-        self.tolerances = Some((reltol, abstol));
+        self.mode.tolerances = Some((reltol, abstol));
         self
     }
 
@@ -519,7 +539,7 @@ impl TrialState {
     /// see [`DeviceState::uic`].
     #[must_use]
     pub const fn with_uic(mut self, enabled: bool) -> Self {
-        self.uic = enabled;
+        self.mode.set(LoadFlag::Uic, enabled);
         self
     }
 
@@ -528,7 +548,7 @@ impl TrialState {
     /// [`IterationPhase::Predict`]); see [`DeviceState::initial_transient`].
     #[must_use]
     pub const fn with_initial_transient(mut self, enabled: bool) -> Self {
-        self.initial_transient = enabled;
+        self.mode.set(LoadFlag::InitialTransient, enabled);
         self
     }
 
@@ -536,14 +556,14 @@ impl TrialState {
     /// the module documentation and [`DeviceState::initial_conditions`].
     #[must_use]
     pub const fn with_initial_conditions(mut self, enabled: bool) -> Self {
-        self.initial_conditions = enabled;
+        self.mode.set(LoadFlag::InitialConditions, enabled);
         self
     }
 
     /// Whether this is the `uic` initial load.
     #[must_use]
     pub const fn initial_conditions(&self) -> bool {
-        self.initial_conditions
+        self.mode.enabled(LoadFlag::InitialConditions)
     }
 
     /// The same trial asking devices to stamp C's own `DEVload` matrix where
@@ -553,7 +573,7 @@ impl TrialState {
     /// turns it on.
     #[must_use]
     pub const fn with_c_jacobian(mut self, enabled: bool) -> Self {
-        self.c_jacobian = enabled;
+        self.mode.set(LoadFlag::ReferenceJacobian, enabled);
         self
     }
 
@@ -562,20 +582,20 @@ impl TrialState {
     /// global voltage-step damping forbid it so devices load exactly.
     #[must_use]
     pub const fn with_device_limiting(mut self, enabled: bool) -> Self {
-        self.device_limiting = enabled;
+        self.mode.set(LoadFlag::DeviceLimiting, enabled);
         self
     }
 
     /// Whether devices may limit their junction voltages in this load.
     #[must_use]
     pub const fn device_limiting(&self) -> bool {
-        self.device_limiting
+        self.mode.enabled(LoadFlag::DeviceLimiting)
     }
 
     /// The Newton phase this trial was loaded in.
     #[must_use]
     pub const fn phase(&self) -> IterationPhase {
-        self.phase
+        self.mode.phase
     }
 
     /// True when a device reported that this load changed a discrete state
@@ -605,16 +625,10 @@ pub struct DeviceState<'a> {
     trial: &'a mut [Real],
     accepted: [&'a [Real]; ACCEPTED_DEPTH],
     depth: usize,
-    phase: IterationPhase,
+    mode: LoadMode,
     previous: Option<&'a [Real]>,
     carried: Option<&'a [Real]>,
     nonconvergent: Option<&'a mut bool>,
-    device_limiting: bool,
-    initial_conditions: bool,
-    c_jacobian: bool,
-    tolerances: Option<(Real, Real)>,
-    initial_transient: bool,
-    uic: bool,
     /// This window's first absolute slot.
     offset: usize,
     patches: Option<&'a mut State1Patches>,
@@ -629,16 +643,10 @@ impl DeviceState<'_> {
             trial: &mut [],
             accepted: [&[]; ACCEPTED_DEPTH],
             depth: 0,
-            phase: IterationPhase::Junction,
+            mode: LoadMode::EXACT,
             previous: None,
             carried: None,
             nonconvergent: None,
-            device_limiting: false,
-            initial_conditions: false,
-            c_jacobian: false,
-            tolerances: None,
-            initial_transient: false,
-            uic: false,
             offset: 0,
             patches: None,
             delay: None,
@@ -646,7 +654,7 @@ impl DeviceState<'_> {
     }
 
     /// C's `MODEINITTRAN` write `*(CKTstate1 + slot) = value`: later loads of
-    /// this solve read it through [`Self::accepted`]`(1, slot)`, and it
+    /// this solve read it through [`Self::accepted`] with age 1, and it
     /// becomes part of the history when the point is accepted.
     ///
     /// # Errors
@@ -673,13 +681,13 @@ impl DeviceState<'_> {
     /// ([`TrialState::with_convergence_tolerances`]).
     #[must_use]
     pub const fn convergence_tolerances(&self) -> Option<(Real, Real)> {
-        self.tolerances
+        self.mode.tolerances
     }
 
     /// The Newton phase of this load.
     #[must_use]
     pub const fn phase(&self) -> IterationPhase {
-        self.phase
+        self.mode.phase
     }
 
     /// Whether this load belongs to a device-limited Newton solve: a
@@ -688,7 +696,7 @@ impl DeviceState<'_> {
     /// nonconvergent when it does). `false` for exact loads.
     #[must_use]
     pub const fn device_limiting(&self) -> bool {
-        self.device_limiting
+        self.mode.enabled(LoadFlag::DeviceLimiting)
     }
 
     /// Whether a [`IterationPhase::Predict`] load is `MODEINITTRAN` (the first
@@ -696,7 +704,7 @@ impl DeviceState<'_> {
     /// rather than `MODEINITPRED` (`DEVpred` extrapolation, limited).
     #[must_use]
     pub const fn initial_transient(&self) -> bool {
-        self.initial_transient
+        self.mode.enabled(LoadFlag::InitialTransient)
     }
 
     /// Whether the transient runs with `uic` (C `MODEUIC`): in the first
@@ -704,7 +712,7 @@ impl DeviceState<'_> {
     /// `ic=` values.
     #[must_use]
     pub const fn uic(&self) -> bool {
-        self.uic
+        self.mode.enabled(LoadFlag::Uic)
     }
 
     /// C `DEVpred` (`devsup.c`): `(1 + r) state1 - r state2` with
@@ -724,7 +732,7 @@ impl DeviceState<'_> {
     /// at their instance initial-condition voltages.
     #[must_use]
     pub const fn initial_conditions(&self) -> bool {
-        self.initial_conditions
+        self.mode.enabled(LoadFlag::InitialConditions)
     }
 
     /// Whether the load must stamp C's `DEVload` matrix rather than the
@@ -735,7 +743,7 @@ impl DeviceState<'_> {
     /// conductance `gx` alone).
     #[must_use]
     pub const fn c_jacobian(&self) -> bool {
-        self.c_jacobian
+        self.mode.enabled(LoadFlag::ReferenceJacobian)
     }
 
     /// The value of `slot` written by the previous load of the same Newton
@@ -836,6 +844,54 @@ impl DeviceState<'_> {
 #[cfg(test)]
 mod tests {
     use super::{ACCEPTED_DEPTH, DeviceState, IterationPhase, StateHistory};
+
+    #[test]
+    fn load_mode_defaults_and_overrides_are_shared_by_every_window() {
+        let history = StateHistory::new(2);
+        let mut exact = history.trial();
+        let window = history.device(&mut exact, 0..1).unwrap();
+        assert_eq!(window.phase(), IterationPhase::Junction);
+        assert!(!window.device_limiting());
+        assert!(!window.c_jacobian());
+        assert!(!window.initial_transient());
+        assert!(!window.initial_conditions());
+        assert!(!window.uic());
+        assert_eq!(window.convergence_tolerances(), None);
+
+        let mut trial = history
+            .trial_in(IterationPhase::Predict, Some(&exact))
+            .unwrap()
+            .with_device_limiting(false)
+            .with_c_jacobian(false)
+            .with_initial_transient(true)
+            .with_initial_conditions(true)
+            .with_uic(true)
+            .with_convergence_tolerances(1e-3, 1e-12);
+        assert_eq!(trial.phase(), IterationPhase::Predict);
+        assert!(!trial.device_limiting());
+        assert!(trial.initial_conditions());
+        for range in [0..1, 1..2] {
+            let window = history.device(&mut trial, range).unwrap();
+            assert_eq!(window.phase(), IterationPhase::Predict);
+            assert!(!window.device_limiting());
+            assert!(!window.c_jacobian());
+            assert!(window.initial_transient());
+            assert!(window.initial_conditions());
+            assert!(window.uic());
+            assert_eq!(window.convergence_tolerances(), Some((1e-3, 1e-12)));
+        }
+        let mut next = history
+            .trial_in(IterationPhase::Float, Some(&trial))
+            .unwrap();
+        let window = history.device(&mut next, 0..1).unwrap();
+        assert_eq!(window.phase(), IterationPhase::Float);
+        assert!(window.device_limiting());
+        assert!(window.c_jacobian());
+        assert!(!window.initial_transient());
+        assert!(!window.initial_conditions());
+        assert!(!window.uic());
+        assert_eq!(window.convergence_tolerances(), None);
+    }
 
     #[test]
     fn commits_rotate_and_are_bounded() {
