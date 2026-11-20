@@ -20,9 +20,8 @@
 //!
 //! so temperature, TC1/TC2, `scale` and multiplicity `m` keep acting on a swept
 //! model-backed resistor, exactly as they do on one written with that value in
-//! the deck. Nothing is mutated: [`crate::devices::Circuit`] builds a disposable
-//! [`crate::devices::Resistor`] with the effective value for the points that carry an
-//! override, and every device, model recipe and AST value is left untouched.
+//! the deck. Nothing is mutated: [`crate::devices::Circuit`] builds a disposable device retaining its original recipe with the supplied
+//! value for the points that carry an override, and every device, model recipe and AST value is left untouched.
 //!
 //! C reference: `dctrcurv.c` stores the sweep value as the instance resistance
 //! (`RESresist`, marked given) and `restemp.c::RESupdate_conduct` then applies

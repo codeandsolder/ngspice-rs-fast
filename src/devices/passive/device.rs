@@ -6,8 +6,8 @@ use crate::devices::rlc::{
     QUANTITY, REACTIVE_STATE_COUNT, ReactiveLoad, assemble_resistor, resistor_noise, stamp_resistor,
 };
 use crate::devices::{
-    Device, InductanceValue, LinearContext, ResistorMetadata, ResistorOrigin, StampContext,
-    StorageElement, StorageKind,
+    Device, InductanceValue, LinearContext, Resistor, ResistorMetadata, ResistorNoise,
+    ResistorOrigin, StampContext, StorageElement, StorageKind,
 };
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
@@ -16,7 +16,9 @@ use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
 struct ModelPassive {
     name: String,
     /// The model card's name, for C's `.noise` visiting order.
-    model: String,
+    model: Option<String>,
+    // Programmatic literal resistors may carry an independent noise recipe.
+    literal_noise: Option<Box<ResistorNoise>>,
     terminals: [NodeId; 2],
     parameters: PassiveParameters,
 }
@@ -93,7 +95,7 @@ impl Device for ModelPassive {
         super::instance_schema(self.parameters.kind)
             .parameters
             .iter()
-            .find(|d| d.name.eq_ignore_ascii_case(keyword))
+            .find(|d| d.name != "noisy" && d.name.eq_ignore_ascii_case(keyword))
             .map(|d| d.name)
     }
 
@@ -103,10 +105,16 @@ impl Device for ModelPassive {
         value: Real,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        Ok(Box::new(Self {
-            parameters: self.parameters.swept(parameter, value, context)?,
-            ..self.clone()
-        }))
+        let mut replacement = self.clone();
+        replacement.parameters = self.parameters.swept(parameter, value, context)?;
+        if let Some(noise) = replacement.literal_noise.as_deref_mut() {
+            match parameter {
+                "temp" => noise.temperature = Some(value),
+                "m" => noise.multiplicity = value,
+                _ => {}
+            }
+        }
+        Ok(Box::new(replacement))
     }
 
     /// Linear in `.disto`: C gives this device no distortion routine
@@ -181,11 +189,18 @@ impl Device for ModelPassive {
     fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
         let value = self.parameters.effective_value(context.model_context)?;
         Ok(if self.parameters.kind == PassiveKind::Resistor {
+            let derived;
+            let noise = if let Some(noise) = self.literal_noise.as_deref() {
+                noise
+            } else {
+                derived = self.parameters.resistor_noise_parameters();
+                &derived
+            };
             resistor_noise(
                 self.terminals,
                 value,
-                &self.parameters.resistor_noise_parameters(),
-                Some(&self.model),
+                noise,
+                self.model.as_deref().or(noise.model.as_deref()),
                 context,
             )
         } else {
@@ -203,7 +218,11 @@ impl Device for ModelPassive {
     }
     fn resistor_metadata(&self) -> Option<ResistorMetadata> {
         (self.parameters.kind == PassiveKind::Resistor).then(|| ResistorMetadata {
-            origin: ResistorOrigin::ModelBacked,
+            origin: if self.model.is_some() {
+                ResistorOrigin::ModelBacked
+            } else {
+                ResistorOrigin::Literal
+            },
             supplied: self.parameters.nominal_value(),
             multiplicity: self.parameters.multiplicity(),
         })
@@ -228,8 +247,8 @@ impl Device for ModelPassive {
         use crate::devices::sensitivity::{
             PassiveInputs, ReactiveKind, ReactiveSensitivity, ResistorSensitivity,
         };
-        let inputs = PassiveInputs::Modeled {
-            name: &self.model,
+        let inputs = PassiveInputs::Validated {
+            name: self.model.as_deref(),
             model: self.parameters.model_values(),
             instance: self.parameters.instance_values(),
         };
@@ -283,7 +302,8 @@ pub(in crate::devices) fn instantiate(
     ];
     let device = ModelPassive {
         name: instance.name.clone(),
-        model: model.card().name.clone(),
+        model: Some(model.card().name.clone()),
+        literal_noise: None,
         terminals,
         parameters,
     };
@@ -302,9 +322,36 @@ pub(in crate::devices) fn swept_literal(
 ) -> SpiceResult<Box<dyn Device>> {
     Ok(Box::new(ModelPassive {
         name: name.to_owned(),
-        model: String::new(),
+        model: None,
+        literal_noise: None,
         terminals,
         parameters: PassiveParameters::literal(kind, value, ic)?
+            .swept(change.0, change.1, context)?,
+    }))
+}
+
+/// A literal resistor can acquire contextual setters in a sweep without
+/// losing the noise description of the original device.
+pub(in crate::devices) fn swept_resistor(
+    resistor: &Resistor,
+    change: (&str, Real),
+    context: &ModelContext,
+) -> SpiceResult<Box<dyn Device>> {
+    let [positive, negative] = resistor.terminals() else {
+        return Err(SpiceError::circuit("invalid resistor terminals"));
+    };
+    let mut noise = resistor.noise_parameters().clone();
+    match change.0 {
+        "temp" => noise.temperature = Some(change.1),
+        "m" => noise.multiplicity = change.1,
+        _ => {}
+    }
+    Ok(Box::new(ModelPassive {
+        name: resistor.name().to_owned(),
+        model: None,
+        literal_noise: Some(Box::new(noise)),
+        terminals: [*positive, *negative],
+        parameters: PassiveParameters::literal(PassiveKind::Resistor, resistor.resistance(), None)?
             .swept(change.0, change.1, context)?,
     }))
 }

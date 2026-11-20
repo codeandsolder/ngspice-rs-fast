@@ -290,15 +290,14 @@ impl Device for Resistor {
         value: Real,
         context: &crate::devices::ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        crate::devices::passive::swept_literal(
-            &self.name,
-            self.terminals,
-            crate::devices::passive::PassiveKind::Resistor,
-            self.resistance,
-            None,
-            (parameter, value),
-            context,
-        )
+        if parameter == "resistance" {
+            validate_resistance(&self.name, value)?;
+            return Ok(Box::new(Self {
+                resistance: value,
+                ..self.clone()
+            }));
+        }
+        crate::devices::passive::swept_resistor(self, (parameter, value), context)
     }
 
     /// Linear in `.disto`: C gives this device no distortion routine

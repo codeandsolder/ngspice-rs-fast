@@ -730,8 +730,8 @@ pub(super) enum PassiveInputs<'a> {
         value: Real,
         initial_condition: Option<Real>,
     },
-    Modeled {
-        name: &'a str,
+    Validated {
+        name: Option<&'a str>,
         model: &'a crate::devices::schema::ScalarValues,
         instance: &'a crate::devices::schema::ScalarValues,
     },
@@ -741,14 +741,14 @@ impl PassiveInputs<'_> {
     const fn model_name(&self) -> Option<&str> {
         match self {
             Self::Literal { .. } => None,
-            Self::Modeled { name, .. } => Some(name),
+            Self::Validated { name, .. } => *name,
         }
     }
 
     fn model_value(&self, keyword: &str) -> Option<Real> {
         match self {
             Self::Literal { .. } => None,
-            Self::Modeled { model, .. } => written(model, keyword),
+            Self::Validated { model, .. } => written(model, keyword),
         }
     }
 
@@ -759,7 +759,7 @@ impl PassiveInputs<'_> {
                 initial_condition, ..
             } if keyword == "ic" => *initial_condition,
             Self::Literal { .. } => None,
-            Self::Modeled { instance, .. } => written(instance, keyword),
+            Self::Validated { instance, .. } => written(instance, keyword),
         }
     }
 }

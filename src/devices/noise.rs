@@ -404,9 +404,14 @@ pub fn circuit_noise(
         ));
     }
     // (family, model creation rank, instance rank, entry)
-    let mut models: Vec<(NoiseFamily, Option<String>)> = Vec::new();
+    let mut models = std::collections::BTreeMap::new();
+    let replacements = circuit.replacements(context)?;
     let mut entries: Vec<(NoiseFamily, usize, usize, InstanceNoise)> = Vec::new();
-    for (index, device) in circuit.devices().iter().enumerate() {
+    for (index, original) in circuit.devices().iter().enumerate() {
+        let device = replacements
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map_or(original.as_ref(), |(_, replacement)| replacement.as_ref());
         let rows = circuit
             .state_rows(index)
             .ok_or_else(|| SpiceError::circuit("circuit numbering is stale; finalize first"))?;
@@ -447,14 +452,8 @@ pub fn circuit_noise(
                 message: format!("nonfinite or out-of-domain generator {}", bad.suffix),
             });
         }
-        let key = (family, model);
-        let rank = models
-            .iter()
-            .position(|known| *known == key)
-            .unwrap_or_else(|| {
-                models.push(key);
-                models.len() - 1
-            });
+        let next_rank = models.len();
+        let rank = *models.entry((family, model)).or_insert(next_rank);
         entries.push((
             family,
             rank,

@@ -23,7 +23,6 @@ use petgraph::graph::UnGraph;
 
 use crate::devices::linear::Forcing;
 use crate::devices::models::ModelContext;
-use crate::devices::rlc::Resistor;
 use crate::devices::state::{StateHistory, TrialState};
 use crate::devices::sweep::{InstanceOverride, ResistorMetadata, ResistorOverride};
 use crate::devices::traits::{
@@ -1474,22 +1473,18 @@ impl Circuit {
                 .devices
                 .get(target.device())
                 .ok_or_else(|| SpiceError::circuit("stale resistor override"))?;
-            let terminals = match device.terminals() {
-                [a, b] if device.resistor_metadata().is_some() => [*a, *b],
-                _ => {
-                    return Err(SpiceError::circuit(format!(
-                        "resistor override targets {}, which is not a two-terminal resistor",
-                        device.name()
-                    )));
-                }
-            };
+            if device.terminals().len() != 2 || device.resistor_metadata().is_none() {
+                return Err(SpiceError::circuit(format!(
+                    "resistor override targets {}, which is not a two-terminal resistor",
+                    device.name()
+                )));
+            }
             if replacements.iter().any(|(i, _)| *i == target.device()) {
                 return Err(SpiceError::circuit("duplicate resistor override"));
             }
-            let effective = device.resistor_effective(target.supplied(), context)?;
             replacements.push((
                 target.device(),
-                Box::new(Resistor::new(device.name(), terminals, effective)?),
+                device.with_instance_parameter("resistance", target.supplied(), context)?,
             ));
         }
         let resistors = replacements.len();
