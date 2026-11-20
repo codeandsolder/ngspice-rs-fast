@@ -57,7 +57,9 @@ fn bsim3_model_real(p: &Parameter, value: Real, location: &SourceLoc) -> SpiceRe
 /// The module retains the native charge and junction-capacitance equations.
 pub mod charges;
 pub mod dc;
-/// Model-only setup defaults and diagnostics, before geometry/temperature setup.
+/// Model-only setup defaults.
+///
+/// Diagnostics precede geometry and temperature setup.
 pub mod defaults;
 mod defaults_data;
 /// The device: `b3ld.c`'s DC load wired into the solver.
@@ -66,7 +68,9 @@ pub mod device;
 pub mod noise;
 /// Generated `IFparm` order, identifiers and setter/given-field mappings.
 pub mod parameters;
-/// Effective geometry, size-dependent parameters and `b3check.c` diagnostics.
+/// Effective geometry and size-dependent parameters.
+///
+/// Includes `b3check.c` diagnostics.
 ///
 /// The module validates setup without allocating state or matrix rows.
 pub mod setup;
