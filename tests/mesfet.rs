@@ -840,3 +840,69 @@ fn the_sensitivity_table_is_mes_cs_parameter_list() {
     }
     assert!(names.contains(&"v(z1_area)"), "{names:?}");
 }
+
+#[test]
+fn ac_conductance_and_capacitance_stamps_preserve_c_grouping() {
+    let context = ModelContext::default();
+    for family in ["nmf", "pmf"] {
+        let pol = if family == "nmf" { 1. } else { -1. };
+        for vd in [2.37, -0.47] {
+            let make = |m| {
+                circuit(&format!(
+                    "z1 d g s zm area=1.37 m={m}\n\
+                     .model zm {family}(vto=-1.8 beta=2.3m lambda=0.027 alpha=2.7 b=0.41\n\
+                     + rd=43 rs=37 is=1.1e-14 cgs=2.3p cgd=0.61p pb=0.83)"
+                ))
+                .unwrap()
+            };
+            let systems = [1., 1.7].map(|literal| {
+                let c = make(literal);
+                let row = |name| c.unknowns().node_row(c.nodes().get(name).unwrap()).unwrap();
+                let n = c.unknown_count();
+                let mut bias = Vector::zeros(n);
+                for (name, voltage) in [
+                    ("d", vd + 0.12),
+                    ("g", -0.51),
+                    ("s", -0.08),
+                    ("z1#drain", vd),
+                    ("z1#source", 0.),
+                ] {
+                    bias.as_mut_slice()[row(name)] = pol * voltage;
+                }
+                let system = c.small_signal_system(&context, &bias).unwrap();
+                // MESask does not expose M; use the same SPICE reader.
+                let m = ngspice_rs::primitives::parse_spice_number(&literal.to_string()).unwrap();
+                // C adds the two omega-scaled gate capacitances first, then
+                // multiplies by M. Preserve the group, not just its real E sum.
+                let gate = row("g");
+                let group = system
+                    .e_groups
+                    .iter()
+                    .find(|group| {
+                        let t = &system.e.triplets()[group.range.start];
+                        (t.row, t.col) == (gate, gate)
+                    })
+                    .expect("one C gate diagonal statement");
+                assert_eq!(group.terms.len(), 2);
+                assert_eq!(group.scale.to_bits(), m.to_bits());
+                assert!(!group.prescaled);
+                let terms = group.terms.clone();
+                (system, m, terms)
+            });
+            let [(unit, _, terms), (scaled, m, scaled_terms)] = systems;
+            assert_eq!(
+                terms.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                scaled_terms.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            for r in 0..unit.a.rows() {
+                for c in 0..unit.a.cols() {
+                    assert_eq!(
+                        (m * entry(&unit.a, r, c)).to_bits(),
+                        entry(&scaled.a, r, c).to_bits(),
+                        "{family}, VDS={vd}, matrix ({r},{c})"
+                    );
+                }
+            }
+        }
+    }
+}

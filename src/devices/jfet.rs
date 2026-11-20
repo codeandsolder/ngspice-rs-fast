@@ -1149,25 +1149,26 @@ pub(super) fn finish_load(
     context.stamp_rhs(g, m * (-ceqgs - ceqgd))?;
     context.stamp_rhs(dp, m * (-cdreq + ceqgd))?;
     context.stamp_rhs(sp, m * (cdreq + ceqgs))?;
-    for (row, col, value) in [
-        (d, dp, -gdpr),
-        (g, dp, -ggd),
-        (g, sp, -ggs),
-        (s, sp, -gspr),
-        (dp, d, -gdpr),
-        (dp, g, gm - ggd),
-        (dp, sp, -gds - gm),
-        (sp, g, -ggs - gm),
-        (sp, s, -gspr),
-        (sp, dp, -gds),
-        (d, d, gdpr),
-        (g, g, ggd + ggs),
-        (s, s, gspr),
-        (dp, dp, gdpr + gds + ggd),
-        (sp, sp, gspr + gds + gm + ggs),
-    ] {
-        context.stamp(row, col, m * value)?;
-    }
+    context.stamp_fixed(
+        [
+            (d, dp, -gdpr),
+            (g, dp, -ggd),
+            (g, sp, -ggs),
+            (s, sp, -gspr),
+            (dp, d, -gdpr),
+            (dp, g, gm - ggd),
+            (dp, sp, -gds - gm),
+            (sp, g, -ggs - gm),
+            (sp, s, -gspr),
+            (sp, dp, -gds),
+            (d, d, gdpr),
+            (g, g, ggd + ggs),
+            (s, s, gspr),
+            (dp, dp, gdpr + gds + ggd),
+            (sp, sp, gspr + gds + gm + ggs),
+        ]
+        .map(|(r, c, value)| (r, c, m * value)),
+    )?;
     Ok(())
 }
 
@@ -1255,11 +1256,6 @@ pub(super) fn start_conditions(
 pub(super) fn series_conductances(area: Real, rd: Real, rs: Real) -> [Real; 2] {
     let conductance = |r: Real| if r == 0. { 0. } else { (1. / r) * area };
     [conductance(rd), conductance(rs)]
-}
-
-/// The d-d' and s-s' ports of the series resistances.
-pub(super) const fn series_ports(terminals: &[NodeId], inner: [NodeId; 3]) -> [[NodeId; 2]; 2] {
-    [[terminals[0], inner[0]], [terminals[2], inner[2]]]
 }
 
 /// `jfetask.c`/`jfet2ask.c` scalar asks: `area` (C reports `area * m`),

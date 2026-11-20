@@ -77,10 +77,6 @@
     reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
 )]
 #![expect(
-    clippy::many_single_char_names,
-    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
     clippy::suboptimal_flops,
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
@@ -798,37 +794,15 @@ impl Device for Mesfet {
         let point = self.point(&op, vgs, vgd, context.model_context.gmin)?;
         let (_, capgs, capgd) = self.charge(&op, vgs, vgd)?;
         let m = self.instance.m;
-        for (ports, conductance) in jfet::series_ports(&self.terminals, self.inner)
-            .into_iter()
-            .zip(jfet::series_conductances(
-                self.instance.area,
-                self.model.rd,
-                self.model.rs,
-            ))
-        {
-            if conductance > 0. {
-                context.nodal(ports, m * conductance, false)?;
-            }
-        }
-        let [d, g, s] = self.inner;
-        let c = point.channel;
-        for (row, sign) in [(d, 1.), (s, -1.)] {
-            for (col, derivative) in self.inner.iter().zip([c.gds, c.gm, -c.gds - c.gm]) {
-                if let (Some(r), Some(col)) = (
-                    context.unknowns.node_row(row),
-                    context.unknowns.node_row(*col),
-                ) {
-                    context.system.a.add(r, col, sign * m * derivative)?;
-                }
-            }
-        }
-        for (ports, conductance, capacitance) in
-            [([g, s], point.gs.1, capgs), ([g, d], point.gd.1, capgd)]
-        {
-            context.nodal(ports, m * conductance, false)?;
-            context.nodal(ports, m * capacitance, true)?;
-        }
-        Ok(())
+        jfet::ac_gate_capacitances(context, self.inner, m, capgs, capgd)?;
+        jfet::ac_conductances(
+            context,
+            &self.terminals,
+            self.inner,
+            m,
+            jfet::series_conductances(self.instance.area, self.model.rd, self.model.rs),
+            [point.channel.gm, point.channel.gds, point.gs.1, point.gd.1],
+        )
     }
     /// `mespzld.c` is the AC load with `s` for `j omega` (see the module
     /// docs for its multiplicity slip).
