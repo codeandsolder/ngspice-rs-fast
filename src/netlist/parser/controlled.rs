@@ -55,10 +55,14 @@ const NONLINEAR_REFERENCE: &str =
     "src/frontend/inpcom.c (inp_compat); src/xspice/icm/xtradev (s_xfer, LAPLACE)";
 
 pub(super) fn controlled_card(input: &mut Input<'_>) -> Result<ParsedCard> {
-    let instance = any
-        .verify(|token: &Token| token.is_name_like() && controlled_designator(token).is_some())
+    let (instance, designator) = any
+        .verify_map(|token: &Token| {
+            if !token.is_name_like() {
+                return None;
+            }
+            controlled_designator(token).map(|designator| (token, designator))
+        })
         .parse_next(input)?;
-    let designator = controlled_designator(instance).expect("verified designator");
     // The designator matched: every failure below is definitive.
     cut_err(move |input: &mut Input<'_>| body(input, instance, designator)).parse_next(input)
 }

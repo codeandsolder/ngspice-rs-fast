@@ -269,27 +269,18 @@ fn binary(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
 
 type InfixOp<'a> = Infix<In<'a>, Expr, ErrMode<Fail>>;
 
-fn fold_mul(_: &mut In<'_>, lhs: Expr, rhs: Expr) -> Res<Expr> {
-    Ok(binary(BinaryOp::Mul, lhs, rhs))
-}
-
-fn fold_div(_: &mut In<'_>, lhs: Expr, rhs: Expr) -> Res<Expr> {
-    Ok(binary(BinaryOp::Div, lhs, rhs))
-}
-
-fn fold_pow(_: &mut In<'_>, lhs: Expr, rhs: Expr) -> Res<Expr> {
-    Ok(binary(BinaryOp::Pow, lhs, rhs))
-}
-
 /// Binding powers: `^`/`**` (30) over `*` `/` (20), all left associative as in
 /// C's accumulator machine (`xpressn.c` levels 2 and 3).
 fn multiplicative<'a>(input: &mut In<'a>) -> Res<InfixOp<'a>> {
     ws.parse_next(input)?;
+    let power = Infix::Left(30, |_, lhs, rhs| Ok(binary(BinaryOp::Pow, lhs, rhs)));
+    let multiply = Infix::Left(20, |_, lhs, rhs| Ok(binary(BinaryOp::Mul, lhs, rhs)));
+    let divide = Infix::Left(20, |_, lhs, rhs| Ok(binary(BinaryOp::Div, lhs, rhs)));
     alt((
-        literal("**").value(Infix::Left(30, fold_pow as _)),
-        literal("^").value(Infix::Left(30, fold_pow as _)),
-        literal("*").value(Infix::Left(20, fold_mul as _)),
-        literal("/").value(Infix::Left(20, fold_div as _)),
+        literal("**").value(power.clone()),
+        literal("^").value(power),
+        literal("*").value(multiply),
+        literal("/").value(divide),
     ))
     .parse_next(input)
 }
