@@ -394,6 +394,17 @@ impl Device for Resistor {
     }
 }
 
+/// The four real nodal stamps in the existing load order. Their positions
+/// never change for this two-terminal element, so a bound matrix can reuse
+/// the verified batch instead of repeating per-node/element lookup.
+fn stamp_nodal(
+    context: &mut StampContext<'_>,
+    [p, n]: [NodeId; 2],
+    value: Real,
+) -> SpiceResult<()> {
+    context.stamp_fixed([(p, p, value), (p, n, -value), (n, p, -value), (n, n, value)])
+}
+
 pub(super) fn stamp_resistor(
     terminals: [NodeId; 2],
     resistance: Real,
@@ -402,12 +413,7 @@ pub(super) fn stamp_resistor(
     if context.mode.is_ac() {
         return Err(SpiceError::circuit("use complex equation assembly for AC"));
     }
-    crate::devices::linear::nodal_stamp(
-        context.matrix,
-        context.unknowns,
-        terminals,
-        1.0 / resistance,
-    )
+    stamp_nodal(context, terminals, 1.0 / resistance)
 }
 pub(super) fn assemble_resistor(
     terminals: [NodeId; 2],
@@ -527,12 +533,7 @@ impl ReactiveLoad<'_> {
             charge
         };
         let companion = self.companion(context, coefficients, charge, initial)?;
-        crate::devices::linear::nodal_stamp(
-            context.matrix,
-            context.unknowns,
-            self.terminals,
-            companion.conductance,
-        )?;
+        stamp_nodal(context, self.terminals, companion.conductance)?;
         context.stamp_rhs(positive, -companion.current)?;
         context.stamp_rhs(negative, companion.current)
     }

@@ -469,6 +469,87 @@ fn model_backed_capacitors_and_inductors_own_companion_state() {
     close(matrix.get(1, 1), -1e-3 / 1e-6);
 }
 
+/// Repeated bound loads (including a verified fixed-stamp replay) must
+/// match unbound stamping bit-for-bit with ground and aliased terminals.
+#[test]
+fn fixed_passive_batches_match_unbound_stamps() {
+    use ngspice_rs::devices::LoadRequest;
+    use ngspice_rs::maths::integrator::DEFAULT_XMU;
+    use ngspice_rs::maths::{IntegrationMethod, StepHistory};
+
+    let netlist = deck(
+        "r1 a b rm\nr2 0 b 4\nr3 a a 2\nc1 a b cm\nc2 a a 0.125\nc3 0 b 0.25\nl1 a 0 0.25\n.model rm r(r=8 tc1=0.01)\n.model cm c(cap=0.5)",
+    );
+    let circuit = Circuit::from_netlist(&netlist).unwrap();
+    let n = circuit.unknown_count();
+    let solution = Vector::from_slice(&[2., -1., 0.5]);
+    assert_eq!(n, solution.len());
+    let mut history = circuit.state_history();
+    let model = ModelContext::default();
+    let mut initial = history.trial();
+    circuit
+        .load(
+            &LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &solution,
+                model_context: &model,
+                integration: None,
+                history: &history,
+                forcing: None,
+            },
+            &mut circuit.new_matrix(),
+            &mut Vector::zeros(n),
+            &mut initial,
+        )
+        .unwrap();
+    circuit
+        .accept_point(&solution, None, &mut history, initial)
+        .unwrap();
+    let coefficients = StepHistory::new()
+        .trial(IntegrationMethod::Trapezoidal, 1, 0.125, DEFAULT_XMU)
+        .unwrap();
+    for temperature in [27., 77., 77., 27., 77.] {
+        let model = ModelContext::new(temperature, 27.);
+        let request = LoadRequest {
+            mode: AnalysisMode::Transient {
+                time: 0.125,
+                dt: 0.125,
+            },
+            solution: &solution,
+            model_context: &model,
+            integration: Some(&coefficients),
+            history: &history,
+            forcing: None,
+        };
+        let mut reference = SparseMatrix::new(n, n);
+        let mut bound = circuit.new_matrix();
+        let (mut ra, mut rb) = (Vector::zeros(n), Vector::zeros(n));
+        let (mut ta, mut tb) = (history.trial(), history.trial());
+        circuit
+            .load(&request, &mut reference, &mut ra, &mut ta)
+            .unwrap();
+        circuit
+            .load(&request, &mut bound, &mut rb, &mut tb)
+            .unwrap();
+        for row in 0..n {
+            for col in 0..n {
+                assert_eq!(
+                    reference.get(row, col).to_bits(),
+                    bound.get(row, col).to_bits(),
+                    "{row},{col}"
+                );
+            }
+            assert_eq!(
+                ra.get(row).unwrap().to_bits(),
+                rb.get(row).unwrap().to_bits()
+            );
+        }
+        for (a, b) in ta.values().iter().zip(tb.values()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+}
+
 #[test]
 fn modeled_noise_uses_the_same_resistor_kernel_and_model_identity() {
     use ngspice_rs::devices::noise::{DeviceNoise, NoiseContext};

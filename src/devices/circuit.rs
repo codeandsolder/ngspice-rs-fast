@@ -276,6 +276,11 @@ impl Circuit {
     /// `res` node; the other setups make internal nodes first. State slots are
     /// numbered in device order, in a separate namespace.
     pub fn rebuild_unknowns(&mut self) {
+        let order = self.setup_order();
+        self.rebuild_unknowns_in_order(&order);
+    }
+
+    fn rebuild_unknowns_in_order(&mut self, order: &[usize]) {
         self.unknown_names.get_mut().take();
         self.fixed_stamps.get_mut().forget();
         let owned: BTreeSet<NodeId> = self.internal_nodes.iter().flatten().copied().collect();
@@ -299,7 +304,7 @@ impl Circuit {
             circuit.unknowns.add_rows(count);
             circuit.branch_rows[index] = start..start + count;
         };
-        for index in self.setup_order() {
+        for &index in order {
             let kind = self.devices[index].c_device_type();
             // vsrcset.c, ccvsset.c and asrcset.c make their own branch before
             // anything else; the other setups make internal nodes first.
@@ -425,13 +430,27 @@ impl Circuit {
     /// system that is not positive semidefinite.
     pub fn mutual_terms(&self, context: &ModelContext) -> SpiceResult<Vec<Vec<MutualTerm>>> {
         self.check_numbering()?;
+        let replacements = if self.mutual.pairs.is_empty() {
+            Vec::new()
+        } else {
+            self.replacements(context)?
+        };
+        self.mutual_terms_with_replacements(context, &replacements)
+    }
+
+    /// The same load's already prepared overrides are also the source of
+    /// coupling values; do not rebuild their contextual devices a second time.
+    fn mutual_terms_with_replacements(
+        &self,
+        context: &ModelContext,
+        replacements: &[(usize, Box<dyn Device>)],
+    ) -> SpiceResult<Vec<Vec<MutualTerm>>> {
         if let Some(error) = &self.mutual.error {
             return Err(error.clone());
         }
         if self.mutual.pairs.is_empty() {
             return Ok(Vec::new());
         }
-        let replacements = self.replacements(context)?;
         let device_at = |index: usize| -> &dyn Device {
             replacements
                 .iter()
@@ -678,7 +697,8 @@ impl Circuit {
             }
         }
         self.topology()?;
-        self.rebuild_unknowns();
+        let order = self.setup_order();
+        self.rebuild_unknowns_in_order(&order);
         for index in 0..self.devices.len() {
             self.controls(index)?;
         }
@@ -686,18 +706,18 @@ impl Circuit {
             return Err(error.clone());
         }
         self.check_port_numbering()?;
-        self.allocate_matrix()
+        self.allocate_matrix(order)
     }
 
     /// Device ordinals in C's `CKTsetup`/`CKTload` order.
     fn setup_order(&self) -> Vec<usize> {
-        let keys: Vec<crate::devices::setup::SetupKey> = self
+        let keys: Vec<crate::devices::setup::SetupKey<'_>> = self
             .devices
             .iter()
             .enumerate()
             .map(|(index, device)| crate::devices::setup::SetupKey {
                 device_type: device.c_device_type(),
-                model: self.models.get(index).cloned().flatten(),
+                model: self.models.get(index).and_then(Option::as_deref),
                 generated_by: self.generated_by.get(index).copied().flatten(),
             })
             .collect();
@@ -758,8 +778,7 @@ impl Circuit {
     /// they declare, in that order. A pattern that already starts with the
     /// same elements is kept, so its pivot order survives re-finalization
     /// (C sets a circuit up once).
-    fn allocate_matrix(&mut self) -> SpiceResult<()> {
-        let order = self.setup_order();
+    fn allocate_matrix(&mut self, order: Vec<usize>) -> SpiceResult<()> {
         let elements = self.ordered_elements(&order, 0)?;
         self.order = order;
         let n = self.unknown_count();
@@ -881,12 +900,15 @@ impl Circuit {
     }
 
     /// Device ordinals in `CKTload` order (card order before `finalize`).
-    pub(crate) fn load_order(&self) -> Vec<usize> {
-        if self.order.len() == self.devices.len() {
-            self.order.clone()
+    pub(crate) fn load_order(&self) -> impl Iterator<Item = usize> + '_ {
+        let finalized = self.order.len() == self.devices.len();
+        let order = if finalized {
+            self.order.as_slice()
         } else {
-            (0..self.devices.len()).collect()
-        }
+            &[]
+        };
+        let fallback = if finalized { 0 } else { self.devices.len() };
+        order.iter().copied().chain(0..fallback)
     }
 
     /// `vsrctemp.c` (`VSRCtemp`, run before every analysis): the RF port
@@ -1167,7 +1189,8 @@ impl Circuit {
     }
 
     fn check_numbering(&self) -> SpiceResult<()> {
-        if self.branch_rows.len() != self.devices.len()
+        if !self.unknowns.covers_nodes(&self.nodes)
+            || self.branch_rows.len() != self.devices.len()
             || self.state_rows.len() != self.devices.len()
             || self.control_rows.len() != self.devices.len()
         {
@@ -1548,7 +1571,7 @@ impl Circuit {
         matrix.set_pivot_tolerances(request.model_context.pivot);
         matrix.set_unknown_names(Some(self.unknown_names()));
         let replacements = self.replacements(request.model_context)?;
-        let mutual = self.mutual_terms(request.model_context)?;
+        let mutual = self.mutual_terms_with_replacements(request.model_context, &replacements)?;
         let mut voltage_source_value = 0.;
         let unlent = matrix.lend_fixed(self.fixed_stamps.take(), self.devices.len());
         let stamped = self.stamp_devices(
@@ -1583,7 +1606,7 @@ impl Circuit {
         mutual: &[Vec<MutualTerm>],
         voltage_source_value: &mut Real,
     ) -> SpiceResult<()> {
-        for (position, index) in self.load_order().into_iter().enumerate() {
+        for (position, index) in self.load_order().enumerate() {
             let device: &dyn Device = match replacements.iter().find(|(i, _)| *i == index) {
                 Some((_, replacement)) => &**replacement,
                 None => &*self.devices[index],
@@ -1961,7 +1984,7 @@ impl Circuit {
         ))?;
         self.finalize()?;
         let replacements = self.replacements(context)?;
-        let mutual = self.mutual_terms(context)?;
+        let mutual = self.mutual_terms_with_replacements(context, &replacements)?;
         let mut system = crate::devices::linear::LinearSystem::new(self.unknown_count());
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
@@ -2135,7 +2158,7 @@ impl Circuit {
             ));
         }
         let replacements = self.replacements(context)?;
-        let mutual = self.mutual_terms(context)?;
+        let mutual = self.mutual_terms_with_replacements(context, &replacements)?;
         let mut system = crate::devices::linear::LinearSystem::new(self.unknown_count());
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));

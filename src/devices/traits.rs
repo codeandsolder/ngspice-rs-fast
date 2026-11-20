@@ -268,6 +268,12 @@ impl MnaUnknowns {
         Some(first)
     }
 
+    /// Whether every node slot in the table has been numbered (including
+    /// the eliminated ground slot).
+    pub(super) fn covers_nodes(&self, nodes: &NodeTable) -> bool {
+        self.node_rows.len() == nodes.len()
+    }
+
     /// Number of unknowns, i.e. the size of the MNA system.
     #[must_use]
     pub const fn len(&self) -> usize {
