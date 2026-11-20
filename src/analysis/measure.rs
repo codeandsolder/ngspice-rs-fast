@@ -424,11 +424,15 @@ impl Window {
             .then_some(self.from)
             .into_iter()
             .map(move |x| clipped_boundary(axis, operand, first - 1, first, x));
-        let interior = (first..=last).map(move |index| {
-            operand
-                .value(index)
-                .map(|value| (axis.values[index], value))
-        });
+        let interior =
+            axis.values[first..=last]
+                .iter()
+                .enumerate()
+                .map(move |(offset, &axis_value)| {
+                    operand
+                        .value(first + offset)
+                        .map(|value| (axis_value, value))
+                });
         let after = (axis.values[last] < self.to)
             .then_some(self.to)
             .into_iter()
