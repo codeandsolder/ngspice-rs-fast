@@ -78,7 +78,9 @@ mod size_data;
 /// Model-level temperature processing from `b3temp.c`.
 pub mod temperature;
 
-/// Select the BSIM3 version, using the first `VERSION` token.
+/// Select the BSIM3 version.
+///
+/// Selection uses the first `VERSION` token.
 ///
 /// Directory selection follows `inpdomod.c`/`INPfindVer`. The eventual
 /// string setter uses last-set precedence.
