@@ -244,7 +244,7 @@ pub(super) fn previous_values<const N: usize>(
     Some(values)
 }
 
-/// Predictor values retain DEVpred's arithmetic and missing-history
+/// Predictor values retain `DEVpred`'s arithmetic and missing-history
 /// behavior, while families choose their own fallback.
 pub(super) fn predicted_values<const N: usize>(
     states: &DeviceState<'_>,
@@ -333,7 +333,7 @@ impl Limiter {
 
     /// The mode chosen by [`Self::new`].
     #[must_use]
-    pub const fn mode(&self) -> Linearization {
+    pub const fn mode(self) -> Linearization {
         self.mode
     }
 
@@ -342,7 +342,7 @@ impl Limiter {
     /// [`IterationPhase::Predict`] the latest accepted value. `None` (no
     /// limiting) without such a value or outside [`Linearization::Limited`].
     #[must_use]
-    pub fn previous(&self, states: &DeviceState<'_>, slot: usize) -> Option<Real> {
+    pub fn previous(self, states: &DeviceState<'_>, slot: usize) -> Option<Real> {
         if self.mode != Linearization::Limited {
             return None;
         }
@@ -366,24 +366,9 @@ impl Limiter {
         limited.value
     }
 
-    /// `DEVfetlim` of a gate voltage `raw` against `previous` and threshold
-    /// `von`. As in C, this does not make the load nonconvergent; the
-    /// device's convergence test catches a limited step.
-    #[must_use]
-    pub fn fet_gate(&self, raw: Real, previous: Real, von: Real) -> Real {
-        fetlim(raw, previous, von)
-    }
-
-    /// `DEVlimvds` of a drain-source voltage `raw` against `previous` (not
-    /// itself nonconvergent, as in C).
-    #[must_use]
-    pub fn drain_source(&self, raw: Real, previous: Real) -> Real {
-        limvds(raw, previous)
-    }
-
     /// Whether the load is nonconvergent so far.
     #[must_use]
-    pub const fn is_nonconvergent(&self) -> bool {
+    pub const fn is_nonconvergent(self) -> bool {
         self.nonconvergent
     }
 
