@@ -1209,9 +1209,9 @@ impl<L: MosLevel> Mosfet<L> {
         ic: [Real; 3],
         xfact: Real,
     ) -> ([Real; 3], Start, bool) {
+        use limiting::Linearization;
         let pol = self.model.common().pol;
         let off = self.initial.off;
-        use limiting::Linearization;
         match Linearization::classify(states) {
             Linearization::InitialConditions => {
                 let v = if off { [0.; 3] } else { ic.map(|v| pol * v) };
@@ -1467,15 +1467,15 @@ impl<L: MosLevel> Device for Mosfet<L> {
         value: Real,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
+        use crate::devices::sweep::check_swept;
         let mut initial = self.initial.clone();
         if let Some(index) = ["icvds", "icvgs", "icvbs"]
             .iter()
             .position(|k| *k == parameter)
         {
-            crate::devices::sweep::check_swept(&self.name, parameter, value, true, "finite")?;
+            check_swept(&self.name, parameter, value, true, "finite")?;
             initial.values[index] = Some(value);
         }
-        use crate::devices::sweep::check_swept;
         let mut geometry = self.geometry;
         let check = |ok: bool, what: &str| check_swept(&self.name, parameter, value, ok, what);
         match parameter {
