@@ -84,7 +84,7 @@ enum Stepping {
 }
 
 impl Stepping {
-    fn parse(text: &str) -> Option<Self> {
+    const fn parse(text: &str) -> Option<Self> {
         if text.eq_ignore_ascii_case("dec") {
             Some(Self::Decade)
         } else if text.eq_ignore_ascii_case("oct") {
@@ -119,7 +119,7 @@ struct NoiseCard {
     negative: NodeId,
     input: String,
     stepping: Stepping,
-    steps: usize,
+    steps: u32,
     start: Real,
     stop: Real,
     summary: usize,
@@ -212,7 +212,11 @@ pub fn plot_count(arguments: &[String]) -> usize {
         return 2;
     }
     let (_, stop) = stepping.normalize(steps, start, stop);
-    if start == stop { 1 } else { 2 }
+    if start.to_bits() == stop.to_bits() {
+        1
+    } else {
+        2
+    }
 }
 
 fn parse(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<NoiseCard> {
@@ -283,6 +287,7 @@ fn parse(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<NoiseCard>
             ".noise point count is limited to {MAX_POINTS}"
         )));
     }
+    let steps = u32::try_from(steps).map_err(|_| unsupported(".noise point count"))?;
     Ok(NoiseCard {
         positive,
         negative,
@@ -297,10 +302,10 @@ fn parse(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<NoiseCard>
 
 /// `ninteg.c`'s per-step frequency data.
 struct Step {
-    del_freq: Real,
-    ln_freq: Real,
-    ln_last_freq: Real,
-    del_ln_freq: Real,
+    width: Real,
+    log_end: Real,
+    log_start: Real,
+    log_width: Real,
 }
 
 /// C's `limexp`.
@@ -315,17 +320,17 @@ fn limexp(x: Real) -> Real {
 /// `Nintegrate`: the integral of `a f^k` between the previous and the present
 /// frequency, given the density and its logarithm at both ends.
 fn nintegrate(density: Real, ln_density: Real, ln_last_density: Real, step: &Step) -> Real {
-    let mut exponent = (ln_density - ln_last_density) / step.del_ln_freq;
+    let mut exponent = (ln_density - ln_last_density) / step.log_width;
     if exponent.abs() < N_INTFTHRESH {
-        density * step.del_freq
+        density * step.width
     } else {
-        let a = limexp(ln_density - exponent * step.ln_freq);
+        let log_frequency_power = exponent * step.log_end;
+        let a = limexp(ln_density - log_frequency_power);
         exponent += 1.;
         if exponent.abs() < N_INTUSELOG {
-            a * (step.ln_freq - step.ln_last_freq)
+            a * (step.log_end - step.log_start)
         } else {
-            a * ((limexp(exponent * step.ln_freq) - limexp(exponent * step.ln_last_freq))
-                / exponent)
+            a * ((limexp(exponent * step.log_end) - limexp(exponent * step.log_start)) / exponent)
         }
     }
 }
@@ -339,7 +344,7 @@ enum Representation {
 }
 
 impl Representation {
-    fn from_squared(squared: bool) -> Self {
+    const fn from_squared(squared: bool) -> Self {
         if squared {
             Self::Power
         } else {
@@ -438,19 +443,19 @@ struct NoiseSample {
 
 impl NoiseSample {
     fn new(frequency: Real, previous: Real, gain_sq_inv: Real, start: Real, summary: bool) -> Self {
-        let ln_freq = frequency.max(N_MINLOG).ln();
-        let ln_last_freq = previous.max(N_MINLOG).ln();
+        let log_end = frequency.max(N_MINLOG).ln();
+        let log_start = previous.max(N_MINLOG).ln();
         Self {
             frequency,
             step: Step {
-                del_freq: frequency - previous,
-                ln_freq,
-                ln_last_freq,
-                del_ln_freq: ln_freq - ln_last_freq,
+                width: frequency - previous,
+                log_end,
+                log_start,
+                log_width: log_end - log_start,
             },
             gain_sq_inv,
             ln_gain_inv: gain_sq_inv.ln(),
-            reset: frequency == start,
+            reset: frequency.to_bits() == start.to_bits(),
             summary,
         }
     }
@@ -467,7 +472,7 @@ struct History {
 impl History {
     fn advance(&mut self, density: Real, sample: &NoiseSample) -> Power {
         let ln_density = density.max(N_MINLOG).ln();
-        if sample.step.del_freq == 0. {
+        if sample.step.width == 0. {
             self.ln_last = ln_density;
             if sample.reset {
                 self.integrated = Power::default();
@@ -544,7 +549,7 @@ impl Generators {
     ) -> Real {
         let mut density_sum = 0.;
         if sample.reset
-            && sample.step.del_freq == 0.
+            && sample.step.width == 0.
             && let Some(total) = &mut self.total
         {
             *total = Power::default();
@@ -553,7 +558,7 @@ impl Generators {
             let density = source.output_density(&difference, sample.frequency);
             density_sum += density;
             let contribution = history.advance(density, sample);
-            if sample.step.del_freq != 0. {
+            if sample.step.width != 0. {
                 integrated.add(contribution);
                 if sample.summary
                     && let Some(total) = &mut self.total
@@ -620,7 +625,9 @@ fn plot_names(
 /// The squared magnitude of `y[n1] - y[n2]`, ground being zero.
 fn gain(circuit: &Circuit, y: &[Complex], nodes: [NodeId; 2]) -> Real {
     let difference = difference(circuit, y, nodes);
-    difference.re * difference.re + difference.im * difference.im
+    let real_power = difference.re * difference.re;
+    let imaginary_power = difference.im * difference.im;
+    real_power + imaginary_power
 }
 
 /// `y[n1] - y[n2]`, ground reading zero (C's `CKTrhs`/`CKTirhs`
@@ -650,6 +657,73 @@ fn input_rhs(system: &LinearSystem, input: &str) -> SpiceResult<Vec<Complex>> {
     Ok(rhs)
 }
 
+/// Resolve the independent input and validate its AC excitation.
+fn input_kind(circuit: &Circuit, name: &str) -> SpiceResult<SourceKind> {
+    let input = circuit
+        .device(name)
+        .ok_or_else(|| unsupported(format!(".noise input source {name} is not in the circuit")))?
+        .input_source()
+        .ok_or_else(|| {
+            unsupported(format!(
+                ".noise input {name} is not an independent voltage or current source"
+            ))
+        })?;
+    if !input.ac_given {
+        return Err(unsupported(format!(
+            ".noise input source {name} has no AC value (noisean.c E_NOACINPUT)"
+        )));
+    }
+    Ok(input.kind)
+}
+
+/// C's frequency grid, with exactly representable bounded point counts.
+fn frequency_grid(card: &NoiseCard, reltol: Real) -> SpiceResult<FrequencyGrid> {
+    let delta = match card.stepping {
+        Stepping::Decade => (10f64.ln() / Real::from(card.steps)).exp(),
+        Stepping::Octave => (2f64.ln() / Real::from(card.steps)).exp(),
+        Stepping::Linear if card.steps == 1 => 0.,
+        Stepping::Linear => (card.stop - card.start) / Real::from(card.steps - 1),
+    };
+    let tolerance = match card.stepping {
+        Stepping::Decade | Stepping::Octave => delta * card.stop * reltol,
+        Stepping::Linear => delta * reltol,
+    };
+    let advance = match card.stepping {
+        Stepping::Decade | Stepping::Octave => Advance::Multiply(delta),
+        Stepping::Linear if card.steps == 1 => Advance::Single,
+        Stepping::Linear => Advance::Add(delta),
+    };
+    FrequencyGrid::new(card.start, card.stop, tolerance, advance, ".noise")
+}
+
+fn integrated_plot(
+    representation: Representation,
+    integrated_variables: Vec<Variable>,
+    generators: &[Generators],
+    summary: bool,
+    integrated_power: Power,
+) -> SpiceResult<Plot> {
+    let mut integrated = Plot::new("noise2", representation.plotname(false), PlotFlags::Real);
+    let mut values = NoiseRow::new(representation, integrated_variables.len());
+    for variable in integrated_variables {
+        integrated.push_variable(variable);
+    }
+    if summary {
+        for g in generators {
+            g.append_integrated(&mut values);
+        }
+    }
+    integrated_power.append(&mut values);
+    integrated.push_point(values.values)?;
+    if !integrated.is_finite() {
+        return Err(SpiceError::Numerical {
+            context: ".noise".into(),
+            message: "nonfinite integrated noise".into(),
+        });
+    }
+    Ok(integrated)
+}
+
 /// Runs `.noise` and returns its plots: the spectrum and, unless the sweep is
 /// a single frequency, the integrated noise.
 pub(crate) fn run(
@@ -665,27 +739,7 @@ pub(crate) fn run(
     };
     circuit.finalize()?;
     let card = parse(circuit, request)?;
-    let input = circuit
-        .device(&card.input)
-        .ok_or_else(|| {
-            unsupported(format!(
-                ".noise input source {} is not in the circuit",
-                card.input
-            ))
-        })?
-        .input_source()
-        .ok_or_else(|| {
-            unsupported(format!(
-                ".noise input {} is not an independent voltage or current source",
-                card.input
-            ))
-        })?;
-    if !input.ac_given {
-        return Err(unsupported(format!(
-            ".noise input source {} has no AC value (noisean.c E_NOACINPUT)",
-            card.input
-        )));
-    }
+    let input_kind = input_kind(circuit, &card.input)?;
     // The operating point and small-signal system exactly as `.ac` builds
     // them (`noisean.c`: `CKTop`, then a `MODEINITSMSIG` load; a
     // `hertz`-dependent circuit is re-solved at every frequency).
@@ -708,7 +762,7 @@ pub(crate) fn run(
 
     let representation = Representation::from_squared(request.squared_noise);
     let (spectrum_variables, integrated_variables) =
-        plot_names(&generators, input.kind, card.summary != 0, representation);
+        plot_names(&generators, input_kind, card.summary != 0, representation);
     let mut spectrum = Plot::new("noise1", representation.plotname(true), PlotFlags::Real);
     for variable in spectrum_variables {
         spectrum.push_variable(variable);
@@ -722,22 +776,7 @@ pub(crate) fn run(
         adjoint_rhs[row] = Complex::real(-1.);
     }
 
-    let delta = match card.stepping {
-        Stepping::Decade => (10f64.ln() / card.steps as Real).exp(),
-        Stepping::Octave => (2f64.ln() / card.steps as Real).exp(),
-        Stepping::Linear if card.steps == 1 => 0.,
-        Stepping::Linear => (card.stop - card.start) / (card.steps - 1) as Real,
-    };
-    let tolerance = match card.stepping {
-        Stepping::Decade | Stepping::Octave => delta * card.stop * reltol,
-        Stepping::Linear => delta * reltol,
-    };
-    let advance = match card.stepping {
-        Stepping::Decade | Stepping::Octave => Advance::Multiply(delta),
-        Stepping::Linear if card.steps == 1 => Advance::Single,
-        Stepping::Linear => Advance::Add(delta),
-    };
-    let frequencies = FrequencyGrid::new(card.start, card.stop, tolerance, advance, ".noise")?;
+    let frequencies = frequency_grid(&card, reltol)?;
     let mut integrated_power = Power::default();
     let mut last = card.start;
     for (step, frequency) in frequencies.enumerate() {
@@ -801,26 +840,14 @@ pub(crate) fn run(
         });
     }
     plots.push(spectrum);
-    if card.start != card.stop {
-        let mut integrated = Plot::new("noise2", representation.plotname(false), PlotFlags::Real);
-        let mut values = NoiseRow::new(representation, integrated_variables.len());
-        for variable in integrated_variables {
-            integrated.push_variable(variable);
-        }
-        if card.summary != 0 {
-            for g in &generators {
-                g.append_integrated(&mut values);
-            }
-        }
-        integrated_power.append(&mut values);
-        integrated.push_point(values.values)?;
-        if !integrated.is_finite() {
-            return Err(SpiceError::Numerical {
-                context: ".noise".into(),
-                message: "nonfinite integrated noise".into(),
-            });
-        }
-        plots.push(integrated);
+    if card.start.to_bits() != card.stop.to_bits() {
+        plots.push(integrated_plot(
+            representation,
+            integrated_variables,
+            &generators,
+            card.summary != 0,
+            integrated_power,
+        )?);
     }
     Ok(plots)
 }
@@ -1010,10 +1037,10 @@ mod tests {
         // A flat density integrates to density * df.
         let (f0, f1) = (10.0_f64, 100.0_f64);
         let step = Step {
-            del_freq: f1 - f0,
-            ln_freq: f1.ln(),
-            ln_last_freq: f0.ln(),
-            del_ln_freq: f1.ln() - f0.ln(),
+            width: f1 - f0,
+            log_end: f1.ln(),
+            log_start: f0.ln(),
+            log_width: f1.ln() - f0.ln(),
         };
         let flat = nintegrate(2.0, 2f64.ln(), 2f64.ln(), &step);
         assert!((flat - 180.0).abs() < 1e-12);
