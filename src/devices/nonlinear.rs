@@ -438,8 +438,8 @@ impl Diode {
         thermal.point(0., context.gmin)?; // validate before interning
         let mut staged = nodes.clone();
         let external = [
-            staged.intern(&instance.nodes[0]),
-            staged.intern(&instance.nodes[1]),
+            staged.intern(&instance.nodes[0])?,
+            staged.intern(&instance.nodes[1])?,
         ];
         let mut terminals = external.to_vec();
         let positive = if p.rs > 0. {
@@ -448,7 +448,7 @@ impl Diode {
             if staged.get(&name).is_some() {
                 return Err(SpiceError::circuit("diode internal-node name collision"));
             }
-            let prime = staged.intern(&name);
+            let prime = staged.intern(&name)?;
             staged.set_kind(prime, NodeKind::Internal);
             terminals.push(prime);
             prime

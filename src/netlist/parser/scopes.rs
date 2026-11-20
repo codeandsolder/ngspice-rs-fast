@@ -361,25 +361,12 @@ fn scope(
                 ScopedCardKind::Subcircuit(push_index(&mut result.subcircuits, s))
             }
             ParsedCard::Ends(name) => {
-                let Some((expected, _)) = opening else {
-                    return Err(SpiceError::parse(card.location.clone(), "unmatched .ends"));
-                };
-                if name.as_deref().is_some_and(|name| name != expected) {
-                    return Err(SpiceError::parse(
-                        card.location.clone(),
-                        format!("mismatched .ends: expected '{expected}'"),
-                    ));
-                }
+                check_ends(name.as_deref(), opening, &card.location)?;
                 result.cards.push(ordered(entry, ScopedCardKind::Ends));
                 return Ok(result);
             }
             ParsedCard::End => {
-                if let Some((name, _)) = opening {
-                    return Err(SpiceError::parse(
-                        card.location.clone(),
-                        format!(".end before .ends for '{name}'"),
-                    ));
-                }
+                check_end(opening, &card.location)?;
                 result.cards.push(ordered(entry, ScopedCardKind::End));
                 return Ok(result);
             }
@@ -402,6 +389,33 @@ fn scope(
         ));
     }
     Ok(result)
+}
+
+fn check_ends(
+    name: Option<&str>,
+    opening: Option<(&str, &SourceLoc)>,
+    location: &SourceLoc,
+) -> SpiceResult<()> {
+    let Some((expected, _)) = opening else {
+        return Err(SpiceError::parse(location.clone(), "unmatched .ends"));
+    };
+    if name.is_some_and(|name| name != expected) {
+        return Err(SpiceError::parse(
+            location.clone(),
+            format!("mismatched .ends: expected '{expected}'"),
+        ));
+    }
+    Ok(())
+}
+
+fn check_end(opening: Option<(&str, &SourceLoc)>, location: &SourceLoc) -> SpiceResult<()> {
+    if let Some((name, _)) = opening {
+        return Err(SpiceError::parse(
+            location.clone(),
+            format!(".end before .ends for '{name}'"),
+        ));
+    }
+    Ok(())
 }
 
 fn ordered(entry: &InputCard, kind: ScopedCardKind) -> ScopedCard {

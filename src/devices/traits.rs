@@ -1034,8 +1034,8 @@ mod tests {
     #[test]
     fn ground_gets_no_row() {
         let mut nodes = NodeTable::new();
-        let a = nodes.intern("a");
-        let b = nodes.intern("b");
+        let a = nodes.intern("a").unwrap();
+        let b = nodes.intern("b").unwrap();
         let mut unknowns = MnaUnknowns::new();
         unknowns.rebuild(&nodes);
         assert_eq!(unknowns.node_row(NodeId::GROUND), None);
@@ -1047,8 +1047,8 @@ mod tests {
     #[test]
     fn internal_nodes_are_unknowns_too() {
         let mut nodes = NodeTable::new();
-        let terminal = nodes.intern("out");
-        let internal = nodes.intern("x1#1");
+        let terminal = nodes.intern("out").unwrap();
+        let internal = nodes.intern("x1#1").unwrap();
         nodes.set_kind(internal, NodeKind::Internal);
         let mut unknowns = MnaUnknowns::new();
         unknowns.rebuild(&nodes);
@@ -1059,11 +1059,11 @@ mod tests {
     #[test]
     fn rows_can_be_assigned_incrementally() {
         let mut nodes = NodeTable::new();
-        nodes.intern("a");
+        nodes.intern("a").unwrap();
         let mut unknowns = MnaUnknowns::new();
         unknowns.rebuild(&nodes);
         assert_eq!(unknowns.len(), 1);
-        let late = nodes.intern("late");
+        let late = nodes.intern("late").unwrap();
         let row = unknowns.assign(nodes.node(late).expect("node exists"));
         assert_eq!(row, Some(1));
         assert_eq!(unknowns.len(), 2);

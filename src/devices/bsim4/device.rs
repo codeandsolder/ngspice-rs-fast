@@ -200,7 +200,11 @@ impl Bsim4 {
             Some(setup),
         )?;
         let mut staged = nodes.clone();
-        let external: Vec<NodeId> = instance.nodes.iter().map(|n| staged.intern(n)).collect();
+        let external: Vec<NodeId> = instance
+            .nodes
+            .iter()
+            .map(|n| staged.intern(n))
+            .collect::<SpiceResult<Vec<_>>>()?;
         device.terminals.clone_from(&external);
         for (local, id) in [node::D, node::G_EXT, node::S, node::B]
             .into_iter()
@@ -222,7 +226,7 @@ impl Bsim4 {
                     instance.name
                 )));
             }
-            let id = staged.intern(&name);
+            let id = staged.intern(&name)?;
             staged.set_kind(id, NodeKind::Internal);
             let index = usize::try_from(local)
                 .ok()

@@ -8,7 +8,7 @@ use ngspice_rs::primitives::{Complex, NodeId, SpiceResult};
 
 fn circuit(voltage: bool, waveform: Waveform) -> Circuit {
     let mut circuit = Circuit::new();
-    let a = circuit.add_node("a");
+    let a = circuit.add_node("a").unwrap();
     circuit
         .add_device(Box::new(
             IndependentSource::new(

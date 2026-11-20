@@ -295,10 +295,7 @@ pub(in crate::devices) fn instantiate(
     // The schema validates the IC and effective_value validates the scalar
     // before any terminals are interned.
     parameters.effective_value(context)?;
-    let terminals = [
-        nodes.intern(&instance.nodes[0]),
-        nodes.intern(&instance.nodes[1]),
-    ];
+    let terminals = nodes.intern_array(&instance.nodes)?;
     let device = ModelPassive {
         name: instance.name.clone(),
         model: Some(model.card().name.clone()),

@@ -34,20 +34,21 @@ pub struct Matrix {
 }
 
 impl Matrix {
-    /// A zeroed `rows` by `cols` matrix.
-    /// # Panics
-    /// If the matrix dimensions overflow the addressable element count.
-    #[must_use]
-    pub fn zeros(rows: usize, cols: usize) -> Self {
-        Self {
+    /// A zeroed matrix.
+    /// # Errors
+    /// Dimensions overflow or storage cannot be allocated.
+    pub fn zeros(rows: usize, cols: usize) -> SpiceResult<Self> {
+        let len = rows
+            .checked_mul(cols)
+            .ok_or_else(|| SpiceError::Numerical {
+                context: "dense matrix".to_owned(),
+                message: "matrix dimensions overflow".to_owned(),
+            })?;
+        Ok(Self {
             rows,
             cols,
-            data: vec![
-                0.0;
-                rows.checked_mul(cols)
-                    .expect("dense matrix dimensions overflow")
-            ],
-        }
+            data: crate::primitives::filled_vec(len, 0.0, "dense matrix")?,
+        })
     }
 
     /// Number of rows.
@@ -146,15 +147,16 @@ impl Matrix {
     }
 
     /// The transpose.
-    #[must_use]
-    pub fn transpose(&self) -> Self {
-        let mut result = Self::zeros(self.cols, self.rows);
+    /// # Errors
+    /// The transposed storage cannot be allocated.
+    pub fn transpose(&self) -> SpiceResult<Self> {
+        let mut result = Self::zeros(self.cols, self.rows)?;
         for row in 0..self.rows {
             for col in 0..self.cols {
                 result.data[col * self.rows + row] = self.data[row * self.cols + col];
             }
         }
-        result
+        Ok(result)
     }
 
     /// Matrix–vector product.
@@ -494,7 +496,7 @@ mod tests {
             2.0_f64.powi(600),
             2.0_f64.powi(1000),
         ] {
-            let mut matrix = Matrix::zeros(2, 2);
+            let mut matrix = Matrix::zeros(2, 2).unwrap();
             matrix
                 .data_mut()
                 .copy_from_slice(&[2. * scale, scale, scale, 2. * scale]);
@@ -511,21 +513,21 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "dense matrix dimensions overflow")]
     fn dimensions_cannot_wrap() {
-        let _ = Matrix::zeros(usize::MAX, 2);
+        assert!(Matrix::zeros(usize::MAX, 2).is_err());
+        assert!(Matrix::zeros(usize::MAX / 8, 1).is_err());
     }
 
     #[test]
     fn zero_column_matrix_multiplies_to_zero_vector() {
-        let a = Matrix::zeros(3, 0);
+        let a = Matrix::zeros(3, 0).unwrap();
         assert_eq!(a.mul_vector(&Vector::zeros(0)).unwrap(), Vector::zeros(3));
-        assert_eq!(a.transpose(), Matrix::zeros(0, 3));
+        assert_eq!(a.transpose().unwrap(), Matrix::zeros(0, 3).unwrap());
     }
 
     #[test]
     fn symmetric_eigenvalues_are_sorted_and_validated() {
-        let mut matrix = Matrix::zeros(2, 2);
+        let mut matrix = Matrix::zeros(2, 2).unwrap();
         for (row, col, value) in [(0, 0, 2.0), (0, 1, 1.0), (1, 0, 1.0), (1, 1, 2.0)] {
             matrix.set(row, col, value).unwrap();
         }
@@ -537,19 +539,29 @@ mod tests {
         assert!(matrix.symmetric_eigenvalues().unwrap()[0] < 0.0);
         matrix.set(1, 0, 2.0).unwrap();
         assert!(matrix.symmetric_eigenvalues().is_err());
-        let mut signed_zero = Matrix::zeros(2, 2);
+        let mut signed_zero = Matrix::zeros(2, 2).unwrap();
         signed_zero.set(0, 1, -0.0).unwrap();
         assert!(signed_zero.symmetric_eigenvalues().is_ok());
-        assert!(Matrix::zeros(2, 3).symmetric_eigenvalues().is_err());
-        assert!(Matrix::zeros(0, 0).symmetric_eigenvalues().is_err());
-        let mut nonfinite = Matrix::zeros(1, 1);
+        assert!(
+            Matrix::zeros(2, 3)
+                .unwrap()
+                .symmetric_eigenvalues()
+                .is_err()
+        );
+        assert!(
+            Matrix::zeros(0, 0)
+                .unwrap()
+                .symmetric_eigenvalues()
+                .is_err()
+        );
+        let mut nonfinite = Matrix::zeros(1, 1).unwrap();
         nonfinite.data_mut()[0] = f64::NAN;
         assert!(nonfinite.symmetric_eigenvalues().is_err());
     }
 
     #[test]
     fn matrix_indexing_is_row_major() {
-        let mut matrix = Matrix::zeros(2, 3);
+        let mut matrix = Matrix::zeros(2, 3).unwrap();
         matrix.set(1, 2, 7.0).unwrap();
         assert_eq!(matrix.get(1, 2), Some(7.0));
         assert_eq!(matrix.get(2, 2), None);
@@ -561,7 +573,7 @@ mod tests {
 
     #[test]
     fn stamping_accumulates() {
-        let mut matrix = Matrix::zeros(1, 1);
+        let mut matrix = Matrix::zeros(1, 1).unwrap();
         matrix.add_to(0, 0, 0.5).unwrap();
         matrix.add_to(0, 0, 0.25).unwrap();
         assert_eq!(matrix.get(0, 0), Some(0.75));
@@ -569,7 +581,7 @@ mod tests {
 
     #[test]
     fn out_of_range_writes_are_errors() {
-        let mut matrix = Matrix::zeros(1, 1);
+        let mut matrix = Matrix::zeros(1, 1).unwrap();
         assert!(matrix.set(0, 1, 1.0).is_err());
         assert!(matrix.add_to(1, 0, 1.0).is_err());
         let mut vector = Vector::zeros(1);
@@ -578,20 +590,20 @@ mod tests {
 
     #[test]
     fn transpose_moves_elements() {
-        let mut matrix = Matrix::zeros(2, 3);
+        let mut matrix = Matrix::zeros(2, 3).unwrap();
         for row in 0..2 {
             for col in 0..3 {
                 matrix.set(row, col, (row * 3 + col) as f64).unwrap();
             }
         }
-        let transposed = matrix.transpose();
+        let transposed = matrix.transpose().unwrap();
         assert_eq!((transposed.rows(), transposed.cols()), (3, 2));
         assert_eq!(transposed.get(2, 1), Some(5.0));
     }
 
     #[test]
     fn multiply_and_dot_agree_on_an_identity() {
-        let mut identity = Matrix::zeros(3, 3);
+        let mut identity = Matrix::zeros(3, 3).unwrap();
         for index in 0..3 {
             identity.set(index, index, 1.0).unwrap();
         }
@@ -605,7 +617,7 @@ mod tests {
 
     #[test]
     fn dimension_mismatches_are_errors() {
-        let matrix = Matrix::zeros(2, 3);
+        let matrix = Matrix::zeros(2, 3).unwrap();
         assert!(matrix.mul_vector(&Vector::zeros(2)).is_err());
         assert!(matrix.solve(&Vector::zeros(3)).is_err());
         assert!(Vector::zeros(2).dot(&Vector::zeros(3)).is_err());
@@ -613,7 +625,7 @@ mod tests {
 
     #[test]
     fn solve_without_prior_factorization() {
-        let mut matrix = Matrix::zeros(1, 1);
+        let mut matrix = Matrix::zeros(1, 1).unwrap();
         matrix.set(0, 0, 2.0).unwrap();
         assert_eq!(
             matrix

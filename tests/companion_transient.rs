@@ -596,7 +596,7 @@ impl Device for Probe {
     }
 }
 fn add_probe(c: &mut Circuit, log: &Log, fail_after: f64) {
-    let out = c.add_node("out");
+    let out = c.add_node("out").unwrap();
     c.add_device(Box::new(Probe {
         terminals: [out, NodeId::GROUND],
         log: Rc::clone(log),
@@ -728,7 +728,7 @@ fn nonlinear_trials_iterate_to_convergence_and_non_convergence_shrinks_the_step(
     };
     let mut c = circuit(RC);
     step_at(&mut c, 1e-3);
-    let out = c.add_node("out");
+    let out = c.add_node("out").unwrap();
     c.add_device(Box::new(Cubic {
         terminals: [out, NodeId::GROUND],
         k,
@@ -745,7 +745,7 @@ fn nonlinear_trials_iterate_to_convergence_and_non_convergence_shrinks_the_step(
 
     let mut c = circuit(RC);
     step_at(&mut c, 1e-3);
-    let out = c.add_node("out");
+    let out = c.add_node("out").unwrap();
     c.add_device(Box::new(Oscillator {
         terminals: [out, NodeId::GROUND],
     }))

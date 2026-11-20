@@ -977,7 +977,11 @@ impl Bjt {
         let thermal = parameters.thermal(&instance, subs > 0., context)?;
         c_point(&thermal, 0., 0., 0., 0., context.gmin)?;
         let mut staged = nodes.clone();
-        let external: Vec<_> = i.nodes.iter().map(|n| staged.intern(n)).collect();
+        let external: Vec<_> = i
+            .nodes
+            .iter()
+            .map(|n| staged.intern(n))
+            .collect::<SpiceResult<Vec<_>>>()?;
         let mut terminals = external.clone();
         let mut internal = |resistance: Real, suffix: &str, external: NodeId| {
             if resistance == 0. {
@@ -989,7 +993,7 @@ impl Bjt {
                     "BJT internal-node name collision: {name}"
                 )));
             }
-            let node = staged.intern(&name);
+            let node = staged.intern(&name)?;
             staged.set_kind(node, NodeKind::Internal);
             terminals.push(node);
             Ok(node)

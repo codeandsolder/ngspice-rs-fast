@@ -442,8 +442,8 @@ mod tests {
     #[test]
     fn each_observed_device_loads_once_per_point_even_with_interleaved_queries() {
         let mut circuit = Circuit::new();
-        let a = circuit.add_node("a");
-        let b = circuit.add_node("b");
+        let a = circuit.add_node("a").unwrap();
+        let b = circuit.add_node("b").unwrap();
         let first = Rc::new(Cell::new(0));
         let second = Rc::new(Cell::new(0));
         for (name, nodes, count) in [
@@ -491,8 +491,8 @@ mod tests {
     #[test]
     fn terminal_residuals_match_full_multiply_with_aliases_and_cancellation() {
         let mut circuit = Circuit::new();
-        let a = circuit.add_node("a");
-        let b = circuit.add_node("b");
+        let a = circuit.add_node("a").unwrap();
+        let b = circuit.add_node("b").unwrap();
         let g = NodeId::GROUND;
         circuit.rebuild_unknowns();
         let mut matrix = SparseMatrix::new(2, 2);

@@ -433,7 +433,7 @@ impl Switch {
             .nodes
             .iter()
             .map(|node| staged.intern(node))
-            .collect();
+            .collect::<SpiceResult<Vec<_>>>()?;
         *nodes = staged;
         Ok(Box::new(Self {
             name: instance.name.clone(),

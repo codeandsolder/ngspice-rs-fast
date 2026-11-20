@@ -19,7 +19,7 @@ usage: cargo xtask snapshots [--bless]
                 write nothing; exit non-zero on any difference
     --bless     write created/changed snapshots, delete orphans, report each";
 
-pub(super) fn main(arguments: &[String]) -> Result<(), String> {
+pub(crate) fn main(arguments: &[String]) -> Result<(), String> {
     let mut bless = false;
     for argument in arguments {
         match argument.as_str() {

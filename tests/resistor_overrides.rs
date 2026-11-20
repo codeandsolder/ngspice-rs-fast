@@ -30,8 +30,8 @@ fn close(got: f64, want: f64) {
 /// names deliberately contradict SPICE's first-letter convention.
 fn misnamed() -> Circuit {
     let mut c = Circuit::new();
-    let a = c.add_node("a");
-    let b = c.add_node("b");
+    let a = c.add_node("a").unwrap();
+    let b = c.add_node("b").unwrap();
     c.add_device(Box::new(Resistor::new("v9", [a, b], 1e3).unwrap()))
         .unwrap();
     c.add_device(Box::new(

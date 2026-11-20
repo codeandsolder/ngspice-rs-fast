@@ -730,48 +730,48 @@ pub(crate) fn instantiate(
     }
     let (output, tree, scale) = parse_parameters(instance)?;
     let program = Program::compile(&tree.root)?;
-    let mark = nodes.len();
-    let positive = nodes.intern(&instance.nodes[0]);
-    let negative = nodes.intern(&instance.nodes[1]);
-    if output == BehaviouralOutput::Voltage && positive == negative {
-        // ASRCsetup: "instance %s is a shorted ASRC".
-        nodes.truncate(mark);
-        return Err(unsupported(
-            location,
-            format!("instance {} is a shorted ASRC", instance.name),
-        ));
-    }
-    let mut terminals = vec![positive, negative];
-    let mut variables = Vec::with_capacity(program.quantities().len());
-    let mut controls = Vec::new();
-    for quantity in program.quantities() {
-        match quantity {
-            Quantity::Node(name) => {
-                let node = nodes.intern(name);
-                if !terminals.contains(&node) {
-                    terminals.push(node);
+    crate::devices::factory::append_nodes(nodes, |nodes| {
+        let positive = nodes.intern(&instance.nodes[0])?;
+        let negative = nodes.intern(&instance.nodes[1])?;
+        if output == BehaviouralOutput::Voltage && positive == negative {
+            // ASRCsetup: "instance %s is a shorted ASRC".
+            return Err(unsupported(
+                location,
+                format!("instance {} is a shorted ASRC", instance.name),
+            ));
+        }
+        let mut terminals = vec![positive, negative];
+        let mut variables = Vec::with_capacity(program.quantities().len());
+        let mut controls = Vec::new();
+        for quantity in program.quantities() {
+            match quantity {
+                Quantity::Node(name) => {
+                    let node = nodes.intern(name)?;
+                    if !terminals.contains(&node) {
+                        terminals.push(node);
+                    }
+                    variables.push(Variable::Node(node));
                 }
-                variables.push(Variable::Node(node));
-            }
-            Quantity::Branch(name) => {
-                variables.push(Variable::Branch(controls.len()));
-                controls.push(ControlReference {
-                    name: name.clone(),
-                    location: Some(tree.span.start.clone()),
-                });
+                Quantity::Branch(name) => {
+                    variables.push(Variable::Branch(controls.len()));
+                    controls.push(ControlReference {
+                        name: name.clone(),
+                        location: Some(tree.span.start.clone()),
+                    });
+                }
             }
         }
-    }
-    Ok(Box::new(Behavioural {
-        name: instance.name.clone(),
-        designator: instance.designator,
-        output,
-        terminals,
-        variables,
-        controls,
-        program,
-        scale,
-    }))
+        Ok(Box::new(Behavioural {
+            name: instance.name.clone(),
+            designator: instance.designator,
+            output,
+            terminals,
+            variables,
+            controls,
+            program,
+            scale,
+        }) as Box<dyn Device>)
+    })
 }
 
 #[cfg(test)]
@@ -783,7 +783,7 @@ mod tests {
     #[test]
     fn failed_behavioural_binding_preserves_existing_nodes() {
         let mut nodes = NodeTable::new();
-        nodes.intern("present");
+        nodes.intern("present").unwrap();
         let before = nodes.nodes().to_vec();
         let deck = Parser::new()
             .parse_deck(&parse_deck_text(

@@ -332,7 +332,7 @@ fn generated_node_collision_rolls_back_just_appended_nodes() {
     use ngspice_rs::primitives::{NodeKind, NodeTable};
     let parsed = netlist("t1 a 0 b 0 z0=50 td=1n").unwrap();
     let mut nodes = NodeTable::default();
-    let collision = nodes.intern("t1#int2");
+    let collision = nodes.intern("t1#int2").unwrap();
     nodes.set_kind(collision, NodeKind::Internal);
     let before = nodes.nodes().to_vec();
     let err = TransmissionLine::instantiate(&parsed.devices[0], &mut nodes).unwrap_err();

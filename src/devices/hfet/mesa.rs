@@ -281,7 +281,7 @@ impl Mesa {
         let (model, model_defaults) = Model::resolve(resolved)?;
         let (initial, setters) = Instance::resolve(i)?;
         let instance = Instance::validate(&model_defaults, &setters, &i.location)?;
-        let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "MESA");
+        let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "MESA")?;
         // C creates source and drain primes in this order.
         // Gate and prime-prime nodes follow, aliasing the corresponding prime
         // when RG, RI or RF is zero. RDI/RSI do not create nodes.

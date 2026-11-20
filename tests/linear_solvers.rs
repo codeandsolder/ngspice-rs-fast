@@ -3,7 +3,7 @@ use ngspice_rs::maths::{Matrix, SparseLu, SparseMatrix, Vector};
 
 fn matrices(values: &[&[f64]]) -> (SparseMatrix, Matrix) {
     let mut s = SparseMatrix::new(values.len(), values[0].len());
-    let mut d = Matrix::zeros(s.rows(), s.cols());
+    let mut d = Matrix::zeros(s.rows(), s.cols()).unwrap();
     for (r, row) in values.iter().enumerate() {
         for (c, a) in row.iter().enumerate() {
             s.add(r, c, *a).unwrap();
@@ -70,8 +70,8 @@ fn duplicates_and_exact_pattern_checked_symbolic_reuse() {
 #[test]
 fn invalid_dimensions_nonfinite_and_overflow() {
     for (s, d) in [
-        (SparseMatrix::new(0, 0), Matrix::zeros(0, 0)),
-        (SparseMatrix::new(2, 3), Matrix::zeros(2, 3)),
+        (SparseMatrix::new(0, 0), Matrix::zeros(0, 0).unwrap()),
+        (SparseMatrix::new(2, 3), Matrix::zeros(2, 3).unwrap()),
     ] {
         assert!(s.factorize().is_err());
         assert!(d.lu_decompose().is_err());

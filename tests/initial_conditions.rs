@@ -439,7 +439,7 @@ impl Device for Probe {
 fn failed_initialization_is_atomic_no_accept_hook_no_plot() {
     let log: Log = Rc::default();
     let mut c = circuit_of("t\nv1 in 0 5\nc1 in 0 1u ic=1\nr1 in 0 1k\n");
-    let node = c.add_node("in");
+    let node = c.add_node("in").unwrap();
     c.add_device(Box::new(Probe {
         terminals: [node, NodeId::GROUND],
         log: Rc::clone(&log),
@@ -459,7 +459,7 @@ fn failed_initialization_is_atomic_no_accept_hook_no_plot() {
     // The same circuit with a consistent ic runs afterwards (nothing leaked),
     // and the first accept hook is the t = 0 initial point.
     let mut c = circuit_of("t\nv1 in 0 5\nc1 in 0 1u ic=5\nr1 in 0 1k\n");
-    let node = c.add_node("in");
+    let node = c.add_node("in").unwrap();
     c.add_device(Box::new(Probe {
         terminals: [node, NodeId::GROUND],
         log: Rc::clone(&log),

@@ -228,7 +228,7 @@ pub(super) fn line_terminals<const N: usize>(
     append_nodes(nodes, |nodes| {
         let mut terminals = [NodeId::GROUND; N];
         for (slot, node) in instance.nodes.iter().enumerate() {
-            terminals[slot] = nodes.intern(node);
+            terminals[slot] = nodes.intern(node)?;
         }
         for (slot, suffix) in suffixes.iter().enumerate() {
             let name = format!("{}#{suffix}", instance.name);
@@ -237,7 +237,7 @@ pub(super) fn line_terminals<const N: usize>(
                     "{label} internal-node name collision: {name}"
                 )));
             }
-            let node = nodes.intern(&name);
+            let node = nodes.intern(&name)?;
             nodes.set_kind(node, NodeKind::Internal);
             terminals[4 + slot] = node;
         }
@@ -304,8 +304,8 @@ fn instantiate_passive(
     }
     append_nodes(nodes, |nodes| {
         let terminals = [
-            nodes.intern(&instance.nodes[0]),
-            nodes.intern(&instance.nodes[1]),
+            nodes.intern(&instance.nodes[0])?,
+            nodes.intern(&instance.nodes[1])?,
         ];
         match kind {
             PassiveKind::Resistor => Resistor::new(&instance.name, terminals, value).map(|r| {
@@ -497,8 +497,8 @@ fn instantiate_source(
     // untouched by an error without cloning it per instance.
     append_nodes(nodes, |new_nodes| {
         let terminals = [
-            new_nodes.intern(&instance.nodes[0]),
-            new_nodes.intern(&instance.nodes[1]),
+            new_nodes.intern(&instance.nodes[0])?,
+            new_nodes.intern(&instance.nodes[1])?,
         ];
         let power_function = port.power_function.is_some();
         let rf = port.finish(instance, new_nodes)?;
@@ -626,7 +626,7 @@ impl PortSetters {
                 "RF port internal-node name collision: {name}"
             )));
         }
-        let internal = nodes.intern(&name);
+        let internal = nodes.intern(&name)?;
         nodes.set_kind(internal, NodeKind::Internal);
         Ok(Some(crate::devices::RfPort {
             number,

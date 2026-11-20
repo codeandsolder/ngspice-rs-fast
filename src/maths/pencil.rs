@@ -533,6 +533,10 @@ impl<'a> LoadedPencil<'a> {
         }
         match sparse.order_and_factor(load.relative_threshold, 1.0e-30) {
             Status::Singular | Status::ZeroDiag => Ok(None),
+            Status::InvalidPlan => Err(numerical(
+                "pole-zero search",
+                "ordered sparse topology lacks a valid traversal plan",
+            )),
             Status::NonFinite => Err(numerical(
                 "pole-zero search",
                 "non-finite or unrepresentable LU factor",
@@ -1494,7 +1498,7 @@ mod tests {
     use super::*;
 
     fn matrix(rows: &[&[Real]]) -> Matrix {
-        let mut m = Matrix::zeros(rows.len(), rows.len());
+        let mut m = Matrix::zeros(rows.len(), rows.len()).unwrap();
         for (r, row) in rows.iter().enumerate() {
             for (c, value) in row.iter().enumerate() {
                 m.set(r, c, *value).unwrap();

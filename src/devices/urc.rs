@@ -92,7 +92,7 @@ use crate::devices::schema::{ScalarDomain, ScalarParameter, ScalarSchema, Scalar
 use crate::devices::traits::{Device, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment, ParameterKind};
-use crate::primitives::{NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
+use crate::primitives::{NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// The most sections one instance may expand into. C has no limit; the bound
 /// keeps a mistyped `n=` or an extreme `FMAX` from building an unbounded
@@ -458,7 +458,7 @@ fn build(
     crate::devices::factory::append_nodes(nodes, |nodes| {
         // The terminals exist before setup in C (INP2U binds them at parse time).
         for terminal in &instance.nodes {
-            nodes.intern(terminal);
+            nodes.intern(terminal)?;
         }
         let fresh = |staged: &mut NodeTable, suffix: String| -> SpiceResult<String> {
             let node = format!("{name}#{suffix}");
@@ -471,7 +471,7 @@ fn build(
                     "URC internal-node name collision: {node}"
                 )));
             }
-            staged.intern(&node);
+            staged.intern(&node)?;
             Ok(node)
         };
         // The diode ladder's generated model (`<name>#diodemod`: cjo, rs, is set
@@ -501,7 +501,7 @@ fn build(
         let mut lowl = instance.nodes[0].clone();
         let mut hir = instance.nodes[1].clone();
         let mut prop: Real = 1.;
-        let id = |staged: &mut NodeTable, node: &str| -> NodeId { staged.intern(node) };
+
         for section in 1..=sections.lumps {
             let hil = fresh(nodes, format!("hi{section}"))?;
             let lowr = if section == sections.lumps {
@@ -511,13 +511,13 @@ fn build(
             };
             let r = prop * sections.resistance;
             let c = prop * sections.capacitance;
-            let terminals = [id(nodes, &lowl), id(nodes, &lowr)];
+            let terminals = [nodes.intern(&lowl)?, nodes.intern(&lowr)?];
             devices.push(Box::new(Resistor::new(
                 format!("{name}#rlo{section}"),
                 terminals,
                 r,
             )?));
-            let terminals = [id(nodes, &hil), id(nodes, &hir)];
+            let terminals = [nodes.intern(&hil)?, nodes.intern(&hir)?];
             devices.push(Box::new(Resistor::new(
                 format!("{name}#rhi{section}"),
                 terminals,
@@ -544,7 +544,7 @@ fn build(
                         &diode, nodes, &model, context,
                     )?);
                 } else {
-                    let terminals = [id(nodes, &node), id(nodes, &reference)];
+                    let terminals = [nodes.intern(&node)?, nodes.intern(&reference)?];
                     devices.push(Box::new(Capacitor::new(
                         format!("{name}#c{side}{section}"),
                         terminals,

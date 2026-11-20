@@ -1,6 +1,8 @@
-//! Model-level temperature processing from `b3temp.c::BSIM3temp`, before
-//! per-instance effective geometry. Junction-capacitance clamping, saturation
-//! currents and potentials are C order and C constants; no load equations here.
+//! Model-level temperature processing from `b3temp.c::BSIM3temp`.
+//!
+//! Before per-instance effective geometry, junction-capacitance clamping,
+//! saturation currents and potentials follow C order and C constants. No load
+//! equations are evaluated here.
 // C-compatible numerical expressions are kept in their reference order:
 // Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(

@@ -431,7 +431,7 @@ fn generated_node_collision_rolls_back_just_appended_nodes() {
     let parsed = netlist("o1 a 0 b 0 m\n.model m ltra l=2.5e-7 c=1e-10 len=1").unwrap();
     let models = ModelResolver::new(&parsed.models).unwrap();
     let mut nodes = NodeTable::default();
-    let collision = nodes.intern("o1#i2");
+    let collision = nodes.intern("o1#i2").unwrap();
     nodes.set_kind(collision, NodeKind::Internal);
     let before = nodes.nodes().to_vec();
     let err = LossyLine::instantiate(

@@ -368,7 +368,7 @@ fn expansion_is_pure_and_reports_the_definition_location() {
 fn a_failed_batch_leaves_the_caller_circuit_untouched() {
     let netlist = deck("r1 a 0 1k\nr2 b 0 dm\n.model dm d(is=1e-14)\n");
     let mut circuit = Circuit::new();
-    circuit.add_node("keep");
+    circuit.add_node("keep").unwrap();
     let before: Vec<String> = circuit
         .nodes()
         .nodes()

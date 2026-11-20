@@ -9,19 +9,19 @@
 //! simulator depends on this crate; it is a development tool. See
 //! `docs/port/VERIFICATION.md`.
 
-mod bsim3;
-mod bsim4;
-mod bsim4_fields;
-mod ci;
-mod compare;
+pub mod bsim3;
+pub mod bsim4;
+pub mod bsim4_fields;
+pub mod ci;
+pub mod compare;
 pub mod golden;
 pub mod ifparm;
-mod ngspice;
+pub mod ngspice;
 #[path = "../../conformance/reference.rs"]
 pub mod reference;
-mod snapshots;
-mod tran;
-mod verify;
+pub mod snapshots;
+pub mod tran;
+pub mod verify;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

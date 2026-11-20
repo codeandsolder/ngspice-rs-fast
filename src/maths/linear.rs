@@ -178,6 +178,10 @@ pub(in crate::maths) fn check_status<T: Scalar>(
 ) -> SpiceResult<()> {
     match status {
         Status::Okay => Ok(()),
+        Status::InvalidPlan => Err(numerical(
+            context,
+            "ordered sparse topology lacks a valid traversal plan",
+        )),
         Status::NonFinite => Err(numerical(
             context,
             "non-finite or unrepresentable LU factor",
@@ -333,9 +337,9 @@ fn solve_real(
 ) -> SpiceResult<Vector> {
     rhs_valid(rhs, n)?;
     let x = Vector::from(if transposed {
-        sparse.solve_transposed_with_workspace(rhs.as_slice(), workspace)
+        sparse.solve_transposed_with_workspace(rhs.as_slice(), workspace)?
     } else {
-        sparse.solve_with_workspace(rhs.as_slice(), workspace)
+        sparse.solve_with_workspace(rhs.as_slice(), workspace)?
     });
     if !x.is_finite() {
         return Err(numerical(
@@ -448,16 +452,18 @@ pub(in crate::maths) fn factor_shared_complex(
     pattern.with_ordering(|state| {
     let (mut sparse, fresh) = match state.frame.take() {
         Some(CachedFrame::Real(symbolic)) if matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern))) => {
-            (Arc::new(Sparse::retype_shared(symbolic.sparse)), false)
+            (Arc::new(Sparse::retype_shared_loaded(symbolic.sparse,values.iter().copied())), false)
         }
-        Some(CachedFrame::Complex(ComplexFactors { sparse })) => (sparse, false),
+        Some(CachedFrame::Complex(ComplexFactors { mut sparse })) => {
+            Sparse::reload_shared(&mut sparse,values.iter().copied());
+            (sparse, false)
+        },
         _ => {
             let sparse=Sparse::from_pattern(pattern,values);
             (Arc::new(sparse), true)
         }
     };
-    let numeric = Sparse::for_reload(&mut sparse);
-    if !fresh { numeric.reload_originals(values); }
+    let numeric = Arc::make_mut(&mut sparse);
     let result = if fresh {
         state.ac_reorder = false;
         order_fresh("complex sparse LU", numeric, pivot, names, true)
@@ -513,11 +519,10 @@ impl LoadedFrame {
 
     /// Reload coefficients in handle order, keeping fill-ins and pivot order.
     fn reload(&mut self, matrix: &SparseMatrix) {
-        let sparse = Sparse::for_reload(&mut self.sparse);
         if let Some((_, values)) = matrix.bound_values() {
-            sparse.reload_originals(values);
+            Sparse::reload_shared(&mut self.sparse, values.iter().copied());
         } else {
-            sparse.reload_originals_iter(matrix.triplets().iter().map(|t| t.value));
+            Sparse::reload_shared(&mut self.sparse, matrix.triplets().iter().map(|t| t.value));
         }
     }
 
@@ -968,7 +973,7 @@ mod tests {
 
     #[test]
     fn dense_and_sparse_transposed_solves_share_workspace_and_preserve_order() {
-        let mut dense = Matrix::zeros(2, 2);
+        let mut dense = Matrix::zeros(2, 2).unwrap();
         let mut sparse = SparseMatrix::new(2, 2);
         for (r, c, v) in [(0, 0, 2.), (0, 1, 1.), (1, 0, 3.), (1, 1, 4.)] {
             dense.set(r, c, v).unwrap();
@@ -1002,7 +1007,7 @@ mod tests {
 
     #[test]
     fn bound_solves_reuse_scratch_and_keep_valid_factors_on_rhs_failure() {
-        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]));
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
         let mut a = SparseMatrix::bound(Arc::clone(&pattern));
         for (r, c, v) in [(0, 0, 3.), (0, 1, 1.), (1, 0, 1.), (1, 1, 4.)] {
             a.set(r, c, v).unwrap();
@@ -1023,7 +1028,7 @@ mod tests {
 
     #[test]
     fn unique_refactors_keep_frame_and_input_allocations() {
-        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]));
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
         let mut a = SparseMatrix::bound(Arc::clone(&pattern));
         for (r, c, v) in [(0, 0, 3.), (0, 1, 1.), (1, 0, 1.), (1, 1, 4.)] {
             a.set(r, c, v).unwrap();
@@ -1066,7 +1071,7 @@ mod tests {
 
     #[test]
     fn unique_complex_refactors_keep_frame_allocation() {
-        let pattern = Arc::new(Pattern::new(1, [(0, 0)]));
+        let pattern = Arc::new(Pattern::new(1, [(0, 0)]).unwrap());
         let mut a = SparseMatrix::bound(Arc::clone(&pattern));
         a.set(0, 0, 3.).unwrap();
         let mut e = SparseMatrix::new(1, 1);
@@ -1100,7 +1105,7 @@ mod tests {
 
     #[test]
     fn unrepresentable_bound_factor_never_enters_retained_solves() {
-        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]));
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
         let mut a = SparseMatrix::bound(Arc::clone(&pattern));
         for (r, c, v) in [(0, 0, 2.), (0, 1, 1.), (1, 0, 1.), (1, 1, 2.)] {
             a.set(r, c, v).unwrap();
@@ -1125,7 +1130,7 @@ mod tests {
 
     #[test]
     fn dense_direct_frame_matches_folded_sparse_order_bit_for_bit() {
-        let mut dense = Matrix::zeros(4, 4);
+        let mut dense = Matrix::zeros(4, 4).unwrap();
         let mut sparse = SparseMatrix::new(4, 4);
         for (r, c, value) in [
             (0, 1, 3.),
@@ -1160,7 +1165,7 @@ mod tests {
 
     #[test]
     fn complex_cache_keeps_snapshots_and_changes_scalar_only_at_boundary() {
-        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]));
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
         let mut a = SparseMatrix::bound(Arc::clone(&pattern));
         for (r, c, value) in [(0, 0, 3.), (0, 1, 1.), (1, 0, 2.), (1, 1, 4.)] {
             a.add(r, c, value).unwrap();
@@ -1245,7 +1250,7 @@ mod tests {
 
     #[test]
     fn complex_frame_retains_order_but_not_real_factors() {
-        let pattern = Arc::new(Pattern::new(2, [(0, 1), (1, 0), (1, 1), (0, 0)]));
+        let pattern = Arc::new(Pattern::new(2, [(0, 1), (1, 0), (1, 1), (0, 0)]).unwrap());
         let mut a = SparseMatrix::bound(Arc::clone(&pattern));
         a.add(0, 1, 2.).unwrap();
         a.add(1, 0, 3.).unwrap();

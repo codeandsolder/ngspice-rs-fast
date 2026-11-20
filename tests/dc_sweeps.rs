@@ -493,8 +493,8 @@ fn deck_dc_cards_with_resistor_targets_use_the_existing_ast_grammar() {
 
 fn programmatic() -> Circuit {
     let mut c = Circuit::new();
-    let a = c.add_node("a");
-    let b = c.add_node("b");
+    let a = c.add_node("a").unwrap();
+    let b = c.add_node("b").unwrap();
     // `v9` is a resistor, `r9` a voltage source, `rc` a capacitor.
     c.add_device(Box::new(Resistor::new("v9", [a, b], 1e3).unwrap()))
         .unwrap();

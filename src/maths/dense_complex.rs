@@ -25,39 +25,39 @@ pub struct DenseComplex {
 }
 
 impl DenseComplex {
-    /// The `n x n` zero matrix.
-    /// # Panics
-    /// If the matrix dimension overflows the addressable element count.
-    #[must_use]
-    pub fn zeros(n: usize) -> Self {
-        Self {
+    /// The zero matrix.
+    /// # Errors
+    /// Dimensions overflow or storage cannot be allocated.
+    pub fn zeros(n: usize) -> SpiceResult<Self> {
+        let len = n
+            .checked_mul(n)
+            .ok_or_else(|| numerical("matrix dimensions overflow"))?;
+        Ok(Self {
             n,
-            data: vec![
-                Complex::ZERO;
-                n.checked_mul(n)
-                    .expect("dense complex matrix dimensions overflow")
-            ],
-        }
+            data: crate::primitives::filled_vec(len, Complex::ZERO, "dense complex matrix")?,
+        })
     }
 
-    /// The `n x n` identity (`ceye`).
-    #[must_use]
-    pub fn identity(n: usize) -> Self {
-        let mut matrix = Self::zeros(n);
+    /// The identity matrix (`ceye`).
+    /// # Errors
+    /// Dimensions overflow or storage cannot be allocated.
+    pub fn identity(n: usize) -> SpiceResult<Self> {
+        let mut matrix = Self::zeros(n)?;
         for i in 0..n {
             matrix.data[i * n + i] = Complex::real(1.);
         }
-        matrix
+        Ok(matrix)
     }
 
     /// A diagonal matrix.
-    #[must_use]
-    pub fn diagonal(values: &[Complex]) -> Self {
-        let mut matrix = Self::zeros(values.len());
+    /// # Errors
+    /// Dimensions overflow or storage cannot be allocated.
+    pub fn diagonal(values: &[Complex]) -> SpiceResult<Self> {
+        let mut matrix = Self::zeros(values.len())?;
         for (i, value) in values.iter().enumerate() {
             matrix.data[i * values.len() + i] = *value;
         }
-        matrix
+        Ok(matrix)
     }
 
     /// The dimension `n`.
@@ -156,7 +156,7 @@ impl DenseComplex {
             return Err(numerical("non-finite entry"));
         }
         let n = self.n;
-        let mut out = Self::zeros(n);
+        let mut out = Self::zeros(n)?;
         if n != 0 {
             for (a_row, out_row) in self.data.chunks_exact(n).zip(out.data.chunks_exact_mut(n)) {
                 for (&a, b_row) in a_row.iter().zip(other.data.chunks_exact(n)) {
@@ -206,7 +206,7 @@ impl DenseComplex {
         let dimension =
             u32::try_from(n).map_err(|_| numerical("matrix dimension exceeds rank guard range"))?;
         let threshold = 128. * f64::EPSILON * f64::from(dimension) * scale;
-        let mut b = Self::identity(n).data;
+        let mut b = Self::identity(n)?.data;
         for c in 0..n {
             let pivot_row = (c..n)
                 .max_by(|&x, &y| {
@@ -281,7 +281,7 @@ mod tests {
     use crate::primitives::Complex;
 
     fn matrix(n: usize, values: &[(f64, f64)]) -> DenseComplex {
-        let mut m = DenseComplex::zeros(n);
+        let mut m = DenseComplex::zeros(n).unwrap();
         for (index, (re, im)) in values.iter().enumerate() {
             m.set(index / n, index % n, Complex::new(*re, *im)).unwrap();
         }
@@ -290,9 +290,9 @@ mod tests {
 
     #[test]
     fn zero_multiplier_does_not_hide_nonfinite_input() {
-        let a = DenseComplex::zeros(1);
+        let a = DenseComplex::zeros(1).unwrap();
         for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let mut b = DenseComplex::zeros(1);
+            let mut b = DenseComplex::zeros(1).unwrap();
             b.set(0, 0, Complex::real(invalid)).unwrap();
             assert!(a.mul(&b).is_err());
             assert!(b.mul(&a).is_err());
@@ -302,8 +302,11 @@ mod tests {
     #[test]
     fn zero_order_product_and_row_accumulation() {
         assert_eq!(
-            DenseComplex::zeros(0).mul(&DenseComplex::zeros(0)).unwrap(),
             DenseComplex::zeros(0)
+                .unwrap()
+                .mul(&DenseComplex::zeros(0).unwrap())
+                .unwrap(),
+            DenseComplex::zeros(0).unwrap()
         );
         // Preserve k order across cancellation, even with a sparse row.
         let a = matrix(
@@ -326,9 +329,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "dense complex matrix dimensions overflow")]
     fn dimensions_cannot_wrap() {
-        let _ = DenseComplex::zeros(usize::MAX);
+        assert!(DenseComplex::zeros(usize::MAX).is_err());
+        assert!(DenseComplex::zeros(usize::MAX.isqrt()).is_err());
     }
 
     #[test]
@@ -364,7 +367,8 @@ mod tests {
     fn inverse_normalizes_extreme_complex_pivots() {
         for scale in [1e-300, 1e300, 1e308] {
             let a =
-                DenseComplex::diagonal(&[Complex::new(scale, scale), Complex::new(scale, -scale)]);
+                DenseComplex::diagonal(&[Complex::new(scale, scale), Complex::new(scale, -scale)])
+                    .unwrap();
             let inverse = a
                 .inverse()
                 .unwrap()
@@ -380,6 +384,7 @@ mod tests {
         }
         assert!(
             DenseComplex::diagonal(&[Complex::real(f64::from_bits(1))])
+                .unwrap()
                 .inverse()
                 .is_err()
         );
@@ -401,25 +406,25 @@ mod tests {
             ],
         );
         assert_eq!(rounded.inverse().unwrap(), None);
-        assert_eq!(DenseComplex::zeros(2).inverse().unwrap(), None);
+        assert_eq!(DenseComplex::zeros(2).unwrap().inverse().unwrap(), None);
         assert_eq!(
-            DenseComplex::zeros(0).inverse().unwrap(),
-            Some(DenseComplex::zeros(0))
+            DenseComplex::zeros(0).unwrap().inverse().unwrap(),
+            Some(DenseComplex::zeros(0).unwrap())
         );
     }
 
     #[test]
     fn arithmetic_checks_dimensions_and_finiteness() {
-        let two = DenseComplex::identity(2);
-        let three = DenseComplex::identity(3);
+        let two = DenseComplex::identity(2).unwrap();
+        let three = DenseComplex::identity(3).unwrap();
         assert!(two.add(&three).is_err());
         assert!(two.sub(&three).is_err());
         assert!(two.mul(&three).is_err());
         assert!(two.clone().set(2, 0, Complex::ZERO).is_err());
         assert_eq!(two.get(2, 0), None);
-        let huge = DenseComplex::diagonal(&[Complex::real(f64::MAX); 2]);
+        let huge = DenseComplex::diagonal(&[Complex::real(f64::MAX); 2]).unwrap();
         assert!(huge.add(&huge).is_err());
-        let nan = DenseComplex::diagonal(&[Complex::real(f64::NAN); 2]);
+        let nan = DenseComplex::diagonal(&[Complex::real(f64::NAN); 2]).unwrap();
         assert!(nan.inverse().is_err());
         let sum = two.add(&two).unwrap().sub(&two).unwrap();
         assert_eq!(sum, two);

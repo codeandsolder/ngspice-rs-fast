@@ -370,7 +370,7 @@ impl Hfet2 {
         let (model, model_defaults) = Model::resolve(resolved)?;
         let (initial, setters) = Instance::resolve(i)?;
         let instance = Instance::validate(&model_defaults, &setters, &i.location)?;
-        let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "HFET2");
+        let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "HFET2")?;
         // C creates source and drain primes in this order.
         let sp = topology.prime(model.rs, "source", s)?;
         let dp = topology.prime(model.rd, "drain", d)?;

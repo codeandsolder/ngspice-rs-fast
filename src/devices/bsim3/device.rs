@@ -192,7 +192,11 @@ impl Bsim3 {
         };
         let ic = [component("icvbs"), component("icvgs"), component("icvds")];
         let mut staged = nodes.clone();
-        let mut terminals: Vec<NodeId> = instance.nodes.iter().map(|n| staged.intern(n)).collect();
+        let mut terminals: Vec<NodeId> = instance
+            .nodes
+            .iter()
+            .map(|n| staged.intern(n))
+            .collect::<SpiceResult<Vec<_>>>()?;
         let mut primes = [None; 2];
         for (index, conductance, suffix) in [
             (0, setup.drain_conductance, "drain"),
@@ -208,7 +212,7 @@ impl Bsim3 {
                     instance.name
                 )));
             }
-            let prime = staged.intern(&name);
+            let prime = staged.intern(&name)?;
             staged.set_kind(prime, NodeKind::Internal);
             terminals.push(prime);
             primes[index] = Some(prime);

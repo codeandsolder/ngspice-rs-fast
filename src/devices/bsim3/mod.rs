@@ -75,7 +75,6 @@ pub mod parameters;
 /// The module validates setup without allocating state or matrix rows.
 pub mod setup;
 mod size_data;
-/// Model-level temperature processing from `b3temp.c`.
 pub mod temperature;
 
 /// Select the BSIM3 version.

@@ -100,8 +100,8 @@ pub(super) fn run(
                 let matrix =
                     crate::analysis::ac::ac_matrix(circuit, system, 2. * std::f64::consts::PI * f)?
                         .factorize()?;
-                let mut incident = DenseComplex::zeros(ports.len());
-                let mut scattered = DenseComplex::zeros(ports.len());
+                let mut incident = DenseComplex::zeros(ports.len())?;
+                let mut scattered = DenseComplex::zeros(ports.len())?;
                 let mut last = Vec::new();
                 for (column, driven) in ports.iter().enumerate() {
                     // VSRCspupdate: unit excitation in the active port's branch
@@ -284,28 +284,28 @@ fn port_matrices(
             .iter()
             .map(|port| Complex::real(port.z0))
             .collect::<Vec<_>>(),
-    );
+    )?;
     let gn = DenseComplex::diagonal(
         &ports
             .iter()
             .map(|port| Complex::real(2. * port.ki))
             .collect::<Vec<_>>(),
-    );
+    )?;
     let gn_inverse = DenseComplex::diagonal(
         &ports
             .iter()
             .map(|port| Complex::real(1. / (2. * port.ki)))
             .collect::<Vec<_>>(),
-    );
-    let e_minus_s = DenseComplex::identity(n).sub(&s)?;
+    )?;
+    let e_minus_s = DenseComplex::identity(n)?.sub(&s)?;
     let s_z0_plus_z0 = s.mul(&zref)?.add(&zref)?;
     let z = match e_minus_s.inverse()? {
         Some(inverse) => gn_inverse.mul(&inverse.mul(&s_z0_plus_z0.mul(&gn)?)?)?,
-        None => DenseComplex::zeros(n),
+        None => DenseComplex::zeros(n)?,
     };
     let y = match s_z0_plus_z0.inverse()? {
         Some(inverse) => gn_inverse.mul(&inverse.mul(&e_minus_s.mul(&gn)?)?)?,
-        None => DenseComplex::zeros(n),
+        None => DenseComplex::zeros(n)?,
     };
     Ok([s, y, z])
 }
@@ -335,7 +335,7 @@ fn noise_parameters(
         }
         adjoints.push(factor.solve_transposed(&rhs)?);
     }
-    let mut cy = DenseComplex::zeros(count);
+    let mut cy = DenseComplex::zeros(count)?;
     for instance in generators {
         for source in &instance.sources {
             if matches!(

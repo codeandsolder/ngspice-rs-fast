@@ -748,7 +748,11 @@ pub(super) fn intern_nodes(
     rs: Real,
 ) -> SpiceResult<(Vec<NodeId>, [NodeId; 3])> {
     let mut staged = nodes.clone();
-    let external: Vec<NodeId> = i.nodes.iter().map(|n| staged.intern(n)).collect();
+    let external: Vec<NodeId> = i
+        .nodes
+        .iter()
+        .map(|n| staged.intern(n))
+        .collect::<SpiceResult<Vec<_>>>()?;
     let mut terminals = external.clone();
     let mut inner = [external[0], external[1], external[2]];
     for (index, resistance, suffix) in [(2, rs, "source"), (0, rd, "drain")] {
@@ -759,7 +763,7 @@ pub(super) fn intern_nodes(
                     "JFET internal-node name collision: {name}"
                 )));
             }
-            let prime = staged.intern(&name);
+            let prime = staged.intern(&name)?;
             staged.set_kind(prime, NodeKind::Internal);
             terminals.push(prime);
             inner[index] = prime;

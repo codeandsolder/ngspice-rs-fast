@@ -28,6 +28,18 @@ pub use value::{
     parse_numparam_number_prefix, parse_spice_number, parse_spice_number_prefix,
 };
 
+/// Allocate initialized storage without overflowing the allocation size.
+pub(crate) fn filled_vec<T: Clone>(len: usize, value: T, context: &str) -> SpiceResult<Vec<T>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(len)
+        .map_err(|error| SpiceError::Numerical {
+            context: context.to_owned(),
+            message: format!("cannot allocate {len} entries: {error}"),
+        })?;
+    data.resize(len, value);
+    Ok(data)
+}
+
 /// The kinds of analysis ngspice can run.
 ///
 /// Shared vocabulary: the netlist front-end records which analyses a deck asks

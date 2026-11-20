@@ -324,7 +324,7 @@ fn programmatic_construction_validates_kinds_and_gains() {
         .is_err()
     );
     let mut nodes = ngspice_rs::primitives::NodeTable::new();
-    let (p, n) = (nodes.intern("p"), nodes.intern("n"));
+    let (p, n) = (nodes.intern("p").unwrap(), nodes.intern("n").unwrap());
     assert!(
         ControlledSource::current_controlled(
             "f1",

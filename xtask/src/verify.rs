@@ -1850,7 +1850,7 @@ const EXCLUDED: &[(&str, &str)] = &[(
      but not the FMA-built golden (3 poles)",
 )];
 
-pub(super) fn main(arguments: &[String]) -> Result<(), String> {
+pub(crate) fn main(arguments: &[String]) -> Result<(), String> {
     let only = match arguments {
         [] => None,
         [flag, name] if flag == "--netlist" && !name.starts_with('-') => Some(name.as_str()),

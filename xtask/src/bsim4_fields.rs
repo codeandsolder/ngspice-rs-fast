@@ -1,3 +1,5 @@
+//! Extract BSIM4 scalar field declarations.
+//!
 //! Extract the numeric field declarations of BSIM4's three C structs
 //! (`sBSIM4model`, `bsim4SizeDependParam`, `sBSIM4instance`) as Rust struct
 //! definitions: field names and scalar types only. The BSIM4 port keeps C's
@@ -209,7 +211,7 @@ fn real_asks(source: &str, prefix: &str) -> Result<Vec<(String, String)>, String
 
 /// The generated `asks.rs` text: the real asks of `b4mask.c` and `b4ask.c`
 /// that read a member directly (`sens_getp()` succeeds only for these).
-pub fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, String> {
+pub(crate) fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, String> {
     let model = real_asks(mask, "model->")?;
     let instance = real_asks(ask, "here->")?;
     if model.len() != 869 || instance.len() != 40 {
@@ -225,12 +227,12 @@ pub fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, String> {
          // bsim4/{{b4mask.c,b4ask.c}}.\n\
          // Regenerate: cargo xtask bsim4-schema --source /path/to/ngspice\n\n\
          /// `b4mask.c`: `(model parameter ID, member)` asks that read one real member.\n\
-         #[rustfmt::skip]\npub(super) const MODEL: &[(&str, &str)] = &[\n"
+         #[rustfmt::skip]\npub(crate) const MODEL: &[(&str, &str)] = &[\n"
     );
     for (id, member) in &model {
         writeln!(out, "    (\"{id}\", \"{member}\"),").map_err(|e| e.to_string())?;
     }
-    out.push_str("];\n\n/// `b4ask.c`: `(instance parameter ID, member)` asks that read one real member.\n#[rustfmt::skip]\npub(super) const INSTANCE: &[(&str, &str)] = &[\n");
+    out.push_str("];\n\n/// `b4ask.c`: `(instance parameter ID, member)` asks that read one real member.\n#[rustfmt::skip]\npub(crate) const INSTANCE: &[(&str, &str)] = &[\n");
     for (id, member) in &instance {
         writeln!(out, "    (\"{id}\", \"{member}\"),").map_err(|e| e.to_string())?;
     }
@@ -239,7 +241,7 @@ pub fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, String> {
 }
 
 /// The generated `fields.rs` text.
-pub fn fields(header: &str, revision: &str) -> Result<String, String> {
+pub(crate) fn fields(header: &str, revision: &str) -> Result<String, String> {
     let header = crate::ifparm::strip_comments(header)?;
     let instance = members(
         &header,

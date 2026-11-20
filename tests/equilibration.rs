@@ -7,7 +7,7 @@ use ngspice_rs::primitives::Complex;
 
 fn matrices(values: &[&[f64]]) -> (SparseMatrix, Matrix) {
     let mut sparse = SparseMatrix::new(values.len(), values[0].len());
-    let mut dense = Matrix::zeros(sparse.rows(), sparse.cols());
+    let mut dense = Matrix::zeros(sparse.rows(), sparse.cols()).unwrap();
     for (r, row) in values.iter().enumerate() {
         for (c, &v) in row.iter().enumerate() {
             sparse.add(r, c, v).unwrap();
@@ -213,8 +213,8 @@ fn singular_homogeneous_nonunique_and_ideal_source_loop_remain_failures() {
 #[test]
 fn dimensions_nonfinite_duplicate_and_frequency_overflow_are_errors() {
     for (s, d) in [
-        (SparseMatrix::new(0, 0), Matrix::zeros(0, 0)),
-        (SparseMatrix::new(2, 3), Matrix::zeros(2, 3)),
+        (SparseMatrix::new(0, 0), Matrix::zeros(0, 0).unwrap()),
+        (SparseMatrix::new(2, 3), Matrix::zeros(2, 3).unwrap()),
     ] {
         assert!(EquilibratedSparseLu::new(&s, None).is_err());
         assert!(EquilibratedDenseLu::new(&d).is_err());

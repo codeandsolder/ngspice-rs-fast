@@ -120,7 +120,7 @@ pub(crate) fn fallback(
         return Ok(None);
     }
     crate::devices::factory::append_nodes(nodes, |nodes| {
-        let terminals: [NodeId; 4] = std::array::from_fn(|i| nodes.intern(&instance.nodes[i]));
+        let terminals: [NodeId; 4] = nodes.intern_array(&instance.nodes)?;
         let mut line = [terminals[0], NodeId::GROUND, NodeId::GROUND, terminals[2]];
         for (k, node) in line.iter_mut().enumerate().take(3).skip(1) {
             let name = format!("txlnd{k}{}", instance.name);
@@ -131,7 +131,7 @@ pub(crate) fn fallback(
                     "TXL generated-node collision: {name}"
                 )));
             }
-            *node = nodes.intern(&name);
+            *node = nodes.intern(&name)?;
         }
         let r = 3. / (m.r * length);
         let c = m.c * length / 6.;
@@ -178,7 +178,7 @@ impl Txl {
         if !resistance.is_finite() {
             return Err(SpiceError::circuit("TXL R*length overflow"));
         }
-        let ids: [NodeId; 4] = std::array::from_fn(|i| nodes.intern(&instance.nodes[i]));
+        let ids: [NodeId; 4] = nodes.intern_array(&instance.nodes)?;
         Ok(Box::new(Self {
             name: instance.name.clone(),
             terminals: [ids[0], ids[2]],

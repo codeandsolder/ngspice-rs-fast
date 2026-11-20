@@ -990,7 +990,11 @@ impl<L: MosLevel> Mosfet<L> {
         // Validate every derivation before interning nodes.
         device.operating(context)?;
         let mut staged = nodes.clone();
-        let external: Vec<NodeId> = i.nodes.iter().map(|n| staged.intern(n)).collect();
+        let external: Vec<NodeId> = i
+            .nodes
+            .iter()
+            .map(|n| staged.intern(n))
+            .collect::<SpiceResult<Vec<_>>>()?;
         device.terminals.clone_from(&external);
         device.inner = [external[0], external[1], external[2], external[3]];
         for (index, conductance, suffix) in [
@@ -1005,7 +1009,7 @@ impl<L: MosLevel> Mosfet<L> {
                         L::LABEL
                     )));
                 }
-                let prime = staged.intern(&name);
+                let prime = staged.intern(&name)?;
                 staged.set_kind(prime, NodeKind::Internal);
                 device.terminals.push(prime);
                 device.inner[index] = prime;

@@ -459,7 +459,9 @@ impl Circuit {
     ///
     /// Matrix rows change as nodes are added, so call
     /// [`Circuit::rebuild_unknowns`] once the circuit is complete.
-    pub fn add_node(&mut self, name: &str) -> NodeId {
+    /// # Errors
+    /// Node identity or allocation capacity is exhausted.
+    pub fn add_node(&mut self, name: &str) -> SpiceResult<NodeId> {
         self.nodes.intern(name)
     }
 
@@ -743,7 +745,7 @@ impl Circuit {
             // `diagonal` (`M_ij / sqrt(d_i d_j)` off the unit diagonal), and
             // its rounding tolerance.
             let smallest = |diagonal: &dyn Fn(&InductanceValue) -> Real| -> SpiceResult<_> {
-                let mut matrix = crate::maths::Matrix::zeros(n, n);
+                let mut matrix = crate::maths::Matrix::zeros(n, n)?;
                 for row in 0..n {
                     matrix.set(row, row, 1.0)?;
                 }
@@ -983,14 +985,14 @@ impl Circuit {
         if elements.is_empty() || n == 0 {
             return Ok(());
         }
-        let allocated = crate::maths::Pattern::new(n, elements);
+        let allocated = crate::maths::Pattern::new(n, elements)?;
         let same = slot.as_ref().is_some_and(|current| {
             current.order() == n
                 && current.len() >= allocated.len()
-                && (0..allocated.len()).all(|index| {
-                    let id = crate::maths::sparse::element_id(index);
-                    current.position(id) == allocated.position(id)
-                })
+                && current
+                    .positions()
+                    .take(allocated.len())
+                    .eq(allocated.positions())
         });
         if !same {
             *slot = Some(std::sync::Arc::new(allocated));
@@ -1046,8 +1048,7 @@ impl Circuit {
         }
         if let Some(pattern) = self.matrix_pattern() {
             let known: BTreeSet<(usize, usize)> = elements.iter().copied().collect();
-            for index in 0..pattern.len() {
-                let position = pattern.position(crate::maths::sparse::element_id(index));
+            for position in pattern.positions() {
                 if !known.contains(&position)
                     && !private.contains(&position.0)
                     && !private.contains(&position.1)
@@ -1835,7 +1836,7 @@ impl Circuit {
         self.fixed_stamps
             .replace(unlent.unwrap_or_else(|| matrix.return_fixed()));
         stamped?;
-        self.learn_pattern(matrix);
+        self.learn_pattern(matrix)?;
         matrix.record_trace();
         Ok(())
     }
@@ -1931,10 +1932,10 @@ impl Circuit {
         let compatible = slot.as_ref().is_none_or(|current| {
             inherited.order() == current.order()
                 && inherited.len() >= current.len()
-                && (0..current.len()).all(|index| {
-                    let id = crate::maths::sparse::element_id(index);
-                    inherited.position(id) == current.position(id)
-                })
+                && inherited
+                    .positions()
+                    .take(current.len())
+                    .eq(current.positions())
         });
         if compatible {
             *slot = Some(inherited);
@@ -1968,35 +1969,38 @@ impl Circuit {
     /// Records the positions a load stamped: the first load defines the
     /// pattern in stamp order; positions outside it are appended (which, as a
     /// new SPARSE element does, forces the next factorization to reorder).
-    fn learn_pattern(&self, matrix: &SparseMatrix) {
+    fn learn_pattern(&self, matrix: &SparseMatrix) -> SpiceResult<()> {
         let n = self.unknown_count();
         let mut slot = self.pattern.borrow_mut();
         let current = slot.as_ref().filter(|pattern| pattern.order() == n);
         let next = if let Some((bound, mut extra)) = matrix.overflow() {
             let mut extra = extra.by_ref().peekable();
             if extra.peek().is_none() {
-                return;
+                return Ok(());
             }
             match current {
-                Some(pattern) if std::sync::Arc::ptr_eq(pattern, bound) => pattern.extended(extra),
-                _ => return,
+                Some(pattern) if std::sync::Arc::ptr_eq(pattern, bound) => {
+                    pattern.extended(extra)?
+                }
+                _ => return Ok(()),
             }
         } else {
             let positions = matrix.triplets().iter().map(|t| (t.row, t.col));
             match current {
-                None => crate::maths::Pattern::new(n, positions),
+                None => crate::maths::Pattern::new(n, positions)?,
                 Some(pattern) => {
                     let mut missing = positions
                         .filter(|&(row, col)| pattern.find(row, col).is_none())
                         .peekable();
                     if missing.peek().is_none() {
-                        return;
+                        return Ok(());
                     }
-                    pattern.extended(missing)
+                    pattern.extended(missing)?
                 }
             }
         };
         *slot = Some(std::sync::Arc::new(next));
+        Ok(())
     }
 
     fn run_accept_hooks(
@@ -2851,8 +2855,8 @@ mod tests {
     }
 
     fn stub(circuit: &mut Circuit, name: &str, a: &str, b: &str, branch_currents: usize) -> Stub {
-        let first = circuit.add_node(a);
-        let second = circuit.add_node(b);
+        let first = circuit.add_node(a).unwrap();
+        let second = circuit.add_node(b).unwrap();
         Stub {
             name: name.to_owned(),
             terminals: vec![first, second],
@@ -2925,7 +2929,7 @@ mod tests {
         // can have an equal-size layout whose node IDs mean other nodes.
         let build = |name: &str| {
             let mut circuit = Circuit::new();
-            let node = circuit.add_node(name);
+            let node = circuit.add_node(name).unwrap();
             circuit
                 .add_device(Box::new(
                     crate::devices::Capacitor::new("c1", [node, NodeId::GROUND], 1., None).unwrap(),
@@ -3006,7 +3010,7 @@ mod tests {
     #[test]
     fn dangling_terminals_are_rejected() {
         let mut circuit = Circuit::new();
-        let known = circuit.add_node("a");
+        let known = circuit.add_node("a").unwrap();
         let dangling = NodeId::new(99);
         let device = Stub {
             name: "r1".to_owned(),
@@ -3026,7 +3030,7 @@ mod tests {
         assert_eq!(circuit.unknown_count(), 2);
 
         // A node added afterwards shifts nothing until the next rebuild.
-        circuit.add_node("late");
+        circuit.add_node("late").unwrap();
         circuit.finalize().unwrap();
         assert_eq!(circuit.unknown_count(), 3);
     }
@@ -3068,7 +3072,7 @@ mod tests {
             empty.node_weights().copied().collect::<Vec<_>>(),
             vec![CircuitVertex::Node(NodeId::GROUND)]
         );
-        let unused = circuit.add_node("unused");
+        let unused = circuit.add_node("unused").unwrap();
         let graph = circuit.topology().unwrap();
         assert_eq!(graph.node_count(), 2);
         assert_eq!(connected_components(&graph), 2);
@@ -3120,8 +3124,8 @@ mod tests {
     #[test]
     fn multiport_and_repeated_terminals_keep_parallel_edges_and_ordinals() {
         let mut circuit = Circuit::new();
-        let output = circuit.add_node("out");
-        let ground = circuit.add_node("gnd");
+        let output = circuit.add_node("out").unwrap();
+        let ground = circuit.add_node("gnd").unwrap();
         circuit
             .add_device(Box::new(Stub {
                 name: "m1".to_owned(),
@@ -3199,7 +3203,7 @@ mod tests {
         let a = device.terminals[0];
         circuit.add_device(Box::new(device)).unwrap();
         let before = circuit.topology().unwrap();
-        circuit.add_node("late");
+        circuit.add_node("late").unwrap();
         circuit.devices_mut()[0] = Box::new(Stub {
             name: "r1".to_owned(),
             terminals: vec![a, a],
@@ -3230,7 +3234,7 @@ mod tests {
         circuit.add_device(Box::new(second)).unwrap();
         circuit.finalize().unwrap();
         let original = circuit.unknowns().clone();
-        circuit.add_node("late");
+        circuit.add_node("late").unwrap();
         circuit.devices_mut()[1] = Box::new(Stub {
             name: "R1".to_owned(),
             terminals: vec![b, NodeId::GROUND],

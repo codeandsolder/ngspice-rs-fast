@@ -93,7 +93,7 @@ struct Operators {
 impl Operators {
     fn new(size: usize, ill_scaled: bool, failure: Option<&str>) -> SpiceResult<Self> {
         let mut conductance = SparseMatrix::new(size, size);
-        let mut dense = Matrix::zeros(size, size);
+        let mut dense = Matrix::zeros(size, size)?;
         let mut susceptance = SparseMatrix::new(size, size);
         let columns: Vec<_> = (0..size)
             .map(|column| {

@@ -48,7 +48,7 @@ fn invalid_source_waveforms_are_rejected_before_mutating_nodes_or_circuit() {
         assert!(Circuit::from_netlist(&netlist).is_err());
         let raw = RawCard::parse(&deck.lines[1]).unwrap();
         let mut nodes = NodeTable::new();
-        nodes.intern("old");
+        nodes.intern("old").unwrap();
         let before = nodes.nodes().to_vec();
         let error = match Registry::with_builtins().instantiate(&raw, &mut nodes) {
             Err(error) => error,

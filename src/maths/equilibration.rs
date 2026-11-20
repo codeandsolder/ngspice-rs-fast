@@ -435,7 +435,7 @@ impl EquilibratedDenseLu {
     pub fn new(matrix: &Matrix) -> SpiceResult<Self> {
         let original = dense_entries(matrix)?;
         let scaling = Equilibration::new(matrix.rows(), &original)?;
-        let mut scaled = Matrix::zeros(matrix.rows(), matrix.cols());
+        let mut scaled = Matrix::zeros(matrix.rows(), matrix.cols())?;
         for entry in scaling.scale_entries(&original) {
             let (r, c, v) = entry?;
             scaled.set(r, c, v)?;

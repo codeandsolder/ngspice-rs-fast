@@ -542,13 +542,13 @@ pub(crate) fn instantiate(
     let mark = nodes.len();
     let result = (|| {
         let output = [
-            nodes.intern(&instance.nodes[0]),
-            nodes.intern(&instance.nodes[1]),
+            nodes.intern(&instance.nodes[0])?,
+            nodes.intern(&instance.nodes[1])?,
         ];
         if kind.voltage_controlled() {
             let control = [
-                nodes.intern(&instance.nodes[2]),
-                nodes.intern(&instance.nodes[3]),
+                nodes.intern(&instance.nodes[2])?,
+                nodes.intern(&instance.nodes[3])?,
             ];
             ControlledSource::voltage_controlled(&instance.name, kind, output, control, gain)
         } else {
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn failed_source_binding_rolls_back_only_new_nodes() {
         let mut nodes = NodeTable::new();
-        let present = nodes.intern("present");
+        let present = nodes.intern("present").unwrap();
         let deck = Parser::new().parse_deck(&parse_deck_text(
             Path::new("control.cir"),
             "title\ne1 fresh fresh newcontrol present 2\nf1 fresh 0 vs 3\ng1 fresh 0 newcontrol present 2\n.end\n"

@@ -172,6 +172,8 @@ pub(super) enum Status {
     Singular,
     /// The factorization produced an unrepresentable numeric value.
     NonFinite,
+    /// A traversal plan cannot be derived from the ordered topology.
+    InvalidPlan,
 }
 
 #[derive(Debug, Clone)]
@@ -186,13 +188,13 @@ struct Element {
 /// retain usize support for larger standalone matrices, with the dispatch
 /// outside all numeric loops.
 trait PlanIndex: Copy {
-    fn pack(index: usize) -> Self;
+    fn pack(index: usize) -> Option<Self>;
     fn unpack(self) -> usize;
 }
 
 impl PlanIndex for usize {
-    fn pack(index: usize) -> Self {
-        index
+    fn pack(index: usize) -> Option<Self> {
+        Some(index)
     }
     fn unpack(self) -> usize {
         self
@@ -200,11 +202,12 @@ impl PlanIndex for usize {
 }
 
 impl PlanIndex for u32 {
-    fn pack(index: usize) -> Self {
-        Self::try_from(index).expect("compact traversal plan index fits")
+    fn pack(index: usize) -> Option<Self> {
+        Self::try_from(index).ok()
     }
     fn unpack(self) -> usize {
-        usize::try_from(self).expect("u32 fits the index width")
+        // The simulator supports 32- and 64-bit targets.
+        self as usize
     }
 }
 
@@ -217,11 +220,11 @@ struct RunEntry<I> {
 }
 
 impl<I: PlanIndex> RunEntry<I> {
-    fn new(handle: usize, coordinate: usize) -> Self {
-        Self {
-            handle: I::pack(handle),
-            coordinate: I::pack(coordinate),
-        }
+    fn new(handle: usize, coordinate: usize) -> Option<Self> {
+        Some(Self {
+            handle: I::pack(handle)?,
+            coordinate: I::pack(coordinate)?,
+        })
     }
 
     fn indices(self) -> (usize, usize) {
@@ -453,6 +456,55 @@ impl Topology {
             }
         }
         e
+    }
+
+    /// Append to a sorted column in constant time, or mark it for deferred
+    /// sorting if rows arrive in an arbitrary order. A missing tail with a
+    /// nonempty head denotes an unordered column.
+    fn append_original(&mut self, row: usize, col: usize, tails: &mut [usize]) -> usize {
+        let tail = tails[col];
+        let head = self.first_in_col[col];
+        if head == NONE {
+            let handle = self.create_element(row, col, Slot::Head(col), false);
+            tails[col] = handle;
+            handle
+        } else if tail != NONE && row > self.elements[tail].row {
+            let handle = self.create_element(row, col, Slot::After(tail), false);
+            tails[col] = handle;
+            handle
+        } else {
+            if row >= self.elements[head].row {
+                tails[col] = NONE;
+            }
+            self.create_element(row, col, Slot::Head(col), false)
+        }
+    }
+
+    /// Finalize only unordered columns. Stable handles remain in original
+    /// creation order; the linked traversal is sorted by internal row.
+    fn finish_original_columns(&mut self, tails: &[usize]) {
+        let mut run = Vec::new();
+        for (col, &tail) in tails.iter().enumerate().skip(1) {
+            if tail != NONE || self.first_in_col[col] == NONE {
+                continue;
+            }
+            run.clear();
+            let mut e = self.first_in_col[col];
+            while e != NONE {
+                run.push(e);
+                e = self.elements[e].next_in_col;
+            }
+            run.sort_unstable_by_key(|&handle| self.elements[handle].row);
+            self.first_in_col[col] = run[0];
+            for pair in run.windows(2) {
+                assert_ne!(
+                    self.elements[pair[0]].row, self.elements[pair[1]].row,
+                    "duplicate original sparse element"
+                );
+                self.elements[pair[0]].next_in_col = pair[1];
+            }
+            self.elements[run[run.len() - 1]].next_in_col = NONE;
+        }
     }
 
     fn col_get(&self, slot: Slot) -> usize {
@@ -726,6 +778,123 @@ impl PermutationParity {
     }
 }
 
+/// Cached summaries of contiguous Markowitz-product blocks. They permit
+/// skipping ranges that cannot contain the next reference-order candidate.
+/// Dirty blocks are rebuilt on demand, never changing the candidate order.
+#[derive(Debug, Clone, Copy)]
+struct ProductSummary {
+    min: i64,
+    zeros: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PivotProducts {
+    values: Vec<i64>,
+    summaries: Vec<Option<ProductSummary>>,
+}
+
+impl PivotProducts {
+    const BLOCK: usize = u64::BITS as usize;
+    // For a short search, walking the contiguous products is cheaper
+    // than maintaining summaries. Amortize them over longer scans.
+    const MIN_INDEXED_PRODUCTS: usize = Self::BLOCK * 8 + 2;
+
+    fn new(len: usize) -> Self {
+        Self {
+            values: vec![0; len],
+            summaries: if len > Self::MIN_INDEXED_PRODUCTS {
+                vec![None; len.div_ceil(Self::BLOCK)]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn set(&mut self, i: usize, value: i64) {
+        if self.summaries.is_empty() {
+            self.values[i] = value;
+        } else if self.values[i] != value {
+            self.values[i] = value;
+            self.summaries[i / Self::BLOCK] = None;
+        }
+    }
+
+    fn swap(&mut self, a: usize, b: usize) {
+        let (x, y) = (self.values[a], self.values[b]);
+        self.set(a, y);
+        self.set(b, x);
+    }
+
+    fn summary(&mut self, block: usize) -> ProductSummary {
+        *self.summaries[block].get_or_insert_with(|| {
+            let start = block * Self::BLOCK;
+            let values = &self.values[start..(start + Self::BLOCK).min(self.values.len())];
+            let mut min = i64::MAX;
+            let mut zeros = 0;
+            for (i, &v) in values.iter().enumerate() {
+                min = min.min(v);
+                if v == 0 {
+                    zeros |= 1_u64 << i;
+                }
+            }
+            ProductSummary { min, zeros }
+        })
+    }
+
+    /// Greatest index strictly before the cursor with product below limit.
+    /// Sentinels ensure the search has a match in the C pivot routine.
+    fn previous_below(&mut self, mut before: usize, limit: i64) -> Option<usize> {
+        if self.summaries.is_empty() {
+            return self.values[..before].iter().rposition(|&v| v < limit);
+        }
+        while before != 0 {
+            let block = (before - 1) / Self::BLOCK;
+            let start = block * Self::BLOCK;
+            if (before - start != Self::BLOCK || self.summary(block).min < limit)
+                && let Some(pos) = self.values[start..before].iter().rposition(|&v| v < limit)
+            {
+                return Some(start + pos);
+            }
+            before = start;
+        }
+        None
+    }
+
+    /// Greatest zero-product index strictly before the cursor.
+    fn previous_zero(&mut self, mut before: usize) -> Option<usize> {
+        if self.summaries.is_empty() {
+            return self.values[..before].iter().rposition(|&v| v == 0);
+        }
+        while before != 0 {
+            let block = (before - 1) / Self::BLOCK;
+            let start = block * Self::BLOCK;
+            let len = before - start;
+            if len == Self::BLOCK {
+                let mask = self.summary(block).zeros;
+                if mask != 0 {
+                    return Some(start + (u64::BITS - 1 - mask.leading_zeros()) as usize);
+                }
+            } else if let Some(pos) = self.values[start..before].iter().rposition(|&v| v == 0) {
+                return Some(start + pos);
+            }
+            before = start;
+        }
+        None
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
+impl std::ops::Index<usize> for PivotProducts {
+    type Output = i64;
+    fn index(&self, index: usize) -> &i64 {
+        &self.values[index]
+    }
+}
+
 /// A SPARSE matrix frame (`struct MatrixFrame`) with 1-based internal and
 /// external indices; external index 0 (ground) is never used here.
 #[derive(Debug, Clone)]
@@ -745,7 +914,7 @@ pub(super) struct Sparse<T> {
     plan: Option<std::sync::Arc<FactorPlan>>,
     markowitz_row: Vec<i64>,
     markowitz_col: Vec<i64>,
-    markowitz_prod: Vec<i64>,
+    markowitz_prod: PivotProducts,
     singletons: i64,
     rel_threshold: f64,
     abs_threshold: f64,
@@ -784,7 +953,7 @@ impl<T: Scalar> Sparse<T> {
             plan: None,
             markowitz_row: Vec::new(),
             markowitz_col: Vec::new(),
-            markowitz_prod: Vec::new(),
+            markowitz_prod: PivotProducts::default(),
             singletons: 0,
             rel_threshold: DEFAULT_THRESHOLD,
             abs_threshold: 0.0,
@@ -928,15 +1097,15 @@ impl<T: Scalar> Sparse<T> {
         let topology = std::sync::Arc::make_mut(&mut sparse.topology);
         topology.elements.reserve(capacity);
         sparse.values.reserve(capacity);
+        let mut tails = vec![NONE; size + 1];
         for (row, col, value) in entries {
             debug_assert!(row >= 1 && col >= 1 && row <= size && col <= size);
             let (r, c) = topology.translate(&mut sparse.size, row, col);
-            let (last, found) = topology.locate_in_col(Slot::Head(c), r);
-            assert_eq!(found, NONE, "duplicate original sparse element");
-            let handle = topology.create_element(r, c, last, false);
+            let handle = topology.append_original(r, c, &mut tails);
             debug_assert_eq!(handle, sparse.values.len());
             sparse.values.push(value);
         }
+        topology.finish_original_columns(&tails[..=sparse.size]);
         sparse
     }
 
@@ -945,10 +1114,10 @@ impl<T: Scalar> Sparse<T> {
         debug_assert_eq!(pattern.len(), values.len());
         Self::from_originals(
             pattern.order(),
-            values.iter().enumerate().map(|(index, &value)| {
-                let (r, c) = pattern.position(crate::maths::sparse::element_id(index));
-                (r + 1, c + 1, value)
-            }),
+            pattern
+                .positions()
+                .zip(values)
+                .map(|((r, c), &value)| (r + 1, c + 1, value)),
         )
     }
 
@@ -970,17 +1139,13 @@ impl<T: Scalar> Sparse<T> {
         self.reset_numeric_status();
     }
 
-    /// The same matrix frame holding another scalar type, every element
-    /// zero: ngspice switches one frame between real and complex
-    /// (`spSetReal`/`spSetComplex`), keeping its internal numbering, row and
-    /// column exchanges, pivot order, fill-ins and flags. Only scalar storage is rebuilt;
-    /// the structural index buffers move unchanged. Loads start with
-    /// `spClear`, so the values carried over do not matter.
-    pub(crate) fn into_retyped<U: Scalar>(self) -> Sparse<U> {
+    /// Transfer one scalar frame's ordering; numeric coefficients are
+    /// supplied by the caller, never copied from the old LU.
+    fn into_retyped_values<U: Scalar>(self, values: Vec<U>) -> Sparse<U> {
         Sparse {
             size: self.size,
             ext_size: self.ext_size,
-            values: vec![U::ZERO; self.values.len()],
+            values,
             topology: self.topology,
             plan: self.plan,
             markowitz_row: self.markowitz_row,
@@ -1001,20 +1166,17 @@ impl<T: Scalar> Sparse<T> {
         }
     }
 
-    /// Fork the ordering, not the numeric payload, when a retained
-    /// snapshot prevents moving its storage. The caller reloads originals
-    /// before factoring. Markowitz and factor scratch are initialized only
-    /// if the new operation needs them.
-    pub(super) fn fork_for_reload<U: Scalar>(&self) -> Sparse<U> {
+    /// Fork the structural state, discarding scratch and old factors.
+    fn fork_values<U: Scalar>(&self, values: Vec<U>) -> Sparse<U> {
         Sparse {
             size: self.size,
             ext_size: self.ext_size,
             topology: self.topology.clone(),
-            values: vec![U::ZERO; self.values.len()],
+            values,
             plan: self.plan.clone(),
             markowitz_row: Vec::new(),
             markowitz_col: Vec::new(),
-            markowitz_prod: Vec::new(),
+            markowitz_prod: PivotProducts::default(),
             singletons: 0,
             rel_threshold: self.rel_threshold,
             abs_threshold: self.abs_threshold,
@@ -1029,22 +1191,72 @@ impl<T: Scalar> Sparse<T> {
         }
     }
 
-    /// Get mutable storage for a full coefficient reload. Unique frames
-    /// keep their numeric buffers; shared frames don't copy discarded data.
-    pub(super) fn for_reload(shared: &mut std::sync::Arc<Self>) -> &mut Self {
-        if std::sync::Arc::strong_count(shared) > 1 {
-            *shared = std::sync::Arc::new(shared.fork_for_reload());
-        }
-        std::sync::Arc::make_mut(shared)
+    /// Construct the complete numeric buffer directly. The original
+    /// handles are consecutive; only the fill-in suffix needs zeroing.
+    fn loaded_values<U: Scalar>(&self, originals: impl ExactSizeIterator<Item = U>) -> Vec<U> {
+        let total = self.values.len();
+        assert!(
+            originals.len() <= total,
+            "more originals than sparse elements"
+        );
+        let mut values = Vec::with_capacity(total);
+        values.extend(originals);
+        values.resize(total, U::ZERO);
+        values
     }
 
-    /// Switch scalar type, moving unique storage and forking only the
-    /// ordering if another snapshot remains alive.
-    pub(super) fn retype_shared<U: Scalar>(shared: std::sync::Arc<Self>) -> Sparse<U> {
-        match std::sync::Arc::try_unwrap(shared) {
-            Ok(owned) => owned.into_retyped(),
-            Err(retained) => retained.fork_for_reload(),
+    pub(super) fn fork_loaded<U: Scalar>(
+        &self,
+        originals: impl ExactSizeIterator<Item = U>,
+    ) -> Sparse<U> {
+        let mut next = self.fork_values(self.loaded_values(originals));
+        next.reset_numeric_status();
+        next
+    }
+
+    /// Reload in place if the factor buffer is uniquely held, otherwise
+    /// fork directly from the newly assembled values. No old LU or blanket
+    /// zero pass is needed on the retained-snapshot path.
+    pub(super) fn reload_shared(
+        shared: &mut std::sync::Arc<Self>,
+        originals: impl ExactSizeIterator<Item = T>,
+    ) {
+        if let Some(owned) = std::sync::Arc::get_mut(shared) {
+            owned.reload_originals_iter(originals);
+        } else {
+            *shared = std::sync::Arc::new(shared.fork_loaded(originals));
         }
+    }
+
+    /// Switch scalar type, moving unique ordering storage or sharing it
+    /// with a retained snapshot. The blank form is used before matching a
+    /// real matrix against the cached order.
+    pub(super) fn retype_shared<U: Scalar>(shared: std::sync::Arc<Self>) -> Sparse<U> {
+        let values = vec![U::ZERO; shared.values.len()];
+        match std::sync::Arc::try_unwrap(shared) {
+            Ok(owned) => owned.into_retyped_values(values),
+            Err(retained) => retained.fork_values(values),
+        }
+    }
+
+    /// Retype and load in a single pass when the new assembly is known.
+    pub(super) fn retype_shared_loaded<U: Scalar>(
+        shared: std::sync::Arc<Self>,
+        originals: impl ExactSizeIterator<Item = U>,
+    ) -> Sparse<U> {
+        let values = shared.loaded_values(originals);
+        let mut next = match std::sync::Arc::try_unwrap(shared) {
+            Ok(owned) => owned.into_retyped_values(values),
+            Err(retained) => retained.fork_values(values),
+        };
+        next.reset_numeric_status();
+        next
+    }
+
+    #[cfg(test)]
+    fn into_retyped<U: Scalar>(self) -> Sparse<U> {
+        let values = vec![U::ZERO; self.values.len()];
+        self.into_retyped_values(values)
     }
 
     /// `LoadGmin` (`spsmp.c`): adds `gmin` to the real part of every
@@ -1352,29 +1564,36 @@ impl<T: Scalar> Sparse<T> {
 
     fn done(&mut self) -> Status {
         if self.plan.is_none() {
-            self.plan = Some(std::sync::Arc::new(self.compile_plan()));
+            let Some(plan) = self.compile_plan() else {
+                self.factored = false;
+                self.status = Status::InvalidPlan;
+                return self.status;
+            };
+            self.plan = Some(std::sync::Arc::new(plan));
         }
         self.needs_ordering = false;
         self.factored = true;
         self.status
     }
 
-    fn compile_plan(&self) -> FactorPlan {
+    fn compile_plan(&self) -> Option<FactorPlan> {
         // Offsets include the exclusive end of the entry array, so both
         // counts (not just the largest existing handles) must fit.
-        if u32::try_from(self.size).is_ok() && u32::try_from(self.topology.elements.len()).is_ok() {
-            FactorPlan::Compact(self.compile_runs())
-        } else {
-            FactorPlan::Wide(self.compile_runs())
+        if u32::try_from(self.size).is_ok()
+            && u32::try_from(self.topology.elements.len()).is_ok()
+            && let Some(runs) = self.compile_runs()
+        {
+            return Some(FactorPlan::Compact(runs));
         }
+        self.compile_runs().map(FactorPlan::Wide)
     }
 
-    fn compile_runs<I: PlanIndex>(&self) -> FactorRuns<I> {
+    fn compile_runs<I: PlanIndex>(&self) -> Option<FactorRuns<I>> {
         let mut columns = Vec::with_capacity(self.size);
         let mut column_entries = Vec::with_capacity(self.topology.elements.len());
         let mut upper_row_start = Vec::with_capacity(self.size + 1);
         let mut upper_row_entries = Vec::new();
-        upper_row_start.push(I::pack(0));
+        upper_row_start.push(I::pack(0)?);
         for i in 1..=self.size {
             let start = column_entries.len();
             let diagonal = self.topology.diag[i];
@@ -1384,27 +1603,27 @@ impl<T: Scalar> Sparse<T> {
                 if e == diagonal {
                     diagonal_offset = Some(column_entries.len());
                 }
-                column_entries.push(RunEntry::new(e, self.topology.elements[e].row));
+                column_entries.push(RunEntry::new(e, self.topology.elements[e].row)?);
                 e = self.topology.elements[e].next_in_col;
             }
             columns.push(ColumnRun {
-                start: I::pack(start),
-                diagonal: I::pack(diagonal_offset.expect("ordered column contains its diagonal")),
-                end: I::pack(column_entries.len()),
+                start: I::pack(start)?,
+                diagonal: I::pack(diagonal_offset?)?,
+                end: I::pack(column_entries.len())?,
             });
             let mut e = self.topology.elements[diagonal].next_in_row;
             while e != NONE {
-                upper_row_entries.push(RunEntry::new(e, self.topology.elements[e].col));
+                upper_row_entries.push(RunEntry::new(e, self.topology.elements[e].col)?);
                 e = self.topology.elements[e].next_in_row;
             }
-            upper_row_start.push(I::pack(upper_row_entries.len()));
+            upper_row_start.push(I::pack(upper_row_entries.len())?);
         }
-        FactorRuns {
+        Some(FactorRuns {
             columns,
             column_entries,
             upper_row_start,
             upper_row_entries,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -1439,8 +1658,12 @@ impl<T: Scalar> Sparse<T> {
             return self.nonfinite_factor();
         }
         self.values[first] = inverse;
+        // Each column is scattered before use. Successful ordering
+        // inserted every structural elimination target as a fill-in, so
+        // the lower-column updates cannot read an unscattered row.
+        // Existing scratch may hold the previous solve's internal RHS;
+        // no blanket initialization is required.
         workspace.resize(size + 1, T::ZERO);
-        workspace.fill(T::ZERO);
         let dest = workspace;
         let result = match plan {
             FactorPlan::Compact(runs) => runs.refactor(&mut self.values, &self.topology.diag, dest),
@@ -1477,7 +1700,7 @@ impl<T: Scalar> Sparse<T> {
         let size = self.size;
         self.markowitz_row = vec![0; size + 1];
         self.markowitz_col = vec![0; size + 1];
-        self.markowitz_prod = vec![0; size + 2];
+        self.markowitz_prod = PivotProducts::new(size + 2);
     }
 
     /// `CountMarkowitz` (no RHS).
@@ -1513,7 +1736,7 @@ impl<T: Scalar> Sparse<T> {
         self.singletons = 0;
         for i in step..=self.size {
             let product = self.markowitz_row[i].saturating_mul(self.markowitz_col[i]);
-            self.markowitz_prod[i] = product;
+            self.markowitz_prod.set(i, product);
             if product == 0 {
                 self.singletons += 1;
             }
@@ -1545,10 +1768,10 @@ impl<T: Scalar> Sparse<T> {
     /// `SearchForSingleton`.
     fn search_for_singleton(&mut self, step: usize) -> Option<usize> {
         let size = self.size;
-        self.markowitz_prod[size + 1] = self.markowitz_prod[step];
+        self.markowitz_prod.set(size + 1, self.markowitz_prod[step]);
         let mut singletons = self.singletons;
         self.singletons -= 1;
-        self.markowitz_prod[step - 1] = 0;
+        self.markowitz_prod.set(step - 1, 0);
         // C advances a pointer *after* testing each product. Track the
         // next index plus one instead: the first read is size + 1 and each
         // subsequent read moves left, preserving C's sentinel and pivot
@@ -1556,12 +1779,10 @@ impl<T: Scalar> Sparse<T> {
         let mut cursor = size + 2;
         while singletons > 0 {
             singletons -= 1;
-            loop {
-                cursor -= 1;
-                if self.markowitz_prod[cursor] == 0 {
-                    break;
-                }
-            }
+            let Some(next) = self.markowitz_prod.previous_zero(cursor) else {
+                break;
+            };
+            cursor = next;
             let mut i = cursor;
             if i < step {
                 break;
@@ -1588,16 +1809,11 @@ impl<T: Scalar> Sparse<T> {
         let size = self.size;
         let mut chosen = NONE;
         let mut min = i64::MAX;
-        self.markowitz_prod[size + 1] = self.markowitz_prod[step];
-        self.markowitz_prod[step - 1] = -1;
+        self.markowitz_prod.set(size + 1, self.markowitz_prod[step]);
+        self.markowitz_prod.set(step - 1, -1);
         let mut p = size + 2;
-        loop {
-            loop {
-                p -= 1;
-                if self.markowitz_prod[p] < min {
-                    break;
-                }
-            }
+        while let Some(next) = self.markowitz_prod.previous_below(p, min) {
+            p = next;
             let mut i = p;
             if i < step {
                 break;
@@ -1665,7 +1881,7 @@ impl<T: Scalar> Sparse<T> {
         let mut min = i64::MAX;
         let mut ties = 0;
         let mut accepted_ratio = 0.0;
-        self.markowitz_prod[size + 1] = self.markowitz_prod[step];
+        self.markowitz_prod.set(size + 1, self.markowitz_prod[step]);
         for j in (step + 1..=size + 1).rev() {
             let product = self.markowitz_prod[j];
             if product > min {
@@ -1845,13 +2061,13 @@ impl<T: Scalar> Sparse<T> {
             if row != step {
                 self.row_exchange(step, row);
                 self.parity.toggle();
-                self.markowitz_prod[row] = self.product_of(row);
+                self.markowitz_prod.set(row, self.product_of(row));
                 self.track_singleton(self.markowitz_prod[row], old_row);
             }
             if col != step {
                 self.col_exchange(step, col);
                 self.parity.toggle();
-                self.markowitz_prod[col] = self.product_of(col);
+                self.markowitz_prod.set(col, self.product_of(col));
                 self.track_singleton(self.markowitz_prod[col], old_col);
                 std::sync::Arc::make_mut(&mut self.topology).diag[col] =
                     self.find_element_in_col(Slot::Head(col), col, col, false);
@@ -1862,7 +2078,7 @@ impl<T: Scalar> Sparse<T> {
             }
             std::sync::Arc::make_mut(&mut self.topology).diag[step] =
                 self.find_element_in_col(Slot::Head(step), step, step, false);
-            self.markowitz_prod[step] = self.product_of(step);
+            self.markowitz_prod.set(step, self.product_of(step));
             self.track_singleton(self.markowitz_prod[step], old_step);
         }
     }
@@ -1900,15 +2116,17 @@ impl<T: Scalar> Sparse<T> {
             }
             self.values[upper] = u;
             let upper_col = self.topology.elements[upper].col;
+            let mut above = upper;
             let mut sub = self.topology.elements[upper].next_in_col;
             let mut lower = self.topology.elements[pivot].next_in_col;
             while lower != NONE {
                 let row = self.topology.elements[lower].row;
                 while sub != NONE && self.topology.elements[sub].row < row {
+                    above = sub;
                     sub = self.topology.elements[sub].next_in_col;
                 }
                 if sub == NONE || self.topology.elements[sub].row > row {
-                    sub = self.create_fillin(row, upper_col);
+                    sub = self.create_fillin(row, upper_col, Slot::After(above));
                 }
                 let l = self.values[lower];
                 let value = self.values[sub].mul_sub(u, l);
@@ -1917,6 +2135,7 @@ impl<T: Scalar> Sparse<T> {
                     return;
                 }
                 self.values[sub] = value;
+                above = sub;
                 sub = self.topology.elements[sub].next_in_col;
                 lower = self.topology.elements[lower].next_in_col;
             }
@@ -1930,7 +2149,7 @@ impl<T: Scalar> Sparse<T> {
         while e != NONE {
             let row = self.topology.elements[e].row;
             self.markowitz_row[row] -= 1;
-            self.markowitz_prod[row] = self.product_of(row);
+            self.markowitz_prod.set(row, self.product_of(row));
             if self.markowitz_row[row] == 0 {
                 self.singletons += 1;
             }
@@ -1940,7 +2159,7 @@ impl<T: Scalar> Sparse<T> {
         while e != NONE {
             let col = self.topology.elements[e].col;
             self.markowitz_col[col] -= 1;
-            self.markowitz_prod[col] = self.product_of(col);
+            self.markowitz_prod.set(col, self.product_of(col));
             if self.markowitz_col[col] == 0 && self.markowitz_row[col] != 0 {
                 self.singletons += 1;
             }
@@ -1948,22 +2167,22 @@ impl<T: Scalar> Sparse<T> {
         }
     }
 
-    /// `CreateFillin`.
-    fn create_fillin(&mut self, row: usize, col: usize) -> usize {
-        let mut above = Slot::Head(col);
-        let mut e = self.topology.col_get(above);
-        while e != NONE && self.topology.elements[e].row < row {
-            above = Slot::After(e);
-            e = self.topology.col_get(above);
-        }
+    /// `CreateFillin`: the elimination merge has already located the
+    /// exact predecessor in its sorted column. Do not rescan its prefix.
+    fn create_fillin(&mut self, row: usize, col: usize, above: Slot) -> usize {
+        debug_assert!(matches!(above, Slot::After(e) if self.topology.elements[e].row < row));
+        debug_assert!({
+            let next = self.topology.col_get(above);
+            next == NONE || self.topology.elements[next].row > row
+        });
         let element = self.create_element(row, col, above, true);
         self.markowitz_row[row] += 1;
-        self.markowitz_prod[row] = self.product_of(row);
+        self.markowitz_prod.set(row, self.product_of(row));
         if self.markowitz_row[row] == 1 && self.markowitz_col[row] != 0 {
             self.singletons -= 1;
         }
         self.markowitz_col[col] += 1;
-        self.markowitz_prod[col] = self.product_of(col);
+        self.markowitz_prod.set(col, self.product_of(col));
         if self.markowitz_row[col] != 0 && self.markowitz_col[col] == 1 {
             self.singletons -= 1;
         }
@@ -2004,22 +2223,25 @@ impl<T: Scalar> Sparse<T> {
     /// no internal row keeps its right-hand-side value.
     #[cfg(test)]
     fn solve(&self, rhs: &[T]) -> Vec<T> {
-        self.solve_with_workspace(rhs, &mut Vec::new())
+        self.solve_with_workspace(rhs, &mut Vec::new()).unwrap()
     }
 
     /// The same triangular solve using a caller-owned numeric workspace.
     /// No factor snapshot needs mutable scratch or interior mutability.
-    pub(super) fn solve_with_workspace(&self, rhs: &[T], x: &mut Vec<T>) -> Vec<T> {
-        self.gather_rhs(rhs, x, false);
+    pub(super) fn solve_with_workspace(&self, rhs: &[T], x: &mut Vec<T>) -> SpiceResult<Vec<T>> {
         let plan = self
             .plan
             .as_deref()
-            .expect("factored sparse frame has a traversal plan");
+            .filter(|_| self.factored)
+            .ok_or_else(|| {
+                crate::primitives::SpiceError::circuit("sparse solve has no valid factor plan")
+            })?;
+        self.gather_rhs(rhs, x, false);
         match plan {
             FactorPlan::Compact(runs) => runs.solve(&self.values, &self.topology.diag, x),
             FactorPlan::Wide(runs) => runs.solve(&self.values, &self.topology.diag, x),
         }
-        self.scatter_solution(rhs, x, false)
+        Ok(self.scatter_solution(rhs, x, false))
     }
 
     /// Gather directly into the internal 1-based work vector without
@@ -2060,21 +2282,29 @@ impl<T: Scalar> Sparse<T> {
     #[cfg(test)]
     fn solve_transposed(&self, rhs: &[T]) -> Vec<T> {
         self.solve_transposed_with_workspace(rhs, &mut Vec::new())
+            .unwrap()
     }
 
-    pub(super) fn solve_transposed_with_workspace(&self, rhs: &[T], x: &mut Vec<T>) -> Vec<T> {
-        self.gather_rhs(rhs, x, true);
+    pub(super) fn solve_transposed_with_workspace(
+        &self,
+        rhs: &[T],
+        x: &mut Vec<T>,
+    ) -> SpiceResult<Vec<T>> {
         let plan = self
             .plan
             .as_deref()
-            .expect("factored sparse frame has a traversal plan");
+            .filter(|_| self.factored)
+            .ok_or_else(|| {
+                crate::primitives::SpiceError::circuit("sparse solve has no valid factor plan")
+            })?;
+        self.gather_rhs(rhs, x, true);
         match plan {
             FactorPlan::Compact(runs) => {
                 runs.solve_transposed(&self.values, &self.topology.diag, x);
             }
             FactorPlan::Wide(runs) => runs.solve_transposed(&self.values, &self.topology.diag, x),
         }
-        self.scatter_solution(rhs, x, true)
+        Ok(self.scatter_solution(rhs, x, true))
     }
 }
 
@@ -2182,6 +2412,37 @@ mod tests {
     }
 
     #[test]
+    fn unfactored_solve_rejects_without_touching_workspace() {
+        let m = Sparse::<f64>::new(1);
+        let mut workspace = vec![42.0];
+        assert!(m.solve_with_workspace(&[1.0], &mut workspace).is_err());
+        assert_eq!(workspace, vec![42.0]);
+    }
+
+    #[test]
+    fn pivot_product_summaries_match_reference_reverse_searches() {
+        for size in [1, 63, 64, 323, 514, 515, 1027] {
+            let mut products = PivotProducts::new(size);
+            let mut seed = 71_u64;
+            for i in 0..6000 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let at = ((seed >> 32) as usize) % size;
+                let v = ((seed >> 48) % 17) as i64 - 2;
+                products.set(at, v);
+                if i % 11 == 0 {
+                    products.swap(at, (at + 99) % size);
+                }
+                let before = ((seed >> 16) as usize) % (size + 1);
+                let limit = ((seed >> 40) % 20) as i64 - 3;
+                let expect = products.values[..before].iter().rposition(|&v| v < limit);
+                assert_eq!(products.previous_below(before, limit), expect);
+                let expect = products.values[..before].iter().rposition(|&v| v == 0);
+                assert_eq!(products.previous_zero(before), expect);
+            }
+        }
+    }
+
+    #[test]
     fn solve_workspace_reuses_storage_and_keeps_external_permutation() {
         // Nodes 2 and 4 are deliberately absent, and the remaining two
         // have a zero diagonal forcing MNA/pivot exchange.
@@ -2190,13 +2451,15 @@ mod tests {
         assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
         let rhs = [8., -0., 6., -17.];
         let mut workspace = Vec::new();
-        let first = m.solve_with_workspace(&rhs, &mut workspace);
+        let first = m.solve_with_workspace(&rhs, &mut workspace).unwrap();
         let storage = workspace.as_ptr();
         assert_eq!(first[0], 2.);
         assert_eq!(first[2], 2.);
         assert_eq!(first[1].to_bits(), (-0.0_f64).to_bits());
         assert_eq!(first[3], -17.);
-        let second = m.solve_with_workspace(&[4., 3., 4., 7.], &mut workspace);
+        let second = m
+            .solve_with_workspace(&[4., 3., 4., 7.], &mut workspace)
+            .unwrap();
         assert_eq!(storage, workspace.as_ptr());
         assert_eq!(second, [1.5, 3., 1., 7.]);
         let transposed = m.solve_transposed(&rhs);
@@ -2300,6 +2563,32 @@ mod tests {
         let imag = mantissa.im * 10_f64.powi(exponent - 614);
         assert!((imag - 2.).abs() < 1e-12);
         assert!((mantissa.re * 10_f64.powi(exponent - 614)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bulk_column_finalization_preserves_nonmonotonic_links() {
+        // Translate all unknowns first, then insert a densely populated
+        // column in deliberately unsorted internal row order.
+        let mut entries: Vec<_> = (1..=8).map(|i| (i, i, 20.)).collect();
+        entries.extend([7, 3, 8, 2, 6, 4, 5].map(|r| (r, 1, r as f64)));
+        entries.extend([8, 6, 5, 4, 3, 1, 7].map(|r| (r, 2, -1.)));
+        let a = Sparse::from_originals(8, entries.iter().copied());
+        let b = build(8, &entries);
+        assert_eq!(a.topology.first_in_col, b.topology.first_in_col);
+        assert_eq!(a.topology.diag, b.topology.diag);
+        for (a, b) in a.topology.elements.iter().zip(&b.topology.elements) {
+            assert_eq!(
+                (a.row, a.col, a.next_in_col, a.next_in_row),
+                (b.row, b.col, b.next_in_col, b.next_in_row)
+            );
+        }
+        assert_eq!(a.values, b.values);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate original sparse element")]
+    fn bulk_column_builder_rejects_duplicate_originals() {
+        let _ = Sparse::from_originals(2, [(1, 2, 1.), (2, 2, 2.), (1, 2, 3.)]);
     }
 
     #[test]
@@ -2416,7 +2705,9 @@ mod tests {
         let mut narrow = build(3, &entries);
         assert_eq!(narrow.order_and_factor(1e-3, 0.), Status::Okay);
         let mut wide = narrow.clone();
-        wide.plan = Some(std::sync::Arc::new(FactorPlan::Wide(wide.compile_runs())));
+        wide.plan = Some(std::sync::Arc::new(FactorPlan::Wide(
+            wide.compile_runs().unwrap(),
+        )));
         narrow.reload_originals(&input);
         wide.reload_originals(&input);
         assert_eq!(narrow.factor(), Status::Okay);
@@ -2510,6 +2801,40 @@ mod tests {
     }
 
     #[test]
+    fn loaded_scalar_transition_preserves_original_bits_and_zero_fillins() {
+        let entries = [
+            (1, 1, 4.),
+            (1, 2, 1.),
+            (2, 2, 5.),
+            (2, 3, 1.),
+            (3, 3, 6.),
+            (3, 1, 1.),
+        ];
+        let mut real = Sparse::from_originals(3, entries);
+        assert_eq!(real.order_and_factor(1e-3, 0.), Status::Okay);
+        assert!(real.values.len() > entries.len());
+        let real = std::sync::Arc::new(real);
+        let before = real.solve(&[1.; 3]);
+        let loaded = entries.map(|(_, _, v)| Complex::new(v, -0.));
+        let complex =
+            Sparse::retype_shared_loaded(std::sync::Arc::clone(&real), loaded.into_iter());
+        assert!(!complex.is_factored());
+        assert!(std::sync::Arc::ptr_eq(&real.topology, &complex.topology));
+        assert!(
+            complex.values[..loaded.len()]
+                .iter()
+                .zip(loaded)
+                .all(|(a, b)| a.re.to_bits() == b.re.to_bits() && a.im.to_bits() == b.im.to_bits())
+        );
+        assert!(
+            complex.values[loaded.len()..]
+                .iter()
+                .all(|v| v.re.to_bits() == 0 && v.im.to_bits() == 0)
+        );
+        assert_eq!(real.solve(&[1.; 3]), before);
+    }
+
+    #[test]
     fn reload_fork_preserves_snapshots_without_copying_numeric_scratch() {
         let entries = [(1, 1, 4.), (1, 2, 1.), (2, 1, 2.), (2, 2, 5.)];
         let rhs = [5., 7.];
@@ -2520,12 +2845,13 @@ mod tests {
         let saved = std::sync::Arc::new(a);
         let expected = saved.solve(&rhs);
         let mut changed = std::sync::Arc::clone(&saved);
-        let next = Sparse::for_reload(&mut changed);
-        assert!(next.values.iter().all(|v| *v == 0.));
+        Sparse::reload_shared(&mut changed, [8., 1., 2., 5.].into_iter());
+        let next = std::sync::Arc::get_mut(&mut changed).unwrap();
+        assert_eq!(&next.values[..4], &[8., 1., 2., 5.]);
+        assert!(next.values[4..].iter().all(|v| *v == 0.));
         assert!(next.markowitz_row.is_empty());
         assert!(next.markowitz_col.is_empty());
         assert!(next.markowitz_prod.is_empty());
-        next.reload_originals(&[8., 1., 2., 5.]);
         assert_eq!(next.factor(), Status::Okay);
         assert_ne!(next.solve(&rhs), expected);
         assert!(std::sync::Arc::ptr_eq(
@@ -2642,14 +2968,18 @@ mod tests {
         // positions. Otherwise the scan proceeds from the highest index.
         let mut m = build(4, &[(1, 1, 5.), (2, 2, 2.), (3, 3, 3.), (4, 4, 4.)]);
         m.create_internal_vectors();
-        m.markowitz_prod[1..=4].copy_from_slice(&[0, 0, 0, 0]);
+        for i in 1..=4 {
+            m.markowitz_prod.set(i, 0);
+        }
         m.singletons = 4;
         let pivot = m.search_for_singleton(1).unwrap();
         assert_eq!(m.topology.elements[pivot].row, 1);
 
         // The sentinel is not a singleton: the search selects the highest
         // remaining zero-product diagonal, never reading a negative index.
-        m.markowitz_prod[1..=4].copy_from_slice(&[1, 1, 0, 0]);
+        for (i, v) in [1, 1, 0, 0].into_iter().enumerate() {
+            m.markowitz_prod.set(i + 1, v);
+        }
         m.singletons = 2;
         let pivot = m.search_for_singleton(1).unwrap();
         assert_eq!(m.topology.elements[pivot].row, 4);
@@ -2698,6 +3028,63 @@ mod tests {
     }
 
     #[test]
+    fn fixed_order_refactor_does_not_read_previous_workspace_contents() {
+        // A nonmonotonic, fill-producing original pattern, with exact
+        // structural zeros deliberately retained in its assembly.
+        let n = 30;
+        let mut seed = 19_u64;
+        let mut entries = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for i in (1..=n).rev() {
+            entries.push((i, i, 20.));
+            seen.insert((i, i));
+            for j in 0..5 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let c = (seed >> 32) as usize % n + 1;
+                if seen.insert((i, c)) {
+                    entries.push((i, c, if j == 0 { -0. } else { 0.125 }));
+                }
+            }
+        }
+        let mut real = Sparse::from_originals(n, entries.iter().copied());
+        assert_eq!(real.order_and_factor(1e-3, 0.), Status::Okay);
+        assert!(real.values.len() > entries.len());
+        let mut clean = real.clone();
+        let mut poisoned = real.clone();
+        let values = entries.iter().map(|&(_, _, v)| v * 1.5);
+        clean.reload_originals_iter(values.clone());
+        poisoned.reload_originals_iter(values);
+        assert_eq!(clean.factor_with_workspace(&mut Vec::new()), Status::Okay);
+        assert_eq!(
+            poisoned.factor_with_workspace(&mut vec![f64::NAN; n + 1]),
+            Status::Okay
+        );
+        assert!(
+            clean
+                .values
+                .iter()
+                .map(|v| v.to_bits())
+                .eq(poisoned.values.iter().map(|v| v.to_bits()))
+        );
+        let mut complex = real.into_retyped::<Complex>();
+        complex.reload_originals_iter(entries.iter().map(|&(_, _, v)| Complex::new(v, v * 0.25)));
+        let mut poisoned = complex.clone();
+        assert_eq!(complex.factor_with_workspace(&mut Vec::new()), Status::Okay);
+        assert_eq!(
+            poisoned.factor_with_workspace(&mut vec![Complex::new(f64::NAN, f64::NAN); n + 1]),
+            Status::Okay
+        );
+        let bits = |v: &Complex| (v.re.to_bits(), v.im.to_bits());
+        assert!(
+            complex
+                .values
+                .iter()
+                .map(bits)
+                .eq(poisoned.values.iter().map(bits))
+        );
+    }
+
+    #[test]
     fn refactor_workspace_survives_success_and_singularity() {
         let entries = [(1, 1, 3.), (1, 2, 1.), (2, 1, 1.), (2, 2, 4.)];
         let mut m = build(2, &entries);
@@ -2724,7 +3111,10 @@ mod tests {
         assert_eq!(m.factor_with_workspace(&mut workspace), Status::Okay);
         assert_eq!(workspace.as_ptr(), address);
         assert_eq!(workspace.capacity(), capacity);
-        assert_eq!(m.solve_with_workspace(&[4., 5.], &mut workspace), initial);
+        assert_eq!(
+            m.solve_with_workspace(&[4., 5.], &mut workspace).unwrap(),
+            initial
+        );
         assert_eq!(workspace.as_ptr(), address);
     }
 

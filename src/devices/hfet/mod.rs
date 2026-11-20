@@ -66,10 +66,10 @@ impl<'a> NodeSetup<'a> {
         nodes: &NodeTable,
         instance: &'a DeviceInstance,
         family: &'static str,
-    ) -> (Self, [NodeId; 3]) {
+    ) -> SpiceResult<(Self, [NodeId; 3])> {
         let mut staged = nodes.clone();
-        let external = std::array::from_fn(|i| staged.intern(&instance.nodes[i]));
-        (
+        let external = staged.intern_array(&instance.nodes)?;
+        Ok((
             Self {
                 staged,
                 terminals: external.to_vec(),
@@ -77,7 +77,7 @@ impl<'a> NodeSetup<'a> {
                 family,
             },
             external,
-        )
+        ))
     }
 
     /// C creates a prime only for a nonzero resistance; otherwise it aliases the parent.
@@ -92,7 +92,7 @@ impl<'a> NodeSetup<'a> {
                 self.name, self.family
             )));
         }
-        let internal = self.staged.intern(&name);
+        let internal = self.staged.intern(&name)?;
         self.staged.set_kind(internal, NodeKind::Internal);
         self.terminals.push(internal);
         Ok(internal)
@@ -713,8 +713,8 @@ mod tests {
         use crate::devices::{Device, ModelContext};
 
         let mut nodes = NodeTable::new();
-        let a = nodes.intern("a");
-        let b = nodes.intern("b");
+        let a = nodes.intern("a").unwrap();
+        let b = nodes.intern("b").unwrap();
         let ground = NodeId::GROUND;
         let mut unknowns = MnaUnknowns::new();
         unknowns.rebuild(&nodes);
@@ -928,7 +928,7 @@ mod tests {
             let resolver = ModelResolver::new(&deck.models).unwrap();
             let resolved = resolver.resolve(instance).unwrap().unwrap();
             let mut nodes = NodeTable::new();
-            let existing = nodes.intern("existing");
+            let existing = nodes.intern("existing").unwrap();
             let count = nodes.len();
             let Err(error) = instantiate(
                 instance,

@@ -66,9 +66,9 @@ fn accept(circuit: &Circuit, history: &mut StateHistory, solution: &[f64], loade
 /// `c1 a b` (floating) or `c1 a 0` (grounded).
 fn capacitor(floating: bool, c: f64) -> Circuit {
     let mut circuit = Circuit::new();
-    let a = circuit.add_node("a");
+    let a = circuit.add_node("a").unwrap();
     let b = if floating {
-        circuit.add_node("b")
+        circuit.add_node("b").unwrap()
     } else {
         NodeId::GROUND
     };
@@ -141,7 +141,7 @@ fn capacitor_companions_match_the_derived_equations() {
 /// `l1 a 0` in parallel with `r1 a 0`.
 fn rl(l: f64, r: f64) -> Circuit {
     let mut circuit = Circuit::new();
-    let a = circuit.add_node("a");
+    let a = circuit.add_node("a").unwrap();
     circuit
         .add_device(Box::new(
             Inductor::new("l1", [a, NodeId::GROUND], l, None).unwrap(),
@@ -338,7 +338,7 @@ fn companion_rc_and_rl_decays_converge_at_second_order() {
     }
     // RC: r1 a 0 1k, c1 a 0 1u (tau = 1 ms), v(0) = 1.
     let mut rc = Circuit::new();
-    let a = rc.add_node("a");
+    let a = rc.add_node("a").unwrap();
     rc.add_device(Box::new(
         Resistor::new("r1", [a, NodeId::GROUND], 1e3).unwrap(),
     ))

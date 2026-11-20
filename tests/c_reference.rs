@@ -128,7 +128,7 @@ fn parsed_transistor_scalars_and_terminal_bindings_match_live_c() {
     // Compare C's external terminal IDs with parsed terminal order, not MNA.
     for device in &netlist.devices {
         for node in &device.nodes {
-            nodes.intern(node);
+            nodes.intern(node).unwrap();
         }
         assignments(&mut expected, &device.name, &device.parameters);
     }
@@ -154,7 +154,7 @@ fn parsed_transistor_scalars_and_terminal_bindings_match_live_c() {
         ) {
             // INP2Q grounds an omitted substrate. The AST keeps it omitted;
             // the engine will need to apply this rule during elaboration.
-            let id = u32::try_from(nodes.intern(node).index()).expect("bounded probe");
+            let id = u32::try_from(nodes.intern(node).unwrap().index()).expect("bounded probe");
             expected.insert(format!("@{}[{parameter}]", device.name), f64::from(id));
         }
     }
