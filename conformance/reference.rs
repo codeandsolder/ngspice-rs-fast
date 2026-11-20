@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 /// The C golden for `name` on the target running the verifier/capture tool.
 /// Capture, drift checks and numerical verification must use the same path.
-pub(super) fn golden_path(root: &Path, name: &str) -> PathBuf {
+pub(crate) fn golden_path(root: &Path, name: &str) -> PathBuf {
     path_for(
         root,
         name,
