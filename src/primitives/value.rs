@@ -500,13 +500,14 @@ pub fn format_spice_number(value: Real) -> String {
         // `NaN`, `inf` and `-inf` have no exponent part.
         return text;
     };
-    match exponent.parse::<i32>() {
-        Ok(exponent) => format!(
+    if let Ok(exponent) = exponent.parse::<i32>() {
+        format!(
             "{mantissa}e{}{:02}",
             if exponent < 0 { '-' } else { '+' },
             exponent.unsigned_abs()
-        ),
-        Err(_) => text,
+        )
+    } else {
+        text
     }
 }
 
@@ -716,6 +717,9 @@ mod tests {
         assert_eq!(format_spice_number(0.0), "0.000000000000000e+00");
         assert_eq!(format_spice_number(1e100), "1.000000000000000e+100");
         assert_eq!(format_spice_number(f64::NAN), "NaN");
+        assert_eq!(format_spice_number(f64::INFINITY), "inf");
+        assert_eq!(format_spice_number(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_spice_number(-0.0), "-0.000000000000000e+00");
     }
 
     #[test]

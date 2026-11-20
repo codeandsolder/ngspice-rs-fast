@@ -578,10 +578,10 @@ mod tests {
         match &expr.kind {
             BExprKind::Number { spelling, .. } => spelling.clone(),
             BExprKind::Name(name) => name.clone(),
-            BExprKind::Voltage { positive, negative } => match negative {
-                Some(negative) => format!("v({positive},{negative})"),
-                None => format!("v({positive})"),
-            },
+            BExprKind::Voltage { positive, negative } => negative.as_ref().map_or_else(
+                || format!("v({positive})"),
+                |negative| format!("v({positive},{negative})"),
+            ),
             BExprKind::Current(name) => format!("i({name})"),
             BExprKind::Unary { op, operand } => format!("({op:?} {})", shape(operand)),
             BExprKind::Binary { op, lhs, rhs } => {

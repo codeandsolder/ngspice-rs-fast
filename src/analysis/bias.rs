@@ -1309,19 +1309,18 @@ impl Engine<'_> {
         point: Point,
         closing: bool,
     ) -> Result<NewtonSolution<TrialState>, Halt> {
-        match from {
-            Some(from) => self.stage(
+        if let Some(from) = from {
+            self.stage(
                 report,
                 strategy,
                 &from.values,
                 Some(from.trial.clone()),
                 point,
                 closing,
-            ),
-            None => {
-                let zero = Vector::zeros(self.circuit.unknown_count());
-                self.stage(report, strategy, &zero, None, point, closing)
-            }
+            )
+        } else {
+            let zero = Vector::zeros(self.circuit.unknown_count());
+            self.stage(report, strategy, &zero, None, point, closing)
         }
     }
 

@@ -182,20 +182,19 @@ impl TransmissionLine {
                 format!("{}: z0 must be positive, got {z0}", instance.name),
             ));
         }
-        let td = match td {
-            Some(td) => td,
-            None => {
-                if f <= 0. || nl <= 0. {
-                    return Err(invalid(
-                        &instance.location,
-                        format!(
-                            "{}: f and nl must be positive when td is not given (td = nl/f)",
-                            instance.name
-                        ),
-                    ));
-                }
-                nl / f
+        let td = if let Some(td) = td {
+            td
+        } else {
+            if f <= 0. || nl <= 0. {
+                return Err(invalid(
+                    &instance.location,
+                    format!(
+                        "{}: f and nl must be positive when td is not given (td = nl/f)",
+                        instance.name
+                    ),
+                ));
             }
+            nl / f
         };
         if !(td.is_finite() && td > 0.) {
             return Err(invalid(

@@ -372,13 +372,7 @@ impl StateHistory {
             patches,
         } = trial;
         let carried = self.carried.as_deref().map(|vector| &vector[range.clone()]);
-        let previous: Option<&'a [Real]> = match previous {
-            Some(vector) => {
-                let vector: &'a Vec<Real> = vector;
-                Some(&vector[range.clone()])
-            }
-            None => None,
-        };
+        let previous: Option<&'a [Real]> = previous.as_ref().map(|vector| &vector[range.clone()]);
         Ok(DeviceState {
             previous,
             carried,

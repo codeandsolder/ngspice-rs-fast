@@ -238,15 +238,14 @@ pub fn run_with_format(
         // C runs every analysis on the matrix and state vectors set up once
         // (`CKTmatrix` with its pivot order and reorder flags, `CKTstate0`),
         // so the circuit inherits them from the previous analysis.
-        let mut circuit = match first_circuit.take() {
-            Some(circuit) => circuit,
-            None => {
-                let mut circuit = config.circuit(netlist)?;
-                if let Some(previous) = &previous_circuit {
-                    circuit.inherit_from(previous);
-                }
-                circuit
+        let mut circuit = if let Some(circuit) = first_circuit.take() {
+            circuit
+        } else {
+            let mut circuit = config.circuit(netlist)?;
+            if let Some(previous) = &previous_circuit {
+                circuit.inherit_from(previous);
             }
+            circuit
         };
         let observations = crate::analysis::observations::requests(
             entry.kind,

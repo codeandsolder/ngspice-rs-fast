@@ -1578,12 +1578,11 @@ impl<L: MosLevel> Device for Mosfet<L> {
             )));
         }
         let fresh;
-        let op = match self.cached(context.temperature, context.nominal_temperature) {
-            Some(op) => op,
-            None => {
-                fresh = self.operating(&context.model_context())?;
-                &fresh
-            }
+        let op = if let Some(op) = self.cached(context.temperature, context.nominal_temperature) {
+            op
+        } else {
+            fresh = self.operating(&context.model_context())?;
+            &fresh
         };
         let pol = self.model.common().pol;
         let [dpv, gv, spv, bv] = self.inner.map(|n| context.node_voltage(n));

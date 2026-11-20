@@ -722,14 +722,15 @@ impl FunctionScope {
             collect_calls(&def.body.root, &mut calls);
             for (name, arguments, location) in calls {
                 let local = self.active.get(name).copied();
-                let callee = match local {
-                    Some(j) => Some(&self.definitions[j]),
-                    None => self
-                        .parent
-                        .as_deref()
-                        .and_then(|p| p.get(name))
-                        .map(|(d, _)| d),
-                };
+                let callee = local.map_or_else(
+                    || {
+                        self.parent
+                            .as_deref()
+                            .and_then(|p| p.get(name))
+                            .map(|(d, _)| d)
+                    },
+                    |j| Some(&self.definitions[j]),
+                );
                 let Some(callee) = callee else { continue };
                 if callee.parameters.len() != arguments {
                     return Err(SpiceError::parse(
@@ -1171,10 +1172,9 @@ fn eval(
     }
     match &node.kind {
         ExprKind::Number { value, .. } => Ok(*value),
-        ExprKind::Identifier(name) => match env.value(name) {
-            Some(value) => Ok(value),
-            None => Err(undefined_parameter(node, name)),
-        },
+        ExprKind::Identifier(name) => env
+            .value(name)
+            .ok_or_else(|| undefined_parameter(node, name)),
         ExprKind::Group(inner) => eval(inner, root, env, budget, depth + 1),
         ExprKind::Unary { op, operand } => {
             let v = eval(operand, root, env, budget, depth + 1)?;

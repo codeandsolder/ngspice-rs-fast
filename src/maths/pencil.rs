@@ -810,12 +810,10 @@ impl Search<'_> {
                 .iter()
                 .map(|t| sparse.get_element(t.row + 1, t.col + 1))
                 .collect();
-            let drive = match load.solution {
-                Some(col) => load
-                    .drive
-                    .map(|row| row.map(|row| sparse.get_element(row + 1, col + 1))),
-                None => [None, None],
-            };
+            let drive = load.solution.map_or([None, None], |col| {
+                load.drive
+                    .map(|row| row.map(|row| sparse.get_element(row + 1, col + 1)))
+            });
             // An external row no element references has no internal row:
             // SPARSE leaves it out of the matrix and its determinant, as a
             // `DEVpzSetup` that drops an internal node (`b4set.c` re-run)
