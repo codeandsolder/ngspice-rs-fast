@@ -319,11 +319,13 @@ enum Probe {
 
 impl Probe {
     /// The unknowns the output reads.
-    fn rows(&self) -> Vec<usize> {
+    fn rows(&self) -> impl Iterator<Item = usize> {
         match *self {
-            Self::Voltage { pos, neg } => pos.into_iter().chain(neg).collect(),
-            Self::Current { row } => vec![row],
+            Self::Voltage { pos, neg } => [pos, neg],
+            Self::Current { row } => [Some(row), None],
         }
+        .into_iter()
+        .flatten()
     }
 
     fn read<T: Copy + std::ops::Sub<Output = T>>(&self, x: &[T], zero: T) -> T {
@@ -727,6 +729,7 @@ fn entries(members: &[Member<'_>], ac: bool, filters: &[String]) -> Vec<Entry> {
 struct DeltaNumbering {
     internal: Vec<Option<usize>>,
     next: usize,
+    ordered: Vec<(usize, usize, Complex)>,
 }
 
 impl DeltaNumbering {
@@ -734,6 +737,7 @@ impl DeltaNumbering {
         Self {
             internal: vec![None; n],
             next: 0,
+            ordered: Vec::new(),
         }
     }
 
@@ -754,12 +758,35 @@ impl DeltaNumbering {
         }
     }
 
-    fn rank(&self, external: usize) -> usize {
-        self.internal
-            .get(external)
-            .copied()
-            .flatten()
-            .unwrap_or(usize::MAX)
+    /// SMPmultiply's row products in internal SPARSE column order. Reuse
+    /// one entry buffer across the parameter walk, visiting even empty rows
+    /// so that subtraction from the RHS preserves signed-zero arithmetic.
+    fn visit_products(
+        &mut self,
+        elements: BTreeMap<(usize, usize), Complex>,
+        x: &[Complex],
+        mut visit: impl FnMut(usize, Complex),
+    ) {
+        self.ordered.clear();
+        self.ordered.extend(
+            elements
+                .into_iter()
+                .map(|((row, col), value)| (row, col, value)),
+        );
+        let internal = &self.internal;
+        self.ordered.sort_unstable_by_key(|&(row, col, _)| {
+            (row, internal[col].expect("translated perturbation column"))
+        });
+        let mut entries = self.ordered.iter().copied().peekable();
+        for row in 0..x.len() {
+            let mut sum = Complex::ZERO;
+            while let Some((_, col, a)) = entries.next_if(|entry| entry.0 == row) {
+                let b = x[col];
+                sum.re += a.re * b.re - a.im * b.im;
+                sum.im += a.re * b.im + a.im * b.re;
+            }
+            visit(row, sum);
+        }
     }
 }
 
@@ -788,35 +815,6 @@ fn accumulate(
         entry.im += value.im;
     }
     sums
-}
-
-/// `SMPmultiply(delta_Y, ..., E, ..., iE)` (`ComplexMatrixMultiply()` in
-/// `sputils.c`, `delta_Y` being complex): per row, `Sum += element * E[col]`
-/// with `CMPLX_MULT_ADD_ASSIGN`, over the row's elements in internal column
-/// order.
-fn multiply(
-    numbering: &DeltaNumbering,
-    elements: &BTreeMap<(usize, usize), Complex>,
-    x: &[Complex],
-) -> Vec<Complex> {
-    let mut rows: BTreeMap<usize, Vec<(usize, Complex)>> = BTreeMap::new();
-    for (&(row, col), &value) in elements {
-        rows.entry(row).or_default().push((col, value));
-    }
-    let mut product = vec![Complex::ZERO; x.len()];
-    for (row, mut entries) in rows {
-        entries.sort_by_key(|&(col, _)| numbering.rank(col));
-        let mut sum = Complex::ZERO;
-        for (col, a) in entries {
-            let b = x.get(col).copied().unwrap_or(Complex::ZERO);
-            sum.re += a.re * b.re - a.im * b.im;
-            sum.im += a.re * b.im + a.im * b.re;
-        }
-        if let Some(slot) = product.get_mut(row) {
-            *slot = sum;
-        }
-    }
-    product
 }
 
 fn real_stamps(matrix: &SparseMatrix) -> impl Iterator<Item = (usize, usize, Complex)> + '_ {
@@ -864,8 +862,8 @@ fn ac_state<'a>(
     system: &LinearSystem,
     omega: Real,
     model: crate::devices::ModelContext,
-    zeros: &Vector,
-    state: &[Real],
+    zeros: &'a Vector,
+    state: &'a [Real],
 ) -> SpiceResult<AcState<'a>> {
     // CKTunsetup/CKTsetup make a new circuit matrix (elements in setup
     // order) and NIacIter reorders it from scratch.
@@ -892,8 +890,8 @@ fn ac_state<'a>(
         factors,
         solution,
         model,
-        bias: zeros.clone(),
-        state: state.to_vec(),
+        bias: zeros,
+        state,
         circuit,
     })
 }
@@ -983,7 +981,7 @@ impl DcState<'_> {
         index: usize,
         base: &SensitivityLoad,
         perturbed: &SensitivityLoad,
-    ) -> SpiceResult<Vec<Real>> {
+    ) -> SpiceResult<Vector> {
         let n = self.circuit.unknown_count();
         let (mut y0, mut y1) = (SparseMatrix::new(n, n), SparseMatrix::new(n, n));
         let mut rhs = Vector::zeros(n);
@@ -1000,37 +998,33 @@ impl DcState<'_> {
                 .map(|t| (t.row, t.col)),
         );
         let elements = accumulate(real_stamps(&y0), real_stamps(&y1));
-        let product = multiply(numbering, &elements, &self.solution);
-        let mut rhs = rhs.as_slice().to_vec();
-        for (value, product) in rhs.iter_mut().zip(&product) {
-            *value -= product.re;
-        }
-        // A nonfinite load difference (C's division by a zero knee current
-        // in `dioload.c`) propagates through C's solve as NaN, through the
-        // block of `Y` it sits in; other blocks keep their (zero) values.
-        let tainted: Vec<usize> = (0..n)
-            .filter(|&row| !rhs[row].is_finite())
-            .map(|row| self.blocks[row])
-            .collect();
-        for value in &mut rhs {
+        numbering.visit_products(elements, &self.solution, |row, product| {
+            rhs.as_mut_slice()[row] -= product.re;
+        });
+        // Nonfinite loads poison the entire connected block, as in C.
+        // Allocate the block mask only when a nonfinite entry actually occurs.
+        let mut tainted = None;
+        for (row, value) in rhs.as_mut_slice().iter_mut().enumerate() {
             if !value.is_finite() {
+                tainted.get_or_insert_with(|| vec![false; n])[self.blocks[row]] = true;
                 *value = 0.;
             }
         }
-        let solved = crate::maths::solve_last_factors(&self.pattern, &Vector::from_slice(&rhs))?
-            .ok_or_else(|| SpiceError::Numerical {
-                context: ".sens".to_owned(),
-                message: "the operating point left no factored circuit matrix".to_owned(),
+        let mut solved =
+            crate::maths::solve_last_factors(&self.pattern, &rhs)?.ok_or_else(|| {
+                SpiceError::Numerical {
+                    context: ".sens".to_owned(),
+                    message: "the operating point left no factored circuit matrix".to_owned(),
+                }
             })?;
-        let mut x = solved.as_slice().to_vec();
-        if !tainted.is_empty() {
-            for (row, value) in x.iter_mut().enumerate() {
-                if tainted.contains(&self.blocks[row]) {
+        if let Some(tainted) = tainted {
+            for (row, value) in solved.as_mut_slice().iter_mut().enumerate() {
+                if tainted[self.blocks[row]] {
                     *value = Real::NAN;
                 }
             }
         }
-        Ok(x)
+        Ok(solved)
     }
 }
 
@@ -1040,8 +1034,8 @@ struct AcState<'a> {
     factors: crate::maths::complex::ComplexLu,
     solution: Vec<Complex>,
     model: crate::devices::ModelContext,
-    bias: Vector,
-    state: Vec<Real>,
+    bias: &'a Vector,
+    state: &'a [Real],
     circuit: &'a Circuit,
 }
 
@@ -1052,8 +1046,8 @@ impl AcState<'_> {
             index,
             stand_in(self.circuit, index, load),
             &self.model,
-            &self.bias,
-            Some(&self.state),
+            self.bias,
+            Some(self.state),
             &mut system,
         )?;
         Ok(system)
@@ -1080,21 +1074,18 @@ impl AcState<'_> {
     ) -> SpiceResult<Vec<Complex>> {
         let s0 = self.assemble(index, base)?;
         let s1 = self.assemble(index, perturbed)?;
-        let (r0, r1) = (s0.ac_rhs(), s1.ac_rhs());
         // -(base) + perturbed, part by part (one source stamp per row).
-        let mut rhs: Vec<Complex> = r1
-            .iter()
-            .zip(&r0)
-            .map(|(a, b)| Complex::new(-b.re + a.re, -b.im + a.im))
-            .collect();
+        let mut rhs = s0.ac_rhs();
+        for (base, perturbed) in rhs.iter_mut().zip(s1.ac_rhs()) {
+            *base = Complex::new(-base.re + perturbed.re, -base.im + perturbed.im);
+        }
         let (t0, t1) = (self.stamps(&s0), self.stamps(&s1));
         numbering.translate(t0.iter().chain(&t1).map(|&(row, col, _)| (row, col)));
         let elements = accumulate(t0, t1);
-        let product = multiply(numbering, &elements, &self.solution);
-        for (value, product) in rhs.iter_mut().zip(&product) {
-            value.re -= product.re;
-            value.im -= product.im;
-        }
+        numbering.visit_products(elements, &self.solution, |row, product| {
+            rhs[row].re -= product.re;
+            rhs[row].im -= product.im;
+        });
         self.factors.solve(&rhs)
     }
 }
@@ -1322,7 +1313,7 @@ fn run_ac(
         // each parameter. A poisoned block the output does not read
         // would leave C's other blocks finite; that is refused.
         let poisoned = poisoned_rows(&system, omega);
-        let probe_poisoned = probe.rows().into_iter().any(|row| poisoned.contains(&row));
+        let probe_poisoned = probe.rows().any(|row| poisoned.contains(&row));
         if !poisoned.is_empty() && !probe_poisoned {
             return Err(SpiceError::not_yet_ported(
                 format!(
@@ -1431,7 +1422,7 @@ fn run_dc(
         |_, member, setup, current| member.sensitivity.load(setup, current, SensitivityMode::Dc),
         |numbering, index, base, perturbed, delta| {
             let dx = at.delta(numbering, index, base, perturbed)?;
-            point.push(Complex::real(probe.read(&dx, 0.) / delta));
+            point.push(Complex::real(probe.read(dx.as_slice(), 0.) / delta));
             Ok(())
         },
     )?;
@@ -1555,6 +1546,29 @@ mod tests {
 
     fn tokens(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn perturbation_products_follow_internal_column_order_and_clear_workspace() {
+        use super::{DeltaNumbering, accumulate};
+        use crate::primitives::Complex;
+
+        let mut numbering = DeltaNumbering::new(3);
+        numbering.translate([(2, 2), (0, 0), (1, 1)]);
+        let elements = accumulate(
+            [],
+            [
+                (0, 0, Complex::real(-1e16)),
+                (0, 1, Complex::real(1.)),
+                (0, 2, Complex::real(1e16)),
+            ],
+        );
+        let x = [Complex::real(1.); 3];
+        let mut result = [Complex::ZERO; 3];
+        numbering.visit_products(elements, &x, |row, sum| result[row] = sum);
+        assert_eq!(result, [Complex::real(1.), Complex::ZERO, Complex::ZERO]);
+        numbering.visit_products(accumulate([], []), &x, |row, sum| result[row] = sum);
+        assert_eq!(result, [Complex::ZERO; 3]);
     }
 
     #[test]
