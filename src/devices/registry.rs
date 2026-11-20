@@ -305,7 +305,8 @@ impl Registry {
     }
 
     /// Adds or replaces an entry. Returns the entry it replaced, if any.
-    pub fn register(&mut self, entry: DeviceEntry) -> Option<DeviceEntry> {
+    pub fn register(&mut self, mut entry: DeviceEntry) -> Option<DeviceEntry> {
+        entry.designator = entry.designator.to_ascii_lowercase();
         self.entries.insert(entry.designator, entry)
     }
 
@@ -558,7 +559,7 @@ mod tests {
 
         let mut registry = Registry::with_builtins();
         let replaced = registry.register(DeviceEntry {
-            designator: 'r',
+            designator: 'R',
             description: "resistor",
             c_reference: "src/spicelib/parser/inp2r.c",
             support: DeviceSupport::Ported,

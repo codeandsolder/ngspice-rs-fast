@@ -33,13 +33,57 @@ use crate::devices::schema::{
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
+/// The three scalar passive backends. No unrelated model family can reach
+/// the passive schema or be interpreted as an inductor by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PassiveKind {
+    Resistor,
+    Capacitor,
+    Inductor,
+}
+
+impl PassiveKind {
+    const fn from_family(family: ModelFamily) -> Option<Self> {
+        match family {
+            ModelFamily::Resistor => Some(Self::Resistor),
+            ModelFamily::Capacitor => Some(Self::Capacitor),
+            ModelFamily::Inductor => Some(Self::Inductor),
+            _ => None,
+        }
+    }
+
+    const fn family(self) -> ModelFamily {
+        match self {
+            Self::Resistor => ModelFamily::Resistor,
+            Self::Capacitor => ModelFamily::Capacitor,
+            Self::Inductor => ModelFamily::Inductor,
+        }
+    }
+
+    pub(super) const fn principal(self) -> ScalarParameter {
+        match self {
+            Self::Resistor => p("resistance", U::Ohm, D::Finite, None),
+            Self::Capacitor => p("capacitance", U::Farad, D::NonNegative, None),
+            Self::Inductor => p("inductance", U::Henry, D::NonNegative, None),
+        }
+    }
+
+    const fn initial(self) -> Option<ScalarParameter> {
+        match self {
+            Self::Resistor => None,
+            Self::Capacitor => Some(p("ic", U::Volt, D::Finite, None)),
+            Self::Inductor => Some(p("ic", U::Ampere, D::Finite, None)),
+        }
+    }
+}
+
 /// Immutable validated input recipe, not a mutable temperature-adjusted cache.
 ///
 /// Explicit instance values override model defaults; model-specific geometry
 /// precedence is preserved. Derived values are recomputed for every context.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PassiveParameters {
-    family: ModelFamily,
+    kind: PassiveKind,
     nominal_value: Real,
     temperature: Option<Real>,
     nominal_temperature: Option<Real>,
@@ -63,20 +107,16 @@ pub struct PassiveParameters {
 }
 
 impl PassiveParameters {
-    pub(crate) fn literal(family: ModelFamily, value: Real, ic: Option<Real>) -> SpiceResult<Self> {
+    fn literal(kind: PassiveKind, value: Real, ic: Option<Real>) -> SpiceResult<Self> {
         let location = SourceLoc::new(std::path::PathBuf::from("<literal passive>"), 0, 0);
-        let primary = match family {
-            ModelFamily::Resistor => "resistance",
-            ModelFamily::Capacitor => "capacitance",
-            _ => "inductance",
-        };
-        let mut instance_values = ScalarSchema {
-            parameters: &instance_schema(family, primary),
+        let primary = kind.principal();
+        let mut instance_values = instance_schema(kind).validate(&[], &location)?;
+        instance_values.set(primary.name, value, primary.unit, location.clone());
+        if let (Some(ic), Some(parameter)) = (ic, kind.initial()) {
+            instance_values.set(parameter.name, ic, parameter.unit, location.clone());
         }
-        .validate(&[], &location)?;
-        instance_values.set(primary, value, U::Dimensionless, location.clone());
         Ok(Self {
-            family,
+            kind,
             nominal_value: value,
             temperature: None,
             nominal_temperature: None,
@@ -90,7 +130,7 @@ impl PassiveParameters {
             af: 1.,
             ef: 1.,
             noise_area: 1.,
-            model_values: model_schema(family).validate(&[], &location)?,
+            model_values: model_schema(kind).validate(&[], &location)?,
             instance_values,
             location,
         })
@@ -104,12 +144,8 @@ impl PassiveParameters {
         context: &ModelContext,
     ) -> SpiceResult<Self> {
         let mut p = self.clone();
-        let primary = match self.family {
-            ModelFamily::Resistor => "resistance",
-            ModelFamily::Capacitor => "capacitance",
-            _ => "inductance",
-        };
-        let definitions = instance_schema(self.family, primary);
+        let primary = self.kind.principal().name;
+        let definitions = instance_schema(self.kind).parameters;
         let definition = definitions
             .iter()
             .find(|d| d.name == parameter)
@@ -131,7 +167,7 @@ impl PassiveParameters {
             .set(parameter, value, definition.unit, self.location.clone());
         match parameter {
             name if name == primary => {
-                valid_value(self.family, value, &self.location)?;
+                valid_value(self.kind, value, &self.location)?;
                 p.nominal_value = value;
             }
             "temp" => p.temperature = Some(value),
@@ -143,15 +179,11 @@ impl PassiveParameters {
             "w" | "l" => {
                 // restemp.c re-derives geometry only without a given resistance;
                 // CAPsetup's geometry is setup-only, not rerun by a DC setter.
-                if self.family == ModelFamily::Resistor
+                if self.kind == PassiveKind::Resistor
                     && optional(&p.instance_values, primary).is_none()
                 {
-                    p.nominal_value = model_value(
-                        self.family,
-                        &p.model_values,
-                        &p.instance_values,
-                        &p.location,
-                    )?;
+                    p.nominal_value =
+                        model_value(self.kind, &p.model_values, &p.instance_values, &p.location)?;
                 }
             }
             _ => {
@@ -167,7 +199,7 @@ impl PassiveParameters {
     /// Validated resistor/capacitor/inductor family.
     #[must_use]
     pub const fn family(&self) -> ModelFamily {
-        self.family
+        self.kind.family()
     }
     /// Unadjusted single-instance R/C/L in ohms/farads/henries, respectively.
     /// Does not include temperature, scale or multiplicity.
@@ -188,7 +220,7 @@ impl PassiveParameters {
     /// `value` is nonfinite, or violates the family's value domain (resistance
     /// must be nonzero with finite conductance; C/L must be positive).
     pub fn with_nominal_value(&self, value: Real) -> SpiceResult<Self> {
-        valid_value(self.family, value, &self.location)?;
+        valid_value(self.kind, value, &self.location)?;
         Ok(Self {
             nominal_value: value,
             ..self.clone()
@@ -253,18 +285,18 @@ impl PassiveParameters {
         nominal: Real,
         context: &ModelContext,
     ) -> SpiceResult<Real> {
-        valid_value(self.family, nominal, &self.location)?;
+        valid_value(self.kind, nominal, &self.location)?;
         self.effective_value_for(nominal, context)
     }
 
     fn effective_value_for(&self, nominal: Real, context: &ModelContext) -> SpiceResult<Real> {
         let scaled = self.scaled_value_for(nominal, context)?;
-        let value = if self.family == ModelFamily::Capacitor {
+        let value = if self.kind == PassiveKind::Capacitor {
             scaled * self.multiplicity
         } else {
             scaled / self.multiplicity
         };
-        valid_value(self.family, value, &self.location)?;
+        valid_value(self.kind, value, &self.location)?;
         Ok(value)
     }
 
@@ -277,7 +309,7 @@ impl PassiveParameters {
     /// As [`Self::effective_value`].
     pub fn coupling_value(&self, context: &ModelContext) -> SpiceResult<Real> {
         let scaled = self.scaled_value(context)?;
-        valid_value(self.family, scaled, &self.location)?;
+        valid_value(self.kind, scaled, &self.location)?;
         Ok(scaled)
     }
 
@@ -298,7 +330,7 @@ impl PassiveParameters {
         )?;
         let dt = temperature - nominal;
         finite(dt, &self.location, "temperature difference")?;
-        let factor = if self.family == ModelFamily::Resistor {
+        let factor = if self.kind == PassiveKind::Resistor {
             let quadratic = finite(self.tc2 * dt, &self.location, "quadratic coefficient")?;
             let slope = finite(quadratic + self.tc1, &self.location, "temperature slope")?;
             finite(slope * dt, &self.location, "temperature correction")? + 1.0
@@ -328,22 +360,17 @@ impl ResolvedModel<'_> {
     /// or geometry, and nonfinite/nonpositive effective geometry/base values.
     /// Temperature/scale/multiplicity derivation is checked by `effective_value`.
     pub fn passive_parameters(&self, instance: &DeviceInstance) -> SpiceResult<PassiveParameters> {
-        let family = self.family();
-        let primary = match family {
-            ModelFamily::Resistor => "resistance",
-            ModelFamily::Capacitor => "capacitance",
-            ModelFamily::Inductor => "inductance",
-            _ => {
-                return Err(SpiceError::parse(
-                    self.card().location.clone(),
-                    "passive schema requires an R/C/L model",
-                ));
-            }
-        };
+        let kind = PassiveKind::from_family(self.family()).ok_or_else(|| {
+            SpiceError::parse(
+                self.card().location.clone(),
+                "passive schema requires an R/C/L model",
+            )
+        })?;
+        let primary = kind.principal().name;
         if instance.nodes.len() != 2
             || !instance
                 .designator
-                .eq_ignore_ascii_case(&family.designator())
+                .eq_ignore_ascii_case(&kind.family().designator())
             || !instance
                 .model
                 .as_deref()
@@ -354,26 +381,23 @@ impl ResolvedModel<'_> {
                 "instance does not reference this two-terminal passive model",
             ));
         }
-        let model = self.parameters(&model_schema(family))?;
-        let definitions = instance_schema(family, primary);
-        let instance_values = ScalarSchema {
-            parameters: &definitions,
-        }
-        .validate(&instance.parameters, &instance.location)?;
+        let model = self.parameters(&model_schema(kind))?;
+        let instance_values =
+            instance_schema(kind).validate(&instance.parameters, &instance.location)?;
         let location = &instance.location;
         let base = if let Some(value) = optional(&instance_values, primary) {
-            if family == ModelFamily::Resistor {
+            if kind == PassiveKind::Resistor {
                 crate::devices::rlc::res_resist(&instance.name, value)
             } else {
                 value
             }
         } else {
-            model_value(family, &model, &instance_values, location)?
+            model_value(kind, &model, &instance_values, location)?
         };
-        valid_value(family, base, location)?;
+        valid_value(kind, base, location)?;
         // ressetup.c: RESeffNoiseArea uses the instance geometry (L/W
         // defaulting to the model's) only when the instance gives L or W.
-        let noise_area = if family == ModelFamily::Resistor
+        let noise_area = if kind == PassiveKind::Resistor
             && (optional(&instance_values, "l").is_some()
                 || optional(&instance_values, "w").is_some())
         {
@@ -387,7 +411,7 @@ impl ResolvedModel<'_> {
             1.0
         };
         Ok(PassiveParameters {
-            family,
+            kind,
             nominal_value: base,
             temperature: optional(&instance_values, "temp"),
             nominal_temperature: optional(&model, "tnom"),
@@ -410,13 +434,13 @@ impl ResolvedModel<'_> {
 }
 
 fn model_value(
-    family: ModelFamily,
+    kind: PassiveKind,
     model: &ScalarValues,
     instance: &ScalarValues,
     location: &SourceLoc,
 ) -> SpiceResult<Real> {
-    match family {
-        ModelFamily::Resistor => {
+    match kind {
+        PassiveKind::Resistor => {
             let sheet = value(model, "rsh", 0.0);
             // RESsetup supplies positive default L/W (10 um); positive RSH
             // therefore takes precedence over model R, even without L/W given.
@@ -431,7 +455,7 @@ fn model_value(
                 optional(model, "r").ok_or_else(|| SpiceError::parse(location.clone(), "resistor requires an instance resistance, model r or positive rsh; no implicit 1 mOhm fallback"))
             }
         }
-        ModelFamily::Capacitor => {
+        PassiveKind::Capacitor => {
             if let Some(cap) = optional(model, "cap") { return Ok(cap); }
             // CAPsetup stores DEFL but initializes missing instance length to
             // zero without applying it. Require explicit positive L instead.
@@ -445,7 +469,7 @@ fn model_value(
             let sidewall = finite(value(model, "cjsw", 0.0) * perimeter, location, "sidewall capacitance")?;
             finite(bottom + sidewall, location, "geometry capacitance")
         }
-        _ => optional(model, "ind").ok_or_else(|| SpiceError::parse(location.clone(), "inductor requires an instance inductance or model ind; coil geometry is unsupported")),
+        PassiveKind::Inductor => optional(model, "ind").ok_or_else(|| SpiceError::parse(location.clone(), "inductor requires an instance inductance or model ind; coil geometry is unsupported")),
     }
 }
 
@@ -457,7 +481,7 @@ const fn p(name: &'static str, unit: U, domain: D, default: Option<Real>) -> Sca
         default,
     }
 }
-const fn model_schema(family: ModelFamily) -> ScalarSchema<'static> {
+const fn model_schema(kind: PassiveKind) -> ScalarSchema<'static> {
     const R: &[ScalarParameter] = &[
         p("r", U::Ohm, D::Positive, None),
         p("rsh", U::Ohm, D::NonNegative, Some(0.0)),
@@ -492,57 +516,59 @@ const fn model_schema(family: ModelFamily) -> ScalarSchema<'static> {
         p("tnom", U::Celsius, D::Temperature, None),
     ];
     ScalarSchema {
-        parameters: match family {
-            ModelFamily::Resistor => R,
-            ModelFamily::Capacitor => C,
-            _ => L,
+        parameters: match kind {
+            PassiveKind::Resistor => R,
+            PassiveKind::Capacitor => C,
+            PassiveKind::Inductor => L,
         },
     }
 }
-fn instance_schema(family: ModelFamily, primary: &'static str) -> Vec<ScalarParameter> {
-    let unit = match family {
-        ModelFamily::Resistor => U::Ohm,
-        ModelFamily::Capacitor => U::Farad,
-        _ => U::Henry,
-    };
-    // resparam.c clamps a tiny resistance (see `res_resist`) and C accepts a
-    // zero capacitance or inductance; the effective value is checked by
-    // `valid_value`.
-    let domain = if family == ModelFamily::Resistor {
-        D::Finite
-    } else {
-        D::NonNegative
-    };
-    let mut definitions = vec![
-        p(primary, unit, domain, None),
-        p("temp", U::Celsius, D::Temperature, None),
-        p("tc1", U::InverseKelvin, D::Finite, None),
-        p("tc2", U::InverseKelvinSquared, D::Finite, None),
-        p("m", U::Dimensionless, D::Positive, Some(1.0)),
-        p("scale", U::Dimensionless, D::Positive, Some(1.0)),
+const fn instance_schema(kind: PassiveKind) -> ScalarSchema<'static> {
+    const TEMP: ScalarParameter = p("temp", U::Celsius, D::Temperature, None);
+    const TC1: ScalarParameter = p("tc1", U::InverseKelvin, D::Finite, None);
+    const TC2: ScalarParameter = p("tc2", U::InverseKelvinSquared, D::Finite, None);
+    const M: ScalarParameter = p("m", U::Dimensionless, D::Positive, Some(1.));
+    const SCALE: ScalarParameter = p("scale", U::Dimensionless, D::Positive, Some(1.));
+    const L: ScalarParameter = p("l", U::Metre, D::Positive, None);
+    const W: ScalarParameter = p("w", U::Metre, D::Positive, None);
+    const R: &[ScalarParameter] = &[
+        PassiveKind::Resistor.principal(),
+        TEMP,
+        TC1,
+        TC2,
+        M,
+        SCALE,
+        L,
+        W,
+        p("noisy", U::Dimensionless, D::Finite, None),
     ];
-    if family != ModelFamily::Inductor {
-        definitions.extend([
-            p("l", U::Metre, D::Positive, None),
-            p("w", U::Metre, D::Positive, None),
-        ]);
+    const C: &[ScalarParameter] = &[
+        PassiveKind::Capacitor.principal(),
+        TEMP,
+        TC1,
+        TC2,
+        M,
+        SCALE,
+        L,
+        W,
+        p("ic", U::Volt, D::Finite, None),
+    ];
+    const I: &[ScalarParameter] = &[
+        PassiveKind::Inductor.principal(),
+        TEMP,
+        TC1,
+        TC2,
+        M,
+        SCALE,
+        p("ic", U::Ampere, D::Finite, None),
+    ];
+    ScalarSchema {
+        parameters: match kind {
+            PassiveKind::Resistor => R,
+            PassiveKind::Capacitor => C,
+            PassiveKind::Inductor => I,
+        },
     }
-    if family == ModelFamily::Resistor {
-        definitions.push(p("noisy", U::Dimensionless, D::Finite, None));
-    }
-    if family != ModelFamily::Resistor {
-        definitions.push(p(
-            "ic",
-            if family == ModelFamily::Capacitor {
-                U::Volt
-            } else {
-                U::Ampere
-            },
-            D::Finite,
-            None,
-        ));
-    }
-    definitions
 }
 fn optional(values: &ScalarValues, name: &str) -> Option<Real> {
     values.get(name).map(|v| v.value)
@@ -575,9 +601,9 @@ fn corrected(value: Real, correction: Real, location: &SourceLoc, name: &str) ->
     finite(correction, location, "geometry correction")?;
     positive(value - correction, location, name)
 }
-fn valid_value(family: ModelFamily, value: Real, location: &SourceLoc) -> SpiceResult<()> {
+fn valid_value(kind: PassiveKind, value: Real, location: &SourceLoc) -> SpiceResult<()> {
     finite(value, location, "effective passive value")?;
-    if family == ModelFamily::Resistor {
+    if kind == PassiveKind::Resistor {
         if value == 0.0 || !(1.0 / value).is_finite() {
             return Err(SpiceError::parse(
                 location.clone(),
@@ -591,4 +617,30 @@ fn valid_value(family: ModelFamily, value: Real, location: &SourceLoc) -> SpiceR
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_recipe_retains_typed_given_values() {
+        for (kind, unit, initial_unit) in [
+            (PassiveKind::Resistor, U::Ohm, None),
+            (PassiveKind::Capacitor, U::Farad, Some(U::Volt)),
+            (PassiveKind::Inductor, U::Henry, Some(U::Ampere)),
+        ] {
+            let recipe = PassiveParameters::literal(kind, 2., initial_unit.map(|_| 3.)).unwrap();
+            let scalar = recipe.instance_values().get(kind.principal().name).unwrap();
+            assert_eq!(scalar.unit, unit);
+            assert_eq!(scalar.value.to_bits(), 2_f64.to_bits());
+            assert!(scalar.location.is_some());
+            let initial = recipe.instance_values().get("ic");
+            assert_eq!(initial.map(|v| v.unit), initial_unit);
+            if let Some(initial) = initial {
+                assert_eq!(initial.value.to_bits(), 3_f64.to_bits());
+                assert!(initial.location.is_some());
+            }
+        }
+    }
 }

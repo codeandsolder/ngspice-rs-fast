@@ -293,7 +293,7 @@ impl Device for Resistor {
         crate::devices::passive::swept_literal(
             &self.name,
             self.terminals,
-            crate::devices::ModelFamily::Resistor,
+            crate::devices::passive::PassiveKind::Resistor,
             self.resistance,
             None,
             (parameter, value),
@@ -733,7 +733,7 @@ impl Device for Capacitor {
         crate::devices::passive::swept_literal(
             &self.name,
             self.terminals,
-            crate::devices::ModelFamily::Capacitor,
+            crate::devices::passive::PassiveKind::Capacitor,
             self.capacitance,
             self.initial_voltage,
             (parameter, value),
@@ -948,7 +948,7 @@ impl Device for Inductor {
         crate::devices::passive::swept_literal(
             &self.name,
             self.terminals,
-            crate::devices::ModelFamily::Inductor,
+            crate::devices::passive::PassiveKind::Inductor,
             self.inductance,
             self.initial_current,
             (parameter, value),
