@@ -357,7 +357,9 @@ impl PulseBreakpoints {
         }
         let cut = pulse.stop.and_then(|stop| {
             let active = (pulse.rise + pulse.width + pulse.fall).min(pulse.period);
-            let offset = stop - pulse.period * (stop / pulse.period).floor();
+            let elapsed_cycles = (stop / pulse.period).floor();
+            let elapsed = pulse.period * elapsed_cycles;
+            let offset = stop - elapsed;
             (offset > 0. && offset < active).then_some(pulse.delay + stop)
         });
         let last_cycle = ((t1 - pulse.delay) / pulse.period).floor();
@@ -407,7 +409,8 @@ impl Iterator for PulseBreakpoints {
                 self.index = 0;
                 self.cycle += 1.;
             }
-            let local = self.pulse.period * self.cycle + self.offsets[self.index];
+            let cycle_start = self.pulse.period * self.cycle;
+            let local = cycle_start + self.offsets[self.index];
             let t = self.pulse.delay + local;
             self.index += 1;
             if !t.is_finite() {

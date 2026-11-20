@@ -189,19 +189,18 @@ impl Device for ModelPassive {
     fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
         let value = self.parameters.effective_value(context.model_context)?;
         Ok(if self.parameters.kind == PassiveKind::Resistor {
-            let derived;
-            let noise = if let Some(noise) = self.literal_noise.as_deref() {
-                noise
-            } else {
-                derived = self.parameters.resistor_noise_parameters();
-                &derived
+            let evaluate = |noise: &ResistorNoise| {
+                resistor_noise(
+                    self.terminals,
+                    value,
+                    noise,
+                    self.model.as_deref().or(noise.model.as_deref()),
+                    context,
+                )
             };
-            resistor_noise(
-                self.terminals,
-                value,
-                noise,
-                self.model.as_deref().or(noise.model.as_deref()),
-                context,
+            self.literal_noise.as_deref().map_or_else(
+                || evaluate(&self.parameters.resistor_noise_parameters()),
+                evaluate,
             )
         } else {
             DeviceNoise::Noiseless

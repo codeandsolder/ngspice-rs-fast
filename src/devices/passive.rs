@@ -257,7 +257,7 @@ impl PassiveParameters {
         }
     }
 
-    fn resistor_noise_parameters(&self) -> crate::devices::ResistorNoise {
+    const fn resistor_noise_parameters(&self) -> crate::devices::ResistorNoise {
         crate::devices::ResistorNoise {
             noisy: self.noisy,
             kf: self.kf,
@@ -408,8 +408,12 @@ impl ResolvedModel<'_> {
                 optional(&instance_values, "l").unwrap_or_else(|| value(&model, "l", 10e-6));
             let width =
                 optional(&instance_values, "w").unwrap_or_else(|| value(&model, "defw", 10e-6));
-            (length - 2.0 * value(&model, "short", 0.0)).powf(value(&model, "lf", 1.0))
-                * (width - 2.0 * value(&model, "narrow", 0.0)).powf(value(&model, "wf", 1.0))
+            let length_correction = 2.0 * value(&model, "short", 0.0);
+            let width_correction = 2.0 * value(&model, "narrow", 0.0);
+            let effective_length = length - length_correction;
+            let effective_width = width - width_correction;
+            effective_length.powf(value(&model, "lf", 1.0))
+                * effective_width.powf(value(&model, "wf", 1.0))
         } else {
             1.0
         };
