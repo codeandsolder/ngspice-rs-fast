@@ -156,7 +156,7 @@ pub fn expand_with_output(
                     .cloned(),
             ),
             ScopedCardKind::Subcircuit(index) if active.contains(&index) => {
-                hoisted_fourier.extend(netlist.subcircuits[index].fourier.iter().cloned())
+                hoisted_fourier.extend(netlist.subcircuits[index].fourier.iter().cloned());
             }
             _ => {}
         }
@@ -247,6 +247,50 @@ struct Directives<'a> {
     nodesets: &'a [NodeHintCard],
     output: &'a OutputCards,
     measurements: &'a [MeasureCard],
+}
+
+enum ExpansionItem<'a> {
+    Device(usize),
+    Directive(&'a ScopedCard),
+}
+
+impl Directives<'_> {
+    /// Parsed cards determine expansion precedence. Lowering may associate
+    /// several devices with a single location, and programmatic netlists may
+    /// have no ordered cards at all.
+    fn sequence(&self) -> Vec<ExpansionItem<'_>> {
+        let mut sequence = Vec::new();
+        let mut emitted = vec![false; self.devices.len()];
+        let mut by_location: BTreeMap<_, Vec<usize>> = BTreeMap::new();
+        for (index, device) in self.devices.iter().enumerate() {
+            let location = &device.location;
+            by_location
+                .entry((location.file.clone(), location.line, location.column))
+                .or_default()
+                .push(index);
+        }
+        for card in self.cards {
+            if matches!(card.kind, ScopedCardKind::Device(_)) {
+                let location = &card.source.location;
+                if let Some(indices) =
+                    by_location.remove(&(location.file.clone(), location.line, location.column))
+                {
+                    for index in indices {
+                        sequence.push(ExpansionItem::Device(index));
+                        emitted[index] = true;
+                    }
+                }
+            } else {
+                sequence.push(ExpansionItem::Directive(card));
+            }
+        }
+        for (index, used) in emitted.into_iter().enumerate() {
+            if !used {
+                sequence.push(ExpansionItem::Device(index));
+            }
+        }
+        sequence
+    }
 }
 
 struct Expander<'a> {
@@ -342,10 +386,11 @@ fn check_acyclic(
     }
     cyclic.sort_by_key(|component| component.iter().map(|&node| graph[node].clone()).min());
     let component = &cyclic[0];
-    let start = *component
+    let start = component
         .iter()
-        .min_by_key(|&&node| graph[node].clone())
-        .expect("non-empty component");
+        .copied()
+        .min_by_key(|&node| graph[node].clone())
+        .ok_or_else(|| SpiceError::circuit("empty cyclic subcircuit component"))?;
     let path = shortest_cycle(&graph, component, start);
     let chain: Vec<String> = path
         .iter()
@@ -526,56 +571,7 @@ impl Expander<'_> {
                 }
             }
             ScopedCardKind::Output => {
-                for save in directives
-                    .output
-                    .saves
-                    .iter()
-                    .filter(|save| &save.location == location)
-                {
-                    let mut save = save.clone();
-                    for request in &mut save.requests {
-                        match &mut request.vector {
-                            RequestedVector::Voltage { positive, negative }
-                            | RequestedVector::Component {
-                                positive, negative, ..
-                            } => {
-                                *positive = self.rewrite_node(positive, terminals, path);
-                                if let Some(negative) = negative {
-                                    *negative = self.rewrite_node(negative, terminals, path);
-                                }
-                            }
-                            RequestedVector::Current { device } => {
-                                *device = device_name(
-                                    device,
-                                    device.chars().next().unwrap_or_default(),
-                                    path,
-                                );
-                            }
-                            RequestedVector::Named { name, .. } if name.starts_with('@') => {
-                                if let Some((device, parameter)) = name[1..].split_once('[') {
-                                    *name = format!(
-                                        "@{}[{parameter}",
-                                        device_name(
-                                            device,
-                                            device.chars().next().unwrap_or_default(),
-                                            path
-                                        )
-                                    );
-                                }
-                            }
-                            RequestedVector::All | RequestedVector::Named { .. } => {}
-                        }
-                    }
-                    self.frontend.output.saves.push(save);
-                }
-                self.frontend.output.prints.extend(
-                    directives
-                        .output
-                        .prints
-                        .iter()
-                        .filter(|print| &print.location == location)
-                        .cloned(),
-                );
+                self.output_directive(directives.output, location, terminals, path);
             }
             ScopedCardKind::Measure => self.frontend.measurements.extend(
                 directives
@@ -587,6 +583,62 @@ impl Expander<'_> {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Rename saved vectors at this instance while retaining print cards'
+    /// reference behavior and order.
+    fn output_directive(
+        &mut self,
+        output: &OutputCards,
+        location: &SourceLoc,
+        terminals: &BTreeMap<String, String>,
+        path: &str,
+    ) {
+        for save in output
+            .saves
+            .iter()
+            .filter(|save| &save.location == location)
+        {
+            let mut save = save.clone();
+            for request in &mut save.requests {
+                match &mut request.vector {
+                    RequestedVector::Voltage { positive, negative }
+                    | RequestedVector::Component {
+                        positive, negative, ..
+                    } => {
+                        *positive = self.rewrite_node(positive, terminals, path);
+                        if let Some(negative) = negative {
+                            *negative = self.rewrite_node(negative, terminals, path);
+                        }
+                    }
+                    RequestedVector::Current { device } => {
+                        *device =
+                            device_name(device, device.chars().next().unwrap_or_default(), path);
+                    }
+                    RequestedVector::Named { name, .. } if name.starts_with('@') => {
+                        if let Some((device, parameter)) = name[1..].split_once('[') {
+                            *name = format!(
+                                "@{}[{parameter}",
+                                device_name(
+                                    device,
+                                    device.chars().next().unwrap_or_default(),
+                                    path
+                                )
+                            );
+                        }
+                    }
+                    RequestedVector::All | RequestedVector::Named { .. } => {}
+                }
+            }
+            self.frontend.output.saves.push(save);
+        }
+        self.frontend.output.prints.extend(
+            output
+                .prints
+                .iter()
+                .filter(|print| &print.location == location)
+                .cloned(),
+        );
     }
 
     /// The root frame's models: every top-level declaration, unrenamed.
@@ -638,47 +690,14 @@ impl Expander<'_> {
         directives: &Directives<'_>,
     ) -> SpiceResult<()> {
         let devices = directives.devices;
-        // Programmatically constructed netlists may have no ordered cards.
-        // Parsed decks always use the ordered stream for directive precedence.
-        let mut sequence = Vec::new();
-        let mut emitted = vec![false; devices.len()];
-        let mut by_location: BTreeMap<_, Vec<usize>> = BTreeMap::new();
-        for (index, device) in devices.iter().enumerate() {
-            let location = &device.location;
-            by_location
-                .entry((location.file.clone(), location.line, location.column))
-                .or_default()
-                .push(index);
-        }
-        for card in directives.cards {
-            if matches!(card.kind, ScopedCardKind::Device(_)) {
-                // Lowering can replace one card with several devices; retain
-                // every lowered device at that source position.
-                let location = &card.source.location;
-                if let Some(indices) =
-                    by_location.remove(&(location.file.clone(), location.line, location.column))
-                {
-                    for index in indices {
-                        sequence.push((Some(card), index));
-                        emitted[index] = true;
-                    }
-                }
-            } else {
-                sequence.push((Some(card), usize::MAX));
-            }
-        }
-        for (index, used) in emitted.into_iter().enumerate() {
-            if !used {
-                sequence.push((None, index));
-            }
-        }
-        for (card, index) in sequence {
-            if index == usize::MAX {
-                if let Some(card) = card {
+        for item in directives.sequence() {
+            let index = match item {
+                ExpansionItem::Device(index) => index,
+                ExpansionItem::Directive(card) => {
                     self.directive(card, directives, terminals, path, scope)?;
+                    continue;
                 }
-                continue;
-            }
+            };
             let original = devices.get(index).ok_or_else(|| {
                 SpiceError::parse(
                     self.netlist.location.clone(),
