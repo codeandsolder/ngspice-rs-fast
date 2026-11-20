@@ -484,10 +484,11 @@ impl Jfet {
         let mut tcgd = model.cgd * cjfact;
         tcgs *= cjfact1;
         tcgd *= cjfact1;
-        let vto = match model.vtotc {
-            Some(vtotc) => model.vto + vtotc * (temp - tnom),
-            None => model.vto - model.tcv * (temp - tnom),
-        };
+        let vto = model
+            .vtotc
+            .map_or(model.vto - model.tcv * (temp - tnom), |vtotc| {
+                model.vto + vtotc * (temp - tnom)
+            });
         let beta = model.betatce.map_or_else(
             || model.beta * (temp / tnom).powf(model.bex),
             |betatce| model.beta * 1.01_f64.powf(betatce * (temp - tnom)),
@@ -1028,7 +1029,12 @@ pub(super) fn incremental_statz(
     let qgs = qgs1 + 0.5 * (qa - qb + qc - qd);
     let qgd = qgd1 + 0.5 * (qa - qc + qb - qd);
     let (capgs, capgd) = match rule {
-        StatzCapacitance::Averaged => (0.5 * (cgsna + cgsnc), 0.5 * (cgdna + cgdnb)),
+        StatzCapacitance::Averaged => {
+            // Preserve the reference sum-then-scale order, including overflow.
+            let gate_source_sum = cgsna + cgsnc;
+            let gate_drain_sum = cgdna + cgdnb;
+            (0.5 * gate_source_sum, 0.5 * gate_drain_sum)
+        }
         StatzCapacitance::Present => (cgsna, cgdna),
     };
     Ok(gate_charges(qgs, qgd, capgs, capgd))
@@ -1051,8 +1057,8 @@ pub(super) fn normalized(pol: Real, [d, g, s]: [Real; 3]) -> [Real; 2] {
     [pol * (g - s), pol * (g - d)]
 }
 
-/// All three C setups allocate this exact TSTALLOC sequence. Include
-/// aliased prime connections; MatrixSetup itself omits ground entries.
+/// All three C setups allocate this exact `TSTALLOC` sequence. Include
+/// aliased prime connections; `MatrixSetup` itself omits ground entries.
 pub(super) fn setup_gate_matrix(
     setup: &mut crate::devices::setup::MatrixSetup<'_>,
     terminals: &[NodeId],

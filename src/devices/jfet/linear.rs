@@ -6,7 +6,7 @@ use crate::devices::LinearContext;
 use crate::primitives::{NodeId, Real, SpiceResult};
 
 /// The two PZ reference routines share topology and statement order, but
-/// MESpzLoad leaves parts of three diagonal conductances unscaled by M.
+/// `MESpzLoad` leaves parts of three diagonal conductances unscaled by M.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::devices) enum GatePencil {
     Jfet,
@@ -155,7 +155,7 @@ impl GateLinearization {
 /// separately, even when multiple prime/external pointers alias. Retain
 /// those statements rather than folding them into one g+s*C term.
 /// JFET's m*(C*s) vs MES's (m*C)*s association cannot yet be expressed by
-/// PencilTerm's single capacitance coefficient; both use the latter here.
+/// `PencilTerm`'s single capacitance coefficient; both use the latter here.
 fn gate_pole_zero(
     context: &mut LinearContext<'_>,
     terminals: &[NodeId],

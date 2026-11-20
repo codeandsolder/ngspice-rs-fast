@@ -1389,7 +1389,6 @@ impl DeviceSensitivity for Jfet2Sensitivity<'_> {
                 "fc" => m.fc,
                 "ibd" => m.ibd,
                 "is" => m.is,
-                "kf" | "ver" => 0.,
                 "lambda" => m.lambda,
                 "lfgam" => m.lfgam,
                 "lfg1" => m.lfg1,
