@@ -472,13 +472,51 @@ impl ComplexLu {
     }
 
     fn solve_with(&self, rhs: &[Complex], transposed: bool) -> SpiceResult<Vec<Complex>> {
+        if let ComplexOrder::Bound(pattern) = &self.order {
+            pattern.with_complex_workspace(|workspace| self.solve_in(rhs, transposed, workspace))
+        } else {
+            self.solve_in(rhs, transposed, &mut Vec::new())
+        }
+    }
+
+    /// Solves using caller-owned scratch, for repeated RHS or concurrent
+    /// independent solves. The scratch contents are unspecified afterward.
+    /// # Errors
+    /// Wrong RHS size, non-finite RHS or solution.
+    pub fn solve_with_workspace(
+        &self,
+        rhs: &[Complex],
+        workspace: &mut Vec<Complex>,
+    ) -> SpiceResult<Vec<Complex>> {
+        self.solve_in(rhs, false, workspace)
+    }
+
+    /// Transposed counterpart of [`Self::solve_with_workspace`].
+    /// # Errors
+    /// Wrong RHS size, non-finite RHS or solution.
+    pub fn solve_transposed_with_workspace(
+        &self,
+        rhs: &[Complex],
+        workspace: &mut Vec<Complex>,
+    ) -> SpiceResult<Vec<Complex>> {
+        self.solve_in(rhs, true, workspace)
+    }
+
+    fn solve_in(
+        &self,
+        rhs: &[Complex],
+        transposed: bool,
+        workspace: &mut Vec<Complex>,
+    ) -> SpiceResult<Vec<Complex>> {
         if rhs.len() != self.n || rhs.iter().any(|v| !v.is_finite()) {
             return Err(numerical("complex solve", "invalid RHS"));
         }
         let x = if transposed {
-            self.factors.sparse.solve_transposed(rhs)
+            self.factors
+                .sparse
+                .solve_transposed_with_workspace(rhs, workspace)
         } else {
-            self.factors.sparse.solve(rhs)
+            self.factors.sparse.solve_with_workspace(rhs, workspace)
         };
         if x.iter().any(|v| !v.is_finite()) {
             return Err(numerical(
@@ -501,6 +539,57 @@ impl ComplexLu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complex_workspace_is_reused_across_snapshots_and_contended_solves() {
+        let pattern = Arc::new(Pattern::new(2, [(1, 0), (0, 1), (0, 0), (1, 1)]));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        let mut e = SparseMatrix::bound(Arc::clone(&pattern));
+        for (r, c, v) in [(0, 0, 3.), (0, 1, 1.), (1, 0, 2.), (1, 1, 4.)] {
+            a.add(r, c, v).unwrap();
+            e.add(r, c, v * 0.125).unwrap();
+        }
+        let factor = |omega| {
+            ComplexMatrix::from_operators_on(&pattern, &a, &e, omega)
+                .unwrap()
+                .unwrap()
+                .factorize()
+                .unwrap()
+        };
+        let rhs = [Complex::new(1., 2.), Complex::new(-3., 4.)];
+        let first = factor(1.);
+        let expected = first.solve(&rhs).unwrap();
+        let addr = pattern.with_complex_workspace(|w| w.as_ptr());
+        let second = factor(2.);
+        assert_ne!(second.solve(&rhs).unwrap(), expected);
+        assert_eq!(pattern.with_complex_workspace(|w| w.as_ptr()), addr);
+        let transposed = first.solve_transposed(&rhs).unwrap();
+        let mut workspace = Vec::new();
+        assert_eq!(
+            first.solve_with_workspace(&rhs, &mut workspace).unwrap(),
+            expected
+        );
+        let addr2 = workspace.as_ptr();
+        assert_eq!(
+            first
+                .solve_transposed_with_workspace(&rhs, &mut workspace)
+                .unwrap(),
+            transposed
+        );
+        assert_eq!(workspace.as_ptr(), addr2);
+        // Held slot forces the local fallback, including when the caller
+        // holds an older immutable factor snapshot.
+        pattern.with_complex_workspace(|_| {
+            assert_eq!(first.solve(&rhs).unwrap(), expected);
+            assert_eq!(first.solve_transposed(&rhs).unwrap(), transposed);
+        });
+        assert_eq!(pattern.with_complex_workspace(|w| w.as_ptr()), addr);
+        assert!(
+            first
+                .solve_with_workspace(&rhs[..1], &mut workspace)
+                .is_err()
+        );
+    }
 
     #[test]
     fn bound_dynamic_coefficients_match_triplet_path_bit_for_bit() {

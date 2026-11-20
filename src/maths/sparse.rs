@@ -21,7 +21,7 @@ use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::sync::Arc;
 
-use crate::primitives::{Real, SpiceError, SpiceResult};
+use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 use petgraph::graphmap::UnGraphMap;
 
 use crate::maths::dense::Vector;
@@ -67,6 +67,9 @@ pub struct Pattern {
     /// The `(row, col, id)` sequence of the last load, replayed by bound
     /// matrices to skip lookups (ngspice's per-device element pointers).
     trace: std::sync::Mutex<Arc<Trace>>,
+    /// Scratch shared across successive AC snapshots, independently of
+    /// pivot-order transactions. Concurrent solves may use local scratch.
+    complex_workspace: std::sync::Mutex<Vec<Complex>>,
 }
 
 /// The retained SPARSE frame and its AC reorder flag form one transaction.
@@ -192,6 +195,7 @@ impl Pattern {
             row_ids: order,
             ordering: std::sync::Mutex::new(OrderingState::default()),
             trace: std::sync::Mutex::new(Arc::new(Trace::default())),
+            complex_workspace: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -205,6 +209,16 @@ impl Pattern {
     fn store_trace(&self, trace: Arc<Trace>) {
         if let Ok(mut slot) = self.trace.lock() {
             *slot = trace;
+        }
+    }
+
+    /// Reuse the circuit's complex solve scratch without serializing
+    /// independent factor snapshots. A busy or poisoned slot is optional:
+    /// the solve still runs with its own scratch in exactly the same order.
+    pub(super) fn with_complex_workspace<R>(&self, f: impl FnOnce(&mut Vec<Complex>) -> R) -> R {
+        match self.complex_workspace.try_lock() {
+            Ok(mut workspace) => f(&mut workspace),
+            Err(_) => f(&mut Vec::new()),
         }
     }
 
@@ -384,6 +398,26 @@ impl Bound {
     /// Starts device `index`'s stamps: replay resumes at its own segment.
     #[inline]
     fn begin_device(&mut self, index: usize) {
+        // Sequential, completely replayed devices are overwhelmingly the
+        // common load path. The previous end is the next start, so read
+        // only the new end, and leave all recording transitions cold.
+        if self.active
+            && self.cursor == self.end
+            && index == self.device + 1
+            && self.recording.is_none()
+            && self.traceable
+            && let Some(&end) = self.trace.starts.get(index + 1)
+        {
+            self.device = index;
+            self.start = self.end;
+            self.end = end as usize;
+            return;
+        }
+        self.begin_device_slow(index);
+    }
+
+    #[cold]
+    fn begin_device_slow(&mut self, index: usize) {
         if !self.traceable {
             return;
         }
@@ -423,7 +457,11 @@ impl Bound {
     }
 
     fn reset_trace(&mut self) {
-        self.trace = self.pattern.trace();
+        let trace = self.pattern.trace();
+        if !Arc::ptr_eq(&trace, &self.trace) {
+            self.fixed.forget();
+        }
+        self.trace = trace;
         self.device = 0;
         self.active = false;
         self.traceable = true;
@@ -447,6 +485,7 @@ impl Bound {
             let trace = Arc::new(recording);
             self.pattern.store_trace(Arc::clone(&trace));
             self.trace = trace;
+            self.fixed.forget();
         }
         self.active = false;
         self.start = 0;
@@ -698,20 +737,24 @@ impl SparseMatrix {
         {
             return false;
         }
-        let mask = u64::from(batch.mask);
         let Some(traced) = bound.trace.entries.get(bound.start..bound.end) else {
             return false;
         };
-        if traced.len() != mask.count_ones() as usize {
-            return false;
-        }
+        // A verified batch's mask is tied to this immutable trace; every
+        // set bit corresponds to one entry. Full batches are a straight
+        // zip, and partial batches visit just the set bits in stamp order.
+        let mut mask = batch.mask;
+        debug_assert_eq!(traced.len(), mask.count_ones() as usize);
         bound.view.take();
-        let mut traced = traced.iter();
-        for (k, value) in values.iter().enumerate() {
-            if mask & (1 << k) != 0
-                && let Some(&(_, _, id)) = traced.next()
-            {
+        if traced.len() == N {
+            for (&(_, _, id), &value) in traced.iter().zip(values) {
                 bound.values[id as usize] += value;
+            }
+        } else {
+            for &(_, _, id) in traced {
+                let k = mask.trailing_zeros() as usize;
+                bound.values[id as usize] += values[k];
+                mask &= mask - 1;
             }
         }
         bound.cursor = bound.end;
@@ -1361,6 +1404,34 @@ mod tests {
         a.record_trace();
         assert_eq!(a.get(0, 1), 9.);
         assert!(Arc::ptr_eq(&before, &pattern.trace()));
+    }
+
+    #[test]
+    fn stale_fixed_batches_are_invalidated_without_a_lend_cycle() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (1, 1)]));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        a.begin_device(0);
+        a.add(0, 0, 1.).unwrap();
+        a.record_trace();
+        a.clear();
+        assert!(a.lend_fixed(FixedStamps::default(), 1).is_none());
+        a.begin_device(0);
+        let start = a.fixed_start();
+        a.add(0, 0, 1.).unwrap();
+        a.verify_fixed(start, 2, 0b01);
+        a.record_trace();
+
+        // Another load changes the same-length trace: blindly keeping
+        // the old mask would apply the wrong batch value to element 1.
+        let mut b = SparseMatrix::bound(Arc::clone(&pattern));
+        b.begin_device(0);
+        b.add(1, 1, 3.).unwrap();
+        b.record_trace();
+        a.clear();
+        a.begin_device(0);
+        assert!(!a.add_fixed(&[2., 4.]));
+        a.add(1, 1, 4.).unwrap();
+        assert_eq!(a.get(1, 1), 4.);
     }
 
     #[test]

@@ -273,7 +273,7 @@ impl<T: Scalar> Sparse<T> {
     }
 
     /// External indices (1-based) that no element references, so have no
-    /// internal row (C leaves them out of the matrix; see [`Self::solve`]).
+    /// internal row (C leaves them out of the matrix; see [`Self::solve_with_workspace`]).
     pub(crate) fn untranslated(&self) -> impl Iterator<Item = usize> + '_ {
         (1..=self.ext_size).filter(|&ext| self.ext_to_int_row[ext] == NONE)
     }
@@ -1631,7 +1631,8 @@ impl<T: Scalar> Sparse<T> {
     /// external index minus one. ngspice solves in place (`SMPsolve` passes
     /// `RHS` as both right-hand side and solution), so an external index with
     /// no internal row keeps its right-hand-side value.
-    pub(crate) fn solve(&self, rhs: &[T]) -> Vec<T> {
+    #[cfg(test)]
+    fn solve(&self, rhs: &[T]) -> Vec<T> {
         self.solve_with_workspace(rhs, &mut Vec::new())
     }
 
@@ -1700,11 +1701,15 @@ impl<T: Scalar> Sparse<T> {
     }
 
     /// `spSolveTransposed`: `A^T x = b` with the same factors (in place like
-    /// [`Self::solve`]).
-    pub(crate) fn solve_transposed(&self, rhs: &[T]) -> Vec<T> {
+    /// [`Self::solve_with_workspace`]).
+    #[cfg(test)]
+    fn solve_transposed(&self, rhs: &[T]) -> Vec<T> {
+        self.solve_transposed_with_workspace(rhs, &mut Vec::new())
+    }
+
+    pub(super) fn solve_transposed_with_workspace(&self, rhs: &[T], x: &mut Vec<T>) -> Vec<T> {
         let size = self.size;
-        let mut x = Vec::new();
-        self.gather_rhs(rhs, &mut x, true);
+        self.gather_rhs(rhs, x, true);
         for i in 1..=size {
             let temp = x[i];
             if !temp.is_zero() {
@@ -1726,7 +1731,7 @@ impl<T: Scalar> Sparse<T> {
             }
             x[i] = temp.mul(self.elements[pivot].value);
         }
-        self.scatter_solution(rhs, &x, true)
+        self.scatter_solution(rhs, x, true)
     }
 }
 
