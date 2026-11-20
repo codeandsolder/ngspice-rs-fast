@@ -57,7 +57,7 @@ fn designator(token: &Token) -> char {
         .to_ascii_lowercase()
 }
 
-fn primary_name(designator: char) -> &'static str {
+const fn primary_name(designator: char) -> &'static str {
     match designator {
         'r' => "resistance",
         'c' => "capacitance",
@@ -66,7 +66,7 @@ fn primary_name(designator: char) -> &'static str {
 }
 
 /// INP2R/C/L set a pre-model scalar before named setters. A scalar immediately
-/// after the model is INPdevParse's leading value, applied *after* named setters.
+/// after the model is `INPdevParse`'s leading value, applied *after* named setters.
 /// No scalar is injected for a model-only/geometry instance. Declared numeric
 /// names cannot steal the first numeric slot; model semantics stay in devices.
 fn passive_parameters(
@@ -104,7 +104,11 @@ fn passive_parameters(
 }
 
 fn passive_model<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
-    let designator = input.state.card.designator().expect("passive card");
+    let designator = input
+        .state
+        .card
+        .designator()
+        .ok_or_else(|| malformed(input, "expected a passive device card"))?;
     // C reserves r/c/l for scalar assignment. inpcom's named-assignment
     // preprocessing also preserves keyword=value even if keyword is declared
     // as a model. Bare declared keywords in this slot *are* model references.
@@ -139,7 +143,11 @@ fn passive_model<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
 }
 
 fn passive_assignment(input: &mut Input<'_>) -> Result<ParameterAssignment> {
-    let designator = input.state.card.designator().expect("device card");
+    let designator = input
+        .state
+        .card
+        .designator()
+        .ok_or_else(|| malformed(input, "expected a passive device card"))?;
     let (token, name) = any
         .verify_map(move |token: &Token| {
             scalar_name(designator, &token.text).map(|name| (token, name))
@@ -153,14 +161,14 @@ fn passive_assignment(input: &mut Input<'_>) -> Result<ParameterAssignment> {
 fn scalar_name(designator: char, text: &str) -> Option<String> {
     let name = text.to_ascii_lowercase();
     let canonical = match (designator, name.as_str()) {
-        ('r', "r" | "resistance") => primary_name(designator),
-        ('c', "c" | "cap" | "capacitance") => primary_name(designator),
-        ('l', "l" | "inductance") => primary_name(designator),
-        (_, "temp" | "dtemp" | "m" | "tc1" | "tc2" | "scale") => &name,
-        ('r' | 'c', "w" | "l" | "bv_max") => &name,
-        ('r', "ac" | "tc" | "tce" | "noisy") => &name,
-        ('c' | 'l', "ic") => &name,
-        ('l', "nt") => &name,
+        ('r', "r" | "resistance")
+        | ('c', "c" | "cap" | "capacitance")
+        | ('l', "l" | "inductance") => primary_name(designator),
+        (_, "temp" | "dtemp" | "m" | "tc1" | "tc2" | "scale")
+        | ('r' | 'c', "w" | "l" | "bv_max")
+        | ('r', "ac" | "tc" | "tce" | "noisy")
+        | ('c' | 'l', "ic")
+        | ('l', "nt") => &name,
         _ => return None,
     };
     Some(canonical.to_owned())

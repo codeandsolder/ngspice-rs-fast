@@ -68,6 +68,21 @@
 //! `RSPERL` without `ISPERL` is accepted and has no effect, exactly as in C
 //! (it only parameterises the generated diode model).
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::similar_names,
+    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
+)]
+#![expect(
+    clippy::float_cmp,
+    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use std::collections::BTreeSet;
 
 use crate::devices::linear::LinearContext;
@@ -77,7 +92,7 @@ use crate::devices::schema::{ScalarDomain, ScalarParameter, ScalarSchema, Scalar
 use crate::devices::traits::{Device, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment, ParameterKind};
-use crate::primitives::{NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
+use crate::primitives::{NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// The most sections one instance may expand into. C has no limit; the bound
 /// keeps a mistyped `n=` or an extreme `FMAX` from building an unbounded
@@ -172,7 +187,10 @@ impl UrcSections {
     ///
     /// # Errors
     /// The degenerate inputs listed in the module documentation.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )]
     pub fn new(
         length: Real,
         lumps: Option<i64>,
@@ -193,32 +211,49 @@ impl UrcSections {
         let r0 = length * rperl;
         let c0 = length * cperl;
         let i0 = isperl.map(|isperl| length * isperl);
-        let lumps = match lumps {
-            Some(given) => {
-                if given < 1 {
+        let lumps = if let Some(given) = lumps {
+            if given < 1 {
+                return Err(invalid(format!(
+                    "n={given} builds no sections (C leaves the terminals unconnected)"
+                )));
+            }
+            usize::try_from(given)
+                .ok()
+                .filter(|&n| n <= MAX_LUMPS)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "n={given} sections exceed the port's bound of {MAX_LUMPS}"
+                    ))
+                })?
+        } else {
+            let wnorm = fmax * r0 * c0 * 2.0 * std::f64::consts::PI;
+            if wnorm < 35. {
+                3
+            } else {
+                let ratio = (p - 1.) / p;
+                let count = 3.0_f64.max((wnorm * (ratio * ratio)).ln() / p.ln());
+                if !count.is_finite()
+                    || count
+                        > Real::from(
+                            u16::try_from(MAX_LUMPS)
+                                .map_err(|_| invalid("section bound exceeds u16".into()))?,
+                        )
+                {
                     return Err(invalid(format!(
-                        "n={given} builds no sections (C leaves the terminals unconnected)"
+                        "FMAX={fmax} needs {count} sections, more than {MAX_LUMPS}"
                     )));
                 }
-                usize::try_from(given).unwrap_or(usize::MAX)
-            }
-            None => {
-                let wnorm = fmax * r0 * c0 * 2.0 * std::f64::consts::PI;
-                if wnorm < 35. {
-                    3
-                } else {
-                    let ratio = (p - 1.) / p;
-                    let count = 3.0_f64.max((wnorm * (ratio * ratio)).ln() / p.ln());
-                    if !count.is_finite() || count > MAX_LUMPS as Real {
-                        return Err(invalid(format!(
-                            "FMAX={fmax} needs {count} sections, more than {MAX_LUMPS}"
-                        )));
-                    }
-                    // C `(int)` truncation of a value of at least 3.
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let count = count as usize;
-                    count
-                }
+                // C `(int)` truncation of a value of at least 3.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "finite positive section count has been bounded by MAX_LUMPS immediately above"
+                )]
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "section count is clamped to a minimum of three before conversion"
+                )]
+                let count = count as usize;
+                count
             }
         };
         if lumps > MAX_LUMPS {
@@ -226,7 +261,10 @@ impl UrcSections {
                 "{lumps} sections exceed the port's bound of {MAX_LUMPS}"
             )));
         }
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the number of URC sections is bounded by MAX_LUMPS and represented in the C real-valued formula"
+        )]
         let n = lumps as Real;
         let r1 = (r0 * (p - 1.)) / ((2. * p.powf(n)) - 2.);
         let denominator = (p.powf(n - 1.)) * (p + 1.) - 2.;
@@ -240,17 +278,23 @@ impl UrcSections {
             capacitance: c1,
             diode,
         };
+        sections.validate()?;
+        Ok(sections)
+    }
+
+    fn validate(&self) -> SpiceResult<()> {
+        let invalid = |message: String| SpiceError::circuit(format!("URC: {message}"));
         // Every section value must be usable, not only the first.
         let mut prop: Real = 1.;
-        for section in 1..=lumps {
-            let r = prop * r1;
-            let c = prop * c1;
+        for section in 1..=self.lumps {
+            let r = prop * self.resistance;
+            let c = prop * self.capacitance;
             if !(r.is_finite() && r > 0.) {
                 return Err(invalid(format!(
                     "section {section} resistance {r} is not finite and positive"
                 )));
             }
-            match diode {
+            match self.diode {
                 None if !(c.is_finite() && c > 0.) => {
                     return Err(invalid(format!(
                         "section {section} capacitance {c} is not finite and positive \
@@ -270,9 +314,9 @@ impl UrcSections {
                 }
                 None => {}
             }
-            prop *= p;
+            prop *= self.ratio;
         }
-        Ok(sections)
+        Ok(())
     }
 }
 
@@ -290,7 +334,7 @@ pub(crate) fn expand(
     nodes: &mut NodeTable,
     models: &ModelResolver<'_>,
     context: &ModelContext,
-    deck_nodes: &BTreeSet<&str>,
+    deck_nodes: &BTreeSet<String>,
 ) -> SpiceResult<Vec<Box<dyn Device>>> {
     context.validate(&instance.location)?;
     if instance.nodes.len() != 3 {
@@ -384,15 +428,10 @@ pub(crate) fn expand(
 
 /// `INPgetValue(IF_INTEGER)`: `(int) floor(0.5 + value)`, range checked.
 fn integer(value: Real, at: Option<&SourceLoc>, owner: &SourceLoc) -> SpiceResult<i64> {
-    let rounded = (value + 0.5).floor();
-    if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&rounded) {
-        return Err(SpiceError::Unsupported {
-            feature: format!("URC n={value} is outside the C integer range"),
-            location: Some(at.unwrap_or(owner).clone()),
-        });
-    }
-    #[allow(clippy::cast_possible_truncation)]
-    Ok(rounded as i64)
+    crate::primitives::c_integer(value).ok_or_else(|| SpiceError::Unsupported {
+        feature: format!("URC n={value} is outside the C integer range"),
+        location: Some(at.unwrap_or(owner).clone()),
+    })
 }
 
 /// A scalar setter as the deck would have written it. `{:e}` is Rust's
@@ -413,116 +452,117 @@ fn build(
     model_location: &SourceLoc,
     nodes: &mut NodeTable,
     context: &ModelContext,
-    deck_nodes: &BTreeSet<&str>,
+    deck_nodes: &BTreeSet<String>,
 ) -> SpiceResult<Vec<Box<dyn Device>>> {
     let name = &instance.name;
-    let mut staged = nodes.clone();
-    // The terminals exist before setup in C (INP2U binds them at parse time).
-    for terminal in &instance.nodes {
-        staged.intern(terminal);
-    }
-    let fresh = |staged: &mut NodeTable, suffix: String| -> SpiceResult<String> {
-        let node = format!("{name}#{suffix}");
-        // C's CKTmkVolt fails (E_EXISTS) on a name the deck already uses,
-        // whichever card comes first.
-        if staged.get(&node).is_some() || deck_nodes.contains(node.as_str()) {
-            return Err(SpiceError::circuit(format!(
-                "URC internal-node name collision: {node}"
-            )));
+    crate::devices::factory::append_nodes(nodes, |nodes| {
+        // The terminals exist before setup in C (INP2U binds them at parse time).
+        for terminal in &instance.nodes {
+            nodes.intern(terminal)?;
         }
-        staged.intern(&node);
-        Ok(node)
-    };
-    // The diode ladder's generated model (`<name>#diodemod`: cjo, rs, is set
-    // in that order by URCsetup); every diode references it.
-    let diode_model = sections.diode.map(|(i1, rd)| ModelCard {
-        name: format!("{name}#diodemod"),
-        base: "d".to_owned(),
-        level: None,
-        parameters: vec![
-            setter("cjo", sections.capacitance, model_location),
-            setter("rs", rd, model_location),
-            setter("is", i1, model_location),
-        ],
-        location: model_location.clone(),
-    });
-    let diode_models = diode_model.into_iter().collect::<Vec<_>>();
-    let diode_resolver = ModelResolver::new(&diode_models)?;
-    let reference = instance.nodes[2].clone();
-    let mut devices: Vec<Box<dyn Device>> = Vec::with_capacity(4 * sections.lumps + 1);
-    // C keeps the URC instance itself (created by INP2U, before setup) next
-    // to the elements URCsetup generates.
-    devices.push(Box::new(UrcLine {
-        name: name.clone(),
-        length: sections.length,
-        lumps: sections.lumps,
-    }));
-    let mut lowl = instance.nodes[0].clone();
-    let mut hir = instance.nodes[1].clone();
-    let mut prop: Real = 1.;
-    let id = |staged: &mut NodeTable, node: &str| -> NodeId { staged.intern(node) };
-    for section in 1..=sections.lumps {
-        let hil = fresh(&mut staged, format!("hi{section}"))?;
-        let lowr = if section == sections.lumps {
-            hil.clone()
-        } else {
-            fresh(&mut staged, format!("lo{section}"))?
-        };
-        let r = prop * sections.resistance;
-        let c = prop * sections.capacitance;
-        let terminals = [id(&mut staged, &lowl), id(&mut staged, &lowr)];
-        devices.push(Box::new(Resistor::new(
-            format!("{name}#rlo{section}"),
-            terminals,
-            r,
-        )?));
-        let terminals = [id(&mut staged, &hil), id(&mut staged, &hir)];
-        devices.push(Box::new(Resistor::new(
-            format!("{name}#rhi{section}"),
-            terminals,
-            r,
-        )?));
-        let mut shunts = vec![("lo", lowr.clone())];
-        if section != sections.lumps {
-            shunts.push(("hi", hil.clone()));
-        }
-        for (side, node) in shunts {
-            if sections.diode.is_some() {
-                let diode = DeviceInstance {
-                    name: format!("{name}#d{side}{section}"),
-                    designator: 'd',
-                    nodes: vec![node, reference.clone()],
-                    model: Some(format!("{name}#diodemod")),
-                    parameters: vec![setter("area", prop, &instance.location)],
-                    location: instance.location.clone(),
-                };
-                let model = diode_resolver.resolve(&diode)?.ok_or_else(|| {
-                    SpiceError::circuit(format!("URC {name}: generated diode model missing"))
-                })?;
-                devices.push(crate::devices::nonlinear::Diode::instantiate(
-                    &diode,
-                    &mut staged,
-                    &model,
-                    context,
-                )?);
-            } else {
-                let terminals = [id(&mut staged, &node), id(&mut staged, &reference)];
-                devices.push(Box::new(Capacitor::new(
-                    format!("{name}#c{side}{section}"),
-                    terminals,
-                    c,
-                    None,
-                )?));
+        let fresh = |staged: &mut NodeTable, suffix: String| -> SpiceResult<String> {
+            let node = format!("{name}#{suffix}");
+            // C's CKTmkVolt fails (E_EXISTS) on a name the deck already uses,
+            // whichever card comes first.
+            if staged.get(&node).is_some()
+                || deck_nodes.contains(&NodeTable::canonical_name(&node, staged.auto_gnd()))
+            {
+                return Err(SpiceError::circuit(format!(
+                    "URC internal-node name collision: {node}"
+                )));
             }
+            staged.intern(&node)?;
+            Ok(node)
+        };
+        // The diode ladder's generated model (`<name>#diodemod`: cjo, rs, is set
+        // in that order by URCsetup); every diode references it.
+        let diode_model = sections.diode.map(|(i1, rd)| ModelCard {
+            name: format!("{name}#diodemod"),
+            base: "d".to_owned(),
+            level: None,
+            parameters: vec![
+                setter("cjo", sections.capacitance, model_location),
+                setter("rs", rd, model_location),
+                setter("is", i1, model_location),
+            ],
+            location: model_location.clone(),
+        });
+        let diode_models = diode_model.into_iter().collect::<Vec<_>>();
+        let diode_resolver = ModelResolver::new(&diode_models)?;
+        let reference = instance.nodes[2].clone();
+        let mut devices: Vec<Box<dyn Device>> = Vec::with_capacity(4 * sections.lumps + 1);
+        // C keeps the URC instance itself (created by INP2U, before setup) next
+        // to the elements URCsetup generates.
+        devices.push(Box::new(UrcLine {
+            name: name.clone(),
+            length: sections.length,
+            lumps: sections.lumps,
+        }));
+        let mut lowl = instance.nodes[0].clone();
+        let mut hir = instance.nodes[1].clone();
+        let mut prop: Real = 1.;
+
+        for section in 1..=sections.lumps {
+            let hil = fresh(nodes, format!("hi{section}"))?;
+            let lowr = if section == sections.lumps {
+                hil.clone()
+            } else {
+                fresh(nodes, format!("lo{section}"))?
+            };
+            let r = prop * sections.resistance;
+            let c = prop * sections.capacitance;
+            let terminals = [nodes.intern(&lowl)?, nodes.intern(&lowr)?];
+            devices.push(Box::new(Resistor::new(
+                format!("{name}#rlo{section}"),
+                terminals,
+                r,
+            )?));
+            let terminals = [nodes.intern(&hil)?, nodes.intern(&hir)?];
+            devices.push(Box::new(Resistor::new(
+                format!("{name}#rhi{section}"),
+                terminals,
+                r,
+            )?));
+            let mut shunts = vec![("lo", lowr.clone())];
+            if section != sections.lumps {
+                shunts.push(("hi", hil.clone()));
+            }
+            for (side, node) in shunts {
+                if sections.diode.is_some() {
+                    let diode = DeviceInstance {
+                        name: format!("{name}#d{side}{section}"),
+                        designator: 'd',
+                        nodes: vec![node, reference.clone()],
+                        model: Some(format!("{name}#diodemod")),
+                        parameters: vec![setter("area", prop, &instance.location)],
+                        location: instance.location.clone(),
+                    };
+                    let model = diode_resolver.resolve(&diode)?.ok_or_else(|| {
+                        SpiceError::circuit(format!("URC {name}: generated diode model missing"))
+                    })?;
+                    devices.push(crate::devices::nonlinear::Diode::instantiate(
+                        &diode, nodes, &model, context,
+                    )?);
+                } else {
+                    let terminals = [nodes.intern(&node)?, nodes.intern(&reference)?];
+                    devices.push(Box::new(Capacitor::new(
+                        format!("{name}#c{side}{section}"),
+                        terminals,
+                        c,
+                        None,
+                    )?));
+                }
+            }
+            prop *= sections.ratio;
+            lowl = lowr;
+            hir = hil;
         }
-        prop *= sections.ratio;
-        lowl = lowr;
-        hir = hil;
-    }
-    *nodes = staged;
-    Ok(devices)
+        Ok(devices)
+    })
 }
 
+/// An expanded URC line instance with no direct matrix contribution.
+///
 /// The URC instance itself, as C keeps it after `URCsetup`: a device with
 /// no terminals and no load (`urcinit.c`: `DEVload`, `DEVacLoad`,
 /// `DEVpzLoad`, `DEVnoise` and `DEVdisto` are all `NULL`). It answers
@@ -616,7 +656,10 @@ impl Device for UrcLine {
         keyword: &str,
         _context: &ModelContext,
     ) -> SpiceResult<Option<Real>> {
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "URC section count fits the bounded C real-valued parameter representation"
+        )]
         Ok(match keyword {
             "l" => Some(self.length),
             "n" => Some(self.lumps as Real),
@@ -686,6 +729,7 @@ mod tests {
         assert!(base(1.5, Some(0), 1e-12).is_err());
         assert!(base(1.5, Some(-2), 1e-12).is_err());
         assert!(base(1.5, Some(MAX_LUMPS as i64 + 1), 1e-12).is_err());
+        assert!(base(1.5, Some(i64::MAX), 1e-12).is_err());
         assert!(base(1.5, None, 0.).is_err());
         // A huge ratio overflows p^n: refused, never a zero resistor.
         assert!(base(1e300, Some(5), 1e-12).is_err());
@@ -705,7 +749,12 @@ mod tests {
 
     #[test]
     fn generated_setters_round_trip_exactly() {
-        for value in [1.3793103448275862e-20, 0.1 + 0.2, 1.5f64.powf(7.), 3e-3] {
+        for value in [
+            1.379_310_344_827_586_2e-20,
+            0.1 + 0.2,
+            1.5f64.powf(7.),
+            3e-3,
+        ] {
             let text = setter(
                 "x",
                 value,

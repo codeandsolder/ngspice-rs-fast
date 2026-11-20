@@ -53,7 +53,7 @@ fn store<T>(
 ///
 /// # Errors
 /// A setter whose generated destination is missing (an internal error).
-pub(crate) fn model(params: &ModelParameters) -> SpiceResult<Model> {
+pub(super) fn model(params: &ModelParameters) -> SpiceResult<Model> {
     // INPmakeMod applies the NMOS/PMOS type before the card's setters.
     let mut m = Model {
         r#type: i32::from(params.polarity),
@@ -92,7 +92,7 @@ pub(crate) fn model(params: &ModelParameters) -> SpiceResult<Model> {
 ///
 /// # Errors
 /// A setter whose generated destination is missing (an internal error).
-pub(crate) fn instance(inputs: &Inputs) -> SpiceResult<Instance> {
+pub(super) fn instance(inputs: &Inputs) -> SpiceResult<Instance> {
     let mut h = Instance::default();
     for applied in inputs.applied() {
         let p = applied.parameter;

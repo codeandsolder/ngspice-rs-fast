@@ -1,17 +1,39 @@
 //! Model-only default processing from `b3set.c::BSIM3setup`, before instance
 //! geometry, state/node allocation, temperature scaling or effective-size
 //! `b3check.c` diagnostics. Keep this phase distinct from raw explicit inputs.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::OnceLock;
 
-use super::{InputType, ModelParameters, Value, defaults_data, descriptor, parameters};
+use super::{InputType, ModelParameters, Parameter, Value, defaults_data, descriptor, parameters};
 use crate::devices::ModelContext;
 use crate::devices::schema::temperature_kelvin;
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 const EPS_OXIDE: Real = 3.453_133e-11;
 // b3set.c uses this rounded constant, not the platform's full-precision pi.
-#[allow(clippy::approx_constant)] // Match the intentionally rounded b3set.c PI.
-const SETUP_PI: Real = 3.141_592_654;
+// Preserve the exact binary64 value of b3set.c's deliberately rounded PI.
+const SETUP_PI: Real = Real::from_bits(0x4009_21fb_5452_4550);
+
+/// The generated descriptor remains authoritative; index its canonical
+/// spelling and aliases once instead of scanning hundreds of rows at every
+/// model-field access in setup and the numerical load. Mixed-case external
+/// input retains the shared descriptor's ASCII-insensitive semantics.
+fn model_descriptor(name: &str) -> Option<&'static Parameter> {
+    static INDEX: OnceLock<HashMap<&'static str, &'static Parameter>> = OnceLock::new();
+    let index = INDEX.get_or_init(|| {
+        let mut index = HashMap::with_capacity(parameters::MODEL.len());
+        for parameter in parameters::MODEL {
+            index.entry(parameter.name).or_insert(parameter);
+        }
+        index
+    });
+    index.get(name).copied().or_else(|| {
+        name.bytes()
+            .any(|b| b.is_ascii_uppercase())
+            .then(|| descriptor(parameters::MODEL, name))
+            .flatten()
+    })
+}
 
 /// A model selector reset performed by `b3set.c`, with the given flag retained.
 /// Device-layer code returns diagnostics rather than printing them.
@@ -27,6 +49,8 @@ pub struct ModelWarning {
     pub c_reference: &'static str,
 }
 
+/// BSIM3 model defaults before geometry or temperature processing.
+///
 /// Model fields as the model-only part of `b3set.c` leaves them, not a
 /// temperature- or geometry-processed transistor. Zero-initialized but ungiven
 /// fields (such as K1/K2) remain distinguishable through [`Self::is_given`].
@@ -49,15 +73,49 @@ impl ModelDefaults {
     /// Flags and VERSION are exposed separately; aliases use the same C ID.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Real> {
-        let parameter = descriptor(parameters::MODEL, name)?;
+        let parameter = model_descriptor(name)?;
         self.numeric.get(&parameter.id).copied()
+    }
+
+    /// Read a C `IF_INTEGER` model field without silently saturating a float.
+    ///
+    /// Setter values are stored in the shared numeric projection as f64, but
+    /// integer fields must remain representable in C's signed i32 domain.
+    ///
+    /// # Errors
+    /// Missing, non-integer, nonfinite or out-of-range internal model fields.
+    pub(super) fn integer(&self, name: &str) -> SpiceResult<i32> {
+        let field = model_descriptor(name)
+            .filter(|field| field.input_type == InputType::Integer)
+            .ok_or_else(|| {
+                SpiceError::circuit(format!("BSIM3 model field {name} is not an integer"))
+            })?;
+        let value = self
+            .numeric
+            .get(&field.id)
+            .copied()
+            .ok_or_else(|| SpiceError::circuit(format!("BSIM3 model defaults lost {name}")))?;
+        // The IF_INTEGER setter has already applied C's floor(v + 0.5).
+        // Validate the internal field rather than rounding it a second time.
+        if value.fract() != 0. {
+            return Err(SpiceError::circuit(format!(
+                "BSIM3 integer model field {name} is fractional: {value}"
+            )));
+        }
+        crate::primitives::c_integer(value)
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| {
+                SpiceError::circuit(format!(
+                    "BSIM3 integer model field {name} is outside the C i32 range: {value}"
+                ))
+            })
     }
 
     /// C's given-bit state, not whether the final number differs from a
     /// default. Aliases (and the two type flags) share their actual C bit.
     #[must_use]
     pub fn is_given(&self, name: &str) -> bool {
-        descriptor(parameters::MODEL, name)
+        model_descriptor(name)
             .and_then(|p| p.c_given)
             .is_some_and(|flag| self.given.contains(flag))
     }
@@ -75,7 +133,7 @@ impl ModelDefaults {
     }
 
     fn set(&mut self, name: &str, value: Real) -> SpiceResult<()> {
-        let p = descriptor(parameters::MODEL, name)
+        let p = model_descriptor(name)
             .ok_or_else(|| SpiceError::circuit(format!("unknown internal BSIM3 default {name}")))?;
         // Dependent defaults may legitimately be nonfinite when a given TOX is
         // not positive; `b3check.c` reports that in the instance phase, as C
@@ -97,7 +155,7 @@ impl ModelDefaults {
         Ok(())
     }
 
-    fn number(&self, name: &str) -> SpiceResult<Real> {
+    pub(super) fn number(&self, name: &str) -> SpiceResult<Real> {
         self.get(name).ok_or_else(|| {
             SpiceError::circuit(format!("missing internal BSIM3 model field {name}"))
         })
@@ -144,12 +202,12 @@ impl ModelDefaults {
             result.default(name, value)?;
         }
         for name in ["nqsmod", "acnqsmod"] {
-            let value = result.number(name)?;
-            if value != 0. && value != 1. {
+            let selector = result.integer(name)?;
+            if !matches!(selector, 0 | 1) {
                 result.set(name, 0.)?;
                 result.warnings.push(ModelWarning {
                     parameter: name,
-                    supplied: value,
+                    supplied: Real::from(selector),
                     replacement: 0.,
                     c_reference: "src/spicelib/devices/bsim3/b3set.c (NQS selector reset)",
                 });
@@ -165,7 +223,7 @@ impl ModelDefaults {
         ] {
             result.default(name, if nmos { n } else { p })?;
         }
-        let mobility_three = result.number("mobmod")? == 3.;
+        let mobility_three = result.integer("mobmod")? == 3;
         result.default("uc", if mobility_three { -0.0465 } else { -0.0465e-9 })?;
         result.default("uc1", if mobility_three { -0.056 } else { -0.056e-9 })?;
         result.default(
@@ -189,29 +247,96 @@ impl ModelDefaults {
         ] {
             result.default(to, result.number(from)?)?;
         }
+        result.derive_capacitances()?;
+        Ok(result)
+    }
+
+    // Retain the C rounding order in fringe and overlap calculations.
+    fn derive_capacitances(&mut self) -> SpiceResult<()> {
         // A nonpositive TOX/TOXM or negative IJTH is reported by
         // `b3check.c` in the instance phase, with C's own message.
-        let tox = result.number("tox")?;
-        result.oxide_capacitance = EPS_OXIDE / tox;
-        if !result.is_given("cf") {
-            let fringe = 2. * EPS_OXIDE / SETUP_PI * (1. + 0.4e-6 / tox).ln();
-            result.set("cf", fringe)?;
+        let tox = self.number("tox")?;
+        self.oxide_capacitance = EPS_OXIDE / tox;
+        if !self.is_given("cf") {
+            let fringe_ratio = 0.4e-6 / tox;
+            let fringe_argument = 1. + fringe_ratio;
+            let fringe = 2. * EPS_OXIDE / SETUP_PI * fringe_argument.ln();
+            self.set("cf", fringe)?;
         }
-        let overlap_length = result.number("dlc")?;
-        let cox = result.oxide_capacitance;
+        let overlap_length = self.number("dlc")?;
+        let cox = self.oxide_capacitance;
         for (overlap, fringe) in [("cgdo", "cgdl"), ("cgso", "cgsl")] {
-            if !result.is_given(overlap) {
-                let value = if result.is_given("dlc") && overlap_length > 0. {
-                    overlap_length * cox - result.number(fringe)?
+            if !self.is_given(overlap) {
+                let value = if self.is_given("dlc") && overlap_length > 0. {
+                    let overlap_capacitance = overlap_length * cox;
+                    overlap_capacitance - self.number(fringe)?
                 } else {
-                    0.6 * result.number("xj")? * cox
+                    0.6 * self.number("xj")? * cox
                 };
-                result.set(overlap, value)?;
+                self.set(overlap, value)?;
             }
         }
-        if !result.is_given("cgbo") {
-            result.set("cgbo", 2. * result.number("dwc")? * cox)?;
+        if !self.is_given("cgbo") {
+            self.set("cgbo", 2. * self.number("dwc")? * cox)?;
         }
-        Ok(result)
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_model_descriptor_matches_generated_order_and_aliases() {
+        for parameter in parameters::MODEL {
+            assert!(
+                parameter
+                    .name
+                    .bytes()
+                    .all(|byte| !byte.is_ascii_uppercase())
+            );
+            for name in [
+                parameter.name.to_owned(),
+                parameter.name.to_ascii_uppercase(),
+            ] {
+                assert_eq!(
+                    model_descriptor(&name),
+                    descriptor(parameters::MODEL, &name),
+                    "{name}"
+                );
+            }
+        }
+        assert_eq!(model_descriptor("missing"), None);
+        assert_eq!(model_descriptor("MISSING"), None);
+    }
+
+    #[test]
+    fn integer_model_fields_validate_type_and_c_bounds() {
+        let mut model = ModelDefaults {
+            numeric: BTreeMap::new(),
+            given: BTreeSet::new(),
+            polarity: 1,
+            version: "3.3.0".into(),
+            oxide_capacitance: 0.,
+            warnings: Vec::new(),
+        };
+        for value in [i32::MIN, -1, 0, 3, i32::MAX] {
+            model.set("capmod", Real::from(value)).unwrap();
+            assert_eq!(model.integer("capmod").unwrap(), value);
+        }
+        for invalid in [
+            Real::from(i32::MIN) - 1.,
+            Real::from(i32::MAX) + 1.,
+            1.25,
+            Real::INFINITY,
+            Real::NAN,
+        ] {
+            model.set("capmod", invalid).unwrap();
+            assert!(model.integer("capmod").is_err(), "{invalid:?}");
+        }
+        assert!(model.integer("tox").is_err());
+        assert!(model.integer("missing").is_err());
+        assert!(model.integer("noimod").is_err());
     }
 }

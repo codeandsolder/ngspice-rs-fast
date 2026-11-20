@@ -10,8 +10,11 @@
 //! - `src/spicelib/devices/cktbindnode.c` — node creation and the node index
 //!   space.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
+
+use crate::primitives::{SpiceError, SpiceResult};
 
 /// Canonical name of the ground node.
 pub const GROUND_NAME: &str = "0";
@@ -85,7 +88,7 @@ pub struct Node {
 /// Maps node names to ids, case-insensitively.
 ///
 /// SPICE node names are case-insensitive, so `In`, `IN` and `in` are one node.
-/// The first spelling seen is kept for display and for rawfile output.
+/// Names are stored in canonical lowercase for display and rawfile output.
 #[derive(Debug, Clone)]
 pub struct NodeTable {
     nodes: Vec<Node>,
@@ -122,7 +125,7 @@ impl NodeTable {
 
     /// Whether `gnd` is aliased to ground.
     #[must_use]
-    pub fn auto_gnd(&self) -> bool {
+    pub const fn auto_gnd(&self) -> bool {
         self.auto_gnd
     }
 
@@ -130,11 +133,26 @@ impl NodeTable {
     /// `0` when aliasing is on.
     #[must_use]
     pub fn canonical_name(name: &str, auto_gnd: bool) -> String {
-        let lowered = name.to_lowercase();
-        if auto_gnd && lowered == GROUND_ALIAS {
-            GROUND_NAME.to_owned()
+        Self::canonical(name, auto_gnd).into_owned()
+    }
+
+    fn canonical(name: &str, auto_gnd: bool) -> Cow<'_, str> {
+        if auto_gnd && name.eq_ignore_ascii_case(GROUND_ALIAS) {
+            Cow::Borrowed(GROUND_NAME)
+        } else if name
+            .bytes()
+            .all(|b| b.is_ascii() && !b.is_ascii_uppercase())
+        {
+            Cow::Borrowed(name)
         } else {
-            lowered
+            // Unicode lowercase includes contextual mappings (e.g. final
+            // sigma), so do not substitute per-character ASCII folding.
+            let lowered = name.to_lowercase();
+            if auto_gnd && lowered == GROUND_ALIAS {
+                Cow::Borrowed(GROUND_NAME)
+            } else {
+                Cow::Owned(lowered)
+            }
         }
     }
 
@@ -143,14 +161,21 @@ impl NodeTable {
     /// The node starts out as a [`NodeKind::Terminal`]; use
     /// [`NodeTable::set_kind`] to mark simulator-internal nodes.
     ///
-    /// # Panics
-    /// If the table already holds `u32::MAX` nodes.
-    pub fn intern(&mut self, name: &str) -> NodeId {
-        let canonical = Self::canonical_name(name, self.auto_gnd);
-        if let Some(id) = self.index.get(&canonical) {
-            return *id;
+    /// # Errors
+    /// The compact node identity space or node storage is exhausted.
+    pub fn intern(&mut self, name: &str) -> SpiceResult<NodeId> {
+        let canonical = Self::canonical(name, self.auto_gnd);
+        if let Some(id) = self.index.get(canonical.as_ref()) {
+            return Ok(*id);
         }
-        let id = NodeId::new(u32::try_from(self.nodes.len()).expect("node table overflow"));
+        let canonical = canonical.into_owned();
+        let id = NodeId::new(
+            u32::try_from(self.nodes.len())
+                .map_err(|_| SpiceError::circuit("node table exceeds compact identity range"))?,
+        );
+        self.nodes
+            .try_reserve(1)
+            .map_err(|error| SpiceError::circuit(format!("cannot allocate node: {error}")))?;
         let kind = if canonical == GROUND_NAME {
             NodeKind::Ground
         } else {
@@ -162,14 +187,36 @@ impl NodeTable {
             kind,
         });
         self.index.insert(canonical, id);
-        id
+        Ok(id)
+    }
+
+    /// Intern a fixed terminal layout transactionally.
+    pub(crate) fn intern_array<const N: usize>(
+        &mut self,
+        names: &[String],
+    ) -> SpiceResult<[NodeId; N]> {
+        if names.len() != N {
+            return Err(SpiceError::circuit("invalid terminal layout"));
+        }
+        let mark = self.len();
+        let mut ids = [NodeId::GROUND; N];
+        for (id, name) in ids.iter_mut().zip(names) {
+            match self.intern(name) {
+                Ok(node) => *id = node,
+                Err(error) => {
+                    self.truncate(mark);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(ids)
     }
 
     /// Looks up a node without creating it.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<NodeId> {
-        let canonical = Self::canonical_name(name, self.auto_gnd);
-        self.index.get(&canonical).copied()
+        let canonical = Self::canonical(name, self.auto_gnd);
+        self.index.get(canonical.as_ref()).copied()
     }
 
     /// The node with this id.
@@ -186,7 +233,7 @@ impl NodeTable {
 
     /// Number of nodes, including ground.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.nodes.len()
     }
 
@@ -200,7 +247,7 @@ impl NodeTable {
 
     /// True when the table holds nothing but ground.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.nodes.len() <= 1
     }
 
@@ -219,12 +266,6 @@ impl NodeTable {
             node.kind = kind;
         }
     }
-
-    /// Ground.
-    #[must_use]
-    pub fn ground(&self) -> NodeId {
-        NodeId::GROUND
-    }
 }
 
 impl Default for NodeTable {
@@ -238,11 +279,49 @@ mod tests {
     use super::{GROUND_ALIAS, GROUND_NAME, NodeId, NodeKind, NodeTable};
 
     #[test]
+    fn canonical_lookup_borrows_ascii_and_preserves_unicode_lowercase() {
+        use std::borrow::Cow;
+
+        assert!(matches!(
+            NodeTable::canonical("v(out)#branch", true),
+            Cow::Borrowed("v(out)#branch")
+        ));
+        assert!(matches!(
+            NodeTable::canonical("GND", true),
+            Cow::Borrowed("0")
+        ));
+        assert!(matches!(NodeTable::canonical("GND", false), Cow::Owned(_)));
+        let mut table = NodeTable::new();
+        // Final sigma uses context-sensitive Unicode lowercase.
+        let greek = table.intern("ΟΣ").unwrap();
+        assert_eq!(table.node(greek).unwrap().name, "ος");
+        assert_eq!(table.get("ος"), Some(greek));
+        assert_eq!(table.get("ΟΣ"), Some(greek));
+        let expanded = table.intern("İ").unwrap();
+        assert_eq!(table.get("i\u{307}"), Some(expanded));
+    }
+
+    #[test]
+    fn fixed_terminal_layout_validates_before_interning() {
+        let mut table = NodeTable::new();
+        let existing = table.intern("Out").unwrap();
+        let names = ["new".to_owned()];
+        assert!(table.intern_array::<2>(&names).is_err());
+        assert!(table.get("new").is_none());
+        assert_eq!(table.len(), 2);
+        let names = ["OUT".to_owned(), "new".to_owned(), "New".to_owned()];
+        let ids = table.intern_array::<3>(&names).unwrap();
+        assert_eq!(ids[0], existing);
+        assert_eq!(ids[1], ids[2]);
+        assert_eq!(table.len(), 3);
+    }
+
+    #[test]
     fn ground_is_node_zero() {
         let table = NodeTable::new();
         assert_eq!(table.len(), 1);
         assert!(table.is_empty());
-        assert_eq!(table.ground(), NodeId::GROUND);
+        assert_eq!(table.nodes()[0].id, NodeId::GROUND);
         assert_eq!(table.node(NodeId::GROUND).unwrap().kind, NodeKind::Ground);
         assert_eq!(table.unknown_count(), 0);
     }
@@ -250,9 +329,9 @@ mod tests {
     #[test]
     fn names_are_case_insensitive_and_deduplicated() {
         let mut table = NodeTable::new();
-        let first = table.intern("Out");
-        assert_eq!(table.intern("OUT"), first);
-        assert_eq!(table.intern("out"), first);
+        let first = table.intern("Out").unwrap();
+        assert_eq!(table.intern("OUT").unwrap(), first);
+        assert_eq!(table.intern("out").unwrap(), first);
         assert_eq!(table.len(), 2);
         assert_eq!(table.node(first).unwrap().name, "out");
     }
@@ -260,15 +339,15 @@ mod tests {
     #[test]
     fn gnd_is_aliased_to_ground_by_default() {
         let mut table = NodeTable::new();
-        assert_eq!(table.intern(GROUND_ALIAS), NodeId::GROUND);
-        assert_eq!(table.intern("GND"), NodeId::GROUND);
+        assert_eq!(table.intern(GROUND_ALIAS).unwrap(), NodeId::GROUND);
+        assert_eq!(table.intern("GND").unwrap(), NodeId::GROUND);
         assert_eq!(table.len(), 1);
     }
 
     #[test]
     fn gnd_is_a_node_when_auto_gnd_is_off() {
         let mut table = NodeTable::with_auto_gnd(false);
-        let gnd = table.intern("gnd");
+        let gnd = table.intern("gnd").unwrap();
         assert_ne!(gnd, NodeId::GROUND);
         assert_eq!(table.len(), 2);
         assert_eq!(table.unknown_count(), 1);
@@ -284,8 +363,8 @@ mod tests {
     #[test]
     fn unknown_count_excludes_ground_and_internal_nodes() {
         let mut table = NodeTable::new();
-        let terminal = table.intern("1");
-        let internal = table.intern("x1#internal");
+        let terminal = table.intern("1").unwrap();
+        let internal = table.intern("x1#internal").unwrap();
         table.set_kind(internal, NodeKind::Internal);
         assert_eq!(table.unknown_count(), 2);
         table.set_kind(terminal, NodeKind::Terminal);

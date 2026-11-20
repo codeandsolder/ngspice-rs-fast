@@ -27,7 +27,7 @@ use winnow::error::ErrMode;
 use winnow::stream::Stream as _;
 use winnow::token::any;
 
-use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind};
+use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind, poly_dimension};
 use crate::netlist::bexpr::BehaviouralExpression;
 use crate::netlist::token::{Token, TokenKind};
 
@@ -137,7 +137,7 @@ pub(super) fn expression_after(
 
 /// Byte offset of a token in its card's joined text (`tokenize` columns are
 /// one-based byte offsets).
-fn raw_offset(token: &Token) -> usize {
+const fn raw_offset(token: &Token) -> usize {
     token.location.column.saturating_sub(1) as usize
 }
 
@@ -277,7 +277,7 @@ pub(super) fn value_form(
 }
 
 /// `TABLE {expr} [=] (x, y) ...` (two output nodes, E/G) or, with
-/// `control_nodes`, the LTspice `table=(x0, y0, x1, y1, ...)` after the two
+/// `control_nodes`, the `LTspice` `table=(x0, y0, x1, y1, ...)` after the two
 /// controlling nodes (E only). Points become ordered `x`/`y` setters.
 pub(super) fn table_form(
     input: &mut Input<'_>,
@@ -286,8 +286,8 @@ pub(super) fn table_form(
 ) -> Result<Vec<ParameterAssignment>> {
     let keyword = any.parse_next(input)?;
     let mut parameters = Vec::new();
+    let _ = winnow::combinator::opt(equals).parse_next(input)?;
     if control_nodes {
-        let _ = winnow::combinator::opt(equals).parse_next(input)?;
         parameters.push(ParameterAssignment {
             name: "table".to_owned(),
             value: String::new(),
@@ -295,7 +295,6 @@ pub(super) fn table_form(
             location: keyword.location.clone(),
         });
     } else {
-        let _ = winnow::combinator::opt(equals).parse_next(input)?;
         let Some(token) = input
             .input
             .first()
@@ -388,22 +387,17 @@ pub(super) fn poly_form(
 ) -> Result<Vec<ParameterAssignment>> {
     let keyword = any.parse_next(input)?;
     skip_punctuation(input)?;
-    let dimension = match input.input.first() {
-        Some(token)
-            if token
-                .number()
-                .is_some_and(|v| v >= 1. && v.fract() == 0. && v <= 64.) =>
-        {
-            any.parse_next(input)?
-        }
-        _ => {
-            return Err(parse_error(
+    let count = input
+        .input
+        .first()
+        .and_then(|token| poly_dimension(&token.text))
+        .ok_or_else(|| {
+            parse_error(
                 input,
                 "expected a positive integer POLY dimension (POLY(n), n <= 64)",
-            ));
-        }
-    };
-    let count = dimension.number().unwrap_or(1.) as usize;
+            )
+        })?;
+    let dimension = any.parse_next(input)?;
     let mut parameters = vec![ParameterAssignment {
         name: "poly".to_owned(),
         value: dimension.text.clone(),

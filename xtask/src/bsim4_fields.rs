@@ -1,3 +1,5 @@
+//! Extract BSIM4 scalar field declarations.
+//!
 //! Extract the numeric field declarations of BSIM4's three C structs
 //! (`sBSIM4model`, `bsim4SizeDependParam`, `sBSIM4instance`) as Rust struct
 //! definitions: field names and scalar types only. The BSIM4 port keeps C's
@@ -115,7 +117,7 @@ fn emit_struct(
         writeln!(
             out,
             "    /// The `{kind}` member named `c_name` in C, if there is one.\n    \
-             #[allow(dead_code)]\n    pub(crate) fn {accessor}_mut(&mut self, c_name: &str) -> Option<&mut {kind}> {{\n        \
+             #[allow(dead_code, reason = \"uniform generated schema accessors may be unused by a particular device path\")]\n    pub(crate) fn {accessor}_mut(&mut self, c_name: &str) -> Option<&mut {kind}> {{\n        \
              Some(match c_name {{"
         )
         .map_err(|e| e.to_string())?;
@@ -133,12 +135,12 @@ fn emit_struct(
     // Positional access over the scalar (non-string) members, for records
     // that hold the whole struct as numbers (`.sens`).
     let scalars: Vec<&Field> = fields.iter().filter(|f| f.kind != "String").collect();
-    out.push_str("    /// C member names of the scalar members, in declaration order.\n    #[allow(dead_code)]\n    pub(crate) const MEMBERS: &[&str] = &[\n");
+    out.push_str("    /// C member names of the scalar members, in declaration order.\n    #[allow(dead_code, reason = \"uniform generated schema accessors may be unused by a particular device path\")]\n    pub(crate) const MEMBERS: &[&str] = &[\n");
     for field in &scalars {
         writeln!(out, "        \"{}\",", field.c_name).map_err(|e| e.to_string())?;
     }
     out.push_str("    ];\n\n");
-    out.push_str("    /// The scalar members as numbers, in [`Self::MEMBERS`] order (`i32` exactly,\n    /// a given bit as 0 or 1).\n    #[allow(dead_code)]\n    pub(crate) fn to_values(&self) -> Vec<f64> {\n        vec![\n");
+    out.push_str("    /// The scalar members as numbers, in [`Self::MEMBERS`] order (`i32` exactly,\n    /// a given bit as 0 or 1).\n    #[allow(dead_code, reason = \"uniform generated schema accessors may be unused by a particular device path\")]\n    pub(crate) fn to_values(&self) -> Vec<f64> {\n        vec![\n");
     for field in &scalars {
         let name = rust_name(&field.c_name);
         let expression = match field.kind {
@@ -149,7 +151,7 @@ fn emit_struct(
         writeln!(out, "            {expression},").map_err(|e| e.to_string())?;
     }
     out.push_str("        ]\n    }\n\n");
-    out.push_str("    /// Stores numbers produced by [`Self::to_values`]; `values` must have\n    /// [`Self::MEMBERS`]`.len()` entries.\n    #[allow(dead_code, clippy::cast_possible_truncation)]\n    pub(crate) fn set_values(&mut self, values: &[f64]) {\n");
+    out.push_str("    /// Stores numbers produced by [`Self::to_values`]; `values` must have\n    /// `Self::MEMBERS.len()` entries.\n    #[allow(dead_code, clippy::cast_possible_truncation, reason = \"generated numeric snapshots round-trip exact i32 fields and may be unused for some record types\")]\n    pub(crate) const fn set_values(&mut self, values: &[f64]) {\n");
     for (index, field) in scalars.iter().enumerate() {
         let name = rust_name(&field.c_name);
         let expression = match field.kind {
@@ -169,7 +171,7 @@ fn emit_struct(
 fn real_asks(source: &str, prefix: &str) -> Result<Vec<(String, String)>, String> {
     let source = crate::ifparm::strip_comments(source)?;
     let mut asks: Vec<(String, String)> = Vec::new();
-    let mut pending: Vec<String> = Vec::new();
+    let mut pending: Vec<&str> = Vec::new();
     // The asks recorded for the last case group, dropped again when C goes
     // on to scale the value (`value->rValue *= ...`).
     let mut last = 0..0;
@@ -185,7 +187,7 @@ fn real_asks(source: &str, prefix: &str) -> Result<Vec<(String, String)>, String
             if !id.starts_with("BSIM4_") {
                 return Err(format!("ask: unexpected case `{line}`"));
             }
-            pending.push(id.into());
+            pending.push(id);
         } else if let Some(rest) = line.strip_prefix("value->rValue = ") {
             if let Some(member) = rest
                 .strip_suffix(';')
@@ -194,8 +196,8 @@ fn real_asks(source: &str, prefix: &str) -> Result<Vec<(String, String)>, String
                 .filter(|m| m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
             {
                 let start = asks.len();
-                for id in pending.drain(..) {
-                    asks.push((id, member.into()));
+                for &id in &pending {
+                    asks.push((id.into(), member.into()));
                 }
                 last = start..asks.len();
             }
@@ -261,13 +263,49 @@ pub(crate) fn fields(header: &str, revision: &str) -> Result<String, String> {
         }
     }
     let mut out = format!(
-        "// Generated field facts (C member names and scalar types), not C\n\
+        "// @generated by cargo xtask bsim4-schema; do not edit directly.\n\
+         // Generated field facts (C member names and scalar types), not C\n\
          // implementation code. Source: ngspice {revision}, bsim4/bsim4def.h.\n\
          // Regenerate: cargo xtask bsim4-schema --source /path/to/ngspice\n\
-         #![allow(non_snake_case, clippy::struct_excessive_bools)]\n"
+         "
+    );
+    // Only the generated schema may retain these C-field spelling and
+    // monolithic accessor patterns. The source policy verifies provenance.
+    out.push_str(
+        "#![allow(\n    non_snake_case,\n    clippy::struct_excessive_bools,\n    clippy::used_underscore_binding,\n    clippy::too_many_lines,\n    clippy::large_stack_arrays,\n    clippy::redundant_pub_crate,\n    reason = \"generated C schema preserves member spelling, layout and uniform positional accessors\"\n)]\n",
     );
     emit_struct(&mut out, "Model", "struct sBSIM4model", &model)?;
     emit_struct(&mut out, "SizeParam", "struct bsim4SizeDependParam", &size)?;
     emit_struct(&mut out, "Instance", "struct sBSIM4instance", &instance)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::real_asks;
+
+    #[test]
+    fn real_asks_keeps_case_aliases_and_discards_scaled_values() {
+        let source = "
+            case BSIM4_A:
+            case BSIM4_ALIAS:
+                value->rValue = model->BSIM4a;
+                return OK;
+            case BSIM4_SCALED:
+                value->rValue = model->BSIM4b;
+                value->rValue *= 2;
+                return OK;
+            case BSIM4_C:
+                value->rValue = model->BSIM4c;
+                return OK;
+        ";
+        assert_eq!(
+            real_asks(source, "model->").unwrap(),
+            [
+                ("BSIM4_A".to_owned(), "BSIM4a".to_owned()),
+                ("BSIM4_ALIAS".to_owned(), "BSIM4a".to_owned()),
+                ("BSIM4_C".to_owned(), "BSIM4c".to_owned()),
+            ]
+        );
+    }
 }

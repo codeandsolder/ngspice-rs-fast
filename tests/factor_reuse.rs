@@ -16,7 +16,7 @@ const A: [f64; 7] = [4.0, -1.25, -0.5, 3.0, -0.75, -1.5, 5.0];
 const B: [f64; 7] = [4.5, -1.25, -0.5, 3.0, -0.75, -1.5, 5.0];
 
 fn pattern() -> Arc<Pattern> {
-    Arc::new(Pattern::new(3, POSITIONS))
+    Arc::new(Pattern::new(3, POSITIONS).unwrap())
 }
 
 fn bound(pattern: &Arc<Pattern>, values: &[f64; 7]) -> SparseMatrix {

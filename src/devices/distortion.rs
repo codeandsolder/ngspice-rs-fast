@@ -64,7 +64,7 @@ impl Control {
 
     /// The sum of the differences of `pairs`.
     #[must_use]
-    pub fn sum(pairs: Vec<[NodeId; 2]>) -> Self {
+    pub const fn sum(pairs: Vec<[NodeId; 2]>) -> Self {
         Self {
             pairs,
             unconjugated_in_f1_minus_f2: Vec::new(),
@@ -126,29 +126,46 @@ impl Control {
     }
 }
 
+/// Second- and third-order coefficients of a controlled function.
+///
 /// Second- and third-order Taylor coefficients of a function of the controls
 /// `x`, `y`, `z` (C's `cxx`, ..., `cxyz` arguments of `dloadfns.c`): the
 /// function's expansion is `xx x^2 + yy y^2 + ... + xy x y + ... + xxx x^3 +
 /// ... + xyz x y z` beyond its linear part. Missing controls have zero
 /// coefficients.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-#[allow(missing_docs)]
 pub struct Taylor {
+    /// Coefficient of the x² monomial.
     pub xx: Real,
+    /// Coefficient of the y² monomial.
     pub yy: Real,
+    /// Coefficient of the z² monomial.
     pub zz: Real,
+    /// Coefficient of the xy monomial.
     pub xy: Real,
+    /// Coefficient of the yz monomial.
     pub yz: Real,
+    /// Coefficient of the xz monomial.
     pub xz: Real,
+    /// Coefficient of the x³ monomial.
     pub xxx: Real,
+    /// Coefficient of the y³ monomial.
     pub yyy: Real,
+    /// Coefficient of the z³ monomial.
     pub zzz: Real,
+    /// Coefficient of the x²y monomial.
     pub xxy: Real,
+    /// Coefficient of the x²z monomial.
     pub xxz: Real,
+    /// Coefficient of the xy² monomial.
     pub xyy: Real,
+    /// Coefficient of the y²z monomial.
     pub yyz: Real,
+    /// Coefficient of the xz² monomial.
     pub xzz: Real,
+    /// Coefficient of the yz² monomial.
     pub yzz: Real,
+    /// Coefficient of the xyz monomial.
     pub xyz: Real,
 }
 
@@ -163,7 +180,7 @@ impl Taylor {
         }
     }
 
-    fn second(&self) -> [(usize, usize, Real); 6] {
+    const fn second(&self) -> [(usize, usize, Real); 6] {
         [
             (0, 0, self.xx),
             (1, 1, self.yy),
@@ -174,7 +191,7 @@ impl Taylor {
         ]
     }
 
-    fn third(&self) -> [(usize, usize, usize, Real); 10] {
+    const fn third(&self) -> [(usize, usize, usize, Real); 10] {
         [
             (0, 0, 0, self.xxx),
             (1, 1, 1, self.yyy),
@@ -233,7 +250,7 @@ pub struct DistortionTerm {
 impl DistortionTerm {
     /// A term.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         response: Response,
         nodes: [NodeId; 2],
         controls: Vec<Control>,
@@ -252,7 +269,7 @@ impl DistortionTerm {
     /// Folds the charge polynomial `charge` into this term as `diodisto.c`
     /// does (see [`Self::charge`]).
     #[must_use]
-    pub fn with_charge(mut self, charge: Taylor) -> Self {
+    pub const fn with_charge(mut self, charge: Taylor) -> Self {
         self.charge = Some(charge);
         self
     }
@@ -260,7 +277,7 @@ impl DistortionTerm {
     /// Marks the term with `mos1dist.c`'s `2f1 - f2` kernel quirk (see
     /// [`Self::first_order_im3_kernel`]).
     #[must_use]
-    pub fn with_first_order_im3_kernel(mut self) -> Self {
+    pub const fn with_first_order_im3_kernel(mut self) -> Self {
         self.first_order_im3_kernel = true;
         self
     }
@@ -542,8 +559,10 @@ pub fn add_products(
             // diodisto.c: `temp += -omega * D1i(...)`, `itemp += omega *
             // D1n(...)` onto the junction current's polynomial.
             let charge = inputs.evaluate(charge);
-            temp += -omega * charge.im;
-            itemp += omega * charge.re;
+            let charge_real = -omega * charge.im;
+            let charge_imag = omega * charge.re;
+            temp += charge_real;
+            itemp += charge_imag;
         }
         let [a, b] = term.nodes;
         if let Some(row) = unknowns.node_row(a) {

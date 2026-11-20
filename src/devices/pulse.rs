@@ -60,6 +60,8 @@ impl TransientTiming {
     }
 }
 
+/// Parsed PULSE fields before analysis-specific timing defaults are resolved.
+///
 /// A PULSE as written: omitted trailing fields stay `None` until an analysis
 /// supplies [`TransientTiming`]. Fields must be supplied as a contiguous prefix
 /// (`delay`, `rise`, `fall`, `width`, `period`), as in the netlist syntax.
@@ -276,7 +278,16 @@ impl Pulse {
             return Ok(self.initial);
         }
         if time > self.period {
-            let basetime = self.period * (time / self.period).floor();
+            let cycle = (time / self.period).floor();
+            if !cycle.is_finite() || cycle >= MAX_CYCLE {
+                return Err(invalid(
+                    "evaluation time is too many periods from the origin",
+                ));
+            }
+            let basetime = self.period * cycle;
+            if !basetime.is_finite() {
+                return Err(invalid("evaluation cycle start overflows"));
+            }
             time -= basetime;
         }
         let (v1, v2) = (self.initial, self.pulsed);
@@ -346,7 +357,9 @@ impl PulseBreakpoints {
         }
         let cut = pulse.stop.and_then(|stop| {
             let active = (pulse.rise + pulse.width + pulse.fall).min(pulse.period);
-            let offset = stop - pulse.period * (stop / pulse.period).floor();
+            let elapsed_cycles = (stop / pulse.period).floor();
+            let elapsed = pulse.period * elapsed_cycles;
+            let offset = stop - elapsed;
             (offset > 0. && offset < active).then_some(pulse.delay + stop)
         });
         let last_cycle = ((t1 - pulse.delay) / pulse.period).floor();
@@ -354,6 +367,11 @@ impl PulseBreakpoints {
             return Err(invalid("breakpoint window spans too many periods"));
         }
         let first = ((t0 - pulse.delay) / pulse.period).floor();
+        // A finite train has only one request after its stop. Do not start
+        // past that request's cycle, or a late window would invent a corner.
+        let first = pulse
+            .stop
+            .map_or(first, |stop| first.min((stop / pulse.period).floor()));
         // Start one cycle early so rounding can never skip a corner at t0.
         let cycle = if first > 1. { first - 1. } else { 0. };
         Ok(Self {
@@ -391,7 +409,8 @@ impl Iterator for PulseBreakpoints {
                 self.index = 0;
                 self.cycle += 1.;
             }
-            let local = self.pulse.period * self.cycle + self.offsets[self.index];
+            let cycle_start = self.pulse.period * self.cycle;
+            let local = cycle_start + self.offsets[self.index];
             let t = self.pulse.delay + local;
             self.index += 1;
             if !t.is_finite() {
@@ -479,6 +498,11 @@ mod tests {
         let p = pulse(1., 1., 1., 10.);
         assert!(p.value_at(f64::NAN, R).is_err());
         assert!(p.value_at(f64::INFINITY, L).is_err());
+        let tiny = Pulse::new(0., 1., 0., 0., 0., 0., 1e-300).unwrap();
+        assert!(tiny.value_at(1., R).is_err());
+        assert!(p.value_at(MAX_CYCLE * p.period() + p.delay(), R).is_err());
+        let finite = p.with_count(2.).unwrap();
+        assert_eq!(finite.value_at(Real::MAX, R).unwrap(), p.initial());
     }
 
     #[test]
@@ -519,6 +543,31 @@ mod tests {
             .unwrap();
         assert_eq!(lazy.next(), Some(2.));
         assert_eq!(lazy.by_ref().take(5).count(), 5);
+    }
+
+    #[test]
+    fn finite_train_windows_are_slices_of_the_complete_corner_sequence() {
+        for count in [0.25, 1., 1.4, 1.9, 3., 8.25] {
+            let pulse = pulse(1., 2., 3., 10.).with_count(count).unwrap();
+            let full: Vec<_> = pulse.breakpoints_in(0., 300.).unwrap().collect();
+            for start in 0..300 {
+                let start = Real::from(start) + 0.25;
+                let end = (start + 9.5).min(300.);
+                let expected: Vec<_> = full
+                    .iter()
+                    .copied()
+                    .filter(|&t| t >= start && t <= end)
+                    .collect();
+                assert_eq!(
+                    pulse
+                        .breakpoints_in(start, end)
+                        .unwrap()
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "count {count}, window {start}..{end}"
+                );
+            }
+        }
     }
 
     #[test]

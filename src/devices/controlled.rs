@@ -101,15 +101,47 @@ impl ControlledKind {
     }
 }
 
+/// Fixed topology: the controlling reference or node pair cannot disagree
+/// with the device kind, and linear sources need no heap terminal array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Topology {
+    Vcvs([NodeId; 4]),
+    Vccs([NodeId; 4]),
+    Cccs([NodeId; 2], ControlReference),
+    Ccvs([NodeId; 2], ControlReference),
+}
+
+impl Topology {
+    const fn kind(&self) -> ControlledKind {
+        match self {
+            Self::Vcvs(_) => ControlledKind::Vcvs,
+            Self::Vccs(_) => ControlledKind::Vccs,
+            Self::Cccs(..) => ControlledKind::Cccs,
+            Self::Ccvs(..) => ControlledKind::Ccvs,
+        }
+    }
+
+    const fn terminals(&self) -> &[NodeId] {
+        match self {
+            Self::Vcvs(nodes) | Self::Vccs(nodes) => nodes,
+            Self::Cccs(nodes, _) | Self::Ccvs(nodes, _) => nodes,
+        }
+    }
+
+    const fn control(&self) -> Option<&ControlReference> {
+        match self {
+            Self::Vcvs(_) | Self::Vccs(_) => None,
+            Self::Cccs(_, control) | Self::Ccvs(_, control) => Some(control),
+        }
+    }
+}
+
 /// A linear controlled source. See the [module documentation](self).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControlledSource {
     name: String,
-    kind: ControlledKind,
-    /// `[n+, n-]`, then `[nc+, nc-]` for E/G.
-    terminals: Vec<NodeId>,
+    topology: Topology,
     gain: Real,
-    control: Option<ControlReference>,
     /// The G/F instance `m`, if given (`VCCSmGiven`/`CCCSmGiven`): a gain set
     /// later through `@g1[gain]` is multiplied by it.
     multiplier: Option<Real>,
@@ -128,18 +160,17 @@ impl ControlledSource {
         control: [NodeId; 2],
         gain: Real,
     ) -> SpiceResult<Self> {
-        if !kind.voltage_controlled() {
-            return Err(SpiceError::circuit(format!(
-                "{kind:?} is not voltage controlled"
-            )));
-        }
-        Self::checked(
-            name.into(),
-            kind,
-            vec![output[0], output[1], control[0], control[1]],
-            gain,
-            None,
-        )
+        let nodes = [output[0], output[1], control[0], control[1]];
+        let topology = match kind {
+            ControlledKind::Vcvs => Topology::Vcvs(nodes),
+            ControlledKind::Vccs => Topology::Vccs(nodes),
+            _ => {
+                return Err(SpiceError::circuit(format!(
+                    "{kind:?} is not voltage controlled"
+                )));
+            }
+        };
+        Self::checked(name.into(), topology, gain)
     }
 
     /// A current-controlled source (F or H) sensing `control`'s branch current.
@@ -154,30 +185,24 @@ impl ControlledSource {
         control: ControlReference,
         gain: Real,
     ) -> SpiceResult<Self> {
-        if kind.voltage_controlled() {
-            return Err(SpiceError::circuit(format!(
-                "{kind:?} is not current controlled"
-            )));
-        }
-        Self::checked(
-            name.into(),
-            kind,
-            vec![output[0], output[1]],
-            gain,
-            Some(control),
-        )
+        let topology = match kind {
+            ControlledKind::Cccs => Topology::Cccs(output, control),
+            ControlledKind::Ccvs => Topology::Ccvs(output, control),
+            _ => {
+                return Err(SpiceError::circuit(format!(
+                    "{kind:?} is not current controlled"
+                )));
+            }
+        };
+        Self::checked(name.into(), topology, gain)
     }
 
-    fn checked(
-        name: String,
-        kind: ControlledKind,
-        terminals: Vec<NodeId>,
-        gain: Real,
-        control: Option<ControlReference>,
-    ) -> SpiceResult<Self> {
+    fn checked(name: String, topology: Topology, gain: Real) -> SpiceResult<Self> {
         if !gain.is_finite() {
             return Err(SpiceError::circuit(format!("{name}: non-finite gain")));
         }
+        let kind = topology.kind();
+        let terminals = topology.terminals();
         if kind.has_branch() && terminals[0] == terminals[1] {
             return Err(SpiceError::Unsupported {
                 feature: format!("instance {name} is a shorted {}", kind.c_name()),
@@ -186,10 +211,8 @@ impl ControlledSource {
         }
         Ok(Self {
             name,
-            kind,
-            terminals,
+            topology,
             gain,
-            control,
             multiplier: None,
         })
     }
@@ -215,7 +238,7 @@ impl ControlledSource {
     /// Which controlled source this is.
     #[must_use]
     pub const fn kind(&self) -> ControlledKind {
-        self.kind
+        self.topology.kind()
     }
 
     /// The effective gain after `m` scaling.
@@ -227,7 +250,16 @@ impl ControlledSource {
     /// The sensed source of an F/H, `None` for E/G.
     #[must_use]
     pub const fn control(&self) -> Option<&ControlReference> {
-        self.control.as_ref()
+        self.topology.control()
+    }
+
+    fn bound_control(&self, controls: &[usize]) -> SpiceResult<usize> {
+        controls.first().copied().ok_or_else(|| {
+            SpiceError::circuit(format!(
+                "{}: controlling source branch is not bound",
+                self.name
+            ))
+        })
     }
 
     /// Stamps the static operator into `matrix` (shared by every analysis).
@@ -239,45 +271,38 @@ impl ControlledSource {
         controls: &[usize],
     ) -> SpiceResult<()> {
         let row = |node: NodeId| unknowns.node_row(node);
-        let (p, n) = (row(self.terminals[0]), row(self.terminals[1]));
+        let terminals = self.topology.terminals();
+        let (p, n) = (row(terminals[0]), row(terminals[1]));
         let missing_branch = || SpiceError::circuit(format!("{}: missing branch row", self.name));
-        let control_branch = || {
-            controls.first().copied().ok_or_else(|| {
-                SpiceError::circuit(format!(
-                    "{}: controlling source branch is not bound",
-                    self.name
-                ))
-            })
-        };
         let mut add = |r: Option<usize>, c: Option<usize>, value: Real| match (r, c) {
             (Some(r), Some(c)) => matrix.add(r, c, value),
             _ => Ok(()),
         };
-        match self.kind {
-            ControlledKind::Vccs => {
-                let (cp, cn) = (row(self.terminals[2]), row(self.terminals[3]));
+        match &self.topology {
+            Topology::Vccs([_, _, cp, cn]) => {
+                let (cp, cn) = (row(*cp), row(*cn));
                 add(p, cp, self.gain)?;
                 add(p, cn, -self.gain)?;
                 add(n, cp, -self.gain)?;
                 add(n, cn, self.gain)?;
             }
-            ControlledKind::Cccs => {
-                let kc = Some(control_branch()?);
+            Topology::Cccs(..) => {
+                let kc = Some(self.bound_control(controls)?);
                 add(p, kc, self.gain)?;
                 add(n, kc, -self.gain)?;
             }
-            ControlledKind::Vcvs | ControlledKind::Ccvs => {
+            Topology::Vcvs(_) | Topology::Ccvs(..) => {
                 let k = Some(branch.ok_or_else(missing_branch)?);
                 add(p, k, 1.)?;
                 add(n, k, -1.)?;
                 add(k, p, 1.)?;
                 add(k, n, -1.)?;
-                if self.kind == ControlledKind::Vcvs {
-                    let (cp, cn) = (row(self.terminals[2]), row(self.terminals[3]));
+                if let Topology::Vcvs([_, _, cp, cn]) = &self.topology {
+                    let (cp, cn) = (row(*cp), row(*cn));
                     add(k, cp, -self.gain)?;
                     add(k, cn, self.gain)?;
                 } else {
-                    add(k, Some(control_branch()?), -self.gain)?;
+                    add(k, Some(self.bound_control(controls)?), -self.gain)?;
                 }
             }
         }
@@ -291,42 +316,33 @@ impl Device for ControlledSource {
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
     ) -> SpiceResult<bool> {
-        let [p, n] = [self.terminals[0], self.terminals[1]];
-        let control = || {
-            setup.controls.first().copied().ok_or_else(|| {
-                SpiceError::circuit(format!(
-                    "{}: controlling source branch is not bound",
-                    self.name
-                ))
-            })
-        };
-        match self.kind {
-            ControlledKind::Vccs => {
-                let (cp, cn) = (self.terminals[2], self.terminals[3]);
-                setup.nodes(p, cp);
-                setup.nodes(p, cn);
-                setup.nodes(n, cp);
-                setup.nodes(n, cn);
+        match &self.topology {
+            Topology::Vccs([p, n, cp, cn]) => {
+                setup.nodes(*p, *cp);
+                setup.nodes(*p, *cn);
+                setup.nodes(*n, *cp);
+                setup.nodes(*n, *cn);
             }
-            ControlledKind::Cccs => {
-                let control = Some(control()?);
-                setup.element(setup.node(p), control);
-                setup.element(setup.node(n), control);
+            Topology::Cccs([p, n], _) => {
+                let control = Some(self.bound_control(setup.controls)?);
+                setup.element(setup.node(*p), control);
+                setup.element(setup.node(*n), control);
             }
-            ControlledKind::Vcvs => {
+            Topology::Vcvs([p, n, cp, cn]) => {
                 let branch = Some(setup.branch(0)?);
-                let (cp, cn) = (self.terminals[2], self.terminals[3]);
-                setup.element(setup.node(p), branch);
-                setup.element(setup.node(n), branch);
-                setup.element(branch, setup.node(p));
-                setup.element(branch, setup.node(n));
-                setup.element(branch, setup.node(cp));
-                setup.element(branch, setup.node(cn));
+                // VCVS setup allocates (branch,p) before (branch,n),
+                // unlike CCVS and VSRC. The order controls C's pivots.
+                setup.element(setup.node(*p), branch);
+                setup.element(setup.node(*n), branch);
+                setup.element(branch, setup.node(*p));
+                setup.element(branch, setup.node(*n));
+                setup.element(branch, setup.node(*cp));
+                setup.element(branch, setup.node(*cn));
             }
-            ControlledKind::Ccvs => {
-                let control = control()?;
+            Topology::Ccvs([p, n], _) => {
+                let control = self.bound_control(setup.controls)?;
                 let branch = setup.branch(0)?;
-                setup.voltage_branch(p, n, branch);
+                setup.voltage_branch(*p, *n, branch);
                 setup.element(Some(branch), Some(control));
             }
         }
@@ -356,24 +372,24 @@ impl Device for ControlledSource {
     }
 
     fn designator(&self) -> char {
-        self.kind.designator()
+        self.kind().designator()
     }
 
     fn terminals(&self) -> &[NodeId] {
-        &self.terminals
+        self.topology.terminals()
     }
 
     fn branch_currents(&self) -> usize {
-        usize::from(self.kind.has_branch())
+        usize::from(self.kind().has_branch())
     }
 
     fn controlling_sources(&self) -> &[ControlReference] {
-        self.control.as_slice()
+        self.control().map_or(&[], std::slice::from_ref)
     }
 
     /// E/H currents can control other F/H sources (`VCVSfindBr`, `CCVSfindBr`).
     fn findable_branch(&self) -> Option<usize> {
-        self.kind.has_branch().then_some(0)
+        self.kind().has_branch().then_some(0)
     }
 
     /// The same real stamps in every analysis mode (`*load.c` equals `*acld.c`).
@@ -419,7 +435,7 @@ impl Device for ControlledSource {
     fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
         match keyword.to_ascii_lowercase().as_str() {
             "gain" => Some("gain"),
-            "m" if matches!(self.kind, ControlledKind::Vccs | ControlledKind::Cccs) => Some("m"),
+            "m" if matches!(self.kind(), ControlledKind::Vccs | ControlledKind::Cccs) => Some("m"),
             _ => None,
         }
     }
@@ -433,7 +449,7 @@ impl Device for ControlledSource {
         value: Real,
         _context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        if parameter == "m" && matches!(self.kind, ControlledKind::Vccs | ControlledKind::Cccs) {
+        if parameter == "m" && matches!(self.kind(), ControlledKind::Vccs | ControlledKind::Cccs) {
             crate::devices::sweep::check_swept(&self.name, parameter, value, true, "finite")?;
             // VCCSparam/CCCSparam: M stores a multiplier; only GAIN applies it.
             return Ok(Box::new(Self {
@@ -473,34 +489,7 @@ pub(crate) fn instantiate(
             instance.name
         )));
     };
-    if let Some(form) = instance
-        .parameters
-        .iter()
-        .find(|p| matches!(p.name.as_str(), "poly" | "value" | "table"))
-    {
-        // The front end rewrites these into B sources/XSPICE instances
-        // (crate::netlist::behavioural::lower_nonlinear_sources, run by
-        // Circuit::from_netlist), as inpcom.c does before INP2E..INP2H.
-        return Err(SpiceError::Unsupported {
-            feature: format!(
-                "{}: the {} form must be lowered with \
-                 crate::netlist::behavioural::lower_nonlinear_sources before instantiation",
-                instance.name,
-                form.name.to_ascii_uppercase()
-            ),
-            location: Some(instance.location.clone()),
-        });
-    }
-    let expected = if kind.voltage_controlled() { 4 } else { 2 };
-    if instance.model.is_some() || instance.nodes.len() != expected {
-        return Err(SpiceError::Unsupported {
-            feature: format!(
-                "{} needs {expected} nodes and no model in its linear form",
-                instance.name
-            ),
-            location: Some(instance.location.clone()),
-        });
-    }
+    validate_linear_form(instance, kind)?;
     let multiplier_allowed = matches!(kind, ControlledKind::Vccs | ControlledKind::Cccs);
     let mut gain: Option<Real> = None;
     let mut multiplier: Option<Real> = None;
@@ -550,32 +539,73 @@ pub(crate) fn instantiate(
             location: Some(instance.location.clone()),
         });
     };
-    let mut staged = nodes.clone();
-    let mut bind = |name: &String| staged.intern(name);
-    let output = [bind(&instance.nodes[0]), bind(&instance.nodes[1])];
-    let device = if kind.voltage_controlled() {
-        let control = [bind(&instance.nodes[2]), bind(&instance.nodes[3])];
-        ControlledSource::voltage_controlled(&instance.name, kind, output, control, gain)
-    } else {
-        let control = control.ok_or_else(|| SpiceError::Unsupported {
-            feature: format!("{} has no controlling source", instance.name),
-            location: Some(instance.location.clone()),
-        })?;
-        ControlledSource::current_controlled(&instance.name, kind, output, control, gain)
-    }
-    .map_err(|error| match error {
-        SpiceError::Unsupported { feature, .. } => SpiceError::Unsupported {
-            feature,
-            location: Some(instance.location.clone()),
-        },
-        other => other,
+    let mark = nodes.len();
+    let result = (|| {
+        let output = [
+            nodes.intern(&instance.nodes[0])?,
+            nodes.intern(&instance.nodes[1])?,
+        ];
+        if kind.voltage_controlled() {
+            let control = [
+                nodes.intern(&instance.nodes[2])?,
+                nodes.intern(&instance.nodes[3])?,
+            ];
+            ControlledSource::voltage_controlled(&instance.name, kind, output, control, gain)
+        } else {
+            let control = control.ok_or_else(|| SpiceError::Unsupported {
+                feature: format!("{} has no controlling source", instance.name),
+                location: Some(instance.location.clone()),
+            })?;
+            ControlledSource::current_controlled(&instance.name, kind, output, control, gain)
+        }
+    })();
+    let device = result.map_err(|error| {
+        nodes.truncate(mark);
+        match error {
+            SpiceError::Unsupported { feature, .. } => SpiceError::Unsupported {
+                feature,
+                location: Some(instance.location.clone()),
+            },
+            other => other,
+        }
     })?;
     let device = ControlledSource {
         multiplier,
         ..device
     };
-    *nodes = staged;
     Ok(Box::new(device))
+}
+
+fn validate_linear_form(instance: &DeviceInstance, kind: ControlledKind) -> SpiceResult<()> {
+    if let Some(form) = instance
+        .parameters
+        .iter()
+        .find(|p| matches!(p.name.as_str(), "poly" | "value" | "table"))
+    {
+        // The front end rewrites these into B sources/XSPICE instances
+        // (crate::netlist::behavioural::lower_nonlinear_sources, run by
+        // Circuit::from_netlist), as inpcom.c does before INP2E..INP2H.
+        return Err(SpiceError::Unsupported {
+            feature: format!(
+                "{}: the {} form must be lowered with \
+                 crate::netlist::behavioural::lower_nonlinear_sources before instantiation",
+                instance.name,
+                form.name.to_ascii_uppercase()
+            ),
+            location: Some(instance.location.clone()),
+        });
+    }
+    let expected = if kind.voltage_controlled() { 4 } else { 2 };
+    if instance.model.is_some() || instance.nodes.len() != expected {
+        return Err(SpiceError::Unsupported {
+            feature: format!(
+                "{} needs {expected} nodes and no model in its linear form",
+                instance.name
+            ),
+            location: Some(instance.location.clone()),
+        });
+    }
+    Ok(())
 }
 
 fn literal(text: &str, location: &SourceLoc, what: &str) -> SpiceResult<Real> {
@@ -585,4 +615,35 @@ fn literal(text: &str, location: &SourceLoc, what: &str) -> SpiceResult<Real> {
             feature: format!("non-finite or nonliteral {what}={text}"),
             location: Some(location.clone()),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+
+    #[test]
+    fn failed_source_binding_rolls_back_only_new_nodes() {
+        let mut nodes = NodeTable::new();
+        let present = nodes.intern("present").unwrap();
+        let deck = Parser::new().parse_deck(&parse_deck_text(
+            Path::new("control.cir"),
+            "title\ne1 fresh fresh newcontrol present 2\nf1 fresh 0 vs 3\ng1 fresh 0 newcontrol present 2\n.end\n"
+        )).unwrap();
+        let before = nodes.nodes().to_vec();
+        assert!(instantiate(&deck.devices[0], &mut nodes).is_err());
+        assert_eq!(nodes.nodes(), before);
+        let mut malformed = deck.devices[1].clone();
+        malformed.parameters.retain(|p| p.name != "control");
+        assert!(instantiate(&malformed, &mut nodes).is_err());
+        assert_eq!(nodes.nodes(), before);
+        let device = instantiate(&deck.devices[2], &mut nodes).unwrap();
+        assert_eq!(
+            device.terminals(),
+            &[NodeId::new(2), NodeId::GROUND, NodeId::new(3), present]
+        );
+        assert_eq!(nodes.get("fresh"), Some(NodeId::new(2)));
+        assert_eq!(nodes.get("newcontrol"), Some(NodeId::new(3)));
+    }
 }

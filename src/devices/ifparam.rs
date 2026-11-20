@@ -14,7 +14,7 @@ use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 ///
 /// Compared by identity: two `Inputs` are equal when they were built from the
 /// same device descriptor and carry the same applied setters.
-pub(crate) struct Device {
+pub(super) struct Device {
     /// Diagnostic reference for the C setter file, e.g. `bsim3/b3.c`.
     pub(crate) reference: &'static str,
     /// Generated model table, in C order.
@@ -76,18 +76,18 @@ impl Diagnostic {
     }
 }
 
-/// The input value type declared by the C IFparm table, not a guessed unit.
+/// The input value type declared by the C `IFparm` table, not a guessed unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputType {
-    /// IF_REAL, finite in the Rust projection.
+    /// `IF_REAL`, finite in the Rust projection.
     Real,
-    /// IF_INTEGER, `floor(value + 0.5)` with checked i32 conversion.
+    /// `IF_INTEGER`, `floor(value + 0.5)` with checked i32 conversion.
     Integer,
-    /// IF_FLAG, a bare keyword (C supplies integer 1).
+    /// `IF_FLAG`, a bare keyword (C supplies integer 1).
     Flag,
-    /// IF_STRING, preserving the version spelling instead of parsing a number.
+    /// `IF_STRING`, preserving the version spelling instead of parsing a number.
     String,
-    /// IF_REALVEC, the IC vector expanded into its scalar component setters.
+    /// `IF_REALVEC`, the IC vector expanded into its scalar component setters.
     RealVector,
 }
 
@@ -110,7 +110,7 @@ pub struct Parameter {
     pub name: &'static str,
     /// First keyword with this ID; aliases share last-set precedence.
     pub canonical: &'static str,
-    /// Numeric IFparm identifier from `bsim3def.h`.
+    /// Numeric `IFparm` identifier from `bsim3def.h`.
     pub id: u16,
     /// C's symbolic identifier, for audits and future setter integration.
     pub c_id: &'static str,
@@ -127,7 +127,10 @@ pub struct Parameter {
 }
 
 impl Parameter {
-    #[allow(clippy::too_many_arguments)] // Generated, reviewable IFparm records.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )] // Generated, reviewable IFparm records.
     pub(crate) const fn new(
         name: &'static str,
         canonical: &'static str,
@@ -188,7 +191,7 @@ pub enum Value {
     Real(Real),
     /// Checked C integer setter value.
     Integer(i32),
-    /// Bare IF_FLAG input.
+    /// Bare `IF_FLAG` input.
     Flag(bool),
     /// Unchanged bare string spelling.
     String(String),
@@ -216,7 +219,7 @@ pub struct Inputs {
 }
 
 impl Inputs {
-    pub(crate) fn new(device: &'static Device, is_model: bool) -> Self {
+    pub(super) const fn new(device: &'static Device, is_model: bool) -> Self {
         Self {
             device,
             table: if is_model {
@@ -309,14 +312,12 @@ impl Inputs {
                 Value::Real(value)
             }
             InputType::Integer => {
-                let value = (finite_literal(p)? + 0.5).floor();
-                if !(Real::from(i32::MIN)..=Real::from(i32::MAX)).contains(&value) {
-                    return Err(SpiceError::parse(
-                        p.location.clone(),
-                        "integer setter overflows i32",
-                    ));
-                }
-                Value::Integer(value as i32)
+                let value = crate::primitives::c_integer(finite_literal(p)?)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        SpiceError::parse(p.location.clone(), "integer setter overflows i32")
+                    })?;
+                Value::Integer(value)
             }
             InputType::Flag if p.kind == ParameterKind::Flag && p.value.is_empty() => {
                 Value::Flag(true)
@@ -339,7 +340,7 @@ impl Inputs {
     }
 }
 
-pub(crate) fn descriptor(table: &'static [Parameter], name: &str) -> Option<&'static Parameter> {
+pub(super) fn descriptor(table: &'static [Parameter], name: &str) -> Option<&'static Parameter> {
     table
         .iter()
         .find(|parameter| parameter.name.eq_ignore_ascii_case(name))
@@ -351,7 +352,7 @@ fn unsupported_setter(p: &ParameterAssignment, what: &str, reference: &str) -> S
     }
 }
 
-pub(crate) fn version_text(p: &ParameterAssignment) -> SpiceResult<&str> {
+pub(super) fn version_text(p: &ParameterAssignment) -> SpiceResult<&str> {
     if !matches!(p.kind, ParameterKind::Scalar | ParameterKind::Textual)
         || p.value.is_empty()
         || !p

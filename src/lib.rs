@@ -52,10 +52,8 @@
 //!
 //! [ngspice]: https://ngspice.sourceforge.io/
 
-#![warn(missing_docs)]
-// Production code says why a panic cannot happen (`expect`) or returns an
-// error; `#[cfg(test)]` code is exempt through `clippy.toml`.
-#![warn(clippy::unwrap_used)]
+// Production unwrap policy is owned by the shared strict Rust gate.
+// Workspace Cargo lints retain regular documentation warnings.
 
 pub mod analysis;
 pub mod cli;

@@ -160,6 +160,34 @@ fn repeated_and_diamond_includes_are_not_cycles_or_deduplicated() {
 }
 
 #[test]
+fn empty_and_adjacent_library_sections_retain_exact_boundaries() {
+    let f = Files::new();
+    f.write(
+        "main.cir",
+        "title\n.lib 'process.lib' empty\n.lib 'process.lib' used\n.end\n",
+    );
+    f.write("process.lib", ".lib empty\n.endl empty\n.lib used\nR1 a 0\n+ 1k\n.endl used\n.lib other\nmalformed {\n.endl other\n");
+    let n = f.parse("main.cir").unwrap();
+    assert_eq!(n.devices.len(), 1);
+    assert_eq!(n.devices[0].name, "r1");
+    assert_eq!(n.devices[0].location.line, 4);
+    for (include, start, end) in [(&n.includes[0], 1, 2), (&n.includes[1], 3, 6)] {
+        let boundary = include.selected_section.as_ref().unwrap();
+        assert_eq!(boundary.opening.location.line, start);
+        assert_eq!(boundary.closing.location.line, end);
+    }
+    assert_eq!(n.cards[2].include_chain.len(), 1);
+    assert_eq!(n.cards[2].include_chain[0].line, 3);
+
+    // Boundary validation must continue beyond the selected section.
+    f.write(
+        "process.lib",
+        ".lib empty\n.endl empty\n.lib other\n.endl wrong\n",
+    );
+    let error = f.parse("main.cir").unwrap_err();
+    assert!(error.to_string().contains("mismatched .endl"), "{error}");
+}
+#[test]
 fn canonical_file_and_section_dependencies_detect_cycles() {
     let f = Files::new();
     f.write("main.cir", "title\n.include a.inc\n");
@@ -246,42 +274,42 @@ fn file_depth_byte_and_card_work_limits_include_repeated_sources() {
     for (limits, message) in [
         (
             SourceLimits {
-                max_depth: 0,
+                depth: 0,
                 ..defaults
             },
             "depth limit",
         ),
         (
             SourceLimits {
-                max_files: 2,
+                files: 2,
                 ..defaults
             },
             "file work limit",
         ),
         (
             SourceLimits {
-                max_bytes: 36,
+                bytes: 36,
                 ..defaults
             },
             "byte work limit",
         ),
         (
             SourceLimits {
-                max_cards: 3,
+                cards: 3,
                 ..defaults
             },
             "card work limit",
         ),
         (
             SourceLimits {
-                max_depth: 65,
+                depth: 65,
                 ..defaults
             },
             "at most 64",
         ),
         (
             SourceLimits {
-                max_files: 0,
+                files: 0,
                 ..defaults
             },
             "file work limit",
@@ -293,10 +321,10 @@ fn file_depth_byte_and_card_work_limits_include_repeated_sources() {
         assert!(e.to_string().contains(message), "{e}");
     }
     let limits = SourceLimits {
-        max_depth: 1,
-        max_files: 3,
-        max_bytes: 56,
-        max_cards: 4,
+        depth: 1,
+        files: 3,
+        bytes: 56,
+        cards: 4,
     };
     assert_eq!(
         Parser::new()
@@ -312,7 +340,7 @@ fn file_depth_byte_and_card_work_limits_include_repeated_sources() {
         .parse_file_with_limits(
             f.0.join("main.cir"),
             SourceLimits {
-                max_depth: 1,
+                depth: 1,
                 ..defaults
             },
         )
@@ -325,7 +353,7 @@ fn file_depth_byte_and_card_work_limits_include_repeated_sources() {
         .parse_file_with_limits(
             unicode,
             SourceLimits {
-                max_bytes: 7,
+                bytes: 7,
                 ..defaults
             },
         )

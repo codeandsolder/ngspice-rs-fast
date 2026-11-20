@@ -1,11 +1,14 @@
 //! Scalar linear-device elaboration; unsupported parameters never disappear.
+use crate::devices::models::ModelFamily;
+use crate::devices::passive::PassiveKind;
 use crate::devices::rlc::ResistorNoise;
 use crate::devices::{
     AmSpec, Capacitor, Device, ExpSpec, FunctionSpec, IndependentSource, Inductor, PulseSpec,
     PwlSource, Resistor, SffmSpec, SineSpec, Waveform,
 };
 use crate::netlist::ast::{
-    DeviceInstance, ParameterKind, PositionedValue, SourceFunction, SourceWaveform,
+    DeviceInstance, FunctionWaveform, ParameterKind, PositionedValue, SourceFunction,
+    SourceWaveform,
 };
 use crate::netlist::source::{Deck, LogicalLine};
 use crate::netlist::{Parser, RawCard};
@@ -16,13 +19,13 @@ use crate::primitives::{
 /// Designators [`instantiate`] builds from the card alone (the registry's
 /// `ported` entries). `tests/registry_support.rs` elaborates one instance of
 /// every designator to keep this list and [`ELABORATED`] honest.
-pub(crate) const CARD_FACTORY: &[char] =
+pub(super) const CARD_FACTORY: &[char] =
     &['r', 'c', 'l', 'v', 'i', 'e', 'f', 'g', 'h', 'b', 'k', 't'];
 
 /// Designators built only while elaborating a deck, with the subset built:
 /// D/Q/M/S/W from a resolved `.model` card ([`instantiate_with_models`]) and X
 /// by subcircuit expansion (`crate::devices::subckt`). The registry's `bounded` entries.
-pub(crate) const ELABORATED: &[(char, &str)] = &[
+pub(super) const ELABORATED: &[(char, &str)] = &[
     ('d', "junction diode (dioload.c subset)"),
     ('q', "Gummel-Poon BJT level 1 (bjtload.c)"),
     (
@@ -57,7 +60,7 @@ pub(crate) const ELABORATED: &[(char, &str)] = &[
     ),
 ];
 
-pub(crate) fn from_card(card: &RawCard, nodes: &mut NodeTable) -> SpiceResult<Box<dyn Device>> {
+pub(super) fn from_card(card: &RawCard, nodes: &mut NodeTable) -> SpiceResult<Box<dyn Device>> {
     let deck = Deck {
         path: card.location.path().to_path_buf(),
         title: String::new(),
@@ -70,140 +73,98 @@ pub(crate) fn from_card(card: &RawCard, nodes: &mut NodeTable) -> SpiceResult<Bo
         }],
     };
     let netlist = Parser::new().parse_deck(&deck)?;
-    instantiate(&netlist.devices[0], nodes)
+    let [instance] = netlist.devices.as_slice() else {
+        return Err(SpiceError::parse(
+            card.location.clone(),
+            "device card must elaborate to exactly one instance",
+        ));
+    };
+    instantiate(instance, nodes)
 }
 
 /// Resolve and validate before any node interning. Bounded R/C/L and M4 D/Q/M
-/// factories reject all unsupported physics before committing staged nodes.
-pub(crate) fn instantiate_with_models(
+/// factories reject unsupported physics before committing staged nodes.
+/// Every builtin must honor the append-only node contract: intern nodes and
+/// change only the kinds of newly created nodes. Circuit batch elaboration
+/// uses that contract to roll back an entire failed batch.
+pub(super) fn instantiate_with_models(
     instance: &DeviceInstance,
     nodes: &mut NodeTable,
     models: &crate::devices::models::ModelResolver<'_>,
     context: &crate::devices::models::ModelContext,
 ) -> SpiceResult<Box<dyn Device>> {
     context.validate(&instance.location)?;
-    if let Some(model) = models.resolve(instance)? {
-        if matches!(
-            model.family(),
-            crate::devices::models::ModelFamily::Resistor
-                | crate::devices::models::ModelFamily::Capacitor
-                | crate::devices::models::ModelFamily::Inductor
-        ) {
-            return crate::devices::passive::instantiate(instance, nodes, &model, context);
-        }
-        if model.family() == crate::devices::models::ModelFamily::Diode {
-            return crate::devices::nonlinear::Diode::instantiate(instance, nodes, &model, context);
-        }
-        match model.family() {
-            crate::devices::models::ModelFamily::Npn | crate::devices::models::ModelFamily::Pnp => {
-                return crate::devices::bjt::Bjt::instantiate(instance, nodes, &model, context);
-            }
-            crate::devices::models::ModelFamily::Nmos
-            | crate::devices::models::ModelFamily::Pmos => {
-                // `inpdomod.c`: the level selects the C device. BSIM3 has
-                // schema validation only; never fall through to MOS1 stamps.
-                if matches!(model.levels().selector, 8 | 49) {
-                    return crate::devices::bsim3::instantiate(instance, nodes, &model, context);
-                }
-                if matches!(model.levels().selector, 14 | 54) {
-                    return crate::devices::bsim4::instantiate(instance, nodes, &model, context);
-                }
-                return if model.levels().selector == 3 {
-                    crate::devices::mos3::Mos3::instantiate(instance, nodes, &model, context)
-                } else if model.levels().selector == 2 {
-                    crate::devices::mos2::Mos2::instantiate(instance, nodes, &model, context)
-                } else if model.levels().selector == 9 {
-                    crate::devices::mos9::Mos9::instantiate(instance, nodes, &model, context)
-                } else if model.levels().selector == 6 {
-                    crate::devices::mos6::Mos6::instantiate(instance, nodes, &model, context)
-                } else {
-                    crate::devices::mos1::Mos1::instantiate(instance, nodes, &model, context)
-                };
-            }
-            crate::devices::models::ModelFamily::Njf | crate::devices::models::ModelFamily::Pjf => {
-                // inpdomod.c: level 2 selects the Parker-Skellern JFET2.
-                if model.levels().selector == 2 {
-                    return crate::devices::jfet2::Jfet2::instantiate(
-                        instance, nodes, &model, context,
-                    );
-                }
-                return crate::devices::jfet::Jfet::instantiate(instance, nodes, &model, context);
-            }
-            crate::devices::models::ModelFamily::Nmf | crate::devices::models::ModelFamily::Pmf => {
-                // inpdomod.c: 0/1 select the MES (`mes/`) card, 2-4 MESA
-                // (`mesa1`-`mesa3`) and 5 HFET1 (`hfet1/`).
-                match model.levels().selector {
-                    2..=4 => {
-                        return crate::devices::hfet::mesa::Mesa::instantiate(
-                            instance, nodes, &model, context,
-                        );
-                    }
-                    5 => {
-                        return crate::devices::hfet::hfet1::Hfet1::instantiate(
-                            instance, nodes, &model, context,
-                        );
-                    }
-                    6 => {
-                        return crate::devices::hfet::hfet2::Hfet2::instantiate(
-                            instance, nodes, &model, context,
-                        );
-                    }
-                    _ => {}
-                }
-                return crate::devices::mesfet::Mesfet::instantiate(
-                    instance, nodes, &model, context,
-                );
-            }
-            crate::devices::models::ModelFamily::Switch
-            | crate::devices::models::ModelFamily::CurrentSwitch => {
-                return crate::devices::switch::Switch::instantiate(
-                    instance, nodes, &model, context,
-                );
-            }
-            crate::devices::models::ModelFamily::Txl => {
-                return crate::devices::txl::Txl::instantiate(instance, nodes, &model);
-            }
-            crate::devices::models::ModelFamily::Ltra => {
-                return crate::devices::ltra::LossyLine::instantiate(
-                    instance, nodes, models, context,
-                );
-            }
-            crate::devices::models::ModelFamily::Urc => {
-                // One U instance becomes many devices: Circuit::add_instances
-                // calls crate::devices::urc::expand instead of this factory.
-                return Err(SpiceError::circuit(format!(
-                    "URC {} is expanded by Circuit::add_instances, not built as one device",
-                    instance.name
-                )));
-            }
-            _ => {}
-        }
-        let reference = match model.family().designator() {
-            'r' => "src/spicelib/devices/res/restemp.c, ressetup.c",
-            'c' => "src/spicelib/devices/cap/captemp.c",
-            'l' => "src/spicelib/devices/ind/indtemp.c",
-            'd' => "src/spicelib/devices/dio/dioload.c",
-            'q' => "src/spicelib/devices/bjt/bjtload.c",
-            _ => "src/spicelib/devices/mos1/mos1load.c",
-        };
-        return Err(SpiceError::not_yet_ported(
+    let Some(model) = models.resolve(instance)? else {
+        return instantiate(instance, nodes);
+    };
+    // The resolver validates supported levels. Keep dispatch explicit so
+    // adding a new supported level cannot silently select a different backend.
+    let unsupported_level = || {
+        SpiceError::not_yet_ported(
             format!(
-                "{}: model-backed {:?} factory for '{}'",
+                "{}: model-backed {:?} level {} factory for '{}'",
                 instance.location,
                 model.family(),
+                model.levels().selector,
                 instance.name
             ),
-            reference,
-        ));
+            "src/spicelib/parser/inpdomod.c",
+        )
+    };
+    match model.family() {
+        ModelFamily::Resistor | ModelFamily::Capacitor | ModelFamily::Inductor => {
+            crate::devices::passive::instantiate(instance, nodes, &model, context)
+        }
+        ModelFamily::Diode => {
+            crate::devices::nonlinear::Diode::instantiate(instance, nodes, &model, context)
+        }
+        ModelFamily::Npn | ModelFamily::Pnp => {
+            crate::devices::bjt::Bjt::instantiate(instance, nodes, &model, context)
+        }
+        ModelFamily::Nmos | ModelFamily::Pmos => match model.levels().selector {
+            1 => crate::devices::mos1::Mos1::instantiate(instance, nodes, &model, context),
+            2 => crate::devices::mos2::Mos2::instantiate(instance, nodes, &model, context),
+            3 => crate::devices::mos3::Mos3::instantiate(instance, nodes, &model, context),
+            6 => crate::devices::mos6::Mos6::instantiate(instance, nodes, &model, context),
+            9 => crate::devices::mos9::Mos9::instantiate(instance, nodes, &model, context),
+            8 | 49 => crate::devices::bsim3::instantiate(instance, nodes, &model, context),
+            14 | 54 => crate::devices::bsim4::instantiate(instance, nodes, &model, context),
+            _ => Err(unsupported_level()),
+        },
+        ModelFamily::Njf | ModelFamily::Pjf => match model.levels().selector {
+            1 => crate::devices::jfet::Jfet::instantiate(instance, nodes, &model, context),
+            2 => crate::devices::jfet2::Jfet2::instantiate(instance, nodes, &model, context),
+            _ => Err(unsupported_level()),
+        },
+        ModelFamily::Nmf | ModelFamily::Pmf => match model.levels().selector {
+            1 => crate::devices::mesfet::Mesfet::instantiate(instance, nodes, &model, context),
+            2..=4 => {
+                crate::devices::hfet::mesa::Mesa::instantiate(instance, nodes, &model, context)
+            }
+            5 => crate::devices::hfet::hfet1::Hfet1::instantiate(instance, nodes, &model, context),
+            6 => crate::devices::hfet::hfet2::Hfet2::instantiate(instance, nodes, &model, context),
+            _ => Err(unsupported_level()),
+        },
+        ModelFamily::Switch | ModelFamily::CurrentSwitch => {
+            crate::devices::switch::Switch::instantiate(instance, nodes, &model, context)
+        }
+        ModelFamily::Txl => crate::devices::txl::Txl::instantiate(instance, nodes, &model),
+        ModelFamily::Ltra => {
+            crate::devices::ltra::LossyLine::instantiate(instance, nodes, models, context)
+        }
+        // URC elaborates to a ladder, not a single device.
+        ModelFamily::Urc => Err(SpiceError::circuit(format!(
+            "URC {} is expanded by Circuit::add_instances, not built as one device",
+            instance.name
+        ))),
     }
-    instantiate(instance, nodes)
 }
 
-pub(crate) fn instantiate(
+pub(super) fn instantiate(
     instance: &DeviceInstance,
     nodes: &mut NodeTable,
 ) -> SpiceResult<Box<dyn Device>> {
-    if matches!(instance.designator, 'e' | 'f' | 'g' | 'h') {
+    if matches!(instance.designator, 'e'..='h') {
         return crate::devices::controlled::instantiate(instance, nodes);
     }
     if instance.designator == 'k' {
@@ -223,26 +184,160 @@ pub(crate) fn instantiate(
             location: Some(instance.location.clone()),
         });
     }
-    let primary = match instance.designator {
-        'r' => "resistance",
-        'c' => "capacitance",
-        'l' => "inductance",
-        'v' | 'i' => "dc",
-        _ => {
+    match instance.designator {
+        'r' => instantiate_passive(instance, nodes, PassiveKind::Resistor),
+        'c' => instantiate_passive(instance, nodes, PassiveKind::Capacitor),
+        'l' => instantiate_passive(instance, nodes, PassiveKind::Inductor),
+        'v' | 'i' => instantiate_source(instance, nodes),
+        _ => Err(SpiceError::not_yet_ported(
+            format!("device {}", instance.name),
+            "src/spicelib/devices/",
+        )),
+    }
+}
+
+/// Execute an append-only node-table transaction. Builders may intern
+/// nodes and assign newly created node kinds, but must not modify existing
+/// nodes. An error discards just the appended suffix, not the entire table.
+pub(super) fn append_nodes<T>(
+    nodes: &mut NodeTable,
+    build: impl FnOnce(&mut NodeTable) -> SpiceResult<T>,
+) -> SpiceResult<T> {
+    let mark = nodes.len();
+    let result = build(nodes);
+    if result.is_err() {
+        nodes.truncate(mark);
+    }
+    result
+}
+
+/// Build a four-terminal line's internal unknowns in C setup order. On a
+/// generated-name collision, rollback only the newly interned nodes.
+pub(super) fn line_terminals<const N: usize>(
+    instance: &DeviceInstance,
+    nodes: &mut NodeTable,
+    suffixes: &[&str],
+    label: &str,
+) -> SpiceResult<[crate::primitives::NodeId; N]> {
+    use crate::primitives::NodeId;
+    if instance.nodes.len() != 4 || N != 4 + suffixes.len() {
+        return Err(SpiceError::circuit(
+            "invalid transmission-line terminal layout",
+        ));
+    }
+    append_nodes(nodes, |nodes| {
+        let mut terminals = [NodeId::GROUND; N];
+        for (slot, node) in instance.nodes.iter().enumerate() {
+            terminals[slot] = nodes.intern(node)?;
+        }
+        for (slot, suffix) in suffixes.iter().enumerate() {
+            let name = format!("{}#{suffix}", instance.name);
+            if nodes.get(&name).is_some() {
+                return Err(SpiceError::circuit(format!(
+                    "{label} internal-node name collision: {name}"
+                )));
+            }
+            let node = nodes.intern(&name)?;
+            nodes.set_kind(node, NodeKind::Internal);
+            terminals[4 + slot] = node;
+        }
+        Ok(terminals)
+    })
+}
+
+/// Parse the shared scalar parameter syntax without conflating the two
+/// factories' supported setter lists or dropping intermediate errors.
+fn scalar_number(p: &crate::netlist::ast::ParameterAssignment) -> SpiceResult<Real> {
+    parse_spice_number(&p.value)
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| SpiceError::Unsupported {
+            feature: format!("non-finite or nonliteral {}={}", p.name, p.value),
+            location: Some(p.location.clone()),
+        })
+}
+
+fn unsupported_parameter(
+    instance: &DeviceInstance,
+    p: &crate::netlist::ast::ParameterAssignment,
+) -> SpiceError {
+    SpiceError::Unsupported {
+        feature: format!("{} parameter {}", instance.name, p.name),
+        location: Some(p.location.clone()),
+    }
+}
+
+fn instantiate_passive(
+    instance: &DeviceInstance,
+    nodes: &mut NodeTable,
+    kind: PassiveKind,
+) -> SpiceResult<Box<dyn Device>> {
+    let mut value = 0.;
+    let mut ic = None;
+    let mut noisy = true;
+    for p in &instance.parameters {
+        if p.kind != ParameterKind::Scalar {
             return Err(SpiceError::not_yet_ported(
-                format!("device {}", instance.name),
-                "src/spicelib/devices/",
+                format!(
+                    "{}: {} setter '{}' runtime semantics",
+                    p.location, instance.name, p.name
+                ),
+                "src/spicelib/parser/inpdpar.c",
             ));
         }
-    };
+        match p.name.as_str() {
+            name if name == kind.principal().name => {
+                let number = scalar_number(p)?;
+                // resparam.c: RES_RESIST raises tiny resistance to RESMIN.
+                value = if kind == PassiveKind::Resistor {
+                    crate::devices::rlc::res_resist(&instance.name, number)
+                } else {
+                    number
+                };
+            }
+            "noisy" if kind == PassiveKind::Resistor => {
+                // IF_INTEGER: floor(value + 0.5).
+                noisy = (scalar_number(p)? + 0.5).floor() != 0.;
+            }
+            "ic" if kind != PassiveKind::Resistor => ic = Some(scalar_number(p)?),
+            _ => return Err(unsupported_parameter(instance, p)),
+        }
+    }
+    append_nodes(nodes, |nodes| {
+        let terminals = [
+            nodes.intern(&instance.nodes[0])?,
+            nodes.intern(&instance.nodes[1])?,
+        ];
+        match kind {
+            PassiveKind::Resistor => Resistor::new(&instance.name, terminals, value).map(|r| {
+                Box::new(r.with_noise(ResistorNoise {
+                    noisy,
+                    ..ResistorNoise::default()
+                })) as Box<dyn Device>
+            }),
+            PassiveKind::Capacitor => Capacitor::new(&instance.name, terminals, value, ic)
+                .map(|c| Box::new(c) as Box<dyn Device>),
+            PassiveKind::Inductor => Inductor::new(&instance.name, terminals, value, ic)
+                .map(|l| Box::new(l) as Box<dyn Device>),
+        }
+    })
+}
+
+struct SourceSetters {
+    value: Option<Real>,
+    mag: Real,
+    phase: Real,
+    ac_given: bool,
+    waveform: Option<Waveform>,
+    port: PortSetters,
+    distortion: [Option<crate::devices::distortion::DistortionInput>; 2],
+}
+
+fn parse_source_setters(instance: &DeviceInstance) -> SpiceResult<SourceSetters> {
     let mut value = None;
-    let mut ic = None;
     let mut mag = 0.;
     let mut phase: f64 = 0.;
     // C `VSRCacGiven`/`ISRCacGiven`: any AC setter, even `ac 0`.
     let mut ac_given = false;
-    // C `RESnoisy` (`noisy=` is an IF_INTEGER setter: `floor(value + 0.5)`).
-    let mut noisy = true;
     // C applies waveform setters in order, so the last one wins.
     let mut waveform = None;
     // PWL `td=` (any order) and `r=` (applies to the PWL already set), as the
@@ -253,7 +348,7 @@ pub(crate) fn instantiate(
     // `distof1`/`distof2` (magnitude, phase), each setter replacing both.
     let mut distortion: [Option<crate::devices::distortion::DistortionInput>; 2] = [None, None];
     for p in &instance.parameters {
-        if let (ParameterKind::Waveform(source), 'v' | 'i') = (&p.kind, instance.designator) {
+        if let ParameterKind::Waveform(source) = &p.kind {
             if let Some((_, at)) = &pwl_repeat {
                 // C keeps r='s knot index from the earlier PWL: refuse rather
                 // than apply a stale repetition point.
@@ -283,37 +378,23 @@ pub(crate) fn instantiate(
                 },
             ));
         }
-        let allowed = p.name == primary
-            || (instance.designator == 'r' && p.name == "noisy")
-            || (matches!(instance.designator, 'c' | 'l') && p.name == "ic")
-            || (matches!(instance.designator, 'v' | 'i')
-                && matches!(
-                    p.name.as_str(),
-                    "acmag"
-                        | "acphase"
-                        | "r"
-                        | "td"
-                        | "distof1mag"
-                        | "distof1phase"
-                        | "distof2mag"
-                        | "distof2phase"
-                ))
-            || (instance.designator == 'v'
-                && matches!(p.name.as_str(), "portnum" | "z0" | "pwr" | "freq" | "phase"));
+        let allowed = matches!(
+            p.name.as_str(),
+            "dc" | "acmag"
+                | "acphase"
+                | "r"
+                | "td"
+                | "distof1mag"
+                | "distof1phase"
+                | "distof2mag"
+                | "distof2phase"
+        ) || (instance.designator == 'v'
+            && matches!(p.name.as_str(), "portnum" | "z0" | "pwr" | "freq" | "phase"));
         if !allowed {
-            return Err(SpiceError::Unsupported {
-                feature: format!("{} parameter {}", instance.name, p.name),
-                location: Some(p.location.clone()),
-            });
+            return Err(unsupported_parameter(instance, p));
         }
-        let number = parse_spice_number(&p.value)
-            .filter(|v| v.is_finite())
-            .ok_or_else(|| SpiceError::Unsupported {
-                feature: format!("non-finite or nonliteral {}={}", p.name, p.value),
-                location: Some(p.location.clone()),
-            })?;
+        let number = scalar_number(p)?;
         match p.name.as_str() {
-            "ic" => ic = Some(number),
             "acmag" => {
                 mag = number;
                 ac_given = true;
@@ -322,7 +403,6 @@ pub(crate) fn instantiate(
                 phase = number;
                 ac_given = true;
             }
-            "noisy" => noisy = (number + 0.5).floor() != 0.,
             "distof1mag" | "distof2mag" | "distof1phase" | "distof2phase" => {
                 let slot = &mut distortion[usize::from(p.name.starts_with("distof2"))];
                 let input = slot.get_or_insert(crate::devices::distortion::DistortionInput {
@@ -341,33 +421,11 @@ pub(crate) fn instantiate(
             }
             "td" => pwl_delay = Some((number, p.location.clone())),
             "portnum" | "z0" | "pwr" | "freq" | "phase" => {
-                port.set(&p.name, number, &p.location)?
+                port.set(&p.name, number, &p.location)?;
             }
             "r" => {
-                // C silently ignores r= when no PWL coefficients exist yet.
-                let Some(Waveform::Pwl(knots)) = &waveform else {
-                    return Err(SpiceError::Unsupported {
-                        feature: format!(
-                            "{}: r= without a preceding PWL setter (C ignores it)",
-                            instance.name
-                        ),
-                        location: Some(p.location.clone()),
-                    });
-                };
-                // VSRC_R/ISRC_R validate every r= as it is set (E_PARMVAL
-                // aborts the deck), so an invalid earlier r= is an error even
-                // when a later one is valid.
-                PwlSource::new(knots.clone(), 0., Some(number)).map_err(|error| {
-                    SpiceError::Unsupported {
-                        feature: format!("{}: {error}", instance.name),
-                        location: Some(p.location.clone()),
-                    }
-                })?;
+                validate_pwl_repeat(instance, p, waveform.as_ref(), number)?;
                 pwl_repeat = Some((number, p.location.clone()));
-            }
-            // resparam.c RES_RESIST raises a tiny resistance to RESMIN.
-            _ if instance.designator == 'r' => {
-                value = Some(crate::devices::rlc::res_resist(&instance.name, number));
             }
             _ => value = Some(number),
         }
@@ -375,6 +433,56 @@ pub(crate) fn instantiate(
     if pwl_delay.is_some() || pwl_repeat.is_some() {
         waveform = Some(pwl_options(waveform, pwl_delay, pwl_repeat)?);
     }
+    Ok(SourceSetters {
+        value,
+        mag,
+        phase,
+        ac_given,
+        waveform,
+        port,
+        distortion,
+    })
+}
+
+fn validate_pwl_repeat(
+    instance: &DeviceInstance,
+    p: &crate::netlist::ast::ParameterAssignment,
+    waveform: Option<&Waveform>,
+    number: Real,
+) -> SpiceResult<()> {
+    // C silently ignores r= when no PWL coefficients exist yet.
+    let Some(Waveform::Pwl(knots)) = waveform else {
+        return Err(SpiceError::Unsupported {
+            feature: format!(
+                "{}: r= without a preceding PWL setter (C ignores it)",
+                instance.name
+            ),
+            location: Some(p.location.clone()),
+        });
+    };
+    // VSRC_R/ISRC_R validate every r= as it is set (E_PARMVAL
+    // aborts the deck), so an invalid earlier r= is an error even
+    // when a later one is valid.
+    PwlSource::new(knots.clone(), 0., Some(number)).map_err(|error| SpiceError::Unsupported {
+        feature: format!("{}: {error}", instance.name),
+        location: Some(p.location.clone()),
+    })?;
+    Ok(())
+}
+
+fn instantiate_source(
+    instance: &DeviceInstance,
+    nodes: &mut NodeTable,
+) -> SpiceResult<Box<dyn Device>> {
+    let SourceSetters {
+        value,
+        mag,
+        phase,
+        ac_given,
+        waveform,
+        port,
+        distortion,
+    } = parse_source_setters(instance)?;
     let dc_given = value.is_some();
     let waveform_given = waveform.is_some();
     // An explicit DC value is kept apart from time forcing. Without one, DC
@@ -387,15 +495,13 @@ pub(crate) fn instantiate(
     };
     // Intern in place and roll back on failure, so the caller's node table is
     // untouched by an error without cloning it per instance.
-    let mark = nodes.len();
-    let built = (|| -> SpiceResult<Box<dyn Device>> {
-        let new_nodes = &mut *nodes;
+    append_nodes(nodes, |new_nodes| {
         let terminals = [
-            new_nodes.intern(&instance.nodes[0]),
-            new_nodes.intern(&instance.nodes[1]),
+            new_nodes.intern(&instance.nodes[0])?,
+            new_nodes.intern(&instance.nodes[1])?,
         ];
         let power_function = port.power_function.is_some();
-        let rf = port.finish(instance, dc_given, new_nodes)?;
+        let rf = port.finish(instance, new_nodes)?;
         let tone = power_function.then(|| {
             rf.as_ref().map_or((0., 0.), |p| {
                 (
@@ -405,48 +511,34 @@ pub(crate) fn instantiate(
                 )
             })
         });
-        let device: Box<dyn Device> = match instance.designator {
-            'r' => Box::new(Resistor::new(&instance.name, terminals, value)?.with_noise(
-                ResistorNoise {
-                    noisy,
-                    ..ResistorNoise::default()
-                },
-            )),
-            'c' => Box::new(Capacitor::new(&instance.name, terminals, value, ic)?),
-            'l' => Box::new(Inductor::new(&instance.name, terminals, value, ic)?),
-            _ => {
-                let source = IndependentSource::new(
-                    &instance.name,
-                    terminals,
-                    instance.designator == 'v',
-                    value,
-                    Complex::new(
-                        mag * phase.to_radians().cos(),
-                        mag * phase.to_radians().sin(),
-                    ),
-                    waveform.unwrap_or(Waveform::Constant(value)),
-                )?
-                .with_power_tone(tone)
-                .with_ac_given(ac_given)
-                .with_sensitivity_inputs(crate::devices::sensitivity::SourceInputs {
-                    dc_given,
-                    function_given: waveform_given,
-                    ac: ac_given.then_some((mag, phase)),
-                })
-                .with_distortion(distortion[0], distortion[1])?;
-                // Only V cards accept port setters (parser and allow-list above).
-                match rf {
-                    Some(rf) => Box::new(source.with_port(rf)?),
-                    None => Box::new(source),
-                }
+        let device: Box<dyn Device> = {
+            let source = IndependentSource::new(
+                &instance.name,
+                terminals,
+                instance.designator == 'v',
+                value,
+                Complex::new(
+                    mag * phase.to_radians().cos(),
+                    mag * phase.to_radians().sin(),
+                ),
+                waveform.unwrap_or(Waveform::Constant(value)),
+            )?
+            .with_power_tone(tone)
+            .with_ac_given(ac_given)
+            .with_sensitivity_inputs(crate::devices::sensitivity::SourceInputs {
+                dc_given,
+                function_given: waveform_given,
+                ac: ac_given.then_some((mag, phase)),
+            })
+            .with_distortion(distortion[0], distortion[1])?;
+            // Only V cards accept port setters (parser and allow-list above).
+            match rf {
+                Some(rf) => Box::new(source.with_port(rf)?),
+                None => Box::new(source),
             }
         };
         Ok(device)
-    })();
-    if built.is_err() {
-        nodes.truncate(mark);
-    }
-    built
+    })
 }
 
 /// The ordered RFSPICE port setters of one V card (`vsrcpar.c`), resolved by
@@ -471,15 +563,12 @@ impl PortSetters {
         match name {
             "portnum" => {
                 // INPgetValue(IF_INTEGER): (int) floor(0.5 + value).
-                let rounded = (number + 0.5).floor();
-                if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&rounded) {
-                    return Err(SpiceError::Unsupported {
+                let rounded = crate::primitives::c_integer(number).ok_or_else(|| {
+                    SpiceError::Unsupported {
                         feature: format!("portnum {number} is outside the C integer range"),
                         location: Some(at.clone()),
-                    });
-                }
-                #[allow(clippy::cast_possible_truncation)]
-                let rounded = rounded as i64;
+                    }
+                })?;
                 self.number = Some((rounded, at.clone()));
                 // VSRC_PORTNUM: a port needs an impedance; take 50 ohms
                 // unless a positive z0 was already set.
@@ -510,7 +599,6 @@ impl PortSetters {
     fn finish(
         self,
         instance: &DeviceInstance,
-        _dc_given: bool,
         nodes: &mut NodeTable,
     ) -> SpiceResult<Option<crate::devices::RfPort>> {
         let Some(at) = self.any else {
@@ -538,7 +626,7 @@ impl PortSetters {
                 "RF port internal-node name collision: {name}"
             )));
         }
-        let internal = nodes.intern(&name);
+        let internal = nodes.intern(&name)?;
         nodes.set_kind(internal, NodeKind::Internal);
         Ok(Some(crate::devices::RfPort {
             number,
@@ -593,74 +681,7 @@ fn source_waveform(
     setter: &SourceLoc,
 ) -> SpiceResult<Waveform> {
     match (name, source) {
-        (_, SourceWaveform::Function(f)) => {
-            // The parser bounds the field count; a hand-built AST may not.
-            let most = f.function.fields().len();
-            if !(2..=most).contains(&f.values.len()) {
-                return Err(SpiceError::Unsupported {
-                    feature: format!(
-                        "{} with {} fields (needs 2 to {most})",
-                        f.function.keyword(),
-                        f.values.len()
-                    ),
-                    location: Some(
-                        f.values
-                            .get(most)
-                            .map_or_else(|| setter.clone(), |extra| extra.location.clone()),
-                    ),
-                });
-            }
-            let at = &f.values[0];
-            let fields = f
-                .values
-                .iter()
-                .zip(f.function.fields())
-                .map(|(value, what)| field(value, &format!("{} {what}", f.function.keyword())))
-                .collect::<SpiceResult<Vec<_>>>()?;
-            let get = |index: usize| fields.get(index).copied();
-            let (v0, v1) = (fields[0], fields[1]);
-            let spec = match f.function {
-                SourceFunction::Sin => FunctionSpec::Sine(SineSpec {
-                    offset: v0,
-                    amplitude: v1,
-                    frequency: get(2),
-                    delay: get(3),
-                    damping: get(4),
-                    phase: get(5),
-                }),
-                SourceFunction::Exp => FunctionSpec::Exp(ExpSpec {
-                    initial: v0,
-                    pulsed: v1,
-                    rise_delay: get(2),
-                    rise_tau: get(3),
-                    fall_delay: get(4),
-                    fall_tau: get(5),
-                }),
-                SourceFunction::Sffm => FunctionSpec::Sffm(SffmSpec {
-                    offset: v0,
-                    amplitude: v1,
-                    carrier: get(2),
-                    index: get(3),
-                    signal: get(4),
-                    delay: get(5),
-                    signal_phase: get(6),
-                    carrier_phase: get(7),
-                }),
-                SourceFunction::Am => FunctionSpec::Am(AmSpec {
-                    offset: v0,
-                    carrier_amplitude: v1,
-                    modulation_amplitude: get(2),
-                    modulation_frequency: get(3),
-                    carrier_frequency: get(4),
-                    delay: get(5),
-                    modulation_phase: get(6),
-                    carrier_phase: get(7),
-                }),
-            };
-            let waveform = Waveform::FunctionDefaults(spec);
-            waveform.validate().map_err(|e| waveform_error(at, &e))?;
-            Ok(waveform)
-        }
+        (_, SourceWaveform::Function(f)) => function_waveform(f, setter),
         ("pulse", SourceWaveform::Pulse(p)) => {
             let optional = |v: &Option<PositionedValue>, what| v.as_ref().map(|v| field(v, what));
             let spec = PulseSpec {
@@ -698,6 +719,75 @@ fn source_waveform(
             "src/spicelib/devices/vsrc/vsrcload.c",
         )),
     }
+}
+
+fn function_waveform(f: &FunctionWaveform, setter: &SourceLoc) -> SpiceResult<Waveform> {
+    // The parser bounds the field count; a hand-built AST may not.
+    let most = f.function.fields().len();
+    if !(2..=most).contains(&f.values.len()) {
+        return Err(SpiceError::Unsupported {
+            feature: format!(
+                "{} with {} fields (needs 2 to {most})",
+                f.function.keyword(),
+                f.values.len()
+            ),
+            location: Some(
+                f.values
+                    .get(most)
+                    .map_or_else(|| setter.clone(), |extra| extra.location.clone()),
+            ),
+        });
+    }
+    let at = &f.values[0];
+    let fields = f
+        .values
+        .iter()
+        .zip(f.function.fields())
+        .map(|(value, what)| field(value, &format!("{} {what}", f.function.keyword())))
+        .collect::<SpiceResult<Vec<_>>>()?;
+    let get = |index: usize| fields.get(index).copied();
+    let (v0, v1) = (fields[0], fields[1]);
+    let spec = match f.function {
+        SourceFunction::Sin => FunctionSpec::Sine(SineSpec {
+            offset: v0,
+            amplitude: v1,
+            frequency: get(2),
+            delay: get(3),
+            damping: get(4),
+            phase: get(5),
+        }),
+        SourceFunction::Exp => FunctionSpec::Exp(ExpSpec {
+            initial: v0,
+            pulsed: v1,
+            rise_delay: get(2),
+            rise_tau: get(3),
+            fall_delay: get(4),
+            fall_tau: get(5),
+        }),
+        SourceFunction::Sffm => FunctionSpec::Sffm(SffmSpec {
+            offset: v0,
+            amplitude: v1,
+            carrier: get(2),
+            index: get(3),
+            signal: get(4),
+            delay: get(5),
+            signal_phase: get(6),
+            carrier_phase: get(7),
+        }),
+        SourceFunction::Am => FunctionSpec::Am(AmSpec {
+            offset: v0,
+            carrier_amplitude: v1,
+            modulation_amplitude: get(2),
+            modulation_frequency: get(3),
+            carrier_frequency: get(4),
+            delay: get(5),
+            modulation_phase: get(6),
+            carrier_phase: get(7),
+        }),
+    };
+    let waveform = Waveform::FunctionDefaults(spec);
+    waveform.validate().map_err(|e| waveform_error(at, &e))?;
+    Ok(waveform)
 }
 
 fn waveform_error(at: &PositionedValue, error: &SpiceError) -> SpiceError {

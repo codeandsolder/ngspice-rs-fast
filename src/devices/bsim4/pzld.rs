@@ -7,23 +7,37 @@
 //! grouping differs from C: the AC NQS charge-node term
 //! `m * s->real * ScalingFactor` is the coefficient `m * ScalingFactor`
 //! times `s`, which rounds differently from C's left-to-right product.
-#![allow(non_snake_case)]
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::similar_names,
+    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
+)]
+#![expect(
+    clippy::many_single_char_names,
+    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)]
 use super::fields::{Instance, Model, SizeParam};
 use super::host::{SmallSignalCkt, state};
-use crate::primitives::SpiceResult;
 
 /// `BSIM4pzLoad` for one instance, from the values the `MODEINITSMSIG`
 /// load left on `h`.
 ///
-/// # Errors
-/// C's error returns (none: `BSIM4pzLoad` always returns `OK`).
-#[allow(clippy::too_many_lines)] // One C function, kept in C's shape.
-pub(crate) fn pz_load(
-    m: &Model,
-    h: &Instance,
-    p: &SizeParam,
-    ckt: &mut dyn SmallSignalCkt,
-) -> SpiceResult<()> {
+/// Like C's always-successful kernel, this cannot fail itself; the caller
+/// checks the host's recorded stamping error.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)] // One C function, kept in C's shape.
+pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn SmallSignalCkt) {
     let ScalingFactor = 1.0e-9;
     let cgso = h.cgso;
     let cgdo = h.cgdo;
@@ -679,7 +693,6 @@ pub(crate) fn pz_load(
         ckt.real(q, bp, mm * xgtb);
         ckt.real(q, sp, mm * xgts);
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -690,7 +703,7 @@ mod tests {
     #[test]
     fn pz_stamps_land_on_allocated_elements() {
         check_shapes(
-            |m, h, ckt| super::pz_load(m, h, &SizeParam::default(), ckt).unwrap(),
+            |m, h, ckt| super::pz_load(m, h, &SizeParam::default(), ckt),
             true,
             false,
         );

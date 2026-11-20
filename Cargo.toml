@@ -68,6 +68,11 @@ bin-dir = "{ name }-aarch64-unknown-linux-musl-v{ version }/{ bin }{ binary-ext 
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }.zip"
 pkg-fmt = "zip"
 
+# The BSIM4 schema is reproducibly generated from upstream bsim4def.h and
+# deliberately preserves C field names, field order, and type spellings.
+[package.metadata.rust-skills2]
+generated-lint-boundaries = ["src/devices/bsim4/fields.rs"]
+
 [workspace]
 resolver = "3"
 members = ["xtask"]
@@ -77,7 +82,7 @@ version = "0.4.0"
 edition = "2024"
 rust-version = "1.89"
 license = "BSD-3-Clause"
-repository = "https://github.com/michaelnavazhylau/ngspice-rs"
+repository = "https://github.com/codeandsolder/ngspice-rs-fast"
 
 [workspace.dependencies]
 # Token-stream combinators replace the manual semantic-parser cursor. No FFI,

@@ -7,6 +7,25 @@
 //! `2`/`3`/`6` combine the strong-inversion and weak-inversion flicker
 //! densities. Values outside 1..6 leave C's `noizDens` uninitialized, so they
 //! are refused here instead of being given a substitute law.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::similar_names,
+    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "a complete translated C numerical routine remains contiguous for equation parity review"
+)]
+#![expect(
+    clippy::many_single_char_names,
+    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use super::charges::ChargeEvaluation;
 use super::dc::DcEvaluation;
 use super::defaults::ModelDefaults;
@@ -22,17 +41,17 @@ const N_MINLOG: Real = 1.0e-38;
 /// multiplicity already applied as C applies it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NoiseDensities {
-    /// Thermal conductance of the drain series resistance (C `drainConductance
-    /// * m`), injected between the drain and its prime node.
+    /// Thermal conductance of the drain series resistance
+    /// (C `drainConductance * m`), injected between the drain and its prime node.
     pub drain_conductance: Real,
     /// The same for the source.
     pub source_conductance: Real,
     /// The channel thermal source's conductance argument to `NevalSrc`
     /// (injected between the drain and source prime nodes).
     pub channel: Real,
-    /// The flicker source's bias-dependent numerator (C's `noizDens *=
-    /// <factor>` after `N_GAIN`), injected between the drain and source prime
-    /// nodes.
+    /// The flicker source's bias-dependent numerator, after the C operation
+    /// `noizDens *= <factor>` in `N_GAIN`, injected between the drain and source
+    /// prime nodes.
     pub flicker_numerator: Real,
     /// C's three frequency-law factors after `pow(f, EF)`.
     pub flicker_factors: [Real; 3],
@@ -50,27 +69,19 @@ pub struct NoiseModel<'a> {
 }
 
 impl NoiseModel<'_> {
-    /// C's `BSIM3noiMod`.
-    fn noi_mod(&self) -> i32 {
-        self.model.get("noimod").unwrap_or(1.).round() as i32
-    }
-
     /// Evaluate the generator laws at `dc`/`charge` and the circuit
     /// temperature `circuit_kelvin` (C `ckt->CKTtemp`).
     ///
     /// # Errors
     /// A `noiMod` outside 1..6, or a nonfinite result.
-    ///
-    /// # Panics
-    /// If a field or parameter this port names is absent from the model or
-    /// instance setup: a schema bug in the port, not a deck error.
+    /// Missing internal model or instance fields also return an error.
     pub fn densities(
         &self,
         dc: &DcEvaluation,
         charge: &ChargeEvaluation,
         circuit_kelvin: Real,
     ) -> SpiceResult<NoiseDensities> {
-        let noi_mod = self.noi_mod();
+        let noi_mod = self.model.integer("noimod")?;
         if !(1..=6).contains(&noi_mod) {
             return Err(SpiceError::not_yet_ported(
                 format!(
@@ -82,18 +93,16 @@ impl NoiseModel<'_> {
         }
         let p = self.setup;
         let m = self.model;
-        let number = |name: &str| -> Real {
-            m.get(name)
-                .unwrap_or_else(|| panic!("BSIM3 noise model field {name}"))
-        };
-        let param = |name: &str| -> Real {
-            p.pparam(name)
-                .unwrap_or_else(|| panic!("BSIM3 noise instance parameter {name}"))
+        let number = |name: &str| m.number(name);
+        let param = |name: &str| {
+            p.pparam(name).ok_or_else(|| {
+                SpiceError::circuit(format!("BSIM3 noise instance parameter {name} is missing"))
+            })
         };
         let multiplier = p.multiplier;
         let cox = m.oxide_capacitance;
-        let leff = param("leff");
-        let weff = param("weff");
+        let leff = param("leff")?;
+        let weff = param("weff")?;
         let ueff = dc.ueff;
         let cd = dc.ids;
 
@@ -117,7 +126,7 @@ impl NoiseModel<'_> {
             1 | 4 | 5 => {
                 let noise_current = cd.abs().max(N_MINLOG);
                 let numerator =
-                    multiplier * number("kf") * (number("af") * noise_current.ln()).exp();
+                    multiplier * number("kf")? * (number("af")? * noise_current.ln()).exp();
                 (numerator, [leff, leff, cox])
             }
             _ => {
@@ -125,15 +134,15 @@ impl NoiseModel<'_> {
                 // carry one `pow(f, EF)` in their denominators, so the blend
                 // keeps the same law and the numerator below is the
                 // frequency-free part.
-                let lintnoi = number("lintnoi");
+                let lintnoi = number("lintnoi")?;
                 let leff_noi = leff - 2.0 * lintnoi;
                 let leff_noi_sq = leff_noi * leff_noi;
                 let vgsteff = dc.vgsteff;
                 let vdseff = dc.vdseff;
                 let abulk = dc.abulk;
-                let em = number("em");
-                let vsattemp = param("vsattemp");
-                let litl = param("litl");
+                let em = number("em")?;
+                let vsattemp = param("vsattemp")?;
+                let litl = param("litl")?;
                 let esat = 2.0 * vsattemp / ueff;
                 let del_clm = if em <= 0.0 {
                     0.0
@@ -143,9 +152,9 @@ impl NoiseModel<'_> {
                 };
                 let n0 = cox * vgsteff / CHARGE;
                 let nl = cox * vgsteff * (1.0 - dc.abulk_over_vgst2vtm * vdseff) / CHARGE;
-                let noia = number("noia");
-                let noib = number("noib");
-                let noic = number("noic");
+                let noia = number("noia")?;
+                let noib = number("noib")?;
+                let noic = number("noic")?;
                 let thermal = 8.62e-5 * circuit_kelvin;
                 // `Ssi = A / pow(f,EF)`, `Swi = C / pow(f,EF)`.
                 let a = CHARGE
@@ -178,7 +187,7 @@ impl NoiseModel<'_> {
             channel,
             flicker_numerator,
             flicker_factors,
-            flicker_exponent: number("ef"),
+            flicker_exponent: number("ef")?,
         };
         for (name, value) in [
             ("drain conductance", result.drain_conductance),

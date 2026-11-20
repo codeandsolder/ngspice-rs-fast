@@ -25,6 +25,19 @@ use crate::primitives::{AnalysisKind, Real, SourceLoc};
 /// A canonical node name: ASCII-lowercased, with optional `gnd` → `0` aliasing.
 pub type NodeName = String;
 
+/// POLY dimensions are positive integers in the port's supported range.
+/// The XSPICE translator uses `atoi` (`get_poly_dimension`, enhtrans.c);
+/// reject spellings whose numeric value differs from that decimal prefix,
+/// rather than parse one dimension and lower another (e.g. `2e1`).
+pub(super) fn poly_dimension(text: &str) -> Option<usize> {
+    let number = crate::primitives::parse_spice_number(text)?;
+    let dimension = crate::primitives::exact_nonnegative_integer::<usize>(number)?;
+    let digits = text.strip_prefix('+').unwrap_or(text);
+    let end = digits.bytes().take_while(u8::is_ascii_digit).count();
+    let prefix = digits.get(..end)?.parse::<usize>().ok()?;
+    (dimension == prefix && (1..=64).contains(&dimension)).then_some(dimension)
+}
+
 /// One device parameter, including positional values mapped to canonical names.
 ///
 /// R/C/L leading values become `resistance`/`capacitance`/`inductance`; source
@@ -69,7 +82,7 @@ pub enum ParameterKind {
     /// syntax tree and spans. Scalar consumers must treat this like any other
     /// non-scalar kind until an evaluation pass resolves it.
     Expression(Box<crate::netlist::expr::ParameterExpression>),
-    /// A bare IF_FLAG keyword: C's INPgetValue supplies integer 1 without
+    /// A bare `IF_FLAG` keyword: C's `INPgetValue` supplies integer 1 without
     /// consuming a value. Explicit `flag=0`/`flag=1` forms are not accepted.
     Flag,
     /// Q/M IC values in C setter order, with omitted components left omitted.
@@ -93,7 +106,7 @@ pub enum ParameterKind {
 }
 
 /// One finite textual waveform/IC value and its byte-column position.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionedValue {
     /// Original numeric spelling, including scale/unit suffixes.
     pub text: String,
@@ -102,7 +115,7 @@ pub struct PositionedValue {
 }
 
 /// One component of a Q/M `ic` vector.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitialCondition {
     /// Canonical scalar setter: icvbe/icvce or icvds/icvgs/icvbs.
     pub name: String,
@@ -115,7 +128,7 @@ pub struct InitialCondition {
 ///
 /// PWL `td=`/`r=` are separate ordered scalar setters (`VSRC_TD`/`VSRC_R` in
 /// `vsrc.c`), not part of this value, exactly as C applies them.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceWaveform {
     /// Two required levels and up to six optional fields.
     Pulse(Box<PulseWaveform>),
@@ -123,6 +136,59 @@ pub enum SourceWaveform {
     Pwl(Vec<PwlPoint>),
     /// SIN/EXP/SFFM/AM: two required fields and a bounded optional prefix.
     Function(Box<FunctionWaveform>),
+}
+
+/// Shared lexical classification for parsing and serializing waveform
+/// setters. Runtime default resolution is independent of these field limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WaveformKind {
+    Pulse,
+    Pwl,
+    Function(SourceFunction),
+}
+
+impl WaveformKind {
+    pub(super) fn from_keyword(keyword: &str) -> Option<Self> {
+        [
+            ("pulse", Self::Pulse),
+            ("pwl", Self::Pwl),
+            ("sin", Self::Function(SourceFunction::Sin)),
+            ("sine", Self::Function(SourceFunction::Sin)),
+            ("exp", Self::Function(SourceFunction::Exp)),
+            ("sffm", Self::Function(SourceFunction::Sffm)),
+            ("am", Self::Function(SourceFunction::Am)),
+        ]
+        .into_iter()
+        .find_map(|(name, kind)| keyword.eq_ignore_ascii_case(name).then_some(kind))
+    }
+
+    pub(super) const fn maximum_fields(self) -> usize {
+        match self {
+            Self::Pulse => 8,
+            Self::Pwl => 4096,
+            Self::Function(function) => function.fields().len(),
+        }
+    }
+
+    /// Keep the accepted `sine` spelling; otherwise use the canonical keyword.
+    pub(super) fn keyword(self, spelling: &str) -> &'static str {
+        match self {
+            Self::Pulse => "pulse",
+            Self::Pwl => "pwl",
+            Self::Function(SourceFunction::Sin) if spelling == "sine" => "sine",
+            Self::Function(function) => function.keyword(),
+        }
+    }
+}
+
+impl SourceWaveform {
+    pub(super) fn kind(&self) -> WaveformKind {
+        match self {
+            Self::Pulse(_) => WaveformKind::Pulse,
+            Self::Pwl(_) => WaveformKind::Pwl,
+            Self::Function(function) => WaveformKind::Function(function.function),
+        }
+    }
 }
 
 /// The analytic transient functions of `vsrcload.c`/`isrcload.c` that share
@@ -165,10 +231,12 @@ impl SourceFunction {
     }
 }
 
+/// One parsed source-function setter and its supplied coefficients.
+///
 /// One SIN/EXP/SFFM/AM setter: its function and the supplied fields in C
 /// coefficient order. Omitted trailing fields are simply absent; defaults that
 /// depend on `.tran` (`CKTstep`, `CKTfinalTime`) belong to elaboration.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionWaveform {
     /// Which function.
     pub function: SourceFunction,
@@ -177,7 +245,7 @@ pub struct FunctionWaveform {
 }
 
 /// `PULSE(V1 V2 [TD [TR [TF [PW [PER [NP]]]]]])`; omissions stay explicit.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PulseWaveform {
     /// Initial level (volts for V, amperes for I).
     pub initial: PositionedValue,
@@ -199,7 +267,7 @@ pub struct PulseWaveform {
 }
 
 /// One PWL knot, retained in supplied order (syntax is not runtime validation).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PwlPoint {
     /// Time in seconds.
     pub time: PositionedValue,
@@ -258,7 +326,7 @@ pub struct Subcircuit {
     /// Models declared in the body.
     pub models: Vec<ModelCard>,
     /// Nested definitions; names are local to this body.
-    pub subcircuits: Vec<Subcircuit>,
+    pub subcircuits: Vec<Self>,
     /// Analysis requests retained in this body, not promoted to the root.
     pub analyses: Vec<AnalysisCard>,
     /// Source directives retained in this body.
@@ -318,6 +386,8 @@ pub struct LibrarySection {
     pub closing: crate::netlist::card::RawCard,
 }
 
+/// A source-ordered .param card whose expressions remain unevaluated.
+///
 /// A `.param` card: one or more `name = expression` assignments in source
 /// order (C's `inp_split_multi_param_lines()` splits them the same way).
 /// Duplicates are kept; later assignments override earlier ones only during
@@ -377,7 +447,7 @@ pub enum FuncSpelling {
 }
 
 /// One formal parameter of a [`FuncCard`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncParameter {
     /// Lowercased name.
     pub name: String,
@@ -519,7 +589,7 @@ pub enum NodeHintValue {
 impl NodeHintValue {
     /// The finite value, if this is (or was literalized to) a literal.
     #[must_use]
-    pub fn literal(&self) -> Option<Real> {
+    pub const fn literal(&self) -> Option<Real> {
         match self {
             Self::Literal { value, .. } => Some(*value),
             Self::Expression(_) => None,
@@ -530,7 +600,7 @@ impl NodeHintValue {
 impl NodeHint {
     /// The finite value, unless the entry still holds an unevaluated expression.
     #[must_use]
-    pub fn literal(&self) -> Option<Real> {
+    pub const fn literal(&self) -> Option<Real> {
         self.value.literal()
     }
 }
@@ -541,7 +611,7 @@ impl NodeHint {
 /// lines and hands them to `com_save()` (`src/frontend/breakp2.c`), which stores
 /// them in the `dbs` save list. A `.save` set applies to **every** analysis of
 /// the deck; `.print` is analysis-specific ([`PrintCard`]).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaveCard {
     /// Requests in source order. Duplicates stay visible here; the consumer
     /// collapses them (see `crate::analysis::selection`).
@@ -555,7 +625,7 @@ pub struct SaveCard {
 /// C: `ft_savedotargs()` in `src/frontend/dotcards.c` reads the analysis name
 /// after `.print` and registers the rest of the line for that analysis through
 /// `com_save2()`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrintCard {
     /// Render a line-printer graph for `.plot`, rather than a table.
     pub ascii_plot: bool,
@@ -570,7 +640,7 @@ pub struct PrintCard {
 }
 
 /// One vector requested by a `.save` or `.print` card.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorRequest {
     /// What to write.
     pub vector: RequestedVector,
@@ -659,25 +729,27 @@ impl RequestedVector {
     #[must_use]
     pub fn name(&self) -> String {
         fn terminals(positive: &str, negative: Option<&str>) -> String {
-            match negative {
-                Some(negative) => format!("{positive},{negative}"),
-                None => positive.to_owned(),
-            }
+            negative.map_or_else(
+                || positive.to_owned(),
+                |negative| format!("{positive},{negative}"),
+            )
         }
         match self {
-            Self::Named { name, component } => match component {
-                None => name.clone(),
-                Some(c) => format!(
-                    "{}({name})",
-                    match c {
-                        VectorComponent::Magnitude => "mag",
-                        VectorComponent::Phase => "ph",
-                        VectorComponent::Real => "real",
-                        VectorComponent::Imaginary => "imag",
-                        VectorComponent::Decibels => "db",
-                    }
-                ),
-            },
+            Self::Named { name, component } => component.map_or_else(
+                || name.clone(),
+                |c| {
+                    format!(
+                        "{}({name})",
+                        match c {
+                            VectorComponent::Magnitude => "mag",
+                            VectorComponent::Phase => "ph",
+                            VectorComponent::Real => "real",
+                            VectorComponent::Imaginary => "imag",
+                            VectorComponent::Decibels => "db",
+                        }
+                    )
+                },
+            ),
             Self::All => "all".to_owned(),
             Self::Voltage { positive, negative } => {
                 format!("v({})", terminals(positive, negative.as_deref()))
@@ -712,7 +784,7 @@ impl RequestedVector {
 /// describe the *output* of an analysis and never reach the device elaboration,
 /// so the netlist stays a description of the circuit. See
 /// [`crate::netlist::Parser::parse_file_with_output`] and `docs/port/OUTPUT_SELECTION.md`.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OutputCards {
     /// `.save` cards in deck order; they apply to every analysis.
     pub saves: Vec<SaveCard>,
@@ -723,13 +795,13 @@ pub struct OutputCards {
 impl OutputCards {
     /// True when the deck has no `.save` and no `.print` card.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.saves.is_empty() && self.prints.is_empty()
     }
 
     /// Number of output cards.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.saves.len() + self.prints.len()
     }
 }
@@ -769,7 +841,7 @@ pub enum MeasureRequest {
         /// Ground-alias policy used when the card was parsed.
         auto_gnd: bool,
         /// Structurally checked request, for discovering observation operands.
-        template: Box<MeasureRequest>,
+        template: Box<Self>,
     },
     /// Scalar numparam expression, evaluated after vector measurements.
     Parameter(Box<crate::netlist::expr::ParameterExpression>),
@@ -874,7 +946,7 @@ pub enum MeasureEvent {
     /// Begin a threshold search at its own TD, independently of another event.
     Delayed {
         /// Event whose crossing count begins at TD.
-        event: Box<MeasureEvent>,
+        event: Box<Self>,
         /// Lower search bound.
         td: Real,
     },
@@ -965,6 +1037,8 @@ impl MeasureWindow {
 /// `1..=9` (`fourier()` in `src/frontend/fourier.c`).
 pub const DEFAULT_HARMONICS: u32 = 9;
 
+/// The bounded Fourier harmonic count and associated sampling budget.
+///
 /// The port's bounded harmonic count, and with it the resampling work budget:
 /// harmonic `n` resamples the period onto `4 * max(n, 50)` subintervals, so the
 /// widest grid this port builds is `4 * MAX_HARMONICS` subintervals per vector
@@ -1009,6 +1083,8 @@ pub struct FourierCard {
     pub location: SourceLoc,
 }
 
+/// One ordered syntax card with an index into its owning scope.
+///
 /// One ordered card in its owning scope. Indexes address that scope's typed
 /// vectors, so semantic values are not duplicated. Source cards remain intact
 /// for future serializers/snapshots; neither is implemented by this storage.
@@ -1070,6 +1146,8 @@ pub enum ScopedCardKind {
     End,
 }
 
+/// A semantic deck containing scoped syntax and deferred expressions.
+///
 /// A semantic deck container. Scoped syntax and file resolution do not imply
 /// flattening, parameter evaluation or simulation. `.param` cards are parsed
 /// but unevaluated; `.option` cards are applied by `crate::analysis::RunConfig`,
@@ -1119,7 +1197,7 @@ impl Netlist {
 
     /// Number of top-level device instances, excluding subcircuit bodies.
     #[must_use]
-    pub fn top_level_device_count(&self) -> usize {
+    pub const fn top_level_device_count(&self) -> usize {
         self.devices.len()
     }
 
@@ -1172,7 +1250,9 @@ impl Netlist {
                 .entry(sub.name.to_ascii_lowercase())
                 .or_insert(node);
         }
-        for node in graph.node_indices().collect::<Vec<_>>() {
+        // Edges are appended below, but the set of nodes is fixed here.
+        // NodeIndices does not require a temporary allocation.
+        for node in graph.node_indices() {
             let devices = graph[node].map_or(self.devices.as_slice(), |index| {
                 &self.subcircuits[index].devices
             });

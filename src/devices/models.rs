@@ -129,6 +129,8 @@ impl ModelFamily {
     }
 }
 
+/// Keep model-backend selection separate from model parameter setters.
+///
 /// Backend selection is distinct from ordered model setters. Only diode has a
 /// `level` integer setter in the initial family tables; BJT/MOS/passive `level`
 /// assignments are selector-only (inpgmod.c consumes them without setting data).
@@ -144,8 +146,10 @@ pub struct LevelSelection {
     pub applied: Option<u8>,
 }
 
+/// Immutable access to a deck's top-level model declarations.
+///
 /// Immutable lookup over one deck's top-level declarations. Duplicate names
-/// retain the *first* card as INPmakeMod does; all cards stay visible in the AST.
+/// retain the *first* card as `INPmakeMod` does; all cards stay visible in the AST.
 /// No validation of a shadowed card is implied, nor any cross-deck state.
 #[derive(Debug)]
 pub struct ModelResolver<'a> {
@@ -264,7 +268,11 @@ impl<'a> ModelResolver<'a> {
     /// Raw first declaration by case-insensitive name; no ground aliasing.
     #[must_use]
     pub fn model(&self, name: &str) -> Option<&'a ModelCard> {
-        self.definitions.get(&name.to_ascii_lowercase()).copied()
+        if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            self.definitions.get(&name.to_ascii_lowercase()).copied()
+        } else {
+            self.definitions.get(name).copied()
+        }
     }
 
     /// Resolve an instance reference and validate its family and selector.
@@ -306,8 +314,8 @@ impl<'a> ModelResolver<'a> {
             return Err(SpiceError::parse(
                 instance.location.clone(),
                 format!(
-                    "wrong model family {:?} for {}; model '{name}' declared at {}",
-                    family, instance.name, card.location
+                    "wrong model family {family:?} for {}; model '{name}' declared at {}",
+                    instance.name, card.location
                 ),
             ));
         }
@@ -703,21 +711,21 @@ fn family(card: &ModelCard) -> SpiceResult<ModelFamily> {
 }
 
 fn rounded_level(raw: Real, location: &SourceLoc) -> SpiceResult<u8> {
-    let rounded = (raw + 0.5).floor();
     // Stricter than INPfindLev's warning/fallback and unsafe C casts. Reject
     // negative raw/nonfinite/out-of-range values, including invalid duplicates.
-    if !raw.is_finite() || raw < 0.0 || !(0.0..=99.0).contains(&rounded) {
-        return Err(SpiceError::parse(
+    // C's shared rounding rule is separate from the model-level range.
+    match crate::primitives::c_integer(raw).and_then(|rounded| u8::try_from(rounded).ok()) {
+        Some(rounded) if raw >= 0. && rounded <= 99 => Ok(rounded),
+        _ => Err(SpiceError::parse(
             location.clone(),
             "model level must be finite, nonnegative and round into 0..=99",
-        ));
+        )),
     }
-    Ok(rounded as u8)
 }
 
 /// The C device directory `inpdomod.c` selects for an unported NMOS/PMOS
 /// level.
-fn mos_level_reference(selector: u8) -> &'static str {
+const fn mos_level_reference(selector: u8) -> &'static str {
     match selector {
         0 => "src/spicelib/parser/inpdomod.c (level 0 selects src/spicelib/devices/mos1/)",
         2 => "src/spicelib/devices/mos2/",
@@ -763,10 +771,11 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
             first_integer
         }
         ModelFamily::Resistor if card.base.eq_ignore_ascii_case("r") => first_integer,
-        // inpdomod.c: NJF/PJF level 0 or 1 is JFET, 2 is JFET2.
-        ModelFamily::Njf | ModelFamily::Pjf => first_integer.max(1),
-        // inpdomod.c: NMF/PMF level 0 or 1 is MES, 2-4 MESA, 5 HFET1, 6 HFET2.
-        ModelFamily::Nmf | ModelFamily::Pmf => first_integer.max(1),
+        // inpdomod.c: NJF/PJF level 0 or 1 is JFET, 2 is JFET2;
+        // NMF/PMF level 0 or 1 is MES, 2-4 MESA, 5 HFET1, 6 HFET2.
+        ModelFamily::Njf | ModelFamily::Pjf | ModelFamily::Nmf | ModelFamily::Pmf => {
+            first_integer.max(1)
+        }
         _ => 1,
     };
     let applied = (family == ModelFamily::Diode).then_some(last.unwrap_or(1));
@@ -774,8 +783,8 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
         // inpdomod.c accepts levels 0-2 (JFET, JFET2) and rejects the rest.
         return Err(SpiceError::not_yet_ported(
             format!(
-                "{location}: {:?} model '{}' level {selector}",
-                family, card.name
+                "{location}: {family:?} model '{}' level {selector}",
+                card.name
             ),
             "src/spicelib/parser/inpdomod.c (only JFET levels 1-2 exist in C)",
         ));
@@ -786,8 +795,8 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
         let reference = "src/spicelib/parser/inpdomod.c (only MESFET levels 1-4 and HFET levels 5-6 exist in C)";
         return Err(SpiceError::not_yet_ported(
             format!(
-                "{location}: {:?} model '{}' level {selector}",
-                family, card.name
+                "{location}: {family:?} model '{}' level {selector}",
+                card.name
             ),
             reference,
         ));
@@ -805,8 +814,7 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
         ModelFamily::Nmos | ModelFamily::Pmos => {
             matches!(selector, 1..=3 | 6 | 8 | 9 | 14 | 49 | 54)
         }
-        ModelFamily::Njf | ModelFamily::Pjf => true,
-        ModelFamily::Nmf | ModelFamily::Pmf => true,
+        ModelFamily::Njf | ModelFamily::Pjf | ModelFamily::Nmf | ModelFamily::Pmf => true,
         ModelFamily::Diode => applied == Some(1),
         ModelFamily::Resistor if card.base.eq_ignore_ascii_case("r") => selector <= 1,
         _ => selector == 1 && first_integer == 1,
@@ -828,8 +836,8 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
         };
         return Err(SpiceError::not_yet_ported(
             format!(
-                "{setter_location}: {:?} model '{}' selector {selector}, applied level {applied:?}",
-                family, card.name
+                "{setter_location}: {family:?} model '{}' selector {selector}, applied level {applied:?}",
+                card.name
             ),
             reference,
         ));

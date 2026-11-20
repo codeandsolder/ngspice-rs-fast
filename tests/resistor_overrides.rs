@@ -30,8 +30,8 @@ fn close(got: f64, want: f64) {
 /// names deliberately contradict SPICE's first-letter convention.
 fn misnamed() -> Circuit {
     let mut c = Circuit::new();
-    let a = c.add_node("a");
-    let b = c.add_node("b");
+    let a = c.add_node("a").unwrap();
+    let b = c.add_node("b").unwrap();
     c.add_device(Box::new(Resistor::new("v9", [a, b], 1e3).unwrap()))
         .unwrap();
     c.add_device(Box::new(
@@ -253,5 +253,89 @@ fn stale_or_mismatched_overrides_are_errors() {
     assert!(
         error.to_string().contains("not a two-terminal resistor"),
         "{error}"
+    );
+}
+
+#[test]
+fn resistor_overrides_preserve_observed_recipe_and_noise() {
+    use ngspice_rs::devices::noise::circuit_noise;
+
+    let original =
+        "r1 a 0 rm scale=2 m=4 temp=47\nr2 a 0 1k noisy=0\n.model rm r(r=1k tc1=0.01 kf=1e-12)";
+    let c = Circuit::from_netlist(&deck(original)).unwrap();
+    let explicit = Circuit::from_netlist(&deck(
+        "r1 a 0 2k rm scale=2 m=4 temp=47\nr2 a 0 2k noisy=0\n.model rm r(r=1k tc1=0.01 kf=1e-12)",
+    ))
+    .unwrap();
+    let context = ModelContext::default()
+        .with_resistor_override(c.resistor_override("r1", 2000.).unwrap())
+        .unwrap()
+        .with_resistor_override(c.resistor_override("r2", 2000.).unwrap())
+        .unwrap();
+    let bias = Vector::from_slice(&[2.]);
+    let swept = circuit_noise(&c, &context, &bias, None).unwrap();
+    assert_eq!(
+        swept,
+        circuit_noise(&explicit, &ModelContext::default(), &bias, None).unwrap()
+    );
+    assert_eq!(swept.len(), 1);
+    let mut c = c;
+    c.set_observations(&[
+        "@r1[resistance]".into(),
+        "@r1[m]".into(),
+        "@r1[temp]".into(),
+        "@r1[conductance]".into(),
+    ])
+    .unwrap();
+    let observed = c.observe_parameters(&context).unwrap();
+    for (got, want) in observed.iter().zip([4800., 4., 47., 1. / 1200.]) {
+        close(got.re, want);
+    }
+    assert_eq!(c.resistor("r1").unwrap().1.supplied, 1000.);
+}
+
+#[test]
+fn contextual_literal_sweep_preserves_default_model_and_noisy_flag() {
+    use ngspice_rs::devices::noise::{DeviceNoise, NoiseContext};
+    let c = Circuit::from_netlist(&deck("r1 a 0 1k noisy=0")).unwrap();
+    let context = ModelContext::default();
+    let replacement = c.devices()[0]
+        .with_instance_parameter("tc1", 0.01, &context)
+        .unwrap();
+    assert_eq!(
+        replacement.resistor_metadata().unwrap().origin,
+        ResistorOrigin::Literal
+    );
+    let sensitivity = replacement.sensitivity(&context).unwrap();
+    assert_eq!(sensitivity.model(), None);
+    let (_, instance) = sensitivity.records().unwrap();
+    assert_eq!(instance.value("tc").unwrap().to_bits(), 0.01_f64.to_bits());
+    let bias = Vector::from_slice(&[1.]);
+    assert_eq!(
+        replacement
+            .noise(&NoiseContext {
+                model_context: &context,
+                unknowns: c.unknowns(),
+                bias: &bias,
+                states: None,
+                controls: &[]
+            })
+            .unwrap(),
+        DeviceNoise::Noiseless
+    );
+    let replacement = replacement
+        .with_instance_parameter("m", 2., &context)
+        .unwrap();
+    assert_eq!(
+        replacement
+            .noise(&NoiseContext {
+                model_context: &context,
+                unknowns: c.unknowns(),
+                bias: &bias,
+                states: None,
+                controls: &[]
+            })
+            .unwrap(),
+        DeviceNoise::Noiseless
     );
 }

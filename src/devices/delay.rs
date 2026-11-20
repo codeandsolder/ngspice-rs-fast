@@ -25,6 +25,7 @@
 //!
 //! A device opts in through [`crate::devices::Device::delay_line`].
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -85,10 +86,21 @@ impl DelayHistory {
         self.times.get(index).copied()
     }
 
+    /// Borrow contiguous accepted times for convolution. Histories that
+    /// have wrapped after pruning are the only ones that require a copy.
+    pub(super) fn contiguous_times(&self) -> Cow<'_, [Real]> {
+        let (first, second) = self.times.as_slices();
+        if second.is_empty() {
+            Cow::Borrowed(first)
+        } else {
+            Cow::Owned(self.times.iter().copied().collect())
+        }
+    }
+
     /// Value `component` of sample `index`.
     #[must_use]
     pub fn value(&self, index: usize, component: usize) -> Option<Real> {
-        if component >= self.width {
+        if index >= self.len() || component >= self.width {
             return None;
         }
         self.values.get(index * self.width + component).copied()
@@ -157,13 +169,18 @@ impl DelayHistory {
         Ok(())
     }
 
-    /// Applies an update [`Self::check`] accepted.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::check`]; nothing changes on error.
+    /// Checked standalone application for line-model unit tests. Production
+    /// updates are committed together by StateHistory::accept_transaction.
+    #[cfg(test)]
     pub(crate) fn apply(&mut self, update: &DelayUpdate) -> SpiceResult<()> {
         self.check(update)?;
+        self.apply_validated(update);
+        Ok(())
+    }
+
+    /// Publish an update preflighted by the owning state transaction.
+    /// No fallible validation remains after fixed state has been committed.
+    pub(super) fn apply_validated(&mut self, update: &DelayUpdate) {
         if let Some(reset) = &update.reset {
             self.times.clear();
             self.values.clear();
@@ -179,7 +196,6 @@ impl DelayHistory {
             self.times.push_back(*time);
             self.values.extend(values.iter().copied());
         }
-        Ok(())
     }
 
     /// Forgets every sample (a restarted run).
@@ -206,6 +222,8 @@ pub struct DelayUpdate {
     pub breakpoints: Vec<Real>,
 }
 
+/// Transient step-size history supplied to delay devices.
+///
 /// The step sizes a delay device sees, C `CKTdeltaOld[0..3]`: during a trial
 /// `[trial step, previous accepted step, the one before]`, at acceptance
 /// `[accepted step, previous accepted step, the one before]`. Steps that do
@@ -299,6 +317,29 @@ mod tests {
     }
 
     #[test]
+    fn contiguous_times_preserve_ring_order_after_pruning() {
+        let mut history = DelayHistory::new(2);
+        for time in 0_i32..32 {
+            history
+                .apply(&DelayUpdate {
+                    append: Some(sample(f64::from(time), 1.)),
+                    drop_front: usize::from(time >= 4),
+                    ..DelayUpdate::default()
+                })
+                .unwrap();
+            let expected = ((time - 3).max(0)..=time)
+                .map(f64::from)
+                .collect::<Vec<_>>();
+            assert_eq!(history.contiguous_times().as_ref(), expected);
+        }
+        history.clear();
+        assert!(matches!(
+            history.contiguous_times(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
     fn updates_reset_drop_and_append_atomically() {
         let mut history = DelayHistory::new(2);
         assert!(history.is_empty());
@@ -312,6 +353,8 @@ mod tests {
         assert_eq!(history.time(0), Some(-2.));
         assert_eq!(history.value(2, 1), Some(-1.));
         assert_eq!(history.value(2, 2), None);
+        assert_eq!(history.value(usize::MAX, 0), None);
+        assert_eq!(history.value(usize::MAX / 2 + 1, 0), None);
         history
             .apply(&DelayUpdate {
                 drop_front: 1,

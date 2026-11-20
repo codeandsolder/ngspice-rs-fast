@@ -23,6 +23,7 @@
 use crate::netlist::ast::{OutputCards, RequestedVector, VectorComponent, VectorRequest};
 use crate::primitives::{AnalysisKind, Complex, Real, SpiceError, SpiceResult};
 
+use crate::analysis::ordered_samples::column_names;
 use crate::analysis::results::{Plot, PlotFlags, Variable};
 
 /// The `.save` and `.print` requests that apply to `kind`.
@@ -85,6 +86,30 @@ fn applicable(
     Ok(requests)
 }
 
+/// Every supported output expression is a ground reference, a signed
+/// single column, or a two-column difference. Keep the fixed-size plan
+/// inline instead of allocating a Vec per output column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Terms {
+    Ground,
+    Positive(usize),
+    Negative(usize),
+    Difference { positive: usize, negative: usize },
+}
+
+impl Terms {
+    const fn pairs(self) -> [Option<(usize, Real)>; 2] {
+        match self {
+            Self::Ground => [None, None],
+            Self::Positive(index) => [Some((index, 1.)), None],
+            Self::Negative(index) => [Some((index, -1.)), None],
+            Self::Difference { positive, negative } => {
+                [Some((positive, 1.)), Some((negative, -1.))]
+            }
+        }
+    }
+}
+
 /// One written column: a signed sum of full-plot columns, then an optional AC
 /// component.
 ///
@@ -99,8 +124,8 @@ pub(crate) struct Column {
     unit: String,
     /// The `Variable::is_real` flag of the written column.
     is_real: bool,
-    /// `(column index in the full plot, factor)`; the factors are `+1` or `-1`.
-    terms: Vec<(usize, Real)>,
+    /// Signed column combination, in the original evaluation order.
+    terms: Terms,
     /// An AC component applied after the sum.
     component: Option<VectorComponent>,
 }
@@ -141,40 +166,51 @@ impl Selection {
         kind: AnalysisKind,
         requests: &[VectorRequest],
     ) -> SpiceResult<Self> {
-        if requests.is_empty() {
+        Self::resolve_refs(plot, kind, requests.iter())
+    }
+
+    /// Resolve borrowed requests, including routed batch cards, without
+    /// cloning their vector names or source locations.
+    pub(super) fn resolve_refs<'a>(
+        plot: &Plot,
+        kind: AnalysisKind,
+        requests: impl IntoIterator<Item = &'a VectorRequest>,
+    ) -> SpiceResult<Self> {
+        let mut requests = requests.into_iter().peekable();
+        if requests.peek().is_none() {
             return Ok(Self {
                 full: true,
                 columns: driver_columns(plot),
             });
         }
-        // `all` widens the written plot to the driver's whole set, but every
-        // other request is still resolved, so an unresolvable vector is an error
-        // rather than being dropped because an `all` happened to be present.
-        let full = requests
-            .iter()
-            .any(|request| request.vector == RequestedVector::All);
+        // All widens the output but must not suppress validation of the other
+        // requests, irrespective of its position in the source deck.
+        let mut full = false;
         let mut columns: Vec<Column> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         // C's `beginPlot()` pass 0: the reference vector is always written first.
         if kind != AnalysisKind::OperatingPoint
             && let Some(scale) = plot.variables.first()
         {
+            seen.insert((Terms::Positive(0), None));
             columns.push(Column {
                 name: scale.name.clone(),
                 unit: scale.unit.clone(),
                 is_real: scale.is_real,
-                terms: vec![(0, 1.0)],
+                terms: Terms::Positive(0),
                 component: None,
             });
         }
         for request in requests {
             if request.vector == RequestedVector::All {
+                full = true;
                 continue;
             }
             let column = resolve_request(plot, request)?;
             // The written vector is the plan (the signed sum and the component),
             // not the spelling: `v(out)` and `v(out,0)` are one vector, and the
             // first request's spelling names it.
-            if !columns.iter().any(|existing| existing.same_vector(&column)) {
+            if seen.insert(column.key()) {
                 columns.push(column);
             }
         }
@@ -195,7 +231,7 @@ impl Selection {
 
     /// True when the driver's whole plot is written, in the driver's order.
     #[must_use]
-    pub fn is_full(&self) -> bool {
+    pub const fn is_full(&self) -> bool {
         self.full
     }
 
@@ -221,6 +257,7 @@ impl Selection {
             return Ok(plot.clone());
         }
         let mut selected = self.header(plot);
+        selected.points.reserve_exact(plot.points.len());
         for point in &plot.points {
             selected.push_point(self.apply_point(point)?)?;
         }
@@ -233,7 +270,7 @@ impl Selection {
     pub fn header(&self, plot: &Plot) -> Plot {
         let mut selected = Plot::new(plot.name.clone(), plot.plotname.clone(), plot.flags);
         if self.full {
-            selected.variables = plot.variables.clone();
+            selected.variables.clone_from(&plot.variables);
             return selected;
         }
         for column in &self.columns {
@@ -303,33 +340,27 @@ impl Selection {
         }
         let _ = writeln!(out, "{:>7}  {}", "point", names.join("  "));
         for (index, point) in plot.points.iter().enumerate() {
-            let mut values = Vec::with_capacity(self.columns.len());
+            let _ = write!(out, "{index:>7}");
             for column in &self.columns {
                 let value = column.value(point)?;
-                let spelling = crate::primitives::format_spice_number(value.re);
-                values.push(if plot.flags == PlotFlags::Complex && !column.is_real {
-                    format!(
-                        "{spelling},{}",
-                        crate::primitives::format_spice_number(value.im)
-                    )
-                } else {
-                    spelling
-                });
+                out.push_str("  ");
+                out.push_str(&crate::primitives::format_spice_number(value.re));
+                if plot.flags == PlotFlags::Complex && !column.is_real {
+                    out.push(',');
+                    out.push_str(&crate::primitives::format_spice_number(value.im));
+                }
             }
-            let _ = writeln!(out, "{index:>7}  {}", values.join("  "));
+            out.push('\n');
         }
         Ok(out)
     }
 }
 
 impl Column {
-    /// True when two plans write the same vector, whatever they are spelled.
-    ///
-    /// The unit and the real flag follow from the plan and the plot, so the
-    /// signed sum and the component identify it: `v(out)`, `v(out,0)` and
-    /// `v(out)` again are one written vector.
-    fn same_vector(&self, other: &Self) -> bool {
-        self.terms == other.terms && self.component == other.component
+    /// The signed combination and component identify a vector independently
+    /// of its spelling. Component function names are unique enum tags.
+    fn key(&self) -> (Terms, Option<&'static str>) {
+        (self.terms, self.component.map(VectorComponent::function))
     }
 
     /// The written name of this column, e.g. `v(out)`.
@@ -349,19 +380,18 @@ impl Column {
     /// [`SpiceError::Numerical`] when the computed value is not finite.
     pub(crate) fn value(&self, point: &[Complex]) -> SpiceResult<Complex> {
         let mut sum = Complex::real(0.0);
-        for (index, factor) in &self.terms {
-            let Some(value) = point.get(*index) else {
+        for (index, factor) in self.terms.pairs().into_iter().flatten() {
+            let Some(value) = point.get(index) else {
                 return Err(SpiceError::Numerical {
                     context: format!("selection: {}", self.name),
                     message: format!("the plot has no column {index}"),
                 });
             };
-            sum = sum + *value * Complex::from(*factor);
+            sum = sum + *value * Complex::from(factor);
         }
-        let value = match self.component {
-            None => sum,
-            Some(component) => component_value(component, sum),
-        };
+        let value = self
+            .component
+            .map_or(sum, |component| component_value(component, sum));
         if !value.is_finite() {
             return Err(SpiceError::Numerical {
                 context: format!("selection: {}", self.name),
@@ -395,7 +425,7 @@ fn driver_columns(plot: &Plot) -> Vec<Column> {
             name: variable.name.clone(),
             unit: variable.unit.clone(),
             is_real: variable.is_real,
-            terms: vec![(index, 1.0)],
+            terms: Terms::Positive(index),
             component: None,
         })
         .collect()
@@ -420,25 +450,12 @@ pub(crate) fn resolve_request(plot: &Plot, request: &VectorRequest) -> SpiceResu
             name: vector,
             component,
         } => {
-            let index = plot
-                .variable_index(vector)
-                .or_else(|| plot.variable_index(&format!("v({vector})")))
-                .or_else(|| plot.variable_index(&format!("i({vector})")))
-                // C's canonical branch-vector spelling, `<source>#branch`
-                // (`CKTmkCur`, `copynode()` in `breakp2.c`): ngspice's own
-                // decks print source currents this way, so it is accepted as
-                // an alias of `i(<source>)`. The written name stays as asked,
-                // which is what C's `.print` header shows.
-                .or_else(|| {
-                    let device = vector.strip_suffix("#branch")?;
-                    (!device.is_empty()).then(|| plot.variable_index(&format!("i({device})")))?
-                })
-                .ok_or_else(|| {
-                    unsupported(format!(
-                        "{name}: the analysis has no named vector {vector}; it carries {}",
-                        column_names(plot)
-                    ))
-                })?;
+            let index = named_vector_index(plot, vector).ok_or_else(|| {
+                unsupported(format!(
+                    "{name}: the analysis has no named vector {vector}; it carries {}",
+                    column_names(plot)
+                ))
+            })?;
             let variable = &plot.variables[index];
             let unit = match component {
                 Some(VectorComponent::Phase) => "phase".to_owned(),
@@ -449,7 +466,7 @@ pub(crate) fn resolve_request(plot: &Plot, request: &VectorRequest) -> SpiceResu
                 name,
                 unit,
                 is_real: component.is_some() || variable.is_real,
-                terms: vec![(index, 1.)],
+                terms: Terms::Positive(index),
                 component: *component,
             })
         }
@@ -461,8 +478,10 @@ pub(crate) fn resolve_request(plot: &Plot, request: &VectorRequest) -> SpiceResu
                 difference(plot, positive, negative.as_deref(), &name).map_err(unsupported)?;
             Ok(Column {
                 name,
-                unit: if negative.is_none() && terms.len() == 1 {
-                    plot.variables[terms[0].0].unit.clone()
+                unit: if negative.is_none()
+                    && let Terms::Positive(index) = terms
+                {
+                    plot.variables[index].unit.clone()
                 } else {
                     "voltage".to_owned()
                 },
@@ -484,7 +503,7 @@ pub(crate) fn resolve_request(plot: &Plot, request: &VectorRequest) -> SpiceResu
                 name,
                 unit: "current".to_owned(),
                 is_real: plot.variables[column].is_real,
-                terms: vec![(column, 1.0)],
+                terms: Terms::Positive(column),
                 component: None,
             })
         }
@@ -507,9 +526,9 @@ pub(crate) fn resolve_request(plot: &Plot, request: &VectorRequest) -> SpiceResu
                     component,
                     VectorComponent::Magnitude | VectorComponent::Real | VectorComponent::Imaginary
                 ) && negative.is_none()
-                    && terms.len() == 1
+                    && let Terms::Positive(index) = terms
                 {
-                    plot.variables[terms[0].0].unit.clone()
+                    plot.variables[index].unit.clone()
                 } else {
                     component_unit(*component).to_owned()
                 },
@@ -519,6 +538,20 @@ pub(crate) fn resolve_request(plot: &Plot, request: &VectorRequest) -> SpiceResu
             })
         }
     }
+}
+
+/// Resolve C branch-vector aliases without changing the requested output name.
+fn named_vector_index(plot: &Plot, vector: &str) -> Option<usize> {
+    // C's canonical branch-vector spelling, `<source>#branch`
+    // (`CKTmkCur`, `copynode()` in `breakp2.c`): it is an alias of
+    // `i(<source>)`, but the written name stays as requested.
+    plot.variable_index(vector)
+        .or_else(|| plot.variable_index(&format!("v({vector})")))
+        .or_else(|| plot.variable_index(&format!("i({vector})")))
+        .or_else(|| {
+            let device = vector.strip_suffix("#branch")?;
+            (!device.is_empty()).then(|| plot.variable_index(&format!("i({device})")))?
+        })
 }
 
 /// The unit of a computed AC component.
@@ -542,7 +575,7 @@ fn difference(
     positive: &str,
     negative: Option<&str>,
     name: &str,
-) -> Result<Vec<(usize, Real)>, String> {
+) -> Result<Terms, String> {
     let column_of = |node: &str| -> Result<Option<usize>, String> {
         if node == "0" {
             return Ok(None);
@@ -563,12 +596,12 @@ fn difference(
         None => None,
     };
     let terms = match (positive_column, negative_column, negative) {
-        (Some(positive), Some(negative), _) => vec![(positive, 1.0), (negative, -1.0)],
-        (Some(positive), None, _) => vec![(positive, 1.0)],
-        (None, Some(negative), _) => vec![(negative, -1.0)],
+        (Some(positive), Some(negative), _) => Terms::Difference { positive, negative },
+        (Some(positive), None, _) => Terms::Positive(positive),
+        (None, Some(negative), _) => Terms::Negative(negative),
         // `v(0)` is ground, i.e. identically zero; the port's plots carry no
         // ground column because ground is 0 V by definition.
-        (None, None, None) => Vec::new(),
+        (None, None, None) => Terms::Ground,
         (None, None, Some(_)) => {
             return Err(format!(
                 "{name}: both terminals are ground, so the difference is zero"
@@ -576,18 +609,6 @@ fn difference(
         }
     };
     Ok(terms)
-}
-
-/// The full plot's column names, for diagnostics.
-fn column_names(plot: &Plot) -> String {
-    if plot.variables.is_empty() {
-        return "no vectors".to_owned();
-    }
-    plot.variables
-        .iter()
-        .map(|variable| variable.name.as_str())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 #[cfg(test)]
@@ -840,6 +861,36 @@ mod tests {
         assert_eq!(written.points[0][0], Complex::real(-2.5e-3));
         assert_eq!(written.variables[0].unit, "current");
         assert!(written.variables[0].is_real);
+    }
+
+    #[test]
+    fn projection_identity_preserves_sign_and_order_with_aliases() {
+        let plot = op_plot();
+        let requests = [
+            voltage("out", Some("0")),
+            voltage("out", None),
+            voltage("0", Some("out")),
+            voltage("in", Some("out")),
+            voltage("out", Some("in")),
+            voltage("in", Some("out")),
+            voltage("out", Some("out")),
+        ];
+        let selection = resolve(&plot, AnalysisKind::OperatingPoint, &requests);
+        assert_eq!(
+            names(&selection),
+            [
+                "v(out,0)",
+                "v(0,out)",
+                "v(in,out)",
+                "v(out,in)",
+                "v(out,out)"
+            ]
+        );
+        let written = selection.apply(&plot).unwrap();
+        assert_eq!(
+            written.points[0],
+            [2.5, -2.5, 2.5, -2.5, 0.].map(Complex::real)
+        );
     }
 
     #[test]

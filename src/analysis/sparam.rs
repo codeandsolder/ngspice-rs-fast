@@ -58,11 +58,12 @@ impl BoundPort {
     }
 }
 
-pub(crate) fn run(
+pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &crate::analysis::AnalysisContext,
-) -> SpiceResult<Plot> {
+    include_bias: bool,
+) -> SpiceResult<Vec<Plot>> {
     let settings = crate::analysis::bias::DcSettings::from_request(request)?;
     let positional: Vec<String> = request
         .arguments
@@ -73,54 +74,25 @@ pub(crate) fn run(
     if !matches!(positional.len(), 4 | 5) {
         return Err(unsupported(".sp lin|dec|oct points start stop [donoise]"));
     }
-    let mut donoise = false;
-    if let Some(flag) = positional.get(4) {
+    let donoise = if let Some(flag) = positional.get(4) {
         // dot_sp() reads donoise as IF_INTEGER, (int) floor(0.5 + value), and
         // SPsetParm enables noise only for exactly 1.
         let value = parse_spice_number(flag)
             .filter(|v| v.is_finite())
             .ok_or_else(|| unsupported(format!(".sp donoise must be an integer, found {flag}")))?;
-        donoise = (value + 0.5).floor() == 1.;
-    }
+        (1. ..2.).contains(&(value + 0.5))
+    } else {
+        false
+    };
 
     let grid = frequency_grid(&positional, settings.newton.reltol, GridKind::Sp)?;
     circuit.finalize()?;
     let ports = bind_ports(circuit)?;
     let mut small_signal = SmallSignal::prepare(circuit, request, context, settings)?;
+    let mut plots = small_signal.retained_bias(circuit, request, context, include_bias)?;
     reject_imaginary_current_excitation(small_signal.system())?;
     let n = circuit.unknown_count();
-    let mut plot = plot(
-        circuit,
-        "sp1",
-        "SP Analysis",
-        Some(("frequency", "frequency")),
-        true,
-    )?;
-    for (prefix, unit) in [("S", "s-param"), ("Y", "admittance"), ("Z", "impedance")] {
-        for i in 1..=ports.len() {
-            for j in 1..=ports.len() {
-                plot.push_variable(Variable::complex(format!("{prefix}_{i}_{j}"), unit));
-            }
-        }
-    }
-    plot.push_variable(Variable::complex("v(Rbase)", "voltage"));
-    if donoise {
-        for i in 1..=ports.len() {
-            for j in 1..=ports.len() {
-                plot.push_variable(Variable::complex(format!("i(Cy_{i}_{j})"), "current"));
-            }
-        }
-        if ports.len() == 2 {
-            for (name, unit) in [
-                ("NF", "decibel"),
-                ("SOpt", "notype"),
-                ("NFmin", "decibel"),
-                ("Rn", "impedance"),
-            ] {
-                plot.push_variable(Variable::complex(name, unit));
-            }
-        }
-    }
+    let mut plot = parameter_plot(circuit, ports.len(), donoise)?;
     let reference = ports[0].z0;
     for f in grid {
         let (last, matrices, factor) =
@@ -128,8 +100,8 @@ pub(crate) fn run(
                 let matrix =
                     crate::analysis::ac::ac_matrix(circuit, system, 2. * std::f64::consts::PI * f)?
                         .factorize()?;
-                let mut incident = DenseComplex::zeros(ports.len());
-                let mut scattered = DenseComplex::zeros(ports.len());
+                let mut incident = DenseComplex::zeros(ports.len())?;
+                let mut scattered = DenseComplex::zeros(ports.len())?;
                 let mut last = Vec::new();
                 for (column, driven) in ports.iter().enumerate() {
                     // VSRCspupdate: unit excitation in the active port's branch
@@ -180,6 +152,44 @@ pub(crate) fn run(
             )?);
         }
         plot.push_point(point)?;
+    }
+    plots.push(plot);
+    Ok(plots)
+}
+
+/// Schema in the same order as the per-frequency point assembly.
+fn parameter_plot(circuit: &Circuit, port_count: usize, donoise: bool) -> SpiceResult<Plot> {
+    let mut plot = plot(
+        circuit,
+        "sp1",
+        "SP Analysis",
+        Some(("frequency", "frequency")),
+        true,
+    )?;
+    for (prefix, unit) in [("S", "s-param"), ("Y", "admittance"), ("Z", "impedance")] {
+        for i in 1..=port_count {
+            for j in 1..=port_count {
+                plot.push_variable(Variable::complex(format!("{prefix}_{i}_{j}"), unit));
+            }
+        }
+    }
+    plot.push_variable(Variable::complex("v(Rbase)", "voltage"));
+    if donoise {
+        for i in 1..=port_count {
+            for j in 1..=port_count {
+                plot.push_variable(Variable::complex(format!("i(Cy_{i}_{j})"), "current"));
+            }
+        }
+        if port_count == 2 {
+            for (name, unit) in [
+                ("NF", "decibel"),
+                ("SOpt", "notype"),
+                ("NFmin", "decibel"),
+                ("Rn", "impedance"),
+            ] {
+                plot.push_variable(Variable::complex(name, unit));
+            }
+        }
     }
     Ok(plot)
 }
@@ -274,35 +284,35 @@ fn port_matrices(
             .iter()
             .map(|port| Complex::real(port.z0))
             .collect::<Vec<_>>(),
-    );
+    )?;
     let gn = DenseComplex::diagonal(
         &ports
             .iter()
             .map(|port| Complex::real(2. * port.ki))
             .collect::<Vec<_>>(),
-    );
+    )?;
     let gn_inverse = DenseComplex::diagonal(
         &ports
             .iter()
             .map(|port| Complex::real(1. / (2. * port.ki)))
             .collect::<Vec<_>>(),
-    );
-    let e_minus_s = DenseComplex::identity(n).sub(&s)?;
+    )?;
+    let e_minus_s = DenseComplex::identity(n)?.sub(&s)?;
     let s_z0_plus_z0 = s.mul(&zref)?.add(&zref)?;
     let z = match e_minus_s.inverse()? {
         Some(inverse) => gn_inverse.mul(&inverse.mul(&s_z0_plus_z0.mul(&gn)?)?)?,
-        None => DenseComplex::zeros(n),
+        None => DenseComplex::zeros(n)?,
     };
     let y = match s_z0_plus_z0.inverse()? {
         Some(inverse) => gn_inverse.mul(&inverse.mul(&e_minus_s.mul(&gn)?)?)?,
-        None => DenseComplex::zeros(n),
+        None => DenseComplex::zeros(n)?,
     };
     Ok([s, y, z])
 }
 
 /// C `span.c::NInspIter` / `CKTspnoise`, `nevalsrc.c`: independent generator
 /// covariances, transformed from terminated port voltages to short-circuit
-/// currents. C's N_GAIN branch does not add flicker generators to Cy.
+/// currents. C's `N_GAIN` branch does not add flicker generators to Cy.
 fn noise_parameters(
     circuit: &Circuit,
     ports: &[BoundPort],
@@ -325,7 +335,7 @@ fn noise_parameters(
         }
         adjoints.push(factor.solve_transposed(&rhs)?);
     }
-    let mut cy = DenseComplex::zeros(count);
+    let mut cy = DenseComplex::zeros(count)?;
     for instance in generators {
         for source in &instance.sources {
             if matches!(
@@ -386,12 +396,16 @@ fn noise_parameters(
             c22.re = 1e-30;
         }
         let ycor = y11 - (get(0, 1) / c22) * y21;
-        let gu = get(0, 0).re - rn * (y11 - ycor).magnitude().powi(2);
-        let ys = Complex::new((ycor.re * ycor.re + gu / rn).max(0.).sqrt(), -ycor.im);
+        let correlated_power = rn * (y11 - ycor).magnitude().powi(2);
+        let gu = get(0, 0).re - correlated_power;
+        let ycor_re_squared = ycor.re * ycor.re;
+        let ys = Complex::new((ycor_re_squared + gu / rn).max(0.).sqrt(), -ycor.im);
         let y0 = Complex::real(1. / ports[0].z0);
         let sopt = (y0 - ys) / (y0 + ys);
-        let fmin = 1. + 2. * rn * (ycor.re + ys.re);
-        let nf = fmin + rn / y0.re * (y0 - ys).magnitude().powi(2);
+        let excess_noise = 2. * rn * (ycor.re + ys.re);
+        let fmin = 1. + excess_noise;
+        let mismatch_noise = rn / y0.re * (y0 - ys).magnitude().powi(2);
+        let nf = fmin + mismatch_noise;
         result.extend([
             Complex::real(10. * nf.log10()),
             sopt,

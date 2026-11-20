@@ -163,7 +163,7 @@ fn enter(input: &mut In<'_>, at: usize) -> Res<()> {
     Ok(())
 }
 
-fn leave(input: &mut In<'_>) {
+const fn leave(input: &mut In<'_>) {
     input.state.depth = input.state.depth.saturating_sub(1);
 }
 
@@ -329,13 +329,13 @@ fn power(input: &mut In<'_>, options: Options) -> Res<BExpr> {
     }
 }
 
-fn is_name_start(c: char) -> bool {
+const fn is_name_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
 
 /// Identifier characters of `inp_modify_exp()` (`isalnum`, `#`, `$`, `%`,
 /// `_`, `[`, `]`; `!` is left out so that `a!=b` is a comparison).
-fn is_name_continue(c: char) -> bool {
+const fn is_name_continue(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '#' | '$' | '%' | '[' | ']')
 }
 
@@ -578,10 +578,10 @@ mod tests {
         match &expr.kind {
             BExprKind::Number { spelling, .. } => spelling.clone(),
             BExprKind::Name(name) => name.clone(),
-            BExprKind::Voltage { positive, negative } => match negative {
-                Some(negative) => format!("v({positive},{negative})"),
-                None => format!("v({positive})"),
-            },
+            BExprKind::Voltage { positive, negative } => negative.as_ref().map_or_else(
+                || format!("v({positive})"),
+                |negative| format!("v({positive},{negative})"),
+            ),
             BExprKind::Current(name) => format!("i({name})"),
             BExprKind::Unary { op, operand } => format!("({op:?} {})", shape(operand)),
             BExprKind::Binary { op, lhs, rhs } => {

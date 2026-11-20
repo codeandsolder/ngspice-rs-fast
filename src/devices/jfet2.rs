@@ -63,11 +63,35 @@
 //! `.noise` (`jfet2noi.c`), `.disto` (C has no `DEVdisto` for level 2) and
 //! `.sens` fail with explicit errors.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::similar_names,
+    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
+)]
+#![expect(
+    clippy::float_cmp,
+    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
+)]
+#![expect(
+    clippy::manual_midpoint,
+    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "a complete translated C numerical routine remains contiguous for equation parity review"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::devices::jfet::{
     self, IC_COMPONENTS, Instance, Junctions, K_OVER_Q, Loaded, p, required,
 };
 use crate::devices::limiting;
-use crate::devices::nonlinear::{JunctionPoint, junction_companion};
+use crate::devices::nonlinear::charge::ChargeBranch;
+use crate::devices::nonlinear::thermal::{TemperatureCache, TemperatureKey};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
@@ -88,8 +112,11 @@ const FX: Real = -10.0;
 /// `psmodel.c` `MX`: the largest exponential argument.
 const MX: Real = 40.0;
 /// `psmodel.c` `EMX = exp(MX)`.
-#[allow(clippy::excessive_precision)]
-const EMX: Real = 2.353852668370199842e17;
+#[expect(
+    clippy::excessive_precision,
+    reason = "reference C literal spelling is preserved for numerical parity"
+)]
+const EMX: Real = 2.353_852_668_370_199_842e17;
 /// `psmodel.h` `FOURTH`: the relaxation filters use a quarter step.
 const FOURTH: Real = 0.25;
 /// `jfet2temp.c` uses a fixed 1.11 eV band gap for IS.
@@ -281,7 +308,10 @@ struct Point {
 }
 
 /// `psmodel.c` `qgg`: Statz gate charge and its partials `(q, cgs, cgd)`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)]
 fn qgg(
     vgs: Real,
     vgd: Real,
@@ -372,7 +402,10 @@ fn relaxation(tau: Real, step: Real) -> Real {
 impl Model {
     /// `psmodel.c` `PSids` at (`vgs`, `vgd`) with `vgs >= vgd`; `memory` is
     /// the accepted filter state of a transient load (`TRAN_ANAL`).
-    #[allow(clippy::many_single_char_names, clippy::similar_names)]
+    #[expect(
+        clippy::similar_names,
+        reason = "related reference equation variables retain their distinct C names"
+    )]
     fn ids(
         &self,
         op: &Operating,
@@ -398,17 +431,14 @@ impl Model {
         // Drain current and derivatives.
         let vdst = vgs - vgd;
         // Rate-dependent threshold modulation.
-        let (h, vgdtrap, vgstrap) = match memory {
-            Some(memory) => {
-                let h = relaxation(self.taug, memory.step);
-                (
-                    h,
-                    h * memory.vgdtrap + (1. - h) * vgd,
-                    h * memory.vgstrap + (1. - h) * vgs,
-                )
-            }
-            None => (0., vgd, vgs),
-        };
+        let (h, vgdtrap, vgstrap) = memory.map_or((0., vgd, vgs), |memory| {
+            let h = relaxation(self.taug, memory.step);
+            (
+                h,
+                h * memory.vgdtrap + (1. - h) * vgd,
+                h * memory.vgstrap + (1. - h) * vgs,
+            )
+        });
         let (lfg, lfg1, lfg2) = (self.lfgam, self.lfg1, self.lfg2);
         let (hfg, hfg1, hfg2) = (self.hfgam, self.hfg1, self.hfg2);
         let (hfe, hfe1, hfe2) = (self.hfeta, self.hfe1, self.hfe2);
@@ -492,18 +522,18 @@ impl Model {
 
         // Thermal reduction of drain current.
         let delta = op.delta;
-        let (h, pave, powr_before) = match memory {
-            Some(memory) => {
+        let (h, pave, powr_before) = memory.map_or_else(
+            || {
+                // `POWR_NOW = POWR_BEFORE = pAverage`.
+                let pave = vdst * idrain;
+                (0., pave, pave)
+            },
+            |memory| {
                 let h = relaxation(self.taud, memory.step);
                 let pave = h * memory.powr + (1. - h) * vdst * idrain;
                 (h, pave, memory.powr)
-            }
-            // `POWR_NOW = POWR_BEFORE = pAverage`.
-            None => {
-                let pave = vdst * idrain;
-                (0., pave, pave)
-            }
-        };
+            },
+        );
         let pfac = 1. + pave * delta;
         idrain /= pfac;
         let arg = (h * delta * powr_before + 1.) / pfac / pfac;
@@ -532,7 +562,14 @@ impl Model {
     /// conductance `(Gm, xGm, Gds, xGds)` at angular frequency `omega` from
     /// the operating point's `gm`, `gds` and drain current `ids` (C's stored
     /// `JFET2cd`).
-    #[allow(clippy::too_many_arguments, clippy::similar_names)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )]
+    #[expect(
+        clippy::similar_names,
+        reason = "related reference equation variables retain their distinct C names"
+    )]
     fn acload(
         &self,
         op: &Operating,
@@ -604,6 +641,7 @@ pub struct Jfet2 {
     inner: [NodeId; 3],
     model: Model,
     instance: Instance,
+    derived: TemperatureCache<Operating>,
     /// `OFF` and `IC-VDS`/`IC-VGS` (C `JFET2off`, `JFET2icVDS`, `JFET2icVGS`).
     initial: crate::devices::initial::InstanceInitial,
 }
@@ -687,6 +725,7 @@ impl Jfet2 {
             inner: [NodeId::GROUND; 3],
             model,
             instance,
+            derived: TemperatureCache::new(),
             initial,
         };
         // Validate every derivation before interning nodes.
@@ -698,6 +737,13 @@ impl Jfet2 {
     /// `jfet2temp.c` and `PSinstanceinit` for this instance, with
     /// `psmodel.c`'s area scaling.
     fn operating(&self, context: &ModelContext) -> SpiceResult<Operating> {
+        self.derived
+            .get_or_derive(TemperatureKey::context(context), || {
+                self.derive_operating(context)
+            })
+    }
+
+    fn derive_operating(&self, context: &ModelContext) -> SpiceResult<Operating> {
         let (model, instance) = (&self.model, &self.instance);
         let (tnom, temp) = jfet::temperatures(&self.name, model.tnom, instance, context)?;
         let junction = jfet::gate_junction(model.pb, tnom, temp);
@@ -813,8 +859,7 @@ impl Jfet2 {
 
     /// Normalized `[vgs, vgd]` from physical node voltages of d', g, s'.
     fn normalized(&self, v: [Real; 3]) -> [Real; 2] {
-        let pol = self.model.pol;
-        [pol * (v[1] - v[2]), pol * (v[1] - v[0])]
+        jfet::normalized(self.model.pol, v)
     }
 
     fn numerical(&self, message: &str) -> SpiceError {
@@ -870,7 +915,7 @@ impl Jfet2 {
     }
 }
 
-/// Rewrites `slot` with its value before this load (C leaves CKTstate0
+/// Rewrites `slot` with its value before this load (C leaves `CKTstate0`
 /// untouched there): the previous load's, else the accepted or carried one,
 /// else zero.
 fn carry(states: &mut crate::devices::DeviceState<'_>, slot: usize) -> SpiceResult<()> {
@@ -894,27 +939,7 @@ impl Device for Jfet2 {
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
     ) -> SpiceResult<bool> {
-        let [d, g, s] = [self.terminals[0], self.terminals[1], self.terminals[2]];
-        let [dp, _, sp] = self.inner;
-        for (row, col) in [
-            (d, dp),
-            (g, dp),
-            (g, sp),
-            (s, sp),
-            (dp, d),
-            (dp, g),
-            (dp, sp),
-            (sp, g),
-            (sp, s),
-            (sp, dp),
-            (d, d),
-            (g, g),
-            (s, s),
-            (dp, dp),
-            (sp, sp),
-        ] {
-            setup.nodes(row, col);
-        }
+        jfet::setup_gate_matrix(setup, &self.terminals, self.inner);
         Ok(true)
     }
     /// `jfet2ask.c` scalar asks: `area` (C reports `area * m`), `m`, `temp`,
@@ -996,6 +1021,7 @@ impl Device for Jfet2 {
             inner: self.inner,
             model: self.model,
             instance,
+            derived: TemperatureCache::new(),
             initial,
         };
         device.operating(context)?;
@@ -1054,20 +1080,7 @@ impl Device for Jfet2 {
         };
         let point = self.point(&op, vgs, vgd, context.gmin, memory.as_ref())?;
         let vds = vgs - vgd;
-        let (cdrain, gm, gds) = point.channel;
-        let ((cgs, ggs), (cgd, ggd)) = (point.gs, point.gd);
-        let mut l = Loaded {
-            vgs,
-            vgd,
-            vds,
-            cg: cgs + cgd,
-            cgd,
-            cd: cdrain - cgd,
-            gm,
-            gds,
-            ggs,
-            ggd,
-        };
+        let mut l = Loaded::from_currents([vgs, vgd], point.channel, point.gs, point.gd);
         let initial_transient = context.states.phase() == crate::devices::IterationPhase::Predict
             && context.states.initial_transient();
 
@@ -1078,30 +1091,25 @@ impl Device for Jfet2 {
         if transient || context.mode == AnalysisMode::DcSweep || context.states.initial_conditions()
         {
             let capds = op.capds;
-            let (qgs, qgd, capgs, capgd) = if transient {
-                // PScharge in transient: the Statz charge incremented from
-                // the accepted point (VGS1, VGD1, QGS_BEFORE, QGD_BEFORE).
-                let vgs1 = state1(&context.states, slot::VGS, "vgs")?;
-                let vgd1 = state1(&context.states, slot::VGD, "vgd")?;
-                let qgs1 = state1(&context.states, slot::QGS, "qgs")?;
-                let qgd1 = state1(&context.states, slot::QGD, "qgd")?;
-                let (qgga, cgsna, cgdna) = self.model.qgg(&op, vgs, vgd);
-                let (qggb, _, cgdnb) = self.model.qgg(&op, vgs1, vgd);
-                let (qggc, cgsnc, _) = self.model.qgg(&op, vgs, vgd1);
-                let (qggd, _, _) = self.model.qgg(&op, vgs1, vgd1);
-                (
-                    qgs1 + 0.5 * (qgga - qggb + qggc - qggd),
-                    qgd1 + 0.5 * (qgga - qggc + qggb - qggd),
-                    0.5 * (cgsna + cgsnc),
-                    0.5 * (cgdna + cgdnb),
-                )
+            let gates = if transient {
+                jfet::incremental_statz(
+                    &context.states,
+                    [vgs, vgd],
+                    jfet::StatzCapacitance::Averaged,
+                    |what| self.numerical(&format!("missing accepted {what}")),
+                    |gs, gd| Ok(self.model.qgg(&op, gs, gd)),
+                )?
             } else {
-                // PScharge outside transient: the total charge in both slots.
+                // PScharge outside transient: total charge in both slots.
                 let (q, capgs, capgd) = self.model.qgg(&op, vgs, vgd);
-                (q, q, capgs, capgd)
+                jfet::gate_charges(q, q, capgs, capgd)
             };
-            let qds = capds * vds;
-            if [qgs, qgd, capgs, capgd, qds].iter().any(|v| !v.is_finite()) {
+            let drain = ChargeBranch::new(slot::QDS, capds * vds, capds);
+            if gates
+                .iter()
+                .any(|branch| !branch.charge.is_finite() || !branch.capacitance.is_finite())
+                || !drain.charge.is_finite()
+            {
                 return Err(self.numerical("nonfinite Statz gate charge"));
             }
             if let Some(coefficients) = integration {
@@ -1113,45 +1121,32 @@ impl Device for Jfet2 {
                 if dt != coefficients.dt() {
                     return Err(SpiceError::circuit("JFET2 charge timestep mismatch"));
                 }
+                let branches = [gates[0], gates[1], drain];
                 if initial_transient {
-                    context.states.patch_state1(slot::QGS, qgs)?;
-                    context.states.patch_state1(slot::QGD, qgd)?;
-                    context.states.patch_state1(slot::QDS, qds)?;
+                    for branch in branches {
+                        branch.seed(&mut context.states)?;
+                    }
                 }
-                let point = |charge, capacitance| JunctionPoint {
-                    current: 0.,
-                    conductance: 0.,
-                    charge,
-                    capacitance,
-                };
-                let (geq, cqgs) =
-                    junction_companion(context, coefficients, point(qgs, capgs), slot::QGS)?;
-                l.ggs += geq;
-                l.cg += cqgs;
-                let (geq, cqgd) =
-                    junction_companion(context, coefficients, point(qgd, capgd), slot::QGD)?;
-                l.ggd += geq;
-                l.cg += cqgd;
-                l.cd -= cqgd;
-                l.cgd += cqgd;
-                // jfet2load.c integrates CDS * vds into the drain current
-                // but leaves its conductance out of the matrix.
-                let (_, cqds) =
-                    junction_companion(context, coefficients, point(qds, capds), slot::QDS)?;
+                let [cqgs, cqgd] = l.integrate_gates(&mut context.states, coefficients, gates)?;
+                // jfet2load.c integrates CDS * vds into drain current but
+                // leaves its conductance out of the matrix.
+                let cqds = drain
+                    .integrate(&mut context.states, coefficients)?
+                    .derivative;
                 l.cd += cqds;
                 if initial_transient {
-                    context.states.patch_state1(slot::QGS + 1, cqgs)?;
-                    context.states.patch_state1(slot::QGD + 1, cqgd)?;
-                    context.states.patch_state1(slot::QDS + 1, cqds)?;
+                    for (branch, derivative) in branches.into_iter().zip([cqgs, cqgd, cqds]) {
+                        branch.seed_derivative(&mut context.states, derivative)?;
+                    }
                 }
             } else {
                 for s in [slot::QGS + 1, slot::QGD + 1, slot::QDS + 1] {
                     carry(&mut context.states, s)?;
                 }
             }
-            context.states.set(slot::QGS, qgs)?;
-            context.states.set(slot::QGD, qgd)?;
-            context.states.set(slot::QDS, qds)?;
+            for branch in [gates[0], gates[1], drain] {
+                branch.store(&mut context.states)?;
+            }
         } else {
             for s in [
                 slot::QGS,
@@ -1232,8 +1227,8 @@ impl Device for Jfet2 {
                 context.scaled_dynamic_sum(row, col, &[op.capds], scale)?;
             }
         }
-        jfet::ac_gate_capacitances(context, self.inner, m, capgs, capgd)?;
-        jfet::ac_conductances(
+        jfet::linear::ac_gate_capacitances(context, self.inner, m, capgs, capgd)?;
+        jfet::linear::ac_conductances(
             context,
             &self.terminals,
             self.inner,
@@ -1259,189 +1254,6 @@ impl Device for Jfet2 {
             format!("distortion analysis of JFET2 {}", self.name),
             "src/spicelib/devices/jfet2/ (no DEVdisto: C omits the device from .disto)",
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn model() -> Model {
-        Model {
-            pol: 1.,
-            acgam: 0.1,
-            beta: 1.3e-3,
-            cds: 0.5e-12,
-            cgd: 1e-12,
-            cgs: 2e-12,
-            delta: 0.3,
-            hfeta: 0.02,
-            hfe1: 0.01,
-            hfe2: 0.015,
-            hfg1: 0.012,
-            hfg2: 0.008,
-            hfgam: 0.04,
-            mvst: 0.2,
-            mxi: 0.1,
-            fc: 0.5,
-            ibd: 1e-9,
-            is: 1e-14,
-            lambda: 0.03,
-            lfgam: 0.05,
-            lfg1: 0.02,
-            lfg2: 0.01,
-            n: 1.2,
-            p: 2.3,
-            pb: 0.9,
-            q: 2.1,
-            rd: 0.,
-            rs: 0.,
-            taud: 1e-7,
-            taug: 2e-7,
-            vbd: 2.,
-            vst: 0.06,
-            vto: -2.,
-            xc: 0.2,
-            xi: 8.,
-            z: 0.6,
-            tnom: None,
-        }
-    }
-
-    fn device(model: Model) -> (Jfet2, Operating) {
-        let device = Jfet2 {
-            name: "j1".into(),
-            model_name: "jm".into(),
-            terminals: vec![],
-            inner: [NodeId::GROUND; 3],
-            model,
-            instance: Instance {
-                area: 1.5,
-                m: 1.,
-                temp: None,
-                dtemp: 0.,
-            },
-            initial: crate::devices::initial::InstanceInitial::default(),
-        };
-        let op = device.operating(&ModelContext::default()).unwrap();
-        (device, op)
-    }
-
-    /// gm = dI/dvgs at fixed vds and gds = dI/dvds at fixed vgs, as well as
-    /// the diode conductances, in every region of both modes, with and
-    /// without the transient filters.
-    #[test]
-    fn ids_partials_are_the_current_derivatives() {
-        let (device, op) = device(model());
-        let memory = Memory {
-            step: 3e-8,
-            vgstrap: -0.7,
-            vgdtrap: -2.4,
-            powr: 4e-3,
-        };
-        for memory in [None, Some(&memory)] {
-            for vgs in [-3.2, -2.3, -1.9, -1., 0., 0.4] {
-                for vds in [-3., -1.2, -0.4, -0.05, 0.05, 0.4, 1.2, 3.] {
-                    let at = |vgs: Real, vds: Real| {
-                        device.point(&op, vgs, vgs - vds, 1e-12, memory).unwrap()
-                    };
-                    let c = at(vgs, vds);
-                    let h = 1e-6;
-                    let gm = (at(vgs + h, vds).channel.0 - at(vgs - h, vds).channel.0) / (2. * h);
-                    let gds = (at(vgs, vds + h).channel.0 - at(vgs, vds - h).channel.0) / (2. * h);
-                    let scale = c.channel.1.abs().max(c.channel.2.abs()).max(1e-9);
-                    let tag = format!("{vgs} {vds} {}", memory.is_some());
-                    assert!(
-                        (gm - c.channel.1).abs() <= 1e-5 * scale,
-                        "{tag}: gm {gm} {:?}",
-                        c.channel
-                    );
-                    assert!(
-                        (gds - c.channel.2).abs() <= 1e-5 * scale,
-                        "{tag}: gds {gds} {:?}",
-                        c.channel
-                    );
-                    // d igs / d vgs at fixed vgd = ggs.
-                    let ggs = (device
-                        .point(&op, vgs + h, vgs - vds, 1e-12, memory)
-                        .unwrap()
-                        .gs
-                        .0
-                        - device
-                            .point(&op, vgs - h, vgs - vds, 1e-12, memory)
-                            .unwrap()
-                            .gs
-                            .0)
-                        / (2. * h);
-                    assert!(
-                        (ggs - c.gs.1).abs() <= 1e-5 * c.gs.1.abs() + 1e-15,
-                        "{tag}: ggs"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_channel_is_antisymmetric_without_filters() {
-        let (device, op) = device(model());
-        for (vgs, vgd) in [(-1., -1.5), (0.2, -2.), (-1.9, -1.95)] {
-            let forward = device.point(&op, vgs, vgd, 0., None).unwrap().channel.0;
-            let reverse = device.point(&op, vgd, vgs, 0., None).unwrap().channel.0;
-            assert!((forward + reverse).abs() <= 1e-15, "{vgs} {vgd}");
-        }
-    }
-
-    #[test]
-    fn statz_charge_partials_are_its_derivatives() {
-        let (device, op) = device(model());
-        for vgs in [-4., -2.1, -1., 0., 0.3, 0.6, 0.85] {
-            for vgd in [-5., -2., -0.5, 0.2, 0.7] {
-                let (_, cgs, cgd) = device.model.qgg(&op, vgs, vgd);
-                let h = 1e-7;
-                let q = |a: Real, b: Real| device.model.qgg(&op, a, b).0;
-                let ngs = (q(vgs + h, vgd) - q(vgs - h, vgd)) / (2. * h);
-                let ngd = (q(vgs, vgd + h) - q(vgs, vgd - h)) / (2. * h);
-                let scale = cgs.abs().max(cgd.abs());
-                assert!(
-                    (ngs - cgs).abs() <= 1e-6 * scale,
-                    "{vgs} {vgd}: cgs {ngs} {cgs}"
-                );
-                assert!(
-                    (ngd - cgd).abs() <= 1e-6 * scale,
-                    "{vgs} {vgd}: cgd {ngd} {cgd}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn ac_load_reduces_to_the_dc_conductances_without_time_constants() {
-        let mut m = model();
-        m.taug = 0.;
-        m.taud = 0.;
-        let (device, op) = device(m);
-        let p = device.point(&op, -0.8, -3., 1e-12, None).unwrap();
-        let (gm, xgm, gds, xgds) = device.model.acload(
-            &op,
-            -0.8,
-            -3.,
-            p.channel.0 - p.gd.0,
-            1e7,
-            p.channel.1,
-            p.channel.2,
-        );
-        assert!(
-            (gm - p.channel.1).abs() <= 1e-12 * gm.abs(),
-            "{gm} {:?}",
-            p.channel
-        );
-        assert!(
-            (gds - p.channel.2).abs() <= 1e-12 * gds.abs(),
-            "{gds} {:?}",
-            p.channel
-        );
-        assert_eq!((xgm, xgds), (0., 0.));
     }
 }
 
@@ -1577,7 +1389,6 @@ impl DeviceSensitivity for Jfet2Sensitivity<'_> {
                 "fc" => m.fc,
                 "ibd" => m.ibd,
                 "is" => m.is,
-                "kf" => 0.,
                 "lambda" => m.lambda,
                 "lfgam" => m.lfgam,
                 "lfg1" => m.lfg1,
@@ -1591,7 +1402,6 @@ impl DeviceSensitivity for Jfet2Sensitivity<'_> {
                 "taud" => m.taud,
                 "taug" => m.taug,
                 "vbd" => m.vbd,
-                "ver" => 0.,
                 "vst" => m.vst,
                 "vt0" => m.vto,
                 "xc" => m.xc,
@@ -1753,7 +1563,6 @@ impl DeviceSensitivity for Jfet2Sensitivity<'_> {
 
 impl Jfet2Sensitivity<'_> {
     /// The port's JFET2 with the records' parameters.
-    #[allow(clippy::too_many_lines)]
     fn jfet2(&self, current: RecordPair<'_>) -> SpiceResult<Jfet2> {
         let (m, i) = (current.model, current.instance);
         let model = Model {
@@ -1816,6 +1625,7 @@ impl Jfet2Sensitivity<'_> {
             inner: self.device.inner,
             model,
             instance,
+            derived: TemperatureCache::new(),
             initial: self.device.initial.clone(),
         })
     }
@@ -1891,7 +1701,7 @@ impl Device for ResetJfet2 {
             .collect();
         ResetStamps::new(&current.name, 'j', &current.terminals, stamps)?
             .assemble_linear(context)?;
-        jfet::ac_conductances(
+        jfet::linear::ac_conductances(
             context,
             &current.terminals,
             current.inner,
@@ -1899,5 +1709,189 @@ impl Device for ResetJfet2 {
             jfet::series_conductances(current.instance.area, current.model.rd, current.model.rs),
             [gm, gds, point.gs.1, point.gd.1],
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model() -> Model {
+        Model {
+            pol: 1.,
+            acgam: 0.1,
+            beta: 1.3e-3,
+            cds: 0.5e-12,
+            cgd: 1e-12,
+            cgs: 2e-12,
+            delta: 0.3,
+            hfeta: 0.02,
+            hfe1: 0.01,
+            hfe2: 0.015,
+            hfg1: 0.012,
+            hfg2: 0.008,
+            hfgam: 0.04,
+            mvst: 0.2,
+            mxi: 0.1,
+            fc: 0.5,
+            ibd: 1e-9,
+            is: 1e-14,
+            lambda: 0.03,
+            lfgam: 0.05,
+            lfg1: 0.02,
+            lfg2: 0.01,
+            n: 1.2,
+            p: 2.3,
+            pb: 0.9,
+            q: 2.1,
+            rd: 0.,
+            rs: 0.,
+            taud: 1e-7,
+            taug: 2e-7,
+            vbd: 2.,
+            vst: 0.06,
+            vto: -2.,
+            xc: 0.2,
+            xi: 8.,
+            z: 0.6,
+            tnom: None,
+        }
+    }
+
+    fn device(model: Model) -> (Jfet2, Operating) {
+        let device = Jfet2 {
+            name: "j1".into(),
+            model_name: "jm".into(),
+            terminals: vec![],
+            inner: [NodeId::GROUND; 3],
+            model,
+            instance: Instance {
+                area: 1.5,
+                m: 1.,
+                temp: None,
+                dtemp: 0.,
+            },
+            derived: TemperatureCache::new(),
+            initial: crate::devices::initial::InstanceInitial::default(),
+        };
+        let op = device.operating(&ModelContext::default()).unwrap();
+        (device, op)
+    }
+
+    /// gm = dI/dvgs at fixed vds and gds = dI/dvds at fixed vgs, as well as
+    /// the diode conductances, in every region of both modes, with and
+    /// without the transient filters.
+    #[test]
+    fn ids_partials_are_the_current_derivatives() {
+        let (device, op) = device(model());
+        let memory = Memory {
+            step: 3e-8,
+            vgstrap: -0.7,
+            vgdtrap: -2.4,
+            powr: 4e-3,
+        };
+        for memory in [None, Some(&memory)] {
+            for vgs in [-3.2, -2.3, -1.9, -1., 0., 0.4] {
+                for vds in [-3., -1.2, -0.4, -0.05, 0.05, 0.4, 1.2, 3.] {
+                    let at = |vgs: Real, vds: Real| {
+                        device.point(&op, vgs, vgs - vds, 1e-12, memory).unwrap()
+                    };
+                    let c = at(vgs, vds);
+                    let h = 1e-6;
+                    let gm = (at(vgs + h, vds).channel.0 - at(vgs - h, vds).channel.0) / (2. * h);
+                    let gds = (at(vgs, vds + h).channel.0 - at(vgs, vds - h).channel.0) / (2. * h);
+                    let scale = c.channel.1.abs().max(c.channel.2.abs()).max(1e-9);
+                    let tag = format!("{vgs} {vds} {}", memory.is_some());
+                    assert!(
+                        (gm - c.channel.1).abs() <= 1e-5 * scale,
+                        "{tag}: gm {gm} {:?}",
+                        c.channel
+                    );
+                    assert!(
+                        (gds - c.channel.2).abs() <= 1e-5 * scale,
+                        "{tag}: gds {gds} {:?}",
+                        c.channel
+                    );
+                    // d igs / d vgs at fixed vgd = ggs.
+                    let ggs = (device
+                        .point(&op, vgs + h, vgs - vds, 1e-12, memory)
+                        .unwrap()
+                        .gs
+                        .0
+                        - device
+                            .point(&op, vgs - h, vgs - vds, 1e-12, memory)
+                            .unwrap()
+                            .gs
+                            .0)
+                        / (2. * h);
+                    assert!(
+                        (ggs - c.gs.1).abs() <= 1e-5 * c.gs.1.abs() + 1e-15,
+                        "{tag}: ggs"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_channel_is_antisymmetric_without_filters() {
+        let (device, op) = device(model());
+        for (vgs, vgd) in [(-1., -1.5), (0.2, -2.), (-1.9, -1.95)] {
+            let forward = device.point(&op, vgs, vgd, 0., None).unwrap().channel.0;
+            let reverse = device.point(&op, vgd, vgs, 0., None).unwrap().channel.0;
+            assert!((forward + reverse).abs() <= 1e-15, "{vgs} {vgd}");
+        }
+    }
+
+    #[test]
+    fn statz_charge_partials_are_its_derivatives() {
+        let (device, op) = device(model());
+        for vgs in [-4., -2.1, -1., 0., 0.3, 0.6, 0.85] {
+            for vgd in [-5., -2., -0.5, 0.2, 0.7] {
+                let (_, cgs, cgd) = device.model.qgg(&op, vgs, vgd);
+                let h = 1e-7;
+                let q = |a: Real, b: Real| device.model.qgg(&op, a, b).0;
+                let ngs = (q(vgs + h, vgd) - q(vgs - h, vgd)) / (2. * h);
+                let ngd = (q(vgs, vgd + h) - q(vgs, vgd - h)) / (2. * h);
+                let scale = cgs.abs().max(cgd.abs());
+                assert!(
+                    (ngs - cgs).abs() <= 1e-6 * scale,
+                    "{vgs} {vgd}: cgs {ngs} {cgs}"
+                );
+                assert!(
+                    (ngd - cgd).abs() <= 1e-6 * scale,
+                    "{vgs} {vgd}: cgd {ngd} {cgd}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ac_load_reduces_to_the_dc_conductances_without_time_constants() {
+        let mut m = model();
+        m.taug = 0.;
+        m.taud = 0.;
+        let (device, op) = device(m);
+        let p = device.point(&op, -0.8, -3., 1e-12, None).unwrap();
+        let (gm, xgm, gds, xgds) = device.model.acload(
+            &op,
+            -0.8,
+            -3.,
+            p.channel.0 - p.gd.0,
+            1e7,
+            p.channel.1,
+            p.channel.2,
+        );
+        assert!(
+            (gm - p.channel.1).abs() <= 1e-12 * gm.abs(),
+            "{gm} {:?}",
+            p.channel
+        );
+        assert!(
+            (gds - p.channel.2).abs() <= 1e-12 * gds.abs(),
+            "{gds} {:?}",
+            p.channel
+        );
+        assert_eq!((xgm, xgds), (0., 0.));
     }
 }

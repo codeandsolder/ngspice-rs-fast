@@ -50,6 +50,7 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::analysis::batch;
@@ -59,7 +60,8 @@ use crate::analysis::selection::Selection;
 use crate::analysis::{
     Plot, PointSink, RawFileWriter, RawFormat, RawPlot, RunConfig, StreamedPlot, runner,
 };
-use crate::netlist::Parser;
+use crate::netlist::eval::ParamScope;
+use crate::netlist::{ParsedDeck, Parser};
 use crate::primitives::{AnalysisKind, Complex, SpiceError, SpiceResult};
 
 use crate::cli::args::kind_name;
@@ -111,6 +113,25 @@ pub struct PlotReport {
     pub fourier_results: Vec<FourierAnalysis>,
 }
 
+impl PlotReport {
+    /// Shared metadata for materialized and streamed plots, before optional
+    /// print/measure/Fourier outputs are attached.
+    fn written(name: &str, analysis: AnalysisKind, plot: &Plot, points: usize) -> Self {
+        Self {
+            name: name.to_owned(),
+            analysis,
+            plotname: plot.plotname.clone(),
+            variables: plot.variables.iter().map(|v| v.name.clone()).collect(),
+            points,
+            printed: None,
+            measured: None,
+            measurements: Vec::new(),
+            fourier: None,
+            fourier_results: Vec::new(),
+        }
+    }
+}
+
 /// Simulates every analysis of the deck and writes them as one ASCII rawfile.
 ///
 /// # Errors
@@ -157,25 +178,7 @@ pub fn run_with_format(
     auto_gnd: bool,
     format: Option<RawFormat>,
 ) -> SpiceResult<Report> {
-    let mut parsed = Parser::with_auto_gnd(auto_gnd).parse_file_with_output(deck)?;
-    if parsed.netlist.subcircuits.iter().any(|sub| {
-        !sub.output.is_empty() || !sub.measurements.is_empty() || !sub.fourier.is_empty()
-    }) {
-        let literal = crate::netlist::elaborate::literalize(&parsed.netlist)?;
-        let expanded = crate::devices::subckt::expand_with_output(
-            &literal.netlist,
-            &literal.scope,
-            crate::devices::subckt::SubcircuitLimits::default(),
-            &parsed.output,
-            &parsed.measurements,
-            &parsed.fourier,
-        )?;
-        parsed.output = expanded.output;
-        parsed.measurements = expanded.measurements;
-        parsed.fourier = expanded.fourier;
-    }
-    let scope = crate::netlist::eval::ParamScope::for_netlist(&parsed.netlist)?;
-    parsed.fourier = fourier::resolve_cards(&parsed.fourier, &scope)?;
+    let (parsed, scope) = prepare_deck(deck, auto_gnd)?;
     let netlist = &parsed.netlist;
     if netlist.analyses.is_empty() {
         return Err(SpiceError::parse(
@@ -193,21 +196,8 @@ pub fn run_with_format(
     // Options are validated before anything runs, exactly as `parse` does:
     // unknown or unsupported settings are errors, never ignored.
     let config = RunConfig::from_netlist(netlist)?;
-    let format = format.or(config.raw_format()).unwrap_or_else(|| {
-        // C uses atoi: leading signed integer, nonzero means ASCII.
-        let value = std::env::var("SPICE_ASCIIRAWFILE").unwrap_or_default();
-        let value = value.trim_start();
-        let digits: String = value
-            .chars()
-            .enumerate()
-            .take_while(|(i, c)| c.is_ascii_digit() || (*i == 0 && matches!(c, '+' | '-')))
-            .map(|(_, c)| c)
-            .collect();
-        if digits.parse::<i64>().unwrap_or(0) != 0 {
-            RawFormat::Ascii
-        } else {
-            RawFormat::Binary
-        }
+    let format = format.or_else(|| config.raw_format()).unwrap_or_else(|| {
+        raw_format_from_env(&std::env::var("SPICE_ASCIIRAWFILE").unwrap_or_default())
     });
     let schedule = batch::schedule_evaluated(&netlist.analyses, &config)?;
     // Every request and driver is validated before the first analysis runs, so
@@ -238,37 +228,16 @@ pub fn run_with_format(
         // C runs every analysis on the matrix and state vectors set up once
         // (`CKTmatrix` with its pivot order and reorder flags, `CKTstate0`),
         // so the circuit inherits them from the previous analysis.
-        let mut circuit = match first_circuit.take() {
-            Some(circuit) => circuit,
-            None => {
-                let mut circuit = config.circuit(netlist)?;
-                if let Some(previous) = &previous_circuit {
-                    circuit.inherit_from(previous);
-                }
-                circuit
+        let mut circuit = if let Some(circuit) = first_circuit.take() {
+            circuit
+        } else {
+            let mut circuit = config.circuit(netlist)?;
+            if let Some(previous) = &previous_circuit {
+                circuit.inherit_from(previous);
             }
+            circuit
         };
-        let observations = crate::analysis::observations::requests(
-            entry.kind,
-            &parsed.output,
-            &parsed.measurements,
-            &parsed.fourier,
-        );
-        circuit.set_observations(&observations)?;
-        if !circuit.observations().is_empty()
-            && !matches!(
-                entry.kind,
-                crate::primitives::AnalysisKind::OperatingPoint
-                    | crate::primitives::AnalysisKind::DcSweep
-                    | crate::primitives::AnalysisKind::Ac
-                    | crate::primitives::AnalysisKind::Transient
-            )
-        {
-            return Err(SpiceError::not_yet_ported(
-                "device observations for this analysis",
-                "src/frontend/outitf.c (OUTpData)",
-            ));
-        }
+        prepare_observations(&mut circuit, entry.kind, &parsed)?;
         let names: Vec<&str> = entry.plot_names().collect();
         // A `.tran` plot that only gets written streams its accepted points
         // into the rawfile as they are accepted, as C's batch output does, so
@@ -277,40 +246,15 @@ pub fn run_with_format(
             && names.len() == 1
             && !batch::needs_full_plot(entry, &parsed.output, &parsed.measurements, &parsed.fourier)
         {
-            let mut sink = RawfileSink {
-                writer: &rawfile.writer,
-                spool: &rawfile.spool,
-                entry,
-                output: &parsed.output,
-                title: &netlist.title,
+            let mut output = BatchOutput {
+                parsed: &parsed,
+                config: &config,
+                scope: &scope,
                 date: &date,
-                plot: None,
+                writer: &mut rawfile.writer,
+                spool: &rawfile.spool,
             };
-            driver.run_into(&mut circuit, &request, &config.context(), &mut sink)?;
-            let Some((_, streamed)) = sink.plot else {
-                return Err(SpiceError::Numerical {
-                    context: format!(".{} analysis", entry.kind.as_str()),
-                    message: "the driver produced no plot".to_owned(),
-                });
-            };
-            let written = &streamed.header().plot;
-            plots.push(PlotReport {
-                name: names[0].to_owned(),
-                analysis: entry.kind,
-                plotname: written.plotname.clone(),
-                variables: written
-                    .variables
-                    .iter()
-                    .map(|variable| variable.name.clone())
-                    .collect(),
-                points: streamed.point_count(),
-                printed: None,
-                measured: None,
-                measurements: Vec::new(),
-                fourier: None,
-                fourier_results: Vec::new(),
-            });
-            rawfile.writer.finish_plot(streamed)?;
+            plots.push(output.stream(entry, names[0], &mut circuit, &request, driver.as_ref())?);
             circuit.note_completed(entry.kind);
             previous_circuit = Some(circuit);
             continue;
@@ -326,51 +270,15 @@ pub fn run_with_format(
                 ),
             });
         }
-        for (plot, name) in produced.iter().zip(names) {
-            // The selection, the measurements and the Fourier cards are
-            // resolved against the **full** plot and before anything is
-            // written or printed: an unresolvable request leaves stdout empty
-            // and an existing destination untouched.
-            let mut outputs = batch::resolve_outputs_with_scope(
-                plot,
-                entry,
-                &parsed.output,
-                &parsed.measurements,
-                if config.fourier_settings().is_some() {
-                    &[]
-                } else {
-                    &parsed.fourier
-                },
-                &scope,
-            )?;
-            if entry.last_of_kind
-                && entry.kind == AnalysisKind::Transient
-                && let Some(settings) = config.fourier_settings()
-            {
-                outputs.fourier =
-                    fourier::resolve_with_settings(plot, entry.kind, &parsed.fourier, settings)?;
-            }
-            let raw_plot = raw_plot_for(&netlist.title, outputs.written, &date);
-            plots.push(PlotReport {
-                name: name.to_owned(),
-                analysis: entry.kind,
-                plotname: raw_plot.plot.plotname.clone(),
-                variables: raw_plot
-                    .plot
-                    .variables
-                    .iter()
-                    .map(|variable| variable.name.clone())
-                    .collect(),
-                points: raw_plot.plot.point_count(),
-                printed: outputs.printed,
-                measured: (!outputs.measurements.is_empty())
-                    .then(|| measure::to_text(&outputs.measurements)),
-                measurements: outputs.measurements,
-                fourier: (!outputs.fourier.is_empty()).then(|| fourier::to_text(&outputs.fourier)),
-                fourier_results: outputs.fourier,
-            });
-            rawfile.writer.write_plot(&raw_plot)?;
+        BatchOutput {
+            parsed: &parsed,
+            config: &config,
+            scope: &scope,
+            date: &date,
+            writer: &mut rawfile.writer,
+            spool: &rawfile.spool,
         }
+        .write(entry, &produced, names, &mut plots)?;
         circuit.note_completed(entry.kind);
         previous_circuit = Some(circuit);
     }
@@ -383,6 +291,176 @@ pub fn run_with_format(
         format,
         plots,
     })
+}
+
+struct BatchOutput<'a> {
+    parsed: &'a ParsedDeck,
+    config: &'a RunConfig,
+    scope: &'a ParamScope,
+    date: &'a str,
+    writer: &'a mut RawFileWriter,
+    spool: &'a Path,
+}
+
+impl BatchOutput<'_> {
+    fn stream(
+        &mut self,
+        entry: &batch::ScheduledAnalysis,
+        name: &str,
+        circuit: &mut crate::devices::Circuit,
+        request: &crate::analysis::AnalysisRequest,
+        driver: &dyn crate::analysis::Analysis,
+    ) -> SpiceResult<PlotReport> {
+        let mut sink = RawfileSink {
+            writer: &*self.writer,
+            spool: self.spool,
+            entry,
+            output: &self.parsed.output,
+            title: &self.parsed.netlist.title,
+            date: self.date,
+            plot: None,
+        };
+        driver.run_into(circuit, request, &self.config.context(), &mut sink)?;
+        let Some((_, streamed)) = sink.plot else {
+            return Err(SpiceError::Numerical {
+                context: format!(".{} analysis", entry.kind.as_str()),
+                message: "the driver produced no plot".to_owned(),
+            });
+        };
+        let report = PlotReport::written(
+            name,
+            entry.kind,
+            &streamed.header().plot,
+            streamed.point_count(),
+        );
+        self.writer.finish_plot(streamed)?;
+        Ok(report)
+    }
+
+    fn write(
+        &mut self,
+        entry: &batch::ScheduledAnalysis,
+        produced: &[Plot],
+        names: Vec<&str>,
+        plots: &mut Vec<PlotReport>,
+    ) -> SpiceResult<()> {
+        for (plot, name) in produced.iter().zip(names) {
+            // The selection, the measurements and the Fourier cards are
+            // resolved against the **full** plot and before anything is
+            // written or printed: an unresolvable request leaves stdout empty
+            // and an existing destination untouched.
+            let mut outputs = batch::resolve_outputs_with_scope(
+                plot,
+                entry,
+                &self.parsed.output,
+                &self.parsed.measurements,
+                if self.config.fourier_settings().is_some() {
+                    &[]
+                } else {
+                    &self.parsed.fourier
+                },
+                self.scope,
+            )?;
+            if entry.last_of_kind
+                && entry.kind == AnalysisKind::Transient
+                && let Some(settings) = self.config.fourier_settings()
+            {
+                outputs.fourier = fourier::resolve_with_settings(
+                    plot,
+                    entry.kind,
+                    &self.parsed.fourier,
+                    settings,
+                )?;
+            }
+            let raw_plot = raw_plot_for(&self.parsed.netlist.title, outputs.written, self.date);
+            let mut report = PlotReport::written(
+                name,
+                entry.kind,
+                &raw_plot.plot,
+                raw_plot.plot.point_count(),
+            );
+            report.printed = outputs.printed;
+            report.measured =
+                (!outputs.measurements.is_empty()).then(|| measure::to_text(&outputs.measurements));
+            report.measurements = outputs.measurements;
+            report.fourier =
+                (!outputs.fourier.is_empty()).then(|| fourier::to_text(&outputs.fourier));
+            report.fourier_results = outputs.fourier;
+            plots.push(report);
+            self.writer.write_plot(&raw_plot)?;
+        }
+        Ok(())
+    }
+}
+
+fn prepare_observations(
+    circuit: &mut crate::devices::Circuit,
+    kind: AnalysisKind,
+    parsed: &ParsedDeck,
+) -> SpiceResult<()> {
+    let observations = crate::analysis::observations::requests(
+        kind,
+        &parsed.output,
+        &parsed.measurements,
+        &parsed.fourier,
+    );
+    circuit.set_observations(&observations)?;
+    if !circuit.observations().is_empty()
+        && !matches!(
+            kind,
+            crate::primitives::AnalysisKind::OperatingPoint
+                | crate::primitives::AnalysisKind::DcSweep
+                | crate::primitives::AnalysisKind::Ac
+                | crate::primitives::AnalysisKind::Transient
+        )
+    {
+        return Err(SpiceError::not_yet_ported(
+            "device observations for this analysis",
+            "src/frontend/outitf.c (OUTpData)",
+        ));
+    }
+    Ok(())
+}
+
+/// Prepare frontend requests and the top-level scope once. Expanding
+/// subcircuit output cards already requires a resolved scope, so reuse it
+/// when evaluating the root Fourier cards and measurement outputs.
+fn prepare_deck(deck: &Path, auto_gnd: bool) -> SpiceResult<(ParsedDeck, Arc<ParamScope>)> {
+    let mut parsed = Parser::with_auto_gnd(auto_gnd).parse_file_with_output(deck)?;
+    let scope = if parsed.netlist.subcircuits.iter().any(|sub| {
+        !sub.output.is_empty() || !sub.measurements.is_empty() || !sub.fourier.is_empty()
+    }) {
+        let literal = crate::netlist::elaborate::literalize(&parsed.netlist)?;
+        let expanded = crate::devices::subckt::expand_with_output(
+            &literal.netlist,
+            &literal.scope,
+            crate::devices::subckt::SubcircuitLimits::default(),
+            &parsed.output,
+            &parsed.measurements,
+            &parsed.fourier,
+        )?;
+        parsed.output = expanded.output;
+        parsed.measurements = expanded.measurements;
+        parsed.fourier = expanded.fourier;
+        literal.scope
+    } else {
+        Arc::new(ParamScope::for_netlist(&parsed.netlist)?)
+    };
+    parsed.fourier = fourier::resolve_cards(&parsed.fourier, &scope)?;
+    Ok((parsed, scope))
+}
+
+/// C uses `atoi` on `SPICE_ASCIIRAWFILE`; preserve the existing signed prefix
+/// and overflow policy without allocating a second string.
+fn raw_format_from_env(value: &str) -> RawFormat {
+    let value = value.trim_start();
+    let sign = usize::from(value.starts_with(['+', '-']));
+    let digits = value[sign..].bytes().take_while(u8::is_ascii_digit).count();
+    if value[..sign + digits].parse::<i64>().unwrap_or(0) != 0 {
+        RawFormat::Ascii
+    } else {
+        RawFormat::Binary
+    }
 }
 
 /// Streams one plot into the rawfile through its `.save`/`.print` selection.
@@ -594,11 +672,16 @@ fn format_ctime(now: SystemTime) -> String {
     let days = seconds / 86_400;
     let time_of_day = seconds % 86_400;
     let (year, month, day) = civil_from_days(days);
+    let Some(month_name) = usize::try_from(month - 1)
+        .ok()
+        .and_then(|index| MONTHS.get(index))
+    else {
+        return "unknown".to_owned();
+    };
     // 1970-01-01 was a Thursday, index 4 in `WEEKDAYS`.
     let weekday = WEEKDAYS[((days + 4) % 7) as usize];
     format!(
-        "{weekday} {} {day:2} {:02}:{:02}:{:02} {year}",
-        MONTHS[month - 1],
+        "{weekday} {month_name} {day:2} {:02}:{:02}:{:02} {year}",
         time_of_day / 3600,
         time_of_day % 3600 / 60,
         time_of_day % 60,
@@ -606,11 +689,16 @@ fn format_ctime(now: SystemTime) -> String {
 }
 
 /// The civil date (`year`, 1-based `month`, 1-based `day`) of a day count since
-/// 1970-01-01. Howard Hinnant's `civil_from_days`.
-fn civil_from_days(days: u64) -> (u64, usize, u64) {
-    let days = days as i64 + 719_468;
-    let era = days.div_euclid(146_097);
-    let day_of_era = days.rem_euclid(146_097);
+/// 1970-01-01. Howard Hinnant's `civil_from_days`, for nonnegative days.
+///
+/// Split the epoch offset into complete Gregorian eras and its remainder so
+/// even a `u64::MAX` day count cannot overflow or wrap through a signed cast.
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    const DAYS_PER_ERA: u64 = 146_097;
+    const EPOCH_OFFSET: u64 = 719_468;
+    let shifted = days % DAYS_PER_ERA + EPOCH_OFFSET;
+    let era = days / DAYS_PER_ERA + shifted / DAYS_PER_ERA;
+    let day_of_era = shifted % DAYS_PER_ERA;
     let year_of_era =
         (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
@@ -621,8 +709,8 @@ fn civil_from_days(days: u64) -> (u64, usize, u64) {
     } else {
         month_prime - 9
     };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    (year as u64, month as usize, day as u64)
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    (year, month, day)
 }
 
 /// Renders the report printed after a successful run.
@@ -718,7 +806,10 @@ fn plot_blocks(out: &mut String, plot: &PlotReport) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PlotReport, Report, civil_from_days, format_ctime, report_text};
+    use super::{
+        PlotReport, RawFormat, Report, civil_from_days, format_ctime, raw_format_from_env,
+        report_text,
+    };
     use crate::primitives::AnalysisKind;
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
@@ -746,6 +837,25 @@ mod tests {
     }
 
     #[test]
+    fn ascii_rawfile_environment_uses_signed_decimal_prefix() {
+        for (text, expected) in [
+            ("", RawFormat::Binary),
+            ("0", RawFormat::Binary),
+            ("+0foo", RawFormat::Binary),
+            ("  -0", RawFormat::Binary),
+            ("+", RawFormat::Binary),
+            ("x1", RawFormat::Binary),
+            ("01", RawFormat::Ascii),
+            (" -12trailing", RawFormat::Ascii),
+            ("+1e0", RawFormat::Ascii),
+            ("1é", RawFormat::Ascii),
+            ("9223372036854775808", RawFormat::Binary),
+        ] {
+            assert_eq!(raw_format_from_env(text), expected, "{text}");
+        }
+    }
+
+    #[test]
     fn the_timestamp_is_a_ctime_style_utc_string() {
         assert_eq!(
             format_ctime(UNIX_EPOCH),
@@ -766,6 +876,12 @@ mod tests {
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         assert_eq!(civil_from_days(20_677), (2026, 8, 12));
         assert_eq!(civil_from_days(365), (1971, 1, 1));
+        // Each 400-year era is exactly 146097 days long, including leap
+        // years. The split-epoch calculation remains valid at u64::MAX.
+        let (year, month, day) = civil_from_days(u64::MAX - 146_097);
+        assert_eq!(civil_from_days(u64::MAX), (year + 400, month, day));
+        assert!((1..=12).contains(&month));
+        assert!((1..=31).contains(&day));
     }
 
     #[test]

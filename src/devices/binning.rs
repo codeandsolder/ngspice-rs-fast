@@ -11,7 +11,7 @@
 //! - Only an `M` instance is binned, and only when no model has the exact
 //!   referenced name. A candidate is a model named `<name>.<digits>` (at least
 //!   one digit, nothing else; `nch.01` matches `nch`, `nch.a` and `nch.` do not).
-//! - Only BSIM3 (`level` 8/49), BSIM4 (14/54), HiSIM2 (68) and HiSIM-HV (73)
+//! - Only BSIM3 (`level` 8/49), BSIM4 (14/54), `HiSIM2` (68) and HiSIM-HV (73)
 //!   `nmos`/`pmos`/`nsoi`/`psoi` cards are binnable; other candidates are
 //!   skipped, so level-1 `.N` cards never bin and C reports
 //!   "could not find a valid modelname".
@@ -45,7 +45,7 @@ use crate::devices::schema::finite_literal;
 pub const BIN_TOLERANCE: Real = 1e-9;
 
 /// MOS `level` selectors whose C model type `INPgetModBin` accepts:
-/// BSIM3 (8, 49), BSIM4 (14, 54), HiSIM2 (68) and HiSIM-HV (73).
+/// BSIM3 (8, 49), BSIM4 (14, 54), `HiSIM2` (68) and HiSIM-HV (73).
 pub const BINNABLE_MOS_LEVELS: [u8; 6] = [8, 49, 14, 54, 68, 73];
 
 /// How a model name relates to a reference (`misc/string.c::model_name_match`).
@@ -76,6 +76,8 @@ pub fn model_name_match(reference: &str, model_name: &str) -> Option<NameMatch> 
     }
 }
 
+/// Check whether a MOS model supports model binning.
+///
 /// Whether C would consider this card for binning: an `nmos`/`pmos`/`nsoi`/
 /// `psoi` card whose first `level` rounds (as `INPfindLev`) into
 /// [`BINNABLE_MOS_LEVELS`]. A missing level is 1. Version strings are not
@@ -86,10 +88,9 @@ pub fn is_binnable(card: &ModelCard) -> bool {
         .iter()
         .any(|base| card.base.eq_ignore_ascii_case(base));
     let level = card.level.unwrap_or(1.);
-    let rounded = (level + 0.5).floor();
-    mos && level.is_finite()
-        && (0.0..=99.0).contains(&rounded)
-        && BINNABLE_MOS_LEVELS.contains(&(rounded as u8))
+    mos && crate::primitives::c_integer(level)
+        .and_then(|rounded| u8::try_from(rounded).ok())
+        .is_some_and(|rounded| BINNABLE_MOS_LEVELS.contains(&rounded))
 }
 
 /// Front-end settings that `INPgetModBin` reads from the option table.
@@ -262,18 +263,19 @@ pub fn select_bin<'a>(
     instance: &DeviceInstance,
     options: &BinOptions,
 ) -> SpiceResult<BinOutcome<'a>> {
-    let binnable: Vec<&'a ModelCard> = candidates
+    let mut binnable = candidates
         .iter()
+        .rev()
         .copied()
         .filter(|card| is_binnable(card))
-        .collect();
-    if binnable.is_empty() {
+        .peekable();
+    if binnable.peek().is_none() {
         return Ok(BinOutcome::NoBinnableCandidate);
     }
     let Some(geometry) = BinGeometry::from_instance(instance, options)? else {
         return Ok(BinOutcome::MissingGeometry);
     };
-    for card in binnable.into_iter().rev() {
+    for card in binnable {
         if BinBounds::from_card(card)?.is_some_and(|bounds| bounds.contains(geometry)) {
             return Ok(BinOutcome::Selected(card));
         }
@@ -512,6 +514,29 @@ mod tests {
             ..options
         };
         assert!(BinGeometry::from_instance(&mos(&base), &bad_scale).is_err());
+    }
+
+    #[test]
+    fn selection_keeps_error_precedence_and_stops_at_first_matching_bin() {
+        let unsupported = card("n.1", "nmos", 1., &[]);
+        let malformed = bsim3("n.2", ("x", "2u"), ("0.5u", "5u"));
+        let good = bsim3("n.3", ("0.5u", "2u"), ("0.5u", "5u"));
+        let instance = mos(&[("l", "1u"), ("w", "1u")]);
+        let options = BinOptions::default();
+        let invalid_options = BinOptions {
+            scale: 0.,
+            ..options
+        };
+        assert_eq!(
+            select_bin(&[&unsupported], &instance, &invalid_options).unwrap(),
+            BinOutcome::NoBinnableCandidate
+        );
+        assert!(select_bin(&[&good], &instance, &invalid_options).is_err());
+        assert_eq!(
+            selected(select_bin(&[&malformed, &good, &unsupported], &instance, &options).unwrap()),
+            "n.3"
+        );
+        assert!(select_bin(&[&good, &malformed], &instance, &options).is_err());
     }
 
     #[test]

@@ -348,7 +348,7 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// parse_file -> write -> (written next to the original) parse_file.
+/// `parse_file` -> write -> (written next to the original) `parse_file`.
 fn file_round_trip(path: &Path) -> (String, Netlist, Netlist) {
     let parser = Parser::new();
     let first = parser
@@ -585,6 +585,27 @@ fn source_functions_pulse_count_and_pwl_options_round_trip() {
         .map(|p| p.name.as_str())
         .collect();
     assert_eq!(names, ["td", "pwl", "r"]);
+}
+
+#[test]
+fn waveform_maximum_field_count_round_trips() {
+    let mut deck = String::from("title\nv1 a 0 PwL(");
+    for i in 0..2048 {
+        if i != 0 {
+            deck.push(' ');
+        }
+        use std::fmt::Write as _;
+        write!(deck, "{i} 1m").unwrap();
+    }
+    deck.push_str(")\ni1 a 0 SiNe(0 1m 1k 0 0 90)\n.end\n");
+    let (written, _, parsed) = round_trip(&deck);
+    let ParameterKind::Waveform(SourceWaveform::Pwl(points)) =
+        &parsed.devices[0].parameters[0].kind
+    else {
+        panic!("PWL AST")
+    };
+    assert_eq!(points.len(), 2048);
+    assert!(written.contains("i1 a 0 sine(0 1m 1k 0 0 90)"));
 }
 
 #[test]

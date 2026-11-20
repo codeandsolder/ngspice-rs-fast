@@ -1,6 +1,19 @@
 //! `b4cvtest.c` (`BSIM4convTest`): the device convergence test, followed
 //! statement by statement over C's struct members.
-#![allow(non_snake_case)]
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::similar_names,
+    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)]
 use super::fields::{Instance, Model};
 use super::host::{mode, state};
 
@@ -12,8 +25,11 @@ fn max(a: f64, b: f64) -> f64 {
 /// `BSIM4convTest` for one instance: `true` when C would increment
 /// `CKTnoncon`. `rhs_old` is the new iterate C reads as `CKTrhsOld`,
 /// `state0` the last load's state vector, `mode` C's `CKTmode`.
-#[allow(clippy::too_many_lines)] // One C function, kept in C's shape.
-pub(crate) fn conv_test(
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)] // One C function, kept in C's shape.
+pub(super) fn conv_test(
     m: &Model,
     h: &Instance,
     rhs_old: &dyn Fn(i32) -> f64,

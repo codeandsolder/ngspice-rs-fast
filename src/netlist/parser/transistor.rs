@@ -179,7 +179,7 @@ fn parameters(input: &mut Input<'_>, designator: char) -> Result<Vec<ParameterAs
         alt((
             super::flags::instance,
             super::ic::vector,
-            scalar_assignment,
+            |input: &mut Input<'_>| scalar_assignment(input, designator),
             invalid_parameter,
         )),
     )
@@ -191,8 +191,7 @@ fn parameters(input: &mut Input<'_>, designator: char) -> Result<Vec<ParameterAs
     Ok(parameters)
 }
 
-fn scalar_assignment(input: &mut Input<'_>) -> Result<ParameterAssignment> {
-    let designator = input.state.card.designator().expect("Q/M card");
+fn scalar_assignment(input: &mut Input<'_>, designator: char) -> Result<ParameterAssignment> {
     let token = any
         .verify(move |token: &Token| {
             let key = token.text.to_ascii_lowercase();

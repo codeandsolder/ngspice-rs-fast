@@ -191,6 +191,10 @@ fn root_set(plot: &Plot, kind: &str) -> Vec<(String, ngspice_rs::primitives::Com
 /// (poles, zeros) under [`RootTolerance`]. The plot structure (name, flags,
 /// variable names, units and real flags) must match exactly, so the root
 /// counts must too. Returns a one-line summary.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "retain the existing separately rounded pole-zero acceptance bounds; changing rounding can change golden classifications at the boundary"
+)]
 pub(crate) fn roots(got: &Plot, want: &Plot, tolerance: RootTolerance) -> Result<String, String> {
     let got_columns = validate(got, "Rust")?;
     let want_columns = validate(want, "C")?;
@@ -345,6 +349,10 @@ pub(crate) fn check_structure(
 /// commands, titles and internal plot IDs are not numerical metadata.
 /// Axis identity is explicit in the fixture registry, not inferred from order.
 /// Complex components each satisfy `|got-want| <= relative*|want| + absolute`.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "retain the existing separately rounded component acceptance bounds; changing rounding can change golden classifications at the boundary"
+)]
 pub(crate) fn plots(
     got: &Plot,
     want: &Plot,
@@ -413,13 +421,12 @@ pub(crate) fn plots(
             }
         }
     }
-    match first {
-        Some(first) => Err(format!(
+    first.map_or(Ok(()), |first| {
+        Err(format!(
             "{mismatches} component mismatch(es)\nfirst: {first}\nworst ({worst_ratio:.6e}x bound): {}",
             worst.as_deref().unwrap_or(&first)
-        )),
-        None => Ok(()),
-    }
+        ))
+    })
 }
 
 #[cfg(test)]

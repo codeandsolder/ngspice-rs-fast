@@ -202,10 +202,12 @@ impl BBinaryOp {
     }
 }
 
+/// The XSPICE piecewise-linear code-model map for TABLE expressions.
+///
 /// The input-to-output map of the XSPICE `pwl` code model
 /// (`src/xspice/icm/analog/pwl/cfunc.mod`) with the parameters `inpcom.c`
 /// gives it for a `TABLE`: `fraction=TRUE limit=TRUE` and an
-/// `input_domain` of 0.1 (or 0.001 for the four-node LTspice form).
+/// `input_domain` of 0.1 (or 0.001 for the four-node `LTspice` form).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableTransfer {
     /// The input expression.
@@ -263,6 +265,8 @@ pub const BUILTIN_FUNCTIONS: &[&str] = &[
     "gauss",
 ];
 
+/// Statistical functions expanded by the ngspice netlist front end.
+///
 /// The statistical functions C replaces in B lines before parsing them
 /// (`src/frontend/inp.c` `eval_agauss()`, over the same set as
 /// `src/frontend/inpcom.c` `inp_fix_agauss_in_param()`). A user `.func` of
@@ -281,7 +285,7 @@ pub const SPECIAL_NAMES: &[&str] = &["time", "temper", "hertz", "pi", "e"];
 
 impl BExpr {
     /// Visits every node, parents before children.
-    pub fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a BExpr)) {
+    pub fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Self)) {
         visitor(self);
         match &self.kind {
             BExprKind::Number { .. }
@@ -321,7 +325,7 @@ impl BExpr {
     }
 
     /// Visits every node mutably, parents before children.
-    pub fn visit_mut(&mut self, visitor: &mut impl FnMut(&mut BExpr)) {
+    pub fn visit_mut(&mut self, visitor: &mut impl FnMut(&mut Self)) {
         visitor(self);
         match &mut self.kind {
             BExprKind::Number { .. }
@@ -389,6 +393,8 @@ impl BExpr {
     }
 }
 
+/// Replicate the numeric rounding of the C B-source literal rewriter.
+///
 /// Rounds a value to the 11 significant digits that `inp_modify_exp()`
 /// (`src/frontend/inpcom.c`) keeps when it re-prints a B-source literal with
 /// `%18.10e`, then reads the printed text back the way the B-source lexer

@@ -37,7 +37,40 @@
 //!   port's scalar schema: use the `nhfet`/`phfet` flag or the card base, which
 //!   C resolves the same way.
 
-use crate::devices::initial::{InstanceInitial, split};
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::similar_names,
+    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
+)]
+#![expect(
+    clippy::float_cmp,
+    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
+)]
+#![expect(
+    clippy::manual_midpoint,
+    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "a complete translated C numerical routine remains contiguous for equation parity review"
+)]
+#![expect(
+    clippy::many_single_char_names,
+    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
+)]
+#![expect(
+    clippy::imprecise_flops,
+    reason = "the original C floating-point algorithm and libm operation sequence must remain intact"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
+use super::{CELSIUS_TO_KELVIN, HFET_INSTANCE as INSTANCE, HfetInstance as Instance};
+use super::{NodeSetup, TemperatureCache, ask_hfet, set_hfet, stamp_reset};
+use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{self, BOLTZMANN, CHARGE, p};
 use crate::devices::limiting;
 use crate::devices::nonlinear::{JunctionPoint, junction_companion};
@@ -45,9 +78,8 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, ParameterScope, RecordPair, ResetStamp, ResetStamps,
-    SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter, SensitivityRecord,
-    StampAt, StampPart,
+    AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
     AnalysisMode, Device, DeviceState, IterationPhase, LinearContext, ModelContext, ResolvedModel,
@@ -55,14 +87,12 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
 
-/// `hfetsetup.c`'s `EPSI` default, C's spelling of the GaAs permittivity.
+/// `hfetsetup.c`'s `EPSI` default, C's spelling of the `GaAs` permittivity.
 const EPSILON_GAAS: Real = 12.244 * 8.854_18e-12;
 /// C `CONSTKoverQ`.
 const K_OVER_Q: Real = BOLTZMANN / CHARGE;
-/// C `CONSTCtoK`.
-const CELSIUS_TO_KELVIN: Real = 273.15;
 /// `hfeta`'s carrier-density cutoff (`nsm < 1.0e-38` turns the channel off).
 const N_MIN: Real = 1e-38;
 
@@ -169,18 +199,6 @@ const MODEL: &[P] = &[
     p("kvto", U::Dimensionless, D::Finite, Some(0.)),
     p("level", U::Dimensionless, D::Finite, Some(5.)),
 ];
-
-/// `HFETApTable`'s scalar instance setters (`hfetparam.c`).
-const INSTANCE: &[P] = &[
-    p("l", U::Metre, D::Positive, Some(1e-6)),
-    p("w", U::Metre, D::Positive, Some(20e-6)),
-    p("m", U::Dimensionless, D::Positive, Some(1.)),
-    p("temp", U::Celsius, D::Temperature, None),
-    p("dtemp", U::Dimensionless, D::Finite, Some(0.)),
-];
-
-/// The `IC` vector components (`hfetparam.c`): `ICVDS`, then `ICVGS`.
-pub(super) const IC_COMPONENTS: [&str; 2] = ["icvds", "icvgs"];
 
 /// The validated model card.
 #[derive(Debug, Clone, Copy)]
@@ -374,51 +392,6 @@ impl Model {
     }
 }
 
-/// Validated instance setters (`hfetparam.c`).
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Instance {
-    pub(super) l: Real,
-    pub(super) w: Real,
-    pub(super) m: Real,
-    /// Celsius as written (`hfetparam.c` adds 273.15); `None` is
-    /// `CKTtemp + dtemp`, used as kelvin.
-    pub(super) temp: Option<Real>,
-    pub(super) dtemp: Real,
-}
-
-impl Instance {
-    pub(super) fn resolve(
-        i: &DeviceInstance,
-    ) -> SpiceResult<(
-        InstanceInitial,
-        Vec<crate::netlist::ast::ParameterAssignment>,
-    )> {
-        split(&i.parameters, &IC_COMPONENTS)
-    }
-
-    pub(super) fn validate(
-        defaults: &[&crate::netlist::ast::ParameterAssignment],
-        setters: &[crate::netlist::ast::ParameterAssignment],
-        owner: &crate::primitives::SourceLoc,
-    ) -> SpiceResult<Self> {
-        let values = crate::devices::schema::with_defaults(
-            &ScalarSchema {
-                parameters: INSTANCE,
-            },
-            defaults,
-            setters.iter(),
-            owner,
-        )?;
-        Ok(Self {
-            l: jfet::required(&values, "l")?,
-            w: jfet::required(&values, "w")?,
-            m: jfet::required(&values, "m")?,
-            temp: values.get("temp").map(|v| v.value),
-            dtemp: jfet::required(&values, "dtemp")?,
-        })
-    }
-}
-
 /// `hfettemp.c`'s per-instance quantities.
 #[derive(Debug, Clone, Copy)]
 struct Derived {
@@ -486,7 +459,7 @@ struct Nodes {
 
 /// HFET1, `Z` level 5.
 #[derive(Debug, Clone)]
-pub(crate) struct Hfet1 {
+pub(in crate::devices) struct Hfet1 {
     name: String,
     model_name: String,
     terminals: Vec<NodeId>,
@@ -494,6 +467,7 @@ pub(crate) struct Hfet1 {
     model: Model,
     instance: Instance,
     initial: InstanceInitial,
+    temperature_cache: TemperatureCache<Derived, 1>,
 }
 
 impl Hfet1 {
@@ -518,51 +492,26 @@ impl Hfet1 {
         let (model, model_defaults) = Model::resolve(resolved)?;
         let (initial, setters) = Instance::resolve(i)?;
         let instance = Instance::validate(&model_defaults, &setters, &i.location)?;
-        let mut staged = nodes.clone();
-        let external: Vec<NodeId> = i.nodes.iter().map(|n| staged.intern(n)).collect();
-        let mut terminals = external.clone();
-        let mut nodes_of = Nodes {
-            d: external[0],
-            g: external[1],
-            s: external[2],
-            sp: external[2],
-            dp: external[0],
-            gp: external[1],
-            spp: external[2],
-            dpp: external[0],
+        let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "HFET1")?;
+        // C creates source and drain primes in this order.
+        // Gate and prime-prime nodes follow, aliasing the corresponding prime
+        // when RG, RI or RF is zero. RDI/RSI do not create nodes.
+        let sp = topology.prime(model.rs, "source", s)?;
+        let dp = topology.prime(model.rd, "drain", d)?;
+        let gp = topology.prime(model.rg, "gate", g)?;
+        let spp = topology.prime(model.ri, "gs", sp)?;
+        let dpp = topology.prime(model.rf, "gd", dp)?;
+        let nodes_of = Nodes {
+            d,
+            g,
+            s,
+            sp,
+            dp,
+            gp,
+            spp,
+            dpp,
         };
-        // `hfetsetup.c` creates `#source` for RS, `#drain` for RD, `#gate` for
-        // RG, `#gs` for RI and `#gd` for RF, in that order, and falls back to
-        // the unfurled node when a resistance is zero.
-        let mut create = |resistance: Real, suffix: &str, target: &mut NodeId| -> SpiceResult<()> {
-            if resistance == 0. {
-                return Ok(());
-            }
-            let name = format!("{}#{suffix}", i.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "{}: HFET1 internal-node name collision: {name}",
-                    i.name
-                )));
-            }
-            let internal = staged.intern(&name);
-            staged.set_kind(internal, NodeKind::Internal);
-            terminals.push(internal);
-            *target = internal;
-            Ok(())
-        };
-        create(model.rs, "source", &mut nodes_of.sp)?;
-        create(model.rd, "drain", &mut nodes_of.dp)?;
-        create(model.rg, "gate", &mut nodes_of.gp)?;
-        create(model.ri, "gs", &mut nodes_of.spp)?;
-        if model.ri == 0. {
-            nodes_of.spp = nodes_of.sp;
-        }
-        create(model.rf, "gd", &mut nodes_of.dpp)?;
-        if model.rf == 0. {
-            nodes_of.dpp = nodes_of.dp;
-        }
-        *nodes = staged;
+        let (staged, terminals) = topology.finish();
         let device = Self {
             name: i.name.clone(),
             model_name: resolved.card().name.clone(),
@@ -571,20 +520,24 @@ impl Hfet1 {
             model,
             instance,
             initial,
+            temperature_cache: TemperatureCache::new(),
         };
         device.derived(context.temperature)?;
+        *nodes = staged;
         Ok(Box::new(device))
     }
 
     /// `hfettemp.c`. `temperature` is Celsius (`CKTtemp`), while `TEMP` is
     /// kelvin.
     fn derived(&self, temperature: Real) -> SpiceResult<Derived> {
+        self.temperature_cache
+            .get_or_compute([temperature], || self.compute_derived(temperature))
+    }
+
+    fn compute_derived(&self, temperature: Real) -> SpiceResult<Derived> {
         let model = &self.model;
         let instance = &self.instance;
-        let temp = match instance.temp {
-            Some(v) => v + CELSIUS_TO_KELVIN,
-            None => temperature + CELSIUS_TO_KELVIN + instance.dtemp,
-        };
+        let temp = self.instance.temperature(temperature);
         let nominal = temperature + CELSIUS_TO_KELVIN;
         let delta = temp - nominal;
         // `hfettemp.c` multiplied the stored threshold by the type before
@@ -690,7 +643,10 @@ impl Hfet1 {
 
     /// `hfetload.c`'s `leak()`: the two-exponential gate junction, with a
     /// series resistance when one is given.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )]
     fn leak(
         gmin: Real,
         vt: Real,
@@ -717,10 +673,10 @@ impl Hfet1 {
                     iseff * ((v / vteff).exp() - 1.),
                 )
             };
-            let iaprox = if iaprox1 * iaprox2 != 0. {
-                1. / (1. / iaprox1 + 1. / iaprox2)
-            } else {
+            let iaprox = if iaprox1 * iaprox2 == 0. {
                 0.5 * (iaprox1 + iaprox2)
+            } else {
+                1. / (1. / iaprox1 + 1. / iaprox2)
             };
             let dvdi0 = rs + vt1 / (iaprox + is1) + vt2 / (iaprox + is2);
             let mut v0 = rs * iaprox;
@@ -736,7 +692,10 @@ impl Hfet1 {
     /// `hfeta()`: the channel, the gate currents and the `gatemod` cross
     /// terms. `vgs` is C's `vds > 0 ? vgs : vgd` argument (see the module
     /// docs); `vds` is the normalized (nonnegative) drain-source voltage.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )]
     fn hfeta(
         &self,
         derived: &Derived,
@@ -900,7 +859,10 @@ impl Hfet1 {
     /// `hfeta`'s `cgd_calc` block: with `gatemod != 0` the gate-drain and
     /// gate-source currents replace the caller's, and the `gmg`/`gmd` cross
     /// conductances exist; with `gatemod == 0` C leaves them at zero.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )]
     fn gatemod_terms(
         &self,
         derived: &Derived,
@@ -1239,14 +1201,6 @@ impl Hfet1 {
             gmd: channel.gmd,
         })
     }
-
-    /// The total instance temperature in kelvin, `hfettemp.c`'s rule for asks.
-    fn temperature(&self, temperature: Real) -> Real {
-        match self.instance.temp {
-            Some(v) => v + CELSIUS_TO_KELVIN,
-            None => temperature + CELSIUS_TO_KELVIN + self.instance.dtemp,
-        }
-    }
 }
 
 impl Device for Hfet1 {
@@ -1300,7 +1254,7 @@ impl Device for Hfet1 {
             "m" => Some(self.instance.m),
             "icvds" => self.initial.values[0],
             "icvgs" => self.initial.values[1],
-            "temp" => Some(self.temperature(context.temperature) - CELSIUS_TO_KELVIN),
+            "temp" => Some(self.instance.temperature(context.temperature) - CELSIUS_TO_KELVIN),
             "dtemp" => Some(self.instance.dtemp),
             _ => None,
         })
@@ -1360,9 +1314,7 @@ impl Device for Hfet1 {
         }))
     }
     fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
-        ["l", "w", "m", "temp", "dtemp"]
-            .into_iter()
-            .find(|name| name.eq_ignore_ascii_case(keyword))
+        Instance::sweep_parameter(keyword)
     }
     /// `HFETAparam` with the instance schema's domains: a swept temperature is
     /// re-derived by the next load.
@@ -1370,46 +1322,9 @@ impl Device for Hfet1 {
         &self,
         parameter: &str,
         value: Real,
-        _context: &ModelContext,
+        context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        let check = |ok: bool, what: &str| -> SpiceResult<()> {
-            if ok {
-                Ok(())
-            } else {
-                Err(SpiceError::circuit(format!(
-                    "{}: HFET1 {} must be {what}, got {value}",
-                    self.name, parameter
-                )))
-            }
-        };
-        let mut instance = self.instance;
-        let mut initial = self.initial.clone();
-        match parameter {
-            "l" | "w" | "m" => {
-                check(value > 0., "positive")?;
-                match parameter {
-                    "l" => instance.l = value,
-                    "w" => instance.w = value,
-                    _ => instance.m = value,
-                }
-            }
-            "temp" => {
-                check(value.is_finite(), "finite")?;
-                instance.temp = Some(value);
-            }
-            "dtemp" => {
-                check(value.is_finite(), "finite")?;
-                instance.dtemp = value;
-            }
-            _ => {
-                // `off`, `icvds` and `icvgs` are the initial-condition setters.
-                let _ = &mut initial;
-                return Err(SpiceError::circuit(format!(
-                    "{}: HFET1 cannot sweep {parameter}",
-                    self.name
-                )));
-            }
-        }
+        let instance = self.instance.swept(&self.name, parameter, value)?;
         let device = Self {
             name: self.name.clone(),
             model_name: self.model_name.clone(),
@@ -1417,9 +1332,10 @@ impl Device for Hfet1 {
             nodes: self.nodes,
             model: self.model,
             instance,
-            initial,
+            initial: self.initial.clone(),
+            temperature_cache: TemperatureCache::new(),
         };
-        device.derived(_context.temperature)?;
+        device.derived(context.temperature)?;
         Ok(Box::new(device))
     }
 
@@ -1600,8 +1516,8 @@ impl Device for Hfet1 {
             }
         }
         point = Point {
-            cg,
             cd,
+            cg,
             gds,
             ..point
         };
@@ -1966,7 +1882,7 @@ impl DeviceSensitivity for Hfet1Sensitivity<'_> {
     }
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
-        let (m, i) = (&self.device.model, &self.device.instance);
+        let m = &self.device.model;
         let pol = m.pol;
         let mut model = SensitivityRecord::new();
         for (keyword, value, given) in [
@@ -2043,32 +1959,10 @@ impl DeviceSensitivity for Hfet1Sensitivity<'_> {
         ] {
             model = model.with(keyword, value, given);
         }
-        let mut instance = SensitivityRecord::new();
-        for (keyword, value, given) in [
-            ("l", i.l, true),
-            ("w", i.w, true),
-            ("m", i.m, true),
-            (
-                "icvds",
-                self.device.initial.values[0].unwrap_or(0.),
-                self.device.initial.values[0].is_some(),
-            ),
-            (
-                "icvgs",
-                self.device.initial.values[1].unwrap_or(0.),
-                self.device.initial.values[1].is_some(),
-            ),
-            // `hfetparam.c` stores `temp` in kelvin.
-            (
-                "temp",
-                i.temp
-                    .map_or(self.circuit_kelvin + i.dtemp, |c| c + CELSIUS_TO_KELVIN),
-                i.temp.is_some(),
-            ),
-            ("dtemp", i.dtemp, true),
-        ] {
-            instance = instance.with(keyword, value, given);
-        }
+        let mut instance = self
+            .device
+            .instance
+            .sensitivity_record(&self.device.initial, self.circuit_kelvin);
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
         Ok((model, instance))
@@ -2080,17 +1974,7 @@ impl DeviceSensitivity for Hfet1Sensitivity<'_> {
         keyword: &str,
         records: RecordPair<'_>,
     ) -> SpiceResult<Real> {
-        // `hfetask.c` answers the instance temperature in Celsius while
-        // `hfetparam.c` stores it in kelvin, so `.sens` perturbs the Celsius
-        // value by a relative step and then adds 273.15 before storing it.
-        // Modelling only the kelvin field would perturb across 273 K instead.
-        if scope == ParameterScope::Instance && keyword == "temp" {
-            return Ok(records.instance.value("temp")? - CELSIUS_TO_KELVIN);
-        }
-        match scope {
-            ParameterScope::Model => records.model.value(keyword),
-            ParameterScope::Instance => records.instance.value(keyword),
-        }
+        ask_hfet(scope, keyword, records)
     }
 
     fn set(
@@ -2101,15 +1985,11 @@ impl DeviceSensitivity for Hfet1Sensitivity<'_> {
         model: &mut SensitivityRecord,
         instance: &mut SensitivityRecord,
     ) -> SpiceResult<()> {
-        match (scope, keyword) {
-            // `hfetmpar.c` stores `tf` as `value + CONSTCtoK`, and
-            // `hfetparam.c` does the same for the instance `temp`; the walk's
-            // restore adds the offset again, as in C.
-            (ParameterScope::Model, "tf") => model.set(keyword, value + CELSIUS_TO_KELVIN),
-            (ParameterScope::Instance, "temp") => instance.set(keyword, value + CELSIUS_TO_KELVIN),
-            (ParameterScope::Model, _) => model.set(keyword, value),
-            (ParameterScope::Instance, _) => instance.set(keyword, value),
+        // HFET1's model TF setter also reapplies the C-to-K offset.
+        if scope == ParameterScope::Model && keyword == "tf" {
+            return model.set(keyword, value + CELSIUS_TO_KELVIN);
         }
+        set_hfet(scope, keyword, value, model, instance)
     }
 
     /// `hfetsetup.c`: `tf` defaults to `CKTtemp` and the instance temperature to
@@ -2193,17 +2073,9 @@ impl DeviceSensitivity for Hfet1Sensitivity<'_> {
 
 impl Hfet1Sensitivity<'_> {
     /// The port's HFET1 with the records' parameters.
-    #[allow(clippy::too_many_lines)]
     fn hfet1(&self, current: RecordPair<'_>) -> SpiceResult<Hfet1> {
         let (m, i) = (current.model, current.instance);
         let r = |keyword: &str| m.value(keyword);
-        let v = |keyword: &str| i.value(keyword);
-        let kevlin = |keyword: &str| -> SpiceResult<Option<Real>> {
-            Ok(i.given(keyword)
-                .then(|| i.value(keyword))
-                .transpose()?
-                .map(|kelvin| kelvin - CELSIUS_TO_KELVIN))
-        };
         let model = Model {
             pol: self.device.model.pol,
             threshold: r("vt0")?,
@@ -2273,13 +2145,7 @@ impl Hfet1Sensitivity<'_> {
             kmu: r("kmu")?,
             kvto: r("kvto")?,
         };
-        let instance = Instance {
-            l: v("l")?,
-            w: v("w")?,
-            m: v("m")?,
-            temp: kevlin("temp")?,
-            dtemp: v("dtemp")?,
-        };
+        let instance = Instance::from_record(i)?;
         Ok(Hfet1 {
             name: self.device.name.clone(),
             model_name: self.device.model_name.clone(),
@@ -2288,6 +2154,7 @@ impl Hfet1Sensitivity<'_> {
             model,
             instance,
             initial: self.device.initial.clone(),
+            temperature_cache: TemperatureCache::new(),
         })
     }
 }
@@ -2404,20 +2271,6 @@ impl Device for ResetHfet1 {
             (n.dp, n.sp, -(m * xds)),
             (n.sp, n.dp, -(m * xds)),
         ];
-        let stamps = real
-            .into_iter()
-            .map(|(a, b, value)| (a, b, value, StampPart::Real))
-            .chain(
-                imaginary
-                    .into_iter()
-                    .map(|(a, b, value)| (a, b, value, StampPart::Imaginary)),
-            )
-            .map(|(a, b, value, part)| ResetStamp {
-                at: StampAt::Nodes(a, b),
-                value,
-                part,
-            })
-            .collect();
-        ResetStamps::new(&current.name, 'z', &current.terminals, stamps)?.assemble_linear(context)
+        stamp_reset(&current.name, context, &real, &imaginary)
     }
 }

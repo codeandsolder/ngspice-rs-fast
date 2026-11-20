@@ -163,8 +163,8 @@ fn dependent_defaults_follow_the_given_values_they_reference() {
 #[test]
 fn oxide_capacitance_and_overlap_defaults_match_the_setup_formulas() {
     const EPS_OX: f64 = 3.453_133e-11;
-    #[allow(clippy::approx_constant)] // b3set.c's intentionally rounded PI
-    const PI: f64 = 3.141_592_654;
+    // Model setup intentionally uses b3set.c's rounded PI.
+    const PI: f64 = f64::from_bits(0x4009_21fb_5452_4550);
     let m = model("tox=10n xj=0.15u dlc=10n cgdl=1e-12 cgsl=2e-12", "nmos");
     let cox = EPS_OX / 10e-9;
     close(m.oxide_capacitance, cox);

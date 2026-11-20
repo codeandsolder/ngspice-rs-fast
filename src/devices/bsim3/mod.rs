@@ -1,12 +1,10 @@
-//! BSIM3v3.3 input plumbing (B3-0 foundation, #90).
+//! BSIM3v3.3 device backend and validated parameter interface.
 //!
-//! This is deliberately **not a simulation backend**. The generated IFparm
-//! interface facts cover the complete model/instance tables; the validated
-//! projection applies ordered explicit setters and preserves provenance, and
-//! [`defaults`], [`temperature`] and [`setup`] reproduce `b3set.c`/`b3temp.c`
-//! defaults and `b3check.c` diagnostics, including effective geometry. Every
-//! factory call still returns `NotYetPorted` after validation, before interning
-//! nodes, allocating states or loading DC/AC/charge terms.
+//! Generated `IFparm` facts describe model and instance setters. The input
+//! projection retains ordered setters and provenance; defaults, temperature
+//! and setup implement model checks and effective geometry before device
+//! loading. DC, charge, small-signal and noise equations use the prepared
+//! instance, with explicit errors for unsupported combinations.
 
 use crate::devices::ifparam::{Device, descriptor, version_text};
 use crate::devices::models::{ModelFamily, ResolvedModel};
@@ -19,7 +17,7 @@ pub use crate::devices::ifparam::{
 };
 
 /// The BSIM3v3.3 interface descriptor the shared input plumbing uses.
-pub(crate) const DEVICE: Device = Device {
+pub(in crate::devices) const DEVICE: Device = Device {
     reference: "bsim3/b3.c",
     model: parameters::MODEL,
     instance: parameters::INSTANCE,
@@ -30,11 +28,11 @@ pub(crate) const DEVICE: Device = Device {
 
 /// C's `IF_UNINTERESTING` rows, as `TABLE:keyword` pairs.
 #[must_use]
-pub fn uninteresting() -> &'static [&'static str] {
+pub const fn uninteresting() -> &'static [&'static str] {
     DEVICE.uninteresting
 }
 
-/// `b3mpar.c`: TNOM adds CONSTCtoK; NPEAK/NGATE and their L/W/P
+/// `b3mpar.c`: TNOM adds `CONSTCtoK`; NPEAK/NGATE and their L/W/P
 /// coefficients use distinct thresholds before a cm^-3 conversion.
 fn bsim3_model_real(p: &Parameter, value: Real, location: &SourceLoc) -> SpiceResult<Real> {
     let threshold = match p.c_field {
@@ -55,26 +53,38 @@ fn bsim3_model_real(p: &Parameter, value: Real, location: &SourceLoc) -> SpiceRe
 }
 
 /// DC channel and junction evaluation from `b3ld.c`.
+///
+/// The module retains the native charge and junction-capacitance equations.
 pub mod charges;
 pub mod dc;
-/// Model-only setup defaults and diagnostics, before geometry/temperature setup.
+/// Model-only setup defaults.
+///
+/// Diagnostics precede geometry and temperature setup.
 pub mod defaults;
 mod defaults_data;
 /// The device: `b3ld.c`'s DC load wired into the solver.
 pub mod device;
 /// BSIM3v3.3 noise generators from `b3noi.c`.
 pub mod noise;
-/// Generated IFparm order, identifiers and setter/given-field mappings.
+/// Generated `IFparm` order, identifiers and setter/given-field mappings.
 pub mod parameters;
-/// Effective geometry, size-dependent parameters and `b3check.c` diagnostics.
+/// Effective geometry and size-dependent parameters.
+///
+/// Includes `b3check.c` diagnostics.
+///
+/// The module validates setup without allocating state or matrix rows.
 pub mod setup;
 mod size_data;
-/// Model-level temperature processing from `b3temp.c`.
 pub mod temperature;
 
-/// Select the BSIM3 directory from the **first** VERSION token, as
-/// `inpdomod.c`/`INPfindVer` do. The eventual string setter still has last-set
-/// precedence. Only the 3.3 family is being ported; no older model is substituted.
+/// Select the BSIM3 version.
+///
+/// Selection uses the first `VERSION` token.
+///
+/// Directory selection follows `inpdomod.c`/`INPfindVer`. The eventual
+/// string setter uses last-set precedence.
+///
+/// Only the 3.3 family is supported; no older model is substituted.
 ///
 /// # Errors
 /// Unsupported versions, or nonliteral version input.

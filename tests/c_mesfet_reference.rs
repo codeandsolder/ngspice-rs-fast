@@ -27,6 +27,9 @@ use std::process::Command;
 use ngspice_rs::analysis::{Plot, RawFile};
 use ngspice_rs::cli::simulate;
 
+#[path = "support/c_parameter_sweep.rs"]
+mod c_parameter_sweep;
+
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {
@@ -93,7 +96,8 @@ fn same(ours: &Plot, c: &Plot, relative: f64, absolute: f64) {
     assert_eq!(ours.points.len(), c.points.len());
     for (i, variable) in ours.variables.iter().enumerate() {
         let name = variable.name.as_str();
-        if name.contains('#') || name.starts_with("sweep") {
+        // Fresh C operating points have no synthetic Rust .dc parameter axis.
+        if name.contains('#') || name.starts_with("sweep") || name == "v(param-sweep)" {
             continue;
         }
         let candidates = [
@@ -144,15 +148,15 @@ fn saved_mesfet_asks_match_c() {
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN; runs a temporary C deck out of process"]
 fn instance_parameter_sweeps_match_c() {
-    let (ours, c) = both(
+    let (ours, c) = c_parameter_sweep::nested(
         "sweep",
         "mesfet instance sweep\n\
          vd d 0 3\nvg g 0 -0.7\nrl d dd 500\nz1 dd g 0 zm\n\
          .model zm nmf(vto=-2 beta=1m lambda=0.02 rs=20 is=1e-13)\n\
          .options reltol=1e-7 vntol=1e-12 abstol=1e-15\n\
          .dc @z1[area] 0.5 2 0.5 @z1[m] 1 3 1\n",
-        None,
-        "DC transfer characteristic",
+        ("@z1[area]", &[0.5, 1.0, 1.5, 2.0]),
+        ("@z1[m]", &[1.0, 2.0, 3.0]),
     );
     same(&ours, &c, 1e-6, 1e-14);
 }

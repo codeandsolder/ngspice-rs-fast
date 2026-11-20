@@ -40,14 +40,31 @@
 //!   the model records in `sens`, including the scaled DELTA ask/raw setter
 //!   mismatch and zero columns for the three table-only model setters.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::manual_midpoint,
+    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
+)]
+#![expect(
+    clippy::imprecise_flops,
+    reason = "the original C floating-point algorithm and libm operation sequence must remain intact"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 mod sens;
 
+use crate::devices::mos::bulk::{BulkJunctions, BulkLaw};
+use crate::devices::mos::surface::{Surface, SurfaceCard, SurfaceLaw};
 use crate::devices::mos::{
-    CELSIUS_TO_KELVIN, CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, Junction, K_OVER_Q,
-    MosLevel, Mosfet, NoiseShape, Operating, REFTEMP, ReverseLaw, aliased, band_gap, p,
-    potential_factor, required,
+    CELSIUS_TO_KELVIN, CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, MosLevel, Mosfet,
+    NoiseShape, Operating, aliased, p, required,
 };
 use crate::devices::noise::NoiseFamily;
+use crate::devices::nonlinear::thermal::SiliconTemperature;
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -122,19 +139,14 @@ pub(super) const MODEL_WITHOUT_NOISE_SELECTORS: &[P] = MODEL.split_at(MODEL.len(
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Level3 {
     common: Common,
-    vto: Option<Real>,
+    surface: SurfaceCard,
     kp: Option<Real>,
-    gamma: Option<Real>,
-    phi: Option<Real>,
     tox: Real,
     xl: Real,
     wd: Real,
     xw: Real,
     delvto: Real,
     u0: Option<Real>,
-    nsub: Option<Real>,
-    tpg: Option<Real>,
-    nss: Option<Real>,
     vmax: Real,
     xj: Real,
     nfs: Real,
@@ -147,12 +159,11 @@ pub(super) struct Level3 {
 /// Process-derived model values (`mos3temp.c`, model loop).
 #[derive(Debug, Clone, Copy)]
 struct Process {
+    surface: Surface,
     cox: Real,
     kp: Real,
     u0: Real,
-    phi: Real,
-    gamma: Real,
-    vto: Real,
+
     /// C `MOS3alpha` and `MOS3coeffDepLayWidth` (zero without NSUB).
     alpha: Real,
     depletion: Real,
@@ -203,19 +214,14 @@ impl Level3 {
         let noise_file = format!("{}noi.c", label.to_ascii_lowercase());
         Ok(Self {
             common: Common::from_values(m, resolved.family(), get("tpg"), label, &noise_file)?,
-            vto: aliased(m, ["vto", "vt0"]),
+            surface: SurfaceCard::from_values(m),
             kp: get("kp"),
-            gamma: get("gamma"),
-            phi: get("phi"),
             tox: required("tox")?,
             xl: required("xl")?,
             wd: required("wd")?,
             xw: required("xw")?,
             delvto: aliased(m, ["delvto", "delvt0"]).unwrap_or(0.),
             u0: aliased(m, ["u0", "uo"]),
-            nsub: get("nsub"),
-            tpg: get("tpg"),
-            nss: get("nss"),
             vmax: required("vmax")?,
             xj: required("xj")?,
             nfs: required("nfs")?,
@@ -249,76 +255,24 @@ impl Level3 {
             )));
         }
         let process = self.process(tnom, label)?;
-        let vt = temp * K_OVER_Q;
-        let vtnom = tnom * K_OVER_Q;
-        let (egfet, egfet1) = (band_gap(temp), band_gap(tnom));
-        let (fact1, fact2) = (tnom / REFTEMP, temp / REFTEMP);
-        let (pbfact, pbfact1) = (potential_factor(temp), potential_factor(tnom));
+        let nominal = SiliconTemperature::new(tnom);
+        let actual = SiliconTemperature::new(temp);
+        let vt = actual.vt;
         let ratio = temp / tnom;
         let ratio4 = ratio * ratio.sqrt();
         let kp = process.kp / ratio4;
         let mobility = process.u0 / ratio4;
-        let phio = (process.phi - pbfact1) / fact1;
-        let phi = fact2 * phio + pbfact;
-        let vbi = self.delvto + process.vto - model.pol * (process.gamma * process.phi.sqrt())
-            + 0.5 * (egfet1 - egfet)
-            + model.pol * 0.5 * (phi - process.phi);
-        let vto = vbi + model.pol * process.gamma * phi.sqrt();
-        let scale = (-egfet / vt + egfet1 / vtnom).exp();
-        let (saturation, density) = (model.is * scale, model.js * scale);
-        let pbo = (model.pb - pbfact1) / fact1;
-        let gmaold = (model.pb - pbo) / pbo;
-        let potential = fact2 * pbo + pbfact;
-        let gmanew = (potential - pbo) / pbo;
-        // mos3temp.c: divide out the nominal-temperature factor, then
-        // multiply by the device-temperature one, as two steps.
-        let nominal = |grading: Real| 1. / (1. + grading * (4e-4 * (tnom - REFTEMP) - gmaold));
-        let actual = |grading: Real| 1. + grading * (4e-4 * (temp - REFTEMP) - gmanew);
-        let (bottom, side) = (
-            [nominal(model.mj), actual(model.mj)],
-            [nominal(model.mjsw), actual(model.mjsw)],
-        );
+        let (phi, vbi, vto) =
+            process
+                .surface
+                .at_temperature(&nominal, &actual, model.pol, Some(self.delvto));
+        let BulkJunctions {
+            drain,
+            source,
+            factors,
+        } = BulkLaw::Mos3.junctions(model, geometry, &nominal, &actual);
         let m = geometry.m;
         let (length, width) = self.effective(geometry);
-        // MOS3tCbd/MOS3tCbs/MOS3tCj and MOS3tCjsw; mos3temp.c multiplies
-        // `tCj * area * m` (mos1temp.c: `tCj * m * area`).
-        let scaled = |c: Real, factor: [Real; 2]| c * factor[0] * factor[1];
-        let bottom_cap = |given: Option<Real>, area: Real| match (given, model.cj) {
-            (Some(c), _) => scaled(c, bottom) * m,
-            (None, Some(cj)) => scaled(cj, bottom) * area * m,
-            (None, None) => 0.,
-        };
-        let side_cap = |perimeter: Real| model.cjsw.map_or(0., |c| scaled(c, side) * perimeter * m);
-        let root2 = std::f64::consts::SQRT_2;
-        // mos3temp.c tests the model's JS for the critical voltages,
-        // mos3load.c the scaled density for the saturation currents.
-        let (vcrit_d, vcrit_s) = if model.js == 0. || geometry.ad == 0. || geometry.as_ == 0. {
-            let vcrit = vt * (vt / (root2 * m * saturation)).ln();
-            (vcrit, vcrit)
-        } else {
-            (
-                vt * (vt / (root2 * m * density * geometry.ad)).ln(),
-                vt * (vt / (root2 * m * density * geometry.as_)).ln(),
-            )
-        };
-        let (sat_d, sat_s) = if density == 0. || geometry.ad == 0. || geometry.as_ == 0. {
-            (m * saturation, m * saturation)
-        } else {
-            (m * density * geometry.ad, m * density * geometry.as_)
-        };
-        let junction = |saturation, vcrit, bottom, sidewall| {
-            Junction::new(
-                saturation,
-                vcrit,
-                bottom,
-                sidewall,
-                model.mj,
-                model.mjsw,
-                potential,
-                model.fc,
-                ReverseLaw::Cubic,
-            )
-        };
         let oxide = process.cox * length * m * width;
         let csonco = if self.nfs == 0. {
             0.
@@ -331,20 +285,10 @@ impl Level3 {
             vbi,
             phi,
             vto,
-            gamma: process.gamma,
+            gamma: process.surface.gamma,
             oxide,
-            drain: junction(
-                sat_d,
-                vcrit_d,
-                bottom_cap(model.cbd, geometry.ad),
-                side_cap(geometry.pd),
-            ),
-            source: junction(
-                sat_s,
-                vcrit_s,
-                bottom_cap(model.cbs, geometry.as_),
-                side_cap(geometry.ps),
-            ),
+            drain,
+            source,
             overlap: [
                 model.overlap[0] * m * width,
                 model.overlap[1] * m * width,
@@ -368,7 +312,7 @@ impl Level3 {
             label,
             temp,
             &[p.mobility, p.eta, p.narrow, p.alpha, p.depletion, p.csonco],
-            &[bottom[0], bottom[1], side[0], side[1]],
+            &factors,
         )?;
         if p.mobility <= 0. {
             return Err(SpiceError::circuit(format!(
@@ -381,57 +325,24 @@ impl Level3 {
     /// `mos3temp.c`'s model loop, in C's arithmetic, under `label`
     /// (`mos9temp.c` is `mos3temp.c`).
     fn process(&self, tnom: Real, label: &str) -> SpiceResult<Process> {
-        let pol = self.common.pol;
-        let vtnom = tnom * K_OVER_Q;
-        let egfet1 = band_gap(tnom);
-        let nifact = (tnom / 300.) * (tnom / 300.).sqrt();
-        let nifact = nifact * (0.5 * egfet1 * ((1. / 300.) - (1. / tnom)) / K_OVER_Q).exp();
-        let intrinsic = 1.45e16 * nifact;
         let cox = 3.9 * EPSILON_0 / self.tox;
         let u0 = self.u0.unwrap_or(600.);
-        let mut process = Process {
+        let surface = self
+            .surface
+            .derive(SurfaceLaw::Mos3, label, tnom, self.common.pol, cox)?;
+        let alpha = self
+            .surface
+            .nsub
+            .map_or(0., |nsub| (EPSILON_SI + EPSILON_SI) / (CHARGE * nsub * 1e6));
+        Ok(Process {
             cox,
             kp: self.kp.unwrap_or(u0 * cox * 1e-4),
             u0,
-            phi: self.phi.unwrap_or(0.6),
-            gamma: self.gamma.unwrap_or(0.),
-            vto: self.vto.unwrap_or(0.),
-            alpha: 0.,
-            depletion: 0.,
-            narrow: 0.,
-        };
-        if let Some(nsub) = self.nsub {
-            if nsub * 1e6 <= intrinsic {
-                return Err(SpiceError::circuit(format!(
-                    "{label} NSUB={nsub} is below the intrinsic density ({}temp.c: Nsub < Ni)",
-                    label.to_ascii_lowercase()
-                )));
-            }
-            if self.phi.is_none() {
-                process.phi = (2. * vtnom * (nsub * 1e6 / intrinsic).ln()).max(0.1);
-            }
-            let fermis = pol * 0.5 * process.phi;
-            let tpg = self.tpg.unwrap_or(1.);
-            let wkfng = if tpg == 0. {
-                3.2
-            } else {
-                let fermig = pol * tpg * 0.5 * egfet1;
-                3.25 + 0.5 * egfet1 - fermig
-            };
-            let wkfngs = wkfng - (3.25 + 0.5 * egfet1 + fermis);
-            if self.gamma.is_none() {
-                // C's left-to-right product, `nsub * 1e6` last.
-                process.gamma = (2. * EPSILON_SI * CHARGE * nsub * 1e6).sqrt() / cox;
-            }
-            if self.vto.is_none() {
-                let vfb = wkfngs - self.nss.unwrap_or(0.) * 1e4 * CHARGE / cox;
-                process.vto = vfb + pol * (process.gamma * process.phi.sqrt() + process.phi);
-            }
-            process.alpha = (EPSILON_SI + EPSILON_SI) / (CHARGE * nsub * 1e6);
-            process.depletion = process.alpha.sqrt();
-        }
-        process.narrow = self.delta * 0.5 * std::f64::consts::PI * EPSILON_SI / cox;
-        Ok(process)
+            surface,
+            alpha,
+            depletion: alpha.sqrt(),
+            narrow: self.delta * 0.5 * std::f64::consts::PI * EPSILON_SI / cox,
+        })
     }
 }
 
@@ -498,7 +409,14 @@ impl MosLevel for Level3 {
     /// `mos3load.c`'s `moseq3` block, line for line, in the normalized device
     /// frame. The derivatives are C's: exact except where C's own expressions
     /// are approximate (see `docs/port/M4_NONLINEAR.md`).
-    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the reference numerical routine in the original statement and rounding order"
+    )]
+    #[expect(
+        clippy::similar_names,
+        reason = "related reference equation variables retain their distinct C names"
+    )]
     fn drain_current(
         &self,
         op: &Operating<Params>,
@@ -508,9 +426,9 @@ impl MosLevel for Level3 {
     ) -> DrainCurrent {
         // C's `(mode == 1 ? vgs : vgd)`, `mode * vds` and `(mode == 1 ? vbs :
         // vbd)`, named as in the normal mode.
-        const COEFF0: Real = 0.0631353e0;
-        const COEFF1: Real = 0.8013292e0;
-        const COEFF2: Real = -0.01110777e0;
+        const COEFF0: Real = 0.063_135_3e0;
+        const COEFF1: Real = 0.801_329_2e0;
+        const COEFF2: Real = -0.011_107_77e0;
         let p = &op.params;
         let (length, width) = (p.length, p.width);
         let vt = op.vt;
@@ -711,10 +629,10 @@ impl MosLevel for Level3 {
             let argc = kappa * alpha;
             let argb = (arga * arga + argc * (vds - vdsat)).sqrt();
             let delxl = argb - arga;
-            let (dldvd, dldem) = if argb != 0.0 {
-                (argc / (argb + argb), 0.5 * (arga / argb - 1.0) * alpha)
-            } else {
+            let (dldvd, dldem) = if argb == 0.0 {
                 (0.0, 0.0)
+            } else {
+                (argc / (argb + argb), 0.5 * (arga / argb - 1.0) * alpha)
             };
             Some((
                 delxl,
@@ -796,6 +714,14 @@ mod tests {
     /// A level-3 card without the schema: every effect switched on.
     fn level(nfs: Real, vmax: Real, nsub: bool) -> Level3 {
         Level3 {
+            surface: SurfaceCard {
+                vto: Some(0.7),
+                gamma: Some(0.5),
+                phi: Some(0.7),
+                nsub: nsub.then_some(2e16),
+                tpg: None,
+                nss: None,
+            },
             common: Common {
                 pol: 1.,
                 rd: None,
@@ -819,19 +745,13 @@ mod tests {
                 nlev: 2,
                 gdsnoi: 1.,
             },
-            vto: Some(0.7),
             kp: Some(60e-6),
-            gamma: Some(0.5),
-            phi: Some(0.7),
             tox: 20e-9,
             xl: 0.,
             wd: 0.,
             xw: 0.,
             delvto: 0.,
             u0: Some(500.),
-            nsub: nsub.then_some(2e16),
-            tpg: None,
-            nss: None,
             vmax,
             xj: 0.25e-6,
             nfs,

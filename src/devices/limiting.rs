@@ -42,6 +42,13 @@
 //! The last rule of the numbered list is how limiting stays compatible with the port's
 //! physical-residual convergence test: a converged iterate is always reloaded
 //! with limiting inactive, i.e. exactly at the returned solution.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::devices::{DeviceState, IterationPhase};
 use crate::primitives::{Real, SpiceResult};
 
@@ -196,6 +203,61 @@ pub enum Linearization {
     Limited,
 }
 
+impl Linearization {
+    /// Shared classification for junction and FET startup paths. Individual
+    /// families still choose their own start voltages and Check semantics.
+    pub(super) fn classify(states: &DeviceState<'_>) -> Self {
+        if states.initial_conditions() {
+            Self::InitialConditions
+        } else if !states.device_limiting() {
+            Self::Exact
+        } else if states.phase() == IterationPhase::Junction {
+            Self::Initial
+        } else if states.phase() == IterationPhase::Predict && states.initial_transient() {
+            Self::InitialTransient
+        } else {
+            Self::Limited
+        }
+    }
+}
+
+/// The reference vector for a limited load: prediction reads accepted
+/// history, while every subsequent iteration reads the previous trial.
+pub(super) fn previous_finite(states: &DeviceState<'_>, slot: usize) -> Option<Real> {
+    match states.phase() {
+        IterationPhase::Predict => states.accepted(1, slot),
+        _ => states.iterate(slot),
+    }
+    .filter(|value| value.is_finite())
+}
+
+/// Fetch all the required reference quantities without allocation. An
+/// incomplete reference vector must not be mixed with fresh voltages.
+pub(super) fn previous_values<const N: usize>(
+    states: &DeviceState<'_>,
+    slots: [usize; N],
+) -> Option<[Real; N]> {
+    let mut values = [0.; N];
+    for (out, slot) in values.iter_mut().zip(slots) {
+        *out = previous_finite(states, slot)?;
+    }
+    Some(values)
+}
+
+/// Predictor values retain `DEVpred`'s arithmetic and missing-history
+/// behavior, while families choose their own fallback.
+pub(super) fn predicted_values<const N: usize>(
+    states: &DeviceState<'_>,
+    slots: [usize; N],
+    ratio: Real,
+) -> Option<[Real; N]> {
+    let mut values = [0.; N];
+    for (out, slot) in values.iter_mut().zip(slots) {
+        *out = states.predicted(slot, ratio)?;
+    }
+    Some(values)
+}
+
 /// One device's limiting bookkeeping for one load; see the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limiter {
@@ -210,17 +272,7 @@ impl Limiter {
     /// The limiting mode of the load `states` belongs to.
     #[must_use]
     pub fn new(states: &DeviceState<'_>) -> Self {
-        let mode = if states.initial_conditions() {
-            Linearization::InitialConditions
-        } else if !states.device_limiting() {
-            Linearization::Exact
-        } else if states.phase() == IterationPhase::Junction {
-            Linearization::Initial
-        } else if states.phase() == IterationPhase::Predict && states.initial_transient() {
-            Linearization::InitialTransient
-        } else {
-            Linearization::Limited
-        };
+        let mode = Linearization::classify(states);
         Self {
             mode,
             nonconvergent: matches!(
@@ -281,7 +333,7 @@ impl Limiter {
 
     /// The mode chosen by [`Self::new`].
     #[must_use]
-    pub const fn mode(&self) -> Linearization {
+    pub const fn mode(self) -> Linearization {
         self.mode
     }
 
@@ -290,15 +342,11 @@ impl Limiter {
     /// [`IterationPhase::Predict`] the latest accepted value. `None` (no
     /// limiting) without such a value or outside [`Linearization::Limited`].
     #[must_use]
-    pub fn previous(&self, states: &DeviceState<'_>, slot: usize) -> Option<Real> {
+    pub fn previous(self, states: &DeviceState<'_>, slot: usize) -> Option<Real> {
         if self.mode != Linearization::Limited {
             return None;
         }
-        match states.phase() {
-            IterationPhase::Predict => states.accepted(1, slot),
-            _ => states.iterate(slot),
-        }
-        .filter(|value| value.is_finite())
+        previous_finite(states, slot)
     }
 
     /// `DEVpnjlim` of `raw` against `previous` (no limiting without one);
@@ -318,28 +366,9 @@ impl Limiter {
         limited.value
     }
 
-    /// `DEVfetlim` of a gate voltage `raw` against `previous` and threshold
-    /// `von`. As in C, this does not make the load nonconvergent; the
-    /// device's convergence test catches a limited step.
-    pub fn fet_gate(&mut self, raw: Real, previous: Real, von: Real) -> Real {
-        self.changed(raw, fetlim(raw, previous, von))
-    }
-
-    /// `DEVlimvds` of a drain-source voltage `raw` against `previous` (not
-    /// itself nonconvergent, as in C).
-    pub fn drain_source(&mut self, raw: Real, previous: Real) -> Real {
-        self.changed(raw, limvds(raw, previous))
-    }
-
-    fn changed(&mut self, _raw: Real, value: Real) -> Real {
-        // C flags only `DEVpnjlim` steps (`Check`) and leaves FET limiting to
-        // the device convergence tests (`mos1conv.c`).
-        value
-    }
-
     /// Whether the load is nonconvergent so far.
     #[must_use]
-    pub const fn is_nonconvergent(&self) -> bool {
+    pub const fn is_nonconvergent(self) -> bool {
         self.nonconvergent
     }
 
@@ -364,7 +393,7 @@ mod tests {
     use super::*;
     use crate::devices::StateHistory;
 
-    const VT: Real = crate::devices::nonlinear::K_OVER_Q * 300.15;
+    const VT: Real = crate::devices::nonlinear::thermal::K_OVER_Q * 300.15;
 
     #[test]
     fn pnjlim_follows_devsup() {
@@ -487,6 +516,52 @@ mod tests {
         assert!(!limiter.holds_off(&states, true));
         limiter.finish(&mut states, &[(0, 0.4)]).unwrap();
         assert!(!uic.is_nonconvergent());
+    }
+
+    #[test]
+    fn reference_vectors_distinguish_predictor_history_and_previous_iterate() {
+        let mut history = StateHistory::new(2);
+        for values in [[1., 2.], [3., 4.]] {
+            let mut trial = history.trial();
+            let mut states = history.device(&mut trial, 0..2).unwrap();
+            for (slot, value) in values.into_iter().enumerate() {
+                states.set(slot, value).unwrap();
+            }
+            history.commit(trial).unwrap();
+        }
+        let mut previous = history.trial();
+        history
+            .device(&mut previous, 0..2)
+            .unwrap()
+            .set(0, 7.)
+            .unwrap();
+        // Slot 1 is unwritten (NaN): the entire finite reference is absent.
+        let mut float = history
+            .trial_in(IterationPhase::Float, Some(&previous))
+            .unwrap();
+        let states = history.device(&mut float, 0..2).unwrap();
+        assert_eq!(previous_values(&states, [0]), Some([7.]));
+        assert_eq!(previous_values(&states, [0, 1]), None);
+        assert_eq!(Limiter::new(&states).previous(&states, 1), None);
+        let mut predict = history
+            .trial_in(IterationPhase::Predict, Some(&previous))
+            .unwrap();
+        let states = history.device(&mut predict, 0..2).unwrap();
+        assert_eq!(previous_values(&states, [1, 0]), Some([4., 3.]));
+        assert_eq!(previous_values(&states, [0, 2]), None);
+        assert_eq!(predicted_values(&states, [0, 1], 0.5), Some([4., 5.]));
+        assert_eq!(predicted_values(&states, [2], 0.5), None);
+        assert_eq!(Linearization::classify(&states), Linearization::Limited);
+        let mut initial = history
+            .trial_in(IterationPhase::Predict, None)
+            .unwrap()
+            .with_initial_transient(true);
+        let states = history.device(&mut initial, 0..2).unwrap();
+        assert_eq!(
+            Linearization::classify(&states),
+            Linearization::InitialTransient
+        );
+        assert_eq!(Limiter::new(&states).previous(&states, 0), None);
     }
 
     #[test]

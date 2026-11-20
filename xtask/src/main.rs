@@ -9,19 +9,19 @@
 //! simulator depends on this crate; it is a development tool. See
 //! `docs/port/VERIFICATION.md`.
 
-mod bsim3;
-mod bsim4;
-mod bsim4_fields;
-mod ci;
-mod compare;
-mod golden;
-mod ifparm;
-mod ngspice;
+pub mod bsim3;
+pub mod bsim4;
+pub mod bsim4_fields;
+pub mod ci;
+pub mod compare;
+pub mod golden;
+pub mod ifparm;
+pub mod ngspice;
 #[path = "../../conformance/reference.rs"]
-mod reference;
-mod snapshots;
-mod tran;
-mod verify;
+pub mod reference;
+pub mod snapshots;
+pub mod tran;
+pub mod verify;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -56,10 +56,11 @@ OPTIONS (golden capture/check):
 /// The workspace root: the parent of this crate's directory.
 #[must_use]
 pub(crate) fn workspace_root() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("xtask lives directly under the workspace root")
-        .to_path_buf()
+    // Cargo supplies the absolute manifest directory of the xtask member,
+    // which lives directly under the workspace root.
+    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    root.pop();
+    root
 }
 
 fn main() -> ExitCode {

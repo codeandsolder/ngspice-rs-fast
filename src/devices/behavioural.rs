@@ -103,7 +103,9 @@ impl BehaviouralScale {
     pub fn factor(&self, circuit: Real) -> Real {
         let kelvin = self.temperature.unwrap_or(circuit) + 273.15;
         let difference = kelvin + self.dtemp - 300.15;
-        let mut factor = 1. + self.tc1 * difference + self.tc2 * difference * difference;
+        let linear_temperature = self.tc1 * difference;
+        let quadratic_temperature = self.tc2 * difference * difference;
+        let mut factor = 1. + linear_temperature + quadratic_temperature;
         if self.reciprocal_tc {
             factor = 1. / factor;
         }
@@ -121,6 +123,24 @@ enum Variable {
     Node(NodeId),
     /// Index into [`Device::controlling_sources`].
     Branch(usize),
+}
+
+/// Evaluation and the circuit bindings it was linearised around, in
+/// expression-variable order. Ground quantities have no matrix column.
+struct Linearization {
+    evaluation: Evaluation,
+    values: Vec<Real>,
+    columns: Vec<Option<usize>>,
+}
+
+impl Linearization {
+    fn equivalent(&self, factor: Real) -> Real {
+        let mut equivalent = self.evaluation.value;
+        for (gradient, value) in self.evaluation.gradient.iter().zip(&self.values) {
+            equivalent -= value * gradient;
+        }
+        factor * equivalent
+    }
 }
 
 /// A behavioural source. See the [module documentation](self).
@@ -173,7 +193,7 @@ impl Behavioural {
         controls: &[usize],
         time: Real,
         context: &crate::devices::ModelContext,
-    ) -> SpiceResult<(Evaluation, Vec<Real>, Vec<Option<usize>>)> {
+    ) -> SpiceResult<Linearization> {
         let columns = self.columns(unknowns, controls)?;
         let values: Vec<Real> = columns
             .iter()
@@ -199,7 +219,11 @@ impl Behavioural {
                 },
                 other => other,
             })?;
-        Ok((evaluation, values, columns))
+        Ok(Linearization {
+            evaluation,
+            values,
+            columns,
+        })
     }
 
     /// The matrix column of every variable (`None` for ground).
@@ -225,16 +249,13 @@ impl Behavioural {
     }
 
     /// Stamps the linearised output. `rhs` is `None` for the AC Jacobian.
-    #[allow(clippy::too_many_arguments)]
     fn stamp_into(
         &self,
         matrix: &mut SparseMatrix,
         rhs: Option<&mut Vector>,
         unknowns: &MnaUnknowns,
         branch: Option<usize>,
-        evaluation: &Evaluation,
-        values: &[Real],
-        columns: &[Option<usize>],
+        linearization: &Linearization,
         factor: Real,
     ) -> SpiceResult<()> {
         let row = |node: NodeId| unknowns.node_row(node);
@@ -243,11 +264,7 @@ impl Behavioural {
             (Some(r), Some(c)) => matrix.add(r, c, value),
             _ => Ok(()),
         };
-        let mut equivalent = evaluation.value;
-        for (gradient, value) in evaluation.gradient.iter().zip(values) {
-            equivalent -= value * gradient;
-        }
-        let equivalent = factor * equivalent;
+        let equivalent = linearization.equivalent(factor);
         match self.output {
             BehaviouralOutput::Voltage => {
                 let k = Some(branch.ok_or_else(|| {
@@ -257,7 +274,12 @@ impl Behavioural {
                 add(n, k, -1.)?;
                 add(k, n, -1.)?;
                 add(k, p, 1.)?;
-                for (gradient, column) in evaluation.gradient.iter().zip(columns) {
+                for (gradient, column) in linearization
+                    .evaluation
+                    .gradient
+                    .iter()
+                    .zip(&linearization.columns)
+                {
                     add(k, *column, -gradient * factor)?;
                 }
                 if let (Some(rhs), Some(k)) = (rhs, k) {
@@ -265,7 +287,12 @@ impl Behavioural {
                 }
             }
             BehaviouralOutput::Current => {
-                for (gradient, column) in evaluation.gradient.iter().zip(columns) {
+                for (gradient, column) in linearization
+                    .evaluation
+                    .gradient
+                    .iter()
+                    .zip(&linearization.columns)
+                {
                     add(p, *column, gradient * factor)?;
                     add(n, *column, -gradient * factor)?;
                 }
@@ -315,20 +342,21 @@ impl Device for Behavioural {
         &self,
         context: &crate::devices::ConvergenceContext<'_>,
     ) -> SpiceResult<bool> {
-        let (evaluation, _, _) = self.evaluate(
+        let linearization = self.evaluate(
             context.solution,
             context.unknowns,
             context.controls,
             context.time,
             context.model_context,
         )?;
-        let rhs = evaluation.value;
+        let rhs = linearization.evaluation.value;
         let prev = context.states.first().copied().unwrap_or(0.);
         let absolute = match self.output {
             BehaviouralOutput::Voltage => context.vntol,
             BehaviouralOutput::Current => context.abstol,
         };
-        let tol = context.reltol * rhs.abs().max(prev.abs()) + absolute;
+        let relative = context.reltol * rhs.abs().max(prev.abs());
+        let tol = relative + absolute;
         Ok((prev - rhs).abs() > tol)
     }
 
@@ -504,7 +532,7 @@ impl Device for Behavioural {
                 )));
             }
         };
-        let (evaluation, values, columns) = self.evaluate(
+        let linearization = self.evaluate(
             context.solution,
             context.unknowns,
             context.controls,
@@ -513,16 +541,14 @@ impl Device for Behavioural {
         )?;
         let factor = self.checked_factor(context.temperature)?;
         // asrcload.c: ASRCprev_value, the raw value ASRCconvTest compares.
-        context.states.set(0, evaluation.value)?;
+        context.states.set(0, linearization.evaluation.value)?;
         let branch = (!context.branches.is_empty()).then_some(context.branches.start);
         self.stamp_into(
             context.matrix,
             Some(context.rhs),
             context.unknowns,
             branch,
-            &evaluation,
-            &values,
-            &columns,
+            &linearization,
             factor,
         )
     }
@@ -534,7 +560,7 @@ impl Device for Behavioural {
         bias: &Vector,
     ) -> SpiceResult<()> {
         let temperature = context.model_context.temperature;
-        let (evaluation, values, columns) = self.evaluate(
+        let linearization = self.evaluate(
             bias,
             context.unknowns,
             context.controls,
@@ -547,9 +573,7 @@ impl Device for Behavioural {
             None,
             context.unknowns,
             context.branch,
-            &evaluation,
-            &values,
-            &columns,
+            &linearization,
             factor,
         )
     }
@@ -600,19 +624,10 @@ fn literal(text: &str, location: &SourceLoc, what: &str) -> SpiceResult<Real> {
         .ok_or_else(|| unsupported(location, format!("non-finite or nonliteral {what}={text}")))
 }
 
-/// Builds a B source (or a front-end generated XSPICE `a` instance) from its
-/// literalized AST instance, binding nodes in `nodes` only on success.
-pub(crate) fn instantiate(
+fn parse_parameters(
     instance: &DeviceInstance,
-    nodes: &mut NodeTable,
-) -> SpiceResult<Box<dyn Device>> {
+) -> SpiceResult<(BehaviouralOutput, &BehaviouralExpression, BehaviouralScale)> {
     let location = &instance.location;
-    if instance.model.is_some() || instance.nodes.len() != 2 {
-        return Err(unsupported(
-            location,
-            format!("{} needs two nodes and no model", instance.name),
-        ));
-    }
     let mut expression: Option<(BehaviouralOutput, &BehaviouralExpression)> = None;
     let mut scale = BehaviouralScale::default();
     let mut temperature_given = false;
@@ -649,8 +664,10 @@ pub(crate) fn instantiate(
                         dtemp_given = true;
                     }
                     // IF_INTEGER flags: only the value 1 selects the reciprocal.
-                    "reciproctc" => scale.reciprocal_tc = value.round() == 1.,
-                    "reciprocm" => scale.reciprocal_m = value.round() == 1.,
+                    "reciproctc" => {
+                        scale.reciprocal_tc = value.round().to_bits() == 1_f64.to_bits();
+                    }
+                    "reciprocm" => scale.reciprocal_m = value.round().to_bits() == 1_f64.to_bits(),
                     other => {
                         return Err(unsupported(
                             at,
@@ -695,47 +712,94 @@ pub(crate) fn instantiate(
             ),
         ));
     };
-    let program = Program::compile(&tree.root)?;
-    let mut staged = nodes.clone();
-    let positive = staged.intern(&instance.nodes[0]);
-    let negative = staged.intern(&instance.nodes[1]);
-    if output == BehaviouralOutput::Voltage && positive == negative {
-        // ASRCsetup: "instance %s is a shorted ASRC".
+    Ok((output, tree, scale))
+}
+
+/// Builds a B source (or a front-end generated XSPICE `a` instance) from its
+/// literalized AST instance, binding nodes in `nodes` only on success.
+pub(crate) fn instantiate(
+    instance: &DeviceInstance,
+    nodes: &mut NodeTable,
+) -> SpiceResult<Box<dyn Device>> {
+    let location = &instance.location;
+    if instance.model.is_some() || instance.nodes.len() != 2 {
         return Err(unsupported(
             location,
-            format!("instance {} is a shorted ASRC", instance.name),
+            format!("{} needs two nodes and no model", instance.name),
         ));
     }
-    let mut terminals = vec![positive, negative];
-    let mut variables = Vec::new();
-    let mut controls = Vec::new();
-    for quantity in program.quantities() {
-        match quantity {
-            Quantity::Node(name) => {
-                let node = staged.intern(name);
-                if !terminals.contains(&node) {
-                    terminals.push(node);
+    let (output, tree, scale) = parse_parameters(instance)?;
+    let program = Program::compile(&tree.root)?;
+    crate::devices::factory::append_nodes(nodes, |nodes| {
+        let positive = nodes.intern(&instance.nodes[0])?;
+        let negative = nodes.intern(&instance.nodes[1])?;
+        if output == BehaviouralOutput::Voltage && positive == negative {
+            // ASRCsetup: "instance %s is a shorted ASRC".
+            return Err(unsupported(
+                location,
+                format!("instance {} is a shorted ASRC", instance.name),
+            ));
+        }
+        let mut terminals = vec![positive, negative];
+        let mut variables = Vec::with_capacity(program.quantities().len());
+        let mut controls = Vec::new();
+        for quantity in program.quantities() {
+            match quantity {
+                Quantity::Node(name) => {
+                    let node = nodes.intern(name)?;
+                    if !terminals.contains(&node) {
+                        terminals.push(node);
+                    }
+                    variables.push(Variable::Node(node));
                 }
-                variables.push(Variable::Node(node));
-            }
-            Quantity::Branch(name) => {
-                variables.push(Variable::Branch(controls.len()));
-                controls.push(ControlReference {
-                    name: name.clone(),
-                    location: Some(tree.span.start.clone()),
-                });
+                Quantity::Branch(name) => {
+                    variables.push(Variable::Branch(controls.len()));
+                    controls.push(ControlReference {
+                        name: name.clone(),
+                        location: Some(tree.span.start.clone()),
+                    });
+                }
             }
         }
+        Ok(Box::new(Behavioural {
+            name: instance.name.clone(),
+            designator: instance.designator,
+            output,
+            terminals,
+            variables,
+            controls,
+            program,
+            scale,
+        }) as Box<dyn Device>)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+
+    #[test]
+    fn failed_behavioural_binding_preserves_existing_nodes() {
+        let mut nodes = NodeTable::new();
+        nodes.intern("present").unwrap();
+        let before = nodes.nodes().to_vec();
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("behavioural.cir"),
+                "title\nb1 fresh fresh v=v(sense)\nb2 fresh 0 v=v(sense)+i(vx)\n.end\n",
+            ))
+            .unwrap();
+        assert!(instantiate(&deck.devices[0], &mut nodes).is_err());
+        assert_eq!(nodes.nodes(), before);
+        let device = instantiate(&deck.devices[1], &mut nodes).unwrap();
+        assert_eq!(
+            device.terminals(),
+            &[NodeId::new(2), NodeId::GROUND, NodeId::new(3)]
+        );
+        assert_eq!(device.controlling_sources()[0].name, "vx");
+        assert_eq!(nodes.get("sense"), Some(NodeId::new(3)));
+        assert_eq!(nodes.get("vx"), None);
     }
-    *nodes = staged;
-    Ok(Box::new(Behavioural {
-        name: instance.name.clone(),
-        designator: instance.designator,
-        output,
-        terminals,
-        variables,
-        controls,
-        program,
-        scale,
-    }))
 }

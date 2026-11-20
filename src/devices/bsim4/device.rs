@@ -37,15 +37,18 @@ use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError
 pub(super) struct Prepared {
     pub(super) temperature: Real,
     pub(super) nominal: Real,
-    /// The `.dc @inst[param]` values applied (field, value).
-    pub(super) swept: Vec<(&'static str, Real)>,
+    /// Ordered instance setters applied after initial setup.
+    swept: Rc<[SweptValue]>,
     pub(super) model: Model,
     pub(super) instance: Instance,
     pub(super) size: SizeParam,
     /// `b4set.c`/`b4temp.c`/`b4check.c` messages, in C order. Kept for
     /// inspection: the port has no channel that reports device warnings
     /// yet (C prints them).
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "retains BSIM4 model diagnostics with their setup for a future public warning channel"
+    )]
     pub(super) warnings: Vec<String>,
 }
 
@@ -59,7 +62,7 @@ struct SetUp {
 }
 
 /// One BSIM4 instance.
-pub(crate) struct Bsim4 {
+pub(in crate::devices) struct Bsim4 {
     pub(super) name: String,
     pub(super) model_name: String,
     /// External drain, gate, source, bulk, then the internal nodes in
@@ -69,20 +72,38 @@ pub(crate) struct Bsim4 {
     /// indices are never looked up: the instance's node fields alias them
     /// to external indices, as in C.
     pub(super) nodes: [NodeId; node::COUNT],
-    params: ModelParameters,
-    inputs: Inputs,
+    has_start_settings: bool,
     pub(super) location: SourceLoc,
-    /// `b4set.c`'s created nodes, fixed at instantiation.
-    created: Vec<(i32, &'static str)>,
     /// C's `noiseAnalGiven` at setup.
     pub(super) noise_analysis: bool,
     /// `.dc @inst[param]` values (C's `DCTsetInstParam`): `BSIM4param`
     /// stores them after `BSIM4setup`, and `BSIM4temp` follows. Each is the
     /// setter's C field and given bit with its value.
-    swept: Vec<(&'static str, Option<&'static str>, Real)>,
+    swept: Rc<[SweptValue]>,
     /// C's structs, shared with this instance's `.dc @inst[param]`
     /// stand-ins (which C's `DCTsetInstParam` writes into the same struct).
     shared: Rc<RefCell<Shared>>,
+}
+
+/// A real setter and its given bit, with an exact floating-point cache key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SweptValue {
+    field: &'static str,
+    given: Option<&'static str>,
+    bits: u64,
+}
+
+impl SweptValue {
+    fn apply(self, instance: &mut Instance) -> SpiceResult<()> {
+        let slot = instance.real_mut(self.field).ok_or_else(|| {
+            SpiceError::circuit(format!("BSIM4 swept field {} has no member", self.field))
+        })?;
+        *slot = Real::from_bits(self.bits);
+        if let Some(flag) = self.given.and_then(|given| instance.flag_mut(given)) {
+            *flag = true;
+        }
+        Ok(())
+    }
 }
 
 /// The C structs of one BSIM4 instance.
@@ -92,6 +113,36 @@ struct Shared {
     setups: Vec<Rc<Prepared>>,
     /// C's instance struct as the last load left it, and its setup.
     live: Option<(Rc<Prepared>, Instance)>,
+}
+
+impl Shared {
+    /// A fresh temperature snapshot carries the previous load-only members.
+    fn live_copy(&self, prepared: &Rc<Prepared>) -> Instance {
+        match &self.live {
+            Some((owner, h)) if Rc::ptr_eq(owner, prepared) => h.clone(),
+            Some((_, h)) => {
+                let mut fresh = prepared.instance.clone();
+                carry_load_members(h, &mut fresh);
+                fresh
+            }
+            None => prepared.instance.clone(),
+        }
+    }
+
+    /// Install a live instance only when the prepared snapshot changes.
+    fn live_instance(&mut self, prepared: &Rc<Prepared>) -> SpiceResult<&mut Instance> {
+        if !self
+            .live
+            .as_ref()
+            .is_some_and(|(owner, _)| Rc::ptr_eq(owner, prepared))
+        {
+            self.live = Some((Rc::clone(prepared), self.live_copy(prepared)));
+        }
+        self.live
+            .as_mut()
+            .map(|(_, instance)| instance)
+            .ok_or_else(|| SpiceError::circuit("BSIM4 live instance missing"))
+    }
 }
 
 /// How many setups [`Shared`] keeps.
@@ -126,31 +177,48 @@ impl Bsim4 {
         }
         let params = super::model_parameters(model)?;
         let inputs = params.instance_parameters(instance, 1.)?;
+        let has_start_settings = inputs
+            .applied()
+            .iter()
+            .any(|a| matches!(a.parameter.canonical, "off" | "icvds" | "icvgs" | "icvbs"));
+        let mut setup = Self::setup(&params, &inputs, &instance.location, context)?;
+        let created = std::mem::take(&mut setup.created);
         let mut device = Self {
             name: instance.name.clone(),
             model_name: model.card().name.clone(),
             terminals: Vec::new(),
             nodes: [NodeId::GROUND; node::COUNT],
-            params,
-            inputs,
+            has_start_settings,
             location: instance.location.clone(),
-            created: Vec::new(),
             noise_analysis: context.noise_analysis,
-            swept: Vec::new(),
+            swept: Rc::default(),
             shared: Rc::new(RefCell::new(Shared::default())),
         };
-        device.created = device.setup(context.nominal_temperature)?.created;
-        let prepared = device.prepare(context.temperature, context.nominal_temperature)?;
+        let prepared = device.prepare(
+            context.temperature,
+            context.nominal_temperature,
+            Some(setup),
+        )?;
         let mut staged = nodes.clone();
-        let external: Vec<NodeId> = instance.nodes.iter().map(|n| staged.intern(n)).collect();
+        let external: Vec<NodeId> = instance
+            .nodes
+            .iter()
+            .map(|n| staged.intern(n))
+            .collect::<SpiceResult<Vec<_>>>()?;
         device.terminals.clone_from(&external);
         for (local, id) in [node::D, node::G_EXT, node::S, node::B]
             .into_iter()
             .zip(external)
         {
-            device.nodes[local as usize] = id;
+            let index = usize::try_from(local)
+                .ok()
+                .filter(|&i| i < node::COUNT)
+                .ok_or_else(|| {
+                    SpiceError::circuit("BSIM4 setup mapped an invalid external node")
+                })?;
+            device.nodes[index] = id;
         }
-        for &(local, suffix) in &device.created {
+        for &(local, suffix) in &created {
             let name = format!("{}#{suffix}", instance.name);
             if staged.get(&name).is_some() {
                 return Err(SpiceError::circuit(format!(
@@ -158,7 +226,7 @@ impl Bsim4 {
                     instance.name
                 )));
             }
-            let id = staged.intern(&name);
+            let id = staged.intern(&name)?;
             staged.set_kind(id, NodeKind::Internal);
             let index = usize::try_from(local)
                 .ok()
@@ -174,20 +242,25 @@ impl Bsim4 {
 
     /// `b4mpar.c`/`b4par.c` setters and `BSIM4setup` at this nominal
     /// temperature (C's `CKTnomTemp`, the TNOM default).
-    fn setup(&self, nominal: Real) -> SpiceResult<SetUp> {
+    fn setup(
+        params: &ModelParameters,
+        inputs: &Inputs,
+        location: &SourceLoc,
+        context: &ModelContext,
+    ) -> SpiceResult<SetUp> {
         let mut warnings = Vec::new();
-        let mut m = apply::model(&self.params)?;
+        let mut m = apply::model(params)?;
         set::setup_model(
             &mut m,
-            temperature_kelvin(nominal, &self.location)?,
+            temperature_kelvin(context.nominal_temperature, location)?,
             &mut warnings,
         )?;
-        let mut h = apply::instance(&self.inputs)?;
+        let mut h = apply::instance(inputs)?;
         h.dNode = node::D;
         h.gNodeExt = node::G_EXT;
         h.sNode = node::S;
         h.bNode = node::B;
-        let created = set::setup_instance(&m, &mut h, self.noise_analysis, &mut warnings)?;
+        let created = set::setup_instance(&m, &mut h, context.noise_analysis, &mut warnings)?;
         Ok(SetUp {
             model: m,
             instance: h,
@@ -207,43 +280,28 @@ impl Bsim4 {
     /// first call's model and instance, apply the swept values, and run the
     /// temperature pass unchecked. (The first call's nominal temperature is
     /// the one setup used; C does not re-run setup either.)
-    fn prepare(&self, temperature: Real, nominal: Real) -> SpiceResult<Prepared> {
-        let first = self
-            .shared
-            .try_borrow()
-            .ok()
-            .and_then(|shared| shared.setups.first().cloned());
-        let (mut model, mut instance, mut warnings, check) = match first {
-            None => {
-                let SetUp {
-                    model,
-                    instance,
-                    warnings,
-                    created,
-                } = self.setup(nominal)?;
-                if created != self.created && !self.created.is_empty() {
-                    return Err(SpiceError::circuit(format!(
-                        "{}: BSIM4 internal nodes changed between setups",
-                        self.name
-                    )));
-                }
-                (model, instance, warnings, true)
-            }
-            Some(first) => (
+    fn prepare(
+        &self,
+        temperature: Real,
+        nominal: Real,
+        initial: Option<SetUp>,
+    ) -> SpiceResult<Prepared> {
+        let (mut model, mut instance, mut warnings, check) = if let Some(setup) = initial {
+            (setup.model, setup.instance, setup.warnings, true)
+        } else {
+            let shared = self.borrow_shared()?;
+            let first = shared.setups.first().ok_or_else(|| {
+                SpiceError::circuit(format!("{}: missing initial BSIM4 setup", self.name))
+            })?;
+            (
                 first.model.clone(),
                 first.instance.clone(),
                 Vec::new(),
                 false,
-            ),
+            )
         };
-        for &(field, given, value) in &self.swept {
-            let slot = instance.real_mut(field).ok_or_else(|| {
-                SpiceError::circuit(format!("BSIM4 swept field {field} has no member"))
-            })?;
-            *slot = value;
-            if let Some(flag) = given.and_then(|given| instance.flag_mut(given)) {
-                *flag = true;
-            }
+        for &setter in self.swept.iter() {
+            setter.apply(&mut instance)?;
         }
         let kelvin = temperature_kelvin(temperature, &self.location)?;
         let locals = temp::temperature_model(&mut model, kelvin, &mut warnings);
@@ -263,11 +321,7 @@ impl Bsim4 {
         Ok(Prepared {
             temperature,
             nominal,
-            swept: self
-                .swept
-                .iter()
-                .map(|&(field, _, value)| (field, value))
-                .collect(),
+            swept: Rc::clone(&self.swept),
             model,
             instance,
             size,
@@ -278,22 +332,15 @@ impl Bsim4 {
     /// The setup for these temperatures (and this device's swept values),
     /// rebuilt when C would re-run `BSIM4temp`.
     pub(super) fn ensure(&self, temperature: Real, nominal: Real) -> SpiceResult<Rc<Prepared>> {
-        let same = |p: &Prepared| {
-            p.temperature == temperature
-                && p.nominal == nominal
-                && p.swept.len() == self.swept.len()
-                && p.swept
-                    .iter()
-                    .zip(&self.swept)
-                    .all(|(a, b)| a.0 == b.0 && a.1.to_bits() == b.2.to_bits())
-        };
+        let same =
+            |p: &Prepared| p.matches_temperatures(temperature, nominal) && p.swept == self.swept;
         {
             let shared = self.borrow_shared()?;
             if let Some(prepared) = shared.setups.iter().find(|p| same(p)) {
                 return Ok(Rc::clone(prepared));
             }
         }
-        let prepared = Rc::new(self.prepare(temperature, nominal)?);
+        let prepared = Rc::new(self.prepare(temperature, nominal, None)?);
         let mut shared = self.borrow_shared_mut()?;
         // The first setup is C's struct as `BSIM4setup` and the checked
         // `BSIM4temp` left it; later passes start from it, so keep it.
@@ -366,22 +413,12 @@ impl Bsim4 {
         p
     }
 
-    /// C's instance struct for `prepared`: the live one when it already
-    /// belongs to it, else `prepared`'s with the members the last load wrote
-    /// carried over (C re-runs `BSIM4temp` on its one struct).
+    /// A probe copies the live instance without changing the running solve.
     pub(super) fn live_copy(&self, prepared: &Rc<Prepared>) -> Instance {
-        let Ok(shared) = self.shared.try_borrow() else {
-            return prepared.instance.clone();
-        };
-        match &shared.live {
-            Some((owner, h)) if Rc::ptr_eq(owner, prepared) => h.clone(),
-            Some((_, h)) => {
-                let mut fresh = prepared.instance.clone();
-                carry_load_members(h, &mut fresh);
-                fresh
-            }
-            None => prepared.instance.clone(),
-        }
+        self.shared.try_borrow().map_or_else(
+            |_| prepared.instance.clone(),
+            |shared| shared.live_copy(prepared),
+        )
     }
 
     /// C's `MODEINITSMSIG` load at `state0` (the operating point's state
@@ -462,7 +499,6 @@ pub(super) fn reset_load(
 ///
 /// # Errors
 /// As the AC load, or a matrix position out of range.
-#[allow(clippy::too_many_arguments)] // C's load inputs.
 pub(super) fn ac_stamp(
     context: &mut LinearContext<'_>,
     nodes: &[NodeId; node::COUNT],
@@ -479,7 +515,7 @@ pub(super) fn ac_stamp(
         s0,
         error: None,
     };
-    acld::ac_load(model, h, size, &mut host)?;
+    acld::ac_load(model, h, size, &mut host);
     host.error.map_or(Ok(()), Err)
 }
 
@@ -498,7 +534,7 @@ impl Bsim4 {
         let prepared = Prepared {
             temperature: context.temperature,
             nominal: context.nominal_temperature,
-            swept: Vec::new(),
+            swept: Rc::default(),
             model,
             instance,
             size,
@@ -509,12 +545,10 @@ impl Bsim4 {
             model_name: self.model_name.clone(),
             terminals: self.terminals.clone(),
             nodes: self.nodes,
-            params: self.params.clone(),
-            inputs: self.inputs.clone(),
+            has_start_settings: self.has_start_settings,
             location: self.location.clone(),
-            created: self.created.clone(),
             noise_analysis: self.noise_analysis,
-            swept: Vec::new(),
+            swept: Rc::default(),
             shared: Rc::new(RefCell::new(Shared {
                 setups: vec![Rc::new(prepared)],
                 live: None,
@@ -524,6 +558,15 @@ impl Bsim4 {
 }
 
 impl Prepared {
+    /// The exact cache key for C temperature passes. Both signed zeros compare equal.
+    #[expect(
+        clippy::float_cmp,
+        reason = "reuse a prepared model only for exactly equal temperatures; retain IEEE signed-zero and NaN equality semantics"
+    )]
+    const fn matches_temperatures(&self, temperature: Real, nominal: Real) -> bool {
+        self.temperature == temperature && self.nominal == nominal
+    }
+
     /// `CKTtemp` in kelvin for the loads.
     fn model_temperature(&self) -> Real {
         self.temperature + 273.15
@@ -535,30 +578,20 @@ impl Prepared {
 /// processed one: C runs `BSIM4temp` on its single struct, which rewrites
 /// the temperature-derived members and leaves these (the next load reads
 /// `BSIM4von` for `DEVfetlim`).
-fn carry_load_members(from: &Instance, to: &mut Instance) {
-    to.AbovVgst2Vtm = from.AbovVgst2Vtm;
-    to.Abulk = from.Abulk;
+const fn carry_load_members(from: &Instance, to: &mut Instance) {
+    carry_charge_members(from, to);
+    carry_current_members(from, to);
+}
+
+/// Charge, capacitance and charge-relaxation results left by the load.
+const fn carry_charge_members(from: &Instance, to: &mut Instance) {
     to.Coxeff = from.Coxeff;
-    to.EsatL = from.EsatL;
-    to.IdovVds = from.IdovVds;
-    to.Igb = from.Igb;
-    to.Igcd = from.Igcd;
-    to.Igcs = from.Igcs;
-    to.Igd = from.Igd;
-    to.Igidl = from.Igidl;
-    to.Igisl = from.Igisl;
-    to.Igs = from.Igs;
-    to.Vdseff = from.Vdseff;
-    to.Vgsteff = from.Vgsteff;
     to.capbd = from.capbd;
     to.capbs = from.capbs;
     to.cbbb = from.cbbb;
-    to.cbd = from.cbd;
     to.cbdb = from.cbdb;
     to.cbgb = from.cbgb;
-    to.cbs = from.cbs;
     to.cbsb = from.cbsb;
-    to.cd = from.cd;
     to.cdbb = from.cdbb;
     to.cddb = from.cddb;
     to.cdgb = from.cdgb;
@@ -577,6 +610,40 @@ fn carry_load_members(from: &Instance, to: &mut Instance) {
     to.csdb = from.csdb;
     to.csgb = from.csgb;
     to.cssb = from.cssb;
+    to.gtau = from.gtau;
+    to.gtb = from.gtb;
+    to.gtd = from.gtd;
+    to.gtg = from.gtg;
+    to.gts = from.gts;
+    to.qbulk = from.qbulk;
+    to.qchqs = from.qchqs;
+    to.qdrn = from.qdrn;
+    to.qgate = from.qgate;
+    to.qgdo = from.qgdo;
+    to.qgso = from.qgso;
+    to.qinv = from.qinv;
+    to.qsrc = from.qsrc;
+    to.taunet = from.taunet;
+}
+
+/// Current, conductance and remaining operating-point results left by the load.
+const fn carry_current_members(from: &Instance, to: &mut Instance) {
+    to.AbovVgst2Vtm = from.AbovVgst2Vtm;
+    to.Abulk = from.Abulk;
+    to.EsatL = from.EsatL;
+    to.IdovVds = from.IdovVds;
+    to.Igb = from.Igb;
+    to.Igcd = from.Igcd;
+    to.Igcs = from.Igcs;
+    to.Igd = from.Igd;
+    to.Igidl = from.Igidl;
+    to.Igisl = from.Igisl;
+    to.Igs = from.Igs;
+    to.Vdseff = from.Vdseff;
+    to.Vgsteff = from.Vgsteff;
+    to.cbd = from.cbd;
+    to.cbs = from.cbs;
+    to.cd = from.cd;
     to.csub = from.csub;
     to.dvgd_eff_dvg = from.dvgd_eff_dvg;
     to.dvgs_eff_dvg = from.dvgs_eff_dvg;
@@ -628,23 +695,9 @@ fn carry_load_members(from: &Instance, to: &mut Instance) {
     to.gstotd = from.gstotd;
     to.gstotg = from.gstotg;
     to.gstots = from.gstots;
-    to.gtau = from.gtau;
-    to.gtb = from.gtb;
-    to.gtd = from.gtd;
-    to.gtg = from.gtg;
-    to.gts = from.gts;
     to.mode = from.mode;
     to.noiGd0 = from.noiGd0;
     to.nstar = from.nstar;
-    to.qbulk = from.qbulk;
-    to.qchqs = from.qchqs;
-    to.qdrn = from.qdrn;
-    to.qgate = from.qgate;
-    to.qgdo = from.qgdo;
-    to.qgso = from.qgso;
-    to.qinv = from.qinv;
-    to.qsrc = from.qsrc;
-    to.taunet = from.taunet;
     to.thetavth = from.thetavth;
     to.ueff = from.ueff;
     to.vdsat = from.vdsat;
@@ -757,7 +810,9 @@ impl LoadCkt for StampHost<'_, '_> {
     fn delta(&self) -> f64 {
         // dctrcurv.c leaves CKTdelta equal to every CKTdeltaOld, so DEVpred's
         // ratio is one in a sweep.
-        self.context.integration.map_or(1., |c| c.dt())
+        self.context
+            .integration
+            .map_or(1., crate::maths::Coefficients::dt)
     }
     fn delta_old(&self, i: usize) -> f64 {
         self.context
@@ -851,6 +906,10 @@ impl LoadCkt for StampHost<'_, '_> {
 /// whatever `CKTag` the last transient left; a fresh circuit's is zero,
 /// which is what every non-transient analysis of a deck without an earlier
 /// `.tran` sees.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "preserve NIintegrate's separate multiply, sum and subtraction, including signed-zero and nonfinite behavior"
+)]
 fn zero_coefficient_integrate(cap: f64, q0: f64, q1: f64) -> (f64, f64, f64) {
     let ag = [0.0_f64; 2];
     let derivative = ag[0] * q0 + ag[1] * q1;
@@ -1057,9 +1116,9 @@ impl Bsim4 {
             error: None,
         };
         if pole_zero {
-            pzld::pz_load(&prepared.model, &h, &prepared.size, &mut host)?;
+            pzld::pz_load(&prepared.model, &h, &prepared.size, &mut host);
         } else {
-            acld::ac_load(&prepared.model, &h, &prepared.size, &mut host)?;
+            acld::ac_load(&prepared.model, &h, &prepared.size, &mut host);
         }
         host.error.map_or(Ok(()), Err)
     }
@@ -1067,7 +1126,6 @@ impl Bsim4 {
     /// `b4ask.c` at an operating point, on the instance and state the
     /// `MODEINITSMSIG` load leaves.
     fn ask(
-        &self,
         keyword: &str,
         prepared: &Prepared,
         h: &Instance,
@@ -1213,10 +1271,7 @@ impl Device for Bsim4 {
     }
 
     fn has_start_settings(&self) -> bool {
-        self.inputs
-            .applied()
-            .iter()
-            .any(|a| matches!(a.parameter.canonical, "off" | "icvds" | "icvgs" | "icvbs"))
+        self.has_start_settings
     }
 
     fn state_count(&self) -> usize {
@@ -1227,7 +1282,7 @@ impl Device for Bsim4 {
         crate::devices::setup::CDeviceType::Bsim
     }
 
-    /// `BSIM4trunc`: CKTterr on qb, qg, qd, then qcdump (`trnqsMod`), qbs
+    /// `BSIM4trunc`: `CKTterr` on qb, qg, qd, then qcdump (`trnqsMod`), qbs
     /// and qbd (`rbodyMod`) and qgmid (`rgateMod == 3`).
     fn truncation_slots(&self) -> Vec<usize> {
         let Some(prepared) = self.any_setup() else {
@@ -1270,19 +1325,8 @@ impl Device for Bsim4 {
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         let prepared = self.ensure(context.temperature, context.nominal_temperature)?;
         let (mode, limiting) = load_mode(context)?;
-        let current = self
-            .borrow_shared()?
-            .live
-            .as_ref()
-            .is_some_and(|(owner, _)| Rc::ptr_eq(owner, &prepared));
-        if !current {
-            let instance = self.live_copy(&prepared);
-            self.borrow_shared_mut()?.live = Some((Rc::clone(&prepared), instance));
-        }
         let mut shared = self.borrow_shared_mut()?;
-        let Some((_, h)) = shared.live.as_mut() else {
-            return Err(SpiceError::circuit("BSIM4 live instance missing"));
-        };
+        let h = shared.live_instance(&prepared)?;
         if mode & mode::MODEUIC != 0 && context.states.initial_conditions() {
             // b4getic.c: unset IC components are the solution's terminal
             // voltages (CKTic runs only under MODEUIC).
@@ -1367,8 +1411,8 @@ impl Device for Bsim4 {
     /// `BSIM4param` then `BSIM4temp` (`dctrcurv.c` `DCTsetInstParam`): the
     /// value is stored after `BSIM4setup`, so setup-derived quantities
     /// (instance defaults, the internal nodes) keep their setup values, as
-    /// in C. Unlike C, whose `static` model name skips `BSIM4checkModel` on
-    /// every later `BSIM4temp`, the port checks each swept point again.
+    /// in C. Later temperature processing starts from the initial checked
+    /// snapshot without rerunning `BSIM4checkModel`.
     fn with_instance_parameter(
         &self,
         parameter: &str,
@@ -1384,20 +1428,21 @@ impl Device for Bsim4 {
                 ))
             })?;
         crate::devices::sweep::check_swept(&self.name, parameter, value, true, "finite")?;
-        let field = p.c_field.unwrap_or_default();
-        let mut swept = self.swept.clone();
-        swept.push((field, p.c_given, value));
+        let mut swept = self.swept.to_vec();
+        swept.push(SweptValue {
+            field: p.c_field.unwrap_or_default(),
+            given: p.c_given,
+            bits: value.to_bits(),
+        });
         let device = Self {
             name: self.name.clone(),
             model_name: self.model_name.clone(),
             terminals: self.terminals.clone(),
             nodes: self.nodes,
-            params: self.params.clone(),
-            inputs: self.inputs.clone(),
+            has_start_settings: self.has_start_settings,
             location: self.location.clone(),
-            created: self.created.clone(),
             noise_analysis: self.noise_analysis,
-            swept,
+            swept: swept.into(),
             shared: Rc::clone(&self.shared),
         };
         device.ensure(context.temperature, context.nominal_temperature)?;
@@ -1434,7 +1479,7 @@ impl Device for Bsim4 {
         let prepared = self.ensure(context.temperature, context.nominal_temperature)?;
         let s0 = self.state_at(&prepared, voltage, context.gmin)?;
         let (h, s0) = self.small_signal_point(&prepared, s0, voltage, context.gmin)?;
-        Ok(self.ask(keyword, &prepared, &h, &s0))
+        Ok(Self::ask(keyword, &prepared, &h, &s0))
     }
 
     /// `b4acld.c` reassembled at every frequency: its `x* = cap * omega`
@@ -1556,5 +1601,82 @@ impl Device for Bsim4 {
             total: true,
             sources,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prepared(length: Real) -> Rc<Prepared> {
+        Rc::new(Prepared {
+            temperature: 27.,
+            nominal: 27.,
+            swept: Rc::default(),
+            model: Model::default(),
+            instance: Instance {
+                l: length,
+                ..Instance::default()
+            },
+            size: SizeParam::default(),
+            warnings: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn sweep_key_preserves_given_bits_and_signed_zero() {
+        let first = SweptValue {
+            field: "BSIM4l",
+            given: Some("BSIM4lGiven"),
+            bits: 0.0_f64.to_bits(),
+        };
+        let negative = SweptValue {
+            bits: (-0.0_f64).to_bits(),
+            ..first
+        };
+        let without_given = SweptValue {
+            given: None,
+            ..first
+        };
+        assert!(first != negative);
+        assert!(first != without_given);
+        let mut instance = Instance::default();
+        negative.apply(&mut instance).unwrap();
+        assert_eq!(instance.l.to_bits(), negative.bits);
+        assert!(instance.lGiven);
+    }
+
+    #[test]
+    fn temperature_cache_uses_exact_numeric_equality() {
+        let setup = prepared(1e-6);
+        assert!(setup.matches_temperatures(27., 27.));
+        assert!(!setup.matches_temperatures(27.0_f64.next_up(), 27.));
+        assert!(!setup.matches_temperatures(27., 27.0_f64.next_up()));
+        assert!(!setup.matches_temperatures(f64::NAN, 27.));
+    }
+
+    #[test]
+    fn live_snapshot_changes_keep_load_members_not_geometry() {
+        let first = prepared(1e-6);
+        let second = prepared(2e-6);
+        let mut shared = Shared::default();
+        let live = shared.live_instance(&first).unwrap();
+        live.gm = 0.123;
+        live.qgate = 0.456;
+        assert_eq!(
+            shared.live_instance(&first).unwrap().gm.to_bits(),
+            0.123_f64.to_bits()
+        );
+        let mut probe = shared.live_copy(&second);
+        assert_eq!(probe.gm.to_bits(), 0.123_f64.to_bits());
+        assert_eq!(probe.qgate.to_bits(), 0.456_f64.to_bits());
+        assert_eq!(probe.l.to_bits(), 2e-6_f64.to_bits());
+        probe.gm = 0.456;
+        assert_eq!(probe.gm.to_bits(), 0.456_f64.to_bits());
+        assert_eq!(shared.live_copy(&first).gm.to_bits(), 0.123_f64.to_bits());
+        let live = shared.live_instance(&second).unwrap();
+        assert_eq!(live.l.to_bits(), 2e-6_f64.to_bits());
+        assert_eq!(live.gm.to_bits(), 0.123_f64.to_bits());
+        assert_eq!(second.instance.gm.to_bits(), 0.0_f64.to_bits());
     }
 }

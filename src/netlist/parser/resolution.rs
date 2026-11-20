@@ -1,4 +1,4 @@
-//! Source-relative preprocessing, referencing inpcom.c's inp_readall and
+//! Source-relative preprocessing, referencing inpcom.c's `inp_readall` and
 //! library section processing. Deliberately no sourcepath/env/home expansion.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,11 +21,11 @@ use crate::netlist::source::{Deck, LogicalLine, parse_deck_text, parse_fragment_
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceLimits {
     /// Maximum nested includes below the root. Values above 64 are rejected.
-    pub max_depth: usize,
+    pub depth: usize,
     /// Total file reads including the root and repeated includes.
-    pub max_files: usize,
+    pub files: usize,
     /// Total UTF-8 source bytes read, including unselected library sections.
-    pub max_bytes: usize,
+    pub bytes: usize,
     /// Total processed cards, including directives and structural terminators.
     ///
     /// C ngspice (`inpcom.c`, `inp_readall`) has no such cap; the port keeps one
@@ -33,16 +33,16 @@ pub struct SourceLimits {
     /// times the default subcircuit device budget (`SubcircuitLimits::max_devices`
     /// in the devices layer, 250,000), so a flat deck that the expansion budget
     /// accepts is not rejected here for its size.
-    pub max_cards: usize,
+    pub cards: usize,
 }
 
 impl Default for SourceLimits {
     fn default() -> Self {
         Self {
-            max_depth: 64,
-            max_files: 1024,
-            max_bytes: 16 * 1024 * 1024,
-            max_cards: 1_000_000,
+            depth: 64,
+            files: 1024,
+            bytes: 16 * 1024 * 1024,
+            cards: 1_000_000,
         }
     }
 }
@@ -63,7 +63,7 @@ pub(super) fn resolve(
     limits: SourceLimits,
 ) -> SpiceResult<(Deck, Vec<SpiceResult<InputCard>>)> {
     let location = SourceLoc::new(path.to_path_buf(), 1, 1);
-    if limits.max_depth > 64 {
+    if limits.depth > 64 {
         return Err(SpiceError::parse(
             location,
             "source depth limit must be at most 64",
@@ -81,9 +81,10 @@ pub(super) fn resolve(
     let text = resolver.read(&canonical, &location)?;
     // Keep the caller's root path/title API; fragments use canonical paths.
     let deck = parse_deck_text(path, &text);
+    drop(text);
     let root = resolver.node((canonical, None));
     let mut output = Vec::new();
-    if let Err(error) = resolver.expand(&deck.lines, root, &[], &mut output) {
+    if let Err(error) = resolver.expand(&deck.lines, root, &mut Vec::new(), &mut output) {
         // Replay resolution errors alongside cards so an earlier unsupported
         // directive/device keeps its diagnostic instead of a later I/O error.
         output.push(Err(error));
@@ -93,14 +94,14 @@ pub(super) fn resolve(
 
 impl Resolver {
     fn read(&mut self, path: &Path, location: &SourceLoc) -> SpiceResult<String> {
-        if self.files >= self.limits.max_files {
+        if self.files >= self.limits.files {
             return Err(SpiceError::parse(
                 location.clone(),
                 "source file work limit exceeded",
             ));
         }
         self.files += 1;
-        let remaining = self.limits.max_bytes.saturating_sub(self.bytes);
+        let remaining = self.limits.bytes.saturating_sub(self.bytes);
         let mut bytes = Vec::new();
         let file = File::open(path).map_err(|e| SpiceError::io(path, &e))?;
         file.take(
@@ -132,16 +133,16 @@ impl Resolver {
         &mut self,
         lines: &[LogicalLine],
         parent: NodeIndex,
-        chain: &[SourceLoc],
+        chain: &mut Vec<SourceLoc>,
         output: &mut Vec<SpiceResult<InputCard>>,
     ) -> SpiceResult<bool> {
         for line in lines {
-            if self.cards >= self.limits.max_cards {
+            if self.cards >= self.limits.cards {
                 return Err(SpiceError::parse(
                     line.location.clone(),
                     format!(
                         "source card work limit exceeded ({} cards, counting repeated includes)",
-                        self.limits.max_cards
+                        self.limits.cards
                     ),
                 ));
             }
@@ -160,14 +161,14 @@ impl Resolver {
             );
             let mut entry = InputCard {
                 source: card,
-                include_chain: chain.to_vec(),
+                include_chain: chain.clone(),
                 resolved_path: None,
                 selected_section: None,
             };
             if include {
                 let parsed = grammar::parse_card(&entry.source, true, &BTreeSet::new())?;
                 if let ParsedCard::Include(directive) = parsed {
-                    if chain.len() >= self.limits.max_depth {
+                    if chain.len() >= self.limits.depth {
                         return Err(SpiceError::parse(
                             directive.location,
                             "source include depth limit exceeded",
@@ -210,6 +211,7 @@ impl Resolver {
                         )
                     })?;
                     let fragment = parse_fragment_text(&canonical, &text);
+                    drop(text);
                     let selected = match directive.section {
                         Some(section) => {
                             let (lines, boundaries) =
@@ -217,12 +219,13 @@ impl Resolver {
                             entry.selected_section = Some(boundaries);
                             lines
                         }
-                        None => fragment.lines,
+                        None => fragment.lines.as_slice(),
                     };
                     output.push(Ok(entry));
-                    let mut nested_chain = chain.to_vec();
-                    nested_chain.push(directive.location);
-                    if self.expand(&selected, child, &nested_chain, output)? {
+                    chain.push(directive.location);
+                    let result = self.expand(selected, child, chain, output);
+                    chain.pop();
+                    if result? {
                         return Ok(true);
                     }
                     continue;
@@ -239,16 +242,15 @@ impl Resolver {
 
 /// Validate section boundaries even in unselected blocks; do not tokenize or
 /// resolve ordinary cards in those blocks. Section names are case-insensitive.
-fn select_section(
-    lines: &[LogicalLine],
+fn select_section<'a>(
+    lines: &'a [LogicalLine],
     requested: &str,
     location: &SourceLoc,
-) -> SpiceResult<(Vec<LogicalLine>, LibrarySection)> {
-    let mut current: Option<(String, RawCard)> = None;
+) -> SpiceResult<(&'a [LogicalLine], LibrarySection)> {
+    let mut current: Option<(String, RawCard, usize)> = None;
     let mut sections = BTreeSet::new();
-    let mut selected = Vec::new();
-    let mut boundaries = None;
-    for line in lines {
+    let mut selected = None;
+    for (index, line) in lines.iter().enumerate() {
         let keyword = line.text.split_whitespace().next().unwrap_or_default();
         if keyword.eq_ignore_ascii_case(".lib") || keyword.eq_ignore_ascii_case(".endl") {
             let card = RawCard::parse(line)?;
@@ -266,11 +268,10 @@ fn select_section(
                             format!("duplicate library section '{name}'"),
                         ));
                     }
-                    current = Some((name, card));
-                    continue;
+                    current = Some((name, card, index + 1));
                 }
                 ParsedCard::LibEnd(name) => {
-                    let Some((expected, opening)) = current.take() else {
+                    let Some((expected, opening, start)) = current.take() else {
                         return Err(SpiceError::parse(line.location.clone(), "unmatched .endl"));
                     };
                     if name.as_deref().is_some_and(|n| n != expected) {
@@ -280,13 +281,17 @@ fn select_section(
                         ));
                     }
                     if expected == requested {
-                        boundaries = Some(LibrarySection {
-                            name: expected,
-                            opening,
-                            closing: card,
-                        });
+                        // No nested sections are permitted, so the body is
+                        // exactly the original contiguous slice.
+                        selected = Some((
+                            &lines[start..index],
+                            LibrarySection {
+                                name: expected,
+                                opening,
+                                closing: card,
+                            },
+                        ));
                     }
-                    continue;
                 }
                 ParsedCard::Include(_) => {}
                 _ => {
@@ -297,21 +302,18 @@ fn select_section(
                 }
             }
         }
-        if current.as_ref().is_some_and(|(name, _)| name == requested) {
-            selected.push(line.clone());
-        }
     }
-    if let Some((name, start)) = current {
+    if let Some((name, start, _)) = current {
         return Err(SpiceError::parse(
             start.location,
             format!("missing .endl for '{name}'"),
         ));
     }
-    let Some(boundaries) = boundaries else {
+    let Some(selected) = selected else {
         return Err(SpiceError::parse(
             location.clone(),
             format!("library section '{requested}' not found"),
         ));
     };
-    Ok((selected, boundaries))
+    Ok(selected)
 }

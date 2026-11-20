@@ -36,7 +36,16 @@
 //!   writes, hold what an earlier analysis's `MODEINITSMSIG` load left (zero
 //!   when none ran). Each parameter's AC load reads those, the reset's
 //!   `CKTstate0`, and the setup/temperature members of the present records.
-#![allow(non_snake_case)] // C's member names.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)] // C's member names.
 
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -77,7 +86,7 @@ const INTERNAL: [i32; 8] = [
 ];
 
 /// The instance's internal node members in [`INTERNAL`] order.
-fn internal_members(h: &Instance) -> [i32; 8] {
+const fn internal_members(h: &Instance) -> [i32; 8] {
     [
         h.dNodePrime,
         h.sNodePrime,
@@ -244,7 +253,7 @@ fn instance_table() -> &'static [P] {
 }
 
 /// One BSIM4 instance as `.sens` sees it.
-pub(crate) struct Bsim4Sensitivity<'a> {
+pub(super) struct Bsim4Sensitivity<'a> {
     device: &'a Bsim4,
     context: ModelContext,
     /// The model's VERSION string (not a numeric member).
@@ -436,7 +445,14 @@ impl DeviceSensitivity for Bsim4Sensitivity<'_> {
     /// which happens once a `.sens` setup re-run has aliased it.
     fn unsetup(&self, _model: &mut Record, instance: &mut Record) -> SpiceResult<()> {
         let (mut h, size, _) = Self::instance_of(instance);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "CREATED encodes the BSIM4-local 12-node creation bitmask"
+        )]
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "CREATED contains only nonnegative node-creation bits"
+        )]
         let created = instance.value(CREATED)? as u32;
         let survives = internal_members(&h)
             .into_iter()
@@ -558,7 +574,7 @@ impl DeviceSensitivity for Bsim4Sensitivity<'_> {
             // model pass stands, the instance keeps its members, and its
             // `pParam` is the freshly allocated (zeroed) set with only the
             // geometry assigned before the failing check.
-            Err(SpiceError::NotYetPorted { .. }) | Err(SpiceError::Unsupported { .. }) => {
+            Err(SpiceError::NotYetPorted { .. } | SpiceError::Unsupported { .. }) => {
                 return Err(SpiceError::circuit(format!(
                     "{}: BSIM4 temperature pass failed under .sens",
                     self.device.name

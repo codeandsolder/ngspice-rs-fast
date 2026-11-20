@@ -43,7 +43,7 @@ fn divider_branch_sign_and_ground_elimination() {
     assert!(p.variable_index("v(0)").is_none());
     assert_eq!(c.branch_rows(0), Some(2..3));
     // Rebinding after a new node shifts branch rows, without stale device state.
-    let n = c.add_node("later");
+    let n = c.add_node("later").unwrap();
     c.add_device(Box::new(
         ngspice_rs::devices::Resistor::new("r3", [n, ngspice_rs::primitives::NodeId::GROUND], 1.)
             .unwrap(),

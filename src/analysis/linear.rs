@@ -4,19 +4,19 @@ use crate::analysis::{AnalysisRequest, Plot};
 use crate::devices::Circuit;
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult, parse_spice_number};
 
-pub(crate) fn unsupported(feature: impl Into<String>) -> SpiceError {
+pub(super) fn unsupported(feature: impl Into<String>) -> SpiceError {
     SpiceError::Unsupported {
         feature: feature.into(),
         location: None,
     }
 }
-pub(crate) fn number(text: Option<&str>, name: &str) -> SpiceResult<Real> {
+pub(super) fn number(text: Option<&str>, name: &str) -> SpiceResult<Real> {
     text.and_then(parse_spice_number)
         .filter(|v| v.is_finite())
         .ok_or_else(|| unsupported(format!("expected finite {name}")))
 }
 
-pub(crate) fn plot(
+pub(super) fn plot(
     circuit: &Circuit,
     name: &str,
     title: &str,
@@ -47,7 +47,13 @@ pub(crate) fn plot(
     let mut names: Vec<Option<(String, &str)>> = vec![None; circuit.unknown_count()];
     for node in circuit.nodes().nodes() {
         if let Some(row) = circuit.unknowns().node_row(node.id) {
-            names[row] = Some((format!("v({})", node.name), "voltage"));
+            let entry = names.get_mut(row).ok_or_else(|| {
+                SpiceError::circuit(format!(
+                    "node {} references nonexistent MNA row {row}",
+                    node.name
+                ))
+            })?;
+            *entry = Some((format!("v({})", node.name), "voltage"));
         }
     }
     for (index, device) in circuit.devices().iter().enumerate() {
@@ -56,11 +62,20 @@ pub(crate) fn plot(
         // twice, in branch order (`raw_write` strips CKTmkCur's `#branchN`
         // suffix). The MNA rows keep `#branch1`/`#branch2`
         // (`Circuit::unknown_names`), which is what solver diagnostics use.
-        let rows = circuit
-            .branch_rows(index)
-            .expect("a finalized circuit has branch rows for every device ordinal");
+        let rows = circuit.branch_rows(index).ok_or_else(|| {
+            SpiceError::circuit(format!(
+                "device {} is missing its MNA branch rows",
+                device.name()
+            ))
+        })?;
         for row in rows {
-            names[row] = Some((format!("i({})", device.name()), "current"));
+            let entry = names.get_mut(row).ok_or_else(|| {
+                SpiceError::circuit(format!(
+                    "device {} references nonexistent MNA branch row {row}",
+                    device.name()
+                ))
+            })?;
+            *entry = Some((format!("i({})", device.name()), "current"));
         }
     }
     for (name, unit) in names.into_iter().flatten() {
@@ -72,7 +87,7 @@ pub(crate) fn plot(
     Ok(plot)
 }
 
-pub(crate) fn op(
+pub(super) fn op(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &crate::analysis::AnalysisContext,
@@ -88,26 +103,14 @@ pub(crate) fn op(
     // .nodeset is forced in the MODEINITJCT/MODEINITFIX loads of a nonlinear
     // solve and cannot change a linear operating point. Both are validated.
     circuit.finalize()?;
-    let hints = crate::analysis::initial::resolve(circuit, request)?;
-    let nodes = crate::analysis::bias::NodeForcing {
-        initial: Vec::new(),
-        nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
-    };
-    let mut seed = crate::maths::Vector::zeros(circuit.unknown_count());
-    for hint in hints.nodesets {
-        seed.as_mut_slice()[hint.row] = hint.value;
-    }
-    let x = crate::analysis::bias::solve_dc_forced(
-        circuit,
-        &context.model_context(),
-        &crate::analysis::bias::DcSettings::from_request(request)?,
-        &[],
-        Some(&seed),
-        None,
-        &nodes,
-    )?
-    .solution
-    .values;
+    let model = context.model_context();
+    let x = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?
+        .solve(
+            circuit,
+            &model,
+            &crate::analysis::bias::DcSettings::from_request(request)?,
+        )?
+        .values;
     let mut plot = plot(circuit, "op1", "Operating Point", None, false)?;
     circuit.accept_solution(&x, None)?;
     let history = circuit.state_history();
@@ -115,7 +118,7 @@ pub(crate) fn op(
         &crate::devices::LoadRequest {
             mode: crate::devices::AnalysisMode::OperatingPoint,
             solution: &x,
-            model_context: &context.model_context(),
+            model_context: &model,
             integration: None,
             history: &history,
             forcing: None,
@@ -127,10 +130,13 @@ pub(crate) fn op(
     let mut point: Vec<_> = x.as_slice().iter().map(|v| Complex::real(*v)).collect();
     point.extend(values);
     plot.push_point(point)?;
+    // dcop.c performs MODEINITSMSIG after CKTop. Publish its persistent
+    // device fields for the next analysis, just as the AC preparation does.
+    circuit.record_small_signal_state(&model, &x)?;
     Ok(plot)
 }
 
-pub(crate) fn dc(
+pub(super) fn dc(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &crate::analysis::AnalysisContext,

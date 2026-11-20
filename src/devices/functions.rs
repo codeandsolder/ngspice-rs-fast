@@ -46,6 +46,7 @@
 //! warning); and every value is checked to be finite.
 
 use std::f64::consts::PI;
+use std::sync::Arc;
 
 use crate::devices::{Limit, TransientTiming};
 use crate::primitives::{Real, SpiceError, SpiceResult};
@@ -191,7 +192,7 @@ pub enum FunctionSpec {
 }
 
 impl FunctionSpec {
-    fn kind(&self) -> &'static str {
+    const fn kind(&self) -> &'static str {
         match self {
             Self::Sine(_) => "SIN",
             Self::Exp(_) => "EXP",
@@ -267,7 +268,7 @@ impl FunctionSpec {
     pub fn time_zero(&self) -> SpiceResult<Real> {
         self.validate()?;
         let value = match self {
-            Self::Sine(s) => s.offset + s.amplitude * (s.phase.unwrap_or(0.) * PI / 180.).sin(),
+            Self::Sine(s) => held_sine(s.offset, s.amplitude, phase_radians(s.phase.unwrap_or(0.))),
             Self::Exp(e) => e.initial,
             Self::Sffm(_) | Self::Am(_) => 0.,
         };
@@ -282,12 +283,12 @@ impl FunctionSpec {
         self.validate()?;
         let kind = self.kind();
         let step = timing.step();
-        let stop = timing.final_time();
+        let final_time = timing.final_time();
         let resolved = match *self {
             Self::Sine(s) => SourceFunction::Sine(Sine {
                 offset: s.offset,
                 amplitude: s.amplitude,
-                frequency: or_default(s.frequency, true, 1. / stop),
+                frequency: or_default(s.frequency, true, 1. / final_time),
                 delay: s.delay.unwrap_or(0.),
                 damping: s.damping.unwrap_or(0.),
                 phase: s.phase.unwrap_or(0.),
@@ -304,8 +305,8 @@ impl FunctionSpec {
                 })
             }
             Self::Sffm(f) => {
-                let carrier = or_default(f.carrier, false, 5. / stop);
-                let signal = or_default(f.signal, true, 500. / stop);
+                let carrier = or_default(f.carrier, false, 5. / final_time);
+                let signal = or_default(f.signal, true, 500. / final_time);
                 let mut index = or_default(f.index, false, 90.);
                 // vsrcload.c limits the modulation index on every load.
                 if index > carrier / signal {
@@ -328,8 +329,8 @@ impl FunctionSpec {
                 offset: a.offset,
                 carrier_amplitude: a.carrier_amplitude,
                 modulation_amplitude: or_default(a.modulation_amplitude, false, 1.),
-                modulation_frequency: or_default(a.modulation_frequency, false, 5. / stop),
-                carrier_frequency: or_default(a.carrier_frequency, false, 500. / stop),
+                modulation_frequency: or_default(a.modulation_frequency, false, 5. / final_time),
+                carrier_frequency: or_default(a.carrier_frequency, false, 500. / final_time),
                 delay: a.delay.unwrap_or(0.),
                 modulation_phase: a.modulation_phase.unwrap_or(0.),
                 carrier_phase: a.carrier_phase.unwrap_or(0.),
@@ -396,6 +397,114 @@ pub struct Am {
     carrier_phase: Real,
 }
 
+/// The phase conversion in `vsrcload.c` and `isrcload.c` rounds the product
+/// before dividing by 180, rather than multiplying by a precomputed ratio.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "retain C phase conversion multiplication and division order"
+)]
+const fn phase_radians(degrees: Real) -> Real {
+    degrees * PI / 180.
+}
+
+/// SIN before its delay and in DC share the same reference formula.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "C SIN offset addition follows a separately rounded amplitude product"
+)]
+fn held_sine(offset: Real, amplitude: Real, radians: Real) -> Real {
+    offset + amplitude * radians.sin()
+}
+
+/// SFFM and AM both use the C left-associated carrier/modulator angle.
+const fn modulation_angle(frequency: Real, time: Real, radians: Real) -> Real {
+    2. * PI * frequency * time + radians
+}
+
+impl Sine {
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "C SIN time-frequency product, phase addition and damping have a fixed rounding order"
+    )]
+    fn value_at(self, t: Real) -> Real {
+        let time = t - self.delay;
+        let phase = phase_radians(self.phase);
+        if time <= 0. {
+            held_sine(self.offset, self.amplitude, phase)
+        } else {
+            self.offset
+                + self.amplitude
+                    * (self.frequency * time * 2. * PI + phase).sin()
+                    * (-time * self.damping).exp()
+        }
+    }
+}
+
+impl Exponential {
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "C EXP adds the rise contribution before the separately rounded fall contribution"
+    )]
+    fn value_at(self, time: Real) -> Real {
+        let rise = |time: Real| {
+            (self.pulsed - self.initial) * (1. - (-(time - self.rise_delay) / self.rise_tau).exp())
+        };
+        if time <= self.rise_delay {
+            self.initial
+        } else if time <= self.fall_delay {
+            self.initial + rise(time)
+        } else {
+            self.initial
+                + rise(time)
+                + (self.initial - self.pulsed)
+                    * (1. - (-(time - self.fall_delay) / self.fall_tau).exp())
+        }
+    }
+}
+
+impl Sffm {
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "C SFFM separately rounds the modulation index product and the offset sum"
+    )]
+    fn value_at(self, t: Real, limit: Limit) -> Real {
+        let time = t - self.delay;
+        if time < 0. || (time == 0. && limit == Limit::Left) {
+            return 0.;
+        }
+        let carrier_angle = modulation_angle(self.carrier, time, phase_radians(self.carrier_phase));
+        let signal_angle = modulation_angle(self.signal, time, phase_radians(self.signal_phase));
+        let angle = carrier_angle + self.index * signal_angle.sin();
+        self.offset + self.amplitude * angle.sin()
+    }
+}
+
+impl Am {
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "C AM rounds the modulation product and carrier amplitude before the final offset sum"
+    )]
+    fn value_at(self, t: Real, limit: Limit) -> Real {
+        let time = t - self.delay;
+        if time < 0. || (time == 0. && limit == Limit::Left) {
+            return 0.;
+        }
+        let carrier_angle = modulation_angle(
+            self.carrier_frequency,
+            time,
+            phase_radians(self.carrier_phase),
+        );
+        let signal_angle = modulation_angle(
+            self.modulation_frequency,
+            time,
+            phase_radians(self.modulation_phase),
+        );
+        self.offset
+            + (self.carrier_amplitude + self.modulation_amplitude * signal_angle.sin())
+                * carrier_angle.sin()
+    }
+}
+
 /// A fully specified SIN/EXP/SFFM/AM.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SourceFunction {
@@ -410,7 +519,7 @@ pub enum SourceFunction {
 }
 
 impl SourceFunction {
-    fn kind(&self) -> &'static str {
+    const fn kind(&self) -> &'static str {
         match self {
             Self::Sine(_) => "SIN",
             Self::Exp(_) => "EXP",
@@ -474,60 +583,10 @@ impl SourceFunction {
             return Err(invalid(kind, "nonfinite evaluation time"));
         }
         let value = match *self {
-            Self::Sine(s) => {
-                let time = t - s.delay;
-                let phase = s.phase * PI / 180.;
-                if time <= 0. {
-                    s.offset + s.amplitude * phase.sin()
-                } else {
-                    s.offset
-                        + s.amplitude
-                            * (s.frequency * time * 2. * PI + phase).sin()
-                            * (-time * s.damping).exp()
-                }
-            }
-            Self::Exp(e) => {
-                let rise = |time: Real| {
-                    (e.pulsed - e.initial) * (1. - (-(time - e.rise_delay) / e.rise_tau).exp())
-                };
-                if t <= e.rise_delay {
-                    e.initial
-                } else if t <= e.fall_delay {
-                    e.initial + rise(t)
-                } else {
-                    e.initial
-                        + rise(t)
-                        + (e.initial - e.pulsed) * (1. - (-(t - e.fall_delay) / e.fall_tau).exp())
-                }
-            }
-            Self::Sffm(f) => {
-                let time = t - f.delay;
-                if time < 0. || (time == 0. && limit == Limit::Left) {
-                    0.
-                } else {
-                    let phasec = f.carrier_phase * PI / 180.;
-                    let phasem = f.signal_phase * PI / 180.;
-                    f.offset
-                        + f.amplitude
-                            * ((2. * PI * f.carrier * time + phasec)
-                                + f.index * (2. * PI * f.signal * time + phasem).sin())
-                            .sin()
-                }
-            }
-            Self::Am(a) => {
-                let time = t - a.delay;
-                if time < 0. || (time == 0. && limit == Limit::Left) {
-                    0.
-                } else {
-                    let phasec = a.carrier_phase * PI / 180.;
-                    let phasem = a.modulation_phase * PI / 180.;
-                    a.offset
-                        + (a.carrier_amplitude
-                            + a.modulation_amplitude
-                                * (2. * PI * a.modulation_frequency * time + phasem).sin())
-                            * (2. * PI * a.carrier_frequency * time + phasec).sin()
-                }
-            }
+            Self::Sine(sine) => sine.value_at(t),
+            Self::Exp(exponential) => exponential.value_at(t),
+            Self::Sffm(sffm) => sffm.value_at(t, limit),
+            Self::Am(am) => am.value_at(t, limit),
         };
         finite(kind, value)
     }
@@ -563,7 +622,7 @@ impl SourceFunction {
 /// landing times bit for bit, so the requested [`Limit`] is ignored.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PwlSource {
-    knots: Vec<(Real, Real)>,
+    knots: Arc<[(Real, Real)]>,
     delay: Real,
     repeat: Option<usize>,
 }
@@ -609,15 +668,21 @@ impl PwlSource {
                         format!("repeat start r={r} must be smaller than the last time point"),
                     ));
                 }
-                let index = knots.iter().position(|(t, _)| *t == r).ok_or_else(|| {
-                    invalid(kind, format!("repeat start r={r} matches no time point"))
-                })?;
+                // Knots are finite and ordered. Locate the exact time without
+                // changing IEEE equality for the two representations of zero.
+                let index = knots.partition_point(|(time, _)| *time < r);
+                if knots.get(index).is_none_or(|(time, _)| *time > r) {
+                    return Err(invalid(
+                        kind,
+                        format!("repeat start r={r} matches no time point"),
+                    ));
+                }
                 Some(index)
             }
             _ => None,
         };
         Ok(Self {
-            knots,
+            knots: knots.into(),
             delay,
             repeat,
         })
@@ -642,15 +707,20 @@ impl PwlSource {
     }
 
     /// Linear interpolation at an in-range local time (C's segment search).
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "C PWL interpolation rounds the scaled segment difference before adding its starting value"
+    )]
     fn interpolate(&self, time: Real) -> Real {
-        for pair in self.knots.windows(2) {
-            let ((t0, v0), (t1, v1)) = (pair[0], pair[1]);
-            if t1 >= time {
-                let fraction = (time - t0) / (t1 - t0);
-                return v0 + fraction * (v1 - v0);
-            }
-        }
-        self.knots[self.knots.len() - 1].1
+        // Strictly increasing finite knots are guaranteed by the constructor.
+        // Search right endpoints, choosing the preceding segment at an exact
+        // knot just as C's first t1 >= time does (including its rounding).
+        let left = self.knots[1..].partition_point(|(t, _)| *t < time);
+        let (t0, v0) = self.knots[left];
+        self.knots.get(left + 1).map_or(v0, |&(t1, v1)| {
+            let fraction = (time - t0) / (t1 - t0);
+            v0 + fraction * (v1 - v0)
+        })
     }
 
     /// Forcing at `t` with the requested one-sided limit.
@@ -658,6 +728,10 @@ impl PwlSource {
     /// # Errors
     /// `t` nonfinite, or so many repetitions from the origin that the
     /// in-cycle position is unresolvable.
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "C PWL repeat folding subtracts the rounded period times cycle"
+    )]
     pub fn value_at(&self, t: Real, limit: Limit) -> SpiceResult<Real> {
         let kind = "PWL";
         // vsrcload.c evaluates a single value; see the type documentation.
@@ -758,6 +832,10 @@ pub struct PwlBreakpoints {
 
 impl Iterator for PwlBreakpoints {
     type Item = Real;
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "retain separate rounded period offsets for repeat-boundary comparisons"
+    )]
     fn next(&mut self) -> Option<Real> {
         let knots = &self.source.knots;
         while !self.done {
@@ -1073,6 +1151,71 @@ mod tests {
         // Mid-run windows skip earlier repetitions without missing corners.
         let window: Vec<_> = tri.breakpoints_in(1000., 1002.5).unwrap().collect();
         assert_eq!(window, [1000., 1001., 1002.]);
+    }
+
+    #[test]
+    fn pwl_binary_lookup_preserves_linear_search_bits() {
+        let knots: Vec<_> = (0..257)
+            .map(|i| {
+                let t = Real::from(i);
+                (t * t * 0.01, if i % 2 == 0 { t * 0.001 } else { -t * 1e12 })
+            })
+            .collect();
+        let p = PwlSource::new(knots.clone(), 0., None).unwrap();
+        for pair in knots.windows(2) {
+            let (t0, t1) = (pair[0].0, pair[1].0);
+            for t in [t0, t0.midpoint(t1), t1, t1.next_down(), t1.next_up()] {
+                let expected = knots
+                    .windows(2)
+                    .find_map(|w| {
+                        let ((a, x), (b, y)) = (w[0], w[1]);
+                        (b >= t).then(|| {
+                            let fraction = (t - a) / (b - a);
+                            x + fraction * (y - x)
+                        })
+                    })
+                    .unwrap_or(knots.last().unwrap().1);
+                assert_eq!(p.interpolate(t).to_bits(), expected.to_bits(), "t={t}");
+            }
+        }
+        let single = PwlSource::new(vec![(0., -0.)], 0., None).unwrap();
+        assert_eq!(single.interpolate(1.).to_bits(), (-0.0_f64).to_bits());
+    }
+
+    #[test]
+    fn pwl_breakpoint_iterators_share_knot_storage() {
+        let source = PwlSource::new(vec![(0., 0.), (1., 1.), (2., 0.)], 0., Some(0.)).unwrap();
+        let mut first = source.breakpoints_in(0., 6.).unwrap();
+        let mut second = first.clone();
+        assert!(Arc::ptr_eq(&source.knots, &first.source.knots));
+        assert!(Arc::ptr_eq(&first.source.knots, &second.source.knots));
+        assert_eq!(first.next(), Some(0.));
+        assert_eq!(first.next(), Some(1.));
+        assert_eq!(second.next(), Some(0.));
+        assert_eq!(first.collect::<Vec<_>>(), [2., 3., 4., 5., 6.]);
+        assert_eq!(second.collect::<Vec<_>>(), [1., 2., 3., 4., 5., 6.]);
+    }
+
+    #[test]
+    fn pwl_repeat_lookup_requires_exact_knot_and_accepts_signed_zero() {
+        let knots = vec![(-0.0, 1.), (0.25, 2.), (1., 3.)];
+        for zero in [0.0, -0.0] {
+            assert_eq!(
+                PwlSource::new(knots.clone(), 0., Some(zero))
+                    .unwrap()
+                    .repeat(),
+                Some(0)
+            );
+        }
+        assert_eq!(
+            PwlSource::new(knots.clone(), 0., Some(0.25))
+                .unwrap()
+                .repeat(),
+            Some(1)
+        );
+        for unmatched in [0.25_f64.next_down(), 0.25_f64.next_up(), -0.25] {
+            assert!(PwlSource::new(knots.clone(), 0., Some(unmatched)).is_err());
+        }
     }
 
     #[test]

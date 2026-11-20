@@ -11,7 +11,7 @@ use std::{hint::black_box, time::Instant};
 fn measure<T>(
     case: &str,
     backend: &str,
-    repeats: usize,
+    repeats: u32,
     expected: &[f64],
     build: impl Fn() -> SpiceResult<T>,
     solve: impl Fn(&T) -> SpiceResult<Vec<f64>>,
@@ -68,11 +68,11 @@ fn measure<T>(
     }
     println!(
         "{case},{backend},repeats={repeats},factor_ok={factors_ok},solve_ok={solves_ok},failures={failed},factor_mean_us={:.3},solve_mean_us={:.3},worst_relative_forward_error={},first_failure={}",
-        factor_time * 1e6 / repeats as f64,
+        factor_time * 1e6 / f64::from(repeats),
         if factors_ok == 0 {
             0.0
         } else {
-            solve_time * 1e6 / (4 * factors_ok) as f64
+            solve_time * 1e6 / f64::from(4 * factors_ok)
         },
         worst_error.map_or_else(|| "not-measured".into(), |v| format!("{v:.3e}")),
         first_failure.as_deref().unwrap_or("none")
@@ -83,123 +83,148 @@ fn flatten(x: &[Complex]) -> Vec<f64> {
     x.iter().flat_map(|v| [v.re, v.im]).collect()
 }
 
-fn run(
-    case: &str,
-    n: usize,
-    ill_scaled: bool,
-    failure: Option<&str>,
-    repeats: usize,
-) -> SpiceResult<()> {
-    let mut s = SparseMatrix::new(n, n);
-    let mut d = Matrix::zeros(n, n);
-    let mut e = SparseMatrix::new(n, n);
-    let columns: Vec<_> = (0..n)
-        .map(|c| {
-            if ill_scaled {
-                2.0_f64.powi(if c % 2 == 0 { 40 } else { -40 })
+struct Operators {
+    conductance: SparseMatrix,
+    dense: Matrix,
+    susceptance: SparseMatrix,
+    columns: Vec<f64>,
+}
+
+impl Operators {
+    fn new(size: usize, ill_scaled: bool, failure: Option<&str>) -> SpiceResult<Self> {
+        let mut conductance = SparseMatrix::new(size, size);
+        let mut dense = Matrix::zeros(size, size)?;
+        let mut susceptance = SparseMatrix::new(size, size);
+        let columns: Vec<_> = (0..size)
+            .map(|column| {
+                if ill_scaled {
+                    2.0_f64.powi(if column % 2 == 0 { 40 } else { -40 })
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        for row_index in 0..size {
+            let row_scale = if ill_scaled {
+                2.0_f64.powi(if row_index % 2 == 0 { 20 } else { -20 })
             } else {
                 1.0
-            }
-        })
-        .collect();
-    for r in 0..n {
-        let row = if ill_scaled {
-            2.0_f64.powi(if r % 2 == 0 { 20 } else { -20 })
-        } else {
-            1.0
-        };
-        for (c, &column) in columns.iter().enumerate() {
-            let v = if r == c {
-                4.0
-            } else if c + 1 == r {
-                -1.0
-            } else if r + 1 == c {
-                0.5
-            } else {
-                0.0
             };
-            s.add(r, c, row * v * column)?;
-            d.set(r, c, row * v * column)?;
+            for (column_index, &column_scale) in columns.iter().enumerate() {
+                let coefficient = if row_index == column_index {
+                    4.0
+                } else if column_index + 1 == row_index {
+                    -1.0
+                } else if row_index + 1 == column_index {
+                    0.5
+                } else {
+                    0.0
+                };
+                let value = row_scale * coefficient * column_scale;
+                conductance.add(row_index, column_index, value)?;
+                dense.set(row_index, column_index, value)?;
+            }
+            susceptance.add(row_index, row_index, row_scale * 0.25 * columns[row_index])?;
         }
-        e.add(r, r, row * 0.25 * columns[r])?;
-    }
-    if let Some(kind) = failure {
-        s.clear();
-        d.clear();
-        e.clear();
-        let values = match kind {
-            "singular" => [1.0, 1.0, 1.0, 1.0],
-            "near-dependent" => [1.0, 1.0, 1.0, 1.0 + 1e-15],
-            "underflow" => [1e300, 1e-300, 0.0, 1.0],
-            _ => [1e308, 0.0, 0.0, 1e308],
-        };
-        for (i, &v) in values.iter().enumerate() {
-            s.add(i / 2, i % 2, v)?;
-            d.set(i / 2, i % 2, v)?;
+        if let Some(kind) = failure {
+            conductance.clear();
+            dense.clear();
+            susceptance.clear();
+            let values = match kind {
+                "singular" => [1.0, 1.0, 1.0, 1.0],
+                "near-dependent" => [1.0, 1.0, 1.0, 1.0 + 1e-15],
+                "underflow" => [1e300, 1e-300, 0.0, 1.0],
+                _ => [1e308, 0.0, 0.0, 1e308],
+            };
+            for (index, &value) in values.iter().enumerate() {
+                conductance.add(index / 2, index % 2, value)?;
+                dense.set(index / 2, index % 2, value)?;
+            }
         }
+        Ok(Self {
+            conductance,
+            dense,
+            susceptance,
+            columns,
+        })
     }
-    let expected = Vector::from_slice(&columns.iter().map(|v| 1.0 / v).collect::<Vec<_>>());
-    let b = s.mul_vector(&expected)?;
+}
+
+fn run(
+    case: &str,
+    size: usize,
+    ill_scaled: bool,
+    failure: Option<&str>,
+    repeats: u32,
+) -> SpiceResult<()> {
+    let Operators {
+        conductance,
+        dense,
+        susceptance,
+        columns,
+    } = Operators::new(size, ill_scaled, failure)?;
+    let expected = Vector::from_slice(&columns.iter().map(|value| 1.0 / value).collect::<Vec<_>>());
+    let real_rhs = conductance.mul_vector(&expected)?;
     measure(
         case,
         "dense-default",
         repeats,
         expected.as_slice(),
-        || d.lu_decompose(),
-        |f| Ok(f.solve(&b)?.as_slice().to_vec()),
+        || dense.lu_decompose(),
+        |factor| Ok(factor.solve(&real_rhs)?.as_slice().to_vec()),
     );
     measure(
         case,
         "dense-equilibrated",
         repeats,
         expected.as_slice(),
-        || EquilibratedDenseLu::new(&d),
-        |f| Ok(f.solve(&b)?.as_slice().to_vec()),
+        || EquilibratedDenseLu::new(&dense),
+        |factor| Ok(factor.solve(&real_rhs)?.as_slice().to_vec()),
     );
     measure(
         case,
         "sparse-default",
         repeats,
         expected.as_slice(),
-        || s.factorize(),
-        |f| Ok(f.solve(&b)?.as_slice().to_vec()),
+        || conductance.factorize(),
+        |factor| Ok(factor.solve(&real_rhs)?.as_slice().to_vec()),
     );
     measure(
         case,
         "sparse-equilibrated",
         repeats,
         expected.as_slice(),
-        || EquilibratedSparseLu::new(&s, None),
-        |f| Ok(f.solve(&b)?.as_slice().to_vec()),
+        || EquilibratedSparseLu::new(&conductance, None),
+        |factor| Ok(factor.solve(&real_rhs)?.as_slice().to_vec()),
     );
-    let x: Vec<_> = expected
+    let solution: Vec<_> = expected
         .as_slice()
         .iter()
-        .map(|&v| Complex::new(v, -0.5 * v))
+        .map(|&value| Complex::new(value, -0.5 * value))
         .collect();
-    let mut rhs = vec![Complex::ZERO; n];
-    for t in s.triplets() {
-        rhs[t.row] = rhs[t.row] + Complex::real(t.value) * x[t.col];
+    let mut rhs = vec![Complex::ZERO; size];
+    for entry in conductance.triplets() {
+        rhs[entry.row] = rhs[entry.row] + Complex::real(entry.value) * solution[entry.col];
     }
-    for t in e.triplets() {
-        rhs[t.row] = rhs[t.row] + Complex::imaginary(t.value) * x[t.col];
+    for entry in susceptance.triplets() {
+        rhs[entry.row] = rhs[entry.row] + Complex::imaginary(entry.value) * solution[entry.col];
     }
-    let expected = flatten(&x);
+    let expected = flatten(&solution);
     measure(
         case,
         "complex-default",
         repeats,
         &expected,
-        || ComplexMatrix::from_operators(&s, &e, 1.0)?.factorize(),
-        |f| Ok(flatten(&f.solve(&rhs)?)),
+        || ComplexMatrix::from_operators(&conductance, &susceptance, 1.0)?.factorize(),
+        |factor| Ok(flatten(&factor.solve(&rhs)?)),
     );
     measure(
         case,
         "complex-equilibrated",
         repeats,
         &expected,
-        || EquilibratedComplexLu::from_operators(&s, &e, 1.0),
-        |f| Ok(flatten(&f.solve(&rhs)?)),
+        || EquilibratedComplexLu::from_operators(&conductance, &susceptance, 1.0),
+        |factor| Ok(flatten(&factor.solve(&rhs)?)),
     );
     Ok(())
 }

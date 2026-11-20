@@ -180,11 +180,12 @@ fn roots(load: &PencilLoad, what: &str) -> SpiceResult<Vec<Complex>> {
         })
 }
 
-pub(crate) fn run(
+pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &crate::analysis::AnalysisContext,
-) -> SpiceResult<Plot> {
+    include_bias: bool,
+) -> SpiceResult<Vec<Plot>> {
     let settings = crate::analysis::bias::DcSettings::from_request(request)?;
     let card = card(request)?;
     circuit.finalize()?;
@@ -217,6 +218,7 @@ pub(crate) fn run(
     // PZan uses the same CKTop/MODEINITSMSIG preparation as acan.c.
     let small_signal =
         crate::analysis::ac::SmallSignal::prepare(circuit, request, context, settings)?;
+    let mut plots = small_signal.retained_bias(circuit, request, context, include_bias)?;
     // `PZan` runs the pole search before the zero search, each on a fresh
     // `CKTpzSetup` matrix (whose `DEVpzSetup` runs count, see
     // `MatrixSetup::pole_zero_setups`); `PZpost` lists poles first.
@@ -234,8 +236,7 @@ pub(crate) fn run(
     };
     let order = circuit.unknown_count();
     let input = [in_pos, in_neg];
-    let mut poles = Vec::new();
-    if card.poles {
+    let mut poles = if card.poles {
         setups += 1;
         let (terms, elements) = pencil(setups)?;
         let output = match card.input {
@@ -244,16 +245,19 @@ pub(crate) fn run(
         };
         let mut load = modified_load(order, &elements, &terms, input, output);
         load.relative_threshold = context.pivot.relative;
-        poles = roots(&load, "poles")?;
-    }
-    let mut zeros = Vec::new();
-    if card.zeros {
+        roots(&load, "poles")?
+    } else {
+        Vec::new()
+    };
+    let zeros = if card.zeros {
         setups += 1;
         let (terms, elements) = pencil(setups)?;
         let mut load = modified_load(order, &elements, &terms, input, Some([out_pos, out_neg]));
         load.relative_threshold = context.pivot.relative;
-        zeros = roots(&load, "zeros")?;
-    }
+        roots(&load, "zeros")?
+    } else {
+        Vec::new()
+    };
     let flags = if poles.is_empty() && zeros.is_empty() {
         PlotFlags::Real
     } else {
@@ -274,7 +278,8 @@ pub(crate) fn run(
     }
     poles.extend(zeros);
     plot.push_point(poles)?;
-    Ok(plot)
+    plots.push(plot);
+    Ok(plots)
 }
 
 #[cfg(test)]

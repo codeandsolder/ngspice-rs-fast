@@ -180,7 +180,7 @@ pub struct MnaUnknowns {
 impl MnaUnknowns {
     /// An empty mapping.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             node_rows: Vec::new(),
             next_row: 0,
@@ -251,7 +251,7 @@ impl MnaUnknowns {
 
     /// The matrix row for a node, or `None` for ground.
     #[must_use]
-    #[inline(always)]
+    #[inline]
     pub fn node_row(&self, node: NodeId) -> Option<usize> {
         self.node_rows.get(node.index()).copied().flatten()
     }
@@ -259,13 +259,19 @@ impl MnaUnknowns {
     /// Reserves `count` rows after every node row, for branch currents.
     ///
     /// Returns the first reserved row, or `None` when `count` is zero.
-    pub fn add_rows(&mut self, count: usize) -> Option<usize> {
+    pub const fn add_rows(&mut self, count: usize) -> Option<usize> {
         if count == 0 {
             return None;
         }
         let first = self.next_row;
         self.next_row += count;
         Some(first)
+    }
+
+    /// Whether every node slot in the table has been numbered (including
+    /// the eliminated ground slot).
+    pub(super) const fn covers_nodes(&self, nodes: &NodeTable) -> bool {
+        self.node_rows.len() == nodes.len()
     }
 
     /// Number of unknowns, i.e. the size of the MNA system.
@@ -414,7 +420,7 @@ impl StampContext<'_> {
     ///
     /// [`crate::primitives::SpiceError::Numerical`] if a row is out of range, which
     /// would be a bug in the caller rather than bad input.
-    #[inline(always)]
+    #[inline]
     pub fn stamp(&mut self, row: NodeId, col: NodeId, value: Real) -> SpiceResult<()> {
         let (Some(row), Some(col)) = (self.unknowns.node_row(row), self.unknowns.node_row(col))
         else {
@@ -464,7 +470,7 @@ impl StampContext<'_> {
     /// # Errors
     ///
     /// [`crate::primitives::SpiceError::Numerical`] if the row is out of range.
-    #[inline(always)]
+    #[inline]
     pub fn stamp_rhs(&mut self, row: NodeId, value: Real) -> SpiceResult<()> {
         let Some(row) = self.unknowns.node_row(row) else {
             return Ok(());
@@ -474,7 +480,7 @@ impl StampContext<'_> {
 
     /// The present solution value at a node, or zero at ground.
     #[must_use]
-    #[inline(always)]
+    #[inline]
     pub fn node_voltage(&self, node: NodeId) -> Real {
         self.unknowns
             .node_row(node)
@@ -585,7 +591,7 @@ pub trait Device: fmt::Debug {
         None
     }
 
-    /// Binds the previous voltage-source value in C VSRCload's reverse-deck
+    /// Binds the previous voltage-source value in C `VSRCload`'s reverse-deck
     /// traversal. Non-voltage devices return None; PORT adds to that value.
     /// # Errors
     /// Invalid accumulated RF excitation.
@@ -1028,8 +1034,8 @@ mod tests {
     #[test]
     fn ground_gets_no_row() {
         let mut nodes = NodeTable::new();
-        let a = nodes.intern("a");
-        let b = nodes.intern("b");
+        let a = nodes.intern("a").unwrap();
+        let b = nodes.intern("b").unwrap();
         let mut unknowns = MnaUnknowns::new();
         unknowns.rebuild(&nodes);
         assert_eq!(unknowns.node_row(NodeId::GROUND), None);
@@ -1041,8 +1047,8 @@ mod tests {
     #[test]
     fn internal_nodes_are_unknowns_too() {
         let mut nodes = NodeTable::new();
-        let terminal = nodes.intern("out");
-        let internal = nodes.intern("x1#1");
+        let terminal = nodes.intern("out").unwrap();
+        let internal = nodes.intern("x1#1").unwrap();
         nodes.set_kind(internal, NodeKind::Internal);
         let mut unknowns = MnaUnknowns::new();
         unknowns.rebuild(&nodes);
@@ -1053,11 +1059,11 @@ mod tests {
     #[test]
     fn rows_can_be_assigned_incrementally() {
         let mut nodes = NodeTable::new();
-        nodes.intern("a");
+        nodes.intern("a").unwrap();
         let mut unknowns = MnaUnknowns::new();
         unknowns.rebuild(&nodes);
         assert_eq!(unknowns.len(), 1);
-        let late = nodes.intern("late");
+        let late = nodes.intern("late").unwrap();
         let row = unknowns.assign(nodes.node(late).expect("node exists"));
         assert_eq!(row, Some(1));
         assert_eq!(unknowns.len(), 2);

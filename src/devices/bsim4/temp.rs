@@ -5,30 +5,62 @@
 //! Ported statement by statement from BSIM4 4.8.3 (`b4temp.c`, Copyright
 //! (c) 2025 University of California, Educational Community License 2.0);
 //! C's member and local names are kept so the port can be read against it.
-#![allow(non_snake_case, non_upper_case_globals)]
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::similar_names,
+    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
+)]
+#![expect(
+    clippy::float_cmp,
+    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
+)]
+#![expect(
+    clippy::manual_midpoint,
+    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
+)]
+#![expect(
+    clippy::many_single_char_names,
+    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
+)]
+#![expect(
+    clippy::while_float,
+    reason = "the C iterative floating-point loop must preserve its original termination and rounding order"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)]
+#![expect(
+    non_upper_case_globals,
+    reason = "constant names intentionally match the reference device equations"
+)]
 
 use super::check::check_model;
 use super::fields::{Instance, Model, SizeParam};
 use super::geo::{pa_eff_geo, rdseff_geo};
 use crate::primitives::{SpiceError, SpiceResult};
 
-const KboQ: f64 = 8.617087e-5;
+const KboQ: f64 = 8.617_087e-5;
 const EPS0: f64 = 8.85418e-12;
 const EPSSI: f64 = 1.03594e-10;
 // b4temp.c's own rounded PI, not the platform's.
-#[allow(clippy::approx_constant)]
-const PI: f64 = 3.141592654;
-const MAX_EXP: f64 = 5.834617425e14;
-const MIN_EXP: f64 = 1.713908431e-15;
+const PI: f64 = f64::from_bits(0x4009_21fb_5452_4550);
+const MAX_EXP: f64 = 5.834_617_425e14;
+const MIN_EXP: f64 = 1.713_908_431e-15;
 const EXP_THRESHOLD: f64 = 34.0;
 const Charge_q: f64 = 1.60219e-19;
 const DELTA: f64 = 1.0E-9;
 /// `const.h` `CHARGE`.
-const CHARGE: f64 = 1.6021766208e-19;
+const CHARGE: f64 = 1.602_176_620_8e-19;
 /// `main.c`: `CONSTroot2 = CONSTsqrt2`.
 const CONSTroot2: f64 = std::f64::consts::SQRT_2;
 /// `main.c`: `CONSTvt0 = CONSTboltz * REFTEMP / CHARGE`.
-const CONSTvt0: f64 = 1.38064852e-23 * (27.0 + 273.15) / CHARGE;
+const CONSTvt0: f64 = 1.380_648_52e-23 * (27.0 + 273.15) / CHARGE;
 /// `bsim4def.h` `NMOS`.
 const NMOS: i32 = 1;
 /// `bsim4def.h` `BSIM4v48V480`.
@@ -47,7 +79,7 @@ fn sqrt(x: f64) -> f64 {
 fn pow(x: f64, y: f64) -> f64 {
     x.powf(y)
 }
-fn fabs(x: f64) -> f64 {
+const fn fabs(x: f64) -> f64 {
     x.abs()
 }
 fn atan(x: f64) -> f64 {
@@ -78,13 +110,18 @@ fn dio_ijth_vjm_eval(Nvtm: f64, Ijth: f64, Isb: f64, XExpBV: f64) -> f64 {
 }
 
 /// A C `printf("%g")` spelling for the ported messages.
-pub(crate) fn c_g(value: f64) -> String {
+pub(super) fn c_g(value: f64) -> String {
     if value == 0.0 {
         return if value.is_sign_negative() { "-0" } else { "0" }.into();
     }
     if !value.is_finite() {
         return if value.is_nan() {
-            "nan".into()
+            if value.is_sign_negative() {
+                "-nan"
+            } else {
+                "nan"
+            }
+            .into()
         } else if value > 0.0 {
             "inf".into()
         } else {
@@ -94,18 +131,22 @@ pub(crate) fn c_g(value: f64) -> String {
     let scientific = format!("{value:.5e}");
     let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
     let exponent: i32 = exponent.parse().unwrap_or(0);
-    if !(-4..6).contains(&exponent) {
+    if (-4..6).contains(&exponent) {
+        let decimals = usize::try_from(5 - exponent).unwrap_or(0);
+        let fixed = format!("{value:.decimals$}");
+        // Do not strip meaningful integer digits when precision is zero.
+        if decimals == 0 {
+            fixed
+        } else {
+            fixed.trim_end_matches('0').trim_end_matches('.').to_owned()
+        }
+    } else {
         let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
         format!(
             "{mantissa}e{}{:02}",
             if exponent < 0 { '-' } else { '+' },
             exponent.unsigned_abs()
         )
-    } else {
-        let decimals = usize::try_from(5 - exponent).unwrap_or(0);
-        let fixed = format!("{value:.decimals$}");
-        let fixed = fixed.trim_end_matches('0').trim_end_matches('.');
-        fixed.to_string()
     }
 }
 
@@ -117,7 +158,7 @@ fn bad_parameter(message: String) -> SpiceError {
 /// The locals `BSIM4temp`'s model pass computes and its instance loop
 /// reads (C keeps them as function locals across the loop).
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ModelTemp {
+pub(super) struct ModelTemp {
     /// C local `Temp`.
     pub(crate) Temp: f64,
     /// C local `Tnom`.
@@ -145,18 +186,31 @@ pub(crate) struct ModelTemp {
 /// `BSIM4temp`'s model pass (everything before its instance loop) at
 /// `temperature` (`CKTtemp`, K): updates `m` as C does and returns the
 /// locals the instance loop reads. C runs it once per model per call.
-#[allow(
+#[expect(
     unused_assignments,
-    unused_parens,
+    reason = "C state-machine locals retain the reference assignment sequence"
+)]
+#[expect(
     unused_mut,
+    reason = "local mutability reflects the source C intermediate state declarations"
+)]
+#[expect(
     unused_variables,
+    reason = "C-translated intermediate variables preserve the reference layout"
+)]
+#[expect(
     clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)]
+#[expect(
     clippy::if_same_then_else,
+    reason = "preserves the C branch evaluation and state-update sequence"
+)]
+#[expect(
     clippy::assign_op_pattern,
-    clippy::collapsible_if,
-    clippy::collapsible_else_if
-)] // A statement-by-statement port of C.
-pub(crate) fn temperature_model(
+    reason = "retains the reference calculation grouping and floating-point operation order"
+)]
+pub(super) fn temperature_model(
     m: &mut Model,
     temperature: f64,
     warnings: &mut Vec<String>,
@@ -313,7 +367,7 @@ pub(crate) fn temperature_model(
             ni = 1.45e10
                 * (Tnom / 300.15)
                 * sqrt(Tnom / 300.15)
-                * exp(21.5565981 - Eg0 / (2.0 * Vtm0));
+                * exp(21.556_598_1 - Eg0 / (2.0 * Vtm0));
         } else {
             Eg0 = m.bg0sub - m.tbgasub * Tnom * Tnom / (Tnom + m.tbgbsub);
             T0 = m.bg0sub - m.tbgasub * 90090.0225 / (300.15 + m.tbgbsub);
@@ -326,7 +380,14 @@ pub(crate) fn temperature_model(
         } else {
             Eg = m.bg0sub - m.tbgasub * Temp * Temp / (Temp + m.tbgbsub);
         }
-        if Temp != Tnom {
+        if Temp == Tnom {
+            m.SjctTempSatCurDensity = m.SjctSatCurDensity;
+            m.SjctSidewallTempSatCurDensity = m.SjctSidewallSatCurDensity;
+            m.SjctGateSidewallTempSatCurDensity = m.SjctGateSidewallSatCurDensity;
+            m.DjctTempSatCurDensity = m.DjctSatCurDensity;
+            m.DjctSidewallTempSatCurDensity = m.DjctSidewallSatCurDensity;
+            m.DjctGateSidewallTempSatCurDensity = m.DjctGateSidewallSatCurDensity;
+        } else {
             T0 = Eg0 / Vtm0 - Eg / m.vtm;
             T1 = log(Temp / Tnom);
             T2 = T0 + m.SjctTempExponent * T1;
@@ -339,13 +400,6 @@ pub(crate) fn temperature_model(
             m.DjctTempSatCurDensity = m.DjctSatCurDensity * T3;
             m.DjctSidewallTempSatCurDensity = m.DjctSidewallSatCurDensity * T3;
             m.DjctGateSidewallTempSatCurDensity = m.DjctGateSidewallSatCurDensity * T3;
-        } else {
-            m.SjctTempSatCurDensity = m.SjctSatCurDensity;
-            m.SjctSidewallTempSatCurDensity = m.SjctSidewallSatCurDensity;
-            m.SjctGateSidewallTempSatCurDensity = m.SjctGateSidewallSatCurDensity;
-            m.DjctTempSatCurDensity = m.DjctSatCurDensity;
-            m.DjctSidewallTempSatCurDensity = m.DjctSidewallSatCurDensity;
-            m.DjctGateSidewallTempSatCurDensity = m.DjctGateSidewallSatCurDensity;
         }
         if m.SjctTempSatCurDensity < 0.0 {
             m.SjctTempSatCurDensity = 0.0;
@@ -542,22 +596,39 @@ pub(crate) fn temperature_model(
 /// # Errors
 /// C's fatal `BSIM4checkModel` result and nonpositive effective sizes
 /// (`E_BADPARM`), with C's messages.
-#[allow(
+#[expect(
     unused_assignments,
+    reason = "upstream C temperature routine assigns intermediates in original order"
+)]
+#[expect(
     unused_parens,
+    reason = "preserves C parenthesization in temperature equations"
+)]
+#[expect(
     unused_mut,
+    reason = "mutable locals retain the reference C state flow"
+)]
+#[expect(
     unused_variables,
+    reason = "reference C temperature locals are kept for statement-level comparison"
+)]
+#[expect(
     clippy::too_many_lines,
-    clippy::neg_multiply,
+    reason = "temperature model follows the upstream C routine statement by statement"
+)]
+#[expect(
     clippy::assign_op_pattern,
-    clippy::excessive_precision,
-    clippy::unnecessary_cast,
-    clippy::if_same_then_else,
+    reason = "C temperature arithmetic preserves its original evaluation order"
+)]
+#[expect(
     clippy::manual_clamp,
-    clippy::collapsible_if,
-    clippy::collapsible_else_if
+    reason = "explicit clamp branches preserve the C handling of nonfinite values"
+)]
+#[expect(
+    clippy::collapsible_else_if,
+    reason = "keeps ngspice C temperature branch topology unchanged"
 )] // A statement-by-statement port of C.
-pub(crate) fn temperature_instance(
+pub(super) fn temperature_instance(
     m: &mut Model,
     h: &mut Instance,
     locals: &ModelTemp,
@@ -648,36 +719,31 @@ pub(crate) fn temperature_instance(
             p.leff = Lnew - 2.0 * p.dl;
             if p.leff <= 0.0 {
                 return Err(bad_parameter(format!(
-                    "BSIM4: mosfet {}, model {}: Effective channel length <= 0",
-                    model_name, instance_name
+                    "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel length <= 0"
                 )));
             }
             p.weff = Wnew - 2.0 * p.dw;
             if p.weff <= 0.0 {
                 return Err(bad_parameter(format!(
-                    "BSIM4: mosfet {}, model {}: Effective channel width <= 0",
-                    model_name, instance_name
+                    "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel width <= 0"
                 )));
             }
             p.leffCV = Lnew - 2.0 * p.dlc;
             if p.leffCV <= 0.0 {
                 return Err(bad_parameter(format!(
-                    "BSIM4: mosfet {}, model {}: Effective channel length for C-V <= 0",
-                    model_name, instance_name
+                    "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel length for C-V <= 0"
                 )));
             }
             p.weffCV = Wnew - 2.0 * p.dwc;
             if p.weffCV <= 0.0 {
                 return Err(bad_parameter(format!(
-                    "BSIM4: mosfet {}, model {}: Effective channel width for C-V <= 0",
-                    model_name, instance_name
+                    "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel width for C-V <= 0"
                 )));
             }
             p.weffCJ = Wnew - 2.0 * p.dwj;
             if p.weffCJ <= 0.0 {
                 return Err(bad_parameter(format!(
-                    "BSIM4: mosfet {}, model {}: Effective channel width for S/D junctions <= 0",
-                    model_name, instance_name
+                    "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel width for S/D junctions <= 0"
                 )));
             }
             if m.binUnit == 1 {
@@ -1015,7 +1081,6 @@ pub(crate) fn temperature_instance(
             };
             if m.v48intVersion <= BSIM4v48V480 {
                 p.AechvbEdgeS = p.Aechvb * p.weff * m.dlcig * p.ToxRatioEdge;
-                p.AechvbEdgeD = p.Aechvb * p.weff * m.dlcigd * p.ToxRatioEdge;
             } else {
                 if m.dlcig < 0.0 {
                     warnings.push(format!(
@@ -1032,8 +1097,8 @@ pub(crate) fn temperature_instance(
                     ));
                     m.dlcigd = 0.0;
                 }
-                p.AechvbEdgeD = p.Aechvb * p.weff * m.dlcigd * p.ToxRatioEdge;
             }
+            p.AechvbEdgeD = p.Aechvb * p.weff * m.dlcigd * p.ToxRatioEdge;
             p.BechvbEdge = -p.Bechvb * toxe * p.poxedge;
             p.Aechvb *= p.weff * p.leff * p.ToxRatio;
             p.Bechvb *= -toxe;
@@ -1221,14 +1286,12 @@ pub(crate) fn temperature_instance(
                 T2 = T1 / T0;
                 if T2 < -EXP_THRESHOLD {
                     T3 = m.coxe * MIN_EXP / p.cdep0;
-                    T4 = p.mstar + T3 * n0;
                 } else if T2 > EXP_THRESHOLD {
                     T3 = m.coxe * MAX_EXP / p.cdep0;
-                    T4 = p.mstar + T3 * n0;
                 } else {
                     T3 = exp(T2) * m.coxe / p.cdep0;
-                    T4 = p.mstar + T3 * n0;
                 }
+                T4 = p.mstar + T3 * n0;
                 p.VgsteffVth = T0 * log(2.0) / T4;
             }
             T0 = -p.dvtp3 * log(p.leff);
@@ -1569,7 +1632,9 @@ pub(crate) fn temperature_instance(
             h.Adeff = 0.0;
             warnings.push("Warning: Adeff is negative, it is set to zero.".to_string());
         }
-        if h.sNodePrime != h.sNode {
+        if h.sNodePrime == h.sNode {
+            h.sourceConductance = 0.0;
+        } else {
             h.sourceConductance = 0.0;
             if h.sourceSquaresGiven {
                 h.sourceConductance = m.sheetResistance * h.sourceSquares;
@@ -1596,10 +1661,10 @@ pub(crate) fn temperature_instance(
                 h.sourceConductance = 1.0e3;
                 warnings.push("Warning: Source conductance reset to 1.0e3 mho.".to_string());
             }
-        } else {
-            h.sourceConductance = 0.0;
         }
-        if h.dNodePrime != h.dNode {
+        if h.dNodePrime == h.dNode {
+            h.drainConductance = 0.0;
+        } else {
             h.drainConductance = 0.0;
             if h.drainSquaresGiven {
                 h.drainConductance = m.sheetResistance * h.drainSquares;
@@ -1626,8 +1691,6 @@ pub(crate) fn temperature_instance(
                 h.drainConductance = 1.0e3;
                 warnings.push("Warning: Drain conductance reset to 1.0e3 mho.".to_string());
             }
-        } else {
-            h.drainConductance = 0.0;
         }
         Nvtms = m.vtm * m.SjctEmissionCoeff;
         if (h.Aseff <= 0.0) && (h.Pseff <= 0.0) {
@@ -1822,7 +1885,8 @@ pub(crate) fn temperature_instance(
             TempRatioeot = m.tempeot / m.tnom - 1.0;
             T0 = sqrt(1.0 + p.lpe0 / m.leffeot);
             T1 = p.k1ox * (T0 - 1.0) * sqrt(phieot) + (p.kt1 + p.kt1l / m.leffeot) * TempRatioeot;
-            Vth_NarrowW = toxe * phieot / (m.weffeot + p.w0);
+            let width_with_offset = m.weffeot + p.w0;
+            Vth_NarrowW = toxe * phieot / width_with_offset;
             Lpe_Vb = sqrt(1.0 + p.lpeb / m.leffeot);
             Vth = f64::from(m.r#type) * h.vth0 + (p.k1ox - p.k1) * sqrt(phieot) * Lpe_Vb
                 - Delt_vth
@@ -1892,7 +1956,7 @@ pub(crate) fn temperature_instance(
 ///
 /// # Errors
 /// As [`temperature_instance`].
-pub(crate) fn temperature(
+pub(super) fn temperature(
     m: &mut Model,
     h: &mut Instance,
     temperature: f64,
@@ -2007,8 +2071,16 @@ mod tests {
             (0.0, "0"),
             (0.1, "0.1"),
             (-1e-9, "-1e-09"),
-            (123456.0, "123456"),
-            (1234567.0, "1.23457e+06"),
+            (123_456.0, "123456"),
+            (100_000.0, "100000"),
+            (-120_000.0, "-120000"),
+            (999_999.4, "999999"),
+            (999_999.6, "1e+06"),
+            (-0.0, "-0"),
+            (f64::NAN, "nan"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+            (1_234_567.0, "1.23457e+06"),
             (1e-4, "0.0001"),
             (-2.64404e10, "-2.64404e+10"),
         ] {

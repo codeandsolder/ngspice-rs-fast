@@ -64,7 +64,7 @@ const OPEN_RESISTANCE: Real = 1e20;
 
 /// The `.tf` output variable as written on the card.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Output {
+pub(super) enum Output {
     /// `v(pos)` or `v(pos,neg)`.
     Voltage {
         /// The positive node as written.
@@ -81,7 +81,7 @@ pub(crate) enum Output {
 
 /// A parsed `.tf` card.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TransferRequest {
+pub(super) struct TransferRequest {
     /// What is measured.
     pub output: Output,
     /// The independent V or I source that is excited.
@@ -103,7 +103,7 @@ fn syntax(message: impl std::fmt::Display) -> SpiceError {
 /// # Errors
 /// [`SpiceError::Unsupported`] for anything but `v(n)`, `v(n,m)` or `i(src)`
 /// followed by exactly one input source name.
-pub(crate) fn parse(positional: &[&str]) -> SpiceResult<TransferRequest> {
+pub(super) fn parse(positional: &[&str]) -> SpiceResult<TransferRequest> {
     let name = |token: Option<&&str>, what: &str| -> SpiceResult<String> {
         match token {
             Some(text) if !matches!(*text, "(" | ")" | ",") => Ok(text.to_ascii_lowercase()),
@@ -198,7 +198,7 @@ enum Probe {
     Current { device: usize, row: usize },
 }
 
-fn not_found(message: String) -> SpiceError {
+fn not_found(message: impl std::fmt::Display) -> SpiceError {
     SpiceError::Circuit {
         message: format!("{message} (C: TFanal in tfanal.c)"),
     }
@@ -209,14 +209,14 @@ fn node_row(circuit: &Circuit, name: &str) -> SpiceResult<(String, Option<usize>
     let id = circuit
         .nodes()
         .get(&canonical)
-        .ok_or_else(|| not_found(format!(".tf output node {name} is not in the circuit")))?;
+        .ok_or_else(|| not_found(format_args!(".tf output node {name} is not in the circuit")))?;
     let row = circuit.unknowns().node_row(id);
     let is_ground = circuit
         .nodes()
         .node(id)
         .is_some_and(|node| node.kind == NodeKind::Ground);
     if row.is_none() && !is_ground {
-        return Err(not_found(format!(
+        return Err(not_found(format_args!(
             ".tf output node {name} has no matrix row"
         )));
     }
@@ -231,15 +231,18 @@ fn device_index(circuit: &Circuit, name: &str) -> Option<usize> {
 }
 
 fn resolve_input(circuit: &Circuit, name: &str) -> SpiceResult<Input> {
-    let index = device_index(circuit, name)
-        .ok_or_else(|| not_found(format!("Transfer function source {name} not in circuit")))?;
+    let index = device_index(circuit, name).ok_or_else(|| {
+        not_found(format_args!(
+            "Transfer function source {name} not in circuit"
+        ))
+    })?;
     let device = &circuit.devices()[index];
     match device.designator() {
         'v' => {
             let branch = circuit
                 .branch_rows(index)
                 .and_then(|mut rows| rows.next())
-                .ok_or_else(|| not_found(format!("{name}: missing branch row")))?;
+                .ok_or_else(|| not_found(format_args!("{name}: missing branch row")))?;
             Ok(Input::Voltage { branch })
         }
         'i' => {
@@ -248,7 +251,7 @@ fn resolve_input(circuit: &Circuit, name: &str) -> SpiceResult<Input> {
                     .terminals()
                     .get(terminal)
                     .copied()
-                    .ok_or_else(|| not_found(format!("{name}: missing terminal")))
+                    .ok_or_else(|| not_found(format_args!("{name}: missing terminal")))
                     .map(|node| circuit.unknowns().node_row(node))
             };
             Ok(Input::Current {
@@ -256,7 +259,7 @@ fn resolve_input(circuit: &Circuit, name: &str) -> SpiceResult<Input> {
                 minus: row(1)?,
             })
         }
-        _ => Err(not_found(format!(
+        _ => Err(not_found(format_args!(
             "Transfer function source {name} not of proper type (an independent V or I \
              source is required)"
         ))),
@@ -278,7 +281,9 @@ fn resolve_output(circuit: &Circuit, output: &Output) -> SpiceResult<(Probe, [Op
         }
         Output::Current { source } => {
             let device = device_index(circuit, source).ok_or_else(|| {
-                not_found(format!(".tf output source {source} is not in the circuit"))
+                not_found(format_args!(
+                    ".tf output source {source} is not in the circuit"
+                ))
             })?;
             let branch = circuit.devices()[device].findable_branch().ok_or_else(|| {
                 unsupported(format!(
@@ -290,17 +295,14 @@ fn resolve_output(circuit: &Circuit, output: &Output) -> SpiceResult<(Probe, [Op
             let row = circuit
                 .branch_rows(device)
                 .and_then(|mut rows| rows.nth(branch))
-                .ok_or_else(|| not_found(format!("{source}: missing branch row")))?;
+                .ok_or_else(|| not_found(format_args!("{source}: missing branch row")))?;
             Ok((Probe::Current { device, row }, [None, None]))
         }
     }
 }
 
 fn add(rhs: &mut Vector, row: Option<usize>, value: Real) -> SpiceResult<()> {
-    match row {
-        Some(row) => rhs.add_to(row, value),
-        None => Ok(()),
-    }
+    row.map_or(Ok(()), |row| rhs.add_to(row, value))
 }
 
 fn at(x: &Vector, row: Option<usize>) -> Real {
@@ -322,7 +324,7 @@ fn resistance(current: Real) -> Real {
 /// Malformed cards, an unknown or wrong-type input source, an unknown output
 /// node or device, an output device without a findable branch, operating-point
 /// failures, and singular or non-finite small-signal solves.
-pub(crate) fn run(
+pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &AnalysisContext,
@@ -342,25 +344,11 @@ pub(crate) fn run(
 
     // The operating point, exactly as `.op` solves it (`CKTop` in MODEDCOP;
     // `.ic` applies only to a transient operating point, `.nodeset` here too).
-    let hints = crate::analysis::initial::resolve(circuit, request)?;
-    let nodes = crate::analysis::bias::NodeForcing {
-        initial: Vec::new(),
-        nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
-    };
     let n = circuit.unknown_count();
-    let mut seed = Vector::zeros(n);
-    for hint in hints.nodesets {
-        seed.as_mut_slice()[hint.row] = hint.value;
-    }
-    let model = context.model_context();
-    crate::analysis::bias::solve_dc_forced(
+    crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?.solve(
         circuit,
-        &model,
+        &context.model_context(),
         &settings,
-        &[],
-        Some(&seed),
-        None,
-        &nodes,
     )?;
 
     // tfanal.c solves with the LU factors CKTop's last NIiter pass left in

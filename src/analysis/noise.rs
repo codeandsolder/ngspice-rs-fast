@@ -51,6 +51,7 @@
 //! ported. `.option keepopinfo`'s extra operating-point plot is not produced
 //! (the option is not accepted by the port).
 
+use crate::analysis::frequency::{Advance, FrequencyGrid, MAX_POINTS};
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{Plot, PlotFlags, Variable};
 use crate::analysis::{AnalysisContext, AnalysisRequest};
@@ -69,8 +70,6 @@ const N_INTUSELOG: Real = 1e-10;
 /// C's default `CKTreltol`, the frequency-loop tolerance without `.option
 /// reltol`.
 const DEFAULT_RELTOL: Real = 1e-3;
-/// The port's bound on the number of frequency points.
-const MAX_POINTS: usize = 100_000;
 /// The spectrum plot's title (`noisean.c`, without `sqrnoise`).
 pub const SPECTRUM_PLOTNAME: &str = "Noise Spectral Density Curves";
 /// The integrated plot's title (`noisean.c`, without `sqrnoise`).
@@ -84,6 +83,35 @@ enum Stepping {
     Linear,
 }
 
+impl Stepping {
+    const fn parse(text: &str) -> Option<Self> {
+        if text.eq_ignore_ascii_case("dec") {
+            Some(Self::Decade)
+        } else if text.eq_ignore_ascii_case("oct") {
+            Some(Self::Octave)
+        } else if text.eq_ignore_ascii_case("lin") {
+            Some(Self::Linear)
+        } else {
+            None
+        }
+    }
+
+    /// noisean.c's asymmetric singleton handling. For lin 1, C only
+    /// replaces the stop when it is NOT almost equal. An unequal stop
+    /// within three ULPs survives, producing a zero integrated-noise plot
+    /// even though the frequency loop executes just once.
+    fn normalize(self, steps: usize, start: Real, stop: Real) -> (usize, Real) {
+        let equal = almost_equal_ulps(start, stop, 3);
+        if self == Self::Linear && steps == 1 {
+            (steps, if equal { stop } else { start })
+        } else if equal {
+            (1, start)
+        } else {
+            (steps, stop)
+        }
+    }
+}
+
 /// A parsed `.noise` card, after C's single-frequency adjustments.
 #[derive(Debug, Clone, PartialEq)]
 struct NoiseCard {
@@ -91,7 +119,7 @@ struct NoiseCard {
     negative: NodeId,
     input: String,
     stepping: Stepping,
-    steps: usize,
+    steps: u32,
     start: Real,
     stop: Real,
     summary: usize,
@@ -103,11 +131,8 @@ fn integer(text: Option<&str>, what: &str) -> SpiceResult<i64> {
         .and_then(parse_spice_number)
         .filter(|v| v.is_finite())
         .ok_or_else(|| unsupported(format!(".noise expects an integer {what}")))?;
-    let rounded = (value + 0.5).floor();
-    if rounded.abs() > i64::from(i32::MAX) as Real {
-        return Err(unsupported(format!(".noise {what} is out of range")));
-    }
-    Ok(rounded as i64)
+    crate::primitives::c_integer(value)
+        .ok_or_else(|| unsupported(format!(".noise {what} is out of range")))
 }
 
 use crate::primitives::almost_equal_ulps;
@@ -151,9 +176,12 @@ fn split_output(arguments: &[String]) -> SpiceResult<Positional> {
     })
 }
 
+/// Determine the number of plots emitted by a noise-analysis card.
+///
 /// How many plots a `.noise` card produces: two (the spectrum and the
-/// integrated noise), or one when C collapses the sweep to a single frequency
-/// (`lin` with one point, or start and stop within 3 ulps). Used by the batch
+/// integrated noise), or one when C normalizes the stop to the start.
+/// A one-point linear sweep with distinct, nearly equal bounds is the
+/// exception: the integrated plot still exists. Used by the batch
 /// scheduler to name the plots before anything runs; a card the driver would
 /// reject (or one with braced, not yet evaluated, arguments) counts two.
 #[must_use]
@@ -174,8 +202,17 @@ pub fn plot_count(arguments: &[String]) -> usize {
     ) else {
         return 2;
     };
-    let linear_single = kind.eq_ignore_ascii_case("lin") && steps == 1;
-    if linear_single || almost_equal_ulps(start, stop, 3) {
+    let Some(stepping) = Stepping::parse(kind) else {
+        return 2;
+    };
+    let Ok(steps) = usize::try_from(steps) else {
+        return 2;
+    };
+    if steps == 0 || start <= 0. || stop < start {
+        return 2;
+    }
+    let (_, stop) = stepping.normalize(steps, start, stop);
+    if start.to_bits() == stop.to_bits() {
         1
     } else {
         2
@@ -213,16 +250,12 @@ fn parse(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<NoiseCard>
             ".noise output nodes must differ (the output voltage is identically zero)",
         ));
     }
-    let stepping = match rest[1].to_ascii_lowercase().as_str() {
-        "dec" => Stepping::Decade,
-        "oct" => Stepping::Octave,
-        "lin" => Stepping::Linear,
-        other => {
-            return Err(unsupported(format!(
-                ".noise sweep must be dec, oct or lin, not '{other}'"
-            )));
-        }
-    };
+    let stepping = Stepping::parse(&rest[1]).ok_or_else(|| {
+        unsupported(format!(
+            ".noise sweep must be dec, oct or lin, not '{}'",
+            rest[1]
+        ))
+    })?;
     let steps = integer(Some(&rest[2]), "point count")?;
     if steps < 1 {
         return Err(unsupported(format!(
@@ -230,7 +263,7 @@ fn parse(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<NoiseCard>
         )));
     }
     let start = number(Some(&rest[3]), "start frequency")?;
-    let mut stop = number(Some(&rest[4]), "stop frequency")?;
+    let stop = number(Some(&rest[4]), "stop frequency")?;
     let summary = match rest.get(5) {
         Some(text) => {
             let value = integer(Some(text), "pts_per_summary")?;
@@ -247,21 +280,14 @@ fn parse(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<NoiseCard>
             ".noise needs 0 < fstart <= fstop, got {start} .. {stop}"
         )));
     }
-    let mut steps = usize::try_from(steps).map_err(|_| unsupported(".noise point count"))?;
-    // noisean.c: a one-point linear sweep measures at the start frequency
-    // only; any other sweep whose start and stop are within 3 ulps becomes a
-    // one-point sweep there.
-    if stepping == Stepping::Linear && steps == 1 {
-        stop = start;
-    } else if almost_equal_ulps(start, stop, 3) {
-        stop = start;
-        steps = 1;
-    }
+    let steps = usize::try_from(steps).map_err(|_| unsupported(".noise point count"))?;
+    let (steps, stop) = stepping.normalize(steps, start, stop);
     if steps > MAX_POINTS {
         return Err(unsupported(format!(
             ".noise point count is limited to {MAX_POINTS}"
         )));
     }
+    let steps = u32::try_from(steps).map_err(|_| unsupported(".noise point count"))?;
     Ok(NoiseCard {
         positive,
         negative,
@@ -276,10 +302,10 @@ fn parse(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<NoiseCard>
 
 /// `ninteg.c`'s per-step frequency data.
 struct Step {
-    del_freq: Real,
-    ln_freq: Real,
-    ln_last_freq: Real,
-    del_ln_freq: Real,
+    width: Real,
+    log_end: Real,
+    log_start: Real,
+    log_width: Real,
 }
 
 /// C's `limexp`.
@@ -294,42 +320,270 @@ fn limexp(x: Real) -> Real {
 /// `Nintegrate`: the integral of `a f^k` between the previous and the present
 /// frequency, given the density and its logarithm at both ends.
 fn nintegrate(density: Real, ln_density: Real, ln_last_density: Real, step: &Step) -> Real {
-    let mut exponent = (ln_density - ln_last_density) / step.del_ln_freq;
+    let mut exponent = (ln_density - ln_last_density) / step.log_width;
     if exponent.abs() < N_INTFTHRESH {
-        density * step.del_freq
+        density * step.width
     } else {
-        let a = limexp(ln_density - exponent * step.ln_freq);
+        let log_frequency_power = exponent * step.log_end;
+        let a = limexp(ln_density - log_frequency_power);
         exponent += 1.;
         if exponent.abs() < N_INTUSELOG {
-            a * (step.ln_freq - step.ln_last_freq)
+            a * (step.log_end - step.log_start)
         } else {
-            a * ((limexp(exponent * step.ln_freq) - limexp(exponent * step.ln_last_freq))
-                / exponent)
+            a * ((limexp(exponent * step.log_end) - limexp(exponent * step.log_start)) / exponent)
         }
     }
 }
 
-/// Per-generator integration history (C `<dev>nVar`).
+/// Front-end representation of the same underlying noise powers. In C
+/// `CKTnoise` writes raw powers and only applies sqrt when sqrnoise is off.
+#[derive(Clone, Copy)]
+enum Representation {
+    Amplitude,
+    Power,
+}
+
+impl Representation {
+    const fn from_squared(squared: bool) -> Self {
+        if squared {
+            Self::Power
+        } else {
+            Self::Amplitude
+        }
+    }
+
+    fn value(self, power: Real) -> Complex {
+        Complex::real(match self {
+            Self::Amplitude => power.sqrt(),
+            Self::Power => power,
+        })
+    }
+
+    const fn plotname(self, density: bool) -> &'static str {
+        match (self, density) {
+            (Self::Amplitude, true) => SPECTRUM_PLOTNAME,
+            (Self::Amplitude, false) => INTEGRATED_PLOTNAME,
+            (Self::Power, true) => "Noise Spectral Density Curves - (V^2 or A^2)/Hz",
+            (Self::Power, false) => "Integrated Noise - V^2 or A^2",
+        }
+    }
+
+    fn variable(self, name: String, kind: SourceKind, density: bool) -> Variable {
+        let unit = match (self, kind, density) {
+            (Self::Amplitude, SourceKind::Voltage, true) => "voltage-density",
+            (Self::Amplitude, SourceKind::Current, true) => "current-density",
+            (Self::Amplitude, SourceKind::Voltage, false) => "voltage",
+            (Self::Amplitude, SourceKind::Current, false) => "current",
+            (Self::Power, SourceKind::Voltage, true) => "voltage^2-density",
+            (Self::Power, SourceKind::Current, true) => "current^2-density",
+            (Self::Power, SourceKind::Voltage, false) => "voltage^2",
+            (Self::Power, SourceKind::Current, false) => "current^2",
+        };
+        let name = if matches!(self, Self::Amplitude) && !density {
+            let prefix = match kind {
+                SourceKind::Voltage => "v",
+                SourceKind::Current => "i",
+            };
+            format!("{prefix}({name})")
+        } else {
+            name
+        };
+        Variable::new(name, unit)
+    }
+}
+
+/// An output row, separate from the integration histories. No amplitude
+/// conversion ever feeds back into the integrator.
+struct NoiseRow {
+    representation: Representation,
+    values: Vec<Complex>,
+}
+
+impl NoiseRow {
+    fn new(representation: Representation, capacity: usize) -> Self {
+        Self {
+            representation,
+            values: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push_power(&mut self, power: Real) {
+        self.values.push(self.representation.value(power));
+    }
+}
+
+/// Integrated output- and input-referred noise power, in C's summation order.
 #[derive(Debug, Clone, Copy, Default)]
-struct History {
-    ln_last: Real,
+struct Power {
     output: Real,
     input: Real,
 }
 
-/// One instance's generators and their history; the last history entry is
-/// the instance total when the instance reports one.
+impl Power {
+    fn add(&mut self, contribution: Self) {
+        self.output += contribution.output;
+        self.input += contribution.input;
+    }
+
+    fn append(self, row: &mut NoiseRow) {
+        row.push_power(self.output);
+        row.push_power(self.input);
+    }
+}
+
+/// Frequency-local data shared by every generator.
+struct NoiseSample {
+    frequency: Real,
+    step: Step,
+    gain_sq_inv: Real,
+    ln_gain_inv: Real,
+    reset: bool,
+    summary: bool,
+}
+
+impl NoiseSample {
+    fn new(frequency: Real, previous: Real, gain_sq_inv: Real, start: Real, summary: bool) -> Self {
+        let log_end = frequency.max(N_MINLOG).ln();
+        let log_start = previous.max(N_MINLOG).ln();
+        Self {
+            frequency,
+            step: Step {
+                width: frequency - previous,
+                log_end,
+                log_start,
+                log_width: log_end - log_start,
+            },
+            gain_sq_inv,
+            ln_gain_inv: gain_sq_inv.ln(),
+            reset: frequency.to_bits() == start.to_bits(),
+            summary,
+        }
+    }
+}
+
+/// Per-generator integration history (C `<dev>nVar`). The optional instance
+/// total only accumulates power: it never enters the logarithmic integrator.
+#[derive(Debug, Clone, Copy, Default)]
+struct History {
+    ln_last: Real,
+    integrated: Power,
+}
+
+impl History {
+    fn advance(&mut self, density: Real, sample: &NoiseSample) -> Power {
+        let ln_density = density.max(N_MINLOG).ln();
+        if sample.step.width == 0. {
+            self.ln_last = ln_density;
+            if sample.reset {
+                self.integrated = Power::default();
+            }
+            return Power::default();
+        }
+        let contribution = Power {
+            output: nintegrate(density, ln_density, self.ln_last, &sample.step),
+            input: nintegrate(
+                density * sample.gain_sq_inv,
+                ln_density + sample.ln_gain_inv,
+                self.ln_last + sample.ln_gain_inv,
+                &sample.step,
+            ),
+        };
+        self.ln_last = ln_density;
+        if sample.summary {
+            self.integrated.add(contribution);
+        }
+        contribution
+    }
+}
+
+/// One instance's fixed ordered output slots and their integration history.
 struct Generators {
     instance: InstanceNoise,
     history: Vec<History>,
+    total: Option<Power>,
 }
 
 impl Generators {
     fn new(instance: InstanceNoise) -> Self {
-        let count = instance.sources.len() + usize::from(instance.total);
+        let history = vec![History::default(); instance.sources.len()];
+        let total = instance.total.then(Power::default);
         Self {
             instance,
-            history: vec![History::default(); count],
+            history,
+            total,
+        }
+    }
+
+    /// Frequency-dependent devices may change their laws and transfer nodes,
+    /// but cannot change the named slots that own integration history and columns.
+    fn refresh(&mut self, instance: InstanceNoise) -> SpiceResult<()> {
+        let old = &self.instance;
+        if old.device != instance.device
+            || old.name != instance.name
+            || old.total != instance.total
+            || old.sources.len() != instance.sources.len()
+            || old
+                .sources
+                .iter()
+                .zip(&instance.sources)
+                .any(|(a, b)| a.suffix != b.suffix)
+        {
+            return Err(SpiceError::circuit(format!(
+                "noise generator layout changed between frequencies for {}",
+                old.name
+            )));
+        }
+        self.instance = instance;
+        Ok(())
+    }
+
+    /// Evaluate and integrate each source once, without allocating a density
+    /// vector. Accumulate global totals per source, never per instance, to
+    /// preserve the reference addition order.
+    fn accumulate(
+        &mut self,
+        sample: &NoiseSample,
+        difference: impl Fn([NodeId; 2]) -> Complex,
+        integrated: &mut Power,
+        mut summary_row: Option<&mut NoiseRow>,
+    ) -> Real {
+        let mut density_sum = 0.;
+        if sample.reset
+            && sample.step.width == 0.
+            && let Some(total) = &mut self.total
+        {
+            *total = Power::default();
+        }
+        for (source, history) in self.instance.sources.iter().zip(&mut self.history) {
+            let density = source.output_density(&difference, sample.frequency);
+            density_sum += density;
+            let contribution = history.advance(density, sample);
+            if sample.step.width != 0. {
+                integrated.add(contribution);
+                if sample.summary
+                    && let Some(total) = &mut self.total
+                {
+                    total.add(contribution);
+                }
+            }
+            if let Some(row) = summary_row.as_deref_mut() {
+                row.push_power(density);
+            }
+        }
+        if self.total.is_some()
+            && let Some(row) = summary_row
+        {
+            row.push_power(density_sum);
+        }
+        density_sum
+    }
+
+    fn append_integrated(&self, row: &mut NoiseRow) {
+        for history in &self.history {
+            history.integrated.append(row);
+        }
+        if let Some(total) = self.total {
+            total.append(row);
         }
     }
 }
@@ -340,13 +594,13 @@ fn plot_names(
     generators: &[Generators],
     input_kind: SourceKind,
     summary: bool,
+    representation: Representation,
 ) -> (Vec<Variable>, Vec<Variable>) {
-    let (input_density, input_unit, input_prefix) = match input_kind {
-        SourceKind::Voltage => ("voltage-density", "voltage", "v"),
-        SourceKind::Current => ("current-density", "current", "i"),
-    };
     let mut spectrum = vec![Variable::new("frequency", "frequency")];
     let mut integrated = Vec::new();
+    let output =
+        |name: String, density| representation.variable(name, SourceKind::Voltage, density);
+    let input = |name: String, density| representation.variable(name, input_kind, density);
     for g in generators.iter().filter(|_| summary) {
         let suffixes = g
             .instance
@@ -356,28 +610,24 @@ fn plot_names(
             .chain(g.instance.total.then_some(""));
         for suffix in suffixes {
             let name = format!("{}{suffix}", g.instance.name);
-            spectrum.push(Variable::new(format!("onoise_{name}"), "voltage-density"));
-            integrated.push(Variable::new(format!("v(onoise_total_{name})"), "voltage"));
-            integrated.push(Variable::new(
-                format!("{input_prefix}(inoise_total_{name})"),
-                input_unit,
-            ));
+            spectrum.push(output(format!("onoise_{name}"), true));
+            integrated.push(output(format!("onoise_total_{name}"), false));
+            integrated.push(input(format!("inoise_total_{name}"), false));
         }
     }
-    spectrum.push(Variable::new("onoise_spectrum", "voltage-density"));
-    spectrum.push(Variable::new("inoise_spectrum", input_density));
-    integrated.push(Variable::new("v(onoise_total)", "voltage"));
-    integrated.push(Variable::new(
-        format!("{input_prefix}(inoise_total)"),
-        input_unit,
-    ));
+    spectrum.push(output("onoise_spectrum".into(), true));
+    spectrum.push(input("inoise_spectrum".into(), true));
+    integrated.push(output("onoise_total".into(), false));
+    integrated.push(input("inoise_total".into(), false));
     (spectrum, integrated)
 }
 
 /// The squared magnitude of `y[n1] - y[n2]`, ground being zero.
 fn gain(circuit: &Circuit, y: &[Complex], nodes: [NodeId; 2]) -> Real {
     let difference = difference(circuit, y, nodes);
-    difference.re * difference.re + difference.im * difference.im
+    let real_power = difference.re * difference.re;
+    let imaginary_power = difference.im * difference.im;
+    real_power + imaginary_power
 }
 
 /// `y[n1] - y[n2]`, ground reading zero (C's `CKTrhs`/`CKTirhs`
@@ -407,12 +657,112 @@ fn input_rhs(system: &LinearSystem, input: &str) -> SpiceResult<Vec<Complex>> {
     Ok(rhs)
 }
 
+/// Resolve the independent input and validate its AC excitation.
+fn input_kind(circuit: &Circuit, name: &str) -> SpiceResult<SourceKind> {
+    let input = circuit
+        .device(name)
+        .ok_or_else(|| unsupported(format!(".noise input source {name} is not in the circuit")))?
+        .input_source()
+        .ok_or_else(|| {
+            unsupported(format!(
+                ".noise input {name} is not an independent voltage or current source"
+            ))
+        })?;
+    if !input.ac_given {
+        return Err(unsupported(format!(
+            ".noise input source {name} has no AC value (noisean.c E_NOACINPUT)"
+        )));
+    }
+    Ok(input.kind)
+}
+
+/// C's frequency grid, with exactly representable bounded point counts.
+fn frequency_grid(card: &NoiseCard, reltol: Real) -> SpiceResult<FrequencyGrid> {
+    let delta = match card.stepping {
+        Stepping::Decade => (10f64.ln() / Real::from(card.steps)).exp(),
+        Stepping::Octave => (2f64.ln() / Real::from(card.steps)).exp(),
+        Stepping::Linear if card.steps == 1 => 0.,
+        Stepping::Linear => (card.stop - card.start) / Real::from(card.steps - 1),
+    };
+    let tolerance = match card.stepping {
+        Stepping::Decade | Stepping::Octave => delta * card.stop * reltol,
+        Stepping::Linear => delta * reltol,
+    };
+    let advance = match card.stepping {
+        Stepping::Decade | Stepping::Octave => Advance::Multiply(delta),
+        Stepping::Linear if card.steps == 1 => Advance::Single,
+        Stepping::Linear => Advance::Add(delta),
+    };
+    FrequencyGrid::new(card.start, card.stop, tolerance, advance, ".noise")
+}
+
+fn integrated_plot(
+    representation: Representation,
+    integrated_variables: Vec<Variable>,
+    generators: &[Generators],
+    summary: bool,
+    integrated_power: Power,
+) -> SpiceResult<Plot> {
+    let mut integrated = Plot::new("noise2", representation.plotname(false), PlotFlags::Real);
+    let mut values = NoiseRow::new(representation, integrated_variables.len());
+    for variable in integrated_variables {
+        integrated.push_variable(variable);
+    }
+    if summary {
+        for g in generators {
+            g.append_integrated(&mut values);
+        }
+    }
+    integrated_power.append(&mut values);
+    integrated.push_point(values.values)?;
+    if !integrated.is_finite() {
+        return Err(SpiceError::Numerical {
+            context: ".noise".into(),
+            message: "nonfinite integrated noise".into(),
+        });
+    }
+    Ok(integrated)
+}
+
+fn refresh_generators(generators: &mut [Generators], fresh: Vec<InstanceNoise>) -> SpiceResult<()> {
+    if fresh.len() != generators.len() {
+        return Err(SpiceError::circuit(
+            "noise generators changed between frequencies",
+        ));
+    }
+    for (generator, instance) in generators.iter_mut().zip(fresh) {
+        generator.refresh(instance)?;
+    }
+    Ok(())
+}
+
+/// Unit differential excitation for the transposed small-signal solve.
+fn output_excitation(circuit: &Circuit, output: [NodeId; 2]) -> Vec<Complex> {
+    let mut adjoint_rhs = vec![Complex::ZERO; circuit.unknown_count()];
+    if let Some(row) = circuit.unknowns().node_row(output[0]) {
+        adjoint_rhs[row] = Complex::real(1.);
+    }
+    if let Some(row) = circuit.unknowns().node_row(output[1]) {
+        adjoint_rhs[row] = Complex::real(-1.);
+    }
+    adjoint_rhs
+}
+
+fn spectrum_plot(representation: Representation, spectrum_variables: Vec<Variable>) -> Plot {
+    let mut spectrum = Plot::new("noise1", representation.plotname(true), PlotFlags::Real);
+    for variable in spectrum_variables {
+        spectrum.push_variable(variable);
+    }
+    spectrum
+}
+
 /// Runs `.noise` and returns its plots: the spectrum and, unless the sweep is
 /// a single frequency, the integrated noise.
 pub(crate) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &AnalysisContext,
+    include_bias: bool,
 ) -> SpiceResult<Vec<Plot>> {
     let settings = crate::analysis::bias::DcSettings::from_request(request)?;
     let reltol = match request.named("rtol") {
@@ -421,33 +771,14 @@ pub(crate) fn run(
     };
     circuit.finalize()?;
     let card = parse(circuit, request)?;
-    let input = circuit
-        .device(&card.input)
-        .ok_or_else(|| {
-            unsupported(format!(
-                ".noise input source {} is not in the circuit",
-                card.input
-            ))
-        })?
-        .input_source()
-        .ok_or_else(|| {
-            unsupported(format!(
-                ".noise input {} is not an independent voltage or current source",
-                card.input
-            ))
-        })?;
-    if !input.ac_given {
-        return Err(unsupported(format!(
-            ".noise input source {} has no AC value (noisean.c E_NOACINPUT)",
-            card.input
-        )));
-    }
+    let input_kind = input_kind(circuit, &card.input)?;
     // The operating point and small-signal system exactly as `.ac` builds
     // them (`noisean.c`: `CKTop`, then a `MODEINITSMSIG` load; a
     // `hertz`-dependent circuit is re-solved at every frequency).
     let mut small = crate::analysis::ac::SmallSignal::prepare(circuit, request, context, settings)?;
+    let mut plots = small.retained_bias(circuit, request, context, include_bias)?;
     let mut model = context.model_context();
-    model.spice3_noise = request.spice3_noise;
+    model.spice3_noise = request.noise.spice3;
     // Generators that depend on the frequency are described at the first
     // frequency; they are re-described at every frequency below.
     let first = if small.reassembles() {
@@ -461,41 +792,18 @@ pub(crate) fn run(
             .map(Generators::new)
             .collect();
 
+    let representation = Representation::from_squared(request.noise.squared);
     let (spectrum_variables, integrated_variables) =
-        plot_names(&generators, input.kind, card.summary != 0);
-    let mut spectrum = Plot::new("noise1", SPECTRUM_PLOTNAME, PlotFlags::Real);
-    for variable in spectrum_variables {
-        spectrum.push_variable(variable);
-    }
+        plot_names(&generators, input_kind, card.summary != 0, representation);
+    let mut spectrum = spectrum_plot(representation, spectrum_variables);
     let output = [card.positive, card.negative];
-    let mut adjoint_rhs = vec![Complex::ZERO; circuit.unknown_count()];
-    if let Some(row) = circuit.unknowns().node_row(card.positive) {
-        adjoint_rhs[row] = Complex::real(1.);
-    }
-    if let Some(row) = circuit.unknowns().node_row(card.negative) {
-        adjoint_rhs[row] = Complex::real(-1.);
-    }
+    let adjoint_rhs = output_excitation(circuit, output);
 
-    let delta = match card.stepping {
-        Stepping::Decade => (10f64.ln() / card.steps as Real).exp(),
-        Stepping::Octave => (2f64.ln() / card.steps as Real).exp(),
-        Stepping::Linear if card.steps == 1 => 0.,
-        Stepping::Linear => (card.stop - card.start) / (card.steps - 1) as Real,
-    };
-    let tolerance = match card.stepping {
-        Stepping::Decade | Stepping::Octave => delta * card.stop * reltol,
-        Stepping::Linear => delta * reltol,
-    };
-    let (mut out_noise, mut in_noise) = (0., 0.);
-    let mut freq = card.start;
-    let mut last = freq;
-    let mut step = 0_usize;
-    while freq <= card.stop + tolerance {
-        if step >= MAX_POINTS {
-            return Err(unsupported(format!(
-                ".noise frequency loop exceeded {MAX_POINTS} points"
-            )));
-        }
+    let frequencies = frequency_grid(&card, reltol)?;
+    let mut integrated_power = Power::default();
+    let mut last = card.start;
+    for (step, frequency) in frequencies.enumerate() {
+        let freq = frequency?;
         let input_name = card.input.as_str();
         let (forward, adjoint) = small.at_frequency(circuit, context, freq, |system| {
             let matrix =
@@ -510,90 +818,42 @@ pub(crate) fn run(
         // describes its generators at that frequency (`b4noi.c` evaluates
         // its flicker factor and correlated gate noise at `data->freq`).
         if small.varies() || small.reassembles() {
-            let local = model.with_frequency(freq);
-            let fresh = circuit_noise(circuit, &local, small.bias(), Some(small.state()))?;
-            if fresh.len() != generators.len() {
-                return Err(SpiceError::circuit(
-                    "noise generators changed between frequencies",
-                ));
-            }
-            for (g, instance) in generators.iter_mut().zip(fresh) {
-                g.instance = instance;
-            }
+            refresh_generators(
+                &mut generators,
+                circuit_noise(
+                    circuit,
+                    &model.with_frequency(freq),
+                    small.bias(),
+                    Some(small.state()),
+                )?,
+            )?;
         }
         let gain_sq_inv = 1. / gain(circuit, &forward, output).max(N_MINGAIN);
-        let ln_gain_inv = gain_sq_inv.ln();
-        let data = Step {
-            del_freq: freq - last,
-            ln_freq: freq.max(N_MINLOG).ln(),
-            ln_last_freq: last.max(N_MINLOG).ln(),
-            del_ln_freq: freq.max(N_MINLOG).ln() - last.max(N_MINLOG).ln(),
-        };
+        let sample = NoiseSample::new(freq, last, gain_sq_inv, card.start, card.summary != 0);
         let print_summary = card.summary != 0 && step.is_multiple_of(card.summary);
         let mut out_density = 0.;
-        let mut row = vec![freq];
-        for g in &mut generators {
-            let mut densities = Vec::with_capacity(g.history.len());
-            for source in &g.instance.sources {
-                densities.push(
-                    source.output_density(|nodes| difference(circuit, &adjoint, nodes), freq),
-                );
-            }
-            let total: Real = densities.iter().sum();
-            if g.instance.total {
-                densities.push(total);
-            }
-            out_density += total;
-            let generators_only = g.instance.sources.len();
-            for (index, density) in densities.iter().enumerate() {
-                let ln_density = density.max(N_MINLOG).ln();
-                let history = &mut g.history[index];
-                if data.del_freq == 0. {
-                    history.ln_last = ln_density;
-                    if freq == card.start {
-                        history.output = 0.;
-                        history.input = 0.;
-                    }
-                } else if index < generators_only {
-                    let out = nintegrate(*density, ln_density, history.ln_last, &data);
-                    let inp = nintegrate(
-                        density * gain_sq_inv,
-                        ln_density + ln_gain_inv,
-                        history.ln_last + ln_gain_inv,
-                        &data,
-                    );
-                    history.ln_last = ln_density;
-                    out_noise += out;
-                    in_noise += inp;
-                    if card.summary != 0 {
-                        history.output += out;
-                        history.input += inp;
-                        if g.instance.total {
-                            let total = &mut g.history[generators_only];
-                            total.output += out;
-                            total.input += inp;
-                        }
-                    }
-                }
-            }
-            if print_summary {
-                row.extend(densities.iter().map(|d| d.sqrt()));
-            }
+        let emit = card.summary == 0 || print_summary;
+        let mut row = NoiseRow::new(
+            representation,
+            if emit { spectrum.variables.len() } else { 0 },
+        );
+        if emit {
+            row.values.push(Complex::real(freq));
         }
-        if card.summary == 0 || print_summary {
-            row.push(out_density.sqrt());
-            row.push((out_density * gain_sq_inv).sqrt());
-            spectrum.push_point(row.into_iter().map(Complex::real).collect())?;
+        for g in &mut generators {
+            out_density += g.accumulate(
+                &sample,
+                |nodes| difference(circuit, &adjoint, nodes),
+                &mut integrated_power,
+                print_summary.then_some(&mut row),
+            );
+        }
+        if emit {
+            row.push_power(out_density);
+            row.push_power(out_density * gain_sq_inv);
+            spectrum.push_point(row.values)?;
         }
         last = freq;
-        match card.stepping {
-            Stepping::Decade | Stepping::Octave => freq *= delta,
-            Stepping::Linear => freq += delta,
-        }
-        step += 1;
-        if card.steps == 1 && card.stepping == Stepping::Linear {
-            break;
-        }
     }
     if !spectrum.is_finite() {
         return Err(SpiceError::Numerical {
@@ -601,75 +861,136 @@ pub(crate) fn run(
             message: "nonfinite noise density".into(),
         });
     }
-    let mut plots = vec![spectrum];
-    if card.start != card.stop {
-        let mut integrated = Plot::new("noise2", INTEGRATED_PLOTNAME, PlotFlags::Real);
-        let mut values = Vec::new();
-        for variable in integrated_variables {
-            integrated.push_variable(variable);
-        }
-        if card.summary != 0 {
-            for g in &generators {
-                for history in &g.history {
-                    values.push(history.output.sqrt());
-                    values.push(history.input.sqrt());
-                }
-            }
-        }
-        values.push(out_noise.sqrt());
-        values.push(in_noise.sqrt());
-        integrated.push_point(values.into_iter().map(Complex::real).collect())?;
-        if !integrated.is_finite() {
-            return Err(SpiceError::Numerical {
-                context: ".noise".into(),
-                message: "nonfinite integrated noise".into(),
-            });
-        }
-        plots.push(integrated);
-    }
-    if request.squared_noise {
-        for plot in &mut plots {
-            plot.plotname = if plot.plotname == SPECTRUM_PLOTNAME {
-                "Noise Spectral Density Curves - (V^2 or A^2)/Hz"
-            } else {
-                "Integrated Noise - V^2 or A^2"
-            }
-            .to_owned();
-            for (index, variable) in plot.variables.iter_mut().enumerate() {
-                if variable.name == "frequency" {
-                    continue;
-                }
-                if let Some(inner) = variable
-                    .name
-                    .strip_prefix("v(")
-                    .or_else(|| variable.name.strip_prefix("i("))
-                    .and_then(|n| n.strip_suffix(')'))
-                {
-                    variable.name = inner.to_owned();
-                }
-                variable.unit = match variable.unit.as_str() {
-                    "voltage-density" => "voltage^2-density",
-                    "current-density" => "current^2-density",
-                    "voltage" => "voltage^2",
-                    "current" => "current^2",
-                    other => other,
-                }
-                .to_owned();
-                for point in &mut plot.points {
-                    point[index].re *= point[index].re;
-                }
-            }
-        }
+    plots.push(spectrum);
+    if card.start.to_bits() != card.stop.to_bits() {
+        plots.push(integrated_plot(
+            representation,
+            integrated_variables,
+            &generators,
+            card.summary != 0,
+            integrated_power,
+        )?);
     }
     Ok(plots)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Step, almost_equal_ulps, nintegrate, plot_count};
+    use super::{
+        Generators, NoiseRow, NoiseSample, Power, Representation, Step, almost_equal_ulps,
+        nintegrate, plot_count,
+    };
+    use crate::devices::noise::{InstanceNoise, NoiseKind, NoiseSource};
+    use crate::primitives::{Complex, NodeId};
 
     fn args(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_owned).collect()
+    }
+
+    fn instance() -> InstanceNoise {
+        InstanceNoise {
+            device: 3,
+            name: "test".into(),
+            sources: vec![
+                NoiseSource::new(
+                    "_a",
+                    [NodeId::new(1), NodeId::GROUND],
+                    NoiseKind::Gain { factor: 2. },
+                ),
+                NoiseSource::new(
+                    "_b",
+                    [NodeId::new(1), NodeId::GROUND],
+                    NoiseKind::Gain { factor: 3. },
+                ),
+            ],
+            total: true,
+        }
+    }
+
+    #[test]
+    fn noise_history_is_bound_to_named_slots_not_frequency_local_values() {
+        let mut generators = Generators::new(instance());
+        let mut integrated = Power::default();
+        let mut row = NoiseRow::new(Representation::Amplitude, 6);
+        let transfer = |_| Complex::real(1.);
+        let first = NoiseSample::new(10., 10., 0.25, 10., true);
+        assert_eq!(
+            generators.accumulate(&first, transfer, &mut integrated, Some(&mut row)),
+            5.
+        );
+        assert_eq!(
+            row.values,
+            [2_f64.sqrt(), 3_f64.sqrt(), 5_f64.sqrt()].map(Complex::real)
+        );
+        let mut fresh = instance();
+        fresh.sources[0].kind = NoiseKind::Gain { factor: 2. };
+        fresh.sources[0].nodes = [NodeId::new(2), NodeId::GROUND];
+        generators.refresh(fresh).unwrap();
+        let second = NoiseSample::new(20., 10., 0.25, 10., true);
+        // Integrate even when this frequency has no printed summary row.
+        assert_eq!(
+            generators.accumulate(&second, transfer, &mut integrated, None),
+            5.
+        );
+        assert_eq!(integrated.output, 50.);
+        assert_eq!(integrated.input, 12.5);
+        row.values.clear();
+        generators.append_integrated(&mut row);
+        assert_eq!(
+            row.values,
+            [
+                20_f64.sqrt(),
+                5_f64.sqrt(),
+                30_f64.sqrt(),
+                7.5_f64.sqrt(),
+                50_f64.sqrt(),
+                12.5_f64.sqrt()
+            ]
+            .map(Complex::real)
+        );
+    }
+
+    #[test]
+    fn squared_noise_preserves_original_powers_in_every_slot() {
+        let mut generators = Generators::new(instance());
+        let mut integrated = Power::default();
+        let mut row = NoiseRow::new(Representation::Power, 6);
+        let transfer = |_| Complex::real(1.);
+        let first = NoiseSample::new(10., 10., 0.25, 10., true);
+        generators.accumulate(&first, transfer, &mut integrated, Some(&mut row));
+        // sqrt(2)^2 != 2 in binary64: the former rendering lost this bit.
+        assert_ne!(2_f64.sqrt().powi(2), 2.);
+        assert_eq!(row.values, [2., 3., 5.].map(Complex::real));
+        let second = NoiseSample::new(20., 10., 0.25, 10., true);
+        generators.accumulate(&second, transfer, &mut integrated, None);
+        row.values.clear();
+        generators.append_integrated(&mut row);
+        integrated.append(&mut row);
+        assert_eq!(
+            row.values,
+            [20., 5., 30., 7.5, 50., 12.5, 50., 12.5].map(Complex::real)
+        );
+    }
+
+    #[test]
+    fn refreshed_noise_slots_reject_changed_identity_order_and_shape() {
+        let mut generators = Generators::new(instance());
+        let mut changed = instance();
+        changed.sources.swap(0, 1);
+        assert!(generators.refresh(changed).is_err());
+        let mut changed = instance();
+        changed.sources.pop();
+        assert!(generators.refresh(changed).is_err());
+        let mut changed = instance();
+        changed.total = false;
+        assert!(generators.refresh(changed).is_err());
+        let mut changed = instance();
+        changed.device = 4;
+        assert!(generators.refresh(changed).is_err());
+        let mut changed = instance();
+        changed.name = "other".into();
+        assert!(generators.refresh(changed).is_err());
+        assert!(generators.refresh(instance()).is_ok());
     }
 
     #[test]
@@ -679,6 +1000,50 @@ mod tests {
         assert_eq!(plot_count(&args("v ( out , ref ) v1 lin 1 1 1k 2")), 1);
         assert_eq!(plot_count(&args("v ( out ) v1 lin 2 1 1k rtol=1e-3")), 2);
         assert_eq!(plot_count(&args("garbage")), 2);
+    }
+
+    #[test]
+    fn almost_equal_linear_singleton_retains_integrated_plot_like_c() {
+        use crate::analysis::{AnalysisContext, AnalysisRequest, runner};
+        use crate::devices::Circuit;
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use crate::primitives::AnalysisKind;
+        use std::path::Path;
+        let netlist = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("noise-single.cir"),
+                "nearby noise bounds\nv1 a 0 dc 0 ac 1\nr1 a 0 1k\n.end\n",
+            ))
+            .unwrap();
+        let start = 1_f64;
+        for distance in 0..=5 {
+            let stop = f64::from_bits(start.to_bits() + distance);
+            for mode in ["lin", "dec", "oct"] {
+                let arguments = args(&format!("v ( a ) v1 {mode} 1 {start:.17} {stop:.17}"));
+                let request =
+                    AnalysisRequest::with_arguments(AnalysisKind::Noise, arguments.clone());
+                let parsed_start = crate::primitives::parse_spice_number(&arguments[7]).unwrap();
+                let parsed_stop = crate::primitives::parse_spice_number(&arguments[8]).unwrap();
+                let equal = almost_equal_ulps(parsed_start, parsed_stop, 3);
+                let integrated = if mode == "lin" {
+                    equal && parsed_start != parsed_stop
+                } else {
+                    !equal
+                };
+                let expected = 1 + usize::from(integrated);
+                let mut circuit = Circuit::from_netlist(&netlist).unwrap();
+                let plots = runner(AnalysisKind::Noise)
+                    .unwrap()
+                    .run_plots(&mut circuit, &request, &AnalysisContext::default())
+                    .unwrap();
+                assert_eq!(plots.len(), expected, "{mode} {distance}");
+                assert_eq!(plot_count(&arguments), expected);
+                assert_eq!(plots[0].point_count(), 1);
+                if let Some(integrated) = plots.get(1) {
+                    assert_eq!(integrated.points[0], [Complex::ZERO; 2]);
+                }
+            }
+        }
     }
 
     #[test]
@@ -694,10 +1059,10 @@ mod tests {
         // A flat density integrates to density * df.
         let (f0, f1) = (10.0_f64, 100.0_f64);
         let step = Step {
-            del_freq: f1 - f0,
-            ln_freq: f1.ln(),
-            ln_last_freq: f0.ln(),
-            del_ln_freq: f1.ln() - f0.ln(),
+            width: f1 - f0,
+            log_end: f1.ln(),
+            log_start: f0.ln(),
+            log_width: f1.ln() - f0.ln(),
         };
         let flat = nintegrate(2.0, 2f64.ln(), 2f64.ln(), &step);
         assert!((flat - 180.0).abs() < 1e-12);

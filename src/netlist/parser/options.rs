@@ -99,7 +99,7 @@ fn option_value(input: &mut Input<'_>) -> Result<OptionValue> {
             TokenKind::Word => true,
             _ => false,
         })
-        .context("a finite numeric literal, a word, {expression} or 'expression'")
+        .context("a finite numeric literal, a word, a brace-delimited or single-quoted expression")
         .parse_next(input)?;
     // A word directly followed by '=' is the next option name, i.e. the value
     // was missing: `reltol= temp=30`.

@@ -98,7 +98,7 @@ pub enum BinaryByteOrder {
 
 impl BinaryByteOrder {
     /// Decodes one stored `double`.
-    fn decode(self, bytes: [u8; DOUBLE_BYTES]) -> Real {
+    const fn decode(self, bytes: [u8; DOUBLE_BYTES]) -> Real {
         match self {
             Self::LittleEndian => Real::from_le_bytes(bytes),
             Self::BigEndian => Real::from_be_bytes(bytes),
@@ -106,7 +106,7 @@ impl BinaryByteOrder {
     }
 
     /// Encodes one `double` for storage.
-    fn encode(self, value: Real) -> [u8; DOUBLE_BYTES] {
+    const fn encode(self, value: Real) -> [u8; DOUBLE_BYTES] {
         match self {
             Self::LittleEndian => value.to_le_bytes(),
             Self::BigEndian => value.to_be_bytes(),
@@ -140,14 +140,14 @@ impl<'a> RawFileReader<'a> {
 
     /// Uses `format` instead of detecting it.
     #[must_use]
-    pub fn with_format(mut self, format: RawFormat) -> Self {
+    pub const fn with_format(mut self, format: RawFormat) -> Self {
         self.format = Some(format);
         self
     }
 
     /// Reads a binary payload in `byte_order`.
     #[must_use]
-    pub fn with_byte_order(mut self, byte_order: BinaryByteOrder) -> Self {
+    pub const fn with_byte_order(mut self, byte_order: BinaryByteOrder) -> Self {
         self.byte_order = byte_order;
         self
     }
@@ -158,10 +158,8 @@ impl<'a> RawFileReader<'a> {
     ///
     /// As [`RawFormat::detect`].
     pub fn format(&self) -> SpiceResult<RawFormat> {
-        match self.format {
-            Some(format) => Ok(format),
-            None => RawFormat::detect(self.bytes),
-        }
+        self.format
+            .map_or_else(|| RawFormat::detect(self.bytes), Ok)
     }
 
     /// Parses the rawfile.
@@ -370,10 +368,12 @@ fn find_section_line(bytes: &[u8], from: usize) -> Option<(usize, Section)> {
     let mut line_start = from;
     loop {
         let rest = &bytes[line_start..];
-        let (line, line_end) = match rest.iter().position(|byte| *byte == b'\n') {
-            Some(index) => (&rest[..index], line_start + index + 1),
-            None => (rest, bytes.len()),
-        };
+        let (line, line_end) = rest
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or((rest, bytes.len()), |index| {
+                (&rest[..index], line_start + index + 1)
+            });
         if let Some(colon) = line.iter().position(|byte| *byte == b':') {
             let key = line[..colon].trim_ascii();
             if key == b"Values" {

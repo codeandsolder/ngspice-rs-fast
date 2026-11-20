@@ -54,7 +54,8 @@ fn transformer(w: f64, r1: f64, rl: f64, l1: f64, l2: f64, m: f64) -> (Complex, 
     let z11 = Complex::new(r1, w * l1);
     let z12 = Complex::new(0.0, w * m);
     let z22 = Complex::new(rl, w * l2);
-    let det = z11 * z22 - z12 * z12;
+    let mutual_squared = z12 * z12;
+    let det = z11 * z22 - mutual_squared;
     let i1 = z22 / det;
     let i2 = -(z12 / det);
     (i1, i2)
@@ -143,7 +144,8 @@ fn an_ideal_transformer_keeps_its_turns_ratio_on_every_method() {
 /// `i(t) = exp(-L^-1 R t) i0` for two coupled RL loops, by the eigenvalues
 /// of the 2x2 matrix `A = -L^-1 R`.
 fn coupled_decay(l1: f64, l2: f64, m: f64, r1: f64, r2: f64, i0: [f64; 2], t: f64) -> [f64; 2] {
-    let det = l1 * l2 - m * m;
+    let mutual_squared = m * m;
+    let det = l1 * l2 - mutual_squared;
     // A = -L^-1 R, L^-1 = [[l2, -m], [-m, l1]] / det.
     let a = [
         [-l2 * r1 / det, m * r2 / det],
