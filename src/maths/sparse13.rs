@@ -175,8 +175,7 @@ pub(super) enum Status {
 }
 
 #[derive(Debug, Clone)]
-struct Element<T> {
-    value: T,
+struct Element {
     row: usize,
     col: usize,
     next_in_row: usize,
@@ -201,7 +200,10 @@ pub(super) struct Sparse<T> {
     /// External order (C `ExtSize`, here fixed by [`Self::new`]).
     ext_size: usize,
     current_size: usize,
-    elements: Vec<Element<T>>,
+    /// Stable handles index topology and numeric storage independently.
+    /// Reordering changes links, never moves element handles.
+    elements: Vec<Element>,
+    values: Vec<T>,
     diag: Vec<usize>,
     first_in_col: Vec<usize>,
     first_in_row: Vec<usize>,
@@ -241,6 +243,7 @@ impl<T: Scalar> Sparse<T> {
             ext_size: size,
             current_size: 0,
             elements: Vec::new(),
+            values: Vec::new(),
             diag: vec![NONE; size + 1],
             first_in_col: vec![NONE; size + 1],
             first_in_row: vec![NONE; size + 1],
@@ -314,7 +317,7 @@ impl<T: Scalar> Sparse<T> {
         }
     }
     fn mag(&self, e: usize) -> f64 {
-        self.elements[e].value.mag()
+        self.values[e].mag()
     }
 
     // --- spbuild.c ------------------------------------------------------
@@ -336,7 +339,7 @@ impl<T: Scalar> Sparse<T> {
     where
         T: std::ops::Add<Output = T>,
     {
-        let v = &mut self.elements[element].value;
+        let v = &mut self.values[element];
         *v = *v + value;
     }
 
@@ -396,12 +399,12 @@ impl<T: Scalar> Sparse<T> {
     fn create_element(&mut self, row: usize, col: usize, last: Slot, fillin: bool) -> usize {
         let e = self.elements.len();
         self.elements.push(Element {
-            value: T::ZERO,
             row,
             col,
             next_in_row: NONE,
             next_in_col: self.col_get(last),
         });
+        self.values.push(T::ZERO);
         if row == col {
             self.diag[row] = e;
         }
@@ -444,14 +447,43 @@ impl<T: Scalar> Sparse<T> {
 
     /// `spClear`: zero every value, keeping structure and pivot order.
     pub(crate) fn clear(&mut self) {
-        for element in &mut self.elements {
-            element.value = T::ZERO;
-        }
+        self.values.fill(T::ZERO);
+        self.reset_numeric_status();
+    }
+
+    fn reset_numeric_status(&mut self) {
         self.status = Status::Okay;
         self.factored = false;
         self.singular_row = 0;
         self.singular_col = 0;
         self.small_pivot = None;
+    }
+
+    /// Insert a unique original in assembly creation order, before any
+    /// fill-ins. Its handle is its position in the original coefficient run.
+    pub(super) fn append_original(&mut self, row: usize, col: usize, value: T) {
+        let next = self.values.len();
+        let handle = self.get_element(row, col);
+        assert_eq!(handle, next, "duplicate original sparse element");
+        self.values[handle] = value;
+    }
+
+    /// Reload consecutive originals, clearing only the fill-in suffix.
+    pub(super) fn reload_originals(&mut self, values: &[T]) {
+        let (originals, fillins) = self.values.split_at_mut(values.len());
+        originals.copy_from_slice(values);
+        fillins.fill(T::ZERO);
+        self.reset_numeric_status();
+    }
+
+    /// Reload from a folded stream without a temporary numeric vector.
+    pub(super) fn reload_originals_iter(&mut self, values: impl ExactSizeIterator<Item = T>) {
+        let (originals, fillins) = self.values.split_at_mut(values.len());
+        for (out, value) in originals.iter_mut().zip(values) {
+            *out = value;
+        }
+        fillins.fill(T::ZERO);
+        self.reset_numeric_status();
     }
 
     /// The same matrix frame holding another scalar type, every element
@@ -465,17 +497,8 @@ impl<T: Scalar> Sparse<T> {
             size: self.size,
             ext_size: self.ext_size,
             current_size: self.current_size,
-            elements: self
-                .elements
-                .into_iter()
-                .map(|e| Element {
-                    value: U::ZERO,
-                    row: e.row,
-                    col: e.col,
-                    next_in_row: e.next_in_row,
-                    next_in_col: e.next_in_col,
-                })
-                .collect(),
+            values: vec![U::ZERO; self.values.len()],
+            elements: self.elements,
             diag: self.diag,
             first_in_col: self.first_in_col,
             first_in_row: self.first_in_row,
@@ -513,15 +536,13 @@ impl<T: Scalar> Sparse<T> {
         for i in (1..=self.size).rev() {
             let diag = self.diag[i];
             if diag != NONE {
-                self.elements[diag].value = self.elements[diag].value.add_real(gmin);
+                self.values[diag] = self.values[diag].add_real(gmin);
             }
         }
     }
 
     pub(super) fn values_are_finite(&self) -> bool {
-        self.elements
-            .iter()
-            .all(|element| element.value.is_finite())
+        self.values.iter().all(|value| value.is_finite())
     }
 
     /// True only when a direct numerical refactor can use the established
@@ -537,12 +558,12 @@ impl<T: Scalar> Sparse<T> {
 
     /// Overwrites one element's value (`*element = value`).
     pub(crate) fn set(&mut self, element: usize, value: T) {
-        self.elements[element].value = value;
+        self.values[element] = value;
     }
 
     /// One element's value.
     pub(crate) fn value(&self, element: usize) -> T {
-        self.elements[element].value
+        self.values[element]
     }
 
     /// `SMPcAddCol` (`spsmp.c`): adds every element of external column
@@ -575,7 +596,7 @@ impl<T: Scalar> Sparse<T> {
             if acc == NONE || self.elements[acc].row > row {
                 acc = self.create_element(row, accum, prev, false);
             }
-            let value = self.elements[next].value;
+            let value = self.values[next];
             self.add(acc, value);
             next = self.elements[next].next_in_col;
         }
@@ -592,7 +613,7 @@ impl<T: Scalar> Sparse<T> {
         }
         let mut e = self.first_in_col[col];
         while e != NONE {
-            self.elements[e].value = T::ZERO;
+            self.values[e] = T::ZERO;
             e = self.elements[e].next_in_col;
         }
     }
@@ -649,13 +670,13 @@ impl<T: Scalar> Sparse<T> {
         let (mut out1, mut out2) = (NONE, NONE);
         let mut t1 = self.first_in_col[col];
         while t1 != NONE {
-            if self.elements[t1].value.real().abs() == 1.0 {
+            if self.values[t1].real().abs() == 1.0 {
                 let row = self.elements[t1].row;
                 let mut t2 = self.first_in_col[row];
                 while t2 != NONE && self.elements[t2].row != col {
                     t2 = self.elements[t2].next_in_col;
                 }
-                if t2 != NONE && self.elements[t2].value.real().abs() == 1.0 {
+                if t2 != NONE && self.values[t2].real().abs() == 1.0 {
                     twins += 1;
                     if twins >= 2 {
                         return (twins, out1, out2);
@@ -701,7 +722,7 @@ impl<T: Scalar> Sparse<T> {
         let mut exponent = 0_i64;
         let mut det = T::one();
         for i in 1..=self.size {
-            let inverse = self.elements[self.diag[i]].value;
+            let inverse = self.values[self.diag[i]];
             if !inverse.is_finite() || inverse.is_zero() {
                 return Err(numerical(
                     "SPARSE determinant",
@@ -817,33 +838,33 @@ impl<T: Scalar> Sparse<T> {
             return self.status;
         }
         let first = self.diag[1];
-        if self.elements[first].value.is_zero() {
+        if self.values[first].is_zero() {
             return self.refactor_zero_pivot(1);
         }
-        let inverse = self.elements[first].value.recip();
+        let inverse = self.values[first].recip();
         if !inverse.is_finite() || inverse.is_zero() {
             return self.nonfinite_factor();
         }
-        self.elements[first].value = inverse;
+        self.values[first] = inverse;
         self.factor_workspace.resize(size + 1, T::ZERO);
         self.factor_workspace.fill(T::ZERO);
         let dest = &mut self.factor_workspace;
         for step in 2..=size {
             let mut e = self.first_in_col[step];
             while e != NONE {
-                dest[self.elements[e].row] = self.elements[e].value;
+                dest[self.elements[e].row] = self.values[e];
                 e = self.elements[e].next_in_col;
             }
             let mut column = self.first_in_col[step];
             while self.elements[column].row < step {
                 let row = self.elements[column].row;
                 let mut e = self.diag[row];
-                let mult = dest[row].mul(self.elements[e].value);
-                self.elements[column].value = mult;
+                let mult = dest[row].mul(self.values[e]);
+                self.values[column] = mult;
                 e = self.elements[e].next_in_col;
                 while e != NONE {
                     let r = self.elements[e].row;
-                    dest[r] = dest[r].mul_sub(mult, self.elements[e].value);
+                    dest[r] = dest[r].mul_sub(mult, self.values[e]);
                     e = self.elements[e].next_in_col;
                 }
                 column = self.elements[column].next_in_col;
@@ -851,7 +872,7 @@ impl<T: Scalar> Sparse<T> {
             let mut e = self.elements[self.diag[step]].next_in_col;
             while e != NONE {
                 let value = dest[self.elements[e].row];
-                self.elements[e].value = value;
+                self.values[e] = value;
                 e = self.elements[e].next_in_col;
             }
             if dest[step].is_zero() {
@@ -862,7 +883,7 @@ impl<T: Scalar> Sparse<T> {
             if !inverse.is_finite() || inverse.is_zero() {
                 return self.nonfinite_factor();
             }
-            self.elements[d].value = inverse;
+            self.values[d] = inverse;
         }
         // Fixed-order factorization does not compare coefficient magnitudes
         // to select pivots. Validate the stored factors in one contiguous
@@ -1509,25 +1530,25 @@ impl<T: Scalar> Sparse<T> {
 
     /// `RealRowColElimination` / `ComplexRowColElimination`.
     fn row_col_elimination(&mut self, pivot: usize) {
-        if self.elements[pivot].value.mag() == 0.0 {
+        if self.values[pivot].mag() == 0.0 {
             let row = self.elements[pivot].row;
             self.matrix_is_singular(row);
             return;
         }
-        let inverse = self.elements[pivot].value.recip();
+        let inverse = self.values[pivot].recip();
         if !inverse.is_finite() || inverse.is_zero() {
             self.nonfinite_factor();
             return;
         }
-        self.elements[pivot].value = inverse;
+        self.values[pivot] = inverse;
         let mut upper = self.elements[pivot].next_in_row;
         while upper != NONE {
-            let u = self.elements[upper].value.mul(inverse);
+            let u = self.values[upper].mul(inverse);
             if !u.is_finite() {
                 self.nonfinite_factor();
                 return;
             }
-            self.elements[upper].value = u;
+            self.values[upper] = u;
             let upper_col = self.elements[upper].col;
             let mut sub = self.elements[upper].next_in_col;
             let mut lower = self.elements[pivot].next_in_col;
@@ -1539,13 +1560,13 @@ impl<T: Scalar> Sparse<T> {
                 if sub == NONE || self.elements[sub].row > row {
                     sub = self.create_fillin(row, upper_col);
                 }
-                let l = self.elements[lower].value;
-                let value = self.elements[sub].value.mul_sub(u, l);
+                let l = self.values[lower];
+                let value = self.values[sub].mul_sub(u, l);
                 if !value.is_finite() {
                     self.nonfinite_factor();
                     return;
                 }
-                self.elements[sub].value = value;
+                self.values[sub] = value;
                 sub = self.elements[sub].next_in_col;
                 lower = self.elements[lower].next_in_col;
             }
@@ -1645,12 +1666,12 @@ impl<T: Scalar> Sparse<T> {
             let mut temp = x[i];
             if !temp.is_zero() {
                 let pivot = self.diag[i];
-                temp = temp.mul(self.elements[pivot].value);
+                temp = temp.mul(self.values[pivot]);
                 x[i] = temp;
                 let mut e = self.elements[pivot].next_in_col;
                 while e != NONE {
                     let r = self.elements[e].row;
-                    x[r] = x[r].mul_sub(temp, self.elements[e].value);
+                    x[r] = x[r].mul_sub(temp, self.values[e]);
                     e = self.elements[e].next_in_col;
                 }
             }
@@ -1659,7 +1680,7 @@ impl<T: Scalar> Sparse<T> {
             let mut temp = x[i];
             let mut e = self.elements[self.diag[i]].next_in_row;
             while e != NONE {
-                temp = temp.mul_sub(self.elements[e].value, x[self.elements[e].col]);
+                temp = temp.mul_sub(self.values[e], x[self.elements[e].col]);
                 e = self.elements[e].next_in_row;
             }
             x[i] = temp;
@@ -1716,7 +1737,7 @@ impl<T: Scalar> Sparse<T> {
                 let mut e = self.elements[self.diag[i]].next_in_row;
                 while e != NONE {
                     let c = self.elements[e].col;
-                    x[c] = x[c].mul_sub(temp, self.elements[e].value);
+                    x[c] = x[c].mul_sub(temp, self.values[e]);
                     e = self.elements[e].next_in_row;
                 }
             }
@@ -1726,10 +1747,10 @@ impl<T: Scalar> Sparse<T> {
             let mut temp = x[i];
             let mut e = self.elements[pivot].next_in_col;
             while e != NONE {
-                temp = temp.mul_sub(x[self.elements[e].row], self.elements[e].value);
+                temp = temp.mul_sub(x[self.elements[e].row], self.values[e]);
                 e = self.elements[e].next_in_col;
             }
-            x[i] = temp.mul(self.elements[pivot].value);
+            x[i] = temp.mul(self.values[pivot]);
         }
         self.scatter_solution(rhs, x, true)
     }
@@ -1960,19 +1981,58 @@ mod tests {
     }
 
     #[test]
+    fn contiguous_original_reload_clears_fillins_and_preserves_handles() {
+        let entries = [
+            (1, 1, 4.),
+            (1, 2, 1.),
+            (2, 2, 4.),
+            (2, 3, 1.),
+            (3, 3, 4.),
+            (3, 4, 1.),
+            (4, 4, 4.),
+            (4, 1, 1.),
+        ];
+        let mut m = Sparse::<f64>::new(4);
+        for (r, c, v) in entries {
+            m.append_original(r, c, v);
+        }
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        assert!(m.values.len() > entries.len());
+        let rhs = [5.; 4];
+        let before = m.solve(&rhs);
+        let ptr = m.values.as_ptr();
+        let topology = m.elements.as_ptr();
+        let input = entries.map(|(_, _, v)| v);
+        m.reload_originals(&input);
+        assert!(!m.is_factored());
+        assert_eq!(&m.values[..entries.len()], &input);
+        assert!(m.values[entries.len()..].iter().all(|v| *v == 0.));
+        assert_eq!(m.factor(), Status::Okay);
+        assert_eq!(m.solve(&rhs), before);
+        assert_eq!(m.values.as_ptr(), ptr);
+        assert_eq!(m.elements.as_ptr(), topology);
+        m.reload_originals_iter(input.into_iter());
+        assert_eq!(m.factor(), Status::Okay);
+        assert_eq!(m.solve(&rhs), before);
+    }
+
+    #[test]
     fn scalar_transition_moves_structural_allocations() {
         let mut real = build(2, &[(1, 1, 2.), (1, 2, 1.), (2, 1, 3.), (2, 2, 4.)]);
         assert_eq!(real.order_and_factor(1e-3, 0.), Status::Okay);
+        let elements = real.elements.as_ptr();
         let diagonal = real.diag.as_ptr();
         let rows = real.int_to_ext_row.as_ptr();
         let columns = real.int_to_ext_col.as_ptr();
         let complex = real.into_retyped::<Complex>();
+        assert_eq!(complex.elements.as_ptr(), elements);
         assert_eq!(complex.diag.as_ptr(), diagonal);
         assert_eq!(complex.int_to_ext_row.as_ptr(), rows);
         assert_eq!(complex.int_to_ext_col.as_ptr(), columns);
         assert!(!complex.is_factored());
-        assert!(complex.elements.iter().all(|e| e.value.is_zero()));
+        assert!(complex.values.iter().all(|v| v.is_zero()));
         let real = complex.into_retyped::<f64>();
+        assert_eq!(real.elements.as_ptr(), elements);
         assert_eq!(real.diag.as_ptr(), diagonal);
         assert_eq!(real.int_to_ext_row.as_ptr(), rows);
         assert_eq!(real.int_to_ext_col.as_ptr(), columns);

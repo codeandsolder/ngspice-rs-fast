@@ -319,7 +319,7 @@ impl ComplexMatrix {
     /// # Errors
     /// Structurally or numerically singular matrix.
     pub fn factorize_new_matrix(&self) -> SpiceResult<ComplexLu> {
-        let (mut sparse, handles) = self.fresh_frame();
+        let mut sparse = self.fresh_frame();
         if !sparse.fully_translated() {
             // A circuit's matrix follows C (see `maths::linear`).
             if self.names.is_none() && matches!(self.assembly, Assembly::Standalone(_)) {
@@ -336,7 +336,6 @@ impl ComplexMatrix {
             n: self.n,
             order: self.order_key(),
             factors: ComplexFactors {
-                handles: Arc::new(handles),
                 sparse: Arc::new(sparse),
             },
         })
@@ -359,7 +358,7 @@ impl ComplexMatrix {
                 factors,
             });
         }
-        let (mut sparse, handles) = self.fresh_frame();
+        let mut sparse = self.fresh_frame();
         order_fresh(
             "complex sparse LU",
             &mut sparse,
@@ -371,33 +370,27 @@ impl ComplexMatrix {
             n: self.n,
             order: self.order_key(),
             factors: ComplexFactors {
-                handles: Arc::new(handles),
                 sparse: Arc::new(sparse),
             },
         })
     }
 
-    fn fresh_frame(&self) -> (Sparse<Complex>, Vec<usize>) {
+    fn fresh_frame(&self) -> Sparse<Complex> {
         let mut sparse = Sparse::new(self.n);
-        let mut insert = |r, c, v| {
-            let handle = sparse.get_element(r + 1, c + 1);
-            sparse.set(handle, v);
-            handle
-        };
-        let handles = match &self.assembly {
-            Assembly::Bound { pattern, values } => values
-                .iter()
-                .enumerate()
-                .map(|(index, &v)| {
+        match &self.assembly {
+            Assembly::Bound { pattern, values } => {
+                for (index, &v) in values.iter().enumerate() {
                     let (r, c) = pattern.position(crate::maths::sparse::element_id(index));
-                    insert(r, c, v)
-                })
-                .collect(),
-            Assembly::Standalone(entries) => {
-                entries.iter().map(|&(r, c, v)| insert(r, c, v)).collect()
+                    sparse.append_original(r + 1, c + 1, v);
+                }
             }
-        };
-        (sparse, handles)
+            Assembly::Standalone(entries) => {
+                for &(r, c, v) in entries {
+                    sparse.append_original(r + 1, c + 1, v);
+                }
+            }
+        }
+        sparse
     }
 
     fn order_key(&self) -> ComplexOrder {
@@ -424,10 +417,7 @@ impl ComplexMatrix {
         }
         let mut sparse = (*previous.factors.sparse).clone();
         let load = |sparse: &mut Sparse<Complex>| {
-            sparse.clear();
-            for (handle, &(_, _, v)) in previous.factors.handles.iter().zip(entries) {
-                sparse.set(*handle, v);
-            }
+            sparse.reload_originals_iter(entries.iter().map(|&(_, _, v)| v));
         };
         load(&mut sparse);
         let mut status = sparse.factor();
@@ -440,7 +430,6 @@ impl ComplexMatrix {
             n: self.n,
             order: previous.order.clone(),
             factors: ComplexFactors {
-                handles: Arc::clone(&previous.factors.handles),
                 sparse: Arc::new(sparse),
             },
         })

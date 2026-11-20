@@ -255,8 +255,6 @@ enum Key {
 pub struct SparseSymbolic {
     n: usize,
     key: Key,
-    /// SPARSE element per triplet (folded order) or per [`crate::maths::ElementId`].
-    handles: Arc<Vec<usize>>,
     sparse: Arc<Sparse<f64>>,
     /// What `sparse`'s factors were computed from, when they came from a
     /// clean `NIiter` refactorization ([`solve_ni`]); `None` after anything
@@ -272,7 +270,6 @@ pub struct SparseSymbolic {
 #[derive(Debug, Clone)]
 pub(super) struct ComplexFactors {
     pub(super) sparse: Arc<Sparse<Complex>>,
-    pub(super) handles: Arc<Vec<usize>>,
 }
 
 #[derive(Debug)]
@@ -285,10 +282,9 @@ impl CachedFrame {
     fn into_real(self, pattern: &Arc<Pattern>) -> SparseSymbolic {
         match self {
             Self::Real(symbolic) => symbolic,
-            Self::Complex(ComplexFactors { sparse, handles }) => SparseSymbolic {
+            Self::Complex(ComplexFactors { sparse }) => SparseSymbolic {
                 n: pattern.order(),
                 key: Key::Pattern(Arc::downgrade(pattern)),
-                handles,
                 sparse: Arc::new(Arc::unwrap_or_clone(sparse).into_retyped()),
                 factored: None,
             },
@@ -444,37 +440,22 @@ pub(in crate::maths) fn factor_shared_complex(
 ) -> SpiceResult<ComplexFactors> {
     pattern.with_ordering(|state| {
     let n = pattern.order();
-    let (mut sparse, handles, fresh) = match state.frame.take() {
+    let (mut sparse, fresh) = match state.frame.take() {
         Some(CachedFrame::Real(symbolic)) if matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern))) => {
-            (
-                Arc::new(Arc::unwrap_or_clone(symbolic.sparse).into_retyped()),
-                symbolic.handles,
-                false,
-            )
+            (Arc::new(Arc::unwrap_or_clone(symbolic.sparse).into_retyped()), false)
         }
-        Some(CachedFrame::Complex(ComplexFactors { sparse, handles })) => {
-            (sparse, handles, false)
-        }
+        Some(CachedFrame::Complex(ComplexFactors { sparse })) => (sparse, false),
         _ => {
             let mut sparse = Sparse::<Complex>::new(n);
-            let handles: Vec<_> = (0..pattern.len())
-                .map(|index| {
-                    let (row, col) = pattern.position(crate::maths::sparse::element_id(index));
-                    sparse.get_element(row + 1, col + 1)
-                })
-                .collect();
-            (Arc::new(sparse), Arc::new(handles), true)
-        }
-    };
-    let load = |sparse: &mut Sparse<Complex>| {
-        sparse.clear();
-        debug_assert_eq!(handles.len(), values.len());
-        for (&handle, &value) in handles.iter().zip(values) {
-            sparse.set(handle, value);
+            for (index, &value) in values.iter().enumerate() {
+                let (row, col) = pattern.position(crate::maths::sparse::element_id(index));
+                sparse.append_original(row + 1, col + 1, value);
+            }
+            (Arc::new(sparse), true)
         }
     };
     let numeric = Arc::make_mut(&mut sparse);
-    load(numeric);
+    if !fresh { numeric.reload_originals(values); }
     let result = if fresh {
         state.ac_reorder = false;
         order_fresh("complex sparse LU", numeric, pivot, names, true)
@@ -487,12 +468,12 @@ pub(in crate::maths) fn factor_shared_complex(
         };
         if status == Status::ZeroDiag {
             // NIacIter: E_SINGULAR sets NIACSHOULDREORDER and retries.
-            load(numeric);
+            numeric.reload_originals(values);
             status = numeric.order_and_factor(pivot.relative, pivot.absolute);
         }
         check_status("complex sparse LU", status, numeric, names)
     };
-    let factors = ComplexFactors { sparse, handles };
+    let factors = ComplexFactors { sparse };
     state.frame = Some(CachedFrame::Complex(factors.clone()));
     result.map(|()| factors)
     })
@@ -514,7 +495,6 @@ pub enum NiStep {
 struct LoadedFrame {
     sparse: Arc<Sparse<f64>>,
     key: Key,
-    handles: Arc<Vec<usize>>,
     previous_inputs: Option<Arc<FactoredInputs>>,
 }
 
@@ -525,7 +505,6 @@ impl LoadedFrame {
         Self {
             sparse: previous.sparse,
             key: previous.key,
-            handles: previous.handles,
             previous_inputs: previous.factored,
         }
     }
@@ -533,18 +512,10 @@ impl LoadedFrame {
     /// Reload coefficients in handle order, keeping fill-ins and pivot order.
     fn reload(&mut self, matrix: &SparseMatrix) {
         let sparse = Arc::make_mut(&mut self.sparse);
-        sparse.clear();
         if let Some((_, values)) = matrix.bound_values() {
-            debug_assert_eq!(self.handles.len(), values.len());
-            for (&handle, &value) in self.handles.iter().zip(values) {
-                sparse.set(handle, value);
-            }
+            sparse.reload_originals(values);
         } else {
-            let triplets = matrix.triplets();
-            debug_assert_eq!(self.handles.len(), triplets.len());
-            for (&handle, triplet) in self.handles.iter().zip(triplets) {
-                sparse.set(handle, triplet.value);
-            }
+            sparse.reload_originals_iter(matrix.triplets().iter().map(|t| t.value));
         }
     }
 
@@ -570,7 +541,6 @@ impl LoadedFrame {
         SparseSymbolic {
             n,
             key: self.key,
-            handles: self.handles,
             sparse: self.sparse,
             factored,
         }
@@ -581,38 +551,25 @@ impl LoadedFrame {
 fn fresh_frame(matrix: &SparseMatrix) -> LoadedFrame {
     if let Some((pattern, values)) = matrix.bound_values() {
         let mut sparse = Sparse::new(pattern.order());
-        let handles: Vec<_> = (0..pattern.len())
-            .map(|index| {
-                let id = crate::maths::sparse::element_id(index);
-                let (row, col) = pattern.position(id);
-                let handle = sparse.get_element(row + 1, col + 1);
-                sparse.set(handle, values[index]);
-                handle
-            })
-            .collect();
+        for (index, &value) in values.iter().enumerate() {
+            let (row, col) = pattern.position(crate::maths::sparse::element_id(index));
+            sparse.append_original(row + 1, col + 1, value);
+        }
         return LoadedFrame {
             sparse: Arc::new(sparse),
             key: Key::Pattern(Arc::downgrade(pattern)),
-            handles: Arc::new(handles),
             previous_inputs: None,
         };
     }
     let n = matrix.rows();
     let pattern: Vec<_> = matrix.triplets().iter().map(|t| (t.row, t.col)).collect();
     let mut sparse = Sparse::new(n);
-    let handles: Vec<_> = matrix
-        .triplets()
-        .iter()
-        .map(|t| {
-            let handle = sparse.get_element(t.row + 1, t.col + 1);
-            sparse.set(handle, t.value);
-            handle
-        })
-        .collect();
+    for t in matrix.triplets() {
+        sparse.append_original(t.row + 1, t.col + 1, t.value);
+    }
     LoadedFrame {
         sparse: Arc::new(sparse),
         key: Key::Triplets(Arc::new(pattern)),
-        handles: Arc::new(handles),
         previous_inputs: None,
     }
 }
@@ -1128,27 +1085,21 @@ mod tests {
         let first = ac(1.);
         let solution = first.solve(&rhs_complex).unwrap();
         let first_frame = pattern.with_ordering(|state| state.frame.take()).unwrap();
-        let CachedFrame::Complex(ComplexFactors { sparse, handles }) = &first_frame else {
+        let CachedFrame::Complex(ComplexFactors { sparse }) = &first_frame else {
             panic!("AC must retain a complex frame");
         };
         assert!(sparse.is_factored());
         assert_eq!(Arc::strong_count(sparse), 2);
-        let handles = Arc::clone(handles);
         pattern.with_ordering(|state| state.frame = Some(first_frame));
         let second = ac(2.);
         assert_ne!(second.solve(&rhs_complex).unwrap(), solution);
         assert_eq!(first.solve(&rhs_complex).unwrap(), solution);
         drop(second);
         let frame = pattern.with_ordering(|state| state.frame.take()).unwrap();
-        let CachedFrame::Complex(ComplexFactors {
-            sparse,
-            handles: retained,
-        }) = &frame
-        else {
+        let CachedFrame::Complex(ComplexFactors { sparse }) = &frame else {
             panic!("second AC factorization lost the complex frame");
         };
         assert_eq!(Arc::strong_count(sparse), 1);
-        assert!(Arc::ptr_eq(&handles, retained));
         pattern.with_ordering(|state| state.frame = Some(frame));
         assert_eq!(solve_last_factors(&pattern, &rhs).unwrap(), None);
         let NiStep::Solved(after) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
@@ -1163,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn unfolded_symbolic_reuse_shares_handles_and_keeps_snapshots() {
+    fn unfolded_symbolic_reuse_keeps_pattern_and_snapshots() {
         let mut a = SparseMatrix::new(2, 2);
         a.add(1, 1, 3.).unwrap();
         a.add(0, 0, 2.).unwrap();
@@ -1174,10 +1125,7 @@ mod tests {
         a.add(1, 0, 9.).unwrap();
         a.add(1, 0, -9.).unwrap();
         let reused = SparseLu::new(&a, Some(original.symbolic())).unwrap();
-        assert!(Arc::ptr_eq(
-            &original.symbolic.handles,
-            &reused.symbolic.handles
-        ));
+        assert!(reused.symbolic.matches(&a));
         assert_eq!(original.solve(&rhs).unwrap().as_slice(), &[2., 2.]);
         assert_eq!(reused.solve(&rhs).unwrap().as_slice(), &[1., 2.]);
 
