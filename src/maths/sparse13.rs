@@ -455,6 +455,55 @@ impl Topology {
         e
     }
 
+    /// Append to a sorted column in constant time, or mark it for deferred
+    /// sorting if rows arrive in an arbitrary order. A missing tail with a
+    /// nonempty head denotes an unordered column.
+    fn append_original(&mut self, row: usize, col: usize, tails: &mut [usize]) -> usize {
+        let tail = tails[col];
+        let head = self.first_in_col[col];
+        if head == NONE {
+            let handle = self.create_element(row, col, Slot::Head(col), false);
+            tails[col] = handle;
+            handle
+        } else if tail != NONE && row > self.elements[tail].row {
+            let handle = self.create_element(row, col, Slot::After(tail), false);
+            tails[col] = handle;
+            handle
+        } else {
+            if row >= self.elements[head].row {
+                tails[col] = NONE;
+            }
+            self.create_element(row, col, Slot::Head(col), false)
+        }
+    }
+
+    /// Finalize only unordered columns. Stable handles remain in original
+    /// creation order; the linked traversal is sorted by internal row.
+    fn finish_original_columns(&mut self, tails: &[usize]) {
+        let mut run = Vec::new();
+        for (col, &tail) in tails.iter().enumerate().skip(1) {
+            if tail != NONE || self.first_in_col[col] == NONE {
+                continue;
+            }
+            run.clear();
+            let mut e = self.first_in_col[col];
+            while e != NONE {
+                run.push(e);
+                e = self.elements[e].next_in_col;
+            }
+            run.sort_unstable_by_key(|&handle| self.elements[handle].row);
+            self.first_in_col[col] = run[0];
+            for pair in run.windows(2) {
+                assert_ne!(
+                    self.elements[pair[0]].row, self.elements[pair[1]].row,
+                    "duplicate original sparse element"
+                );
+                self.elements[pair[0]].next_in_col = pair[1];
+            }
+            self.elements[*run.last().expect("unordered column is nonempty")].next_in_col = NONE;
+        }
+    }
+
     fn col_get(&self, slot: Slot) -> usize {
         match slot {
             Slot::Head(col) => self.first_in_col[col],
@@ -913,15 +962,15 @@ impl<T: Scalar> Sparse<T> {
             std::sync::Arc::get_mut(&mut sparse.topology).expect("new topology is unique");
         topology.elements.reserve(capacity);
         sparse.values.reserve(capacity);
+        let mut tails = vec![NONE; size + 1];
         for (row, col, value) in entries {
             debug_assert!(row >= 1 && col >= 1 && row <= size && col <= size);
             let (r, c) = topology.translate(&mut sparse.size, row, col);
-            let (last, found) = topology.locate_in_col(Slot::Head(c), r);
-            assert_eq!(found, NONE, "duplicate original sparse element");
-            let handle = topology.create_element(r, c, last, false);
+            let handle = topology.append_original(r, c, &mut tails);
             debug_assert_eq!(handle, sparse.values.len());
             sparse.values.push(value);
         }
+        topology.finish_original_columns(&tails[..=sparse.size]);
         sparse
     }
 
@@ -2286,6 +2335,32 @@ mod tests {
         let imag = mantissa.im * 10_f64.powi(exponent - 614);
         assert!((imag - 2.).abs() < 1e-12);
         assert!((mantissa.re * 10_f64.powi(exponent - 614)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bulk_column_finalization_preserves_nonmonotonic_links() {
+        // Translate all unknowns first, then insert a densely populated
+        // column in deliberately unsorted internal row order.
+        let mut entries: Vec<_> = (1..=8).map(|i| (i, i, 20.)).collect();
+        entries.extend([7, 3, 8, 2, 6, 4, 5].map(|r| (r, 1, r as f64)));
+        entries.extend([8, 6, 5, 4, 3, 1, 7].map(|r| (r, 2, -1.)));
+        let a = Sparse::from_originals(8, entries.iter().copied());
+        let b = build(8, &entries);
+        assert_eq!(a.topology.first_in_col, b.topology.first_in_col);
+        assert_eq!(a.topology.diag, b.topology.diag);
+        for (a, b) in a.topology.elements.iter().zip(&b.topology.elements) {
+            assert_eq!(
+                (a.row, a.col, a.next_in_col, a.next_in_row),
+                (b.row, b.col, b.next_in_col, b.next_in_row)
+            );
+        }
+        assert_eq!(a.values, b.values);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate original sparse element")]
+    fn bulk_column_builder_rejects_duplicate_originals() {
+        let _ = Sparse::from_originals(2, [(1, 2, 1.), (2, 2, 2.), (1, 2, 3.)]);
     }
 
     #[test]
