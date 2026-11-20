@@ -24,7 +24,9 @@ pub(in crate::devices) fn band_gap(kelvin: Real) -> Real {
 
 /// Built-in potential shift from the C temperature routines.
 pub(in crate::devices) fn potential_shift(vt: Real, relative: Real, arg: Real) -> Real {
-    -2. * vt * (1.5 * relative.ln() + CHARGE * arg)
+    let logarithmic = 1.5 * relative.ln();
+    let electrical = CHARGE * arg;
+    -2. * vt * (logarithmic + electrical)
 }
 
 /// One temperature's shift and scale of semiconductor junction potential.
@@ -50,7 +52,8 @@ impl PotentialTemperature {
 
     /// Transform a nominal-temperature potential to this temperature.
     pub(in crate::devices) fn correct(&self, nominal: &Self, potential: Real) -> Real {
-        self.relative * nominal.reference_potential(potential) + self.shift
+        let scaled = self.relative * nominal.reference_potential(potential);
+        scaled + self.shift
     }
 
     /// The nominal and actual grading-coefficient offsets of the C MOS,
@@ -63,12 +66,15 @@ impl PotentialTemperature {
     ) -> JunctionCorrection {
         let pbo = nominal.reference_potential(potential);
         let gmaold = (potential - pbo) / pbo;
-        let actual = self.relative * pbo + self.shift;
+        let scaled = self.relative * pbo;
+        let actual = scaled + self.shift;
         let gmanew = (actual - pbo) / pbo;
+        let nominal_delta = 4e-4 * (nominal.kelvin - REFTEMP);
+        let actual_delta = 4e-4 * (self.kelvin - REFTEMP);
         JunctionCorrection {
             potential: actual,
-            nominal_offset: 4e-4 * (nominal.kelvin - REFTEMP) - gmaold,
-            actual_offset: 4e-4 * (self.kelvin - REFTEMP) - gmanew,
+            nominal_offset: nominal_delta - gmaold,
+            actual_offset: actual_delta - gmanew,
         }
     }
 }
@@ -107,11 +113,13 @@ pub(in crate::devices) struct JunctionCorrection {
 
 impl JunctionCorrection {
     pub(in crate::devices) fn nominal_denominator(&self, grading: Real) -> Real {
-        1. + grading * self.nominal_offset
+        let correction = grading * self.nominal_offset;
+        1. + correction
     }
 
     pub(in crate::devices) fn actual_factor(&self, grading: Real) -> Real {
-        1. + grading * self.actual_offset
+        let correction = grading * self.actual_offset;
+        1. + correction
     }
 
     /// The two separate MOS/JFET factors, not their rounded quotient:
@@ -155,7 +163,9 @@ impl<K: Eq, T> DerivedCache<K, T> {
     pub(in crate::devices) const fn from_value(key: K, value: T) -> Self {
         Self(RefCell::new(Some((key, value))))
     }
+}
 
+impl<K: Copy + Eq, T> DerivedCache<K, T> {
     /// Borrow on hot paths without copying a large operating descriptor.
     pub(in crate::devices) fn get(&self, key: K) -> Option<Ref<'_, T>> {
         Ref::filter_map(self.0.borrow(), |entry| {

@@ -27,7 +27,7 @@ impl ChargeBranch {
         states.patch_state1(self.slot, self.charge)
     }
 
-    /// C's initial-transient derivative write, after NIintegrate.
+    /// C's initial-transient derivative write, after `NIintegrate`.
     pub(in crate::devices) fn seed_derivative(
         self,
         states: &mut DeviceState<'_>,
@@ -63,7 +63,7 @@ impl ChargeBranch {
         Ok(value)
     }
 
-    /// NIintegrate stores the derivative, but does not advance accepted
+    /// `NIintegrate` stores the derivative, but does not advance accepted
     /// history or write the charge slot. The device owns those operations.
     #[inline]
     pub(in crate::devices) fn integrate(
