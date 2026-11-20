@@ -96,19 +96,19 @@ impl Mos1 {
         let (sarg, dvon, d2von, d3von);
         if vbx <= 0. {
             sarg = (phi - vbx).sqrt();
-            if -gamma != 0. {
+            if -gamma == 0. {
+                (dvon, d2von, d3von) = (0., 0., 0.);
+            } else {
                 let d1 = -gamma * 0.5 / sarg;
                 let d2 = -d1 * 0.5 / (sarg * sarg);
                 (dvon, d2von, d3von) = (d1, d2, 1.5 * d2 / (sarg * sarg));
-            } else {
-                (dvon, d2von, d3von) = (0., 0., 0.);
             }
         } else {
             let root = phi.sqrt();
-            let d1 = if gamma != 0. {
-                -gamma / (root + root)
-            } else {
+            let d1 = if gamma == 0. {
                 0.
+            } else {
+                -gamma / (root + root)
             };
             let s = (root - vbx / (root + root)).max(0.);
             sarg = s;

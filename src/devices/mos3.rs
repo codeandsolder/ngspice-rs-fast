@@ -629,10 +629,10 @@ impl MosLevel for Level3 {
             let argc = kappa * alpha;
             let argb = (arga * arga + argc * (vds - vdsat)).sqrt();
             let delxl = argb - arga;
-            let (dldvd, dldem) = if argb != 0.0 {
-                (argc / (argb + argb), 0.5 * (arga / argb - 1.0) * alpha)
-            } else {
+            let (dldvd, dldem) = if argb == 0.0 {
                 (0.0, 0.0)
+            } else {
+                (argc / (argb + argb), 0.5 * (arga / argb - 1.0) * alpha)
             };
             Some((
                 delxl,

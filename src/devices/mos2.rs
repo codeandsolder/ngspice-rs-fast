@@ -373,9 +373,8 @@ impl MosLevel for Level2 {
             || factors.iter().any(|f| !f.is_finite() || *f < 0.)
         {
             return Err(SpiceError::circuit(format!(
-                "{}: MOS2 parameters are out of range at {:.2} K \
-                 (nonfinite value, or nonpositive PHI/PB/KP/IS after temperature scaling)",
-                name, temp
+                "{name}: MOS2 parameters are out of range at {temp:.2} K \
+                 (nonfinite value, or nonpositive PHI/PB/KP/IS after temperature scaling)"
             )));
         }
         Ok(operating)
