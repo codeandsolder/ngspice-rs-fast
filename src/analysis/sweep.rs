@@ -148,13 +148,13 @@ impl SweepSpec {
     /// needs its length only; the C-compatible accumulated grid needs the
     /// same validation and capacity hint, but evaluates a different sequence.
     fn exact_values(&self) -> SpiceResult<impl ExactSizeIterator<Item = Real> + Clone> {
-        let (start, stop, step) = (self.start, self.stop, self.step);
-        if ![start, stop, step].iter().all(|v| v.is_finite()) || step == 0. {
+        let (start, stop, increment) = (self.start, self.stop, self.step);
+        if ![start, stop, increment].iter().all(|v| v.is_finite()) || increment == 0. {
             return Err(unsupported(
                 "DC sweep needs finite start/stop and a nonzero step",
             ));
         }
-        let ratio = (stop - start) / step;
+        let ratio = (stop - start) / increment;
         if !ratio.is_finite() {
             return Err(unsupported("DC sweep span overflows"));
         }
@@ -174,7 +174,7 @@ impl SweepSpec {
             if snap_stop && i == intervals {
                 stop
             } else {
-                let offset = Real::from(i) * step;
+                let offset = Real::from(i) * increment;
                 start + offset
             }
         });
@@ -310,7 +310,7 @@ impl<'a> Written<'a> {
     }
 }
 
-fn resolve_target(circuit: &Circuit, written: Written<'_>) -> SpiceResult<SweepTarget> {
+fn resolve_target(circuit: &Circuit, written: &Written<'_>) -> SpiceResult<SweepTarget> {
     let source = |name: &str| {
         circuit.device(name).and_then(|device| {
             device
@@ -325,7 +325,7 @@ fn resolve_target(circuit: &Circuit, written: Written<'_>) -> SpiceResult<SweepT
         parameter: parameter.to_owned(),
         route,
     };
-    Ok(match written {
+    Ok(match *written {
         Written::Temperature => SweepTarget::Temperature,
         Written::Name(name) => {
             if let Some((name, kind)) = source(name) {
@@ -427,7 +427,7 @@ pub fn resolve(
     }
     let mut axes = vec![];
     let mut work = 1usize;
-    for (axis, written) in args.as_chunks::<4>().0.iter().zip(written) {
+    for (axis, written) in args.as_chunks::<4>().0.iter().zip(&written) {
         let target = resolve_target(circuit, written)?;
         let spec = SweepSpec {
             target,
@@ -693,6 +693,67 @@ fn prepare_grids(
     Ok(grids)
 }
 
+/// Policy and circuit inputs shared by all points in a DC sweep.
+struct SweepSolver<'a> {
+    circuit: &'a Circuit,
+    settings: &'a crate::analysis::bias::DcSettings,
+    warm_settings: Option<&'a crate::analysis::bias::DcSettings>,
+    nodes: &'a crate::analysis::bias::NodeForcing,
+}
+
+impl SweepSolver<'_> {
+    fn solve(
+        &self,
+        point: &PointContext<'_>,
+        previous: &Vector,
+        history: &crate::devices::StateHistory,
+        first: bool,
+    ) -> SpiceResult<crate::analysis::newton::NewtonSolution<crate::devices::TrialState>> {
+        use crate::analysis::bias::{DcOutcome, solve_dc_from};
+        use crate::analysis::newton::PhasePolicy;
+        let overrides = point.source_values();
+        // After the first point, C tries a bounded warm Newton solve before CKTop.
+        if let Some(direct) = self.warm_settings.filter(|_| !first) {
+            match solve_dc_from(
+                self.circuit,
+                &point.model,
+                direct,
+                overrides,
+                Some(previous),
+                history,
+                PhasePolicy::Predicted,
+                self.nodes,
+            ) {
+                Ok(solved) => return Ok(solved.solution),
+                Err(failure)
+                    if matches!(
+                        failure.report.outcome,
+                        DcOutcome::Exhausted | DcOutcome::BudgetExhausted
+                    ) => {}
+                Err(failure) => return Err(failure.error),
+            }
+        }
+        // Without a warm limit the full solve uses the predicted point.
+        // Otherwise retry with a fresh operating-point phase as C does.
+        let phase = if first || self.warm_settings.is_some() {
+            PhasePolicy::OperatingPoint
+        } else {
+            PhasePolicy::Predicted
+        };
+        Ok(solve_dc_from(
+            self.circuit,
+            &point.model,
+            self.settings,
+            overrides,
+            Some(previous),
+            history,
+            phase,
+            self.nodes,
+        )?
+        .solution)
+    }
+}
+
 pub(crate) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
@@ -711,6 +772,12 @@ pub(crate) fn run(
     let axes = resolve(circuit, request, context)?;
     let (point_iterations, settings) = sweep_settings(request)?;
     let warm_settings = warm_start_settings(point_iterations, &settings);
+    let solver = SweepSolver {
+        circuit,
+        settings: &settings,
+        warm_settings: warm_settings.as_ref(),
+        nodes: &nodes,
+    };
     let grids = prepare_grids(circuit, &axes, context)?;
     // C order: the first axis is the inner (fast) loop, the second the outer.
     let GridPair { inner, outer } = GridPair::new(&grids);
@@ -747,61 +814,7 @@ pub(crate) fn run(
             let model = point_context.model;
             let overrides = point_context.source_values();
             // dctrcurv.c runs NIiter at every point, linear circuits included.
-            let solution = {
-                // dctrcurv.c: every point after the first first tries a plain
-                // warm-started Newton bounded by `itl2` (CKTdcTrcvMaxIter) and
-                // only on failure falls back to the full operating-point solve.
-                let warm = match warm_settings.as_ref().filter(|_| !first) {
-                    None => None,
-                    Some(direct) => {
-                        match crate::analysis::bias::solve_dc_from(
-                            circuit,
-                            &model,
-                            direct,
-                            overrides,
-                            Some(&previous),
-                            &history,
-                            crate::analysis::newton::PhasePolicy::Predicted,
-                            &nodes,
-                        ) {
-                            Ok(solved) => Some(solved.solution),
-                            Err(failure)
-                                if matches!(
-                                    failure.report.outcome,
-                                    crate::analysis::bias::DcOutcome::Exhausted
-                                        | crate::analysis::bias::DcOutcome::BudgetExhausted
-                                ) =>
-                            {
-                                None
-                            }
-                            Err(failure) => return Err(failure.error),
-                        }
-                    }
-                };
-                match warm {
-                    Some(solution) => solution,
-                    None => {
-                        crate::analysis::bias::solve_dc_from(
-                            circuit,
-                            &model,
-                            &settings,
-                            overrides,
-                            Some(&previous),
-                            &history,
-                            // Without a warm-start limit the full solve's
-                            // direct attempt is the predicted point; after a
-                            // failed warm start it restarts like CKTop.
-                            if first || warm_settings.is_some() {
-                                crate::analysis::newton::PhasePolicy::OperatingPoint
-                            } else {
-                                crate::analysis::newton::PhasePolicy::Predicted
-                            },
-                            &nodes,
-                        )?
-                        .solution
-                    }
-                }
-            };
+            let solution = solver.solve(&point_context, &previous, &history, first)?;
             let x = solution.values;
             let trial = solution.trial;
             let first_point = std::mem::replace(&mut first, false);

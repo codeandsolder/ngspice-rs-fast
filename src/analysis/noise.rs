@@ -748,6 +748,14 @@ fn output_excitation(circuit: &Circuit, output: [NodeId; 2]) -> Vec<Complex> {
     adjoint_rhs
 }
 
+fn spectrum_plot(representation: Representation, spectrum_variables: Vec<Variable>) -> Plot {
+    let mut spectrum = Plot::new("noise1", representation.plotname(true), PlotFlags::Real);
+    for variable in spectrum_variables {
+        spectrum.push_variable(variable);
+    }
+    spectrum
+}
+
 /// Runs `.noise` and returns its plots: the spectrum and, unless the sweep is
 /// a single frequency, the integrated noise.
 pub(crate) fn run(
@@ -787,10 +795,7 @@ pub(crate) fn run(
     let representation = Representation::from_squared(request.squared_noise);
     let (spectrum_variables, integrated_variables) =
         plot_names(&generators, input_kind, card.summary != 0, representation);
-    let mut spectrum = Plot::new("noise1", representation.plotname(true), PlotFlags::Real);
-    for variable in spectrum_variables {
-        spectrum.push_variable(variable);
-    }
+    let mut spectrum = spectrum_plot(representation, spectrum_variables);
     let output = [card.positive, card.negative];
     let adjoint_rhs = output_excitation(circuit, output);
 
