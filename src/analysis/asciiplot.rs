@@ -3,8 +3,10 @@
 //! it. Pagination, date headers and terminal-dependent widths are deliberately
 //! replaced by a fixed 60-column field; no graphical backend is involved.
 use crate::analysis::Plot;
-use crate::primitives::{SpiceError, SpiceResult};
+use crate::primitives::{SpiceError, SpiceResult, exact_nonnegative_integer};
 use std::fmt::Write as _;
+
+const SYMBOLS: &[u8] = b"+*=$%!0123456789";
 
 /// Render selected vectors, using C's legend and collision characters.
 /// Complex vectors are plotted by their real component (C `ft_agraf`).
@@ -37,7 +39,7 @@ pub fn render(plot: &Plot) -> SpiceResult<String> {
             high = high.max(value.re);
         }
     }
-    if low == high {
+    if low >= high {
         let delta = low.abs().max(1.) * 0.1;
         low -= delta;
         high += delta;
@@ -46,7 +48,6 @@ pub fn render(plot: &Plot) -> SpiceResult<String> {
     if !span.is_finite() || span <= 0. {
         return Err(invalid("dependent range overflows"));
     }
-    const SYMBOLS: &[u8] = b"+*=$%!0123456789";
     let mut text = format!("plot: {}\nLegend:  ", plot.plotname);
     for (i, variable) in plot.variables[1..].iter().enumerate() {
         let _ = write!(
@@ -58,8 +59,8 @@ pub fn render(plot: &Plot) -> SpiceResult<String> {
     }
     let _ = writeln!(
         text,
-        "\n{}     {:.3e} .. {:.3e}",
-        plot.variables[0].name, low, high
+        "\n{}     {low:.3e} .. {high:.3e}",
+        plot.variables[0].name
     );
     for row in &plot.points {
         let mut field = [b' '; 61];
@@ -67,7 +68,9 @@ pub fn render(plot: &Plot) -> SpiceResult<String> {
             field[i] = b'.';
         }
         for (i, value) in row[1..].iter().enumerate() {
-            let at = (((value.re - low) / span) * 60.).round().clamp(0., 60.) as usize;
+            let position = (((value.re - low) / span) * 60.).round().clamp(0., 60.);
+            let at = exact_nonnegative_integer::<usize>(position)
+                .ok_or_else(|| invalid("invalid plot column"))?;
             field[at] = if matches!(field[at], b' ' | b'.') {
                 *SYMBOLS.get(i).unwrap_or(&b'#')
             } else {
