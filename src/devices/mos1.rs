@@ -132,7 +132,9 @@ impl Level1 {
         let cox = 3.9 * EPSILON_0 / tox;
         Ok(Process {
             cox,
-            kp: self.kp.unwrap_or(self.u0.unwrap_or(600.) * cox * 1e-4),
+            kp: self
+                .kp
+                .unwrap_or_else(|| self.u0.unwrap_or(600.) * cox * 1e-4),
             surface: self.surface.derive(
                 SurfaceLaw::Classic,
                 "MOS1",

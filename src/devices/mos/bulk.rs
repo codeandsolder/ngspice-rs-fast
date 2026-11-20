@@ -39,7 +39,7 @@ impl BulkLaw {
         }
     }
 
-    fn reverse(self) -> ReverseLaw {
+    const fn reverse(self) -> ReverseLaw {
         match self {
             Self::Mos3 => ReverseLaw::Cubic,
             _ => ReverseLaw::Constant,

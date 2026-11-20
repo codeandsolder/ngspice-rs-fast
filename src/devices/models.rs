@@ -314,8 +314,8 @@ impl<'a> ModelResolver<'a> {
             return Err(SpiceError::parse(
                 instance.location.clone(),
                 format!(
-                    "wrong model family {:?} for {}; model '{name}' declared at {}",
-                    family, instance.name, card.location
+                    "wrong model family {family:?} for {}; model '{name}' declared at {}",
+                    instance.name, card.location
                 ),
             ));
         }
@@ -771,10 +771,11 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
             first_integer
         }
         ModelFamily::Resistor if card.base.eq_ignore_ascii_case("r") => first_integer,
-        // inpdomod.c: NJF/PJF level 0 or 1 is JFET, 2 is JFET2.
-        ModelFamily::Njf | ModelFamily::Pjf => first_integer.max(1),
-        // inpdomod.c: NMF/PMF level 0 or 1 is MES, 2-4 MESA, 5 HFET1, 6 HFET2.
-        ModelFamily::Nmf | ModelFamily::Pmf => first_integer.max(1),
+        // inpdomod.c: NJF/PJF level 0 or 1 is JFET, 2 is JFET2;
+        // NMF/PMF level 0 or 1 is MES, 2-4 MESA, 5 HFET1, 6 HFET2.
+        ModelFamily::Njf | ModelFamily::Pjf | ModelFamily::Nmf | ModelFamily::Pmf => {
+            first_integer.max(1)
+        }
         _ => 1,
     };
     let applied = (family == ModelFamily::Diode).then_some(last.unwrap_or(1));
@@ -782,8 +783,8 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
         // inpdomod.c accepts levels 0-2 (JFET, JFET2) and rejects the rest.
         return Err(SpiceError::not_yet_ported(
             format!(
-                "{location}: {:?} model '{}' level {selector}",
-                family, card.name
+                "{location}: {family:?} model '{}' level {selector}",
+                card.name
             ),
             "src/spicelib/parser/inpdomod.c (only JFET levels 1-2 exist in C)",
         ));
@@ -794,8 +795,8 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
         let reference = "src/spicelib/parser/inpdomod.c (only MESFET levels 1-4 and HFET levels 5-6 exist in C)";
         return Err(SpiceError::not_yet_ported(
             format!(
-                "{location}: {:?} model '{}' level {selector}",
-                family, card.name
+                "{location}: {family:?} model '{}' level {selector}",
+                card.name
             ),
             reference,
         ));
@@ -835,8 +836,8 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
         };
         return Err(SpiceError::not_yet_ported(
             format!(
-                "{setter_location}: {:?} model '{}' selector {selector}, applied level {applied:?}",
-                family, card.name
+                "{setter_location}: {family:?} model '{}' selector {selector}, applied level {applied:?}",
+                card.name
             ),
             reference,
         ));
