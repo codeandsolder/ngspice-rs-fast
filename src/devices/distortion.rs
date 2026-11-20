@@ -559,8 +559,10 @@ pub fn add_products(
             // diodisto.c: `temp += -omega * D1i(...)`, `itemp += omega *
             // D1n(...)` onto the junction current's polynomial.
             let charge = inputs.evaluate(charge);
-            temp += -omega * charge.im;
-            itemp += omega * charge.re;
+            let charge_real = -omega * charge.im;
+            let charge_imag = omega * charge.re;
+            temp += charge_real;
+            itemp += charge_imag;
         }
         let [a, b] = term.nodes;
         if let Some(row) = unknowns.node_row(a) {

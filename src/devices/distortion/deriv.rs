@@ -341,97 +341,102 @@ impl Dderivs {
         n.d2_pr = (a.d2_pr - b.d1_r * n.d1_p - n.value * b.d2_pr
             + b.d1_p * (n.value * b.d1_r - a.d1_r) / b.value)
             / b.value;
-        n.d3_p3 = (-b.d1_p * n.d2_p2 + a.d3_p3
-            - b.d2_p2 * n.d1_p
-            - b.d1_p * n.d2_p2
-            - n.d1_p * b.d2_p2
-            - n.value * b.d3_p3
-            + (b.d1_p * (n.d1_p * b.d1_p + n.value * b.d2_p2 - a.d2_p2)
-                + (n.value * b.d1_p - a.d1_p) * (b.d2_p2 - b.d1_p * b.d1_p / b.value))
-                / b.value)
-            / b.value;
-        n.d3_q3 = (-b.d1_q * n.d2_q2 + a.d3_q3
-            - b.d2_q2 * n.d1_q
-            - b.d1_q * n.d2_q2
-            - n.d1_q * b.d2_q2
-            - n.value * b.d3_q3
-            + (b.d1_q * (n.d1_q * b.d1_q + n.value * b.d2_q2 - a.d2_q2)
-                + (n.value * b.d1_q - a.d1_q) * (b.d2_q2 - b.d1_q * b.d1_q / b.value))
-                / b.value)
-            / b.value;
-        n.d3_r3 = (-b.d1_r * n.d2_r2 + a.d3_r3
-            - b.d2_r2 * n.d1_r
-            - b.d1_r * n.d2_r2
-            - n.d1_r * b.d2_r2
-            - n.value * b.d3_r3
-            + (b.d1_r * (n.d1_r * b.d1_r + n.value * b.d2_r2 - a.d2_r2)
-                + (n.value * b.d1_r - a.d1_r) * (b.d2_r2 - b.d1_r * b.d1_r / b.value))
-                / b.value)
-            / b.value;
-        n.d3_p2r = (-b.d1_r * n.d2_p2 + a.d3_p2r
-            - b.d2_pr * n.d1_p
-            - b.d1_p * n.d2_pr
-            - n.d1_r * b.d2_p2
-            - n.value * b.d3_p2r
-            + (b.d1_p * (n.d1_r * b.d1_p + n.value * b.d2_pr - a.d2_pr)
-                + (n.value * b.d1_p - a.d1_p) * (b.d2_pr - b.d1_p * b.d1_r / b.value))
-                / b.value)
-            / b.value;
-        n.d3_p2q = (-b.d1_q * n.d2_p2 + a.d3_p2q
-            - b.d2_pq * n.d1_p
-            - b.d1_p * n.d2_pq
-            - n.d1_q * b.d2_p2
-            - n.value * b.d3_p2q
-            + (b.d1_p * (n.d1_q * b.d1_p + n.value * b.d2_pq - a.d2_pq)
-                + (n.value * b.d1_p - a.d1_p) * (b.d2_pq - b.d1_p * b.d1_q / b.value))
-                / b.value)
-            / b.value;
-        n.d3_q2r = (-b.d1_r * n.d2_q2 + a.d3_q2r
-            - b.d2_qr * n.d1_q
-            - b.d1_q * n.d2_qr
-            - n.d1_r * b.d2_q2
-            - n.value * b.d3_q2r
-            + (b.d1_q * (n.d1_r * b.d1_q + n.value * b.d2_qr - a.d2_qr)
-                + (n.value * b.d1_q - a.d1_q) * (b.d2_qr - b.d1_q * b.d1_r / b.value))
-                / b.value)
-            / b.value;
-        n.d3_pq2 = (-b.d1_p * n.d2_q2 + a.d3_pq2
-            - b.d2_pq * n.d1_q
-            - b.d1_q * n.d2_pq
-            - n.d1_p * b.d2_q2
-            - n.value * b.d3_pq2
-            + (b.d1_q * (n.d1_p * b.d1_q + n.value * b.d2_pq - a.d2_pq)
-                + (n.value * b.d1_q - a.d1_q) * (b.d2_pq - b.d1_q * b.d1_p / b.value))
-                / b.value)
-            / b.value;
-        n.d3_pr2 = (-b.d1_p * n.d2_r2 + a.d3_pr2
-            - b.d2_pr * n.d1_r
-            - b.d1_r * n.d2_pr
-            - n.d1_p * b.d2_r2
-            - n.value * b.d3_pr2
-            + (b.d1_r * (n.d1_p * b.d1_r + n.value * b.d2_pr - a.d2_pr)
-                + (n.value * b.d1_r - a.d1_r) * (b.d2_pr - b.d1_r * b.d1_p / b.value))
-                / b.value)
-            / b.value;
-        n.d3_qr2 = (-b.d1_q * n.d2_r2 + a.d3_qr2
-            - b.d2_qr * n.d1_r
-            - b.d1_r * n.d2_qr
-            - n.d1_q * b.d2_r2
-            - n.value * b.d3_qr2
-            + (b.d1_r * (n.d1_q * b.d1_r + n.value * b.d2_qr - a.d2_qr)
-                + (n.value * b.d1_r - a.d1_r) * (b.d2_qr - b.d1_r * b.d1_q / b.value))
-                / b.value)
-            / b.value;
-        n.d3_pqr = (-b.d1_r * n.d2_pq + a.d3_pqr
-            - b.d2_qr * n.d1_p
-            - b.d1_q * n.d2_pr
-            - n.d1_r * b.d2_pq
-            - n.value * b.d3_pqr
-            + (b.d1_p * (n.d1_r * b.d1_q + n.value * b.d2_qr - a.d2_qr)
-                + (n.value * b.d1_q - a.d1_q) * (b.d2_pr - b.d1_p * b.d1_r / b.value))
-                / b.value)
-            / b.value;
+        n.div_third_order(&a, &b);
         n
+    }
+
+    // Third-order quotient derivatives consume the already computed lower orders.
+    fn div_third_order(&mut self, a: &Self, b: &Self) {
+        self.d3_p3 = (-b.d1_p * self.d2_p2 + a.d3_p3
+            - b.d2_p2 * self.d1_p
+            - b.d1_p * self.d2_p2
+            - self.d1_p * b.d2_p2
+            - self.value * b.d3_p3
+            + (b.d1_p * (self.d1_p * b.d1_p + self.value * b.d2_p2 - a.d2_p2)
+                + (self.value * b.d1_p - a.d1_p) * (b.d2_p2 - b.d1_p * b.d1_p / b.value))
+                / b.value)
+            / b.value;
+        self.d3_q3 = (-b.d1_q * self.d2_q2 + a.d3_q3
+            - b.d2_q2 * self.d1_q
+            - b.d1_q * self.d2_q2
+            - self.d1_q * b.d2_q2
+            - self.value * b.d3_q3
+            + (b.d1_q * (self.d1_q * b.d1_q + self.value * b.d2_q2 - a.d2_q2)
+                + (self.value * b.d1_q - a.d1_q) * (b.d2_q2 - b.d1_q * b.d1_q / b.value))
+                / b.value)
+            / b.value;
+        self.d3_r3 = (-b.d1_r * self.d2_r2 + a.d3_r3
+            - b.d2_r2 * self.d1_r
+            - b.d1_r * self.d2_r2
+            - self.d1_r * b.d2_r2
+            - self.value * b.d3_r3
+            + (b.d1_r * (self.d1_r * b.d1_r + self.value * b.d2_r2 - a.d2_r2)
+                + (self.value * b.d1_r - a.d1_r) * (b.d2_r2 - b.d1_r * b.d1_r / b.value))
+                / b.value)
+            / b.value;
+        self.d3_p2r = (-b.d1_r * self.d2_p2 + a.d3_p2r
+            - b.d2_pr * self.d1_p
+            - b.d1_p * self.d2_pr
+            - self.d1_r * b.d2_p2
+            - self.value * b.d3_p2r
+            + (b.d1_p * (self.d1_r * b.d1_p + self.value * b.d2_pr - a.d2_pr)
+                + (self.value * b.d1_p - a.d1_p) * (b.d2_pr - b.d1_p * b.d1_r / b.value))
+                / b.value)
+            / b.value;
+        self.d3_p2q = (-b.d1_q * self.d2_p2 + a.d3_p2q
+            - b.d2_pq * self.d1_p
+            - b.d1_p * self.d2_pq
+            - self.d1_q * b.d2_p2
+            - self.value * b.d3_p2q
+            + (b.d1_p * (self.d1_q * b.d1_p + self.value * b.d2_pq - a.d2_pq)
+                + (self.value * b.d1_p - a.d1_p) * (b.d2_pq - b.d1_p * b.d1_q / b.value))
+                / b.value)
+            / b.value;
+        self.d3_q2r = (-b.d1_r * self.d2_q2 + a.d3_q2r
+            - b.d2_qr * self.d1_q
+            - b.d1_q * self.d2_qr
+            - self.d1_r * b.d2_q2
+            - self.value * b.d3_q2r
+            + (b.d1_q * (self.d1_r * b.d1_q + self.value * b.d2_qr - a.d2_qr)
+                + (self.value * b.d1_q - a.d1_q) * (b.d2_qr - b.d1_q * b.d1_r / b.value))
+                / b.value)
+            / b.value;
+        self.d3_pq2 = (-b.d1_p * self.d2_q2 + a.d3_pq2
+            - b.d2_pq * self.d1_q
+            - b.d1_q * self.d2_pq
+            - self.d1_p * b.d2_q2
+            - self.value * b.d3_pq2
+            + (b.d1_q * (self.d1_p * b.d1_q + self.value * b.d2_pq - a.d2_pq)
+                + (self.value * b.d1_q - a.d1_q) * (b.d2_pq - b.d1_q * b.d1_p / b.value))
+                / b.value)
+            / b.value;
+        self.d3_pr2 = (-b.d1_p * self.d2_r2 + a.d3_pr2
+            - b.d2_pr * self.d1_r
+            - b.d1_r * self.d2_pr
+            - self.d1_p * b.d2_r2
+            - self.value * b.d3_pr2
+            + (b.d1_r * (self.d1_p * b.d1_r + self.value * b.d2_pr - a.d2_pr)
+                + (self.value * b.d1_r - a.d1_r) * (b.d2_pr - b.d1_r * b.d1_p / b.value))
+                / b.value)
+            / b.value;
+        self.d3_qr2 = (-b.d1_q * self.d2_r2 + a.d3_qr2
+            - b.d2_qr * self.d1_r
+            - b.d1_r * self.d2_qr
+            - self.d1_q * b.d2_r2
+            - self.value * b.d3_qr2
+            + (b.d1_r * (self.d1_q * b.d1_r + self.value * b.d2_qr - a.d2_qr)
+                + (self.value * b.d1_r - a.d1_r) * (b.d2_qr - b.d1_r * b.d1_q / b.value))
+                / b.value)
+            / b.value;
+        self.d3_pqr = (-b.d1_r * self.d2_pq + a.d3_pqr
+            - b.d2_qr * self.d1_p
+            - b.d1_q * self.d2_pr
+            - self.d1_r * b.d2_pq
+            - self.value * b.d3_pqr
+            + (b.d1_p * (self.d1_r * b.d1_q + self.value * b.d2_qr - a.d2_qr)
+                + (self.value * b.d1_q - a.d1_q) * (b.d2_pr - b.d1_p * b.d1_r / b.value))
+                / b.value)
+            / b.value;
     }
 
     /// C `sqrtder.c`.
