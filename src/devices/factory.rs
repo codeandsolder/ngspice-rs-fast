@@ -7,7 +7,8 @@ use crate::devices::{
     PwlSource, Resistor, SffmSpec, SineSpec, Waveform,
 };
 use crate::netlist::ast::{
-    DeviceInstance, ParameterKind, PositionedValue, SourceFunction, SourceWaveform,
+    DeviceInstance, FunctionWaveform, ParameterKind, PositionedValue, SourceFunction,
+    SourceWaveform,
 };
 use crate::netlist::source::{Deck, LogicalLine};
 use crate::netlist::{Parser, RawCard};
@@ -321,10 +322,17 @@ fn instantiate_passive(
     })
 }
 
-fn instantiate_source(
-    instance: &DeviceInstance,
-    nodes: &mut NodeTable,
-) -> SpiceResult<Box<dyn Device>> {
+struct SourceSetters {
+    value: Option<Real>,
+    mag: Real,
+    phase: Real,
+    ac_given: bool,
+    waveform: Option<Waveform>,
+    port: PortSetters,
+    distortion: [Option<crate::devices::distortion::DistortionInput>; 2],
+}
+
+fn parse_source_setters(instance: &DeviceInstance) -> SpiceResult<SourceSetters> {
     let mut value = None;
     let mut mag = 0.;
     let mut phase: f64 = 0.;
@@ -413,28 +421,10 @@ fn instantiate_source(
             }
             "td" => pwl_delay = Some((number, p.location.clone())),
             "portnum" | "z0" | "pwr" | "freq" | "phase" => {
-                port.set(&p.name, number, &p.location)?
+                port.set(&p.name, number, &p.location)?;
             }
             "r" => {
-                // C silently ignores r= when no PWL coefficients exist yet.
-                let Some(Waveform::Pwl(knots)) = &waveform else {
-                    return Err(SpiceError::Unsupported {
-                        feature: format!(
-                            "{}: r= without a preceding PWL setter (C ignores it)",
-                            instance.name
-                        ),
-                        location: Some(p.location.clone()),
-                    });
-                };
-                // VSRC_R/ISRC_R validate every r= as it is set (E_PARMVAL
-                // aborts the deck), so an invalid earlier r= is an error even
-                // when a later one is valid.
-                PwlSource::new(knots.clone(), 0., Some(number)).map_err(|error| {
-                    SpiceError::Unsupported {
-                        feature: format!("{}: {error}", instance.name),
-                        location: Some(p.location.clone()),
-                    }
-                })?;
+                validate_pwl_repeat(instance, p, waveform.as_ref(), number)?;
                 pwl_repeat = Some((number, p.location.clone()));
             }
             _ => value = Some(number),
@@ -443,6 +433,56 @@ fn instantiate_source(
     if pwl_delay.is_some() || pwl_repeat.is_some() {
         waveform = Some(pwl_options(waveform, pwl_delay, pwl_repeat)?);
     }
+    Ok(SourceSetters {
+        value,
+        mag,
+        phase,
+        ac_given,
+        waveform,
+        port,
+        distortion,
+    })
+}
+
+fn validate_pwl_repeat(
+    instance: &DeviceInstance,
+    p: &crate::netlist::ast::ParameterAssignment,
+    waveform: Option<&Waveform>,
+    number: Real,
+) -> SpiceResult<()> {
+    // C silently ignores r= when no PWL coefficients exist yet.
+    let Some(Waveform::Pwl(knots)) = waveform else {
+        return Err(SpiceError::Unsupported {
+            feature: format!(
+                "{}: r= without a preceding PWL setter (C ignores it)",
+                instance.name
+            ),
+            location: Some(p.location.clone()),
+        });
+    };
+    // VSRC_R/ISRC_R validate every r= as it is set (E_PARMVAL
+    // aborts the deck), so an invalid earlier r= is an error even
+    // when a later one is valid.
+    PwlSource::new(knots.clone(), 0., Some(number)).map_err(|error| SpiceError::Unsupported {
+        feature: format!("{}: {error}", instance.name),
+        location: Some(p.location.clone()),
+    })?;
+    Ok(())
+}
+
+fn instantiate_source(
+    instance: &DeviceInstance,
+    nodes: &mut NodeTable,
+) -> SpiceResult<Box<dyn Device>> {
+    let SourceSetters {
+        value,
+        mag,
+        phase,
+        ac_given,
+        waveform,
+        port,
+        distortion,
+    } = parse_source_setters(instance)?;
     let dc_given = value.is_some();
     let waveform_given = waveform.is_some();
     // An explicit DC value is kept apart from time forcing. Without one, DC
@@ -641,74 +681,7 @@ fn source_waveform(
     setter: &SourceLoc,
 ) -> SpiceResult<Waveform> {
     match (name, source) {
-        (_, SourceWaveform::Function(f)) => {
-            // The parser bounds the field count; a hand-built AST may not.
-            let most = f.function.fields().len();
-            if !(2..=most).contains(&f.values.len()) {
-                return Err(SpiceError::Unsupported {
-                    feature: format!(
-                        "{} with {} fields (needs 2 to {most})",
-                        f.function.keyword(),
-                        f.values.len()
-                    ),
-                    location: Some(
-                        f.values
-                            .get(most)
-                            .map_or_else(|| setter.clone(), |extra| extra.location.clone()),
-                    ),
-                });
-            }
-            let at = &f.values[0];
-            let fields = f
-                .values
-                .iter()
-                .zip(f.function.fields())
-                .map(|(value, what)| field(value, &format!("{} {what}", f.function.keyword())))
-                .collect::<SpiceResult<Vec<_>>>()?;
-            let get = |index: usize| fields.get(index).copied();
-            let (v0, v1) = (fields[0], fields[1]);
-            let spec = match f.function {
-                SourceFunction::Sin => FunctionSpec::Sine(SineSpec {
-                    offset: v0,
-                    amplitude: v1,
-                    frequency: get(2),
-                    delay: get(3),
-                    damping: get(4),
-                    phase: get(5),
-                }),
-                SourceFunction::Exp => FunctionSpec::Exp(ExpSpec {
-                    initial: v0,
-                    pulsed: v1,
-                    rise_delay: get(2),
-                    rise_tau: get(3),
-                    fall_delay: get(4),
-                    fall_tau: get(5),
-                }),
-                SourceFunction::Sffm => FunctionSpec::Sffm(SffmSpec {
-                    offset: v0,
-                    amplitude: v1,
-                    carrier: get(2),
-                    index: get(3),
-                    signal: get(4),
-                    delay: get(5),
-                    signal_phase: get(6),
-                    carrier_phase: get(7),
-                }),
-                SourceFunction::Am => FunctionSpec::Am(AmSpec {
-                    offset: v0,
-                    carrier_amplitude: v1,
-                    modulation_amplitude: get(2),
-                    modulation_frequency: get(3),
-                    carrier_frequency: get(4),
-                    delay: get(5),
-                    modulation_phase: get(6),
-                    carrier_phase: get(7),
-                }),
-            };
-            let waveform = Waveform::FunctionDefaults(spec);
-            waveform.validate().map_err(|e| waveform_error(at, &e))?;
-            Ok(waveform)
-        }
+        (_, SourceWaveform::Function(f)) => function_waveform(f, setter),
         ("pulse", SourceWaveform::Pulse(p)) => {
             let optional = |v: &Option<PositionedValue>, what| v.as_ref().map(|v| field(v, what));
             let spec = PulseSpec {
@@ -746,6 +719,75 @@ fn source_waveform(
             "src/spicelib/devices/vsrc/vsrcload.c",
         )),
     }
+}
+
+fn function_waveform(f: &FunctionWaveform, setter: &SourceLoc) -> SpiceResult<Waveform> {
+    // The parser bounds the field count; a hand-built AST may not.
+    let most = f.function.fields().len();
+    if !(2..=most).contains(&f.values.len()) {
+        return Err(SpiceError::Unsupported {
+            feature: format!(
+                "{} with {} fields (needs 2 to {most})",
+                f.function.keyword(),
+                f.values.len()
+            ),
+            location: Some(
+                f.values
+                    .get(most)
+                    .map_or_else(|| setter.clone(), |extra| extra.location.clone()),
+            ),
+        });
+    }
+    let at = &f.values[0];
+    let fields = f
+        .values
+        .iter()
+        .zip(f.function.fields())
+        .map(|(value, what)| field(value, &format!("{} {what}", f.function.keyword())))
+        .collect::<SpiceResult<Vec<_>>>()?;
+    let get = |index: usize| fields.get(index).copied();
+    let (v0, v1) = (fields[0], fields[1]);
+    let spec = match f.function {
+        SourceFunction::Sin => FunctionSpec::Sine(SineSpec {
+            offset: v0,
+            amplitude: v1,
+            frequency: get(2),
+            delay: get(3),
+            damping: get(4),
+            phase: get(5),
+        }),
+        SourceFunction::Exp => FunctionSpec::Exp(ExpSpec {
+            initial: v0,
+            pulsed: v1,
+            rise_delay: get(2),
+            rise_tau: get(3),
+            fall_delay: get(4),
+            fall_tau: get(5),
+        }),
+        SourceFunction::Sffm => FunctionSpec::Sffm(SffmSpec {
+            offset: v0,
+            amplitude: v1,
+            carrier: get(2),
+            index: get(3),
+            signal: get(4),
+            delay: get(5),
+            signal_phase: get(6),
+            carrier_phase: get(7),
+        }),
+        SourceFunction::Am => FunctionSpec::Am(AmSpec {
+            offset: v0,
+            carrier_amplitude: v1,
+            modulation_amplitude: get(2),
+            modulation_frequency: get(3),
+            carrier_frequency: get(4),
+            delay: get(5),
+            modulation_phase: get(6),
+            carrier_phase: get(7),
+        }),
+    };
+    let waveform = Waveform::FunctionDefaults(spec);
+    waveform.validate().map_err(|e| waveform_error(at, &e))?;
+    Ok(waveform)
 }
 
 fn waveform_error(at: &PositionedValue, error: &SpiceError) -> SpiceError {
