@@ -10,6 +10,7 @@
 //! - `src/spicelib/devices/cktbindnode.c` — node creation and the node index
 //!   space.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -85,7 +86,7 @@ pub struct Node {
 /// Maps node names to ids, case-insensitively.
 ///
 /// SPICE node names are case-insensitive, so `In`, `IN` and `in` are one node.
-/// The first spelling seen is kept for display and for rawfile output.
+/// Names are stored in canonical lowercase for display and rawfile output.
 #[derive(Debug, Clone)]
 pub struct NodeTable {
     nodes: Vec<Node>,
@@ -130,11 +131,26 @@ impl NodeTable {
     /// `0` when aliasing is on.
     #[must_use]
     pub fn canonical_name(name: &str, auto_gnd: bool) -> String {
-        let lowered = name.to_lowercase();
-        if auto_gnd && lowered == GROUND_ALIAS {
-            GROUND_NAME.to_owned()
+        Self::canonical(name, auto_gnd).into_owned()
+    }
+
+    fn canonical(name: &str, auto_gnd: bool) -> Cow<'_, str> {
+        if auto_gnd && name.eq_ignore_ascii_case(GROUND_ALIAS) {
+            Cow::Borrowed(GROUND_NAME)
+        } else if name
+            .bytes()
+            .all(|b| b.is_ascii() && !b.is_ascii_uppercase())
+        {
+            Cow::Borrowed(name)
         } else {
-            lowered
+            // Unicode lowercase includes contextual mappings (e.g. final
+            // sigma), so do not substitute per-character ASCII folding.
+            let lowered = name.to_lowercase();
+            if auto_gnd && lowered == GROUND_ALIAS {
+                Cow::Borrowed(GROUND_NAME)
+            } else {
+                Cow::Owned(lowered)
+            }
         }
     }
 
@@ -146,10 +162,11 @@ impl NodeTable {
     /// # Panics
     /// If the table already holds `u32::MAX` nodes.
     pub fn intern(&mut self, name: &str) -> NodeId {
-        let canonical = Self::canonical_name(name, self.auto_gnd);
-        if let Some(id) = self.index.get(&canonical) {
+        let canonical = Self::canonical(name, self.auto_gnd);
+        if let Some(id) = self.index.get(canonical.as_ref()) {
             return *id;
         }
+        let canonical = canonical.into_owned();
         let id = NodeId::new(u32::try_from(self.nodes.len()).expect("node table overflow"));
         let kind = if canonical == GROUND_NAME {
             NodeKind::Ground
@@ -168,8 +185,8 @@ impl NodeTable {
     /// Looks up a node without creating it.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<NodeId> {
-        let canonical = Self::canonical_name(name, self.auto_gnd);
-        self.index.get(&canonical).copied()
+        let canonical = Self::canonical(name, self.auto_gnd);
+        self.index.get(canonical.as_ref()).copied()
     }
 
     /// The node with this id.
@@ -236,6 +253,29 @@ impl Default for NodeTable {
 #[cfg(test)]
 mod tests {
     use super::{GROUND_ALIAS, GROUND_NAME, NodeId, NodeKind, NodeTable};
+
+    #[test]
+    fn canonical_lookup_borrows_ascii_and_preserves_unicode_lowercase() {
+        use std::borrow::Cow;
+
+        assert!(matches!(
+            NodeTable::canonical("v(out)#branch", true),
+            Cow::Borrowed("v(out)#branch")
+        ));
+        assert!(matches!(
+            NodeTable::canonical("GND", true),
+            Cow::Borrowed("0")
+        ));
+        assert!(matches!(NodeTable::canonical("GND", false), Cow::Owned(_)));
+        let mut table = NodeTable::new();
+        // Final sigma uses context-sensitive Unicode lowercase.
+        let greek = table.intern("ΟΣ");
+        assert_eq!(table.node(greek).unwrap().name, "ος");
+        assert_eq!(table.get("ος"), Some(greek));
+        assert_eq!(table.get("ΟΣ"), Some(greek));
+        let expanded = table.intern("İ");
+        assert_eq!(table.get("i\u{307}"), Some(expanded));
+    }
 
     #[test]
     fn ground_is_node_zero() {

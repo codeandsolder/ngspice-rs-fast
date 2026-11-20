@@ -172,11 +172,174 @@ impl Div for Complex {
 
     fn div(self, rhs: Self) -> Self {
         let denominator = rhs.re * rhs.re + rhs.im * rhs.im;
-        Self::new(
-            (self.re * rhs.re + self.im * rhs.im) / denominator,
-            (self.im * rhs.re - self.re * rhs.im) / denominator,
-        )
+        let ac = self.re * rhs.re;
+        let bd = self.im * rhs.im;
+        let bc = self.im * rhs.re;
+        let ad = self.re * rhs.im;
+        let result = Self::new((ac + bd) / denominator, (bc - ad) / denominator);
+        // Keep the C operation order on the ordinary path. Only use the
+        // scaled path when a product or sum loses its representable range.
+        if (!denominator.is_normal()
+            || !result.is_finite()
+            || lost_product(ac, self.re, rhs.re)
+            || lost_product(bd, self.im, rhs.im)
+            || lost_product(bc, self.im, rhs.re)
+            || lost_product(ad, self.re, rhs.im))
+            && self.is_finite()
+            && rhs.is_finite()
+            && rhs != Self::ZERO
+        {
+            return scaled_complex_div(self, rhs);
+        }
+        result
     }
+}
+
+fn lost_product(product: Real, a: Real, b: Real) -> bool {
+    !product.is_normal() && a != 0.0 && b != 0.0
+}
+
+/// A number represented outside the native binary64 exponent range.
+#[derive(Clone, Copy)]
+struct ScaledNumber {
+    mantissa: Real,
+    exponent: i32,
+}
+
+impl ScaledNumber {
+    fn divide(self, rhs: Self) -> Real {
+        scale_power(self.mantissa / rhs.mantissa, self.exponent - rhs.exponent)
+    }
+}
+
+/// An exponent-scaled product with its exact rounding residual. Keeping
+/// products independent preserves each quotient component even with a
+/// very large dynamic range between the real and imaginary inputs. The
+/// residual also recovers cancellation between two products that round
+/// to the same significand.
+#[derive(Clone, Copy)]
+struct ScaledProduct {
+    value: ScaledNumber,
+    roundoff: Real,
+}
+
+impl ScaledProduct {
+    fn product(a: Real, b: Real) -> Self {
+        if a == 0.0 || b == 0.0 {
+            return Self {
+                value: ScaledNumber {
+                    mantissa: a * b,
+                    exponent: 0,
+                },
+                roundoff: 0.0,
+            };
+        }
+        let (a, ae) = split_power(a);
+        let (b, be) = split_power(b);
+        let mantissa = a * b;
+        Self {
+            value: ScaledNumber {
+                mantissa,
+                exponent: ae + be,
+            },
+            // Both scaled factors have magnitude in [1, 2), so this
+            // error-free product cannot overflow or underflow.
+            roundoff: a.mul_add(b, -mantissa),
+        }
+    }
+
+    fn add(self, other: Self) -> ScaledNumber {
+        let x = self.value;
+        let y = other.value;
+        if x.mantissa == 0.0 && y.mantissa == 0.0 {
+            return ScaledNumber {
+                mantissa: x.mantissa + y.mantissa,
+                exponent: 0,
+            };
+        }
+        if x.mantissa == 0.0 {
+            return y;
+        }
+        if y.mantissa == 0.0 {
+            return x;
+        }
+        let exponent = x.exponent.max(y.exponent);
+        let a = scale_power(x.mantissa, x.exponent - exponent);
+        let b = scale_power(y.mantissa, y.exponent - exponent);
+        let sum = a + b;
+        // Knuth's TwoSum: keep the addition rounding residual too. This
+        // is strictly on the exceptional path, never ordinary C arithmetic.
+        let virtual_b = sum - a;
+        let residual = (a - (sum - virtual_b)) + (b - virtual_b);
+        let roundoff = residual
+            + scale_power(self.roundoff, x.exponent - exponent)
+            + scale_power(other.roundoff, y.exponent - exponent);
+        ScaledNumber {
+            mantissa: sum + roundoff,
+            exponent,
+        }
+    }
+}
+
+/// Exact unbiased exponent of a finite, nonzero binary64 magnitude,
+/// including subnormals. Returns None for zero, infinity and NaN.
+pub(crate) fn binary_exponent(value: Real) -> Option<i32> {
+    if !value.is_finite() || value == 0.0 {
+        return None;
+    }
+    let bits = value.abs().to_bits();
+    let biased = i32::try_from((bits >> 52) & 0x7ff).expect("11-bit exponent");
+    if biased == 0 {
+        let leading =
+            i32::try_from(bits.leading_zeros()).expect("binary64 has at most 64 leading zeros");
+        Some(63 - leading - 1074)
+    } else {
+        Some(biased - 1023)
+    }
+}
+
+/// Split a finite nonzero binary64 into a signed significand in [1, 2)
+/// in magnitude and an unbiased exponent, including subnormals.
+fn split_power(value: Real) -> (Real, i32) {
+    let bits = value.to_bits();
+    let exponent = i32::try_from((bits >> 52) & 0x7ff).expect("11-bit exponent");
+    if exponent == 0 {
+        let (mantissa, exponent) = split_power(value * 4_503_599_627_370_496.0);
+        return (mantissa, exponent - 52);
+    }
+    (
+        Real::from_bits((bits & 0x800f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000),
+        exponent - 1023,
+    )
+}
+
+/// Multiply by a power of two without first forming an unrepresentable
+/// power. The final multiply is the only one that can round into subnormals
+/// for the normalized significands used by the scaled division.
+fn scale_power(mut value: Real, mut exponent: i32) -> Real {
+    while exponent > 1023 {
+        value *= Real::from_bits(0x7fe0_0000_0000_0000);
+        exponent -= 1023;
+    }
+    while exponent < -1022 {
+        // Defer the smallest normal factor to the final multiplication.
+        if exponent >= -2044 {
+            return scale_power(value, exponent + 1022) * Real::MIN_POSITIVE;
+        }
+        value *= Real::MIN_POSITIVE;
+        exponent += 1022;
+    }
+    value * Real::from_bits(u64::try_from(exponent + 1023).expect("normal exponent") << 52)
+}
+
+#[cold]
+fn scaled_complex_div(a: Complex, b: Complex) -> Complex {
+    let p = ScaledProduct::product;
+    let denominator = p(b.re, b.re).add(p(b.im, b.im));
+    Complex::new(
+        p(a.re, b.re).add(p(a.im, b.im)).divide(denominator),
+        p(a.im, b.re).add(p(-a.re, b.im)).divide(denominator),
+    )
 }
 
 impl Neg for Complex {
@@ -518,6 +681,56 @@ mod tests {
         format_spice_number, parse_numparam_number_prefix, parse_spice_number,
         parse_spice_number_prefix,
     };
+
+    #[test]
+    fn scaled_division_recovers_product_cancellation_below_one_ulp() {
+        let epsilon = f64::EPSILON;
+        for scale in [2_f64.powi(-700), 2_f64.powi(700)] {
+            let a = Complex::new((1. + epsilon) * scale, -scale);
+            let b = Complex::new((1. - epsilon) * scale, scale);
+            let quotient = a / b;
+            // Exact real numerator is -epsilon^2 * scale^2, even though
+            // the two rounded products cancel. It must not become zero.
+            let expected = -(epsilon * epsilon) / ((1. - epsilon) * (1. - epsilon) + 1.);
+            assert!((quotient.re / expected - 1.).abs() < 1e-14);
+            assert!((quotient.im + 1.).abs() < 1e-14);
+        }
+    }
+
+    #[test]
+    fn complex_division_preserves_normal_rounding_and_extreme_components() {
+        let a = Complex::new(1.23456789, -9.87654321);
+        let b = Complex::new(-0.371, 2.415);
+        let d = b.re * b.re + b.im * b.im;
+        let expected = Complex::new(
+            (a.re * b.re + a.im * b.im) / d,
+            (a.im * b.re - a.re * b.im) / d,
+        );
+        let actual = a / b;
+        assert_eq!(actual.re.to_bits(), expected.re.to_bits());
+        assert_eq!(actual.im.to_bits(), expected.im.to_bits());
+        for scale in [1e-300, 1e-200, 1e200, 1e300, f64::MAX] {
+            let z = Complex::new(scale, scale);
+            assert_eq!(z / z, Complex::real(1.));
+            let q = Complex::new(scale, -scale) / z;
+            assert_eq!(q, Complex::imaginary(-1.));
+            let reciprocal = Complex::real(1.) / z;
+            assert!(reciprocal.is_finite() && reciprocal.re > 0.);
+            assert!((reciprocal.re * scale - 0.5).abs() < 1e-14);
+        }
+        // Scaling the entire numerator first would erase its small component.
+        let q = Complex::new(1e300, 1e-300) / Complex::real(1e-10);
+        assert!(q.re.is_infinite());
+        assert!((q.im / 1e-290 - 1.).abs() < 1e-14);
+        let q = Complex::new(1e150, 1e-200) / Complex::real(1e-150);
+        assert!((q.re / 1e300 - 1.).abs() < 1e-14);
+        assert!((q.im / 1e-50 - 1.).abs() < 1e-14);
+        let smallest = f64::from_bits(1);
+        assert_eq!(
+            Complex::new(smallest, smallest) / Complex::new(smallest, smallest),
+            Complex::real(1.)
+        );
+    }
 
     #[test]
     fn parses_plain_numbers() {

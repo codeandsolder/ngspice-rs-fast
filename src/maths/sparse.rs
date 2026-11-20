@@ -21,7 +21,7 @@ use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::sync::Arc;
 
-use crate::primitives::{Real, SpiceError, SpiceResult};
+use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 use petgraph::graphmap::UnGraphMap;
 
 use crate::maths::dense::Vector;
@@ -63,13 +63,34 @@ pub struct Pattern {
     row_start: Vec<u32>,
     row_cols: Vec<u32>,
     row_ids: Vec<u32>,
-    ordering: std::sync::Mutex<Option<crate::maths::SparseSymbolic>>,
+    ordering: std::sync::Mutex<OrderingState>,
     /// The `(row, col, id)` sequence of the last load, replayed by bound
     /// matrices to skip lookups (ngspice's per-device element pointers).
     trace: std::sync::Mutex<Arc<Trace>>,
-    /// ngspice's `NIACSHOULDREORDER`: set when the matrix is created
-    /// (`NIreinit`), cleared by the first complex reorder.
-    ac_reorder: std::sync::atomic::AtomicBool,
+    /// Scratch shared across successive AC snapshots, independently of
+    /// pivot-order transactions. Concurrent solves may use local scratch.
+    complex_workspace: std::sync::Mutex<Vec<Complex>>,
+}
+
+/// The retained SPARSE frame and its AC reorder flag form one transaction.
+/// A shared pattern cannot lose its pivot history to a concurrent solve.
+#[derive(Debug)]
+pub(super) struct OrderingState {
+    pub(super) frame: Option<crate::maths::linear::CachedFrame>,
+    pub(super) ac_reorder: bool,
+    /// Reused real triangular-solve scratch, owned by the circuit
+    /// transaction rather than by an immutable factor snapshot.
+    pub(super) solve_workspace: Vec<Real>,
+}
+
+impl Default for OrderingState {
+    fn default() -> Self {
+        Self {
+            frame: None,
+            ac_reorder: true,
+            solve_workspace: Vec::new(),
+        }
+    }
 }
 
 /// One recorded stamp: `(row, col, element)`.
@@ -92,7 +113,7 @@ struct Trace {
 #[derive(Debug, Clone, Default)]
 pub struct FixedStamps {
     trace: Option<Arc<Trace>>,
-    masks: Vec<u64>,
+    batches: Vec<Option<VerifiedBatch>>,
 }
 
 impl FixedStamps {
@@ -100,7 +121,7 @@ impl FixedStamps {
     /// changed.
     pub fn forget(&mut self) {
         self.trace = None;
-        self.masks.clear();
+        self.batches.clear();
     }
 }
 
@@ -111,9 +132,15 @@ impl PartialEq for FixedStamps {
     }
 }
 
-/// [`FixedStamps`] mask encoding: verified flag, batch length, entry mask.
-const FIXED_VERIFIED: u64 = 1 << 63;
-const FIXED_MAX: usize = 32;
+/// A verified fixed batch contains exactly the traced (non-ground)
+/// positions; its mask must not have any bits beyond the batch length.
+#[derive(Debug, Clone, Copy)]
+struct VerifiedBatch {
+    mask: u32,
+    len: u8,
+}
+
+const FIXED_MAX: usize = u32::BITS as usize;
 
 impl Clone for Pattern {
     /// A copy without the cached pivot order.
@@ -166,9 +193,9 @@ impl Pattern {
             row_start,
             row_cols,
             row_ids: order,
-            ordering: std::sync::Mutex::new(None),
+            ordering: std::sync::Mutex::new(OrderingState::default()),
             trace: std::sync::Mutex::new(Arc::new(Trace::default())),
-            ac_reorder: std::sync::atomic::AtomicBool::new(true),
+            complex_workspace: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -185,38 +212,48 @@ impl Pattern {
         }
     }
 
-    /// Takes the cached pivot order (leaving none while a solve uses it).
-    pub(crate) fn take_ordering(&self) -> Option<crate::maths::SparseSymbolic> {
-        self.ordering.lock().ok().and_then(|mut slot| slot.take())
+    /// Reuse the circuit's complex solve scratch without serializing
+    /// independent factor snapshots. A busy or poisoned slot is optional:
+    /// the solve still runs with its own scratch in exactly the same order.
+    pub(super) fn with_complex_workspace<R>(&self, f: impl FnOnce(&mut Vec<Complex>) -> R) -> R {
+        match self.complex_workspace.try_lock() {
+            Ok(mut workspace) => f(&mut workspace),
+            Err(_) => f(&mut Vec::new()),
+        }
     }
 
-    /// `NIACSHOULDREORDER`: whether the next complex factorization reorders.
-    pub(crate) fn ac_reorder(&self) -> bool {
-        self.ac_reorder.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Sets or clears `NIACSHOULDREORDER`.
-    pub(crate) fn set_ac_reorder(&self, value: bool) {
-        self.ac_reorder
-            .store(value, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Caches the pivot order for the next solve.
-    pub(crate) fn store_ordering(&self, ordering: Option<crate::maths::SparseSymbolic>) {
-        if let Ok(mut slot) = self.ordering.lock() {
-            *slot = ordering;
+    /// Serializes factor-cache updates, including scalar changes and AC
+    /// reordering. A poisoned cache is discarded rather than reused.
+    pub(super) fn with_ordering<R>(&self, f: impl FnOnce(&mut OrderingState) -> R) -> R {
+        match self.ordering.lock() {
+            Ok(mut state) => f(&mut state),
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                *state = OrderingState::default();
+                self.ordering.clear_poison();
+                f(&mut state)
+            }
         }
     }
 
     /// This pattern plus new positions appended in order (existing ids keep
     /// their numbers).
+    ///
+    /// # Panics
+    /// If any new position is outside the pattern's dimensions, or the
+    /// element count exceeds the representable handle range.
     #[must_use]
     pub fn extended(&self, extra: impl IntoIterator<Item = (usize, usize)>) -> Self {
         let mut positions = self.positions.clone();
+        let mut appended = std::collections::HashSet::new();
         for (row, col) in extra {
+            assert!(
+                row < self.n && col < self.n,
+                "pattern position out of range"
+            );
             if self.find(row, col).is_none() {
                 let position = (to_u32(row), to_u32(col));
-                if !positions[self.positions.len()..].contains(&position) {
+                if appended.insert(position) {
                     positions.push(position);
                 }
             }
@@ -255,15 +292,20 @@ impl Pattern {
         if row >= self.n {
             return None;
         }
-        let (start, end) = (
-            self.row_start[row] as usize,
-            self.row_start[row + 1] as usize,
-        );
+        let (start, end) = self.row_bounds(row);
         let col = u32::try_from(col).ok()?;
         self.row_cols[start..end]
             .binary_search(&col)
             .ok()
             .map(|offset| ElementId(self.row_ids[start + offset]))
+    }
+
+    /// Index interval of one row within the row-major handle array.
+    fn row_bounds(&self, row: usize) -> (usize, usize) {
+        (
+            self.row_start[row] as usize,
+            self.row_start[row + 1] as usize,
+        )
     }
 
     /// Element ids in row-major position order.
@@ -282,7 +324,7 @@ fn to_u32(value: usize) -> u32 {
 }
 
 /// Values of a matrix bound to a [`Pattern`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 struct Bound {
     pattern: Arc<Pattern>,
     values: Vec<Real>,
@@ -292,6 +334,9 @@ struct Bound {
     /// part of its segment still to match.
     trace: Arc<Trace>,
     device: usize,
+    active: bool,
+    /// Out-of-order device positions cannot form one contiguous trace.
+    traceable: bool,
     /// Where the present device's segment of `trace` starts.
     start: usize,
     cursor: usize,
@@ -302,26 +347,150 @@ struct Bound {
     fixed: FixedStamps,
 }
 
+impl Clone for Bound {
+    fn clone(&self) -> Self {
+        Self {
+            pattern: Arc::clone(&self.pattern),
+            values: self.values.clone(),
+            // A read-through projection is not part of the matrix state.
+            view: OnceCell::new(),
+            trace: Arc::clone(&self.trace),
+            device: self.device,
+            active: self.active,
+            traceable: self.traceable,
+            start: self.start,
+            cursor: self.cursor,
+            end: self.end,
+            recording: self.recording.clone(),
+            fixed: self.fixed.clone(),
+        }
+    }
+}
+
+impl PartialEq for Bound {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern && self.values == other.values
+    }
+}
+
 impl Bound {
-    /// Starts device `index`'s stamps: replay resumes at its segment.
+    /// Start recording only when the previously matched prefix differs.
+    /// Completed segments before this device remain exact; a shortened
+    /// segment contributes only its matched prefix, not its old suffix.
+    fn start_recording(&mut self) {
+        if self.recording.is_some() {
+            return;
+        }
+        let mut starts: Vec<_> = self
+            .trace
+            .starts
+            .iter()
+            .copied()
+            .take(self.device + 1)
+            .collect();
+        starts.resize(self.device + 1, to_u32(self.cursor));
+        self.recording = Some(Trace {
+            entries: self.trace.entries[..self.cursor].to_vec(),
+            starts,
+        });
+    }
+
+    /// Starts device `index`'s stamps: replay resumes at its own segment.
     #[inline]
     fn begin_device(&mut self, index: usize) {
-        self.device = index;
-        if let Some(recording) = &mut self.recording {
-            recording.starts.push(to_u32(recording.entries.len()));
-        }
-        if let (Some(&start), Some(&end)) = (
-            self.trace.starts.get(index),
-            self.trace.starts.get(index + 1),
-        ) {
-            self.start = start as usize;
-            self.cursor = start as usize;
+        // Sequential, completely replayed devices are overwhelmingly the
+        // common load path. The previous end is the next start, so read
+        // only the new end, and leave all recording transitions cold.
+        if self.active
+            && self.cursor == self.end
+            && index == self.device + 1
+            && self.recording.is_none()
+            && self.traceable
+            && let Some(&end) = self.trace.starts.get(index + 1)
+        {
+            self.device = index;
+            self.start = self.end;
             self.end = end as usize;
-        } else {
-            self.start = 0;
-            self.cursor = 0;
-            self.end = 0;
+            return;
         }
+        self.begin_device_slow(index);
+    }
+
+    #[cold]
+    fn begin_device_slow(&mut self, index: usize) {
+        if !self.traceable {
+            return;
+        }
+        if self.active {
+            if index <= self.device {
+                // Numerical stamping still works; this load cannot publish
+                // a device-indexed trace or use fixed-batch verification.
+                self.traceable = false;
+                self.cursor = 0;
+                self.end = 0;
+                self.recording = None;
+                return;
+            }
+            if self.recording.is_none() && (self.cursor != self.end || index != self.device + 1) {
+                self.start_recording();
+            }
+        } else if index != 0 {
+            self.recording = Some(Trace::default());
+        }
+        self.device = index;
+        self.active = true;
+        if let Some(recording) = &mut self.recording {
+            recording
+                .starts
+                .resize(index + 1, to_u32(recording.entries.len()));
+        }
+        let past = self.trace.entries.len();
+        let start = self.trace.starts.get(index).map_or(past, |&s| s as usize);
+        let end = self
+            .trace
+            .starts
+            .get(index + 1)
+            .map_or(past, |&s| s as usize);
+        self.start = start;
+        self.cursor = start;
+        self.end = end;
+    }
+
+    fn reset_trace(&mut self) {
+        let trace = self.pattern.trace();
+        if !Arc::ptr_eq(&trace, &self.trace) {
+            self.fixed.forget();
+        }
+        self.trace = trace;
+        self.device = 0;
+        self.active = false;
+        self.traceable = true;
+        self.start = 0;
+        self.cursor = 0;
+        self.end = 0;
+        self.recording = None;
+    }
+
+    fn finish_trace(&mut self) {
+        if !self.active || !self.traceable {
+            return;
+        }
+        if self.recording.is_none()
+            && (self.cursor != self.end || self.trace.starts.len() != self.device + 2)
+        {
+            self.start_recording();
+        }
+        if let Some(mut recording) = self.recording.take() {
+            recording.starts.push(to_u32(recording.entries.len()));
+            let trace = Arc::new(recording);
+            self.pattern.store_trace(Arc::clone(&trace));
+            self.trace = trace;
+            self.fixed.forget();
+        }
+        self.active = false;
+        self.start = 0;
+        self.cursor = 0;
+        self.end = 0;
     }
 
     /// The device's next traced element when it is at `(row, col)` and this
@@ -345,6 +514,12 @@ impl Bound {
     /// this load to recording its own sequence.
     #[inline]
     fn element(&mut self, row: usize, col: usize) -> Option<ElementId> {
+        if !self.traceable {
+            return self.pattern.find(row, col);
+        }
+        if !self.active {
+            self.begin_device(0);
+        }
         let (r, c) = (u32::try_from(row).ok()?, u32::try_from(col).ok()?);
         if self.cursor < self.end {
             let (tr, tc, id) = self.trace.entries[self.cursor];
@@ -356,22 +531,7 @@ impl Bound {
                 return Some(ElementId(id));
             }
         }
-        if self.recording.is_none() {
-            // Everything before this stamp matched the trace.
-            let done = self
-                .trace
-                .starts
-                .get(self.device)
-                .map_or(0, |&start| start as usize);
-            let matched = if self.end > 0 { self.cursor } else { done };
-            let starts = (0..=self.device)
-                .map(|d| self.trace.starts.get(d).copied().unwrap_or(0))
-                .collect();
-            self.recording = Some(Trace {
-                entries: self.trace.entries[..matched].to_vec(),
-                starts,
-            });
-        }
+        self.start_recording();
         // The rest of this device is looked up.
         self.end = 0;
         let id = self.pattern.find(row, col)?;
@@ -380,6 +540,30 @@ impl Bound {
         }
         Some(id)
     }
+}
+
+/// Stable in-place folding over an arbitrary stamp sequence, including
+/// cancellation and accumulation in original equal-coordinate order.
+fn fold_triplets(triplets: &mut Vec<Triplet>) {
+    triplets.sort_by_key(|triplet| (triplet.row, triplet.col));
+    // Stable sorting preserves the order of equal stamps. Compact in
+    // place, retaining the first value and adding subsequent values in
+    // exactly the same order, even through intermediate cancellations.
+    let mut len = 0;
+    for read in 0..triplets.len() {
+        let triplet = triplets[read];
+        if len > 0 {
+            let last = &mut triplets[len - 1];
+            if last.row == triplet.row && last.col == triplet.col {
+                last.value += triplet.value;
+                continue;
+            }
+        }
+        triplets[len] = triplet;
+        len += 1;
+    }
+    triplets.truncate(len);
+    triplets.retain(|triplet| triplet.value != 0.0);
 }
 
 /// A sparse matrix as a list of contributions.
@@ -418,6 +602,25 @@ impl SparseMatrix {
         }
     }
 
+    /// Construct an already folded stream from a trusted assembly pass.
+    /// Its coordinates are sorted and unique, as with fold_duplicates.
+    pub(super) fn from_assembled(rows: usize, cols: usize, mut triplets: Vec<Triplet>) -> Self {
+        debug_assert!(triplets.iter().all(|t| t.row < rows && t.col < cols));
+        debug_assert!(
+            triplets
+                .windows(2)
+                .all(|w| (w[0].row, w[0].col) < (w[1].row, w[1].col))
+        );
+        // The ordinary stamp path drops zeros even when they were present
+        // in a previous folded matrix whose row was cleared.
+        triplets.retain(|t| t.value != 0.);
+        Self {
+            triplets,
+            folded: true,
+            ..Self::new(rows, cols)
+        }
+    }
+
     /// An all-zero matrix bound to `pattern`, accumulating by element.
     #[must_use]
     pub fn bound(pattern: Arc<Pattern>) -> Self {
@@ -431,6 +634,8 @@ impl SparseMatrix {
                 values: vec![0.0; pattern.len()],
                 trace: pattern.trace(),
                 device: 0,
+                active: false,
+                traceable: true,
                 start: 0,
                 cursor: 0,
                 end: 0,
@@ -510,10 +715,10 @@ impl SparseMatrix {
             .trace
             .as_ref()
             .is_some_and(|trace| Arc::ptr_eq(trace, &bound.trace));
-        if !same || fixed.masks.len() != devices {
+        if !same || fixed.batches.len() != devices {
             fixed.trace = Some(Arc::clone(&bound.trace));
-            fixed.masks.clear();
-            fixed.masks.resize(devices, 0);
+            fixed.batches.clear();
+            fixed.batches.resize(devices, None);
         }
         bound.fixed = fixed;
         None
@@ -540,29 +745,35 @@ impl SparseMatrix {
         let Some(bound) = &mut self.bound else {
             return false;
         };
-        let code = bound.fixed.masks.get(bound.device).copied().unwrap_or(0);
-        if N > FIXED_MAX
-            || code & FIXED_VERIFIED == 0
-            || (code >> FIXED_MAX) & 0x7fff_ffff != N as u64
+        let Some(batch) = bound.fixed.batches.get(bound.device).copied().flatten() else {
+            return false;
+        };
+        if N != usize::from(batch.len)
+            || !bound.traceable
+            || !bound.active
             || bound.recording.is_some()
             || bound.cursor != bound.start
         {
             return false;
         }
-        let mask = code & 0xffff_ffff;
         let Some(traced) = bound.trace.entries.get(bound.start..bound.end) else {
             return false;
         };
-        if traced.len() != mask.count_ones() as usize {
-            return false;
-        }
+        // A verified batch's mask is tied to this immutable trace; every
+        // set bit corresponds to one entry. Full batches are a straight
+        // zip, and partial batches visit just the set bits in stamp order.
+        let mut mask = batch.mask;
+        debug_assert_eq!(traced.len(), mask.count_ones() as usize);
         bound.view.take();
-        let mut traced = traced.iter();
-        for (k, value) in values.iter().enumerate() {
-            if mask & (1 << k) != 0
-                && let Some(&(_, _, id)) = traced.next()
-            {
+        if traced.len() == N {
+            for (&(_, _, id), &value) in traced.iter().zip(values) {
                 bound.values[id as usize] += value;
+            }
+        } else {
+            for &(_, _, id) in traced {
+                let k = mask.trailing_zeros() as usize;
+                bound.values[id as usize] += values[k];
+                mask &= mask - 1;
             }
         }
         bound.cursor = bound.end;
@@ -573,7 +784,10 @@ impl SparseMatrix {
     /// [`Self::verify_fixed`].
     #[must_use]
     pub fn fixed_start(&self) -> Option<usize> {
-        self.bound.as_ref().map(|bound| bound.cursor)
+        self.bound
+            .as_ref()
+            .filter(|bound| bound.active && bound.traceable)
+            .map(|bound| bound.cursor)
     }
 
     /// After a device stamped its fixed batch entry by entry from `start`
@@ -585,29 +799,29 @@ impl SparseMatrix {
             return;
         };
         if len <= FIXED_MAX
+            && mask >> len == 0
+            && bound.traceable
+            && bound.active
             && start == Some(bound.start)
             && bound.recording.is_none()
             && bound.cursor == bound.end
             && bound.end - bound.start == mask.count_ones() as usize
-            && let Some(slot) = bound.fixed.masks.get_mut(bound.device)
+            && let (Ok(len), Ok(mask)) = (u8::try_from(len), u32::try_from(mask))
+            && let Some(slot) = bound.fixed.batches.get_mut(bound.device)
         {
-            *slot = FIXED_VERIFIED | ((len as u64) << FIXED_MAX) | mask;
+            *slot = Some(VerifiedBatch { len, mask });
         }
     }
 
     /// Saves this load's stamp sequence on the pattern when it differed from
-    /// the recorded one (call once the load is complete).
-    pub fn record_trace(&self) {
-        let Some(bound) = &self.bound else {
-            return;
-        };
+    /// the recorded one (call once the load is complete). The recording's
+    /// owned buffers move into the published trace without a second copy.
+    pub fn record_trace(&mut self) {
         if !self.triplets.is_empty() {
             return;
         }
-        if let Some(recording) = &bound.recording {
-            let mut trace = recording.clone();
-            trace.starts.push(to_u32(trace.entries.len()));
-            bound.pattern.store_trace(Arc::new(trace));
+        if let Some(bound) = &mut self.bound {
+            bound.finish_trace();
         }
     }
 
@@ -622,18 +836,22 @@ impl SparseMatrix {
     /// Zeroes every element of `row` whose column `keep` rejects, keeping it
     /// in the structure (C `ZeroNoncurRow` in `cktload.c` stores `0.0`
     /// through `SMPfindElt`). Returns whether a kept column holds an element.
+    /// The predicate is a column selection, independent of traversal order.
     pub fn zero_row(&mut self, row: usize, keep: impl Fn(usize) -> bool) -> bool {
         let mut kept = false;
-        if let Some(bound) = &mut self.bound {
+        if let Some(bound) = &mut self.bound
+            && row < bound.pattern.order()
+        {
             bound.view.take();
-            for (index, value) in bound.values.iter_mut().enumerate() {
-                let (r, c) = bound.pattern.position(ElementId(to_u32(index)));
-                if r == row {
-                    if keep(c) {
-                        kept = true;
-                    } else {
-                        *value = 0.0;
-                    }
+            let (start, end) = bound.pattern.row_bounds(row);
+            for (&id, &col) in bound.pattern.row_ids[start..end]
+                .iter()
+                .zip(&bound.pattern.row_cols[start..end])
+            {
+                if keep(col as usize) {
+                    kept = true;
+                } else {
+                    bound.values[id as usize] = 0.0;
                 }
             }
         }
@@ -680,16 +898,25 @@ impl SparseMatrix {
     /// Number of stored contributions, including duplicates.
     #[must_use]
     pub fn nnz(&self) -> usize {
-        if self.bound.is_some() {
-            return self.triplets().len();
+        match &self.bound {
+            Some(bound) if self.triplets.is_empty() => {
+                bound.values.iter().filter(|&&value| value != 0.0).count()
+            }
+            Some(_) => self.triplets().len(),
+            None => self.triplets.len(),
         }
-        self.triplets.len()
     }
 
     /// True when nothing has been stamped.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.nnz() == 0
+        match &self.bound {
+            Some(bound) if self.triplets.is_empty() => {
+                bound.values.iter().all(|&value| value == 0.0)
+            }
+            Some(_) => self.triplets().is_empty(),
+            None => self.triplets.is_empty(),
+        }
     }
 
     /// True when duplicate positions have been folded away.
@@ -746,8 +973,7 @@ impl SparseMatrix {
 
     /// The contribution at a position, summed over duplicates.
     ///
-    /// Linear in the number of stored contributions; call
-    /// [`SparseMatrix::fold_duplicates`] first if this is on a hot path.
+    /// Binary search after folding, otherwise a scan in stamp order.
     #[must_use]
     pub fn get(&self, row: usize, col: usize) -> Real {
         let bound = self.bound.as_ref().and_then(|bound| {
@@ -756,13 +982,19 @@ impl SparseMatrix {
                 .find(row, col)
                 .map(|id| bound.values[id.index()])
         });
-        bound.unwrap_or(0.0)
-            + self
-                .triplets
+        let overflow = if self.folded {
+            // Match the floating-point sum's negative-zero identity.
+            self.triplets
+                .binary_search_by_key(&(row, col), |t| (t.row, t.col))
+                .map_or(-0.0, |i| -0.0 + self.triplets[i].value)
+        } else {
+            self.triplets
                 .iter()
                 .filter(|triplet| triplet.row == row && triplet.col == col)
                 .map(|triplet| triplet.value)
                 .sum::<Real>()
+        };
+        bound.unwrap_or(0.0) + overflow
     }
 
     /// Sorts and sums duplicate positions.
@@ -770,19 +1002,7 @@ impl SparseMatrix {
         if self.folded {
             return;
         }
-        self.triplets
-            .sort_by_key(|triplet| (triplet.row, triplet.col));
-        let mut folded: Vec<Triplet> = Vec::with_capacity(self.triplets.len());
-        for triplet in self.triplets.drain(..) {
-            match folded.last_mut() {
-                Some(last) if last.row == triplet.row && last.col == triplet.col => {
-                    last.value += triplet.value;
-                }
-                _ => folded.push(triplet),
-            }
-        }
-        folded.retain(|triplet| triplet.value != 0.0);
-        self.triplets = folded;
+        fold_triplets(&mut self.triplets);
         self.folded = true;
     }
 
@@ -793,10 +1013,7 @@ impl SparseMatrix {
         if let Some(bound) = &mut self.bound {
             bound.values.fill(0.0);
             bound.view.take();
-            bound.device = 0;
-            bound.cursor = 0;
-            bound.end = 0;
-            bound.recording = None;
+            bound.reset_trace();
         }
     }
 
@@ -808,23 +1025,39 @@ impl SparseMatrix {
             return &self.triplets;
         };
         bound.view.get_or_init(|| {
-            let mut view: Vec<Triplet> = bound
-                .pattern
-                .sorted()
-                .filter_map(|id| {
-                    let value = bound.values[id.index()];
-                    let (row, col) = bound.pattern.position(id);
-                    (value != 0.0).then_some(Triplet { row, col, value })
-                })
-                .collect();
-            if !self.triplets.is_empty() {
-                let mut overflow = Self::new(self.rows, self.cols);
-                overflow.triplets.clone_from(&self.triplets);
-                overflow.fold_duplicates();
-                view.extend(overflow.triplets);
-                view.sort_by_key(|t| (t.row, t.col));
+            let bound_entries = bound.pattern.sorted().filter_map(|id| {
+                let value = bound.values[id.index()];
+                if value == 0.0 {
+                    return None;
+                }
+                let (row, col) = bound.pattern.position(id);
+                Some(Triplet { row, col, value })
+            });
+            if self.triplets.is_empty() {
+                return bound_entries.collect();
             }
-            view
+            // The overflow has no positions in the pattern. Fold only the
+            // overflow, and merge the two sorted runs without another
+            // whole-matrix sort or an intermediate SparseMatrix.
+            let overflow: Cow<'_, [Triplet]> = if self.folded {
+                Cow::Borrowed(&self.triplets)
+            } else {
+                let mut entries = self.triplets.clone();
+                fold_triplets(&mut entries);
+                Cow::Owned(entries)
+            };
+            let mut additional = overflow
+                .iter()
+                .filter(|t| t.value != 0.0)
+                .copied()
+                .peekable();
+            let mut bound = bound_entries.peekable();
+            std::iter::from_fn(|| match (bound.peek(), additional.peek()) {
+                (Some(a), Some(b)) if (b.row, b.col) < (a.row, a.col) => additional.next(),
+                (Some(_), _) => bound.next(),
+                (None, _) => additional.next(),
+            })
+            .collect()
         })
     }
 
@@ -857,12 +1090,21 @@ impl SparseMatrix {
         for row in 0..self.rows {
             graph.add_node(row);
         }
+        if let Some((pattern, values)) = self.bound_values() {
+            for id in pattern.sorted() {
+                let (row, col) = pattern.position(id);
+                if row != col && values[id.index()] != 0.0 {
+                    graph.add_edge(row, col, ());
+                }
+            }
+            return Ok(graph);
+        }
         let mut assembled = Cow::Borrowed(self);
         if !self.is_folded() {
             assembled.to_mut().fold_duplicates();
         }
         for triplet in assembled.triplets() {
-            if triplet.row != triplet.col {
+            if triplet.row != triplet.col && triplet.value != 0.0 {
                 graph.add_edge(triplet.row, triplet.col, ());
             }
         }
@@ -886,10 +1128,24 @@ impl SparseMatrix {
             });
         }
         let mut result = Vector::zeros(self.rows);
-        for triplet in self.triplets() {
-            let current = result.get(triplet.row).unwrap_or(0.0);
-            let contribution = triplet.value * vector.get(triplet.col).unwrap_or(0.0);
-            result.set(triplet.row, current + contribution)?;
+        let y = result.as_mut_slice();
+        let x = vector.as_slice();
+        if let Some(bound) = &self.bound
+            && self.triplets.is_empty()
+        {
+            // Use the same row-major accumulation as the triplet view,
+            // without materializing coordinates for the bound coefficients.
+            for id in bound.pattern.sorted() {
+                let value = bound.values[id.index()];
+                if value != 0.0 {
+                    let (row, col) = bound.pattern.position(id);
+                    y[row] += value * x[col];
+                }
+            }
+        } else {
+            for triplet in self.triplets() {
+                y[triplet.row] += triplet.value * x[triplet.col];
+            }
         }
         Ok(result)
     }
@@ -918,9 +1174,129 @@ impl SparseMatrix {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn folding_compacts_in_place_in_stable_stamp_order() {
+        let mut matrix = SparseMatrix::new(3, 3);
+        for (row, col, value) in [
+            (1, 2, 1e16),
+            (0, 0, 2.),
+            (1, 2, -1e16),
+            (2, 0, -1.),
+            (0, 0, -2.),
+            (1, 2, 1.),
+            (2, 0, 1.),
+        ] {
+            matrix.add(row, col, value).unwrap();
+        }
+        let allocation = matrix.triplets.as_ptr();
+        let capacity = matrix.triplets.capacity();
+        matrix.fold_duplicates();
+        assert_eq!(matrix.triplets.as_ptr(), allocation);
+        assert_eq!(matrix.triplets.capacity(), capacity);
+        assert_eq!(
+            matrix.triplets(),
+            &[Triplet {
+                row: 1,
+                col: 2,
+                value: 1.
+            }]
+        );
+        matrix.fold_duplicates();
+        assert_eq!(
+            matrix.triplets(),
+            &[Triplet {
+                row: 1,
+                col: 2,
+                value: 1.
+            }]
+        );
+    }
+
+    #[test]
+    fn bound_read_paths_do_not_materialize_triplets() {
+        let pattern = Arc::new(Pattern::new(3, [(0, 2), (0, 0), (0, 1), (2, 1)]));
+        let mut matrix = SparseMatrix::bound(pattern);
+        assert!(matrix.is_empty());
+        for (r, c, v) in [(0, 2, 1.0), (0, 0, 1e16), (0, 1, -1e16), (2, 1, -2.0)] {
+            matrix.add(r, c, v).unwrap();
+        }
+        assert_eq!(matrix.nnz(), 4);
+        assert!(!matrix.is_empty());
+        assert_eq!(matrix.get(0, 1), -1e16);
+        let x = Vector::from_slice(&[1., 1., 1.]);
+        // Creation order would lose the 1; row-major order preserves it.
+        assert_eq!(matrix.mul_vector(&x).unwrap().as_slice(), &[1., 0., -2.]);
+        assert!(matrix.bound.as_ref().unwrap().view.get().is_none());
+        matrix.add(1, 2, 3.).unwrap();
+        matrix.add(1, 2, -3.).unwrap();
+        assert_eq!(matrix.nnz(), 4);
+        assert_eq!(matrix.mul_vector(&x).unwrap().as_slice(), &[1., 0., -2.]);
+    }
+
+    #[test]
+    fn folded_lookup_preserves_ordinary_and_overflow_values() {
+        let pattern = Arc::new(Pattern::new(4, [(1, 1)]));
+        let mut matrix = SparseMatrix::bound(pattern);
+        matrix.add(1, 1, 4.).unwrap();
+        matrix.add(2, 0, 1e16).unwrap();
+        matrix.add(2, 0, -1e16).unwrap();
+        matrix.add(2, 0, 1.).unwrap();
+        matrix.add(0, 2, -2.).unwrap();
+        let values = [(1, 1), (2, 0), (0, 2), (3, 3)].map(|(r, c)| matrix.get(r, c).to_bits());
+        matrix.fold_duplicates();
+        assert_eq!(
+            values,
+            [(1, 1), (2, 0), (0, 2), (3, 3)].map(|(r, c)| matrix.get(r, c).to_bits())
+        );
+    }
+
+    #[test]
+    fn pattern_extension_preserves_old_handles_and_new_creation_order() {
+        let old = Pattern::new(4, [(3, 1), (0, 0)]);
+        let new = old.extended([(0, 0), (2, 3), (1, 2), (2, 3), (0, 1)]);
+        assert_eq!(new.len(), 5);
+        for (i, (r, c)) in [(3, 1), (0, 0), (2, 3), (1, 2), (0, 1)]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(new.find(r, c).unwrap().index(), i);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "pattern position out of range")]
+    fn extension_rejects_out_of_range_columns() {
+        let _ = Pattern::new(1, [(0, 0)]).extended([(0, 1)]);
+    }
+
+    #[test]
+    fn row_clearing_and_graph_use_current_nonzero_values() {
+        let mut plain = SparseMatrix::new(3, 3);
+        let pattern = Arc::new(Pattern::new(3, [(2, 0), (1, 2), (1, 0), (1, 1)]));
+        let mut bound = SparseMatrix::bound(pattern);
+        for (r, c, value) in [(2, 0, 7.), (1, 2, 4.), (1, 0, 3.), (1, 1, 2.)] {
+            plain.add(r, c, value).unwrap();
+            bound.add(r, c, value).unwrap();
+        }
+        plain.fold_duplicates();
+        for matrix in [&mut plain, &mut bound] {
+            assert!(matrix.zero_row(1, |col| col == 1));
+            assert!(!matrix.zero_row(9, |_| true));
+            assert_eq!(matrix.get(1, 1), 2.);
+            assert_eq!(matrix.get(1, 0), 0.);
+            assert_eq!(matrix.get(1, 2), 0.);
+            assert_eq!(matrix.get(2, 0), 7.);
+            let graph = matrix.coupling_graph().unwrap();
+            assert_eq!(graph.node_count(), 3);
+            assert_eq!(graph.edge_count(), 1);
+            assert!(graph.contains_edge(2, 0));
+        }
+        assert!(bound.bound.as_ref().unwrap().view.get().is_none());
+    }
+
     use std::sync::Arc;
 
-    use super::{FixedStamps, Pattern, SparseMatrix};
+    use super::{FixedStamps, Pattern, SparseMatrix, Triplet};
     use crate::maths::dense::Vector;
 
     /// One device's load of `stamps` into a fresh matrix bound to `pattern`,
@@ -948,6 +1324,169 @@ mod tests {
         let fixed = matrix.return_fixed();
         matrix.record_trace();
         (matrix, by_element, fixed)
+    }
+
+    #[test]
+    fn bound_overflow_projection_merges_sorted_runs_and_preserves_bits() {
+        let pattern = Arc::new(Pattern::new(3, [(2, 2), (0, 1), (1, 1)]));
+        let mut matrix = SparseMatrix::bound(pattern);
+        let mut plain = SparseMatrix::new(3, 3);
+        for (r, c, v) in [
+            (2, 2, 4.),
+            (0, 1, 3.),
+            (1, 1, 9.),
+            (2, 0, 5.),
+            (0, 0, 1e16),
+            (0, 0, -1e16),
+            (0, 0, 1.),
+            (1, 2, 2.),
+            (1, 2, -2.),
+            (0, 2, -5.),
+        ] {
+            matrix.add(r, c, v).unwrap();
+            plain.add(r, c, v).unwrap();
+        }
+        plain.fold_duplicates();
+        assert_eq!(matrix.triplets(), plain.triplets());
+        matrix.fold_duplicates();
+        assert_eq!(matrix.triplets(), plain.triplets());
+        matrix.zero_row(0, |c| c == 1);
+        plain.zero_row(0, |c| c == 1);
+        let expected: Vec<_> = plain
+            .triplets()
+            .iter()
+            .filter(|t| t.value != 0.)
+            .copied()
+            .collect();
+        assert_eq!(matrix.triplets(), expected);
+        matrix.add(0, 2, 7.).unwrap();
+        assert_eq!(matrix.get(0, 2), 7.);
+        assert!(
+            matrix
+                .triplets()
+                .iter()
+                .any(|t| t.row == 0 && t.col == 2 && t.value == 7.)
+        );
+    }
+
+    #[test]
+    fn trace_replaces_shortened_and_skipped_segments_and_reuses_its_storage() {
+        let pattern = Arc::new(Pattern::new(3, [(0, 0), (0, 1), (1, 1), (2, 2)]));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        a.begin_device(0);
+        a.add(0, 0, 1.).unwrap();
+        a.add(0, 1, 2.).unwrap();
+        a.begin_device(1);
+        a.add(1, 1, 3.).unwrap();
+        a.begin_device(2);
+        a.add(2, 2, 4.).unwrap();
+        a.record_trace();
+        assert_eq!(pattern.trace().starts, [0, 2, 3, 4]);
+
+        a.clear();
+        a.begin_device(0);
+        a.add(0, 0, 10.).unwrap();
+        a.begin_device(2);
+        a.add(2, 2, 20.).unwrap();
+        a.record_trace();
+        let trace = pattern.trace();
+        assert_eq!(trace.starts, [0, 1, 1, 2]);
+        assert_eq!(trace.entries, [(0, 0, 0), (2, 2, 3)]);
+        assert_eq!(a.get(0, 1), 0.);
+        assert_eq!(a.get(1, 1), 0.);
+        assert_eq!(a.get(2, 2), 20.);
+
+        a.clear();
+        a.begin_device(0);
+        a.add(0, 0, 1.).unwrap();
+        a.begin_device(1);
+        a.begin_device(2);
+        a.add(2, 2, 2.).unwrap();
+        a.record_trace();
+        assert!(Arc::ptr_eq(&trace, &pattern.trace()));
+
+        // Omit a trailing device entirely: only actual segments remain.
+        a.clear();
+        a.begin_device(0);
+        a.add(0, 0, 3.).unwrap();
+        a.record_trace();
+        assert_eq!(pattern.trace().starts, [0, 1]);
+        assert_eq!(pattern.trace().entries, [(0, 0, 0)]);
+
+        // Invalid traversal disables learning, never numerical stamping.
+        let before = pattern.trace();
+        a.clear();
+        a.begin_device(0);
+        a.add(0, 0, 1.).unwrap();
+        a.begin_device(0);
+        a.add(0, 1, 9.).unwrap();
+        a.record_trace();
+        assert_eq!(a.get(0, 1), 9.);
+        assert!(Arc::ptr_eq(&before, &pattern.trace()));
+    }
+
+    #[test]
+    fn stale_fixed_batches_are_invalidated_without_a_lend_cycle() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (1, 1)]));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        a.begin_device(0);
+        a.add(0, 0, 1.).unwrap();
+        a.record_trace();
+        a.clear();
+        assert!(a.lend_fixed(FixedStamps::default(), 1).is_none());
+        a.begin_device(0);
+        let start = a.fixed_start();
+        a.add(0, 0, 1.).unwrap();
+        a.verify_fixed(start, 2, 0b01);
+        a.record_trace();
+
+        // Another load changes the same-length trace: blindly keeping
+        // the old mask would apply the wrong batch value to element 1.
+        let mut b = SparseMatrix::bound(Arc::clone(&pattern));
+        b.begin_device(0);
+        b.add(1, 1, 3.).unwrap();
+        b.record_trace();
+        a.clear();
+        a.begin_device(0);
+        assert!(!a.add_fixed(&[2., 4.]));
+        a.add(1, 1, 4.).unwrap();
+        assert_eq!(a.get(1, 1), 4.);
+    }
+
+    #[test]
+    fn invalid_fixed_mask_cannot_drop_traced_stamps() {
+        let pattern = Arc::new(Pattern::new(1, [(0, 0)]));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        a.begin_device(0);
+        a.add(0, 0, 1.).unwrap();
+        a.record_trace();
+        a.clear();
+        assert!(a.lend_fixed(FixedStamps::default(), 1).is_none());
+        a.begin_device(0);
+        let start = a.fixed_start();
+        a.add(0, 0, 1.).unwrap();
+        a.verify_fixed(start, 1, 0b10);
+        let fixed = a.return_fixed();
+        a.record_trace();
+        a.clear();
+        assert!(a.lend_fixed(fixed, 1).is_none());
+        a.begin_device(0);
+        assert!(!a.add_fixed(&[2.]));
+    }
+
+    #[test]
+    fn bound_equality_and_clone_ignore_lazy_projection_and_trace_state() {
+        let pattern = Arc::new(Pattern::new(1, [(0, 0)]));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        a.add(0, 0, 2.).unwrap();
+        let b = a.clone();
+        let _ = a.triplets();
+        assert_eq!(a, b);
+        a.record_trace();
+        assert_eq!(a, b);
+        let clone = a.clone();
+        assert!(clone.bound.as_ref().unwrap().view.get().is_none());
+        assert_eq!(clone, a);
     }
 
     #[test]

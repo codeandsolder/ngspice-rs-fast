@@ -329,19 +329,20 @@ impl StepHistory {
             deltas[self.len + 1..].fill(fill);
         }
         // nicomcof.c
-        let mut ag = [0.0; HISTORY_LEN + 1];
-        match (method, order) {
+        let ag = match (method, order) {
             (IntegrationMethod::Trapezoidal, 1) => {
+                let mut ag = [0.0; HISTORY_LEN + 1];
                 ag[..2].copy_from_slice(&[1.0 / dt, -1.0 / dt]);
+                ag
             }
             (IntegrationMethod::Trapezoidal, _) => {
+                let mut ag = [0.0; HISTORY_LEN + 1];
                 ag[..2].copy_from_slice(&[1.0 / dt / (1.0 - xmu), xmu / (1.0 - xmu)]);
+                ag
             }
             // nicomcof.c: Gear order 1 falls through to the general case.
-            (IntegrationMethod::Gear { .. }, _) => {
-                gear_corrector(&deltas, usize::from(order), &mut ag);
-            }
-        }
+            (IntegrationMethod::Gear { .. }, _) => gear_corrector(&deltas, usize::from(order)),
+        };
         for value in ag {
             finite(value, "integration coefficient")?;
         }
@@ -352,6 +353,7 @@ impl StepHistory {
             history: self.len,
             filled: self.fill.is_some(),
             ag,
+            truncation: TruncationSpans::new(&deltas, usize::from(order)),
         })
     }
 
@@ -359,7 +361,8 @@ impl StepHistory {
     /// (C keeps `CKTdeltaOld[0..=6]`; the oldest step drops out).
     /// This is the only operation that advances the history.
     pub fn accept(&mut self, coefficients: &Coefficients) {
-        self.accepted.copy_within(0..HISTORY_LEN - 1, 1);
+        let retained = self.len.min(HISTORY_LEN - 1);
+        self.accepted.copy_within(0..retained, 1);
         self.accepted[0] = coefficients.dt();
         self.len = (self.len + 1).min(HISTORY_LEN);
     }
@@ -377,50 +380,39 @@ impl StepHistory {
 /// `t_{n+1} - s_i`, `s_0 = 0`, `s_i = deltas[0] + ... + deltas[i - 1]`.
 ///
 /// `nicomcof.c` solves the Vandermonde system `sum_i ag_i (s_i/h)^j =
-/// -delta_{j1}/h`, `j = 0..=order`, in step-normalized form (its "SPICE2
-/// difference warning"). The solution is the derivative at `t_{n+1}` of the
-/// Lagrange basis polynomials, which this evaluates in closed form on the same
-/// normalized abscissae `sigma_i = s_i / h`, so no matrix (and no pivot-free
-/// elimination) is involved:
-///
-/// * `ag_0 = (1/h) sum_{j >= 1} 1/sigma_j`,
-/// * `ag_i = (1/h) prod_{j != 0, i} sigma_j / (-sigma_i prod_{j != 0, i} (sigma_j - sigma_i))`.
-///
-/// The two agree to rounding; the result is exact for polynomials of degree
-/// `order` (tested), which is what defines the C coefficients.
-// Kept index-for-index with nicomcof.c so the arithmetic matches it.
-fn gear_corrector(
-    deltas: &[Real; HISTORY_LEN + 1],
-    order: usize,
-    ag: &mut [Real; HISTORY_LEN + 1],
-) {
+/// -delta_{j1}/h`, `j = 0..=order`, in step-normalized form. The
+/// corrector follows the reference's unpivoted LU elimination and
+/// substitution, preserving operation order rather than evaluating the
+/// algebraically equivalent Lagrange derivative in closed form.
+fn gear_corrector(deltas: &[Real; HISTORY_LEN + 1], order: usize) -> [Real; HISTORY_LEN + 1] {
     // nicomcof.c, `case GEAR`, verbatim: the corrector matrix built from
     // (sum of h)/h, LU-decomposed without pivoting (its first column is
     // 1 0 0 ...), then forward and backward substitution on CKTag.
     let delta = deltas[0];
     let mut mat = [[0.0; HISTORY_LEN + 1]; HISTORY_LEN + 1];
-    *ag = [0.0; HISTORY_LEN + 1];
+    let mut ag = [0.0; HISTORY_LEN + 1];
     ag[1] = -1. / delta;
     for entry in mat[0].iter_mut().take(order + 1) {
         *entry = 1.;
     }
-    for row in mat.iter_mut().take(order + 1).skip(1) {
-        row[0] = 0.;
-    }
     let mut arg = 0.;
     for i in 1..=order {
         arg += deltas[i - 1];
+        let normalized = arg / delta;
         let mut arg1 = 1.;
         for row in mat.iter_mut().take(order + 1).skip(1) {
-            arg1 *= arg / delta;
+            arg1 *= normalized;
             row[i] = arg1;
         }
     }
     for i in 1..=order {
-        for j in i + 1..=order {
-            mat[j][i] /= mat[i][i];
-            for k in i + 1..=order {
-                mat[j][k] -= mat[j][i] * mat[i][k];
+        let (head, tail) = mat[..=order].split_at_mut(i + 1);
+        let pivot = &head[i];
+        for row in tail {
+            row[i] /= pivot[i];
+            let multiplier = row[i];
+            for (entry, &p) in row[i + 1..=order].iter_mut().zip(&pivot[i + 1..=order]) {
+                *entry -= multiplier * p;
             }
         }
     }
@@ -435,6 +427,73 @@ fn gear_corrector(
             ag[i] -= mat[i][j] * ag[j];
         }
         ag[i] /= mat[i][i];
+    }
+    ag
+}
+
+/// Packed triangular table of CKTterr's divided-difference denominators.
+const SPAN_COUNT: usize = (HISTORY_LEN + 1) * (HISTORY_LEN + 2) / 2;
+
+#[derive(Debug, Clone, PartialEq)]
+struct TruncationSpans {
+    /// Widest row first, then progressively shorter rows. The same trial
+    /// coefficients are used by every charge-storage device.
+    values: [Real; SPAN_COUNT],
+    /// Keep unavailable history or overflowing spans from rejecting a
+    /// legitimate integration trial that never requests truncation.
+    error: Option<&'static str>,
+}
+
+impl TruncationSpans {
+    fn new(deltas: &[Real; HISTORY_LEN + 1], order: usize) -> Self {
+        let mut values = [0.0; SPAN_COUNT];
+        let mut span = [0.0; HISTORY_LEN + 1];
+        span[..=order].copy_from_slice(&deltas[..=order]);
+        if span[..=order]
+            .iter()
+            .any(|dt| !dt.is_finite() || *dt <= 0.0)
+        {
+            return Self {
+                values,
+                error: Some("truncation-error steps must be positive and finite"),
+            };
+        }
+        let mut offset = 0;
+        for width in (1..=order + 1).rev() {
+            values[offset..offset + width].copy_from_slice(&span[..width]);
+            offset += width;
+            // Preserve C's exact order: span[i + 1] + delta[i], not a
+            // prefix-sum subtraction or an algebraically reassociated sum.
+            for i in 0..width - 1 {
+                span[i] = span[i + 1] + deltas[i];
+                if !span[i].is_finite() {
+                    return Self {
+                        values,
+                        error: Some("truncation-error span is not finite"),
+                    };
+                }
+            }
+        }
+        Self {
+            values,
+            error: None,
+        }
+    }
+
+    fn divided_difference(&self, charge: &[Real], order: usize) -> SpiceResult<Real> {
+        if let Some(error) = self.error {
+            return Err(cold_numerical(error));
+        }
+        let mut diff = [0.0; HISTORY_LEN + 2];
+        diff[..order + 2].copy_from_slice(&charge[..order + 2]);
+        let mut offset = 0;
+        for width in (1..=order + 1).rev() {
+            for (i, &span) in self.values[offset..offset + width].iter().enumerate() {
+                diff[i] = finite((diff[i] - diff[i + 1]) / span, "charge divided difference")?;
+            }
+            offset += width;
+        }
+        Ok(diff[0])
     }
 }
 
@@ -453,6 +512,7 @@ pub struct Coefficients {
     /// Older steps are placeholders (see [`StepHistory::with_fill`]).
     filled: bool,
     ag: [Real; HISTORY_LEN + 1],
+    truncation: TruncationSpans,
 }
 
 /// One integrated charge-storage element in companion form, as
@@ -514,7 +574,8 @@ impl Coefficients {
     }
 
     /// C `CKTdeltaOld[index]`: index 0 is the trial step (`CKTdelta`), 1 the
-    /// last accepted step, and so on; `None` beyond the recorded history.
+    /// last accepted step, and so on. Unfilled older slots hold zero,
+    /// or the configured placeholder; `None` beyond the retained capacity.
     #[must_use]
     pub fn delta_old(&self, index: usize) -> Option<Real> {
         self.deltas.get(index).copied()
@@ -715,31 +776,14 @@ impl Coefficients {
         let volttol = tol.abstol + tol.reltol * derivative[0].abs().max(derivative[1].abs());
         let chargetol =
             tol.reltol * charge[0].abs().max(charge[1].abs()).max(tol.chgtol) / self.dt();
-        let tolerance = volttol.max(chargetol);
-        // Divided differences over the trial and accepted points.
-        let mut diff = [0.0; HISTORY_LEN + 2];
-        diff[..order + 2].copy_from_slice(&charge[..order + 2]);
-        let mut span = [0.0; HISTORY_LEN + 1];
-        span[..=order].copy_from_slice(&self.deltas[..=order]);
-        let mut j = order;
-        loop {
-            for i in 0..=j {
-                diff[i] = (diff[i] - diff[i + 1]) / span[i];
-            }
-            if j == 0 {
-                break;
-            }
-            j -= 1;
-            for i in 0..=j {
-                span[i] = span[i + 1] + self.deltas[i];
-            }
-        }
+        let tolerance = finite(volttol.max(chargetol), "truncation tolerance")?;
+        let difference = self.truncation.divided_difference(charge, order)?;
         // cktterr.c gearCoeff/trapCoeff (trial() guarantees the index).
         let factor = match self.method {
             IntegrationMethod::Trapezoidal => TRAP_ERROR_CONSTANTS[order - 1],
             IntegrationMethod::Gear { .. } => GEAR_ERROR_CONSTANTS[order - 1],
         };
-        let del = tol.trtol * tolerance / tol.abstol.max(factor * diff[0].abs());
+        let del = tol.trtol * tolerance / tol.abstol.max(factor * difference.abs());
         let del = match order {
             1 => del,
             2 => del.sqrt(),
@@ -770,6 +814,108 @@ mod tests {
             history.accept(&coefficients);
         }
         history
+    }
+
+    /// Frozen binary64 results of the original unpivoted C-order corrector.
+    #[test]
+    fn prepared_truncation_spans_preserve_c_order_for_every_supported_order() {
+        let mut history = StepHistory::new();
+        for dt in [0.071, 0.143, 0.211, 0.137, 0.293, 0.019] {
+            history.accept(&history.trial(TRAP, 1, dt, DEFAULT_XMU).unwrap());
+        }
+        for order in 1..=6 {
+            let c = history
+                .trial(
+                    IntegrationMethod::Gear { order: 6 },
+                    order,
+                    0.079,
+                    DEFAULT_XMU,
+                )
+                .unwrap();
+            let order = usize::from(order);
+            for charge in [
+                [0.31, 0.24, 0.97, -0.35, 0.19, 0.463, 0.291, -0.44],
+                [1e18, -1e18, 0.01, 0.04, 0.06, -0.03, 0.07, 0.1],
+            ] {
+                let mut diff = charge;
+                let mut span = c.deltas;
+                for j in (0..=order).rev() {
+                    for i in 0..=j {
+                        diff[i] = (diff[i] - diff[i + 1]) / span[i];
+                    }
+                    for i in 0..j {
+                        span[i] = span[i + 1] + c.deltas[i];
+                    }
+                }
+                let actual = c.truncation.divided_difference(&charge, order).unwrap();
+                assert_eq!(actual.to_bits(), diff[0].to_bits(), "order {order}");
+            }
+        }
+    }
+
+    #[test]
+    fn gear_corrector_preserves_reference_operation_order() {
+        let deltas = [0.125, 0.25, 0.1875, 0.375, 0.125, 0.3125, 0.0625];
+        let expected = [
+            [
+                0x4020_0000_0000_0000,
+                0xc020_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+            ],
+            [
+                0x4025_5555_5555_5555,
+                0xc028_0000_0000_0000,
+                0x3ff5_5555_5555_5555,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+            ],
+            [
+                0x4028_e38e_38e3_8e39,
+                0xc02e_db6d_b6db_6db7,
+                0x4010_0000_0000_0000,
+                0xbff0_4104_1041_0410,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+            ],
+            [
+                0x402b_05b0_5b05_b05b,
+                0xc031_cd5c_d5cd_5cd6,
+                0x401a_aaaa_aaaa_aaab,
+                0xc004_5145_1451_4514,
+                0x3fc5_0150_1501_5015,
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+            ],
+            [
+                0x402c_e792_3ce7_923b,
+                0xc034_2d02_d02d_02cf,
+                0x4024_9b26_c9b2_6c9b,
+                0xc015_9659_6596_5966,
+                0x3ff6_5165_1651_6516,
+                0xbfe2_7b35_63ef_927b,
+                0x0000_0000_0000_0000,
+            ],
+            [
+                0x402e_5bef_542d_63b8,
+                0xc036_3183_1831_831d,
+                0x402c_5555_5555_5559,
+                0xc022_4424_4244_2444,
+                0x4011_8918_9189_1892,
+                0xc004_5454_5454_5454,
+                0x3fc1_9ba5_5d3e_8e17,
+            ],
+        ];
+        for (order, expected) in (1..=6).zip(expected) {
+            let ag = super::gear_corrector(&deltas, order);
+            assert_eq!(ag.map(f64::to_bits), expected, "order {order}");
+        }
     }
 
     #[test]
@@ -1041,6 +1187,52 @@ mod tests {
     }
 
     #[test]
+    fn truncation_rejects_invalid_spans_and_hidden_nonfinite_differences() {
+        let tolerance = TruncationTolerances::default();
+        for fill in [0., -1., f64::NAN, f64::INFINITY] {
+            let trial = StepHistory::with_fill(fill)
+                .trial(TRAP, 1, 1., DEFAULT_XMU)
+                .unwrap();
+            assert!(
+                trial
+                    .truncation_timestep(&[0., 0., 0.], [0., 0.], &tolerance)
+                    .is_err()
+            );
+        }
+        let trial = history(&[f64::MAX])
+            .trial(TRAP, 1, f64::MAX, DEFAULT_XMU)
+            .unwrap();
+        assert!(
+            trial
+                .truncation_timestep(&[1., 1., 1.], [0., 0.], &tolerance)
+                .is_err()
+        );
+        let trial = history(&[0.5]).trial(TRAP, 1, 0.5, DEFAULT_XMU).unwrap();
+        // Two overflowing first differences used to produce NaN, which
+        // f64::max(abstol, NaN) silently replaced with abstol.
+        let relaxed = TruncationTolerances {
+            abstol: 1e300,
+            ..tolerance
+        };
+        assert!(
+            trial
+                .truncation_timestep(&[f64::MAX, 0., -f64::MAX], [0., 0.], &relaxed)
+                .is_err()
+        );
+        assert!(
+            trial
+                .truncation_timestep(&[f64::MAX, -f64::MAX, -f64::MAX], [0., 0.], &relaxed)
+                .is_err()
+        );
+        assert!(
+            trial
+                .truncation_timestep(&[1., 0., -1.], [0., 0.], &tolerance)
+                .unwrap()
+                > 0.
+        );
+    }
+
+    #[test]
     fn filled_history_supplies_placeholder_steps_for_truncation_only() {
         // dctran.c fills CKTdeltaOld with CKTmaxStep, so the second step can
         // already probe an order-2 truncation estimate.
@@ -1182,17 +1374,9 @@ mod tests {
             assert!(close6(companion.derivative, df(times[0])), "order {order}");
             assert!(close6(c.predict(&q[1..]).unwrap(), q[0]), "order {order}");
             let reference = vandermonde_ag(&c.deltas, usize::from(order));
-            // The general Lagrange form also reproduces the order-1 and the
-            // closed-form order-2 coefficients.
-            let mut general = [0.0; 7];
-            super::gear_corrector(&c.deltas, usize::from(order), &mut general);
-            for ((a, b), g) in c.ag().iter().zip(&reference).zip(general) {
+            for (a, b) in c.ag().iter().zip(&reference) {
                 assert!(
                     (a - b).abs() <= 1e-10 * b.abs().max(1.0 / TRIAL_STEP),
-                    "order {order}"
-                );
-                assert!(
-                    (a - g).abs() <= 1e-12 * g.abs().max(1.0 / TRIAL_STEP),
                     "order {order}"
                 );
             }

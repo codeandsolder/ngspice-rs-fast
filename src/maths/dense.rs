@@ -35,12 +35,18 @@ pub struct Matrix {
 
 impl Matrix {
     /// A zeroed `rows` by `cols` matrix.
+    /// # Panics
+    /// If the matrix dimensions overflow the addressable element count.
     #[must_use]
     pub fn zeros(rows: usize, cols: usize) -> Self {
         Self {
             rows,
             cols,
-            data: vec![0.0; rows * cols],
+            data: vec![
+                0.0;
+                rows.checked_mul(cols)
+                    .expect("dense matrix dimensions overflow")
+            ],
         }
     }
 
@@ -161,12 +167,14 @@ impl Matrix {
             return Err(length_error(self.cols, vector.len()));
         }
         let mut result = Vector::zeros(self.rows);
-        for row in 0..self.rows {
-            let mut sum = 0.0;
-            for (col, value) in vector.as_slice().iter().enumerate() {
-                sum += self.data[row * self.cols + col] * value;
+        if self.cols != 0 {
+            for (row, output) in self.data.chunks_exact(self.cols).zip(result.as_mut_slice()) {
+                let mut sum = 0.0;
+                for (entry, value) in row.iter().zip(vector.as_slice()) {
+                    sum += entry * value;
+                }
+                *output = sum;
             }
-            result.as_mut_slice()[row] = sum;
         }
         Ok(result)
     }
@@ -223,13 +231,43 @@ impl Matrix {
                 }
             }
         }
-        let values = jacobi_eigenvalues(self.data.clone(), n)
+        let mut data = self.data.clone();
+        // Ordinary physical matrices keep their original arithmetic. At
+        // extreme scales the sum of squared entries (or its epsilon-squared
+        // threshold) can overflow or underflow, falsely reporting convergence.
+        // Normalize by a power of two only outside the safe norm range.
+        let max = data.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        let scale = extreme_norm_scale(max);
+        if let Some(scale) = scale {
+            for value in &mut data {
+                *value /= scale;
+            }
+        }
+        let mut values = jacobi_eigenvalues(data, n)
             .ok_or_else(|| error("Jacobi rotations did not converge".to_owned()))?;
+        if let Some(scale) = scale {
+            for value in &mut values {
+                *value *= scale;
+            }
+        }
         if values.iter().any(|value| !value.is_finite()) {
             return Err(error("nonfinite eigenvalue".to_owned()));
         }
         Ok(values)
     }
+}
+
+/// A power-of-two normalization for finite nonnegative maximum components,
+/// only when squaring unscaled values risks overflow or underflow. Keep
+/// ordinary matrices on their reference-compatible arithmetic path.
+pub(super) fn extreme_norm_scale(max: Real) -> Option<Real> {
+    if max == 0.0 || (2.0_f64.powi(-450)..=2.0_f64.powi(450)).contains(&max) {
+        return None;
+    }
+    // The exponent bits yield the leading power of two. Subnormal inputs
+    // use MIN_POSITIVE, so the smallest ratio remains 2^-52.
+    let exponent = f64::from_bits(max.to_bits() & 0x7ff0_0000_0000_0000);
+    Some(exponent.max(f64::MIN_POSITIVE))
 }
 
 /// Cyclic Jacobi eigenvalues of the symmetric row-major `a` (n x n), sorted.
@@ -286,6 +324,12 @@ fn jacobi_eigenvalues(mut a: Vec<Real>, n: usize) -> Option<Vec<Real>> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Vector {
     data: Vec<Real>,
+}
+
+impl From<Vec<Real>> for Vector {
+    fn from(data: Vec<Real>) -> Self {
+        Self { data }
+    }
 }
 
 impl Vector {
@@ -421,6 +465,43 @@ fn out_of_range(index: usize, len: usize) -> SpiceError {
 #[cfg(test)]
 mod tests {
     use super::{Matrix, Vector};
+
+    #[test]
+    fn symmetric_eigenvalues_do_not_converge_on_overflowed_or_underflowed_norms() {
+        for scale in [
+            2.0_f64.powi(-1000),
+            2.0_f64.powi(-600),
+            2.0_f64.powi(600),
+            2.0_f64.powi(1000),
+        ] {
+            let mut matrix = Matrix::zeros(2, 2);
+            matrix
+                .data_mut()
+                .copy_from_slice(&[2. * scale, scale, scale, 2. * scale]);
+            let values = matrix.symmetric_eigenvalues().unwrap();
+            assert!((values[0] / scale - 1.).abs() < 1e-14);
+            assert!((values[1] / scale - 3.).abs() < 1e-14);
+            matrix
+                .data_mut()
+                .copy_from_slice(&[scale, 2. * scale, 2. * scale, scale]);
+            let values = matrix.symmetric_eigenvalues().unwrap();
+            assert!((values[0] / scale + 1.).abs() < 1e-14);
+            assert!((values[1] / scale - 3.).abs() < 1e-14);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "dense matrix dimensions overflow")]
+    fn dimensions_cannot_wrap() {
+        let _ = Matrix::zeros(usize::MAX, 2);
+    }
+
+    #[test]
+    fn zero_column_matrix_multiplies_to_zero_vector() {
+        let a = Matrix::zeros(3, 0);
+        assert_eq!(a.mul_vector(&Vector::zeros(0)).unwrap(), Vector::zeros(3));
+        assert_eq!(a.transpose(), Matrix::zeros(0, 3));
+    }
 
     #[test]
     fn symmetric_eigenvalues_are_sorted_and_validated() {
