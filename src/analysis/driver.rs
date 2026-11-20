@@ -662,11 +662,11 @@ pub fn runner(kind: AnalysisKind) -> SpiceResult<Box<dyn Analysis>> {
         AnalysisKind::Noise => Box::new(Noise),
         AnalysisKind::Distortion => Box::new(Distortion),
         AnalysisKind::Sensitivity => Box::new(Sensitivity),
-        other => {
+        AnalysisKind::Fourier => {
             return Err(SpiceError::Unsupported {
                 feature: format!(
                     ".{} analysis has no driver in the port yet (see {C_REFERENCE_ANALYSIS})",
-                    other.as_str()
+                    kind.as_str()
                 ),
                 location: None,
             });
