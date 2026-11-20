@@ -47,7 +47,18 @@ fn c_g(value: Real) -> String {
         };
     }
     if !value.is_finite() {
-        return format!("{value}");
+        return if value.is_nan() {
+            if value.is_sign_negative() {
+                "-nan"
+            } else {
+                "nan"
+            }
+            .into()
+        } else if value.is_sign_negative() {
+            "-inf".into()
+        } else {
+            "inf".into()
+        };
     }
     let scientific = format!("{value:.5e}");
     let (mantissa, exponent) = scientific.split_once('e').expect("scientific form");
@@ -62,14 +73,11 @@ fn c_g(value: Real) -> String {
     } else {
         let decimals = usize::try_from(5 - exponent).unwrap_or(0);
         let fixed = format!("{value:.decimals$}");
-        let fixed = fixed
-            .trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_string();
-        if fixed.is_empty() || fixed == "-" {
-            "0".into()
-        } else {
+        // In fixed format only fractional trailing zeros are insignificant.
+        if decimals == 0 {
             fixed
+        } else {
+            fixed.trim_end_matches('0').trim_end_matches('.').to_owned()
         }
     }
 }
@@ -1314,5 +1322,28 @@ fn instance_real(inputs: &Inputs, name: &str) -> SpiceResult<Real> {
             applied.location.clone(),
             format!("BSIM3 instance {name} is not numeric: {value:?}"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn c_g_preserves_integer_zeros_and_c_exponent_boundaries() {
+        for (value, expected) in [
+            (100_000., "100000"),
+            (-120_000., "-120000"),
+            (999_999.4, "999999"),
+            (999_999.6, "1e+06"),
+            (0.000_01, "1e-05"),
+            (0.0001, "0.0001"),
+            (-0., "-0"),
+            (Real::NAN, "nan"),
+            (Real::INFINITY, "inf"),
+            (Real::NEG_INFINITY, "-inf"),
+        ] {
+            assert_eq!(c_g(value), expected);
+        }
     }
 }

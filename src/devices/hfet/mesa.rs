@@ -52,7 +52,7 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
-use super::{NodeSetup, TemperatureCache, given_celsius, stamp_reset};
+use super::{NodeSetup, TemperatureCache, given_celsius, physical_temperature, stamp_reset};
 use crate::devices::hfet::{Instance, Model};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{BOLTZMANN, CHARGE};
@@ -1279,13 +1279,17 @@ impl Device for Mesa {
                     _ => instance.m = value,
                 }
             }
-            "td" | "ts" | "dtemp" => {
-                check(value.is_finite(), "finite")?;
-                match parameter {
-                    "td" => instance.td = Some(value),
-                    "ts" => instance.ts = Some(value),
-                    _ => instance.dtemp = value,
+            "td" | "ts" => {
+                check(physical_temperature(value), "above absolute zero")?;
+                if parameter == "td" {
+                    instance.td = Some(value);
+                } else {
+                    instance.ts = Some(value);
                 }
+            }
+            "dtemp" => {
+                check(true, "finite")?;
+                instance.dtemp = value;
             }
             "icvds" | "icvgs" => {
                 check(value.is_finite(), "finite")?;

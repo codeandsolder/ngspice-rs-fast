@@ -116,7 +116,12 @@ pub(super) fn c_g(value: f64) -> String {
     }
     if !value.is_finite() {
         return if value.is_nan() {
-            "nan".into()
+            if value.is_sign_negative() {
+                "-nan"
+            } else {
+                "nan"
+            }
+            .into()
         } else if value > 0.0 {
             "inf".into()
         } else {
@@ -136,8 +141,12 @@ pub(super) fn c_g(value: f64) -> String {
     } else {
         let decimals = usize::try_from(5 - exponent).unwrap_or(0);
         let fixed = format!("{value:.decimals$}");
-        let fixed = fixed.trim_end_matches('0').trim_end_matches('.');
-        fixed.to_string()
+        // Do not strip meaningful integer digits when precision is zero.
+        if decimals == 0 {
+            fixed
+        } else {
+            fixed.trim_end_matches('0').trim_end_matches('.').to_owned()
+        }
     }
 }
 
@@ -2071,6 +2080,14 @@ mod tests {
             (0.1, "0.1"),
             (-1e-9, "-1e-09"),
             (123_456.0, "123456"),
+            (100_000.0, "100000"),
+            (-120_000.0, "-120000"),
+            (999_999.4, "999999"),
+            (999_999.6, "1e+06"),
+            (-0.0, "-0"),
+            (f64::NAN, "nan"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
             (1_234_567.0, "1.23457e+06"),
             (1e-4, "0.0001"),
             (-2.64404e10, "-2.64404e+10"),

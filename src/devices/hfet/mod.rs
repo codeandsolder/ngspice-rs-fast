@@ -138,6 +138,12 @@ impl<T: Copy, const N: usize> TemperatureCache<T, N> {
 /// C `CONSTCtoK`.
 pub(super) const CELSIUS_TO_KELVIN: Real = 273.15;
 
+/// Match the deck schema's temperature domain for explicit sweep inputs.
+fn physical_temperature(celsius: Real) -> bool {
+    let kelvin = celsius + CELSIUS_TO_KELVIN;
+    kelvin.is_finite() && kelvin > 0.
+}
+
 /// Common HFET1/HFET2 scalar instance setters.
 pub(super) const HFET_INSTANCE: &[P] = &[
     p("l", U::Metre, D::Positive, Some(1e-6)),
@@ -192,6 +198,43 @@ impl HfetInstance {
             temp: values.get("temp").map(|v| v.value),
             dtemp: jfet::required(&values, "dtemp")?,
         })
+    }
+
+    /// The shared schema defines which real instance setters can be swept.
+    fn sweep_parameter(keyword: &str) -> Option<&'static str> {
+        HFET_INSTANCE
+            .iter()
+            .find(|field| field.name.eq_ignore_ascii_case(keyword))
+            .map(|field| field.name)
+    }
+
+    fn swept(mut self, owner: &str, parameter: &str, value: Real) -> SpiceResult<Self> {
+        let check =
+            |ok, what| crate::devices::sweep::check_swept(owner, parameter, value, ok, what);
+        match Self::sweep_parameter(parameter) {
+            Some(field @ ("l" | "w" | "m")) => {
+                check(value > 0., "finite and positive")?;
+                match field {
+                    "l" => self.l = value,
+                    "w" => self.w = value,
+                    _ => self.m = value,
+                }
+            }
+            Some("temp") => {
+                check(physical_temperature(value), "above absolute zero")?;
+                self.temp = Some(value);
+            }
+            Some("dtemp") => {
+                check(true, "finite")?;
+                self.dtemp = value;
+            }
+            _ => {
+                return Err(SpiceError::circuit(format!(
+                    "{owner}: HFET instance parameter {parameter} cannot be swept"
+                )));
+            }
+        }
+        Ok(self)
     }
 
     fn sensitivity_record(
@@ -800,6 +843,63 @@ mod tests {
             (-12.5_f64).to_bits()
         );
         assert!(record.given("temp"));
+    }
+
+    #[test]
+    fn sweeps_match_deck_scalar_domains_for_all_hfet_families() {
+        use crate::devices::{Circuit, ModelContext};
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use std::path::Path;
+
+        let context = ModelContext::default();
+        for (base, level, temperatures) in [
+            ("nmf", 2, &["td", "ts"][..]),
+            ("nhfet", 5, &["temp"][..]),
+            ("nhfet", 6, &["temp"][..]),
+        ] {
+            let deck = Parser::new()
+                .parse_deck(&parse_deck_text(
+                    Path::new("hfet-sweeps.cir"),
+                    &format!(
+                        "HFET sweeps\nz1 d g 0 test\n.model test {base} level={level}\n.end\n"
+                    ),
+                ))
+                .unwrap();
+            let circuit = Circuit::from_netlist(&deck).unwrap();
+            let device = circuit.device("z1").unwrap();
+            for field in ["l", "w", "m"] {
+                let field = device.instance_parameter(field).unwrap();
+                for invalid in [0., -1., Real::INFINITY, Real::NAN] {
+                    assert!(
+                        device
+                            .with_instance_parameter(field, invalid, &context)
+                            .is_err(),
+                        "level {level} accepted {field}={invalid}"
+                    );
+                }
+            }
+            for field in temperatures {
+                let field = device.instance_parameter(field).unwrap();
+                for invalid in [-273.15, -300., Real::INFINITY, Real::NAN] {
+                    assert!(
+                        device
+                            .with_instance_parameter(field, invalid, &context)
+                            .is_err(),
+                        "level {level} accepted {field}={invalid}"
+                    );
+                }
+                let swept = device
+                    .with_instance_parameter(field, 42., &context)
+                    .unwrap();
+                assert_eq!(swept.terminals(), device.terminals());
+            }
+            assert!(
+                device
+                    .with_instance_parameter("dtemp", Real::INFINITY, &context)
+                    .is_err()
+            );
+            assert!(device.with_instance_parameter("m", 2., &context).is_ok());
+        }
     }
 
     #[test]
