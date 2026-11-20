@@ -179,6 +179,31 @@ struct Scope<'a> {
     cards: &'a [ScopedCard],
 }
 
+impl Scope<'_> {
+    fn verify_usage(&self, used: [usize; 11]) -> SpiceResult<()> {
+        let lengths = [
+            self.devices.len(),
+            self.models.len(),
+            self.subcircuits.len(),
+            self.analyses.len(),
+            self.includes.len(),
+            self.params.len(),
+            self.options.len(),
+            self.globals.len(),
+            self.initial_conditions.len(),
+            self.nodesets.len(),
+            self.functions.len(),
+        ];
+        if used != lengths {
+            return Err(refuse(
+                "the ordered cards do not reference every typed entry exactly once",
+                None,
+            ));
+        }
+        Ok(())
+    }
+}
+
 struct Writer {
     out: String,
 }
@@ -208,6 +233,23 @@ impl Writer {
         Ok(())
     }
 
+    /// Resolve included entries as well as local ones, but emit only local cards.
+    fn scoped_item<T>(
+        &mut self,
+        items: &[T],
+        index: usize,
+        what: &str,
+        skip: bool,
+        depth: usize,
+        write: impl FnOnce(&mut Self, &T, usize) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        let item = entry(items, index, what)?;
+        if !skip {
+            write(self, item, depth)?;
+        }
+        Ok(())
+    }
+
     fn scope(&mut self, scope: &Scope<'_>, depth: usize, body: bool) -> SpiceResult<()> {
         let mut used = [0usize; 11];
         for card in scope.cards {
@@ -218,17 +260,11 @@ impl Writer {
             match card.kind {
                 ScopedCardKind::Device(i) => {
                     used[0] += 1;
-                    let device = entry(scope.devices, i, "devices")?;
-                    if !skip {
-                        self.device(device, depth)?;
-                    }
+                    self.scoped_item(scope.devices, i, "devices", skip, depth, Self::device)?;
                 }
                 ScopedCardKind::Model(i) => {
                     used[1] += 1;
-                    let model = entry(scope.models, i, "models")?;
-                    if !skip {
-                        self.model(model, depth)?;
-                    }
+                    self.scoped_item(scope.models, i, "models", skip, depth, Self::model)?;
                 }
                 ScopedCardKind::Subcircuit(i) => {
                     used[2] += 1;
@@ -240,31 +276,19 @@ impl Writer {
                 }
                 ScopedCardKind::Analysis(i) => {
                     used[3] += 1;
-                    let analysis = entry(scope.analyses, i, "analyses")?;
-                    if !skip {
-                        self.analysis(analysis, depth)?;
-                    }
+                    self.scoped_item(scope.analyses, i, "analyses", skip, depth, Self::analysis)?;
                 }
                 ScopedCardKind::Include(i) => {
                     used[4] += 1;
-                    let include = entry(scope.includes, i, "includes")?;
-                    if !skip {
-                        self.include(include, depth)?;
-                    }
+                    self.scoped_item(scope.includes, i, "includes", skip, depth, Self::include)?;
                 }
                 ScopedCardKind::Param(i) => {
                     used[5] += 1;
-                    let param = entry(scope.params, i, "params")?;
-                    if !skip {
-                        self.param(param, depth)?;
-                    }
+                    self.scoped_item(scope.params, i, "params", skip, depth, Self::param)?;
                 }
                 ScopedCardKind::Func(i) => {
                     used[10] += 1;
-                    let function = entry(scope.functions, i, "functions")?;
-                    if !skip {
-                        self.func(function, depth)?;
-                    }
+                    self.scoped_item(scope.functions, i, "functions", skip, depth, Self::func)?;
                 }
                 ScopedCardKind::Options(i) => {
                     used[6] += 1;
@@ -284,10 +308,7 @@ impl Writer {
                 }
                 ScopedCardKind::Global(i) => {
                     used[7] += 1;
-                    let globals = entry(scope.globals, i, "globals")?;
-                    if !skip {
-                        self.global(globals, depth)?;
-                    }
+                    self.scoped_item(scope.globals, i, "globals", skip, depth, Self::global)?;
                 }
                 ScopedCardKind::InitialCondition(i) => {
                     used[8] += 1;
@@ -330,26 +351,7 @@ impl Writer {
                 }
             }
         }
-        let lengths = [
-            scope.devices.len(),
-            scope.models.len(),
-            scope.subcircuits.len(),
-            scope.analyses.len(),
-            scope.includes.len(),
-            scope.params.len(),
-            scope.options.len(),
-            scope.globals.len(),
-            scope.initial_conditions.len(),
-            scope.nodesets.len(),
-            scope.functions.len(),
-        ];
-        if used != lengths {
-            return Err(refuse(
-                "the ordered cards do not reference every typed entry exactly once",
-                None,
-            ));
-        }
-        Ok(())
+        scope.verify_usage(used)
     }
 
     fn subcircuit(&mut self, sub: &Subcircuit, depth: usize) -> SpiceResult<()> {
@@ -785,72 +787,7 @@ impl Writer {
             return self.line(depth, &line, location);
         }
         let mut parts = vec![node(&device.name, location)?];
-        let count = device.nodes.len();
-        let count_ok = match designator {
-            'r' | 'c' | 'l' | 'v' | 'i' | 'd' | 'f' | 'h' | 'w' => count == 2,
-            'q' => count == 3 || count == 4,
-            'm' | 'e' | 'g' | 's' | 't' | 'o' | 'y' => count == 4,
-            'j' | 'u' | 'z' => count == 3,
-            'x' => true,
-            'k' => count == 0,
-            _ => {
-                return Err(refuse(
-                    format!("device designator '{designator}' has no writer"),
-                    Some(location),
-                ));
-            }
-        };
-        if !count_ok {
-            return Err(refuse(
-                format!("'{designator}' instance with {count} nodes"),
-                Some(location),
-            ));
-        }
-        for n in &device.nodes {
-            parts.push(node(n, location)?);
-        }
-        let mut setters = device.parameters.as_slice();
-        if designator == 'w' {
-            // INP2W reads the controlling source before the model name.
-            match setters.split_first() {
-                Some((control, rest))
-                    if control.name == "control" && control.kind == ParameterKind::Instance =>
-                {
-                    parts.push(node(&control.value, &control.location)?);
-                    setters = rest;
-                }
-                _ => {
-                    return Err(refuse(
-                        "'w' instance without a leading controlling source",
-                        Some(location),
-                    ));
-                }
-            }
-        }
-        match (designator, &device.model) {
-            ('v' | 'i' | 'e'..='h' | 'k' | 't', Some(_)) => {
-                return Err(refuse("source with a model", Some(location)));
-            }
-            ('d' | 'q' | 'm' | 'x' | 's' | 'w' | 'j' | 'u' | 'o' | 'z' | 'y', None) => {
-                return Err(refuse("device without a model/target", Some(location)));
-            }
-            (_, Some(model)) => {
-                if designator == 'q'
-                    && (!model.bytes().any(|b| b.is_ascii_alphabetic())
-                        || parse_spice_number(model).is_some())
-                {
-                    return Err(refuse(
-                        "BJT model name must be a non-numeric word with a letter",
-                        Some(location),
-                    ));
-                }
-                if designator == 'm' && parse_spice_number(model).is_some() {
-                    return Err(refuse("numeric-looking MOS model name", Some(location)));
-                }
-                parts.push(node(model, location)?);
-            }
-            (_, None) => {}
-        }
+        let setters = device_prefix(device, &mut parts)?;
         match designator {
             'r' | 'c' | 'l' => passive_parameters(device, &mut parts)?,
             'v' | 'i' => source_parameters(device, &mut parts)?,
@@ -879,6 +816,82 @@ impl Writer {
         }
         self.line(depth, &parts.join(" "), location)
     }
+}
+
+// Write and validate the common positional device fields before its setters.
+fn device_prefix<'a>(
+    device: &'a DeviceInstance,
+    parts: &mut Vec<String>,
+) -> SpiceResult<&'a [ParameterAssignment]> {
+    let location = &device.location;
+    let designator = device.designator;
+    let count = device.nodes.len();
+    let count_ok = match designator {
+        'r' | 'c' | 'l' | 'v' | 'i' | 'd' | 'f' | 'h' | 'w' => count == 2,
+        'q' => count == 3 || count == 4,
+        'm' | 'e' | 'g' | 's' | 't' | 'o' | 'y' => count == 4,
+        'j' | 'u' | 'z' => count == 3,
+        'x' => true,
+        'k' => count == 0,
+        _ => {
+            return Err(refuse(
+                format!("device designator '{designator}' has no writer"),
+                Some(location),
+            ));
+        }
+    };
+    if !count_ok {
+        return Err(refuse(
+            format!("'{designator}' instance with {count} nodes"),
+            Some(location),
+        ));
+    }
+    for n in &device.nodes {
+        parts.push(node(n, location)?);
+    }
+    let mut setters = device.parameters.as_slice();
+    if designator == 'w' {
+        // INP2W reads the controlling source before the model name.
+        match setters.split_first() {
+            Some((control, rest))
+                if control.name == "control" && control.kind == ParameterKind::Instance =>
+            {
+                parts.push(node(&control.value, &control.location)?);
+                setters = rest;
+            }
+            _ => {
+                return Err(refuse(
+                    "'w' instance without a leading controlling source",
+                    Some(location),
+                ));
+            }
+        }
+    }
+    match (designator, &device.model) {
+        ('v' | 'i' | 'e'..='h' | 'k' | 't', Some(_)) => {
+            return Err(refuse("source with a model", Some(location)));
+        }
+        ('d' | 'q' | 'm' | 'x' | 's' | 'w' | 'j' | 'u' | 'o' | 'z' | 'y', None) => {
+            return Err(refuse("device without a model/target", Some(location)));
+        }
+        (_, Some(model)) => {
+            if designator == 'q'
+                && (!model.bytes().any(|b| b.is_ascii_alphabetic())
+                    || parse_spice_number(model).is_some())
+            {
+                return Err(refuse(
+                    "BJT model name must be a non-numeric word with a letter",
+                    Some(location),
+                ));
+            }
+            if designator == 'm' && parse_spice_number(model).is_some() {
+                return Err(refuse("numeric-looking MOS model name", Some(location)));
+            }
+            parts.push(node(model, location)?);
+        }
+        (_, None) => {}
+    }
+    Ok(setters)
 }
 
 /// An opening card in `chain` must be closed by a final `.ends` in the same
@@ -1392,16 +1405,6 @@ fn behavioural_card(device: &DeviceInstance) -> SpiceResult<String> {
     };
     parts.push(node(positive, location)?);
     parts.push(node(negative, location)?);
-    let setter = |parameter: &ParameterAssignment, allowed: &[&str]| {
-        if allowed.contains(&parameter.name.as_str()) {
-            named_value(parameter, false)
-        } else {
-            Err(refuse(
-                format!("parameter {:?} on '{designator}' instance", parameter.name),
-                Some(&parameter.location),
-            ))
-        }
-    };
     let b_setters = [
         "m",
         "tc1",
@@ -1427,115 +1430,14 @@ fn behavioural_card(device: &DeviceInstance) -> SpiceResult<String> {
                 &b_setters
             };
             for parameter in &parameters[1..] {
-                parts.push(setter(parameter, allowed)?);
+                parts.push(behavioural_setter(parameter, designator, allowed)?);
             }
         }
         ('e' | 'g', "table") => {
-            let four_node = match (&first.kind, controls) {
-                (ParameterKind::Behavioural(_), []) => false,
-                (ParameterKind::Flag, [nc_positive, nc_negative]) if designator == 'e' => {
-                    parts.push(node(nc_positive, location)?);
-                    parts.push(node(nc_negative, location)?);
-                    true
-                }
-                _ => {
-                    return Err(refuse(
-                        format!("'{designator}' TABLE with {} nodes", device.nodes.len()),
-                        Some(location),
-                    ));
-                }
-            };
-            let mut rest = &parameters[1..];
-            let mut values = Vec::new();
-            while let [x, y, tail @ ..] = rest {
-                if x.name != "x" || y.name != "y" {
-                    break;
-                }
-                values.push((value_text(x, false)?, value_text(y, false)?));
-                rest = tail;
-            }
-            if values.is_empty() {
-                return Err(refuse("TABLE without points", Some(location)));
-            }
-            if four_node {
-                let flat: Vec<String> = values
-                    .iter()
-                    .flat_map(|(x, y)| [x.clone(), y.clone()])
-                    .collect();
-                parts.push(format!("table=({})", flat.join(", ")));
-            } else {
-                parts.push(format!("table {{{}}} =", behavioural_text(first)?));
-                for (x, y) in &values {
-                    parts.push(format!("({x}, {y})"));
-                }
-            }
-            let allowed: &[&str] = if designator == 'g' { &["m"] } else { &[] };
-            for parameter in rest {
-                parts.push(setter(parameter, allowed)?);
-            }
+            behavioural_table(device, first, controls, &parameters[1..], &mut parts)?;
         }
         (_, "poly") => {
-            let spelling = value_text(first, false)?;
-            let dimension = poly_dimension(&spelling).ok_or_else(|| {
-                refuse("POLY dimension is not an integer in 1..=64", Some(location))
-            })?;
-            parts.push(format!("poly({spelling})"));
-            let mut rest = &parameters[1..];
-            if matches!(designator, 'e' | 'g') {
-                if controls.len() != 2 * dimension {
-                    return Err(refuse(
-                        format!(
-                            "POLY({dimension}) with {} controlling nodes",
-                            controls.len()
-                        ),
-                        Some(location),
-                    ));
-                }
-                for control in controls {
-                    parts.push(node(control, location)?);
-                }
-            } else {
-                for _ in 0..dimension {
-                    match rest.split_first() {
-                        Some((control, tail))
-                            if control.name == "control"
-                                && control.kind == ParameterKind::Instance =>
-                        {
-                            parts.push(node(&control.value, &control.location)?);
-                            rest = tail;
-                        }
-                        _ => {
-                            return Err(refuse(
-                                format!("POLY({dimension}) without its controlling sources"),
-                                Some(location),
-                            ));
-                        }
-                    }
-                }
-                if !controls.is_empty() {
-                    return Err(refuse("F/H POLY with controlling nodes", Some(location)));
-                }
-            }
-            let mut coefficients = 0;
-            while let Some((coefficient, tail)) = rest.split_first() {
-                if coefficient.name != "coef" {
-                    break;
-                }
-                parts.push(value_text(coefficient, false)?);
-                coefficients += 1;
-                rest = tail;
-            }
-            if coefficients == 0 {
-                return Err(refuse("POLY without coefficients", Some(location)));
-            }
-            let allowed: &[&str] = if matches!(designator, 'g' | 'f') {
-                &["m"]
-            } else {
-                &[]
-            };
-            for parameter in rest {
-                parts.push(setter(parameter, allowed)?);
-            }
+            behavioural_poly(device, first, controls, &parameters[1..], &mut parts)?;
         }
         _ => {
             return Err(refuse(
@@ -1548,6 +1450,146 @@ fn behavioural_card(device: &DeviceInstance) -> SpiceResult<String> {
         }
     }
     Ok(parts.join(" "))
+}
+
+fn behavioural_setter(
+    parameter: &ParameterAssignment,
+    designator: char,
+    allowed: &[&str],
+) -> SpiceResult<String> {
+    if allowed.contains(&parameter.name.as_str()) {
+        named_value(parameter, false)
+    } else {
+        Err(refuse(
+            format!("parameter {:?} on '{designator}' instance", parameter.name),
+            Some(&parameter.location),
+        ))
+    }
+}
+
+fn behavioural_table(
+    device: &DeviceInstance,
+    first: &ParameterAssignment,
+    controls: &[String],
+    remaining: &[ParameterAssignment],
+    parts: &mut Vec<String>,
+) -> SpiceResult<()> {
+    let designator = device.designator;
+    let location = &device.location;
+    let four_node = match (&first.kind, controls) {
+        (ParameterKind::Behavioural(_), []) => false,
+        (ParameterKind::Flag, [nc_positive, nc_negative]) if designator == 'e' => {
+            parts.push(node(nc_positive, location)?);
+            parts.push(node(nc_negative, location)?);
+            true
+        }
+        _ => {
+            return Err(refuse(
+                format!("'{designator}' TABLE with {} nodes", device.nodes.len()),
+                Some(location),
+            ));
+        }
+    };
+    let mut rest = remaining;
+    let mut values = Vec::new();
+    while let [x, y, tail @ ..] = rest {
+        if x.name != "x" || y.name != "y" {
+            break;
+        }
+        values.push((value_text(x, false)?, value_text(y, false)?));
+        rest = tail;
+    }
+    if values.is_empty() {
+        return Err(refuse("TABLE without points", Some(location)));
+    }
+    if four_node {
+        let flat: Vec<String> = values
+            .iter()
+            .flat_map(|(x, y)| [x.clone(), y.clone()])
+            .collect();
+        parts.push(format!("table=({})", flat.join(", ")));
+    } else {
+        parts.push(format!("table {{{}}} =", behavioural_text(first)?));
+        for (x, y) in &values {
+            parts.push(format!("({x}, {y})"));
+        }
+    }
+    let allowed: &[&str] = if designator == 'g' { &["m"] } else { &[] };
+    for parameter in rest {
+        parts.push(behavioural_setter(parameter, designator, allowed)?);
+    }
+    Ok(())
+}
+
+fn behavioural_poly(
+    device: &DeviceInstance,
+    first: &ParameterAssignment,
+    controls: &[String],
+    remaining: &[ParameterAssignment],
+    parts: &mut Vec<String>,
+) -> SpiceResult<()> {
+    let designator = device.designator;
+    let location = &device.location;
+    let spelling = value_text(first, false)?;
+    let dimension = poly_dimension(&spelling)
+        .ok_or_else(|| refuse("POLY dimension is not an integer in 1..=64", Some(location)))?;
+    parts.push(format!("poly({spelling})"));
+    let mut rest = remaining;
+    if matches!(designator, 'e' | 'g') {
+        if controls.len() != 2 * dimension {
+            return Err(refuse(
+                format!(
+                    "POLY({dimension}) with {} controlling nodes",
+                    controls.len()
+                ),
+                Some(location),
+            ));
+        }
+        for control in controls {
+            parts.push(node(control, location)?);
+        }
+    } else {
+        for _ in 0..dimension {
+            match rest.split_first() {
+                Some((control, tail))
+                    if control.name == "control" && control.kind == ParameterKind::Instance =>
+                {
+                    parts.push(node(&control.value, &control.location)?);
+                    rest = tail;
+                }
+                _ => {
+                    return Err(refuse(
+                        format!("POLY({dimension}) without its controlling sources"),
+                        Some(location),
+                    ));
+                }
+            }
+        }
+        if !controls.is_empty() {
+            return Err(refuse("F/H POLY with controlling nodes", Some(location)));
+        }
+    }
+    let mut coefficients = 0;
+    while let Some((coefficient, tail)) = rest.split_first() {
+        if coefficient.name != "coef" {
+            break;
+        }
+        parts.push(value_text(coefficient, false)?);
+        coefficients += 1;
+        rest = tail;
+    }
+    if coefficients == 0 {
+        return Err(refuse("POLY without coefficients", Some(location)));
+    }
+    let allowed: &[&str] = if matches!(designator, 'g' | 'f') {
+        &["m"]
+    } else {
+        &[]
+    };
+    for parameter in rest {
+        parts.push(behavioural_setter(parameter, designator, allowed)?);
+    }
+    Ok(())
 }
 
 /// K (`parser/mutual.rs`): the inductor references `inductor1`, `inductor2`,

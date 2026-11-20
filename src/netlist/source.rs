@@ -83,6 +83,9 @@ impl Deck {
 }
 
 /// Reads a deck from disk.
+///
+/// # Errors
+/// Returns [`SpiceError::Io`] if the file cannot be read as UTF-8.
 pub fn load(path: impl AsRef<Path>) -> SpiceResult<Deck> {
     let path = path.as_ref();
     let text = fs::read_to_string(path).map_err(|error| SpiceError::io(path, &error))?;
