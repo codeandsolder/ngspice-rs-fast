@@ -216,14 +216,14 @@ enum Node {
     Operator(Operator, Tree, Tree),
     Binary(Binary, Tree, Tree),
     Ternary(Tree, Tree, Tree),
-    /// `pwl(x, x0, y0, x1, y1, ...)`: flattened literal points.
-    Pwl(Tree, Vec<Real>),
+    /// `pwl(x, x0, y0, x1, y1, ...)`: shared immutable literal points.
+    Pwl(Tree, Arc<PwlTable>),
     /// `PTF_PWL_DERIVATIVE`: the slope `PTdifferentiate` builds for `pwl()`.
-    PwlDerivative(Tree, Vec<Real>),
+    PwlDerivative(Tree, Arc<PwlTable>),
     /// The XSPICE `pwl` transfer of a lowered TABLE.
-    Table(Tree, XspicePwl),
+    Table(Tree, Arc<XspicePwl>),
     /// The slope of [`Node::Table`] (the code model's partial).
-    TableSlope(Tree, XspicePwl),
+    TableSlope(Tree, Arc<XspicePwl>),
 }
 
 impl Node {
@@ -446,7 +446,7 @@ fn compile(expr: &BExpr, quantities: &mut Vec<Quantity>) -> SpiceResult<Node> {
                 SpiceError::Unsupported { feature, .. } => unsupported(expr, feature),
                 other => other,
             })?;
-            Node::Table(boxed(&table.input, quantities)?, map)
+            Node::Table(boxed(&table.input, quantities)?, Arc::new(map))
         }
     })
 }
@@ -574,62 +574,95 @@ fn pwl(expr: &BExpr, arguments: &[BExpr], quantities: &mut Vec<Quantity>) -> Spi
             ),
         ));
     }
-    let values = points
+    let points = points
+        .as_chunks::<2>()
+        .0
         .iter()
-        .map(literal)
+        .map(|[x, y]| Ok((literal(x)?, literal(y)?)))
         .collect::<SpiceResult<Vec<_>>>()?;
-    let abscissas: Vec<Real> = values.iter().step_by(2).copied().collect();
-    let monotonic = if abscissas[0] < abscissas[1] {
-        abscissas.windows(2).all(|w| w[0] <= w[1])
-    } else if abscissas[0] > abscissas[1] {
-        abscissas.windows(2).all(|w| w[0] >= w[1])
-    } else {
-        false
-    };
-    if !monotonic {
-        return Err(parse_error(
+    let table = PwlTable::new(points).ok_or_else(|| {
+        parse_error(
             expr,
             "PWL(expr, points...) the abscissa of points must be monotonic \
              (C: prepare_PTF_PWL)",
-        ));
-    }
-    Ok(Node::Pwl(boxed(input, quantities)?, values))
+        )
+    })?;
+    Ok(Node::Pwl(boxed(input, quantities)?, Arc::new(table)))
 }
 
-/// `PTpwl`: binary search (ascending or descending abscissa), then linear
-/// interpolation in the found segment, extrapolating at the ends.
-fn pwl_value(arg: Real, values: &[Real]) -> Real {
-    let x = |k: usize| values[2 * k];
-    let y = |k: usize| values[2 * k + 1];
-    let (mut k0, mut k1) = (0usize, values.len() / 2 - 1);
-    let ascending = x(0) < x(1);
-    while k1 - k0 > 1 {
-        let k = usize::midpoint(k0, k1);
-        let upper = if ascending { x(k) > arg } else { x(k) < arg };
-        if upper {
-            k1 = k;
-        } else {
-            k0 = k;
-        }
-    }
-    y(k0) + (y(k1) - y(k0)) * (arg - x(k0)) / (x(k1) - x(k0))
+/// `PTpwl` supports both orders, but `PTpwl_derivative` always performs an
+/// ascending search (even for descending point tables).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PwlOrder {
+    Ascending,
+    Descending,
 }
 
-/// `PTpwl_derivative`: the slope of the segment an **ascending** search
-/// selects, whatever the table order (C quirk, kept).
-fn pwl_slope(arg: Real, values: &[Real]) -> Real {
-    let x = |k: usize| values[2 * k];
-    let y = |k: usize| values[2 * k + 1];
-    let (mut k0, mut k1) = (0usize, values.len() / 2 - 1);
-    while k1 - k0 > 1 {
-        let k = usize::midpoint(k0, k1);
-        if x(k) > arg {
-            k1 = k;
-        } else {
-            k0 = k;
+impl PwlOrder {
+    fn is_upper(self, x: Real, arg: Real) -> bool {
+        match self {
+            Self::Ascending => x > arg,
+            Self::Descending => x < arg,
         }
     }
-    (y(k1) - y(k0)) / (x(k1) - x(k0))
+
+    fn ordered(self, pts: &[(Real, Real)]) -> bool {
+        pts.windows(2).all(|w| match self {
+            Self::Ascending => w[0].0 <= w[1].0,
+            Self::Descending => w[0].0 >= w[1].0,
+        })
+    }
+}
+
+/// Validated literal coordinates, shared by value and slope nodes. The first
+/// two abscissas must differ; subsequent equal abscissas are allowed by C.
+#[derive(Debug, PartialEq)]
+struct PwlTable {
+    points: Vec<(Real, Real)>,
+    order: PwlOrder,
+}
+
+impl PwlTable {
+    fn new(points: Vec<(Real, Real)>) -> Option<Self> {
+        let [first, second, ..] = points.as_slice() else {
+            return None;
+        };
+        let order = if first.0 < second.0 {
+            PwlOrder::Ascending
+        } else if first.0 > second.0 {
+            PwlOrder::Descending
+        } else {
+            return None;
+        };
+        order.ordered(&points).then_some(Self { points, order })
+    }
+
+    /// The original C binary search, including extrapolation at both ends.
+    /// Preserve its midpoint and strict comparison even for duplicate knots.
+    fn segment(&self, arg: Real, order: PwlOrder) -> [(Real, Real); 2] {
+        let (mut lower, mut upper) = (0, self.points.len() - 1);
+        while upper - lower > 1 {
+            let middle = usize::midpoint(lower, upper);
+            if order.is_upper(self.points[middle].0, arg) {
+                upper = middle;
+            } else {
+                lower = middle;
+            }
+        }
+        [self.points[lower], self.points[upper]]
+    }
+
+    /// `PTpwl` in the original floating-point operation order.
+    fn value(&self, arg: Real) -> Real {
+        let [(x0, y0), (x1, y1)] = self.segment(arg, self.order);
+        y0 + (y1 - y0) * (arg - x0) / (x1 - x0)
+    }
+
+    /// `PTpwl_derivative`: intentionally ignores the table's actual order.
+    fn slope(&self, arg: Real) -> Real {
+        let [(x0, y0), (x1, y1)] = self.segment(arg, PwlOrder::Ascending);
+        (y1 - y0) / (x1 - x0)
+    }
 }
 
 /// Dawson's ULP comparison (`AlmostEqualUlps`, `src/maths/misc/equality.c`).
@@ -1093,16 +1126,16 @@ fn differentiate(p: &Tree, variable: usize) -> Tree {
             };
             times(slope, differentiate(u, variable))
         }
-        Node::Pwl(u, values) => {
+        Node::Pwl(u, table) => {
             let slope = u.constant().map_or_else(
-                || Arc::new(Node::PwlDerivative(u.clone(), values.clone())),
-                |x| constant(pwl_slope(x, values)),
+                || Arc::new(Node::PwlDerivative(Arc::clone(u), Arc::clone(table))),
+                |x| constant(table.slope(x)),
             );
             times(slope, differentiate(u, variable))
         }
         Node::Table(u, map) => {
             let slope = u.constant().map_or_else(
-                || Arc::new(Node::TableSlope(u.clone(), map.clone())),
+                || Arc::new(Node::TableSlope(Arc::clone(u), Arc::clone(map))),
                 |x| constant(map.evaluate(x).1),
             );
             times(slope, differentiate(u, variable))
@@ -1197,8 +1230,8 @@ impl Evaluator<'_> {
                     self.eval(otherwise)?
                 }
             }
-            Node::Pwl(argument, values) => pwl_value(self.eval(argument)?, values),
-            Node::PwlDerivative(argument, values) => pwl_slope(self.eval(argument)?, values),
+            Node::Pwl(argument, table) => table.value(self.eval(argument)?),
+            Node::PwlDerivative(argument, table) => table.slope(self.eval(argument)?),
             Node::Table(argument, map) => map.evaluate(self.eval(argument)?).0,
             Node::TableSlope(argument, map) => map.evaluate(self.eval(argument)?).1,
         };
@@ -1275,13 +1308,51 @@ mod tests {
 
     #[test]
     fn pwl_extrapolates_and_searches_like_c() {
-        let ascending = [0., 0., 1., 1., 3., 5.];
-        assert_eq!(pwl_value(2., &ascending), 3.);
-        assert_eq!(pwl_value(-1., &ascending), -1.);
-        assert_eq!(pwl_value(4., &ascending), 7.);
-        let descending = [3., 5., 1., 1., 0., 0.];
-        assert_eq!(pwl_value(2., &descending), 3.);
-        assert_eq!(pwl_slope(2., &ascending), 2.);
+        let ascending = PwlTable::new(vec![(0., 0.), (1., 1.), (3., 5.)]).unwrap();
+        assert_eq!(ascending.value(2.), 3.);
+        assert_eq!(ascending.value(-1.), -1.);
+        assert_eq!(ascending.value(4.), 7.);
+        let descending = PwlTable::new(vec![(3., 5.), (1., 1.), (0., 0.)]).unwrap();
+        assert_eq!(descending.value(2.), 3.);
+        assert_eq!(ascending.slope(2.), 2.);
+        assert_eq!(descending.slope(2.), 1.);
+
+        let duplicate = PwlTable::new(vec![(0., 0.), (1., 1.), (1., 2.), (2., 5.)]).unwrap();
+        assert_eq!(duplicate.value(1.), 2.);
+        assert_eq!(duplicate.slope(1.), 3.);
+        assert!(PwlTable::new(vec![(0., 0.), (0., 1.)]).is_none());
+        assert!(PwlTable::new(vec![(0., 0.), (1., 1.), (0., 2.)]).is_none());
+    }
+
+    #[test]
+    fn derivative_nodes_share_immutable_tables() {
+        let input = Arc::new(Node::Operator(
+            Operator::Plus,
+            Arc::new(Node::Variable(0)),
+            Arc::new(Node::Variable(1)),
+        ));
+        let points = vec![(0., 0.), (1., 2.), (2., 1.)];
+        let pwl = Arc::new(PwlTable::new(points.clone()).unwrap());
+        let root = Arc::new(Node::Pwl(Arc::clone(&input), Arc::clone(&pwl)));
+        for variable in 0..2 {
+            let derivative = differentiate(&root, variable);
+            let Node::PwlDerivative(arg, table) = &*derivative else {
+                panic!("expected PWL slope");
+            };
+            assert!(Arc::ptr_eq(arg, &input));
+            assert!(Arc::ptr_eq(table, &pwl));
+        }
+
+        let map = Arc::new(XspicePwl::new(&points, 0.001).unwrap());
+        let root = Arc::new(Node::Table(Arc::clone(&input), Arc::clone(&map)));
+        for variable in 0..2 {
+            let derivative = differentiate(&root, variable);
+            let Node::TableSlope(arg, table) = &*derivative else {
+                panic!("expected TABLE slope");
+            };
+            assert!(Arc::ptr_eq(arg, &input));
+            assert!(Arc::ptr_eq(table, &map));
+        }
     }
 
     #[test]
