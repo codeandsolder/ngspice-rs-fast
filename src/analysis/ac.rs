@@ -187,26 +187,11 @@ impl SmallSignal {
         settings: crate::analysis::bias::DcSettings,
     ) -> SpiceResult<Self> {
         circuit.finalize()?;
-        let hints = crate::analysis::initial::resolve(circuit, request)?;
-        let nodes = crate::analysis::bias::NodeForcing {
-            initial: Vec::new(),
-            nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
-        };
-        let mut seed = Vector::zeros(circuit.unknown_count());
-        for hint in hints.nodesets {
-            seed.as_mut_slice()[hint.row] = hint.value;
-        }
-        // AC is linearized only after a valid physical DC solution, never at zero.
-        let solved = crate::analysis::bias::solve_dc_forced(
+        let solved = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?.solve(
             circuit,
             &context.model_context(),
             &settings,
-            &[],
-            Some(&seed),
-            None,
-            &nodes,
-        )?
-        .solution;
+        )?;
         // The MODEINITSMSIG load's state writes outlive the analysis (C keeps
         // one CKTstate0 per deck): later analyses read them back.
         circuit.record_small_signal_state(&context.model_context(), &solved.values)?;
@@ -323,6 +308,27 @@ mod tests {
         let mut trial = history.trial();
         let state = history.device(&mut trial, 0..history.len()).unwrap();
         (0..history.len()).map(|slot| state.carried(slot)).collect()
+    }
+
+    #[test]
+    fn ordinary_operating_point_records_small_signal_state_for_later_analyses() {
+        let netlist = Parser::new().parse_deck(&parse_deck_text(
+            Path::new("op-state.cir"),
+            "BJT operating point\nvcc c 0 5\nvbase b 0 0.3\nq1 c b 0 qmod\n.model qmod npn (is=1e-15 bf=100 rb=100 cjc=2p xcjc=0.5 cjs=3p)\n.end\n",
+        )).unwrap();
+        let mut circuit = Circuit::from_netlist(&netlist).unwrap();
+        let mut same_bias = Circuit::from_netlist(&netlist).unwrap();
+        let context = AnalysisContext::default();
+        let request = AnalysisRequest::with_arguments(
+            AnalysisKind::OperatingPoint,
+            std::iter::empty::<&str>(),
+        );
+        crate::analysis::linear::op(&mut circuit, &request, &context).unwrap();
+        let settings = crate::analysis::bias::DcSettings::from_request(&request).unwrap();
+        SmallSignal::prepare(&mut same_bias, &request, &context, settings).unwrap();
+        let expected = carried(&same_bias);
+        assert!(expected.iter().flatten().any(|value| *value > 0.));
+        assert_eq!(carried(&circuit), expected);
     }
 
     #[test]

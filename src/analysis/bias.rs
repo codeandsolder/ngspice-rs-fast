@@ -895,6 +895,49 @@ impl NodeForcing {
     }
 }
 
+/// The node hints common to every ordinary operating-point solve. Transient
+/// initialization deliberately has a separate path for enforced IC rows.
+pub(super) struct OperatingPointStart {
+    seed: Vector,
+    nodes: NodeForcing,
+}
+
+impl OperatingPointStart {
+    pub(super) fn resolve(
+        circuit: &Circuit,
+        request: &crate::analysis::AnalysisRequest,
+    ) -> SpiceResult<Self> {
+        let hints = crate::analysis::initial::resolve(circuit, request)?;
+        let nodes = NodeForcing {
+            initial: Vec::new(),
+            nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
+        };
+        let mut seed = Vector::zeros(circuit.unknown_count());
+        for hint in hints.nodesets {
+            seed.as_mut_slice()[hint.row] = hint.value;
+        }
+        Ok(Self { seed, nodes })
+    }
+
+    pub(super) fn solve(
+        &self,
+        circuit: &Circuit,
+        model: &ModelContext,
+        settings: &DcSettings,
+    ) -> SpiceResult<NewtonSolution<TrialState>> {
+        Ok(solve_dc_forced(
+            circuit,
+            model,
+            settings,
+            &[],
+            Some(&self.seed),
+            None,
+            &self.nodes,
+        )?
+        .solution)
+    }
+}
+
 /// Solve a finalized circuit without committing device history or accept hooks,
 /// using the default [`ContinuationPolicy`]. Compatible wrapper over
 /// [`solve_dc_with`] that drops the report.

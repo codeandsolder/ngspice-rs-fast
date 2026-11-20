@@ -344,25 +344,11 @@ pub(super) fn run(
 
     // The operating point, exactly as `.op` solves it (`CKTop` in MODEDCOP;
     // `.ic` applies only to a transient operating point, `.nodeset` here too).
-    let hints = crate::analysis::initial::resolve(circuit, request)?;
-    let nodes = crate::analysis::bias::NodeForcing {
-        initial: Vec::new(),
-        nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
-    };
     let n = circuit.unknown_count();
-    let mut seed = Vector::zeros(n);
-    for hint in hints.nodesets {
-        seed.as_mut_slice()[hint.row] = hint.value;
-    }
-    let model = context.model_context();
-    crate::analysis::bias::solve_dc_forced(
+    crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?.solve(
         circuit,
-        &model,
+        &context.model_context(),
         &settings,
-        &[],
-        Some(&seed),
-        None,
-        &nodes,
     )?;
 
     // tfanal.c solves with the LU factors CKTop's last NIiter pass left in

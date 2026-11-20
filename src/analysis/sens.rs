@@ -1135,26 +1135,8 @@ pub(super) fn run(
         EarlierAcState::default()
     };
     // The operating point, exactly as `.op` solves it (`CKTop`).
-    let hints = crate::analysis::initial::resolve(circuit, request)?;
-    let nodes = crate::analysis::bias::NodeForcing {
-        initial: Vec::new(),
-        nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
-    };
-    let n = circuit.unknown_count();
-    let mut seed = Vector::zeros(n);
-    for hint in hints.nodesets {
-        seed.as_mut_slice()[hint.row] = hint.value;
-    }
-    let solved = crate::analysis::bias::solve_dc_forced(
-        circuit,
-        &model,
-        &settings,
-        &[],
-        Some(&seed),
-        None,
-        &nodes,
-    )?
-    .solution;
+    let solved = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?
+        .solve(circuit, &model, &settings)?;
 
     let mut plot = workspace.plot(ac);
     if let Some(grid) = grid {
