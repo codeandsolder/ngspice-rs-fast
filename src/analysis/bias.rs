@@ -7,11 +7,10 @@
 //! attempt and stage on success *and* failure. [`solve_dc`] is the compatible
 //! default wrapper. See `docs/port/DC_CONTINUATION.md` for the contract and
 //! for the remaining differences from ngspice.
-use crate::analysis::newton::{self, NewtonFailure, NewtonOptions, NewtonSolution, PhasePolicy};
-use crate::devices::{
-    AnalysisMode, Circuit, Forcing, IterationPhase, LoadRequest, ModelContext, StateHistory,
-    TrialState,
+use crate::analysis::newton::{
+    self, CircuitLoad, CircuitNewton, NewtonFailure, NewtonOptions, NewtonSolution, PhasePolicy,
 };
+use crate::devices::{Circuit, Forcing, IterationPhase, ModelContext, StateHistory, TrialState};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
@@ -896,6 +895,52 @@ impl NodeForcing {
     }
 }
 
+/// The node hints common to every ordinary operating-point solve. Transient
+/// initialization deliberately has a separate path for enforced IC rows.
+pub(super) struct OperatingPointStart {
+    seed: Vector,
+    nodes: NodeForcing,
+}
+
+impl OperatingPointStart {
+    pub(super) fn resolve(
+        circuit: &Circuit,
+        request: &crate::analysis::AnalysisRequest,
+    ) -> SpiceResult<Self> {
+        let hints = crate::analysis::initial::resolve(circuit, request)?;
+        let nodes = NodeForcing {
+            initial: Vec::new(),
+            nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
+        };
+        let mut seed = Vector::zeros(circuit.unknown_count());
+        for hint in hints.nodesets {
+            seed.as_mut_slice()[hint.row] = hint.value;
+        }
+        Ok(Self { seed, nodes })
+    }
+
+    pub(super) fn solve(
+        &self,
+        circuit: &Circuit,
+        model: &ModelContext,
+        settings: &DcSettings,
+    ) -> SpiceResult<NewtonSolution<TrialState>> {
+        self.solve_from(circuit, model, settings, &self.seed)
+    }
+
+    /// Another operating point in the same analysis: keep MODEINITJCT and
+    /// MODEINITFIX node forcing, but warm-start from the previous solution.
+    pub(super) fn solve_from(
+        &self,
+        circuit: &Circuit,
+        model: &ModelContext,
+        settings: &DcSettings,
+        seed: &Vector,
+    ) -> SpiceResult<NewtonSolution<TrialState>> {
+        Ok(solve_dc_forced(circuit, model, settings, &[], Some(seed), None, &self.nodes)?.solution)
+    }
+}
+
 /// Solve a finalized circuit without committing device history or accept hooks,
 /// using the default [`ContinuationPolicy`]. Compatible wrapper over
 /// [`solve_dc_with`] that drops the report.
@@ -1289,7 +1334,6 @@ impl Engine<'_> {
                 describe()
             )));
         }
-        let n = self.circuit.unknown_count();
         // C bounds the direct solve and the gmin strategies' closing solve by
         // `iterlim` (itl1) and every other continuation solve by itl2
         // (`cktop.c`: `spice3_gmin`/`dynamic_gmin`/`new_gmin` end with
@@ -1308,65 +1352,36 @@ impl Engine<'_> {
             ..self.newton
         };
         let reduced = options.max_iterations < limit;
-        let history = self.history;
-        let device_limiting = options.limiting.is_device();
-        let (reltol, abstol) = (options.reltol, options.abstol);
         // Sources load their value scaled by CKTsrcFact (vsrcload.c).
         let context = junction
             .map_or(*self.context, |junction| self.context.with_gmin(junction))
             .with_source_factor(scale);
-        let result = newton::solve_phased(
+        let result = CircuitNewton {
+            circuit: self.circuit,
+            context: &context,
+            history: self.history,
+            branch_rows: &self.branches,
+            limited_rows: self.limited.as_deref(),
+            options: &options,
+            load: CircuitLoad::Bias {
+                forcing: self.forcing,
+            },
+        }
+        .solve(
             guess,
-            &self.branches,
-            self.limited.as_deref(),
-            &options,
-            // Continuation strategies restart like `CKTop` (MODEINITJCT); only
-            // the direct attempt may continue a predicted point.
+            // Continuation strategies restart like CKTop; only the direct
+            // attempt may continue a predicted point.
             if strategy == DcStrategy::Direct {
                 self.policy
             } else {
                 PhasePolicy::OperatingPoint
             },
             continued,
-            |x, phase, previous| {
-                let mut a = self.circuit.new_matrix();
-                let mut b = Vector::zeros(n);
-                let mut trial = history
-                    .trial_in(phase, previous)?
-                    .with_device_limiting(device_limiting)
-                    .with_convergence_tolerances(reltol, abstol);
-                self.circuit.load(
-                    &LoadRequest {
-                        mode: AnalysisMode::OperatingPoint,
-                        solution: x,
-                        model_context: &context,
-                        integration: None,
-                        history,
-                        forcing: self.forcing,
-                    },
-                    &mut a,
-                    &mut b,
-                    &mut trial,
-                )?;
-                // cktload.c: .nodeset rows in MODEINITJCT/MODEINITFIX only,
+            |phase, matrix, rhs| {
+                // cktload.c: nodeset rows only in MODEINITJCT/MODEINITFIX;
                 // .ic rows in every load, both scaled by CKTsrcFact.
                 let hinted = matches!(phase, IterationPhase::Junction | IterationPhase::Fix);
-                self.nodes
-                    .apply(&mut a, &mut b, scale, hinted, &self.branches)?;
-                Ok((a, b, trial))
-            },
-            |new, old, trial| {
-                self.circuit
-                    .convergence_test(&crate::devices::ConvergenceRequest {
-                        solution: new,
-                        previous: old,
-                        trial,
-                        model_context: &context,
-                        time: 0.,
-                        reltol: options.reltol,
-                        abstol: options.abstol,
-                        vntol: options.vntol,
-                    })
+                self.nodes.apply(matrix, rhs, scale, hinted, &self.branches)
             },
         );
         let (iterations, error) = match &result {

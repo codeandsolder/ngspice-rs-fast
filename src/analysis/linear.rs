@@ -103,26 +103,14 @@ pub(super) fn op(
     // .nodeset is forced in the MODEINITJCT/MODEINITFIX loads of a nonlinear
     // solve and cannot change a linear operating point. Both are validated.
     circuit.finalize()?;
-    let hints = crate::analysis::initial::resolve(circuit, request)?;
-    let nodes = crate::analysis::bias::NodeForcing {
-        initial: Vec::new(),
-        nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
-    };
-    let mut seed = crate::maths::Vector::zeros(circuit.unknown_count());
-    for hint in hints.nodesets {
-        seed.as_mut_slice()[hint.row] = hint.value;
-    }
-    let x = crate::analysis::bias::solve_dc_forced(
-        circuit,
-        &context.model_context(),
-        &crate::analysis::bias::DcSettings::from_request(request)?,
-        &[],
-        Some(&seed),
-        None,
-        &nodes,
-    )?
-    .solution
-    .values;
+    let model = context.model_context();
+    let x = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?
+        .solve(
+            circuit,
+            &model,
+            &crate::analysis::bias::DcSettings::from_request(request)?,
+        )?
+        .values;
     let mut plot = plot(circuit, "op1", "Operating Point", None, false)?;
     circuit.accept_solution(&x, None)?;
     let history = circuit.state_history();
@@ -130,7 +118,7 @@ pub(super) fn op(
         &crate::devices::LoadRequest {
             mode: crate::devices::AnalysisMode::OperatingPoint,
             solution: &x,
-            model_context: &context.model_context(),
+            model_context: &model,
             integration: None,
             history: &history,
             forcing: None,
@@ -142,6 +130,9 @@ pub(super) fn op(
     let mut point: Vec<_> = x.as_slice().iter().map(|v| Complex::real(*v)).collect();
     point.extend(values);
     plot.push_point(point)?;
+    // dcop.c performs MODEINITSMSIG after CKTop. Publish its persistent
+    // device fields for the next analysis, just as the AC preparation does.
+    circuit.record_small_signal_state(&model, &x)?;
     Ok(plot)
 }
 

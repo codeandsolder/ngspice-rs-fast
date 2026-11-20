@@ -319,11 +319,13 @@ enum Probe {
 
 impl Probe {
     /// The unknowns the output reads.
-    fn rows(&self) -> Vec<usize> {
+    fn rows(&self) -> impl Iterator<Item = usize> {
         match *self {
-            Self::Voltage { pos, neg } => pos.into_iter().chain(neg).collect(),
-            Self::Current { row } => vec![row],
+            Self::Voltage { pos, neg } => [pos, neg],
+            Self::Current { row } => [Some(row), None],
         }
+        .into_iter()
+        .flatten()
     }
 
     fn read<T: Copy + std::ops::Sub<Output = T>>(&self, x: &[T], zero: T) -> T {
@@ -727,6 +729,7 @@ fn entries(members: &[Member<'_>], ac: bool, filters: &[String]) -> Vec<Entry> {
 struct DeltaNumbering {
     internal: Vec<Option<usize>>,
     next: usize,
+    ordered: Vec<(usize, usize, Complex)>,
 }
 
 impl DeltaNumbering {
@@ -734,6 +737,7 @@ impl DeltaNumbering {
         Self {
             internal: vec![None; n],
             next: 0,
+            ordered: Vec::new(),
         }
     }
 
@@ -754,12 +758,35 @@ impl DeltaNumbering {
         }
     }
 
-    fn rank(&self, external: usize) -> usize {
-        self.internal
-            .get(external)
-            .copied()
-            .flatten()
-            .unwrap_or(usize::MAX)
+    /// SMPmultiply's row products in internal SPARSE column order. Reuse
+    /// one entry buffer across the parameter walk, visiting even empty rows
+    /// so that subtraction from the RHS preserves signed-zero arithmetic.
+    fn visit_products(
+        &mut self,
+        elements: BTreeMap<(usize, usize), Complex>,
+        x: &[Complex],
+        mut visit: impl FnMut(usize, Complex),
+    ) {
+        self.ordered.clear();
+        self.ordered.extend(
+            elements
+                .into_iter()
+                .map(|((row, col), value)| (row, col, value)),
+        );
+        let internal = &self.internal;
+        self.ordered.sort_unstable_by_key(|&(row, col, _)| {
+            (row, internal[col].expect("translated perturbation column"))
+        });
+        let mut entries = self.ordered.iter().copied().peekable();
+        for row in 0..x.len() {
+            let mut sum = Complex::ZERO;
+            while let Some((_, col, a)) = entries.next_if(|entry| entry.0 == row) {
+                let b = x[col];
+                sum.re += a.re * b.re - a.im * b.im;
+                sum.im += a.re * b.im + a.im * b.re;
+            }
+            visit(row, sum);
+        }
     }
 }
 
@@ -788,35 +815,6 @@ fn accumulate(
         entry.im += value.im;
     }
     sums
-}
-
-/// `SMPmultiply(delta_Y, ..., E, ..., iE)` (`ComplexMatrixMultiply()` in
-/// `sputils.c`, `delta_Y` being complex): per row, `Sum += element * E[col]`
-/// with `CMPLX_MULT_ADD_ASSIGN`, over the row's elements in internal column
-/// order.
-fn multiply(
-    numbering: &DeltaNumbering,
-    elements: &BTreeMap<(usize, usize), Complex>,
-    x: &[Complex],
-) -> Vec<Complex> {
-    let mut rows: BTreeMap<usize, Vec<(usize, Complex)>> = BTreeMap::new();
-    for (&(row, col), &value) in elements {
-        rows.entry(row).or_default().push((col, value));
-    }
-    let mut product = vec![Complex::ZERO; x.len()];
-    for (row, mut entries) in rows {
-        entries.sort_by_key(|&(col, _)| numbering.rank(col));
-        let mut sum = Complex::ZERO;
-        for (col, a) in entries {
-            let b = x.get(col).copied().unwrap_or(Complex::ZERO);
-            sum.re += a.re * b.re - a.im * b.im;
-            sum.im += a.re * b.im + a.im * b.re;
-        }
-        if let Some(slot) = product.get_mut(row) {
-            *slot = sum;
-        }
-    }
-    product
 }
 
 fn real_stamps(matrix: &SparseMatrix) -> impl Iterator<Item = (usize, usize, Complex)> + '_ {
@@ -864,8 +862,8 @@ fn ac_state<'a>(
     system: &LinearSystem,
     omega: Real,
     model: crate::devices::ModelContext,
-    zeros: &Vector,
-    state: &[Real],
+    zeros: &'a Vector,
+    state: &'a [Real],
 ) -> SpiceResult<AcState<'a>> {
     // CKTunsetup/CKTsetup make a new circuit matrix (elements in setup
     // order) and NIacIter reorders it from scratch.
@@ -892,8 +890,8 @@ fn ac_state<'a>(
         factors,
         solution,
         model,
-        bias: zeros.clone(),
-        state: state.to_vec(),
+        bias: zeros,
+        state,
         circuit,
     })
 }
@@ -983,7 +981,7 @@ impl DcState<'_> {
         index: usize,
         base: &SensitivityLoad,
         perturbed: &SensitivityLoad,
-    ) -> SpiceResult<Vec<Real>> {
+    ) -> SpiceResult<Vector> {
         let n = self.circuit.unknown_count();
         let (mut y0, mut y1) = (SparseMatrix::new(n, n), SparseMatrix::new(n, n));
         let mut rhs = Vector::zeros(n);
@@ -1000,37 +998,33 @@ impl DcState<'_> {
                 .map(|t| (t.row, t.col)),
         );
         let elements = accumulate(real_stamps(&y0), real_stamps(&y1));
-        let product = multiply(numbering, &elements, &self.solution);
-        let mut rhs = rhs.as_slice().to_vec();
-        for (value, product) in rhs.iter_mut().zip(&product) {
-            *value -= product.re;
-        }
-        // A nonfinite load difference (C's division by a zero knee current
-        // in `dioload.c`) propagates through C's solve as NaN, through the
-        // block of `Y` it sits in; other blocks keep their (zero) values.
-        let tainted: Vec<usize> = (0..n)
-            .filter(|&row| !rhs[row].is_finite())
-            .map(|row| self.blocks[row])
-            .collect();
-        for value in &mut rhs {
+        numbering.visit_products(elements, &self.solution, |row, product| {
+            rhs.as_mut_slice()[row] -= product.re;
+        });
+        // Nonfinite loads poison the entire connected block, as in C.
+        // Allocate the block mask only when a nonfinite entry actually occurs.
+        let mut tainted = None;
+        for (row, value) in rhs.as_mut_slice().iter_mut().enumerate() {
             if !value.is_finite() {
+                tainted.get_or_insert_with(|| vec![false; n])[self.blocks[row]] = true;
                 *value = 0.;
             }
         }
-        let solved = crate::maths::solve_last_factors(&self.pattern, &Vector::from_slice(&rhs))?
-            .ok_or_else(|| SpiceError::Numerical {
-                context: ".sens".to_owned(),
-                message: "the operating point left no factored circuit matrix".to_owned(),
+        let mut solved =
+            crate::maths::solve_last_factors(&self.pattern, &rhs)?.ok_or_else(|| {
+                SpiceError::Numerical {
+                    context: ".sens".to_owned(),
+                    message: "the operating point left no factored circuit matrix".to_owned(),
+                }
             })?;
-        let mut x = solved.as_slice().to_vec();
-        if !tainted.is_empty() {
-            for (row, value) in x.iter_mut().enumerate() {
-                if tainted.contains(&self.blocks[row]) {
+        if let Some(tainted) = tainted {
+            for (row, value) in solved.as_mut_slice().iter_mut().enumerate() {
+                if tainted[self.blocks[row]] {
                     *value = Real::NAN;
                 }
             }
         }
-        Ok(x)
+        Ok(solved)
     }
 }
 
@@ -1040,8 +1034,8 @@ struct AcState<'a> {
     factors: crate::maths::complex::ComplexLu,
     solution: Vec<Complex>,
     model: crate::devices::ModelContext,
-    bias: Vector,
-    state: Vec<Real>,
+    bias: &'a Vector,
+    state: &'a [Real],
     circuit: &'a Circuit,
 }
 
@@ -1052,8 +1046,8 @@ impl AcState<'_> {
             index,
             stand_in(self.circuit, index, load),
             &self.model,
-            &self.bias,
-            Some(&self.state),
+            self.bias,
+            Some(self.state),
             &mut system,
         )?;
         Ok(system)
@@ -1080,21 +1074,18 @@ impl AcState<'_> {
     ) -> SpiceResult<Vec<Complex>> {
         let s0 = self.assemble(index, base)?;
         let s1 = self.assemble(index, perturbed)?;
-        let (r0, r1) = (s0.ac_rhs(), s1.ac_rhs());
         // -(base) + perturbed, part by part (one source stamp per row).
-        let mut rhs: Vec<Complex> = r1
-            .iter()
-            .zip(&r0)
-            .map(|(a, b)| Complex::new(-b.re + a.re, -b.im + a.im))
-            .collect();
+        let mut rhs = s0.ac_rhs();
+        for (base, perturbed) in rhs.iter_mut().zip(s1.ac_rhs()) {
+            *base = Complex::new(-base.re + perturbed.re, -base.im + perturbed.im);
+        }
         let (t0, t1) = (self.stamps(&s0), self.stamps(&s1));
         numbering.translate(t0.iter().chain(&t1).map(|&(row, col, _)| (row, col)));
         let elements = accumulate(t0, t1);
-        let product = multiply(numbering, &elements, &self.solution);
-        for (value, product) in rhs.iter_mut().zip(&product) {
-            value.re -= product.re;
-            value.im -= product.im;
-        }
+        numbering.visit_products(elements, &self.solution, |row, product| {
+            rhs[row].re -= product.re;
+            rhs[row].im -= product.im;
+        });
         self.factors.solve(&rhs)
     }
 }
@@ -1128,57 +1119,91 @@ pub(super) fn run(
     let probe = resolve_output(circuit, &card.output)?;
     let model = context.model_context();
 
-    let (members, mut records) = members(circuit, &model)?;
-    let couplings = couplings(circuit, &members, ac)?;
+    let mut workspace = ParameterWalk::new(circuit, &model, ac, &card.filters)?;
     let earlier = if ac {
-        earlier_ac_state(circuit, &members)?
+        earlier_ac_state(circuit, &workspace.members)?
     } else {
         EarlierAcState::default()
     };
-    let entries = entries(&members, ac, &card.filters);
-    if entries.iter().all(|entry| entry.name.is_none()) {
-        return Err(unsupported(
-            ".sens perturbs no parameter (every name is filtered out, or the circuit has no \
-             perturbable parameter); C writes no plot in that case",
-        ));
-    }
-
     // The operating point, exactly as `.op` solves it (`CKTop`).
-    let hints = crate::analysis::initial::resolve(circuit, request)?;
-    let nodes = crate::analysis::bias::NodeForcing {
-        initial: Vec::new(),
-        nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
-    };
-    let n = circuit.unknown_count();
-    let mut seed = Vector::zeros(n);
-    for hint in hints.nodesets {
-        seed.as_mut_slice()[hint.row] = hint.value;
-    }
-    let solved = crate::analysis::bias::solve_dc_forced(
-        circuit,
-        &model,
-        &settings,
-        &[],
-        Some(&seed),
-        None,
-        &nodes,
-    )?
-    .solution;
+    let solved = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?
+        .solve(circuit, &model, &settings)?;
 
-    let mut plot = Plot::new(
-        "sens1",
-        PLOTNAME,
-        if ac {
-            PlotFlags::Complex
-        } else {
-            PlotFlags::Real
-        },
-    );
-    if ac {
-        plot.push_variable(Variable::complex("frequency", "frequency"));
+    let mut plot = workspace.plot(ac);
+    if let Some(grid) = grid {
+        run_ac(
+            &mut workspace,
+            &earlier,
+            &solved.values,
+            model,
+            probe,
+            grid,
+            &mut plot,
+        )?;
+    } else {
+        run_dc(
+            &mut workspace,
+            solved,
+            model,
+            settings.newton.limiting.is_device(),
+            probe,
+            &mut plot,
+        )?;
     }
-    for entry in &entries {
-        if let Some(name) = &entry.name {
+    Ok(plot)
+}
+
+/// One analysis's parameter sequence, owning all live mutable C records and
+/// the persistent perturbation-matrix numbering. AC resets and individual
+/// perturbations share this state; DC and AC never duplicate the walk.
+struct ParameterWalk<'a> {
+    circuit: &'a Circuit,
+    members: Vec<Member<'a>>,
+    records: Records,
+    entries: Vec<Entry>,
+    couplings: Vec<Option<Coupling>>,
+    numbering: DeltaNumbering,
+}
+
+impl<'a> ParameterWalk<'a> {
+    fn new(
+        circuit: &'a Circuit,
+        model: &crate::devices::ModelContext,
+        ac: bool,
+        filters: &[String],
+    ) -> SpiceResult<Self> {
+        let (members, records) = members(circuit, model)?;
+        let couplings = couplings(circuit, &members, ac)?;
+        let entries = entries(&members, ac, filters);
+        if entries.iter().all(|entry| entry.name.is_none()) {
+            return Err(unsupported(
+                ".sens perturbs no parameter (every name is filtered out, or the circuit has no perturbable parameter); C writes no plot in that case",
+            ));
+        }
+        Ok(Self {
+            circuit,
+            members,
+            records,
+            entries,
+            couplings,
+            numbering: DeltaNumbering::new(circuit.unknown_count()),
+        })
+    }
+
+    fn plot(&self, ac: bool) -> Plot {
+        let mut plot = Plot::new(
+            "sens1",
+            PLOTNAME,
+            if ac {
+                PlotFlags::Complex
+            } else {
+                PlotFlags::Real
+            },
+        );
+        if ac {
+            plot.push_variable(Variable::complex("frequency", "frequency"));
+        }
+        for name in self.entries.iter().filter_map(|entry| entry.name.as_ref()) {
             let name = format!("v({name})");
             plot.push_variable(if ac {
                 Variable::complex(name, "voltage")
@@ -1186,176 +1211,223 @@ pub(super) fn run(
                 Variable::new(name, "voltage")
             });
         }
+        plot
     }
 
-    // `delta_Y` is created once, before the frequency loop.
-    let mut numbering = DeltaNumbering::new(n);
-    if let Some(grid) = grid {
-        // CKTunsetup/CKTsetup give every frequency fresh, zeroed state and
-        // solution vectors, so the DC load before NIacIter sees all-zero node
-        // voltages: the devices' AC loads read what that load stored
-        // (DeviceSensitivity::reset_ac_load).
-        let zeros = Vector::zeros(n);
-        let state = vec![0.; circuit.state_history().len()];
-        for frequency in grid {
-            let omega = 2. * std::f64::consts::PI * frequency;
-            // CKTunsetup, then CKTsetup and CKTtemp of the whole circuit in
-            // its present (perturbed and restored) state.
-            for (slot, member) in members.iter().enumerate() {
-                let (model_record, instance_record) = records.pair(member, slot);
-                member.sensitivity.unsetup(model_record, instance_record)?;
-            }
-            for (slot, member) in members.iter().enumerate() {
-                let (model_record, instance_record) = records.pair(member, slot);
-                member.sensitivity.setup(model_record, instance_record)?;
-                mirror(&couplings, &mut records, slot)?;
-                let (model_record, instance_record) = records.pair(member, slot);
-                member
-                    .sensitivity
-                    .temperature(model_record, instance_record)?;
-            }
-            // The reset DC load sees these records; NIacIter's AC load too.
-            let reset = records.clone();
-            let mut system = LinearSystem::new(n);
-            system.a.set_pivot_tolerances(model.pivot);
-            for (slot, member) in members.iter().enumerate() {
-                let pair = reset.view(member, slot);
-                let load = member.sensitivity.reset_ac_load(
-                    pair,
-                    earlier.reset(circuit, member, pair, omega, &solved.values)?,
-                    pair,
-                )?;
-                circuit.assemble_small_signal_device(
-                    member.index,
-                    stand_in(circuit, member.index, &load),
-                    &model,
-                    &zeros,
-                    Some(&state),
-                    &mut system,
-                )?;
-            }
-            // A device whose present records C loads into a non-finite
-            // matrix (BSIM4's TNOM drifting by 273.15 K per frequency, see
-            // `cktsens.c` and `b4mask.c`) poisons NIacIter's solve: every
-            // unknown of a block holding such an entry is NaN, so is every
-            // column read from it, and the walk still perturbs and restores
-            // each parameter. A poisoned block the output does not read
-            // would leave C's other blocks finite; that is refused.
-            let poisoned = poisoned_rows(&system, omega);
-            let probe_poisoned = probe.rows().into_iter().any(|row| poisoned.contains(&row));
-            if !poisoned.is_empty() && !probe_poisoned {
-                return Err(SpiceError::not_yet_ported(
-                    format!(
-                        ".sens ac at {frequency:e} Hz: a non-finite device load in a block \
-                         the output does not read"
-                    ),
-                    "src/spicelib/analysis/cktsens.c (NIacIter on a partly non-finite matrix)",
-                ));
-            }
-            let at = if probe_poisoned {
-                None
-            } else {
-                Some(ac_state(circuit, &system, omega, model, &zeros, &state)?)
-            };
-            let mut point = vec![Complex::real(frequency)];
-            sweep_parameters(
-                &members,
-                &mut records,
-                &entries,
-                &couplings,
-                |slot, setup, current| {
-                    let member = &members[slot];
-                    member.sensitivity.reset_ac_load(
-                        setup,
-                        earlier.reset(
-                            circuit,
-                            member,
-                            reset.view(member, slot),
-                            omega,
-                            &solved.values,
-                        )?,
-                        current,
-                    )
-                },
-                |index, elements, base, perturbed, delta| {
-                    numbering.translate(setup_elements(circuit, index, elements)?);
-                    let Some(at) = &at else {
-                        point.push(Complex::new(Real::NAN, Real::NAN));
-                        return Ok(());
-                    };
-                    let dx = at.delta(&mut numbering, index, base, perturbed)?;
-                    let value = probe.read(&dx, Complex::ZERO);
-                    point.push(Complex::new(value.re / delta, value.im / delta));
-                    Ok(())
-                },
-            )?;
-            plot.push_point(point)?;
+    /// CKTunsetup, then CKTsetup and CKTtemp in sgen order. The reset-load
+    /// snapshot survives the following in-place parameter perturbations.
+    fn reset_ac(&mut self) -> SpiceResult<Records> {
+        for (slot, member) in self.members.iter().enumerate() {
+            let (model, instance) = self.records.pair(member, slot);
+            member.sensitivity.unsetup(model, instance)?;
         }
-    } else {
-        // `Y` is the matrix CKTop's last NIiter load left factored (its
-        // load at CKTrhsOld), as for `.tf`; the devices are reloaded at that
-        // iterate and `delta_Y` multiplies its solve, CKTrhs.
-        let history = circuit.state_history();
-        let trial = history
-            .trial_in(IterationPhase::Float, Some(&solved.trial))?
-            .with_device_limiting(settings.newton.limiting.is_device())
-            .with_c_jacobian(true);
-        let mut jacobian = SparseMatrix::new(n, n);
-        circuit.load(
-            &LoadRequest {
-                mode: AnalysisMode::OperatingPoint,
-                solution: &solved.values,
-                model_context: &model,
-                integration: None,
-                history: &history,
-                forcing: None,
-            },
-            &mut jacobian,
-            &mut Vector::zeros(n),
-            &mut trial.clone(),
-        )?;
-        let pattern = circuit
-            .matrix_pattern()
-            .ok_or_else(|| SpiceError::Numerical {
-                context: ".sens".to_owned(),
-                message: "the operating point left no factored circuit matrix".to_owned(),
-            })?;
-        let at = DcState {
-            pattern,
-            blocks: blocks(&jacobian),
-            load_point: solved.values.clone(),
-            solution: solved
-                .next
-                .as_slice()
-                .iter()
-                .map(|&v| Complex::real(v))
-                .collect(),
-            model,
-            history,
-            trial,
-            circuit,
+        for (slot, member) in self.members.iter().enumerate() {
+            let (model, instance) = self.records.pair(member, slot);
+            member.sensitivity.setup(model, instance)?;
+            mirror(&self.couplings, &mut self.records, slot)?;
+            let (model, instance) = self.records.pair(member, slot);
+            member.sensitivity.temperature(model, instance)?;
+        }
+        Ok(self.records.clone())
+    }
+}
+
+/// The state reset for an AC frequency: the load point and state vectors are
+/// zero, while the preceding analysis's surviving fields belong to `earlier`.
+struct AcSweep<'a> {
+    earlier: &'a EarlierAcState,
+    bias: &'a Vector,
+    model: crate::devices::ModelContext,
+    zeros: Vector,
+    state: Vec<Real>,
+}
+
+impl AcSweep<'_> {
+    fn load(
+        &self,
+        circuit: &Circuit,
+        member: &Member<'_>,
+        reset: RecordPair<'_>,
+        setup: RecordPair<'_>,
+        current: RecordPair<'_>,
+        omega: Real,
+    ) -> SpiceResult<SensitivityLoad> {
+        member.sensitivity.reset_ac_load(
+            setup,
+            self.earlier
+                .reset(circuit, member, reset, omega, self.bias)?,
+            current,
+        )
+    }
+
+    fn assemble(
+        &self,
+        walk: &ParameterWalk<'_>,
+        reset: &Records,
+        omega: Real,
+    ) -> SpiceResult<LinearSystem> {
+        let mut system = LinearSystem::new(walk.circuit.unknown_count());
+        system.a.set_pivot_tolerances(self.model.pivot);
+        for (slot, member) in walk.members.iter().enumerate() {
+            let pair = reset.view(member, slot);
+            let load = self.load(walk.circuit, member, pair, pair, pair, omega)?;
+            walk.circuit.assemble_small_signal_device(
+                member.index,
+                stand_in(walk.circuit, member.index, &load),
+                &self.model,
+                &self.zeros,
+                Some(&self.state),
+                &mut system,
+            )?;
+        }
+        Ok(system)
+    }
+}
+
+fn run_ac(
+    walk: &mut ParameterWalk<'_>,
+    earlier: &EarlierAcState,
+    bias: &Vector,
+    model: crate::devices::ModelContext,
+    probe: Probe,
+    grid: Vec<Real>,
+    plot: &mut Plot,
+) -> SpiceResult<()> {
+    let circuit = walk.circuit;
+    let sweep = AcSweep {
+        earlier,
+        bias,
+        model,
+        zeros: Vector::zeros(circuit.unknown_count()),
+        state: vec![0.; circuit.state_history().len()],
+    };
+    for frequency in grid {
+        let omega = 2. * std::f64::consts::PI * frequency;
+        let reset = walk.reset_ac()?;
+        let system = sweep.assemble(walk, &reset, omega)?;
+        // A device whose present records C loads into a non-finite
+        // matrix (BSIM4's TNOM drifting by 273.15 K per frequency, see
+        // `cktsens.c` and `b4mask.c`) poisons NIacIter's solve: every
+        // unknown of a block holding such an entry is NaN, so is every
+        // column read from it, and the walk still perturbs and restores
+        // each parameter. A poisoned block the output does not read
+        // would leave C's other blocks finite; that is refused.
+        let poisoned = poisoned_rows(&system, omega);
+        let probe_poisoned = probe.rows().any(|row| poisoned.contains(&row));
+        if !poisoned.is_empty() && !probe_poisoned {
+            return Err(SpiceError::not_yet_ported(
+                format!(
+                    ".sens ac at {frequency:e} Hz: a non-finite device load in a block \
+                     the output does not read"
+                ),
+                "src/spicelib/analysis/cktsens.c (NIacIter on a partly non-finite matrix)",
+            ));
+        }
+        let at = if probe_poisoned {
+            None
+        } else {
+            Some(ac_state(
+                circuit,
+                &system,
+                omega,
+                model,
+                &sweep.zeros,
+                &sweep.state,
+            )?)
         };
-        let mut point = Vec::new();
-        sweep_parameters(
-            &members,
-            &mut records,
-            &entries,
-            &couplings,
-            |slot, setup, current| {
-                members[slot]
-                    .sensitivity
-                    .load(setup, current, SensitivityMode::Dc)
+        let mut point = Vec::with_capacity(plot.variables.len());
+        point.push(Complex::real(frequency));
+        walk.sweep(
+            |slot, member, setup, current| {
+                sweep.load(
+                    circuit,
+                    member,
+                    reset.view(member, slot),
+                    setup,
+                    current,
+                    omega,
+                )
             },
-            |index, elements, base, perturbed, delta| {
-                numbering.translate(setup_elements(circuit, index, elements)?);
-                let dx = at.delta(&mut numbering, index, base, perturbed)?;
-                point.push(Complex::real(probe.read(&dx, 0.) / delta));
+            |numbering, index, base, perturbed, delta| {
+                let Some(at) = &at else {
+                    point.push(Complex::new(Real::NAN, Real::NAN));
+                    return Ok(());
+                };
+                let dx = at.delta(numbering, index, base, perturbed)?;
+                let value = probe.read(&dx, Complex::ZERO);
+                point.push(Complex::new(value.re / delta, value.im / delta));
                 Ok(())
             },
         )?;
         plot.push_point(point)?;
     }
-    Ok(plot)
+    Ok(())
+}
+
+fn run_dc(
+    walk: &mut ParameterWalk<'_>,
+    solved: crate::analysis::newton::NewtonSolution<TrialState>,
+    model: crate::devices::ModelContext,
+    device_limiting: bool,
+    probe: Probe,
+    plot: &mut Plot,
+) -> SpiceResult<()> {
+    let circuit = walk.circuit;
+    let n = circuit.unknown_count();
+    // `Y` is the matrix CKTop's last NIiter load left factored (its
+    // load at CKTrhsOld), as for `.tf`; the devices are reloaded at that
+    // iterate and `delta_Y` multiplies its solve, CKTrhs.
+    let history = circuit.state_history();
+    let trial = history
+        .trial_in(IterationPhase::Float, Some(&solved.trial))?
+        .with_device_limiting(device_limiting)
+        .with_c_jacobian(true);
+    let mut jacobian = SparseMatrix::new(n, n);
+    circuit.load(
+        &LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &solved.values,
+            model_context: &model,
+            integration: None,
+            history: &history,
+            forcing: None,
+        },
+        &mut jacobian,
+        &mut Vector::zeros(n),
+        &mut trial.clone(),
+    )?;
+    let pattern = circuit
+        .matrix_pattern()
+        .ok_or_else(|| SpiceError::Numerical {
+            context: ".sens".to_owned(),
+            message: "the operating point left no factored circuit matrix".to_owned(),
+        })?;
+    let at = DcState {
+        pattern,
+        blocks: blocks(&jacobian),
+        load_point: solved.values,
+        solution: solved
+            .next
+            .as_slice()
+            .iter()
+            .map(|&v| Complex::real(v))
+            .collect(),
+        model,
+        history,
+        trial,
+        circuit,
+    };
+    let mut point = Vec::with_capacity(plot.variables.len());
+    walk.sweep(
+        |_, member, setup, current| member.sensitivity.load(setup, current, SensitivityMode::Dc),
+        |numbering, index, base, perturbed, delta| {
+            let dx = at.delta(numbering, index, base, perturbed)?;
+            point.push(Complex::real(probe.read(dx.as_slice(), 0.) / delta));
+            Ok(())
+        },
+    )?;
+    plot.push_point(point)?;
+    Ok(())
 }
 
 /// The elements a member's `DEVsetup` makes on `delta_Y`: its own list for
@@ -1382,88 +1454,90 @@ fn setup_elements(
     )
 }
 
-/// The per-parameter loop of `sens_sens()`: setup, base load, perturbation,
-/// perturbed load and restoration, on the live records; `load` is the
-/// analysis's device load of a member's records as setup left them and as
-/// they are, and `measure` turns a pair of loads into the output column.
-fn sweep_parameters(
-    members: &[Member<'_>],
-    records: &mut Records,
-    entries: &[Entry],
-    couplings: &[Option<Coupling>],
-    load: impl Fn(usize, RecordPair<'_>, RecordPair<'_>) -> SpiceResult<SensitivityLoad>,
-    mut measure: impl FnMut(
-        usize,
-        Option<Vec<(NodeId, NodeId)>>,
-        &SensitivityLoad,
-        &SensitivityLoad,
-        Real,
-    ) -> SpiceResult<()>,
-) -> SpiceResult<()> {
-    // A device that refuses `.sens` outright keeps its own error class; only a
-    // numerical failure is labelled with the parameter that caused it.
-    fn labelled(error: SpiceError, label: &str, what: &str) -> SpiceError {
-        match error {
-            error @ (SpiceError::NotYetPorted { .. } | SpiceError::Unsupported { .. }) => error,
-            error => SpiceError::Numerical {
-                context: format!(".sens {label}: {error}"),
-                message: what.to_owned(),
-            },
+impl ParameterWalk<'_> {
+    /// C sens_sens parameter lifecycle. The callback sees an already numbered
+    /// perturbation and the two device loads, independent of DC/AC assembly.
+    fn sweep(
+        &mut self,
+        load: impl Fn(
+            usize,
+            &Member<'_>,
+            RecordPair<'_>,
+            RecordPair<'_>,
+        ) -> SpiceResult<SensitivityLoad>,
+        mut measure: impl FnMut(
+            &mut DeltaNumbering,
+            usize,
+            &SensitivityLoad,
+            &SensitivityLoad,
+            Real,
+        ) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        // A device that refuses `.sens` outright keeps its own error class; only a
+        // numerical failure is labelled with the parameter that caused it.
+        fn labelled(error: SpiceError, label: &str, what: &str) -> SpiceError {
+            match error {
+                error @ (SpiceError::NotYetPorted { .. } | SpiceError::Unsupported { .. }) => error,
+                error => SpiceError::Numerical {
+                    context: format!(".sens {label}: {error}"),
+                    message: what.to_owned(),
+                },
+            }
         }
-    }
-    for entry in entries {
-        if entry.name.is_none() {
-            continue;
-        }
-        let member = &members[entry.member];
-        let device = &member.sensitivity;
-        mirror(couplings, records, entry.member)?;
-        let (model, instance) = records.pair(member, entry.member);
-        // `sgen_next()` asks the value before this parameter's DEVsetup.
-        let value = device.ask(entry.scope, entry.keyword, RecordPair { model, instance })?;
-        device.setup(model, instance)?;
-        device.temperature(model, instance)?;
-        let snapshot = (model.clone(), instance.clone());
-        let setup = RecordPair {
-            model: &snapshot.0,
-            instance: &snapshot.1,
-        };
-        let elements = device.setup_elements(setup);
-        let label = entry
-            .name
-            .clone()
-            .unwrap_or_else(|| entry.keyword.to_owned());
-        // A device whose perturbed state C loads without complaint but the
-        // port refuses (a strict range check) has to name the parameter:
-        // `.sens` is C's walk over dozens of them.
-        let base = load(entry.member, setup, setup)
-            .map_err(|error| labelled(error, &label, "the base load failed"))?;
-        let delta = if value == 0. {
-            ABSOLUTE_DELTA
-        } else {
-            value * RELATIVE_DELTA
-        };
-        device.set(entry.scope, entry.keyword, value + delta, model, instance)?;
-        device.temperature(model, instance)?;
-        let perturbed = load(
-            entry.member,
-            setup,
-            RecordPair {
-                model: &*model,
-                instance: &*instance,
-            },
-        )
-        .map_err(|error| labelled(error, &label, "the perturbed load failed"))?;
-        measure(member.index, elements, &base, &perturbed, delta).map_err(|error| {
-            SpiceError::Numerical {
+        for entry in &self.entries {
+            let Some(label) = entry.name.as_deref() else {
+                continue;
+            };
+            let member = &self.members[entry.member];
+            let device = &member.sensitivity;
+            mirror(&self.couplings, &mut self.records, entry.member)?;
+            let (model, instance) = self.records.pair(member, entry.member);
+            // `sgen_next()` asks the value before this parameter's DEVsetup.
+            let value = device.ask(entry.scope, entry.keyword, RecordPair { model, instance })?;
+            device.setup(model, instance)?;
+            device.temperature(model, instance)?;
+            let snapshot = (model.clone(), instance.clone());
+            let setup = RecordPair {
+                model: &snapshot.0,
+                instance: &snapshot.1,
+            };
+            let elements = device.setup_elements(setup);
+            // A device whose perturbed state C loads without complaint but the
+            // port refuses (a strict range check) has to name the parameter:
+            // `.sens` is C's walk over dozens of them.
+            let base = load(entry.member, member, setup, setup)
+                .map_err(|error| labelled(error, label, "the base load failed"))?;
+            let delta = if value == 0. {
+                ABSOLUTE_DELTA
+            } else {
+                value * RELATIVE_DELTA
+            };
+            device.set(entry.scope, entry.keyword, value + delta, model, instance)?;
+            device.temperature(model, instance)?;
+            let perturbed = load(
+                entry.member,
+                member,
+                setup,
+                RecordPair {
+                    model: &*model,
+                    instance: &*instance,
+                },
+            )
+            .map_err(|error| labelled(error, label, "the perturbed load failed"))?;
+            let measured = (|| {
+                self.numbering
+                    .translate(setup_elements(self.circuit, member.index, elements)?);
+                measure(&mut self.numbering, member.index, &base, &perturbed, delta)
+            })();
+            measured.map_err(|error| SpiceError::Numerical {
                 context: format!(".sens {label}: {error}"),
                 message: "the perturbed load could not be evaluated".to_owned(),
-            }
-        })?;
-        device.set(entry.scope, entry.keyword, value, model, instance)?;
-        device.temperature(model, instance)?;
+            })?;
+            device.set(entry.scope, entry.keyword, value, model, instance)?;
+            device.temperature(model, instance)?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1472,6 +1546,29 @@ mod tests {
 
     fn tokens(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn perturbation_products_follow_internal_column_order_and_clear_workspace() {
+        use super::{DeltaNumbering, accumulate};
+        use crate::primitives::Complex;
+
+        let mut numbering = DeltaNumbering::new(3);
+        numbering.translate([(2, 2), (0, 0), (1, 1)]);
+        let elements = accumulate(
+            [],
+            [
+                (0, 0, Complex::real(-1e16)),
+                (0, 1, Complex::real(1.)),
+                (0, 2, Complex::real(1e16)),
+            ],
+        );
+        let x = [Complex::real(1.); 3];
+        let mut result = [Complex::ZERO; 3];
+        numbering.visit_products(elements, &x, |row, sum| result[row] = sum);
+        assert_eq!(result, [Complex::real(1.), Complex::ZERO, Complex::ZERO]);
+        numbering.visit_products(accumulate([], []), &x, |row, sum| result[row] = sum);
+        assert_eq!(result, [Complex::ZERO; 3]);
     }
 
     #[test]

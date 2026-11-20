@@ -37,6 +37,7 @@
 //! 1)` (so it measures `pts + 2` frequencies) while `f <= fstop +
 //! delta*reltol`.
 
+use crate::analysis::frequency::{Advance, FrequencyGrid};
 use crate::analysis::linear::{number, plot, unsupported};
 use crate::analysis::results::Plot;
 use crate::analysis::{AnalysisContext, AnalysisRequest};
@@ -50,8 +51,6 @@ use crate::primitives::{Complex, Real, SpiceError, SpiceResult, parse_spice_numb
 /// C's default `CKTreltol`, the frequency-loop tolerance without `.option
 /// reltol`.
 const DEFAULT_RELTOL: Real = 1e-3;
-/// The port's bound on the number of frequency points.
-const MAX_POINTS: usize = 100_000;
 /// The harmonic plot titles (`distoan.c`).
 pub const HARMONIC_PLOTNAMES: [&str; 2] =
     ["DISTORTION - 2nd harmonic", "DISTORTION - 3rd harmonic"];
@@ -177,31 +176,13 @@ fn frequencies(card: &DistoCard, reltol: Real) -> SpiceResult<Vec<Real>> {
             (delta, delta * reltol)
         }
     };
-    let mut grid = Vec::new();
-    let mut freq = card.start;
-    while freq <= card.stop + tolerance {
-        if grid.len() >= MAX_POINTS {
-            return Err(unsupported(format!(
-                ".disto frequency loop exceeded {MAX_POINTS} points"
-            )));
-        }
-        grid.push(freq);
-        match card.stepping {
-            Stepping::Decade | Stepping::Octave => {
-                freq *= delta;
-                if delta == 1. {
-                    break;
-                }
-            }
-            Stepping::Linear => {
-                freq += delta;
-                if delta == 0. {
-                    break;
-                }
-            }
-        }
-    }
-    Ok(grid)
+    let advance = match card.stepping {
+        Stepping::Decade | Stepping::Octave if delta == 1. => Advance::Single,
+        Stepping::Decade | Stepping::Octave => Advance::Multiply(delta),
+        Stepping::Linear if delta == 0. => Advance::Single,
+        Stepping::Linear => Advance::Add(delta),
+    };
+    FrequencyGrid::new(card.start, card.stop, tolerance, advance, ".disto")?.collect()
 }
 
 /// `NIdIter`: solves `(A + j omega E) x = rhs` on the circuit's matrix at
@@ -301,6 +282,7 @@ pub(crate) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &AnalysisContext,
+    include_bias: bool,
 ) -> SpiceResult<Vec<Plot>> {
     let settings = crate::analysis::bias::DcSettings::from_request(request)?;
     let reltol = match request.named("rtol") {
@@ -311,6 +293,7 @@ pub(crate) fn run(
     let card = parse(request)?;
     let grid = frequencies(&card, reltol)?;
     let small = crate::analysis::ac::SmallSignal::prepare(circuit, request, context, settings)?;
+    let mut retained = small.retained_bias(circuit, request, context, include_bias)?;
     if small.varies() {
         return Err(unsupported(
             ".disto of a circuit with a `hertz`-dependent device (distoan.c linearizes once, \
@@ -427,7 +410,8 @@ pub(crate) fn run(
             message: "nonfinite distortion response".into(),
         });
     }
-    Ok(plots)
+    retained.extend(plots);
+    Ok(retained)
 }
 
 #[cfg(test)]
