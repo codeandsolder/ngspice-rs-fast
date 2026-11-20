@@ -80,7 +80,7 @@ pub(super) fn run(
         let value = parse_spice_number(flag)
             .filter(|v| v.is_finite())
             .ok_or_else(|| unsupported(format!(".sp donoise must be an integer, found {flag}")))?;
-        (value + 0.5).floor() == 1.
+        (1. ..2.).contains(&(value + 0.5))
     } else {
         false
     };
@@ -92,38 +92,7 @@ pub(super) fn run(
     let mut plots = small_signal.retained_bias(circuit, request, context, include_bias)?;
     reject_imaginary_current_excitation(small_signal.system())?;
     let n = circuit.unknown_count();
-    let mut plot = plot(
-        circuit,
-        "sp1",
-        "SP Analysis",
-        Some(("frequency", "frequency")),
-        true,
-    )?;
-    for (prefix, unit) in [("S", "s-param"), ("Y", "admittance"), ("Z", "impedance")] {
-        for i in 1..=ports.len() {
-            for j in 1..=ports.len() {
-                plot.push_variable(Variable::complex(format!("{prefix}_{i}_{j}"), unit));
-            }
-        }
-    }
-    plot.push_variable(Variable::complex("v(Rbase)", "voltage"));
-    if donoise {
-        for i in 1..=ports.len() {
-            for j in 1..=ports.len() {
-                plot.push_variable(Variable::complex(format!("i(Cy_{i}_{j})"), "current"));
-            }
-        }
-        if ports.len() == 2 {
-            for (name, unit) in [
-                ("NF", "decibel"),
-                ("SOpt", "notype"),
-                ("NFmin", "decibel"),
-                ("Rn", "impedance"),
-            ] {
-                plot.push_variable(Variable::complex(name, unit));
-            }
-        }
-    }
+    let mut plot = parameter_plot(circuit, ports.len(), donoise)?;
     let reference = ports[0].z0;
     for f in grid {
         let (last, matrices, factor) =
@@ -186,6 +155,43 @@ pub(super) fn run(
     }
     plots.push(plot);
     Ok(plots)
+}
+
+/// Schema in the same order as the per-frequency point assembly.
+fn parameter_plot(circuit: &Circuit, port_count: usize, donoise: bool) -> SpiceResult<Plot> {
+    let mut plot = plot(
+        circuit,
+        "sp1",
+        "SP Analysis",
+        Some(("frequency", "frequency")),
+        true,
+    )?;
+    for (prefix, unit) in [("S", "s-param"), ("Y", "admittance"), ("Z", "impedance")] {
+        for i in 1..=port_count {
+            for j in 1..=port_count {
+                plot.push_variable(Variable::complex(format!("{prefix}_{i}_{j}"), unit));
+            }
+        }
+    }
+    plot.push_variable(Variable::complex("v(Rbase)", "voltage"));
+    if donoise {
+        for i in 1..=port_count {
+            for j in 1..=port_count {
+                plot.push_variable(Variable::complex(format!("i(Cy_{i}_{j})"), "current"));
+            }
+        }
+        if port_count == 2 {
+            for (name, unit) in [
+                ("NF", "decibel"),
+                ("SOpt", "notype"),
+                ("NFmin", "decibel"),
+                ("Rn", "impedance"),
+            ] {
+                plot.push_variable(Variable::complex(name, unit));
+            }
+        }
+    }
+    Ok(plot)
 }
 
 /// The circuit's RF ports in port-number order, bound to their rows.
@@ -390,13 +396,16 @@ fn noise_parameters(
             c22.re = 1e-30;
         }
         let ycor = y11 - (get(0, 1) / c22) * y21;
-        let gu = get(0, 0).re - rn * (y11 - ycor).magnitude().powi(2);
+        let correlated_power = rn * (y11 - ycor).magnitude().powi(2);
+        let gu = get(0, 0).re - correlated_power;
         let ycor_re_squared = ycor.re * ycor.re;
         let ys = Complex::new((ycor_re_squared + gu / rn).max(0.).sqrt(), -ycor.im);
         let y0 = Complex::real(1. / ports[0].z0);
         let sopt = (y0 - ys) / (y0 + ys);
-        let fmin = 1. + 2. * rn * (ycor.re + ys.re);
-        let nf = fmin + rn / y0.re * (y0 - ys).magnitude().powi(2);
+        let excess_noise = 2. * rn * (ycor.re + ys.re);
+        let fmin = 1. + excess_noise;
+        let mismatch_noise = rn / y0.re * (y0 - ys).magnitude().powi(2);
+        let nf = fmin + mismatch_noise;
         result.extend([
             Complex::real(10. * nf.log10()),
             sopt,

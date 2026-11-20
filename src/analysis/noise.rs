@@ -724,6 +724,30 @@ fn integrated_plot(
     Ok(integrated)
 }
 
+fn refresh_generators(generators: &mut [Generators], fresh: Vec<InstanceNoise>) -> SpiceResult<()> {
+    if fresh.len() != generators.len() {
+        return Err(SpiceError::circuit(
+            "noise generators changed between frequencies",
+        ));
+    }
+    for (generator, instance) in generators.iter_mut().zip(fresh) {
+        generator.refresh(instance)?;
+    }
+    Ok(())
+}
+
+/// Unit differential excitation for the transposed small-signal solve.
+fn output_excitation(circuit: &Circuit, output: [NodeId; 2]) -> Vec<Complex> {
+    let mut adjoint_rhs = vec![Complex::ZERO; circuit.unknown_count()];
+    if let Some(row) = circuit.unknowns().node_row(output[0]) {
+        adjoint_rhs[row] = Complex::real(1.);
+    }
+    if let Some(row) = circuit.unknowns().node_row(output[1]) {
+        adjoint_rhs[row] = Complex::real(-1.);
+    }
+    adjoint_rhs
+}
+
 /// Runs `.noise` and returns its plots: the spectrum and, unless the sweep is
 /// a single frequency, the integrated noise.
 pub(crate) fn run(
@@ -768,13 +792,7 @@ pub(crate) fn run(
         spectrum.push_variable(variable);
     }
     let output = [card.positive, card.negative];
-    let mut adjoint_rhs = vec![Complex::ZERO; circuit.unknown_count()];
-    if let Some(row) = circuit.unknowns().node_row(card.positive) {
-        adjoint_rhs[row] = Complex::real(1.);
-    }
-    if let Some(row) = circuit.unknowns().node_row(card.negative) {
-        adjoint_rhs[row] = Complex::real(-1.);
-    }
+    let adjoint_rhs = output_excitation(circuit, output);
 
     let frequencies = frequency_grid(&card, reltol)?;
     let mut integrated_power = Power::default();
@@ -795,16 +813,15 @@ pub(crate) fn run(
         // describes its generators at that frequency (`b4noi.c` evaluates
         // its flicker factor and correlated gate noise at `data->freq`).
         if small.varies() || small.reassembles() {
-            let local = model.with_frequency(freq);
-            let fresh = circuit_noise(circuit, &local, small.bias(), Some(small.state()))?;
-            if fresh.len() != generators.len() {
-                return Err(SpiceError::circuit(
-                    "noise generators changed between frequencies",
-                ));
-            }
-            for (g, instance) in generators.iter_mut().zip(fresh) {
-                g.refresh(instance)?;
-            }
+            refresh_generators(
+                &mut generators,
+                circuit_noise(
+                    circuit,
+                    &model.with_frequency(freq),
+                    small.bias(),
+                    Some(small.state()),
+                )?,
+            )?;
         }
         let gain_sq_inv = 1. / gain(circuit, &forward, output).max(N_MINGAIN);
         let sample = NoiseSample::new(freq, last, gain_sq_inv, card.start, card.summary != 0);

@@ -16,7 +16,8 @@ use crate::maths::Vector;
 use crate::primitives::{AnalysisKind, Complex, Real, SpiceError, SpiceResult};
 
 /// Largest number of grid points, per axis and as a Cartesian product.
-pub const MAX_SWEEP_POINTS: usize = 100_000;
+pub const MAX_SWEEP_POINTS: usize = MAX_SWEEP_POINTS_U32 as usize;
+const MAX_SWEEP_POINTS_U32: u32 = 100_000;
 /// Relative slack, in steps, within which a grid is taken to reach its stop
 /// (`0..0.3 by 0.1` is `2.9999999999999996` steps in binary floating point).
 const ENDPOINT_TOLERANCE: Real = 32. * Real::EPSILON;
@@ -161,18 +162,20 @@ impl SweepSpec {
             return Err(unsupported("DC sweep step points away from its stop"));
         }
         let slack = ENDPOINT_TOLERANCE * ratio.max(1.);
-        let steps = (ratio + slack).floor();
-        if steps + 1. > MAX_SWEEP_POINTS as Real {
+        let interval_count = (ratio + slack).floor();
+        if interval_count + 1. > Real::from(MAX_SWEEP_POINTS_U32) {
             return Err(unsupported("DC sweep point limit exceeded"));
         }
-        let steps = crate::primitives::exact_nonnegative_integer::<usize>(steps)
+        let intervals = crate::primitives::exact_nonnegative_integer::<u32>(interval_count)
             .ok_or_else(|| unsupported("DC sweep point limit exceeded"))?;
-        let snap_stop = steps > 0 && (ratio - steps as Real).abs() <= slack;
-        let values = (0..steps + 1).map(move |i| {
-            if snap_stop && i == steps {
+        let snap_stop = intervals > 0 && (ratio - Real::from(intervals)).abs() <= slack;
+        let point_count = intervals + 1;
+        let values = (0..point_count).map(move |i| {
+            if snap_stop && i == intervals {
                 stop
             } else {
-                start + (i as Real) * step
+                let offset = Real::from(i) * step;
+                start + offset
             }
         });
         let mut previous = None;
@@ -307,6 +310,79 @@ impl<'a> Written<'a> {
     }
 }
 
+fn resolve_target(circuit: &Circuit, written: Written<'_>) -> SpiceResult<SweepTarget> {
+    let source = |name: &str| {
+        circuit.device(name).and_then(|device| {
+            device
+                .input_source()
+                .map(|source| (device.name(), source.kind))
+        })
+    };
+    let instance_name = |index: usize| circuit.devices()[index].name().to_owned();
+    let parameter = |instance: String, parameter: &str, route| SweepTarget::InstanceParameter {
+        name: format!("@{instance}[{parameter}]"),
+        instance,
+        parameter: parameter.to_owned(),
+        route,
+    };
+    Ok(match written {
+        Written::Temperature => SweepTarget::Temperature,
+        Written::Name(name) => {
+            if let Some((name, kind)) = source(name) {
+                match kind {
+                    crate::devices::SourceKind::Voltage => {
+                        SweepTarget::VoltageSource(name.to_owned())
+                    }
+                    crate::devices::SourceKind::Current => {
+                        SweepTarget::CurrentSource(name.to_owned())
+                    }
+                }
+            } else if let Some((index, _)) = circuit.resistor(name) {
+                SweepTarget::Resistor(instance_name(index))
+            } else {
+                return Err(unsupported(format!(
+                    "DC sweep supports independent V/I sources, resistors, temp and \
+                         @instance[parameter] only; unsupported target {name}"
+                )));
+            }
+        }
+        Written::Resistance(name) => {
+            let (index, _) = circuit
+                .resistor(name)
+                .ok_or_else(|| SpiceError::circuit("resolved DC resistor disappeared"))?;
+            parameter(instance_name(index), "r", ParameterRoute::Resistor)
+        }
+        Written::Device(name, canonical) => {
+            let (index, _) = circuit.instance_parameter(name, canonical)?;
+            parameter(instance_name(index), canonical, ParameterRoute::Device)
+        }
+        Written::Other(name, keyword) => {
+            let keyword = keyword.to_ascii_lowercase();
+            match source(name) {
+                // vsrc.c/isrc.c: `dc` (isrc alias `c`) is the DC value
+                // that `.dc v1` sweeps.
+                Some((name, kind))
+                    if keyword == "dc"
+                        || (keyword == "c" && kind == crate::devices::SourceKind::Current) =>
+                {
+                    let route = match kind {
+                        crate::devices::SourceKind::Voltage => ParameterRoute::VoltageSource,
+                        crate::devices::SourceKind::Current => ParameterRoute::CurrentSource,
+                    };
+                    parameter(name.to_owned(), "dc", route)
+                }
+                // Explicit NotYetPorted/Unsupported with the C reference.
+                _ => {
+                    circuit.instance_parameter(name, &keyword)?;
+                    return Err(SpiceError::circuit(format!(
+                        "DC sweep target @{name}[{keyword}] could not be resolved"
+                    )));
+                }
+            }
+        }
+    })
+}
+
 /// Resolve one or two DC sweep axes against circuit devices and parameters.
 ///
 /// Parse and resolve one/two axes against actual independent sources,
@@ -349,79 +425,10 @@ pub fn resolve(
         }
         written.push(target);
     }
-    let source = |name: &str| {
-        circuit.device(name).and_then(|device| {
-            device
-                .input_source()
-                .map(|source| (device.name(), source.kind))
-        })
-    };
-    let instance_name = |index: usize| circuit.devices()[index].name().to_owned();
-    let parameter = |instance: String, parameter: &str, route| SweepTarget::InstanceParameter {
-        name: format!("@{instance}[{parameter}]"),
-        instance,
-        parameter: parameter.to_owned(),
-        route,
-    };
     let mut axes = vec![];
     let mut work = 1usize;
     for (axis, written) in args.as_chunks::<4>().0.iter().zip(written) {
-        let target = match written {
-            Written::Temperature => SweepTarget::Temperature,
-            Written::Name(name) => {
-                if let Some((name, kind)) = source(name) {
-                    match kind {
-                        crate::devices::SourceKind::Voltage => {
-                            SweepTarget::VoltageSource(name.to_owned())
-                        }
-                        crate::devices::SourceKind::Current => {
-                            SweepTarget::CurrentSource(name.to_owned())
-                        }
-                    }
-                } else if let Some((index, _)) = circuit.resistor(name) {
-                    SweepTarget::Resistor(instance_name(index))
-                } else {
-                    return Err(unsupported(format!(
-                        "DC sweep supports independent V/I sources, resistors, temp and \
-                         @instance[parameter] only; unsupported target {name}"
-                    )));
-                }
-            }
-            Written::Resistance(name) => {
-                let (index, _) = circuit
-                    .resistor(name)
-                    .ok_or_else(|| SpiceError::circuit("resolved DC resistor disappeared"))?;
-                parameter(instance_name(index), "r", ParameterRoute::Resistor)
-            }
-            Written::Device(name, canonical) => {
-                let (index, _) = circuit.instance_parameter(name, canonical)?;
-                parameter(instance_name(index), canonical, ParameterRoute::Device)
-            }
-            Written::Other(name, keyword) => {
-                let keyword = keyword.to_ascii_lowercase();
-                match source(name) {
-                    // vsrc.c/isrc.c: `dc` (isrc alias `c`) is the DC value
-                    // that `.dc v1` sweeps.
-                    Some((name, kind))
-                        if keyword == "dc"
-                            || (keyword == "c" && kind == crate::devices::SourceKind::Current) =>
-                    {
-                        let route = match kind {
-                            crate::devices::SourceKind::Voltage => ParameterRoute::VoltageSource,
-                            crate::devices::SourceKind::Current => ParameterRoute::CurrentSource,
-                        };
-                        parameter(name.to_owned(), "dc", route)
-                    }
-                    // Explicit NotYetPorted/Unsupported with the C reference.
-                    _ => {
-                        circuit.instance_parameter(name, &keyword)?;
-                        return Err(SpiceError::circuit(format!(
-                            "DC sweep target @{name}[{keyword}] could not be resolved"
-                        )));
-                    }
-                }
-            }
-        };
+        let target = resolve_target(circuit, written)?;
         let spec = SweepSpec {
             target,
             start: number(Some(axis[1]), "sweep start")?,
@@ -579,14 +586,14 @@ fn preflight(
     }
     let model = context.model_context();
     for (axis, grid) in axes.iter().zip(grids) {
-        let name = match &axis.target {
-            SweepTarget::Resistor(name)
-            | SweepTarget::InstanceParameter {
-                instance: name,
-                route: ParameterRoute::Resistor,
-                ..
-            } => name,
-            _ => continue,
+        let (SweepTarget::Resistor(name)
+        | SweepTarget::InstanceParameter {
+            instance: name,
+            route: ParameterRoute::Resistor,
+            ..
+        }) = &axis.target
+        else {
+            continue;
         };
         for value in grid {
             let target = circuit.resistor_override(name, *value)?;
@@ -639,6 +646,53 @@ fn sweep_settings(
     ))
 }
 
+fn warm_start_settings(
+    point_iterations: Option<usize>,
+    settings: &crate::analysis::bias::DcSettings,
+) -> Option<crate::analysis::bias::DcSettings> {
+    // dctrcurv.c always warm-starts every point after the first with
+    // `NIiter(CKTdcTrcvMaxIter)` (C's effective default 100) before falling
+    // back to a fresh `CKTop`; the port's legacy ladder schedule instead runs
+    // one full solve per point unless `itl2` is given.
+    let point_iterations = point_iterations.or(match settings.continuation.schedule {
+        crate::analysis::bias::ContinuationSchedule::Ngspice(_) => {
+            Some(crate::analysis::config::C_DEFAULT_ITL2_EFFECTIVE)
+        }
+        crate::analysis::bias::ContinuationSchedule::Ladder => None,
+    });
+    // The direct warm-start policy is invariant across sweep points. Build it
+    // once; only the previous accepted solution and model overrides change.
+    point_iterations.map(|limit| crate::analysis::bias::DcSettings {
+        newton: crate::analysis::newton::NewtonOptions {
+            max_iterations: limit,
+            ..settings.newton
+        },
+        continuation: crate::analysis::bias::ContinuationPolicy::disabled(),
+    })
+}
+
+fn prepare_grids(
+    circuit: &Circuit,
+    axes: &[SweepSpec],
+    context: &AnalysisContext,
+) -> SpiceResult<Vec<Vec<Real>>> {
+    // The values `dctrcurv.c` visits (`value += step`, C's absolute stop
+    // test), not `start + i step`: the last bits reach every device and the
+    // output scale.
+    let grids = axes
+        .iter()
+        .map(SweepSpec::accumulated_grid)
+        .collect::<SpiceResult<Vec<_>>>()?;
+    // C's absolute stop test can add one point per axis to the checked budget.
+    grids
+        .iter()
+        .try_fold(1usize, |work, grid| work.checked_mul(grid.len()))
+        .filter(|n| *n <= MAX_SWEEP_POINTS)
+        .ok_or_else(|| unsupported("nested DC sweep point limit exceeded"))?;
+    preflight(circuit, axes, &grids, context)?;
+    Ok(grids)
+}
+
 pub(crate) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
@@ -656,39 +710,8 @@ pub(crate) fn run(
     };
     let axes = resolve(circuit, request, context)?;
     let (point_iterations, settings) = sweep_settings(request)?;
-    // dctrcurv.c always warm-starts every point after the first with
-    // `NIiter(CKTdcTrcvMaxIter)` (C's effective default 100) before falling
-    // back to a fresh `CKTop`; the port's legacy ladder schedule instead runs
-    // one full solve per point unless `itl2` is given.
-    let point_iterations = point_iterations.or(match settings.continuation.schedule {
-        crate::analysis::bias::ContinuationSchedule::Ngspice(_) => {
-            Some(crate::analysis::config::C_DEFAULT_ITL2_EFFECTIVE)
-        }
-        crate::analysis::bias::ContinuationSchedule::Ladder => None,
-    });
-    // The direct warm-start policy is invariant across sweep points. Build it
-    // once; only the previous accepted solution and model overrides change.
-    let warm_settings = point_iterations.map(|limit| crate::analysis::bias::DcSettings {
-        newton: crate::analysis::newton::NewtonOptions {
-            max_iterations: limit,
-            ..settings.newton
-        },
-        continuation: crate::analysis::bias::ContinuationPolicy::disabled(),
-    });
-    // The values `dctrcurv.c` visits (`value += step`, C's absolute stop
-    // test), not `start + i step`: the last bits reach every device and the
-    // output scale.
-    let grids = axes
-        .iter()
-        .map(SweepSpec::accumulated_grid)
-        .collect::<SpiceResult<Vec<_>>>()?;
-    // C's absolute stop test can add one point per axis to the checked budget.
-    grids
-        .iter()
-        .try_fold(1usize, |work, grid| work.checked_mul(grid.len()))
-        .filter(|n| *n <= MAX_SWEEP_POINTS)
-        .ok_or_else(|| unsupported("nested DC sweep point limit exceeded"))?;
-    preflight(circuit, &axes, &grids, context)?;
+    let warm_settings = warm_start_settings(point_iterations, &settings);
+    let grids = prepare_grids(circuit, &axes, context)?;
     // C order: the first axis is the inner (fast) loop, the second the outer.
     let GridPair { inner, outer } = GridPair::new(&grids);
     let mut result = plot(
@@ -768,7 +791,7 @@ pub(crate) fn run(
                             // Without a warm-start limit the full solve's
                             // direct attempt is the predicted point; after a
                             // failed warm start it restarts like CKTop.
-                            if first || point_iterations.is_some() {
+                            if first || warm_settings.is_some() {
                                 crate::analysis::newton::PhasePolicy::OperatingPoint
                             } else {
                                 crate::analysis::newton::PhasePolicy::Predicted
