@@ -131,14 +131,7 @@ pub(super) fn c_g(value: f64) -> String {
     let scientific = format!("{value:.5e}");
     let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
     let exponent: i32 = exponent.parse().unwrap_or(0);
-    if !(-4..6).contains(&exponent) {
-        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
-        format!(
-            "{mantissa}e{}{:02}",
-            if exponent < 0 { '-' } else { '+' },
-            exponent.unsigned_abs()
-        )
-    } else {
+    if (-4..6).contains(&exponent) {
         let decimals = usize::try_from(5 - exponent).unwrap_or(0);
         let fixed = format!("{value:.decimals$}");
         // Do not strip meaningful integer digits when precision is zero.
@@ -147,6 +140,13 @@ pub(super) fn c_g(value: f64) -> String {
         } else {
             fixed.trim_end_matches('0').trim_end_matches('.').to_owned()
         }
+    } else {
+        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
+        format!(
+            "{mantissa}e{}{:02}",
+            if exponent < 0 { '-' } else { '+' },
+            exponent.unsigned_abs()
+        )
     }
 }
 
@@ -380,7 +380,14 @@ pub(super) fn temperature_model(
         } else {
             Eg = m.bg0sub - m.tbgasub * Temp * Temp / (Temp + m.tbgbsub);
         }
-        if Temp != Tnom {
+        if Temp == Tnom {
+            m.SjctTempSatCurDensity = m.SjctSatCurDensity;
+            m.SjctSidewallTempSatCurDensity = m.SjctSidewallSatCurDensity;
+            m.SjctGateSidewallTempSatCurDensity = m.SjctGateSidewallSatCurDensity;
+            m.DjctTempSatCurDensity = m.DjctSatCurDensity;
+            m.DjctSidewallTempSatCurDensity = m.DjctSidewallSatCurDensity;
+            m.DjctGateSidewallTempSatCurDensity = m.DjctGateSidewallSatCurDensity;
+        } else {
             T0 = Eg0 / Vtm0 - Eg / m.vtm;
             T1 = log(Temp / Tnom);
             T2 = T0 + m.SjctTempExponent * T1;
@@ -393,13 +400,6 @@ pub(super) fn temperature_model(
             m.DjctTempSatCurDensity = m.DjctSatCurDensity * T3;
             m.DjctSidewallTempSatCurDensity = m.DjctSidewallSatCurDensity * T3;
             m.DjctGateSidewallTempSatCurDensity = m.DjctGateSidewallSatCurDensity * T3;
-        } else {
-            m.SjctTempSatCurDensity = m.SjctSatCurDensity;
-            m.SjctSidewallTempSatCurDensity = m.SjctSidewallSatCurDensity;
-            m.SjctGateSidewallTempSatCurDensity = m.SjctGateSidewallSatCurDensity;
-            m.DjctTempSatCurDensity = m.DjctSatCurDensity;
-            m.DjctSidewallTempSatCurDensity = m.DjctSidewallSatCurDensity;
-            m.DjctGateSidewallTempSatCurDensity = m.DjctGateSidewallSatCurDensity;
         }
         if m.SjctTempSatCurDensity < 0.0 {
             m.SjctTempSatCurDensity = 0.0;
@@ -719,36 +719,31 @@ pub(super) fn temperature_instance(
             p.leff = Lnew - 2.0 * p.dl;
             if p.leff <= 0.0 {
                 return Err(bad_parameter(format!(
-                    "BSIM4: mosfet {}, model {}: Effective channel length <= 0",
-                    model_name, instance_name
+                    "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel length <= 0"
                 )));
             }
             p.weff = Wnew - 2.0 * p.dw;
             if p.weff <= 0.0 {
                 return Err(bad_parameter(format!(
-                    "BSIM4: mosfet {}, model {}: Effective channel width <= 0",
-                    model_name, instance_name
+                    "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel width <= 0"
                 )));
             }
             p.leffCV = Lnew - 2.0 * p.dlc;
             if p.leffCV <= 0.0 {
                 return Err(bad_parameter(format!(
-                    "BSIM4: mosfet {}, model {}: Effective channel length for C-V <= 0",
-                    model_name, instance_name
+                    "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel length for C-V <= 0"
                 )));
             }
             p.weffCV = Wnew - 2.0 * p.dwc;
             if p.weffCV <= 0.0 {
                 return Err(bad_parameter(format!(
-                    "BSIM4: mosfet {}, model {}: Effective channel width for C-V <= 0",
-                    model_name, instance_name
+                    "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel width for C-V <= 0"
                 )));
             }
             p.weffCJ = Wnew - 2.0 * p.dwj;
             if p.weffCJ <= 0.0 {
                 return Err(bad_parameter(format!(
-                    "BSIM4: mosfet {}, model {}: Effective channel width for S/D junctions <= 0",
-                    model_name, instance_name
+                    "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel width for S/D junctions <= 0"
                 )));
             }
             if m.binUnit == 1 {
@@ -1086,7 +1081,6 @@ pub(super) fn temperature_instance(
             };
             if m.v48intVersion <= BSIM4v48V480 {
                 p.AechvbEdgeS = p.Aechvb * p.weff * m.dlcig * p.ToxRatioEdge;
-                p.AechvbEdgeD = p.Aechvb * p.weff * m.dlcigd * p.ToxRatioEdge;
             } else {
                 if m.dlcig < 0.0 {
                     warnings.push(format!(
@@ -1103,8 +1097,8 @@ pub(super) fn temperature_instance(
                     ));
                     m.dlcigd = 0.0;
                 }
-                p.AechvbEdgeD = p.Aechvb * p.weff * m.dlcigd * p.ToxRatioEdge;
             }
+            p.AechvbEdgeD = p.Aechvb * p.weff * m.dlcigd * p.ToxRatioEdge;
             p.BechvbEdge = -p.Bechvb * toxe * p.poxedge;
             p.Aechvb *= p.weff * p.leff * p.ToxRatio;
             p.Bechvb *= -toxe;
@@ -1292,14 +1286,12 @@ pub(super) fn temperature_instance(
                 T2 = T1 / T0;
                 if T2 < -EXP_THRESHOLD {
                     T3 = m.coxe * MIN_EXP / p.cdep0;
-                    T4 = p.mstar + T3 * n0;
                 } else if T2 > EXP_THRESHOLD {
                     T3 = m.coxe * MAX_EXP / p.cdep0;
-                    T4 = p.mstar + T3 * n0;
                 } else {
                     T3 = exp(T2) * m.coxe / p.cdep0;
-                    T4 = p.mstar + T3 * n0;
                 }
+                T4 = p.mstar + T3 * n0;
                 p.VgsteffVth = T0 * log(2.0) / T4;
             }
             T0 = -p.dvtp3 * log(p.leff);
@@ -1640,7 +1632,9 @@ pub(super) fn temperature_instance(
             h.Adeff = 0.0;
             warnings.push("Warning: Adeff is negative, it is set to zero.".to_string());
         }
-        if h.sNodePrime != h.sNode {
+        if h.sNodePrime == h.sNode {
+            h.sourceConductance = 0.0;
+        } else {
             h.sourceConductance = 0.0;
             if h.sourceSquaresGiven {
                 h.sourceConductance = m.sheetResistance * h.sourceSquares;
@@ -1667,10 +1661,10 @@ pub(super) fn temperature_instance(
                 h.sourceConductance = 1.0e3;
                 warnings.push("Warning: Source conductance reset to 1.0e3 mho.".to_string());
             }
-        } else {
-            h.sourceConductance = 0.0;
         }
-        if h.dNodePrime != h.dNode {
+        if h.dNodePrime == h.dNode {
+            h.drainConductance = 0.0;
+        } else {
             h.drainConductance = 0.0;
             if h.drainSquaresGiven {
                 h.drainConductance = m.sheetResistance * h.drainSquares;
@@ -1697,8 +1691,6 @@ pub(super) fn temperature_instance(
                 h.drainConductance = 1.0e3;
                 warnings.push("Warning: Drain conductance reset to 1.0e3 mho.".to_string());
             }
-        } else {
-            h.drainConductance = 0.0;
         }
         Nvtms = m.vtm * m.SjctEmissionCoeff;
         if (h.Aseff <= 0.0) && (h.Pseff <= 0.0) {

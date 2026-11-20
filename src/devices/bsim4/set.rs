@@ -2856,7 +2856,7 @@ pub(super) fn setup_model(
     }
     if !m.wpemodGiven {
         m.wpemod = 0.0;
-    } else if (m.wpemod != 0.0) && (m.wpemod != 1.0) {
+    } else if m.wpemod != 0.0 && m.wpemod.to_bits() != 1.0_f64.to_bits() {
         m.wpemod = 0.0;
         warnings.push("Warning: wpemod has been set to its default value: 0.".into());
     }
