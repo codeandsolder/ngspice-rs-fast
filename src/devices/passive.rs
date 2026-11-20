@@ -218,13 +218,16 @@ impl PassiveParameters {
     ///
     /// # Errors
     /// `value` is nonfinite, or violates the family's value domain (resistance
-    /// must be nonzero with finite conductance; C/L must be positive).
+    /// must be nonzero with finite conductance; C/L must be nonnegative).
     pub fn with_nominal_value(&self, value: Real) -> SpiceResult<Self> {
         valid_value(self.kind, value, &self.location)?;
-        Ok(Self {
-            nominal_value: value,
-            ..self.clone()
-        })
+        let mut recipe = self.clone();
+        let principal = self.kind.principal();
+        recipe.nominal_value = value;
+        recipe
+            .instance_values
+            .set(principal.name, value, principal.unit, self.location.clone());
+        Ok(recipe)
     }
     /// The validated model setters (schema defaults have no location).
     #[must_use]
@@ -635,7 +638,22 @@ mod tests {
             assert_eq!(scalar.unit, unit);
             assert_eq!(scalar.value.to_bits(), 2_f64.to_bits());
             assert!(scalar.location.is_some());
+            let replacement = recipe.with_nominal_value(4.).unwrap();
+            let replaced = replacement
+                .instance_values()
+                .get(kind.principal().name)
+                .unwrap();
+            assert_eq!(replaced.unit, unit);
+            assert_eq!(replaced.value.to_bits(), 4_f64.to_bits());
+            assert!(replaced.location.is_some());
+            assert_eq!(replacement.nominal_value().to_bits(), 4_f64.to_bits());
+            assert_eq!(recipe.nominal_value().to_bits(), 2_f64.to_bits());
+            assert_eq!(
+                recipe.instance_values().get(kind.principal().name),
+                Some(scalar)
+            );
             let initial = recipe.instance_values().get("ic");
+            assert_eq!(replacement.instance_values().get("ic"), initial);
             assert_eq!(initial.map(|v| v.unit), initial_unit);
             if let Some(initial) = initial {
                 assert_eq!(initial.value.to_bits(), 3_f64.to_bits());

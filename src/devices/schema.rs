@@ -5,7 +5,9 @@
 //! setter and its source, and distinguishes defaults from explicit values.
 //! Unsupported setters error instead of C's warning-and-ignore behavior.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::netlist::ast::ParameterAssignment;
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
@@ -141,14 +143,15 @@ pub struct ScalarValue {
     pub location: Option<SourceLoc>,
 }
 
-/// Read-only last-set/default projection. The original AST remains unchanged.
+/// Last-set/default projection. Clones share the validated snapshot until a
+/// per-point recipe replaces a setter; the original AST remains unchanged.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct ScalarValues(BTreeMap<String, ScalarValue>);
+pub struct ScalarValues(Arc<BTreeMap<String, ScalarValue>>);
 
 impl ScalarValues {
     /// Replace a previously validated scalar in an owned per-point recipe.
     pub(crate) fn set(&mut self, name: &str, value: Real, unit: ScalarUnit, location: SourceLoc) {
-        self.0.insert(
+        Arc::make_mut(&mut self.0).insert(
             name.to_owned(),
             ScalarValue {
                 value,
@@ -162,11 +165,15 @@ impl ScalarValues {
     /// return `None`, rather than inventing a zero.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&ScalarValue> {
-        if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            self.0.get(&name.to_ascii_lowercase())
-        } else {
-            self.0.get(name)
-        }
+        self.0.get(ascii_key(name).as_ref())
+    }
+}
+
+fn ascii_key(name: &str) -> Cow<'_, str> {
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
     }
 }
 
@@ -183,12 +190,12 @@ impl ScalarSchema<'_> {
         parameters: impl IntoIterator<Item = &'a ParameterAssignment>,
         owner: &SourceLoc,
     ) -> SpiceResult<ScalarValues> {
-        let mut seen = BTreeSet::new();
-        let mut values = ScalarValues::default();
+        let mut definitions = BTreeMap::new();
+        let mut values = BTreeMap::new();
         for parameter in self.parameters {
             if parameter.name.is_empty()
-                || parameter.name != parameter.name.to_ascii_lowercase()
-                || !seen.insert(parameter.name)
+                || parameter.name.bytes().any(|byte| byte.is_ascii_uppercase())
+                || definitions.insert(parameter.name, parameter).is_some()
             {
                 return Err(SpiceError::parse(
                     owner.clone(),
@@ -197,7 +204,7 @@ impl ScalarSchema<'_> {
             }
             if let Some(default) = parameter.default {
                 validate_value(default, parameter, owner)?;
-                values.0.insert(
+                values.insert(
                     parameter.name.into(),
                     ScalarValue {
                         value: default,
@@ -208,17 +215,15 @@ impl ScalarSchema<'_> {
             }
         }
         for assignment in parameters {
-            let parameter = self
-                .parameters
-                .iter()
-                .find(|parameter| parameter.name.eq_ignore_ascii_case(&assignment.name))
+            let parameter = definitions
+                .get(ascii_key(&assignment.name).as_ref())
                 .ok_or_else(|| SpiceError::Unsupported {
                     feature: format!("unsupported setter '{}'", assignment.name),
                     location: Some(assignment.location.clone()),
                 })?;
             let value = finite_literal(assignment)?;
             validate_value(value, parameter, &assignment.location)?;
-            values.0.insert(
+            values.insert(
                 parameter.name.into(),
                 ScalarValue {
                     value,
@@ -227,7 +232,7 @@ impl ScalarSchema<'_> {
                 },
             );
         }
-        Ok(values)
+        Ok(ScalarValues(Arc::new(values)))
     }
 }
 
@@ -266,21 +271,18 @@ pub(crate) fn split_model_setters<'a>(
             .parameters
             .iter()
             .any(|p| p.name.eq_ignore_ascii_case(&setter.name));
-        let in_instance = instance
-            .parameters
-            .iter()
-            .any(|p| p.name.eq_ignore_ascii_case(&setter.name));
-        if in_model {
-            kept.push(setter);
-        } else if in_instance {
-            if !["level", "m"]
+        if in_model
+            || !instance
+                .parameters
                 .iter()
-                .any(|name| setter.name.eq_ignore_ascii_case(name))
-            {
-                defaults.push(setter);
-            }
-        } else {
+                .any(|p| p.name.eq_ignore_ascii_case(&setter.name))
+        {
             kept.push(setter);
+        } else if !["level", "m"]
+            .iter()
+            .any(|name| setter.name.eq_ignore_ascii_case(name))
+        {
+            defaults.push(setter);
         }
     }
     // C prepends pairs, so its list runs in reverse card order.
@@ -355,4 +357,68 @@ pub fn temperature_kelvin(celsius: Real, location: &SourceLoc) -> SpiceResult<Re
     };
     validate_value(celsius, &parameter, location)?;
     Ok(celsius + 273.15)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::netlist::ast::ParameterKind;
+    use std::path::PathBuf;
+
+    const PARAMETERS: &[ScalarParameter] = &[
+        ScalarParameter {
+            name: "r",
+            unit: ScalarUnit::Ohm,
+            domain: ScalarDomain::Positive,
+            default: Some(1.),
+        },
+        ScalarParameter {
+            name: "m",
+            unit: ScalarUnit::Dimensionless,
+            domain: ScalarDomain::Positive,
+            default: Some(1.),
+        },
+    ];
+
+    fn loc(line: u32) -> SourceLoc {
+        SourceLoc::new(PathBuf::from("schema.cir"), line, 1)
+    }
+
+    fn setter(name: &str, value: &str, line: u32) -> ParameterAssignment {
+        ParameterAssignment {
+            name: name.to_owned(),
+            value: value.to_owned(),
+            kind: ParameterKind::Scalar,
+            location: loc(line),
+        }
+    }
+
+    #[test]
+    fn cloned_snapshots_share_until_changed_and_keep_provenance() {
+        let schema = ScalarSchema {
+            parameters: PARAMETERS,
+        };
+        let assignments = [setter("R", "2", 2), setter("r", "3", 3)];
+        let original = schema.validate(&assignments, &loc(1)).unwrap();
+        let mut copy = original.clone();
+        assert!(Arc::ptr_eq(&original.0, &copy.0));
+        assert_eq!(original.get("R").unwrap().value.to_bits(), 3_f64.to_bits());
+        assert_eq!(original.get("r").unwrap().location, Some(loc(3)));
+        assert_eq!(original.get("M").unwrap().location, None);
+        copy.set("m", 4., ScalarUnit::Dimensionless, loc(4));
+        assert!(!Arc::ptr_eq(&original.0, &copy.0));
+        assert_eq!(copy.get("m").unwrap().location, Some(loc(4)));
+        assert_eq!(original.get("m").unwrap().value.to_bits(), 1_f64.to_bits());
+        assert_eq!(original.get("m").unwrap().location, None);
+        assert_eq!(copy.get("r"), original.get("r"));
+    }
+
+    #[test]
+    fn ordered_validation_rejects_even_overwritten_invalid_values() {
+        let schema = ScalarSchema {
+            parameters: PARAMETERS,
+        };
+        let assignments = [setter("R", "-1", 2), setter("r", "3", 3)];
+        assert!(schema.validate(&assignments, &loc(1)).is_err());
+    }
 }
