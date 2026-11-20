@@ -244,10 +244,6 @@ pub struct NoiseSource {
 }
 
 /// Squared transfer gain in the reference noise evaluator's operation order.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "NevalSrc sums the two separately rounded squared adjoint components"
-)]
 const fn squared_gain(transfer: Complex) -> Real {
     transfer.re * transfer.re + transfer.im * transfer.im
 }
