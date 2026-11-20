@@ -215,7 +215,55 @@ struct MutualBinding {
     pairs: Vec<MutualPair>,
     groups: Vec<CoupledGroup>,
     setup_rows: BTreeMap<usize, Vec<(usize, usize)>>,
+    evaluation: std::cell::RefCell<Option<MutualEvaluation>>,
     error: Option<SpiceError>,
+}
+
+/// The actual physical input values used for a verified coupling load.
+/// Cache by bit pattern, not by analysis/temperature guesses, so any
+/// contextual device or setter can invalidate it without special rules.
+#[derive(Debug, Clone)]
+struct MutualEvaluation {
+    values: BTreeMap<usize, InductanceValue>,
+    mutuals: Vec<Real>,
+    terms: PreparedMutualTerms,
+}
+
+impl MutualEvaluation {
+    fn matches(&self, values: &BTreeMap<usize, InductanceValue>, mutuals: &[Real]) -> bool {
+        fn bits(value: &InductanceValue) -> [u64; 3] {
+            [
+                value.effective.to_bits(),
+                value.coupling_base.to_bits(),
+                value.initial.to_bits(),
+            ]
+        }
+        self.values.len() == values.len()
+            && self
+                .values
+                .iter()
+                .zip(values)
+                .all(|((a, x), (b, y))| a == b && bits(x) == bits(y))
+            && self.mutuals.len() == mutuals.len()
+            && self
+                .mutuals
+                .iter()
+                .zip(mutuals)
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+}
+
+/// No allocation for the ordinary uncoupled circuit. A checked coupled
+/// circuit shares its complete stamp input across successive loads.
+#[derive(Debug, Clone, Default)]
+pub(super) struct PreparedMutualTerms(Option<Arc<[Vec<MutualTerm>]>>);
+
+impl std::ops::Deref for PreparedMutualTerms {
+    type Target = [Vec<MutualTerm>];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().unwrap_or(&[])
+    }
 }
 
 /// A fixed connected component of the K-card graph. Its local rows are
@@ -283,6 +331,7 @@ impl MutualBinding {
             pairs,
             groups: groups.into_values().collect(),
             setup_rows,
+            evaluation: Default::default(),
             error: None,
         }
     }
@@ -390,6 +439,7 @@ impl Circuit {
     pub fn devices_mut(&mut self) -> &mut [Box<dyn Device>] {
         // A replaced device may stamp other positions.
         self.fixed_stamps.get_mut().forget();
+        self.mutual.evaluation.get_mut().take();
         &mut self.devices
     }
 
@@ -576,6 +626,10 @@ impl Circuit {
     /// Stale numbering, unresolved K references, invalid inductances or a
     /// system that is not positive semidefinite.
     pub fn mutual_terms(&self, context: &ModelContext) -> SpiceResult<Vec<Vec<MutualTerm>>> {
+        Ok(self.prepared_mutual_terms(context)?.to_vec())
+    }
+
+    fn prepared_mutual_terms(&self, context: &ModelContext) -> SpiceResult<PreparedMutualTerms> {
         self.check_numbering()?;
         let replacements = if self.mutual.pairs.is_empty() {
             Vec::new()
@@ -591,12 +645,12 @@ impl Circuit {
         &self,
         context: &ModelContext,
         replacements: &[(usize, Box<dyn Device>)],
-    ) -> SpiceResult<Vec<Vec<MutualTerm>>> {
+    ) -> SpiceResult<PreparedMutualTerms> {
         if let Some(error) = &self.mutual.error {
             return Err(error.clone());
         }
         if self.mutual.pairs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(PreparedMutualTerms::default());
         }
         let device_at = |index: usize| -> &dyn Device {
             replacements
@@ -618,7 +672,6 @@ impl Circuit {
                 values.insert(index, value);
             }
         }
-        let mut terms = vec![Vec::new(); self.devices.len()];
         let mut mutuals = Vec::with_capacity(self.mutual.pairs.len());
         // INDload adds each K's flux in the MUT instance list's order, the
         // last card first (instances are prepended).
@@ -635,6 +688,20 @@ impl Circuit {
                     self.devices[pair.coupling].name()
                 )));
             }
+            mutuals.push(inductance);
+        }
+        // PSD additions use pair order while the INDload flux sum uses
+        // reverse pair order. Both remain unchanged.
+        mutuals.reverse();
+        if let Some(cached) = &*self.mutual.evaluation.borrow()
+            && cached.matches(&values, &mutuals)
+        {
+            return Ok(cached.terms.clone());
+        }
+        self.check_inductive_systems(&values, &mutuals)?;
+        let mut terms = vec![Vec::new(); self.devices.len()];
+        for (pair, &inductance) in self.mutual.pairs.iter().zip(&mutuals).rev() {
+            let (a, b) = (values[&pair.first], values[&pair.second]);
             terms[pair.first].push(MutualTerm {
                 row: self.branch_rows[pair.second].start,
                 inductance,
@@ -645,11 +712,13 @@ impl Circuit {
                 inductance,
                 initial: a.initial,
             });
-            mutuals.push(inductance);
         }
-        // check_inductive_systems pairs these with self.mutual.pairs in order.
-        mutuals.reverse();
-        self.check_inductive_systems(&values, &mutuals)?;
+        let terms = PreparedMutualTerms(Some(terms.into()));
+        self.mutual.evaluation.replace(Some(MutualEvaluation {
+            values,
+            mutuals,
+            terms: terms.clone(),
+        }));
         Ok(terms)
     }
 
@@ -1543,7 +1612,7 @@ impl Circuit {
                 "single-device load does not match the circuit numbering",
             ));
         }
-        let mutual = self.mutual_terms(request.model_context)?;
+        let mutual = self.prepared_mutual_terms(request.model_context)?;
         self.stamp_isolated(index, device, request, matrix, rhs, trial, &mutual)
     }
 
@@ -2688,7 +2757,7 @@ impl Circuit {
         }
         circuit.finalize()?;
         // Reject an invalid inductive system (K coupling) before any analysis.
-        circuit.mutual_terms(context)?;
+        circuit.prepared_mutual_terms(context)?;
         Ok(circuit)
     }
 
@@ -2761,6 +2830,61 @@ mod tests {
             terminals: vec![first, second],
             branch_currents,
         }
+    }
+
+    #[test]
+    fn coupling_cache_reuses_only_bitwise_identical_validated_values() {
+        use crate::devices::ModelContext;
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use std::{path::Path, sync::Arc};
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("coupling.cir"),
+                "coupling\nl1 a 0 1m ic=0\nl2 b 0 4m\nk1 l1 l2 0.5\n.end\n",
+            ))
+            .unwrap();
+        let context = ModelContext::default();
+        let mut c = Circuit::from_netlist(&deck).unwrap();
+        let first = c.prepared_mutual_terms(&context).unwrap();
+        let same = c
+            .prepared_mutual_terms(&ModelContext::new(57., 27.))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            first.0.as_ref().unwrap(),
+            same.0.as_ref().unwrap()
+        ));
+        let override_k = |value| {
+            context
+                .with_instance_override(c.instance_override("k1", "k", value, &context).unwrap())
+                .unwrap()
+        };
+        let invalid = override_k(1.5);
+        assert!(c.prepared_mutual_terms(&invalid).is_err());
+        let retained = c.prepared_mutual_terms(&context).unwrap();
+        assert!(Arc::ptr_eq(
+            first.0.as_ref().unwrap(),
+            retained.0.as_ref().unwrap()
+        ));
+        let changed = c.prepared_mutual_terms(&override_k(0.25)).unwrap();
+        assert!(!Arc::ptr_eq(
+            first.0.as_ref().unwrap(),
+            changed.0.as_ref().unwrap()
+        ));
+        assert_ne!(&*first, &*changed);
+        let zero = c.prepared_mutual_terms(&override_k(0.)).unwrap();
+        let negative_zero = c.prepared_mutual_terms(&override_k(-0.)).unwrap();
+        assert!(!Arc::ptr_eq(
+            zero.0.as_ref().unwrap(),
+            negative_zero.0.as_ref().unwrap()
+        ));
+        let repeated = c.prepared_mutual_terms(&context).unwrap();
+        assert_eq!(&*repeated, &*first);
+        c.finalize().unwrap();
+        let rebuilt = c.prepared_mutual_terms(&context).unwrap();
+        assert!(!Arc::ptr_eq(
+            repeated.0.as_ref().unwrap(),
+            rebuilt.0.as_ref().unwrap()
+        ));
     }
 
     #[test]

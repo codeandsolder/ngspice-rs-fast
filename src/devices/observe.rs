@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::devices::{
-    Circuit, Device, Forcing, IterationPhase, LoadRequest, ModelContext, MutualTerm, TrialState,
+    Circuit, Device, Forcing, IterationPhase, LoadRequest, ModelContext, TrialState,
 };
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
@@ -114,7 +114,7 @@ struct PointLoads<'a, 'b> {
     time: Option<(Real, Forcing)>,
     previous: Option<&'a TrialState>,
     replacements: &'a [(usize, Box<dyn Device>)],
-    mutual: Option<Vec<Vec<MutualTerm>>>,
+    mutual: Option<crate::devices::circuit::PreparedMutualTerms>,
     scratch: Option<(SparseMatrix, Vector)>,
     currents: BTreeMap<usize, Vec<Real>>,
 }
