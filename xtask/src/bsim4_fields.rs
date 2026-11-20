@@ -209,7 +209,7 @@ fn real_asks(source: &str, prefix: &str) -> Result<Vec<(String, String)>, String
 
 /// The generated `asks.rs` text: the real asks of `b4mask.c` and `b4ask.c`
 /// that read a member directly (`sens_getp()` succeeds only for these).
-pub(super) fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, String> {
+pub fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, String> {
     let model = real_asks(mask, "model->")?;
     let instance = real_asks(ask, "here->")?;
     if model.len() != 869 || instance.len() != 40 {
@@ -239,7 +239,7 @@ pub(super) fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, Stri
 }
 
 /// The generated `fields.rs` text.
-pub(super) fn fields(header: &str, revision: &str) -> Result<String, String> {
+pub fn fields(header: &str, revision: &str) -> Result<String, String> {
     let header = crate::ifparm::strip_comments(header)?;
     let instance = members(
         &header,
