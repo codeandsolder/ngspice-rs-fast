@@ -83,6 +83,35 @@ enum Stepping {
     Linear,
 }
 
+impl Stepping {
+    fn parse(text: &str) -> Option<Self> {
+        if text.eq_ignore_ascii_case("dec") {
+            Some(Self::Decade)
+        } else if text.eq_ignore_ascii_case("oct") {
+            Some(Self::Octave)
+        } else if text.eq_ignore_ascii_case("lin") {
+            Some(Self::Linear)
+        } else {
+            None
+        }
+    }
+
+    /// noisean.c's asymmetric singleton handling. For lin 1, C only
+    /// replaces the stop when it is NOT almost equal. An unequal stop
+    /// within three ULPs survives, producing a zero integrated-noise plot
+    /// even though the frequency loop executes just once.
+    fn normalize(self, steps: usize, start: Real, stop: Real) -> (usize, Real) {
+        let equal = almost_equal_ulps(start, stop, 3);
+        if self == Self::Linear && steps == 1 {
+            (steps, if equal { stop } else { start })
+        } else if equal {
+            (1, start)
+        } else {
+            (steps, stop)
+        }
+    }
+}
+
 /// A parsed `.noise` card, after C's single-frequency adjustments.
 #[derive(Debug, Clone, PartialEq)]
 struct NoiseCard {
@@ -150,8 +179,9 @@ fn split_output(arguments: &[String]) -> SpiceResult<Positional> {
 /// Determine the number of plots emitted by a noise-analysis card.
 ///
 /// How many plots a `.noise` card produces: two (the spectrum and the
-/// integrated noise), or one when C collapses the sweep to a single frequency
-/// (`lin` with one point, or start and stop within 3 ulps). Used by the batch
+/// integrated noise), or one when C normalizes the stop to the start.
+/// A one-point linear sweep with distinct, nearly equal bounds is the
+/// exception: the integrated plot still exists. Used by the batch
 /// scheduler to name the plots before anything runs; a card the driver would
 /// reject (or one with braced, not yet evaluated, arguments) counts two.
 #[must_use]
@@ -172,12 +202,17 @@ pub fn plot_count(arguments: &[String]) -> usize {
     ) else {
         return 2;
     };
-    let linear_single = kind.eq_ignore_ascii_case("lin") && steps == 1;
-    if linear_single || almost_equal_ulps(start, stop, 3) {
-        1
-    } else {
-        2
+    let Some(stepping) = Stepping::parse(kind) else {
+        return 2;
+    };
+    let Ok(steps) = usize::try_from(steps) else {
+        return 2;
+    };
+    if steps == 0 || start <= 0. || stop < start {
+        return 2;
     }
+    let (_, stop) = stepping.normalize(steps, start, stop);
+    if start == stop { 1 } else { 2 }
 }
 
 fn parse(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<NoiseCard> {
@@ -211,16 +246,12 @@ fn parse(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<NoiseCard>
             ".noise output nodes must differ (the output voltage is identically zero)",
         ));
     }
-    let stepping = match rest[1].to_ascii_lowercase().as_str() {
-        "dec" => Stepping::Decade,
-        "oct" => Stepping::Octave,
-        "lin" => Stepping::Linear,
-        other => {
-            return Err(unsupported(format!(
-                ".noise sweep must be dec, oct or lin, not '{other}'"
-            )));
-        }
-    };
+    let stepping = Stepping::parse(&rest[1]).ok_or_else(|| {
+        unsupported(format!(
+            ".noise sweep must be dec, oct or lin, not '{}'",
+            rest[1]
+        ))
+    })?;
     let steps = integer(Some(&rest[2]), "point count")?;
     if steps < 1 {
         return Err(unsupported(format!(
@@ -228,7 +259,7 @@ fn parse(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<NoiseCard>
         )));
     }
     let start = number(Some(&rest[3]), "start frequency")?;
-    let mut stop = number(Some(&rest[4]), "stop frequency")?;
+    let stop = number(Some(&rest[4]), "stop frequency")?;
     let summary = match rest.get(5) {
         Some(text) => {
             let value = integer(Some(text), "pts_per_summary")?;
@@ -245,16 +276,8 @@ fn parse(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<NoiseCard>
             ".noise needs 0 < fstart <= fstop, got {start} .. {stop}"
         )));
     }
-    let mut steps = usize::try_from(steps).map_err(|_| unsupported(".noise point count"))?;
-    // noisean.c: a one-point linear sweep measures at the start frequency
-    // only; any other sweep whose start and stop are within 3 ulps becomes a
-    // one-point sweep there.
-    if stepping == Stepping::Linear && steps == 1 {
-        stop = start;
-    } else if almost_equal_ulps(start, stop, 3) {
-        stop = start;
-        steps = 1;
-    }
+    let steps = usize::try_from(steps).map_err(|_| unsupported(".noise point count"))?;
+    let (steps, stop) = stepping.normalize(steps, start, stop);
     if steps > MAX_POINTS {
         return Err(unsupported(format!(
             ".noise point count is limited to {MAX_POINTS}"
@@ -928,6 +951,50 @@ mod tests {
         assert_eq!(plot_count(&args("v ( out , ref ) v1 lin 1 1 1k 2")), 1);
         assert_eq!(plot_count(&args("v ( out ) v1 lin 2 1 1k rtol=1e-3")), 2);
         assert_eq!(plot_count(&args("garbage")), 2);
+    }
+
+    #[test]
+    fn almost_equal_linear_singleton_retains_integrated_plot_like_c() {
+        use crate::analysis::{AnalysisContext, AnalysisRequest, runner};
+        use crate::devices::Circuit;
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use crate::primitives::AnalysisKind;
+        use std::path::Path;
+        let netlist = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("noise-single.cir"),
+                "nearby noise bounds\nv1 a 0 dc 0 ac 1\nr1 a 0 1k\n.end\n",
+            ))
+            .unwrap();
+        let start = 1_f64;
+        for distance in 0..=5 {
+            let stop = f64::from_bits(start.to_bits() + distance);
+            for mode in ["lin", "dec", "oct"] {
+                let arguments = args(&format!("v ( a ) v1 {mode} 1 {start:.17} {stop:.17}"));
+                let request =
+                    AnalysisRequest::with_arguments(AnalysisKind::Noise, arguments.clone());
+                let parsed_start = crate::primitives::parse_spice_number(&arguments[7]).unwrap();
+                let parsed_stop = crate::primitives::parse_spice_number(&arguments[8]).unwrap();
+                let equal = almost_equal_ulps(parsed_start, parsed_stop, 3);
+                let integrated = if mode == "lin" {
+                    equal && parsed_start != parsed_stop
+                } else {
+                    !equal
+                };
+                let expected = 1 + usize::from(integrated);
+                let mut circuit = Circuit::from_netlist(&netlist).unwrap();
+                let plots = runner(AnalysisKind::Noise)
+                    .unwrap()
+                    .run_plots(&mut circuit, &request, &AnalysisContext::default())
+                    .unwrap();
+                assert_eq!(plots.len(), expected, "{mode} {distance}");
+                assert_eq!(plot_count(&arguments), expected);
+                assert_eq!(plots[0].point_count(), 1);
+                if let Some(integrated) = plots.get(1) {
+                    assert_eq!(integrated.points[0], [Complex::ZERO; 2]);
+                }
+            }
+        }
     }
 
     #[test]
