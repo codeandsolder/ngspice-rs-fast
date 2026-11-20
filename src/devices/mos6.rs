@@ -72,9 +72,10 @@ mod sens;
 use crate::devices::ModelContext;
 use crate::devices::ResolvedModel;
 use crate::devices::mos::bulk::{BulkJunctions, BulkLaw};
+use crate::devices::mos::surface::{Surface, SurfaceCard, SurfaceLaw};
 use crate::devices::mos::{
-    CELSIUS_TO_KELVIN, CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, K_OVER_Q, MosLevel,
-    Mosfet, Operating, aliased, band_gap, p, required,
+    CELSIUS_TO_KELVIN, Common, DrainCurrent, EPSILON_0, Geometry, MosLevel, Mosfet, Operating,
+    aliased, p, required,
 };
 use crate::devices::nonlinear::thermal::SiliconTemperature;
 use crate::devices::schema::{
@@ -82,9 +83,6 @@ use crate::devices::schema::{
 };
 use crate::devices::setup::CDeviceType;
 use crate::primitives::{Real, SpiceError, SpiceResult};
-
-/// Intrinsic carrier density of silicon used by `mos6temp.c` (m^-3).
-const INTRINSIC_DENSITY: Real = 1.45e16;
 
 /// The level-6 MOSFET: the shared shell around [`Level6`].
 pub(super) type Mos6 = Mosfet<Level6>;
@@ -140,15 +138,13 @@ const MODEL: &[P] = &[
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Level6 {
     common: Common,
-    vto: Option<Real>,
+    surface: SurfaceCard,
     kv: Real,
     nv: Real,
     kc: Option<Real>,
     nc: Real,
-    gamma: Option<Real>,
     gamma1: Real,
     sigma: Real,
-    phi: Option<Real>,
     /// C `MOS6lamda0`: LAMBDA0, else LAMBDA, else zero (`mos6set.c`).
     lambda0: Real,
     /// Separate C LAMBDA setter and LAMDA0 flag, retained for `.sens` setup.
@@ -159,20 +155,15 @@ pub(super) struct Level6 {
     ps: Real,
     tox: Option<Real>,
     u0: Option<Real>,
-    nsub: Option<Real>,
-    tpg: Option<Real>,
-    nss: Option<Real>,
 }
 
 /// Process-derived model values (`mos6temp.c`, model loop).
 #[derive(Debug, Clone, Copy)]
 struct Process {
+    surface: Surface,
     /// Oxide capacitance per area, zero when TOX is absent or zero.
     cox: Real,
     kc: Real,
-    phi: Real,
-    gamma: Real,
-    vto: Real,
 }
 
 /// The level-6 channel parameters of one load.
@@ -197,52 +188,27 @@ impl Level6 {
 
     /// `mos6temp.c`'s model loop at the nominal temperature `tnom` (K).
     fn process(&self, tnom: Real) -> SpiceResult<Process> {
-        let pol = self.common.pol;
-        let mut process = Process {
-            cox: 0.,
-            kc: self.kc.unwrap_or(5e-5),
-            phi: self.phi.unwrap_or(0.6),
-            gamma: self.gamma.unwrap_or(0.),
-            vto: self.vto.unwrap_or(0.),
-        };
         let Some(tox) = self.tox.filter(|tox| *tox != 0.) else {
-            return Ok(process);
+            return Ok(Process {
+                cox: 0.,
+                kc: self.kc.unwrap_or(5e-5),
+                surface: self.surface.defaults(),
+            });
         };
         let cox = 3.9 * EPSILON_0 / tox;
-        process.cox = cox;
-        if self.kc.is_none() {
-            process.kc = 0.5 * self.u0.unwrap_or(600.) * cox * 1e-4;
-        }
-        if let Some(nsub) = self.nsub {
-            let density = nsub * 1e6;
-            if density <= INTRINSIC_DENSITY {
-                return Err(SpiceError::circuit(format!(
-                    "MOS6 NSUB={nsub} is below the intrinsic density (mos6temp.c: Nsub < Ni)"
-                )));
-            }
-            let vtnom = tnom * K_OVER_Q;
-            let egfet1 = band_gap(tnom);
-            if self.phi.is_none() {
-                process.phi = (2. * vtnom * (density / INTRINSIC_DENSITY).ln()).max(0.1);
-            }
-            let fermis = pol * 0.5 * process.phi;
-            let tpg = self.tpg.unwrap_or(1.);
-            let wkfng = if tpg == 0. {
-                3.2
-            } else {
-                let fermig = pol * tpg * 0.5 * egfet1;
-                3.25 + 0.5 * egfet1 - fermig
-            };
-            let wkfngs = wkfng - (3.25 + 0.5 * egfet1 + fermis);
-            if self.gamma.is_none() {
-                process.gamma = (2. * 11.70 * EPSILON_0 * CHARGE * density).sqrt() / cox;
-            }
-            if self.vto.is_none() {
-                let vfb = wkfngs - self.nss.unwrap_or(0.) * 1e4 * CHARGE / cox;
-                process.vto = vfb + pol * (process.gamma * process.phi.sqrt() + process.phi);
-            }
-        }
-        Ok(process)
+        Ok(Process {
+            cox,
+            kc: self
+                .kc
+                .unwrap_or(0.5 * self.u0.unwrap_or(600.) * cox * 1e-4),
+            surface: self.surface.derive(
+                SurfaceLaw::Classic,
+                "MOS6",
+                tnom,
+                self.common.pol,
+                cox,
+            )?,
+        })
     }
 }
 
@@ -272,15 +238,13 @@ impl MosLevel for Level6 {
         )?;
         let model = Self {
             common,
-            vto: aliased(&m, ["vto", "vt0"]),
+            surface: SurfaceCard::from_values(&m),
             kv: required("kv")?,
             nv: required("nv")?,
             kc: get("kc"),
             nc: required("nc")?,
-            gamma: get("gamma"),
             gamma1: required("gamma1")?,
             sigma: required("sigma")?,
-            phi: get("phi"),
             lambda0: get("lambda0").or_else(|| get("lambda")).unwrap_or(0.),
             lambda: get("lambda"),
             lambda0_given: get("lambda0").is_some(),
@@ -289,9 +253,6 @@ impl MosLevel for Level6 {
             ps: required("ps")?,
             tox: get("tox"),
             u0: aliased(&m, ["u0", "uo"]),
-            nsub: get("nsub"),
-            tpg: get("tpg"),
-            nss: get("nss"),
         };
         Ok((model, defaults))
     }
@@ -370,14 +331,11 @@ impl MosLevel for Level6 {
         let nominal = SiliconTemperature::new(tnom);
         let actual = SiliconTemperature::new(temp);
         let vt = actual.vt;
-        let (egfet, egfet1) = (actual.gap, nominal.gap);
         let ratio = temp / tnom;
         let kc = process.kc / (ratio * ratio.sqrt());
-        let phi = actual.potential.correct(&nominal.potential, process.phi);
-        let vbi = process.vto - model.pol * (process.gamma * process.phi.sqrt())
-            + 0.5 * (egfet1 - egfet)
-            + model.pol * 0.5 * (phi - process.phi);
-        let vto = vbi + model.pol * process.gamma * phi.sqrt();
+        let (phi, vbi, vto) = process
+            .surface
+            .at_temperature(&nominal, &actual, model.pol, None);
         let BulkJunctions {
             drain,
             source,
@@ -392,7 +350,7 @@ impl MosLevel for Level6 {
             vbi,
             phi,
             vto,
-            gamma: process.gamma,
+            gamma: process.surface.gamma,
             oxide: process.cox * length * m * geometry.w,
             drain,
             source,
@@ -588,6 +546,14 @@ mod tests {
 
     fn level(pol: Real) -> Level6 {
         Level6 {
+            surface: SurfaceCard {
+                vto: None,
+                gamma: None,
+                phi: None,
+                nsub: None,
+                tpg: None,
+                nss: None,
+            },
             common: Common {
                 pol,
                 rd: None,
@@ -611,15 +577,12 @@ mod tests {
                 nlev: 2,
                 gdsnoi: 1.,
             },
-            vto: None,
             kv: 1.6,
             nv: 0.8,
             kc: None,
             nc: 1.3,
-            gamma: None,
             gamma1: 0.05,
             sigma: 0.02,
-            phi: None,
             lambda0: 0.03,
             lambda: None,
             lambda0_given: true,
@@ -628,9 +591,6 @@ mod tests {
             ps: 0.,
             tox: None,
             u0: None,
-            nsub: None,
-            tpg: None,
-            nss: None,
         }
     }
 

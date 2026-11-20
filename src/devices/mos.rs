@@ -80,6 +80,7 @@
 
 pub(super) mod bulk;
 pub(super) mod sens;
+pub(super) mod surface;
 
 use crate::devices::nonlinear::thermal::{TemperatureCache, TemperatureKey};
 use std::cell::Ref;

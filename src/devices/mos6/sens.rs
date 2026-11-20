@@ -66,16 +66,11 @@ impl SensitivityLevel for Level6 {
         P::dc("dtemp"),
     ];
     fn record(&self, context: &ModelContext) -> Record {
-        let mut r = record_common(&self.common, context);
+        let mut r = self.surface.record(record_common(&self.common, context));
         for (k, value, given) in [
-            ("vto", self.vto.unwrap_or(0.), self.vto.is_some()),
             ("kc", self.kc.unwrap_or(5e-5), self.kc.is_some()),
-            ("gamma", self.gamma.unwrap_or(0.), self.gamma.is_some()),
-            ("phi", self.phi.unwrap_or(0.6), self.phi.is_some()),
             ("tox", self.tox.unwrap_or(0.), self.tox.is_some()),
             ("u0", self.u0.unwrap_or(0.), self.u0.is_some()),
-            ("nsub", self.nsub.unwrap_or(0.), self.nsub.is_some()),
-            ("nss", self.nss.unwrap_or(0.), self.nss.is_some()),
             ("kv", self.kv, true),
             ("nv", self.nv, true),
             ("nc", self.nc, true),
@@ -94,14 +89,10 @@ impl SensitivityLevel for Level6 {
     fn with_record(&self, r: &Record, derived: bool) -> SpiceResult<Self> {
         let mut m = *self;
         update_common(&mut m.common, r)?;
-        m.vto = optional(r, "vto", derived)?;
+        m.surface.update(r, derived)?;
         m.kc = optional(r, "kc", derived)?;
-        m.gamma = optional(r, "gamma", derived)?;
-        m.phi = optional(r, "phi", derived)?;
         m.tox = optional(r, "tox", false)?;
         m.u0 = optional(r, "u0", false)?;
-        m.nsub = optional(r, "nsub", false)?;
-        m.nss = optional(r, "nss", false)?;
         m.kv = r.value("kv")?;
         m.nv = r.value("nv")?;
         m.nc = r.value("nc")?;
@@ -126,14 +117,8 @@ impl SensitivityLevel for Level6 {
     }
     fn temperature(&self, r: &mut Record) -> SpiceResult<()> {
         let process = self.with_record(r, false)?.process(r.value("tnom")?)?;
-        for (k, value) in [
-            ("vto", process.vto),
-            ("kc", process.kc),
-            ("gamma", process.gamma),
-            ("phi", process.phi),
-        ] {
-            r.store(k, value)?;
-        }
+        process.surface.store(r)?;
+        r.store("kc", process.kc)?;
         if r.given("tox") && r.value("tox")? != 0. && !r.given("u0") {
             r.store("u0", 600.)?;
         }

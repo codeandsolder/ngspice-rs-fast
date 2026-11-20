@@ -15,6 +15,7 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
+use super::surface::{Surface, SurfaceCard};
 use super::{CELSIUS_TO_KELVIN, Common, MosLevel, Mosfet};
 use crate::devices::ModelContext;
 use crate::devices::nonlinear::thermal::TemperatureCache;
@@ -126,6 +127,41 @@ pub(in crate::devices) fn update_common(c: &mut Common, r: &Record) -> SpiceResu
     c.cj = optional(r, "cj", false)?;
     c.cjsw = optional(r, "cjsw", false)?;
     Ok(())
+}
+
+/// The surface-process card's sensitivity record, excluding TPG (not
+/// exposed as a C sensitivity parameter).
+impl SurfaceCard {
+    pub(in crate::devices) fn record(self, mut record: Record) -> Record {
+        for (keyword, field, default) in [
+            ("vto", self.vto, 0.),
+            ("gamma", self.gamma, 0.),
+            ("phi", self.phi, 0.6),
+            ("nsub", self.nsub, 0.),
+            ("nss", self.nss, 0.),
+        ] {
+            record = record.with(keyword, field.unwrap_or(default), field.is_some());
+        }
+        record
+    }
+
+    pub(in crate::devices) fn update(&mut self, record: &Record, derived: bool) -> SpiceResult<()> {
+        self.vto = optional(record, "vto", derived)?;
+        self.gamma = optional(record, "gamma", derived)?;
+        self.phi = optional(record, "phi", derived)?;
+        self.nsub = optional(record, "nsub", false)?;
+        self.nss = optional(record, "nss", false)?;
+        Ok(())
+    }
+}
+
+impl Surface {
+    pub(in crate::devices) fn store(self, record: &mut Record) -> SpiceResult<()> {
+        for (keyword, value) in [("vto", self.vto), ("gamma", self.gamma), ("phi", self.phi)] {
+            record.store(keyword, value)?;
+        }
+        Ok(())
+    }
 }
 
 /// C's field value with the setter flag, or an already-derived field.

@@ -43,10 +43,6 @@
 // C-compatible numerical expressions are kept in their reference order:
 // Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
-    clippy::similar_names,
-    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
-)]
-#![expect(
     clippy::manual_midpoint,
     reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
 )]
@@ -62,9 +58,10 @@
 mod sens;
 
 use crate::devices::mos::bulk::{BulkJunctions, BulkLaw};
+use crate::devices::mos::surface::{Surface, SurfaceCard, SurfaceLaw};
 use crate::devices::mos::{
-    CELSIUS_TO_KELVIN, CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, K_OVER_Q, MosLevel,
-    Mosfet, NoiseShape, Operating, aliased, band_gap, p, required,
+    CELSIUS_TO_KELVIN, CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, MosLevel, Mosfet,
+    NoiseShape, Operating, aliased, p, required,
 };
 use crate::devices::noise::NoiseFamily;
 use crate::devices::nonlinear::thermal::SiliconTemperature;
@@ -142,19 +139,14 @@ pub(super) const MODEL_WITHOUT_NOISE_SELECTORS: &[P] = MODEL.split_at(MODEL.len(
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Level3 {
     common: Common,
-    vto: Option<Real>,
+    surface: SurfaceCard,
     kp: Option<Real>,
-    gamma: Option<Real>,
-    phi: Option<Real>,
     tox: Real,
     xl: Real,
     wd: Real,
     xw: Real,
     delvto: Real,
     u0: Option<Real>,
-    nsub: Option<Real>,
-    tpg: Option<Real>,
-    nss: Option<Real>,
     vmax: Real,
     xj: Real,
     nfs: Real,
@@ -167,12 +159,11 @@ pub(super) struct Level3 {
 /// Process-derived model values (`mos3temp.c`, model loop).
 #[derive(Debug, Clone, Copy)]
 struct Process {
+    surface: Surface,
     cox: Real,
     kp: Real,
     u0: Real,
-    phi: Real,
-    gamma: Real,
-    vto: Real,
+
     /// C `MOS3alpha` and `MOS3coeffDepLayWidth` (zero without NSUB).
     alpha: Real,
     depletion: Real,
@@ -223,19 +214,14 @@ impl Level3 {
         let noise_file = format!("{}noi.c", label.to_ascii_lowercase());
         Ok(Self {
             common: Common::from_values(m, resolved.family(), get("tpg"), label, &noise_file)?,
-            vto: aliased(m, ["vto", "vt0"]),
+            surface: SurfaceCard::from_values(m),
             kp: get("kp"),
-            gamma: get("gamma"),
-            phi: get("phi"),
             tox: required("tox")?,
             xl: required("xl")?,
             wd: required("wd")?,
             xw: required("xw")?,
             delvto: aliased(m, ["delvto", "delvt0"]).unwrap_or(0.),
             u0: aliased(m, ["u0", "uo"]),
-            nsub: get("nsub"),
-            tpg: get("tpg"),
-            nss: get("nss"),
             vmax: required("vmax")?,
             xj: required("xj")?,
             nfs: required("nfs")?,
@@ -272,16 +258,14 @@ impl Level3 {
         let nominal = SiliconTemperature::new(tnom);
         let actual = SiliconTemperature::new(temp);
         let vt = actual.vt;
-        let (egfet, egfet1) = (actual.gap, nominal.gap);
         let ratio = temp / tnom;
         let ratio4 = ratio * ratio.sqrt();
         let kp = process.kp / ratio4;
         let mobility = process.u0 / ratio4;
-        let phi = actual.potential.correct(&nominal.potential, process.phi);
-        let vbi = self.delvto + process.vto - model.pol * (process.gamma * process.phi.sqrt())
-            + 0.5 * (egfet1 - egfet)
-            + model.pol * 0.5 * (phi - process.phi);
-        let vto = vbi + model.pol * process.gamma * phi.sqrt();
+        let (phi, vbi, vto) =
+            process
+                .surface
+                .at_temperature(&nominal, &actual, model.pol, Some(self.delvto));
         let BulkJunctions {
             drain,
             source,
@@ -301,7 +285,7 @@ impl Level3 {
             vbi,
             phi,
             vto,
-            gamma: process.gamma,
+            gamma: process.surface.gamma,
             oxide,
             drain,
             source,
@@ -341,57 +325,24 @@ impl Level3 {
     /// `mos3temp.c`'s model loop, in C's arithmetic, under `label`
     /// (`mos9temp.c` is `mos3temp.c`).
     fn process(&self, tnom: Real, label: &str) -> SpiceResult<Process> {
-        let pol = self.common.pol;
-        let vtnom = tnom * K_OVER_Q;
-        let egfet1 = band_gap(tnom);
-        let nifact = (tnom / 300.) * (tnom / 300.).sqrt();
-        let nifact = nifact * (0.5 * egfet1 * ((1. / 300.) - (1. / tnom)) / K_OVER_Q).exp();
-        let intrinsic = 1.45e16 * nifact;
         let cox = 3.9 * EPSILON_0 / self.tox;
         let u0 = self.u0.unwrap_or(600.);
-        let mut process = Process {
+        let surface = self
+            .surface
+            .derive(SurfaceLaw::Mos3, label, tnom, self.common.pol, cox)?;
+        let alpha = self
+            .surface
+            .nsub
+            .map_or(0., |nsub| (EPSILON_SI + EPSILON_SI) / (CHARGE * nsub * 1e6));
+        Ok(Process {
             cox,
             kp: self.kp.unwrap_or(u0 * cox * 1e-4),
             u0,
-            phi: self.phi.unwrap_or(0.6),
-            gamma: self.gamma.unwrap_or(0.),
-            vto: self.vto.unwrap_or(0.),
-            alpha: 0.,
-            depletion: 0.,
-            narrow: 0.,
-        };
-        if let Some(nsub) = self.nsub {
-            if nsub * 1e6 <= intrinsic {
-                return Err(SpiceError::circuit(format!(
-                    "{label} NSUB={nsub} is below the intrinsic density ({}temp.c: Nsub < Ni)",
-                    label.to_ascii_lowercase()
-                )));
-            }
-            if self.phi.is_none() {
-                process.phi = (2. * vtnom * (nsub * 1e6 / intrinsic).ln()).max(0.1);
-            }
-            let fermis = pol * 0.5 * process.phi;
-            let tpg = self.tpg.unwrap_or(1.);
-            let wkfng = if tpg == 0. {
-                3.2
-            } else {
-                let fermig = pol * tpg * 0.5 * egfet1;
-                3.25 + 0.5 * egfet1 - fermig
-            };
-            let wkfngs = wkfng - (3.25 + 0.5 * egfet1 + fermis);
-            if self.gamma.is_none() {
-                // C's left-to-right product, `nsub * 1e6` last.
-                process.gamma = (2. * EPSILON_SI * CHARGE * nsub * 1e6).sqrt() / cox;
-            }
-            if self.vto.is_none() {
-                let vfb = wkfngs - self.nss.unwrap_or(0.) * 1e4 * CHARGE / cox;
-                process.vto = vfb + pol * (process.gamma * process.phi.sqrt() + process.phi);
-            }
-            process.alpha = (EPSILON_SI + EPSILON_SI) / (CHARGE * nsub * 1e6);
-            process.depletion = process.alpha.sqrt();
-        }
-        process.narrow = self.delta * 0.5 * std::f64::consts::PI * EPSILON_SI / cox;
-        Ok(process)
+            surface,
+            alpha,
+            depletion: alpha.sqrt(),
+            narrow: self.delta * 0.5 * std::f64::consts::PI * EPSILON_SI / cox,
+        })
     }
 }
 
@@ -763,6 +714,14 @@ mod tests {
     /// A level-3 card without the schema: every effect switched on.
     fn level(nfs: Real, vmax: Real, nsub: bool) -> Level3 {
         Level3 {
+            surface: SurfaceCard {
+                vto: Some(0.7),
+                gamma: Some(0.5),
+                phi: Some(0.7),
+                nsub: nsub.then_some(2e16),
+                tpg: None,
+                nss: None,
+            },
             common: Common {
                 pol: 1.,
                 rd: None,
@@ -786,19 +745,13 @@ mod tests {
                 nlev: 2,
                 gdsnoi: 1.,
             },
-            vto: Some(0.7),
             kp: Some(60e-6),
-            gamma: Some(0.5),
-            phi: Some(0.7),
             tox: 20e-9,
             xl: 0.,
             wd: 0.,
             xw: 0.,
             delvto: 0.,
             u0: Some(500.),
-            nsub: nsub.then_some(2e16),
-            tpg: None,
-            nss: None,
             vmax,
             xj: 0.25e-6,
             nfs,
