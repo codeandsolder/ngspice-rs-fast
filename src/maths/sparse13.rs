@@ -103,7 +103,7 @@ impl Scalar for f64 {
         self == 0.0
     }
     fn is_finite(self) -> bool {
-        f64::is_finite(self)
+        Self::is_finite(self)
     }
     fn add_real(self, r: f64) -> Self {
         self + r
@@ -155,7 +155,7 @@ impl Scalar for Complex {
         self.re == 0.0 && self.im == 0.0
     }
     fn is_finite(self) -> bool {
-        Complex::is_finite(self)
+        Self::is_finite(self)
     }
     fn add_real(self, r: f64) -> Self {
         Self::new(self.re + r, self.im)
@@ -201,7 +201,7 @@ impl PlanIndex for usize {
 
 impl PlanIndex for u32 {
     fn pack(index: usize) -> Self {
-        u32::try_from(index).expect("compact traversal plan index fits")
+        Self::try_from(index).expect("compact traversal plan index fits")
     }
     fn unpack(self) -> usize {
         usize::try_from(self).expect("u32 fits the index width")
@@ -413,13 +413,13 @@ impl Topology {
         let mut e = self.col_get(last);
         while e != NONE {
             let r = self.elements[e].row;
-            if r < row {
-                last = Slot::After(e);
-                e = self.elements[e].next_in_col;
-            } else if r == row {
-                return (last, e);
-            } else {
-                break;
+            match r.cmp(&row) {
+                std::cmp::Ordering::Less => {
+                    last = Slot::After(e);
+                    e = self.elements[e].next_in_col;
+                }
+                std::cmp::Ordering::Equal => return (last, e),
+                std::cmp::Ordering::Greater => break,
             }
         }
         (last, NONE)
@@ -498,7 +498,24 @@ impl Topology {
             above1 = Slot::After(p);
             p = self.col_get(above1);
         }
-        if e1 != NONE {
+        if e1 == NONE {
+            let below1 = p;
+            if self.elements[below1].row != row2 {
+                let mut above2;
+                loop {
+                    above2 = Slot::After(p);
+                    p = self.col_get(above2);
+                    if self.elements[p].row >= row2 {
+                        break;
+                    }
+                }
+                let below2 = self.elements[e2].next_in_col;
+                self.col_set(above2, below2);
+                self.col_set(above1, e2);
+                self.elements[e2].next_in_col = below1;
+            }
+            self.elements[e2].row = row1;
+        } else {
             let below1 = self.elements[e1].next_in_col;
             if e2 == NONE {
                 if below1 != NONE && self.elements[below1].row < row2 {
@@ -541,23 +558,6 @@ impl Topology {
                 self.elements[e1].row = row2;
                 self.elements[e2].row = row1;
             }
-        } else {
-            let below1 = p;
-            if self.elements[below1].row != row2 {
-                let mut above2;
-                loop {
-                    above2 = Slot::After(p);
-                    p = self.col_get(above2);
-                    if self.elements[p].row >= row2 {
-                        break;
-                    }
-                }
-                let below2 = self.elements[e2].next_in_col;
-                self.col_set(above2, below2);
-                self.col_set(above1, e2);
-                self.elements[e2].next_in_col = below1;
-            }
-            self.elements[e2].row = row1;
         }
     }
 
@@ -576,7 +576,24 @@ impl Topology {
             left1 = Slot::After(p);
             p = self.row_get(left1);
         }
-        if e1 != NONE {
+        if e1 == NONE {
+            let right1 = p;
+            if self.elements[right1].col != col2 {
+                let mut left2;
+                loop {
+                    left2 = Slot::After(p);
+                    p = self.row_get(left2);
+                    if self.elements[p].col >= col2 {
+                        break;
+                    }
+                }
+                let right2 = self.elements[e2].next_in_row;
+                self.row_set(left2, right2);
+                self.row_set(left1, e2);
+                self.elements[e2].next_in_row = right1;
+            }
+            self.elements[e2].col = col1;
+        } else {
             let right1 = self.elements[e1].next_in_row;
             if e2 == NONE {
                 if right1 != NONE && self.elements[right1].col < col2 {
@@ -619,23 +636,6 @@ impl Topology {
                 self.elements[e1].col = col2;
                 self.elements[e2].col = col1;
             }
-        } else {
-            let right1 = p;
-            if self.elements[right1].col != col2 {
-                let mut left2;
-                loop {
-                    left2 = Slot::After(p);
-                    p = self.row_get(left2);
-                    if self.elements[p].col >= col2 {
-                        break;
-                    }
-                }
-                let right2 = self.elements[e2].next_in_row;
-                self.row_set(left2, right2);
-                self.row_set(left1, e2);
-                self.elements[e2].next_in_row = right1;
-            }
-            self.elements[e2].col = col1;
         }
     }
 
@@ -710,6 +710,22 @@ impl Topology {
     }
 }
 
+/// Parity of the row/column permutation accumulated during ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermutationParity {
+    Even,
+    Odd,
+}
+
+impl PermutationParity {
+    const fn toggle(&mut self) {
+        *self = match self {
+            Self::Even => Self::Odd,
+            Self::Odd => Self::Even,
+        };
+    }
+}
+
 /// A SPARSE matrix frame (`struct MatrixFrame`) with 1-based internal and
 /// external indices; external index 0 (ground) is never used here.
 #[derive(Debug, Clone)]
@@ -736,7 +752,7 @@ pub(super) struct Sparse<T> {
     rows_linked: bool,
     needs_ordering: bool,
     factored: bool,
-    interchanges_odd: bool,
+    parity: PermutationParity,
     status: Status,
     singular_row: usize,
     singular_col: usize,
@@ -775,7 +791,7 @@ impl<T: Scalar> Sparse<T> {
             rows_linked: false,
             needs_ordering: true,
             factored: false,
-            interchanges_odd: false,
+            parity: PermutationParity::Even,
             status: Status::Okay,
             singular_row: 0,
             singular_col: 0,
@@ -891,7 +907,7 @@ impl<T: Scalar> Sparse<T> {
         self.reset_numeric_status();
     }
 
-    fn reset_numeric_status(&mut self) {
+    const fn reset_numeric_status(&mut self) {
         self.status = Status::Okay;
         self.factored = false;
         self.singular_row = 0;
@@ -909,8 +925,7 @@ impl<T: Scalar> Sparse<T> {
         let mut sparse = Self::new(size);
         let entries = entries.into_iter();
         let capacity = entries.size_hint().0;
-        let topology =
-            std::sync::Arc::get_mut(&mut sparse.topology).expect("new topology is unique");
+        let topology = std::sync::Arc::make_mut(&mut sparse.topology);
         topology.elements.reserve(capacity);
         sparse.values.reserve(capacity);
         for (row, col, value) in entries {
@@ -978,7 +993,7 @@ impl<T: Scalar> Sparse<T> {
             needs_ordering: self.needs_ordering,
             // The frame retains the order, not the numeric factors.
             factored: false,
-            interchanges_odd: self.interchanges_odd,
+            parity: self.parity,
             status: self.status,
             singular_row: self.singular_row,
             singular_col: self.singular_col,
@@ -1006,7 +1021,7 @@ impl<T: Scalar> Sparse<T> {
             rows_linked: self.rows_linked,
             needs_ordering: self.needs_ordering,
             factored: false,
-            interchanges_odd: self.interchanges_odd,
+            parity: self.parity,
             status: self.status,
             singular_row: self.singular_row,
             singular_col: self.singular_col,
@@ -1209,7 +1224,7 @@ impl<T: Scalar> Sparse<T> {
         topology.ext_to_int_col[topology.int_to_ext_col[c1]] = c1;
         topology.diag[c1] = t2;
         topology.diag[c2] = t1;
-        self.interchanges_odd = !self.interchanges_odd;
+        self.parity.toggle();
     }
 
     /// `spDeterminant`: normalized decimal mantissa and exponent, or zero
@@ -1253,7 +1268,7 @@ impl<T: Scalar> Sparse<T> {
             det = normalize_decimal(next, &mut exponent, DecimalScale::Coarse);
         }
         det = normalize_decimal(det, &mut exponent, DecimalScale::Final);
-        if self.interchanges_odd {
+        if self.parity == PermutationParity::Odd {
             det = det.scale(-1.0);
         }
         let exponent = i32::try_from(exponent)
@@ -1280,7 +1295,11 @@ impl<T: Scalar> Sparse<T> {
         }
         let mut step = 1;
         let mut reorder = false;
-        if !self.needs_ordering {
+        if self.needs_ordering {
+            if !self.rows_linked {
+                self.link_rows();
+            }
+        } else {
             // A failed partial reorder may have invalidated the plan.
             // Retain its numbering like C; initialize scratch in case
             // completing the previously attempted prefix creates fill-ins.
@@ -1307,10 +1326,6 @@ impl<T: Scalar> Sparse<T> {
             }
             if !reorder {
                 return self.done();
-            }
-        } else {
-            if !self.rows_linked {
-                self.link_rows();
             }
         }
         // Reordering always rebuilds all active counts. A snapshot fork
@@ -1403,9 +1418,12 @@ impl<T: Scalar> Sparse<T> {
         // C retains a partial order after a singular reordering. If
         // topology changed, no complete numeric traversal is available;
         // retry the threshold path, preserving C's existing pivot prefix.
-        if !self.can_refactor() {
+        if self.needs_ordering {
             return self.order_and_factor(0.0, 0.0);
         }
+        let Some(plan) = self.plan.as_deref() else {
+            return self.order_and_factor(0.0, 0.0);
+        };
         self.factored = false;
         let size = self.size;
         if size == 0 {
@@ -1424,10 +1442,6 @@ impl<T: Scalar> Sparse<T> {
         workspace.resize(size + 1, T::ZERO);
         workspace.fill(T::ZERO);
         let dest = workspace;
-        let plan = self
-            .plan
-            .as_deref()
-            .expect("ordered sparse frame has a traversal plan");
         let result = match plan {
             FactorPlan::Compact(runs) => runs.refactor(&mut self.values, &self.topology.diag, dest),
             FactorPlan::Wide(runs) => runs.refactor(&mut self.values, &self.topology.diag, dest),
@@ -1779,10 +1793,10 @@ impl<T: Scalar> Sparse<T> {
         while e != NONE && self.topology.elements[e].row < step {
             e = self.topology.elements[e].next_in_col;
         }
-        let mut largest = if self.topology.elements[e].row != row {
-            self.mag(e)
-        } else {
+        let mut largest = if self.topology.elements[e].row == row {
             0.0
+        } else {
+            self.mag(e)
         };
         e = self.topology.elements[e].next_in_col;
         while e != NONE {
@@ -1830,13 +1844,13 @@ impl<T: Scalar> Sparse<T> {
             let old_col = self.markowitz_prod[col];
             if row != step {
                 self.row_exchange(step, row);
-                self.interchanges_odd = !self.interchanges_odd;
+                self.parity.toggle();
                 self.markowitz_prod[row] = self.product_of(row);
                 self.track_singleton(self.markowitz_prod[row], old_row);
             }
             if col != step {
                 self.col_exchange(step, col);
-                self.interchanges_odd = !self.interchanges_odd;
+                self.parity.toggle();
                 self.markowitz_prod[col] = self.product_of(col);
                 self.track_singleton(self.markowitz_prod[col], old_col);
                 std::sync::Arc::make_mut(&mut self.topology).diag[col] =
@@ -1959,7 +1973,7 @@ impl<T: Scalar> Sparse<T> {
     /// A partially eliminated frame cannot serve retained solves or continue
     /// using its possibly incomplete ordering. A later clear/reload may
     /// safely restart ordering with its existing structure.
-    fn nonfinite_factor(&mut self) -> Status {
+    const fn nonfinite_factor(&mut self) -> Status {
         self.status = Status::NonFinite;
         self.factored = false;
         self.needs_ordering = true;
@@ -2056,7 +2070,7 @@ impl<T: Scalar> Sparse<T> {
             .expect("factored sparse frame has a traversal plan");
         match plan {
             FactorPlan::Compact(runs) => {
-                runs.solve_transposed(&self.values, &self.topology.diag, x)
+                runs.solve_transposed(&self.values, &self.topology.diag, x);
             }
             FactorPlan::Wide(runs) => runs.solve_transposed(&self.values, &self.topology.diag, x),
         }
