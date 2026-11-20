@@ -62,7 +62,7 @@ impl ScaleValue for Complex {
         self.re.abs().max(self.im.abs())
     }
     fn magnitude(self) -> f64 {
-        Complex::magnitude(self)
+        Self::magnitude(self)
     }
     fn finite(self) -> bool {
         self.is_finite()
@@ -207,11 +207,9 @@ impl Equilibration {
         if x.iter().any(|v| !v.is_finite()) {
             return Err(numerical("equilibration", "non-finite balancing exponent"));
         }
-        let limit = f64::from(MAX_SCALING_EXPONENT);
-        let power = |e: &f64| 2.0_f64.powi(e.round().clamp(-limit, limit) as i32);
         Ok(Self {
-            rows: x[..n].iter().map(power).collect(),
-            columns: x[n..].iter().map(power).collect(),
+            rows: x[..n].iter().copied().map(balanced_factor).collect(),
+            columns: x[n..].iter().copied().map(balanced_factor).collect(),
         })
     }
 
@@ -256,6 +254,16 @@ fn floor_log2(v: f64, what: impl FnOnce() -> String) -> SpiceResult<i32> {
     }
     crate::primitives::value::binary_exponent(v)
         .ok_or_else(|| numerical("equilibration", "invalid binary exponent"))
+}
+
+/// Quantize a finite least-squares exponent to the supported power-of-two range.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the rounded exponent is finite and clamped to the exact i32 interval -512..=512"
+)]
+fn balanced_factor(exponent: f64) -> f64 {
+    let limit = f64::from(MAX_SCALING_EXPONENT);
+    2.0_f64.powi(exponent.round().clamp(-limit, limit) as i32)
 }
 
 fn factors(maxima: &[f64], namespace: &str) -> SpiceResult<Vec<f64>> {
@@ -357,6 +365,19 @@ pub struct BackwardError {
     pub row_bounds: Vec<f64>,
 }
 
+/// The opt-in LU residual policy uses the dimension as a floating-point scale.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the error budget is a floating-point scale rather than an integer index"
+)]
+fn residual_tolerance(n: usize) -> f64 {
+    128.0 * f64::EPSILON * n as f64
+}
+
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "retain separately rounded residual-bound products to preserve existing acceptance thresholds"
+)]
 fn check_residual<T: ScaleValue>(
     n: usize,
     entries: &[Entry<T>],
@@ -376,7 +397,7 @@ fn check_residual<T: ScaleValue>(
         ax[r] = ax[r] + v * x[c];
         bounds[r] += v.magnitude() * max_x;
     }
-    let tol = 128.0 * f64::EPSILON * n as f64;
+    let tol = residual_tolerance(n);
     let mut residuals = Vec::with_capacity(n);
     for r in 0..n {
         let error = (ax[r] - rhs[r]).magnitude();
