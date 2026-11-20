@@ -47,7 +47,8 @@ fn companion_coefficients<'a>(
             "{name}: companion transient load without integration coefficients"
         ))
     })?;
-    if coefficients.dt() != dt {
+    // These must be the very same trial timestep, not merely close.
+    if coefficients.dt().partial_cmp(&dt) != Some(std::cmp::Ordering::Equal) {
         return Err(SpiceError::circuit(format!(
             "{name}: load timestep {dt} differs from integration timestep {}",
             coefficients.dt()
@@ -480,7 +481,7 @@ pub(super) struct ReactiveLoad<'a> {
 }
 
 impl ReactiveLoad<'_> {
-    /// Perform NIintegrate and publish the trial charge/flux and derivative.
+    /// Perform `NIintegrate` and publish the trial charge/flux and derivative.
     /// MODEINITTRAN patches state1 before integration and its derivative
     /// afterwards; the trial owns those patches until acceptance.
     fn companion(
@@ -548,7 +549,8 @@ impl ReactiveLoad<'_> {
         let row = context.branch(0)?;
         let mut flux = self.value * context.row_value(row)?;
         for term in context.mutual {
-            flux += term.inductance * context.row_value(term.row)?;
+            let mutual_flux = term.inductance * context.row_value(term.row)?;
+            flux += mutual_flux;
         }
         if context.mode.is_dc() {
             record_dc_state(context, flux)?;
@@ -578,7 +580,8 @@ impl ReactiveLoad<'_> {
             // INDgetic defaults INDinitCond to the uic start vector's value.
             let mut flux = self.value * self.initial.unwrap_or(context.row_value(row)?);
             for term in context.mutual {
-                flux += term.inductance * term.initial;
+                let mutual_flux = term.inductance * term.initial;
+                flux += mutual_flux;
             }
             flux
         } else {
