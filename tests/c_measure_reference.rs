@@ -84,18 +84,58 @@ fn c_results(tag: &str, deck: &str) -> Vec<(String, Real)> {
         !output.contains("failed!"),
         "{tag}: C reported a failed measurement:\n{output}"
     );
-    output
-        .lines()
-        .filter_map(|line| {
-            let (name, rest) = line.split_once('=')?;
-            let name = name.trim();
-            if name.is_empty() || name.contains(' ') {
-                return None;
+    measurement_results(&output)
+}
+
+/// Restrict name/value parsing to C's measurement report, not its trailing
+/// resource accounting (which includes the valid-looking line `Stack = 0 bytes.`).
+fn measurement_results(output: &str) -> Vec<(String, Real)> {
+    let mut measuring = false;
+    let mut started = false;
+    let mut results = Vec::new();
+    for line in output.lines().map(str::trim) {
+        if line.starts_with("Measurements for ") && line.ends_with(" Analysis") {
+            measuring = true;
+            started = false;
+            continue;
+        }
+        if !measuring {
+            continue;
+        }
+        if line.is_empty() {
+            if started {
+                measuring = false;
             }
-            let value = rest.split_whitespace().next()?;
-            Some((name.to_owned(), value.parse::<Real>().ok()?))
-        })
-        .collect()
+            continue;
+        }
+        started = true;
+        let Some((name, rest)) = line.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() || name.chars().any(char::is_whitespace) {
+            continue;
+        }
+        if let Some(value) = rest.split_whitespace().next()
+            && let Ok(value) = value.parse::<Real>()
+        {
+            results.push((name.to_owned(), value));
+        }
+    }
+    results
+}
+
+#[test]
+fn measurement_report_excludes_resource_statistics_but_preserves_all_results() {
+    let output = "Measurements for DC Analysis\n\n                  gain = 2.00000e+00 at= 1.00000e+00\n                  stack = 3.00000e+00\n\n                  Stack = 0 bytes.\n                  Measurements for AC Analysis\n\n                  phase = -1.50000e+00\n\n                  Stack = 0 bytes.";
+    assert_eq!(
+        measurement_results(output),
+        vec![
+            ("gain".to_owned(), 2.0),
+            ("stack".to_owned(), 3.0),
+            ("phase".to_owned(), -1.5)
+        ]
+    );
 }
 
 /// Runs both engines on one deck and compares every named measurement.
@@ -119,7 +159,7 @@ fn compare(tag: &str, kind: AnalysisKind, deck: &str) {
     assert_eq!(
         ours.len(),
         theirs.len(),
-        "{tag}: the two engines measured a different set"
+        "{tag}: the two engines measured a different set: Rust {ours:?}; C {theirs:?}"
     );
     let _ = kind;
 }
