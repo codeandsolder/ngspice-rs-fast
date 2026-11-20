@@ -275,10 +275,10 @@ impl ComplexMatrix {
     /// Structurally or numerically singular matrix.
     pub fn factorize(&self) -> SpiceResult<ComplexLu> {
         if let Some(pattern) = &self.bound {
-            let values: Vec<Complex> = self.entries.iter().map(|&(_, _, v)| v).collect();
+            let values = self.entries.iter().map(|&(_, _, v)| v);
             let (sparse, handles) = crate::maths::linear::factor_shared_complex(
                 pattern,
-                &values,
+                values,
                 self.pivot,
                 self.names.as_ref(),
             )?;

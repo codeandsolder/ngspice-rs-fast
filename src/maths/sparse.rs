@@ -772,17 +772,24 @@ impl SparseMatrix {
         }
         self.triplets
             .sort_by_key(|triplet| (triplet.row, triplet.col));
-        let mut folded: Vec<Triplet> = Vec::with_capacity(self.triplets.len());
-        for triplet in self.triplets.drain(..) {
-            match folded.last_mut() {
-                Some(last) if last.row == triplet.row && last.col == triplet.col => {
+        // Stable sorting preserves the order of equal stamps. Compact in
+        // place, retaining the first value and adding subsequent values in
+        // exactly the same order, even through intermediate cancellations.
+        let mut len = 0;
+        for read in 0..self.triplets.len() {
+            let triplet = self.triplets[read];
+            if len > 0 {
+                let last = &mut self.triplets[len - 1];
+                if last.row == triplet.row && last.col == triplet.col {
                     last.value += triplet.value;
+                    continue;
                 }
-                _ => folded.push(triplet),
             }
+            self.triplets[len] = triplet;
+            len += 1;
         }
-        folded.retain(|triplet| triplet.value != 0.0);
-        self.triplets = folded;
+        self.triplets.truncate(len);
+        self.triplets.retain(|triplet| triplet.value != 0.0);
         self.folded = true;
     }
 
@@ -918,9 +925,47 @@ impl SparseMatrix {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn folding_compacts_in_place_in_stable_stamp_order() {
+        let mut matrix = SparseMatrix::new(3, 3);
+        for (row, col, value) in [
+            (1, 2, 1e16),
+            (0, 0, 2.),
+            (1, 2, -1e16),
+            (2, 0, -1.),
+            (0, 0, -2.),
+            (1, 2, 1.),
+            (2, 0, 1.),
+        ] {
+            matrix.add(row, col, value).unwrap();
+        }
+        let allocation = matrix.triplets.as_ptr();
+        let capacity = matrix.triplets.capacity();
+        matrix.fold_duplicates();
+        assert_eq!(matrix.triplets.as_ptr(), allocation);
+        assert_eq!(matrix.triplets.capacity(), capacity);
+        assert_eq!(
+            matrix.triplets(),
+            &[Triplet {
+                row: 1,
+                col: 2,
+                value: 1.
+            }]
+        );
+        matrix.fold_duplicates();
+        assert_eq!(
+            matrix.triplets(),
+            &[Triplet {
+                row: 1,
+                col: 2,
+                value: 1.
+            }]
+        );
+    }
+
     use std::sync::Arc;
 
-    use super::{FixedStamps, Pattern, SparseMatrix};
+    use super::{FixedStamps, Pattern, SparseMatrix, Triplet};
     use crate::maths::dense::Vector;
 
     /// One device's load of `stamps` into a fresh matrix bound to `pattern`,

@@ -37,7 +37,11 @@ impl DenseComplex {
     /// The `n x n` identity (`ceye`).
     #[must_use]
     pub fn identity(n: usize) -> Self {
-        Self::diagonal(&vec![Complex::real(1.); n])
+        let mut matrix = Self::zeros(n);
+        for i in 0..n {
+            matrix.data[i * n + i] = Complex::real(1.);
+        }
+        matrix
     }
 
     /// A diagonal matrix.

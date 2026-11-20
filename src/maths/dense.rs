@@ -288,6 +288,12 @@ pub struct Vector {
     data: Vec<Real>,
 }
 
+impl From<Vec<Real>> for Vector {
+    fn from(data: Vec<Real>) -> Self {
+        Self { data }
+    }
+}
+
 impl Vector {
     /// A zeroed vector of `len` elements.
     #[must_use]

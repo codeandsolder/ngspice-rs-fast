@@ -373,7 +373,7 @@ fn solve_reusing(
 /// A singular matrix.
 pub(in crate::maths) fn factor_shared_complex(
     pattern: &Arc<Pattern>,
-    values: &[crate::primitives::Complex],
+    values: impl Iterator<Item = crate::primitives::Complex> + Clone,
     pivot: PivotTolerances,
     names: Option<&UnknownNames>,
 ) -> SpiceResult<(Sparse<crate::primitives::Complex>, Arc<Vec<usize>>)> {
@@ -400,8 +400,8 @@ pub(in crate::maths) fn factor_shared_complex(
     };
     let load = |sparse: &mut Sparse<Complex>| {
         sparse.clear();
-        for (handle, value) in handles.iter().zip(values) {
-            sparse.set(*handle, *value);
+        for (handle, value) in handles.iter().zip(values.clone()) {
+            sparse.set(*handle, value);
         }
     };
     load(&mut sparse);
@@ -445,7 +445,25 @@ pub enum NiStep {
 /// A SPARSE frame for `matrix` with elements created in its order (a bound
 /// matrix's pattern order, else folded row-major), values loaded, not yet
 /// ordered.
-fn fresh_frame(matrix: &SparseMatrix) -> SpiceResult<(Sparse<f64>, SparseSymbolic)> {
+struct LoadedFrame {
+    sparse: Sparse<f64>,
+    key: Key,
+    handles: Arc<Vec<usize>>,
+}
+
+impl LoadedFrame {
+    fn into_symbolic(self, n: usize, factored: Option<Arc<FactoredInputs>>) -> SparseSymbolic {
+        SparseSymbolic {
+            n,
+            key: self.key,
+            handles: self.handles,
+            sparse: Arc::new(self.sparse),
+            factored,
+        }
+    }
+}
+
+fn fresh_frame(matrix: &SparseMatrix) -> SpiceResult<LoadedFrame> {
     if let Some((pattern, values)) = matrix.bound_values() {
         square(matrix.rows(), matrix.cols())?;
         finite_bound(values)?;
@@ -459,14 +477,11 @@ fn fresh_frame(matrix: &SparseMatrix) -> SpiceResult<(Sparse<f64>, SparseSymboli
                 handle
             })
             .collect();
-        let symbolic = SparseSymbolic {
-            n: pattern.order(),
+        return Ok(LoadedFrame {
+            sparse,
             key: Key::Pattern(Arc::downgrade(pattern)),
             handles: Arc::new(handles),
-            sparse: Arc::new(Sparse::new(0)),
-            factored: None,
-        };
-        return Ok((sparse, symbolic));
+        });
     }
     let matrix = assembled(matrix)?;
     let n = matrix.rows();
@@ -481,14 +496,11 @@ fn fresh_frame(matrix: &SparseMatrix) -> SpiceResult<(Sparse<f64>, SparseSymboli
             handle
         })
         .collect();
-    let symbolic = SparseSymbolic {
-        n,
+    Ok(LoadedFrame {
+        sparse,
         key: Key::Triplets(Arc::new(pattern)),
         handles: Arc::new(handles),
-        sparse: Arc::new(Sparse::new(0)),
-        factored: None,
-    };
-    Ok((sparse, symbolic))
+    })
 }
 
 /// One `NIiter` step on `matrix`: the factorization ngspice performs after a
@@ -549,7 +561,7 @@ fn ni_step(
         *ordering = Some(lu.symbolic);
         return result;
     }
-    let (mut sparse, symbolic, fresh) = if let Some(previous) = previous {
+    let (mut frame, fresh) = if let Some(previous) = previous {
         let mut sparse =
             Arc::try_unwrap(previous.sparse).unwrap_or_else(|shared| (*shared).clone());
         let values = matrix_values(matrix)?;
@@ -557,15 +569,17 @@ fn ni_step(
         for (handle, value) in previous.handles.iter().zip(values.iter()) {
             sparse.set(*handle, *value);
         }
-        let symbolic = SparseSymbolic {
-            sparse: Arc::new(Sparse::new(0)),
-            factored: None,
-            ..previous
-        };
-        (sparse, symbolic, false)
+        (
+            LoadedFrame {
+                sparse,
+                key: previous.key,
+                handles: previous.handles,
+            },
+            false,
+        )
     } else {
-        let (mut sparse, symbolic) = fresh_frame(matrix)?;
-        if !sparse.fully_translated() {
+        let mut frame = fresh_frame(matrix)?;
+        if !frame.sparse.fully_translated() {
             // A circuit's matrix (bound, or carrying unknown names)
             // follows C: an unknown without entries stays untranslated
             // and its solution entry holds the RHS. A standalone one
@@ -576,11 +590,12 @@ fn ni_step(
                     "singular matrix: an unknown has no matrix entries",
                 ));
             }
-            warn_untranslated(&sparse, matrix.unknown_names());
+            warn_untranslated(&frame.sparse, matrix.unknown_names());
         }
-        sparse.mna_preorder();
-        (sparse, symbolic, true)
+        frame.sparse.mna_preorder();
+        (frame, true)
     };
+    let sparse = &mut frame.sparse;
     sparse.load_gmin(diag_gmin);
     let status = if fresh || reorder {
         sparse.order_and_factor(pivot.relative, pivot.absolute)
@@ -592,7 +607,7 @@ fn ni_step(
     let checked = if zero_pivot {
         Ok(())
     } else {
-        check_status("sparse LU", status, &sparse, matrix.unknown_names())
+        check_status("sparse LU", status, sparse, matrix.unknown_names())
     };
     // Only a clean refactorization of a bound matrix is reusable: a fresh
     // order or a reorder may change the pivots, and a small or zero pivot
@@ -603,11 +618,7 @@ fn ni_step(
         }
         _ => None,
     };
-    let factored = SparseSymbolic {
-        sparse: Arc::new(sparse),
-        factored: inputs,
-        ..symbolic
-    };
+    let factored = frame.into_symbolic(matrix.rows(), inputs);
     let result = checked.and_then(|()| {
         if zero_pivot {
             return Ok(NiStep::ZeroPivot);
@@ -656,10 +667,13 @@ pub struct SparseLu {
     symbolic: SparseSymbolic,
 }
 
-fn assembled(matrix: &SparseMatrix) -> SpiceResult<SparseMatrix> {
+fn assembled(matrix: &SparseMatrix) -> SpiceResult<Cow<'_, SparseMatrix>> {
     square(matrix.rows(), matrix.cols())?;
     if matrix.triplets().iter().any(|t| !t.value.is_finite()) {
         return Err(numerical("sparse LU assembly", "non-finite coefficient"));
+    }
+    if matrix.is_folded() {
+        return Ok(Cow::Borrowed(matrix));
     }
     let mut matrix = matrix.clone();
     matrix.fold_duplicates();
@@ -669,7 +683,7 @@ fn assembled(matrix: &SparseMatrix) -> SpiceResult<SparseMatrix> {
             "duplicate summation overflow",
         ));
     }
-    Ok(matrix)
+    Ok(Cow::Owned(matrix))
 }
 
 fn finite_bound(values: &[f64]) -> SpiceResult<()> {
@@ -712,67 +726,16 @@ impl SparseLu {
             }
             return Self::refactor(previous.clone(), matrix);
         }
-        if let Some((pattern, values)) = matrix.bound_values() {
-            square(matrix.rows(), matrix.cols())?;
-            finite_bound(values)?;
-            // Elements are created in pattern (device stamp) order, zeros
-            // included, as `TSTALLOC` creates them in ngspice.
-            let mut sparse = Sparse::new(pattern.order());
-            let handles: Vec<_> = (0..pattern.len())
-                .map(|index| {
-                    let id = crate::maths::sparse::element_id(index);
-                    let (row, col) = pattern.position(id);
-                    let handle = sparse.get_element(row + 1, col + 1);
-                    sparse.set(handle, values[index]);
-                    handle
-                })
-                .collect();
-            // A bound matrix is a circuit's, so it follows C.
-            order_fresh(
-                "sparse LU",
-                &mut sparse,
-                matrix.pivot_tolerances(),
-                matrix.unknown_names(),
-                true,
-            )?;
-            return Ok(Self {
-                symbolic: SparseSymbolic {
-                    n: pattern.order(),
-                    key: Key::Pattern(Arc::downgrade(pattern)),
-                    handles: Arc::new(handles),
-                    sparse: Arc::new(sparse),
-                    factored: None,
-                },
-            });
-        }
-        let matrix = assembled(matrix)?;
-        let n = matrix.rows();
-        let pattern: Vec<_> = matrix.triplets().iter().map(|t| (t.row, t.col)).collect();
-        let mut sparse = Sparse::new(n);
-        let handles: Vec<_> = matrix
-            .triplets()
-            .iter()
-            .map(|t| {
-                let handle = sparse.get_element(t.row + 1, t.col + 1);
-                sparse.set(handle, t.value);
-                handle
-            })
-            .collect();
+        let mut frame = fresh_frame(matrix)?;
         order_fresh(
             "sparse LU",
-            &mut sparse,
+            &mut frame.sparse,
             matrix.pivot_tolerances(),
             matrix.unknown_names(),
-            matrix.unknown_names().is_some(),
+            matrix.bound_values().is_some() || matrix.unknown_names().is_some(),
         )?;
         Ok(Self {
-            symbolic: SparseSymbolic {
-                n,
-                key: Key::Triplets(Arc::new(pattern)),
-                handles: Arc::new(handles),
-                sparse: Arc::new(sparse),
-                factored: None,
-            },
+            symbolic: frame.into_symbolic(matrix.rows(), None),
         })
     }
 
@@ -825,7 +788,7 @@ impl SparseLu {
     /// Invalid RHS or non-finite solution.
     pub fn solve(&self, rhs: &Vector) -> SpiceResult<Vector> {
         rhs_valid(rhs, self.symbolic.n)?;
-        let x = Vector::from_slice(&self.symbolic.sparse.solve(rhs.as_slice()));
+        let x = Vector::from(self.symbolic.sparse.solve(rhs.as_slice()));
         if !x.is_finite() {
             return Err(numerical(
                 "LU solve",
@@ -881,5 +844,64 @@ impl DenseLu {
     /// Invalid RHS or non-finite solution.
     pub fn solve(&self, rhs: &Vector) -> SpiceResult<Vector> {
         self.factor.solve(rhs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::maths::complex::ComplexMatrix;
+
+    #[test]
+    fn complex_frame_retains_order_but_not_real_factors() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 1), (1, 0), (1, 1), (0, 0)]));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        a.add(0, 1, 2.).unwrap();
+        a.add(1, 0, 3.).unwrap();
+        a.add(1, 1, 4.).unwrap();
+        let rhs = Vector::from_slice(&[4., 11.]);
+        let NiStep::Solved(before) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
+            panic!("first factorization failed");
+        };
+        assert_eq!(
+            solve_last_factors(&pattern, &rhs).unwrap(),
+            Some(before.clone())
+        );
+        let mut e = SparseMatrix::new(2, 2);
+        e.add(0, 0, 0.5).unwrap();
+        let ac = ComplexMatrix::from_operators_on(&pattern, &a, &e, 2.)
+            .unwrap()
+            .unwrap()
+            .factorize()
+            .unwrap();
+        assert!(
+            ac.solve(&[
+                crate::primitives::Complex::real(4.),
+                crate::primitives::Complex::real(11.)
+            ])
+            .is_ok()
+        );
+        // The retained frame is retyped with zero coefficients. Its order
+        // can be reused, but it cannot answer a real solve until reloaded.
+        assert_eq!(solve_last_factors(&pattern, &rhs).unwrap(), None);
+        let NiStep::Solved(after) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
+            panic!("refactorization failed");
+        };
+        assert_eq!(before, after);
+        assert_eq!(solve_last_factors(&pattern, &rhs).unwrap(), Some(after));
+    }
+
+    #[test]
+    fn assembled_view_borrows_folded_storage_and_checks_overflow() {
+        let mut a = SparseMatrix::new(1, 1);
+        a.add(0, 0, 2.).unwrap();
+        assert!(matches!(assembled(&a).unwrap(), Cow::Owned(_)));
+        a.fold_duplicates();
+        assert!(matches!(assembled(&a).unwrap(), Cow::Borrowed(_)));
+        a.add(0, 0, f64::MAX).unwrap();
+        a.add(0, 0, f64::MAX).unwrap();
+        assert!(assembled(&a).is_err());
+        a.fold_duplicates();
+        assert!(assembled(&a).is_err());
     }
 }

@@ -470,7 +470,8 @@ impl<T: Scalar> Sparse<T> {
             rows_linked: self.rows_linked,
             internal_vectors: self.internal_vectors,
             needs_ordering: self.needs_ordering,
-            factored: self.factored,
+            // The frame retains the order, not the numeric factors.
+            factored: false,
             interchanges_odd: self.interchanges_odd,
             status: self.status,
             singular_row: self.singular_row,
