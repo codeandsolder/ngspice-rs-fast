@@ -27,9 +27,11 @@
 /// `BSIM4NumFingerDiff`: the numbers of interior and end source/drain
 /// diffusions `(nuIntD, nuEndD, nuIntS, nuEndS)` for `nf` fingers.
 fn num_finger_diff(nf: f64, min_sd: i32) -> (f64, f64, f64, f64) {
-    // C truncates with `(int)nf`; `as` saturates where C is undefined.
-    let nf_int = nf as i32;
-    if (nf_int % 2) != 0 {
+    // C truncates with `(int)nf` solely to determine parity. Compute that
+    // parity directly, retaining the previous Rust saturation outside C's
+    // defined range (NaN is even, as its previous integer conversion was 0).
+    let nf_int = nf.trunc().clamp(f64::from(i32::MIN), f64::from(i32::MAX));
+    if (nf_int % 2.0).abs() == 1.0 {
         let int = 2.0 * f64::max((nf - 1.0) / 2.0, 0.0);
         (int, 1.0, int, 1.0)
     } else if min_sd == 1 {
@@ -398,6 +400,12 @@ mod tests {
         assert_eq!(num_finger_diff(4.0, 1), (2.0, 2.0, 4.0, 0.0));
         assert_eq!(num_finger_diff(4.0, 0), (4.0, 0.0, 2.0, 2.0));
         assert_eq!(num_finger_diff(1.0, 0), (0.0, 1.0, 0.0, 1.0));
+        // The parity truncates nf, but the diffusion equations use the
+        // original fractional value.
+        assert_eq!(num_finger_diff(3.5, 0), (2.5, 1.0, 2.5, 1.0));
+        assert_eq!(num_finger_diff(4.5, 0), (4.5, 0.0, 2.5, 2.0));
+        assert_eq!(num_finger_diff(f64::from(i32::MAX), 0).1, 1.0);
+        assert_eq!(num_finger_diff(f64::from(i32::MAX) + 1.0, 0).1, 1.0);
     }
 
     #[test]
