@@ -104,7 +104,11 @@ fn passive_parameters(
 }
 
 fn passive_model<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
-    let designator = input.state.card.designator().expect("passive card");
+    let designator = input
+        .state
+        .card
+        .designator()
+        .ok_or_else(|| malformed(input, "expected a passive device card"))?;
     // C reserves r/c/l for scalar assignment. inpcom's named-assignment
     // preprocessing also preserves keyword=value even if keyword is declared
     // as a model. Bare declared keywords in this slot *are* model references.
@@ -139,7 +143,11 @@ fn passive_model<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
 }
 
 fn passive_assignment(input: &mut Input<'_>) -> Result<ParameterAssignment> {
-    let designator = input.state.card.designator().expect("device card");
+    let designator = input
+        .state
+        .card
+        .designator()
+        .ok_or_else(|| malformed(input, "expected a passive device card"))?;
     let (token, name) = any
         .verify_map(move |token: &Token| {
             scalar_name(designator, &token.text).map(|name| (token, name))

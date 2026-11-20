@@ -16,7 +16,7 @@ use winnow::token::any;
 use crate::netlist::ast::{ModelCard, ParameterAssignment, ParameterKind};
 use crate::netlist::token::{Token, TokenKind};
 
-use super::grammar::{Input, ParsedCard, Result, gap, keyword};
+use super::grammar::{Failure, Input, ParsedCard, Result, gap, keyword};
 use super::syntax::{equals, malformed, name, named, value};
 
 pub(super) fn model_card(input: &mut Input<'_>) -> Result<ParsedCard> {
@@ -47,8 +47,14 @@ fn model_body(input: &mut Input<'_>) -> Result<ParsedCard> {
         .iter()
         .find(|parameter| parameter.name == "level")
         .map(|parameter| {
-            crate::primitives::parse_spice_number(&parameter.value).expect("validated scalar")
-        });
+            crate::primitives::parse_spice_number(&parameter.value).ok_or_else(|| {
+                ErrMode::Cut(Failure(crate::primitives::SpiceError::parse(
+                    parameter.location.clone(),
+                    "expected a literal model level",
+                )))
+            })
+        })
+        .transpose()?;
     Ok(ParsedCard::Model(ModelCard {
         name: model_name.text.to_ascii_lowercase(),
         base: base.text.to_ascii_lowercase(),
@@ -59,8 +65,7 @@ fn model_body(input: &mut Input<'_>) -> Result<ParsedCard> {
 }
 
 fn model_base<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
-    peek(name("model type")).parse_next(input)?;
-    let base = input.input.first().expect("peek succeeded");
+    let base = peek(name("model type")).parse_next(input)?;
     if !matches!(
         base.text.to_ascii_lowercase().as_str(),
         "d" | "npn" | "pnp" | "nmos" | "pmos" | "r" | "res" | "c" | "l" | "sw" | "csw" | "urc"
