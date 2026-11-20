@@ -363,7 +363,10 @@ impl Device for Resistor {
             crate::devices::sensitivity::ResistorSensitivity::new(
                 &self.name,
                 self.terminals,
-                crate::devices::sensitivity::ResistorInputs::Literal(self.resistance),
+                crate::devices::sensitivity::PassiveInputs::Literal {
+                    value: self.resistance,
+                    initial_condition: None,
+                },
                 context,
             ),
         ))
@@ -660,17 +663,14 @@ impl Device for Capacitor {
         &self,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
-        use crate::devices::sensitivity::{ReactiveInputs, ReactiveKind, ReactiveSensitivity};
-        let mut instance = vec![("capacitance", self.capacitance)];
-        instance.extend(self.initial_voltage.map(|ic| ("ic", ic)));
+        use crate::devices::sensitivity::{PassiveInputs, ReactiveKind, ReactiveSensitivity};
         Ok(Box::new(ReactiveSensitivity::new(
             ReactiveKind::Capacitor,
             &self.name,
-            None,
             self.terminals,
-            ReactiveInputs {
-                instance,
-                model: Vec::new(),
+            PassiveInputs::Literal {
+                value: self.capacitance,
+                initial_condition: self.initial_voltage,
             },
             context,
         )))
@@ -958,17 +958,14 @@ impl Device for Inductor {
         &self,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
-        use crate::devices::sensitivity::{ReactiveInputs, ReactiveKind, ReactiveSensitivity};
-        let mut instance = vec![("inductance", self.inductance)];
-        instance.extend(self.initial_current.map(|ic| ("ic", ic)));
+        use crate::devices::sensitivity::{PassiveInputs, ReactiveKind, ReactiveSensitivity};
         Ok(Box::new(ReactiveSensitivity::new(
             ReactiveKind::Inductor,
             &self.name,
-            None,
             self.terminals,
-            ReactiveInputs {
-                instance,
-                model: Vec::new(),
+            PassiveInputs::Literal {
+                value: self.inductance,
+                initial_condition: self.initial_current,
             },
             context,
         )))

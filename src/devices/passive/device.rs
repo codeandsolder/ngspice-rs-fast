@@ -209,67 +209,38 @@ impl Device for ModelPassive {
             .effective_value(context)
     }
 
-    /// `.sens`: C's resistor records from the card's model and instance
+    /// `.sens`: C's passive records from the card's model and instance
     /// setters ([`crate::devices::sensitivity`]).
     fn sensitivity(
         &self,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
-        use crate::devices::sensitivity::{ResistorInputs, ResistorSensitivity, written};
-        let (m, i) = (
-            self.parameters.model_values(),
-            self.parameters.instance_values(),
-        );
+        use crate::devices::sensitivity::{
+            PassiveInputs, ReactiveKind, ReactiveSensitivity, ResistorSensitivity,
+        };
+        let inputs = PassiveInputs::Modeled {
+            name: &self.model,
+            model: self.parameters.model_values(),
+            instance: self.parameters.instance_values(),
+        };
         match self.parameters.family() {
             ModelFamily::Resistor => Ok(Box::new(ResistorSensitivity::new(
                 &self.name,
                 self.terminals,
-                ResistorInputs::Modeled {
-                    name: &self.model,
-                    model: m,
-                    instance: i,
-                },
+                inputs,
                 context,
             ))),
             family => {
-                use crate::devices::sensitivity::{
-                    ReactiveInputs, ReactiveKind, ReactiveSensitivity,
-                };
-                type Keys = &'static [&'static str];
-                let (kind, value, instance_keys, model_keys): (_, _, Keys, Keys) = if family
-                    == ModelFamily::Capacitor
-                {
-                    (
-                        ReactiveKind::Capacitor,
-                        "capacitance",
-                        &["ic", "temp", "w", "l", "m", "tc1", "tc2", "scale"],
-                        &[
-                            "cap", "cj", "cjsw", "defw", "narrow", "short", "tc1", "tc2", "tnom",
-                        ],
-                    )
+                let kind = if family == ModelFamily::Capacitor {
+                    ReactiveKind::Capacitor
                 } else {
-                    (
-                        ReactiveKind::Inductor,
-                        "inductance",
-                        &["ic", "temp", "m", "tc1", "tc2", "scale"],
-                        &["ind", "tc1", "tc2", "tnom"],
-                    )
+                    ReactiveKind::Inductor
                 };
-                let mut instance: Vec<(&'static str, Real)> = Vec::new();
-                instance.extend(written(i, value).map(|v| (value, v)));
-                for key in instance_keys {
-                    instance.extend(written(i, key).map(|v| (*key, v)));
-                }
-                let mut model = Vec::new();
-                for key in model_keys {
-                    model.extend(written(m, key).map(|v| (*key, v)));
-                }
                 Ok(Box::new(ReactiveSensitivity::new(
                     kind,
                     &self.name,
-                    Some(&self.model),
                     self.terminals,
-                    ReactiveInputs { instance, model },
+                    inputs,
                     context,
                 )))
             }

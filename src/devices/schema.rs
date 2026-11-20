@@ -162,7 +162,11 @@ impl ScalarValues {
     /// return `None`, rather than inventing a zero.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&ScalarValue> {
-        self.0.get(&name.to_ascii_lowercase())
+        if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            self.0.get(&name.to_ascii_lowercase())
+        } else {
+            self.0.get(name)
+        }
     }
 }
 

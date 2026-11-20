@@ -35,8 +35,8 @@ mod res;
 mod source;
 pub(super) use controlled::ControlledSensitivity;
 pub(super) use misc::{BehaviouralSensitivity, MutualSensitivity, SwitchSensitivity};
-pub(super) use reactive::{ReactiveInputs, ReactiveKind, ReactiveSensitivity};
-pub(super) use res::{ResistorInputs, ResistorSensitivity};
+pub(super) use reactive::{ReactiveKind, ReactiveSensitivity};
+pub(super) use res::ResistorSensitivity;
 pub use source::SourceInputs;
 pub(super) use source::SourceSensitivity;
 
@@ -719,6 +719,49 @@ pub struct SwitchValues {
     pub on: Option<Real>,
     /// `roff`.
     pub off: Option<Real>,
+}
+
+/// Immutable source of passive sensitivity records. Literal devices give
+/// only their principal value and optional initial condition; modeled
+/// devices already own validated card setters and their provenance.
+#[derive(Debug)]
+pub(super) enum PassiveInputs<'a> {
+    Literal {
+        value: Real,
+        initial_condition: Option<Real>,
+    },
+    Modeled {
+        name: &'a str,
+        model: &'a crate::devices::schema::ScalarValues,
+        instance: &'a crate::devices::schema::ScalarValues,
+    },
+}
+
+impl PassiveInputs<'_> {
+    const fn model_name(&self) -> Option<&str> {
+        match self {
+            Self::Literal { .. } => None,
+            Self::Modeled { name, .. } => Some(name),
+        }
+    }
+
+    fn model_value(&self, keyword: &str) -> Option<Real> {
+        match self {
+            Self::Literal { .. } => None,
+            Self::Modeled { model, .. } => written(model, keyword),
+        }
+    }
+
+    fn instance_value(&self, principal: &str, keyword: &str) -> Option<Real> {
+        match self {
+            Self::Literal { value, .. } if keyword == principal => Some(*value),
+            Self::Literal {
+                initial_condition, ..
+            } if keyword == "ic" => *initial_condition,
+            Self::Literal { .. } => None,
+            Self::Modeled { instance, .. } => written(instance, keyword),
+        }
+    }
 }
 
 /// A setter the card wrote (`Some`), or `None` for a schema default.
