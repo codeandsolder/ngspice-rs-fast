@@ -20,7 +20,8 @@
 //! - `mos6/mos6trun.c` (the three Meyer gate charges) and `mos6ic.c`.
 //!
 //! The shell supplies series resistance, junction charges, Meyer gate charge,
-//! limiting, the instance sweeps and observations.
+//! limiting, the instance sweeps and observations. Intrinsic state is per
+//! unit device; M scales the completed matrix and RHS stamps, as in C.
 //!
 //! # What C does not have
 //!
@@ -37,13 +38,6 @@
 //!
 //! # Deliberate divergences
 //!
-//! - `mos6load.c` multiplies its whole stamp by `M`; the shell scales the
-//!   currents, charges and conductances instead, which is the same except for
-//!   `gmin`, which [`MosLevel::junction_gmin`] keeps per unit device, and the
-//!   junction `vcrit`, which [`Level6::operating`] derives from the
-//!   per-unit-device saturation current as `mos6temp.c` does. C's convergence
-//!   test compares per-unit currents (`MOS6convTest`); the port's Newton test
-//!   is circuit-wide.
 //! - `mos6set.c` gives NRD/NRS no default, so RSH without an explicit nonzero
 //!   NRD (NRS) creates no internal node and, in C, no resistance at all; the
 //!   port refuses that combination rather than silently dropping RSH. An
@@ -74,8 +68,8 @@ use crate::devices::ResolvedModel;
 use crate::devices::mos::bulk::{BulkJunctions, BulkLaw};
 use crate::devices::mos::surface::{Surface, SurfaceCard, SurfaceLaw};
 use crate::devices::mos::{
-    CELSIUS_TO_KELVIN, Common, DrainCurrent, EPSILON_0, Geometry, MosLevel, Mosfet, Operating,
-    aliased, p, required,
+    CELSIUS_TO_KELVIN, Common, DrainCurrent, EPSILON_0, Geometry, MosLevel, Mosfet, Multiplicity,
+    Operating, aliased, p, required,
 };
 use crate::devices::nonlinear::thermal::SiliconTemperature;
 use crate::devices::schema::{
@@ -169,7 +163,7 @@ struct Process {
 /// The level-6 channel parameters of one load.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Params {
-    /// C `betac = tKc W / Leff`, times `M`.
+    /// C per-unit `betac = tKc W / Leff`.
     pub(super) betac: Real,
     pub(super) kv: Real,
     pub(super) nv: Real,
@@ -217,6 +211,7 @@ impl MosLevel for Level6 {
     const LEVEL: u8 = 6;
     const LABEL: &'static str = "MOS6";
     const DEVICE_TYPE: CDeviceType = CDeviceType::Mos6;
+    const MULTIPLICITY: Multiplicity = BulkLaw::Mos6.multiplicity();
     const PRIME_SUFFIXES: [&'static str; 2] = ["drain", "source"];
 
     fn model_schema() -> ScalarSchema<'static> {
@@ -341,9 +336,8 @@ impl MosLevel for Level6 {
             source,
             factors,
         } = BulkLaw::Mos6.junctions(model, geometry, &nominal, &actual);
-        let m = geometry.m;
         let length = self.length(geometry);
-        let betac = kc * m * geometry.w / length;
+        let betac = kc * geometry.w / length;
         let operating = Operating {
             vt,
             beta: betac,
@@ -351,13 +345,13 @@ impl MosLevel for Level6 {
             phi,
             vto,
             gamma: process.surface.gamma,
-            oxide: process.cox * length * m * geometry.w,
+            oxide: process.cox * length * geometry.w,
             drain,
             source,
             overlap: [
-                model.overlap[0] * m * geometry.w,
-                model.overlap[1] * m * geometry.w,
-                model.overlap[2] * m * length,
+                model.overlap[0] * geometry.w,
+                model.overlap[1] * geometry.w,
+                model.overlap[2] * length,
             ],
             params: Params {
                 betac,
@@ -523,12 +517,6 @@ impl MosLevel for Level6 {
             format!("MOS6 distortion of {}", device.name),
             "src/spicelib/devices/mos6/mos6init.c (DEVdisto = NULL: C has no level-6 distortion)",
         ))
-    }
-
-    /// `mos6load.c` multiplies the junction `gmin` by `M` with the rest of
-    /// the stamp.
-    fn junction_gmin(gmin: Real, geometry: &Geometry) -> Real {
-        gmin * geometry.m
     }
 }
 
@@ -700,26 +688,5 @@ mod tests {
         let d = model.drain_current(&op, 1., 2., 0.);
         assert!((d.von - (0.6 - 0.02 * 2.)).abs() < 1e-15);
         assert!(d.cdrain > 0.);
-    }
-
-    #[test]
-    fn multiplier_hooks_keep_gmin_per_unit_device() {
-        let geometry = Geometry {
-            m: 3.,
-            l: 1e-6,
-            w: 1e-6,
-            ad: 0.,
-            as_: 0.,
-            pd: 0.,
-            ps: 0.,
-            nrd: 1.,
-            nrs: 1.,
-            temp: None,
-            dtemp: 0.,
-        };
-        assert_eq!(Level6::junction_gmin(1e-12, &geometry), 3e-12);
-        // mos6temp.c's per-unit-device `vcrit` is derived in [`Level6::operating`]
-        // (it has no `MOS6m`, unlike mos1temp.c); the `m=2` instance in
-        // `conformance/netlists/m10_mos6_dc.cir` is compared against C.
     }
 }

@@ -463,3 +463,109 @@ fn m10_mos6_fixtures_parse_write_parse_with_a_fixed_point() {
         assert_eq!(text, ngspice_rs::netlist::write_netlist(&round).unwrap());
     }
 }
+
+#[test]
+fn multiplicity_scales_completed_stamps_not_intrinsic_state() {
+    use ngspice_rs::maths::integrator::{DEFAULT_XMU, IntegrationMethod, StepHistory};
+
+    let make = |multiplicity| {
+        circuit(&format!(
+            "m1 d g s b mm w=10u l=2u ad=13p as=23p pd=21u ps=31u m={multiplicity}\n\
+             .model mm nmos(level=6 vto=0.83 kc=37u gamma=0.51 phi=0.72 lambda=0.037\n\
+             + tox=21n rd=43 rs=37 js=0.11m cj=0.53m cjsw=0.41n\n\
+             + cgso=0.43n cgdo=0.32n cgbo=0.21n)"
+        ))
+    };
+    for method in [
+        IntegrationMethod::Trapezoidal,
+        IntegrationMethod::Gear { order: 2 },
+    ] {
+        let circuits = [make(1.), make(1.7)];
+        // The SPICE reader follows C's decimal accumulation, not Rust's
+        // literal rounding. Compare with the actual parsed multiplier.
+        let m = circuits[1].devices()[0]
+            .observation_parameter("m", &ModelContext::default())
+            .unwrap()
+            .unwrap();
+        let mut histories = circuits.each_ref().map(Circuit::state_history);
+        let mut steps = StepHistory::new();
+        for (step, dt) in [0., 1e-9, 7e-10, 1.3e-9].into_iter().enumerate() {
+            let coefficients = (step != 0).then(|| {
+                steps
+                    .trial(method, if step == 1 { 1 } else { 2 }, dt, DEFAULT_XMU)
+                    .unwrap()
+            });
+            let mode = if step == 0 {
+                AnalysisMode::OperatingPoint
+            } else {
+                AnalysisMode::Transient {
+                    time: 1e-9 * step as f64,
+                    dt,
+                }
+            };
+            let context = ModelContext::default();
+            let loads = std::array::from_fn::<_, 2, _>(|i| {
+                let c = &circuits[i];
+                let n = c.unknown_count();
+                let mut x = Vector::zeros(n);
+                let phase = [0., 0.04, -0.03, 0.07][step];
+                for (name, voltage) in [
+                    ("d", 3.1),
+                    ("g", 1.9 + phase),
+                    ("s", 0.1),
+                    ("b", -0.43),
+                    ("m1#drain", 2.91 - phase),
+                    ("m1#source", 0.17),
+                ] {
+                    x.as_mut_slice()[row(c, name)] = voltage;
+                }
+                let history = &mut histories[i];
+                let mut trial = history.trial();
+                let mut matrix = SparseMatrix::new(n, n);
+                let mut rhs = Vector::zeros(n);
+                c.load_device(
+                    0,
+                    c.devices()[0].as_ref(),
+                    &LoadRequest {
+                        mode,
+                        solution: &x,
+                        model_context: &context,
+                        integration: coefficients.as_ref(),
+                        history,
+                        forcing: None,
+                    },
+                    &mut matrix,
+                    &mut rhs,
+                    &mut trial,
+                )
+                .unwrap();
+                let state = trial
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>();
+                history.commit(trial).unwrap();
+                (matrix, rhs, state)
+            });
+            let [(a, b, state), (am, bm, state_m)] = loads;
+            assert_eq!(state, state_m, "intrinsic state at step {step}");
+            for r in 0..a.rows() {
+                for c in 0..a.cols() {
+                    assert_eq!(
+                        (m * entry(&a, r, c)).to_bits(),
+                        entry(&am, r, c).to_bits(),
+                        "step {step}, matrix ({r}, {c})"
+                    );
+                }
+                assert_eq!(
+                    (m * b.as_slice()[r]).to_bits(),
+                    bm.as_slice()[r].to_bits(),
+                    "step {step}, RHS {r}"
+                );
+            }
+            if let Some(coefficients) = coefficients {
+                steps.accept(&coefficients);
+            }
+        }
+    }
+}

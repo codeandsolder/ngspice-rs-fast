@@ -394,11 +394,11 @@ impl<L: SensitivityLevel> MosSensitivity<'_, L> {
         let c = model.common();
         let conductance = |resistance: Option<Real>, squares: Real| match resistance {
             Some(0.) => 0.,
-            Some(r) => geometry.m / r,
+            Some(r) => L::MULTIPLICITY.storage(geometry.m) / r,
             None => c
                 .rsh
                 .filter(|r| *r != 0.)
-                .map_or(0., |r| geometry.m / (r * squares)),
+                .map_or(0., |r| L::MULTIPLICITY.storage(geometry.m) / (r * squares)),
         };
         let series = [
             conductance(c.rd, geometry.nrd),
@@ -463,8 +463,7 @@ impl<L: MosLevel> Device for ResetMosfet<L> {
         let model = context.model_context;
         let state = &self.state;
         let op = state.operating(model)?;
-        let e =
-            state.small_signal_eval(&op, |_| 0., L::junction_gmin(model.gmin, &state.geometry))?;
+        let e = state.small_signal_eval(&op, |_| 0., model.gmin)?;
         let overlap = self.current.operating(model)?.overlap;
         let omega = self.omega;
         // `state0 + state0 + overlap` with zero Meyer halves.
@@ -482,7 +481,7 @@ impl<L: MosLevel> Device for ResetMosfet<L> {
                             .and_then(|r| bias.get(r))
                             .unwrap_or(0.)
                     },
-                    L::junction_gmin(model.gmin, &device.geometry),
+                    model.gmin,
                 )?;
                 (e.capbd, e.capbs)
             }

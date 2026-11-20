@@ -2,7 +2,7 @@
 //! The levels differ in C multiplication order and limiter scaling, not
 //! in the underlying temperature or capacitance laws.
 
-use super::{Common, Geometry, Junction, ReverseLaw};
+use super::{Common, Geometry, Junction, Multiplicity, ReverseLaw};
 use crate::devices::nonlinear::thermal::SiliconTemperature;
 use crate::primitives::Real;
 
@@ -32,9 +32,11 @@ impl BulkLaw {
         }
     }
 
-    fn vcrit_scale(self, m: Real) -> Real {
-        let root2 = std::f64::consts::SQRT_2;
-        if self == Self::Mos6 { root2 } else { root2 * m }
+    pub(in crate::devices) const fn multiplicity(self) -> Multiplicity {
+        match self {
+            Self::Mos6 => Multiplicity::Stamp,
+            _ => Multiplicity::Embedded,
+        }
     }
 
     fn reverse(self) -> ReverseLaw {
@@ -57,7 +59,7 @@ impl BulkLaw {
         let correction = actual.potential.junction(&nominal.potential, model.pb);
         let bottom = correction.factors(model.mj);
         let side = correction.factors(model.mjsw);
-        let m = geometry.m;
+        let m = self.multiplicity().storage(geometry.m);
         let area_zero = geometry.ad == 0. || geometry.as_ == 0.;
         let use_density = density != 0. && !area_zero;
         // mos3temp.c tests nominal JS; mos3load.c tests the scaled density.
@@ -73,7 +75,7 @@ impl BulkLaw {
             } else {
                 m * saturation
             };
-            let root2 = self.vcrit_scale(m);
+            let root2 = std::f64::consts::SQRT_2 * m;
             let divisor = if critical_density {
                 root2 * density * area
             } else {
@@ -98,8 +100,6 @@ impl BulkLaw {
                 self.reverse(),
             )
         };
-        // MOS6 still uses the common shell's M-scaled junction storage;
-        // only its limiter threshold is per unit device.
         BulkJunctions {
             drain: junction(true, model.cbd, geometry.ad, geometry.pd),
             source: junction(false, model.cbs, geometry.as_, geometry.ps),

@@ -583,6 +583,31 @@ pub(super) struct NoiseShape {
     pub(super) cox_squared: Real,
 }
 
+/// Where the reference device applies instance multiplicity. MOS6 keeps
+/// intrinsic state per unit device and multiplies completed matrix/RHS
+/// terms, unlike MOS1/2/3/9, which scale the operating parameters.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Multiplicity {
+    Embedded,
+    Stamp,
+}
+
+impl Multiplicity {
+    const fn storage(self, m: Real) -> Real {
+        match self {
+            Self::Embedded => m,
+            Self::Stamp => 1.,
+        }
+    }
+
+    const fn stamp(self, m: Real) -> Real {
+        match self {
+            Self::Embedded => 1.,
+            Self::Stamp => m,
+        }
+    }
+}
+
 /// What a MOS level supplies to the shared shell. See the module
 /// documentation.
 pub(super) trait MosLevel: std::fmt::Debug + Clone + Copy + Sized + 'static {
@@ -594,6 +619,8 @@ pub(super) trait MosLevel: std::fmt::Debug + Clone + Copy + Sized + 'static {
     const LABEL: &'static str;
     /// The C device type (`mos1`, `mos3`) for the setup/load order.
     const DEVICE_TYPE: CDeviceType;
+    /// Instance multiplicity placement in the reference load.
+    const MULTIPLICITY: Multiplicity = Multiplicity::Embedded;
     /// C's device type for the `.noise` visiting order, or `None` when C's
     /// level has no `mosXnoi.c` routine at all (level 6): `.noise` then
     /// refuses instead of returning zeros.
@@ -741,14 +768,6 @@ pub(super) trait MosLevel: std::fmt::Debug + Clone + Copy + Sized + 'static {
         _setters: &crate::devices::schema::ScalarValues,
     ) -> SpiceResult<()> {
         Ok(())
-    }
-
-    /// The `gmin` the bulk junctions add in a load. C's level 6
-    /// (`mos6load.c`) multiplies its whole stamp, `gmin` included, by `M`;
-    /// the other classic levels scale the currents and add `gmin` once (the
-    /// default).
-    fn junction_gmin(gmin: Real, _geometry: &Geometry) -> Real {
-        gmin
     }
 
     /// Refuses a small-signal (`"AC"`) or pole-zero (`"pole-zero"`) load the
@@ -992,7 +1011,7 @@ impl<L: MosLevel> Mosfet<L> {
                 common.rd,
                 common.rsh,
                 geometry.nrd,
-                geometry.m,
+                L::MULTIPLICITY.storage(geometry.m),
                 "drain",
                 L::LABEL,
             )?,
@@ -1000,7 +1019,7 @@ impl<L: MosLevel> Mosfet<L> {
                 common.rs,
                 common.rsh,
                 geometry.nrs,
-                geometry.m,
+                L::MULTIPLICITY.storage(geometry.m),
                 "source",
                 L::LABEL,
             )?,
@@ -1549,7 +1568,7 @@ impl<L: MosLevel> Device for Mosfet<L> {
         // C `xfact = CKTdelta / CKTdeltaOld[1]`; one in a `.dc` sweep.
         let xfact = integration.map_or(1., crate::maths::integrator::Coefficients::predictor_ratio);
         let (v, start, check) = self.select(op, &context.states, raw, ic, xfact);
-        let mut e = self.evaluate(op, v, L::junction_gmin(context.gmin, &self.geometry))?;
+        let mut e = self.evaluate(op, v, context.gmin)?;
         let states = &mut context.states;
 
         // Bulk junction charges (C computes them in MODETRAN, MODETRANOP and
@@ -1688,6 +1707,7 @@ impl<L: MosLevel> Device for Mosfet<L> {
 
         // Current vector and Y matrix, in mos1load.c's order and arithmetic.
         let t = pol;
+        let m = L::MULTIPLICITY.stamp(self.geometry.m);
         let ceqbs = t * (e.cbs - e.gbs * e.vbs);
         let ceqbd = t * (e.cbd - e.gbd * e.vbd);
         let (xnrm, xrev, cdreq) = if e.mode >= 0. {
@@ -1712,34 +1732,37 @@ impl<L: MosLevel> Device for Mosfet<L> {
         let [dp, _, sp, _] = self.inner;
         let [gdr, gsr] = self.series;
         let (gm, gds, gmbs, gbd, gbs) = (e.gm, e.gds, e.gmbs, e.gbd, e.gbs);
-        context.stamp_rhs(g, -(t * (ceqgs + ceqgb + ceqgd)))?;
-        context.stamp_rhs(b, -(ceqbs + ceqbd - t * ceqgb))?;
-        context.stamp_rhs(dp, ceqbd - cdreq + t * ceqgd)?;
-        context.stamp_rhs(sp, cdreq + ceqbs + t * ceqgs)?;
-        context.stamp_fixed([
-            (d, d, gdr),
-            (g, g, gcgd + gcgs + gcgb),
-            (s, s, gsr),
-            (b, b, gbd + gbs + gcgb),
-            (dp, dp, gdr + gds + gbd + xrev * (gm + gmbs) + gcgd),
-            (sp, sp, gsr + gds + gbs + xnrm * (gm + gmbs) + gcgs),
-            (d, dp, -gdr),
-            (g, b, -gcgb),
-            (g, dp, -gcgd),
-            (g, sp, -gcgs),
-            (s, sp, -gsr),
-            (b, g, -gcgb),
-            (b, dp, -gbd),
-            (b, sp, -gbs),
-            (dp, d, -gdr),
-            (dp, g, (xnrm - xrev) * gm - gcgd),
-            (dp, b, -gbd + (xnrm - xrev) * gmbs),
-            (dp, sp, -gds - xnrm * (gm + gmbs)),
-            (sp, g, -(xnrm - xrev) * gm - gcgs),
-            (sp, s, -gsr),
-            (sp, b, -gbs - (xnrm - xrev) * gmbs),
-            (sp, dp, -gds - xrev * (gm + gmbs)),
-        ])?;
+        context.stamp_rhs(g, -(m * (t * (ceqgs + ceqgb + ceqgd))))?;
+        context.stamp_rhs(b, -(m * (ceqbs + ceqbd - t * ceqgb)))?;
+        context.stamp_rhs(dp, m * (ceqbd - cdreq + t * ceqgd))?;
+        context.stamp_rhs(sp, m * (cdreq + ceqbs + t * ceqgs))?;
+        context.stamp_fixed(
+            [
+                (d, d, gdr),
+                (g, g, gcgd + gcgs + gcgb),
+                (s, s, gsr),
+                (b, b, gbd + gbs + gcgb),
+                (dp, dp, gdr + gds + gbd + xrev * (gm + gmbs) + gcgd),
+                (sp, sp, gsr + gds + gbs + xnrm * (gm + gmbs) + gcgs),
+                (d, dp, -gdr),
+                (g, b, -gcgb),
+                (g, dp, -gcgd),
+                (g, sp, -gcgs),
+                (s, sp, -gsr),
+                (b, g, -gcgb),
+                (b, dp, -gbd),
+                (b, sp, -gbs),
+                (dp, d, -gdr),
+                (dp, g, (xnrm - xrev) * gm - gcgd),
+                (dp, b, -gbd + (xnrm - xrev) * gmbs),
+                (dp, sp, -gds - xnrm * (gm + gmbs)),
+                (sp, g, -(xnrm - xrev) * gm - gcgs),
+                (sp, s, -gsr),
+                (sp, b, -gbs - (xnrm - xrev) * gmbs),
+                (sp, dp, -gds - xrev * (gm + gmbs)),
+            ]
+            .map(|(r, c, value)| (r, c, m * value)),
+        )?;
         Ok(())
     }
     /// `MOS1convTest` (`mos1conv.c`, equal to `mos3conv.c`): the drain and
@@ -1802,14 +1825,11 @@ impl<L: MosLevel> Device for Mosfet<L> {
         if context.states.is_some() {
             L::small_signal(self, "AC")?;
         }
+        let m = L::MULTIPLICITY.stamp(self.geometry.m);
         let op = self.operating(context.model_context)?;
         let unknowns = context.unknowns;
         let voltage = |n: NodeId| unknowns.node_row(n).and_then(|r| bias.get(r)).unwrap_or(0.);
-        let e = self.small_signal_eval(
-            &op,
-            voltage,
-            L::junction_gmin(context.model_context.gmin, &self.geometry),
-        )?;
+        let e = self.small_signal_eval(&op, voltage, context.model_context.gmin)?;
         let cap: [Real; 3] = std::array::from_fn(|k| e.half[k] + e.half[k] + op.overlap[k]);
         let [capgs, capgd, capgb] = cap;
         let (xnrm, xrev) = if e.mode < 0. { (0., 1.) } else { (1., 0.) };
@@ -1839,7 +1859,7 @@ impl<L: MosLevel> Device for Mosfet<L> {
             (sp, g, &[-capgs][..]),
             (sp, b, &[-capbs][..]),
         ] {
-            context.dynamic_sum(row, col, terms)?;
+            context.scaled_dynamic_sum(row, col, terms, m)?;
         }
         for (row, col, value) in [
             (d, d, gdr),
@@ -1861,7 +1881,7 @@ impl<L: MosLevel> Device for Mosfet<L> {
             (sp, dp, -(gds + xrev * (gm + gmbs))),
         ] {
             if let (Some(r), Some(c)) = (unknowns.node_row(row), unknowns.node_row(col)) {
-                context.system.a.add(r, c, value)?;
+                context.system.a.add(r, c, m * value)?;
             }
         }
         Ok(())
