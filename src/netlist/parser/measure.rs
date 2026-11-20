@@ -722,7 +722,7 @@ fn next_is(input: &Input<'_>, word: &str) -> bool {
 fn merge(left: MeasureWindow, right: MeasureWindow, card: &SourceLoc) -> Result<MeasureWindow> {
     for (written, other, name) in [(left.from, right.from, "FROM"), (left.to, right.to, "TO")] {
         if let (Some(a), Some(b)) = (written, other)
-            && a != b
+            && a.partial_cmp(&b) != Some(std::cmp::Ordering::Equal)
         {
             return Err(fail(
                 card,
@@ -792,15 +792,15 @@ impl Setters {
     }
 
     fn at(&self) -> Option<(Real, SourceLoc)> {
-        copy(self.at.as_ref())
+        self.at.clone()
     }
 
     fn val(&self) -> Option<(Real, SourceLoc)> {
-        copy(self.val.as_ref())
+        self.val.clone()
     }
 
     fn transition(&self) -> Option<(MeasureTransition, SourceLoc)> {
-        copy(self.transition.as_ref())
+        self.transition.clone()
     }
 
     fn window(&self) -> MeasureWindow {
@@ -809,11 +809,6 @@ impl Setters {
             to: self.to.as_ref().map(|(value, _)| *value),
         }
     }
-}
-
-/// A copy of one positional setter.
-fn copy<T: Copy>(setter: Option<&(T, SourceLoc)>) -> Option<(T, SourceLoc)> {
-    setter.map(|(value, location)| (*value, location.clone()))
 }
 
 fn set(slot: &mut Option<(Real, SourceLoc)>, value: Real, at: SourceLoc, name: &str) -> Result<()> {
