@@ -115,7 +115,7 @@ fn emit_struct(
         writeln!(
             out,
             "    /// The `{kind}` member named `c_name` in C, if there is one.\n    \
-             #[allow(dead_code)]\n    pub(crate) fn {accessor}_mut(&mut self, c_name: &str) -> Option<&mut {kind}> {{\n        \
+             #[allow(dead_code, reason = \"uniform generated schema accessors may be unused by a particular device path\")]\n    pub(crate) fn {accessor}_mut(&mut self, c_name: &str) -> Option<&mut {kind}> {{\n        \
              Some(match c_name {{"
         )
         .map_err(|e| e.to_string())?;
@@ -133,12 +133,12 @@ fn emit_struct(
     // Positional access over the scalar (non-string) members, for records
     // that hold the whole struct as numbers (`.sens`).
     let scalars: Vec<&Field> = fields.iter().filter(|f| f.kind != "String").collect();
-    out.push_str("    /// C member names of the scalar members, in declaration order.\n    #[allow(dead_code)]\n    pub(crate) const MEMBERS: &[&str] = &[\n");
+    out.push_str("    /// C member names of the scalar members, in declaration order.\n    #[allow(dead_code, reason = \"uniform generated schema accessors may be unused by a particular device path\")]\n    pub(crate) const MEMBERS: &[&str] = &[\n");
     for field in &scalars {
         writeln!(out, "        \"{}\",", field.c_name).map_err(|e| e.to_string())?;
     }
     out.push_str("    ];\n\n");
-    out.push_str("    /// The scalar members as numbers, in [`Self::MEMBERS`] order (`i32` exactly,\n    /// a given bit as 0 or 1).\n    #[allow(dead_code)]\n    pub(crate) fn to_values(&self) -> Vec<f64> {\n        vec![\n");
+    out.push_str("    /// The scalar members as numbers, in [`Self::MEMBERS`] order (`i32` exactly,\n    /// a given bit as 0 or 1).\n    #[allow(dead_code, reason = \"uniform generated schema accessors may be unused by a particular device path\")]\n    pub(crate) fn to_values(&self) -> Vec<f64> {\n        vec![\n");
     for field in &scalars {
         let name = rust_name(&field.c_name);
         let expression = match field.kind {
@@ -149,7 +149,7 @@ fn emit_struct(
         writeln!(out, "            {expression},").map_err(|e| e.to_string())?;
     }
     out.push_str("        ]\n    }\n\n");
-    out.push_str("    /// Stores numbers produced by [`Self::to_values`]; `values` must have\n    /// `Self::MEMBERS.len()` entries.\n    #[allow(dead_code, clippy::cast_possible_truncation)]\n    pub(crate) const fn set_values(&mut self, values: &[f64]) {\n");
+    out.push_str("    /// Stores numbers produced by [`Self::to_values`]; `values` must have\n    /// `Self::MEMBERS.len()` entries.\n    #[allow(dead_code, clippy::cast_possible_truncation, reason = \"generated numeric snapshots round-trip exact i32 fields and may be unused for some record types\")]\n    pub(crate) const fn set_values(&mut self, values: &[f64]) {\n");
     for (index, field) in scalars.iter().enumerate() {
         let name = rust_name(&field.c_name);
         let expression = match field.kind {
@@ -270,7 +270,7 @@ pub(crate) fn fields(header: &str, revision: &str) -> Result<String, String> {
     // Only the generated schema may retain these C-field spelling and
     // monolithic accessor patterns. The source policy verifies provenance.
     out.push_str(
-        "#![allow(\n    non_snake_case,\n    clippy::struct_excessive_bools,\n    clippy::used_underscore_binding,\n    clippy::too_many_lines,\n    clippy::large_stack_arrays,\n    clippy::redundant_pub_crate\n)]\n",
+        "#![allow(\n    non_snake_case,\n    clippy::struct_excessive_bools,\n    clippy::used_underscore_binding,\n    clippy::too_many_lines,\n    clippy::large_stack_arrays,\n    clippy::redundant_pub_crate,\n    reason = \"generated C schema preserves member spelling, layout and uniform positional accessors\"\n)]\n",
     );
     emit_struct(&mut out, "Model", "struct sBSIM4model", &model)?;
     emit_struct(&mut out, "SizeParam", "struct bsim4SizeDependParam", &size)?;
