@@ -766,15 +766,12 @@ pub(super) fn load(
     let mut mult_q: f64 = 0.0;
     ScalingFactor = 1.0e-9;
     // No integration if DC sweep, but keep evaluating capacitances.
-    ChargeComputationNeeded = (if (((ckt.mode()
-        & (((mode::MODEDCTRANCURVE | mode::MODEAC) | mode::MODETRAN) | mode::MODEINITSMSIG))
-        != 0)
-        || (((ckt.mode() & mode::MODETRANOP) != 0) && ((ckt.mode() & mode::MODEUIC) != 0)))
-    {
-        1
-    } else {
-        0
-    });
+    ChargeComputationNeeded = i32::from(
+        (ckt.mode()
+            & (mode::MODEDCTRANCURVE | mode::MODEAC | mode::MODETRAN | mode::MODEINITSMSIG))
+            != 0
+            || ((ckt.mode() & mode::MODETRANOP) != 0 && (ckt.mode() & mode::MODEUIC) != 0),
+    );
 
     Check2 = 1;
     Check1 = Check2;
@@ -1688,7 +1685,10 @@ pub(super) fn load(
     Abulk *= T0;
     Abulk0_Q = Abulk0;
     Abulk0 *= T0;
-    if pParam.ketac != pParam.keta {
+    if pParam.ketac == pParam.keta {
+        dAbulk0_Q_dVb = dAbulk0_dVb;
+        Abulk0_Q = Abulk0;
+    } else {
         T2 = pParam.ketac * Vbseff;
         if T2 >= -0.9 {
             T0 = 1.0 / (1.0 + T2);
@@ -1700,9 +1700,6 @@ pub(super) fn load(
         }
         dAbulk0_Q_dVb = dAbulk0_Q_dVb * T0 + Abulk0_Q * dT0_dVb;
         Abulk0_Q *= T0;
-    } else {
-        dAbulk0_Q_dVb = dAbulk0_dVb;
-        Abulk0_Q = Abulk0;
     }
     if (model.mtrlMod != 0) && model.mtrlCompatMod == 0 {
         T14 = 2.0 * f64::from(model.r#type) * (model.phig - model.easub - 0.5 * model.Eg0 + 0.45);
@@ -2520,14 +2517,12 @@ pub(super) fn load(
             if T2 < EXPL_THRESHOLD {
                 Igisl = pParam.weffCJ * pParam.agisl * T1 * exp(-T2);
                 T3 = Igisl / T1 * (T2 + 1.0);
-                Ggisls = T3 * dT1_dVd;
-                Ggislg = T3 * dT1_dVg;
             } else {
                 T3 = pParam.weffCJ * pParam.agisl * MIN_EXPL;
                 Igisl = T3 * T1;
-                Ggisls = T3 * dT1_dVd;
-                Ggislg = T3 * dT1_dVg;
             }
+            Ggisls = T3 * dT1_dVd;
+            Ggislg = T3 * dT1_dVg;
             T4 = vbs - pParam.fgisl;
             if T4 > model.gidlclamp {
                 T4 = model.gidlclamp;
@@ -2569,14 +2564,12 @@ pub(super) fn load(
             if T2 < EXPL_THRESHOLD {
                 Igidl = pParam.weffCJ * pParam.agidl * T1 * exp(-T2);
                 T3 = Igidl / T1 * (T2 + 1.0);
-                Ggidld = T3 * dT1_dVd;
-                Ggidlg = T3 * dT1_dVg;
             } else {
                 T3 = pParam.weffCJ * pParam.agidl * MIN_EXPL;
                 Igidl = T3 * T1;
-                Ggidld = T3 * dT1_dVd;
-                Ggidlg = T3 * dT1_dVg;
             }
+            Ggidld = T3 * dT1_dVd;
+            Ggidlg = T3 * dT1_dVg;
             T4 = vbd - pParam.fgidl;
             if T4 > model.gidlclamp {
                 T4 = model.gidlclamp;
@@ -4275,8 +4268,6 @@ pub(super) fn load(
                     qgmid = qgdo + qgso + qgmb;
                     qgate = 0.0;
                     qbulk = -qgmb;
-                    qdrn = -qgdo;
-                    qsrc = -qgso;
                 } else {
                     gcggb = (cgdo + cgso + pParam.cgbo) * ag0;
                     gcgdb = -cgdo * ag0;
@@ -4291,9 +4282,9 @@ pub(super) fn load(
                     qgb = pParam.cgbo * vgb;
                     qgate = qgdo + qgso + qgb;
                     qbulk = -qgb;
-                    qdrn = -qgdo;
-                    qsrc = -qgso;
                 }
+                qdrn = -qgdo;
+                qsrc = -qgso;
                 gcddb = (here.capbd + cgdo) * ag0;
                 gcsdb = 0.0;
                 gcdsb = gcsdb;
