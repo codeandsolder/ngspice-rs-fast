@@ -35,7 +35,7 @@
 
 use crate::devices::{Circuit, MnaUnknowns, ModelContext, SourceKind};
 use crate::maths::Vector;
-use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
+use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
 
 /// ngspice `CONSTboltz` (J/K).
 pub const BOLTZMANN: Real = 1.380_648_52e-23;
@@ -243,6 +243,32 @@ pub struct NoiseSource {
     pub kind: NoiseKind,
 }
 
+/// Squared transfer gain in the reference noise evaluator's operation order.
+const fn squared_gain(transfer: Complex) -> Real {
+    transfer.re * transfer.re + transfer.im * transfer.im
+}
+
+/// Coherent sum of both thermal generators, following `NevalSrc2`.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "NevalSrc2 adds the first generator before the second generator's imaginary contribution"
+)]
+fn correlated_gain(
+    first: Complex,
+    second: Complex,
+    conductance: Real,
+    second_conductance: Real,
+    phase: Real,
+) -> Real {
+    let first_scale = conductance.sqrt();
+    let second_scale = second_conductance.sqrt();
+    let in_phase = second_scale * phase.cos();
+    let quadrature = second_scale * phase.sin();
+    let real = first_scale * first.re + in_phase * second.re - quadrature * second.im;
+    let imag = first_scale * first.im + in_phase * second.im + quadrature * second.re;
+    squared_gain(Complex::new(real, imag))
+}
+
 impl NoiseSource {
     /// A generator.
     #[must_use]
@@ -260,7 +286,7 @@ impl NoiseSource {
     #[must_use]
     pub fn output_density(
         &self,
-        difference: impl Fn([NodeId; 2]) -> crate::primitives::Complex,
+        difference: impl Fn([NodeId; 2]) -> Complex,
         frequency: Real,
     ) -> Real {
         if let NoiseKind::CorrelatedThermal {
@@ -271,22 +297,17 @@ impl NoiseSource {
             temperature,
         } = self.kind
         {
-            let first = difference(self.nodes);
-            let other = difference(second);
-            let (real_val1, imag_val1) = (first.re, first.im);
-            let (real_val2, imag_val2) = (other.re, other.im);
-            let t0 = conductance.sqrt();
-            let t1 = second_conductance.sqrt();
-            let t2 = t1 * phase.cos();
-            let t3 = t1 * phase.sin();
-            let real_out = t0 * real_val1 + t2 * real_val2 - t3 * imag_val2;
-            let imag_out = t0 * imag_val1 + t2 * imag_val2 + t3 * real_val2;
-            let param_gain = (real_out * real_out) + (imag_out * imag_out);
-            return 4.0 * BOLTZMANN * temperature * param_gain;
+            let gain = correlated_gain(
+                difference(self.nodes),
+                difference(second),
+                conductance,
+                second_conductance,
+                phase,
+            );
+            return 4.0 * BOLTZMANN * temperature * gain;
         }
-        let d = difference(self.nodes);
         self.kind
-            .output_density(d.re * d.re + d.im * d.im, frequency)
+            .output_density(squared_gain(difference(self.nodes)), frequency)
     }
 }
 
@@ -408,10 +429,10 @@ pub fn circuit_noise(
     let replacements = circuit.replacements(context)?;
     let mut entries: Vec<(NoiseFamily, usize, usize, InstanceNoise)> = Vec::new();
     for (index, original) in circuit.devices().iter().enumerate() {
-        let device = replacements
-            .iter()
-            .find(|(i, _)| *i == index)
-            .map_or(original.as_ref(), |(_, replacement)| replacement.as_ref());
+        let device = replacements.iter().find(|(i, _)| *i == index).map_or_else(
+            || original.as_ref(),
+            |(_, replacement)| replacement.as_ref(),
+        );
         let rows = circuit
             .state_rows(index)
             .ok_or_else(|| SpiceError::circuit("circuit numbering is stale; finalize first"))?;
@@ -473,7 +494,8 @@ pub fn circuit_noise(
 
 #[cfg(test)]
 mod tests {
-    use super::{BOLTZMANN, CHARGE, FlickerLaw, NoiseKind};
+    use super::{BOLTZMANN, CHARGE, FlickerLaw, NoiseKind, correlated_gain};
+    use crate::primitives::Complex;
 
     #[test]
     fn densities_follow_nevalsrc() {
@@ -500,6 +522,28 @@ mod tests {
             },
         };
         assert!((steep.output_density(1.0, 10.0) - 1e-14).abs() < 1e-28);
+    }
+
+    #[test]
+    fn coherent_noise_combines_transfers_before_squaring() {
+        let first = Complex::new(2., -3.);
+        let opposing = Complex::new(-2., 3.);
+        assert_eq!(
+            correlated_gain(first, opposing, 4., 4., 0.).to_bits(),
+            0_f64.to_bits()
+        );
+        assert_eq!(correlated_gain(first, first, 4., 4., 0.), 208.);
+        let second = Complex::new(1.25, -0.875);
+        let angle = 0.37_f64;
+        let in_phase = 3. * angle.cos();
+        let quadrature = 3. * angle.sin();
+        let real = 2. * first.re + in_phase * second.re - quadrature * second.im;
+        let imag = 2. * first.im + in_phase * second.im + quadrature * second.re;
+        let reference = real * real + imag * imag;
+        assert_eq!(
+            correlated_gain(first, second, 4., 9., angle).to_bits(),
+            reference.to_bits()
+        );
     }
 
     #[test]
