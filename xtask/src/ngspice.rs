@@ -37,11 +37,11 @@ use std::process::Command;
 
 /// The C binary, and what it says it is.
 #[derive(Debug, Clone)]
-pub(crate) struct Ngspice {
+pub(super) struct Ngspice {
     /// Path to the binary. May be a bare name to be resolved through `PATH`.
-    pub(crate) path: PathBuf,
+    pub(super) path: PathBuf,
     /// The version string scraped from `--version`, e.g. `ngspice-47+`.
-    pub(crate) version: String,
+    pub(super) version: String,
 }
 
 /// Finds the C binary.
@@ -52,7 +52,7 @@ pub(crate) struct Ngspice {
 /// # Errors
 ///
 /// A message listing everywhere it looked.
-pub(crate) fn locate(explicit: Option<&Path>, workspace: &Path) -> Result<Ngspice, String> {
+pub(super) fn locate(explicit: Option<&Path>, workspace: &Path) -> Result<Ngspice, String> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(path) = explicit {
         candidates.push(path.to_path_buf());
@@ -114,13 +114,13 @@ fn version_of(binary: &Path) -> Result<String, String> {
 
 /// The result of capturing one fixture.
 #[derive(Debug, Clone)]
-pub(crate) struct Captured {
+pub(super) struct Captured {
     /// The rawfile text, exactly as ngspice wrote it.
-    pub(crate) rawfile: String,
+    pub(super) rawfile: String,
     /// Where the instrumented deck was written, for debugging.
-    pub(crate) deck_path: PathBuf,
+    pub(super) deck_path: PathBuf,
     /// ngspice's stdout and stderr combined, for diagnostics.
-    pub(crate) log: String,
+    pub(super) log: String,
 }
 
 /// Builds the instrumented deck: the fixture plus a `.control` block that writes
@@ -130,7 +130,7 @@ pub(crate) struct Captured {
 ///
 /// A message when the fixture already contains a `.control` section, because
 /// golden fixtures must be pure decks.
-pub(crate) fn instrument(netlist: &str, plot_file: &str) -> Result<String, String> {
+pub(super) fn instrument(netlist: &str, plot_file: &str) -> Result<String, String> {
     instrument_with(
         netlist,
         &format!(".control\nset filetype=ascii\nrun\nwrite {plot_file}\n.endc\n"),
@@ -143,7 +143,7 @@ pub(crate) fn instrument(netlist: &str, plot_file: &str) -> Result<String, Strin
 /// # Errors
 ///
 /// As [`instrument`].
-pub(crate) fn instrument_plots(
+pub(super) fn instrument_plots(
     netlist: &str,
     plot_file: &str,
     plots: &[String],
@@ -190,7 +190,7 @@ fn instrument_with(netlist: &str, control: &str) -> Result<String, String> {
 ///
 /// Any failure to prepare the scratch directory, run the binary, or find a
 /// non-empty rawfile afterwards. The message includes ngspice's output.
-pub(crate) fn capture(
+pub(super) fn capture(
     ngspice: &Ngspice,
     netlist: &Path,
     scratch: &Path,
@@ -277,11 +277,11 @@ pub(crate) fn capture(
 }
 
 /// The marker comment through which a fixture asks for XSPICE code models.
-pub(crate) const CODEMODEL_MARKER: &str = "* xtask-codemodels:";
+pub(super) const CODEMODEL_MARKER: &str = "* xtask-codemodels:";
 
 /// The XSPICE code models a fixture names on a `* xtask-codemodels: a b`
 /// comment line (E/G `TABLE` needs `analog`, `POLY` needs `spice2poly`).
-pub(crate) fn requested_codemodels(netlist: &str) -> Vec<String> {
+pub(super) fn requested_codemodels(netlist: &str) -> Vec<String> {
     netlist
         .lines()
         .filter_map(|line| {
@@ -379,7 +379,7 @@ fn tail(text: &str, lines: usize) -> String {
 /// trailing whitespace, but `Title:` preserves it: it is deck data and must
 /// agree with the title checked by `tests/golden_rawfiles.rs`.
 #[must_use]
-pub(crate) fn rawfiles_match(left: &str, right: &str) -> bool {
+pub(super) fn rawfiles_match(left: &str, right: &str) -> bool {
     comparable(left) == comparable(right)
 }
 
@@ -398,7 +398,7 @@ fn comparable(text: &str) -> Vec<&str> {
 
 /// The first differing line, for a drift report.
 #[must_use]
-pub(crate) fn first_difference(left: &str, right: &str) -> Option<String> {
+pub(super) fn first_difference(left: &str, right: &str) -> Option<String> {
     let left = comparable(left);
     let right = comparable(right);
     for index in 0..left.len().max(right.len()) {
