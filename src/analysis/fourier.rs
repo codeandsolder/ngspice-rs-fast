@@ -765,9 +765,8 @@ fn resolve_settings(
                 let samples = (0..axis.values.len())
                     .map(|i| trace.value(i))
                     .collect::<SpiceResult<Vec<_>>>()?;
-                let grid: Vec<_> = (0..count)
-                    .map(|i| from + (to - from) * i as Real / count as Real)
-                    .collect();
+                let step = (to - from) / count as Real;
+                let grid: Vec<_> = (0..count).map(|i| from + i as Real * step).collect();
                 let degree = settings.polydegree as usize;
                 if compatible {
                     values =

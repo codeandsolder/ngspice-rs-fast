@@ -392,7 +392,7 @@ pub fn resolve_outputs_with_scope(
         });
     }
     let own = own_cards(plot, scheduled, output)?;
-    let selection = written_selection(plot, scheduled, output)?;
+    let selection = Selection::resolve(plot, kind, &selection::write_requests(&own, kind)?)?;
     let print_requests = selection::print_requests(&own, kind)?;
     let mut printed = if print_requests.is_empty() {
         None
