@@ -111,6 +111,7 @@ use crate::netlist::ast::{
     AnalysisCard, DeviceInstance, FuncCard, FuncSpelling, GlobalCard, IncludeDirective, ModelCard,
     Netlist, NodeHintCard, NodeHintValue, OptionCard, ParamCard, ParameterAssignment,
     ParameterKind, PositionedValue, ScopedCard, ScopedCardKind, SourceWaveform, Subcircuit,
+    poly_dimension,
 };
 use crate::netlist::expr::ParameterExpression;
 use crate::netlist::semantic::{bexpr_form, expr_form};
@@ -1474,12 +1475,11 @@ fn behavioural_card(device: &DeviceInstance) -> SpiceResult<String> {
             }
         }
         (_, "poly") => {
-            let dimension = value_text(first, false)?
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n >= 1)
-                .ok_or_else(|| refuse("POLY dimension is not an integer", Some(location)))?;
-            parts.push(format!("poly({dimension})"));
+            let spelling = value_text(first, false)?;
+            let dimension = poly_dimension(&spelling).ok_or_else(|| {
+                refuse("POLY dimension is not an integer in 1..=64", Some(location))
+            })?;
+            parts.push(format!("poly({spelling})"));
             let mut rest = &parameters[1..];
             if matches!(designator, 'e' | 'g') {
                 if controls.len() != 2 * dimension {

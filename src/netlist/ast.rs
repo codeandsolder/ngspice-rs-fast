@@ -25,6 +25,19 @@ use crate::primitives::{AnalysisKind, Real, SourceLoc};
 /// A canonical node name: ASCII-lowercased, with optional `gnd` → `0` aliasing.
 pub type NodeName = String;
 
+/// POLY dimensions are positive integers in the port's supported range.
+/// The XSPICE translator uses `atoi` (`get_poly_dimension`, enhtrans.c);
+/// reject spellings whose numeric value differs from that decimal prefix,
+/// rather than parse one dimension and lower another (e.g. `2e1`).
+pub(super) fn poly_dimension(text: &str) -> Option<usize> {
+    let number = crate::primitives::parse_spice_number(text)?;
+    let dimension = crate::primitives::exact_nonnegative_integer::<usize>(number)?;
+    let digits = text.strip_prefix('+').unwrap_or(text);
+    let end = digits.bytes().take_while(u8::is_ascii_digit).count();
+    let prefix = digits.get(..end)?.parse::<usize>().ok()?;
+    (dimension == prefix && (1..=64).contains(&dimension)).then_some(dimension)
+}
+
 /// One device parameter, including positional values mapped to canonical names.
 ///
 /// R/C/L leading values become `resistance`/`capacitance`/`inductance`; source

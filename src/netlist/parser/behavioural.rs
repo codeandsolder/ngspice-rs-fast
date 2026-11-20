@@ -27,7 +27,7 @@ use winnow::error::ErrMode;
 use winnow::stream::Stream as _;
 use winnow::token::any;
 
-use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind};
+use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind, poly_dimension};
 use crate::netlist::bexpr::BehaviouralExpression;
 use crate::netlist::token::{Token, TokenKind};
 
@@ -391,9 +391,7 @@ pub(super) fn poly_form(
     let count = input
         .input
         .first()
-        .and_then(|token| token.number())
-        .and_then(crate::primitives::exact_nonnegative_integer::<usize>)
-        .filter(|count| (1..=64).contains(count))
+        .and_then(|token| poly_dimension(&token.text))
         .ok_or_else(|| {
             parse_error(
                 input,

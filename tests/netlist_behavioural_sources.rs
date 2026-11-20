@@ -415,6 +415,36 @@ fn poly_forms_lower_onto_spice2poly_in_spice2_term_order() {
 }
 
 #[test]
+fn poly_dimensions_use_one_validation_rule_across_frontend() {
+    for spelling in ["2", "2.0", "2e0", "02", "+2"] {
+        let body = format!("e1 o 0 poly({spelling}) a 0 b 0 1 2 3");
+        let written = round_trip(&body);
+        assert!(written.contains(&body), "{written}");
+        let netlist = lowered(&body);
+        assert_eq!(
+            shape(&expression(&netlist.devices[0], "v").root),
+            "((1 + (2 * v(a,0))) + (3 * v(b,0)))"
+        );
+    }
+    // atoi in the C translator reads a decimal prefix, not a scaled SPICE
+    // number; the port must not accept an inconsistent dimension.
+    for spelling in ["2e1", "0.2e1", "1.5", "65", "0"] {
+        let body = format!("e1 o 0 poly({spelling}) a 0 b 0 1 2 3");
+        let error = try_parse(&body).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("positive integer POLY dimension"),
+            "{error}"
+        );
+    }
+    let mut malformed = parse("e1 o 0 poly(2) a 0 b 0 1 2 3");
+    malformed.devices[0].parameters[0].value = "18446744073709551615".into();
+    assert!(lower_nonlinear_sources(&malformed).is_err());
+    assert!(write_netlist(&malformed).is_err());
+}
+
+#[test]
 fn current_references_insert_measurement_sources_like_inp_meas_current() {
     let netlist = lowered(
         "b1 o 0 v=1\nb2 p 0 v=i(b1)*2 + i(b1)\nb3 q 0 v=max(1,i(b1))\n\

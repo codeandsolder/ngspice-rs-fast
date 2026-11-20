@@ -50,6 +50,7 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::analysis::batch;
@@ -59,7 +60,8 @@ use crate::analysis::selection::Selection;
 use crate::analysis::{
     Plot, PointSink, RawFileWriter, RawFormat, RawPlot, RunConfig, StreamedPlot, runner,
 };
-use crate::netlist::Parser;
+use crate::netlist::eval::ParamScope;
+use crate::netlist::{ParsedDeck, Parser};
 use crate::primitives::{AnalysisKind, Complex, SpiceError, SpiceResult};
 
 use crate::cli::args::kind_name;
@@ -111,6 +113,25 @@ pub struct PlotReport {
     pub fourier_results: Vec<FourierAnalysis>,
 }
 
+impl PlotReport {
+    /// Shared metadata for materialized and streamed plots, before optional
+    /// print/measure/Fourier outputs are attached.
+    fn written(name: &str, analysis: AnalysisKind, plot: &Plot, points: usize) -> Self {
+        Self {
+            name: name.to_owned(),
+            analysis,
+            plotname: plot.plotname.clone(),
+            variables: plot.variables.iter().map(|v| v.name.clone()).collect(),
+            points,
+            printed: None,
+            measured: None,
+            measurements: Vec::new(),
+            fourier: None,
+            fourier_results: Vec::new(),
+        }
+    }
+}
+
 /// Simulates every analysis of the deck and writes them as one ASCII rawfile.
 ///
 /// # Errors
@@ -157,25 +178,7 @@ pub fn run_with_format(
     auto_gnd: bool,
     format: Option<RawFormat>,
 ) -> SpiceResult<Report> {
-    let mut parsed = Parser::with_auto_gnd(auto_gnd).parse_file_with_output(deck)?;
-    if parsed.netlist.subcircuits.iter().any(|sub| {
-        !sub.output.is_empty() || !sub.measurements.is_empty() || !sub.fourier.is_empty()
-    }) {
-        let literal = crate::netlist::elaborate::literalize(&parsed.netlist)?;
-        let expanded = crate::devices::subckt::expand_with_output(
-            &literal.netlist,
-            &literal.scope,
-            crate::devices::subckt::SubcircuitLimits::default(),
-            &parsed.output,
-            &parsed.measurements,
-            &parsed.fourier,
-        )?;
-        parsed.output = expanded.output;
-        parsed.measurements = expanded.measurements;
-        parsed.fourier = expanded.fourier;
-    }
-    let scope = crate::netlist::eval::ParamScope::for_netlist(&parsed.netlist)?;
-    parsed.fourier = fourier::resolve_cards(&parsed.fourier, &scope)?;
+    let (parsed, scope) = prepare_deck(deck, auto_gnd)?;
     let netlist = &parsed.netlist;
     if netlist.analyses.is_empty() {
         return Err(SpiceError::parse(
@@ -194,20 +197,7 @@ pub fn run_with_format(
     // unknown or unsupported settings are errors, never ignored.
     let config = RunConfig::from_netlist(netlist)?;
     let format = format.or_else(|| config.raw_format()).unwrap_or_else(|| {
-        // C uses atoi: leading signed integer, nonzero means ASCII.
-        let value = std::env::var("SPICE_ASCIIRAWFILE").unwrap_or_default();
-        let value = value.trim_start();
-        let digits: String = value
-            .chars()
-            .enumerate()
-            .take_while(|(i, c)| c.is_ascii_digit() || (*i == 0 && matches!(c, '+' | '-')))
-            .map(|(_, c)| c)
-            .collect();
-        if digits.parse::<i64>().unwrap_or(0) != 0 {
-            RawFormat::Ascii
-        } else {
-            RawFormat::Binary
-        }
+        raw_format_from_env(&std::env::var("SPICE_ASCIIRAWFILE").unwrap_or_default())
     });
     let schedule = batch::schedule_evaluated(&netlist.analyses, &config)?;
     // Every request and driver is validated before the first analysis runs, so
@@ -292,23 +282,12 @@ pub fn run_with_format(
                     message: "the driver produced no plot".to_owned(),
                 });
             };
-            let written = &streamed.header().plot;
-            plots.push(PlotReport {
-                name: names[0].to_owned(),
-                analysis: entry.kind,
-                plotname: written.plotname.clone(),
-                variables: written
-                    .variables
-                    .iter()
-                    .map(|variable| variable.name.clone())
-                    .collect(),
-                points: streamed.point_count(),
-                printed: None,
-                measured: None,
-                measurements: Vec::new(),
-                fourier: None,
-                fourier_results: Vec::new(),
-            });
+            plots.push(PlotReport::written(
+                names[0],
+                entry.kind,
+                &streamed.header().plot,
+                streamed.point_count(),
+            ));
             rawfile.writer.finish_plot(streamed)?;
             circuit.note_completed(entry.kind);
             previous_circuit = Some(circuit);
@@ -350,24 +329,20 @@ pub fn run_with_format(
                     fourier::resolve_with_settings(plot, entry.kind, &parsed.fourier, settings)?;
             }
             let raw_plot = raw_plot_for(&netlist.title, outputs.written, &date);
-            plots.push(PlotReport {
-                name: name.to_owned(),
-                analysis: entry.kind,
-                plotname: raw_plot.plot.plotname.clone(),
-                variables: raw_plot
-                    .plot
-                    .variables
-                    .iter()
-                    .map(|variable| variable.name.clone())
-                    .collect(),
-                points: raw_plot.plot.point_count(),
-                printed: outputs.printed,
-                measured: (!outputs.measurements.is_empty())
-                    .then(|| measure::to_text(&outputs.measurements)),
-                measurements: outputs.measurements,
-                fourier: (!outputs.fourier.is_empty()).then(|| fourier::to_text(&outputs.fourier)),
-                fourier_results: outputs.fourier,
-            });
+            let mut report = PlotReport::written(
+                name,
+                entry.kind,
+                &raw_plot.plot,
+                raw_plot.plot.point_count(),
+            );
+            report.printed = outputs.printed;
+            report.measured =
+                (!outputs.measurements.is_empty()).then(|| measure::to_text(&outputs.measurements));
+            report.measurements = outputs.measurements;
+            report.fourier =
+                (!outputs.fourier.is_empty()).then(|| fourier::to_text(&outputs.fourier));
+            report.fourier_results = outputs.fourier;
+            plots.push(report);
             rawfile.writer.write_plot(&raw_plot)?;
         }
         circuit.note_completed(entry.kind);
@@ -382,6 +357,47 @@ pub fn run_with_format(
         format,
         plots,
     })
+}
+
+/// Prepare frontend requests and the top-level scope once. Expanding
+/// subcircuit output cards already requires a resolved scope, so reuse it
+/// when evaluating the root Fourier cards and measurement outputs.
+fn prepare_deck(deck: &Path, auto_gnd: bool) -> SpiceResult<(ParsedDeck, Arc<ParamScope>)> {
+    let mut parsed = Parser::with_auto_gnd(auto_gnd).parse_file_with_output(deck)?;
+    let scope = if parsed.netlist.subcircuits.iter().any(|sub| {
+        !sub.output.is_empty() || !sub.measurements.is_empty() || !sub.fourier.is_empty()
+    }) {
+        let literal = crate::netlist::elaborate::literalize(&parsed.netlist)?;
+        let expanded = crate::devices::subckt::expand_with_output(
+            &literal.netlist,
+            &literal.scope,
+            crate::devices::subckt::SubcircuitLimits::default(),
+            &parsed.output,
+            &parsed.measurements,
+            &parsed.fourier,
+        )?;
+        parsed.output = expanded.output;
+        parsed.measurements = expanded.measurements;
+        parsed.fourier = expanded.fourier;
+        literal.scope
+    } else {
+        Arc::new(ParamScope::for_netlist(&parsed.netlist)?)
+    };
+    parsed.fourier = fourier::resolve_cards(&parsed.fourier, &scope)?;
+    Ok((parsed, scope))
+}
+
+/// C uses atoi on SPICE_ASCIIRAWFILE; preserve the existing signed prefix
+/// and overflow policy without allocating a second string.
+fn raw_format_from_env(value: &str) -> RawFormat {
+    let value = value.trim_start();
+    let sign = usize::from(value.starts_with(['+', '-']));
+    let digits = value[sign..].bytes().take_while(u8::is_ascii_digit).count();
+    if value[..sign + digits].parse::<i64>().unwrap_or(0) != 0 {
+        RawFormat::Ascii
+    } else {
+        RawFormat::Binary
+    }
 }
 
 /// Streams one plot into the rawfile through its `.save`/`.print` selection.
@@ -726,7 +742,10 @@ fn plot_blocks(out: &mut String, plot: &PlotReport) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PlotReport, Report, civil_from_days, format_ctime, report_text};
+    use super::{
+        PlotReport, RawFormat, Report, civil_from_days, format_ctime, raw_format_from_env,
+        report_text,
+    };
     use crate::primitives::AnalysisKind;
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
@@ -750,6 +769,25 @@ mod tests {
             measurements: Vec::new(),
             fourier: None,
             fourier_results: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ascii_rawfile_environment_uses_signed_decimal_prefix() {
+        for (text, expected) in [
+            ("", RawFormat::Binary),
+            ("0", RawFormat::Binary),
+            ("+0foo", RawFormat::Binary),
+            ("  -0", RawFormat::Binary),
+            ("+", RawFormat::Binary),
+            ("x1", RawFormat::Binary),
+            ("01", RawFormat::Ascii),
+            (" -12trailing", RawFormat::Ascii),
+            ("+1e0", RawFormat::Ascii),
+            ("1é", RawFormat::Ascii),
+            ("9223372036854775808", RawFormat::Binary),
+        ] {
+            assert_eq!(raw_format_from_env(text), expected, "{text}");
         }
     }
 

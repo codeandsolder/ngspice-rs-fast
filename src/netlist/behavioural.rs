@@ -34,7 +34,7 @@ use std::sync::Arc;
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 use crate::netlist::ast::{
-    DeviceInstance, Netlist, ParameterAssignment, ParameterKind, Subcircuit,
+    DeviceInstance, Netlist, ParameterAssignment, ParameterKind, Subcircuit, poly_dimension,
 };
 use crate::netlist::bexpr::{
     BBinaryOp, BExpr, BExprKind, BUnaryOp, BehaviouralExpression, SPECIAL_NAMES,
@@ -67,7 +67,7 @@ const MAX_RESOLVED_NODES: usize = 100_000;
 pub fn lower_nonlinear_sources(netlist: &Netlist) -> SpiceResult<Netlist> {
     let mut out = netlist.clone();
     measure_currents(&mut out);
-    out.devices = lower_devices(&out.devices)?;
+    out.devices = lower_devices(std::mem::take(&mut out.devices))?;
     for subcircuit in &mut out.subcircuits {
         lower_subcircuit(subcircuit)?;
     }
@@ -271,17 +271,17 @@ fn rename_occurrence(device: &mut DeviceInstance, occurrence: usize, name: &str)
 }
 
 fn lower_subcircuit(subcircuit: &mut Subcircuit) -> SpiceResult<()> {
-    subcircuit.devices = lower_devices(&subcircuit.devices)?;
+    subcircuit.devices = lower_devices(std::mem::take(&mut subcircuit.devices))?;
     for nested in &mut subcircuit.subcircuits {
         lower_subcircuit(nested)?;
     }
     Ok(())
 }
 
-fn lower_devices(devices: &[DeviceInstance]) -> SpiceResult<Vec<DeviceInstance>> {
+fn lower_devices(devices: Vec<DeviceInstance>) -> SpiceResult<Vec<DeviceInstance>> {
     let mut out = Vec::with_capacity(devices.len());
     for device in devices {
-        out.extend(lower_device(device)?);
+        lower_device(device, &mut out)?;
     }
     Ok(out)
 }
@@ -290,20 +290,25 @@ fn has(device: &DeviceInstance, name: &str) -> bool {
     device.parameters.iter().any(|p| p.name == name)
 }
 
-fn lower_device(device: &DeviceInstance) -> SpiceResult<Vec<DeviceInstance>> {
-    if !matches!(device.designator, 'e'..='h') {
-        return Ok(vec![device.clone()]);
+fn lower_device(device: DeviceInstance, out: &mut Vec<DeviceInstance>) -> SpiceResult<()> {
+    if matches!(device.designator, 'e'..='h') {
+        if has(&device, "poly") {
+            out.push(lower_poly(&device)?);
+            return Ok(());
+        }
+        if has(&device, "value") {
+            out.extend(lower_value(&device)?);
+            return Ok(());
+        }
+        if has(&device, "table") {
+            out.extend(lower_table(&device)?);
+            return Ok(());
+        }
     }
-    if has(device, "poly") {
-        return lower_poly(device).map(|device| vec![device]);
-    }
-    if has(device, "value") {
-        return lower_value(device);
-    }
-    if has(device, "table") {
-        return lower_table(device);
-    }
-    Ok(vec![device.clone()])
+    // The deck was cloned once before rewriting; unchanged devices can move
+    // directly into the lowered vector, including their expression trees.
+    out.push(device);
+    Ok(())
 }
 
 fn scalar(name: &str, value: &str, location: &SourceLoc) -> ParameterAssignment {
@@ -638,8 +643,7 @@ fn lower_poly(device: &DeviceInstance) -> SpiceResult<DeviceInstance> {
         .parameters
         .iter()
         .find(|p| p.name == "poly")
-        .and_then(|p| p.value.parse::<usize>().ok())
-        .filter(|n| *n >= 1)
+        .and_then(|p| poly_dimension(&p.value))
         .ok_or_else(|| malformed(device, "POLY needs a positive integer dimension"))?;
     let location = &device.location;
     let mut controls = Vec::new();

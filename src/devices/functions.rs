@@ -46,6 +46,7 @@
 //! warning); and every value is checked to be finite.
 
 use std::f64::consts::PI;
+use std::sync::Arc;
 
 use crate::devices::{Limit, TransientTiming};
 use crate::primitives::{Real, SpiceError, SpiceResult};
@@ -563,7 +564,7 @@ impl SourceFunction {
 /// landing times bit for bit, so the requested [`Limit`] is ignored.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PwlSource {
-    knots: Vec<(Real, Real)>,
+    knots: Arc<[(Real, Real)]>,
     delay: Real,
     repeat: Option<usize>,
 }
@@ -617,7 +618,7 @@ impl PwlSource {
             _ => None,
         };
         Ok(Self {
-            knots,
+            knots: knots.into(),
             delay,
             repeat,
         })
@@ -1103,6 +1104,20 @@ mod tests {
         }
         let single = PwlSource::new(vec![(0., -0.)], 0., None).unwrap();
         assert_eq!(single.interpolate(1.).to_bits(), (-0.0_f64).to_bits());
+    }
+
+    #[test]
+    fn pwl_breakpoint_iterators_share_knot_storage() {
+        let source = PwlSource::new(vec![(0., 0.), (1., 1.), (2., 0.)], 0., Some(0.)).unwrap();
+        let mut first = source.breakpoints_in(0., 6.).unwrap();
+        let mut second = first.clone();
+        assert!(Arc::ptr_eq(&source.knots, &first.source.knots));
+        assert!(Arc::ptr_eq(&first.source.knots, &second.source.knots));
+        assert_eq!(first.next(), Some(0.));
+        assert_eq!(first.next(), Some(1.));
+        assert_eq!(second.next(), Some(0.));
+        assert_eq!(first.collect::<Vec<_>>(), [2., 3., 4., 5., 6.]);
+        assert_eq!(second.collect::<Vec<_>>(), [1., 2., 3., 4., 5., 6.]);
     }
 
     #[test]
