@@ -128,7 +128,7 @@ pub struct InitialCondition {
 ///
 /// PWL `td=`/`r=` are separate ordered scalar setters (`VSRC_TD`/`VSRC_R` in
 /// `vsrc.c`), not part of this value, exactly as C applies them.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceWaveform {
     /// Two required levels and up to six optional fields.
     Pulse(Box<PulseWaveform>),
@@ -236,7 +236,7 @@ impl SourceFunction {
 /// One SIN/EXP/SFFM/AM setter: its function and the supplied fields in C
 /// coefficient order. Omitted trailing fields are simply absent; defaults that
 /// depend on `.tran` (`CKTstep`, `CKTfinalTime`) belong to elaboration.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionWaveform {
     /// Which function.
     pub function: SourceFunction,
@@ -245,7 +245,7 @@ pub struct FunctionWaveform {
 }
 
 /// `PULSE(V1 V2 [TD [TR [TF [PW [PER [NP]]]]]])`; omissions stay explicit.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PulseWaveform {
     /// Initial level (volts for V, amperes for I).
     pub initial: PositionedValue,
@@ -267,7 +267,7 @@ pub struct PulseWaveform {
 }
 
 /// One PWL knot, retained in supplied order (syntax is not runtime validation).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PwlPoint {
     /// Time in seconds.
     pub time: PositionedValue,

@@ -67,7 +67,7 @@ const MAX_RESOLVED_NODES: usize = 100_000;
 /// POLY without its controls), positioned at the card.
 pub fn lower_nonlinear_sources(netlist: &Netlist) -> SpiceResult<Netlist> {
     let mut out = netlist.clone();
-    measure_currents(&mut out);
+    measure_currents(&mut out)?;
     out.devices = lower_devices(std::mem::take(&mut out.devices))?;
     for subcircuit in &mut out.subcircuits {
         lower_subcircuit(subcircuit)?;
@@ -195,7 +195,7 @@ struct ScopeMeasurements {
 /// current into `name`'s first node through an inserted zero-volt source
 /// `v_name` (`name`'s first node becomes `<node>_vmeas_<n>`), unless `name`
 /// is a simple linear E/H. The device is searched in the same scope only.
-fn measure_currents(netlist: &mut Netlist) {
+fn measure_currents(netlist: &mut Netlist) -> SpiceResult<()> {
     // Phase 1: every rewritable reference, grouped by device, in deck order.
     let mut references = Vec::new();
     let mut scopes = HashMap::<Vec<usize>, ScopeMeasurements>::new();
@@ -248,19 +248,47 @@ fn measure_currents(netlist: &mut Netlist) {
         }
     }
 
+    rewrite_measured_references(netlist, references, &mut scopes)?;
+
+    // Rebuild each affected device vector in order. Repeated Vec::insert
+    // would move all following devices once for every generated source.
+    for (path, mut scope) in scopes {
+        if scope.insertions.is_empty() {
+            continue;
+        }
+        let devices = scope_devices(netlist, &path);
+        let mut rewritten = Vec::with_capacity(devices.len() + scope.insertions.len());
+        for (index, device) in std::mem::take(devices).into_iter().enumerate() {
+            rewritten.push(device);
+            if let Some(source) = scope.insertions.remove(&index) {
+                rewritten.push(source);
+            }
+        }
+        *devices = rewritten;
+    }
+    Ok(())
+}
+
+fn rewrite_measured_references(
+    netlist: &mut Netlist,
+    references: Vec<(Position, Vec<MeasurementReference>)>,
+    scopes: &mut HashMap<Vec<usize>, ScopeMeasurements>,
+) -> SpiceResult<()> {
     // Phase 2: process references in global deck order. Every matching
     // non-simple target still advances C's serial, even after its source
     // was inserted. Rewrite each expression once, not once per reference.
     let mut serial = 0usize;
     for ((path, device_index), group) in references {
         let devices = scope_devices(netlist, &path);
-        let scope = scopes.get_mut(&path).expect("indexed referenced scope");
+        let scope = scopes
+            .get_mut(&path)
+            .ok_or_else(|| SpiceError::circuit("missing indexed current-reference scope"))?;
         let mut renames = Vec::new();
         for reference in group {
             let targets = scope
                 .targets
                 .get_mut(&reference.name)
-                .expect("indexed reference");
+                .ok_or_else(|| SpiceError::circuit("missing indexed current-reference target"))?;
             let source = format!("v_{}", reference.name);
             if !targets.simple {
                 renames.push((reference.occurrence, source.clone()));
@@ -296,22 +324,7 @@ fn measure_currents(netlist: &mut Netlist) {
         rename_occurrences(&mut devices[device_index], &renames);
     }
 
-    // Rebuild each affected device vector in order. Repeated Vec::insert
-    // would move all following devices once for every generated source.
-    for (path, mut scope) in scopes {
-        if scope.insertions.is_empty() {
-            continue;
-        }
-        let devices = scope_devices(netlist, &path);
-        let mut rewritten = Vec::with_capacity(devices.len() + scope.insertions.len());
-        for (index, device) in std::mem::take(devices).into_iter().enumerate() {
-            rewritten.push(device);
-            if let Some(source) = scope.insertions.remove(&index) {
-                rewritten.push(source);
-            }
-        }
-        *devices = rewritten;
-    }
+    Ok(())
 }
 
 /// C's "simple linear e source": an E/H without `=` or POLY on its card.
@@ -580,22 +593,7 @@ fn lower_table(device: &DeviceInstance) -> SpiceResult<Vec<DeviceInstance>> {
     }
     let mut out = vec![driven_source(device, &int1)];
     if points.len() == 1 {
-        // "A single pair (x0, y0) will return a constant voltage y0".
-        let y = device
-            .parameters
-            .iter()
-            .find(|p| p.name == "y")
-            .expect("one point");
-        out.push(instance(
-            format!("v{}", device.name),
-            'v',
-            vec![int1, "0".to_owned()],
-            vec![ParameterAssignment {
-                name: "dc".to_owned(),
-                ..y.clone()
-            }],
-            &device.location,
-        ));
+        out.push(constant_table_source(device, int1)?);
         return Ok(out);
     }
     let location = &input.location;
@@ -656,6 +654,25 @@ fn lower_table(device: &DeviceInstance) -> SpiceResult<Vec<DeviceInstance>> {
         &device.location,
     ));
     Ok(out)
+}
+
+/// A single TABLE pair is a constant voltage source, independent of the input.
+fn constant_table_source(device: &DeviceInstance, node: String) -> SpiceResult<DeviceInstance> {
+    let y = device
+        .parameters
+        .iter()
+        .find(|p| p.name == "y")
+        .ok_or_else(|| malformed(device, "TABLE single point missing y value"))?;
+    Ok(instance(
+        format!("v{}", device.name),
+        'v',
+        vec![node, "0".to_owned()],
+        vec![ParameterAssignment {
+            name: "dc".to_owned(),
+            ..y.clone()
+        }],
+        &device.location,
+    ))
 }
 
 /// In-place SPICE2 monomial sequence (`nxtpwr` in
@@ -776,7 +793,9 @@ fn lower_poly(device: &DeviceInstance) -> SpiceResult<DeviceInstance> {
         let term = binary(
             BBinaryOp::Mul,
             point(coefficient)?,
-            product.expect("degree >= 1"),
+            product.ok_or_else(|| {
+                malformed(device, "POLY nonconstant term has no controlling factors")
+            })?,
         );
         sum = binary(BBinaryOp::Add, sum, term);
     }
