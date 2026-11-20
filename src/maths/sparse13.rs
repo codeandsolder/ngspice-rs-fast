@@ -720,7 +720,6 @@ pub(super) struct Sparse<T> {
     size: usize,
     /// External order (C `ExtSize`, here fixed by [`Self::new`]).
     ext_size: usize,
-    current_size: usize,
     /// Stable handles index topology and numeric storage independently.
     /// Reordering changes links, never moves element handles.
     topology: std::sync::Arc<Topology>,
@@ -731,8 +730,6 @@ pub(super) struct Sparse<T> {
     markowitz_row: Vec<i64>,
     markowitz_col: Vec<i64>,
     markowitz_prod: Vec<i64>,
-    /// Numeric column workspace for repeated `spFactor` calls.
-    factor_workspace: Vec<T>,
     singletons: i64,
     rel_threshold: f64,
     abs_threshold: f64,
@@ -757,7 +754,6 @@ impl<T: Scalar> Sparse<T> {
         Self {
             size: 0,
             ext_size: size,
-            current_size: 0,
             topology: std::sync::Arc::new(Topology {
                 elements: Vec::new(),
                 diag: vec![NONE; size + 1],
@@ -773,7 +769,6 @@ impl<T: Scalar> Sparse<T> {
             markowitz_row: Vec::new(),
             markowitz_col: Vec::new(),
             markowitz_prod: Vec::new(),
-            factor_workspace: Vec::new(),
             singletons: 0,
             rel_threshold: DEFAULT_THRESHOLD,
             abs_threshold: 0.0,
@@ -790,7 +785,7 @@ impl<T: Scalar> Sparse<T> {
 
     /// Whether every external index has been translated (no empty unknown).
     pub(crate) const fn fully_translated(&self) -> bool {
-        self.current_size == self.ext_size
+        self.size == self.ext_size
     }
 
     /// External indices (1-based) that no element references, so have no
@@ -844,13 +839,7 @@ impl<T: Scalar> Sparse<T> {
         if row != NONE && col != NONE {
             return (row, col);
         }
-        let translated = std::sync::Arc::make_mut(&mut self.topology).translate(
-            &mut self.current_size,
-            ext_row,
-            ext_col,
-        );
-        self.size = self.current_size;
-        translated
+        std::sync::Arc::make_mut(&mut self.topology).translate(&mut self.size, ext_row, ext_col)
     }
 
     /// `spcFindElementInCol`.
@@ -926,14 +915,13 @@ impl<T: Scalar> Sparse<T> {
         sparse.values.reserve(capacity);
         for (row, col, value) in entries {
             debug_assert!(row >= 1 && col >= 1 && row <= size && col <= size);
-            let (r, c) = topology.translate(&mut sparse.current_size, row, col);
+            let (r, c) = topology.translate(&mut sparse.size, row, col);
             let (last, found) = topology.locate_in_col(Slot::Head(c), r);
             assert_eq!(found, NONE, "duplicate original sparse element");
             let handle = topology.create_element(r, c, last, false);
             debug_assert_eq!(handle, sparse.values.len());
             sparse.values.push(value);
         }
-        sparse.size = sparse.current_size;
         sparse
     }
 
@@ -977,14 +965,12 @@ impl<T: Scalar> Sparse<T> {
         Sparse {
             size: self.size,
             ext_size: self.ext_size,
-            current_size: self.current_size,
             values: vec![U::ZERO; self.values.len()],
             topology: self.topology,
             plan: self.plan,
             markowitz_row: self.markowitz_row,
             markowitz_col: self.markowitz_col,
             markowitz_prod: self.markowitz_prod,
-            factor_workspace: Vec::new(),
             singletons: self.singletons,
             rel_threshold: self.rel_threshold,
             abs_threshold: self.abs_threshold,
@@ -1008,14 +994,12 @@ impl<T: Scalar> Sparse<T> {
         Sparse {
             size: self.size,
             ext_size: self.ext_size,
-            current_size: self.current_size,
             topology: self.topology.clone(),
             values: vec![U::ZERO; self.values.len()],
             plan: self.plan.clone(),
             markowitz_row: Vec::new(),
             markowitz_col: Vec::new(),
             markowitz_prod: Vec::new(),
-            factor_workspace: Vec::new(),
             singletons: 0,
             rel_threshold: self.rel_threshold,
             abs_threshold: self.abs_threshold,
@@ -1070,7 +1054,7 @@ impl<T: Scalar> Sparse<T> {
     /// True only when a direct numerical refactor can use the established
     /// pivot order, rather than implicitly running the ordering algorithm.
     pub(super) const fn can_refactor(&self) -> bool {
-        !self.needs_ordering
+        !self.needs_ordering && self.plan.is_some()
     }
 
     /// Whether the frame holds LU factors (`Matrix->Factored`).
@@ -1297,6 +1281,12 @@ impl<T: Scalar> Sparse<T> {
         let mut step = 1;
         let mut reorder = false;
         if !self.needs_ordering {
+            // A failed partial reorder may have invalidated the plan.
+            // Retain its numbering like C; initialize scratch in case
+            // completing the previously attempted prefix creates fill-ins.
+            if self.plan.is_none() && self.markowitz_row.len() <= self.size {
+                self.create_internal_vectors();
+            }
             while step <= size {
                 let pivot = self.topology.diag[step];
                 if pivot == NONE {
@@ -1325,10 +1315,6 @@ impl<T: Scalar> Sparse<T> {
         }
         // Reordering always rebuilds all active counts. A snapshot fork
         // needs no copy of the previous ordering's scratch arrays.
-        // Once pivot search starts, a failure can leave a partially
-        // exchanged topology and a discarded plan. Only done() publishes
-        // a reusable ordering.
-        self.needs_ordering = true;
         if self.markowitz_row.len() <= self.size {
             self.create_internal_vectors();
         }
@@ -1406,9 +1392,18 @@ impl<T: Scalar> Sparse<T> {
         }
     }
 
-    /// `spFactor`: refactor with the existing pivot order (no threshold test).
-    pub(crate) fn factor(&mut self) -> Status {
-        if self.needs_ordering {
+    #[cfg(test)]
+    fn factor(&mut self) -> Status {
+        self.factor_with_workspace(&mut Vec::new())
+    }
+
+    /// `spFactor`: refactor with the existing pivot order (no threshold
+    /// test). Scratch belongs to the operation, not to factor snapshots.
+    pub(super) fn factor_with_workspace(&mut self, workspace: &mut Vec<T>) -> Status {
+        // C retains a partial order after a singular reordering. If
+        // topology changed, no complete numeric traversal is available;
+        // retry the threshold path, preserving C's existing pivot prefix.
+        if !self.can_refactor() {
             return self.order_and_factor(0.0, 0.0);
         }
         self.factored = false;
@@ -1426,9 +1421,9 @@ impl<T: Scalar> Sparse<T> {
             return self.nonfinite_factor();
         }
         self.values[first] = inverse;
-        self.factor_workspace.resize(size + 1, T::ZERO);
-        self.factor_workspace.fill(T::ZERO);
-        let dest = &mut self.factor_workspace;
+        workspace.resize(size + 1, T::ZERO);
+        workspace.fill(T::ZERO);
+        let dest = workspace;
         let plan = self
             .plan
             .as_deref()
@@ -2480,9 +2475,19 @@ mod tests {
         assert_eq!(a.order_and_factor(1e-3, 0.), Status::Singular);
         assert!(!a.is_factored());
         assert!(!a.can_refactor());
+        assert!(
+            !a.needs_ordering,
+            "C retains its partial ordering after singular failure"
+        );
         assert!(a.plan.is_none());
+        let mut threshold = a.clone();
         a.reload_originals(&input);
+        threshold.reload_originals(&input);
+        assert_eq!(threshold.order_and_factor(0., 0.), Status::Okay);
         assert_eq!(a.factor(), Status::Okay);
+        assert_eq!(a.topology.int_to_ext_row, threshold.topology.int_to_ext_row);
+        assert_eq!(a.topology.int_to_ext_col, threshold.topology.int_to_ext_col);
+        assert_eq!(a.values, threshold.values);
         let x = a.solve(&rhs);
         for v in x {
             assert!((v - 1.).abs() < 1e-14);
@@ -2506,7 +2511,6 @@ mod tests {
         assert!(next.markowitz_row.is_empty());
         assert!(next.markowitz_col.is_empty());
         assert!(next.markowitz_prod.is_empty());
-        assert!(next.factor_workspace.is_empty());
         next.reload_originals(&[8., 1., 2., 5.]);
         assert_eq!(next.factor(), Status::Okay);
         assert_ne!(next.solve(&rhs), expected);
@@ -2523,7 +2527,6 @@ mod tests {
         assert_eq!(saved.solve(&rhs), expected);
         let c: Sparse<Complex> = Sparse::retype_shared(std::sync::Arc::clone(&saved));
         assert!(c.values.iter().all(|v| *v == Complex::ZERO));
-        assert!(c.factor_workspace.is_empty());
         assert!(c.markowitz_row.is_empty());
         assert_eq!(saved.solve(&rhs), expected);
     }
@@ -2695,18 +2698,20 @@ mod tests {
                 m.set(h, v);
             }
         };
+        let mut workspace = Vec::new();
         load(&mut m, &[3., 1., 1., 4.]);
-        assert_eq!(m.factor(), Status::Okay);
+        assert_eq!(m.factor_with_workspace(&mut workspace), Status::Okay);
         let initial = m.solve(&[4., 5.]);
-        let address = m.factor_workspace.as_ptr();
-        let capacity = m.factor_workspace.capacity();
+        let address = workspace.as_ptr();
+        let capacity = workspace.capacity();
         load(&mut m, &[1., 1., 1., 1.]);
-        assert_eq!(m.factor(), Status::ZeroDiag);
+        assert_eq!(m.factor_with_workspace(&mut workspace), Status::ZeroDiag);
         load(&mut m, &[3., 1., 1., 4.]);
-        assert_eq!(m.factor(), Status::Okay);
-        assert_eq!(m.factor_workspace.as_ptr(), address);
-        assert_eq!(m.factor_workspace.capacity(), capacity);
-        assert_eq!(m.solve(&[4., 5.]), initial);
+        assert_eq!(m.factor_with_workspace(&mut workspace), Status::Okay);
+        assert_eq!(workspace.as_ptr(), address);
+        assert_eq!(workspace.capacity(), capacity);
+        assert_eq!(m.solve_with_workspace(&[4., 5.], &mut workspace), initial);
+        assert_eq!(workspace.as_ptr(), address);
     }
 
     /// External row 2 has no element: as with ngspice's `Translate`, the
