@@ -325,3 +325,20 @@ fn the_card_round_trips_through_the_writer() {
     let names: Vec<_> = line.parameters.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["zo", "ic", "v2", "td", "rel", "abs"]);
 }
+
+#[test]
+fn generated_node_collision_rolls_back_just_appended_nodes() {
+    use ngspice_rs::devices::tline::TransmissionLine;
+    use ngspice_rs::primitives::{NodeKind, NodeTable};
+    let parsed = netlist("t1 a 0 b 0 z0=50 td=1n").unwrap();
+    let mut nodes = NodeTable::default();
+    let collision = nodes.intern("t1#int2");
+    nodes.set_kind(collision, NodeKind::Internal);
+    let before = nodes.nodes().to_vec();
+    let err = TransmissionLine::instantiate(&parsed.devices[0], &mut nodes).unwrap_err();
+    assert!(err.to_string().contains("collision"));
+    assert_eq!(nodes.nodes(), before);
+    for name in ["a", "b", "t1#i1", "t1#i2", "t1#int1"] {
+        assert!(nodes.get(name).is_none());
+    }
+}

@@ -25,6 +25,7 @@
 //!
 //! A device opts in through [`crate::devices::Device::delay_line`].
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -83,6 +84,17 @@ impl DelayHistory {
     #[must_use]
     pub fn time(&self, index: usize) -> Option<Real> {
         self.times.get(index).copied()
+    }
+
+    /// Borrow contiguous accepted times for convolution. Histories that
+    /// have wrapped after pruning are the only ones that require a copy.
+    pub(super) fn contiguous_times(&self) -> Cow<'_, [Real]> {
+        let (first, second) = self.times.as_slices();
+        if second.is_empty() {
+            Cow::Borrowed(first)
+        } else {
+            Cow::Owned(self.times.iter().copied().collect())
+        }
     }
 
     /// Value `component` of sample `index`.
@@ -302,6 +314,29 @@ mod tests {
 
     fn sample(time: f64, value: f64) -> (f64, Vec<f64>) {
         (time, vec![value, -value])
+    }
+
+    #[test]
+    fn contiguous_times_preserve_ring_order_after_pruning() {
+        let mut history = DelayHistory::new(2);
+        for time in 0_i32..32 {
+            history
+                .apply(&DelayUpdate {
+                    append: Some(sample(f64::from(time), 1.)),
+                    drop_front: usize::from(time >= 4),
+                    ..DelayUpdate::default()
+                })
+                .unwrap();
+            let expected = ((time - 3).max(0)..=time)
+                .map(f64::from)
+                .collect::<Vec<_>>();
+            assert_eq!(history.contiguous_times().as_ref(), expected);
+        }
+        history.clear();
+        assert!(matches!(
+            history.contiguous_times(),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

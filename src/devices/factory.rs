@@ -192,6 +192,55 @@ pub(super) fn instantiate(
     }
 }
 
+/// Execute an append-only node-table transaction. Builders may intern
+/// nodes and assign newly created node kinds, but must not modify existing
+/// nodes. An error discards just the appended suffix, not the entire table.
+pub(super) fn append_nodes<T>(
+    nodes: &mut NodeTable,
+    build: impl FnOnce(&mut NodeTable) -> SpiceResult<T>,
+) -> SpiceResult<T> {
+    let mark = nodes.len();
+    let result = build(nodes);
+    if result.is_err() {
+        nodes.truncate(mark);
+    }
+    result
+}
+
+/// Build a four-terminal line's internal unknowns in C setup order. On a
+/// generated-name collision, rollback only the newly interned nodes.
+pub(super) fn line_terminals<const N: usize>(
+    instance: &DeviceInstance,
+    nodes: &mut NodeTable,
+    suffixes: &[&str],
+    label: &str,
+) -> SpiceResult<[crate::primitives::NodeId; N]> {
+    use crate::primitives::NodeId;
+    if instance.nodes.len() != 4 || N != 4 + suffixes.len() {
+        return Err(SpiceError::circuit(
+            "invalid transmission-line terminal layout",
+        ));
+    }
+    append_nodes(nodes, |nodes| {
+        let mut terminals = [NodeId::GROUND; N];
+        for (slot, node) in instance.nodes.iter().enumerate() {
+            terminals[slot] = nodes.intern(node);
+        }
+        for (slot, suffix) in suffixes.iter().enumerate() {
+            let name = format!("{}#{suffix}", instance.name);
+            if nodes.get(&name).is_some() {
+                return Err(SpiceError::circuit(format!(
+                    "{label} internal-node name collision: {name}"
+                )));
+            }
+            let node = nodes.intern(&name);
+            nodes.set_kind(node, NodeKind::Internal);
+            terminals[4 + slot] = node;
+        }
+        Ok(terminals)
+    })
+}
+
 /// Parse the shared scalar parameter syntax without conflating the two
 /// factories' supported setter lists or dropping intermediate errors.
 fn scalar_number(p: &crate::netlist::ast::ParameterAssignment) -> SpiceResult<Real> {
@@ -249,27 +298,24 @@ fn instantiate_passive(
             _ => return Err(unsupported_parameter(instance, p)),
         }
     }
-    let mark = nodes.len();
-    let terminals = [
-        nodes.intern(&instance.nodes[0]),
-        nodes.intern(&instance.nodes[1]),
-    ];
-    let built: SpiceResult<Box<dyn Device>> = match kind {
-        PassiveKind::Resistor => Resistor::new(&instance.name, terminals, value).map(|r| {
-            Box::new(r.with_noise(ResistorNoise {
-                noisy,
-                ..ResistorNoise::default()
-            })) as Box<dyn Device>
-        }),
-        PassiveKind::Capacitor => Capacitor::new(&instance.name, terminals, value, ic)
-            .map(|c| Box::new(c) as Box<dyn Device>),
-        PassiveKind::Inductor => Inductor::new(&instance.name, terminals, value, ic)
-            .map(|l| Box::new(l) as Box<dyn Device>),
-    };
-    if built.is_err() {
-        nodes.truncate(mark);
-    }
-    built
+    append_nodes(nodes, |nodes| {
+        let terminals = [
+            nodes.intern(&instance.nodes[0]),
+            nodes.intern(&instance.nodes[1]),
+        ];
+        match kind {
+            PassiveKind::Resistor => Resistor::new(&instance.name, terminals, value).map(|r| {
+                Box::new(r.with_noise(ResistorNoise {
+                    noisy,
+                    ..ResistorNoise::default()
+                })) as Box<dyn Device>
+            }),
+            PassiveKind::Capacitor => Capacitor::new(&instance.name, terminals, value, ic)
+                .map(|c| Box::new(c) as Box<dyn Device>),
+            PassiveKind::Inductor => Inductor::new(&instance.name, terminals, value, ic)
+                .map(|l| Box::new(l) as Box<dyn Device>),
+        }
+    })
 }
 
 fn instantiate_source(
@@ -406,9 +452,7 @@ fn instantiate_source(
     };
     // Intern in place and roll back on failure, so the caller's node table is
     // untouched by an error without cloning it per instance.
-    let mark = nodes.len();
-    let built = (|| -> SpiceResult<Box<dyn Device>> {
-        let new_nodes = &mut *nodes;
+    append_nodes(nodes, |new_nodes| {
         let terminals = [
             new_nodes.intern(&instance.nodes[0]),
             new_nodes.intern(&instance.nodes[1]),
@@ -451,11 +495,7 @@ fn instantiate_source(
             }
         };
         Ok(device)
-    })();
-    if built.is_err() {
-        nodes.truncate(mark);
-    }
-    built
+    })
 }
 
 /// The ordered RFSPICE port setters of one V card (`vsrcpar.c`), resolved by

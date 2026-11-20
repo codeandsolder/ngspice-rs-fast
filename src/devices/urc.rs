@@ -447,111 +447,108 @@ fn build(
     deck_nodes: &BTreeSet<&str>,
 ) -> SpiceResult<Vec<Box<dyn Device>>> {
     let name = &instance.name;
-    let mut staged = nodes.clone();
-    // The terminals exist before setup in C (INP2U binds them at parse time).
-    for terminal in &instance.nodes {
-        staged.intern(terminal);
-    }
-    let fresh = |staged: &mut NodeTable, suffix: String| -> SpiceResult<String> {
-        let node = format!("{name}#{suffix}");
-        // C's CKTmkVolt fails (E_EXISTS) on a name the deck already uses,
-        // whichever card comes first.
-        if staged.get(&node).is_some() || deck_nodes.contains(node.as_str()) {
-            return Err(SpiceError::circuit(format!(
-                "URC internal-node name collision: {node}"
-            )));
+    crate::devices::factory::append_nodes(nodes, |nodes| {
+        // The terminals exist before setup in C (INP2U binds them at parse time).
+        for terminal in &instance.nodes {
+            nodes.intern(terminal);
         }
-        staged.intern(&node);
-        Ok(node)
-    };
-    // The diode ladder's generated model (`<name>#diodemod`: cjo, rs, is set
-    // in that order by URCsetup); every diode references it.
-    let diode_model = sections.diode.map(|(i1, rd)| ModelCard {
-        name: format!("{name}#diodemod"),
-        base: "d".to_owned(),
-        level: None,
-        parameters: vec![
-            setter("cjo", sections.capacitance, model_location),
-            setter("rs", rd, model_location),
-            setter("is", i1, model_location),
-        ],
-        location: model_location.clone(),
-    });
-    let diode_models = diode_model.into_iter().collect::<Vec<_>>();
-    let diode_resolver = ModelResolver::new(&diode_models)?;
-    let reference = instance.nodes[2].clone();
-    let mut devices: Vec<Box<dyn Device>> = Vec::with_capacity(4 * sections.lumps + 1);
-    // C keeps the URC instance itself (created by INP2U, before setup) next
-    // to the elements URCsetup generates.
-    devices.push(Box::new(UrcLine {
-        name: name.clone(),
-        length: sections.length,
-        lumps: sections.lumps,
-    }));
-    let mut lowl = instance.nodes[0].clone();
-    let mut hir = instance.nodes[1].clone();
-    let mut prop: Real = 1.;
-    let id = |staged: &mut NodeTable, node: &str| -> NodeId { staged.intern(node) };
-    for section in 1..=sections.lumps {
-        let hil = fresh(&mut staged, format!("hi{section}"))?;
-        let lowr = if section == sections.lumps {
-            hil.clone()
-        } else {
-            fresh(&mut staged, format!("lo{section}"))?
-        };
-        let r = prop * sections.resistance;
-        let c = prop * sections.capacitance;
-        let terminals = [id(&mut staged, &lowl), id(&mut staged, &lowr)];
-        devices.push(Box::new(Resistor::new(
-            format!("{name}#rlo{section}"),
-            terminals,
-            r,
-        )?));
-        let terminals = [id(&mut staged, &hil), id(&mut staged, &hir)];
-        devices.push(Box::new(Resistor::new(
-            format!("{name}#rhi{section}"),
-            terminals,
-            r,
-        )?));
-        let mut shunts = vec![("lo", lowr.clone())];
-        if section != sections.lumps {
-            shunts.push(("hi", hil.clone()));
-        }
-        for (side, node) in shunts {
-            if sections.diode.is_some() {
-                let diode = DeviceInstance {
-                    name: format!("{name}#d{side}{section}"),
-                    designator: 'd',
-                    nodes: vec![node, reference.clone()],
-                    model: Some(format!("{name}#diodemod")),
-                    parameters: vec![setter("area", prop, &instance.location)],
-                    location: instance.location.clone(),
-                };
-                let model = diode_resolver.resolve(&diode)?.ok_or_else(|| {
-                    SpiceError::circuit(format!("URC {name}: generated diode model missing"))
-                })?;
-                devices.push(crate::devices::nonlinear::Diode::instantiate(
-                    &diode,
-                    &mut staged,
-                    &model,
-                    context,
-                )?);
-            } else {
-                let terminals = [id(&mut staged, &node), id(&mut staged, &reference)];
-                devices.push(Box::new(Capacitor::new(
-                    format!("{name}#c{side}{section}"),
-                    terminals,
-                    c,
-                    None,
-                )?));
+        let fresh = |staged: &mut NodeTable, suffix: String| -> SpiceResult<String> {
+            let node = format!("{name}#{suffix}");
+            // C's CKTmkVolt fails (E_EXISTS) on a name the deck already uses,
+            // whichever card comes first.
+            if staged.get(&node).is_some() || deck_nodes.contains(node.as_str()) {
+                return Err(SpiceError::circuit(format!(
+                    "URC internal-node name collision: {node}"
+                )));
             }
+            staged.intern(&node);
+            Ok(node)
+        };
+        // The diode ladder's generated model (`<name>#diodemod`: cjo, rs, is set
+        // in that order by URCsetup); every diode references it.
+        let diode_model = sections.diode.map(|(i1, rd)| ModelCard {
+            name: format!("{name}#diodemod"),
+            base: "d".to_owned(),
+            level: None,
+            parameters: vec![
+                setter("cjo", sections.capacitance, model_location),
+                setter("rs", rd, model_location),
+                setter("is", i1, model_location),
+            ],
+            location: model_location.clone(),
+        });
+        let diode_models = diode_model.into_iter().collect::<Vec<_>>();
+        let diode_resolver = ModelResolver::new(&diode_models)?;
+        let reference = instance.nodes[2].clone();
+        let mut devices: Vec<Box<dyn Device>> = Vec::with_capacity(4 * sections.lumps + 1);
+        // C keeps the URC instance itself (created by INP2U, before setup) next
+        // to the elements URCsetup generates.
+        devices.push(Box::new(UrcLine {
+            name: name.clone(),
+            length: sections.length,
+            lumps: sections.lumps,
+        }));
+        let mut lowl = instance.nodes[0].clone();
+        let mut hir = instance.nodes[1].clone();
+        let mut prop: Real = 1.;
+        let id = |staged: &mut NodeTable, node: &str| -> NodeId { staged.intern(node) };
+        for section in 1..=sections.lumps {
+            let hil = fresh(nodes, format!("hi{section}"))?;
+            let lowr = if section == sections.lumps {
+                hil.clone()
+            } else {
+                fresh(nodes, format!("lo{section}"))?
+            };
+            let r = prop * sections.resistance;
+            let c = prop * sections.capacitance;
+            let terminals = [id(nodes, &lowl), id(nodes, &lowr)];
+            devices.push(Box::new(Resistor::new(
+                format!("{name}#rlo{section}"),
+                terminals,
+                r,
+            )?));
+            let terminals = [id(nodes, &hil), id(nodes, &hir)];
+            devices.push(Box::new(Resistor::new(
+                format!("{name}#rhi{section}"),
+                terminals,
+                r,
+            )?));
+            let mut shunts = vec![("lo", lowr.clone())];
+            if section != sections.lumps {
+                shunts.push(("hi", hil.clone()));
+            }
+            for (side, node) in shunts {
+                if sections.diode.is_some() {
+                    let diode = DeviceInstance {
+                        name: format!("{name}#d{side}{section}"),
+                        designator: 'd',
+                        nodes: vec![node, reference.clone()],
+                        model: Some(format!("{name}#diodemod")),
+                        parameters: vec![setter("area", prop, &instance.location)],
+                        location: instance.location.clone(),
+                    };
+                    let model = diode_resolver.resolve(&diode)?.ok_or_else(|| {
+                        SpiceError::circuit(format!("URC {name}: generated diode model missing"))
+                    })?;
+                    devices.push(crate::devices::nonlinear::Diode::instantiate(
+                        &diode, nodes, &model, context,
+                    )?);
+                } else {
+                    let terminals = [id(nodes, &node), id(nodes, &reference)];
+                    devices.push(Box::new(Capacitor::new(
+                        format!("{name}#c{side}{section}"),
+                        terminals,
+                        c,
+                        None,
+                    )?));
+                }
+            }
+            prop *= sections.ratio;
+            lowl = lowr;
+            hir = hil;
         }
-        prop *= sections.ratio;
-        lowl = lowr;
-        hir = hil;
-    }
-    *nodes = staged;
-    Ok(devices)
+        Ok(devices)
+    })
 }
 
 /// An expanded URC line instance with no direct matrix contribution.
