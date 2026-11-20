@@ -665,7 +665,7 @@ fn parse_parameters(
                     }
                     // IF_INTEGER flags: only the value 1 selects the reciprocal.
                     "reciproctc" => {
-                        scale.reciprocal_tc = value.round().to_bits() == 1_f64.to_bits()
+                        scale.reciprocal_tc = value.round().to_bits() == 1_f64.to_bits();
                     }
                     "reciprocm" => scale.reciprocal_m = value.round().to_bits() == 1_f64.to_bits(),
                     other => {

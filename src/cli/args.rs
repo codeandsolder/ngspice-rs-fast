@@ -295,8 +295,8 @@ pub fn run(args: &Args) -> SpiceResult<()> {
             print!("{}", analyses_text());
         }
         Command::Simulate => {
-            let deck = required_path(args, &args.netlist, "netlist")?;
-            let output = required_path(args, &args.output, "--output")?;
+            let deck = required_path(args, args.netlist.as_deref(), "netlist")?;
+            let output = required_path(args, args.output.as_deref(), "--output")?;
             let report =
                 crate::cli::simulate::run_with_format(deck, output, args.auto_gnd, args.format)?;
             print!("{}", crate::cli::simulate::report_text(&report));
@@ -312,7 +312,7 @@ pub fn run(args: &Args) -> SpiceResult<()> {
             print!("{text}");
         }
         Command::Parse => {
-            let path = required_path(args, &args.netlist, "netlist")?;
+            let path = required_path(args, args.netlist.as_deref(), "netlist")?;
             let parser = crate::netlist::Parser::with_auto_gnd(args.auto_gnd);
             let netlist = parser.parse_file(path)?;
             // Options are validated before reporting success: unknown or
@@ -361,15 +361,15 @@ pub fn run(args: &Args) -> SpiceResult<()> {
     Ok(())
 }
 
-fn required_path<'a>(args: &Args, path: &'a Option<PathBuf>, name: &str) -> SpiceResult<&'a Path> {
-    path.as_deref().ok_or_else(|| SpiceError::Unsupported {
+fn required_path<'a>(args: &Args, path: Option<&'a Path>, name: &str) -> SpiceResult<&'a Path> {
+    path.ok_or_else(|| SpiceError::Unsupported {
         feature: format!("{} requires {name}", args.command.name()),
         location: None,
     })
 }
 
 fn load_deck(args: &Args) -> SpiceResult<Deck> {
-    let path = required_path(args, &args.netlist, "netlist")?;
+    let path = required_path(args, args.netlist.as_deref(), "netlist")?;
     load(path)
 }
 

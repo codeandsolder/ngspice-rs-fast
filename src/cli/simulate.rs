@@ -672,11 +672,17 @@ fn format_ctime(now: SystemTime) -> String {
     let days = seconds / 86_400;
     let time_of_day = seconds % 86_400;
     let (year, month, day) = civil_from_days(days);
+    let Some(month_name) = usize::try_from(month - 1)
+        .ok()
+        .and_then(|index| MONTHS.get(index))
+    else {
+        return "unknown".to_owned();
+    };
     // 1970-01-01 was a Thursday, index 4 in `WEEKDAYS`.
     let weekday = WEEKDAYS[((days + 4) % 7) as usize];
     format!(
         "{weekday} {} {day:2} {:02}:{:02}:{:02} {year}",
-        MONTHS[month - 1],
+        month_name,
         time_of_day / 3600,
         time_of_day % 3600 / 60,
         time_of_day % 60,
@@ -688,7 +694,7 @@ fn format_ctime(now: SystemTime) -> String {
 ///
 /// Split the epoch offset into complete Gregorian eras and its remainder so
 /// even a `u64::MAX` day count cannot overflow or wrap through a signed cast.
-fn civil_from_days(days: u64) -> (u64, usize, u64) {
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
     const DAYS_PER_ERA: u64 = 146_097;
     const EPOCH_OFFSET: u64 = 719_468;
     let shifted = days % DAYS_PER_ERA + EPOCH_OFFSET;
@@ -705,11 +711,7 @@ fn civil_from_days(days: u64) -> (u64, usize, u64) {
         month_prime - 9
     };
     let year = year_of_era + era * 400 + u64::from(month <= 2);
-    (
-        year,
-        usize::try_from(month).expect("Gregorian month is between 1 and 12"),
-        day,
-    )
+    (year, month, day)
 }
 
 /// Renders the report printed after a successful run.
