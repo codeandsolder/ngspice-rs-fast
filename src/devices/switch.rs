@@ -292,6 +292,73 @@ const STATE: usize = 0;
 /// State slot of the control value.
 const CONTROL: usize = 1;
 
+/// Read the model setters and preserve the written values for sensitivity.
+fn resolve_switch_model(
+    kind: SwitchKind,
+    model: &ResolvedModel<'_>,
+) -> SpiceResult<(SwitchModel, crate::devices::sensitivity::SwitchValues)> {
+    let card = model.card();
+    let mut setters = Vec::new();
+    for parameter in &card.parameters {
+        if parameter.kind == ParameterKind::Flag && parameter.name == kind.base() {
+            // SW_MOD_SW / CSW_CSW: "just says that this is a switch".
+            continue;
+        }
+        if parameter.name.eq_ignore_ascii_case("level") {
+            return Err(SpiceError::Unsupported {
+                feature: format!(
+                    "'level' on {} model '{}' (C ignores it with a warning)",
+                    kind.base(),
+                    card.name
+                ),
+                location: Some(parameter.location.clone()),
+            });
+        }
+        setters.push(parameter);
+    }
+    let values = schema(kind).validate(setters, &card.location)?;
+    let (threshold, hysteresis) = match kind {
+        SwitchKind::Voltage => ("vt", "vh"),
+        SwitchKind::Current => ("it", "ih"),
+    };
+    let get = |name: &str| values.get(name).map(|value| value.value);
+    let conductance = |name: &str| -> SpiceResult<Option<Real>> {
+        let Some(value) = values.get(name) else {
+            return Ok(None);
+        };
+        let g = 1. / value.value;
+        if !g.is_finite() {
+            return Err(SpiceError::parse(
+                value
+                    .location
+                    .clone()
+                    .unwrap_or_else(|| card.location.clone()),
+                format!("{name}={} has no finite conductance", value.value),
+            ));
+        }
+        Ok(Some(g))
+    };
+    let written_value = |name: &str| {
+        values
+            .get(name)
+            .filter(|value| value.location.is_some())
+            .map(|value| value.value)
+    };
+    let written = crate::devices::sensitivity::SwitchValues {
+        threshold: written_value(threshold),
+        hysteresis: written_value(hysteresis),
+        on: written_value("ron"),
+        off: written_value("roff"),
+    };
+    let parameters = SwitchModel {
+        threshold: get(threshold).unwrap_or(0.),
+        hysteresis: get(hysteresis).unwrap_or(0.),
+        on_conductance: conductance("ron")?.unwrap_or(1.),
+        off_conductance: conductance("roff")?,
+    };
+    Ok((parameters, written))
+}
+
 impl Switch {
     /// Builds an S/W instance from its AST and resolved `sw`/`csw` model.
     /// Validation happens before any node is interned.
@@ -322,65 +389,8 @@ impl Switch {
                 ),
             ));
         }
+        let (parameters, written) = resolve_switch_model(kind, model)?;
         let card = model.card();
-        let mut setters = Vec::new();
-        for parameter in &card.parameters {
-            if parameter.kind == ParameterKind::Flag && parameter.name == kind.base() {
-                // SW_MOD_SW / CSW_CSW: "just says that this is a switch".
-                continue;
-            }
-            if parameter.name.eq_ignore_ascii_case("level") {
-                return Err(SpiceError::Unsupported {
-                    feature: format!(
-                        "'level' on {} model '{}' (C ignores it with a warning)",
-                        kind.base(),
-                        card.name
-                    ),
-                    location: Some(parameter.location.clone()),
-                });
-            }
-            setters.push(parameter);
-        }
-        let values = schema(kind).validate(setters, &card.location)?;
-        let (threshold, hysteresis) = match kind {
-            SwitchKind::Voltage => ("vt", "vh"),
-            SwitchKind::Current => ("it", "ih"),
-        };
-        let get = |name: &str| values.get(name).map(|value| value.value);
-        let conductance = |name: &str| -> SpiceResult<Option<Real>> {
-            let Some(value) = values.get(name) else {
-                return Ok(None);
-            };
-            let g = 1. / value.value;
-            if !g.is_finite() {
-                return Err(SpiceError::parse(
-                    value
-                        .location
-                        .clone()
-                        .unwrap_or_else(|| card.location.clone()),
-                    format!("{name}={} has no finite conductance", value.value),
-                ));
-            }
-            Ok(Some(g))
-        };
-        let written_value = |name: &str| {
-            values
-                .get(name)
-                .filter(|value| value.location.is_some())
-                .map(|value| value.value)
-        };
-        let written = crate::devices::sensitivity::SwitchValues {
-            threshold: written_value(threshold),
-            hysteresis: written_value(hysteresis),
-            on: written_value("ron"),
-            off: written_value("roff"),
-        };
-        let parameters = SwitchModel {
-            threshold: get(threshold).unwrap_or(0.),
-            hysteresis: get(hysteresis).unwrap_or(0.),
-            on_conductance: conductance("ron")?.unwrap_or(1.),
-            off_conductance: conductance("roff")?,
-        };
         let mut control = Vec::new();
         let mut initially_on = false;
         for parameter in &instance.parameters {
@@ -799,13 +809,15 @@ impl Device for Switch {
             if !(control < reference && change > 0.) {
                 return Ok(None);
             }
-            (reference - control) * 0.75 + 0.05
+            let scaled_distance = (reference - control) * 0.75;
+            scaled_distance + 0.05
         } else {
             let reference = t - h;
             if !(control > reference && change < 0.) {
                 return Ok(None);
             }
-            (reference - control) * 0.75 - 0.05
+            let scaled_distance = (reference - control) * 0.75;
+            scaled_distance - 0.05
         };
         Ok(Some(max_change / change * context.dt))
     }

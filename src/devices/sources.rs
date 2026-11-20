@@ -476,7 +476,8 @@ impl Device for IndependentSource {
         } else {
             let mut value = match (self.voltage, self.power_tone) {
                 (true, Some((amplitude, two_pi_frequency))) => {
-                    *context.voltage_source_value + amplitude * (time * two_pi_frequency).cos()
+                    let tone = amplitude * (time * two_pi_frequency).cos();
+                    *context.voltage_source_value + tone
                 }
                 _ => match context.forcing {
                     Some(forcing) => self.effective_waveform().value_at_timed(

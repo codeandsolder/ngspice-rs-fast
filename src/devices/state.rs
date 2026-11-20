@@ -97,7 +97,7 @@ fn state_error(message: impl Into<String>) -> SpiceError {
     }
 }
 
-/// MODEINITTRAN writes into CKTstate1 during a solve. A sparse, immutable
+/// `MODEINITTRAN` writes into `CKTstate1` during a solve. A sparse, immutable
 /// snapshot is shared by subsequent Newton trials until another write. Each
 /// absolute slot keeps only its latest value.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -510,8 +510,9 @@ impl LoadMode {
     }
 }
 
-/// The trial state vector (C `CKTstate0`) for one load. Newton iterations
-/// share read-only snapshots of the preceding load instead of copying all
+/// The trial state vector (C `CKTstate0`) for one load.
+///
+/// Newton iterations share read-only snapshots of the preceding load instead of copying all
 /// its state slots; mutating a cloned trial detaches its own vector.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrialState {
@@ -724,7 +725,9 @@ impl DeviceState<'_> {
     pub fn predicted(&self, slot: usize, ratio: Real) -> Option<Real> {
         let s1 = self.accepted(1, slot)?;
         let s2 = self.accepted(2, slot).unwrap_or(s1);
-        Some((1. + ratio) * s1 - ratio * s2)
+        let latest = (1. + ratio) * s1;
+        let preceding = ratio * s2;
+        Some(latest - preceding)
     }
 
     /// Whether this is C's `uic` initial load
@@ -808,7 +811,7 @@ impl DeviceState<'_> {
     /// # Errors
     ///
     /// [`SpiceError::Numerical`] for an out-of-range slot or a nonfinite value.
-    #[inline(always)]
+    #[inline]
     pub fn set(&mut self, slot: usize, value: Real) -> SpiceResult<()> {
         match self.trial.get_mut(slot) {
             Some(entry) if value.is_finite() => {
@@ -821,7 +824,7 @@ impl DeviceState<'_> {
 
     /// The accepted value of `slot`, `age` points back (1 is the latest).
     #[must_use]
-    #[inline(always)]
+    #[inline]
     pub fn accepted(&self, age: usize, slot: usize) -> Option<Real> {
         // Validate the local index before translating it into an absolute
         // slot: a patch in another device's window is never visible here.
