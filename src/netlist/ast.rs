@@ -25,6 +25,19 @@ use crate::primitives::{AnalysisKind, Real, SourceLoc};
 /// A canonical node name: ASCII-lowercased, with optional `gnd` → `0` aliasing.
 pub type NodeName = String;
 
+/// POLY dimensions are positive integers in the port's supported range.
+/// The XSPICE translator uses `atoi` (`get_poly_dimension`, enhtrans.c);
+/// reject spellings whose numeric value differs from that decimal prefix,
+/// rather than parse one dimension and lower another (e.g. `2e1`).
+pub(super) fn poly_dimension(text: &str) -> Option<usize> {
+    let number = crate::primitives::parse_spice_number(text)?;
+    let dimension = crate::primitives::exact_nonnegative_integer::<usize>(number)?;
+    let digits = text.strip_prefix('+').unwrap_or(text);
+    let end = digits.bytes().take_while(u8::is_ascii_digit).count();
+    let prefix = digits.get(..end)?.parse::<usize>().ok()?;
+    (dimension == prefix && (1..=64).contains(&dimension)).then_some(dimension)
+}
+
 /// One device parameter, including positional values mapped to canonical names.
 ///
 /// R/C/L leading values become `resistance`/`capacitance`/`inductance`; source
@@ -123,6 +136,59 @@ pub enum SourceWaveform {
     Pwl(Vec<PwlPoint>),
     /// SIN/EXP/SFFM/AM: two required fields and a bounded optional prefix.
     Function(Box<FunctionWaveform>),
+}
+
+/// Shared lexical classification for parsing and serializing waveform
+/// setters. Runtime default resolution is independent of these field limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WaveformKind {
+    Pulse,
+    Pwl,
+    Function(SourceFunction),
+}
+
+impl WaveformKind {
+    pub(super) fn from_keyword(keyword: &str) -> Option<Self> {
+        [
+            ("pulse", Self::Pulse),
+            ("pwl", Self::Pwl),
+            ("sin", Self::Function(SourceFunction::Sin)),
+            ("sine", Self::Function(SourceFunction::Sin)),
+            ("exp", Self::Function(SourceFunction::Exp)),
+            ("sffm", Self::Function(SourceFunction::Sffm)),
+            ("am", Self::Function(SourceFunction::Am)),
+        ]
+        .into_iter()
+        .find_map(|(name, kind)| keyword.eq_ignore_ascii_case(name).then_some(kind))
+    }
+
+    pub(super) const fn maximum_fields(self) -> usize {
+        match self {
+            Self::Pulse => 8,
+            Self::Pwl => 4096,
+            Self::Function(function) => function.fields().len(),
+        }
+    }
+
+    /// Keep the accepted `sine` spelling; otherwise use the canonical keyword.
+    pub(super) fn keyword(self, spelling: &str) -> &'static str {
+        match self {
+            Self::Pulse => "pulse",
+            Self::Pwl => "pwl",
+            Self::Function(SourceFunction::Sin) if spelling == "sine" => "sine",
+            Self::Function(function) => function.keyword(),
+        }
+    }
+}
+
+impl SourceWaveform {
+    pub(super) fn kind(&self) -> WaveformKind {
+        match self {
+            Self::Pulse(_) => WaveformKind::Pulse,
+            Self::Pwl(_) => WaveformKind::Pwl,
+            Self::Function(function) => WaveformKind::Function(function.function),
+        }
+    }
 }
 
 /// The analytic transient functions of `vsrcload.c`/`isrcload.c` that share

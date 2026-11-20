@@ -81,9 +81,10 @@ pub(super) fn resolve(
     let text = resolver.read(&canonical, &location)?;
     // Keep the caller's root path/title API; fragments use canonical paths.
     let deck = parse_deck_text(path, &text);
+    drop(text);
     let root = resolver.node((canonical, None));
     let mut output = Vec::new();
-    if let Err(error) = resolver.expand(&deck.lines, root, &[], &mut output) {
+    if let Err(error) = resolver.expand(&deck.lines, root, &mut Vec::new(), &mut output) {
         // Replay resolution errors alongside cards so an earlier unsupported
         // directive/device keeps its diagnostic instead of a later I/O error.
         output.push(Err(error));
@@ -132,7 +133,7 @@ impl Resolver {
         &mut self,
         lines: &[LogicalLine],
         parent: NodeIndex,
-        chain: &[SourceLoc],
+        chain: &mut Vec<SourceLoc>,
         output: &mut Vec<SpiceResult<InputCard>>,
     ) -> SpiceResult<bool> {
         for line in lines {
@@ -210,6 +211,7 @@ impl Resolver {
                         )
                     })?;
                     let fragment = parse_fragment_text(&canonical, &text);
+                    drop(text);
                     let selected = match directive.section {
                         Some(section) => {
                             let (lines, boundaries) =
@@ -217,12 +219,13 @@ impl Resolver {
                             entry.selected_section = Some(boundaries);
                             lines
                         }
-                        None => fragment.lines,
+                        None => fragment.lines.as_slice(),
                     };
                     output.push(Ok(entry));
-                    let mut nested_chain = chain.to_vec();
-                    nested_chain.push(directive.location);
-                    if self.expand(&selected, child, &nested_chain, output)? {
+                    chain.push(directive.location);
+                    let result = self.expand(selected, child, chain, output);
+                    chain.pop();
+                    if result? {
                         return Ok(true);
                     }
                     continue;
@@ -239,16 +242,15 @@ impl Resolver {
 
 /// Validate section boundaries even in unselected blocks; do not tokenize or
 /// resolve ordinary cards in those blocks. Section names are case-insensitive.
-fn select_section(
-    lines: &[LogicalLine],
+fn select_section<'a>(
+    lines: &'a [LogicalLine],
     requested: &str,
     location: &SourceLoc,
-) -> SpiceResult<(Vec<LogicalLine>, LibrarySection)> {
-    let mut current: Option<(String, RawCard)> = None;
+) -> SpiceResult<(&'a [LogicalLine], LibrarySection)> {
+    let mut current: Option<(String, RawCard, usize)> = None;
     let mut sections = BTreeSet::new();
-    let mut selected = Vec::new();
-    let mut boundaries = None;
-    for line in lines {
+    let mut selected = None;
+    for (index, line) in lines.iter().enumerate() {
         let keyword = line.text.split_whitespace().next().unwrap_or_default();
         if keyword.eq_ignore_ascii_case(".lib") || keyword.eq_ignore_ascii_case(".endl") {
             let card = RawCard::parse(line)?;
@@ -266,11 +268,11 @@ fn select_section(
                             format!("duplicate library section '{name}'"),
                         ));
                     }
-                    current = Some((name, card));
+                    current = Some((name, card, index + 1));
                     continue;
                 }
                 ParsedCard::LibEnd(name) => {
-                    let Some((expected, opening)) = current.take() else {
+                    let Some((expected, opening, start)) = current.take() else {
                         return Err(SpiceError::parse(line.location.clone(), "unmatched .endl"));
                     };
                     if name.as_deref().is_some_and(|n| n != expected) {
@@ -280,11 +282,16 @@ fn select_section(
                         ));
                     }
                     if expected == requested {
-                        boundaries = Some(LibrarySection {
-                            name: expected,
-                            opening,
-                            closing: card,
-                        });
+                        // No nested sections are permitted, so the body is
+                        // exactly the original contiguous slice.
+                        selected = Some((
+                            &lines[start..index],
+                            LibrarySection {
+                                name: expected,
+                                opening,
+                                closing: card,
+                            },
+                        ));
                     }
                     continue;
                 }
@@ -297,21 +304,18 @@ fn select_section(
                 }
             }
         }
-        if current.as_ref().is_some_and(|(name, _)| name == requested) {
-            selected.push(line.clone());
-        }
     }
-    if let Some((name, start)) = current {
+    if let Some((name, start, _)) = current {
         return Err(SpiceError::parse(
             start.location,
             format!("missing .endl for '{name}'"),
         ));
     }
-    let Some(boundaries) = boundaries else {
+    let Some(selected) = selected else {
         return Err(SpiceError::parse(
             location.clone(),
             format!("library section '{requested}' not found"),
         ));
     };
-    Ok((selected, boundaries))
+    Ok(selected)
 }

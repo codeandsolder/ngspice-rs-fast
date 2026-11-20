@@ -202,9 +202,8 @@ pub fn literalize_with(
             }
         })?;
     }
-    for (ai, card) in out.analyses.iter_mut().enumerate() {
-        let before = card.clone();
-        *card = literalize_analysis(&before, &scope, budget)?;
+    for (ai, (before, card)) in netlist.analyses.iter().zip(&mut out.analyses).enumerate() {
+        literalize_analysis_into(before, card, &scope, budget)?;
         for e in &before.expressions {
             let value = card.arguments[e.index]
                 .parse::<Real>()
@@ -371,6 +370,18 @@ pub fn literalize_analysis(
     budget: &mut EvalBudget,
 ) -> SpiceResult<AnalysisCard> {
     let mut out = card.clone();
+    literalize_analysis_into(card, &mut out, scope, budget)?;
+    Ok(out)
+}
+
+/// Resolve into an existing copy of the input card so whole-deck
+/// literalization does not clone the expression trees a second time.
+fn literalize_analysis_into(
+    card: &AnalysisCard,
+    out: &mut AnalysisCard,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+) -> SpiceResult<()> {
     for e in &card.expressions {
         let value = scope
             .evaluate(&e.expression, budget)
@@ -389,5 +400,5 @@ pub fn literalize_analysis(
         out.arguments[e.index] = format_literal(value);
     }
     out.expressions.clear();
-    Ok(out)
+    Ok(())
 }

@@ -29,12 +29,13 @@
 //!    literals are rounded to the 11 significant digits `inp_modify_exp()`
 //!    prints and numparam `{...}` values in `=pwl(` lines are evaluated.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 use crate::netlist::ast::{
-    DeviceInstance, Netlist, ParameterAssignment, ParameterKind, Subcircuit,
+    DeviceInstance, Netlist, ParameterAssignment, ParameterKind, Subcircuit, poly_dimension,
 };
 use crate::netlist::bexpr::{
     BBinaryOp, BExpr, BExprKind, BUnaryOp, BehaviouralExpression, SPECIAL_NAMES,
@@ -67,7 +68,7 @@ const MAX_RESOLVED_NODES: usize = 100_000;
 pub fn lower_nonlinear_sources(netlist: &Netlist) -> SpiceResult<Netlist> {
     let mut out = netlist.clone();
     measure_currents(&mut out);
-    out.devices = lower_devices(&out.devices)?;
+    out.devices = lower_devices(std::mem::take(&mut out.devices))?;
     for subcircuit in &mut out.subcircuits {
         lower_subcircuit(subcircuit)?;
     }
@@ -167,17 +168,41 @@ fn measured_reference(text: &str, offset: usize) -> bool {
     converts_after(previous)
 }
 
+/// An expression's current reference, in traversal (source) order.
+struct MeasurementReference {
+    occurrence: usize,
+    name: String,
+}
+
+/// The device indexes referenced by one name in one scope. Store only names
+/// that occur in an expression; preserve the original order even for malformed
+/// decks with duplicate device names (the circuit validates those separately).
+#[derive(Default)]
+struct MeasurementTargets {
+    simple: bool,
+    measured: Vec<usize>,
+    inserted: bool,
+}
+
+#[derive(Default)]
+struct ScopeMeasurements {
+    targets: HashMap<String, MeasurementTargets>,
+    insertions: HashMap<usize, DeviceInstance>,
+}
+
 /// `inp_meas_current()` (`src/frontend/inpcom.c`): an `i(name)` in a
 /// behavioural expression whose `name` does not start with `v` senses the
 /// current into `name`'s first node through an inserted zero-volt source
 /// `v_name` (`name`'s first node becomes `<node>_vmeas_<n>`), unless `name`
 /// is a simple linear E/H. The device is searched in the same scope only.
 fn measure_currents(netlist: &mut Netlist) {
-    // Phase 1: every rewritable reference, in deck order.
-    let mut references: Vec<(Position, usize, String)> = Vec::new();
+    // Phase 1: every rewritable reference, grouped by device, in deck order.
+    let mut references = Vec::new();
+    let mut scopes = HashMap::<Vec<usize>, ScopeMeasurements>::new();
     for position in deck_order(netlist) {
         let device = &scope_devices(netlist, &position.0)[position.1];
         let mut occurrence = 0;
+        let mut group = Vec::new();
         for parameter in &device.parameters {
             let ParameterKind::Behavioural(expression) = &parameter.kind else {
                 continue;
@@ -187,60 +212,105 @@ fn measure_currents(netlist: &mut Netlist) {
                 if let BExprKind::Current(name) = &node.kind {
                     let offset = node.span.start.column.saturating_sub(origin) as usize;
                     if !name.starts_with('v') && measured_reference(&expression.text, offset) {
-                        references.push((position.clone(), occurrence, name.clone()));
+                        group.push(MeasurementReference {
+                            occurrence,
+                            name: name.clone(),
+                        });
                     }
                     occurrence += 1;
                 }
             });
         }
+        if !group.is_empty() {
+            let scope = scopes.entry(position.0.clone()).or_default();
+            for reference in &group {
+                if !scope.targets.contains_key(&reference.name) {
+                    scope
+                        .targets
+                        .insert(reference.name.clone(), MeasurementTargets::default());
+                }
+            }
+            references.push((position, group));
+        }
     }
-    // Phase 2: rewrite references and add the measurement sources, which are
-    // inserted after their devices only at the end so positions stay valid.
+
+    // Index each relevant scope once, before any names or nodes are changed.
+    // This replaces one full device scan for every reference.
+    for (path, scope) in &mut scopes {
+        for (index, device) in scope_devices(netlist, path).iter().enumerate() {
+            if let Some(targets) = scope.targets.get_mut(&device.name) {
+                if is_simple_linear(device) {
+                    targets.simple = true;
+                } else if !device.nodes.is_empty() {
+                    targets.measured.push(index);
+                }
+            }
+        }
+    }
+
+    // Phase 2: process references in global deck order. Every matching
+    // non-simple target still advances C's serial, even after its source
+    // was inserted. Rewrite each expression once, not once per reference.
     let mut serial = 0usize;
-    let mut insertions: Vec<(Vec<usize>, usize, DeviceInstance)> = Vec::new();
-    for ((path, index), occurrence, name) in references {
+    for ((path, device_index), group) in references {
         let devices = scope_devices(netlist, &path);
-        let simple = devices
-            .iter()
-            .any(|d| d.name == name && is_simple_linear(d));
-        if !simple {
-            rename_occurrence(&mut devices[index], occurrence, &format!("v_{name}"));
+        let scope = scopes.get_mut(&path).expect("indexed referenced scope");
+        let mut renames = Vec::new();
+        for reference in group {
+            let targets = scope
+                .targets
+                .get_mut(&reference.name)
+                .expect("indexed reference");
+            let source = format!("v_{}", reference.name);
+            if !targets.simple {
+                renames.push((reference.occurrence, source.clone()));
+            }
+            for &target in &targets.measured {
+                let device = &mut devices[target];
+                let node = &mut device.nodes[0];
+                let needs_node = !node.contains("_vmeas");
+                let original = (!targets.inserted).then(|| {
+                    node.split_once("_vmeas_")
+                        .map_or_else(|| node.clone(), |(base, _)| base.to_owned())
+                });
+                if needs_node {
+                    *node = format!("{node}_vmeas_{serial}");
+                }
+                if let Some(original) = original {
+                    let location = device.location.clone();
+                    scope.insertions.insert(
+                        target,
+                        instance(
+                            source.clone(),
+                            'v',
+                            vec![original, node.clone()],
+                            vec![scalar("dc", "0", &location)],
+                            &location,
+                        ),
+                    );
+                    targets.inserted = true;
+                }
+                serial += 1;
+            }
         }
-        let source = format!("v_{name}");
-        for (target, device) in devices.iter_mut().enumerate() {
-            if device.name != name || is_simple_linear(device) || device.nodes.is_empty() {
-                continue;
-            }
-            let node = device.nodes[0].clone();
-            if !node.contains("_vmeas") {
-                device.nodes[0] = format!("{node}_vmeas_{serial}");
-            }
-            if !insertions
-                .iter()
-                .any(|(p, _, d)| *p == path && d.name == source)
-            {
-                let original = node
-                    .split_once("_vmeas_")
-                    .map_or_else(|| node.clone(), |(base, _)| base.to_owned());
-                let location = device.location.clone();
-                insertions.push((
-                    path.clone(),
-                    target,
-                    instance(
-                        source.clone(),
-                        'v',
-                        vec![original, device.nodes[0].clone()],
-                        vec![scalar("dc", "0", &location)],
-                        &location,
-                    ),
-                ));
-            }
-            serial += 1;
-        }
+        rename_occurrences(&mut devices[device_index], &renames);
     }
-    insertions.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-    for (path, after, source) in insertions.into_iter().rev() {
-        scope_devices(netlist, &path).insert(after + 1, source);
+
+    // Rebuild each affected device vector in order. Repeated Vec::insert
+    // would move all following devices once for every generated source.
+    for (path, mut scope) in scopes {
+        if scope.insertions.is_empty() {
+            continue;
+        }
+        let devices = scope_devices(netlist, &path);
+        let mut rewritten = Vec::with_capacity(devices.len() + scope.insertions.len());
+        for (index, device) in std::mem::take(devices).into_iter().enumerate() {
+            rewritten.push(device);
+            if let Some(source) = scope.insertions.remove(&index) {
+                rewritten.push(source);
+            }
+        }
+        *devices = rewritten;
     }
 }
 
@@ -253,16 +323,24 @@ fn is_simple_linear(device: &DeviceInstance) -> bool {
             .any(|p| matches!(p.name.as_str(), "value" | "table" | "poly"))
 }
 
-fn rename_occurrence(device: &mut DeviceInstance, occurrence: usize, name: &str) {
+fn rename_occurrences(device: &mut DeviceInstance, renames: &[(usize, String)]) {
+    if renames.is_empty() {
+        return;
+    }
     let mut seen = 0;
+    let mut remaining = renames.iter();
+    let mut next = remaining.next();
     for parameter in &mut device.parameters {
         let ParameterKind::Behavioural(expression) = &mut parameter.kind else {
             continue;
         };
         expression.root.visit_mut(&mut |node| {
             if let BExprKind::Current(source) = &mut node.kind {
-                if seen == occurrence {
+                if let Some((occurrence, name)) = next
+                    && seen == *occurrence
+                {
                     name.clone_into(source);
+                    next = remaining.next();
                 }
                 seen += 1;
             }
@@ -271,17 +349,17 @@ fn rename_occurrence(device: &mut DeviceInstance, occurrence: usize, name: &str)
 }
 
 fn lower_subcircuit(subcircuit: &mut Subcircuit) -> SpiceResult<()> {
-    subcircuit.devices = lower_devices(&subcircuit.devices)?;
+    subcircuit.devices = lower_devices(std::mem::take(&mut subcircuit.devices))?;
     for nested in &mut subcircuit.subcircuits {
         lower_subcircuit(nested)?;
     }
     Ok(())
 }
 
-fn lower_devices(devices: &[DeviceInstance]) -> SpiceResult<Vec<DeviceInstance>> {
+fn lower_devices(devices: Vec<DeviceInstance>) -> SpiceResult<Vec<DeviceInstance>> {
     let mut out = Vec::with_capacity(devices.len());
     for device in devices {
-        out.extend(lower_device(device)?);
+        lower_device(device, &mut out)?;
     }
     Ok(out)
 }
@@ -290,20 +368,25 @@ fn has(device: &DeviceInstance, name: &str) -> bool {
     device.parameters.iter().any(|p| p.name == name)
 }
 
-fn lower_device(device: &DeviceInstance) -> SpiceResult<Vec<DeviceInstance>> {
-    if !matches!(device.designator, 'e'..='h') {
-        return Ok(vec![device.clone()]);
+fn lower_device(device: DeviceInstance, out: &mut Vec<DeviceInstance>) -> SpiceResult<()> {
+    if matches!(device.designator, 'e'..='h') {
+        if has(&device, "poly") {
+            out.push(lower_poly(&device)?);
+            return Ok(());
+        }
+        if has(&device, "value") {
+            out.extend(lower_value(&device)?);
+            return Ok(());
+        }
+        if has(&device, "table") {
+            out.extend(lower_table(&device)?);
+            return Ok(());
+        }
     }
-    if has(device, "poly") {
-        return lower_poly(device).map(|device| vec![device]);
-    }
-    if has(device, "value") {
-        return lower_value(device);
-    }
-    if has(device, "table") {
-        return lower_table(device);
-    }
-    Ok(vec![device.clone()])
+    // The deck was cloned once before rewriting; unchanged devices can move
+    // directly into the lowered vector, including their expression trees.
+    out.push(device);
+    Ok(())
 }
 
 fn scalar(name: &str, value: &str, location: &SourceLoc) -> ParameterAssignment {
@@ -575,50 +658,40 @@ fn lower_table(device: &DeviceInstance) -> SpiceResult<Vec<DeviceInstance>> {
     Ok(out)
 }
 
-/// Generate SPICE2 polynomial exponents in coefficient order.
+/// In-place SPICE2 monomial sequence (`nxtpwr` in
+/// `src/xspice/icm/spice2poly/icm_spice2poly/cfunc.mod`).
 ///
-/// Exponent vectors of the SPICE2 polynomial terms in coefficient order
-/// (after the constant): total degree ascending, then lexicographically
-/// descending, which is the sequence `nxtpwr()` generates (`a`, `b`, `a²`,
-/// `ab`, `b²`, `a³`, ...). Returns `count` vectors of `dimension` entries.
-#[must_use]
-pub fn poly_exponents(dimension: usize, count: usize) -> Vec<Vec<u32>> {
-    let mut out = Vec::with_capacity(count);
-    let mut degree = 1u32;
-    while out.len() < count {
-        let mut current = vec![0u32; dimension];
-        compositions(&mut current, 0, degree, &mut out, count);
-        degree += 1;
-    }
-    out
+/// Starts at the constant term. Each advance visits the next composition
+/// in increasing total degree, then decreasing lexicographic order.
+/// A single vector is sufficient to lower every coefficient.
+struct PolyPowers {
+    powers: Vec<u32>,
 }
 
-/// All exponent vectors of total `remaining` from `index` on, the largest
-/// leading exponent first.
-fn compositions(
-    current: &mut [u32],
-    index: usize,
-    remaining: u32,
-    out: &mut Vec<Vec<u32>>,
-    count: usize,
-) {
-    if out.len() >= count {
-        return;
+impl PolyPowers {
+    fn new(dimension: usize) -> Option<Self> {
+        (dimension != 0).then(|| Self {
+            powers: vec![0; dimension],
+        })
     }
-    if index + 1 == current.len() {
-        current[index] = remaining;
-        out.push(current.to_vec());
-        current[index] = 0;
-        return;
-    }
-    for value in (0..=remaining).rev() {
-        current[index] = value;
-        compositions(current, index + 1, remaining - value, out, count);
-        if out.len() >= count {
-            break;
+
+    fn advance(&mut self) -> Option<&[u32]> {
+        let last = self.powers.len() - 1;
+        if let Some(index) = self.powers[..last].iter().rposition(|&power| power != 0) {
+            // Move one power from the rightmost nonzero prefix element,
+            // along with all remaining powers, to its next neighbour.
+            let tail = self.powers[last];
+            self.powers[last] = 0;
+            self.powers[index] -= 1;
+            self.powers[index + 1] = tail + 1;
+        } else {
+            // The previous degree is exhausted, or this is the constant term.
+            let degree = self.powers[last].checked_add(1)?;
+            self.powers[last] = 0;
+            self.powers[0] = degree;
         }
+        Some(&self.powers)
     }
-    current[index] = 0;
 }
 
 /// A parameter value as the B-source parser sees it: numparam splices the
@@ -638,8 +711,7 @@ fn lower_poly(device: &DeviceInstance) -> SpiceResult<DeviceInstance> {
         .parameters
         .iter()
         .find(|p| p.name == "poly")
-        .and_then(|p| p.value.parse::<usize>().ok())
-        .filter(|n| *n >= 1)
+        .and_then(|p| poly_dimension(&p.value))
         .ok_or_else(|| malformed(device, "POLY needs a positive integer dimension"))?;
     let location = &device.location;
     let mut controls = Vec::new();
@@ -670,14 +742,13 @@ fn lower_poly(device: &DeviceInstance) -> SpiceResult<DeviceInstance> {
             ));
         }
     }
-    let coefficients: Vec<&ParameterAssignment> = device
-        .parameters
-        .iter()
-        .filter(|p| p.name == "coef")
-        .collect();
-    let Some((first, rest)) = coefficients.split_first() else {
-        return Err(malformed(device, "POLY needs at least one coefficient"));
-    };
+    let mut coefficients = device.parameters.iter().filter(|p| p.name == "coef");
+    let first = coefficients
+        .next()
+        .ok_or_else(|| malformed(device, "POLY needs at least one coefficient"))?;
+    let mut powers = PolyPowers::new(dimension)
+        .ok_or_else(|| malformed(device, "POLY needs a positive integer dimension"))?;
+    let mut coefficient_count = 1;
     let node = |kind: BExprKind| quantity(kind, location);
     let binary = |op, lhs: BExpr, rhs: BExpr| {
         node(BExprKind::Binary {
@@ -687,7 +758,11 @@ fn lower_poly(device: &DeviceInstance) -> SpiceResult<DeviceInstance> {
         })
     };
     let mut sum = point(first)?;
-    for (exponents, coefficient) in poly_exponents(dimension, rest.len()).iter().zip(rest) {
+    for coefficient in coefficients {
+        coefficient_count += 1;
+        let exponents = powers
+            .advance()
+            .ok_or_else(|| malformed(device, "POLY degree exceeds supported range"))?;
         let mut product: Option<BExpr> = None;
         for (control, power) in controls.iter().zip(exponents) {
             for _ in 0..*power {
@@ -710,10 +785,7 @@ fn lower_poly(device: &DeviceInstance) -> SpiceResult<DeviceInstance> {
     } else {
         "i"
     };
-    let text = format!(
-        "spice2poly({dimension}) with {} coefficient(s)",
-        coefficients.len()
-    );
+    let text = format!("spice2poly({dimension}) with {coefficient_count} coefficient(s)");
     let mut parameters = vec![ParameterAssignment {
         name: output.to_owned(),
         value: text.clone(),
@@ -1037,7 +1109,71 @@ fn circuit_quantity(name: &str, arguments: &[Expr]) -> Option<BExprKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::poly_exponents;
+    use super::PolyPowers;
+
+    fn poly_exponents(dimension: usize, count: usize) -> Vec<Vec<u32>> {
+        let mut powers = PolyPowers::new(dimension).unwrap();
+        (0..count)
+            .map(|_| powers.advance().unwrap().to_vec())
+            .collect()
+    }
+
+    /// Independent recursive composition enumerator, limited to the tiny
+    /// reference cases; the production lowering never allocates these lists.
+    fn reference_terms(dimension: usize, count: usize) -> Vec<Vec<u32>> {
+        fn compose(
+            prefix: &mut Vec<u32>,
+            remaining: u32,
+            dimension: usize,
+            out: &mut Vec<Vec<u32>>,
+            count: usize,
+        ) {
+            if out.len() == count {
+                return;
+            }
+            if prefix.len() + 1 == dimension {
+                prefix.push(remaining);
+                out.push(prefix.clone());
+                prefix.pop();
+            } else {
+                for power in (0..=remaining).rev() {
+                    prefix.push(power);
+                    compose(prefix, remaining - power, dimension, out, count);
+                    prefix.pop();
+                    if out.len() == count {
+                        break;
+                    }
+                }
+            }
+        }
+        let mut result = Vec::new();
+        let mut degree = 1;
+        while result.len() < count {
+            compose(&mut Vec::new(), degree, dimension, &mut result, count);
+            degree += 1;
+        }
+        result
+    }
+
+    #[test]
+    fn poly_power_cursor_matches_compositions() {
+        for dimension in [1, 2, 3, 4, 5, 6, 64] {
+            assert_eq!(
+                poly_exponents(dimension, 300),
+                reference_terms(dimension, 300)
+            );
+        }
+        assert!(PolyPowers::new(0).is_none());
+        let mut overflow = PolyPowers {
+            powers: vec![u32::MAX],
+        };
+        assert!(overflow.advance().is_none());
+        let mut limit = PolyPowers {
+            powers: vec![1, u32::MAX - 1],
+        };
+        assert_eq!(limit.advance(), Some([0, u32::MAX].as_slice()));
+        assert!(limit.advance().is_none());
+    }
 
     #[test]
     fn poly_terms_follow_the_spice2_order() {

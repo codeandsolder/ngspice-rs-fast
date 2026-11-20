@@ -87,6 +87,34 @@ const POINTS: &[&[(&str, Real)]] = &[
 ];
 
 #[test]
+fn quantity_interning_preserves_first_use_and_namespaces() {
+    let compiled = program("v(x,y)+i(x)+2*v(y)+3*i(x)+v(x)");
+    assert_eq!(
+        compiled.quantities(),
+        &[
+            Quantity::Node("x".into()),
+            Quantity::Node("y".into()),
+            Quantity::Branch("x".into())
+        ],
+    );
+    let result = compiled.evaluate(&environment(&[2., 3., 5.])).unwrap();
+    assert_eq!(result.value, 27.);
+    assert_eq!(result.gradient, [2., 1., 4.]);
+    assert!(!compiled.uses_frequency());
+
+    for text in [
+        "hertz",
+        "v(x)+hertz",
+        "pwl(hertz,0,0,1,1)",
+        "ternary_fcn(0,hertz,v(x))",
+        "max(v(x),sin(hertz))",
+    ] {
+        assert!(program(text).uses_frequency(), "{text}");
+    }
+    assert!(!program("v(hertz)+i(hertz)").uses_frequency());
+}
+
+#[test]
 fn every_function_has_a_derivative_matching_finite_differences() {
     for text in [
         // inpptree.c funcs[] in table order, each with an inner expression so

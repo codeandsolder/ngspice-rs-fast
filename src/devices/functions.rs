@@ -46,6 +46,7 @@
 //! warning); and every value is checked to be finite.
 
 use std::f64::consts::PI;
+use std::sync::Arc;
 
 use crate::devices::{Limit, TransientTiming};
 use crate::primitives::{Real, SpiceError, SpiceResult};
@@ -563,7 +564,7 @@ impl SourceFunction {
 /// landing times bit for bit, so the requested [`Limit`] is ignored.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PwlSource {
-    knots: Vec<(Real, Real)>,
+    knots: Arc<[(Real, Real)]>,
     delay: Real,
     repeat: Option<usize>,
 }
@@ -617,7 +618,7 @@ impl PwlSource {
             _ => None,
         };
         Ok(Self {
-            knots,
+            knots: knots.into(),
             delay,
             repeat,
         })
@@ -643,14 +644,15 @@ impl PwlSource {
 
     /// Linear interpolation at an in-range local time (C's segment search).
     fn interpolate(&self, time: Real) -> Real {
-        for pair in self.knots.windows(2) {
-            let ((t0, v0), (t1, v1)) = (pair[0], pair[1]);
-            if t1 >= time {
-                let fraction = (time - t0) / (t1 - t0);
-                return v0 + fraction * (v1 - v0);
-            }
-        }
-        self.knots[self.knots.len() - 1].1
+        // Strictly increasing finite knots are guaranteed by the constructor.
+        // Search right endpoints, choosing the preceding segment at an exact
+        // knot just as C's first t1 >= time does (including its rounding).
+        let left = self.knots[1..].partition_point(|(t, _)| *t < time);
+        let (t0, v0) = self.knots[left];
+        self.knots.get(left + 1).map_or(v0, |&(t1, v1)| {
+            let fraction = (time - t0) / (t1 - t0);
+            v0 + fraction * (v1 - v0)
+        })
     }
 
     /// Forcing at `t` with the requested one-sided limit.
@@ -1073,6 +1075,49 @@ mod tests {
         // Mid-run windows skip earlier repetitions without missing corners.
         let window: Vec<_> = tri.breakpoints_in(1000., 1002.5).unwrap().collect();
         assert_eq!(window, [1000., 1001., 1002.]);
+    }
+
+    #[test]
+    fn pwl_binary_lookup_preserves_linear_search_bits() {
+        let knots: Vec<_> = (0..257)
+            .map(|i| {
+                let t = Real::from(i);
+                (t * t * 0.01, if i % 2 == 0 { t * 0.001 } else { -t * 1e12 })
+            })
+            .collect();
+        let p = PwlSource::new(knots.clone(), 0., None).unwrap();
+        for pair in knots.windows(2) {
+            let (t0, t1) = (pair[0].0, pair[1].0);
+            for t in [t0, t0.midpoint(t1), t1, t1.next_down(), t1.next_up()] {
+                let expected = knots
+                    .windows(2)
+                    .find_map(|w| {
+                        let ((a, x), (b, y)) = (w[0], w[1]);
+                        (b >= t).then(|| {
+                            let fraction = (t - a) / (b - a);
+                            x + fraction * (y - x)
+                        })
+                    })
+                    .unwrap_or(knots.last().unwrap().1);
+                assert_eq!(p.interpolate(t).to_bits(), expected.to_bits(), "t={t}");
+            }
+        }
+        let single = PwlSource::new(vec![(0., -0.)], 0., None).unwrap();
+        assert_eq!(single.interpolate(1.).to_bits(), (-0.0_f64).to_bits());
+    }
+
+    #[test]
+    fn pwl_breakpoint_iterators_share_knot_storage() {
+        let source = PwlSource::new(vec![(0., 0.), (1., 1.), (2., 0.)], 0., Some(0.)).unwrap();
+        let mut first = source.breakpoints_in(0., 6.).unwrap();
+        let mut second = first.clone();
+        assert!(Arc::ptr_eq(&source.knots, &first.source.knots));
+        assert!(Arc::ptr_eq(&first.source.knots, &second.source.knots));
+        assert_eq!(first.next(), Some(0.));
+        assert_eq!(first.next(), Some(1.));
+        assert_eq!(second.next(), Some(0.));
+        assert_eq!(first.collect::<Vec<_>>(), [2., 3., 4., 5., 6.]);
+        assert_eq!(second.collect::<Vec<_>>(), [1., 2., 3., 4., 5., 6.]);
     }
 
     #[test]
