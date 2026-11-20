@@ -367,7 +367,7 @@ mod tests {
     use super::*;
     use crate::devices::StateHistory;
 
-    const VT: Real = crate::devices::nonlinear::K_OVER_Q * 300.15;
+    const VT: Real = crate::devices::nonlinear::thermal::K_OVER_Q * 300.15;
 
     #[test]
     fn pnjlim_follows_devsup() {

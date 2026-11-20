@@ -101,16 +101,9 @@ use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
 
-/// C `CONSTboltz` (J/K).
-pub(super) const BOLTZMANN: Real = 1.380_648_52e-23;
-/// C `CHARGE` (C).
-pub(super) const CHARGE: Real = 1.602_176_620_8e-19;
-/// C `CONSTKoverQ`.
-pub(super) const K_OVER_Q: Real = BOLTZMANN / CHARGE;
-/// C `CONSTCtoK`.
-pub(super) const CELSIUS_TO_KELVIN: Real = 273.15;
-/// C `REFTEMP` (27 degrees Celsius).
-pub(super) const REFTEMP: Real = 27. + CELSIUS_TO_KELVIN;
+pub(super) use crate::devices::nonlinear::thermal::{
+    CELSIUS_TO_KELVIN, CHARGE, K_OVER_Q, band_gap,
+};
 /// Vacuum permittivity as written in `mos1temp.c` (F/m).
 pub(super) const EPSILON_0: Real = 8.854_214_871e-12;
 /// C `MAX_EXP_ARG`: junction exponent clamp of `mos1load.c`.
@@ -201,20 +194,6 @@ pub(super) fn aliased(values: &ScalarValues, names: [&str; 2]) -> Option<Real> {
         .filter_map(|name| values.get(name))
         .max_by_key(|v| v.location.as_ref().map(|l| (l.line, l.column)))
         .map(|v| v.value)
-}
-
-/// Band gap of silicon at `kelvin` (`mos1temp.c`, `mos3temp.c`).
-pub(super) fn band_gap(kelvin: Real) -> Real {
-    1.16 - (7.02e-4 * kelvin * kelvin) / (kelvin + 1108.)
-}
-
-/// The `pbfact` potential correction of `mos1temp.c`/`mos3temp.c` at
-/// `kelvin`.
-pub(super) fn potential_factor(kelvin: Real) -> Real {
-    let vt = kelvin * K_OVER_Q;
-    let kt = BOLTZMANN * kelvin;
-    let arg = -band_gap(kelvin) / (kt + kt) + 1.115_087_7 / (BOLTZMANN * (REFTEMP + REFTEMP));
-    -2. * vt * (1.5 * (kelvin / REFTEMP).ln() + CHARGE * arg)
 }
 
 /// Model setters every classic level shares, read from the level's own

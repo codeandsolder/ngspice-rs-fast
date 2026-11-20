@@ -68,7 +68,10 @@ use crate::devices::limiting::{self, Limiter, Linearization};
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
-use crate::devices::nonlinear::thermal::{TemperatureCache, TemperatureKey};
+use crate::devices::nonlinear::thermal::{
+    BOLTZMANN, CELSIUS_TO_KELVIN, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureCache,
+    TemperatureKey, band_gap, potential_shift,
+};
 use crate::devices::nonlinear::{
     DepletionLaw, cubic_reverse_junction, exponential_junction, reverse_depletion,
 };
@@ -86,16 +89,6 @@ use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
 
-/// ngspice `CONSTboltz`.
-const BOLTZMANN: Real = 1.380_648_52e-23;
-/// ngspice `CHARGE`.
-const CHARGE: Real = 1.602_176_620_8e-19;
-/// ngspice `CONSTKoverQ`.
-const K_OVER_Q: Real = BOLTZMANN / CHARGE;
-/// ngspice `REFTEMP` (27 C in kelvin).
-const REFTEMP: Real = 27. + CELSIUS_TO_KELVIN;
-/// ngspice `CONSTCtoK`.
-const CELSIUS_TO_KELVIN: Real = 273.15;
 /// ngspice `MAX_EXP_ARG`, the substrate exponential clamp of `bjtload.c`.
 const MAX_EXP_ARG: Real = 709.;
 
@@ -591,9 +584,9 @@ struct Thermal {
 /// `bjttemp.c`'s silicon band-gap built-in-potential shift `pbfact` at `t`.
 fn pbfact(t: Real) -> Real {
     let vt = K_OVER_Q * t;
-    let egfet = 1.16 - (7.02e-4 * t * t) / (t + 1108.);
+    let egfet = band_gap(t);
     let arg = -egfet / (2. * BOLTZMANN * t) + 1.115_087_7 / (BOLTZMANN * (REFTEMP + REFTEMP));
-    -2. * vt * (1.5 * (t / REFTEMP).ln() + CHARGE * arg)
+    potential_shift(vt, t / REFTEMP, arg)
 }
 
 impl Model {
@@ -628,10 +621,8 @@ impl Model {
         };
         let dt = t - tnom;
         let vt = t * K_OVER_Q;
-        let fact1 = tnom / REFTEMP;
-        let fact2 = t / REFTEMP;
-        let pbfact1 = pbfact(tnom);
-        let pbfact = pbfact(t);
+        let nominal = PotentialTemperature::new(tnom, pbfact(tnom));
+        let actual = PotentialTemperature::new(t, pbfact(t));
         let ratlog = (t / tnom).ln();
         let ratio1 = t / tnom - 1.;
         let factlog = ratio1 * self.eg / vt + self.xti * ratlog;
@@ -703,13 +694,10 @@ impl Model {
             if self.tlevc == 1 {
                 (cap * (1. + ct * dt), pot - tv * dt)
             } else {
-                let pbo = (pot - pbfact1) / fact1;
-                let gmaold = (pot - pbo) / pbo;
-                let mut cap = cap / (1. + m * (4e-4 * (tnom - REFTEMP) - gmaold));
-                let pot = fact2 * pbo + pbfact;
-                let gmanew = (pot - pbo) / pbo;
-                cap *= 1. + m * (4e-4 * (t - REFTEMP) - gmanew);
-                (cap, pot)
+                let correction = actual.junction(&nominal, pot);
+                let mut cap = cap / correction.nominal_denominator(m);
+                cap *= correction.actual_factor(m);
+                (cap, correction.potential)
             }
         };
         let (cje, vje) = junction(self.cje, self.vje, mje, self.cte, self.tvje);

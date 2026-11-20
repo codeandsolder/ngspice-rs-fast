@@ -63,7 +63,7 @@
 )]
 
 use crate::devices::limiting;
-use crate::devices::nonlinear::thermal::{TemperatureCache, TemperatureKey};
+use crate::devices::nonlinear::thermal::{SiliconTemperature, TemperatureCache, TemperatureKey};
 use crate::devices::nonlinear::{
     JunctionPoint, cubic_reverse_junction, exponential_junction, junction_companion,
 };
@@ -82,16 +82,9 @@ use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind};
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
 
-/// C `CONSTboltz` (J/K).
-pub(super) const BOLTZMANN: Real = 1.380_648_52e-23;
-/// C `CHARGE` (C).
-pub(super) const CHARGE: Real = 1.602_176_620_8e-19;
-/// C `CONSTKoverQ`.
-pub(super) const K_OVER_Q: Real = BOLTZMANN / CHARGE;
-/// C `CONSTCtoK`.
-pub(super) const CELSIUS_TO_KELVIN: Real = 273.15;
-/// C `REFTEMP` (27 degrees Celsius).
-pub(super) const REFTEMP: Real = 27. + CELSIUS_TO_KELVIN;
+pub(super) use crate::devices::nonlinear::thermal::{
+    BOLTZMANN, CELSIUS_TO_KELVIN, CHARGE, K_OVER_Q, REFTEMP,
+};
 /// `jfettemp.c` limits FC to this value (the port rejects larger values).
 pub(super) const MAX_FC: Real = 0.95;
 
@@ -810,26 +803,12 @@ pub(super) struct GateJunction {
 /// `jfettemp.c`'s band-gap laws for the gate potential `pb` (given at
 /// `tnom`) and the capacitance factors at `temp` (both Kelvin).
 pub(super) fn gate_junction(pb: Real, tnom: Real, temp: Real) -> GateJunction {
-    let band_gap = |kelvin: Real| 1.16 - (7.02e-4 * kelvin * kelvin) / (kelvin + 1108.);
-    let reference = 1.115_087_7 / (BOLTZMANN * (REFTEMP + REFTEMP));
-    let vtnom = K_OVER_Q * tnom;
-    let fact1 = tnom / REFTEMP;
-    let kt1 = BOLTZMANN * tnom;
-    let arg1 = -band_gap(tnom) / (kt1 + kt1) + reference;
-    let pbfact1 = -2. * vtnom * (1.5 * fact1.ln() + CHARGE * arg1);
-    let pbo = (pb - pbfact1) / fact1;
-    let gmaold = (pb - pbo) / pbo;
-    let cjfact = 1. / (1. + 0.5 * (4e-4 * (tnom - REFTEMP) - gmaold));
-    let vt = temp * K_OVER_Q;
-    let fact2 = temp / REFTEMP;
-    let kt = BOLTZMANN * temp;
-    let arg = -band_gap(temp) / (kt + kt) + reference;
-    let pbfact = -2. * vt * (1.5 * fact2.ln() + CHARGE * arg);
-    let pb = fact2 * pbo + pbfact;
-    let gmanew = (pb - pbo) / pbo;
-    let cjfact1 = 1. + 0.5 * (4e-4 * (temp - REFTEMP) - gmanew);
+    let nominal = SiliconTemperature::new(tnom);
+    let actual = SiliconTemperature::new(temp);
+    let correction = actual.potential.junction(&nominal.potential, pb);
+    let [cjfact, cjfact1] = correction.factors(0.5);
     GateJunction {
-        pb,
+        pb: correction.potential,
         cjfact,
         cjfact1,
     }

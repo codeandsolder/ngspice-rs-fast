@@ -67,10 +67,10 @@ mod sens;
 
 use crate::devices::mos::{
     CELSIUS_TO_KELVIN, CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, Junction, K_OVER_Q,
-    MosLevel, Mosfet, NoiseShape, Operating, REFTEMP, ReverseLaw, aliased, band_gap, p,
-    potential_factor, required,
+    MosLevel, Mosfet, NoiseShape, Operating, ReverseLaw, aliased, band_gap, p, required,
 };
 use crate::devices::noise::NoiseFamily;
+use crate::devices::nonlinear::thermal::SiliconTemperature;
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -272,35 +272,24 @@ impl Level3 {
             )));
         }
         let process = self.process(tnom, label)?;
-        let vt = temp * K_OVER_Q;
-        let vtnom = tnom * K_OVER_Q;
-        let (egfet, egfet1) = (band_gap(temp), band_gap(tnom));
-        let (fact1, fact2) = (tnom / REFTEMP, temp / REFTEMP);
-        let (pbfact, pbfact1) = (potential_factor(temp), potential_factor(tnom));
+        let nominal = SiliconTemperature::new(tnom);
+        let actual = SiliconTemperature::new(temp);
+        let (vt, vtnom) = (actual.vt, nominal.vt);
+        let (egfet, egfet1) = (actual.gap, nominal.gap);
         let ratio = temp / tnom;
         let ratio4 = ratio * ratio.sqrt();
         let kp = process.kp / ratio4;
         let mobility = process.u0 / ratio4;
-        let phio = (process.phi - pbfact1) / fact1;
-        let phi = fact2 * phio + pbfact;
+        let phi = actual.potential.correct(&nominal.potential, process.phi);
         let vbi = self.delvto + process.vto - model.pol * (process.gamma * process.phi.sqrt())
             + 0.5 * (egfet1 - egfet)
             + model.pol * 0.5 * (phi - process.phi);
         let vto = vbi + model.pol * process.gamma * phi.sqrt();
         let scale = (-egfet / vt + egfet1 / vtnom).exp();
         let (saturation, density) = (model.is * scale, model.js * scale);
-        let pbo = (model.pb - pbfact1) / fact1;
-        let gmaold = (model.pb - pbo) / pbo;
-        let potential = fact2 * pbo + pbfact;
-        let gmanew = (potential - pbo) / pbo;
-        // mos3temp.c: divide out the nominal-temperature factor, then
-        // multiply by the device-temperature one, as two steps.
-        let nominal = |grading: Real| 1. / (1. + grading * (4e-4 * (tnom - REFTEMP) - gmaold));
-        let actual = |grading: Real| 1. + grading * (4e-4 * (temp - REFTEMP) - gmanew);
-        let (bottom, side) = (
-            [nominal(model.mj), actual(model.mj)],
-            [nominal(model.mjsw), actual(model.mjsw)],
-        );
+        let correction = actual.potential.junction(&nominal.potential, model.pb);
+        let potential = correction.potential;
+        let (bottom, side) = (correction.factors(model.mj), correction.factors(model.mjsw));
         let m = geometry.m;
         let (length, width) = self.effective(geometry);
         // MOS3tCbd/MOS3tCbs/MOS3tCj and MOS3tCjsw; mos3temp.c multiplies

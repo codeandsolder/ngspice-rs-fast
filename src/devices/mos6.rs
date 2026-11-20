@@ -77,9 +77,9 @@ use crate::devices::ModelContext;
 use crate::devices::ResolvedModel;
 use crate::devices::mos::{
     CELSIUS_TO_KELVIN, CHARGE, Common, DrainCurrent, EPSILON_0, Geometry, Junction, K_OVER_Q,
-    MosLevel, Mosfet, Operating, REFTEMP, ReverseLaw, aliased, band_gap, p, potential_factor,
-    required,
+    MosLevel, Mosfet, Operating, ReverseLaw, aliased, band_gap, p, required,
 };
+use crate::devices::nonlinear::thermal::SiliconTemperature;
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -370,15 +370,13 @@ impl MosLevel for Level6 {
             )));
         }
         let process = self.process(tnom)?;
-        let vt = temp * K_OVER_Q;
-        let vtnom = tnom * K_OVER_Q;
-        let (egfet, egfet1) = (band_gap(temp), band_gap(tnom));
-        let (fact1, fact2) = (tnom / REFTEMP, temp / REFTEMP);
-        let (pbfact, pbfact1) = (potential_factor(temp), potential_factor(tnom));
+        let nominal = SiliconTemperature::new(tnom);
+        let actual = SiliconTemperature::new(temp);
+        let (vt, vtnom) = (actual.vt, nominal.vt);
+        let (egfet, egfet1) = (actual.gap, nominal.gap);
         let ratio = temp / tnom;
         let kc = process.kc / (ratio * ratio.sqrt());
-        let phio = (process.phi - pbfact1) / fact1;
-        let phi = fact2 * phio + pbfact;
+        let phi = actual.potential.correct(&nominal.potential, process.phi);
         let vbi = process.vto - model.pol * (process.gamma * process.phi.sqrt())
             + 0.5 * (egfet1 - egfet)
             + model.pol * 0.5 * (phi - process.phi);
@@ -387,23 +385,20 @@ impl MosLevel for Level6 {
         // multiply by the device-temperature one, as two steps.
         let scale = (-egfet / vt + egfet1 / vtnom).exp();
         let (saturation, density) = (model.is * scale, model.js * scale);
-        let pbo = (model.pb - pbfact1) / fact1;
-        let gmaold = (model.pb - pbo) / pbo;
-        let potential = fact2 * pbo + pbfact;
-        let gmanew = (potential - pbo) / pbo;
-        let factor = |grading: Real| {
-            (1. + grading * (4e-4 * (temp - REFTEMP) - gmanew))
-                / (1. + grading * (4e-4 * (tnom - REFTEMP) - gmaold))
-        };
-        let (bottom, side) = (factor(model.mj), factor(model.mjsw));
+        let correction = actual.potential.junction(&nominal.potential, model.pb);
+        let potential = correction.potential;
+        let (bottom, side) = (correction.factors(model.mj), correction.factors(model.mjsw));
         let m = geometry.m;
         let length = self.length(geometry);
+        // C stores the nominal-scaled capacitance, then multiplies by
+        // the actual factor; area precedes M for derived CJ.
+        let scaled = |c: Real, factor: [Real; 2]| c * factor[0] * factor[1];
         let bottom_cap = |given: Option<Real>, area: Real| match (given, model.cj) {
-            (Some(c), _) => c * bottom * m,
-            (None, Some(cj)) => cj * bottom * m * area,
+            (Some(c), _) => scaled(c, bottom) * m,
+            (None, Some(cj)) => scaled(cj, bottom) * area * m,
             (None, None) => 0.,
         };
-        let side_cap = |perimeter: Real| model.cjsw.map_or(0., |c| c * side * perimeter * m);
+        let side_cap = |perimeter: Real| model.cjsw.map_or(0., |c| scaled(c, side) * perimeter * m);
         let root2 = std::f64::consts::SQRT_2;
         // mos6temp.c derives `vcrit` from the per-unit-device saturation
         // current -- its expression has no `MOS6m`, where mos1temp.c scales
@@ -496,7 +491,9 @@ impl MosLevel for Level6 {
             || operating.params.betac < 0.
             || operating.drain.saturation <= 0.
             || operating.source.saturation <= 0.
-            || [bottom, side].iter().any(|f| !f.is_finite() || *f < 0.)
+            || [bottom[0], bottom[1], side[0], side[1]]
+                .iter()
+                .any(|f| !f.is_finite() || *f < 0.)
         {
             return Err(SpiceError::circuit(format!(
                 "{}: MOS6 parameters are out of range at {:.2} K \
