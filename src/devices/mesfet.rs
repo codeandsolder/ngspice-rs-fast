@@ -505,7 +505,7 @@ impl Mesfet {
     /// cases (a forward gate with `PB <= 0.5 V`).
     fn charge(&self, op: &Operating, vgs: Real, vgd: Real) -> SpiceResult<(Real, Real, Real)> {
         let q = self.model.qgg(op, vgs, vgd);
-        if [q.0, q.1, q.2].iter().any(|v| !v.is_finite()) {
+        if <[Real; 3]>::from(q).iter().any(|v| !v.is_finite()) {
             return Err(self.numerical(&format!(
                 "nonfinite Statz gate charge (qggnew's effective gate voltage reaches \
                  PB = {} V; it needs PB > {VMAX} V for a forward-biased gate)",

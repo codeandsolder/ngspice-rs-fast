@@ -209,10 +209,10 @@ pub fn rlc_h2(time: Real, t: Real, alpha: Real, beta: Real) -> Real {
     if alpha == 0.0 || time < t {
         return 0.0;
     }
-    let besselarg = if time != t {
-        alpha * (time * time - t * t).sqrt()
-    } else {
+    let besselarg = if time == t {
         0.0
+    } else {
+        alpha * (time * time - t * t).sqrt()
     };
     let exparg = -beta * time;
     alpha * alpha * t * exparg.exp() * bess_i1_x_over_x(besselarg)
@@ -398,17 +398,17 @@ pub fn rc_coefficients(
     let temp5 = cbyr.sqrt();
 
     let h2value = |hilimit: Real, temp2: Real, temp3: Real| {
-        if hilimit != 0.0 {
-            (hilimit + rclsqr * 0.5) * temp2 - (hilimit * rclsqr / PI).sqrt() * temp3
-        } else {
+        if hilimit == 0.0 {
             0.0
+        } else {
+            (hilimit + rclsqr * 0.5) * temp2 - (hilimit * rclsqr / PI).sqrt() * temp3
         }
     };
     let h3value = |hilimit: Real, temp2: Real, temp3: Real| {
-        if hilimit != 0.0 {
-            temp5 * (2. * (hilimit / PI).sqrt() * temp3 - temp4 * temp2)
-        } else {
+        if hilimit == 0.0 {
             0.0
+        } else {
+            temp5 * (2. * (hilimit / PI).sqrt() * temp3 - temp4 * temp2)
         }
     };
 

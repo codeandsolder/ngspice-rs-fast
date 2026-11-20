@@ -189,11 +189,8 @@ impl Waveform {
                 after,
                 time,
             } => {
-                if t < *time || (left && t == *time) {
-                    *before
-                } else {
-                    *after
-                }
+                let before_jump = if left { t <= *time } else { t < *time };
+                if before_jump { *before } else { *after }
             }
             Self::Pwl(p) => {
                 if t <= p[0].0 {
@@ -203,7 +200,8 @@ impl Waveform {
                 for w in p.windows(2) {
                     if w[1].0 >= t {
                         let fraction = (t - w[0].0) / (w[1].0 - w[0].0);
-                        return Ok(w[0].1 + fraction * (w[1].1 - w[0].1));
+                        let increment = fraction * (w[1].1 - w[0].1);
+                        return Ok(w[0].1 + increment);
                     }
                 }
                 p.last().map_or(0., |p| p.1)
@@ -337,7 +335,12 @@ impl Iterator for SystemBreakpoints {
             .filter_map(|s| s.peek().copied())
             .min_by(f64::total_cmp)?;
         for source in &mut self.sources {
-            while source.next_if(|t| *t == next).is_some() {}
+            // The validated time domain is finite. Exact numeric equality
+            // (rather than total_cmp) also coalesces the two signed zeros.
+            while source
+                .next_if(|t| t.partial_cmp(&next) == Some(std::cmp::Ordering::Equal))
+                .is_some()
+            {}
         }
         Some(next)
     }
@@ -398,6 +401,9 @@ impl LinearSystem {
         }
     }
     /// DC forcing, optionally overriding one independent source.
+    ///
+    /// # Errors
+    /// An out-of-range source row or nonfinite source sum.
     pub fn dc_rhs(&self, sweep: Option<(&str, Real)>) -> SpiceResult<Vector> {
         let mut rhs = Vector::zeros(self.a.rows());
         for s in &self.sources {
@@ -511,6 +517,9 @@ pub struct LinearContext<'a> {
 }
 impl LinearContext<'_> {
     /// Stamps a two-terminal nodal operator into A or E.
+    ///
+    /// # Errors
+    /// A matrix position outside the assembled system.
     pub fn nodal(&mut self, terminals: [NodeId; 2], value: Real, dynamic: bool) -> SpiceResult<()> {
         let matrix = if dynamic {
             &mut self.system.e
@@ -623,7 +632,9 @@ impl LinearContext<'_> {
         let end = self.system.e.triplets().len();
         // Only an unbound (triplet-list) E keeps the contributions apart.
         if end > start
-            && (terms.len() > 1 || scale != 1. || divisor != 1.)
+            && (terms.len() > 1
+                || scale.to_bits() != 1_f64.to_bits()
+                || divisor.to_bits() != 1_f64.to_bits())
             && self.system.e.overflow().is_none()
         {
             self.system.e_groups.push(crate::maths::DynamicGroup {
@@ -637,6 +648,9 @@ impl LinearContext<'_> {
         Ok(())
     }
     /// Stamps a voltage/inductor branch, positive current from terminal 0 to 1.
+    ///
+    /// # Errors
+    /// The branch-row binding is absent or a matrix position is out of range.
     pub fn branch(&mut self, terminals: [NodeId; 2]) -> SpiceResult<usize> {
         let branch = self
             .branch
