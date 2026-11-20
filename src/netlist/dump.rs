@@ -201,7 +201,7 @@ impl PathMapper {
             && let Some(start) = text[..position].rfind(": ")
             && let Some(close) = text[position..].find(')')
         {
-            text.replace_range(start..position + close + 1, ": <os error>");
+            text.replace_range(start..=position + close, ": <os error>");
         }
         text
     }
@@ -298,9 +298,8 @@ impl Ctx<'_> {
                 out.line(
                     indent,
                     format!(
-                        "error unknown-device name={} designator={} @{}",
+                        "error unknown-device name={} designator={designator} @{}",
                         quote(name),
-                        designator,
                         self.loc(location)
                     ),
                 );
@@ -492,6 +491,15 @@ fn section(out: &mut Out, indent: usize, name: &str, count: usize) {
 }
 
 fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
+    write_scope_devices(ctx, out, indent, scope);
+    write_scope_subcircuits(ctx, out, indent, scope);
+    write_scope_analyses(ctx, out, indent, scope);
+    write_scope_parameters(ctx, out, indent, scope);
+    write_scope_options(ctx, out, indent, scope);
+    write_scope_hints(ctx, out, indent, scope);
+}
+
+fn write_scope_devices(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
     section(out, indent, "cards", scope.cards.len());
     for (n, card) in scope.cards.iter().enumerate() {
         write_card(ctx, out, indent + 1, n, card);
@@ -514,6 +522,9 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
         );
         write_parameters(ctx, out, indent + 2, &model.parameters);
     }
+}
+
+fn write_scope_subcircuits(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
     section(out, indent, "subcircuits", scope.subcircuits.len());
     for (n, sub) in scope.subcircuits.iter().enumerate() {
         out.line(
@@ -545,6 +556,9 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
         };
         write_scope(ctx, out, indent + 3, &inner);
     }
+}
+
+fn write_scope_analyses(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
     section(out, indent, "analyses", scope.analyses.len());
     for (n, analysis) in scope.analyses.iter().enumerate() {
         out.line(
@@ -601,6 +615,9 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
             );
         }
     }
+}
+
+fn write_scope_parameters(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
     section(out, indent, "params", scope.params.len());
     for (n, card) in scope.params.iter().enumerate() {
         out.line(
@@ -649,6 +666,9 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
             write_expression(out, indent + 2, &card.body);
         }
     }
+}
+
+fn write_scope_options(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
     section(out, indent, "options", scope.options.len());
     for (n, card) in scope.options.iter().enumerate() {
         out.line(
@@ -690,6 +710,9 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
             );
         }
     }
+}
+
+fn write_scope_hints(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
     for (name, label, cards) in [
         ("initial-conditions", "ic-card", scope.initial_conditions),
         ("nodesets", "nodeset-card", scope.nodesets),
@@ -865,64 +888,72 @@ fn write_parameters(
                     );
                 }
             }
-            ParameterKind::Waveform(SourceWaveform::Pulse(pulse)) => {
-                out.line(indent + 2, "pulse");
-                out.line(
-                    indent + 3,
-                    format!("initial: {}", positioned(ctx, &pulse.initial)),
-                );
-                out.line(
-                    indent + 3,
-                    format!("pulsed: {}", positioned(ctx, &pulse.pulsed)),
-                );
-                out.line(
-                    indent + 3,
-                    format!("delay: {}", optional(ctx, pulse.delay.as_ref())),
-                );
-                out.line(
-                    indent + 3,
-                    format!("rise: {}", optional(ctx, pulse.rise.as_ref())),
-                );
-                out.line(
-                    indent + 3,
-                    format!("fall: {}", optional(ctx, pulse.fall.as_ref())),
-                );
-                out.line(
-                    indent + 3,
-                    format!("width: {}", optional(ctx, pulse.width.as_ref())),
-                );
-                out.line(
-                    indent + 3,
-                    format!("period: {}", optional(ctx, pulse.period.as_ref())),
-                );
-                // Only printed when supplied, so seven-field snapshots are stable.
-                if let Some(count) = &pulse.count {
-                    out.line(indent + 3, format!("count: {}", positioned(ctx, count)));
-                }
-            }
-            ParameterKind::Waveform(SourceWaveform::Function(function)) => {
-                out.line(indent + 2, function.function.keyword());
-                for (name, value) in function.function.fields().iter().zip(&function.values) {
-                    out.line(indent + 3, format!("{name}: {}", positioned(ctx, value)));
-                }
-            }
-            ParameterKind::Waveform(SourceWaveform::Pwl(points)) => {
-                out.line(indent + 2, "pwl");
-                for (m, point) in points.iter().enumerate() {
-                    out.line(
-                        indent + 3,
-                        format!(
-                            "point [{m}] time={} value={}",
-                            positioned(ctx, &point.time),
-                            positioned(ctx, &point.value)
-                        ),
-                    );
-                }
+            ParameterKind::Waveform(waveform) => {
+                write_waveform(ctx, out, indent + 2, waveform);
             }
             ParameterKind::Scalar
             | ParameterKind::Textual
             | ParameterKind::Flag
             | ParameterKind::Instance => {}
+        }
+    }
+}
+
+fn write_waveform(ctx: &Ctx<'_>, out: &mut Out, indent: usize, waveform: &SourceWaveform) {
+    match waveform {
+        SourceWaveform::Pulse(pulse) => {
+            out.line(indent, "pulse");
+            out.line(
+                indent + 1,
+                format!("initial: {}", positioned(ctx, &pulse.initial)),
+            );
+            out.line(
+                indent + 1,
+                format!("pulsed: {}", positioned(ctx, &pulse.pulsed)),
+            );
+            out.line(
+                indent + 1,
+                format!("delay: {}", optional(ctx, pulse.delay.as_ref())),
+            );
+            out.line(
+                indent + 1,
+                format!("rise: {}", optional(ctx, pulse.rise.as_ref())),
+            );
+            out.line(
+                indent + 1,
+                format!("fall: {}", optional(ctx, pulse.fall.as_ref())),
+            );
+            out.line(
+                indent + 1,
+                format!("width: {}", optional(ctx, pulse.width.as_ref())),
+            );
+            out.line(
+                indent + 1,
+                format!("period: {}", optional(ctx, pulse.period.as_ref())),
+            );
+            // Only printed when supplied, so seven-field snapshots are stable.
+            if let Some(count) = &pulse.count {
+                out.line(indent + 1, format!("count: {}", positioned(ctx, count)));
+            }
+        }
+        SourceWaveform::Function(function) => {
+            out.line(indent, function.function.keyword());
+            for (name, value) in function.function.fields().iter().zip(&function.values) {
+                out.line(indent + 1, format!("{name}: {}", positioned(ctx, value)));
+            }
+        }
+        SourceWaveform::Pwl(points) => {
+            out.line(indent, "pwl");
+            for (m, point) in points.iter().enumerate() {
+                out.line(
+                    indent + 1,
+                    format!(
+                        "point [{m}] time={} value={}",
+                        positioned(ctx, &point.time),
+                        positioned(ctx, &point.value)
+                    ),
+                );
+            }
         }
     }
 }
