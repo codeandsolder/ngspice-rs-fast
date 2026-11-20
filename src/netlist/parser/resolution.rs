@@ -161,7 +161,7 @@ impl Resolver {
             );
             let mut entry = InputCard {
                 source: card,
-                include_chain: chain.to_vec(),
+                include_chain: chain.clone(),
                 resolved_path: None,
                 selected_section: None,
             };
@@ -269,7 +269,6 @@ fn select_section<'a>(
                         ));
                     }
                     current = Some((name, card, index + 1));
-                    continue;
                 }
                 ParsedCard::LibEnd(name) => {
                     let Some((expected, opening, start)) = current.take() else {
@@ -293,7 +292,6 @@ fn select_section<'a>(
                             },
                         ));
                     }
-                    continue;
                 }
                 ParsedCard::Include(_) => {}
                 _ => {
