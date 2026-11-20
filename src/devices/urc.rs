@@ -79,10 +79,6 @@
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
 )]
 #![expect(
-    clippy::many_single_char_names,
-    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
     clippy::suboptimal_flops,
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
@@ -236,7 +232,13 @@ impl UrcSections {
             } else {
                 let ratio = (p - 1.) / p;
                 let count = 3.0_f64.max((wnorm * (ratio * ratio)).ln() / p.ln());
-                if !count.is_finite() || count > MAX_LUMPS as Real {
+                if !count.is_finite()
+                    || count
+                        > Real::from(
+                            u16::try_from(MAX_LUMPS)
+                                .map_err(|_| invalid("section bound exceeds u16".into()))?,
+                        )
+                {
                     return Err(invalid(format!(
                         "FMAX={fmax} needs {count} sections, more than {MAX_LUMPS}"
                     )));
@@ -276,17 +278,23 @@ impl UrcSections {
             capacitance: c1,
             diode,
         };
+        sections.validate()?;
+        Ok(sections)
+    }
+
+    fn validate(&self) -> SpiceResult<()> {
+        let invalid = |message: String| SpiceError::circuit(format!("URC: {message}"));
         // Every section value must be usable, not only the first.
         let mut prop: Real = 1.;
-        for section in 1..=lumps {
-            let r = prop * r1;
-            let c = prop * c1;
+        for section in 1..=self.lumps {
+            let r = prop * self.resistance;
+            let c = prop * self.capacitance;
             if !(r.is_finite() && r > 0.) {
                 return Err(invalid(format!(
                     "section {section} resistance {r} is not finite and positive"
                 )));
             }
-            match diode {
+            match self.diode {
                 None if !(c.is_finite() && c > 0.) => {
                     return Err(invalid(format!(
                         "section {section} capacitance {c} is not finite and positive \
@@ -306,9 +314,9 @@ impl UrcSections {
                 }
                 None => {}
             }
-            prop *= p;
+            prop *= self.ratio;
         }
-        Ok(sections)
+        Ok(())
     }
 }
 
