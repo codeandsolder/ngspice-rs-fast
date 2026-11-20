@@ -72,9 +72,9 @@ pub use rawfile::{
 pub use results::{Plot, PlotFlags, PointSink, Variable};
 pub use selection::{Selection, print_requests, write_requests};
 
-/// The C reference for the analysis drivers.
+/// C analysis driver reference.
 ///
-/// Included in `NotYetPorted` errors to identify upstream analysis routines.
+/// Identifies upstream routines in `NotYetPorted` errors.
 pub const C_REFERENCE_ANALYSIS: &str = "src/spicelib/analysis/cktdojob.c, dctran.c, dcop.c, acan.c";
 
 /// Batch line-printer plots.

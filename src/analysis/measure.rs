@@ -557,112 +557,12 @@ fn evaluate(plot: &Plot, axis: &Axis, card: &MeasureCard) -> SpiceResult<Measure
             at,
             window,
             ..
-        } => {
-            let operand = Operand::resolve(plot, operand, &card.name)?;
-            let window = Window::resolve(window, axis, card)?;
-            check_range(axis, *at, card, "AT=")?;
-            if *at < window.from || *at > window.to {
-                return Err(unsupported(
-                    card,
-                    format!(
-                        ".measure {}: AT={} is outside the measurement window [{}, {}]",
-                        card.name,
-                        crate::primitives::format_spice_number(*at),
-                        crate::primitives::format_spice_number(window.from),
-                        crate::primitives::format_spice_number(window.to)
-                    ),
-                ));
-            }
-            Ok(Measurement {
-                name: card.name.clone(),
-                value: value_at(axis, &operand, *at, card)?,
-                unit: operand.unit().to_owned(),
-                at: Some(*at),
-                window: None,
-                events: None,
-            })
-        }
+        } => evaluate_find(plot, axis, card, operand, *at, window),
         MeasureRequest::Statistic {
             statistic,
             operand,
             window,
-        } => {
-            let operand = Operand::resolve(plot, operand, &card.name)?;
-            let window = Window::resolve(window, axis, card)?;
-            let (value, at, span) = match statistic {
-                MeasureStatistic::PhaseMargin | MeasureStatistic::GainMargin => {
-                    let (value, at) = margin(
-                        axis,
-                        &operand,
-                        &window,
-                        *statistic == MeasureStatistic::PhaseMargin,
-                        card,
-                    )?;
-                    (value, Some(at), None)
-                }
-                MeasureStatistic::MinAt | MeasureStatistic::MaxAt => {
-                    let extrema = extrema(axis, &operand, &window, card)?;
-                    let (_, at) = if *statistic == MeasureStatistic::MaxAt {
-                        extrema.max
-                    } else {
-                        extrema.min
-                    };
-                    (at, None, None)
-                }
-                MeasureStatistic::PeakToPeak => {
-                    let extrema = extrema(axis, &operand, &window, card)?;
-                    (extrema.max.0 - extrema.min.0, None, None)
-                }
-                MeasureStatistic::Min | MeasureStatistic::Max => {
-                    let extrema = extrema(axis, &operand, &window, card)?;
-                    let (value, at) = if *statistic == MeasureStatistic::Max {
-                        extrema.max
-                    } else {
-                        extrema.min
-                    };
-                    (value, Some(at), None)
-                }
-                MeasureStatistic::Avg | MeasureStatistic::Rms | MeasureStatistic::Integ => {
-                    let span = MeasureSpan {
-                        from: window.from,
-                        to: window.to,
-                    };
-                    // Every one of these three is an integral over the covered
-                    // window; a window without width has no mean and is a
-                    // failure rather than a division by zero.
-                    let width = span_width(span, card)?;
-                    let points = window.clipped(axis, &operand, card)?;
-                    let squared = *statistic == MeasureStatistic::Rms;
-                    let area = if *statistic == MeasureStatistic::Avg {
-                        trapezoid_integral(points, card)?
-                    } else {
-                        simpson_integral(points, squared, card)?
-                    };
-                    let mean = if *statistic == MeasureStatistic::Integ {
-                        area
-                    } else {
-                        area / width
-                    };
-                    let value = if squared { mean.sqrt() } else { mean };
-                    (value, None, Some(span))
-                }
-            };
-            if !value.is_finite() {
-                return Err(nonfinite(
-                    card,
-                    statistic.name(),
-                    "the computed result is not finite".to_owned(),
-                ));
-            }
-            Ok(Measurement {
-                name: card.name.clone(),
-                value,
-                unit: statistic_unit(*statistic, &operand, axis),
-                at,
-                window: span,
-                events: None,
-            })
-        }
+        } => evaluate_statistic(plot, axis, card, statistic, operand, window),
         MeasureRequest::TrigTarg { trig, targ, window } => {
             let window = Window::resolve(window, axis, card)?;
             let trig = event_at(plot, axis, trig, &window, card)?;
@@ -685,6 +585,124 @@ fn evaluate(plot: &Plot, axis: &Axis, card: &MeasureCard) -> SpiceResult<Measure
             })
         }
     }
+}
+
+fn evaluate_statistic(
+    plot: &Plot,
+    axis: &Axis,
+    card: &MeasureCard,
+    statistic: &MeasureStatistic,
+    operand: &VectorRequest,
+    window: &MeasureWindow,
+) -> SpiceResult<Measurement> {
+    let operand = Operand::resolve(plot, operand, &card.name)?;
+    let window = Window::resolve(window, axis, card)?;
+    let (value, at, span) = match statistic {
+        MeasureStatistic::PhaseMargin | MeasureStatistic::GainMargin => {
+            let (value, at) = margin(
+                axis,
+                &operand,
+                &window,
+                *statistic == MeasureStatistic::PhaseMargin,
+                card,
+            )?;
+            (value, Some(at), None)
+        }
+        MeasureStatistic::MinAt | MeasureStatistic::MaxAt => {
+            let extrema = extrema(axis, &operand, &window, card)?;
+            let (_, at) = if *statistic == MeasureStatistic::MaxAt {
+                extrema.max
+            } else {
+                extrema.min
+            };
+            (at, None, None)
+        }
+        MeasureStatistic::PeakToPeak => {
+            let extrema = extrema(axis, &operand, &window, card)?;
+            (extrema.max.0 - extrema.min.0, None, None)
+        }
+        MeasureStatistic::Min | MeasureStatistic::Max => {
+            let extrema = extrema(axis, &operand, &window, card)?;
+            let (value, at) = if *statistic == MeasureStatistic::Max {
+                extrema.max
+            } else {
+                extrema.min
+            };
+            (value, Some(at), None)
+        }
+        MeasureStatistic::Avg | MeasureStatistic::Rms | MeasureStatistic::Integ => {
+            let span = MeasureSpan {
+                from: window.from,
+                to: window.to,
+            };
+            // Every one of these three is an integral over the covered
+            // window; a window without width has no mean and is a
+            // failure rather than a division by zero.
+            let width = span_width(span, card)?;
+            let points = window.clipped(axis, &operand, card)?;
+            let squared = *statistic == MeasureStatistic::Rms;
+            let area = if *statistic == MeasureStatistic::Avg {
+                trapezoid_integral(points, card)?
+            } else {
+                simpson_integral(points, squared, card)?
+            };
+            let mean = if *statistic == MeasureStatistic::Integ {
+                area
+            } else {
+                area / width
+            };
+            let value = if squared { mean.sqrt() } else { mean };
+            (value, None, Some(span))
+        }
+    };
+    if !value.is_finite() {
+        return Err(nonfinite(
+            card,
+            statistic.name(),
+            "the computed result is not finite".to_owned(),
+        ));
+    }
+    Ok(Measurement {
+        name: card.name.clone(),
+        value,
+        unit: statistic_unit(*statistic, &operand, axis),
+        at,
+        window: span,
+        events: None,
+    })
+}
+
+fn evaluate_find(
+    plot: &Plot,
+    axis: &Axis,
+    card: &MeasureCard,
+    operand: &VectorRequest,
+    at: Real,
+    window: &MeasureWindow,
+) -> SpiceResult<Measurement> {
+    let operand = Operand::resolve(plot, operand, &card.name)?;
+    let window = Window::resolve(window, axis, card)?;
+    check_range(axis, at, card, "AT=")?;
+    if at < window.from || at > window.to {
+        return Err(unsupported(
+            card,
+            format!(
+                ".measure {}: AT={} is outside the measurement window [{}, {}]",
+                card.name,
+                crate::primitives::format_spice_number(at),
+                crate::primitives::format_spice_number(window.from),
+                crate::primitives::format_spice_number(window.to)
+            ),
+        ));
+    }
+    Ok(Measurement {
+        name: card.name.clone(),
+        value: value_at(axis, &operand, at, card)?,
+        unit: operand.unit().to_owned(),
+        at: Some(at),
+        window: None,
+        events: None,
+    })
 }
 
 /// The operand's value at one physical axis value.
@@ -763,8 +781,16 @@ fn extrema(
     Ok(extrema)
 }
 
-/// C measure_minMaxAvg uses the trapezoidal integral for AVG. Only the
+/// C `measure_minMaxAvg` uses the trapezoidal integral for AVG. Only the
 /// preceding sample is needed; keep exactly the original grouping.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "retain separately rounded C trapezoid sum"
+)]
+#[expect(
+    clippy::manual_midpoint,
+    reason = "C AVG explicitly sums the samples before scaling; midpoint changes overflow and rounding semantics"
+)]
 fn trapezoid_integral(
     points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
     card: &MeasureCard,
@@ -788,10 +814,14 @@ fn trapezoid_integral(
     Ok(area)
 }
 
-/// C measure_rms_integral: greedy Simpson 3/8, then 1/3, then trapezoid.
+/// C `measure_rms_integral`: greedy Simpson 3/8, then 1/3, then trapezoid.
 /// Four samples are sufficient to select a panel; retain an overlapping
 /// endpoint and refill only consumed slots. Only positive widths within
 /// 100 ULPs share a Simpson panel. Duplicate coordinates use trapezoids.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "preserve C Simpson panel weighting and independently rounded accumulation"
+)]
 fn simpson_integral(
     points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
     square: bool,
@@ -843,6 +873,10 @@ fn simpson_integral(
 }
 
 /// C `measure_margin`: unwrap phase, interpolate dB/degrees and log frequency.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "retain reference interpolation rounding for the selected crossover and its margin"
+)]
 fn margin(
     axis: &Axis,
     operand: &Operand<'_>,
@@ -909,6 +943,10 @@ fn margin(
 
 /// Nonuniform quadratic derivative, C `measure_deriv_at`; two samples use a
 /// safe secant instead of the C implementation's out-of-range stencil.
+#[expect(
+    clippy::float_cmp,
+    reason = "exact coordinate identity selects discontinuities and zero-width stencil intervals; a tolerance would merge distinct samples"
+)]
 fn derivative_at(
     axis: &Axis,
     operand: &Operand<'_>,
@@ -1081,6 +1119,10 @@ fn crossing(
     )
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "identical axis coordinates denote a discontinuous jump; nearby distinct samples require interpolation"
+)]
 fn crossing_samples(
     axis: &Axis,
     sample: impl Fn(usize) -> SpiceResult<Real>,
@@ -1154,11 +1196,10 @@ fn crossing_samples(
         unsupported(
             card,
             format!(
-                ".measure {}: no {} crossing of {} through {} found from the window's \
+                ".measure {}: no {} crossing of {description} through {} found from the window's \
                  lower bound [{}, {}]",
                 card.name,
                 transition.name(),
-                description,
                 crate::primitives::format_spice_number(value),
                 crate::primitives::format_spice_number(window.from),
                 crate::primitives::format_spice_number(window.to)
@@ -1282,6 +1323,46 @@ mod tests {
             value_location: loc(),
             transition,
         }
+    }
+
+    #[test]
+    fn distinct_adjacent_coordinates_are_not_discontinuities() {
+        let left = 1.0_f64;
+        let middle = left.next_up();
+        let right = middle.next_up();
+        let plot = tran(&[(left, 0.0), (right, 2.0)]);
+        let result = measure(
+            &plot,
+            "crossing",
+            MeasureRequest::When {
+                event: crossing(1.0, MeasureTransition::Rise(1)),
+                window: MeasureWindow::default(),
+            },
+        );
+        assert_eq!(result.value.to_bits(), middle.to_bits());
+        let result = measure(
+            &plot,
+            "slope",
+            MeasureRequest::AtEvent {
+                operand: out(),
+                event: MeasureEvent::At {
+                    at: middle,
+                    location: loc(),
+                },
+                derivative: true,
+                window: MeasureWindow::default(),
+            },
+        );
+        assert_eq!(result.value.to_bits(), (2.0 / (right - left)).to_bits());
+    }
+
+    #[test]
+    fn trapezoid_keeps_reference_sum_before_scaling() {
+        let card = card("m", request(MeasureStatistic::Avg, None, None));
+        let values = [(0.0, Real::MAX), (0.5, Real::MAX)];
+        // C's intermediate sample sum overflows, even though an alternative
+        // midpoint implementation could keep the final integral finite.
+        assert!(super::trapezoid_integral(values.into_iter().map(Ok), &card).is_err());
     }
 
     #[test]
