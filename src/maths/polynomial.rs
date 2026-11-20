@@ -19,6 +19,9 @@ pub fn fit_power_basis(x: &[Real], y: &[Real]) -> Option<Vec<Real>> {
     }
     if n == 2 {
         let dx = x[1] - x[0];
+        if dx == 0.0 || !dx.is_finite() {
+            return None;
+        }
         let result = vec![x[1].mul_add(y[0], -x[0] * y[1]) / dx, (y[1] - y[0]) / dx];
         return result.iter().all(|v| v.is_finite()).then_some(result);
     }
@@ -146,6 +149,7 @@ mod tests {
             assert!((a - b).abs() < 1e-12);
         }
         assert!(fit_power_basis(&[1., 1.], &[1., 2.]).is_none());
+        assert!(fit_power_basis(&[-f64::MAX, f64::MAX], &[0., 1e-300]).is_none());
         assert!(fit_power_basis(&[0., 1.], &[1.]).is_none());
     }
 }

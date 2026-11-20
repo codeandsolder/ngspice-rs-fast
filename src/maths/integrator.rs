@@ -705,10 +705,18 @@ impl Coefficients {
         if charge.iter().chain(&derivative).any(|v| !v.is_finite()) {
             return Err(numerical("nonfinite truncation-error history"));
         }
+        if self.deltas[..=order]
+            .iter()
+            .any(|dt| !dt.is_finite() || *dt <= 0.0)
+        {
+            return Err(numerical(
+                "truncation-error steps must be positive and finite",
+            ));
+        }
         let volttol = tol.abstol + tol.reltol * derivative[0].abs().max(derivative[1].abs());
         let chargetol =
             tol.reltol * charge[0].abs().max(charge[1].abs()).max(tol.chgtol) / self.dt();
-        let tolerance = volttol.max(chargetol);
+        let tolerance = finite(volttol.max(chargetol), "truncation tolerance")?;
         // Divided differences over the trial and accepted points.
         let mut diff = [0.0; HISTORY_LEN + 2];
         diff[..order + 2].copy_from_slice(&charge[..order + 2]);
@@ -717,14 +725,17 @@ impl Coefficients {
         let mut j = order;
         loop {
             for i in 0..=j {
-                diff[i] = (diff[i] - diff[i + 1]) / span[i];
+                diff[i] = finite(
+                    (diff[i] - diff[i + 1]) / span[i],
+                    "charge divided difference",
+                )?;
             }
             if j == 0 {
                 break;
             }
             j -= 1;
             for i in 0..=j {
-                span[i] = span[i + 1] + self.deltas[i];
+                span[i] = finite(span[i + 1] + self.deltas[i], "truncation-error span")?;
             }
         }
         // cktterr.c gearCoeff/trapCoeff (trial() guarantees the index).
@@ -1097,6 +1108,52 @@ mod tests {
         let bad = TruncationTolerances { trtol: 0.0, ..tol };
         assert!(c.truncation_timestep(&q, d, &bad).is_err());
         assert!(c.truncation_timestep(&q, [f64::NAN, 0.0], &tol).is_err());
+    }
+
+    #[test]
+    fn truncation_rejects_invalid_spans_and_hidden_nonfinite_differences() {
+        let tolerance = TruncationTolerances::default();
+        for fill in [0., -1., f64::NAN, f64::INFINITY] {
+            let trial = StepHistory::with_fill(fill)
+                .trial(TRAP, 1, 1., DEFAULT_XMU)
+                .unwrap();
+            assert!(
+                trial
+                    .truncation_timestep(&[0., 0., 0.], [0., 0.], &tolerance)
+                    .is_err()
+            );
+        }
+        let trial = history(&[f64::MAX])
+            .trial(TRAP, 1, f64::MAX, DEFAULT_XMU)
+            .unwrap();
+        assert!(
+            trial
+                .truncation_timestep(&[1., 1., 1.], [0., 0.], &tolerance)
+                .is_err()
+        );
+        let trial = history(&[0.5]).trial(TRAP, 1, 0.5, DEFAULT_XMU).unwrap();
+        // Two overflowing first differences used to produce NaN, which
+        // f64::max(abstol, NaN) silently replaced with abstol.
+        let relaxed = TruncationTolerances {
+            abstol: 1e300,
+            ..tolerance
+        };
+        assert!(
+            trial
+                .truncation_timestep(&[f64::MAX, 0., -f64::MAX], [0., 0.], &relaxed)
+                .is_err()
+        );
+        assert!(
+            trial
+                .truncation_timestep(&[f64::MAX, -f64::MAX, -f64::MAX], [0., 0.], &relaxed)
+                .is_err()
+        );
+        assert!(
+            trial
+                .truncation_timestep(&[1., 0., -1.], [0., 0.], &tolerance)
+                .unwrap()
+                > 0.
+        );
     }
 
     #[test]
