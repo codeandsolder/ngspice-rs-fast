@@ -1850,7 +1850,7 @@ const EXCLUDED: &[(&str, &str)] = &[(
      but not the FMA-built golden (3 poles)",
 )];
 
-pub(crate) fn main(arguments: &[String]) -> Result<(), String> {
+pub(super) fn main(arguments: &[String]) -> Result<(), String> {
     let only = match arguments {
         [] => None,
         [flag, name] if flag == "--netlist" && !name.starts_with('-') => Some(name.as_str()),
@@ -2212,10 +2212,10 @@ fn compare_plot(
                     .filter(|v| v.is_finite() && *v > 0.0)
                     .ok_or_else(|| format!(".tran {what} is not a positive number"))
             };
-            let (step, stop) = (time(0, "tstep")?, time(1, "tstop")?);
-            let mut breakpoints = tran::breakpoints(netlist, step, stop)?;
+            let (step, final_time) = (time(0, "tstep")?, time(1, "tstop")?);
+            let mut breakpoints = tran::breakpoints(netlist, step, final_time)?;
             if !offsets.is_empty() {
-                breakpoints = tran::echoes(&breakpoints, offsets, stop)?;
+                breakpoints = tran::echoes(&breakpoints, offsets, final_time)?;
             }
             // With `uic` C writes no t = 0 row: its first row is the first
             // accepted step. The comparison then starts at that time, which the
@@ -2233,7 +2233,11 @@ fn compare_plot(
                 got,
                 want,
                 tolerance,
-                &tran::Grid { start, stop, step },
+                &tran::Grid {
+                    start,
+                    stop: final_time,
+                    step,
+                },
                 &breakpoints,
             )
             .map(|summary| {
