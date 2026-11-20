@@ -1121,17 +1121,13 @@ impl<T: Scalar> Sparse<T> {
         self.reset_numeric_status();
     }
 
-    /// The same matrix frame holding another scalar type, every element
-    /// zero: ngspice switches one frame between real and complex
-    /// (`spSetReal`/`spSetComplex`), keeping its internal numbering, row and
-    /// column exchanges, pivot order, fill-ins and flags. Only scalar storage is rebuilt;
-    /// the structural index buffers move unchanged. Loads start with
-    /// `spClear`, so the values carried over do not matter.
-    pub(crate) fn into_retyped<U: Scalar>(self) -> Sparse<U> {
+    /// Transfer one scalar frame's ordering; numeric coefficients are
+    /// supplied by the caller, never copied from the old LU.
+    fn into_retyped_values<U: Scalar>(self, values: Vec<U>) -> Sparse<U> {
         Sparse {
             size: self.size,
             ext_size: self.ext_size,
-            values: vec![U::ZERO; self.values.len()],
+            values,
             topology: self.topology,
             plan: self.plan,
             markowitz_row: self.markowitz_row,
@@ -1152,16 +1148,13 @@ impl<T: Scalar> Sparse<T> {
         }
     }
 
-    /// Fork the ordering, not the numeric payload, when a retained
-    /// snapshot prevents moving its storage. The caller reloads originals
-    /// before factoring. Markowitz and factor scratch are initialized only
-    /// if the new operation needs them.
-    pub(super) fn fork_for_reload<U: Scalar>(&self) -> Sparse<U> {
+    /// Fork the structural state, discarding scratch and old factors.
+    fn fork_values<U: Scalar>(&self, values: Vec<U>) -> Sparse<U> {
         Sparse {
             size: self.size,
             ext_size: self.ext_size,
             topology: self.topology.clone(),
-            values: vec![U::ZERO; self.values.len()],
+            values,
             plan: self.plan.clone(),
             markowitz_row: Vec::new(),
             markowitz_col: Vec::new(),
@@ -1180,22 +1173,72 @@ impl<T: Scalar> Sparse<T> {
         }
     }
 
-    /// Get mutable storage for a full coefficient reload. Unique frames
-    /// keep their numeric buffers; shared frames don't copy discarded data.
-    pub(super) fn for_reload(shared: &mut std::sync::Arc<Self>) -> &mut Self {
-        if std::sync::Arc::strong_count(shared) > 1 {
-            *shared = std::sync::Arc::new(shared.fork_for_reload());
-        }
-        std::sync::Arc::make_mut(shared)
+    /// Construct the complete numeric buffer directly. The original
+    /// handles are consecutive; only the fill-in suffix needs zeroing.
+    fn loaded_values<U: Scalar>(&self, originals: impl ExactSizeIterator<Item = U>) -> Vec<U> {
+        let total = self.values.len();
+        assert!(
+            originals.len() <= total,
+            "more originals than sparse elements"
+        );
+        let mut values = Vec::with_capacity(total);
+        values.extend(originals);
+        values.resize(total, U::ZERO);
+        values
     }
 
-    /// Switch scalar type, moving unique storage and forking only the
-    /// ordering if another snapshot remains alive.
-    pub(super) fn retype_shared<U: Scalar>(shared: std::sync::Arc<Self>) -> Sparse<U> {
-        match std::sync::Arc::try_unwrap(shared) {
-            Ok(owned) => owned.into_retyped(),
-            Err(retained) => retained.fork_for_reload(),
+    pub(super) fn fork_loaded<U: Scalar>(
+        &self,
+        originals: impl ExactSizeIterator<Item = U>,
+    ) -> Sparse<U> {
+        let mut next = self.fork_values(self.loaded_values(originals));
+        next.reset_numeric_status();
+        next
+    }
+
+    /// Reload in place if the factor buffer is uniquely held, otherwise
+    /// fork directly from the newly assembled values. No old LU or blanket
+    /// zero pass is needed on the retained-snapshot path.
+    pub(super) fn reload_shared(
+        shared: &mut std::sync::Arc<Self>,
+        originals: impl ExactSizeIterator<Item = T>,
+    ) {
+        if let Some(owned) = std::sync::Arc::get_mut(shared) {
+            owned.reload_originals_iter(originals);
+        } else {
+            *shared = std::sync::Arc::new(shared.fork_loaded(originals));
         }
+    }
+
+    /// Switch scalar type, moving unique ordering storage or sharing it
+    /// with a retained snapshot. The blank form is used before matching a
+    /// real matrix against the cached order.
+    pub(super) fn retype_shared<U: Scalar>(shared: std::sync::Arc<Self>) -> Sparse<U> {
+        let values = vec![U::ZERO; shared.values.len()];
+        match std::sync::Arc::try_unwrap(shared) {
+            Ok(owned) => owned.into_retyped_values(values),
+            Err(retained) => retained.fork_values(values),
+        }
+    }
+
+    /// Retype and load in a single pass when the new assembly is known.
+    pub(super) fn retype_shared_loaded<U: Scalar>(
+        shared: std::sync::Arc<Self>,
+        originals: impl ExactSizeIterator<Item = U>,
+    ) -> Sparse<U> {
+        let values = shared.loaded_values(originals);
+        let mut next = match std::sync::Arc::try_unwrap(shared) {
+            Ok(owned) => owned.into_retyped_values(values),
+            Err(retained) => retained.fork_values(values),
+        };
+        next.reset_numeric_status();
+        next
+    }
+
+    #[cfg(test)]
+    fn into_retyped<U: Scalar>(self) -> Sparse<U> {
+        let values = vec![U::ZERO; self.values.len()];
+        self.into_retyped_values(values)
     }
 
     /// `LoadGmin` (`spsmp.c`): adds `gmin` to the real part of every
@@ -1587,8 +1630,12 @@ impl<T: Scalar> Sparse<T> {
             return self.nonfinite_factor();
         }
         self.values[first] = inverse;
+        // Each column is scattered before use. Successful ordering
+        // inserted every structural elimination target as a fill-in, so
+        // the lower-column updates cannot read an unscattered row.
+        // Existing scratch may hold the previous solve's internal RHS;
+        // no blanket initialization is required.
         workspace.resize(size + 1, T::ZERO);
-        workspace.fill(T::ZERO);
         let dest = workspace;
         let plan = self
             .plan
@@ -2710,6 +2757,40 @@ mod tests {
     }
 
     #[test]
+    fn loaded_scalar_transition_preserves_original_bits_and_zero_fillins() {
+        let entries = [
+            (1, 1, 4.),
+            (1, 2, 1.),
+            (2, 2, 5.),
+            (2, 3, 1.),
+            (3, 3, 6.),
+            (3, 1, 1.),
+        ];
+        let mut real = Sparse::from_originals(3, entries);
+        assert_eq!(real.order_and_factor(1e-3, 0.), Status::Okay);
+        assert!(real.values.len() > entries.len());
+        let real = std::sync::Arc::new(real);
+        let before = real.solve(&[1.; 3]);
+        let loaded = entries.map(|(_, _, v)| Complex::new(v, -0.));
+        let complex =
+            Sparse::retype_shared_loaded(std::sync::Arc::clone(&real), loaded.into_iter());
+        assert!(!complex.is_factored());
+        assert!(std::sync::Arc::ptr_eq(&real.topology, &complex.topology));
+        assert!(
+            complex.values[..loaded.len()]
+                .iter()
+                .zip(loaded)
+                .all(|(a, b)| a.re.to_bits() == b.re.to_bits() && a.im.to_bits() == b.im.to_bits())
+        );
+        assert!(
+            complex.values[loaded.len()..]
+                .iter()
+                .all(|v| v.re.to_bits() == 0 && v.im.to_bits() == 0)
+        );
+        assert_eq!(real.solve(&[1.; 3]), before);
+    }
+
+    #[test]
     fn reload_fork_preserves_snapshots_without_copying_numeric_scratch() {
         let entries = [(1, 1, 4.), (1, 2, 1.), (2, 1, 2.), (2, 2, 5.)];
         let rhs = [5., 7.];
@@ -2720,12 +2801,13 @@ mod tests {
         let saved = std::sync::Arc::new(a);
         let expected = saved.solve(&rhs);
         let mut changed = std::sync::Arc::clone(&saved);
-        let next = Sparse::for_reload(&mut changed);
-        assert!(next.values.iter().all(|v| *v == 0.));
+        Sparse::reload_shared(&mut changed, [8., 1., 2., 5.].into_iter());
+        let next = std::sync::Arc::get_mut(&mut changed).unwrap();
+        assert_eq!(&next.values[..4], &[8., 1., 2., 5.]);
+        assert!(next.values[4..].iter().all(|v| *v == 0.));
         assert!(next.markowitz_row.is_empty());
         assert!(next.markowitz_col.is_empty());
         assert!(next.markowitz_prod.is_empty());
-        next.reload_originals(&[8., 1., 2., 5.]);
         assert_eq!(next.factor(), Status::Okay);
         assert_ne!(next.solve(&rhs), expected);
         assert!(std::sync::Arc::ptr_eq(
@@ -2899,6 +2981,63 @@ mod tests {
         assert!((4.0 * x[0] + x[1] - 5.0).abs() < 1e-14);
         m.clear();
         assert_eq!(m.factor(), Status::ZeroDiag);
+    }
+
+    #[test]
+    fn fixed_order_refactor_does_not_read_previous_workspace_contents() {
+        // A nonmonotonic, fill-producing original pattern, with exact
+        // structural zeros deliberately retained in its assembly.
+        let n = 30;
+        let mut seed = 19_u64;
+        let mut entries = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for i in (1..=n).rev() {
+            entries.push((i, i, 20.));
+            seen.insert((i, i));
+            for j in 0..5 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let c = (seed >> 32) as usize % n + 1;
+                if seen.insert((i, c)) {
+                    entries.push((i, c, if j == 0 { -0. } else { 0.125 }));
+                }
+            }
+        }
+        let mut real = Sparse::from_originals(n, entries.iter().copied());
+        assert_eq!(real.order_and_factor(1e-3, 0.), Status::Okay);
+        assert!(real.values.len() > entries.len());
+        let mut clean = real.clone();
+        let mut poisoned = real.clone();
+        let values = entries.iter().map(|&(_, _, v)| v * 1.5);
+        clean.reload_originals_iter(values.clone());
+        poisoned.reload_originals_iter(values);
+        assert_eq!(clean.factor_with_workspace(&mut Vec::new()), Status::Okay);
+        assert_eq!(
+            poisoned.factor_with_workspace(&mut vec![f64::NAN; n + 1]),
+            Status::Okay
+        );
+        assert!(
+            clean
+                .values
+                .iter()
+                .map(|v| v.to_bits())
+                .eq(poisoned.values.iter().map(|v| v.to_bits()))
+        );
+        let mut complex = real.into_retyped::<Complex>();
+        complex.reload_originals_iter(entries.iter().map(|&(_, _, v)| Complex::new(v, v * 0.25)));
+        let mut poisoned = complex.clone();
+        assert_eq!(complex.factor_with_workspace(&mut Vec::new()), Status::Okay);
+        assert_eq!(
+            poisoned.factor_with_workspace(&mut vec![Complex::new(f64::NAN, f64::NAN); n + 1]),
+            Status::Okay
+        );
+        let bits = |v: &Complex| (v.re.to_bits(), v.im.to_bits());
+        assert!(
+            complex
+                .values
+                .iter()
+                .map(bits)
+                .eq(poisoned.values.iter().map(bits))
+        );
     }
 
     #[test]

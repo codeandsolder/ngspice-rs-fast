@@ -448,16 +448,18 @@ pub(in crate::maths) fn factor_shared_complex(
     pattern.with_ordering(|state| {
     let (mut sparse, fresh) = match state.frame.take() {
         Some(CachedFrame::Real(symbolic)) if matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern))) => {
-            (Arc::new(Sparse::retype_shared(symbolic.sparse)), false)
+            (Arc::new(Sparse::retype_shared_loaded(symbolic.sparse,values.iter().copied())), false)
         }
-        Some(CachedFrame::Complex(ComplexFactors { sparse })) => (sparse, false),
+        Some(CachedFrame::Complex(ComplexFactors { mut sparse })) => {
+            Sparse::reload_shared(&mut sparse,values.iter().copied());
+            (sparse, false)
+        },
         _ => {
             let sparse=Sparse::from_pattern(pattern,values);
             (Arc::new(sparse), true)
         }
     };
-    let numeric = Sparse::for_reload(&mut sparse);
-    if !fresh { numeric.reload_originals(values); }
+    let numeric = Arc::make_mut(&mut sparse);
     let result = if fresh {
         state.ac_reorder = false;
         order_fresh("complex sparse LU", numeric, pivot, names, true)
@@ -513,11 +515,10 @@ impl LoadedFrame {
 
     /// Reload coefficients in handle order, keeping fill-ins and pivot order.
     fn reload(&mut self, matrix: &SparseMatrix) {
-        let sparse = Sparse::for_reload(&mut self.sparse);
         if let Some((_, values)) = matrix.bound_values() {
-            sparse.reload_originals(values);
+            Sparse::reload_shared(&mut self.sparse, values.iter().copied());
         } else {
-            sparse.reload_originals_iter(matrix.triplets().iter().map(|t| t.value));
+            Sparse::reload_shared(&mut self.sparse, matrix.triplets().iter().map(|t| t.value));
         }
     }
 

@@ -447,11 +447,13 @@ impl ComplexMatrix {
         if previous.n != self.n || !previous.order.matches(entries) {
             return self.factorize();
         }
-        let mut sparse = previous.factors.sparse.fork_for_reload();
+        let mut sparse = previous
+            .factors
+            .sparse
+            .fork_loaded(entries.iter().map(|&(_, _, v)| v));
         let load = |sparse: &mut Sparse<Complex>| {
             sparse.reload_originals_iter(entries.iter().map(|&(_, _, v)| v));
         };
-        load(&mut sparse);
         let mut status = sparse.factor_with_workspace(&mut Vec::new());
         if status == Status::ZeroDiag {
             load(&mut sparse);
