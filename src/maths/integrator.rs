@@ -188,7 +188,7 @@ fn numerical(message: impl Into<String>) -> SpiceError {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn finite(value: Real, what: &str) -> SpiceResult<Real> {
     if value.is_finite() {
         Ok(value)
@@ -384,6 +384,10 @@ impl StepHistory {
 /// corrector follows the reference's unpivoted LU elimination and
 /// substitution, preserving operation order rather than evaluating the
 /// algebraically equivalent Lagrange derivative in closed form.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "nicomcof.c unpivoted Gear elimination and substitution round products before subtraction"
+)]
 fn gear_corrector(deltas: &[Real; HISTORY_LEN + 1], order: usize) -> [Real; HISTORY_LEN + 1] {
     // nicomcof.c, `case GEAR`, verbatim: the corrector matrix built from
     // (sum of h)/h, LU-decomposed without pivoting (its first column is
@@ -431,7 +435,7 @@ fn gear_corrector(deltas: &[Real; HISTORY_LEN + 1], order: usize) -> [Real; HIST
     ag
 }
 
-/// Packed triangular table of CKTterr's divided-difference denominators.
+/// Packed triangular table of `CKTterr`'s divided-difference denominators.
 const SPAN_COUNT: usize = (HISTORY_LEN + 1) * (HISTORY_LEN + 2) / 2;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -619,6 +623,10 @@ impl Coefficients {
     /// [`SpiceError::Numerical`] for a short history, a missing derivative,
     /// nonfinite inputs/capacitance or nonfinite results.
     #[inline]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "NIintegrate companion derivative and history source follow the C addition order"
+    )]
     pub fn integrate(
         &self,
         charge: &[Real],
@@ -687,6 +695,10 @@ impl Coefficients {
     /// # Errors
     ///
     /// [`SpiceError::Numerical`] for short/nonfinite history or results.
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "NIpred trapezoidal divided differences preserve the reference multiply/add order"
+    )]
     pub fn predict(&self, solutions: &[Real]) -> SpiceResult<Real> {
         let order = usize::from(self.order);
         if self.history < order || solutions.len() < order + 1 {
@@ -748,6 +760,10 @@ impl Coefficients {
     ///
     /// [`SpiceError::Numerical`] for short/nonfinite inputs, invalid
     /// tolerances or a nonfinite result.
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "CKTterr uses separately rounded relative and absolute derivative tolerances"
+    )]
     pub fn truncation_timestep(
         &self,
         charge: &[Real],
