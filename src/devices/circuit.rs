@@ -51,7 +51,7 @@ pub enum CircuitVertex {
 pub type CircuitGraph = UnGraph<CircuitVertex, usize, usize>;
 
 /// A transient setup index, rebuilt from the current devices. No cache
-/// survives a topology change or a caller's use of devices_mut.
+/// survives a topology change or a caller's use of `devices_mut`.
 #[derive(Default)]
 struct DeviceNames(BTreeMap<String, usize>);
 
@@ -76,7 +76,7 @@ impl DeviceNames {
 struct DeviceOrigin {
     /// The parsed model name (lowercase), or C's default model.
     model: Option<String>,
-    /// Nodes this device creates in its DEVsetup, in creation order.
+    /// Nodes this device creates in its `DEVsetup`, in creation order.
     internal_nodes: Vec<NodeId>,
     /// The URC setup which generated this device and its model.
     generated_by: Option<usize>,
@@ -231,7 +231,7 @@ struct MutualEvaluation {
 
 impl MutualEvaluation {
     fn matches(&self, values: &BTreeMap<usize, InductanceValue>, mutuals: &[Real]) -> bool {
-        fn bits(value: &InductanceValue) -> [u64; 3] {
+        const fn bits(value: &InductanceValue) -> [u64; 3] {
             [
                 value.effective.to_bits(),
                 value.coupling_base.to_bits(),
@@ -331,7 +331,7 @@ impl MutualBinding {
             pairs,
             groups: groups.into_values().collect(),
             setup_rows,
-            evaluation: Default::default(),
+            evaluation: std::cell::RefCell::default(),
             error: None,
         }
     }
@@ -406,7 +406,7 @@ impl fmt::Debug for Circuit {
                     .map(|device| device.name())
                     .collect::<Vec<_>>(),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -480,6 +480,8 @@ impl Circuit {
     }
 
     fn rebuild_unknowns_in_order(&mut self, order: &[usize], names: &DeviceNames) {
+        use crate::devices::setup::CDeviceType;
+
         self.unknown_names.get_mut().take();
         self.fixed_stamps.get_mut().forget();
         let mut owned = vec![false; self.nodes.len()];
@@ -494,19 +496,18 @@ impl Circuit {
         }
         self.unknowns
             .rebuild_deferring(&self.nodes, |node| owned[node.index()]);
-        use crate::devices::setup::CDeviceType;
         self.branch_rows = vec![0..0; self.devices.len()];
         // `CKTmkCur` runs once per device: in its own DEVsetup, or earlier
         // when a CCCS/CCVS/CSW/ASRC setup asks `CKTfndBranch` for it
-        // (`VSRCfindBr`, `VCVSfindBr`, `CCVSfindBr` and `ASRCfindBr` make the
+        // (`VSRCfindBr`, `VCVSfindBr`, `CCVSfindBr` and `ASRCfindBr` create the
         // branch on demand), so a controlling source's branch is numbered
         // where its first user is set up.
-        let mut made = vec![false; self.devices.len()];
-        let mut make = |unknowns: &mut MnaUnknowns, index: usize| {
-            if made[index] {
+        let mut allocated = vec![false; self.devices.len()];
+        let mut allocate_branch = |unknowns: &mut MnaUnknowns, index: usize| {
+            if allocated[index] {
                 return;
             }
-            made[index] = true;
+            allocated[index] = true;
             let count = self.devices[index].branch_currents();
             let start = unknowns.len();
             unknowns.add_rows(count);
@@ -514,12 +515,12 @@ impl Circuit {
         };
         for &index in order {
             let kind = self.devices[index].c_device_type();
-            // vsrcset.c, ccvsset.c and asrcset.c make their own branch before
-            // anything else; the other setups make internal nodes first.
+            // vsrcset.c, ccvsset.c and asrcset.c create their own branch before
+            // anything else; the other setups create internal nodes first.
             let branches_first = matches!(kind, CDeviceType::Vsrc | CDeviceType::Ccvs)
                 || (kind == CDeviceType::Asrc && self.devices[index].branch_currents() > 0);
             if branches_first {
-                make(&mut self.unknowns, index);
+                allocate_branch(&mut self.unknowns, index);
             }
             // cccsset.c, ccvsset.c, cswsetup.c and asrcset.c call
             // CKTfndBranch for each controlling source, in order.
@@ -527,13 +528,13 @@ impl Circuit {
                 if let Some(target) = names.get(&control.name)
                     && self.devices[target].findable_branch().is_some()
                 {
-                    make(&mut self.unknowns, target);
+                    allocate_branch(&mut self.unknowns, target);
                 }
             }
             for &node in &self.origins[index].internal_nodes {
                 self.unknowns.assign_deferred(node);
             }
-            make(&mut self.unknowns, index);
+            allocate_branch(&mut self.unknowns, index);
         }
         self.state_rows.clear();
         self.state_len = 0;
@@ -1172,7 +1173,7 @@ impl Circuit {
         Ok(graph)
     }
 
-    /// Validate exactly the incidence constraints enforced by topology(),
+    /// Validate exactly the incidence constraints enforced by `topology()`,
     /// without constructing a graph just to discard it. Build the lookup index
     /// in the same pass. Keep the existing Unicode duplicate-name rule as
     /// well as ASCII case-insensitive reference resolution.
@@ -1192,10 +1193,10 @@ impl Circuit {
                     )));
                 }
             }
-            let duplicate = match &mut unicode {
-                Some(seen) => !seen.insert(device.name().to_lowercase()),
-                None => names.get(device.name()).is_some(),
-            };
+            let duplicate = unicode.as_mut().map_or_else(
+                || names.get(device.name()).is_some(),
+                |seen| !seen.insert(device.name().to_lowercase()),
+            );
             if duplicate {
                 return Err(SpiceError::circuit(format!(
                     "duplicate instance name '{}'",
@@ -2327,10 +2328,10 @@ impl Circuit {
         let mut ranges = Vec::new();
         let system =
             self.bias_linearized_system(context, bias, state, setups.max(1), Some(&mut ranges))?;
-        let a = system.a.triplets();
-        let e = system.e.triplets();
+        let conductance_stamps = system.a.triplets();
+        let capacitance_stamps = system.e.triplets();
         let mut terms = Vec::new();
-        for (a_range, e_range, statements) in ranges {
+        for (conductance_range, capacitance_range, statements) in ranges {
             if !statements.is_empty() {
                 // The device recorded its C statements in order.
                 terms.extend(statements);
@@ -2338,9 +2339,12 @@ impl Circuit {
             }
             let first = terms.len();
             let slot = |terms: &mut Vec<crate::maths::pencil::PencilTerm>, row, col| {
-                let existing = terms[first..]
-                    .iter()
-                    .position(|t: &crate::maths::pencil::PencilTerm| t.row == row && t.col == col);
+                let existing =
+                    terms[first..]
+                        .iter()
+                        .position(|stamp: &crate::maths::pencil::PencilTerm| {
+                            stamp.row == row && stamp.col == col
+                        });
                 existing.map_or_else(
                     || {
                         terms.push(crate::maths::pencil::PencilTerm {
@@ -2351,23 +2355,26 @@ impl Circuit {
                         });
                         terms.len() - 1
                     },
-                    |i| first + i,
+                    |slot_index| first + slot_index,
                 )
             };
-            for t in &a[a_range] {
-                let i = slot(&mut terms, t.row, t.col);
-                let g = &mut terms[i].conductance;
-                *g = Some(g.map_or(t.value, |g| g + t.value));
+            for stamp in &conductance_stamps[conductance_range] {
+                let slot_index = slot(&mut terms, stamp.row, stamp.col);
+                let conductance = &mut terms[slot_index].conductance;
+                *conductance =
+                    Some(conductance.map_or(stamp.value, |conductance| conductance + stamp.value));
             }
-            let mut index = e_range.start;
-            while index < e_range.end {
-                let t = &e[index];
+            let mut index = capacitance_range.start;
+            while index < capacitance_range.end {
+                let stamp = &capacitance_stamps[index];
                 let (value, next) = system
                     .e_groups
                     .iter()
-                    .find(|g| g.range.start == index && g.range.end <= e_range.end)
+                    .find(|group| {
+                        group.range.start == index && group.range.end <= capacitance_range.end
+                    })
                     .map_or_else(
-                        || (t.value, index + 1),
+                        || (stamp.value, index + 1),
                         |group| {
                             let mut sum = group.terms.first().copied().unwrap_or(0.);
                             for term in group.terms.iter().skip(1) {
@@ -2376,9 +2383,9 @@ impl Circuit {
                             (group.scale * sum, group.range.end.max(index + 1))
                         },
                     );
-                let i = slot(&mut terms, t.row, t.col);
-                let c = &mut terms[i].capacitance;
-                *c = Some(c.map_or(value, |c| c + value));
+                let slot_index = slot(&mut terms, stamp.row, stamp.col);
+                let capacitance = &mut terms[slot_index].capacitance;
+                *capacitance = Some(capacitance.map_or(value, |capacitance| capacitance + value));
                 index = next;
             }
         }
@@ -2571,63 +2578,16 @@ impl Circuit {
             if instance.designator == 'u' {
                 let expanded =
                     crate::devices::urc::expand(instance, nodes, models, context, &deck_nodes)?;
-                let parsed_terminals: BTreeSet<_> = instance
-                    .nodes
-                    .iter()
-                    .filter_map(|name| nodes.get(name))
-                    .collect();
                 let line = base + staged.len();
-                let lower = instance.name.to_lowercase();
-                for device in expanded {
-                    let is_line = device.name().eq_ignore_ascii_case(&instance.name);
-                    if !is_line && !seen.insert(device.name().to_lowercase()) {
-                        return Err(SpiceError::circuit(format!(
-                            "duplicate instance name '{}' generated by URC {}",
-                            device.name(),
-                            instance.name
-                        )));
-                    }
-                    let origin = if is_line {
-                        // URCsetup's own ladder nodes: defer until the URC's setup.
-                        DeviceOrigin {
-                            internal_nodes: nodes.nodes()[first..]
-                                .iter()
-                                .filter(|node| {
-                                    node.kind != NodeKind::Internal
-                                        && !parsed_terminals.contains(&node.id)
-                                })
-                                .map(|node| node.id)
-                                .collect(),
-                            model: instance.model.as_ref().map(|m| m.to_ascii_lowercase()),
-                            generated_by: None,
-                        }
-                    } else {
-                        // The generated diode's prime node belongs to diosetup.
-                        let internal_nodes = device
-                            .terminals()
-                            .iter()
-                            .copied()
-                            .filter(|id| {
-                                id.index() >= first
-                                    && !parsed_terminals.contains(id)
-                                    && nodes
-                                        .node(*id)
-                                        .is_some_and(|node| node.kind == NodeKind::Internal)
-                            })
-                            .collect();
-                        let suffix = match device.c_device_type() {
-                            crate::devices::setup::CDeviceType::Res => "resmod",
-                            crate::devices::setup::CDeviceType::Cap => "capmod",
-                            _ => "diodemod",
-                        };
-                        DeviceOrigin {
-                            internal_nodes,
-                            model: Some(format!("{lower}#{suffix}")),
-                            generated_by: Some(line),
-                        }
-                    };
-                    staged.push(PendingDevice { device, origin });
-                }
+                Self::stage_urc(
+                    instance,
+                    nodes,
+                    expanded,
+                    first,
+                    line,
+                    &mut seen,
+                    &mut staged,
+                )?;
                 continue;
             }
             let device =
@@ -2657,6 +2617,74 @@ impl Circuit {
             )));
         }
         Ok(staged)
+    }
+
+    // Preserve ownership and insertion order of a URC's generated devices.
+    fn stage_urc(
+        instance: &crate::netlist::ast::DeviceInstance,
+        nodes: &NodeTable,
+        expanded: Vec<Box<dyn Device>>,
+        first: usize,
+        line: usize,
+        seen: &mut BTreeSet<String>,
+        staged: &mut Vec<PendingDevice>,
+    ) -> SpiceResult<()> {
+        let parsed_terminals: BTreeSet<_> = instance
+            .nodes
+            .iter()
+            .filter_map(|name| nodes.get(name))
+            .collect();
+        let lower = instance.name.to_lowercase();
+        for device in expanded {
+            let is_line = device.name().eq_ignore_ascii_case(&instance.name);
+            if !is_line && !seen.insert(device.name().to_lowercase()) {
+                return Err(SpiceError::circuit(format!(
+                    "duplicate instance name '{}' generated by URC {}",
+                    device.name(),
+                    instance.name
+                )));
+            }
+            let origin = if is_line {
+                // URCsetup's own ladder nodes: defer until the URC's setup.
+                DeviceOrigin {
+                    internal_nodes: nodes.nodes()[first..]
+                        .iter()
+                        .filter(|node| {
+                            node.kind != NodeKind::Internal && !parsed_terminals.contains(&node.id)
+                        })
+                        .map(|node| node.id)
+                        .collect(),
+                    model: instance.model.as_ref().map(|m| m.to_ascii_lowercase()),
+                    generated_by: None,
+                }
+            } else {
+                // The generated diode's prime node belongs to diosetup.
+                let internal_nodes = device
+                    .terminals()
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        id.index() >= first
+                            && !parsed_terminals.contains(id)
+                            && nodes
+                                .node(*id)
+                                .is_some_and(|node| node.kind == NodeKind::Internal)
+                    })
+                    .collect();
+                let suffix = match device.c_device_type() {
+                    crate::devices::setup::CDeviceType::Res => "resmod",
+                    crate::devices::setup::CDeviceType::Cap => "capmod",
+                    _ => "diodemod",
+                };
+                DeviceOrigin {
+                    internal_nodes,
+                    model: Some(format!("{lower}#{suffix}")),
+                    generated_by: Some(line),
+                }
+            };
+            staged.push(PendingDevice { device, origin });
+        }
+        Ok(())
     }
 
     /// Elaborate literal (or top-level `.param`/`{expr}`-literalized) R/C/L/V/I and

@@ -121,7 +121,7 @@ impl Topology {
         }
     }
 
-    fn terminals(&self) -> &[NodeId] {
+    const fn terminals(&self) -> &[NodeId] {
         match self {
             Self::Vcvs(nodes) | Self::Vccs(nodes) => nodes,
             Self::Cccs(nodes, _) | Self::Ccvs(nodes, _) => nodes,
@@ -489,34 +489,7 @@ pub(crate) fn instantiate(
             instance.name
         )));
     };
-    if let Some(form) = instance
-        .parameters
-        .iter()
-        .find(|p| matches!(p.name.as_str(), "poly" | "value" | "table"))
-    {
-        // The front end rewrites these into B sources/XSPICE instances
-        // (crate::netlist::behavioural::lower_nonlinear_sources, run by
-        // Circuit::from_netlist), as inpcom.c does before INP2E..INP2H.
-        return Err(SpiceError::Unsupported {
-            feature: format!(
-                "{}: the {} form must be lowered with \
-                 crate::netlist::behavioural::lower_nonlinear_sources before instantiation",
-                instance.name,
-                form.name.to_ascii_uppercase()
-            ),
-            location: Some(instance.location.clone()),
-        });
-    }
-    let expected = if kind.voltage_controlled() { 4 } else { 2 };
-    if instance.model.is_some() || instance.nodes.len() != expected {
-        return Err(SpiceError::Unsupported {
-            feature: format!(
-                "{} needs {expected} nodes and no model in its linear form",
-                instance.name
-            ),
-            location: Some(instance.location.clone()),
-        });
-    }
+    validate_linear_form(instance, kind)?;
     let multiplier_allowed = matches!(kind, ControlledKind::Vccs | ControlledKind::Cccs);
     let mut gain: Option<Real> = None;
     let mut multiplier: Option<Real> = None;
@@ -601,6 +574,38 @@ pub(crate) fn instantiate(
         ..device
     };
     Ok(Box::new(device))
+}
+
+fn validate_linear_form(instance: &DeviceInstance, kind: ControlledKind) -> SpiceResult<()> {
+    if let Some(form) = instance
+        .parameters
+        .iter()
+        .find(|p| matches!(p.name.as_str(), "poly" | "value" | "table"))
+    {
+        // The front end rewrites these into B sources/XSPICE instances
+        // (crate::netlist::behavioural::lower_nonlinear_sources, run by
+        // Circuit::from_netlist), as inpcom.c does before INP2E..INP2H.
+        return Err(SpiceError::Unsupported {
+            feature: format!(
+                "{}: the {} form must be lowered with \
+                 crate::netlist::behavioural::lower_nonlinear_sources before instantiation",
+                instance.name,
+                form.name.to_ascii_uppercase()
+            ),
+            location: Some(instance.location.clone()),
+        });
+    }
+    let expected = if kind.voltage_controlled() { 4 } else { 2 };
+    if instance.model.is_some() || instance.nodes.len() != expected {
+        return Err(SpiceError::Unsupported {
+            feature: format!(
+                "{} needs {expected} nodes and no model in its linear form",
+                instance.name
+            ),
+            location: Some(instance.location.clone()),
+        });
+    }
+    Ok(())
 }
 
 fn literal(text: &str, location: &SourceLoc, what: &str) -> SpiceResult<Real> {
