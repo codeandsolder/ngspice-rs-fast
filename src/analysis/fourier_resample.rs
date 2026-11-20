@@ -129,7 +129,7 @@ fn same_timestamp(left: Real, right: Real) -> bool {
 }
 
 /// Move the older coincident sample back by C's fractional interval.
-/// Keep the displacement rounded separately, as in ft_interpolate.
+/// Keep the displacement rounded separately, as in `ft_interpolate`.
 const fn retreat_duplicate(time: &mut Real, interval: Real) {
     let displacement = interval * 0.001;
     *time -= displacement;
