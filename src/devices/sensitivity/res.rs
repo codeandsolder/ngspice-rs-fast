@@ -5,8 +5,9 @@
 use super::{
     CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, RecordPair, SensitivityConductance,
     SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
-    SensitivityRecord,
+    SensitivityRecord, written,
 };
+use crate::devices::schema::ScalarValues;
 use crate::primitives::{NodeId, Real, SpiceResult};
 
 /// `RESmPTable` entries `set_param()` accepts (`defw`, `l` and `tnom` are
@@ -46,63 +47,56 @@ const INSTANCE: &[P] = &[
 /// `RESMIN` of `resparam.c`.
 const RESMIN: Real = 1e-12;
 
-/// The values a resistor card gave, `None` where it gave none.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(in crate::devices) struct ResistorInputs {
-    /// Instance resistance.
-    pub resistance: Option<Real>,
-    /// Instance `temp=` (Celsius).
-    pub temp: Option<Real>,
-    /// Instance `l=`/`w=`.
-    pub length: Option<Real>,
-    pub width: Option<Real>,
-    /// Instance `m=`, `scale=`.
-    pub m: Option<Real>,
-    pub scale: Option<Real>,
-    /// Instance `tc1=`/`tc2=` (C's `tc`/`tc2`).
-    pub tc1: Option<Real>,
-    pub tc2: Option<Real>,
-    /// Model `r`, `rsh`, `defw`, `l`, `narrow`, `short`, `tc1`, `tc2`,
-    /// `tnom` (Celsius), `kf`, `af`, `lf`, `wf`, `ef`.
-    pub model_r: Option<Real>,
-    pub rsh: Option<Real>,
-    pub defw: Option<Real>,
-    pub defl: Option<Real>,
-    pub narrow: Option<Real>,
-    pub short: Option<Real>,
-    pub model_tc1: Option<Real>,
-    pub model_tc2: Option<Real>,
-    pub tnom: Option<Real>,
-    pub kf: Option<Real>,
-    pub af: Option<Real>,
-    pub lf: Option<Real>,
-    pub wf: Option<Real>,
-    pub ef: Option<Real>,
+/// Where the given resistor parameters come from. A literal has no model
+/// card and only its resistance given; a modeled device already holds its
+/// validated instance and model setters, including the schema defaults.
+#[derive(Debug)]
+pub(in crate::devices) enum ResistorInputs<'a> {
+    Literal(Real),
+    Modeled {
+        name: &'a str,
+        model: &'a ScalarValues,
+        instance: &'a ScalarValues,
+    },
 }
 
-/// A resistor's `.sens` description.
+impl ResistorInputs<'_> {
+    fn model_value(&self, keyword: &str) -> Option<Real> {
+        match self {
+            Self::Literal(_) => None,
+            Self::Modeled { model, .. } => written(model, keyword),
+        }
+    }
+
+    fn instance_value(&self, keyword: &str) -> Option<Real> {
+        match self {
+            Self::Literal(resistance) if keyword == "resistance" => Some(*resistance),
+            Self::Literal(_) => None,
+            Self::Modeled { instance, .. } => written(instance, keyword),
+        }
+    }
+}
+
+/// A resistor's `.sens` description, borrowing the device's immutable card.
 #[derive(Debug)]
-pub(in crate::devices) struct ResistorSensitivity {
-    name: String,
-    model: Option<String>,
+pub(in crate::devices) struct ResistorSensitivity<'a> {
+    name: &'a str,
     terminals: [NodeId; 2],
     /// `CKTtemp`, `CKTnomTemp` in kelvin.
     circuit_kelvin: Real,
     nominal_kelvin: Real,
-    inputs: ResistorInputs,
+    inputs: ResistorInputs<'a>,
 }
 
-impl ResistorSensitivity {
+impl<'a> ResistorSensitivity<'a> {
     pub(crate) fn new(
-        name: &str,
-        model: Option<&str>,
+        name: &'a str,
         terminals: [NodeId; 2],
-        inputs: ResistorInputs,
+        inputs: ResistorInputs<'a>,
         context: &crate::devices::ModelContext,
     ) -> Self {
         Self {
-            name: name.to_owned(),
-            model: model.map(str::to_owned),
+            name,
             terminals,
             circuit_kelvin: context.temperature + CELSIUS_TO_KELVIN,
             nominal_kelvin: context.nominal_temperature + CELSIUS_TO_KELVIN,
@@ -115,13 +109,16 @@ fn field(value: Option<Real>, default: Real) -> (Real, bool) {
     value.map_or((default, false), |value| (value, true))
 }
 
-impl DeviceSensitivity for ResistorSensitivity {
+impl DeviceSensitivity for ResistorSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Resistor
     }
 
     fn model(&self) -> Option<&str> {
-        self.model.as_deref()
+        match &self.inputs {
+            ResistorInputs::Literal(_) => None,
+            ResistorInputs::Modeled { name, .. } => Some(name),
+        }
     }
 
     fn model_parameters(&self) -> &'static [P] {
@@ -139,37 +136,37 @@ impl DeviceSensitivity for ResistorSensitivity {
             record.with(keyword, value, given)
         };
         let mut model = SensitivityRecord::new();
-        let (tnom, tnom_given) = field(i.tnom.map(|t| t + CELSIUS_TO_KELVIN), 0.);
+        let (tnom, tnom_given) = field(i.model_value("tnom").map(|t| t + CELSIUS_TO_KELVIN), 0.);
         model = model.with("tnom", tnom, tnom_given);
-        model = entry(model, "rsh", i.rsh, 0.);
-        model = entry(model, "defw", i.defw, 0.);
-        model = entry(model, "defl", i.defl, 0.);
-        model = entry(model, "narrow", i.narrow, 0.);
-        model = entry(model, "short", i.short, 0.);
-        model = entry(model, "tc1", i.model_tc1, 0.);
-        model = entry(model, "tc2", i.model_tc2, 0.);
+        model = entry(model, "rsh", i.model_value("rsh"), 0.);
+        model = entry(model, "defw", i.model_value("defw"), 0.);
+        model = entry(model, "defl", i.model_value("l"), 0.);
+        model = entry(model, "narrow", i.model_value("narrow"), 0.);
+        model = entry(model, "short", i.model_value("short"), 0.);
+        model = entry(model, "tc1", i.model_value("tc1"), 0.);
+        model = entry(model, "tc2", i.model_value("tc2"), 0.);
         model = entry(model, "tce", None, 0.);
-        model = entry(model, "kf", i.kf, 0.);
-        model = entry(model, "af", i.af, 0.);
-        model = entry(model, "r", i.model_r, 0.);
+        model = entry(model, "kf", i.model_value("kf"), 0.);
+        model = entry(model, "af", i.model_value("af"), 0.);
+        model = entry(model, "r", i.model_value("r"), 0.);
         model = entry(model, "bv_max", None, 0.);
-        model = entry(model, "lf", i.lf, 0.);
-        model = entry(model, "wf", i.wf, 0.);
-        model = entry(model, "ef", i.ef, 0.);
+        model = entry(model, "lf", i.model_value("lf"), 0.);
+        model = entry(model, "wf", i.model_value("wf"), 0.);
+        model = entry(model, "ef", i.model_value("ef"), 0.);
         let mut instance = SensitivityRecord::new();
-        instance = entry(instance, "resistance", i.resistance, 0.);
+        instance = entry(instance, "resistance", i.instance_value("resistance"), 0.);
         instance = entry(instance, "ac", None, 0.);
-        let (temp, temp_given) = field(i.temp.map(|t| t + CELSIUS_TO_KELVIN), 0.);
+        let (temp, temp_given) = field(i.instance_value("temp").map(|t| t + CELSIUS_TO_KELVIN), 0.);
         instance = instance.with("temp", temp, temp_given);
         instance = entry(instance, "dtemp", None, 0.);
-        instance = entry(instance, "l", i.length, 0.);
-        instance = entry(instance, "w", i.width, 0.);
-        instance = entry(instance, "m", i.m, 0.);
-        instance = entry(instance, "tc", i.tc1, 0.);
-        instance = entry(instance, "tc2", i.tc2, 0.);
+        instance = entry(instance, "l", i.instance_value("l"), 0.);
+        instance = entry(instance, "w", i.instance_value("w"), 0.);
+        instance = entry(instance, "m", i.instance_value("m"), 0.);
+        instance = entry(instance, "tc", i.instance_value("tc1"), 0.);
+        instance = entry(instance, "tc2", i.instance_value("tc2"), 0.);
         instance = entry(instance, "tce", None, 0.);
         instance = entry(instance, "bv_max", None, 0.);
-        instance = entry(instance, "scale", i.scale, 0.);
+        instance = entry(instance, "scale", i.instance_value("scale"), 0.);
         instance = instance
             .with("conduct", 0., false)
             .with("acconduct", 0., false);
@@ -356,7 +353,7 @@ impl DeviceSensitivity for ResistorSensitivity {
             conduct
         };
         Ok(SensitivityLoad::Replacement(Box::new(
-            SensitivityConductance::new(&self.name, 'r', self.terminals, conduct, ac)?,
+            SensitivityConductance::new(self.name, 'r', self.terminals, conduct, ac)?,
         )))
     }
 }

@@ -551,6 +551,77 @@ fn exhausted_schedules_and_total_budget_are_bounded_and_reported() {
 }
 
 #[test]
+fn default_budget_distinguishes_direct_and_continuation_iteration_limits() {
+    use ngspice_rs::analysis::bias::MAX_ADAPTIVE_STAGES;
+
+    let c = circuit("v1 a 0 1\nr1 a 0 1k");
+    let context = ModelContext::default();
+    let direct_limit = 4;
+    let stage_limit = 7;
+    let cases = [
+        // One direct solve, two gmin stages plus their direct-limit
+        // closing solve, three source stages plus a stage-limit closing solve.
+        (
+            ContinuationPolicy {
+                gmin_schedule: vec![1e-6, 1e-9],
+                source_stepping: Some(SourceStepping {
+                    scales: vec![0., 0.5, 1.],
+                    gmin: 1e-8,
+                }),
+                ..ContinuationPolicy::disabled()
+            },
+            2,
+            6,
+        ),
+        (
+            ContinuationPolicy {
+                skip_direct: true,
+                gmin_schedule: vec![1e-6, 1e-9],
+                source_stepping: Some(SourceStepping {
+                    scales: vec![0., 0.5, 1.],
+                    gmin: 1e-8,
+                }),
+                ..ContinuationPolicy::disabled()
+            },
+            1,
+            6,
+        ),
+        (
+            ContinuationPolicy::ngspice(NgspiceStepping {
+                gmin_steps: 2,
+                source_steps: 3,
+                ..NgspiceStepping::default()
+            }),
+            2,
+            3 + 4,
+        ),
+        // Both dynamic gmin strategies have a direct-limit closing solve.
+        // Gillespie may run its initial zero-source solve, eleven gmin
+        // stages and all adaptive source steps, all at the stage limit.
+        (
+            ContinuationPolicy::default(),
+            3,
+            3 * MAX_ADAPTIVE_STAGES + 12,
+        ),
+        (ContinuationPolicy::disabled(), 1, 0),
+    ];
+    for (mut policy, direct_count, stage_count) in cases {
+        policy.stage_max_iterations = Some(stage_limit);
+        let expected = direct_count * (direct_limit + 1) + stage_count * (stage_limit + 1);
+        let settings = settings(
+            NewtonOptions {
+                max_iterations: direct_limit,
+                ..NewtonOptions::default()
+            },
+            policy,
+        );
+        let solved = solve_dc_with(&c, &context, &settings, &[], None, None).unwrap();
+        assert_eq!(solved.report.budget, expected, "{settings:?}");
+        assert_original_equations_solved(&solved.report);
+    }
+}
+
+#[test]
 fn invalid_schedules_scales_and_budgets_are_rejected_before_any_load() {
     let c = circuit(DIFFICULT);
     let context = ModelContext::default();

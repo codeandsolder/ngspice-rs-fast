@@ -672,7 +672,7 @@ impl MosLevel for Level2 {
         if self.vmax > 0.0 {
             // Saturation voltage by Baum's theory of scattering-velocity
             // saturation: the smallest positive root of a quartic.
-            if let Some(x) = baum_root(BaumInputs {
+            if let Some(x) = baum_root(&BaumInputs {
                 v1: (vgsx - vbin) / eta + phi_min_vbs,
                 v2: phi_min_vbs,
                 xv: self.vmax * length / ueff,
@@ -911,14 +911,14 @@ struct BaumInputs {
     clippy::many_single_char_names,
     reason = "conventional symbolic variables match the published device equations"
 )]
-fn baum_root(inputs: BaumInputs) -> Option<Real> {
+fn baum_root(inputs: &BaumInputs) -> Option<Real> {
     let BaumInputs {
         v1,
         v2,
         xv,
         gammad,
         sarg3,
-    } = inputs;
+    } = *inputs;
     let a1 = gammad / 0.75;
     let b1 = -2.0 * (v1 + xv);
     let c1 = -2.0 * gammad * xv;
@@ -1117,7 +1117,7 @@ mod tests {
         let (a1, b1) = (0.4 / 0.75, -2.0 * (2.5 + 1.2));
         let c1 = -2.0 * 0.4 * 1.2;
         let d1 = 2.0 * 2.5 * (0.7 + 1.2) - 0.49 - 4.0 / 3.0 * 0.4 * 0.7f64.powf(1.5);
-        let x = baum_root(inputs).unwrap();
+        let x = baum_root(&inputs).unwrap();
         assert!(x > 0.);
         let poly = |x: Real| x.powi(4) + a1 * x.powi(3) + b1 * x * x + c1 * x + d1;
         assert!(poly(x).abs() < 1e-9);

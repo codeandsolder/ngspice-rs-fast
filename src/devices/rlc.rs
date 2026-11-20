@@ -362,12 +362,8 @@ impl Device for Resistor {
         Ok(Box::new(
             crate::devices::sensitivity::ResistorSensitivity::new(
                 &self.name,
-                None,
                 self.terminals,
-                crate::devices::sensitivity::ResistorInputs {
-                    resistance: Some(self.resistance),
-                    ..Default::default()
-                },
+                crate::devices::sensitivity::ResistorInputs::Literal(self.resistance),
                 context,
             ),
         ))

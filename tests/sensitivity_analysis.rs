@@ -93,6 +93,55 @@ fn a_divider_matches_its_closed_form_derivatives() {
     }
 }
 
+/// Model and instance records must retain distinct given flags, including
+/// explicitly written zero and values identical to schema defaults. The C
+/// resistor field names differ from the card's `l` and `tc1` setters.
+#[test]
+fn resistor_records_preserve_given_flags_aliases_and_geometry() {
+    use ngspice_rs::devices::{Circuit, ModelContext};
+
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("resistor-records.cir"),
+            "resistor records\nr1 a 0 1k\nr2 b 0 rm tc1=0 temp=50 m=2 scale=1\n.model rm r rsh=100 defw=2u l=10u tc1=0.01 tnom=20\n.end\n",
+        ))
+        .unwrap();
+    let circuit = Circuit::from_netlist(&netlist).unwrap();
+    let describe = |name| {
+        circuit
+            .devices()
+            .iter()
+            .find(|device| device.name() == name)
+            .unwrap()
+            .sensitivity(&ModelContext::default())
+            .unwrap()
+    };
+
+    let literal = describe("r1");
+    assert!(literal.model().is_none());
+    let (model, instance) = literal.records().unwrap();
+    assert!(!model.given("rsh") && !model.given("tnom"));
+    assert!(!instance.given("m") && !instance.given("scale"));
+    assert!(instance.given("resistance"));
+    close(instance.value("resistance").unwrap(), 1e3, 1e-12);
+
+    let modeled = describe("r2");
+    assert_eq!(modeled.model(), Some("rm"));
+    let (model, instance) = modeled.records().unwrap();
+    assert!(model.given("defl") && model.given("defw") && model.given("tc1"));
+    assert!(!model.given("tc2") && !model.given("narrow"));
+    close(model.value("defl").unwrap(), 10e-6, 1e-12);
+    close(model.value("defw").unwrap(), 2e-6, 1e-12);
+    close(model.value("tnom").unwrap(), 293.15, 1e-12);
+    assert!(instance.given("tc") && instance.given("temp"));
+    assert!(instance.given("m") && instance.given("scale"));
+    assert!(!instance.given("resistance") && !instance.given("l") && !instance.given("w"));
+    assert_eq!(instance.value("tc").unwrap().to_bits(), 0.0_f64.to_bits());
+    close(instance.value("temp").unwrap(), 323.15, 1e-12);
+    close(instance.value("resistance").unwrap(), 500., 1e-12);
+    close(instance.value("conduct").unwrap(), 0.004, 1e-12);
+}
+
 /// C's `sgen` order and names: device types in `DEVices[]` order, later
 /// models and instances first, model parameters `inst:kw`, the first
 /// principal instance parameter `inst`, the rest `inst_kw`.
