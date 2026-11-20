@@ -50,16 +50,19 @@ impl RfPort {
 #[derive(Debug, Clone)]
 pub struct IndependentSource {
     name: String,
-    /// `[positive, negative]`, plus the internal `#res` node of a port.
-    terminals: Vec<NodeId>,
+    /// Inline `[positive, negative, internal]`. The third entry is exposed
+    /// only when a port is present.
+    terminals: [NodeId; 3],
     voltage: bool,
     dc: Real,
     ac: Complex,
     multiplier: Real,
     /// Whether an AC value was written (C `VSRCacGiven`), even `ac 0`.
     ac_given: bool,
+    /// The source's immutable original function. Only PORT accumulation
+    /// has a second, derived waveform.
     waveform: Waveform,
-    original_waveform: Waveform,
+    accumulated_waveform: Option<Box<Waveform>>,
     original_dc: Real,
     power_tone: Option<(Real, Real)>,
     port: Option<RfPort>,
@@ -89,7 +92,7 @@ impl IndependentSource {
         }
         Ok(Self {
             name: name.into(),
-            terminals: terminals.to_vec(),
+            terminals: [terminals[0], terminals[1], NodeId::GROUND],
             voltage,
             dc,
             ac,
@@ -101,7 +104,7 @@ impl IndependentSource {
                 ac: (ac != Complex::ZERO)
                     .then(|| (ac.magnitude(), ac.im.atan2(ac.re).to_degrees())),
             },
-            original_waveform: waveform.clone(),
+            accumulated_waveform: None,
             original_dc: dc,
             power_tone: None,
             waveform,
@@ -214,8 +217,7 @@ impl IndependentSource {
                 self.name
             )));
         }
-        self.terminals.truncate(2);
-        self.terminals.push(port.internal);
+        self.terminals[2] = port.internal;
         self.power_tone = port.power_function.then(|| {
             (
                 // vsrctemp.c: sqrt(VSRCportPower * 4.0 * VSRCportZ0).
@@ -225,6 +227,12 @@ impl IndependentSource {
         });
         self.port = Some(port);
         Ok(self)
+    }
+
+    fn effective_waveform(&self) -> &Waveform {
+        self.accumulated_waveform
+            .as_deref()
+            .unwrap_or(&self.waveform)
     }
 
     /// The terminals of the ideal source: `[positive, negative]`, or
@@ -282,7 +290,9 @@ impl Device for IndependentSource {
             return Ok(None);
         }
         let value = match time {
-            Some((t, f)) => self.waveform.value_at_timed(t, f.limit, &f.timing)?,
+            Some((t, f)) => self
+                .effective_waveform()
+                .value_at_timed(t, f.limit, &f.timing)?,
             None => self.dc,
         };
         Ok(Some(value * self.multiplier))
@@ -401,7 +411,7 @@ impl Device for IndependentSource {
         if self.voltage { 'v' } else { 'i' }
     }
     fn terminals(&self) -> &[NodeId] {
-        &self.terminals
+        &self.terminals[..if self.port.is_some() { 3 } else { 2 }]
     }
     fn branch_currents(&self) -> usize {
         usize::from(self.voltage)
@@ -419,15 +429,16 @@ impl Device for IndependentSource {
             return Ok(None);
         }
         self.dc = self.original_dc;
-        self.waveform = self.original_waveform.clone();
+        self.accumulated_waveform = None;
         if let Some(tone) = self.power_tone {
             let (baseline, mut tones) = match previous {
                 Waveform::PortSeries { baseline, tones } => (baseline.clone(), tones.clone()),
                 other => (Box::new(other.clone()), Vec::new()),
             };
             tones.push(tone);
-            self.waveform = Waveform::PortSeries { baseline, tones };
-            self.waveform.validate()?;
+            let accumulated = Waveform::PortSeries { baseline, tones };
+            accumulated.validate()?;
+            self.accumulated_waveform = Some(Box::new(accumulated));
             if !self.sensitivity.dc_given {
                 self.dc = previous_dc + tone.0;
             }
@@ -435,7 +446,7 @@ impl Device for IndependentSource {
                 return Err(SpiceError::circuit("nonfinite PORT DC accumulation"));
             }
         }
-        Ok(Some((self.waveform.clone(), self.dc)))
+        Ok(Some((self.effective_waveform().clone(), self.dc)))
     }
     fn rf_port(&self) -> Option<&RfPort> {
         self.port.as_ref()
@@ -468,10 +479,11 @@ impl Device for IndependentSource {
                     *context.voltage_source_value + amplitude * (time * two_pi_frequency).cos()
                 }
                 _ => match context.forcing {
-                    Some(forcing) => {
-                        self.waveform
-                            .value_at_timed(time, forcing.limit, &forcing.timing)?
-                    }
+                    Some(forcing) => self.effective_waveform().value_at_timed(
+                        time,
+                        forcing.limit,
+                        &forcing.timing,
+                    )?,
                     // DC without a given value: the function at time 0,
                     // which the factory stored as `dc`.
                     None if dc_mode => self.dc,
@@ -540,7 +552,7 @@ impl Device for IndependentSource {
             rows,
             dc: self.dc,
             ac: self.ac,
-            waveform: self.waveform.clone(),
+            waveform: self.effective_waveform().clone(),
         });
         Ok(())
     }
@@ -584,5 +596,47 @@ impl Device for IndependentSource {
             }
         }
         context.system.a.add(branch, branch, 1.)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_accumulation_rebuilds_from_predecessor_not_previous_result() {
+        let original = Waveform::Pwl(vec![(0., 1.), (1., 2.)]);
+        let mut source = IndependentSource::new(
+            "v1",
+            [NodeId::new(1), NodeId::GROUND],
+            true,
+            0.,
+            Complex::ZERO,
+            original.clone(),
+        )
+        .unwrap()
+        .with_power_tone(Some((2., 3.)));
+        let predecessor = Waveform::Constant(4.);
+        let expected = Waveform::PortSeries {
+            baseline: Box::new(predecessor.clone()),
+            tones: vec![(2., 3.)],
+        };
+        for _ in 0..2 {
+            let (actual, dc) = source
+                .bind_voltage_predecessor(&predecessor, 4.)
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(dc, 0.);
+            assert_eq!(source.waveform, original);
+        }
+        source.power_tone = None;
+        let (actual, dc) = source
+            .bind_voltage_predecessor(&predecessor, 4.)
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual, original);
+        assert_eq!(dc, 0.);
+        assert!(source.accumulated_waveform.is_none());
     }
 }

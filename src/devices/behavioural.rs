@@ -717,23 +717,24 @@ pub(crate) fn instantiate(
         ));
     };
     let program = Program::compile(&tree.root)?;
-    let mut staged = nodes.clone();
-    let positive = staged.intern(&instance.nodes[0]);
-    let negative = staged.intern(&instance.nodes[1]);
+    let mark = nodes.len();
+    let positive = nodes.intern(&instance.nodes[0]);
+    let negative = nodes.intern(&instance.nodes[1]);
     if output == BehaviouralOutput::Voltage && positive == negative {
         // ASRCsetup: "instance %s is a shorted ASRC".
+        nodes.truncate(mark);
         return Err(unsupported(
             location,
             format!("instance {} is a shorted ASRC", instance.name),
         ));
     }
     let mut terminals = vec![positive, negative];
-    let mut variables = Vec::new();
+    let mut variables = Vec::with_capacity(program.quantities().len());
     let mut controls = Vec::new();
     for quantity in program.quantities() {
         match quantity {
             Quantity::Node(name) => {
-                let node = staged.intern(name);
+                let node = nodes.intern(name);
                 if !terminals.contains(&node) {
                     terminals.push(node);
                 }
@@ -748,7 +749,6 @@ pub(crate) fn instantiate(
             }
         }
     }
-    *nodes = staged;
     Ok(Box::new(Behavioural {
         name: instance.name.clone(),
         designator: instance.designator,
@@ -759,4 +759,34 @@ pub(crate) fn instantiate(
         program,
         scale,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+
+    #[test]
+    fn failed_behavioural_binding_preserves_existing_nodes() {
+        let mut nodes = NodeTable::new();
+        nodes.intern("present");
+        let before = nodes.nodes().to_vec();
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("behavioural.cir"),
+                "title\nb1 fresh fresh v=v(sense)\nb2 fresh 0 v=v(sense)+i(vx)\n.end\n",
+            ))
+            .unwrap();
+        assert!(instantiate(&deck.devices[0], &mut nodes).is_err());
+        assert_eq!(nodes.nodes(), before);
+        let device = instantiate(&deck.devices[1], &mut nodes).unwrap();
+        assert_eq!(
+            device.terminals(),
+            &[NodeId::new(2), NodeId::GROUND, NodeId::new(3)]
+        );
+        assert_eq!(device.controlling_sources()[0].name, "vx");
+        assert_eq!(nodes.get("sense"), Some(NodeId::new(3)));
+        assert_eq!(nodes.get("vx"), None);
+    }
 }
