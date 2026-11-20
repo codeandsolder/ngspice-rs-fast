@@ -328,20 +328,16 @@ impl Limiter {
     /// `DEVfetlim` of a gate voltage `raw` against `previous` and threshold
     /// `von`. As in C, this does not make the load nonconvergent; the
     /// device's convergence test catches a limited step.
-    pub fn fet_gate(&mut self, raw: Real, previous: Real, von: Real) -> Real {
-        self.changed(raw, fetlim(raw, previous, von))
+    #[must_use]
+    pub fn fet_gate(&self, raw: Real, previous: Real, von: Real) -> Real {
+        fetlim(raw, previous, von)
     }
 
     /// `DEVlimvds` of a drain-source voltage `raw` against `previous` (not
     /// itself nonconvergent, as in C).
-    pub fn drain_source(&mut self, raw: Real, previous: Real) -> Real {
-        self.changed(raw, limvds(raw, previous))
-    }
-
-    const fn changed(&mut self, _raw: Real, value: Real) -> Real {
-        // C flags only `DEVpnjlim` steps (`Check`) and leaves FET limiting to
-        // the device convergence tests (`mos1conv.c`).
-        value
+    #[must_use]
+    pub fn drain_source(&self, raw: Real, previous: Real) -> Real {
+        limvds(raw, previous)
     }
 
     /// Whether the load is nonconvergent so far.

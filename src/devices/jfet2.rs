@@ -430,17 +430,14 @@ impl Model {
         // Drain current and derivatives.
         let vdst = vgs - vgd;
         // Rate-dependent threshold modulation.
-        let (h, vgdtrap, vgstrap) = match memory {
-            Some(memory) => {
-                let h = relaxation(self.taug, memory.step);
-                (
-                    h,
-                    h * memory.vgdtrap + (1. - h) * vgd,
-                    h * memory.vgstrap + (1. - h) * vgs,
-                )
-            }
-            None => (0., vgd, vgs),
-        };
+        let (h, vgdtrap, vgstrap) = memory.map_or((0., vgd, vgs), |memory| {
+            let h = relaxation(self.taug, memory.step);
+            (
+                h,
+                h * memory.vgdtrap + (1. - h) * vgd,
+                h * memory.vgstrap + (1. - h) * vgs,
+            )
+        });
         let (lfg, lfg1, lfg2) = (self.lfgam, self.lfg1, self.lfg2);
         let (hfg, hfg1, hfg2) = (self.hfgam, self.hfg1, self.hfg2);
         let (hfe, hfe1, hfe2) = (self.hfeta, self.hfe1, self.hfe2);
@@ -524,18 +521,18 @@ impl Model {
 
         // Thermal reduction of drain current.
         let delta = op.delta;
-        let (h, pave, powr_before) = match memory {
-            Some(memory) => {
+        let (h, pave, powr_before) = memory.map_or_else(
+            || {
+                // `POWR_NOW = POWR_BEFORE = pAverage`.
+                let pave = vdst * idrain;
+                (0., pave, pave)
+            },
+            |memory| {
                 let h = relaxation(self.taud, memory.step);
                 let pave = h * memory.powr + (1. - h) * vdst * idrain;
                 (h, pave, memory.powr)
-            }
-            // `POWR_NOW = POWR_BEFORE = pAverage`.
-            None => {
-                let pave = vdst * idrain;
-                (0., pave, pave)
-            }
-        };
+            },
+        );
         let pfac = 1. + pave * delta;
         idrain /= pfac;
         let arg = (h * delta * powr_before + 1.) / pfac / pfac;

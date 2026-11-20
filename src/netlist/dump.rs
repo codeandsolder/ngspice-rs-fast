@@ -269,7 +269,7 @@ impl Ctx<'_> {
         )
     }
 
-    fn span(&self, span: &SourceSpan) -> String {
+    fn span(span: &SourceSpan) -> String {
         if span.start.line == span.end.line {
             format!(
                 "{}:{}..{}",
@@ -565,7 +565,7 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
                 indent + 2,
                 format!("argument-expression index={}", argument.index),
             );
-            write_expression(ctx, out, indent + 3, &argument.expression);
+            write_expression(out, indent + 3, &argument.expression);
         }
     }
     section(out, indent, "includes", scope.includes.len());
@@ -613,10 +613,10 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
                 format!(
                     "assignment [{m}] name={} name_span={}",
                     quote(&assignment.name),
-                    ctx.span(&assignment.name_span)
+                    Ctx::span(&assignment.name_span)
                 ),
             );
-            write_expression(ctx, out, indent + 3, &assignment.expression);
+            write_expression(out, indent + 3, &assignment.expression);
         }
     }
     // Only decks with `.func` cards get the section, so other snapshots keep
@@ -627,14 +627,14 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
             let parameters: Vec<String> = card
                 .parameters
                 .iter()
-                .map(|p| format!("{}@{}", quote(&p.name), ctx.span(&p.span)))
+                .map(|p| format!("{}@{}", quote(&p.name), Ctx::span(&p.span)))
                 .collect();
             out.line(
                 indent + 1,
                 format!(
                     "func [{n}] name={} name_span={} parameters=[{}]{} @{}",
                     quote(&card.name),
-                    ctx.span(&card.name_span),
+                    Ctx::span(&card.name_span),
                     parameters.join(", "),
                     // Printed only for the `.param` spelling, so `.func`
                     // snapshots keep their shape.
@@ -646,7 +646,7 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
                     ctx.loc(&card.location)
                 ),
             );
-            write_expression(ctx, out, indent + 2, &card.body);
+            write_expression(out, indent + 2, &card.body);
         }
     }
     section(out, indent, "options", scope.options.len());
@@ -669,7 +669,7 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
                 ),
             );
             if let Some(expression) = &setting.expression {
-                write_expression(ctx, out, indent + 3, expression);
+                write_expression(out, indent + 3, expression);
             }
         }
     }
@@ -730,7 +730,7 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
                             indent + 3,
                             format!("value expression @{}", ctx.loc(&hint.value_location)),
                         );
-                        write_expression(ctx, out, indent + 4, expression);
+                        write_expression(out, indent + 4, expression);
                     }
                 }
             }
@@ -835,7 +835,7 @@ fn write_parameters(
         );
         match &parameter.kind {
             ParameterKind::Expression(expression) => {
-                write_expression(ctx, out, indent + 2, expression);
+                write_expression(out, indent + 2, expression);
             }
             ParameterKind::Behavioural(expression) => {
                 out.line(
@@ -848,10 +848,10 @@ fn write_parameters(
                             ""
                         },
                         quote(&expression.text),
-                        ctx.span(&expression.span)
+                        Ctx::span(&expression.span)
                     ),
                 );
-                write_bexpr(ctx, out, indent + 3, &expression.root);
+                write_bexpr(out, indent + 3, &expression.root);
             }
             ParameterKind::InitialConditions(components) => {
                 for component in components {
@@ -927,7 +927,7 @@ fn write_parameters(
     }
 }
 
-fn write_expression(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expression: &ParameterExpression) {
+fn write_expression(out: &mut Out, indent: usize, expression: &ParameterExpression) {
     out.line(
         indent,
         format!(
@@ -939,14 +939,14 @@ fn write_expression(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expression: &Pa
                 ""
             },
             quote(&expression.text),
-            ctx.span(&expression.span)
+            Ctx::span(&expression.span)
         ),
     );
-    write_expr(ctx, out, indent + 1, &expression.root);
+    write_expr(out, indent + 1, &expression.root);
 }
 
-fn write_expr(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expr: &Expr) {
-    let span = ctx.span(&expr.span);
+fn write_expr(out: &mut Out, indent: usize, expr: &Expr) {
+    let span = Ctx::span(&expr.span);
     match &expr.kind {
         ExprKind::Number { value, spelling } => out.line(
             indent,
@@ -965,7 +965,7 @@ fn write_expr(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expr: &Expr) {
                 UnaryOp::Minus => "minus",
             };
             out.line(indent, format!("unary {op} span={span}"));
-            write_expr(ctx, out, indent + 1, operand);
+            write_expr(out, indent + 1, operand);
         }
         ExprKind::Binary { op, lhs, rhs } => {
             let op = match op {
@@ -976,8 +976,8 @@ fn write_expr(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expr: &Expr) {
                 BinaryOp::Pow => "pow",
             };
             out.line(indent, format!("binary {op} span={span}"));
-            write_expr(ctx, out, indent + 1, lhs);
-            write_expr(ctx, out, indent + 1, rhs);
+            write_expr(out, indent + 1, lhs);
+            write_expr(out, indent + 1, rhs);
         }
         ExprKind::Call {
             function,
@@ -985,24 +985,24 @@ fn write_expr(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expr: &Expr) {
         } => {
             out.line(indent, format!("call {} span={span}", function.name()));
             for argument in arguments {
-                write_expr(ctx, out, indent + 1, argument);
+                write_expr(out, indent + 1, argument);
             }
         }
         ExprKind::Group(inner) => {
             out.line(indent, format!("group span={span}"));
-            write_expr(ctx, out, indent + 1, inner);
+            write_expr(out, indent + 1, inner);
         }
         ExprKind::UserCall { name, arguments } => {
             out.line(indent, format!("user-call {} span={span}", quote(name)));
             for argument in arguments {
-                write_expr(ctx, out, indent + 1, argument);
+                write_expr(out, indent + 1, argument);
             }
         }
     }
 }
 
-fn write_bexpr(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expr: &BExpr) {
-    let span = ctx.span(&expr.span);
+fn write_bexpr(out: &mut Out, indent: usize, expr: &BExpr) {
+    let span = Ctx::span(&expr.span);
     match &expr.kind {
         BExprKind::Number { value, spelling } => out.line(
             indent,
@@ -1033,12 +1033,12 @@ fn write_bexpr(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expr: &BExpr) {
                 BUnaryOp::Not => "not",
             };
             out.line(indent, format!("unary {op} span={span}"));
-            write_bexpr(ctx, out, indent + 1, operand);
+            write_bexpr(out, indent + 1, operand);
         }
         BExprKind::Binary { op, lhs, rhs } => {
             out.line(indent, format!("binary {} span={span}", quote(op.symbol())));
-            write_bexpr(ctx, out, indent + 1, lhs);
-            write_bexpr(ctx, out, indent + 1, rhs);
+            write_bexpr(out, indent + 1, lhs);
+            write_bexpr(out, indent + 1, rhs);
         }
         BExprKind::Ternary {
             condition,
@@ -1046,33 +1046,33 @@ fn write_bexpr(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expr: &BExpr) {
             otherwise,
         } => {
             out.line(indent, format!("ternary span={span}"));
-            write_bexpr(ctx, out, indent + 1, condition);
-            write_bexpr(ctx, out, indent + 1, then);
-            write_bexpr(ctx, out, indent + 1, otherwise);
+            write_bexpr(out, indent + 1, condition);
+            write_bexpr(out, indent + 1, then);
+            write_bexpr(out, indent + 1, otherwise);
         }
         BExprKind::Call { name, arguments } => {
             out.line(indent, format!("call {} span={span}", quote(name)));
             for argument in arguments {
-                write_bexpr(ctx, out, indent + 1, argument);
+                write_bexpr(out, indent + 1, argument);
             }
         }
         BExprKind::Group(inner) => {
             out.line(indent, format!("group span={span}"));
-            write_bexpr(ctx, out, indent + 1, inner);
+            write_bexpr(out, indent + 1, inner);
         }
         BExprKind::Value(value) => {
             out.line(indent, format!("value span={span}"));
-            write_expression(ctx, out, indent + 1, value);
+            write_expression(out, indent + 1, value);
         }
         BExprKind::Table(table) => {
             out.line(
                 indent,
                 format!("table domain={} span={span}", real(table.domain)),
             );
-            write_bexpr(ctx, out, indent + 1, &table.input);
+            write_bexpr(out, indent + 1, &table.input);
             for (x, y) in &table.points {
-                write_bexpr(ctx, out, indent + 1, x);
-                write_bexpr(ctx, out, indent + 1, y);
+                write_bexpr(out, indent + 1, x);
+                write_bexpr(out, indent + 1, y);
             }
         }
     }

@@ -734,10 +734,9 @@ impl MosLevel for Level2 {
                 }
             }
         }
-        let (mut dldvgs, mut dldvds, mut dldvbs) = match dldsat {
-            Some(dldsat) => (dldsat * dsdvgs, -xlamda + dldsat, dldsat * dsdvbs),
-            None => (0.0, 0.0, 0.0),
-        };
+        let (mut dldvgs, mut dldvds, mut dldvbs) = dldsat.map_or((0.0, 0.0, 0.0), |dldsat| {
+            (dldsat * dsdvgs, -xlamda + dldsat, dldsat * dsdvbs)
+        });
         // Limit channel shortening at punch-through.
         let mut xwb = xd * sbiarg;
         let xld = length - xwb;

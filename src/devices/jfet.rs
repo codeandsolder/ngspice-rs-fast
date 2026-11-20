@@ -482,10 +482,10 @@ impl Jfet {
         let vt = temp * K_OVER_Q;
         let vtn = vt * model.n;
         let ratio1 = temp / tnom - 1.;
-        let saturation = match model.xti {
-            Some(xti) => model.is * (ratio1 * model.eg / vtn).exp() * (ratio1 + 1.).powf(xti),
-            None => model.is * (ratio1 * model.eg / vtn).exp(),
-        };
+        let saturation = model.xti.map_or_else(
+            || model.is * (ratio1 * model.eg / vtn).exp(),
+            |xti| model.is * (ratio1 * model.eg / vtn).exp() * (ratio1 + 1.).powf(xti),
+        );
         let GateJunction {
             pb,
             cjfact,
@@ -499,10 +499,10 @@ impl Jfet {
             Some(vtotc) => model.vto + vtotc * (temp - tnom),
             None => model.vto - model.tcv * (temp - tnom),
         };
-        let beta = match model.betatce {
-            Some(betatce) => model.beta * 1.01_f64.powf(betatce * (temp - tnom)),
-            None => model.beta * (temp / tnom).powf(model.bex),
-        };
+        let beta = model.betatce.map_or_else(
+            || model.beta * (temp / tnom).powf(model.bex),
+            |betatce| model.beta * 1.01_f64.powf(betatce * (temp - tnom)),
+        );
         let area = instance.area;
         let [gdpr, gspr] = series_conductances(area, model.rd, model.rs);
         let operating = Operating {

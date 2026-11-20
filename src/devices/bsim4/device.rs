@@ -1071,7 +1071,6 @@ impl Bsim4 {
     /// `b4ask.c` at an operating point, on the instance and state the
     /// `MODEINITSMSIG` load leaves.
     fn ask(
-        &self,
         keyword: &str,
         prepared: &Prepared,
         h: &Instance,
@@ -1438,7 +1437,7 @@ impl Device for Bsim4 {
         let prepared = self.ensure(context.temperature, context.nominal_temperature)?;
         let s0 = self.state_at(&prepared, voltage, context.gmin)?;
         let (h, s0) = self.small_signal_point(&prepared, s0, voltage, context.gmin)?;
-        Ok(self.ask(keyword, &prepared, &h, &s0))
+        Ok(Self::ask(keyword, &prepared, &h, &s0))
     }
 
     /// `b4acld.c` reassembled at every frequency: its `x* = cap * omega`

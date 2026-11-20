@@ -381,12 +381,7 @@ impl Bsim3 {
         }
     }
 
-    fn evaluate_at(
-        &self,
-        cached: &Cached,
-        bias: dc::Bias,
-        gmin: Real,
-    ) -> SpiceResult<dc::DcEvaluation> {
+    fn evaluate_at(cached: &Cached, bias: dc::Bias, gmin: Real) -> SpiceResult<dc::DcEvaluation> {
         dc::DcModel {
             model: &cached.defaults,
             temperature: &cached.temperature_model,
@@ -663,7 +658,7 @@ impl Device for Bsim3 {
                     .map_or(1., crate::maths::integrator::Coefficients::predictor_ratio)
             });
         let bias = dc::Bias { vbs, vgs, vds };
-        let e = self.evaluate_at(&cached, bias, context.gmin)?;
+        let e = Self::evaluate_at(&cached, bias, context.gmin)?;
         let report = match start {
             Start::Junction => true,
             Start::Limited => check,
@@ -849,7 +844,7 @@ impl Device for Bsim3 {
             vgs: pol * (voltage(g) - voltage(sp)),
             vds: pol * (voltage(dp) - voltage(sp)),
         };
-        let e = self.evaluate_at(&cached, bias, context.gmin)?;
+        let e = Self::evaluate_at(&cached, bias, context.gmin)?;
         let m = cached.setup.multiplier;
         if let Some(value) = e.ask(keyword) {
             return Ok(Some(value * m));
@@ -910,7 +905,7 @@ impl Device for Bsim3 {
             vgs: pol * (voltage(g) - voltage(sp)),
             vds: pol * (voltage(dp) - voltage(sp)),
         };
-        let e = self.evaluate_at(&cached, point, model.gmin)?;
+        let e = Self::evaluate_at(&cached, point, model.gmin)?;
         let c = charges::ChargeModel {
             model: &cached.defaults,
             temperature: &cached.temperature_model,
@@ -1039,7 +1034,7 @@ impl Device for Bsim3 {
             vgs: pol * (voltage(g) - voltage(sp)),
             vds: pol * (voltage(dp) - voltage(sp)),
         };
-        let e = self.evaluate_at(&cached, bias, model.gmin)?;
+        let e = Self::evaluate_at(&cached, bias, model.gmin)?;
         let charge = charges::ChargeModel {
             model: &cached.defaults,
             temperature: &cached.temperature_model,
