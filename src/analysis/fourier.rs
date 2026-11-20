@@ -85,6 +85,7 @@
 use crate::netlist::ast::{FourierCard, MAX_HARMONICS, VectorRequest};
 use crate::primitives::{AnalysisKind, Real, SpiceError, SpiceResult};
 
+use super::ordered_samples::{self, AxisError, SampleError, column_names};
 use crate::analysis::results::Plot;
 use crate::analysis::selection::{self, Column};
 
@@ -358,46 +359,20 @@ struct TimeAxis {
 
 impl TimeAxis {
     fn of(plot: &Plot, card: &FourierCard) -> SpiceResult<Self> {
-        let Some(column) = plot.variable_index("time") else {
+        let values = ordered_samples::ordered_values(plot, "time").map_err(|error| match error {
+            AxisError::MissingColumn => unsupported(card, format!(
+                ".four: the {} plot carries no 'time' axis vector; it carries {}", plot.plotname, column_names(plot))),
+            AxisError::MissingSample(index) => nonfinite("time", format!("point {index} has no time value")),
+            AxisError::Nonfinite(index) => nonfinite("time", format!("point {index} is not finite")),
+            AxisError::Descending(index) => unsupported(card, format!(
+                ".four: the time axis is not non-decreasing (it descends at point {index}); a Fourier transform needs an ordered axis")),
+        })?;
+        if values.len() < 2 {
             return Err(unsupported(
                 card,
                 format!(
-                    ".four: the {} plot carries no 'time' axis vector; it carries {}",
-                    plot.plotname,
-                    column_names(plot)
-                ),
-            ));
-        };
-        if plot.points.len() < 2 {
-            return Err(unsupported(
-                card,
-                format!(
-                    ".four: a Fourier transform needs at least 2 data points (the plot has {}); C \
-                     reports the same refusal",
-                    plot.points.len()
-                ),
-            ));
-        }
-        let mut values = Vec::with_capacity(plot.points.len());
-        for (index, point) in plot.points.iter().enumerate() {
-            let Some(value) = point.get(column) else {
-                return Err(nonfinite(
-                    "time",
-                    format!("point {index} has no time value"),
-                ));
-            };
-            if !value.is_finite() {
-                return Err(nonfinite("time", format!("point {index} is not finite")));
-            }
-            values.push(value.re);
-        }
-        if let Some(index) = values.windows(2).position(|window| window[1] < window[0]) {
-            return Err(unsupported(
-                card,
-                format!(
-                    ".four: the time axis is not non-decreasing (it descends at point {}); a \
-                     Fourier transform needs an ordered axis",
-                    index + 1
+                    ".four: a Fourier transform needs at least 2 data points (the plot has {}); C reports the same refusal",
+                    values.len()
                 ),
             ));
         }
@@ -599,45 +574,14 @@ fn evaluate(
 /// bracket is interpolated from the bracketing samples, which may lie just
 /// outside the window.
 fn sample(axis: &TimeAxis, trace: &Trace<'_>, x: Real, card: &FourierCard) -> SpiceResult<Real> {
-    let index = axis.values.partition_point(|value| *value < x);
-    if axis.values[index] == x {
-        let left = trace.value(index)?;
-        if index + 1 < axis.values.len()
-            && axis.values[index + 1] == x
-            && trace.value(index + 1)? != left
-        {
-            return Err(unsupported(
-                card,
-                format!(
-                    ".four {}: the vector is discontinuous at time = {}: the plot has two values \
-                     at that time, so the resampling grid cannot read it there",
-                    trace.name(),
-                    crate::primitives::format_spice_number(x)
-                ),
-            ));
-        }
-        return Ok(left);
-    }
-    // `x` is strictly inside the bracket `index - 1 .. index`: `x >= from` is at
-    // or after the first sample, so the bracket exists and has positive width
-    // (a repeated value would have moved `index` back).
-    let x0 = axis.values[index - 1];
-    let y0 = trace.value(index - 1)?;
-    let x1 = axis.values[index];
-    let y1 = trace.value(index)?;
-    Ok(y0 + (y1 - y0) * (x - x0) / (x1 - x0))
-}
-
-/// The plot's column names, for diagnostics.
-fn column_names(plot: &Plot) -> String {
-    if plot.variables.is_empty() {
-        return "no vectors".to_owned();
-    }
-    plot.variables
-        .iter()
-        .map(|variable| variable.name.as_str())
-        .collect::<Vec<_>>()
-        .join(" ")
+    ordered_samples::linear_sample(&axis.values, x, |i| trace.value(i)).map_err(|error| match error {
+        SampleError::Discontinuous => unsupported(card, format!(
+            ".four {}: the vector is discontinuous at time = {}: the plot has multiple values at that time, so the resampling grid cannot read it there",
+            trace.name(), crate::primitives::format_spice_number(x))),
+        SampleError::OutOfRange => unsupported(card, format!(".four {}: resampling coordinate is outside the time axis", trace.name())),
+        SampleError::Nonfinite => nonfinite(trace.name(), "nonfinite interpolated value".into()),
+        SampleError::Operand(error) => error,
+    })
 }
 
 /// C's `fourier()` front-end variables. `nfreqs` includes the DC row.
@@ -1295,6 +1239,17 @@ mod tests {
         rows.insert(at + 1, rows[at]);
         let result = analyze(&tran(&rows), &[out()], 9).remove(0);
         assert!((amplitude(&result, 1) - 1.0).abs() < 1e-9, "{result:?}");
+    }
+
+    #[test]
+    fn closed_grid_rejects_a_jump_in_any_duplicate_sample() {
+        let mut rows = on_grid(sine(1., 1, 0.));
+        let index = DIVISIONS / 2;
+        let (time, value) = rows[index];
+        rows.insert(index + 1, (time, value));
+        rows.insert(index + 2, (time, value + 1.));
+        let error = failed(&tran(&rows), &[out()], 9);
+        assert!(error.to_string().contains("discontinuous"));
     }
 
     #[test]

@@ -44,6 +44,7 @@ mod linear;
 pub mod measure;
 pub mod newton;
 pub mod noise;
+mod ordered_samples;
 mod pz;
 pub mod rawfile;
 pub mod results;
