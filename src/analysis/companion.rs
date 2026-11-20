@@ -100,6 +100,7 @@ use crate::primitives::{Complex, Real, SpiceError, SpiceResult, almost_equal_ulp
 
 use crate::analysis::initial::{self, Hints, VoltageTolerance};
 use crate::analysis::linear::{number, plot, unsupported};
+use crate::analysis::newton::{CircuitLoad, CircuitNewton};
 use crate::analysis::{AnalysisContext, AnalysisRequest, Plot, PointSink};
 
 /// C's *effective* default `CKTtranMaxIter` (`.option itl4`): Newton
@@ -198,7 +199,7 @@ struct Settings {
 }
 
 impl Settings {
-    fn from_request(request: &AnalysisRequest) -> SpiceResult<Self> {
+    fn time_bounds(request: &AnalysisRequest) -> SpiceResult<[Real; 4]> {
         let mut positional = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for argument in &request.arguments {
@@ -220,14 +221,14 @@ impl Settings {
         if !(2..=4).contains(&positional.len()) {
             return Err(unsupported(".tran requires tstep tstop [tstart [tmax]]"));
         }
-        let step = number(positional.first().copied(), "step time")?;
-        let stop = number(positional.get(1).copied(), "stop time")?;
+        let step_size = number(positional.first().copied(), "step time")?;
+        let end_time = number(positional.get(1).copied(), "stop time")?;
         let start = number(
             Some(positional.get(2).copied().unwrap_or("0")),
             "start time",
         )?;
         let tmax = number(Some(positional.get(3).copied().unwrap_or("0")), "tmax")?;
-        if step <= 0. || stop <= 0. || start < 0. || start >= stop || tmax < 0. {
+        if step_size <= 0. || end_time <= 0. || start < 0. || start >= end_time || tmax < 0. {
             return Err(unsupported(
                 "invalid transient time bounds (need tstep > 0, tstop > 0, 0 <= tstart < tstop, tmax >= 0)",
             ));
@@ -236,8 +237,13 @@ impl Settings {
         let max_step = if tmax > 0. {
             tmax
         } else {
-            step.min((stop - start) / 50.)
+            step_size.min((end_time - start) / 50.)
         };
+        Ok([step_size, end_time, start, max_step])
+    }
+
+    fn from_request(request: &AnalysisRequest) -> SpiceResult<Self> {
+        let [step_size, end_time, start, max_step] = Self::time_bounds(request)?;
         // cktsopt.c clamps maxord to 1..=6 with a warning; out-of-range or
         // non-integer values are explicit errors here.
         let max_order = match request.named("maxord") {
@@ -316,8 +322,8 @@ impl Settings {
                 .ok_or_else(|| unsupported(format!("xmu must be in [0, 0.5], not '{text}'")))?,
         };
         Ok(Self {
-            step,
-            stop,
+            step: step_size,
+            stop: end_time,
             start,
             max_step,
             method,
@@ -378,7 +384,7 @@ enum Trial {
 /// Time and order policy, independent of circuit loading or state acceptance.
 ///
 /// The source-hook breakpoint flag and the one-sided forcing flag are
-/// intentionally distinct: C retains CKTbreak across a rejected trial, but
+/// intentionally distinct: C retains `CKTbreak` across a rejected trial, but
 /// a shortened retry no longer lands on the original breakpoint.
 struct StepControl {
     time: Real,
@@ -404,6 +410,10 @@ impl StepControl {
         }
     }
 
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "match C breakpoint projection rounding without FMA"
+    )]
     fn prepare(
         &mut self,
         settings: &Settings,
@@ -483,7 +493,7 @@ impl StepControl {
         Ok(())
     }
 
-    fn accept(&mut self, next: Real) {
+    const fn accept(&mut self, next: Real) {
         self.first = false;
         self.delta = next;
     }
@@ -637,14 +647,7 @@ fn companion(
 
 impl Driver<'_> {
     fn run(mut self, mut sink: Option<&mut dyn PointSink>) -> SpiceResult<(Plot, TransientStats)> {
-        let Settings {
-            stop,
-            start,
-            method,
-            max_order,
-            max_steps,
-            ..
-        } = self.settings;
+        let Settings { stop, start, .. } = self.settings;
         // traninit.c: CKTdelmin; dctran.c (XSPICE build): CKTminBreak.
         let min_step = self.settings.min_step();
         let mut breaks = BreakTable::new(stop, 10.0 * min_step);
@@ -730,120 +733,146 @@ impl Driver<'_> {
                 break;
             }
             cursor.prepare(&self.settings, &mut breaks, self.uic)?;
-            loop {
-                if self.stats.accepted + self.stats.rejected >= max_steps {
-                    return Err(failure(format!(
-                        "work limit of {max_steps} accepted + rejected steps reached at t = {:e}",
-                        cursor.time
-                    )));
-                }
-                let limit = cursor.begin_trial();
-                let coefficients =
-                    self.steps
-                        .trial(method, cursor.order, cursor.delta, self.settings.xmu)?;
-                match self.solve_trial(cursor.time, &coefficients, limit, &x, cursor.first)? {
-                    Trial::NotConverged { last } => {
-                        x = last;
-                        self.stats.rejected += 1;
-                        cursor.order = 1;
-                        cursor.reject(cursor.delta / 8., min_step)?;
-                    }
-                    Trial::Converged { x: x_new, state } => {
-                        let mut accept = cursor.first;
-                        let mut next = cursor.delta;
-                        if !cursor.first {
-                            // CKTtrunc: newdelta = MIN(2 * delta, device bounds).
-                            next = (2. * cursor.delta).min(self.truncation_limit(
-                                &coefficients,
-                                &state,
-                                &x_new,
-                                cursor.time,
-                            )?);
-                            if next > 0.9 * cursor.delta {
-                                accept = true;
-                                // Don't raise the order for backward Euler.
-                                // dctran.c never probes or raises beyond
-                                // order 2, whatever maxord (3..=6) allows.
-                                if cursor.order == 1 && max_order > 1 {
-                                    let probe = self.steps.trial(
-                                        method,
-                                        2,
-                                        cursor.delta,
-                                        self.settings.xmu,
-                                    )?;
-                                    cursor.order = 2;
-                                    next = (2. * cursor.delta).min(self.truncation_limit(
-                                        &probe,
-                                        &state,
-                                        &x_new,
-                                        cursor.time,
-                                    )?);
-                                    if next <= 1.05 * cursor.delta {
-                                        cursor.order = 1;
-                                    }
-                                }
-                            }
-                        }
-                        if accept {
-                            observed = if cursor.time >= start {
-                                self.circuit.observe_real(
-                                    &LoadRequest {
-                                        mode: AnalysisMode::Transient {
-                                            time: cursor.time,
-                                            dt: coefficients.dt(),
-                                        },
-                                        solution: &x_new,
-                                        model_context: &self.model_context,
-                                        integration: Some(&coefficients),
-                                        history: &self.history,
-                                        forcing: Some(Forcing {
-                                            limit,
-                                            timing: self.timing,
-                                        }),
-                                    },
-                                    &[],
-                                    Some((
-                                        cursor.time,
-                                        Forcing {
-                                            limit,
-                                            timing: self.timing,
-                                        },
-                                    )),
-                                    Some(&state),
-                                )?
-                            } else {
-                                Vec::new()
-                            };
-                            // CKTaccept: TRAaccept's history update and
-                            // breakpoint requests (set at nextTime below).
-                            let acceptance = self.delay_acceptance(coefficients.dt(), false);
-                            device_breaks = self.circuit.accept_transient_point(
-                                &x_new,
-                                cursor.time,
-                                &mut self.history,
-                                state,
-                                &acceptance,
-                            )?;
-                            self.steps.accept(&coefficients);
-                            self.record_step(cursor.delta, cursor.at_break);
-                            x = x_new;
-                            cursor.accept(next);
-                            break;
-                        }
-                        // Truncation error too large: redo with the bound,
-                        // starting from this trial's solution (CKTrhsOld).
-                        x = x_new;
-                        self.stats.rejected += 1;
-                        cursor.reject(next, min_step)?;
-                    }
-                }
-            }
+            (observed, device_breaks) = self.advance(&mut cursor, &mut x)?;
         }
         // C keeps the final load's instance fields, not values re-evaluated
         // at the final solution (the load can lag that solution by an iterate).
         // Publish only after the entire run and every sink write succeeded.
         self.circuit.record_final_transient_state(&self.history)?;
         Ok((plot, self.stats))
+    }
+
+    /// Advance through rejected trials until the next accepted point.
+    fn advance(
+        &mut self,
+        cursor: &mut StepControl,
+        x: &mut Vector,
+    ) -> SpiceResult<(Vec<Complex>, Vec<Real>)> {
+        let min_step = self.settings.min_step();
+        loop {
+            if self.stats.accepted + self.stats.rejected >= self.settings.max_steps {
+                return Err(failure(format!(
+                    "work limit of {} accepted + rejected steps reached at t = {:e}",
+                    self.settings.max_steps, cursor.time
+                )));
+            }
+            let limit = cursor.begin_trial();
+            let coefficients = self.steps.trial(
+                self.settings.method,
+                cursor.order,
+                cursor.delta,
+                self.settings.xmu,
+            )?;
+            match self.solve_trial(cursor.time, &coefficients, limit, x, cursor.first)? {
+                Trial::NotConverged { last } => {
+                    *x = last;
+                    self.stats.rejected += 1;
+                    cursor.order = 1;
+                    cursor.reject(cursor.delta / 8., min_step)?;
+                }
+                Trial::Converged { x: x_new, state } => {
+                    let (accept, next) =
+                        self.trial_step_policy(cursor, &coefficients, &state, &x_new)?;
+                    if accept {
+                        let observed = if cursor.time >= self.settings.start {
+                            self.circuit.observe_real(
+                                &LoadRequest {
+                                    mode: AnalysisMode::Transient {
+                                        time: cursor.time,
+                                        dt: coefficients.dt(),
+                                    },
+                                    solution: &x_new,
+                                    model_context: &self.model_context,
+                                    integration: Some(&coefficients),
+                                    history: &self.history,
+                                    forcing: Some(Forcing {
+                                        limit,
+                                        timing: self.timing,
+                                    }),
+                                },
+                                &[],
+                                Some((
+                                    cursor.time,
+                                    Forcing {
+                                        limit,
+                                        timing: self.timing,
+                                    },
+                                )),
+                                Some(&state),
+                            )?
+                        } else {
+                            Vec::new()
+                        };
+                        // CKTaccept: TRAaccept's history update and
+                        // breakpoint requests (set at nextTime below).
+                        let acceptance = self.delay_acceptance(coefficients.dt(), false);
+                        let device_breaks = self.circuit.accept_transient_point(
+                            &x_new,
+                            cursor.time,
+                            &mut self.history,
+                            state,
+                            &acceptance,
+                        )?;
+                        self.steps.accept(&coefficients);
+                        self.record_step(cursor.delta, cursor.at_break);
+                        *x = x_new;
+                        cursor.accept(next);
+                        return Ok((observed, device_breaks));
+                    }
+                    // Truncation error too large: redo with the bound,
+                    // starting from this trial's solution (CKTrhsOld).
+                    *x = x_new;
+                    self.stats.rejected += 1;
+                    cursor.reject(next, min_step)?;
+                }
+            }
+        }
+    }
+
+    /// Choose acceptance and the next delta using the C truncation/order policy.
+    fn trial_step_policy(
+        &self,
+        cursor: &mut StepControl,
+        coefficients: &Coefficients,
+        state: &TrialState,
+        solution: &Vector,
+    ) -> SpiceResult<(bool, Real)> {
+        let mut accept = cursor.first;
+        let mut next = cursor.delta;
+        if !cursor.first {
+            // CKTtrunc: newdelta = MIN(2 * delta, device bounds).
+            next = (2. * cursor.delta).min(self.truncation_limit(
+                coefficients,
+                state,
+                solution,
+                cursor.time,
+            )?);
+            if next > 0.9 * cursor.delta {
+                accept = true;
+                // Don't raise the order for backward Euler.
+                // dctran.c never probes or raises beyond
+                // order 2, whatever maxord (3..=6) allows.
+                if cursor.order == 1 && self.settings.max_order > 1 {
+                    let probe = self.steps.trial(
+                        self.settings.method,
+                        2,
+                        cursor.delta,
+                        self.settings.xmu,
+                    )?;
+                    cursor.order = 2;
+                    next = (2. * cursor.delta).min(self.truncation_limit(
+                        &probe,
+                        state,
+                        solution,
+                        cursor.time,
+                    )?);
+                    if next <= 1.05 * cursor.delta {
+                        cursor.order = 1;
+                    }
+                }
+            }
+        }
+        Ok((accept, next))
     }
 
     fn record_step(&mut self, step: Real, on_breakpoint: bool) {
@@ -1049,7 +1078,6 @@ impl Driver<'_> {
         } else {
             crate::analysis::newton::PhasePolicy::Predicted
         };
-        use crate::analysis::newton::{CircuitLoad, CircuitNewton};
         let solved = CircuitNewton {
             circuit: self.circuit,
             context: &self.model_context,
