@@ -68,6 +68,7 @@ use crate::devices::limiting::{self, Limiter, Linearization};
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
+use crate::devices::nonlinear::charge::ChargeBranch;
 use crate::devices::nonlinear::thermal::{
     BOLTZMANN, CELSIUS_TO_KELVIN, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureCache,
     TemperatureKey, band_gap, potential_shift,
@@ -1362,27 +1363,6 @@ fn c_point(
     Ok(point)
 }
 
-/// The `NIintegrate` companion of the charge in `slot` with capacitance
-/// `cap`: `(geq, ccap)`, `ccap` stored in `slot + 1` (C `CKTstate0[q + 1]`).
-fn integrate(
-    context: &mut StampContext<'_>,
-    coefficients: &crate::maths::integrator::Coefficients,
-    charge: Real,
-    cap: Real,
-    slot: usize,
-) -> SpiceResult<(Real, Real)> {
-    crate::devices::nonlinear::junction_companion(
-        context,
-        coefficients,
-        crate::devices::nonlinear::JunctionPoint {
-            current: 0.,
-            conductance: 0.,
-            charge,
-            capacitance: cap,
-        },
-        slot,
-    )
-}
 impl Device for Bjt {
     /// `bjtsetup.c` without quasi-saturation (`RCO`, which the port rejects),
     /// so `collCX` is the collector prime; a three-terminal device's
@@ -1620,6 +1600,10 @@ impl Device for Bjt {
             let cbhat = cb + gpi * delvbe + gmu * delvbc;
             limiter.test_held(&context.states, &[(cc, cchat), (cb, cbhat)]);
         }
+        let be = ChargeBranch::new(slot::QBE, p.qbe, p.capbe);
+        let bc = ChargeBranch::new(slot::QBC, p.qbc, p.capbc);
+        let bx = ChargeBranch::new(slot::QBX, p.qbx, p.capbx);
+        let sub = ChargeBranch::new(slot::QSUB, p.qsub, p.capsub);
         let mut geqcb = 0.;
         let (mut gcsub, mut geqbx) = (0., 0.);
         let (cqsub, cqbx);
@@ -1635,28 +1619,29 @@ impl Device for Bjt {
             let initial = context.states.phase() == crate::devices::IterationPhase::Predict
                 && context.states.initial_transient();
             if initial {
-                context.states.patch_state1(slot::QBE, p.qbe)?;
-                context.states.patch_state1(slot::QBC, p.qbc)?;
-                context.states.patch_state1(slot::QBX, p.qbx)?;
-                context.states.patch_state1(slot::QSUB, p.qsub)?;
+                for branch in [be, bc, bx, sub] {
+                    branch.seed(&mut context.states)?;
+                }
             }
-            let (geq, cqbe) = integrate(context, coefficients, p.qbe, p.capbe, slot::QBE)?;
+            let be_comp = be.integrate(&mut context.states, coefficients)?;
             geqcb = p.geqcb * coefficients.ag()[0];
-            gpi += geq;
-            cb += cqbe;
-            let (geq, cqbc) = integrate(context, coefficients, p.qbc, p.capbc, slot::QBC)?;
-            gmu += geq;
-            cb += cqbc;
-            cc -= cqbc;
+            gpi += be_comp.conductance;
+            cb += be_comp.derivative;
+            let bc_comp = bc.integrate(&mut context.states, coefficients)?;
+            gmu += bc_comp.conductance;
+            cb += bc_comp.derivative;
+            cc -= bc_comp.derivative;
             if initial {
-                context.states.patch_state1(slot::QBE + 1, cqbe)?;
-                context.states.patch_state1(slot::QBC + 1, cqbc)?;
+                be.seed_derivative(&mut context.states, be_comp.derivative)?;
+                bc.seed_derivative(&mut context.states, bc_comp.derivative)?;
             }
-            (gcsub, cqsub) = integrate(context, coefficients, p.qsub, p.capsub, slot::QSUB)?;
-            (geqbx, cqbx) = integrate(context, coefficients, p.qbx, p.capbx, slot::QBX)?;
+            let sub_comp = sub.integrate(&mut context.states, coefficients)?;
+            (gcsub, cqsub) = (sub_comp.conductance, sub_comp.derivative);
+            let bx_comp = bx.integrate(&mut context.states, coefficients)?;
+            (geqbx, cqbx) = (bx_comp.conductance, bx_comp.derivative);
             if initial {
-                context.states.patch_state1(slot::QBX + 1, cqbx)?;
-                context.states.patch_state1(slot::QSUB + 1, cqsub)?;
+                bx.seed_derivative(&mut context.states, cqbx)?;
+                sub.seed_derivative(&mut context.states, cqsub)?;
             }
         } else {
             if context.mode.is_transient() {
@@ -1664,8 +1649,8 @@ impl Device for Bjt {
                     "BJT transient needs companion integration",
                 ));
             }
-            for charge in [slot::QBE, slot::QBC] {
-                context.states.set(charge + 1, 0.)?;
+            for branch in [be, bc] {
+                branch.zero_derivative(&mut context.states)?;
             }
             // C never writes `cqsub`/`cqbx` outside transient and
             // `MODEINITSMSIG`, yet reads them into `ceqsub`/`ceqbx`: a DC load
@@ -1682,13 +1667,8 @@ impl Device for Bjt {
             cqsub = context.states.trial(slot::QSUB + 1).unwrap_or(0.);
             cqbx = context.states.trial(slot::QBX + 1).unwrap_or(0.);
         }
-        for (charge, value) in [
-            (slot::QBE, p.qbe),
-            (slot::QBC, p.qbc),
-            (slot::QSUB, p.qsub),
-            (slot::QBX, p.qbx),
-        ] {
-            context.states.set(charge, value)?;
+        for branch in [be, bc, bx, sub] {
+            branch.store(&mut context.states)?;
         }
         // Load the current excitation vector and the matrix.
         let m = self.instance.multiplier;

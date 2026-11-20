@@ -90,8 +90,8 @@ use crate::devices::jfet::{
     self, IC_COMPONENTS, Instance, Junctions, K_OVER_Q, Loaded, p, required,
 };
 use crate::devices::limiting;
+use crate::devices::nonlinear::charge::ChargeBranch;
 use crate::devices::nonlinear::thermal::{TemperatureCache, TemperatureKey};
-use crate::devices::nonlinear::{JunctionPoint, junction_companion};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
@@ -1101,20 +1101,7 @@ impl Device for Jfet2 {
         };
         let point = self.point(&op, vgs, vgd, context.gmin, memory.as_ref())?;
         let vds = vgs - vgd;
-        let (cdrain, gm, gds) = point.channel;
-        let ((cgs, ggs), (cgd, ggd)) = (point.gs, point.gd);
-        let mut l = Loaded {
-            vgs,
-            vgd,
-            vds,
-            cg: cgs + cgd,
-            cgd,
-            cd: cdrain - cgd,
-            gm,
-            gds,
-            ggs,
-            ggd,
-        };
+        let mut l = Loaded::from_currents([vgs, vgd], point.channel, point.gs, point.gd);
         let initial_transient = context.states.phase() == crate::devices::IterationPhase::Predict
             && context.states.initial_transient();
 
@@ -1125,30 +1112,25 @@ impl Device for Jfet2 {
         if transient || context.mode == AnalysisMode::DcSweep || context.states.initial_conditions()
         {
             let capds = op.capds;
-            let (qgs, qgd, capgs, capgd) = if transient {
-                // PScharge in transient: the Statz charge incremented from
-                // the accepted point (VGS1, VGD1, QGS_BEFORE, QGD_BEFORE).
-                let vgs1 = state1(&context.states, slot::VGS, "vgs")?;
-                let vgd1 = state1(&context.states, slot::VGD, "vgd")?;
-                let qgs1 = state1(&context.states, slot::QGS, "qgs")?;
-                let qgd1 = state1(&context.states, slot::QGD, "qgd")?;
-                let (qgga, cgsna, cgdna) = self.model.qgg(&op, vgs, vgd);
-                let (qggb, _, cgdnb) = self.model.qgg(&op, vgs1, vgd);
-                let (qggc, cgsnc, _) = self.model.qgg(&op, vgs, vgd1);
-                let (qggd, _, _) = self.model.qgg(&op, vgs1, vgd1);
-                (
-                    qgs1 + 0.5 * (qgga - qggb + qggc - qggd),
-                    qgd1 + 0.5 * (qgga - qggc + qggb - qggd),
-                    0.5 * (cgsna + cgsnc),
-                    0.5 * (cgdna + cgdnb),
-                )
+            let gates = if transient {
+                jfet::incremental_statz(
+                    &context.states,
+                    [vgs, vgd],
+                    jfet::StatzCapacitance::Averaged,
+                    |what| self.numerical(&format!("missing accepted {what}")),
+                    |gs, gd| Ok(self.model.qgg(&op, gs, gd)),
+                )?
             } else {
-                // PScharge outside transient: the total charge in both slots.
+                // PScharge outside transient: total charge in both slots.
                 let (q, capgs, capgd) = self.model.qgg(&op, vgs, vgd);
-                (q, q, capgs, capgd)
+                jfet::gate_charges(q, q, capgs, capgd)
             };
-            let qds = capds * vds;
-            if [qgs, qgd, capgs, capgd, qds].iter().any(|v| !v.is_finite()) {
+            let drain = ChargeBranch::new(slot::QDS, capds * vds, capds);
+            if gates
+                .iter()
+                .any(|branch| !branch.charge.is_finite() || !branch.capacitance.is_finite())
+                || !drain.charge.is_finite()
+            {
                 return Err(self.numerical("nonfinite Statz gate charge"));
             }
             if let Some(coefficients) = integration {
@@ -1160,45 +1142,32 @@ impl Device for Jfet2 {
                 if dt != coefficients.dt() {
                     return Err(SpiceError::circuit("JFET2 charge timestep mismatch"));
                 }
+                let branches = [gates[0], gates[1], drain];
                 if initial_transient {
-                    context.states.patch_state1(slot::QGS, qgs)?;
-                    context.states.patch_state1(slot::QGD, qgd)?;
-                    context.states.patch_state1(slot::QDS, qds)?;
+                    for branch in branches {
+                        branch.seed(&mut context.states)?;
+                    }
                 }
-                let point = |charge, capacitance| JunctionPoint {
-                    current: 0.,
-                    conductance: 0.,
-                    charge,
-                    capacitance,
-                };
-                let (geq, cqgs) =
-                    junction_companion(context, coefficients, point(qgs, capgs), slot::QGS)?;
-                l.ggs += geq;
-                l.cg += cqgs;
-                let (geq, cqgd) =
-                    junction_companion(context, coefficients, point(qgd, capgd), slot::QGD)?;
-                l.ggd += geq;
-                l.cg += cqgd;
-                l.cd -= cqgd;
-                l.cgd += cqgd;
-                // jfet2load.c integrates CDS * vds into the drain current
-                // but leaves its conductance out of the matrix.
-                let (_, cqds) =
-                    junction_companion(context, coefficients, point(qds, capds), slot::QDS)?;
+                let [cqgs, cqgd] = l.integrate_gates(&mut context.states, coefficients, gates)?;
+                // jfet2load.c integrates CDS * vds into drain current but
+                // leaves its conductance out of the matrix.
+                let cqds = drain
+                    .integrate(&mut context.states, coefficients)?
+                    .derivative;
                 l.cd += cqds;
                 if initial_transient {
-                    context.states.patch_state1(slot::QGS + 1, cqgs)?;
-                    context.states.patch_state1(slot::QGD + 1, cqgd)?;
-                    context.states.patch_state1(slot::QDS + 1, cqds)?;
+                    for (branch, derivative) in branches.into_iter().zip([cqgs, cqgd, cqds]) {
+                        branch.seed_derivative(&mut context.states, derivative)?;
+                    }
                 }
             } else {
                 for s in [slot::QGS + 1, slot::QGD + 1, slot::QDS + 1] {
                     carry(&mut context.states, s)?;
                 }
             }
-            context.states.set(slot::QGS, qgs)?;
-            context.states.set(slot::QGD, qgd)?;
-            context.states.set(slot::QDS, qds)?;
+            for branch in [gates[0], gates[1], drain] {
+                branch.store(&mut context.states)?;
+            }
         } else {
             for s in [
                 slot::QGS,

@@ -63,10 +63,9 @@
 )]
 
 use crate::devices::limiting;
+use crate::devices::nonlinear::charge::ChargeBranch;
 use crate::devices::nonlinear::thermal::{SiliconTemperature, TemperatureCache, TemperatureKey};
-use crate::devices::nonlinear::{
-    JunctionPoint, cubic_reverse_junction, exponential_junction, junction_companion,
-};
+use crate::devices::nonlinear::{cubic_reverse_junction, exponential_junction};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -955,6 +954,94 @@ pub(super) struct Loaded {
     pub(super) ggd: Real,
 }
 
+impl Loaded {
+    /// Construct from the channel and both gate diodes without changing the
+    /// two additions/subtractions of the C load.
+    pub(super) fn from_currents(
+        [vgs, vgd]: [Real; 2],
+        (cdrain, gm, gds): (Real, Real, Real),
+        (cgs, ggs): (Real, Real),
+        (cgd, ggd): (Real, Real),
+    ) -> Self {
+        Self {
+            vgs,
+            vgd,
+            vds: vgs - vgd,
+            cg: cgs + cgd,
+            cgd,
+            cd: cdrain - cgd,
+            gm,
+            gds,
+            ggs,
+            ggd,
+        }
+    }
+
+    /// Fold the gate charge companions into the per-unit C currents and
+    /// conductances in source-then-drain order.
+    pub(super) fn integrate_gates(
+        &mut self,
+        states: &mut DeviceState<'_>,
+        coefficients: &crate::maths::integrator::Coefficients,
+        [source, drain]: [ChargeBranch; 2],
+    ) -> SpiceResult<[Real; 2]> {
+        let gs = source.integrate(states, coefficients)?;
+        self.ggs += gs.conductance;
+        self.cg += gs.derivative;
+        let gd = drain.integrate(states, coefficients)?;
+        self.ggd += gd.conductance;
+        self.cg += gd.derivative;
+        self.cd -= gd.derivative;
+        self.cgd += gd.derivative;
+        Ok([gs.derivative, gd.derivative])
+    }
+}
+
+/// The two Statz implementations integrate the same charge increments but
+/// JFET2 averages the partials while MESFET keeps the first evaluation.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum StatzCapacitance {
+    Averaged,
+    Present,
+}
+
+pub(super) fn incremental_statz(
+    states: &DeviceState<'_>,
+    [vgs, vgd]: [Real; 2],
+    rule: StatzCapacitance,
+    missing: impl Fn(&str) -> SpiceError,
+    mut evaluate: impl FnMut(Real, Real) -> SpiceResult<(Real, Real, Real)>,
+) -> SpiceResult<[ChargeBranch; 2]> {
+    let accepted = |slot, name| states.accepted(1, slot).ok_or_else(|| missing(name));
+    let vgs1 = accepted(slot::VGS, "vgs")?;
+    let vgd1 = accepted(slot::VGD, "vgd")?;
+    let qgs1 = accepted(slot::QGS, "qgs")?;
+    let qgd1 = accepted(slot::QGD, "qgd")?;
+    let (qa, cgsna, cgdna) = evaluate(vgs, vgd)?;
+    let (qb, _, cgdnb) = evaluate(vgs1, vgd)?;
+    let (qc, cgsnc, _) = evaluate(vgs, vgd1)?;
+    let (qd, _, _) = evaluate(vgs1, vgd1)?;
+    let qgs = qgs1 + 0.5 * (qa - qb + qc - qd);
+    let qgd = qgd1 + 0.5 * (qa - qc + qb - qd);
+    let (capgs, capgd) = match rule {
+        StatzCapacitance::Averaged => (0.5 * (cgsna + cgsnc), 0.5 * (cgdna + cgdnb)),
+        StatzCapacitance::Present => (cgsna, cgdna),
+    };
+    Ok(gate_charges(qgs, qgd, capgs, capgd))
+}
+
+pub(super) const fn gate_charges(
+    qgs: Real,
+    qgd: Real,
+    capgs: Real,
+    capgd: Real,
+) -> [ChargeBranch; 2] {
+    [
+        ChargeBranch::new(slot::QGS, qgs, capgs),
+        ChargeBranch::new(slot::QGD, qgd, capgd),
+    ]
+}
+
 /// The end of `jfetload.c`/`jfet2load.c`: the convergence check (`icheck`,
 /// then the gate and drain currents against their linear prediction from
 /// the previous load), the `CKTstate0` writes and the current vector and Y
@@ -1367,13 +1454,24 @@ impl Device for Jfet {
             ic,
             xfact,
         );
-        let mut e = self.evaluate(&op, vgs, vgd, context.gmin)?;
+        let e = self.evaluate(&op, vgs, vgd, context.gmin)?;
+        let mut loaded = Loaded {
+            vgs: e.vgs,
+            vgd: e.vgd,
+            vds: e.vds,
+            cg: e.cg,
+            cgd: e.cgd,
+            cd: e.cd,
+            gm: e.gm,
+            gds: e.gds,
+            ggs: e.ggs,
+            ggd: e.ggd,
+        };
+        let gates = gate_charges(e.qgs, e.qgd, e.capgs, e.capgd);
         let initial_transient =
             context.states.phase() == IterationPhase::Predict && context.states.initial_transient();
 
-        // Charge storage: C evaluates the charges in transient, `.dc` sweeps,
-        // MODEINITSMSIG and the `uic` operating point, and integrates them in
-        // transient only; storing them in every load changes no stamp.
+        // Charge storage is updated on every load; companions only in transient.
         if let Some(coefficients) = integration {
             let AnalysisMode::Transient { dt, .. } = context.mode else {
                 return Err(SpiceError::circuit(
@@ -1384,28 +1482,15 @@ impl Device for Jfet {
                 return Err(SpiceError::circuit("JFET charge timestep mismatch"));
             }
             if initial_transient {
-                context.states.patch_state1(slot::QGS, e.qgs)?;
-                context.states.patch_state1(slot::QGD, e.qgd)?;
+                for branch in gates {
+                    branch.seed(&mut context.states)?;
+                }
             }
-            let point = |charge, capacitance| JunctionPoint {
-                current: 0.,
-                conductance: 0.,
-                charge,
-                capacitance,
-            };
-            let (geq, cqgs) =
-                junction_companion(context, coefficients, point(e.qgs, e.capgs), slot::QGS)?;
-            e.ggs += geq;
-            e.cg += cqgs;
-            let (geq, cqgd) =
-                junction_companion(context, coefficients, point(e.qgd, e.capgd), slot::QGD)?;
-            e.ggd += geq;
-            e.cg += cqgd;
-            e.cd -= cqgd;
-            e.cgd += cqgd;
+            let derivatives = loaded.integrate_gates(&mut context.states, coefficients, gates)?;
             if initial_transient {
-                context.states.patch_state1(slot::QGS + 1, cqgs)?;
-                context.states.patch_state1(slot::QGD + 1, cqgd)?;
+                for (branch, derivative) in gates.into_iter().zip(derivatives) {
+                    branch.seed_derivative(&mut context.states, derivative)?;
+                }
             }
         } else {
             if context.mode.is_transient() {
@@ -1413,27 +1498,18 @@ impl Device for Jfet {
                     "JFET transient needs companion integration",
                 ));
             }
-            context.states.set(slot::QGS + 1, 0.)?;
-            context.states.set(slot::QGD + 1, 0.)?;
+            for branch in gates {
+                branch.zero_derivative(&mut context.states)?;
+            }
         }
-        context.states.set(slot::QGS, e.qgs)?;
-        context.states.set(slot::QGD, e.qgd)?;
+        for branch in gates {
+            branch.store(&mut context.states)?;
+        }
 
         finish_load(
             context,
             start,
-            &Loaded {
-                vgs: e.vgs,
-                vgd: e.vgd,
-                vds: e.vds,
-                cg: e.cg,
-                cgd: e.cgd,
-                cd: e.cd,
-                gm: e.gm,
-                gds: e.gds,
-                ggs: e.ggs,
-                ggd: e.ggd,
-            },
+            &loaded,
             &self.terminals,
             self.inner,
             self.model.pol,

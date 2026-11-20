@@ -77,10 +77,6 @@
     reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
 )]
 #![expect(
-    clippy::too_many_lines,
-    reason = "a complete translated C numerical routine remains contiguous for equation parity review"
-)]
-#![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
 )]
@@ -95,9 +91,7 @@ use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
 use crate::devices::nonlinear::thermal::DerivedCache;
-use crate::devices::nonlinear::{
-    JunctionPoint, ReverseBoundary, junction_companion, junction_current,
-};
+use crate::devices::nonlinear::{ReverseBoundary, junction_current};
 use crate::devices::schema::{
     self, ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
@@ -731,84 +725,40 @@ impl Device for Mesfet {
             ));
         }
         let point = self.point(&op, vgs, vgd, context.gmin)?;
-        let vds = vgs - vgd;
-        let (cdrain, gm, gds) = (point.channel.current, point.channel.gm, point.channel.gds);
-        let ((cgs, ggs), (cgd, ggd)) = (point.gs, point.gd);
-        let mut l = jfet::Loaded {
-            vgs,
-            vgd,
-            vds,
-            cg: cgs + cgd,
-            cgd,
-            cd: cdrain - cgd,
-            gm,
-            gds,
-            ggs,
-            ggd,
-        };
-        // The incremental Statz charges with their capacitances: (charge,
-        // d/dvgs, d/dvgd) for qgs and qgd.
-        let (qgs, qgd, capgs, capgd) = if transient {
-            let accepted = |s: usize, what: &str| {
-                context
-                    .states
-                    .accepted(1, s)
-                    .ok_or_else(|| self.numerical(&format!("missing accepted {what}")))
-            };
-            let (vgs1, vgd1) = (accepted(slot::VGS, "vgs")?, accepted(slot::VGD, "vgd")?);
-            let (qgs1, qgd1) = (accepted(slot::QGS, "qgs")?, accepted(slot::QGD, "qgd")?);
-            let (qa, cgsna, cgdna) = self.charge(&op, vgs, vgd)?;
-            let (qb, _, _) = self.charge(&op, vgs1, vgd)?;
-            let (qc, _, _) = self.charge(&op, vgs, vgd1)?;
-            let (qd, _, _) = self.charge(&op, vgs1, vgd1)?;
-            // mesload.c takes the incremental charges from CKTstate1 and the
-            // capacitances of the *first* evaluation (`capgs = cgsna`,
-            // `capgd = cgdna`), not an average of the four calls.
-            (
-                qgs1 + 0.5 * (qa - qb + qc - qd),
-                qgd1 + 0.5 * (qa - qc + qb - qd),
-                cgsna,
-                cgdna,
-            )
+        let mut l = jfet::Loaded::from_currents(
+            [vgs, vgd],
+            (point.channel.current, point.channel.gm, point.channel.gds),
+            point.gs,
+            point.gd,
+        );
+        let gates = if transient {
+            jfet::incremental_statz(
+                &context.states,
+                [vgs, vgd],
+                jfet::StatzCapacitance::Present,
+                |what| self.numerical(&format!("missing accepted {what}")),
+                |gs, gd| self.charge(&op, gs, gd),
+            )?
         } else {
-            // Outside transient the total charge goes to both slots: what
-            // mesload.c stores in DC sweeps and the `uic` load, and what its
-            // MODEINITTRAN load writes into CKTstate1 for both charges from
-            // the operating point. CKTterr's charge tolerance (mestrunc.c)
-            // scales with |q|, so the first steps need C's offset. Nothing
-            // integrates it here, so C's NaN for a forward gate with
-            // PB <= 0.5 V is stored as zero rather than refusing a DC
-            // analysis C completes (a transient then fails in `charge`).
+            // The total charge goes to both slots outside transient so
+            // CKTterr sees C's charge offset. Preserve C's nonfinite qggnew
+            // DC fallback; transient charge() instead rejects that case.
             let q = self.model.qgg(&op, vgs, vgd).0;
             let q = if q.is_finite() { q } else { 0. };
-            (q, q, 0., 0.)
+            jfet::gate_charges(q, q, 0., 0.)
         };
         if transient {
             let coefficients = integration.ok_or_else(|| {
                 SpiceError::circuit("MESFET transient needs companion integration")
             })?;
-            let companion = |charge, capacitance| JunctionPoint {
-                current: 0.,
-                conductance: 0.,
-                charge,
-                capacitance,
-            };
-            let (geq, cqgs) =
-                junction_companion(context, coefficients, companion(qgs, capgs), slot::QGS)?;
-            l.ggs += geq;
-            l.cg += cqgs;
-            let (geq, cqgd) =
-                junction_companion(context, coefficients, companion(qgd, capgd), slot::QGD)?;
-            l.ggd += geq;
-            l.cg += cqgd;
-            l.cd -= cqgd;
-            l.cgd += cqgd;
-            context.states.set(slot::QGS, qgs)?;
-            context.states.set(slot::QGD, qgd)?;
+            l.integrate_gates(&mut context.states, coefficients, gates)?;
+            for branch in gates {
+                branch.store(&mut context.states)?;
+            }
         } else {
-            for (s, q) in [(slot::QGS, qgs), (slot::QGD, qgd)] {
-                context.states.set(s, q)?;
-                context.states.set(s + 1, 0.)?;
+            for branch in gates {
+                branch.store(&mut context.states)?;
+                branch.zero_derivative(&mut context.states)?;
             }
         }
         jfet::finish_load(

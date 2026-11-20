@@ -90,7 +90,8 @@ use crate::devices::limiting;
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
-use crate::devices::nonlinear::{JunctionPoint, cubic_reverse_junction, junction_companion};
+use crate::devices::nonlinear::charge::ChargeBranch;
+use crate::devices::nonlinear::cubic_reverse_junction;
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -1554,34 +1555,23 @@ impl<L: MosLevel> Device for Mosfet<L> {
         // Bulk junction charges (C computes them in MODETRAN, MODETRANOP and
         // MODEINITSMSIG; computing them in every load changes no stamp) and
         // their NIintegrate companions folded into gbd/cbd/cd and gbs/cbs.
-        states.set(slot::QBD, e.qbd)?;
-        states.set(slot::QBS, e.qbs)?;
+        let drain = ChargeBranch::new(slot::QBD, e.qbd, e.capbd);
+        let source = ChargeBranch::new(slot::QBS, e.qbs, e.capbs);
+        drain.store(states)?;
+        source.store(states)?;
         let mut ag0 = 0.;
         if let Some(coefficients) = &integration {
             ag0 = coefficients.ag()[0];
-            let companion = |context: &mut StampContext<'_>, charge, capacitance, slot| {
-                junction_companion(
-                    context,
-                    coefficients,
-                    JunctionPoint {
-                        current: 0.,
-                        conductance: 0.,
-                        charge,
-                        capacitance,
-                    },
-                    slot,
-                )
-            };
-            let (geq, ccap) = companion(context, e.qbd, e.capbd, slot::QBD)?;
-            e.gbd += geq;
-            e.cbd += ccap;
-            e.cd -= ccap;
-            let (geq, ccap) = companion(context, e.qbs, e.capbs, slot::QBS)?;
-            e.gbs += geq;
-            e.cbs += ccap;
+            let companion = drain.integrate(&mut context.states, coefficients)?;
+            e.gbd += companion.conductance;
+            e.cbd += companion.derivative;
+            e.cd -= companion.derivative;
+            let companion = source.integrate(&mut context.states, coefficients)?;
+            e.gbs += companion.conductance;
+            e.cbs += companion.derivative;
         } else {
-            context.states.set(slot::QBD + 1, 0.)?;
-            context.states.set(slot::QBS + 1, 0.)?;
+            drain.zero_derivative(&mut context.states)?;
+            source.zero_derivative(&mut context.states)?;
         }
         let states = &mut context.states;
         // C: `if (off == 0 || !(MODEINITFIX | MODEINITSMSIG)) if (Check)
@@ -1662,19 +1652,10 @@ impl<L: MosLevel> Device for Mosfet<L> {
         match &integration {
             Some(coefficients) if !initial_transient => {
                 for k in 0..3 {
-                    let (geq, ccap) = junction_companion(
-                        context,
-                        coefficients,
-                        JunctionPoint {
-                            current: 0.,
-                            conductance: 0.,
-                            charge: charge[k],
-                            capacitance: cap[k],
-                        },
-                        slot::QG[k],
-                    )?;
-                    gcg[k] = geq;
-                    ceqg[k] = ccap - ag0 * charge[k];
+                    let companion = ChargeBranch::new(slot::QG[k], charge[k], cap[k])
+                        .integrate(&mut context.states, coefficients)?;
+                    gcg[k] = companion.conductance;
+                    ceqg[k] = companion.derivative - ag0 * charge[k];
                 }
                 for k in 0..3 {
                     ceqg[k] = ceqg[k] - gcg[k] * gate[k] + ag0 * charge[k];

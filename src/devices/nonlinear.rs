@@ -34,6 +34,7 @@ use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 
+pub(super) mod charge;
 mod sens;
 pub(super) mod thermal;
 use thermal::{
@@ -1187,31 +1188,9 @@ pub(crate) fn junction_companion(
     p: JunctionPoint,
     slot: usize,
 ) -> SpiceResult<(Real, Real)> {
-    let mut history = crate::maths::integrator::ChargeHistory::new(p.charge);
-    for age in 1..=coefficients.charge_history_len() {
-        let Some(charge) = context.states.accepted(age, slot) else {
-            return Err(missing_history("missing accepted junction charge"));
-        };
-        history.push(charge)?;
-    }
-    let previous = if coefficients.needs_previous_derivative() {
-        let Some(derivative) = context.states.accepted(1, slot + 1) else {
-            return Err(missing_history("missing accepted junction derivative"));
-        };
-        Some(derivative)
-    } else {
-        None
-    };
-    let companion = coefficients.integrate(&history, previous, p.capacitance)?;
-    context.states.set(slot + 1, companion.derivative)?;
+    let companion = charge::ChargeBranch::new(slot, p.charge, p.capacitance)
+        .integrate(&mut context.states, coefficients)?;
     Ok((companion.conductance, companion.derivative))
-}
-
-/// [`junction_companion`]'s error for a short accepted history.
-#[cold]
-#[inline(never)]
-fn missing_history(message: &str) -> SpiceError {
-    SpiceError::circuit(message)
 }
 
 impl Device for Diode {
