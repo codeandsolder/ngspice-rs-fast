@@ -441,6 +441,54 @@ fn poly_dimensions_use_one_validation_rule_across_frontend() {
 }
 
 #[test]
+fn measurement_rewrite_preserves_global_serials_and_scope_boundaries() {
+    let result = lowered(
+        "r1 a 0 1k\nb1 out 0 v=i(r1)+i(r1)\n.subckt child a\nr1 a 0 2k\nb1 out 0 v=i(r1)\n.ends\nr2 b 0 2k\nb2 p 0 v=i(r2)+i(r1)+i(r2)",
+    );
+    assert_eq!(
+        result
+            .devices
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
+        ["r1", "v_r1", "b1", "r2", "v_r2", "b2"]
+    );
+    assert_eq!(result.devices[0].nodes[0], "a_vmeas_0");
+    assert_eq!(result.devices[3].nodes[0], "b_vmeas_3");
+    assert_eq!(result.devices[1].nodes, ["a", "a_vmeas_0"]);
+    assert_eq!(result.devices[4].nodes, ["b", "b_vmeas_3"]);
+    assert_eq!(result.subcircuits[0].devices[0].nodes[0], "a_vmeas_2");
+    assert_eq!(result.subcircuits[0].devices[1].name, "v_r1");
+    assert_eq!(
+        expression(&result.devices[5], "v")
+            .root
+            .current_references(),
+        ["v_r2", "v_r1", "v_r2"]
+    );
+}
+
+#[test]
+fn measurement_rewrite_handles_many_independent_references() {
+    use std::fmt::Write as _;
+    let mut body = String::new();
+    for index in 0..512 {
+        writeln!(body, "r{index} n{index} 0 1k").unwrap();
+        writeln!(body, "b{index} out{index} 0 v=i(r{index})+i(r{index})").unwrap();
+    }
+    let result = lowered(&body);
+    assert_eq!(result.devices.len(), 3 * 512);
+    for (index, devices) in result.devices.chunks_exact(3).enumerate() {
+        assert_eq!(devices[0].nodes[0], format!("n{index}_vmeas_{}", 2 * index));
+        assert_eq!(devices[1].name, format!("v_r{index}"));
+        let reference = format!("v_r{index}");
+        assert_eq!(
+            expression(&devices[2], "v").root.current_references(),
+            [reference.as_str(), reference.as_str()]
+        );
+    }
+}
+
+#[test]
 fn current_references_insert_measurement_sources_like_inp_meas_current() {
     let netlist = lowered(
         "b1 o 0 v=1\nb2 p 0 v=i(b1)*2 + i(b1)\nb3 q 0 v=max(1,i(b1))\n\

@@ -29,6 +29,7 @@
 //!    literals are rounded to the 11 significant digits `inp_modify_exp()`
 //!    prints and numparam `{...}` values in `=pwl(` lines are evaluated.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
@@ -167,17 +168,41 @@ fn measured_reference(text: &str, offset: usize) -> bool {
     converts_after(previous)
 }
 
+/// An expression's current reference, in traversal (source) order.
+struct MeasurementReference {
+    occurrence: usize,
+    name: String,
+}
+
+/// The device indexes referenced by one name in one scope. Store only names
+/// that occur in an expression; preserve the original order even for malformed
+/// decks with duplicate device names (the circuit validates those separately).
+#[derive(Default)]
+struct MeasurementTargets {
+    simple: bool,
+    measured: Vec<usize>,
+    inserted: bool,
+}
+
+#[derive(Default)]
+struct ScopeMeasurements {
+    targets: HashMap<String, MeasurementTargets>,
+    insertions: HashMap<usize, DeviceInstance>,
+}
+
 /// `inp_meas_current()` (`src/frontend/inpcom.c`): an `i(name)` in a
 /// behavioural expression whose `name` does not start with `v` senses the
 /// current into `name`'s first node through an inserted zero-volt source
 /// `v_name` (`name`'s first node becomes `<node>_vmeas_<n>`), unless `name`
 /// is a simple linear E/H. The device is searched in the same scope only.
 fn measure_currents(netlist: &mut Netlist) {
-    // Phase 1: every rewritable reference, in deck order.
-    let mut references: Vec<(Position, usize, String)> = Vec::new();
+    // Phase 1: every rewritable reference, grouped by device, in deck order.
+    let mut references = Vec::new();
+    let mut scopes = HashMap::<Vec<usize>, ScopeMeasurements>::new();
     for position in deck_order(netlist) {
         let device = &scope_devices(netlist, &position.0)[position.1];
         let mut occurrence = 0;
+        let mut group = Vec::new();
         for parameter in &device.parameters {
             let ParameterKind::Behavioural(expression) = &parameter.kind else {
                 continue;
@@ -187,60 +212,105 @@ fn measure_currents(netlist: &mut Netlist) {
                 if let BExprKind::Current(name) = &node.kind {
                     let offset = node.span.start.column.saturating_sub(origin) as usize;
                     if !name.starts_with('v') && measured_reference(&expression.text, offset) {
-                        references.push((position.clone(), occurrence, name.clone()));
+                        group.push(MeasurementReference {
+                            occurrence,
+                            name: name.clone(),
+                        });
                     }
                     occurrence += 1;
                 }
             });
         }
+        if !group.is_empty() {
+            let scope = scopes.entry(position.0.clone()).or_default();
+            for reference in &group {
+                if !scope.targets.contains_key(&reference.name) {
+                    scope
+                        .targets
+                        .insert(reference.name.clone(), MeasurementTargets::default());
+                }
+            }
+            references.push((position, group));
+        }
     }
-    // Phase 2: rewrite references and add the measurement sources, which are
-    // inserted after their devices only at the end so positions stay valid.
+
+    // Index each relevant scope once, before any names or nodes are changed.
+    // This replaces one full device scan for every reference.
+    for (path, scope) in &mut scopes {
+        for (index, device) in scope_devices(netlist, path).iter().enumerate() {
+            if let Some(targets) = scope.targets.get_mut(&device.name) {
+                if is_simple_linear(device) {
+                    targets.simple = true;
+                } else if !device.nodes.is_empty() {
+                    targets.measured.push(index);
+                }
+            }
+        }
+    }
+
+    // Phase 2: process references in global deck order. Every matching
+    // non-simple target still advances C's serial, even after its source
+    // was inserted. Rewrite each expression once, not once per reference.
     let mut serial = 0usize;
-    let mut insertions: Vec<(Vec<usize>, usize, DeviceInstance)> = Vec::new();
-    for ((path, index), occurrence, name) in references {
+    for ((path, device_index), group) in references {
         let devices = scope_devices(netlist, &path);
-        let simple = devices
-            .iter()
-            .any(|d| d.name == name && is_simple_linear(d));
-        if !simple {
-            rename_occurrence(&mut devices[index], occurrence, &format!("v_{name}"));
+        let scope = scopes.get_mut(&path).expect("indexed referenced scope");
+        let mut renames = Vec::new();
+        for reference in group {
+            let targets = scope
+                .targets
+                .get_mut(&reference.name)
+                .expect("indexed reference");
+            let source = format!("v_{}", reference.name);
+            if !targets.simple {
+                renames.push((reference.occurrence, source.clone()));
+            }
+            for &target in &targets.measured {
+                let device = &mut devices[target];
+                let node = &mut device.nodes[0];
+                let needs_node = !node.contains("_vmeas");
+                let original = (!targets.inserted).then(|| {
+                    node.split_once("_vmeas_")
+                        .map_or_else(|| node.clone(), |(base, _)| base.to_owned())
+                });
+                if needs_node {
+                    *node = format!("{node}_vmeas_{serial}");
+                }
+                if let Some(original) = original {
+                    let location = device.location.clone();
+                    scope.insertions.insert(
+                        target,
+                        instance(
+                            source.clone(),
+                            'v',
+                            vec![original, node.clone()],
+                            vec![scalar("dc", "0", &location)],
+                            &location,
+                        ),
+                    );
+                    targets.inserted = true;
+                }
+                serial += 1;
+            }
         }
-        let source = format!("v_{name}");
-        for (target, device) in devices.iter_mut().enumerate() {
-            if device.name != name || is_simple_linear(device) || device.nodes.is_empty() {
-                continue;
-            }
-            let node = device.nodes[0].clone();
-            if !node.contains("_vmeas") {
-                device.nodes[0] = format!("{node}_vmeas_{serial}");
-            }
-            if !insertions
-                .iter()
-                .any(|(p, _, d)| *p == path && d.name == source)
-            {
-                let original = node
-                    .split_once("_vmeas_")
-                    .map_or_else(|| node.clone(), |(base, _)| base.to_owned());
-                let location = device.location.clone();
-                insertions.push((
-                    path.clone(),
-                    target,
-                    instance(
-                        source.clone(),
-                        'v',
-                        vec![original, device.nodes[0].clone()],
-                        vec![scalar("dc", "0", &location)],
-                        &location,
-                    ),
-                ));
-            }
-            serial += 1;
-        }
+        rename_occurrences(&mut devices[device_index], &renames);
     }
-    insertions.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-    for (path, after, source) in insertions.into_iter().rev() {
-        scope_devices(netlist, &path).insert(after + 1, source);
+
+    // Rebuild each affected device vector in order. Repeated Vec::insert
+    // would move all following devices once for every generated source.
+    for (path, mut scope) in scopes {
+        if scope.insertions.is_empty() {
+            continue;
+        }
+        let devices = scope_devices(netlist, &path);
+        let mut rewritten = Vec::with_capacity(devices.len() + scope.insertions.len());
+        for (index, device) in std::mem::take(devices).into_iter().enumerate() {
+            rewritten.push(device);
+            if let Some(source) = scope.insertions.remove(&index) {
+                rewritten.push(source);
+            }
+        }
+        *devices = rewritten;
     }
 }
 
@@ -253,16 +323,24 @@ fn is_simple_linear(device: &DeviceInstance) -> bool {
             .any(|p| matches!(p.name.as_str(), "value" | "table" | "poly"))
 }
 
-fn rename_occurrence(device: &mut DeviceInstance, occurrence: usize, name: &str) {
+fn rename_occurrences(device: &mut DeviceInstance, renames: &[(usize, String)]) {
+    if renames.is_empty() {
+        return;
+    }
     let mut seen = 0;
+    let mut remaining = renames.iter();
+    let mut next = remaining.next();
     for parameter in &mut device.parameters {
         let ParameterKind::Behavioural(expression) = &mut parameter.kind else {
             continue;
         };
         expression.root.visit_mut(&mut |node| {
             if let BExprKind::Current(source) = &mut node.kind {
-                if seen == occurrence {
+                if let Some((occurrence, name)) = next
+                    && seen == *occurrence
+                {
                     name.clone_into(source);
+                    next = remaining.next();
                 }
                 seen += 1;
             }
