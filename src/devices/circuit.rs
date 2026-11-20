@@ -51,7 +51,7 @@ pub type CircuitGraph = UnGraph<CircuitVertex, usize, usize>;
 /// A circuit under construction, or ready to be simulated.
 #[derive(Default)]
 pub struct Circuit {
-    pub(crate) observations: Vec<String>,
+    pub(super) observations: crate::devices::observe::ObservationPlan,
     nodes: NodeTable,
     unknowns: MnaUnknowns,
     devices: Vec<Box<dyn Device>>,
@@ -439,7 +439,7 @@ impl Circuit {
 
     /// The same load's already prepared overrides are also the source of
     /// coupling values; do not rebuild their contextual devices a second time.
-    fn mutual_terms_with_replacements(
+    pub(super) fn mutual_terms_with_replacements(
         &self,
         context: &ModelContext,
         replacements: &[(usize, Box<dyn Device>)],
@@ -657,7 +657,7 @@ impl Circuit {
     }
 
     /// The resolved controlling-branch rows of device `index`.
-    fn controls(&self, index: usize) -> SpiceResult<&[usize]> {
+    pub(super) fn controls(&self, index: usize) -> SpiceResult<&[usize]> {
         match self.control_rows.get(index) {
             Some(Ok(rows)) => Ok(rows),
             Some(Err(error)) => Err(error.clone()),
@@ -1187,7 +1187,7 @@ impl Circuit {
             .map(|state| state.values.clone())
     }
 
-    fn check_numbering(&self) -> SpiceResult<()> {
+    pub(super) fn check_numbering(&self) -> SpiceResult<()> {
         if !self.unknowns.covers_nodes(&self.nodes)
             || self.branch_rows.len() != self.devices.len()
             || self.state_rows.len() != self.devices.len()
@@ -1379,6 +1379,25 @@ impl Circuit {
             ));
         }
         let mutual = self.mutual_terms(request.model_context)?;
+        self.stamp_isolated(index, device, request, matrix, rhs, trial, &mutual)
+    }
+
+    /// A checked isolated load's shared stamping path. Observations reuse the
+    /// point's already prepared coupling terms for every isolated device.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "explicit isolated load and its prepared coupling inputs"
+    )]
+    pub(super) fn stamp_isolated(
+        &self,
+        index: usize,
+        device: &dyn Device,
+        request: &LoadRequest<'_>,
+        matrix: &mut SparseMatrix,
+        rhs: &mut Vector,
+        trial: &mut TrialState,
+        mutual: &[Vec<MutualTerm>],
+    ) -> SpiceResult<()> {
         let states = request
             .history
             .device_of(trial, self.state_rows[index].clone(), index)?;

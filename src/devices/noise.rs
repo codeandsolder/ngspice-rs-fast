@@ -415,7 +415,7 @@ pub fn circuit_noise(
         let rows = circuit
             .state_rows(index)
             .ok_or_else(|| SpiceError::circuit("circuit numbering is stale; finalize first"))?;
-        let controls = circuit.control_rows(index)?;
+        let controls = circuit.controls(index)?;
         let device_state = match state {
             Some(state) => Some(
                 state
@@ -429,7 +429,7 @@ pub fn circuit_noise(
             unknowns: circuit.unknowns(),
             bias,
             states: device_state,
-            controls: &controls,
+            controls,
         })?;
         let DeviceNoise::Sources {
             family,
