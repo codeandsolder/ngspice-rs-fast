@@ -202,15 +202,11 @@ impl Request<'_> {
                 SourceKind::Voltage => self.vsrc_pulse(pulse, break_time, table),
                 SourceKind::Current => self.isrc_pulse(pulse, table),
             },
-            Waveform::Pwl(knots) => {
-                let times: Vec<Real> = knots.iter().map(|(t, _)| *t).collect();
-                self.pwl(&times, 0., None, break_time, table)
-            }
+            Waveform::Pwl(knots) => self.pwl(knots, 0., None, break_time, table),
             Waveform::PwlSource(pwl) => {
-                let times: Vec<Real> = pwl.knots().iter().map(|(t, _)| *t).collect();
-                self.pwl(&times, pwl.delay(), pwl.repeat(), break_time, table)
+                self.pwl(pwl.knots(), pwl.delay(), pwl.repeat(), break_time, table)
             }
-            Waveform::Step { time, .. } => self.pwl(&[*time], 0., None, break_time, table),
+            Waveform::Step { time, .. } => self.pwl(&[(*time, 0.)], 0., None, break_time, table),
             Waveform::PulseDefaults(_) | Waveform::FunctionDefaults(_) => Err(SpiceError::circuit(
                 "source defaults are unresolved; bind transient timing before scheduling breakpoints",
             )),
@@ -336,11 +332,11 @@ impl Request<'_> {
         request.map_or(Ok(()), |time| table.set(now, time))
     }
 
-    /// `VSRCaccept`/`ISRCaccept`, `case PWL`: knot times `times` (as given),
+    /// `VSRCaccept`/`ISRCaccept`, `case PWL`: borrowed knots (as given),
     /// `td=` delay and the `r=` restart knot index.
     fn pwl(
         &self,
-        times: &[Real],
+        knots: &[(Real, Real)],
         delay: Real,
         repeat: Option<usize>,
         break_time: &mut Real,
@@ -351,12 +347,12 @@ impl Request<'_> {
             return Ok(());
         }
         let mut time = now - delay;
-        let Some(&end) = times.last() else {
+        let Some(&(end, _)) = knots.last() else {
             return Ok(());
         };
         if time > end {
             if let Some(index) = repeat {
-                let start = times[index];
+                let start = knots[index].0;
                 let period = end - start;
                 time -= start;
                 time -= period * (time / period).floor();
@@ -368,7 +364,7 @@ impl Request<'_> {
         }
         let min_break = table.min_break();
         let atime = time + min_break;
-        if let Some(knot) = times.iter().find(|knot| **knot > atime) {
+        if let Some(&(knot, _)) = knots.iter().find(|(knot, _)| *knot > atime) {
             *break_time = now + knot - time;
             table.set(now, *break_time)?;
             *break_time -= min_break;
