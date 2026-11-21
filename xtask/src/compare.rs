@@ -3,7 +3,7 @@
 //! Names/units follow `src/frontend/rawfile.c`; Rust MNA column order is not
 //! ngspice's vector order. Bounds retain the production DC/AC regression policy.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use ngspice_rs::analysis::{Plot, PlotFlags};
 
@@ -187,6 +187,50 @@ fn root_set(plot: &Plot, kind: &str) -> Vec<(String, ngspice_rs::primitives::Com
         .collect()
 }
 
+/// Find a perfect matching in reference-column order using breadth-first
+/// augmenting paths. Only admissible edges enter the graph. The reported
+/// maximum ratio is for the resulting assignment, not an optimized bottleneck.
+/// Search is iterative (no root-count-dependent recursion), O(n³) time in the
+/// dense worst case and O(n) additional space beyond the edge lists.
+fn perfect_root_matching(edges: &[Vec<(usize, f64)>]) -> Result<f64, usize> {
+    let n = edges.len();
+    let mut reference_match: Vec<Option<(usize, f64)>> = vec![None; n];
+    let mut candidate_match: Vec<Option<usize>> = vec![None; n];
+    for start in 0..n {
+        let mut parent = vec![None; n];
+        let mut queue = VecDeque::from([start]);
+        let mut free = None;
+        'search: while let Some(reference) = queue.pop_front() {
+            for &(candidate, ratio) in &edges[reference] {
+                if parent[candidate].is_some() {
+                    continue;
+                }
+                parent[candidate] = Some((reference, ratio));
+                if let Some(next) = candidate_match[candidate] {
+                    queue.push_back(next);
+                } else {
+                    free = Some(candidate);
+                    break 'search;
+                }
+            }
+        }
+        let mut candidate = free.ok_or(start)?;
+        while let Some((reference, ratio)) = parent[candidate] {
+            candidate_match[candidate] = Some(reference);
+            if let Some((previous, _)) = reference_match[reference].replace((candidate, ratio)) {
+                candidate = previous;
+            } else {
+                break;
+            }
+        }
+    }
+    Ok(reference_match
+        .into_iter()
+        .flatten()
+        .map(|(_, ratio)| ratio)
+        .fold(0.0_f64, f64::max))
+}
+
 /// Compares a Rust pole-zero plot with a C one as two unordered root sets
 /// (poles, zeros) under [`RootTolerance`]. The plot structure (name, flags,
 /// variable names, units and real flags) must match exactly, so the root
@@ -223,30 +267,32 @@ pub(crate) fn roots(got: &Plot, want: &Plot, tolerance: RootTolerance) -> Result
         let bound = |c: ngspice_rs::primitives::Complex| {
             tolerance.relative * c.magnitude() + tolerance.scale_relative * scale
         };
-        // Greedy assignment by error/bound ratio over every pair.
-        let mut pairs = Vec::with_capacity(rust.len() * c.len());
-        for (i, (_, r)) in rust.iter().enumerate() {
-            for (j, (_, w)) in c.iter().enumerate() {
-                pairs.push(((*r - *w).magnitude() / bound(*w), i, j));
+        let mut edges = Vec::with_capacity(c.len());
+        for (_, w) in &c {
+            let limit = bound(*w);
+            if !limit.is_finite() {
+                return Err(format!("{kind}: nonfinite reference bound"));
             }
+            let mut admissible = Vec::new();
+            for (i, (_, r)) in rust.iter().enumerate() {
+                let error = (*r - *w).magnitude();
+                if limit == 0.0 {
+                    if r == w {
+                        admissible.push((i, 0.0));
+                    }
+                } else if error <= limit {
+                    admissible.push((i, error / limit));
+                }
+            }
+            edges.push(admissible);
         }
-        pairs.sort_by(|x, y| x.0.total_cmp(&y.0));
-        let (mut rust_used, mut c_used) = (vec![false; rust.len()], vec![false; c.len()]);
-        for (ratio, i, j) in pairs {
-            if rust_used[i] || c_used[j] {
-                continue;
-            }
-            rust_used[i] = true;
-            c_used[j] = true;
-            if ratio.is_nan() || ratio > 1.0 {
-                return Err(format!(
-                    "{kind} mismatch: C {} = {:.17e}{:+.17e}j has no Rust root within the bound \
-                     (nearest unmatched Rust {} = {:.17e}{:+.17e}j, {ratio:.6e}x bound)",
-                    c[j].0, c[j].1.re, c[j].1.im, rust[i].0, rust[i].1.re, rust[i].1.im
-                ));
-            }
-            worst_ratio = worst_ratio.max(ratio);
-        }
+        let ratio = perfect_root_matching(&edges).map_err(|j| {
+            format!(
+                "{kind} mismatch: no perfect matching when including C {} = {:.17e}{:+.17e}j ({} admissible Rust candidates)",
+                c[j].0, c[j].1.re, c[j].1.im, edges[j].len()
+            )
+        })?;
+        worst_ratio = worst_ratio.max(ratio);
         counts.push(format!("{} {kind}(s)", c.len()));
     }
     Ok(format!(
@@ -657,6 +703,107 @@ mod tests {
         let mut renamed = want.clone();
         renamed.plotname = "AC Analysis".into();
         assert!(roots(&renamed, &want, POLE_ZERO).is_err());
+    }
+
+    #[test]
+    fn root_matching_reassigns_greedy_counterexample() {
+        let reference = [Complex::real(1_000_000.0), Complex::real(1_000_001.5)];
+        let candidates = [Complex::real(1_000_000.6), Complex::real(999_999.2)];
+        for expected in [reference, [reference[1], reference[0]]] {
+            for actual in [candidates, [candidates[1], candidates[0]]] {
+                let want = pole_zero(&expected, &expected);
+                let got = pole_zero(&actual, &actual);
+                let report = roots(&got, &want, POLE_ZERO).unwrap();
+                assert!(report.contains("2 pole(s) + 2 zero(s)"), "{report}");
+            }
+        }
+        let impossible = pole_zero(&[candidates[0]; 2], &[]);
+        // Both C roots can take the same candidate value here; use a
+        // reference for which only one of the two candidates is admissible.
+        let want = pole_zero(&reference, &[]);
+        assert!(roots(&impossible, &want, POLE_ZERO).is_ok());
+        let deficient = pole_zero(&[candidates[0], Complex::real(999_990.0)], &[]);
+        let error = roots(&deficient, &want, POLE_ZERO).unwrap_err();
+        assert!(error.contains("no perfect matching"), "{error}");
+    }
+
+    #[test]
+    fn root_matching_zero_bounds_and_repeated_roots() {
+        let want = pole_zero(&[Complex::ZERO; 3], &[Complex::ZERO; 2]);
+        let got = pole_zero(&[Complex::real(-0.0); 3], &[Complex::ZERO; 2]);
+        let report = roots(&got, &want, POLE_ZERO).unwrap();
+        assert!(report.contains("worst error 0.000e0"), "{report}");
+        let mut bad = got.clone();
+        bad.points[0][0] = Complex::real(f64::from_bits(1));
+        assert!(
+            roots(&bad, &want, POLE_ZERO)
+                .unwrap_err()
+                .contains("pole mismatch")
+        );
+        bad.points[0][0] = Complex::real(f64::NAN);
+        assert!(
+            roots(&bad, &want, POLE_ZERO)
+                .unwrap_err()
+                .contains("nonfinite")
+        );
+        bad.points[0].pop();
+        assert!(
+            roots(&bad, &want, POLE_ZERO)
+                .unwrap_err()
+                .contains("row shape")
+        );
+
+        let repeated = Complex::new(-1e6, 1e6);
+        let nearby = Complex::new(-1_000_000.25, 999_999.75);
+        let want = pole_zero(&[repeated, nearby, repeated], &[]);
+        let got = pole_zero(&[nearby, repeated, nearby], &[]);
+        assert!(roots(&got, &want, POLE_ZERO).is_ok());
+    }
+
+    fn exhaustive_matching(edges: &[Vec<(usize, f64)>], used: u32) -> bool {
+        let Some((first, rest)) = edges.split_first() else {
+            return true;
+        };
+        first.iter().any(|&(candidate, _)| {
+            let bit = 1 << candidate;
+            used & bit == 0 && exhaustive_matching(rest, used | bit)
+        })
+    }
+
+    #[test]
+    fn root_matching_agrees_with_exhaustive_assignments() {
+        let graph = |size: usize, mask: u32| {
+            (0..size)
+                .map(|i| {
+                    (0..size)
+                        .filter(|&j| mask & (1 << (i * size + j)) != 0)
+                        .map(|j| (j, 0.5))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        for size in 0..=3 {
+            for mask in 0..(1 << (size * size)) {
+                let edges = graph(size, mask);
+                assert_eq!(
+                    perfect_root_matching(&edges).is_ok(),
+                    exhaustive_matching(&edges, 0)
+                );
+            }
+        }
+        let mut seed = 0x1234_5678_u32;
+        for _ in 0..512 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let edges = graph(5, seed >> 7);
+            assert_eq!(
+                perfect_root_matching(&edges).is_ok(),
+                exhaustive_matching(&edges, 0)
+            );
+        }
+        // The low-ratio edge for C[0] must be displaced. The summary
+        // must describe the final matching, not the initial greedy choice.
+        let edges = [vec![(0, 0.1), (1, 0.8)], vec![(0, 0.9)]];
+        assert!((perfect_root_matching(&edges).unwrap() - 0.9).abs() < f64::EPSILON);
     }
 
     #[test]
