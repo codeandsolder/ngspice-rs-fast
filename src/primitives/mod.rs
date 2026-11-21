@@ -18,14 +18,18 @@
 
 pub mod error;
 pub mod node;
+pub(crate) mod numeric;
 pub mod value;
 
 pub use error::{SourceLoc, SpiceError, SpiceResult};
 pub use node::{GROUND_ALIAS, GROUND_NAME, Node, NodeId, NodeKind, NodeTable};
+pub use numeric::{
+    c_integer, exact_nonnegative_integer, exact_signed_integer, truncating_signed_integer,
+};
 pub use value::{
-    Complex, ParsedNumber, Real, almost_equal_ulps, approx_eq, c_integer,
-    exact_nonnegative_integer, format_spice_number, parse_numparam_number,
-    parse_numparam_number_prefix, parse_spice_number, parse_spice_number_prefix,
+    Complex, ParsedNumber, Real, almost_equal_ulps, approx_eq, format_spice_number,
+    parse_numparam_number, parse_numparam_number_prefix, parse_spice_number,
+    parse_spice_number_prefix,
 };
 
 /// Allocate initialized storage without overflowing the allocation size.

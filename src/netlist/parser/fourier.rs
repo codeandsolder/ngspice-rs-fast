@@ -253,15 +253,8 @@ fn harmonics_value(input: &mut Input<'_>, at: &SourceLoc) -> Result<u32> {
                     location: Some(value.location),
                 })));
             }
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "finite integral harmonic count was checked against MAX_HARMONICS"
-            )]
-            #[expect(
-                clippy::cast_sign_loss,
-                reason = "harmonic count was checked to be at least one"
-            )]
-            Ok(number as u32)
+            crate::primitives::exact_nonnegative_integer(number)
+                .ok_or_else(|| fail(&value.location, "HARMONICS= is outside the integer range"))
         }
         _ if super::expression::is_expression_token(&value) => Err(gap(
             &value.location,
