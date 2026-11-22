@@ -212,3 +212,30 @@ NGSPICE_BIN=/absolute/path/to/ngspice cargo test -p ngspice-rs --test c_referenc
 The no-FMA oracle and trace tooling used for bit-level comparison live
 outside the repository; see [VERIFICATION.md](VERIFICATION.md) for the
 committed C-golden workflow.
+
+### Aggregate elaboration resources
+
+The device-generation limits apply to the materialized circuit, not just the
+flattened input cards. `ElaborationLimits` defaults to 250,000 device records,
+1,000,000 distinct non-ground nodes including setup-private nodes, and
+4,000,000 declared scalar device-state slots (32 MiB per complete f64 state
+vector). Call `Circuit::with_elaboration_limits` for incremental construction,
+or `Circuit::from_netlist_with_limits` for a complete deck with explicit
+mutual-inductor and elaboration limits. The complete-deck path also uses the
+device limit for initial subcircuit expansion.
+
+The planner charges existing records and one minimum record per incoming
+card, then binds exact URC and TXL expansion counts and distinct written
+terminals before constructing any ladder. It retains plans only for those
+special cards; ordinary cards remain borrowed. Ordinary private nodes and
+state counts are checked when the factory binds them, and every planned
+expansion is checked against the actual remaining budget and verified against
+its resulting counts. Checked sums, node identity range, state allocation
+layout and fallible staging capacity reject overflow. The final device
+vector reserve takes place inside the node transaction: allocation failure
+or a later card error leaves the previous nodes, devices, origins and
+finalized analysis bindings unchanged. Manual node/device additions and
+replacement obey the same aggregate limits. This bounds materialized records
+and state slots, not arbitrary strings, model caches or dynamic analysis
+history storage. Standard allocator-backed boxed devices and map/string
+construction remain subject to the system allocator.
