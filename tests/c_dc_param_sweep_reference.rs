@@ -122,6 +122,21 @@ fn diode_instance_parameter_sweeps_match_c() {
 
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN; runs temporary C decks out of process"]
+fn diode_knee_currents_are_setup_only_in_instance_sweeps() {
+    let diode = "Diode setup-time knee currents\n.options reltol=1e-8 temp=50\n\
+                 v1 in 0 3\nr1 in a 100\nd1 a 0 dx area=2 pj=1 m=1.5\n\
+                 .model dx d(is=1e-14 jsw=2e-14 n=1.1 ns=1.2 rs=7.3 trs=3m ikf=1m ikr=2m ikp=0.8m)";
+    for (tag, sweep) in [
+        ("knee-area", "@d1[area] 0.5 4 0.5"),
+        ("knee-multiplier", "@d1[m] 0.5 3 0.5"),
+        ("knee-perimeter", "@d1[pj] 0 4 1"),
+    ] {
+        compare(tag, &format!("{diode}\n.dc {sweep}"), NONLINEAR);
+    }
+}
+
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN; runs temporary C decks out of process"]
 fn bjt_and_mos1_instance_parameter_sweeps_match_c() {
     let bjt = "BJT parameter sweep\n.options reltol=1e-8\n\
                vcc c 0 5\nvb b 0 0.75\nrc c cc 1k\nq1 cc b 0 qx areac=2\n\
