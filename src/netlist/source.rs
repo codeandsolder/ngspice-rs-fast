@@ -252,13 +252,19 @@ impl Deck {
 /// # Errors
 /// Invalid UTF-8, I/O or default source admission limits.
 pub fn load(path: impl AsRef<Path>) -> SpiceResult<Deck> {
-    let path = path.as_ref();
+    load_bounded(
+        path.as_ref(),
+        &mut SourceBudget::new(SourceLimits::default()),
+    )
+}
+
+pub(super) fn load_bounded(path: &Path, budget: &mut SourceBudget) -> SpiceResult<Deck> {
     let location = SourceLoc::new(path.to_path_buf(), 1, 1);
-    let mut budget = SourceBudget::new(SourceLimits::default());
+    budget.validate(&location)?;
     let remaining = budget.begin_file(&location)?;
     let text = read_text(path, remaining, &location)?;
     budget.bytes(text.len(), &location)?;
-    fold_bounded(path, &text, true, &mut budget)
+    fold_bounded(path, &text, true, budget)
 }
 
 pub(super) fn read_text(

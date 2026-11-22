@@ -24,7 +24,7 @@ use crate::primitives::SpiceResult;
 
 use crate::netlist::ast::{FourierCard, MeasureCard, Netlist, OutputCards};
 use crate::netlist::card::{DotCommand, RawCard};
-use crate::netlist::source::{Deck, fold_bounded, load};
+use crate::netlist::source::{Deck, fold_bounded, load_bounded};
 
 use crate::netlist::source::budget::SourceBudget;
 pub use crate::netlist::source::budget::SourceLimits;
@@ -339,11 +339,15 @@ pub fn classify_deck(deck: &Deck) -> SpiceResult<Vec<RawCard>> {
 pub fn classify_deck_with_limits(deck: &Deck, limits: SourceLimits) -> SpiceResult<Vec<RawCard>> {
     let mut budget = SourceBudget::new(limits);
     budget.admit_deck(deck)?;
+    classify_admitted(deck, &mut budget)
+}
+
+fn classify_admitted(deck: &Deck, budget: &mut SourceBudget) -> SpiceResult<Vec<RawCard>> {
     let mut out = Vec::new();
     for line in &deck.lines {
         budget.card(&line.location)?;
         budget.allocation(out.try_reserve(1), &line.location)?;
-        out.push(RawCard::parse_bounded(line, &mut budget)?);
+        out.push(RawCard::parse_bounded(line, budget)?);
     }
     Ok(out)
 }
@@ -354,8 +358,21 @@ pub fn classify_deck_with_limits(deck: &Deck, limits: SourceLimits) -> SpiceResu
 ///
 /// Fails if the file cannot be read or a card cannot be tokenized.
 pub fn load_classified(path: impl AsRef<Path>) -> SpiceResult<(Deck, Vec<RawCard>)> {
-    let deck = load(path)?;
-    let cards = classify_deck(&deck)?;
+    load_classified_with_limits(path, SourceLimits::default())
+}
+
+/// Load and classify a file under one shared source and lexical budget.
+/// This does not expand included sources.
+///
+/// # Errors
+/// Invalid UTF-8, I/O, lexical syntax or exhausted source/work limits.
+pub fn load_classified_with_limits(
+    path: impl AsRef<Path>,
+    limits: SourceLimits,
+) -> SpiceResult<(Deck, Vec<RawCard>)> {
+    let mut budget = SourceBudget::new(limits);
+    let deck = load_bounded(path.as_ref(), &mut budget)?;
+    let cards = classify_admitted(&deck, &mut budget)?;
     Ok((deck, cards))
 }
 

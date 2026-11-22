@@ -1,5 +1,5 @@
 //! Shared source admission and lexical work budgets (#129).
-use ngspice_rs::netlist::parser::classify_deck_with_limits;
+use ngspice_rs::netlist::parser::{classify_deck_with_limits, load_classified_with_limits};
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::netlist::{Parser, SourceLimits};
 use std::fmt::Write as _;
@@ -124,12 +124,18 @@ fn borrowed_text_and_file_have_identical_exact_limits() {
         .unwrap();
     assert_eq!(memory, file);
     assert_eq!(file.netlist.devices.len(), 1);
+    assert_eq!(limits.tokens, 8);
+    assert_eq!(limits.physical_lines, 4);
+    assert_eq!(limits.folded_cards, 2);
+    let (deck, cards) = load_classified_with_limits(&path, limits).unwrap();
+    assert_eq!(cards, classify_deck_with_limits(&deck, limits).unwrap());
     for (smaller, label) in smaller(limits) {
         for error in [
             Parser::new().parse_text(&path, text, smaller).unwrap_err(),
             Parser::new()
                 .parse_file_with_limits(&path, smaller)
                 .unwrap_err(),
+            load_classified_with_limits(&path, smaller).unwrap_err(),
         ] {
             assert!(error.to_string().contains(label), "{label}: {error}");
         }

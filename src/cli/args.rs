@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::analysis::{AnalysisSupport, DRIVERS};
 use crate::devices::Registry;
-use crate::netlist::{Deck, RawCard, classify_deck, load};
+use crate::netlist::{Deck, RawCard, load_classified};
 use crate::primitives::{AnalysisKind as Kind, SpiceError, SpiceResult};
 
 /// Process exit codes. See the crate documentation.
@@ -302,8 +302,8 @@ pub fn run(args: &Args) -> SpiceResult<()> {
             print!("{}", crate::cli::simulate::report_text(&report));
         }
         Command::Summary | Command::Cards | Command::Tokens => {
-            let deck = load_deck(args)?;
-            let cards = classify_deck(&deck)?;
+            let path = required_path(args, args.netlist.as_deref(), "netlist")?;
+            let (deck, cards) = load_classified(path)?;
             let text = match args.command {
                 Command::Cards => cards_text(&deck, &cards),
                 Command::Tokens => tokens_text(&cards),
@@ -366,11 +366,6 @@ fn required_path<'a>(args: &Args, path: Option<&'a Path>, name: &str) -> SpiceRe
         feature: format!("{} requires {name}", args.command.name()),
         location: None,
     })
-}
-
-fn load_deck(args: &Args) -> SpiceResult<Deck> {
-    let path = required_path(args, args.netlist.as_deref(), "netlist")?;
-    load(path)
 }
 
 /// Renders the deck summary.

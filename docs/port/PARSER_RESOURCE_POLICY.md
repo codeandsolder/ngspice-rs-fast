@@ -9,7 +9,7 @@ Use `Parser::parse_text(path, text, limits)` for borrowed text (no include I/O),
 `parse_deck_with_limits_and_output(&deck, limits)` for an already-folded deck.
 The ordinary semantic methods use defaults. `parser::classify_deck_with_limits`
 applies the same admission and lexical counters to classification (all cards,
-including after .end). The low-level `source::load` admits files before folding.
+including after .end). `parser::load_classified_with_limits` and default CLI classification share one budget across loading, folding and classification; the low-level `source::load` also admits files before folding.
 
 | Resource | Default | Charged |
 |---|---:|---|
