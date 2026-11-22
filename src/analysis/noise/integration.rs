@@ -278,6 +278,45 @@ mod tests {
     }
 
     #[test]
+    fn independent_full_range_power_law_reference() {
+        // Generated from an independent 100-digit decimal antiderivative,
+        // stratified by output and input range classifications. Verify
+        // physical values, not rounding from a previous implementation.
+        let mut count = 0;
+        for line in include_str!("reference.tsv").lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let values: Vec<_> = line
+                .split_whitespace()
+                .map(|bits| Real::from_bits(u64::from_str_radix(bits, 16).unwrap()))
+                .collect();
+            let [f0, f1, d0, d1, gain, expected_out, expected_in] = values[..] else {
+                panic!("invalid noise quadrature reference row");
+            };
+            let area = Interval::new(f0, f1).integrate(d0, d1);
+            for (actual, expected) in [
+                (area.scaled(1.), expected_out),
+                (area.scaled(gain), expected_in),
+            ] {
+                if expected == 0. || expected.is_infinite() {
+                    assert_eq!(actual.to_bits(), expected.to_bits(), "{line}");
+                } else {
+                    assert!(actual.is_finite() && actual > 0., "{line}");
+                    let ulps = actual.to_bits().abs_diff(expected.to_bits());
+                    let bound = if expected.is_normal() { 8 } else { 1 };
+                    assert!(
+                        ulps <= bound,
+                        "{line}: {actual:e} != {expected:e} ({ulps} ULP)"
+                    );
+                }
+            }
+            count += 1;
+        }
+        assert!(count > 100);
+    }
+
+    #[test]
     fn scaled_products_recover_range_and_preserve_final_rounding() {
         close(product([1e300, 1e300, 1e-300, 1e-300]), 1., 4e-15);
         close(product([1e-300, 1e-300, 1e300, 1e300]), 1., 4e-15);
