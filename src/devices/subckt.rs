@@ -1166,6 +1166,6 @@ fn literal_expression(text: &str, value: Real, start: &SourceLoc) -> ParameterEx
     }
 }
 
-fn byte_len(text: &str) -> usize {
+const fn byte_len(text: &str) -> usize {
     text.len()
 }

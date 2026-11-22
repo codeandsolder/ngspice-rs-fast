@@ -138,16 +138,21 @@ impl<'a> SourcePosition<'a> {
     }
 
     pub(crate) fn location(self) -> SourceLoc {
-        if let Some(run) = self.segments.and_then(|runs| runs.at(self.offset)) {
-            SourceLoc::new(
-                self.origin.file.clone(),
-                run.line,
-                run.column + (self.offset - run.logical_start),
+        self.segments
+            .and_then(|runs| runs.at(self.offset))
+            .map_or_else(
+                || {
+                    self.origin
+                        .at_column(self.origin.column + (self.offset - self.anchor_offset))
+                },
+                |run| {
+                    SourceLoc::new(
+                        self.origin.file.clone(),
+                        run.line,
+                        run.column + (self.offset - run.logical_start),
+                    )
+                },
             )
-        } else {
-            self.origin
-                .at_column(self.origin.column + (self.offset - self.anchor_offset))
-        }
     }
 }
 

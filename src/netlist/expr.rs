@@ -32,9 +32,10 @@
 
 use crate::primitives::{Real, SourceLoc};
 
-/// A half-open byte range with physical source coordinates and a separate
-/// logical byte range in the parser's input. Physical endpoints can be on
-/// different lines; logical offsets are used to slice the retained spelling.
+/// A half-open source span.
+///
+/// Physical endpoints can be on different lines; the separate logical byte
+/// offsets address the retained spelling in the parser input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSpan {
     /// First byte of the spanned text.

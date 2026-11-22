@@ -52,7 +52,7 @@ fn raw() -> RawCard {
         raw: String::new(),
         tokens: Vec::new(),
         kind: CardKind::Unknown,
-        source_map: Default::default(),
+        source_map: crate::netlist::source::SourceMap::default(),
     }
 }
 
