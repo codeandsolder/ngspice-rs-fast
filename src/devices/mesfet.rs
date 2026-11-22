@@ -61,8 +61,6 @@
 //!
 //! `.disto` and `.sens` use the separate model-specific reference paths.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -70,10 +68,6 @@
 #![expect(
     clippy::manual_midpoint,
     reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use crate::devices::jfet::{
@@ -256,8 +250,8 @@ fn qggnew(
     let cminus = cplus - cfact;
     (
         qggval,
-        cgs / qroot * par1 * cplus + cgd * cminus,
-        cgs / qroot * par1 * cminus + cgd * cplus,
+        cgd.mul_add(cminus, cgs / qroot * par1 * cplus),
+        cgd.mul_add(cplus, cgs / qroot * par1 * cminus),
     )
 }
 
@@ -276,9 +270,9 @@ impl Model {
             if vgst <= 0. {
                 return off;
             }
-            let prod = 1. + lambda * vds;
+            let prod = f64::mul_add(lambda, vds, 1.);
             let betap = beta * prod;
-            let denom = 1. + b * vgst;
+            let denom = f64::mul_add(b, vgst, 1.);
             let invdenom = 1. / denom;
             if vds >= 3. / alpha {
                 // Normal mode, saturation region.
@@ -290,7 +284,7 @@ impl Model {
             } else {
                 // Normal mode, linear region.
                 let afact = 1. - alpha * vds / 3.;
-                let lfact = 1. - afact * afact * afact;
+                let lfact = (afact * afact).mul_add(-afact, 1.);
                 Channel {
                     current: betap * vgst * vgst * invdenom * lfact,
                     gm: betap * vgst * (1. + denom) * invdenom * invdenom * lfact,
@@ -298,7 +292,7 @@ impl Model {
                         * vgst
                         * vgst
                         * invdenom
-                        * (alpha * afact * afact * prod + lfact * lambda),
+                        * lfact.mul_add(lambda, alpha * afact * afact * prod),
                 }
             }
         } else {
@@ -306,9 +300,9 @@ impl Model {
             if vgdt <= 0. {
                 return off;
             }
-            let prod = 1. - lambda * vds;
+            let prod = f64::mul_add(lambda, -vds, 1.);
             let betap = beta * prod;
-            let denom = 1. + b * vgdt;
+            let denom = f64::mul_add(b, vgdt, 1.);
             let invdenom = 1. / denom;
             if -vds >= 3. / alpha {
                 // Inverse mode, saturation region.
@@ -316,22 +310,18 @@ impl Model {
                 Channel {
                     current: -betap * vgdt * vgdt * invdenom,
                     gm,
-                    gds: lambda * beta * vgdt * vgdt * invdenom - gm,
+                    gds: (lambda * beta * vgdt * vgdt).mul_add(invdenom, -gm),
                 }
             } else {
                 // Inverse mode, linear region.
                 let afact = 1. + alpha * vds / 3.;
-                let lfact = 1. - afact * afact * afact;
+                let lfact = (afact * afact).mul_add(-afact, 1.);
                 let gm = -betap * vgdt * (1. + denom) * invdenom * invdenom * lfact;
                 Channel {
                     current: -betap * vgdt * vgdt * invdenom * lfact,
                     gm,
-                    gds: beta
-                        * vgdt
-                        * vgdt
-                        * invdenom
-                        * (alpha * afact * afact * prod + lfact * lambda)
-                        - gm,
+                    gds: (beta * vgdt * vgdt * invdenom)
+                        .mul_add(lfact.mul_add(lambda, alpha * afact * afact * prod), -gm),
                 }
             }
         }
@@ -477,7 +467,7 @@ impl Mesfet {
     fn point(&self, op: &Operating, vgs: Real, vgd: Real, gmin: Real) -> SpiceResult<Point> {
         let junction = |v: Real| -> SpiceResult<(Real, Real)> {
             let (current, conductance) = junction_current(v, VT0, op.csat, ReverseBoundary::Cubic)?;
-            Ok((current + gmin * v, conductance + gmin))
+            Ok((gmin.mul_add(v, current), conductance + gmin))
         };
         let point = Point {
             channel: self.model.channel(op, vgs, vgd),

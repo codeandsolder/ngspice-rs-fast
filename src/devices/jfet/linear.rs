@@ -62,9 +62,9 @@ fn gate_entries(
         // mespzld.c's actual left-associated expressions. Do not correct
         // C's precedence mistake by scaling the whole diagonal.
         [
-            m * ggd + ggs,
-            m * gdpr + gds + ggd,
-            m * gspr + gds + gm + ggs,
+            m.mul_add(ggd, ggs),
+            m.mul_add(gdpr, gds) + ggd,
+            m.mul_add(gspr, gds) + gm + ggs,
         ]
     } else {
         [

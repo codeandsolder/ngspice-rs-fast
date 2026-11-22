@@ -43,15 +43,9 @@
 //! error naming `jfetnoi.c`/`jfetdist.c` rather than contributing nothing.
 //! `.sens` is ported (#164) through [`JfetSensitivity`].
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 pub(super) mod lifecycle;
@@ -264,7 +258,7 @@ fn gate_diode(v: Real, vt_temp: Real, csat: Real, gmin: Real) -> (Real, Real) {
     } else {
         exponential_junction(v, vt_temp, csat)
     };
-    (current + gmin * v, conductance + gmin)
+    (gmin.mul_add(v, current), conductance + gmin)
 }
 
 impl Model {
@@ -282,15 +276,15 @@ impl Model {
             if vgst <= 0. {
                 return off;
             }
-            let betap = beta * (1. + lambda * vds);
+            let betap = beta * f64::mul_add(lambda, vds, 1.);
             if vgst >= vds {
                 // Normal mode, linear region.
-                let apart = 2. * b + 3. * op.bfac * (vgst - vds);
-                let cpart = vds * (vds * (op.bfac * vds - b) + vgst * apart);
+                let apart = (3. * op.bfac).mul_add(vgst - vds, 2. * b);
+                let cpart = vds * vgst.mul_add(apart, vds * op.bfac.mul_add(vds, -b));
                 Channel {
                     current: betap * cpart,
-                    gm: betap * vds * (apart + 3. * op.bfac * vgst),
-                    gds: betap * (vgst - vds) * apart + beta * lambda * cpart,
+                    gm: betap * vds * (3. * op.bfac).mul_add(vgst, apart),
+                    gds: f64::mul_add(beta * lambda, cpart, betap * (vgst - vds) * apart),
                 }
             } else {
                 // Normal mode, saturation region.
@@ -299,7 +293,7 @@ impl Model {
                 let cpart = vgst_squared * (b + bfac);
                 Channel {
                     current: betap * cpart,
-                    gm: betap * vgst * (2. * b + 3. * bfac),
+                    gm: betap * vgst * 3.0f64.mul_add(bfac, 2. * b),
                     gds: lambda * beta * cpart,
                 }
             }
@@ -308,27 +302,27 @@ impl Model {
             if vgdt <= 0. {
                 return off;
             }
-            let betap = beta * (1. - lambda * vds);
+            let betap = beta * f64::mul_add(lambda, -vds, 1.);
             if vgdt + vds >= 0. {
                 // Inverse mode, linear region.
-                let apart = 2. * b + 3. * op.bfac * (vgdt + vds);
-                let cpart = vds * (-vds * (-op.bfac * vds - b) + vgdt * apart);
-                let gm = betap * vds * (apart + 3. * op.bfac * vgdt);
+                let apart = (3. * op.bfac).mul_add(vgdt + vds, 2. * b);
+                let cpart = vds * vgdt.mul_add(apart, -vds * (-op.bfac).mul_add(vds, -b));
+                let gm = betap * vds * (3. * op.bfac).mul_add(vgdt, apart);
                 Channel {
                     current: betap * cpart,
                     gm,
-                    gds: betap * (vgdt + vds) * apart - beta * lambda * cpart - gm,
+                    gds: f64::mul_add(beta * lambda, -cpart, betap * (vgdt + vds) * apart) - gm,
                 }
             } else {
                 // Inverse mode, saturation region.
                 let bfac = vgdt * op.bfac;
-                let gm = -betap * vgdt * (2. * b + 3. * bfac);
+                let gm = -betap * vgdt * 3.0f64.mul_add(bfac, 2. * b);
                 let vgdt_squared = vgdt * vgdt;
                 let cpart = vgdt_squared * (b + bfac);
                 Channel {
                     current: -betap * cpart,
                     gm,
-                    gds: lambda * beta * cpart - gm,
+                    gds: f64::mul_add(lambda * beta, cpart, -gm),
                 }
             }
         }
@@ -480,11 +474,10 @@ impl Jfet {
         let mut tcgd = model.cgd * cjfact;
         tcgs *= cjfact1;
         tcgd *= cjfact1;
-        let vto = model
-            .vtotc
-            .map_or(model.vto - model.tcv * (temp - tnom), |vtotc| {
-                model.vto + vtotc * (temp - tnom)
-            });
+        let vto = model.vtotc.map_or(
+            f64::mul_add(model.tcv, -(temp - tnom), model.vto),
+            |vtotc| f64::mul_add(vtotc, temp - tnom, model.vto),
+        );
         let beta = model.betatce.map_or_else(
             || model.beta * (temp / tnom).powf(model.bex),
             |betatce| model.beta * 1.01_f64.powf(betatce * (temp - tnom)),
