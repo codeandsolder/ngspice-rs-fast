@@ -4,7 +4,8 @@
 
 use super::{
     CrossingSelector, Extrema, Integral, MarginScan, MeasureEvents, MeasureSpan, Measurement,
-    Window, axis_name, nonfinite, span_width, unsupported,
+    Window, axis_name, descending_axis, missing_axis, nonfinite, nonfinite_axis, span_width,
+    unsupported,
 };
 use crate::analysis::ordered_samples::same_coordinate;
 use crate::analysis::results::Plot;
@@ -19,9 +20,9 @@ use local_query::LocalHistory;
 
 type Sample = (Real, SpiceResult<Complex>);
 
-/// Coordinates must be finite and nondecreasing even when no observation uses
-/// a particular row. Track the first violation of each class; finiteness has
-/// precedence over ordering, as in the retained `OrderedAxis`.
+/// Shared coordinate validation. Deck measurements require the retained
+/// evaluator's nondecreasing axis; direct point objectives may instead use
+/// a nonincreasing axis. Finiteness has precedence over order violations.
 pub(in crate::analysis) struct AxisTracker {
     pub(super) name: &'static str,
     column: usize,
@@ -30,6 +31,7 @@ pub(in crate::analysis) struct AxisTracker {
     count: usize,
     nonfinite: Option<usize>,
     descending: Option<usize>,
+    ascending: Option<usize>,
 }
 
 impl AxisTracker {
@@ -40,10 +42,7 @@ impl AxisTracker {
     pub(in crate::analysis) fn bind_named(plot: &Plot, name: &'static str) -> SpiceResult<Self> {
         let column = plot
             .variable_index(name)
-            .ok_or_else(|| SpiceError::Unsupported {
-                feature: format!("the {} plot carries no '{name}' axis vector", plot.plotname),
-                location: None,
-            })?;
+            .ok_or_else(|| missing_axis(plot, name))?;
         Ok(Self {
             name,
             column,
@@ -52,6 +51,7 @@ impl AxisTracker {
             count: 0,
             nonfinite: None,
             descending: None,
+            ascending: None,
         })
     }
 
@@ -68,6 +68,7 @@ impl AxisTracker {
             count: 0,
             nonfinite: None,
             descending: None,
+            ascending: None,
         }
     }
 
@@ -81,31 +82,57 @@ impl AxisTracker {
             return None;
         }
         let x = coordinate.re;
-        if self.last.is_some_and(|last| x < last) {
-            self.descending.get_or_insert(index);
+        if let Some(last) = self.last {
+            if x < last {
+                self.descending.get_or_insert(index);
+            } else if x > last {
+                self.ascending.get_or_insert(index);
+            }
         }
         self.first.get_or_insert(x);
         self.last = Some(x);
-        (self.nonfinite.is_none() && self.descending.is_none()).then_some(x)
+        (self.nonfinite.is_none() && !(self.ascending.is_some() && self.descending.is_some()))
+            .then_some(x)
+    }
+
+    pub(in crate::analysis) const fn is_nondecreasing(&self) -> bool {
+        self.descending.is_none()
+    }
+
+    fn finite(&self) -> SpiceResult<()> {
+        if let Some(index) = self.nonfinite {
+            return Err(nonfinite_axis(self.name, index));
+        }
+        Ok(())
     }
 
     pub(in crate::analysis) fn range(&self) -> SpiceResult<Option<(Real, Real)>> {
-        if let Some(index) = self.nonfinite {
-            return Err(SpiceError::Numerical {
-                context: format!("measure axis {}", self.name),
-                message: format!("point {index} is not finite"),
-            });
-        }
+        self.finite()?;
         if let Some(index) = self.descending {
+            return Err(descending_axis(self.name, index));
+        }
+        Ok(self.first.zip(self.last))
+    }
+
+    /// The physical coordinate interval, in ascending order regardless of
+    /// traversal direction. Repeated inner sweeps have no unique interval
+    /// interpolation and are rejected rather than choosing one arbitrarily.
+    pub(in crate::analysis) fn query_range(&self) -> SpiceResult<Option<(Real, Real)>> {
+        self.finite()?;
+        if let (Some(up), Some(down)) = (self.ascending, self.descending) {
             return Err(SpiceError::Unsupported {
                 feature: format!(
-                    "the {} axis is not non-decreasing (it descends at point {index})",
-                    self.name
+                    "the {} axis changes direction at point {}; objective AT requires a monotonic scale",
+                    self.name,
+                    up.max(down)
                 ),
                 location: None,
             });
         }
-        Ok(self.first.zip(self.last))
+        Ok(self
+            .first
+            .zip(self.last)
+            .map(|(first, last)| (first.min(last), first.max(last))))
     }
 }
 
@@ -164,10 +191,6 @@ impl PointQuery {
         x: Real,
         sample: impl FnOnce() -> SpiceResult<Complex>,
     ) {
-        if x < self.at {
-            self.previous = Some((x, sample()));
-            return;
-        }
         if same_coordinate(x, self.at) {
             let current = sample().map_err(QueryFailure::Invalid).map(|value| {
                 if self.real_only {
@@ -191,19 +214,30 @@ impl PointQuery {
             }
             return;
         }
-        if self.result.is_none()
-            && let Some((x0, before)) = self.previous.take()
+        if self.result.is_some() {
+            return;
+        }
+        if let Some((x0, before)) = self.previous.take()
+            && ((x0 < self.at) != (x < self.at))
         {
             self.result = Some(
                 before
-                    .and_then(|left| {
-                        let right = sample()?;
+                    .and_then(|first| {
+                        let next = sample()?;
+                        // Numerical interpolation always receives its
+                        // coordinates in increasing order. The chosen
+                        // samples are adjacent in actual traversal order.
+                        let ((lo, left), (hi, right)) = if x0 < x {
+                            ((x0, first), (x, next))
+                        } else {
+                            ((x, next), (x0, first))
+                        };
                         let value = Complex::new(
-                            interpolate(x0, left.re, x, right.re, self.at),
+                            interpolate(lo, left.re, hi, right.re, self.at),
                             if self.real_only {
                                 0.
                             } else {
-                                interpolate(x0, left.im, x, right.im, self.at)
+                                interpolate(lo, left.im, hi, right.im, self.at)
                             },
                         );
                         if value.is_finite() {
@@ -217,6 +251,8 @@ impl PointQuery {
                     })
                     .map_err(QueryFailure::Invalid),
             );
+        } else {
+            self.previous = Some((x, sample()));
         }
     }
 

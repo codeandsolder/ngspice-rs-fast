@@ -115,7 +115,7 @@ card 10 @netlists/sens_jfet.cir:16:1 lines=16-18 continuations=2
   token 31 17:13 number "1e-14" value=1e-14
   token 32 17:19 word "n"
   token 33 17:20 equals "="
-  token 34 17:21 number "1.2" value=1.2000000000000002e0
+  token 34 17:21 number "1.2" value=1.2e0
   token 35 17:25 word "fc"
   token 36 17:27 equals "="
   token 37 17:28 number "0.4" value=4e-1
@@ -136,13 +136,13 @@ card 10 @netlists/sens_jfet.cir:16:1 lines=16-18 continuations=2
   token 52 18:7 number "0.5" value=5e-1
   token 53 18:11 word "betatce"
   token 54 18:18 equals "="
-  token 55 18:19 number "0.7" value=7.000000000000001e-1
+  token 55 18:19 number "0.7" value=7e-1
   token 56 18:23 word "xti"
   token 57 18:26 equals "="
   token 58 18:27 number "2.5" value=2.5e0
   token 59 18:31 word "eg"
   token 60 18:33 equals "="
-  token 61 18:34 number "1.15" value=1.1500000000000001e0
+  token 61 18:34 number "1.15" value=1.15e0
   token 62 18:39 word "kf"
   token 63 18:41 equals "="
   token 64 18:42 number "1e-26" value=1e-26

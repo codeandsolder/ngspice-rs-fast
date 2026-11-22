@@ -84,7 +84,7 @@ card 8 @netlists/m10_urc_diode_tran.cir:17:1 lines=17-17 continuations=0
   kind: dot(.tran)
   token 1 17:1 word ".tran"
   token 2 17:7 number "20n" value=2e-8
-  token 3 17:11 number "10u" value=9.999999999999999e-6
+  token 3 17:11 number "10u" value=1e-5
 card 9 @netlists/m10_urc_diode_tran.cir:18:1 lines=18-18 continuations=0
   raw: ".end"
   kind: dot(.end)

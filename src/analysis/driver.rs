@@ -154,6 +154,9 @@ pub struct AnalysisContext {
     /// default [`crate::devices::DEFAULT_GMIN`]. See
     /// [`crate::devices::ModelContext::gmin`].
     pub gmin: Real,
+    /// Resolved circuit relative tolerance (C `CKTreltol`). Device preparation
+    /// uses this value even when the analysis has a local Newton override.
+    pub reltol: Real,
     /// SPARSE pivot thresholds of the circuit matrix (`.option pivtol`/
     /// `pivrel`, C `CKTpivotAbsTol`/`CKTpivotRelTol`), default
     /// [`crate::maths::PivotTolerances::DEFAULT`].
@@ -170,6 +173,7 @@ impl AnalysisContext {
     pub const fn model_context(&self) -> crate::devices::ModelContext {
         crate::devices::ModelContext::new(self.temperature, self.nominal_temperature)
             .with_gmin(self.gmin)
+            .with_reltol(self.reltol)
             .with_pivot_tolerances(self.pivot)
     }
 }
@@ -180,6 +184,7 @@ impl Default for AnalysisContext {
             temperature: 27.0,
             nominal_temperature: 27.0,
             gmin: crate::devices::DEFAULT_GMIN,
+            reltol: crate::devices::DEFAULT_RELTOL,
             pivot: crate::maths::PivotTolerances::DEFAULT,
             rf_limits: crate::analysis::RfLimits::default(),
         }

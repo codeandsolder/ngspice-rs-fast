@@ -58,7 +58,7 @@ card 6 @netlists/sens_mesa.cir:24:1 lines=24-24 continuations=0
   token 8 24:19 number "1u" value=1e-6
   token 9 24:22 word "w"
   token 10 24:23 equals "="
-  token 11 24:24 number "20u" value=1.9999999999999998e-5
+  token 11 24:24 number "20u" value=2e-5
 card 7 @netlists/sens_mesa.cir:25:1 lines=25-25 continuations=0
   raw: "z2 2 3 0 mesmod2 l=2u w=40u dtemp=10"
   kind: device(z)
@@ -72,7 +72,7 @@ card 7 @netlists/sens_mesa.cir:25:1 lines=25-25 continuations=0
   token 8 25:20 number "2u" value=2e-6
   token 9 25:23 word "w"
   token 10 25:24 equals "="
-  token 11 25:25 number "40u" value=3.9999999999999996e-5
+  token 11 25:25 number "40u" value=4e-5
   token 12 25:29 word "dtemp"
   token 13 25:34 equals "="
   token 14 25:35 number "10" value=1e1

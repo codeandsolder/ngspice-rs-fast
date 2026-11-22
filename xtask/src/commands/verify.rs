@@ -2286,6 +2286,15 @@ mod tests {
             for name in names {
                 let deck = format!("conformance/netlists/{name}.cir");
                 fs::copy(workspace_root().join(&deck), root.join(&deck)).unwrap();
+                let original = workspace_root().join(&deck);
+                let reference =
+                    fixtures::reference_netlist_path(&workspace_root(), &original).unwrap();
+                if reference != original {
+                    let destination =
+                        fixtures::reference_netlist_path(&root, &root.join(&deck)).unwrap();
+                    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                    fs::copy(reference, destination).unwrap();
+                }
                 let target = fixtures::golden_path(&root, name);
                 fs::create_dir_all(target.parent().unwrap()).unwrap();
                 fs::copy(fixtures::golden_path(&workspace_root(), name), target).unwrap();
@@ -2309,7 +2318,8 @@ mod tests {
                     &workspace_root(),
                     p.file_stem().unwrap().to_str().unwrap(),
                 );
-                [p, raw]
+                let reference = fixtures::reference_netlist_path(&workspace_root(), &p).unwrap();
+                [p, raw, reference]
             })
             .collect();
         let before: Vec<_> = paths.iter().map(|p| fs::read(p).unwrap()).collect();
@@ -2324,25 +2334,109 @@ mod tests {
     }
 
     #[test]
+    fn reference_input_variants_change_only_numeric_spellings() {
+        let root = workspace_root();
+        for original in fixtures::netlist_paths_at(&root, None).unwrap() {
+            let reference = fixtures::reference_netlist_path(&root, &original).unwrap();
+            if reference == original {
+                continue;
+            }
+            let a = fs::read_to_string(&original).unwrap();
+            let b = fs::read_to_string(&reference).unwrap();
+            assert_eq!(a.lines().count(), b.lines().count());
+            let mut changed = 0;
+            for (left, right) in a.lines().zip(b.lines()) {
+                if left == right {
+                    continue;
+                }
+                assert!(!left.starts_with('*'), "changed comment: {left}");
+                let left: Vec<_> = left.split_ascii_whitespace().collect();
+                let right: Vec<_> = right.split_ascii_whitespace().collect();
+                assert_eq!(left.len(), right.len());
+                for (x, y) in left.into_iter().zip(right) {
+                    if x == y {
+                        continue;
+                    }
+                    let (key_x, value_x) = x.split_once('=').unwrap_or(("", x));
+                    let (key_y, value_y) = y.split_once('=').unwrap_or(("", y));
+                    assert_eq!(key_x, key_y);
+                    let number = ngspice_rs::primitives::value::parse_spice_number;
+                    assert_eq!(
+                        number(value_x).unwrap().to_bits(),
+                        number(value_y).unwrap().to_bits(),
+                        "{x} != {y} in {}",
+                        original.display()
+                    );
+                    changed += 1;
+                }
+            }
+            assert!(
+                changed > 0,
+                "redundant reference deck: {}",
+                reference.display()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_exact_input_capture_does_not_fall_back_to_original() {
+        let temp = Temp::with(&["sens_mos3"]);
+        let historical = temp.0.join("conformance/golden/sens_mos3.raw");
+        fs::copy(
+            workspace_root().join("conformance/golden/sens_mos3.raw"),
+            &historical,
+        )
+        .unwrap();
+        let selected = fixtures::golden_path(&temp.0, "sens_mos3");
+        let original = fs::read_to_string(&selected).unwrap();
+        run(&temp.0, Some("sens_mos3")).unwrap();
+        fs::remove_file(&selected).unwrap();
+        let error = run(&temp.0, Some("sens_mos3")).unwrap_err();
+        assert!(error.contains(&selected.display().to_string()), "{error}");
+
+        let mut raw = RawFile::parse(&original).unwrap();
+        let plot = &mut raw.plots[0].plot;
+        let index = plot.variable_index("v(m1:tox)").unwrap();
+        plot.point_mut(0).unwrap()[index] = ngspice_rs::primitives::Complex::ZERO;
+        fs::write(selected, raw.to_ascii().unwrap()).unwrap();
+        let error = run(&temp.0, Some("sens_mos3")).unwrap_err();
+        assert!(error.contains("v(m1:tox)"), "{error}");
+    }
+
+    #[test]
     #[ignore = "requires the independent C oracle in NGSPICE_BIN"]
     fn capture_check_verify_use_the_same_selected_reference() {
         use super::super::golden;
-        let temp = Temp::with(&["rc_divider", "multi_analysis_rc", "sens_bjt"]);
+        let names = [
+            "rc_divider",
+            "multi_analysis_rc",
+            "sens_bjt",
+            "sens_hfet2",
+            "sens_mos3",
+            "sens_mos9",
+        ];
+        let temp = Temp::with(&names);
         let root = &temp.0;
         let binary = std::env::var("NGSPICE_BIN").unwrap();
         assert!(Path::new(&binary).is_absolute());
         // Exercise case-insensitive deck IDs without perturbing the real fixtures.
         let netlists = root.join(fixtures::NETLIST_DIR);
         fs::rename(netlists.join("sens_bjt.cir"), netlists.join("SENS_BJT.CIR")).unwrap();
-        for name in ["rc_divider", "multi_analysis_rc", "sens_bjt"] {
+        for name in names {
             let selected = fixtures::golden_path(root, name);
-            let alternative = if selected == root.join("conformance/golden/sens_bjt.raw") {
+            let historical = root.join(fixtures::GOLDEN_DIR).join(format!("{name}.raw"));
+            let alternative = if name == "sens_bjt" && selected == historical {
                 root.join("conformance/golden/linux-x86_64-gnu/sens_bjt.raw")
             } else {
-                root.join("conformance/golden/sens_bjt.raw")
+                historical
             };
             if name == "sens_bjt" {
                 fs::create_dir_all(alternative.parent().unwrap()).unwrap();
+                fs::write(&alternative, "not the selected reference").unwrap();
+            }
+            let original = root.join(fixtures::NETLIST_DIR).join(format!("{name}.cir"));
+            let reference = fixtures::reference_netlist_path(root, &original).unwrap();
+            if reference != original && name != "sens_bjt" {
                 fs::write(&alternative, "not the selected reference").unwrap();
             }
             fs::remove_file(&selected).unwrap();
@@ -2355,7 +2449,7 @@ mod tests {
             golden::main(root, &c_command("check")).unwrap();
             run(root, Some(name)).unwrap();
             assert_eq!(fs::read(&selected).unwrap(), bytes);
-            if name == "sens_bjt" {
+            if name == "sens_bjt" || reference != original {
                 assert_eq!(
                     fs::read_to_string(alternative).unwrap(),
                     "not the selected reference"

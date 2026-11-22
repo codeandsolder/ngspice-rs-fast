@@ -126,10 +126,10 @@ card 11 @parser/transistor_scalars.cir:16:1 lines=16-17 continuations=1
   token 9 16:20 number "1u" value=1e-6
   token 10 16:23 word "w"
   token 11 16:24 equals "="
-  token 12 16:25 number "10u" value=9.999999999999999e-6
+  token 12 16:25 number "10u" value=1e-5
   token 13 16:29 word "w"
   token 14 16:30 equals "="
-  token 15 16:31 number "20u" value=1.9999999999999998e-5
+  token 15 16:31 number "20u" value=2e-5
   token 16 16:35 word "ad"
   token 17 16:37 equals "="
   token 18 16:38 number "2p" value=2e-12
@@ -141,7 +141,7 @@ card 11 @parser/transistor_scalars.cir:16:1 lines=16-17 continuations=1
   token 24 16:50 number "4u" value=4e-6
   token 25 16:53 word "ps"
   token 26 16:55 equals "="
-  token 27 16:56 number "5u" value=4.9999999999999996e-6
+  token 27 16:56 number "5u" value=5e-6
   token 28 16:59 word "nrd"
   token 29 16:62 equals "="
   token 30 16:63 number "2" value=2e0

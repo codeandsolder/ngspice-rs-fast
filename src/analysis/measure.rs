@@ -343,21 +343,40 @@ pub(super) fn axis_name(plot: &Plot, kind: AnalysisKind) -> SpiceResult<&'static
     Ok(name)
 }
 
+fn missing_axis(plot: &Plot, name: &str) -> SpiceError {
+    SpiceError::Unsupported {
+        feature: format!(
+            "the {} plot carries no '{name}' axis vector; it carries {}",
+            plot.plotname,
+            column_names(plot)
+        ),
+        location: None,
+    }
+}
+
+fn nonfinite_axis(name: &str, index: usize) -> SpiceError {
+    SpiceError::Numerical {
+        context: format!("measure axis {name}"),
+        message: format!("point {index} is not finite"),
+    }
+}
+
+fn descending_axis(name: &str, index: usize) -> SpiceError {
+    SpiceError::Unsupported {
+        feature: format!(
+            "the {name} axis is not non-decreasing (it descends at point {index}); a measurement needs an ordered axis, so a descending or nested .dc sweep is not measurable"
+        ),
+        location: None,
+    }
+}
+
 impl Axis {
     pub(super) fn of(plot: &Plot, kind: AnalysisKind) -> SpiceResult<Self> {
         let name = axis_name(plot, kind)?;
         let values = OrderedAxis::from_plot(plot, name).map_err(|error| match error {
-            AxisError::MissingColumn => SpiceError::Unsupported {
-                feature: format!("the {} plot carries no '{name}' axis vector; it carries {}", plot.plotname, column_names(plot)),
-                location: None,
-            },
-            AxisError::Nonfinite(index) => SpiceError::Numerical {
-                context: format!("measure axis {name}"), message: format!("point {index} is not finite"),
-            },
-            AxisError::Descending(index) => SpiceError::Unsupported {
-                feature: format!("the {name} axis is not non-decreasing (it descends at point {index}); a measurement needs an ordered axis, so a descending or nested .dc sweep is not measurable"),
-                location: None,
-            },
+            AxisError::MissingColumn => missing_axis(plot, name),
+            AxisError::Nonfinite(index) => nonfinite_axis(name, index),
+            AxisError::Descending(index) => descending_axis(name, index),
         })?;
         Ok(Self { name, values })
     }

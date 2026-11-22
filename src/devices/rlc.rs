@@ -1185,13 +1185,14 @@ mod tests {
         let solution = Vector::zeros(1);
         let mut context = crate::devices::traits::StampContext {
             matrix: &mut matrix,
-            rhs: &mut rhs,
+            rhs: crate::devices::traits::StampRhs::dense(&mut rhs),
             unknowns: &unknowns,
             nodes: &nodes,
             solution: &solution,
             temperature: 27.0,
             nominal_temperature: 27.0,
             gmin: crate::devices::DEFAULT_GMIN,
+            reltol: crate::devices::DEFAULT_RELTOL,
             frequency: 0.,
             mode: crate::devices::traits::AnalysisMode::Transient { time: 0., dt: 1e-6 },
             branches: 0..0,

@@ -298,8 +298,8 @@ fn setter_order_and_multiplier_follow_vccsparam() {
     // f1: gain=3 after m=2 gives 6, then the leading 1 after m=2 gives 2.
     assert_eq!(a.get(row(&c, "c"), branch(&c, "vin")), -2.0);
     // A literalized {2*3} gain: numparam splices "6.000000000000000e+00",
-    // which INPevaluate reads as 6e15 * 1e-15.
-    assert_eq!(a.get(branch(&c, "e1"), input), -6.000000000000001);
+    // which is now read back as the nearest binary64 value.
+    assert_eq!(a.get(branch(&c, "e1"), input), -6.);
 }
 
 #[test]

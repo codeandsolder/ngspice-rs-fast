@@ -18,7 +18,7 @@ fn circuit(body: &str) -> Result<Circuit, SpiceError> {
 }
 
 /// A `{...}` value as ngspice's card sees it: numparam's "% 23.15e" text
-/// read back by `INPevaluate`.
+/// read back with correct binary64 rounding.
 fn spliced(value: Real) -> Real {
     parse_spice_number(&format_spice_number(value)).unwrap()
 }

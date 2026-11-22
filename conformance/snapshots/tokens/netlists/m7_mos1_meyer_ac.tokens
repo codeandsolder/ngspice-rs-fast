@@ -36,7 +36,7 @@ card 4 @netlists/m7_mos1_meyer_ac.cir:5:1 lines=5-5 continuations=0
   token 6 5:19 word "mm"
   token 7 5:22 word "w"
   token 8 5:23 equals "="
-  token 9 5:24 number "5u" value=4.9999999999999996e-6
+  token 9 5:24 number "5u" value=5e-6
   token 10 5:27 word "l"
   token 11 5:28 equals "="
   token 12 5:29 number "2.2u" value=2.2e-6
@@ -70,7 +70,7 @@ card 5 @netlists/m7_mos1_meyer_ac.cir:6:1 lines=6-7 continuations=1
   token 10 6:28 number "0.8" value=8e-1
   token 11 6:32 word "kp"
   token 12 6:34 equals "="
-  token 13 6:35 number "50u" value=4.9999999999999996e-5
+  token 13 6:35 number "50u" value=5e-5
   token 14 6:39 word "gamma"
   token 15 6:44 equals "="
   token 16 6:45 number "0.5" value=5e-1

@@ -14,8 +14,8 @@ card 1 @netlists/transformer_tran.cir:5:1 lines=5-5 continuations=0
   token 8 5:20 number "0" value=0e0
   token 9 5:22 number "1u" value=1e-6
   token 10 5:25 number "1u" value=1e-6
-  token 11 5:28 number "100u" value=9.999999999999999e-5
-  token 12 5:33 number "200u" value=1.9999999999999998e-4
+  token 11 5:28 number "100u" value=1e-4
+  token 12 5:33 number "200u" value=2e-4
   token 13 5:37 rparen ")"
 card 2 @netlists/transformer_tran.cir:6:1 lines=6-6 continuations=0
   raw: "rs in p 10"
@@ -57,7 +57,7 @@ card 7 @netlists/transformer_tran.cir:11:1 lines=11-11 continuations=0
   kind: dot(.tran)
   token 1 11:1 word ".tran"
   token 2 11:7 number "1u" value=1e-6
-  token 3 11:10 number "400u" value=3.9999999999999996e-4
+  token 3 11:10 number "400u" value=4e-4
 card 8 @netlists/transformer_tran.cir:12:1 lines=12-12 continuations=0
   raw: ".end"
   kind: dot(.end)

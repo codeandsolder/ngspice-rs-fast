@@ -4,8 +4,11 @@
 //! Loads are disposable; no observation accepts state or advances history.
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::devices::circuit::{PreparedMutualTerms, PreparedPoint, TopologyId};
+use crate::devices::state::IsolatedState;
+use crate::devices::traits::{IsolatedRhs, StampRhs};
 use crate::devices::{
-    Circuit, Device, Forcing, IterationPhase, LoadRequest, ModelContext, PreparedRun, TrialState,
+    Circuit, Device, Forcing, LoadRequest, ModelContext, PreparedRun, TrialState,
 };
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
@@ -47,15 +50,12 @@ fn terminal(device: &dyn Device, key: &str) -> Option<usize> {
     }
 }
 
-/// Rawfile units of the supported observation quantities.
-#[must_use]
-pub fn unit(name: &str) -> &'static str {
-    let (device, key) = query(name).unwrap_or(("", ""));
-    if key == "ic" && device.starts_with('c') {
+fn unit(device: char, key: &str) -> &'static str {
+    if key == "ic" && device == 'c' {
         return "voltage";
     }
     // mesask.c: drain, gate and gate-drain currents.
-    if matches!(key, "cd" | "cg" | "cgd") && device.starts_with('z') {
+    if matches!(key, "cd" | "cg" | "cgd") && device == 'z' {
         return "current";
     }
     match key {
@@ -70,218 +70,377 @@ pub fn unit(name: &str) -> &'static str {
     }
 }
 
-/// Resolve observation targets once, while keeping the public column names
-/// in their original order. A caller replacing devices through `devices_mut`
-/// can invalidate a hint; identity is checked before using it.
+/// A column bound to finalized device identity and a typed ask selector.
+#[derive(Debug)]
+pub struct Observation {
+    name: String,
+    unit: &'static str,
+    device: usize,
+    selector: Selector,
+}
+
+impl Observation {
+    /// Original (canonical lower-case) plot column name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Rawfile unit derived once from the resolved device and quantity.
+    #[must_use]
+    pub const fn unit(&self) -> &'static str {
+        self.unit
+    }
+}
+
+#[derive(Debug)]
+enum Selector {
+    Current {
+        load: usize,
+        slot: usize,
+        signed: bool,
+    },
+    Power {
+        load: usize,
+        slot: usize,
+        rows: [Option<usize>; 2],
+    },
+    SourceDc,
+    // Device-specific ask keywords are resolved by the device against the
+    // effective context; their spelling is never parsed during evaluation.
+    Parameter(Box<str>),
+}
+
 #[derive(Default)]
 pub(super) struct ObservationPlan {
-    names: Vec<String>,
-    devices: Vec<usize>,
+    topology: Option<TopologyId>,
+    queries: Vec<Observation>,
+    loads: Vec<TerminalLayout>,
 }
 
-impl ObservationPlan {
-    fn iter(&self) -> impl Iterator<Item = (&str, usize)> {
-        self.names
-            .iter()
-            .map(String::as_str)
-            .zip(self.devices.iter().copied())
+/// Physical terminal rows in first-port order, with a separate lookup index
+/// for each unfolded matrix contribution. Aliased ports share one slot;
+/// the final slot is ground's negative sum of distinct physical rows.
+struct TerminalLayout {
+    device: usize,
+    rows: Vec<usize>,
+    by_row: Vec<(usize, usize)>,
+    ports: Vec<usize>,
+}
+
+impl TerminalLayout {
+    fn new(circuit: &Circuit, device: usize, terminals: &[NodeId]) -> Self {
+        let mut rows = Vec::new();
+        let mut by_row = BTreeMap::new();
+        let mut ports = Vec::with_capacity(terminals.len());
+        for &node in terminals {
+            ports.push(circuit.unknowns().node_row(node).map(|row| {
+                *by_row.entry(row).or_insert_with(|| {
+                    let slot = rows.len();
+                    rows.push(row);
+                    slot
+                })
+            }));
+        }
+        Self {
+            device,
+            ports: ports
+                .into_iter()
+                .map(|slot| slot.unwrap_or(rows.len()))
+                .collect(),
+            rows,
+            by_row: by_row.into_iter().collect(),
+        }
+    }
+
+    fn residuals(
+        &self,
+        matrix: &SparseMatrix,
+        rhs: impl Fn(usize) -> Real,
+        solution: &Vector,
+        currents: &mut [Real],
+    ) {
+        currents.fill(0.);
+        for triplet in matrix.triplets() {
+            if let Ok(index) = self
+                .by_row
+                .binary_search_by_key(&triplet.row, |&(row, _)| row)
+            {
+                let contribution = triplet.value * solution.as_slice()[triplet.col];
+                currents[self.by_row[index].1] += contribution;
+            }
+        }
+        let mut ground = 0.;
+        for (&row, current) in self.rows.iter().zip(&mut *currents) {
+            *current -= rhs(row);
+            ground -= *current;
+        }
+        currents[self.rows.len()] = ground;
     }
 }
 
-fn observation_index(circuit: &Circuit, instance: &str, hint: usize) -> Option<usize> {
-    if circuit
-        .devices()
-        .get(hint)
-        .is_some_and(|d| d.name().eq_ignore_ascii_case(instance))
-    {
-        Some(hint)
-    } else {
-        circuit
-            .devices()
-            .iter()
-            .position(|d| d.name().eq_ignore_ascii_case(instance))
+struct LoadedTerminals {
+    ready: bool,
+    currents: Vec<Real>,
+}
+
+/// Capacity is analysis-local; no previous point's currents or trial
+/// state are considered valid after the next call begins.
+pub(super) struct ObservationWorkspace {
+    matrix: SparseMatrix,
+    rhs: IsolatedRhs,
+    state: IsolatedState,
+    loaded: Vec<LoadedTerminals>,
+}
+
+impl ObservationWorkspace {
+    fn new(circuit: &Circuit, plan: &ObservationPlan) -> Self {
+        let n = circuit.unknown_count();
+        Self {
+            matrix: SparseMatrix::new(n, n),
+            rhs: IsolatedRhs::new(n),
+            state: IsolatedState::default(),
+            loaded: plan
+                .loads
+                .iter()
+                .map(|layout| LoadedTerminals {
+                    ready: false,
+                    currents: vec![0.; layout.rows.len() + 1],
+                })
+                .collect(),
+        }
+    }
+
+    fn begin(&mut self) {
+        for load in &mut self.loaded {
+            load.ready = false;
+        }
     }
 }
 
-/// One converged point: the isolated matrix and RHS are scratch, not accepted
-/// state. Cache only the terminal residuals, not a dense vector per device.
+/// Read-only point loads. The effective replacements and mutual terms are
+/// supplied by the same prepared context that the solver used.
 struct PointLoads<'a, 'b> {
     circuit: &'a Circuit,
     request: &'a LoadRequest<'b>,
     sources: &'a [(&'a str, Real)],
     time: Option<(Real, Forcing)>,
     previous: Option<&'a TrialState>,
-    point: &'a crate::devices::circuit::PreparedPoint,
-    mutual: Option<crate::devices::circuit::PreparedMutualTerms>,
-    scratch: Option<(SparseMatrix, Vector)>,
-    currents: BTreeMap<usize, Vec<Real>>,
+    point: &'a PreparedPoint,
+    mutual: Option<PreparedMutualTerms>,
+    workspace: &'a mut ObservationWorkspace,
 }
 
 impl PointLoads<'_, '_> {
-    fn current(
-        &mut self,
-        index: usize,
-        device: &dyn Device,
-        port: usize,
-        query: &str,
-    ) -> SpiceResult<Real> {
-        if let Some(currents) = self.currents.get(&index) {
-            return currents.get(port).copied().ok_or_else(|| gap(query));
-        }
-        if self.mutual.is_none() {
-            self.circuit.check_numbering()?;
-            let n = self.circuit.unknown_count();
-            if self.request.solution.len() != n
-                || self.request.history.len() != self.circuit.state_len()
-            {
-                return Err(SpiceError::circuit(
-                    "isolated observation load does not match the circuit numbering",
-                ));
+    fn current(&mut self, load: usize, slot: usize, name: &str) -> SpiceResult<Real> {
+        let layout = &self.circuit.runtime.observations.loads[load];
+        let work = &mut *self.workspace;
+        let loaded = &mut work.loaded[load];
+        if !loaded.ready {
+            if self.mutual.is_none() {
+                self.mutual = Some(self.point.mutual(self.circuit)?);
             }
-            self.mutual = Some(self.point.mutual(self.circuit)?);
+            let device = self.point.device(self.circuit, layout.device);
+            work.matrix.clear();
+            work.rhs.clear();
+            let states = self.request.history.isolated_device(
+                &mut work.state,
+                self.previous,
+                layout.device,
+            )?;
+            let stamped = self.circuit.stamp_isolated(
+                layout.device,
+                device,
+                self.request,
+                &mut work.matrix,
+                StampRhs::isolated(&mut work.rhs),
+                states,
+                self.mutual.as_deref().unwrap_or(&[]),
+            );
+            work.state.clear();
+            stamped?;
+            if device.designator() == 'i' {
+                let value = device
+                    .observation_source_current(self.time)?
+                    .ok_or_else(|| gap(name))?;
+                let value = self
+                    .sources
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(device.name()))
+                    .map_or(value, |(_, v)| *v * device.observation_source_multiplier());
+                for (terminal, sign) in device.terminals().iter().take(2).zip([-1., 1.]) {
+                    if let Some(row) = self.circuit.unknowns().node_row(*terminal) {
+                        work.rhs.set(row, sign * value)?;
+                    }
+                }
+            }
+            layout.residuals(
+                &work.matrix,
+                |row| work.rhs.get(row),
+                self.request.solution,
+                &mut loaded.currents,
+            );
+            loaded.ready = true;
         }
-        let n = self.circuit.unknown_count();
-        let (matrix, rhs) = self
-            .scratch
-            .get_or_insert_with(|| (SparseMatrix::new(n, n), Vector::zeros(n)));
-        matrix.clear();
-        rhs.clear();
-        let mut trial = self
-            .request
-            .history
-            .trial_in(IterationPhase::Float, self.previous)?
-            .with_device_limiting(false);
-        self.circuit.stamp_isolated(
-            index,
-            device,
-            self.request,
-            matrix,
-            rhs,
-            &mut trial,
-            self.mutual.as_deref().unwrap_or(&[]),
-        )?;
-        if device.designator() == 'i' {
-            let value = device
-                .observation_source_current(self.time)?
-                .ok_or_else(|| gap(query))?;
-            let value = self
+        loaded.currents.get(slot).copied().ok_or_else(|| gap(name))
+    }
+
+    fn observe(&mut self, query: &Observation) -> SpiceResult<Real> {
+        let name = query.name();
+        let device = self.point.device(self.circuit, query.device);
+        let row_value =
+            |row: Option<usize>| row.map_or(0., |row| self.request.solution.as_slice()[row]);
+        let context = self.request.model_context;
+        match &query.selector {
+            Selector::Current { load, slot, signed } => {
+                let current = self.current(*load, *slot, name)?;
+                Ok(if *signed {
+                    current * device.observation_current_sign()
+                } else {
+                    current
+                })
+            }
+            Selector::Power { load, slot, rows } => {
+                let current = self.current(*load, *slot, name)? * device.observation_current_sign();
+                Ok(current * (row_value(rows[0]) - row_value(rows[1])))
+            }
+            Selector::SourceDc => self
                 .sources
                 .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(device.name()))
-                .map_or(value, |(_, v)| *v * device.observation_source_multiplier());
-            for (terminal, sign) in device.terminals().iter().take(2).zip([-1., 1.]) {
-                if let Some(row) = self.circuit.unknowns().node_row(*terminal) {
-                    rhs.as_mut_slice()[row] = sign * value;
+                .find(|(n, _)| n.eq_ignore_ascii_case(device.name()))
+                .map(|(_, value)| *value)
+                .or(device.observation_parameter("dc", context)?)
+                .ok_or_else(|| gap(name)),
+            Selector::Parameter(key) => {
+                if let Some(value) = device.observation_parameter(key, context)? {
+                    Ok(value)
+                } else {
+                    let voltage = |node| row_value(self.circuit.unknowns().node_row(node));
+                    device
+                        .observation_operating(key, context, &voltage, self.time.is_some())?
+                        .ok_or_else(|| gap(name))
                 }
             }
         }
-        let currents = terminal_residuals(
-            self.circuit,
-            device.terminals(),
-            matrix,
-            rhs,
-            self.request.solution,
-        );
-        let value = currents.get(port).copied().ok_or_else(|| gap(query))?;
-        self.currents.insert(index, currents);
-        Ok(value)
     }
 }
 
-/// Same accumulation as `SparseMatrix::mul_vector`, but only for terminal
-/// rows. Preserve the unfolded contribution order, including cancellation
-/// and aliased nodes. Ground is the negative sum in terminal order, with
-/// each physical node counted once.
-fn terminal_residuals(
-    circuit: &Circuit,
-    terminals: &[NodeId],
-    matrix: &SparseMatrix,
-    rhs: &Vector,
-    solution: &Vector,
-) -> Vec<Real> {
-    let rows: Vec<_> = terminals
-        .iter()
-        .map(|&node| circuit.unknowns().node_row(node))
-        .collect();
-    let mut currents = vec![0.; rows.len()];
-    for triplet in matrix.triplets() {
-        for (&row, current) in rows.iter().zip(&mut currents) {
-            if row == Some(triplet.row) {
-                let contribution = triplet.value * solution.as_slice()[triplet.col];
-                *current += contribution;
+impl ObservationPlan {
+    fn bind(circuit: &Circuit, names: &[String]) -> SpiceResult<Self> {
+        let mut plan = Self {
+            topology: Some(circuit.topology_id()?),
+            ..Self::default()
+        };
+        let mut seen = BTreeSet::new();
+        let mut load_by_device = BTreeMap::new();
+        for name in names {
+            let name = name.to_ascii_lowercase();
+            let (instance, key) = query(&name)?;
+            let index = circuit
+                .observation_device_index(instance)
+                .ok_or_else(|| SpiceError::circuit(format!("{name}: unknown device {instance}")))?;
+            let device = circuit.devices()[index].as_ref();
+            if name.starts_with("i(") && device.branch_currents() == 1 {
+                continue;
             }
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if plan.queries.len() >= 1024 {
+                return Err(gap("more than 1024 requested quantities"));
+            }
+            let power = matches!(key, "p" | "power");
+            let selector = if let Some(port) = terminal(device, key).or_else(|| power.then_some(0))
+            {
+                let terminals = device.terminals();
+                if power && terminals.len() != 2 {
+                    return Err(gap(&name));
+                }
+                let node = terminals.get(port).ok_or_else(|| gap(&name))?;
+                if terminals
+                    .iter()
+                    .filter(|terminal| *terminal == node)
+                    .count()
+                    != 1
+                {
+                    return Err(gap(&format!("{name}: coincident terminals")));
+                }
+                let load = *load_by_device.entry(index).or_insert_with(|| {
+                    let load = plan.loads.len();
+                    plan.loads
+                        .push(TerminalLayout::new(circuit, index, terminals));
+                    load
+                });
+                let slot = plan.loads[load].ports[port];
+                if power {
+                    Selector::Power {
+                        load,
+                        slot,
+                        rows: [
+                            circuit.unknowns().node_row(terminals[0]),
+                            circuit.unknowns().node_row(terminals[1]),
+                        ],
+                    }
+                } else {
+                    Selector::Current {
+                        load,
+                        slot,
+                        signed: !matches!(key, "i" | "current"),
+                    }
+                }
+            } else if key == "dc" && matches!(device.designator(), 'v' | 'i') {
+                Selector::SourceDc
+            } else {
+                Selector::Parameter(key.into())
+            };
+            plan.queries.push(Observation {
+                unit: unit(device.designator(), key),
+                name,
+                device: index,
+                selector,
+            });
         }
+        Ok(plan)
     }
-    for (&row, current) in rows.iter().zip(&mut currents) {
-        if let Some(row) = row {
-            *current -= rhs.as_slice()[row];
+
+    fn validate(&self, circuit: &Circuit) -> SpiceResult<()> {
+        let topology = circuit.topology_id()?;
+        if self.topology.is_some_and(|bound| bound != topology) {
+            return Err(SpiceError::circuit("stale observation topology binding"));
         }
+        Ok(())
     }
-    let mut ground = 0.;
-    for (port, node) in terminals.iter().enumerate() {
-        if rows[port].is_some() && !terminals[..port].contains(node) {
-            ground -= currents[port];
-        }
-    }
-    for (&row, current) in rows.iter().zip(&mut currents) {
-        if row.is_none() {
-            *current = ground;
-        }
-    }
-    currents
 }
 
 impl Circuit {
-    /// Select extra device quantities to record at each solved point.
+    /// Bind extra quantities to finalized devices and terminal roles.
     /// Existing branch-current columns are retained without duplication.
     ///
     /// # Errors
-    /// Unknown devices, malformed queries, or duplicate queries beyond the budget.
+    /// Unknown devices, invalid terminal queries, malformed queries or
+    /// more than 1024 distinct additional quantities.
     pub fn set_observations(&mut self, names: &[String]) -> SpiceResult<()> {
-        self.check_numbering()?;
-        let mut plan = ObservationPlan::default();
-        let mut seen = BTreeSet::new();
-        for name in names {
-            let name = name.to_ascii_lowercase();
-            let (device, _) = query(&name)?;
-            let index = self
-                .devices()
-                .iter()
-                .position(|d| d.name().eq_ignore_ascii_case(device))
-                .ok_or_else(|| SpiceError::circuit(format!("{name}: unknown device {device}")))?;
-            if name.starts_with("i(") && self.devices()[index].branch_currents() == 1 {
-                continue;
-            }
-            if seen.insert(name.clone()) {
-                plan.names.push(name);
-                plan.devices.push(index);
-            }
-            if plan.names.len() > 1024 {
-                return Err(gap("more than 1024 requested quantities"));
-            }
-        }
-        self.runtime.observations = plan;
+        self.runtime.observations = ObservationPlan::bind(self, names)?;
         Ok(())
     }
 
-    /// Extra columns requested through [`Self::set_observations`].
+    /// Extra bound columns requested through [`Self::set_observations`].
     #[must_use]
-    pub fn observations(&self) -> &[String] {
-        &self.runtime.observations.names
+    pub fn observations(&self) -> &[Observation] {
+        &self.runtime.observations.queries
     }
 
-    /// Observe a converged real point using immutable copies of its device loads.
-    /// `sources` carries DC sweep source values; `time` selects transient source forcing.
+    /// Observe a converged real point using isolated, disposable device loads.
     /// The pre-acceptance history and coefficients must be those of the solved trial.
     ///
     /// # Errors
-    /// Unsupported quantities, ambiguous coincident terminal currents, or nonfinite arithmetic.
+    /// Unsupported quantities, stale state, or nonfinite arithmetic.
     pub fn observe_real(
         &self,
         request: &LoadRequest<'_>,
         sources: &[(&str, Real)],
-        time: Option<(Real, crate::devices::Forcing)>,
-        previous: Option<&crate::devices::TrialState>,
+        time: Option<(Real, Forcing)>,
+        previous: Option<&TrialState>,
     ) -> SpiceResult<Vec<Complex>> {
         self.prepare_run()
             .observe_real(request, sources, time, previous)
@@ -299,10 +458,20 @@ impl Circuit {
         if let Some(trial) = previous {
             request.history.check_trial(trial)?;
         }
-        if self.runtime.observations.names.is_empty() {
+        let plan = &self.runtime.observations;
+        plan.validate(self)?;
+        if plan.queries.is_empty() {
             return Ok(Vec::new());
         }
+        if request.solution.len() != self.unknown_count() {
+            return Err(SpiceError::circuit(
+                "isolated observation load does not match the circuit numbering",
+            ));
+        }
         let point = run.point(request.model_context)?;
+        let mut workspace = run.observation_work.borrow_mut();
+        let workspace = workspace.get_or_insert_with(|| ObservationWorkspace::new(self, plan));
+        workspace.begin();
         let mut loads = PointLoads {
             circuit: self,
             request,
@@ -311,73 +480,15 @@ impl Circuit {
             previous,
             point: &point,
             mutual: None,
-            scratch: None,
-            currents: BTreeMap::new(),
+            workspace,
         };
-        self.runtime
-            .observations
+        plan.queries
             .iter()
-            .map(|(name, hint)| {
-                let (instance, key) = query(name)?;
-                let index = observation_index(self, instance, hint).ok_or_else(|| {
-                    SpiceError::circuit(format!("unknown observation device {instance}"))
-                })?;
-                let device = point.device(self, index);
-                let power = matches!(key, "p" | "power");
-                let value = if let Some(port) = terminal(device, key).or_else(|| power.then_some(0))
-                {
-                    if power && device.terminals().len() != 2 {
-                        return Err(gap(name));
-                    }
-                    let node = *device.terminals().get(port).ok_or_else(|| gap(name))?;
-                    if device.terminals().iter().filter(|n| **n == node).count() != 1 {
-                        return Err(gap(&format!("{name}: coincident terminals")));
-                    }
-                    let current = loads.current(index, device, port, name)?;
-                    let current = if matches!(key, "i" | "current") {
-                        current
-                    } else {
-                        current * device.observation_current_sign()
-                    };
-                    if power {
-                        let voltage = |node| {
-                            self.unknowns()
-                                .node_row(node)
-                                .map_or(0., |r| request.solution.as_slice()[r])
-                        };
-                        current * (voltage(device.terminals()[0]) - voltage(device.terminals()[1]))
-                    } else {
-                        current
-                    }
-                } else if key == "dc" && matches!(device.designator(), 'v' | 'i') {
-                    sources
-                        .iter()
-                        .find(|(n, _)| n.eq_ignore_ascii_case(instance))
-                        .map(|(_, value)| *value)
-                        .or(device.observation_parameter(key, request.model_context)?)
-                        .ok_or_else(|| gap(name))?
-                } else if let Some(value) =
-                    device.observation_parameter(key, request.model_context)?
-                {
-                    value
-                } else {
-                    let voltage = |node: crate::primitives::NodeId| {
-                        self.unknowns()
-                            .node_row(node)
-                            .map_or(0., |r| request.solution.as_slice()[r])
-                    };
-                    device
-                        .observation_operating(
-                            key,
-                            request.model_context,
-                            &voltage,
-                            time.is_some(),
-                        )?
-                        .ok_or_else(|| gap(name))?
-                };
+            .map(|query| {
+                let value = loads.observe(query)?;
                 if !value.is_finite() {
                     return Err(SpiceError::Numerical {
-                        context: name.to_owned(),
+                        context: query.name.clone(),
                         message: "nonfinite device observation".into(),
                     });
                 }
@@ -386,11 +497,11 @@ impl Circuit {
             .collect()
     }
 
-    /// Observe scalar instance parameters for a spectral point. Device current and
-    /// power asks are rejected as by C's passive `*ask.c` routines in AC.
+    /// Observe scalar instance parameters for a spectral point. Device current
+    /// and power asks are rejected as by C's passive asks in AC.
     ///
     /// # Errors
-    /// A current/power or unsupported scalar query, or nonfinite parameter.
+    /// A current/power or unsupported scalar query, stale plan, or nonfinite parameter.
     pub fn observe_parameters(&self, context: &ModelContext) -> SpiceResult<Vec<Complex>> {
         self.prepare_run().observe_parameters(context)
     }
@@ -400,22 +511,25 @@ impl Circuit {
         run: &PreparedRun<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Vec<Complex>> {
+        let plan = &self.runtime.observations;
+        plan.validate(self)?;
         let point = run.point(context)?;
-        self.runtime
-            .observations
+        plan.queries
             .iter()
-            .map(|(name, hint)| {
-                let (instance, key) = query(name)?;
-                let index = observation_index(self, instance, hint).ok_or_else(|| gap(name))?;
-                let device = point.device(self, index);
-                if terminal(device, key).is_some() || matches!(key, "p" | "power") {
-                    return Err(gap(&format!("{name}: AC current/power ask")));
-                }
-                let value = device
+            .map(|query| {
+                let key = match &query.selector {
+                    Selector::SourceDc => "dc",
+                    Selector::Parameter(key) => key,
+                    Selector::Current { .. } | Selector::Power { .. } => {
+                        return Err(gap(&format!("{}: AC current/power ask", query.name())));
+                    }
+                };
+                let value = point
+                    .device(self, query.device)
                     .observation_parameter(key, context)?
-                    .ok_or_else(|| gap(name))?;
+                    .ok_or_else(|| gap(query.name()))?;
                 if !value.is_finite() {
-                    return Err(gap(name));
+                    return Err(gap(query.name()));
                 }
                 Ok(Complex::real(value))
             })
@@ -508,7 +622,127 @@ mod tests {
         assert_eq!(circuit.observations().len(), 5);
         let history = circuit.state_history().unwrap();
         let model = ModelContext::default();
-        let solution = Vector::from_slice(&[3., 1.]);
+        let names: Vec<_> = circuit
+            .observations()
+            .iter()
+            .map(|q| (q.name(), q.unit()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("i(r1)", "current"),
+                ("@r2[i]", "current"),
+                ("@r1[p]", "power"),
+                ("@r2[power]", "power"),
+                ("@r1[current]", "current"),
+            ]
+        );
+        let counts = [first.get(), second.get()];
+        let run = circuit.prepare_run();
+        for (step, (solution, expected)) in [
+            ([3., 1.], [4., -6., 8., 18., 4.]),
+            ([-1., 2.], [-6., 2., 18., 2., -6.]),
+            ([0., 0.], [0.; 5]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let solution = Vector::from_slice(&solution);
+            let request = LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &solution,
+                model_context: &model,
+                integration: None,
+                history: &history,
+                forcing: None,
+            };
+            let values = run.observe_real(&request, &[], None, None).unwrap();
+            assert_eq!(values, expected.map(Complex::real));
+            assert_eq!(
+                [first.get(), second.get()],
+                [counts[0] + step + 1, counts[1] + step + 1]
+            );
+        }
+        assert!(
+            run.observe_parameters(&model)
+                .unwrap_err()
+                .to_string()
+                .contains("AC current/power")
+        );
+    }
+
+    #[derive(Debug)]
+    struct Stateful {
+        name: &'static str,
+        nodes: [NodeId; 2],
+        slots: usize,
+    }
+
+    impl Device for Stateful {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn designator(&self) -> char {
+            'r'
+        }
+        fn terminals(&self) -> &[NodeId] {
+            &self.nodes
+        }
+        fn state_count(&self) -> usize {
+            self.slots
+        }
+        fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
+            assert_eq!(context.states.len(), self.slots);
+            assert!(context.states.trial(0).unwrap().is_nan());
+            assert!(!context.states.device_limiting());
+            let value = context.states.accepted(1, 0).unwrap_or(0.)
+                + context.states.iterate(0).unwrap_or(0.);
+            context.states.set(0, value)?;
+            context.states.patch_state1(0, value + 100.)?;
+            context.states.report_nonconvergence()?;
+            context.stamp_rhs(self.nodes[0], -value)?;
+            context.stamp_rhs(self.nodes[1], value)
+        }
+    }
+
+    #[test]
+    fn isolated_state_and_rhs_are_point_local_even_with_previous_patches() {
+        let mut circuit = Circuit::new();
+        let a = circuit.add_node("a").unwrap();
+        let b = circuit.add_node("b").unwrap();
+        for (name, node, slots) in [("r1", a, 1), ("r2", b, 4)] {
+            circuit
+                .add_device(Box::new(Stateful {
+                    name,
+                    nodes: [node, NodeId::GROUND],
+                    slots,
+                }))
+                .unwrap();
+        }
+        circuit.finalize().unwrap();
+        circuit
+            .set_observations(&["i(r1)".into(), "i(r2)".into(), "@r1[p]".into()])
+            .unwrap();
+        let mut history = circuit.state_history().unwrap();
+        let mut accepted = history.trial();
+        for index in 0..2 {
+            let mut view = history.device_of(&mut accepted, index).unwrap();
+            for slot in 0..view.len() {
+                view.set(slot, if index == 0 { 2. } else { 3. }).unwrap();
+            }
+        }
+        history.commit(accepted).unwrap();
+        let mut previous = history.trial();
+        for (index, value) in [5., 7.].into_iter().enumerate() {
+            let mut view = history.device_of(&mut previous, index).unwrap();
+            view.set(0, value).unwrap();
+            view.patch_state1(0, value + 10.).unwrap();
+        }
+        let history_before = history.clone();
+        let previous_before = previous.clone();
+        let run = circuit.prepare_run();
+        let model = ModelContext::default();
+        let solution = Vector::from_slice(&[2., 3.]);
         let request = LoadRequest {
             mode: AnalysisMode::OperatingPoint,
             solution: &solution,
@@ -517,14 +751,128 @@ mod tests {
             history: &history,
             forcing: None,
         };
-        let counts = [first.get(), second.get()];
-        for step in 1..=2 {
-            let values = circuit.observe_real(&request, &[], None, None).unwrap();
-            assert_eq!(values, [4., -6., 8., 18., 4.].map(Complex::real));
+        for (prev, expected) in [
+            (Some(&previous), [20., 24., 40.]),
+            (None, [2., 3., 4.]),
+            (Some(&previous), [20., 24., 40.]),
+        ] {
             assert_eq!(
-                [first.get(), second.get()],
-                [counts[0] + step, counts[1] + step]
+                run.observe_real(&request, &[], None, prev).unwrap(),
+                expected.map(Complex::real)
             );
+        }
+        assert_eq!(history, history_before);
+        // NaN slots cannot be compared using TrialState's PartialEq.
+        assert_eq!(
+            previous
+                .values()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            previous_before
+                .values()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        let work = run.observation_work.borrow();
+        let work = work.as_ref().unwrap();
+        assert!(work.loaded.iter().all(|load| load.ready));
+    }
+
+    #[test]
+    fn binding_failures_are_transactional_and_topology_edits_invalidate() {
+        let mut circuit = Circuit::new();
+        let a = circuit.add_node("a").unwrap();
+        let g = NodeId::GROUND;
+        let count = Rc::new(Cell::new(0));
+        for (name, nodes) in [("r1", [a, g]), ("r2", [a, a])] {
+            circuit
+                .add_device(Box::new(Counted {
+                    name,
+                    nodes,
+                    count: Rc::clone(&count),
+                }))
+                .unwrap();
+        }
+        circuit.finalize().unwrap();
+        circuit.set_observations(&["i(r1)".into()]).unwrap();
+        for query in ["i(unknown)", "@r1[", "i(r2)", "@r2[p]", "@r1[ib]]"] {
+            assert!(
+                circuit.set_observations(&[query.into()]).is_err(),
+                "{query}"
+            );
+            assert_eq!(circuit.observations()[0].name(), "i(r1)");
+        }
+        let history = circuit.state_history().unwrap();
+        let model = ModelContext::default();
+        let solution = Vector::from_slice(&[1.]);
+        let request = LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &solution,
+            model_context: &model,
+            integration: None,
+            history: &history,
+            forcing: None,
+        };
+        circuit
+            .replace_device(
+                0,
+                Box::new(Counted {
+                    name: "r1",
+                    nodes: [g, a],
+                    count,
+                }),
+            )
+            .unwrap();
+        assert!(circuit.observe_real(&request, &[], None, None).is_err());
+        circuit.finalize().unwrap();
+        assert!(circuit.observations().is_empty());
+        assert!(circuit.observe_real(&request, &[], None, None).is_err());
+        circuit.set_observations(&["i(r1)".into()]).unwrap();
+        let history = circuit.state_history().unwrap();
+        let request = LoadRequest {
+            history: &history,
+            ..request
+        };
+        assert_eq!(
+            circuit.observe_real(&request, &[], None, None).unwrap(),
+            [Complex::real(-2.)]
+        );
+    }
+
+    #[test]
+    fn a_nonfinite_point_does_not_poison_the_next_observation() {
+        let mut circuit = Circuit::new();
+        let a = circuit.add_node("a").unwrap();
+        circuit
+            .add_device(Box::new(Counted {
+                name: "r1",
+                nodes: [a, NodeId::GROUND],
+                count: Rc::new(Cell::new(0)),
+            }))
+            .unwrap();
+        circuit.finalize().unwrap();
+        circuit.set_observations(&["i(r1)".into()]).unwrap();
+        let history = circuit.state_history().unwrap();
+        let model = ModelContext::default();
+        let run = circuit.prepare_run();
+        for (value, expected) in [(Real::MAX, None), (2., Some(4.))] {
+            let solution = Vector::from_slice(&[value]);
+            let request = LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &solution,
+                model_context: &model,
+                integration: None,
+                history: &history,
+                forcing: None,
+            };
+            let actual = run.observe_real(&request, &[], None, None);
+            if let Some(expected) = expected {
+                assert_eq!(actual.unwrap(), [Complex::real(expected)]);
+            } else {
+                assert!(matches!(actual, Err(SpiceError::Numerical { .. })));
+            }
         }
     }
 
@@ -550,8 +898,11 @@ mod tests {
         let ax = matrix.mul_vector(&solution).unwrap();
         let ra = ax.as_slice()[0] - rhs.as_slice()[0];
         let rb = ax.as_slice()[1] - rhs.as_slice()[1];
-        let actual = terminal_residuals(&circuit, &[g, a, b, a], &matrix, &rhs, &solution);
-        for (got, expected) in actual.iter().zip([0. - ra - rb, ra, rb, ra]) {
+        let layout = TerminalLayout::new(&circuit, 0, &[g, a, b, a]);
+        let mut currents = vec![0.; layout.rows.len() + 1];
+        layout.residuals(&matrix, |row| rhs.as_slice()[row], &solution, &mut currents);
+        let actual = layout.ports.iter().map(|&slot| currents[slot]);
+        for (got, expected) in actual.zip([0. - ra - rb, ra, rb, ra]) {
             assert_eq!(got.to_bits(), expected.to_bits());
         }
     }

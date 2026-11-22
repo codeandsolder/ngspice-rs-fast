@@ -19,6 +19,9 @@ use crate::netlist::ast::{FourierCard, MeasureCard, MeasureEvent, MeasureRequest
 use crate::netlist::eval::ParamScope;
 use crate::primitives::{AnalysisKind, Complex, Real, SpiceError, SpiceResult};
 
+mod queries;
+use queries::{QueryPlan, QueryRows};
+
 /// A requested observation independent of measurement-card expression bindings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Observation {
@@ -37,6 +40,8 @@ pub enum ObservationReduction {
     /// Last accepted value; supports single-point operating-point outputs.
     Last,
     /// Linear query at a physical time, frequency or DC scale coordinate.
+    /// The scale must be monotonic in either direction; a direction change
+    /// makes a single coordinate query ambiguous.
     At(Real),
     /// Selected trace with an explicit maximum number of accepted samples.
     /// No decimation, interpolation or duplicate-coordinate merging.
@@ -133,6 +138,7 @@ pub struct PlotObjectivePlan {
     measurements: Vec<MeasureCard>,
     reductions: Vec<Option<BoundMeasure>>,
     observations: Vec<BoundObservation>,
+    queries: QueryPlan,
     fourier: Vec<FourierCard>,
     axis: Option<AxisTracker>,
     trace_axis: Option<usize>,
@@ -317,7 +323,7 @@ impl PlotObjectivePlan {
             }
             reductions.push(bound);
         }
-        let observations = observations
+        let mut observations = observations
             .into_iter()
             .map(|request| {
                 if let ObservationReduction::At(at) = request.reduction
@@ -334,6 +340,7 @@ impl PlotObjectivePlan {
                 })
             })
             .collect::<SpiceResult<Vec<_>>>()?;
+        let queries = QueryPlan::bind(&mut observations)?;
         if !fourier.is_empty() {
             if kind != AnalysisKind::Transient {
                 return Err(invalid("Fourier objectives require a transient plot"));
@@ -360,6 +367,7 @@ impl PlotObjectivePlan {
             measurements,
             reductions,
             observations,
+            queries,
             fourier,
             axis,
             trace_axis,
@@ -477,7 +485,7 @@ impl ObservationState {
                 };
                 let range = axis
                     .ok_or_else(|| ObservationFailure::Invalid(invalid("missing objective axis")))?
-                    .range()
+                    .query_range()
                     .map_err(ObservationFailure::Invalid)?;
                 query
                     .finish()
@@ -527,6 +535,7 @@ struct ActivePlot<'a> {
     axis: Option<AxisTracker>,
     measurements: Vec<Option<MeasureState<'a>>>,
     observations: Vec<ObservationState>,
+    query_rows: QueryRows,
     retained: SpiceResult<Option<Plot>>,
     scratch: Vec<Complex>,
     rows: usize,
@@ -551,6 +560,7 @@ impl<'a> ActivePlot<'a> {
             axis: plan.axis.as_ref().map(AxisTracker::fresh),
             measurements,
             observations,
+            query_rows: QueryRows::new(&plan.queries),
             retained: Ok(plan
                 .projection
                 .as_ref()
@@ -568,13 +578,32 @@ impl<'a> ActivePlot<'a> {
             .checked_add(1)
             .ok_or_else(|| lifecycle_error("objective point count overflows usize"))?;
         let axis = self.axis.as_mut().and_then(|axis| axis.observe(row));
-        if let Some(x) = axis {
+        if let Some(x) = axis
+            && self
+                .axis
+                .as_ref()
+                .is_some_and(AxisTracker::is_nondecreasing)
+        {
             for measure in self.measurements.iter_mut().flatten() {
                 measure.observe(x, row);
             }
         }
-        for (state, bound) in self.observations.iter_mut().zip(&self.plan.observations) {
-            state.observe(bound, row, axis, self.plan.trace_axis);
+        for &index in &self.plan.queries.ordinary {
+            self.observations[index].observe(
+                &self.plan.observations[index],
+                row,
+                None,
+                self.plan.trace_axis,
+            );
+        }
+        if let Some(x) = axis {
+            self.query_rows.observe(
+                &self.plan.queries,
+                &self.plan.observations,
+                &mut self.observations,
+                x,
+                row,
+            );
         }
         if let (Ok(Some(retained)), Some(projection)) = (&mut self.retained, &self.plan.projection)
         {

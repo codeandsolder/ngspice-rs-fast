@@ -38,7 +38,7 @@ card 4 @netlists/m10_hfet2_op.cir:5:1 lines=5-5 continuations=0
   token 8 5:15 number "1u" value=1e-6
   token 9 5:18 word "w"
   token 10 5:19 equals "="
-  token 11 5:20 number "10u" value=9.999999999999999e-6
+  token 11 5:20 number "10u" value=1e-5
 card 5 @netlists/m10_hfet2_op.cir:6:1 lines=6-6 continuations=0
   raw: "z2 3 4 0 p2 l=1u w=10u"
   kind: device(z)
@@ -52,7 +52,7 @@ card 5 @netlists/m10_hfet2_op.cir:6:1 lines=6-6 continuations=0
   token 8 6:15 number "1u" value=1e-6
   token 9 6:18 word "w"
   token 10 6:19 equals "="
-  token 11 6:20 number "10u" value=9.999999999999999e-6
+  token 11 6:20 number "10u" value=1e-5
 card 6 @netlists/m10_hfet2_op.cir:7:1 lines=7-7 continuations=0
   raw: ".model n2 nhfet level=6 rd=31 rs=31 rdi=50 rsi=50 js=1e-6"
   kind: dot(.model)
