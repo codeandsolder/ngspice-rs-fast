@@ -16,7 +16,6 @@
 //! | `K` | 1e3 | |
 //! | `MIL` | 25.4e-6 | thousandths of an inch |
 //! | `M` | 1e-3 | **milli**, not mega |
-//! | `L` | 1e-3 | accepted by `INPevaluate()` |
 //! | `U` | 1e-6 | |
 //! | `N` | 1e-9 | |
 //! | `P` | 1e-12 | |
@@ -27,7 +26,7 @@
 //! `1kohm` is `1000`. Anything else after the literal — `1k2` — is rejected by
 //! [`parse_spice_number`]; see the RKM note on that function.
 
-use super::numeric::{scale_power, split_power};
+use super::numeric::{DecimalMultiplier, rounded_decimal, scale_power, split_power};
 use std::fmt;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
@@ -332,211 +331,145 @@ pub struct ParsedNumber {
     pub consumed: usize,
 }
 
-/// `INPevaluate`'s decimal exponent adjustment and byte width of a scale
-/// suffix, plus whether it is `MIL` (which also scales the mantissa by 25.4).
-///
-/// `letter` is the first letter after the numeric part, `rest` the text that
-/// follows it. `MEG` and `MIL` are three bytes wide, everything else one.
-/// Other letters (units such as `V`, `F`, `ohm`) do not scale.
-fn scale_suffix(letter: char, rest: &str) -> (i32, usize, bool) {
-    fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
-        text.len() >= prefix.len()
-            && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+/// Literal dialects share decimal syntax and exact scaling, but not the
+/// exponent markers, MIL suffix or consumed-letter convention.
+#[derive(Clone, Copy)]
+enum LiteralDialect {
+    Spice,
+    Numparam,
+}
+
+impl LiteralDialect {
+    const fn exponent_marker(self, byte: u8) -> bool {
+        match self {
+            Self::Spice => matches!(byte, b'e' | b'E' | b'd' | b'D'),
+            Self::Numparam => matches!(byte, b'e' | b'E'),
+        }
     }
 
-    match letter.to_ascii_lowercase() {
-        't' => (12, 1, false),
-        'g' => (9, 1, false),
-        'k' => (3, 1, false),
-        'u' => (-6, 1, false),
-        'n' => (-9, 1, false),
-        'p' => (-12, 1, false),
-        'f' => (-15, 1, false),
-        'a' => (-18, 1, false),
-        'm' => {
-            if starts_with_ignore_case(rest, "eg") {
-                (6, 3, false)
-            } else if starts_with_ignore_case(rest, "il") {
-                (-6, 3, true)
-            } else {
-                (-3, 1, false)
+    fn suffix(self, rest: &[u8]) -> (i32, usize, DecimalMultiplier) {
+        use DecimalMultiplier::{Mil, One};
+        let three = rest.get(..3);
+        match rest.first().map(u8::to_ascii_lowercase) {
+            Some(b't') => (12, 1, One),
+            Some(b'g') => (9, 1, One),
+            Some(b'k') => (3, 1, One),
+            Some(b'u') => (-6, 1, One),
+            Some(b'n') => (-9, 1, One),
+            Some(b'p') => (-12, 1, One),
+            Some(b'f') => (-15, 1, One),
+            Some(b'a') => (-18, 1, One),
+            Some(b'm') if three.is_some_and(|s| s.eq_ignore_ascii_case(b"meg")) => (6, 3, One),
+            // 25.4e-6 = 254e-7 exactly, not a binary64 multiplication.
+            Some(b'm')
+                if matches!(self, Self::Spice)
+                    && three.is_some_and(|s| s.eq_ignore_ascii_case(b"mil")) =>
+            {
+                (-7, 3, Mil)
             }
+            Some(b'm') => (-3, 1, One),
+            _ => (0, 0, One),
         }
-        _ => (0, 0, false),
     }
 }
 
-/// Consume consecutive decimal digits with the reference mantissa accumulator.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "INPevaluate rounds multiplication by ten before adding the digit"
-)]
-fn scan_mantissa_digits(bytes: &[u8], index: &mut usize, mantissa: &mut Real) -> usize {
+/// Scan decimal digits and simultaneously compute a candidate short coefficient.
+/// Wrapping is harmless for longer literals: the result is used only when
+/// there were at most 16 digits (then the exact integer fits in u64).
+fn scan_digits(bytes: &[u8], index: &mut usize, coefficient: &mut u64) -> usize {
     let start = *index;
-    while bytes.get(*index).is_some_and(u8::is_ascii_digit) {
-        *mantissa = 10.0 * *mantissa + Real::from(bytes[*index] - b'0');
+    while let Some(&digit) = bytes.get(*index).filter(|digit| digit.is_ascii_digit()) {
+        *coefficient = coefficient
+            .wrapping_mul(10)
+            .wrapping_add(u64::from(digit - b'0'));
         *index += 1;
     }
     *index - start
 }
 
-/// Parses a literal from the start of `input`, reporting bytes consumed.
-///
-/// Does not skip leading whitespace: the literal must begin at byte 0. Returns
-/// `None` when no numeric part is present. The numeric part is
-/// `[+-]?(digits[.digits?]|.digits)([eEdD][+-]?digits)?`, optionally followed
-/// by a scale suffix.
-///
-/// The value is computed exactly as `INPevaluate()` (`inpeval.c`) does, not
-/// as the nearest double to the decimal literal: the digits accumulate into a
-/// double mantissa (`mantis = 10 * mantis + digit`, fraction digits counted
-/// as negative powers), `MIL` multiplies the mantissa by 25.4, and the result
-/// is `sign * mantis * pow(10, expo)`. So `1.2` is `12 * 0.1`,
-/// `1.2000000000000002`, as in ngspice.
-///
-/// # Divergence from `INPevaluate()`
-///
-/// `INPevaluate()` applies the suffix multiplier but leaves `MEG`/`MIL`
-/// unconsumed in its output pointer, because its callers do the skipping.
-/// This function consumes the whole recognised suffix, so `consumed` is the
-/// full width. An exponent marker without digits (`1e`) is left for the
-/// caller; C would consume it with exponent zero, which gives the same value
-/// unless a scale letter follows it.
-#[must_use]
-pub fn parse_spice_number_prefix(input: &str) -> Option<ParsedNumber> {
+fn decimal_prefix(input: &str, dialect: LiteralDialect) -> Option<ParsedNumber> {
     let bytes = input.as_bytes();
-    let mut i = 0;
-    let mut sign = 1.0;
-    match bytes.first() {
-        Some(b'+') => i += 1,
-        Some(b'-') => {
-            i += 1;
-            sign = -1.0;
-        }
-        _ => {}
-    }
-
-    let mut mantis: Real = 0.0;
-    let integer_digits = scan_mantissa_digits(bytes, &mut i, &mut mantis);
+    let negative = bytes.first() == Some(&b'-');
+    let start = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let mut i = start;
+    let mut coefficient = 0;
+    let integer_digits = scan_digits(bytes, &mut i, &mut coefficient);
     let fractional_digits = if bytes.get(i) == Some(&b'.') {
         i += 1;
-        scan_mantissa_digits(bytes, &mut i, &mut mantis)
+        scan_digits(bytes, &mut i, &mut coefficient)
     } else {
         0
     };
     if integer_digits == 0 && fractional_digits == 0 {
         return None;
     }
-    // Match the old saturating decrement once per fractional digit.
-    let expo1 = i32::try_from(fractional_digits).map_or(i32::MIN, |count| -count);
-
-    let mut expo2: i32 = 0;
+    let mantissa = &input[start..i];
+    let mut exponent = 0_i128;
     if bytes
         .get(i)
-        .is_some_and(|byte| matches!(byte.to_ascii_lowercase(), b'e' | b'd'))
-    {
-        let mut exponent_end = i + 1;
-        let mut negative = false;
-        match bytes.get(exponent_end) {
-            Some(b'+') => exponent_end += 1,
-            Some(b'-') => {
-                exponent_end += 1;
-                negative = true;
-            }
-            _ => {}
-        }
-        let exponent_digits_start = exponent_end;
-        let mut exponent: i32 = 0;
-        while exponent_end < bytes.len() && bytes[exponent_end].is_ascii_digit() {
-            exponent = exponent
-                .saturating_mul(10)
-                .saturating_add(i32::from(bytes[exponent_end] - b'0'));
-            exponent_end += 1;
-        }
-        // `1e` with nothing after it is a mantissa of `1` followed by junk, not
-        // an exponent; leave it for the caller.
-        if exponent_end > exponent_digits_start {
-            i = exponent_end;
-            expo2 = if negative { -exponent } else { exponent };
-        }
-    }
-
-    let (scale, suffix_width, mil) = input[i..].chars().next().map_or((0, 0, false), |letter| {
-        scale_suffix(letter, &input[i + letter.len_utf8()..])
-    });
-    if mil {
-        mantis *= 25.4;
-    }
-    let expo = expo1.saturating_add(scale).saturating_add(expo2);
-
-    Some(ParsedNumber {
-        value: sign * mantis * Real::from(expo).powf_c(),
-        consumed: i + suffix_width,
-    })
-}
-
-/// Parse numeric literals and unit suffixes accepted by numparam.
-///
-/// Parses a number inside a `.param`/`{...}` expression as numparam's
-/// `fetchnumber()` (`xpressn.c`) does: `sscanf("%lG")` (the correctly rounded
-/// decimal value, `e`/`E` exponents only) times `parseunit()`'s multiplier
-/// for the next letter (`T G K MEG M U N P F A`; `MIL` is milli there).
-/// `consumed` covers the numeric part only; the caller swallows the unit
-/// letters, as `fetchnumber()` does.
-#[must_use]
-pub fn parse_numparam_number_prefix(input: &str) -> Option<ParsedNumber> {
-    let bytes = input.as_bytes();
-    let mut i = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
-    let mut digits = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-        digits += 1;
-    }
-    if bytes.get(i) == Some(&b'.') {
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-            digits += 1;
-        }
-    }
-    if digits == 0 {
-        return None;
-    }
-    if bytes
-        .get(i)
-        .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'e'))
+        .is_some_and(|&byte| dialect.exponent_marker(byte))
     {
         let mut end = i + 1;
+        let negative_exponent = bytes.get(end) == Some(&b'-');
         if matches!(bytes.get(end), Some(b'+' | b'-')) {
             end += 1;
         }
-        let start = end;
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
+        let exponent_start = end;
+        while let Some(&digit) = bytes.get(end).filter(|digit| digit.is_ascii_digit()) {
+            exponent = exponent
+                .saturating_mul(10)
+                .saturating_add(i128::from(digit - b'0'));
             end += 1;
         }
-        if end > start {
+        // Incomplete exponent markers remain for the caller, as before.
+        if end > exponent_start {
             i = end;
+            if negative_exponent {
+                exponent = -exponent;
+            }
         }
     }
-    let value: Real = input[..i].parse().ok()?;
-    let rest = &input[i..];
-    let unit = match rest.bytes().next().map(|b| b.to_ascii_uppercase()) {
-        Some(b'T') => 1e12,
-        Some(b'G') => 1e9,
-        Some(b'K') => 1e3,
-        Some(b'M') if rest.len() >= 3 && rest[..3].eq_ignore_ascii_case("meg") => 1e6,
-        Some(b'M') => 1e-3,
-        Some(b'U') => 1e-6,
-        Some(b'N') => 1e-9,
-        Some(b'P') => 1e-12,
-        Some(b'F') => 1e-15,
-        Some(b'A') => 1e-18,
-        _ => 1.0,
-    };
+    let (scale, suffix_width, multiplier) = dialect.suffix(&bytes[i..]);
+    // A saturated exponent cannot be cancelled by the length of an actual
+    // input slice, so saturating adjustment is exact for every finite result.
+    let exponent = exponent
+        .saturating_sub(i128::try_from(fractional_digits).ok()?)
+        .saturating_add(i128::from(scale));
+    let short_coefficient = (integer_digits + fractional_digits <= 16).then_some(coefficient);
+    let value = rounded_decimal(mantissa, short_coefficient, negative, exponent, multiplier)?;
     Some(ParsedNumber {
-        value: value * unit,
-        consumed: i,
+        value,
+        consumed: i + if matches!(dialect, LiteralDialect::Spice) {
+            suffix_width
+        } else {
+            0
+        },
     })
+}
+
+/// Parse a SPICE literal prefix with its scale suffix, without leading space.
+///
+/// Decimal digits, optional sign, point and e/E/d/D exponent are recognized
+/// before the optional scale. The exact scaled decimal is rounded once to
+/// nearest binary64. Overflow produces infinity, underflow gradual or signed
+/// zero; semantic parsers retain their existing finite-value checks.
+///
+/// The full MEG/MIL suffix is consumed, unlike C's internal rest pointer.
+/// A marker without exponent digits is left for the caller.
+#[must_use]
+pub fn parse_spice_number_prefix(input: &str) -> Option<ParsedNumber> {
+    decimal_prefix(input, LiteralDialect::Spice)
+}
+
+/// Parse a numparam literal prefix.
+///
+/// Numparam recognizes only e/E exponents,
+/// and MIL means milli, not thousandths of an inch. The scale is applied
+/// before correct rounding, but consumed counts just the numeric part;
+/// the expression parser swallows trailing unit letters separately.
+#[must_use]
+pub fn parse_numparam_number_prefix(input: &str) -> Option<ParsedNumber> {
+    decimal_prefix(input, LiteralDialect::Numparam)
 }
 
 /// A complete numparam number ([`parse_numparam_number_prefix`]) followed by
@@ -549,17 +482,6 @@ pub fn parse_numparam_number(input: &str) -> Option<Real> {
         .chars()
         .all(|c| c.is_ascii_alphabetic())
         .then_some(parsed.value)
-}
-
-/// `pow(10.0, expo)` through the platform `pow`, as C calls it.
-trait PowTen {
-    fn powf_c(self) -> Real;
-}
-
-impl PowTen for Real {
-    fn powf_c(self) -> Real {
-        Self::powf(10.0, self)
-    }
 }
 
 /// Parses a complete SPICE numeric literal, scale factor included.
@@ -704,9 +626,8 @@ mod tests {
         assert_eq!(parse_spice_number("1meg"), Some(1e6));
         assert_eq!(parse_spice_number("1MEG"), Some(1e6));
         assert_eq!(parse_spice_number("1MeG"), Some(1e6));
-        // `mantis *= 25.4`, then `pow(10, -6)`.
-        assert_eq!(parse_spice_number("1mil"), Some(25.4 * 1e-6));
-        assert_eq!(parse_spice_number("1MIL"), Some(25.4 * 1e-6));
+        assert_eq!(parse_spice_number("1mil"), Some(25.4e-6));
+        assert_eq!(parse_spice_number("1MIL"), Some(25.4e-6));
         assert_eq!(parse_spice_number("1u"), Some(1e-6));
         assert_eq!(parse_spice_number("1n"), Some(1e-9));
         assert_eq!(parse_spice_number("1p"), Some(1e-12));
@@ -719,22 +640,150 @@ mod tests {
     }
 
     #[test]
-    fn values_are_computed_as_inpevaluate_does() {
-        // Digits accumulate into a double mantissa scaled by pow(10, expo),
-        // so these differ from the nearest double; ngspice gives the same.
-        assert_eq!(parse_spice_number("1.2"), Some(1.200_000_000_000_000_2));
-        assert_eq!(parse_spice_number("1.2"), Some(12.0 * 10f64.powf(-1.0)));
-        // numparam writes `{3}` back as "% 23.15e" text before INPevaluate.
+    fn literals_round_once_after_exact_scaling() {
+        assert_eq!(parse_spice_number("1.2"), Some(1.2));
+        assert_eq!(parse_spice_number("3.000000000000000e+00"), Some(3.));
+        assert_eq!(parse_spice_number("1d3"), Some(1e3));
+        assert_eq!(parse_spice_number("-2.5D-3"), Some(-2.5e-3));
+        assert_eq!(parse_spice_number("1e312f"), Some(1e297));
+        assert_eq!(parse_spice_number("1e-330meg"), Some(0.));
+        assert_eq!(parse_spice_number("1e-330t"), Some(1e-318));
+        assert_eq!(parse_spice_number("1e309mil"), Some(2.54e304));
+        assert_eq!(parse_spice_number("1e-323mil"), Some(0.));
+        assert_eq!(parse_spice_number("0e99999999999999999999999"), Some(0.));
         assert_eq!(
-            parse_spice_number("3.000000000000000e+00"),
-            Some(3e15 * 10f64.powf(-15.0))
+            parse_spice_number("-1e-99999999999999999999999")
+                .unwrap()
+                .to_bits(),
+            (-0_f64).to_bits()
         );
-        // `d`/`D` is an exponent marker, as `e`.
-        assert_eq!(parse_spice_number("1d3"), Some(1000.0));
         assert_eq!(
-            parse_spice_number("-2.5D-3"),
-            Some(-25.0 * 10f64.powf(-4.0))
+            parse_spice_number("-0e99999999999999999999999")
+                .unwrap()
+                .to_bits(),
+            (-0_f64).to_bits()
         );
+        assert_eq!(
+            parse_spice_number("1e99999999999999999999999"),
+            Some(f64::INFINITY)
+        );
+    }
+
+    #[test]
+    fn decimal_edges_match_independent_exact_rounding() {
+        // Expected bits from exact decimal products converted with CPython
+        // Decimal -> binary64, including boundaries on both sides of a tie.
+        for (text, expected) in [
+            ("9007199254740993", 0x4340_0000_0000_0000),
+            ("9007199254740995", 0x4340_0000_0000_0002),
+            ("9007199254740993e-3k", 0x4340_0000_0000_0000),
+            ("1.7976931348623157e311m", f64::MAX.to_bits()),
+            ("1.7976931348623159e308", f64::INFINITY.to_bits()),
+            ("2.2250738585072011e-308", 0x000f_ffff_ffff_ffff),
+            ("2.2250738585072014e-308", f64::MIN_POSITIVE.to_bits()),
+            ("2.4703282292062327e-306a", 0),
+            ("2.4703282292062328e-306a", 1),
+            ("1.234567890123456789mil", 0x3f00_70cd_83b2_078b),
+            ("9999999999999999mil", 0x424d_91ca_35ff_ffff),
+            ("1.234567890123456789e12a", 0x3eb4_b66d_c01e_c6fb),
+            ("-0.0", (-0_f64).to_bits()),
+        ] {
+            assert_eq!(
+                parse_spice_number(text).unwrap().to_bits(),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_sticky_tail_distinguishes_exact_halfway_cases() {
+        // Exact midpoint between 1 and the next binary64, and perturbations
+        // smaller than the retained 768 significant digits.
+        let midpoint = "1.00000000000000011102230246251565404236316680908203125";
+        let zeros = "0".repeat(1000);
+        let tie = format!("{midpoint}{zeros}");
+        let above = format!("{tie}1");
+        let below = format!("{}4{}", &midpoint[..midpoint.len() - 1], "9".repeat(1000));
+        for (text, bits) in [
+            (tie, 1_f64.to_bits()),
+            (above, 1_f64.to_bits() + 1),
+            (below, 1_f64.to_bits()),
+        ] {
+            assert_eq!(parse_spice_number(&text).unwrap().to_bits(), bits);
+            assert_eq!(
+                parse_numparam_number_prefix(&text).unwrap().value.to_bits(),
+                bits
+            );
+        }
+
+        // MIL is the non-power-of-ten case. Construct a decimal from an
+        // independent exact rational: midpoint / (254e-7). The odd factor 127
+        // gives a repeating decimal, so truncation and incrementing the last
+        // digit straddle the exact midpoint. Carries from the discarded
+        // decimal tail must be taken into account *before* truncation.
+        let denominator = (1_u128 << 53) * 254;
+        let numerator = ((1_u128 << 53) + 1) * 10_000_000;
+        let mut lower = format!("{}.", numerator / denominator);
+        let mut remainder = numerator % denominator;
+        while lower.len() < 1000 || lower.ends_with('9') {
+            remainder *= 10;
+            lower.push(char::from(
+                b'0' + u8::try_from(remainder / denominator).unwrap(),
+            ));
+            remainder %= denominator;
+        }
+        assert_ne!(remainder, 0);
+        let mut upper = lower.clone();
+        let last = upper.pop().unwrap();
+        upper.push(char::from_u32(u32::from(last) + 1).unwrap());
+        assert_eq!(
+            parse_spice_number(&format!("{lower}mil"))
+                .unwrap()
+                .to_bits(),
+            1_f64.to_bits()
+        );
+        assert_eq!(
+            parse_spice_number(&format!("{upper}mil"))
+                .unwrap()
+                .to_bits(),
+            1_f64.to_bits() + 1
+        );
+    }
+
+    #[test]
+    fn huge_decimal_coefficients_cancel_exponents_without_intermediate_overflow() {
+        let count = 100_000;
+        let zeros = "0".repeat(count);
+        let integer = format!("1{zeros}e-{count}");
+        let fraction = format!("0.{zeros}12345e{}k", count + 1);
+        assert_eq!(parse_spice_number(&integer), Some(1.));
+        assert_eq!(parse_spice_number(&format!("{integer}mil")), Some(25.4e-6));
+        assert_eq!(parse_spice_number(&fraction), Some(1234.5));
+        assert_eq!(parse_numparam_number_prefix(&integer).unwrap().value, 1.);
+    }
+
+    #[test]
+    fn decimal_prefix_boundaries_are_dialect_specific_and_utf8_safe() {
+        for (text, spice, numparam, spice_width, numparam_width) in [
+            ("1d2k", 100_000., 1., 4, 1),
+            ("1e+", 1., 1., 1, 1),
+            ("1MeGoHm", 1e6, 1e6, 4, 1),
+            ("1mIl", 25.4e-6, 1e-3, 4, 1),
+            ("1m²", 1e-3, 1e-3, 2, 1),
+            ("1m€", 1e-3, 1e-3, 2, 1),
+            ("1Ω", 1., 1., 1, 1),
+            ("1l", 1., 1., 1, 1),
+            ("1e-330T", 1e-318, 1e-318, 7, 6),
+        ] {
+            let a = parse_spice_number_prefix(text).unwrap();
+            let b = parse_numparam_number_prefix(text).unwrap();
+            assert_eq!((a.value, a.consumed), (spice, spice_width), "{text}");
+            assert_eq!((b.value, b.consumed), (numparam, numparam_width), "{text}");
+        }
+        for text in ["1m²", "1m€", "1Ω", "1e+", "4k7", "2N2222"] {
+            assert_eq!(parse_spice_number(text), None, "{text}");
+        }
     }
 
     #[test]
@@ -764,10 +813,10 @@ mod tests {
     }
 
     #[test]
-    fn numparam_numbers_are_strtod_times_the_unit() {
+    fn numparam_retains_its_own_suffix_and_exponent_grammar() {
         let value = |text| parse_numparam_number_prefix(text).map(|p| p.value);
         assert_eq!(value("1.2"), Some(1.2));
-        assert_eq!(value("1.2k"), Some(1.2 * 1e3));
+        assert_eq!(value("1.2k"), Some(1.2e3));
         assert_eq!(value("2meg"), Some(2e6));
         // parseunit() has no MIL: `1mil` is milli.
         assert_eq!(value("1mil"), Some(1e-3));
@@ -782,7 +831,7 @@ mod tests {
     fn trailing_unit_names_are_ignored() {
         assert_eq!(parse_spice_number("5V"), Some(5.0));
         assert_eq!(parse_spice_number("1kohm"), Some(1000.0));
-        assert_eq!(parse_spice_number("1000F"), Some(1e-15 * 1000.0));
+        assert_eq!(parse_spice_number("1000F"), Some(1e-12));
     }
 
     #[test]
@@ -810,10 +859,7 @@ mod tests {
 
         let parsed = parse_spice_number_prefix("2.5uF").unwrap();
         assert_eq!(parsed.consumed, 4);
-        // `INPevaluate()` computes `mantissa * pow(10, expo)`; it does not parse
-        // the scaled literal directly, so the result is this product and not
-        // necessarily the nearest double to `2.5e-6`.
-        assert_eq!(parsed.value, 2.5 * 1e-6);
+        assert_eq!(parsed.value, 2.5e-6);
 
         let parsed = parse_spice_number_prefix("1e3").unwrap();
         assert_eq!(parsed.consumed, 3);

@@ -508,8 +508,7 @@ fn itl4_is_the_companion_newton_limit_per_timepoint() {
 #[test]
 fn xmu_weights_the_companion_trapezoidal_rule() {
     let c = config(".options xmu=0.3").unwrap();
-    // INPevaluate("0.3") is 3 * 0.1.
-    assert_eq!(c.transient().xmu, Some(3. * 0.1));
+    assert_eq!(c.transient().xmu, Some(0.3));
     assert_eq!(
         c.plan(tran()).unwrap().transient().unwrap().xmu(),
         c.transient().xmu.unwrap()

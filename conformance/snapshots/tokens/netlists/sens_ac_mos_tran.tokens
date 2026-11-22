@@ -38,10 +38,10 @@ card 4 @netlists/sens_ac_mos_tran.cir:10:1 lines=10-10 continuations=0
   token 2 10:5 word "bn"
   token 3 10:8 number "0" value=0e0
   token 4 10:10 word "dc"
-  token 5 10:13 number "-0.3" value=-3.0000000000000004e-1
+  token 5 10:13 number "-0.3" value=-3e-1
   token 6 10:18 word "sin"
   token 7 10:21 lparen "("
-  token 8 10:22 number "-0.3" value=-3.0000000000000004e-1
+  token 8 10:22 number "-0.3" value=-3e-1
   token 9 10:27 number "0.2" value=2e-1
   token 10 10:31 number "100k" value=1e5
   token 11 10:35 rparen ")"
@@ -63,10 +63,10 @@ card 6 @netlists/sens_ac_mos_tran.cir:12:1 lines=12-12 continuations=0
   token 6 12:15 word "m1n"
   token 7 12:19 word "l"
   token 8 12:20 equals "="
-  token 9 12:21 number "10u" value=9.999999999999999e-6
+  token 9 12:21 number "10u" value=1e-5
   token 10 12:25 word "w"
   token 11 12:26 equals "="
-  token 12 12:27 number "20u" value=1.9999999999999998e-5
+  token 12 12:27 number "20u" value=2e-5
   token 13 12:31 word "ad"
   token 14 12:33 equals "="
   token 15 12:34 number "10p" value=1e-11
@@ -75,10 +75,10 @@ card 6 @netlists/sens_ac_mos_tran.cir:12:1 lines=12-12 continuations=0
   token 18 12:41 number "20p" value=2e-11
   token 19 12:45 word "pd"
   token 20 12:47 equals "="
-  token 21 12:48 number "10u" value=9.999999999999999e-6
+  token 21 12:48 number "10u" value=1e-5
   token 22 12:52 word "ps"
   token 23 12:54 equals "="
-  token 24 12:55 number "20u" value=1.9999999999999998e-5
+  token 24 12:55 number "20u" value=2e-5
   token 25 12:59 word "nrd"
   token 26 12:62 equals "="
   token 27 12:63 number "2" value=2e0
@@ -96,10 +96,10 @@ card 7 @netlists/sens_ac_mos_tran.cir:13:1 lines=13-13 continuations=0
   token 6 13:15 word "m2n"
   token 7 13:19 word "l"
   token 8 13:20 equals "="
-  token 9 13:21 number "10u" value=9.999999999999999e-6
+  token 9 13:21 number "10u" value=1e-5
   token 10 13:25 word "w"
   token 11 13:26 equals "="
-  token 12 13:27 number "20u" value=1.9999999999999998e-5
+  token 12 13:27 number "20u" value=2e-5
   token 13 13:31 word "ad"
   token 14 13:33 equals "="
   token 15 13:34 number "10p" value=1e-11
@@ -108,10 +108,10 @@ card 7 @netlists/sens_ac_mos_tran.cir:13:1 lines=13-13 continuations=0
   token 18 13:41 number "20p" value=2e-11
   token 19 13:45 word "pd"
   token 20 13:47 equals "="
-  token 21 13:48 number "10u" value=9.999999999999999e-6
+  token 21 13:48 number "10u" value=1e-5
   token 22 13:52 word "ps"
   token 23 13:54 equals "="
-  token 24 13:55 number "20u" value=1.9999999999999998e-5
+  token 24 13:55 number "20u" value=2e-5
   token 25 13:59 word "nrd"
   token 26 13:62 equals "="
   token 27 13:63 number "2" value=2e0
@@ -129,10 +129,10 @@ card 8 @netlists/sens_ac_mos_tran.cir:14:1 lines=14-14 continuations=0
   token 6 14:15 word "m3n"
   token 7 14:19 word "l"
   token 8 14:20 equals "="
-  token 9 14:21 number "10u" value=9.999999999999999e-6
+  token 9 14:21 number "10u" value=1e-5
   token 10 14:25 word "w"
   token 11 14:26 equals "="
-  token 12 14:27 number "20u" value=1.9999999999999998e-5
+  token 12 14:27 number "20u" value=2e-5
   token 13 14:31 word "ad"
   token 14 14:33 equals "="
   token 15 14:34 number "10p" value=1e-11
@@ -141,10 +141,10 @@ card 8 @netlists/sens_ac_mos_tran.cir:14:1 lines=14-14 continuations=0
   token 18 14:41 number "20p" value=2e-11
   token 19 14:45 word "pd"
   token 20 14:47 equals "="
-  token 21 14:48 number "10u" value=9.999999999999999e-6
+  token 21 14:48 number "10u" value=1e-5
   token 22 14:52 word "ps"
   token 23 14:54 equals "="
-  token 24 14:55 number "20u" value=1.9999999999999998e-5
+  token 24 14:55 number "20u" value=2e-5
   token 25 14:59 word "nrd"
   token 26 14:62 equals "="
   token 27 14:63 number "2" value=2e0
@@ -162,10 +162,10 @@ card 9 @netlists/sens_ac_mos_tran.cir:15:1 lines=15-15 continuations=0
   token 6 15:15 word "m9n"
   token 7 15:19 word "l"
   token 8 15:20 equals "="
-  token 9 15:21 number "10u" value=9.999999999999999e-6
+  token 9 15:21 number "10u" value=1e-5
   token 10 15:25 word "w"
   token 11 15:26 equals "="
-  token 12 15:27 number "20u" value=1.9999999999999998e-5
+  token 12 15:27 number "20u" value=2e-5
   token 13 15:31 word "ad"
   token 14 15:33 equals "="
   token 15 15:34 number "10p" value=1e-11
@@ -174,10 +174,10 @@ card 9 @netlists/sens_ac_mos_tran.cir:15:1 lines=15-15 continuations=0
   token 18 15:41 number "20p" value=2e-11
   token 19 15:45 word "pd"
   token 20 15:47 equals "="
-  token 21 15:48 number "10u" value=9.999999999999999e-6
+  token 21 15:48 number "10u" value=1e-5
   token 22 15:52 word "ps"
   token 23 15:54 equals "="
-  token 24 15:55 number "20u" value=1.9999999999999998e-5
+  token 24 15:55 number "20u" value=2e-5
   token 25 15:59 word "nrd"
   token 26 15:62 equals "="
   token 27 15:63 number "2" value=2e0
@@ -195,10 +195,10 @@ card 10 @netlists/sens_ac_mos_tran.cir:16:1 lines=16-16 continuations=0
   token 6 16:23 number "1" value=1e0
   token 7 16:25 word "vto"
   token 8 16:28 equals "="
-  token 9 16:29 number "0.7" value=7.000000000000001e-1
+  token 9 16:29 number "0.7" value=7e-1
   token 10 16:33 word "kp"
   token 11 16:35 equals "="
-  token 12 16:36 number "50u" value=4.9999999999999996e-5
+  token 12 16:36 number "50u" value=5e-5
   token 13 16:40 word "tox"
   token 14 16:43 equals "="
   token 15 16:44 number "20n" value=2e-8
@@ -228,10 +228,10 @@ card 11 @netlists/sens_ac_mos_tran.cir:17:1 lines=17-17 continuations=0
   token 6 17:23 number "2" value=2e0
   token 7 17:25 word "vto"
   token 8 17:28 equals "="
-  token 9 17:29 number "0.7" value=7.000000000000001e-1
+  token 9 17:29 number "0.7" value=7e-1
   token 10 17:33 word "kp"
   token 11 17:35 equals "="
-  token 12 17:36 number "50u" value=4.9999999999999996e-5
+  token 12 17:36 number "50u" value=5e-5
   token 13 17:40 word "tox"
   token 14 17:43 equals "="
   token 15 17:44 number "20n" value=2e-8
@@ -261,10 +261,10 @@ card 12 @netlists/sens_ac_mos_tran.cir:18:1 lines=18-18 continuations=0
   token 6 18:23 number "3" value=3e0
   token 7 18:25 word "vto"
   token 8 18:28 equals "="
-  token 9 18:29 number "0.7" value=7.000000000000001e-1
+  token 9 18:29 number "0.7" value=7e-1
   token 10 18:33 word "kp"
   token 11 18:35 equals "="
-  token 12 18:36 number "50u" value=4.9999999999999996e-5
+  token 12 18:36 number "50u" value=5e-5
   token 13 18:40 word "tox"
   token 14 18:43 equals "="
   token 15 18:44 number "20n" value=2e-8
@@ -294,10 +294,10 @@ card 13 @netlists/sens_ac_mos_tran.cir:19:1 lines=19-19 continuations=0
   token 6 19:23 number "9" value=9e0
   token 7 19:25 word "vto"
   token 8 19:28 equals "="
-  token 9 19:29 number "0.7" value=7.000000000000001e-1
+  token 9 19:29 number "0.7" value=7e-1
   token 10 19:33 word "kp"
   token 11 19:35 equals "="
-  token 12 19:36 number "50u" value=4.9999999999999996e-5
+  token 12 19:36 number "50u" value=5e-5
   token 13 19:40 word "tox"
   token 14 19:43 equals "="
   token 15 19:44 number "20n" value=2e-8

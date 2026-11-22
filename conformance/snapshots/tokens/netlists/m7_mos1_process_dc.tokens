@@ -35,14 +35,14 @@ card 5 @netlists/m7_mos1_process_dc.cir:6:1 lines=6-6 continuations=0
   token 1 6:1 word "vbs"
   token 2 6:5 word "b"
   token 3 6:7 number "0" value=0e0
-  token 4 6:9 number "0.3" value=3.0000000000000004e-1
+  token 4 6:9 number "0.3" value=3e-1
 card 6 @netlists/m7_mos1_process_dc.cir:7:1 lines=7-7 continuations=0
   raw: "vbp bp 0 -0.3"
   kind: device(v)
   token 1 7:1 word "vbp"
   token 2 7:5 word "bp"
   token 3 7:8 number "0" value=0e0
-  token 4 7:10 number "-0.3" value=-3.0000000000000004e-1
+  token 4 7:10 number "-0.3" value=-3e-1
 card 7 @netlists/m7_mos1_process_dc.cir:8:1 lines=8-8 continuations=0
   raw: "egp gp 0 g 0 -1"
   kind: device(e)
@@ -121,7 +121,7 @@ card 11 @netlists/m7_mos1_process_dc.cir:12:1 lines=12-12 continuations=0
   token 7 12:22 number "1" value=1e0
   token 8 12:24 word "tox"
   token 9 12:27 equals "="
-  token 10 12:28 number "25n" value=2.5000000000000002e-8
+  token 10 12:28 number "25n" value=2.5e-8
   token 11 12:32 word "nsub"
   token 12 12:36 equals "="
   token 13 12:37 number "2e16" value=2e16
@@ -153,7 +153,7 @@ card 12 @netlists/m7_mos1_process_dc.cir:13:1 lines=13-13 continuations=0
   token 7 13:22 number "1" value=1e0
   token 8 13:24 word "tox"
   token 9 13:27 equals "="
-  token 10 13:28 number "25n" value=2.5000000000000002e-8
+  token 10 13:28 number "25n" value=2.5e-8
   token 11 13:32 word "nsub"
   token 12 13:36 equals "="
   token 13 13:37 number "5e15" value=5e15
@@ -165,7 +165,7 @@ card 12 @netlists/m7_mos1_process_dc.cir:13:1 lines=13-13 continuations=0
   token 19 13:52 number "500" value=5e2
   token 20 13:56 word "phi"
   token 21 13:59 equals "="
-  token 22 13:60 number "0.6" value=6.000000000000001e-1
+  token 22 13:60 number "0.6" value=6e-1
   token 23 13:63 rparen ")"
 card 13 @netlists/m7_mos1_process_dc.cir:14:1 lines=14-14 continuations=0
   raw: ".model mp pmos(level=1 tox=25n nsub=1e16 nss=2e10 u0=250 gamma=0.45 rsh=30)"
@@ -179,7 +179,7 @@ card 13 @netlists/m7_mos1_process_dc.cir:14:1 lines=14-14 continuations=0
   token 7 14:22 number "1" value=1e0
   token 8 14:24 word "tox"
   token 9 14:27 equals "="
-  token 10 14:28 number "25n" value=2.5000000000000002e-8
+  token 10 14:28 number "25n" value=2.5e-8
   token 11 14:32 word "nsub"
   token 12 14:36 equals "="
   token 13 14:37 number "1e16" value=1e16

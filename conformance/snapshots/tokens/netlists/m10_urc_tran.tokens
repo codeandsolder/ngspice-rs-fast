@@ -11,11 +11,11 @@ card 1 @netlists/m10_urc_tran.cir:7:1 lines=7-7 continuations=0
   token 5 7:14 lparen "("
   token 6 7:15 number "0" value=0e0
   token 7 7:17 number "1" value=1e0
-  token 8 7:19 number "100n" value=1.0000000000000001e-7
+  token 8 7:19 number "100n" value=1e-7
   token 9 7:24 number "20n" value=2e-8
   token 10 7:28 number "20n" value=2e-8
   token 11 7:32 number "4u" value=4e-6
-  token 12 7:35 number "10u" value=9.999999999999999e-6
+  token 12 7:35 number "10u" value=1e-5
   token 13 7:38 rparen ")"
 card 2 @netlists/m10_urc_tran.cir:8:1 lines=8-8 continuations=0
   raw: "rs in a 1k"
@@ -88,7 +88,7 @@ card 9 @netlists/m10_urc_tran.cir:15:1 lines=15-15 continuations=0
   token 5 15:11 word "rline3"
   token 6 15:18 word "l"
   token 7 15:19 equals "="
-  token 8 15:20 number "10u" value=9.999999999999999e-6
+  token 8 15:20 number "10u" value=1e-5
 card 10 @netlists/m10_urc_tran.cir:16:1 lines=16-16 continuations=0
   raw: "rc c 0 50k"
   kind: device(r)
@@ -145,7 +145,7 @@ card 14 @netlists/m10_urc_tran.cir:20:1 lines=20-20 continuations=0
   kind: dot(.tran)
   token 1 20:1 word ".tran"
   token 2 20:7 number "20n" value=2e-8
-  token 3 20:11 number "10u" value=9.999999999999999e-6
+  token 3 20:11 number "10u" value=1e-5
 card 15 @netlists/m10_urc_tran.cir:21:1 lines=21-21 continuations=0
   raw: ".end"
   kind: dot(.end)
