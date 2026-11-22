@@ -907,7 +907,7 @@ mod tests {
         // The exact binary64 intermediate distinguishes C from to_radians().
         assert_eq!(
             crate::devices::functions::phase_radians(123_456_789_012_345.).to_bits(),
-            2_154_727_452_205.3784_f64.to_bits()
+            2_154_727_452_205.378_4_f64.to_bits()
         );
     }
 
