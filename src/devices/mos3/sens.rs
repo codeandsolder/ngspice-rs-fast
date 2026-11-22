@@ -57,8 +57,10 @@ impl SensitivityLevel for Level3 {
         P::dc("gdsnoi"),
     ];
     const INSTANCE: &'static [P] = INSTANCE;
-    fn record(&self, context: &ModelContext) -> Record {
-        let mut r = self.surface.record(record_common(&self.common, context));
+    fn record(&self, family: SensitivityFamily, context: &ModelContext) -> SpiceResult<Record> {
+        let mut r = self
+            .surface
+            .record(record_common(family, &self.common, context)?)?;
         for (k, value, given) in [
             ("kp", self.kp.unwrap_or(2e-5), self.kp.is_some()),
             ("tox", self.tox, true),
@@ -79,9 +81,9 @@ impl SensitivityLevel for Level3 {
             ("narrow", 0., false),
             ("input_delta", self.delta, true),
         ] {
-            r = r.with(k, value, given);
+            r = r.with(k, value, given)?;
         }
-        r
+        Ok(r)
     }
     fn with_record(&self, r: &Record, derived: bool) -> SpiceResult<Self> {
         let mut m = *self;

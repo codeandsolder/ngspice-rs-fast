@@ -227,7 +227,7 @@ impl DeviceSensitivity for ReactiveSensitivity<'_> {
             ReactiveKind::Inductor => "inductance",
         };
         let build = |fields: &[&'static str], scope| {
-            let mut record = SensitivityRecord::new();
+            let mut record = SensitivityRecord::new(self.family(), scope);
             for keyword in fields {
                 let value = match scope {
                     ParameterScope::Model => self.inputs.model_value(keyword),
@@ -237,12 +237,12 @@ impl DeviceSensitivity for ReactiveSensitivity<'_> {
                     ("temp" | "tnom", Some(celsius)) => Some(celsius + CELSIUS_TO_KELVIN),
                     (_, value) => value,
                 };
-                record = record.with(keyword, value.unwrap_or(0.), value.is_some());
+                record = record.with(keyword, value.unwrap_or(0.), value.is_some())?;
             }
-            record
+            Ok::<_, SpiceError>(record)
         };
-        let mut model = build(model_fields, ParameterScope::Model);
-        let mut instance = build(instance_fields, ParameterScope::Instance);
+        let mut model = build(model_fields, ParameterScope::Model)?;
+        let mut instance = build(instance_fields, ParameterScope::Instance)?;
         // The instance value is kept as C's `CAPcapacinst`/`INDinductinst`.
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;

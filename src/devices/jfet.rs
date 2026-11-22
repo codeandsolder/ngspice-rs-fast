@@ -73,8 +73,8 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, RecordPair, SensitivityFamily, SensitivityLoad, SensitivityMode,
-    SensitivityParameter, SensitivityRecord,
+    AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
     AnalysisMode, Device, DeviceState, IterationPhase, LinearContext, ModelContext, ModelFamily,
@@ -1629,7 +1629,7 @@ impl DeviceSensitivity for JfetSensitivity<'_> {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (m, i) = (&self.device.model, &self.device.instance);
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for keyword in SENSITIVITY_MODEL_FIELDS {
             // `tnom` is celsius in the port and kelvin in C, like the diode.
             let (value, given) = match *keyword {
@@ -1666,9 +1666,9 @@ impl DeviceSensitivity for JfetSensitivity<'_> {
                     true,
                 ),
             };
-            model = model.with(keyword, value, given);
+            model = model.with(keyword, value, given)?;
         }
-        let mut instance = SensitivityRecord::new();
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
         for keyword in SENSITIVITY_INSTANCE_FIELDS {
             let (value, given) = match *keyword {
                 "area" => (i.area, true),
@@ -1682,7 +1682,7 @@ impl DeviceSensitivity for JfetSensitivity<'_> {
                 "ic-vds" => (self.device.initial.values[0].unwrap_or(0.), true),
                 _ => (self.device.initial.values[1].unwrap_or(0.), true),
             };
-            instance = instance.with(keyword, value, given);
+            instance = instance.with(keyword, value, given)?;
         }
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;

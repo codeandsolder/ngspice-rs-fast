@@ -614,14 +614,8 @@ fn mirror(couplings: &[Option<Coupling>], records: &mut Records, slot: usize) ->
     let instance = &mut records.instances[slot];
     instance.store("induct1", induct[0])?;
     instance.store("induct2", induct[1])?;
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "in-memory matrix row indices are stored in the C real-valued sensitivity record"
-    )]
-    {
-        instance.store("row1", coupling.rows[0] as Real)?;
-        instance.store("row2", coupling.rows[1] as Real)
-    }
+    instance.store_index("row1", coupling.rows[0])?;
+    instance.store_index("row2", coupling.rows[1])
 }
 
 /// Every device's sensitivity description in C's `sgen` order: by device type
@@ -634,6 +628,10 @@ fn members<'a>(
     context: &crate::devices::ModelContext,
 ) -> SpiceResult<(Vec<Member<'a>>, Records)> {
     let mut keys: Vec<(SensitivityFamily, Option<String>)> = Vec::new();
+    let mut layouts = std::collections::BTreeMap::<
+        SensitivityFamily,
+        (SensitivityRecord, SensitivityRecord),
+    >::new();
     let mut models: Vec<SensitivityRecord> = Vec::new();
     let mut ordered: Vec<(
         SensitivityFamily,
@@ -644,7 +642,20 @@ fn members<'a>(
     )> = Vec::new();
     for (index, device) in circuit.devices().iter().enumerate() {
         let sensitivity = device.sensitivity(context)?;
-        let (model_record, instance_record) = sensitivity.records()?;
+        let (mut model_record, mut instance_record) = sensitivity.records()?;
+        let family = sensitivity.family();
+        model_record.validate(family, ParameterScope::Model)?;
+        instance_record.validate(family, ParameterScope::Instance)?;
+        match layouts.entry(family) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((model_record.clone(), instance_record.clone()));
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                let (model, instance) = entry.get();
+                model_record.share_layout(model)?;
+                instance_record.share_layout(instance)?;
+            }
+        }
         let key = (
             sensitivity.family(),
             sensitivity.model().map(str::to_ascii_lowercase),
@@ -1514,7 +1525,7 @@ impl ParameterWalk<'_> {
                 model: &snapshot.0,
                 instance: &snapshot.1,
             };
-            let elements = device.setup_elements(setup);
+            let elements = device.setup_elements(setup)?;
             // A device whose perturbed state C loads without complaint but the
             // port refuses (a strict range check) has to name the parameter:
             // `.sens` is C's walk over dozens of them.

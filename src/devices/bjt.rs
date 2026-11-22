@@ -2126,7 +2126,7 @@ impl DeviceSensitivity for BjtSensitivity<'_> {
         let ibc = m.ibc.unwrap_or(0.);
         let (ibe_given, ibc_given) = (m.ibe.is_some(), m.ibc.is_some());
         let npn = self.device.pol > 0.;
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for (keyword, value, given) in [
             (
                 "tnom",
@@ -2261,9 +2261,9 @@ impl DeviceSensitivity for BjtSensitivity<'_> {
             ("te_max", 1e99, false),
             ("rth0", 0., false),
         ] {
-            model = model.with(keyword, value, given);
+            model = model.with(keyword, value, given)?;
         }
-        let mut instance = SensitivityRecord::new();
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
         let ic = |k: usize| self.device.initial.values.get(k).copied().flatten();
         for (keyword, value, given) in [
             ("icvbe", ic(0).unwrap_or(0.), ic(0).is_some()),
@@ -2280,7 +2280,7 @@ impl DeviceSensitivity for BjtSensitivity<'_> {
             ),
             ("dtemp", i.dtemp, true),
         ] {
-            instance = instance.with(keyword, value, given);
+            instance = instance.with(keyword, value, given)?;
         }
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;

@@ -1227,7 +1227,7 @@ impl DeviceSensitivity for Hfet2Sensitivity<'_> {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let m = &self.device.model;
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for (keyword, value, given) in [
             ("cf", m.cf, true),
             ("d1", m.d1, true),
@@ -1270,12 +1270,13 @@ impl DeviceSensitivity for Hfet2Sensitivity<'_> {
             ("vt1", m.vt1.unwrap_or(0.), m.vt1.is_some()),
             ("vt2", m.vt2.unwrap_or(0.), m.vt2.is_some()),
         ] {
-            model = model.with(keyword, value, given);
+            model = model.with(keyword, value, given)?;
         }
-        let mut instance = self
-            .device
-            .instance
-            .sensitivity_record(&self.device.initial, self.circuit_kelvin);
+        let mut instance = self.device.instance.sensitivity_record(
+            self.family(),
+            &self.device.initial,
+            self.circuit_kelvin,
+        )?;
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
         Ok((model, instance))

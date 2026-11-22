@@ -89,8 +89,8 @@ use crate::devices::schema::{
     self, ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, RecordPair, SensitivityFamily, SensitivityLoad, SensitivityMode,
-    SensitivityParameter, SensitivityRecord,
+    AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
     Device, LinearContext, ModelContext, ModelFamily, ResolvedModel, StampContext,
@@ -950,7 +950,7 @@ impl DeviceSensitivity for MesfetSensitivity<'_> {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (m, i) = (&self.device.model, &self.device.instance);
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for keyword in SENSITIVITY_MODEL_FIELDS {
             let value = match *keyword {
                 "vt0" => m.vto,
@@ -970,15 +970,15 @@ impl DeviceSensitivity for MesfetSensitivity<'_> {
                 "kf" => m.kf,
                 _ => m.af,
             };
-            model = model.with(keyword, value, true);
+            model = model.with(keyword, value, true)?;
         }
-        let mut instance = SensitivityRecord::new();
-        instance = instance.with("area", i.area, true);
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
+        instance = instance.with("area", i.area, true)?;
         // C's `MES_M` is `IOPUR`: enumerated by no analysis, but the load reads
         // it, so the record carries it unperturbed.
-        instance = instance.with("m", i.m, true);
-        instance = instance.with("icvds", self.device.initial.values[0].unwrap_or(0.), true);
-        instance = instance.with("icvgs", self.device.initial.values[1].unwrap_or(0.), true);
+        instance = instance.with("m", i.m, true)?;
+        instance = instance.with("icvds", self.device.initial.values[0].unwrap_or(0.), true)?;
+        instance = instance.with("icvgs", self.device.initial.values[1].unwrap_or(0.), true)?;
         self.setup(&mut model, &mut instance)?;
         Ok((model, instance))
     }

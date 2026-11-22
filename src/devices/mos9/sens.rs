@@ -13,8 +13,8 @@ impl SensitivityLevel for Level9 {
     const MODEL: &'static [P] = Level3::MODEL.split_at(Level3::MODEL.len() - 1).0;
     // mos9ask.c has no MOS9_DTEMP case: C drops this GET ERROR column.
     const INSTANCE: &'static [P] = INSTANCE.split_at(INSTANCE.len() - 1).0;
-    fn record(&self, c: &ModelContext) -> Record {
-        self.0.record(c)
+    fn record(&self, family: SensitivityFamily, c: &ModelContext) -> SpiceResult<Record> {
+        self.0.record(family, c)
     }
     fn with_record(&self, r: &Record, derived: bool) -> SpiceResult<Self> {
         self.0.with_record(r, derived).map(Self)

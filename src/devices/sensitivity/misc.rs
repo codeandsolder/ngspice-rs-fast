@@ -91,13 +91,13 @@ impl DeviceSensitivity for BehaviouralSensitivity<'_> {
         let (temp, temp_given) = scale
             .temperature
             .map_or((0., false), |t| (t + CELSIUS_TO_KELVIN, true));
-        let mut instance = SensitivityRecord::new()
-            .with("temp", temp, temp_given)
-            .with("dtemp", scale.dtemp, scale.dtemp != 0.)
-            .with("tc1", scale.tc1, scale.tc1 != 0.)
-            .with("tc2", scale.tc2, scale.tc2 != 0.)
-            .with("m", scale.m, !matches!(scale.m, 1.));
-        let mut model = SensitivityRecord::new();
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance)
+            .with("temp", temp, temp_given)?
+            .with("dtemp", scale.dtemp, scale.dtemp != 0.)?
+            .with("tc1", scale.tc1, scale.tc1 != 0.)?
+            .with("tc2", scale.tc2, scale.tc2 != 0.)?
+            .with("m", scale.m, !matches!(scale.m, 1.))?;
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         self.temperature(&mut model, &mut instance)?;
         Ok((model, instance))
     }
@@ -260,23 +260,29 @@ impl DeviceSensitivity for SwitchSensitivity<'_> {
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (threshold, hysteresis) = self.keys();
         let values = self.switch.model_values();
-        let mut model = SensitivityRecord::new()
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model)
             .with(
                 threshold,
                 values.threshold.unwrap_or(0.),
                 values.threshold.is_some(),
-            )
+            )?
             .with(
                 hysteresis,
                 values.hysteresis.unwrap_or(0.),
                 values.hysteresis.is_some(),
-            )
-            .with("ron", values.on.unwrap_or(0.), values.on.is_some())
-            .with("roff", values.off.unwrap_or(0.), values.off.is_some())
-            .with("gon", values.on.map_or(0., |r| 1. / r), false)
-            .with("goff", values.off.map_or(0., |r| 1. / r), false);
-        self.setup(&mut model, &mut SensitivityRecord::new())?;
-        Ok((model, SensitivityRecord::new()))
+            )?
+            .with("ron", values.on.unwrap_or(0.), values.on.is_some())?
+            .with("roff", values.off.unwrap_or(0.), values.off.is_some())?
+            .with("gon", values.on.map_or(0., |r| 1. / r), false)?
+            .with("goff", values.off.map_or(0., |r| 1. / r), false)?;
+        self.setup(
+            &mut model,
+            &mut SensitivityRecord::new(self.family(), ParameterScope::Instance),
+        )?;
+        Ok((
+            model,
+            SensitivityRecord::new(self.family(), ParameterScope::Instance),
+        ))
     }
 
     /// `SWmParam`/`CSWmParam`: a resistance also stores its conductance.
@@ -407,14 +413,17 @@ impl DeviceSensitivity for MutualSensitivity<'_> {
     }
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
-        let instance = SensitivityRecord::new()
-            .with("k", self.coupling.coefficient(), true)
-            .with("factor", 0., false)
-            .with("induct1", 0., false)
-            .with("induct2", 0., false)
-            .with("row1", 0., false)
-            .with("row2", 0., false);
-        Ok((SensitivityRecord::new(), instance))
+        let instance = SensitivityRecord::new(self.family(), ParameterScope::Instance)
+            .with("k", self.coupling.coefficient(), true)?
+            .with("factor", 0., false)?
+            .with("induct1", 0., false)?
+            .with("induct2", 0., false)?
+            .with_index("row1", 0)?
+            .with_index("row2", 0)?;
+        Ok((
+            SensitivityRecord::new(self.family(), ParameterScope::Model),
+            instance,
+        ))
     }
 
     /// `MUTask` answers `MUTfactor` for `k`.
@@ -463,16 +472,7 @@ impl DeviceSensitivity for MutualSensitivity<'_> {
     ) -> SpiceResult<SensitivityLoad> {
         let i = current.instance;
         let factor = i.value("factor")?;
-        let row = |keyword: &str| -> SpiceResult<usize> {
-            let value = i.value(keyword)?;
-            crate::primitives::exact_nonnegative_integer::<usize>(value).ok_or_else(|| {
-                SpiceError::circuit(format!(
-                    "{}: unbound inductor branch row",
-                    self.coupling.name()
-                ))
-            })
-        };
-        let (row1, row2) = (row("row1")?, row("row2")?);
+        let (row1, row2) = (i.index("row1")?, i.index("row2")?);
         let stamps = [(row1, row2), (row2, row1)]
             .into_iter()
             .map(|(r, c)| ResetStamp {

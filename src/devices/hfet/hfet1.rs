@@ -1884,7 +1884,7 @@ impl DeviceSensitivity for Hfet1Sensitivity<'_> {
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let m = &self.device.model;
         let pol = m.pol;
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for (keyword, value, given) in [
             // The raw card value: `hfettemp.c` multiplies the stored field by
             // the type, and `temperature` below replays that.
@@ -1957,12 +1957,13 @@ impl DeviceSensitivity for Hfet1Sensitivity<'_> {
             ("kmu", m.kmu, true),
             ("kvto", m.kvto, true),
         ] {
-            model = model.with(keyword, value, given);
+            model = model.with(keyword, value, given)?;
         }
-        let mut instance = self
-            .device
-            .instance
-            .sensitivity_record(&self.device.initial, self.circuit_kelvin);
+        let mut instance = self.device.instance.sensitivity_record(
+            self.family(),
+            &self.device.initial,
+            self.circuit_kelvin,
+        )?;
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
         Ok((model, instance))

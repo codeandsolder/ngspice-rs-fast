@@ -1821,7 +1821,7 @@ impl DeviceSensitivity for MesaSensitivity<'_> {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (m, i) = (&self.device.model, &self.device.instance);
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for (keyword, value, given) in [
             ("vto", m.threshold, true),
             ("lambda", m.lambda, true),
@@ -1893,9 +1893,9 @@ impl DeviceSensitivity for MesaSensitivity<'_> {
             ("cas", m.cas, true),
             ("cbs", m.cbs, true),
         ] {
-            model = model.with(keyword, value, given);
+            model = model.with(keyword, value, given)?;
         }
-        let mut instance = SensitivityRecord::new();
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
         for (keyword, value, given) in [
             ("l", i.l, true),
             ("w", i.w, true),
@@ -1914,7 +1914,7 @@ impl DeviceSensitivity for MesaSensitivity<'_> {
             ),
             ("dtemp", i.dtemp, true),
         ] {
-            instance = instance.with(keyword, value, given);
+            instance = instance.with(keyword, value, given)?;
         }
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;

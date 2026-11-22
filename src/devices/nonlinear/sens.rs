@@ -256,16 +256,16 @@ impl DeviceSensitivity for DiodeSensitivity<'_> {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (m, i) = &*self.diode.written;
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for keyword in MODEL_FIELDS {
             let value = written(m, port_name(keyword));
             let value = match (*keyword, value) {
                 ("tnom", Some(celsius)) => Some(celsius + CELSIUS_TO_KELVIN),
                 (_, value) => value,
             };
-            model = model.with(keyword, value.unwrap_or(0.), value.is_some());
+            model = model.with(keyword, value.unwrap_or(0.), value.is_some())?;
         }
-        let mut instance = SensitivityRecord::new();
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
         for keyword in INSTANCE_FIELDS {
             let value = match *keyword {
                 "ikf" | "ikr" | "ikp" => None,
@@ -273,7 +273,7 @@ impl DeviceSensitivity for DiodeSensitivity<'_> {
                 "temp" => written(i, "temp").map(|t| t + CELSIUS_TO_KELVIN),
                 other => written(i, other),
             };
-            instance = instance.with(keyword, value.unwrap_or(0.), value.is_some());
+            instance = instance.with(keyword, value.unwrap_or(0.), value.is_some())?;
         }
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
