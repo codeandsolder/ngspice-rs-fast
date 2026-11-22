@@ -103,7 +103,7 @@ pub(crate) fn binary_exponent(value: Real) -> Option<i32> {
 
 /// Split a finite nonzero binary64 into a signed significand in [1, 2)
 /// in magnitude and an unbiased exponent, including subnormals.
-pub(super) fn split_power(value: Real) -> (Real, i32) {
+pub(crate) fn split_power(value: Real) -> (Real, i32) {
     let bits = value.to_bits();
     let exponent = biased_exponent(bits);
     if exponent == 0 {
@@ -119,7 +119,7 @@ pub(super) fn split_power(value: Real) -> (Real, i32) {
 /// Multiply by a power of two without first forming an unrepresentable
 /// power. The final multiply is the only one that can round into subnormals
 /// for the normalized significands used by the scaled division.
-pub(super) fn scale_power(mut value: Real, mut exponent: i32) -> Real {
+pub(crate) fn scale_power(mut value: Real, mut exponent: i32) -> Real {
     while exponent > 1023 {
         value *= Real::from_bits(0x7fe0_0000_0000_0000);
         exponent -= 1023;
