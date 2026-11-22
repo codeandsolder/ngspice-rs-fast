@@ -132,7 +132,7 @@ and `3` when the deck needs something the port does not support yet. Details are
 in [CLI.md](docs/port/CLI.md).
 
 The engine can also be used as a library: parse a deck, build a `Circuit`
-and run `analysis::runner(kind)` (see
+and resolve an `analysis::AnalysisPlan` to run (see
 [NATIVE_SOLVER.md](docs/port/NATIVE_SOLVER.md)).
 
 ## Transient solvers

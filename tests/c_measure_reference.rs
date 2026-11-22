@@ -20,7 +20,7 @@ use std::path::Path;
 use ngspice_conformance::measurement::{self, ActualSection, Analysis};
 use ngspice_conformance::ngspice::{Ngspice, Scratch};
 
-use ngspice_rs::analysis::{RunConfig, measure, runner};
+use ngspice_rs::analysis::{RunConfig, measure};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::{AnalysisKind, Real};
@@ -34,13 +34,12 @@ fn port_results(deck: &str) -> Vec<(String, Real)> {
     let netlist = &parsed.netlist;
     let card = netlist.analyses.first().expect("one analysis");
     let config = RunConfig::from_netlist(netlist).expect("the deck configures");
-    let request = config.request_for(card).expect("the analysis request");
+    let request = config.plan_for(card).expect("the analysis request");
     let mut circuit = config.circuit(netlist).expect("the circuit builds");
-    let plot = runner(request.kind)
-        .expect("a driver")
-        .run(&mut circuit, &request, &config.context())
+    let plot = request
+        .run(&mut circuit, &config.context())
         .expect("the run succeeds");
-    assert_eq!(card.kind, request.kind);
+    assert_eq!(card.kind, request.kind());
     measure::resolve(&plot, card.kind, &parsed.measurements)
         .expect("every measurement resolves")
         .into_iter()

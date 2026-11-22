@@ -1,7 +1,7 @@
 //! Diode physics (#86) through the production analysis paths, checked against
 //! independent closed forms rather than C. C-golden comparisons of the same
 //! physics (`m7_*` fixtures) live in `xtask golden verify`.
-use ngspice_rs::analysis::{Plot, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use std::path::Path;
@@ -18,11 +18,8 @@ fn simulate(body: &str) -> Plot {
         .unwrap();
     let config = RunConfig::from_netlist(&n).unwrap();
     let mut circuit = config.circuit(&n).unwrap();
-    let request = config.request_for(&n.analyses[0]).unwrap();
-    runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap()
+    let request = config.plan_for(&n.analyses[0]).unwrap();
+    request.run(&mut circuit, &config.context()).unwrap()
 }
 fn real(plot: &Plot, name: &str, point: usize) -> f64 {
     plot.value(name, point).unwrap().re

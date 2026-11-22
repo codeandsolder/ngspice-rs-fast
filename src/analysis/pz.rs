@@ -47,7 +47,7 @@
 
 use crate::analysis::linear::unsupported;
 use crate::analysis::results::{PlotFlags, Variable};
-use crate::analysis::{AnalysisRequest, Plot};
+use crate::analysis::{AnalysisPlan, Plot};
 use crate::devices::Circuit;
 use crate::maths::pencil::{PencilLoad, PencilTerm, pencil_load_roots};
 use crate::primitives::{Complex, NodeId, SpiceError, SpiceResult};
@@ -61,19 +61,14 @@ enum Input {
 
 /// The parsed card: four node names, the input type and what to compute.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Card {
+pub(super) struct Card {
     nodes: [String; 4],
     input: Input,
     poles: bool,
     zeros: bool,
 }
 
-fn card(request: &AnalysisRequest) -> SpiceResult<Card> {
-    let positional: Vec<&String> = request
-        .arguments
-        .iter()
-        .filter(|a| !a.contains('='))
-        .collect();
+pub(super) fn parse(positional: &[String]) -> SpiceResult<Card> {
     let usage = || unsupported(".pz in+ in- out+ out- cur|vol pol|zer|pz");
     if positional.len() != 6 {
         return Err(usage());
@@ -182,12 +177,12 @@ fn roots(load: &PencilLoad, what: &str) -> SpiceResult<Vec<Complex>> {
 
 pub(super) fn run(
     circuit: &mut Circuit,
-    request: &AnalysisRequest,
+    request: &AnalysisPlan,
     context: &crate::analysis::AnalysisContext,
+    card: &Card,
     include_bias: bool,
 ) -> SpiceResult<Vec<Plot>> {
-    let settings = crate::analysis::bias::DcSettings::from_request(request)?;
-    let card = card(request)?;
+    let settings = request.dc_settings().clone();
     circuit.finalize()?;
     let [
         (in_pos_id, in_pos),
@@ -287,19 +282,16 @@ pub(super) fn run(
 mod tests {
     use super::*;
 
-    fn request(arguments: &[&str]) -> AnalysisRequest {
-        AnalysisRequest::with_arguments(
-            crate::primitives::AnalysisKind::PoleZero,
-            arguments.iter().copied(),
-        )
+    fn request(arguments: &[&str]) -> Vec<String> {
+        arguments.iter().map(|a| (*a).to_owned()).collect()
     }
 
     #[test]
     fn cards_take_both_flags_in_either_order() {
-        let parsed = card(&request(&["in", "0", "out", "0", "vol", "pz"])).unwrap();
+        let parsed = parse(&request(&["in", "0", "out", "0", "vol", "pz"])).unwrap();
         assert_eq!(parsed.input, Input::Voltage);
         assert!(parsed.poles && parsed.zeros);
-        let parsed = card(&request(&["in", "0", "out", "0", "ZER", "CUR"])).unwrap();
+        let parsed = parse(&request(&["in", "0", "out", "0", "ZER", "CUR"])).unwrap();
         assert_eq!(parsed.input, Input::Current);
         assert!(!parsed.poles && parsed.zeros);
         for bad in [
@@ -309,7 +301,7 @@ mod tests {
             &["in", "0", "out", "0", "vol", "poles"],
             &["in", "0", "out", "0", "vol", "pz", "extra"],
         ] {
-            assert!(card(&request(bad)).is_err(), "{bad:?}");
+            assert!(parse(&request(bad)).is_err(), "{bad:?}");
         }
     }
 

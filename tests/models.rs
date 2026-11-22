@@ -647,12 +647,9 @@ fn a_model_card_can_carry_instance_defaults() {
     let currents = |name: &str, body: &str| -> f64 {
         let deck = deck(body);
         let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck).unwrap();
-        let request = config.request_for(&deck.analyses[0]).unwrap();
+        let request = config.plan_for(&deck.analyses[0]).unwrap();
         let mut circuit = config.circuit(&deck).unwrap();
-        let plot = ngspice_rs::analysis::runner(request.kind)
-            .unwrap()
-            .run(&mut circuit, &request, &config.context())
-            .unwrap();
+        let plot = request.run(&mut circuit, &config.context()).unwrap();
         plot.value(name, 0).unwrap().re
     };
     let mesa = |model: &str, instance: &str| {

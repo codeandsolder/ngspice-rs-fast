@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ngspice_rs::analysis::{RunConfig, runner};
+use ngspice_rs::analysis::RunConfig;
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 
@@ -99,12 +99,9 @@ fn operating_point_matches_c() {
         // `.options temp` needs RunConfig so the analysis point carries the
         // deck temperature, exactly as C's `CKTtemp` does.
         let config = RunConfig::from_netlist(&netlist).unwrap();
-        let request = config.request_for(&netlist.analyses[0]).unwrap();
+        let request = config.plan_for(&netlist.analyses[0]).unwrap();
         let mut circuit = config.circuit(&netlist).unwrap();
-        let plot = runner(request.kind)
-            .unwrap()
-            .run(&mut circuit, &request, &config.context())
-            .unwrap();
+        let plot = request.run(&mut circuit, &config.context()).unwrap();
         for node in ["d", "g", "s"] {
             let actual = plot.value(&format!("v({node})"), 0).unwrap().re;
             close(

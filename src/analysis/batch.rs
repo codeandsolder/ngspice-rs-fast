@@ -43,7 +43,7 @@
 //!   plots that succeeded; the port's callers publish nothing when any analysis
 //!   fails.
 
-use crate::netlist::ast::{AnalysisCard, FourierCard, MeasureCard, OutputCards, VectorRequest};
+use crate::netlist::ast::{FourierCard, MeasureCard, OutputCards, VectorRequest};
 use crate::primitives::{AnalysisKind, SpiceError, SpiceResult};
 
 use crate::analysis::fourier::{self, FourierAnalysis};
@@ -71,9 +71,9 @@ pub struct ScheduledAnalysis {
     /// The names of the further plots this card produces after
     /// [`Self::plot_name`], in order: `.noise` writes its `Integrated Noise`
     /// plot as a second plot (`noise2` after `noise1`) unless its sweep is a
-    /// single frequency ([`crate::analysis::noise::plot_count`]); `.disto`
+    /// single frequency ([`crate::analysis::AnalysisPlan::plot_count`]); `.disto`
     /// writes its 3rd-harmonic plot after the 2nd, or its `f1-f2` and
-    /// `2f1-f2` products after `f1+f2` ([`crate::analysis::disto::plot_count`]).
+    /// `2f1-f2` products after `f1+f2` ([`crate::analysis::AnalysisPlan::plot_count`]).
     /// Empty for every other analysis.
     pub extra_plot_names: Vec<String>,
 }
@@ -130,21 +130,17 @@ pub const fn plot_abbreviation(kind: AnalysisKind) -> &'static str {
     }
 }
 
-/// The deck's analysis cards in batch execution order, with C's plot names.
+/// Resolved analyses in batch execution order, with C's plot names.
 ///
 /// See the module documentation for the rules. An empty list schedules
 /// nothing; whether that is an error is the caller's decision.
 #[must_use]
-pub fn schedule(cards: &[AnalysisCard]) -> Vec<ScheduledAnalysis> {
-    schedule_with_bias(cards, false)
-}
-
-fn schedule_with_bias(cards: &[AnalysisCard], keep_op_info: bool) -> Vec<ScheduledAnalysis> {
-    let mut order: Vec<usize> = (0..cards.len()).collect();
+pub fn schedule(plans: &[crate::analysis::AnalysisPlan]) -> Vec<ScheduledAnalysis> {
+    let mut order: Vec<usize> = (0..plans.len()).collect();
     // Same type: reverse deck order (the job list is built by prepending).
     order.sort_by(|&a, &b| {
-        job_order(cards[a].kind)
-            .cmp(&job_order(cards[b].kind))
+        job_order(plans[a].kind())
+            .cmp(&job_order(plans[b].kind()))
             .then(b.cmp(&a))
     });
     // Generated names are lowercase; membership need not scan all prior plots.
@@ -153,28 +149,13 @@ fn schedule_with_bias(cards: &[AnalysisCard], keep_op_info: bool) -> Vec<Schedul
     let mut scheduled: Vec<ScheduledAnalysis> = order
         .iter()
         .map(|&card_index| {
-            let kind = cards[card_index].kind;
+            let plan = &plans[card_index];
+            let kind = plan.kind();
             let abbreviation = plot_abbreviation(kind);
-            let count = match kind {
-                AnalysisKind::Noise => {
-                    crate::analysis::noise::plot_count(&cards[card_index].arguments)
-                }
-                AnalysisKind::Distortion => {
-                    crate::analysis::disto::plot_count(&cards[card_index].arguments)
-                }
-                _ => 1,
-            };
-            let bias = keep_op_info
-                && matches!(
-                    kind,
-                    AnalysisKind::Ac
-                        | AnalysisKind::Noise
-                        | AnalysisKind::SParameter
-                        | AnalysisKind::Distortion
-                        | AnalysisKind::PoleZero
-                );
-            let mut own = Vec::with_capacity(count + usize::from(bias));
-            for index in 0..count + usize::from(bias) {
+            let count = plan.plot_count();
+            let bias = plan.retains_bias();
+            let mut own = Vec::with_capacity(count);
+            for index in 0..count {
                 let abbreviation = if bias && index == 0 {
                     "op"
                 } else {
@@ -206,26 +187,6 @@ fn schedule_with_bias(cards: &[AnalysisCard], keep_op_info: bool) -> Vec<Schedul
             .is_none_or(|later| later.kind != kind);
     }
     scheduled
-}
-
-/// Schedules evaluated analysis cards, so expression-valued noise bounds
-/// determine the same plot count as the driver (C `noisean.c`).
-///
-/// # Errors
-/// Returns errors from evaluating card arguments and applying deck options.
-pub fn schedule_evaluated(
-    cards: &[AnalysisCard],
-    config: &crate::analysis::RunConfig,
-) -> SpiceResult<Vec<ScheduledAnalysis>> {
-    let mut evaluated = cards.to_vec();
-    let mut keep_op_info = false;
-    for card in &mut evaluated {
-        let request = config.request_for(card)?;
-        keep_op_info = request.keep_op_info;
-        card.arguments = request.arguments;
-        card.expressions.clear();
-    }
-    Ok(schedule_with_bias(&evaluated, keep_op_info))
 }
 
 /// Checks, before anything runs, that every `.print`, `.measure` and `.four`
@@ -617,7 +578,15 @@ mod tests {
     fn card(kind: AnalysisKind, line: u32) -> AnalysisCard {
         AnalysisCard {
             kind,
-            arguments: Vec::new(),
+            arguments: match kind {
+                AnalysisKind::Ac => "lin 3 1 3",
+                AnalysisKind::DcSweep => "v1 0 1 0.1",
+                AnalysisKind::Transient => "1u 10u",
+                _ => "",
+            }
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
             expressions: Vec::new(),
             uic: false,
             uic_location: None,
@@ -625,8 +594,14 @@ mod tests {
         }
     }
 
+    fn plans(cards: &[AnalysisCard]) -> Vec<crate::analysis::AnalysisPlan> {
+        crate::analysis::RunConfig::default()
+            .plans_for(cards)
+            .unwrap()
+    }
+
     fn names(cards: &[AnalysisCard]) -> Vec<(usize, String, bool)> {
-        schedule(cards)
+        schedule(&plans(cards))
             .into_iter()
             .map(|entry| (entry.card_index, entry.plot_name, entry.last_of_kind))
             .collect()
@@ -701,7 +676,7 @@ mod tests {
             card(AnalysisKind::OperatingPoint, 3),
             noise(4, "v ( out ) v1 lin 1 10k 20k 1"),
         ];
-        let entries = schedule(&cards);
+        let entries = schedule(&plans(&cards));
         let names: Vec<Vec<&str>> = entries
             .iter()
             .map(|entry| entry.plot_names().collect())
@@ -728,7 +703,7 @@ mod tests {
             disto(3, "dec 2 1k 100k 0.9"),
             card(AnalysisKind::Ac, 4),
         ];
-        let names: Vec<Vec<String>> = schedule(&cards)
+        let names: Vec<Vec<String>> = schedule(&plans(&cards))
             .iter()
             .map(|entry| entry.plot_names().map(str::to_owned).collect())
             .collect();

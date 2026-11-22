@@ -642,6 +642,12 @@ fn duplicate_card_ordinals_are_not_a_valid_scope() {
     let mut deck = parse("title\nr1 a 0 1k\nr2 b 0 2k\n.end\n");
     deck.cards[1].kind = ScopedCardKind::Device(0);
     refused(&deck, "exactly once");
+    assert!(
+        ngspice_rs::netlist::behavioural::lower_nonlinear_sources(&deck)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly once")
+    );
 }
 
 #[test]
@@ -710,4 +716,67 @@ fn generated_device_cards_retain_source_order_and_provenance() {
             assert_eq!(card.source.location, lowered.devices[index].location);
         }
     }
+}
+
+#[test]
+fn nested_included_expansions_have_distinct_ordinals_and_shared_source_provenance() {
+    use ngspice_rs::netlist::behavioural::lower_nonlinear_sources;
+
+    let temp = TempDir::new("included-nonlinear-edits");
+    fs::write(temp.0.join("leaf.inc"), "r1 a 0 1k\ne1 o 0 value={i(r1)}\n").unwrap();
+    fs::write(temp.0.join("outer.inc"), ".include leaf.inc\n").unwrap();
+    let main = temp.0.join("main.cir");
+    fs::write(
+        &main,
+        "title\n.subckt first a\n.include outer.inc\n.ends\n\
+         .subckt second a\n.include outer.inc\n.ends\n.end\n",
+    )
+    .unwrap();
+    let input = Parser::new().parse_file(&main).unwrap();
+    let lowered = lower_nonlinear_sources(&input).unwrap();
+
+    for (serial, (before, after)) in input
+        .subcircuits
+        .iter()
+        .zip(&lowered.subcircuits)
+        .enumerate()
+    {
+        let original_cards: Vec<_> = before
+            .cards
+            .iter()
+            .filter(|card| matches!(card.kind, ScopedCardKind::Device(_)))
+            .collect();
+        let generated_cards: Vec<_> = after
+            .cards
+            .iter()
+            .filter(|card| matches!(card.kind, ScopedCardKind::Device(_)))
+            .collect();
+        assert_eq!(original_cards.len(), 2);
+        assert_eq!(generated_cards.len(), 4);
+        assert_eq!(after.devices[0].nodes[0], format!("a_vmeas_{serial}"));
+        assert_eq!(after.devices[1].name, "v_r1");
+        assert_eq!(after.devices[2].name, "e1");
+        assert_eq!(after.devices[3].name, "be1");
+        for (index, card) in generated_cards.iter().enumerate() {
+            let original = original_cards[index / 2];
+            assert_eq!(card.kind, ScopedCardKind::Device(index));
+            assert_eq!(card.source, original.source);
+            assert_eq!(card.include_chain, original.include_chain);
+            assert_eq!(card.include_chain.len(), 2);
+        }
+    }
+    // The same physical leaf cards were reached through different include
+    // occurrences. The ordinal mapping must never merge those identities.
+    let first = lowered.subcircuits[0]
+        .cards
+        .iter()
+        .find(|card| matches!(card.kind, ScopedCardKind::Device(0)))
+        .unwrap();
+    let second = lowered.subcircuits[1]
+        .cards
+        .iter()
+        .find(|card| matches!(card.kind, ScopedCardKind::Device(0)))
+        .unwrap();
+    assert_eq!(first.source, second.source);
+    assert_ne!(first.include_chain, second.include_chain);
 }

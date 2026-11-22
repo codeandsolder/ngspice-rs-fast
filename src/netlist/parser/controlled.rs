@@ -44,6 +44,7 @@ use winnow::error::ErrMode;
 use winnow::token::any;
 
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind};
+use crate::netlist::behavioural::forms::NonlinearForm;
 use crate::netlist::token::{Token, TokenKind};
 
 use super::behavioural;
@@ -72,17 +73,19 @@ fn body(input: &mut Input<'_>, instance: &Token, designator: char) -> Result<Par
         canonical_node(negative, auto_gnd),
     ];
     let device = |nodes: Vec<String>, parameters: Vec<ParameterAssignment>, input: &Input<'_>| {
-        ParsedCard::Device(DeviceInstance {
+        let device = DeviceInstance {
             name: instance.text.to_ascii_lowercase(),
             designator,
             nodes,
             model: None,
             parameters,
             location: input.state.card.location.clone(),
-        })
+        };
+        NonlinearForm::validate(&device).map_err(|error| ErrMode::Cut(Failure(error)))?;
+        Ok(ParsedCard::Device(device))
     };
     if let Some(parameters) = nonlinear_form(input, designator, &mut nodes)? {
-        return Ok(device(nodes, parameters, input));
+        return device(nodes, parameters, input);
     }
     hspice_keyword(input, designator)?;
     let mut parameters = Vec::new();
@@ -100,7 +103,7 @@ fn body(input: &mut Input<'_>, instance: &Token, designator: char) -> Result<Par
                 ));
             }
             let parameters = behavioural::table_form(input, designator, true)?;
-            return Ok(device(nodes, parameters, input));
+            return device(nodes, parameters, input);
         }
     } else {
         let control = terminal_name(input, "controlling voltage source name")?;
@@ -128,14 +131,14 @@ fn body(input: &mut Input<'_>, instance: &Token, designator: char) -> Result<Par
             },
         );
         behavioural::coefficients(input, designator, &mut parameters)?;
-        return Ok(device(nodes, parameters, input));
+        return device(nodes, parameters, input);
     }
     let (leading, setters) = gain_and_setters(input, designator)?;
     parameters.extend(setters);
     if let Some(gain) = leading {
         parameters.push(gain);
     }
-    Ok(device(nodes, parameters, input))
+    device(nodes, parameters, input)
 }
 
 /// The gain is followed by another token that is neither `m=` nor `ic=`.

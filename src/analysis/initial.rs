@@ -49,7 +49,7 @@ use petgraph::graph::{NodeIndex, UnGraph};
 use petgraph::unionfind::UnionFind;
 use petgraph::visit::{Control, DfsEvent, depth_first_search};
 
-use crate::analysis::{AnalysisRequest, NodeCondition};
+use crate::analysis::{AnalysisPlan, NodeCondition};
 
 fn failure(message: impl Into<String>) -> SpiceError {
     SpiceError::Numerical {
@@ -80,10 +80,10 @@ pub(super) struct Hints {
 /// # Errors
 /// A node that is not part of the circuit (C: warning "IC on non-existent node
 /// ... ignored") or that is ground.
-pub(super) fn resolve(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<Hints> {
+pub(super) fn resolve(circuit: &Circuit, request: &AnalysisPlan) -> SpiceResult<Hints> {
     Ok(Hints {
-        initial: bind(circuit, &request.initial_conditions, ".ic")?,
-        nodesets: bind(circuit, &request.nodesets, ".nodeset")?,
+        initial: bind(circuit, request.initial_conditions(), ".ic")?,
+        nodesets: bind(circuit, request.nodesets(), ".nodeset")?,
     })
 }
 

@@ -2,7 +2,7 @@
 //! geometry, process extraction and temperature, checked against independent
 //! restatements of `mos1temp.c`/`mos1load.c`/`DEVqmeyer` and finite
 //! differences. C-golden comparisons live in `xtask golden verify`.
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
 use ngspice_rs::devices::{
     AnalysisMode, Circuit, Forcing, Limit, LoadRequest, ModelContext, StateHistory, TransientTiming,
 };
@@ -32,13 +32,9 @@ fn circuit(body: &str) -> Circuit {
     Circuit::from_netlist(&deck(body)).unwrap()
 }
 fn op(c: &mut Circuit) -> Plot {
-    runner(AnalysisKind::OperatingPoint)
-        .unwrap()
-        .run(
-            c,
-            &AnalysisRequest::with_arguments(AnalysisKind::OperatingPoint, [""; 0]),
-            &AnalysisContext::default(),
-        )
+    AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, [""; 0])
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
         .unwrap()
 }
 fn close(a: f64, b: f64, relative: f64, absolute: f64) {

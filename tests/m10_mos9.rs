@@ -7,7 +7,7 @@
 //! comparisons (`m10_mos9_*`) live in `xtask golden verify`;
 //! `tests/c_noise_reference.rs` and `tests/c_pole_zero.rs` compare MOS9
 //! `.noise` and `.pz` with live C.
-use ngspice_rs::analysis::{Plot, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, RunConfig};
 use ngspice_rs::devices::{AnalysisMode, Circuit, LoadRequest, ModelContext};
 use ngspice_rs::maths::{SparseMatrix, Vector};
 use ngspice_rs::netlist::Parser;
@@ -70,9 +70,9 @@ fn run(body: &str) -> SpiceResult<Vec<Plot>> {
         &format!("M10\n{body}\n.end\n"),
     ))?;
     let config = RunConfig::from_netlist(&netlist)?;
-    let request = config.request_for(&netlist.analyses[0])?;
+    let request = config.plan_for(&netlist.analyses[0])?;
     let mut circuit = config.circuit(&netlist)?;
-    runner(request.kind)?.run_plots(&mut circuit, &request, &config.context())
+    request.run_plots(&mut circuit, &config.context())
 }
 fn level(body: &str, level: u8) -> String {
     body.replace("level=9", &format!("level={level}"))
