@@ -112,6 +112,47 @@ No column metadata, floating-point bits, explicit byte order, collection
 limit or atomic transaction rule changes. ASCII and the zero-width rootless
 pole-zero result require no binary scratch allocation.
 
+The retained encoder initializes its storage only once. Completed blocks
+reset a byte count rather than zeroing the storage; every word in the next
+active range is overwritten before it is emitted. A reader whose current
+row fits in the borrowed buffer bypasses all fragment handling.
+
+The opt-in `rawfile_codec_bench` matrix exercises 4 × 262,144 and
+4,097 × 256 (columns × rows), with both real and mixed-column complex
+schemas, from memory and buffered files. Codec-level `Read::read` and
+`BufRead::fill_buf` calls are counted separately from physical file
+syscalls. A retained 32 MiB complex payload formerly made 4,194,304
+8-byte writer calls; the new codec emits 1,024 blocks. The narrow memory
+fixture goes from 1,048,576 payload reads to 262,144 row lends; the wide
+fixture from 1,048,832 payload reads to 256 row lends. Unit regression
+checks independently generated endian-specific scalar bytes and the
+exact block write count, even when a row crosses multiple blocks.
+
+Release-mode measurements on Acer, baseline 506e3314 and block codec ad0953d
+(median of three runs, elapsed milliseconds, concurrent build load):
+
+| Input/output | Columns | Flags | Encode (ms) | Decode (ms) |
+| --- | ---: | --- | ---: | ---: |
+| memory | 4 | Real | 12.29 → 4.87 | 21.08 → 4.86 |
+| memory | 4 | Complex | 38.24 → 6.78 | 25.15 → 4.71 |
+| memory | 4097 | Real | 10.55 → 3.98 | 23.59 → 2.62 |
+| memory | 4097 | Complex | 30.12 → 13.73 | 24.36 → 3.15 |
+| file | 4 | Real | 9.15 → 6.92 | 24.95 → 9.60 |
+| file | 4 | Complex | 16.43 → 12.41 | 35.57 → 10.44 |
+| file | 4097 | Real | 11.59 → 6.16 | 35.27 → 4.82 |
+| file | 4097 | Complex | 38.03 → 10.80 | 69.16 → 7.37 |
+
+Aggregate process CPU time (user + system) for the 12-round memory matrix
+fell from 0.29 to 0.16 s; peak RSS 68,684 to 68,764 KiB. The buffered file
+matrix fell from 0.51 to 0.23 s; peak RSS 36,156 to 35,864 KiB. The original
+2,097,152-complex-cell benchmark produced byte-identical rawfiles, with
+single-run encode 161 → 14 ms and lending iteration 141 → 70 ms; CPU
+0.05 → 0.02 s for each of those tests, peak RSS 35,632 → 35,848 KiB
+(encode) and 3,052 → 3,160 KiB (iterate). File measurements include normal
+OS page-cache effects, not durable fsync throughput; wall-clock improvements
+are indicative under simultaneous builds. All call-count assertions and
+bitwise equality checks are deterministic.
+
 That is also the layout of a multi-analysis batch run (`ngspice -b -r`, #96):
 one plot per analysis, in `CKTdoJob()` order. The opt-in
 `tests/c_batch_reference.rs` reads such a C binary file with
