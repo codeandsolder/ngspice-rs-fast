@@ -30,10 +30,6 @@
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
 )]
-#![expect(
-    clippy::while_float,
-    reason = "the C iterative floating-point loop must preserve its original termination and rounding order"
-)]
 
 use crate::maths::Matrix;
 use crate::maths::linear::numerical;

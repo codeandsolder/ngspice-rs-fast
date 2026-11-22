@@ -161,9 +161,21 @@ impl Mul for Complex {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self {
+        let ac = self.re * rhs.re;
+        let bd = -self.im * rhs.im;
+        let ad = self.re * rhs.im;
+        let bc = self.im * rhs.re;
+        let real = ac + bd;
+        let imag = ad + bc;
+        // An axial operand has only one potentially nonzero product in
+        // each component: no two-product cancellation or range recovery
+        // is possible. Preserve the IEEE zero/nonfinite signs of the sum.
+        if self.re == 0. || self.im == 0. || rhs.re == 0. || rhs.im == 0. {
+            return Self::new(real, imag);
+        }
         Self::new(
-            product_sum(self.re, rhs.re, -self.im, rhs.im),
-            product_sum(self.re, rhs.im, self.im, rhs.re),
+            refine_product(self.re, rhs.re, -self.im, rhs.im, ac, bd, real),
+            refine_product(self.re, rhs.im, self.im, rhs.re, ad, bc, imag),
         )
     }
 }
@@ -219,30 +231,38 @@ fn compensated_sum(a: Real, b: Real, c: Real, d: Real, first: Real, second: Real
 }
 
 #[inline]
-fn product_sum(a: Real, b: Real, c: Real, d: Real) -> Real {
-    let first = a * b;
-    let second = c * d;
-    let sum = first + second;
-    // A normal sum of rounded products cannot conceal an overflowing
-    // intermediate. A subnormal product can affect a normal sum by at
-    // most one ulp; reserve exponent recovery for the result near a
-    // representability boundary, where a component could disappear.
-    if sum.is_normal() {
-        return compensated_sum(a, b, c, d, first, second);
+fn refine_product(
+    a: Real,
+    b: Real,
+    c: Real,
+    d: Real,
+    first: Real,
+    second: Real,
+    sum: Real,
+) -> Real {
+    if sum.is_normal() && sum.abs() > 0.5 * first.abs().max(second.abs()) {
+        return sum;
     }
-    if !sum.is_finite() || lost_product(first, a, b) || lost_product(second, c, d) {
-        return exceptional_product_sum(a, b, c, d, sum);
-    }
-    compensated_sum(a, b, c, d, first, second)
+    refine_product_sum(a, b, c, d, first, second, sum)
 }
 
 #[cold]
-fn exceptional_product_sum(a: Real, b: Real, c: Real, d: Real, sum: Real) -> Real {
-    if [a, b, c, d].into_iter().all(Real::is_finite) {
+fn refine_product_sum(
+    a: Real,
+    b: Real,
+    c: Real,
+    d: Real,
+    first: Real,
+    second: Real,
+    sum: Real,
+) -> Real {
+    if (!sum.is_finite() || lost_product(first, a, b) || lost_product(second, c, d))
+        && [a, b, c, d].into_iter().all(Real::is_finite)
+    {
         let scaled = ScaledProduct::product(a, b).add(ScaledProduct::product(c, d));
         scale_power(scaled.mantissa, scaled.exponent)
     } else {
-        sum
+        compensated_sum(a, b, c, d, first, second)
     }
 }
 
@@ -724,6 +744,18 @@ mod tests {
         let q = Complex::new(a.re, -a.im) / b;
         assert_eq!(q.re, expected / ((1. - epsilon).powi(2) + 1.));
         assert_eq!((b * a).re, expected);
+    }
+
+    #[test]
+    fn quotient_retains_cancellation_before_subnormal_rounding() {
+        let e = f64::EPSILON;
+        let scale = 2_f64.powi(-500);
+        let a = Complex::new((1. + e) * scale, -scale);
+        let b = Complex::new((1. - e) * scale, scale);
+        let q = a / b;
+        let expected = -(e * e) / ((1. - e).powi(2) + 1.);
+        assert!((q.re / expected - 1.).abs() < 1e-14);
+        assert!((q.im + 1.).abs() < 1e-14);
     }
 
     #[test]

@@ -5,10 +5,13 @@ method below was accepted and implemented in M8; it was replaced by a port of
 C's deflated Muller search when faer (which supplied the SVD and QZ) was
 removed. `src/maths/pencil.rs` now ports `CKTpzFindZeros` and its helpers
 (`cktpzstr.c`) with `NIpzSym2`/`NIpzMuller` (`nipzmeth.c`), taking each
-trial's determinant from the SPARSE 1.3 port, and reproduces C's failures
-too: the iteration limit and the "numerical aberrations" warning return the
-roots found so far. Against a `-ffp-contract=off` C build the search is
-bit-identical. The sections [Decision](#decision-finite-generalized-eigenvalues-of-the-modified-pencil),
+trial's determinant from the SPARSE 1.3 port. The later numerical-accuracy
+revision (#91) computes binary-normalized determinants, uses the actual
+conjugate-pair polynomial in deflation, checks convergence independently of
+trial collisions, and bounds root count by the reactive support. Both
+formerly iteration-limited cubic examples now return the complete roots.
+The iteration-limit warning still returns the roots found so far.
+The sections [Decision](#decision-finite-generalized-eigenvalues-of-the-modified-pencil),
 the completeness and accuracy items of [Divergences](#divergences-from-c) and
 the eigenvalue-era error figures describe the M8 method and are kept as the
 historical record; the card, loads, device support, output and CCVS sign
@@ -176,11 +179,12 @@ Golden fixtures (captured once each with `cargo xtask golden capture
 --netlist <name>`; compared as unordered root sets under `compare::POLE_ZERO`,
 `|Rust - C| <= 1e-6 |C| + 1e-9 max|C root|`): `pz_ladder_cur`,
 `pz_bridge_diff`, `pz_transformer`, `pz_cv_loop`, `pz_diode`, `pz_mos1` and the
-batch `multi_analysis_pz` (`.ac`, `.op`, two `.pz`). Since the Muller port,
-`multi_analysis_pz` is excluded from `golden verify` (`EXCLUDED` in
-`xtask/src/commands/verify.rs`): the port matches a `-ffp-contract=off` C build bit
-for bit, which hits the 201-trial limit on the poles and writes an empty `pz2`
-plot, while the committed golden came from the FMA-built reference, whose
-search converges to three poles. See
+batch `multi_analysis_pz` (`.ac`, `.op`, two `.pz`). The historical
+`multi_analysis_pz` exclusion from `golden verify` (`EXCLUDED` in
+`xtask/src/commands/verify.rs`) was caused by the no-FMA C search returning
+an empty pole plot. The accuracy revision instead checks the full numerator
+and denominator root sets in `tests/pole_zero.rs` via independently derived
+cubic residuals and Vieta coefficients. The notch case uses the same
+independent completeness criterion. See
 [VERIFICATION.md](VERIFICATION.md#m8-pole-zero-analysis-103) for the measured
 errors.

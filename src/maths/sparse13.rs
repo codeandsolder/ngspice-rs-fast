@@ -43,10 +43,6 @@
     clippy::float_cmp,
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
 )]
-#![expect(
-    clippy::while_float,
-    reason = "the C iterative floating-point loop must preserve its original termination and rounding order"
-)]
 
 use super::linear::numerical;
 use crate::primitives::{Complex, SpiceResult};

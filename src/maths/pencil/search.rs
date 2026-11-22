@@ -781,12 +781,12 @@ impl Search<'_> {
     /// Evaluate or merge a proposed trial. Preserve distinct roots and
     /// require a numerical residual check before declaring convergence.
     fn run_trial(&mut self, mut s: Cx, middle: Option<TrialId>) -> SpiceResult<TrialId> {
+        const ABSTOL: Real = 1e-20;
+        const RELTOL: Real = 1e-12;
         s.im = s.im.abs();
         if s.im <= 8. * Real::EPSILON * s.re.abs() {
             s.im = 0.;
         }
-        const ABSTOL: Real = 1e-20;
-        const RELTOL: Real = 1e-12;
         let mut shifted = false;
         let mut attempts = 0;
         loop {
