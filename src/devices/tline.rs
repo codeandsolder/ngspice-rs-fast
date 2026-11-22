@@ -398,7 +398,9 @@ impl TransmissionLine {
     /// the first sample (from the third on) later than `time - TD`, or the
     /// last one (extrapolation).
     fn delayed(&self, history: &WaveformHistory, time: Real) -> SpiceResult<[Real; 2]> {
-        let size = history
+        let samples = history.samples::<2>()?;
+        let size = samples
+            .times()
             .len()
             .checked_sub(1)
             .filter(|size| *size >= 2)
@@ -409,12 +411,13 @@ impl TransmissionLine {
                 ))
             })?;
         let target = time - self.td;
-        let at = |index: usize| history.time(index).unwrap_or(Real::NAN);
-        let mut i = 2;
-        while i < size && at(i) <= target {
-            i += 1;
-        }
-        let (t1, t2, t3) = (at(i - 2), at(i - 1), at(i));
+        // The C loop starts at index 2 and advances through exact knots,
+        // except that it always stops at the final sample (extrapolation).
+        let end = samples.upper_bound(target).clamp(2, size);
+        let [first, second, third] = samples.window::<3>(end).ok_or_else(|| {
+            SpiceError::circuit(format!("{}: delay history window out of bounds", self.name))
+        })?;
+        let (t1, t2, t3) = (first.time, second.time, third.time);
         if t2 - t1 == 0. || t3 - t2 == 0. || t3 - t1 == 0. {
             // C skips the source load (`continue`); history times are
             // strictly increasing here, so this is an internal error.
@@ -433,12 +436,10 @@ impl TransmissionLine {
         f3 /= t2 - t3;
         f1 /= t1 - t3;
         f3 /= t1 - t3;
-        let value =
-            |index: usize, component: usize| history.value(index, component).unwrap_or(Real::NAN);
-        let result = [0, 1].map(|component| {
-            let first = f1 * value(i - 2, component);
-            let second = f2 * value(i - 1, component);
-            let third = f3 * value(i, component);
+        let result = std::array::from_fn(|component| {
+            let first = f1 * first.values[component];
+            let second = f2 * second.values[component];
+            let third = f3 * third.values[component];
             first + second + third
         });
         if result.iter().any(|v| !v.is_finite()) {
@@ -683,42 +684,39 @@ impl DelayLine for TransmissionLine {
         history: &DelayHistory,
         context: &DelayContext<'_>,
     ) -> SpiceResult<DelayUpdate> {
-        let history = history.as_waveform()?;
+        let history = history.as_waveform()?.samples::<2>()?;
         let time = context.time;
         let size = history
+            .times()
             .len()
             .checked_sub(1)
             .filter(|s| *s >= 2)
             .ok_or_else(|| {
                 SpiceError::circuit(format!("{}: delay history too short", self.name))
             })?;
-        let at = |index: usize| history.time(index).unwrap_or(Real::NAN);
-        let value =
-            |index: usize, component: usize| history.value(index, component).unwrap_or(Real::NAN);
-        let mut update = WaveformUpdate::default();
-        // Shift out samples no later interpolation can reach, keeping two
-        // before the first one at or after `time - TD`.
-        if time - self.td > at(2) {
-            let mut i = 2;
-            while i < size && time - self.td > at(i) {
-                i += 1;
-            }
-            update.drop_front = i - 2;
-        }
-        if time - at(size) > context.min_break {
+        let [previous, latest] = history.window::<2>(size).ok_or_else(|| {
+            SpiceError::circuit(format!("{}: delay history window out of bounds", self.name))
+        })?;
+        // TRAaccept's strict comparison keeps two samples before the
+        // first one at or after the delayed target, including an exact knot.
+        let mut update = WaveformUpdate {
+            drop_front: history.lower_bound(time - self.td).clamp(2, size) - 2,
+            ..WaveformUpdate::default()
+        };
+        if time - latest.time > context.min_break {
             let wave = self.waves(context);
             update.append = Some((time, wave.to_vec()));
             let [h0, h1, ..] = context.steps;
             let slopes = [0, 1].map(|k| {
                 (
-                    (wave[k] - value(size, k)) / h0,
-                    (value(size, k) - value(size - 1, k)) / h1,
+                    (wave[k] - latest.values[k]) / h0,
+                    (latest.values[k] - previous.values[k]) / h1,
                 )
             });
             if self.slope_changed(slopes) {
                 // The slope changed at the previous sample: its wave reaches
                 // the other port TD later.
-                let when = at(size) + self.td;
+                let when = latest.time + self.td;
                 if when > time {
                     update.breakpoints.push(when);
                 }
@@ -734,27 +732,172 @@ impl DelayLine for TransmissionLine {
         history: &DelayHistory,
         context: &DelayContext<'_>,
     ) -> SpiceResult<Option<Real>> {
-        let history = history.as_waveform()?;
-        let size = history
-            .len()
-            .checked_sub(1)
-            .filter(|s| *s >= 1)
-            .ok_or_else(|| {
-                SpiceError::circuit(format!("{}: delay history too short", self.name))
-            })?;
-        let at = |index: usize| history.time(index).unwrap_or(Real::NAN);
-        let value =
-            |index: usize, component: usize| history.value(index, component).unwrap_or(Real::NAN);
+        let history = history.as_waveform()?.samples::<2>()?;
+        let [previous, latest] =
+            history
+                .window::<2>(history.times().len() - 1)
+                .ok_or_else(|| {
+                    SpiceError::circuit(format!("{}: delay history too short", self.name))
+                })?;
         let wave = self.waves(context);
         let [_, h1, h2] = context.steps;
         let slopes = [0, 1].map(|k| {
             (
-                (wave[k] - value(size, k)) / h1,
-                (value(size, k) - value(size - 1, k)) / h2,
+                (wave[k] - latest.values[k]) / h1,
+                (latest.values[k] - previous.values[k]) / h2,
             )
         });
         Ok(self
             .slope_changed(slopes)
-            .then(|| at(size) + self.td - context.time))
+            .then_some(latest.time + self.td - context.time))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::traits::MnaUnknowns;
+    use std::path::PathBuf;
+
+    fn line(td: Real) -> TransmissionLine {
+        TransmissionLine {
+            name: "t1".into(),
+            terminals: [NodeId::GROUND; 8],
+            z0: 50.,
+            td,
+            nl: 0.25,
+            f: 1e9,
+            initial: [0.; 4],
+            reltol: 0.,
+            abstol: 0.,
+            location: SourceLoc::new(PathBuf::from("history.cir"), 1, 1),
+        }
+    }
+
+    // The former linear-scan implementation, kept only as an independent
+    // regression oracle for index selection, interpolation and C rounding.
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "Preserve the previous non-fused C arithmetic"
+    )]
+    fn scan_interpolate(history: &WaveformHistory, target: Real) -> [Real; 2] {
+        let last = history.len() - 1;
+        let mut index = 2;
+        while index < last && history.time(index).unwrap() <= target {
+            index += 1;
+        }
+        let [t1, t2, t3] = [index - 2, index - 1, index].map(|i| history.time(i).unwrap());
+        let mut f1 = (target - t2) * (target - t3);
+        let mut f2 = (target - t1) * (target - t3);
+        let mut f3 = (target - t1) * (target - t2);
+        f1 /= t1 - t2;
+        f2 /= t2 - t1;
+        f2 /= t2 - t3;
+        f3 /= t2 - t3;
+        f1 /= t1 - t3;
+        f3 /= t1 - t3;
+        [0, 1].map(|k| {
+            let first = f1 * history.value(index - 2, k).unwrap();
+            let second = f2 * history.value(index - 1, k).unwrap();
+            let third = f3 * history.value(index, k).unwrap();
+            first + second + third
+        })
+    }
+
+    #[test]
+    fn indexed_interpolation_is_bitwise_identical_across_wrap_and_retry() {
+        let line = line(0.25);
+        let mut history = WaveformHistory::new(2);
+        for tick in -8_i32..=125 {
+            let time = Real::from(tick) * 0.25;
+            history
+                .apply(&WaveformUpdate {
+                    drop_front: usize::from(history.len() >= 12),
+                    append: Some((time, vec![time.sin(), time.cos()])),
+                    ..WaveformUpdate::default()
+                })
+                .unwrap();
+            if history.len() < 3 {
+                continue;
+            }
+            let old = history.clone();
+            let mut trials = vec![time + 1., time - 4., time + 1.];
+            for index in 0..history.len() {
+                let trial = history.time(index).unwrap() + line.td;
+                trials.extend([trial.next_down(), trial, trial.next_up()]);
+            }
+            for trial in trials.into_iter().rev() {
+                let expected = scan_interpolate(&history, trial - line.td);
+                let got = line.delayed(&history, trial).unwrap();
+                assert_eq!(got.map(Real::to_bits), expected.map(Real::to_bits));
+            }
+            assert_eq!(history, old);
+        }
+        assert!(line.delayed(&WaveformHistory::new(2), 0.).is_err());
+        let wrong = WaveformHistory::new(4);
+        assert!(line.delayed(&wrong, 0.).is_err());
+    }
+
+    #[test]
+    fn pruning_retains_exact_knot_and_reference_breakpoint_and_tail() {
+        let line = line(32.);
+        let mut history = DelayHistory::waveform(2);
+        for tick in 0_i32..40 {
+            let time = Real::from(tick);
+            history
+                .apply(&DelayUpdate::Waveform(WaveformUpdate {
+                    drop_front: usize::from(history.len() >= 16),
+                    append: Some((time, vec![time * 0.25, time * 0.5])),
+                    ..WaveformUpdate::default()
+                }))
+                .unwrap();
+        }
+        let samples = history.as_waveform().unwrap();
+        let last = samples.len() - 1;
+        let solution = Vector::from_slice(&[]);
+        let unknowns = MnaUnknowns::new();
+        for index in 0..samples.len() {
+            let time = samples.time(index).unwrap() + line.td;
+            for time in [time.next_down(), time, time.next_up()] {
+                let context = DelayContext {
+                    solution: &solution,
+                    unknowns: &unknowns,
+                    time,
+                    steps: [1.; 3],
+                    min_break: 0.,
+                    reltol: 0.,
+                    abstol: 0.,
+                    initial_conditions: false,
+                    branches: 0..0,
+                };
+                let mut expected = 2;
+                while expected < last && samples.time(expected).unwrap() < time - line.td {
+                    expected += 1;
+                }
+                let DelayUpdate::Waveform(update) =
+                    DelayLine::accept(&line, &history, &context).unwrap()
+                else {
+                    unreachable!()
+                };
+                assert_eq!(update.drop_front, expected - 2);
+                assert_eq!(
+                    update.breakpoints,
+                    if samples.last_time().unwrap() + line.td > time {
+                        vec![samples.last_time().unwrap() + line.td]
+                    } else {
+                        vec![]
+                    }
+                );
+                let mut copy = history.clone();
+                copy.apply(&DelayUpdate::Waveform(update)).unwrap();
+                let copy = copy.as_waveform().unwrap();
+                for (i, old) in (expected - 2..=last).enumerate() {
+                    assert_eq!(copy.time(i), samples.time(old));
+                    for k in 0..2 {
+                        assert_eq!(copy.value(i, k), samples.value(old, k));
+                    }
+                }
+            }
+        }
     }
 }

@@ -60,8 +60,9 @@
 //!   `Q` positive; `Z`, `TAUD`, `TAUG`, `VST`, `DELTA`, `IBD`, `CDS`
 //!   nonnegative), and any nonfinite evaluation is an error.
 //!
-//! `.noise` (`jfet2noi.c`), `.disto` (C has no `DEVdisto` for level 2) and
-//! `.sens` fail with explicit errors.
+//! `.sens` replays the family-specific DC and AC reset loads; gate-lag
+//! and thermal memory remain part of the Parker model, not the shared
+//! gate lifecycle.
 
 // C-compatible numerical expressions are kept in their reference order:
 // Clippy's fused multiply-add suggestions change IEEE-754 rounding.
@@ -87,7 +88,9 @@
 )]
 
 use crate::devices::jfet::{
-    self, IC_COMPONENTS, Instance, Junctions, K_OVER_Q, Loaded, p, required,
+    self, IC_COMPONENTS, Instance, K_OVER_Q,
+    lifecycle::{self, GateStamp, GateUpdate, Junctions, LoadPhase, Loaded, carry},
+    p, required,
 };
 use crate::devices::limiting;
 use crate::devices::nonlinear::charge::ChargeBranch;
@@ -99,9 +102,7 @@ use crate::devices::sensitivity::{
     AcReset, CELSIUS_TO_KELVIN, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel,
     SensitivityLoad, SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
-use crate::devices::{
-    AnalysisMode, Device, LinearContext, ModelContext, ResolvedModel, StampContext,
-};
+use crate::devices::{Device, LinearContext, ModelContext, ResolvedModel, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
@@ -857,7 +858,7 @@ impl Jfet2 {
 
     /// Normalized `[vgs, vgd]` from physical node voltages of d', g, s'.
     fn normalized(&self, v: [Real; 3]) -> [Real; 2] {
-        jfet::normalized(self.model.pol, v)
+        lifecycle::normalized(self.model.pol, v)
     }
 
     fn numerical(&self, message: &str) -> SpiceError {
@@ -916,16 +917,6 @@ impl Jfet2 {
 /// Rewrites `slot` with its value before this load (C leaves `CKTstate0`
 /// untouched there): the previous load's, else the accepted or carried one,
 /// else zero.
-fn carry(states: &mut crate::devices::DeviceState<'_>, slot: usize) -> SpiceResult<()> {
-    let value = states
-        .iterate(slot)
-        .or_else(|| states.accepted(1, slot))
-        .or_else(|| states.carried(slot))
-        .filter(|v| v.is_finite())
-        .unwrap_or(0.);
-    states.set(slot, value)
-}
-
 impl Device for Jfet2 {
     /// `jfet2set.c`: C's device type and `TSTALLOC` order.
     fn c_device_type(&self) -> crate::devices::setup::CDeviceType {
@@ -937,7 +928,7 @@ impl Device for Jfet2 {
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
     ) -> SpiceResult<bool> {
-        jfet::setup_gate_matrix(setup, &self.terminals, self.inner);
+        lifecycle::setup_gate_matrix(setup, &self.terminals, self.inner);
         Ok(true)
     }
     /// `jfet2ask.c` scalar asks: `area` (C reports `area * m`), `m`, `temp`,
@@ -1032,18 +1023,10 @@ impl Device for Jfet2 {
     /// default. As for level 1 the load's own `icheck`/`cghat`/`cdhat` test
     /// is the convergence test (`DEVconvTest = NULL`).
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        if context.mode.is_ac() {
-            return Err(SpiceError::circuit("JFET2 AC needs small-signal assembly"));
-        }
+        let phase = LoadPhase::new(context.mode, context.integration, &context.states, "JFET2")?;
         let op = self.operating(&context.model_context())?;
         let pol = self.model.pol;
-        let raw = self.normalized(self.inner.map(|n| context.node_voltage(n)));
-        let ic =
-            jfet::start_conditions(&self.terminals, &self.initial, |n| context.node_voltage(n));
-        let integration = context.integration;
-        // C `xfact = CKTdelta / CKTdeltaOld[1]`; one in a `.dc` sweep.
-        let xfact = integration.map_or(1., crate::maths::integrator::Coefficients::predictor_ratio);
-        let ([vgs, vgd], start) = jfet::select_junctions(
+        let ([vgs, vgd], start) = phase.junctions(
             Junctions {
                 pol,
                 off: self.initial.off,
@@ -1051,17 +1034,11 @@ impl Device for Jfet2 {
                 vcrit: op.vcrit,
                 vto: self.model.vto,
             },
-            &context.states,
-            raw,
-            ic,
-            xfact,
+            context,
+            &self.terminals,
+            self.inner,
+            &self.initial,
         );
-        let transient = context.mode.is_transient();
-        if transient && integration.is_none() {
-            return Err(SpiceError::circuit(
-                "JFET2 transient needs companion integration",
-            ));
-        }
         let state1 = |states: &crate::devices::DeviceState<'_>, s: usize, what: &str| {
             states
                 .accepted(1, s)
@@ -1069,7 +1046,7 @@ impl Device for Jfet2 {
         };
         // psmodel.h: TRAN_ANAL is MODETRAN, the `BEFORE` values CKTstate1
         // and STEP `CKTdelta`.
-        let memory = if let AnalysisMode::Transient { dt, .. } = context.mode {
+        let memory = if let Some(dt) = phase.step() {
             Some(Memory {
                 step: dt,
                 vgstrap: state1(&context.states, slot::VGSTRAP, "vgstrap")?,
@@ -1082,28 +1059,24 @@ impl Device for Jfet2 {
         let point = self.point(&op, vgs, vgd, context.gmin, memory.as_ref())?;
         let vds = vgs - vgd;
         let mut l = Loaded::from_currents([vgs, vgd], point.channel, point.gs, point.gd);
-        let initial_transient = context.states.phase() == crate::devices::IterationPhase::Predict
-            && context.states.initial_transient();
-
         // Charge storage: C evaluates the charges in transient, `.dc` sweeps,
         // MODEINITSMSIG and the `uic` operating point, and integrates them in
         // transient only. Elsewhere the slots keep their previous values, as
         // C's CKTstate0 does.
-        if transient || context.mode == AnalysisMode::DcSweep || context.states.initial_conditions()
-        {
+        if phase.updates_statz() {
             let capds = op.capds;
-            let gates = if transient {
-                jfet::incremental_statz(
+            let gates = if phase.step().is_some() {
+                lifecycle::incremental_statz(
                     &context.states,
                     [vgs, vgd],
-                    jfet::StatzCapacitance::Averaged,
+                    lifecycle::StatzCapacitance::Averaged,
                     |what| self.numerical(&format!("missing accepted {what}")),
                     |gs, gd| Ok(self.model.qgg(&op, gs, gd)),
                 )?
             } else {
                 // PScharge outside transient: total charge in both slots.
                 let (q, capgs, capgd) = self.model.qgg(&op, vgs, vgd);
-                jfet::gate_charges(q, q, capgs, capgd)
+                lifecycle::gate_charges(q, q, capgs, capgd)
             };
             let drain = ChargeBranch::new(slot::QDS, capds * vds, capds);
             if gates
@@ -1113,41 +1086,7 @@ impl Device for Jfet2 {
             {
                 return Err(self.numerical("nonfinite Statz gate charge"));
             }
-            if let Some(coefficients) = integration {
-                let AnalysisMode::Transient { dt, .. } = context.mode else {
-                    return Err(SpiceError::circuit(
-                        "JFET2 charge companion outside transient",
-                    ));
-                };
-                if dt != coefficients.dt() {
-                    return Err(SpiceError::circuit("JFET2 charge timestep mismatch"));
-                }
-                let branches = [gates[0], gates[1], drain];
-                if initial_transient {
-                    for branch in branches {
-                        branch.seed(&mut context.states)?;
-                    }
-                }
-                let [cqgs, cqgd] = l.integrate_gates(&mut context.states, coefficients, gates)?;
-                // jfet2load.c integrates CDS * vds into drain current but
-                // leaves its conductance out of the matrix.
-                let cqds = drain
-                    .integrate(&mut context.states, coefficients)?
-                    .derivative;
-                l.cd += cqds;
-                if initial_transient {
-                    for (branch, derivative) in branches.into_iter().zip([cqgs, cqgd, cqds]) {
-                        branch.seed_derivative(&mut context.states, derivative)?;
-                    }
-                }
-            } else {
-                for s in [slot::QGS + 1, slot::QGD + 1, slot::QDS + 1] {
-                    carry(&mut context.states, s)?;
-                }
-            }
-            for branch in [gates[0], gates[1], drain] {
-                branch.store(&mut context.states)?;
-            }
+            GateUpdate::Parker { gates, drain }.apply(phase, &mut context.states, &mut l)?;
         } else {
             for s in [
                 slot::QGS,
@@ -1168,16 +1107,14 @@ impl Device for Jfet2 {
         ] {
             context.states.set(s, value)?;
         }
-        jfet::finish_load(
-            context,
-            start,
-            &l,
-            &self.terminals,
-            self.inner,
-            pol,
-            self.instance.m,
-            jfet::series_conductances(self.instance.area, self.model.rd, self.model.rs),
-        )
+        GateStamp {
+            terminals: &self.terminals,
+            inner: self.inner,
+            polarity: pol,
+            multiplicity: self.instance.m,
+            series: jfet::series_conductances(self.instance.area, self.model.rd, self.model.rs),
+        }
+        .finish(context, start, &l)
     }
     /// `jfet2acld.c` after C's `MODEINITSMSIG` load: `PSacload`'s
     /// frequency-dependent transconductance and output conductance at the

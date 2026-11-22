@@ -17,10 +17,10 @@ fn column(plot: &ngspice_rs::analysis::Plot, name: &str) -> Vec<Complex> {
     let i = plot
         .variable_index(name)
         .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
-    plot.points().iter().map(|p| p[i]).collect()
+    plot.rows().map(|p| p[i]).collect()
 }
 fn compare(ours: &ngspice_rs::analysis::Plot, c: &ngspice_rs::analysis::Plot) {
-    assert_eq!(ours.points().len(), c.points().len());
+    assert_eq!(ours.point_count(), c.point_count());
     for v in ours.variables() {
         let name = v.name.as_str();
         let c_name = if name.starts_with("i(") {
@@ -35,7 +35,7 @@ fn compare(ours: &ngspice_rs::analysis::Plot, c: &ngspice_rs::analysis::Plot) {
             .or_else(|| c.variable_index(&format!("v({name})")))
             .unwrap_or_else(|| panic!("missing {name}: {:?}", c.variables()));
         let i = ours.variable_index(&v.name).unwrap();
-        for (a, b) in ours.points().iter().zip(c.points()) {
+        for (a, b) in ours.rows().zip(c.rows()) {
             assert!(
                 (a[i].re - b[other].re).abs() <= 1e-7 * b[other].re.abs() + 2e-11,
                 "{}: {:?} {:?}",
@@ -71,7 +71,7 @@ fn companion_currents_use_integrated_charge_and_satisfy_kcl() {
     let input = column(p, "v(in)");
     let output = column(p, "v(out)");
     let power = column(p, "@r1[p]");
-    for k in 0..p.points().len() {
+    for k in 0..p.point_count() {
         assert!((resistor[k].re - capacitor[k].re).abs() < 2e-12);
         let drop = input[k].re - output[k].re;
         assert!((resistor[k].re - drop / 1000.).abs() < 1e-14);
@@ -128,7 +128,7 @@ fn assert_plot_bits(actual: &Plot, expected: &Plot) {
     assert_eq!(actual.flags(), expected.flags());
     assert_eq!(actual.variables(), expected.variables());
     assert_eq!(actual.point_count(), expected.point_count());
-    for (row, (actual, expected)) in actual.points().iter().zip(expected.points()).enumerate() {
+    for (row, (actual, expected)) in actual.rows().zip(expected.rows()).enumerate() {
         assert_eq!(actual.len(), expected.len());
         for (column, (a, b)) in actual.iter().zip(expected).enumerate() {
             assert_eq!(
@@ -157,7 +157,7 @@ fn capture_comparison_distinguishes_signed_zero() {
     let saved = RawFile::load(root().join("m9_device_dc.raw")).unwrap();
     let expected = &saved.plots[0].plot;
     let mut actual = expected.clone();
-    assert_eq!(actual.points()[0][0].re.to_bits(), 0.0_f64.to_bits());
+    assert_eq!(actual.row(0).unwrap()[0].re.to_bits(), 0.0_f64.to_bits());
     actual.point_mut(0).unwrap()[0].re = -0.0;
     assert_plot_bits(&actual, expected);
 }

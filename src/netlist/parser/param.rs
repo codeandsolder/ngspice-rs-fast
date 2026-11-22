@@ -79,6 +79,7 @@ fn assignments(card: &RawCard, start: usize) -> SpiceResult<Vec<ParamAssignment>
             origin,
             total: text.len(),
             depth: 0,
+            remaining_nodes: crate::netlist::expr::MAX_TREE_NODES,
             shadowing: &[],
         },
     };

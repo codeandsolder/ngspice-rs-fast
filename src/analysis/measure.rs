@@ -310,9 +310,6 @@ impl Axis {
                 feature: format!("the {} plot carries no '{name}' axis vector; it carries {}", plot.plotname, column_names(plot)),
                 location: None,
             },
-            AxisError::MissingSample(index) => SpiceError::Numerical {
-                context: format!("measure axis {name}"), message: format!("point {index} has no {name} value"),
-            },
             AxisError::Nonfinite(index) => SpiceError::Numerical {
                 context: format!("measure axis {name}"), message: format!("point {index} is not finite"),
             },
@@ -447,7 +444,7 @@ impl<'a> Operand<'a> {
 
     /// The operand's value at one plot point.
     fn value(&self, index: usize) -> SpiceResult<Real> {
-        let Some(point) = self.plot.points().get(index) else {
+        let Some(point) = self.plot.row(index) else {
             return Err(SpiceError::Numerical {
                 context: format!("measure {}", self.name),
                 message: format!("the plot has no point {index}"),
@@ -853,7 +850,7 @@ fn margin(
     let mut previous: Option<(Real, Real, Real)> = None;
     let mut raw_previous = 0.;
     let mut offset = 0.;
-    for (i, point) in operand.plot.points().iter().enumerate() {
+    for (i, point) in operand.plot.rows().enumerate() {
         let value = operand.column.value(point)?;
         let db = 20. * value.re.hypot(value.im).log10();
         let raw = value.im.atan2(value.re).to_degrees();
@@ -1201,7 +1198,7 @@ mod tests {
         plot.push_variable(Variable::new("v(out)", "voltage"));
         let mut plot = plot.build();
         for (time, value) in rows {
-            plot.push_point(vec![Complex::real(*time), Complex::real(*value)])
+            plot.push_point(&[Complex::real(*time), Complex::real(*value)])
                 .unwrap();
         }
         plot
@@ -1946,7 +1943,7 @@ mod tests {
         ac.push_variable(Variable::complex("v(out)", "voltage"));
         let mut ac = ac.build();
         for frequency in [100.0, 200.0, 400.0] {
-            ac.push_point(vec![
+            ac.push_point(&[
                 Complex::real(frequency),
                 Complex::new(frequency / 100.0, -1.0),
             ])

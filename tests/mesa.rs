@@ -40,13 +40,13 @@ fn value(plot: &Plot, name: &str, point: usize) -> f64 {
     let index = plot
         .variable_index(name)
         .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
-    plot.points()[point][index].re
+    plot.row(point).unwrap()[index].re
 }
 fn phase(plot: &Plot, name: &str, point: usize) -> (f64, f64) {
     let index = plot
         .variable_index(name)
         .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
-    let value = plot.points()[point][index];
+    let value = plot.row(point).unwrap()[index];
     (value.re, value.im)
 }
 fn close(a: f64, b: f64, relative: f64, absolute: f64) {

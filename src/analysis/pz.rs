@@ -273,7 +273,7 @@ pub(super) fn run(
     }
     let mut plot = plot.build();
     poles.extend(zeros);
-    plot.push_point(poles)?;
+    plot.push_point(&poles)?;
     plots.push(plot);
     Ok(plots)
 }

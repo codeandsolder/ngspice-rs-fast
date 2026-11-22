@@ -296,11 +296,11 @@ fn the_netlist_keeps_the_card_and_the_writer_round_trips_it() {
 }
 
 #[test]
-fn four_cards_are_part_of_semantic_equality_and_survive_a_semantic_form() {
+fn four_cards_are_part_of_semantic_equality_and_survive_writer_roundtrip() {
     // The typed request lives in `ParsedDeck::fourier`, so the card's spelling
     // is the netlist's only record of what was asked for: two decks that differ
     // only in their `.four` request must not compare equal, and the writer must
-    // still reproduce the card from a semantic form.
+    // still reproduce the card.
     let left = parse_deck_text(Path::new("four.cir"), "Title\n.four 1k v(a)\n.tran 1u 1m\n");
     let right = parse_deck_text(Path::new("four.cir"), "Title\n.four 2k v(a)\n.tran 1u 1m\n");
     let left = Parser::new().parse_deck(&left).unwrap();
@@ -311,8 +311,7 @@ fn four_cards_are_part_of_semantic_equality_and_survive_a_semantic_form() {
     );
     assert!(semantic_eq(&left, &left.clone()));
 
-    let semantic = ngspice_rs::netlist::semantic::semantic_form(&left);
-    let written = write_netlist(&semantic).expect("the writer reproduces the card");
+    let written = write_netlist(&left).expect("the writer reproduces the card");
     assert!(written.contains(".four 1k v(a)"), "{written}");
     let reparsed = parse_deck_text(Path::new("four.cir"), &written);
     assert!(semantic_eq(

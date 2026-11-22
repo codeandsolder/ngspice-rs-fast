@@ -754,12 +754,12 @@ mod tests {
             vec![Variable::new("v(in)", "voltage")],
         );
         let data = vec![Complex::real(1.)];
-        let row = data.as_ptr();
-        plot.push_point(data).unwrap();
+        plot.push_point(&data).unwrap();
+        let row = plot.cells().as_ptr();
         let scope = crate::netlist::eval::ParamScope::root(&[]).unwrap();
         let outputs = super::resolve_outputs(plot, &plans[0], &scope, None).unwrap();
         assert!(outputs.printed.unwrap().contains("v(in)"));
-        assert_eq!(outputs.written.points()[0].as_ptr(), row);
+        assert_eq!(outputs.written.row(0).unwrap().as_ptr(), row);
     }
 
     #[test]

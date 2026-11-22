@@ -37,7 +37,9 @@ fn real(plot: &Plot, name: &str) -> Vec<f64> {
 fn complex(plot: &Plot, name: &str) -> Vec<Complex> {
     plot.column(name)
         .unwrap_or_else(|| panic!("no {name}"))
-        .to_vec()
+        .iter()
+        .copied()
+        .collect()
 }
 
 /// The PWL trapezoid the transient tests drive: 0 until 1 ns, 1 V from

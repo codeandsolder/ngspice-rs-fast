@@ -406,7 +406,7 @@ comparator does. The simulation always starts at `t = 0`; `tstart` only
 suppresses earlier rows.
 
 The rows need not be stored. `companion_transient_into` (and
-`AnalysisPlan::run_into`) hands each row by ownership to a `PointSink` as
+`AnalysisPlan::run_into`) lends each row from reusable scratch to a `PointSink` as
 it is accepted, after announcing the plot header before the initial
 operating point, and signals completion before recording final load state.
 The collecting adapter and rawfile spool share this single driver path.

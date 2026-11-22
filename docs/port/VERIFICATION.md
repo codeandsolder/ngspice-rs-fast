@@ -1041,8 +1041,8 @@ source senses; `.option reltol=1e-4` applies to every analysis. The deck lists
   m6_gate`; no other golden was touched. Registered in `BATCH`: AC, DC and OP
   under `compare::NONLINEAR`, the transient under `compare::TRAN` (301
   instants, worst error 0.077 of the bound). The transient breakpoint
-  enumerator now accepts subcircuits without V/I waveform sources (a
-  macromodel adds no breakpoints) and still refuses ones that contain them.
+  enumerator accepts elaborated subcircuit waveforms (a source-free
+  macromodel adds no breakpoints). This was generalized in #33.
 * **Circuit relations.** `tests/simulate.rs`
   (`the_m6_gate_deck_runs_every_analysis_end_to_end`) runs `spice-rs
   simulate` and checks, independently of C: the batch order and the C vector
@@ -1108,8 +1108,8 @@ registered in `golden verify` with `compare::TRAN`: `rc_sin_tran`,
 0.000 of the bound). A discontinuous repeated PWL has no golden: at its
 repetition boundaries C's single loaded value depends on ulp-level rounding of
 its landing time, while the port always takes the left limit (see
-[TRANSIENT.md](TRANSIENT.md#source-functions-94-95)). `tran::breakpoints` follows C's `VSRCaccept`: PULSE
-corners up to `TD + NP*PER`, delayed and repeated PWL knots, none for
+[TRANSIENT.md](TRANSIENT.md#source-functions-94-95)). `tran::breakpoints` uses the resolved waveform timeline: nominal PULSE
+corners up to `TD + NP*PER` (including physical count cuts), delayed and repeated PWL knots, none for
 SIN/EXP/SFFM/AM. The SIN and EXP decks therefore add a constant PWL marker whose
 knots make C land on the function's corners; without it the comparator would
 interpolate C's plot across a slope corner that only the port lands on.
@@ -1736,12 +1736,22 @@ that mention BDF, `TRAN_RESTART` and variants are that historical record.)
   grid `0, step, ..., stop` (`tran::Grid`); linear interpolation is used only
   between two neighbouring samples of one plot with no breakpoint between them,
   otherwise the comparison fails (it never passes by smoothing over an event).
-* Breakpoints come from the deck AST (`tran::breakpoints`): PWL knot times and
-  PULSE `TD + n*PER + {0, TR, TR+PW, TR+PW+TF}` with the C `VSRCaccept`
-  defaults, never from the data. At a breakpoint the left and right limits are
-  compared separately: two samples at one instant are (left, right); one sample
-  serves as both limits; no sample at a breakpoint is an error (ngspice lands a
-  step on every breakpoint, and so does the companion driver).
+* Breakpoints come from the already elaborated circuit (`tran::breakpoints`,
+  #33), not a second interpretation of the AST. The same validated `Waveform`
+  and `TransientTiming` resolve source setters, subcircuit instances and
+  analysis defaults for simulation and comparison. Lazy events retain source
+  identity, exact times and kind (PULSE edge/period/count cut, PWL knot/repeat
+  boundary, step jump, analytic-function corner or trailing accept request).
+  Nominal PULSE/PWL/step corners, including physical fractional-count cuts,
+  require samples in both plots; analytic corners and post-count
+  scheduling-only requests do not. The global event budget is checked before
+  filtering or tolerance coalescing. The comparator reports a missing sample
+  rather than smoothing over the required corner. C's accept callbacks keep
+  their own rounding and merging policies: for example, a zero-width current
+  PULSE can miss a nominal corner when `SAMETIME` requires exact equality.
+  At required events the first and last matching samples represent left and
+  right limits; one sample serves as both. Independent live C tests use
+  manually specified times and voltages, not the shared waveform resolver.
 * `uic` runs: C writes no `t = 0` row (the first row is the first accepted step) and
   adds a breakpoint at the `.tran` step. `tran::Grid` has a `start` (0 normally);
   for a `uic` deck `verify.rs` passes the golden's first time and **both** plots must
@@ -1780,7 +1790,7 @@ that mention BDF, `TRAN_RESTART` and variants are that historical record.)
 
 Tests use only synthetic and committed data (no C): grid alignment on unrelated
 timesteps, in-segment interpolation, refusal across breakpoints, jump left/right
-limits, end-time mismatch, missing signals, nonfinite data, AST breakpoints, and
+limits, end-time mismatch, missing signals, nonfinite data, resolved waveform events,
 and, until M10 wave 0.5, an end-to-end diffsol BDF RC PWL ramp against its
 analytic response (worst error 4e-5 of the bound).
 

@@ -115,3 +115,49 @@ fn runaway_periodic_sources_hit_the_work_limit() {
     let error = tran(&mut c, &["1m", "10m"]).unwrap_err();
     assert!(error.to_string().contains("work limit"), "{error}");
 }
+
+#[test]
+fn resolved_source_events_preserve_identity_and_exact_adjacent_times() {
+    use ngspice_rs::devices::{Limit, PwlSource, TransientTiming, Waveform, WaveformEventKind};
+    let t = 1.0_f64;
+    let mut wave =
+        Waveform::Pwl(PwlSource::plain(vec![(-0., 0.), (t, 1.), (t.next_up(), 2.)]).unwrap())
+            .breakpoints_in(-0., 2.)
+            .unwrap();
+    assert_eq!(
+        wave.next_event().unwrap().time.to_bits(),
+        (-0.0_f64).to_bits()
+    );
+    let a = wave.next_event().unwrap();
+    let b = wave.next_event().unwrap();
+    assert_eq!(a.kind, WaveformEventKind::PwlKnot);
+    assert_eq!(b.kind, WaveformEventKind::PwlKnot);
+    assert_eq!(a.time.to_bits(), t.to_bits());
+    assert_eq!(b.time.to_bits(), t.next_up().to_bits());
+    assert!(wave.next_event().is_none());
+    let c = circuit(
+        "v1 n 0 pulse(0 1 2 1 2 3 10 1.25)\ni1 0 a pwl(0 0 1 1 2 0) r=1 td=0.5\nr1 n 0 1k\nr2 a 0 1k",
+    );
+    let timing = TransientTiming::new(0.1, 30.).unwrap();
+    let sources = c
+        .source_timelines(timing)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let pulse = sources.iter().find(|s| s.name == "v1").unwrap();
+    let mut events = pulse.waveform.breakpoints_in(0., 30.).unwrap();
+    let events = std::iter::from_fn(|| events.next_event()).collect::<Vec<_>>();
+    assert_eq!(events[6].kind, WaveformEventKind::PulseCountCut);
+    assert_eq!(events[6].time.to_bits(), 14.5_f64.to_bits());
+    assert_eq!(events[7].kind, WaveformEventKind::PulseTrailingRequest);
+    assert_eq!(events[7].time.to_bits(), 16.0_f64.to_bits());
+    let pwl = sources.iter().find(|s| s.name == "i1").unwrap();
+    let mut events = pwl.waveform.breakpoints_in(0., 4.).unwrap();
+    let events = std::iter::from_fn(|| events.next_event()).collect::<Vec<_>>();
+    assert_eq!(events[2].kind, WaveformEventKind::PwlRepeatBoundary);
+    assert_eq!(events[3].kind, WaveformEventKind::PwlRepeatBoundary);
+    assert_eq!(events[2].time.to_bits(), 2.5_f64.to_bits());
+    assert_eq!(events[3].time.to_bits(), 3.5_f64.to_bits());
+    // The timeline retains the resolved forcing, not just event times.
+    assert_eq!(pwl.waveform.value_at(2., Limit::Left).unwrap(), 0.5);
+    assert_eq!(pwl.waveform.value_at(2., Limit::Right).unwrap(), 0.5);
+}

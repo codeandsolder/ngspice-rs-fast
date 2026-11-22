@@ -1998,12 +1998,15 @@ impl super::ModelParameters {
         use crate::devices::schema::temperature_kelvin;
         let tnom = temperature_kelvin(nominal_celsius, &self.location)?;
         let temp = temperature_kelvin(temperature_celsius, &instance.location)?;
-        let mut warnings = Vec::new();
-        let mut m = super::apply::model(self)?;
-        super::set::setup_model(&mut m, tnom, &mut warnings)?;
+        let prepared = super::set::prepare_model(super::apply::model(self)?, tnom);
         let mut h = super::apply::instance(&self.instance_parameters(instance, 1.)?)?;
         (h.dNode, h.gNodeExt, h.sNode, h.bNode) = (node::D, node::G_EXT, node::S, node::B);
-        super::set::setup_instance(&m, &mut h, false, &mut warnings)?;
+        let super::set::PreparedSetup {
+            model: mut m,
+            instance: mut h,
+            mut warnings,
+            ..
+        } = prepared.prepare_instance(h, false);
         let model_name = instance.model.as_deref().unwrap_or_default();
         let p = temperature(
             &mut m,

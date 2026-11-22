@@ -40,7 +40,9 @@ use crate::netlist::bexpr::{
 };
 use crate::netlist::elaborate::format_literal;
 use crate::netlist::eval::{EvalBudget, FunctionScope, ParamScope};
-use crate::netlist::expr::{BinaryOp, Expr, ExprKind, SourceSpan, UnaryOp};
+use crate::netlist::expr::{
+    BinaryOp, Expr, ExprKind, MAX_TREE_DEPTH, MAX_TREE_NODES, SourceSpan, TreeBudget, UnaryOp,
+};
 
 mod edits;
 pub(super) mod forms;
@@ -54,10 +56,6 @@ pub const C_REFERENCE: &str = "src/frontend/inpcom.c (inp_compat, inp_poly_2g6_c
 pub const TABLE_DOMAIN: Real = 0.1;
 /// The `input_domain` of the four-node `LTspice` TABLE form.
 pub const LTSPICE_TABLE_DOMAIN: Real = 0.001;
-
-/// Largest number of nodes a resolved expression may have (a bound on
-/// nested `.func` expansion).
-const MAX_RESOLVED_NODES: usize = 100_000;
 
 /// Rewrites the nonlinear E/G/F/H forms of the root and every subcircuit
 /// body into primitive devices (see the [module documentation](self)).
@@ -76,7 +74,7 @@ pub fn lower_nonlinear_sources(netlist: &Netlist) -> SpiceResult<Netlist> {
 fn lower_device(device: DeviceInstance, out: &mut Vec<DeviceInstance>) -> SpiceResult<()> {
     match NonlinearForm::validate(&device)? {
         Some(NonlinearForm::Value(form)) => out.extend(lower_value(&device, &form)),
-        Some(NonlinearForm::Table(form)) => out.extend(lower_table(&device, &form)),
+        Some(NonlinearForm::Table(form)) => out.extend(lower_table(&device, &form)?),
         Some(NonlinearForm::Poly(form)) => out.push(lower_poly(&device, &form)?),
         None => out.push(device),
     }
@@ -204,14 +202,20 @@ fn quantity(kind: BExprKind, location: &SourceLoc) -> BExpr {
     }
 }
 
-fn lower_table(device: &DeviceInstance, form: &TableForm<'_>) -> Vec<DeviceInstance> {
+fn lower_table(device: &DeviceInstance, form: &TableForm<'_>) -> SpiceResult<Vec<DeviceInstance>> {
     let stok = sanitized(&device.name, device.designator);
     let int1 = format!("{stok}_int1");
     let int2 = format!("{stok}_int2");
     let mut out = vec![driven_source(device, &int1, form.setters)];
     if let [(_, y)] = form.points.as_slice() {
         out.push(constant_table_source(device, int1, y.parameter));
-        return out;
+        return Ok(out);
+    }
+    let mut budget = TreeBudget::new(MAX_TREE_NODES);
+    budget.charge(2, 2, &device.location)?; // Table root and input quantity.
+    for (x, y) in &form.points {
+        check_coefficient(x.parameter, 2, &mut budget)?;
+        check_coefficient(y.parameter, 2, &mut budget)?;
     }
     let points: Vec<_> = form
         .points
@@ -273,7 +277,7 @@ fn lower_table(device: &DeviceInstance, form: &TableForm<'_>) -> Vec<DeviceInsta
         }],
         &device.location,
     ));
-    out
+    Ok(out)
 }
 
 /// A single TABLE pair is a constant voltage source, independent of the input.
@@ -341,6 +345,20 @@ fn spliced(value: Real) -> BExprKind {
     }
 }
 
+/// The generated coefficient is either a literal or a Value containing an
+/// already parsed numparam tree. Count the wrapper too, before cloning it.
+fn check_coefficient(
+    parameter: &ParameterAssignment,
+    depth: usize,
+    budget: &mut TreeBudget,
+) -> SpiceResult<usize> {
+    budget.charge(depth, 1, &parameter.location)?;
+    match &parameter.kind {
+        ParameterKind::Expression(value) => value.root.check_tree(depth + 1, budget),
+        _ => Ok(depth),
+    }
+}
+
 fn lower_poly(device: &DeviceInstance, form: &PolyForm<'_>) -> SpiceResult<DeviceInstance> {
     let dimension = form.dimension;
     let location = &device.location;
@@ -372,12 +390,22 @@ fn lower_poly(device: &DeviceInstance, form: &PolyForm<'_>) -> SpiceResult<Devic
             rhs: Box::new(rhs),
         })
     };
+    let mut budget = TreeBudget::new(MAX_TREE_NODES);
+    let mut height = check_coefficient(first.parameter, 1, &mut budget)?;
     let mut sum = first.expression();
     for coefficient in coefficients {
         coefficient_count += 1;
         let exponents = powers
             .advance()
             .ok_or_else(|| malformed(device, "POLY degree exceeds supported range"))?;
+        // Calculate the exact height and node count of this monomial's
+        // left-folded product before constructing any of its factors.
+        let degree = exponents.iter().map(|&power| power as usize).sum::<usize>();
+        let coefficient_height = check_coefficient(coefficient.parameter, 1, &mut budget)?;
+        let term_height = coefficient_height.max(degree) + 1;
+        height = height.max(term_height) + 1;
+        // degree factors, degree-1 products, coefficient multiplication and sum.
+        budget.charge(height, 2 * degree + 1, &coefficient.parameter.location)?;
         let mut product: Option<BExpr> = None;
         for (control, power) in controls.iter().zip(exponents) {
             for _ in 0..*power {
@@ -443,8 +471,9 @@ pub fn resolve_expression(
         budget,
         verbatim: expression.verbatim,
         nodes: 0,
+        expansion_budget: TreeBudget::new(MAX_TREE_NODES),
     };
-    let root = resolver.resolve(&expression.root, 0)?;
+    let root = resolver.resolve(&expression.root, 1)?;
     Ok(BehaviouralExpression {
         text: expression.text.clone(),
         span: expression.span.clone(),
@@ -459,6 +488,7 @@ struct Resolver<'a> {
     budget: &'a mut EvalBudget,
     verbatim: bool,
     nodes: usize,
+    expansion_budget: TreeBudget,
 }
 
 fn parse_error(span: &SourceSpan, message: String) -> SpiceError {
@@ -468,13 +498,12 @@ fn parse_error(span: &SourceSpan, message: String) -> SpiceError {
 impl Resolver<'_> {
     fn resolve(&mut self, expr: &BExpr, depth: usize) -> SpiceResult<BExpr> {
         self.nodes += 1;
-        if self.nodes > MAX_RESOLVED_NODES || depth > 4 * crate::netlist::expr::MAX_NESTING {
+        if self.nodes > MAX_TREE_NODES || depth > MAX_TREE_DEPTH {
             return Err(parse_error(
                 &expr.span,
                 format!(
                     "behavioural expression too large after .func expansion \
-                     (more than {MAX_RESOLVED_NODES} nodes or nesting deeper than {})",
-                    4 * crate::netlist::expr::MAX_NESTING
+                     (more than {MAX_TREE_NODES} nodes or nesting deeper than {MAX_TREE_DEPTH})"
                 ),
             ));
         }
@@ -564,11 +593,11 @@ impl Resolver<'_> {
         arguments: &[BExpr],
         depth: usize,
     ) -> SpiceResult<BExpr> {
-        let definition = self
-            .functions
+        let functions = self.functions.clone();
+        let definition = functions
             .as_deref()
             .and_then(|scope| scope.get(name))
-            .map(|(definition, _)| definition.clone());
+            .map(|(definition, _)| definition);
         if let Some(definition) = definition {
             if definition.parameters.len() != arguments.len() {
                 return Err(parse_error(
@@ -583,16 +612,13 @@ impl Resolver<'_> {
             }
             // inp_expand_macro_in_str(): the body replaces the call, each
             // formal by its parenthesised argument text.
-            let formals: Vec<(String, BExpr)> = definition
-                .parameters
-                .iter()
-                .cloned()
-                .zip(arguments.iter().map(|argument| BExpr {
-                    kind: BExprKind::Group(Box::new(argument.clone())),
-                    span: argument.span.clone(),
-                }))
-                .collect();
-            let body = from_numparam(&definition.body.root, &formals)?;
+            let body = from_numparam(
+                &definition.body.root,
+                &definition.parameters,
+                arguments,
+                depth + 1,
+                &mut self.expansion_budget,
+            )?;
             let expanded = self.resolve(&body, depth + 1)?;
             return Ok(BExpr {
                 kind: BExprKind::Group(Box::new(expanded)),
@@ -639,16 +665,29 @@ impl Resolver<'_> {
 /// Converts a numparam `.func` body into a behavioural tree, binding formals.
 /// `v(name[, name])`/`i(name)` calls in a body name nodes/sources literally:
 /// C does not substitute formals inside them (verified with the C binary).
-fn from_numparam(expr: &Expr, formals: &[(String, BExpr)]) -> SpiceResult<BExpr> {
-    let convert = |expr: &Expr| from_numparam(expr, formals).map(Box::new);
+fn from_numparam(
+    expr: &Expr,
+    formals: &[String],
+    arguments: &[BExpr],
+    depth: usize,
+    budget: &mut TreeBudget,
+) -> SpiceResult<BExpr> {
+    budget.charge(depth, 1, &expr.span.start)?;
+    let mut convert =
+        |expr: &Expr| from_numparam(expr, formals, arguments, depth + 1, budget).map(Box::new);
     let kind = match &expr.kind {
         ExprKind::Number { value, spelling } => BExprKind::Number {
             value: *value,
             spelling: spelling.clone(),
         },
         ExprKind::Identifier(name) => {
-            if let Some((_, argument)) = formals.iter().find(|(formal, _)| formal == name) {
-                return Ok(argument.clone());
+            if let Some(index) = formals.iter().position(|formal| formal == name) {
+                let argument = &arguments[index];
+                argument.check_tree(depth + 1, budget)?;
+                return Ok(BExpr {
+                    kind: BExprKind::Group(Box::new(argument.clone())),
+                    span: argument.span.clone(),
+                });
             }
             BExprKind::Name(name.clone())
         }
@@ -672,24 +711,29 @@ fn from_numparam(expr: &Expr, formals: &[(String, BExpr)]) -> SpiceResult<BExpr>
         },
         ExprKind::Call {
             function,
-            arguments,
+            arguments: operands,
         } => BExprKind::Call {
             name: function.name().to_owned(),
-            arguments: arguments
+            arguments: operands
                 .iter()
-                .map(|argument| from_numparam(argument, formals))
+                .map(|operand| from_numparam(operand, formals, arguments, depth + 1, budget))
                 .collect::<SpiceResult<_>>()?,
         },
         ExprKind::Group(inner) => BExprKind::Group(convert(inner)?),
-        ExprKind::UserCall { name, arguments } => {
-            if let Some(kind) = circuit_quantity(name, arguments) {
+        ExprKind::UserCall {
+            name,
+            arguments: operands,
+        } => {
+            if let Some(kind) = circuit_quantity(name, operands) {
                 kind
             } else {
                 BExprKind::Call {
                     name: name.clone(),
-                    arguments: arguments
+                    arguments: operands
                         .iter()
-                        .map(|argument| from_numparam(argument, formals))
+                        .map(|operand| {
+                            from_numparam(operand, formals, arguments, depth + 1, budget)
+                        })
                         .collect::<SpiceResult<_>>()?,
                 }
             }

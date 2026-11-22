@@ -58,10 +58,10 @@ The command, in order:
 5. runs each analysis through the production driver on a freshly elaborated
    circuit with an ordered per-plot output plan. Optional bias, spectrum and
    integrated plots have separate consumers. Transient, AC, DC and noise
-   spectrum rows go directly to a sink, which only retains a full plot if
+   spectrum rows are borrowed from reusable scratch into a sink, which only retains a packed full plot if
    print, measurement or Fourier processing needs it. Rawfile-only rows are
    projected into a transaction-owned spool; materialized driver outputs
-   transfer ownership without replaying or cloning rows. Every completed
+   transfer the packed cell allocation without replaying or cloning rows. Every completed
    plot is written to the transaction before the next one begins;
 6. only when every analysis and every output card succeeded, renames the
    temporary file to `<path>`; on any failure it is removed and `<path>` is

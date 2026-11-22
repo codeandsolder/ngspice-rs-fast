@@ -312,13 +312,15 @@ bytes between ASCII values, variables per plot, and plots per file.
 `RawFormat::detect_with_policy` uses the same header decoder. Defaults are
 64 KiB per text line, 16 MiB and 131,072 lines per header, 1 MiB per blank
 run, 65,536 columns per plot and 65,536 plots. These are inclusive limits.
-Zero-column plots must declare zero points; a nonzero count is rejected rather
-than silently discarded.
+Zero-column plots must declare zero points, except C's rootless real
+`Pole-Zero Analysis` plot, which has exactly one empty row. The ASCII
+incremental C writer emits `0<TAB>` without a line ending in that case;
+the reader consumes just the marker, including when the next header
+immediately follows it. Other positive zero-column counts are rejected.
 
 The separate `RawCollectPolicy` bounds cumulative actually collected rows,
 cells, header bytes and variables across plots. Defaults are 2 Mi rows,
-16 Mi cells (256 MiB of complex values, plus row and metadata allocation
-overhead), 64 MiB of encoded header text and 262,144 variables. These logical
+16 Mi cells (256 MiB of complex values, plus cell capacity slack and metadata overhead), 64 MiB of encoded header text and 262,144 variables. These logical
 limits are not an exact allocator/RSS budget. The lending row reader does
 not charge collection limits and accepts arbitrarily large valid row streams,
 subject to checked address-size/payload arithmetic and the configured header
@@ -331,3 +333,23 @@ and validates UTF-8 only for bounded lines. Binary doubles use their original
 byte-oriented decoder; the text buffer cannot consume payload bytes beyond
 the section marker. Exceeding a limit reports the named resource, and a
 failed or unfinished decoder cannot advance to another plot.
+
+### Packed retained plots
+
+`Plot` stores a checked row-major cell buffer and explicit point count.
+`row`, `rows`, `point_mut` and `rows_mut` borrow the rectangular table;
+`column`/ `column_at` are allocation-free strided views, including indexed
+access and binary search. `cells` borrows the whole buffer and `with_cells`
+checks an owned buffer's shape before attaching it. `push_point` appends a
+borrowed row with checked growth, and `reserve_points` checks both addition
+and multiplication before attempting allocation.
+
+The rawfile collector charges the existing cumulative budget before
+extending a single packed buffer with each lending row. It does not reserve
+the declared number of points in advance, so truncated files cannot request
+large speculative allocations. ASCII column realness is finalized before
+attaching the buffer. The row budget remains useful to bound traversal work
+on very narrow plots. Identity projections transfer the buffer as-is;
+non-expanding consuming projections compact in-place using one reusable row,
+and expanding projections use a separately sized destination. Borrowed
+report consumers preserve the original full table until their work ends.

@@ -637,3 +637,156 @@ fn folded_current_references_use_logical_offsets_for_the_c_rewrite() {
         ["r1", "v_r2"]
     );
 }
+
+#[test]
+fn behavioural_flat_chains_are_bounded_before_recursive_consumers() {
+    use ngspice_rs::netlist::expr::MAX_TREE_DEPTH;
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            for op in ["+", "-", "*", "/", "^", "**", "||", "&&", "==", "<"] {
+                let accepted = format!("{}1", format!("1{op}").repeat(MAX_TREE_DEPTH - 1));
+                let n = parse(&format!("b1 o 0 v={accepted}"));
+                assert_eq!(n, n.clone());
+                assert!(!shape(&expression(&n.devices[0], "v").root).is_empty());
+                let written = write_netlist(&n).unwrap();
+                let reparsed = Parser::new()
+                    .parse_deck(&parse_deck_text(Path::new("in.cir"), &written))
+                    .unwrap();
+                assert!(semantic_diff(&n, &reparsed).is_none());
+                assert!(literalize(&n).is_ok());
+                assert!(
+                    ngspice_rs::devices::Circuit::from_netlist(&n).is_ok(),
+                    "{op}"
+                );
+                let excessive = format!("{}1", format!("1{op}").repeat(20_000));
+                let error = try_parse(&format!("b1 o 0 v={excessive}")).unwrap_err();
+                assert!(
+                    error.to_string().contains("structural depth limit"),
+                    "{error}"
+                );
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn generated_and_embedded_expression_nodes_obey_the_same_limits() {
+    use ngspice_rs::netlist::expr::{MAX_TREE_DEPTH, MAX_TREE_NODES};
+    let chain = format!("{}1", "1+".repeat(MAX_TREE_DEPTH - 1));
+    for body in [
+        format!("b1 o 0 v=pwl(v(in),0,0,{{{chain}}},1)"),
+        format!("b1 o 0 v=1?{chain}:0"),
+        format!("b1 o 0 v=abs({chain})"),
+    ] {
+        let error = try_parse(&body).unwrap_err();
+        assert!(
+            error.to_string().contains("structural depth limit"),
+            "{error}"
+        );
+    }
+    let wide = format!("b1 o 0 v=f({}1)", "1,".repeat(MAX_TREE_NODES - 1));
+    let error = try_parse(&wide).unwrap_err();
+    assert!(error.to_string().contains("node limit"), "{error}");
+    let embedded = format!(
+        "b1 o 0 v=pwl(v(in),0,0,{}1)",
+        "{1+1},".repeat(MAX_TREE_NODES / 4)
+    );
+    let error = try_parse(&embedded).unwrap_err();
+    assert!(error.to_string().contains("node limit"), "{error}");
+    let n = parse(&format!(
+        "e1 o 0 poly(1) in 0 {}",
+        "1 ".repeat(MAX_TREE_DEPTH)
+    ));
+    let error = lower_nonlinear_sources(&n).unwrap_err();
+    assert!(
+        error.to_string().contains("structural depth limit"),
+        "{error}"
+    );
+}
+
+#[test]
+fn macro_substitution_checks_height_and_amplification_before_cloning() {
+    use ngspice_rs::netlist::expr::MAX_TREE_DEPTH;
+    let chain = format!("{}1", "1+".repeat(MAX_TREE_DEPTH - 2));
+    let n = parse(&format!(".func f(x) {{x+1}}\nb1 o 0 v=f({chain})"));
+    let error = literalize(&n).unwrap_err();
+    assert!(
+        error.to_string().contains("structural depth limit"),
+        "{error}"
+    );
+    // 240 occurrences of a 511-node argument would exceed 100,000 nodes.
+    let body = format!("{}x", "x+".repeat(239));
+    let arg = format!("pwl(v(in),0,0,{}1)", "1,".repeat(510));
+    let n = parse(&format!(".func f(x) {{{body}}}\nb1 o 0 v=f({arg})"));
+    let error = literalize(&n).unwrap_err();
+    assert!(error.to_string().contains("node limit"), "{error}");
+}
+
+#[test]
+fn wide_valid_pwl_constructs_resolves_and_compiles_on_bounded_stack() {
+    use std::fmt::Write as _;
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let points = 8192;
+            let mut body = "v1 in 0 1\nb1 o 0 v=pwl(v(in)".to_owned();
+            for i in 0..points {
+                write!(body, ",{i},{i}").unwrap();
+            }
+            body.push(')');
+            let start = std::time::Instant::now();
+            let n = parse(&body);
+            let parsed = start.elapsed();
+            assert_eq!(n, n.clone());
+            let written = write_netlist(&n).unwrap();
+            let reparsed = Parser::new()
+                .parse_deck(&parse_deck_text(Path::new("in.cir"), &written))
+                .unwrap();
+            assert!(semantic_diff(&n, &reparsed).is_none());
+            assert!(literalize(&n).is_ok());
+            assert!(ngspice_rs::devices::Circuit::from_netlist(&n).is_ok());
+            eprintln!(
+                "PWL {points} points: parsed {parsed:?}, full pipeline {:?}",
+                start.elapsed()
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn symbolic_depth_boundary_and_nested_syntax_compile_on_bounded_stack() {
+    use ngspice_rs::netlist::expr::{MAX_NESTING, MAX_TREE_DEPTH};
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let symbolic = format!("{}v(in)", "v(in)+".repeat(MAX_TREE_DEPTH - 1));
+            let nested = [
+                symbolic,
+                format!("{}1{}", "(".repeat(MAX_NESTING), ")".repeat(MAX_NESTING)),
+                format!("{}1", "1?1:".repeat(MAX_NESTING)),
+            ];
+            for text in nested {
+                let n = parse(&format!("v1 in 0 1\nb1 o 0 v={text}"));
+                assert!(ngspice_rs::devices::Circuit::from_netlist(&n).is_ok());
+            }
+            for text in [
+                format!(
+                    "{}1{}",
+                    "(".repeat(MAX_NESTING + 1),
+                    ")".repeat(MAX_NESTING + 1)
+                ),
+                format!("{}1", "1?1:".repeat(MAX_NESTING + 1)),
+            ] {
+                let error = try_parse(&format!("b1 o 0 v={text}")).unwrap_err();
+                assert!(error.to_string().contains("nesting limit"), "{error}");
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

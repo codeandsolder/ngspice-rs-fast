@@ -35,7 +35,7 @@ fn value(plot: &Plot, name: &str, point: usize) -> f64 {
     let index = plot
         .variable_index(name)
         .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
-    plot.points()[point][index].re
+    plot.row(point).unwrap()[index].re
 }
 fn close(a: f64, b: f64, relative: f64, absolute: f64) {
     assert!(
@@ -397,7 +397,7 @@ fn sensitivity_runs_for_a_p_channel_card() {
     let mut circuit = config.circuit(&parsed).unwrap();
     let plot = request.run(&mut circuit, &config.context()).unwrap();
     let index = plot.variable_index("v(z2:vt0)").expect("vt0 column");
-    let value = plot.points()[0][index].re;
+    let value = plot.row(0).unwrap()[index].re;
     // The first step multiplies the stored -0.15 by -1 once, so the column is
     // the finite difference across that product rather than across `vt0`.
     assert!(value.is_finite(), "{value}");
