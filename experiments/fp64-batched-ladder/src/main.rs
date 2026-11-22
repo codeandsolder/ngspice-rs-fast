@@ -162,7 +162,7 @@ fn main() -> Result<()> {
     println!("persistent CPU workers: {}", rayon::current_num_threads());
     println!("nodes={N}, tile={TILE}, repeats=7");
     println!(
-        "systems,scalar_ms,row_simd_ms,parallel_row_simd_ms,gpu_resident_ms,gpu_amortized_ms,gpu_roundtrip_ms,max_error"
+        "systems,scalar_ms,row_simd_ms,parallel_row_simd_ms,gpu_resident_ms,gpu_amortized_ms,gpu_roundtrip_ms,gpu_kernel_ms,max_error"
     );
     for tiles in [1_u32, 4, 16, 64, 256, 1024] {
         let input = Input::new(tiles as usize);
@@ -186,7 +186,7 @@ fn main() -> Result<()> {
             })?);
             error = error.max(input.check(&x)?);
         }
-        let (resident, throughput, transfer) = gpu.trial(
+        let (resident, throughput, transfer, kernel) = gpu.trial(
             &[&input.diagonal, &input.rhs],
             &[p.len(), x.len()],
             None,
@@ -195,7 +195,7 @@ fn main() -> Result<()> {
         )?;
         let gpu_error = input.check(&x)?;
         println!(
-            "{},{:.4},{:.4},{:.4},{resident:.4},{throughput:.4},{transfer:.4},{:.3e}",
+            "{},{:.4},{:.4},{:.4},{resident:.4},{throughput:.4},{transfer:.4},{kernel:.4},{:.3e}",
             tiles * TILE as u32,
             timings[0],
             timings[1],

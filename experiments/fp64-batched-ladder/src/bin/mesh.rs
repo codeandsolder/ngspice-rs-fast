@@ -630,7 +630,7 @@ fn main() -> Result<()> {
     println!("local shared memory bytes: {local_bytes}");
     println!("persistent CPU workers: {}", rayon::current_num_threads());
     println!(
-        "systems,scalar_ms,simd_ms,parallel_simd_ms,grouped_simd_ms,grouped_parallel_simd_ms,gpu_resident_ms,gpu_amortized_ms,gpu_roundtrip_ms,grouped_resident_ms,grouped_amortized_ms,grouped_roundtrip_ms,mixed_resident_ms,mixed_amortized_ms,mixed_roundtrip_ms,mixed_error,mixed_backward,local_resident_ms,local_amortized_ms,local_roundtrip_ms,specialized_resident_ms,specialized_amortized_ms,specialized_roundtrip_ms,max_solution_error,max_backward_error"
+        "systems,scalar_ms,simd_ms,parallel_simd_ms,grouped_simd_ms,grouped_parallel_simd_ms,gpu_resident_ms,gpu_amortized_ms,gpu_roundtrip_ms,grouped_resident_ms,grouped_amortized_ms,grouped_roundtrip_ms,mixed_resident_ms,mixed_amortized_ms,mixed_roundtrip_ms,mixed_error,mixed_backward,local_resident_ms,local_amortized_ms,local_roundtrip_ms,specialized_resident_ms,specialized_amortized_ms,specialized_roundtrip_ms,tape_kernel_ms,grouped_kernel_ms,mixed_kernel_ms,local_kernel_ms,specialized_kernel_ms,max_solution_error,max_backward_error"
     );
     for groups in [1_u32, 4, 16, 64] {
         let input = Input::new(&plan, groups as usize);
@@ -694,7 +694,7 @@ fn main() -> Result<()> {
             error = error.max(e);
             backward = backward.max(r);
         }
-        let (resident, amortized, roundtrip) = gpu.trial(
+        let (resident, amortized, roundtrip, k) = gpu.trial(
             &[&input.matrix, &input.rhs],
             &[matrix.len(), x.len()],
             Some(&plan.tape),
@@ -702,7 +702,7 @@ fn main() -> Result<()> {
             groups,
         )?;
         let (e, r) = input.check(&plan, &x)?;
-        let (gr, ga, gt) = grouped_gpu.trial(
+        let (gr, ga, gt, gk) = grouped_gpu.trial(
             &[&input.matrix, &input.rhs],
             &[matrix.len(), x.len(), x.len()],
             Some(&grouped),
@@ -712,7 +712,7 @@ fn main() -> Result<()> {
         let (ge, gb) = input.check(&plan, &x)?;
         // Factor and correction storage uses f32; the runner sizes workspace
         // in f64 units, so allocate exactly half as many units.
-        let (mr, ma, mt) = mixed_gpu.trial(
+        let (mr, ma, mt, mk) = mixed_gpu.trial(
             &[&input.matrix, &input.rhs],
             &[matrix.len() / 2, x.len() / 2, x.len()],
             Some(&grouped),
@@ -720,7 +720,7 @@ fn main() -> Result<()> {
             groups,
         )?;
         let (me, mb) = input.check(&plan, &x)?;
-        let (lr, la, lt) = local_gpu.trial(
+        let (lr, la, lt, lk) = local_gpu.trial(
             &[&input.matrix, &input.rhs],
             &[x.len()],
             Some(&grouped),
@@ -728,7 +728,7 @@ fn main() -> Result<()> {
             groups * (TILE / LOCAL_SYSTEMS) as u32,
         )?;
         let (le, lb) = input.check(&plan, &x)?;
-        let (sr, sa, st) = specialized_gpu.trial(
+        let (sr, sa, st, sk) = specialized_gpu.trial(
             &[&input.matrix, &input.rhs],
             &[matrix.len(), x.len()],
             None,
@@ -737,7 +737,7 @@ fn main() -> Result<()> {
         )?;
         let (se, sb) = input.check(&plan, &x)?;
         println!(
-            "{},{:.4},{:.4},{:.4},{:.4},{:.4},{resident:.4},{amortized:.4},{roundtrip:.4},{gr:.4},{ga:.4},{gt:.4},{mr:.4},{ma:.4},{mt:.4},{me:.3e},{mb:.3e},{lr:.4},{la:.4},{lt:.4},{sr:.4},{sa:.4},{st:.4},{:.3e},{:.3e}",
+            "{},{:.4},{:.4},{:.4},{:.4},{:.4},{resident:.4},{amortized:.4},{roundtrip:.4},{gr:.4},{ga:.4},{gt:.4},{mr:.4},{ma:.4},{mt:.4},{me:.3e},{mb:.3e},{lr:.4},{la:.4},{lt:.4},{sr:.4},{sa:.4},{st:.4},{k:.4},{gk:.4},{mk:.4},{lk:.4},{sk:.4},{:.3e},{:.3e}",
             groups * TILE as u32,
             times[0],
             times[1],

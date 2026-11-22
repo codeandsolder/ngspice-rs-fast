@@ -52,13 +52,16 @@ impl Gpu {
                 <= adapter.limits().max_compute_workgroup_storage_size,
             "adapter lacks requested workgroup storage ({shared_bytes} bytes)"
         );
+        let features =
+            wgpu::Features::SHADER_F64 | (adapter.features() & wgpu::Features::TIMESTAMP_QUERY);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::SHADER_F64,
+                required_features: features,
                 required_limits,
                 ..Default::default()
             })
             .await?;
+        let pipeline_start = Instant::now();
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(name),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(shader)),
@@ -71,6 +74,10 @@ impl Gpu {
             compilation_options: Default::default(),
             cache: None,
         });
+        println!(
+            "pipeline {name}: {:.3} ms (creation API latency)",
+            pipeline_start.elapsed().as_secs_f64() * 1000.
+        );
         Ok(Self {
             device,
             queue,
@@ -89,7 +96,7 @@ impl Gpu {
         plan: Option<&[[u32; 4]]>,
         output: &mut [f64],
         groups: u32,
-    ) -> Result<(f64, f64, f64)> {
+    ) -> Result<(f64, f64, f64, f64)> {
         let limits = self.device.limits();
         let bytes = |n: usize| -> Result<u64> {
             let size = n
@@ -207,6 +214,77 @@ impl Gpu {
             staging.unmap();
             Ok(())
         })?;
-        Ok((resident, amortized, transfer))
+        // Device timestamps bracket the actual compute pass, independently
+        // of wall-clock synchronization and the timing of map/readback.
+        let kernel_ms = if self
+            .device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY)
+        {
+            let queries = self.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("compute elapsed time"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            });
+            let resolved = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timestamp resolve"),
+                size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let read = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timestamp host read"),
+                size: 16,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut readings = [0.; 7];
+            for time in &mut readings {
+                let mut encoder = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("timed solve"),
+                        timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                            query_set: &queries,
+                            beginning_of_pass_write_index: Some(0),
+                            end_of_pass_write_index: Some(1),
+                        }),
+                    });
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &bindings, &[]);
+                    pass.dispatch_workgroups(groups, 1, 1);
+                }
+                encoder.resolve_query_set(&queries, 0..2, &resolved, 0);
+                encoder.copy_buffer_to_buffer(&resolved, 0, &read, 0, 16);
+                let submission = self.queue.submit([encoder.finish()]);
+                let slice = read.slice(..);
+                let (tx, rx) = mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send(result);
+                });
+                self.device.poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: Some(std::time::Duration::from_secs(30)),
+                })?;
+                rx.recv_timeout(std::time::Duration::from_secs(30))
+                    .context("timestamp callback")??;
+                {
+                    let mapped = slice.get_mapped_range()?;
+                    let ticks: &[u64] = bytemuck::cast_slice(&mapped);
+                    let elapsed = ticks[1]
+                        .checked_sub(ticks[0])
+                        .context("GPU timestamp wrapped")?;
+                    *time = elapsed as f64 * f64::from(self.queue.get_timestamp_period()) / 1e6;
+                }
+                read.unmap();
+            }
+            readings.sort_by(f64::total_cmp);
+            readings[3]
+        } else {
+            f64::NAN
+        };
+        Ok((resident, amortized, transfer, kernel_ms))
     }
 }
