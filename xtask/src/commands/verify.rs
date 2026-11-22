@@ -25,6 +25,12 @@ enum Gate {
     /// Pole-zero plots: poles and zeros as unordered root sets
     /// (`compare::roots`).
     Roots(compare::RootTolerance),
+    /// C exhausted its search before finding these independently verified
+    /// real poles. Require the augmented root set, not either outcome.
+    CompletedRoots {
+        tolerance: compare::RootTolerance,
+        additional_poles: &'static [f64],
+    },
     /// [`Gate::Transient`] for transmission-line decks: every source
     /// breakpoint `b` also declares the breakpoints `b + offset` (inside the
     /// run) where a line's delayed wave changes slope. The offsets are
@@ -263,7 +269,16 @@ const SUPPORTED: &[Supported] = &[
             tolerance: compare::NONLINEAR,
         },
     },
-    pole_zero("m10_hfet2_pz"),
+    Supported {
+        name: "m10_hfet2_pz",
+        kind: AnalysisKind::PoleZero,
+        gate: Gate::CompletedRoots {
+            tolerance: compare::POLE_ZERO,
+            // Independent exact-rational expansion of the loaded pencil;
+            // see POLE_ZERO_ADR.md and the production-path regression.
+            additional_poles: &[-10_000_000_014.000_954],
+        },
+    },
     tran("m10_hfet2_tran"),
     // BSIM4 (#90): `bsim4/` translated statement by statement. Gate and body
     // resistance, the mid-gate/rbodymod=2/rdsmod=1 family, both polarities,
@@ -1777,6 +1792,35 @@ const BATCH: &[Batch] = &[
             },
         ],
     },
+    // The former FMA-dependent exclusion is now covered by the
+    // independently validated pole search (#91), including both PZ cards.
+    Batch {
+        name: "multi_analysis_pz",
+        stages: &[
+            Stage {
+                kind: AnalysisKind::Ac,
+                gate: Gate::Points {
+                    axis: Some("frequency"),
+                    tolerance: compare::AC,
+                },
+            },
+            Stage {
+                kind: AnalysisKind::OperatingPoint,
+                gate: Gate::Points {
+                    axis: None,
+                    tolerance: compare::DC,
+                },
+            },
+            Stage {
+                kind: AnalysisKind::PoleZero,
+                gate: Gate::Roots(compare::POLE_ZERO),
+            },
+            Stage {
+                kind: AnalysisKind::PoleZero,
+                gate: Gate::Roots(compare::POLE_ZERO),
+            },
+        ],
+    },
     // `.sp` (#105) beside `.ac`, `.op` and `.tran` on the same RF ports: the
     // series z0 of each port in every analysis, and `sp1` last in batch order.
     Batch {
@@ -1835,23 +1879,7 @@ const fn noise_stages(tolerance: compare::Tolerance) -> [Stage; 2] {
 /// Fixtures whose deck the Rust engine does not reproduce. A requested excluded
 /// fixture still fails the run, so an entry cannot be reported as a success by
 /// accident.
-///
-/// `multi_analysis_pz` (`.op`, `.ac` and two `.pz` cards, #103) is excluded
-/// because its pole search is decided by floating-point contraction, not by the
-/// C source. The port of the deflated Muller search (`cktpzstr.c`,
-/// `nipzmeth.c`) reproduces a `-ffp-contract=off` build of the same ngspice
-/// commit bit for bit: both list the zeros, then give up on the poles after 201
-/// trials ("Pole-zero iteration limit reached") and write an empty `pz2` plot.
-/// The committed golden comes from the reference build, whose fused
-/// multiply-adds let the search converge to three poles (the real pole near
-/// -7.97e4 and a complex pair), and its zeros differ from the port's in the last
-/// digits. The golden is unchanged; the AC and operating-point stages of this
-/// deck are covered by the other fixtures.
-const EXCLUDED: &[(&str, &str)] = &[(
-    "multi_analysis_pz",
-    "FMA-dependent: matches -ffp-contract=off C (pole search gives up after 201 trials) \
-     but not the FMA-built golden (3 poles)",
-)];
+const EXCLUDED: &[(&str, &str)] = &[];
 
 pub(super) fn main(root: &Path, arguments: &[String]) -> Result<(), String> {
     let only = match arguments {
@@ -2017,6 +2045,13 @@ fn run_deck(root: &Path, path: &Path, fixture: &Supported) -> Result<String, Str
             tolerance: *tolerance,
         },
         Gate::Roots(tolerance) => Gate::Roots(*tolerance),
+        Gate::CompletedRoots {
+            tolerance,
+            additional_poles,
+        } => Gate::CompletedRoots {
+            tolerance: *tolerance,
+            additional_poles,
+        },
         Gate::Echoes { tolerance, offsets } => Gate::Echoes {
             tolerance: *tolerance,
             offsets,
@@ -2197,6 +2232,45 @@ fn load_golden(root: &Path, name: &str) -> Result<RawFile, String> {
     RawFile::parse(&text).map_err(|e| format!("{}: {e}", target.display()))
 }
 
+/// Preserve every C reference vector; append the explicitly certified
+/// missing poles to its unordered reference root set.
+fn complete_pole_reference(
+    want: &ngspice_rs::analysis::Plot,
+    additional_poles: &[f64],
+) -> Result<ngspice_rs::analysis::Plot, String> {
+    use ngspice_rs::analysis::Variable;
+    use ngspice_rs::primitives::Complex;
+    if want.point_count() != 1 {
+        return Err("the pole-zero reference must have one point".to_owned());
+    }
+    let mut variables = want.variables().to_vec();
+    let mut row = want
+        .row(0)
+        .ok_or("missing pole-zero reference row")?
+        .to_vec();
+    let poles = variables
+        .iter()
+        .filter(|v| v.name.starts_with("v(pole("))
+        .count();
+    for (index, &pole) in additional_poles.iter().enumerate() {
+        variables.push(Variable::complex(
+            format!("v(pole({}))", poles + index + 1),
+            "voltage",
+        ));
+        row.push(Complex::real(pole));
+    }
+    let mut completed = ngspice_rs::analysis::Plot::new(
+        want.name.clone(),
+        want.plotname.clone(),
+        want.flags(),
+        variables,
+    );
+    completed
+        .push_point(&row)
+        .map_err(|error| error.to_string())?;
+    Ok(completed)
+}
+
 /// Compares one Rust plot with one C plot under `gate`.
 fn compare_plot(
     gate: &Gate,
@@ -2220,6 +2294,18 @@ fn compare_plot(
         Gate::Points { axis, tolerance } => compare::plots(got, want, tolerance, axis)
             .map(|()| format!("{} point(s)", got.point_count())),
         Gate::Roots(tolerance) => compare::roots(got, want, tolerance),
+        Gate::CompletedRoots {
+            tolerance,
+            additional_poles,
+        } => {
+            let completed = complete_pole_reference(want, additional_poles)?;
+            compare::roots(got, &completed, tolerance).map(|summary| {
+                format!(
+                    "{summary}; includes {} independently verified pole(s)",
+                    additional_poles.len()
+                )
+            })
+        }
         Gate::Transient(tolerance) => {
             let transient = request.transient().ok_or("expected a transient plan")?;
             let (step, final_time) = (transient.step(), transient.stop());
