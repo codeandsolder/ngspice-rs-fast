@@ -196,7 +196,7 @@ card 24 @netlists/m6_gate.cir:29:1 lines=29-29 continuations=0
   raw: ".tran 10u 3m"
   kind: dot(.tran)
   token 1 29:1 word ".tran"
-  token 2 29:7 number "10u" value=9.999999999999999e-6
+  token 2 29:7 number "10u" value=1e-5
   token 3 29:11 number "3m" value=3e-3
 card 25 @netlists/m6_gate.cir:30:1 lines=30-30 continuations=0
   raw: ".ac dec 5 10 100k"

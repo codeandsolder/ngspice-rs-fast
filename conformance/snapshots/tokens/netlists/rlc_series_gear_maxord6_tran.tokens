@@ -11,10 +11,10 @@ card 1 @netlists/rlc_series_gear_maxord6_tran.cir:5:1 lines=5-5 continuations=0
   token 5 5:14 lparen "("
   token 6 5:15 number "0" value=0e0
   token 7 5:17 number "1" value=1e0
-  token 8 5:19 number "50u" value=4.9999999999999996e-5
-  token 9 5:23 number "20u" value=1.9999999999999998e-5
-  token 10 5:27 number "20u" value=1.9999999999999998e-5
-  token 11 5:31 number "400u" value=3.9999999999999996e-4
+  token 8 5:19 number "50u" value=5e-5
+  token 9 5:23 number "20u" value=2e-5
+  token 10 5:27 number "20u" value=2e-5
+  token 11 5:31 number "400u" value=4e-4
   token 12 5:36 number "1m" value=1e-3
   token 13 5:38 rparen ")"
 card 2 @netlists/rlc_series_gear_maxord6_tran.cir:6:1 lines=6-6 continuations=0

@@ -89,7 +89,7 @@ card 10 @netlists/sens_hfet1.cir:24:1 lines=24-24 continuations=0
   token 8 24:16 number "1u" value=1e-6
   token 9 24:19 word "w"
   token 10 24:20 equals "="
-  token 11 24:21 number "20u" value=1.9999999999999998e-5
+  token 11 24:21 number "20u" value=2e-5
 card 11 @netlists/sens_hfet1.cir:25:1 lines=25-25 continuations=0
   raw: "z2 6 7 0 pch l=2u w=40u dtemp=10"
   kind: device(z)
@@ -103,7 +103,7 @@ card 11 @netlists/sens_hfet1.cir:25:1 lines=25-25 continuations=0
   token 8 25:16 number "2u" value=2e-6
   token 9 25:19 word "w"
   token 10 25:20 equals "="
-  token 11 25:21 number "40u" value=3.9999999999999996e-5
+  token 11 25:21 number "40u" value=4e-5
   token 12 25:25 word "dtemp"
   token 13 25:30 equals "="
   token 14 25:31 number "10" value=1e1

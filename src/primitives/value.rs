@@ -461,7 +461,9 @@ pub fn parse_spice_number_prefix(input: &str) -> Option<ParsedNumber> {
     decimal_prefix(input, LiteralDialect::Spice)
 }
 
-/// Parse a numparam literal prefix. Numparam recognizes only e/E exponents,
+/// Parse a numparam literal prefix.
+///
+/// Numparam recognizes only e/E exponents,
 /// and MIL means milli, not thousandths of an inch. The scale is applied
 /// before correct rounding, but consumed counts just the numeric part;
 /// the expression parser swallows trailing unit letters separately.

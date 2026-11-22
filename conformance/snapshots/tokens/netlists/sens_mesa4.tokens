@@ -58,7 +58,7 @@ card 6 @netlists/sens_mesa4.cir:18:1 lines=18-18 continuations=0
   token 8 18:20 number "1u" value=1e-6
   token 9 18:23 word "w"
   token 10 18:24 equals "="
-  token 11 18:25 number "20u" value=1.9999999999999998e-5
+  token 11 18:25 number "20u" value=2e-5
 card 7 @netlists/sens_mesa4.cir:19:1 lines=19-20 continuations=1
   raw: ".model mesmod4 nmf(level=4 rd=31 rs=31 rdi=20 rsi=20 mu=0.3 gamma=2.5 nmax=4e16 cas=0.9 cbs=1.1 epsi=1.142189e-10 phib=3.1232e18)"
   kind: dot(.model)
@@ -83,7 +83,7 @@ card 7 @netlists/sens_mesa4.cir:19:1 lines=19-20 continuations=1
   token 19 19:51 number "20" value=2e1
   token 20 19:54 word "mu"
   token 21 19:56 equals "="
-  token 22 19:57 number "0.3" value=3.0000000000000004e-1
+  token 22 19:57 number "0.3" value=3e-1
   token 23 19:61 word "gamma"
   token 24 19:66 equals "="
   token 25 19:67 number "2.5" value=2.5e0
@@ -98,7 +98,7 @@ card 7 @netlists/sens_mesa4.cir:19:1 lines=19-20 continuations=1
   token 34 20:25 number "1.1" value=1.1e0
   token 35 20:29 word "epsi"
   token 36 20:33 equals "="
-  token 37 20:34 number "1.142189e-10" value=1.1421889999999999e-10
+  token 37 20:34 number "1.142189e-10" value=1.142189e-10
   token 38 20:47 word "phib"
   token 39 20:51 equals "="
   token 40 20:52 number "3.1232e18" value=3.1232e18

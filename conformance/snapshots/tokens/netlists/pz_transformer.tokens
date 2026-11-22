@@ -52,7 +52,7 @@ card 7 @netlists/pz_transformer.cir:10:1 lines=10-10 continuations=0
   token 1 10:1 word "cl"
   token 2 10:4 word "s"
   token 3 10:6 number "0" value=0e0
-  token 4 10:8 number "100n" value=1.0000000000000001e-7
+  token 4 10:8 number "100n" value=1e-7
 card 8 @netlists/pz_transformer.cir:11:1 lines=11-11 continuations=0
   raw: ".pz in 0 s 0 vol pz"
   kind: dot(.pz)

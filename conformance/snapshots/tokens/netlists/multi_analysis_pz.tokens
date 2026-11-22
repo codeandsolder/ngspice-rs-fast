@@ -45,7 +45,7 @@ card 6 @netlists/multi_analysis_pz.cir:9:1 lines=9-9 continuations=0
   token 1 9:1 word "c2"
   token 2 9:4 word "out"
   token 3 9:8 number "0" value=0e0
-  token 4 9:10 number "100n" value=1.0000000000000001e-7
+  token 4 9:10 number "100n" value=1e-7
 card 7 @netlists/multi_analysis_pz.cir:10:1 lines=10-10 continuations=0
   raw: "c3 in out 10n"
   kind: device(c)

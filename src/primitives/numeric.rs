@@ -148,15 +148,16 @@ pub(super) fn rounded_decimal(
 ) -> Option<Real> {
     use std::io::Write as _;
 
+    const BOUNDARY_DIGITS: usize = 768;
+    // MIL multiplies by 254, requiring up to three extra leading positions.
+    const EXTRA_DIGITS: usize = 3;
+
     if let Some(magnitude) =
         short_coefficient.and_then(|coefficient| short_decimal(coefficient, exponent, multiplier))
     {
         return Some(if negative { -magnitude } else { magnitude });
     }
 
-    const BOUNDARY_DIGITS: usize = 768;
-    // MIL multiplies by 254, requiring up to three extra leading positions.
-    const EXTRA_DIGITS: usize = 3;
     let significant = mantissa.trim_start_matches(['0', '.']);
     if significant.is_empty() {
         return Some(if negative { -0. } else { 0. });
