@@ -448,6 +448,23 @@ remain unchanged.
   The ignored real-device benchmark reports wall time and, on Linux, per-thread
   CPU ticks for portable and native builds, to exclude scheduler preemption.
 
+Initial measurement (Ryzen 7 4700U, 2026-11-22, five batches of 200,000
+loads per mode, median thread CPU time in microseconds per load):
+
+| capMod | Original generic | Audited generic | Original native | Audited native |
+|---|---:|---:|---:|---:|
+| 0 | 1.30 | 2.15 | 1.40 | 1.40 |
+| 1 | 1.25 | 2.30 | 1.50 | 1.40 |
+| 2 | 1.40 | 2.15 | 1.70 | 1.55 |
+
+The native builds show no clear throughput loss; the generic build pays for
+out-of-line fused operations. These are busy-host measurements and CPU clock
+variation remains. A runtime FMA specialization experiment investigates
+recovering that generic-target overhead without changing the arithmetic.
+The numerical audit passes 75 focused tests (including live C comparisons)
+and the full golden verification: 219 verified, one existing unsupported
+fixture, zero failures.
+
 ### Notes for the next slice (`capMod` 0/1/2)
 
 Measured from the C files while porting `capMod=3`, so the next session does not
