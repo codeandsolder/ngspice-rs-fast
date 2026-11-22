@@ -245,8 +245,9 @@ pub(crate) fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, Stri
     Ok(out)
 }
 
-/// Direct scalar writes in the statement-by-statement translation. The
-/// routines use a named instance argument, with no mutable field aliases
+/// Direct scalar writes in the statement-by-statement translation.
+///
+/// The routines use a named instance argument, with no mutable field aliases
 /// or writes hidden in macros. Setup, temperature, validation and load
 /// are visited separately, including their conditional branches.
 struct InstanceWrites<'a> {
@@ -383,7 +384,7 @@ fn emit_instance_ownership(out: &mut String, fields: &[Field]) -> Result<(), Str
         }
         out.push_str("    ];\n");
     }
-    out.push_str("    /// Rebase persistent load state onto a fresh setup/temperature snapshot.\n    /// Fields also written by preparation belong to that fresh snapshot.\n    pub(crate) const fn with_previous_load_state(&self, previous: &Self) -> Self {\n        Self {\n");
+    out.push_str("    /// Rebase persistent load state onto a fresh setup/temperature snapshot.\n    ///\n    /// Fields also written by preparation belong to that fresh snapshot.\n    pub(crate) const fn with_previous_load_state(&self, previous: &Self) -> Self {\n        Self {\n");
     for field in fields {
         let name = rust_name(&field.c_name);
         if field.kind == "String" {

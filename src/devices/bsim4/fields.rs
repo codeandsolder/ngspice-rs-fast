@@ -12471,6 +12471,7 @@ impl Instance {
         "BSIM4gtb",
     ];
     /// Rebase persistent load state onto a fresh setup/temperature snapshot.
+    ///
     /// Fields also written by preparation belong to that fresh snapshot.
     pub(crate) const fn with_previous_load_state(&self, previous: &Self) -> Self {
         Self {
