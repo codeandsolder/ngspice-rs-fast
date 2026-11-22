@@ -8,7 +8,7 @@
 //! `cinv_gj`) is adequate; the MNA solves stay with the SPARSE LU of
 //! [`crate::maths::complex`].
 
-use super::dense::{DenseShape, collect_dense};
+use super::dense::DenseShape;
 use crate::primitives::{Complex, SpiceError, SpiceResult, filled_vec};
 
 fn numerical(message: impl Into<String>) -> SpiceError {
@@ -103,63 +103,72 @@ impl DenseComplex {
         }
     }
 
-    fn checked(self) -> SpiceResult<Self> {
+    fn check_finite(&self) -> SpiceResult<()> {
         if self.data.iter().all(|value| value.is_finite()) {
-            Ok(self)
+            Ok(())
         } else {
             Err(numerical("non-finite result"))
         }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.data.fill(Complex::ZERO);
     }
 
     /// `self + other` (`csum`).
     /// # Errors
     /// Mismatched dimensions, a non-finite result, or unavailable storage.
     pub fn add(&self, other: &Self) -> SpiceResult<Self> {
+        let mut out = Self::zeros(self.dim())?;
+        self.add_into(other, &mut out)?;
+        Ok(out)
+    }
+
+    pub(crate) fn add_into(&self, other: &Self, out: &mut Self) -> SpiceResult<()> {
         self.same_dimension(other)?;
-        Self {
-            shape: self.shape,
-            data: collect_dense(
-                self.data.iter().zip(&other.data).map(|(a, b)| *a + *b),
-                "dense complex matrix",
-            )?,
+        self.same_dimension(out)?;
+        for ((value, a), b) in out.data.iter_mut().zip(&self.data).zip(&other.data) {
+            *value = *a + *b;
         }
-        .checked()
+        out.check_finite()
     }
 
     /// `self - other` (`cminus`).
     /// # Errors
     /// Mismatched dimensions, a non-finite result, or unavailable storage.
     pub fn sub(&self, other: &Self) -> SpiceResult<Self> {
+        let mut out = Self::zeros(self.dim())?;
+        self.sub_into(other, &mut out)?;
+        Ok(out)
+    }
+
+    pub(crate) fn sub_into(&self, other: &Self, out: &mut Self) -> SpiceResult<()> {
         self.same_dimension(other)?;
-        Self {
-            shape: self.shape,
-            data: collect_dense(
-                self.data.iter().zip(&other.data).map(|(a, b)| *a - *b),
-                "dense complex matrix",
-            )?,
+        self.same_dimension(out)?;
+        for ((value, a), b) in out.data.iter_mut().zip(&self.data).zip(&other.data) {
+            *value = *a - *b;
         }
-        .checked()
+        out.check_finite()
     }
 
     /// `self * other` (`cmultiply`).
     /// # Errors
     /// Mismatched dimensions, a non-finite result, or unavailable storage.
     pub fn mul(&self, other: &Self) -> SpiceResult<Self> {
+        let mut out = Self::zeros(self.dim())?;
+        self.mul_into(other, &mut out)?;
+        Ok(out)
+    }
+
+    pub(crate) fn mul_into(&self, other: &Self, out: &mut Self) -> SpiceResult<()> {
         self.same_dimension(other)?;
-        // Skipping a zero multiplier is valid only for finite operands:
-        // otherwise zero times infinity/NaN would be silently swallowed.
+        self.same_dimension(out)?;
+        // Skipping a zero multiplier is valid only for finite operands.
         if self.data.iter().chain(&other.data).any(|v| !v.is_finite()) {
             return Err(numerical("non-finite entry"));
         }
+        out.clear();
         let n = self.dim();
-        let mut out = Self {
-            shape: self.shape,
-            data: filled_vec(
-                self.shape.len(),
-                Complex::ZERO,
-                "dense complex matrix product",
-            )?,
-        };
         if n != 0 {
             for (a_row, out_row) in self.data.chunks_exact(n).zip(out.data.chunks_exact_mut(n)) {
                 for (&a, b_row) in a_row.iter().zip(other.data.chunks_exact(n)) {
@@ -172,7 +181,65 @@ impl DenseComplex {
                 }
             }
         }
-        out.checked()
+        out.check_finite()
+    }
+
+    /// Right diagonal product in O(n²), equivalent to the finite generic
+    /// product's one nonzero term. Accumulate from positive zero even
+    /// for underflowed/signed-zero products.
+    pub(crate) fn right_diagonal_into(
+        &self,
+        diagonal: &[Complex],
+        out: &mut Self,
+    ) -> SpiceResult<()> {
+        self.check_diagonal(diagonal, out)?;
+        let n = self.dim().max(1);
+        for (input, output) in self.data.chunks_exact(n).zip(out.data.chunks_exact_mut(n)) {
+            for ((&a, &d), value) in input.iter().zip(diagonal).zip(output) {
+                *value = if a == Complex::ZERO {
+                    Complex::ZERO
+                } else {
+                    Complex::ZERO + a * d
+                };
+            }
+        }
+        out.check_finite()
+    }
+
+    /// Left diagonal product with the original operand order.
+    pub(crate) fn left_diagonal_into(
+        &self,
+        diagonal: &[Complex],
+        out: &mut Self,
+    ) -> SpiceResult<()> {
+        self.check_diagonal(diagonal, out)?;
+        let n = self.dim().max(1);
+        for ((input, output), &d) in self
+            .data
+            .chunks_exact(n)
+            .zip(out.data.chunks_exact_mut(n))
+            .zip(diagonal)
+        {
+            for (&a, value) in input.iter().zip(output) {
+                *value = if d == Complex::ZERO {
+                    Complex::ZERO
+                } else {
+                    Complex::ZERO + d * a
+                };
+            }
+        }
+        out.check_finite()
+    }
+
+    fn check_diagonal(&self, diagonal: &[Complex], out: &Self) -> SpiceResult<()> {
+        self.same_dimension(out)?;
+        if diagonal.len() != self.dim() {
+            return Err(numerical("diagonal dimension mismatch"));
+        }
+        if self.data.iter().chain(diagonal).any(|v| !v.is_finite()) {
+            return Err(numerical("non-finite entry"));
+        }
+        Ok(())
     }
 
     /// The inverse by Gauss-Jordan elimination with partial pivoting, or
@@ -185,31 +252,50 @@ impl DenseComplex {
     /// # Errors
     /// A non-finite entry or result, or unavailable workspace storage.
     pub fn inverse(&self) -> SpiceResult<Option<Self>> {
+        let mut out = Self::zeros(self.dim())?;
+        let mut scratch = Self::zeros(self.dim())?;
+        if self.inverse_into(&mut out, &mut scratch)? {
+            Ok(Some(out))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Invert into two shape-checked reusable buffers. False denotes
+    /// a singular input; the output contents are unspecified in that case.
+    pub(crate) fn inverse_into(&self, out: &mut Self, scratch: &mut Self) -> SpiceResult<bool> {
+        self.same_dimension(out)?;
+        self.same_dimension(scratch)?;
         let n = self.dim();
         if self.data.iter().any(|value| !value.is_finite()) {
             return Err(numerical("non-finite entry"));
         }
-        let mut a = collect_dense(self.data.iter().copied(), "dense complex inverse workspace")?;
+        let a = &mut scratch.data;
+        a.copy_from_slice(&self.data);
         let max_component = a
             .iter()
             .fold(0.0_f64, |m, v| m.max(v.re.abs()).max(v.im.abs()));
         let normalization = super::dense::extreme_norm_scale(max_component);
         if let Some(scale) = normalization {
-            for value in &mut a {
+            for value in &mut *a {
                 value.re /= scale;
                 value.im /= scale;
             }
         }
         let scale = a.iter().fold(0_f64, |m, value| m.max(value.magnitude()));
         if scale == 0. {
-            return Ok((n == 0).then(|| self.clone()));
+            return Ok(n == 0);
         }
         // A real allocation of n*n complex elements bounds n well below
         // u32::MAX on the supported address spaces. Check before converting.
         let dimension =
             u32::try_from(n).map_err(|_| numerical("matrix dimension exceeds rank guard range"))?;
         let threshold = 128. * f64::EPSILON * f64::from(dimension) * scale;
-        let mut b = Self::identity(n)?.data;
+        out.clear();
+        for i in 0..n {
+            out.data[i * n + i] = Complex::real(1.);
+        }
+        let b = &mut out.data;
         for c in 0..n {
             let pivot_row = (c..n)
                 .max_by(|&x, &y| {
@@ -219,14 +305,14 @@ impl DenseComplex {
                 })
                 .unwrap_or(c);
             if a[pivot_row * n + c].magnitude() <= threshold {
-                return Ok(None);
+                return Ok(false);
             }
             if pivot_row != c {
-                swap_rows(&mut a, n, c, pivot_row);
-                swap_rows(&mut b, n, c, pivot_row);
+                swap_rows(a, n, c, pivot_row);
+                swap_rows(b, n, c, pivot_row);
             }
-            let (a_before, a_pivot, a_after) = split_row(&mut a, n, c);
-            let (b_before, b_pivot, b_after) = split_row(&mut b, n, c);
+            let (a_before, a_pivot, a_after) = split_row(a, n, c);
+            let (b_before, b_pivot, b_after) = split_row(b, n, c);
             let inverse_pivot = Complex::real(1.) / a_pivot[c];
             for (a_value, b_value) in a_pivot.iter_mut().zip(b_pivot.iter_mut()) {
                 *a_value = *a_value * inverse_pivot;
@@ -256,17 +342,13 @@ impl DenseComplex {
         // If A was scaled down by s, A'^{-1} = s A^{-1}.
         // Undo that scale in the returned inverse, not the pivot policy.
         if let Some(scale) = normalization {
-            for value in &mut b {
+            for value in &mut *b {
                 value.re /= scale;
                 value.im /= scale;
             }
         }
-        Self {
-            shape: self.shape,
-            data: b,
-        }
-        .checked()
-        .map(Some)
+        out.check_finite()?;
+        Ok(true)
     }
 }
 
