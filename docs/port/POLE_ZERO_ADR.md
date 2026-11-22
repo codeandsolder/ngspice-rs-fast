@@ -20,7 +20,7 @@ sections remain current.
 Code: `src/analysis/pz.rs` (card, C's drive/column conventions, plot),
 `src/maths/pencil.rs` (roots of `det(A + s E)`), `Device::assemble_pole_zero`
 (per-device loads). Tests: `tests/pole_zero.rs`, opt-in `tests/c_pole_zero.rs`,
-the `pz_*` goldens in `golden verify` (`multi_analysis_pz` is excluded, see
+the `pz_*` goldens in `golden verify` (including `multi_analysis_pz`, see
 [Verification](#verification)), unit tests in both
 modules.
 
@@ -180,9 +180,9 @@ Golden fixtures (captured once each with `cargo xtask golden capture
 `|Rust - C| <= 1e-6 |C| + 1e-9 max|C root|`): `pz_ladder_cur`,
 `pz_bridge_diff`, `pz_transformer`, `pz_cv_loop`, `pz_diode`, `pz_mos1` and the
 batch `multi_analysis_pz` (`.ac`, `.op`, two `.pz`). The historical
-`multi_analysis_pz` exclusion from `golden verify` (`EXCLUDED` in
-`xtask/src/commands/verify.rs`) was caused by the no-FMA C search returning
-an empty pole plot. The accuracy revision instead checks the full numerator
+`multi_analysis_pz` exclusion was caused by the no-FMA C search returning
+an empty pole plot. The fixture is now included in `golden verify` with
+its original C golden and tolerance. The accuracy revision instead checks the full numerator
 and denominator root sets in `tests/pole_zero.rs` via independently derived
 cubic residuals and Vieta coefficients. The notch case uses the same
 independent completeness criterion. See

@@ -372,6 +372,284 @@ fn scaled_complex_div(a: Complex, b: Complex) -> Complex {
     )
 }
 
+/// Exact signed binary64 product as an integer significand and exponent.
+/// The input pair is finite; its product needs at most 106 bits.
+#[derive(Clone, Copy)]
+struct ExactTerm {
+    significand: i128,
+    exponent: i32,
+}
+
+impl ExactTerm {
+    fn new(a: Real, b: Real) -> Self {
+        let unpack = |v: Real| {
+            let bits = v.to_bits();
+            let biased = i32::try_from((bits >> 52) & 0x7ff).unwrap_or_default();
+            let fraction = bits & 0x000f_ffff_ffff_ffff;
+            let significand = if biased == 0 {
+                fraction
+            } else {
+                fraction | (1 << 52)
+            };
+            (significand, biased.max(1) - 1075)
+        };
+        let (a_int, a_exp) = unpack(a);
+        let (b_int, b_exp) = unpack(b);
+        let abs = i128::from(a_int) * i128::from(b_int);
+        Self {
+            significand: if a.is_sign_negative() == b.is_sign_negative() {
+                abs
+            } else {
+                -abs
+            },
+            exponent: a_exp + b_exp,
+        }
+    }
+}
+
+/// Exact sum of up to four products, before normalization and rounding.
+/// With exponents within 19 bits, four 106-bit significands fit in a
+/// signed i128. Use the full finite-binary64 superaccumulator only when
+/// the products span a wider range.
+#[cold]
+fn exact_product_sum<const N: usize>(pairs: [(Real, Real); N]) -> ScaledNumber {
+    let terms = pairs.map(|(a, b)| ExactTerm::new(a, b));
+    let mut min = i32::MAX;
+    let mut max = i32::MIN;
+    for term in terms.iter().filter(|term| term.significand != 0) {
+        min = min.min(term.exponent);
+        max = max.max(term.exponent);
+    }
+    if min > max {
+        return ScaledNumber {
+            mantissa: 0.,
+            exponent: 0,
+        };
+    }
+    if max - min <= 19 {
+        let sum = terms
+            .iter()
+            .filter(|term| term.significand != 0)
+            .map(|term| term.significand << (term.exponent - min))
+            .sum::<i128>();
+        return scaled_integer(sum, min);
+    }
+    wide_product_sum(&terms)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "round the exact integer sum once to binary64"
+)]
+fn scaled_integer(sum: i128, exponent: i32) -> ScaledNumber {
+    if sum == 0 {
+        return ScaledNumber {
+            mantissa: 0.,
+            exponent: 0,
+        };
+    }
+    let (mantissa, shift) = split_power(sum as Real);
+    ScaledNumber {
+        mantissa,
+        exponent: exponent + shift,
+    }
+}
+
+/// 66 limbs cover the full finite binary64 product range, including
+/// four maximal products. Positive and negative sums stay separate
+/// until subtraction, so even cancellation across a huge exponent
+/// spread cannot erase a nonzero determinant.
+#[cold]
+fn wide_product_sum(terms: &[ExactTerm]) -> ScaledNumber {
+    const LIMBS: usize = 66;
+    const MIN_EXP: i32 = -2148;
+    let mut positive = [0_u64; LIMBS];
+    let mut negative = [0_u64; LIMBS];
+    for term in terms.iter().filter(|term| term.significand != 0) {
+        let product = term.significand.unsigned_abs();
+        let shift = usize::try_from(term.exponent - MIN_EXP).unwrap_or_default();
+        let index = shift / 64;
+        let offset = shift % 64;
+        let bytes = product.to_le_bytes();
+        let lo = u64::from_le_bytes(*bytes.first_chunk::<8>().unwrap_or(&[0; 8]));
+        let hi = u64::from_le_bytes(*bytes.last_chunk::<8>().unwrap_or(&[0; 8]));
+        let parts = if offset == 0 {
+            [lo, hi, 0]
+        } else {
+            [
+                lo << offset,
+                (hi << offset) | (lo >> (64 - offset)),
+                hi >> (64 - offset),
+            ]
+        };
+        let out = if term.significand > 0 {
+            &mut positive
+        } else {
+            &mut negative
+        };
+        let mut carry = false;
+        for (i, slot) in out[index..].iter_mut().enumerate() {
+            let (value, overflow) = slot.overflowing_add(parts.get(i).copied().unwrap_or_default());
+            let (value, next) = value.overflowing_add(u64::from(carry));
+            *slot = value;
+            carry = overflow || next;
+            if i >= 2 && !carry {
+                break;
+            }
+        }
+    }
+    let negative_sign = positive.iter().rev().cmp(negative.iter().rev()).is_lt();
+    let (mut magnitude, subtrahend) = if negative_sign {
+        (negative, positive)
+    } else {
+        (positive, negative)
+    };
+    let mut borrow = false;
+    for (value, other) in magnitude.iter_mut().zip(subtrahend) {
+        let (diff, underflow) = value.overflowing_sub(other);
+        let (diff, next) = diff.overflowing_sub(u64::from(borrow));
+        *value = diff;
+        borrow = underflow || next;
+    }
+    let Some(index) = magnitude.iter().rposition(|&word| word != 0) else {
+        return ScaledNumber {
+            mantissa: 0.,
+            exponent: 0,
+        };
+    };
+    let high_bit = index * 64 + usize::try_from(magnitude[index].ilog2()).unwrap_or_default();
+    let exponent = i32::try_from(high_bit).unwrap_or_default() + MIN_EXP;
+    let shift = high_bit.saturating_sub(52);
+    let limb = shift / 64;
+    let offset = shift % 64;
+    let mut significand = magnitude[limb] >> offset;
+    if offset != 0 {
+        significand |= magnitude.get(limb + 1).copied().unwrap_or_default() << (64 - offset);
+    }
+    if high_bit < 52 {
+        significand <<= 52 - high_bit;
+    } else if shift != 0 {
+        let halfway = shift - 1;
+        let halfway_limb = halfway / 64;
+        let halfway_mask = 1_u64 << (halfway % 64);
+        let halfway_set = magnitude[halfway_limb] & halfway_mask != 0;
+        let sticky = magnitude[halfway_limb] & (halfway_mask - 1) != 0
+            || magnitude[..halfway_limb].iter().any(|&word| word != 0);
+        significand += u64::from(halfway_set && (sticky || significand & 1 != 0));
+    }
+    // The implicit bit at 52 supplies the low exponent bit; adding
+    // rather than masking also handles rounding the significand to 2.
+    let mantissa = Real::from_bits((1022_u64 << 52) + significand);
+    ScaledNumber {
+        mantissa: if negative_sign { -mantissa } else { mantissa },
+        exponent,
+    }
+}
+
+/// Accurate complex value minus product. Ordinary inputs use a direct
+/// three-term update; cancellation-sensitive components are recovered
+/// from the original operands, rather than a separately rounded product.
+#[inline]
+pub(crate) fn complex_mul_sub(value: Complex, a: Complex, b: Complex) -> Complex {
+    let ac = a.re * b.re;
+    let bd = a.im * b.im;
+    let ad = a.re * b.im;
+    let bc = a.im * b.re;
+    let real = value.re - (ac - bd);
+    let imag = value.im - (ad + bc);
+    let result = Complex::new(real, imag);
+    let scale = value.re.abs().max(value.im.abs()) * 0.0625;
+    // Complex multiplication is normwise well-conditioned. A small
+    // individual component does not by itself imply a cancellation of
+    // the vector update. Recompute when the entire update nearly cancels,
+    // or when its exponent range threatens to erase it.
+    if result.is_finite()
+        && ((real.abs() > scale || imag.abs() > scale) && (real.is_normal() || imag.is_normal()))
+    {
+        return result;
+    }
+    if !value.is_finite()
+        || !a.is_finite()
+        || !b.is_finite()
+        || a == Complex::ZERO
+        || b == Complex::ZERO
+    {
+        return result;
+    }
+    complex_mul_sub_recover(value, a, b)
+}
+
+#[cold]
+fn complex_mul_sub_recover(value: Complex, a: Complex, b: Complex) -> Complex {
+    let restore = |terms: [(Real, Real); 3]| {
+        let exact = exact_product_sum(terms);
+        scale_power(exact.mantissa, exact.exponent)
+    };
+    Complex::new(
+        restore([(value.re, 1.), (-a.re, b.re), (a.im, b.im)]),
+        restore([(value.im, 1.), (-a.re, b.im), (-a.im, b.re)]),
+    )
+}
+
+/// Accurate (value * pivot - upper * lower) / pivot. All four inputs
+/// are original, unnormalized coefficients of the current Schur step.
+#[cold]
+pub(crate) fn real_schur(value: Real, pivot: Real, upper: Real, lower: Real) -> Real {
+    let product = upper * lower;
+    let other = value * pivot;
+    // Normal products with enough exponent headroom have an exact FMA
+    // rounding residual. A two-product difference needs no wide accumulator.
+    if product.is_normal()
+        && other.is_normal()
+        && product.abs().min(other.abs()) >= Real::from_bits(55_u64 << 52)
+        && product.abs().max(other.abs()) < Real::MAX * 0.5
+    {
+        return (value.mul_add(pivot, -product) - upper.mul_add(lower, -product)) / pivot;
+    }
+    let numerator = exact_product_sum([(value, pivot), (-upper, lower)]);
+    let (mantissa, exponent) = split_power(pivot);
+    numerator.divide(ScaledNumber { mantissa, exponent })
+}
+
+/// Same Schur update for complex entries. Accumulate the cross products
+/// before rounding, then divide in scaled form, preserving independently
+/// scaled real and imaginary numerator components.
+#[cold]
+pub(crate) fn complex_schur(
+    value: Complex,
+    pivot: Complex,
+    upper: Complex,
+    lower: Complex,
+) -> Complex {
+    let real = exact_product_sum([
+        (value.re, pivot.re),
+        (-value.im, pivot.im),
+        (-upper.re, lower.re),
+        (upper.im, lower.im),
+    ]);
+    let imag = exact_product_sum([
+        (value.re, pivot.im),
+        (value.im, pivot.re),
+        (-upper.re, lower.im),
+        (-upper.im, lower.re),
+    ]);
+    let times = |x: ScaledNumber, v: Real| {
+        let mut product = ScaledProduct::product(x.mantissa, v);
+        product.value.exponent += x.exponent;
+        product
+    };
+    let p = ScaledProduct::product;
+    let denominator = p(pivot.re, pivot.re).add(p(pivot.im, pivot.im));
+    Complex::new(
+        times(real, pivot.re)
+            .add(times(imag, pivot.im))
+            .divide(denominator),
+        times(imag, pivot.re)
+            .add(times(real, -pivot.im))
+            .divide(denominator),
+    )
+}
+
 impl Neg for Complex {
     type Output = Self;
 
@@ -744,6 +1022,48 @@ mod tests {
         let q = Complex::new(a.re, -a.im) / b;
         assert_eq!(q.re, expected / ((1. - epsilon).powi(2) + 1.));
         assert_eq!((b * a).re, expected);
+    }
+
+    #[test]
+    fn exact_products_preserve_cancellation_across_the_full_exponent_range() {
+        let tiny = Real::from_bits(1);
+        let huge = Real::MAX;
+        let exact = exact_product_sum([(huge, huge), (-huge, huge), (tiny, tiny)]);
+        assert_eq!(exact.mantissa, 1.);
+        assert_eq!(exact.exponent, -2148);
+        let exact = exact_product_sum([(huge, huge), (-huge, huge), (-tiny, tiny)]);
+        assert_eq!(exact.mantissa, -1.);
+        assert_eq!(exact.exponent, -2148);
+        let power = scale_power(1., 1023);
+        let exact = exact_product_sum([(power, power); 4]);
+        assert_eq!(exact.mantissa, 1.);
+        assert_eq!(exact.exponent, 2048);
+        // The wide sum rounds halfway to even, but a sticky bit at the
+        // opposite end of the accumulator changes the rounded result.
+        let half = Real::EPSILON / 2.;
+        for (extra, expected) in [(0., 1.), (tiny, 1.0_f64.next_up())] {
+            let exact = exact_product_sum([(1., 1.), (half, 1.), (extra, 1.)]);
+            assert_eq!(scale_power(exact.mantissa, exact.exponent), expected);
+        }
+    }
+
+    #[test]
+    fn unnormalized_schur_recovers_tiny_nonzero_determinants() {
+        for (pivot_exp, lower_exp) in [(700, 700), (-500, -700), (500, -500)] {
+            let pivot = scale_power(1., pivot_exp);
+            let lower = scale_power(1., lower_exp);
+            let value = lower.next_up();
+            assert_eq!(real_schur(lower, pivot, pivot, lower), 0.);
+            assert_eq!(real_schur(value, pivot, pivot, lower), value - lower);
+        }
+        let pivot = Complex::new(scale_power(1., 500), scale_power(1., -500));
+        let lower = Complex::new(scale_power(1., 600), scale_power(1., -600));
+        let value = Complex::new(lower.re, lower.im.next_up());
+        assert_eq!(complex_schur(lower, pivot, pivot, lower), Complex::ZERO);
+        let result = complex_schur(value, pivot, pivot, lower);
+        let expected = value.im - lower.im;
+        assert!((result.im / expected - 1.).abs() < 1e-14);
+        assert!(result.re.abs() <= expected.abs() * 1e-14);
     }
 
     #[test]

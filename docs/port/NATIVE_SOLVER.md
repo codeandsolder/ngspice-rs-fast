@@ -233,8 +233,13 @@ singular systems).
 ## Fidelity and limits
 
 - The solver preserves the SPARSE policy, not intermediate C rounding.
-  Real elimination uses explicit FMA; complex arithmetic compensates
-  cancellation and recovers components at exponent-range boundaries.
+  Ordinary Schur updates use the reciprocal-based fast path. Ordering
+  keeps the original pivot locally and fixed-order refactor keeps raw pivots
+  in reusable scratch, allowing cancellation-sensitive updates to evaluate
+  the unnormalized cross-product before dividing. Exact product accumulation
+  distinguishes proportional rows from genuine tiny nonzero determinants.
+  Triangular updates compensate cancellation and recover components at
+  exponent-range boundaries.
   Determinants are accumulated with binary normalization, with no decimal
   conversion in the pole-zero path. The historical no-FMA C failure on
   `multi_analysis_pz` is no longer reproduced: the notch and multi-analysis

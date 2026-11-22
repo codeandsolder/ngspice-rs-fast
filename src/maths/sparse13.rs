@@ -96,6 +96,9 @@ pub(super) trait Scalar: Copy + PartialEq + std::fmt::Debug {
     fn mul(self, other: Self) -> Self;
     /// C `to -= a * b` or `CMPLX_MULT_SUBT_ASSIGN(to, a, b)`.
     fn mul_sub(self, a: Self, b: Self) -> Self;
+    /// Update a Schur entry using the rounded multiplier only when well
+    /// conditioned; otherwise recover the unnormalized cross-product.
+    fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self) -> Self;
     /// Whether the value is exactly zero (`== 0.0` on every part).
     fn is_zero(self) -> bool;
     /// Whether every scalar component is finite.
@@ -118,8 +121,37 @@ impl Scalar for f64 {
     fn mul(self, other: Self) -> Self {
         self * other
     }
+    #[inline]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "cheap rounded update decides whether FMA recovery is needed; generic targets otherwise call software FMA for every entry"
+    )]
     fn mul_sub(self, a: Self, b: Self) -> Self {
-        a.mul_add(-b, self)
+        let result = self - a * b;
+        if result.is_finite() && (result.abs() > self.abs() * 0.0625 || a == 0. || b == 0.) {
+            result
+        } else {
+            a.mul_add(-b, self)
+        }
+    }
+    #[inline]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "the rounded multiplier cannot supply a reliable cancellation residual; near cancellation uses the original cross-products instead"
+    )]
+    fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self) -> Self {
+        let result = self - mult * lower;
+        if result.is_finite()
+            && ((mult.is_normal() && result.abs() > self.abs() * 0.0625)
+                || upper == 0.
+                || lower == 0.)
+        {
+            result
+        } else if self.is_finite() && upper.is_finite() && lower.is_finite() {
+            crate::primitives::value::real_schur(self, pivot, upper, lower)
+        } else {
+            result
+        }
     }
     fn is_zero(self) -> bool {
         self == 0.0
@@ -161,11 +193,58 @@ impl Scalar for Complex {
             result
         }
     }
+    #[inline]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "ordinary normwise products use the cheap two-product sum; only exponent-range failures need the robust kernel"
+    )]
     fn mul(self, b: Self) -> Self {
-        self * b
+        // Matrix factors and triangular solves use normwise error bounds:
+        // a normal finite complex product already meets that bound with
+        // ordinary arithmetic. Recover exponent-range failures using the
+        // componentwise robust public multiplication.
+        let result = Self::new(
+            self.re * b.re - self.im * b.im,
+            self.re * b.im + self.im * b.re,
+        );
+        if result.is_finite() && (result.re.is_normal() || result.im.is_normal()) {
+            result
+        } else if self.is_zero() || b.is_zero() {
+            result
+        } else {
+            self * b
+        }
     }
+    #[inline]
     fn mul_sub(self, a: Self, b: Self) -> Self {
-        self - a * b
+        crate::primitives::value::complex_mul_sub(self, a, b)
+    }
+    #[inline]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "the cheap update estimates cancellation; a fused update using the rounded multiplier would not remove its rounding error"
+    )]
+    fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self) -> Self {
+        // The ordinary Schur update is a three-term dot product.
+        // Avoid separately compensating the normalized multiplier's product:
+        // its error is dominated by the multiplier itself near cancellation.
+        let product = Self::new(
+            mult.re * lower.re - mult.im * lower.im,
+            mult.re * lower.im + mult.im * lower.re,
+        );
+        let result = self - product;
+        let norm = |v: Self| v.re.abs().max(v.im.abs());
+        if result.is_finite()
+            && ((norm(mult).is_normal() && norm(result) > norm(self) * 0.0625)
+                || upper.is_zero()
+                || lower.is_zero())
+        {
+            result
+        } else if self.is_finite() && upper.is_finite() && lower.is_finite() {
+            crate::primitives::value::complex_schur(self, pivot, upper, lower)
+        } else {
+            result
+        }
     }
     fn is_zero(self) -> bool {
         self.re == 0.0 && self.im == 0.0
@@ -319,6 +398,7 @@ impl<I: PlanIndex> FactorRuns<I> {
         values: &mut [T],
         diag: &[usize],
         dest: &mut [T],
+        pivots: &mut [T],
     ) -> Result<(), RefactorIssue> {
         for step in 2..=self.columns.len() {
             for entry in self.column(step) {
@@ -327,11 +407,12 @@ impl<I: PlanIndex> FactorRuns<I> {
             }
             for entry in self.upper_column(step) {
                 let (handle, row) = entry.indices();
-                let mult = dest[row].mul(values[diag[row]]);
+                let upper = dest[row];
+                let mult = upper.mul(values[diag[row]]);
                 values[handle] = mult;
                 for entry in self.lower_column(row) {
                     let (handle, r) = entry.indices();
-                    dest[r] = dest[r].mul_sub(mult, values[handle]);
+                    dest[r] = dest[r].schur(pivots[row], upper, mult, values[handle]);
                 }
             }
             for entry in self.lower_column(step) {
@@ -341,6 +422,7 @@ impl<I: PlanIndex> FactorRuns<I> {
             if dest[step].is_zero() {
                 return Err(RefactorIssue::ZeroPivot(step));
             }
+            pivots[step] = dest[step];
             let inverse = dest[step].recip();
             if !inverse.is_finite() || inverse.is_zero() {
                 return Err(RefactorIssue::NonFinite);
@@ -1922,7 +2004,8 @@ impl<T: Scalar> Sparse<T> {
         if self.values[first].is_zero() {
             return self.refactor_zero_pivot(1);
         }
-        let inverse = self.values[first].recip();
+        let first_pivot = self.values[first];
+        let inverse = first_pivot.recip();
         if !inverse.is_finite() || inverse.is_zero() {
             return self.nonfinite_factor();
         }
@@ -1932,15 +2015,23 @@ impl<T: Scalar> Sparse<T> {
         // the lower-column updates cannot read an unscattered row.
         // Existing scratch may hold the previous solve's internal RHS;
         // no blanket initialization is required.
-        let additional = (size + 1).saturating_sub(workspace.len());
+        let Some(required) = (size + 1).checked_mul(2) else {
+            return self.resource_failure();
+        };
+        let additional = required.saturating_sub(workspace.len());
         if sparse_reserve(workspace, additional).is_err() {
             return self.resource_failure();
         }
-        workspace.resize(size + 1, T::ZERO);
-        let dest = workspace;
+        workspace.resize(required, T::ZERO);
+        let (dest, pivots) = workspace.split_at_mut(size + 1);
+        pivots[1] = first_pivot;
         let result = match plan.as_ref() {
-            FactorPlan::Compact(runs) => runs.refactor(&mut self.values, &self.topology.diag, dest),
-            FactorPlan::Wide(runs) => runs.refactor(&mut self.values, &self.topology.diag, dest),
+            FactorPlan::Compact(runs) => {
+                runs.refactor(&mut self.values, &self.topology.diag, dest, pivots)
+            }
+            FactorPlan::Wide(runs) => {
+                runs.refactor(&mut self.values, &self.topology.diag, dest, pivots)
+            }
         };
         match result {
             Ok(()) => {}
@@ -2347,7 +2438,8 @@ impl<T: Scalar> Sparse<T> {
             self.matrix_is_singular(row);
             return;
         }
-        let inverse = self.values[pivot].recip();
+        let raw_pivot = self.values[pivot];
+        let inverse = raw_pivot.recip();
         if !inverse.is_finite() || inverse.is_zero() {
             self.nonfinite_factor();
             return;
@@ -2355,7 +2447,8 @@ impl<T: Scalar> Sparse<T> {
         self.values[pivot] = inverse;
         let mut upper = self.topology.elements[pivot].next_in_row;
         while upper != NONE {
-            let u = self.values[upper].mul(inverse);
+            let raw_upper = self.values[upper];
+            let u = raw_upper.mul(inverse);
             if !u.is_finite() {
                 self.nonfinite_factor();
                 return;
@@ -2384,7 +2477,7 @@ impl<T: Scalar> Sparse<T> {
                     sub = element;
                 }
                 let l = self.values[lower];
-                let value = self.values[sub].mul_sub(u, l);
+                let value = self.values[sub].schur(raw_pivot, raw_upper, u, l);
                 if !value.is_finite() {
                     self.nonfinite_factor();
                     return;
@@ -2520,7 +2613,13 @@ impl<T: Scalar> Sparse<T> {
             &self.topology.int_to_ext_row
         };
         x.clear();
-        sparse_reserve(x, self.size + 1)?;
+        // The same scratch is used by fixed-order refactorization. Reserve
+        // its full column + raw-pivot capacity on the first solve so the
+        // next refactor does not invalidate the reusable allocation.
+        let required = (self.size + 1).checked_mul(2).ok_or_else(|| {
+            numerical("SPARSE scratch", "column and raw-pivot capacity overflows")
+        })?;
+        sparse_reserve(x, required)?;
         x.push(T::ZERO);
         x.extend(indices[1..=self.size].iter().map(|&ext| rhs[ext - 1]));
         Ok(())
@@ -3603,6 +3702,72 @@ mod tests {
         let mut m = build(2, &[(1, 1, 1e-14), (2, 2, 2e-14)]);
         assert_eq!(m.order_and_factor(1e-3, 1e-16), Status::Okay);
         assert_eq!(m.small_pivot(), None);
+    }
+
+    #[test]
+    fn proportional_rows_do_not_acquire_spurious_pivots() {
+        for x in 1..=100 {
+            for y in 1..=100 {
+                for z in 1..=7 {
+                    let (x, y, z) = (f64::from(x), f64::from(y), f64::from(z));
+                    let entries = [(1, 1, x), (1, 2, y), (2, 1, z * x), (2, 2, z * y)];
+                    let mut m = build(2, &entries);
+                    assert_eq!(
+                        m.order_and_factor(1e-3, 0.),
+                        Status::Singular,
+                        "{entries:?}"
+                    );
+                }
+            }
+        }
+        let entries = [(1, 1, 3.), (1, 2, 7.), (2, 1, 9.), (2, 2, 22.)];
+        let mut m = build(2, &entries);
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        m.reload_originals(&[3., 7., 9., 21.]);
+        assert_eq!(m.factor(), Status::ZeroDiag);
+        m.reload_originals(&[3., 7., 9., 21.0_f64.next_up()]);
+        assert_eq!(m.factor(), Status::Okay);
+        let (mantissa, exponent) = m.factors().unwrap().determinant().unwrap();
+        let expected = 3. * (21.0_f64.next_up() - 21.);
+        let actual =
+            crate::primitives::numeric::scale_power(mantissa, i32::try_from(exponent).unwrap());
+        assert!((actual / expected - 1.).abs() < 1e-14);
+    }
+
+    #[test]
+    fn complex_proportional_rows_and_nearby_nonsingular_rows() {
+        for a in [
+            Complex::new(3., 7.),
+            Complex::new(7., -3.),
+            Complex::new(1., 0.),
+        ] {
+            for b in [Complex::new(-5., 11.), Complex::new(13., 17.)] {
+                for ratio in [
+                    Complex::new(3., -2.),
+                    Complex::new(0., 7.),
+                    Complex::real(5.),
+                ] {
+                    let c = a * ratio;
+                    let d = b * ratio;
+                    let entries = [(1, 1, a), (1, 2, b), (2, 1, c), (2, 2, d)];
+                    let mut m = Sparse::from_originals(2, entries).unwrap();
+                    assert_eq!(
+                        m.order_and_factor(1e-3, 0.),
+                        Status::Singular,
+                        "{entries:?}"
+                    );
+                    let different = Complex::new(d.re.next_up(), d.im);
+                    let mut m = Sparse::from_originals(
+                        2,
+                        [(1, 1, a), (1, 2, b), (2, 1, c), (2, 2, different)],
+                    )
+                    .unwrap();
+                    assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+                    m.reload_originals(&[a, b, c, d]);
+                    assert_eq!(m.factor(), Status::ZeroDiag);
+                }
+            }
+        }
     }
 
     #[test]
