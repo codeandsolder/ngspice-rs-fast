@@ -1008,7 +1008,7 @@ mod tests {
     #[test]
     fn bound_solves_reuse_scratch_and_keep_valid_factors_on_rhs_failure() {
         let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
-        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
         for (r, c, v) in [(0, 0, 3.), (0, 1, 1.), (1, 0, 1.), (1, 1, 4.)] {
             a.set(r, c, v).unwrap();
         }
@@ -1029,7 +1029,7 @@ mod tests {
     #[test]
     fn unique_refactors_keep_frame_and_input_allocations() {
         let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
-        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
         for (r, c, v) in [(0, 0, 3.), (0, 1, 1.), (1, 0, 1.), (1, 1, 4.)] {
             a.set(r, c, v).unwrap();
         }
@@ -1072,7 +1072,7 @@ mod tests {
     #[test]
     fn unique_complex_refactors_keep_frame_allocation() {
         let pattern = Arc::new(Pattern::new(1, [(0, 0)]).unwrap());
-        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
         a.set(0, 0, 3.).unwrap();
         let mut e = SparseMatrix::new(1, 1);
         e.add(0, 0, 0.5).unwrap();
@@ -1106,7 +1106,7 @@ mod tests {
     #[test]
     fn unrepresentable_bound_factor_never_enters_retained_solves() {
         let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
-        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
         for (r, c, v) in [(0, 0, 2.), (0, 1, 1.), (1, 0, 1.), (1, 1, 2.)] {
             a.set(r, c, v).unwrap();
         }
@@ -1166,7 +1166,7 @@ mod tests {
     #[test]
     fn complex_cache_keeps_snapshots_and_changes_scalar_only_at_boundary() {
         let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
-        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
         for (r, c, value) in [(0, 0, 3.), (0, 1, 1.), (1, 0, 2.), (1, 1, 4.)] {
             a.add(r, c, value).unwrap();
         }
@@ -1251,7 +1251,7 @@ mod tests {
     #[test]
     fn complex_frame_retains_order_but_not_real_factors() {
         let pattern = Arc::new(Pattern::new(2, [(0, 1), (1, 0), (1, 1), (0, 0)]).unwrap());
-        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
         a.add(0, 1, 2.).unwrap();
         a.add(1, 0, 3.).unwrap();
         a.add(1, 1, 4.).unwrap();

@@ -587,8 +587,14 @@ fn bipolar_and_diode_fixed_stamps_replay_the_unbound_matrix() {
             }
             let integration = (step % 2 != 0).then_some(&coeff);
             let (plain, rhs, state) = load(&c, &x, &history, &context, integration);
-            let (bound, bound_rhs, bound_state) =
-                load_on(&c, &x, &history, &context, integration, c.new_matrix());
+            let (bound, bound_rhs, bound_state) = load_on(
+                &c,
+                &x,
+                &history,
+                &context,
+                integration,
+                c.new_matrix().unwrap(),
+            );
             assert!(bound.bound_values().is_some());
             for r in 0..c.unknown_count() {
                 for col in 0..c.unknown_count() {

@@ -613,8 +613,8 @@ mod tests {
     #[test]
     fn complex_workspace_is_reused_across_snapshots_and_contended_solves() {
         let pattern = Arc::new(Pattern::new(2, [(1, 0), (0, 1), (0, 0), (1, 1)]).unwrap());
-        let mut a = SparseMatrix::bound(Arc::clone(&pattern));
-        let mut e = SparseMatrix::bound(Arc::clone(&pattern));
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        let mut e = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
         for (r, c, v) in [(0, 0, 3.), (0, 1, 1.), (1, 0, 2.), (1, 1, 4.)] {
             a.add(r, c, v).unwrap();
             e.add(r, c, v * 0.125).unwrap();
@@ -664,8 +664,8 @@ mod tests {
     #[test]
     fn bound_dynamic_coefficients_match_triplet_path_bit_for_bit() {
         let pattern = Arc::new(Pattern::new(2, [(1, 1), (0, 0), (0, 1), (1, 0)]).unwrap());
-        let a = SparseMatrix::bound(Arc::clone(&pattern));
-        let mut e = SparseMatrix::bound(Arc::clone(&pattern));
+        let a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        let mut e = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
         e.set(1, 1, 0.5).unwrap();
         e.set(0, 0, 1e-300).unwrap();
         e.set(0, 1, -0.).unwrap();
@@ -694,7 +694,7 @@ mod tests {
     #[test]
     fn bound_and_standalone_assembly_follow_stamp_order() {
         let pattern = Arc::new(Pattern::new(2, [(1, 1), (0, 1), (0, 0), (1, 0)]).unwrap());
-        let mut bound = SparseMatrix::bound(Arc::clone(&pattern));
+        let mut bound = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
         let mut triplets = SparseMatrix::new(2, 2);
         for (r, c, v) in [(0, 0, 3.), (1, 1, 4.), (0, 1, -0.), (1, 0, 2.), (0, 0, 1.)] {
             bound.add(r, c, v).unwrap();

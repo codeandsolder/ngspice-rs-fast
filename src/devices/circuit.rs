@@ -2035,7 +2035,7 @@ impl Circuit {
         let replacements = self.replacements(request.model_context)?;
         let mutual = self.mutual_terms_with_replacements(request.model_context, &replacements)?;
         let mut voltage_source_value = 0.;
-        let unlent = matrix.lend_fixed(self.fixed_stamps.take(), self.devices.len());
+        let unlent = matrix.lend_fixed(self.fixed_stamps.take(), self.devices.len())?;
         let stamped = self.stamp_devices(
             request,
             matrix,
@@ -2049,7 +2049,7 @@ impl Circuit {
             .replace(unlent.unwrap_or_else(|| matrix.return_fixed()));
         stamped?;
         self.learn_pattern(matrix)?;
-        matrix.record_trace();
+        matrix.record_trace()?;
         Ok(())
     }
 
@@ -2076,7 +2076,7 @@ impl Circuit {
             let states = request
                 .history
                 .device_of(trial, self.state_rows[index].clone(), index)?;
-            matrix.begin_device(position);
+            matrix.begin_device(position)?;
             device.stamp(&mut StampContext {
                 matrix: &mut *matrix,
                 rhs: &mut *rhs,
@@ -2104,12 +2104,14 @@ impl Circuit {
     /// A zeroed MNA matrix for [`Circuit::load`]: bound to the learned element
     /// pattern (stamps accumulate by element, no triplet list or sort), or a
     /// plain triplet matrix before the first load.
-    #[must_use]
-    pub fn new_matrix(&self) -> SparseMatrix {
+    ///
+    /// # Errors
+    /// Bound coefficient storage cannot be allocated.
+    pub fn new_matrix(&self) -> SpiceResult<SparseMatrix> {
         let n = self.unknown_count();
         match &*self.pattern.borrow() {
             Some(pattern) if pattern.order() == n => SparseMatrix::bound(pattern.clone()),
-            _ => SparseMatrix::new(n, n),
+            _ => Ok(SparseMatrix::new(n, n)),
         }
     }
 
