@@ -347,6 +347,27 @@ pub(super) fn extreme_norm_scale(max: Real) -> Option<Real> {
     Some(exponent.max(f64::MIN_POSITIVE))
 }
 
+const JACOBI_MAX_SWEEPS: usize = 100;
+
+/// Worst-case dense symmetric validation payload and element-visit work.
+///
+/// The caller's matrix, Jacobi's same-sized copy, and the eigenvalue vector
+/// coexist. A sweep visits the entire matrix to test the norm, visits each
+/// upper-triangle pair, and rotates two pairs of entries per matrix row.
+/// Additional complete passes account for preparation, checks and output.
+pub(crate) fn symmetric_eigenvalue_cost(order: usize) -> Option<(usize, usize)> {
+    let cells = order.checked_mul(order)?;
+    let bytes = cells
+        .checked_mul(2)?
+        .checked_add(order)?
+        .checked_mul(size_of::<Real>())?;
+    let work = cells
+        .checked_mul(order.checked_mul(2)?.checked_add(2)?)?
+        .checked_mul(JACOBI_MAX_SWEEPS)?
+        .checked_add(cells.checked_mul(8)?)?;
+    Some((bytes, work))
+}
+
 /// Cyclic Jacobi eigenvalues of the symmetric row-major `a` (n x n), sorted.
 /// `None` if the off-diagonal mass fails to vanish within the sweep budget.
 fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<Vec<Real>>> {
@@ -364,7 +385,7 @@ fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<V
         sum
     };
     let total: Real = data.iter().map(|value| value * value).sum();
-    for _sweep in 0..100 {
+    for _sweep in 0..JACOBI_MAX_SWEEPS {
         if off_diagonal_norm(&data) <= Real::EPSILON * Real::EPSILON * total {
             let mut values = collect_dense(
                 (0..order).map(|index| data[index * order + index]),

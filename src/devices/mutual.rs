@@ -46,6 +46,10 @@
 //!   port checks the summed matrix.
 //! - A K card without a coupling value is a parse error (C silently uses 0).
 
+use std::collections::BTreeSet;
+
+pub(super) mod validation;
+
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
 
@@ -55,6 +59,85 @@ use crate::devices::traits::{ControlReference, Device, MutualCoupling, StampCont
 /// The C references for diagnostics.
 pub const C_REFERENCE: &str = "src/spicelib/parser/inp2k.c; src/spicelib/devices/ind/mutsetup.c, \
      muttemp.c, mutacld.c, indload.c";
+
+/// Resource limits for expanding and validating K-card coupling systems.
+///
+/// These are construction and per-validation budgets, not physical parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MutualLimits {
+    /// Maximum aggregate pair contributions, including repeated K cards.
+    pub pairs: usize,
+    /// Maximum inductors in any connected coupling group.
+    pub group_inductors: usize,
+    /// Maximum estimated mutual-specific vector payload and indexed records.
+    ///
+    /// Excludes allocator metadata and the circuit's otherwise unrelated storage.
+    pub storage_bytes: usize,
+    /// Maximum simultaneous dense eigensolver payload (matrix and workspace).
+    pub dense_bytes: usize,
+    /// Maximum structural element visits and worst-case Jacobi rotation work
+    /// across one validation of all coupled systems.
+    pub validation_work: usize,
+}
+
+impl Default for MutualLimits {
+    fn default() -> Self {
+        Self {
+            pairs: 1_000_000,
+            group_inductors: 250_000,
+            storage_bytes: 512 * 1024 * 1024,
+            dense_bytes: 64 * 1024 * 1024,
+            validation_work: 1_000_000_000,
+        }
+    }
+}
+
+/// Context for a checked allocation or budget rejection.
+#[derive(Clone, Copy)]
+pub(super) struct CouplingSite<'a> {
+    name: &'a str,
+    location: Option<&'a SourceLoc>,
+}
+
+impl<'a> CouplingSite<'a> {
+    pub(super) fn of(device: &'a dyn Device) -> Self {
+        Self {
+            name: device.name(),
+            location: device
+                .mutual_coupling()
+                .and_then(|coupling| coupling.location),
+        }
+    }
+
+    pub(super) fn resource(self, message: impl std::fmt::Display) -> SpiceError {
+        SpiceError::Unsupported {
+            feature: format!("K coupling {}: {message}", self.name),
+            location: self.location.cloned(),
+        }
+    }
+
+    pub(super) fn reserve<T>(self, count: usize) -> SpiceResult<Vec<T>> {
+        let mut data = Vec::new();
+        data.try_reserve_exact(count).map_err(|error| {
+            self.resource(format_args!(
+                "cannot allocate {count} mutual entries: {error}"
+            ))
+        })?;
+        Ok(data)
+    }
+}
+
+/// Choose two without overflowing an intermediate product.
+pub(super) const fn pair_count(inductors: usize) -> Option<usize> {
+    if inductors < 2 {
+        return Some(0);
+    }
+    if inductors.is_multiple_of(2) {
+        (inductors / 2).checked_mul(inductors - 1)
+    } else {
+        inductors.checked_mul((inductors - 1) / 2)
+    }
+}
 
 /// A K device. See the [module documentation](self).
 #[derive(Debug, Clone, PartialEq)]
@@ -87,11 +170,9 @@ impl MutualInductance {
                 "{name}: nonfinite coupling coefficient"
             )));
         }
-        for (index, inductor) in inductors.iter().enumerate() {
-            if inductors[..index]
-                .iter()
-                .any(|other| other.name.eq_ignore_ascii_case(&inductor.name))
-            {
+        let mut seen = BTreeSet::new();
+        for inductor in &inductors {
+            if !seen.insert(inductor.name.to_ascii_lowercase()) {
                 return Err(SpiceError::Unsupported {
                     feature: format!(
                         "{name} couples inductor {} to itself (C produces a zero solution)",
