@@ -24,9 +24,10 @@ pub const SENSITIVITY: Tolerance = Tolerance {
     absolute: 1e-12,
 };
 
-/// Agreement with C's finite-difference nonlinear sensitivity at engineering
-/// precision (0.1%, SPICE's default relative accuracy scale). This is not
-/// a claim about the accuracy of the physical derivative. Independent analytic
+/// Engineering-scale agreement with C's finite-difference nonlinear sensitivity.
+///
+/// The 0.1% relative budget follows SPICE's default accuracy scale, not a
+/// claim about the accuracy of the physical derivative. Independent analytic
 /// and convergence checks retain their own numerical budgets.
 pub const SENSITIVITY_NONLINEAR: Tolerance = Tolerance {
     relative: 1e-3,
