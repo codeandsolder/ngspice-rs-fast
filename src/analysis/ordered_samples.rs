@@ -224,10 +224,6 @@ impl Segment {
     pub(super) const fn right(self) -> usize {
         self.left + 1
     }
-
-    pub(super) fn is_jump(self) -> bool {
-        same_coordinate(self.x0, self.x1)
-    }
 }
 
 const fn segment(values: &[Real], left: usize) -> Segment {
@@ -311,7 +307,7 @@ pub(super) enum SampleError {
     Operand(SpiceError),
 }
 
-fn interpolate(x0: Real, y0: Real, x1: Real, y1: Real, x: Real) -> Real {
+pub(super) fn interpolate(x0: Real, y0: Real, x1: Real, y1: Real, x: Real) -> Real {
     y0 + (y1 - y0) * (x - x0) / (x1 - x0)
 }
 
@@ -397,7 +393,7 @@ mod tests {
         );
         let event_segments = window
             .event_segments()
-            .map(|s| (s.left, s.right(), s.is_jump()))
+            .map(|s| (s.left, s.right(), super::same_coordinate(s.x0, s.x1)))
             .collect::<Vec<_>>();
         assert_eq!(event_segments, [(0, 1, false), (1, 2, true), (2, 3, false)]);
         assert!(axis.sample_window(2.25, 2.75).is_none());
