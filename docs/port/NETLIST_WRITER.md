@@ -72,3 +72,26 @@ same test file against the parent revision to compare, e.g. with perf
 task-clock and Valgrind DHAT. The DHAT process totals include fixture
 parsing and fixed-point verification; the printed elapsed time covers
 only the repeated collector calls.
+
+### Measured results (2026-11-22)
+
+Acer Ryzen 7 4700U, pinned campaign nightly, generic release with managed
+sccache. Baseline d31ddac2; candidate 9c8ca5f (implementation cf09314).
+Three interleaved repetitions per variant; task-clock is median userspace
+CPU time for the whole test including setup and verification. The wall
+clock varied substantially with concurrent campaign load, so CPU rather
+than elapsed time is the comparison metric. DHAT covers the entire test
+process, with each workload run individually.
+
+| Workload | Normalized bytes | Digest (both) | CPU before / after (ms) | Allocated bytes before / after | Allocation count before / after | Peak heap before / after (bytes) |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| Model lists | 268579 | c0f971f50ffa945c | 395.00 / 184.77 | 840551753 / 89511780 | 8056678 / 798568 | 34062699 / 34062700 |
+| PWL lists | 629174 | 8b58ab426f23115b | 875.54 / 612.59 | 1603235378 / 166795833 | 11127358 / 807566 | 68927902 / 68927903 |
+| Nested expressions | 127146 | 910066c7d91bb41d | 187.90 / 172.09 | 207347757 / 121899304 | 2462745 / 1282241 | 15635667 / 15635668 |
+
+All eighteen native runs and six DHAT runs passed semantic equality,
+fixed-point and deterministic-byte checks. Cumulative allocations fall
+substantially; peak heap remains dominated by input AST and verification.
+The nested expression workload still necessarily reparses editable
+expression trees. DHAT reports are in the campaign logs with prefix
+arch-1122-a7c9-next-128; benchmark scratch worktree and executables removed.
