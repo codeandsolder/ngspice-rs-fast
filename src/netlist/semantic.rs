@@ -293,8 +293,8 @@ fn include(directive: &IncludeDirective) -> IncludeDirective {
             .as_ref()
             .map(|section| LibrarySection {
                 name: section.name.clone(),
-                opening: raw(),
-                closing: raw(),
+                opening: raw().into(),
+                closing: raw().into(),
             }),
         location: blank(),
     }
@@ -414,7 +414,8 @@ fn cards(cards: &[ScopedCard]) -> Vec<ScopedCard> {
                     ..raw()
                 },
                 _ => raw(),
-            },
+            }
+            .into(),
             include_chain: card.include_chain.iter().map(|_| blank()).collect(),
         })
         .collect()

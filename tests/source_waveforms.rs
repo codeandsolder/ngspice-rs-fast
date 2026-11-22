@@ -1,5 +1,5 @@
 //! Parsed PULSE/PWL decks through the default companion transient (#9).
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
 use ngspice_rs::devices::Circuit;
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -16,8 +16,10 @@ fn circuit(body: &str) -> Circuit {
     Circuit::from_netlist(&netlist).unwrap()
 }
 fn tran(c: &mut Circuit, args: &[&str]) -> ngspice_rs::primitives::SpiceResult<Plot> {
-    let request = AnalysisRequest::with_arguments(AnalysisKind::Transient, args.iter().copied());
-    runner(request.kind)?.run(c, &request, &AnalysisContext::default())
+    let request = AnalysisInput::with_arguments(AnalysisKind::Transient, args.iter().copied());
+    request
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
 }
 /// The value at `time`: an accepted point exactly there if one exists (the
 /// companion driver lands on source breakpoints), otherwise a linear

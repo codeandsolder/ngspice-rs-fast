@@ -6,9 +6,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
-use ngspice_rs::analysis::{
-    AnalysisContext, AnalysisRequest, Plot, RunConfig, companion_transient, runner,
-};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RunConfig, companion_transient};
 use ngspice_rs::devices::{
     AcceptContext, AnalysisMode, Circuit, Device, IndependentSource, LinearContext, StampContext,
     Waveform,
@@ -27,9 +25,9 @@ fn parse(deck: &str) -> ngspice_rs::netlist::ast::Netlist {
 fn run_at(deck: &str, index: usize) -> SpiceResult<Plot> {
     let netlist = parse(deck);
     let config = RunConfig::from_netlist(&netlist)?;
-    let request = config.request_for(&netlist.analyses[index])?;
+    let request = config.plan_for(&netlist.analyses[index])?;
     let mut circuit = config.circuit(&netlist)?;
-    runner(request.kind)?.run(&mut circuit, &request, &config.context())
+    request.run(&mut circuit, &config.context())
 }
 fn run(deck: &str) -> SpiceResult<Plot> {
     run_at(deck, 0)
@@ -343,11 +341,10 @@ fn step_source(circuit: &mut Circuit, time: f64) {
     );
 }
 
-fn uic_request(args: &[&str]) -> AnalysisRequest {
-    let mut request =
-        AnalysisRequest::with_arguments(AnalysisKind::Transient, args.iter().copied());
+fn uic_request(args: &[&str]) -> ngspice_rs::analysis::AnalysisPlan {
+    let mut request = AnalysisInput::with_arguments(AnalysisKind::Transient, args.iter().copied());
     request.uic = true;
-    request
+    request.resolve().unwrap()
 }
 fn circuit_of(deck: &str) -> Circuit {
     Circuit::from_netlist(&parse(deck)).unwrap()

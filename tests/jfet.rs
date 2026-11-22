@@ -2,7 +2,7 @@
 //! operation against independent restatements of `jfetload.c`, finite-
 //! difference Jacobians, gate charge, observations and explicit gaps.
 //! C-golden comparisons live in `xtask golden verify` (`m10_jfet_*`).
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
 use ngspice_rs::devices::{AnalysisMode, Circuit, LoadRequest, ModelContext};
 use ngspice_rs::maths::{SparseMatrix, Vector};
 use ngspice_rs::netlist::ast::ParameterKind;
@@ -23,13 +23,9 @@ fn circuit(body: &str) -> Result<Circuit, SpiceError> {
     Circuit::from_netlist(&deck(body)?)
 }
 fn run(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> Plot {
-    runner(kind)
-        .unwrap()
-        .run(
-            c,
-            &AnalysisRequest::with_arguments(kind, arguments.iter().copied()),
-            &AnalysisContext::default(),
-        )
+    AnalysisInput::with_arguments(kind, arguments.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
         .unwrap()
 }
 fn value(plot: &Plot, name: &str, point: usize) -> f64 {
@@ -379,34 +375,25 @@ fn bias_observations_follow_jfetask() {
 fn noise_distortion_and_sensitivity_are_refused_explicitly() {
     let body = "vd d 0 5\nvg g 0 dc -1 ac 1\nrl d o 1k\nvo o 0 0\nj1 d g 0 jm\n.model jm njf";
     let mut c = circuit(body).unwrap();
-    let noise = runner(AnalysisKind::Noise).unwrap().run(
-        &mut c,
-        &AnalysisRequest::with_arguments(
-            AnalysisKind::Noise,
-            ["v(d)", "vg", "dec", "2", "1k", "10k"],
-        ),
-        &AnalysisContext::default(),
-    );
+    let noise =
+        AnalysisInput::with_arguments(AnalysisKind::Noise, ["v(d)", "vg", "dec", "2", "1k", "10k"])
+            .resolve()
+            .and_then(|plan| plan.run(&mut c, &AnalysisContext::default()));
     let error = noise.unwrap_err();
     assert!(error.is_not_yet_ported(), "{error}");
     assert!(error.to_string().contains("jfetnoi.c"), "{error}");
     let mut c = circuit(&body.replace("ac 1", "distof1 1")).unwrap();
-    let disto = runner(AnalysisKind::Distortion).unwrap().run(
-        &mut c,
-        &AnalysisRequest::with_arguments(AnalysisKind::Distortion, ["dec", "2", "1k", "10k"]),
-        &AnalysisContext::default(),
-    );
+    let disto = AnalysisInput::with_arguments(AnalysisKind::Distortion, ["dec", "2", "1k", "10k"])
+        .resolve()
+        .and_then(|plan| plan.run(&mut c, &AnalysisContext::default()));
     assert!(disto.unwrap_err().is_not_yet_ported());
     // `.sens` through the production front end (C: `cktsens.c`) is ported
     // (#164): the enumerated list is `jfet.c`'s tables, not the card's.
     let netlist = deck(&format!("{body}\n.sens v(o)")).unwrap();
     let config = ngspice_rs::analysis::RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut c = config.circuit(&netlist).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut c, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut c, &config.context()).unwrap();
     let names: Vec<&str> = plot
         .variables()
         .iter()

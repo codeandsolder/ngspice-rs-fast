@@ -29,15 +29,11 @@
 //!    literals are rounded to the 11 significant digits `inp_modify_exp()`
 //!    prints and numparam `{...}` values in `=pwl(` lines are evaluated.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
-use crate::netlist::ast::{
-    DeviceInstance, Netlist, ParameterAssignment, ParameterKind, ScopeView, ScopedCard,
-    ScopedCardKind, Subcircuit, poly_dimension,
-};
+use crate::netlist::ast::{DeviceInstance, Netlist, ParameterAssignment, ParameterKind, ScopeView};
 use crate::netlist::bexpr::{
     BBinaryOp, BExpr, BExprKind, BUnaryOp, BehaviouralExpression, SPECIAL_NAMES,
     STATISTICAL_FUNCTIONS, TableTransfer, is_builtin_function, round_like_c_literal,
@@ -45,6 +41,10 @@ use crate::netlist::bexpr::{
 use crate::netlist::elaborate::format_literal;
 use crate::netlist::eval::{EvalBudget, FunctionScope, ParamScope};
 use crate::netlist::expr::{BinaryOp, Expr, ExprKind, SourceSpan, UnaryOp};
+
+mod edits;
+pub(super) mod forms;
+use forms::{NonlinearForm, PolyControls, PolyForm, TableForm, TableInput, ValueForm};
 
 /// C references of the front-end rewrites.
 pub const C_REFERENCE: &str = "src/frontend/inpcom.c (inp_compat, inp_poly_2g6_compat, \
@@ -67,378 +67,19 @@ const MAX_RESOLVED_NODES: usize = 100_000;
 /// A malformed nonlinear form (no expression, an odd TABLE point list, a
 /// POLY without its controls), positioned at the card.
 pub fn lower_nonlinear_sources(netlist: &Netlist) -> SpiceResult<Netlist> {
+    let plan = edits::ScopeEdits::build(ScopeView::from(netlist), &mut 0)?;
     let mut out = netlist.clone();
-    measure_currents(&mut out)?;
-    lower_devices(&mut out.devices, &mut out.cards)?;
-    for subcircuit in &mut out.subcircuits {
-        lower_subcircuit(subcircuit)?;
-    }
+    plan.apply(&mut out)?;
     Ok(out)
-}
-
-/// A device position: the chain of subcircuit indexes (empty at the root)
-/// and the index in that scope's device list.
-type Position = (Vec<usize>, usize);
-
-fn scope_parts<'a>(
-    netlist: &'a mut Netlist,
-    path: &[usize],
-) -> (&'a mut Vec<DeviceInstance>, &'a mut Vec<ScopedCard>) {
-    let Some((first, rest)) = path.split_first() else {
-        return (&mut netlist.devices, &mut netlist.cards);
-    };
-    let mut subcircuit = &mut netlist.subcircuits[*first];
-    for index in rest {
-        subcircuit = &mut subcircuit.subcircuits[*index];
-    }
-    (&mut subcircuit.devices, &mut subcircuit.cards)
-}
-
-/// Device positions in deck order: the root's and every body's cards as they
-/// were written (falling back to vector order without card lists).
-fn deck_order(netlist: &Netlist) -> SpiceResult<Vec<Position>> {
-    fn walk(scope: ScopeView<'_>, path: &[usize], out: &mut Vec<Position>) -> SpiceResult<()> {
-        if scope.cards.is_empty() {
-            out.extend((0..scope.devices.len()).map(|index| (path.to_vec(), index)));
-            for (index, body) in scope.subcircuits.iter().enumerate() {
-                let mut nested = path.to_vec();
-                nested.push(index);
-                walk(ScopeView::from(body), &nested, out)?;
-            }
-            return Ok(());
-        }
-        scope
-            .validate_order()
-            .map_err(|error| SpiceError::circuit(error.to_string()))?;
-        for card in scope.cards {
-            match card.kind {
-                ScopedCardKind::Device(index) => out.push((path.to_vec(), index)),
-                ScopedCardKind::Subcircuit(index) => {
-                    let mut nested = path.to_vec();
-                    nested.push(index);
-                    walk(ScopeView::from(&scope.subcircuits[index]), &nested, out)?;
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-    let mut out = Vec::new();
-    walk(ScopeView::from(netlist), &[], &mut out)?;
-    Ok(out)
-}
-
-/// Characters `is_arith_char()` accepts before `i(` (plus `{` and `=`).
-fn converts_after(previous: char) -> bool {
-    "+-*/()<>?:|&^!%\\{='".contains(previous)
-}
-
-/// Whether `inp_meas_current()` rewrites the `i(` at byte `offset` of an
-/// expression's text: the character before it (after
-/// `stripWhiteSpacesInsideParens()`) must be an arithmetic character, `{`,
-/// `=` or a space outside parentheses; a comma is not.
-fn measured_reference(text: &str, offset: usize) -> bool {
-    let before = &text[..offset.min(text.len())];
-    let trimmed = before.trim_end();
-    let Some(previous) = trimmed.chars().last() else {
-        // The expression starts the value: `=`, `{` or a space precede it.
-        return true;
-    };
-    if trimmed.len() < before.len() {
-        let depth = trimmed.chars().fold(0i32, |depth, c| match c {
-            '(' => depth + 1,
-            ')' => depth - 1,
-            _ => depth,
-        });
-        if depth <= 0 {
-            return true;
-        }
-    }
-    converts_after(previous)
-}
-
-/// An expression's current reference, in traversal (source) order.
-struct MeasurementReference {
-    occurrence: usize,
-    name: String,
-}
-
-/// The device indexes referenced by one name in one scope. Store only names
-/// that occur in an expression; preserve the original order even for malformed
-/// decks with duplicate device names (the circuit validates those separately).
-#[derive(Default)]
-struct MeasurementTargets {
-    simple: bool,
-    measured: Vec<usize>,
-    inserted: bool,
-}
-
-#[derive(Default)]
-struct ScopeMeasurements {
-    targets: HashMap<String, MeasurementTargets>,
-    insertions: HashMap<usize, DeviceInstance>,
-}
-
-/// `inp_meas_current()` (`src/frontend/inpcom.c`): an `i(name)` in a
-/// behavioural expression whose `name` does not start with `v` senses the
-/// current into `name`'s first node through an inserted zero-volt source
-/// `v_name` (`name`'s first node becomes `<node>_vmeas_<n>`), unless `name`
-/// is a simple linear E/H. The device is searched in the same scope only.
-fn measure_currents(netlist: &mut Netlist) -> SpiceResult<()> {
-    // Phase 1: every rewritable reference, grouped by device, in deck order.
-    let mut references = Vec::new();
-    let mut scopes = HashMap::<Vec<usize>, ScopeMeasurements>::new();
-    for position in deck_order(netlist)? {
-        let device = &scope_parts(netlist, &position.0).0[position.1];
-        let mut occurrence = 0;
-        let mut group = Vec::new();
-        for parameter in &device.parameters {
-            let ParameterKind::Behavioural(expression) = &parameter.kind else {
-                continue;
-            };
-            expression.root.visit(&mut |node| {
-                if let BExprKind::Current(name) = &node.kind {
-                    if !name.starts_with('v')
-                        && node
-                            .span
-                            .relative_to(&expression.span)
-                            .is_some_and(|range| measured_reference(&expression.text, range.start))
-                    {
-                        group.push(MeasurementReference {
-                            occurrence,
-                            name: name.clone(),
-                        });
-                    }
-                    occurrence += 1;
-                }
-            });
-        }
-        if !group.is_empty() {
-            let scope = scopes.entry(position.0.clone()).or_default();
-            for reference in &group {
-                if !scope.targets.contains_key(&reference.name) {
-                    scope
-                        .targets
-                        .insert(reference.name.clone(), MeasurementTargets::default());
-                }
-            }
-            references.push((position, group));
-        }
-    }
-
-    // Index each relevant scope once, before any names or nodes are changed.
-    // This replaces one full device scan for every reference.
-    for (path, scope) in &mut scopes {
-        for (index, device) in scope_parts(netlist, path).0.iter().enumerate() {
-            if let Some(targets) = scope.targets.get_mut(&device.name) {
-                if is_simple_linear(device) {
-                    targets.simple = true;
-                } else if !device.nodes.is_empty() {
-                    targets.measured.push(index);
-                }
-            }
-        }
-    }
-
-    rewrite_measured_references(netlist, references, &mut scopes)?;
-
-    // Rebuild each affected device vector in order. Repeated Vec::insert
-    // would move all following devices once for every generated source.
-    for (path, mut scope) in scopes {
-        if scope.insertions.is_empty() {
-            continue;
-        }
-        let (devices, cards) = scope_parts(netlist, &path);
-        let mut rewritten = Vec::with_capacity(devices.len() + scope.insertions.len());
-        let mut mapping = Vec::with_capacity(devices.len());
-        for (index, device) in std::mem::take(devices).into_iter().enumerate() {
-            let start = rewritten.len();
-            rewritten.push(device);
-            if let Some(source) = scope.insertions.remove(&index) {
-                rewritten.push(source);
-            }
-            mapping.push(start..rewritten.len());
-        }
-        remap_device_cards(cards, &mapping)?;
-        *devices = rewritten;
-    }
-    Ok(())
-}
-
-fn rewrite_measured_references(
-    netlist: &mut Netlist,
-    references: Vec<(Position, Vec<MeasurementReference>)>,
-    scopes: &mut HashMap<Vec<usize>, ScopeMeasurements>,
-) -> SpiceResult<()> {
-    // Phase 2: process references in global deck order. Every matching
-    // non-simple target still advances C's serial, even after its source
-    // was inserted. Rewrite each expression once, not once per reference.
-    let mut serial = 0usize;
-    for ((path, device_index), group) in references {
-        let (devices, _) = scope_parts(netlist, &path);
-        let scope = scopes
-            .get_mut(&path)
-            .ok_or_else(|| SpiceError::circuit("missing indexed current-reference scope"))?;
-        let mut renames = Vec::new();
-        for reference in group {
-            let targets = scope
-                .targets
-                .get_mut(&reference.name)
-                .ok_or_else(|| SpiceError::circuit("missing indexed current-reference target"))?;
-            let source = format!("v_{}", reference.name);
-            if !targets.simple {
-                renames.push((reference.occurrence, source.clone()));
-            }
-            for &target in &targets.measured {
-                let device = &mut devices[target];
-                let node = &mut device.nodes[0];
-                let needs_node = !node.contains("_vmeas");
-                let original = (!targets.inserted).then(|| {
-                    node.split_once("_vmeas_")
-                        .map_or_else(|| node.clone(), |(base, _)| base.to_owned())
-                });
-                if needs_node {
-                    *node = format!("{node}_vmeas_{serial}");
-                }
-                if let Some(original) = original {
-                    let location = device.location.clone();
-                    scope.insertions.insert(
-                        target,
-                        instance(
-                            source.clone(),
-                            'v',
-                            vec![original, node.clone()],
-                            vec![scalar("dc", "0", &location)],
-                            &location,
-                        ),
-                    );
-                    targets.inserted = true;
-                }
-                serial += 1;
-            }
-        }
-        rename_occurrences(&mut devices[device_index], &renames);
-    }
-
-    Ok(())
-}
-
-/// C's "simple linear e source": an E/H without `=` or POLY on its card.
-fn is_simple_linear(device: &DeviceInstance) -> bool {
-    matches!(device.designator, 'e' | 'h')
-        && !device
-            .parameters
-            .iter()
-            .any(|p| matches!(p.name.as_str(), "value" | "table" | "poly"))
-}
-
-fn rename_occurrences(device: &mut DeviceInstance, renames: &[(usize, String)]) {
-    if renames.is_empty() {
-        return;
-    }
-    let mut seen = 0;
-    let mut remaining = renames.iter();
-    let mut next = remaining.next();
-    for parameter in &mut device.parameters {
-        let ParameterKind::Behavioural(expression) = &mut parameter.kind else {
-            continue;
-        };
-        expression.root.visit_mut(&mut |node| {
-            if let BExprKind::Current(source) = &mut node.kind {
-                if let Some((occurrence, name)) = next
-                    && seen == *occurrence
-                {
-                    name.clone_into(source);
-                    next = remaining.next();
-                }
-                seen += 1;
-            }
-        });
-    }
-}
-
-fn lower_subcircuit(subcircuit: &mut Subcircuit) -> SpiceResult<()> {
-    lower_devices(&mut subcircuit.devices, &mut subcircuit.cards)?;
-    for nested in &mut subcircuit.subcircuits {
-        lower_subcircuit(nested)?;
-    }
-    Ok(())
-}
-
-/// Rewrite only device ordinals, preserving the original card and include
-/// chain on every generated device. Location alone is not a card identity:
-/// the same physical line can be expanded by multiple include directives.
-fn remap_device_cards(
-    cards: &mut Vec<ScopedCard>,
-    mapping: &[std::ops::Range<usize>],
-) -> SpiceResult<()> {
-    let mut rewritten = Vec::with_capacity(cards.len());
-    for card in std::mem::take(cards) {
-        if let ScopedCardKind::Device(index) = card.kind {
-            let range = mapping.get(index).ok_or_else(|| {
-                SpiceError::parse(
-                    card.source.location.clone(),
-                    "invalid device card index during lowering",
-                )
-            })?;
-            if let Some(last) = range.clone().next_back() {
-                for index in range.start..last {
-                    rewritten.push(ScopedCard {
-                        kind: ScopedCardKind::Device(index),
-                        ..card.clone()
-                    });
-                }
-                rewritten.push(ScopedCard {
-                    kind: ScopedCardKind::Device(last),
-                    ..card
-                });
-            }
-        } else {
-            rewritten.push(card);
-        }
-    }
-    *cards = rewritten;
-    Ok(())
-}
-
-fn lower_devices(
-    devices: &mut Vec<DeviceInstance>,
-    cards: &mut Vec<ScopedCard>,
-) -> SpiceResult<()> {
-    let mut out = Vec::with_capacity(devices.len());
-    let mut mapping = Vec::with_capacity(devices.len());
-    for device in std::mem::take(devices) {
-        let start = out.len();
-        lower_device(device, &mut out)?;
-        mapping.push(start..out.len());
-    }
-    remap_device_cards(cards, &mapping)?;
-    *devices = out;
-    Ok(())
-}
-
-fn has(device: &DeviceInstance, name: &str) -> bool {
-    device.parameters.iter().any(|p| p.name == name)
 }
 
 fn lower_device(device: DeviceInstance, out: &mut Vec<DeviceInstance>) -> SpiceResult<()> {
-    if matches!(device.designator, 'e'..='h') {
-        if has(&device, "poly") {
-            out.push(lower_poly(&device)?);
-            return Ok(());
-        }
-        if has(&device, "value") {
-            out.extend(lower_value(&device)?);
-            return Ok(());
-        }
-        if has(&device, "table") {
-            out.extend(lower_table(&device)?);
-            return Ok(());
-        }
+    match NonlinearForm::validate(&device)? {
+        Some(NonlinearForm::Value(form)) => out.extend(lower_value(&device, &form)),
+        Some(NonlinearForm::Table(form)) => out.extend(lower_table(&device, &form)),
+        Some(NonlinearForm::Poly(form)) => out.push(lower_poly(&device, &form)?),
+        None => out.push(device),
     }
-    // The deck was cloned once before rewriting; unchanged devices can move
-    // directly into the lowered vector, including their expression trees.
-    out.push(device);
     Ok(())
 }
 
@@ -477,9 +118,12 @@ fn malformed(device: &DeviceInstance, message: &str) -> SpiceError {
 
 /// The controlled source driven by the generated internal node: gain 1 for
 /// E, the `m=` value (default 1) for G (`inp_compat`, "find multiplier m").
-fn driven_source(device: &DeviceInstance, internal: &str) -> DeviceInstance {
-    let gain = device
-        .parameters
+fn driven_source(
+    device: &DeviceInstance,
+    internal: &str,
+    setters: &[ParameterAssignment],
+) -> DeviceInstance {
+    let gain = setters
         .iter()
         .rev()
         .find(|p| p.name == "m")
@@ -505,25 +149,17 @@ fn driven_source(device: &DeviceInstance, internal: &str) -> DeviceInstance {
     )
 }
 
-fn lower_value(device: &DeviceInstance) -> SpiceResult<Vec<DeviceInstance>> {
-    if device.nodes.len() != 2 {
-        return Err(malformed(device, "VALUE form needs two output nodes"));
-    }
+fn lower_value(device: &DeviceInstance, form: &ValueForm<'_>) -> [DeviceInstance; 2] {
     let internal = format!("{}_int1", device.name);
-    let mut b_parameters = Vec::new();
-    for parameter in &device.parameters {
-        match parameter.name.as_str() {
-            "value" => b_parameters.push(ParameterAssignment {
-                name: "v".to_owned(),
-                ..parameter.clone()
-            }),
-            // G: m is the controlled source's gain, not a B setter.
-            "m" if device.designator == 'g' => {}
-            _ => b_parameters.push(parameter.clone()),
-        }
+    let mut b_parameters = vec![ParameterAssignment {
+        name: "v".to_owned(),
+        ..form.input.clone()
+    }];
+    if device.designator == 'e' {
+        b_parameters.extend_from_slice(form.setters);
     }
-    Ok(vec![
-        driven_source(device, &internal),
+    [
+        driven_source(device, &internal, form.setters),
         instance(
             format!("b{}", device.name),
             'b',
@@ -531,7 +167,7 @@ fn lower_value(device: &DeviceInstance) -> SpiceResult<Vec<DeviceInstance>> {
             b_parameters,
             &device.location,
         ),
-    ])
+    ]
 }
 
 /// `inp_compat()` replaces `[`, `]` and `%` by `_` in the G TABLE names it
@@ -542,35 +178,6 @@ fn sanitized(name: &str, designator: char) -> String {
     } else {
         name.to_owned()
     }
-}
-
-fn point(parameter: &ParameterAssignment) -> SpiceResult<BExpr> {
-    let span = SourceSpan {
-        start: parameter.location.clone(),
-        end: parameter.location.clone(),
-        logical: 0..0,
-    };
-    let kind = match &parameter.kind {
-        ParameterKind::Scalar => BExprKind::Number {
-            value: crate::primitives::parse_spice_number(&parameter.value)
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| {
-                    SpiceError::parse(
-                        parameter.location.clone(),
-                        format!("'{}' is not a finite number", parameter.value),
-                    )
-                })?,
-            spelling: parameter.value.clone(),
-        },
-        ParameterKind::Expression(expression) => BExprKind::Value(expression.clone()),
-        _ => {
-            return Err(SpiceError::parse(
-                parameter.location.clone(),
-                format!("'{}' is not a numeric value", parameter.value),
-            ));
-        }
-    };
-    Ok(BExpr { kind, span })
 }
 
 fn generated(root: BExpr, text: String, location: &SourceLoc) -> ParameterKind {
@@ -597,80 +204,50 @@ fn quantity(kind: BExprKind, location: &SourceLoc) -> BExpr {
     }
 }
 
-fn lower_table(device: &DeviceInstance) -> SpiceResult<Vec<DeviceInstance>> {
-    let four_node = device.nodes.len() == 4;
-    if !matches!(device.designator, 'e' | 'g') || !(device.nodes.len() == 2 || four_node) {
-        return Err(malformed(
-            device,
-            "TABLE form needs an E/G with 2 or 4 nodes",
-        ));
-    }
+fn lower_table(device: &DeviceInstance, form: &TableForm<'_>) -> Vec<DeviceInstance> {
     let stok = sanitized(&device.name, device.designator);
     let int1 = format!("{stok}_int1");
     let int2 = format!("{stok}_int2");
-    let mut points = Vec::new();
-    let mut pending: Option<BExpr> = None;
-    let mut input = None;
-    for parameter in &device.parameters {
-        match parameter.name.as_str() {
-            "table" => input = Some(parameter),
-            "x" => pending = Some(point(parameter)?),
-            "y" => {
-                let x = pending
-                    .take()
-                    .ok_or_else(|| malformed(device, "TABLE y value without x"))?;
-                points.push((x, point(parameter)?));
-            }
-            "m" if device.designator == 'g' => {}
-            other => {
-                return Err(malformed(
-                    device,
-                    &format!("unexpected TABLE parameter '{other}'"),
-                ));
-            }
-        }
+    let mut out = vec![driven_source(device, &int1, form.setters)];
+    if let [(_, y)] = form.points.as_slice() {
+        out.push(constant_table_source(device, int1, y.parameter));
+        return out;
     }
-    let input = input.ok_or_else(|| malformed(device, "TABLE without an input"))?;
-    if points.is_empty() || pending.is_some() {
-        return Err(malformed(device, "TABLE needs (x, y) pairs"));
-    }
-    let mut out = vec![driven_source(device, &int1)];
-    if points.len() == 1 {
-        out.push(constant_table_source(device, int1)?);
-        return Ok(out);
-    }
-    let location = &input.location;
-    let (source, domain) = if four_node {
-        (
+    let points: Vec<_> = form
+        .points
+        .iter()
+        .map(|(x, y)| (x.expression(), y.expression()))
+        .collect();
+    let location = form.location;
+    let (source, domain) = match form.input {
+        TableInput::Voltage([positive, negative]) => (
             BExprKind::Voltage {
-                positive: device.nodes[2].clone(),
-                negative: Some(device.nodes[3].clone()),
+                positive: positive.clone(),
+                negative: Some(negative.clone()),
             },
             LTSPICE_TABLE_DOMAIN,
-        )
-    } else {
-        let ParameterKind::Behavioural(expression) = &input.kind else {
-            return Err(malformed(device, "TABLE input is not an expression"));
-        };
-        out.push(instance(
-            format!("b{}", device.name),
-            'b',
-            vec![int2.clone(), "0".to_owned()],
-            vec![ParameterAssignment {
-                name: "v".to_owned(),
-                value: expression.text.clone(),
-                kind: input.kind.clone(),
-                location: input.location.clone(),
-            }],
-            &device.location,
-        ));
-        (
-            BExprKind::Voltage {
-                positive: int2,
-                negative: None,
-            },
-            TABLE_DOMAIN,
-        )
+        ),
+        TableInput::Expression(input, expression) => {
+            out.push(instance(
+                format!("b{}", device.name),
+                'b',
+                vec![int2.clone(), "0".to_owned()],
+                vec![ParameterAssignment {
+                    name: "v".to_owned(),
+                    value: expression.text.clone(),
+                    kind: input.kind.clone(),
+                    location: input.location.clone(),
+                }],
+                &device.location,
+            ));
+            (
+                BExprKind::Voltage {
+                    positive: int2,
+                    negative: None,
+                },
+                TABLE_DOMAIN,
+            )
+        }
     };
     let text = format!(
         "xspice-pwl input_domain={domain} fraction=TRUE limit=TRUE ({} points)",
@@ -696,17 +273,16 @@ fn lower_table(device: &DeviceInstance) -> SpiceResult<Vec<DeviceInstance>> {
         }],
         &device.location,
     ));
-    Ok(out)
+    out
 }
 
 /// A single TABLE pair is a constant voltage source, independent of the input.
-fn constant_table_source(device: &DeviceInstance, node: String) -> SpiceResult<DeviceInstance> {
-    let y = device
-        .parameters
-        .iter()
-        .find(|p| p.name == "y")
-        .ok_or_else(|| malformed(device, "TABLE single point missing y value"))?;
-    Ok(instance(
+fn constant_table_source(
+    device: &DeviceInstance,
+    node: String,
+    y: &ParameterAssignment,
+) -> DeviceInstance {
+    instance(
         format!("v{}", device.name),
         'v',
         vec![node, "0".to_owned()],
@@ -715,7 +291,7 @@ fn constant_table_source(device: &DeviceInstance, node: String) -> SpiceResult<D
             ..y.clone()
         }],
         &device.location,
-    ))
+    )
 }
 
 /// In-place SPICE2 monomial sequence (`nxtpwr` in
@@ -765,44 +341,23 @@ fn spliced(value: Real) -> BExprKind {
     }
 }
 
-fn lower_poly(device: &DeviceInstance) -> SpiceResult<DeviceInstance> {
-    let voltage_controlled = matches!(device.designator, 'e' | 'g');
-    let dimension = device
-        .parameters
-        .iter()
-        .find(|p| p.name == "poly")
-        .and_then(|p| poly_dimension(&p.value))
-        .ok_or_else(|| malformed(device, "POLY needs a positive integer dimension"))?;
+fn lower_poly(device: &DeviceInstance, form: &PolyForm<'_>) -> SpiceResult<DeviceInstance> {
+    let dimension = form.dimension;
     let location = &device.location;
-    let mut controls = Vec::new();
-    if voltage_controlled {
-        if device.nodes.len() != 2 + 2 * dimension {
-            return Err(malformed(
-                device,
-                &format!(
-                    "POLY({dimension}) needs {} controlling nodes",
-                    2 * dimension
-                ),
-            ));
-        }
-        for pair in device.nodes[2..].chunks(2) {
-            controls.push(BExprKind::Voltage {
-                positive: pair[0].clone(),
-                negative: Some(pair[1].clone()),
-            });
-        }
-    } else {
-        for parameter in device.parameters.iter().filter(|p| p.name == "control") {
-            controls.push(BExprKind::Current(parameter.value.clone()));
-        }
-        if controls.len() != dimension || device.nodes.len() != 2 {
-            return Err(malformed(
-                device,
-                &format!("POLY({dimension}) needs {dimension} controlling source(s)"),
-            ));
-        }
-    }
-    let mut coefficients = device.parameters.iter().filter(|p| p.name == "coef");
+    let controls: Vec<_> = match form.controls {
+        PolyControls::Voltage(pairs) => pairs
+            .iter()
+            .map(|[positive, negative]| BExprKind::Voltage {
+                positive: positive.clone(),
+                negative: Some(negative.clone()),
+            })
+            .collect(),
+        PolyControls::Current(sources) => sources
+            .iter()
+            .map(|parameter| BExprKind::Current(parameter.value.clone()))
+            .collect(),
+    };
+    let mut coefficients = form.coefficients.iter();
     let first = coefficients
         .next()
         .ok_or_else(|| malformed(device, "POLY needs at least one coefficient"))?;
@@ -817,7 +372,7 @@ fn lower_poly(device: &DeviceInstance) -> SpiceResult<DeviceInstance> {
             rhs: Box::new(rhs),
         })
     };
-    let mut sum = point(first)?;
+    let mut sum = first.expression();
     for coefficient in coefficients {
         coefficient_count += 1;
         let exponents = powers
@@ -835,7 +390,7 @@ fn lower_poly(device: &DeviceInstance) -> SpiceResult<DeviceInstance> {
         }
         let term = binary(
             BBinaryOp::Mul,
-            point(coefficient)?,
+            coefficient.expression(),
             product.ok_or_else(|| {
                 malformed(device, "POLY nonconstant term has no controlling factors")
             })?,
@@ -854,7 +409,7 @@ fn lower_poly(device: &DeviceInstance) -> SpiceResult<DeviceInstance> {
         kind: generated(sum, text, location),
         location: location.clone(),
     }];
-    parameters.extend(device.parameters.iter().filter(|p| p.name == "m").cloned());
+    parameters.extend_from_slice(form.setters);
     Ok(instance(
         format!("a$poly${}", device.name),
         'a',

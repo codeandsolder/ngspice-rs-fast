@@ -3,7 +3,7 @@
 //! opt-in `c_bsim3_device_reference` suite.
 use std::path::Path;
 
-use ngspice_rs::analysis::{Plot, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, RunConfig};
 use ngspice_rs::devices::{Circuit, ModelContext};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -23,12 +23,9 @@ fn circuit(body: &str) -> Circuit {
 fn operating(body: &str) -> Plot {
     let netlist = deck(&format!("{body}\n.op"));
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap()
+    request.run(&mut circuit, &config.context()).unwrap()
 }
 
 /// Bias of the fixed-point tests: C's bare BSIM3 default model is above
@@ -157,12 +154,9 @@ fn unported_analyses_refuse_instead_of_loading_zero() {
     let (analysis, reference) = (".sens v(d)", "cktsgen.c");
     let netlist = deck(&format!("{body}\n{analysis}"));
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    let error = runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap_err();
+    let error = request.run(&mut circuit, &config.context()).unwrap_err();
     assert!(
         matches!(error, SpiceError::NotYetPorted { .. }),
         "{analysis}: {error}"
@@ -176,12 +170,9 @@ fn unported_analyses_refuse_instead_of_loading_zero() {
              .model nn nmos level=8 capmod=1\n{analysis}"
         ));
         let config = RunConfig::from_netlist(&netlist).unwrap();
-        let request = config.request_for(&netlist.analyses[0]).unwrap();
+        let request = config.plan_for(&netlist.analyses[0]).unwrap();
         let mut circuit = config.circuit(&netlist).unwrap();
-        let error = runner(request.kind)
-            .unwrap()
-            .run(&mut circuit, &request, &config.context())
-            .unwrap_err();
+        let error = request.run(&mut circuit, &config.context()).unwrap_err();
         assert!(error.is_not_yet_ported(), "{analysis}: {error}");
         assert!(
             error.to_string().contains("capMod=1"),
@@ -233,12 +224,9 @@ const SMALL_SIGNAL: &str = "vin g 0 dc 1.2 ac 1\nvdd vdd 0 1.8\nvs s 0 0\n\
 fn op_asks() -> (f64, f64) {
     let netlist = deck(&format!("{SMALL_SIGNAL}\n.op"));
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut circuit, &config.context()).unwrap();
     let solution: Vec<f64> = circuit
         .nodes()
         .nodes()
@@ -269,12 +257,9 @@ fn transfer_function_matches_the_small_signal_conductances() {
 
     let netlist = deck(&format!("{SMALL_SIGNAL}\n.tf v(d) vin"));
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut circuit, &config.context()).unwrap();
     let gain = plot.value("v(Transfer_function)", 0).unwrap().re;
     let impedance = plot.value("v(output_impedance_at_V(d))", 0).unwrap().re;
     // `.tf` solves with the load matrix, which also carries the junction and
@@ -298,12 +283,9 @@ fn pole_zero_and_ac_agree_on_the_dominant_pole() {
 
     let netlist = deck(&format!("{SMALL_SIGNAL}\n.pz g 0 d 0 cur pol"));
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut circuit, &config.context()).unwrap();
     let pole = plot.value("v(pole(1))", 0).unwrap();
     assert!(
         (pole.re - expected_radians).abs() <= 1e-3 * expected_radians.abs(),
@@ -315,12 +297,9 @@ fn pole_zero_and_ac_agree_on_the_dominant_pole() {
     // small-signal expression `-gm / (1/rd + gds)`.
     let netlist = deck(&format!("{SMALL_SIGNAL}\n.ac dec 2 1 100meg"));
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut circuit, &config.context()).unwrap();
     let (gm, gds) = op_asks();
     let expected_gain = -gm / (1.0 / 10e3 + gds);
     let low = plot.value("v(d)", 0).unwrap();

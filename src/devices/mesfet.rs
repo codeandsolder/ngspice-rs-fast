@@ -389,14 +389,9 @@ impl Mesfet {
         // `inpgmod.c::create_model`: a `.model` setter that is not in the
         // model table but is a settable *instance* parameter becomes a
         // model-level instance default (`GENmodel.defaults`).
-        let (scalars, model_defaults) = schema::split_model_setters(
-            scalars,
-            &ScalarSchema { parameters: MODEL },
-            &ScalarSchema {
-                parameters: INSTANCE,
-            },
-        );
-        let m = ScalarSchema { parameters: MODEL }.validate(scalars, &resolved.card().location)?;
+        let (scalars, model_defaults) =
+            schema::split_model_setters(scalars, &MODEL_SCHEMA, &INSTANCE_SCHEMA);
+        let m = MODEL_SCHEMA.validate(scalars, &resolved.card().location)?;
         let r = |name: &str| jfet::required(&m, name);
         // MES_MOD_VTO has the IOP spelling `vt0` and the IOPR alias `vto`;
         // setters apply in card order, so the later one wins.
@@ -417,9 +412,7 @@ impl Mesfet {
             af: r("af")?,
         };
         let v = schema::with_defaults(
-            &ScalarSchema {
-                parameters: INSTANCE,
-            },
+            &INSTANCE_SCHEMA,
             &model_defaults,
             setters.iter(),
             &i.location,
@@ -1152,6 +1145,10 @@ impl Device for ResetMesfet {
         )
     }
 }
+
+static INSTANCE_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(INSTANCE);
+
+static MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(MODEL);
 
 #[cfg(test)]
 mod tests {

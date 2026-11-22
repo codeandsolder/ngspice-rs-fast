@@ -12,7 +12,7 @@
 //! overflows) are NaN here too. See `docs/port/SENSITIVITY.md`.
 use std::path::Path;
 
-use ngspice_rs::analysis::{Plot, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::SpiceResult;
@@ -40,9 +40,9 @@ const CARD: &str =
 fn run(text: &str) -> SpiceResult<Plot> {
     let netlist = Parser::new().parse_deck(&parse_deck_text(Path::new("bsim4.cir"), text))?;
     let config = RunConfig::from_netlist(&netlist)?;
-    let request = config.request_for(&netlist.analyses[0])?;
+    let request = config.plan_for(&netlist.analyses[0])?;
     let mut circuit = config.circuit(&netlist)?;
-    runner(request.kind)?.run(&mut circuit, &request, &config.context())
+    request.run(&mut circuit, &config.context())
 }
 
 /// C's zero columns are `-0.0` or `0.0` by its own operation order; the

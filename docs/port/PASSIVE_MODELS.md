@@ -178,7 +178,7 @@ let context = analysis::AnalysisContext {
 let mut circuit = devices::Circuit::from_netlist_with_context(
     &netlist, &context.model_context(),
 )?;
-let plot = analysis::runner(request.kind)?.run(&mut circuit, &request, &context)?;
+let plot = input.resolve()?.run(&mut circuit, &context)?;
 ```
 
 ## Explicit limits and verification

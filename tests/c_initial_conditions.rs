@@ -12,7 +12,7 @@
 //! `xtask::compare::TRAN`): two correct trap/Gear solutions of one circuit can
 //! legitimately differ by about the accuracy ngspice itself targets. The decks
 //! use `tmax = tau/100` so linear resampling adds far less than that.
-use ngspice_rs::analysis::{AnalysisContext, Plot, RawFile, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisContext, Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use std::fs;
@@ -73,11 +73,10 @@ fn run_rust(deck: &str) -> Plot {
         .parse_deck(&parse_deck_text(Path::new("c.cir"), deck))
         .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &AnalysisContext::default())
+    request
+        .run(&mut circuit, &AnalysisContext::default())
         .unwrap()
 }
 

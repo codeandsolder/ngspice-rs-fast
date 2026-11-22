@@ -112,10 +112,10 @@ fn scoped_cards_round_trip_and_expand_in_instance_order() {
             .all(|device| !device.nodes.iter().any(|node| node.ends_with(".rail")))
     );
     let config = RunConfig::from_netlist(&parsed.netlist).unwrap();
-    let request = config.request_for(&parsed.netlist.analyses[0]).unwrap();
-    assert_eq!(request.initial_conditions.len(), 2);
-    assert_eq!(request.initial_conditions[0].node, "x1.local");
-    assert_eq!(request.nodesets.len(), 2);
+    let request = config.plan_for(&parsed.netlist.analyses[0]).unwrap();
+    assert_eq!(request.initial_conditions().len(), 2);
+    assert_eq!(request.initial_conditions()[0].node, "x1.local");
+    assert_eq!(request.nodesets().len(), 2);
 }
 
 #[test]

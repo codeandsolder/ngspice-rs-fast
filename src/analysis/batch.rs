@@ -43,7 +43,7 @@
 //!   plots that succeeded; the port's callers publish nothing when any analysis
 //!   fails.
 
-use crate::netlist::ast::{AnalysisCard, FourierCard, MeasureCard, OutputCards, VectorRequest};
+use crate::netlist::ast::{FourierCard, MeasureCard, OutputCards, VectorRequest};
 use crate::primitives::{AnalysisKind, SpiceError, SpiceResult};
 
 use crate::analysis::fourier::{self, FourierAnalysis};
@@ -71,11 +71,12 @@ pub struct ScheduledAnalysis {
     /// The names of the further plots this card produces after
     /// [`Self::plot_name`], in order: `.noise` writes its `Integrated Noise`
     /// plot as a second plot (`noise2` after `noise1`) unless its sweep is a
-    /// single frequency ([`crate::analysis::noise::plot_count`]); `.disto`
+    /// single frequency ([`crate::analysis::AnalysisPlan::plot_count`]); `.disto`
     /// writes its 3rd-harmonic plot after the 2nd, or its `f1-f2` and
-    /// `2f1-f2` products after `f1+f2` ([`crate::analysis::disto::plot_count`]).
+    /// `2f1-f2` products after `f1+f2` ([`crate::analysis::AnalysisPlan::plot_count`]).
     /// Empty for every other analysis.
     pub extra_plot_names: Vec<String>,
+    retain_bias: bool,
 }
 
 impl ScheduledAnalysis {
@@ -130,21 +131,17 @@ pub const fn plot_abbreviation(kind: AnalysisKind) -> &'static str {
     }
 }
 
-/// The deck's analysis cards in batch execution order, with C's plot names.
+/// Resolved analyses in batch execution order, with C's plot names.
 ///
 /// See the module documentation for the rules. An empty list schedules
 /// nothing; whether that is an error is the caller's decision.
 #[must_use]
-pub fn schedule(cards: &[AnalysisCard]) -> Vec<ScheduledAnalysis> {
-    schedule_with_bias(cards, false)
-}
-
-fn schedule_with_bias(cards: &[AnalysisCard], keep_op_info: bool) -> Vec<ScheduledAnalysis> {
-    let mut order: Vec<usize> = (0..cards.len()).collect();
+pub fn schedule(plans: &[crate::analysis::AnalysisPlan]) -> Vec<ScheduledAnalysis> {
+    let mut order: Vec<usize> = (0..plans.len()).collect();
     // Same type: reverse deck order (the job list is built by prepending).
     order.sort_by(|&a, &b| {
-        job_order(cards[a].kind)
-            .cmp(&job_order(cards[b].kind))
+        job_order(plans[a].kind())
+            .cmp(&job_order(plans[b].kind()))
             .then(b.cmp(&a))
     });
     // Generated names are lowercase; membership need not scan all prior plots.
@@ -153,28 +150,13 @@ fn schedule_with_bias(cards: &[AnalysisCard], keep_op_info: bool) -> Vec<Schedul
     let mut scheduled: Vec<ScheduledAnalysis> = order
         .iter()
         .map(|&card_index| {
-            let kind = cards[card_index].kind;
+            let plan = &plans[card_index];
+            let kind = plan.kind();
             let abbreviation = plot_abbreviation(kind);
-            let count = match kind {
-                AnalysisKind::Noise => {
-                    crate::analysis::noise::plot_count(&cards[card_index].arguments)
-                }
-                AnalysisKind::Distortion => {
-                    crate::analysis::disto::plot_count(&cards[card_index].arguments)
-                }
-                _ => 1,
-            };
-            let bias = keep_op_info
-                && matches!(
-                    kind,
-                    AnalysisKind::Ac
-                        | AnalysisKind::Noise
-                        | AnalysisKind::SParameter
-                        | AnalysisKind::Distortion
-                        | AnalysisKind::PoleZero
-                );
-            let mut own = Vec::with_capacity(count + usize::from(bias));
-            for index in 0..count + usize::from(bias) {
+            let count = plan.plot_count();
+            let bias = plan.retains_bias();
+            let mut own = Vec::with_capacity(count);
+            for index in 0..count {
                 let abbreviation = if bias && index == 0 {
                     "op"
                 } else {
@@ -195,6 +177,7 @@ fn schedule_with_bias(cards: &[AnalysisCard], keep_op_info: bool) -> Vec<Schedul
                 plot_name,
                 last_of_kind: false,
                 extra_plot_names: own,
+                retain_bias: bias,
             }
         })
         .collect();
@@ -206,26 +189,6 @@ fn schedule_with_bias(cards: &[AnalysisCard], keep_op_info: bool) -> Vec<Schedul
             .is_none_or(|later| later.kind != kind);
     }
     scheduled
-}
-
-/// Schedules evaluated analysis cards, so expression-valued noise bounds
-/// determine the same plot count as the driver (C `noisean.c`).
-///
-/// # Errors
-/// Returns errors from evaluating card arguments and applying deck options.
-pub fn schedule_evaluated(
-    cards: &[AnalysisCard],
-    config: &crate::analysis::RunConfig,
-) -> SpiceResult<Vec<ScheduledAnalysis>> {
-    let mut evaluated = cards.to_vec();
-    let mut keep_op_info = false;
-    for card in &mut evaluated {
-        let request = config.request_for(card)?;
-        keep_op_info = request.keep_op_info;
-        card.arguments = request.arguments;
-        card.expressions.clear();
-    }
-    Ok(schedule_with_bias(&evaluated, keep_op_info))
 }
 
 /// Checks, before anything runs, that every `.print`, `.measure` and `.four`
@@ -338,90 +301,140 @@ pub struct PlotOutputs {
     pub fourier: Vec<FourierAnalysis>,
 }
 
-/// Resolves the output cards that apply to one scheduled plot.
-///
-/// * the written selection is every `.save` request plus the `.print` requests
-///   naming this plot's type (an empty set keeps the whole plot), through
-///   [`Selection::resolve`];
-/// * the `.print` table, through [`Selection::to_text`], when any `.print` card
-///   names this type (every plot of that type gets its own table);
-/// * the `.measure` cards of this type and, for `.tran`, the `.four` cards,
-///   only when this is the last executed plot of its type.
-///
-/// Everything is resolved against the **full** `plot`, so a measured or
-/// transformed operand the selection dropped stays available.
-///
-/// # Errors
-///
-/// Whatever [`Selection::resolve`], [`measure::resolve`] or
-/// [`fourier::resolve`] report for this plot.
-pub fn resolve_outputs(
-    plot: Plot,
-    scheduled: &ScheduledAnalysis,
-    output: &OutputCards,
-    measures: &[MeasureCard],
-    fourier_cards: &[FourierCard],
-) -> SpiceResult<PlotOutputs> {
-    resolve_outputs_with_scope(
-        plot,
-        scheduled,
-        output,
-        measures,
-        fourier_cards,
-        &crate::netlist::eval::ParamScope::root(&[])?,
-        None,
-    )
+/// Identity and consumers of one scheduled plot, independent of its header
+/// spelling, solver and storage representation.
+pub struct PlannedOutput<'a> {
+    /// Batch-allocated name in C plot order.
+    pub name: &'a str,
+    /// Analysis that produced this plot (including its optional bias).
+    pub kind: AnalysisKind,
+    selection_kind: AnalysisKind,
+    routed: RoutedOutputs<'a>,
+    measurements: Vec<&'a MeasureCard>,
+    fourier: &'a [FourierCard],
 }
 
-/// Resolves outputs with the deck parameter scope for scalar measurements.
+impl PlannedOutput<'_> {
+    /// Whether a consumer requires the full plot after the last row.
+    #[must_use]
+    pub fn requires_retention(&self) -> bool {
+        self.routed
+            .prints
+            .iter()
+            .any(|print| !print.requests.is_empty())
+            || !self.measurements.is_empty()
+            || !self.fourier.is_empty()
+    }
+
+    /// Bind the rawfile output selection to the driver's schema.
+    ///
+    /// # Errors
+    /// An unknown vector or an invalid component request.
+    pub fn selection(&self, header: &Plot) -> SpiceResult<Selection> {
+        Selection::resolve_refs(header, self.selection_kind, self.routed.write_requests())
+    }
+}
+
+/// Resolve the consumers for every scheduled output before executing a job.
+///
+/// Bias plots take only .save, noise totals route to the integrated result,
+/// and measurement/Fourier selection preserves the last-of-kind policy.
 ///
 /// # Errors
-/// As [`resolve_outputs`], including scalar expression evaluation errors.
-pub fn resolve_outputs_with_scope(
+/// A total-noise vector requested from a single-frequency noise analysis.
+pub fn plan_outputs<'a>(
+    scheduled: &'a ScheduledAnalysis,
+    output: &'a OutputCards,
+    measures: &'a [MeasureCard],
+    fourier_cards: &'a [FourierCard],
+) -> SpiceResult<Vec<PlannedOutput<'a>>> {
+    let kind = scheduled.kind;
+    let has_integrated = kind == AnalysisKind::Noise
+        && scheduled.plot_names().count() - usize::from(scheduled.retain_bias) > 1;
+    scheduled
+        .plot_names()
+        .enumerate()
+        .map(|(index, name)| {
+            let bias = scheduled.retain_bias && index == 0;
+            let integrated = has_integrated && index > usize::from(scheduled.retain_bias);
+            let routed = if bias {
+                RoutedOutputs {
+                    saves: output
+                        .saves
+                        .iter()
+                        .flat_map(|save| &save.requests)
+                        .collect(),
+                    prints: Vec::new(),
+                }
+            } else {
+                own_cards(kind, integrated, has_integrated, output)?
+            };
+            let measurements = if !bias && scheduled.last_of_kind {
+                measures
+                    .iter()
+                    .filter(|card| card.analysis == kind)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let fourier = if !bias && scheduled.last_of_kind && kind == AnalysisKind::Transient {
+                fourier_cards
+            } else {
+                &[]
+            };
+            Ok(PlannedOutput {
+                name,
+                kind,
+                selection_kind: if bias {
+                    AnalysisKind::OperatingPoint
+                } else {
+                    kind
+                },
+                routed,
+                measurements,
+                fourier,
+            })
+        })
+        .collect()
+}
+
+/// Execute the retained consumers and transfer the written plot's ownership.
+/// All reports see the original full plot before projection consumes it.
+///
+/// # Errors
+/// Any invalid selection, measurement or Fourier request.
+pub fn resolve_outputs(
     plot: Plot,
-    scheduled: &ScheduledAnalysis,
-    output: &OutputCards,
-    measures: &[MeasureCard],
-    fourier_cards: &[FourierCard],
+    planned: &PlannedOutput<'_>,
     scope: &crate::netlist::eval::ParamScope,
     fourier_settings: Option<fourier::FourierSettings>,
 ) -> SpiceResult<PlotOutputs> {
-    let kind = scheduled.kind;
-    if is_operating_point_prelude(&plot) {
-        return Ok(PlotOutputs {
-            written: written_selection(&plot, scheduled, output)?.into_plot(plot)?,
-            printed: None,
-            measurements: Vec::new(),
-            fourier: Vec::new(),
-        });
-    }
-    let own = own_cards(&plot, scheduled, output)?;
-    let selection = Selection::resolve_refs(&plot, kind, own.write_requests())?;
-    let mut print_requests = own.print_requests().peekable();
+    let kind = planned.selection_kind;
+    let selection = planned.selection(&plot)?;
+    let mut print_requests = planned.routed.print_requests().peekable();
     let mut printed = if print_requests.peek().is_none() {
         None
     } else {
         Some(Selection::resolve_refs(&plot, kind, print_requests)?.to_text(&plot)?)
     };
-    for card in own
+    for card in planned
+        .routed
         .prints
         .iter()
         .filter(|card| card.ascii_plot && !card.requests.is_empty())
     {
-        let selected =
-            Selection::resolve_refs(&plot, kind, card.requests.iter().copied())?.apply(&plot)?;
-        printed
-            .get_or_insert_with(String::new)
-            .push_str(&super::asciiplot::render(&selected)?);
+        let projected = Selection::resolve_refs(&plot, kind, card.requests.iter().copied())?;
+        let text = if projected.is_full() {
+            super::asciiplot::render(&plot)?
+        } else {
+            super::asciiplot::render(&projected.apply(&plot)?)?
+        };
+        printed.get_or_insert_with(String::new).push_str(&text);
     }
-    let measurements = if scheduled.last_of_kind {
-        let own = measures.iter().filter(|card| card.analysis == kind);
-        measure::resolve_refs_with_scope(&plot, kind, own, scope)?
-    } else {
-        Vec::new()
-    };
+    let measurements =
+        measure::resolve_refs_with_scope(&plot, kind, planned.measurements.iter().copied(), scope)?;
     let (written, fourier) =
-        finish_projection(plot, selection, scheduled, fourier_cards, fourier_settings)?;
+        finish_projection(plot, selection, kind, planned.fourier, fourier_settings)?;
     Ok(PlotOutputs {
         written,
         printed,
@@ -430,92 +443,29 @@ pub fn resolve_outputs_with_scope(
     })
 }
 
-// The configured Fourier path historically projected the output before
-// evaluating Fourier settings. Keep that error order for narrowed output;
-// an identity projection cannot fail after its own schema was resolved.
+// Preserve the configured Fourier path's projection-before-transform error
+// order when narrowing. Full selection transfers the original allocation.
 fn finish_projection(
     plot: Plot,
     selection: Selection,
-    scheduled: &ScheduledAnalysis,
+    kind: AnalysisKind,
     cards: &[FourierCard],
     settings: Option<fourier::FourierSettings>,
 ) -> SpiceResult<(Plot, Vec<FourierAnalysis>)> {
-    if !scheduled.last_of_kind || scheduled.kind != AnalysisKind::Transient {
+    if cards.is_empty() {
         return Ok((selection.into_plot(plot)?, Vec::new()));
     }
     if let Some(settings) = settings {
         if !selection.is_full() {
             let written = selection.apply(&plot)?;
-            let fourier = fourier::resolve_with_settings(&plot, scheduled.kind, cards, settings)?;
+            let fourier = fourier::resolve_with_settings(&plot, kind, cards, settings)?;
             return Ok((written, fourier));
         }
-        let fourier = fourier::resolve_with_settings(&plot, scheduled.kind, cards, settings)?;
+        let fourier = fourier::resolve_with_settings(&plot, kind, cards, settings)?;
         return Ok((selection.into_plot(plot)?, fourier));
     }
-    let fourier = fourier::resolve(&plot, scheduled.kind, cards)?;
+    let fourier = fourier::resolve(&plot, kind, cards)?;
     Ok((selection.into_plot(plot)?, fourier))
-}
-
-/// The `.save`/`.print` selection one scheduled plot is written with: the
-/// selection [`resolve_outputs`] applies to make [`PlotOutputs::written`].
-///
-/// It depends only on the plot's variables, so the points-free header a
-/// [`crate::analysis::PointSink`] receives resolves to the same selection as
-/// the full plot.
-///
-/// # Errors
-///
-/// As [`Selection::resolve`], and for a `.noise` total that a single-frequency
-/// run cannot produce.
-pub fn written_selection(
-    plot: &Plot,
-    scheduled: &ScheduledAnalysis,
-    output: &OutputCards,
-) -> SpiceResult<Selection> {
-    if is_operating_point_prelude(plot) {
-        let kind = AnalysisKind::OperatingPoint;
-        return Selection::resolve_refs(
-            plot,
-            kind,
-            output.saves.iter().flat_map(|save| &save.requests),
-        );
-    }
-    let kind = scheduled.kind;
-    let own = own_cards(plot, scheduled, output)?;
-    Selection::resolve_refs(plot, kind, own.write_requests())
-}
-
-/// Whether a scheduled plot must be retained for later output processing.
-///
-/// Whether [`resolve_outputs`] reads more of this scheduled plot than its
-/// written selection: a `.print` card of its type (a table or an ASCII plot),
-/// or, on the last plot of its type, a `.measure` card of its type or a
-/// `.four` card for `.tran`.
-///
-/// When it does not, the plot's points are only ever written, so a caller may
-/// stream them into the rawfile through [`written_selection`] instead of
-/// storing the whole plot, as C's batch output does.
-#[must_use]
-pub fn needs_full_plot(
-    scheduled: &ScheduledAnalysis,
-    output: &OutputCards,
-    measures: &[MeasureCard],
-    fourier_cards: &[FourierCard],
-) -> bool {
-    let kind = scheduled.kind;
-    output.prints.iter().any(|card| card.analysis == kind)
-        || (scheduled.last_of_kind
-            && (measures.iter().any(|card| card.analysis == kind)
-                || (kind == AnalysisKind::Transient && !fourier_cards.is_empty())))
-}
-
-/// The bias plot `.option keepopinfo` adds before a small-signal sweep; only
-/// the deck's `.save` cards apply to it.
-fn is_operating_point_prelude(plot: &Plot) -> bool {
-    matches!(
-        plot.plotname.as_str(),
-        "AC Operating Point" | "NOISE Operating Point" | "Distortion Operating Point"
-    )
 }
 
 /// A borrowed per-plot routing plan. The AST owns location/name strings;
@@ -552,17 +502,11 @@ impl<'a> RoutedOutputs<'a> {
 /// plot can satisfy. Preserve source order and report invalid totals even when
 /// the current plot is the spectrum.
 fn own_cards<'a>(
-    plot: &Plot,
-    scheduled: &ScheduledAnalysis,
+    kind: AnalysisKind,
+    integrated: bool,
+    has_integrated: bool,
     output: &'a OutputCards,
 ) -> SpiceResult<RoutedOutputs<'a>> {
-    let kind = scheduled.kind;
-    let integrated = plot.plotname.starts_with("Integrated Noise");
-    let has_integrated = scheduled
-        .plot_names()
-        .filter(|name| name.starts_with("noise"))
-        .count()
-        > 1;
     let applicable = |request: &VectorRequest| -> SpiceResult<bool> {
         if kind != AnalysisKind::Noise
             || matches!(request.vector, crate::netlist::ast::RequestedVector::All)
@@ -617,7 +561,15 @@ mod tests {
     fn card(kind: AnalysisKind, line: u32) -> AnalysisCard {
         AnalysisCard {
             kind,
-            arguments: Vec::new(),
+            arguments: match kind {
+                AnalysisKind::Ac => "lin 3 1 3",
+                AnalysisKind::DcSweep => "v1 0 1 0.1",
+                AnalysisKind::Transient => "1u 10u",
+                _ => "",
+            }
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
             expressions: Vec::new(),
             uic: false,
             uic_location: None,
@@ -625,8 +577,14 @@ mod tests {
         }
     }
 
+    fn plans(cards: &[AnalysisCard]) -> Vec<crate::analysis::AnalysisPlan> {
+        crate::analysis::RunConfig::default()
+            .plans_for(cards)
+            .unwrap()
+    }
+
     fn names(cards: &[AnalysisCard]) -> Vec<(usize, String, bool)> {
-        schedule(cards)
+        schedule(&plans(cards))
             .into_iter()
             .map(|entry| (entry.card_index, entry.plot_name, entry.last_of_kind))
             .collect()
@@ -701,7 +659,7 @@ mod tests {
             card(AnalysisKind::OperatingPoint, 3),
             noise(4, "v ( out ) v1 lin 1 10k 20k 1"),
         ];
-        let entries = schedule(&cards);
+        let entries = schedule(&plans(&cards));
         let names: Vec<Vec<&str>> = entries
             .iter()
             .map(|entry| entry.plot_names().collect())
@@ -728,7 +686,7 @@ mod tests {
             disto(3, "dec 2 1k 100k 0.9"),
             card(AnalysisKind::Ac, 4),
         ];
-        let names: Vec<Vec<String>> = schedule(&cards)
+        let names: Vec<Vec<String>> = schedule(&plans(&cards))
             .iter()
             .map(|entry| entry.plot_names().map(str::to_owned).collect())
             .collect();
@@ -740,6 +698,89 @@ mod tests {
                 vec!["disto4", "disto5"]
             ]
         );
+    }
+
+    #[test]
+    fn consumers_are_planned_per_output_identity() {
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use std::path::Path;
+        let parsed = Parser::new().parse_deck_with_output(&parse_deck_text(
+            Path::new("outputs.cir"),
+            "outputs\nv1 in 0 dc 1 ac 1\nr1 in out 1k\nr2 out 0 1k\n.options keepopinfo\n.ac dec 3 1 100\n.tran 1u 10u\n.tran 1u 20u\n.noise v(out) v1 lin 4 1 4\n.print ac all\n.print noise onoise_spectrum\n.measure tran top max v(out)\n.end\n",
+        )).unwrap();
+        let config = crate::analysis::RunConfig::from_netlist(&parsed.netlist).unwrap();
+        let schedule = schedule(&config.plans_for(&parsed.netlist.analyses).unwrap());
+        let outputs: Vec<_> = schedule
+            .iter()
+            .flat_map(|entry| {
+                super::plan_outputs(entry, &parsed.output, &parsed.measurements, &parsed.fourier)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|plan| plan.requires_retention())
+                .collect::<Vec<_>>(),
+            [false, true, false, true, false, true, false]
+        );
+        assert_eq!(outputs[0].selection_kind, AnalysisKind::OperatingPoint);
+        assert_eq!(outputs[4].selection_kind, AnalysisKind::OperatingPoint);
+        assert_eq!(outputs[5].kind, AnalysisKind::Noise);
+        assert_eq!(outputs[5].routed.print_requests().count(), 1);
+        assert_eq!(outputs[6].routed.print_requests().count(), 0);
+    }
+
+    #[test]
+    fn full_retained_selection_moves_the_original_rows_after_printing() {
+        use crate::analysis::{Plot, PlotFlags, Variable};
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use crate::primitives::Complex;
+        use std::path::Path;
+        let parsed = Parser::new()
+            .parse_deck_with_output(&parse_deck_text(
+                Path::new("retained.cir"),
+                "retained\nv1 in 0 1\nr1 in 0 1k\n.op\n.print op all\n.end\n",
+            ))
+            .unwrap();
+        let config = crate::analysis::RunConfig::from_netlist(&parsed.netlist).unwrap();
+        let schedule = schedule(&config.plans_for(&parsed.netlist.analyses).unwrap());
+        let plans = super::plan_outputs(&schedule[0], &parsed.output, &[], &[]).unwrap();
+        assert!(plans[0].requires_retention());
+        let mut plot = Plot::new(
+            "op1",
+            "Operating Point",
+            PlotFlags::Real,
+            vec![Variable::new("v(in)", "voltage")],
+        );
+        let data = vec![Complex::real(1.)];
+        let row = data.as_ptr();
+        plot.push_point(data).unwrap();
+        let scope = crate::netlist::eval::ParamScope::root(&[]).unwrap();
+        let outputs = super::resolve_outputs(plot, &plans[0], &scope, None).unwrap();
+        assert!(outputs.printed.unwrap().contains("v(in)"));
+        assert_eq!(outputs.written.points()[0].as_ptr(), row);
+    }
+
+    #[test]
+    fn singleton_noise_rejects_integrated_consumers_before_rows() {
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use std::path::Path;
+        let parsed = Parser::new().parse_deck_with_output(&parse_deck_text(
+            Path::new("single.cir"),
+            "singleton\nv1 in 0 ac 1\nr1 in out 1k\nr2 out 0 1k\n.options keepopinfo\n.noise v(out) v1 lin 1 1 1\n.print noise v(onoise_total)\n.end\n",
+        )).unwrap();
+        let config = crate::analysis::RunConfig::from_netlist(&parsed.netlist).unwrap();
+        let schedule = schedule(&config.plans_for(&parsed.netlist.analyses).unwrap());
+        let Err(error) = super::plan_outputs(
+            &schedule[0],
+            &parsed.output,
+            &parsed.measurements,
+            &parsed.fourier,
+        ) else {
+            panic!("accepted integrated noise consumer for a singleton")
+        };
+        assert!(error.to_string().contains("single-frequency"), "{error}");
     }
 
     #[test]

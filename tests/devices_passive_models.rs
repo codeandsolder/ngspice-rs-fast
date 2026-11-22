@@ -508,7 +508,7 @@ fn fixed_passive_batches_match_unbound_stamps() {
                 history: &history,
                 forcing: None,
             },
-            &mut circuit.new_matrix(),
+            &mut circuit.new_matrix().unwrap(),
             &mut Vector::zeros(n),
             &mut initial,
         )
@@ -533,7 +533,7 @@ fn fixed_passive_batches_match_unbound_stamps() {
             forcing: None,
         };
         let mut reference = SparseMatrix::new(n, n);
-        let mut bound = circuit.new_matrix();
+        let mut bound = circuit.new_matrix().unwrap();
         let (mut ra, mut rb) = (Vector::zeros(n), Vector::zeros(n));
         let (mut ta, mut tb) = (history.trial(), history.trial());
         circuit

@@ -1,5 +1,5 @@
 //! Opt-in live C validation. `NGSPICE_BIN` must name the external reference binary.
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, RawFile, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, RawFile};
 use ngspice_rs::devices::{Circuit, IndependentSource, Waveform};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -42,13 +42,11 @@ fn compare_with_c(
     c.devices_mut()[0] = Box::new(
         IndependentSource::new("v1", nodes, true, 0., Complex::ZERO, rust_waveform).unwrap(),
     );
-    let request = AnalysisRequest::with_arguments(
-        AnalysisKind::Transient,
-        ["0.0001", "0.006", "0", "0.00005"],
-    );
-    let got = runner(request.kind)
-        .unwrap()
-        .run(&mut c, &request, &AnalysisContext::default())
+    let request =
+        AnalysisInput::with_arguments(AnalysisKind::Transient, ["0.0001", "0.006", "0", "0.00005"]);
+    let got = request
+        .resolve()
+        .and_then(|plan| plan.run(&mut c, &AnalysisContext::default()))
         .unwrap();
     let c_body = body.replacen("v1 in 0 0", &format!("v1 in 0 {c_source}"), 1);
     fs::write(
@@ -96,7 +94,15 @@ fn compare_with_c(
 fn ramp() -> (&'static str, Waveform) {
     (
         "PWL(0 0 1m 0 1.01m 1 6m 1)",
-        Waveform::Pwl(vec![(0., 0.), (0.001, 0.), (0.00101, 1.), (0.006, 1.)]),
+        Waveform::Pwl(
+            ngspice_rs::devices::PwlSource::plain(vec![
+                (0., 0.),
+                (0.001, 0.),
+                (0.00101, 1.),
+                (0.006, 1.),
+            ])
+            .unwrap(),
+        ),
     )
 }
 

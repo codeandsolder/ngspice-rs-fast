@@ -6,7 +6,10 @@
 //! [`Device`] descriptor: its generated tables, the diagnostic reference, the
 //! IC component order and its own model-level real conversion
 //! (`*mpar.c` TNOM/doping thresholds).
-use crate::devices::schema::{ScalarUnit, finite_literal};
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+
+use crate::devices::schema::{ScalarUnit, ascii_key, finite_literal};
 use crate::netlist::ast::{ParameterAssignment, ParameterKind};
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
@@ -18,9 +21,9 @@ pub(super) struct Device {
     /// Diagnostic reference for the C setter file, e.g. `bsim3/b3.c`.
     pub(crate) reference: &'static str,
     /// Generated model table, in C order.
-    pub(crate) model: &'static [Parameter],
+    pub(super) model: ParameterTable,
     /// Generated instance table, in C order.
-    pub(crate) instance: &'static [Parameter],
+    pub(super) instance: ParameterTable,
     /// `TABLE:keyword` rows C marks `IF_UNINTERESTING`.
     pub(crate) uninteresting: &'static [&'static str],
     /// The IC vector's component keywords, in C's fallthrough order.
@@ -40,6 +43,33 @@ impl std::fmt::Debug for Device {
 impl PartialEq for Device {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self, other)
+    }
+}
+
+/// Compiled lookup over a generated table, retaining first descriptor and
+/// original alias spelling. Each static device owns its two table indexes.
+pub(super) struct ParameterTable {
+    definitions: &'static [Parameter],
+    names: OnceLock<HashMap<&'static str, &'static Parameter>>,
+}
+
+impl ParameterTable {
+    pub(super) const fn new(definitions: &'static [Parameter]) -> Self {
+        Self {
+            definitions,
+            names: OnceLock::new(),
+        }
+    }
+
+    pub(super) fn get(&self, name: &str) -> Option<&'static Parameter> {
+        let names = self.names.get_or_init(|| {
+            let mut names = HashMap::with_capacity(self.definitions.len());
+            for definition in self.definitions {
+                names.entry(definition.name).or_insert(definition);
+            }
+            names
+        });
+        names.get(ascii_key(name).as_ref()).copied()
     }
 }
 
@@ -213,43 +243,52 @@ pub struct AppliedParameter {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Inputs {
     device: &'static Device,
-    table: &'static [Parameter],
     is_model: bool,
-    applied: Vec<AppliedParameter>,
+    applied: Arc<AppliedSetters>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+struct AppliedSetters {
+    ordered: Vec<AppliedParameter>,
+    last: HashMap<u16, usize>,
 }
 
 impl Inputs {
-    pub(super) const fn new(device: &'static Device, is_model: bool) -> Self {
+    pub(super) fn new(device: &'static Device, is_model: bool) -> Self {
         Self {
             device,
-            table: if is_model {
-                device.model
-            } else {
-                device.instance
-            },
             is_model,
-            applied: Vec::new(),
+            applied: Arc::default(),
         }
     }
+
+    const fn table(&self) -> &ParameterTable {
+        if self.is_model {
+            &self.device.model
+        } else {
+            &self.device.instance
+        }
+    }
+
     /// Every applied setter, in application order; IC is expanded in C's
     /// VBS/VGS/VDS fallthrough order. This does not rewrite the source AST.
     #[must_use]
     pub fn applied(&self) -> &[AppliedParameter] {
-        &self.applied
+        &self.applied.ordered
     }
     /// Last setter for a keyword or any alias of its C parameter ID.
     /// `None` means ungiven, not a default or a simulated ask value.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&AppliedParameter> {
-        let id = descriptor(self.table, name)?.id;
-        self.applied
-            .iter()
-            .rev()
-            .find(|value| value.parameter.id == id)
+        let id = self.table().get(name)?.id;
+        let index = *self.applied.last.get(&id)?;
+        self.applied.ordered.get(index)
     }
 
     pub(crate) fn apply(&mut self, p: &ParameterAssignment, scale: Real) -> SpiceResult<()> {
-        let descriptor = descriptor(self.table, &p.name)
+        let descriptor = self
+            .table()
+            .get(&p.name)
             .ok_or_else(|| unsupported_setter(p, "unknown setter", self.device.reference))?;
         if descriptor.access == Access::Output {
             return Err(unsupported_setter(
@@ -331,7 +370,9 @@ impl Inputs {
                 ));
             }
         };
-        self.applied.push(AppliedParameter {
+        let applied = Arc::make_mut(&mut self.applied);
+        applied.last.insert(descriptor.id, applied.ordered.len());
+        applied.ordered.push(AppliedParameter {
             parameter: descriptor,
             value,
             location: p.location.clone(),
@@ -340,11 +381,6 @@ impl Inputs {
     }
 }
 
-pub(super) fn descriptor(table: &'static [Parameter], name: &str) -> Option<&'static Parameter> {
-    table
-        .iter()
-        .find(|parameter| parameter.name.eq_ignore_ascii_case(name))
-}
 fn unsupported_setter(p: &ParameterAssignment, what: &str, reference: &str) -> SpiceError {
     SpiceError::Unsupported {
         feature: format!("{what}: '{}' ({reference})", p.name),
@@ -373,4 +409,32 @@ pub(super) fn version_text(p: &ParameterAssignment) -> SpiceResult<&str> {
         finite_literal(p)?;
     }
     Ok(&p.value)
+}
+
+#[cfg(test)]
+mod indexed_tests {
+
+    #[test]
+    fn generated_indexes_match_first_linear_keyword_and_alias() {
+        for device in [
+            &crate::devices::bsim3::DEVICE,
+            &crate::devices::bsim4::DEVICE,
+        ] {
+            for table in [&device.model, &device.instance] {
+                for parameter in table.definitions {
+                    let expected = table
+                        .definitions
+                        .iter()
+                        .find(|p| p.name.eq_ignore_ascii_case(parameter.name))
+                        .unwrap();
+                    assert!(std::ptr::eq(table.get(parameter.name).unwrap(), expected));
+                    assert!(std::ptr::eq(
+                        table.get(&parameter.name.to_ascii_uppercase()).unwrap(),
+                        expected
+                    ));
+                }
+                assert!(table.get("not-a-parameter").is_none());
+            }
+        }
+    }
 }

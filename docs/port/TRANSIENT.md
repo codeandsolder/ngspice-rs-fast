@@ -406,11 +406,13 @@ comparator does. The simulation always starts at `t = 0`; `tstart` only
 suppresses earlier rows.
 
 The rows need not be stored. `companion_transient_into` (and
-`Analysis::run_into`) hands each row to a `PointSink` as it is accepted, the
-same rows in the same order, after announcing the plot's variables before the
-initial operating point; `spice-rs simulate` uses it to stream a `.tran` plot
-straight into the rawfile, as C's `CKTdump`/`OUTpData` do, whenever no
-`.print`, `.measure` or `.four` card needs the whole plot.
+`AnalysisPlan::run_into`) hands each row by ownership to a `PointSink` as
+it is accepted, after announcing the plot header before the initial
+operating point, and signals completion before recording final load state.
+The collecting adapter and rawfile spool share this single driver path.
+`spice-rs simulate` chooses the consumer for each scheduled plot, as C's
+`CKTdump`/`OUTpData` do, whenever no print, measurement or Fourier consumer
+needs the whole plot.
 
 ## Measured accuracy (physical-error limits)
 

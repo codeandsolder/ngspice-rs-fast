@@ -452,28 +452,26 @@ fn context_and_typed_schema_misuse_fail_explicitly() {
 #[test]
 fn scalar_schema_extension_retains_units_last_set_sources_and_defaults() {
     let n = deck("d1 a 0 mdl\n.model mdl d(is=1e-14 is=2e-14)");
-    let schema = ScalarSchema {
-        parameters: &[
-            ScalarParameter {
-                name: "is",
-                unit: ScalarUnit::Ampere,
-                domain: ScalarDomain::Positive,
-                default: Some(3e-14),
-            },
-            ScalarParameter {
-                name: "rs",
-                unit: ScalarUnit::Ohm,
-                domain: ScalarDomain::NonNegative,
-                default: Some(0.0),
-            },
-            ScalarParameter {
-                name: "optional",
-                unit: ScalarUnit::Dimensionless,
-                domain: ScalarDomain::Finite,
-                default: None,
-            },
-        ],
-    };
+    let schema = ScalarSchema::new(&[
+        ScalarParameter {
+            name: "is",
+            unit: ScalarUnit::Ampere,
+            domain: ScalarDomain::Positive,
+            default: Some(3e-14),
+        },
+        ScalarParameter {
+            name: "rs",
+            unit: ScalarUnit::Ohm,
+            domain: ScalarDomain::NonNegative,
+            default: Some(0.0),
+        },
+        ScalarParameter {
+            name: "optional",
+            unit: ScalarUnit::Dimensionless,
+            domain: ScalarDomain::Finite,
+            default: None,
+        },
+    ]);
     let values = schema
         .validate(&n.models[0].parameters, &n.models[0].location)
         .unwrap();
@@ -485,7 +483,7 @@ fn scalar_schema_extension_retains_units_last_set_sources_and_defaults() {
     );
     assert!(values.get("rs").unwrap().location.is_none());
     assert!(values.get("optional").is_none());
-    let parameter = schema.parameters[0];
+    let parameter = schema.parameters()[0];
     for definitions in [
         vec![parameter, parameter],
         vec![ScalarParameter {
@@ -506,11 +504,9 @@ fn scalar_schema_extension_retains_units_last_set_sources_and_defaults() {
         }],
     ] {
         assert!(
-            ScalarSchema {
-                parameters: &definitions
-            }
-            .validate([], &n.location)
-            .is_err()
+            ScalarSchema::new(&definitions)
+                .validate([], &n.location)
+                .is_err()
         );
     }
 }
@@ -647,12 +643,9 @@ fn a_model_card_can_carry_instance_defaults() {
     let currents = |name: &str, body: &str| -> f64 {
         let deck = deck(body);
         let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck).unwrap();
-        let request = config.request_for(&deck.analyses[0]).unwrap();
+        let request = config.plan_for(&deck.analyses[0]).unwrap();
         let mut circuit = config.circuit(&deck).unwrap();
-        let plot = ngspice_rs::analysis::runner(request.kind)
-            .unwrap()
-            .run(&mut circuit, &request, &config.context())
-            .unwrap();
+        let plot = request.run(&mut circuit, &config.context()).unwrap();
         plot.value(name, 0).unwrap().re
     };
     let mesa = |model: &str, instance: &str| {

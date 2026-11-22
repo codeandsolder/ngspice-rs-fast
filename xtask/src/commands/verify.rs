@@ -4,9 +4,9 @@
 use std::fs;
 use std::path::Path;
 
-use ngspice_rs::analysis::{AnalysisRequest, RawFile, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisInput, AnalysisPlan, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
-use ngspice_rs::primitives::{AnalysisKind, parse_spice_number};
+use ngspice_rs::primitives::AnalysisKind;
 
 #[cfg(test)]
 use super::workspace_root;
@@ -1989,10 +1989,11 @@ fn run_deck(root: &Path, path: &Path, fixture: &Supported) -> Result<String, Str
     }
     let config = RunConfig::from_netlist(&netlist).map_err(|e| e.to_string())?;
     let (request, got) = run_card(&netlist, &config, &netlist.analyses[0], &[])?;
-    if request.kind != fixture.kind {
+    if request.kind() != fixture.kind {
         return Err(format!(
             "registry expects {:?}, deck requests {:?}",
-            fixture.kind, request.kind
+            fixture.kind,
+            request.kind()
         ));
     }
     let want = load_golden(root, fixture.name)?;
@@ -2020,8 +2021,10 @@ fn run_deck(root: &Path, path: &Path, fixture: &Supported) -> Result<String, Str
 fn batch_result(root: &Path, path: &Path, fixture: &Batch) -> Result<Vec<String>, String> {
     let netlist = Parser::new().parse_file(path).map_err(|e| e.to_string())?;
     let config = RunConfig::from_netlist(&netlist).map_err(|e| e.to_string())?;
-    let schedule = ngspice_rs::analysis::batch::schedule_evaluated(&netlist.analyses, &config)
+    let plans = config
+        .plans_for(&netlist.analyses)
         .map_err(|e| e.to_string())?;
+    let schedule = ngspice_rs::analysis::batch::schedule(&plans);
     let want = load_golden(root, fixture.name)?;
     let names: Vec<&str> = schedule
         .iter()
@@ -2041,10 +2044,9 @@ fn batch_result(root: &Path, path: &Path, fixture: &Batch) -> Result<Vec<String>
     // analysis-kind markers alone cannot reproduce transient instance fields.
     let mut previous = None;
     for entry in &schedule {
-        let card = &netlist.analyses[entry.card_index];
-        let (request, plots, circuit) =
-            run_card_plots(&netlist, &config, card, &[], previous.as_ref())
-                .map_err(|error| format!("{}: {error}", entry.plot_name))?;
+        let request = &plans[entry.card_index];
+        let (plots, circuit) = run_plan_plots(&netlist, &config, request, previous.as_ref())
+            .map_err(|error| format!("{}: {error}", entry.plot_name))?;
         previous = Some(circuit);
         let own: Vec<&str> = entry.plot_names().collect();
         if plots.len() != own.len() {
@@ -2057,10 +2059,11 @@ fn batch_result(root: &Path, path: &Path, fixture: &Batch) -> Result<Vec<String>
         }
         for (got, name) in plots.iter().zip(own) {
             let (stage, want) = stages.next().ok_or("more Rust plots than stages")?;
-            if request.kind != stage.kind {
+            if request.kind() != stage.kind {
                 return Err(format!(
                     "{name}: registry expects {:?}, the batch schedule runs {:?}",
-                    stage.kind, request.kind
+                    stage.kind,
+                    request.kind()
                 ));
             }
             if got.plotname != want.plot.plotname {
@@ -2069,7 +2072,7 @@ fn batch_result(root: &Path, path: &Path, fixture: &Batch) -> Result<Vec<String>
                     got.plotname, want.plot.plotname
                 ));
             }
-            let detail = compare_plot(&stage.gate, &netlist, &request, got, &want.plot)
+            let detail = compare_plot(&stage.gate, &netlist, request, got, &want.plot)
                 .map_err(|error| format!("{name}: {error}"))?;
             details.push(format!("{name} ({}): {detail}", got.plotname));
         }
@@ -2083,7 +2086,7 @@ fn run_card(
     config: &RunConfig,
     card: &ngspice_rs::netlist::ast::AnalysisCard,
     extra: &[&str],
-) -> Result<(AnalysisRequest, ngspice_rs::analysis::Plot), String> {
+) -> Result<(AnalysisPlan, ngspice_rs::analysis::Plot), String> {
     let (request, mut plots, _) = run_card_plots(netlist, config, card, extra, None)?;
     if plots.len() != 1 {
         return Err(format!(
@@ -2108,7 +2111,7 @@ fn run_card_plots(
     previous: Option<&ngspice_rs::devices::Circuit>,
 ) -> Result<
     (
-        AnalysisRequest,
+        AnalysisPlan,
         Vec<ngspice_rs::analysis::Plot>,
         ngspice_rs::devices::Circuit,
     ),
@@ -2117,19 +2120,35 @@ fn run_card_plots(
     if !card.expressions.is_empty() {
         return Err("braced analysis arguments are not supported in verification fixtures".into());
     }
-    let mut request: AnalysisRequest = AnalysisRequest::from(card);
+    let mut request: AnalysisInput = AnalysisInput::from(card);
     request
         .arguments
         .extend(extra.iter().map(|token| (*token).to_owned()));
-    let request = config.request(request).map_err(|e| e.to_string())?;
+    let request = config.plan(request).map_err(|e| e.to_string())?;
+    let (plots, circuit) = run_plan_plots(netlist, config, &request, previous)?;
+    Ok((request, plots, circuit))
+}
+
+fn run_plan_plots(
+    netlist: &ngspice_rs::netlist::ast::Netlist,
+    config: &RunConfig,
+    request: &AnalysisPlan,
+    previous: Option<&ngspice_rs::devices::Circuit>,
+) -> Result<
+    (
+        Vec<ngspice_rs::analysis::Plot>,
+        ngspice_rs::devices::Circuit,
+    ),
+    String,
+> {
     let mut circuit = config.circuit(netlist).map_err(|e| e.to_string())?;
     if let Some(previous) = previous {
         circuit.inherit_from(previous);
     }
-    let plots = runner(request.kind)
-        .and_then(|driver| driver.run_plots(&mut circuit, &request, &config.context()))
+    let plots = request
+        .run_plots(&mut circuit, &config.context())
         .map_err(|e| e.to_string())?;
-    circuit.note_completed(request.kind);
+    circuit.note_completed(request.kind());
     // C's default save set omits device internal nodes by name
     // (`outitf.c`: `#internal`, `#source`, `#drain`, `#collector`,
     // `#collCX`, `#emitter`, `#base`) and saves every other node, including
@@ -2155,7 +2174,7 @@ fn run_card_plots(
         .into_iter()
         .map(|plot| project(plot, &internal))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok((request, plots, circuit))
+    Ok((plots, circuit))
 }
 
 /// The internal-node name fragments `outitf.c` leaves out of C's default
@@ -2209,7 +2228,7 @@ fn load_golden(root: &Path, name: &str) -> Result<RawFile, String> {
 fn compare_plot(
     gate: &Gate,
     netlist: &ngspice_rs::netlist::ast::Netlist,
-    request: &AnalysisRequest,
+    request: &AnalysisPlan,
     got: &ngspice_rs::analysis::Plot,
     want: &ngspice_rs::analysis::Plot,
 ) -> Result<String, String> {
@@ -2229,14 +2248,8 @@ fn compare_plot(
             .map(|()| format!("{} point(s)", got.point_count())),
         Gate::Roots(tolerance) => compare::roots(got, want, tolerance),
         Gate::Transient(tolerance) => {
-            let time = |index: usize, what: &str| {
-                request
-                    .argument(index)
-                    .and_then(parse_spice_number)
-                    .filter(|v| v.is_finite() && *v > 0.0)
-                    .ok_or_else(|| format!(".tran {what} is not a positive number"))
-            };
-            let (step, final_time) = (time(0, "tstep")?, time(1, "tstop")?);
+            let transient = request.transient().ok_or("expected a transient plan")?;
+            let (step, final_time) = (transient.step(), transient.stop());
             let mut breakpoints = tran::breakpoints(netlist, step, final_time)?;
             if !offsets.is_empty() {
                 breakpoints = tran::echoes(&breakpoints, offsets, final_time)?;
@@ -2245,7 +2258,7 @@ fn compare_plot(
             // accepted step. The comparison then starts at that time, which the
             // Rust plot must reproduce (`tran::Series::new`); without `uic`
             // both plots start at 0 as always.
-            let start = if request.uic {
+            let start = if request.uic() {
                 want.value("time", 0)
                     .map(|t| t.re)
                     .filter(|t| t.is_finite() && *t > 0.0)

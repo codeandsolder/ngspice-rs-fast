@@ -1,9 +1,7 @@
 //! #110 / #107: every `.option` name this port accepts either takes effect,
 //! is a documented no-op (`RunConfig::ignored`) or fails explicitly; option
 //! values may be `{expr}`/`'expr'` evaluated against top-level `.param`.
-use ngspice_rs::analysis::{
-    AnalysisContext, AnalysisRequest, Plot, RunConfig, RunOverrides, runner,
-};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RunConfig, RunOverrides};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::Netlist;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -27,17 +25,39 @@ fn config(options: &str) -> Result<RunConfig, SpiceError> {
 fn simulate(body: &str) -> Result<Plot, SpiceError> {
     let n = deck(body);
     let c = RunConfig::from_netlist(&n)?;
-    let request = c.request_for(&n.analyses[0])?;
+    let request = c.plan_for(&n.analyses[0])?;
     let mut circuit = c.circuit(&n)?;
-    runner(request.kind)?.run(&mut circuit, &request, &c.context())
+    request.run(&mut circuit, &c.context())
 }
 
-fn tran() -> AnalysisRequest {
-    AnalysisRequest::with_arguments(AnalysisKind::Transient, ["1u", "1m"])
+fn input_for(kind: AnalysisKind) -> AnalysisInput {
+    let text = match kind {
+        AnalysisKind::OperatingPoint => "",
+        AnalysisKind::DcSweep => "v1 0 1 0.1",
+        AnalysisKind::Ac | AnalysisKind::SParameter | AnalysisKind::Distortion => "dec 1 1k 10k",
+        AnalysisKind::Noise => "v(out) v1 dec 1 1k 10k",
+        AnalysisKind::PoleZero => "in 0 out 0 vol pz",
+        AnalysisKind::Sensitivity => "v ( out )",
+        AnalysisKind::TransferFunction => "v ( out ) v1",
+        AnalysisKind::Transient => "1u 10u",
+        AnalysisKind::Fourier => unreachable!("not a driver"),
+    };
+    AnalysisInput::with_arguments(kind, text.split_whitespace())
 }
 
-fn dc() -> AnalysisRequest {
-    AnalysisRequest::with_arguments(AnalysisKind::DcSweep, ["v1", "0", "1", "0.1"])
+fn stage_limit(plan: &ngspice_rs::analysis::AnalysisPlan) -> Option<usize> {
+    plan.dc_settings()
+        .continuation
+        .stage_max_iterations
+        .map(ngspice_rs::analysis::bias::IterationLimit::get)
+}
+
+fn tran() -> AnalysisInput {
+    AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m"])
+}
+
+fn dc() -> AnalysisInput {
+    AnalysisInput::with_arguments(AnalysisKind::DcSweep, ["v1", "0", "1", "0.1"])
 }
 
 /// ngspice's default Newton tolerances (`CKTreltol`, `CKTvoltTol`): two
@@ -142,13 +162,27 @@ fn itl1_reaches_dc_analyses_and_the_companion_initial_bias() {
     let c = config(".options itl1=37").unwrap();
     assert_eq!(c.dc().itl1, Some(100));
     for kind in [AnalysisKind::OperatingPoint, AnalysisKind::Ac] {
-        let request = c.request(AnalysisRequest::new(kind)).unwrap();
-        assert_eq!(request.named("maxiter"), Some("100"));
+        let request = c.plan(input_for(kind)).unwrap();
+        assert_eq!(request.dc_settings().newton.max_iterations, 100);
     }
-    assert_eq!(c.request(dc()).unwrap().named("maxiter"), Some("100"));
-    assert_eq!(c.request(tran()).unwrap().named("maxiter"), Some("100"));
+    assert_eq!(
+        c.plan(dc()).unwrap().dc_settings().newton.max_iterations,
+        100
+    );
+    assert_eq!(
+        c.plan(tran()).unwrap().dc_settings().newton.max_iterations,
+        100
+    );
     let above = config(".options itl1=250").unwrap();
-    assert_eq!(above.request(dc()).unwrap().named("maxiter"), Some("250"));
+    assert_eq!(
+        above
+            .plan(dc())
+            .unwrap()
+            .dc_settings()
+            .newton
+            .max_iterations,
+        250
+    );
     for low in ["0", "1", "99", "100"] {
         let c = config(&format!(".options itl1={low}")).unwrap();
         assert_eq!(c.dc().itl1, Some(100), "itl1={low}");
@@ -184,35 +218,32 @@ fn itl1_reaches_dc_analyses_and_the_companion_initial_bias() {
 fn deck_with_request(body: &str, extra: &[&str]) -> Result<Plot, SpiceError> {
     let n = deck(body);
     let c = RunConfig::from_netlist(&n)?;
-    let mut request = AnalysisRequest::from(&n.analyses[0]);
+    let mut request = AnalysisInput::from(&n.analyses[0]);
     request
         .arguments
         .extend(extra.iter().map(|a| (*a).to_owned()));
-    let request = c.request(request)?;
+    let request = c.plan(request)?;
     let mut circuit = c.circuit(&n)?;
-    runner(request.kind)?.run(&mut circuit, &request, &c.context())
+    request.run(&mut circuit, &c.context())
 }
 
 #[test]
 fn itl2_bounds_the_warm_started_dc_sweep_points() {
     let c = config(".options itl2=7").unwrap();
     assert_eq!(c.dc().itl2, Some(100));
-    assert_eq!(c.request(dc()).unwrap().named("trcvmaxiter"), Some("100"));
+    assert_eq!(c.plan(dc()).unwrap().point_iterations(), Some(100));
     let above = config(".options itl2=300").unwrap();
-    assert_eq!(
-        above.request(dc()).unwrap().named("trcvmaxiter"),
-        Some("300")
-    );
+    assert_eq!(above.plan(dc()).unwrap().point_iterations(), Some(300));
     // The warm start exists only in .dc; the continuation stage limit reaches
     // every analysis that runs the DC bias (tests below).
     for request in [
-        AnalysisRequest::new(AnalysisKind::OperatingPoint),
-        AnalysisRequest::new(AnalysisKind::Ac),
+        AnalysisInput::new(AnalysisKind::OperatingPoint),
+        input_for(AnalysisKind::Ac),
         tran(),
     ] {
-        let request = c.request(request).unwrap();
-        assert_eq!(request.named("trcvmaxiter"), None);
-        assert_eq!(request.named("stagemaxiter"), Some("100"));
+        let request = c.plan(request).unwrap();
+        assert_eq!(request.point_iterations(), None);
+        assert_eq!(stage_limit(&request), Some(100));
     }
     // One large sweep step (0 V -> 5 V) on a diode: the first point is
     // trivial, the second needs several damped Newton iterations from the
@@ -265,13 +296,13 @@ fn itl2_bounds_the_warm_started_dc_sweep_points() {
         .unwrap()
         .circuit(&deck(sweep))
         .unwrap();
-    let request = AnalysisRequest::with_arguments(
+    let request = AnalysisInput::with_arguments(
         AnalysisKind::DcSweep,
         ["v1", "0", "1", "0.5", "trcvmaxiter=0"],
     );
-    let error = runner(AnalysisKind::DcSweep)
-        .unwrap()
-        .run(&mut circuit, &request, &AnalysisContext::default())
+    let error = request
+        .resolve()
+        .and_then(|plan| plan.run(&mut circuit, &AnalysisContext::default()))
         .unwrap_err();
     assert!(error.to_string().contains("trcvmaxiter"), "{error}");
 }
@@ -281,46 +312,39 @@ fn itl2_bounds_every_continuation_stage_of_the_dc_bias() {
     // cktop.c: the direct solve runs NIiter(itl1), every dynamic/spice3 gmin
     // and source-stepping stage NIiter(itl2); CKTop serves .op, .ac, the .dc
     // first point and the .tran initial bias alike.
-    let op = AnalysisRequest::new(AnalysisKind::OperatingPoint);
-    let ac = AnalysisRequest::with_arguments(AnalysisKind::Ac, ["dec", "1", "1k", "10k"]);
+    let op = AnalysisInput::new(AnalysisKind::OperatingPoint);
+    let ac = AnalysisInput::with_arguments(AnalysisKind::Ac, ["dec", "1", "1k", "10k"]);
     assert_eq!(
-        config("")
-            .unwrap()
-            .request(op.clone())
-            .unwrap()
-            .named("stagemaxiter"),
+        stage_limit(&config("").unwrap().plan(op.clone()).unwrap()),
         None
     );
     for (options, stage) in [
-        (".options itl2=300", "300"),
-        (".options itl2=7", "100"),
+        (".options itl2=300", 300),
+        (".options itl2=7", 100),
         // itl1 alone: C keeps the stages at its default itl2 (50 -> 100).
-        (".options itl1=5000", "100"),
-        (".options itl1=5000 itl2=250", "250"),
+        (".options itl1=5000", 100),
+        (".options itl1=5000 itl2=250", 250),
     ] {
         let c = config(options).unwrap();
         for request in [op.clone(), ac.clone(), dc(), tran()] {
             let kind = request.kind;
-            let request = c.request(request).unwrap();
-            assert_eq!(
-                request.named("stagemaxiter"),
-                Some(stage),
-                "{options} {kind:?}"
-            );
+            let request = c.plan(request).unwrap();
+            assert_eq!(stage_limit(&request), Some(stage), "{options} {kind:?}");
         }
     }
     let c = config(".options itl1=5000").unwrap();
     assert_eq!(
-        c.request(op.clone()).unwrap().named("maxiter"),
-        Some("5000")
+        c.plan(op.clone())
+            .unwrap()
+            .dc_settings()
+            .newton
+            .max_iterations,
+        5000
     );
     // Explicit request entries win.
     let mut explicit = op.clone();
     explicit.arguments.push("stagemaxiter=7".into());
-    assert_eq!(
-        c.request(explicit).unwrap().named("stagemaxiter"),
-        Some("7")
-    );
+    assert_eq!(stage_limit(&c.plan(explicit).unwrap()), Some(7));
 
     // Observable: a diode the damped direct Newton cannot reach in three
     // iterations. With maxiter=3 and no deck limits every gmin stage gets
@@ -363,10 +387,10 @@ fn itl2_bounds_every_continuation_stage_of_the_dc_bias() {
 
 #[test]
 fn stage_iteration_limit_is_separate_from_the_direct_limit() {
-    use ngspice_rs::analysis::bias::{DcSettings, DcStrategy, solve_dc_with};
+    use ngspice_rs::analysis::bias::{DcStrategy, solve_dc_with};
     let n = deck("v1 a 0 5\nr1 a b 1k\nd1 b 0 dm\n.model dm d(is=1e-14)\n.op");
     let circuit = RunConfig::from_netlist(&n).unwrap().circuit(&n).unwrap();
-    let settings = DcSettings::from_request(&AnalysisRequest::with_arguments(
+    let plan = AnalysisInput::with_arguments(
         AnalysisKind::OperatingPoint,
         [
             "maxiter=3",
@@ -374,8 +398,10 @@ fn stage_iteration_limit_is_separate_from_the_direct_limit() {
             "srcsteps=0",
             "continuation=ladder",
         ],
-    ))
+    )
+    .resolve()
     .unwrap();
+    let settings = plan.dc_settings();
     assert_eq!(settings.newton.max_iterations, 3);
     assert_eq!(
         settings
@@ -385,7 +411,7 @@ fn stage_iteration_limit_is_separate_from_the_direct_limit() {
         Some(40)
     );
     let context = AnalysisContext::default().model_context();
-    let solved = solve_dc_with(&circuit, &context, &settings, &[], None, None).unwrap();
+    let solved = solve_dc_with(&circuit, &context, settings, &[], None, None).unwrap();
     let stages = &solved.report.stages;
     assert_eq!(stages[0].strategy, DcStrategy::Direct);
     // NIiter fails after the pass that exceeds the limit: 3 + 1.
@@ -412,8 +438,8 @@ fn stage_iteration_limit_is_separate_from_the_direct_limit() {
         2 * (3 + 1) + (stages.len() - 2) * (40 + 1)
     );
     for bad in ["stagemaxiter=0", "stagemaxiter=10001", "stagemaxiter=2.5"] {
-        let request = AnalysisRequest::with_arguments(AnalysisKind::OperatingPoint, [bad]);
-        assert!(DcSettings::from_request(&request).is_err(), "{bad}");
+        let request = AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, [bad]);
+        assert!(request.resolve().is_err(), "{bad}");
     }
 }
 
@@ -421,16 +447,23 @@ fn stage_iteration_limit_is_separate_from_the_direct_limit() {
 fn itl4_is_the_companion_newton_limit_per_timepoint() {
     let c = config(".options itl4=250").unwrap();
     assert_eq!(c.transient().itl4, Some(250));
-    assert_eq!(c.request(tran()).unwrap().named("tranmaxiter"), Some("250"));
+    assert_eq!(
+        c.plan(tran())
+            .unwrap()
+            .transient()
+            .unwrap()
+            .max_iterations(),
+        250
+    );
     // niiter.c: below 100 (including C's nominal default 10) means 100.
     for low in ["0", "3", "10", "99"] {
         let c = config(&format!(".options itl4={low}")).unwrap();
         assert_eq!(c.transient().itl4, Some(100), "itl4={low}");
     }
     assert_eq!(
-        c.request(AnalysisRequest::new(AnalysisKind::OperatingPoint))
+        c.plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
             .unwrap()
-            .named("tranmaxiter"),
+            .transient(),
         None
     );
     let deck_text = "v1 a 0 pulse(0 5 1u 1u 1u 5u 20u)\nr1 a b 1k\nd1 b 0 dm\n\
@@ -438,11 +471,11 @@ fn itl4_is_the_companion_newton_limit_per_timepoint() {
     let stats = |options: &str, extra: &[&str]| {
         let n = deck(&format!("{deck_text}\n{options}"));
         let c = RunConfig::from_netlist(&n).unwrap();
-        let mut request = AnalysisRequest::from(&n.analyses[0]);
+        let mut request = AnalysisInput::from(&n.analyses[0]);
         request
             .arguments
             .extend(extra.iter().map(|a| (*a).to_owned()));
-        let request = c.request(request).unwrap();
+        let request = c.plan(request).unwrap();
         let mut circuit = c.circuit(&n).unwrap();
         ngspice_rs::analysis::companion_transient(&mut circuit, &request, &c.context())
             .unwrap()
@@ -478,8 +511,8 @@ fn xmu_weights_the_companion_trapezoidal_rule() {
     // INPevaluate("0.3") is 3 * 0.1.
     assert_eq!(c.transient().xmu, Some(3. * 0.1));
     assert_eq!(
-        c.request(tran()).unwrap().named("xmu"),
-        Some("3.0000000000000004e-1")
+        c.plan(tran()).unwrap().transient().unwrap().xmu(),
+        c.transient().xmu.unwrap()
     );
     let rc = "v1 a 0 pulse(0 1 0 1n 1n 1 2)\nr1 a b 1k\nc1 b 0 1u\n.tran 10u 2m";
     let at = |plot: &Plot, t: f64| {
@@ -507,10 +540,14 @@ fn itl6_is_srcsteps() {
     assert_eq!(c.dc().srcsteps, Some(3));
     assert_eq!(c.applied()[0].name, "itl6");
     assert_eq!(
-        c.request(AnalysisRequest::new(AnalysisKind::OperatingPoint))
+        c.plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
             .unwrap()
-            .named("srcsteps"),
-        Some("3")
+            .dc_settings()
+            .continuation
+            .schedule,
+        ngspice_rs::analysis::bias::ContinuationSchedule::Ngspice(
+            ngspice_rs::analysis::bias::NgspiceStepping::new(1, 3, 10., 50).unwrap()
+        )
     );
     // One setting: last occurrence wins across both spellings.
     assert_eq!(
@@ -570,7 +607,10 @@ fn existing_effective_options_are_still_applied() {
         (t.rtol, t.vntol, t.abstol, t.chgtol, t.trtol),
         (Some(1e-4), Some(2e-6), Some(3e-12), Some(1e-13), Some(5.))
     );
-    assert_eq!((c.method(), c.maxord()), (Some("gear"), Some(1)));
+    assert_eq!(
+        (c.method(), c.maxord()),
+        (Some(ngspice_rs::analysis::IntegrationFamily::Gear), Some(1))
+    );
     assert_eq!(
         (c.dc().srcsteps, c.dc().gminsteps, c.dc().gminfactor),
         (Some(2), Some(4), Some(5.))
@@ -597,10 +637,11 @@ fn every_analysis_with_an_operating_point_gets_the_deck_tolerances() {
         AnalysisKind::TransferFunction,
         AnalysisKind::SParameter,
     ] {
-        let request = c.request(AnalysisRequest::new(kind)).unwrap();
-        for key in ["rtol", "vntol", "abstol"] {
-            assert!(request.named(key).is_some(), "{kind:?} lacks {key}");
-        }
+        let request = c.plan(input_for(kind)).unwrap();
+        let newton = &request.dc_settings().newton;
+        assert_eq!(newton.reltol, c.transient().rtol.unwrap(), "{kind:?}");
+        assert_eq!(newton.vntol, c.transient().vntol.unwrap(), "{kind:?}");
+        assert_eq!(newton.abstol, c.transient().abstol.unwrap(), "{kind:?}");
     }
 }
 
@@ -626,8 +667,12 @@ fn print_control_flags_are_documented_no_ops() {
         assert_eq!(c.ignored()[0].value, None);
         assert!(c.ignored()[0].reason.contains("print"), "{flag}");
         // Nothing reaches any request.
-        for request in [tran(), AnalysisRequest::new(AnalysisKind::OperatingPoint)] {
-            assert_eq!(c.request(request.clone()).unwrap(), request, "{flag}");
+        for request in [tran(), AnalysisInput::new(AnalysisKind::OperatingPoint)] {
+            assert_eq!(
+                c.plan(request.clone()).unwrap(),
+                request.resolve().unwrap(),
+                "{flag}"
+            );
         }
         let error = config(&format!(".options {flag}=1")).unwrap_err();
         assert!(matches!(error, SpiceError::Parse { .. }), "{flag}: {error}");

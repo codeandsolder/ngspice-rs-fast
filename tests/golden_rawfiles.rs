@@ -72,14 +72,15 @@ fn production_linear_drivers_match_c_goldens() {
             .parse_deck(&deck)
             .unwrap();
         let mut circuit = ngspice_rs::devices::Circuit::from_netlist(&netlist).unwrap();
-        let request = ngspice_rs::analysis::AnalysisRequest::from(&netlist.analyses[0]);
-        let got = ngspice_rs::analysis::runner(request.kind)
-            .unwrap()
-            .run(
-                &mut circuit,
-                &request,
-                &ngspice_rs::analysis::AnalysisContext::default(),
-            )
+        let request = ngspice_rs::analysis::AnalysisInput::from(&netlist.analyses[0]);
+        let got = request
+            .resolve()
+            .and_then(|plan| {
+                plan.run(
+                    &mut circuit,
+                    &ngspice_rs::analysis::AnalysisContext::default(),
+                )
+            })
             .unwrap();
         let golden = RawFile::parse(&golden_text(name)).unwrap();
         let want = &golden.plots[0].plot;
@@ -12197,6 +12198,29 @@ fn multi_plot_goldens_round_trip_through_both_encodings() {
                     variable.name
                 );
             }
+        }
+    }
+}
+
+/// The complete corpus is a cross-encoding regression, not only the handful
+/// of multi-plot examples. Compare the binary serialization itself after a
+/// decode, which covers signed zero and all IEEE-754 bits.
+#[test]
+fn every_golden_preserves_binary_bytes_in_both_orders() {
+    use ngspice_rs::analysis::{BinaryByteOrder, RawFileReader};
+    for name in fixture_names() {
+        let raw = RawFile::parse(&golden_text(&name)).unwrap();
+        for order in [BinaryByteOrder::LittleEndian, BinaryByteOrder::BigEndian] {
+            let bytes = raw.to_binary_with(order).unwrap();
+            let decoded = RawFileReader::new(bytes.as_slice())
+                .with_byte_order(order)
+                .read()
+                .unwrap();
+            assert_eq!(
+                decoded.to_binary_with(order).unwrap(),
+                bytes,
+                "{name}: {order:?}"
+            );
         }
     }
 }

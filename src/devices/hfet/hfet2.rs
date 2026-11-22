@@ -64,7 +64,7 @@
 )]
 
 use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step};
-use super::{CELSIUS_TO_KELVIN, HFET_INSTANCE as INSTANCE, HfetInstance as Instance};
+use super::{CELSIUS_TO_KELVIN, HfetInstance as Instance};
 use super::{NodeSetup, TemperatureCache, ask_hfet, set_hfet, stamp_reset};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{BOLTZMANN, CHARGE, p};
@@ -219,13 +219,10 @@ impl Model {
         // default, applied before the instance card's own setters.
         let (scalars, defaults) = crate::devices::schema::split_model_setters(
             scalars,
-            &ScalarSchema { parameters: MODEL },
-            &ScalarSchema {
-                parameters: INSTANCE,
-            },
+            &MODEL_SCHEMA,
+            &super::HFET_INSTANCE_SCHEMA,
         );
-        let values =
-            ScalarSchema { parameters: MODEL }.validate(scalars, &resolved.card().location)?;
+        let values = MODEL_SCHEMA.validate(scalars, &resolved.card().location)?;
         let r = |name: &str| crate::devices::jfet::required(&values, name);
         let alias = |names: &[&str]| crate::devices::jfet::last_setter(&values, names);
         let typed = |explicit: Option<Real>, n: Real, p: Real| {
@@ -1362,3 +1359,5 @@ impl Device for ResetHfet2 {
         stamp_reset(&self.current.name, context, &stamps, &[])
     }
 }
+
+static MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(MODEL);

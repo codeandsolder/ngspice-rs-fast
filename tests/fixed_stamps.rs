@@ -79,7 +79,7 @@ fn assert_bound_loads_match(circuit: &Circuit, x: &Vector) {
     assert!(reference.iter().any(|&bits| bits != 0));
     for pass in 0..4 {
         assert_eq!(
-            load(circuit, circuit.new_matrix(), x),
+            load(circuit, circuit.new_matrix().unwrap(), x),
             reference,
             "bound load {pass}"
         );

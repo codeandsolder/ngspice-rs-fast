@@ -80,8 +80,38 @@ pub struct ResolvedSite {
     pub original: String,
     /// Location of the expression text.
     pub location: SourceLoc,
-    /// The evaluated finite value.
+    /// The evaluated finite value before numparam formatting.
     pub value: Real,
+    /// The literal inserted into the card by numparam.
+    pub formatted: String,
+    /// Reading that literal with C's `INPevaluate` arithmetic can differ
+    /// from the original evaluation in the last bit (or underflow).
+    pub read_back: Real,
+}
+
+impl ResolvedSite {
+    fn record(
+        kind: SiteKind,
+        original: String,
+        location: SourceLoc,
+        value: Real,
+        formatted: &str,
+    ) -> SpiceResult<Self> {
+        let read_back = crate::primitives::parse_spice_number(formatted).ok_or_else(|| {
+            SpiceError::parse(
+                location.clone(),
+                "formatted numeric value cannot be read back",
+            )
+        })?;
+        Ok(Self {
+            kind,
+            original,
+            location,
+            value,
+            formatted: formatted.to_owned(),
+            read_back,
+        })
+    }
 }
 
 /// A literalized copy plus the evaluation record.
@@ -190,34 +220,7 @@ pub fn literalize_with(
         Some(&mut sites),
     )?;
     for (ai, (before, card)) in netlist.analyses.iter().zip(&mut out.analyses).enumerate() {
-        literalize_analysis_into(before, card, &scope, budget)?;
-        for e in &before.expressions {
-            let value = card
-                .arguments
-                .get(e.index)
-                .and_then(|argument| argument.parse::<Real>().ok())
-                .ok_or_else(|| {
-                    SpiceError::parse(
-                        e.expression.span.start.clone(),
-                        "literalized analysis argument is not numeric",
-                    )
-                })?;
-            let original = before.arguments.get(e.index).ok_or_else(|| {
-                SpiceError::parse(
-                    e.expression.span.start.clone(),
-                    "analysis argument expression index is out of range",
-                )
-            })?;
-            sites.push(ResolvedSite {
-                kind: SiteKind::AnalysisArgument {
-                    analysis: ai,
-                    argument: e.index,
-                },
-                original: original.clone(),
-                location: e.expression.span.start.clone(),
-                value,
-            });
-        }
+        literalize_analysis_into(before, card, &scope, budget, Some((&mut sites, ai)))?;
     }
     literalize_hints(
         &mut out.initial_conditions,
@@ -356,22 +359,28 @@ fn literalize_hints(
                     ),
                     other => other,
                 })?;
-            if let Some(sites) = sites.as_deref_mut() {
-                sites.push(ResolvedSite {
-                    kind: kind(ci, ei),
-                    original: if expression.braced {
+            // numparam's text, read back by INPevaluate as the card is.
+            let text = format_literal(value);
+            let read_back = if let Some(sites) = sites.as_deref_mut() {
+                let site = ResolvedSite::record(
+                    kind(ci, ei),
+                    if expression.braced {
                         format!("{{{}}}", expression.text)
                     } else {
                         expression.text.clone()
                     },
-                    location: expression.span.start.clone(),
+                    expression.span.start.clone(),
                     value,
-                });
-            }
-            // numparam's text, read back by INPevaluate as the card is.
-            let text = format_literal(value);
+                    &text,
+                )?;
+                let read_back = site.read_back;
+                sites.push(site);
+                read_back
+            } else {
+                crate::primitives::parse_spice_number(&text).unwrap_or(value)
+            };
             hint.value = NodeHintValue::Literal {
-                value: crate::primitives::parse_spice_number(&text).unwrap_or(value),
+                value: read_back,
                 text,
             };
         }
@@ -421,15 +430,17 @@ fn literalize_parameters(
                 ),
                 other => other,
             })?;
+        let text = format_literal(value);
         if let Some(sites) = sites.as_deref_mut() {
-            sites.push(ResolvedSite {
-                kind: kind(index),
-                original: parameter.value.clone(),
-                location: expression.span.start.clone(),
+            sites.push(ResolvedSite::record(
+                kind(index),
+                parameter.value.clone(),
+                expression.span.start.clone(),
                 value,
-            });
+                &text,
+            )?);
         }
-        parameter.value = format_literal(value);
+        parameter.value = text;
         parameter.kind = ParameterKind::Scalar;
     }
     Ok(())
@@ -445,7 +456,7 @@ pub fn literalize_analysis(
     budget: &mut EvalBudget,
 ) -> SpiceResult<AnalysisCard> {
     let mut out = card.clone();
-    literalize_analysis_into(card, &mut out, scope, budget)?;
+    literalize_analysis_into(card, &mut out, scope, budget, None)?;
     Ok(out)
 }
 
@@ -456,7 +467,25 @@ fn literalize_analysis_into(
     out: &mut AnalysisCard,
     scope: &ParamScope,
     budget: &mut EvalBudget,
+    mut sites: Option<(&mut Vec<ResolvedSite>, usize)>,
 ) -> SpiceResult<()> {
+    // Validate the whole index set before evaluation. A constructed card
+    // must not silently overwrite an earlier resolved argument.
+    let mut seen = vec![false; card.arguments.len()];
+    for e in &card.expressions {
+        let position = seen.get_mut(e.index).ok_or_else(|| {
+            SpiceError::parse(
+                e.expression.span.start.clone(),
+                "analysis argument expression index is out of range",
+            )
+        })?;
+        if std::mem::replace(position, true) {
+            return Err(SpiceError::parse(
+                e.expression.span.start.clone(),
+                "duplicate analysis argument expression index",
+            ));
+        }
+    }
     for e in &card.expressions {
         let argument = out.arguments.get_mut(e.index).ok_or_else(|| {
             SpiceError::parse(
@@ -478,7 +507,20 @@ fn literalize_analysis_into(
                 ),
                 other => other,
             })?;
-        *argument = format_literal(value);
+        let formatted = format_literal(value);
+        if let Some((sites, analysis)) = &mut sites {
+            sites.push(ResolvedSite::record(
+                SiteKind::AnalysisArgument {
+                    analysis: *analysis,
+                    argument: e.index,
+                },
+                argument.clone(),
+                e.expression.span.start.clone(),
+                value,
+                &formatted,
+            )?);
+        }
+        *argument = formatted;
     }
     out.expressions.clear();
     Ok(())

@@ -1,6 +1,6 @@
 //! Linear analysis orchestration. Nonlinear SPICE convergence policies stay separate.
 use crate::analysis::results::{PlotFlags, Variable};
-use crate::analysis::{AnalysisRequest, Plot};
+use crate::analysis::{AnalysisPlan, Plot};
 use crate::devices::Circuit;
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult, parse_spice_number};
 
@@ -89,27 +89,16 @@ pub(super) fn plot(
 
 pub(super) fn op(
     circuit: &mut Circuit,
-    request: &AnalysisRequest,
+    request: &AnalysisPlan,
     context: &crate::analysis::AnalysisContext,
 ) -> SpiceResult<Plot> {
-    if request
-        .arguments
-        .iter()
-        .any(|argument| !argument.contains('='))
-    {
-        return Err(unsupported(".op arguments"));
-    }
     // .ic is a transient-only constraint in C (cktload.c, MODETRANOP); a
     // .nodeset is forced in the MODEINITJCT/MODEINITFIX loads of a nonlinear
     // solve and cannot change a linear operating point. Both are validated.
     circuit.finalize()?;
     let model = context.model_context();
     let x = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?
-        .solve(
-            circuit,
-            &model,
-            &crate::analysis::bias::DcSettings::from_request(request)?,
-        )?
+        .solve(circuit, &model, request.dc_settings())?
         .values;
     let mut plot = plot(circuit, "op1", "Operating Point", None, false)?;
     circuit.accept_solution(&x, None)?;
@@ -134,12 +123,4 @@ pub(super) fn op(
     // device fields for the next analysis, just as the AC preparation does.
     circuit.record_small_signal_state(&model, &x)?;
     Ok(plot)
-}
-
-pub(super) fn dc(
-    circuit: &mut Circuit,
-    request: &AnalysisRequest,
-    context: &crate::analysis::AnalysisContext,
-) -> SpiceResult<Plot> {
-    crate::analysis::sweep::run(circuit, request, context)
 }
