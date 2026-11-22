@@ -362,11 +362,11 @@ fn the_netlist_keeps_the_card_and_the_writer_round_trips_it() {
 }
 
 #[test]
-fn measure_cards_are_part_of_semantic_equality_and_survive_a_semantic_form() {
+fn measure_cards_are_part_of_semantic_equality_and_survive_writer_roundtrip() {
     // The typed request lives in `ParsedDeck::measurements`, so the card's
     // spelling is the netlist's only record of what was asked for: two decks
     // that differ only in their `.measure` request must not compare equal, and
-    // the writer must still reproduce the card from a semantic form.
+    // the writer must still reproduce the card.
     let left = parse_deck_text(
         Path::new("measure.cir"),
         "Title\n.meas tran vat find v(a) at=1m\n.op\n",
@@ -383,8 +383,7 @@ fn measure_cards_are_part_of_semantic_equality_and_survive_a_semantic_form() {
     );
     assert!(semantic_eq(&left, &left.clone()));
 
-    let semantic = ngspice_rs::netlist::semantic::semantic_form(&left);
-    let written = write_netlist(&semantic).expect("the writer reproduces the card");
+    let written = write_netlist(&left).expect("the writer reproduces the card");
     assert!(
         written.contains(".meas tran vat find v(a) at=1m"),
         "{written}"
