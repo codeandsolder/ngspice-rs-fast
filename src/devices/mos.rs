@@ -375,7 +375,7 @@ fn mos_depletion(v: Real, cz: Real, potential: Real, grading: Real) -> (Real, Re
         (0., 0.)
     } else if grading == 0.5 {
         let root = (1. - v / potential).sqrt();
-        (cz * v / (0.5 * (1. + root)), cz / root)
+        (cz * (v / 1_f64.midpoint(root)), cz / root)
     } else {
         reverse_depletion(v, cz, potential, grading)
     }

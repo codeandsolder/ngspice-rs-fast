@@ -540,11 +540,12 @@ fn sensitivity_matches_the_reference_on_the_fixture_card() {
     assert_eq!(plot.variable_count(), expected.variable_count());
     assert_eq!(plot.point_count(), expected.point_count());
     for variable in expected.variables() {
-        close(
-            column(&plot, &variable.name),
-            column(expected, &variable.name),
-            1e-6,
-            1e-9,
+        let actual = column(&plot, &variable.name);
+        let reference = column(expected, &variable.name);
+        assert!(
+            (actual - reference).abs() <= 1e-6 * reference.abs() + 1e-9,
+            "{}: {actual:e} != {reference:e}",
+            variable.name
         );
     }
     assert_eq!(column(&plot, "v(q1:rco)"), 0., "sens_setp skips RCO");

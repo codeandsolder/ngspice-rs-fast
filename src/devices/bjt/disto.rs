@@ -384,7 +384,7 @@ fn distortion_base_resistance(
                 * gbb1
                 * gbb1
                 * gbb1
-                * (-(d_vbb.d3_p3 / 6.0) + 2. * (d_vbb.d2_p2 * 0.5) * (d_vbb.d2_p2 * 0.5) * gbb1);
+                * (0.5 * d_vbb.d2_p2 * d_vbb.d2_p2).mul_add(gbb1, -(d_vbb.d3_p3 / 6.));
             let mut d = d_r;
             d.value = cb;
             d.d1_r = gbb1;
@@ -527,8 +527,8 @@ fn distortion_be_charge(
     } else {
         (0.5 * xme * (czbe / t.be.f2) / pe, 0.)
     };
-    d_qbe.d2_p2 += capbe2 * 2.;
-    d_qbe.d3_p3 += capbe3 * 6.;
+    d_qbe.d2_p2 = capbe2.mul_add(2., d_qbe.d2_p2);
+    d_qbe.d3_p3 = capbe3.mul_add(6., d_qbe.d3_p3);
     d_qbe
 }
 

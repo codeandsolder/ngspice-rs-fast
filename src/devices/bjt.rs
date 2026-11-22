@@ -1042,7 +1042,7 @@ impl Bjt {
         let icvbe = self.initial.values[0].unwrap_or_else(|| voltage(n.b) - voltage(n.e));
         let icvce = self.initial.values[1].unwrap_or_else(|| voltage(n.c) - voltage(n.e));
         let vbe = self.pol * icvbe;
-        let vbc = vbe - self.pol * icvce;
+        let vbc = self.pol.mul_add(-icvce, vbe);
         Bias {
             vbe,
             vbc,
@@ -2417,7 +2417,7 @@ impl Device for ResetBjt {
             let arg = td * self.omega;
             gm += go;
             xgm = -gm * arg.sin();
-            gm = gm * arg.cos() - go;
+            gm = gm.mul_add(arg.cos(), -go);
         }
         let Nodes {
             c,
