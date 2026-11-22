@@ -6,9 +6,8 @@
 //! explicit, so that the port's coverage can be reported programmatically
 //! instead of inferred from the presence of C files.
 //!
-//! Each entry's [`DeviceSupport`] is derived from the factory module's own
-//! designator lists (`factory::CARD_FACTORY`, `factory::ELABORATED`), so the table cannot claim more or less than
-//! the factories build:
+//! [`DeviceSupport`] is derived from the card factory designators and the
+//! model backend catalog used for actual dispatch:
 //!
 //! - **ported**: R/C/L/V/I, E/F/G/H controlled, B behavioural, K (mutual
 //!   inductance) and T (lossless transmission line), built from the card
@@ -57,11 +56,8 @@ pub enum DeviceSupport {
     /// The entry's factory builds the device from its card.
     Ported,
     /// Built only while elaborating a deck (it needs a `.model` card or a
-    /// `.subckt` definition), for the subset of C's models named by `scope`.
-    Bounded {
-        /// What is built, e.g. the model levels.
-        scope: &'static str,
-    },
+    /// `.subckt` definition), for the model backends in the built-in catalog.
+    Bounded,
     /// Not built: instances fail with `NotYetPorted` and the C reference.
     Pending,
 }
@@ -72,7 +68,7 @@ impl DeviceSupport {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Ported => "ported",
-            Self::Bounded { .. } => "bounded",
+            Self::Bounded => "bounded",
             Self::Pending => "pending",
         }
     }
@@ -89,11 +85,8 @@ impl DeviceSupport {
         let designator = designator.to_ascii_lowercase();
         if crate::devices::factory::CARD_FACTORY.contains(&designator) {
             Self::Ported
-        } else if let Some((_, scope)) = crate::devices::factory::ELABORATED
-            .iter()
-            .find(|(letter, _)| *letter == designator)
-        {
-            Self::Bounded { scope }
+        } else if designator == 'x' || crate::devices::ModelBackend::requires_model(designator) {
+            Self::Bounded
         } else {
             Self::Pending
         }
@@ -296,7 +289,7 @@ impl Registry {
                 support,
                 factory: match support {
                     DeviceSupport::Ported => crate::devices::factory::from_card,
-                    DeviceSupport::Bounded { .. } => elaborated_factory,
+                    DeviceSupport::Bounded => elaborated_factory,
                     DeviceSupport::Pending => stub_factory,
                 },
             });
@@ -343,7 +336,7 @@ impl Registry {
     /// How many known designators are built only during deck elaboration.
     #[must_use]
     pub fn bounded_count(&self) -> usize {
-        self.count(|support| matches!(support, DeviceSupport::Bounded { .. }))
+        self.count(|support| matches!(support, DeviceSupport::Bounded))
     }
 
     fn count(&self, keep: impl Fn(DeviceSupport) -> bool) -> usize {

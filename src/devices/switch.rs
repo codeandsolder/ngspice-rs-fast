@@ -208,7 +208,7 @@ impl SwitchModel {
     }
 }
 
-const fn schema(kind: SwitchKind) -> ScalarSchema<'static> {
+fn schema(kind: SwitchKind) -> &'static ScalarSchema<'static> {
     const SW: &[ScalarParameter] = &[
         ScalarParameter {
             name: "vt",
@@ -261,11 +261,11 @@ const fn schema(kind: SwitchKind) -> ScalarSchema<'static> {
             default: None,
         },
     ];
-    ScalarSchema {
-        parameters: match kind {
-            SwitchKind::Voltage => SW,
-            SwitchKind::Current => CSW,
-        },
+    static SW_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(SW);
+    static CSW_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(CSW);
+    match kind {
+        SwitchKind::Voltage => &SW_SCHEMA,
+        SwitchKind::Current => &CSW_SCHEMA,
     }
 }
 

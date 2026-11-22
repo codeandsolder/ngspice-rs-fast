@@ -12,13 +12,15 @@
 //! files follow the upstream notice: Copyright (c) 2025 University of
 //! California, licensed under the Educational Community License, Version 2.0
 //! (see `NOTICE` and `LICENSE-ECL-2.0`).
-use crate::devices::ifparam::Device;
-use crate::devices::models::{ModelFamily, ResolvedModel};
+use crate::devices::ifparam::{Device, ParameterTable};
+use std::sync::Arc;
+
+use crate::devices::models::{ModelFamily, PreparationKey, ResolvedModel};
 use crate::devices::schema::temperature_kelvin;
 use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment};
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
-use crate::devices::ifparam::{descriptor, version_text};
+use crate::devices::ifparam::version_text;
 
 pub use crate::devices::ifparam::{
     Access, AppliedParameter, Diagnostic, InputType, Inputs, Parameter, Value,
@@ -51,18 +53,19 @@ mod temp;
 
 /// The generated literal model defaults in C setup order (`b4set.c`).
 ///
-/// Generated from `b4set.c`'s given-guarded literal assignments, which
-/// `set.rs` reproduces in C order (a unit test there checks they agree).
+/// Generated from `b4set.c`'s given-guarded literal assignments. Independent
+/// defaults execute as typed generated assignments; selector fallbacks and
+/// conditional defaults remain in the ordered setup stages.
 #[must_use]
 pub const fn literal_defaults() -> &'static [(&'static str, f64)] {
     defaults_data::LITERALS
 }
 
 /// The BSIM4 interface descriptor the shared input plumbing uses.
-pub(in crate::devices) const DEVICE: Device = Device {
+pub(in crate::devices) static DEVICE: Device = Device {
     reference: "bsim4/b4.c",
-    model: parameters::MODEL,
-    instance: parameters::INSTANCE,
+    model: ParameterTable::new(parameters::MODEL),
+    instance: ParameterTable::new(parameters::INSTANCE),
     uninteresting: parameters::UNINTERESTING,
     ic_names: ["icvds", "icvgs", "icvbs"],
     model_real: bsim4_model_real,
@@ -102,7 +105,7 @@ pub struct ModelParameters {
     pub inputs: Inputs,
     /// Last effective polarity flag, initially the model family (+1 NMOS/-1 PMOS).
     pub polarity: i8,
-    instance_defaults: Vec<ParameterAssignment>,
+    instance_defaults: Arc<[ParameterAssignment]>,
     location: SourceLoc,
 }
 
@@ -147,15 +150,18 @@ impl ModelParameters {
 /// # Errors
 /// Wrong family/level/version, unknown/read-only setters or invalid typed input.
 pub fn model_parameters(model: &ResolvedModel<'_>) -> SpiceResult<ModelParameters> {
-    if !matches!(model.family(), ModelFamily::Nmos | ModelFamily::Pmos)
-        || !matches!(model.levels().selector, 14 | 54)
-    {
+    model
+        .prepare(PreparationKey::Inputs, || parse_model_parameters(model))
+        .map(|parameters| (*parameters).clone())
+}
+
+fn parse_model_parameters(model: &ResolvedModel<'_>) -> SpiceResult<ModelParameters> {
+    if model.levels().backend != crate::devices::ModelBackend::Bsim4 {
         return Err(SpiceError::parse(
             model.card().location.clone(),
             "BSIM4 input schema requires NMOS/PMOS level 14 or 54",
         ));
     }
-    select_version(model.card())?;
     let mut result = ModelParameters {
         inputs: Inputs::new(&DEVICE, true),
         polarity: if model.family() == ModelFamily::Nmos {
@@ -163,14 +169,15 @@ pub fn model_parameters(model: &ResolvedModel<'_>) -> SpiceResult<ModelParameter
         } else {
             -1
         },
-        instance_defaults: Vec::new(),
+        instance_defaults: Arc::from([]),
         location: model.card().location.clone(),
     };
+    let mut defaults = Vec::new();
     for p in &model.card().parameters {
         if p.name.eq_ignore_ascii_case("level") {
             continue;
         }
-        if descriptor(parameters::MODEL, &p.name).is_some() {
+        if DEVICE.model.get(&p.name).is_some() {
             result.inputs.apply(p, 1.)?;
             if p.name.eq_ignore_ascii_case("nmos") {
                 result.polarity = 1;
@@ -182,11 +189,12 @@ pub fn model_parameters(model: &ResolvedModel<'_>) -> SpiceResult<ModelParameter
             let mut check = Inputs::new(&DEVICE, false);
             check.apply(p, 1.)?;
             if !p.name.eq_ignore_ascii_case("m") {
-                result.instance_defaults.push(p.clone());
+                defaults.push(p.clone());
             }
         }
     }
-    result.instance_defaults.reverse();
+    defaults.reverse();
+    result.instance_defaults = defaults.into();
     Ok(result)
 }
 

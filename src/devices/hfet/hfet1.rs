@@ -65,7 +65,7 @@
 )]
 
 use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step, prime_prime};
-use super::{CELSIUS_TO_KELVIN, HFET_INSTANCE as INSTANCE, HfetInstance as Instance};
+use super::{CELSIUS_TO_KELVIN, HfetInstance as Instance};
 use super::{NodeSetup, TemperatureCache, ask_hfet, set_hfet, stamp_reset};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{self, BOLTZMANN, CHARGE, p};
@@ -288,13 +288,10 @@ impl Model {
         // default, applied before the instance card's own setters.
         let (scalars, defaults) = crate::devices::schema::split_model_setters(
             scalars,
-            &ScalarSchema { parameters: MODEL },
-            &ScalarSchema {
-                parameters: INSTANCE,
-            },
+            &MODEL_SCHEMA,
+            &super::HFET_INSTANCE_SCHEMA,
         );
-        let values =
-            ScalarSchema { parameters: MODEL }.validate(scalars, &resolved.card().location)?;
+        let values = MODEL_SCHEMA.validate(scalars, &resolved.card().location)?;
         let r = |name: &str| jfet::required(&values, name);
         let alias = |names: &[&str]| jfet::last_setter(&values, names);
         // `hfetsetup.c` gives the threshold, `eta`, `mu` and `vs` per type.
@@ -472,7 +469,7 @@ impl Hfet1 {
         resolved: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        if resolved.levels().selector != 5 {
+        if resolved.levels().backend != crate::devices::ModelBackend::Hfet1 {
             return Err(SpiceError::circuit(format!(
                 "{}: HFET1 needs level 5",
                 i.name
@@ -2116,3 +2113,5 @@ impl Device for ResetHfet1 {
         stamp_reset(&current.name, context, &real, &imaginary)
     }
 }
+
+static MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(MODEL);

@@ -238,7 +238,9 @@ fn pulse_driven_rc_matches_analytic_lands_on_every_corner_and_refines() {
 
 #[test]
 fn parsed_rc_transient_fixture_runs_through_an_ordinary_tran() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/netlists");
+    let root = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance/netlists");
     let netlist = Parser::new()
         .parse_file(root.join("rc_transient.cir"))
         .unwrap();

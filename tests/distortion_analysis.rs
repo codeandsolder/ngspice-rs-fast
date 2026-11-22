@@ -30,7 +30,7 @@ fn error_of(deck: &str) -> String {
     run_at(deck, 0).expect_err("expected failure").to_string()
 }
 
-fn column(plot: &Plot, name: &str) -> Vec<Complex> {
+fn column<'a>(plot: &'a Plot, name: &str) -> ngspice_rs::analysis::ColumnView<'a> {
     plot.column(name)
         .unwrap_or_else(|| panic!("{name} missing from {}", plot.plotname))
 }

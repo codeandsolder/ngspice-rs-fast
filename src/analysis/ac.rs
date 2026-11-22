@@ -6,7 +6,7 @@
 //! prepares its operating point exactly as `acan.c` does.
 use crate::analysis::frequency::{Advance, FrequencyGrid};
 use crate::analysis::linear::{number, plot, unsupported};
-use crate::analysis::{AnalysisPlan, Plot};
+use crate::analysis::{AnalysisPlan, Plot, PointSink};
 use crate::devices::Circuit;
 use crate::devices::linear::LinearSystem;
 use crate::maths::Vector;
@@ -19,35 +19,41 @@ pub(super) fn run(
     context: &crate::analysis::AnalysisContext,
     grid: &[Real],
     include_bias: bool,
-) -> SpiceResult<Vec<Plot>> {
+    sink: &mut dyn PointSink,
+) -> SpiceResult<()> {
     let settings = request.dc_settings().clone();
     let mut small_signal = SmallSignal::prepare(circuit, request, context, settings)?;
-    let mut plots = small_signal.retained_bias(circuit, request, context, include_bias)?;
-    let mut plot = plot(
+    for bias in small_signal.retained_bias(circuit, request, context, include_bias)? {
+        sink.complete(bias)?;
+    }
+    let plot = plot(
         circuit,
         "ac1",
         "AC Analysis",
         Some(("frequency", "frequency")),
         true,
     )?;
+    sink.begin(&plot)?;
     // NIacIter on the circuit's own matrix: the first AC solve of the
     // circuit reorders (`SMPcReorder`, starting from the real pivot order),
     // later frequencies refactor (`SMPcLUfac`) and reorder only after a zero
     // pivot. See [`ac_matrix`].
     let shared: &Circuit = circuit;
+    let mut point = Vec::with_capacity(plot.variable_count());
     for &f in grid {
         let x = small_signal.at_frequency(shared, context, f, |system| {
             ac_matrix(shared, system, 2. * std::f64::consts::PI * f)?
                 .factorize()?
                 .solve(&system.ac_rhs())
         })?;
-        let mut point = vec![Complex::real(f)];
+        point.clear();
+        point.push(Complex::real(f));
         point.extend(x);
         point.extend(circuit.observe_parameters(&context.model_context().with_frequency(f))?);
-        plot.push_point(point)?;
+        plot.check_point(&point)?;
+        sink.point(&point)?;
     }
-    plots.push(plot);
-    Ok(plots)
+    sink.end()
 }
 
 /// Which C frequency loop a grid follows: `acan.c` has a special decade delta
@@ -247,7 +253,7 @@ impl SmallSignal {
         // Spectral observations support scalar instance parameters. Include
         // them in the bias row as well; its header already names them.
         point.extend(circuit.observe_parameters(&context.model_context())?);
-        plot.push_point(point)?;
+        plot.push_point(&point)?;
         Ok(vec![plot])
     }
 

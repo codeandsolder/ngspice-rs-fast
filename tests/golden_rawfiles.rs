@@ -18,10 +18,7 @@ use ngspice_rs::analysis::results::PlotFlags;
 use ngspice_rs::primitives::{Complex, Real, approx_eq, format_spice_number};
 
 fn workspace() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".")
-        .canonicalize()
-        .expect("the workspace root exists")
+    ngspice_conformance::fixtures::workspace_root().unwrap()
 }
 
 fn fixture_names() -> Vec<String> {
@@ -12198,6 +12195,29 @@ fn multi_plot_goldens_round_trip_through_both_encodings() {
                     variable.name
                 );
             }
+        }
+    }
+}
+
+/// The complete corpus is a cross-encoding regression, not only the handful
+/// of multi-plot examples. Compare the binary serialization itself after a
+/// decode, which covers signed zero and all IEEE-754 bits.
+#[test]
+fn every_golden_preserves_binary_bytes_in_both_orders() {
+    use ngspice_rs::analysis::{BinaryByteOrder, RawFileReader};
+    for name in fixture_names() {
+        let raw = RawFile::parse(&golden_text(&name)).unwrap();
+        for order in [BinaryByteOrder::LittleEndian, BinaryByteOrder::BigEndian] {
+            let bytes = raw.to_binary_with(order).unwrap();
+            let decoded = RawFileReader::new(bytes.as_slice())
+                .with_byte_order(order)
+                .read()
+                .unwrap();
+            assert_eq!(
+                decoded.to_binary_with(order).unwrap(),
+                bytes,
+                "{name}: {order:?}"
+            );
         }
     }
 }

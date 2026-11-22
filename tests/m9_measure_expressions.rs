@@ -18,7 +18,7 @@ fn evaluate(body: &str) -> ngspice_rs::primitives::SpiceResult<Vec<measure::Meas
     plot.push_variable(Variable::new("v(out)", "voltage"));
     let mut plot = plot.build();
     for t in [0., 0.5, 1.] {
-        plot.push_point(vec![Complex::real(t), Complex::real(2. * t)])?;
+        plot.push_point(&[Complex::real(t), Complex::real(2. * t)])?;
     }
     measure::resolve_with_scope(&plot, AnalysisKind::Transient, &parsed.measurements, &scope)
 }
@@ -45,6 +45,62 @@ fn scalar_measurements_use_two_passes_but_return_source_order() {
             .is_err()
         );
     }
+}
+
+#[test]
+fn result_overlay_shadows_the_base_and_prior_results_case_insensitively() {
+    let values = evaluate(
+        "Overlay\n.param peak=9 base=3\n.func shift(x) {x+peak+base}\n\
+         .measure tran first param='shift(1)'\n\
+         .measure tran peak max v(out)\n\
+         .measure tran sample find v(out) at={peak/4}\n\
+         .measure tran PEAK find v(out) at=.75\n\
+         .measure tran peak param='PEAK+base'\n\
+         .measure tran latest param='shift(0)'\n.end\n",
+    )
+    .unwrap();
+    // The vector pass sees peak=2, then PEAK=1.5. The scalar pass sees
+    // the last vector value, and a self-named scalar can read its prior value.
+    assert_eq!(
+        values.iter().map(|result| result.value).collect::<Vec<_>>(),
+        [5.5, 2., 1., 1.5, 4.5, 7.5],
+    );
+    assert_eq!(
+        values
+            .iter()
+            .map(|result| result.name.to_ascii_lowercase())
+            .collect::<Vec<_>>(),
+        ["first", "peak", "sample", "peak", "peak", "latest"],
+    );
+}
+
+#[test]
+fn many_result_records_keep_early_and_root_bindings_accessible() {
+    use std::fmt::Write as _;
+    use std::time::Instant;
+
+    // 20,000 names refer to the earliest result and an outer parameter
+    // through a user function, the previous worst-case ancestor traversal.
+    let mut text = String::from(
+        "Long measurement sequence\n.param base=3\n.func shift(x) {x+seed+base}\n.meas tran seed max v(out)\n",
+    );
+    for i in 0..20_000_u32 {
+        writeln!(text, ".meas tran r{i} param='shift({i})'").unwrap();
+    }
+    text.push_str(".meas tran last param='r19999+seed+base'\n.end\n");
+    let start = Instant::now();
+    let records = evaluate(&text).unwrap();
+    eprintln!(
+        "20,002 measurement records including parse: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(records.len(), 20_002);
+    assert_eq!(records[0].value, 2.);
+    for (i, row) in (0..20_000_u32).zip(&records[1..20_001]) {
+        assert_eq!(row.name, format!("r{i}"));
+        assert_eq!(row.value, f64::from(i) + 5.);
+    }
+    assert_eq!(records[20_001].value, 20_009.);
 }
 
 #[test]

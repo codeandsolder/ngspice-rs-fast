@@ -182,6 +182,10 @@ pub(in crate::maths) fn check_status<T: Scalar>(
             context,
             "sparse factor storage capacity exceeded",
         )),
+        Status::NeedsReload => Err(numerical(
+            context,
+            "matrix coefficients must be reloaded before factorization",
+        )),
         Status::InvalidPlan => Err(numerical(
             context,
             "ordered sparse topology lacks a valid traversal plan",
@@ -340,10 +344,11 @@ fn solve_real(
     transposed: bool,
 ) -> SpiceResult<Vector> {
     rhs_valid(rhs, n)?;
+    let factors = sparse.factors()?;
     let x = Vector::from(if transposed {
-        sparse.solve_transposed_with_workspace(rhs.as_slice(), workspace)?
+        factors.solve_transposed(rhs.as_slice(), workspace)?
     } else {
-        sparse.solve_with_workspace(rhs.as_slice(), workspace)?
+        factors.solve(rhs.as_slice(), workspace)?
     });
     if !x.is_finite() {
         return Err(numerical(
@@ -886,7 +891,7 @@ impl SparseLu {
     /// # Errors
     /// Non-finite/invalid inverse factors or an out-of-range exponent.
     pub fn determinant(&self) -> SpiceResult<(f64, i32)> {
-        self.symbolic.sparse.determinant()
+        self.symbolic.sparse.factors()?.determinant()
     }
 }
 
@@ -1158,11 +1163,18 @@ mod tests {
             bits(previous.solve(&rhs).unwrap())
         );
         assert_eq!(
-            direct.sparse.determinant().unwrap().0.to_bits(),
+            direct
+                .sparse
+                .factors()
+                .unwrap()
+                .determinant()
+                .unwrap()
+                .0
+                .to_bits(),
             previous.determinant().unwrap().0.to_bits()
         );
         assert_eq!(
-            direct.sparse.determinant().unwrap().1,
+            direct.sparse.factors().unwrap().determinant().unwrap().1,
             previous.determinant().unwrap().1
         );
     }

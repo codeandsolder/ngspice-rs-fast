@@ -151,7 +151,7 @@ pub(super) fn run(
                 context,
             )?);
         }
-        plot.push_point(point)?;
+        plot.push_point(&point)?;
     }
     plots.push(plot);
     Ok(plots)

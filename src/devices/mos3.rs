@@ -348,15 +348,15 @@ impl Level3 {
 
 impl MosLevel for Level3 {
     type Params = Params;
-    const LEVEL: u8 = 3;
+    const BACKEND: crate::devices::ModelBackend = crate::devices::ModelBackend::Mos3;
     const LABEL: &'static str = "MOS3";
     const DEVICE_TYPE: CDeviceType = CDeviceType::Mos3;
     const NOISE_FAMILY: Option<NoiseFamily> = Some(NoiseFamily::Mos3);
     /// `mos3set.c`: `CKTmkVolt(..., "internal#drain")` / `"internal#source"`.
     const PRIME_SUFFIXES: [&'static str; 2] = ["internal#drain", "internal#source"];
 
-    fn model_schema() -> ScalarSchema<'static> {
-        ScalarSchema { parameters: MODEL }
+    fn model_schema() -> &'static ScalarSchema<'static> {
+        &MODEL_SCHEMA
     }
 
     fn from_card<'a>(
@@ -707,6 +707,8 @@ impl MosLevel for Level3 {
         })
     }
 }
+
+static MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(MODEL);
 
 #[cfg(test)]
 mod tests {

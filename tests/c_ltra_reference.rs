@@ -19,7 +19,6 @@ use std::process::Command;
 use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
-use ngspice_rs::primitives::Complex;
 
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
@@ -68,7 +67,7 @@ fn run_rust(cards: &str, analysis: &str) -> Plot {
     request.run(&mut circuit, &config.context()).unwrap()
 }
 
-fn column(plot: &Plot, name: &str) -> Vec<Complex> {
+fn column<'a>(plot: &'a Plot, name: &str) -> ngspice_rs::analysis::ColumnView<'a> {
     plot.column(name)
         .unwrap_or_else(|| panic!("no {name} in {:?}", plot.variables()))
 }

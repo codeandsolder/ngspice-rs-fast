@@ -409,7 +409,7 @@ pub(super) fn run(
             let mut point = Vec::with_capacity(values.len() + 1);
             point.push(Complex::real(freq));
             point.extend(values);
-            plot.push_point(point)?;
+            plot.push_point(&point)?;
         }
     }
     if plots.iter().any(|plot| !plot.is_finite()) {

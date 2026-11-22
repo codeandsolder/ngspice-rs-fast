@@ -200,7 +200,8 @@ fn pulse_series_rlc_with_high_maxord_matches_c() {
 #[test]
 #[ignore = "requires NGSPICE_BIN; the maxord=6 conformance deck against live C"]
 fn conformance_rlc_gear_maxord6_matches_c() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
         .join("conformance/netlists/rlc_series_gear_maxord6_tran.cir");
     let deck = fs::read_to_string(path).unwrap();
     compare(
@@ -216,7 +217,9 @@ fn conformance_rlc_gear_maxord6_matches_c() {
 #[test]
 #[ignore = "requires NGSPICE_BIN; the committed conformance deck against live C"]
 fn conformance_rc_transient_matches_c() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/netlists/rc_transient.cir");
+    let path = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance/netlists/rc_transient.cir");
     let deck = fs::read_to_string(path).unwrap();
     compare(
         "rc_transient",

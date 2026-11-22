@@ -16,7 +16,9 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::str;
 
-use ngspice_rs::analysis::{BinaryByteOrder, PlotFlags, RawFile, RawFileReader, RawFormat};
+use ngspice_rs::analysis::{
+    BinaryByteOrder, PlotFlags, RawFile, RawFileReader, RawFormat, RawReadPolicy,
+};
 use ngspice_rs::primitives::Complex;
 
 /// A `real` operating-point header: three variables, two points.
@@ -226,14 +228,14 @@ fn declared_counts_are_validated_before_allocation() {
         "{message}"
     );
 
-    // An absurd variable count is a claim the file has to back with lines.
+    // An absurd variable count is rejected by the streaming schema limit.
     let header = OP_HEADER.replace(
         "No. Variables: 3",
         &format!("No. Variables: {}", usize::MAX),
     );
     let error =
         RawFile::parse_bytes(&binary_rawfile(&header, &OP_VALUES)).expect_err("no such lines");
-    assert!(error.to_string().contains("variable line"), "{error}");
+    assert!(error.to_string().contains("variables per plot"), "{error}");
 }
 
 #[test]
@@ -469,8 +471,7 @@ fn detection_reads_only_the_header_and_never_decodes_the_payload() {
     assert!(
         rawfile.plots[0]
             .plot
-            .points()
-            .iter()
+            .rows()
             .flatten()
             .all(|value| value.re.is_nan())
     );
@@ -605,10 +606,10 @@ fn lending_rows_match_collected_data_with_small_input_buffers() {
         let mut decoder = RawFileReader::new(input).with_byte_order(order);
         for expected_plot in &expected.plots {
             let mut rows = decoder.next_plot().unwrap().unwrap();
-            assert!(rows.header().plot.points().is_empty());
-            assert_eq!(rows.point_count(), expected_plot.plot.points().len());
+            assert!(rows.header().plot.point_count() == 0);
+            assert_eq!(rows.point_count(), expected_plot.plot.point_count());
             let mut address = None;
-            for expected_row in expected_plot.plot.points() {
+            for expected_row in expected_plot.plot.rows() {
                 let row = rows.next_row().unwrap().unwrap();
                 assert_eq!(row, expected_row);
                 if let Some(previous) = address {
@@ -674,4 +675,395 @@ fn ascii_iteration_infers_mixed_column_flags_and_rejects_binary_followers() {
     let mut bytes = text.as_bytes().to_vec();
     bytes.extend_from_slice(&binary_rawfile(OP_HEADER, &OP_VALUES));
     assert!(RawFile::parse_bytes(&bytes).is_err());
+}
+
+#[test]
+fn policy_rejects_actual_long_lines_and_unbounded_blank_runs() {
+    use std::io::{Cursor, Read};
+
+    let policy = RawReadPolicy {
+        line_bytes: 64,
+        blank_bytes: 8,
+        ..RawReadPolicy::DEFAULT
+    };
+    // A long line without a terminator must stop after 64 bytes even when the
+    // entire input is already present in fill_buf.
+    let data = vec![b'x'; 2 * 1024 * 1024];
+    let error = RawFileReader::new(data.as_slice())
+        .with_policy(policy)
+        .read()
+        .unwrap_err();
+    assert!(error.to_string().contains("text line bytes"), "{error}");
+
+    // An effectively endless input is bounded too, with a tiny BufReader.
+    let input = BufReader::with_capacity(3, std::io::repeat(b'x').take(u64::MAX));
+    let error = RawFileReader::new(input)
+        .with_policy(policy)
+        .read()
+        .unwrap_err();
+    assert!(error.to_string().contains("text line bytes"), "{error}");
+
+    let input = Cursor::new(b"\n\n\n\n\n\n\n\n\n");
+    let error = RawFileReader::new(input)
+        .with_policy(policy)
+        .read()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("consecutive blank bytes"),
+        "{error}"
+    );
+
+    let text = ASCII_RAWFILE.replace("Values:\n", "Values:\n\n\n\n\n\n\n\n\n\n");
+    let error = RawFileReader::new(text.as_bytes())
+        .with_policy(policy)
+        .read()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("consecutive blank bytes"),
+        "{error}"
+    );
+}
+
+#[test]
+fn header_work_and_declared_columns_are_bounded() {
+    let header = "Title: repeated\n".repeat(64);
+    let text = format!("{header}{ASCII_RAWFILE}");
+    for (policy, resource) in [
+        (
+            RawReadPolicy {
+                header_lines: 10,
+                ..RawReadPolicy::DEFAULT
+            },
+            "header lines per plot",
+        ),
+        (
+            RawReadPolicy {
+                header_bytes: 100,
+                ..RawReadPolicy::DEFAULT
+            },
+            "header bytes per plot",
+        ),
+        (
+            RawReadPolicy {
+                variables: 0,
+                ..RawReadPolicy::DEFAULT
+            },
+            "variables per plot",
+        ),
+    ] {
+        let error = RawFileReader::new(text.as_bytes())
+            .with_policy(policy)
+            .read()
+            .unwrap_err();
+        assert!(error.to_string().contains(resource), "{error}");
+        assert!(RawFormat::detect_with_policy(text.as_bytes(), policy).is_err());
+    }
+    let bytes = binary_rawfile(OP_HEADER, &OP_VALUES);
+    let policy = RawReadPolicy {
+        variables: 3,
+        header_bytes: OP_HEADER.len() + "Binary:\n".len(),
+        header_lines: OP_HEADER.lines().count() + 1,
+        ..RawReadPolicy::DEFAULT
+    };
+    assert!(
+        RawFileReader::new(bytes.as_slice())
+            .with_policy(policy)
+            .read()
+            .is_ok()
+    );
+    assert_eq!(
+        RawFormat::detect_with_policy(&bytes, policy).unwrap(),
+        RawFormat::Binary
+    );
+    assert!(
+        RawFileReader::new(bytes.as_slice())
+            .with_policy(RawReadPolicy {
+                header_bytes: policy.header_bytes - 1,
+                ..policy
+            })
+            .read()
+            .is_err()
+    );
+    assert!(
+        RawFileReader::new(bytes.as_slice())
+            .with_policy(RawReadPolicy {
+                header_lines: policy.header_lines - 1,
+                ..policy
+            })
+            .read()
+            .is_err()
+    );
+
+    let empty =
+        "Plotname: empty\nFlags: real\nNo. Variables: 0\nNo. Points: 0\nVariables:\nValues:\n";
+    assert_eq!(
+        RawFile::parse(empty)
+            .unwrap()
+            .single_plot()
+            .unwrap()
+            .point_count(),
+        0
+    );
+    let malformed = empty.replace("No. Points: 0", "No. Points: 1");
+    assert!(
+        RawFile::parse(&malformed)
+            .unwrap_err()
+            .to_string()
+            .contains("zero variables")
+    );
+    assert!(RawFile::parse_bytes(malformed.replace("Values:", "Binary:").as_bytes()).is_err());
+}
+
+#[test]
+fn cumulative_collection_budgets_do_not_limit_streaming() {
+    let bytes = binary_rawfile(OP_HEADER, &OP_VALUES);
+    let mut two = bytes.clone();
+    two.extend_from_slice(&bytes);
+    let columns = 3;
+    let points = 2;
+    let header_bytes = OP_HEADER.len() + "Binary:\n".len();
+    let exact = RawReadPolicy {
+        plots: 2,
+        collect: ngspice_rs::analysis::RawCollectPolicy {
+            cells: 2 * points * columns,
+            rows: 2 * points,
+            variables: 2 * columns,
+            header_bytes: 2 * header_bytes,
+        },
+        ..RawReadPolicy::DEFAULT
+    };
+    assert_eq!(
+        RawFileReader::new(two.as_slice())
+            .with_policy(exact)
+            .read()
+            .unwrap()
+            .len(),
+        2
+    );
+    let mut limits = Vec::new();
+    let mut policy = exact;
+    policy.collect.cells -= 1;
+    limits.push((policy, "collected cells"));
+    policy = exact;
+    policy.collect.rows -= 1;
+    limits.push((policy, "collected rows"));
+    policy = exact;
+    policy.collect.variables -= 1;
+    limits.push((policy, "collected variables"));
+    policy = exact;
+    policy.collect.header_bytes -= 1;
+    limits.push((policy, "collected header bytes"));
+    for (policy, resource) in limits {
+        let error = RawFileReader::new(two.as_slice())
+            .with_policy(policy)
+            .read()
+            .unwrap_err();
+        assert!(error.to_string().contains(resource), "{error}");
+        let mut reader = RawFileReader::new(two.as_slice()).with_policy(policy);
+        for _ in 0..2 {
+            let mut rows = reader.next_plot().unwrap().unwrap();
+            for _ in 0..points {
+                assert_eq!(rows.next_row().unwrap().unwrap().len(), columns);
+            }
+            rows.finish().unwrap();
+        }
+        assert!(reader.next_plot().unwrap().is_none());
+    }
+    let mut reader =
+        RawFileReader::new(two.as_slice()).with_policy(RawReadPolicy { plots: 1, ..exact });
+    reader.next_plot().unwrap().unwrap().finish().unwrap();
+    let Err(error) = reader.next_plot() else {
+        panic!("accepted extra plot")
+    };
+    assert!(error.to_string().contains("plots per input"), "{error}");
+    assert!(reader.next_plot().is_err());
+}
+
+#[test]
+fn rootless_pole_zero_rows_round_trip_without_consuming_next_header() {
+    use ngspice_rs::analysis::{Plot, PlotFlags};
+    let pz = "Title: empty roots\nPlotname: Pole-Zero Analysis\nFlags: real\nNo. Variables: 0\nNo. Points: 1\nVariables:\n";
+    // Pinned ngspice's ASCII batch writer emits 0 + TAB without any newline.
+    let concatenated = format!("{pz}Values:\n0\t{pz}Values:\n0\t");
+    let raw = RawFile::parse(&concatenated).unwrap();
+    assert_eq!(raw.len(), 2);
+    for raw_plot in &raw.plots {
+        assert_eq!(raw_plot.plot.point_count(), 1);
+        assert!(raw_plot.plot.cells().is_empty());
+        assert_eq!(raw_plot.plot.rows().count(), 1);
+    }
+    assert_eq!(RawFile::parse(&raw.to_ascii().unwrap()).unwrap(), raw);
+    for order in [BinaryByteOrder::LittleEndian, BinaryByteOrder::BigEndian] {
+        let bytes = raw.to_binary_with(order).unwrap();
+        assert_eq!(
+            RawFileReader::new(bytes.as_slice())
+                .with_byte_order(order)
+                .read()
+                .unwrap(),
+            raw
+        );
+    }
+    assert_eq!(
+        RawFile::parse(&format!("{pz}Values:\n 0\n"))
+            .unwrap()
+            .single_plot()
+            .unwrap()
+            .point_count(),
+        1
+    );
+    for tail in ["", "1\t", "0", "0x"] {
+        assert!(
+            RawFile::parse(&format!("{pz}Values:\n{tail}")).is_err(),
+            "{tail:?}"
+        );
+    }
+    let excessive = pz.replace("No. Points: 1", "No. Points: 2");
+    assert!(RawFile::parse(&format!("{excessive}Values:\n0\t1\t")).is_err());
+    assert!(RawFile::parse_bytes(format!("{excessive}Binary:\n").as_bytes()).is_err());
+    let budget = RawReadPolicy {
+        collect: ngspice_rs::analysis::RawCollectPolicy {
+            rows: 1,
+            ..RawReadPolicy::DEFAULT.collect
+        },
+        ..RawReadPolicy::DEFAULT
+    };
+    assert!(
+        RawFileReader::new(concatenated.as_bytes())
+            .with_policy(budget)
+            .read()
+            .unwrap_err()
+            .to_string()
+            .contains("collected rows")
+    );
+    let mut invalid = Plot::new("pz1", "Pole-Zero Analysis", PlotFlags::Real, vec![]);
+    invalid.push_point(&[]).unwrap();
+    invalid.plotname = "other".into();
+    assert!(RawFile::single(invalid).to_ascii().is_err());
+}
+
+#[test]
+fn empty_pz_streaming_preserves_following_plot_and_exact_row_budget() {
+    for empty_rows in [0, 1] {
+        let header = format!(
+            "Plotname: Pole-Zero Analysis\nFlags: real\nNo. Variables: 0\nNo. Points: {empty_rows}\nVariables:\n"
+        );
+        let marker = if empty_rows == 1 { "0\t" } else { "" };
+        for (mut bytes, following, encoding) in [
+            (
+                format!("{header}Values:\n{marker}").into_bytes(),
+                ASCII_RAWFILE.as_bytes().to_vec(),
+                RawFormat::Ascii,
+            ),
+            (
+                binary_rawfile(&header, &[]),
+                binary_rawfile(OP_HEADER, &OP_VALUES),
+                RawFormat::Binary,
+            ),
+        ] {
+            let expected = RawFile::parse_bytes(&following).unwrap();
+            let ordinary = expected.single_plot().unwrap();
+            bytes.extend_from_slice(&following);
+            let mut policy = RawReadPolicy::DEFAULT;
+            policy.collect.rows = empty_rows + ordinary.point_count();
+            policy.collect.cells = ordinary.cells().len();
+            policy.collect.variables = ordinary.variable_count();
+            assert_eq!(RawFormat::detect(&bytes).unwrap(), encoding);
+            // Exercise both explicit decoding and finish() draining the
+            // empty row. A one-byte reader splits the ASCII index token.
+            for drain_first in [false, true] {
+                let input = BufReader::with_capacity(1, bytes.as_slice());
+                let mut reader = RawFileReader::new(input).with_policy(policy);
+                let mut empty = reader.next_plot().unwrap().unwrap();
+                assert_eq!(empty.point_count(), empty_rows);
+                if drain_first {
+                    for _ in 0..empty_rows {
+                        assert_eq!(empty.next_row().unwrap().unwrap(), &[]);
+                    }
+                    assert!(empty.next_row().unwrap().is_none());
+                }
+                assert_eq!(empty.finish().unwrap().plot.point_count(), 0);
+                let mut next = reader.next_plot().unwrap().unwrap();
+                assert_eq!(next.point_count(), ordinary.point_count());
+                for row in ordinary.rows() {
+                    assert_eq!(next.next_row().unwrap().unwrap(), row);
+                }
+                next.finish().unwrap();
+                assert!(reader.next_plot().unwrap().is_none());
+            }
+            let collected = RawFileReader::new(bytes.as_slice())
+                .with_policy(policy)
+                .read()
+                .unwrap();
+            assert_eq!(collected.len(), 2);
+            assert_eq!(collected.plots[0].plot.point_count(), empty_rows);
+            assert!(collected.plots[0].plot.cells().is_empty());
+            assert_eq!(collected.plots[1], expected.plots[0]);
+            policy.collect.rows -= 1;
+            assert!(
+                RawFileReader::new(bytes.as_slice())
+                    .with_policy(policy)
+                    .read()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("collected rows")
+            );
+        }
+    }
+}
+
+#[test]
+fn malformed_zero_width_shapes_fail_before_streaming_or_allocation() {
+    for (plotname, flags, points) in [
+        ("Pole-Zero Analysis", "real", 2),
+        ("Pole-Zero Analysis", "real", usize::MAX),
+        ("Pole-Zero Analysis", "complex", 1),
+        ("Operating Point", "real", 1),
+    ] {
+        let header = format!(
+            "Plotname: {plotname}\nFlags: {flags}\nNo. Variables: 0\nNo. Points: {points}\nVariables:\n"
+        );
+        for (mut bytes, next) in [
+            (
+                format!("{header}Values:\n").into_bytes(),
+                ASCII_RAWFILE.as_bytes().to_vec(),
+            ),
+            (
+                binary_rawfile(&header, &[]),
+                binary_rawfile(OP_HEADER, &OP_VALUES),
+            ),
+        ] {
+            bytes.extend_from_slice(&next);
+            assert!(
+                RawFormat::detect(&bytes)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("zero variables")
+            );
+            let mut reader = RawFileReader::new(bytes.as_slice());
+            let Err(error) = reader.next_plot() else {
+                panic!("accepted invalid zero-width shape");
+            };
+            assert!(error.to_string().contains("zero variables"), "{error}");
+            assert!(reader.next_plot().is_err());
+        }
+    }
+}
+
+#[test]
+fn rootless_ascii_index_work_is_bounded_even_when_finishing() {
+    let header = "Plotname: Pole-Zero Analysis\nFlags: real\nNo. Variables: 0\nNo. Points: 1\nVariables:\nValues:\n";
+    let policy = RawReadPolicy {
+        line_bytes: 64,
+        ..RawReadPolicy::DEFAULT
+    };
+    let text = format!("{header}{}0\t{ASCII_RAWFILE}", " ".repeat(65));
+    let mut reader = RawFileReader::new(text.as_bytes()).with_policy(policy);
+    let row = reader.next_plot().unwrap().unwrap();
+    assert!(
+        row.finish()
+            .unwrap_err()
+            .to_string()
+            .contains("empty pole-zero point index")
+    );
+    assert!(reader.next_plot().is_err());
 }

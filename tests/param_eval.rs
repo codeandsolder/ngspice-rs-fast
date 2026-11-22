@@ -140,9 +140,15 @@ fn work_is_bounded() {
         ..EvalLimits::default()
     });
     assert!(ParamScope::resolve(None, &[], &n.params, &mut budget).is_err());
-    let long = format!(".param p={{{}1}}", "1+".repeat(2000));
-    let e = scope(&long).unwrap_err();
-    assert!(e.contains("deeper than"), "{e}");
+    // The syntax tree is within the construction limit; a deliberately
+    // smaller evaluation depth budget must still be enforced independently.
+    let long = deck(&format!(".param p={{{}1}}", "1+".repeat(100)));
+    let mut budget = EvalBudget::new(EvalLimits {
+        depth: 64,
+        ..EvalLimits::default()
+    });
+    let e = ParamScope::resolve(None, &[], &long.params, &mut budget).unwrap_err();
+    assert!(e.to_string().contains("deeper than"), "{e}");
 }
 
 #[test]

@@ -180,17 +180,19 @@ values: complex as `re,im` with 15 fractional digits, except that a component wh
       0  1.000000000000000e+02,0.000000000000000e+00  7.169568003248978e-01,-4.504772433683886e-01  …
 ```
 
-**The full plot is kept while anything reads it.** The selection is a
-projection applied only to what is written. `Selection::apply` builds a new
-plot; the driver's plot stays untouched for the measurement work that follows.
-The selection depends only on the plot's variables, so it can also be applied
-one row at a time (`Selection::header`, `Selection::apply_point`): when no
-`.print`, `.measure` or `.four` card reads a `.tran` plot
-(`batch::needs_full_plot`), `simulate` resolves the selection against the
-header the driver announces and streams each accepted point through it into the
-rawfile, keeping no plot at all, as C's batch output does. Both paths write the
-same bytes, and an unresolvable request still fails before anything is
-published.
+**Retention is per scheduled plot.** `batch::plan_outputs` assigns the
+rawfile projection, print, measurement and Fourier consumers to the ordered
+output identities before running a job. The optional small-signal bias
+receives only .save requests; noise spectra and integrated totals route
+by planned ordinal, not by the human-readable Plotname header. Only the
+last job of each kind receives its measurement/Fourier consumers. A consumer
+that needs the result retains one packed row-major table; `Selection::into_plot`
+transfers an identity projection without copying it, and compacts non-expanding consuming projections in place. All post-processing
+sees full unprojected data, including operands absent from the rawfile.
+For rawfile-only transient, AC, DC and noise spectrum output, selection
+binds against the announced header and projects each borrowed reusable row into the spool.
+Both paths use the same plan and write the same bytes; failure of any
+consumer leaves the previous destination unchanged.
 
 ## Divergence from C
 

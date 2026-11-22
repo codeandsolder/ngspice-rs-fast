@@ -32,7 +32,7 @@ fn value(plot: &Plot, name: &str, point: usize) -> f64 {
     let index = plot
         .variable_index(name)
         .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
-    plot.points()[point][index].re
+    plot.row(point).unwrap()[index].re
 }
 fn close(a: f64, b: f64, relative: f64, absolute: f64) {
     assert!(
@@ -417,7 +417,7 @@ fn transient_gate_charge_drives_the_source_follower() {
              j1 vdd g s jm\nrs s 0 2k\n.model jm njf(vto=-2 beta=1m cgs=5p cgd=2p)";
         let mut c = circuit(body).unwrap();
         let plot = run(&mut c, AnalysisKind::Transient, &["5n", "1.5u"]);
-        let last = plot.points().len() - 1;
+        let last = plot.point_count() - 1;
         // Settled: the source follows the gate within a volt (vgs > vto).
         let (g, s) = (value(&plot, "v(g)", last), value(&plot, "v(s)", last));
         close(g, 1., 1e-3, 1e-3);

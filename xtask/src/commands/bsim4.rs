@@ -42,14 +42,14 @@ pub(super) fn main(root: &std::path::Path, args: &[String]) -> Result<(), String
         &read("b4par.c")?,
         &revision,
     )?;
-    let defaults = ifparm::literal_defaults(
-        &SPEC,
-        &read("b4.c")?,
-        &read("b4mpar.c")?,
-        &read("b4set.c")?,
-        &revision,
-    )?;
-    let fields = super::bsim4_fields::fields(&read("bsim4def.h")?, &revision)?;
+    let setup = read("b4set.c")?;
+    let header = read("bsim4def.h")?;
+    let facts = ifparm::literal_default_facts(&SPEC, &read("b4.c")?, &read("b4mpar.c")?, &setup)?;
+    let mut defaults = ifparm::literal_defaults(&SPEC, &facts, &revision)?;
+    defaults.push_str(&super::bsim4_fields::independent_defaults(
+        &header, &setup, &facts,
+    )?);
+    let fields = super::bsim4_fields::fields(root, &header, &revision)?;
     let asks = super::bsim4_fields::asks(&read("b4mask.c")?, &read("b4ask.c")?, &revision)?;
     for (path, text) in [
         ("src/devices/bsim4/asks.rs", asks),

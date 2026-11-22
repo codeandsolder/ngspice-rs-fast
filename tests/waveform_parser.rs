@@ -15,7 +15,9 @@ fn parse(body: &str) -> Result<Netlist, SpiceError> {
 
 #[test]
 fn transient_fixture_has_positioned_pulse_and_unvalidated_request() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/netlists/rc_transient.cir");
+    let path = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance/netlists/rc_transient.cir");
     let netlist = Parser::new().parse_file(path).unwrap();
     assert_eq!(netlist.devices.len(), 3);
     let source = netlist.device("v1").unwrap();

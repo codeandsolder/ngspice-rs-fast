@@ -410,7 +410,9 @@ fn simulate_writes_both_plots_and_composes_with_other_analyses() {
 #[test]
 fn large_bjt_bypass_runs_ac_and_adjoint_noise_at_high_frequency() {
     let deck = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/netlists/noise_bjt.cir"),
+        ngspice_conformance::fixtures::workspace_root()
+            .unwrap()
+            .join("conformance/netlists/noise_bjt.cir"),
     )
     .unwrap()
     .replace("ce e 0 1n", "ce e 0 10u")

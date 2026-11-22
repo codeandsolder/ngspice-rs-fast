@@ -69,7 +69,7 @@ pub(super) struct Level9(Level3);
 
 impl MosLevel for Level9 {
     type Params = Params;
-    const LEVEL: u8 = 9;
+    const BACKEND: crate::devices::ModelBackend = crate::devices::ModelBackend::Mos9;
     const LABEL: &'static str = "MOS9";
     const DEVICE_TYPE: CDeviceType = CDeviceType::Mos9;
     const NOISE_FAMILY: Option<NoiseFamily> = Some(NoiseFamily::Mos9);
@@ -79,10 +79,8 @@ impl MosLevel for Level9 {
     /// NLEV and GDSNOI, which are refused as unknown setters. The validated
     /// card then carries level 3's `NLEV = 2` default, which selects
     /// `mos9noi.c`'s `2/3 |gm|` channel noise in the shell.
-    fn model_schema() -> ScalarSchema<'static> {
-        ScalarSchema {
-            parameters: MODEL_WITHOUT_NOISE_SELECTORS,
-        }
+    fn model_schema() -> &'static ScalarSchema<'static> {
+        &MODEL_WITHOUT_NOISE_SELECTORS_SCHEMA
     }
 
     fn from_card<'a>(
@@ -165,6 +163,9 @@ impl MosLevel for Level9 {
         )
     }
 }
+
+static MODEL_WITHOUT_NOISE_SELECTORS_SCHEMA: ScalarSchema<'static> =
+    ScalarSchema::new(MODEL_WITHOUT_NOISE_SELECTORS);
 
 #[cfg(test)]
 mod tests {

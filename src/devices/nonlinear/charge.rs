@@ -63,6 +63,11 @@ impl ChargeBranch {
         Ok(value)
     }
 
+    /// The derivative state adjacent to this charge.
+    pub(in crate::devices) const fn derivative_slot(self) -> usize {
+        self.slot + 1
+    }
+
     /// `NIintegrate` stores the derivative, but does not advance accepted
     /// history or write the charge slot. The device owns those operations.
     #[inline]

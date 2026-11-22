@@ -365,7 +365,8 @@ fn m10_mos2_fixtures_parse_write_parse_with_a_fixed_point() {
     for name in ["m10_mos2_dc", "m10_mos2_ac", "m10_mos2_tran"] {
         let n = Parser::new()
             .parse_file(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
+                ngspice_conformance::fixtures::workspace_root()
+                    .unwrap()
                     .join(format!("conformance/netlists/{name}.cir")),
             )
             .unwrap();
@@ -390,7 +391,7 @@ fn model_card_current(body: &str) -> f64 {
     let plot = op(&mut circuit(&format!(
         "vd d 0 3\nvg g 0 2\nvsense s 0 0\n{body}"
     )));
-    plot.points()[0][plot.variable_index("i(vsense)").unwrap()].re
+    plot.row(0).unwrap()[plot.variable_index("i(vsense)").unwrap()].re
 }
 
 #[test]

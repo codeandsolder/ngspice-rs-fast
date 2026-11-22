@@ -14,7 +14,9 @@ use ngspice_rs::netlist::{Parser, semantic_diff, semantic_eq, write_netlist};
 use ngspice_rs::primitives::{AnalysisKind, SpiceError};
 
 fn conformance() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance")
+    ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance")
 }
 
 /// (instance, nodes, model) for each top-level device in deck order.

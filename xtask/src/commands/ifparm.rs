@@ -388,6 +388,9 @@ pub(super) struct LiteralDefault {
     pub(super) kind: String,
     /// Literal C default.
     pub(super) value: f64,
+    /// Verified destination and given-bit members.
+    pub(super) field: String,
+    pub(super) given: String,
 }
 
 impl LiteralDefault {
@@ -459,6 +462,8 @@ pub(super) fn literal_default_facts(
             name: p.name.clone(),
             kind: p.kind.clone(),
             value,
+            field: field.trim().into(),
+            given: given.into(),
         });
     }
     if seen.len() != spec.literal_expected {
@@ -474,16 +479,14 @@ pub(super) fn literal_default_facts(
 /// The generated `defaults_data.rs` text for models using keyword/value tables.
 pub(super) fn literal_defaults(
     spec: &Spec,
-    tables: &str,
-    mpar: &str,
-    setup: &str,
+    facts: &[LiteralDefault],
     revision: &str,
 ) -> Result<String, String> {
     let mut out = format!(
         "// Generated literal-default facts, not C implementation code.\n// Source: ngspice {revision}, {}/{}.\n// Dependent defaults and diagnostics are implemented separately.\n\n/// Canonical model keyword and literal default, in C setup order.\n#[rustfmt::skip]\npub(super) const LITERALS: &[(&str, f64)] = &[\n",
         spec.directory, spec.setup_file
     );
-    for default in literal_default_facts(spec, tables, mpar, setup)? {
+    for default in facts {
         writeln!(out, "    ({:?}, {}),", default.name, default.formatted())
             .map_err(|e| e.to_string())?;
     }

@@ -18,9 +18,9 @@ use winnow::stream::Stream;
 use winnow::token::{any, literal, take, take_while};
 
 use crate::netlist::bexpr::{BBinaryOp, BExpr, BExprKind, BUnaryOp, BehaviouralExpression};
-use crate::netlist::expr::{MAX_NESTING, SourceSpan};
+use crate::netlist::expr::{MAX_NESTING, MAX_TREE_NODES, SourceSpan};
 
-use super::expression::{Ctx, Fail, In, Res, cut, into_error};
+use super::expression::{Built, Ctx, Fail, In, Res, cut, into_error};
 
 /// Parses the longest behavioural expression at the start of `text` (whose
 /// first byte is at `origin`). Returns the expression and
@@ -58,11 +58,12 @@ pub(super) fn parse_prefix(
             origin,
             total: prepared.len(),
             depth: 0,
+            remaining_nodes: MAX_TREE_NODES,
             shadowing: &[],
         },
     };
     let options = Options { verbatim, auto_gnd };
-    let run = |input: &mut In<'_>| -> Res<BExpr> {
+    let run = |input: &mut In<'_>| -> Res<Built<BExpr>> {
         ws(input)?;
         if input.input.is_empty() {
             return Err(cut(input.eof_offset(), "empty behavioural expression"));
@@ -85,7 +86,7 @@ pub(super) fn parse_prefix(
                     text: written.to_owned(),
                     span,
                     verbatim,
-                    root,
+                    root: root.node,
                 },
                 consumed,
             ))
@@ -144,16 +145,22 @@ fn joined(lhs: &BExpr, rhs: &BExpr) -> SourceSpan {
     }
 }
 
-fn binary(op: BBinaryOp, lhs: BExpr, rhs: BExpr) -> BExpr {
-    let span = joined(&lhs, &rhs);
-    BExpr {
+fn binary(
+    input: &mut In<'_>,
+    at: usize,
+    op: BBinaryOp,
+    lhs: Built<BExpr>,
+    rhs: Built<BExpr>,
+) -> Res<Built<BExpr>> {
+    let span = joined(&lhs.node, &rhs.node);
+    input.state.node(at, lhs.height.max(rhs.height), || BExpr {
         kind: BExprKind::Binary {
             op,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
+            lhs: Box::new(lhs.node),
+            rhs: Box::new(rhs.node),
         },
         span,
-    }
+    })
 }
 
 fn enter(input: &mut In<'_>, at: usize) -> Res<()> {
@@ -176,7 +183,7 @@ fn next_char(input: &In<'_>) -> Option<char> {
 }
 
 /// `or [ '?' expr ':' expr ]`, right associative.
-fn ternary(input: &mut In<'_>, options: Options) -> Res<BExpr> {
+fn ternary(input: &mut In<'_>, options: Options) -> Res<Built<BExpr>> {
     let condition = binary_level(input, options, 0)?;
     ws(input)?;
     if next_char(input) != Some('?') {
@@ -193,15 +200,19 @@ fn ternary(input: &mut In<'_>, options: Options) -> Res<BExpr> {
     }
     let otherwise = ternary(input, options)?;
     leave(input);
-    let span = joined(&condition, &otherwise);
-    Ok(BExpr {
-        kind: BExprKind::Ternary {
-            condition: Box::new(condition),
-            then: Box::new(then),
-            otherwise: Box::new(otherwise),
+    let span = joined(&condition.node, &otherwise.node);
+    input.state.node(
+        at,
+        condition.height.max(then.height).max(otherwise.height),
+        || BExpr {
+            kind: BExprKind::Ternary {
+                condition: Box::new(condition.node),
+                then: Box::new(then.node),
+                otherwise: Box::new(otherwise.node),
+            },
+            span,
         },
-        span,
-    })
+    )
 }
 
 /// Binary operators of one precedence level, lowest first (yacc `%left`).
@@ -242,7 +253,7 @@ fn operator_at(input: &In<'_>, level: usize) -> Option<(&'static str, BBinaryOp)
     None
 }
 
-fn binary_level(input: &mut In<'_>, options: Options, level: usize) -> Res<BExpr> {
+fn binary_level(input: &mut In<'_>, options: Options, level: usize) -> Res<Built<BExpr>> {
     if level == LEVELS.len() {
         return unary(input, options);
     }
@@ -252,9 +263,10 @@ fn binary_level(input: &mut In<'_>, options: Options, level: usize) -> Res<BExpr
         let Some((symbol, op)) = operator_at(input, level) else {
             return Ok(lhs);
         };
+        let at = input.eof_offset();
         take(symbol.len()).void().parse_next(input)?;
         let rhs = binary_level(input, options, level + 1)?;
-        lhs = binary(op, lhs, rhs);
+        lhs = binary(input, at, op, lhs, rhs)?;
     }
 }
 
@@ -269,7 +281,7 @@ fn prefix_operator(input: &In<'_>) -> Option<BUnaryOp> {
 }
 
 /// `('-' | '+' | '!') unary | power`: a sign binds looser than `^`.
-fn unary(input: &mut In<'_>, options: Options) -> Res<BExpr> {
+fn unary(input: &mut In<'_>, options: Options) -> Res<Built<BExpr>> {
     ws(input)?;
     let start = input.eof_offset();
     let Some(op) = prefix_operator(input) else {
@@ -279,23 +291,24 @@ fn unary(input: &mut In<'_>, options: Options) -> Res<BExpr> {
     enter(input, start)?;
     let operand = unary(input, options)?;
     leave(input);
-    let end = operand.span.end.clone();
-    let logical = input.state.position(start).logical_offset()..operand.span.logical.end;
-    Ok(BExpr {
+    let end = operand.node.span.end.clone();
+    let logical = input.state.position(start).logical_offset()..operand.node.span.logical.end;
+    let span = SourceSpan {
+        start: input.state.location(start),
+        end,
+        logical,
+    };
+    input.state.node(start, operand.height, || BExpr {
         kind: BExprKind::Unary {
             op,
-            operand: Box::new(operand),
+            operand: Box::new(operand.node),
         },
-        span: SourceSpan {
-            start: input.state.location(start),
-            end,
-            logical,
-        },
+        span,
     })
 }
 
 /// `primary { ('^' | '**') (primary | prefix unary) }`, left associative.
-fn power(input: &mut In<'_>, options: Options) -> Res<BExpr> {
+fn power(input: &mut In<'_>, options: Options) -> Res<Built<BExpr>> {
     let mut lhs = primary(input, options)?;
     loop {
         ws(input)?;
@@ -306,6 +319,7 @@ fn power(input: &mut In<'_>, options: Options) -> Res<BExpr> {
         } else {
             return Ok(lhs);
         };
+        let at = input.eof_offset();
         take(width).void().parse_next(input)?;
         ws(input)?;
         // yacc: the right operand may itself start with a sign, which then
@@ -315,7 +329,7 @@ fn power(input: &mut In<'_>, options: Options) -> Res<BExpr> {
         } else {
             primary(input, options)?
         };
-        lhs = binary(BBinaryOp::Pow, lhs, rhs);
+        lhs = binary(input, at, BBinaryOp::Pow, lhs, rhs)?;
     }
 }
 
@@ -329,7 +343,7 @@ const fn is_name_continue(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '#' | '$' | '%' | '[' | ']')
 }
 
-fn primary(input: &mut In<'_>, options: Options) -> Res<BExpr> {
+fn primary(input: &mut In<'_>, options: Options) -> Res<Built<BExpr>> {
     ws(input)?;
     let start = input.eof_offset();
     match peek(opt(any)).parse_next(input)? {
@@ -348,16 +362,17 @@ fn primary(input: &mut In<'_>, options: Options) -> Res<BExpr> {
     }
 }
 
-fn group(input: &mut In<'_>, options: Options) -> Res<BExpr> {
+fn group(input: &mut In<'_>, options: Options) -> Res<Built<BExpr>> {
     let start = input.eof_offset();
     literal("(").void().parse_next(input)?;
     enter(input, start)?;
     let inner = ternary(input, options)?;
     close(input, start)?;
     leave(input);
-    Ok(BExpr {
-        kind: BExprKind::Group(Box::new(inner)),
-        span: span(input, start, input.eof_offset()),
+    let span = span(input, start, input.eof_offset());
+    input.state.node(start, inner.height, || BExpr {
+        kind: BExprKind::Group(Box::new(inner.node)),
+        span,
     })
 }
 
@@ -382,7 +397,7 @@ fn close(input: &mut In<'_>, open: usize) -> Res<()> {
 
 /// `INPevaluate()` number with its scale factor; trailing letters (units)
 /// are swallowed as `inp_modify_exp()`/`PTlex()` do.
-fn number(input: &mut In<'_>) -> Res<BExpr> {
+fn number(input: &mut In<'_>) -> Res<Built<BExpr>> {
     let start = input.eof_offset();
     let before = input.input;
     let Some(parsed) = parse_spice_number_prefix(before) else {
@@ -399,16 +414,17 @@ fn number(input: &mut In<'_>) -> Res<BExpr> {
             format!("numeric literal '{spelling}' overflows to a non-finite value"),
         ));
     }
-    Ok(BExpr {
+    let span = span(input, start, input.eof_offset());
+    input.state.node(start, 0, || BExpr {
         kind: BExprKind::Number {
             value: parsed.value,
             spelling: spelling.to_owned(),
         },
-        span: span(input, start, input.eof_offset()),
+        span,
     })
 }
 
-fn name_or_call(input: &mut In<'_>, options: Options) -> Res<BExpr> {
+fn name_or_call(input: &mut In<'_>, options: Options) -> Res<Built<BExpr>> {
     let start = input.eof_offset();
     let name: &str = (
         any.verify(|c: &char| is_name_start(*c)),
@@ -423,9 +439,10 @@ fn name_or_call(input: &mut In<'_>, options: Options) -> Res<BExpr> {
     let call = next_char(input) == Some('(');
     if !call {
         input.reset(&checkpoint);
-        return Ok(BExpr {
+        let span = span(input, start, input.eof_offset());
+        return input.state.node(start, 0, || BExpr {
             kind: BExprKind::Name(lowered),
-            span: span(input, start, input.eof_offset()),
+            span,
         });
     }
     if matches!(lowered.as_str(), "v" | "i") {
@@ -456,12 +473,14 @@ fn name_or_call(input: &mut In<'_>, options: Options) -> Res<BExpr> {
     }
     close(input, open)?;
     leave(input);
-    Ok(BExpr {
+    let height = arguments.iter().map(|arg| arg.height).max().unwrap_or(0);
+    let span = span(input, start, input.eof_offset());
+    input.state.node(start, height, || BExpr {
         kind: BExprKind::Call {
             name: lowered,
-            arguments,
+            arguments: arguments.into_iter().map(|arg| arg.node).collect(),
         },
-        span: span(input, start, input.eof_offset()),
+        span,
     })
 }
 
@@ -485,7 +504,7 @@ fn circuit_quantity(
     start: usize,
     voltage: bool,
     options: Options,
-) -> Res<BExpr> {
+) -> Res<Built<BExpr>> {
     ws(input)?;
     literal("(").void().parse_next(input)?;
     let canonical = |name: &str| {
@@ -520,14 +539,12 @@ fn circuit_quantity(
             },
         ));
     }
-    Ok(BExpr {
-        kind,
-        span: span(input, start, input.eof_offset()),
-    })
+    let span = span(input, start, input.eof_offset());
+    input.state.node(start, 0, || BExpr { kind, span })
 }
 
 /// A `{...}`/`'...'` numparam value inside a `=pwl(` line.
-fn numparam_value(input: &mut In<'_>) -> Res<BExpr> {
+fn numparam_value(input: &mut In<'_>) -> Res<Built<BExpr>> {
     let start = input.eof_offset();
     let open = next_char(input).unwrap_or('{');
     let close = if open == '{' { '}' } else { '\'' };
@@ -536,11 +553,13 @@ fn numparam_value(input: &mut In<'_>) -> Res<BExpr> {
         return Err(cut(start, format!("unterminated '{open}' value")));
     };
     let inner = &text[1..=length];
-    let parsed = super::expression::parse_delimited(
+    let (parsed, height, remaining) = super::expression::parse_with_budget(
         inner,
         input.state.position(start).advance(1),
         true,
         open == '\'',
+        &[],
+        input.state.remaining_nodes,
     )
     .map_err(|error| {
         ErrMode::Cut(Fail {
@@ -551,9 +570,11 @@ fn numparam_value(input: &mut In<'_>) -> Res<BExpr> {
         })
     })?;
     take(length + 2).void().parse_next(input)?;
-    Ok(BExpr {
+    input.state.remaining_nodes = remaining;
+    let span = span(input, start, input.eof_offset());
+    input.state.node(start, height, || BExpr {
         kind: BExprKind::Value(Box::new(parsed)),
-        span: span(input, start, input.eof_offset()),
+        span,
     })
 }
 

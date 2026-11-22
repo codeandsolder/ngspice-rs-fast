@@ -13,10 +13,11 @@ use crate::netlist::source::Deck;
 use crate::primitives::{SourceLoc, SpiceError, SpiceResult};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub(super) struct InputCard {
-    pub source: RawCard,
-    pub include_chain: Vec<SourceLoc>,
+    pub source: Arc<RawCard>,
+    pub include_chain: Arc<[SourceLoc]>,
     pub resolved_path: Option<PathBuf>,
     pub selected_section: Option<crate::netlist::ast::LibrarySection>,
 }
@@ -24,8 +25,8 @@ pub(super) struct InputCard {
 impl From<RawCard> for InputCard {
     fn from(source: RawCard) -> Self {
         Self {
-            source,
-            include_chain: Vec::new(),
+            source: Arc::new(source),
+            include_chain: Arc::default(),
             resolved_path: None,
             selected_section: None,
         }
@@ -425,8 +426,8 @@ fn check_end(opening: Option<(&str, &SourceLoc)>, location: &SourceLoc) -> Spice
 fn ordered(entry: &InputCard, kind: ScopedCardKind) -> ScopedCard {
     ScopedCard {
         kind,
-        source: entry.source.clone(),
-        include_chain: entry.include_chain.clone(),
+        source: Arc::clone(&entry.source),
+        include_chain: Arc::clone(&entry.include_chain),
     }
 }
 

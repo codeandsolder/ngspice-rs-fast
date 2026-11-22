@@ -92,9 +92,9 @@ unsafe-cast cases instead of silently changing the input.
 | Family | Backend selection | Initial supported level policy |
 | --- | --- | --- |
 | BJT NPN/PNP | First explicit rounded level; default 1 | 0/1/2 (classic BJT); other selectors fail |
-| MOS NMOS/PMOS | First explicit rounded level; default 1 | MOS1/2/3/6/9 simulation; BSIM3 (8/49, 3.3 family) simulation including `capMod=3` charges, AC/`.pz`/`.tf`/`.tran`/`.noise`; BSIM4 (14/54, 4.8) simulation of every selector and analysis; other selectors/older BSIM3/BSIM4 versions fail naming the C directory `inpdomod.c` selects |
+| MOS NMOS/PMOS | First explicit rounded level; default 1 | MOS1 (0/1), MOS2/3/6/9 simulation; BSIM3 (8/49, 3.3 family) simulation including `capMod=3` charges, AC/`.pz`/`.tf`/`.tran`/`.noise`; BSIM4 (14/54, 4.8) simulation of every selector and analysis; other selectors/older BSIM3/BSIM4 versions fail naming the C directory `inpdomod.c` selects |
 | JFET NJF/PJF | First explicit rounded level; default 1 | 0/1 (JFET level 1), 2 (Parker-Skellern `jfet2/`), see [JFET.md](JFET.md); others fail with `NotYetPorted` |
-| MESFET NMF/PMF | First explicit rounded level; default 1 | 0/1 (Statz MES, `mes/`), see [MESFET.md](MESFET.md); 2-4 (`mesa/`), 5 (`hfet1/`), 6 (`hfet2/`) and others fail with `NotYetPorted` |
+| MESFET NMF/PMF | First explicit rounded level; default 1 | 0/1 (Statz MES, `mes/`), see [MESFET.md](MESFET.md); 2-4 (`mesa/`), 5 (`hfet1/`), 6 (`hfet2/`) are implemented; others fail with `NotYetPorted` |
 | `r` | First explicit rounded level; default 1 | Scalar resistor selector 0/1; advanced selectors fail |
 | `res`, `c`, `l` | C fixes backend 1 without scanning level | Bounded Rust contract requires first explicit level to round to 1 |
 | `d` | C fixes backend 1 without scanning level | Last ordered integer setter applies; only final applied level 1 supported |
@@ -104,10 +104,17 @@ level assignments do not change the backend and are not model data setters.
 Diode **does** have an integer model setter. Thus diode
 `level=3 level=1.49` has first raw 3, fixed selector 1 and final applied level 1;
 MOS `level=1.49 level=49` selects MOS1, with no applied level field. This separation
-is explicit in `LevelSelection::{first_raw,selector,applied}`. C would ignore some
-passive level values that Rust conservatively rejects. Unsupported levels return
-located errors with C references; recognition of classic BJT/MOS1 does not
-make their factories available.
+is explicit in `LevelSelection::{first_raw,selector,backend,applied}`. The
+validated `ModelBackend` catalog is authoritative for factory dispatch and
+the CLI device capability list. The pinned C `INPdomodel` maps BJT levels
+0/1/2 to Gummel–Poon and MOS levels 0/1 to MOS1; these aliases now instantiate
+the exact same Rust physics without changing the first-selector provenance.
+JFET and MESFET retain the rounded first selector including zero. MESA retains its
+actual level for its distinct equations. BSIM version selection occurs once during
+model resolution, not again during input schema preparation. C would ignore some
+passive level values that Rust conservatively rejects. Unsupported levels
+return located errors with C references, and an available backend can still
+reject an unsupported physical parameter or analysis.
 
 MOS level schemas are owned by the level modules on the shared
 `devices::mos` shell (M10, #89): `devices::mos1::MODEL` and
@@ -299,11 +306,9 @@ schema concern.
 and stages changes. On any error, existing node IDs, device ordinals and branch
 rows remain unchanged. Successful scalar insertion still requires `finalize`
 to rebuild numbering. `Circuit::from_netlist` uses this path with default context.
-D/Q/M factories stay unavailable; valid diode inputs still end in `NotYetPorted`.
 The bounded passive wrapper now computes contextual effective values and delegates
 to existing R/C/L stamps, as documented in [PASSIVE_MODELS.md](PASSIVE_MODELS.md). Unused model declarations remain explicit unsupported
-inputs instead of disappearing from a successful scalar simulation. Registry
-ported flags are unchanged.
+inputs instead of disappearing from a successful scalar simulation. Registry capability reporting derives model-level entries from the same backend catalog.
 
 Ordinary tests: `tests/netlist_passive_models.rs` and
 `tests/models.rs` cover syntax, scoping/order, raw AST preservation,
@@ -320,8 +325,7 @@ NGSPICE_BIN=/absolute/path/to/ngspice cargo test -p ngspice-rs --test model_c_re
 `passive_models.cir` pins setter order and geometry-based C setup values.
 `model_schemas.cir` pins first declarations, default/explicit diode IS/N/RS/AREA/
 TEMP/TNOM, repeated diode integer levels and first BJT/MOS selector behavior.
-These are setup/input checks, not Rust nonlinear simulation parity. Goldens and
-solver tolerances are unchanged. Validation results are recorded in
+Those are setup/input checks. The selector-alias tests compare actual Rust and pinned C DC sweeps of both polarities, including bit-identical Rust results for the equivalent selectors. Goldens and solver tolerances are unchanged. Validation results are recorded in
 [VERIFICATION.md](VERIFICATION.md#passive-syntax-and-model-schema-verification).
 
 ## URC line model (`urc`, #85)

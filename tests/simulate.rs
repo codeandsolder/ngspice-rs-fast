@@ -16,10 +16,7 @@ use ngspice_rs::analysis::{PlotFlags, RawFile};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn workspace() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".")
-        .canonicalize()
-        .expect("the workspace root exists")
+    ngspice_conformance::fixtures::workspace_root().unwrap()
 }
 
 fn fixture(name: &str) -> PathBuf {
@@ -70,22 +67,26 @@ fn stderr(run: &Output) -> String {
 
 /// Runs `spice-rs simulate --output <output> <deck>`.
 fn simulate(output: &Path, deck: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("simulate")
-        .args(["--format", "ascii"])
-        .arg("--output")
-        .arg(output)
-        .arg(deck)
-        .output()
-        .expect("run spice-rs")
+    Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("simulate")
+    .args(["--format", "ascii"])
+    .arg("--output")
+    .arg(output)
+    .arg(deck)
+    .output()
+    .expect("run spice-rs")
 }
 
 /// Runs `spice-rs` with raw arguments.
 fn cli(arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .args(arguments)
-        .output()
-        .expect("run spice-rs")
+    Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .args(arguments)
+    .output()
+    .expect("run spice-rs")
 }
 
 /// Compares a written rawfile with its committed C golden, variable by name.
@@ -1675,7 +1676,7 @@ fn the_m6_gate_deck_runs_every_analysis_end_to_end() {
         close("dc sense", isense[point].re, lim[point].re / 10., 1e-9);
     }
     // The operating point is at rest: every source is 0 V at DC.
-    for value in &written.plots[2].plot.points()[0] {
+    for value in written.plots[2].plot.row(0).unwrap() {
         assert!(value.magnitude() < 1e-9, "{value}");
     }
     // Transient: the 0.1 V, 1 kHz drive reaches about 2 V at v(out), where
@@ -1734,12 +1735,14 @@ fn binary_cli_output_and_encoding_precedence() {
         "binary test\nV1 in 0 1 ac 1\nR1 in 0 1k\n.op\n.ac lin 2 1 2\n.control\nset filetype=ascii\n.endc\n.end\n",
     );
     let raw = dir.join("out.raw");
-    let run = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .args(["simulate", "--format", "binary", "--output"])
-        .arg(&raw)
-        .arg(&deck)
-        .output()
-        .unwrap();
+    let run = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .args(["simulate", "--format", "binary", "--output"])
+    .arg(&raw)
+    .arg(&deck)
+    .output()
+    .unwrap();
     assert!(run.status.success(), "{}", stderr(&run));
     assert_eq!(
         RawFormat::detect(&fs::read(&raw).unwrap()).unwrap(),
@@ -1747,13 +1750,15 @@ fn binary_cli_output_and_encoding_precedence() {
     );
     assert_eq!(RawFile::load(&raw).unwrap().plots.len(), 2);
     assert!(stdout(&run).contains("ngspice binary rawfile with 2 plots"));
-    let run = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .args(["simulate", "--output"])
-        .arg(&raw)
-        .arg(&deck)
-        .env("SPICE_ASCIIRAWFILE", "0")
-        .output()
-        .unwrap();
+    let run = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .args(["simulate", "--output"])
+    .arg(&raw)
+    .arg(&deck)
+    .env("SPICE_ASCIIRAWFILE", "0")
+    .output()
+    .unwrap();
     assert!(run.status.success(), "{}", stderr(&run));
     assert_eq!(
         RawFormat::detect(&fs::read(&raw).unwrap()).unwrap(),
@@ -1761,13 +1766,15 @@ fn binary_cli_output_and_encoding_precedence() {
     );
     fs::write(&deck, "binary test\nV1 in 0 1\nR1 in 0 1k\n.op\n.end\n").unwrap();
     for (environment, expected) in [("0", RawFormat::Binary), ("1", RawFormat::Ascii)] {
-        let run = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-            .args(["simulate", "--output"])
-            .arg(&raw)
-            .arg(&deck)
-            .env("SPICE_ASCIIRAWFILE", environment)
-            .output()
-            .unwrap();
+        let run = Command::new(
+            std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+        )
+        .args(["simulate", "--output"])
+        .arg(&raw)
+        .arg(&deck)
+        .env("SPICE_ASCIIRAWFILE", environment)
+        .output()
+        .unwrap();
         assert!(run.status.success(), "{}", stderr(&run));
         assert_eq!(
             RawFormat::detect(&fs::read(&raw).unwrap()).unwrap(),
@@ -1849,12 +1856,14 @@ fn c_reads_the_cli_binary_rawfile() {
         "binary C test\nV1 in 0 1 ac 1\nR1 in 0 1k\n.op\n.ac lin 2 1 2\n.end\n",
     );
     let raw = dir.join("out.raw");
-    let run = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .args(["simulate", "--format", "binary", "--output"])
-        .arg(&raw)
-        .arg(&deck)
-        .output()
-        .unwrap();
+    let run = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .args(["simulate", "--format", "binary", "--output"])
+    .arg(&raw)
+    .arg(&deck)
+    .output()
+    .unwrap();
     assert!(run.status.success(), "{}", stderr(&run));
     let control = dir.join("read.cir");
     fs::write(&control, format!("Read Rust binary\n.control\nload {}\nsetplot op1\nprint v(in)\nsetplot ac1\nprint v(in)\nquit\n.endc\n.end\n", raw.display())).unwrap();
@@ -1952,7 +1961,15 @@ fn rawfile_without_date(dir: &Path, name: &str, deck: &Path, format: &str) -> Ve
             .position(|byte| *byte == b'\n')
             .unwrap()
         + 1;
-    [&bytes[..date], &bytes[end..]].concat()
+    let stamp = &bytes[date..end];
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut rest = bytes.as_slice();
+    while let Some(index) = rest.windows(stamp.len()).position(|window| window == stamp) {
+        normalized.extend_from_slice(&rest[..index]);
+        rest = &rest[index + stamp.len()..];
+    }
+    normalized.extend_from_slice(rest);
+    normalized
 }
 
 #[test]
@@ -2010,4 +2027,113 @@ fn a_streamed_transient_that_fails_publishes_nothing_and_leaves_no_spool() {
         assert_eq!(entries(&dir), ["deck.cir", "keep.raw"], "{tail}");
     }
     fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn concurrent_simulations_to_one_destination_publish_complete_runs() {
+    let dir = scratch("concurrent-publish");
+    let output = dir.join("same.raw");
+    let first = dir.join("first.cir");
+    let second = dir.join("second.cir");
+    fs::write(
+        &first,
+        "first\nv1 in 0 dc 1\nr1 in out 1k\nc1 out 0 1u\n.op\n.tran 0.1m 1m\n.end\n",
+    )
+    .unwrap();
+    fs::write(
+        &second,
+        "second\nv1 in 0 dc 2\nr1 in out 1k\nc1 out 0 1u\n.op\n.tran 0.1m 1m\n.end\n",
+    )
+    .unwrap();
+    fs::write(&output, "PREVIOUS").unwrap();
+    let barrier = std::sync::Barrier::new(6);
+    std::thread::scope(|scope| {
+        let mut runs = Vec::new();
+        for i in 0..6 {
+            let deck = if i % 2 == 0 { &first } else { &second };
+            let output = &output;
+            let barrier = &barrier;
+            runs.push(scope.spawn(move || {
+                barrier.wait();
+                simulate(output, deck)
+            }));
+        }
+        for run in runs {
+            let run = run.join().unwrap();
+            assert!(run.status.success(), "{}", stderr(&run));
+        }
+    });
+    let written = RawFile::load(&output).unwrap();
+    assert_eq!(written.len(), 2);
+    let title = &written.plots[0].title;
+    let voltage = match title.as_str() {
+        "first" => 1.,
+        "second" => 2.,
+        other => panic!("unexpected title {other}"),
+    };
+    for raw in &written.plots {
+        assert_eq!(&raw.title, title);
+        assert!(raw.plot.point_count() > 0);
+        for value in raw.plot.column("v(in)").unwrap() {
+            assert!((value.re - voltage).abs() < 1e-12);
+        }
+    }
+    assert_eq!(entries(&dir), ["first.cir", "same.raw", "second.cir"]);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn mixed_batch_streaming_and_retention_are_byte_identical() {
+    let dir = scratch("mixed-output-plan");
+    let input = "mixed outputs\nv1 in 0 dc 1 ac 1 pulse(0 1 1m 1u 1u 1m 2m)\nr1 in out 1k\nc1 out 0 1u\n.options keepopinfo\n.ac dec 8 1 1k\n.dc v1 0 1 0.1\n.op\n.tran 0.1m 6m\n.tran 0.1m 4m\n.noise v(out) v1 dec 4 1 1k 3\n.noise v(out) v1 lin 1 1k 1k\n";
+    for flags in ["", ".control\nset sqrnoise\n.endc\n"] {
+        let streamed = dir.join("streamed.cir");
+        fs::write(&streamed, format!("{input}{flags}.end\n")).unwrap();
+        let retained = write_deck(
+            &dir,
+            &format!(
+                "{input}{flags}.print ac all\n.print dc all\n.print noise all\n.measure tran top max v(out)\n.end\n"
+            ),
+        );
+        for format in ["ascii", "binary"] {
+            let actual = rawfile_without_date(&dir, "streamed.raw", &streamed, format);
+            let expected = rawfile_without_date(&dir, "retained.raw", &retained, format);
+            assert_eq!(actual, expected, "{format} {flags}");
+        }
+        let raw = RawFile::load(dir.join("streamed.raw")).unwrap();
+        assert_eq!(raw.len(), 11);
+        assert_eq!(raw.plots[0].plot.plotname, "AC Operating Point");
+        assert_eq!(raw.plots[1].plot.plotname, "AC Analysis");
+        assert_eq!(raw.plots[9].plot.point_count(), 5);
+        assert_eq!(raw.plots[10].plot.point_count(), 1);
+    }
+    assert_eq!(
+        entries(&dir),
+        ["deck.cir", "retained.raw", "streamed.cir", "streamed.raw"]
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn projected_ac_and_dc_streaming_matches_retained_outputs() {
+    let dir = scratch("projected-sweeps");
+    let input = "projected outputs\nv1 in 0 dc 1 ac 1\nr1 in out 1k\nr2 out 0 1k\n.ac dec 10 1 1k\n.dc v1 0 5 0.1\n.save v(out)\n";
+    let streamed = dir.join("streamed.cir");
+    fs::write(&streamed, format!("{input}.end\n")).unwrap();
+    let retained = write_deck(
+        &dir,
+        &format!("{input}.print ac v(out)\n.measure dc hidden max v(in)\n.end\n"),
+    );
+    for format in ["ascii", "binary"] {
+        assert_eq!(
+            rawfile_without_date(&dir, "streamed.raw", &streamed, format),
+            rawfile_without_date(&dir, "retained.raw", &retained, format),
+        );
+    }
+    let raw = RawFile::load(dir.join("streamed.raw")).unwrap();
+    assert_eq!(variable_names(&raw.plots[0].plot), ["frequency", "v(out)"]);
+    assert_eq!(raw.plots[1].plot.variable_count(), 2);
+    let run = simulate(&dir.join("retained.raw"), &retained);
+    assert!(stdout(&run).contains("hidden"), "{}", stdout(&run));
+    fs::remove_dir_all(dir).unwrap();
 }

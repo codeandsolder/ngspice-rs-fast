@@ -1,13 +1,9 @@
 //! `b4set.c` (`BSIM4setup`): model defaults, then instance defaults and the
 //! internal nodes C creates. Matrix elements are listed in `elements.rs`.
 //!
-//! The model pass follows C statement by statement over C's own members,
-//! including its quirk that any VERSION beginning `4.8` selects the 4.8.3
-//! equations, because C tests `strncmp(version, "4.8", 3)` first.
-#![expect(
-    non_snake_case,
-    reason = "preserves upstream C identifiers for equation-by-equation comparison"
-)] // C's member names.
+//! Independent defaults are generated from the C model loop. Selector
+//! normalization and dependent defaults retain C's precedence, including
+//! its quirk that any VERSION beginning `4.8` selects the 4.8.3 equations.
 
 use super::fields::{Instance, Model};
 use super::geo::rdseff_geo;
@@ -16,194 +12,174 @@ use super::{InputType, ModelParameters, parameters};
 use crate::devices::schema::temperature_kelvin;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
-/// C's `!strncmp(a, b, n)` for a literal `b` at least `n` bytes long.
-fn c_strncmp_eq(a: &str, b: &str, n: usize) -> bool {
-    a.as_bytes().starts_with(&b.as_bytes()[..n])
+/// Model-only setup before instance topology or temperature processing.
+#[derive(Clone)]
+pub(super) struct PreparedModel {
+    model: Model,
+    warnings: Vec<String>,
 }
 
-/// `BSIM4setup`'s model pass: every given-guarded default, the dependent
-/// defaults and the model selector checks, in C order. `nominal_temperature`
-/// is `CKTnomTemp` in kelvin. C's `printf` warnings are appended to
-/// `warnings` verbatim.
-///
-/// # Errors
-/// None today: C's model pass has no error return. The `Result` keeps the
-/// stage signature uniform.
-#[expect(
-    clippy::too_many_lines,
-    reason = "keeps the reference numerical routine in the original statement and rounding order"
-)] // One C function, kept whole.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "uniform setup stage signatures carry device errors without special cases"
-)] // Uniform stage signature.
-pub(super) fn setup_model(
-    m: &mut Model,
-    nominal_temperature: f64,
-    warnings: &mut Vec<String>,
-) -> SpiceResult<()> {
+/// Complete instance setup, with internal node requests in C creation order.
+pub(super) struct PreparedSetup {
+    pub(super) model: Model,
+    pub(super) instance: Instance,
+    pub(super) warnings: Vec<String>,
+    pub(super) created: Vec<(i32, &'static str)>,
+}
+
+pub(super) fn prepare_model(mut model: Model, nominal_temperature: f64) -> PreparedModel {
+    let mut warnings = Vec::new();
+    setup_model(&mut model, nominal_temperature, &mut warnings);
+    PreparedModel { model, warnings }
+}
+
+impl PreparedModel {
+    pub(super) fn prepare_instance(
+        mut self,
+        mut instance: Instance,
+        noise_analysis: bool,
+    ) -> PreparedSetup {
+        let created = setup_instance(
+            &self.model,
+            &mut instance,
+            noise_analysis,
+            &mut self.warnings,
+        );
+        PreparedSetup {
+            model: self.model,
+            instance,
+            warnings: self.warnings,
+            created,
+        }
+    }
+}
+
+/// Independent defaults do not depend on any other member; their generated
+/// typed assignments run before the selector and dependent-default stages.
+fn setup_model(m: &mut Model, nominal_temperature: f64, warnings: &mut Vec<String>) {
+    super::defaults_data::apply_independent_defaults(m);
+    normalize_model_selectors(m, warnings);
+    apply_dependent_defaults(m, nominal_temperature);
+}
+
+/// Integer selectors in setup order. The distinction between absent
+/// inputs and explicitly invalid values controls whether C warns.
+struct Selector<'a> {
+    name: &'static str,
+    value: &'a mut i32,
+    given: bool,
+    fallback: i32,
+    upper: i32,
+}
+
+#[derive(Clone, Copy)]
+enum SelectorOrigin {
+    Model,
+    Instance,
+}
+
+impl SelectorOrigin {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Model => "default value:",
+            Self::Instance => "global value",
+        }
+    }
+}
+
+impl<'a> Selector<'a> {
+    const fn new(
+        name: &'static str,
+        value: &'a mut i32,
+        given: bool,
+        fallback: i32,
+        upper: i32,
+    ) -> Self {
+        Self {
+            name,
+            value,
+            given,
+            fallback,
+            upper,
+        }
+    }
+
+    fn normalize(self, origin: SelectorOrigin, warnings: &mut Vec<String>) {
+        if !self.given {
+            *self.value = self.fallback;
+        } else if !(0..=self.upper).contains(self.value) {
+            *self.value = self.fallback;
+            warnings.push(format!(
+                "Warning: {} has been set to its {} {}.",
+                self.name,
+                origin.label(),
+                self.fallback
+            ));
+        }
+    }
+}
+
+/// Normalize model selectors in upstream diagnostic order.
+fn normalize_model_selectors(m: &mut Model, warnings: &mut Vec<String>) {
     if !m.typeGiven {
         m.r#type = 1;
     }
-    if !m.mobModGiven {
-        m.mobMod = 0;
-    } else if (m.mobMod != 0)
-        && (m.mobMod != 1)
-        && (m.mobMod != 2)
-        && (m.mobMod != 3)
-        && (m.mobMod != 4)
-        && (m.mobMod != 5)
-        && (m.mobMod != 6)
-    {
-        m.mobMod = 0;
-        warnings.push("Warning: mobMod has been set to its default value: 0.".into());
-    }
-    if !m.binUnitGiven {
-        m.binUnit = 1;
-    }
-    if !m.paramChkGiven {
-        m.paramChk = 1;
-    }
-    if !m.dioModGiven {
-        m.dioMod = 1;
-    } else if (m.dioMod != 0) && (m.dioMod != 1) && (m.dioMod != 2) {
-        m.dioMod = 1;
-        warnings.push("Warning: dioMod has been set to its default value: 1.".into());
-    }
-    if !m.cvchargeModGiven {
-        m.cvchargeMod = 0;
-    }
-    if !m.capModGiven {
-        m.capMod = 2;
-    } else if (m.capMod != 0) && (m.capMod != 1) && (m.capMod != 2) {
-        m.capMod = 2;
-        warnings.push("Warning: capMod has been set to its default value: 2.".into());
-    }
-    if !m.rdsModGiven {
-        m.rdsMod = 0;
-    } else if (m.rdsMod != 0) && (m.rdsMod != 1) {
-        m.rdsMod = 0;
-        warnings.push("Warning: rdsMod has been set to its default value: 0.".into());
-    }
-    if !m.rbodyModGiven {
-        m.rbodyMod = 0;
-    } else if (m.rbodyMod != 0) && (m.rbodyMod != 1) && (m.rbodyMod != 2) {
-        m.rbodyMod = 0;
-        warnings.push("Warning: rbodyMod has been set to its default value: 0.".into());
-    }
-    if !m.rgateModGiven {
-        m.rgateMod = 0;
-    } else if (m.rgateMod != 0) && (m.rgateMod != 1) && (m.rgateMod != 2) && (m.rgateMod != 3) {
-        m.rgateMod = 0;
-        warnings.push("Warning: rgateMod has been set to its default value: 0.".into());
-    }
-    if !m.perModGiven {
-        m.perMod = 1;
-    } else if (m.perMod != 0) && (m.perMod != 1) {
-        m.perMod = 1;
-        warnings.push("Warning: perMod has been set to its default value: 1.".into());
-    }
-    if !m.geoModGiven {
-        m.geoMod = 0;
-    }
-    if !m.fnoiModGiven {
-        m.fnoiMod = 1;
-    } else if (m.fnoiMod != 0) && (m.fnoiMod != 1) {
-        m.fnoiMod = 1;
-        warnings.push("Warning: fnoiMod has been set to its default value: 1.".into());
-    }
-    if !m.tnoiModGiven {
-        m.tnoiMod = 0;
-    } else if (m.tnoiMod != 0) && (m.tnoiMod != 1) && (m.tnoiMod != 2) {
-        m.tnoiMod = 0;
-        warnings.push("Warning: tnoiMod has been set to its default value: 0.".into());
-    }
-    if !m.trnqsModGiven {
-        m.trnqsMod = 0;
-    } else if (m.trnqsMod != 0) && (m.trnqsMod != 1) {
-        m.trnqsMod = 0;
-        warnings.push("Warning: trnqsMod has been set to its default value: 0.".into());
-    }
-    if !m.acnqsModGiven {
-        m.acnqsMod = 0;
-    } else if (m.acnqsMod != 0) && (m.acnqsMod != 1) {
-        m.acnqsMod = 0;
-        warnings.push("Warning: acnqsMod has been set to its default value: 0.".into());
-    }
-    if !m.mtrlModGiven {
-        m.mtrlMod = 0;
-    } else if (m.mtrlMod != 0) && (m.mtrlMod != 1) {
-        m.mtrlMod = 0;
-        warnings.push("Warning: mtrlMod has been set to its default value: 0.".into());
-    }
-    if !m.mtrlCompatModGiven {
-        m.mtrlCompatMod = 0;
-    } else if (m.mtrlCompatMod != 0) && (m.mtrlCompatMod != 1) {
-        m.mtrlCompatMod = 0;
-        warnings.push("Warning: mtrlCompatMod has been set to its default value: 0.".into());
-    }
-    if !m.igcModGiven {
-        m.igcMod = 0;
-    } else if (m.igcMod != 0) && (m.igcMod != 1) && (m.igcMod != 2) {
-        m.igcMod = 0;
-        warnings.push("Warning: igcMod has been set to its default value: 0.".into());
-    }
-    if !m.igbModGiven {
-        m.igbMod = 0;
-    } else if (m.igbMod != 0) && (m.igbMod != 1) {
-        m.igbMod = 0;
-        warnings.push("Warning: igbMod has been set to its default value: 0.".into());
-    }
-    if !m.tempModGiven {
-        m.tempMod = 0;
-    } else if (m.tempMod != 0) && (m.tempMod != 1) && (m.tempMod != 2) && (m.tempMod != 3) {
-        m.tempMod = 0;
-        warnings.push("Warning: tempMod has been set to its default value: 0.".into());
+    for selector in [
+        Selector::new("mobMod", &mut m.mobMod, m.mobModGiven, 0, 6),
+        Selector::new("dioMod", &mut m.dioMod, m.dioModGiven, 1, 2),
+        Selector::new("capMod", &mut m.capMod, m.capModGiven, 2, 2),
+        Selector::new("rdsMod", &mut m.rdsMod, m.rdsModGiven, 0, 1),
+        Selector::new("rbodyMod", &mut m.rbodyMod, m.rbodyModGiven, 0, 2),
+        Selector::new("rgateMod", &mut m.rgateMod, m.rgateModGiven, 0, 3),
+        Selector::new("perMod", &mut m.perMod, m.perModGiven, 1, 1),
+        Selector::new("fnoiMod", &mut m.fnoiMod, m.fnoiModGiven, 1, 1),
+        Selector::new("tnoiMod", &mut m.tnoiMod, m.tnoiModGiven, 0, 2),
+        Selector::new("trnqsMod", &mut m.trnqsMod, m.trnqsModGiven, 0, 1),
+        Selector::new("acnqsMod", &mut m.acnqsMod, m.acnqsModGiven, 0, 1),
+        Selector::new("mtrlMod", &mut m.mtrlMod, m.mtrlModGiven, 0, 1),
+        Selector::new(
+            "mtrlCompatMod",
+            &mut m.mtrlCompatMod,
+            m.mtrlCompatModGiven,
+            0,
+            1,
+        ),
+        Selector::new("igcMod", &mut m.igcMod, m.igcModGiven, 0, 2),
+        Selector::new("igbMod", &mut m.igbMod, m.igbModGiven, 0, 1),
+        Selector::new("tempMod", &mut m.tempMod, m.tempModGiven, 0, 3),
+    ] {
+        selector.normalize(SelectorOrigin::Model, warnings);
     }
     if !m.versionGiven {
         m.version = String::from("4.8.3");
     }
-    if (m.version == "4.8.3")
-        || (c_strncmp_eq(&m.version, "4.83", 4))
-        || (c_strncmp_eq(&m.version, "4.8", 3))
-    {
-        m.v48intVersion = 483;
-    } else if (m.version == "4.8.2") || (c_strncmp_eq(&m.version, "4.82", 4)) {
-        m.v48intVersion = 482;
-    } else if (m.version == "4.8.1") || (c_strncmp_eq(&m.version, "4.81", 4)) {
-        m.v48intVersion = 481;
-    } else if (m.version == "4.8.0") || (c_strncmp_eq(&m.version, "4.80", 4)) {
-        m.v48intVersion = 480;
-    } else {
+    // C's first prefix test subsumes its subsequent 4.8.2/4.8.1/4.8.0 tests.
+    if !m.version.starts_with("4.8") {
         warnings.push("Warning: unknown BSIM4 version. Working now with BSIM4.8.3.".into());
-        m.v48intVersion = 483;
     }
-    if !m.toxrefGiven {
-        m.toxref = 30.0e-10;
+    m.v48intVersion = 483;
+    if !m.wpemodGiven {
+        m.wpemod = 0.0;
+    } else if m.wpemod != 0.0 && m.wpemod.to_bits() != 1.0_f64.to_bits() {
+        m.wpemod = 0.0;
+        warnings.push("Warning: wpemod has been set to its default value: 0.".into());
     }
-    if !m.eotGiven {
-        m.eot = 15.0e-10;
-    }
+}
+
+/// The remaining expressions depend on polarity, selectors, nominal
+/// temperature or other already initialized model fields. Keep their C order.
+const fn apply_dependent_defaults(m: &mut Model, nominal_temperature: f64) {
+    electrical_dependent_defaults(m);
+    length_dependent_defaults(m);
+    width_dependent_defaults(m);
+    cross_dependent_defaults(m);
+    geometry_defaults(m, nominal_temperature);
+    junction_and_noise_defaults(m);
+}
+
+const fn electrical_dependent_defaults(m: &mut Model) {
     if !m.vddeotGiven {
         m.vddeot = if m.r#type == 1 { 1.5 } else { -1.5 };
-    }
-    if !m.tempeotGiven {
-        m.tempeot = 300.15;
-    }
-    if !m.leffeotGiven {
-        m.leffeot = 1.0;
-    }
-    if !m.weffeotGiven {
-        m.weffeot = 10.0;
-    }
-    if !m.adosGiven {
-        m.ados = 1.0;
-    }
-    if !m.bdosGiven {
-        m.bdos = 1.0;
-    }
-    if !m.toxeGiven {
-        m.toxe = 30.0e-10;
     }
     if !m.toxpGiven {
         m.toxp = m.toxe;
@@ -211,170 +187,14 @@ pub(super) fn setup_model(
     if !m.toxmGiven {
         m.toxm = m.toxe;
     }
-    if !m.dtoxGiven {
-        m.dtox = 0.0;
-    }
-    if !m.epsroxGiven {
-        m.epsrox = 3.9;
-    }
-    if !m.cdscGiven {
-        m.cdsc = 2.4e-4;
-    }
-    if !m.cdscbGiven {
-        m.cdscb = 0.0;
-    }
-    if !m.cdscdGiven {
-        m.cdscd = 0.0;
-    }
-    if !m.citGiven {
-        m.cit = 0.0;
-    }
-    if !m.nfactorGiven {
-        m.nfactor = 1.0;
-    }
-    if !m.xjGiven {
-        m.xj = 0.15e-6;
-    }
-    if !m.vsatGiven {
-        m.vsat = 8.0e4;
-    }
-    if !m.atGiven {
-        m.at = 3.3e4;
-    }
-    if !m.a0Given {
-        m.a0 = 1.0;
-    }
-    if !m.agsGiven {
-        m.ags = 0.0;
-    }
-    if !m.a1Given {
-        m.a1 = 0.0;
-    }
-    if !m.a2Given {
-        m.a2 = 1.0;
-    }
-    if !m.ketaGiven {
-        m.keta = -0.047;
-    }
     if !m.ketacGiven {
         m.ketac = m.keta;
-    }
-    if !m.nsubGiven {
-        m.nsub = 6.0e16;
-    }
-    if !m.phigGiven {
-        m.phig = 4.05;
-    }
-    if !m.epsrgateGiven {
-        m.epsrgate = 11.7;
-    }
-    if !m.easubGiven {
-        m.easub = 4.05;
-    }
-    if !m.epsrsubGiven {
-        m.epsrsub = 11.7;
-    }
-    if !m.ni0subGiven {
-        m.ni0sub = 1.45e10;
-    }
-    if !m.bg0subGiven {
-        m.bg0sub = 1.16;
-    }
-    if !m.tbgasubGiven {
-        m.tbgasub = 7.02e-4;
-    }
-    if !m.tbgbsubGiven {
-        m.tbgbsub = 1108.0;
-    }
-    if !m.ndepGiven {
-        m.ndep = 1.7e17;
-    }
-    if !m.nsdGiven {
-        m.nsd = 1.0e20;
-    }
-    if !m.phinGiven {
-        m.phin = 0.0;
-    }
-    if !m.ngateGiven {
-        m.ngate = 0.0;
-    }
-    if !m.vbmGiven {
-        m.vbm = -3.0;
-    }
-    if !m.xtGiven {
-        m.xt = 1.55e-7;
-    }
-    if !m.kt1Given {
-        m.kt1 = -0.11;
-    }
-    if !m.kt1lGiven {
-        m.kt1l = 0.0;
-    }
-    if !m.kt2Given {
-        m.kt2 = 0.022;
-    }
-    if !m.k3Given {
-        m.k3 = 80.0;
-    }
-    if !m.k3bGiven {
-        m.k3b = 0.0;
-    }
-    if !m.w0Given {
-        m.w0 = 2.5e-6;
-    }
-    if !m.lpe0Given {
-        m.lpe0 = 1.74e-7;
-    }
-    if !m.lpebGiven {
-        m.lpeb = 0.0;
-    }
-    if !m.dvtp0Given {
-        m.dvtp0 = 0.0;
-    }
-    if !m.dvtp1Given {
-        m.dvtp1 = 0.0;
-    }
-    if !m.dvtp2Given {
-        m.dvtp2 = 0.0;
-    }
-    if !m.dvtp3Given {
-        m.dvtp3 = 0.0;
-    }
-    if !m.dvtp4Given {
-        m.dvtp4 = 0.0;
-    }
-    if !m.dvtp5Given {
-        m.dvtp5 = 0.0;
-    }
-    if !m.dvt0Given {
-        m.dvt0 = 2.2;
-    }
-    if !m.dvt1Given {
-        m.dvt1 = 0.53;
-    }
-    if !m.dvt2Given {
-        m.dvt2 = -0.032;
-    }
-    if !m.dvt0wGiven {
-        m.dvt0w = 0.0;
-    }
-    if !m.dvt1wGiven {
-        m.dvt1w = 5.3e6;
-    }
-    if !m.dvt2wGiven {
-        m.dvt2w = -0.032;
-    }
-    if !m.droutGiven {
-        m.drout = 0.56;
     }
     if !m.dsubGiven {
         m.dsub = m.drout;
     }
     if !m.vth0Given {
         m.vth0 = if m.r#type == 1 { 0.7 } else { -0.7 };
-    }
-    if !m.vfbGiven {
-        m.vfb = -1.0;
     }
     if !m.euGiven {
         m.eu = if m.r#type == 1 { 1.67 } else { 1.0 };
@@ -415,168 +235,13 @@ pub(super) fn setup_model(
             };
         }
     }
-    if !m.ua1Given {
-        m.ua1 = 1.0e-9;
-    }
-    if !m.ubGiven {
-        m.ub = 1.0e-19;
-    }
-    if !m.ub1Given {
-        m.ub1 = -1.0e-18;
-    }
-    if !m.udGiven {
-        m.ud = 0.0;
-    }
-    if !m.ud1Given {
-        m.ud1 = 0.0;
-    }
-    if !m.upGiven {
-        m.up = 0.0;
-    }
-    if !m.lpGiven {
-        m.lp = 1.0e-8;
-    }
     if !m.u0Given {
         m.u0 = if m.r#type == 1 { 0.067 } else { 0.025 };
     }
-    if !m.uteGiven {
-        m.ute = -1.5;
-    }
-    if !m.ucsteGiven {
-        m.ucste = -4.775e-3;
-    }
-    if !m.voffGiven {
-        m.voff = -0.08;
-    }
-    if !m.vofflGiven {
-        m.voffl = 0.0;
-    }
-    if !m.voffcvlGiven {
-        m.voffcvl = 0.0;
-    }
-    if !m.minvGiven {
-        m.minv = 0.0;
-    }
-    if !m.minvcvGiven {
-        m.minvcv = 0.0;
-    }
-    if !m.fproutGiven {
-        m.fprout = 0.0;
-    }
-    if !m.pditsGiven {
-        m.pdits = 0.0;
-    }
-    if !m.pditsdGiven {
-        m.pditsd = 0.0;
-    }
-    if !m.pditslGiven {
-        m.pditsl = 0.0;
-    }
-    if !m.deltaGiven {
-        m.delta = 0.01;
-    }
-    if !m.rdswminGiven {
-        m.rdswmin = 0.0;
-    }
-    if !m.rdwminGiven {
-        m.rdwmin = 0.0;
-    }
-    if !m.rswminGiven {
-        m.rswmin = 0.0;
-    }
-    if !m.rdswGiven {
-        m.rdsw = 200.0;
-    }
-    if !m.rdwGiven {
-        m.rdw = 100.0;
-    }
-    if !m.rswGiven {
-        m.rsw = 100.0;
-    }
-    if !m.prwgGiven {
-        m.prwg = 1.0;
-    }
-    if !m.prwbGiven {
-        m.prwb = 0.0;
-    }
-    if !m.prtGiven {
-        m.prt = 0.0;
-    }
-    if !m.eta0Given {
-        m.eta0 = 0.08;
-    }
-    if !m.etabGiven {
-        m.etab = -0.07;
-    }
-    if !m.pclmGiven {
-        m.pclm = 1.3;
-    }
-    if !m.pdibl1Given {
-        m.pdibl1 = 0.39;
-    }
-    if !m.pdibl2Given {
-        m.pdibl2 = 0.0086;
-    }
-    if !m.pdiblbGiven {
-        m.pdiblb = 0.0;
-    }
-    if !m.pscbe1Given {
-        m.pscbe1 = 4.24e8;
-    }
-    if !m.pscbe2Given {
-        m.pscbe2 = 1.0e-5;
-    }
-    if !m.pvagGiven {
-        m.pvag = 0.0;
-    }
-    if !m.wrGiven {
-        m.wr = 1.0;
-    }
-    if !m.dwgGiven {
-        m.dwg = 0.0;
-    }
-    if !m.dwbGiven {
-        m.dwb = 0.0;
-    }
-    if !m.b0Given {
-        m.b0 = 0.0;
-    }
-    if !m.b1Given {
-        m.b1 = 0.0;
-    }
-    if !m.alpha0Given {
-        m.alpha0 = 0.0;
-    }
-    if !m.alpha1Given {
-        m.alpha1 = 0.0;
-    }
-    if !m.beta0Given {
-        m.beta0 = 0.0;
-    }
-    if !m.gidlModGiven {
-        m.gidlMod = 0;
-    }
-    if !m.agidlGiven {
-        m.agidl = 0.0;
-    }
-    if !m.bgidlGiven {
-        m.bgidl = 2.3e9;
-    }
-    if !m.cgidlGiven {
-        m.cgidl = 0.5;
-    }
-    if !m.egidlGiven {
-        m.egidl = 0.8;
-    }
-    if !m.rgidlGiven {
-        m.rgidl = 1.0;
-    }
-    if !m.kgidlGiven {
-        m.kgidl = 0.0;
-    }
-    if !m.fgidlGiven {
-        m.fgidl = 1.0;
-    }
+    leakage_defaults(m);
+}
+
+const fn leakage_defaults(m: &mut Model) {
     if !m.agislGiven {
         m.agisl = m.agidl;
     }
@@ -643,593 +308,29 @@ pub(super) fn setup_model(
             m.cigd = if m.r#type == 1 { 0.075 } else { 0.03 };
         }
     }
-    if !m.aigbaccGiven {
-        m.aigbacc = 1.36e-2;
-    }
-    if !m.bigbaccGiven {
-        m.bigbacc = 1.71e-3;
-    }
-    if !m.cigbaccGiven {
-        m.cigbacc = 0.075;
-    }
-    if !m.aigbinvGiven {
-        m.aigbinv = 1.11e-2;
-    }
-    if !m.bigbinvGiven {
-        m.bigbinv = 9.49e-4;
-    }
-    if !m.cigbinvGiven {
-        m.cigbinv = 0.006;
-    }
-    if !m.nigcGiven {
-        m.nigc = 1.0;
-    }
-    if !m.nigbinvGiven {
-        m.nigbinv = 3.0;
-    }
-    if !m.nigbaccGiven {
-        m.nigbacc = 1.0;
-    }
-    if !m.ntoxGiven {
-        m.ntox = 1.0;
-    }
-    if !m.eigbinvGiven {
-        m.eigbinv = 1.1;
-    }
-    if !m.pigcdGiven {
-        m.pigcd = 1.0;
-    }
-    if !m.poxedgeGiven {
-        m.poxedge = 1.0;
-    }
-    if !m.xrcrg1Given {
-        m.xrcrg1 = 12.0;
-    }
-    if !m.xrcrg2Given {
-        m.xrcrg2 = 1.0;
-    }
-    if !m.ijthsfwdGiven {
-        m.ijthsfwd = 0.1;
-    }
     if !m.ijthdfwdGiven {
         m.ijthdfwd = m.ijthsfwd;
-    }
-    if !m.ijthsrevGiven {
-        m.ijthsrev = 0.1;
     }
     if !m.ijthdrevGiven {
         m.ijthdrev = m.ijthsrev;
     }
-    if !m.tnoiaGiven {
-        m.tnoia = 1.5;
-    }
-    if !m.tnoibGiven {
-        m.tnoib = 3.5;
-    }
-    if !m.tnoicGiven {
-        m.tnoic = 0.0;
-    }
-    if !m.rnoiaGiven {
-        m.rnoia = 0.577;
-    }
-    if !m.rnoibGiven {
-        m.rnoib = 0.5164;
-    }
-    if !m.gidlclampGiven {
-        m.gidlclamp = -1e-5;
-    }
-    if !m.idovvdscGiven {
-        m.idovvdsc = 1e-9;
-    }
-    if !m.rnoicGiven {
-        m.rnoic = 0.395;
-    }
-    if !m.ntnoiGiven {
-        m.ntnoi = 1.0;
-    }
-    if !m.lambdaGiven {
-        m.lambda = 0.0;
-    }
-    if !m.vtlGiven {
-        m.vtl = 2.0e5;
-    }
-    if !m.xnGiven {
-        m.xn = 3.0;
-    }
-    if !m.lcGiven {
-        m.lc = 5.0e-9;
-    }
-    if !m.vfbsdoffGiven {
-        m.vfbsdoff = 0.0;
-    }
-    if !m.tvfbsdoffGiven {
-        m.tvfbsdoff = 0.0;
-    }
-    if !m.tvoffGiven {
-        m.tvoff = 0.0;
-    }
-    if !m.tnfactorGiven {
-        m.tnfactor = 0.0;
-    }
-    if !m.teta0Given {
-        m.teta0 = 0.0;
-    }
-    if !m.tvoffcvGiven {
-        m.tvoffcv = 0.0;
-    }
-    if !m.lintnoiGiven {
-        m.lintnoi = 0.0;
-    }
-    if !m.xjbvsGiven {
-        m.xjbvs = 1.0;
-    }
     if !m.xjbvdGiven {
         m.xjbvd = m.xjbvs;
-    }
-    if !m.bvsGiven {
-        m.bvs = 10.0;
     }
     if !m.bvdGiven {
         m.bvd = m.bvs;
     }
-    if !m.gbminGiven {
-        m.gbmin = 1.0e-12;
-    }
-    if !m.rbdbGiven {
-        m.rbdb = 50.0;
-    }
-    if !m.rbpbGiven {
-        m.rbpb = 50.0;
-    }
-    if !m.rbsbGiven {
-        m.rbsb = 50.0;
-    }
-    if !m.rbpsGiven {
-        m.rbps = 50.0;
-    }
-    if !m.rbpdGiven {
-        m.rbpd = 50.0;
-    }
-    if !m.rbps0Given {
-        m.rbps0 = 50.0;
-    }
-    if !m.rbpslGiven {
-        m.rbpsl = 0.0;
-    }
-    if !m.rbpswGiven {
-        m.rbpsw = 0.0;
-    }
-    if !m.rbpsnfGiven {
-        m.rbpsnf = 0.0;
-    }
-    if !m.rbpd0Given {
-        m.rbpd0 = 50.0;
-    }
-    if !m.rbpdlGiven {
-        m.rbpdl = 0.0;
-    }
-    if !m.rbpdwGiven {
-        m.rbpdw = 0.0;
-    }
-    if !m.rbpdnfGiven {
-        m.rbpdnf = 0.0;
-    }
-    if !m.rbpbx0Given {
-        m.rbpbx0 = 100.0;
-    }
-    if !m.rbpbxlGiven {
-        m.rbpbxl = 0.0;
-    }
-    if !m.rbpbxwGiven {
-        m.rbpbxw = 0.0;
-    }
-    if !m.rbpbxnfGiven {
-        m.rbpbxnf = 0.0;
-    }
-    if !m.rbpby0Given {
-        m.rbpby0 = 100.0;
-    }
-    if !m.rbpbylGiven {
-        m.rbpbyl = 0.0;
-    }
-    if !m.rbpbywGiven {
-        m.rbpbyw = 0.0;
-    }
-    if !m.rbpbynfGiven {
-        m.rbpbynf = 0.0;
-    }
-    if !m.rbsbx0Given {
-        m.rbsbx0 = 100.0;
-    }
-    if !m.rbsby0Given {
-        m.rbsby0 = 100.0;
-    }
-    if !m.rbdbx0Given {
-        m.rbdbx0 = 100.0;
-    }
-    if !m.rbdby0Given {
-        m.rbdby0 = 100.0;
-    }
-    if !m.rbsdbxlGiven {
-        m.rbsdbxl = 0.0;
-    }
-    if !m.rbsdbxwGiven {
-        m.rbsdbxw = 0.0;
-    }
-    if !m.rbsdbxnfGiven {
-        m.rbsdbxnf = 0.0;
-    }
-    if !m.rbsdbylGiven {
-        m.rbsdbyl = 0.0;
-    }
-    if !m.rbsdbywGiven {
-        m.rbsdbyw = 0.0;
-    }
-    if !m.rbsdbynfGiven {
-        m.rbsdbynf = 0.0;
-    }
-    if !m.cgslGiven {
-        m.cgsl = 0.0;
-    }
-    if !m.cgdlGiven {
-        m.cgdl = 0.0;
-    }
-    if !m.ckappasGiven {
-        m.ckappas = 0.6;
-    }
     if !m.ckappadGiven {
         m.ckappad = m.ckappas;
-    }
-    if !m.clcGiven {
-        m.clc = 0.1e-6;
-    }
-    if !m.cleGiven {
-        m.cle = 0.6;
-    }
-    if !m.vfbcvGiven {
-        m.vfbcv = -1.0;
-    }
-    if !m.acdeGiven {
-        m.acde = 1.0;
-    }
-    if !m.moinGiven {
-        m.moin = 15.0;
-    }
-    if !m.noffGiven {
-        m.noff = 1.0;
-    }
-    if !m.voffcvGiven {
-        m.voffcv = 0.0;
-    }
-    if !m.dmcgGiven {
-        m.dmcg = 0.0;
     }
     if !m.dmciGiven {
         m.dmci = m.dmcg;
     }
-    if !m.dmdgGiven {
-        m.dmdg = 0.0;
-    }
-    if !m.dmcgtGiven {
-        m.dmcgt = 0.0;
-    }
-    if !m.xgwGiven {
-        m.xgw = 0.0;
-    }
-    if !m.xglGiven {
-        m.xgl = 0.0;
-    }
-    if !m.rshgGiven {
-        m.rshg = 0.1;
-    }
-    if !m.ngconGiven {
-        m.ngcon = 1.0;
-    }
-    if !m.tcjGiven {
-        m.tcj = 0.0;
-    }
-    if !m.tpbGiven {
-        m.tpb = 0.0;
-    }
-    if !m.tcjswGiven {
-        m.tcjsw = 0.0;
-    }
-    if !m.tpbswGiven {
-        m.tpbsw = 0.0;
-    }
-    if !m.tcjswgGiven {
-        m.tcjswg = 0.0;
-    }
-    if !m.tpbswgGiven {
-        m.tpbswg = 0.0;
-    }
-    if !m.lcdscGiven {
-        m.lcdsc = 0.0;
-    }
-    if !m.lcdscbGiven {
-        m.lcdscb = 0.0;
-    }
-    if !m.lcdscdGiven {
-        m.lcdscd = 0.0;
-    }
-    if !m.lcitGiven {
-        m.lcit = 0.0;
-    }
-    if !m.lnfactorGiven {
-        m.lnfactor = 0.0;
-    }
-    if !m.lxjGiven {
-        m.lxj = 0.0;
-    }
-    if !m.lvsatGiven {
-        m.lvsat = 0.0;
-    }
-    if !m.latGiven {
-        m.lat = 0.0;
-    }
-    if !m.la0Given {
-        m.la0 = 0.0;
-    }
-    if !m.lagsGiven {
-        m.lags = 0.0;
-    }
-    if !m.la1Given {
-        m.la1 = 0.0;
-    }
-    if !m.la2Given {
-        m.la2 = 0.0;
-    }
-    if !m.lketaGiven {
-        m.lketa = 0.0;
-    }
+}
+
+const fn length_dependent_defaults(m: &mut Model) {
     if !m.lketacGiven {
         m.lketac = m.lketa;
-    }
-    if !m.lnsubGiven {
-        m.lnsub = 0.0;
-    }
-    if !m.lndepGiven {
-        m.lndep = 0.0;
-    }
-    if !m.lnsdGiven {
-        m.lnsd = 0.0;
-    }
-    if !m.lphinGiven {
-        m.lphin = 0.0;
-    }
-    if !m.lngateGiven {
-        m.lngate = 0.0;
-    }
-    if !m.lvbmGiven {
-        m.lvbm = 0.0;
-    }
-    if !m.lxtGiven {
-        m.lxt = 0.0;
-    }
-    if !m.lk1Given {
-        m.lk1 = 0.0;
-    }
-    if !m.lkt1Given {
-        m.lkt1 = 0.0;
-    }
-    if !m.lkt1lGiven {
-        m.lkt1l = 0.0;
-    }
-    if !m.lkt2Given {
-        m.lkt2 = 0.0;
-    }
-    if !m.lk2Given {
-        m.lk2 = 0.0;
-    }
-    if !m.lk3Given {
-        m.lk3 = 0.0;
-    }
-    if !m.lk3bGiven {
-        m.lk3b = 0.0;
-    }
-    if !m.lw0Given {
-        m.lw0 = 0.0;
-    }
-    if !m.llpe0Given {
-        m.llpe0 = 0.0;
-    }
-    if !m.llpebGiven {
-        m.llpeb = 0.0;
-    }
-    if !m.ldvtp0Given {
-        m.ldvtp0 = 0.0;
-    }
-    if !m.ldvtp1Given {
-        m.ldvtp1 = 0.0;
-    }
-    if !m.ldvtp2Given {
-        m.ldvtp2 = 0.0;
-    }
-    if !m.ldvtp3Given {
-        m.ldvtp3 = 0.0;
-    }
-    if !m.ldvtp4Given {
-        m.ldvtp4 = 0.0;
-    }
-    if !m.ldvtp5Given {
-        m.ldvtp5 = 0.0;
-    }
-    if !m.ldvt0Given {
-        m.ldvt0 = 0.0;
-    }
-    if !m.ldvt1Given {
-        m.ldvt1 = 0.0;
-    }
-    if !m.ldvt2Given {
-        m.ldvt2 = 0.0;
-    }
-    if !m.ldvt0wGiven {
-        m.ldvt0w = 0.0;
-    }
-    if !m.ldvt1wGiven {
-        m.ldvt1w = 0.0;
-    }
-    if !m.ldvt2wGiven {
-        m.ldvt2w = 0.0;
-    }
-    if !m.ldroutGiven {
-        m.ldrout = 0.0;
-    }
-    if !m.ldsubGiven {
-        m.ldsub = 0.0;
-    }
-    if !m.lvth0Given {
-        m.lvth0 = 0.0;
-    }
-    if !m.luaGiven {
-        m.lua = 0.0;
-    }
-    if !m.lua1Given {
-        m.lua1 = 0.0;
-    }
-    if !m.lubGiven {
-        m.lub = 0.0;
-    }
-    if !m.lub1Given {
-        m.lub1 = 0.0;
-    }
-    if !m.lucGiven {
-        m.luc = 0.0;
-    }
-    if !m.luc1Given {
-        m.luc1 = 0.0;
-    }
-    if !m.ludGiven {
-        m.lud = 0.0;
-    }
-    if !m.lud1Given {
-        m.lud1 = 0.0;
-    }
-    if !m.lupGiven {
-        m.lup = 0.0;
-    }
-    if !m.llpGiven {
-        m.llp = 0.0;
-    }
-    if !m.lu0Given {
-        m.lu0 = 0.0;
-    }
-    if !m.luteGiven {
-        m.lute = 0.0;
-    }
-    if !m.lucsteGiven {
-        m.lucste = 0.0;
-    }
-    if !m.lvoffGiven {
-        m.lvoff = 0.0;
-    }
-    if !m.lminvGiven {
-        m.lminv = 0.0;
-    }
-    if !m.lminvcvGiven {
-        m.lminvcv = 0.0;
-    }
-    if !m.lfproutGiven {
-        m.lfprout = 0.0;
-    }
-    if !m.lpditsGiven {
-        m.lpdits = 0.0;
-    }
-    if !m.lpditsdGiven {
-        m.lpditsd = 0.0;
-    }
-    if !m.ldeltaGiven {
-        m.ldelta = 0.0;
-    }
-    if !m.lrdswGiven {
-        m.lrdsw = 0.0;
-    }
-    if !m.lrdwGiven {
-        m.lrdw = 0.0;
-    }
-    if !m.lrswGiven {
-        m.lrsw = 0.0;
-    }
-    if !m.lprwbGiven {
-        m.lprwb = 0.0;
-    }
-    if !m.lprwgGiven {
-        m.lprwg = 0.0;
-    }
-    if !m.lprtGiven {
-        m.lprt = 0.0;
-    }
-    if !m.leta0Given {
-        m.leta0 = 0.0;
-    }
-    if !m.letabGiven {
-        m.letab = -0.0;
-    }
-    if !m.lpclmGiven {
-        m.lpclm = 0.0;
-    }
-    if !m.lpdibl1Given {
-        m.lpdibl1 = 0.0;
-    }
-    if !m.lpdibl2Given {
-        m.lpdibl2 = 0.0;
-    }
-    if !m.lpdiblbGiven {
-        m.lpdiblb = 0.0;
-    }
-    if !m.lpscbe1Given {
-        m.lpscbe1 = 0.0;
-    }
-    if !m.lpscbe2Given {
-        m.lpscbe2 = 0.0;
-    }
-    if !m.lpvagGiven {
-        m.lpvag = 0.0;
-    }
-    if !m.lwrGiven {
-        m.lwr = 0.0;
-    }
-    if !m.ldwgGiven {
-        m.ldwg = 0.0;
-    }
-    if !m.ldwbGiven {
-        m.ldwb = 0.0;
-    }
-    if !m.lb0Given {
-        m.lb0 = 0.0;
-    }
-    if !m.lb1Given {
-        m.lb1 = 0.0;
-    }
-    if !m.lalpha0Given {
-        m.lalpha0 = 0.0;
-    }
-    if !m.lalpha1Given {
-        m.lalpha1 = 0.0;
-    }
-    if !m.lbeta0Given {
-        m.lbeta0 = 0.0;
-    }
-    if !m.lagidlGiven {
-        m.lagidl = 0.0;
-    }
-    if !m.lbgidlGiven {
-        m.lbgidl = 0.0;
-    }
-    if !m.lcgidlGiven {
-        m.lcgidl = 0.0;
-    }
-    if !m.legidlGiven {
-        m.legidl = 0.0;
-    }
-    if !m.lrgidlGiven {
-        m.lrgidl = 0.0;
-    }
-    if !m.lkgidlGiven {
-        m.lkgidl = 0.0;
-    }
-    if !m.lfgidlGiven {
-        m.lfgidl = 0.0;
     }
     if !m.lagislGiven {
         m.lagisl = m.lagidl;
@@ -1251,15 +352,6 @@ pub(super) fn setup_model(
     }
     if !m.lfgislGiven {
         m.lfgisl = m.lfgidl;
-    }
-    if !m.laigcGiven {
-        m.laigc = 0.0;
-    }
-    if !m.lbigcGiven {
-        m.lbigc = 0.0;
-    }
-    if !m.lcigcGiven {
-        m.lcigc = 0.0;
     }
     if !m.aigsdGiven && (m.aigsGiven || m.aigdGiven) {
         if !m.laigsGiven {
@@ -1303,410 +395,11 @@ pub(super) fn setup_model(
         m.lcigd = m.lcigsd;
         m.lcigs = m.lcigd;
     }
-    if !m.laigbaccGiven {
-        m.laigbacc = 0.0;
-    }
-    if !m.lbigbaccGiven {
-        m.lbigbacc = 0.0;
-    }
-    if !m.lcigbaccGiven {
-        m.lcigbacc = 0.0;
-    }
-    if !m.laigbinvGiven {
-        m.laigbinv = 0.0;
-    }
-    if !m.lbigbinvGiven {
-        m.lbigbinv = 0.0;
-    }
-    if !m.lcigbinvGiven {
-        m.lcigbinv = 0.0;
-    }
-    if !m.lnigcGiven {
-        m.lnigc = 0.0;
-    }
-    if !m.lnigbinvGiven {
-        m.lnigbinv = 0.0;
-    }
-    if !m.lnigbaccGiven {
-        m.lnigbacc = 0.0;
-    }
-    if !m.lntoxGiven {
-        m.lntox = 0.0;
-    }
-    if !m.leigbinvGiven {
-        m.leigbinv = 0.0;
-    }
-    if !m.lpigcdGiven {
-        m.lpigcd = 0.0;
-    }
-    if !m.lpoxedgeGiven {
-        m.lpoxedge = 0.0;
-    }
-    if !m.lxrcrg1Given {
-        m.lxrcrg1 = 0.0;
-    }
-    if !m.lxrcrg2Given {
-        m.lxrcrg2 = 0.0;
-    }
-    if !m.leuGiven {
-        m.leu = 0.0;
-    }
-    if !m.lucsGiven {
-        m.lucs = 0.0;
-    }
-    if !m.lvfbGiven {
-        m.lvfb = 0.0;
-    }
-    if !m.llambdaGiven {
-        m.llambda = 0.0;
-    }
-    if !m.lvtlGiven {
-        m.lvtl = 0.0;
-    }
-    if !m.lxnGiven {
-        m.lxn = 0.0;
-    }
-    if !m.lvfbsdoffGiven {
-        m.lvfbsdoff = 0.0;
-    }
-    if !m.ltvfbsdoffGiven {
-        m.ltvfbsdoff = 0.0;
-    }
-    if !m.ltvoffGiven {
-        m.ltvoff = 0.0;
-    }
-    if !m.ltnfactorGiven {
-        m.ltnfactor = 0.0;
-    }
-    if !m.lteta0Given {
-        m.lteta0 = 0.0;
-    }
-    if !m.ltvoffcvGiven {
-        m.ltvoffcv = 0.0;
-    }
-    if !m.lcgslGiven {
-        m.lcgsl = 0.0;
-    }
-    if !m.lcgdlGiven {
-        m.lcgdl = 0.0;
-    }
-    if !m.lckappasGiven {
-        m.lckappas = 0.0;
-    }
-    if !m.lckappadGiven {
-        m.lckappad = 0.0;
-    }
-    if !m.lclcGiven {
-        m.lclc = 0.0;
-    }
-    if !m.lcleGiven {
-        m.lcle = 0.0;
-    }
-    if !m.lcfGiven {
-        m.lcf = 0.0;
-    }
-    if !m.lvfbcvGiven {
-        m.lvfbcv = 0.0;
-    }
-    if !m.lacdeGiven {
-        m.lacde = 0.0;
-    }
-    if !m.lmoinGiven {
-        m.lmoin = 0.0;
-    }
-    if !m.lnoffGiven {
-        m.lnoff = 0.0;
-    }
-    if !m.lvoffcvGiven {
-        m.lvoffcv = 0.0;
-    }
-    if !m.wcdscGiven {
-        m.wcdsc = 0.0;
-    }
-    if !m.wcdscbGiven {
-        m.wcdscb = 0.0;
-    }
-    if !m.wcdscdGiven {
-        m.wcdscd = 0.0;
-    }
-    if !m.wcitGiven {
-        m.wcit = 0.0;
-    }
-    if !m.wnfactorGiven {
-        m.wnfactor = 0.0;
-    }
-    if !m.wxjGiven {
-        m.wxj = 0.0;
-    }
-    if !m.wvsatGiven {
-        m.wvsat = 0.0;
-    }
-    if !m.watGiven {
-        m.wat = 0.0;
-    }
-    if !m.wa0Given {
-        m.wa0 = 0.0;
-    }
-    if !m.wagsGiven {
-        m.wags = 0.0;
-    }
-    if !m.wa1Given {
-        m.wa1 = 0.0;
-    }
-    if !m.wa2Given {
-        m.wa2 = 0.0;
-    }
-    if !m.wketaGiven {
-        m.wketa = 0.0;
-    }
+}
+
+const fn width_dependent_defaults(m: &mut Model) {
     if !m.wketacGiven {
         m.wketac = m.wketa;
-    }
-    if !m.wnsubGiven {
-        m.wnsub = 0.0;
-    }
-    if !m.wndepGiven {
-        m.wndep = 0.0;
-    }
-    if !m.wnsdGiven {
-        m.wnsd = 0.0;
-    }
-    if !m.wphinGiven {
-        m.wphin = 0.0;
-    }
-    if !m.wngateGiven {
-        m.wngate = 0.0;
-    }
-    if !m.wvbmGiven {
-        m.wvbm = 0.0;
-    }
-    if !m.wxtGiven {
-        m.wxt = 0.0;
-    }
-    if !m.wk1Given {
-        m.wk1 = 0.0;
-    }
-    if !m.wkt1Given {
-        m.wkt1 = 0.0;
-    }
-    if !m.wkt1lGiven {
-        m.wkt1l = 0.0;
-    }
-    if !m.wkt2Given {
-        m.wkt2 = 0.0;
-    }
-    if !m.wk2Given {
-        m.wk2 = 0.0;
-    }
-    if !m.wk3Given {
-        m.wk3 = 0.0;
-    }
-    if !m.wk3bGiven {
-        m.wk3b = 0.0;
-    }
-    if !m.ww0Given {
-        m.ww0 = 0.0;
-    }
-    if !m.wlpe0Given {
-        m.wlpe0 = 0.0;
-    }
-    if !m.wlpebGiven {
-        m.wlpeb = 0.0;
-    }
-    if !m.wdvtp0Given {
-        m.wdvtp0 = 0.0;
-    }
-    if !m.wdvtp1Given {
-        m.wdvtp1 = 0.0;
-    }
-    if !m.wdvtp2Given {
-        m.wdvtp2 = 0.0;
-    }
-    if !m.wdvtp3Given {
-        m.wdvtp3 = 0.0;
-    }
-    if !m.wdvtp4Given {
-        m.wdvtp4 = 0.0;
-    }
-    if !m.wdvtp5Given {
-        m.wdvtp5 = 0.0;
-    }
-    if !m.wdvt0Given {
-        m.wdvt0 = 0.0;
-    }
-    if !m.wdvt1Given {
-        m.wdvt1 = 0.0;
-    }
-    if !m.wdvt2Given {
-        m.wdvt2 = 0.0;
-    }
-    if !m.wdvt0wGiven {
-        m.wdvt0w = 0.0;
-    }
-    if !m.wdvt1wGiven {
-        m.wdvt1w = 0.0;
-    }
-    if !m.wdvt2wGiven {
-        m.wdvt2w = 0.0;
-    }
-    if !m.wdroutGiven {
-        m.wdrout = 0.0;
-    }
-    if !m.wdsubGiven {
-        m.wdsub = 0.0;
-    }
-    if !m.wvth0Given {
-        m.wvth0 = 0.0;
-    }
-    if !m.wuaGiven {
-        m.wua = 0.0;
-    }
-    if !m.wua1Given {
-        m.wua1 = 0.0;
-    }
-    if !m.wubGiven {
-        m.wub = 0.0;
-    }
-    if !m.wub1Given {
-        m.wub1 = 0.0;
-    }
-    if !m.wucGiven {
-        m.wuc = 0.0;
-    }
-    if !m.wuc1Given {
-        m.wuc1 = 0.0;
-    }
-    if !m.wudGiven {
-        m.wud = 0.0;
-    }
-    if !m.wud1Given {
-        m.wud1 = 0.0;
-    }
-    if !m.wupGiven {
-        m.wup = 0.0;
-    }
-    if !m.wlpGiven {
-        m.wlp = 0.0;
-    }
-    if !m.wu0Given {
-        m.wu0 = 0.0;
-    }
-    if !m.wuteGiven {
-        m.wute = 0.0;
-    }
-    if !m.wucsteGiven {
-        m.wucste = 0.0;
-    }
-    if !m.wvoffGiven {
-        m.wvoff = 0.0;
-    }
-    if !m.wminvGiven {
-        m.wminv = 0.0;
-    }
-    if !m.wminvcvGiven {
-        m.wminvcv = 0.0;
-    }
-    if !m.wfproutGiven {
-        m.wfprout = 0.0;
-    }
-    if !m.wpditsGiven {
-        m.wpdits = 0.0;
-    }
-    if !m.wpditsdGiven {
-        m.wpditsd = 0.0;
-    }
-    if !m.wdeltaGiven {
-        m.wdelta = 0.0;
-    }
-    if !m.wrdswGiven {
-        m.wrdsw = 0.0;
-    }
-    if !m.wrdwGiven {
-        m.wrdw = 0.0;
-    }
-    if !m.wrswGiven {
-        m.wrsw = 0.0;
-    }
-    if !m.wprwbGiven {
-        m.wprwb = 0.0;
-    }
-    if !m.wprwgGiven {
-        m.wprwg = 0.0;
-    }
-    if !m.wprtGiven {
-        m.wprt = 0.0;
-    }
-    if !m.weta0Given {
-        m.weta0 = 0.0;
-    }
-    if !m.wetabGiven {
-        m.wetab = 0.0;
-    }
-    if !m.wpclmGiven {
-        m.wpclm = 0.0;
-    }
-    if !m.wpdibl1Given {
-        m.wpdibl1 = 0.0;
-    }
-    if !m.wpdibl2Given {
-        m.wpdibl2 = 0.0;
-    }
-    if !m.wpdiblbGiven {
-        m.wpdiblb = 0.0;
-    }
-    if !m.wpscbe1Given {
-        m.wpscbe1 = 0.0;
-    }
-    if !m.wpscbe2Given {
-        m.wpscbe2 = 0.0;
-    }
-    if !m.wpvagGiven {
-        m.wpvag = 0.0;
-    }
-    if !m.wwrGiven {
-        m.wwr = 0.0;
-    }
-    if !m.wdwgGiven {
-        m.wdwg = 0.0;
-    }
-    if !m.wdwbGiven {
-        m.wdwb = 0.0;
-    }
-    if !m.wb0Given {
-        m.wb0 = 0.0;
-    }
-    if !m.wb1Given {
-        m.wb1 = 0.0;
-    }
-    if !m.walpha0Given {
-        m.walpha0 = 0.0;
-    }
-    if !m.walpha1Given {
-        m.walpha1 = 0.0;
-    }
-    if !m.wbeta0Given {
-        m.wbeta0 = 0.0;
-    }
-    if !m.wagidlGiven {
-        m.wagidl = 0.0;
-    }
-    if !m.wbgidlGiven {
-        m.wbgidl = 0.0;
-    }
-    if !m.wcgidlGiven {
-        m.wcgidl = 0.0;
-    }
-    if !m.wegidlGiven {
-        m.wegidl = 0.0;
-    }
-    if !m.wrgidlGiven {
-        m.wrgidl = 0.0;
-    }
-    if !m.wkgidlGiven {
-        m.wkgidl = 0.0;
-    }
-    if !m.wfgidlGiven {
-        m.wfgidl = 0.0;
     }
     if !m.wagislGiven {
         m.wagisl = m.wagidl;
@@ -1728,15 +421,6 @@ pub(super) fn setup_model(
     }
     if !m.wfgislGiven {
         m.wfgisl = m.wfgidl;
-    }
-    if !m.waigcGiven {
-        m.waigc = 0.0;
-    }
-    if !m.wbigcGiven {
-        m.wbigc = 0.0;
-    }
-    if !m.wcigcGiven {
-        m.wcigc = 0.0;
     }
     if !m.aigsdGiven && (m.aigsGiven || m.aigdGiven) {
         if !m.waigsGiven {
@@ -1780,410 +464,11 @@ pub(super) fn setup_model(
         m.wcigd = m.wcigsd;
         m.wcigs = m.wcigd;
     }
-    if !m.waigbaccGiven {
-        m.waigbacc = 0.0;
-    }
-    if !m.wbigbaccGiven {
-        m.wbigbacc = 0.0;
-    }
-    if !m.wcigbaccGiven {
-        m.wcigbacc = 0.0;
-    }
-    if !m.waigbinvGiven {
-        m.waigbinv = 0.0;
-    }
-    if !m.wbigbinvGiven {
-        m.wbigbinv = 0.0;
-    }
-    if !m.wcigbinvGiven {
-        m.wcigbinv = 0.0;
-    }
-    if !m.wnigcGiven {
-        m.wnigc = 0.0;
-    }
-    if !m.wnigbinvGiven {
-        m.wnigbinv = 0.0;
-    }
-    if !m.wnigbaccGiven {
-        m.wnigbacc = 0.0;
-    }
-    if !m.wntoxGiven {
-        m.wntox = 0.0;
-    }
-    if !m.weigbinvGiven {
-        m.weigbinv = 0.0;
-    }
-    if !m.wpigcdGiven {
-        m.wpigcd = 0.0;
-    }
-    if !m.wpoxedgeGiven {
-        m.wpoxedge = 0.0;
-    }
-    if !m.wxrcrg1Given {
-        m.wxrcrg1 = 0.0;
-    }
-    if !m.wxrcrg2Given {
-        m.wxrcrg2 = 0.0;
-    }
-    if !m.weuGiven {
-        m.weu = 0.0;
-    }
-    if !m.wucsGiven {
-        m.wucs = 0.0;
-    }
-    if !m.wvfbGiven {
-        m.wvfb = 0.0;
-    }
-    if !m.wlambdaGiven {
-        m.wlambda = 0.0;
-    }
-    if !m.wvtlGiven {
-        m.wvtl = 0.0;
-    }
-    if !m.wxnGiven {
-        m.wxn = 0.0;
-    }
-    if !m.wvfbsdoffGiven {
-        m.wvfbsdoff = 0.0;
-    }
-    if !m.wtvfbsdoffGiven {
-        m.wtvfbsdoff = 0.0;
-    }
-    if !m.wtvoffGiven {
-        m.wtvoff = 0.0;
-    }
-    if !m.wtnfactorGiven {
-        m.wtnfactor = 0.0;
-    }
-    if !m.wteta0Given {
-        m.wteta0 = 0.0;
-    }
-    if !m.wtvoffcvGiven {
-        m.wtvoffcv = 0.0;
-    }
-    if !m.wcgslGiven {
-        m.wcgsl = 0.0;
-    }
-    if !m.wcgdlGiven {
-        m.wcgdl = 0.0;
-    }
-    if !m.wckappasGiven {
-        m.wckappas = 0.0;
-    }
-    if !m.wckappadGiven {
-        m.wckappad = 0.0;
-    }
-    if !m.wcfGiven {
-        m.wcf = 0.0;
-    }
-    if !m.wclcGiven {
-        m.wclc = 0.0;
-    }
-    if !m.wcleGiven {
-        m.wcle = 0.0;
-    }
-    if !m.wvfbcvGiven {
-        m.wvfbcv = 0.0;
-    }
-    if !m.wacdeGiven {
-        m.wacde = 0.0;
-    }
-    if !m.wmoinGiven {
-        m.wmoin = 0.0;
-    }
-    if !m.wnoffGiven {
-        m.wnoff = 0.0;
-    }
-    if !m.wvoffcvGiven {
-        m.wvoffcv = 0.0;
-    }
-    if !m.pcdscGiven {
-        m.pcdsc = 0.0;
-    }
-    if !m.pcdscbGiven {
-        m.pcdscb = 0.0;
-    }
-    if !m.pcdscdGiven {
-        m.pcdscd = 0.0;
-    }
-    if !m.pcitGiven {
-        m.pcit = 0.0;
-    }
-    if !m.pnfactorGiven {
-        m.pnfactor = 0.0;
-    }
-    if !m.pxjGiven {
-        m.pxj = 0.0;
-    }
-    if !m.pvsatGiven {
-        m.pvsat = 0.0;
-    }
-    if !m.patGiven {
-        m.pat = 0.0;
-    }
-    if !m.pa0Given {
-        m.pa0 = 0.0;
-    }
-    if !m.pagsGiven {
-        m.pags = 0.0;
-    }
-    if !m.pa1Given {
-        m.pa1 = 0.0;
-    }
-    if !m.pa2Given {
-        m.pa2 = 0.0;
-    }
-    if !m.pketaGiven {
-        m.pketa = 0.0;
-    }
+}
+
+const fn cross_dependent_defaults(m: &mut Model) {
     if !m.pketacGiven {
         m.pketac = m.pketa;
-    }
-    if !m.pnsubGiven {
-        m.pnsub = 0.0;
-    }
-    if !m.pndepGiven {
-        m.pndep = 0.0;
-    }
-    if !m.pnsdGiven {
-        m.pnsd = 0.0;
-    }
-    if !m.pphinGiven {
-        m.pphin = 0.0;
-    }
-    if !m.pngateGiven {
-        m.pngate = 0.0;
-    }
-    if !m.pvbmGiven {
-        m.pvbm = 0.0;
-    }
-    if !m.pxtGiven {
-        m.pxt = 0.0;
-    }
-    if !m.pk1Given {
-        m.pk1 = 0.0;
-    }
-    if !m.pkt1Given {
-        m.pkt1 = 0.0;
-    }
-    if !m.pkt1lGiven {
-        m.pkt1l = 0.0;
-    }
-    if !m.pk2Given {
-        m.pk2 = 0.0;
-    }
-    if !m.pkt2Given {
-        m.pkt2 = 0.0;
-    }
-    if !m.pk3Given {
-        m.pk3 = 0.0;
-    }
-    if !m.pk3bGiven {
-        m.pk3b = 0.0;
-    }
-    if !m.pw0Given {
-        m.pw0 = 0.0;
-    }
-    if !m.plpe0Given {
-        m.plpe0 = 0.0;
-    }
-    if !m.plpebGiven {
-        m.plpeb = 0.0;
-    }
-    if !m.pdvtp0Given {
-        m.pdvtp0 = 0.0;
-    }
-    if !m.pdvtp1Given {
-        m.pdvtp1 = 0.0;
-    }
-    if !m.pdvtp2Given {
-        m.pdvtp2 = 0.0;
-    }
-    if !m.pdvtp3Given {
-        m.pdvtp3 = 0.0;
-    }
-    if !m.pdvtp4Given {
-        m.pdvtp4 = 0.0;
-    }
-    if !m.pdvtp5Given {
-        m.pdvtp5 = 0.0;
-    }
-    if !m.pdvt0Given {
-        m.pdvt0 = 0.0;
-    }
-    if !m.pdvt1Given {
-        m.pdvt1 = 0.0;
-    }
-    if !m.pdvt2Given {
-        m.pdvt2 = 0.0;
-    }
-    if !m.pdvt0wGiven {
-        m.pdvt0w = 0.0;
-    }
-    if !m.pdvt1wGiven {
-        m.pdvt1w = 0.0;
-    }
-    if !m.pdvt2wGiven {
-        m.pdvt2w = 0.0;
-    }
-    if !m.pdroutGiven {
-        m.pdrout = 0.0;
-    }
-    if !m.pdsubGiven {
-        m.pdsub = 0.0;
-    }
-    if !m.pvth0Given {
-        m.pvth0 = 0.0;
-    }
-    if !m.puaGiven {
-        m.pua = 0.0;
-    }
-    if !m.pua1Given {
-        m.pua1 = 0.0;
-    }
-    if !m.pubGiven {
-        m.r#pub = 0.0;
-    }
-    if !m.pub1Given {
-        m.pub1 = 0.0;
-    }
-    if !m.pucGiven {
-        m.puc = 0.0;
-    }
-    if !m.puc1Given {
-        m.puc1 = 0.0;
-    }
-    if !m.pudGiven {
-        m.pud = 0.0;
-    }
-    if !m.pud1Given {
-        m.pud1 = 0.0;
-    }
-    if !m.pupGiven {
-        m.pup = 0.0;
-    }
-    if !m.plpGiven {
-        m.plp = 0.0;
-    }
-    if !m.pu0Given {
-        m.pu0 = 0.0;
-    }
-    if !m.puteGiven {
-        m.pute = 0.0;
-    }
-    if !m.pucsteGiven {
-        m.pucste = 0.0;
-    }
-    if !m.pvoffGiven {
-        m.pvoff = 0.0;
-    }
-    if !m.pminvGiven {
-        m.pminv = 0.0;
-    }
-    if !m.pminvcvGiven {
-        m.pminvcv = 0.0;
-    }
-    if !m.pfproutGiven {
-        m.pfprout = 0.0;
-    }
-    if !m.ppditsGiven {
-        m.ppdits = 0.0;
-    }
-    if !m.ppditsdGiven {
-        m.ppditsd = 0.0;
-    }
-    if !m.pdeltaGiven {
-        m.pdelta = 0.0;
-    }
-    if !m.prdswGiven {
-        m.prdsw = 0.0;
-    }
-    if !m.prdwGiven {
-        m.prdw = 0.0;
-    }
-    if !m.prswGiven {
-        m.prsw = 0.0;
-    }
-    if !m.pprwbGiven {
-        m.pprwb = 0.0;
-    }
-    if !m.pprwgGiven {
-        m.pprwg = 0.0;
-    }
-    if !m.pprtGiven {
-        m.pprt = 0.0;
-    }
-    if !m.peta0Given {
-        m.peta0 = 0.0;
-    }
-    if !m.petabGiven {
-        m.petab = 0.0;
-    }
-    if !m.ppclmGiven {
-        m.ppclm = 0.0;
-    }
-    if !m.ppdibl1Given {
-        m.ppdibl1 = 0.0;
-    }
-    if !m.ppdibl2Given {
-        m.ppdibl2 = 0.0;
-    }
-    if !m.ppdiblbGiven {
-        m.ppdiblb = 0.0;
-    }
-    if !m.ppscbe1Given {
-        m.ppscbe1 = 0.0;
-    }
-    if !m.ppscbe2Given {
-        m.ppscbe2 = 0.0;
-    }
-    if !m.ppvagGiven {
-        m.ppvag = 0.0;
-    }
-    if !m.pwrGiven {
-        m.pwr = 0.0;
-    }
-    if !m.pdwgGiven {
-        m.pdwg = 0.0;
-    }
-    if !m.pdwbGiven {
-        m.pdwb = 0.0;
-    }
-    if !m.pb0Given {
-        m.pb0 = 0.0;
-    }
-    if !m.pb1Given {
-        m.pb1 = 0.0;
-    }
-    if !m.palpha0Given {
-        m.palpha0 = 0.0;
-    }
-    if !m.palpha1Given {
-        m.palpha1 = 0.0;
-    }
-    if !m.pbeta0Given {
-        m.pbeta0 = 0.0;
-    }
-    if !m.pagidlGiven {
-        m.pagidl = 0.0;
-    }
-    if !m.pbgidlGiven {
-        m.pbgidl = 0.0;
-    }
-    if !m.pcgidlGiven {
-        m.pcgidl = 0.0;
-    }
-    if !m.pegidlGiven {
-        m.pegidl = 0.0;
-    }
-    if !m.prgidlGiven {
-        m.prgidl = 0.0;
-    }
-    if !m.pkgidlGiven {
-        m.pkgidl = 0.0;
-    }
-    if !m.pfgidlGiven {
-        m.pfgidl = 0.0;
     }
     if !m.pagislGiven {
         m.pagisl = m.pagidl;
@@ -2205,15 +490,6 @@ pub(super) fn setup_model(
     }
     if !m.pfgislGiven {
         m.pfgisl = m.pfgidl;
-    }
-    if !m.paigcGiven {
-        m.paigc = 0.0;
-    }
-    if !m.pbigcGiven {
-        m.pbigc = 0.0;
-    }
-    if !m.pcigcGiven {
-        m.pcigc = 0.0;
     }
     if !m.aigsdGiven && (m.aigsGiven || m.aigdGiven) {
         if !m.paigsGiven {
@@ -2257,239 +533,35 @@ pub(super) fn setup_model(
         m.pcigd = m.pcigsd;
         m.pcigs = m.pcigd;
     }
-    if !m.paigbaccGiven {
-        m.paigbacc = 0.0;
-    }
-    if !m.pbigbaccGiven {
-        m.pbigbacc = 0.0;
-    }
-    if !m.pcigbaccGiven {
-        m.pcigbacc = 0.0;
-    }
-    if !m.paigbinvGiven {
-        m.paigbinv = 0.0;
-    }
-    if !m.pbigbinvGiven {
-        m.pbigbinv = 0.0;
-    }
-    if !m.pcigbinvGiven {
-        m.pcigbinv = 0.0;
-    }
-    if !m.pnigcGiven {
-        m.pnigc = 0.0;
-    }
-    if !m.pnigbinvGiven {
-        m.pnigbinv = 0.0;
-    }
-    if !m.pnigbaccGiven {
-        m.pnigbacc = 0.0;
-    }
-    if !m.pntoxGiven {
-        m.pntox = 0.0;
-    }
-    if !m.peigbinvGiven {
-        m.peigbinv = 0.0;
-    }
-    if !m.ppigcdGiven {
-        m.ppigcd = 0.0;
-    }
-    if !m.ppoxedgeGiven {
-        m.ppoxedge = 0.0;
-    }
-    if !m.pxrcrg1Given {
-        m.pxrcrg1 = 0.0;
-    }
-    if !m.pxrcrg2Given {
-        m.pxrcrg2 = 0.0;
-    }
-    if !m.peuGiven {
-        m.peu = 0.0;
-    }
-    if !m.pucsGiven {
-        m.pucs = 0.0;
-    }
-    if !m.pvfbGiven {
-        m.pvfb = 0.0;
-    }
-    if !m.plambdaGiven {
-        m.plambda = 0.0;
-    }
-    if !m.pvtlGiven {
-        m.pvtl = 0.0;
-    }
-    if !m.pxnGiven {
-        m.pxn = 0.0;
-    }
-    if !m.pvfbsdoffGiven {
-        m.pvfbsdoff = 0.0;
-    }
-    if !m.ptvfbsdoffGiven {
-        m.ptvfbsdoff = 0.0;
-    }
-    if !m.ptvoffGiven {
-        m.ptvoff = 0.0;
-    }
-    if !m.ptnfactorGiven {
-        m.ptnfactor = 0.0;
-    }
-    if !m.pteta0Given {
-        m.pteta0 = 0.0;
-    }
-    if !m.ptvoffcvGiven {
-        m.ptvoffcv = 0.0;
-    }
-    if !m.pcgslGiven {
-        m.pcgsl = 0.0;
-    }
-    if !m.pcgdlGiven {
-        m.pcgdl = 0.0;
-    }
-    if !m.pckappasGiven {
-        m.pckappas = 0.0;
-    }
-    if !m.pckappadGiven {
-        m.pckappad = 0.0;
-    }
-    if !m.pcfGiven {
-        m.pcf = 0.0;
-    }
-    if !m.pclcGiven {
-        m.pclc = 0.0;
-    }
-    if !m.pcleGiven {
-        m.pcle = 0.0;
-    }
-    if !m.pvfbcvGiven {
-        m.pvfbcv = 0.0;
-    }
-    if !m.pacdeGiven {
-        m.pacde = 0.0;
-    }
-    if !m.pmoinGiven {
-        m.pmoin = 0.0;
-    }
-    if !m.pnoffGiven {
-        m.pnoff = 0.0;
-    }
-    if !m.pvoffcvGiven {
-        m.pvoffcv = 0.0;
-    }
-    if !m.gamma1Given {
-        m.gamma1 = 0.0;
-    }
-    if !m.lgamma1Given {
-        m.lgamma1 = 0.0;
-    }
-    if !m.wgamma1Given {
-        m.wgamma1 = 0.0;
-    }
-    if !m.pgamma1Given {
-        m.pgamma1 = 0.0;
-    }
-    if !m.gamma2Given {
-        m.gamma2 = 0.0;
-    }
-    if !m.lgamma2Given {
-        m.lgamma2 = 0.0;
-    }
-    if !m.wgamma2Given {
-        m.wgamma2 = 0.0;
-    }
-    if !m.pgamma2Given {
-        m.pgamma2 = 0.0;
-    }
-    if !m.vbxGiven {
-        m.vbx = 0.0;
-    }
-    if !m.lvbxGiven {
-        m.lvbx = 0.0;
-    }
-    if !m.wvbxGiven {
-        m.wvbx = 0.0;
-    }
-    if !m.pvbxGiven {
-        m.pvbx = 0.0;
-    }
+}
+
+const fn geometry_defaults(m: &mut Model, nominal_temperature: f64) {
     if !m.tnomGiven {
         m.tnom = nominal_temperature;
-    }
-    if !m.LintGiven {
-        m.Lint = 0.0;
-    }
-    if !m.LlGiven {
-        m.Ll = 0.0;
     }
     if !m.LlcGiven {
         m.Llc = m.Ll;
     }
-    if !m.LlnGiven {
-        m.Lln = 1.0;
-    }
-    if !m.LwGiven {
-        m.Lw = 0.0;
-    }
     if !m.LwcGiven {
         m.Lwc = m.Lw;
-    }
-    if !m.LwnGiven {
-        m.Lwn = 1.0;
-    }
-    if !m.LwlGiven {
-        m.Lwl = 0.0;
     }
     if !m.LwlcGiven {
         m.Lwlc = m.Lwl;
     }
-    if !m.LminGiven {
-        m.Lmin = 0.0;
-    }
-    if !m.LmaxGiven {
-        m.Lmax = 1.0;
-    }
-    if !m.WintGiven {
-        m.Wint = 0.0;
-    }
-    if !m.WlGiven {
-        m.Wl = 0.0;
-    }
     if !m.WlcGiven {
         m.Wlc = m.Wl;
-    }
-    if !m.WlnGiven {
-        m.Wln = 1.0;
-    }
-    if !m.WwGiven {
-        m.Ww = 0.0;
     }
     if !m.WwcGiven {
         m.Wwc = m.Ww;
     }
-    if !m.WwnGiven {
-        m.Wwn = 1.0;
-    }
-    if !m.WwlGiven {
-        m.Wwl = 0.0;
-    }
     if !m.WwlcGiven {
         m.Wwlc = m.Wwl;
-    }
-    if !m.WminGiven {
-        m.Wmin = 0.0;
-    }
-    if !m.WmaxGiven {
-        m.Wmax = 1.0;
     }
     if !m.dwcGiven {
         m.dwc = m.Wint;
     }
     if !m.dlcGiven {
         m.dlc = m.Lint;
-    }
-    if !m.xlGiven {
-        m.xl = 0.0;
-    }
-    if !m.xwGiven {
-        m.xw = 0.0;
     }
     if !m.dlcigGiven {
         m.dlcig = m.Lint;
@@ -2504,20 +576,11 @@ pub(super) fn setup_model(
     if !m.dwjGiven {
         m.dwj = m.dwc;
     }
-    if !m.xpartGiven {
-        m.xpart = 0.0;
-    }
-    if !m.sheetResistanceGiven {
-        m.sheetResistance = 0.0;
-    }
-    if !m.SunitAreaJctCapGiven {
-        m.SunitAreaJctCap = 5.0E-4;
-    }
+}
+
+const fn junction_and_noise_defaults(m: &mut Model) {
     if !m.DunitAreaJctCapGiven {
         m.DunitAreaJctCap = m.SunitAreaJctCap;
-    }
-    if !m.SunitLengthSidewallJctCapGiven {
-        m.SunitLengthSidewallJctCap = 5.0E-10;
     }
     if !m.DunitLengthSidewallJctCapGiven {
         m.DunitLengthSidewallJctCap = m.SunitLengthSidewallJctCap;
@@ -2528,32 +591,17 @@ pub(super) fn setup_model(
     if !m.DunitLengthGateSidewallJctCapGiven {
         m.DunitLengthGateSidewallJctCap = m.SunitLengthGateSidewallJctCap;
     }
-    if !m.SjctSatCurDensityGiven {
-        m.SjctSatCurDensity = 1.0E-4;
-    }
     if !m.DjctSatCurDensityGiven {
         m.DjctSatCurDensity = m.SjctSatCurDensity;
-    }
-    if !m.SjctSidewallSatCurDensityGiven {
-        m.SjctSidewallSatCurDensity = 0.0;
     }
     if !m.DjctSidewallSatCurDensityGiven {
         m.DjctSidewallSatCurDensity = m.SjctSidewallSatCurDensity;
     }
-    if !m.SjctGateSidewallSatCurDensityGiven {
-        m.SjctGateSidewallSatCurDensity = 0.0;
-    }
     if !m.DjctGateSidewallSatCurDensityGiven {
         m.DjctGateSidewallSatCurDensity = m.SjctGateSidewallSatCurDensity;
     }
-    if !m.SbulkJctPotentialGiven {
-        m.SbulkJctPotential = 1.0;
-    }
     if !m.DbulkJctPotentialGiven {
         m.DbulkJctPotential = m.SbulkJctPotential;
-    }
-    if !m.SsidewallJctPotentialGiven {
-        m.SsidewallJctPotential = 1.0;
     }
     if !m.DsidewallJctPotentialGiven {
         m.DsidewallJctPotential = m.SsidewallJctPotential;
@@ -2564,14 +612,8 @@ pub(super) fn setup_model(
     if !m.DGatesidewallJctPotentialGiven {
         m.DGatesidewallJctPotential = m.SGatesidewallJctPotential;
     }
-    if !m.SbulkJctBotGradingCoeffGiven {
-        m.SbulkJctBotGradingCoeff = 0.5;
-    }
     if !m.DbulkJctBotGradingCoeffGiven {
         m.DbulkJctBotGradingCoeff = m.SbulkJctBotGradingCoeff;
-    }
-    if !m.SbulkJctSideGradingCoeffGiven {
-        m.SbulkJctSideGradingCoeff = 0.33;
     }
     if !m.DbulkJctSideGradingCoeffGiven {
         m.DbulkJctSideGradingCoeff = m.SbulkJctSideGradingCoeff;
@@ -2582,47 +624,24 @@ pub(super) fn setup_model(
     if !m.DbulkJctGateSideGradingCoeffGiven {
         m.DbulkJctGateSideGradingCoeff = m.SbulkJctGateSideGradingCoeff;
     }
-    if !m.SjctEmissionCoeffGiven {
-        m.SjctEmissionCoeff = 1.0;
-    }
     if !m.DjctEmissionCoeffGiven {
         m.DjctEmissionCoeff = m.SjctEmissionCoeff;
-    }
-    if !m.SjctTempExponentGiven {
-        m.SjctTempExponent = 3.0;
     }
     if !m.DjctTempExponentGiven {
         m.DjctTempExponent = m.SjctTempExponent;
     }
-    if !m.jtssGiven {
-        m.jtss = 0.0;
-    }
+    tunnelling_and_noise_defaults(m);
+}
+
+const fn tunnelling_and_noise_defaults(m: &mut Model) {
     if !m.jtsdGiven {
         m.jtsd = m.jtss;
-    }
-    if !m.jtsswsGiven {
-        m.jtssws = 0.0;
     }
     if !m.jtsswdGiven {
         m.jtsswd = m.jtssws;
     }
-    if !m.jtsswgsGiven {
-        m.jtsswgs = 0.0;
-    }
     if !m.jtsswgdGiven {
         m.jtsswgd = m.jtsswgs;
-    }
-    if !m.jtweffGiven {
-        m.jtweff = 0.0;
-    }
-    if !m.njtsGiven {
-        m.njts = 20.0;
-    }
-    if !m.njtsswGiven {
-        m.njtssw = 20.0;
-    }
-    if !m.njtsswgGiven {
-        m.njtsswg = 20.0;
     }
     if !m.njtsdGiven {
         if m.njtsGiven {
@@ -2645,32 +664,14 @@ pub(super) fn setup_model(
             m.njtsswgd = 20.0;
         }
     }
-    if !m.xtssGiven {
-        m.xtss = 0.02;
-    }
     if !m.xtsdGiven {
         m.xtsd = m.xtss;
-    }
-    if !m.xtsswsGiven {
-        m.xtssws = 0.02;
     }
     if !m.xtsswdGiven {
         m.xtsswd = m.xtssws;
     }
-    if !m.xtsswgsGiven {
-        m.xtsswgs = 0.02;
-    }
     if !m.xtsswgdGiven {
         m.xtsswgd = m.xtsswgs;
-    }
-    if !m.tnjtsGiven {
-        m.tnjts = 0.0;
-    }
-    if !m.tnjtsswGiven {
-        m.tnjtssw = 0.0;
-    }
-    if !m.tnjtsswgGiven {
-        m.tnjtsswg = 0.0;
     }
     if !m.tnjtsdGiven {
         if m.tnjtsGiven {
@@ -2693,20 +694,11 @@ pub(super) fn setup_model(
             m.tnjtsswgd = 0.0;
         }
     }
-    if !m.vtssGiven {
-        m.vtss = 10.0;
-    }
     if !m.vtsdGiven {
         m.vtsd = m.vtss;
     }
-    if !m.vtsswsGiven {
-        m.vtssws = 10.0;
-    }
     if !m.vtsswdGiven {
         m.vtsswd = m.vtssws;
-    }
-    if !m.vtsswgsGiven {
-        m.vtsswgs = 10.0;
     }
     if !m.vtsswgdGiven {
         m.vtsswgd = m.vtsswgs;
@@ -2725,202 +717,23 @@ pub(super) fn setup_model(
             m.oxideTrapDensityB = 1.5e25;
         }
     }
-    if !m.oxideTrapDensityCGiven {
-        m.oxideTrapDensityC = 8.75e9;
-    }
-    if !m.emGiven {
-        m.em = 4.1e7;
-    }
-    if !m.efGiven {
-        m.ef = 1.0;
-    }
-    if !m.afGiven {
-        m.af = 1.0;
-    }
-    if !m.kfGiven {
-        m.kf = 0.0;
-    }
-    if !m.vgsMaxGiven {
-        m.vgsMax = 1e99;
-    }
-    if !m.vgdMaxGiven {
-        m.vgdMax = 1e99;
-    }
-    if !m.vgbMaxGiven {
-        m.vgbMax = 1e99;
-    }
-    if !m.vdsMaxGiven {
-        m.vdsMax = 1e99;
-    }
-    if !m.vbsMaxGiven {
-        m.vbsMax = 1e99;
-    }
-    if !m.vbdMaxGiven {
-        m.vbdMax = 1e99;
-    }
-    if !m.vgsrMaxGiven {
-        m.vgsrMax = 1e99;
-    }
-    if !m.vgdrMaxGiven {
-        m.vgdrMax = 1e99;
-    }
-    if !m.vgbrMaxGiven {
-        m.vgbrMax = 1e99;
-    }
-    if !m.vbsrMaxGiven {
-        m.vbsrMax = 1e99;
-    }
-    if !m.vbdrMaxGiven {
-        m.vbdrMax = 1e99;
-    }
-    if !m.sarefGiven {
-        m.saref = 1e-6;
-    }
-    if !m.sbrefGiven {
-        m.sbref = 1e-6;
-    }
-    if !m.wlodGiven {
-        m.wlod = 0.0;
-    }
-    if !m.ku0Given {
-        m.ku0 = 0.0;
-    }
-    if !m.kvsatGiven {
-        m.kvsat = 0.0;
-    }
-    if !m.kvth0Given {
-        m.kvth0 = 0.0;
-    }
-    if !m.tku0Given {
-        m.tku0 = 0.0;
-    }
-    if !m.llodku0Given {
-        m.llodku0 = 0.0;
-    }
-    if !m.wlodku0Given {
-        m.wlodku0 = 0.0;
-    }
-    if !m.llodvthGiven {
-        m.llodvth = 0.0;
-    }
-    if !m.wlodvthGiven {
-        m.wlodvth = 0.0;
-    }
-    if !m.lku0Given {
-        m.lku0 = 0.0;
-    }
-    if !m.wku0Given {
-        m.wku0 = 0.0;
-    }
-    if !m.pku0Given {
-        m.pku0 = 0.0;
-    }
-    if !m.lkvth0Given {
-        m.lkvth0 = 0.0;
-    }
-    if !m.wkvth0Given {
-        m.wkvth0 = 0.0;
-    }
-    if !m.pkvth0Given {
-        m.pkvth0 = 0.0;
-    }
-    if !m.stk2Given {
-        m.stk2 = 0.0;
-    }
-    if !m.lodk2Given {
-        m.lodk2 = 1.0;
-    }
-    if !m.steta0Given {
-        m.steta0 = 0.0;
-    }
-    if !m.lodeta0Given {
-        m.lodeta0 = 1.0;
-    }
-    if !m.webGiven {
-        m.web = 0.0;
-    }
-    if !m.wecGiven {
-        m.wec = 0.0;
-    }
-    if !m.kvth0weGiven {
-        m.kvth0we = 0.0;
-    }
-    if !m.k2weGiven {
-        m.k2we = 0.0;
-    }
-    if !m.ku0weGiven {
-        m.ku0we = 0.0;
-    }
-    if !m.screfGiven {
-        m.scref = 1.0E-6;
-    }
-    if !m.wpemodGiven {
-        m.wpemod = 0.0;
-    } else if m.wpemod != 0.0 && m.wpemod.to_bits() != 1.0_f64.to_bits() {
-        m.wpemod = 0.0;
-        warnings.push("Warning: wpemod has been set to its default value: 0.".into());
-    }
-    if !m.lkvth0weGiven {
-        m.lkvth0we = 0.0;
-    }
-    if !m.lk2weGiven {
-        m.lk2we = 0.0;
-    }
-    if !m.lku0weGiven {
-        m.lku0we = 0.0;
-    }
-    if !m.wkvth0weGiven {
-        m.wkvth0we = 0.0;
-    }
-    if !m.wk2weGiven {
-        m.wk2we = 0.0;
-    }
-    if !m.wku0weGiven {
-        m.wku0we = 0.0;
-    }
-    if !m.pkvth0weGiven {
-        m.pkvth0we = 0.0;
-    }
-    if !m.pk2weGiven {
-        m.pk2we = 0.0;
-    }
-    if !m.pku0weGiven {
-        m.pku0we = 0.0;
-    }
-
-    Ok(())
 }
 
-/// `BSIM4setup`'s instance pass: instance defaults and selector overrides,
-/// then the internal nodes to create, as `(local node index, CKTmkVolt
-/// suffix)` in C's creation order. The caller has set the four external
-/// node fields; this sets every internal node field (an uncreated node
-/// aliases its external node, an uncreated `qNode` is
-/// [`super::host::node::GROUND`]). `noise_analysis` is C's
-/// `noiseAnalGiven` (the deck requests a `.noise` analysis).
-///
-/// # Errors
-/// None today: C's only error here is `CKTmkVolt` running out of memory.
-#[expect(
-    clippy::too_many_lines,
-    reason = "keeps the reference numerical routine in the original statement and rounding order"
-)] // One C loop body, kept whole.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "uniform setup stage signatures carry device errors without special cases"
-)] // Uniform stage signature.
-pub(super) fn setup_instance(
+/// Prepare instance defaults and selector overrides before choosing nodes.
+fn setup_instance(
     m: &Model,
     h: &mut Instance,
     noise_analysis: bool,
     warnings: &mut Vec<String>,
-) -> SpiceResult<Vec<(i32, &'static str)>> {
-    // End of C's model pass, before its instance loop.
-    let DMCGeff = m.dmcg - m.dmcgt;
-    let DMCIeff = m.dmci;
-    let DMDGeff = m.dmdg - m.dmcgt;
-    let mut created = Vec::new();
+) -> Vec<(i32, &'static str)> {
+    instance_defaults(m, h);
+    normalize_instance_selectors(m, h, warnings);
+    layout_defaults(m, h);
+    let plan = decide_topology(m, h, noise_analysis, warnings);
+    apply_topology(h, plan)
+}
 
+const fn instance_defaults(m: &Model, h: &mut Instance) {
     if !h.lGiven {
         h.l = 5.0e-6;
     }
@@ -3003,55 +816,27 @@ pub(super) fn setup_instance(
     if !h.dtempGiven {
         h.dtemp = 0.0;
     }
+}
 
-    // Process instance model selectors, some may override their global
-    // counterparts.
-    if !h.rbodyModGiven {
-        h.rbodyMod = m.rbodyMod;
-    } else if (h.rbodyMod != 0) && (h.rbodyMod != 1) && (h.rbodyMod != 2) {
-        h.rbodyMod = m.rbodyMod;
-        warnings.push(format!(
-            "Warning: rbodyMod has been set to its global value {}.",
-            m.rbodyMod
-        ));
+fn normalize_instance_selectors(m: &Model, h: &mut Instance, warnings: &mut Vec<String>) {
+    // Unspecified selectors inherit model defaults without becoming "given".
+    for selector in [
+        Selector::new("rbodyMod", &mut h.rbodyMod, h.rbodyModGiven, m.rbodyMod, 2),
+        Selector::new("rgateMod", &mut h.rgateMod, h.rgateModGiven, m.rgateMod, 3),
+        Selector::new("trnqsMod", &mut h.trnqsMod, h.trnqsModGiven, m.trnqsMod, 1),
+        Selector::new("acnqsMod", &mut h.acnqsMod, h.acnqsModGiven, m.acnqsMod, 1),
+    ] {
+        selector.normalize(SelectorOrigin::Instance, warnings);
     }
-
-    if !h.rgateModGiven {
-        h.rgateMod = m.rgateMod;
-    } else if (h.rgateMod != 0) && (h.rgateMod != 1) && (h.rgateMod != 2) && (h.rgateMod != 3) {
-        h.rgateMod = m.rgateMod;
-        warnings.push(format!(
-            "Warning: rgateMod has been set to its global value {}.",
-            m.rgateMod
-        ));
-    }
-
     if !h.geoModGiven {
         h.geoMod = m.geoMod;
     }
     if !h.rgeoModGiven {
         h.rgeoMod = 0;
     }
-    if !h.trnqsModGiven {
-        h.trnqsMod = m.trnqsMod;
-    } else if (h.trnqsMod != 0) && (h.trnqsMod != 1) {
-        h.trnqsMod = m.trnqsMod;
-        warnings.push(format!(
-            "Warning: trnqsMod has been set to its global value {}.",
-            m.trnqsMod
-        ));
-    }
+}
 
-    if !h.acnqsModGiven {
-        h.acnqsMod = m.acnqsMod;
-    } else if (h.acnqsMod != 0) && (h.acnqsMod != 1) {
-        h.acnqsMod = m.acnqsMod;
-        warnings.push(format!(
-            "Warning: acnqsMod has been set to its global value {}.",
-            m.acnqsMod
-        ));
-    }
-
+const fn layout_defaults(m: &Model, h: &mut Instance) {
     // Stress effect.
     if !h.saGiven {
         h.sa = 0.0;
@@ -3075,81 +860,113 @@ pub(super) fn setup_instance(
     if !h.scGiven {
         h.sc = 0.0; // m
     }
+}
 
-    // Process drain series resistance.
-    let mut createNode = false;
-    if (m.rdsMod != 0) || (m.tnoiMod == 1 && noise_analysis) {
-        createNode = true;
-    } else if m.sheetResistance > 0.0 {
-        if h.drainSquaresGiven && h.drainSquares > 0.0 {
-            createNode = true;
-        } else if !h.drainSquaresGiven && (h.rgeoMod != 0) {
-            let Rtot = rdseff_geo(
-                h.nf,
-                h.geoMod,
-                h.rgeoMod,
-                h.min,
-                h.w,
-                m.sheetResistance,
-                DMCGeff,
-                DMCIeff,
-                DMDGeff,
-                0,
-                warnings,
-            );
-            if Rtot > 0.0 {
-                createNode = true;
-            }
-        }
+#[derive(Clone, Copy)]
+enum GateNodes {
+    External,
+    Prime,
+    PrimeAndMid,
+}
+
+#[derive(Clone, Copy)]
+struct TopologyPlan {
+    series: [bool; 2],
+    gate: GateNodes,
+    body: bool,
+    charge: bool,
+}
+
+#[derive(Clone, Copy)]
+enum SeriesTerminal {
+    Drain,
+    Source,
+}
+
+/// C's series-resistance decision is made for drain and then source.
+/// Keeping the call order also preserves geometry diagnostic order.
+fn needs_prime(
+    m: &Model,
+    h: &Instance,
+    terminal: SeriesTerminal,
+    noise_analysis: bool,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if m.rdsMod != 0 || (m.tnoiMod == 1 && noise_analysis) {
+        return true;
     }
-    if createNode {
+    if m.sheetResistance <= 0.0 || m.sheetResistance.is_nan() {
+        return false;
+    }
+    let (given, squares, side) = match terminal {
+        SeriesTerminal::Drain => (h.drainSquaresGiven, h.drainSquares, 0),
+        SeriesTerminal::Source => (h.sourceSquaresGiven, h.sourceSquares, 1),
+    };
+    if given {
+        return squares > 0.0;
+    }
+    if h.rgeoMod == 0 {
+        return false;
+    }
+    rdseff_geo(
+        h.nf,
+        h.geoMod,
+        h.rgeoMod,
+        h.min,
+        h.w,
+        m.sheetResistance,
+        m.dmcg - m.dmcgt,
+        m.dmci,
+        m.dmdg - m.dmcgt,
+        side,
+        warnings,
+    ) > 0.0
+}
+
+fn decide_topology(
+    m: &Model,
+    h: &Instance,
+    noise_analysis: bool,
+    warnings: &mut Vec<String>,
+) -> TopologyPlan {
+    let drain = needs_prime(m, h, SeriesTerminal::Drain, noise_analysis, warnings);
+    let source = needs_prime(m, h, SeriesTerminal::Source, noise_analysis, warnings);
+    let gate = match h.rgateMod {
+        3 => GateNodes::PrimeAndMid,
+        value if value > 0 => GateNodes::Prime,
+        _ => GateNodes::External,
+    };
+    TopologyPlan {
+        series: [drain, source],
+        gate,
+        body: matches!(h.rbodyMod, 1 | 2),
+        charge: h.trnqsMod != 0,
+    }
+}
+
+/// Apply the topology once, assigning all aliases and creating nodes in C order.
+fn apply_topology(h: &mut Instance, plan: TopologyPlan) -> Vec<(i32, &'static str)> {
+    let mut created = Vec::new();
+    if plan.series[0] {
         h.dNodePrime = node::DP;
         created.push((node::DP, "drain"));
     } else {
         h.dNodePrime = h.dNode;
     }
-
-    // Process source series resistance.
-    createNode = false;
-    if (m.rdsMod != 0) || (m.tnoiMod == 1 && noise_analysis) {
-        createNode = true;
-    } else if m.sheetResistance > 0.0 {
-        if h.sourceSquaresGiven && h.sourceSquares > 0.0 {
-            createNode = true;
-        } else if !h.sourceSquaresGiven && (h.rgeoMod != 0) {
-            let Rtot = rdseff_geo(
-                h.nf,
-                h.geoMod,
-                h.rgeoMod,
-                h.min,
-                h.w,
-                m.sheetResistance,
-                DMCGeff,
-                DMCIeff,
-                DMDGeff,
-                1,
-                warnings,
-            );
-            if Rtot > 0.0 {
-                createNode = true;
-            }
-        }
-    }
-    if createNode {
+    if plan.series[1] {
         h.sNodePrime = node::SP;
         created.push((node::SP, "source"));
     } else {
         h.sNodePrime = h.sNode;
     }
-
-    if h.rgateMod > 0 {
+    if matches!(plan.gate, GateNodes::External) {
+        h.gNodePrime = h.gNodeExt;
+    } else {
         h.gNodePrime = node::GP;
         created.push((node::GP, "gate"));
-    } else {
-        h.gNodePrime = h.gNodeExt;
     }
 
-    if h.rgateMod == 3 {
+    if matches!(plan.gate, GateNodes::PrimeAndMid) {
         h.gNodeMid = node::GM;
         created.push((node::GM, "midgate"));
     } else {
@@ -3157,7 +974,7 @@ pub(super) fn setup_instance(
     }
 
     // Internal body nodes for the body resistance model.
-    if (h.rbodyMod == 1) || (h.rbodyMod == 2) {
+    if plan.body {
         h.dbNode = node::DB;
         created.push((node::DB, "dbody"));
         h.bNodePrime = node::BP;
@@ -3171,13 +988,13 @@ pub(super) fn setup_instance(
     }
 
     // NQS node.
-    if h.trnqsMod != 0 {
+    if plan.charge {
         h.qNode = node::Q;
         created.push((node::Q, "charge"));
     } else {
         h.qNode = node::GROUND;
     }
-    Ok(created)
+    created
 }
 
 impl ModelParameters {
@@ -3196,10 +1013,8 @@ impl ModelParameters {
         nominal_temperature_celsius: Real,
     ) -> SpiceResult<Vec<(&'static str, Real)>> {
         let tnom = temperature_kelvin(nominal_temperature_celsius, &self.location)?;
-        let mut m = super::apply::model(self)?;
-        let mut warnings = Vec::new();
-        setup_model(&mut m, tnom, &mut warnings)?;
-        numeric_members(&mut m)
+        let mut prepared = prepare_model(super::apply::model(self)?, tnom);
+        numeric_members(&mut prepared.model)
     }
 }
 
@@ -3237,7 +1052,7 @@ mod tests {
             ..Model::default()
         };
         let mut warnings = Vec::new();
-        setup_model(&mut m, 300.15, &mut warnings).unwrap();
+        setup_model(&mut m, 300.15, &mut warnings);
         (m, warnings)
     }
 
@@ -3247,7 +1062,7 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         let mut checked = 0;
         for &(keyword, expected) in super::super::defaults_data::LITERALS {
-            let p = super::super::descriptor(parameters::MODEL, keyword).unwrap();
+            let p = super::super::DEVICE.model.get(keyword).unwrap();
             let field = p.c_field.unwrap();
             let actual = if let Some(v) = m.real_mut(field) {
                 *v
@@ -3258,6 +1073,125 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 777);
+    }
+
+    #[test]
+    fn independent_default_stage_never_writes_given_parameters_or_given_bits() {
+        let facts = super::super::defaults_data::LITERALS;
+        let sentinel: Real = -123_456.25;
+        let mut ungiven = Model::default();
+        let mut given_model = Model::default();
+        for &(keyword, _) in facts {
+            let p = super::super::DEVICE.model.get(keyword).unwrap();
+            let field = p.c_field.unwrap();
+            let given = p.c_given.unwrap();
+            for (m, explicitly_given) in [(&mut ungiven, false), (&mut given_model, true)] {
+                if let Some(slot) = m.real_mut(field) {
+                    *slot = sentinel;
+                } else {
+                    *m.int_mut(field).unwrap() = -123_456;
+                }
+                *m.flag_mut(given).unwrap() = explicitly_given;
+            }
+        }
+        for m in [&mut ungiven, &mut given_model] {
+            super::super::defaults_data::apply_independent_defaults(m);
+        }
+        let mut changed = 0;
+        for &(keyword, expected) in facts {
+            let p = super::super::DEVICE.model.get(keyword).unwrap();
+            let field = p.c_field.unwrap();
+            let given = p.c_given.unwrap();
+            let (actual, original) = if let Some(slot) = ungiven.real_mut(field) {
+                (*slot, sentinel)
+            } else {
+                (Real::from(*ungiven.int_mut(field).unwrap()), -123_456.)
+            };
+            if actual.to_bits() != original.to_bits() {
+                changed += 1;
+                assert_eq!(actual.to_bits(), expected.to_bits(), "{keyword}");
+            }
+            let explicit = if let Some(slot) = given_model.real_mut(field) {
+                *slot
+            } else {
+                Real::from(*given_model.int_mut(field).unwrap())
+            };
+            assert_eq!(explicit.to_bits(), original.to_bits(), "{keyword}");
+            assert!(!*ungiven.flag_mut(given).unwrap(), "{keyword}");
+            assert!(*given_model.flag_mut(given).unwrap(), "{keyword}");
+        }
+        assert_eq!(changed, 733);
+    }
+
+    #[test]
+    fn combined_and_separate_leakage_defaults_preserve_given_precedence() {
+        let base = Model {
+            aigsd: 0.012,
+            aigsdGiven: true,
+            aigs: 0.02,
+            aigsGiven: true,
+            aigd: 0.03,
+            aigdGiven: true,
+            laigsd: 2e-12,
+            laigsdGiven: true,
+            laigs: 3e-12,
+            laigsGiven: true,
+            laigd: 4e-12,
+            laigdGiven: true,
+            waigsd: 5e-12,
+            waigsdGiven: true,
+            paigsd: 6e-12,
+            paigsdGiven: true,
+            agidl: 7e-9,
+            agidlGiven: true,
+            lagidl: 8e-9,
+            lagidlGiven: true,
+            wagidl: 9e-9,
+            wagidlGiven: true,
+            pagidl: 1e-8,
+            pagidlGiven: true,
+            Lint: 1e-8,
+            LintGiven: true,
+            dlcig: 2e-8,
+            dlcigGiven: true,
+            ..Model::default()
+        };
+        let combined = prepare_model(base.clone(), 310.).model;
+        assert_eq!([combined.aigs, combined.aigd], [0.012; 2]);
+        assert_eq!([combined.laigs, combined.laigd], [2e-12; 2]);
+        assert_eq!([combined.waigs, combined.waigd], [5e-12; 2]);
+        assert_eq!([combined.paigs, combined.paigd], [6e-12; 2]);
+        assert_eq!(
+            [
+                combined.agisl,
+                combined.lagisl,
+                combined.wagisl,
+                combined.pagisl
+            ],
+            [7e-9, 8e-9, 9e-9, 1e-8]
+        );
+        assert_eq!(combined.dlcigd, 2e-8);
+        let separate = prepare_model(
+            Model {
+                aigsdGiven: false,
+                dlcigGiven: false,
+                ..base
+            },
+            310.,
+        )
+        .model;
+        assert_eq!([separate.aigs, separate.aigd], [0.02, 0.03]);
+        assert_eq!([separate.laigs, separate.laigd], [3e-12, 4e-12]);
+        assert_eq!(
+            [
+                separate.waigs,
+                separate.waigd,
+                separate.paigs,
+                separate.paigd
+            ],
+            [0.; 4]
+        );
+        assert_eq!(separate.dlcigd, 1e-8);
     }
 
     #[test]
@@ -3287,7 +1221,7 @@ mod tests {
             ..Model::default()
         };
         let mut warnings = Vec::new();
-        setup_model(&mut m, 300.15, &mut warnings).unwrap();
+        setup_model(&mut m, 300.15, &mut warnings);
         assert_eq!(m.capMod, 2);
         assert_eq!(m.mtrlMod, 0);
         assert_eq!(m.v48intVersion, 483);
@@ -3299,9 +1233,27 @@ mod tests {
                 "Warning: unknown BSIM4 version. Working now with BSIM4.8.3.",
             ]
         );
-        // Any 4.8x spelling selects 4.8.3 through the "4.8" prefix test.
-        assert!(c_strncmp_eq("4.8.0", "4.8", 3));
-        assert!(!c_strncmp_eq("4.8", "4.80", 4));
+        // The first C prefix test makes all the more specific branches unreachable.
+        for version in [
+            "4.8",
+            "4.80",
+            "4.8.0",
+            "4.8.1",
+            "4.82",
+            "4.8.3",
+            "4.8-other",
+        ] {
+            let prepared = prepare_model(
+                Model {
+                    version: version.into(),
+                    versionGiven: true,
+                    ..Model::default()
+                },
+                300.15,
+            );
+            assert_eq!(prepared.model.v48intVersion, 483);
+            assert!(prepared.warnings.is_empty(), "{version}");
+        }
     }
 
     fn instance() -> Instance {
@@ -3315,11 +1267,193 @@ mod tests {
     }
 
     #[test]
+    fn normalized_model_and_instance_selectors_keep_c_warning_order() {
+        let mut model = Model {
+            version: "unknown".into(),
+            versionGiven: true,
+            wpemod: 3.,
+            wpemodGiven: true,
+            ..Model::default()
+        };
+        let selectors = [
+            ("mobMod", 0),
+            ("dioMod", 1),
+            ("capMod", 2),
+            ("rdsMod", 0),
+            ("rbodyMod", 0),
+            ("rgateMod", 0),
+            ("perMod", 1),
+            ("fnoiMod", 1),
+            ("tnoiMod", 0),
+            ("trnqsMod", 0),
+            ("acnqsMod", 0),
+            ("mtrlMod", 0),
+            ("mtrlCompatMod", 0),
+            ("igcMod", 0),
+            ("igbMod", 0),
+            ("tempMod", 0),
+        ];
+        let mut expected = Vec::new();
+        for (name, fallback) in selectors {
+            *model.int_mut(&format!("BSIM4{name}")).unwrap() = -1;
+            *model.flag_mut(&format!("BSIM4{name}Given")).unwrap() = true;
+            expected.push(format!(
+                "Warning: {name} has been set to its default value: {fallback}."
+            ));
+        }
+        expected.push("Warning: unknown BSIM4 version. Working now with BSIM4.8.3.".into());
+        expected.push("Warning: wpemod has been set to its default value: 0.".into());
+        let mut prepared = prepare_model(model, 300.15);
+        assert_eq!(prepared.warnings, expected);
+        for (name, fallback) in selectors {
+            assert_eq!(
+                *prepared.model.int_mut(&format!("BSIM4{name}")).unwrap(),
+                fallback
+            );
+            assert!(
+                *prepared
+                    .model
+                    .flag_mut(&format!("BSIM4{name}Given"))
+                    .unwrap()
+            );
+        }
+        let h = Instance {
+            rbodyMod: -1,
+            rbodyModGiven: true,
+            rgateMod: -1,
+            rgateModGiven: true,
+            trnqsMod: -1,
+            trnqsModGiven: true,
+            acnqsMod: -1,
+            acnqsModGiven: true,
+            ..instance()
+        };
+        let result = prepared.prepare_instance(h, false);
+        assert_eq!(
+            &result.warnings[expected.len()..],
+            [
+                "Warning: rbodyMod has been set to its global value 0.",
+                "Warning: rgateMod has been set to its global value 0.",
+                "Warning: trnqsMod has been set to its global value 0.",
+                "Warning: acnqsMod has been set to its global value 0.",
+            ]
+        );
+    }
+
+    #[test]
+    fn topology_order_and_aliases_cover_all_selector_combinations() {
+        for rds in [0, 1] {
+            for noise_mode in [0, 1, 2] {
+                for gate in 0..=3 {
+                    for body in 0..=2 {
+                        for nqs in [0, 1] {
+                            let prepared = prepare_model(
+                                Model {
+                                    rdsMod: rds,
+                                    rdsModGiven: true,
+                                    tnoiMod: noise_mode,
+                                    tnoiModGiven: true,
+                                    rgateMod: gate,
+                                    rgateModGiven: true,
+                                    rbodyMod: body,
+                                    rbodyModGiven: true,
+                                    trnqsMod: nqs,
+                                    trnqsModGiven: true,
+                                    sheetResistance: 10.,
+                                    sheetResistanceGiven: true,
+                                    ..Model::default()
+                                },
+                                300.15,
+                            );
+                            for noise_analysis in [false, true] {
+                                for squares in
+                                    [[false, false], [true, false], [false, true], [true, true]]
+                                {
+                                    let h = Instance {
+                                        drainSquares: 2.,
+                                        drainSquaresGiven: squares[0],
+                                        sourceSquares: 2.,
+                                        sourceSquaresGiven: squares[1],
+                                        ..instance()
+                                    };
+                                    let result =
+                                        prepared.clone().prepare_instance(h, noise_analysis);
+                                    let forced = rds == 1 || (noise_mode == 1 && noise_analysis);
+                                    assert_topology(
+                                        &result,
+                                        [
+                                            forced || squares[0],
+                                            forced || squares[1],
+                                            gate != 0,
+                                            gate == 3,
+                                            body != 0,
+                                            body != 0,
+                                            body != 0,
+                                            nqs != 0,
+                                        ],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_topology(result: &PreparedSetup, flags: [bool; 8]) {
+        let own = [
+            node::DP,
+            node::SP,
+            node::GP,
+            node::GM,
+            node::DB,
+            node::BP,
+            node::SB,
+            node::Q,
+        ];
+        let alias = [
+            node::D,
+            node::S,
+            node::G_EXT,
+            node::G_EXT,
+            node::B,
+            node::B,
+            node::B,
+            node::GROUND,
+        ];
+        let expected: Vec<_> = own
+            .into_iter()
+            .zip([
+                "drain", "source", "gate", "midgate", "dbody", "body", "sbody", "charge",
+            ])
+            .zip(flags)
+            .filter_map(|(node, create)| create.then_some(node))
+            .collect();
+        assert_eq!(result.created, expected);
+        let h = &result.instance;
+        let actual = [
+            h.dNodePrime,
+            h.sNodePrime,
+            h.gNodePrime,
+            h.gNodeMid,
+            h.dbNode,
+            h.bNodePrime,
+            h.sbNode,
+            h.qNode,
+        ];
+        for (((actual, own), alias), create) in actual.into_iter().zip(own).zip(alias).zip(flags) {
+            assert_eq!(actual, if create { own } else { alias });
+        }
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
     fn default_instance_creates_no_nodes() {
         let (m, _) = defaulted(1);
         let mut h = instance();
         let mut w = Vec::new();
-        let created = setup_instance(&m, &mut h, false, &mut w).unwrap();
+        let created = setup_instance(&m, &mut h, false, &mut w);
         assert!(created.is_empty());
         assert_eq!((h.l, h.w, h.nf, h.m), (5.0e-6, 5.0e-6, 1.0, 1.0));
         assert_eq!(
@@ -3343,7 +1477,7 @@ mod tests {
         h.trnqsMod = 1;
         h.trnqsModGiven = true;
         let mut w = Vec::new();
-        let created = setup_instance(&m, &mut h, false, &mut w).unwrap();
+        let created = setup_instance(&m, &mut h, false, &mut w);
         let suffixes: Vec<_> = created.iter().map(|c| c.1).collect();
         assert_eq!(
             suffixes,
@@ -3361,7 +1495,7 @@ mod tests {
         h.rbodyMod = 5;
         h.rbodyModGiven = true;
         let mut w = Vec::new();
-        setup_instance(&m, &mut h, false, &mut w).unwrap();
+        setup_instance(&m, &mut h, false, &mut w);
         assert_eq!(h.rbodyMod, 0);
         assert_eq!(w, ["Warning: rbodyMod has been set to its global value 0."]);
     }
@@ -3374,18 +1508,14 @@ mod tests {
         h.drainSquares = 2.0;
         h.drainSquaresGiven = true;
         let mut w = Vec::new();
-        let created = setup_instance(&m, &mut h, false, &mut w).unwrap();
+        let created = setup_instance(&m, &mut h, false, &mut w);
         assert_eq!(created, [(node::DP, "drain")]);
         // tnoiMod=1 creates both primes only for a deck with .noise.
         let (mut m, _) = defaulted(1);
         m.tnoiMod = 1;
         let mut h = instance();
-        assert!(
-            setup_instance(&m, &mut h, false, &mut w)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(setup_instance(&m, &mut h, false, &mut w).is_empty());
         let mut h = instance();
-        assert_eq!(setup_instance(&m, &mut h, true, &mut w).unwrap().len(), 2);
+        assert_eq!(setup_instance(&m, &mut h, true, &mut w).len(), 2);
     }
 }

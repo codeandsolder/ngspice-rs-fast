@@ -80,7 +80,7 @@ fn both(tag: &str, deck: &str) -> (Plot, Plot) {
 /// Every port column (internal nodes excepted) within `1e-6 |C| + absolute`,
 /// matched by name through C's `i(@...)`/`v(@...)`/`#branch` spellings.
 fn same(ours: &Plot, c: &Plot, absolute: f64) {
-    assert_eq!(ours.points().len(), c.points().len());
+    assert_eq!(ours.point_count(), c.point_count());
     for (i, variable) in ours.variables().iter().enumerate() {
         let name = variable.name.as_str();
         if name.contains('#') || name.starts_with("sweep") {
@@ -98,7 +98,7 @@ fn same(ours: &Plot, c: &Plot, absolute: f64) {
             .iter()
             .find_map(|n| c.variable_index(n))
             .unwrap_or_else(|| panic!("C has no {name}: {:?}", c.variables()));
-        for (point, (a, b)) in ours.points().iter().zip(c.points()).enumerate() {
+        for (point, (a, b)) in ours.rows().zip(c.rows()).enumerate() {
             let (x, y) = (a[i], b[k]);
             let error = ((x.re - y.re).powi(2) + (x.im - y.im).powi(2)).sqrt();
             let scale = (y.re * y.re + y.im * y.im).sqrt();
@@ -160,7 +160,7 @@ fn uic_transient_matches_c() {
     // Both engines take the same step sequence here (no breakpoints after
     // t = 0); compare point by point under `compare::TRAN`'s bound
     // (1e-3 relative plus vntol/abstol floors).
-    assert_eq!(ours.points().len(), c.points().len());
+    assert_eq!(ours.point_count(), c.point_count());
     for (i, variable) in ours.variables().iter().enumerate() {
         let name = variable.name.as_str();
         if name.contains('#') {
@@ -176,7 +176,7 @@ fn uic_transient_matches_c() {
         .find_map(|n| c.variable_index(n))
         .unwrap_or_else(|| panic!("C has no {name}"));
         let floor = if name.starts_with("i(") { 1e-12 } else { 1e-6 };
-        for (point, (a, b)) in ours.points().iter().zip(c.points()).enumerate() {
+        for (point, (a, b)) in ours.rows().zip(c.rows()).enumerate() {
             let (x, y) = (a[i].re, b[k].re);
             assert!(
                 (x - y).abs() <= 1e-3 * y.abs() + floor,

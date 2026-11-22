@@ -39,7 +39,9 @@ fn classic_mos_dc_sensitivity_tables_and_values() {
     for level in [1, 2, 3, 6, 9] {
         let name = format!("sens_mos{level}");
         let deck = fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("conformance/netlists/{name}.cir")),
+            ngspice_conformance::fixtures::workspace_root()
+                .unwrap()
+                .join(format!("conformance/netlists/{name}.cir")),
         )
         .unwrap();
         compare_with_c(&name, &deck, NONLINEAR);
@@ -112,13 +114,15 @@ fn compare_with_c(name: &str, deck_text: &str, (relative, absolute): (f64, f64))
         !log.contains("aborted") && !log.contains("Error"),
         "{name}: ngspice reported a problem:\n{log}"
     );
-    let rust = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("simulate")
-        .arg("--output")
-        .arg(directory.join("rust.raw"))
-        .arg(&deck)
-        .output()
-        .expect("spice-rs runs");
+    let rust = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("simulate")
+    .arg("--output")
+    .arg(directory.join("rust.raw"))
+    .arg(&deck)
+    .output()
+    .expect("spice-rs runs");
     assert!(
         rust.status.success(),
         "{name}: {}",
@@ -149,9 +153,15 @@ fn compare_with_c(name: &str, deck_text: &str, (relative, absolute): (f64, f64))
             "{name}: plot {index} names in order"
         );
         assert_eq!(got.point_count(), want.point_count(), "{name}");
-        for (point, (a, b)) in got.points().iter().zip(want.points()).enumerate() {
-            for ((x, y), variable) in a.iter().zip(b).zip(want.variables()) {
-                if y.re.is_nan() || y.im.is_nan() {
+        for (point, (a, b)) in got.rows().zip(want.rows()).enumerate() {
+            for (column, ((x, y), variable)) in a.iter().zip(b).zip(want.variables()).enumerate() {
+                let [re, im] = ngspice_conformance::ngspice::batch_reference_sample(
+                    column,
+                    &variable.name,
+                    [y.re, y.im],
+                );
+                let reference = ngspice_rs::primitives::Complex::new(re, im);
+                if reference.re.is_nan() || reference.im.is_nan() {
                     assert!(
                         x.re.is_nan(),
                         "{name}: '{}' point {point}: C NaN, Rust {x}",
@@ -159,9 +169,9 @@ fn compare_with_c(name: &str, deck_text: &str, (relative, absolute): (f64, f64))
                     );
                     continue;
                 }
-                let difference = (*x - *y).magnitude();
+                let difference = (*x - reference).magnitude();
                 assert!(
-                    difference <= relative * y.magnitude() + absolute,
+                    difference <= relative * reference.magnitude() + absolute,
                     "{name}: '{}' point {point}: Rust {x} != C {y}",
                     variable.name
                 );

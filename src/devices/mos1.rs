@@ -148,15 +148,15 @@ impl Level1 {
 
 impl MosLevel for Level1 {
     type Params = Params;
-    const LEVEL: u8 = 1;
+    const BACKEND: crate::devices::ModelBackend = crate::devices::ModelBackend::Mos1;
     const LABEL: &'static str = "MOS1";
     const DEVICE_TYPE: CDeviceType = CDeviceType::Mos1;
     const NOISE_FAMILY: Option<NoiseFamily> = Some(NoiseFamily::Mos1);
     /// `mos1set.c`: `CKTmkVolt(..., "drain")` / `"source"`.
     const PRIME_SUFFIXES: [&'static str; 2] = ["drain", "source"];
 
-    fn model_schema() -> ScalarSchema<'static> {
-        ScalarSchema { parameters: MODEL }
+    fn model_schema() -> &'static ScalarSchema<'static> {
+        &MODEL_SCHEMA
     }
 
     fn from_card<'a>(
@@ -342,3 +342,5 @@ impl MosLevel for Level1 {
         device.distortion_terms(context)
     }
 }
+
+static MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(MODEL);

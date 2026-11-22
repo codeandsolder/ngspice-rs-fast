@@ -156,6 +156,32 @@ that file was already in this canonical form: per-variable options are dropped
 a batch-written file parses correctly but re-renders canonically rather than
 byte for byte.
 
+### Atomic rawfile output transactions
+
+`RawFileTransaction::create(destination, format, byte_order)` exclusively
+creates its output beside the destination and owns that opened file. A bounded
+128-attempt name generator retries collisions without opening, truncating or
+unlinking existing paths (including symlinks). Names are independent of the
+destination basename, which can itself be long. The destination is excluded
+from candidate names.
+
+Use `write_plot` for retained plots, or `begin_plot`, `push_point` and
+`finish_plot` for streamed plots; the transaction owns the active spool and
+its unique path. Each operation failure poisons the transaction. Only a
+complete, flushed transaction can `publish`, replacing the final file by a
+same-directory rename. Dropping an unfinished transaction closes and removes
+its owned temporary files. Unix cleanup/publication also verifies the opened
+file's device and inode before operating on its name. As with other
+rename-based transactions, this assumes the destination directory is trusted;
+it is not a defense against a process freely rearranging directory entries
+during the rename itself. Publication is atomic, not a power-loss durability
+guarantee.
+
+The lower-level `RawFileWriter::create` retains deliberate create/truncate
+semantics for explicit paths; its explicit spool paths still require
+exclusive creation. The CLI uses the transaction for both retained and
+streamed analysis output.
+
 ## Incremental decoding and validation
 
 For both formats, a single header parser validates the declared shape. Binary
@@ -276,3 +302,54 @@ workloads over 2,097,152 complex cells. Set `NGSPICE_RAWFILE_BENCH` to a scratch
 file path. Run `encode_ascii` or `encode_binary` before the corresponding
 `collect` and `iterate` tests. Measure each in a separate process; use
 `/usr/bin/time -v` for peak RSS and Valgrind DHAT for allocation counts.
+
+### Reader resource limits
+
+`RawFileReader::with_policy(RawReadPolicy { ... })` controls the maximum
+physical text-line length (including the line ending), cumulative header
+bytes and line count per plot (including leading blanks), consecutive blank
+bytes between ASCII values, variables per plot, and plots per file.
+`RawFormat::detect_with_policy` uses the same header decoder. Defaults are
+64 KiB per text line, 16 MiB and 131,072 lines per header, 1 MiB per blank
+run, 65,536 columns per plot and 65,536 plots. These are inclusive limits.
+Zero-column plots must declare zero points, except C's rootless real
+`Pole-Zero Analysis` plot, which has exactly one empty row. The ASCII
+incremental C writer emits `0<TAB>` without a line ending in that case;
+the reader consumes just the marker, including when the next header
+immediately follows it. Other positive zero-column counts are rejected.
+
+The separate `RawCollectPolicy` bounds cumulative actually collected rows,
+cells, header bytes and variables across plots. Defaults are 2 Mi rows,
+16 Mi cells (256 MiB of complex values, plus cell capacity slack and metadata overhead), 64 MiB of encoded header text and 262,144 variables. These logical
+limits are not an exact allocator/RSS budget. The lending row reader does
+not charge collection limits and accepts arbitrarily large valid row streams,
+subject to checked address-size/payload arithmetic and the configured header
+and whitespace limits. Declared point counts never trigger allocations
+proportional to the declaration. Set larger explicit limits when collecting
+large trusted data, or consume rows directly.
+
+The text reader checks byte counts before copying out of `BufRead::fill_buf`
+and validates UTF-8 only for bounded lines. Binary doubles use their original
+byte-oriented decoder; the text buffer cannot consume payload bytes beyond
+the section marker. Exceeding a limit reports the named resource, and a
+failed or unfinished decoder cannot advance to another plot.
+
+### Packed retained plots
+
+`Plot` stores a checked row-major cell buffer and explicit point count.
+`row`, `rows`, `point_mut` and `rows_mut` borrow the rectangular table;
+`column`/ `column_at` are allocation-free strided views, including indexed
+access and binary search. `cells` borrows the whole buffer and `with_cells`
+checks an owned buffer's shape before attaching it. `push_point` appends a
+borrowed row with checked growth, and `reserve_points` checks both addition
+and multiplication before attempting allocation.
+
+The rawfile collector charges the existing cumulative budget before
+extending a single packed buffer with each lending row. It does not reserve
+the declared number of points in advance, so truncated files cannot request
+large speculative allocations. ASCII column realness is finalized before
+attaching the buffer. The row budget remains useful to bound traversal work
+on very narrow plots. Identity projections transfer the buffer as-is;
+non-expanding consuming projections compact in-place using one reusable row,
+and expanding projections use a separately sized destination. Borrowed
+report consumers preserve the original full table until their work ends.

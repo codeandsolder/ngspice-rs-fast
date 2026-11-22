@@ -63,13 +63,22 @@ remain explicit errors.
   `spice-rs parse` uses this resolved API; summary/cards/tokens still inspect the
   original deck without source expansion.
 - Only the root file has a title. Included sources are **fragments**, including
-  their first physical line. Existing comment/continuation rules and joined-card
-  byte columns remain unchanged.
+  their first physical line. Existing comment/continuation rules and physical
+  byte columns are retained.
 - Paths resolve relative to the **containing source file**, not the process
   working directory. Resolved fragments carry canonical paths and original
   physical line numbers. A directive stays in its insertion scope and its
   expanded content follows it in order. Repeated/diamond includes remain
   repeated; no global deduplication suppresses content.
+- During one resolved parse, each canonical file's successful read is an
+  immutable source snapshot. Fragment folding, visited lexical cards and
+  library section indexes are shared across occurrences. The root keeps its
+  caller path and title interpretation; if a section of the root is selected,
+  its fragment interpretation uses the same original bytes. Raw cards and
+  boundary cards use shared ownership, as do the include chains of cards from
+  the same occurrence. Each visit still assembles its own typed semantic cards
+  and scope-local indices. A new parse starts with an empty store. Canonical
+  path lookup still happens at each directive, including symlink resolution.
 - `.lib path section` selects a case-insensitive `.lib section` …
   `.endl [section]` block. Section boundaries are validated across the source:
   missing, unmatched/mismatched, duplicate or nested section definitions fail.
@@ -98,7 +107,7 @@ Default limits per parse:
 | Limit | Default |
 | --- | ---: |
 | Include nesting below root | 64 |
-| File reads, including root/repeated sources | 1,024 |
+| Logical file visits, including root/repeated sources | 1,024 |
 | Aggregate bytes, including unselected sections | 16 MiB |
 | Processed expanded cards, including directives/terminators | 1,000,000 |
 
@@ -107,8 +116,9 @@ subcircuit-expansion budget (`SubcircuitLimits`), so it only stops runaway
 repeated includes, not large flat decks (it was 100,000, which rejected a
 50,000-stage RC ladder). Depth settings above 64 are rejected to protect the
 call stack. Bytes are read
-with a bounded reader **before** constructing fragments; byte/card/file limits
-also bound repeated acyclic work. UTF-8 input is required. These are explicit
+with a bounded reader **before** constructing fragments. Snapshot hits charge
+the original full file size and another file visit, even for empty sections;
+card/depth limits also apply to repeated occurrences. UTF-8 input is required. These are explicit
 port safety policies, not C parity claims. No environment/home/search-path
 expansion, compatibility aliases, nested library sections, parameter evaluation,
 source serialization or sandboxing is promised. Canonical paths follow symlinks;
@@ -275,9 +285,14 @@ source reproduction. The full contract is the module documentation of
   that are not single tokens or would be read as comments, scopes opened and
   closed in different files).
 - **Reparse:** SourceLocs, joined card text and spans always differ. Use
-  `semantic_eq`/`semantic_diff`/`semantic_form` (module `semantic`), which
-  neutralise locations, `Netlist::path`, raw card text, `path_spelling` and the
-  original text of waveform/`ic` vectors (their structured values are compared).
+  `semantic_eq`/`semantic_diff` (module `semantic`), which compare borrowed
+  typed fields through one short-circuiting traversal. They ignore physical
+  positions/source maps, `Netlist::path`, include quoting and lexical raw card
+  text (except output/control requests), and the original text of waveform/
+  `ic` vectors (their structured values are compared). Expression grouping,
+  literal spellings and include-chain depth/resolved paths remain significant.
+  Equal decks require no comparison allocations; differences report the first
+  differing field/index path. Writer expression checks use the same traversal.
   Re-parse with the same `Parser` configuration (`auto_gnd`). Tests:
   `tests/deck_writer.rs` (all `conformance/netlists/*.cir`,
   `conformance/parser/*.cir` and the source-resolution fixture round-trip and

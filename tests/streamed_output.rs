@@ -47,20 +47,23 @@ fn entries(dir: &Path) -> Vec<String> {
 #[derive(Default)]
 struct Recorder {
     header: Option<Plot>,
-    points: Vec<Vec<Complex>>,
+    plots: Vec<Plot>,
 }
 
 impl PointSink for Recorder {
     fn begin(&mut self, header: &Plot) -> SpiceResult<()> {
         assert!(self.header.is_none(), "begin is called once");
-        assert!(header.points().is_empty(), "the header holds no points");
+        assert!(header.point_count() == 0, "the header holds no points");
         self.header = Some(header.clone());
         Ok(())
     }
 
     fn point(&mut self, values: &[Complex]) -> SpiceResult<()> {
         assert!(self.header.is_some(), "begin precedes the points");
-        self.points.push(values.to_vec());
+        self.header.as_mut().unwrap().push_point(values)
+    }
+    fn end(&mut self) -> SpiceResult<()> {
+        self.plots.push(self.header.take().unwrap());
         Ok(())
     }
 }
@@ -73,23 +76,27 @@ fn assert_streams_the_stored_plot(body: &str) {
     let request = config.plan_for(&netlist.analyses[0]).unwrap();
 
     let mut circuit = config.circuit(&netlist).unwrap();
-    let stored = request.run(&mut circuit, &config.context()).unwrap();
+    let stored = request.run_plots(&mut circuit, &config.context()).unwrap();
     let final_state = circuit.final_transient_state();
 
     let mut circuit = config.circuit(&netlist).unwrap();
     let mut recorder = Recorder::default();
-    let returned = request
+    request
         .run_into(&mut circuit, &config.context(), &mut recorder)
         .unwrap();
-
-    assert!(returned.points().is_empty(), "run_into returns no points");
-    let header = recorder.header.expect("the sink saw a header");
-    assert_eq!(header.variables(), stored.variables());
-    assert_eq!(header.plotname, stored.plotname);
-    assert_eq!(returned.variables(), stored.variables());
-    assert!(!stored.points().is_empty());
-    // Bit-identical rows: streaming changes where points go, not what they are.
-    assert_eq!(recorder.points, stored.points());
+    assert!(recorder.header.is_none());
+    assert_eq!(recorder.plots.len(), stored.len());
+    for (streamed, stored) in recorder.plots.iter().zip(stored) {
+        assert_eq!(streamed.variables(), stored.variables());
+        assert_eq!(streamed.plotname, stored.plotname);
+        assert!(stored.point_count() != 0);
+        // Bit-exact row values, including signed zero.
+        assert_eq!(streamed.point_count(), stored.point_count());
+        for (a, b) in streamed.rows().flatten().zip(stored.rows().flatten()) {
+            assert_eq!(a.re.to_bits(), b.re.to_bits());
+            assert_eq!(a.im.to_bits(), b.im.to_bits());
+        }
+    }
     assert_eq!(circuit.final_transient_state(), final_state);
 }
 
@@ -116,9 +123,111 @@ fn a_streamed_mos_transient_carries_the_same_final_load_as_the_stored_path() {
 }
 
 #[test]
-fn the_default_run_into_replays_the_stored_plot() {
+fn direct_ac_and_dc_streams_and_completed_op_match_collected_rows() {
     assert_streams_the_stored_plot("v1 in 0 dc 5\nr1 in out 1k\nr2 out 0 1k\n.op");
     assert_streams_the_stored_plot("v1 in 0 dc 5 ac 1\nr1 in out 1k\nc1 out 0 1u\n.ac dec 5 1 1k");
+}
+
+#[test]
+fn multi_output_noise_and_bias_preserve_exact_rows_and_summary_cadence() {
+    for (sweep, options) in [
+        ("lin 1 1k 1k", ""),
+        ("dec 4 1 1k 3", ""),
+        (
+            "dec 4 1 1k 3",
+            ".control\nset sqrnoise\nset ngbehavior=s3\n.endc\n",
+        ),
+    ] {
+        assert_streams_the_stored_plot(&format!(
+            "v1 in 0 dc 1 ac 1\nr1 in out 1k\nr2 out 0 3k\n.options keepopinfo\n{options}.noise v(out) v1 {sweep}"
+        ));
+    }
+    assert_streams_the_stored_plot(
+        "v1 in 0 dc 1 ac 1\nr1 in out 1k\nc1 out 0 1u\n.options keepopinfo\n.ac lin 8 1 100",
+    );
+    assert_streams_the_stored_plot(
+        "v1 in 0 dc 1\nv2 aux 0 dc 1\nr1 in out 1k\nr2 out aux 1k\n.dc v1 0 4 1 v2 0 2 1",
+    );
+}
+
+#[test]
+fn spectral_and_dc_sink_failures_stop_before_completing_a_plot() {
+    struct Abort {
+        begun: usize,
+        ended: usize,
+        points: usize,
+    }
+    impl PointSink for Abort {
+        fn begin(&mut self, _header: &Plot) -> SpiceResult<()> {
+            self.begun += 1;
+            Ok(())
+        }
+        fn point(&mut self, _values: &[Complex]) -> SpiceResult<()> {
+            self.points += 1;
+            if self.points == 3 {
+                return Err(SpiceError::circuit("stop on third row"));
+            }
+            Ok(())
+        }
+        fn end(&mut self) -> SpiceResult<()> {
+            self.ended += 1;
+            Ok(())
+        }
+    }
+    for (analysis, bias) in [
+        (".ac lin 20 1 20", 1),
+        (".noise v(out) v1 lin 20 1 20 2", 1),
+        (".dc v1 0 20 1", 0),
+    ] {
+        let netlist = deck(&format!(
+            "v1 in 0 dc 1 ac 1\nr1 in out 1k\nr2 out 0 1k\n.options keepopinfo\n{analysis}"
+        ));
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let request = config.plan_for(&netlist.analyses[0]).unwrap();
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let mut sink = Abort {
+            begun: 0,
+            ended: 0,
+            points: 0,
+        };
+        let error = request
+            .run_into(&mut circuit, &config.context(), &mut sink)
+            .unwrap_err();
+        assert!(error.to_string().contains("stop on third row"), "{error}");
+        assert_eq!(
+            (sink.begun, sink.ended, sink.points),
+            (bias + 1, bias, 3),
+            "{analysis}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_end_event_does_not_publish_transient_state() {
+    struct AbortEnd;
+    impl PointSink for AbortEnd {
+        fn begin(&mut self, _header: &Plot) -> SpiceResult<()> {
+            Ok(())
+        }
+        fn point(&mut self, _values: &[Complex]) -> SpiceResult<()> {
+            Ok(())
+        }
+        fn end(&mut self) -> SpiceResult<()> {
+            Err(SpiceError::circuit("end refused"))
+        }
+    }
+    let netlist = deck("v1 in 0 dc 1\nr1 in out 1k\nc1 out 0 1u\n.tran 0.1m 1m");
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    assert!(
+        request
+            .run_into(&mut circuit, &config.context(), &mut AbortEnd)
+            .unwrap_err()
+            .to_string()
+            .contains("end refused")
+    );
+    assert!(circuit.final_transient_state().is_none());
 }
 
 /// A sink that fails on its third point.
@@ -137,6 +246,9 @@ impl PointSink for Refusing {
                 location: None,
             });
         }
+        Ok(())
+    }
+    fn end(&mut self) -> SpiceResult<()> {
         Ok(())
     }
 }
@@ -177,7 +289,7 @@ fn sample_plots() -> RawFile {
     let mut real = real.build();
     for index in 0..5 {
         let t = f64::from(index) * 1e-4;
-        real.push_point(vec![Complex::real(t), Complex::real((-t / 1e-3).exp())])
+        real.push_point(&[Complex::real(t), Complex::real((-t / 1e-3).exp())])
             .unwrap();
     }
     let mut complex = Plot::builder("ac1", "AC Analysis", PlotFlags::Complex);
@@ -187,7 +299,7 @@ fn sample_plots() -> RawFile {
     for index in 0..3 {
         let f = 10f64.powi(index);
         complex
-            .push_point(vec![Complex::real(f), Complex::new(1.0 / f, -0.5 / f)])
+            .push_point(&[Complex::real(f), Complex::new(1.0 / f, -0.5 / f)])
             .unwrap();
     }
     let mut empty = Plot::builder("tran2", "Transient Analysis", PlotFlags::Real);
@@ -225,11 +337,11 @@ fn streamed_and_stored_plots_write_the_same_bytes() {
         writer.write_plot(&rawfile.plots[0]).unwrap();
         for raw_plot in &rawfile.plots[1..] {
             let mut plot = writer.begin_plot(raw_plot.clone(), &spool).unwrap();
-            assert!(plot.header().plot.points().is_empty());
-            for point in raw_plot.plot.points() {
+            assert!(plot.header().plot.point_count() == 0);
+            for point in raw_plot.plot.rows() {
                 plot.push_point(point).unwrap();
             }
-            assert_eq!(plot.point_count(), raw_plot.plot.points().len());
+            assert_eq!(plot.point_count(), raw_plot.plot.point_count());
             writer.finish_plot(plot).unwrap();
             assert!(!spool.exists(), "finishing removes the spool");
         }
@@ -259,7 +371,7 @@ fn streamed_and_stored_plots_write_the_same_bytes() {
         );
         if format.is_binary() {
             for (actual, expected) in parsed.plots.iter().zip(&rawfile.plots) {
-                assert_eq!(actual.plot.points(), expected.plot.points());
+                assert_eq!(actual.plot.cells(), expected.plot.cells());
             }
         }
     }
@@ -319,11 +431,48 @@ fn a_streamed_binary_plot_cannot_cross_byte_orders() {
     )
     .unwrap();
     let mut plot = origin.begin_plot(rawfile.plots[0].clone(), &spool).unwrap();
-    plot.push_point(&rawfile.plots[0].plot.points()[0]).unwrap();
+    plot.push_point(rawfile.plots[0].plot.row(0).unwrap())
+        .unwrap();
     assert!(writer.finish_plot(plot).is_err());
     writer.finish().unwrap();
     origin.finish().unwrap();
     assert!(!spool.exists());
     assert_eq!(fs::metadata(dir.join("dest.raw")).unwrap().len(), 0);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn atomic_transaction_matches_stored_and_streamed_encodings() {
+    use ngspice_rs::analysis::RawFileTransaction;
+
+    let dir = scratch("transaction-encodings");
+    let rawfile = sample_plots();
+    let output = dir.join("out.raw");
+    for (format, order) in [
+        (RawFormat::Ascii, BinaryByteOrder::LittleEndian),
+        (RawFormat::Binary, BinaryByteOrder::LittleEndian),
+        (RawFormat::Binary, BinaryByteOrder::BigEndian),
+    ] {
+        fs::write(&output, "PREVIOUS").unwrap();
+        let mut transaction = RawFileTransaction::create(&output, format, order).unwrap();
+        transaction.write_plot(&rawfile.plots[0]).unwrap();
+        for raw in &rawfile.plots[1..] {
+            transaction.begin_plot(raw.clone()).unwrap();
+            for row in raw.plot.rows() {
+                transaction.push_point(row).unwrap();
+            }
+            let completed = transaction.finish_plot().unwrap();
+            assert_eq!(completed.point_count, raw.plot.point_count());
+            assert!(completed.header.plot.point_count() == 0);
+        }
+        assert_eq!(fs::read_to_string(&output).unwrap(), "PREVIOUS");
+        transaction.publish().unwrap();
+        let expected = match format {
+            RawFormat::Ascii => rawfile.to_ascii().unwrap().into_bytes(),
+            RawFormat::Binary => rawfile.to_binary_with(order).unwrap(),
+        };
+        assert_eq!(fs::read(&output).unwrap(), expected);
+        assert_eq!(entries(&dir), ["out.raw"]);
+    }
     fs::remove_dir_all(&dir).unwrap();
 }

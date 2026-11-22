@@ -54,8 +54,13 @@
     reason = "the ASCII ngspice rawfile documentation demonstrates literal tab separator bytes"
 )]
 
+mod transaction;
+
+use transaction::OwnedTemporary;
+pub use transaction::RawFileTransaction;
+
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -64,6 +69,10 @@ use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 use crate::analysis::results::{Plot, PlotFlags, Variable};
 
 mod binary;
+mod policy;
+
+pub use policy::{RawCollectPolicy, RawReadPolicy};
+use policy::{limit, reserve, spend};
 
 pub use binary::BinaryByteOrder;
 
@@ -341,12 +350,21 @@ impl RawFileWriter {
     ) -> SpiceResult<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::create(&path).map_err(|error| SpiceError::io(&path, &error))?;
-        Ok(Self {
+        Ok(Self::from_file(file, path, format, byte_order))
+    }
+
+    fn from_file(
+        file: File,
+        path: PathBuf,
+        format: RawFormat,
+        byte_order: BinaryByteOrder,
+    ) -> Self {
+        Self {
             out: BufWriter::new(file),
             path,
             format,
             byte_order,
-        })
+        }
     }
 
     /// The encoding this writer uses.
@@ -385,22 +403,26 @@ impl RawFileWriter {
         spool: impl AsRef<Path>,
     ) -> SpiceResult<StreamedPlot> {
         let path = spool.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| SpiceError::io(&path, &error))?;
-        let mut header = header;
+        let (file, temporary) =
+            OwnedTemporary::open(path.clone()).map_err(|error| SpiceError::io(&path, &error))?;
+        Ok(self.begin_owned_plot(header, file, temporary))
+    }
+
+    fn begin_owned_plot(
+        &self,
+        mut header: RawPlot,
+        file: File,
+        temporary: OwnedTemporary,
+    ) -> StreamedPlot {
         header.plot.clear_points();
-        Ok(StreamedPlot {
+        StreamedPlot {
             header,
             format: self.format,
             byte_order: self.byte_order,
             point_count: 0,
-            spool: Some(BufWriter::new(file)),
-            path,
-        })
+            spool: BufWriter::new(file),
+            temporary,
+        }
     }
 
     /// Writes a streamed plot: its header with the final point count, then the
@@ -411,7 +433,7 @@ impl RawFileWriter {
     /// [`SpiceError::Io`] when the spool cannot be read back or the rawfile
     /// cannot be written; [`SpiceError::Unsupported`] when the spool encoding
     /// differs from this writer's encoding.
-    pub fn finish_plot(&mut self, mut plot: StreamedPlot) -> SpiceResult<()> {
+    pub fn finish_plot(&mut self, plot: StreamedPlot) -> SpiceResult<FinishedPlot> {
         if plot.format != self.format
             || (self.format.is_binary() && plot.byte_order != self.byte_order)
         {
@@ -419,18 +441,25 @@ impl RawFileWriter {
                 "streamed plot encoding differs from rawfile writer",
             ));
         }
-        let spool_error = |error: io::Error| SpiceError::io(&plot.path, &error);
-        let Some(spool) = plot.spool.take() else {
-            return Ok(());
-        };
+        let StreamedPlot {
+            header,
+            point_count,
+            spool,
+            temporary,
+            ..
+        } = plot;
+        let spool_error = |error: io::Error| SpiceError::io(temporary.path(), &error);
         let mut file = spool
             .into_inner()
             .map_err(|error| spool_error(error.into_error()))?;
         file.seek(SeekFrom::Start(0)).map_err(spool_error)?;
-        render_header(&mut self.out, &plot.header, plot.point_count, self.format)
+        render_header(&mut self.out, &header, point_count, self.format)
             .map_err(|error| self.io_error(&error))?;
         io::copy(&mut file, &mut self.out).map_err(|error| self.io_error(&error))?;
-        Ok(())
+        Ok(FinishedPlot {
+            header,
+            point_count,
+        })
     }
 
     /// Flushes everything written so far and closes the file.
@@ -460,9 +489,9 @@ pub struct StreamedPlot {
     format: RawFormat,
     byte_order: BinaryByteOrder,
     point_count: usize,
-    /// `None` once finished.
-    spool: Option<BufWriter<File>>,
-    path: PathBuf,
+    // Field order closes the spool before the owned path is removed.
+    spool: BufWriter<File>,
+    temporary: OwnedTemporary,
 }
 
 impl StreamedPlot {
@@ -490,37 +519,42 @@ impl StreamedPlot {
             .point_count
             .checked_add(1)
             .ok_or_else(|| unsupported("rawfile point count overflows a usize"))?;
-        let Some(spool) = self.spool.as_mut() else {
-            return Err(unsupported("point pushed to a finished rawfile plot"));
-        };
+        if self.header.plot.variable_count() == 0
+            && !super::results::valid_empty_shape(
+                &self.header.plot.plotname,
+                self.header.plot.flags(),
+                next_count,
+            )
+        {
+            return Err(unsupported(
+                "zero variables with nonzero points outside a rootless pole-zero result",
+            ));
+        }
         write_point(
-            spool,
+            &mut self.spool,
             &self.header.plot,
             self.format,
             self.point_count,
             values,
             self.byte_order,
         )
-        .map_err(|error| SpiceError::io(&self.path, &error))?;
+        .map_err(|error| SpiceError::io(self.temporary.path(), &error))?;
         self.point_count = next_count;
         Ok(())
     }
 }
 
-impl Drop for StreamedPlot {
-    fn drop(&mut self) {
-        // Close before removing; a failed removal leaves only a stray spool
-        // file beside the rawfile, never a partial rawfile.
-        self.spool = None;
-        let _ = fs::remove_file(&self.path);
-    }
+/// Metadata of a completed streamed plot; rows were written without retention.
+#[derive(Debug)]
+pub struct FinishedPlot {
+    /// Plot headers and column schema.
+    pub header: RawPlot,
+    /// Number of stored points.
+    pub point_count: usize,
 }
 
-/// Checks that every point of `plot` has one value per variable.
 fn validate_plot(plot: &Plot) -> SpiceResult<()> {
-    plot.points()
-        .iter()
-        .try_for_each(|point| plot.check_point(point))
+    plot.validate_shape()
 }
 
 /// The line that ends the header in `format`.
@@ -539,8 +573,8 @@ fn write_plot(
     byte_order: BinaryByteOrder,
 ) -> io::Result<()> {
     let plot = &raw_plot.plot;
-    render_header(out, raw_plot, plot.points().len(), format)?;
-    for (index, point) in plot.points().iter().enumerate() {
+    render_header(out, raw_plot, plot.point_count(), format)?;
+    for (index, point) in plot.rows().enumerate() {
         write_point(out, plot, format, index, point, byte_order)?;
     }
     Ok(())
@@ -569,6 +603,10 @@ fn render_ascii_point(
     index: usize,
     point: &[Complex],
 ) -> io::Result<()> {
+    if point.is_empty() {
+        // C's incremental writer has no value/newline to follow its index.
+        return write!(out, "{index}\t");
+    }
     write!(out, " {index}")?;
     for (variable, value) in plot.variables().iter().zip(point) {
         let real = SpiceNumber(value.re);
@@ -603,44 +641,138 @@ fn render_header(
     out.write_all(section_line(format))
 }
 
+/// Remaining physical bytes and lines in the current header.
+struct HeaderBudget {
+    bytes: usize,
+    lines: usize,
+}
+
 /// Byte-aware line reader: only the current line is decoded as text.
 struct Cursor<R> {
     input: R,
-    line: String,
+    line: Vec<u8>,
+    policy: RawReadPolicy,
+    header: Option<HeaderBudget>,
 }
 
 impl<R: BufRead> Cursor<R> {
     const fn new(input: R) -> Self {
         Self {
             input,
-            line: String::new(),
+            line: Vec::new(),
+            policy: RawReadPolicy::DEFAULT,
+            header: None,
         }
     }
 
-    fn next(&mut self, skip_blank: bool) -> SpiceResult<Option<&str>> {
+    const fn begin_header(&mut self) {
+        self.header = Some(HeaderBudget {
+            bytes: self.policy.header_bytes,
+            lines: self.policy.header_lines,
+        });
+    }
+
+    fn end_header(&mut self) -> usize {
+        self.header
+            .take()
+            .map_or(0, |work| self.policy.header_bytes - work.bytes)
+    }
+
+    /// Read no more than the remaining limit plus one inspected byte, without
+    /// consuming the excess or reserving capacity proportional to input size.
+    fn read_line(&mut self) -> SpiceResult<bool> {
+        self.line.clear();
         loop {
-            self.line.clear();
-            if self.input.read_line(&mut self.line).map_err(|error| {
-                if error.kind() == io::ErrorKind::InvalidData {
-                    unsupported("rawfile header or ASCII value is not UTF-8 text")
-                } else {
-                    input_error(&error)
-                }
-            })? == 0
-            {
-                return Ok(None);
+            let available = match self.input.fill_buf() {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(input_error(&error)),
+            };
+            if available.is_empty() {
+                return Ok(!self.line.is_empty());
             }
-            if !skip_blank || !self.line.trim().is_empty() {
-                break;
+            if self.header.as_ref().is_some_and(|work| work.lines == 0) {
+                return Err(limit("header lines per plot"));
+            }
+            let line_remaining = self.policy.line_bytes - self.line.len();
+            let header_remaining = self.header.as_ref().map_or(usize::MAX, |work| work.bytes);
+            let remaining = line_remaining.min(header_remaining);
+            let inspect = available.len().min(remaining.saturating_add(1));
+            let end = available[..inspect].iter().position(|&byte| byte == b'\n');
+            let count = end.map_or(inspect, |index| index + 1);
+            if count > remaining {
+                return Err(limit(if line_remaining <= header_remaining {
+                    "text line bytes"
+                } else {
+                    "header bytes per plot"
+                }));
+            }
+            let needed = self.line.len() + count;
+            if needed > self.line.capacity() {
+                let capacity = self
+                    .line
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(needed)
+                    .min(self.policy.line_bytes);
+                self.line
+                    .try_reserve_exact(capacity - self.line.len())
+                    .map_err(|error| {
+                        unsupported(format!("rawfile allocation failed for text line: {error}"))
+                    })?;
+            }
+            self.line.extend_from_slice(&available[..count]);
+            if let Some(work) = &mut self.header {
+                work.bytes -= count;
+            }
+            self.input.consume(count);
+            if end.is_some() {
+                return Ok(true);
             }
         }
-        Ok(Some(
-            self.line
-                .strip_suffix('\n')
-                .map_or(self.line.as_str(), |line| {
-                    line.strip_suffix('\r').unwrap_or(line)
-                }),
-        ))
+    }
+
+    fn is_blank(&self) -> SpiceResult<bool> {
+        // Most data lines begin with ASCII whitespace followed by a number.
+        // A single non-whitespace ASCII byte proves the line is not blank.
+        for &byte in &self.line {
+            if byte.is_ascii() {
+                if !byte.is_ascii_whitespace() && byte != b'\x0b' {
+                    return Ok(false);
+                }
+            } else {
+                // Preserve the original Unicode trim semantics.
+                return std::str::from_utf8(&self.line)
+                    .map(|line| line.trim().is_empty())
+                    .map_err(|_| unsupported("rawfile header or ASCII value is not UTF-8 text"));
+            }
+        }
+        Ok(true)
+    }
+
+    fn next(&mut self, skip_blank: bool) -> SpiceResult<Option<&str>> {
+        let mut blank_remaining = self.policy.blank_bytes;
+        loop {
+            if !self.read_line()? {
+                return Ok(None);
+            }
+            if let Some(work) = &mut self.header {
+                spend(&mut work.lines, 1, "header lines per plot")?;
+            }
+            if !skip_blank || !self.is_blank()? {
+                break;
+            }
+            spend(
+                &mut blank_remaining,
+                self.line.len(),
+                "consecutive blank bytes",
+            )?;
+        }
+        let line = std::str::from_utf8(&self.line)
+            .map_err(|_| unsupported("rawfile header or ASCII value is not UTF-8 text"))?;
+        Ok(Some(line.strip_suffix('\n').map_or(line, |line| {
+            line.strip_suffix('\r').unwrap_or(line)
+        })))
     }
 }
 
@@ -690,7 +822,17 @@ impl RawFormat {
     /// # Errors
     /// Invalid or missing rawfile header.
     pub fn detect(bytes: &[u8]) -> SpiceResult<Self> {
-        parse_header(&mut Cursor::new(bytes))?
+        Self::detect_with_policy(bytes, RawReadPolicy::DEFAULT)
+    }
+
+    /// Detects format using the specified header limits.
+    ///
+    /// # Errors
+    /// Invalid, missing or over-budget first header.
+    pub fn detect_with_policy(bytes: &[u8], policy: RawReadPolicy) -> SpiceResult<Self> {
+        let mut cursor = Cursor::new(bytes);
+        cursor.policy = policy;
+        parse_header(&mut cursor)?
             .map(|(_, format)| format)
             .ok_or_else(|| unsupported("rawfile contains no plot header"))
     }
@@ -713,6 +855,7 @@ struct Header {
     padded: bool,
     point_count: usize,
     variables: Vec<Variable>,
+    text_bytes: usize,
 }
 
 /// Parses one plot header, up to and including its `Values:` or `Binary:` line.
@@ -720,6 +863,7 @@ struct Header {
 /// Returns `None` at the end of the file. The returned [`Section`] is the line
 /// that ended the header and determines the payload decoder.
 fn parse_header(cursor: &mut Cursor<impl BufRead>) -> SpiceResult<Option<(Header, RawFormat)>> {
+    cursor.begin_header();
     let Some(first) = cursor.next(true)? else {
         return Ok(None);
     };
@@ -782,6 +926,14 @@ fn parse_header(cursor: &mut Cursor<impl BufRead>) -> SpiceResult<Option<(Header
     let plotname = plotname.ok_or_else(|| missing_header("Plotname"))?;
     let flags = flags.ok_or_else(|| missing_header("Flags"))?;
 
+    if variable_count > cursor.policy.variables {
+        return Err(limit("variables per plot"));
+    }
+    if variable_count == 0 && !super::results::valid_empty_shape(&plotname, flags, point_count) {
+        return Err(unsupported(
+            "rawfile declares zero variables with nonzero points",
+        ));
+    }
     let variables = parse_variables(cursor, variable_count)?;
 
     let Some(line) = cursor.next(false)? else {
@@ -812,6 +964,7 @@ fn parse_header(cursor: &mut Cursor<impl BufRead>) -> SpiceResult<Option<(Header
             padded,
             point_count,
             variables,
+            text_bytes: cursor.end_header(),
         },
         format,
     )))
@@ -847,6 +1000,7 @@ fn parse_variables(
                 "rawfile variable index {declared} out of order, expected {index}"
             )));
         }
+        reserve(&mut variables, 1, "variable definitions")?;
         variables.push(Variable::new(name, fields.next().unwrap_or("")));
     }
 
@@ -862,6 +1016,7 @@ pub struct RawFileReader<R> {
     format: Option<RawFormat>,
     byte_order: BinaryByteOrder,
     blocked: bool,
+    plot_count: usize,
 }
 
 impl<R: BufRead> RawFileReader<R> {
@@ -873,7 +1028,15 @@ impl<R: BufRead> RawFileReader<R> {
             format: None,
             byte_order: BinaryByteOrder::LittleEndian,
             blocked: false,
+            plot_count: 0,
         }
+    }
+
+    /// Set resource limits for the complete input. Configure before reading.
+    #[must_use]
+    pub const fn with_policy(mut self, policy: RawReadPolicy) -> Self {
+        self.cursor.policy = policy;
+        self
     }
 
     /// Requires the specified file encoding.
@@ -906,6 +1069,10 @@ impl<R: BufRead> RawFileReader<R> {
             self.blocked = false;
             return Ok(None);
         };
+        if self.plot_count >= self.cursor.policy.plots {
+            return Err(limit("plots per input"));
+        }
+        self.plot_count += 1;
         if self.format.is_some_and(|expected| expected != format) {
             return Err(unsupported(if format.is_binary() {
                 BINARY_UNSUPPORTED
@@ -923,6 +1090,7 @@ impl<R: BufRead> RawFileReader<R> {
             padded,
             point_count,
             mut variables,
+            text_bytes: header_bytes,
         } = header;
         if format.is_binary() && !padded {
             return Err(unsupported(
@@ -945,7 +1113,9 @@ impl<R: BufRead> RawFileReader<R> {
         } else {
             0
         };
-        let realness = variables.iter().map(|v| v.is_real).collect();
+        let mut realness = Vec::new();
+        reserve(&mut realness, columns, "column realness")?;
+        realness.extend(variables.iter().map(|v| v.is_real));
         let plot = Plot::new(plotname.clone(), plotname, flags, variables);
         Ok(Some(RawPlotRows {
             reader: self,
@@ -956,7 +1126,8 @@ impl<R: BufRead> RawFileReader<R> {
                 plot,
             },
             format,
-            point_count: if columns == 0 { 0 } else { point_count },
+            point_count,
+            header_bytes,
             next_index: 0,
             payload_len,
             consumed: 0,
@@ -972,13 +1143,30 @@ impl<R: BufRead> RawFileReader<R> {
     /// Invalid or truncated rawfile data, unsupported layouts or I/O failures.
     pub fn read(mut self) -> SpiceResult<RawFile> {
         let mut plots = Vec::new();
+        let mut budget = self.cursor.policy.collect;
         while let Some(mut rows) = self.next_plot()? {
-            let mut points = Vec::new();
+            spend(
+                &mut budget.header_bytes,
+                rows.header_bytes,
+                "collected header bytes",
+            )?;
+            spend(
+                &mut budget.variables,
+                rows.header.plot.variables().len(),
+                "collected variables",
+            )?;
+            let mut cells = Vec::new();
+            let mut point_count = 0;
             while let Some(row) = rows.next_row()? {
-                points.push(row.to_vec());
+                spend(&mut budget.rows, 1, "collected rows")?;
+                spend(&mut budget.cells, row.len(), "collected cells")?;
+                reserve(&mut cells, row.len(), "collected cells")?;
+                cells.extend_from_slice(row);
+                point_count += 1;
             }
             let mut raw_plot = rows.finish()?;
-            raw_plot.plot = raw_plot.plot.with_points(points)?;
+            raw_plot.plot = raw_plot.plot.with_cells(point_count, cells)?;
+            reserve(&mut plots, 1, "collected plots")?;
             plots.push(raw_plot);
         }
         Ok(RawFile { plots })
@@ -994,6 +1182,7 @@ pub struct RawPlotRows<'a, R> {
     header: RawPlot,
     format: RawFormat,
     point_count: usize,
+    header_bytes: usize,
     next_index: usize,
     payload_len: usize,
     consumed: usize,
@@ -1028,6 +1217,7 @@ impl<R: BufRead> RawPlotRows<'_, R> {
         }
         self.row.clear();
         self.failed = true;
+        reserve(&mut self.row, self.realness.len(), "streaming row")?;
         match self.format {
             RawFormat::Ascii => self.decode_ascii_row()?,
             RawFormat::Binary => self.decode_binary_row()?,
@@ -1039,6 +1229,9 @@ impl<R: BufRead> RawPlotRows<'_, R> {
 
     fn decode_ascii_row(&mut self) -> SpiceResult<()> {
         let columns = self.header.plot.variables().len();
+        if columns == 0 {
+            return self.decode_empty_pz_row();
+        }
         for (column, is_real) in self.realness.iter_mut().enumerate() {
             let Some(line) = self.reader.cursor.next(true)? else {
                 return Err(unsupported(format!(
@@ -1061,6 +1254,39 @@ impl<R: BufRead> RawPlotRows<'_, R> {
                 *is_real = false;
             }
             self.row.push(parsed.value);
+        }
+        Ok(())
+    }
+
+    fn decode_empty_pz_row(&mut self) -> SpiceResult<()> {
+        // C outitf.c writes 0 + TAB, without a newline. A following Title:
+        // may immediately follow the TAB, so never read a whole text line.
+        // Also accept the older writer's space-prefixed index and newline.
+        let cursor = &mut self.reader.cursor;
+        let mut remaining = cursor.policy.line_bytes;
+        let mut byte = [0];
+        loop {
+            spend(&mut remaining, 1, "empty pole-zero point index")?;
+            cursor.input.read_exact(&mut byte).map_err(|error| {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    unsupported("truncated empty pole-zero row")
+                } else {
+                    input_error(&error)
+                }
+            })?;
+            match byte[0] {
+                b' ' | b'\t' => {}
+                b'0' => break,
+                _ => return Err(unsupported("invalid empty pole-zero point index")),
+            }
+        }
+        spend(&mut remaining, 1, "empty pole-zero point index")?;
+        cursor
+            .input
+            .read_exact(&mut byte)
+            .map_err(|error| input_error(&error))?;
+        if !byte[0].is_ascii_whitespace() {
+            return Err(unsupported("invalid empty pole-zero point index separator"));
         }
         Ok(())
     }
@@ -1231,6 +1457,31 @@ Values:
 ";
 
     #[test]
+    fn bounded_line_reads_do_not_consume_or_allocate_the_oversize_suffix() {
+        let data = vec![b'x'; 2 * 1024 * 1024];
+        let mut cursor = super::Cursor::new(data.as_slice());
+        cursor.policy.line_bytes = 64;
+        assert!(cursor.next(false).is_err());
+        assert_eq!(cursor.input.len(), data.len());
+        assert!(cursor.line.capacity() <= 64);
+
+        let mut cursor = super::Cursor::new(std::io::BufReader::with_capacity(3, data.as_slice()));
+        cursor.policy.line_bytes = 63;
+        assert!(cursor.next(false).is_err());
+        assert!(cursor.line.len() <= 63);
+        assert!(cursor.line.capacity() <= 63);
+
+        // A line exactly at the limit is accepted, with either LF or CRLF.
+        for text in ["1234567\n", "123456\r\n", "12345678"] {
+            let mut cursor =
+                super::Cursor::new(std::io::BufReader::with_capacity(3, text.as_bytes()));
+            cursor.policy.line_bytes = 8;
+            assert_eq!(cursor.next(false).unwrap(), Some(text.trim_end()));
+            assert_eq!(cursor.next(false).unwrap(), None);
+        }
+    }
+
+    #[test]
     fn direct_numeric_output_preserves_spice_spelling() {
         let mut bits = 0x12ab_3456_e789_cdef_u64;
         for value in [
@@ -1273,7 +1524,7 @@ Values:
         assert_eq!(raw_plot.plot.variables().len(), 3);
         assert_eq!(raw_plot.plot.variables()[1].name, "v(out)");
         assert_eq!(raw_plot.plot.variables()[1].unit, "voltage");
-        assert_eq!(raw_plot.plot.points().len(), 1);
+        assert_eq!(raw_plot.plot.point_count(), 1);
         assert_eq!(raw_plot.plot.value("v(out)", 0), Some(Complex::real(2.5)));
         assert_eq!(raw_plot.plot.value("v(in)", 0), Some(Complex::real(5.0)));
         assert_eq!(
@@ -1287,7 +1538,7 @@ Values:
         let rawfile = RawFile::parse(AC_RAWFILE).expect("parses");
         let plot = &rawfile.single_plot().expect("one plot");
         assert_eq!(plot.flags(), PlotFlags::Complex);
-        assert_eq!(plot.points().len(), 2);
+        assert_eq!(plot.point_count(), 2);
         assert_eq!(plot.value("frequency", 1), Some(Complex::new(1e3, 0.0)));
         assert_eq!(plot.value("v(out)", 1), Some(Complex::new(0.9, -0.1)));
         assert_eq!(plot.value("i(v1)", 0), Some(Complex::new(-1e-3, 1e-5)));
@@ -1487,7 +1738,7 @@ Values:
     #[test]
     fn validate_catches_ragged_plots() {
         let mut rawfile = RawFile::parse(OP_RAWFILE).expect("parses");
-        assert!(rawfile.plots[0].plot.push_point(Vec::new()).is_err());
+        assert!(rawfile.plots[0].plot.push_point(&[]).is_err());
         assert!(rawfile.validate().is_ok());
     }
 }

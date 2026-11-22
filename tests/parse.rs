@@ -1,17 +1,19 @@
 //! Process-level checks for the parser's success/gap/failure exit contract.
 
-use std::path::Path;
 use std::process::Command;
 
 fn run(name: &str) -> std::process::Output {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
         .join("conformance/netlists")
         .join(format!("{name}.cir"));
-    Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("parse")
-        .arg(path)
-        .output()
-        .expect("run spice-rs")
+    Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("parse")
+    .arg(path)
+    .output()
+    .expect("run spice-rs")
 }
 
 #[test]
@@ -45,13 +47,16 @@ fn supported_fixtures_parse_successfully() {
 
 #[test]
 fn param_fixture_parses_and_evaluates_top_level_values() {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/parser/param_expressions.cir");
-    let output = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("parse")
-        .arg(path)
-        .output()
-        .unwrap();
+    let path = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance/parser/param_expressions.cir");
+    let output = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("parse")
+    .arg(path)
+    .output()
+    .unwrap();
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -72,11 +77,13 @@ fn param_failures_exit_with_a_located_error() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("bad.cir");
     std::fs::write(&path, "t\n.param a={1/0}\nr1 1 0 {a}\n.end\n").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("parse")
-        .arg(&path)
-        .output()
-        .unwrap();
+    let output = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("parse")
+    .arg(&path)
+    .output()
+    .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -95,12 +102,16 @@ fn subcircuit_parse_success_is_not_flattening() {
 
 #[test]
 fn parse_command_resolves_source_relative_fragments_and_library_sections() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/parser/sources/main.cir");
-    let output = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("parse")
-        .arg(path)
-        .output()
-        .unwrap();
+    let path = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance/parser/sources/main.cir");
+    let output = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("parse")
+    .arg(path)
+    .output()
+    .unwrap();
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -133,11 +144,13 @@ fn remaining_syntax_gaps_and_source_failures_keep_distinct_exits() {
         ("title\n.include missing.inc\n", 2),
     ] {
         std::fs::write(&path, text).unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-            .arg("parse")
-            .arg(&path)
-            .output()
-            .unwrap();
+        let output = Command::new(
+            std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+        )
+        .arg("parse")
+        .arg(&path)
+        .output()
+        .unwrap();
         assert_eq!(
             output.status.code(),
             Some(status),
@@ -161,11 +174,13 @@ fn run_text(name: &str, text: &str) -> std::process::Output {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("deck.cir");
     std::fs::write(&path, text).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("parse")
-        .arg(&path)
-        .output()
-        .expect("run spice-rs");
+    let output = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("parse")
+    .arg(&path)
+    .output()
+    .expect("run spice-rs");
     let _ = std::fs::remove_dir_all(&dir);
     output
 }

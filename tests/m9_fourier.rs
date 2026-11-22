@@ -28,7 +28,7 @@ fn configured_fourier_recovers_multiple_periods_and_polynomial_interpolation() {
         let value = 0.5
             + (std::f64::consts::TAU * 1000. * t).sin()
             + 0.25 * (std::f64::consts::TAU * 2000. * t).sin();
-        plot.push_point(vec![Complex::real(t), Complex::real(value)])
+        plot.push_point(&[Complex::real(t), Complex::real(value)])
             .unwrap();
     }
     for degree in [1, 2, 3, 5] {
@@ -237,13 +237,15 @@ fn control_fourier_command_runs_through_the_process_interface() {
     let raw = dir.join("out.raw");
     let text = "Control Fourier\nV1 out 0 sin(.5 1 1k)\nR1 out 0 1k\n.tran 1u 4m\n.control\nset nfreqs=5 nperiods=2 polydegree=3 fourgridsize=256\nrun\nfourier 1k v(out)\nquit\n.endc\n.end\n";
     fs::write(&deck, text).unwrap();
-    let run = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("simulate")
-        .arg("--output")
-        .arg(&raw)
-        .arg(&deck)
-        .output()
-        .unwrap();
+    let run = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("simulate")
+    .arg("--output")
+    .arg(&raw)
+    .arg(&deck)
+    .output()
+    .unwrap();
     assert!(
         run.status.success(),
         "{}",

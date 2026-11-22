@@ -14,7 +14,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use ngspice_rs::analysis::{
-    BinaryByteOrder, Plot, PlotFlags, RawFile, RawFileReader, RawFormat, Variable,
+    BinaryByteOrder, Plot, PlotFlags, RawCollectPolicy, RawFile, RawFileReader, RawFormat,
+    RawReadPolicy, Variable,
 };
 use ngspice_rs::primitives::Complex;
 
@@ -36,18 +37,18 @@ fn workload() -> RawFile {
         });
     }
     let mut plot = plot.build();
+    let mut values = Vec::with_capacity(COLUMNS as usize);
     for row in 0..ROWS {
-        let values = (0..COLUMNS)
-            .map(|column| {
-                let real = f64::from(row).mul_add(0.125, f64::from(column) + 1.0);
-                if column % 2 == 0 {
-                    Complex::real(real)
-                } else {
-                    Complex::new(real, -0.5 * real)
-                }
-            })
-            .collect();
-        plot.push_point(values).unwrap();
+        values.clear();
+        values.extend((0..COLUMNS).map(|column| {
+            let real = f64::from(row).mul_add(0.125, f64::from(column) + 1.0);
+            if column % 2 == 0 {
+                Complex::real(real)
+            } else {
+                Complex::new(real, -0.5 * real)
+            }
+        }));
+        plot.push_point(&values).unwrap();
     }
     RawFile::single(plot)
 }
@@ -90,7 +91,7 @@ fn collect() {
     let start = Instant::now();
     let raw = RawFile::load(&path).unwrap();
     let plot = raw.single_plot().unwrap();
-    assert_eq!(plot.points().len(), usize::try_from(ROWS).unwrap());
+    assert_eq!(plot.point_count(), usize::try_from(ROWS).unwrap());
     assert_eq!(plot.variables().len(), usize::try_from(COLUMNS).unwrap());
     black_box(&raw);
     report(start);
@@ -101,7 +102,15 @@ fn collect() {
 fn iterate() {
     let input = BufReader::new(File::open(fixture()).unwrap());
     let start = Instant::now();
-    let mut reader = RawFileReader::new(input);
+    let mut reader = RawFileReader::new(input).with_policy(RawReadPolicy {
+        collect: RawCollectPolicy {
+            cells: 0,
+            rows: 0,
+            header_bytes: 0,
+            variables: 0,
+        },
+        ..RawReadPolicy::DEFAULT
+    });
     let mut rows = reader.next_plot().unwrap().unwrap();
     let mut count = 0;
     while let Some(row) = rows.next_row().unwrap() {

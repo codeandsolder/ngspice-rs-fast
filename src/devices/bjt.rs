@@ -62,6 +62,10 @@
 mod disto;
 mod physics;
 
+static INSTANCE_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(INSTANCE);
+
+static MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(MODEL);
+
 #[cfg(test)]
 use physics::Point;
 use physics::{Junction, Transport, c_point};
@@ -913,9 +917,11 @@ impl Bjt {
         model: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        if model.levels().selector != 1 || !(3..=4).contains(&i.nodes.len()) {
+        if model.levels().backend != crate::devices::ModelBackend::Bjt
+            || !(3..=4).contains(&i.nodes.len())
+        {
             return Err(SpiceError::Unsupported {
-                feature: "BJT backend requires level 1 and 3/4 terminals".into(),
+                feature: "BJT backend requires a Gummel-Poon model and 3/4 terminals".into(),
                 location: Some(i.location.clone()),
             });
         }
@@ -928,13 +934,11 @@ impl Bjt {
             card.parameters
                 .iter()
                 .filter(|p| !p.name.eq_ignore_ascii_case("level")),
-            &ScalarSchema { parameters: MODEL },
-            &ScalarSchema {
-                parameters: INSTANCE,
-            },
+            &MODEL_SCHEMA,
+            &INSTANCE_SCHEMA,
         );
         let assignments: Vec<_> = model_side.into_iter().map(canonical).collect();
-        let values = ScalarSchema { parameters: MODEL }.validate(&assignments, &card.location)?;
+        let values = MODEL_SCHEMA.validate(&assignments, &card.location)?;
         let parameters = Model::from_values(&values)?;
         let excess_phase = get(&values, "ptf")? * parameters.tf;
         if excess_phase != 0. {
@@ -946,9 +950,7 @@ impl Bjt {
         let (initial, instance_setters) =
             crate::devices::initial::split(&i.parameters, &IC_COMPONENTS)?;
         let instance_values = crate::devices::schema::with_defaults(
-            &ScalarSchema {
-                parameters: INSTANCE,
-            },
+            &INSTANCE_SCHEMA,
             &model_defaults,
             instance_setters.iter(),
             &i.location,
@@ -2474,9 +2476,7 @@ mod tests {
         let netlist = crate::netlist::Parser::new().parse_deck(&deck).unwrap();
         let card = &netlist.models[0];
         let assignments: Vec<_> = card.parameters.iter().map(canonical).collect();
-        let values = ScalarSchema { parameters: MODEL }
-            .validate(&assignments, &card.location)
-            .unwrap();
+        let values = MODEL_SCHEMA.validate(&assignments, &card.location).unwrap();
         let model = Model::from_values(&values).unwrap();
         let instance = Instance {
             area: 1.3,

@@ -184,9 +184,7 @@ impl HfetInstance {
         owner: &crate::primitives::SourceLoc,
     ) -> SpiceResult<Self> {
         let values = crate::devices::schema::with_defaults(
-            &ScalarSchema {
-                parameters: HFET_INSTANCE,
-            },
+            &HFET_INSTANCE_SCHEMA,
             defaults,
             setters.iter(),
             owner,
@@ -564,15 +562,9 @@ impl Model {
         // `inpgmod.c::create_model`: a setter outside the model table that is
         // a settable instance parameter becomes a model-level instance
         // default, applied before the instance card's own setters.
-        let (scalars, defaults) = crate::devices::schema::split_model_setters(
-            scalars,
-            &ScalarSchema { parameters: MODEL },
-            &ScalarSchema {
-                parameters: INSTANCE,
-            },
-        );
-        let values =
-            ScalarSchema { parameters: MODEL }.validate(scalars, &resolved.card().location)?;
+        let (scalars, defaults) =
+            crate::devices::schema::split_model_setters(scalars, &MODEL_SCHEMA, &INSTANCE_SCHEMA);
+        let values = MODEL_SCHEMA.validate(scalars, &resolved.card().location)?;
         let r = |name: &str| jfet::required(&values, name);
         let alias = |names: &[&str]| jfet::last_setter(&values, names);
         let model = Self {
@@ -684,9 +676,7 @@ impl Instance {
         owner: &crate::primitives::SourceLoc,
     ) -> SpiceResult<Self> {
         let values = crate::devices::schema::with_defaults(
-            &ScalarSchema {
-                parameters: INSTANCE,
-            },
+            &INSTANCE_SCHEMA,
             defaults,
             setters.iter(),
             owner,
@@ -701,6 +691,12 @@ impl Instance {
         })
     }
 }
+
+pub(super) static HFET_INSTANCE_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(HFET_INSTANCE);
+
+static INSTANCE_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(INSTANCE);
+
+static MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(MODEL);
 
 #[cfg(test)]
 mod tests {

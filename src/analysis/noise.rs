@@ -697,7 +697,7 @@ fn integrated_plot(
         }
     }
     integrated_power.append(&mut values);
-    integrated.push_point(values.values)?;
+    integrated.push_point(&values.values)?;
     if !integrated.is_finite() {
         return Err(SpiceError::Numerical {
             context: ".noise".into(),
@@ -740,17 +740,20 @@ fn spectrum_plot(representation: Representation, spectrum_variables: Vec<Variabl
     )
 }
 
-/// Runs `.noise` and returns its plots: the spectrum and, unless the sweep is
-/// a single frequency, the integrated noise.
+/// Emits the optional bias, streamed spectrum and, unless the sweep is a
+/// single frequency, its integrated noise in that order.
 pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisPlan,
     context: &AnalysisContext,
     card: &NoiseCard,
     frequencies: &[Real],
-    options: crate::analysis::NoiseOptions,
     include_bias: bool,
-) -> SpiceResult<Vec<Plot>> {
+    sink: &mut dyn crate::analysis::PointSink,
+) -> SpiceResult<()> {
+    let options = request
+        .noise_options()
+        .ok_or_else(|| unsupported("noise driver requires a noise plan"))?;
     let settings = request.dc_settings().clone();
     circuit.finalize()?;
     let output = card.output(circuit)?;
@@ -759,7 +762,9 @@ pub(super) fn run(
     // them (`noisean.c`: `CKTop`, then a `MODEINITSMSIG` load; a
     // `hertz`-dependent circuit is re-solved at every frequency).
     let mut small = crate::analysis::ac::SmallSignal::prepare(circuit, request, context, settings)?;
-    let mut plots = small.retained_bias(circuit, request, context, include_bias)?;
+    for bias in small.retained_bias(circuit, request, context, include_bias)? {
+        sink.complete(bias)?;
+    }
     let mut model = context.model_context();
     model.spice3_noise = options.spice3;
     // Generators that depend on the frequency are described at the first
@@ -778,11 +783,13 @@ pub(super) fn run(
     let representation = Representation::from_squared(options.squared);
     let (spectrum_variables, integrated_variables) =
         plot_names(&generators, input_kind, card.summary != 0, representation);
-    let mut spectrum = spectrum_plot(representation, spectrum_variables);
+    let spectrum = spectrum_plot(representation, spectrum_variables);
+    sink.begin(&spectrum)?;
     let adjoint_rhs = output_excitation(circuit, output);
 
     let mut integrated_power = Power::default();
     let mut last = card.start;
+    let mut row = NoiseRow::new(representation, spectrum.variable_count());
     for (step, &freq) in frequencies.iter().enumerate() {
         let input_name = card.input.as_str();
         let (forward, adjoint) = small.at_frequency(circuit, context, freq, |system| {
@@ -813,10 +820,7 @@ pub(super) fn run(
         let print_summary = card.summary != 0 && step.is_multiple_of(card.summary);
         let mut out_density = 0.;
         let emit = card.summary == 0 || print_summary;
-        let mut row = NoiseRow::new(
-            representation,
-            if emit { spectrum.variables().len() } else { 0 },
-        );
+        row.values.clear();
         if emit {
             row.values.push(Complex::real(freq));
         }
@@ -831,27 +835,28 @@ pub(super) fn run(
         if emit {
             row.push_power(out_density);
             row.push_power(out_density * gain_sq_inv);
-            spectrum.push_point(row.values)?;
+            spectrum.check_point(&row.values)?;
+            if !row.values.iter().all(|value| value.is_finite()) {
+                return Err(SpiceError::Numerical {
+                    context: ".noise".into(),
+                    message: "nonfinite noise density".into(),
+                });
+            }
+            sink.point(&row.values)?;
         }
         last = freq;
     }
-    if !spectrum.is_finite() {
-        return Err(SpiceError::Numerical {
-            context: ".noise".into(),
-            message: "nonfinite noise density".into(),
-        });
-    }
-    plots.push(spectrum);
+    sink.end()?;
     if card.start.to_bits() != card.stop.to_bits() {
-        plots.push(integrated_plot(
+        sink.complete(integrated_plot(
             representation,
             integrated_variables,
             &generators,
             card.summary != 0,
             integrated_power,
-        )?);
+        )?)?;
     }
-    Ok(plots)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1057,7 +1062,7 @@ mod tests {
                 assert_eq!(plots.len(), expected, "{mode} {distance}");
                 assert_eq!(plots[0].point_count(), 1);
                 if let Some(integrated) = plots.get(1) {
-                    assert_eq!(integrated.points()[0], [Complex::ZERO; 2]);
+                    assert_eq!(integrated.row(0).unwrap(), [Complex::ZERO; 2]);
                 }
             }
         }

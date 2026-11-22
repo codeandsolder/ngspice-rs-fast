@@ -7,7 +7,7 @@
 //!   neighbouring samples of that plot. Interpolation is refused (an error, not
 //!   a pass) if a source breakpoint lies strictly between those two samples.
 //! * **Breakpoint**: a discontinuity or slope change of a source (PWL corner,
-//!   PULSE edge, from the deck AST via [`breakpoints`], never guessed from
+//!   PULSE edge, from the elaborated circuit via [`breakpoints`], never guessed from
 //!   data). The left and right limits are compared separately. A plot carries
 //!   two samples at the instant for a true jump (first = left, second = right);
 //!   a single sample is taken as both limits, which is exact for the continuous
@@ -22,15 +22,11 @@
 //! spacing is small against the circuit time constants; that is the caller's
 //! fixture design responsibility and is not hidden by a looser tolerance.
 
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use ngspice_rs::analysis::{Plot, PlotFlags};
-use ngspice_rs::netlist::ast::{
-    DeviceInstance, Netlist, ParameterKind, PositionedValue, PulseWaveform, PwlPoint,
-    SourceWaveform, Subcircuit,
-};
-use ngspice_rs::primitives::{exact_nonnegative_integer, parse_spice_number};
+use ngspice_rs::devices::{Circuit, TransientTiming};
+use ngspice_rs::primitives::{Complex, exact_nonnegative_integer};
 
 use super::compare::{self, TranTolerance};
 
@@ -74,6 +70,61 @@ enum Side {
     Right,
 }
 
+/// Bound rows and weights for one instant. Every signal uses the same plan,
+/// and sampling two plots needs only two plans live at a time.
+#[derive(Debug)]
+enum SamplePlan<'a> {
+    Exact(&'a [Complex]),
+    Linear {
+        lower: &'a [Complex],
+        upper: &'a [Complex],
+        lower_weight: f64,
+        upper_weight: f64,
+    },
+}
+
+impl SamplePlan<'_> {
+    fn value(&self, column: usize) -> f64 {
+        match self {
+            Self::Exact(row) => row[column].re,
+            Self::Linear {
+                lower,
+                upper,
+                lower_weight,
+                upper_weight,
+            } => {
+                // Preserve the original arithmetic order and rounding.
+                let left = lower_weight * lower[column].re;
+                let right = upper_weight * upper[column].re;
+                left + right
+            }
+        }
+    }
+}
+
+type EventRows = Option<(usize, usize)>;
+
+/// Index the first and last original row matching each event. Iterate rows
+/// in storage order: small time reversals are legal at corners, so a binary
+/// search of the time axis cannot establish the one-sided limits. A row may
+/// belong to two nearby event windows; retain both rather than only the
+/// first matching event. The event timeline is strictly ordered.
+fn index_event_rows(times: &[f64], events: &[f64], eps: f64) -> Vec<EventRows> {
+    let mut rows: Vec<EventRows> = vec![None; events.len()];
+    if !events.is_empty() {
+        for (row, &time) in times.iter().enumerate() {
+            let start = first_possible_breakpoint(events, time, eps);
+            for (&event, endpoints) in events[start..].iter().zip(&mut rows[start..]) {
+                if (event - time).abs() > eps {
+                    break;
+                }
+                *endpoints = Some((endpoints.map_or(row, |(first, _)| first), row));
+            }
+        }
+    }
+    rows
+}
+
 /// One validated transient plot.
 struct Series<'a> {
     label: &'static str,
@@ -81,6 +132,7 @@ struct Series<'a> {
     columns: BTreeMap<String, usize>,
     times: Vec<f64>,
     breakpoints: &'a [f64],
+    event_rows: Vec<EventRows>,
     eps: f64,
 }
 
@@ -102,7 +154,7 @@ impl<'a> Series<'a> {
         if plot.variables()[time].unit != "time" {
             return Err(format!("{label}: axis 'time' must have unit 'time'"));
         }
-        let times: Vec<f64> = plot.points().iter().map(|row| row[time].re).collect();
+        let times: Vec<f64> = plot.rows().map(|row| row[time].re).collect();
         if (times[0] - grid.start).abs() > eps {
             return Err(format!(
                 "{label}: transient starts at {:e}, not {:e}",
@@ -116,20 +168,23 @@ impl<'a> Series<'a> {
                 grid.stop
             ));
         }
-        let series = Self {
+        let mut series = Self {
             label,
             plot,
             columns,
             times,
             breakpoints,
+            event_rows: Vec::new(),
             eps,
         };
         series.check_times()?;
+        series.event_rows = index_event_rows(&series.times, breakpoints, eps);
         Ok(series)
     }
 
-    /// Times must not decrease; two samples may share an instant only at a
-    /// declared breakpoint (left/right limits), and never three.
+    /// Decreases greater than the time tolerance are invalid. Two samples
+    /// may coincide within tolerance only at a declared breakpoint, and
+    /// never three consecutive samples.
     fn check_times(&self) -> Result<(), String> {
         for (index, pair) in self.times.windows(2).enumerate() {
             let step = pair[1] - pair[0];
@@ -163,60 +218,80 @@ impl<'a> Series<'a> {
     }
 
     fn breakpoint_near(&self, t: f64) -> Option<f64> {
-        self.breakpoints
-            .iter()
-            .copied()
-            .find(|b| (b - t).abs() <= self.eps)
+        nearby_breakpoint(self.breakpoints, t, self.eps)
     }
 
-    /// Value of column `column` at `t` on `side`.
-    fn value(&self, column: usize, t: f64, side: Side) -> Result<f64, String> {
-        let at = |index: usize| self.plot.points()[index][column].re;
-        if let Some(b) = self.breakpoint_near(t) {
-            let near: Vec<usize> = (0..self.times.len())
-                .filter(|&i| (self.times[i] - b).abs() <= self.eps)
-                .collect();
-            let (Some(&first), Some(&last)) = (near.first(), near.last()) else {
+    /// Bind the sample once, independent of the requested signal.
+    fn sample(&self, t: f64, side: Side) -> Result<SamplePlan<'a>, String> {
+        let row = |index| {
+            self.plot
+                .row(index)
+                .ok_or_else(|| format!("{}: no sample {index}", self.label))
+        };
+        if let Some(index) = nearby_breakpoint_index(self.breakpoints, t, self.eps) {
+            let b = self.breakpoints[index];
+            let Some((first, last)) = self.event_rows[index] else {
                 return Err(format!(
                     "{}: no sample at breakpoint {b:e}; cannot form a one-sided limit",
                     self.label
                 ));
             };
             return match side {
-                Side::Left => Ok(at(first)),
-                Side::Right => Ok(at(last)),
+                Side::Left => row(first).map(SamplePlan::Exact),
+                Side::Right => row(last).map(SamplePlan::Exact),
                 Side::Interior => Err(format!(
                     "{}: interior evaluation requested at breakpoint {b:e}",
                     self.label
                 )),
             };
         }
+        // Keep the original interior bracket-selection rule, including its
+        // behavior for the tiny reversals allowed by check_times. Only the
+        // event lookup above required a complete scan of matching rows.
         let upper = self.times.partition_point(|&x| x < t - self.eps);
         if upper == self.times.len() {
             return Err(format!("{}: time {t:e} is beyond the samples", self.label));
         }
         if (self.times[upper] - t).abs() <= self.eps {
-            return Ok(at(upper));
+            return row(upper).map(SamplePlan::Exact);
         }
         if upper == 0 {
             return Err(format!("{}: time {t:e} precedes the samples", self.label));
         }
         let (t0, t1) = (self.times[upper - 1], self.times[upper]);
-        if let Some(b) = self
-            .breakpoints
-            .iter()
-            .find(|&&b| b > t0 + self.eps && b < t1 - self.eps)
-        {
+        let next = self.breakpoints.partition_point(|&b| b <= t0 + self.eps);
+        if let Some(b) = self.breakpoints.get(next).filter(|&&b| b < t1 - self.eps) {
             return Err(format!(
                 "{}: samples [{t0:e}, {t1:e}] straddle breakpoint {b:e}; refusing to interpolate across it",
                 self.label
             ));
         }
         let fraction = (t - t0) / (t1 - t0);
-        let left = (1.0 - fraction) * at(upper - 1);
-        let right = fraction * at(upper);
-        Ok(left + right)
+        Ok(SamplePlan::Linear {
+            lower: row(upper - 1)?,
+            upper: row(upper)?,
+            lower_weight: 1.0 - fraction,
+            upper_weight: fraction,
+        })
     }
+}
+
+/// Find the first matching corner in an already validated sorted timeline.
+/// Use the original subtraction predicate rather than rounding a new bound.
+fn first_possible_breakpoint(breakpoints: &[f64], time: f64, eps: f64) -> usize {
+    breakpoints.partition_point(|&event| event < time && time - event > eps)
+}
+
+fn nearby_breakpoint_index(breakpoints: &[f64], time: f64, eps: f64) -> Option<usize> {
+    let index = first_possible_breakpoint(breakpoints, time, eps);
+    breakpoints
+        .get(index)
+        .filter(|&&event| (event - time).abs() <= eps)
+        .map(|_| index)
+}
+
+fn nearby_breakpoint(breakpoints: &[f64], time: f64, eps: f64) -> Option<f64> {
+    nearby_breakpoint_index(breakpoints, time, eps).map(|index| breakpoints[index])
 }
 
 fn comparison_instants(
@@ -245,33 +320,39 @@ fn comparison_instants(
         }
         previous = b;
     }
-    let mut instants: Vec<(f64, Side)> = Vec::new();
-    // The first instant is `start` itself (0 for an ordinary run); grid times
-    // before it do not exist in either plot.
-    instants.push((grid.start, Side::Interior));
-    for index in 0..=count {
-        let t = f64::from(index) * grid.step;
-        if t > grid.start + eps
-            && t < grid.stop - eps
-            && !breakpoints.iter().any(|b| (b - t).abs() <= eps)
-        {
-            check_event_capacity(instants.len(), 1)?;
-            instants.push((t, Side::Interior));
-        }
-    }
-    check_event_capacity(instants.len(), 1)?;
-    instants.push((grid.stop, Side::Interior));
     let limit_count = breakpoints
         .len()
         .checked_mul(2)
         .ok_or("too many breakpoint limits")?;
-    check_event_capacity(instants.len(), limit_count)?;
-    for &b in breakpoints {
-        instants.push((b, Side::Left));
-        instants.push((b, Side::Right));
+    check_event_capacity(2, limit_count)?;
+    let mandatory = limit_count + 2;
+    let mut instants = Vec::with_capacity(mandatory);
+    instants.push((grid.start, Side::Interior));
+    let mut interiors = 0;
+    let mut events = breakpoints.iter().copied().peekable();
+    // Merge monotonically increasing grid times with the event timeline.
+    // A grid time near a breakpoint is omitted, using exactly the original
+    // subtraction test (not a rounded t +/- eps bound).
+    for index in 0..=count {
+        let t = f64::from(index) * grid.step;
+        if !(t > grid.start + eps && t < grid.stop - eps) {
+            continue;
+        }
+        while events.peek().is_some_and(|&b| b < t && t - b > eps) {
+            if let Some(b) = events.next() {
+                instants.extend([(b, Side::Left), (b, Side::Right)]);
+            }
+        }
+        if events.peek().is_none_or(|&b| (b - t).abs() > eps) {
+            check_event_capacity(mandatory, interiors + 1)?;
+            interiors += 1;
+            instants.push((t, Side::Interior));
+        }
     }
-    // Stable sort keeps Left before Right at equal times.
-    instants.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for b in events {
+        instants.extend([(b, Side::Left), (b, Side::Right)]);
+    }
+    instants.push((grid.stop, Side::Interior));
     Ok(instants)
 }
 
@@ -303,8 +384,11 @@ pub(super) fn transient(
             "current" => tolerance.current_absolute,
             other => return Err(format!("signal '{name}' has unsupported unit '{other}'")),
         };
-        let peak = (0..want.point_count())
-            .map(|row| want.points()[row][column].re.abs())
+        let peak = want
+            .column_at(column)
+            .ok_or_else(|| format!("C: missing column {column} for '{name}'"))?
+            .iter()
+            .map(|value| value.re.abs())
             .fold(0.0, f64::max);
         let peak_allowance = tolerance.peak_relative * peak;
         let absolute = absolute + peak_allowance;
@@ -324,9 +408,15 @@ pub(super) fn transient(
         } else {
             summary.limits += 1;
         }
+        // With no compared signals the old comparator never bound samples.
+        if signals.is_empty() {
+            continue;
+        }
+        let got_sample = rust.sample(t, side)?;
+        let want_sample = c.sample(t, side)?;
         for &(name, got_column, want_column, absolute) in &signals {
-            let actual = rust.value(got_column, t, side)?;
-            let expected = c.value(want_column, t, side)?;
+            let actual = got_sample.value(got_column);
+            let expected = want_sample.value(want_column);
             let relative_allowance = tolerance.relative * expected.abs();
             let limit = relative_allowance + absolute;
             let error = (actual - expected).abs();
@@ -354,57 +444,32 @@ pub(super) fn transient(
     }
 }
 
-fn number(value: &PositionedValue, what: &str, device: &str) -> Result<f64, String> {
-    parse_spice_number(&value.text)
-        .filter(|v| v.is_finite())
-        .ok_or_else(|| format!("{device}: {what} '{}' is not a finite number", value.text))
-}
-
-/// Source breakpoints in `(0, tstop)` from the deck AST, sorted and deduplicated.
-///
-/// Only each source's last waveform setter counts (C applies setters in order).
-///
-/// * PWL (C `VSRCaccept`, `vsrcacct.c`): every knot time shifted by `td=`; with
-///   `r=` the knots after the repeat point recur every `t_last - r`.
-/// * PULSE: `TD + n*PER + {0, TR, TR+PW, TR+PW+TF}`, with C's defaults: `TR`/`TF`
-///   <= 0 or omitted -> `tstep`; `PW` omitted -> `tstop`, except exactly five
-///   values given -> 0; `PER` <= 0 or omitted -> `tstop`. A positive eighth
-///   field `NP` keeps only corners at or before `TD + NP*PER` (C sets none
-///   after it; its one extra request just past that time is not a corner).
-/// * SIN/EXP/SFFM/AM: none (C sets no breakpoints for them); fields are still
-///   checked to be numbers.
-///
-/// Only top-level V/I sources are inspected; a deck whose subcircuit
-/// definitions (at any depth) contain a V/I waveform source is rejected because
-/// waveforms inside them are not enumerated. Subcircuits without such sources
-/// (e.g. an op-amp macromodel) add no breakpoints and are accepted.
-/// Expression-valued or non-numeric waveform fields are errors.
-pub(super) fn breakpoints(
-    netlist: &Netlist,
-    time_step: f64,
-    stop_time: f64,
-) -> Result<Vec<f64>, String> {
-    if !(time_step.is_finite() && time_step > 0.0 && stop_time.is_finite() && stop_time > 0.0) {
-        return Err("tstep and tstop must be finite and positive".into());
-    }
-    if netlist.subcircuits.iter().any(has_waveform_source) {
-        return Err("breakpoints: subcircuit waveforms are not enumerated".into());
-    }
+/// Source breakpoints required to have samples in both transient plots.
+/// Uses the same validated, elaborated forcing as the driver, including
+/// nested parameterized sources and the effective last waveform setter.
+/// Analytic function corners and trailing scheduling requests are not
+/// required; an actual pulse-count cut is a discontinuity and must not be
+/// interpolated across, even if C did not schedule a landing there.
+pub(super) fn breakpoints(circuit: &Circuit, timing: &TransientTiming) -> Result<Vec<f64>, String> {
+    let stop_time = timing.final_time();
     let eps = TIME_EPS_REL * stop_time;
     let mut times = Vec::new();
-    for device in &netlist.devices {
-        if !matches!(device.designator, 'v' | 'i') {
-            continue;
-        }
-        let waveform = device.parameters.iter().rev().find_map(|p| match &p.kind {
-            ParameterKind::Waveform(waveform) => Some(waveform),
-            _ => None,
-        });
-        if let Some(waveform) = waveform {
-            collect(device, waveform, time_step, stop_time, &mut times)?;
+    let mut generated = 0;
+    for source in circuit.source_timelines(*timing) {
+        let source = source.map_err(|error| error.to_string())?;
+        let mut events = source
+            .waveform
+            .breakpoints_in(0., stop_time)
+            .map_err(|error| format!("{}: {error}", source.name))?;
+        while let Some(event) = events.next_event() {
+            // Count all generated events before filtering or deduplication.
+            check_event_capacity(generated, 1)?;
+            generated += 1;
+            if event.kind.requires_landing() && event.time > eps && event.time < stop_time - eps {
+                times.push(event.time);
+            }
         }
     }
-    times.retain(|&t| t > eps && t < stop_time - eps);
     times.sort_by(f64::total_cmp);
     times.dedup_by(|b, a| (*b - *a).abs() <= eps);
     Ok(times)
@@ -437,53 +502,6 @@ pub(super) fn echoes(
     Ok(times)
 }
 
-/// Whether a subcircuit body, or one nested in it, defines a V/I source with a
-/// waveform setter.
-fn has_waveform_source(subcircuit: &Subcircuit) -> bool {
-    subcircuit.devices.iter().any(|device| {
-        matches!(device.designator, 'v' | 'i')
-            && device
-                .parameters
-                .iter()
-                .any(|p| matches!(p.kind, ParameterKind::Waveform(_)))
-    }) || subcircuit.subcircuits.iter().any(has_waveform_source)
-}
-
-/// The last scalar `name=` setter of `device`, if any.
-fn scalar(device: &DeviceInstance, name: &str) -> Result<Option<f64>, String> {
-    device
-        .parameters
-        .iter()
-        .rev()
-        .find(|p| p.name == name)
-        .map(|p| {
-            parse_spice_number(&p.value)
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| format!("{}: {name}= '{}' is not a number", device.name, p.value))
-        })
-        .transpose()
-}
-
-fn collect(
-    device: &DeviceInstance,
-    waveform: &SourceWaveform,
-    time_step: f64,
-    stop_time: f64,
-    out: &mut Vec<f64>,
-) -> Result<(), String> {
-    let name = device.name.as_str();
-    match waveform {
-        SourceWaveform::Pwl(points) => collect_pwl(device, points, stop_time, out)?,
-        SourceWaveform::Pulse(pulse) => collect_pulse(name, pulse, time_step, stop_time, out)?,
-        SourceWaveform::Function(function) => {
-            for (value, field) in function.values.iter().zip(function.function.fields()) {
-                number(value, field, name)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Bound the total event count before extending any waveform's output.
 fn check_event_capacity(existing: usize, additional: usize) -> Result<(), String> {
     let count = existing
@@ -494,121 +512,6 @@ fn check_event_capacity(existing: usize, additional: usize) -> Result<(), String
     } else {
         Err("too many generated breakpoints".into())
     }
-}
-
-fn collect_pwl(
-    device: &DeviceInstance,
-    points: &[PwlPoint],
-    stop_time: f64,
-    out: &mut Vec<f64>,
-) -> Result<(), String> {
-    let name = device.name.as_str();
-    let delay = scalar(device, "td")?.unwrap_or(0.0);
-    check_event_capacity(out.len(), points.len())?;
-    let knots = points
-        .iter()
-        .map(|point| number(&point.time, "PWL time", name))
-        .collect::<Result<Vec<_>, _>>()?;
-    let last = *knots.last().ok_or_else(|| format!("{name}: empty PWL"))?;
-    out.extend(knots.iter().map(|t| delay + t));
-    if let Some(r) = scalar(device, "r")?.filter(|&r| r >= -0.5) {
-        let start = knots
-            .iter()
-            .position(|&t| t.partial_cmp(&r) == Some(Ordering::Equal))
-            .ok_or_else(|| format!("{name}: r={r} matches no PWL time"))?;
-        let period = last - r;
-        if period <= 0.0 || (stop_time - delay - last) / period > f64::from(MAX_POINTS) / 4.0 {
-            return Err(format!(
-                "{name}: repeated PWL would create too many breakpoints"
-            ));
-        }
-        let mut cycle = 1_u32;
-        loop {
-            let previous_offset = f64::from(cycle - 1) * period;
-            let previous_end = delay + last + previous_offset;
-            if previous_end.partial_cmp(&stop_time) != Some(Ordering::Less) {
-                break;
-            }
-            if cycle > MAX_POINTS {
-                return Err(format!(
-                    "{name}: repeated PWL would create too many breakpoints"
-                ));
-            }
-            let offset = f64::from(cycle) * period;
-            check_event_capacity(out.len(), knots.len() - start - 1)?;
-            for &t in &knots[start + 1..] {
-                out.push(delay + t + offset);
-            }
-            cycle += 1;
-        }
-    }
-    Ok(())
-}
-
-fn collect_pulse(
-    name: &str,
-    pulse: &PulseWaveform,
-    time_step: f64,
-    stop_time: f64,
-    out: &mut Vec<f64>,
-) -> Result<(), String> {
-    let optional = [
-        &pulse.delay,
-        &pulse.rise,
-        &pulse.fall,
-        &pulse.width,
-        &pulse.period,
-    ];
-    let given = optional.iter().take_while(|v| v.is_some()).count();
-    let get = |value: &Option<PositionedValue>, what| -> Result<Option<f64>, String> {
-        value.as_ref().map(|v| number(v, what, name)).transpose()
-    };
-    let delay = get(&pulse.delay, "PULSE delay")?.unwrap_or(0.0);
-    let rise = get(&pulse.rise, "PULSE rise")?
-        .filter(|&v| v > 0.0)
-        .unwrap_or(time_step);
-    let fall = get(&pulse.fall, "PULSE fall")?
-        .filter(|&v| v > 0.0)
-        .unwrap_or(time_step);
-    let width = if given == 3 {
-        0.0
-    } else {
-        get(&pulse.width, "PULSE width")?
-            .filter(|&v| v >= 0.0)
-            .unwrap_or(stop_time)
-    };
-    let period = get(&pulse.period, "PULSE period")?
-        .filter(|&v| v > 0.0)
-        .unwrap_or(stop_time);
-    let stop = get(&pulse.count, "PULSE count")?
-        .filter(|&v| v > 0.0)
-        .map(|count| count * period);
-    // Validate level spellings too: an unparseable level is an error.
-    number(&pulse.initial, "PULSE v1", name)?;
-    number(&pulse.pulsed, "PULSE v2", name)?;
-    if (stop_time - delay) / period > f64::from(MAX_POINTS) / 4.0 {
-        return Err(format!("{name}: PULSE would create too many breakpoints"));
-    }
-    let mut cycle = 0_u32;
-    loop {
-        let offset = f64::from(cycle) * period;
-        let start = delay + offset;
-        if start.partial_cmp(&stop_time) != Some(Ordering::Less) {
-            break;
-        }
-        if cycle >= MAX_POINTS {
-            return Err(format!("{name}: PULSE would create too many breakpoints"));
-        }
-        for corner in [0.0, rise, rise + width, rise + width + fall] {
-            let local = offset + corner;
-            if stop.is_none_or(|stop| local <= stop) {
-                check_event_capacity(out.len(), 1)?;
-                out.push(delay + local);
-            }
-        }
-        cycle += 1;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -632,10 +535,9 @@ mod tests {
                 Variable::new("v(out)", "voltage"),
             ],
         )
-        .with_points(
+        .with_rows(
             rows.iter()
-                .map(|&(t, v)| vec![Complex::real(t), Complex::real(v)])
-                .collect(),
+                .map(|&(t, v)| [Complex::real(t), Complex::real(v)]),
         )
         .unwrap()
     }
@@ -644,7 +546,7 @@ mod tests {
         let mut variables = plot.variables().to_vec();
         change(&mut flags, &mut variables);
         Plot::new(plot.name.clone(), plot.plotname.clone(), flags, variables)
-            .with_points(plot.points().to_vec())
+            .with_rows(plot.rows())
             .unwrap()
     }
     /// Samples of `f` at the given times.
@@ -685,6 +587,314 @@ mod tests {
             }
         }
         plot(&rows)
+    }
+
+    // Pre-refactor oracle. Keep the original row scan, arithmetic and
+    // per-call bracket lookup independent of the indexed implementation.
+    fn legacy_value(series: &Series<'_>, column: usize, t: f64, side: Side) -> Result<f64, String> {
+        let at = |index| series.plot.row(index).unwrap()[column].re;
+        if let Some(b) = series.breakpoint_near(t) {
+            let near: Vec<usize> = (0..series.times.len())
+                .filter(|&i| (series.times[i] - b).abs() <= series.eps)
+                .collect();
+            let (Some(&first), Some(&last)) = (near.first(), near.last()) else {
+                return Err(format!(
+                    "{}: no sample at breakpoint {b:e}; cannot form a one-sided limit",
+                    series.label
+                ));
+            };
+            return match side {
+                Side::Left => Ok(at(first)),
+                Side::Right => Ok(at(last)),
+                Side::Interior => Err(format!(
+                    "{}: interior evaluation requested at breakpoint {b:e}",
+                    series.label
+                )),
+            };
+        }
+        let upper = series.times.partition_point(|&x| x < t - series.eps);
+        if upper == series.times.len() {
+            return Err(format!(
+                "{}: time {t:e} is beyond the samples",
+                series.label
+            ));
+        }
+        if (series.times[upper] - t).abs() <= series.eps {
+            return Ok(at(upper));
+        }
+        if upper == 0 {
+            return Err(format!("{}: time {t:e} precedes the samples", series.label));
+        }
+        let (t0, t1) = (series.times[upper - 1], series.times[upper]);
+        let next = series
+            .breakpoints
+            .partition_point(|&b| b <= t0 + series.eps);
+        if let Some(b) = series
+            .breakpoints
+            .get(next)
+            .filter(|&&b| b < t1 - series.eps)
+        {
+            return Err(format!(
+                "{}: samples [{t0:e}, {t1:e}] straddle breakpoint {b:e}; refusing to interpolate across it",
+                series.label
+            ));
+        }
+        let fraction = (t - t0) / (t1 - t0);
+        let left = (1.0 - fraction) * at(upper - 1);
+        let right = fraction * at(upper);
+        Ok(left + right)
+    }
+
+    fn legacy_instants(
+        grid: &Grid,
+        breakpoints: &[f64],
+        eps: f64,
+    ) -> Result<Vec<(f64, Side)>, String> {
+        if !(grid.stop.is_finite() && grid.stop > 0.0 && grid.step.is_finite() && grid.step > 0.0) {
+            return Err("grid stop and step must be finite and positive".into());
+        }
+        if !(grid.start.is_finite() && grid.start >= 0.0 && grid.start < grid.stop - eps) {
+            return Err("grid start must be finite and lie in [0, stop)".into());
+        }
+        let count = (grid.stop / grid.step + 1e-9).floor();
+        if count >= f64::from(MAX_POINTS) {
+            return Err(format!("grid needs more than {MAX_POINTS} points"));
+        }
+        let count = exact_nonnegative_integer::<u32>(count)
+            .ok_or_else(|| "invalid grid point count".to_owned())?;
+        let mut previous = grid.start;
+        for &b in breakpoints {
+            if !(b.is_finite() && b > eps && b < grid.stop - eps && b > previous + eps) {
+                return Err(format!(
+                    "breakpoint {b:e} must be finite, strictly inside (start, stop) and strictly increasing"
+                ));
+            }
+            previous = b;
+        }
+        let mut instants: Vec<(f64, Side)> = Vec::new();
+        // The first instant is `start` itself (0 for an ordinary run); grid times
+        // before it do not exist in either plot.
+        instants.push((grid.start, Side::Interior));
+        for index in 0..=count {
+            let t = f64::from(index) * grid.step;
+            if t > grid.start + eps
+                && t < grid.stop - eps
+                && nearby_breakpoint(breakpoints, t, eps).is_none()
+            {
+                check_event_capacity(instants.len(), 1)?;
+                instants.push((t, Side::Interior));
+            }
+        }
+        check_event_capacity(instants.len(), 1)?;
+        instants.push((grid.stop, Side::Interior));
+        let limit_count = breakpoints
+            .len()
+            .checked_mul(2)
+            .ok_or("too many breakpoint limits")?;
+        check_event_capacity(instants.len(), limit_count)?;
+        for &b in breakpoints {
+            instants.push((b, Side::Left));
+            instants.push((b, Side::Right));
+        }
+        // Stable sort keeps Left before Right at equal times.
+        instants.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Ok(instants)
+    }
+
+    #[test]
+    fn indexed_event_rows_match_full_scans_at_rounding_boundaries() {
+        let eps = 0.125;
+        let events: [f64; 5] = [0.5, 1.0, 1.1875, 2.0, 4.0];
+        let mut times = vec![-0.0, 0.0, 3.0];
+        for event in events {
+            for boundary in [event - eps, event, event + eps] {
+                for time in [boundary.next_down(), boundary, boundary.next_up()] {
+                    times.push(time);
+                }
+            }
+        }
+        // This deliberately permutes storage order, to exercise the
+        // first/last index invariant independently of time validation.
+        times.reverse();
+        let indexed = index_event_rows(&times, &events, eps);
+        for (&event, actual) in events.iter().zip(indexed) {
+            let matching: Vec<_> = times
+                .iter()
+                .enumerate()
+                .filter(|(_, time)| (**time - event).abs() <= eps)
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(
+                actual,
+                matching.first().zip(matching.last()).map(|(&a, &b)| (a, b))
+            );
+        }
+    }
+
+    #[test]
+    fn planned_samples_preserve_legacy_results_including_reversed_limits() {
+        let eps = TIME_EPS_REL * STOP;
+        let b = 5.0;
+        let cases = [
+            (
+                vec![b],
+                vec![
+                    (-0.0, -0.0),
+                    (3.0, 1.0),
+                    (b, 2.0),
+                    (b, 3.0),
+                    (7.0, 4.0),
+                    (STOP, 5.0),
+                ],
+            ),
+            (
+                vec![b],
+                vec![
+                    (-0.0, -0.0),
+                    (3.0, 1.0),
+                    (b + eps * 0.25, 2.0),
+                    (b - eps * 0.25, 3.0),
+                    (7.0, 4.0),
+                    (STOP, 5.0),
+                ],
+            ),
+            (
+                vec![b, b + eps * 1.5],
+                vec![
+                    (-0.0, -0.0),
+                    (3.0, 1.0),
+                    (b + eps * 0.75, 2.0),
+                    (7.0, 4.0),
+                    (STOP, 5.0),
+                ],
+            ),
+            (
+                vec![b],
+                vec![(-0.0, -0.0), (3.0, 1.0), (7.0, 4.0), (STOP, 5.0)],
+            ),
+        ];
+        for (events, rows) in cases {
+            let p = plot(&rows);
+            let series = Series::new("test", &p, &events, &grid(), eps).unwrap();
+            let mut queries = vec![-0.0, 0.0, 1.5, 4.0, 6.0, 8.0, STOP];
+            for event in &events {
+                for boundary in [event - eps, *event, event + eps] {
+                    queries.extend([boundary.next_down(), boundary, boundary.next_up()]);
+                }
+            }
+            for t in queries {
+                for side in [Side::Interior, Side::Left, Side::Right] {
+                    for column in 0..2 {
+                        let expected = legacy_value(&series, column, t, side).map(f64::to_bits);
+                        let actual = series
+                            .sample(t, side)
+                            .map(|plan| plan.value(column).to_bits());
+                        assert_eq!(actual, expected, "{events:?}, {t:e}, {side:?}, {column}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn merged_instants_match_legacy_sort_and_coincidence_rules() {
+        for start in [-0.0, 0.0, 0.4] {
+            for step in [0.125, 0.3, 0.5, 1.0, 20.0] {
+                let grid = Grid {
+                    start,
+                    stop: STOP,
+                    step,
+                };
+                let eps = TIME_EPS_REL * grid.stop;
+                let mut events = vec![1.0_f64, 3.5, 8.0];
+                for delta in [-eps, eps] {
+                    for edge in [
+                        (5.0 + delta).next_down(),
+                        5.0 + delta,
+                        (5.0 + delta).next_up(),
+                    ] {
+                        events[1] = edge;
+                        let expected = legacy_instants(&grid, &events, eps).unwrap();
+                        let actual = comparison_instants(&grid, &events, eps).unwrap();
+                        let bits = |v: Vec<(f64, Side)>| {
+                            v.into_iter()
+                                .map(|(t, side)| (t.to_bits(), side))
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(bits(actual), bits(expected));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run explicitly"]
+    fn indexed_dense_transient_comparison_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        let grid = Grid {
+            start: 0.0,
+            stop: STOP,
+            step: STOP / 20_000.0,
+        };
+        let eps = TIME_EPS_REL * grid.stop;
+        let events: Vec<_> = (1..500).map(|i| f64::from(i * 40) * grid.step).collect();
+        let mut variables = vec![Variable::new("time", "time")];
+        variables.extend((0..32).map(|i| Variable::new(format!("v({i})"), "voltage")));
+        let rows = (0..=20_000).map(|i| {
+            let t = f64::from(i) * grid.step;
+            std::array::from_fn::<_, 33, _>(|j| {
+                Complex::real(if j == 0 {
+                    t
+                } else {
+                    t * f64::from(u32::try_from(j).unwrap())
+                })
+            })
+        });
+        let p = Plot::new("tran1", "Transient Analysis", PlotFlags::Real, variables)
+            .with_rows(rows)
+            .unwrap();
+        let baseline = Series::new("test", &p, &events, &grid, eps).unwrap();
+        let start = Instant::now();
+        let queries = legacy_instants(&grid, &events, eps).unwrap();
+        let mut old_sum = 0.0;
+        for &(t, side) in &queries {
+            for col in 1..33 {
+                old_sum += black_box(legacy_value(black_box(&baseline), col, t, side).unwrap());
+            }
+        }
+        let old_time = start.elapsed();
+        let start = Instant::now();
+        let queries = comparison_instants(&grid, &events, eps).unwrap();
+        let indexed = Series::new("test", &p, &events, &grid, eps).unwrap();
+        let mut new_sum = 0.0;
+        for &(t, side) in &queries {
+            let sample = indexed.sample(t, side).unwrap();
+            for col in 1..33 {
+                new_sum += black_box(sample.value(col));
+            }
+        }
+        let new_time = start.elapsed();
+        assert_eq!(old_sum.to_bits(), new_sum.to_bits());
+        eprintln!(
+            "20,001 rows, 499 events, 32 signals; old {old_time:?}, indexed including validation {new_time:?}, {:.2}x",
+            old_time.as_secs_f64() / new_time.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn breakpoint_search_preserves_first_match_and_rounding() {
+        let events: [f64; 5] = [0.5, 1.0, 1.125, 2.0, 4.0];
+        for eps in [0.0, 0.125, 1e-9] {
+            for event in events {
+                for boundary in [event - eps, event, event + eps] {
+                    for time in [boundary.next_down(), boundary, boundary.next_up()] {
+                        let expected = events.iter().copied().find(|b| (b - time).abs() <= eps);
+                        assert_eq!(nearby_breakpoint(&events, time, eps), expected);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -767,10 +977,10 @@ mod tests {
         let p = plot(&[(0.0, 0.0), (3.0, 0.0), (6.0, 9.0), (10.0, 9.0)]);
         let bps = [5.0];
         let series = Series::new("Rust", &p, &bps, &grid(), 1e-8).unwrap();
-        let error = series.value(1, 4.0, Side::Interior).unwrap_err();
+        let error = series.sample(4.0, Side::Interior).unwrap_err();
         assert!(error.contains("refusing to interpolate"), "{error}");
-        assert_eq!(series.value(1, 1.5, Side::Interior).unwrap(), 0.0);
-        assert_eq!(series.value(1, 8.0, Side::Interior).unwrap(), 9.0);
+        assert_eq!(series.sample(1.5, Side::Interior).unwrap().value(1), 0.0);
+        assert_eq!(series.sample(8.0, Side::Interior).unwrap().value(1), 9.0);
     }
 
     #[test]
@@ -782,20 +992,12 @@ mod tests {
         // Interpolating across the jump would pass 4.5..5.5 values wrongly; the
         // plots above only agree because each side is handled on its own.
         let mut bad_right = jump_plot(0.5);
-        let last_at_five = bad_right
-            .points()
-            .iter()
-            .rposition(|row| row[0].re == 5.0)
-            .unwrap();
+        let last_at_five = bad_right.rows().rposition(|row| row[0].re == 5.0).unwrap();
         bad_right.point_mut(last_at_five).unwrap()[1] = Complex::real(8.5);
         let error = run(&bad_right, &want, &[5.0]).unwrap_err();
         assert!(error.contains("(Right)"), "{error}");
         let mut bad_left = jump_plot(0.5);
-        let first_at_five = bad_left
-            .points()
-            .iter()
-            .position(|row| row[0].re == 5.0)
-            .unwrap();
+        let first_at_five = bad_left.rows().position(|row| row[0].re == 5.0).unwrap();
         bad_left.point_mut(first_at_five).unwrap()[1] = Complex::real(0.5);
         let error = run(&bad_left, &want, &[5.0]).unwrap_err();
         assert!(error.contains("(Left)"), "{error}");
@@ -807,12 +1009,8 @@ mod tests {
         // sample at 5 is both limits, so the C jump (0 vs 8) must be caught.
         let want = jump_plot(0.5);
         let mut smeared = jump_plot(0.5);
-        let first = smeared
-            .points()
-            .iter()
-            .position(|r| r[0].re == 5.0)
-            .unwrap();
-        smeared.remove_point(first).unwrap();
+        let first = smeared.rows().position(|r| r[0].re == 5.0).unwrap();
+        assert!(smeared.remove_point(first));
         let error = run(&smeared, &want, &[5.0]).unwrap_err();
         assert!(error.contains("(Left)"), "{error}");
         // And with no declared event the repeated instant is invalid input.
@@ -949,6 +1147,18 @@ mod tests {
         }
     }
 
+    use ngspice_rs::netlist::ast::Netlist;
+
+    fn deck_breakpoints(netlist: &Netlist, step: f64, stop: f64) -> Result<Vec<f64>, String> {
+        let config =
+            ngspice_rs::analysis::RunConfig::from_netlist(netlist).map_err(|e| e.to_string())?;
+        let circuit = config.circuit(netlist).map_err(|e| e.to_string())?;
+        super::breakpoints(
+            &circuit,
+            &TransientTiming::new(step, stop).map_err(|e| e.to_string())?,
+        )
+    }
+
     fn deck(body: &str) -> Netlist {
         Parser::new()
             .parse_deck(&parse_deck_text(
@@ -960,47 +1170,52 @@ mod tests {
 
     #[test]
     fn pwl_corners_become_breakpoints() {
-        let netlist = deck("v1 in 0 pwl(0 0 1m 0 1.01m 1 1.01m 2 6m 2 9m 0)");
-        let found = breakpoints(&netlist, 1e-5, 8e-3).unwrap();
+        let netlist = deck("v1 in 0 pwl(0 0 1m 0 1.01m 1 6m 2 9m 0)");
+        let found = deck_breakpoints(&netlist, 1e-5, 8e-3).unwrap();
         assert_eq!(found, vec![1e-3, 1.01e-3, 6e-3]);
-        assert!(breakpoints(&netlist, 0.0, 8e-3).is_err());
+        assert!(deck_breakpoints(&netlist, 0.0, 8e-3).is_err());
     }
 
     #[test]
-    fn only_subcircuits_holding_waveform_sources_are_refused() {
+    fn nested_and_parameterized_waveforms_use_expanded_sources() {
         // A source-free macromodel (the M6 gate's op-amp) adds no breakpoints.
         let netlist = deck(
             "v1 in 0 pulse(0 1 1m 1u 1u 1m)\n.subckt amp a b\ne1 b 0 a 0 2\n.ends\nx1 in out amp",
         );
         assert_eq!(
-            breakpoints(&netlist, 1e-5, 4e-3).unwrap(),
+            deck_breakpoints(&netlist, 1e-5, 4e-3).unwrap(),
             vec![1e-3, 1.001e-3, 2.001e-3, 2.002e-3]
         );
-        // A waveform source in a nested definition is not enumerated.
+        // Nested instances resolve their own formal parameters and names.
         let netlist = deck(
-            ".subckt outer a\n.subckt inner b\nv1 b 0 pulse(0 1)\n.ends\nx1 a inner\n.ends\nx1 n outer",
+            ".subckt inner b params: td=1m\nv1 b 0 pwl(0 0 1u 1 1.001m 1 1.003m 0) td={td}\n.ends\n.subckt outer a params: d=1m\nx1 a inner td={d}\n.ends\nx1 n outer d=0.5m\nx2 m outer d=1m",
         );
-        assert!(
-            breakpoints(&netlist, 1e-5, 4e-3)
-                .unwrap_err()
-                .contains("not enumerated")
-        );
+        let found = deck_breakpoints(&netlist, 1e-5, 4e-3).unwrap();
+        assert_eq!(found.len(), 8);
+        for (actual, expected) in found.iter().zip([
+            0.5e-3, 0.501e-3, 1e-3, 1.001e-3, 1.501e-3, 1.503e-3, 2.001e-3, 2.003e-3,
+        ]) {
+            assert!((actual - expected).abs() < 1e-15);
+        }
     }
 
     #[test]
     fn pulse_edges_follow_c_defaults_and_period() {
         // td=1, tr=1, tf=2, pw=3, per=10 over 0..25.
         let netlist = deck("v1 in 0 pulse(0 5 1 1 2 3 10)");
-        let found = breakpoints(&netlist, 0.1, 25.0).unwrap();
+        let found = deck_breakpoints(&netlist, 0.1, 25.0).unwrap();
         assert_eq!(
             found,
             vec![1.0, 2.0, 5.0, 7.0, 11.0, 12.0, 15.0, 17.0, 21.0, 22.0]
         );
         // Omitted tr/tf -> tstep; omitted pw with five values -> 0; per -> tstop.
         let netlist = deck("i1 in 0 pulse(0 1 0 0 0)");
-        assert_eq!(breakpoints(&netlist, 0.5, 4.0).unwrap(), vec![0.5, 1.0]);
+        assert_eq!(
+            deck_breakpoints(&netlist, 0.5, 4.0).unwrap(),
+            vec![0.5, 1.0]
+        );
         let netlist = deck("i1 in 0 pulse(0 1)");
-        assert_eq!(breakpoints(&netlist, 0.5, 4.0).unwrap(), vec![0.5]);
+        assert_eq!(deck_breakpoints(&netlist, 0.5, 4.0).unwrap(), vec![0.5]);
     }
 
     #[test]
@@ -1008,21 +1223,21 @@ mod tests {
         // PULSE count: corners at or before td + np*per only.
         let netlist = deck("v1 in 0 pulse(0 5 1 1 2 3 10 2)");
         assert_eq!(
-            breakpoints(&netlist, 0.1, 40.0).unwrap(),
+            deck_breakpoints(&netlist, 0.1, 40.0).unwrap(),
             vec![1.0, 2.0, 5.0, 7.0, 11.0, 12.0, 15.0, 17.0, 21.0]
         );
         // PWL td=/r=: delayed knots, then the knots after r recur.
         let netlist = deck("v1 in 0 pwl(0 0 1 1 2 0) r=1 td=0.5");
         assert_eq!(
-            breakpoints(&netlist, 0.1, 5.0).unwrap(),
+            deck_breakpoints(&netlist, 0.1, 5.0).unwrap(),
             vec![0.5, 1.5, 2.5, 3.5, 4.5]
         );
         let netlist = deck("v1 in 0 pwl(0 0 1 1 2 0) r=-1 td=0.5");
         assert_eq!(
-            breakpoints(&netlist, 0.1, 5.0).unwrap(),
+            deck_breakpoints(&netlist, 0.1, 5.0).unwrap(),
             vec![0.5, 1.5, 2.5]
         );
-        assert!(breakpoints(&deck("v1 in 0 pwl(0 0 1 1) r=0.5"), 0.1, 5.0).is_err());
+        assert!(deck_breakpoints(&deck("v1 in 0 pwl(0 0 1 1) r=0.5"), 0.1, 5.0).is_err());
         // C sets no breakpoints for SIN/EXP/SFFM/AM; only the last setter counts.
         for card in [
             "v1 in 0 sin(0 1 1 0.5)",
@@ -1032,24 +1247,31 @@ mod tests {
             "v1 in 0 pwl(0 0 1 1) sin(0 1)",
         ] {
             assert!(
-                breakpoints(&deck(card), 0.1, 5.0).unwrap().is_empty(),
+                deck_breakpoints(&deck(card), 0.1, 5.0).unwrap().is_empty(),
                 "{card}"
             );
         }
     }
 
     #[test]
+    fn fractional_count_cut_is_required_but_trailing_request_is_not() {
+        let netlist = deck("v1 in 0 pulse(0 5 2 1 2 3 10 1.25)");
+        let found = deck_breakpoints(&netlist, 0.1, 30.0).unwrap();
+        assert_eq!(found, vec![2.0, 3.0, 6.0, 8.0, 12.0, 13.0, 14.5]);
+    }
+
+    #[test]
     fn non_source_devices_and_out_of_range_corners_are_ignored() {
         let netlist = deck("v1 in 0 dc 1");
-        assert!(breakpoints(&netlist, 1.0, 5.0).unwrap().is_empty());
+        assert!(deck_breakpoints(&netlist, 1.0, 5.0).unwrap().is_empty());
         let netlist = deck("v1 in 0 pwl(0 0 9 1)");
-        assert!(breakpoints(&netlist, 1.0, 5.0).unwrap().is_empty());
+        assert!(deck_breakpoints(&netlist, 1.0, 5.0).unwrap().is_empty());
     }
 
     #[test]
     fn breakpoints_feed_the_comparator_end_to_end() {
-        let netlist = deck("v1 in 0 pwl(0 0 5 0 5 3 10 13)");
-        let bps = breakpoints(&netlist, 0.1, STOP).unwrap();
+        let netlist = deck("v1 in 0 pwl(0 0 5 3 10 13)");
+        let bps = deck_breakpoints(&netlist, 0.1, STOP).unwrap();
         assert_eq!(bps, vec![5.0]);
         run(&jump_plot(0.5), &jump_plot(0.2), &bps).unwrap();
     }

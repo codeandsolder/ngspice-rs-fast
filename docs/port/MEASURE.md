@@ -430,10 +430,17 @@ Scalar `PARAM`/`EXPR` expressions accept quoted or braced numparam syntax,
 optional `=`, and a single bare scalar/name. Evaluation follows C
 `measure.c::do_measure`: all vector measurements first, then scalar cards in
 source order. Scalars can read top-level `.param`/`.func` values, any vector
-measurement result, and earlier scalar results. Results are returned in source
-order; undefined/forward scalar references, domain errors and nonfinite results
+measurement result, and earlier scalar results. One local hash-indexed
+sequential namespace borrows the immutable deck parameter/function environment;
+the latest successful result shadows the previous value case-insensitively.
+Earlier references and missing names do not traverse a scope per measurement,
+and duplicate result names still each occupy their source-order report slot.
+The 100,000-record default limit matches `EvalLimits::definitions` (including
+duplicate names), and scalar/deferred expressions share the existing expression
+node budget. Independent analyses do not share published values. Results are
+returned in source order; undefined/forward scalar references, domain errors and nonfinite results
 fail the run before publication. Library callers use `measure::resolve_with_scope`
-and `batch::resolve_outputs_with_scope` when deck parameters are needed.
+using the scheduled `batch::plan_outputs` and scoped `batch::resolve_outputs` for retained plots.
 The local C input preprocessor mishandles `EXPR` with a user function and a
 measurement-result argument; the live C regression uses its `PARAM` spelling.
 Numeric setters AT/VAL/TD/FROM/TO and crossing counts accept braced or
