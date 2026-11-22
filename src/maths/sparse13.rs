@@ -54,11 +54,43 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
+use super::linear::numerical;
 use crate::primitives::{Complex, SpiceResult};
 
 const NONE: usize = usize::MAX;
 const DEFAULT_THRESHOLD: f64 = 1.0e-3;
 const TIES_MULTIPLIER: i64 = 5;
+
+/// Stable original element handle obtained only from a validated frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SolverElement(usize);
+
+fn sparse_reserve<T>(entries: &mut Vec<T>, additional: usize) -> SpiceResult<()> {
+    entries.try_reserve(additional).map_err(|error| {
+        numerical(
+            "SPARSE storage",
+            format!("cannot reserve {additional} entries: {error}"),
+        )
+    })
+}
+
+fn sparse_rows(size: usize) -> SpiceResult<usize> {
+    // The external indexing uses a zero sentinel and the pivot workspace
+    // also needs a trailing sentinel.
+    let count = size
+        .checked_add(2)
+        .ok_or_else(|| numerical("SPARSE storage", "row sentinel count overflows"))?;
+    std::alloc::Layout::array::<usize>(count)
+        .map_err(|error| numerical("SPARSE storage", format!("row index capacity: {error}")))?;
+    Ok(count - 1)
+}
+
+fn sparse_indices(size: usize) -> SpiceResult<Vec<usize>> {
+    let mut indices = Vec::new();
+    sparse_reserve(&mut indices, sparse_rows(size)?)?;
+    indices.extend(0..=size);
+    Ok(indices)
+}
 
 /// Matrix entry type: `f64` for real systems, [`Complex`] for AC.
 pub(super) trait Scalar: Copy + PartialEq + std::fmt::Debug {
@@ -174,6 +206,8 @@ pub(super) enum Status {
     NonFinite,
     /// A traversal plan cannot be derived from the ordered topology.
     InvalidPlan,
+    /// A required factor allocation exceeds storage capacity.
+    Resource,
 }
 
 #[derive(Debug, Clone)]
@@ -482,7 +516,7 @@ impl Topology {
 
     /// Finalize only unordered columns. Stable handles remain in original
     /// creation order; the linked traversal is sorted by internal row.
-    fn finish_original_columns(&mut self, tails: &[usize]) {
+    fn finish_original_columns(&mut self, tails: &[usize]) -> SpiceResult<()> {
         let mut run = Vec::new();
         for (col, &tail) in tails.iter().enumerate().skip(1) {
             if tail != NONE || self.first_in_col[col] == NONE {
@@ -491,20 +525,26 @@ impl Topology {
             run.clear();
             let mut e = self.first_in_col[col];
             while e != NONE {
+                if run.len() == run.capacity() {
+                    sparse_reserve(&mut run, 1)?;
+                }
                 run.push(e);
                 e = self.elements[e].next_in_col;
             }
             run.sort_unstable_by_key(|&handle| self.elements[handle].row);
             self.first_in_col[col] = run[0];
             for pair in run.windows(2) {
-                assert_ne!(
-                    self.elements[pair[0]].row, self.elements[pair[1]].row,
-                    "duplicate original sparse element"
-                );
+                if self.elements[pair[0]].row == self.elements[pair[1]].row {
+                    return Err(numerical(
+                        "SPARSE construction",
+                        "duplicate original sparse element",
+                    ));
+                }
                 self.elements[pair[0]].next_in_col = pair[1];
             }
             self.elements[run[run.len() - 1]].next_in_col = NONE;
         }
+        Ok(())
     }
 
     fn col_get(&self, slot: Slot) -> usize {
@@ -933,21 +973,26 @@ pub(super) struct Sparse<T> {
 
 impl<T: Scalar> Sparse<T> {
     /// `spCreate(size)`.
-    pub(crate) fn new(size: usize) -> Self {
-        let mut ext_to_int = vec![NONE; size + 1];
-        ext_to_int[0] = 0;
-        Self {
+    pub(crate) fn new(size: usize) -> SpiceResult<Self> {
+        let rows = sparse_rows(size)?;
+        let empty = || crate::primitives::filled_vec(rows, NONE, "SPARSE row index");
+        let external = || {
+            let mut indices = empty()?;
+            indices[0] = 0;
+            Ok::<_, crate::primitives::SpiceError>(indices)
+        };
+        Ok(Self {
             size: 0,
             ext_size: size,
             topology: std::sync::Arc::new(Topology {
                 elements: Vec::new(),
-                diag: vec![NONE; size + 1],
-                first_in_col: vec![NONE; size + 1],
-                first_in_row: vec![NONE; size + 1],
-                ext_to_int_row: ext_to_int.clone(),
-                ext_to_int_col: ext_to_int,
-                int_to_ext_row: (0..=size).collect(),
-                int_to_ext_col: (0..=size).collect(),
+                diag: empty()?,
+                first_in_col: empty()?,
+                first_in_row: empty()?,
+                ext_to_int_row: external()?,
+                ext_to_int_col: external()?,
+                int_to_ext_row: sparse_indices(size)?,
+                int_to_ext_col: sparse_indices(size)?,
             }),
             values: Vec::new(),
             plan: None,
@@ -965,7 +1010,7 @@ impl<T: Scalar> Sparse<T> {
             singular_row: 0,
             singular_col: 0,
             small_pivot: None,
-        }
+        })
     }
 
     /// Whether every external index has been translated (no empty unknown).
@@ -998,22 +1043,39 @@ impl<T: Scalar> Sparse<T> {
 
     /// `spGetElement(ext_row, ext_col)`: the element handle, created if
     /// missing. Indices are external and 1-based.
-    pub(crate) fn get_element(&mut self, row: usize, col: usize) -> usize {
-        debug_assert!(row >= 1 && col >= 1 && row <= self.ext_size && col <= self.ext_size);
+    pub(super) fn get_element(&mut self, row: usize, col: usize) -> SpiceResult<SolverElement> {
+        self.check_coordinate(row, col)?;
         let (row, col) = self.translate(row, col);
         if row == col && self.topology.diag[row] != NONE {
-            return self.topology.diag[row];
+            return Ok(SolverElement(self.topology.diag[row]));
         }
-        self.find_element_in_col(Slot::Head(col), row, col, true)
+        let (last, found) = self.topology.locate_in_col(Slot::Head(col), row);
+        if found != NONE {
+            return Ok(SolverElement(found));
+        }
+        self.create_element(row, col, last, false)
+            .map(SolverElement)
     }
 
-    /// Adds to an element obtained from [`Self::get_element`]
-    /// (`*element += value`).
-    pub(crate) fn add(&mut self, element: usize, value: T)
+    fn check_coordinate(&self, row: usize, col: usize) -> SpiceResult<()> {
+        if row == 0 || col == 0 || row > self.ext_size || col > self.ext_size {
+            return Err(numerical(
+                "SPARSE construction",
+                format!(
+                    "external coordinate ({row}, {col}) outside 1..={}",
+                    self.ext_size
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Adds using the stable handle; no coordinate conversion in the load.
+    pub(super) fn add(&mut self, element: SolverElement, value: T)
     where
         T: std::ops::Add<Output = T>,
     {
-        let v = &mut self.values[element];
+        let v = &mut self.values[element.0];
         *v = *v + value;
     }
 
@@ -1028,30 +1090,33 @@ impl<T: Scalar> Sparse<T> {
     }
 
     /// `spcFindElementInCol`.
-    fn find_element_in_col(&mut self, last: Slot, row: usize, col: usize, create: bool) -> usize {
-        let (last, found) = self.topology.locate_in_col(last, row);
-        if found != NONE || !create {
-            found
-        } else {
-            self.create_element(row, col, last, false)
-        }
+    fn find_element_in_col(&self, last: Slot, row: usize) -> usize {
+        self.topology.locate_in_col(last, row).1
     }
 
-    /// `spcCreateElement`.
-    fn create_element(&mut self, row: usize, col: usize, last: Slot, fillin: bool) -> usize {
-        let e = std::sync::Arc::make_mut(&mut self.topology).create_element(
-            row,
-            col,
-            last,
-            self.rows_linked,
-        );
+    /// \`spcCreateElement\`. Reserve both arenas before mutating links.
+    fn create_element(
+        &mut self,
+        row: usize,
+        col: usize,
+        last: Slot,
+        fillin: bool,
+    ) -> SpiceResult<usize> {
+        let topology = std::sync::Arc::make_mut(&mut self.topology);
+        if topology.elements.len() == topology.elements.capacity() {
+            sparse_reserve(&mut topology.elements, 1)?;
+        }
+        if self.values.len() == self.values.capacity() {
+            sparse_reserve(&mut self.values, 1)?;
+        }
+        let e = topology.create_element(row, col, last, self.rows_linked);
         self.plan = None;
         self.factored = false;
         if self.rows_linked && !fillin {
             self.needs_ordering = true;
         }
         self.values.push(T::ZERO);
-        e
+        Ok(e)
     }
 
     /// `spcLinkRows`.
@@ -1090,28 +1155,45 @@ impl<T: Scalar> Sparse<T> {
     pub(super) fn from_originals(
         size: usize,
         entries: impl IntoIterator<Item = (usize, usize, T)>,
-    ) -> Self {
-        let mut sparse = Self::new(size);
+    ) -> SpiceResult<Self> {
+        let mut sparse = Self::new(size)?;
         let entries = entries.into_iter();
         let capacity = entries.size_hint().0;
         let topology = std::sync::Arc::make_mut(&mut sparse.topology);
-        topology.elements.reserve(capacity);
-        sparse.values.reserve(capacity);
-        let mut tails = vec![NONE; size + 1];
+        sparse_reserve(&mut topology.elements, capacity)?;
+        sparse_reserve(&mut sparse.values, capacity)?;
+        let mut tails =
+            crate::primitives::filled_vec(sparse_rows(size)?, NONE, "SPARSE column tails")?;
         for (row, col, value) in entries {
-            debug_assert!(row >= 1 && col >= 1 && row <= size && col <= size);
+            if row == 0 || col == 0 || row > size || col > size {
+                return Err(numerical(
+                    "SPARSE construction",
+                    format!("external coordinate ({row}, {col}) outside 1..={size}"),
+                ));
+            }
+            if topology.elements.len() == topology.elements.capacity() {
+                sparse_reserve(&mut topology.elements, 1)?;
+            }
+            if sparse.values.len() == sparse.values.capacity() {
+                sparse_reserve(&mut sparse.values, 1)?;
+            }
             let (r, c) = topology.translate(&mut sparse.size, row, col);
             let handle = topology.append_original(r, c, &mut tails);
             debug_assert_eq!(handle, sparse.values.len());
             sparse.values.push(value);
         }
-        topology.finish_original_columns(&tails[..=sparse.size]);
-        sparse
+        topology.finish_original_columns(&tails[..=sparse.size])?;
+        Ok(sparse)
     }
 
     /// A pattern already contains its unique positions in creation order.
-    pub(super) fn from_pattern(pattern: &crate::maths::Pattern, values: &[T]) -> Self {
-        debug_assert_eq!(pattern.len(), values.len());
+    pub(super) fn from_pattern(pattern: &crate::maths::Pattern, values: &[T]) -> SpiceResult<Self> {
+        if pattern.len() != values.len() {
+            return Err(numerical(
+                "SPARSE construction",
+                "pattern and coefficient count differ",
+            ));
+        }
         Self::from_originals(
             pattern.order(),
             pattern
@@ -1290,13 +1372,13 @@ impl<T: Scalar> Sparse<T> {
     }
 
     /// Overwrites one element's value (`*element = value`).
-    pub(crate) fn set(&mut self, element: usize, value: T) {
-        self.values[element] = value;
+    pub(super) fn set(&mut self, element: SolverElement, value: T) {
+        self.values[element.0] = value;
     }
 
     /// One element's value.
-    pub(crate) fn value(&self, element: usize) -> T {
-        self.values[element]
+    pub(super) fn value(&self, element: SolverElement) -> T {
+        self.values[element.0]
     }
 
     /// `SMPcAddCol` (`spsmp.c`): adds every element of external column
@@ -1304,7 +1386,7 @@ impl<T: Scalar> Sparse<T> {
     /// creating the missing elements there as originals (which, once rows
     /// are linked, forces the next factorization to reorder). Untranslated
     /// columns are left alone.
-    pub(crate) fn add_col(&mut self, accum: usize, addend: usize)
+    pub(crate) fn add_col(&mut self, accum: usize, addend: usize) -> SpiceResult<()>
     where
         T: std::ops::Add<Output = T>,
     {
@@ -1312,10 +1394,10 @@ impl<T: Scalar> Sparse<T> {
             self.topology.ext_to_int_col.get(accum),
             self.topology.ext_to_int_col.get(addend),
         ) else {
-            return;
+            return Ok(());
         };
         if accum == NONE || addend == NONE {
-            return;
+            return Ok(());
         }
         let mut next = self.topology.first_in_col[addend];
         let mut prev = Slot::Head(accum);
@@ -1327,12 +1409,13 @@ impl<T: Scalar> Sparse<T> {
                 acc = self.topology.elements[acc].next_in_col;
             }
             if acc == NONE || self.topology.elements[acc].row > row {
-                acc = self.create_element(row, accum, prev, false);
+                acc = self.create_element(row, accum, prev, false)?;
             }
             let value = self.values[next];
-            self.add(acc, value);
+            self.add(SolverElement(acc), value);
             next = self.topology.elements[next].next_in_col;
         }
+        Ok(())
     }
 
     /// `SMPcZeroCol` (`spsmp.c`): zeroes every element of external column
@@ -1527,7 +1610,10 @@ impl<T: Scalar> Sparse<T> {
                 let largest = self.find_largest_in_col(self.topology.elements[pivot].next_in_col);
                 if largest * self.rel_threshold < self.mag(pivot) {
                     self.row_col_elimination(pivot);
-                    if matches!(self.status, Status::Singular | Status::NonFinite) {
+                    if matches!(
+                        self.status,
+                        Status::Singular | Status::NonFinite | Status::Resource
+                    ) {
                         return self.status;
                     }
                 } else {
@@ -1553,7 +1639,10 @@ impl<T: Scalar> Sparse<T> {
             };
             self.exchange_rows_and_cols(pivot, step);
             self.row_col_elimination(pivot);
-            if matches!(self.status, Status::Singular | Status::NonFinite) {
+            if matches!(
+                self.status,
+                Status::Singular | Status::NonFinite | Status::Resource
+            ) {
                 return self.status;
             }
             self.update_markowitz_numbers(pivot);
@@ -1589,10 +1678,20 @@ impl<T: Scalar> Sparse<T> {
     }
 
     fn compile_runs<I: PlanIndex>(&self) -> Option<FactorRuns<I>> {
-        let mut columns = Vec::with_capacity(self.size);
-        let mut column_entries = Vec::with_capacity(self.topology.elements.len());
-        let mut upper_row_start = Vec::with_capacity(self.size + 1);
+        let mut columns = Vec::new();
+        columns.try_reserve_exact(self.size).ok()?;
+        let mut column_entries = Vec::new();
+        column_entries
+            .try_reserve_exact(self.topology.elements.len())
+            .ok()?;
+        let mut upper_row_start = Vec::new();
+        upper_row_start
+            .try_reserve_exact(self.size.checked_add(1)?)
+            .ok()?;
         let mut upper_row_entries = Vec::new();
+        upper_row_entries
+            .try_reserve_exact(self.topology.elements.len())
+            .ok()?;
         upper_row_start.push(I::pack(0)?);
         for i in 1..=self.size {
             let start = column_entries.len();
@@ -2070,14 +2169,14 @@ impl<T: Scalar> Sparse<T> {
                 self.markowitz_prod.set(col, self.product_of(col));
                 self.track_singleton(self.markowitz_prod[col], old_col);
                 std::sync::Arc::make_mut(&mut self.topology).diag[col] =
-                    self.find_element_in_col(Slot::Head(col), col, col, false);
+                    self.find_element_in_col(Slot::Head(col), col);
             }
             if row != step {
                 std::sync::Arc::make_mut(&mut self.topology).diag[row] =
-                    self.find_element_in_col(Slot::Head(row), row, row, false);
+                    self.find_element_in_col(Slot::Head(row), row);
             }
             std::sync::Arc::make_mut(&mut self.topology).diag[step] =
-                self.find_element_in_col(Slot::Head(step), step, step, false);
+                self.find_element_in_col(Slot::Head(step), step);
             self.markowitz_prod.set(step, self.product_of(step));
             self.track_singleton(self.markowitz_prod[step], old_step);
         }
@@ -2126,7 +2225,13 @@ impl<T: Scalar> Sparse<T> {
                     sub = self.topology.elements[sub].next_in_col;
                 }
                 if sub == NONE || self.topology.elements[sub].row > row {
-                    sub = self.create_fillin(row, upper_col, Slot::After(above));
+                    match self.create_fillin(row, upper_col, Slot::After(above)) {
+                        Ok(element) => sub = element,
+                        Err(_) => {
+                            self.resource_failure();
+                            return;
+                        }
+                    }
                 }
                 let l = self.values[lower];
                 let value = self.values[sub].mul_sub(u, l);
@@ -2169,13 +2274,13 @@ impl<T: Scalar> Sparse<T> {
 
     /// `CreateFillin`: the elimination merge has already located the
     /// exact predecessor in its sorted column. Do not rescan its prefix.
-    fn create_fillin(&mut self, row: usize, col: usize, above: Slot) -> usize {
+    fn create_fillin(&mut self, row: usize, col: usize, above: Slot) -> SpiceResult<usize> {
         debug_assert!(matches!(above, Slot::After(e) if self.topology.elements[e].row < row));
         debug_assert!({
             let next = self.topology.col_get(above);
             next == NONE || self.topology.elements[next].row > row
         });
-        let element = self.create_element(row, col, above, true);
+        let element = self.create_element(row, col, above, true)?;
         self.markowitz_row[row] += 1;
         self.markowitz_prod.set(row, self.product_of(row));
         if self.markowitz_row[row] == 1 && self.markowitz_col[row] != 0 {
@@ -2186,7 +2291,14 @@ impl<T: Scalar> Sparse<T> {
         if self.markowitz_row[col] != 0 && self.markowitz_col[col] == 1 {
             self.singletons -= 1;
         }
-        element
+        Ok(element)
+    }
+
+    fn resource_failure(&mut self) -> Status {
+        self.status = Status::Resource;
+        self.factored = false;
+        self.needs_ordering = true;
+        self.status
     }
 
     /// A partially eliminated frame cannot serve retained solves or continue
@@ -2392,9 +2504,9 @@ mod tests {
     use super::*;
 
     fn build(n: usize, entries: &[(usize, usize, f64)]) -> Sparse<f64> {
-        let mut m = Sparse::new(n);
+        let mut m = Sparse::new(n).unwrap();
         for &(r, c, v) in entries {
-            let e = m.get_element(r, c);
+            let e = m.get_element(r, c).unwrap();
             m.add(e, v);
         }
         m
@@ -2413,7 +2525,7 @@ mod tests {
 
     #[test]
     fn unfactored_solve_rejects_without_touching_workspace() {
-        let m = Sparse::<f64>::new(1);
+        let m = Sparse::<f64>::new(1).unwrap();
         let mut workspace = vec![42.0];
         assert!(m.solve_with_workspace(&[1.0], &mut workspace).is_err());
         assert_eq!(workspace, vec![42.0]);
@@ -2471,8 +2583,8 @@ mod tests {
 
     #[test]
     fn extreme_complex_reciprocals_and_invalid_factor_recovery() {
-        let mut c = Sparse::<Complex>::new(1);
-        let handle = c.get_element(1, 1);
+        let mut c = Sparse::<Complex>::new(1).unwrap();
+        let handle = c.get_element(1, 1).unwrap();
         c.set(handle, Complex::new(f64::MAX, f64::MAX));
         assert!(matches!(
             c.order_and_factor(1e-3, 0.),
@@ -2485,7 +2597,7 @@ mod tests {
         assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
         m.clear();
         for (r, c, v) in [(1, 1, 1.), (1, 2, f64::MAX), (2, 1, f64::MAX), (2, 2, 1.)] {
-            let h = m.get_element(r, c);
+            let h = m.get_element(r, c).unwrap();
             m.set(h, v);
         }
         assert_eq!(m.factor(), Status::NonFinite);
@@ -2493,7 +2605,7 @@ mod tests {
         assert!(m.determinant().is_err());
         m.clear();
         for (r, c, v) in [(1, 1, 2.), (1, 2, 1.), (2, 1, 1.), (2, 2, 2.)] {
-            let h = m.get_element(r, c);
+            let h = m.get_element(r, c).unwrap();
             m.set(h, v);
         }
         assert_eq!(m.factor(), Status::Okay);
@@ -2512,7 +2624,7 @@ mod tests {
         ] {
             m.clear();
             for (r, c, v) in entries {
-                let h = m.get_element(r, c);
+                let h = m.get_element(r, c).unwrap();
                 m.set(
                     h,
                     if (r, c) == (bad_row, bad_col) {
@@ -2526,13 +2638,13 @@ mod tests {
             assert!(!m.is_factored());
             m.clear();
             for (r, c, v) in entries {
-                let h = m.get_element(r, c);
+                let h = m.get_element(r, c).unwrap();
                 m.set(h, v);
             }
             assert_eq!(m.factor(), Status::Okay);
         }
         m.clear();
-        let h = m.get_element(2, 2);
+        let h = m.get_element(2, 2).unwrap();
         m.set(h, f64::NAN);
         assert_eq!(m.factor(), Status::NonFinite);
     }
@@ -2553,9 +2665,9 @@ mod tests {
             "inverse pivot overflow must be explicit"
         );
 
-        let mut m = Sparse::<Complex>::new(2);
+        let mut m = Sparse::<Complex>::new(2).unwrap();
         for i in 1..=2 {
-            let h = m.get_element(i, i);
+            let h = m.get_element(i, i).unwrap();
             m.set(h, Complex::new(1e307, 1e307));
         }
         assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
@@ -2572,7 +2684,7 @@ mod tests {
         let mut entries: Vec<_> = (1..=8).map(|i| (i, i, 20.)).collect();
         entries.extend([7, 3, 8, 2, 6, 4, 5].map(|r| (r, 1, r as f64)));
         entries.extend([8, 6, 5, 4, 3, 1, 7].map(|r| (r, 2, -1.)));
-        let a = Sparse::from_originals(8, entries.iter().copied());
+        let a = Sparse::from_originals(8, entries.iter().copied()).unwrap();
         let b = build(8, &entries);
         assert_eq!(a.topology.first_in_col, b.topology.first_in_col);
         assert_eq!(a.topology.diag, b.topology.diag);
@@ -2586,9 +2698,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "duplicate original sparse element")]
     fn bulk_column_builder_rejects_duplicate_originals() {
-        let _ = Sparse::from_originals(2, [(1, 2, 1.), (2, 2, 2.), (1, 2, 3.)]);
+        let error = Sparse::from_originals(2, [(1, 2, 1.), (2, 2, 2.), (1, 2, 3.)]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate original sparse element")
+        );
     }
 
     #[test]
@@ -2601,7 +2717,7 @@ mod tests {
             (1, 1, 5.),
             (4, 4, 6.),
         ];
-        let mut a = Sparse::from_originals(5, entries);
+        let mut a = Sparse::from_originals(5, entries).unwrap();
         let mut b = build(5, &entries);
         assert_eq!(a.size, b.size);
         assert_eq!(a.topology.int_to_ext_row, b.topology.int_to_ext_row);
@@ -2645,7 +2761,7 @@ mod tests {
             (4, 4, 4.),
             (4, 1, 1.),
         ];
-        let mut m = Sparse::from_originals(4, entries);
+        let mut m = Sparse::from_originals(4, entries).unwrap();
         m.mna_preorder();
         assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
         let plan = std::sync::Arc::clone(m.plan.as_ref().unwrap());
@@ -2684,7 +2800,7 @@ mod tests {
         let mut c = m.into_retyped::<Complex>();
         assert!(std::sync::Arc::ptr_eq(c.plan.as_ref().unwrap(), &plan));
         // Insert a missing structural entry after a completed ordering.
-        let h = c.get_element(1, 4);
+        let h = c.get_element(1, 4).unwrap();
         c.set(h, Complex::real(2.));
         assert!(c.plan.is_none());
     }
@@ -2810,7 +2926,7 @@ mod tests {
             (3, 3, 6.),
             (3, 1, 1.),
         ];
-        let mut real = Sparse::from_originals(3, entries);
+        let mut real = Sparse::from_originals(3, entries).unwrap();
         assert_eq!(real.order_and_factor(1e-3, 0.), Status::Okay);
         assert!(real.values.len() > entries.len());
         let real = std::sync::Arc::new(real);
@@ -2886,14 +3002,14 @@ mod tests {
         let mut complex = a.into_retyped::<Complex>();
         assert!(std::sync::Arc::ptr_eq(&complex.topology, &saved.topology));
         // Lookup of an already allocated element does not detach.
-        complex.get_element(1, 1);
+        complex.get_element(1, 1).unwrap();
         assert!(std::sync::Arc::ptr_eq(&complex.topology, &saved.topology));
         // Add a previously untranslated unknown after successful ordering.
-        let h = complex.get_element(3, 3);
+        let h = complex.get_element(3, 3).unwrap();
         assert!(!std::sync::Arc::ptr_eq(&complex.topology, &saved.topology));
         complex.clear();
         for i in 1..=3 {
-            let h = complex.get_element(i, i);
+            let h = complex.get_element(i, i).unwrap();
             complex.set(h, Complex::real(i as f64));
         }
         complex.set(h, Complex::real(3.));
@@ -2918,7 +3034,7 @@ mod tests {
             (4, 4, 4.),
             (4, 1, 1.),
         ];
-        let mut m = Sparse::from_originals(4, entries);
+        let mut m = Sparse::from_originals(4, entries).unwrap();
         assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
         assert!(m.values.len() > entries.len());
         let rhs = [5.; 4];
@@ -3014,7 +3130,7 @@ mod tests {
         assert_eq!(m.order_and_factor(1e-3, 0.0), Status::Okay);
         let handles: Vec<_> = entries
             .iter()
-            .map(|&(r, c, _)| m.get_element(r, c))
+            .map(|&(r, c, _)| m.get_element(r, c).unwrap())
             .collect();
         m.clear();
         for (h, v) in handles.iter().zip([4.0, 1.0, 1.0, 5.0]) {
@@ -3046,7 +3162,7 @@ mod tests {
                 }
             }
         }
-        let mut real = Sparse::from_originals(n, entries.iter().copied());
+        let mut real = Sparse::from_originals(n, entries.iter().copied()).unwrap();
         assert_eq!(real.order_and_factor(1e-3, 0.), Status::Okay);
         assert!(real.values.len() > entries.len());
         let mut clean = real.clone();
@@ -3091,7 +3207,7 @@ mod tests {
         assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
         let handles: Vec<_> = entries
             .iter()
-            .map(|&(r, c, _)| m.get_element(r, c))
+            .map(|&(r, c, _)| m.get_element(r, c).unwrap())
             .collect();
         let load = |m: &mut Sparse<f64>, values: &[f64]| {
             m.clear();
@@ -3168,9 +3284,9 @@ mod tests {
             (2, 1, Complex::new(0.0, -1.0)),
             (2, 2, Complex::new(2.0, 0.5)),
         ];
-        let mut m: Sparse<Complex> = Sparse::new(2);
+        let mut m: Sparse<Complex> = Sparse::new(2).unwrap();
         for &(r, c, v) in &entries {
-            let e = m.get_element(r, c);
+            let e = m.get_element(r, c).unwrap();
             m.add(e, v);
         }
         assert_eq!(m.order_and_factor(1e-3, 0.0), Status::Okay);

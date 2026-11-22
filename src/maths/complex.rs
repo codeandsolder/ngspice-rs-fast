@@ -353,7 +353,7 @@ impl ComplexMatrix {
     /// # Errors
     /// Structurally or numerically singular matrix.
     pub fn factorize_new_matrix(&self) -> SpiceResult<ComplexLu> {
-        let mut sparse = self.fresh_frame();
+        let mut sparse = self.fresh_frame()?;
         if !sparse.fully_translated() {
             // A circuit's matrix follows C (see `maths::linear`).
             if self.names.is_none() && matches!(self.assembly, Assembly::Standalone(_)) {
@@ -392,7 +392,7 @@ impl ComplexMatrix {
                 factors,
             });
         }
-        let mut sparse = self.fresh_frame();
+        let mut sparse = self.fresh_frame()?;
         order_fresh(
             "complex sparse LU",
             &mut sparse,
@@ -409,7 +409,7 @@ impl ComplexMatrix {
         })
     }
 
-    fn fresh_frame(&self) -> Sparse<Complex> {
+    fn fresh_frame(&self) -> SpiceResult<Sparse<Complex>> {
         match &self.assembly {
             Assembly::Bound { pattern, values } => Sparse::from_pattern(pattern, values),
             Assembly::Standalone(entries) => {

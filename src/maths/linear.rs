@@ -178,6 +178,10 @@ pub(in crate::maths) fn check_status<T: Scalar>(
 ) -> SpiceResult<()> {
     match status {
         Status::Okay => Ok(()),
+        Status::Resource => Err(numerical(
+            context,
+            "sparse factor storage capacity exceeded",
+        )),
         Status::InvalidPlan => Err(numerical(
             context,
             "ordered sparse topology lacks a valid traversal plan",
@@ -459,7 +463,7 @@ pub(in crate::maths) fn factor_shared_complex(
             (sparse, false)
         },
         _ => {
-            let sparse=Sparse::from_pattern(pattern,values);
+            let sparse=Sparse::from_pattern(pattern,values)?;
             (Arc::new(sparse), true)
         }
     };
@@ -555,14 +559,14 @@ impl LoadedFrame {
 }
 
 /// Build the initial frame from a validated, assembled matrix.
-fn fresh_frame(matrix: &SparseMatrix) -> LoadedFrame {
+fn fresh_frame(matrix: &SparseMatrix) -> SpiceResult<LoadedFrame> {
     if let Some((pattern, values)) = matrix.bound_values() {
-        let sparse = Sparse::from_pattern(pattern, values);
-        return LoadedFrame {
+        let sparse = Sparse::from_pattern(pattern, values)?;
+        return Ok(LoadedFrame {
             sparse: Arc::new(sparse),
             key: Key::Pattern(Arc::downgrade(pattern)),
             previous_inputs: None,
-        };
+        });
     }
     let n = matrix.rows();
     let pattern: Vec<_> = matrix.triplets().iter().map(|t| (t.row, t.col)).collect();
@@ -572,12 +576,12 @@ fn fresh_frame(matrix: &SparseMatrix) -> LoadedFrame {
             .triplets()
             .iter()
             .map(|t| (t.row + 1, t.col + 1, t.value)),
-    );
-    LoadedFrame {
+    )?;
+    Ok(LoadedFrame {
         sparse: Arc::new(sparse),
         key: Key::Triplets(Arc::new(pattern)),
         previous_inputs: None,
-    }
+    })
 }
 
 /// One `NIiter` step on `matrix`: the factorization ngspice performs after a
@@ -659,7 +663,7 @@ fn ni_step(
         frame.reload(&matrix);
         (frame, false)
     } else {
-        let mut frame = fresh_frame(&matrix);
+        let mut frame = fresh_frame(&matrix)?;
         if !frame.sparse.fully_translated() {
             // A circuit's matrix (bound, or carrying unknown names)
             // follows C: an unknown without entries stays untranslated
@@ -800,7 +804,7 @@ impl SparseLu {
     }
 
     fn factor_prepared(matrix: &SparseMatrix) -> SpiceResult<Self> {
-        let mut frame = fresh_frame(matrix);
+        let mut frame = fresh_frame(matrix)?;
         order_fresh(
             "sparse LU",
             Arc::make_mut(&mut frame.sparse),
@@ -917,7 +921,7 @@ impl DenseLu {
                     .filter(|(_, v)| **v != 0.)
                     .map(move |(col, &v)| (row + 1, col + 1, v))
             });
-        let mut sparse = Sparse::from_originals(n, entries);
+        let mut sparse = Sparse::from_originals(n, entries)?;
         order_fresh(
             "dense LU",
             &mut sparse,
