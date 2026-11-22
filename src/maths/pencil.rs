@@ -545,7 +545,7 @@ impl<'a> LoadedPencil<'a> {
                 "non-finite or unrepresentable LU factor",
             )),
             Status::Okay | Status::SmallPivot => {
-                let (mantissa, exponent) = sparse.determinant()?;
+                let (mantissa, exponent) = sparse.factors()?.determinant()?;
                 base2_determinant(mantissa, exponent).map(Some)
             }
         }

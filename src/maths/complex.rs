@@ -527,12 +527,11 @@ impl ComplexLu {
         if rhs.len() != self.n || rhs.iter().any(|v| !v.is_finite()) {
             return Err(numerical("complex solve", "invalid RHS"));
         }
+        let factors = self.factors.sparse.factors()?;
         let x = if transposed {
-            self.factors
-                .sparse
-                .solve_transposed_with_workspace(rhs, workspace)?
+            factors.solve_transposed(rhs, workspace)?
         } else {
-            self.factors.sparse.solve_with_workspace(rhs, workspace)?
+            factors.solve(rhs, workspace)?
         };
         if x.iter().any(|v| !v.is_finite()) {
             return Err(numerical(
@@ -548,7 +547,7 @@ impl ComplexLu {
     /// # Errors
     /// Non-finite/invalid inverse factors or an out-of-range exponent.
     pub fn determinant(&self) -> SpiceResult<(Complex, i32)> {
-        self.factors.sparse.determinant()
+        self.factors.sparse.factors()?.determinant()
     }
 }
 
