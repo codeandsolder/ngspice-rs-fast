@@ -462,10 +462,12 @@ fn validate_pwl_repeat(
     // VSRC_R/ISRC_R validate every r= as it is set (E_PARMVAL
     // aborts the deck), so an invalid earlier r= is an error even
     // when a later one is valid.
-    PwlSource::new(knots.clone(), 0., Some(number)).map_err(|error| SpiceError::Unsupported {
-        feature: format!("{}: {error}", instance.name),
-        location: Some(p.location.clone()),
-    })?;
+    knots
+        .repeat_index(Some(number))
+        .map_err(|error| SpiceError::Unsupported {
+            feature: format!("{}: {error}", instance.name),
+            location: Some(p.location.clone()),
+        })?;
     Ok(())
 }
 
@@ -645,8 +647,9 @@ fn pwl_options(
             location: at,
         });
     };
-    PwlSource::new(knots, delay.map_or(0., |(d, _)| d), repeat.map(|(r, _)| r))
-        .map(Waveform::PwlSource)
+    knots
+        .with_timing(delay.map_or(0., |(d, _)| d), repeat.map(|(r, _)| r))
+        .map(Waveform::Pwl)
         .map_err(|error| SpiceError::Unsupported {
             feature: error.to_string(),
             location: at,
@@ -692,16 +695,16 @@ fn source_waveform(
                 .iter()
                 .map(|p| Ok((field(&p.time, "pwl time")?, field(&p.value, "pwl value")?)))
                 .collect::<SpiceResult<Vec<_>>>()?;
-            let waveform = Waveform::Pwl(knots);
-            waveform.validate().map_err(|_| SpiceError::Unsupported {
-                feature: "PWL times must be nonnegative and strictly increasing".to_owned(),
-                location: Some(
-                    points
-                        .first()
-                        .map_or_else(|| setter.clone(), |p| p.time.location.clone()),
-                ),
-            })?;
-            Ok(waveform)
+            PwlSource::plain(knots)
+                .map(Waveform::Pwl)
+                .map_err(|_| SpiceError::Unsupported {
+                    feature: "PWL times must be nonnegative and strictly increasing".to_owned(),
+                    location: Some(
+                        points
+                            .first()
+                            .map_or_else(|| setter.clone(), |p| p.time.location.clone()),
+                    ),
+                })
         }
     }
 }

@@ -173,7 +173,10 @@ fn rlc_underdamped_reference_and_pwl_breakpoints() {
     let mut c = circuit("v1 in 0 0\nr1 in out 1k\nc1 out 0 1u");
     waveform(
         &mut c,
-        ngspice_rs::devices::Waveform::Pwl(vec![(0., 0.), (0.001, 1.), (0.002, 1.)]),
+        ngspice_rs::devices::Waveform::Pwl(
+            ngspice_rs::devices::PwlSource::plain(vec![(0., 0.), (0.001, 1.), (0.002, 1.)])
+                .unwrap(),
+        ),
     );
     let p = transient(&mut c).unwrap();
     for i in 0..p.point_count() {

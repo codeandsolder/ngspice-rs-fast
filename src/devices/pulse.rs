@@ -20,7 +20,30 @@ use crate::devices::Limit;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// The largest cycle index whose start time is still resolvable in `f64`.
-const MAX_CYCLE: Real = 4_503_599_627_370_496.0; // 2^52
+pub(super) const MAX_CYCLE: Real = 4_503_599_627_370_496.0; // 2^52
+
+/// Cycle decomposition in the reference C order. Callers choose when to
+/// fold (load uses a strict boundary, accept an inclusive one) and when to
+/// reject unresolvable cycle numbers; neither policy belongs in this kernel.
+#[derive(Clone, Copy)]
+pub(super) struct CyclePosition {
+    pub index: Real,
+    pub base: Real,
+    pub phase: Real,
+}
+
+pub(super) fn cycle_position(elapsed: Real, period: Real) -> CyclePosition {
+    let index = (elapsed / period).floor();
+    let base = period * index;
+    let phase = elapsed - base;
+    CyclePosition { index, base, phase }
+}
+
+impl CyclePosition {
+    pub fn resolvable(self) -> bool {
+        self.index.is_finite() && self.index < MAX_CYCLE && self.base.is_finite()
+    }
+}
 
 fn invalid(message: impl Into<String>) -> SpiceError {
     SpiceError::circuit(format!("invalid PULSE waveform: {}", message.into()))
@@ -300,17 +323,13 @@ impl Pulse {
             return Ok(self.initial);
         }
         if time > self.period {
-            let cycle = (time / self.period).floor();
-            if !cycle.is_finite() || cycle >= MAX_CYCLE {
+            let cycle = cycle_position(time, self.period);
+            if !cycle.resolvable() {
                 return Err(invalid(
                     "evaluation time is too many periods from the origin",
                 ));
             }
-            let basetime = self.period * cycle;
-            if !basetime.is_finite() {
-                return Err(invalid("evaluation cycle start overflows"));
-            }
-            time -= basetime;
+            time = cycle.phase;
         }
         let (v1, v2) = (self.initial, self.pulsed);
         let (tr, tf, pw) = (self.rise, self.fall, self.width);
@@ -379,9 +398,7 @@ impl PulseBreakpoints {
         }
         let cut = pulse.stop.and_then(|stop| {
             let active = (pulse.rise + pulse.width + pulse.fall).min(pulse.period);
-            let elapsed_cycles = (stop / pulse.period).floor();
-            let elapsed = pulse.period * elapsed_cycles;
-            let offset = stop - elapsed;
+            let offset = cycle_position(stop, pulse.period).phase;
             (offset > 0. && offset < active).then_some(pulse.delay + stop)
         });
         let last_cycle = ((t1 - pulse.delay) / pulse.period).floor();
