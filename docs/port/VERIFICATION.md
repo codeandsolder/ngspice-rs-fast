@@ -2079,8 +2079,8 @@ current directory (Cargo runs tests from their package directories).
 Run xtask from inside the intended checkout, including when invoking a
 previously built executable directly. Process-level tests use Cargo's
 runtime `CARGO_BIN_EXE_*` environment to select the exact built executable,
-never a binary found through PATH. Source inputs to the BSIM4 generator
-use source-relative `include_str!` paths. No checkout or executable paths
+never a binary found through PATH. The BSIM4 ownership generator reads its source inputs from the explicitly
+resolved workspace root (the ordered BSIM4 setup change). No checkout or executable paths
 are embedded through compile-time Cargo environment macros.
 
 ### Incremental C batch frequency axes

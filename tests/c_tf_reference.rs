@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ngspice_rs::analysis::{RawFile, RawFormat};
+use ngspice_rs::primitives::Complex;
 
 struct Cleanup(PathBuf);
 
@@ -103,16 +104,25 @@ fn compare_with_c(name: &str, deck_text: &str, relative: f64) {
             want.point_count(),
             "{name}: plot {index}"
         );
-        for (column, variable) in want.variables().iter().enumerate() {
+        for variable in want.variables() {
             let want_column = want.column(&variable.name).unwrap();
             let got_column = got.column(&variable.name).unwrap();
             for (point, (a, b)) in got_column.iter().zip(&want_column).enumerate() {
-                let [re, im] = ngspice_conformance::ngspice::batch_reference_sample(
-                    column,
-                    &variable.name,
-                    [b.re, b.im],
-                );
-                let reference = ngspice_rs::primitives::Complex::new(re, im);
+                // CKTacDump initializes only freqData.rValue, but the
+                // complex batch writer reads refValue->cValue. The
+                // imaginary lane of this declared real frequency axis is
+                // uninitialized in the pinned C reference (059066b5).
+                // Require an exactly real Rust axis and compare its
+                // physical frequency; all dependent phasors remain complex.
+                let reference = if want.plotname == "AC Analysis"
+                    && variable.name == "frequency"
+                    && variable.unit == "frequency"
+                {
+                    assert_eq!(a.im.to_bits() & !(1_u64 << 63), 0);
+                    Complex::real(b.re)
+                } else {
+                    *b
+                };
                 let difference = (*a - reference).magnitude();
                 assert!(
                     difference <= relative * reference.magnitude() + 1e-12,
