@@ -3,19 +3,15 @@
 //! Every expected value below is C's: printed by a `-ffp-contract=off` build
 //! of the reference ngspice (the FMA-free oracle the port is judged against,
 //! see `docs/port/VERIFICATION.md`) from the same deck with `.options
-//! sparse`. On macOS arm64, where that oracle was built, the port reproduces
-//! them bit for bit; other platforms' `exp`/`log`/`pow` round differently in
-//! the last place, so there the comparison is relative (and a transient is
-//! compared on C's time grid by interpolation, since its step sequence can
-//! differ).
+//! sparse`. The portable numerical bounds apply on every platform: the
+//! compact model deliberately uses more accurate fused and rationalized
+//! expressions. A transient is compared on C's accepted time grid since
+//! improved arithmetic can also alter the accepted steps.
 use std::path::Path;
 
 use ngspice_rs::analysis::{Plot, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
-
-/// Exact on the oracle's platform.
-const EXACT: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
 
 fn plots(text: &str) -> Vec<Plot> {
     let netlist = Parser::new()
@@ -28,18 +24,10 @@ fn plots(text: &str) -> Vec<Plot> {
 }
 
 fn same(actual: f64, expected: f64, label: &str) {
-    if EXACT {
-        assert_eq!(
-            actual.to_bits(),
-            expected.to_bits(),
-            "{label}: Rust {actual:e}, C {expected:e}"
-        );
-    } else {
-        assert!(
-            (actual - expected).abs() <= 1e-9 * expected.abs() + 1e-30,
-            "{label}: Rust {actual:e}, C {expected:e}"
-        );
-    }
+    assert!(
+        (actual - expected).abs() <= 1e-9 * expected.abs() + 1e-30,
+        "{label}: Rust {actual:e}, C {expected:e}"
+    );
 }
 
 /// Expected samples: `(vector, [(point, re, im)])`.
@@ -772,7 +760,6 @@ cl out 0 2f
         ),
     ];
     // C's accepted time points at those indices.
-    let indices = [0, 14, 28, 42, 56, 70, 84, 98, 112, 126, 140, 154, 168];
     let times = [
         0.0,
         7.28e-11,
@@ -788,14 +775,7 @@ cl out 0 2f
         1.2949999999999996e-09,
         1.434999999999999e-09,
     ];
-    if EXACT {
-        for (&index, &time) in indices.iter().zip(&times) {
-            same(plot.value("time", index).unwrap().re, time, "time");
-        }
-        check(plot, expected);
-        return;
-    }
-    // Elsewhere: compare on C's grid by interpolating the port's waveform.
+    // Compare on C's grid by interpolating the port's waveform.
     let grid: Vec<f64> = (0..)
         .map_while(|i| plot.value("time", i).map(|v| v.re))
         .collect();

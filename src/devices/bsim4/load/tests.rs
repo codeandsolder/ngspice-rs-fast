@@ -330,12 +330,21 @@ fn charge_conservation_and_channel_derivatives_over_bias_grid() {
 #[ignore = "manual BSIM4 throughput benchmark"]
 fn benchmark_bsim4_arithmetic() {
     use std::{hint::black_box, time::Instant};
-    const LOADS: u32 = 30_000;
+    const LOADS: u32 = 200_000;
+    fn thread_ticks() -> Option<u64> {
+        let stat = std::fs::read_to_string("/proc/thread-self/stat").ok()?;
+        let (_, fields) = stat.rsplit_once(')')?;
+        let mut fields = fields.split_whitespace().skip(11);
+        let user = fields.next()?.parse::<u64>().ok()?;
+        let system = fields.next()?.parse::<u64>().ok()?;
+        Some(user + system)
+    }
     for cap in 0..=2 {
         let (model, seed, size, _) = prepared("4.8.3", 2, cap, 0, 0, 0);
         let mut instance = seed.clone();
         let mut trace = Trace::bias(0.1, 0.45, -0.05);
         for batch in 0..5 {
+            let cpu_start = thread_ticks();
             let start = Instant::now();
             for index in 0..LOADS {
                 let v = f64::from(index % 101) / 100.;
@@ -352,9 +361,13 @@ fn benchmark_bsim4_arithmetic() {
                 .unwrap();
             }
             black_box((&instance, &trace));
+            let elapsed = start.elapsed();
+            let ticks = cpu_start
+                .zip(thread_ticks())
+                .map(|(start, end)| end.saturating_sub(start));
             println!(
-                "bsim4 capmod={cap} batch={batch} loads={LOADS} elapsed_ns={}",
-                start.elapsed().as_nanos()
+                "bsim4 capmod={cap} batch={batch} loads={LOADS} elapsed_ns={} cpu_ticks={ticks:?}",
+                elapsed.as_nanos()
             );
         }
     }
