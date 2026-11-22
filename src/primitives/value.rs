@@ -55,13 +55,13 @@ pub fn approx_eq(a: Real, b: Real, relative_tolerance: Real) -> bool {
 /// most `max_ulps` apart.
 #[must_use]
 pub fn almost_equal_ulps(a: Real, b: Real, max_ulps: i64) -> bool {
-    if a == b {
-        return true;
-    }
+    // The ordered mapping already makes equal values, including both signed
+    // zeros, zero ULPs apart.
     // Lexicographically ordered integer representations (`INT64_MIN - bits`
     // for negative values), compared without overflow.
     let ordered = |x: Real| {
-        let bits = x.to_bits() as i64;
+        // Reinterpret the IEEE-754 sign bit, rather than numerically narrowing.
+        let bits = x.to_bits().cast_signed();
         i128::from(if bits < 0 { i64::MIN - bits } else { bits })
     };
     (ordered(a) - ordered(b)).unsigned_abs() <= u128::from(max_ulps.unsigned_abs())
@@ -122,7 +122,7 @@ impl Complex {
 
     /// True when both parts are finite.
     #[must_use]
-    pub fn is_finite(self) -> bool {
+    pub const fn is_finite(self) -> bool {
         self.re.is_finite() && self.im.is_finite()
     }
 
@@ -158,6 +158,10 @@ impl Sub for Complex {
 impl Mul for Complex {
     type Output = Self;
 
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "ordinary SPICE complex multiplication preserves separate product rounding"
+    )]
     fn mul(self, rhs: Self) -> Self {
         Self::new(
             self.re * rhs.re - self.im * rhs.im,
@@ -169,13 +173,186 @@ impl Mul for Complex {
 impl Div for Complex {
     type Output = Self;
 
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "the normal complex-division path uses the reference C squared denominator"
+    )]
     fn div(self, rhs: Self) -> Self {
         let denominator = rhs.re * rhs.re + rhs.im * rhs.im;
-        Self::new(
-            (self.re * rhs.re + self.im * rhs.im) / denominator,
-            (self.im * rhs.re - self.re * rhs.im) / denominator,
-        )
+        let ac = self.re * rhs.re;
+        let bd = self.im * rhs.im;
+        let bc = self.im * rhs.re;
+        let ad = self.re * rhs.im;
+        let result = Self::new((ac + bd) / denominator, (bc - ad) / denominator);
+        // Keep the C operation order on the ordinary path. Only use the
+        // scaled path when a product or sum loses its representable range.
+        if (!denominator.is_normal()
+            || !result.is_finite()
+            || lost_product(ac, self.re, rhs.re)
+            || lost_product(bd, self.im, rhs.im)
+            || lost_product(bc, self.im, rhs.re)
+            || lost_product(ad, self.re, rhs.im))
+            && self.is_finite()
+            && rhs.is_finite()
+            && rhs != Self::ZERO
+        {
+            return scaled_complex_div(self, rhs);
+        }
+        result
     }
+}
+
+fn lost_product(product: Real, a: Real, b: Real) -> bool {
+    !product.is_normal() && a != 0.0 && b != 0.0
+}
+
+/// A number represented outside the native binary64 exponent range.
+#[derive(Clone, Copy)]
+struct ScaledNumber {
+    mantissa: Real,
+    exponent: i32,
+}
+
+impl ScaledNumber {
+    fn divide(self, rhs: Self) -> Real {
+        scale_power(self.mantissa / rhs.mantissa, self.exponent - rhs.exponent)
+    }
+}
+
+/// An exponent-scaled product with its exact rounding residual. Keeping
+/// products independent preserves each quotient component even with a
+/// very large dynamic range between the real and imaginary inputs. The
+/// residual also recovers cancellation between two products that round
+/// to the same significand.
+#[derive(Clone, Copy)]
+struct ScaledProduct {
+    value: ScaledNumber,
+    roundoff: Real,
+}
+
+impl ScaledProduct {
+    fn product(a: Real, b: Real) -> Self {
+        if a == 0.0 || b == 0.0 {
+            return Self {
+                value: ScaledNumber {
+                    mantissa: a * b,
+                    exponent: 0,
+                },
+                roundoff: 0.0,
+            };
+        }
+        let (a, ae) = split_power(a);
+        let (b, be) = split_power(b);
+        let mantissa = a * b;
+        Self {
+            value: ScaledNumber {
+                mantissa,
+                exponent: ae + be,
+            },
+            // Both scaled factors have magnitude in [1, 2), so this
+            // error-free product cannot overflow or underflow.
+            roundoff: a.mul_add(b, -mantissa),
+        }
+    }
+
+    fn add(self, other: Self) -> ScaledNumber {
+        let x = self.value;
+        let y = other.value;
+        if x.mantissa == 0.0 && y.mantissa == 0.0 {
+            return ScaledNumber {
+                mantissa: x.mantissa + y.mantissa,
+                exponent: 0,
+            };
+        }
+        if x.mantissa == 0.0 {
+            return y;
+        }
+        if y.mantissa == 0.0 {
+            return x;
+        }
+        let exponent = x.exponent.max(y.exponent);
+        let a = scale_power(x.mantissa, x.exponent - exponent);
+        let b = scale_power(y.mantissa, y.exponent - exponent);
+        let sum = a + b;
+        // Knuth's TwoSum: keep the addition rounding residual too. This
+        // is strictly on the exceptional path, never ordinary C arithmetic.
+        let virtual_b = sum - a;
+        let residual = (a - (sum - virtual_b)) + (b - virtual_b);
+        let roundoff = residual
+            + scale_power(self.roundoff, x.exponent - exponent)
+            + scale_power(other.roundoff, y.exponent - exponent);
+        ScaledNumber {
+            mantissa: sum + roundoff,
+            exponent,
+        }
+    }
+}
+
+/// Extract the binary64 exponent field without a checked narrowing that can panic.
+fn biased_exponent(bits: u64) -> i32 {
+    let [high, next, ..] = bits.to_be_bytes();
+    i32::from((u16::from_be_bytes([high, next]) >> 4) & 0x07ff)
+}
+
+/// Exact unbiased exponent of a finite, nonzero binary64 magnitude,
+/// including subnormals. Returns None for zero, infinity and NaN.
+pub(crate) fn binary_exponent(value: Real) -> Option<i32> {
+    if !value.is_finite() || value == 0.0 {
+        return None;
+    }
+    let bits = value.abs().to_bits();
+    let biased = biased_exponent(bits);
+    if biased == 0 {
+        // The count is at most 64, so its signed representation is identical.
+        let leading = bits.leading_zeros().cast_signed();
+        Some(63 - leading - 1074)
+    } else {
+        Some(biased - 1023)
+    }
+}
+
+/// Split a finite nonzero binary64 into a signed significand in [1, 2)
+/// in magnitude and an unbiased exponent, including subnormals.
+fn split_power(value: Real) -> (Real, i32) {
+    let bits = value.to_bits();
+    let exponent = biased_exponent(bits);
+    if exponent == 0 {
+        let (mantissa, exponent) = split_power(value * 4_503_599_627_370_496.0);
+        return (mantissa, exponent - 52);
+    }
+    (
+        Real::from_bits((bits & 0x800f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000),
+        exponent - 1023,
+    )
+}
+
+/// Multiply by a power of two without first forming an unrepresentable
+/// power. The final multiply is the only one that can round into subnormals
+/// for the normalized significands used by the scaled division.
+fn scale_power(mut value: Real, mut exponent: i32) -> Real {
+    while exponent > 1023 {
+        value *= Real::from_bits(0x7fe0_0000_0000_0000);
+        exponent -= 1023;
+    }
+    while exponent < -1022 {
+        // Defer the smallest normal factor to the final multiplication.
+        if exponent >= -2044 {
+            return scale_power(value, exponent + 1022) * Real::MIN_POSITIVE;
+        }
+        value *= Real::MIN_POSITIVE;
+        exponent += 1022;
+    }
+    value * Real::from_bits(u64::from((exponent + 1023).cast_unsigned()) << 52)
+}
+
+#[cold]
+fn scaled_complex_div(a: Complex, b: Complex) -> Complex {
+    let p = ScaledProduct::product;
+    let denominator = p(b.re, b.re).add(p(b.im, b.im));
+    Complex::new(
+        p(a.re, b.re).add(p(a.im, b.im)).divide(denominator),
+        p(a.im, b.re).add(p(-a.re, b.im)).divide(denominator),
+    )
 }
 
 impl Neg for Complex {
@@ -245,6 +422,20 @@ fn scale_suffix(letter: char, rest: &str) -> (i32, usize, bool) {
     }
 }
 
+/// Consume consecutive decimal digits with the reference mantissa accumulator.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "INPevaluate rounds multiplication by ten before adding the digit"
+)]
+fn scan_mantissa_digits(bytes: &[u8], index: &mut usize, mantissa: &mut Real) -> usize {
+    let start = *index;
+    while bytes.get(*index).is_some_and(u8::is_ascii_digit) {
+        *mantissa = 10.0 * *mantissa + Real::from(bytes[*index] - b'0');
+        *index += 1;
+    }
+    *index - start
+}
+
 /// Parses a literal from the start of `input`, reporting bytes consumed.
 ///
 /// Does not skip leading whitespace: the literal must begin at byte 0. Returns
@@ -282,25 +473,18 @@ pub fn parse_spice_number_prefix(input: &str) -> Option<ParsedNumber> {
     }
 
     let mut mantis: Real = 0.0;
-    let mut expo1: i32 = 0;
-    let mut mantissa_digits = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        mantis = 10.0 * mantis + Real::from(bytes[i] - b'0');
+    let integer_digits = scan_mantissa_digits(bytes, &mut i, &mut mantis);
+    let fractional_digits = if bytes.get(i) == Some(&b'.') {
         i += 1;
-        mantissa_digits += 1;
-    }
-    if bytes.get(i) == Some(&b'.') {
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            mantis = 10.0 * mantis + Real::from(bytes[i] - b'0');
-            expo1 = expo1.saturating_sub(1);
-            i += 1;
-            mantissa_digits += 1;
-        }
-    }
-    if mantissa_digits == 0 {
+        scan_mantissa_digits(bytes, &mut i, &mut mantis)
+    } else {
+        0
+    };
+    if integer_digits == 0 && fractional_digits == 0 {
         return None;
     }
+    // Match the old saturating decrement once per fractional digit.
+    let expo1 = i32::try_from(fractional_digits).map_or(i32::MIN, |count| -count);
 
     let mut expo2: i32 = 0;
     if bytes
@@ -333,10 +517,9 @@ pub fn parse_spice_number_prefix(input: &str) -> Option<ParsedNumber> {
         }
     }
 
-    let (scale, suffix_width, mil) = match input[i..].chars().next() {
-        Some(letter) => scale_suffix(letter, &input[i + letter.len_utf8()..]),
-        None => (0, 0, false),
-    };
+    let (scale, suffix_width, mil) = input[i..].chars().next().map_or((0, 0, false), |letter| {
+        scale_suffix(letter, &input[i + letter.len_utf8()..])
+    });
     if mil {
         mantis *= 25.4;
     }
@@ -350,12 +533,49 @@ pub fn parse_spice_number_prefix(input: &str) -> Option<ParsedNumber> {
 
 /// C's `INPgetValue(IF_INTEGER)` conversion (`inpgval.c`):
 /// `(int) floor(0.5 + value)`, or `None` when that is not a finite `int`.
+///
+/// The signed C range is asymmetric: `i32::MIN` is a valid result, while
+/// `-i32::MIN` is not. Check the actual bounds before the narrowing cast.
 #[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the rounded result is integral, finite and checked against the full i32 range"
+)]
 pub fn c_integer(value: Real) -> Option<i64> {
     let rounded = (0.5 + value).floor();
-    (rounded.is_finite() && rounded.abs() <= Real::from(i32::MAX)).then_some(rounded as i64)
+    if !rounded.is_finite() || rounded < Real::from(i32::MIN) || rounded > Real::from(i32::MAX) {
+        return None;
+    }
+    Some(i64::from(rounded as i32))
 }
 
+/// Convert an already integral, nonnegative `f64` to a checked integer
+/// type without silently saturating an out-of-range value.
+///
+/// Rust's float-to-integer `as` conversion saturates on overflow. First
+/// enforce the **exclusive** `2^128` bound, then use `TryFrom<u128>` for the
+/// actual target integer type. This works for both `usize` and the full
+/// `u32` range, even on targets whose `usize` is narrower than 32 bits.
+/// It validates the supplied `f64`, not digits already lost during parsing.
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the value is checked for integrality and bounded below 2^128 before conversion"
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "the range check rejects every negative value except signed zero"
+)]
+pub fn exact_nonnegative_integer<T: TryFrom<u128>>(value: Real) -> Option<T> {
+    let exclusive_upper_bound = Real::from(128).exp2();
+    if !value.is_finite() || value < 0. || value.fract() != 0. || value >= exclusive_upper_bound {
+        return None;
+    }
+    T::try_from(value as u128).ok()
+}
+
+/// Parse numeric literals and unit suffixes accepted by numparam.
+///
 /// Parses a number inside a `.param`/`{...}` expression as numparam's
 /// `fetchnumber()` (`xpressn.c`) does: `sscanf("%lG")` (the correctly rounded
 /// decimal value, `e`/`E` exponents only) times `parseunit()`'s multiplier
@@ -437,7 +657,7 @@ trait PowTen {
 
 impl PowTen for Real {
     fn powf_c(self) -> Real {
-        Real::powf(10.0, self)
+        Self::powf(10.0, self)
     }
 }
 
@@ -475,22 +695,73 @@ pub fn format_spice_number(value: Real) -> String {
         // `NaN`, `inf` and `-inf` have no exponent part.
         return text;
     };
-    match exponent.parse::<i32>() {
-        Ok(exponent) => format!(
-            "{mantissa}e{}{:02}",
-            if exponent < 0 { '-' } else { '+' },
-            exponent.unsigned_abs()
-        ),
-        Err(_) => text,
-    }
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        return text;
+    };
+    format!(
+        "{mantissa}e{}{:02}",
+        if exponent < 0 { '-' } else { '+' },
+        exponent.unsigned_abs()
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Complex, approx_eq, format_spice_number, parse_numparam_number_prefix, parse_spice_number,
-        parse_spice_number_prefix,
+        Complex, almost_equal_ulps, approx_eq, binary_exponent, c_integer,
+        exact_nonnegative_integer, format_spice_number, parse_numparam_number_prefix,
+        parse_spice_number, parse_spice_number_prefix,
     };
+
+    #[test]
+    fn scaled_division_recovers_product_cancellation_below_one_ulp() {
+        let epsilon = f64::EPSILON;
+        for scale in [2_f64.powi(-700), 2_f64.powi(700)] {
+            let a = Complex::new((1. + epsilon) * scale, -scale);
+            let b = Complex::new((1. - epsilon) * scale, scale);
+            let quotient = a / b;
+            // Exact real numerator is -epsilon^2 * scale^2, even though
+            // the two rounded products cancel. It must not become zero.
+            let expected = -(epsilon * epsilon) / ((1. - epsilon) * (1. - epsilon) + 1.);
+            assert!((quotient.re / expected - 1.).abs() < 1e-14);
+            assert!((quotient.im + 1.).abs() < 1e-14);
+        }
+    }
+
+    #[test]
+    fn complex_division_preserves_normal_rounding_and_extreme_components() {
+        let a = Complex::new(1.23456789, -9.87654321);
+        let b = Complex::new(-0.371, 2.415);
+        let d = b.re * b.re + b.im * b.im;
+        let expected = Complex::new(
+            (a.re * b.re + a.im * b.im) / d,
+            (a.im * b.re - a.re * b.im) / d,
+        );
+        let actual = a / b;
+        assert_eq!(actual.re.to_bits(), expected.re.to_bits());
+        assert_eq!(actual.im.to_bits(), expected.im.to_bits());
+        for scale in [1e-300, 1e-200, 1e200, 1e300, f64::MAX] {
+            let z = Complex::new(scale, scale);
+            assert_eq!(z / z, Complex::real(1.));
+            let q = Complex::new(scale, -scale) / z;
+            assert_eq!(q, Complex::imaginary(-1.));
+            let reciprocal = Complex::real(1.) / z;
+            assert!(reciprocal.is_finite() && reciprocal.re > 0.);
+            assert!((reciprocal.re * scale - 0.5).abs() < 1e-14);
+        }
+        // Scaling the entire numerator first would erase its small component.
+        let q = Complex::new(1e300, 1e-300) / Complex::real(1e-10);
+        assert!(q.re.is_infinite());
+        assert!((q.im / 1e-290 - 1.).abs() < 1e-14);
+        let q = Complex::new(1e150, 1e-200) / Complex::real(1e-150);
+        assert!((q.re / 1e300 - 1.).abs() < 1e-14);
+        assert!((q.im / 1e-50 - 1.).abs() < 1e-14);
+        let smallest = f64::from_bits(1);
+        assert_eq!(
+            Complex::new(smallest, smallest) / Complex::new(smallest, smallest),
+            Complex::real(1.)
+        );
+    }
 
     #[test]
     fn parses_plain_numbers() {
@@ -542,6 +813,104 @@ mod tests {
             parse_spice_number("-2.5D-3"),
             Some(-25.0 * 10f64.powf(-4.0))
         );
+    }
+
+    #[test]
+    fn ulp_comparison_uses_a_wide_difference_for_distant_floats() {
+        assert!(almost_equal_ulps(1., 1., 0));
+        assert!(almost_equal_ulps(-0., 0., 0));
+        assert!(almost_equal_ulps(f64::INFINITY, f64::INFINITY, 0));
+        assert!(almost_equal_ulps(f64::NAN, f64::NAN, 0));
+        assert!(almost_equal_ulps(1., f64::from_bits(1f64.to_bits() + 1), 1));
+        assert!(!almost_equal_ulps(
+            1.,
+            f64::from_bits(1f64.to_bits() + 2),
+            1
+        ));
+        // The old LTRA-local implementation computed this difference as i64
+        // and overflowed in debug builds for widely separated values.
+        assert!(!almost_equal_ulps(-f64::MAX, f64::MAX, 3));
+        assert!(!almost_equal_ulps(f64::NEG_INFINITY, f64::INFINITY, 3));
+        assert!(!almost_equal_ulps(-f64::MAX, f64::MAX, i64::MAX));
+        // The sign-bit transformation must order adjacent negative values as
+        // well as both sides of zero without overflowing at i64::MIN.
+        let first_subnormal = f64::from_bits(1);
+        let second_subnormal = f64::from_bits(2);
+        assert!(almost_equal_ulps(-first_subnormal, -second_subnormal, 1));
+        assert!(!almost_equal_ulps(-first_subnormal, second_subnormal, 2));
+        assert!(almost_equal_ulps(-first_subnormal, first_subnormal, 2));
+    }
+
+    #[test]
+    fn binary_exponent_covers_every_finite_exponent_and_subnormal_bit() {
+        for biased in 1_u64..=2046 {
+            let value = f64::from_bits(biased << 52);
+            let expected = i32::try_from(biased).unwrap() - 1023;
+            assert_eq!(binary_exponent(value), Some(expected));
+            assert_eq!(binary_exponent(-value), Some(expected));
+        }
+        for bit in 0_u32..52 {
+            let value = f64::from_bits(1_u64 << bit);
+            let expected = i32::try_from(bit).unwrap() - 1074;
+            assert_eq!(binary_exponent(value), Some(expected));
+            assert_eq!(binary_exponent(-value), Some(expected));
+        }
+        for value in [0., -0., f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert_eq!(binary_exponent(value), None);
+        }
+    }
+
+    #[test]
+    fn c_integer_accepts_the_full_signed_c_int_range() {
+        assert_eq!(c_integer(f64::from(i32::MIN)), Some(i64::from(i32::MIN)));
+        assert_eq!(c_integer(f64::from(i32::MAX)), Some(i64::from(i32::MAX)));
+        assert_eq!(c_integer(f64::from(i32::MAX) + 1.0), None);
+        assert_eq!(c_integer(f64::from(i32::MIN) - 1.0), None);
+        assert_eq!(c_integer(f64::NAN), None);
+        assert_eq!(c_integer(f64::INFINITY), None);
+        assert_eq!(c_integer(f64::NEG_INFINITY), None);
+        assert_eq!(c_integer(1.5), Some(2));
+        assert_eq!(c_integer(-1.5), Some(-1));
+    }
+
+    #[test]
+    fn exact_nonnegative_integer_rejects_invalid_values_and_target_overflow() {
+        let as_usize = exact_nonnegative_integer::<usize>;
+        let usize_bound = f64::from(usize::BITS).exp2();
+        assert_eq!(as_usize(0.0), Some(0));
+        assert_eq!(as_usize(-0.0), Some(0));
+        assert_eq!(as_usize(31.0), Some(31));
+        assert_eq!(as_usize(31.5), None);
+        assert_eq!(as_usize(-1.0), None);
+        assert_eq!(as_usize(f64::NAN), None);
+        assert_eq!(as_usize(f64::INFINITY), None);
+        assert_eq!(as_usize(f64::NEG_INFINITY), None);
+        assert_eq!(as_usize(usize_bound), None);
+        assert_eq!(as_usize(usize_bound * 2.0), None);
+
+        // Validate the actual float just below the usize bound, not an
+        // unchecked float-to-usize cast used as a test oracle.
+        if usize::BITS >= 53 {
+            let prior = f64::from_bits(usize_bound.to_bits() - 1);
+            let spacing = 1_usize << usize::BITS.saturating_sub(53);
+            assert_eq!(as_usize(prior), Some(usize::MAX - (spacing - 1)));
+        }
+
+        // A u32-valued SPICE field must accept all of u32, regardless of
+        // whether the target's usize can represent that value.
+        let as_u32 = exact_nonnegative_integer::<u32>;
+        assert_eq!(as_u32(f64::from(u32::MAX)), Some(u32::MAX));
+        assert_eq!(as_u32(f64::from(u32::MAX) + 1.0), None);
+        assert_eq!(exact_nonnegative_integer::<u16>(65_535.0), Some(u16::MAX));
+        assert_eq!(exact_nonnegative_integer::<u16>(65_536.0), None);
+
+        // At 2^128 the conversion would saturate at u128::MAX without
+        // the independent floating-point range check.
+        let u128_bound = f64::from(128).exp2();
+        assert_eq!(exact_nonnegative_integer::<u128>(u128_bound), None);
+        let prior = f64::from_bits(u128_bound.to_bits() - 1);
+        let expected = u128::MAX - ((1_u128 << (128 - 53)) - 1);
+        assert_eq!(exact_nonnegative_integer::<u128>(prior), Some(expected));
     }
 
     #[test]
@@ -613,6 +982,9 @@ mod tests {
         assert_eq!(format_spice_number(0.0), "0.000000000000000e+00");
         assert_eq!(format_spice_number(1e100), "1.000000000000000e+100");
         assert_eq!(format_spice_number(f64::NAN), "NaN");
+        assert_eq!(format_spice_number(f64::INFINITY), "inf");
+        assert_eq!(format_spice_number(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_spice_number(-0.0), "-0.000000000000000e+00");
     }
 
     #[test]

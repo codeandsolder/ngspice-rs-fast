@@ -257,6 +257,42 @@ fn inverse_mode_mirrors_the_normal_mode_current() {
 }
 
 #[test]
+fn mes_setup_uses_the_c_device_type_and_exact_matrix_allocation_order() {
+    use ngspice_rs::devices::setup::CDeviceType;
+    let c = circuit(
+        "z1 d g s zm\nm1 d g s b mm w=10u l=2u\nv1 d 0 1\n.model zm nmf(rd=5 rs=3)\n.model mm nmos(level=1 rd=5 rs=3)"
+    ).unwrap();
+    let index = c.devices().iter().position(|d| d.name() == "z1").unwrap();
+    assert_eq!(c.devices()[index].c_device_type(), CDeviceType::Mes);
+    let row = |name: &str| c.unknowns().node_row(c.nodes().get(name).unwrap()).unwrap();
+    let [d, g, s, dp, sp] = ["d", "g", "s", "z1#drain", "z1#source"].map(row);
+    assert_eq!(
+        c.setup_elements(index).unwrap(),
+        [
+            (d, dp),
+            (g, dp),
+            (g, sp),
+            (s, sp),
+            (dp, d),
+            (dp, g),
+            (dp, sp),
+            (sp, g),
+            (sp, s),
+            (sp, dp),
+            (d, d),
+            (g, g),
+            (s, s),
+            (dp, dp),
+            (sp, sp),
+        ]
+    );
+    assert!(sp < dp);
+    assert!(dp < row("m1#source"));
+    let source = c.devices().iter().position(|d| d.name() == "v1").unwrap();
+    assert!(dp < c.branch_rows(source).unwrap().start);
+}
+
+#[test]
 fn series_resistance_creates_source_then_drain_internal_nodes() {
     let c = circuit(
         "vd d 0 3\nvg g 0 0\nz1 d g 0 zm area=2\n.model zm nmf(rd=40 rs=30)\nz2 d g 0 zn\n\
@@ -803,4 +839,206 @@ fn the_sensitivity_table_is_mes_cs_parameter_list() {
         );
     }
     assert!(names.contains(&"v(z1_area)"), "{names:?}");
+}
+
+#[test]
+fn ac_conductance_and_capacitance_stamps_preserve_c_grouping() {
+    let context = ModelContext::default();
+    for family in ["nmf", "pmf"] {
+        let pol = if family == "nmf" { 1. } else { -1. };
+        for vd in [2.37, -0.47] {
+            let make = |m| {
+                circuit(&format!(
+                    "z1 d g s zm area=1.37 m={m}\n\
+                     .model zm {family}(vto=-1.8 beta=2.3m lambda=0.027 alpha=2.7 b=0.41\n\
+                     + rd=43 rs=37 is=1.1e-14 cgs=2.3p cgd=0.61p pb=0.83)"
+                ))
+                .unwrap()
+            };
+            let systems = [1., 1.7].map(|literal| {
+                let c = make(literal);
+                let row = |name| c.unknowns().node_row(c.nodes().get(name).unwrap()).unwrap();
+                let n = c.unknown_count();
+                let mut bias = Vector::zeros(n);
+                for (name, voltage) in [
+                    ("d", vd + 0.12),
+                    ("g", -0.51),
+                    ("s", -0.08),
+                    ("z1#drain", vd),
+                    ("z1#source", 0.),
+                ] {
+                    bias.as_mut_slice()[row(name)] = pol * voltage;
+                }
+                let system = c.small_signal_system(&context, &bias).unwrap();
+                // MESask does not expose M; use the same SPICE reader.
+                let m = ngspice_rs::primitives::parse_spice_number(&literal.to_string()).unwrap();
+                // C adds the two omega-scaled gate capacitances first, then
+                // multiplies by M. Preserve the group, not just its real E sum.
+                let gate = row("g");
+                let group = system
+                    .e_groups
+                    .iter()
+                    .find(|group| {
+                        let t = &system.e.triplets()[group.range.start];
+                        (t.row, t.col) == (gate, gate)
+                    })
+                    .expect("one C gate diagonal statement");
+                assert_eq!(group.terms.len(), 2);
+                assert_eq!(group.scale.to_bits(), m.to_bits());
+                assert!(!group.prescaled);
+                let terms = group.terms.clone();
+                (system, m, terms)
+            });
+            let [(unit, _, terms), (scaled, m, scaled_terms)] = systems;
+            assert_eq!(
+                terms.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                scaled_terms.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            for r in 0..unit.a.rows() {
+                for c in 0..unit.a.cols() {
+                    assert_eq!(
+                        (m * entry(&unit.a, r, c)).to_bits(),
+                        entry(&scaled.a, r, c).to_bits(),
+                        "{family}, VDS={vd}, matrix ({r},{c})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn gate_pencils_keep_reference_diagonal_scaling_and_statement_order() {
+    let context = ModelContext::default();
+    let parse = |s: &str| ngspice_rs::primitives::parse_spice_number(s).unwrap();
+    for (instance, family) in [("z1", "nmf"), ("j1", "njf")] {
+        for (rd, rs) in [("43", "37"), ("0", "0")] {
+            for multiplier in ["1", "1.7"] {
+                let c = circuit(&format!(
+                    "{instance} d g s model area=1.37 m={multiplier}\n\
+                     .model model {family}(vto=-1.8 beta=2.3m lambda=0.027\n\
+                     + rd={rd} rs={rs} is=1.1e-14 cgs=2.3p cgd=0.61p pb=0.83)"
+                ))
+                .unwrap();
+                let row = |name: &str| c.unknowns().node_row(c.nodes().get(name).unwrap()).unwrap();
+                let [d, g, s] = ["d", "g", "s"].map(row);
+                let dp = if rd == "0" {
+                    d
+                } else {
+                    row(&format!("{instance}#drain"))
+                };
+                let sp = if rs == "0" {
+                    s
+                } else {
+                    row(&format!("{instance}#source"))
+                };
+                let n = c.unknown_count();
+                let mut bias = Vector::zeros(n);
+                for (r, v) in [(d, 1.71), (g, -0.21), (s, 0.12), (dp, 1.6), (sp, 0.)] {
+                    bias.as_mut_slice()[r] = v;
+                }
+                let history = c.state_history();
+                let mut trial = history.trial();
+                c.load_device(
+                    0,
+                    c.devices()[0].as_ref(),
+                    &LoadRequest {
+                        mode: AnalysisMode::OperatingPoint,
+                        solution: &bias,
+                        model_context: &context,
+                        integration: None,
+                        history: &history,
+                        forcing: None,
+                    },
+                    &mut SparseMatrix::new(n, n),
+                    &mut Vector::zeros(n),
+                    &mut trial,
+                )
+                .unwrap();
+                let state = trial.values();
+                let (gm, gds, ggs, ggd) = (state[5], state[6], state[7], state[8]);
+                let m = parse(multiplier);
+                let area = parse("1.37");
+                let series = |r| {
+                    let r = parse(r);
+                    if r == 0. { 0. } else { (1. / r) * area }
+                };
+                let (gdpr, gspr) = (series(rd), series(rs));
+                let ac = c.small_signal_system(&context, &bias).unwrap();
+                let group = ac
+                    .e_groups
+                    .iter()
+                    .find(|group| {
+                        let t = &ac.e.triplets()[group.range.start];
+                        (t.row, t.col) == (g, g)
+                    })
+                    .unwrap();
+                let [capgd, capgs] = group.terms.as_slice() else {
+                    panic!("gate capacitance pair")
+                };
+                let (capgd, capgs) = (*capgd, *capgs);
+                let (gg, dd, ss) = if family == "nmf" {
+                    (
+                        m * ggd + ggs,
+                        m * gdpr + gds + ggd,
+                        m * gspr + gds + gm + ggs,
+                    )
+                } else {
+                    (
+                        m * (ggd + ggs),
+                        m * (gdpr + gds + ggd),
+                        m * (gspr + gds + gm + ggs),
+                    )
+                };
+                // Independent literal statement order from mespzld.c / jfetpzld.c.
+                let expected = [
+                    (d, d, m * gdpr, None),
+                    (g, g, gg, Some(m * (capgd + capgs))),
+                    (s, s, m * gspr, None),
+                    (dp, dp, dd, Some(m * capgd)),
+                    (sp, sp, ss, Some(m * capgs)),
+                    (d, dp, -(m * gdpr), None),
+                    (g, dp, -(m * ggd), Some(-(m * capgd))),
+                    (g, sp, -(m * ggs), Some(-(m * capgs))),
+                    (s, sp, -(m * gspr), None),
+                    (dp, d, -(m * gdpr), None),
+                    (dp, g, m * (-ggd + gm), Some(-(m * capgd))),
+                    (dp, sp, m * (-gds - gm), None),
+                    (sp, g, m * (-ggs - gm), Some(-(m * capgs))),
+                    (sp, s, -(m * gspr), None),
+                    (sp, dp, -(m * gds), None),
+                ];
+                let expected = expected
+                    .into_iter()
+                    .flat_map(|(r, c, g, cap)| {
+                        std::iter::once((r, c, Some(g.to_bits()), None))
+                            .chain(cap.map(|v| (r, c, None, Some(v.to_bits()))))
+                    })
+                    .collect::<Vec<_>>();
+                let actual = c.pole_zero_terms_at(&context, &bias, None, 1).unwrap();
+                let actual = actual
+                    .iter()
+                    .map(|term| {
+                        (
+                            term.row,
+                            term.col,
+                            term.conductance.map(f64::to_bits),
+                            term.capacitance.map(f64::to_bits),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual, expected,
+                    "{instance}, RD={rd}, RS={rs}, M={multiplier}"
+                );
+                // At M=1 both PZ diagonals match AC, but nonunit MES M must
+                // retain C's distinct expression rather than AC scaling.
+                let pz = c.pole_zero_system_at(&context, &bias, None).unwrap();
+                assert_eq!(entry(&pz.a, g, g).to_bits(), gg.to_bits());
+                if family == "nmf" && multiplier != "1" {
+                    assert_ne!(entry(&ac.a, g, g).to_bits(), gg.to_bits());
+                }
+            }
+        }
+    }
 }

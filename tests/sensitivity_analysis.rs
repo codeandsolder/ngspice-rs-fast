@@ -93,6 +93,118 @@ fn a_divider_matches_its_closed_form_derivatives() {
     }
 }
 
+/// Model and instance records must retain distinct given flags, including
+/// explicitly written zero and values identical to schema defaults. The C
+/// resistor field names differ from the card's `l` and `tc1` setters.
+#[test]
+fn resistor_records_preserve_given_flags_aliases_and_geometry() {
+    use ngspice_rs::devices::{Circuit, ModelContext};
+
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("resistor-records.cir"),
+            "resistor records\nr1 a 0 1k\nr2 b 0 rm tc1=0 temp=50 m=2 scale=1\n.model rm r rsh=100 defw=2u l=10u tc1=0.01 tnom=20\n.end\n",
+        ))
+        .unwrap();
+    let circuit = Circuit::from_netlist(&netlist).unwrap();
+    let describe = |name| {
+        circuit
+            .devices()
+            .iter()
+            .find(|device| device.name() == name)
+            .unwrap()
+            .sensitivity(&ModelContext::default())
+            .unwrap()
+    };
+
+    let literal = describe("r1");
+    assert!(literal.model().is_none());
+    let (model, instance) = literal.records().unwrap();
+    assert!(!model.given("rsh") && !model.given("tnom"));
+    assert!(!instance.given("m") && !instance.given("scale"));
+    assert!(instance.given("resistance"));
+    close(instance.value("resistance").unwrap(), 1e3, 1e-12);
+
+    let modeled = describe("r2");
+    assert_eq!(modeled.model(), Some("rm"));
+    let (model, instance) = modeled.records().unwrap();
+    assert!(model.given("defl") && model.given("defw") && model.given("tc1"));
+    assert!(!model.given("tc2") && !model.given("narrow"));
+    close(model.value("defl").unwrap(), 10e-6, 1e-12);
+    close(model.value("defw").unwrap(), 2e-6, 1e-12);
+    close(model.value("tnom").unwrap(), 293.15, 1e-12);
+    assert!(instance.given("tc") && instance.given("temp"));
+    assert!(instance.given("m") && instance.given("scale"));
+    assert!(!instance.given("resistance") && !instance.given("l") && !instance.given("w"));
+    assert_eq!(instance.value("tc").unwrap().to_bits(), 0.0_f64.to_bits());
+    close(instance.value("temp").unwrap(), 323.15, 1e-12);
+    close(instance.value("resistance").unwrap(), 500., 1e-12);
+    close(instance.value("conduct").unwrap(), 0.004, 1e-12);
+}
+
+/// Initial records preserve explicit zero ICs, modeled geometry, written
+/// defaults and the distinct C capacitance/inductance multiplier semantics.
+#[test]
+fn reactive_records_preserve_literal_and_modeled_inputs() {
+    use ngspice_rs::devices::{Circuit, ModelContext};
+
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("reactive-records.cir"),
+            "reactive records\nc1 a 0 2u ic=0\nl1 b 0 3m ic=-1\nc2 c 0 cm l=4u m=2 scale=1 tc1=0 temp=50\nl2 d 0 lm m=3 scale=2 tc1=0 temp=50\n.model cm c cj=0.5 defw=2u tc1=0.01 tnom=20\n.model lm l ind=4m tc1=0.01 tnom=20\n.end\n",
+        ))
+        .unwrap();
+    let circuit = Circuit::from_netlist(&netlist).unwrap();
+    let describe = |name| {
+        circuit
+            .devices()
+            .iter()
+            .find(|device| device.name() == name)
+            .unwrap()
+            .sensitivity(&ModelContext::default())
+            .unwrap()
+    };
+
+    for (name, principal, value, ic) in [
+        ("c1", "capacitance", 2e-6, 0.),
+        ("l1", "inductance", 3e-3, -1.),
+    ] {
+        let literal = describe(name);
+        assert!(literal.model().is_none());
+        let (model, instance) = literal.records().unwrap();
+        assert!(!model.given("tnom"));
+        assert!(instance.given(principal) && instance.given("ic"));
+        assert!(!instance.given("temp") && !instance.given("m") && !instance.given("scale"));
+        close(instance.value(principal).unwrap(), value, 1e-12);
+        close(instance.value("ic").unwrap(), ic, 1e-12);
+    }
+
+    let capacitor = describe("c2");
+    assert_eq!(capacitor.model(), Some("cm"));
+    let (model, instance) = capacitor.records().unwrap();
+    assert!(model.given("cj") && model.given("defw") && model.given("tnom"));
+    assert!(!model.given("cap") && !model.given("cjsw"));
+    assert!(instance.given("l") && instance.given("m") && instance.given("scale"));
+    assert!(instance.given("tc1") && instance.given("temp"));
+    assert!(!instance.given("capacitance") && !instance.given("w") && !instance.given("ic"));
+    close(instance.value("w").unwrap(), 2e-6, 1e-12);
+    assert_eq!(
+        instance.value("capac").unwrap().to_bits(),
+        (0.5_f64 * 2e-6 * 4e-6).to_bits()
+    );
+    close(instance.value("temp").unwrap(), 323.15, 1e-12);
+
+    let inductor = describe("l2");
+    assert_eq!(inductor.model(), Some("lm"));
+    let (model, instance) = inductor.records().unwrap();
+    assert!(model.given("ind") && model.given("tc1") && model.given("tnom"));
+    assert!(!model.given("csect") && !model.given("nt"));
+    assert!(instance.given("m") && instance.given("scale") && instance.given("tc1"));
+    assert!(!instance.given("inductance") && !instance.given("ic") && !instance.given("nt"));
+    close(instance.value("induct").unwrap(), 8e-3, 1e-12);
+    close(instance.value("m").unwrap(), 3., 1e-12);
+}
+
 /// C's `sgen` order and names: device types in `DEVices[]` order, later
 /// models and instances first, model parameters `inst:kw`, the first
 /// principal instance parameter `inst`, the rest `inst_kw`.

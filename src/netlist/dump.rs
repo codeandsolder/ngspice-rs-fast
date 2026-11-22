@@ -201,7 +201,7 @@ impl PathMapper {
             && let Some(start) = text[..position].rfind(": ")
             && let Some(close) = text[position..].find(')')
         {
-            text.replace_range(start..position + close + 1, ": <os error>");
+            text.replace_range(start..=position + close, ": <os error>");
         }
         text
     }
@@ -269,7 +269,7 @@ impl Ctx<'_> {
         )
     }
 
-    fn span(&self, span: &SourceSpan) -> String {
+    fn span(span: &SourceSpan) -> String {
         if span.start.line == span.end.line {
             format!(
                 "{}:{}..{}",
@@ -298,9 +298,8 @@ impl Ctx<'_> {
                 out.line(
                     indent,
                     format!(
-                        "error unknown-device name={} designator={} @{}",
+                        "error unknown-device name={} designator={designator} @{}",
                         quote(name),
-                        designator,
                         self.loc(location)
                     ),
                 );
@@ -308,7 +307,7 @@ impl Ctx<'_> {
             SpiceError::Unsupported { feature, location } => {
                 let at = location
                     .as_ref()
-                    .map_or("none".to_owned(), |l| format!("@{}", self.loc(l)));
+                    .map_or_else(|| "none".to_owned(), |l| format!("@{}", self.loc(l)));
                 out.line(indent, format!("error unsupported {at}"));
                 out.line(indent + 1, format!("feature: {}", m(feature)));
             }
@@ -421,7 +420,7 @@ pub fn dump_tokens_file(path: &Path, root: &Path) -> SpiceResult<String> {
 /// Parses `path` (resolving includes) and dumps the AST, or the positioned
 /// error when parsing fails; the output is deterministic either way.
 #[must_use]
-pub fn dump_ast_file(parser: &Parser, path: &Path, root: &Path) -> String {
+pub fn dump_ast_file(parser: Parser, path: &Path, root: &Path) -> String {
     let paths = PathMapper::new(root);
     match parser.parse_file(path) {
         Ok(netlist) => dump_ast(&netlist, &paths),
@@ -492,6 +491,15 @@ fn section(out: &mut Out, indent: usize, name: &str, count: usize) {
 }
 
 fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
+    write_scope_devices(ctx, out, indent, scope);
+    write_scope_subcircuits(ctx, out, indent, scope);
+    write_scope_analyses(ctx, out, indent, scope);
+    write_scope_parameters(ctx, out, indent, scope);
+    write_scope_options(ctx, out, indent, scope);
+    write_scope_hints(ctx, out, indent, scope);
+}
+
+fn write_scope_devices(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
     section(out, indent, "cards", scope.cards.len());
     for (n, card) in scope.cards.iter().enumerate() {
         write_card(ctx, out, indent + 1, n, card);
@@ -508,12 +516,15 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
                 "model [{n}] name={} base={} level={} @{}",
                 quote(&model.name),
                 quote(&model.base),
-                model.level.map_or("none".to_owned(), real),
+                model.level.map_or_else(|| "none".to_owned(), real),
                 ctx.loc(&model.location)
             ),
         );
         write_parameters(ctx, out, indent + 2, &model.parameters);
     }
+}
+
+fn write_scope_subcircuits(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
     section(out, indent, "subcircuits", scope.subcircuits.len());
     for (n, sub) in scope.subcircuits.iter().enumerate() {
         out.line(
@@ -545,6 +556,9 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
         };
         write_scope(ctx, out, indent + 3, &inner);
     }
+}
+
+fn write_scope_analyses(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
     section(out, indent, "analyses", scope.analyses.len());
     for (n, analysis) in scope.analyses.iter().enumerate() {
         out.line(
@@ -565,7 +579,7 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
                 indent + 2,
                 format!("argument-expression index={}", argument.index),
             );
-            write_expression(ctx, out, indent + 3, &argument.expression);
+            write_expression(out, indent + 3, &argument.expression);
         }
     }
     section(out, indent, "includes", scope.includes.len());
@@ -579,11 +593,11 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
                 include
                     .resolved_path
                     .as_ref()
-                    .map_or("none".to_owned(), |p| quote(&ctx.paths.map(p))),
+                    .map_or_else(|| "none".to_owned(), |p| quote(&ctx.paths.map(p))),
                 include
                     .section
                     .as_ref()
-                    .map_or("none".to_owned(), |s| quote(s)),
+                    .map_or_else(|| "none".to_owned(), |s| quote(s)),
                 ctx.loc(&include.location)
             ),
         );
@@ -601,6 +615,9 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
             );
         }
     }
+}
+
+fn write_scope_parameters(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
     section(out, indent, "params", scope.params.len());
     for (n, card) in scope.params.iter().enumerate() {
         out.line(
@@ -613,10 +630,10 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
                 format!(
                     "assignment [{m}] name={} name_span={}",
                     quote(&assignment.name),
-                    ctx.span(&assignment.name_span)
+                    Ctx::span(&assignment.name_span)
                 ),
             );
-            write_expression(ctx, out, indent + 3, &assignment.expression);
+            write_expression(out, indent + 3, &assignment.expression);
         }
     }
     // Only decks with `.func` cards get the section, so other snapshots keep
@@ -627,14 +644,14 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
             let parameters: Vec<String> = card
                 .parameters
                 .iter()
-                .map(|p| format!("{}@{}", quote(&p.name), ctx.span(&p.span)))
+                .map(|p| format!("{}@{}", quote(&p.name), Ctx::span(&p.span)))
                 .collect();
             out.line(
                 indent + 1,
                 format!(
                     "func [{n}] name={} name_span={} parameters=[{}]{} @{}",
                     quote(&card.name),
-                    ctx.span(&card.name_span),
+                    Ctx::span(&card.name_span),
                     parameters.join(", "),
                     // Printed only for the `.param` spelling, so `.func`
                     // snapshots keep their shape.
@@ -646,9 +663,12 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
                     ctx.loc(&card.location)
                 ),
             );
-            write_expression(ctx, out, indent + 2, &card.body);
+            write_expression(out, indent + 2, &card.body);
         }
     }
+}
+
+fn write_scope_options(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
     section(out, indent, "options", scope.options.len());
     for (n, card) in scope.options.iter().enumerate() {
         out.line(
@@ -659,7 +679,7 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
             let value = setting
                 .value
                 .as_ref()
-                .map_or("flag".to_owned(), |v| positioned(ctx, v));
+                .map_or_else(|| "flag".to_owned(), |v| positioned(ctx, v));
             out.line(
                 indent + 2,
                 format!(
@@ -669,7 +689,7 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
                 ),
             );
             if let Some(expression) = &setting.expression {
-                write_expression(ctx, out, indent + 3, expression);
+                write_expression(out, indent + 3, expression);
             }
         }
     }
@@ -690,6 +710,9 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
             );
         }
     }
+}
+
+fn write_scope_hints(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
     for (name, label, cards) in [
         ("initial-conditions", "ic-card", scope.initial_conditions),
         ("nodesets", "nodeset-card", scope.nodesets),
@@ -730,7 +753,7 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
                             indent + 3,
                             format!("value expression @{}", ctx.loc(&hint.value_location)),
                         );
-                        write_expression(ctx, out, indent + 4, expression);
+                        write_expression(out, indent + 4, expression);
                     }
                 }
             }
@@ -792,7 +815,7 @@ fn write_device(ctx: &Ctx<'_>, out: &mut Out, indent: usize, n: usize, device: &
             device
                 .model
                 .as_ref()
-                .map_or("none".to_owned(), |m| quote(m))
+                .map_or_else(|| "none".to_owned(), |m| quote(m))
         ),
     );
     write_parameters(ctx, out, indent + 1, &device.parameters);
@@ -803,7 +826,7 @@ fn positioned(ctx: &Ctx<'_>, value: &PositionedValue) -> String {
 }
 
 fn optional(ctx: &Ctx<'_>, value: Option<&PositionedValue>) -> String {
-    value.map_or("none".to_owned(), |v| positioned(ctx, v))
+    value.map_or_else(|| "none".to_owned(), |v| positioned(ctx, v))
 }
 
 fn write_parameters(
@@ -835,7 +858,7 @@ fn write_parameters(
         );
         match &parameter.kind {
             ParameterKind::Expression(expression) => {
-                write_expression(ctx, out, indent + 2, expression);
+                write_expression(out, indent + 2, expression);
             }
             ParameterKind::Behavioural(expression) => {
                 out.line(
@@ -848,10 +871,10 @@ fn write_parameters(
                             ""
                         },
                         quote(&expression.text),
-                        ctx.span(&expression.span)
+                        Ctx::span(&expression.span)
                     ),
                 );
-                write_bexpr(ctx, out, indent + 3, &expression.root);
+                write_bexpr(out, indent + 3, &expression.root);
             }
             ParameterKind::InitialConditions(components) => {
                 for component in components {
@@ -865,59 +888,8 @@ fn write_parameters(
                     );
                 }
             }
-            ParameterKind::Waveform(SourceWaveform::Pulse(pulse)) => {
-                out.line(indent + 2, "pulse");
-                out.line(
-                    indent + 3,
-                    format!("initial: {}", positioned(ctx, &pulse.initial)),
-                );
-                out.line(
-                    indent + 3,
-                    format!("pulsed: {}", positioned(ctx, &pulse.pulsed)),
-                );
-                out.line(
-                    indent + 3,
-                    format!("delay: {}", optional(ctx, pulse.delay.as_ref())),
-                );
-                out.line(
-                    indent + 3,
-                    format!("rise: {}", optional(ctx, pulse.rise.as_ref())),
-                );
-                out.line(
-                    indent + 3,
-                    format!("fall: {}", optional(ctx, pulse.fall.as_ref())),
-                );
-                out.line(
-                    indent + 3,
-                    format!("width: {}", optional(ctx, pulse.width.as_ref())),
-                );
-                out.line(
-                    indent + 3,
-                    format!("period: {}", optional(ctx, pulse.period.as_ref())),
-                );
-                // Only printed when supplied, so seven-field snapshots are stable.
-                if let Some(count) = &pulse.count {
-                    out.line(indent + 3, format!("count: {}", positioned(ctx, count)));
-                }
-            }
-            ParameterKind::Waveform(SourceWaveform::Function(function)) => {
-                out.line(indent + 2, function.function.keyword());
-                for (name, value) in function.function.fields().iter().zip(&function.values) {
-                    out.line(indent + 3, format!("{name}: {}", positioned(ctx, value)));
-                }
-            }
-            ParameterKind::Waveform(SourceWaveform::Pwl(points)) => {
-                out.line(indent + 2, "pwl");
-                for (m, point) in points.iter().enumerate() {
-                    out.line(
-                        indent + 3,
-                        format!(
-                            "point [{m}] time={} value={}",
-                            positioned(ctx, &point.time),
-                            positioned(ctx, &point.value)
-                        ),
-                    );
-                }
+            ParameterKind::Waveform(waveform) => {
+                write_waveform(ctx, out, indent + 2, waveform);
             }
             ParameterKind::Scalar
             | ParameterKind::Textual
@@ -927,7 +899,66 @@ fn write_parameters(
     }
 }
 
-fn write_expression(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expression: &ParameterExpression) {
+fn write_waveform(ctx: &Ctx<'_>, out: &mut Out, indent: usize, waveform: &SourceWaveform) {
+    match waveform {
+        SourceWaveform::Pulse(pulse) => {
+            out.line(indent, "pulse");
+            out.line(
+                indent + 1,
+                format!("initial: {}", positioned(ctx, &pulse.initial)),
+            );
+            out.line(
+                indent + 1,
+                format!("pulsed: {}", positioned(ctx, &pulse.pulsed)),
+            );
+            out.line(
+                indent + 1,
+                format!("delay: {}", optional(ctx, pulse.delay.as_ref())),
+            );
+            out.line(
+                indent + 1,
+                format!("rise: {}", optional(ctx, pulse.rise.as_ref())),
+            );
+            out.line(
+                indent + 1,
+                format!("fall: {}", optional(ctx, pulse.fall.as_ref())),
+            );
+            out.line(
+                indent + 1,
+                format!("width: {}", optional(ctx, pulse.width.as_ref())),
+            );
+            out.line(
+                indent + 1,
+                format!("period: {}", optional(ctx, pulse.period.as_ref())),
+            );
+            // Only printed when supplied, so seven-field snapshots are stable.
+            if let Some(count) = &pulse.count {
+                out.line(indent + 1, format!("count: {}", positioned(ctx, count)));
+            }
+        }
+        SourceWaveform::Function(function) => {
+            out.line(indent, function.function.keyword());
+            for (name, value) in function.function.fields().iter().zip(&function.values) {
+                out.line(indent + 1, format!("{name}: {}", positioned(ctx, value)));
+            }
+        }
+        SourceWaveform::Pwl(points) => {
+            out.line(indent, "pwl");
+            for (m, point) in points.iter().enumerate() {
+                out.line(
+                    indent + 1,
+                    format!(
+                        "point [{m}] time={} value={}",
+                        positioned(ctx, &point.time),
+                        positioned(ctx, &point.value)
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn write_expression(out: &mut Out, indent: usize, expression: &ParameterExpression) {
     out.line(
         indent,
         format!(
@@ -939,14 +970,14 @@ fn write_expression(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expression: &Pa
                 ""
             },
             quote(&expression.text),
-            ctx.span(&expression.span)
+            Ctx::span(&expression.span)
         ),
     );
-    write_expr(ctx, out, indent + 1, &expression.root);
+    write_expr(out, indent + 1, &expression.root);
 }
 
-fn write_expr(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expr: &Expr) {
-    let span = ctx.span(&expr.span);
+fn write_expr(out: &mut Out, indent: usize, expr: &Expr) {
+    let span = Ctx::span(&expr.span);
     match &expr.kind {
         ExprKind::Number { value, spelling } => out.line(
             indent,
@@ -965,7 +996,7 @@ fn write_expr(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expr: &Expr) {
                 UnaryOp::Minus => "minus",
             };
             out.line(indent, format!("unary {op} span={span}"));
-            write_expr(ctx, out, indent + 1, operand);
+            write_expr(out, indent + 1, operand);
         }
         ExprKind::Binary { op, lhs, rhs } => {
             let op = match op {
@@ -976,8 +1007,8 @@ fn write_expr(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expr: &Expr) {
                 BinaryOp::Pow => "pow",
             };
             out.line(indent, format!("binary {op} span={span}"));
-            write_expr(ctx, out, indent + 1, lhs);
-            write_expr(ctx, out, indent + 1, rhs);
+            write_expr(out, indent + 1, lhs);
+            write_expr(out, indent + 1, rhs);
         }
         ExprKind::Call {
             function,
@@ -985,24 +1016,24 @@ fn write_expr(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expr: &Expr) {
         } => {
             out.line(indent, format!("call {} span={span}", function.name()));
             for argument in arguments {
-                write_expr(ctx, out, indent + 1, argument);
+                write_expr(out, indent + 1, argument);
             }
         }
         ExprKind::Group(inner) => {
             out.line(indent, format!("group span={span}"));
-            write_expr(ctx, out, indent + 1, inner);
+            write_expr(out, indent + 1, inner);
         }
         ExprKind::UserCall { name, arguments } => {
             out.line(indent, format!("user-call {} span={span}", quote(name)));
             for argument in arguments {
-                write_expr(ctx, out, indent + 1, argument);
+                write_expr(out, indent + 1, argument);
             }
         }
     }
 }
 
-fn write_bexpr(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expr: &BExpr) {
-    let span = ctx.span(&expr.span);
+fn write_bexpr(out: &mut Out, indent: usize, expr: &BExpr) {
+    let span = Ctx::span(&expr.span);
     match &expr.kind {
         BExprKind::Number { value, spelling } => out.line(
             indent,
@@ -1033,12 +1064,12 @@ fn write_bexpr(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expr: &BExpr) {
                 BUnaryOp::Not => "not",
             };
             out.line(indent, format!("unary {op} span={span}"));
-            write_bexpr(ctx, out, indent + 1, operand);
+            write_bexpr(out, indent + 1, operand);
         }
         BExprKind::Binary { op, lhs, rhs } => {
             out.line(indent, format!("binary {} span={span}", quote(op.symbol())));
-            write_bexpr(ctx, out, indent + 1, lhs);
-            write_bexpr(ctx, out, indent + 1, rhs);
+            write_bexpr(out, indent + 1, lhs);
+            write_bexpr(out, indent + 1, rhs);
         }
         BExprKind::Ternary {
             condition,
@@ -1046,33 +1077,33 @@ fn write_bexpr(ctx: &Ctx<'_>, out: &mut Out, indent: usize, expr: &BExpr) {
             otherwise,
         } => {
             out.line(indent, format!("ternary span={span}"));
-            write_bexpr(ctx, out, indent + 1, condition);
-            write_bexpr(ctx, out, indent + 1, then);
-            write_bexpr(ctx, out, indent + 1, otherwise);
+            write_bexpr(out, indent + 1, condition);
+            write_bexpr(out, indent + 1, then);
+            write_bexpr(out, indent + 1, otherwise);
         }
         BExprKind::Call { name, arguments } => {
             out.line(indent, format!("call {} span={span}", quote(name)));
             for argument in arguments {
-                write_bexpr(ctx, out, indent + 1, argument);
+                write_bexpr(out, indent + 1, argument);
             }
         }
         BExprKind::Group(inner) => {
             out.line(indent, format!("group span={span}"));
-            write_bexpr(ctx, out, indent + 1, inner);
+            write_bexpr(out, indent + 1, inner);
         }
         BExprKind::Value(value) => {
             out.line(indent, format!("value span={span}"));
-            write_expression(ctx, out, indent + 1, value);
+            write_expression(out, indent + 1, value);
         }
         BExprKind::Table(table) => {
             out.line(
                 indent,
                 format!("table domain={} span={span}", real(table.domain)),
             );
-            write_bexpr(ctx, out, indent + 1, &table.input);
+            write_bexpr(out, indent + 1, &table.input);
             for (x, y) in &table.points {
-                write_bexpr(ctx, out, indent + 1, x);
-                write_bexpr(ctx, out, indent + 1, y);
+                write_bexpr(out, indent + 1, x);
+                write_bexpr(out, indent + 1, y);
             }
         }
     }

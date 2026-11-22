@@ -139,11 +139,11 @@ impl CDeviceType {
 
 /// Which C model list a device instance belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct SetupKey {
+pub(crate) struct SetupKey<'a> {
     pub(crate) device_type: CDeviceType,
     /// The model name (lowercase, after subcircuit scoping), or `None` for
     /// the type's default model.
-    pub(crate) model: Option<String>,
+    pub(crate) model: Option<&'a str>,
     /// For an element `URCsetup` creates (`urcsetup.c`), the ordinal of its
     /// URC line: its model is created during setup, after every parsed one.
     pub(crate) generated_by: Option<usize>,
@@ -159,10 +159,10 @@ pub(crate) struct SetupKey {
 /// those models are newer than every parsed model, in the order the URC
 /// lines are set up; their instances are created (and prepended) in the
 /// order [`crate::devices::urc`] lists them.
-pub(crate) fn setup_order(keys: &[SetupKey]) -> Vec<usize> {
+pub(crate) fn setup_order(keys: &[SetupKey<'_>]) -> Vec<usize> {
     let traverse = |created: &[usize]| {
         let mut order: Vec<usize> = (0..keys.len()).collect();
-        order.sort_by(|&a, &b| {
+        order.sort_unstable_by(|&a, &b| {
             keys[a]
                 .device_type
                 .cmp(&keys[b].device_type)
@@ -181,10 +181,13 @@ pub(crate) fn setup_order(keys: &[SetupKey]) -> Vec<usize> {
         return traverse(&created);
     }
     // The URC lines' own setup order decides when their models are made.
-    let parsed = traverse(&created);
+    let mut ranks = vec![0; keys.len()];
+    for (rank, index) in traverse(&created).into_iter().enumerate() {
+        ranks[index] = rank;
+    }
     for (index, key) in keys.iter().enumerate() {
         if let Some(line) = key.generated_by {
-            let rank = parsed.iter().position(|&i| i == line).unwrap_or(line);
+            let rank = ranks.get(line).copied().unwrap_or(line);
             created[index] = keys.len() + rank;
         }
     }
@@ -279,10 +282,10 @@ impl MatrixSetup<'_> {
 mod tests {
     use super::*;
 
-    fn key(device_type: CDeviceType, model: Option<&str>) -> SetupKey {
+    fn key(device_type: CDeviceType, model: Option<&str>) -> SetupKey<'_> {
         SetupKey {
             device_type,
-            model: model.map(str::to_owned),
+            model,
             generated_by: None,
         }
     }
@@ -302,5 +305,22 @@ mod tests {
         // cap, then res models newest first: late (7), rm (2, 5), default
         // (1, 3), each instance list reversed; vsrc last.
         assert_eq!(setup_order(&keys), vec![4, 7, 5, 2, 3, 1, 6, 0]);
+    }
+    #[test]
+    fn generated_models_follow_urc_setup_creation_order() {
+        let mut keys = [
+            key(CDeviceType::Urc, Some("u")),
+            key(CDeviceType::Res, None),
+            key(CDeviceType::Urc, Some("u")),
+            key(CDeviceType::Res, Some("first#resmod")),
+            key(CDeviceType::Res, Some("second#resmod")),
+            key(CDeviceType::Res, Some("first#resmod")),
+        ];
+        keys[3].generated_by = Some(0);
+        keys[4].generated_by = Some(2);
+        keys[5].generated_by = Some(0);
+        // URCs are set up 2 then 0; the newer generated resistor model
+        // (line 0) precedes line 2, and both precede parsed resistor models.
+        assert_eq!(setup_order(&keys), vec![2, 0, 5, 3, 4, 1]);
     }
 }

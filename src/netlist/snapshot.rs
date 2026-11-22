@@ -33,7 +33,10 @@ fn walk(dir: &Path, prefix: &str, found: &mut Vec<String>) -> io::Result<()> {
         let relative = format!("{prefix}/{name}");
         if entry.file_type()?.is_dir() {
             walk(&entry.path(), &relative, found)?;
-        } else if name.ends_with(".cir") {
+        } else if Path::new(&name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cir"))
+        {
             found.push(relative);
         }
     }
@@ -58,7 +61,7 @@ pub fn discover_inputs(conformance: &Path) -> io::Result<Vec<String>> {
 ///
 /// # Errors
 ///
-/// Fails if an input cannot be read. Parse failures are not errors: they are
+/// Fails if an input cannot be read or decks map to the same snapshot. Parse failures are not errors: they are
 /// snapshotted as positioned error dumps.
 pub fn generate(conformance: &Path) -> io::Result<Vec<SnapshotFile>> {
     let root = conformance.canonicalize()?;
@@ -66,7 +69,9 @@ pub fn generate(conformance: &Path) -> io::Result<Vec<SnapshotFile>> {
     let mut files = Vec::new();
     for input in discover_inputs(&root)? {
         let path = root.join(&input);
-        let stem = input.strip_suffix(".cir").unwrap_or(&input);
+        let stem = input
+            .rsplit_once('.')
+            .map_or(input.as_str(), |(stem, _)| stem);
         let tokens = dump_tokens_file(&path, &root).map_err(io::Error::other)?;
         files.push(SnapshotFile {
             path: format!("tokens/{stem}.tokens"),
@@ -74,10 +79,16 @@ pub fn generate(conformance: &Path) -> io::Result<Vec<SnapshotFile>> {
         });
         files.push(SnapshotFile {
             path: format!("ast/{stem}.ast"),
-            contents: dump_ast_file(&parser, &path, &root),
+            contents: dump_ast_file(parser, &path, &root),
         });
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
+    if let Some(pair) = files.windows(2).find(|pair| pair[0].path == pair[1].path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("multiple decks map to snapshot {}", pair[0].path),
+        ));
+    }
     Ok(files)
 }
 

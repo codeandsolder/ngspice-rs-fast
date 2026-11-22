@@ -299,7 +299,7 @@ impl DcOptions {
 }
 
 /// One accepted option occurrence, kept in deck order for diagnostics.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedOption {
     /// Lowercased option name.
     pub name: String,
@@ -310,7 +310,7 @@ pub struct AppliedOption {
 }
 
 /// An accepted option occurrence that has no effect, with the C-based reason.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IgnoredOption {
     /// Lowercased option name.
     pub name: String,
@@ -320,6 +320,78 @@ pub struct IgnoredOption {
     pub reason: &'static str,
     /// Where the option name was written.
     pub location: SourceLoc,
+}
+
+/// The original option text and, when applicable, its evaluated expression.
+struct OptionInput<'a> {
+    setting: &'a OptionSetting,
+    evaluated: Option<Real>,
+}
+
+impl OptionInput<'_> {
+    fn number(&self, what: &str) -> SpiceResult<Real> {
+        let setting = self.setting;
+        let name = setting.name.as_str();
+        let value_location = setting
+            .value
+            .as_ref()
+            .map_or(&setting.location, |value| &value.location);
+        let parsed = match (self.evaluated, &setting.value) {
+            (Some(value), _) => Some(value),
+            (None, Some(value)) => parse_spice_number(&value.text),
+            (None, None) => None,
+        };
+        parsed.filter(|v| v.is_finite()).ok_or_else(|| {
+            SpiceError::parse(
+                value_location.clone(),
+                format!(
+                    "option '{name}' needs {what}, not '{}'",
+                    setting.value.as_ref().map_or("", |v| v.text.as_str())
+                ),
+            )
+        })
+    }
+
+    fn whole(&self, lowest: u32, highest: u32) -> SpiceResult<u32> {
+        let name = self.setting.name.as_str();
+        let value_location = self
+            .setting
+            .value
+            .as_ref()
+            .map_or(&self.setting.location, |value| &value.location);
+        let value = self.number("an integer")?;
+        integer_value(value)
+            .filter(|n| (lowest..=highest).contains(n))
+            .ok_or_else(|| {
+                SpiceError::parse(
+                    value_location.clone(),
+                    format!(
+                        "option '{name}' must be an integer in {lowest}..={highest}, not {value}"
+                    ),
+                )
+            })
+    }
+
+    fn whole_usize(&self, lowest: usize, highest: usize) -> SpiceResult<usize> {
+        let name = self.setting.name.as_str();
+        let value_location = self
+            .setting
+            .value
+            .as_ref()
+            .map_or(&self.setting.location, |value| &value.location);
+        let value = self.number("an integer")?;
+        integer_value(value)
+            .and_then(|count| usize::try_from(count).ok())
+            .filter(|count| (lowest..=highest).contains(count))
+            .ok_or_else(|| {
+                SpiceError::parse(
+                    value_location.clone(),
+                    format!(
+                        "option '{name}' must be an integer in {lowest}..={highest}, not {value}"
+                    ),
+                )
+            })
+    }
 }
 
 /// Resolved, validated run configuration for one deck.
@@ -383,7 +455,7 @@ impl RunConfig {
                 .flat_map(|card| &card.entries)
                 .filter_map(|entry| {
                     Some(NodeCondition {
-                        node: entry.node.to_string(),
+                        node: entry.node.clone(),
                         value: entry.literal()?,
                         location: entry.location.clone(),
                     })
@@ -406,13 +478,13 @@ impl RunConfig {
 
     /// Explicit Fourier front-end settings.
     #[must_use]
-    pub fn fourier_settings(&self) -> Option<crate::analysis::fourier::FourierSettings> {
+    pub const fn fourier_settings(&self) -> Option<crate::analysis::fourier::FourierSettings> {
         self.fourier
     }
 
     /// Rawfile encoding selected by the front-end `set filetype` variable.
     #[must_use]
-    pub fn raw_format(&self) -> Option<crate::analysis::RawFormat> {
+    pub const fn raw_format(&self) -> Option<crate::analysis::RawFormat> {
         self.raw_format
     }
 
@@ -512,8 +584,10 @@ impl RunConfig {
                 .iter()
                 .rev()
                 .find(|option| DC_OPTIONS.contains(&option.name.as_str()))
-                .map(|option| option.location.clone())
-                .unwrap_or_else(|| SourceLoc::new(std::path::PathBuf::from("<options>"), 0, 0));
+                .map_or_else(
+                    || SourceLoc::new(std::path::PathBuf::from("<options>"), 0, 0),
+                    |option| option.location.clone(),
+                );
             return Err(SpiceError::parse(location, error.to_string()));
         }
         let unknown = SourceLoc::new(std::path::PathBuf::from("<run overrides>"), 0, 0);
@@ -537,175 +611,14 @@ impl RunConfig {
         });
     }
 
-    /// Apply one setting; `evaluated` is the value of an expression setting.
+    /// Apply one setting; the input carries both its text and evaluated expression.
     fn apply(&mut self, setting: &OptionSetting, evaluated: Option<Real>) -> SpiceResult<()> {
+        let input = OptionInput { setting, evaluated };
+        if self.apply_ignored_option(&input)? || self.apply_frontend_option(&input)? {
+            return Ok(());
+        }
         let name = setting.name.as_str();
         let location = &setting.location;
-        // The value as a number: an evaluated expression, or the literal text.
-        let value_location = setting
-            .value
-            .as_ref()
-            .map_or(location, |value| &value.location);
-        let number = |what: &str| -> SpiceResult<Real> {
-            let parsed = match (evaluated, &setting.value) {
-                (Some(value), _) => Some(value),
-                (None, Some(value)) => parse_spice_number(&value.text),
-                (None, None) => None,
-            };
-            parsed.filter(|v| v.is_finite()).ok_or_else(|| {
-                SpiceError::parse(
-                    value_location.clone(),
-                    format!(
-                        "option '{name}' needs {what}, not '{}'",
-                        setting.value.as_ref().map_or("", |v| v.text.as_str())
-                    ),
-                )
-            })
-        };
-        let whole = |lowest: u32, highest: u32| -> SpiceResult<usize> {
-            let value = number("an integer")?;
-            integer_value(value)
-                .filter(|n| (lowest..=highest).contains(n))
-                .map(|n| n as usize)
-                .ok_or_else(|| {
-                    SpiceError::parse(
-                        value_location.clone(),
-                        format!("option '{name}' must be an integer in {lowest}..={highest}, not {value}"),
-                    )
-                })
-        };
-        if PRINT_FLAGS.contains(&name) {
-            if setting.value.is_some() {
-                return Err(SpiceError::parse(
-                    location.clone(),
-                    format!("option '{name}' is a flag and takes no value"),
-                ));
-            }
-            self.ignore(setting, PRINT_FLAG_REASON);
-            return Ok(());
-        }
-        if let Some((_, integral)) = IGNORED_BY_C.iter().find(|(n, _)| *n == name) {
-            if setting.value.is_none() {
-                return Err(SpiceError::parse(
-                    location.clone(),
-                    format!("option '{name}' requires a value"),
-                ));
-            }
-            if *integral {
-                whole(0, u32::MAX)?;
-            } else {
-                number("a finite number")?;
-            }
-            self.ignore(setting, IGNORED_BY_C_REASON);
-            return Ok(());
-        }
-        match name {
-            "nfreqs" | "nperiods" | "polydegree" | "fourgridsize" => {
-                let value = whole(
-                    if name == "polydegree" { 0 } else { 1 },
-                    match name {
-                        "nfreqs" => 101,
-                        "nperiods" => 100,
-                        "polydegree" => 16,
-                        _ => 100_000,
-                    },
-                )?;
-                let settings = self.fourier.get_or_insert_with(Default::default);
-                match name {
-                    "nfreqs" => settings.nfreqs = value as u32,
-                    "nperiods" => settings.nperiods = value as u32,
-                    "polydegree" => settings.polydegree = value as u32,
-                    _ => settings.gridsize = value as u32,
-                }
-                return Ok(());
-            }
-            "filetype" => {
-                self.raw_format = Some(match setting.value.as_ref().map(|v| v.text.as_str()) {
-                    Some("ascii") => crate::analysis::RawFormat::Ascii,
-                    Some("binary") => crate::analysis::RawFormat::Binary,
-                    _ => {
-                        return Err(SpiceError::parse(
-                            location.clone(),
-                            "filetype requires ascii or binary",
-                        ));
-                    }
-                });
-                return Ok(());
-            }
-            "sqrnoise" => {
-                if setting.value.is_some() {
-                    return Err(SpiceError::Unsupported {
-                        feature: "use the bare boolean set sqrnoise".into(),
-                        location: Some(location.clone()),
-                    });
-                }
-                self.squared_noise = true;
-                return Ok(());
-            }
-            "ngbehavior" => {
-                let value = setting.value.as_ref().map(|v| v.text.to_ascii_lowercase());
-                if value.as_deref() != Some("s3") {
-                    return Err(SpiceError::Unsupported {
-                        feature: "only ngbehavior=s3 for MOS1 noise compatibility is supported"
-                            .into(),
-                        location: Some(location.clone()),
-                    });
-                }
-                self.spice3_noise = true;
-                return Ok(());
-            }
-            "keepopinfo" => {
-                self.keep_op_info = setting.value.is_none() || number("0 or 1")? != 0.;
-                return Ok(());
-            }
-            "post" | "ingold" => {
-                self.ignore(setting, UNREAD_REASON);
-                return Ok(());
-            }
-            "indverbosity" => {
-                if setting.value.is_none() {
-                    return Err(SpiceError::parse(
-                        location.clone(),
-                        "option 'indverbosity' requires an integer value",
-                    ));
-                }
-                whole(0, u32::MAX)?;
-                self.ignore(setting, INDVERBOSITY_REASON);
-                return Ok(());
-            }
-            "noopiter" => {
-                if setting.value.is_some() {
-                    return Err(SpiceError::parse(
-                        location.clone(),
-                        "option 'noopiter' is a flag and takes no value",
-                    ));
-                }
-                self.dc.noopiter = true;
-                self.applied.push(AppliedOption {
-                    name: setting.name.clone(),
-                    value: String::new(),
-                    location: location.clone(),
-                });
-                return Ok(());
-            }
-            "bypass" => {
-                if setting.value.is_none() {
-                    return Err(SpiceError::parse(
-                        location.clone(),
-                        "option 'bypass' requires an integer value",
-                    ));
-                }
-                if whole(0, u32::MAX)? != 0 {
-                    return Err(SpiceError::not_yet_ported(
-                        format!("{location}: option 'bypass' other than 0 (device bypass)"),
-                        C_REFERENCE,
-                    ));
-                }
-                self.ignore(setting, BYPASS_REASON);
-                return Ok(());
-            }
-            _ => {}
-        }
         let supported = matches!(
             name,
             "temp"
@@ -759,6 +672,170 @@ impl RunConfig {
                 format!("option '{name}' requires a value"),
             ));
         };
+        if !self.apply_solver_control(&input, value)? {
+            self.apply_real_option(&input, value)?;
+        }
+        self.applied.push(AppliedOption {
+            name: setting.name.clone(),
+            value: value.text.clone(),
+            location: location.clone(),
+        });
+        Ok(())
+    }
+
+    /// Validate the accepted settings that C does not use for computation.
+    fn apply_ignored_option(&mut self, input: &OptionInput<'_>) -> SpiceResult<bool> {
+        let setting = input.setting;
+        let name = setting.name.as_str();
+        let location = &setting.location;
+        if PRINT_FLAGS.contains(&name) {
+            if setting.value.is_some() {
+                return Err(SpiceError::parse(
+                    location.clone(),
+                    format!("option '{name}' is a flag and takes no value"),
+                ));
+            }
+            self.ignore(setting, PRINT_FLAG_REASON);
+            return Ok(true);
+        }
+        if let Some((_, integral)) = IGNORED_BY_C.iter().find(|(n, _)| *n == name) {
+            if setting.value.is_none() {
+                return Err(SpiceError::parse(
+                    location.clone(),
+                    format!("option '{name}' requires a value"),
+                ));
+            }
+            if *integral {
+                input.whole(0, u32::MAX)?;
+            } else {
+                input.number("a finite number")?;
+            }
+            self.ignore(setting, IGNORED_BY_C_REASON);
+            return Ok(true);
+        }
+        match name {
+            "post" | "ingold" => {
+                self.ignore(setting, UNREAD_REASON);
+                Ok(true)
+            }
+            "indverbosity" => {
+                if setting.value.is_none() {
+                    return Err(SpiceError::parse(
+                        location.clone(),
+                        "option 'indverbosity' requires an integer value",
+                    ));
+                }
+                input.whole(0, u32::MAX)?;
+                self.ignore(setting, INDVERBOSITY_REASON);
+                Ok(true)
+            }
+            "bypass" => {
+                if setting.value.is_none() {
+                    return Err(SpiceError::parse(
+                        location.clone(),
+                        "option 'bypass' requires an integer value",
+                    ));
+                }
+                if input.whole(0, u32::MAX)? != 0 {
+                    return Err(SpiceError::not_yet_ported(
+                        format!("{location}: option 'bypass' other than 0 (device bypass)"),
+                        C_REFERENCE,
+                    ));
+                }
+                self.ignore(setting, BYPASS_REASON);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Resolve front-end analysis/output controls and the bare Newton skip flag.
+    fn apply_frontend_option(&mut self, input: &OptionInput<'_>) -> SpiceResult<bool> {
+        let setting = input.setting;
+        let name = setting.name.as_str();
+        let location = &setting.location;
+        match name {
+            "nfreqs" | "nperiods" | "polydegree" | "fourgridsize" => {
+                let value = input.whole(
+                    u32::from(name != "polydegree"),
+                    match name {
+                        "nfreqs" => 101,
+                        "nperiods" => 100,
+                        "polydegree" => 16,
+                        _ => 100_000,
+                    },
+                )?;
+                let settings = self.fourier.get_or_insert_with(Default::default);
+                match name {
+                    "nfreqs" => settings.nfreqs = value,
+                    "nperiods" => settings.nperiods = value,
+                    "polydegree" => settings.polydegree = value,
+                    _ => settings.gridsize = value,
+                }
+            }
+            "filetype" => {
+                self.raw_format = Some(match setting.value.as_ref().map(|v| v.text.as_str()) {
+                    Some("ascii") => crate::analysis::RawFormat::Ascii,
+                    Some("binary") => crate::analysis::RawFormat::Binary,
+                    _ => {
+                        return Err(SpiceError::parse(
+                            location.clone(),
+                            "filetype requires ascii or binary",
+                        ));
+                    }
+                });
+            }
+            "sqrnoise" => {
+                if setting.value.is_some() {
+                    return Err(SpiceError::Unsupported {
+                        feature: "use the bare boolean set sqrnoise".into(),
+                        location: Some(location.clone()),
+                    });
+                }
+                self.squared_noise = true;
+            }
+            "ngbehavior" => {
+                let value = setting.value.as_ref().map(|v| v.text.to_ascii_lowercase());
+                if value.as_deref() != Some("s3") {
+                    return Err(SpiceError::Unsupported {
+                        feature: "only ngbehavior=s3 for MOS1 noise compatibility is supported"
+                            .into(),
+                        location: Some(location.clone()),
+                    });
+                }
+                self.spice3_noise = true;
+            }
+            "keepopinfo" => {
+                self.keep_op_info = setting.value.is_none() || input.number("0 or 1")? != 0.;
+            }
+            "noopiter" => {
+                if setting.value.is_some() {
+                    return Err(SpiceError::parse(
+                        location.clone(),
+                        "option 'noopiter' is a flag and takes no value",
+                    ));
+                }
+                self.dc.noopiter = true;
+                self.applied.push(AppliedOption {
+                    name: setting.name.clone(),
+                    value: String::new(),
+                    location: location.clone(),
+                });
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Apply discrete solver controls and the continuation schedule.
+    fn apply_solver_control(
+        &mut self,
+        input: &OptionInput<'_>,
+        value: &crate::netlist::ast::PositionedValue,
+    ) -> SpiceResult<bool> {
+        let setting = input.setting;
+        let name = setting.name.as_str();
+        let location = &setting.location;
         match name {
             "method" => {
                 if IntegrationMethod::parse(&value.text, 2).is_none() {
@@ -773,7 +850,8 @@ impl RunConfig {
                 self.method = Some((value.text.to_ascii_lowercase(), location.clone()));
             }
             "maxord" => {
-                let order = number("an integer")
+                let order = input
+                    .number("an integer")
                     .ok()
                     .and_then(integer_value)
                     .and_then(|n| u8::try_from(n).ok())
@@ -793,7 +871,7 @@ impl RunConfig {
                 // niiter.c: `if (maxIter < 100) maxIter = 100;` applies to all
                 // three (CKTop, dctrcurv and dctran call NIiter with them), so
                 // C's effective limit is never below 100.
-                let written = whole(0, crate::analysis::newton::MAX_ITERATIONS as u32)?;
+                let written = input.whole_usize(0, crate::analysis::newton::MAX_ITERATIONS)?;
                 let count = written.max(NIITER_MIN_ITERATIONS);
                 match name {
                     "itl1" => self.dc.itl1 = Some(count),
@@ -807,14 +885,31 @@ impl RunConfig {
                 }
             }
             "srcsteps" | "itl6" => {
-                self.dc.srcsteps = Some(whole(0, crate::analysis::bias::MAX_SOURCE_STEPS as u32)?);
+                self.dc.srcsteps =
+                    Some(input.whole_usize(0, crate::analysis::bias::MAX_SOURCE_STEPS)?);
             }
             "gminsteps" => {
-                self.dc.gminsteps = Some(whole(0, crate::analysis::bias::MAX_GMIN_STAGES as u32)?);
+                self.dc.gminsteps =
+                    Some(input.whole_usize(0, crate::analysis::bias::MAX_GMIN_STAGES)?);
             }
-            "gminfactor" => self.dc.gminfactor = Some(number("a finite number")?),
+            "gminfactor" => self.dc.gminfactor = Some(input.number("a finite number")?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Apply finite real-valued solver and temperature options.
+    fn apply_real_option(
+        &mut self,
+        input: &OptionInput<'_>,
+        value: &crate::netlist::ast::PositionedValue,
+    ) -> SpiceResult<()> {
+        let setting = input.setting;
+        let name = setting.name.as_str();
+        let location = &setting.location;
+        match name {
             "xmu" => {
-                let xmu = number("a finite number")?;
+                let xmu = input.number("a finite number")?;
                 if !(0. ..=0.5).contains(&xmu) {
                     return Err(SpiceError::parse(
                         value.location.clone(),
@@ -824,7 +919,7 @@ impl RunConfig {
                 self.transient.xmu = Some(xmu);
             }
             "gmin" => {
-                let gmin = number("a finite number")?;
+                let gmin = input.number("a finite number")?;
                 if gmin < 0. {
                     return Err(SpiceError::parse(
                         value.location.clone(),
@@ -835,7 +930,7 @@ impl RunConfig {
             }
             "pivtol" | "pivrel" => {
                 let mut pivot = self.context.pivot;
-                let number = number("a finite number")?;
+                let number = input.number("a finite number")?;
                 if name == "pivtol" {
                     pivot.absolute = number;
                 } else {
@@ -848,14 +943,15 @@ impl RunConfig {
                 self.context.pivot = pivot;
             }
             "temp" => {
-                self.context.temperature = temperature(number("a finite number")?, location, name)?;
+                self.context.temperature =
+                    temperature(input.number("a finite number")?, location, name)?;
             }
             "tnom" => {
                 self.context.nominal_temperature =
-                    temperature(number("a finite number")?, location, name)?;
+                    temperature(input.number("a finite number")?, location, name)?;
             }
             _ => {
-                let number = number("a finite number")?;
+                let number = input.number("a finite number")?;
                 if number <= 0. {
                     return Err(SpiceError::parse(
                         location.clone(),
@@ -871,11 +967,6 @@ impl RunConfig {
                 }
             }
         }
-        self.applied.push(AppliedOption {
-            name: setting.name.clone(),
-            value: value.text.clone(),
-            location: location.clone(),
-        });
         Ok(())
     }
 
@@ -979,8 +1070,8 @@ impl RunConfig {
     /// If the stored `method`/`maxord` pair no longer parses; deck parsing has
     /// already validated it.
     pub fn request(&self, mut request: AnalysisRequest) -> SpiceResult<AnalysisRequest> {
-        request.squared_noise |= self.squared_noise;
-        request.spice3_noise |= self.spice3_noise;
+        request.noise.squared |= self.squared_noise;
+        request.noise.spice3 |= self.spice3_noise;
         request.keep_op_info |= self.keep_op_info;
         // Deck-level hints travel with every request (explicit request entries
         // win); each driver validates them against its circuit.
@@ -1023,9 +1114,14 @@ impl RunConfig {
             }
             return Ok(request);
         }
-        if let Some((name, _)) = &self.method {
+        if let Some((name, location)) = &self.method {
             let order = self.maxord.as_ref().map_or(2, |(order, _)| *order);
-            let method = IntegrationMethod::parse(name, order).expect("validated at parse");
+            let method = IntegrationMethod::parse(name, order).ok_or_else(|| {
+                SpiceError::parse(
+                    location.clone(),
+                    format!("invalid integration method '{name}'"),
+                )
+            })?;
             method.validate_runtime()?;
             if request.named("method").is_none() {
                 request.arguments.push(format!("method={name}"));

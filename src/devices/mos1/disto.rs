@@ -17,6 +17,17 @@
 //!   from the first-order `H1(f1)` vector (a C defect, reproduced through
 //!   [`DistortionTerm::with_first_order_im3_kernel`]).
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::float_cmp,
+    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::devices::distortion::{
     Control, DeviceDistortion, DistortionContext, DistortionTerm, Response, Taylor,
 };
@@ -37,7 +48,14 @@ fn grading_power(arg: Real, grading: Real) -> Real {
 impl Mos1 {
     /// The `mos1dset.c` terms at the operating point (see the module
     /// documentation).
-    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the reference numerical routine in the original statement and rounding order"
+    )]
+    #[expect(
+        clippy::similar_names,
+        reason = "related reference equation variables retain their distinct C names"
+    )]
     pub(super) fn distortion_terms(
         &self,
         context: &DistortionContext<'_>,
@@ -78,19 +96,19 @@ impl Mos1 {
         let (sarg, dvon, d2von, d3von);
         if vbx <= 0. {
             sarg = (phi - vbx).sqrt();
-            if -gamma != 0. {
+            if -gamma == 0. {
+                (dvon, d2von, d3von) = (0., 0., 0.);
+            } else {
                 let d1 = -gamma * 0.5 / sarg;
                 let d2 = -d1 * 0.5 / (sarg * sarg);
                 (dvon, d2von, d3von) = (d1, d2, 1.5 * d2 / (sarg * sarg));
-            } else {
-                (dvon, d2von, d3von) = (0., 0., 0.);
             }
         } else {
             let root = phi.sqrt();
-            let d1 = if gamma != 0. {
-                -gamma / (root + root)
-            } else {
+            let d1 = if gamma == 0. {
                 0.
+            } else {
+                -gamma / (root + root)
             };
             let s = (root - vbx / (root + root)).max(0.);
             sarg = s;

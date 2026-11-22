@@ -19,10 +19,10 @@
 //! where `<fundamental-frequency>` is a finite, strictly positive literal
 //! (`1k`, `2.5e3`) or a braced/quoted numparam expression (Rust extension),
 //! `<n>` is a whole number of harmonics in
-//! `1..=`[`MAX_HARMONICS`], `<vector>` is the `.save`/`.print` spelling of one
+//! 1 through [`MAX_HARMONICS`] inclusive, `<vector>` is the `.save`/`.print` spelling of one
 //! vector (`v(node)`, `v(first,second)`, `i(source|inductor|E|H)`) without `all`,
 //! and `HARMONICS=` may be written anywhere after the frequency. Without
-//! `HARMONICS=` the card tabulates harmonics `1..=`[`DEFAULT_HARMONICS`].
+//! `HARMONICS=` the card tabulates harmonics 1 through [`DEFAULT_HARMONICS`].
 //!
 //! Everything else is a positioned failure rather than a dropped card:
 //!
@@ -242,12 +242,10 @@ fn harmonics_value(input: &mut Input<'_>, at: &SourceLoc) -> Result<u32> {
                     ),
                 ));
             }
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let harmonics = number as u32;
-            if harmonics > MAX_HARMONICS {
+            if number > f64::from(MAX_HARMONICS) {
                 return Err(ErrMode::Cut(Failure(SpiceError::Unsupported {
                     feature: format!(
-                        "HARMONICS={harmonics}: this port resamples the period onto 4 * max(n, 50) \
+                        "HARMONICS={number}: this port resamples the period onto 4 * max(n, 50) \
                          subintervals per vector, so its bounded Fourier budget is {MAX_HARMONICS} \
                          harmonics ({MAX_GRID} grid subintervals); C has no such bound \
                          (docs/port/FOURIER.md)"
@@ -255,7 +253,15 @@ fn harmonics_value(input: &mut Input<'_>, at: &SourceLoc) -> Result<u32> {
                     location: Some(value.location),
                 })));
             }
-            Ok(harmonics)
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "finite integral harmonic count was checked against MAX_HARMONICS"
+            )]
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "harmonic count was checked to be at least one"
+            )]
+            Ok(number as u32)
         }
         _ if super::expression::is_expression_token(&value) => Err(gap(
             &value.location,

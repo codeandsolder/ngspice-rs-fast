@@ -1,7 +1,24 @@
 //! Shared classic-MOS sensitivity lifecycle. Each level supplies its own
 //! `mosX.c` tables, model fields and `mosXtemp.c` process stores.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::similar_names,
+    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
+)]
+#![expect(
+    clippy::many_single_char_names,
+    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
+use super::surface::{Surface, SurfaceCard};
 use super::{CELSIUS_TO_KELVIN, Common, MosLevel, Mosfet};
 use crate::devices::ModelContext;
+use crate::devices::nonlinear::thermal::TemperatureCache;
 use crate::devices::sensitivity::{
     AcReset, DeviceSensitivity, ParameterScope, RecordPair, ResetStamp, ResetStamps,
     SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
@@ -9,11 +26,10 @@ use crate::devices::sensitivity::{
 };
 use crate::devices::{Device, LinearContext, StampContext};
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
-use std::cell::OnceCell;
 
 /// Level-owned model record mapping. `derived` selects the already-stored
 /// process fields rather than recomputing them in the replacement's load.
-pub(crate) trait SensitivityLevel: MosLevel {
+pub(in crate::devices) trait SensitivityLevel: MosLevel {
     const FAMILY: SensitivityFamily;
     const MODEL: &'static [P];
     const INSTANCE: &'static [P];
@@ -34,7 +50,7 @@ pub(crate) trait SensitivityLevel: MosLevel {
 }
 
 /// `mosX.c`: levels 2/3/9 make IC voltages AC-only; level 1 does not.
-pub(crate) const INSTANCE: &[P] = &[
+pub(in crate::devices) const INSTANCE: &[P] = &[
     P::dc("m"),
     P::dc("l"),
     P::dc("w"),
@@ -52,7 +68,7 @@ pub(crate) const INSTANCE: &[P] = &[
 ];
 
 /// Common `mosXset.c` fields, retaining optional resistance flags.
-pub(crate) fn record_common(c: &Common, context: &ModelContext) -> Record {
+pub(in crate::devices) fn record_common(c: &Common, context: &ModelContext) -> Record {
     let mut record = Record::new();
     for (k, value, given) in [
         ("rd", c.rd.unwrap_or(0.), c.rd.is_some()),
@@ -90,7 +106,7 @@ pub(crate) fn record_common(c: &Common, context: &ModelContext) -> Record {
 }
 
 /// The common fields read by `mosXtemp.c` and `mosXload.c`.
-pub(crate) fn update_common(c: &mut Common, r: &Record) -> SpiceResult<()> {
+pub(in crate::devices) fn update_common(c: &mut Common, r: &Record) -> SpiceResult<()> {
     c.rd = optional(r, "rd", false)?;
     c.rs = optional(r, "rs", false)?;
     c.rsh = optional(r, "rsh", false)?;
@@ -113,15 +129,57 @@ pub(crate) fn update_common(c: &mut Common, r: &Record) -> SpiceResult<()> {
     Ok(())
 }
 
+/// The surface-process card's sensitivity record, excluding TPG (not
+/// exposed as a C sensitivity parameter).
+impl SurfaceCard {
+    pub(in crate::devices) fn record(self, mut record: Record) -> Record {
+        for (keyword, field, default) in [
+            ("vto", self.vto, 0.),
+            ("gamma", self.gamma, 0.),
+            ("phi", self.phi, 0.6),
+            ("nsub", self.nsub, 0.),
+            ("nss", self.nss, 0.),
+        ] {
+            record = record.with(keyword, field.unwrap_or(default), field.is_some());
+        }
+        record
+    }
+
+    pub(in crate::devices) fn update(&mut self, record: &Record, derived: bool) -> SpiceResult<()> {
+        self.vto = optional(record, "vto", derived)?;
+        self.gamma = optional(record, "gamma", derived)?;
+        self.phi = optional(record, "phi", derived)?;
+        self.nsub = optional(record, "nsub", false)?;
+        self.nss = optional(record, "nss", false)?;
+        Ok(())
+    }
+}
+
+impl Surface {
+    pub(in crate::devices) fn store(self, record: &mut Record) -> SpiceResult<()> {
+        for (keyword, value) in [("vto", self.vto), ("gamma", self.gamma), ("phi", self.phi)] {
+            record.store(keyword, value)?;
+        }
+        Ok(())
+    }
+}
+
 /// C's field value with the setter flag, or an already-derived field.
-pub(crate) fn optional(r: &Record, k: &str, derived: bool) -> SpiceResult<Option<Real>> {
+pub(in crate::devices) fn optional(
+    r: &Record,
+    k: &str,
+    derived: bool,
+) -> SpiceResult<Option<Real>> {
     (derived || r.given(k)).then(|| r.value(k)).transpose()
 }
 
 /// `mosXset.c` resets process defaults on every visit until restored/given.
 /// `gain` names the level's conductance setter default; `mos2set.c`, unlike
 /// levels 1/3/9 (`transconductance`) and 6 (`kc`), has none of its own.
-pub(crate) fn setup_process(r: &mut Record, gain: Option<(&str, Real)>) -> SpiceResult<()> {
+pub(in crate::devices) fn setup_process(
+    r: &mut Record,
+    gain: Option<(&str, Real)>,
+) -> SpiceResult<()> {
     let fields = [
         ("vto", 0.),
         (gain.map_or("", |(k, _)| k), gain.map_or(0., |(_, v)| v)),
@@ -138,7 +196,7 @@ pub(crate) fn setup_process(r: &mut Record, gain: Option<(&str, Real)>) -> Spice
 }
 
 #[derive(Debug)]
-pub(crate) struct MosSensitivity<'a, L: SensitivityLevel> {
+pub(in crate::devices) struct MosSensitivity<'a, L: SensitivityLevel> {
     pub(crate) device: &'a Mosfet<L>,
     pub(crate) context: ModelContext,
 }
@@ -310,7 +368,7 @@ impl<L: SensitivityLevel> MosSensitivity<'_, L> {
             geometry: d.geometry,
             series: d.series,
             initial: d.initial.clone(),
-            derived: OnceCell::new(),
+            derived: TemperatureCache::new(),
         }
     }
 
@@ -336,11 +394,11 @@ impl<L: SensitivityLevel> MosSensitivity<'_, L> {
         let c = model.common();
         let conductance = |resistance: Option<Real>, squares: Real| match resistance {
             Some(0.) => 0.,
-            Some(r) => geometry.m / r,
+            Some(r) => L::MULTIPLICITY.storage(geometry.m) / r,
             None => c
                 .rsh
                 .filter(|r| *r != 0.)
-                .map_or(0., |r| geometry.m / (r * squares)),
+                .map_or(0., |r| L::MULTIPLICITY.storage(geometry.m) / (r * squares)),
         };
         let series = [
             conductance(c.rd, geometry.nrd),
@@ -355,7 +413,7 @@ impl<L: SensitivityLevel> MosSensitivity<'_, L> {
             geometry,
             series,
             initial: self.device.initial.clone(),
-            derived: OnceCell::new(),
+            derived: TemperatureCache::new(),
         })
     }
 }
@@ -405,8 +463,7 @@ impl<L: MosLevel> Device for ResetMosfet<L> {
         let model = context.model_context;
         let state = &self.state;
         let op = state.operating(model)?;
-        let e =
-            state.small_signal_eval(&op, |_| 0., L::junction_gmin(model.gmin, &state.geometry))?;
+        let e = state.small_signal_eval(&op, |_| 0., model.gmin)?;
         let overlap = self.current.operating(model)?.overlap;
         let omega = self.omega;
         // `state0 + state0 + overlap` with zero Meyer halves.
@@ -424,7 +481,7 @@ impl<L: MosLevel> Device for ResetMosfet<L> {
                             .and_then(|r| bias.get(r))
                             .unwrap_or(0.)
                     },
-                    L::junction_gmin(model.gmin, &device.geometry),
+                    model.gmin,
                 )?;
                 (e.capbd, e.capbs)
             }

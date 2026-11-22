@@ -31,6 +31,25 @@
 //! phase itself (`PTF`) is rejected at instantiation, so the delayed `vbe`
 //! control equals `vbe`.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::similar_names,
+    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
+)]
+#![expect(
+    clippy::float_cmp,
+    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
+)]
+#![expect(
+    clippy::many_single_char_names,
+    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::devices::distortion::deriv::Dderivs;
 use crate::devices::distortion::{
     Control, DeviceDistortion, DistortionContext, DistortionTerm, Response, Taylor,
@@ -83,7 +102,10 @@ fn depletion(cz: Real, pot: Real, m: Real, v: Real) -> (Real, Real) {
 impl Bjt {
     /// The `bjtdset.c` terms at the operating point (see the module
     /// documentation).
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the reference numerical routine in the original statement and rounding order"
+    )]
     pub(super) fn distortion_terms(
         &self,
         context: &DistortionContext<'_>,
@@ -312,36 +334,36 @@ impl Bjt {
             d_cbe.d1_p = gbe;
             d_cbe.d2_p2 = gbe2;
             d_cbe.d3_p3 = gbe3;
-            let d_tff = if xtf != 0. {
-                let d_dummy = if ovtf != 0. {
+            let d_tff = if xtf == 0. {
+                Dderivs {
+                    value: tf,
+                    ..Dderivs::default()
+                }
+            } else {
+                let d_dummy = if ovtf == 0. {
+                    Dderivs {
+                        value: 1.,
+                        ..Dderivs::default()
+                    }
+                } else {
                     let mut d = d_q;
                     d.value = vbc * ovtf;
                     d.d1_q = ovtf;
                     d.exp()
-                } else {
-                    let mut d = d_p;
-                    d.value = 1.0;
-                    d.d1_p = 0.0;
-                    d
                 };
-                let d_dummy2 = if xjtf != 0. {
+                let d_dummy2 = if xjtf == 0. {
+                    Dderivs {
+                        value: 1.,
+                        ..Dderivs::default()
+                    }
+                } else {
                     let mut d = d_cbe;
                     d.value += xjtf;
                     let d = d_cbe.div(&d);
                     d.mul(&d)
-                } else {
-                    let mut d = d_p;
-                    d.value = 1.0;
-                    d.d1_p = 0.0;
-                    d
                 };
                 let mut d = d_dummy.mul(&d_dummy2).times(tf * xtf);
                 d.value += tf;
-                d
-            } else {
-                let mut d = d_p;
-                d.value = tf;
-                d.d1_p = 0.0;
                 d
             };
             d_tff.div(&d_qb).mul(&d_cbe)
@@ -352,11 +374,11 @@ impl Bjt {
             d
         };
         let czbe = t.cje * self.instance.area * m;
-        let (pe, xme) = (t.vje, t.mje);
-        let (capbe2, capbe3) = if vbe < t.fc_vje {
+        let (pe, xme) = (t.be.potential, t.be.grading);
+        let (capbe2, capbe3) = if vbe < t.be.threshold {
             depletion(czbe, pe, xme, vbe)
         } else {
-            (0.5 * xme * (czbe / t.f2) / pe, 0.)
+            (0.5 * xme * (czbe / t.be.f2) / pe, 0.)
         };
         d_qbe.d2_p2 += capbe2 * 2.;
         d_qbe.d3_p3 += capbe3 * 6.;
@@ -365,12 +387,12 @@ impl Bjt {
         let ctot = t.cjc * m;
         let czbc = ctot * t.xcjc;
         let czbx = ctot - czbc;
-        let (pc, xmc) = (t.vjc, t.mjc);
+        let (pc, xmc) = (t.bc.potential, t.bc.grading);
         let collector = |cz: Real, v: Real| {
-            if v < t.fc_vjc {
+            if v < t.bc.threshold {
                 depletion(cz, pc, xmc, v)
             } else {
-                (0.5 * xmc * (cz / t.f6) / pc, 0.)
+                (0.5 * xmc * (cz / t.bc.f2) / pc, 0.)
             }
         };
         let (capbc2, capbc3) = collector(czbc, vbc);

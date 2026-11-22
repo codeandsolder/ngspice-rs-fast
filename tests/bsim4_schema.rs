@@ -268,6 +268,19 @@ fn setter_conversions_follow_c_thresholds_and_integer_rounding() {
         Value::Integer(-1)
     );
     assert_eq!(instance.get("min").unwrap().value, Value::Integer(-2));
+    // C IF_INTEGER accepts the asymmetric signed minimum; all integer
+    // setters use the same checked conversion and reject either overflow.
+    for (number, expected) in [("-2147483648", i32::MIN), ("2147483647", i32::MAX)] {
+        let (edge, _) = inputs(&format!("rdsmod={number}"), "").unwrap();
+        assert_eq!(
+            edge.inputs.get("rdsmod").unwrap().value,
+            Value::Integer(expected),
+            "rdsmod={number}"
+        );
+    }
+    for outside in ["-2147483649", "2147483648"] {
+        assert!(inputs(&format!("rdsmod={outside}"), "").is_err());
+    }
 }
 
 #[test]

@@ -55,7 +55,7 @@ const CSW: &[P] = &[P::dc("it"), P::dc("ih"), P::dc("ron"), P::dc("roff")];
 
 /// A B source's `.sens` description.
 #[derive(Debug)]
-pub(crate) struct BehaviouralSensitivity<'a> {
+pub(in crate::devices) struct BehaviouralSensitivity<'a> {
     source: &'a Behavioural,
     circuit_kelvin: Real,
 }
@@ -96,7 +96,7 @@ impl DeviceSensitivity for BehaviouralSensitivity<'_> {
             .with("dtemp", scale.dtemp, scale.dtemp != 0.)
             .with("tc1", scale.tc1, scale.tc1 != 0.)
             .with("tc2", scale.tc2, scale.tc2 != 0.)
-            .with("m", scale.m, scale.m != 1.);
+            .with("m", scale.m, !matches!(scale.m, 1.));
         let mut model = SensitivityRecord::new();
         self.temperature(&mut model, &mut instance)?;
         Ok((model, instance))
@@ -213,20 +213,20 @@ impl DeviceSensitivity for BehaviouralSensitivity<'_> {
 
 /// An S or W switch's `.sens` description.
 #[derive(Debug)]
-pub(crate) struct SwitchSensitivity<'a> {
+pub(in crate::devices) struct SwitchSensitivity<'a> {
     switch: &'a Switch,
     gmin: Real,
 }
 
 impl<'a> SwitchSensitivity<'a> {
-    pub(crate) fn new(switch: &'a Switch, context: &crate::devices::ModelContext) -> Self {
+    pub(crate) const fn new(switch: &'a Switch, context: &crate::devices::ModelContext) -> Self {
         Self {
             switch,
             gmin: context.gmin,
         }
     }
 
-    fn keys(&self) -> (&'static str, &'static str) {
+    const fn keys(&self) -> (&'static str, &'static str) {
         match self.switch.kind() {
             SwitchKind::Voltage => ("vt", "vh"),
             SwitchKind::Current => ("it", "ih"),
@@ -303,8 +303,7 @@ impl DeviceSensitivity for SwitchSensitivity<'_> {
         model: &mut SensitivityRecord,
         _instance: &mut SensitivityRecord,
     ) -> SpiceResult<()> {
-        let (threshold, hysteresis) = self.keys();
-        for keyword in [threshold, hysteresis] {
+        for keyword in <[&str; 2]>::from(self.keys()) {
             if !model.given(keyword) {
                 model.store(keyword, 0.)?;
             }
@@ -378,7 +377,7 @@ impl DeviceSensitivity for SwitchSensitivity<'_> {
 /// C's `MUTfactor` (`factor`) and the mirrored inductances and branch rows
 /// of its inductors ([`DeviceSensitivity::coupled_inductors`]).
 #[derive(Debug)]
-pub(crate) struct MutualSensitivity<'a> {
+pub(in crate::devices) struct MutualSensitivity<'a> {
     coupling: &'a MutualInductance,
 }
 
@@ -466,14 +465,12 @@ impl DeviceSensitivity for MutualSensitivity<'_> {
         let factor = i.value("factor")?;
         let row = |keyword: &str| -> SpiceResult<usize> {
             let value = i.value(keyword)?;
-            if value >= 0. && value.fract() == 0. {
-                Ok(value as usize)
-            } else {
-                Err(SpiceError::circuit(format!(
+            crate::primitives::exact_nonnegative_integer::<usize>(value).ok_or_else(|| {
+                SpiceError::circuit(format!(
                     "{}: unbound inductor branch row",
                     self.coupling.name()
-                )))
-            }
+                ))
+            })
         };
         let (row1, row2) = (row("row1")?, row("row2")?);
         let stamps = [(row1, row2), (row2, row1)]

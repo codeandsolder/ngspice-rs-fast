@@ -46,6 +46,14 @@ fn configured_fourier_recovers_multiple_periods_and_polynomial_interpolation() {
         .unwrap();
         let result = &results[0];
         assert_eq!(result.harmonics.len(), 4);
+        assert_eq!(
+            result
+                .harmonics
+                .iter()
+                .map(|harmonic| harmonic.order)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
         assert_eq!(result.divisions, 512);
         assert!((result.dc - 0.5).abs() < 1e-7);
         assert!((result.harmonics[0].amplitude - 1.).abs() < 4e-6);

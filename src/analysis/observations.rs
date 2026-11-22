@@ -43,7 +43,7 @@ pub fn requests(
             MeasureRequest::Deferred { template, .. } => measure(template, out),
             MeasureRequest::Parameter(_) => {}
             MeasureRequest::Find { operand, .. } | MeasureRequest::Statistic { operand, .. } => {
-                vector(operand, out)
+                vector(operand, out);
             }
             MeasureRequest::AtEvent {
                 operand, event: e, ..

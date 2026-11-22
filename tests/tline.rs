@@ -325,3 +325,59 @@ fn the_card_round_trips_through_the_writer() {
     let names: Vec<_> = line.parameters.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["zo", "ic", "v2", "td", "rel", "abs"]);
 }
+
+#[test]
+fn generated_node_collision_rolls_back_just_appended_nodes() {
+    use ngspice_rs::devices::tline::TransmissionLine;
+    use ngspice_rs::primitives::{NodeKind, NodeTable};
+    let parsed = netlist("t1 a 0 b 0 z0=50 td=1n").unwrap();
+    let mut nodes = NodeTable::default();
+    let collision = nodes.intern("t1#int2").unwrap();
+    nodes.set_kind(collision, NodeKind::Internal);
+    let before = nodes.nodes().to_vec();
+    let err = TransmissionLine::instantiate(&parsed.devices[0], &mut nodes).unwrap_err();
+    assert!(err.to_string().contains("collision"));
+    assert_eq!(nodes.nodes(), before);
+    for name in ["a", "b", "t1#i1", "t1#i2", "t1#int1"] {
+        assert!(nodes.get(name).is_none());
+    }
+}
+
+#[test]
+fn later_external_card_cannot_reuse_private_setup_node() {
+    use ngspice_rs::devices::ModelResolver;
+    let initial = netlist("rkeep keep 0 2k").unwrap();
+    let mut circuit = Circuit::from_netlist(&initial).unwrap();
+    let before_nodes = circuit.nodes().nodes().to_vec();
+    let before_unknowns = circuit.unknowns().clone();
+    let before_pattern = circuit.matrix_pattern().unwrap();
+    let mut parsed =
+        netlist("rfirst new 0 1k\nt1 a 0 b 0 z0=50 td=1n\nrlate t1#int2 0 1k").unwrap();
+    // Programmatic ASTs can preserve the case spelling of node references.
+    parsed.devices[2].nodes[0] = "T1#INT2".into();
+    let models = ModelResolver::new(&parsed.models).unwrap();
+    let error = circuit
+        .add_instances(&parsed.devices, &models, &ModelContext::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("collision: t1#int2"), "{error}");
+    assert_eq!(circuit.nodes().nodes(), before_nodes);
+    assert_eq!(circuit.device_count(), 1);
+    assert_eq!(circuit.unknowns(), &before_unknowns);
+    assert!(std::sync::Arc::ptr_eq(
+        &before_pattern,
+        &circuit.matrix_pattern().unwrap()
+    ));
+    // A subsequent valid append reuses the same node IDs/numbering.
+    parsed.devices[2].nodes[0] = "b".into();
+    circuit
+        .add_instances(&parsed.devices, &models, &ModelContext::default())
+        .unwrap();
+    circuit.finalize().unwrap();
+    assert_eq!(circuit.device_count(), 4);
+    let fresh = Circuit::from_netlist(
+        &netlist("rkeep keep 0 2k\nrfirst new 0 1k\nt1 a 0 b 0 z0=50 td=1n\nrlate b 0 1k").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(circuit.unknowns(), fresh.unknowns());
+    assert_eq!(circuit.unknown_names(), fresh.unknown_names());
+}

@@ -4,7 +4,7 @@
 //! or binds two signal nodes (the written reference terminals are ignored by
 //! C's Padé device). `txlsetup.c` constructs the Padé coefficients and
 //! `txlload.c` stamps DC or recursive-convolution transient equations.
-//! AC/SP are explicitly refused: C reuses TXLload with an unset delta.
+//! AC/SP are explicitly refused: C reuses `TXLload` with an unset delta.
 //! See `docs/port/TXL.md` for the compatibility boundaries.
 mod pade;
 mod transient;
@@ -110,7 +110,7 @@ pub(crate) fn fallback(
     instance: &DeviceInstance,
     nodes: &mut NodeTable,
     models: &ModelResolver<'_>,
-    deck_nodes: &BTreeSet<&str>,
+    deck_nodes: &BTreeSet<String>,
 ) -> SpiceResult<Option<Vec<Box<dyn Device>>>> {
     let resolved = models
         .resolve(instance)?
@@ -119,39 +119,40 @@ pub(crate) fn fallback(
     if !(m.r != 0. && m.l != 0. && m.r / m.l > 1.6e10) {
         return Ok(None);
     }
-    let mut staged = nodes.clone();
-    let terminals: Vec<_> = instance.nodes.iter().map(|s| staged.intern(s)).collect();
-    let mut line = vec![terminals[0]];
-    for k in 1..=2 {
-        let name = format!("txlnd{k}{}", instance.name);
-        if staged.get(&name).is_some() || deck_nodes.contains(name.as_str()) {
-            return Err(SpiceError::circuit(format!(
-                "TXL generated-node collision: {name}"
-            )));
+    crate::devices::factory::append_nodes(nodes, |nodes| {
+        let terminals: [NodeId; 4] = nodes.intern_array(&instance.nodes)?;
+        let mut line = [terminals[0], NodeId::GROUND, NodeId::GROUND, terminals[2]];
+        for (k, node) in line.iter_mut().enumerate().take(3).skip(1) {
+            let name = format!("txlnd{k}{}", instance.name);
+            if nodes.get(&name).is_some()
+                || deck_nodes.contains(&NodeTable::canonical_name(&name, nodes.auto_gnd()))
+            {
+                return Err(SpiceError::circuit(format!(
+                    "TXL generated-node collision: {name}"
+                )));
+            }
+            *node = nodes.intern(&name)?;
         }
-        line.push(staged.intern(&name));
-    }
-    line.push(terminals[2]);
-    let r = 3. / (m.r * length);
-    let c = m.c * length / 6.;
-    let mut devices: Vec<Box<dyn Device>> = Vec::new();
-    for k in 0..3 {
-        devices.push(Box::new(Resistor::new(
-            format!("txlres{}{}", k + 1, instance.name),
-            [line[k], line[k + 1]],
-            r,
-        )?));
-    }
-    for (k, node) in line.iter().enumerate() {
-        devices.push(Box::new(Capacitor::new(
-            format!("txlcap{}{}", k + 1, instance.name),
-            [*node, terminals[1]],
-            if k == 0 || k == 3 { c } else { 2. * c },
-            None,
-        )?));
-    }
-    *nodes = staged;
-    Ok(Some(devices))
+        let r = 3. / (m.r * length);
+        let c = m.c * length / 6.;
+        let mut devices: Vec<Box<dyn Device>> = Vec::with_capacity(7);
+        for k in 0..3 {
+            devices.push(Box::new(Resistor::new(
+                format!("txlres{}{}", k + 1, instance.name),
+                [line[k], line[k + 1]],
+                r,
+            )?));
+        }
+        for (k, node) in line.iter().enumerate() {
+            devices.push(Box::new(Capacitor::new(
+                format!("txlcap{}{}", k + 1, instance.name),
+                [*node, terminals[1]],
+                if k == 0 || k == 3 { c } else { 2. * c },
+                None,
+            )?));
+        }
+        Ok(Some(devices))
+    })
 }
 /// A Padé-path TXL instance. Its two branch currents point into the line
 /// at the respective signal terminals, as `txlload.c` stamps them.
@@ -173,11 +174,11 @@ impl Txl {
     ) -> SpiceResult<Box<dyn Device>> {
         let (m, length, instance_length) = inputs(instance, model)?;
         let coefficients = pade::Pade::new(m.r, m.l, m.g, m.c, length)?;
-        let ids: Vec<_> = instance.nodes.iter().map(|n| nodes.intern(n)).collect();
         let resistance = m.r * length;
         if !resistance.is_finite() {
             return Err(SpiceError::circuit("TXL R*length overflow"));
         }
+        let ids: [NodeId; 4] = nodes.intern_array(&instance.nodes)?;
         Ok(Box::new(Self {
             name: instance.name.clone(),
             terminals: [ids[0], ids[2]],
@@ -193,7 +194,7 @@ impl Txl {
         )
     }
     /// TSTALLOC order shared by setup and each load; row 0 is never ground.
-    fn positions(
+    const fn positions(
         p: Option<usize>,
         n: Option<usize>,
         a: usize,

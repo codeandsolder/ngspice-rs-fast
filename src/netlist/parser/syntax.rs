@@ -45,7 +45,7 @@ pub(super) enum Value<'a> {
 }
 
 impl Value<'_> {
-    pub(super) fn token(&self) -> &Token {
+    pub(super) const fn token(&self) -> &Token {
         match self {
             Self::Literal(token) | Self::Expression(token, _) => token,
         }

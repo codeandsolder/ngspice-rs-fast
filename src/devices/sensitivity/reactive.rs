@@ -6,8 +6,9 @@
 //! every DC sensitivity of theirs is exactly zero.
 
 use super::{
-    CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily,
-    SensitivityLoad, SensitivityMode, SensitivityParameter as P, SensitivityRecord,
+    CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, PassiveInputs, RecordPair,
+    SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
+    SensitivityRecord,
 };
 use crate::devices::{Device, LinearContext, StampContext};
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
@@ -68,55 +69,42 @@ const IND_INSTANCE: &[P] = &[
 ];
 
 /// `CONSTepsZero`, `CONSTepsSiO2` (`const.h`).
-const EPS_ZERO: Real = 8.854214871e-12;
+const EPS_ZERO: Real = 8.854_214_871e-12;
 const EPS_SIO2: Real = 3.9 * EPS_ZERO;
 /// `CONSTmuZero`.
 const MU_ZERO: Real = 4.0 * std::f64::consts::PI * 1e-7;
 
 /// Which reactive element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReactiveKind {
+pub(in crate::devices) enum ReactiveKind {
     /// A capacitor.
     Capacitor,
     /// An inductor.
     Inductor,
 }
 
-/// The values a capacitor or inductor card gave, `None` where it gave none
-/// (keywords as in C's tables).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct ReactiveInputs {
-    /// Written instance setters: `(keyword, value)`; `temp` in Celsius.
-    pub instance: Vec<(&'static str, Real)>,
-    /// Written model setters: `(keyword, value)`; `tnom` in Celsius.
-    pub model: Vec<(&'static str, Real)>,
-}
-
 /// A capacitor's or inductor's `.sens` description.
 #[derive(Debug)]
-pub(crate) struct ReactiveSensitivity {
+pub(in crate::devices) struct ReactiveSensitivity<'a> {
     kind: ReactiveKind,
-    name: String,
-    model: Option<String>,
+    name: &'a str,
     terminals: [NodeId; 2],
     circuit_kelvin: Real,
     nominal_kelvin: Real,
-    inputs: ReactiveInputs,
+    inputs: PassiveInputs<'a>,
 }
 
-impl ReactiveSensitivity {
+impl<'a> ReactiveSensitivity<'a> {
     pub(crate) fn new(
         kind: ReactiveKind,
-        name: &str,
-        model: Option<&str>,
+        name: &'a str,
         terminals: [NodeId; 2],
-        inputs: ReactiveInputs,
+        inputs: PassiveInputs<'a>,
         context: &crate::devices::ModelContext,
     ) -> Self {
         Self {
             kind,
-            name: name.to_owned(),
-            model: model.map(str::to_owned),
+            name,
             terminals,
             circuit_kelvin: context.temperature + CELSIUS_TO_KELVIN,
             nominal_kelvin: context.nominal_temperature + CELSIUS_TO_KELVIN,
@@ -124,7 +112,7 @@ impl ReactiveSensitivity {
         }
     }
 
-    fn fields(&self) -> (&'static [&'static str], &'static [&'static str]) {
+    const fn fields(&self) -> (&'static [&'static str], &'static [&'static str]) {
         match self.kind {
             ReactiveKind::Capacitor => (
                 &[
@@ -168,6 +156,10 @@ impl ReactiveSensitivity {
 }
 
 /// `Lundin()` of `indsetup.c`: Lundin's geometry correction of a solenoid.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "indsetup.c Lundin correction evaluates the original separately rounded polynomial"
+)]
 fn lundin(length: Real, csect: Real) -> Real {
     if csect < 1e-12 || length < 1e-6 {
         return 1.;
@@ -176,18 +168,33 @@ fn lundin(length: Real, csect: Real) -> Real {
     let xx = x * x;
     let xxxx = xx * xx;
     if x < 1. {
-        let num = 1. + 0.383901 * xx + 0.017108 * xxxx;
-        let den = 1. + 0.258952 * xx;
+        let num = 1. + 0.383_901 * xx + 0.017_108 * xxxx;
+        let den = 1. + 0.258_952 * xx;
         num / den - 4. * x / (3. * std::f64::consts::PI)
     } else {
-        let num = ((4. * x).ln() - 0.5) * (1. + 0.383901 / xx + 0.017108 / xxxx);
-        let den = 1. + 0.258952 / xx;
-        let kk = 0.093842 / xx + 0.002029 / xxxx - 0.000801 / (xx * xxxx);
+        let num = ((4. * x).ln() - 0.5) * (1. + 0.383_901 / xx + 0.017_108 / xxxx);
+        let den = 1. + 0.258_952 / xx;
+        let kk = 0.093_842 / xx + 0.002_029 / xxxx - 0.000_801 / (xx * xxxx);
         2. * (num / den + kk) / (std::f64::consts::PI * x)
     }
 }
 
-impl DeviceSensitivity for ReactiveSensitivity {
+/// Area and perimeter contributions after model geometry corrections.
+const fn geometry_capacitance(
+    width: Real,
+    length: Real,
+    area_density: Real,
+    sidewall_density: Real,
+) -> Real {
+    area_density * width * length + sidewall_density * 2. * (length + width)
+}
+
+/// The temperature factor shared by `CAPtemp` and `INDtemp`.
+const fn reactive_temperature_factor(tc1: Real, tc2: Real, difference: Real) -> Real {
+    1.0 + tc1 * difference + tc2 * difference * difference
+}
+
+impl DeviceSensitivity for ReactiveSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         match self.kind {
             ReactiveKind::Capacitor => SensitivityFamily::Capacitor,
@@ -196,7 +203,7 @@ impl DeviceSensitivity for ReactiveSensitivity {
     }
 
     fn model(&self) -> Option<&str> {
-        self.model.as_deref()
+        self.inputs.model_name()
     }
 
     fn model_parameters(&self) -> &'static [P] {
@@ -215,14 +222,17 @@ impl DeviceSensitivity for ReactiveSensitivity {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (model_fields, instance_fields) = self.fields();
-        let build = |fields: &[&'static str], written: &[(&'static str, Real)]| {
+        let principal = match self.kind {
+            ReactiveKind::Capacitor => "capacitance",
+            ReactiveKind::Inductor => "inductance",
+        };
+        let build = |fields: &[&'static str], scope| {
             let mut record = SensitivityRecord::new();
             for keyword in fields {
-                let value = written
-                    .iter()
-                    .rev()
-                    .find(|(name, _)| name == keyword)
-                    .map(|(_, value)| *value);
+                let value = match scope {
+                    ParameterScope::Model => self.inputs.model_value(keyword),
+                    ParameterScope::Instance => self.inputs.instance_value(principal, keyword),
+                };
                 let value = match (*keyword, value) {
                     ("temp" | "tnom", Some(celsius)) => Some(celsius + CELSIUS_TO_KELVIN),
                     (_, value) => value,
@@ -231,8 +241,8 @@ impl DeviceSensitivity for ReactiveSensitivity {
             }
             record
         };
-        let mut model = build(model_fields, &self.inputs.model);
-        let mut instance = build(instance_fields, &self.inputs.instance);
+        let mut model = build(model_fields, ParameterScope::Model);
+        let mut instance = build(instance_fields, ParameterScope::Instance);
         // The instance value is kept as C's `CAPcapacinst`/`INDinductinst`.
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
@@ -406,8 +416,12 @@ impl DeviceSensitivity for ReactiveSensitivity {
                 } else {
                     let (w, l) = (instance.value("w")?, instance.value("l")?);
                     let (narrow, short) = (model.value("narrow")?, model.value("short")?);
-                    model.value("cj")? * (w - narrow) * (l - short)
-                        + model.value("cjsw")? * 2. * ((l - short) + (w - narrow))
+                    geometry_capacitance(
+                        w - narrow,
+                        l - short,
+                        model.value("cj")?,
+                        model.value("cjsw")?,
+                    )
                 }
             }
             ReactiveKind::Inductor => {
@@ -434,7 +448,7 @@ impl DeviceSensitivity for ReactiveSensitivity {
             }
         };
         let (tc1, tc2) = (pick("tc1")?, pick("tc2")?);
-        let factor = 1.0 + tc1 * difference + tc2 * difference * difference;
+        let factor = reactive_temperature_factor(tc1, tc2, difference);
         let value = base * factor * instance.value("scale")?;
         match self.kind {
             ReactiveKind::Capacitor => instance.store("capac", value),
@@ -471,7 +485,7 @@ impl DeviceSensitivity for ReactiveSensitivity {
             });
         }
         Ok(SensitivityLoad::Replacement(Box::new(ReactiveStandIn {
-            name: self.name.clone(),
+            name: self.name.to_owned(),
             kind: self.kind,
             terminals: self.terminals,
             value,

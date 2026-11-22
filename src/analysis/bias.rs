@@ -7,11 +7,10 @@
 //! attempt and stage on success *and* failure. [`solve_dc`] is the compatible
 //! default wrapper. See `docs/port/DC_CONTINUATION.md` for the contract and
 //! for the remaining differences from ngspice.
-use crate::analysis::newton::{self, NewtonFailure, NewtonOptions, NewtonSolution, PhasePolicy};
-use crate::devices::{
-    AnalysisMode, Circuit, Forcing, IterationPhase, LoadRequest, ModelContext, StateHistory,
-    TrialState,
+use crate::analysis::newton::{
+    self, CircuitLoad, CircuitNewton, NewtonFailure, NewtonOptions, NewtonSolution, PhasePolicy,
 };
+use crate::devices::{Circuit, Forcing, IterationPhase, ModelContext, StateHistory, TrialState};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
@@ -28,15 +27,20 @@ pub const MAX_GMIN_FACTOR: Real = 1e6;
 /// Largest scheduled artificial nodal gmin (S).
 pub const MAX_GMIN: Real = 1.;
 /// Default number of equal source increments.
-pub const DEFAULT_SOURCE_STEPS: usize = 20;
+pub const DEFAULT_SOURCE_STEPS: u32 = 20;
 /// Default temporary nodal gmin (S) held during source stepping.
 pub const DEFAULT_SOURCE_GMIN: Real = 1e-8;
-/// Most gmin stages accepted in one schedule.
+/// Maximum gmin steps, or explicit ladder entries. The ngspice
+/// `spice3_gmin` schedule includes both endpoints (steps + 1 entries).
 pub const MAX_GMIN_STAGES: usize = 100;
 /// Most equal source increments accepted (a schedule has one more scale).
 pub const MAX_SOURCE_STEPS: usize = 1_000;
 /// Largest explicit total Newton-iteration budget.
 pub const MAX_TOTAL_ITERATIONS: usize = 10_000_000;
+
+fn uniform_scales(steps: u32) -> impl Iterator<Item = Real> {
+    (0..=steps).map(move |step| Real::from(step) / Real::from(steps))
+}
 
 fn invalid(message: impl Into<String>) -> SpiceError {
     SpiceError::Numerical {
@@ -70,8 +74,9 @@ impl SourceStepping {
                 "source steps must be in 1..={MAX_SOURCE_STEPS}, not {steps}"
             )));
         }
+        let steps = u32::try_from(steps).map_err(|_| invalid("source step count exceeds u32"))?;
         let stepping = Self {
-            scales: (0..=steps).map(|k| k as Real / steps as Real).collect(),
+            scales: uniform_scales(steps).collect(),
             gmin,
         };
         stepping.validate()?;
@@ -136,7 +141,7 @@ const GILLESPIE_MIN_RAISE: Real = 1e-7;
 const GILLESPIE_MAX_RAISE: Real = 0.01;
 const GILLESPIE_MIN_PROGRESS: Real = 1e-8;
 /// `gillespie_src`'s zero-source gmin ladder spans ten decades above `gmin`.
-const GILLESPIE_GMIN_DECADES: i32 = 10;
+const GILLESPIE_GMIN_DECADES: usize = 10;
 
 /// ngspice's `CKTop` continuation (`cktop.c`), parameterised like C.
 ///
@@ -212,9 +217,12 @@ impl NgspiceStepping {
     /// `gmin * factor^steps` down to `gmin`, `steps + 1` values.
     ///
     /// # Errors
-    /// A ladder that is not finite, positive, at most [`MAX_GMIN`] and
-    /// strictly decreasing (e.g. a zero junction gmin).
+    /// Invalid stepping parameters, or a ladder that is not finite,
+    /// positive, at most [`MAX_GMIN`] and strictly decreasing.
     pub fn spice3_ladder(&self, gmin: Real) -> SpiceResult<Vec<Real>> {
+        // Validate before loops and capacity arithmetic: callers can construct
+        // NgspiceStepping directly, outside ContinuationPolicy's validation.
+        self.validate()?;
         let mut value = gmin;
         for _ in 0..self.gmin_steps {
             value *= self.gmin_factor;
@@ -224,7 +232,7 @@ impl NgspiceStepping {
             ladder.push(value);
             value /= self.gmin_factor;
         }
-        validate_gmin_schedule(&ladder).map_err(|_| {
+        validate_gmin_schedule(&ladder, MAX_GMIN_STAGES + 1).map_err(|_| {
             invalid(format!(
                 "gminsteps={} with gminfactor={} and gmin={gmin:e} S gives the ladder \
                  {:e}..{gmin:e} S; each value must be finite, positive, at most \
@@ -309,9 +317,7 @@ impl ContinuationPolicy {
         Self {
             gmin_schedule: DEFAULT_GMIN_SCHEDULE.to_vec(),
             source_stepping: Some(SourceStepping {
-                scales: (0..=DEFAULT_SOURCE_STEPS)
-                    .map(|k| k as Real / DEFAULT_SOURCE_STEPS as Real)
-                    .collect(),
+                scales: uniform_scales(DEFAULT_SOURCE_STEPS).collect(),
                 gmin: DEFAULT_SOURCE_GMIN,
             }),
             ..Self::disabled()
@@ -320,7 +326,7 @@ impl ContinuationPolicy {
 
     /// No continuation: a failed direct Newton solve is final.
     #[must_use]
-    pub fn disabled() -> Self {
+    pub const fn disabled() -> Self {
         Self {
             schedule: ContinuationSchedule::Ladder,
             gmin_schedule: Vec::new(),
@@ -381,7 +387,7 @@ impl ContinuationPolicy {
         let schedule: Vec<Real> = (0..steps)
             .map(|k| start / factor.powi(i32::try_from(k).unwrap_or(i32::MAX)))
             .collect();
-        validate_gmin_schedule(&schedule)?;
+        validate_gmin_schedule(&schedule, MAX_GMIN_STAGES)?;
         Ok(schedule)
     }
 
@@ -429,7 +435,7 @@ impl ContinuationPolicy {
                 ));
             }
         }
-        validate_gmin_schedule(&self.gmin_schedule)?;
+        validate_gmin_schedule(&self.gmin_schedule, MAX_GMIN_STAGES)?;
         if let Some(source) = &self.source_stepping {
             source.validate()?;
         }
@@ -462,10 +468,10 @@ fn check_factor(factor: Real) -> SpiceResult<()> {
     }
 }
 
-fn validate_gmin_schedule(schedule: &[Real]) -> SpiceResult<()> {
-    if schedule.len() > MAX_GMIN_STAGES {
+fn validate_gmin_schedule(schedule: &[Real], max_entries: usize) -> SpiceResult<()> {
+    if schedule.len() > max_entries {
         return Err(invalid(format!(
-            "gmin schedule has {} stages; at most {MAX_GMIN_STAGES}",
+            "gmin schedule has {} stages; at most {max_entries}",
             schedule.len()
         )));
     }
@@ -560,16 +566,18 @@ impl DcSettings {
                 newton::SKIP_DIRECT_KEY => (0, 1),
                 _ => (0, MAX_GMIN_STAGES),
             };
-            if value.fract() != 0. || !(lowest as Real..=limit as Real).contains(&value) {
-                return Err(invalid(format!(
-                    "option {key} must be an integer in {lowest}..={limit}, not {text}"
-                )));
-            }
-            let count = Some(value as usize);
+            let count = crate::primitives::exact_nonnegative_integer::<usize>(value)
+                .filter(|n| (lowest..=limit).contains(n))
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "option {key} must be an integer in {lowest}..={limit}, not {text}"
+                    ))
+                })?;
+            let count = Some(count);
             match key.as_str() {
                 newton::STAGE_ITERATIONS_KEY => stage_limit = count,
                 newton::ADAPT_ITERATIONS_KEY => adapt = count,
-                newton::SKIP_DIRECT_KEY => skip_direct = value == 1.,
+                newton::SKIP_DIRECT_KEY => skip_direct = count == Some(1),
                 "srcsteps" => source = count,
                 _ => gmin_steps = count,
             }
@@ -656,7 +664,9 @@ impl DcStage {
     /// solution is ever returned.
     #[must_use]
     pub fn is_unregularized(&self) -> bool {
-        self.source_scale == 1. && self.gmin == 0. && self.junction_gmin.is_none()
+        self.source_scale.to_bits() == 1.0_f64.to_bits()
+            && self.gmin == 0.
+            && self.junction_gmin.is_none()
     }
 }
 
@@ -672,7 +682,7 @@ pub enum AttemptOutcome {
 }
 
 /// One strategy attempt, in the order tried.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DcAttempt {
     /// Which strategy.
     pub strategy: DcStrategy,
@@ -811,6 +821,8 @@ pub(crate) fn branch_rows(circuit: &Circuit) -> Vec<bool> {
     kinds
 }
 
+/// Constraints applied to node rows during a DC operating-point solve.
+///
 /// Node rows a DC solve forces in its loads, the exact form of `cktload.c`'s
 /// `.nodeset`/`.ic` stamping: each listed row's equation is replaced by
 /// `x[row] = value * scale`, where `scale` is the source-stepping factor
@@ -837,7 +849,7 @@ pub struct NodeForcing {
 impl NodeForcing {
     /// No forced rows.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.initial.is_empty() && self.nodesets.is_empty()
     }
 
@@ -885,6 +897,52 @@ impl NodeForcing {
             };
         }
         Ok(())
+    }
+}
+
+/// The node hints common to every ordinary operating-point solve. Transient
+/// initialization deliberately has a separate path for enforced IC rows.
+pub(super) struct OperatingPointStart {
+    seed: Vector,
+    nodes: NodeForcing,
+}
+
+impl OperatingPointStart {
+    pub(super) fn resolve(
+        circuit: &Circuit,
+        request: &crate::analysis::AnalysisRequest,
+    ) -> SpiceResult<Self> {
+        let hints = crate::analysis::initial::resolve(circuit, request)?;
+        let nodes = NodeForcing {
+            initial: Vec::new(),
+            nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
+        };
+        let mut seed = Vector::zeros(circuit.unknown_count());
+        for hint in hints.nodesets {
+            seed.as_mut_slice()[hint.row] = hint.value;
+        }
+        Ok(Self { seed, nodes })
+    }
+
+    pub(super) fn solve(
+        &self,
+        circuit: &Circuit,
+        model: &ModelContext,
+        settings: &DcSettings,
+    ) -> SpiceResult<NewtonSolution<TrialState>> {
+        self.solve_from(circuit, model, settings, &self.seed)
+    }
+
+    /// Another operating point in the same analysis: keep MODEINITJCT and
+    /// MODEINITFIX node forcing, but warm-start from the previous solution.
+    pub(super) fn solve_from(
+        &self,
+        circuit: &Circuit,
+        model: &ModelContext,
+        settings: &DcSettings,
+        seed: &Vector,
+    ) -> SpiceResult<NewtonSolution<TrialState>> {
+        Ok(solve_dc_forced(circuit, model, settings, &[], Some(seed), None, &self.nodes)?.solution)
     }
 }
 
@@ -947,6 +1005,8 @@ pub fn solve_dc_with(
     )
 }
 
+/// Run a DC solve with initial-condition and nodeset row constraints.
+///
 /// [`solve_dc_with`] with `.ic`/`.nodeset` row forcing ([`NodeForcing`]) in
 /// every Newton load of every strategy. The returned point satisfies the
 /// forced `.ic` rows and the physical equations of every other row; the
@@ -968,7 +1028,7 @@ pub fn solve_dc_forced(
         context,
         settings,
         overrides,
-        Start {
+        &Start {
             initial,
             forcing,
             history: &circuit.state_history(),
@@ -978,6 +1038,8 @@ pub fn solve_dc_forced(
     )
 }
 
+/// Continue a DC solve from an accepted previous state.
+///
 /// [`solve_dc_forced`] continuing an accepted state `history` (C `CKTstate1..`),
 /// starting the direct Newton attempt in `policy`'s phase: a DC sweep point
 /// after the first runs [`PhasePolicy::Predicted`] (`dctrcurv.c` sets
@@ -989,7 +1051,10 @@ pub fn solve_dc_forced(
 ///
 /// # Errors
 /// As [`solve_dc_with`], or a history that does not match the circuit.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)]
 pub fn solve_dc_from(
     circuit: &Circuit,
     context: &ModelContext,
@@ -1005,7 +1070,7 @@ pub fn solve_dc_from(
         context,
         settings,
         overrides,
-        Start {
+        &Start {
             initial,
             forcing: None,
             history,
@@ -1030,7 +1095,7 @@ fn solve(
     context: &ModelContext,
     settings: &DcSettings,
     overrides: &[(&str, f64)],
-    start: Start<'_>,
+    start: &Start<'_>,
 ) -> Result<DcSolution, DcFailure> {
     let mut report = DcReport::default();
     match run(circuit, context, settings, overrides, start, &mut report) {
@@ -1113,6 +1178,133 @@ enum Plan<'p> {
     Uniform(usize),
 }
 
+/// Only the direct attempt and closing gmin solves use ITL1. All other
+/// continuation stages, including closing source steps, use ITL2.
+const fn uses_direct_limit(strategy: DcStrategy, closing: bool) -> bool {
+    matches!(strategy, DcStrategy::Direct)
+        || (closing
+            && matches!(
+                strategy,
+                DcStrategy::GminStepping | DcStrategy::JunctionGminStepping
+            ))
+}
+
+impl Plan<'_> {
+    /// Upper bound on the number of solves at ITL1 and ITL2 respectively.
+    const fn solve_counts(&self, strategy: DcStrategy) -> (usize, usize) {
+        match self {
+            Self::Disabled => (0, 0),
+            Self::Walk { stages, .. } => {
+                if uses_direct_limit(strategy, true) {
+                    (1, stages.len())
+                } else {
+                    (0, stages.len().saturating_add(1))
+                }
+            }
+            Self::Dynamic { .. } => (1, MAX_ADAPTIVE_STAGES),
+            Self::Gillespie(_) => (0, 1 + GILLESPIE_GMIN_DECADES + 1 + MAX_ADAPTIVE_STAGES),
+            Self::Uniform(steps) => (0, steps.saturating_add(1)),
+        }
+    }
+}
+
+impl ContinuationPolicy {
+    /// Resolve the validated schedule to the actual ordered attempts.
+    fn plan<'a>(
+        &self,
+        seed: &'a Vector,
+        zero: &'a Vector,
+        gmin: Real,
+    ) -> SpiceResult<Vec<(DcStrategy, Plan<'a>)>> {
+        // Source stepping restarts from the all-sources-off state, not the seed.
+        let mut plan: Vec<(DcStrategy, Plan<'_>)> = vec![(
+            DcStrategy::Direct,
+            if self.skip_direct {
+                Plan::Disabled
+            } else {
+                Plan::Walk {
+                    start: seed,
+                    stages: Vec::new(),
+                }
+            },
+        )];
+        match self.schedule {
+            ContinuationSchedule::Ladder => {
+                let ladder = &self.gmin_schedule;
+                plan.push((
+                    DcStrategy::GminStepping,
+                    if ladder.is_empty() {
+                        Plan::Disabled
+                    } else {
+                        Plan::Walk {
+                            start: seed,
+                            stages: ladder.iter().map(|g| Point::nodal(1., *g)).collect(),
+                        }
+                    },
+                ));
+                plan.push((
+                    DcStrategy::SourceStepping,
+                    self.source_stepping
+                        .as_ref()
+                        .map_or(Plan::Disabled, |source| Plan::Walk {
+                            start: zero,
+                            stages: source
+                                .scales
+                                .iter()
+                                .map(|k| Point::nodal(*k, source.gmin))
+                                .collect(),
+                        }),
+                ));
+            }
+            ContinuationSchedule::Ngspice(stepping) => {
+                match stepping.gmin_steps {
+                    0 => plan.push((DcStrategy::GminStepping, Plan::Disabled)),
+                    1 => {
+                        for junction in [false, true] {
+                            let strategy = if junction {
+                                DcStrategy::JunctionGminStepping
+                            } else {
+                                DcStrategy::GminStepping
+                            };
+                            plan.push((strategy, Plan::Dynamic { stepping, junction }));
+                        }
+                    }
+                    _ => {
+                        let ladder = stepping.spice3_ladder(gmin)?;
+                        plan.push((
+                            DcStrategy::GminStepping,
+                            Plan::Walk {
+                                start: seed,
+                                stages: ladder.iter().map(|g| Point::nodal(1., *g)).collect(),
+                            },
+                        ));
+                    }
+                }
+                plan.push((
+                    DcStrategy::SourceStepping,
+                    match stepping.source_steps {
+                        0 => Plan::Disabled,
+                        1 => Plan::Gillespie(stepping),
+                        steps => Plan::Uniform(steps),
+                    },
+                ));
+            }
+        }
+        Ok(plan)
+    }
+}
+
+/// `NIiter` may take its configured limit plus the failing extra pass.
+/// The implicit budget covers every enabled strategy's worst-case work.
+fn iteration_budget(plan: &[(DcStrategy, Plan<'_>)], direct: usize, stage: usize) -> usize {
+    plan.iter().fold(0_usize, |total, (strategy, planned)| {
+        let (direct_count, stage_count) = planned.solve_counts(*strategy);
+        total
+            .saturating_add(direct_count.saturating_mul(direct.saturating_add(1)))
+            .saturating_add(stage_count.saturating_mul(stage.saturating_add(1)))
+    })
+}
+
 impl Engine<'_> {
     /// One disposable Newton solve at `point`; charges the budget.
     /// `continued` is the preceding stage's converged trial, if any; `closing`
@@ -1131,9 +1323,11 @@ impl Engine<'_> {
             gmin,
             junction,
         } = point;
-        let describe = || match junction {
-            Some(junction) => format!("scale {scale}, junction gmin {junction:e} S"),
-            None => format!("scale {scale}, gmin {gmin:e} S"),
+        let describe = || {
+            junction.map_or_else(
+                || format!("scale {scale}, gmin {gmin:e} S"),
+                |junction| format!("scale {scale}, junction gmin {junction:e} S"),
+            )
         };
         // A Newton solve needs two passes at least (the first never
         // converges), and a failing one uses `max_iterations + 1` (NIiter
@@ -1145,17 +1339,14 @@ impl Engine<'_> {
                 describe()
             )));
         }
-        let n = self.circuit.unknown_count();
         // C bounds the direct solve and the gmin strategies' closing solve by
         // `iterlim` (itl1) and every other continuation solve by itl2
         // (`cktop.c`: `spice3_gmin`/`dynamic_gmin`/`new_gmin` end with
         // `NIiter(ckt, iterlim)`; `gillespie_src`/`spice3_src` ignore it).
-        let limit = match strategy {
-            DcStrategy::Direct => self.newton.max_iterations,
-            DcStrategy::GminStepping | DcStrategy::JunctionGminStepping if closing => {
-                self.newton.max_iterations
-            }
-            _ => self.stage_limit,
+        let limit = if uses_direct_limit(strategy, closing) {
+            self.newton.max_iterations
+        } else {
+            self.stage_limit
         };
         let options = NewtonOptions {
             max_iterations: limit.min(self.remaining - 1),
@@ -1166,65 +1357,36 @@ impl Engine<'_> {
             ..self.newton
         };
         let reduced = options.max_iterations < limit;
-        let history = self.history;
-        let device_limiting = options.limiting.is_device();
-        let (reltol, abstol) = (options.reltol, options.abstol);
         // Sources load their value scaled by CKTsrcFact (vsrcload.c).
         let context = junction
             .map_or(*self.context, |junction| self.context.with_gmin(junction))
             .with_source_factor(scale);
-        let result = newton::solve_phased(
+        let result = CircuitNewton {
+            circuit: self.circuit,
+            context: &context,
+            history: self.history,
+            branch_rows: &self.branches,
+            limited_rows: self.limited.as_deref(),
+            options: &options,
+            load: CircuitLoad::Bias {
+                forcing: self.forcing,
+            },
+        }
+        .solve(
             guess,
-            &self.branches,
-            self.limited.as_deref(),
-            &options,
-            // Continuation strategies restart like `CKTop` (MODEINITJCT); only
-            // the direct attempt may continue a predicted point.
+            // Continuation strategies restart like CKTop; only the direct
+            // attempt may continue a predicted point.
             if strategy == DcStrategy::Direct {
                 self.policy
             } else {
                 PhasePolicy::OperatingPoint
             },
             continued,
-            |x, phase, previous| {
-                let mut a = self.circuit.new_matrix();
-                let mut b = Vector::zeros(n);
-                let mut trial = history
-                    .trial_in(phase, previous)?
-                    .with_device_limiting(device_limiting)
-                    .with_convergence_tolerances(reltol, abstol);
-                self.circuit.load(
-                    &LoadRequest {
-                        mode: AnalysisMode::OperatingPoint,
-                        solution: x,
-                        model_context: &context,
-                        integration: None,
-                        history,
-                        forcing: self.forcing,
-                    },
-                    &mut a,
-                    &mut b,
-                    &mut trial,
-                )?;
-                // cktload.c: .nodeset rows in MODEINITJCT/MODEINITFIX only,
+            |phase, matrix, rhs| {
+                // cktload.c: nodeset rows only in MODEINITJCT/MODEINITFIX;
                 // .ic rows in every load, both scaled by CKTsrcFact.
                 let hinted = matches!(phase, IterationPhase::Junction | IterationPhase::Fix);
-                self.nodes
-                    .apply(&mut a, &mut b, scale, hinted, &self.branches)?;
-                Ok((a, b, trial))
-            },
-            |new, old, trial| {
-                self.circuit
-                    .convergence_test(&crate::devices::ConvergenceRequest {
-                        solution: new,
-                        previous: old,
-                        trial,
-                        model_context: &context,
-                        time: 0.,
-                        reltol: options.reltol,
-                        abstol: options.abstol,
-                        vntol: options.vntol,
-                    })
+                self.nodes.apply(matrix, rhs, scale, hinted, &self.branches)
             },
         );
         let (iterations, error) = match &result {
@@ -1292,19 +1454,18 @@ impl Engine<'_> {
         point: Point,
         closing: bool,
     ) -> Result<NewtonSolution<TrialState>, Halt> {
-        match from {
-            Some(from) => self.stage(
+        if let Some(from) = from {
+            self.stage(
                 report,
                 strategy,
                 &from.values,
                 Some(from.trial.clone()),
                 point,
                 closing,
-            ),
-            None => {
-                let zero = Vector::zeros(self.circuit.unknown_count());
-                self.stage(report, strategy, &zero, None, point, closing)
-            }
+            )
+        } else {
+            let zero = Vector::zeros(self.circuit.unknown_count());
+            self.stage(report, strategy, &zero, None, point, closing)
         }
     }
 
@@ -1479,9 +1640,10 @@ impl Engine<'_> {
         report: &mut DcReport,
         steps: usize,
     ) -> Result<NewtonSolution<TrialState>, Halt> {
+        let steps = u32::try_from(steps)
+            .map_err(|_| Halt::Retry("source step count exceeds u32".into()))?;
         let mut last: Option<NewtonSolution<TrialState>> = None;
-        for step in 0..=steps {
-            let scale = step as Real / steps as Real;
+        for scale in uniform_scales(steps) {
             last = Some(self.step(
                 report,
                 DcStrategy::SourceStepping,
@@ -1529,7 +1691,7 @@ fn run(
     context: &ModelContext,
     settings: &DcSettings,
     overrides: &[(&str, f64)],
-    start: Start<'_>,
+    start: &Start<'_>,
     report: &mut DcReport,
 ) -> SpiceResult<NewtonSolution<TrialState>> {
     let Start {
@@ -1538,7 +1700,7 @@ fn run(
         history,
         policy: phases,
         nodes,
-    } = start;
+    } = *start;
     settings.validate()?;
     nodes.validate(circuit.unknown_count())?;
     if !settings.newton.limiting.is_device()
@@ -1581,110 +1743,10 @@ fn run(
     let stage_limit = policy
         .stage_max_iterations
         .unwrap_or(options.max_iterations);
-    // Source stepping restarts from the all-sources-off state, not the seed.
-    let mut plan: Vec<(DcStrategy, Plan<'_>)> = vec![(
-        DcStrategy::Direct,
-        if policy.skip_direct {
-            Plan::Disabled
-        } else {
-            Plan::Walk {
-                start: seed,
-                stages: Vec::new(),
-            }
-        },
-    )];
-    match policy.schedule {
-        ContinuationSchedule::Ladder => {
-            let gmin = &policy.gmin_schedule;
-            plan.push((
-                DcStrategy::GminStepping,
-                if gmin.is_empty() {
-                    Plan::Disabled
-                } else {
-                    Plan::Walk {
-                        start: seed,
-                        stages: gmin.iter().map(|g| Point::nodal(1., *g)).collect(),
-                    }
-                },
-            ));
-            plan.push((
-                DcStrategy::SourceStepping,
-                match &policy.source_stepping {
-                    None => Plan::Disabled,
-                    Some(source) => Plan::Walk {
-                        start: &zero,
-                        stages: source
-                            .scales
-                            .iter()
-                            .map(|k| Point::nodal(*k, source.gmin))
-                            .collect(),
-                    },
-                },
-            ));
-        }
-        ContinuationSchedule::Ngspice(stepping) => {
-            match stepping.gmin_steps {
-                0 => plan.push((DcStrategy::GminStepping, Plan::Disabled)),
-                1 => {
-                    for junction in [false, true] {
-                        let strategy = if junction {
-                            DcStrategy::JunctionGminStepping
-                        } else {
-                            DcStrategy::GminStepping
-                        };
-                        plan.push((strategy, Plan::Dynamic { stepping, junction }));
-                    }
-                }
-                _ => {
-                    let ladder = stepping.spice3_ladder(context.gmin)?;
-                    plan.push((
-                        DcStrategy::GminStepping,
-                        Plan::Walk {
-                            start: seed,
-                            stages: ladder.iter().map(|g| Point::nodal(1., *g)).collect(),
-                        },
-                    ));
-                }
-            }
-            plan.push((
-                DcStrategy::SourceStepping,
-                match stepping.source_steps {
-                    0 => Plan::Disabled,
-                    1 => Plan::Gillespie(stepping),
-                    steps => Plan::Uniform(steps),
-                },
-            ));
-        }
-    }
-    // Default budget: every solve bounded by itl1 (the direct solve and the
-    // gmin strategies' closing solves) at that limit, every other stage at
-    // the stage limit, adaptive strategies at their stage cap.
-    let (mut direct_count, mut stage_count) = (0_usize, 0_usize);
-    for (_, planned) in &plan {
-        let (direct, stages) = match planned {
-            Plan::Disabled => (0, 0),
-            Plan::Walk { stages, .. } => (1, stages.len()),
-            Plan::Dynamic { .. } => (1, MAX_ADAPTIVE_STAGES),
-            Plan::Gillespie(_) => (
-                0,
-                1 + GILLESPIE_GMIN_DECADES as usize + 1 + MAX_ADAPTIVE_STAGES,
-            ),
-            Plan::Uniform(steps) => (0, steps + 1),
-        };
-        direct_count += direct;
-        stage_count = stage_count.saturating_add(stages);
-    }
-    // The ladder's source stepping ends with a closing solve at the stage limit.
-    if policy.schedule == ContinuationSchedule::Ladder && policy.source_stepping.is_some() {
-        direct_count -= 1;
-        stage_count += 1;
-    }
-    // Each solve may take its limit plus the pass that exceeds it (NIiter).
-    let budget = policy.max_total_iterations.unwrap_or_else(|| {
-        direct_count
-            .saturating_mul(options.max_iterations.saturating_add(1))
-            .saturating_add(stage_count.saturating_mul(stage_limit.saturating_add(1)))
-    });
+    let plan = policy.plan(seed, &zero, context.gmin)?;
+    let budget = policy
+        .max_total_iterations
+        .unwrap_or_else(|| iteration_budget(&plan, options.max_iterations, stage_limit));
     report.budget = budget;
     let mut engine = Engine {
         circuit,

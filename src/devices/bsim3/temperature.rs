@@ -1,6 +1,23 @@
-//! Model-level temperature processing from `b3temp.c::BSIM3temp`, before
-//! per-instance effective geometry. Junction-capacitance clamping, saturation
-//! currents and potentials are C order and C constants; no load equations here.
+//! Model-level temperature processing from `b3temp.c::BSIM3temp`.
+//!
+//! Before per-instance effective geometry, junction-capacitance clamping,
+//! saturation currents and potentials follow C order and C constants. No load
+//! equations are evaluated here.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::float_cmp,
+    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "a complete translated C numerical routine remains contiguous for equation parity review"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use std::collections::BTreeMap;
 
 use super::Diagnostic;
@@ -17,8 +34,8 @@ const CONST_BOLTZ: Real = 1.380_648_52e-23;
 const CONST_CHARGE: Real = 1.602_176_620_8e-19;
 const REF_TEMP: Real = 27.0 + 273.15;
 const CONST_VT0: Real = CONST_BOLTZ * REF_TEMP / CONST_CHARGE;
-#[allow(clippy::approx_constant)] // `const.h`'s CONSTsqrt2 spelling
-const CONST_ROOT2: Real = 1.414_213_562_373_095;
+// `const.h` spells this just below binary64 SQRT_2; do not change the bit pattern.
+const CONST_ROOT2: Real = Real::from_bits(0x3ff6_a09e_667f_3bcc);
 /// `b3temp.c`'s `Meter2Micron` equivalent used by the size-dependent setup.
 pub(super) const METER2MICRON: Real = 1.0e6;
 
@@ -97,12 +114,12 @@ impl TemperatureModel {
         let vtm = KB_OVER_Q * temp;
         let eg = 1.16 - 7.02e-4 * temp * temp / (temp + 1108.0);
 
-        let (jct_temp_sat_cur, jct_sidewall_temp_sat_cur) = if temp != tnom {
+        let (jct_temp_sat_cur, jct_sidewall_temp_sat_cur) = if temp == tnom {
+            (number("js")?, number("jsw")?)
+        } else {
             let exponent = eg0 / vtm0 - eg / vtm + number("xti")? * (temp / tnom).ln();
             let scale = (exponent / number("nj")?).exp();
             (number("js")? * scale, number("jsw")? * scale)
-        } else {
-            (number("js")?, number("jsw")?)
         };
         values.insert("jct_temp_sat_cur_density", jct_temp_sat_cur.max(0.));
         values.insert(

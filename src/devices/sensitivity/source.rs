@@ -41,7 +41,7 @@ pub struct SourceInputs {
 
 /// An independent source's `.sens` description.
 #[derive(Debug)]
-pub(crate) struct SourceSensitivity<'a> {
+pub(in crate::devices) struct SourceSensitivity<'a> {
     source: &'a IndependentSource,
     voltage: bool,
     /// The card's DC value (the function's time-zero value when not given).
@@ -50,7 +50,7 @@ pub(crate) struct SourceSensitivity<'a> {
 }
 
 impl<'a> SourceSensitivity<'a> {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         source: &'a IndependentSource,
         voltage: bool,
         level: Real,
@@ -125,6 +125,10 @@ impl DeviceSensitivity for SourceSensitivity<'_> {
     }
 
     /// `VSRCtemp`/`ISRCtemp`: the AC defaults, the phasor and the default `m`.
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "VSRCtemp and ISRCtemp convert phase by multiplying by pi before dividing by 180"
+    )]
     fn temperature(
         &self,
         _model: &mut SensitivityRecord,

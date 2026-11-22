@@ -21,6 +21,38 @@
 //! - `mesaload.c` reads the prime-prime pair straight from the solution, so it
 //!   is never limited; the port does the same.
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::similar_names,
+    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
+)]
+#![expect(
+    clippy::float_cmp,
+    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
+)]
+#![expect(
+    clippy::manual_midpoint,
+    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "a complete translated C numerical routine remains contiguous for equation parity review"
+)]
+#![expect(
+    clippy::many_single_char_names,
+    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
+)]
+#![expect(
+    clippy::imprecise_flops,
+    reason = "the original C floating-point algorithm and libm operation sequence must remain intact"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
+use super::{NodeSetup, TemperatureCache, given_celsius, physical_temperature, stamp_reset};
 use crate::devices::hfet::{Instance, Model};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{BOLTZMANN, CHARGE};
@@ -37,7 +69,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
 
 /// `mesaload.c`'s `#define EPSILONGAAS (12.244*8.85418e-12)`, the same value
 /// `mesasetup.c` defaults `MESAepsi` to. The modern `eps0`
@@ -206,7 +238,7 @@ struct Nodes {
 
 /// MESA level 2.
 #[derive(Debug, Clone)]
-pub(crate) struct Mesa {
+pub(in crate::devices) struct Mesa {
     name: String,
     model_name: String,
     /// `mesasetup.c`/`inpdomod.c`'s level: 2 (`mesa1`), 3 (`mesa2`) or 4
@@ -223,6 +255,7 @@ pub(crate) struct Mesa {
     model: Model,
     instance: Instance,
     initial: InstanceInitial,
+    temperature_cache: TemperatureCache<Derived, 2>,
 }
 
 impl Mesa {
@@ -248,56 +281,26 @@ impl Mesa {
         let (model, model_defaults) = Model::resolve(resolved)?;
         let (initial, setters) = Instance::resolve(i)?;
         let instance = Instance::validate(&model_defaults, &setters, &i.location)?;
-        let mut staged = nodes.clone();
-        let external: Vec<NodeId> = i.nodes.iter().map(|n| staged.intern(n)).collect();
-        let mut terminals = external.clone();
-        let mut nodes_of = Nodes {
-            d: external[0],
-            g: external[1],
-            s: external[2],
-            sp: external[2],
-            dp: external[0],
-            gp: external[1],
-            spp: external[2],
-            dpp: external[0],
+        let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "MESA")?;
+        // C creates source and drain primes in this order.
+        // Gate and prime-prime nodes follow, aliasing the corresponding prime
+        // when RG, RI or RF is zero. RDI/RSI do not create nodes.
+        let sp = topology.prime(model.rs, "source", s)?;
+        let dp = topology.prime(model.rd, "drain", d)?;
+        let gp = topology.prime(model.rg, "gate", g)?;
+        let spp = topology.prime(model.ri, "gs", sp)?;
+        let dpp = topology.prime(model.rf, "gd", dp)?;
+        let nodes_of = Nodes {
+            d,
+            g,
+            s,
+            sp,
+            dp,
+            gp,
+            spp,
+            dpp,
         };
-        // `mesasetup.c` creates `#source` for RS, `#drain` for RD, `#gate` for
-        // RG, `#gs` for RI and `#gd` for RF, in that order, and falls back to
-        // the unfurled node when a resistance is zero: the prime-prime pair
-        // becomes the prime pair. `rdi`/`rsi` create no node at all;
-        // `mesatemp.c` folds them into the channel's series terms. The
-        // reference binary's rawfile omits `#source`/`#drain` (`outitf.c`'s
-        // skip list), not the model: `show` reports `dprimenode`/`sprimenode`
-        // and `rd=1e6 rs=1e6` collapses the current to `0.5/(rd+rs)`.
-        let mut create = |resistance: Real, suffix: &str, target: &mut NodeId| -> SpiceResult<()> {
-            if resistance == 0. {
-                return Ok(());
-            }
-            let name = format!("{}#{suffix}", i.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "{}: MESA internal-node name collision: {name}",
-                    i.name
-                )));
-            }
-            let internal = staged.intern(&name);
-            staged.set_kind(internal, NodeKind::Internal);
-            terminals.push(internal);
-            *target = internal;
-            Ok(())
-        };
-        create(model.rs, "source", &mut nodes_of.sp)?;
-        create(model.rd, "drain", &mut nodes_of.dp)?;
-        create(model.rg, "gate", &mut nodes_of.gp)?;
-        create(model.ri, "gs", &mut nodes_of.spp)?;
-        if model.ri == 0. {
-            nodes_of.spp = nodes_of.sp;
-        }
-        create(model.rf, "gd", &mut nodes_of.dpp)?;
-        if model.rf == 0. {
-            nodes_of.dpp = nodes_of.dp;
-        }
-        *nodes = staged;
+        let (staged, terminals) = topology.finish();
         let device = Self {
             name: i.name.clone(),
             model_name: resolved.card().name.clone(),
@@ -307,9 +310,11 @@ impl Mesa {
             model,
             instance,
             initial,
+            temperature_cache: TemperatureCache::new(),
         };
         // Validate the derivations before the device joins the circuit.
         device.derived(context.temperature, context.nominal_temperature)?;
+        *nodes = staged;
         Ok(Box::new(device))
     }
 
@@ -317,6 +322,13 @@ impl Mesa {
     /// (`CKTtemp`/`CKTnomTemp`), while the instance temperatures are kelvin
     /// after `mesaparam.c`'s conversion.
     fn derived(&self, temperature: Real, nominal: Real) -> SpiceResult<Derived> {
+        self.temperature_cache
+            .get_or_compute([temperature, nominal], || {
+                self.compute_derived(temperature, nominal)
+            })
+    }
+
+    fn compute_derived(&self, temperature: Real, nominal: Real) -> SpiceResult<Derived> {
         let model = &self.model;
         let instance = &self.instance;
         // C's `CKTtemp`/`CKTnomTemp` are kelvin; the port's `ModelContext`
@@ -324,14 +336,7 @@ impl Mesa {
         // `value + CONSTCtoK`, so it is Celsius in the deck, and
         // `mesasetup.c`'s default `CKTtemp + DTEMP` is kelvin.
         let nominal_kelvin = nominal + CELSIUS_TO_KELVIN;
-        let ts = match instance.ts {
-            Some(v) => v + CELSIUS_TO_KELVIN,
-            None => temperature + CELSIUS_TO_KELVIN + instance.dtemp,
-        };
-        let td = match instance.td {
-            Some(v) => v + CELSIUS_TO_KELVIN,
-            None => temperature + CELSIUS_TO_KELVIN + instance.dtemp,
-        };
+        let (ts, td) = self.temperatures(temperature);
         let scalar = |resistance: Real, kelvin: Real| {
             if resistance == 0. {
                 0.
@@ -601,7 +606,6 @@ impl Mesa {
     /// (level 4). `mesaload.c` selects between them on `model->MESAlevel`, and
     /// everything around them - the junctions, the charge storage, the load
     /// and the small-signal assembly - is shared.
-    #[allow(clippy::too_many_arguments)]
     fn channel(
         &self,
         derived: &Derived,
@@ -709,10 +713,10 @@ impl Mesa {
         let capgd = derived.cf + 2. / 3. * cgc * (1. - c);
         let delvgtevgt = 0.5 * (1. + t / q);
         let delidvds0 = gch / h;
-        let delidvds1 = if vds != 0. {
-            cdrain * (vds / vsate).powf(model.m - 1.) / vsate / (1. + g)
-        } else {
+        let delidvds1 = if vds == 0. {
             0.
+        } else {
+            cdrain * (vds / vsate).powf(model.m - 1.) / vsate / (1. + g)
         };
         let delidvds = delidvds0 * (1. + 2. * lambda * vds) - delidvds1;
         let delgchgchi = 1. / (1. + gchi * rt) / (1. + gchi * rt);
@@ -913,10 +917,10 @@ impl Mesa {
         };
         let delvgtevgt = 0.5 * (1. + u / t);
         let delidvds0 = gch / h;
-        let delidvds1 = if vds != 0. {
-            cdrain * (vds / vsate).powf(m - 1.) / (vsate * (1. + g))
-        } else {
+        let delidvds1 = if vds == 0. {
             0.
+        } else {
+            cdrain * (vds / vsate).powf(m - 1.) / (vsate * (1. + g))
         };
         let delidvds = delidvds0 * (1. + 2. * lambda * vds) - delidvds1;
         let delidvsate = cdrain * g / (vsate * (1. + g));
@@ -947,7 +951,9 @@ impl Mesa {
         let dvsatevds = delvsateisat
             * (delisatisata * disatavds + delisatisatb * disatbvgt * sigma)
             + delvsategch * w;
-        let (gmmadd, gdsmadd) = if model.alpha != 0. {
+        let (gmmadd, gdsmadd) = if model.alpha == 0. {
+            (0., 0.)
+        } else {
             let gmmadd = if vds == 0. {
                 0.
             } else {
@@ -957,8 +963,6 @@ impl Mesa {
                     * delvgtevgt
             };
             (gmmadd, gmmadd * sigma)
-        } else {
-            (0., 0.)
         };
         let g = delidgch * p + delidvsate * dvsatevgt;
         let gm = (g + gmmadd) * dvgtvgs;
@@ -1043,21 +1047,24 @@ impl Mesa {
 
     /// The instance temperatures in kelvin, `mesatemp.c`'s rule for asks.
     fn temperatures(&self, temperature: Real) -> (Real, Real) {
-        let ts = match self.instance.ts {
-            Some(v) => v + CELSIUS_TO_KELVIN,
-            None => temperature + CELSIUS_TO_KELVIN + self.instance.dtemp,
-        };
-        let td = match self.instance.td {
-            Some(v) => v + CELSIUS_TO_KELVIN,
-            None => temperature + CELSIUS_TO_KELVIN + self.instance.dtemp,
-        };
+        let ts = self
+            .instance
+            .ts
+            .map_or(temperature + CELSIUS_TO_KELVIN + self.instance.dtemp, |v| {
+                v + CELSIUS_TO_KELVIN
+            });
+        let td = self
+            .instance
+            .td
+            .map_or(temperature + CELSIUS_TO_KELVIN + self.instance.dtemp, |v| {
+                v + CELSIUS_TO_KELVIN
+            });
         (ts, td)
     }
 
     /// `mesaacl.c`: `gm`/`gds` are re-derived at the bias with the
     /// frequency-blended `lambda`, and the gate capacitances come from the
     /// operating point.
-    #[allow(clippy::too_many_arguments)]
     fn ac_point(
         &self,
         derived: &Derived,
@@ -1272,13 +1279,17 @@ impl Device for Mesa {
                     _ => instance.m = value,
                 }
             }
-            "td" | "ts" | "dtemp" => {
-                check(value.is_finite(), "finite")?;
-                match parameter {
-                    "td" => instance.td = Some(value),
-                    "ts" => instance.ts = Some(value),
-                    _ => instance.dtemp = value,
+            "td" | "ts" => {
+                check(physical_temperature(value), "above absolute zero")?;
+                if parameter == "td" {
+                    instance.td = Some(value);
+                } else {
+                    instance.ts = Some(value);
                 }
+            }
+            "dtemp" => {
+                check(true, "finite")?;
+                instance.dtemp = value;
             }
             "icvds" | "icvgs" => {
                 check(value.is_finite(), "finite")?;
@@ -1300,6 +1311,7 @@ impl Device for Mesa {
             model: self.model,
             instance,
             initial,
+            temperature_cache: TemperatureCache::new(),
         }))
     }
     /// `MESAload`'s DC path.
@@ -1454,7 +1466,7 @@ impl Device for Mesa {
         }
         // The convergence test compares the predicted currents with the
         // integrated ones (C's `cg`/`cd` after the charge block).
-        let point = Point { cg, cd, ..point };
+        let point = Point { cd, cg, ..point };
         let nonconvergent = match start {
             Start::Fixed => true,
             Start::Conditions | Start::Exact => false,
@@ -2046,16 +2058,8 @@ impl DeviceSensitivity for MesaSensitivity<'_> {
 
 impl MesaSensitivity<'_> {
     /// The port's MESA with the records' parameters.
-    #[allow(clippy::too_many_lines)]
     fn mesa(&self, current: RecordPair<'_>) -> SpiceResult<Mesa> {
         let (m, i) = (current.model, current.instance);
-        let celsius = |record: &SensitivityRecord, keyword: &str| -> SpiceResult<Option<Real>> {
-            Ok(record
-                .given(keyword)
-                .then(|| record.value(keyword))
-                .transpose()?
-                .map(|kelvin| kelvin - CELSIUS_TO_KELVIN))
-        };
         let model = Model {
             threshold: m.value("vto")?,
             lambda: m.value("lambda")?,
@@ -2113,7 +2117,7 @@ impl MesaSensitivity<'_> {
             xtm2: m.value("xtm2")?,
             ks: m.value("ks")?,
             vsg: m.value("vsg")?,
-            tf: celsius(m, "tf")?,
+            tf: given_celsius(m, "tf")?,
             flo: m.value("flo")?,
             delfo: m.value("delfo")?,
             ag: m.value("ag")?,
@@ -2125,8 +2129,8 @@ impl MesaSensitivity<'_> {
             l: i.value("l")?,
             w: i.value("w")?,
             m: i.value("m")?,
-            td: celsius(i, "td")?,
-            ts: celsius(i, "ts")?,
+            td: given_celsius(i, "td")?,
+            ts: given_celsius(i, "ts")?,
             dtemp: i.value("dtemp")?,
         };
         // `MESAmParam` writes the level straight into C's `double` field, so a
@@ -2142,6 +2146,7 @@ impl MesaSensitivity<'_> {
             model,
             instance,
             initial: self.device.initial.clone(),
+            temperature_cache: TemperatureCache::new(),
         })
     }
 }
@@ -2179,7 +2184,6 @@ impl Device for ResetMesa {
 
     /// `mesaacl.c`'s real stamps in its order; `xgs`/`xgd` are zero.
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
-        use crate::devices::sensitivity::{ResetStamp, ResetStamps, StampAt, StampPart};
         let model_context = context.model_context;
         let (temperature, nominal) = (model_context.temperature, model_context.nominal_temperature);
         let state = &self.state;
@@ -2227,14 +2231,7 @@ impl Device for ResetMesa {
             (n.dpp, n.dp, -(m * tgf)),
             (n.gp, n.dpp, -(m * ggdpp)),
             (n.dpp, n.gp, -(m * ggdpp)),
-        ]
-        .into_iter()
-        .map(|(a, b, value)| ResetStamp {
-            at: StampAt::Nodes(a, b),
-            value,
-            part: StampPart::Real,
-        })
-        .collect();
-        ResetStamps::new(&current.name, 'z', &current.terminals, stamps)?.assemble_linear(context)
+        ];
+        stamp_reset(&current.name, context, &stamps, &[])
     }
 }

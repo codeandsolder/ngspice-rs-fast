@@ -330,3 +330,37 @@ fn coupled_flux_drives_dc_state_companions_and_linear_assembly() {
     close(system.e.get(b1, b1), -1e-3);
     close(system.e.get(b2, b2), -4e-3);
 }
+
+#[test]
+fn independent_coupling_groups_keep_pair_order_and_local_diagnostics() {
+    let body =
+        "l1 a 0 1m\nl2 b 0 4m\nl3 c 0 2m\nl4 d 0 8m\nk1 l1 l2 0.25\nk2 l3 l4 0.75\nk3 l2 l1 -0.125";
+    let c = circuit(body).unwrap();
+    let index = |name: &str| c.devices().iter().position(|d| d.name() == name).unwrap();
+    let terms = c.mutual_terms(&ModelContext::default()).unwrap();
+    let a = &terms[index("l1")];
+    let b = &terms[index("l3")];
+    assert_eq!(a.len(), 2);
+    assert_eq!(b.len(), 1);
+    assert_eq!(a[0].row, c.branch_rows(index("l2")).unwrap().start);
+    assert_eq!(a[1].row, a[0].row);
+    close(a[0].inductance, -0.00025);
+    close(a[1].inductance, 0.0005);
+    close(b[0].inductance, 0.003);
+    // A failure in the second component reports only its member inductors
+    // and coupling cards, not cards interleaved from the first component.
+    let error = error(&format!("{body}\nk4 l4 l3 0.5")).to_string();
+    assert!(error.contains("system l3 l4 coupled by k2 k4"), "{error}");
+    assert!(!error.contains("l1 l2"), "{error}");
+
+    let context = ModelContext::default()
+        .with_instance_override(
+            c.instance_override("k2", "k", 0.5, &ModelContext::default())
+                .unwrap(),
+        )
+        .unwrap();
+    let updated = c.mutual_terms(&context).unwrap();
+    close(updated[index("l3")][0].inductance, 0.002);
+    assert_eq!(updated[index("l1")], terms[index("l1")]);
+    assert_eq!(c.mutual_terms(&ModelContext::default()).unwrap(), terms);
+}

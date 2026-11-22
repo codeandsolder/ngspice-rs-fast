@@ -189,6 +189,16 @@ pub(super) fn request(input: &mut Input<'_>) -> Result<VectorRequest> {
             ),
         ));
     }
+    terminal_request(input, &head.text, &name, location)
+}
+
+/// Voltage/current and component functions with one or two terminal arguments.
+fn terminal_request(
+    input: &mut Input<'_>,
+    spelling: &str,
+    name: &str,
+    location: SourceLoc,
+) -> Result<VectorRequest> {
     if !input
         .input
         .first()
@@ -196,26 +206,22 @@ pub(super) fn request(input: &mut Input<'_>) -> Result<VectorRequest> {
     {
         return Err(fail(
             &location,
-            format!(
-                "'{}' needs a parenthesised argument ({SUPPORTED})",
-                head.text
-            ),
+            format!("'{spelling}' needs a parenthesised argument ({SUPPORTED})"),
         ));
     }
     any.parse_next(input)?;
-    let (positive, negative) = terminals(input, &location, &name)?;
+    let (positive, negative) = terminals(input, &location, name)?;
     if let Some(negative) = &negative
         && *negative == positive
     {
         return Err(fail(
             &location,
             format!(
-                "{}({positive},{negative}) is identically zero; leave out the repeated node",
-                name
+                "{name}({positive},{negative}) is identically zero; leave out the repeated node"
             ),
         ));
     }
-    let vector = match name.as_str() {
+    let vector = match name {
         "v" => RequestedVector::Voltage { positive, negative },
         "i" => {
             if negative.is_some() {
@@ -242,15 +248,16 @@ fn terminals(
     function: &str,
 ) -> Result<(String, Option<String>)> {
     let first = node(input, at, function)?;
-    let mut second = None;
-    if input
+    let second = if input
         .input
         .first()
         .is_some_and(|token| token.kind == TokenKind::Comma)
     {
         any.parse_next(input)?;
-        second = Some(node(input, at, function)?);
-    }
+        Some(node(input, at, function)?)
+    } else {
+        None
+    };
     cut_err(punctuation(TokenKind::RParen).context("')' after the node name(s)"))
         .parse_next(input)?;
     Ok((first, second))

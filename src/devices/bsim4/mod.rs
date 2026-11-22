@@ -41,7 +41,7 @@ mod geo;
 mod host;
 mod load;
 mod noise;
-/// Generated IFparm order, identifiers and setter/given-field mappings.
+/// Generated `IFparm` order, identifiers and setter/given-field mappings.
 pub mod parameters;
 mod pzld;
 mod sens;
@@ -53,12 +53,12 @@ mod temp;
 /// Generated from `b4set.c`'s given-guarded literal assignments, which
 /// `set.rs` reproduces in C order (a unit test there checks they agree).
 #[must_use]
-pub fn literal_defaults() -> &'static [(&'static str, f64)] {
+pub const fn literal_defaults() -> &'static [(&'static str, f64)] {
     defaults_data::LITERALS
 }
 
 /// The BSIM4 interface descriptor the shared input plumbing uses.
-pub(crate) const DEVICE: Device = Device {
+pub(in crate::devices) const DEVICE: Device = Device {
     reference: "bsim4/b4.c",
     model: parameters::MODEL,
     instance: parameters::INSTANCE,
@@ -67,7 +67,7 @@ pub(crate) const DEVICE: Device = Device {
     model_real: bsim4_model_real,
 };
 
-/// `b4mpar.c`: TNOM adds CONSTCtoK; NDEP converts above 1e20 and NSD/NGATE
+/// `b4mpar.c`: TNOM adds `CONSTCtoK`; NDEP converts above 1e20 and NSD/NGATE
 /// above 1e23 (and their L/W/P coefficients likewise) from cm^-3 to m^-3.
 fn bsim4_model_real(p: &Parameter, value: Real, location: &SourceLoc) -> SpiceResult<Real> {
     if p.canonical == "tnom" {
@@ -90,7 +90,7 @@ fn bsim4_model_real(p: &Parameter, value: Real, location: &SourceLoc) -> SpiceRe
 
 /// C's `IF_UNINTERESTING` rows, as `TABLE:keyword` pairs.
 #[must_use]
-pub fn uninteresting() -> &'static [&'static str] {
+pub const fn uninteresting() -> &'static [&'static str] {
     DEVICE.uninteresting
 }
 

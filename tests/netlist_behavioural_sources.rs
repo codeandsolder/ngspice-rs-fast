@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ngspice_rs::netlist::ast::{DeviceInstance, Netlist, ParameterKind};
-use ngspice_rs::netlist::behavioural::{lower_nonlinear_sources, poly_exponents};
+use ngspice_rs::netlist::behavioural::lower_nonlinear_sources;
 use ngspice_rs::netlist::bexpr::{BExpr, BExprKind, BehaviouralExpression};
 use ngspice_rs::netlist::elaborate::literalize;
 use ngspice_rs::netlist::eval::{EvalBudget, ParamScope};
@@ -177,6 +177,8 @@ fn malformed_nonlinear_forms_are_explicit_errors() {
     for (body, message) in [
         ("e1 o 0 poly(1) a 0", "at least one coefficient"),
         ("e1 o 0 poly(0) a 0 1", "positive integer POLY dimension"),
+        ("e1 o 0 poly(1.5) a 0 1", "positive integer POLY dimension"),
+        ("e1 o 0 poly(65) a 0 1", "positive integer POLY dimension"),
         ("e1 o 0 poly(1) a 0 1 2 m=2", "remove it"),
         ("e1 o 0 table {v(a)} = (0,0) (1)", "pairs"),
         ("e1 o 0 table (0,0) (1,1)", "in braces"),
@@ -406,10 +408,84 @@ fn poly_forms_lower_onto_spice2poly_in_spice2_term_order() {
         shape(&expression(&netlist.devices[1], "i").root),
         "(0 + (2 * i(vx)))"
     );
-    assert_eq!(
-        poly_exponents(2, 3),
-        vec![vec![1, 0], vec![0, 1], vec![2, 0]]
+}
+
+#[test]
+fn poly_dimensions_use_one_validation_rule_across_frontend() {
+    for spelling in ["2", "2.0", "2e0", "02", "+2"] {
+        let body = format!("e1 o 0 poly({spelling}) a 0 b 0 1 2 3");
+        let written = round_trip(&body);
+        assert!(written.contains(&body), "{written}");
+        let netlist = lowered(&body);
+        assert_eq!(
+            shape(&expression(&netlist.devices[0], "v").root),
+            "((1 + (2 * v(a,0))) + (3 * v(b,0)))"
+        );
+    }
+    // atoi in the C translator reads a decimal prefix, not a scaled SPICE
+    // number; the port must not accept an inconsistent dimension.
+    for spelling in ["2e1", "0.2e1", "1.5", "65", "0"] {
+        let body = format!("e1 o 0 poly({spelling}) a 0 b 0 1 2 3");
+        let error = try_parse(&body).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("positive integer POLY dimension"),
+            "{error}"
+        );
+    }
+    let mut malformed = parse("e1 o 0 poly(2) a 0 b 0 1 2 3");
+    malformed.devices[0].parameters[0].value = "18446744073709551615".into();
+    assert!(lower_nonlinear_sources(&malformed).is_err());
+    assert!(write_netlist(&malformed).is_err());
+}
+
+#[test]
+fn measurement_rewrite_preserves_global_serials_and_scope_boundaries() {
+    let result = lowered(
+        "r1 a 0 1k\nb1 out 0 v=i(r1)+i(r1)\n.subckt child a\nr1 a 0 2k\nb1 out 0 v=i(r1)\n.ends\nr2 b 0 2k\nb2 p 0 v=i(r2)+i(r1)+i(r2)",
     );
+    assert_eq!(
+        result
+            .devices
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
+        ["r1", "v_r1", "b1", "r2", "v_r2", "b2"]
+    );
+    assert_eq!(result.devices[0].nodes[0], "a_vmeas_0");
+    assert_eq!(result.devices[3].nodes[0], "b_vmeas_3");
+    assert_eq!(result.devices[1].nodes, ["a", "a_vmeas_0"]);
+    assert_eq!(result.devices[4].nodes, ["b", "b_vmeas_3"]);
+    assert_eq!(result.subcircuits[0].devices[0].nodes[0], "a_vmeas_2");
+    assert_eq!(result.subcircuits[0].devices[1].name, "v_r1");
+    assert_eq!(
+        expression(&result.devices[5], "v")
+            .root
+            .current_references(),
+        ["v_r2", "v_r1", "v_r2"]
+    );
+}
+
+#[test]
+fn measurement_rewrite_handles_many_independent_references() {
+    use std::fmt::Write as _;
+    let mut body = String::new();
+    for index in 0..512 {
+        writeln!(body, "r{index} n{index} 0 1k").unwrap();
+        writeln!(body, "b{index} out{index} 0 v=i(r{index})+i(r{index})").unwrap();
+    }
+    let result = lowered(&body);
+    assert_eq!(result.devices.len(), 3 * 512);
+    for (index, devices) in result.devices.as_chunks::<3>().0.iter().enumerate() {
+        assert_eq!(devices[0].nodes[0], format!("n{index}_vmeas_{}", 2 * index));
+        assert_eq!(devices[1].name, format!("v_r{index}"));
+        let reference = format!("v_r{index}");
+        assert_eq!(
+            expression(&devices[2], "v").root.current_references(),
+            [reference.as_str(), reference.as_str()]
+        );
+    }
 }
 
 #[test]

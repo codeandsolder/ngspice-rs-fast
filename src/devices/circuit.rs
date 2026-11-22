@@ -14,8 +14,10 @@
 //! [`Circuit::finalize`], which validates the graph and rebuilds the numbering
 //! in one go.
 
-use std::collections::BTreeSet;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::maths::{Coefficients, SparseMatrix, Vector};
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
@@ -23,7 +25,6 @@ use petgraph::graph::UnGraph;
 
 use crate::devices::linear::Forcing;
 use crate::devices::models::ModelContext;
-use crate::devices::rlc::Resistor;
 use crate::devices::state::{StateHistory, TrialState};
 use crate::devices::sweep::{InstanceOverride, ResistorMetadata, ResistorOverride};
 use crate::devices::traits::{
@@ -49,22 +50,51 @@ pub enum CircuitVertex {
 /// Connectivity is structural, not proof of a conductive DC path or solvability.
 pub type CircuitGraph = UnGraph<CircuitVertex, usize, usize>;
 
+/// A transient setup index, rebuilt from the current devices. No cache
+/// survives a topology change or a caller's use of `devices_mut`.
+#[derive(Default)]
+struct DeviceNames(BTreeMap<String, usize>);
+
+impl DeviceNames {
+    fn insert(&mut self, name: &str, index: usize) {
+        self.0.entry(name.to_ascii_lowercase()).or_insert(index);
+    }
+
+    fn get(&self, name: &str) -> Option<usize> {
+        let name = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(name.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(name)
+        };
+        self.0.get(name.as_ref()).copied()
+    }
+}
+
+/// Elaborated provenance of a device, kept as one record rather than three
+/// independently extended lists. Its ordinal indexes the device slice.
+#[derive(Default)]
+struct DeviceOrigin {
+    /// The parsed model name (lowercase), or C's default model.
+    model: Option<String>,
+    /// Nodes this device creates in its `DEVsetup`, in creation order.
+    internal_nodes: Vec<NodeId>,
+    /// The URC setup which generated this device and its model.
+    generated_by: Option<usize>,
+}
+
+struct PendingDevice {
+    device: Box<dyn Device>,
+    origin: DeviceOrigin,
+}
+
 /// A circuit under construction, or ready to be simulated.
 #[derive(Default)]
 pub struct Circuit {
-    pub(crate) observations: Vec<String>,
+    pub(super) observations: crate::devices::observe::ObservationPlan,
     nodes: NodeTable,
     unknowns: MnaUnknowns,
     devices: Vec<Box<dyn Device>>,
-    /// Per device, the model name it was parsed with (lowercase), or `None`
-    /// for its type's default model: C's model list membership.
-    models: Vec<Option<String>>,
-    /// Per device, the internal nodes its factory created, in creation order:
-    /// the nodes C's `DEVsetup` makes with `CKTmkVolt`.
-    internal_nodes: Vec<Vec<NodeId>>,
-    /// Per device, the ordinal of the URC line whose `URCsetup` created it
-    /// (and its model), or `None` for a parsed device.
-    generated_by: Vec<Option<usize>>,
+    origins: Vec<DeviceOrigin>,
     /// Device ordinals in C's `CKTsetup`/`CKTload` order
     /// ([`crate::devices::setup`]), computed by `finalize`.
     order: Vec<usize>,
@@ -84,7 +114,7 @@ pub struct Circuit {
     pattern: std::cell::RefCell<Option<std::sync::Arc<crate::maths::Pattern>>>,
     /// C's `CKTstate0` as the analyses run so far left it (C keeps one state
     /// vector for the whole deck); see [`Circuit::inherit_from`].
-    carried_state: std::cell::RefCell<Option<Vec<Real>>>,
+    carried_state: std::cell::RefCell<Option<StateSnapshot>>,
     /// The analyses already run on this circuit, in order (C keeps one
     /// circuit, and its devices' instance fields, for the whole deck); see
     /// [`Circuit::inherit_from`].
@@ -92,7 +122,7 @@ pub struct Circuit {
     /// The last successful transient's final load, including device instance
     /// quantities stored in trial slots (MOS `capbd`/`capbs`). Kept separate
     /// from `carried_state`: a later DC load must not overwrite these fields.
-    final_transient: std::cell::RefCell<Option<FinalTransientState>>,
+    final_transient: std::cell::RefCell<Option<StateSnapshot>>,
     /// [`Circuit::unknown_names`], computed on first use after
     /// [`Circuit::rebuild_unknowns`].
     unknown_names: std::cell::RefCell<Option<crate::maths::UnknownNames>>,
@@ -101,28 +131,72 @@ pub struct Circuit {
     fixed_stamps: std::cell::RefCell<crate::maths::FixedStamps>,
 }
 
-/// A successful transient's final load and the layout that can interpret it.
+/// Device-local state has meaning only under the layout that produced it.
+/// Node IDs are circuit-local, so include the node table, not just IDs.
 #[derive(Clone)]
-struct FinalTransientState {
-    values: Vec<Real>,
+struct StateLayout {
     rows: Vec<std::ops::Range<usize>>,
-    devices: Vec<(String, char, Vec<NodeId>)>,
+    nodes: Vec<crate::primitives::Node>,
+    devices: Vec<DeviceStateLayout>,
 }
 
-impl FinalTransientState {
+#[derive(Clone)]
+struct DeviceStateLayout {
+    name: String,
+    kind: crate::devices::setup::CDeviceType,
+    designator: char,
+    terminals: Vec<NodeId>,
+}
+
+impl StateLayout {
+    fn capture(circuit: &Circuit) -> Self {
+        Self {
+            rows: circuit.state_rows.clone(),
+            nodes: circuit.nodes.nodes().to_vec(),
+            devices: circuit
+                .devices
+                .iter()
+                .map(|device| DeviceStateLayout {
+                    name: device.name().to_owned(),
+                    kind: device.c_device_type(),
+                    designator: device.designator(),
+                    terminals: device.terminals().to_vec(),
+                })
+                .collect(),
+        }
+    }
     fn matches(&self, circuit: &Circuit) -> bool {
-        self.values.len() == circuit.state_len
-            && self.rows == circuit.state_rows
+        self.rows == circuit.state_rows
+            && self.nodes == circuit.nodes.nodes()
             && self.devices.len() == circuit.devices.len()
+            && self.rows.len() == circuit.devices.len()
             && self
                 .devices
                 .iter()
                 .zip(&circuit.devices)
-                .all(|((name, kind, terminals), device)| {
-                    name == device.name()
-                        && *kind == device.designator()
-                        && terminals == device.terminals()
+                .zip(&self.rows)
+                .all(|((saved, device), range)| {
+                    saved.name == device.name()
+                        && saved.kind == device.c_device_type()
+                        && saved.designator == device.designator()
+                        && saved.terminals == device.terminals()
+                        && range.len() == device.state_count()
                 })
+    }
+}
+
+/// An immutable state vector and the layout that interprets it. Carried
+/// small-signal state and the final transient snapshot have the same
+/// ownership and compatibility rules, but remain separate values.
+#[derive(Clone)]
+struct StateSnapshot {
+    values: Arc<[Real]>,
+    layout: Arc<StateLayout>,
+}
+
+impl StateSnapshot {
+    fn matches(&self, circuit: &Circuit) -> bool {
+        self.values.len() == circuit.state_len && self.layout.matches(circuit)
     }
 }
 
@@ -133,14 +207,134 @@ struct MutualPair {
     coupling: usize,
     first: usize,
     second: usize,
-    coefficient: Real,
 }
 
 /// The resolved K couplings of a circuit.
 #[derive(Debug, Clone, Default)]
 struct MutualBinding {
     pairs: Vec<MutualPair>,
+    groups: Vec<CoupledGroup>,
+    setup_rows: BTreeMap<usize, Vec<(usize, usize)>>,
+    evaluation: std::cell::RefCell<Option<MutualEvaluation>>,
     error: Option<SpiceError>,
+}
+
+/// The actual physical input values used for a verified coupling load.
+/// Cache by bit pattern, not by analysis/temperature guesses, so any
+/// contextual device or setter can invalidate it without special rules.
+#[derive(Debug, Clone)]
+struct MutualEvaluation {
+    values: BTreeMap<usize, InductanceValue>,
+    mutuals: Vec<Real>,
+    terms: PreparedMutualTerms,
+}
+
+impl MutualEvaluation {
+    fn matches(&self, values: &BTreeMap<usize, InductanceValue>, mutuals: &[Real]) -> bool {
+        const fn bits(value: &InductanceValue) -> [u64; 3] {
+            [
+                value.effective.to_bits(),
+                value.coupling_base.to_bits(),
+                value.initial.to_bits(),
+            ]
+        }
+        self.values.len() == values.len()
+            && self
+                .values
+                .iter()
+                .zip(values)
+                .all(|((a, x), (b, y))| a == b && bits(x) == bits(y))
+            && self.mutuals.len() == mutuals.len()
+            && self
+                .mutuals
+                .iter()
+                .zip(mutuals)
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+}
+
+/// No allocation for the ordinary uncoupled circuit. A checked coupled
+/// circuit shares its complete stamp input across successive loads.
+#[derive(Debug, Clone, Default)]
+pub(super) struct PreparedMutualTerms(Option<Arc<[Vec<MutualTerm>]>>);
+
+impl std::ops::Deref for PreparedMutualTerms {
+    type Target = [Vec<MutualTerm>];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().unwrap_or(&[])
+    }
+}
+
+/// A fixed connected component of the K-card graph. Its local rows are
+/// increasing device ordinals, and edges keep original pair visitation order
+/// (including repeated and reversed couplings).
+#[derive(Debug, Clone, Default)]
+struct CoupledGroup {
+    inductors: Vec<usize>,
+    edges: Vec<GroupEdge>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GroupEdge {
+    pair: usize,
+    first_row: usize,
+    second_row: usize,
+}
+
+impl MutualBinding {
+    fn from_pairs(pairs: Vec<MutualPair>, branch_rows: &[std::ops::Range<usize>]) -> Self {
+        let inductors: Vec<_> = pairs
+            .iter()
+            .flat_map(|pair| [pair.first, pair.second])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let positions: BTreeMap<_, _> = inductors
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(position, device)| (device, position))
+            .collect();
+        let mut systems = petgraph::unionfind::UnionFind::<usize>::new(inductors.len());
+        for pair in &pairs {
+            systems.union(positions[&pair.first], positions[&pair.second]);
+        }
+        let labels = systems.into_labeling();
+        let mut groups = BTreeMap::<_, CoupledGroup>::new();
+        let mut local = vec![0; inductors.len()];
+        for (slot, (&label, &device)) in labels.iter().zip(&inductors).enumerate() {
+            let group = groups.entry(label).or_default();
+            local[slot] = group.inductors.len();
+            group.inductors.push(device);
+        }
+        for (index, pair) in pairs.iter().enumerate() {
+            let (first, second) = (positions[&pair.first], positions[&pair.second]);
+            groups
+                .entry(labels[first])
+                .or_default()
+                .edges
+                .push(GroupEdge {
+                    pair: index,
+                    first_row: local[first],
+                    second_row: local[second],
+                });
+        }
+        let mut setup_rows = BTreeMap::<_, Vec<_>>::new();
+        for pair in pairs.iter().rev() {
+            setup_rows.entry(pair.coupling).or_default().push((
+                branch_rows[pair.first].start,
+                branch_rows[pair.second].start,
+            ));
+        }
+        Self {
+            pairs,
+            groups: groups.into_values().collect(),
+            setup_rows,
+            evaluation: std::cell::RefCell::default(),
+            error: None,
+        }
+    }
 }
 
 /// One device convergence test pass ([`Circuit::convergence_test`]).
@@ -212,7 +406,7 @@ impl fmt::Debug for Circuit {
                     .map(|device| device.name())
                     .collect::<Vec<_>>(),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -225,13 +419,13 @@ impl Circuit {
 
     /// The node table.
     #[must_use]
-    pub fn nodes(&self) -> &NodeTable {
+    pub const fn nodes(&self) -> &NodeTable {
         &self.nodes
     }
 
     /// The MNA unknown numbering. Only valid after [`Circuit::rebuild_unknowns`].
     #[must_use]
-    pub fn unknowns(&self) -> &MnaUnknowns {
+    pub const fn unknowns(&self) -> &MnaUnknowns {
         &self.unknowns
     }
 
@@ -245,18 +439,19 @@ impl Circuit {
     pub fn devices_mut(&mut self) -> &mut [Box<dyn Device>] {
         // A replaced device may stamp other positions.
         self.fixed_stamps.get_mut().forget();
+        self.mutual.evaluation.get_mut().take();
         &mut self.devices
     }
 
     /// Number of device instances.
     #[must_use]
-    pub fn device_count(&self) -> usize {
+    pub const fn device_count(&self) -> usize {
         self.devices.len()
     }
 
     /// Size of the MNA system.
     #[must_use]
-    pub fn unknown_count(&self) -> usize {
+    pub const fn unknown_count(&self) -> usize {
         self.unknowns.len()
     }
 
@@ -264,7 +459,9 @@ impl Circuit {
     ///
     /// Matrix rows change as nodes are added, so call
     /// [`Circuit::rebuild_unknowns`] once the circuit is complete.
-    pub fn add_node(&mut self, name: &str) -> NodeId {
+    /// # Errors
+    /// Node identity or allocation capacity is exhausted.
+    pub fn add_node(&mut self, name: &str) -> SpiceResult<NodeId> {
         self.nodes.intern(name)
     }
 
@@ -276,57 +473,70 @@ impl Circuit {
     /// `res` node; the other setups make internal nodes first. State slots are
     /// numbered in device order, in a separate namespace.
     pub fn rebuild_unknowns(&mut self) {
+        let order = self.setup_order();
+        let mut names = DeviceNames::default();
+        for (index, device) in self.devices.iter().enumerate() {
+            names.insert(device.name(), index);
+        }
+        self.rebuild_unknowns_in_order(&order, &names);
+    }
+
+    fn rebuild_unknowns_in_order(&mut self, order: &[usize], names: &DeviceNames) {
+        use crate::devices::setup::CDeviceType;
+
         self.unknown_names.get_mut().take();
         self.fixed_stamps.get_mut().forget();
-        let owned: BTreeSet<NodeId> = self.internal_nodes.iter().flatten().copied().collect();
+        let mut owned = vec![false; self.nodes.len()];
+        for node in self
+            .origins
+            .iter()
+            .flat_map(|origin| &origin.internal_nodes)
+        {
+            if let Some(slot) = owned.get_mut(node.index()) {
+                *slot = true;
+            }
+        }
         self.unknowns
-            .rebuild_deferring(&self.nodes, |node| owned.contains(&node));
-        use crate::devices::setup::CDeviceType;
+            .rebuild_deferring(&self.nodes, |node| owned[node.index()]);
         self.branch_rows = vec![0..0; self.devices.len()];
         // `CKTmkCur` runs once per device: in its own DEVsetup, or earlier
         // when a CCCS/CCVS/CSW/ASRC setup asks `CKTfndBranch` for it
-        // (`VSRCfindBr`, `VCVSfindBr`, `CCVSfindBr` and `ASRCfindBr` make the
+        // (`VSRCfindBr`, `VCVSfindBr`, `CCVSfindBr` and `ASRCfindBr` create the
         // branch on demand), so a controlling source's branch is numbered
         // where its first user is set up.
-        let mut made = vec![false; self.devices.len()];
-        let make = |circuit: &mut Self, made: &mut [bool], index: usize| {
-            if made[index] {
+        let mut allocated = vec![false; self.devices.len()];
+        let mut allocate_branch = |unknowns: &mut MnaUnknowns, index: usize| {
+            if allocated[index] {
                 return;
             }
-            made[index] = true;
-            let count = circuit.devices[index].branch_currents();
-            let start = circuit.unknowns.len();
-            circuit.unknowns.add_rows(count);
-            circuit.branch_rows[index] = start..start + count;
+            allocated[index] = true;
+            let count = self.devices[index].branch_currents();
+            let start = unknowns.len();
+            unknowns.add_rows(count);
+            self.branch_rows[index] = start..start + count;
         };
-        for index in self.setup_order() {
+        for &index in order {
             let kind = self.devices[index].c_device_type();
-            // vsrcset.c, ccvsset.c and asrcset.c make their own branch before
-            // anything else; the other setups make internal nodes first.
+            // vsrcset.c, ccvsset.c and asrcset.c create their own branch before
+            // anything else; the other setups create internal nodes first.
             let branches_first = matches!(kind, CDeviceType::Vsrc | CDeviceType::Ccvs)
                 || (kind == CDeviceType::Asrc && self.devices[index].branch_currents() > 0);
             if branches_first {
-                make(self, &mut made, index);
+                allocate_branch(&mut self.unknowns, index);
             }
             // cccsset.c, ccvsset.c, cswsetup.c and asrcset.c call
             // CKTfndBranch for each controlling source, in order.
-            let found: Vec<usize> = self.devices[index]
-                .controlling_sources()
-                .iter()
-                .filter_map(|control| {
-                    self.devices.iter().position(|other| {
-                        other.name().eq_ignore_ascii_case(&control.name)
-                            && other.findable_branch().is_some()
-                    })
-                })
-                .collect();
-            for target in found {
-                make(self, &mut made, target);
+            for control in self.devices[index].controlling_sources() {
+                if let Some(target) = names.get(&control.name)
+                    && self.devices[target].findable_branch().is_some()
+                {
+                    allocate_branch(&mut self.unknowns, target);
+                }
             }
-            for &node in &self.internal_nodes[index] {
+            for &node in &self.origins[index].internal_nodes {
                 self.unknowns.assign_deferred(node);
             }
-            make(self, &mut made, index);
+            allocate_branch(&mut self.unknowns, index);
         }
         self.state_rows.clear();
         self.state_len = 0;
@@ -339,13 +549,13 @@ impl Circuit {
         self.control_rows = self
             .devices
             .iter()
-            .map(|device| self.resolve_controls(device.as_ref()))
+            .map(|device| self.resolve_controls(device.as_ref(), names))
             .collect();
-        self.mutual = match self.resolve_mutual() {
-            Ok(pairs) => MutualBinding { pairs, error: None },
+        self.mutual = match self.resolve_mutual(names) {
+            Ok(pairs) => MutualBinding::from_pairs(pairs, &self.branch_rows),
             Err(error) => MutualBinding {
-                pairs: Vec::new(),
                 error: Some(error),
+                ..MutualBinding::default()
             },
         };
     }
@@ -354,7 +564,7 @@ impl Circuit {
     /// inductors up with `CKTfndDev`; a card with more than two inductors
     /// couples every pair, as `inp_compat()` expands it). Names are matched
     /// case-insensitively after subcircuit renaming.
-    fn resolve_mutual(&self) -> Result<Vec<MutualPair>, SpiceError> {
+    fn resolve_mutual(&self, names: &DeviceNames) -> Result<Vec<MutualPair>, SpiceError> {
         let mut pairs = Vec::new();
         for (coupling, device) in self.devices.iter().enumerate() {
             let Some(description) = device.mutual_coupling() else {
@@ -366,11 +576,7 @@ impl Circuit {
                     Some(location) => SpiceError::parse(location.clone(), message),
                     None => SpiceError::circuit(message),
                 };
-                let Some(index) = self
-                    .devices
-                    .iter()
-                    .position(|other| other.name().eq_ignore_ascii_case(&reference.name))
-                else {
+                let Some(index) = names.get(&reference.name) else {
                     return Err(failure(format!(
                         "{}: coupling to non-existent inductor {}",
                         device.name(),
@@ -402,7 +608,6 @@ impl Circuit {
                         coupling,
                         first: *first,
                         second: *second,
-                        coefficient: description.coefficient,
                     });
                 }
             }
@@ -424,19 +629,37 @@ impl Circuit {
     /// Stale numbering, unresolved K references, invalid inductances or a
     /// system that is not positive semidefinite.
     pub fn mutual_terms(&self, context: &ModelContext) -> SpiceResult<Vec<Vec<MutualTerm>>> {
+        Ok(self.prepared_mutual_terms(context)?.to_vec())
+    }
+
+    fn prepared_mutual_terms(&self, context: &ModelContext) -> SpiceResult<PreparedMutualTerms> {
         self.check_numbering()?;
+        let replacements = if self.mutual.pairs.is_empty() {
+            Vec::new()
+        } else {
+            self.replacements(context)?
+        };
+        self.mutual_terms_with_replacements(context, &replacements)
+    }
+
+    /// The same load's already prepared overrides are also the source of
+    /// coupling values; do not rebuild their contextual devices a second time.
+    pub(super) fn mutual_terms_with_replacements(
+        &self,
+        context: &ModelContext,
+        replacements: &[(usize, Box<dyn Device>)],
+    ) -> SpiceResult<PreparedMutualTerms> {
         if let Some(error) = &self.mutual.error {
             return Err(error.clone());
         }
         if self.mutual.pairs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(PreparedMutualTerms::default());
         }
-        let replacements = self.replacements(context)?;
         let device_at = |index: usize| -> &dyn Device {
             replacements
                 .iter()
                 .find(|(i, _)| *i == index)
-                .map_or(self.devices[index].as_ref(), |(_, d)| d.as_ref())
+                .map_or_else(|| self.devices[index].as_ref(), |(_, d)| d.as_ref())
         };
         let mut values: std::collections::BTreeMap<usize, InductanceValue> =
             std::collections::BTreeMap::new();
@@ -452,7 +675,6 @@ impl Circuit {
                 values.insert(index, value);
             }
         }
-        let mut terms = vec![Vec::new(); self.devices.len()];
         let mut mutuals = Vec::with_capacity(self.mutual.pairs.len());
         // INDload adds each K's flux in the MUT instance list's order, the
         // last card first (instances are prepended).
@@ -469,6 +691,20 @@ impl Circuit {
                     self.devices[pair.coupling].name()
                 )));
             }
+            mutuals.push(inductance);
+        }
+        // PSD additions use pair order while the INDload flux sum uses
+        // reverse pair order. Both remain unchanged.
+        mutuals.reverse();
+        if let Some(cached) = &*self.mutual.evaluation.borrow()
+            && cached.matches(&values, &mutuals)
+        {
+            return Ok(cached.terms.clone());
+        }
+        self.check_inductive_systems(&values, &mutuals)?;
+        let mut terms = vec![Vec::new(); self.devices.len()];
+        for (pair, &inductance) in self.mutual.pairs.iter().zip(&mutuals).rev() {
+            let (a, b) = (values[&pair.first], values[&pair.second]);
             terms[pair.first].push(MutualTerm {
                 row: self.branch_rows[pair.second].start,
                 inductance,
@@ -479,11 +715,13 @@ impl Circuit {
                 inductance,
                 initial: a.initial,
             });
-            mutuals.push(inductance);
         }
-        // check_inductive_systems pairs these with self.mutual.pairs in order.
-        mutuals.reverse();
-        self.check_inductive_systems(&values, &mutuals)?;
+        let terms = PreparedMutualTerms(Some(terms.into()));
+        self.mutual.evaluation.replace(Some(MutualEvaluation {
+            values,
+            mutuals,
+            terms: terms.clone(),
+        }));
         Ok(terms)
     }
 
@@ -501,36 +739,20 @@ impl Circuit {
         values: &std::collections::BTreeMap<usize, InductanceValue>,
         mutuals: &[Real],
     ) -> SpiceResult<()> {
-        let inductors: Vec<usize> = values.keys().copied().collect();
-        let position = |index: usize| inductors.binary_search(&index).unwrap_or(0);
-        let mut systems = petgraph::unionfind::UnionFind::<usize>::new(inductors.len());
-        for pair in &self.mutual.pairs {
-            systems.union(position(pair.first), position(pair.second));
-        }
-        let labels = systems.into_labeling();
-        let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
-            std::collections::BTreeMap::new();
-        for (slot, label) in labels.iter().enumerate() {
-            groups.entry(*label).or_default().push(slot);
-        }
-        for members in groups.values() {
-            let n = members.len();
-            let local = |slot: usize| members.iter().position(|member| *member == slot);
+        for group in &self.mutual.groups {
+            let n = group.inductors.len();
             // The smallest eigenvalue of the group's matrix normalized by
             // `diagonal` (`M_ij / sqrt(d_i d_j)` off the unit diagonal), and
             // its rounding tolerance.
             let smallest = |diagonal: &dyn Fn(&InductanceValue) -> Real| -> SpiceResult<_> {
-                let mut matrix = crate::maths::Matrix::zeros(n, n);
+                let mut matrix = crate::maths::Matrix::zeros(n, n)?;
                 for row in 0..n {
                     matrix.set(row, row, 1.0)?;
                 }
-                let mut couplings = Vec::new();
-                for (pair, mutual) in self.mutual.pairs.iter().zip(mutuals) {
-                    let (Some(i), Some(j)) =
-                        (local(position(pair.first)), local(position(pair.second)))
-                    else {
-                        continue;
-                    };
+                for edge in &group.edges {
+                    let pair = &self.mutual.pairs[edge.pair];
+                    let mutual = mutuals[edge.pair];
+                    let (i, j) = (edge.first_row, edge.second_row);
                     let scale =
                         (diagonal(&values[&pair.first]) * diagonal(&values[&pair.second])).sqrt();
                     // A zero inductance (accepted, as in C) couples with
@@ -539,22 +761,29 @@ impl Circuit {
                     let normalized = if scale == 0.0 { 0.0 } else { mutual / scale };
                     matrix.add_to(i, j, normalized)?;
                     matrix.add_to(j, i, normalized)?;
-                    couplings.push(pair.coupling);
                 }
                 let eigenvalues = matrix.symmetric_eigenvalues()?;
                 let largest = eigenvalues.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "in-memory system size is converted to binary64 when defining a numerical tolerance"
+                )]
                 let tolerance = 64.0 * n as Real * Real::EPSILON * largest;
                 let smallest = eigenvalues.first().copied().unwrap_or(0.0);
-                Ok((smallest, tolerance, couplings))
+                Ok((smallest, tolerance))
             };
             // The matrix actually simulated: self-inductances as stamped
             // (`INDinduct / m`), mutuals from `INDinduct` (as C).
-            let (stamped, tolerance, mut couplings) = smallest(&|value| value.effective)?;
+            let (stamped, tolerance) = smallest(&|value| value.effective)?;
             if stamped < -tolerance {
                 // C's own check (`muttemp.c`) puts `INDinduct` (before `/m`)
                 // on the diagonal; it warns only when that matrix fails too.
-                let (c_matrix, c_tolerance, _) = smallest(&|value| value.coupling_base.abs())?;
+                let (c_matrix, c_tolerance) = smallest(&|value| value.coupling_base.abs())?;
+                let mut couplings: Vec<_> = group
+                    .edges
+                    .iter()
+                    .map(|edge| self.mutual.pairs[edge.pair].coupling)
+                    .collect();
                 couplings.sort_unstable();
                 couplings.dedup();
                 let names = |indices: &mut dyn Iterator<Item = usize>| {
@@ -563,7 +792,7 @@ impl Circuit {
                         .collect::<Vec<_>>()
                         .join(" ")
                 };
-                let inductor_names = names(&mut members.iter().map(|slot| inductors[*slot]));
+                let inductor_names = names(&mut group.inductors.iter().copied());
                 let coupling_names = names(&mut couplings.iter().copied());
                 let location = couplings.first().and_then(|index| {
                     self.devices[*index]
@@ -597,7 +826,11 @@ impl Circuit {
     /// device is known, so a controlling source may follow its user in the
     /// deck. Only devices with a [`Device::findable_branch`] qualify: C finds
     /// V, E, H (and B) branches, but not inductor currents.
-    fn resolve_controls(&self, device: &dyn Device) -> Result<Vec<usize>, SpiceError> {
+    fn resolve_controls(
+        &self,
+        device: &dyn Device,
+        names: &DeviceNames,
+    ) -> Result<Vec<usize>, SpiceError> {
         device
             .controlling_sources()
             .iter()
@@ -606,11 +839,7 @@ impl Circuit {
                     Some(location) => SpiceError::parse(location.clone(), message),
                     None => SpiceError::circuit(message),
                 };
-                let Some(index) = self
-                    .devices
-                    .iter()
-                    .position(|other| other.name().eq_ignore_ascii_case(&control.name))
-                else {
+                let Some(index) = names.get(&control.name) else {
                     return Err(failure(format!(
                         "{}: unknown controlling source {}",
                         device.name(),
@@ -636,7 +865,7 @@ impl Circuit {
     }
 
     /// The resolved controlling-branch rows of device `index`.
-    fn controls(&self, index: usize) -> SpiceResult<&[usize]> {
+    pub(super) fn controls(&self, index: usize) -> SpiceResult<&[usize]> {
         match self.control_rows.get(index) {
             Some(Ok(rows)) => Ok(rows),
             Some(Err(error)) => Err(error.clone()),
@@ -674,8 +903,9 @@ impl Circuit {
                 previous_dc = dc;
             }
         }
-        self.topology()?;
-        self.rebuild_unknowns();
+        let names = self.validate_topology()?;
+        let order = self.setup_order();
+        self.rebuild_unknowns_in_order(&order, &names);
         for index in 0..self.devices.len() {
             self.controls(index)?;
         }
@@ -683,19 +913,19 @@ impl Circuit {
             return Err(error.clone());
         }
         self.check_port_numbering()?;
-        self.allocate_matrix()
+        self.allocate_matrix(order)
     }
 
     /// Device ordinals in C's `CKTsetup`/`CKTload` order.
     fn setup_order(&self) -> Vec<usize> {
-        let keys: Vec<crate::devices::setup::SetupKey> = self
+        let keys: Vec<crate::devices::setup::SetupKey<'_>> = self
             .devices
             .iter()
             .enumerate()
             .map(|(index, device)| crate::devices::setup::SetupKey {
                 device_type: device.c_device_type(),
-                model: self.models.get(index).cloned().flatten(),
-                generated_by: self.generated_by.get(index).copied().flatten(),
+                model: self.origins[index].model.as_deref(),
+                generated_by: self.origins[index].generated_by,
             })
             .collect();
         crate::devices::setup::setup_order(&keys)
@@ -710,24 +940,16 @@ impl Circuit {
         pole_zero_setups: u32,
         elements: &mut Vec<(usize, usize)>,
     ) -> SpiceResult<bool> {
-        let coupled: Vec<(usize, usize)> = self
+        let coupled = self
             .mutual
-            .pairs
-            .iter()
-            .rev()
-            .filter(|pair| pair.coupling == index)
-            .map(|pair| {
-                (
-                    self.branch_rows[pair.first].start,
-                    self.branch_rows[pair.second].start,
-                )
-            })
-            .collect();
+            .setup_rows
+            .get(&index)
+            .map_or(&[][..], Vec::as_slice);
         let mut setup = crate::devices::setup::MatrixSetup {
             unknowns: &self.unknowns,
             branches: self.branch_rows[index].clone(),
             controls: self.controls(index)?,
-            coupled: &coupled,
+            coupled,
             pole_zero: pole_zero_setups > 0,
             pole_zero_setups,
             elements,
@@ -755,8 +977,7 @@ impl Circuit {
     /// they declare, in that order. A pattern that already starts with the
     /// same elements is kept, so its pivot order survives re-finalization
     /// (C sets a circuit up once).
-    fn allocate_matrix(&mut self) -> SpiceResult<()> {
-        let order = self.setup_order();
+    fn allocate_matrix(&mut self, order: Vec<usize>) -> SpiceResult<()> {
         let elements = self.ordered_elements(&order, 0)?;
         self.order = order;
         let n = self.unknown_count();
@@ -764,14 +985,14 @@ impl Circuit {
         if elements.is_empty() || n == 0 {
             return Ok(());
         }
-        let allocated = crate::maths::Pattern::new(n, elements);
+        let allocated = crate::maths::Pattern::new(n, elements)?;
         let same = slot.as_ref().is_some_and(|current| {
             current.order() == n
                 && current.len() >= allocated.len()
-                && (0..allocated.len()).all(|index| {
-                    let id = crate::maths::sparse::element_id(index);
-                    current.position(id) == allocated.position(id)
-                })
+                && current
+                    .positions()
+                    .take(allocated.len())
+                    .eq(allocated.positions())
         });
         if !same {
             *slot = Some(std::sync::Arc::new(allocated));
@@ -818,7 +1039,8 @@ impl Circuit {
         for index in self.setup_order() {
             if self.declare_elements(index, setups, &mut elements)? {
                 private.extend(
-                    self.internal_nodes[index]
+                    self.origins[index]
+                        .internal_nodes
                         .iter()
                         .filter_map(|&node| self.unknowns.node_row(node)),
                 );
@@ -826,8 +1048,7 @@ impl Circuit {
         }
         if let Some(pattern) = self.matrix_pattern() {
             let known: BTreeSet<(usize, usize)> = elements.iter().copied().collect();
-            for index in 0..pattern.len() {
-                let position = pattern.position(crate::maths::sparse::element_id(index));
+            for position in pattern.positions() {
                 if !known.contains(&position)
                     && !private.contains(&position.0)
                     && !private.contains(&position.1)
@@ -878,12 +1099,15 @@ impl Circuit {
     }
 
     /// Device ordinals in `CKTload` order (card order before `finalize`).
-    pub(crate) fn load_order(&self) -> Vec<usize> {
-        if self.order.len() == self.devices.len() {
-            self.order.clone()
+    pub(crate) fn load_order(&self) -> impl Iterator<Item = usize> + '_ {
+        let finalized = self.order.len() == self.devices.len();
+        let order = if finalized {
+            self.order.as_slice()
         } else {
-            (0..self.devices.len()).collect()
-        }
+            &[]
+        };
+        let fallback = if finalized { 0 } else { self.devices.len() };
+        order.iter().copied().chain(0..fallback)
     }
 
     /// `vsrctemp.c` (`VSRCtemp`, run before every analysis): the RF port
@@ -933,6 +1157,7 @@ impl Circuit {
     /// [`SpiceError::Circuit`] for dangling terminals or duplicate names, as in
     /// [`Circuit::finalize`]. No circuit state is changed on failure.
     pub fn topology(&self) -> SpiceResult<CircuitGraph> {
+        self.validate_topology()?;
         let mut graph = CircuitGraph::default();
         let node_vertices: Vec<_> = self
             .nodes
@@ -940,26 +1165,48 @@ impl Circuit {
             .iter()
             .map(|node| graph.add_node(CircuitVertex::Node(node.id)))
             .collect();
-        let mut seen = BTreeSet::new();
         for (index, device) in self.devices.iter().enumerate() {
             let vertex = graph.add_node(CircuitVertex::Device(index));
             for (port, terminal) in device.terminals().iter().enumerate() {
-                let Some(node_vertex) = node_vertices.get(terminal.index()) else {
+                graph.add_edge(vertex, node_vertices[terminal.index()], port);
+            }
+        }
+        Ok(graph)
+    }
+
+    /// Validate exactly the incidence constraints enforced by `topology()`,
+    /// without constructing a graph just to discard it. Build the lookup index
+    /// in the same pass. Keep the existing Unicode duplicate-name rule as
+    /// well as ASCII case-insensitive reference resolution.
+    fn validate_topology(&self) -> SpiceResult<DeviceNames> {
+        let mut names = DeviceNames::default();
+        let mut unicode = self
+            .devices
+            .iter()
+            .any(|d| !d.name().is_ascii())
+            .then(BTreeSet::new);
+        for (index, device) in self.devices.iter().enumerate() {
+            for terminal in device.terminals() {
+                if self.nodes.node(*terminal).is_none() {
                     return Err(SpiceError::circuit(format!(
                         "device {} refers to {terminal}, which is not in the node table",
                         device.name()
                     )));
-                };
-                graph.add_edge(vertex, *node_vertex, port);
+                }
             }
-            if !seen.insert(device.name().to_lowercase()) {
+            let duplicate = unicode.as_mut().map_or_else(
+                || names.get(device.name()).is_some(),
+                |seen| !seen.insert(device.name().to_lowercase()),
+            );
+            if duplicate {
                 return Err(SpiceError::circuit(format!(
                     "duplicate instance name '{}'",
                     device.name()
                 )));
             }
+            names.insert(device.name(), index);
         }
-        Ok(graph)
+        Ok(names)
     }
 
     /// Adds a device, checking that its terminals are already in the node table
@@ -995,9 +1242,10 @@ impl Circuit {
             })
             .collect();
         self.devices.push(device);
-        self.models.push(None);
-        self.internal_nodes.push(internal);
-        self.generated_by.push(None);
+        self.origins.push(DeviceOrigin {
+            internal_nodes: internal,
+            ..DeviceOrigin::default()
+        });
         Ok(())
     }
 
@@ -1059,7 +1307,13 @@ impl Circuit {
     #[must_use]
     pub fn state_history(&self) -> StateHistory {
         StateHistory::new(self.state_len)
-            .with_carried(self.carried_state.borrow().clone())
+            .with_carried_snapshot(
+                self.carried_state
+                    .borrow()
+                    .as_ref()
+                    .filter(|snapshot| snapshot.matches(self))
+                    .map(|snapshot| Arc::clone(&snapshot.values)),
+            )
             .with_delay_lines(
                 self.devices
                     .iter()
@@ -1098,9 +1352,12 @@ impl Circuit {
         let mut state = self
             .carried_state
             .borrow()
-            .clone()
-            .filter(|vector| vector.len() == self.state_len)
-            .unwrap_or_else(|| vec![0.; self.state_len]);
+            .as_ref()
+            .filter(|snapshot| snapshot.matches(self))
+            .map_or_else(
+                || vec![0.; self.state_len],
+                |snapshot| snapshot.values.to_vec(),
+            );
         let operating = crate::devices::distortion::DistortionContext {
             model_context: context,
             unknowns: &self.unknowns,
@@ -1112,7 +1369,8 @@ impl Circuit {
                 device.small_signal_state(&operating, slots)?;
             }
         }
-        *self.carried_state.borrow_mut() = Some(state);
+        let snapshot = self.make_state_snapshot(state.into());
+        *self.carried_state.borrow_mut() = Some(snapshot);
         Ok(())
     }
 
@@ -1127,25 +1385,27 @@ impl Circuit {
         if history.len() != self.state_len {
             return Err(SpiceError::circuit("final transient state dimensions"));
         }
-        let state = history.accepted(1).ok_or_else(|| {
+        let state = history.accepted_snapshot(1).ok_or_else(|| {
             SpiceError::circuit("a completed transient has no accepted device state")
         })?;
-        *self.final_transient.borrow_mut() = Some(FinalTransientState {
-            values: state.to_vec(),
-            rows: self.state_rows.clone(),
-            devices: self
-                .devices
-                .iter()
-                .map(|device| {
-                    (
-                        device.name().to_owned(),
-                        device.designator(),
-                        device.terminals().to_vec(),
-                    )
-                })
-                .collect(),
-        });
+        let snapshot = self.make_state_snapshot(state);
+        *self.final_transient.borrow_mut() = Some(snapshot);
         Ok(())
+    }
+
+    /// Reuse the layout shared by either compatible existing snapshot.
+    fn make_state_snapshot(&self, values: Arc<[Real]>) -> StateSnapshot {
+        let carried = self.carried_state.borrow();
+        let transient = self.final_transient.borrow();
+        let layout = carried
+            .iter()
+            .chain(transient.iter())
+            .find(|snapshot| snapshot.matches(self))
+            .map_or_else(
+                || Arc::new(StateLayout::capture(self)),
+                |snapshot| Arc::clone(&snapshot.layout),
+            );
+        StateSnapshot { values, layout }
     }
 
     /// A snapshot of the last successful transient's final load state, in
@@ -1160,11 +1420,12 @@ impl Circuit {
             .borrow()
             .as_ref()
             .filter(|state| state.matches(self))
-            .map(|state| state.values.clone())
+            .map(|state| state.values.to_vec())
     }
 
-    fn check_numbering(&self) -> SpiceResult<()> {
-        if self.branch_rows.len() != self.devices.len()
+    pub(super) fn check_numbering(&self) -> SpiceResult<()> {
+        if !self.unknowns.covers_nodes(&self.nodes)
+            || self.branch_rows.len() != self.devices.len()
             || self.state_rows.len() != self.devices.len()
             || self.control_rows.len() != self.devices.len()
         {
@@ -1353,7 +1614,26 @@ impl Circuit {
                 "single-device load does not match the circuit numbering",
             ));
         }
-        let mutual = self.mutual_terms(request.model_context)?;
+        let mutual = self.prepared_mutual_terms(request.model_context)?;
+        self.stamp_isolated(index, device, request, matrix, rhs, trial, &mutual)
+    }
+
+    /// A checked isolated load's shared stamping path. Observations reuse the
+    /// point's already prepared coupling terms for every isolated device.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "explicit isolated load and its prepared coupling inputs"
+    )]
+    pub(super) fn stamp_isolated(
+        &self,
+        index: usize,
+        device: &dyn Device,
+        request: &LoadRequest<'_>,
+        matrix: &mut SparseMatrix,
+        rhs: &mut Vector,
+        trial: &mut TrialState,
+        mutual: &[Vec<MutualTerm>],
+    ) -> SpiceResult<()> {
         let states = request
             .history
             .device_of(trial, self.state_rows[index].clone(), index)?;
@@ -1448,22 +1728,18 @@ impl Circuit {
                 .devices
                 .get(target.device())
                 .ok_or_else(|| SpiceError::circuit("stale resistor override"))?;
-            let terminals = match device.terminals() {
-                [a, b] if device.resistor_metadata().is_some() => [*a, *b],
-                _ => {
-                    return Err(SpiceError::circuit(format!(
-                        "resistor override targets {}, which is not a two-terminal resistor",
-                        device.name()
-                    )));
-                }
-            };
+            if device.terminals().len() != 2 || device.resistor_metadata().is_none() {
+                return Err(SpiceError::circuit(format!(
+                    "resistor override targets {}, which is not a two-terminal resistor",
+                    device.name()
+                )));
+            }
             if replacements.iter().any(|(i, _)| *i == target.device()) {
                 return Err(SpiceError::circuit("duplicate resistor override"));
             }
-            let effective = device.resistor_effective(target.supplied(), context)?;
             replacements.push((
                 target.device(),
-                Box::new(Resistor::new(device.name(), terminals, effective)?),
+                device.with_instance_parameter("resistance", target.supplied(), context)?,
             ));
         }
         let resistors = replacements.len();
@@ -1545,7 +1821,7 @@ impl Circuit {
         matrix.set_pivot_tolerances(request.model_context.pivot);
         matrix.set_unknown_names(Some(self.unknown_names()));
         let replacements = self.replacements(request.model_context)?;
-        let mutual = self.mutual_terms(request.model_context)?;
+        let mutual = self.mutual_terms_with_replacements(request.model_context, &replacements)?;
         let mut voltage_source_value = 0.;
         let unlent = matrix.lend_fixed(self.fixed_stamps.take(), self.devices.len());
         let stamped = self.stamp_devices(
@@ -1560,13 +1836,16 @@ impl Circuit {
         self.fixed_stamps
             .replace(unlent.unwrap_or_else(|| matrix.return_fixed()));
         stamped?;
-        self.learn_pattern(matrix);
+        self.learn_pattern(matrix)?;
         matrix.record_trace();
         Ok(())
     }
 
     /// [`Circuit::load`]'s device loop: each device stamps in load order.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the positional interface explicit at the reference solver or device boundary"
+    )]
     fn stamp_devices(
         &self,
         request: &LoadRequest<'_>,
@@ -1577,7 +1856,7 @@ impl Circuit {
         mutual: &[Vec<MutualTerm>],
         voltage_source_value: &mut Real,
     ) -> SpiceResult<()> {
-        for (position, index) in self.load_order().into_iter().enumerate() {
+        for (position, index) in self.load_order().enumerate() {
             let device: &dyn Device = match replacements.iter().find(|(i, _)| *i == index) {
                 Some((_, replacement)) => &**replacement,
                 None => &*self.devices[index],
@@ -1639,9 +1918,13 @@ impl Circuit {
             .as_ref()
             .filter(|state| state.matches(previous) && state.matches(self))
             .cloned();
-        self.carried_state
-            .borrow_mut()
-            .clone_from(&previous.carried_state.borrow());
+        let carried = previous
+            .carried_state
+            .borrow()
+            .as_ref()
+            .filter(|state| state.matches(previous) && state.matches(self))
+            .cloned();
+        *self.carried_state.borrow_mut() = carried;
         let Some(inherited) = previous.pattern.borrow().clone() else {
             return;
         };
@@ -1649,10 +1932,10 @@ impl Circuit {
         let compatible = slot.as_ref().is_none_or(|current| {
             inherited.order() == current.order()
                 && inherited.len() >= current.len()
-                && (0..current.len()).all(|index| {
-                    let id = crate::maths::sparse::element_id(index);
-                    inherited.position(id) == current.position(id)
-                })
+                && inherited
+                    .positions()
+                    .take(current.len())
+                    .eq(current.positions())
         });
         if compatible {
             *slot = Some(inherited);
@@ -1686,35 +1969,38 @@ impl Circuit {
     /// Records the positions a load stamped: the first load defines the
     /// pattern in stamp order; positions outside it are appended (which, as a
     /// new SPARSE element does, forces the next factorization to reorder).
-    fn learn_pattern(&self, matrix: &SparseMatrix) {
+    fn learn_pattern(&self, matrix: &SparseMatrix) -> SpiceResult<()> {
         let n = self.unknown_count();
         let mut slot = self.pattern.borrow_mut();
         let current = slot.as_ref().filter(|pattern| pattern.order() == n);
         let next = if let Some((bound, mut extra)) = matrix.overflow() {
             let mut extra = extra.by_ref().peekable();
             if extra.peek().is_none() {
-                return;
+                return Ok(());
             }
             match current {
-                Some(pattern) if std::sync::Arc::ptr_eq(pattern, bound) => pattern.extended(extra),
-                _ => return,
+                Some(pattern) if std::sync::Arc::ptr_eq(pattern, bound) => {
+                    pattern.extended(extra)?
+                }
+                _ => return Ok(()),
             }
         } else {
             let positions = matrix.triplets().iter().map(|t| (t.row, t.col));
             match current {
-                None => crate::maths::Pattern::new(n, positions),
+                None => crate::maths::Pattern::new(n, positions)?,
                 Some(pattern) => {
                     let mut missing = positions
                         .filter(|&(row, col)| pattern.find(row, col).is_none())
                         .peekable();
                     if missing.peek().is_none() {
-                        return;
+                        return Ok(());
                     }
-                    pattern.extended(missing)
+                    pattern.extended(missing)?
                 }
             }
         };
         *slot = Some(std::sync::Arc::new(next));
+        Ok(())
     }
 
     fn run_accept_hooks(
@@ -1771,9 +2057,13 @@ impl Circuit {
                 "state history does not match the circuit numbering",
             ));
         }
-        history.check(&trial)?;
-        self.run_accept_hooks(solution, time, Some(&trial))?;
-        history.commit(trial)
+        history
+            .accept_transaction(
+                trial,
+                |_, _| Ok(Vec::new()),
+                |trial| self.run_accept_hooks(solution, time, Some(trial)),
+            )
+            .map(drop)
     }
 
     /// Accepts a companion-transient point: [`Self::accept_point`] plus the
@@ -1805,7 +2095,22 @@ impl Circuit {
                 "state history does not match the circuit numbering",
             ));
         }
-        history.check(&trial)?;
+        history.accept_transaction(
+            trial,
+            |history, trial| self.delay_updates(solution, time, history, trial, delay),
+            |trial| self.run_accept_hooks(solution, Some(time), Some(trial)),
+        )
+    }
+
+    /// Compute delay updates in C's load order without modifying history.
+    fn delay_updates(
+        &self,
+        solution: &Vector,
+        time: Real,
+        history: &StateHistory,
+        trial: &TrialState,
+        delay: &DelayAcceptance,
+    ) -> SpiceResult<Vec<(usize, crate::devices::delay::DelayUpdate)>> {
         let mut updates = Vec::new();
         // TRAaccept walks C's model/instance lists: the load order.
         for index in self.load_order() {
@@ -1850,14 +2155,7 @@ impl Circuit {
             };
             updates.push((index, update));
         }
-        history.check_delays(&updates)?;
-        self.run_accept_hooks(solution, Some(time), Some(&trial))?;
-        history.commit(trial)?;
-        history.apply_delays(&updates)?;
-        Ok(updates
-            .into_iter()
-            .flat_map(|(_, update)| update.breakpoints)
-            .collect())
+        Ok(updates)
     }
 
     /// The tightest step bound of every delay line for a converged transient
@@ -1943,7 +2241,7 @@ impl Circuit {
         ))?;
         self.finalize()?;
         let replacements = self.replacements(context)?;
-        let mutual = self.mutual_terms(context)?;
+        let mutual = self.mutual_terms_with_replacements(context, &replacements)?;
         let mut system = crate::devices::linear::LinearSystem::new(self.unknown_count());
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
@@ -2034,10 +2332,10 @@ impl Circuit {
         let mut ranges = Vec::new();
         let system =
             self.bias_linearized_system(context, bias, state, setups.max(1), Some(&mut ranges))?;
-        let a = system.a.triplets();
-        let e = system.e.triplets();
+        let conductance_stamps = system.a.triplets();
+        let capacitance_stamps = system.e.triplets();
         let mut terms = Vec::new();
-        for (a_range, e_range, statements) in ranges {
+        for (conductance_range, capacitance_range, statements) in ranges {
             if !statements.is_empty() {
                 // The device recorded its C statements in order.
                 terms.extend(statements);
@@ -2045,46 +2343,53 @@ impl Circuit {
             }
             let first = terms.len();
             let slot = |terms: &mut Vec<crate::maths::pencil::PencilTerm>, row, col| {
-                if let Some(i) = terms[first..]
-                    .iter()
-                    .position(|t: &crate::maths::pencil::PencilTerm| t.row == row && t.col == col)
-                {
-                    first + i
-                } else {
-                    terms.push(crate::maths::pencil::PencilTerm {
-                        row,
-                        col,
-                        conductance: None,
-                        capacitance: None,
-                    });
-                    terms.len() - 1
-                }
+                let existing =
+                    terms[first..]
+                        .iter()
+                        .position(|stamp: &crate::maths::pencil::PencilTerm| {
+                            stamp.row == row && stamp.col == col
+                        });
+                existing.map_or_else(
+                    || {
+                        terms.push(crate::maths::pencil::PencilTerm {
+                            row,
+                            col,
+                            conductance: None,
+                            capacitance: None,
+                        });
+                        terms.len() - 1
+                    },
+                    |slot_index| first + slot_index,
+                )
             };
-            for t in &a[a_range] {
-                let i = slot(&mut terms, t.row, t.col);
-                let g = &mut terms[i].conductance;
-                *g = Some(g.map_or(t.value, |g| g + t.value));
+            for stamp in &conductance_stamps[conductance_range] {
+                let slot_index = slot(&mut terms, stamp.row, stamp.col);
+                let conductance = &mut terms[slot_index].conductance;
+                *conductance =
+                    Some(conductance.map_or(stamp.value, |conductance| conductance + stamp.value));
             }
-            let mut index = e_range.start;
-            while index < e_range.end {
-                let t = &e[index];
-                let (value, next) = match system
+            let mut index = capacitance_range.start;
+            while index < capacitance_range.end {
+                let stamp = &capacitance_stamps[index];
+                let (value, next) = system
                     .e_groups
                     .iter()
-                    .find(|g| g.range.start == index && g.range.end <= e_range.end)
-                {
-                    Some(group) => {
-                        let mut sum = group.terms.first().copied().unwrap_or(0.);
-                        for term in group.terms.iter().skip(1) {
-                            sum += term;
-                        }
-                        (group.scale * sum, group.range.end.max(index + 1))
-                    }
-                    None => (t.value, index + 1),
-                };
-                let i = slot(&mut terms, t.row, t.col);
-                let c = &mut terms[i].capacitance;
-                *c = Some(c.map_or(value, |c| c + value));
+                    .find(|group| {
+                        group.range.start == index && group.range.end <= capacitance_range.end
+                    })
+                    .map_or_else(
+                        || (stamp.value, index + 1),
+                        |group| {
+                            let mut sum = group.terms.first().copied().unwrap_or(0.);
+                            for term in group.terms.iter().skip(1) {
+                                sum += term;
+                            }
+                            (group.scale * sum, group.range.end.max(index + 1))
+                        },
+                    );
+                let slot_index = slot(&mut terms, stamp.row, stamp.col);
+                let capacitance = &mut terms[slot_index].capacitance;
+                *capacitance = Some(capacitance.map_or(value, |capacitance| capacitance + value));
                 index = next;
             }
         }
@@ -2116,7 +2421,7 @@ impl Circuit {
             ));
         }
         let replacements = self.replacements(context)?;
-        let mutual = self.mutual_terms(context)?;
+        let mutual = self.mutual_terms_with_replacements(context, &replacements)?;
         let mut system = crate::devices::linear::LinearSystem::new(self.unknown_count());
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
@@ -2194,13 +2499,11 @@ impl Circuit {
 
     /// Elaborate several AST instances atomically, in order.
     ///
-    /// Every device is built against one staged copy of the node table, and the
-    /// nodes and devices are committed together only once the whole batch has
-    /// succeeded. A failure at any point — a duplicate name, an unavailable
-    /// factory, an invalid parameter — therefore leaves the caller's node table,
-    /// devices and branch rows untouched, which is what subcircuit expansion
-    /// (#18) needs when it hands over a flattened deck. As with
-    /// [`Circuit::add_instance`], finalize after successful additions.
+    /// Builtin factories extend the node table under an append-only
+    /// transaction. Devices and their origins are staged as pairs; the new
+    /// node suffix and all devices are published only if the entire batch
+    /// succeeds. A failed batch does not change existing nodes, devices or
+    /// numbering. Finalize after adding instances.
     ///
     /// # Errors
     /// [`SpiceError::Circuit`] on a duplicate instance name (against the
@@ -2212,23 +2515,44 @@ impl Circuit {
         models: &crate::devices::models::ModelResolver<'_>,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<()> {
-        let mut seen: BTreeSet<String> = self
+        let seen: BTreeSet<String> = self
             .devices
             .iter()
             .map(|device| device.name().to_lowercase())
             .collect();
-        let mut nodes = self.nodes.clone();
-        let mut staged: Vec<Box<dyn Device>> = Vec::with_capacity(instances.len());
-        let mut internal: Vec<Vec<NodeId>> = Vec::with_capacity(instances.len());
-        let mut model_names: Vec<Option<String>> = Vec::with_capacity(instances.len());
-        let mut generated_by: Vec<Option<usize>> = Vec::with_capacity(instances.len());
-        // Node names written on the batch's cards, which URC-generated
-        // internal nodes must not reuse (crate::devices::urc::expand).
-        let deck_nodes: BTreeSet<&str> = instances
-            .iter()
-            .flat_map(|instance| instance.nodes.iter().map(String::as_str))
-            .collect();
         let base = self.devices.len();
+        let staged = crate::devices::factory::append_nodes(&mut self.nodes, |nodes| {
+            Self::elaborate_batch(instances, models, context, nodes, base, seen)
+        })?;
+        self.devices.reserve(staged.len());
+        self.origins.reserve(staged.len());
+        for pending in staged {
+            self.devices.push(pending.device);
+            self.origins.push(pending.origin);
+        }
+        self.fixed_stamps.get_mut().forget();
+        Ok(())
+    }
+
+    /// Build each device and its provenance in deck order. All node mutations
+    /// are append-only, as required by the surrounding transaction.
+    fn elaborate_batch(
+        instances: &[crate::netlist::ast::DeviceInstance],
+        models: &crate::devices::models::ModelResolver<'_>,
+        context: &ModelContext,
+        nodes: &mut NodeTable,
+        base: usize,
+        mut seen: BTreeSet<String>,
+    ) -> SpiceResult<Vec<PendingDevice>> {
+        let mark = nodes.len();
+        let mut staged = Vec::with_capacity(instances.len());
+        // C parses every external node before DEVsetup creates private nodes:
+        // canonicalize future names as well as those already interned.
+        let deck_nodes: BTreeSet<String> = instances
+            .iter()
+            .flat_map(|instance| &instance.nodes)
+            .map(|name| NodeTable::canonical_name(name, nodes.auto_gnd()))
+            .collect();
         for instance in instances {
             if !seen.insert(instance.name.to_lowercase()) {
                 return Err(SpiceError::circuit(format!(
@@ -2239,7 +2563,7 @@ impl Circuit {
             let first = nodes.len();
             if instance.designator == 'y'
                 && let Some(expanded) =
-                    crate::devices::txl::fallback(instance, &mut nodes, models, &deck_nodes)?
+                    crate::devices::txl::fallback(instance, nodes, models, &deck_nodes)?
             {
                 for device in expanded {
                     if !seen.insert(device.name().to_ascii_lowercase()) {
@@ -2248,99 +2572,122 @@ impl Circuit {
                             device.name()
                         )));
                     }
-                    staged.push(device);
-                    internal.push(Vec::new());
-                    model_names.push(None);
-                    generated_by.push(None);
+                    staged.push(PendingDevice {
+                        device,
+                        origin: DeviceOrigin::default(),
+                    });
                 }
                 continue;
             }
-            // A URC line is expanded into its generated R/C/D elements
-            // (urcsetup.c), which take its place under their own names.
             if instance.designator == 'u' {
-                let expanded = crate::devices::urc::expand(
-                    instance,
-                    &mut nodes,
-                    models,
-                    context,
-                    &deck_nodes,
-                )?;
-                let created: Vec<&crate::primitives::Node> = nodes.nodes()[first..]
-                    .iter()
-                    .filter(|node| !instance.nodes.contains(&node.name))
-                    .collect();
+                let expanded =
+                    crate::devices::urc::expand(instance, nodes, models, context, &deck_nodes)?;
                 let line = base + staged.len();
-                let lower = instance.name.to_lowercase();
-                for device in expanded {
-                    // The URC instance itself keeps its (already checked) name.
-                    let is_line = device.name().eq_ignore_ascii_case(&instance.name);
-                    if !is_line && !seen.insert(device.name().to_lowercase()) {
-                        return Err(SpiceError::circuit(format!(
-                            "duplicate instance name '{}' generated by URC {}",
-                            device.name(),
-                            instance.name
-                        )));
-                    }
-                    if is_line {
-                        // URCsetup's CKTmkVolt calls: the ladder nodes are
-                        // numbered at the URC line's own setup.
-                        internal.push(
-                            created
-                                .iter()
-                                .filter(|node| node.kind != NodeKind::Internal)
-                                .map(|node| node.id)
-                                .collect(),
-                        );
-                        model_names.push(instance.model.as_ref().map(|m| m.to_ascii_lowercase()));
-                        generated_by.push(None);
-                    } else {
-                        // A generated diode's own prime node (diosetup.c).
-                        internal.push(
-                            device
-                                .terminals()
-                                .iter()
-                                .copied()
-                                .filter(|id| {
-                                    created.iter().any(|node| {
-                                        node.id == *id && node.kind == NodeKind::Internal
-                                    })
-                                })
-                                .collect(),
-                        );
-                        // URCsetup's CKTmodCrt models `<name>#resmod`,
-                        // `#capmod` and `#diodemod`.
-                        let suffix = match device.c_device_type() {
-                            crate::devices::setup::CDeviceType::Res => "resmod",
-                            crate::devices::setup::CDeviceType::Cap => "capmod",
-                            _ => "diodemod",
-                        };
-                        model_names.push(Some(format!("{lower}#{suffix}")));
-                        generated_by.push(Some(line));
-                    }
-                    staged.push(device);
-                }
+                Self::stage_urc(
+                    instance,
+                    nodes,
+                    expanded,
+                    first,
+                    line,
+                    &mut seen,
+                    &mut staged,
+                )?;
                 continue;
             }
-            // Builtin factories bind terminals in this staged table. Nothing
-            // fallible remains after committing the containers together.
-            staged.push(crate::devices::factory::instantiate_with_models(
-                instance, &mut nodes, models, context,
-            )?);
-            internal.push(
-                nodes.nodes()[first..]
+            let device =
+                crate::devices::factory::instantiate_with_models(instance, nodes, models, context)?;
+            let origin = DeviceOrigin {
+                internal_nodes: nodes.nodes()[first..]
                     .iter()
                     .filter(|node| node.kind == NodeKind::Internal)
                     .map(|node| node.id)
                     .collect(),
-            );
-            model_names.push(instance.model.as_ref().map(|m| m.to_ascii_lowercase()));
-            generated_by.push(None);
+                model: instance.model.as_ref().map(|m| m.to_ascii_lowercase()),
+                generated_by: None,
+            };
+            staged.push(PendingDevice { device, origin });
         }
-        self.nodes = nodes;
-        self.devices.extend(staged);
-        self.internal_nodes.extend(internal);
-        self.models.extend(model_names);
-        self.generated_by.extend(generated_by);
+        // Factories already reject existing names. Check private nodes which
+        // were created before a later parsed card could introduce its name.
+        // This includes semiconductor and transmission-line setup, not just
+        // the explicit URC/TXL expansions.
+        if let Some(collision) = nodes.nodes()[mark..]
+            .iter()
+            .find(|node| node.kind == NodeKind::Internal && deck_nodes.contains(&node.name))
+        {
+            return Err(SpiceError::circuit(format!(
+                "internal-node name collision: {}",
+                collision.name
+            )));
+        }
+        Ok(staged)
+    }
+
+    // Preserve ownership and insertion order of a URC's generated devices.
+    fn stage_urc(
+        instance: &crate::netlist::ast::DeviceInstance,
+        nodes: &NodeTable,
+        expanded: Vec<Box<dyn Device>>,
+        first: usize,
+        line: usize,
+        seen: &mut BTreeSet<String>,
+        staged: &mut Vec<PendingDevice>,
+    ) -> SpiceResult<()> {
+        let parsed_terminals: BTreeSet<_> = instance
+            .nodes
+            .iter()
+            .filter_map(|name| nodes.get(name))
+            .collect();
+        let lower = instance.name.to_lowercase();
+        for device in expanded {
+            let is_line = device.name().eq_ignore_ascii_case(&instance.name);
+            if !is_line && !seen.insert(device.name().to_lowercase()) {
+                return Err(SpiceError::circuit(format!(
+                    "duplicate instance name '{}' generated by URC {}",
+                    device.name(),
+                    instance.name
+                )));
+            }
+            let origin = if is_line {
+                // URCsetup's own ladder nodes: defer until the URC's setup.
+                DeviceOrigin {
+                    internal_nodes: nodes.nodes()[first..]
+                        .iter()
+                        .filter(|node| {
+                            node.kind != NodeKind::Internal && !parsed_terminals.contains(&node.id)
+                        })
+                        .map(|node| node.id)
+                        .collect(),
+                    model: instance.model.as_ref().map(|m| m.to_ascii_lowercase()),
+                    generated_by: None,
+                }
+            } else {
+                // The generated diode's prime node belongs to diosetup.
+                let internal_nodes = device
+                    .terminals()
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        id.index() >= first
+                            && !parsed_terminals.contains(id)
+                            && nodes
+                                .node(*id)
+                                .is_some_and(|node| node.kind == NodeKind::Internal)
+                    })
+                    .collect();
+                let suffix = match device.c_device_type() {
+                    crate::devices::setup::CDeviceType::Res => "resmod",
+                    crate::devices::setup::CDeviceType::Cap => "capmod",
+                    _ => "diodemod",
+                };
+                DeviceOrigin {
+                    internal_nodes,
+                    model: Some(format!("{lower}#{suffix}")),
+                    generated_by: Some(line),
+                }
+            };
+            staged.push(PendingDevice { device, origin });
+        }
         Ok(())
     }
 
@@ -2442,7 +2789,7 @@ impl Circuit {
         }
         circuit.finalize()?;
         // Reject an invalid inductive system (K coupling) before any analysis.
-        circuit.mutual_terms(context)?;
+        circuit.prepared_mutual_terms(context)?;
         Ok(circuit)
     }
 
@@ -2508,13 +2855,131 @@ mod tests {
     }
 
     fn stub(circuit: &mut Circuit, name: &str, a: &str, b: &str, branch_currents: usize) -> Stub {
-        let first = circuit.add_node(a);
-        let second = circuit.add_node(b);
+        let first = circuit.add_node(a).unwrap();
+        let second = circuit.add_node(b).unwrap();
         Stub {
             name: name.to_owned(),
             terminals: vec![first, second],
             branch_currents,
         }
+    }
+
+    #[test]
+    fn coupling_cache_reuses_only_bitwise_identical_validated_values() {
+        use crate::devices::ModelContext;
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use std::{path::Path, sync::Arc};
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("coupling.cir"),
+                "coupling\nl1 a 0 1m ic=0\nl2 b 0 4m\nk1 l1 l2 0.5\n.end\n",
+            ))
+            .unwrap();
+        let context = ModelContext::default();
+        let mut c = Circuit::from_netlist(&deck).unwrap();
+        let first = c.prepared_mutual_terms(&context).unwrap();
+        let same = c
+            .prepared_mutual_terms(&ModelContext::new(57., 27.))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            first.0.as_ref().unwrap(),
+            same.0.as_ref().unwrap()
+        ));
+        let override_k = |value| {
+            context
+                .with_instance_override(c.instance_override("k1", "k", value, &context).unwrap())
+                .unwrap()
+        };
+        let invalid = override_k(1.5);
+        assert!(c.prepared_mutual_terms(&invalid).is_err());
+        let retained = c.prepared_mutual_terms(&context).unwrap();
+        assert!(Arc::ptr_eq(
+            first.0.as_ref().unwrap(),
+            retained.0.as_ref().unwrap()
+        ));
+        let changed = c.prepared_mutual_terms(&override_k(0.25)).unwrap();
+        assert!(!Arc::ptr_eq(
+            first.0.as_ref().unwrap(),
+            changed.0.as_ref().unwrap()
+        ));
+        assert_ne!(&*first, &*changed);
+        let zero = c.prepared_mutual_terms(&override_k(0.)).unwrap();
+        let negative_zero = c.prepared_mutual_terms(&override_k(-0.)).unwrap();
+        assert!(!Arc::ptr_eq(
+            zero.0.as_ref().unwrap(),
+            negative_zero.0.as_ref().unwrap()
+        ));
+        let repeated = c.prepared_mutual_terms(&context).unwrap();
+        assert_eq!(&*repeated, &*first);
+        c.finalize().unwrap();
+        let rebuilt = c.prepared_mutual_terms(&context).unwrap();
+        assert!(!Arc::ptr_eq(
+            repeated.0.as_ref().unwrap(),
+            rebuilt.0.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn inherited_state_checks_node_identity_and_shares_compatible_snapshots() {
+        use crate::devices::ModelContext;
+        use crate::devices::state::StateHistory;
+        use crate::maths::Vector;
+        use std::sync::Arc;
+        // A real capacitor supplies two state slots. A programmatic caller
+        // can have an equal-size layout whose node IDs mean other nodes.
+        let build = |name: &str| {
+            let mut circuit = Circuit::new();
+            let node = circuit.add_node(name).unwrap();
+            circuit
+                .add_device(Box::new(
+                    crate::devices::Capacitor::new("c1", [node, NodeId::GROUND], 1., None).unwrap(),
+                ))
+                .unwrap();
+            circuit.finalize().unwrap();
+            circuit
+        };
+        let original = build("a");
+        original
+            .record_small_signal_state(&ModelContext::default(), &Vector::zeros(1))
+            .unwrap();
+        let mut history = StateHistory::new(original.state_len());
+        let mut trial = history.trial();
+        let mut state = history.device(&mut trial, 0..2).unwrap();
+        state.set(0, 1.).unwrap();
+        state.set(1, 2.).unwrap();
+        history.commit(trial).unwrap();
+        original.record_final_transient_state(&history).unwrap();
+        let snapshot = original.final_transient.borrow();
+        let snapshot = snapshot.as_ref().unwrap();
+        assert!(Arc::ptr_eq(
+            &snapshot.values,
+            &history.accepted_snapshot(1).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &snapshot.layout,
+            &original.carried_state.borrow().as_ref().unwrap().layout
+        ));
+
+        let mut compatible = build("a");
+        compatible.inherit_from(&original);
+        assert_eq!(compatible.final_transient_state(), Some(vec![1., 2.]));
+        assert!(Arc::ptr_eq(
+            &compatible.carried_state.borrow().as_ref().unwrap().values,
+            &original.carried_state.borrow().as_ref().unwrap().values
+        ));
+        let mut foreign = build("different");
+        foreign.inherit_from(&original);
+        assert!(foreign.final_transient_state().is_none());
+        assert!(foreign.carried_state.borrow().is_none());
+        // Device mutation can invalidate a snapshot before re-finalization.
+        compatible.devices_mut()[0] = Box::new(
+            crate::devices::Capacitor::new("other", [NodeId::new(1), NodeId::GROUND], 1., None)
+                .unwrap(),
+        );
+        assert!(compatible.final_transient_state().is_none());
+        let history = compatible.state_history();
+        let mut trial = history.trial();
+        assert_eq!(history.device(&mut trial, 0..2).unwrap().carried(0), None);
     }
 
     #[test]
@@ -2545,7 +3010,7 @@ mod tests {
     #[test]
     fn dangling_terminals_are_rejected() {
         let mut circuit = Circuit::new();
-        let known = circuit.add_node("a");
+        let known = circuit.add_node("a").unwrap();
         let dangling = NodeId::new(99);
         let device = Stub {
             name: "r1".to_owned(),
@@ -2565,7 +3030,7 @@ mod tests {
         assert_eq!(circuit.unknown_count(), 2);
 
         // A node added afterwards shifts nothing until the next rebuild.
-        circuit.add_node("late");
+        circuit.add_node("late").unwrap();
         circuit.finalize().unwrap();
         assert_eq!(circuit.unknown_count(), 3);
     }
@@ -2607,7 +3072,7 @@ mod tests {
             empty.node_weights().copied().collect::<Vec<_>>(),
             vec![CircuitVertex::Node(NodeId::GROUND)]
         );
-        let unused = circuit.add_node("unused");
+        let unused = circuit.add_node("unused").unwrap();
         let graph = circuit.topology().unwrap();
         assert_eq!(graph.node_count(), 2);
         assert_eq!(connected_components(&graph), 2);
@@ -2659,8 +3124,8 @@ mod tests {
     #[test]
     fn multiport_and_repeated_terminals_keep_parallel_edges_and_ordinals() {
         let mut circuit = Circuit::new();
-        let output = circuit.add_node("out");
-        let ground = circuit.add_node("gnd");
+        let output = circuit.add_node("out").unwrap();
+        let ground = circuit.add_node("gnd").unwrap();
         circuit
             .add_device(Box::new(Stub {
                 name: "m1".to_owned(),
@@ -2738,7 +3203,7 @@ mod tests {
         let a = device.terminals[0];
         circuit.add_device(Box::new(device)).unwrap();
         let before = circuit.topology().unwrap();
-        circuit.add_node("late");
+        circuit.add_node("late").unwrap();
         circuit.devices_mut()[0] = Box::new(Stub {
             name: "r1".to_owned(),
             terminals: vec![a, a],
@@ -2769,7 +3234,7 @@ mod tests {
         circuit.add_device(Box::new(second)).unwrap();
         circuit.finalize().unwrap();
         let original = circuit.unknowns().clone();
-        circuit.add_node("late");
+        circuit.add_node("late").unwrap();
         circuit.devices_mut()[1] = Box::new(Stub {
             name: "R1".to_owned(),
             terminals: vec![b, NodeId::GROUND],

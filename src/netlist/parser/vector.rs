@@ -1,4 +1,4 @@
-//! Bounded numeric vectors for INPgetValue(IF_REALVEC), in `inpgval.c`.
+//! Bounded numeric vectors for `INPgetValue(IF_REALVEC)`, in `inpgval.c`.
 //! C gobbles punctuation permissively; this grammar deliberately requires a
 //! balanced optional outer pair and a value after every comma. Bare vectors
 //! end at the next keyword, not by swallowing an overflowing numeric value.
@@ -39,7 +39,7 @@ pub(super) fn numeric<'a>(input: &mut Input<'a>, maximum: usize) -> Result<Numer
         .is_some();
     let first = cut_err(literal).parse_next(input)?;
     let mut count = 1;
-    let following: Vec<&Token> = repeat(0.., |input: &mut Input<'a>| {
+    let values: Vec<&Token> = repeat(0.., |input: &mut Input<'a>| {
         // A comma claims another value. So do numeric and expression tokens;
         // their errors must survive repeat's optional stopping rule.
         let comma = opt(punctuation(TokenKind::Comma)).parse_next(input)?;
@@ -57,9 +57,14 @@ pub(super) fn numeric<'a>(input: &mut Input<'a>, maximum: usize) -> Result<Numer
         count += 1;
         Ok(value)
     })
+    .fold(
+        || vec![first],
+        |mut values, value| {
+            values.push(value);
+            values
+        },
+    )
     .parse_next(input)?;
-    let mut values = vec![first];
-    values.extend(following);
     let last = if parenthesized {
         cut_err(punctuation(TokenKind::RParen).context("')' after numeric vector"))
             .parse_next(input)?

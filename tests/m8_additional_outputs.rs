@@ -64,7 +64,7 @@ fn frontend_settings_roundtrip_and_unsupported_commands_fail() {
         .unwrap();
     let config = RunConfig::from_netlist(&reparsed).unwrap();
     let request = config.request_for(&reparsed.analyses[0]).unwrap();
-    assert!(request.squared_noise && request.spice3_noise);
+    assert!(request.noise.squared && request.noise.spice3);
     for body in [
         ".control\nresume\n.endc",
         ".control\nset unknown\n.endc",

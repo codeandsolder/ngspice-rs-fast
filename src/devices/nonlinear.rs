@@ -34,17 +34,17 @@ use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 
+pub(super) mod charge;
 mod sens;
+pub(super) mod thermal;
+use thermal::{
+    BOLTZMANN, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureCache, TemperatureKey, band_gap,
+    potential_shift,
+};
 
 /// Diode state slot of the limited junction voltage (C `DIOvoltage`).
+const DIODE_CHARGE_SLOT: usize = 0;
 const DIODE_VOLTAGE_SLOT: usize = 2;
-pub(crate) const K_OVER_Q: Real = 1.38064852e-23 / 1.6021766208e-19; // ngspice CONSTboltz/CHARGE
-/// ngspice `CONSTboltz` (J/K).
-const BOLTZMANN: Real = 1.38064852e-23;
-/// ngspice `CHARGE` (C).
-const CHARGE: Real = 1.6021766208e-19;
-/// ngspice `REFTEMP`: 27 degrees Celsius in Kelvin.
-const REFTEMP: Real = 300.15;
 /// ngspice default `CKTepsmin` (`cktntask.c`): IS floor and knee-current cutoff.
 const EPSMIN: Real = 1e-28;
 /// C's breakdown matching stops once `|xcbv - cbv| <= CKTreltol * cbv`
@@ -290,22 +290,21 @@ fn canonical<'a>(
     }
     Ok(out)
 }
-/// `floor(raw + 0.5)` integer selector (`inpgval.c` IF_INTEGER) within `0..=max`.
+/// `floor(raw + 0.5)` integer selector (`inpgval.c` `IF_INTEGER`) within `0..=max`.
 fn selector(values: &ScalarValues, name: &str, max: u8, owner: &DeviceInstance) -> SpiceResult<u8> {
     let raw = value(values, name)?;
-    let rounded = (raw + 0.5).floor();
-    if (0. ..=Real::from(max)).contains(&rounded) {
-        // In range 0..=max, so the cast is exact.
-        Ok(rounded as u8)
-    } else {
-        Err(SpiceError::parse(
-            values
-                .get(name)
-                .and_then(|v| v.location.clone())
-                .unwrap_or_else(|| owner.location.clone()),
-            format!("diode {name} must round to 0..={max}, got {raw}"),
-        ))
-    }
+    crate::primitives::c_integer(raw)
+        .and_then(|rounded| u8::try_from(rounded).ok())
+        .filter(|rounded| *rounded <= max)
+        .ok_or_else(|| {
+            SpiceError::parse(
+                values
+                    .get(name)
+                    .and_then(|v| v.location.clone())
+                    .unwrap_or_else(|| owner.location.clone()),
+                format!("diode {name} must round to 0..={max}, got {raw}"),
+            )
+        })
 }
 
 /// A level-1 diode with an optional internal anode for series resistance.
@@ -318,6 +317,7 @@ pub struct Diode {
     terminals: Vec<NodeId>,
     junction: [NodeId; 2],
     parameters: DiodeParameters,
+    derived: TemperatureCache<Thermal>,
     /// `off` and the instance `ic` (C `DIOoff`, `DIOinitCond`). The `ic`
     /// value is validated and kept but, exactly as in C, never used: see
     /// the `uic` start in `stamp`.
@@ -395,6 +395,13 @@ struct DiodeParameters {
     af: Real,
 }
 impl Diode {
+    fn thermal(&self, context: &ModelContext) -> SpiceResult<Thermal> {
+        self.derived
+            .get_or_derive(TemperatureKey::context(context), || {
+                self.parameters.thermal(context)
+            })
+    }
+
     pub(crate) fn instantiate(
         instance: &DeviceInstance,
         nodes: &mut NodeTable,
@@ -427,11 +434,12 @@ impl Diode {
             &instance.location,
         )?;
         let p = DiodeParameters::new(&m, &i, instance)?;
-        p.thermal(context)?.point(0., context.gmin)?; // validate before interning
+        let thermal = p.thermal(context)?;
+        thermal.point(0., context.gmin)?; // validate before interning
         let mut staged = nodes.clone();
         let external = [
-            staged.intern(&instance.nodes[0]),
-            staged.intern(&instance.nodes[1]),
+            staged.intern(&instance.nodes[0])?,
+            staged.intern(&instance.nodes[1])?,
         ];
         let mut terminals = external.to_vec();
         let positive = if p.rs > 0. {
@@ -440,7 +448,7 @@ impl Diode {
             if staged.get(&name).is_some() {
                 return Err(SpiceError::circuit("diode internal-node name collision"));
             }
-            let prime = staged.intern(&name);
+            let prime = staged.intern(&name)?;
             staged.set_kind(prime, NodeKind::Internal);
             terminals.push(prime);
             prime
@@ -454,6 +462,7 @@ impl Diode {
             terminals,
             junction: [positive, external[1]],
             parameters: p,
+            derived: TemperatureCache::from_value(TemperatureKey::context(context), thermal),
             initial,
             location: instance.location.clone(),
             written: std::rc::Rc::new((m, i)),
@@ -579,6 +588,23 @@ impl DiodeParameters {
         Ok(())
     }
 
+    /// Instance-scaled series conductance in C's order, after temperature correction.
+    fn series_conductance(&self, dt: Real) -> SpiceResult<Real> {
+        if self.rs > 0. {
+            let factor = temperature_polynomial(self.trs1, self.trs2, dt);
+            if factor <= 0. || factor.is_nan() {
+                return Err(SpiceError::Numerical {
+                    context: "diode".into(),
+                    message: "nonpositive temperature-adjusted series resistance".into(),
+                });
+            }
+            // diosetup.c: DIOconductance = 1/RS; diotemp.c scales then divides.
+            Ok((1. / self.rs) * self.area * self.multiplier / factor)
+        } else {
+            Ok(0.)
+        }
+    }
+
     /// `diotemp.c::DIOtempUpdate` at this run's instance temperature.
     fn thermal(&self, context: &ModelContext) -> SpiceResult<Thermal> {
         // diotemp.c::DIOtemp: TEMP (dioparam.c adds CONSTCtoK), else the
@@ -599,7 +625,7 @@ impl DiodeParameters {
         let scale = |v: Real| v * self.area * self.multiplier;
         let perimeter = |v: Real| v * self.perimeter * self.multiplier;
 
-        let factor = 1. + self.tm1 * dt + self.tm2 * dt * dt;
+        let factor = temperature_polynomial(self.tm1, self.tm2, dt);
         let grading = self.grading * factor;
 
         // Band gap at T and TNOM: the fixed silicon law for TLEV 0/1, the
@@ -610,39 +636,17 @@ impl DiodeParameters {
                 self.eg - self.gap1 * tn * tn / (tn + self.gap2),
             )
         } else {
-            (
-                1.16 - 7.02e-4 * t * t / (t + 1108.),
-                1.16 - 7.02e-4 * tn * tn / (tn + 1108.),
-            )
+            (band_gap(t), band_gap(tn))
         };
         let fact2 = t / REFTEMP;
-        let arg = -egfet / (2. * BOLTZMANN * t) + 1.1150877 / (BOLTZMANN * (REFTEMP + REFTEMP));
-        let pbfact = -2. * vt * (1.5 * fact2.ln() + CHARGE * arg);
-        let arg1 = -egfet1 / (BOLTZMANN * 2. * tn) + 1.1150877 / (2. * BOLTZMANN * REFTEMP);
+        let arg = -egfet / (2. * BOLTZMANN * t) + 1.115_087_7 / (BOLTZMANN * (REFTEMP + REFTEMP));
+        let pbfact = potential_shift(vt, fact2, arg);
+        let arg1 = -egfet1 / (BOLTZMANN * 2. * tn) + 1.115_087_7 / (2. * BOLTZMANN * REFTEMP);
         let fact1 = tn / REFTEMP;
-        let pbfact1 = -2. * vtnom * (1.5 * fact1.ln() + CHARGE * arg1);
-        // Depletion capacitance/potential temperature laws (TLEVC 0 or 1).
-        let depletion = |cap: Real, pot: Real, grading: Real, ct: Real, tp: Real| {
-            if self.tlevc == 0 {
-                let pbo = (pot - pbfact1) / fact1;
-                let gmaold = (pot - pbo) / pbo;
-                let mut c = cap / (1. + grading * (400e-6 * (tn - REFTEMP) - gmaold));
-                let pot_t = pbfact + fact2 * pbo;
-                let gmanew = (pot_t - pbo) / pbo;
-                c *= 1. + grading * (400e-6 * (t - REFTEMP) - gmanew);
-                (c, pot_t)
-            } else {
-                (cap * (1. + ct * (t - REFTEMP)), pot - tp * (t - REFTEMP))
-            }
-        };
-        let (cjo, vj) = depletion(scale(self.cjo), self.vj, grading, self.cta, self.tpb);
-        let (cjsw, vjsw) = depletion(
-            perimeter(self.cjsw),
-            self.vjsw,
-            self.mjsw,
-            self.ctp,
-            self.tphp,
-        );
+        let pbfact1 = potential_shift(vtnom, fact1, arg1);
+        let actual = PotentialTemperature::new(t, pbfact);
+        let nominal = PotentialTemperature::new(tn, pbfact1);
+        let (bottom, sidewall) = self.depletion_at_temperature(t, &actual, &nominal, grading);
 
         // Saturation currents: `n` is the emission coefficient, `xti` the
         // exponent and `k` the band-gap factor (KEG for tunnelling).
@@ -650,11 +654,13 @@ impl DiodeParameters {
         // tunnelling. `base` is already instance-scaled (diotemp.c).
         let saturation = |base: Real, n: Real, xti: Real, k: Real| {
             let vte = n * vt;
-            let exponent = if self.tlev == 2 {
-                k * egfet1 / (n * vtnom) - k * egfet / vte + xti / n * ln_ratio
+            let temperature_exponent = xti / n * ln_ratio;
+            let band_gap_exponent = if self.tlev == 2 {
+                k * egfet1 / (n * vtnom) - k * egfet / vte
             } else {
-                (t / tn - 1.) * k * self.eg / vte + xti / n * ln_ratio
+                (t / tn - 1.) * k * self.eg / vte
             };
+            let exponent = band_gap_exponent + temperature_exponent;
             base * exponent.exp()
         };
         let csat = saturation(scale(self.is), self.n, self.xti, 1.);
@@ -664,10 +670,13 @@ impl DiodeParameters {
         };
         let breakdown = match self.bv {
             Some(bv) => Some(breakdown_voltage(
-                if self.tlev == 0 {
-                    bv - self.tcv * dt
-                } else {
-                    bv * (1. - self.tcv * dt)
+                {
+                    let temperature_shift = self.tcv * dt;
+                    if self.tlev == 0 {
+                        bv - temperature_shift
+                    } else {
+                        bv * (1. - temperature_shift)
+                    }
                 },
                 // Level 1: IBV scales with M only, not AREA.
                 self.multiplier * self.ibv,
@@ -677,20 +686,7 @@ impl DiodeParameters {
             )?),
             None => None,
         };
-        let polynomial = |a: Real, b: Real| 1. + a * dt + b * dt * dt;
-        let conductance = if self.rs > 0. {
-            let factor = polynomial(self.trs1, self.trs2);
-            if factor <= 0. || factor.is_nan() {
-                return Err(SpiceError::Numerical {
-                    context: "diode".into(),
-                    message: "nonpositive temperature-adjusted series resistance".into(),
-                });
-            }
-            // diosetup.c: DIOconductance = 1/RS; diotemp.c scales then divides.
-            scale(1. / self.rs) / factor
-        } else {
-            0.
-        };
+        let conductance = self.series_conductance(dt)?;
         let thermal = Thermal {
             vt,
             n: self.n,
@@ -708,21 +704,76 @@ impl DiodeParameters {
             ikf: self.ikf.map(scale),
             ikr: self.ikr.map(scale),
             ikp: self.ikp.map(perimeter),
-            cjo,
-            vj,
-            grading,
-            fc: self.fc,
-            cjsw,
-            vjsw,
-            mjsw: self.mjsw,
-            fcs: self.fcs,
+            cjo: bottom.capacitance,
+            bottom: bottom.law,
+            cjsw: sidewall.capacitance,
+            sidewall: sidewall.law,
             // diotemp.c: tt must stay positive.
-            tt: self.tt * polynomial(self.ttt1, self.ttt2).max(1e-3),
+            tt: self.tt * temperature_polynomial(self.ttt1, self.ttt2, dt).max(1e-3),
             conductance,
         };
         thermal.validate()?;
         Ok(thermal)
     }
+    /// Prepare bottom and sidewall capacitances with their separate grading laws.
+    fn depletion_at_temperature(
+        &self,
+        t: Real,
+        actual: &PotentialTemperature,
+        nominal: &PotentialTemperature,
+        grading: Real,
+    ) -> (PreparedDepletion, PreparedDepletion) {
+        // Depletion capacitance/potential temperature laws (TLEVC 0 or 1).
+        let depletion = |cap: Real, pot: Real, grading: Real, ct: Real, tp: Real| {
+            if self.tlevc == 0 {
+                let correction = actual.junction(nominal, pot);
+                // The diode divides then multiplies, unlike MOS's two factors.
+                let nominal_capacitance = cap / correction.nominal_denominator(grading);
+                (
+                    nominal_capacitance * correction.actual_factor(grading),
+                    correction.potential,
+                )
+            } else {
+                let shift = t - REFTEMP;
+                let capacitance_scale = ct * shift;
+                let potential_offset = tp * shift;
+                (cap * (1. + capacitance_scale), pot - potential_offset)
+            }
+        };
+        let (cjo, vj) = depletion(
+            self.cjo * self.area * self.multiplier,
+            self.vj,
+            grading,
+            self.cta,
+            self.tpb,
+        );
+        let (cjsw, vjsw) = depletion(
+            self.cjsw * self.perimeter * self.multiplier,
+            self.vjsw,
+            self.mjsw,
+            self.ctp,
+            self.tphp,
+        );
+
+        (
+            PreparedDepletion {
+                capacitance: cjo,
+                law: DepletionLaw::new(vj, grading, self.fc),
+            },
+            PreparedDepletion {
+                capacitance: cjsw,
+                law: DepletionLaw::new(vjsw, self.mjsw, self.fcs),
+            },
+        )
+    }
+}
+
+/// Temperature coefficient law for grading, transit time and series resistance.
+/// Round each C term separately and keep the left-associative additions.
+const fn temperature_polynomial(linear: Real, quadratic: Real, delta: Real) -> Real {
+    let first_order = linear * delta;
+    let second_order = quadratic * delta * delta;
+    (1. + first_order) + second_order
 }
 
 /// `diotemp.c` breakdown matching: the knee voltage `xbv` at which the
@@ -733,11 +784,17 @@ fn breakdown_voltage(bv: Real, cbv: Real, total: Real, vt: Real, nbv: Real) -> S
         // C keeps BV unmatched (its warning is TRACE-only).
         return Ok(bv);
     }
-    let matched = |x: Real| total * (((bv - x) / (nbv * vt)).exp() - 1. + x / vt);
+    let matched = |x: Real| {
+        let exponential = ((bv - x) / (nbv * vt)).exp();
+        total * (exponential - 1. + x / vt)
+    };
     let tolerance = BREAKDOWN_RELTOL * cbv;
-    let mut x = bv - nbv * vt * (1. + cbv / total).ln();
+    let normalized_current = 1. + cbv / total;
+    let initial_offset = nbv * vt * normalized_current.ln();
+    let mut x = bv - initial_offset;
     for _ in 0..25 {
-        x = bv - nbv * vt * (cbv / total + 1. - x / vt).ln();
+        let offset = nbv * vt * (cbv / total + 1. - x / vt).ln();
+        x = bv - offset;
         if (matched(x) - cbv).abs() <= tolerance {
             break;
         }
@@ -750,6 +807,12 @@ fn breakdown_voltage(bv: Real, cbv: Real, total: Real, vt: Real, nbv: Real) -> S
         });
     }
     Ok(x)
+}
+
+/// Capacitance and the continuation law prepared at the same temperature.
+struct PreparedDepletion {
+    capacitance: Real,
+    law: DepletionLaw,
 }
 
 /// Temperature-adjusted, instance-scaled diode quantities (`diotemp.c` outputs).
@@ -774,13 +837,9 @@ struct Thermal {
     ikr: Option<Real>,
     ikp: Option<Real>,
     cjo: Real,
-    vj: Real,
-    grading: Real,
-    fc: Real,
+    bottom: DepletionLaw,
     cjsw: Real,
-    vjsw: Real,
-    mjsw: Real,
-    fcs: Real,
+    sidewall: DepletionLaw,
     tt: Real,
     /// Series conductance AREA*M/RS at temperature (0 without RS).
     conductance: Real,
@@ -829,8 +888,9 @@ impl Thermal {
         }
         let previous = limiter.previous(states, DIODE_VOLTAGE_SLOT);
         let vtebrk = self.nbv * self.vt;
+        let breakdown_margin = 10. * vtebrk;
         match self.breakdown {
-            Some(bv) if raw < (-bv + 10. * vtebrk).min(0.) => {
+            Some(bv) if raw < (-bv + breakdown_margin).min(0.) => {
                 let reflected = limiter.pn_junction(
                     -(raw + bv),
                     previous.map(|old| -(old + bv)),
@@ -852,10 +912,10 @@ impl Thermal {
             self.tunnel.unwrap_or(0.),
             self.tunnel_sidewall.unwrap_or(0.),
             self.cjo,
-            self.vj,
-            self.grading,
+            self.bottom.potential,
+            self.bottom.grading,
             self.cjsw,
-            self.vjsw,
+            self.sidewall.potential,
             self.tt,
             self.conductance,
         ]
@@ -867,8 +927,9 @@ impl Thermal {
         if !finite
             || self.cjo < 0.
             || self.cjsw < 0.
-            || (bottom && (self.vj <= 0. || !(0. ..1.).contains(&self.grading)))
-            || (self.cjsw != 0. && self.vjsw <= 0.)
+            || (bottom
+                && (self.bottom.potential <= 0. || !(0. ..1.).contains(&self.bottom.grading)))
+            || (self.cjsw != 0. && self.sidewall.potential <= 0.)
         {
             return Err(SpiceError::Numerical {
                 context: "diode".into(),
@@ -922,38 +983,53 @@ impl Thermal {
             let vterec = nr * self.vt;
             // dioload.c: t1 = pow(1 - vd/VJ, 2) + 0.005, gen_fac = pow(t1, M/2).
             let generation = |v: Real| {
-                let t1 = (1. - v / self.vj).powf(2.) + 0.005;
-                (t1, t1.powf(self.grading / 2.))
+                // C uses pow(x, 2) here, not a product or powi.
+                #[expect(
+                    clippy::suboptimal_flops,
+                    reason = "retain the reference pow operation"
+                )]
+                let squared = (1. - v / self.bottom.potential).powf(2.);
+                let t1 = squared + 0.005;
+                (t1, t1.powf(self.bottom.grading / 2.))
             };
             if forward {
                 let evd = (vd / vterec).exp();
                 let current = crec * (evd - 1.);
                 let conductance = crec * evd / vterec;
                 let (t1, factor) = generation(vd);
-                let derivative =
-                    -self.grading * (1. - vd / self.vj) * t1.powf(self.grading / 2. - 1.);
-                cdb += current * factor;
+                let derivative = -self.bottom.grading
+                    * (1. - vd / self.bottom.potential)
+                    * t1.powf(self.bottom.grading / 2. - 1.);
+                let generation_current = current * factor;
+                cdb += generation_current;
                 // d/dv of the generation factor carries 1/VJ.
-                gdb += conductance * factor + current * derivative / self.vj;
+                let generation_conductance = conductance * factor;
+                let newton_correction = current * derivative / self.bottom.potential;
+                gdb += generation_conductance + newton_correction;
                 // dioload.c instead multiplies the already-scaled current and
                 // omits 1/VJ; its root is unaffected, its AC conductance is.
-                ac_gdb += conductance * factor + current * factor * derivative;
+                let ac_correction = generation_current * derivative;
+                ac_gdb += generation_conductance + ac_correction;
             } else {
                 // Reverse and breakdown: the constant value at -3*N*Vt,
                 // `cdb = -csat*(..) + gen_fac*cdb_rec` (dioload.c).
                 let (_, factor) = generation(-3. * vte);
-                cdb += factor * (crec * ((-3. * vte / vterec).exp() - 1.));
+                let exponential = (-3. * vte / vterec).exp();
+                let reverse_current = factor * (crec * (exponential - 1.));
+                cdb += reverse_current;
             }
         }
         let vtetun = self.ntun * self.vt;
         if let Some(tunnel) = self.tunnel_sidewall {
             let evd = (-vd / vtetun).exp();
-            cdsw -= tunnel * (evd - 1.);
+            let reverse_current = tunnel * (evd - 1.);
+            cdsw -= reverse_current;
             gdsw += tunnel * evd / vtetun;
         }
         if let Some(tunnel) = self.tunnel {
             let evd = (-vd / vtetun).exp();
-            cdb -= tunnel * (evd - 1.);
+            let reverse_current = tunnel * (evd - 1.);
+            cdb -= reverse_current;
             let g = tunnel * evd / vtetun;
             gdb += g;
             ac_gdb += g;
@@ -971,23 +1047,26 @@ impl Thermal {
         if let Some(k) = self.ikp.filter(|_| cdsw > 1e-18) {
             (cdsw, gdsw) = high_injection(cdsw, gdsw, k, true);
         }
-        let current = cdb + cdsw + gmin * vd;
+        let shunt_current = gmin * vd;
+        let current = cdb + cdsw + shunt_current;
         let conductance = gdb + gdsw + gmin;
         let ac_conductance = ac_gdb + gdsw + gmin;
-        let (charge, capacitance) = c_depletion(vd, self.cjo, self.vj, self.grading, self.fc);
-        let (charge_sw, capacitance_sw) =
-            c_depletion(vd, self.cjsw, self.vjsw, self.mjsw, self.fcs);
+        let (charge, capacitance) = self.bottom.charge(vd, self.cjo, None);
+        let (charge_sw, capacitance_sw) = self.sidewall.charge(vd, self.cjsw, None);
         // dioload.c, in its order: diffusion (TT times the current including
         // gmin), bottom depletion, sidewall depletion.
+        let diffusion_charge = self.tt * current;
+        let diffusion_capacitance = self.tt * conductance;
+        let ac_diffusion_capacitance = self.tt * ac_conductance;
         let point = DiodePoint {
             junction: JunctionPoint {
                 current,
                 conductance,
-                charge: self.tt * current + charge + charge_sw,
-                capacitance: self.tt * conductance + capacitance + capacitance_sw,
+                charge: diffusion_charge + charge + charge_sw,
+                capacitance: diffusion_capacitance + capacitance + capacitance_sw,
             },
             ac_conductance,
-            ac_capacitance: self.tt * ac_conductance + capacitance + capacitance_sw,
+            ac_capacitance: ac_diffusion_capacitance + capacitance + capacitance_sw,
         };
         Ok(point)
     }
@@ -1015,7 +1094,7 @@ fn characteristic(
             Ok(result)
         }
         _ if sat == 0. => Ok((0., 0.)),
-        _ => junction_current(v, vte, sat),
+        _ => junction_current(v, vte, sat, ReverseBoundary::Exponential),
     }
 }
 
@@ -1023,21 +1102,24 @@ fn characteristic(
 /// IKF/IKP (`forward`) or IKR (reverse, `i < 0`). Returns the limited current
 /// and conductance in C's arithmetic.
 fn high_injection(cdb: Real, gdb: Real, knee: Real, forward: bool) -> (Real, Real) {
-    if forward {
-        let sqrt_ikx = (cdb / knee).sqrt();
+    let knee_ratio = if forward { cdb / knee } else { cdb / (-knee) };
+    let sqrt_ikx = knee_ratio.sqrt();
+    let scaled_conductance = (1. + sqrt_ikx) * gdb;
+    let correction = cdb * gdb / (2. * sqrt_ikx * knee);
+    let twice_root = 2. * sqrt_ikx;
+    // Preserve C's separate signed expressions (including signed zero).
+    let (numerator, denominator) = if forward {
         (
-            cdb / (1. + sqrt_ikx),
-            ((1. + sqrt_ikx) * gdb - cdb * gdb / (2. * sqrt_ikx * knee))
-                / (1. + 2. * sqrt_ikx + cdb / knee),
+            scaled_conductance - correction,
+            1. + twice_root + cdb / knee,
         )
     } else {
-        let sqrt_ikx = (cdb / (-knee)).sqrt();
         (
-            cdb / (1. + sqrt_ikx),
-            ((1. + sqrt_ikx) * gdb + cdb * gdb / (2. * sqrt_ikx * knee))
-                / (1. + 2. * sqrt_ikx - cdb / knee),
+            scaled_conductance + correction,
+            1. + twice_root - cdb / knee,
         )
-    }
+    };
+    (cdb / (1. + sqrt_ikx), numerator / denominator)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1067,14 +1149,48 @@ impl JunctionPoint {
         Ok(())
     }
 }
-/// The C reverse-bias continuation joins the exponential at -3*Vt.
-pub(crate) fn junction_current(v: Real, vt: Real, is: Real) -> SpiceResult<(Real, Real)> {
-    let result = if v >= -3. * vt {
-        let exp = (v / vt).exp();
-        (is * (exp - 1.), is * exp / vt)
+/// C's cubic reverse-bias continuation argument, with multiplication
+/// grouped exactly as in dioload, bjtload, jfetload, mesload and mos3load.
+pub(super) fn cubic_reverse_argument(v: Real, vt: Real) -> Real {
+    let arg = 3. * vt / (v * std::f64::consts::E);
+    arg * arg * arg
+}
+
+/// Current and conductance without gmin in the cubic reverse region.
+pub(super) fn cubic_reverse_junction(v: Real, vt: Real, is: Real) -> (Real, Real) {
+    let arg = cubic_reverse_argument(v, vt);
+    (-is * (1. + arg), is * 3. * arg / v)
+}
+
+/// Current and conductance without gmin or an exponential clamp.
+pub(super) fn exponential_junction(v: Real, vt: Real, is: Real) -> (Real, Real) {
+    let exp = (v / vt).exp();
+    (is * (exp - 1.), is * exp / vt)
+}
+
+/// Which region owns the exact -3 Vt boundary in the reference load.
+#[derive(Clone, Copy)]
+pub(super) enum ReverseBoundary {
+    Exponential,
+    Cubic,
+}
+
+/// Checked junction current for diode and MESFET loads. The reference
+/// models differ in their comparison at the reverse continuation boundary.
+pub(super) fn junction_current(
+    v: Real,
+    vt: Real,
+    is: Real,
+    boundary: ReverseBoundary,
+) -> SpiceResult<(Real, Real)> {
+    let forward = match boundary {
+        ReverseBoundary::Exponential => v >= -3. * vt,
+        ReverseBoundary::Cubic => v > -3. * vt,
+    };
+    let result = if forward {
+        exponential_junction(v, vt, is)
     } else {
-        let arg = (3. * vt / (v * std::f64::consts::E)).powi(3);
-        (-is * (1. + arg), is * 3. * arg / v)
+        cubic_reverse_junction(v, vt, is)
     };
     if [is, vt, result.0, result.1].iter().any(|v| !v.is_finite()) || vt <= 0. || is <= 0. {
         return Err(SpiceError::Numerical {
@@ -1084,27 +1200,75 @@ pub(crate) fn junction_current(v: Real, vt: Real, is: Real) -> SpiceResult<(Real
     }
     Ok(result)
 }
-/// `dioload.c`'s depletion charge and capacitance, in C's arithmetic:
-/// `sarg = exp(-m ln(1 - v/p))` below `FC p`, and above it the linear
-/// capacitance with `diotemp.c`'s `F1 = p (1 - exp((1-m) xfc)) / (1-m)`,
-/// `F2 = exp((1+m) xfc)` and `F3 = 1 - FC (1+m)`, `xfc = ln(1 - FC)`.
-pub(crate) fn c_depletion(v: Real, czero: Real, pot: Real, m: Real, fc: Real) -> (Real, Real) {
-    let depcap = fc * pot;
-    if v < depcap {
-        let arg = 1. - v / pot;
-        let sarg = (-m * arg.ln()).exp();
-        (pot * czero * (1. - arg * sarg) / (1. - m), czero * sarg)
-    } else {
+/// Reverse depletion charge and capacitance for the logarithmic grading law
+/// in `dioload.c` and `bjtload.c` (not the MOS or JFET square-root shortcuts).
+pub(super) fn reverse_depletion(v: Real, cz: Real, pot: Real, m: Real) -> (Real, Real) {
+    let arg = 1. - v / pot;
+    let sarg = (-m * arg.ln()).exp();
+    let normalized = arg * sarg;
+    (pot * cz * (1. - normalized) / (1. - m), cz * sarg)
+}
+
+/// Temperature-adjusted depletion continuation shared by diode and BJT.
+/// C computes these coefficients in diotemp/bjttemp, before evaluating load.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DepletionLaw {
+    pub(super) potential: Real,
+    pub(super) grading: Real,
+    pub(super) threshold: Real,
+    pub(super) f1: Real,
+    pub(super) f2: Real,
+    pub(super) f3: Real,
+}
+
+impl DepletionLaw {
+    pub(super) fn new(potential: Real, grading: Real, fc: Real) -> Self {
         let xfc = (1. - fc).ln();
-        let f1 = pot * (1. - ((1. - m) * xfc).exp()) / (1. - m);
-        let f2 = ((1. + m) * xfc).exp();
-        let f3 = 1. - fc * (1. + m);
-        let czof2 = czero / f2;
-        (
-            czero * f1
-                + czof2 * (f3 * (v - depcap) + (m / (pot + pot)) * (v * v - depcap * depcap)),
-            czof2 * (f3 + m * v / pot),
-        )
+        let forward_factor = fc * (1. + grading);
+        Self {
+            potential,
+            grading,
+            threshold: fc * potential,
+            f1: potential * (1. - ((1. - grading) * xfc).exp()) / (1. - grading),
+            f2: ((1. + grading) * xfc).exp(),
+            f3: 1. - forward_factor,
+        }
+    }
+
+    /// C's BJT BE/BC charge adds diffusion first, including before the
+    /// second forward depletion term. BX and diode use depletion alone.
+    /// Absence is distinct from adding +0 (signed zero and rounding).
+    pub(super) fn charge(
+        &self,
+        v: Real,
+        cz: Real,
+        diffusion: Option<(Real, Real)>,
+    ) -> (Real, Real) {
+        let add_diffusion = |charge, capacitance| match diffusion {
+            Some((diffusion_charge, diffusion_capacitance)) => (
+                diffusion_charge + charge,
+                diffusion_capacitance + capacitance,
+            ),
+            None => (charge, capacitance),
+        };
+        let potential = self.potential;
+        let grading = self.grading;
+        let threshold = self.threshold;
+        if v < threshold {
+            let (charge, capacitance) = reverse_depletion(v, cz, potential, grading);
+            add_diffusion(charge, capacitance)
+        } else {
+            let czf2 = cz / self.f2;
+            let slope = grading * v / potential;
+            let (charge, capacitance) = add_diffusion(cz * self.f1, czf2 * (self.f3 + slope));
+            let linear = self.f3 * (v - threshold);
+            let voltage_squared = v * v;
+            let threshold_squared = threshold * threshold;
+            let quadratic =
+                (grading / (potential + potential)) * (voltage_squared - threshold_squared);
+            let forward_charge = czf2 * (linear + quadratic);
+            (charge + forward_charge, capacitance)
+        }
     }
 }
 
@@ -1118,88 +1282,11 @@ pub(crate) fn junction_companion(
     p: JunctionPoint,
     slot: usize,
 ) -> SpiceResult<(Real, Real)> {
-    let mut history = crate::maths::integrator::ChargeHistory::new(p.charge);
-    for age in 1..=coefficients.charge_history_len() {
-        let Some(charge) = context.states.accepted(age, slot) else {
-            return Err(missing_history("missing accepted junction charge"));
-        };
-        history.push(charge)?;
-    }
-    let previous = if coefficients.needs_previous_derivative() {
-        let Some(derivative) = context.states.accepted(1, slot + 1) else {
-            return Err(missing_history("missing accepted junction derivative"));
-        };
-        Some(derivative)
-    } else {
-        None
-    };
-    let companion = coefficients.integrate(&history, previous, p.capacitance)?;
-    context.states.set(slot + 1, companion.derivative)?;
+    let companion = charge::ChargeBranch::new(slot, p.charge, p.capacitance)
+        .integrate(&mut context.states, coefficients)?;
     Ok((companion.conductance, companion.derivative))
 }
 
-/// [`junction_companion`]'s error for a short accepted history.
-#[cold]
-#[inline(never)]
-fn missing_history(message: &str) -> SpiceError {
-    SpiceError::circuit(message)
-}
-
-#[allow(dead_code)] // No in-tree caller since MOS1 follows mos1load.c directly.
-pub(crate) fn stamp_junction(
-    context: &mut StampContext<'_>,
-    nodes: [NodeId; 2],
-    v: Real,
-    p: JunctionPoint,
-    slot: usize,
-) -> SpiceResult<()> {
-    let mut conductance = p.conductance;
-    let mut equivalent = p.current - p.conductance * v;
-    if let Some(coefficients) = context.integration {
-        let crate::devices::AnalysisMode::Transient { dt, .. } = context.mode else {
-            return Err(SpiceError::circuit("junction companion outside transient"));
-        };
-        if dt != coefficients.dt() {
-            return Err(SpiceError::circuit("junction timestep mismatch"));
-        }
-        let mut history = crate::maths::integrator::ChargeHistory::new(p.charge);
-        for age in 1..=coefficients.charge_history_len() {
-            history.push(
-                context
-                    .states
-                    .accepted(age, slot)
-                    .ok_or_else(|| SpiceError::circuit("missing accepted junction charge"))?,
-            )?;
-        }
-        let previous = if coefficients.needs_previous_derivative() {
-            Some(
-                context
-                    .states
-                    .accepted(1, slot + 1)
-                    .ok_or_else(|| SpiceError::circuit("missing accepted junction derivative"))?,
-            )
-        } else {
-            None
-        };
-        let companion = coefficients.integrate(&history, previous, p.capacitance)?;
-        conductance += companion.conductance;
-        // For nonlinear Q, integrate()'s current is dQ/dt-a0*Q.
-        // Linearize Q around actual v: dq/dt - a0*(dQ/dv)*v.
-        equivalent += companion.derivative - companion.conductance * v;
-        context.states.set(slot + 1, companion.derivative)?;
-    } else {
-        if context.mode.is_transient() {
-            return Err(SpiceError::circuit(
-                "junction transient needs companion integration",
-            ));
-        }
-        context.states.set(slot + 1, 0.)?;
-    }
-    context.states.set(slot, p.charge)?;
-    crate::devices::linear::nodal_stamp(context.matrix, context.unknowns, nodes, conductance)?;
-    context.stamp_rhs(nodes[0], -equivalent)?;
-    context.stamp_rhs(nodes[1], equivalent)
-}
 impl Device for Diode {
     /// `diosetup.c` (without sidewall resistance or self-heating, which the
     /// port rejects); `posPrime` is the external anode when `RS = 0`.
@@ -1286,9 +1373,9 @@ impl Device for Diode {
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
         let mut initial = self.initial.clone();
-        if let Some(index) = ["ic"].iter().position(|k| *k == parameter) {
+        if parameter == "ic" {
             crate::devices::sweep::check_swept(&self.name, parameter, value, true, "finite")?;
-            initial.values[index] = Some(value);
+            initial.values[0] = Some(value);
         }
         let mut p = self.parameters;
         let domain = |ok: bool, what: &str| {
@@ -1343,13 +1430,15 @@ impl Device for Diode {
             }
         }
         p.check(&self.location)?;
-        p.thermal(context)?.point(0., context.gmin)?;
+        let thermal = p.thermal(context)?;
+        thermal.point(0., context.gmin)?;
         Ok(Box::new(Self {
             name: self.name.clone(),
             model: self.model.clone(),
             terminals: self.terminals.clone(),
             junction: self.junction,
             parameters: p,
+            derived: TemperatureCache::from_value(TemperatureKey::context(context), thermal),
             initial,
             location: self.location.clone(),
             written: self.written.clone(),
@@ -1368,7 +1457,7 @@ impl Device for Diode {
             return Err(SpiceError::circuit("diode AC needs small-signal assembly"));
         }
         let model = context.model_context();
-        let thermal = self.parameters.thermal(&model)?;
+        let thermal = self.thermal(&model)?;
         let mut limiter = Limiter::new(&context.states);
         // dioload.c: MODEINITPRED extrapolates the junction voltage
         // (`DEVpred`) before limiting it; otherwise the iterate's. Outside
@@ -1377,7 +1466,9 @@ impl Device for Diode {
         // so DEVpred's ratio is 1: `2 state1 - state2`.
         let raw = match (context.states.phase(), limiter.mode()) {
             (crate::devices::IterationPhase::Predict, Linearization::Limited) => {
-                let ratio = context.integration.map_or(1., |c| c.predictor_ratio());
+                let ratio = context
+                    .integration
+                    .map_or(1., crate::maths::integrator::Coefficients::predictor_ratio);
                 context
                     .states
                     .predicted(DIODE_VOLTAGE_SLOT, ratio)
@@ -1403,10 +1494,8 @@ impl Device for Diode {
         }
         // DIOconvTest for an `off` diode held in MODEINITFIX.
         let held = p.junction.current;
-        limiter.test_held(
-            &context.states,
-            &[(held, held + p.junction.conductance * (raw - v))],
-        );
+        let predicted_change = p.junction.conductance * (raw - v);
+        limiter.test_held(&context.states, &[(held, held + predicted_change)]);
         // dioload.c from here: the charge companion folds into gd and cd,
         // then cdeq = cd - gd vd and the stamps, in C's order.
         let gspr = if self.parameters.rs > 0. {
@@ -1415,37 +1504,43 @@ impl Device for Diode {
             0.
         };
         let (mut gd, mut cd) = (p.junction.conductance, p.junction.current);
+        let branch =
+            charge::ChargeBranch::new(DIODE_CHARGE_SLOT, p.junction.charge, p.junction.capacitance);
         if let Some(coefficients) = context.integration {
             let crate::devices::AnalysisMode::Transient { dt, .. } = context.mode else {
                 return Err(SpiceError::circuit("junction companion outside transient"));
             };
-            if dt != coefficients.dt() {
+            // Both timesteps are positive and finite; require the same step, not a tolerance.
+            if dt.to_bits() != coefficients.dt().to_bits() {
                 return Err(SpiceError::circuit("junction timestep mismatch"));
             }
-            let (geq, ccap) = junction_companion(context, coefficients, p.junction, 0)?;
-            gd += geq;
-            cd += ccap;
+            let companion = branch.integrate(&mut context.states, coefficients)?;
+            gd += companion.conductance;
+            cd += companion.derivative;
         } else {
             if context.mode.is_transient() {
                 return Err(SpiceError::circuit(
                     "junction transient needs companion integration",
                 ));
             }
-            context.states.set(1, 0.)?;
+            branch.zero_derivative(&mut context.states)?;
         }
-        context.states.set(0, p.junction.charge)?;
-        let cdeq = cd - gd * v;
+        branch.store(&mut context.states)?;
+        let linearized_current = gd * v;
+        let cdeq = cd - linearized_current;
         let [pos, neg] = [self.terminals[0], self.terminals[1]];
         let prime = self.junction[0];
         context.stamp_rhs(neg, cdeq)?;
         context.stamp_rhs(prime, -cdeq)?;
-        context.stamp(pos, pos, gspr)?;
-        context.stamp(neg, neg, gd)?;
-        context.stamp(prime, prime, gd + gspr)?;
-        context.stamp(pos, prime, -gspr)?;
-        context.stamp(neg, prime, -gd)?;
-        context.stamp(prime, pos, -gspr)?;
-        context.stamp(prime, neg, -gd)?;
+        context.stamp_fixed([
+            (pos, pos, gspr),
+            (neg, neg, gd),
+            (prime, prime, gd + gspr),
+            (pos, prime, -gspr),
+            (neg, prime, -gd),
+            (prime, pos, -gspr),
+            (prime, neg, -gd),
+        ])?;
         limiter.finish(&mut context.states, &[(DIODE_VOLTAGE_SLOT, v)])
     }
     /// `dioacld.c`: series conductance, C's small-signal junction conductance
@@ -1462,7 +1557,7 @@ impl Device for Diode {
                 .and_then(|r| bias.get(r))
                 .unwrap_or(0.)
         };
-        let thermal = self.parameters.thermal(context.model_context)?;
+        let thermal = self.thermal(context.model_context)?;
         let p = thermal.point(
             v(self.junction[0]) - v(self.junction[1]),
             context.model_context.gmin,
@@ -1508,7 +1603,7 @@ impl Device for Diode {
             Control, DeviceDistortion, DistortionTerm, Response, Taylor,
         };
         let p = &self.parameters;
-        let t = p.thermal(context.model_context)?;
+        let t = self.thermal(context.model_context)?;
         let vd = context.voltage(self.junction[0]) - context.voltage(self.junction[1]);
         let csat = t.csat + t.csatsw.unwrap_or(0.);
         let vt = t.vt;
@@ -1522,8 +1617,7 @@ impl Device for Diode {
             let g3 = g2 / 3. / vte;
             (g2, g3, g2 * tt, g3 * tt)
         } else if breakdown.is_none_or(|bv| vd >= -bv) {
-            let arg = 3. * vte / (vd * std::f64::consts::E);
-            let arg = arg * arg * arg;
+            let arg = cubic_reverse_argument(vd, vte);
             let gd = csat * 3. * arg / vd;
             let g2 = -4. * gd / vd;
             (g2, 5. * g2 / vd, 0., 0.)
@@ -1534,7 +1628,7 @@ impl Device for Diode {
             let g2 = -gd / 2. / vt;
             (g2, -g2 / 3. / vt, 0., 0.)
         };
-        let depletion_cap = p.fc * t.vj;
+        let depletion_cap = t.bottom.threshold;
         // `diotemp.c`: DIOtF2 = exp((1 + M(T)) ln(1 - FC)).
         let junction = |czero: Real, pot: Real, grading: Real, f2: Real| {
             if czero == 0. {
@@ -1550,9 +1644,9 @@ impl Device for Diode {
                 (czero / f2 / 2. / pot * grading, 0.)
             }
         };
-        let f2 = ((1. + t.grading) * (1. - p.fc).ln()).exp();
-        let f2_sw = ((1. + p.mjsw) * (1. - p.fcs).ln()).exp();
-        let (cjunc2, cjunc3) = junction(t.cjo, p.vj, t.grading, f2);
+        let f2 = t.bottom.f2;
+        let f2_sw = t.sidewall.f2;
+        let (cjunc2, cjunc3) = junction(t.cjo, p.vj, t.bottom.grading, f2);
         let (sw2, sw3) = junction(t.cjsw, p.vjsw, p.mjsw, f2_sw);
         let (cap2, cap3) = (cdiff2 + (cjunc2 + sw2), cdiff3 + (cjunc3 + sw3));
         let mut term = DistortionTerm::new(
@@ -1577,7 +1671,7 @@ impl Device for Diode {
     /// a separate sidewall (RSW, not ported) are zero, as C's are without RSW.
     fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
         let p = &self.parameters;
-        let thermal = p.thermal(context.model_context)?;
+        let thermal = self.thermal(context.model_context)?;
         let vd = context.voltage(self.junction[0]) - context.voltage(self.junction[1]);
         let cd = thermal
             .point(vd, context.model_context.gmin)?
@@ -1720,20 +1814,96 @@ mod tests {
     }
 
     #[test]
+    fn junction_boundary_follows_each_reference_model() {
+        for vt in [0.018_f64, 0.026, 0.04] {
+            let is = 1.3e-14;
+            let edge = -3. * vt;
+            for (v, boundary, reverse) in [
+                (edge.next_down(), ReverseBoundary::Exponential, true),
+                (edge, ReverseBoundary::Exponential, false),
+                (edge.next_up(), ReverseBoundary::Exponential, false),
+                (edge.next_down(), ReverseBoundary::Cubic, true),
+                (edge, ReverseBoundary::Cubic, true),
+                (edge.next_up(), ReverseBoundary::Cubic, false),
+            ] {
+                let expected = if reverse {
+                    let arg = 3. * vt / (v * std::f64::consts::E);
+                    let arg = arg * arg * arg;
+                    (-is * (1. + arg), is * 3. * arg / v)
+                } else {
+                    let ev = (v / vt).exp();
+                    (is * (ev - 1.), is * ev / vt)
+                };
+                let actual = junction_current(v, vt, is, boundary).unwrap();
+                assert_eq!(actual.0.to_bits(), expected.0.to_bits());
+                assert_eq!(actual.1.to_bits(), expected.1.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn depletion_keeps_the_reference_diffusion_addition_order() {
+        for (p, m, fc) in [(0.7, 0.33, 0.5), (1.1, 0.5, 0.8), (0.9, 0.999, 0.2)] {
+            let law = DepletionLaw::new(p, m, fc);
+            let fcp = fc * p;
+            let xfc = (1. - fc).ln();
+            let f1 = p * (1. - ((1. - m) * xfc).exp()) / (1. - m);
+            let f2 = ((1. + m) * xfc).exp();
+            let f3 = 1. - fc * (1. + m);
+            for cz in [0., 2.3e-12, 7.7e-9] {
+                for v in [-1., -0.0, fcp.next_down(), fcp, fcp.next_up(), fcp + 0.2] {
+                    for diffusion in [None, Some((-0., -0.)), Some((-cz * f1, 1.2e-12))] {
+                        let (q0, c0) = diffusion.unwrap_or((0., 0.));
+                        let expected = if v < fcp {
+                            let arg = 1. - v / p;
+                            let sarg = (-m * arg.ln()).exp();
+                            let q = p * cz * (1. - arg * sarg) / (1. - m);
+                            let c = cz * sarg;
+                            if diffusion.is_some() {
+                                (q0 + q, c0 + c)
+                            } else {
+                                (q, c)
+                            }
+                        } else {
+                            let czf2 = cz / f2;
+                            let tail =
+                                czf2 * (f3 * (v - fcp) + (m / (p + p)) * (v * v - fcp * fcp));
+                            let c = czf2 * (f3 + m * v / p);
+                            if diffusion.is_some() {
+                                (q0 + cz * f1 + tail, c0 + c)
+                            } else {
+                                (cz * f1 + tail, c)
+                            }
+                        };
+                        let actual = law.charge(v, cz, diffusion);
+                        assert_eq!(actual.0.to_bits(), expected.0.to_bits());
+                        assert_eq!(actual.1.to_bits(), expected.1.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn charge_derivative_and_current_jacobian_are_consistent() {
+        let depletion = DepletionLaw::new(1., 0.5, 0.5);
         for v in [-1., -0.08, -0.02, 0., 0.49, 0.5, 0.51, 0.7] {
             let h = 1e-7;
-            let (q, c) = c_depletion(v, 2e-12, 1., 0.5, 0.5);
-            let derivative = (c_depletion(v + h, 2e-12, 1., 0.5, 0.5).0
-                - c_depletion(v - h, 2e-12, 1., 0.5, 0.5).0)
+            let (q, c) = depletion.charge(v, 2e-12, None);
+            let derivative = (depletion.charge(v + h, 2e-12, None).0
+                - depletion.charge(v - h, 2e-12, None).0)
                 / (2. * h);
             assert!(
                 (derivative - c).abs() < 1e-8 * c.abs(),
                 "{v}: {q} {derivative} {c}"
             );
-            let (i, g) = junction_current(v, 0.026, 1e-14).unwrap();
-            let derivative = (junction_current(v + h, 0.026, 1e-14).unwrap().0
-                - junction_current(v - h, 0.026, 1e-14).unwrap().0)
+            let (i, g) = junction_current(v, 0.026, 1e-14, ReverseBoundary::Exponential).unwrap();
+            let derivative = (junction_current(v + h, 0.026, 1e-14, ReverseBoundary::Exponential)
+                .unwrap()
+                .0
+                - junction_current(v - h, 0.026, 1e-14, ReverseBoundary::Exponential)
+                    .unwrap()
+                    .0)
                 / (2. * h);
             assert!(
                 (derivative - g).abs() < 1e-7 * g.abs() + 4. * f64::EPSILON * 1e-14 / h,
@@ -1846,8 +2016,8 @@ mod tests {
     fn temperature_laws_follow_diotemp() {
         // Nominal temperature leaves VJ, CJO and IS unchanged.
         let t = thermal("cjo=10p vj=0.7 m=0.4 cjsw=1p vjsw=0.6", "pj=2", 27.);
-        assert!((t.vj - 0.7).abs() < 1e-14 && (t.cjo - 10e-12).abs() < 1e-24);
-        assert!((t.vjsw - 0.6).abs() < 1e-14 && (t.cjsw - 2e-12).abs() < 1e-24);
+        assert!((t.bottom.potential - 0.7).abs() < 1e-14 && (t.cjo - 10e-12).abs() < 1e-24);
+        assert!((t.sidewall.potential - 0.6).abs() < 1e-14 && (t.cjsw - 2e-12).abs() < 1e-24);
         assert!((t.csat - 1e-14).abs() < 1e-28);
         // TLEV 0: IS(T) = IS exp((T/Tn - 1) EG/(N Vt) + XTI/N ln(T/Tn)).
         let (tk, tn) = (398.15, 300.15);
@@ -1870,11 +2040,13 @@ mod tests {
             "pj=1",
             77.,
         );
-        assert!((t.cjo - 10e-12 * 1.05).abs() < 1e-24 && (t.vj - 0.6).abs() < 1e-12);
-        assert!((t.cjsw - 1e-12 * 1.15).abs() < 1e-24 && (t.vjsw - 0.45).abs() < 1e-12);
+        assert!((t.cjo - 10e-12 * 1.05).abs() < 1e-24 && (t.bottom.potential - 0.6).abs() < 1e-12);
+        assert!(
+            (t.cjsw - 1e-12 * 1.15).abs() < 1e-24 && (t.sidewall.potential - 0.45).abs() < 1e-12
+        );
         // TLEVC 0 lowers the junction potential and raises CJO when heated.
         let hot = thermal("cjo=10p vj=0.7 m=0.4", "", 125.);
-        assert!(hot.vj < 0.7 && hot.cjo > 10e-12);
+        assert!(hot.bottom.potential < 0.7 && hot.cjo > 10e-12);
         // TLEV 2 uses the EG/GAP1/GAP2 band gap; TT/RS coefficients apply.
         let t = thermal(
             "tlev=2 eg=1.16 gap1=7.02e-4 gap2=1108 tt=1n ttt1=1m rs=10 trs1=2m",

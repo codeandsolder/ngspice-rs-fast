@@ -97,7 +97,6 @@ fn run(body: &str) -> SpiceResult<Vec<Plot>> {
 
 /// `mos6load.c`'s drain current in the normalized frame for the
 /// temperature-scaled `betac` (with M), `vbi` and `phi`.
-#[allow(clippy::too_many_arguments)]
 fn power_law(
     betac: f64,
     [kv, nv, nc]: [f64; 3],
@@ -462,5 +461,189 @@ fn m10_mos6_fixtures_parse_write_parse_with_a_fixed_point() {
             .unwrap();
         assert!(ngspice_rs::netlist::semantic_eq(&n, &round));
         assert_eq!(text, ngspice_rs::netlist::write_netlist(&round).unwrap());
+    }
+}
+
+#[test]
+fn multiplicity_scales_completed_stamps_not_intrinsic_state() {
+    use ngspice_rs::maths::integrator::{DEFAULT_XMU, IntegrationMethod, StepHistory};
+
+    let make = |multiplicity| {
+        circuit(&format!(
+            "m1 d g s b mm w=10u l=2u ad=13p as=23p pd=21u ps=31u m={multiplicity}\n\
+             .model mm nmos(level=6 vto=0.83 kc=37u gamma=0.51 phi=0.72 lambda=0.037\n\
+             + tox=21n rd=43 rs=37 js=0.11m cj=0.53m cjsw=0.41n\n\
+             + cgso=0.43n cgdo=0.32n cgbo=0.21n)"
+        ))
+    };
+    for method in [
+        IntegrationMethod::Trapezoidal,
+        IntegrationMethod::Gear { order: 2 },
+    ] {
+        let circuits = [make(1.), make(1.7)];
+        // The SPICE reader follows C's decimal accumulation, not Rust's
+        // literal rounding. Compare with the actual parsed multiplier.
+        let m = circuits[1].devices()[0]
+            .observation_parameter("m", &ModelContext::default())
+            .unwrap()
+            .unwrap();
+        let mut histories = circuits.each_ref().map(Circuit::state_history);
+        let mut steps = StepHistory::new();
+        for (step, dt) in [0., 1e-9, 7e-10, 1.3e-9].into_iter().enumerate() {
+            let coefficients = (step != 0).then(|| {
+                steps
+                    .trial(method, if step == 1 { 1 } else { 2 }, dt, DEFAULT_XMU)
+                    .unwrap()
+            });
+            let mode = if step == 0 {
+                AnalysisMode::OperatingPoint
+            } else {
+                AnalysisMode::Transient {
+                    time: 1e-9 * step as f64,
+                    dt,
+                }
+            };
+            let context = ModelContext::default();
+            let loads = std::array::from_fn::<_, 2, _>(|i| {
+                let c = &circuits[i];
+                let n = c.unknown_count();
+                let mut x = Vector::zeros(n);
+                let phase = [0., 0.04, -0.03, 0.07][step];
+                for (name, voltage) in [
+                    ("d", 3.1),
+                    ("g", 1.9 + phase),
+                    ("s", 0.1),
+                    ("b", -0.43),
+                    ("m1#drain", 2.91 - phase),
+                    ("m1#source", 0.17),
+                ] {
+                    x.as_mut_slice()[row(c, name)] = voltage;
+                }
+                let history = &mut histories[i];
+                let mut trial = history.trial();
+                let mut matrix = SparseMatrix::new(n, n);
+                let mut rhs = Vector::zeros(n);
+                c.load_device(
+                    0,
+                    c.devices()[0].as_ref(),
+                    &LoadRequest {
+                        mode,
+                        solution: &x,
+                        model_context: &context,
+                        integration: coefficients.as_ref(),
+                        history,
+                        forcing: None,
+                    },
+                    &mut matrix,
+                    &mut rhs,
+                    &mut trial,
+                )
+                .unwrap();
+                let state = trial
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>();
+                history.commit(trial).unwrap();
+                (matrix, rhs, state)
+            });
+            let [(a, b, state), (am, bm, state_m)] = loads;
+            assert_eq!(state, state_m, "intrinsic state at step {step}");
+            for r in 0..a.rows() {
+                for c in 0..a.cols() {
+                    assert_eq!(
+                        (m * entry(&a, r, c)).to_bits(),
+                        entry(&am, r, c).to_bits(),
+                        "step {step}, matrix ({r}, {c})"
+                    );
+                }
+                assert_eq!(
+                    (m * b.as_slice()[r]).to_bits(),
+                    bm.as_slice()[r].to_bits(),
+                    "step {step}, RHS {r}"
+                );
+            }
+            if let Some(coefficients) = coefficients {
+                steps.accept(&coefficients);
+            }
+        }
+    }
+}
+
+#[test]
+fn reference_jacobian_omits_gamma1_only_on_the_clamped_body_branch() {
+    for (family, pol) in [("nmos", 1.), ("pmos", -1.)] {
+        let c = circuit(&format!(
+            "m1 d g s b mm w=10u l=2u\n\
+             .model mm {family}(level=6 vto={} kc=37u gamma=0.5 phi=0.2 gamma1=0.13\n\
+             + kv=1.6 nv=0.8 nc=1.3 sigma=0.02 lambda0=0.037 lambda1=0 is=1e-50)",
+            pol * 0.7
+        ));
+        let n = c.unknown_count();
+        let context = ModelContext::default();
+        let history = c.state_history();
+        for vd in [0.3_f64, 3.0, -0.3, -3.0] {
+            for vb in [-0.2, 0.1, 0.65] {
+                let mut x = Vector::zeros(n);
+                let source = vd.min(0_f64);
+                for (terminal, voltage) in [
+                    ("d", vd),
+                    ("s", 0.),
+                    ("g", 2.0 + source),
+                    ("b", vb + source),
+                ] {
+                    x.as_mut_slice()[row(&c, terminal)] = pol * voltage;
+                }
+                let load = |reference| {
+                    let mut a = SparseMatrix::new(n, n);
+                    let mut b = Vector::zeros(n);
+                    let mut trial = history.trial().with_c_jacobian(reference);
+                    c.load_device(
+                        0,
+                        c.devices()[0].as_ref(),
+                        &LoadRequest {
+                            mode: AnalysisMode::OperatingPoint,
+                            solution: &x,
+                            model_context: &context,
+                            integration: None,
+                            history: &history,
+                            forcing: None,
+                        },
+                        &mut a,
+                        &mut b,
+                        &mut trial,
+                    )
+                    .unwrap();
+                    let state = trial.values();
+                    // Shared MOS state: channel current, GM, GDS, GMBS.
+                    (a, b, [state[20], state[23], state[24], state[25]])
+                };
+                let (exact, exact_rhs, e) = load(false);
+                let (reference, reference_rhs, r) = load(true);
+                assert_eq!(e[..3], r[..3]);
+                if vb > 0.4 {
+                    assert_eq!(r[3], 0.);
+                    assert!(e[3] > 0.);
+                    let drain = row(&c, if vd > 0. { "d" } else { "s" });
+                    let bulk = row(&c, "b");
+                    close(
+                        entry(&exact, drain, bulk) - entry(&reference, drain, bulk),
+                        e[3],
+                        1e-12,
+                        1e-16,
+                    );
+                } else {
+                    assert_eq!(e, r);
+                }
+                // Matrix selection must not alter the load's fixed point.
+                for (a, b) in residual(&exact, &exact_rhs, &x).into_iter().zip(residual(
+                    &reference,
+                    &reference_rhs,
+                    &x,
+                )) {
+                    close(a, b, 1e-12, 1e-15);
+                }
+            }
+        }
     }
 }

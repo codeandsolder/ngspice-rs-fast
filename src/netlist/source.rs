@@ -71,18 +71,21 @@ pub struct Deck {
 impl Deck {
     /// The number of cards, excluding the title.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.lines.len()
     }
 
     /// True when the deck has no cards.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.lines.is_empty()
     }
 }
 
 /// Reads a deck from disk.
+///
+/// # Errors
+/// Returns [`SpiceError::Io`] if the file cannot be read as UTF-8.
 pub fn load(path: impl AsRef<Path>) -> SpiceResult<Deck> {
     let path = path.as_ref();
     let text = fs::read_to_string(path).map_err(|error| SpiceError::io(path, &error))?;
@@ -95,13 +98,18 @@ pub fn load(path: impl AsRef<Path>) -> SpiceResult<Deck> {
 /// produce a final empty line.
 #[must_use]
 pub fn split_physical_lines(text: &str) -> Vec<PhysicalLine> {
-    text.lines()
-        .enumerate()
-        .map(|(index, line)| PhysicalLine {
-            number: u32::try_from(index + 1).unwrap_or(u32::MAX),
+    numbered_lines(text)
+        .map(|(number, line)| PhysicalLine {
+            number,
             text: line.to_owned(),
         })
         .collect()
+}
+
+fn numbered_lines(text: &str) -> impl Iterator<Item = (u32, &str)> {
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| (u32::try_from(index + 1).unwrap_or(u32::MAX), line))
 }
 
 /// True when this physical line continues the previous card.
@@ -189,6 +197,20 @@ pub fn strip_comment(text: &str, in_control: bool) -> &str {
 /// Folds physical lines into a [`Deck`].
 #[must_use]
 pub fn fold_logical_lines(file: &Path, lines: &[PhysicalLine]) -> Deck {
+    fold_lines(
+        file,
+        lines.iter().map(|line| (line.number, line.text.as_str())),
+        true,
+    )
+}
+
+/// The common folding pass borrows physical text until it becomes part of
+/// a logical card. Fragments have no title and need no synthetic first line.
+fn fold_lines<'a>(
+    file: &Path,
+    mut lines: impl Iterator<Item = (u32, &'a str)>,
+    has_title: bool,
+) -> Deck {
     let file: Arc<PathBuf> = Arc::new(file.to_path_buf());
     let mut deck = Deck {
         path: file.as_ref().clone(),
@@ -197,34 +219,26 @@ pub fn fold_logical_lines(file: &Path, lines: &[PhysicalLine]) -> Deck {
         lines: Vec::new(),
     };
 
-    let Some((first, rest)) = lines.split_first() else {
-        return deck;
-    };
-    deck.title = first.text.trim_end().to_owned();
+    if has_title && let Some((_, title)) = lines.next() {
+        title.trim_end().clone_into(&mut deck.title);
+    }
 
     let mut pending: Option<LogicalLine> = None;
     let mut in_control = false;
 
-    for line in rest {
-        let begins_control = line
-            .text
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with(".control");
-        let begins_endc = line
-            .text
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with(".endc");
+    for (number, line) in lines {
+        let trimmed = line.trim_start();
+        let begins_control = starts_with_ascii_case(trimmed, ".control");
+        let begins_endc = starts_with_ascii_case(trimmed, ".endc");
 
-        if is_comment_line(&line.text) {
+        if is_comment_line(line) {
             // Comments may sit between the continuation lines of a card, so a
             // comment never terminates the card being built.
             continue;
         }
 
-        if is_continuation(&line.text) {
-            let text = strip_comment(&line.text, in_control);
+        if is_continuation(line) {
+            let text = strip_comment(line, in_control);
             let body = text.trim_start().trim_start_matches('+').trim();
             if let Some(card) = pending.as_mut() {
                 if !body.is_empty() {
@@ -232,13 +246,13 @@ pub fn fold_logical_lines(file: &Path, lines: &[PhysicalLine]) -> Deck {
                     card.text.push_str(body);
                 }
                 card.continuations += 1;
-                card.end_line = line.number;
+                card.end_line = number;
             } else {
                 // ngspice would reject this while building the card list; there is
                 // no card to attach it to.
                 deck.lines.push(LogicalLine {
-                    location: SourceLoc::new(file.clone(), line.number, 1),
-                    end_line: line.number,
+                    location: SourceLoc::new(file.clone(), number, 1),
+                    end_line: number,
                     continuations: 0,
                     text: body.to_owned(),
                 });
@@ -246,7 +260,7 @@ pub fn fold_logical_lines(file: &Path, lines: &[PhysicalLine]) -> Deck {
             continue;
         }
 
-        let text = strip_comment(&line.text, in_control);
+        let text = strip_comment(line, in_control);
         let text = text.trim();
         if text.is_empty() {
             // A blank line (or a line holding nothing but a comment) ends the
@@ -259,8 +273,8 @@ pub fn fold_logical_lines(file: &Path, lines: &[PhysicalLine]) -> Deck {
                 deck.lines.push(card);
             }
             pending = Some(LogicalLine {
-                location: SourceLoc::new(file.clone(), line.number, 1),
-                end_line: line.number,
+                location: SourceLoc::new(file.clone(), number, 1),
+                end_line: number,
                 continuations: 0,
                 text: text.to_owned(),
             });
@@ -279,25 +293,24 @@ pub fn fold_logical_lines(file: &Path, lines: &[PhysicalLine]) -> Deck {
     deck
 }
 
+/// This deliberately matches prefixes, including the legacy handling of
+/// suffixes, exactly as the previous ASCII lowercasing check did.
+fn starts_with_ascii_case(text: &str, prefix: &str) -> bool {
+    text.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
 /// Splits `text` into a [`Deck`], as if it had been read from `file`.
 #[must_use]
 pub fn parse_deck_text(file: &Path, text: &str) -> Deck {
-    fold_logical_lines(file, &split_physical_lines(text))
+    fold_lines(file, numbered_lines(text), true)
 }
 
 /// Folds an included source fragment without treating its first line as a
 /// title. Physical line numbers and continuation/comment rules are unchanged.
 #[must_use]
 pub fn parse_fragment_text(file: &Path, text: &str) -> Deck {
-    let mut lines = split_physical_lines(text);
-    lines.insert(
-        0,
-        PhysicalLine {
-            number: 0,
-            text: String::new(),
-        },
-    );
-    fold_logical_lines(file, &lines)
+    fold_lines(file, numbered_lines(text), false)
 }
 
 #[cfg(test)]
@@ -307,6 +320,41 @@ mod tests {
 
     fn deck(text: &str) -> super::Deck {
         parse_deck_text(Path::new("test.cir"), text)
+    }
+
+    #[test]
+    fn borrowed_folding_matches_owned_lines_and_fragment_locations() {
+        let file = Path::new("fragment.cir");
+        for text in [
+            "",
+            "title",
+            "title\r\nR1 a 0\r\n* comment\r\n+ 1k\r\n",
+            "title\n.CoNtRoL\necho $value\n.EnDc\nR1 a 0 1k $comment\n",
+            "title\n+ orphan\n\n😀 abc\n*# directive\n",
+            "* title   \n\n+ orphan\n",
+        ] {
+            let owned = super::split_physical_lines(text);
+            assert_eq!(
+                super::parse_deck_text(file, text),
+                super::fold_logical_lines(file, &owned)
+            );
+            let mut fragment_lines = owned;
+            fragment_lines.insert(
+                0,
+                super::PhysicalLine {
+                    number: 0,
+                    text: String::new(),
+                },
+            );
+            assert_eq!(
+                super::parse_fragment_text(file, text),
+                super::fold_logical_lines(file, &fragment_lines)
+            );
+        }
+        let fragment = super::parse_fragment_text(file, "* comment\nR1 a 0\n+ 1k\n");
+        assert_eq!(fragment.lines[0].location.line, 2);
+        assert_eq!(fragment.lines[0].end_line, 3);
+        assert_eq!(fragment.lines[0].text, "R1 a 0 1k");
     }
 
     #[test]

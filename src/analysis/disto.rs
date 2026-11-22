@@ -37,6 +37,7 @@
 //! 1)` (so it measures `pts + 2` frequencies) while `f <= fstop +
 //! delta*reltol`.
 
+use crate::analysis::frequency::{Advance, FrequencyGrid};
 use crate::analysis::linear::{number, plot, unsupported};
 use crate::analysis::results::Plot;
 use crate::analysis::{AnalysisContext, AnalysisRequest};
@@ -50,8 +51,6 @@ use crate::primitives::{Complex, Real, SpiceError, SpiceResult, parse_spice_numb
 /// C's default `CKTreltol`, the frequency-loop tolerance without `.option
 /// reltol`.
 const DEFAULT_RELTOL: Real = 1e-3;
-/// The port's bound on the number of frequency points.
-const MAX_POINTS: usize = 100_000;
 /// The harmonic plot titles (`distoan.c`).
 pub const HARMONIC_PLOTNAMES: [&str; 2] =
     ["DISTORTION - 2nd harmonic", "DISTORTION - 3rd harmonic"];
@@ -74,7 +73,7 @@ enum Stepping {
 #[derive(Debug, Clone, PartialEq)]
 struct DistoCard {
     stepping: Stepping,
-    steps: usize,
+    steps: u32,
     start: Real,
     stop: Real,
     f2_over_f1: Option<Real>,
@@ -105,11 +104,8 @@ fn integer(text: &str) -> SpiceResult<i64> {
     let value = parse_spice_number(text)
         .filter(|v| v.is_finite())
         .ok_or_else(|| unsupported(".disto expects an integer point count"))?;
-    let rounded = (value + 0.5).floor();
-    if rounded.abs() > Real::from(i32::MAX) {
-        return Err(unsupported(".disto point count is out of range"));
-    }
-    Ok(rounded as i64)
+    crate::primitives::c_integer(value)
+        .ok_or_else(|| unsupported(".disto point count is out of range"))
 }
 
 fn parse(request: &AnalysisRequest) -> SpiceResult<DistoCard> {
@@ -131,7 +127,7 @@ fn parse(request: &AnalysisRequest) -> SpiceResult<DistoCard> {
     let steps = integer(args[1])?;
     // dec/oct with no step never advance (`distoan.c` would loop forever); a
     // `lin` sweep with zero steps measures fstart and fstop.
-    let minimum = if stepping == Stepping::Linear { 0 } else { 1 };
+    let minimum = i64::from(stepping != Stepping::Linear);
     if steps < minimum {
         return Err(unsupported(format!(
             ".disto needs at least {minimum} step(s) for this sweep, got {steps}"
@@ -156,7 +152,7 @@ fn parse(request: &AnalysisRequest) -> SpiceResult<DistoCard> {
     };
     Ok(DistoCard {
         stepping,
-        steps: usize::try_from(steps).map_err(|_| syntax())?,
+        steps: u32::try_from(steps).map_err(|_| syntax())?,
         start,
         stop,
         f2_over_f1,
@@ -165,7 +161,7 @@ fn parse(request: &AnalysisRequest) -> SpiceResult<DistoCard> {
 
 /// `distoan.c`'s frequency sweep.
 fn frequencies(card: &DistoCard, reltol: Real) -> SpiceResult<Vec<Real>> {
-    let n = card.steps as Real;
+    let n = Real::from(card.steps);
     let (delta, tolerance) = match card.stepping {
         Stepping::Decade => {
             let delta = (10f64.ln() / n).exp();
@@ -180,31 +176,16 @@ fn frequencies(card: &DistoCard, reltol: Real) -> SpiceResult<Vec<Real>> {
             (delta, delta * reltol)
         }
     };
-    let mut grid = Vec::new();
-    let mut freq = card.start;
-    while freq <= card.stop + tolerance {
-        if grid.len() >= MAX_POINTS {
-            return Err(unsupported(format!(
-                ".disto frequency loop exceeded {MAX_POINTS} points"
-            )));
+    // Detect a rounded, stationary multiplier exactly, not approximately.
+    let advance = match card.stepping {
+        Stepping::Decade | Stepping::Octave if delta.to_bits() == 1.0_f64.to_bits() => {
+            Advance::Single
         }
-        grid.push(freq);
-        match card.stepping {
-            Stepping::Decade | Stepping::Octave => {
-                freq *= delta;
-                if delta == 1. {
-                    break;
-                }
-            }
-            Stepping::Linear => {
-                freq += delta;
-                if delta == 0. {
-                    break;
-                }
-            }
-        }
-    }
-    Ok(grid)
+        Stepping::Decade | Stepping::Octave => Advance::Multiply(delta),
+        Stepping::Linear if delta == 0. => Advance::Single,
+        Stepping::Linear => Advance::Add(delta),
+    };
+    FrequencyGrid::new(card.start, card.stop, tolerance, advance, ".disto")?.collect()
 }
 
 /// `NIdIter`: solves `(A + j omega E) x = rhs` on the circuit's matrix at
@@ -298,12 +279,83 @@ fn scaled(values: &[Complex], k: Real) -> Vec<Complex> {
         .collect()
 }
 
+fn harmonic_outputs(
+    products: &impl Fn(Product, Kernels<'_>, Real) -> SpiceResult<Vec<Complex>>,
+    base: Kernels<'_>,
+    h2: &[Complex],
+    omega1: Real,
+) -> SpiceResult<Vec<Vec<Complex>>> {
+    let h3 = products(
+        Product::ThreeF1,
+        Kernels {
+            h2: Some(h2),
+            ..base
+        },
+        3. * omega1,
+    )?;
+    Ok(vec![scaled(h2, 2.), scaled(&h3, 2.)])
+}
+
+fn intermodulation_outputs(
+    products: &impl Fn(Product, Kernels<'_>, Real) -> SpiceResult<Vec<Complex>>,
+    base: Kernels<'_>,
+    h2: &[Complex],
+    h1_f2: &[Complex],
+    omega1: Real,
+    omega2: Real,
+) -> SpiceResult<Vec<Vec<Complex>>> {
+    let with_f2 = Kernels {
+        h1_f2: Some(h1_f2),
+        ..base
+    };
+    let sum = products(Product::F1PlusF2, with_f2, omega1 + omega2)?;
+    let difference = products(Product::F1MinusF2, with_f2, omega1 - omega2)?;
+    // C computes the doubled frequency before subtracting f2.
+    let twice_omega1 = 2. * omega1;
+    let third = products(
+        Product::TwoF1MinusF2,
+        Kernels {
+            h2: Some(h2),
+            h2_minus: Some(&difference),
+            ..with_f2
+        },
+        twice_omega1 - omega2,
+    )?;
+    Ok(vec![
+        scaled(&sum, 4.),
+        scaled(&difference, 4.),
+        scaled(&third, 6.),
+    ])
+}
+
+fn output_plots(circuit: &Circuit, intermodulation: bool) -> SpiceResult<Vec<Plot>> {
+    let titles: &[&str] = if intermodulation {
+        &INTERMODULATION_PLOTNAMES
+    } else {
+        &HARMONIC_PLOTNAMES
+    };
+    titles
+        .iter()
+        .enumerate()
+        .map(|(index, title)| {
+            plot(
+                circuit,
+                &format!("disto{}", index + 1),
+                title,
+                Some(("frequency", "frequency")),
+                true,
+            )
+        })
+        .collect()
+}
+
 /// Runs `.disto` and returns its plots: the 2nd and 3rd harmonics, or the
 /// three intermodulation products with `f2overf1`.
 pub(crate) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &AnalysisContext,
+    include_bias: bool,
 ) -> SpiceResult<Vec<Plot>> {
     let settings = crate::analysis::bias::DcSettings::from_request(request)?;
     let reltol = match request.named("rtol") {
@@ -314,6 +366,7 @@ pub(crate) fn run(
     let card = parse(request)?;
     let grid = frequencies(&card, reltol)?;
     let small = crate::analysis::ac::SmallSignal::prepare(circuit, request, context, settings)?;
+    let mut retained = small.retained_bias(circuit, request, context, include_bias)?;
     if small.varies() {
         return Err(unsupported(
             ".disto of a circuit with a `hertz`-dependent device (distoan.c linearizes once, \
@@ -340,24 +393,7 @@ pub(crate) fn run(
     };
     let two_pi = 2. * std::f64::consts::PI;
     let omega2 = two_pi * card.start * card.f2_over_f1.unwrap_or(0.);
-    let titles: &[&str] = if intermodulation {
-        &INTERMODULATION_PLOTNAMES
-    } else {
-        &HARMONIC_PLOTNAMES
-    };
-    let mut plots = titles
-        .iter()
-        .enumerate()
-        .map(|(index, title)| {
-            plot(
-                circuit,
-                &format!("disto{}", index + 1),
-                title,
-                Some(("frequency", "frequency")),
-                true,
-            )
-        })
-        .collect::<SpiceResult<Vec<_>>>()?;
+    let mut plots = output_plots(circuit, intermodulation)?;
     let n = circuit.unknown_count();
     let products = |product: Product, kernels: Kernels<'_>, omega: Real| {
         let mut rhs = vec![Complex::ZERO; n];
@@ -381,40 +417,11 @@ pub(crate) fn run(
             h2_minus: None,
         };
         let h2 = products(Product::TwoF1, base, 2. * omega1)?;
-        let outputs: Vec<Vec<Complex>> = match &rhs_f2 {
-            None => {
-                let h3 = products(
-                    Product::ThreeF1,
-                    Kernels {
-                        h2: Some(&h2),
-                        ..base
-                    },
-                    3. * omega1,
-                )?;
-                vec![scaled(&h2, 2.), scaled(&h3, 2.)]
-            }
+        let outputs = match &rhs_f2 {
+            None => harmonic_outputs(&products, base, &h2, omega1)?,
             Some(rhs_f2) => {
                 let h1_f2 = solve_at(circuit, system, omega2, rhs_f2)?;
-                let with_f2 = Kernels {
-                    h1_f2: Some(&h1_f2),
-                    ..base
-                };
-                let sum = products(Product::F1PlusF2, with_f2, omega1 + omega2)?;
-                let difference = products(Product::F1MinusF2, with_f2, omega1 - omega2)?;
-                let third = products(
-                    Product::TwoF1MinusF2,
-                    Kernels {
-                        h2: Some(&h2),
-                        h2_minus: Some(&difference),
-                        ..with_f2
-                    },
-                    2. * omega1 - omega2,
-                )?;
-                vec![
-                    scaled(&sum, 4.),
-                    scaled(&difference, 4.),
-                    scaled(&third, 6.),
-                ]
+                intermodulation_outputs(&products, base, &h2, &h1_f2, omega1, omega2)?
             }
         };
         for (plot, values) in plots.iter_mut().zip(outputs) {
@@ -430,7 +437,8 @@ pub(crate) fn run(
             message: "nonfinite distortion response".into(),
         });
     }
-    Ok(plots)
+    retained.extend(plots);
+    Ok(retained)
 }
 
 #[cfg(test)]

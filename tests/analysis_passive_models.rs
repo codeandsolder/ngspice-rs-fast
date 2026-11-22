@@ -188,6 +188,45 @@ fn contextual_model_rc_transient_matches_the_analytic_step() {
     }
 }
 
+/// With matching effective parameters, the model-backed and literal
+/// paths must produce identical accepted points, not just close waveforms.
+#[test]
+fn modeled_rlc_uic_matches_literal_coupled_transient_bitwise() {
+    let model = "r1 a 0 rm scale=2 m=2\nc1 a 0 cm m=2 ic=1\nl1 a 0 lm ic=0.5\nr2 b 0 8\nl2 b 0 lm ic=-0.25\nk1 l1 l2 0.5\n.model rm r(r=8)\n.model cm c(cap=0.0625)\n.model lm l(ind=0.25)";
+    let literal = "r1 a 0 8\nc1 a 0 0.125 ic=1\nl1 a 0 0.25 ic=0.5\nr2 b 0 8\nl2 b 0 0.25 ic=-0.25\nk1 l1 l2 0.5";
+    let context = AnalysisContext::default();
+    let mut request =
+        AnalysisRequest::with_arguments(AnalysisKind::Transient, ["1m", "20m", "0", "1m"]);
+    request.uic = true;
+    let transient = runner(AnalysisKind::Transient).unwrap();
+    let a = transient
+        .run(&mut circuit(model), &request, &context)
+        .unwrap();
+    let b = transient
+        .run(&mut circuit(literal), &request, &context)
+        .unwrap();
+    assert_eq!(a.point_count(), b.point_count());
+    assert_eq!(a.variable_count(), b.variable_count());
+    for var in &b.variables {
+        for point in 0..b.point_count() {
+            let got = a.value(&var.name, point).unwrap();
+            let expected = b.value(&var.name, point).unwrap();
+            assert_eq!(
+                got.re.to_bits(),
+                expected.re.to_bits(),
+                "{} at {point}",
+                var.name
+            );
+            assert_eq!(
+                got.im.to_bits(),
+                expected.im.to_bits(),
+                "{} at {point}",
+                var.name
+            );
+        }
+    }
+}
+
 #[test]
 fn logarithmic_ac_preserves_integer_span_endpoints_without_adding_out_of_range_points() {
     // ngspice (acan.c) steps `freq *= delta` while `freq <= stop + freqTol`;

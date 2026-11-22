@@ -10,7 +10,7 @@ use super::expression::{is_ident_continue, is_ident_start};
 use super::grammar::{Failure, Input, ParsedCard, Result, keyword};
 use super::syntax::{canonical_node, equals, malformed, name};
 use crate::netlist::ast::{
-    DeviceInstance, IncludeDirective, ParameterAssignment, ParameterKind, Subcircuit,
+    DeviceInstance, IncludeDirective, OutputCards, ParameterAssignment, ParameterKind, Subcircuit,
 };
 use crate::netlist::expr::{EXCLUDED_FUNCTIONS, Function};
 use crate::netlist::token::{Token, TokenKind};
@@ -58,7 +58,7 @@ fn subckt(input: &mut Input<'_>) -> Result<ParsedCard> {
             globals: Vec::new(),
             initial_conditions: Vec::new(),
             nodesets: Vec::new(),
-            output: Default::default(),
+            output: OutputCards::default(),
             measurements: Vec::new(),
             fourier: Vec::new(),
             cards: Vec::new(),
@@ -83,7 +83,9 @@ fn instance(input: &mut Input<'_>) -> Result<ParsedCard> {
     cut_err(|input: &mut Input<'_>| {
         let (mut connections, parameters): (Vec<_>, _) =
             (repeat(1.., connection), parameters).parse_next(input)?;
-        let target = connections.pop().expect("at least one name");
+        let target = connections
+            .pop()
+            .ok_or_else(|| malformed(input, "expected subcircuit name"))?;
         Ok(ParsedCard::Device(DeviceInstance {
             name: instance.text.to_ascii_lowercase(),
             designator: 'x',
@@ -207,15 +209,14 @@ fn library(input: &mut Input<'_>) -> Result<ParsedCard> {
     keyword(".lib").parse_next(input)?;
     cut_err(|input: &mut Input<'_>| {
         let (first, second) = (path, opt(path)).parse_next(input)?;
-        match second {
-            Some(section) => directive(input, first, Some(section)),
-            None => {
-                let section = path_value(first).to_ascii_lowercase();
-                if section.is_empty() {
-                    return Err(malformed(input, "library section cannot be empty"));
-                }
-                Ok(ParsedCard::LibStart(section))
+        if let Some(section) = second {
+            directive(input, first, Some(section))
+        } else {
+            let section = path_value(first).to_ascii_lowercase();
+            if section.is_empty() {
+                return Err(malformed(input, "library section cannot be empty"));
             }
+            Ok(ParsedCard::LibStart(section))
         }
     })
     .parse_next(input)

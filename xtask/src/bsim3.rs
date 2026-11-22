@@ -96,7 +96,7 @@ fn size_dependent(
         .find("pParam->BSIM3abulkCVfactor")
         .ok_or("missing BSIM3 size-dependent end")?;
     let mut out = format!(
-        "// Generated size-dependent coefficient facts, not C implementation code.\n// Source: ngspice {revision}, bsim3/b3temp.c.\n// Each row is a canonical parameter plus its L, W and reciprocal-area\n// coefficients. Dependent formulas live in setup.rs, not here.\n\n/// Canonical base keyword and its L, W, P coefficient keywords, in C order.\n#[rustfmt::skip]\npub(super) const SIZE_DEPENDENT: &[(&str, &str, &str, &str)] = &[\n"
+        "// Generated size-dependent coefficient facts, not C implementation code.\n// Source: ngspice {revision}, bsim3/b3temp.c.\n// Each row is a canonical parameter plus its L, W and reciprocal-area\n// coefficients. Dependent formulas live in setup.rs, not here.\n\n/// Canonical base keyword and its L, W, P coefficient keywords, in C order.\n#[rustfmt::skip]\npub(crate) const SIZE_DEPENDENT: &[(&str, &str, &str, &str)] = &[\n"
     );
     let mut seen = BTreeSet::new();
     let body = &clean[start..end];

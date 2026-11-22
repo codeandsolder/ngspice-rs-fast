@@ -3,13 +3,16 @@
 //!
 //! Ported statement by statement from BSIM4 4.8.3 (`b4check.c`, Copyright
 //! (c) 2025 University of California, Educational Community License 2.0).
-#![allow(non_snake_case)]
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)]
 
 use super::fields::{Instance, Model, SizeParam};
 use super::temp::c_g;
 
 /// C `fabs`.
-fn fabs(x: f64) -> f64 {
+const fn fabs(x: f64) -> f64 {
     x.abs()
 }
 
@@ -57,14 +60,23 @@ fn strncmp(a: &str, b: &str, n: usize) -> bool {
 ///   instance is the first one in that order; its model resets persist
 ///   into every later instance and pass, its size-dependent resets only
 ///   into instances sharing its (l, w, nf) parameter set in that pass.
-#[allow(
+#[expect(
     clippy::too_many_lines,
-    clippy::if_same_then_else,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)]
+#[expect(
     clippy::collapsible_if,
+    reason = "preserves the reference conditional order and side-effect boundaries"
+)]
+#[expect(
     clippy::collapsible_else_if,
-    unused_parens
-)] // A statement-by-statement port of C.
-pub(crate) fn check_model(
+    reason = "keeps the reference branches identifiable by their original conditions"
+)]
+#[expect(
+    clippy::float_cmp,
+    reason = "C checks exact singular denominators and discrete real-valued NF, NGCON and WPEMOD selectors; epsilon comparisons would change model resets and diagnostics"
+)]
+pub(super) fn check_model(
     m: &mut Model,
     h: &mut Instance,
     p: &mut SizeParam,
@@ -916,6 +928,41 @@ mod tests {
         assert!(strncmp("4.7", "4.8", 3));
         assert!(strncmp("4", "4.8", 3));
         assert!(!strcmp("4.8.0", "4.8.0"));
+    }
+
+    #[test]
+    fn model_checks_use_exact_denominators_and_discrete_selectors() {
+        let mut model = Model {
+            version: "4.8.3".into(),
+            ..Model::default()
+        };
+        let mut instance = Instance {
+            ngcon: 1.0_f64.next_up(),
+            ..Instance::default()
+        };
+        let mut size = SizeParam {
+            weff: 1.0,
+            w0: -1.0,
+            b1: -1.0_f64.next_up(),
+            ..SizeParam::default()
+        };
+        let mut messages = Vec::new();
+        check_model(
+            &mut model,
+            &mut instance,
+            &mut size,
+            300.15,
+            "exact",
+            &mut messages,
+        );
+        assert!(messages.iter().any(|s| s.contains("(W0 + Weff) = 0")));
+        assert!(!messages.iter().any(|s| s.contains("(B1 + Weff) = 0")));
+        assert!(
+            messages
+                .iter()
+                .any(|s| s.contains("Ngcon must be equal to one or two"))
+        );
+        assert_eq!(instance.ngcon.to_bits(), 1.0_f64.to_bits());
     }
 
     #[test]

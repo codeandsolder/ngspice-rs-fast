@@ -374,7 +374,10 @@ struct Expectation {
 ///
 /// The literals keep every digit ngspice printed, including trailing zeros, so a
 /// change in the last digit fails rather than being lost to precision.
-#[allow(clippy::excessive_precision)]
+#[expect(
+    clippy::excessive_precision,
+    reason = "reference C literal spelling is preserved for numerical parity"
+)]
 const EXPECTATIONS: &[Expectation] = &[
     // BSIM3v3.3 (#90). No gate current flows, so i(vdd) is exactly the two
     // resistor currents: (1.8 - v(d1))/2 kOhm + v(d2)/5 kOhm = 330.7 uA.
@@ -10044,7 +10047,10 @@ const EXPECTATIONS: &[Expectation] = &[
 /// Multi-analysis fixtures (#96): one [`Expectation`] per plot, in rawfile
 /// order, which is ngspice's batch order (`.ac`, `.dc`, `.op`, `.tran`), not
 /// the deck order.
-#[allow(clippy::excessive_precision)]
+#[expect(
+    clippy::excessive_precision,
+    reason = "reference C literal spelling is preserved for numerical parity"
+)]
 const MULTI_EXPECTATIONS: &[&[Expectation]] = &[
     &[
         // BSIM4 (#90): b4noi.c. At 1 kHz onoise/inoise is the stage gain

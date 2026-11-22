@@ -65,8 +65,8 @@ impl Device for Accumulator {
 
 fn circuit(log: &Log) -> Circuit {
     let mut circuit = Circuit::new();
-    let a = circuit.add_node("a");
-    let b = circuit.add_node("b");
+    let a = circuit.add_node("a").unwrap();
+    let b = circuit.add_node("b").unwrap();
     for (name, node, branches) in [("x1", a, 0), ("x2", b, 1)] {
         circuit
             .add_device(Box::new(Accumulator {
@@ -227,7 +227,9 @@ fn loads_validate_dimensions_and_stale_numbering() {
     assert!(load(&circuit, &history, &[1.0, 1.0]).is_err());
     assert!(load(&circuit, &history, &[f64::NAN, 1.0, 0.0]).is_err());
     assert!(load(&circuit, &StateHistory::new(1), &[1.0, 1.0, 0.0]).is_err());
-    let c = circuit.add_node("c");
+    let c = circuit.add_node("c").unwrap();
+    let error = load(&circuit, &history, &[1.0, 1.0, 0.0]).unwrap_err();
+    assert!(error.to_string().contains("stale"), "{error}");
     circuit
         .add_device(Box::new(
             Resistor::new("r1", [c, NodeId::GROUND], 1.0).unwrap(),

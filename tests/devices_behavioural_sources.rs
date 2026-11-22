@@ -87,6 +87,34 @@ const POINTS: &[&[(&str, Real)]] = &[
 ];
 
 #[test]
+fn quantity_interning_preserves_first_use_and_namespaces() {
+    let compiled = program("v(x,y)+i(x)+2*v(y)+3*i(x)+v(x)");
+    assert_eq!(
+        compiled.quantities(),
+        &[
+            Quantity::Node("x".into()),
+            Quantity::Node("y".into()),
+            Quantity::Branch("x".into())
+        ],
+    );
+    let result = compiled.evaluate(&environment(&[2., 3., 5.])).unwrap();
+    assert_eq!(result.value, 27.);
+    assert_eq!(result.gradient, [2., 1., 4.]);
+    assert!(!compiled.uses_frequency());
+
+    for text in [
+        "hertz",
+        "v(x)+hertz",
+        "pwl(hertz,0,0,1,1)",
+        "ternary_fcn(0,hertz,v(x))",
+        "max(v(x),sin(hertz))",
+    ] {
+        assert!(program(text).uses_frequency(), "{text}");
+    }
+    assert!(!program("v(hertz)+i(hertz)").uses_frequency());
+}
+
+#[test]
 fn every_function_has_a_derivative_matching_finite_differences() {
     for text in [
         // inpptree.c funcs[] in table order, each with an inner expression so
@@ -144,6 +172,38 @@ fn every_function_has_a_derivative_matching_finite_differences() {
         "pi*v(a) + e*v(b)",
     ] {
         assert_gradient(text, POINTS);
+    }
+}
+
+/// The `^` operator and `pow()` produce the same C derivative tree, even
+/// though their value functions diverge at a zero base. This covers constant
+/// exponents, variable exponents and the special constant-base rule.
+#[test]
+fn caret_and_pow_share_identical_derivative_values() {
+    let cases = [
+        ("(v(a) + 3)^2.5", "pow(v(a) + 3, 2.5)"),
+        ("(v(a) - 3)^3", "pow(v(a) - 3, 3)"),
+        ("(v(a) + 3)^(v(b) + 1)", "pow(v(a) + 3, v(b) + 1)"),
+        ("2^(v(a) - v(b))", "pow(2, v(a) - v(b))"),
+    ];
+    for (caret, function) in cases {
+        let left = program(caret);
+        let right = program(function);
+        assert_eq!(left.quantities(), right.quantities());
+        for point in POINTS {
+            let names: BTreeMap<&str, Real> = point.iter().copied().collect();
+            let x = values(&left, &names);
+            let lhs = left.evaluate(&environment(&x)).unwrap();
+            let rhs = right.evaluate(&environment(&x)).unwrap();
+            assert_eq!(lhs.gradient.len(), rhs.gradient.len(), "{caret}");
+            for (a, b) in lhs.gradient.iter().zip(&rhs.gradient) {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{caret} vs {function} at {point:?}"
+                );
+            }
+        }
     }
 }
 

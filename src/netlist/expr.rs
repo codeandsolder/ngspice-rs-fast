@@ -46,13 +46,13 @@ pub struct SourceSpan {
 impl SourceSpan {
     /// Span length in bytes.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.end.column.saturating_sub(self.start.column) as usize
     }
 
     /// True when the span covers no bytes.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
@@ -97,9 +97,13 @@ impl ParameterExpression {
     /// duplicates kept. Function names are not references.
     #[must_use]
     pub fn references(&self) -> Vec<&str> {
-        let mut names = Vec::new();
-        self.root.collect_references(&mut names);
-        names
+        self.root
+            .preorder()
+            .filter_map(|node| match &node.kind {
+                ExprKind::Identifier(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -114,23 +118,28 @@ pub struct Expr {
 }
 
 impl Expr {
-    fn collect_references<'a>(&'a self, names: &mut Vec<&'a str>) {
-        match &self.kind {
-            ExprKind::Number { .. } => {}
-            ExprKind::Identifier(name) => names.push(name),
-            ExprKind::Unary { operand, .. } | ExprKind::Group(operand) => {
-                operand.collect_references(names);
-            }
-            ExprKind::Binary { lhs, rhs, .. } => {
-                lhs.collect_references(names);
-                rhs.collect_references(names);
-            }
-            ExprKind::Call { arguments, .. } | ExprKind::UserCall { arguments, .. } => {
-                for argument in arguments {
-                    argument.collect_references(names);
+    /// Visit a syntax tree in source order without recursive stack growth.
+    /// A binary node visits its left subtree before the right; a call is
+    /// visited before its arguments.
+    pub(super) fn preorder(&self) -> impl Iterator<Item = &Self> {
+        let mut pending = vec![self];
+        std::iter::from_fn(move || {
+            let node = pending.pop()?;
+            match &node.kind {
+                ExprKind::Number { .. } | ExprKind::Identifier(_) => {}
+                ExprKind::Unary { operand, .. } | ExprKind::Group(operand) => {
+                    pending.push(operand);
+                }
+                ExprKind::Binary { lhs, rhs, .. } => {
+                    pending.push(rhs);
+                    pending.push(lhs);
+                }
+                ExprKind::Call { arguments, .. } | ExprKind::UserCall { arguments, .. } => {
+                    pending.extend(arguments.iter().rev());
                 }
             }
-        }
+            Some(node)
+        })
     }
 }
 

@@ -15,38 +15,78 @@
 //! - C's bypass branch (`goto line755`/`line850` when `CKTbypass` is set) is
 //!   not compiled: the port runs with `bypass = 0`, C's default, so `ByPass`
 //!   stays 0 (`NOBYPASS` path), and `NEWCONV` is defined as in C.
-#![allow(non_snake_case)] // C's member and local names.
-#![allow(unused_assignments, unused_variables, unused_mut)] // C assigns locals that some paths never read.
-#![allow(non_upper_case_globals)] // C's `Charge_q`.
-#![allow(unused_parens)] // C's parenthesisation is kept verbatim.
-#![allow(clippy::assign_op_pattern)] // `x = x * y` is kept as C writes it.
-#![allow(clippy::collapsible_else_if)] // C's if/else nesting.
-#![allow(clippy::collapsible_if)] // C's if nesting.
-#![allow(clippy::double_parens)] // C's parenthesisation is kept verbatim.
-#![allow(clippy::eq_op)] // C's expressions are kept verbatim.
-#![allow(clippy::excessive_precision)] // C's literals.
-#![allow(clippy::float_cmp)] // C compares floating point exactly.
-#![allow(clippy::if_same_then_else)] // C's branches.
-#![allow(clippy::many_single_char_names)] // C's locals.
-#![allow(clippy::misrefactored_assign_op)] // C's `T0 *= T0 * 4.0e-16`.
-#![allow(clippy::manual_range_contains)] // C's range tests.
-#![allow(clippy::neg_multiply)] // C's `-1 * x` forms.
-#![allow(clippy::nonminimal_bool)] // C's conditions.
-#![allow(clippy::precedence)] // C's expressions are kept verbatim.
-#![allow(clippy::self_assignment)] // C's statements.
-#![allow(clippy::too_many_lines)] // One C function.
-#![allow(clippy::cognitive_complexity)] // One C function.
-#![allow(clippy::useless_conversion)] // Generated int-to-double conversions.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::similar_names,
+    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
+)]
+#![expect(
+    clippy::manual_midpoint,
+    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)] // C's member and local names.
+#![expect(
+    unused_assignments,
+    reason = "C state-machine locals retain the reference assignment sequence"
+)]
+#![expect(
+    unused_variables,
+    reason = "C-translated intermediate variables preserve the reference layout"
+)]
+#![expect(
+    unused_mut,
+    reason = "local mutability reflects the source C intermediate state declarations"
+)] // C assigns locals that some paths never read.
+#![expect(
+    non_upper_case_globals,
+    reason = "constant names intentionally match the reference device equations"
+)] // C's `Charge_q`.
+#![expect(
+    unused_parens,
+    reason = "preserves source C expression grouping during numerical port verification"
+)] // C's parenthesisation is kept verbatim.
+#![expect(
+    clippy::assign_op_pattern,
+    reason = "retains the reference calculation grouping and floating-point operation order"
+)] // `x = x * y` is kept as C writes it.
+#![expect(
+    clippy::collapsible_if,
+    reason = "preserves the reference conditional order and side-effect boundaries"
+)] // C's if nesting.
+#![expect(
+    clippy::float_cmp,
+    reason = "exact equality is part of the reference device model branch conditions"
+)] // C compares floating point exactly.
+#![expect(
+    clippy::manual_range_contains,
+    reason = "comparison spelling matches the reference C conditional sequence"
+)] // C's range tests.
+#![expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)] // One C function.
+#![expect(
+    clippy::cognitive_complexity,
+    reason = "single translated reference routine retains its checked evaluation sequence"
+)] // One C function.
 use super::fields::{Instance, Model, SizeParam};
 use super::host::{LoadCkt, mode, state};
 use crate::devices::limiting::{fetlim, limvds, pnjlim};
 use crate::primitives::SpiceResult;
 
-const MAX_EXPL: f64 = 2.688117142e+43;
-const MIN_EXPL: f64 = 3.720075976e-44;
+const MAX_EXPL: f64 = 2.688_117_142e+43;
+const MIN_EXPL: f64 = 3.720_075_976e-44;
 const EXPL_THRESHOLD: f64 = 100.0;
-const MAX_EXP: f64 = 5.834617425e14;
-const MIN_EXP: f64 = 1.713908431e-15;
+const MAX_EXP: f64 = 5.834_617_425e14;
+const MIN_EXP: f64 = 1.713_908_431e-15;
 const EXP_THRESHOLD: f64 = 34.0;
 const EPS0: f64 = 8.85418e-12;
 const EPSSI: f64 = 1.03594e-10;
@@ -57,9 +97,9 @@ const DELTA_4: f64 = 0.02;
 /// Smoothing coefficient.
 const MM: i32 = 3;
 /// `const.h`'s `CHARGE`.
-const CHARGE: f64 = 1.6021766208e-19;
+const CHARGE: f64 = 1.602_176_620_8e-19;
 /// `CONSTvt0 = CONSTboltz * REFTEMP / CHARGE` (`main.c`), REFTEMP = 27 C.
-const CONST_VT0: f64 = 1.38064852e-23 * (27.0 + 273.15) / CHARGE;
+const CONST_VT0: f64 = 1.380_648_52e-23 * (27.0 + 273.15) / CHARGE;
 
 fn exp(x: f64) -> f64 {
     x.exp()
@@ -70,7 +110,7 @@ fn log(x: f64) -> f64 {
 fn sqrt(x: f64) -> f64 {
     x.sqrt()
 }
-fn fabs(x: f64) -> f64 {
+const fn fabs(x: f64) -> f64 {
     x.abs()
 }
 /// `b4ld.c`'s `DEXP(A, B, C)` macro: returns `(B, C)`.
@@ -87,7 +127,7 @@ fn DEXP(A: f64) -> (f64, f64) {
 
 /// `BSIM4polyDepletion`: the poly-gate depletion effective gate voltage and
 /// its gate derivative, `(Vgs_eff, dVgs_eff_dVg)`.
-pub(crate) fn BSIM4polyDepletion(
+pub(super) fn BSIM4polyDepletion(
     phi: f64,
     ngate: f64,
     epsgate: f64,
@@ -116,7 +156,7 @@ pub(crate) fn BSIM4polyDepletion(
 ///
 /// # Errors
 /// `NIintegrate` failures (C returns its error).
-pub(crate) fn load(
+pub(super) fn load(
     model: &Model,
     here: &mut Instance,
     pParam: &SizeParam,
@@ -726,15 +766,12 @@ pub(crate) fn load(
     let mut mult_q: f64 = 0.0;
     ScalingFactor = 1.0e-9;
     // No integration if DC sweep, but keep evaluating capacitances.
-    ChargeComputationNeeded = (if (((ckt.mode()
-        & (((mode::MODEDCTRANCURVE | mode::MODEAC) | mode::MODETRAN) | mode::MODEINITSMSIG))
-        != 0)
-        || (((ckt.mode() & mode::MODETRANOP) != 0) && ((ckt.mode() & mode::MODEUIC) != 0)))
-    {
-        1
-    } else {
-        0
-    });
+    ChargeComputationNeeded = i32::from(
+        (ckt.mode()
+            & (mode::MODEDCTRANCURVE | mode::MODEAC | mode::MODETRAN | mode::MODEINITSMSIG))
+            != 0
+            || ((ckt.mode() & mode::MODETRANOP) != 0 && (ckt.mode() & mode::MODEUIC) != 0),
+    );
 
     Check2 = 1;
     Check1 = Check2;
@@ -1571,7 +1608,8 @@ pub(crate) fn load(
     if Weff < 2.0e-8 {
         T0 = 1.0 / (6.0e-8 - 2.0 * Weff);
         Weff = 2.0e-8 * (4.0e-8 - Weff) * T0;
-        T0 *= T0 * 4.0e-16;
+        let correction = T0 * 4.0e-16;
+        T0 *= correction;
         dWeff_dVg *= T0;
         dWeff_dVb *= T0;
     }
@@ -1647,7 +1685,10 @@ pub(crate) fn load(
     Abulk *= T0;
     Abulk0_Q = Abulk0;
     Abulk0 *= T0;
-    if pParam.ketac != pParam.keta {
+    if pParam.ketac == pParam.keta {
+        dAbulk0_Q_dVb = dAbulk0_dVb;
+        Abulk0_Q = Abulk0;
+    } else {
         T2 = pParam.ketac * Vbseff;
         if T2 >= -0.9 {
             T0 = 1.0 / (1.0 + T2);
@@ -1659,9 +1700,6 @@ pub(crate) fn load(
         }
         dAbulk0_Q_dVb = dAbulk0_Q_dVb * T0 + Abulk0_Q * dT0_dVb;
         Abulk0_Q *= T0;
-    } else {
-        dAbulk0_Q_dVb = dAbulk0_dVb;
-        Abulk0_Q = Abulk0;
     }
     if (model.mtrlMod != 0) && model.mtrlCompatMod == 0 {
         T14 = 2.0 * f64::from(model.r#type) * (model.phig - model.easub - 0.5 * model.Eg0 + 0.45);
@@ -2398,7 +2436,7 @@ pub(crate) fn load(
                 Ggidld = T3 * dT1_dVd;
                 Ggidlg = T3 * dT1_dVg;
             } else {
-                Igidl = pParam.agidl * pParam.weffCJ * 3.720075976e-44;
+                Igidl = pParam.agidl * pParam.weffCJ * 3.720_075_976e-44;
                 Ggidld = Igidl * dT1_dVd;
                 Ggidlg = Igidl * dT1_dVg;
                 Igidl *= T1;
@@ -2442,7 +2480,7 @@ pub(crate) fn load(
                 Ggisls = T3 * dT1_dVd;
                 Ggislg = T3 * dT1_dVg;
             } else {
-                Igisl = pParam.agisl * pParam.weffCJ * 3.720075976e-44;
+                Igisl = pParam.agisl * pParam.weffCJ * 3.720_075_976e-44;
                 Ggisls = Igisl * dT1_dVd;
                 Ggislg = Igisl * dT1_dVg;
                 Igisl *= T1;
@@ -2479,14 +2517,12 @@ pub(crate) fn load(
             if T2 < EXPL_THRESHOLD {
                 Igisl = pParam.weffCJ * pParam.agisl * T1 * exp(-T2);
                 T3 = Igisl / T1 * (T2 + 1.0);
-                Ggisls = T3 * dT1_dVd;
-                Ggislg = T3 * dT1_dVg;
             } else {
                 T3 = pParam.weffCJ * pParam.agisl * MIN_EXPL;
                 Igisl = T3 * T1;
-                Ggisls = T3 * dT1_dVd;
-                Ggislg = T3 * dT1_dVg;
             }
+            Ggisls = T3 * dT1_dVd;
+            Ggislg = T3 * dT1_dVg;
             T4 = vbs - pParam.fgisl;
             if T4 > model.gidlclamp {
                 T4 = model.gidlclamp;
@@ -2528,14 +2564,12 @@ pub(crate) fn load(
             if T2 < EXPL_THRESHOLD {
                 Igidl = pParam.weffCJ * pParam.agidl * T1 * exp(-T2);
                 T3 = Igidl / T1 * (T2 + 1.0);
-                Ggidld = T3 * dT1_dVd;
-                Ggidlg = T3 * dT1_dVg;
             } else {
                 T3 = pParam.weffCJ * pParam.agidl * MIN_EXPL;
                 Igidl = T3 * T1;
-                Ggidld = T3 * dT1_dVd;
-                Ggidlg = T3 * dT1_dVg;
             }
+            Ggidld = T3 * dT1_dVd;
+            Ggidlg = T3 * dT1_dVg;
             T4 = vbd - pParam.fgidl;
             if T4 > model.gidlclamp {
                 T4 = model.gidlclamp;
@@ -2969,7 +3003,8 @@ pub(crate) fn load(
         if T0 >= 0.0 {
             Vdseff = Vdsat - 0.5 * (T0 + T1);
         } else {
-            T3 = (DELTA_4 + DELTA_4) / (T1 - T0);
+            let twice_delta = DELTA_4 + DELTA_4;
+            T3 = twice_delta / (T1 - T0);
             T4 = 1.0 - T3;
             T5 = Vdsat * T3 / (T1 - T0);
             Vdseff = Vdsat * T4;
@@ -3375,7 +3410,8 @@ pub(crate) fn load(
                 dVdseffCV_dVd = 0.5 * (1.0 - dT1_dVd);
                 dVdseffCV_dVb = 0.5 * (dT0_dVb - dT1_dVb);
             } else {
-                T3 = (DELTA_4 + DELTA_4) / (T1 - T0);
+                let twice_delta = DELTA_4 + DELTA_4;
+                T3 = twice_delta / (T1 - T0);
                 T4 = 1.0 - T3;
                 T5 = VdsatCV * T3 / (T1 - T0);
                 VdseffCV = VdsatCV * T4;
@@ -3580,7 +3616,8 @@ pub(crate) fn load(
                 dVdseffCV_dVd = 0.5 * (1.0 - dT1_dVd);
                 dVdseffCV_dVb = 0.5 * (dT0_dVb - dT1_dVb);
             } else {
-                T3 = (DELTA_4 + DELTA_4) / (T1 - T0);
+                let twice_delta = DELTA_4 + DELTA_4;
+                T3 = twice_delta / (T1 - T0);
                 T4 = 1.0 - T3;
                 T5 = VdsatCV * T3 / (T1 - T0);
                 VdseffCV = VdsatCV * T4;
@@ -4231,8 +4268,6 @@ pub(crate) fn load(
                     qgmid = qgdo + qgso + qgmb;
                     qgate = 0.0;
                     qbulk = -qgmb;
-                    qdrn = -qgdo;
-                    qsrc = -qgso;
                 } else {
                     gcggb = (cgdo + cgso + pParam.cgbo) * ag0;
                     gcgdb = -cgdo * ag0;
@@ -4247,9 +4282,9 @@ pub(crate) fn load(
                     qgb = pParam.cgbo * vgb;
                     qgate = qgdo + qgso + qgb;
                     qbulk = -qgb;
-                    qdrn = -qgdo;
-                    qsrc = -qgso;
                 }
+                qdrn = -qgdo;
+                qsrc = -qgso;
                 gcddb = (here.capbd + cgdo) * ag0;
                 gcsdb = 0.0;
                 gcdsb = gcsdb;

@@ -277,10 +277,7 @@ impl RawCard {
     /// Propagates tokenizer errors, for instance an unterminated `{` expression.
     pub fn parse(line: &LogicalLine) -> SpiceResult<Self> {
         let tokens = tokenize(line)?;
-        let kind = match tokens.first() {
-            Some(first) => CardKind::classify(first),
-            None => CardKind::Unknown,
-        };
+        let kind = tokens.first().map_or(CardKind::Unknown, CardKind::classify);
         Ok(Self {
             location: line.location.clone(),
             raw: line.text.clone(),

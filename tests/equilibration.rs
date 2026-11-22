@@ -7,7 +7,7 @@ use ngspice_rs::primitives::Complex;
 
 fn matrices(values: &[&[f64]]) -> (SparseMatrix, Matrix) {
     let mut sparse = SparseMatrix::new(values.len(), values[0].len());
-    let mut dense = Matrix::zeros(sparse.rows(), sparse.cols());
+    let mut dense = Matrix::zeros(sparse.rows(), sparse.cols()).unwrap();
     for (r, row) in values.iter().enumerate() {
         for (c, &v) in row.iter().enumerate() {
             sparse.add(r, c, v).unwrap();
@@ -213,8 +213,8 @@ fn singular_homogeneous_nonunique_and_ideal_source_loop_remain_failures() {
 #[test]
 fn dimensions_nonfinite_duplicate_and_frequency_overflow_are_errors() {
     for (s, d) in [
-        (SparseMatrix::new(0, 0), Matrix::zeros(0, 0)),
-        (SparseMatrix::new(2, 3), Matrix::zeros(2, 3)),
+        (SparseMatrix::new(0, 0), Matrix::zeros(0, 0).unwrap()),
+        (SparseMatrix::new(2, 3), Matrix::zeros(2, 3).unwrap()),
     ] {
         assert!(EquilibratedSparseLu::new(&s, None).is_err());
         assert!(EquilibratedDenseLu::new(&d).is_err());
@@ -306,7 +306,7 @@ fn exponent_bounds_extremes_and_subnormal_input_are_deterministic() {
 }
 
 /// The linearisation of `b o 0 v=log(v(in))` beside `vin in 0 dc 2` at a 0 V
-/// Newton start: a 1e32 slope (C's PTdivide fudge) and a -1e99 value.
+/// Newton start: a 1e32 slope (C's `PTdivide` fudge) and a -1e99 value.
 fn behavioural_zero_start() -> (SparseMatrix, Vector) {
     let mut m = SparseMatrix::new(4, 4);
     for (r, c, v) in [

@@ -54,7 +54,7 @@ pub(crate) fn args(args: &[String], usage: &str) -> Result<Args, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--source" if source.is_none() => {
-                source = Some(PathBuf::from(args.next().ok_or(usage)?))
+                source = Some(PathBuf::from(args.next().ok_or(usage)?));
             }
             "--check" if !check => check = true,
             _ => return Err(usage.into()),
@@ -109,7 +109,7 @@ pub(crate) struct Entry {
     pub(crate) uninteresting: bool,
 }
 
-/// Restricted IFparm reader: one declarator per line, four comma-separated
+/// Restricted `IFparm` reader: one declarator per line, four comma-separated
 /// leading arguments. Descriptions are deliberately not copied into Rust.
 pub(crate) fn table(text: &str, name: &str) -> Result<Vec<Entry>, String> {
     let marker = format!("IFparm {name}[] = {{");
@@ -139,7 +139,7 @@ pub(crate) fn table(text: &str, name: &str) -> Result<Vec<Entry>, String> {
             other => return Err(format!("unknown IFparm macro {other}")),
         };
         let args: Vec<_> = arguments.splitn(4, ',').map(str::trim).collect();
-        if args.len() != 4 || !args[3].starts_with('"') || !line.contains(")") {
+        if args.len() != 4 || !args[3].starts_with('"') || !line.contains(')') {
             return Err(format!("unsupported IFparm declaration: {line}"));
         }
         let name = args[0]
@@ -305,7 +305,7 @@ pub(crate) fn parameters(
     ] {
         let setters = setters(setter_text, spec.prefix)?;
         let mut canonical = BTreeMap::new();
-        writeln!(out, "\n/// `{name}` IFparm entries in C table order, including aliases and ask-only rows.\n#[rustfmt::skip]\npub const {name}: &[Parameter] = &[").map_err(|e| e.to_string())?;
+        writeln!(out, "\n/// `{name}` `IFparm` entries in C table order, including aliases and ask-only rows.\n#[rustfmt::skip]\npub const {name}: &[Parameter] = &[").map_err(|e| e.to_string())?;
         for entry in entries {
             let id = ids
                 .get(entry.symbol.as_str())
@@ -339,6 +339,47 @@ pub(crate) fn parameters(
     }
     out.push_str("];\n");
     Ok(out)
+}
+
+/// Group canonical `Debug` decimal digits without changing their value.
+///
+/// This is source-code formatting only, applied after parsing C defaults into
+/// `f64`. Keep the mantissa/exponent and significant digits intact so the
+/// generator's output continues to represent the exact same binary float.
+fn grouped_literal(value: f64) -> String {
+    fn group_digits(digits: &str, from_right: bool) -> String {
+        if digits.len() < 6 {
+            return digits.to_owned();
+        }
+        let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+        for (index, digit) in digits.chars().enumerate() {
+            let boundary = if from_right {
+                (digits.len() - index).is_multiple_of(3)
+            } else {
+                index.is_multiple_of(3)
+            };
+            if index > 0 && boundary {
+                out.push('_');
+            }
+            out.push(digit);
+        }
+        out
+    }
+
+    let literal = format!("{value:?}");
+    let exponent_index = literal.find(['e', 'E']).unwrap_or(literal.len());
+    let (mantissa, exponent) = literal.split_at(exponent_index);
+    let (sign, digits) = mantissa
+        .strip_prefix('-')
+        .map_or(("", mantissa), |v| ("-", v));
+    let (whole, decimal) = digits
+        .split_once('.')
+        .map_or((digits, None), |(w, d)| (w, Some(d)));
+    let whole = group_digits(whole, true);
+    let fraction = decimal
+        .map(|d| format!(".{}", group_digits(d, false)))
+        .unwrap_or_default();
+    format!("{sign}{whole}{fraction}{exponent}")
 }
 
 /// The generated `defaults_data.rs` text: the setup file's literal model
@@ -404,7 +445,8 @@ pub(crate) fn literal_defaults(
         if !seen.insert(p.name.as_str()) {
             return Err(format!("duplicate literal default for {}", p.name));
         }
-        writeln!(out, "    ({:?}, {value:?}),", p.name).map_err(|e| e.to_string())?;
+        let formatted = grouped_literal(value);
+        writeln!(out, "    ({:?}, {formatted}),", p.name).map_err(|e| e.to_string())?;
     }
     if seen.len() != spec.literal_expected {
         return Err(format!(
@@ -430,6 +472,15 @@ pub(crate) fn emit(path: &str, text: &str, check: bool) -> Result<(), String> {
             ));
         }
     } else {
+        match fs::read_to_string(&output) {
+            Ok(current) if current == text => {
+                println!("unchanged {}", output.display());
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{}: {error}", output.display())),
+        }
         fs::create_dir_all(output.parent().ok_or("missing output parent")?)
             .map_err(|e| e.to_string())?;
         fs::write(&output, text).map_err(|e| e.to_string())?;
@@ -448,4 +499,28 @@ pub(crate) fn read(source: &Path, spec: &Spec, name: &str) -> Result<String, Str
         .join(spec.directory)
         .join(name);
     fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod literal_format_tests {
+    use super::grouped_literal;
+
+    #[test]
+    fn groups_decimal_digits_without_changing_float_bits() {
+        for (value, expected) in [
+            (14_500_000_000.0, "14_500_000_000.0"),
+            (5_300_000.0, "5_300_000.0"),
+            (0.000_702, "0.000_702"),
+            (1.380_648_52e-23, "1.380_648_52e-23"),
+            (-0.004_775, "-0.004_775"),
+            (80_000.0, "80000.0"),
+            (2.5, "2.5"),
+            (-0.0, "-0.0"),
+        ] {
+            let formatted = grouped_literal(value);
+            assert_eq!(formatted, expected);
+            let decoded: f64 = formatted.replace('_', "").parse().unwrap();
+            assert_eq!(decoded.to_bits(), value.to_bits());
+        }
+    }
 }

@@ -69,13 +69,8 @@ jobs:
         shell: bash
         run: rustup target add ${{ matrix.target }}
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-          # A tag run cannot read caches saved by another tag, so only runs
-          # started by hand from main save; tag releases restore from those.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
 
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
@@ -126,6 +121,10 @@ jobs:
           name: ${{ matrix.target }}
           path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error
+
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
 
   release:
     name: Attach to GitHub release

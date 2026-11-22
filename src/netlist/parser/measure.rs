@@ -512,7 +512,7 @@ fn event(
     let (at_setter, val_setter) = (setters.at(), setters.val());
     let event = match (operand, at_setter, val_setter) {
         (None, Some((at, location)), None) => MeasureEvent::At { at, location },
-        (Some(_), Some((_, at)), _) => {
+        (Some(_), Some((_, at)), _) | (None, Some(_), Some((_, at))) => {
             return Err(fail(
                 &at,
                 format!("{clause} takes AT=<value> or <vector> VAL=<value>, not both"),
@@ -538,12 +538,6 @@ fn event(
                 format!("{clause} needs AT=<value> or <vector> VAL=<value>"),
             ));
         }
-        (None, Some(_), Some((_, at))) => {
-            return Err(fail(
-                &at,
-                format!("{clause} takes AT=<value> or <vector> VAL=<value>, not both"),
-            ));
-        }
     };
     if let Some((_, at)) = setters.transition()
         && operand_is_at(&event)
@@ -564,7 +558,7 @@ fn event(
     Ok((event, setters.window()))
 }
 
-fn operand_is_at(event: &MeasureEvent) -> bool {
+const fn operand_is_at(event: &MeasureEvent) -> bool {
     matches!(event, MeasureEvent::At { .. })
 }
 
@@ -698,16 +692,17 @@ fn transition(input: &mut Input<'_>, name: &str, at: &SourceLoc) -> Result<Measu
         return Ok(MeasureTransition::Last);
     }
     let value = number(input, name, at)?;
-    if !(value >= 1.0 && value.fract() == 0.0 && value <= f64::from(u32::MAX)) {
-        return Err(fail(
-            at,
-            format!(
-                "{name}= takes a whole crossing number of at least 1, or LAST (found {})",
-                crate::primitives::format_spice_number(value)
-            ),
-        ));
-    }
-    let count = value as u32;
+    let count = crate::primitives::exact_nonnegative_integer::<u32>(value)
+        .filter(|n| *n >= 1)
+        .ok_or_else(|| {
+            fail(
+                at,
+                format!(
+                    "{name}= takes a whole crossing number of at least 1, or LAST (found {})",
+                    crate::primitives::format_spice_number(value)
+                ),
+            )
+        })?;
     Ok(match name {
         "rise" => MeasureTransition::Rise(count),
         "fall" => MeasureTransition::Fall(count),
@@ -727,7 +722,7 @@ fn next_is(input: &Input<'_>, word: &str) -> bool {
 fn merge(left: MeasureWindow, right: MeasureWindow, card: &SourceLoc) -> Result<MeasureWindow> {
     for (written, other, name) in [(left.from, right.from, "FROM"), (left.to, right.to, "TO")] {
         if let (Some(a), Some(b)) = (written, other)
-            && a != b
+            && a.partial_cmp(&b) != Some(std::cmp::Ordering::Equal)
         {
             return Err(fail(
                 card,
@@ -797,15 +792,15 @@ impl Setters {
     }
 
     fn at(&self) -> Option<(Real, SourceLoc)> {
-        copy(self.at.as_ref())
+        self.at.clone()
     }
 
     fn val(&self) -> Option<(Real, SourceLoc)> {
-        copy(self.val.as_ref())
+        self.val.clone()
     }
 
     fn transition(&self) -> Option<(MeasureTransition, SourceLoc)> {
-        copy(self.transition.as_ref())
+        self.transition.clone()
     }
 
     fn window(&self) -> MeasureWindow {
@@ -814,11 +809,6 @@ impl Setters {
             to: self.to.as_ref().map(|(value, _)| *value),
         }
     }
-}
-
-/// A copy of one positional setter.
-fn copy<T: Copy>(setter: Option<&(T, SourceLoc)>) -> Option<(T, SourceLoc)> {
-    setter.map(|(value, location)| (*value, location.clone()))
 }
 
 fn set(slot: &mut Option<(Real, SourceLoc)>, value: Real, at: SourceLoc, name: &str) -> Result<()> {

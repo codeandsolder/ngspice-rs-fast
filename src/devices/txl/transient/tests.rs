@@ -6,7 +6,7 @@ use crate::primitives::NodeTable;
 #[test]
 fn rejected_trials_are_pure_and_the_clamp_survives_pruning() {
     let mut nodes = NodeTable::new();
-    let terminals = [nodes.intern("in"), nodes.intern("out")];
+    let terminals = [nodes.intern("in").unwrap(), nodes.intern("out").unwrap()];
     let mut unknowns = MnaUnknowns::new();
     unknowns.rebuild(&nodes);
     let solution = Vector::zeros(4);

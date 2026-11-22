@@ -33,12 +33,12 @@ mod misc;
 mod reactive;
 mod res;
 mod source;
-pub(crate) use controlled::ControlledSensitivity;
-pub(crate) use misc::{BehaviouralSensitivity, MutualSensitivity, SwitchSensitivity};
-pub(crate) use reactive::{ReactiveInputs, ReactiveKind, ReactiveSensitivity};
-pub(crate) use res::{ResistorInputs, ResistorSensitivity};
+pub(super) use controlled::ControlledSensitivity;
+pub(super) use misc::{BehaviouralSensitivity, MutualSensitivity, SwitchSensitivity};
+pub(super) use reactive::{ReactiveKind, ReactiveSensitivity};
+pub(super) use res::ResistorSensitivity;
 pub use source::SourceInputs;
-pub(crate) use source::SourceSensitivity;
+pub(super) use source::SourceSensitivity;
 
 use crate::devices::{Device, LinearContext, StampContext};
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
@@ -114,6 +114,8 @@ pub enum ParameterScope {
     Instance,
 }
 
+/// A real device parameter available to sensitivity analysis.
+///
 /// One entry of a C `IFparm` table that `set_param()` (`cktsgen.c`) accepts:
 /// flagged `IF_SET|IF_ASK|IF_REAL`, neither `IF_VECTOR`, `IF_REDUNDANT` nor
 /// `IF_NONSENSE`, and asked successfully by the device's `DEVask`. Tables list
@@ -717,6 +719,49 @@ pub struct SwitchValues {
     pub on: Option<Real>,
     /// `roff`.
     pub off: Option<Real>,
+}
+
+/// Immutable source of passive sensitivity records. Literal devices give
+/// only their principal value and optional initial condition; modeled
+/// devices already own validated card setters and their provenance.
+#[derive(Debug)]
+pub(super) enum PassiveInputs<'a> {
+    Literal {
+        value: Real,
+        initial_condition: Option<Real>,
+    },
+    Validated {
+        name: Option<&'a str>,
+        model: &'a crate::devices::schema::ScalarValues,
+        instance: &'a crate::devices::schema::ScalarValues,
+    },
+}
+
+impl PassiveInputs<'_> {
+    const fn model_name(&self) -> Option<&str> {
+        match self {
+            Self::Literal { .. } => None,
+            Self::Validated { name, .. } => *name,
+        }
+    }
+
+    fn model_value(&self, keyword: &str) -> Option<Real> {
+        match self {
+            Self::Literal { .. } => None,
+            Self::Validated { model, .. } => written(model, keyword),
+        }
+    }
+
+    fn instance_value(&self, principal: &str, keyword: &str) -> Option<Real> {
+        match self {
+            Self::Literal { value, .. } if keyword == principal => Some(*value),
+            Self::Literal {
+                initial_condition, ..
+            } if keyword == "ic" => *initial_condition,
+            Self::Literal { .. } => None,
+            Self::Validated { instance, .. } => written(instance, keyword),
+        }
+    }
 }
 
 /// A setter the card wrote (`Some`), or `None` for a schema default.

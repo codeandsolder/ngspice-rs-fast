@@ -2,6 +2,29 @@
 //! `y_pade`, `exp_pade`, `get_h3` and `update_h1C_c`.
 //! Local arrays replace C's file-global scratch variables. Setup failures
 //! return contextual errors instead of terminating the process.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::manual_midpoint,
+    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "a complete translated C numerical routine remains contiguous for equation parity review"
+)]
+#![expect(
+    clippy::many_single_char_names,
+    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
+)]
+#![expect(
+    clippy::imprecise_flops,
+    reason = "the original C floating-point algorithm and libm operation sequence must remain intact"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -39,7 +62,6 @@ fn eval(a: Real, b: Real, c: Real, x: Real) -> Real {
 /// The loops stay index-based because this is C's row/column algorithm: the
 /// row swap uses the pivot row that partial pivoting just chose, and the
 /// elimination reads the row it is updating.
-#[allow(clippy::needless_range_loop)]
 fn eliminate(mut a: [[Real; 4]; 3], threshold: Real) -> SpiceResult<[Real; 3]> {
     for i in 0..3 {
         let mut pivot = i;
@@ -192,9 +214,10 @@ impl Pade {
             + (9. * b * b + 3. * a * a) * y1 * y2
             + 0.5 * t * y3)
             / delta;
+        let y2_squared = y2 * y2;
         let y5 = (12. * a * a * y1 * y1 * y1 * y1
             + y1 * y1 * y2 * (18. * b * b - 18. * a * a)
-            + (9. * b * b + 3. * a * a) * (y2 * y2 + y1 * y3)
+            + (9. * b * b + 3. * a * a) * (y2_squared + y1 * y3)
             + (3. * b * b + a * a) * y1 * y3
             + 0.5 * t * y4)
             / delta;
@@ -210,7 +233,9 @@ impl Pade {
         }
         // exp_pade(): expansion of exp(-length*sqrt((sL+R)(sC+G))).
         let y1 = 0.5 * (a + b);
-        let y2 = a * b - y1 * y1;
+        let ab = a * b;
+        let y1_squared = y1 * y1;
+        let y2 = ab - y1_squared;
         let y3 = -3. * y1 * y2;
         let y4 = -3. * y2 * y2 - 4. * y1 * y3;
         let y5 = -5. * y1 * y4 - 10. * y2 * y3;
@@ -228,11 +253,13 @@ impl Pade {
         let mut bb = [0.; 6];
         bb[0] = 1.;
         bb[1] = aa[1];
-        for i in 2..6 {
+        for i in 2_u16..6 {
+            let row = usize::from(i);
             for j in 1..=i {
-                bb[i] += j as Real * aa[j] * bb[i - j];
+                let col = usize::from(j);
+                bb[row] += Real::from(j) * aa[col] * bb[row - col];
             }
-            bb[i] /= i as Real;
+            bb[row] /= Real::from(i);
         }
         let dc = (a0 - length * (r * g).sqrt()).exp();
         let (mut p, mut q) = solve_series([bb[1], bb[2], bb[3], bb[4], bb[5]], dc, 1e-28)?;
@@ -254,9 +281,13 @@ impl Pade {
             let mut sum = 0.;
             if pair {
                 let [u, v, w] = h.h2;
-                sum += u.c / (t.x - u.x)
-                    + 2. * (v.c * t.x - w.x * w.c - v.x * v.c)
-                        / (t.x * t.x - 2. * v.x * t.x + v.x * v.x + w.x * w.x);
+                let single_pole = u.c / (t.x - u.x);
+                let v_residue = v.c * t.x;
+                let w_residue = w.x * w.c;
+                let v_shifted_residue = v.x * v.c;
+                let pair_numerator = v_residue - w_residue - v_shifted_residue;
+                sum += single_pole
+                    + 2. * pair_numerator / (t.x * t.x - 2. * v.x * t.x + v.x * v.x + w.x * w.x);
             } else {
                 for u in h.h2 {
                     sum += u.c / (t.x - u.x);

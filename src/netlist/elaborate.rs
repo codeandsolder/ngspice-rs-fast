@@ -140,6 +140,8 @@ fn resolved<'a>(entries: impl Iterator<Item = &'a NodeHint>) -> Vec<ResolvedNode
         .collect()
 }
 
+/// Format an evaluated parameter for insertion back into a netlist.
+///
 /// Spell an evaluated value as numparam splices it back into the card
 /// (`double_to_string`, `xpressn.c`: `"% 23.15e"`, without the padding).
 /// Reading the text back with [`crate::primitives::parse_spice_number`]
@@ -173,10 +175,6 @@ pub fn literalize(netlist: &Netlist) -> SpiceResult<ElaboratedNetlist> {
 ///
 /// # Errors
 /// As [`literalize`].
-///
-/// # Panics
-/// If a literalized analysis argument does not parse as a number, which
-/// literalization guarantees.
 pub fn literalize_with(
     netlist: &Netlist,
     scope: Arc<ParamScope>,
@@ -200,19 +198,31 @@ pub fn literalize_with(
             }
         })?;
     }
-    for (ai, card) in out.analyses.iter_mut().enumerate() {
-        let before = card.clone();
-        *card = literalize_analysis(&before, &scope, budget)?;
+    for (ai, (before, card)) in netlist.analyses.iter().zip(&mut out.analyses).enumerate() {
+        literalize_analysis_into(before, card, &scope, budget)?;
         for e in &before.expressions {
-            let value = card.arguments[e.index]
-                .parse::<Real>()
-                .expect("literalized argument");
+            let value = card
+                .arguments
+                .get(e.index)
+                .and_then(|argument| argument.parse::<Real>().ok())
+                .ok_or_else(|| {
+                    SpiceError::parse(
+                        e.expression.span.start.clone(),
+                        "literalized analysis argument is not numeric",
+                    )
+                })?;
+            let original = before.arguments.get(e.index).ok_or_else(|| {
+                SpiceError::parse(
+                    e.expression.span.start.clone(),
+                    "analysis argument expression index is out of range",
+                )
+            })?;
             sites.push(ResolvedSite {
                 kind: SiteKind::AnalysisArgument {
                     analysis: ai,
                     argument: e.index,
                 },
-                original: before.arguments[e.index].clone(),
+                original: original.clone(),
                 location: e.expression.span.start.clone(),
                 value,
             });
@@ -235,6 +245,8 @@ pub fn literalize_with(
     })
 }
 
+/// Evaluate .ic and .nodeset entries without elaborating the whole deck.
+///
 /// Evaluates only the `.ic` and `.nodeset` entries against `scope`, returning
 /// literalized copies of those cards (`.ic` first, `.nodeset` second) without
 /// elaborating the rest of the deck. Order and duplicates are preserved.
@@ -367,7 +379,25 @@ pub fn literalize_analysis(
     budget: &mut EvalBudget,
 ) -> SpiceResult<AnalysisCard> {
     let mut out = card.clone();
+    literalize_analysis_into(card, &mut out, scope, budget)?;
+    Ok(out)
+}
+
+/// Resolve into an existing copy of the input card so whole-deck
+/// literalization does not clone the expression trees a second time.
+fn literalize_analysis_into(
+    card: &AnalysisCard,
+    out: &mut AnalysisCard,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+) -> SpiceResult<()> {
     for e in &card.expressions {
+        let argument = out.arguments.get_mut(e.index).ok_or_else(|| {
+            SpiceError::parse(
+                e.expression.span.start.clone(),
+                "analysis argument expression index is out of range",
+            )
+        })?;
         let value = scope
             .evaluate(&e.expression, budget)
             .map_err(|error| match error {
@@ -382,8 +412,32 @@ pub fn literalize_analysis(
                 ),
                 other => other,
             })?;
-        out.arguments[e.index] = format_literal(value);
+        *argument = format_literal(value);
     }
     out.expressions.clear();
-    Ok(out)
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::literalize;
+    use crate::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+
+    #[test]
+    fn malformed_analysis_expression_index_is_a_positioned_error() {
+        let deck = parse_deck_text(
+            Path::new("invalid-index.cir"),
+            "Title\n.tran {1u} 2u\n.end\n",
+        );
+        let mut netlist = Parser::new().parse_deck(&deck).unwrap();
+        netlist.analyses[0].expressions[0].index = usize::MAX;
+        let error = literalize(&netlist).expect_err("out-of-range expression index");
+        assert!(
+            error
+                .to_string()
+                .contains("analysis argument expression index is out of range")
+        );
+        assert!(error.to_string().contains("invalid-index.cir:2:"));
+    }
 }

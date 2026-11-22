@@ -97,7 +97,7 @@ pub struct ParsedDeck {
 impl Parser {
     /// A parser with ngspice's default behaviour, where `gnd` means ground.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { auto_gnd: true }
     }
 
@@ -106,23 +106,14 @@ impl Parser {
     /// `auto_gnd == false` matches ngspice with `no_auto_gnd` set, where `gnd`
     /// is an ordinary node.
     #[must_use]
-    pub fn with_auto_gnd(auto_gnd: bool) -> Self {
+    pub const fn with_auto_gnd(auto_gnd: bool) -> Self {
         Self { auto_gnd }
     }
 
     /// Whether `gnd` is aliased to node `0`.
     #[must_use]
-    pub fn auto_gnd(&self) -> bool {
+    pub const fn auto_gnd(self) -> bool {
         self.auto_gnd
-    }
-
-    /// Classifies every card in a deck, independently of semantic parsing.
-    ///
-    /// # Errors
-    ///
-    /// Propagates tokenizer errors, for instance an unterminated `{` expression.
-    pub fn classify_deck(&self, deck: &Deck) -> SpiceResult<Vec<RawCard>> {
-        classify_deck(deck)
     }
 
     /// Builds a semantic netlist, stopping at `.end` as `INP2dot()` does.
@@ -147,7 +138,7 @@ impl Parser {
     /// Returns [`crate::primitives::SpiceError::Parse`] for malformed supported syntax and
     /// [`crate::primitives::SpiceError::NotYetPorted`] for constructs outside the current subset.
     /// No partially parsed netlist is returned on failure.
-    pub fn parse_deck(&self, deck: &Deck) -> SpiceResult<Netlist> {
+    pub fn parse_deck(self, deck: &Deck) -> SpiceResult<Netlist> {
         Ok(self.parse_deck_with_output(deck)?.netlist)
     }
 
@@ -157,9 +148,9 @@ impl Parser {
     /// # Errors
     ///
     /// The same failures as [`Parser::parse_deck`].
-    pub fn parse_deck_with_output(&self, deck: &Deck) -> SpiceResult<ParsedDeck> {
+    pub fn parse_deck_with_output(self, deck: &Deck) -> SpiceResult<ParsedDeck> {
         let (netlist, output, measurements, fourier) =
-            scopes::assemble(deck, prepare_cards(deck), self.auto_gnd)?;
+            scopes::assemble(deck, &prepare_cards(deck), self.auto_gnd)?;
         Ok(ParsedDeck {
             netlist,
             output,
@@ -179,7 +170,6 @@ impl Parser {
     /// [`crate::primitives::SpiceError::NotYetPorted`] for valid numparam outside the
     /// bounded subset (other operators, functions or quoting).
     pub fn parse_expression(
-        &self,
         text: &str,
         location: &crate::primitives::SourceLoc,
     ) -> SpiceResult<crate::netlist::expr::ParameterExpression> {
@@ -194,7 +184,7 @@ impl Parser {
     ///
     /// [`crate::primitives::SpiceError::Parse`] for malformed syntax or trailing text.
     pub fn parse_behavioural_expression(
-        &self,
+        self,
         text: &str,
         location: &crate::primitives::SourceLoc,
         verbatim: bool,
@@ -210,7 +200,7 @@ impl Parser {
     ///
     /// Fails if the file cannot be read, or for the syntax errors and unported
     /// constructs described by [`Parser::parse_deck`].
-    pub fn parse_file(&self, path: impl AsRef<Path>) -> SpiceResult<Netlist> {
+    pub fn parse_file(self, path: impl AsRef<Path>) -> SpiceResult<Netlist> {
         Ok(self.parse_file_with_output(path)?.netlist)
     }
 
@@ -220,7 +210,7 @@ impl Parser {
     /// # Errors
     ///
     /// The same failures as [`Parser::parse_file`].
-    pub fn parse_file_with_output(&self, path: impl AsRef<Path>) -> SpiceResult<ParsedDeck> {
+    pub fn parse_file_with_output(self, path: impl AsRef<Path>) -> SpiceResult<ParsedDeck> {
         self.parse_file_with_limits_and_output(path, SourceLimits::default())
     }
 
@@ -233,7 +223,7 @@ impl Parser {
     /// # Errors
     /// I/O, malformed structure, unavailable syntax, cycles or exhausted limits.
     pub fn parse_file_with_limits(
-        &self,
+        self,
         path: impl AsRef<Path>,
         limits: SourceLimits,
     ) -> SpiceResult<Netlist> {
@@ -249,13 +239,13 @@ impl Parser {
     ///
     /// The same failures as [`Parser::parse_file_with_limits`].
     pub fn parse_file_with_limits_and_output(
-        &self,
+        self,
         path: impl AsRef<Path>,
         limits: SourceLimits,
     ) -> SpiceResult<ParsedDeck> {
         let (deck, cards) = resolution::resolve(path.as_ref(), limits)?;
         let (netlist, output, measurements, fourier) =
-            scopes::assemble(&deck, cards, self.auto_gnd)?;
+            scopes::assemble(&deck, &cards, self.auto_gnd)?;
         Ok(ParsedDeck {
             netlist,
             output,
@@ -345,7 +335,7 @@ pub fn resolve_measure_card(
 
 #[cfg(test)]
 mod tests {
-    use super::Parser;
+    use super::{Parser, classify_deck};
     use crate::netlist::source::parse_deck_text;
     use std::path::Path;
 
@@ -365,7 +355,7 @@ r1 a b 10k
     #[test]
     fn classification_still_works_on_unported_syntax() {
         let deck = parse_deck_text(Path::new("rc.cir"), DECK);
-        let cards = Parser::new().classify_deck(&deck).expect("classifies");
+        let cards = classify_deck(&deck).expect("classifies");
         assert_eq!(cards.len(), 9);
         assert_eq!(cards.iter().filter(|c| c.kind.is_device()).count(), 4);
         assert_eq!(cards.iter().filter(|c| c.kind.is_dot_command()).count(), 5);

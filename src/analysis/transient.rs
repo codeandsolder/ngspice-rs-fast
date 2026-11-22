@@ -10,7 +10,7 @@ use crate::analysis::{AnalysisRequest, Plot, PointSink};
 use crate::devices::Circuit;
 use crate::primitives::SpiceResult;
 
-pub(crate) fn run(
+pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &crate::analysis::AnalysisContext,
@@ -22,7 +22,7 @@ pub(crate) fn run(
 
 /// [`run`], streaming the accepted points into `sink`; the returned plot has
 /// no points.
-pub(crate) fn run_into(
+pub(super) fn run_into(
     circuit: &mut Circuit,
     request: &AnalysisRequest,
     context: &crate::analysis::AnalysisContext,

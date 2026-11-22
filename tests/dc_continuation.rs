@@ -30,9 +30,9 @@ const DIFFICULT: &str = "i1 0 a 1m\nd1 a 0 dm\n.model dm d(is=1m)";
 const DIFFICULT_AC: &str = "i1 0 a dc 1m ac 1\nd1 a 0 dm\n.model dm d(is=1m)";
 
 /// Relative accuracy of a converged bias of [`DIFFICULT`] under ngspice's
-/// default Newton tolerances: NIiter accepts once the update is within
+/// default Newton tolerances: `NIiter` accepts once the update is within
 /// `reltol |v| + vntol` (1e-3 relative plus 1e-6 V, 1.9e-5 V at this 18 mV
-/// bias) and returns the iterate the last load used (CKTrhsOld), so the bias
+/// bias) and returns the iterate the last load used (`CKTrhsOld`), so the bias
 /// is guaranteed only to about reltol. Measured in C ngspice (SPARSE): the
 /// direct solve misses `vt ln 2` by 1.7e-9 relative (its AC `v(a)` misses
 /// `vt / 2 mA` by 1.2e-9), but with `.options noopiter gminsteps=0
@@ -111,8 +111,8 @@ struct Cubic {
     accepted: Rc<Cell<usize>>,
 }
 impl ngspice_rs::devices::Device for Cubic {
-    /// Like a C device's DEVsetup, allocate the conductance elements even
-    /// though the load stamps zero at v = 0 (where LoadGmin then acts).
+    /// Like a C device's `DEVsetup`, allocate the conductance elements even
+    /// though the load stamps zero at v = 0 (where `LoadGmin` then acts).
     fn setup_matrix(
         &self,
         setup: &mut ngspice_rs::devices::setup::MatrixSetup<'_>,
@@ -551,6 +551,77 @@ fn exhausted_schedules_and_total_budget_are_bounded_and_reported() {
 }
 
 #[test]
+fn default_budget_distinguishes_direct_and_continuation_iteration_limits() {
+    use ngspice_rs::analysis::bias::MAX_ADAPTIVE_STAGES;
+
+    let c = circuit("v1 a 0 1\nr1 a 0 1k");
+    let context = ModelContext::default();
+    let direct_limit = 4;
+    let stage_limit = 7;
+    let cases = [
+        // One direct solve, two gmin stages plus their direct-limit
+        // closing solve, three source stages plus a stage-limit closing solve.
+        (
+            ContinuationPolicy {
+                gmin_schedule: vec![1e-6, 1e-9],
+                source_stepping: Some(SourceStepping {
+                    scales: vec![0., 0.5, 1.],
+                    gmin: 1e-8,
+                }),
+                ..ContinuationPolicy::disabled()
+            },
+            2,
+            6,
+        ),
+        (
+            ContinuationPolicy {
+                skip_direct: true,
+                gmin_schedule: vec![1e-6, 1e-9],
+                source_stepping: Some(SourceStepping {
+                    scales: vec![0., 0.5, 1.],
+                    gmin: 1e-8,
+                }),
+                ..ContinuationPolicy::disabled()
+            },
+            1,
+            6,
+        ),
+        (
+            ContinuationPolicy::ngspice(NgspiceStepping {
+                gmin_steps: 2,
+                source_steps: 3,
+                ..NgspiceStepping::default()
+            }),
+            2,
+            3 + 4,
+        ),
+        // Both dynamic gmin strategies have a direct-limit closing solve.
+        // Gillespie may run its initial zero-source solve, eleven gmin
+        // stages and all adaptive source steps, all at the stage limit.
+        (
+            ContinuationPolicy::default(),
+            3,
+            3 * MAX_ADAPTIVE_STAGES + 12,
+        ),
+        (ContinuationPolicy::disabled(), 1, 0),
+    ];
+    for (mut policy, direct_count, stage_count) in cases {
+        policy.stage_max_iterations = Some(stage_limit);
+        let expected = direct_count * (direct_limit + 1) + stage_count * (stage_limit + 1);
+        let settings = settings(
+            NewtonOptions {
+                max_iterations: direct_limit,
+                ..NewtonOptions::default()
+            },
+            policy,
+        );
+        let solved = solve_dc_with(&c, &context, &settings, &[], None, None).unwrap();
+        assert_eq!(solved.report.budget, expected, "{settings:?}");
+        assert_original_equations_solved(&solved.report);
+    }
+}
+
+#[test]
 fn invalid_schedules_scales_and_budgets_are_rejected_before_any_load() {
     let c = circuit(DIFFICULT);
     let context = ModelContext::default();
@@ -965,6 +1036,29 @@ fn continuation_never_accepts_state_or_edits_sources_on_success_or_failure() {
 
 fn request(arguments: &[&str]) -> AnalysisRequest {
     AnalysisRequest::with_arguments(AnalysisKind::OperatingPoint, arguments.iter().copied())
+}
+
+#[test]
+fn ngspice_maximum_gmin_steps_include_both_ladder_endpoints() {
+    let stepping = NgspiceStepping {
+        gmin_steps: MAX_GMIN_STAGES,
+        gmin_factor: 1.01,
+        ..NgspiceStepping::default()
+    };
+    stepping.validate().unwrap();
+    let ladder = stepping.spice3_ladder(1e-12).unwrap();
+    assert_eq!(ladder.len(), MAX_GMIN_STAGES + 1);
+    assert!(ladder.windows(2).all(|pair| pair[0] > pair[1]));
+    close(ladder[0], 1e-12 * 1.01_f64.powi(100), 1e-12, 0.);
+    close(*ladder.last().unwrap(), 1e-12, 1e-12, 0.);
+
+    // This public method may be invoked before ContinuationPolicy::validate.
+    // Reject an impossible count before looping or adding one to its length.
+    let bad = NgspiceStepping {
+        gmin_steps: usize::MAX,
+        ..stepping
+    };
+    assert!(bad.spice3_ladder(1e-12).is_err());
 }
 
 #[test]

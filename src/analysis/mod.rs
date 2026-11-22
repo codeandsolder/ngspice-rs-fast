@@ -17,8 +17,10 @@
 //! The C equivalent is `src/spicelib/analysis/` (21,993 lines: the `CKT*`
 //! job-control, loading and iteration machinery) and `src/frontend/rawfile.c`.
 //!
-//! ASCII rawfile I/O makes the port verifiable: `xtask` captures ASCII rawfiles
-//! from C and the test suite parses them, so the format the port must reproduce
+//! ASCII rawfile I/O makes the port verifiable.
+//!
+//! `xtask` captures ASCII rawfiles from C and the test suite parses them, so
+//! the format the port must reproduce
 //! is pinned by data
 //! rather than by prose. `cargo xtask golden verify` runs supported Rust fixtures
 //! against that data without C. Binary rawfiles are read and written through the
@@ -37,11 +39,13 @@ pub mod config;
 pub mod disto;
 pub mod driver;
 pub mod fourier;
+mod frequency;
 mod initial;
 mod linear;
 pub mod measure;
 pub mod newton;
 pub mod noise;
+mod ordered_samples;
 mod pz;
 pub mod rawfile;
 pub mod results;
@@ -68,7 +72,9 @@ pub use rawfile::{
 pub use results::{Plot, PlotFlags, PointSink, Variable};
 pub use selection::{Selection, print_requests, write_requests};
 
-/// The C reference for the analysis drivers, used in `NotYetPorted` errors.
+/// The C reference for the analysis drivers.
+///
+/// Included in `NotYetPorted` errors to identify upstream analysis routines.
 pub const C_REFERENCE_ANALYSIS: &str = "src/spicelib/analysis/cktdojob.c, dctran.c, dcop.c, acan.c";
 
 /// Batch line-printer plots.

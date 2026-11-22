@@ -21,7 +21,7 @@ fn parse(body: &str) -> Result<Netlist, SpiceError> {
 
 /// Expression text at line 5, column 10 so offsets are visible in columns.
 fn expression(text: &str) -> Result<ParameterExpression, SpiceError> {
-    Parser::new().parse_expression(
+    Parser::parse_expression(
         text,
         &SourceLoc::new(Path::new("e.cir").to_path_buf(), 5, 10),
     )
@@ -69,6 +69,12 @@ fn shape(text: &str) -> String {
             .unwrap_or_else(|e| panic!("{text}: {e}"))
             .root,
     )
+}
+
+#[test]
+fn reference_traversal_retains_duplicates_and_argument_order() {
+    let parsed = expression("f(A, b + g(c, a)) + (-d) * max(e, f(b))").unwrap();
+    assert_eq!(parsed.references(), ["a", "b", "c", "a", "d", "e", "b"]);
 }
 
 #[test]

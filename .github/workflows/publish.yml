@@ -50,12 +50,8 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          # Caches saved on main are readable from every branch, PR and tag;
-          # caches saved elsewhere are readable only from that ref.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
 
       - name: Read crate version
         id: version
@@ -94,6 +90,10 @@ jobs:
       - name: List packaged files
         run: cargo package --list --locked --package ngspice-rs
 
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+
   publish:
     name: Publish to crates.io
     needs: verify
@@ -113,6 +113,9 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+
       - name: Authenticate with crates.io
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
@@ -121,3 +124,7 @@ jobs:
         run: cargo publish --locked --package ngspice-rs
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main

@@ -42,7 +42,7 @@ fn dc() -> AnalysisRequest {
 
 /// ngspice's default Newton tolerances (`CKTreltol`, `CKTvoltTol`): two
 /// converged solutions of one circuit reached along different iterates
-/// agree only to these (NIiter stops once the update is within them).
+/// agree only to these (`NIiter` stops once the update is within them).
 const NIITER_RELTOL: f64 = 1e-3;
 const NIITER_VNTOL: f64 = 1e-6;
 
@@ -519,6 +519,38 @@ fn itl6_is_srcsteps() {
 }
 
 #[test]
+fn iteration_and_stepping_limits_preserve_c_integer_rounding() {
+    for (name, limit) in [
+        ("itl1", 10_000),
+        ("itl2", 10_000),
+        ("itl4", 10_000),
+        ("itl6", 1_000),
+        ("srcsteps", 1_000),
+        ("gminsteps", 100),
+    ] {
+        // A 100-step gmin ladder requires a near-unity factor to stay below
+        // MAX_GMIN; the default factor of 10 would overflow its conductance.
+        let factor = if name == "gminsteps" {
+            " gminfactor=1.01"
+        } else {
+            ""
+        };
+        for valid in [limit.to_string(), format!("{limit}.49")] {
+            assert!(
+                config(&format!(".options {name}={valid}{factor}")).is_ok(),
+                "{name}={valid}"
+            );
+        }
+        for invalid in [(limit + 1).to_string(), format!("{limit}.5")] {
+            assert!(
+                config(&format!(".options {name}={invalid}{factor}")).is_err(),
+                "{name}={invalid}"
+            );
+        }
+    }
+}
+
+#[test]
 fn existing_effective_options_are_still_applied() {
     let c = config(
         ".options temp=50 tnom=20 reltol=1e-4 vntol=2u abstol=3p chgtol=1e-13 trtol=5 \
@@ -629,6 +661,37 @@ fn options_c_ignores_are_documented_no_ops() {
     // Validated as C's IF_INTEGER: 2.5 rounds, a word does not parse.
     assert!(config(".options itl3=2.5").is_ok());
     assert!(config(".options cptime=2.5").is_ok());
+}
+
+#[test]
+fn integral_option_storage_preserves_the_validated_c_range() {
+    // IF_INTEGER is a signed C integer even when the accepting field is
+    // unsigned. Values above i32::MAX must not silently truncate or saturate.
+    assert!(config(".options itl3=2147483647").is_ok());
+    for outside in ["2147483648", "4294967295", "-2147483648"] {
+        assert!(
+            config(&format!(".options itl3={outside}")).is_err(),
+            "out-of-C-range value: {outside}"
+        );
+    }
+
+    let c = config(".options nfreqs=101 nperiods=100 polydegree=16 fourgridsize=100000 itl1=10000")
+        .unwrap();
+    let four = c.fourier_settings().unwrap();
+    assert_eq!(
+        (four.nfreqs, four.nperiods, four.polydegree, four.gridsize),
+        (101, 100, 16, 100_000)
+    );
+    assert_eq!(c.dc().itl1, Some(10_000));
+    for outside in [
+        "nfreqs=102",
+        "nperiods=101",
+        "polydegree=17",
+        "fourgridsize=100001",
+        "itl1=10001",
+    ] {
+        assert!(config(&format!(".options {outside}")).is_err(), "{outside}");
+    }
 }
 
 #[test]

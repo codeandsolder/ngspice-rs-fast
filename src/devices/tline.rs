@@ -55,7 +55,7 @@ use crate::devices::traits::{AnalysisMode, Device, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::primitives::{
-    NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
+    NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
 };
 
 /// C reference for errors.
@@ -88,6 +88,140 @@ fn invalid(location: &SourceLoc, message: impl Into<String>) -> SpiceError {
     }
 }
 
+struct LineParameters {
+    z0: Real,
+    td: Real,
+    nl: Real,
+    f: Real,
+    initial: [Real; 4],
+    reltol: Real,
+    abstol: Real,
+}
+
+fn parse_line_parameters(instance: &DeviceInstance) -> SpiceResult<LineParameters> {
+    let mut z0 = None;
+    let mut td = None;
+    let mut nl = 0.25;
+    let mut f = 1e9;
+    let mut initial = [0.; 4];
+    let mut reltol = 1.;
+    let mut abstol = 1.;
+    let number = |text: &str, at: &SourceLoc, name: &str| {
+        parse_spice_number(text)
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| invalid(at, format!("{name} must be a finite number, not '{text}'")))
+    };
+    for p in &instance.parameters {
+        match (&p.kind, p.name.as_str()) {
+            (ParameterKind::InitialConditions(values), "ic") => {
+                for value in values {
+                    let slot = match value.name.as_str() {
+                        "v1" => 0,
+                        "i1" => 1,
+                        "v2" => 2,
+                        "i2" => 3,
+                        other => {
+                            return Err(invalid(
+                                &value.value.location,
+                                format!("unexpected ic component {other}"),
+                            ));
+                        }
+                    };
+                    initial[slot] = number(&value.value.text, &value.value.location, "ic")?;
+                }
+            }
+            (ParameterKind::Scalar, name) => {
+                let value = number(&p.value, &p.location, name)?;
+                match name {
+                    "z0" | "zo" => z0 = Some(value),
+                    "td" => td = Some(value),
+                    "nl" => nl = value,
+                    "f" => f = value,
+                    "v1" => initial[0] = value,
+                    "i1" => initial[1] = value,
+                    "v2" => initial[2] = value,
+                    "i2" => initial[3] = value,
+                    "rel" => reltol = value,
+                    "abs" => abstol = value,
+                    other => {
+                        return Err(invalid(
+                            &p.location,
+                            format!("unknown transmission-line parameter {other}"),
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(SpiceError::not_yet_ported(
+                    format!(
+                        "{}: transmission-line setter '{}' of this form",
+                        p.location, p.name
+                    ),
+                    "src/spicelib/devices/tra/traparam.c",
+                ));
+            }
+        }
+    }
+    let Some(z0) = z0 else {
+        return Err(invalid(
+            &instance.location,
+            format!(
+                "{}: transmission line z0 must be given (trasetup.c)",
+                instance.name
+            ),
+        ));
+    };
+    if z0 <= 0. || !(1. / z0).is_finite() {
+        return Err(invalid(
+            &instance.location,
+            format!("{}: z0 must be positive, got {z0}", instance.name),
+        ));
+    }
+    let td = line_delay(instance, td, f, nl)?;
+    if reltol < 0. || abstol < 0. {
+        return Err(invalid(
+            &instance.location,
+            format!("{}: rel and abs must not be negative", instance.name),
+        ));
+    }
+    Ok(LineParameters {
+        z0,
+        td,
+        nl,
+        f,
+        initial,
+        reltol,
+        abstol,
+    })
+}
+
+fn line_delay(instance: &DeviceInstance, td: Option<Real>, f: Real, nl: Real) -> SpiceResult<Real> {
+    let td = if let Some(td) = td {
+        td
+    } else {
+        if f <= 0. || nl <= 0. {
+            return Err(invalid(
+                &instance.location,
+                format!(
+                    "{}: f and nl must be positive when td is not given (td = nl/f)",
+                    instance.name
+                ),
+            ));
+        }
+        nl / f
+    };
+    if !(td.is_finite() && td > 0.) {
+        return Err(invalid(
+            &instance.location,
+            format!(
+                "{}: td must be positive and finite, got {td}",
+                instance.name
+            ),
+        ));
+    }
+    Ok(td)
+}
+
 impl TransmissionLine {
     /// Builds the line from its instance card, interning the four terminals
     /// and the four internal nodes (nothing is interned on error).
@@ -104,131 +238,21 @@ impl TransmissionLine {
                 instance.name
             )));
         }
-        let mut z0 = None;
-        let mut td = None;
-        let mut nl = 0.25;
-        let mut f = 1e9;
-        let mut initial = [0.; 4];
-        let mut reltol = 1.;
-        let mut abstol = 1.;
-        let number = |text: &str, at: &SourceLoc, name: &str| {
-            parse_spice_number(text)
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| invalid(at, format!("{name} must be a finite number, not '{text}'")))
-        };
-        for p in &instance.parameters {
-            match (&p.kind, p.name.as_str()) {
-                (ParameterKind::InitialConditions(values), "ic") => {
-                    for value in values {
-                        let slot = match value.name.as_str() {
-                            "v1" => 0,
-                            "i1" => 1,
-                            "v2" => 2,
-                            "i2" => 3,
-                            other => {
-                                return Err(invalid(
-                                    &value.value.location,
-                                    format!("unexpected ic component {other}"),
-                                ));
-                            }
-                        };
-                        initial[slot] = number(&value.value.text, &value.value.location, "ic")?;
-                    }
-                }
-                (ParameterKind::Scalar, name) => {
-                    let value = number(&p.value, &p.location, name)?;
-                    match name {
-                        "z0" | "zo" => z0 = Some(value),
-                        "td" => td = Some(value),
-                        "nl" => nl = value,
-                        "f" => f = value,
-                        "v1" => initial[0] = value,
-                        "i1" => initial[1] = value,
-                        "v2" => initial[2] = value,
-                        "i2" => initial[3] = value,
-                        "rel" => reltol = value,
-                        "abs" => abstol = value,
-                        other => {
-                            return Err(invalid(
-                                &p.location,
-                                format!("unknown transmission-line parameter {other}"),
-                            ));
-                        }
-                    }
-                }
-                _ => {
-                    return Err(SpiceError::not_yet_ported(
-                        format!(
-                            "{}: transmission-line setter '{}' of this form",
-                            p.location, p.name
-                        ),
-                        "src/spicelib/devices/tra/traparam.c",
-                    ));
-                }
-            }
-        }
-        let Some(z0) = z0 else {
-            return Err(invalid(
-                &instance.location,
-                format!(
-                    "{}: transmission line z0 must be given (trasetup.c)",
-                    instance.name
-                ),
-            ));
-        };
-        if z0 <= 0. || !(1. / z0).is_finite() {
-            return Err(invalid(
-                &instance.location,
-                format!("{}: z0 must be positive, got {z0}", instance.name),
-            ));
-        }
-        let td = match td {
-            Some(td) => td,
-            None => {
-                if f <= 0. || nl <= 0. {
-                    return Err(invalid(
-                        &instance.location,
-                        format!(
-                            "{}: f and nl must be positive when td is not given (td = nl/f)",
-                            instance.name
-                        ),
-                    ));
-                }
-                nl / f
-            }
-        };
-        if !(td.is_finite() && td > 0.) {
-            return Err(invalid(
-                &instance.location,
-                format!(
-                    "{}: td must be positive and finite, got {td}",
-                    instance.name
-                ),
-            ));
-        }
-        if reltol < 0. || abstol < 0. {
-            return Err(invalid(
-                &instance.location,
-                format!("{}: rel and abs must not be negative", instance.name),
-            ));
-        }
-        let mut staged = nodes.clone();
-        let mut terminals = [NodeId::GROUND; 8];
-        for (slot, node) in instance.nodes.iter().enumerate() {
-            terminals[slot] = staged.intern(node);
-        }
-        for (slot, suffix) in INTERNAL_SUFFIXES.iter().enumerate() {
-            let name = format!("{}#{suffix}", instance.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "transmission-line internal-node name collision: {name}"
-                )));
-            }
-            let node = staged.intern(&name);
-            staged.set_kind(node, NodeKind::Internal);
-            terminals[4 + slot] = node;
-        }
-        *nodes = staged;
+        let LineParameters {
+            z0,
+            td,
+            nl,
+            f,
+            initial,
+            reltol,
+            abstol,
+        } = parse_line_parameters(instance)?;
+        let terminals = crate::devices::factory::line_terminals::<8>(
+            instance,
+            nodes,
+            &INTERNAL_SUFFIXES,
+            "transmission-line",
+        )?;
         Ok(Box::new(Self {
             name: instance.name.clone(),
             terminals,
@@ -323,9 +347,11 @@ impl TransmissionLine {
     /// waves launched towards port 1 and port 2 (C `TRAinput1/2` sources).
     fn waves(&self, context: &DelayContext<'_>) -> [Real; 2] {
         let v = |node| context.node_voltage(node);
+        let reflected2 = v(self.ibr2()) * self.z0;
+        let reflected1 = v(self.ibr1()) * self.z0;
         [
-            (v(self.pos2()) - v(self.neg2())) + v(self.ibr2()) * self.z0,
-            (v(self.pos1()) - v(self.neg1())) + v(self.ibr1()) * self.z0,
+            (v(self.pos2()) - v(self.neg2())) + reflected2,
+            (v(self.pos1()) - v(self.neg1())) + reflected1,
         ]
     }
 
@@ -372,7 +398,10 @@ impl TransmissionLine {
         let value =
             |index: usize, component: usize| history.value(index, component).unwrap_or(Real::NAN);
         let result = [0, 1].map(|component| {
-            f1 * value(i - 2, component) + f2 * value(i - 1, component) + f3 * value(i, component)
+            let first = f1 * value(i - 2, component);
+            let second = f2 * value(i - 1, component);
+            let third = f3 * value(i, component);
+            first + second + third
         });
         if result.iter().any(|v| !v.is_finite()) {
             return Err(SpiceError::Numerical {
@@ -386,9 +415,10 @@ impl TransmissionLine {
     /// `traacct.c`/`tratrunc.c`'s test: the slope of either wave changed by
     /// at least `rel * max(|d1|, |d2|) + abs`.
     fn slope_changed(&self, slopes: [(Real, Real); 2]) -> bool {
-        slopes
-            .iter()
-            .any(|(d1, d2)| (d1 - d2).abs() >= self.reltol * d1.abs().max(d2.abs()) + self.abstol)
+        slopes.iter().any(|(d1, d2)| {
+            let relative = self.reltol * d1.abs().max(d2.abs());
+            (d1 - d2).abs() >= relative + self.abstol
+        })
     }
 
     /// Stamps a coefficient that may be complex into a small-signal system:
@@ -592,7 +622,9 @@ impl DelayLine for TransmissionLine {
         let [v1, i1, v2, i2] = self.initial;
         let wave = if context.initial_conditions {
             // traload.c MODEINITTRAN | MODEUIC.
-            [v2 + i2 * self.z0, v1 + i1 * self.z0]
+            let reflected2 = i2 * self.z0;
+            let reflected1 = i1 * self.z0;
+            [v2 + reflected2, v1 + reflected1]
         } else {
             self.waves(context)
         };

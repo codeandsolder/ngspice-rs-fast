@@ -130,13 +130,13 @@ fn function_semantics_follow_xpressn() {
 fn work_is_bounded() {
     let n = deck(".param a=1\n.param b={a+a+a+a}");
     let mut budget = EvalBudget::new(EvalLimits {
-        max_nodes: 3,
+        nodes: 3,
         ..EvalLimits::default()
     });
     let e = ParamScope::resolve(None, &[], &n.params, &mut budget).unwrap_err();
     assert!(e.to_string().contains("budget"), "{e}");
     let mut budget = EvalBudget::new(EvalLimits {
-        max_definitions: 1,
+        definitions: 1,
         ..EvalLimits::default()
     });
     assert!(ParamScope::resolve(None, &[], &n.params, &mut budget).is_err());

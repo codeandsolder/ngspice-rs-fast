@@ -270,7 +270,7 @@ fn parse_slice(
 }
 
 /// Wraps an already positioned error from a nested parse.
-pub(super) fn resolved(error: crate::primitives::SpiceError) -> ErrMode<Fail> {
+pub(super) const fn resolved(error: crate::primitives::SpiceError) -> ErrMode<Fail> {
     ErrMode::Cut(Fail {
         remaining: 0,
         message: String::new(),

@@ -1,7 +1,32 @@
+//! BSIM3 instance setup and parameter validation.
+//!
 //! Instance setup: `b3set.c`'s instance defaulting, `b3temp.c`'s
 //! size-dependent and temperature-dependent parameters, and `b3check.c`'s
 //! model/instance diagnostics. This is geometry and parameter setup only: no
 //! nodes are interned, no states are allocated and no load equations run.
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::similar_names,
+    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
+)]
+#![expect(
+    clippy::float_cmp,
+    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "a complete translated C numerical routine remains contiguous for equation parity review"
+)]
+#![expect(
+    clippy::imprecise_flops,
+    reason = "the original C floating-point algorithm and libm operation sequence must remain intact"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use std::collections::BTreeMap;
 
 use super::defaults::ModelDefaults;
@@ -22,30 +47,42 @@ fn c_g(value: Real) -> String {
         };
     }
     if !value.is_finite() {
-        return format!("{value}");
+        return if value.is_nan() {
+            if value.is_sign_negative() {
+                "-nan"
+            } else {
+                "nan"
+            }
+            .into()
+        } else if value.is_sign_negative() {
+            "-inf".into()
+        } else {
+            "inf".into()
+        };
     }
     let scientific = format!("{value:.5e}");
-    let (mantissa, exponent) = scientific.split_once('e').expect("scientific form");
-    let exponent: i32 = exponent.parse().expect("exponent");
-    if !(-4..6).contains(&exponent) {
+    let Some((mantissa, exponent)) = scientific.split_once('e') else {
+        return scientific;
+    };
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        return scientific;
+    };
+    if (-4..6).contains(&exponent) {
+        let decimals = usize::try_from(5 - exponent).unwrap_or(0);
+        let fixed = format!("{value:.decimals$}");
+        // In fixed format only fractional trailing zeros are insignificant.
+        if decimals == 0 {
+            fixed
+        } else {
+            fixed.trim_end_matches('0').trim_end_matches('.').to_owned()
+        }
+    } else {
         let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
         format!(
             "{mantissa}e{}{:02}",
             if exponent < 0 { '-' } else { '+' },
             exponent.unsigned_abs()
         )
-    } else {
-        let decimals = usize::try_from(5 - exponent).unwrap_or(0);
-        let fixed = format!("{value:.decimals$}");
-        let fixed = fixed
-            .trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_string();
-        if fixed.is_empty() || fixed == "-" {
-            "0".into()
-        } else {
-            fixed
-        }
     }
 }
 
@@ -140,10 +177,29 @@ pub struct InstanceSetup {
 pub struct ModelSetup {
     defaults: ModelDefaults,
     temperature: TemperatureModel,
+    checks: ModelChecks,
+}
+
+/// Only these four model fields are mutated by the instance check pass.
+/// A standalone instance needs its own copy of these scalars, not a clone
+/// of the immutable defaulted model and temperature tables.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ModelChecks {
     cgdo: Real,
     cgso: Real,
     cgbo: Real,
     calcacm: i32,
+}
+
+impl ModelChecks {
+    fn new(defaults: &ModelDefaults) -> SpiceResult<Self> {
+        Ok(Self {
+            cgdo: model_value(defaults, "cgdo")?,
+            cgso: model_value(defaults, "cgso")?,
+            cgbo: model_value(defaults, "cgbo")?,
+            calcacm: defaults.integer("calcacm")?,
+        })
+    }
 }
 
 impl ModelSetup {
@@ -153,10 +209,7 @@ impl ModelSetup {
     /// Missing internal model fields.
     pub fn new(defaults: ModelDefaults, temperature: TemperatureModel) -> SpiceResult<Self> {
         Ok(Self {
-            cgdo: model_value(&defaults, "cgdo")?,
-            cgso: model_value(&defaults, "cgso")?,
-            cgbo: model_value(&defaults, "cgbo")?,
-            calcacm: model_int(&defaults, "calcacm")?,
+            checks: ModelChecks::new(&defaults)?,
             defaults,
             temperature,
         })
@@ -184,7 +237,13 @@ impl ModelSetup {
         instance: &Inputs,
         location: &SourceLoc,
     ) -> SpiceResult<InstanceSetup> {
-        InstanceSetup::with_model(self, instance, location)
+        InstanceSetup::with_model(
+            &self.defaults,
+            &self.temperature,
+            &mut self.checks,
+            instance,
+            location,
+        )
     }
 }
 
@@ -224,24 +283,24 @@ impl InstanceSetup {
         instance: &Inputs,
         location: &SourceLoc,
     ) -> SpiceResult<Self> {
-        let mut shared = ModelSetup::new(model.clone(), temperature.clone())?;
-        Self::with_model(&mut shared, instance, location)
+        let mut checks = ModelChecks::new(model)?;
+        Self::with_model(model, temperature, &mut checks, instance, location)
     }
 
     fn with_model(
-        shared: &mut ModelSetup,
+        model: &ModelDefaults,
+        temperature: &TemperatureModel,
+        checks: &mut ModelChecks,
         instance: &Inputs,
         location: &SourceLoc,
     ) -> SpiceResult<Self> {
-        let ModelSetup {
-            defaults: model,
-            temperature,
+        let ModelChecks {
             cgdo: model_cgdo,
             cgso: model_cgso,
             cgbo: model_cgbo,
             calcacm,
-        } = shared;
-        let acm = model_int(model, "acm")?;
+        } = checks;
+        let acm = model.integer("acm")?;
         if acm != 0 {
             return Err(SpiceError::not_yet_ported(
                 format!(
@@ -302,8 +361,8 @@ impl InstanceSetup {
         } else {
             0
         };
-        let model_nqs = model_int(model, "nqsmod")?;
-        let model_acnqs = model_int(model, "acnqsmod")?;
+        let model_nqs = model.integer("nqsmod")?;
+        let model_acnqs = model.integer("acnqsmod")?;
         let resolve_selector = |name: &str,
                                 model_value: i32,
                                 label: &str,
@@ -368,7 +427,7 @@ impl InstanceSetup {
             }
         }
 
-        let bin_unit = model_int(model, "binunit")?;
+        let bin_unit = model.integer("binunit")?;
         let (inv_l, inv_w, inv_lw) = if bin_unit == 1 {
             (1.0e-6 / leff, 1.0e-6 / weff, 1.0e-12 / (leff * weff))
         } else {
@@ -401,34 +460,30 @@ impl InstanceSetup {
             ("pdibl2", "pdiblc2"),
             ("pdiblb", "pdiblcb"),
         ] {
-            let value = p.get(keyword).copied().expect("binned coefficient");
+            let value = size_value(&p, keyword)?;
             p.insert(field, value);
         }
         p.insert(
             "abulkcvfactor",
-            1.0 + (p.get("clc").copied().expect("clc") / leff_cv)
-                .powf(p.get("cle").copied().expect("cle")),
+            1.0 + (size_value(&p, "clc")? / leff_cv).powf(size_value(&p, "cle")?),
         );
 
         let ratio =
-            temperature.get("temp").expect("temperature") / temperature.get("tnom").expect("tnom");
+            temperature_value(temperature, "temp")? / temperature_value(temperature, "tnom")?;
         let t0 = ratio - 1.0;
         for (base, coefficient) in [("ua", "ua1"), ("ub", "ub1"), ("uc", "uc1")] {
-            let value =
-                p.get(base).copied().expect("binned") + model_value(model, coefficient)? * t0;
+            let value = size_value(&p, base)? + model_value(model, coefficient)? * t0;
             p.insert(base, value);
         }
-        let mut u0 = p.get("u0").copied().expect("binned");
+        let mut u0 = size_value(&p, "u0")?;
         if u0 > 1.0 {
             u0 /= 1.0e4;
             p.insert("u0", u0);
         }
-        let u0temp = u0 * ratio.powf(p.get("ute").copied().expect("binned"));
-        let vsattemp =
-            p.get("vsat").copied().expect("binned") - p.get("at").copied().expect("binned") * t0;
-        let rds0 = (p.get("rdsw").copied().expect("binned")
-            + p.get("prt").copied().expect("binned") * t0)
-            / (weff * METER2MICRON).powf(p.get("wr").copied().expect("binned"));
+        let u0temp = u0 * ratio.powf(size_value(&p, "ute")?);
+        let vsattemp = size_value(&p, "vsat")? - size_value(&p, "at")? * t0;
+        let rds0 = (size_value(&p, "rdsw")? + size_value(&p, "prt")? * t0)
+            / (weff * METER2MICRON).powf(size_value(&p, "wr")?);
         p.insert("u0temp", u0temp);
         p.insert("vsattemp", vsattemp);
         p.insert("rds0", rds0);
@@ -456,7 +511,7 @@ impl InstanceSetup {
             }
             macro_rules! get {
                 ($name:expr) => {
-                    pval(&p, model, $name)
+                    pval(&p, model, $name)?
                 };
             }
             if get!("nlx") < -leff {
@@ -680,7 +735,7 @@ impl InstanceSetup {
                     "src/spicelib/devices/bsim3/b3check.c",
                 ));
             }
-            if model_int(model, "capmod")? == 3 {
+            if model.integer("capmod")? == 3 {
                 if get!("acde") < 0.4 {
                     diagnostics.push(Diagnostic::warning(
                         format!("Warning:  Acde = {} is too small.", c_g(get!("acde"))),
@@ -694,7 +749,7 @@ impl InstanceSetup {
                     ));
                 }
             }
-            if model_int(model, "paramchk")? == 1 {
+            if model.integer("paramchk")? == 1 {
                 if get!("leff") <= 5.0e-8 {
                     diagnostics.push(Diagnostic::warning(
                         format!("Warning: Leff = {} may be too small.", c_g(get!("leff"))),
@@ -868,7 +923,7 @@ impl InstanceSetup {
         }
         // The CGDO/CGSO/CGBO resets belong to the `paramchk` block in C and
         // persist in the shared model.
-        if model_int(model, "paramchk")? == 1 {
+        if model.integer("paramchk")? == 1 {
             let reset = |value: &mut Real, name: &str, diagnostics: &mut Vec<Diagnostic>| {
                 if *value < 0.0 {
                     diagnostics.push(Diagnostic::warning(
@@ -903,23 +958,23 @@ impl InstanceSetup {
 
         // Overlap capacitances and C's `tconst` (see the quirk note above).
         let cox = model.oxide_capacitance;
-        let cf = p.get("cf").copied().expect("binned");
+        let cf = size_value(&p, "cf")?;
         p.insert("cgdo", (*model_cgdo + cf) * weff_cv);
         p.insert("cgso", (*model_cgso + cf) * weff_cv);
         p.insert("cgbo", *model_cgbo * leff_cv);
-        let elm = p.get("elm").copied().expect("binned");
+        let elm = size_value(&p, "elm")?;
         let mut tconst_quirk = u0temp * elm / (cox * weff_cv * leff_cv * (leff_cv * leff_cv));
         p.insert("tconst", tconst_quirk);
 
         // Potential and threshold derivations.
-        let vtm0 = temperature.get("vtm0").expect("vtm0");
-        let ni = temperature.get("ni").expect("ni");
+        let vtm0 = temperature_value(temperature, "vtm0")?;
+        let ni = temperature_value(temperature, "ni")?;
         if !model.is_given("nch") && model.is_given("gamma1") {
-            let gamma1 = p.get("gamma1").copied().expect("binned");
+            let gamma1 = size_value(&p, "gamma1")?;
             let t0 = gamma1 * cox;
             p.insert("npeak", 3.021e22 * t0 * t0);
         }
-        let npeak = p.get("npeak").copied().expect("npeak");
+        let npeak = size_value(&p, "npeak")?;
         let phi = 2.0 * vtm0 * (npeak / ni).ln();
         let sqrt_phi = phi.sqrt();
         p.insert("phi", phi);
@@ -932,7 +987,7 @@ impl InstanceSetup {
         p.insert("sqrtxdep0", xdep0.sqrt());
         p.insert(
             "litl",
-            (3.0 * p.get("xj").copied().expect("xj") * model_value(model, "tox")?).sqrt(),
+            (3.0 * size_value(&p, "xj")? * model_value(model, "tox")?).sqrt(),
         );
         p.insert("vbi", vtm0 * (1.0e20 * npeak / (ni * ni)).ln());
         p.insert(
@@ -943,7 +998,7 @@ impl InstanceSetup {
             "ldeb",
             (eps_si * vtm0 / (charge_q * npeak * 1.0e6)).sqrt() / 3.0,
         );
-        let acde = p.get("acde").copied().expect("acde") * (npeak / 2.0e16).powf(-0.25);
+        let acde = size_value(&p, "acde")? * (npeak / 2.0e16).powf(-0.25);
         p.insert("acde", acde);
 
         // K1/K2: explicit pair, or derived from doping and flat-band data.
@@ -978,30 +1033,27 @@ impl InstanceSetup {
             }
         } else {
             if !model.is_given("vbx") {
-                let vbx = phi - 7.7348e-4 * npeak * p.get("xt").copied().expect("xt").powi(2);
+                let vbx = phi - 7.7348e-4 * npeak * size_value(&p, "xt")?.powi(2);
                 p.insert("vbx", vbx);
             }
-            if p.get("vbx").copied().expect("vbx") > 0.0 {
-                let value = -p.get("vbx").copied().expect("vbx");
+            if size_value(&p, "vbx")? > 0.0 {
+                let value = -size_value(&p, "vbx")?;
                 p.insert("vbx", value);
             }
-            if p.get("vbm").copied().expect("vbm") > 0.0 {
-                let value = -p.get("vbm").copied().expect("vbm");
+            if size_value(&p, "vbm")? > 0.0 {
+                let value = -size_value(&p, "vbm")?;
                 p.insert("vbm", value);
             }
             if !model.is_given("gamma1") {
                 p.insert("gamma1", 5.753e-12 * npeak.sqrt() / cox);
             }
             if !model.is_given("gamma2") {
-                p.insert(
-                    "gamma2",
-                    5.753e-12 * p.get("nsub").copied().expect("nsub").sqrt() / cox,
-                );
+                p.insert("gamma2", 5.753e-12 * size_value(&p, "nsub")?.sqrt() / cox);
             }
-            let gamma1 = p.get("gamma1").copied().expect("gamma1");
-            let gamma2 = p.get("gamma2").copied().expect("gamma2");
-            let vbx = p.get("vbx").copied().expect("vbx");
-            let vbm = p.get("vbm").copied().expect("vbm");
+            let gamma1 = size_value(&p, "gamma1")?;
+            let gamma2 = size_value(&p, "gamma2")?;
+            let vbx = size_value(&p, "vbx")?;
+            let vbm = size_value(&p, "vbm")?;
             let t0 = gamma1 - gamma2;
             let t1 = (phi - vbx).sqrt() - sqrt_phi;
             let t2 = (phi * (phi - vbm)).sqrt() - phi;
@@ -1011,9 +1063,9 @@ impl InstanceSetup {
             p.insert("k1", k1);
         }
 
-        let k1 = p.get("k1").copied().expect("k1");
-        let k2 = p.get("k2").copied().expect("k2");
-        let vbm = p.get("vbm").copied().expect("vbm");
+        let k1 = size_value(&p, "k1")?;
+        let k2 = size_value(&p, "k2")?;
+        let vbm = size_value(&p, "vbm")?;
         let vbsc = if k2 < 0.0 {
             let t0 = 0.5 * k1 / k2;
             // `b3temp.c` clamps to [-30, -3]; endpoint values are unchanged.
@@ -1027,14 +1079,14 @@ impl InstanceSetup {
         let polarity = Real::from(model.polarity);
         if !model.is_given("vfb") {
             let vfb = if model.is_given("vth0") {
-                polarity * p.get("vth0").copied().expect("vth0") - phi - k1 * sqrt_phi
+                polarity * size_value(&p, "vth0")? - phi - k1 * sqrt_phi
             } else {
                 -1.0
             };
             p.insert("vfb", vfb);
         }
         if !model.is_given("vth0") {
-            let vfb = p.get("vfb").copied().expect("vfb");
+            let vfb = size_value(&p, "vfb")?;
             p.insert("vth0", polarity * (vfb + phi + k1 * sqrt_phi));
         }
         let k1ox = k1 * model_value(model, "tox")? / model_value(model, "toxm")?;
@@ -1042,48 +1094,44 @@ impl InstanceSetup {
         p.insert("k1ox", k1ox);
         p.insert("k2ox", k2ox);
 
-        let factor1 = temperature.get("factor1").expect("factor1");
-        let dsub = p.get("dsub").copied().expect("dsub");
+        let factor1 = temperature_value(temperature, "factor1")?;
+        let dsub = size_value(&p, "dsub")?;
         let t1 = (eps_si / 3.453_133e-11 * model_value(model, "tox")? * xdep0).sqrt();
         let t0 = (-0.5 * dsub * leff / t1).exp();
         p.insert("theta0vb0", t0 + 2.0 * t0 * t0);
-        let t0 = (-0.5 * p.get("drout").copied().expect("drout") * leff / t1).exp();
+        let t0 = (-0.5 * size_value(&p, "drout")? * leff / t1).exp();
         let t2 = t0 + 2.0 * t0 * t0;
         p.insert(
             "thetarout",
-            p.get("pdibl1").copied().expect("pdibl1") * t2
-                + p.get("pdibl2").copied().expect("pdibl2"),
+            size_value(&p, "pdibl1")? * t2 + size_value(&p, "pdibl2")?,
         );
 
         let tmp = xdep0.sqrt();
-        let tmp1 = p.get("vbi").copied().expect("vbi") - phi;
+        let tmp1 = size_value(&p, "vbi")? - phi;
         let tmp2 = factor1 * tmp;
-        let t0 = -0.5 * p.get("dvt1w").copied().expect("dvt1w") * weff * leff / tmp2;
+        let t0 = -0.5 * size_value(&p, "dvt1w")? * weff * leff / tmp2;
         let t2 = if t0 > -EXP_THRESHOLD {
             let e = t0.exp();
             e * (1.0 + 2.0 * e)
         } else {
             MIN_EXP * (1.0 + 2.0 * MIN_EXP)
         };
-        let t0 = p.get("dvt0w").copied().expect("dvt0w") * t2;
+        let t0 = size_value(&p, "dvt0w")? * t2;
         let t2w = t0 * tmp1;
-        let t0 = -0.5 * p.get("dvt1").copied().expect("dvt1") * leff / tmp2;
+        let t0 = -0.5 * size_value(&p, "dvt1")? * leff / tmp2;
         let t3 = if t0 > -EXP_THRESHOLD {
             let e = t0.exp();
             e * (1.0 + 2.0 * e)
         } else {
             MIN_EXP * (1.0 + 2.0 * MIN_EXP)
         };
-        let t3 = p.get("dvt0").copied().expect("dvt0") * t3 * tmp1;
-        let t4 = model_value(model, "tox")? * phi / (weff + p.get("w0").copied().expect("w0"));
-        let nlx = p.get("nlx").copied().expect("nlx");
+        let t3 = size_value(&p, "dvt0")? * t3 * tmp1;
+        let t4 = model_value(model, "tox")? * phi / (weff + size_value(&p, "w0")?);
+        let nlx = size_value(&p, "nlx")?;
         let t0 = (1.0 + nlx / leff).sqrt();
         let t5 = k1ox * (t0 - 1.0) * sqrt_phi
-            + (p.get("kt1").copied().expect("kt1") + p.get("kt1l").copied().expect("kt1l") / leff)
-                * (ratio - 1.0);
-        let tmp3 = polarity * p.get("vth0").copied().expect("vth0") - t2w - t3
-            + p.get("k3").copied().expect("k3") * t4
-            + t5;
+            + (size_value(&p, "kt1")? + size_value(&p, "kt1l")? / leff) * (ratio - 1.0);
+        let tmp3 = polarity * size_value(&p, "vth0")? - t2w - t3 + size_value(&p, "k3")? * t4 + t5;
         p.insert("vfbzb", tmp3 - phi - k1 * sqrt_phi);
 
         for name in [
@@ -1127,10 +1175,10 @@ impl InstanceSetup {
         }
 
         // Instance-level adjustments: DELVTO and MULU0.
-        let vth0 = p.get("vth0").copied().expect("vth0") + delvto;
-        let vfb = p.get("vfb").copied().expect("vfb") + polarity * delvto;
-        let vfbzb = p.get("vfbzb").copied().expect("vfbzb") + polarity * delvto;
-        let u0temp_instance = p.get("u0temp").copied().expect("u0temp") * mulu0;
+        let vth0 = size_value(&p, "vth0")? + delvto;
+        let vfb = size_value(&p, "vfb")? + polarity * delvto;
+        let vfbzb = size_value(&p, "vfbzb")? + polarity * delvto;
+        let u0temp_instance = size_value(&p, "u0temp")? * mulu0;
         // C recomputes `tconst` here with `T0 = sqrt(1 + nlx/leff)` from above.
         tconst_quirk = u0temp_instance * elm / (cox * weff_cv * leff_cv * t0);
         p.insert("tconst", tconst_quirk);
@@ -1151,14 +1199,11 @@ impl InstanceSetup {
         };
 
         // Junction saturation currents and breakdown voltages.
-        let vtm = temperature.get("vtm").expect("vtm");
+        let vtm = temperature_value(temperature, "vtm")?;
         let nvtm = vtm * model_value(model, "nj")?;
-        let jct_temp = temperature
-            .get("jct_temp_sat_cur_density")
-            .expect("junction current");
-        let jct_sidewall_temp = temperature
-            .get("jct_sidewall_temp_sat_cur_density")
-            .expect("junction current");
+        let jct_temp = temperature_value(temperature, "jct_temp_sat_cur_density")?;
+        let jct_sidewall_temp =
+            temperature_value(temperature, "jct_sidewall_temp_sat_cur_density")?;
         let ijth = model_value(model, "ijth")?;
         let source_sat_current = if source_area <= 0.0 && source_perimeter <= 0.0 {
             1.0e-14
@@ -1208,8 +1253,8 @@ impl InstanceSetup {
             vfbzb,
             u0temp: u0temp_instance,
             tconst: tconst_quirk,
-            cgso: p.get("cgso").copied().expect("cgso"),
-            cgdo: p.get("cgdo").copied().expect("cgdo"),
+            cgso: size_value(&p, "cgso")?,
+            cgdo: size_value(&p, "cgdo")?,
             drain_conductance,
             source_conductance,
             source_sat_current,
@@ -1227,15 +1272,23 @@ impl InstanceSetup {
 
 /// A `b3temp.c` size-dependent parameter, falling back to the model field for
 /// names that are not binned.
-fn pval(p: &BTreeMap<&'static str, Real>, model: &ModelDefaults, name: &str) -> Real {
+fn pval(p: &BTreeMap<&'static str, Real>, model: &ModelDefaults, name: &str) -> SpiceResult<Real> {
     p.get(name)
         .copied()
         .or_else(|| model.get(name))
-        .unwrap_or_else(|| panic!("BSIM3 setup field {name} is missing"))
+        .ok_or_else(|| SpiceError::circuit(format!("BSIM3 setup field {name} is missing")))
 }
 
-fn model_int(model: &ModelDefaults, name: &str) -> SpiceResult<i32> {
-    Ok(model_value(model, name)? as i32)
+fn size_value(p: &BTreeMap<&'static str, Real>, name: &str) -> SpiceResult<Real> {
+    p.get(name)
+        .copied()
+        .ok_or_else(|| SpiceError::circuit(format!("BSIM3 size-dependent field {name} is missing")))
+}
+
+fn temperature_value(temperature: &TemperatureModel, name: &str) -> SpiceResult<Real> {
+    temperature
+        .get(name)
+        .ok_or_else(|| SpiceError::circuit(format!("BSIM3 temperature field {name} is missing")))
 }
 
 fn model_value(model: &ModelDefaults, name: &str) -> SpiceResult<Real> {
@@ -1252,7 +1305,6 @@ fn integer(inputs: &Inputs, name: &str) -> SpiceResult<i32> {
     };
     match &applied.value {
         Value::Integer(value) => Ok(*value),
-        Value::Real(value) => Ok(*value as i32),
         value => Err(SpiceError::circuit(format!(
             "BSIM3 setup expected integer {name}, found {value:?}"
         ))),
@@ -1272,5 +1324,41 @@ fn instance_real(inputs: &Inputs, name: &str) -> SpiceResult<Real> {
             applied.location.clone(),
             format!("BSIM3 instance {name} is not numeric: {value:?}"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_size_field_reports_its_name() {
+        let mut fields = BTreeMap::new();
+        fields.insert("npeak", 1.0);
+        assert_eq!(size_value(&fields, "npeak").unwrap(), 1.0);
+        assert!(
+            size_value(&fields, "missing")
+                .unwrap_err()
+                .to_string()
+                .contains("missing")
+        );
+    }
+
+    #[test]
+    fn c_g_preserves_integer_zeros_and_c_exponent_boundaries() {
+        for (value, expected) in [
+            (100_000., "100000"),
+            (-120_000., "-120000"),
+            (999_999.4, "999999"),
+            (999_999.6, "1e+06"),
+            (0.000_01, "1e-05"),
+            (0.0001, "0.0001"),
+            (-0., "-0"),
+            (Real::NAN, "nan"),
+            (Real::INFINITY, "inf"),
+            (Real::NEG_INFINITY, "-inf"),
+        ] {
+            assert_eq!(c_g(value), expected);
+        }
     }
 }

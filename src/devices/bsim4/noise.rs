@@ -5,11 +5,35 @@
 //! The analysis owns gains, `Nintegrate` and the output columns; this file
 //! reproduces what C passes to `NevalSrc`/`NevalSrc2` and the flicker factor
 //! it multiplies the `N_GAIN` gain by, in C's order and arithmetic.
-#![allow(non_snake_case)]
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::similar_names,
+    reason = "C-translated equation symbols keep their original distinct names for source-level audit"
+)]
+#![expect(
+    clippy::many_single_char_names,
+    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+#![expect(
+    non_snake_case,
+    reason = "preserves upstream C identifiers for equation-by-equation comparison"
+)]
 // C's member and local names.
 // C's own spellings: `x = x * y` and the two-sided `if` limits (`clamp`
 // differs on NaN).
-#![allow(clippy::assign_op_pattern, clippy::manual_clamp)]
+#![expect(
+    clippy::assign_op_pattern,
+    reason = "retains the reference calculation grouping and floating-point operation order"
+)]
+#![expect(
+    clippy::manual_clamp,
+    reason = "the explicit reference branch sequence has different NaN handling"
+)]
 
 use super::fields::{Instance, Model, SizeParam};
 use super::host::state;
@@ -25,7 +49,7 @@ fn max(a: f64, b: f64) -> f64 {
 
 /// One generator, on BSIM4-local nodes.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Source {
+pub(super) enum Source {
     /// `NevalSrc(..., THERMNOISE, a, b, conductance)`.
     Thermal(i32, i32, f64),
     /// `NevalSrc(..., SHOTNOISE, a, b, current)`.
@@ -50,7 +74,7 @@ pub(crate) enum Source {
 }
 
 /// `BSIM4nNames`, in C's order (the instance total `""` follows).
-pub(crate) const NAMES: [&str; 14] = [
+pub(super) const NAMES: [&str; 14] = [
     ".rd", ".rs", ".rg", ".rbps", ".rbpd", ".rbpb", ".rbsb", ".rbdb", ".id", ".1overf", ".igs",
     ".igd", ".igb", ".corl",
 ];
@@ -90,8 +114,11 @@ fn eval_1ov_f_noise(Vds: f64, m: &Model, h: &Instance, p: &SizeParam, freq: f64,
 /// `BSIM4noise`'s `N_DENS` evaluation for one instance at `freq` (Hz):
 /// the 14 generators in [`NAMES`] order. `state0` is C's `CKTstates[0]` at
 /// the operating point, `temp` is `CKTtemp` (K).
-#[allow(clippy::too_many_lines)] // One C function, kept whole.
-pub(crate) fn generators(
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)] // One C function, kept whole.
+pub(super) fn generators(
     m: &Model,
     h: &Instance,
     p: &SizeParam,
@@ -215,21 +242,10 @@ pub(crate) fn generators(
         let epsilon = (T7 - T7 * T7 * T7 / 3.0) / (6.0 * T6);
         let mut T8 = h.Vgsteff / h.EsatL;
         T8 *= T8;
+        let npart_c = m.rnoic * (1.0 + T8 * m.tnoic * Leff);
         if m.v48intVersion <= 480 {
-            let npart_c = m.rnoic * (1.0 + T8 * m.tnoic * Leff);
             ctnoi = epsilon / (gamma * delta).sqrt() * (2.5316 * npart_c);
-
-            npart_beta = m.rnoia * (1.0 + T8 * m.tnoia * Leff);
-            npart_theta = m.rnoib * (1.0 + T8 * m.tnoib * Leff);
-            gamma = gamma * (3.0 * npart_beta * npart_beta);
-            delta = delta * (3.75 * npart_theta * npart_theta);
-
-            GammaGd0 = gamma * h.noiGd0;
-            let C0 = h.Coxeff * p.weffCV * h.nf * p.leffCV;
-            let T0 = C0 / h.noiGd0;
-            sigrat = T0 * (delta / gamma).sqrt();
         } else {
-            let npart_c = m.rnoic * (1.0 + T8 * m.tnoic * Leff);
             // Limits added for rnoia..tnoic in BSIM4.8.1.
             let T9 = gamma * delta;
             ctnoi = if T9 > 0.0 {
@@ -243,22 +259,22 @@ pub(crate) fn generators(
             if ctnoi < 0.0 {
                 ctnoi = 0.0;
             }
-
-            npart_beta = m.rnoia * (1.0 + T8 * m.tnoia * Leff);
-            npart_theta = m.rnoib * (1.0 + T8 * m.tnoib * Leff);
-            gamma = gamma * (3.0 * npart_beta * npart_beta);
-            delta = delta * (3.75 * npart_theta * npart_theta);
-
-            GammaGd0 = gamma * h.noiGd0;
-            let C0 = h.Coxeff * p.weffCV * h.nf * p.leffCV;
-            let T0 = C0 / h.noiGd0;
-
-            sigrat = if gamma > 0.0 && delta > 0.0 {
-                T0 * (delta / gamma).sqrt()
-            } else {
-                0.0
-            };
         }
+
+        npart_beta = m.rnoia * (1.0 + T8 * m.tnoia * Leff);
+        npart_theta = m.rnoib * (1.0 + T8 * m.tnoib * Leff);
+        gamma = gamma * (3.0 * npart_beta * npart_beta);
+        delta = delta * (3.75 * npart_theta * npart_theta);
+
+        GammaGd0 = gamma * h.noiGd0;
+        let C0 = h.Coxeff * p.weffCV * h.nf * p.leffCV;
+        let T0 = C0 / h.noiGd0;
+        // Earlier models did not guard the ratio, including nonfinite inputs.
+        sigrat = if m.v48intVersion <= 480 || (gamma > 0.0 && delta > 0.0) {
+            T0 * (delta / gamma).sqrt()
+        } else {
+            0.0
+        };
     }
     match m.tnoiMod {
         0 => {
@@ -267,7 +283,8 @@ pub(crate) fn generators(
             // indeterminate stack value C adds to the total). The port uses
             // zero there.
             let T0 = h.ueff * h.qinv.abs();
-            let T1 = T0 * tmp + p.leff * p.leff;
+            let leff_squared = p.leff * p.leff;
+            let T1 = T0 * tmp + leff_squared;
             out[8] = Source::Thermal(h.dNodePrime, h.sNodePrime, (T0 / T1) * m.ntnoi * mult_i);
         }
         1 => {

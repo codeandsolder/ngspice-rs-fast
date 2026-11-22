@@ -16,6 +16,25 @@
 //! (`bessI0`, `bessI1`, `bessI1xOverX`); `erfc` is a separate implementation
 //! (see [`erfc`]).
 
+// C-compatible numerical expressions are kept in their reference order:
+// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+#![expect(
+    clippy::float_cmp,
+    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
+)]
+#![expect(
+    clippy::manual_midpoint,
+    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
+)]
+#![expect(
+    clippy::many_single_char_names,
+    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
+)]
+
 use std::f64::consts::PI;
 
 use crate::primitives::Real;
@@ -87,7 +106,6 @@ fn intlinfunc(
 }
 
 /// `twiceintlinfunc`: `int_lo^hi int_other^tau h` for the same linear `h`.
-#[allow(clippy::too_many_arguments)]
 fn twiceintlinfunc(
     lolimit: Real,
     hilimit: Real,
@@ -108,9 +126,10 @@ fn twiceintlinfunc(
     let mut dummy = lovalue
         * ((hilimit - otherlolimit) * (hilimit - otherlolimit)
             - (lolimit - otherlolimit) * (lolimit - otherlolimit));
+    let temp3_squared = temp3 * temp3;
     dummy += m
         * ((temp1 * temp1 * temp1 - temp2 * temp2 * temp2) / 3.0
-            - temp3 * temp3 * (hilimit - lolimit));
+            - temp3_squared * (hilimit - lolimit));
     dummy * 0.5
 }
 
@@ -122,29 +141,29 @@ pub fn bess_i0(x: Real) -> Real {
         let mut y = x / 3.75;
         y *= y;
         1.0 + y
-            * (3.5156229
-                + y * (3.0899424
-                    + y * (1.2067492 + y * (0.2659732 + y * (0.360768e-1 + y * 0.45813e-2)))))
+            * (3.515_622_9
+                + y * (3.089_942_4
+                    + y * (1.206_749_2 + y * (0.265_973_2 + y * (0.360_768e-1 + y * 0.45813e-2)))))
     } else {
         let y = 3.75 / ax;
         (ax.exp() / ax.sqrt())
-            * (0.39894228
-                + y * (0.1328592e-1
-                    + y * (0.225319e-2
-                        + y * (-0.157565e-2
-                            + y * (0.916281e-2
-                                + y * (-0.2057706e-1
-                                    + y * (0.2635537e-1
-                                        + y * (-0.1647633e-1 + y * 0.392377e-2))))))))
+            * (0.398_942_28
+                + y * (0.132_859_2e-1
+                    + y * (0.225_319e-2
+                        + y * (-0.157_565e-2
+                            + y * (0.916_281e-2
+                                + y * (-0.205_770_6e-1
+                                    + y * (0.263_553_7e-1
+                                        + y * (-0.164_763_3e-1 + y * 0.392_377e-2))))))))
     }
 }
 
 /// The large-argument series shared by `bessI1` and `bessI1xOverX`.
 fn bess_i1_tail(y: Real) -> Real {
-    let ans = 0.2282967e-1 + y * (-0.2895312e-1 + y * (0.1787654e-1 - y * 0.420059e-2));
-    0.39894228
-        + y * (-0.3988024e-1
-            + y * (-0.362018e-2 + y * (0.163801e-2 + y * (-0.1031555e-1 + y * ans))))
+    let ans = 0.228_296_7e-1 + y * (-0.289_531_2e-1 + y * (0.178_765_4e-1 - y * 0.420_059e-2));
+    0.398_942_28
+        + y * (-0.398_802_4e-1
+            + y * (-0.362_018e-2 + y * (0.163_801e-2 + y * (-0.103_155_5e-1 + y * ans))))
 }
 
 /// `bessI1` (Abramowitz and Stegun 9.8.3, 9.8.4).
@@ -155,9 +174,10 @@ pub fn bess_i1(x: Real) -> Real {
         let mut y = x / 3.75;
         y *= y;
         ax * (0.5
-            + y * (0.87890594
-                + y * (0.51498869
-                    + y * (0.15084934 + y * (0.2658733e-1 + y * (0.301532e-2 + y * 0.32411e-3))))))
+            + y * (0.878_905_94
+                + y * (0.514_988_69
+                    + y * (0.150_849_34
+                        + y * (0.265_873_3e-1 + y * (0.301_532e-2 + y * 0.32411e-3))))))
     } else {
         let y = 3.75 / ax;
         bess_i1_tail(y) * (ax.exp() / ax.sqrt())
@@ -173,9 +193,10 @@ pub fn bess_i1_x_over_x(x: Real) -> Real {
         let mut y = x / 3.75;
         y *= y;
         0.5 + y
-            * (0.87890594
-                + y * (0.51498869
-                    + y * (0.15084934 + y * (0.2658733e-1 + y * (0.301532e-2 + y * 0.32411e-3)))))
+            * (0.878_905_94
+                + y * (0.514_988_69
+                    + y * (0.150_849_34
+                        + y * (0.265_873_3e-1 + y * (0.301_532e-2 + y * 0.32411e-3)))))
     } else {
         let y = 3.75 / ax;
         bess_i1_tail(y) * (ax.exp() / (ax * ax.sqrt()))
@@ -188,10 +209,10 @@ pub fn rlc_h2(time: Real, t: Real, alpha: Real, beta: Real) -> Real {
     if alpha == 0.0 || time < t {
         return 0.0;
     }
-    let besselarg = if time != t {
-        alpha * (time * time - t * t).sqrt()
-    } else {
+    let besselarg = if time == t {
         0.0
+    } else {
+        alpha * (time * time - t * t).sqrt()
     };
     let exparg = -beta * time;
     alpha * alpha * t * exparg.exp() * bess_i1_x_over_x(besselarg)
@@ -201,7 +222,10 @@ pub fn rlc_h2(time: Real, t: Real, alpha: Real, beta: Real) -> Real {
 /// straight line, by comparing the triangle they span with the trapezoid area
 /// under them (`area * reltol + abstol > triangle`).
 #[must_use]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)]
 pub fn straight_line_check(
     x1: Real,
     y1: Real,
@@ -374,17 +398,17 @@ pub fn rc_coefficients(
     let temp5 = cbyr.sqrt();
 
     let h2value = |hilimit: Real, temp2: Real, temp3: Real| {
-        if hilimit != 0.0 {
-            (hilimit + rclsqr * 0.5) * temp2 - (hilimit * rclsqr / PI).sqrt() * temp3
-        } else {
+        if hilimit == 0.0 {
             0.0
+        } else {
+            (hilimit + rclsqr * 0.5) * temp2 - (hilimit * rclsqr / PI).sqrt() * temp3
         }
     };
     let h3value = |hilimit: Real, temp2: Real, temp3: Real| {
-        if hilimit != 0.0 {
-            temp5 * (2. * (hilimit / PI).sqrt() * temp3 - temp4 * temp2)
-        } else {
+        if hilimit == 0.0 {
             0.0
+        } else {
+            temp5 * (2. * (hilimit / PI).sqrt() * temp3 - temp4 * temp2)
         }
     };
 
@@ -457,7 +481,10 @@ pub fn rc_coefficients(
 /// the previous window `[lolimit2, hilimit2]` with the values at `TD` and at
 /// the auxiliary time (C's commented-out `lolimit2 = T` fix is not applied).
 #[must_use]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)]
 pub fn rlc_coefficients(
     t: Real,
     alpha: Real,

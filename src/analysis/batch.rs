@@ -43,13 +43,13 @@
 //!   plots that succeeded; the port's callers publish nothing when any analysis
 //!   fails.
 
-use crate::netlist::ast::{AnalysisCard, FourierCard, MeasureCard, OutputCards};
+use crate::netlist::ast::{AnalysisCard, FourierCard, MeasureCard, OutputCards, VectorRequest};
 use crate::primitives::{AnalysisKind, SpiceError, SpiceResult};
 
 use crate::analysis::fourier::{self, FourierAnalysis};
 use crate::analysis::measure::{self, Measurement};
 use crate::analysis::results::Plot;
-use crate::analysis::selection::{self, Selection};
+use crate::analysis::selection::Selection;
 
 /// The C reference for the batch order and plot naming.
 pub const C_REFERENCE: &str = "src/spicelib/analysis/cktdojob.c (CKTdoJob), \
@@ -147,7 +147,8 @@ fn schedule_with_bias(cards: &[AnalysisCard], keep_op_info: bool) -> Vec<Schedul
             .cmp(&job_order(cards[b].kind))
             .then(b.cmp(&a))
     });
-    let mut names: Vec<String> = Vec::with_capacity(order.len());
+    // Generated names are lowercase; membership need not scan all prior plots.
+    let mut names = std::collections::HashSet::with_capacity(order.len());
     let mut plot_num = 1_usize;
     let mut scheduled: Vec<ScheduledAnalysis> = order
         .iter()
@@ -180,11 +181,11 @@ fn schedule_with_bias(cards: &[AnalysisCard], keep_op_info: bool) -> Vec<Schedul
                     abbreviation
                 };
                 let mut name = format!("{abbreviation}{plot_num}");
-                while names.iter().any(|taken| taken.eq_ignore_ascii_case(&name)) {
+                while names.contains(&name) {
                     plot_num += 1;
                     name = format!("{abbreviation}{plot_num}");
                 }
-                names.push(name.clone());
+                names.insert(name.clone());
                 own.push(name);
             }
             let plot_name = own.remove(0);
@@ -199,9 +200,10 @@ fn schedule_with_bias(cards: &[AnalysisCard], keep_op_info: bool) -> Vec<Schedul
         .collect();
     for index in 0..scheduled.len() {
         let kind = scheduled[index].kind;
-        scheduled[index].last_of_kind = !scheduled[index + 1..]
-            .iter()
-            .any(|later| later.kind == kind);
+        // Sorting makes all jobs of one kind contiguous.
+        scheduled[index].last_of_kind = scheduled
+            .get(index + 1)
+            .is_none_or(|later| later.kind != kind);
     }
     scheduled
 }
@@ -392,30 +394,27 @@ pub fn resolve_outputs_with_scope(
         });
     }
     let own = own_cards(plot, scheduled, output)?;
-    let selection = written_selection(plot, scheduled, output)?;
-    let print_requests = selection::print_requests(&own, kind)?;
-    let mut printed = if print_requests.is_empty() {
+    let selection = Selection::resolve_refs(plot, kind, own.write_requests())?;
+    let mut print_requests = own.print_requests().peekable();
+    let mut printed = if print_requests.peek().is_none() {
         None
     } else {
-        Some(Selection::resolve(plot, kind, &print_requests)?.to_text(plot)?)
+        Some(Selection::resolve_refs(plot, kind, print_requests)?.to_text(plot)?)
     };
     for card in own
         .prints
         .iter()
         .filter(|card| card.ascii_plot && !card.requests.is_empty())
     {
-        let selected = Selection::resolve(plot, kind, &card.requests)?.apply(plot)?;
+        let selected =
+            Selection::resolve_refs(plot, kind, card.requests.iter().copied())?.apply(plot)?;
         printed
             .get_or_insert_with(String::new)
             .push_str(&super::asciiplot::render(&selected)?);
     }
     let measurements = if scheduled.last_of_kind {
-        let own: Vec<MeasureCard> = measures
-            .iter()
-            .filter(|card| card.analysis == kind)
-            .cloned()
-            .collect();
-        measure::resolve_with_scope(plot, kind, &own, scope)?
+        let own = measures.iter().filter(|card| card.analysis == kind);
+        measure::resolve_refs_with_scope(plot, kind, own, scope)?
     } else {
         Vec::new()
     };
@@ -451,17 +450,19 @@ pub fn written_selection(
 ) -> SpiceResult<Selection> {
     if is_operating_point_prelude(plot) {
         let kind = AnalysisKind::OperatingPoint;
-        let saves_only = OutputCards {
-            saves: output.saves.clone(),
-            prints: Vec::new(),
-        };
-        return Selection::resolve(plot, kind, &selection::write_requests(&saves_only, kind)?);
+        return Selection::resolve_refs(
+            plot,
+            kind,
+            output.saves.iter().flat_map(|save| &save.requests),
+        );
     }
     let kind = scheduled.kind;
     let own = own_cards(plot, scheduled, output)?;
-    Selection::resolve(plot, kind, &selection::write_requests(&own, kind)?)
+    Selection::resolve_refs(plot, kind, own.write_requests())
 }
 
+/// Whether a scheduled plot must be retained for later output processing.
+///
 /// Whether [`resolve_outputs`] reads more of this scheduled plot than its
 /// written selection: a `.print` card of its type (a table or an ASCII plot),
 /// or, on the last plot of its type, a `.measure` card of its type or a
@@ -493,69 +494,94 @@ fn is_operating_point_prelude(plot: &Plot) -> bool {
     )
 }
 
-/// The output cards that apply to this plot: every `.save`, the `.print`
-/// cards naming its type, and for `.noise` only the requests its plot (the
-/// spectrum or the integrated noise) can satisfy.
-fn own_cards(
+/// A borrowed per-plot routing plan. The AST owns location/name strings;
+/// only references are needed to apply selections or render each ASCII card.
+struct RoutedPrint<'a> {
+    ascii_plot: bool,
+    requests: Vec<&'a VectorRequest>,
+}
+
+struct RoutedOutputs<'a> {
+    saves: Vec<&'a VectorRequest>,
+    prints: Vec<RoutedPrint<'a>>,
+}
+
+impl<'a> RoutedOutputs<'a> {
+    fn write_requests(&self) -> impl Iterator<Item = &'a VectorRequest> + '_ {
+        self.saves.iter().copied().chain(
+            self.prints
+                .iter()
+                .flat_map(|card| card.requests.iter().copied()),
+        )
+    }
+
+    fn print_requests(&self) -> impl Iterator<Item = &'a VectorRequest> + '_ {
+        self.prints
+            .iter()
+            .filter(|card| !card.ascii_plot)
+            .flat_map(|card| card.requests.iter().copied())
+    }
+}
+
+/// The output cards that apply to this plot: every .save, the .print cards
+/// naming its type, and for .noise only the requests the spectrum/integrated
+/// plot can satisfy. Preserve source order and report invalid totals even when
+/// the current plot is the spectrum.
+fn own_cards<'a>(
     plot: &Plot,
     scheduled: &ScheduledAnalysis,
-    output: &OutputCards,
-) -> SpiceResult<OutputCards> {
+    output: &'a OutputCards,
+) -> SpiceResult<RoutedOutputs<'a>> {
     let kind = scheduled.kind;
-    let mut own = OutputCards {
-        saves: output.saves.clone(),
-        prints: output
-            .prints
-            .iter()
-            .filter(|print| print.analysis == kind)
-            .cloned()
-            .collect(),
+    let integrated = plot.plotname.starts_with("Integrated Noise");
+    let has_integrated = scheduled
+        .plot_names()
+        .filter(|name| name.starts_with("noise"))
+        .count()
+        > 1;
+    let applicable = |request: &VectorRequest| -> SpiceResult<bool> {
+        if kind != AnalysisKind::Noise
+            || matches!(request.vector, crate::netlist::ast::RequestedVector::All)
+        {
+            return Ok(true);
+        }
+        let name = request.vector.name().to_ascii_lowercase();
+        let total = name.contains("onoise_total") || name.contains("inoise_total");
+        if total && !has_integrated {
+            return Err(SpiceError::Unsupported {
+                feature: format!("{name}: single-frequency .noise has no integrated plot"),
+                location: Some(request.location.clone()),
+            });
+        }
+        Ok(total == integrated)
     };
-    if kind == AnalysisKind::Noise {
-        let integrated = plot.plotname.starts_with("Integrated Noise");
-        let has_integrated = scheduled
-            .plot_names()
-            .filter(|name| name.starts_with("noise"))
-            .count()
-            > 1;
-        let applicable = |request: &crate::netlist::ast::VectorRequest| -> SpiceResult<bool> {
-            if matches!(request.vector, crate::netlist::ast::RequestedVector::All) {
-                return Ok(true);
-            }
-            let name = request.vector.name().to_ascii_lowercase();
-            let total = name.contains("onoise_total") || name.contains("inoise_total");
-            if total && !has_integrated {
-                return Err(SpiceError::Unsupported {
-                    feature: format!("{name}: single-frequency .noise has no integrated plot"),
-                    location: Some(request.location.clone()),
-                });
-            }
-            Ok(total == integrated)
-        };
-        for save in &mut own.saves {
-            save.requests = save
-                .requests
-                .iter()
-                .filter_map(|r| match applicable(r) {
-                    Ok(true) => Some(Ok(r.clone())),
-                    Ok(false) => None,
-                    Err(e) => Some(Err(e)),
-                })
-                .collect::<SpiceResult<_>>()?;
-        }
-        for print in &mut own.prints {
-            print.requests = print
-                .requests
-                .iter()
-                .filter_map(|r| match applicable(r) {
-                    Ok(true) => Some(Ok(r.clone())),
-                    Ok(false) => None,
-                    Err(e) => Some(Err(e)),
-                })
-                .collect::<SpiceResult<_>>()?;
-        }
-    }
-    Ok(own)
+    let route = |request: &'a VectorRequest| match applicable(request) {
+        Ok(true) => Some(Ok(request)),
+        Ok(false) => None,
+        Err(error) => Some(Err(error)),
+    };
+    let saves = output
+        .saves
+        .iter()
+        .flat_map(|card| &card.requests)
+        .filter_map(route)
+        .collect::<SpiceResult<_>>()?;
+    let prints = output
+        .prints
+        .iter()
+        .filter(|card| card.analysis == kind)
+        .map(|card| {
+            Ok(RoutedPrint {
+                ascii_plot: card.ascii_plot,
+                requests: card
+                    .requests
+                    .iter()
+                    .filter_map(route)
+                    .collect::<SpiceResult<_>>()?,
+            })
+        })
+        .collect::<SpiceResult<_>>()?;
+    Ok(RoutedOutputs { saves, prints })
 }
 
 #[cfg(test)]

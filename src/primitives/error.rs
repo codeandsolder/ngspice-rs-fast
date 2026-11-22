@@ -154,7 +154,7 @@ impl SpiceError {
 
     /// True when this error only means "not implemented yet".
     #[must_use]
-    pub fn is_not_yet_ported(&self) -> bool {
+    pub const fn is_not_yet_ported(&self) -> bool {
         matches!(self, Self::NotYetPorted { .. })
     }
 

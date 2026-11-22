@@ -14,6 +14,7 @@
 //! `1e-14`: perturbing it turns the recombination current on, and restoring
 //! it leaves it on for every later parameter of the model).
 
+use super::thermal::TemperatureCache;
 use super::{Diode, DiodeParameters, EPSMIN};
 use crate::devices::sensitivity::{
     AcReset, CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, RecordPair, ResetStamp,
@@ -182,7 +183,7 @@ fn port_name(keyword: &str) -> &str {
 
 /// A diode's `.sens` description.
 #[derive(Debug)]
-pub(crate) struct DiodeSensitivity<'a> {
+pub(in crate::devices) struct DiodeSensitivity<'a> {
     diode: &'a Diode,
     circuit_kelvin: Real,
     nominal_kelvin: Real,
@@ -204,6 +205,36 @@ fn default(record: &mut SensitivityRecord, keyword: &str, value: Real) -> SpiceR
     } else {
         record.store(keyword, value)
     }
+}
+
+// Geometry, multiplier and effective knee currents belong to the instance.
+fn setup_diode_instance(
+    model: &SensitivityRecord,
+    instance: &mut SensitivityRecord,
+) -> SpiceResult<()> {
+    let geometry = instance.given("w") || instance.given("l");
+    if !instance.given("area") {
+        let area = if geometry { 1. } else { model.value("area")? };
+        instance.store("area", area)?;
+    }
+    if !instance.given("pj") {
+        let pj = if geometry { 0. } else { model.value("pj")? };
+        instance.store("pj", pj)?;
+    }
+    if !instance.given("m") || instance.value("m")? <= 0. {
+        instance.store("m", 1.)?;
+    }
+    if instance.value("area")? <= 0. {
+        instance.store("area", 1.)?;
+    }
+    let (area, pj, m) = (
+        instance.value("area")?,
+        instance.value("pj")?,
+        instance.value("m")?,
+    );
+    instance.store("ikf", model.value("ikf")? * area * m)?;
+    instance.store("ikr", model.value("ikr")? * area * m)?;
+    instance.store("ikp", model.value("ikp")? * pj * m)
 }
 
 impl DeviceSensitivity for DiodeSensitivity<'_> {
@@ -321,7 +352,7 @@ impl DeviceSensitivity for DiodeSensitivity<'_> {
         default(model, "nbv", n)?;
         default(model, "tlev", 0.)?;
         default(model, "tlevc", 0.)?;
-        let eg = if model.value("tlev")? == 2. {
+        let eg = if matches!(model.value("tlev")?, 2.) {
             1.16
         } else {
             1.11
@@ -376,29 +407,7 @@ impl DeviceSensitivity for DiodeSensitivity<'_> {
             0.
         };
         model.store("conductance", conductance)?;
-        let geometry = instance.given("w") || instance.given("l");
-        if !instance.given("area") {
-            let area = if geometry { 1. } else { model.value("area")? };
-            instance.store("area", area)?;
-        }
-        if !instance.given("pj") {
-            let pj = if geometry { 0. } else { model.value("pj")? };
-            instance.store("pj", pj)?;
-        }
-        if !instance.given("m") || instance.value("m")? <= 0. {
-            instance.store("m", 1.)?;
-        }
-        if instance.value("area")? <= 0. {
-            instance.store("area", 1.)?;
-        }
-        let (area, pj, m) = (
-            instance.value("area")?,
-            instance.value("pj")?,
-            instance.value("m")?,
-        );
-        instance.store("ikf", model.value("ikf")? * area * m)?;
-        instance.store("ikr", model.value("ikr")? * area * m)?;
-        instance.store("ikp", model.value("ikp")? * pj * m)
+        setup_diode_instance(model, instance)
     }
 
     /// `DIOtemp`: the instance temperature (`CKTtemp + dtemp` unless given).
@@ -547,6 +556,7 @@ impl DiodeSensitivity<'_> {
             terminals: self.diode.terminals.clone(),
             junction: self.diode.junction,
             parameters,
+            derived: TemperatureCache::new(),
             initial: self.diode.initial.clone(),
             location: self.diode.location.clone(),
             written: self.diode.written.clone(),
@@ -591,13 +601,12 @@ impl Device for ResetDiode {
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         let model = context.model_context;
         let gspr = if self.current.parameters.rs > 0. {
-            self.current.parameters.thermal(model)?.conductance
+            self.current.thermal(model)?.conductance
         } else {
             0.
         };
         let geq = self
             .state
-            .parameters
             .thermal(model)?
             .point_unchecked(0., model.gmin)?
             .ac_conductance;

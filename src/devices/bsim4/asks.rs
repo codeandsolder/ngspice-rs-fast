@@ -5,7 +5,7 @@
 
 /// `b4mask.c`: `(model parameter ID, member)` asks that read one real member.
 #[rustfmt::skip]
-pub(crate) const MODEL: &[(&str, &str)] = &[
+pub(super) const MODEL: &[(&str, &str)] = &[
     ("BSIM4_MOD_TOXREF", "BSIM4toxref"),
     ("BSIM4_MOD_EOT", "BSIM4eot"),
     ("BSIM4_MOD_VDDEOT", "BSIM4vddeot"),
@@ -879,7 +879,7 @@ pub(crate) const MODEL: &[(&str, &str)] = &[
 
 /// `b4ask.c`: `(instance parameter ID, member)` asks that read one real member.
 #[rustfmt::skip]
-pub(crate) const INSTANCE: &[(&str, &str)] = &[
+pub(super) const INSTANCE: &[(&str, &str)] = &[
     ("BSIM4_L", "BSIM4l"),
     ("BSIM4_W", "BSIM4w"),
     ("BSIM4_M", "BSIM4m"),
