@@ -557,8 +557,8 @@ impl MosLevel for Level2 {
                 dsdvgs = increment / arg1 / eta;
                 dsdvbs = factor.mul_add(
                     dsdvgs,
-                    (-gammad).mul_add(increment, 2.0 * argv / (gammad * arg1)) / eta * dgdvbs
-                        + 1.0 / arg1,
+                    ((-gammad).mul_add(increment, 2.0 * argv / (gammad * arg1)) / eta)
+                        .mul_add(dgdvbs, 1.0 / arg1),
                 );
             }
         } else {
@@ -740,7 +740,7 @@ impl MosLevel for Level2 {
             let gm = beta1.mul_add(lvds, arg1);
             let arg1 = cdrain * (dudvds / ufact - dldvds / clfact);
             let gds = beta1.mul_add(
-                eta.mul_add(-lvds, lvgs - vbin) - gammad * barg - dgdvds * body / 1.5,
+                f64::mul_add(gammad, -barg, eta.mul_add(-lvds, lvgs - vbin)) - dgdvds * body / 1.5,
                 arg1,
             );
             let arg1 = cdrain * (dudvbs / ufact - dldvbs / clfact);
@@ -751,14 +751,15 @@ impl MosLevel for Level2 {
             let cdrain =
                 beta1 * (lvgs - vbin - eta * vdsat / 2.0).mul_add(vdsat, -(gammad * bodys / 1.5));
             let arg1 = cdrain * (dudvgs / ufact - dldvgs / clfact);
-            let gm = (beta1 * (eta.mul_add(-vdsat, lvgs - vbin) - gammad * bsarg))
-                .mul_add(dsdvgs, arg1 + beta1 * vdsat);
+            let gm = (beta1 * f64::mul_add(gammad, -bsarg, eta.mul_add(-vdsat, lvgs - vbin)))
+                .mul_add(dsdvgs, beta1.mul_add(vdsat, arg1));
             let gds = -cdrain * dldvds / clfact - beta1 * dgdvds * bodys / 1.5;
             let arg1 = cdrain * (dudvbs / ufact - dldvbs / clfact);
-            let gmbs = (beta1 * (eta.mul_add(-vdsat, lvgs - vbin) - gammad * bsarg)).mul_add(
-                dsdvbs,
-                arg1 - beta1 * factor.mul_add(-vdsat, gdbdvs + dgdvbs * bodys / 1.5),
-            );
+            let gmbs = (beta1 * f64::mul_add(gammad, -bsarg, eta.mul_add(-vdsat, lvgs - vbin)))
+                .mul_add(
+                    dsdvbs,
+                    beta1.mul_add(-factor.mul_add(-vdsat, gdbdvs + dgdvbs * bodys / 1.5), arg1),
+                );
             (cdrain, gm, gds, gmbs)
         };
         DrainCurrent {

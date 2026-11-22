@@ -220,9 +220,10 @@ impl Level6 {
         } else {
             (root - vbs / (root + root)).max(0.)
         };
-        let von = p
-            .sigma
-            .mul_add(-vds, gamma.mul_add(sarg, op.vbi * pol) - p.gamma1 * vbs);
+        let von = p.sigma.mul_add(
+            -vds,
+            p.gamma1.mul_add(-vbs, gamma.mul_add(sarg, op.vbi * pol)),
+        );
         let vgon = vgs - von;
         if vgon <= 0. {
             return DrainCurrent {
@@ -260,7 +261,7 @@ impl Level6 {
             let ivdst1 = current * (2. - vdst - vdst);
             current *= vdst2;
             gm = ivdst1.mul_add(vdstg, gm * vdst2);
-            gds = ivdst1.mul_add(1. / vdsat + vdstg * p.sigma, gds * vdst2);
+            gds = ivdst1.mul_add(vdstg.mul_add(p.sigma, 1. / vdsat), gds * vdst2);
             gmbs = (ivdst1 * vdstg).mul_add(vonbm, gmbs * vdst2);
         }
         DrainCurrent {

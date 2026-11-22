@@ -235,7 +235,10 @@ impl Mos1 {
                 yyy: -gb3,
                 zzz: 6.0f64.mul_add(
                     gmbds,
-                    gm3 + gb3 + gds3 + 3. * (gm2b + gm2ds + gmb2 + gb2ds + gmds2 + gbds2),
+                    3.0f64.mul_add(
+                        gm2b + gm2ds + gmb2 + gb2ds + gmds2 + gbds2,
+                        gm3 + gb3 + gds3,
+                    ),
                 ),
                 xxz: gm3 + gm2b + gm2ds,
                 xxy: -gm2b,

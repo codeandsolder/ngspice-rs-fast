@@ -110,7 +110,7 @@ impl SurfaceCard {
         }
         if self.vto.is_none() {
             let vfb = wkfngs - self.nss.unwrap_or(0.) * 1e4 * CHARGE / cox;
-            surface.vto = pol.mul_add(surface.gamma * surface.phi.sqrt() + surface.phi, vfb);
+            surface.vto = pol.mul_add(surface.gamma.mul_add(surface.phi.sqrt(), surface.phi), vfb);
         }
         Ok(surface)
     }
@@ -130,7 +130,10 @@ impl Surface {
         let vto = delvto.map_or(self.vto, |delta| delta + self.vto);
         let vbi = (pol * 0.5).mul_add(
             phi - self.phi,
-            pol.mul_add(-(self.gamma * self.phi.sqrt()), vto) + 0.5 * (nominal.gap - actual.gap),
+            0.5f64.mul_add(
+                nominal.gap - actual.gap,
+                pol.mul_add(-(self.gamma * self.phi.sqrt()), vto),
+            ),
         );
         let vto = (pol * self.gamma).mul_add(phi.sqrt(), vbi);
         (phi, vbi, vto)

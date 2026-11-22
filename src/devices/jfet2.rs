@@ -440,7 +440,7 @@ impl Model {
         let (hfe, hfe1, hfe2) = (self.hfeta, self.hfe1, self.hfe2);
         let mut vgst = vgs - self.vto;
         vgst = f64::mul_add(
-            f64::mul_add(lfg1, -vgstrap, lfg) + lfg2 * vgdtrap,
+            f64::mul_add(lfg2, vgdtrap, f64::mul_add(lfg1, -vgstrap, lfg)),
             -vgdtrap,
             vgst,
         );
@@ -526,13 +526,17 @@ impl Model {
         }
         let arg = f64::mul_add(
             1. - h,
-            f64::mul_add(hfg2, -dvgd, hfe1 * dvgs) + 2. * lfg2 * vgdtrap - lfg1 * vgstrap + lfg,
+            f64::mul_add(
+                lfg1,
+                -vgstrap,
+                f64::mul_add(hfg2, -dvgd, hfe1 * dvgs) + 2. * lfg2 * vgdtrap,
+            ) + lfg,
             h * gam,
         );
         gds = f64::mul_add(gm, arg, gds);
         gm *= f64::mul_add(
             1. - h,
-            f64::mul_add(hfg1, -dvgd, hfe2 * dvgs) + lfg1 * vgdtrap,
+            f64::mul_add(lfg1, vgdtrap, f64::mul_add(hfg1, -dvgd, hfe2 * dvgs)),
             f64::mul_add(h, -eta, 1.),
         ) - arg;
 

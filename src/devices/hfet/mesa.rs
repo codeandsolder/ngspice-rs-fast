@@ -623,10 +623,10 @@ impl Mesa {
             return Ok((0., 0., 0., derived.cf, derived.cf));
         }
         let gchi = derived.gchi0 * ns;
-        let gch = gchi / (1. + gchi * rt);
-        let f = (1. + 2. * a * derived.trsi).sqrt();
-        let d = 1. + a * derived.trsi + f;
-        let e = 1. + model.tc * vgte;
+        let gch = gchi / gchi.mul_add(rt, 1.);
+        let f = (2. * a).mul_add(derived.trsi, 1.).sqrt();
+        let d = a.mul_add(derived.trsi, 1.) + f;
+        let e = model.tc.mul_add(vgte, 1.);
         let isata = a * vgte / d / e;
         let isatb = derived.isatb0 * b;
         let isat = isata * isatb / (isata + isatb);
@@ -635,15 +635,15 @@ impl Mesa {
         let g = (vds / vsate).powf(model.m);
         let h = (1. + g).powf(1. / model.m);
         let delidgch0 = vds / h;
-        let delidgch = delidgch0 * (1. + lambda * vds);
+        let delidgch = delidgch0 * lambda.mul_add(vds, 1.);
         let cdrain = gch * delidgch;
         let cgc = self.instance.w * self.instance.l * ca * cb / (ca + cb);
-        let c = (vsate - vdse) / (2. * vsate - vdse);
+        let c = (vsate - vdse) / 2.0f64.mul_add(vsate, -vdse);
         let c = c * c;
-        let capgs = derived.cf + 2. / 3. * cgc * (1. - c);
-        let c = vsate / (2. * vsate - vdse);
+        let capgs = (2. / 3. * cgc).mul_add(1. - c, derived.cf);
+        let c = vsate / 2.0f64.mul_add(vsate, -vdse);
         let c = c * c;
-        let capgd = derived.cf + 2. / 3. * cgc * (1. - c);
+        let capgd = (2. / 3. * cgc).mul_add(1. - c, derived.cf);
         let delvgtevgt = smoothed.high_weights[0];
         let delidvds0 = gch / h;
         let delidvds1 = if vds == 0. {
@@ -651,7 +651,7 @@ impl Mesa {
         } else {
             cdrain * (vds / vsate).powf(model.m - 1.) / vsate / (1. + g)
         };
-        let delidvds = delidvds0 * (1. + 2. * lambda * vds) - delidvds1;
+        let delidvds = delidvds0.mul_add(1. + 2. * lambda * vds, -delidvds1);
         let delgchgchi = 1. / gchi.mul_add(rt, 1.) / gchi.mul_add(rt, 1.);
         let delgchins = derived.gchi0;
         let r = nsa + nsb;
@@ -667,7 +667,7 @@ impl Mesa {
         let delisatisatb = isata * isata / r;
         let delisatbvgt = isatb / etavth;
         let delvsategch = -vsate / gch;
-        let delvgtvgs = 1. - vds * model.sigma0 / model.vsigma * rolloff_slope;
+        let delvgtvgs = (vds * model.sigma0 / model.vsigma).mul_add(-rolloff_slope, 1.);
         let p = delgchgchi * delgchins * delnsvgt;
         let delvsatevgt = delvsategch.mul_add(
             p,
@@ -677,7 +677,7 @@ impl Mesa {
         let gm1 = delidvsate * delvsatevgt;
         let g = delidgch.mul_add(p, gm1);
         let gm = g * delvgtvgs;
-        let gds = delidvds + g * sigma;
+        let gds = g.mul_add(sigma, delidvds);
         let values = [cdrain, gm, gds, capgs, capgd];
         if values.iter().any(|v| !v.is_finite()) {
             return Err(self.numerical("nonfinite mesa2 channel equations"));
@@ -716,7 +716,7 @@ impl Mesa {
         let q = (1. + c).powf(1. / model.gamma);
         let ns = nsm / q;
         let gchi = derived.gchi0 * ns;
-        let gch = gchi / (1. + gchi * rt);
+        let gch = gchi / gchi.mul_add(rt, 1.);
         let gchim = derived.gchi0 * nsm;
         let h = ((2. * gchim).mul_add(model.rsi, 1.) + vgte * vgte / (vl * vl)).sqrt();
         let p = gchim.mul_add(derived.trsi, 1.) + h;
@@ -755,7 +755,7 @@ impl Mesa {
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
         let delvsategch = -vsate / gch;
         let delisatmgchim = vgte * (gchim * derived.trsi).mul_add(-(1. + 1. / h), p) / (p * p);
-        let delvgtvgs = 1. - vds * model.sigma0 / model.vsigma * rolloff_slope;
+        let delvgtvgs = (vds * model.sigma0 / model.vsigma).mul_add(-rolloff_slope, 1.);
         let p = delgchgchi * delgchins * delnsnsm * delnsmvgt;
         let delvsatevgt = delvsategch.mul_add(
             p,
@@ -765,7 +765,7 @@ impl Mesa {
         );
         let g = delidvsate.mul_add(delvsatevgt, delidgch * p);
         let gm = g * delvgtvgs;
-        let gds = delidvds + g * sigma;
+        let gds = g.mul_add(sigma, delidvds);
         let values = [cdrain, gm, gds, capgs, capgd];
         if values.iter().any(|v| !v.is_finite()) {
             return Err(self.numerical("nonfinite mesa3 channel equations"));
@@ -814,10 +814,10 @@ impl Mesa {
             return Ok((0., 0., 0., derived.cf, derived.cf));
         }
         let gchi = derived.gchi0 * mu * ns;
-        let gch = gchi / (1. + gchi * rt);
-        let f = (1. + 2. * a * derived.trsi).sqrt();
-        let d = 1. + a * derived.trsi + f;
-        let e = 1. + model.tc * vgte;
+        let gch = gchi / gchi.mul_add(rt, 1.);
+        let f = (2. * a).mul_add(derived.trsi, 1.).sqrt();
+        let d = a.mul_add(derived.trsi, 1.) + f;
+        let e = model.tc.mul_add(vgte, 1.);
         let isata = a * vgte / (d * e);
         let isatb = derived.isatb0 * mu * (vgt / etavth).exp();
         let isat = isata * isatb / (isata + isatb);
@@ -827,7 +827,7 @@ impl Mesa {
         let g = (vds / vsate).powf(m);
         let h = (1. + g).powf(1. / m);
         let delidgch0 = vds / h;
-        let delidgch = delidgch0 * (1. + lambda * vds);
+        let delidgch = delidgch0 * lambda.mul_add(vds, 1.);
         let cdrain = gch * delidgch;
         let temp = if vgt > derived.vpo {
             0.
@@ -835,12 +835,12 @@ impl Mesa {
             (1. - vgt / derived.vpo).sqrt()
         };
         let cgc = self.instance.w * self.instance.l * EPSILON_GAAS / (temp + b) / model.d;
-        let c = (vsate - vdse) / (2. * vsate - vdse);
+        let c = (vsate - vdse) / 2.0f64.mul_add(vsate, -vdse);
         let c = c * c;
-        let capgs = derived.cf + 2. / 3. * cgc * (1. - c);
-        let c = vsate / (2. * vsate - vdse);
+        let capgs = (2. / 3. * cgc).mul_add(1. - c, derived.cf);
+        let c = vsate / 2.0f64.mul_add(vsate, -vdse);
         let c = c * c;
-        let capgd = derived.cf + 2. / 3. * cgc * (1. - c);
+        let capgd = (2. / 3. * cgc).mul_add(1. - c, derived.cf);
         let temp = gchi.mul_add(rt, 1.);
         let delgchgchi = 1. / (temp * temp);
         let delgchins = derived.gchi0 * mu;
@@ -858,7 +858,7 @@ impl Mesa {
         } else {
             cdrain * (vds / vsate).powf(m - 1.) / (vsate * (1. + g))
         };
-        let delidvds = delidvds0 * (1. + 2. * lambda * vds) - delidvds1;
+        let delidvds = delidvds0.mul_add(1. + 2. * lambda * vds, -delidvds1);
         let delidvsate = cdrain * g / (vsate * (1. + g));
         let delvsateisat = 1. / gch;
         let r = isata + isatb;
@@ -873,7 +873,7 @@ impl Mesa {
         let delvsategch = -vsate / gch;
         let dvgtvgs = (vds * model.sigma0 / model.vsigma).mul_add(-rolloff_slope, 1.);
         let temp = derived.gchi0 * ns * model.theta;
-        let dgchivgt = delgchins.mul_add(delnsvgte * delvgtevgt + delnsvgt, temp);
+        let dgchivgt = delgchins.mul_add(f64::mul_add(delnsvgte, delvgtevgt, delnsvgt), temp);
         let dvgtevds = delvgtevgt * sigma;
         let dgchivds = temp.mul_add(
             sigma,
@@ -1164,7 +1164,10 @@ impl Device for Mesa {
         let derived = self.derived(context.temperature, context.nominal_temperature)?;
         let vgs = voltage(self.nodes.gp) - voltage(self.nodes.sp);
         let vgd = voltage(self.nodes.gp) - voltage(self.nodes.dp);
-        let von = derived.tvto + self.model.ks * (voltage(self.nodes.sp) - self.model.vsg);
+        let von = self
+            .model
+            .ks
+            .mul_add(voltage(self.nodes.sp) - self.model.vsg, derived.tvto);
         let point = self.point(&derived, vgs, vgd, von, context.gmin)?;
         let m = self.instance.m;
         Ok(Some(match key {
@@ -1304,7 +1307,10 @@ impl Device for Mesa {
             slot::VGDPP,
             || voltage(self.nodes.gp) - voltage(self.nodes.dpp),
         );
-        let von = derived.tvto + self.model.ks * (voltage(self.nodes.sp) - self.model.vsg);
+        let von = self
+            .model
+            .ks
+            .mul_add(voltage(self.nodes.sp) - self.model.vsg, derived.tvto);
         let point = self.point(&derived, vgs, vgd, von, gmin)?;
         // `mesaload.c`'s charge storage, which C runs before its convergence
         // test because the test compares `cghat` with the *integrated* `cg`.
@@ -1490,7 +1496,10 @@ impl Device for Mesa {
         let voltage = |node: NodeId| row(node).and_then(|r| bias.get(r)).unwrap_or(0.);
         let vgs = voltage(self.nodes.gp) - voltage(self.nodes.sp);
         let vgd = voltage(self.nodes.gp) - voltage(self.nodes.dp);
-        let von = derived.tvto + self.model.ks * (voltage(self.nodes.sp) - self.model.vsg);
+        let von = self
+            .model
+            .ks
+            .mul_add(voltage(self.nodes.sp) - self.model.vsg, derived.tvto);
         let m = self.instance.m;
         let AcValues {
             gm,

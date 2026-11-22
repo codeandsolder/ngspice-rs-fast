@@ -1614,7 +1614,7 @@ impl<L: MosLevel> Device for Mosfet<L> {
                 t * f64::mul_add(
                     e.gmbs,
                     -e.vbs,
-                    f64::mul_add(e.gds, -e.vds, e.cdrain) - e.gm * e.vgs,
+                    f64::mul_add(e.gm, -e.vgs, f64::mul_add(e.gds, -e.vds, e.cdrain)),
                 ),
             )
         } else {
@@ -1624,7 +1624,7 @@ impl<L: MosLevel> Device for Mosfet<L> {
                 -t * f64::mul_add(
                     e.gmbs,
                     -e.vbd,
-                    f64::mul_add(e.gds, -(-e.vds), e.cdrain) - e.gm * e.vgd,
+                    f64::mul_add(e.gm, -e.vgd, f64::mul_add(e.gds, -(-e.vds), e.cdrain)),
                 ),
             )
         };
@@ -1711,13 +1711,13 @@ impl<L: MosLevel> Device for Mosfet<L> {
             f64::mul_add(
                 gds,
                 delvds,
-                f64::mul_add(gbd, -delvbd, cd) + gmbs * delvbs + gm * delvgs,
+                f64::mul_add(gm, delvgs, f64::mul_add(gbd, -delvbd, cd) + gmbs * delvbs),
             )
         } else {
             f64::mul_add(
                 gds,
                 delvds,
-                f64::mul_add(gbd - gmbs, -delvbd, cd) - gm * delvgd,
+                f64::mul_add(gm, -delvgd, f64::mul_add(gbd - gmbs, -delvbd, cd)),
             )
         };
         let cbhat = f64::mul_add(gbs, delvbs, f64::mul_add(gbd, delvbd, cbs + cbd));
@@ -1798,7 +1798,7 @@ impl<L: MosLevel> Device for Mosfet<L> {
             (b, sp, -gbs),
             (dp, d, -gdr),
             (dp, g, (xnrm - xrev) * gm),
-            (dp, b, -gbd + (xnrm - xrev) * gmbs),
+            (dp, b, f64::mul_add((xnrm - xrev), gmbs, -gbd)),
             (dp, sp, -f64::mul_add(xnrm, gm + gmbs, gds)),
             (sp, g, -((xnrm - xrev) * gm)),
             (sp, s, -gsr),

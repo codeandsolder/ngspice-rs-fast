@@ -815,12 +815,13 @@ impl Hfet1 {
             let d = model.a2.mul_add(c, 1.);
             let e = vdse * delvgtevgt;
             let f = model.a2 * cgd;
-            cdrain = model.a1.mul_add(d * cgd - cgs, cdrain);
-            gds = model
-                .a1
-                .mul_add(d * terms.gmd + f * e.mul_add(sigma, vgte * dvdsevds), gds);
+            cdrain = model.a1.mul_add(d.mul_add(cgd, -cgs), cdrain);
+            gds = model.a1.mul_add(
+                f.mul_add(e.mul_add(sigma, vgte * dvdsevds), d * terms.gmd),
+                gds,
+            );
             gm = model.a1.mul_add(
-                d * terms.gmg + f * e.mul_add(delvgtvgs, vgte * dvdsevgs) - terms.ggs,
+                f.mul_add(e.mul_add(delvgtvgs, vgte * dvdsevgs), d * terms.gmg) - terms.ggs,
                 gm,
             );
         }
@@ -1025,15 +1026,18 @@ impl Hfet1 {
                 let cghat = f64::mul_add(
                     ggspp0,
                     delvgspp,
-                    f64::mul_add(gmg0, delvgs, cg0) - gmd0 * delvds
-                        + ggd0 * delvgd
-                        + ggs0 * delvgs
-                        + ggdpp0 * delvgdpp,
+                    f64::mul_add(
+                        ggdpp0,
+                        delvgdpp,
+                        f64::mul_add(gmg0, delvgs, cg0) - gmd0 * delvds
+                            + ggd0 * delvgd
+                            + ggs0 * delvgs,
+                    ),
                 );
                 let cdhat = f64::mul_add(
                     ggd0,
                     -delvgd,
-                    f64::mul_add(gm0, delvgs, cd0) + gds0 * delvds,
+                    f64::mul_add(gds0, delvds, f64::mul_add(gm0, delvgs, cd0)),
                 ) - f64::mul_add(gmd0, -delvds, gmg0 * delvgs);
                 // `HFETAload` limits only through `DEVfetlim`.
                 let vgs = limiting::fetlim(vgs, vgs0, derived.tvto);
@@ -1433,9 +1437,11 @@ impl Device for Hfet1 {
             * f64::mul_add(
                 ggdpp,
                 -vgdpp,
-                f64::mul_add(ggd, -point.vgd, point.cgd + cgdpp)
-                    - gmg * point.vgs
-                    - gmd * point.vds,
+                f64::mul_add(
+                    gmd,
+                    -point.vds,
+                    f64::mul_add(ggd, -point.vgd, point.cgd + cgdpp) - gmg * point.vgs,
+                ),
             );
         let ceqgs = pol
             * f64::mul_add(
@@ -1453,12 +1459,19 @@ impl Device for Hfet1 {
         context.stamp_rhs(
             n.dp,
             m * pol.mul_add(
-                f64::mul_add(ggd, -point.vgd, point.cgd) - gmg * point.vgs - gmd * point.vds,
+                f64::mul_add(
+                    gmd,
+                    -point.vds,
+                    f64::mul_add(ggd, -point.vgd, point.cgd) - gmg * point.vgs,
+                ),
                 -cdreq,
             ),
         )?;
         context.stamp_rhs(n.dpp, m * pol * f64::mul_add(ggdpp, -vgdpp, cgdpp))?;
-        context.stamp_rhs(n.sp, m * pol.mul_add(point.cgs - ggs * point.vgs, cdreq))?;
+        context.stamp_rhs(
+            n.sp,
+            m * pol.mul_add(f64::mul_add(ggs, -point.vgs, point.cgs), cdreq),
+        )?;
         context.stamp_rhs(n.spp, m * pol * f64::mul_add(ggspp, -vgspp, cgspp))?;
         for (row, col, value) in [
             (n.d, n.d, m * gdpr),
