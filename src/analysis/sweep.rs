@@ -144,7 +144,7 @@ impl SweepSpec {
         Ok(self.exact_values()?.collect())
     }
 
-    fn range(&self) -> SweepRange {
+    const fn range(&self) -> SweepRange {
         SweepRange {
             start: self.start,
             stop: self.stop,
@@ -168,7 +168,7 @@ impl SweepSpec {
     /// accumulation for temperature axes.
     ///
     /// # Errors
-    /// As [Self::grid], including bounds on accumulated progress and work.
+    /// As [`Self::grid`], including bounds on accumulated progress and work.
     pub fn accumulated_grid(&self) -> SpiceResult<Vec<Real>> {
         let expected = self.exact_values()?.len();
         let temperature = self.target == SweepTarget::Temperature;
@@ -209,7 +209,8 @@ struct ExactGrid {
 impl ExactGrid {
     fn values(self) -> impl ExactSizeIterator<Item = Real> + Clone {
         let SweepRange { start, stop, step } = self.range;
-        (0..self.intervals + 1).map(move |i| {
+        let point_count = self.intervals + 1;
+        (0..point_count).map(move |i| {
             if self.snap_stop && i == self.intervals {
                 stop
             } else {

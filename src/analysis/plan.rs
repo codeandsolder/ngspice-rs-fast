@@ -148,10 +148,10 @@ pub(super) struct TransientOptions {
 impl TransientOverrides {
     fn resolve(self, config: &RunConfig) -> SpiceResult<TransientOptions> {
         let deck = config.transient();
-        let max_order = self.max_order.or(config.maxord()).unwrap_or(2);
+        let max_order = self.max_order.or_else(|| config.maxord()).unwrap_or(2);
         let method = self
             .method
-            .or(config.method())
+            .or_else(|| config.method())
             .unwrap_or(IntegrationFamily::Trapezoidal)
             .with_order(max_order);
         method.validate_runtime()?;
@@ -346,7 +346,7 @@ pub(super) fn resolve_options(
     let specific = match input.kind {
         AnalysisKind::Transient => SpecificOptions::Transient(overrides.tran.resolve(config)?),
         AnalysisKind::DcSweep => SpecificOptions::Dc {
-            point_iterations: overrides.point_iterations.or(config.dc().itl2),
+            point_iterations: overrides.point_iterations.or_else(|| config.dc().itl2),
         },
         _ => SpecificOptions::Ordinary,
     };
@@ -414,6 +414,37 @@ pub struct AnalysisPlan {
     nodesets: Vec<crate::analysis::NodeCondition>,
 }
 
+fn validate_input(input: &AnalysisInput) -> SpiceResult<()> {
+    let retains = matches!(
+        input.kind,
+        AnalysisKind::Ac
+            | AnalysisKind::PoleZero
+            | AnalysisKind::SParameter
+            | AnalysisKind::Noise
+            | AnalysisKind::Distortion
+    );
+    if input.uic && input.kind != AnalysisKind::Transient {
+        return Err(unsupported("uic is valid only for .tran"));
+    }
+    if input.noise.is_some() && input.kind != AnalysisKind::Noise {
+        return Err(unsupported("noise options are valid only for .noise"));
+    }
+    if input.keep_op_info.is_some() && !retains {
+        return Err(unsupported(
+            "retaining the bias plot is not supported for this analysis",
+        ));
+    }
+    for entry in input.initial_conditions.iter().chain(&input.nodesets) {
+        if !entry.value.is_finite() {
+            return Err(crate::primitives::SpiceError::parse(
+                entry.location.clone(),
+                format!("nonfinite node condition for V({})", entry.node),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl AnalysisPlan {
     pub(super) fn resolve(
         input: AnalysisInput,
@@ -425,25 +456,7 @@ impl AnalysisPlan {
             ac, companion::TransientPlan, disto, noise, pz, sens, sparam, sweep, tf,
         };
         let kind = input.kind;
-        let retains = matches!(
-            kind,
-            AnalysisKind::Ac
-                | AnalysisKind::PoleZero
-                | AnalysisKind::SParameter
-                | AnalysisKind::Noise
-                | AnalysisKind::Distortion
-        );
-        if input.uic && kind != AnalysisKind::Transient {
-            return Err(unsupported("uic is valid only for .tran"));
-        }
-        if input.noise.is_some() && kind != AnalysisKind::Noise {
-            return Err(unsupported("noise options are valid only for .noise"));
-        }
-        if input.keep_op_info.is_some() && !retains {
-            return Err(unsupported(
-                "retaining the bias plot is not supported for this analysis",
-            ));
-        }
+        validate_input(&input)?;
         let retain_bias = input.keep_op_info.unwrap_or(deck_keep_op_info);
         let ResolvedOptions {
             positional,
@@ -744,7 +757,7 @@ impl AnalysisPlan {
     /// Transients stream directly; other analyses replay their completed plot.
     ///
     /// # Errors
-    /// As [Self::run], or an error from the point sink.
+    /// As [`Self::run`], or an error from the point sink.
     pub fn run_into(
         &self,
         circuit: &mut crate::devices::Circuit,
@@ -948,6 +961,21 @@ mod boundary_tests {
         op.keep_op_info = None;
         op.uic = true;
         assert!(config.plan(op).is_err());
+    }
+
+    #[test]
+    fn programmatic_node_hints_reject_nonfinite_values_at_resolution() {
+        let location = crate::primitives::SourceLoc::new("input.cir".into(), 7, 4);
+        let mut input = AnalysisInput::new(AnalysisKind::OperatingPoint);
+        input.nodesets.push(crate::analysis::NodeCondition {
+            node: "a".into(),
+            value: Real::NAN,
+            location: location.clone(),
+        });
+        assert!(matches!(
+            input.resolve(),
+            Err(SpiceError::Parse { location: rejected, .. }) if rejected == location
+        ));
     }
 
     #[test]

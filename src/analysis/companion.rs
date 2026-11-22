@@ -179,11 +179,11 @@ impl TransientPlan {
         options: crate::analysis::plan::TransientOptions,
         newton: &crate::analysis::newton::NewtonOptions,
     ) -> SpiceResult<Self> {
-        let [step, stop, start, max_step] = Self::time_bounds(positional)?;
+        let [output_step, end_time, start_time, max_step] = Self::time_bounds(positional)?;
         Ok(Self {
-            step,
-            stop,
-            start,
+            step: output_step,
+            stop: end_time,
+            start: start_time,
             max_step,
             method: options.method,
             max_order: options.max_order,

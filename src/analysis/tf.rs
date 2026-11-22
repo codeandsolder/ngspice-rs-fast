@@ -408,7 +408,7 @@ pub(super) fn run(
         });
     }
     let names = names(
-        &card,
+        card,
         pos_name.as_deref().unwrap_or_default(),
         neg_name.as_deref(),
     );

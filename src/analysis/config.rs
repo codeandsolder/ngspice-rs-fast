@@ -1045,7 +1045,7 @@ impl RunConfig {
     /// Resolve all analysis cards before scheduling or executing any of them.
     ///
     /// # Errors
-    /// As [Self::plan_for], at the invalid card.
+    /// As [`Self::plan_for`], at the invalid card.
     pub fn plans_for(
         &self,
         cards: &[AnalysisCard],

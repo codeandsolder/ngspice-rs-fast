@@ -1155,7 +1155,7 @@ pub(super) fn run(
             &solved.values,
             model,
             probe,
-            grid,
+            grid.iter().copied(),
             &mut plot,
         )?;
     } else {
@@ -1308,7 +1308,7 @@ fn run_ac(
     bias: &Vector,
     model: crate::devices::ModelContext,
     probe: Probe,
-    grid: &[Real],
+    grid: impl Iterator<Item = Real>,
     plot: &mut Plot,
 ) -> SpiceResult<()> {
     let circuit = walk.circuit;
@@ -1319,7 +1319,7 @@ fn run_ac(
         zeros: Vector::zeros(circuit.unknown_count()),
         state: vec![0.; circuit.state_history().len()],
     };
-    for &frequency in grid {
+    for frequency in grid {
         let omega = 2. * std::f64::consts::PI * frequency;
         let reset = walk.reset_ac()?;
         let system = sweep.assemble(walk, &reset, omega)?;
