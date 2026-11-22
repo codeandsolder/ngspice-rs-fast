@@ -5,42 +5,66 @@
 //! which bind tighter than `+` `-`, all left associative (`2^3^2` is 64 in C).
 //! A sign at the start of an expression, group or argument behaves like the
 //! additive operator (`-2^2` is -4); after a binary operator C only accepts
-//! `-` before a numeric literal. Multiplicative and power levels use winnow's
-//! `expression()` precedence climber; the additive level is a fold so the
-//! leading sign can apply to the first term only.
+//! `-` before a numeric literal. All binary levels use incremental left folds.
 //!
 //! Every failure after a recognised prefix is a committed error carrying a
 //! byte column. Nothing is evaluated.
 
 use crate::primitives::{SourceLoc, SpiceError, SpiceResult, parse_numparam_number_prefix};
 use winnow::Parser as _;
-use winnow::combinator::{Infix, alt, expression, opt, peek, repeat, separated};
+use winnow::combinator::{opt, peek, separated};
 use winnow::error::{AddContext, ErrMode, ModalResult, ParserError};
 use winnow::stream::{Stateful, Stream};
 use winnow::token::{any, literal, one_of, take, take_while};
 
 use crate::netlist::expr::{
-    BinaryOp, EXCLUDED_FUNCTIONS, Expr, ExprKind, Function, MAX_NESTING, ParameterExpression,
-    SourceSpan, UnaryOp,
+    BinaryOp, EXCLUDED_FUNCTIONS, Expr, ExprKind, Function, MAX_NESTING, MAX_TREE_DEPTH,
+    MAX_TREE_NODES, ParameterExpression, SourceSpan, UnaryOp,
 };
 use crate::netlist::source::SourcePosition;
 use crate::netlist::token::{Token, TokenKind};
 
 pub(super) const C_REFERENCE: &str = "src/frontend/numparam/xpressn.c";
 
-/// Read-only position context plus the nesting counter.
+/// Position context, syntactic nesting, and remaining expression-tree budget.
 #[derive(Debug)]
 pub(super) struct Ctx<'a> {
     pub origin: SourcePosition<'a>,
     /// Byte length of the parsed text.
     pub total: usize,
     pub depth: usize,
+    pub remaining_nodes: usize,
     /// `.func` formals named like a built-in function: a bare use binds to
     /// the formal, a call is an error (as in C's numparam). Empty elsewhere.
     pub shadowing: &'a [String],
 }
 
 impl Ctx<'_> {
+    /// Charge a node before constructing its parent or allocating child boxes.
+    pub(super) fn node<T>(
+        &mut self,
+        at: usize,
+        child_height: usize,
+        build: impl FnOnce() -> T,
+    ) -> Res<Built<T>> {
+        if child_height >= MAX_TREE_DEPTH {
+            return Err(cut(
+                at,
+                format!("expression structural depth limit ({MAX_TREE_DEPTH}) exceeded"),
+            ));
+        }
+        self.remaining_nodes = self.remaining_nodes.checked_sub(1).ok_or_else(|| {
+            cut(
+                at,
+                format!("expression node limit ({MAX_TREE_NODES}) exceeded"),
+            )
+        })?;
+        Ok(Built {
+            node: build(),
+            height: child_height + 1,
+        })
+    }
+
     pub(super) fn location(&self, remaining: usize) -> SourceLoc {
         self.position(remaining).location()
     }
@@ -48,6 +72,12 @@ impl Ctx<'_> {
     pub(super) const fn position(&self, remaining: usize) -> SourcePosition<'_> {
         self.origin.advance(self.total - remaining)
     }
+}
+
+/// Parser-only bookkeeping; the public AST has no redundant cached metadata.
+pub(super) struct Built<T> {
+    pub node: T,
+    pub height: usize,
 }
 
 pub(super) type In<'a> = Stateful<&'a str, Ctx<'a>>;
@@ -116,6 +146,7 @@ pub(super) fn into_error(origin: SourcePosition<'_>, total: usize, fail: Fail) -
         origin,
         total,
         depth: 0,
+        remaining_nodes: MAX_TREE_NODES,
         shadowing: &[],
     }
     .location(fail.remaining);
@@ -197,7 +228,7 @@ const fn leave(input: &mut In<'_>) {
 }
 
 /// `sum := [sign] term { ('+' | '-') term }`
-fn sum(input: &mut In<'_>) -> Res<Expr> {
+fn sum(input: &mut In<'_>) -> Res<Built<Expr>> {
     ws.parse_next(input)?;
     let open = input.eof_offset();
     let lead = opt(one_of(['+', '-'])).parse_next(input)?;
@@ -211,23 +242,29 @@ fn sum(input: &mut In<'_>) -> Res<Expr> {
             };
             let span = SourceSpan {
                 start: input.state.location(open),
-                end: first.span.end.clone(),
-                logical: input.state.position(open).logical_offset()..first.span.logical.end,
+                end: first.node.span.end.clone(),
+                logical: input.state.position(open).logical_offset()..first.node.span.logical.end,
             };
-            Expr {
+            input.state.node(open, first.height, || Expr {
                 kind: ExprKind::Unary {
                     op,
-                    operand: Box::new(first),
+                    operand: Box::new(first.node),
                 },
                 span,
-            }
+            })?
         }
         None => first,
     };
-    let rest: Vec<(BinaryOp, Expr)> = repeat(0.., (additive, term)).parse_next(input)?;
-    Ok(rest
-        .into_iter()
-        .fold(first, |lhs, (op, rhs)| binary(op, lhs, rhs)))
+    let mut lhs = first;
+    loop {
+        ws(input)?;
+        let at = input.eof_offset();
+        let Some(op) = opt(additive).parse_next(input)? else {
+            return Ok(lhs);
+        };
+        let rhs = term(input)?;
+        lhs = binary(input, at, op, lhs, rhs)?;
+    }
 }
 
 fn additive(input: &mut In<'_>) -> Res<BinaryOp> {
@@ -243,46 +280,69 @@ fn additive(input: &mut In<'_>) -> Res<BinaryOp> {
         .parse_next(input)
 }
 
-fn binary(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
+fn binary(
+    input: &mut In<'_>,
+    at: usize,
+    op: BinaryOp,
+    lhs: Built<Expr>,
+    rhs: Built<Expr>,
+) -> Res<Built<Expr>> {
     let span = SourceSpan {
-        start: lhs.span.start.clone(),
-        end: rhs.span.end.clone(),
-        logical: lhs.span.logical.start..rhs.span.logical.end,
+        start: lhs.node.span.start.clone(),
+        end: rhs.node.span.end.clone(),
+        logical: lhs.node.span.logical.start..rhs.node.span.logical.end,
     };
-    Expr {
+    input.state.node(at, lhs.height.max(rhs.height), || Expr {
         kind: ExprKind::Binary {
             op,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
+            lhs: Box::new(lhs.node),
+            rhs: Box::new(rhs.node),
         },
         span,
+    })
+}
+
+/// Multiplication/division and power are separate left folds. No reassociation.
+fn term(input: &mut In<'_>) -> Res<Built<Expr>> {
+    let mut lhs = power(input)?;
+    loop {
+        ws(input)?;
+        let at = input.eof_offset();
+        let op = if input.input.starts_with("**") {
+            return Ok(lhs);
+        } else if input.input.starts_with('*') {
+            BinaryOp::Mul
+        } else if input.input.starts_with('/') {
+            BinaryOp::Div
+        } else {
+            return Ok(lhs);
+        };
+        take(1usize).void().parse_next(input)?;
+        let rhs = power(input)?;
+        lhs = binary(input, at, op, lhs, rhs)?;
     }
 }
 
-type InfixOp<'a> = Infix<In<'a>, Expr, ErrMode<Fail>>;
-
-/// Binding powers: `^`/`**` (30) over `*` `/` (20), all left associative as in
-/// C's accumulator machine (`xpressn.c` levels 2 and 3).
-fn multiplicative<'a>(input: &mut In<'a>) -> Res<InfixOp<'a>> {
-    ws.parse_next(input)?;
-    let power = Infix::Left(30, |_, lhs, rhs| Ok(binary(BinaryOp::Pow, lhs, rhs)));
-    let multiply = Infix::Left(20, |_, lhs, rhs| Ok(binary(BinaryOp::Mul, lhs, rhs)));
-    let divide = Infix::Left(20, |_, lhs, rhs| Ok(binary(BinaryOp::Div, lhs, rhs)));
-    alt((
-        literal("**").value(power.clone()),
-        literal("^").value(power),
-        literal("*").value(multiply),
-        literal("/").value(divide),
-    ))
-    .parse_next(input)
-}
-
-fn term(input: &mut In<'_>) -> Res<Expr> {
-    expression(operand).infix(multiplicative).parse_next(input)
+fn power(input: &mut In<'_>) -> Res<Built<Expr>> {
+    let mut lhs = operand(input)?;
+    loop {
+        ws(input)?;
+        let at = input.eof_offset();
+        let width = if input.input.starts_with("**") {
+            2usize
+        } else if input.input.starts_with('^') {
+            1
+        } else {
+            return Ok(lhs);
+        };
+        take(width).void().parse_next(input)?;
+        let rhs = operand(input)?;
+        lhs = binary(input, at, BinaryOp::Pow, lhs, rhs)?;
+    }
 }
 
 /// Every operand position is mandatory, so failures here are committed.
-fn operand(input: &mut In<'_>) -> Res<Expr> {
+fn operand(input: &mut In<'_>) -> Res<Built<Expr>> {
     ws.parse_next(input)?;
     let start = input.eof_offset();
     match peek(opt(any)).parse_next(input)? {
@@ -299,7 +359,7 @@ fn operand(input: &mut In<'_>) -> Res<Expr> {
     }
 }
 
-fn number(input: &mut In<'_>) -> Res<Expr> {
+fn number(input: &mut In<'_>) -> Res<Built<Expr>> {
     let start = input.eof_offset();
     let before = input.input;
     // numparam's fetchnumber(): %lG plus parseunit(), not INPevaluate.
@@ -320,18 +380,19 @@ fn number(input: &mut In<'_>) -> Res<Expr> {
             format!("numeric literal '{spelling}' overflows to a non-finite value"),
         ));
     }
-    Ok(Expr {
+    let span = span(input, start, end);
+    input.state.node(start, 0, || Expr {
         kind: ExprKind::Number {
             value: parsed.value,
             spelling: spelling.to_owned(),
         },
-        span: span(input, start, end),
+        span,
     })
 }
 
 /// `-` directly before a numeric literal, valid after a binary operator
 /// (xpressn.c's `negate` flag, which only `fetchnumber()` consumes).
-fn signed_number(input: &mut In<'_>) -> Res<Expr> {
+fn signed_number(input: &mut In<'_>) -> Res<Built<Expr>> {
     let start = input.eof_offset();
     literal("-").void().parse_next(input)?;
     ws.parse_next(input)?;
@@ -349,28 +410,29 @@ fn signed_number(input: &mut In<'_>) -> Res<Expr> {
     let literal_value = number(input)?;
     let span = SourceSpan {
         start: input.state.location(start),
-        end: literal_value.span.end.clone(),
-        logical: input.state.position(start).logical_offset()..literal_value.span.logical.end,
+        end: literal_value.node.span.end.clone(),
+        logical: input.state.position(start).logical_offset()..literal_value.node.span.logical.end,
     };
-    Ok(Expr {
+    input.state.node(start, literal_value.height, || Expr {
         kind: ExprKind::Unary {
             op: UnaryOp::Minus,
-            operand: Box::new(literal_value),
+            operand: Box::new(literal_value.node),
         },
         span,
     })
 }
 
-fn group(input: &mut In<'_>) -> Res<Expr> {
+fn group(input: &mut In<'_>) -> Res<Built<Expr>> {
     let start = input.eof_offset();
     literal("(").void().parse_next(input)?;
     enter(input, start)?;
     let inner = sum.parse_next(input)?;
     close(input, start)?;
     leave(input);
-    Ok(Expr {
-        kind: ExprKind::Group(Box::new(inner)),
-        span: span(input, start, input.eof_offset()),
+    let span = span(input, start, input.eof_offset());
+    input.state.node(start, inner.height, || Expr {
+        kind: ExprKind::Group(Box::new(inner.node)),
+        span,
     })
 }
 
@@ -402,7 +464,7 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
     Function::from_name(name).is_some() || EXCLUDED_FUNCTIONS.contains(&name)
 }
 
-fn identifier_or_call(input: &mut In<'_>) -> Res<Expr> {
+fn identifier_or_call(input: &mut In<'_>) -> Res<Built<Expr>> {
     let start = input.eof_offset();
     let name: &str = (one_of(is_ident_start), take_while(0.., is_ident_continue))
         .take()
@@ -422,9 +484,10 @@ fn identifier_or_call(input: &mut In<'_>) -> Res<Expr> {
                 ),
             ));
         }
-        return Ok(Expr {
+        let span = span(input, start, after);
+        return input.state.node(start, 0, || Expr {
             kind: ExprKind::Identifier(lowered),
-            span: span(input, start, after),
+            span,
         });
     }
     if !call {
@@ -434,9 +497,10 @@ fn identifier_or_call(input: &mut In<'_>) -> Res<Expr> {
                 format!("function name '{name}' requires an argument list"),
             ));
         }
-        return Ok(Expr {
+        let span = span(input, start, after);
+        return input.state.node(start, 0, || Expr {
             kind: ExprKind::Identifier(lowered),
-            span: span(input, start, after),
+            span,
         });
     }
     let Some(function) = Function::from_name(&lowered) else {
@@ -446,7 +510,7 @@ fn identifier_or_call(input: &mut In<'_>) -> Res<Expr> {
     let open = input.eof_offset();
     literal("(").void().parse_next(input)?;
     enter(input, open)?;
-    let arguments: Vec<Expr> = separated(1.., sum, (ws, literal(","))).parse_next(input)?;
+    let arguments: Vec<Built<Expr>> = separated(1.., sum, (ws, literal(","))).parse_next(input)?;
     close(input, open)?;
     leave(input);
     if arguments.len() != function.arity() {
@@ -460,33 +524,40 @@ fn identifier_or_call(input: &mut In<'_>) -> Res<Expr> {
             ),
         ));
     }
-    Ok(Expr {
+    let height = arguments.iter().map(|arg| arg.height).max().unwrap_or(0);
+    let span = span(input, start, input.eof_offset());
+    input.state.node(start, height, || Expr {
         kind: ExprKind::Call {
             function,
-            arguments,
+            arguments: arguments.into_iter().map(|arg| arg.node).collect(),
         },
-        span: span(input, start, input.eof_offset()),
+        span,
     })
 }
 
 /// `name(args)` for a name outside the allowlist: a user `.func` call
 /// (resolved during evaluation). Zero arguments are allowed (`f()`).
-fn user_call(input: &mut In<'_>, start: usize, name: String) -> Res<Expr> {
+fn user_call(input: &mut In<'_>, start: usize, name: String) -> Res<Built<Expr>> {
     ws.parse_next(input)?;
     let open = input.eof_offset();
     literal("(").void().parse_next(input)?;
     enter(input, open)?;
     let empty = peek((ws, opt(literal(")")))).parse_next(input)?.1.is_some();
-    let arguments: Vec<Expr> = if empty {
+    let arguments: Vec<Built<Expr>> = if empty {
         Vec::new()
     } else {
         separated(1.., sum, (ws, literal(","))).parse_next(input)?
     };
     close(input, open)?;
     leave(input);
-    Ok(Expr {
-        kind: ExprKind::UserCall { name, arguments },
-        span: span(input, start, input.eof_offset()),
+    let height = arguments.iter().map(|arg| arg.height).max().unwrap_or(0);
+    let span = span(input, start, input.eof_offset());
+    input.state.node(start, height, || Expr {
+        kind: ExprKind::UserCall {
+            name,
+            arguments: arguments.into_iter().map(|arg| arg.node).collect(),
+        },
+        span,
     })
 }
 
@@ -525,16 +596,30 @@ pub(super) fn parse_func_body(
     quoted: bool,
     shadowing: &[String],
 ) -> SpiceResult<ParameterExpression> {
+    parse_with_budget(text, origin, braced, quoted, shadowing, MAX_TREE_NODES)
+        .map(|(expression, _, _)| expression)
+}
+
+/// Parse an embedded value with the enclosing expression's remaining budget.
+pub(super) fn parse_with_budget(
+    text: &str,
+    origin: SourcePosition<'_>,
+    braced: bool,
+    quoted: bool,
+    shadowing: &[String],
+    remaining_nodes: usize,
+) -> SpiceResult<(ParameterExpression, usize, usize)> {
     let mut input = In {
         input: text,
         state: Ctx {
             origin,
             total: text.len(),
             depth: 0,
+            remaining_nodes,
             shadowing,
         },
     };
-    let run = |input: &mut In<'_>| -> Res<Expr> {
+    let run = |input: &mut In<'_>| -> Res<Built<Expr>> {
         let root = sum(input)?;
         ws.parse_next(input)?;
         let here = input.eof_offset();
@@ -551,13 +636,17 @@ pub(super) fn parse_func_body(
         return Err(SpiceError::parse(origin.location(), "empty expression"));
     }
     match run(&mut input) {
-        Ok(root) => Ok(ParameterExpression {
-            text: text.to_owned(),
-            braced: braced || quoted,
-            quoted,
-            span: SourceSpan::from_positions(origin, origin.advance(text.len())),
-            root,
-        }),
+        Ok(root) => Ok((
+            ParameterExpression {
+                text: text.to_owned(),
+                braced: braced || quoted,
+                quoted,
+                span: SourceSpan::from_positions(origin, origin.advance(text.len())),
+                root: root.node,
+            },
+            root.height,
+            input.state.remaining_nodes,
+        )),
         Err(ErrMode::Backtrack(fail) | ErrMode::Cut(fail)) => {
             Err(into_error(origin, text.len(), fail))
         }
