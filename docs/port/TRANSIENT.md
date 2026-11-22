@@ -121,6 +121,12 @@ the run with an error; no partial plot is returned.
   | Shuffled | 16384 | 75.649 → 26.197 | 27.349 → 5.030 |
   | Shuffled | 65536 | 1156.176 → 165.627 | 705.961 → 42.209 |
 
+  Test-only counters on the 65536-event shuffled sequence measured
+  1,074,070,895 vector lookup visits and 3,221,158,545 shifted entries
+  before indexing, versus 6,865,739 tree-key comparisons (node-local
+  movement is not counted). The bitwise sequence oracle passed all
+  75,000 randomized transitions.
+
   At each step the driver clears entries at or
   within `CKTminBreak` of the current time, cuts the step to `CKTbreaks[0] -
   CKTtime` when it would pass it (the landing time is `CKTtime + CKTdelta`,
