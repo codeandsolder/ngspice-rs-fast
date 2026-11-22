@@ -153,7 +153,7 @@ fn modified_load(
 
 fn prepared_load(
     circuit: &Circuit,
-    small_signal: &crate::analysis::ac::SmallSignal,
+    small_signal: &crate::analysis::ac::SmallSignal<'_>,
     context: &crate::analysis::AnalysisContext,
     setups: u32,
     input: [Option<usize>; 2],
@@ -337,7 +337,7 @@ mod tests {
                 None
             };
             let signal = crate::analysis::ac::SmallSignal::prepare(
-                &mut circuit,
+                &circuit,
                 &plan,
                 &context,
                 plan.dc_settings().clone(),

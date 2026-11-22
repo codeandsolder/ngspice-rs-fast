@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::devices::{
-    Circuit, Device, Forcing, IterationPhase, LoadRequest, ModelContext, TrialState,
+    Circuit, Device, Forcing, IterationPhase, LoadRequest, ModelContext, PreparedRun, TrialState,
 };
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
@@ -111,7 +111,7 @@ struct PointLoads<'a, 'b> {
     sources: &'a [(&'a str, Real)],
     time: Option<(Real, Forcing)>,
     previous: Option<&'a TrialState>,
-    replacements: &'a [(usize, Box<dyn Device>)],
+    point: &'a crate::devices::circuit::PreparedPoint,
     mutual: Option<crate::devices::circuit::PreparedMutualTerms>,
     scratch: Option<(SparseMatrix, Vector)>,
     currents: BTreeMap<usize, Vec<Real>>,
@@ -138,11 +138,7 @@ impl PointLoads<'_, '_> {
                     "isolated observation load does not match the circuit numbering",
                 ));
             }
-            self.mutual =
-                Some(self.circuit.mutual_terms_with_replacements(
-                    self.request.model_context,
-                    self.replacements,
-                )?);
+            self.mutual = Some(self.point.mutual(self.circuit)?);
         }
         let n = self.circuit.unknown_count();
         let (matrix, rhs) = self
@@ -287,6 +283,18 @@ impl Circuit {
         time: Option<(Real, crate::devices::Forcing)>,
         previous: Option<&crate::devices::TrialState>,
     ) -> SpiceResult<Vec<Complex>> {
+        self.prepare_run()
+            .observe_real(request, sources, time, previous)
+    }
+
+    fn observe_real_prepared(
+        &self,
+        run: &PreparedRun<'_>,
+        request: &LoadRequest<'_>,
+        sources: &[(&str, Real)],
+        time: Option<(Real, Forcing)>,
+        previous: Option<&TrialState>,
+    ) -> SpiceResult<Vec<Complex>> {
         self.validate_history(request.history)?;
         if let Some(trial) = previous {
             request.history.check_trial(trial)?;
@@ -294,14 +302,14 @@ impl Circuit {
         if self.runtime.observations.names.is_empty() {
             return Ok(Vec::new());
         }
-        let replacements = self.replacements(request.model_context)?;
+        let point = run.point(request.model_context)?;
         let mut loads = PointLoads {
             circuit: self,
             request,
             sources,
             time,
             previous,
-            replacements: &replacements,
+            point: &point,
             mutual: None,
             scratch: None,
             currents: BTreeMap::new(),
@@ -314,10 +322,7 @@ impl Circuit {
                 let index = observation_index(self, instance, hint).ok_or_else(|| {
                     SpiceError::circuit(format!("unknown observation device {instance}"))
                 })?;
-                let device: &dyn Device = replacements
-                    .iter()
-                    .find(|(i, _)| *i == index)
-                    .map_or_else(|| self.devices()[index].as_ref(), |(_, d)| d.as_ref());
+                let device = point.device(self, index);
                 let power = matches!(key, "p" | "power");
                 let value = if let Some(port) = terminal(device, key).or_else(|| power.then_some(0))
                 {
@@ -387,17 +392,22 @@ impl Circuit {
     /// # Errors
     /// A current/power or unsupported scalar query, or nonfinite parameter.
     pub fn observe_parameters(&self, context: &ModelContext) -> SpiceResult<Vec<Complex>> {
-        let replacements = self.replacements(context)?;
+        self.prepare_run().observe_parameters(context)
+    }
+
+    fn observe_parameters_prepared(
+        &self,
+        run: &PreparedRun<'_>,
+        context: &ModelContext,
+    ) -> SpiceResult<Vec<Complex>> {
+        let point = run.point(context)?;
         self.runtime
             .observations
             .iter()
             .map(|(name, hint)| {
                 let (instance, key) = query(name)?;
                 let index = observation_index(self, instance, hint).ok_or_else(|| gap(name))?;
-                let device: &dyn Device = replacements
-                    .iter()
-                    .find(|(i, _)| *i == index)
-                    .map_or_else(|| self.devices()[index].as_ref(), |(_, d)| d.as_ref());
+                let device = point.device(self, index);
                 if terminal(device, key).is_some() || matches!(key, "p" | "power") {
                     return Err(gap(&format!("{name}: AC current/power ask")));
                 }
@@ -410,6 +420,29 @@ impl Circuit {
                 Ok(Complex::real(value))
             })
             .collect()
+    }
+}
+
+impl PreparedRun<'_> {
+    /// Observe a real point with the run's already prepared devices.
+    /// # Errors
+    /// As [`Circuit::observe_real`].
+    pub fn observe_real(
+        &self,
+        request: &LoadRequest<'_>,
+        sources: &[(&str, Real)],
+        time: Option<(Real, Forcing)>,
+        previous: Option<&TrialState>,
+    ) -> SpiceResult<Vec<Complex>> {
+        self.circuit()
+            .observe_real_prepared(self, request, sources, time, previous)
+    }
+
+    /// Observe scalar device parameters in the prepared context.
+    /// # Errors
+    /// As [`Circuit::observe_parameters`].
+    pub fn observe_parameters(&self, context: &ModelContext) -> SpiceResult<Vec<Complex>> {
+        self.circuit().observe_parameters_prepared(self, context)
     }
 }
 
