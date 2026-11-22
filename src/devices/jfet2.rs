@@ -332,15 +332,17 @@ fn qgg(
     let vnr = d1_xc * (veff - vto);
     let vnrt = (vnr * vnr + 0.04).sqrt();
     let vnew = veff + 0.5 * (vnrt - vnr);
-    let (ext, qrt, cgso_eff);
+    let (ext, qrt, cgso_eff, charge_voltage);
     if vnew < vmax {
         ext = 0.;
         qrt = (1. - vnew / pb).sqrt();
+        charge_voltage = vnew;
         cgso_eff = 0.5 * cgso / qrt * (1. + xc + d1_xc * vnr / vnrt);
     } else {
         let vx = 0.5 * (vnew - vmax);
         let par = 1. + vx / (pb - vmax);
         qrt = (1. - vmax / pb).sqrt();
+        charge_voltage = vmax;
         ext = vx * (1. + par) / qrt;
         cgso_eff = 0.5 * cgso / qrt * (1. + xc + d1_xc * vnr / vnrt) * par;
     }
@@ -350,7 +352,10 @@ fn qgg(
     let cgs = cgso_eff * (cplus + gamma) + cgdo * (cminus + gamma);
     let cgd = cgso_eff * (cminus - gamma) + cgdo * (cplus - gamma);
     (
-        cgso * ((pb + pb) * (1. - qrt) + ext) + cgdo * (veff - vert),
+        cgso.mul_add(
+            jfet::depletion_voltage(charge_voltage, qrt) + ext,
+            cgdo * (veff - vert),
+        ),
         cgs,
         cgd,
     )
@@ -363,7 +368,7 @@ fn forward_diode(v: Real, isat: Real, nvt: Real, gmin: Real) -> (Real, Real) {
     if arg > FX {
         if arg < MX {
             let zz = isat * arg.exp();
-            (zz - isat + gmin * v, zz / nvt + gmin)
+            (isat.mul_add(arg.exp_m1(), gmin * v), zz / nvt + gmin)
         } else {
             let zz = isat * EMX;
             (zz * (arg - MX + 1.) - isat + gmin * v, zz / nvt + gmin)
@@ -380,7 +385,7 @@ fn breakdown((mut i, mut g): (Real, Real), v: Real, ibd: Real, vbd: Real) -> (Re
         if arg < MX {
             let zz = ibd * arg.exp();
             g += zz / vbd;
-            i -= zz - ibd;
+            i = (-ibd).mul_add(arg.exp_m1(), i);
         } else {
             let zz = ibd * EMX;
             g += zz / vbd;

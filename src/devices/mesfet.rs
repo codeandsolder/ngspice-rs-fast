@@ -249,7 +249,7 @@ fn qggnew(
         (vnew3 - VMAX) / (1. - VMAX / phib).sqrt()
     };
     let qroot = (1. - vnew1 / phib).sqrt();
-    let qggval = cgs * (2. * phib * (1. - qroot) + ext) + cgd * veff2;
+    let qggval = cgs.mul_add(jfet::depletion_voltage(vnew1, qroot) + ext, cgd * veff2);
     let par1 = 0.5 * (1. + (veff1 - vto) / vnroot);
     let cfact = (vgs - vgd) / veroot;
     let cplus = 0.5 * (1. + cfact);

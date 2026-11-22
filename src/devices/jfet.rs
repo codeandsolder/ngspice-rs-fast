@@ -335,6 +335,12 @@ impl Model {
     }
 }
 
+/// Rationalized integral of the inverse-square-root depletion capacitance,
+/// divided by its zero-bias capacitance.
+pub(super) fn depletion_voltage(voltage: Real, root: Real) -> Real {
+    voltage / Real::midpoint(1., root)
+}
+
 impl Operating {
     /// Gate depletion charge and capacitance at a normalized junction
     /// voltage for zero-bias capacitance `cz` (`jfetload.c`, grading 1/2 with
@@ -343,13 +349,13 @@ impl Operating {
         let twop = 2. * self.pb;
         if v < self.cor_dep_cap {
             let sarg = (1. - v / self.pb).sqrt();
-            (twop * cz * (1. - sarg), cz / sarg)
+            (cz * depletion_voltage(v, sarg), cz / sarg)
         } else {
             let czf2 = cz / self.f2;
-            let fcpb2 = self.cor_dep_cap * self.cor_dep_cap;
+            let dv = v - self.cor_dep_cap;
+            let mean = self.f3 + Real::midpoint(v, self.cor_dep_cap) / twop;
             (
-                cz * self.f1
-                    + czf2 * (self.f3 * (v - self.cor_dep_cap) + (v * v - fcpb2) / (twop + twop)),
+                (czf2 * mean).mul_add(dv, cz * self.f1),
                 czf2 * (self.f3 + v / twop),
             )
         }
@@ -453,9 +459,9 @@ impl Jfet {
         let (model, instance) = (&self.model, &self.instance);
         let (tnom, temp) = temperatures(&self.name, model.tnom, instance, context)?;
         let junction = gate_junction(model.pb, tnom, temp);
-        let xfc = (1. - model.fc).ln();
+        let xfc = (-model.fc).ln_1p();
         let f2 = ((1. + 0.5) * xfc).exp();
-        let f3 = 1. - model.fc * (1. + 0.5);
+        let f3 = (-model.fc).mul_add(1.5, 1.);
         let bfac = (1. - model.b) / (model.pb - model.vto);
 
         let vt = temp * K_OVER_Q;
@@ -498,7 +504,7 @@ impl Jfet {
             czgs: tcgs * area,
             czgd: tcgd * area,
             cor_dep_cap: model.fc * pb,
-            f1: pb * (1. - ((1. - 0.5) * xfc).exp()) / (1. - 0.5),
+            f1: depletion_voltage(model.fc * pb, (1. - model.fc).sqrt()),
             f2,
             f3,
             bfac,
@@ -1585,6 +1591,17 @@ mod tests {
             let forward = model.channel(&op, vgs, vgd).current;
             let reverse = model.channel(&op, vgd, vgs).current;
             assert!((forward + reverse).abs() <= 1e-15, "{vgs} {vgd}");
+        }
+    }
+
+    #[test]
+    fn depletion_charge_retains_the_linear_term_near_zero() {
+        let (_, op) = operating(1.);
+        for v in [-1e-20, 1e-20] {
+            let cz = 2e-12;
+            let (q, c) = op.charge(v, cz);
+            assert_eq!(q, cz * v);
+            assert_eq!(c, cz);
         }
     }
 
