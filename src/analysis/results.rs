@@ -452,6 +452,12 @@ impl Plot {
         true
     }
 
+    /// Consume the plot and transfer its packed cells without allocating.
+    #[must_use]
+    pub fn into_cells(self) -> Vec<Complex> {
+        self.cells
+    }
+
     /// A point-free header sharing the same schema.
     #[must_use]
     pub fn header(&self) -> Self {
@@ -509,7 +515,7 @@ impl Plot {
         }
     }
 
-    fn cell_count(&self, points: usize) -> SpiceResult<usize> {
+    pub(super) fn cell_count(&self, points: usize) -> SpiceResult<usize> {
         let width = self.variable_count();
         if width == 0 && !valid_empty_shape(&self.plotname, self.flags(), points) {
             return Err(self.storage_error(
@@ -858,6 +864,121 @@ mod tests {
         assert!(collector.point(&[Complex::ZERO]).is_err());
         assert!(collector.finish(1).is_err());
         assert!(PlotCollector::default().finish(1).is_err());
+    }
+
+    #[test]
+    fn packed_rows_and_strided_columns_preserve_shape_and_mutation() {
+        use std::sync::Arc;
+        let mut plot = plot().header();
+        assert!(plot.column("v(out)").unwrap().is_empty());
+        assert!(plot.row(0).is_none());
+        plot.reserve_points(4).unwrap();
+        for i in 0..4 {
+            plot.push_point(&[Complex::real(f64::from(i)), Complex::new(-f64::from(i), 1.)])
+                .unwrap();
+        }
+        assert_eq!(plot.cells().len(), 8);
+        assert_eq!(plot.row(1).unwrap().as_ptr(), plot.cells()[2..].as_ptr());
+        assert_eq!(plot.rows().len(), 4);
+        assert_eq!(plot.rows().rev().next(), plot.row(3));
+        let column = plot.column("v(out)").unwrap();
+        assert_eq!(column.len(), 4);
+        assert_eq!(column.first(), Some(&Complex::real(0.)));
+        assert_eq!(column.last(), Some(&Complex::real(3.)));
+        assert!(column.get(usize::MAX).is_none());
+        assert!(plot.column_at(2).is_none());
+        assert_eq!(column.partition_point(|value| value.re < 2.5), 3);
+        assert_eq!(
+            column.iter().rev().copied().collect::<Vec<_>>(),
+            [3., 2., 1., 0.].map(Complex::real)
+        );
+        assert_eq!(
+            column.get(2).unwrap() as *const Complex,
+            &plot.cells()[4] as *const Complex
+        );
+        let copy = plot.clone();
+        assert_eq!(copy, plot);
+        assert!(Arc::ptr_eq(copy.schema(), plot.schema()));
+        assert_ne!(copy.cells().as_ptr(), plot.cells().as_ptr());
+        let before = plot.clone();
+        assert!(plot.push_point(&[]).is_err());
+        assert!(plot.reserve_points(usize::MAX).is_err());
+        assert_eq!(plot, before);
+        assert!(plot.remove_point(1));
+        assert!(!plot.remove_point(usize::MAX));
+        assert_eq!(
+            plot.column("v(out)")
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [0., 2., 3.].map(Complex::real)
+        );
+        for row in plot.rows_mut() {
+            row[1].im = 2.;
+        }
+        assert_eq!(plot.point_mut(1).unwrap()[1], Complex::new(-2., 2.));
+        plot.truncate_points(2);
+        assert_eq!(plot.point_count(), 2);
+        assert_eq!(plot.cells().len(), 4);
+        plot.truncate_points(usize::MAX);
+        assert_eq!(plot.point_count(), 2);
+        plot.clear_points();
+        assert_eq!(plot.rows().len(), 0);
+        assert!(plot.cells().is_empty());
+        assert!(Arc::ptr_eq(copy.schema(), plot.schema()));
+    }
+
+    #[test]
+    fn checked_flat_attachment_and_capacity_failure_are_atomic() {
+        let header = plot().header();
+        assert!(header.clone().with_cells(usize::MAX, vec![]).is_err());
+        assert!(
+            header
+                .clone()
+                .with_cells(2, vec![Complex::ZERO; 3])
+                .is_err()
+        );
+        let data = vec![Complex::ZERO; 4];
+        let pointer = data.as_ptr();
+        let packed = header.with_cells(2, data).unwrap();
+        assert_eq!(packed.cells().as_ptr(), pointer);
+        let mut narrow = Plot::new(
+            "one",
+            "one",
+            PlotFlags::Complex,
+            vec![Variable::complex("v(out)", "voltage")],
+        );
+        // Product fits usize, but impossible allocation exceeds isize::MAX.
+        let huge = isize::MAX as usize / std::mem::size_of::<Complex>() + 1;
+        assert!(narrow.reserve_points(huge).is_err());
+        assert_eq!(narrow.point_count(), 0);
+        narrow
+            .push_point(&[Complex::new(f64::INFINITY, -0.)])
+            .unwrap();
+        assert!(!narrow.is_finite());
+        assert_eq!(narrow.cells()[0].im.to_bits(), (-0.0_f64).to_bits());
+    }
+
+    #[test]
+    fn zero_column_policy_preserves_only_the_rootless_c_result() {
+        let mut empty = Plot::new("empty", "empty", PlotFlags::Real, vec![]);
+        assert!(empty.push_point(&[]).is_err());
+        assert!(empty.clone().with_cells(1, vec![]).is_err());
+        assert!(empty.reserve_points(1).is_err());
+        let mut rootless = Plot::new("pz1", "Pole-Zero Analysis", PlotFlags::Real, vec![]);
+        rootless.reserve_points(1).unwrap();
+        rootless.push_point(&[]).unwrap();
+        assert_eq!(rootless.point_count(), 1);
+        assert!(rootless.cells().is_empty());
+        assert_eq!(rootless.row(0), Some([].as_slice()));
+        assert_eq!(rootless.rows().count(), 1);
+        assert_eq!(rootless.rows_mut().count(), 1);
+        assert!(rootless.point_mut(0).unwrap().is_empty());
+        assert!(rootless.push_point(&[]).is_err());
+        assert!(rootless.clone().with_cells(2, vec![]).is_err());
+        assert!(rootless.remove_point(0));
+        assert_eq!(rootless.point_count(), 0);
+        assert!(!rootless.remove_point(0));
     }
 
     #[test]

@@ -14,7 +14,6 @@ use crate::primitives::{Real, SpiceError, SpiceResult};
 #[derive(Debug)]
 pub(super) enum AxisError {
     MissingColumn,
-    MissingSample(usize),
     Nonfinite(usize),
     Descending(usize),
 }
@@ -39,20 +38,19 @@ pub(super) struct OrderedAxis<'a> {
 
 impl OrderedAxis<'static> {
     pub(super) fn from_plot(plot: &Plot, name: &str) -> Result<Self, AxisError> {
-        let column = plot.variable_index(name).ok_or(AxisError::MissingColumn)?;
-        let values = plot
-            .rows()
+        let column = plot.column(name).ok_or(AxisError::MissingColumn)?;
+        let values = column
+            .iter()
             .enumerate()
-            .map(|(index, point)| {
-                let value = point.get(column).ok_or(AxisError::MissingSample(index))?;
+            .map(|(index, value)| {
                 if !value.is_finite() {
                     return Err(AxisError::Nonfinite(index));
                 }
                 Ok(value.re)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // Preserve error precedence: missing/nonfinite column entries are
-        // reported before a descending coordinate anywhere in the axis.
+        // Preserve error precedence: nonfinite column entries are reported
+        // before a descending coordinate anywhere in the axis.
         Self::validate_order(&values)?;
         Ok(Self {
             values: Cow::Owned(values),

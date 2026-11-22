@@ -603,6 +603,10 @@ fn render_ascii_point(
     index: usize,
     point: &[Complex],
 ) -> io::Result<()> {
+    if point.is_empty() {
+        // C's incremental writer has no value/newline to follow its index.
+        return write!(out, "{index}\t");
+    }
     write!(out, " {index}")?;
     for (variable, value) in plot.variables().iter().zip(point) {
         let real = SpiceNumber(value.re);
@@ -1226,15 +1230,7 @@ impl<R: BufRead> RawPlotRows<'_, R> {
     fn decode_ascii_row(&mut self) -> SpiceResult<()> {
         let columns = self.header.plot.variables().len();
         if columns == 0 {
-            // The C batch writer emits an index followed by a newline even
-            // when its single rootless pole-zero row has no values.
-            let Some(line) = self.reader.cursor.next(true)? else {
-                return Err(unsupported("truncated empty pole-zero row"));
-            };
-            if line.trim() != "0" {
-                return Err(unsupported("invalid empty pole-zero point index"));
-            }
-            return Ok(());
+            return self.decode_empty_pz_row();
         }
         for (column, is_real) in self.realness.iter_mut().enumerate() {
             let Some(line) = self.reader.cursor.next(true)? else {
@@ -1258,6 +1254,39 @@ impl<R: BufRead> RawPlotRows<'_, R> {
                 *is_real = false;
             }
             self.row.push(parsed.value);
+        }
+        Ok(())
+    }
+
+    fn decode_empty_pz_row(&mut self) -> SpiceResult<()> {
+        // C outitf.c writes 0 + TAB, without a newline. A following Title:
+        // may immediately follow the TAB, so never read a whole text line.
+        // Also accept the older writer's space-prefixed index and newline.
+        let cursor = &mut self.reader.cursor;
+        let mut remaining = cursor.policy.line_bytes;
+        let mut byte = [0];
+        loop {
+            spend(&mut remaining, 1, "empty pole-zero point index")?;
+            cursor.input.read_exact(&mut byte).map_err(|error| {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    unsupported("truncated empty pole-zero row")
+                } else {
+                    input_error(&error)
+                }
+            })?;
+            match byte[0] {
+                b' ' | b'\t' => {}
+                b'0' => break,
+                _ => return Err(unsupported("invalid empty pole-zero point index")),
+            }
+        }
+        spend(&mut remaining, 1, "empty pole-zero point index")?;
+        cursor
+            .input
+            .read_exact(&mut byte)
+            .map_err(|error| input_error(&error))?;
+        if !byte[0].is_ascii_whitespace() {
+            return Err(unsupported("invalid empty pole-zero point index separator"));
         }
         Ok(())
     }

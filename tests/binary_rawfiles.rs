@@ -878,3 +878,65 @@ fn cumulative_collection_budgets_do_not_limit_streaming() {
     assert!(error.to_string().contains("plots per input"), "{error}");
     assert!(reader.next_plot().is_err());
 }
+
+#[test]
+fn rootless_pole_zero_rows_round_trip_without_consuming_next_header() {
+    use ngspice_rs::analysis::{Plot, PlotFlags};
+    let pz = "Title: empty roots\nPlotname: Pole-Zero Analysis\nFlags: real\nNo. Variables: 0\nNo. Points: 1\nVariables:\n";
+    // Pinned ngspice's ASCII batch writer emits 0 + TAB without any newline.
+    let concatenated = format!("{pz}Values:\n0\t{pz}Values:\n0\t");
+    let raw = RawFile::parse(&concatenated).unwrap();
+    assert_eq!(raw.len(), 2);
+    for raw_plot in &raw.plots {
+        assert_eq!(raw_plot.plot.point_count(), 1);
+        assert!(raw_plot.plot.cells().is_empty());
+        assert_eq!(raw_plot.plot.rows().count(), 1);
+    }
+    assert_eq!(RawFile::parse(&raw.to_ascii().unwrap()).unwrap(), raw);
+    for order in [BinaryByteOrder::LittleEndian, BinaryByteOrder::BigEndian] {
+        let bytes = raw.to_binary_with(order).unwrap();
+        assert_eq!(
+            RawFileReader::new(bytes.as_slice())
+                .with_byte_order(order)
+                .read()
+                .unwrap(),
+            raw
+        );
+    }
+    assert_eq!(
+        RawFile::parse(&format!("{pz}Values:\n 0\n"))
+            .unwrap()
+            .single_plot()
+            .unwrap()
+            .point_count(),
+        1
+    );
+    for tail in ["", "1\t", "0", "0x"] {
+        assert!(
+            RawFile::parse(&format!("{pz}Values:\n{tail}")).is_err(),
+            "{tail:?}"
+        );
+    }
+    let excessive = pz.replace("No. Points: 1", "No. Points: 2");
+    assert!(RawFile::parse(&format!("{excessive}Values:\n0\t1\t")).is_err());
+    assert!(RawFile::parse_bytes(format!("{excessive}Binary:\n").as_bytes()).is_err());
+    let budget = RawReadPolicy {
+        collect: ngspice_rs::analysis::RawCollectPolicy {
+            rows: 1,
+            ..RawReadPolicy::DEFAULT.collect
+        },
+        ..RawReadPolicy::DEFAULT
+    };
+    assert!(
+        RawFileReader::new(concatenated.as_bytes())
+            .with_policy(budget)
+            .read()
+            .unwrap_err()
+            .to_string()
+            .contains("collected rows")
+    );
+    let mut invalid = Plot::new("pz1", "Pole-Zero Analysis", PlotFlags::Real, vec![]);
+    invalid.push_point(&[]).unwrap();
+    invalid.plotname = "other".into();
+    assert!(RawFile::single(invalid).to_ascii().is_err());
+}

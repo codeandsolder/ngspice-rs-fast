@@ -41,13 +41,13 @@ fn workload() -> RawFile {
     for row in 0..ROWS {
         values.clear();
         values.extend((0..COLUMNS).map(|column| {
-                let real = f64::from(row).mul_add(0.125, f64::from(column) + 1.0);
-                if column % 2 == 0 {
-                    Complex::real(real)
-                } else {
-                    Complex::new(real, -0.5 * real)
-                }
-            }));
+            let real = f64::from(row).mul_add(0.125, f64::from(column) + 1.0);
+            if column % 2 == 0 {
+                Complex::real(real)
+            } else {
+                Complex::new(real, -0.5 * real)
+            }
+        }));
         plot.push_point(&values).unwrap();
     }
     RawFile::single(plot)

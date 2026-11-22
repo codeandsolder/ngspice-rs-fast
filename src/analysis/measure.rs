@@ -310,9 +310,6 @@ impl Axis {
                 feature: format!("the {} plot carries no '{name}' axis vector; it carries {}", plot.plotname, column_names(plot)),
                 location: None,
             },
-            AxisError::MissingSample(index) => SpiceError::Numerical {
-                context: format!("measure axis {name}"), message: format!("point {index} has no {name} value"),
-            },
             AxisError::Nonfinite(index) => SpiceError::Numerical {
                 context: format!("measure axis {name}"), message: format!("point {index} is not finite"),
             },

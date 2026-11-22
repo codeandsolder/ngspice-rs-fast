@@ -186,11 +186,11 @@ output identities before running a job. The optional small-signal bias
 receives only .save requests; noise spectra and integrated totals route
 by planned ordinal, not by the human-readable Plotname header. Only the
 last job of each kind receives its measurement/Fourier consumers. A consumer
-that needs the result retains the original owned rows; `Selection::into_plot`
-transfers an identity projection without copying it. All post-processing
+that needs the result retains one packed row-major table; `Selection::into_plot`
+transfers an identity projection without copying it, and compacts non-expanding consuming projections in place. All post-processing
 sees full unprojected data, including operands absent from the rawfile.
 For rawfile-only transient, AC, DC and noise spectrum output, selection
-binds against the announced header and projects each row into the spool.
+binds against the announced header and projects each borrowed reusable row into the spool.
 Both paths use the same plan and write the same bytes; failure of any
 consumer leaves the previous destination unchanged.
 

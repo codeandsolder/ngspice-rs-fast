@@ -355,7 +355,6 @@ fn time_axis(plot: &Plot, card: &FourierCard) -> SpiceResult<OrderedAxis<'static
     let values = OrderedAxis::from_plot(plot, "time").map_err(|error| match error {
             AxisError::MissingColumn => unsupported(card, format!(
                 ".four: the {} plot carries no 'time' axis vector; it carries {}", plot.plotname, column_names(plot))),
-            AxisError::MissingSample(index) => nonfinite("time", format!("point {index} has no time value")),
             AxisError::Nonfinite(index) => nonfinite("time", format!("point {index} is not finite")),
             AxisError::Descending(index) => unsupported(card, format!(
                 ".four: the time axis is not non-decreasing (it descends at point {index}); a Fourier transform needs an ordered axis")),

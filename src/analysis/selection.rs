@@ -304,7 +304,41 @@ impl Selection {
         if self.full {
             return Ok(plot);
         }
-        self.project(&plot)
+        let header = self.header(&plot)?;
+        let count = plot.point_count();
+        let source_width = plot.variable_count();
+        let width = header.variable_count();
+        let cell_count = header.cell_count(count)?;
+        if width > source_width {
+            return self.project(&plot);
+        }
+        // Read the entire source row into scratch before overwriting its
+        // first cell. With a non-expanding projection, the output prefix
+        // never crosses the next unread source row, regardless of column
+        // order, differential operands or duplicate requests.
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve_exact(width)
+            .map_err(|error| SpiceError::Numerical {
+                context: "selection row".into(),
+                message: error.to_string(),
+            })?;
+        let mut cells = plot.into_cells();
+        for index in 0..count {
+            let start = index * source_width;
+            let source = &cells[start..start + source_width];
+            scratch.clear();
+            for column in &self.columns {
+                scratch.push(column.value(source)?);
+            }
+            let destination = index * width;
+            cells[destination..destination + width].copy_from_slice(&scratch);
+        }
+        cells.truncate(cell_count);
+        if width < source_width {
+            cells.shrink_to_fit();
+        }
+        header.with_cells(count, cells)
     }
 
     /// The selected header, after verifying the original ordered schema.
@@ -1180,6 +1214,44 @@ mod tests {
     }
 
     #[test]
+    fn consuming_projection_compacts_reordered_and_differential_rows() {
+        let mut plot = op_plot();
+        plot.push_point(&[Complex::real(-1.), Complex::real(4.), Complex::real(-0.)])
+            .unwrap();
+        plot.push_point(&[Complex::real(3.), Complex::real(1.), Complex::real(2.)])
+            .unwrap();
+        for requests in [
+            vec![current("v1"), voltage("out", Some("in"))],
+            vec![
+                current("v1"),
+                voltage("out", Some("in")),
+                voltage("in", None),
+            ],
+            vec![
+                current("v1"),
+                voltage("out", Some("in")),
+                voltage("in", None),
+                voltage("0", None),
+            ],
+        ] {
+            let selection = resolve(&plot, AnalysisKind::OperatingPoint, &requests);
+            let expected = selection.apply(&plot).unwrap();
+            let owned = plot.clone();
+            let pointer = owned.cells().as_ptr();
+            let actual = selection.into_plot(owned).unwrap();
+            assert_eq!(actual, expected);
+            for (a, b) in actual.cells().iter().zip(expected.cells()) {
+                assert_eq!(a.re.to_bits(), b.re.to_bits());
+                assert_eq!(a.im.to_bits(), b.im.to_bits());
+            }
+            // Equal-width nonidentity projection must retain the original allocation.
+            if requests.len() == plot.variable_count() {
+                assert_eq!(actual.cells().as_ptr(), pointer);
+            }
+        }
+    }
+
+    #[test]
     fn streaming_projection_checks_all_widths_and_reuses_storage() {
         let plot = op_plot();
         let selection = resolve(&plot, AnalysisKind::OperatingPoint, &[voltage("out", None)]);
@@ -1269,7 +1341,7 @@ mod tests {
                     .columns
                     .iter()
                     .map(|column| column.value(black_box(&row)))
-                    .collect::<SpiceResult<Vec<_>>>()
+                    .collect::<Result<Vec<_>, _>>()
                     .unwrap(),
             );
         }
