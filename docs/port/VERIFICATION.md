@@ -368,10 +368,10 @@ table from four clean inputs at upstream revision
 ask-only rejection, ordered aliases/flags/defaults/IC, setter conversions,
 integer/scale errors, literal VERSION selection/round-trip, actual model-bin
 resolution and factory atomicity. A device-layer unit test injects exact
-binary64 doping thresholds: `INPevaluate` deliberately uses platform
-`pow(10, exponent)`, so a textual `1e23` is not a portable way to construct
-that exact threshold. The live C query checks the textual boundary on both
-platforms instead. No numeric-parser or comparison tolerance was changed.
+binary64 doping thresholds: C's `INPevaluate` uses platform
+`pow(10, exponent)`, so a textual `1e23` in C is not a portable way to
+construct that exact threshold. Rust now rounds the exact decimal once.
+The live C query checks the textual boundary separately.
 
 `conformance/parser/bsim3_schema.cir` is hand-authored PDK-shaped input,
 not a calibrated/foundry card or simulation golden. It adds two snapshots;

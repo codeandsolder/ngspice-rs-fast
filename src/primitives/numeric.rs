@@ -78,6 +78,112 @@ pub(crate) fn bounded_rounded_exponent(value: Real, bounds: RangeInclusive<i32>)
     )
 }
 
+/// Convert a validated decimal mantissa times an exact integer and power
+/// of ten to nearest binary64 (ties to even). The sign is independent of the
+/// magnitude so zero and gradual underflow retain negative zero.
+///
+/// Round once, after scaling. A binary64 rounding boundary is a dyadic
+/// rational with a numerator of at most 54 bits and a denominator at most
+/// 2^1075 (or an integer of at most 309 decimal digits). Its terminating
+/// decimal therefore needs at most ceil(54 log10(2) + 1075 log10(5)) = 768
+/// significant digits. Retaining 768 leading digits and a sticky digit is
+/// enough: no rounding boundary can lie strictly inside the discarded tail
+/// interval. This also prevents enormous mantissas or exponents from
+/// requiring a proportional allocation or overwhelming the library parser.
+pub(super) fn rounded_decimal(
+    mantissa: &str,
+    negative: bool,
+    exponent: i128,
+    multiplier: DecimalMultiplier,
+) -> Option<Real> {
+    use std::io::Write as _;
+
+    const BOUNDARY_DIGITS: usize = 768;
+    // MIL multiplies by 254, requiring up to three extra leading positions.
+    const EXTRA_DIGITS: usize = 3;
+    let significant = mantissa.trim_start_matches(['0', '.']);
+    if significant.is_empty() {
+        return Some(if negative { -0. } else { 0. });
+    }
+    let source_digits = significant.len() - usize::from(significant.contains('.'));
+    let max_digits = source_digits.checked_add(multiplier.extra_digits())?;
+    let mut position = max_digits;
+    let mut digits = [b'0'; BOUNDARY_DIGITS + EXTRA_DIGITS];
+    let mut sticky = false;
+    let mut carry = 0_u16;
+    // Multiply from the least significant end, even for discarded digits:
+    // their carry into the retained prefix is part of the exact product.
+    {
+        let mut emit = |digit: u16| -> Option<()> {
+            position -= 1;
+            if let Some(slot) = digits.get_mut(position) {
+                *slot = b'0' + u8::try_from(digit).ok()?;
+            } else {
+                sticky |= digit != 0;
+            }
+            Some(())
+        };
+        for digit in significant.bytes().rev().filter(|&byte| byte != b'.') {
+            let product = u16::from(digit - b'0') * multiplier.factor() + carry;
+            emit(product % 10)?;
+            carry = product / 10;
+        }
+        while carry != 0 {
+            emit(carry % 10)?;
+            carry /= 10;
+        }
+    }
+    // position contains unused high padding, not leading significant digits.
+    let scientific = exponent.saturating_add(i128::try_from(max_digits - position - 1).ok()?);
+    let magnitude = if scientific > 308 {
+        Real::INFINITY
+    } else if scientific < -324 {
+        0.
+    } else {
+        let prefix = std::str::from_utf8(&digits[position..max_digits.min(digits.len())]).ok()?;
+        let adjusted_exponent =
+            scientific - i128::try_from(prefix.len() - 1 + usize::from(sticky)).ok()?;
+        let mut text = [0; BOUNDARY_DIGITS + EXTRA_DIGITS + 16];
+        let available = text.len();
+        let mut remaining = text.as_mut_slice();
+        write!(
+            remaining,
+            "{prefix}{}e{adjusted_exponent}",
+            if sticky { "1" } else { "" }
+        )
+        .ok()?;
+        let used = available - remaining.len();
+        std::str::from_utf8(&text[..used])
+            .ok()?
+            .parse::<Real>()
+            .ok()?
+    };
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+/// The only non-power-of-ten multiplier in SPICE's literal grammar.
+#[derive(Clone, Copy)]
+pub(super) enum DecimalMultiplier {
+    One,
+    Mil,
+}
+
+impl DecimalMultiplier {
+    const fn factor(self) -> u16 {
+        match self {
+            Self::One => 1,
+            Self::Mil => 254,
+        }
+    }
+
+    const fn extra_digits(self) -> usize {
+        match self {
+            Self::One => 0,
+            Self::Mil => 3,
+        }
+    }
+}
+
 /// Extract the binary64 exponent field without a checked narrowing that can panic.
 fn biased_exponent(bits: u64) -> i32 {
     let [high, next, ..] = bits.to_be_bytes();

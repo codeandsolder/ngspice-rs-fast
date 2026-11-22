@@ -432,14 +432,12 @@ impl BExpr {
     }
 }
 
-/// Replicate the numeric rounding of the C B-source literal rewriter.
+/// Retain the eleven-significant-digit B-source literal rewrite.
 ///
 /// Rounds a value to the 11 significant digits that `inp_modify_exp()`
 /// (`src/frontend/inpcom.c`) keeps when it re-prints a B-source literal with
-/// `%18.10e`, then reads the printed text back the way the B-source lexer
-/// does (`PTlex` -> `INPevaluate()`, which is not correctly rounded: C's
-/// `5.0000000000e-01` is 0.49999999999999994). Non-finite input is returned
-/// unchanged.
+/// `%18.10e`, then correctly rounds the resulting decimal to binary64.
+/// Non-finite input is returned unchanged.
 #[must_use]
 pub fn round_like_c_literal(value: Real) -> Real {
     if !value.is_finite() {
@@ -454,13 +452,9 @@ mod tests {
 
     #[test]
     fn literals_are_rounded_to_eleven_significant_digits() {
-        // Values read back from the reference binary's B sources
-        // (`v=1.23456789012345`, `v=0.5`): INPevaluate of the %18.10e text.
-        assert_eq!(
-            round_like_c_literal(1.234_567_890_123_456),
-            1.234_567_890_100_000_1
-        );
-        assert_eq!(round_like_c_literal(0.5), 0.499_999_999_999_999_94);
+        // Preserve the decimal rewrite, not C's per-digit double rounding.
+        assert_eq!(round_like_c_literal(1.234_567_890_123_456), 1.234_567_890_1);
+        assert_eq!(round_like_c_literal(0.5), 0.5);
         assert_eq!(round_like_c_literal(-2.5e-3), -2.5e-3);
         assert_eq!(round_like_c_literal(0.0), 0.0);
         assert_eq!(round_like_c_literal(1e300), 1e300);
