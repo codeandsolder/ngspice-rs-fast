@@ -801,39 +801,34 @@ pub(super) fn meyer(
         MEYER_MIN_VDSAT
     };
     if vgst <= -phi {
-        [0., 0., cox / 2.]
-    } else if vgst <= -phi / 2. {
-        [0., 0., -vgst * cox / (2. * phi)]
-    } else if vgst <= 0. {
-        let capgb = -vgst * cox / (2. * phi);
-        let capgs = vgst * cox / (1.5 * phi) + cox / 3.;
-        let vds = vgs - vgd;
-        if vds >= vdsat {
-            [capgs, 0., capgb]
-        } else {
-            let vddif = 2.0 * vdsat - vds;
-            let vddif1 = vdsat - vds;
-            let vddif2 = vddif * vddif;
-            [
-                capgs * (1.0 - vddif1 * vddif1 / vddif2),
-                capgs * (1.0 - vdsat * vdsat / vddif2),
-                capgb,
-            ]
-        }
+        return [0., 0., cox / 2.];
+    }
+    if vgst <= -phi / 2. {
+        return [0., 0., -vgst * cox / (2. * phi)];
+    }
+    let (channel_cap, bulk_cap) = if vgst <= 0. {
+        (
+            cox * ((vgst + phi / 2.) / (1.5 * phi)),
+            -vgst * cox / (2. * phi),
+        )
     } else {
-        let vds = vgs - vgd;
-        if vdsat <= vds {
-            [cox / 3., 0., 0.]
-        } else {
-            let vddif = 2.0 * vdsat - vds;
-            let vddif1 = vdsat - vds;
-            let vddif2 = vddif * vddif;
-            [
-                cox * (1.0 - vddif1 * vddif1 / vddif2) / 3.,
-                cox * (1.0 - vdsat * vdsat / vddif2) / 3.,
-                0.,
-            ]
-        }
+        (cox / 3., 0.)
+    };
+    let vds = vgs - vgd;
+    if vds >= vdsat {
+        [channel_cap, 0., bulk_cap]
+    } else {
+        // Factor both differences of squares and normalize before
+        // multiplying; preserve tiny drain capacitance near pinch-off.
+        let remaining = vdsat - vds;
+        let denominator = vdsat + remaining;
+        let source_ratio = remaining / denominator;
+        let drain_ratio = vdsat / denominator;
+        [
+            channel_cap * drain_ratio * (1. + source_ratio),
+            channel_cap * source_ratio * (1. + drain_ratio),
+            bulk_cap,
+        ]
     }
 }
 
@@ -1093,7 +1088,7 @@ impl<L: MosLevel> Mosfet<L> {
             cbs,
             gbd,
             cbd,
-            cd: mode * cdrain - cbd,
+            cd: mode.mul_add(cdrain, -cbd),
             von,
             vdsat,
             qbs,
@@ -1610,19 +1605,27 @@ impl<L: MosLevel> Device for Mosfet<L> {
         // Current vector and Y matrix, in mos1load.c's order and arithmetic.
         let t = pol;
         let m = L::MULTIPLICITY.stamp(self.geometry.m);
-        let ceqbs = t * (e.cbs - e.gbs * e.vbs);
-        let ceqbd = t * (e.cbd - e.gbd * e.vbd);
+        let ceqbs = t * f64::mul_add(e.gbs, -e.vbs, e.cbs);
+        let ceqbd = t * f64::mul_add(e.gbd, -e.vbd, e.cbd);
         let (xnrm, xrev, cdreq) = if e.mode >= 0. {
             (
                 1.,
                 0.,
-                t * (e.cdrain - e.gds * e.vds - e.gm * e.vgs - e.gmbs * e.vbs),
+                t * f64::mul_add(
+                    e.gmbs,
+                    -e.vbs,
+                    f64::mul_add(e.gds, -e.vds, e.cdrain) - e.gm * e.vgs,
+                ),
             )
         } else {
             (
                 0.,
                 1.,
-                -t * (e.cdrain - e.gds * (-e.vds) - e.gm * e.vgd - e.gmbs * e.vbd),
+                -t * f64::mul_add(
+                    e.gmbs,
+                    -e.vbd,
+                    f64::mul_add(e.gds, -(-e.vds), e.cdrain) - e.gm * e.vgd,
+                ),
             )
         };
         let [d, g, s, b] = [
@@ -1635,17 +1638,25 @@ impl<L: MosLevel> Device for Mosfet<L> {
         let [gdr, gsr] = self.series;
         let (gm, gds, gmbs, gbd, gbs) = (e.gm, e.gds, e.gmbs, e.gbd, e.gbs);
         context.stamp_rhs(g, -(m * (t * (ceqgs + ceqgb + ceqgd))))?;
-        context.stamp_rhs(b, -(m * (ceqbs + ceqbd - t * ceqgb)))?;
-        context.stamp_rhs(dp, m * (ceqbd - cdreq + t * ceqgd))?;
-        context.stamp_rhs(sp, m * (cdreq + ceqbs + t * ceqgs))?;
+        context.stamp_rhs(b, -(m * t.mul_add(-ceqgb, ceqbs + ceqbd)))?;
+        context.stamp_rhs(dp, m * t.mul_add(ceqgd, ceqbd - cdreq))?;
+        context.stamp_rhs(sp, m * t.mul_add(ceqgs, cdreq + ceqbs))?;
         context.stamp_fixed(
             [
                 (d, d, gdr),
                 (g, g, gcgd + gcgs + gcgb),
                 (s, s, gsr),
                 (b, b, gbd + gbs + gcgb),
-                (dp, dp, gdr + gds + gbd + xrev * (gm + gmbs) + gcgd),
-                (sp, sp, gsr + gds + gbs + xnrm * (gm + gmbs) + gcgs),
+                (
+                    dp,
+                    dp,
+                    f64::mul_add(xrev, gm + gmbs, gdr + gds + gbd) + gcgd,
+                ),
+                (
+                    sp,
+                    sp,
+                    f64::mul_add(xnrm, gm + gmbs, gsr + gds + gbs) + gcgs,
+                ),
                 (d, dp, -gdr),
                 (g, b, -gcgb),
                 (g, dp, -gcgd),
@@ -1655,13 +1666,13 @@ impl<L: MosLevel> Device for Mosfet<L> {
                 (b, dp, -gbd),
                 (b, sp, -gbs),
                 (dp, d, -gdr),
-                (dp, g, (xnrm - xrev) * gm - gcgd),
-                (dp, b, -gbd + (xnrm - xrev) * gmbs),
-                (dp, sp, -gds - xnrm * (gm + gmbs)),
-                (sp, g, -(xnrm - xrev) * gm - gcgs),
+                (dp, g, f64::mul_add(xnrm - xrev, gm, -gcgd)),
+                (dp, b, f64::mul_add(xnrm - xrev, gmbs, -gbd)),
+                (dp, sp, f64::mul_add(xnrm, -(gm + gmbs), -gds)),
+                (sp, g, f64::mul_add((-(xnrm - xrev)), gm, -gcgs)),
                 (sp, s, -gsr),
-                (sp, b, -gbs - (xnrm - xrev) * gmbs),
-                (sp, dp, -gds - xrev * (gm + gmbs)),
+                (sp, b, f64::mul_add(xnrm - xrev, -gmbs, -gbs)),
+                (sp, dp, f64::mul_add(xrev, -(gm + gmbs), -gds)),
             ]
             .map(|(r, c, value)| (r, c, m * value)),
         )?;
@@ -1697,16 +1708,28 @@ impl<L: MosLevel> Device for Mosfet<L> {
         );
         let (cbs, cbd, gbs) = (at(slot::CBS), at(slot::CBD), at(slot::GBS));
         let cdhat = if at(slot::MODE) >= 0. {
-            cd - gbd * delvbd + gmbs * delvbs + gm * delvgs + gds * delvds
+            f64::mul_add(
+                gds,
+                delvds,
+                f64::mul_add(gbd, -delvbd, cd) + gmbs * delvbs + gm * delvgs,
+            )
         } else {
-            cd - (gbd - gmbs) * delvbd - gm * delvgd + gds * delvds
+            f64::mul_add(
+                gds,
+                delvds,
+                f64::mul_add(gbd - gmbs, -delvbd, cd) - gm * delvgd,
+            )
         };
-        let cbhat = cbs + cbd + gbd * delvbd + gbs * delvbs;
-        let tol = context.reltol * cdhat.abs().max(cd.abs()) + context.abstol;
+        let cbhat = f64::mul_add(gbs, delvbs, f64::mul_add(gbd, delvbd, cbs + cbd));
+        let tol = context
+            .reltol
+            .mul_add(cdhat.abs().max(cd.abs()), context.abstol);
         if (cdhat - cd).abs() >= tol {
             return Ok(true);
         }
-        let tol = context.reltol * cbhat.abs().max((cbs + cbd).abs()) + context.abstol;
+        let tol = context
+            .reltol
+            .mul_add(cbhat.abs().max((cbs + cbd).abs()), context.abstol);
         Ok((cbhat - (cbs + cbd)).abs() > tol)
     }
 
@@ -1767,8 +1790,8 @@ impl<L: MosLevel> Device for Mosfet<L> {
             (d, d, gdr),
             (s, s, gsr),
             (b, b, gbd + gbs),
-            (dp, dp, gdr + gds + gbd + xrev * (gm + gmbs)),
-            (sp, sp, gsr + gds + gbs + xnrm * (gm + gmbs)),
+            (dp, dp, f64::mul_add(xrev, gm + gmbs, gdr + gds + gbd)),
+            (sp, sp, f64::mul_add(xnrm, gm + gmbs, gsr + gds + gbs)),
             (d, dp, -gdr),
             (s, sp, -gsr),
             (b, dp, -gbd),
@@ -1776,11 +1799,11 @@ impl<L: MosLevel> Device for Mosfet<L> {
             (dp, d, -gdr),
             (dp, g, (xnrm - xrev) * gm),
             (dp, b, -gbd + (xnrm - xrev) * gmbs),
-            (dp, sp, -(gds + xnrm * (gm + gmbs))),
+            (dp, sp, -f64::mul_add(xnrm, gm + gmbs, gds)),
             (sp, g, -((xnrm - xrev) * gm)),
             (sp, s, -gsr),
-            (sp, b, -(gbs + (xnrm - xrev) * gmbs)),
-            (sp, dp, -(gds + xrev * (gm + gmbs))),
+            (sp, b, -f64::mul_add(xnrm - xrev, gmbs, gbs)),
+            (sp, dp, -f64::mul_add(xrev, gm + gmbs, gds)),
         ] {
             if let (Some(r), Some(c)) = (unknowns.node_row(row), unknowns.node_row(col)) {
                 context.system.a.add(r, c, m * value)?;
@@ -1837,7 +1860,8 @@ impl<L: MosLevel> Device for Mosfet<L> {
                 } else {
                     1.0 - (e.vds * e.mode / e.vdsat)
                 };
-                2.0 / 3.0 * shape.beta * vgst * (1.0 + alpha + alpha * alpha) / (1.0 + alpha)
+                2.0 / 3.0 * shape.beta * vgst * f64::mul_add(alpha, alpha, 1.0 + alpha)
+                    / (1.0 + alpha)
                     * common.gdsnoi
             } else {
                 0.

@@ -20,22 +20,26 @@ use crate::primitives::{Complex, Real};
 pub(super) type Values = [Complex; 3];
 
 fn s2v2f1(c: Real, x: Complex, y: Complex) -> Real {
-    c * (x.re * y.re - x.im * y.im)
+    c * x.im.mul_add(-y.im, x.re * y.re)
 }
 
 fn s2i2f1(c: Real, x: Complex, y: Complex) -> Real {
-    c * (x.re * y.im + x.im * y.re)
+    c * x.im.mul_add(y.re, x.re * y.im)
 }
 
 /// `S2v3F1` and `S2vF12` (the same expression): `x1`, `y1` first-order,
 /// `x2`, `y2` the other kernel.
 fn s2v3f1(c: Real, x1: Complex, y1: Complex, x2: Complex, y2: Complex) -> Real {
-    c * (x1.re * y2.re - x1.im * y2.im + y1.re * x2.re - y1.im * x2.im)
+    c * y1
+        .im
+        .mul_add(-x2.im, x1.im.mul_add(-y2.im, x1.re * y2.re) + y1.re * x2.re)
 }
 
 /// `S2i3F1` and `S2iF12`.
 fn s2i3f1(c: Real, x1: Complex, y1: Complex, x2: Complex, y2: Complex) -> Real {
-    c * (x1.re * y2.im + x1.im * y2.re + y1.re * x2.im + y1.im * x2.re)
+    c * y1
+        .im
+        .mul_add(x2.re, x1.im.mul_add(y2.re, x1.re * y2.im) + y1.re * x2.im)
 }
 
 /// The kernels of a `2 f1 - f2` term: `H1(f1)`, `H1(-f2)`, `H2(f1, f1)` and
@@ -49,52 +53,66 @@ struct Im3 {
 }
 
 fn s2v2f12(c: Real, x: Im3, y: Im3) -> Real {
-    c * (2.
-        * (x.h1.re * y.h1m2_2.re - x.h1.im * y.h1m2_2.im + y.h1.re * x.h1m2_2.re
+    c * y.h1m2.im.mul_add(
+        -x.h11.im,
+        2. * (x.h1.im.mul_add(-y.h1m2_2.im, x.h1.re * y.h1m2_2.re) + y.h1.re * x.h1m2_2.re
             - y.h1.im * x.h1m2_2.im)
-        + x.h1m2.re * y.h11.re
-        - x.h1m2.im * y.h11.im
-        + y.h1m2.re * x.h11.re
-        - y.h1m2.im * x.h11.im)
+            + x.h1m2.re * y.h11.re
+            - x.h1m2.im * y.h11.im
+            + y.h1m2.re * x.h11.re,
+    )
 }
 
 fn s2i2f12(c: Real, x: Im3, y: Im3) -> Real {
-    c * (2.
-        * (x.h1.re * y.h1m2_2.im
-            + x.h1.im * y.h1m2_2.re
+    c * y.h1m2.im.mul_add(
+        x.h11.re,
+        2. * (x.h1.im.mul_add(y.h1m2_2.re, x.h1.re * y.h1m2_2.im)
             + y.h1.re * x.h1m2_2.im
             + y.h1.im * x.h1m2_2.re)
-        + x.h1m2.re * y.h11.im
-        + x.h1m2.im * y.h11.re
-        + y.h1m2.re * x.h11.im
-        + y.h1m2.im * x.h11.re)
+            + x.h1m2.re * y.h11.im
+            + x.h1m2.im * y.h11.re
+            + y.h1m2.re * x.h11.im,
+    )
 }
 
 fn s3v3f1(c: Real, x: Complex, y: Complex, z: Complex) -> Real {
-    c * ((x.re * y.re - x.im * y.im) * z.re - (x.im * y.re + x.re * y.im) * z.im)
+    c * x
+        .re
+        .mul_add(y.im, x.im * y.re)
+        .mul_add(-z.im, x.im.mul_add(-y.im, x.re * y.re) * z.re)
 }
 
 fn s3i3f1(c: Real, x: Complex, y: Complex, z: Complex) -> Real {
-    c * ((x.re * y.re - x.im * y.im) * z.im + (x.im * y.re + x.re * y.im) * z.re)
+    c * x
+        .re
+        .mul_add(y.im, x.im * y.re)
+        .mul_add(z.re, x.im.mul_add(-y.im, x.re * y.re) * z.im)
 }
 
 /// `S3v2F12`: `x`, `y`, `z` first-order, `x2`, `y2`, `z2` at `-f2`.
 fn s3v2f12(c: Real, [x, y, z]: Values, [x2, y2, z2]: Values) -> Real {
-    c * ((x.re * y.re - x.im * y.im) * z2.re - (x.im * y.re + x.re * y.im) * z2.im
-        + (x.re * z.re - x.im * z.im) * y2.re
-        - (x.im * z.re + x.re * z.im) * y2.im
-        + (z.re * y.re - z.im * y.im) * x2.re
-        - (z.im * y.re + z.re * y.im) * x2.im)
+    c * f64::mul_add(
+        f64::mul_add(z.re, y.im, z.im * y.re),
+        -x2.im,
+        f64::mul_add(x.im, -y.im, x.re * y.re) * z2.re
+            - f64::mul_add(x.re, y.im, x.im * y.re) * z2.im
+            + f64::mul_add(x.im, -z.im, x.re * z.re) * y2.re
+            - f64::mul_add(x.re, z.im, x.im * z.re) * y2.im
+            + f64::mul_add(z.im, -y.im, z.re * y.re) * x2.re,
+    )
 }
 
 /// `S3i2F12`.
 fn s3i2f12(c: Real, [x, y, z]: Values, [x2, y2, z2]: Values) -> Real {
-    c * ((x.re * y.re - x.im * y.im) * z2.im
-        + (x.im * y.re + x.re * y.im) * z2.re
-        + (x.re * z.re - x.im * z.im) * y2.im
-        + (x.im * z.re + x.re * z.im) * y2.re
-        + (z.re * y.re - z.im * y.im) * x2.im
-        + (z.im * y.re + z.re * y.im) * x2.re)
+    c * f64::mul_add(
+        f64::mul_add(z.re, y.im, z.im * y.re),
+        x2.re,
+        f64::mul_add(x.im, -y.im, x.re * y.re) * z2.im
+            + f64::mul_add(x.re, y.im, x.im * y.re) * z2.re
+            + f64::mul_add(x.im, -z.im, x.re * z.re) * y2.im
+            + f64::mul_add(x.re, z.im, x.im * z.re) * y2.re
+            + f64::mul_add(z.im, -y.im, z.re * y.re) * x2.im,
+    )
 }
 
 /// `DFn2F1`/`DFi2F1` (and `D1n2F1`/`D1i2F1`, equal for one control).

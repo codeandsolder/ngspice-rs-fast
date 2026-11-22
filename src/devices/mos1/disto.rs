@@ -56,7 +56,6 @@ impl Mos1 {
     ) -> SpiceResult<DeviceDistortion> {
         let op = self.operating(context.model_context)?;
         let pol = self.model.common.pol;
-        let gmin = context.model_context.gmin;
         let [dp, g, sp, b] = self.inner;
         let v = |node| context.voltage(node);
         let vt = op.vt;
@@ -72,8 +71,7 @@ impl Mos1 {
                 (0., 0.)
             } else {
                 let e = (v / vt).min(MAX_EXP_ARG).exp();
-                let g = saturation * e / vt + gmin;
-                let g2 = pol * 0.5 * (g - gmin) / vt;
+                let g2 = pol * 0.5 * (saturation * e / vt) / vt;
                 (g2, pol * g2 / (vt * 3.))
             }
         };
@@ -109,7 +107,7 @@ impl Mos1 {
             dvon = if s <= 0. { 0. } else { d1 };
             (d2von, d3von) = (0., 0.);
         }
-        let von = op.vbi * pol + gamma * sarg;
+        let von = f64::mul_add(gamma, sarg, op.vbi * pol);
         let vgst = (if normal { vgs } else { vgd }) - von;
         let vdsat = vgst.max(0.);
         let vdsm = vds * mode;
@@ -119,23 +117,23 @@ impl Mos1 {
         let (mut gm2ds, mut gmds2, mut gm2b, mut gmb2, mut gb2ds, mut gbds2, mut gmbds) =
             (0., 0., 0., 0., 0., 0., 0.);
         if vgst > 0. {
-            let betap = beta * (1. + lambda * vdsm);
+            let betap = beta * f64::mul_add(lambda, vdsm, 1.);
             if vgst <= vdsm {
                 // Saturation.
                 let gm = betap * vgst;
                 gm2 = betap;
                 gds2 = 0.;
-                gb2 = -(gm * d2von - betap * dvon * dvon);
+                gb2 = -(betap * dvon).mul_add(-dvon, gm * d2von);
                 gmds = vgst * lambda * beta;
                 gbds = -gmds * dvon;
                 gmb = -betap * dvon;
                 gm3 = 0.;
-                gb3 = -(gmb * d2von + gm * d3von - betap * 2. * dvon * d2von);
+                gb3 = -(betap * 2. * dvon).mul_add(-d2von, gm.mul_add(d3von, gmb * d2von));
                 gds3 = 0.;
                 gm2ds = beta * lambda;
                 gm2b = 0.;
                 gmb2 = -betap * d2von;
-                gb2ds = -(gmds * d2von - dvon * dvon * beta * lambda);
+                gb2ds = -f64::mul_add(dvon * dvon * beta, -lambda, gmds * d2von);
                 gmds2 = 0.;
                 gbds2 = 0.;
                 gmbds = -beta * lambda * dvon;
@@ -144,8 +142,8 @@ impl Mos1 {
                 let gm = betap * vdsm;
                 gm2 = 0.;
                 gb2 = -(gm * d2von);
-                gds2 = 2. * beta * lambda * (vgst - vdsm) - betap;
-                gmds = beta * lambda * vdsm + betap;
+                gds2 = f64::mul_add(2. * beta * lambda, vgst - vdsm, -betap);
+                gmds = f64::mul_add(beta * lambda, vdsm, betap);
                 gbds = -gmds * dvon;
                 gmb = 0.;
                 gm3 = 0.;
@@ -169,8 +167,8 @@ impl Mos1 {
                 let sargsw = grading_power(arg, mjsw);
                 let c2 = pol * 0.5 / pb
                     * (junction.bottom * mj * sarg / arg + junction.sidewall * mjsw * sargsw / arg);
-                let c3 = (junction.bottom * sarg * mj * (mj + 1.)
-                    + junction.sidewall * sargsw * mjsw * (mjsw + 1.))
+                let c3 = (junction.sidewall * sargsw * mjsw)
+                    .mul_add(mjsw + 1., junction.bottom * sarg * mj * (mj + 1.))
                     / (6. * pb * pb * arg * arg);
                 (c2, c3)
             } else {
@@ -196,13 +194,13 @@ impl Mos1 {
             capgb2 = -cox / (4. * phi);
             capgs2 = cox / (3. * phi);
         } else if vdsat > vdsm {
-            let vddif = 2.0 * vdsat - vdsm;
+            let vddif = 2.0f64.mul_add(vdsat, -vdsm);
             let vddif1 = vdsat - vdsm;
             let vddif2 = vddif * vddif;
             capgd2 = -vdsat * vdsm * cox / (3. * vddif * vddif2);
-            capgd3 = -vdsm * cox * (vddif - 6. * vdsat) / (9. * vddif2 * vddif2);
+            capgd3 = -vdsm * cox * 6.0f64.mul_add(-vdsat, vddif) / (9. * vddif2 * vddif2);
             capgs2 = -vddif1 * vdsm * cox / (3. * vddif * vddif2);
-            capgs3 = -vdsm * cox * (vddif - 6. * vddif1) / (9. * vddif2 * vddif2);
+            capgs3 = -vdsm * cox * 6.0f64.mul_add(-vddif1, vddif) / (9. * vddif2 * vddif2);
         }
         let capgb3 = 0.;
 
@@ -229,23 +227,22 @@ impl Mos1 {
             Taylor {
                 xx: -gm2,
                 yy: -gb2,
-                zz: -(gm2 + gb2 + gds2 + 2. * (gmb + gmds + gbds)),
+                zz: -2.0f64.mul_add(gmb + gmds + gbds, gm2 + gb2 + gds2),
                 xy: -gmb,
                 yz: gmb + gb2 + gbds,
                 xz: gm2 + gmb + gmds,
                 xxx: -gm3,
                 yyy: -gb3,
-                zzz: gm3
-                    + gb3
-                    + gds3
-                    + 3. * (gm2b + gm2ds + gmb2 + gb2ds + gmds2 + gbds2)
-                    + 6. * gmbds,
+                zzz: 6.0f64.mul_add(
+                    gmbds,
+                    gm3 + gb3 + gds3 + 3. * (gm2b + gm2ds + gmb2 + gb2ds + gmds2 + gbds2),
+                ),
                 xxz: gm3 + gm2b + gm2ds,
                 xxy: -gm2b,
                 yyz: gmb2 + gb3 + gb2ds,
                 xyy: -gmb2,
-                xzz: -(gm3 + 2. * (gm2b + gm2ds + gmbds) + gmb2 + gmds2),
-                yzz: -(gb3 + 2. * (gmb2 + gb2ds + gmbds) + gm2b + gbds2),
+                xzz: -(2.0f64.mul_add(gm2b + gm2ds + gmbds, gm3) + gmb2 + gmds2),
+                yzz: -(2.0f64.mul_add(gmb2 + gb2ds + gmbds, gb3) + gm2b + gbds2),
                 xyz: gm2b + gmb2 + gmbds,
             }
         };

@@ -171,7 +171,7 @@ pub(super) struct Params {
 impl Level6 {
     /// Effective channel length `L - 2 LD`.
     fn length(&self, geometry: &Geometry) -> Real {
-        geometry.l - 2. * self.common.ld
+        2.0f64.mul_add(-self.common.ld, geometry.l)
     }
 
     /// `mos6temp.c`'s model loop at the nominal temperature `tnom` (K).
@@ -220,7 +220,9 @@ impl Level6 {
         } else {
             (root - vbs / (root + root)).max(0.)
         };
-        let von = op.vbi * pol + gamma * sarg - p.gamma1 * vbs - p.sigma * vds;
+        let von = p
+            .sigma
+            .mul_add(-vds, gamma.mul_add(sarg, op.vbi * pol) - p.gamma1 * vbs);
         let vgon = vgs - von;
         if vgon <= 0. {
             return DrainCurrent {
@@ -244,12 +246,12 @@ impl Level6 {
         let log = vgon.ln();
         let vdsat = p.kv * (log * p.nv).exp();
         let idsat = p.betac * (log * p.nc).exp();
-        let lambda = p.lambda0 - p.lambda1 * vbs;
+        let lambda = p.lambda1.mul_add(-vbs, p.lambda0);
         // Saturation.
-        let mut current = idsat * (1. + lambda * vds);
+        let mut current = idsat * lambda.mul_add(vds, 1.);
         let mut gm = current * p.nc / vgon;
-        let mut gds = gm * p.sigma + idsat * lambda;
-        let mut gmbs = gm * vonbm - idsat * p.lambda1 * vds;
+        let mut gds = idsat.mul_add(lambda, gm * p.sigma);
+        let mut gmbs = (idsat * p.lambda1).mul_add(-vds, gm * vonbm);
         if vdsat > vds {
             // Linear region.
             let vdst = vds / vdsat;
@@ -257,9 +259,9 @@ impl Level6 {
             let vdstg = -vdst * p.nv / vgon;
             let ivdst1 = current * (2. - vdst - vdst);
             current *= vdst2;
-            gm = gm * vdst2 + ivdst1 * vdstg;
-            gds = gds * vdst2 + ivdst1 * (1. / vdsat + vdstg * p.sigma);
-            gmbs = gmbs * vdst2 + ivdst1 * vdstg * vonbm;
+            gm = ivdst1.mul_add(vdstg, gm * vdst2);
+            gds = ivdst1.mul_add(1. / vdsat + vdstg * p.sigma, gds * vdst2);
+            gmbs = (ivdst1 * vdstg).mul_add(vonbm, gmbs * vdst2);
         }
         DrainCurrent {
             cdrain: current,

@@ -98,9 +98,9 @@ impl SurfaceCard {
             3.2
         } else {
             let fermig = pol * tpg * 0.5 * gap;
-            3.25 + 0.5 * gap - fermig
+            0.5f64.mul_add(gap, 3.25) - fermig
         };
-        let wkfngs = wkfng - (3.25 + 0.5 * gap + fermis);
+        let wkfngs = wkfng - (0.5f64.mul_add(gap, 3.25) + fermis);
         if self.gamma.is_none() {
             let product = match law {
                 SurfaceLaw::Classic => 2. * 11.70 * EPSILON_0 * CHARGE * nsub * 1e6,
@@ -110,7 +110,7 @@ impl SurfaceCard {
         }
         if self.vto.is_none() {
             let vfb = wkfngs - self.nss.unwrap_or(0.) * 1e4 * CHARGE / cox;
-            surface.vto = vfb + pol * (surface.gamma * surface.phi.sqrt() + surface.phi);
+            surface.vto = pol.mul_add(surface.gamma * surface.phi.sqrt() + surface.phi, vfb);
         }
         Ok(surface)
     }
@@ -128,10 +128,11 @@ impl Surface {
     ) -> (Real, Real, Real) {
         let phi = actual.potential.correct(&nominal.potential, self.phi);
         let vto = delvto.map_or(self.vto, |delta| delta + self.vto);
-        let vbi = vto - pol * (self.gamma * self.phi.sqrt())
-            + 0.5 * (nominal.gap - actual.gap)
-            + pol * 0.5 * (phi - self.phi);
-        let vto = vbi + pol * self.gamma * phi.sqrt();
+        let vbi = (pol * 0.5).mul_add(
+            phi - self.phi,
+            pol.mul_add(-(self.gamma * self.phi.sqrt()), vto) + 0.5 * (nominal.gap - actual.gap),
+        );
+        let vto = (pol * self.gamma).mul_add(phi.sqrt(), vbi);
         (phi, vbi, vto)
     }
 }

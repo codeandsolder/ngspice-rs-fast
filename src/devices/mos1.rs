@@ -111,7 +111,7 @@ struct Process {
 impl Level1 {
     /// C `EffectiveLength = l - 2 * latDiff`.
     fn length(&self, geometry: &Geometry) -> Real {
-        geometry.l - 2. * self.common.ld
+        2.0f64.mul_add(-self.common.ld, geometry.l)
     }
 
     fn process(&self, tnom: Real) -> SpiceResult<Process> {
@@ -268,7 +268,7 @@ impl MosLevel for Level1 {
             // MAX(0, sarg)
             if 0. > sarg { 0. } else { sarg }
         };
-        let von = (op.vbi * self.common.pol) + op.gamma * sarg;
+        let von = op.gamma.mul_add(sarg, op.vbi * self.common.pol);
         let vgst = vgx - von;
         let vdsat = if vgst > 0. { vgst } else { 0. };
         let arg = if sarg <= 0. {
@@ -279,7 +279,7 @@ impl MosLevel for Level1 {
         let (cdrain, gm, gds, gmbs) = if vgst <= 0. {
             (0., 0., 0., 0.)
         } else {
-            let betap = op.beta * (1. + lambda * vdsm);
+            let betap = op.beta * lambda.mul_add(vdsm, 1.);
             if vgst <= vdsm {
                 let gm = betap * vgst;
                 (
@@ -290,10 +290,12 @@ impl MosLevel for Level1 {
                 )
             } else {
                 let gm = betap * vdsm;
+                let shape = (-0.5_f64).mul_add(vdsm, vgst);
+                let intrinsic = vdsm * shape;
                 (
-                    betap * vdsm * (vgst - 0.5 * vdsm),
+                    betap * intrinsic,
                     gm,
-                    betap * (vgst - vdsm) + lambda * op.beta * vdsm * (vgst - 0.5 * vdsm),
+                    betap.mul_add(vgst - vdsm, lambda * op.beta * intrinsic),
                     gm * arg,
                 )
             }
