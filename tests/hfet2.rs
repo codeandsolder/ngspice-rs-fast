@@ -156,6 +156,57 @@ fn the_channel_matches_the_reference_binary() {
     );
 }
 
+/// Compare the intrinsic channel Jacobian with independent central
+/// differences, without the operating-point solve or gate leakage obscuring
+/// the result. Exercise both carrier-density branches and both polarities.
+#[test]
+fn channel_derivatives_agree_with_central_differences() {
+    use ngspice_rs::devices::ModelContext;
+
+    let context = ModelContext::default();
+    for (family, polarity) in [("nhfet", 1.), ("phfet", -1.)] {
+        for parameters in ["", "eta2=1.5 d2=0.1u"] {
+            let c = circuit(&format!(
+                "vd d 0 1\nvg g 0 0\nz1 d g 0 model l=2u w=20u\n\
+                 .model model {family} level=6 {parameters} rdi=5 rsi=7"
+            ))
+            .unwrap();
+            let device = c.device("z1").unwrap();
+            let drain = c.nodes().get("d").unwrap();
+            let gate = c.nodes().get("g").unwrap();
+            let observe = |key: &str, vgs: f64, vds: f64| {
+                device
+                    .observation_operating(
+                        key,
+                        &context,
+                        &|node| {
+                            if node == drain {
+                                polarity * vds
+                            } else if node == gate {
+                                polarity * vgs
+                            } else {
+                                0.
+                            }
+                        },
+                        false,
+                    )
+                    .unwrap()
+                    .unwrap()
+            };
+            for vgs in [-0.8, -0.3, 0., 0.25, 0.6, 1.] {
+                for vds in [0.001, 0.1, 0.8, 2.] {
+                    let h = 1e-6;
+                    let gm = (observe("cd", vgs + h, vds) - observe("cd", vgs - h, vds)) / (2. * h);
+                    let gds =
+                        (observe("cd", vgs, vds + h) - observe("cd", vgs, vds - h)) / (2. * h);
+                    close(observe("gm", vgs, vds), gm, 2e-6, 1e-18);
+                    close(observe("gds", vgs, vds), gds, 2e-6, 1e-18);
+                }
+            }
+        }
+    }
+}
+
 /// HFET2 limits with `DEVpnjlim` *and* `DEVfetlim` (HFET1 has only the
 /// latter), so a strongly forward-biased gate exercises a code path the other
 /// levels do not have. The reference binary answers
