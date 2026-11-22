@@ -443,12 +443,20 @@ mod tests {
     fn base_resistance_retains_the_low_current_limit() {
         // High-precision independent evaluation of the original
         // tan-angle formula at C's positive clamp.
-        let expected = 0.999_999_997_600_046_1;
-        let actual = resistance_reduction(1e-9);
-        assert!((actual - expected).abs() < 5e-12, "{actual:.17}");
-        assert!(resistance_reduction(1e-9) <= 1.);
-        let at_large_current = resistance_reduction(Real::MAX);
-        assert!(at_large_current.is_finite() && at_large_current >= 0. && at_large_current < 1e-3);
+        for (ratio, expected) in [
+            (1e-9, 0.999_999_997_599_983_6),
+            (1e-5, 0.999_976_001_277_653_7),
+            (0.1, 0.842_202_817_059_103_5),
+            (1., 0.505_832_484_975_420_9),
+            (10., 0.212_853_734_527_759_96),
+            // C's rounded 14.59025 and 2.4317 give an angle just above
+            // pi/2 in the limit. Keep the model constants rather than
+            // silently clamp this small negative asymptotic correction.
+            (Real::MAX, -1.032_662_376_017_544_6e-5),
+        ] {
+            let actual = resistance_reduction(ratio);
+            assert!((actual - expected).abs() < 4e-14, "{ratio:e}: {actual:.17}");
+        }
     }
 
     #[test]

@@ -31,8 +31,6 @@
 //! phase itself (`PTF`) is rejected at instantiation, so the delayed `vbe`
 //! control equals `vbe`.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -40,10 +38,6 @@
 #![expect(
     clippy::float_cmp,
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use crate::devices::distortion::deriv::Dderivs;
