@@ -244,7 +244,7 @@ fn four_is_a_post_processing_card_and_not_an_analysis() {
             .netlist
             .cards
             .iter()
-            .any(|card| card.kind == ScopedCardKind::Fourier)
+            .any(|card| card.kind == ScopedCardKind::Fourier(0))
     );
     assert!(
         parsed.output.is_empty(),

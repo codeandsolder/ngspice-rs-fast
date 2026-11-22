@@ -1090,7 +1090,7 @@ pub struct FourierCard {
 /// for future serializers/snapshots; neither is implemented by this storage.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScopedCard {
-    /// Semantic kind and scope-local index, where applicable.
+    /// Semantic kind and scope-local index, including frontend side channels.
     pub kind: ScopedCardKind,
     /// Positioned source spelling/tokens of this card.
     pub source: crate::netlist::card::RawCard,
@@ -1125,21 +1125,16 @@ pub enum ScopedCardKind {
     InitialCondition(usize),
     /// Index into this scope's nodeset cards.
     Nodeset(usize),
-    /// A `.save` or root `.print`/`.plot` card. Body requests live in `Subcircuit::output`; root requests live in
-    /// the [`OutputCards`] the parser returns beside the [`Netlist`]
-    /// ([`crate::netlist::Parser::parse_file_with_output`]), so this card carries no
-    /// scope-local index.
-    Output,
-    /// A `.measure`/`.meas` card. Body requests live in `Subcircuit::measurements`; root requests live in
-    /// the [`MeasureCard`] list returned beside the [`Netlist`]
-    /// ([`ParsedDeck::measurements`](crate::netlist::ParsedDeck::measurements)), so this
-    /// card carries no scope-local index.
-    Measure,
-    /// A `.four` card. Body requests live in `Subcircuit::fourier`; root requests live in the
-    /// [`FourierCard`] list returned beside the [`Netlist`]
-    /// ([`ParsedDeck::fourier`](crate::netlist::ParsedDeck::fourier)), so this card
-    /// carries no scope-local index.
-    Fourier,
+    /// Index into the owning scope's output save cards.
+    Save(usize),
+    /// Index into the owning scope's output print/plot cards.
+    Print(usize),
+    /// Index into the owning scope's measurement cards.
+    Measure(usize),
+    /// Index into the owning scope's Fourier cards.
+    Fourier(usize),
+    /// Structural/control command with no separate semantic payload.
+    Control,
     /// End of a subcircuit body.
     Ends,
     /// End of a deck.
@@ -1187,6 +1182,212 @@ pub struct Netlist {
     pub cards: Vec<ScopedCard>,
     /// Where the deck started.
     pub location: SourceLoc,
+}
+
+/// Borrowed lexical scope shared by frontend passes. Semantic entries retain
+/// their typed vector identity and their source card's include provenance.
+#[derive(Clone, Copy)]
+pub(crate) struct ScopeView<'a> {
+    pub(crate) devices: &'a [DeviceInstance],
+    pub(crate) models: &'a [ModelCard],
+    pub(crate) subcircuits: &'a [Subcircuit],
+    pub(crate) analyses: &'a [AnalysisCard],
+    pub(crate) includes: &'a [IncludeDirective],
+    pub(crate) params: &'a [ParamCard],
+    pub(crate) options: &'a [OptionCard],
+    pub(crate) globals: &'a [GlobalCard],
+    pub(crate) initial_conditions: &'a [NodeHintCard],
+    pub(crate) nodesets: &'a [NodeHintCard],
+    pub(crate) functions: &'a [FuncCard],
+    pub(crate) cards: &'a [ScopedCard],
+}
+
+impl<'a> From<&'a Netlist> for ScopeView<'a> {
+    fn from(scope: &'a Netlist) -> Self {
+        Self {
+            devices: &scope.devices,
+            models: &scope.models,
+            subcircuits: &scope.subcircuits,
+            analyses: &scope.analyses,
+            includes: &scope.includes,
+            params: &scope.params,
+            options: &scope.options,
+            globals: &scope.globals,
+            initial_conditions: &scope.initial_conditions,
+            nodesets: &scope.nodesets,
+            functions: &scope.functions,
+            cards: &scope.cards,
+        }
+    }
+}
+
+impl<'a> From<&'a Subcircuit> for ScopeView<'a> {
+    fn from(scope: &'a Subcircuit) -> Self {
+        Self {
+            devices: &scope.devices,
+            models: &scope.models,
+            subcircuits: &scope.subcircuits,
+            analyses: &scope.analyses,
+            includes: &scope.includes,
+            params: &scope.params,
+            options: &scope.options,
+            globals: &scope.globals,
+            initial_conditions: &scope.initial_conditions,
+            nodesets: &scope.nodesets,
+            functions: &scope.functions,
+            cards: &scope.cards,
+        }
+    }
+}
+
+/// Resolved semantic entry with no unchecked index at consumer boundaries.
+pub(crate) enum ScopeEntry<'a> {
+    Device(&'a DeviceInstance),
+    Model(&'a ModelCard),
+    Subcircuit(&'a Subcircuit),
+    Analysis(&'a AnalysisCard),
+    Include(&'a IncludeDirective),
+    Param(&'a ParamCard),
+    Options(&'a OptionCard),
+    Global(&'a GlobalCard),
+    InitialCondition(&'a NodeHintCard),
+    Nodeset(&'a NodeHintCard),
+    Func(&'a FuncCard),
+    Save(usize),
+    Print(usize),
+    Measure(usize),
+    Fourier(usize),
+    Control,
+    Ends,
+    End,
+}
+
+#[derive(Debug)]
+pub(crate) enum ScopeOrderError {
+    Index {
+        index: usize,
+        collection: &'static str,
+    },
+    Coverage,
+}
+
+impl std::fmt::Display for ScopeOrderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Index { index, collection } => {
+                write!(f, "card index {index} is out of range for {collection}")
+            }
+            Self::Coverage => f.write_str(
+                "the ordered cards do not reference every typed entry exactly once in vector order",
+            ),
+        }
+    }
+}
+
+fn scope_entry<'a, T>(
+    entries: &'a [T],
+    index: usize,
+    collection: &'static str,
+) -> Result<&'a T, ScopeOrderError> {
+    entries
+        .get(index)
+        .ok_or(ScopeOrderError::Index { index, collection })
+}
+
+impl<'a> ScopeView<'a> {
+    pub(crate) fn entry(self, kind: ScopedCardKind) -> Result<ScopeEntry<'a>, ScopeOrderError> {
+        match kind {
+            ScopedCardKind::Device(index) => {
+                scope_entry(self.devices, index, "devices").map(ScopeEntry::Device)
+            }
+            ScopedCardKind::Model(index) => {
+                scope_entry(self.models, index, "models").map(ScopeEntry::Model)
+            }
+            ScopedCardKind::Subcircuit(index) => {
+                scope_entry(self.subcircuits, index, "subcircuits").map(ScopeEntry::Subcircuit)
+            }
+            ScopedCardKind::Analysis(index) => {
+                scope_entry(self.analyses, index, "analyses").map(ScopeEntry::Analysis)
+            }
+            ScopedCardKind::Include(index) => {
+                scope_entry(self.includes, index, "includes").map(ScopeEntry::Include)
+            }
+            ScopedCardKind::Param(index) => {
+                scope_entry(self.params, index, "params").map(ScopeEntry::Param)
+            }
+            ScopedCardKind::Options(index) => {
+                scope_entry(self.options, index, "options").map(ScopeEntry::Options)
+            }
+            ScopedCardKind::Global(index) => {
+                scope_entry(self.globals, index, "globals").map(ScopeEntry::Global)
+            }
+            ScopedCardKind::InitialCondition(index) => {
+                scope_entry(self.initial_conditions, index, "initial_conditions")
+                    .map(ScopeEntry::InitialCondition)
+            }
+            ScopedCardKind::Nodeset(index) => {
+                scope_entry(self.nodesets, index, "nodesets").map(ScopeEntry::Nodeset)
+            }
+            ScopedCardKind::Func(index) => {
+                scope_entry(self.functions, index, "functions").map(ScopeEntry::Func)
+            }
+            ScopedCardKind::Save(index) => Ok(ScopeEntry::Save(index)),
+            ScopedCardKind::Print(index) => Ok(ScopeEntry::Print(index)),
+            ScopedCardKind::Measure(index) => Ok(ScopeEntry::Measure(index)),
+            ScopedCardKind::Fourier(index) => Ok(ScopeEntry::Fourier(index)),
+            ScopedCardKind::Control => Ok(ScopeEntry::Control),
+            ScopedCardKind::Ends => Ok(ScopeEntry::Ends),
+            ScopedCardKind::End => Ok(ScopeEntry::End),
+        }
+    }
+
+    /// Indexed vectors are in card order. Reject missing or duplicate refs
+    /// even when their total count happens to equal the vector lengths.
+    pub(crate) fn validate_order(self) -> Result<(), ScopeOrderError> {
+        let lengths = [
+            self.devices.len(),
+            self.models.len(),
+            self.subcircuits.len(),
+            self.analyses.len(),
+            self.includes.len(),
+            self.params.len(),
+            self.options.len(),
+            self.globals.len(),
+            self.initial_conditions.len(),
+            self.nodesets.len(),
+            self.functions.len(),
+        ];
+        let mut next = [0; 15];
+        for card in self.cards {
+            let (collection, index) = match card.kind {
+                ScopedCardKind::Device(index) => (0, index),
+                ScopedCardKind::Model(index) => (1, index),
+                ScopedCardKind::Subcircuit(index) => (2, index),
+                ScopedCardKind::Analysis(index) => (3, index),
+                ScopedCardKind::Include(index) => (4, index),
+                ScopedCardKind::Param(index) => (5, index),
+                ScopedCardKind::Options(index) => (6, index),
+                ScopedCardKind::Global(index) => (7, index),
+                ScopedCardKind::InitialCondition(index) => (8, index),
+                ScopedCardKind::Nodeset(index) => (9, index),
+                ScopedCardKind::Func(index) => (10, index),
+                ScopedCardKind::Save(index) => (11, index),
+                ScopedCardKind::Print(index) => (12, index),
+                ScopedCardKind::Measure(index) => (13, index),
+                ScopedCardKind::Fourier(index) => (14, index),
+                _ => continue,
+            };
+            self.entry(card.kind)?;
+            if index != next[collection] {
+                return Err(ScopeOrderError::Coverage);
+            }
+            next[collection] += 1;
+        }
+        if next[..11] != lengths {
+            return Err(ScopeOrderError::Coverage);
+        }
+        Ok(())
+    }
 }
 
 impl Netlist {
