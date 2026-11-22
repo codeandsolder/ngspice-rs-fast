@@ -29,10 +29,12 @@
 //!    `* xtask-codemodels: <name>...` comment; the scratch directory then gets
 //!    a `.spiceinit` with just those `codemodel` commands.
 
-use std::fmt::Write as _;
+use std::ffi::{OsStr, OsString};
+use std::fmt::{Debug, Write as _};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The C binary, and what it says it is.
 #[derive(Debug, Clone)]
@@ -131,6 +133,151 @@ fn version_of(binary: &Path) -> Result<String, String> {
         .find(|word| word.starts_with("ngspice-"))
         .map(|word| word.trim_end_matches(':').to_owned())
         .ok_or_else(|| "no 'ngspice-<version>' token in --version output".to_owned())
+}
+
+/// Isolated scratch directory, removed on normal return and unwinding.
+/// Set `NGSPICE_KEEP_SCRATCH=1` to preserve it explicitly for diagnosis.
+#[derive(Debug)]
+pub struct Scratch {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl Scratch {
+    /// Create a new directory; an existing path is never reused or removed.
+    ///
+    /// # Errors
+    /// The tag is not a simple name, or the directory cannot be created.
+    pub fn new(tag: &str) -> Result<Self, String> {
+        Self::create_at(
+            &std::env::temp_dir(),
+            tag,
+            std::env::var_os("NGSPICE_KEEP_SCRATCH").is_some_and(|value| value == "1"),
+        )
+    }
+
+    fn create_at(root: &Path, tag: &str, keep: bool) -> Result<Self, String> {
+        if tag.is_empty()
+            || !tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(format!("invalid scratch tag {tag:?}"));
+        }
+        static ID: AtomicUsize = AtomicUsize::new(0);
+        let root = fs::canonicalize(root)
+            .map_err(|error| format!("scratch root {}: {error}", root.display()))?;
+        loop {
+            let path = root.join(format!(
+                "ngspice-{tag}-{}-{}",
+                std::process::id(),
+                ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path, keep }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(format!("creating {}: {error}", path.display())),
+            }
+        }
+    }
+
+    /// Absolute directory path, valid for this scratch owner's lifetime.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if self.keep {
+            eprintln!("preserved ngspice scratch: {}", self.path.display());
+        } else if let Err(error) = fs::remove_dir_all(&self.path) {
+            eprintln!("cleanup of {} failed: {error}", self.path.display());
+        }
+    }
+}
+
+impl Ngspice {
+    /// Resolve the explicitly pinned live-test binary, with no PATH fallback.
+    ///
+    /// # Errors
+    /// Missing/relative `NGSPICE_BIN`, or the executable/version probe fails.
+    pub fn pinned() -> Result<Self, String> {
+        Self::pinned_selection(std::env::var_os("NGSPICE_BIN"))
+    }
+
+    fn pinned_selection(selected: Option<OsString>) -> Result<Self, String> {
+        let path = selected
+            .map(PathBuf::from)
+            .ok_or_else(|| "set absolute NGSPICE_BIN for live C tests".to_owned())?;
+        if !path.is_absolute() {
+            return Err(format!("NGSPICE_BIN must be absolute: {}", path.display()));
+        }
+        locate(Some(&path), Path::new("."))
+    }
+
+    /// Run C in the specified isolated directory, retaining both captured
+    /// streams and the child status independently. The binary is absolute.
+    ///
+    /// # Errors
+    /// The child could not be launched or its output could not be captured.
+    pub fn run(
+        &self,
+        directory: &Path,
+        args: &[impl AsRef<OsStr> + Debug],
+    ) -> Result<ProcessOutput, String> {
+        let output = Command::new(&self.path)
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .map_err(|error| {
+                format!(
+                    "running {} {args:?} in {}: {error}",
+                    self.path.display(),
+                    directory.display()
+                )
+            })?;
+        Ok(ProcessOutput {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
+/// Child status and the two separately captured log streams.
+#[derive(Debug, Clone)]
+pub struct ProcessOutput {
+    /// Exit status; successful exit does not guarantee all measurements passed.
+    pub status: ExitStatus,
+    /// Console output.
+    pub stdout: String,
+    /// Diagnostics.
+    pub stderr: String,
+}
+
+impl ProcessOutput {
+    /// Return both streams with explicit separators for diagnostics.
+    #[must_use]
+    pub fn transcript(&self) -> String {
+        format!(
+            "--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.stdout, self.stderr
+        )
+    }
+
+    /// Check the child's exit status, preserving the full captured diagnostics.
+    ///
+    /// # Errors
+    /// The child exited unsuccessfully.
+    pub fn require_success(&self, label: &str) -> Result<(), String> {
+        if self.status.success() {
+            Ok(())
+        } else {
+            Err(format!("{label}: {}\n{}", self.status, self.transcript()))
+        }
+    }
 }
 
 /// The result of capturing one fixture.
@@ -237,15 +384,8 @@ pub fn capture(
     fs::write(&deck_path, &deck)
         .map_err(|error| format!("writing {}: {error}", deck_path.display()))?;
 
-    let output = Command::new(&ngspice.path)
-        .arg("-b")
-        .arg(&deck_path)
-        .current_dir(&directory)
-        .output()
-        .map_err(|error| format!("running {}: {error}", ngspice.path.display()))?;
-
-    let log = String::from_utf8_lossy(&output.stdout).into_owned()
-        + &String::from_utf8_lossy(&output.stderr);
+    let output = ngspice.run(&directory, &[OsStr::new("-b"), deck_path.as_os_str()])?;
+    let log = format!("{}{}", output.stdout, output.stderr);
     if !output.status.success() {
         return Err(format!(
             "{} failed on {name} with {}\n--- ngspice output ---\n{}",
@@ -413,6 +553,59 @@ mod tests {
     };
 
     #[test]
+    fn scratch_names_are_unique_and_cleanup_survives_unwinding() {
+        use super::Scratch;
+        let root = Scratch::create_at(&std::env::temp_dir(), "scratch-root", false).unwrap();
+        let first = Scratch::create_at(root.path(), "same", false).unwrap();
+        let second = Scratch::create_at(root.path(), "same", false).unwrap();
+        assert_ne!(first.path(), second.path());
+        let path = first.path().to_path_buf();
+        let result = std::panic::catch_unwind(move || {
+            std::fs::write(first.path().join("data"), "test").unwrap();
+            panic!("intentional test unwind");
+        });
+        assert!(result.is_err());
+        assert!(!path.exists());
+        assert!(second.path().exists());
+        assert!(Scratch::create_at(root.path(), "../escape", false).is_err());
+        let kept = Scratch::create_at(root.path(), "retained", true).unwrap();
+        let kept_path = kept.path().to_path_buf();
+        drop(kept);
+        assert!(kept_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_keeps_streams_status_and_launch_errors_separate() {
+        let directory = super::Scratch::create_at(&std::env::temp_dir(), "child", false).unwrap();
+        let binary = super::Ngspice {
+            path: "/bin/sh".into(),
+            version: "test".into(),
+        };
+        let output = binary
+            .run(
+                directory.path(),
+                &["-c", "printf hello; printf warning >&2; exit 7"],
+            )
+            .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, "hello");
+        assert_eq!(output.stderr, "warning");
+        let error = output.require_success("child").unwrap_err();
+        assert!(error.contains("hello") && error.contains("warning") && error.contains("child"));
+        let missing = super::Ngspice {
+            path: directory.path().join("missing-executable"),
+            version: "test".into(),
+        };
+        assert!(
+            missing
+                .run(directory.path(), &["-b"])
+                .unwrap_err()
+                .contains("missing-executable")
+        );
+    }
+
+    #[test]
     fn fixtures_request_code_models_by_a_marker_comment() {
         let deck = "t\n* xtask-codemodels: spice2poly Analog\n* other\nr1 a 0 1\n.end\n";
         assert_eq!(requested_codemodels(deck), ["spice2poly", "analog"]);
@@ -420,27 +613,48 @@ mod tests {
     }
 
     #[test]
+    fn live_oracle_requires_an_absolute_explicit_selection() {
+        assert!(
+            super::Ngspice::pinned_selection(None)
+                .unwrap_err()
+                .contains("set absolute NGSPICE_BIN")
+        );
+        assert!(
+            super::Ngspice::pinned_selection(Some("ngspice".into()))
+                .unwrap_err()
+                .contains("must be absolute")
+        );
+        let directory = super::Scratch::new("pinned-selection").unwrap();
+        let absent = directory.path().join("missing-c").into_os_string();
+        assert!(
+            super::Ngspice::pinned_selection(Some(absent))
+                .unwrap_err()
+                .contains("missing-c")
+        );
+    }
+
+    #[test]
     fn missing_explicit_binary_never_falls_back() {
-        let directory = crate::Temp::new();
-        let binary = directory.0.join("missing-ngspice");
-        let error = super::locate(Some(&binary), &directory.0).unwrap_err();
+        let directory = super::Scratch::new("conformance-test").unwrap();
+        let binary = directory.path().join("missing-ngspice");
+        let error = super::locate(Some(&binary), directory.path()).unwrap_err();
         assert!(error.contains(&binary.display().to_string()), "{error}");
     }
 
     #[test]
     fn stale_init_is_removed_or_reported() {
-        let directory = crate::Temp::new();
+        let directory = super::Scratch::new("conformance-test").unwrap();
         let binary = super::Ngspice {
-            path: directory.0.join("missing-ngspice"),
+            path: directory.path().join("missing-ngspice"),
             version: "test".to_owned(),
         };
-        let init = directory.0.join(".spiceinit");
+        let init = directory.path().join(".spiceinit");
         std::fs::write(&init, "codemodel obsolete.cm").unwrap();
-        super::write_codemodel_init(&binary, DECK, &directory.0).unwrap();
+        super::write_codemodel_init(&binary, DECK, directory.path()).unwrap();
         assert!(!init.exists());
-        super::write_codemodel_init(&binary, DECK, &directory.0).unwrap();
+        super::write_codemodel_init(&binary, DECK, directory.path()).unwrap();
         std::fs::create_dir(&init).unwrap();
-        let error = super::write_codemodel_init(&binary, DECK, &directory.0).unwrap_err();
+        let error = super::write_codemodel_init(&binary, DECK, directory.path()).unwrap_err();
         assert!(
             error.contains("removing stale") && error.contains(".spiceinit"),
             "{error}"
@@ -449,14 +663,14 @@ mod tests {
 
     #[test]
     fn stale_rawfile_failure_precedes_process_launch() {
-        let directory = crate::Temp::new();
+        let directory = super::Scratch::new("conformance-test").unwrap();
         let binary = super::Ngspice {
-            path: directory.0.join("missing-ngspice"),
+            path: directory.path().join("missing-ngspice"),
             version: "test".to_owned(),
         };
-        let deck = directory.0.join("fixture.cir");
+        let deck = directory.path().join("fixture.cir");
         std::fs::write(&deck, DECK).unwrap();
-        let scratch = directory.0.join("scratch");
+        let scratch = directory.path().join("scratch");
         std::fs::create_dir_all(scratch.join("fixture/fixture.raw")).unwrap();
         let error = super::capture(&binary, &deck, &scratch, &[]).unwrap_err();
         assert!(

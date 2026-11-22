@@ -1,4 +1,6 @@
 //! Scalar measurements: C's two-pass ordering, deck parameters, and atomic errors.
+use ngspice_conformance::measurement::{self, Analysis};
+use ngspice_conformance::ngspice::{Ngspice, Scratch};
 use ngspice_rs::analysis::{Plot, PlotFlags, Variable, measure};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::eval::ParamScope;
@@ -6,7 +8,6 @@ use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::{AnalysisKind, Complex};
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 fn evaluate(body: &str) -> ngspice_rs::primitives::SpiceResult<Vec<measure::Measurement>> {
     let parsed =
@@ -71,62 +72,58 @@ fn scalar_measurements_round_trip_and_malformed_tails_fail() {
     }
 }
 
+fn compare_live(tag: &str, text: &str) {
+    let scratch = Scratch::new(tag).expect("scratch directory");
+    let deck = scratch.path().join("deck.cir");
+    let raw = scratch.path().join("out.raw");
+    fs::write(&deck, text).unwrap();
+    let binary = Ngspice::pinned().expect("pinned C reference");
+    let output = binary
+        .run(scratch.path(), &["-b", "deck.cir"])
+        .expect("run C");
+    output
+        .require_success(tag)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let report = measurement::parse(&output.stdout, &output.stderr)
+        .unwrap_or_else(|error| panic!("{tag}: {error}\n{}", output.transcript()));
+    let ours = ngspice_rs::cli::simulate::run(&deck, &raw, true).unwrap();
+    let [plot] = ours.plots.as_slice() else {
+        panic!("{tag}: expected one analysis plot");
+    };
+    assert_eq!(plot.analysis, AnalysisKind::Transient);
+    measurement::compare(
+        &report,
+        Analysis::Tran,
+        plot.measurements
+            .iter()
+            .map(|row| (row.name.clone(), row.value)),
+        |_| 1e-5_f64.next_down(),
+    )
+    .unwrap_or_else(|error| panic!("{tag}: {error}\n{}", output.transcript()));
+}
+
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN"]
 fn scalar_measurements_match_live_c() {
-    let binary = std::env::var("NGSPICE_BIN").unwrap();
-    assert!(Path::new(&binary).is_absolute());
-    let dir = std::env::temp_dir().join(format!("m9-meas-expr-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    let deck = dir.join("deck.cir");
-    let raw = dir.join("out.raw");
-    fs::write(
-        &deck,
-        DECK.replace("chained expr=", "chained param=").replace(
+    compare_live(
+        "m9-meas-expr",
+        &DECK.replace("chained expr=", "chained param=").replace(
             "Scalar\n",
             "Scalar\nV1 out 0 pwl(0 0 1 2)\nR1 out 0 1k\n.tran .01 1\n",
         ),
-    )
-    .unwrap();
-    let c = Command::new(binary).arg("-b").arg(&deck).output().unwrap();
-    let stdout = String::from_utf8_lossy(&c.stdout);
-    assert!(
-        c.status.success(),
-        "{stdout} {}",
-        String::from_utf8_lossy(&c.stderr)
     );
-    let ours = ngspice_rs::cli::simulate::run(&deck, &raw, true).unwrap();
-    for result in &ours.plots.last().unwrap().measurements {
-        let value: f64 = stdout
-            .lines()
-            .find_map(|line| {
-                let (name, tail) = line.split_once('=')?;
-                (name.trim() == result.name)
-                    .then(|| tail.split_whitespace().next()?.parse().ok())
-                    .flatten()
-            })
-            .unwrap_or_else(|| panic!("missing {}: {stdout}", result.name));
-        assert!(
-            (result.value - value).abs() < 1e-5,
-            "{}: {} vs {value}",
-            result.name,
-            result.value
-        );
-    }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn invalid_scalar_expression_preserves_existing_rawfile() {
-    let dir = std::env::temp_dir().join(format!("m9-meas-atomic-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let scratch = Scratch::new("m9-meas-atomic").unwrap();
+    let dir = scratch.path();
     let deck = dir.join("deck.cir");
     let raw = dir.join("out.raw");
     fs::write(&raw, b"previous output").unwrap();
     fs::write(&deck, "Bad scalar\nV1 out 0 1\nR1 out 0 1k\n.tran .01 1\n.measure tran invalid param='missing+1'\n.end\n").unwrap();
     assert!(ngspice_rs::cli::simulate::run(&deck, &raw, true).is_err());
     assert_eq!(fs::read(&raw).unwrap(), b"previous output");
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -158,39 +155,10 @@ fn numeric_setter_expressions_resolve_parameters_and_prior_results() {
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN"]
 fn numeric_setter_integration_expressions_match_live_c() {
-    let binary = std::env::var("NGSPICE_BIN").unwrap();
-    assert!(Path::new(&binary).is_absolute());
-    let dir = std::env::temp_dir().join(format!("m9-setters-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    let deck = dir.join("deck.cir");
-    let raw = dir.join("out.raw");
-    fs::write(&deck, "Setters\n.param half=.5 one=1\nV1 out 0 pwl(0 0 1 2)\nR1 out 0 1k\n.tran .01 1\n.measure tran sample find v(out) at={half}\n.measure tran crossing when v(out)={one} rise={one} td={half/2}\n.measure tran area integ v(out) from={half} to={one}\n.end\n").unwrap();
-    let c = Command::new(binary).arg("-b").arg(&deck).output().unwrap();
-    let stdout = String::from_utf8_lossy(&c.stdout);
-    assert!(
-        c.status.success(),
-        "{stdout} {}",
-        String::from_utf8_lossy(&c.stderr)
+    compare_live(
+        "m9-setters",
+        "Setters\n.param half=.5 one=1\nV1 out 0 pwl(0 0 1 2)\nR1 out 0 1k\n.tran .01 1\n.measure tran sample find v(out) at={half}\n.measure tran crossing when v(out)={one} rise={one} td={half/2}\n.measure tran area integ v(out) from={half} to={one}\n.end\n",
     );
-    let ours = ngspice_rs::cli::simulate::run(&deck, &raw, true).unwrap();
-    for result in &ours.plots.last().unwrap().measurements {
-        let value: f64 = stdout
-            .lines()
-            .find_map(|line| {
-                let (name, tail) = line.split_once('=')?;
-                (name.trim() == result.name)
-                    .then(|| tail.split_whitespace().next()?.parse().ok())
-                    .flatten()
-            })
-            .unwrap_or_else(|| panic!("missing {}: {stdout}", result.name));
-        assert!(
-            (result.value - value).abs() < 1e-5,
-            "{}: {} vs {value}",
-            result.name,
-            result.value
-        );
-    }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -226,37 +194,8 @@ fn numeric_setter_expressions_share_the_measurement_scope() {
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN"]
 fn numeric_setter_expressions_match_live_c() {
-    let binary = std::env::var("NGSPICE_BIN").unwrap();
-    assert!(Path::new(&binary).is_absolute());
-    let dir = std::env::temp_dir().join(format!("m9-meas-setters-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    let deck = dir.join("deck.cir");
-    let raw = dir.join("out.raw");
-    fs::write(&deck,"Setters\n.param lo=.25 hi=.75 target=1 count=1\nV1 out 0 pwl(0 0 1 2)\nR1 out 0 1k\n.tran .01 1\n.meas tran peak max v(out) from={lo} to='hi'\n.meas tran cross when v(out)={target} rise={count} td={lo}\n.meas tran at_cross find v(out) at={target/2}\n.meas tran delay trig v(out) val={target} rise='count' td={lo} targ at={hi}\n.end\n").unwrap();
-    let c = Command::new(binary).arg("-b").arg(&deck).output().unwrap();
-    let stdout = String::from_utf8_lossy(&c.stdout);
-    assert!(
-        c.status.success(),
-        "{stdout} {}",
-        String::from_utf8_lossy(&c.stderr)
+    compare_live(
+        "m9-meas-setters",
+        "Setters\n.param lo=.25 hi=.75 target=1 count=1\nV1 out 0 pwl(0 0 1 2)\nR1 out 0 1k\n.tran .01 1\n.meas tran peak max v(out) from={lo} to='hi'\n.meas tran cross when v(out)={target} rise={count} td={lo}\n.meas tran at_cross find v(out) at={target/2}\n.meas tran delay trig v(out) val={target} rise='count' td={lo} targ at={hi}\n.end\n",
     );
-    let ours = ngspice_rs::cli::simulate::run(&deck, &raw, true).unwrap();
-    for result in &ours.plots[0].measurements {
-        let value: f64 = stdout
-            .lines()
-            .find_map(|line| {
-                let (name, tail) = line.split_once('=')?;
-                (name.trim() == result.name)
-                    .then(|| tail.split_whitespace().next()?.parse().ok())
-                    .flatten()
-            })
-            .unwrap_or_else(|| panic!("missing {}: {stdout}", result.name));
-        assert!(
-            (result.value - value).abs() < 1e-5,
-            "{}: {} vs {value}",
-            result.name,
-            result.value
-        );
-    }
-    fs::remove_dir_all(dir).unwrap();
 }

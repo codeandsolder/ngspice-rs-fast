@@ -15,22 +15,15 @@
 //! Nothing here reads or rewrites a committed golden.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
+
+use ngspice_conformance::measurement::{self, Analysis};
+use ngspice_conformance::ngspice::{Ngspice, Scratch};
 
 use ngspice_rs::analysis::{RunConfig, measure, runner};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::{AnalysisKind, Real};
-
-/// Removes the temporary directory even when the test fails.
-struct Cleanup(PathBuf);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// The deck's `.measure` results, evaluated over the port's own plot.
 fn port_results(deck: &str) -> Vec<(String, Real)> {
@@ -55,113 +48,29 @@ fn port_results(deck: &str) -> Vec<(String, Real)> {
         .collect()
 }
 
-/// The `name = value` pairs C printed for the same deck.
-fn c_results(tag: &str, deck: &str) -> Vec<(String, Real)> {
-    let binary = std::env::var_os("NGSPICE_BIN").expect("set absolute NGSPICE_BIN");
-    assert!(Path::new(&binary).is_absolute());
-    let dir =
-        std::env::temp_dir().join(format!("spice-measure-oracle-{}-{tag}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir(&dir).expect("scratch directory");
-    let _cleanup = Cleanup(dir.clone());
+/// Runs both engines and checks the complete result set, with the original
+/// few-printed-ULP bound and the actual requested analysis.
+fn compare(tag: &str, kind: AnalysisKind, deck: &str) {
+    let scratch = Scratch::new(tag).expect("scratch directory");
     fs::write(
-        dir.join("measure.cir"),
+        scratch.path().join("measure.cir"),
         format!("Measure oracle\n{deck}\n.end\n"),
     )
     .expect("write the deck");
-    let run = Command::new(&binary)
-        .args(["-b", "measure.cir"])
-        .current_dir(&dir)
-        .output()
-        .expect("run ngspice");
-    let output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr)
-    );
-    assert!(run.status.success(), "{tag}: {output}");
-    assert!(
-        !output.contains("failed!"),
-        "{tag}: C reported a failed measurement:\n{output}"
-    );
-    measurement_results(&output)
-}
-
-/// Restrict name/value parsing to C's measurement report, not its trailing
-/// resource accounting (which includes the valid-looking line `Stack = 0 bytes.`).
-fn measurement_results(output: &str) -> Vec<(String, Real)> {
-    let mut measuring = false;
-    let mut started = false;
-    let mut results = Vec::new();
-    for line in output.lines().map(str::trim) {
-        if line.starts_with("Measurements for ") && line.ends_with(" Analysis") {
-            measuring = true;
-            started = false;
-            continue;
-        }
-        if !measuring {
-            continue;
-        }
-        if line.is_empty() {
-            if started {
-                measuring = false;
-            }
-            continue;
-        }
-        started = true;
-        let Some((name, rest)) = line.split_once('=') else {
-            continue;
-        };
-        let name = name.trim();
-        if name.is_empty() || name.chars().any(char::is_whitespace) {
-            continue;
-        }
-        if let Some(value) = rest.split_whitespace().next()
-            && let Ok(value) = value.parse::<Real>()
-        {
-            results.push((name.to_owned(), value));
-        }
-    }
-    results
-}
-
-#[test]
-fn measurement_report_excludes_resource_statistics_but_preserves_all_results() {
-    let output = "Measurements for DC Analysis\n\n                  gain = 2.00000e+00 at= 1.00000e+00\n                  stack = 3.00000e+00\n\n                  Stack = 0 bytes.\n                  Measurements for AC Analysis\n\n                  phase = -1.50000e+00\n\n                  Stack = 0 bytes.";
-    assert_eq!(
-        measurement_results(output),
-        vec![
-            ("gain".to_owned(), 2.0),
-            ("stack".to_owned(), 3.0),
-            ("phase".to_owned(), -1.5)
-        ]
-    );
-}
-
-/// Runs both engines on one deck and compares every named measurement.
-fn compare(tag: &str, kind: AnalysisKind, deck: &str) {
-    let ours = port_results(deck);
-    let theirs = c_results(tag, deck);
-    assert!(!ours.is_empty(), "{tag}: the port measured nothing");
-    for (name, value) in &ours {
-        let Some((_, reference)) = theirs.iter().find(|(other, _)| other == name) else {
-            panic!("{tag}: C measured no '{name}': {theirs:?}");
-        };
-        // A few printed ULPs of C's 5-fractional-digit output, not a physical
-        // tolerance: both engines ran the same deck and this port's transient
-        // driver is compared with C elsewhere (m3_gate).
-        let error = (value - reference).abs();
-        assert!(
-            error <= 3e-5 * reference.abs() + 1e-9,
-            "{tag}: {name}: port {value:e}, C {reference:e} (error {error:e})"
-        );
-    }
-    assert_eq!(
-        ours.len(),
-        theirs.len(),
-        "{tag}: the two engines measured a different set: Rust {ours:?}; C {theirs:?}"
-    );
-    let _ = kind;
+    let binary = Ngspice::pinned().expect("pinned C reference");
+    let output = binary
+        .run(scratch.path(), &["-b", "measure.cir"])
+        .expect("run C");
+    output
+        .require_success(tag)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let theirs = measurement::parse(&output.stdout, &output.stderr)
+        .unwrap_or_else(|error| panic!("{tag}: {error}\n{}", output.transcript()));
+    let analysis = Analysis::keyword(kind.as_str()).expect("supported measurement analysis");
+    measurement::compare(&theirs, analysis, port_results(deck), |reference| {
+        3e-5 * reference.abs() + 1e-9
+    })
+    .unwrap_or_else(|error| panic!("{tag}: {error}\n{}", output.transcript()));
 }
 
 #[test]
