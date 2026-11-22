@@ -55,7 +55,7 @@ use crate::analysis::frequency::{Advance, FrequencyGrid, MAX_POINTS};
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{Plot, PlotFlags, Variable};
 use crate::analysis::{AnalysisContext, AnalysisPlan};
-use crate::devices::noise::{InstanceNoise, circuit_noise, squared_gain};
+use crate::devices::noise::{InstanceNoise, prepared_noise, squared_gain};
 use crate::devices::{Circuit, LinearSystem, SourceKind};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult, parse_spice_number};
 
@@ -775,7 +775,7 @@ pub(super) fn run(
         model
     };
     let mut generators: Vec<Generators> =
-        circuit_noise(circuit, &first, small.bias(), Some(small.state()))?
+        prepared_noise(small.prepared(), &first, small.bias(), Some(small.state()))?
             .into_iter()
             .map(Generators::new)
             .collect();
@@ -792,7 +792,7 @@ pub(super) fn run(
     let mut row = NoiseRow::new(representation, spectrum.variable_count());
     for (step, &freq) in frequencies.iter().enumerate() {
         let input_name = card.input.as_str();
-        let (forward, adjoint) = small.at_frequency(circuit, context, freq, |system| {
+        let (forward, adjoint) = small.at_frequency(context, freq, |system| {
             let matrix =
                 crate::analysis::ac::ac_matrix(circuit, system, 2. * std::f64::consts::PI * freq)?;
             let lu = matrix.factorize()?;
@@ -807,8 +807,8 @@ pub(super) fn run(
         if small.varies() || small.reassembles() {
             refresh_generators(
                 &mut generators,
-                circuit_noise(
-                    circuit,
+                prepared_noise(
+                    small.prepared(),
                     &model.with_frequency(freq),
                     small.bias(),
                     Some(small.state()),

@@ -328,6 +328,18 @@ impl<'a> PreparedRun<'a> {
         self.circuit.convergence_prepared(self, request)
     }
 
+    /// Record persistent MODEINITSMSIG slots using the effective devices.
+    /// # Errors
+    /// As [`Circuit::record_small_signal_state`].
+    pub fn record_small_signal_state(
+        &self,
+        context: &ModelContext,
+        bias: &Vector,
+    ) -> SpiceResult<()> {
+        self.circuit
+            .record_small_signal_state_prepared(self, context, bias)
+    }
+
     /// Assemble the small-signal system with this run's effective devices.
     /// # Errors
     /// As [`Circuit::small_signal_system_at`].
@@ -1770,6 +1782,15 @@ impl Circuit {
         context: &ModelContext,
         bias: &crate::maths::Vector,
     ) -> SpiceResult<()> {
+        self.prepare_run().record_small_signal_state(context, bias)
+    }
+
+    fn record_small_signal_state_prepared(
+        &self,
+        run: &PreparedRun<'_>,
+        context: &ModelContext,
+        bias: &Vector,
+    ) -> SpiceResult<()> {
         self.check_numbering()?;
         if bias.len() != self.unknown_count() {
             return Err(SpiceError::circuit("small-signal state bias dimensions"));
@@ -1789,10 +1810,13 @@ impl Circuit {
             unknowns: &self.bindings.unknowns,
             bias,
         };
-        for (index, device) in self.devices.iter().enumerate() {
+        let point = run.point(context)?;
+        for index in 0..self.devices.len() {
             let rows = self.bindings.state_rows[index].clone();
             if let Some(slots) = state.get_mut(rows) {
-                device.small_signal_state(&operating, slots)?;
+                point
+                    .device(self, index)
+                    .small_signal_state(&operating, slots)?;
             }
         }
         let snapshot = self.bind_state(state)?;

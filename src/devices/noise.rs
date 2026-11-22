@@ -488,13 +488,22 @@ pub fn circuit_noise(
     bias: &Vector,
     state: Option<&crate::devices::StateSnapshot>,
 ) -> SpiceResult<Vec<InstanceNoise>> {
+    prepared_noise(&circuit.prepare_run(), context, bias, state)
+}
+
+pub(crate) fn prepared_noise(
+    run: &crate::devices::PreparedRun<'_>,
+    context: &ModelContext,
+    bias: &Vector,
+    state: Option<&crate::devices::StateSnapshot>,
+) -> SpiceResult<Vec<InstanceNoise>> {
+    let circuit = run.circuit();
     if bias.len() != circuit.unknown_count() || !bias.is_finite() {
         return Err(SpiceError::circuit("invalid noise bias dimensions/values"));
     }
     let state = circuit.snapshot_values(state)?;
     // (family, model creation rank, instance rank, entry)
     let mut models = std::collections::BTreeMap::new();
-    let run = circuit.prepare_run();
     let point = run.point(context)?;
     let mut entries: Vec<(NoiseFamily, usize, usize, InstanceNoise)> = Vec::new();
     for index in 0..circuit.device_count() {

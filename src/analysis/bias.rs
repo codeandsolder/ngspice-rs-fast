@@ -858,11 +858,11 @@ impl OperatingPointStart {
 
     pub(super) fn solve(
         &self,
-        circuit: &Circuit,
+        prepared: &PreparedRun<'_>,
         model: &ModelContext,
         settings: &DcSettings,
     ) -> SpiceResult<NewtonSolution<TrialState>> {
-        self.solve_from(&circuit.prepare_run(), model, settings, &self.seed)
+        self.solve_from(prepared, model, settings, &self.seed)
     }
 
     /// Another operating point in the same analysis: keep MODEINITJCT and
