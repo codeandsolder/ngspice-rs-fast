@@ -812,8 +812,12 @@ mod tests {
             .unwrap();
         let instance = &deck.devices[0];
         let input = parse_source_setters(instance).unwrap();
-        assert!(input.ac_given);
-        assert_eq!(input.mag.to_bits(), 0_f64.to_bits());
+        let ac = input
+            .inputs
+            .ac
+            .expect("explicit AC magnitude must be retained");
+        assert_eq!(ac.magnitude.map(f64::to_bits), Some(0_f64.to_bits()));
+        assert!(ac.phase.is_none());
         assert!(input.port.power_function.is_some());
         let mut nodes = NodeTable::new();
         let existing = nodes.intern("v1#res").unwrap();
