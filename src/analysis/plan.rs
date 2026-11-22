@@ -965,7 +965,7 @@ mod boundary_tests {
 
     #[test]
     fn programmatic_node_hints_reject_nonfinite_values_at_resolution() {
-        let location = crate::primitives::SourceLoc::new("input.cir".into(), 7, 4);
+        let location = crate::primitives::SourceLoc::new(std::path::PathBuf::from("input.cir"), 7, 4);
         let mut input = AnalysisInput::new(AnalysisKind::OperatingPoint);
         input.nodesets.push(crate::analysis::NodeCondition {
             node: "a".into(),
