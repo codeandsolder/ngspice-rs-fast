@@ -2338,7 +2338,7 @@ mod tests {
         let plot = &mut raw.plots[0].plot;
         let index = plot.variable_index("v(q1:ise)").unwrap();
         plot.points[0][index] = ngspice_rs::primitives::Complex::ZERO;
-        fs::write(selected, raw.to_ascii()).unwrap();
+        fs::write(selected, raw.to_ascii().unwrap()).unwrap();
         let error = run(&temp.0, Some("sens_bjt")).unwrap_err();
         assert!(error.contains("v(q1:ise)"), "{error}");
     }

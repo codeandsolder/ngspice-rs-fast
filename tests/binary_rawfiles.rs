@@ -12,6 +12,7 @@
 //! each value in a `complex` plot.
 
 use std::fs;
+use std::io::BufReader;
 use std::path::PathBuf;
 use std::str;
 
@@ -238,7 +239,7 @@ fn declared_counts_are_validated_before_allocation() {
 #[test]
 fn byte_order_is_explicit_and_never_detected() {
     let bytes = big_endian_rawfile(OP_HEADER, &OP_VALUES);
-    let big_endian = RawFileReader::new(&bytes)
+    let big_endian = RawFileReader::new(bytes.as_slice())
         .with_byte_order(BinaryByteOrder::BigEndian)
         .read()
         .expect("parses with an explicit byte order");
@@ -402,7 +403,7 @@ fn mixed_ascii_and_binary_plots_are_rejected() {
     let mut bytes = ASCII_RAWFILE.as_bytes().to_vec();
     bytes.extend_from_slice(&binary_rawfile(AC_HEADER, &AC_VALUES));
     assert_eq!(RawFormat::detect(&bytes).unwrap(), RawFormat::Ascii);
-    let error = RawFileReader::new(&bytes)
+    let error = RawFileReader::new(bytes.as_slice())
         .with_format(RawFormat::Binary)
         .read()
         .expect_err("mixed");
@@ -418,9 +419,7 @@ fn bytes_after_the_last_payload_are_rejected() {
     bytes.extend_from_slice(b"junk\n");
     let error = RawFile::parse_bytes(&bytes).expect_err("trailing bytes");
     assert!(
-        error
-            .to_string()
-            .contains("no 'Values:' or 'Binary:' section"),
+        error.to_string().contains("header line without a colon"),
         "{error}"
     );
 
@@ -429,9 +428,7 @@ fn bytes_after_the_last_payload_are_rejected() {
     bytes.extend_from_slice(AC_HEADER.as_bytes());
     let error = RawFile::parse_bytes(&bytes).expect_err("no section line");
     assert!(
-        error
-            .to_string()
-            .contains("no 'Values:' or 'Binary:' section"),
+        error.to_string().contains("no 'Values:' section"),
         "{error}"
     );
 
@@ -506,16 +503,23 @@ fn files_round_trip_through_both_encodings() {
 
     let binary_path = directory.join("op_bin.raw");
     parsed
-        .write_with_format(&binary_path, RawFormat::Binary)
+        .write_with_format(
+            &binary_path,
+            RawFormat::Binary,
+            BinaryByteOrder::LittleEndian,
+        )
         .unwrap();
     assert_eq!(fs::read(&binary_path).unwrap(), bytes);
     assert_eq!(RawFile::load(&binary_path).unwrap(), parsed);
 
     let ascii_path = directory.join("op_ascii.raw");
     parsed
-        .write_with_format(&ascii_path, RawFormat::Ascii)
+        .write_with_format(&ascii_path, RawFormat::Ascii, BinaryByteOrder::LittleEndian)
         .unwrap();
-    assert_eq!(fs::read(&ascii_path).unwrap(), parsed.to_ascii().as_bytes());
+    assert_eq!(
+        fs::read(&ascii_path).unwrap(),
+        parsed.to_ascii().unwrap().as_bytes()
+    );
     assert_eq!(RawFile::load(&ascii_path).unwrap(), parsed);
 }
 
@@ -561,13 +565,110 @@ fn a_binary_round_trip_loses_the_real_spelling_of_a_complex_column() {
     );
     // The documented consequence: the spelling changes, the values do not.
     assert!(
-        parsed.to_ascii().contains("1.000000000000000e+03,0.0"),
+        parsed
+            .to_ascii()
+            .unwrap()
+            .contains("1.000000000000000e+03,0.0"),
         "the parsed text keeps the short form"
     );
     assert!(
         round_tripped
             .to_ascii()
+            .unwrap()
             .contains("1.000000000000000e+03,0.000000000000000e+00"),
         "the re-rendered text uses the long form"
     );
+}
+#[test]
+fn lending_rows_match_collected_data_with_small_input_buffers() {
+    let mut ascii = ASCII_RAWFILE.as_bytes().to_vec();
+    ascii.extend_from_slice(ASCII_RAWFILE.as_bytes());
+    let mut little = binary_rawfile(OP_HEADER, &OP_VALUES);
+    little.extend_from_slice(&binary_rawfile(AC_HEADER, &AC_VALUES));
+    let mut big = big_endian_rawfile(OP_HEADER, &OP_VALUES);
+    big.extend_from_slice(&big_endian_rawfile(AC_HEADER, &AC_VALUES));
+
+    for (bytes, order) in [
+        (ascii, BinaryByteOrder::LittleEndian),
+        (little, BinaryByteOrder::LittleEndian),
+        (big, BinaryByteOrder::BigEndian),
+    ] {
+        let expected = RawFileReader::new(bytes.as_slice())
+            .with_byte_order(order)
+            .read()
+            .unwrap();
+        // A 3-byte buffer forces even one binary64 across multiple reads.
+        let input = BufReader::with_capacity(3, bytes.as_slice());
+        let mut decoder = RawFileReader::new(input).with_byte_order(order);
+        for expected_plot in &expected.plots {
+            let mut rows = decoder.next_plot().unwrap().unwrap();
+            assert!(rows.header().plot.points.is_empty());
+            assert_eq!(rows.point_count(), expected_plot.plot.points.len());
+            let mut address = None;
+            for expected_row in &expected_plot.plot.points {
+                let row = rows.next_row().unwrap().unwrap();
+                assert_eq!(row, expected_row);
+                if let Some(previous) = address {
+                    assert_eq!(row.as_ptr(), previous, "row storage is reused");
+                }
+                address = Some(row.as_ptr());
+            }
+            assert!(rows.next_row().unwrap().is_none());
+            let mut header = expected_plot.clone();
+            header.plot.points.clear();
+            assert_eq!(rows.finish().unwrap(), header);
+        }
+        assert!(decoder.next_plot().unwrap().is_none());
+    }
+}
+
+#[test]
+fn row_decoder_requires_completion_and_latches_failures() {
+    let bytes = binary_rawfile(OP_HEADER, &OP_VALUES);
+    let mut reader = RawFileReader::new(bytes.as_slice());
+    {
+        let mut rows = reader.next_plot().unwrap().unwrap();
+        assert_eq!(rows.next_row().unwrap().unwrap().len(), 3);
+    }
+    assert!(reader.next_plot().is_err());
+
+    let mut two = bytes.clone();
+    two.extend_from_slice(&binary_rawfile(AC_HEADER, &AC_VALUES));
+    let mut reader = RawFileReader::new(two.as_slice());
+    let first = reader.next_plot().unwrap().unwrap().finish().unwrap();
+    assert_eq!(first.plot.plotname, "Operating Point");
+    let second = reader.next_plot().unwrap().unwrap().finish().unwrap();
+    assert_eq!(second.plot.plotname, "AC Analysis");
+    assert!(reader.next_plot().unwrap().is_none());
+
+    let input = BufReader::with_capacity(3, &bytes[..bytes.len() - 1]);
+    let mut reader = RawFileReader::new(input);
+    let mut rows = reader.next_plot().unwrap().unwrap();
+    assert!(rows.next_row().unwrap().is_some());
+    assert!(rows.next_row().is_err());
+    assert!(rows.next_row().is_err());
+    assert!(rows.finish().is_err());
+    assert!(reader.next_plot().is_err());
+}
+
+#[test]
+fn ascii_iteration_infers_mixed_column_flags_and_rejects_binary_followers() {
+    let text = concat!(
+        "Plotname: mixed\nFlags: complex\nNo. Variables: 2\nNo. Points: 2\n",
+        "Variables:\n0 frequency frequency\n1 v(out) voltage\nValues:\n",
+        "0 1.0e+00,0.0\n2.0e+00,0.0\n\n",
+        "1 2.0e+00,0.0\n3.0e+00,1.0e+00\n\n"
+    );
+    let mut reader = RawFileReader::new(text.as_bytes());
+    let mut rows = reader.next_plot().unwrap().unwrap();
+    assert!(rows.next_row().unwrap().is_some());
+    assert!(rows.header().plot.variables.iter().all(|v| v.is_real));
+    assert!(rows.next_row().unwrap().is_some());
+    let header = rows.finish().unwrap();
+    assert!(header.plot.variables[0].is_real);
+    assert!(!header.plot.variables[1].is_real);
+
+    let mut bytes = text.as_bytes().to_vec();
+    bytes.extend_from_slice(&binary_rawfile(OP_HEADER, &OP_VALUES));
+    assert!(RawFile::parse_bytes(&bytes).is_err());
 }

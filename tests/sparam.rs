@@ -149,7 +149,7 @@ fn the_plot_has_c_names_units_and_order() {
     assert_eq!(plot.point_count(), 3);
     close_real(&plot, "frequency", 1, 500.5e3);
     // The rawfile writer and reader keep the S/Y/Z vectors and their types.
-    let text = RawFile::single(plot.clone()).to_ascii();
+    let text = RawFile::single(plot.clone()).to_ascii().unwrap();
     let back = RawFile::parse(&text).unwrap();
     let back = back.single_plot().unwrap();
     assert_eq!(back.variables, plot.variables);

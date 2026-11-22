@@ -8,10 +8,9 @@
 //!
 //! Both forms share one header and differ only in the line that announces the
 //! values (`Values:` against `Binary:`) and in how those values are encoded.
-//! [`RawFile::parse_bytes`] detects the encoding and dispatches to
-//! [`RawFile::parse`] for text or to the binary codec for `double` payloads,
+//! [`RawFileReader`] reads each header once and selects a row decoder,
 //! so binary bytes are never decoded as text. [`RawFormat::detect`] reports the
-//! encoding of a file on its own.
+//! encoding of a valid first header without reading the payload.
 //!
 //! An ASCII rawfile is a sequence of plots, each looking like:
 //!
@@ -57,7 +56,7 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
@@ -66,7 +65,7 @@ use crate::analysis::results::{Plot, PlotFlags, Variable};
 
 mod binary;
 
-pub use binary::{BinaryByteOrder, RawFileReader, RawFormat};
+pub use binary::BinaryByteOrder;
 
 fn unsupported(feature: impl Into<String>) -> SpiceError {
     SpiceError::Unsupported {
@@ -156,18 +155,14 @@ impl RawFile {
     /// [`SpiceError::Unsupported`] for a binary rawfile, a malformed header, a
     /// truncated file, or values that are not numbers.
     pub fn parse(text: &str) -> SpiceResult<Self> {
-        let mut cursor = Cursor::new(text);
-        let mut plots = Vec::new();
-        while let Some(plot) = parse_plot(&mut cursor)? {
-            plots.push(plot);
-        }
-        Ok(Self { plots })
+        RawFileReader::new(text.as_bytes())
+            .with_format(RawFormat::Ascii)
+            .read()
     }
 
     /// Reads and parses a rawfile of either encoding.
     ///
-    /// The file is read as bytes and handed to [`RawFile::parse_bytes`], so a
-    /// binary rawfile is decoded without being treated as text.
+    /// A buffered reader decodes headers and rows without holding the input file in memory.
     ///
     /// # Errors
     ///
@@ -175,8 +170,19 @@ impl RawFile {
     /// [`RawFile::parse_bytes`] reports.
     pub fn load(path: impl AsRef<Path>) -> SpiceResult<Self> {
         let path = path.as_ref();
-        let bytes = fs::read(path).map_err(|error| SpiceError::io(path, &error))?;
-        Self::parse_bytes(&bytes)
+        let file = File::open(path).map_err(|error| SpiceError::io(path, &error))?;
+        RawFileReader::new(BufReader::new(file))
+            .read()
+            .map_err(|error| {
+                if let SpiceError::Io { message, .. } = error {
+                    SpiceError::Io {
+                        path: path.to_path_buf(),
+                        message,
+                    }
+                } else {
+                    error
+                }
+            })
     }
 
     /// Parses a rawfile from its bytes, detecting which encoding it uses.
@@ -215,12 +221,16 @@ impl RawFile {
     /// plot carries only real parts, and a vector flagged real inside a
     /// `complex` plot is written as `re,0.0` (see [`Variable::is_real`]).
     ///
-    /// Trailing whitespace in header values is not reproduced, because parsing
-    /// trims it. [`RawFile::write`] streams the same bytes to a file without
+    /// [`RawFile::write`] streams the same bytes to a file without
     /// building them in memory.
-    #[must_use]
-    pub fn to_ascii(&self) -> String {
-        AsciiRawFile(self).to_string()
+    ///
+    /// # Errors
+    /// [`SpiceError::Numerical`] for a row whose length differs from the schema,
+    /// or [`SpiceError::Io`] if rendering fails.
+    pub fn to_ascii(&self) -> SpiceResult<String> {
+        let bytes = self.encode(RawFormat::Ascii, BinaryByteOrder::LittleEndian)?;
+        String::from_utf8(bytes)
+            .map_err(|error| unsupported(format!("invalid UTF-8 in encoded rawfile: {error}")))
     }
 
     /// Writes the rawfile in ASCII format.
@@ -233,7 +243,7 @@ impl RawFile {
     /// [`SpiceError::Numerical`] from [`RawFile::validate`], or
     /// [`SpiceError::Io`] when the file cannot be written.
     pub fn write(&self, path: impl AsRef<Path>) -> SpiceResult<()> {
-        self.write_with_format(path, RawFormat::Ascii)
+        self.write_with_format(path, RawFormat::Ascii, BinaryByteOrder::LittleEndian)
     }
 
     /// Renders the rawfile in ngspice's binary format, little-endian.
@@ -258,11 +268,14 @@ impl RawFile {
     /// [`SpiceError::Numerical`] from [`RawFile::validate`], or
     /// [`SpiceError::Io`] if the binary renderer fails.
     pub fn to_binary_with(&self, byte_order: BinaryByteOrder) -> SpiceResult<Vec<u8>> {
+        self.encode(RawFormat::Binary, byte_order)
+    }
+
+    fn encode(&self, format: RawFormat, byte_order: BinaryByteOrder) -> SpiceResult<Vec<u8>> {
         self.validate()?;
         let mut bytes = Vec::new();
         for raw_plot in &self.plots {
-            render_header(&mut bytes, raw_plot, raw_plot.plot.points.len())
-                .and_then(|()| binary::write_points(&mut bytes, &raw_plot.plot, byte_order))
+            write_plot(&mut bytes, raw_plot, format, byte_order)
                 .map_err(|error| SpiceError::io("<rawfile memory buffer>", &error))?;
         }
         Ok(bytes)
@@ -271,7 +284,7 @@ impl RawFile {
     /// Writes the rawfile in the requested encoding.
     ///
     /// [`RawFormat::Ascii`] writes exactly [`RawFile::to_ascii`];
-    /// [`RawFormat::Binary`] writes exactly [`RawFile::to_binary`]. Either is
+    /// [`RawFormat::Binary`] writes exactly [`RawFile::to_binary_with`] for the selected byte order. Either is
     /// streamed through a buffer rather than rendered in memory first, so
     /// writing a long transient costs no second copy of its data.
     ///
@@ -279,11 +292,17 @@ impl RawFile {
     ///
     /// [`SpiceError::Numerical`] from [`RawFile::validate`], or
     /// [`SpiceError::Io`] when the file cannot be written.
-    pub fn write_with_format(&self, path: impl AsRef<Path>, format: RawFormat) -> SpiceResult<()> {
+    pub fn write_with_format(
+        &self,
+        path: impl AsRef<Path>,
+        format: RawFormat,
+        byte_order: BinaryByteOrder,
+    ) -> SpiceResult<()> {
         self.validate()?;
-        let mut writer = RawFileWriter::create(path, format)?;
+        let mut writer = RawFileWriter::create(path, format, byte_order)?;
         for raw_plot in &self.plots {
-            writer.write_plot(raw_plot)?;
+            write_plot(&mut writer.out, raw_plot, format, byte_order)
+                .map_err(|error| writer.io_error(&error))?;
         }
         writer.finish()
     }
@@ -306,21 +325,27 @@ pub struct RawFileWriter {
     out: BufWriter<File>,
     path: PathBuf,
     format: RawFormat,
+    byte_order: BinaryByteOrder,
 }
 
 impl RawFileWriter {
-    /// Creates `path`, or truncates it when it exists.
+    /// Creates `path`, or truncates it when it exists. The byte order is used only for binary output.
     ///
     /// # Errors
     ///
     /// [`SpiceError::Io`] when the file cannot be created.
-    pub fn create(path: impl AsRef<Path>, format: RawFormat) -> SpiceResult<Self> {
+    pub fn create(
+        path: impl AsRef<Path>,
+        format: RawFormat,
+        byte_order: BinaryByteOrder,
+    ) -> SpiceResult<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::create(&path).map_err(|error| SpiceError::io(&path, &error))?;
         Ok(Self {
             out: BufWriter::new(file),
             path,
             format,
+            byte_order,
         })
     }
 
@@ -338,7 +363,8 @@ impl RawFileWriter {
     /// variable (nothing is written then), or [`SpiceError::Io`].
     pub fn write_plot(&mut self, raw_plot: &RawPlot) -> SpiceResult<()> {
         validate_plot(&raw_plot.plot)?;
-        write_plot(&mut self.out, raw_plot, self.format).map_err(|error| self.io_error(&error))
+        write_plot(&mut self.out, raw_plot, self.format, self.byte_order)
+            .map_err(|error| self.io_error(&error))
     }
 
     /// Starts a plot whose points are pushed one at a time with
@@ -370,6 +396,7 @@ impl RawFileWriter {
         Ok(StreamedPlot {
             header,
             format: self.format,
+            byte_order: self.byte_order,
             point_count: 0,
             spool: Some(BufWriter::new(file)),
             path,
@@ -385,7 +412,9 @@ impl RawFileWriter {
     /// cannot be written; [`SpiceError::Unsupported`] when the spool encoding
     /// differs from this writer's encoding.
     pub fn finish_plot(&mut self, mut plot: StreamedPlot) -> SpiceResult<()> {
-        if plot.format != self.format {
+        if plot.format != self.format
+            || (self.format.is_binary() && plot.byte_order != self.byte_order)
+        {
             return Err(unsupported(
                 "streamed plot encoding differs from rawfile writer",
             ));
@@ -398,8 +427,7 @@ impl RawFileWriter {
             .into_inner()
             .map_err(|error| spool_error(error.into_error()))?;
         file.seek(SeekFrom::Start(0)).map_err(spool_error)?;
-        render_header(&mut self.out, &plot.header, plot.point_count)
-            .and_then(|()| self.out.write_all(section_line(self.format)))
+        render_header(&mut self.out, &plot.header, plot.point_count, self.format)
             .map_err(|error| self.io_error(&error))?;
         io::copy(&mut file, &mut self.out).map_err(|error| self.io_error(&error))?;
         Ok(())
@@ -430,6 +458,7 @@ pub struct StreamedPlot {
     /// The headers and variables; `points` stays empty.
     header: RawPlot,
     format: RawFormat,
+    byte_order: BinaryByteOrder,
     point_count: usize,
     /// `None` once finished.
     spool: Option<BufWriter<File>>,
@@ -457,6 +486,10 @@ impl StreamedPlot {
     /// variable, or [`SpiceError::Io`] when the spool cannot be written.
     pub fn push_point(&mut self, values: &[Complex]) -> SpiceResult<()> {
         self.header.plot.check_point(values)?;
+        let next_count = self
+            .point_count
+            .checked_add(1)
+            .ok_or_else(|| unsupported("rawfile point count overflows a usize"))?;
         let Some(spool) = self.spool.as_mut() else {
             return Err(unsupported("point pushed to a finished rawfile plot"));
         };
@@ -466,9 +499,10 @@ impl StreamedPlot {
             self.format,
             self.point_count,
             values,
+            self.byte_order,
         )
         .map_err(|error| SpiceError::io(&self.path, &error))?;
-        self.point_count += 1;
+        self.point_count = next_count;
         Ok(())
     }
 }
@@ -484,19 +518,9 @@ impl Drop for StreamedPlot {
 
 /// Checks that every point of `plot` has one value per variable.
 fn validate_plot(plot: &Plot) -> SpiceResult<()> {
-    let expected = plot.variables.len();
-    for (index, point) in plot.points.iter().enumerate() {
-        if point.len() != expected {
-            return Err(SpiceError::Numerical {
-                context: format!("plot {}", plot.name),
-                message: format!(
-                    "point {index} has {} value(s) but the plot has {expected} variable(s)",
-                    point.len()
-                ),
-            });
-        }
-    }
-    Ok(())
+    plot.points
+        .iter()
+        .try_for_each(|point| plot.check_point(point))
 }
 
 /// The line that ends the header in `format`.
@@ -507,143 +531,121 @@ const fn section_line(format: RawFormat) -> &'static [u8] {
     }
 }
 
-/// Writes one plot, header and points, in `format` (binary little-endian).
-fn write_plot(out: &mut impl Write, raw_plot: &RawPlot, format: RawFormat) -> io::Result<()> {
+/// Writes one validated plot with an explicit format and byte order.
+fn write_plot(
+    out: &mut impl Write,
+    raw_plot: &RawPlot,
+    format: RawFormat,
+    byte_order: BinaryByteOrder,
+) -> io::Result<()> {
     let plot = &raw_plot.plot;
-    render_header(out, raw_plot, plot.points.len())?;
-    out.write_all(section_line(format))?;
+    render_header(out, raw_plot, plot.points.len(), format)?;
     for (index, point) in plot.points.iter().enumerate() {
-        write_point(out, plot, format, index, point)?;
+        write_point(out, plot, format, index, point, byte_order)?;
     }
     Ok(())
 }
 
-/// One text renderer serves both the streamed I/O and in-memory formatting
-/// paths without converting a byte buffer back to UTF-8.
-trait TextOutput {
-    type Error;
-
-    fn emit(&mut self, args: fmt::Arguments<'_>) -> Result<(), Self::Error>;
-}
-
-struct IoText<'a, W>(&'a mut W);
-
-impl<W: Write> TextOutput for IoText<'_, W> {
-    type Error = io::Error;
-
-    fn emit(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
-        self.0.write_fmt(args)
-    }
-}
-
-impl TextOutput for fmt::Formatter<'_> {
-    type Error = fmt::Error;
-
-    fn emit(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
-        self.write_fmt(args)
-    }
-}
-
-struct AsciiRawFile<'a>(&'a RawFile);
-
-impl fmt::Display for AsciiRawFile<'_> {
-    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for raw_plot in &self.0.plots {
-            let plot = &raw_plot.plot;
-            render_text_header(out, raw_plot, plot.points.len())?;
-            out.emit(format_args!("Values:\n"))?;
-            for (index, point) in plot.points.iter().enumerate() {
-                render_ascii_point(out, plot, index, point)?;
-            }
-        }
-        Ok(())
-    }
-}
-
 /// Writes point `index` of `plot` in `format`, as `raw_write()` does: in ASCII
 /// the index, one tab-led line per value and a blank line; in binary one
-/// little-endian `double` (or `re, im` pair) per value.
+/// `double` (or `re, im` pair) per value in the selected byte order.
 fn write_point(
     out: &mut impl Write,
     plot: &Plot,
     format: RawFormat,
     index: usize,
     point: &[Complex],
+    byte_order: BinaryByteOrder,
 ) -> io::Result<()> {
     match format {
-        RawFormat::Ascii => render_ascii_point(&mut IoText(out), plot, index, point),
-        RawFormat::Binary => binary::write_point(out, plot, point, BinaryByteOrder::LittleEndian),
+        RawFormat::Ascii => render_ascii_point(out, plot, index, point),
+        RawFormat::Binary => binary::write_point(out, plot, point, byte_order),
     }
 }
 
-fn render_ascii_point<O: TextOutput>(
-    out: &mut O,
+fn render_ascii_point(
+    out: &mut impl Write,
     plot: &Plot,
     index: usize,
     point: &[Complex],
-) -> Result<(), O::Error> {
-    out.emit(format_args!(" {index}"))?;
-    for (column, value) in point.iter().enumerate() {
-        let is_real = plot
-            .variables
-            .get(column)
-            .is_some_and(|variable| variable.is_real);
-        out.emit(format_args!(
-            "\t{}\n",
-            format_value(*value, plot.flags, is_real)
-        ))?;
+) -> io::Result<()> {
+    write!(out, " {index}")?;
+    for (variable, value) in plot.variables.iter().zip(point) {
+        let real = SpiceNumber(value.re);
+        match plot.flags {
+            PlotFlags::Real => writeln!(out, "\t{real}")?,
+            PlotFlags::Complex if variable.is_real => writeln!(out, "\t{real},0.0")?,
+            PlotFlags::Complex => writeln!(out, "\t{real},{}", SpiceNumber(value.im))?,
+        }
     }
-    out.emit(format_args!("\n"))
+    writeln!(out)
 }
 
-/// Writes the header both encodings share, up to and including the `Variables:`
-/// lines, exactly as `raw_write()` lays it out.
-fn render_header(out: &mut impl Write, raw_plot: &RawPlot, point_count: usize) -> io::Result<()> {
-    render_text_header(&mut IoText(out), raw_plot, point_count)
-}
-
-fn render_text_header<O: TextOutput>(
-    out: &mut O,
+/// Writes the shared header and its encoding marker as `raw_write()` lays them out.
+fn render_header(
+    out: &mut impl Write,
     raw_plot: &RawPlot,
     point_count: usize,
-) -> Result<(), O::Error> {
+    format: RawFormat,
+) -> io::Result<()> {
     let plot = &raw_plot.plot;
-    out.emit(format_args!("Title: {}\n", raw_plot.title))?;
-    out.emit(format_args!("Date: {}\n", raw_plot.date))?;
-    out.emit(format_args!("Command: {}\n", raw_plot.command))?;
-    out.emit(format_args!("Plotname: {}\n", plot.plotname))?;
-    out.emit(format_args!("Flags: {}\n", plot.flags.as_rawfile()))?;
-    out.emit(format_args!("No. Variables: {}\n", plot.variables.len()))?;
-    out.emit(format_args!("No. Points: {point_count}\n"))?;
-    out.emit(format_args!("Variables:\n"))?;
+    writeln!(out, "Title: {}", raw_plot.title)?;
+    writeln!(out, "Date: {}", raw_plot.date)?;
+    writeln!(out, "Command: {}", raw_plot.command)?;
+    writeln!(out, "Plotname: {}", plot.plotname)?;
+    writeln!(out, "Flags: {}", plot.flags.as_rawfile())?;
+    writeln!(out, "No. Variables: {}", plot.variables.len())?;
+    writeln!(out, "No. Points: {point_count}")?;
+    writeln!(out, "Variables:")?;
     for (index, variable) in plot.variables.iter().enumerate() {
-        out.emit(format_args!(
-            "\t{index}\t{}\t{}\n",
-            variable.name, variable.unit
-        ))?;
+        writeln!(out, "\t{index}\t{}\t{}", variable.name, variable.unit)?;
     }
-    Ok(())
+    out.write_all(section_line(format))
 }
 
-/// A constant-size line cursor over rawfile text, with one-line lookahead.
-struct Cursor<'a> {
-    lines: std::iter::Peekable<std::str::Lines<'a>>,
+/// Byte-aware line reader: only the current line is decoded as text.
+struct Cursor<R> {
+    input: R,
+    line: String,
 }
 
-impl<'a> Cursor<'a> {
-    fn new(text: &'a str) -> Self {
+impl<R: BufRead> Cursor<R> {
+    const fn new(input: R) -> Self {
         Self {
-            lines: text.lines().peekable(),
+            input,
+            line: String::new(),
         }
     }
 
-    fn peek(&mut self) -> Option<&'a str> {
-        self.lines.peek().copied()
+    fn next(&mut self, skip_blank: bool) -> SpiceResult<Option<&str>> {
+        loop {
+            self.line.clear();
+            if self.input.read_line(&mut self.line).map_err(|error| {
+                if error.kind() == io::ErrorKind::InvalidData {
+                    unsupported("rawfile header or ASCII value is not UTF-8 text")
+                } else {
+                    input_error(error)
+                }
+            })? == 0
+            {
+                return Ok(None);
+            }
+            if !skip_blank || !self.line.trim().is_empty() {
+                break;
+            }
+        }
+        Ok(Some(
+            self.line
+                .strip_suffix('\n')
+                .map_or(self.line.as_str(), |line| {
+                    line.strip_suffix('\r').unwrap_or(line)
+                }),
+        ))
     }
+}
 
-    fn next(&mut self) -> Option<&'a str> {
-        self.lines.next()
-    }
+fn input_error(error: io::Error) -> SpiceError {
+    SpiceError::io("<rawfile input>", &error)
 }
 
 fn parse_count(key: &str, value: &str) -> SpiceResult<usize> {
@@ -672,13 +674,32 @@ fn parse_padding(flags: &str) -> bool {
     padded
 }
 
-/// The data-section line that ends a plot header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Section {
-    /// `Values:`, the ASCII form.
-    Values,
-    /// `Binary:`, the native-`double` form.
+/// The encoding a rawfile uses for its values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RawFormat {
+    /// Text values under a `Values:` line — `set filetype=ascii`, and what
+    /// `cargo xtask golden capture` records.
+    Ascii,
+    /// Native `double`s under a `Binary:` line — `raw_write()`'s default.
     Binary,
+}
+
+impl RawFormat {
+    /// Detects the encoding from a valid first plot header without reading its payload.
+    ///
+    /// # Errors
+    /// Invalid or missing rawfile header.
+    pub fn detect(bytes: &[u8]) -> SpiceResult<Self> {
+        parse_header(&mut Cursor::new(bytes))?
+            .map(|(_, format)| format)
+            .ok_or_else(|| unsupported("rawfile contains no plot header"))
+    }
+
+    /// True for [`RawFormat::Binary`].
+    #[must_use]
+    pub const fn is_binary(self) -> bool {
+        matches!(self, Self::Binary)
+    }
 }
 
 /// One plot's headers, up to but excluding its data section.
@@ -697,15 +718,11 @@ struct Header {
 /// Parses one plot header, up to and including its `Values:` or `Binary:` line.
 ///
 /// Returns `None` at the end of the file. The returned [`Section`] is the line
-/// that ended the header: [`parse_plot`] accepts only the ASCII one, while
-/// the binary codec locates its payload from the same line.
-fn parse_header(cursor: &mut Cursor<'_>) -> SpiceResult<Option<(Header, Section)>> {
-    while cursor.peek().is_some_and(|line| line.trim().is_empty()) {
-        cursor.next();
-    }
-    if cursor.peek().is_none() {
+/// that ended the header and determines the payload decoder.
+fn parse_header(cursor: &mut Cursor<impl BufRead>) -> SpiceResult<Option<(Header, RawFormat)>> {
+    let Some(first) = cursor.next(true)? else {
         return Ok(None);
-    }
+    };
 
     let mut title = String::new();
     let mut date = String::new();
@@ -717,10 +734,8 @@ fn parse_header(cursor: &mut Cursor<'_>) -> SpiceResult<Option<(Header, Section)
     let mut declared_points = None;
 
     // Header, up to and including the `Variables:` line.
+    let mut line = first;
     loop {
-        let Some(line) = cursor.next() else {
-            return Err(unsupported("truncated rawfile: no 'Variables:' section"));
-        };
         let Some((key, value)) = line.split_once(':') else {
             return Err(unsupported(format!(
                 "rawfile header line without a colon: '{line}'"
@@ -756,6 +771,10 @@ fn parse_header(cursor: &mut Cursor<'_>) -> SpiceResult<Option<(Header, Section)
                 return Err(unsupported(format!("rawfile header key '{other}'")));
             }
         }
+        let Some(next) = cursor.next(false)? else {
+            return Err(unsupported("truncated rawfile: no 'Variables:' section"));
+        };
+        line = next;
     }
 
     let variable_count = declared_variables.ok_or_else(|| missing_header("No. Variables"))?;
@@ -765,15 +784,17 @@ fn parse_header(cursor: &mut Cursor<'_>) -> SpiceResult<Option<(Header, Section)
 
     let variables = parse_variables(cursor, variable_count)?;
 
-    let Some(line) = cursor.next() else {
+    let Some(line) = cursor.next(false)? else {
         return Err(unsupported("truncated rawfile: no 'Values:' section"));
     };
     let key = line
         .split_once(':')
-        .map_or_else(|| line.trim(), |(key, _)| key.trim());
-    let section = match key {
-        "Values" => Section::Values,
-        "Binary" => Section::Binary,
+        .ok_or_else(|| unsupported("rawfile values section has no colon"))?
+        .0
+        .trim();
+    let format = match key {
+        "Values" => RawFormat::Ascii,
+        "Binary" => RawFormat::Binary,
         other => {
             return Err(unsupported(format!(
                 "rawfile values section starts with '{other}', expected 'Values'"
@@ -792,17 +813,20 @@ fn parse_header(cursor: &mut Cursor<'_>) -> SpiceResult<Option<(Header, Section)
             point_count,
             variables,
         },
-        section,
+        format,
     )))
 }
 
-fn parse_variables(cursor: &mut Cursor<'_>, variable_count: usize) -> SpiceResult<Vec<Variable>> {
+fn parse_variables(
+    cursor: &mut Cursor<impl BufRead>,
+    variable_count: usize,
+) -> SpiceResult<Vec<Variable>> {
     // A declared count is a header claim, not a promise, so the list grows as
     // the lines are read: a bogus `No. Variables:` cannot ask for a huge
     // allocation before the file has been shown to hold that many lines.
     let mut variables = Vec::new();
     for index in 0..variable_count {
-        let Some(line) = cursor.next() else {
+        let Some(line) = cursor.next(false)? else {
             return Err(unsupported(format!(
                 "truncated rawfile: variable {index} of {variable_count} is missing"
             )));
@@ -829,83 +853,246 @@ fn parse_variables(cursor: &mut Cursor<'_>, variable_count: usize) -> SpiceResul
     Ok(variables)
 }
 
-/// Parses one ASCII plot, or returns `None` at the end of the file.
-fn parse_plot(cursor: &mut Cursor<'_>) -> SpiceResult<Option<RawPlot>> {
-    let Some((header, section)) = parse_header(cursor)? else {
-        return Ok(None);
-    };
-    if section == Section::Binary {
-        return Err(unsupported(BINARY_UNSUPPORTED));
-    }
+/// Reads one rawfile sequentially from any buffered byte source.
+///
+/// The first header selects the format unless explicitly configured. Subsequent
+/// plots must use the same format. Binary payloads never pass through UTF-8.
+pub struct RawFileReader<R> {
+    cursor: Cursor<R>,
+    format: Option<RawFormat>,
+    byte_order: BinaryByteOrder,
+    blocked: bool,
+}
 
-    let Header {
-        title,
-        date,
-        command,
-        plotname,
-        flags,
-        mut variables,
-        point_count,
-        ..
-    } = header;
-    let variable_count = variables.len();
-
-    if point_count.checked_mul(variable_count).is_none() {
-        return Err(unsupported(format!(
-            "ASCII rawfile declares No. Variables: {variable_count} and No. Points: {point_count}, whose value count overflows a usize"
-        )));
-    }
-    // Header counts are claims, not trusted allocation sizes. Grow the point
-    // list only after decoding each complete row; a truncated file with a
-    // huge count must not reserve memory in proportion to the claim.
-    let mut points = Vec::new();
-    // The real short form recovers the column flag, as for raw_write().
-    let mut column_is_real = vec![true; variable_count];
-    if variable_count != 0 {
-        for expected_point in 0..point_count {
-            let mut row = Vec::with_capacity(variable_count);
-            for (column, is_real) in column_is_real.iter_mut().enumerate() {
-                // raw_write emits a blank line after every point.
-                while cursor.peek().is_some_and(|line| line.trim().is_empty()) {
-                    cursor.next();
-                }
-                let Some(line) = cursor.next() else {
-                    return Err(unsupported(format!(
-                        "truncated rawfile: expected {point_count} point(s) of {variable_count} value(s)"
-                    )));
-                };
-                let (declared_point, value_text) = split_index_and_value(line);
-                if column == 0
-                    && let Some(declared_point) = declared_point
-                    && declared_point != expected_point
-                {
-                    return Err(unsupported(format!(
-                        "rawfile point index {declared_point} out of order, expected {expected_point}"
-                    )));
-                }
-                let parsed = parse_value(value_text)?;
-                if flags.is_complex() && !parsed.real_short_form {
-                    *is_real = false;
-                }
-                row.push(parsed.value);
-            }
-            points.push(row);
+impl<R: BufRead> RawFileReader<R> {
+    /// Constructs a reader with automatic format detection and little-endian doubles.
+    #[must_use]
+    pub const fn new(input: R) -> Self {
+        Self {
+            cursor: Cursor::new(input),
+            format: None,
+            byte_order: BinaryByteOrder::LittleEndian,
+            blocked: false,
         }
     }
-    for (variable, is_real) in variables.iter_mut().zip(column_is_real) {
-        variable.is_real = is_real;
+
+    /// Requires the specified file encoding.
+    #[must_use]
+    pub const fn with_format(mut self, format: RawFormat) -> Self {
+        self.format = Some(format);
+        self
     }
 
-    let mut plot = Plot::new(plotname.clone(), plotname, flags);
-    plot.variables = variables;
-    plot.points = points;
+    /// Selects the byte order for binary doubles.
+    #[must_use]
+    pub const fn with_byte_order(mut self, byte_order: BinaryByteOrder) -> Self {
+        self.byte_order = byte_order;
+        self
+    }
 
-    Ok(Some(RawPlot {
-        title,
-        date,
-        command,
-        plot,
-    }))
+    /// Reads the next plot header and lends a bounded row decoder.
+    ///
+    /// Finish the previous plot before requesting another.
+    ///
+    /// # Errors
+    /// Invalid headers, mixed encodings, unsupported layouts, I/O failures or
+    /// an unfinished previous plot.
+    pub fn next_plot(&mut self) -> SpiceResult<Option<RawPlotRows<'_, R>>> {
+        if self.blocked {
+            return Err(unsupported("previous rawfile plot was not finished"));
+        }
+        self.blocked = true;
+        let Some((header, format)) = parse_header(&mut self.cursor)? else {
+            self.blocked = false;
+            return Ok(None);
+        };
+        if self.format.is_some_and(|expected| expected != format) {
+            return Err(unsupported(if format.is_binary() {
+                BINARY_UNSUPPORTED
+            } else {
+                "mixed rawfile encodings: a 'Values:' section cannot appear in a binary rawfile"
+            }));
+        }
+        self.format = Some(format);
+        let Header {
+            title,
+            date,
+            command,
+            plotname,
+            flags,
+            padded,
+            point_count,
+            mut variables,
+        } = header;
+        if format.is_binary() && !padded {
+            return Err(unsupported(
+                "binary rawfile flagged 'unpadded': its payload length cannot be derived from the header",
+            ));
+        }
+        let columns = variables.len();
+        let cells = point_count.checked_mul(columns).ok_or_else(|| {
+            unsupported(format!("rawfile declares No. Variables: {columns} and No. Points: {point_count}, whose value count overflows a usize"))
+        })?;
+        let payload_len = if format.is_binary() {
+            if flags.is_complex() {
+                for variable in &mut variables {
+                    variable.is_real = false;
+                }
+            }
+            cells.checked_mul(binary::value_width(flags)).ok_or_else(|| {
+                unsupported(format!("binary rawfile declares No. Variables: {columns} and No. Points: {point_count}, whose payload size overflows a usize"))
+            })?
+        } else {
+            0
+        };
+        let mut plot = Plot::new(plotname.clone(), plotname, flags);
+        plot.variables = variables;
+        Ok(Some(RawPlotRows {
+            reader: self,
+            header: RawPlot {
+                title,
+                date,
+                command,
+                plot,
+            },
+            format,
+            point_count: if columns == 0 { 0 } else { point_count },
+            next_index: 0,
+            payload_len,
+            consumed: 0,
+            row: Vec::new(),
+            failed: false,
+        }))
+    }
+
+    /// Collects every plot and its rows.
+    ///
+    /// # Errors
+    /// Invalid or truncated rawfile data, unsupported layouts or I/O failures.
+    pub fn read(mut self) -> SpiceResult<RawFile> {
+        let mut plots = Vec::new();
+        while let Some(mut rows) = self.next_plot()? {
+            let mut points = Vec::new();
+            while let Some(row) = rows.next_row()? {
+                points.push(row.to_vec());
+            }
+            let mut raw_plot = rows.finish()?;
+            raw_plot.plot.points = points;
+            plots.push(raw_plot);
+        }
+        Ok(RawFile { plots })
+    }
+}
+
+/// A plot header and reusable row buffer borrowed from a sequential rawfile reader.
+///
+/// Column realness for ASCII complex plots is inferred as rows arrive. The
+/// final metadata is available from [`Self::finish`].
+pub struct RawPlotRows<'a, R> {
+    reader: &'a mut RawFileReader<R>,
+    header: RawPlot,
+    format: RawFormat,
+    point_count: usize,
+    next_index: usize,
+    payload_len: usize,
+    consumed: usize,
+    row: Vec<Complex>,
+    failed: bool,
+}
+
+impl<R: BufRead> RawPlotRows<'_, R> {
+    /// Header and currently inferred column flags; points are not retained.
+    #[must_use]
+    pub const fn header(&self) -> &RawPlot {
+        &self.header
+    }
+
+    /// Number of rows to decode.
+    #[must_use]
+    pub const fn point_count(&self) -> usize {
+        self.point_count
+    }
+
+    /// Decodes the next row into a reusable buffer, without allocating per row.
+    ///
+    /// # Errors
+    /// Malformed, out-of-order or truncated values, or I/O failure.
+    pub fn next_row(&mut self) -> SpiceResult<Option<&[Complex]>> {
+        if self.failed {
+            return Err(unsupported("rawfile row decoder has failed"));
+        }
+        if self.next_index == self.point_count {
+            return Ok(None);
+        }
+        self.row.clear();
+        self.failed = true;
+        match self.format {
+            RawFormat::Ascii => self.decode_ascii_row()?,
+            RawFormat::Binary => self.decode_binary_row()?,
+        }
+        self.failed = false;
+        self.next_index += 1;
+        Ok(Some(&self.row))
+    }
+
+    fn decode_ascii_row(&mut self) -> SpiceResult<()> {
+        let columns = self.header.plot.variables.len();
+        for (column, variable) in self.header.plot.variables.iter_mut().enumerate() {
+            let Some(line) = self.reader.cursor.next(true)? else {
+                return Err(unsupported(format!(
+                    "truncated rawfile: expected {} point(s) of {columns} value(s)",
+                    self.point_count
+                )));
+            };
+            let (declared_point, value_text) = split_index_and_value(line);
+            if column == 0
+                && let Some(declared_point) = declared_point
+                && declared_point != self.next_index
+            {
+                return Err(unsupported(format!(
+                    "rawfile point index {declared_point} out of order, expected {}",
+                    self.next_index
+                )));
+            }
+            let parsed = parse_value(value_text)?;
+            if self.header.plot.flags.is_complex() && !parsed.real_short_form {
+                variable.is_real = false;
+            }
+            self.row.push(parsed.value);
+        }
+        Ok(())
+    }
+
+    fn decode_binary_row(&mut self) -> SpiceResult<()> {
+        let columns = self.header.plot.variables.len();
+        for _ in 0..columns {
+            let Some(value) = binary::read_value(
+                &mut self.reader.cursor.input,
+                self.header.plot.flags,
+                self.reader.byte_order,
+                &mut self.consumed,
+            )
+            .map_err(input_error)?
+            else {
+                return Err(unsupported(format!(
+                    "truncated binary rawfile: No. Variables: {columns} x No. Points: {} needs {} byte(s) of data, but only {} byte(s) remain",
+                    self.point_count, self.payload_len, self.consumed,
+                )));
+            };
+            self.row.push(value);
+        }
+        Ok(())
+    }
+
+    /// Consumes any remaining rows and returns the final metadata with no points.
+    ///
+    /// # Errors
+    /// Any malformed or truncated row or I/O failure.
+    pub fn finish(mut self) -> SpiceResult<RawPlot> {
+        while self.next_row()?.is_some() {}
+        self.reader.blocked = false;
+        Ok(self.header)
+    }
 }
 
 /// Splits the optional point index ngspice writes before the first value of each
@@ -929,19 +1116,24 @@ fn split_index_and_value(line: &str) -> (Option<usize>, &str) {
     (None, line.trim())
 }
 
-/// Formats one value the way `raw_write()` does.
-///
-/// `column_is_real` is the column's [`Variable::is_real`] flag, which selects
-/// the `re,0.0` short form for a vector ngspice has flagged real.
-fn format_value(value: Complex, flags: PlotFlags, column_is_real: bool) -> String {
-    let real = crate::primitives::format_spice_number(value.re);
-    match flags {
-        PlotFlags::Real => real,
-        PlotFlags::Complex if column_is_real => format!("{real},0.0"),
-        PlotFlags::Complex => format!(
-            "{real},{}",
-            crate::primitives::format_spice_number(value.im)
-        ),
+/// An allocation-free display of ngspice's `%-.15e` number spelling.
+struct SpiceNumber(Real);
+
+impl fmt::Display for SpiceNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Sign, leading digit, decimal point, 15 digits, 'e', exponent sign
+        // and at most three exponent digits for any binary64.
+        const MAX_SCIENTIFIC_LEN: usize = 1 + 1 + 1 + 15 + 1 + 1 + 3;
+        let mut buffer = [0_u8; MAX_SCIENTIFIC_LEN];
+        let mut remaining = buffer.as_mut_slice();
+        write!(&mut remaining, "{:.15e}", self.0).map_err(|_| fmt::Error)?;
+        let written = MAX_SCIENTIFIC_LEN - remaining.len();
+        let text = std::str::from_utf8(&buffer[..written]).map_err(|_| fmt::Error)?;
+        let Some((mantissa, exponent)) = text.split_once('e') else {
+            return f.write_str(text);
+        };
+        let exponent = exponent.parse::<i32>().map_err(|_| fmt::Error)?;
+        write!(f, "{mantissa}e{exponent:+03}")
     }
 }
 
@@ -975,7 +1167,7 @@ fn parse_real(text: &str) -> SpiceResult<Real> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RawFile, split_index_and_value};
+    use super::{RawFile, SpiceNumber, split_index_and_value};
     use crate::analysis::results::PlotFlags;
     use crate::primitives::Complex;
 
@@ -1019,6 +1211,38 @@ Values:
 ";
 
     #[test]
+    fn direct_numeric_output_preserves_spice_spelling() {
+        let mut bits = 0x12ab_3456_e789_cdef_u64;
+        for value in [
+            f64::MIN,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            0.0,
+            -0.0,
+            1e99,
+            1e100,
+            1e-99,
+            1e-100,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ]
+        .into_iter()
+        .chain((0..4096).map(|_| {
+            bits ^= bits << 13;
+            bits ^= bits >> 7;
+            bits ^= bits << 17;
+            f64::from_bits(bits)
+        })) {
+            assert_eq!(
+                SpiceNumber(value).to_string(),
+                crate::primitives::format_spice_number(value)
+            );
+        }
+    }
+
+    #[test]
     fn parses_ngspice_operating_point_output() {
         let rawfile = RawFile::parse(OP_RAWFILE).expect("parses");
         assert_eq!(rawfile.len(), 1);
@@ -1053,7 +1277,7 @@ Values:
     fn values_round_trip_through_the_writer() {
         for text in [OP_RAWFILE, AC_RAWFILE] {
             let parsed = RawFile::parse(text).expect("parses");
-            let rendered = parsed.to_ascii();
+            let rendered = parsed.to_ascii().unwrap();
             let reparsed = RawFile::parse(&rendered).expect("reparses");
             assert_eq!(parsed, reparsed);
         }
@@ -1062,7 +1286,7 @@ Values:
     #[test]
     fn the_writer_matches_ngspice_layout() {
         let rawfile = RawFile::parse(OP_RAWFILE).expect("parses");
-        let rendered = rawfile.to_ascii();
+        let rendered = rawfile.to_ascii().unwrap();
         let lines: Vec<&str> = rendered.lines().collect();
         assert_eq!(lines[0], "Title: rc divider");
         assert_eq!(lines[3], "Plotname: Operating Point");
@@ -1136,9 +1360,19 @@ Values:
         let dest = dir.join("dest.raw");
         let spool = dir.join("spool");
         let header = RawFile::parse(OP_RAWFILE).unwrap().plots.remove(0);
-        let origin = super::RawFileWriter::create(&source, super::RawFormat::Binary).unwrap();
+        let origin = super::RawFileWriter::create(
+            &source,
+            super::RawFormat::Binary,
+            super::BinaryByteOrder::LittleEndian,
+        )
+        .unwrap();
         let stream = origin.begin_plot(header, &spool).unwrap();
-        let mut writer = super::RawFileWriter::create(&dest, super::RawFormat::Ascii).unwrap();
+        let mut writer = super::RawFileWriter::create(
+            &dest,
+            super::RawFormat::Ascii,
+            super::BinaryByteOrder::LittleEndian,
+        )
+        .unwrap();
         let error = writer.finish_plot(stream).unwrap_err();
         assert!(error.to_string().contains("encoding differs"));
         writer.finish().unwrap();
@@ -1203,7 +1437,7 @@ Values:
         let plot = &rawfile.plots[0].plot;
         assert!(plot.variables[0].is_real, "frequency was written as re,0.0");
         assert!(!plot.variables[1].is_real);
-        assert_eq!(rawfile.to_ascii(), MIXED_RAWFILE);
+        assert_eq!(rawfile.to_ascii().unwrap(), MIXED_RAWFILE);
     }
 
     #[test]
@@ -1232,5 +1466,7 @@ Values:
         let mut rawfile = RawFile::parse(OP_RAWFILE).expect("parses");
         rawfile.plots[0].plot.points[0].pop();
         assert!(rawfile.validate().is_err());
+        assert!(rawfile.to_ascii().is_err());
+        assert!(rawfile.to_binary().is_err());
     }
 }

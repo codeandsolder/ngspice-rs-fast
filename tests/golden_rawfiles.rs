@@ -211,7 +211,7 @@ fn the_writer_agrees_with_ngspice_apart_from_non_round_trippable_decimals() {
     for name in fixture_names() {
         let text = golden_text(&name);
         let rawfile = RawFile::parse(&text).unwrap_or_else(|error| panic!("{name}: {error}"));
-        let rendered = rawfile.to_ascii();
+        let rendered = rawfile.to_ascii().unwrap();
 
         assert_eq!(
             rendered.lines().count(),
@@ -286,11 +286,11 @@ fn known_golden_tokens_are_not_round_trippable() {
 fn the_writer_reaches_a_fixed_point() {
     for name in fixture_names() {
         let first = RawFile::parse(&golden_text(&name)).expect("parses");
-        let once = first.to_ascii();
+        let once = first.to_ascii().unwrap();
         let reparsed = RawFile::parse(&once).expect("reparses");
         assert_eq!(
             once,
-            reparsed.to_ascii(),
+            reparsed.to_ascii().unwrap(),
             "{name}: the second pass changed the bytes"
         );
         assert_eq!(first, reparsed, "{name}: the values changed");
@@ -12177,7 +12177,7 @@ fn multi_plot_goldens_round_trip_through_both_encodings() {
     for plots in MULTI_EXPECTATIONS {
         let fixture = plots[0].fixture;
         let rawfile = RawFile::parse(&golden_text(fixture)).expect("parses");
-        let ascii = RawFile::parse(&rawfile.to_ascii()).expect("the ASCII form parses");
+        let ascii = RawFile::parse(&rawfile.to_ascii().unwrap()).expect("the ASCII form parses");
         assert_eq!(ascii, rawfile, "{fixture}: ASCII round trip");
         let binary = RawFile::parse_bytes(&rawfile.to_binary().expect("binary encodes"))
             .expect("the binary form parses");
