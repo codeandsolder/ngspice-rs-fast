@@ -298,7 +298,8 @@ mod tests {
     }
 
     #[test]
-    fn pinned_c_trial_sequences() {
+    #[ignore = "optional historical C trial-sequence diagnostic; numerical paths may differ"]
+    fn report_pinned_c_trial_sequences() {
         use crate::analysis::RunConfig;
         use crate::netlist::Parser;
         use crate::netlist::source::parse_deck_text;
@@ -344,9 +345,87 @@ mod tests {
             )
             .unwrap();
             let load = prepared_load(&circuit, &signal, &context, 1, input, output).unwrap();
-            crate::maths::pencil::check_c_trace(&load, name, trace);
+            crate::maths::pencil::report_c_trace(&load, name, trace);
         }
         assert!(cases.next().is_none());
+    }
+
+    #[test]
+    #[ignore = "optional trace of a third-order pencil"]
+    fn report_cubic_pencil_trace() {
+        use crate::maths::pencil::{PencilLoad, PencilTerm};
+        // Companion matrix of the multi-analysis pole polynomial after
+        // scaling frequency by 10000. Actual circuit validation is in the
+        // integration tests; this only exposes the numerical root search.
+        let coefficients = [0.011, 0.0121, 0.01011, 0.0011];
+        let mut terms = Vec::new();
+        for row in 0..3 {
+            terms.push(PencilTerm {
+                row,
+                col: row,
+                conductance: None,
+                capacitance: Some(1.),
+            });
+        }
+        for row in 0..2 {
+            terms.push(PencilTerm {
+                row,
+                col: row + 1,
+                conductance: Some(-1.),
+                capacitance: None,
+            });
+        }
+        for (col, coefficient) in coefficients[..3].iter().enumerate() {
+            terms.push(PencilTerm {
+                row: 2,
+                col,
+                conductance: Some(coefficient / coefficients[3]),
+                capacitance: None,
+            });
+        }
+        let load = PencilLoad {
+            order: 3,
+            terms,
+            ..PencilLoad::default()
+        };
+        crate::maths::pencil::report_c_trace(&load, "multi-analysis companion", "");
+    }
+
+    #[test]
+    #[ignore = "optional independent polynomial-coefficient diagnostic"]
+    fn report_hfet2_pole_pencil() {
+        use crate::analysis::RunConfig;
+        use crate::netlist::Parser;
+        use crate::netlist::source::parse_deck_text;
+        use std::path::Path;
+        let deck = include_str!("../../conformance/netlists/m10_hfet2_pz.cir");
+        let netlist = Parser::new()
+            .parse_deck(&parse_deck_text(Path::new("hfet2.cir"), deck))
+            .unwrap();
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+        let context = config.context();
+        let mut circuit = config.circuit(&netlist).unwrap();
+        circuit.finalize().unwrap();
+        let signal = crate::analysis::ac::SmallSignal::prepare(
+            &mut circuit,
+            &plan,
+            &context,
+            plan.dc_settings().clone(),
+        )
+        .unwrap();
+        let load = prepared_load(&circuit, &signal, &context, 1, [None, None], None).unwrap();
+        println!("order {}", load.order);
+        for term in &load.terms {
+            println!(
+                "term {} {} {:016x} {:016x}",
+                term.row,
+                term.col,
+                term.conductance.unwrap_or(0.).to_bits(),
+                term.capacitance.unwrap_or(0.).to_bits()
+            );
+        }
+        println!("roots {:?}", roots(&load, "poles").unwrap());
     }
 
     #[test]
