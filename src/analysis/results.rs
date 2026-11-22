@@ -880,7 +880,7 @@ mod tests {
         assert_eq!(plot.cells().len(), 8);
         assert_eq!(plot.row(1).unwrap().as_ptr(), plot.cells()[2..].as_ptr());
         assert_eq!(plot.rows().len(), 4);
-        assert_eq!(plot.rows().rev().next(), plot.row(3));
+        assert_eq!(plot.rows().next_back(), plot.row(3));
         let column = plot.column("v(out)").unwrap();
         assert_eq!(column.len(), 4);
         assert_eq!(column.first(), Some(&Complex::real(0.)));
