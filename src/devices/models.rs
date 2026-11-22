@@ -741,6 +741,9 @@ pub struct ModelContext {
     /// artificial nodal continuation conductance of DC gmin stepping. Default
     /// [`DEFAULT_GMIN`]; must be finite and nonnegative.
     pub gmin: Real,
+    /// Resolved circuit relative tolerance (C `CKTreltol`), used by device preparation.
+    /// Independent of analysis-local Newton tolerance overrides.
+    pub reltol: Real,
     /// The analysis frequency in Hz that a behavioural source's `hertz` reads
     /// (C `CKTomega / 2 pi`): the AC frequency while an AC analysis re-solves
     /// the operating point for a frequency-dependent circuit, 0 otherwise.
@@ -761,6 +764,8 @@ pub struct ModelContext {
 
 /// ngspice's default junction `gmin` (`cktntask.c`: `TSKgmin = 1e-12`).
 pub const DEFAULT_GMIN: Real = 1e-12;
+/// ngspice's default circuit relative tolerance (cktntask.c).
+pub const DEFAULT_RELTOL: Real = 1e-3;
 
 impl Default for ModelContext {
     fn default() -> Self {
@@ -777,6 +782,7 @@ impl ModelContext {
             resistor_overrides: [None; MAX_RESISTOR_OVERRIDES],
             instance_overrides: [None; MAX_INSTANCE_OVERRIDES],
             gmin: DEFAULT_GMIN,
+            reltol: DEFAULT_RELTOL,
             frequency: 0.,
             spice3_noise: false,
             pivot: crate::maths::PivotTolerances::DEFAULT,
@@ -804,6 +810,13 @@ impl ModelContext {
     #[must_use]
     pub const fn with_frequency(mut self, frequency: Real) -> Self {
         self.frequency = frequency;
+        self
+    }
+
+    /// This context with the circuit relative tolerance replaced (validated on use).
+    #[must_use]
+    pub const fn with_reltol(mut self, reltol: Real) -> Self {
+        self.reltol = reltol;
         self
     }
 
@@ -871,6 +884,7 @@ impl ModelContext {
                 context.temperature,
                 context.nominal_temperature,
                 context.gmin,
+                context.reltol,
                 context.frequency,
                 context.pivot.absolute,
                 context.pivot.relative,
@@ -923,6 +937,15 @@ impl ModelContext {
                 format!(
                     "junction gmin must be finite and nonnegative, got {}",
                     self.gmin
+                ),
+            ));
+        }
+        if !(self.reltol.is_finite() && self.reltol > 0.) {
+            return Err(SpiceError::parse(
+                location.clone(),
+                format!(
+                    "circuit RELTOL must be finite and positive, got {}",
+                    self.reltol
                 ),
             ));
         }

@@ -402,3 +402,19 @@ m1 d g s b nch l=0.1u w=1u
         (1e-4, 1e-9),
     );
 }
+
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN; diode breakdown sensitivity"]
+fn diode_breakdown_replay_uses_circuit_reltol() {
+    for reltol in ["1e-3", "1e-9"] {
+        for analysis in ["dc", "ac lin 2 1k 2k"] {
+            let text = format!(
+                "breakdown sensitivity\n.options reltol={reltol} vntol=1e-15 abstol=1e-18\n\
+                 v1 a 0 dc -5.1 ac 1\nd1 a 0 dm\n\
+                 .model dm d(is=1e-11 bv=5 ibv=2e-9 nbv=1.3 cjo=20p)\n\
+                 .sens i(v1) d1:ibv d1:bv d1:nbv {analysis}\n.end\n"
+            );
+            compare_with_c(&format!("breakdown-{reltol}-{analysis}"), &text, NONLINEAR);
+        }
+    }
+}

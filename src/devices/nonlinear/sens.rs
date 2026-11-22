@@ -14,7 +14,7 @@
 //! `1e-14`: perturbing it turns the recombination current on, and restoring
 //! it leaves it on for every later parameter of the model).
 
-use super::thermal::TemperatureCache;
+use super::thermal::DerivedCache;
 use super::{
     Diode, DiodeGeometry, DiodeInstanceParameters, DiodeParameters, DiodeSetup, EPSMIN, default_eg,
 };
@@ -488,7 +488,7 @@ impl DiodeSensitivity<'_> {
             terminals: self.diode.terminals.clone(),
             junction: self.diode.junction,
             parameters,
-            derived: TemperatureCache::new(),
+            derived: DerivedCache::new(),
             initial: self.diode.initial.clone(),
             location: self.diode.location.clone(),
             written_model: self.diode.written_model.clone(),
@@ -604,6 +604,67 @@ mod tests {
                 input.bind(nodes, [anode, NodeId::GROUND])
             })
             .unwrap()
+    }
+
+    #[test]
+    fn diode_thermal_cache_rekeys_on_reltol_and_replay_uses_same_context() {
+        let loose = ModelContext::default();
+        let tight = loose.with_reltol(1e-9);
+        let original = diode(
+            &[("is", 1e-11), ("bv", 5.), ("ibv", 2e-9), ("nbv", 1.3)],
+            &[],
+            &loose,
+        );
+        let first = original.thermal(&loose).unwrap().breakdown.unwrap();
+        let next = original.thermal(&tight).unwrap().breakdown.unwrap();
+        assert!((first - next).abs() > 1e-5);
+        assert_eq!(
+            original
+                .thermal(&loose)
+                .unwrap()
+                .breakdown
+                .unwrap()
+                .to_bits(),
+            first.to_bits()
+        );
+        assert_eq!(
+            original
+                .thermal(&tight)
+                .unwrap()
+                .breakdown
+                .unwrap()
+                .to_bits(),
+            next.to_bits()
+        );
+
+        for reltol in [0., -1., f64::NAN, f64::INFINITY] {
+            assert!(original.thermal(&tight.with_reltol(reltol)).is_err());
+            // Failure must not replace the last successful derivation.
+            let cached = original
+                .derived
+                .get(super::super::DiodeThermalKey::context(&tight))
+                .unwrap();
+            assert_eq!(cached.breakdown.unwrap().to_bits(), next.to_bits());
+        }
+
+        // The sensitivity stand-in owns a fresh cache; loading at the same
+        // temperatures but changing RELTOL must not recover the old knee.
+        let kernel = DiodeSensitivity::new(&original, &tight);
+        let (model, instance) = kernel.records().unwrap();
+        let replay = kernel
+            .diode(RecordPair {
+                model: &model,
+                instance: &instance,
+            })
+            .unwrap();
+        assert_eq!(
+            replay.thermal(&tight).unwrap().breakdown.unwrap().to_bits(),
+            next.to_bits()
+        );
+        assert_eq!(
+            replay.thermal(&loose).unwrap().breakdown.unwrap().to_bits(),
+            first.to_bits()
+        );
     }
 
     #[test]
