@@ -153,6 +153,24 @@ impl InstanceTarget {
             value,
         })
     }
+
+    /// The ordinary DC resistance route retains its separately ordered
+    /// supplied-scalar override, rather than an arbitrary instance setter.
+    pub(crate) fn at_resistance(
+        self,
+        supplied: Real,
+    ) -> crate::primitives::SpiceResult<ResistorOverride> {
+        if self.parameter != "resistance"
+            || !supplied.is_finite()
+            || supplied == 0.
+            || !(1. / supplied).is_finite()
+        {
+            return Err(crate::primitives::SpiceError::circuit(
+                "supplied resistance must be finite and nonzero with finite conductance",
+            ));
+        }
+        Ok(ResistorOverride::new(self.topology, self.device, supplied))
+    }
 }
 
 /// One per-point replacement of a bound device instance parameter.

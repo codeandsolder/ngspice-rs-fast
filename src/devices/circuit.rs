@@ -58,6 +58,41 @@ pub enum CircuitVertex {
 /// Connectivity is structural, not proof of a conductive DC path or solvability.
 pub type CircuitGraph = UnGraph<CircuitVertex, usize, usize>;
 
+// Test-only counters at the actual shared preparation operations, not a
+// synthetic estimate from point counts. Thread-local for parallel unit tests.
+#[cfg(test)]
+pub(crate) mod preparation_metrics {
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Counts {
+        pub(crate) name_lookups: usize,
+        pub(crate) bindings: usize,
+        pub(crate) contexts: usize,
+        pub(crate) setters: usize,
+        pub(crate) resistance_checks: usize,
+        pub(crate) physical_validations: usize,
+        pub(crate) small_signal_assemblies: usize,
+    }
+
+    thread_local! {
+        static COUNTS: std::cell::Cell<Counts> = const { std::cell::Cell::new(Counts {
+            name_lookups: 0, bindings: 0, contexts: 0, setters: 0,
+            resistance_checks: 0, physical_validations: 0, small_signal_assemblies: 0,
+        }) };
+    }
+
+    pub(super) fn record(update: impl FnOnce(&mut Counts)) {
+        COUNTS.with(|cell| {
+            let mut counts = cell.get();
+            update(&mut counts);
+            cell.set(counts);
+        });
+    }
+
+    pub(crate) fn take() -> Counts {
+        COUNTS.with(|cell| cell.replace(Counts::default()))
+    }
+}
+
 /// Name-to-ordinal index built during setup and retained only for the
 /// lifetime of the finalized topology.
 #[derive(Default)]
@@ -306,6 +341,8 @@ impl<'a> PreparedRun<'a> {
         }
         // Validate once on a context transition. Do not discard a valid
         // preparation on error (including a foreign override).
+        #[cfg(test)]
+        preparation_metrics::record(|counts| counts.contexts += 1);
         context.validate(&MODEL_CONTEXT_LOCATION)?;
         let replacements = self.circuit.replacements(context)?;
         self.point.replace(Some(PreparedPoint {
@@ -330,6 +367,8 @@ impl<'a> PreparedRun<'a> {
     /// # Errors
     /// Invalid context, replacement, contextual device input or mutual coupling.
     pub fn validate_dc_inputs(&self, context: &ModelContext) -> SpiceResult<()> {
+        #[cfg(test)]
+        preparation_metrics::record(|counts| counts.physical_validations += 1);
         let point = self.point(context)?;
         point.mutual(self.circuit)?;
         for index in self.circuit.load_order() {
@@ -1999,12 +2038,10 @@ impl Circuit {
     /// letter.
     #[must_use]
     pub fn resistor(&self, name: &str) -> Option<(usize, ResistorMetadata)> {
-        self.devices.iter().enumerate().find_map(|(index, device)| {
-            if !device.name().eq_ignore_ascii_case(name) {
-                return None;
-            }
-            device.resistor_metadata().map(|metadata| (index, metadata))
-        })
+        let index = self.device_index(name)?;
+        self.devices[index]
+            .resistor_metadata()
+            .map(|metadata| (index, metadata))
     }
 
     /// An immutable per-point override of resistor `name`'s supplied scalar.
@@ -2038,6 +2075,8 @@ impl Circuit {
         target: &ResistorOverride,
         context: &ModelContext,
     ) -> SpiceResult<Real> {
+        #[cfg(test)]
+        preparation_metrics::record(|counts| counts.resistance_checks += 1);
         if target.topology() != self.topology_id()? {
             return Err(SpiceError::circuit("foreign or stale resistor override"));
         }
@@ -2063,17 +2102,13 @@ impl Circuit {
         name: &str,
         keyword: &str,
     ) -> SpiceResult<(usize, &'static str)> {
-        let Some((index, device)) = self
-            .devices
-            .iter()
-            .enumerate()
-            .find(|(_, device)| device.name().eq_ignore_ascii_case(name))
-        else {
+        let Some(index) = self.device_index(name) else {
             return Err(SpiceError::Unsupported {
                 feature: format!("DC sweep parameter target: no instance named {name}"),
                 location: None,
             });
         };
+        let device = &self.devices[index];
         if let Some(parameter) = device.instance_parameter(keyword) {
             return Ok((index, parameter));
         }
@@ -2126,6 +2161,8 @@ impl Circuit {
     /// Unfinalized topology, unknown device or unsupported parameter.
     pub fn bind_instance_target(&self, name: &str, keyword: &str) -> SpiceResult<InstanceTarget> {
         let (index, parameter) = self.instance_parameter(name, keyword)?;
+        #[cfg(test)]
+        preparation_metrics::record(|counts| counts.bindings += 1);
         Ok(InstanceTarget::new(self.topology_id()?, index, parameter))
     }
 
@@ -2137,6 +2174,8 @@ impl Circuit {
         let (index, _) = self
             .resistor(name)
             .ok_or_else(|| SpiceError::circuit(format!("{name} is not a resistor")))?;
+        #[cfg(test)]
+        preparation_metrics::record(|counts| counts.bindings += 1);
         Ok(InstanceTarget::new(
             self.topology_id()?,
             index,
@@ -2176,11 +2215,11 @@ impl Circuit {
     /// Unfinalized topology, unknown name or non-source device.
     pub fn bind_source_target(&self, name: &str) -> SpiceResult<InstanceTarget> {
         let index = self
-            .devices
-            .iter()
-            .position(|d| d.name().eq_ignore_ascii_case(name))
+            .device_index(name)
             .filter(|&i| matches!(self.devices[i].designator().to_ascii_lowercase(), 'v' | 'i'))
             .ok_or_else(|| SpiceError::circuit("invalid or unknown DC source override"))?;
+        #[cfg(test)]
+        preparation_metrics::record(|counts| counts.bindings += 1);
         Ok(InstanceTarget::new(self.topology_id()?, index, "dc"))
     }
 
@@ -2357,6 +2396,8 @@ impl Circuit {
             if replacements.iter().any(|(i, _)| *i == target.device()) {
                 return Err(SpiceError::circuit("duplicate resistor override"));
             }
+            #[cfg(test)]
+            preparation_metrics::record(|counts| counts.setters += 1);
             replacements.push((
                 target.device(),
                 device.with_instance_parameter("resistance", target.supplied(), context)?,
@@ -2395,6 +2436,8 @@ impl Circuit {
                     original.name()
                 )));
             }
+            #[cfg(test)]
+            preparation_metrics::record(|counts| counts.setters += 1);
             match replacements.iter_mut().find(|(i, _)| *i == target.device()) {
                 Some((_, replacement)) => {
                     *replacement = replacement.with_instance_parameter(
@@ -3169,6 +3212,8 @@ impl Circuit {
         pole_zero_setups: u32,
         mut ranges: Option<&mut Vec<PoleZeroRange>>,
     ) -> SpiceResult<crate::devices::linear::LinearSystem> {
+        #[cfg(test)]
+        preparation_metrics::record(|counts| counts.small_signal_assemblies += 1);
         let state = self.snapshot_values(state)?;
         context.validate(&MODEL_CONTEXT_LOCATION)?;
         if bias.len() != self.unknown_count() || !bias.is_finite() {
@@ -3650,10 +3695,22 @@ impl Circuit {
     /// Looks up a device by instance name, case-insensitively.
     #[must_use]
     pub fn device(&self, name: &str) -> Option<&dyn Device> {
-        self.devices
-            .iter()
-            .find(|device| device.name().eq_ignore_ascii_case(name))
-            .map(AsRef::as_ref)
+        self.device_index(name)
+            .map(|index| self.devices[index].as_ref())
+    }
+
+    // The finalized names are already indexed. During construction, callers
+    // such as add_device still need to inspect the unfinalized device list.
+    fn device_index(&self, name: &str) -> Option<usize> {
+        #[cfg(test)]
+        preparation_metrics::record(|counts| counts.name_lookups += 1);
+        if self.bindings.identity.is_some() {
+            self.bindings.names.get(name)
+        } else {
+            self.devices
+                .iter()
+                .position(|device| device.name().eq_ignore_ascii_case(name))
+        }
     }
 }
 
