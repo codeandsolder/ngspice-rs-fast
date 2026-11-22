@@ -103,6 +103,7 @@ impl ResistorOverride {
 pub const MAX_INSTANCE_OVERRIDES: usize = 2;
 
 /// A value-independent instance parameter binding in a finalized topology.
+///
 /// The canonical keyword comes from the device's existing setter registry.
 /// The same binding can be used for every point or independent candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

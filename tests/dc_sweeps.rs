@@ -893,8 +893,12 @@ fn sweep_points_are_seeded_from_the_previous_accepted_solution() {
 fn rejected(body: &str, args: &[&str], context: &AnalysisContext) -> SpiceError {
     let mut c =
         Circuit::from_netlist_with_context(&netlist(body), &context.model_context()).unwrap();
-    let (_, accepted) = probe(&mut c, "a");
-    let error = run_in(&mut c, args, context).unwrap_err();
+    rejected_circuit(&mut c, args, context)
+}
+
+fn rejected_circuit(c: &mut Circuit, args: &[&str], context: &AnalysisContext) -> SpiceError {
+    let (_, accepted) = probe(c, "a");
+    let error = run_in(c, args, context).unwrap_err();
     assert!(
         !matches!(error, SpiceError::Numerical { .. }),
         "{args:?} was rejected by a mid-run numerical failure, not up front: {error}"
@@ -995,11 +999,34 @@ fn resistance_only_preflight_validates_the_replacement_clamp() {
 #[test]
 fn late_independent_source_forcing_overflow_is_an_input_error() {
     let context = AnalysisContext::default();
+    // The parser does not yet accept the C current-source m card setter;
+    // instantiate the same effective source through its public device API.
+    let mut fixed = circuit("r1 a 0 1");
+    let source = IndependentSource::new(
+        "i1",
+        [NodeId::GROUND, fixed.nodes().get("a").unwrap()],
+        false,
+        0.,
+        Complex::real(0.),
+        Waveform::Constant(0.),
+    )
+    .unwrap();
+    fixed
+        .add_device(
+            source
+                .with_instance_parameter("m", 1e200, &context.model_context())
+                .unwrap(),
+        )
+        .unwrap();
+    fixed.finalize().unwrap();
+    let error = rejected_circuit(&mut fixed, &["i1", "0", "1e200", "1e200"], &context);
+    assert!(
+        error
+            .to_string()
+            .contains("nonfinite independent DC forcing"),
+        "{error}"
+    );
     for (body, args) in [
-        (
-            "i1 0 a 0 m=1e200\nr1 a 0 1",
-            vec!["i1", "0", "1e200", "1e200"],
-        ),
         (
             "i1 0 a 0\nr1 a 0 1",
             vec!["i1", "0", "1e200", "1e200", "@i1[m]", "0", "1e200", "1e200"],
@@ -1019,6 +1046,20 @@ fn late_independent_source_forcing_overflow_is_an_input_error() {
             "{error}"
         );
     }
+}
+
+#[test]
+fn bias_independent_behavioural_overflow_is_rejected_before_samples() {
+    let context = AnalysisContext::default();
+    let error = rejected(
+        "v1 a 0 0\nb1 a 0 i=1e308*(temper-27)\nr1 a 0 1",
+        &["temp", "27", "29", "1"],
+        &context,
+    );
+    assert!(
+        error.to_string().contains("behavioural source b1"),
+        "{error}"
+    );
 }
 
 // ---- product and work limits ------------------------------------------------------------

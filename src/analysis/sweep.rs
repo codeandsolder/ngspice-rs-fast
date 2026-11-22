@@ -881,7 +881,12 @@ pub(super) fn run(
         nodes: &nodes,
     };
     let grids = &sweep.grids;
-    preflight(&solver.prepared, &axes, grids, context)?;
+    preflight(&solver.prepared, &axes, grids, context).map_err(|error| match error {
+        SpiceError::Numerical { context, message } => {
+            SpiceError::circuit(format!("DC sweep input validation ({context}): {message}"))
+        }
+        other => other,
+    })?;
     // C order: the first axis is the inner (fast) loop, the second the outer.
     let GridPair { inner, outer } = GridPair::new(grids);
     let result = plot(
@@ -1075,6 +1080,8 @@ mod grid_tests {
             let plot = request.run(&mut circuit, &context).unwrap();
             let run = take();
             assert_eq!(run.bindings, bindings, "{args}: {run:?}");
+            assert_eq!(run.name_lookups, binding.name_lookups, "{args}: {run:?}");
+            assert_eq!(run.replacement_validations, resistances, "{args}: {run:?}");
             assert_eq!(run.small_signal_assemblies, 0, "{args}: {run:?}");
             assert_eq!(run.physical_validations, physical, "{args}: {run:?}");
             assert_eq!(

@@ -203,11 +203,24 @@ impl Behavioural {
             .iter()
             .map(|column| column.and_then(|row| solution.get(row)).unwrap_or(0.))
             .collect();
-        let evaluation = self
-            .program
+        let evaluation = self.evaluate_values(&values, time, context)?;
+        Ok(Linearization {
+            evaluation,
+            values,
+            columns,
+        })
+    }
+
+    fn evaluate_values(
+        &self,
+        values: &[Real],
+        time: Real,
+        context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Evaluation> {
+        self.program
             .evaluate_with_workspace(
                 &Environment {
-                    values: &values,
+                    values,
                     time,
                     temperature: context.temperature,
                     gmin: context.gmin,
@@ -225,12 +238,7 @@ impl Behavioural {
                     message,
                 },
                 other => other,
-            })?;
-        Ok(Linearization {
-            evaluation,
-            values,
-            columns,
-        })
+            })
     }
 
     /// The matrix column of every variable (`None` for ground).
@@ -331,7 +339,25 @@ impl Behavioural {
 
 impl Device for Behavioural {
     fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
-        self.checked_factor(context.temperature).map(|_| ())
+        let factor = self.checked_factor(context.temperature)?;
+        // An expression depending only on the environment and ground has a
+        // known value independent of any Newton iterate. Do not evaluate
+        // expressions reading real nodes or branches at an arbitrary bias.
+        if self
+            .variables
+            .iter()
+            .all(|variable| matches!(variable, Variable::Node(node) if *node == NodeId::GROUND))
+        {
+            let values = vec![0.; self.variables.len()];
+            let evaluation = self.evaluate_values(&values, 0., context)?;
+            if !(factor * evaluation.value).is_finite() {
+                return Err(SpiceError::circuit(format!(
+                    "{}: nonfinite independent behavioural DC forcing",
+                    self.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// `asrc`: `inpcom.c` rewrites the E/G/F/H VALUE/TABLE/POLY forms into
