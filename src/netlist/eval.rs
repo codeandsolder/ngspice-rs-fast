@@ -1256,10 +1256,10 @@ fn evaluate_root(
 }
 
 fn snippet<'a>(root: &'a ParameterExpression, node: &Expr) -> &'a str {
-    let base = root.span.start.column as usize;
-    let s = (node.span.start.column as usize).saturating_sub(base);
-    let e = (node.span.end.column as usize).saturating_sub(base);
-    root.text.get(s..e).unwrap_or(root.text.as_str())
+    node.span
+        .relative_to(&root.span)
+        .and_then(|range| root.text.get(range))
+        .unwrap_or(root.text.as_str())
 }
 
 fn fail(node: &Expr, root: &ParameterExpression, message: impl std::fmt::Display) -> Failure {

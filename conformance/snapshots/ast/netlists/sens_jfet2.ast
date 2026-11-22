@@ -67,19 +67,19 @@ scope root
         [4] name="rd" kind=scalar value="10" @netlists/sens_jfet2.cir:16:52
         [5] name="rs" kind=scalar value="20" @netlists/sens_jfet2.cir:16:58
         [6] name="cds" kind=scalar value="1p" @netlists/sens_jfet2.cir:16:64
-        [7] name="cgs" kind=scalar value="2p" @netlists/sens_jfet2.cir:16:71
-        [8] name="cgd" kind=scalar value="1p" @netlists/sens_jfet2.cir:16:78
-        [9] name="vbi" kind=scalar value="0.8" @netlists/sens_jfet2.cir:16:85
-        [10] name="is" kind=scalar value="1e-14" @netlists/sens_jfet2.cir:16:93
-        [11] name="n" kind=scalar value="1.2" @netlists/sens_jfet2.cir:16:102
-        [12] name="fc" kind=scalar value="0.4" @netlists/sens_jfet2.cir:16:108
-        [13] name="ibd" kind=scalar value="1e-9" @netlists/sens_jfet2.cir:16:115
-        [14] name="vbd" kind=scalar value="1.2" @netlists/sens_jfet2.cir:16:124
-        [15] name="taud" kind=scalar value="1e-9" @netlists/sens_jfet2.cir:16:132
-        [16] name="taug" kind=scalar value="1e-9" @netlists/sens_jfet2.cir:16:142
-        [17] name="vst" kind=scalar value="0.5" @netlists/sens_jfet2.cir:16:152
-        [18] name="ver" kind=scalar value="1" @netlists/sens_jfet2.cir:16:160
-        [19] name="tnom" kind=scalar value="30" @netlists/sens_jfet2.cir:16:166
+        [7] name="cgs" kind=scalar value="2p" @netlists/sens_jfet2.cir:17:3
+        [8] name="cgd" kind=scalar value="1p" @netlists/sens_jfet2.cir:17:10
+        [9] name="vbi" kind=scalar value="0.8" @netlists/sens_jfet2.cir:17:17
+        [10] name="is" kind=scalar value="1e-14" @netlists/sens_jfet2.cir:17:25
+        [11] name="n" kind=scalar value="1.2" @netlists/sens_jfet2.cir:17:34
+        [12] name="fc" kind=scalar value="0.4" @netlists/sens_jfet2.cir:17:40
+        [13] name="ibd" kind=scalar value="1e-9" @netlists/sens_jfet2.cir:17:47
+        [14] name="vbd" kind=scalar value="1.2" @netlists/sens_jfet2.cir:17:56
+        [15] name="taud" kind=scalar value="1e-9" @netlists/sens_jfet2.cir:18:3
+        [16] name="taug" kind=scalar value="1e-9" @netlists/sens_jfet2.cir:18:13
+        [17] name="vst" kind=scalar value="0.5" @netlists/sens_jfet2.cir:18:23
+        [18] name="ver" kind=scalar value="1" @netlists/sens_jfet2.cir:18:31
+        [19] name="tnom" kind=scalar value="30" @netlists/sens_jfet2.cir:18:37
     model [1] name="jp" base="pjf" level=2e0 @netlists/sens_jfet2.cir:19:1
       parameters (6):
         [0] name="level" kind=scalar value="2" @netlists/sens_jfet2.cir:19:15

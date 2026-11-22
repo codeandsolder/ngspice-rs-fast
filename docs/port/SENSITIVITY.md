@@ -569,7 +569,7 @@ difference in the solved response. Linux C reproduces the Linux Rust values,
 including the other ten columns that failed against the macOS capture. The
 original golden is unchanged; `conformance/golden/linux-x86_64-gnu/sens_bjt.raw`
 is an independently captured C variant with build provenance in its README.
-`conformance/reference.rs` selects it for GNU Linux x86-64 in capture, drift
+`conformance/support/src/fixtures.rs` selects it for GNU Linux x86-64 in capture, drift
 checks, verification and the BJT production test. All 291 columns retain the
 same tolerance, with no skips or missing-file fallback. A large quotient in
 this fixture is not necessarily a portable physical derivative.
@@ -715,7 +715,7 @@ deck that asks fails loudly.
   models, tightened RELTOL) under `compare::SENSITIVITY_NONLINEAR` (1e-6
   relative, 1e-9 absolute; the floor covers forward differences of weak
   parameters that are a few ulps of the node voltage, see
-  `xtask/src/compare.rs`). The `j`/`z` family fixtures are there too:
+  `xtask/src/commands/compare.rs`). The `j`/`z` family fixtures are there too:
   `sens_jfet`, `sens_jfet2`, `sens_mesfet`, `sens_hfet1`, `sens_hfet2`,
   `sens_mesa`, `sens_mesa3`, `sens_mesa4`, `sens_mesa4_ts` and `sens_bjt`.
   The AC reset state (#102): `sens_ac_reset` (diode, S/W switches, B sources),

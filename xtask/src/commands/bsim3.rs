@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::ifparm::{self, Spec};
+use super::ifparm::{self, Spec};
 
 const USAGE: &str = "usage: cargo xtask bsim3-schema --source <ngspice-checkout> [--check]";
 
@@ -21,7 +21,7 @@ const SPEC: Spec = Spec {
     literal_expected: 376,
 };
 
-pub(crate) fn main(args: &[String]) -> Result<(), String> {
+pub(super) fn main(root: &std::path::Path, args: &[String]) -> Result<(), String> {
     let parsed = ifparm::args(args, USAGE)?;
     let source = parsed.source;
     let files = [
@@ -61,7 +61,7 @@ pub(crate) fn main(args: &[String]) -> Result<(), String> {
         ("src/devices/bsim3/defaults_data.rs", defaults),
         ("src/devices/bsim3/size_data.rs", size),
     ] {
-        ifparm::emit(path, &text, parsed.check)?;
+        ifparm::emit(root, path, &text, parsed.check)?;
     }
     if parsed.check {
         println!("BSIM3 schema/default facts match {revision} (429 model, 49 instance entries)");

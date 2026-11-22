@@ -36,16 +36,16 @@ scope root
         [2] name="rsi" kind=scalar value="0" @netlists/m10_hfet1_dc.cir:5:33
         [3] name="m" kind=scalar value="2.57" @netlists/m10_hfet1_dc.cir:5:39
         [4] name="lambda" kind=scalar value="0.17" @netlists/m10_hfet1_dc.cir:5:46
-        [5] name="vs" kind=scalar value="1.5e5" @netlists/m10_hfet1_dc.cir:5:58
-        [6] name="mu" kind=scalar value="0.385" @netlists/m10_hfet1_dc.cir:5:67
-        [7] name="vt0" kind=scalar value="0.13" @netlists/m10_hfet1_dc.cir:5:76
-        [8] name="eta" kind=scalar value="1.32" @netlists/m10_hfet1_dc.cir:5:85
-        [9] name="sigma0" kind=scalar value="0.04" @netlists/m10_hfet1_dc.cir:5:94
-        [10] name="vsigma" kind=scalar value="0.1" @netlists/m10_hfet1_dc.cir:5:106
-        [11] name="vsigmat" kind=scalar value="0.3" @netlists/m10_hfet1_dc.cir:5:117
-        [12] name="js1s" kind=scalar value="0" @netlists/m10_hfet1_dc.cir:5:129
-        [13] name="js1d" kind=scalar value="0" @netlists/m10_hfet1_dc.cir:5:136
-        [14] name="nmax" kind=scalar value="6e15" @netlists/m10_hfet1_dc.cir:5:143
+        [5] name="vs" kind=scalar value="1.5e5" @netlists/m10_hfet1_dc.cir:6:3
+        [6] name="mu" kind=scalar value="0.385" @netlists/m10_hfet1_dc.cir:6:12
+        [7] name="vt0" kind=scalar value="0.13" @netlists/m10_hfet1_dc.cir:6:21
+        [8] name="eta" kind=scalar value="1.32" @netlists/m10_hfet1_dc.cir:6:30
+        [9] name="sigma0" kind=scalar value="0.04" @netlists/m10_hfet1_dc.cir:6:39
+        [10] name="vsigma" kind=scalar value="0.1" @netlists/m10_hfet1_dc.cir:7:3
+        [11] name="vsigmat" kind=scalar value="0.3" @netlists/m10_hfet1_dc.cir:7:14
+        [12] name="js1s" kind=scalar value="0" @netlists/m10_hfet1_dc.cir:7:26
+        [13] name="js1d" kind=scalar value="0" @netlists/m10_hfet1_dc.cir:7:33
+        [14] name="nmax" kind=scalar value="6e15" @netlists/m10_hfet1_dc.cir:7:40
   subcircuits (0):
   analyses (1):
     analysis [0] kind=dc @netlists/m10_hfet1_dc.cir:10:1

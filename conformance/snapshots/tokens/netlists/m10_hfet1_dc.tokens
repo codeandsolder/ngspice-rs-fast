@@ -52,36 +52,36 @@ card 4 @netlists/m10_hfet1_dc.cir:5:1 lines=5-7 continuations=2
   token 16 5:46 word "lambda"
   token 17 5:52 equals "="
   token 18 5:53 number "0.17" value=1.7e-1
-  token 19 5:58 word "vs"
-  token 20 5:60 equals "="
-  token 21 5:61 number "1.5e5" value=1.5e5
-  token 22 5:67 word "mu"
-  token 23 5:69 equals "="
-  token 24 5:70 number "0.385" value=3.85e-1
-  token 25 5:76 word "vt0"
-  token 26 5:79 equals "="
-  token 27 5:80 number "0.13" value=1.3e-1
-  token 28 5:85 word "eta"
-  token 29 5:88 equals "="
-  token 30 5:89 number "1.32" value=1.32e0
-  token 31 5:94 word "sigma0"
-  token 32 5:100 equals "="
-  token 33 5:101 number "0.04" value=4e-2
-  token 34 5:106 word "vsigma"
-  token 35 5:112 equals "="
-  token 36 5:113 number "0.1" value=1e-1
-  token 37 5:117 word "vsigmat"
-  token 38 5:124 equals "="
-  token 39 5:125 number "0.3" value=3.0000000000000004e-1
-  token 40 5:129 word "js1s"
-  token 41 5:133 equals "="
-  token 42 5:134 number "0" value=0e0
-  token 43 5:136 word "js1d"
-  token 44 5:140 equals "="
-  token 45 5:141 number "0" value=0e0
-  token 46 5:143 word "nmax"
-  token 47 5:147 equals "="
-  token 48 5:148 number "6e15" value=6e15
+  token 19 6:3 word "vs"
+  token 20 6:5 equals "="
+  token 21 6:6 number "1.5e5" value=1.5e5
+  token 22 6:12 word "mu"
+  token 23 6:14 equals "="
+  token 24 6:15 number "0.385" value=3.85e-1
+  token 25 6:21 word "vt0"
+  token 26 6:24 equals "="
+  token 27 6:25 number "0.13" value=1.3e-1
+  token 28 6:30 word "eta"
+  token 29 6:33 equals "="
+  token 30 6:34 number "1.32" value=1.32e0
+  token 31 6:39 word "sigma0"
+  token 32 6:45 equals "="
+  token 33 6:46 number "0.04" value=4e-2
+  token 34 7:3 word "vsigma"
+  token 35 7:9 equals "="
+  token 36 7:10 number "0.1" value=1e-1
+  token 37 7:14 word "vsigmat"
+  token 38 7:21 equals "="
+  token 39 7:22 number "0.3" value=3.0000000000000004e-1
+  token 40 7:26 word "js1s"
+  token 41 7:30 equals "="
+  token 42 7:31 number "0" value=0e0
+  token 43 7:33 word "js1d"
+  token 44 7:37 equals "="
+  token 45 7:38 number "0" value=0e0
+  token 46 7:40 word "nmax"
+  token 47 7:44 equals "="
+  token 48 7:45 number "6e15" value=6e15
 card 5 @netlists/m10_hfet1_dc.cir:8:1 lines=8-8 continuations=0
   raw: ".save all"
   kind: dot(.save)

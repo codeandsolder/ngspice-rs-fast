@@ -636,3 +636,78 @@ fn rf_port_setters_and_the_sp_card_round_trip_in_order() {
     assert!(written.contains("v2 b 0 portnum=2 z0=75"), "{written}");
     assert!(written.contains(".sp dec 10 1k 1g 0"), "{written}");
 }
+
+#[test]
+fn duplicate_card_ordinals_are_not_a_valid_scope() {
+    let mut deck = parse("title\nr1 a 0 1k\nr2 b 0 2k\n.end\n");
+    deck.cards[1].kind = ScopedCardKind::Device(0);
+    refused(&deck, "exactly once");
+}
+
+#[test]
+fn repeated_include_occurrences_preserve_expansion_order_and_output() {
+    use ngspice_rs::devices::subckt::{SubcircuitLimits, expand_with_output};
+    use ngspice_rs::netlist::{behavioural::lower_nonlinear_sources, elaborate::literalize};
+    let temp = TempDir::new("repeated-scope-order");
+    fs::write(temp.0.join("part.inc"), "r1 a 0 1k\n.save v(a)\n").unwrap();
+    let main = temp.0.join("main.cir");
+    fs::write(
+        &main,
+        "title\n.include part.inc\nr2 b 0 2k\n.save v(b)\n.include part.inc\n.end\n",
+    )
+    .unwrap();
+    let parsed = Parser::new().parse_file_with_output(&main).unwrap();
+    let lowered = lower_nonlinear_sources(&parsed.netlist).unwrap();
+    let literal = literalize(&lowered).unwrap();
+    let expanded = expand_with_output(
+        &literal.netlist,
+        &literal.scope,
+        SubcircuitLimits::default(),
+        &parsed.output,
+        &parsed.measurements,
+        &parsed.fourier,
+    )
+    .unwrap();
+    assert_eq!(
+        expanded
+            .devices
+            .iter()
+            .map(|device| device.name.as_str())
+            .collect::<Vec<_>>(),
+        ["r1", "r2", "r1"]
+    );
+    assert_eq!(
+        expanded
+            .output
+            .saves
+            .iter()
+            .map(|save| save.requests[0].vector.name())
+            .collect::<Vec<_>>(),
+        ["v(a)", "v(b)", "v(a)"]
+    );
+}
+
+#[test]
+fn generated_device_cards_retain_source_order_and_provenance() {
+    use ngspice_rs::netlist::behavioural::lower_nonlinear_sources;
+    let input =
+        parse("title\nr1 a 0 1k\nb1 o 0 v=i(r1)\n.option reltol=.001\ne1 x 0 value={v(o)}\n.end\n");
+    let lowered = lower_nonlinear_sources(&input).unwrap();
+    let mut indices = Vec::new();
+    let mut option_at = None;
+    for card in &lowered.cards {
+        match card.kind {
+            ScopedCardKind::Device(index) => indices.push(index),
+            ScopedCardKind::Options(_) => option_at = Some(indices.len()),
+            _ => {}
+        }
+    }
+    assert_eq!(indices, (0..lowered.devices.len()).collect::<Vec<_>>());
+    assert_eq!(option_at, Some(3)); // r1, generated current probe, b1
+    assert!(lowered.devices.len() > input.devices.len());
+    for card in &lowered.cards {
+        if let ScopedCardKind::Device(index) = card.kind {
+            assert_eq!(card.source.location, lowered.devices[index].location);
+        }
+    }
+}

@@ -63,30 +63,30 @@ card 5 @netlists/m10_mesa_l3_op.cir:6:1 lines=6-8 continuations=2
   token 19 6:56 word "vto"
   token 20 6:59 equals "="
   token 21 6:60 number "-2.04" value=-2.04e0
-  token 22 6:66 word "eta"
-  token 23 6:69 equals "="
-  token 24 6:70 number "1.5" value=1.5e0
-  token 25 6:74 word "lambda"
-  token 26 6:80 equals "="
-  token 27 6:81 number "0.04" value=4e-2
-  token 28 6:86 word "tc"
-  token 29 6:88 equals "="
-  token 30 6:89 number "0.001" value=1e-3
-  token 31 6:95 word "sigma0"
-  token 32 6:101 equals "="
-  token 33 6:102 number "0.02" value=2e-2
-  token 34 6:107 word "vsigma"
-  token 35 6:113 equals "="
-  token 36 6:114 number "0.1" value=1e-1
-  token 37 6:118 word "vsigmat"
-  token 38 6:125 equals "="
-  token 39 6:126 number "1.37" value=1.37e0
-  token 40 6:131 word "delta"
-  token 41 6:136 equals "="
-  token 42 6:137 number "5" value=5e0
-  token 43 6:139 word "beta"
-  token 44 6:143 equals "="
-  token 45 6:144 number "0.0085" value=8.5e-3
+  token 22 7:3 word "eta"
+  token 23 7:6 equals "="
+  token 24 7:7 number "1.5" value=1.5e0
+  token 25 7:11 word "lambda"
+  token 26 7:17 equals "="
+  token 27 7:18 number "0.04" value=4e-2
+  token 28 7:23 word "tc"
+  token 29 7:25 equals "="
+  token 30 7:26 number "0.001" value=1e-3
+  token 31 7:32 word "sigma0"
+  token 32 7:38 equals "="
+  token 33 7:39 number "0.02" value=2e-2
+  token 34 7:44 word "vsigma"
+  token 35 7:50 equals "="
+  token 36 7:51 number "0.1" value=1e-1
+  token 37 7:55 word "vsigmat"
+  token 38 7:62 equals "="
+  token 39 7:63 number "1.37" value=1.37e0
+  token 40 8:3 word "delta"
+  token 41 8:8 equals "="
+  token 42 8:9 number "5" value=5e0
+  token 43 8:11 word "beta"
+  token 44 8:15 equals "="
+  token 45 8:16 number "0.0085" value=8.5e-3
 card 6 @netlists/m10_mesa_l3_op.cir:9:1 lines=9-9 continuations=0
   raw: ".save all"
   kind: dot(.save)

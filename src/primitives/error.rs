@@ -24,14 +24,14 @@ pub struct SourceLoc {
     pub file: Arc<PathBuf>,
     /// 1-based line number.
     pub line: u32,
-    /// 1-based byte column within the logical line.
-    pub column: u32,
+    /// 1-based UTF-8 byte column within the physical line.
+    pub column: usize,
 }
 
 impl SourceLoc {
     /// Builds a location.
     #[must_use]
-    pub fn new(file: impl Into<Arc<PathBuf>>, line: u32, column: u32) -> Self {
+    pub fn new(file: impl Into<Arc<PathBuf>>, line: u32, column: usize) -> Self {
         Self {
             file: file.into(),
             line,
@@ -47,7 +47,7 @@ impl SourceLoc {
 
     /// The same location, moved to a different column.
     #[must_use]
-    pub fn at_column(&self, column: u32) -> Self {
+    pub fn at_column(&self, column: usize) -> Self {
         Self {
             file: Arc::clone(&self.file),
             line: self.line,

@@ -122,12 +122,10 @@ pub(super) fn expression_after(
     verbatim: bool,
 ) -> Result<BehaviouralExpression> {
     let raw = &input.state.card.raw;
-    let start = raw_offset(after) + after.text.len();
-    let column = after.location.column + u32::try_from(after.text.len()).unwrap_or(u32::MAX);
+    let start = after.raw_offset + after.text.len();
     let (expression, consumed) = super::bexpression::parse_prefix(
-        &raw[start.min(raw.len())..],
-        &input.state.card.location,
-        column,
+        &raw[start..],
+        input.state.card.position().advance(start),
         verbatim,
         input.state.auto_gnd,
     )
@@ -136,25 +134,17 @@ pub(super) fn expression_after(
     Ok(expression)
 }
 
-/// Byte offset of a token in its card's joined text (`tokenize` columns are
-/// one-based byte offsets).
-const fn raw_offset(token: &Token) -> usize {
-    token.location.column.saturating_sub(1) as usize
-}
-
 /// Consumes every token that starts before `end`; a token that starts before
 /// `end` but extends past it was split by the expression and is an error.
 fn skip_to(input: &mut Input<'_>, end: usize) -> Result<()> {
     while let Some(token) = input.input.first() {
-        let start = raw_offset(token);
+        let start = token.raw_offset;
         if start >= end {
             break;
         }
         if start + token.text.len() > end {
             return Err(ErrMode::Cut(Failure(SpiceError::parse(
-                token
-                    .location
-                    .at_column(u32::try_from(end + 1).unwrap_or(u32::MAX)),
+                input.state.card.position().advance(end).location(),
                 format!(
                     "unexpected text after a complete behavioural expression in '{}'",
                     token.text
@@ -289,8 +279,7 @@ pub(super) fn table_form(
         let verbatim = inner.trim_start().to_ascii_lowercase().starts_with("pwl(");
         let expression = super::bexpression::parse_complete(
             inner,
-            &token.location,
-            token.location.column + 1,
+            token.position().advance(1),
             verbatim,
             input.state.auto_gnd,
         )

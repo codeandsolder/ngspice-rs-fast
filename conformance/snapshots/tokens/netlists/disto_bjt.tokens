@@ -216,58 +216,58 @@ card 23 @netlists/disto_bjt.cir:30:1 lines=30-32 continuations=2
   token 35 30:94 word "br"
   token 36 30:96 equals "="
   token 37 30:97 number "3" value=3e0
-  token 38 30:99 word "rb"
-  token 39 30:101 equals "="
-  token 40 30:102 number "100" value=1e2
-  token 41 30:106 word "rbm"
-  token 42 30:109 equals "="
-  token 43 30:110 number "20" value=2e1
-  token 44 30:113 word "irb"
-  token 45 30:116 equals "="
-  token 46 30:117 number "1m" value=1e-3
-  token 47 30:120 word "re"
-  token 48 30:122 equals "="
-  token 49 30:123 number "1" value=1e0
-  token 50 30:125 word "rc"
-  token 51 30:127 equals "="
-  token 52 30:128 number "10" value=1e1
-  token 53 30:131 word "cje"
-  token 54 30:134 equals "="
-  token 55 30:135 number "2p" value=2e-12
-  token 56 30:138 word "vje"
-  token 57 30:141 equals "="
-  token 58 30:142 number "0.8" value=8e-1
-  token 59 30:146 word "mje"
-  token 60 30:149 equals "="
-  token 61 30:150 number "0.4" value=4e-1
-  token 62 30:154 word "tf"
-  token 63 30:156 equals "="
-  token 64 30:157 number "0.4n" value=4e-10
-  token 65 30:162 word "xtf"
-  token 66 30:165 equals "="
-  token 67 30:166 number "2" value=2e0
-  token 68 30:168 word "vtf"
-  token 69 30:171 equals "="
-  token 70 30:172 number "4" value=4e0
-  token 71 30:174 word "itf"
-  token 72 30:177 equals "="
-  token 73 30:178 number "50m" value=5e-2
-  token 74 30:182 word "cjc"
-  token 75 30:185 equals "="
-  token 76 30:186 number "1p" value=1e-12
-  token 77 30:189 word "vjc"
-  token 78 30:192 equals "="
-  token 79 30:193 number "0.7" value=7.000000000000001e-1
-  token 80 30:197 word "mjc"
-  token 81 30:200 equals "="
-  token 82 30:201 number "0.35" value=3.5000000000000003e-1
-  token 83 30:206 word "xcjc"
-  token 84 30:210 equals "="
-  token 85 30:211 number "0.6" value=6.000000000000001e-1
-  token 86 30:215 word "tr"
-  token 87 30:217 equals "="
-  token 88 30:218 number "10n" value=1e-8
-  token 89 30:221 rparen ")"
+  token 38 31:3 word "rb"
+  token 39 31:5 equals "="
+  token 40 31:6 number "100" value=1e2
+  token 41 31:10 word "rbm"
+  token 42 31:13 equals "="
+  token 43 31:14 number "20" value=2e1
+  token 44 31:17 word "irb"
+  token 45 31:20 equals "="
+  token 46 31:21 number "1m" value=1e-3
+  token 47 31:24 word "re"
+  token 48 31:26 equals "="
+  token 49 31:27 number "1" value=1e0
+  token 50 31:29 word "rc"
+  token 51 31:31 equals "="
+  token 52 31:32 number "10" value=1e1
+  token 53 31:35 word "cje"
+  token 54 31:38 equals "="
+  token 55 31:39 number "2p" value=2e-12
+  token 56 31:42 word "vje"
+  token 57 31:45 equals "="
+  token 58 31:46 number "0.8" value=8e-1
+  token 59 31:50 word "mje"
+  token 60 31:53 equals "="
+  token 61 31:54 number "0.4" value=4e-1
+  token 62 31:58 word "tf"
+  token 63 31:60 equals "="
+  token 64 31:61 number "0.4n" value=4e-10
+  token 65 31:66 word "xtf"
+  token 66 31:69 equals "="
+  token 67 31:70 number "2" value=2e0
+  token 68 31:72 word "vtf"
+  token 69 31:75 equals "="
+  token 70 31:76 number "4" value=4e0
+  token 71 31:78 word "itf"
+  token 72 31:81 equals "="
+  token 73 31:82 number "50m" value=5e-2
+  token 74 32:3 word "cjc"
+  token 75 32:6 equals "="
+  token 76 32:7 number "1p" value=1e-12
+  token 77 32:10 word "vjc"
+  token 78 32:13 equals "="
+  token 79 32:14 number "0.7" value=7.000000000000001e-1
+  token 80 32:18 word "mjc"
+  token 81 32:21 equals "="
+  token 82 32:22 number "0.35" value=3.5000000000000003e-1
+  token 83 32:27 word "xcjc"
+  token 84 32:31 equals "="
+  token 85 32:32 number "0.6" value=6.000000000000001e-1
+  token 86 32:36 word "tr"
+  token 87 32:38 equals "="
+  token 88 32:39 number "10n" value=1e-8
+  token 89 32:42 rparen ")"
 card 24 @netlists/disto_bjt.cir:33:1 lines=33-34 continuations=1
   raw: ".model qb npn(is=2e-15 bf=100 vaf=80 ikf=30m rb=200 re=2 rc=20 cje=1p tf=1n xtf=1 cjc=0.5p cjs=0.8p vjs=0.6 mjs=0.4)"
   kind: dot(.model)
@@ -308,16 +308,16 @@ card 24 @netlists/disto_bjt.cir:33:1 lines=33-34 continuations=1
   token 35 33:83 word "cjc"
   token 36 33:86 equals "="
   token 37 33:87 number "0.5p" value=5e-13
-  token 38 33:92 word "cjs"
-  token 39 33:95 equals "="
-  token 40 33:96 number "0.8p" value=8e-13
-  token 41 33:101 word "vjs"
-  token 42 33:104 equals "="
-  token 43 33:105 number "0.6" value=6.000000000000001e-1
-  token 44 33:109 word "mjs"
-  token 45 33:112 equals "="
-  token 46 33:113 number "0.4" value=4e-1
-  token 47 33:116 rparen ")"
+  token 38 34:3 word "cjs"
+  token 39 34:6 equals "="
+  token 40 34:7 number "0.8p" value=8e-13
+  token 41 34:12 word "vjs"
+  token 42 34:15 equals "="
+  token 43 34:16 number "0.6" value=6.000000000000001e-1
+  token 44 34:20 word "mjs"
+  token 45 34:23 equals "="
+  token 46 34:24 number "0.4" value=4e-1
+  token 47 34:27 rparen ")"
 card 25 @netlists/disto_bjt.cir:35:1 lines=35-35 continuations=0
   raw: ".model qp pnp(is=1e-15 bf=80 vaf=50 ikf=10m cje=2p mje=0.4 tf=0.5n xtf=1 vtf=3 cjc=1p xcjc=0.5 cjs=0.3p)"
   kind: dot(.model)

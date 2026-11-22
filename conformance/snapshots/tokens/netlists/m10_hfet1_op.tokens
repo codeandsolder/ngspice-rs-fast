@@ -89,12 +89,12 @@ card 6 @netlists/m10_hfet1_op.cir:7:1 lines=7-8 continuations=1
   token 25 7:65 word "rsi"
   token 26 7:68 equals "="
   token 27 7:69 number "50" value=5e1
-  token 28 7:72 word "js1s"
-  token 29 7:76 equals "="
-  token 30 7:77 number "1e-10" value=1e-10
-  token 31 7:83 word "js1d"
-  token 32 7:87 equals "="
-  token 33 7:88 number "1e-10" value=1e-10
+  token 28 8:3 word "js1s"
+  token 29 8:7 equals "="
+  token 30 8:8 number "1e-10" value=1e-10
+  token 31 8:14 word "js1d"
+  token 32 8:18 equals "="
+  token 33 8:19 number "1e-10" value=1e-10
 card 7 @netlists/m10_hfet1_op.cir:9:1 lines=9-10 continuations=1
   raw: ".model pch phfet level=5 rd=31 rs=31 rg=10 ri=1e3 rf=2e3 rdi=50 rsi=50 js1s=1e-10 js1d=1e-10"
   kind: dot(.model)
@@ -125,12 +125,12 @@ card 7 @netlists/m10_hfet1_op.cir:9:1 lines=9-10 continuations=1
   token 25 9:65 word "rsi"
   token 26 9:68 equals "="
   token 27 9:69 number "50" value=5e1
-  token 28 9:72 word "js1s"
-  token 29 9:76 equals "="
-  token 30 9:77 number "1e-10" value=1e-10
-  token 31 9:83 word "js1d"
-  token 32 9:87 equals "="
-  token 33 9:88 number "1e-10" value=1e-10
+  token 28 10:3 word "js1s"
+  token 29 10:7 equals "="
+  token 30 10:8 number "1e-10" value=1e-10
+  token 31 10:14 word "js1d"
+  token 32 10:18 equals "="
+  token 33 10:19 number "1e-10" value=1e-10
 card 8 @netlists/m10_hfet1_op.cir:11:1 lines=11-11 continuations=0
   raw: ".save all"
   kind: dot(.save)

@@ -104,10 +104,10 @@ card 8 @netlists/sens_mesa3.cir:21:1 lines=21-22 continuations=1
   token 23 21:63 word "rtc2"
   token 24 21:67 equals "="
   token 25 21:68 number "1e-5" value=1e-5
-  token 26 21:73 word "phib"
-  token 27 21:77 equals "="
-  token 28 21:78 number "3.1232e18" value=3.1232e18
-  token 29 21:87 rparen ")"
+  token 26 22:3 word "phib"
+  token 27 22:7 equals "="
+  token 28 22:8 number "3.1232e18" value=3.1232e18
+  token 29 22:17 rparen ")"
 card 9 @netlists/sens_mesa3.cir:23:1 lines=23-24 continuations=1
   raw: ".model mesmod2 nmf(level=3 rd=31 rs=31 rdi=20 rsi=20 rtc1=1e-3 rtc2=1e-5 phib=3.1232e18)"
   kind: dot(.model)
@@ -136,10 +136,10 @@ card 9 @netlists/sens_mesa3.cir:23:1 lines=23-24 continuations=1
   token 23 23:64 word "rtc2"
   token 24 23:68 equals "="
   token 25 23:69 number "1e-5" value=1e-5
-  token 26 23:74 word "phib"
-  token 27 23:78 equals "="
-  token 28 23:79 number "3.1232e18" value=3.1232e18
-  token 29 23:88 rparen ")"
+  token 26 24:3 word "phib"
+  token 27 24:7 equals "="
+  token 28 24:8 number "3.1232e18" value=3.1232e18
+  token 29 24:17 rparen ")"
 card 10 @netlists/sens_mesa3.cir:25:1 lines=25-25 continuations=0
   raw: ".sens i(vids)"
   kind: dot(.sens)

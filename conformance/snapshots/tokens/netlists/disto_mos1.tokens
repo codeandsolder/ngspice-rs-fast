@@ -173,34 +173,34 @@ card 14 @netlists/disto_mos1.cir:20:1 lines=20-21 continuations=1
   token 32 20:90 word "cbs"
   token 33 20:93 equals "="
   token 34 20:94 number "20f" value=2.0000000000000003e-14
-  token 35 20:98 word "cj"
-  token 36 20:100 equals "="
-  token 37 20:101 number "1e-4" value=1e-4
-  token 38 20:106 word "cjsw"
-  token 39 20:110 equals "="
-  token 40 20:111 number "1e-10" value=1e-10
-  token 41 20:117 word "mj"
-  token 42 20:119 equals "="
-  token 43 20:120 number "0.4" value=4e-1
-  token 44 20:124 word "mjsw"
-  token 45 20:128 equals "="
-  token 46 20:129 number "0.3" value=3.0000000000000004e-1
-  token 47 20:133 word "tox"
-  token 48 20:136 equals "="
-  token 49 20:137 number "20n" value=2e-8
-  token 50 20:141 word "cgso"
-  token 51 20:145 equals "="
-  token 52 20:146 number "1e-10" value=1e-10
-  token 53 20:152 word "cgdo"
-  token 54 20:156 equals "="
-  token 55 20:157 number "1e-10" value=1e-10
-  token 56 20:163 word "cgbo"
-  token 57 20:167 equals "="
-  token 58 20:168 number "1e-10" value=1e-10
-  token 59 20:174 word "is"
-  token 60 20:176 equals "="
-  token 61 20:177 number "1e-14" value=1e-14
-  token 62 20:182 rparen ")"
+  token 35 21:3 word "cj"
+  token 36 21:5 equals "="
+  token 37 21:6 number "1e-4" value=1e-4
+  token 38 21:11 word "cjsw"
+  token 39 21:15 equals "="
+  token 40 21:16 number "1e-10" value=1e-10
+  token 41 21:22 word "mj"
+  token 42 21:24 equals "="
+  token 43 21:25 number "0.4" value=4e-1
+  token 44 21:29 word "mjsw"
+  token 45 21:33 equals "="
+  token 46 21:34 number "0.3" value=3.0000000000000004e-1
+  token 47 21:38 word "tox"
+  token 48 21:41 equals "="
+  token 49 21:42 number "20n" value=2e-8
+  token 50 21:46 word "cgso"
+  token 51 21:50 equals "="
+  token 52 21:51 number "1e-10" value=1e-10
+  token 53 21:57 word "cgdo"
+  token 54 21:61 equals "="
+  token 55 21:62 number "1e-10" value=1e-10
+  token 56 21:68 word "cgbo"
+  token 57 21:72 equals "="
+  token 58 21:73 number "1e-10" value=1e-10
+  token 59 21:79 word "is"
+  token 60 21:81 equals "="
+  token 61 21:82 number "1e-14" value=1e-14
+  token 62 21:87 rparen ")"
 card 15 @netlists/disto_mos1.cir:22:1 lines=22-22 continuations=0
   raw: ".model pm pmos(level=1 vto=-0.8 kp=20u gamma=0.4 lambda=0.05 tox=20n cgso=1e-10 cgdo=1e-10 cj=1e-4 mj=0.5 mjsw=0.5 cjsw=1e-10)"
   kind: dot(.model)

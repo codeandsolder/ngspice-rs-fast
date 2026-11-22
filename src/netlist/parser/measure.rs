@@ -297,13 +297,7 @@ fn parameter_expression(input: &mut Input<'_>) -> Result<MeasureRequest> {
     let expression = match &token.kind {
         TokenKind::Expression(_) => super::expression::from_brace_token(token),
         TokenKind::Quoted(inner) if token.text == format!("'{inner}'") => {
-            super::expression::parse_delimited(
-                inner,
-                &token.location,
-                token.location.column + 1,
-                false,
-                true,
-            )
+            super::expression::parse_delimited(inner, token.position().advance(1), false, true)
         }
         TokenKind::Number(_) | TokenKind::Word => super::expression::from_name_token(token),
         _ => return Err(fail(&token.location, "PARAM requires a scalar expression")),
@@ -826,13 +820,7 @@ pub(super) fn numeric_expression(
     match &token.kind {
         TokenKind::Expression(_) => super::expression::from_brace_token(token),
         TokenKind::Quoted(inner) if token.text == format!("'{inner}'") => {
-            super::expression::parse_delimited(
-                inner,
-                &token.location,
-                token.location.column + 1,
-                false,
-                true,
-            )
+            super::expression::parse_delimited(inner, token.position().advance(1), false, true)
         }
         _ => Err(SpiceError::parse(
             token.location.clone(),

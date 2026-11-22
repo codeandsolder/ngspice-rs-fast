@@ -107,52 +107,52 @@ card 10 @netlists/sens_jfet.cir:16:1 lines=16-18 continuations=2
   token 23 16:63 word "cgd"
   token 24 16:66 equals "="
   token 25 16:67 number "1p" value=1e-12
-  token 26 16:70 word "pb"
-  token 27 16:72 equals "="
-  token 28 16:73 number "0.8" value=8e-1
-  token 29 16:77 word "is"
-  token 30 16:79 equals "="
-  token 31 16:80 number "1e-14" value=1e-14
-  token 32 16:86 word "n"
-  token 33 16:87 equals "="
-  token 34 16:88 number "1.2" value=1.2000000000000002e0
-  token 35 16:92 word "fc"
-  token 36 16:94 equals "="
-  token 37 16:95 number "0.4" value=4e-1
-  token 38 16:99 word "b"
-  token 39 16:100 equals "="
-  token 40 16:101 number "0.9" value=9e-1
-  token 41 16:105 word "tnom"
-  token 42 16:109 equals "="
-  token 43 16:110 number "30" value=3e1
-  token 44 16:113 word "tcv"
-  token 45 16:116 equals "="
-  token 46 16:117 number "-2e-3" value=-2e-3
-  token 47 16:123 word "vtotc"
-  token 48 16:128 equals "="
-  token 49 16:129 number "1e-3" value=1e-3
-  token 50 16:134 word "bex"
-  token 51 16:137 equals "="
-  token 52 16:138 number "0.5" value=5e-1
-  token 53 16:142 word "betatce"
-  token 54 16:149 equals "="
-  token 55 16:150 number "0.7" value=7.000000000000001e-1
-  token 56 16:154 word "xti"
-  token 57 16:157 equals "="
-  token 58 16:158 number "2.5" value=2.5e0
-  token 59 16:162 word "eg"
-  token 60 16:164 equals "="
-  token 61 16:165 number "1.15" value=1.1500000000000001e0
-  token 62 16:170 word "kf"
-  token 63 16:172 equals "="
-  token 64 16:173 number "1e-26" value=1e-26
-  token 65 16:179 word "af"
-  token 66 16:181 equals "="
-  token 67 16:182 number "1.1" value=1.1e0
-  token 68 16:186 word "gdsnoi"
-  token 69 16:192 equals "="
-  token 70 16:193 number "2" value=2e0
-  token 71 16:194 rparen ")"
+  token 26 17:3 word "pb"
+  token 27 17:5 equals "="
+  token 28 17:6 number "0.8" value=8e-1
+  token 29 17:10 word "is"
+  token 30 17:12 equals "="
+  token 31 17:13 number "1e-14" value=1e-14
+  token 32 17:19 word "n"
+  token 33 17:20 equals "="
+  token 34 17:21 number "1.2" value=1.2000000000000002e0
+  token 35 17:25 word "fc"
+  token 36 17:27 equals "="
+  token 37 17:28 number "0.4" value=4e-1
+  token 38 17:32 word "b"
+  token 39 17:33 equals "="
+  token 40 17:34 number "0.9" value=9e-1
+  token 41 17:38 word "tnom"
+  token 42 17:42 equals "="
+  token 43 17:43 number "30" value=3e1
+  token 44 17:46 word "tcv"
+  token 45 17:49 equals "="
+  token 46 17:50 number "-2e-3" value=-2e-3
+  token 47 17:56 word "vtotc"
+  token 48 17:61 equals "="
+  token 49 17:62 number "1e-3" value=1e-3
+  token 50 18:3 word "bex"
+  token 51 18:6 equals "="
+  token 52 18:7 number "0.5" value=5e-1
+  token 53 18:11 word "betatce"
+  token 54 18:18 equals "="
+  token 55 18:19 number "0.7" value=7.000000000000001e-1
+  token 56 18:23 word "xti"
+  token 57 18:26 equals "="
+  token 58 18:27 number "2.5" value=2.5e0
+  token 59 18:31 word "eg"
+  token 60 18:33 equals "="
+  token 61 18:34 number "1.15" value=1.1500000000000001e0
+  token 62 18:39 word "kf"
+  token 63 18:41 equals "="
+  token 64 18:42 number "1e-26" value=1e-26
+  token 65 18:48 word "af"
+  token 66 18:50 equals "="
+  token 67 18:51 number "1.1" value=1.1e0
+  token 68 18:55 word "gdsnoi"
+  token 69 18:61 equals "="
+  token 70 18:62 number "2" value=2e0
+  token 71 18:63 rparen ")"
 card 11 @netlists/sens_jfet.cir:19:1 lines=19-19 continuations=0
   raw: ".model jp pjf(vto=-1.5 beta=5e-5 rd=5 rs=5 tnom=40 tcv=1e-3)"
   kind: dot(.model)

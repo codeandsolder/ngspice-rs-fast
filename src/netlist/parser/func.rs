@@ -23,7 +23,7 @@ use winnow::stream::Stream;
 use winnow::token::{any, literal, one_of, take_while};
 
 use crate::netlist::ast::{FuncCard, FuncParameter, FuncSpelling};
-use crate::netlist::card::DotCommand;
+use crate::netlist::card::{DotCommand, RawCard};
 use crate::netlist::expr::{Function, ParameterExpression, SourceSpan};
 use crate::netlist::token::Token;
 
@@ -46,46 +46,41 @@ pub(super) fn func_card(input: &mut Input<'_>) -> Result<ParsedCard> {
         token.text.starts_with('.') && DotCommand::parse(&token.text) == DotCommand::Func
     })
     .parse_next(input)?;
-    let location = input.state.card.location.clone();
-    let Some(first) = input.input.first().map(|token| token.location.column) else {
+    let Some(start) = input.input.first().map(|token| token.raw_offset) else {
         return Err(super::syntax::malformed(
             input,
             "expected a function name after .func",
         ));
     };
-    let raw = input.state.card.raw.as_str();
     // The text grammar owns the whole tail (the tokenizer already matched
     // braces and quotes), so drain the token slice.
     winnow::token::rest.parse_next(input)?;
-    let start = (first as usize).saturating_sub(1).min(raw.len());
-    let card = definition(raw, start, &location, FuncSpelling::Func)
+    let card = definition(input.state.card, start, FuncSpelling::Func)
         .map_err(|error| ErrMode::Cut(Failure(error)))?;
     Ok(ParsedCard::Func(card))
 }
 
 /// Parses `raw[start..]` as `name(params) [=] body`.
 pub(super) fn definition(
-    raw: &str,
+    raw: &RawCard,
     start: usize,
-    origin: &SourceLoc,
     spelling: FuncSpelling,
 ) -> SpiceResult<FuncCard> {
-    let text = &raw[start..];
-    let column = u32::try_from(start).unwrap_or(u32::MAX).saturating_add(1);
+    let text = &raw.raw[start..];
+    let origin = raw.position().advance(start);
     let mut input = In {
         input: text,
         state: Ctx {
             origin,
-            column,
             total: text.len(),
             depth: 0,
             shadowing: &[],
         },
     };
-    let card = match card(&mut input, spelling) {
+    let card = match card(&mut input, spelling, &raw.location) {
         Ok(card) => card,
         Err(ErrMode::Backtrack(fail) | ErrMode::Cut(fail)) => {
-            return Err(into_error(origin, column, text.len(), fail));
+            return Err(into_error(origin, text.len(), fail));
         }
         Err(ErrMode::Incomplete(_)) => unreachable!("complete input"),
     };
@@ -101,14 +96,11 @@ fn identifier<'a>(input: &mut In<'a>) -> Res<(&'a str, SourceSpan)> {
     let end = input.eof_offset();
     Ok((
         name,
-        SourceSpan {
-            start: input.state.location(start),
-            end: input.state.location(end),
-        },
+        SourceSpan::from_positions(input.state.position(start), input.state.position(end)),
     ))
 }
 
-fn card(input: &mut In<'_>, spelling: FuncSpelling) -> Res<FuncCard> {
+fn card(input: &mut In<'_>, spelling: FuncSpelling, location: &SourceLoc) -> Res<FuncCard> {
     ws.parse_next(input)?;
     let here = input.eof_offset();
     let Some((name, name_span)) = opt(identifier).parse_next(input)? else {
@@ -172,7 +164,7 @@ fn card(input: &mut In<'_>, spelling: FuncSpelling) -> Res<FuncCard> {
         parameters,
         body,
         spelling,
-        location: input.state.origin.clone(),
+        location: location.clone(),
     })
 }
 
@@ -202,11 +194,9 @@ fn body(input: &mut In<'_>, name: &str, shadowing: &[String]) -> Res<ParameterEx
                     },
                 ));
             }
-            let column = input.state.location(body_start).column;
             parse_func_body(
                 text,
-                input.state.origin,
-                column,
+                input.state.position(body_start),
                 true,
                 open == '\'',
                 shadowing,
@@ -222,8 +212,7 @@ fn body(input: &mut In<'_>, name: &str, shadowing: &[String]) -> Res<ParameterEx
         Some(_) => {
             let text: &str = winnow::token::rest.parse_next(input)?;
             let text = text.trim_end();
-            let column = input.state.location(start).column;
-            parse_func_body(text, input.state.origin, column, false, false, shadowing)
+            parse_func_body(text, input.state.position(start), false, false, shadowing)
                 .map_err(resolved)?
         }
     };
