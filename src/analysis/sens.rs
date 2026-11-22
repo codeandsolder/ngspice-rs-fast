@@ -38,8 +38,6 @@
 //! The device side, including C's side effects of the in-place perturbation,
 //! lives in [`crate::devices::sensitivity`]; see `docs/port/SENSITIVITY.md`.
 
-use std::collections::BTreeMap;
-
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{PlotFlags, Variable};
 use crate::analysis::{AnalysisContext, AnalysisPlan, Plot};
@@ -740,17 +738,41 @@ fn entries(members: &[Member<'_>], ac: bool, filters: &[String]) -> Vec<Entry> {
     entries
 }
 
-/// The numbering of C's perturbation matrix `delta_Y` (`sens_sens()` in
-/// `cktsens.c`). SPARSE creates it once with `TRANSLATE`: an external row or
-/// column gets the next internal number the first time an element names it
-/// (`Translate()` in `spbuild.c`, row before column), and the first names
-/// come from the `DEVsetup` that `sens_sens()` runs on `delta_Y` for each
-/// device in `sgen` order. `SMPmultiply()` (`spMultiply()`) sums each row of
-/// `delta_Y * E` in that internal column order.
+/// Checked external matrix coordinates and C SPARSE first-touch identities
+/// belong to different domains, even when their numeric values coincide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExternalIndex(usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct InternalIndex(usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Position {
+    row: ExternalIndex,
+    col: ExternalIndex,
+}
+
+#[derive(Clone, Copy)]
+struct NumberedStamp {
+    position: Position,
+    internal_col: InternalIndex,
+    value: Complex,
+    next: Option<usize>,
+}
+
+/// Unvalidated contribution at the assembly boundary.
+#[derive(Clone, Copy)]
+struct Stamp {
+    row: usize,
+    col: usize,
+    value: Complex,
+}
+
+/// C's persistent `TRANSLATE` numbering of `delta_Y` (`spbuild.c`). Setup stamps
+/// precede load stamps; a first-touch row is numbered before its column.
 struct DeltaNumbering {
-    internal: Vec<Option<usize>>,
+    internal: Vec<Option<InternalIndex>>,
     next: usize,
-    ordered: Vec<(usize, usize, usize, Complex)>,
 }
 
 impl DeltaNumbering {
@@ -758,59 +780,204 @@ impl DeltaNumbering {
         Self {
             internal: vec![None; n],
             next: 0,
-            ordered: Vec::new(),
         }
     }
 
-    fn translate_one(&mut self, external: usize) {
-        if let Some(slot) = self.internal.get_mut(external)
-            && slot.is_none()
-        {
-            *slot = Some(self.next);
+    fn translate(&mut self, row: usize, col: usize) -> SpiceResult<(Position, InternalIndex)> {
+        if row >= self.internal.len() || col >= self.internal.len() {
+            return Err(SpiceError::Numerical {
+                context: ".sens".into(),
+                message: format!("out-of-range perturbation coordinate ({row}, {col})"),
+            });
+        }
+        let position = Position {
+            row: ExternalIndex(row),
+            col: ExternalIndex(col),
+        };
+        self.touch(position.row);
+        let internal_col = self.touch(position.col);
+        Ok((position, internal_col))
+    }
+
+    fn touch(&mut self, external: ExternalIndex) -> InternalIndex {
+        *self.internal[external.0].get_or_insert_with(|| {
+            let internal = InternalIndex(self.next);
             self.next += 1;
+            internal
+        })
+    }
+}
+
+/// An append-only chain of contributions to one external row.
+#[derive(Clone, Copy, Default)]
+struct RowChain {
+    first: Option<usize>,
+    last: Option<usize>,
+}
+
+/// One folded column of the row currently being assembled.
+struct RowEntry {
+    col: ExternalIndex,
+    internal_col: InternalIndex,
+    value: Complex,
+}
+
+/// Reusable sparse perturbation assembly.
+///
+/// Row chains retain chronological
+/// stamp order. A direct-address column table folds each row without a map,
+/// sorting only its distinct columns before multiplication. Storage is
+/// linear in the matrix dimension and the largest single-device load.
+struct DeltaMatrix {
+    numbering: DeltaNumbering,
+    rows: Vec<RowChain>,
+    stamps: Vec<NumberedStamp>,
+    column_slots: Vec<Option<usize>>,
+    row_entries: Vec<RowEntry>,
+}
+
+impl DeltaMatrix {
+    fn new(n: usize) -> Self {
+        Self {
+            numbering: DeltaNumbering::new(n),
+            rows: vec![RowChain::default(); n],
+            stamps: Vec::new(),
+            column_slots: vec![None; n],
+            row_entries: Vec::new(),
         }
     }
 
-    /// `Translate()` of each element in order.
-    fn translate(&mut self, elements: impl IntoIterator<Item = (usize, usize)>) {
-        for (row, col) in elements {
-            self.translate_one(row);
-            self.translate_one(col);
-        }
-    }
-
-    /// `SMPmultiply`'s row products in internal SPARSE column order. Reuse
-    /// one entry buffer across the parameter walk, visiting even empty rows
-    /// so that subtraction from the RHS preserves signed-zero arithmetic.
-    fn visit_products(
+    fn begin(
         &mut self,
-        elements: BTreeMap<(usize, usize), Complex>,
+        setup: impl IntoIterator<Item = (usize, usize)>,
+    ) -> SpiceResult<BaseAssembly<'_>> {
+        // Only populated rows need resetting, including on an abandoned load.
+        for stamp in &self.stamps {
+            self.rows[stamp.position.row.0] = RowChain::default();
+        }
+        self.stamps.clear();
+        for (row, col) in setup {
+            self.numbering.translate(row, col)?;
+        }
+        Ok(BaseAssembly(self))
+    }
+
+    fn add(&mut self, stamps: impl IntoIterator<Item = Stamp>) -> SpiceResult<()> {
+        for stamp in stamps {
+            let (position, internal_col) = self.numbering.translate(stamp.row, stamp.col)?;
+            let i = self.stamps.len();
+            let row = &mut self.rows[position.row.0];
+            if let Some(last) = row.last {
+                self.stamps[last].next = Some(i);
+            } else {
+                row.first = Some(i);
+            }
+            row.last = Some(i);
+            self.stamps.push(NumberedStamp {
+                position,
+                internal_col,
+                value: stamp.value,
+                next: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn fold_stamp(&mut self, stamp: NumberedStamp, zero: Complex) {
+        let col = stamp.position.col;
+        let i = *self.column_slots[col.0].get_or_insert_with(|| {
+            let i = self.row_entries.len();
+            self.row_entries.push(RowEntry {
+                col,
+                internal_col: stamp.internal_col,
+                value: zero,
+            });
+            i
+        });
+        let value = &mut self.row_entries[i].value;
+        value.re += stamp.value.re;
+        value.im += stamp.value.im;
+    }
+
+    /// Fold the base load, negate it, then add the perturbed load. The
+    /// boundary is the original stamp-stream index, not the sorted position.
+    fn fold_row(&mut self, row: usize, base_count: usize) -> &[RowEntry] {
+        self.row_entries.clear();
+        let mut next = self.rows[row].first;
+        while let Some(i) = next.filter(|i| *i < base_count) {
+            let stamp = self.stamps[i];
+            self.fold_stamp(stamp, Complex::ZERO);
+            next = stamp.next;
+        }
+        for entry in &mut self.row_entries {
+            entry.value.re *= -1.;
+            entry.value.im *= -1.;
+        }
+        while let Some(i) = next {
+            let stamp = self.stamps[i];
+            self.fold_stamp(stamp, Complex::new(-0., -0.));
+            next = stamp.next;
+        }
+        // Drop the direct-address mappings before sorting the distinct
+        // columns. No clearing of the circuit-sized index is necessary.
+        for entry in &self.row_entries {
+            self.column_slots[entry.col.0] = None;
+        }
+        self.row_entries
+            .sort_unstable_by_key(|entry| entry.internal_col);
+        &self.row_entries
+    }
+}
+
+/// The base contribution phase, after `DEVsetup` has numbered its elements.
+struct BaseAssembly<'a>(&'a mut DeltaMatrix);
+
+impl<'a> BaseAssembly<'a> {
+    fn add(&mut self, stamps: impl IntoIterator<Item = Stamp>) -> SpiceResult<()> {
+        self.0.add(stamps)
+    }
+
+    const fn negate(self) -> PerturbedAssembly<'a> {
+        let base_count = self.0.stamps.len();
+        PerturbedAssembly {
+            matrix: self.0,
+            base_count,
+        }
+    }
+}
+
+/// The perturbed contribution phase, after `SMPconstMult(delta_Y, -1)`.
+struct PerturbedAssembly<'a> {
+    matrix: &'a mut DeltaMatrix,
+    base_count: usize,
+}
+
+impl PerturbedAssembly<'_> {
+    fn add(&mut self, stamps: impl IntoIterator<Item = Stamp>) -> SpiceResult<()> {
+        self.matrix.add(stamps)
+    }
+
+    /// `SMPmultiply`: visit every row, including empty ones, in external row
+    /// order, with terms ordered by their persistent internal column number.
+    fn visit_products(
+        self,
         x: &[Complex],
         mut visit: impl FnMut(usize, Complex),
     ) -> SpiceResult<()> {
-        self.ordered.clear();
-        for ((row, col), value) in elements {
-            let internal = self
-                .internal
-                .get(col)
-                .copied()
-                .flatten()
-                .filter(|_| row < x.len() && col < x.len())
-                .ok_or_else(|| SpiceError::Numerical {
-                    context: ".sens".into(),
-                    message: format!("invalid or untranslated perturbation entry ({row}, {col})"),
-                })?;
-            self.ordered.push((row, internal, col, value));
+        if x.len() != self.matrix.numbering.internal.len() {
+            return Err(SpiceError::Numerical {
+                context: ".sens".into(),
+                message: "perturbation and solution dimensions disagree".into(),
+            });
         }
-        self.ordered
-            .sort_unstable_by_key(|&(row, internal, _, _)| (row, internal));
-        let mut entries = self.ordered.iter().copied().peekable();
         for row in 0..x.len() {
             let mut sum = Complex::ZERO;
-            while let Some((_, _, col, a)) = entries.next_if(|entry| entry.0 == row) {
-                // Complex multiplication and addition retain C's separate
-                // products, subtraction/addition, and row accumulation.
-                sum = sum + a * x[col];
+            // This is the ordinary C complex product and sum, not a fused
+            // dot product; each contribution is reduced before multiplication.
+            if self.matrix.rows[row].first.is_some() {
+                for entry in self.matrix.fold_row(row, self.base_count) {
+                    sum = sum + entry.value * x[entry.col.0];
+                }
             }
             visit(row, sum);
         }
@@ -818,38 +985,12 @@ impl DeltaNumbering {
     }
 }
 
-/// One `delta_Y` element as C accumulates it: the base load's contributions
-/// summed in stamp order from zero, the sum negated (`SMPconstMult(delta_Y,
-/// -1)`), then the perturbed load's contributions added in stamp order. The
-/// real and imaginary parts accumulate separately, as the loads stamp them.
-fn accumulate(
-    base: impl IntoIterator<Item = (usize, usize, Complex)>,
-    perturbed: impl IntoIterator<Item = (usize, usize, Complex)>,
-) -> BTreeMap<(usize, usize), Complex> {
-    let mut sums: BTreeMap<(usize, usize), Complex> = BTreeMap::new();
-    for (row, col, value) in base {
-        let entry = sums.entry((row, col)).or_insert(Complex::ZERO);
-        entry.re += value.re;
-        entry.im += value.im;
-    }
-    for value in sums.values_mut() {
-        value.re *= -1.;
-        value.im *= -1.;
-    }
-    for (row, col, value) in perturbed {
-        // A fresh element was cleared to zero and negated with the rest.
-        let entry = sums.entry((row, col)).or_insert(Complex::new(-0., -0.));
-        entry.re += value.re;
-        entry.im += value.im;
-    }
-    sums
-}
-
-fn real_stamps(matrix: &SparseMatrix) -> impl Iterator<Item = (usize, usize, Complex)> + '_ {
-    matrix
-        .triplets()
-        .iter()
-        .map(|t| (t.row, t.col, Complex::real(t.value)))
+fn real_stamps(matrix: &SparseMatrix) -> impl Iterator<Item = Stamp> + '_ {
+    matrix.triplets().iter().map(|t| Stamp {
+        row: t.row,
+        col: t.col,
+        value: Complex::real(t.value),
+    })
 }
 
 /// The device a sensitivity load stamps.
@@ -860,9 +1001,8 @@ fn stand_in<'d>(circuit: &'d Circuit, index: usize, load: &'d SensitivityLoad) -
     }
 }
 
-/// The connected block of every unknown of `matrix` (union-find over its
-/// entries).
-fn blocks(matrix: &SparseMatrix) -> Vec<usize> {
+/// The connected block of every unknown, union-find over checked entries.
+fn blocks(n: usize, entries: impl IntoIterator<Item = (usize, usize)>) -> SpiceResult<Vec<usize>> {
     const fn root(parent: &mut [usize], mut x: usize) -> usize {
         while parent[x] != x {
             parent[x] = parent[parent[x]];
@@ -870,17 +1010,23 @@ fn blocks(matrix: &SparseMatrix) -> Vec<usize> {
         }
         x
     }
-    let mut parent: Vec<usize> = (0..matrix.rows()).collect();
-    for triplet in matrix.triplets() {
-        let (a, b) = (
-            root(&mut parent, triplet.row),
-            root(&mut parent, triplet.col),
-        );
+    let mut parent: Vec<usize> = (0..n).collect();
+    for (row, col) in entries {
+        if row >= n || col >= n {
+            return Err(SpiceError::Numerical {
+                context: ".sens".into(),
+                message: format!("out-of-range block coordinate ({row}, {col})"),
+            });
+        }
+        let (a, b) = (root(&mut parent, row), root(&mut parent, col));
         if a != b {
             parent[a] = b;
         }
     }
-    (0..parent.len()).map(|x| root(&mut parent, x)).collect()
+    for x in 0..n {
+        parent[x] = root(&mut parent, x);
+    }
+    Ok(parent)
 }
 
 /// `NIacIter` at one frequency: the reset system factored from scratch and
@@ -924,35 +1070,45 @@ fn ac_state<'a>(
     })
 }
 
-/// The unknowns in a coupling block of `system` (at `omega`) that holds a
-/// non-finite entry; empty when every entry is finite.
-fn poisoned_rows(system: &LinearSystem, omega: Real) -> std::collections::BTreeSet<usize> {
+/// Unknowns in a block containing a nonfinite AC entry. In the normal
+/// finite case no block structure or dynamic stamp vector is allocated.
+fn poisoned_rows(
+    system: &LinearSystem,
+    omega: Real,
+) -> SpiceResult<std::collections::BTreeSet<usize>> {
     let n = system.a.rows();
-    let mut structure = SparseMatrix::new(n, n);
+    let entries = || {
+        system
+            .a
+            .triplets()
+            .iter()
+            .map(|t| (t.row, t.col, t.value))
+            .chain(crate::maths::complex::iter_dynamic_terms(
+                &system.e,
+                &system.e_groups,
+                omega,
+            ))
+    };
     let mut bad = Vec::new();
-    let dynamic = crate::maths::complex::dynamic_terms(&system.e, &system.e_groups, omega);
-    let entries = system
-        .a
-        .triplets()
-        .iter()
-        .map(|t| (t.row, t.col, t.value))
-        .chain(dynamic);
-    for (row, col, value) in entries {
-        if structure.add(row, col, 1.).is_err() {
-            continue;
+    for (row, col, value) in entries() {
+        if row >= n || col >= n {
+            return Err(SpiceError::Numerical {
+                context: ".sens".into(),
+                message: format!("out-of-range AC block coordinate ({row}, {col})"),
+            });
         }
         if !value.is_finite() {
             bad.push(row);
         }
     }
     if bad.is_empty() {
-        return std::collections::BTreeSet::new();
+        return Ok(std::collections::BTreeSet::new());
     }
-    let blocks = blocks(&structure);
+    let blocks = blocks(n, entries().map(|(row, col, _)| (row, col)))?;
     let tainted: std::collections::BTreeSet<usize> = bad.iter().map(|&row| blocks[row]).collect();
-    (0..n)
+    Ok((0..n)
         .filter(|&row| tainted.contains(&blocks[row]))
-        .collect()
+        .collect())
 }
 
 /// The DC state of the analysis: C's operating-point factors and vectors.
@@ -972,6 +1128,48 @@ struct DcState<'a> {
     history: crate::devices::StateHistory,
     trial: TrialState,
     circuit: &'a Circuit,
+}
+
+struct DcAssembly {
+    matrix: SparseMatrix,
+    rhs: Vector,
+    tainted: Vec<bool>,
+}
+
+impl DcAssembly {
+    fn new(n: usize) -> Self {
+        Self {
+            matrix: SparseMatrix::new(n, n),
+            rhs: Vector::zeros(n),
+            tainted: Vec::new(),
+        }
+    }
+}
+
+/// Sanitizes the factored solve's RHS while retaining exactly the blocks that
+/// C would poison. Preserve finite and signed-zero entries.
+fn mask_nonfinite(rhs: &mut Vector, blocks: &[usize], tainted: &mut Vec<bool>) {
+    tainted.clear();
+    let n = rhs.len();
+    for (row, value) in rhs.as_mut_slice().iter_mut().enumerate() {
+        if !value.is_finite() {
+            if tainted.is_empty() {
+                tainted.resize(n, false);
+            }
+            tainted[blocks[row]] = true;
+            *value = 0.;
+        }
+    }
+}
+
+fn restore_nonfinite(solution: &mut Vector, blocks: &[usize], tainted: &[bool]) {
+    if !tainted.is_empty() {
+        for (row, value) in solution.as_mut_slice().iter_mut().enumerate() {
+            if tainted[blocks[row]] {
+                *value = Real::NAN;
+            }
+        }
+    }
 }
 
 impl DcState<'_> {
@@ -1005,53 +1203,36 @@ impl DcState<'_> {
     /// `delta_I` and `delta_Y` accumulated as `sens_sens()` does.
     fn delta(
         &self,
-        numbering: &mut DeltaNumbering,
+        mut assembly: BaseAssembly<'_>,
+        scratch: &mut DcAssembly,
         index: usize,
         base: &SensitivityLoad,
         perturbed: &SensitivityLoad,
     ) -> SpiceResult<Vector> {
-        let n = self.circuit.unknown_count();
-        let (mut y0, mut y1) = (SparseMatrix::new(n, n), SparseMatrix::new(n, n));
-        let mut rhs = Vector::zeros(n);
-        self.load(index, base, &mut y0, &mut rhs)?;
+        scratch.matrix.clear();
+        scratch.rhs.clear();
+        self.load(index, base, &mut scratch.matrix, &mut scratch.rhs)?;
+        assembly.add(real_stamps(&scratch.matrix))?;
+        let mut assembly = assembly.negate();
         // delta_I *= -1, then the perturbed load adds to it in place.
-        for value in rhs.as_mut_slice() {
+        for value in scratch.rhs.as_mut_slice() {
             *value *= -1.;
         }
-        self.load(index, perturbed, &mut y1, &mut rhs)?;
-        numbering.translate(
-            y0.triplets()
-                .iter()
-                .chain(y1.triplets())
-                .map(|t| (t.row, t.col)),
-        );
-        let elements = accumulate(real_stamps(&y0), real_stamps(&y1));
-        numbering.visit_products(elements, &self.solution, |row, product| {
-            rhs.as_mut_slice()[row] -= product.re;
+        scratch.matrix.clear();
+        self.load(index, perturbed, &mut scratch.matrix, &mut scratch.rhs)?;
+        assembly.add(real_stamps(&scratch.matrix))?;
+        assembly.visit_products(&self.solution, |row, product| {
+            scratch.rhs.as_mut_slice()[row] -= product.re;
         })?;
         // Nonfinite loads poison the entire connected block, as in C.
-        // Allocate the block mask only when a nonfinite entry actually occurs.
-        let mut tainted = None;
-        for (row, value) in rhs.as_mut_slice().iter_mut().enumerate() {
-            if !value.is_finite() {
-                tainted.get_or_insert_with(|| vec![false; n])[self.blocks[row]] = true;
-                *value = 0.;
-            }
-        }
-        let mut solved =
-            crate::maths::solve_last_factors(&self.pattern, &rhs)?.ok_or_else(|| {
-                SpiceError::Numerical {
-                    context: ".sens".to_owned(),
-                    message: "the operating point left no factored circuit matrix".to_owned(),
-                }
+        // The mask remains unallocated on the normal path and reuses capacity.
+        mask_nonfinite(&mut scratch.rhs, &self.blocks, &mut scratch.tainted);
+        let mut solved = crate::maths::solve_last_factors(&self.pattern, &scratch.rhs)?
+            .ok_or_else(|| SpiceError::Numerical {
+                context: ".sens".to_owned(),
+                message: "the operating point left no factored circuit matrix".to_owned(),
             })?;
-        if let Some(tainted) = tainted {
-            for (row, value) in solved.as_mut_slice().iter_mut().enumerate() {
-                if tainted[self.blocks[row]] {
-                    *value = Real::NAN;
-                }
-            }
-        }
+        restore_nonfinite(&mut solved, &self.blocks, &scratch.tainted);
         Ok(solved)
     }
 }
@@ -1067,54 +1248,81 @@ struct AcState<'a> {
     circuit: &'a Circuit,
 }
 
+struct AcAssembly {
+    system: LinearSystem,
+    rhs: Vec<Complex>,
+    perturbed_rhs: Vec<Complex>,
+    solve: Vec<Complex>,
+}
+
+impl AcAssembly {
+    const fn new(n: usize) -> Self {
+        Self {
+            system: LinearSystem::new(n),
+            rhs: Vec::new(),
+            perturbed_rhs: Vec::new(),
+            solve: Vec::new(),
+        }
+    }
+}
+
 impl AcState<'_> {
-    fn assemble(&self, index: usize, load: &SensitivityLoad) -> SpiceResult<LinearSystem> {
-        let mut system = LinearSystem::new(self.circuit.unknown_count());
+    fn assemble(
+        &self,
+        index: usize,
+        load: &SensitivityLoad,
+        system: &mut LinearSystem,
+    ) -> SpiceResult<()> {
+        system.clear();
         self.circuit.assemble_small_signal_device(
             index,
             stand_in(self.circuit, index, load),
             &self.model,
             self.bias,
             Some(self.state),
-            &mut system,
-        )?;
-        Ok(system)
+            system,
+        )
     }
 
-    /// The complex stamps of one `DEVacLoad`: the real contributions and
-    /// `omega` times the dynamic ones, each in stamp order.
-    fn stamps(&self, system: &LinearSystem) -> Vec<(usize, usize, Complex)> {
-        real_stamps(&system.a)
-            .chain(
-                crate::maths::complex::dynamic_terms(&system.e, &system.e_groups, self.omega)
-                    .into_iter()
-                    .map(|(row, col, value)| (row, col, Complex::new(0., value))),
-            )
-            .collect()
+    /// Real contributions, then frequency-scaled dynamic contributions,
+    /// with each group's original arithmetic and stamp order.
+    fn stamps<'s>(&self, system: &'s LinearSystem) -> impl Iterator<Item = Stamp> + use<'s> {
+        real_stamps(&system.a).chain(
+            crate::maths::complex::iter_dynamic_terms(&system.e, &system.e_groups, self.omega).map(
+                |(row, col, value)| Stamp {
+                    row,
+                    col,
+                    value: Complex::new(0., value),
+                },
+            ),
+        )
     }
 
     fn delta(
         &self,
-        numbering: &mut DeltaNumbering,
+        mut assembly: BaseAssembly<'_>,
+        scratch: &mut AcAssembly,
         index: usize,
         base: &SensitivityLoad,
         perturbed: &SensitivityLoad,
     ) -> SpiceResult<Vec<Complex>> {
-        let s0 = self.assemble(index, base)?;
-        let s1 = self.assemble(index, perturbed)?;
-        // -(base) + perturbed, part by part (one source stamp per row).
-        let mut rhs = s0.ac_rhs();
-        for (base, perturbed) in rhs.iter_mut().zip(s1.ac_rhs()) {
+        self.assemble(index, base, &mut scratch.system)?;
+        scratch.system.ac_rhs_into(&mut scratch.rhs);
+        assembly.add(self.stamps(&scratch.system))?;
+        let mut assembly = assembly.negate();
+        self.assemble(index, perturbed, &mut scratch.system)?;
+        scratch.system.ac_rhs_into(&mut scratch.perturbed_rhs);
+        // -(base) + perturbed, part by part.
+        for (base, perturbed) in scratch.rhs.iter_mut().zip(&scratch.perturbed_rhs) {
             *base = Complex::new(-base.re + perturbed.re, -base.im + perturbed.im);
         }
-        let (t0, t1) = (self.stamps(&s0), self.stamps(&s1));
-        numbering.translate(t0.iter().chain(&t1).map(|&(row, col, _)| (row, col)));
-        let elements = accumulate(t0, t1);
-        numbering.visit_products(elements, &self.solution, |row, product| {
-            rhs[row].re -= product.re;
-            rhs[row].im -= product.im;
+        assembly.add(self.stamps(&scratch.system))?;
+        assembly.visit_products(&self.solution, |row, product| {
+            scratch.rhs[row].re -= product.re;
+            scratch.rhs[row].im -= product.im;
         })?;
-        self.factors.solve(&rhs)
+        self.factors
+            .solve_with_workspace(&scratch.rhs, &mut scratch.solve)
     }
 }
 
@@ -1180,7 +1388,7 @@ struct ParameterWalk<'a> {
     records: Records,
     entries: Vec<Entry>,
     couplings: Vec<Option<Coupling>>,
-    numbering: DeltaNumbering,
+    delta: DeltaMatrix,
 }
 
 impl<'a> ParameterWalk<'a> {
@@ -1204,7 +1412,7 @@ impl<'a> ParameterWalk<'a> {
             records,
             entries,
             couplings,
-            numbering: DeltaNumbering::new(circuit.unknown_count()),
+            delta: DeltaMatrix::new(circuit.unknown_count()),
         })
     }
 
@@ -1283,8 +1491,9 @@ impl AcSweep<'_> {
         walk: &ParameterWalk<'_>,
         reset: &Records,
         omega: Real,
-    ) -> SpiceResult<LinearSystem> {
-        let mut system = LinearSystem::new(walk.circuit.unknown_count());
+        system: &mut LinearSystem,
+    ) -> SpiceResult<()> {
+        system.clear();
         system.a.set_pivot_tolerances(self.model.pivot);
         for (slot, member) in walk.members.iter().enumerate() {
             let pair = reset.view(member, slot);
@@ -1295,10 +1504,10 @@ impl AcSweep<'_> {
                 &self.model,
                 &self.zeros,
                 Some(&self.state),
-                &mut system,
+                system,
             )?;
         }
-        Ok(system)
+        Ok(())
     }
 }
 
@@ -1319,10 +1528,12 @@ fn run_ac(
         zeros: Vector::zeros(circuit.unknown_count()),
         state: vec![0.; circuit.state_history().len()],
     };
+    let mut scratch = AcAssembly::new(circuit.unknown_count());
+    let mut system = LinearSystem::new(circuit.unknown_count());
     for frequency in grid {
         let omega = 2. * std::f64::consts::PI * frequency;
         let reset = walk.reset_ac()?;
-        let system = sweep.assemble(walk, &reset, omega)?;
+        sweep.assemble(walk, &reset, omega, &mut system)?;
         // A device whose present records C loads into a non-finite
         // matrix (BSIM4's TNOM drifting by 273.15 K per frequency, see
         // `cktsens.c` and `b4mask.c`) poisons NIacIter's solve: every
@@ -1330,7 +1541,7 @@ fn run_ac(
         // column read from it, and the walk still perturbs and restores
         // each parameter. A poisoned block the output does not read
         // would leave C's other blocks finite; that is refused.
-        let poisoned = poisoned_rows(&system, omega);
+        let poisoned = poisoned_rows(&system, omega)?;
         let probe_poisoned = probe.rows().any(|row| poisoned.contains(&row));
         if !poisoned.is_empty() && !probe_poisoned {
             return Err(SpiceError::not_yet_ported(
@@ -1366,12 +1577,12 @@ fn run_ac(
                     omega,
                 )
             },
-            |numbering, index, base, perturbed, delta| {
+            |assembly, index, base, perturbed, delta| {
                 let Some(at) = &at else {
                     point.push(Complex::new(Real::NAN, Real::NAN));
                     return Ok(());
                 };
-                let dx = at.delta(numbering, index, base, perturbed)?;
+                let dx = at.delta(assembly, &mut scratch, index, base, perturbed)?;
                 let value = probe.read(&dx, Complex::ZERO);
                 point.push(Complex::new(value.re / delta, value.im / delta));
                 Ok(())
@@ -1422,7 +1633,7 @@ fn run_dc(
         })?;
     let at = DcState {
         pattern,
-        blocks: blocks(&jacobian),
+        blocks: blocks(n, jacobian.triplets().iter().map(|t| (t.row, t.col)))?,
         load_point: solved.values,
         solution: solved
             .next
@@ -1436,10 +1647,11 @@ fn run_dc(
         circuit,
     };
     let mut point = Vec::with_capacity(plot.variables().len());
+    let mut scratch = DcAssembly::new(n);
     walk.sweep(
         |_, member, setup, current| member.sensitivity.load(setup, current, SensitivityMode::Dc),
-        |numbering, index, base, perturbed, delta| {
-            let dx = at.delta(numbering, index, base, perturbed)?;
+        |assembly, index, base, perturbed, delta| {
+            let dx = at.delta(assembly, &mut scratch, index, base, perturbed)?;
             point.push(Complex::real(probe.read(dx.as_slice(), 0.) / delta));
             Ok(())
         },
@@ -1459,15 +1671,25 @@ fn setup_elements(
     elements.map_or_else(
         || circuit.setup_elements(index),
         |pairs| {
-            Ok(pairs
-                .into_iter()
-                .filter_map(|(row, col)| {
-                    Some((
-                        circuit.unknowns().node_row(row)?,
-                        circuit.unknowns().node_row(col)?,
-                    ))
-                })
-                .collect())
+            let row_of = |node| {
+                if node == NodeId::GROUND {
+                    Ok(None)
+                } else {
+                    circuit.unknowns().node_row(node).map(Some).ok_or_else(|| {
+                        SpiceError::Numerical {
+                            context: ".sens".into(),
+                            message: format!("unmapped setup node {node}"),
+                        }
+                    })
+                }
+            };
+            let mut mapped = Vec::with_capacity(pairs.len());
+            for (row, col) in pairs {
+                if let (Some(row), Some(col)) = (row_of(row)?, row_of(col)?) {
+                    mapped.push((row, col));
+                }
+            }
+            Ok(mapped)
         },
     )
 }
@@ -1484,7 +1706,7 @@ impl ParameterWalk<'_> {
             RecordPair<'_>,
         ) -> SpiceResult<SensitivityLoad>,
         mut measure: impl FnMut(
-            &mut DeltaNumbering,
+            BaseAssembly<'_>,
             usize,
             &SensitivityLoad,
             &SensitivityLoad,
@@ -1543,9 +1765,10 @@ impl ParameterWalk<'_> {
             )
             .map_err(|error| labelled(error, label, "the perturbed load failed"))?;
             let measured = (|| {
-                self.numbering
-                    .translate(setup_elements(self.circuit, member.index, elements)?);
-                measure(&mut self.numbering, member.index, &base, &perturbed, delta)
+                let assembly =
+                    self.delta
+                        .begin(setup_elements(self.circuit, member.index, elements)?)?;
+                measure(assembly, member.index, &base, &perturbed, delta)
             })();
             measured.map_err(|error| SpiceError::Numerical {
                 context: format!(".sens {label}: {error}"),
@@ -1566,44 +1789,173 @@ mod tests {
         text.split_whitespace().map(str::to_owned).collect()
     }
 
-    #[test]
-    fn perturbation_products_follow_internal_column_order_and_clear_workspace() {
-        use super::{DeltaNumbering, accumulate};
-        use crate::primitives::Complex;
-
-        let mut numbering = DeltaNumbering::new(3);
-        numbering.translate([(2, 2), (0, 0), (1, 1)]);
-        let elements = accumulate(
-            [],
-            [
-                (0, 0, Complex::real(-1e16)),
-                (0, 1, Complex::real(1.)),
-                (0, 2, Complex::real(1e16)),
-            ],
-        );
-        let x = [Complex::real(1.); 3];
-        let mut result = [Complex::ZERO; 3];
-        numbering
-            .visit_products(elements, &x, |row, sum| result[row] = sum)
-            .unwrap();
-        assert_eq!(result, [Complex::real(1.), Complex::ZERO, Complex::ZERO]);
-        numbering
-            .visit_products(accumulate([], []), &x, |row, sum| result[row] = sum)
-            .unwrap();
-        assert_eq!(result, [Complex::ZERO; 3]);
+    const fn stamp(row: usize, col: usize, value: crate::primitives::Complex) -> super::Stamp {
+        super::Stamp { row, col, value }
     }
 
     #[test]
-    fn perturbation_products_reject_untranslated_or_invalid_entries() {
-        use super::{DeltaNumbering, accumulate};
+    fn perturbation_products_follow_internal_column_order_and_clear_workspace() {
+        use super::DeltaMatrix;
         use crate::primitives::Complex;
-        let mut numbering = DeltaNumbering::new(2);
-        numbering.translate([(0, 0)]);
-        let x = [Complex::real(1.); 2];
-        for entry in [(0, 1), (0, 2), (2, 0)] {
-            let elements = accumulate([], [(entry.0, entry.1, Complex::real(1.))]);
-            assert!(numbering.visit_products(elements, &x, |_, _| {}).is_err());
+
+        let mut matrix = DeltaMatrix::new(3);
+        let base = matrix.begin([(2, 2), (0, 0), (1, 1)]).unwrap();
+        let mut perturbed = base.negate();
+        perturbed
+            .add([
+                stamp(0, 0, Complex::real(-1e16)),
+                stamp(0, 1, Complex::real(1.)),
+                stamp(0, 2, Complex::real(1e16)),
+            ])
+            .unwrap();
+        let x = [Complex::real(1.); 3];
+        let mut result = [Complex::ZERO; 3];
+        perturbed
+            .visit_products(&x, |row, sum| result[row] = sum)
+            .unwrap();
+        assert_eq!(result, [Complex::real(1.), Complex::ZERO, Complex::ZERO]);
+        let stamp_capacity = matrix.stamps.capacity();
+        let row_capacity = matrix.row_entries.capacity();
+        matrix
+            .begin([(1, 0)])
+            .unwrap()
+            .negate()
+            .visit_products(&x, |row, sum| result[row] = sum)
+            .unwrap();
+        assert_eq!(result, [Complex::ZERO; 3]);
+        assert_eq!(matrix.stamps.capacity(), stamp_capacity);
+        assert_eq!(matrix.row_entries.capacity(), row_capacity);
+        assert_eq!(
+            matrix.numbering.internal,
+            [
+                Some(super::InternalIndex(1)),
+                Some(super::InternalIndex(2)),
+                Some(super::InternalIndex(0))
+            ]
+        );
+    }
+
+    #[test]
+    fn perturbation_rejects_invalid_setup_and_load_coordinates() {
+        use super::DeltaMatrix;
+        use crate::primitives::Complex;
+        let mut matrix = DeltaMatrix::new(2);
+        for (row, col) in [(0, 2), (2, 0)] {
+            assert!(matrix.begin([(row, col)]).is_err());
+            assert!(
+                matrix
+                    .begin([])
+                    .unwrap()
+                    .add([stamp(row, col, Complex::real(1.))])
+                    .is_err()
+            );
+            assert!(
+                matrix
+                    .begin([])
+                    .unwrap()
+                    .negate()
+                    .add([stamp(row, col, Complex::real(1.))])
+                    .is_err()
+            );
         }
+        assert!(
+            matrix
+                .begin([])
+                .unwrap()
+                .negate()
+                .visit_products(&[Complex::ZERO], |_, _| {})
+                .is_err()
+        );
+        assert_eq!(matrix.numbering.next, 0);
+    }
+
+    #[test]
+    fn separate_base_and_perturbed_reductions_preserve_duplicates_and_signed_zeros() {
+        use super::DeltaMatrix;
+        use crate::primitives::Complex;
+        let mut matrix = DeltaMatrix::new(4);
+        let mut base = matrix.begin([(1, 0)]).unwrap();
+        base.add([
+            stamp(0, 0, Complex::new(1e16, 0.)),
+            stamp(0, 0, Complex::new(1., 0.)),
+            stamp(0, 0, Complex::new(-1e16, 0.)),
+            stamp(1, 1, Complex::real(0.)),
+        ])
+        .unwrap();
+        let mut perturbed = base.negate();
+        perturbed
+            .add([
+                stamp(0, 0, Complex::real(2.)),
+                stamp(2, 2, Complex::new(-0., -0.)),
+            ])
+            .unwrap();
+        let cutoff = perturbed.base_count;
+        assert_eq!(
+            perturbed.matrix.fold_row(0, cutoff)[0].value.re.to_bits(),
+            2_f64.to_bits()
+        );
+        for row in [1, 2] {
+            let entry = &perturbed.matrix.fold_row(row, cutoff)[0];
+            assert_eq!(entry.value.re.to_bits(), (-0_f64).to_bits());
+            assert_eq!(entry.value.im.to_bits(), (-0_f64).to_bits());
+        }
+        let mut seen = Vec::new();
+        perturbed
+            .visit_products(&[Complex::real(1.); 4], |row, sum| seen.push((row, sum)))
+            .unwrap();
+        assert_eq!(
+            seen,
+            [
+                (0, Complex::real(2.)),
+                (1, Complex::ZERO),
+                (2, Complex::ZERO),
+                (3, Complex::ZERO)
+            ]
+        );
+    }
+
+    #[test]
+    fn dc_nonfinite_mask_is_block_local_and_reset_between_parameters() {
+        use super::{blocks, mask_nonfinite, restore_nonfinite};
+        use crate::maths::Vector;
+
+        let blocks = blocks(5, [(0, 2), (2, 1), (3, 4)]).unwrap();
+        let mut rhs = Vector::from_slice(&[1., f64::INFINITY, -0., 3., 4.]);
+        let mut tainted = Vec::new();
+        mask_nonfinite(&mut rhs, &blocks, &mut tainted);
+        assert_eq!(rhs.as_slice(), &[1., 0., -0., 3., 4.]);
+        assert_eq!(rhs.as_slice()[2].to_bits(), (-0_f64).to_bits());
+        let mut solved = Vector::from_slice(&[1., 2., 3., 4., 5.]);
+        restore_nonfinite(&mut solved, &blocks, &tainted);
+        assert!(solved.as_slice()[..3].iter().all(|x| x.is_nan()));
+        assert_eq!(solved.as_slice()[3..], [4., 5.]);
+        let capacity = tainted.capacity();
+        mask_nonfinite(&mut rhs, &blocks, &mut tainted);
+        assert!(tainted.is_empty());
+        assert_eq!(tainted.capacity(), capacity);
+        restore_nonfinite(&mut rhs, &blocks, &tainted);
+        assert!(rhs.is_finite());
+    }
+
+    #[test]
+    fn ac_nonfinite_structure_spans_dynamic_and_static_couplings() {
+        use super::{blocks, poisoned_rows};
+        use crate::devices::linear::LinearSystem;
+        let mut system = LinearSystem::new(5);
+        system.a.add(0, 1, 2.).unwrap();
+        system.a.add(3, 4, 3.).unwrap();
+        system.e.add(1, 2, f64::MAX).unwrap();
+        assert!(poisoned_rows(&system, 1.).unwrap().is_empty());
+        assert_eq!(
+            poisoned_rows(&system, 2.)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [0, 1, 2],
+        );
+        assert!(blocks(2, [(0, 2)]).is_err());
+        system.clear();
+        assert!(poisoned_rows(&system, 2.).unwrap().is_empty());
     }
 
     #[test]

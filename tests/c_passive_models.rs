@@ -196,3 +196,53 @@ fn scratch_nonce() -> u128 {
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[test]
+#[ignore = "requires NGSPICE_BIN; compares exponential TC, DTEMP, AC resistance, dielectric and coil geometry with C"]
+fn expanded_model_passive_inputs_match_c() {
+    let body = "v1 in 0 1 ac 1\nr1 in out rm m=1.7 scale=1.13 dtemp=12 ac=330\nc1 out 0 cm l=30u w=12u m=2.3 scale=0.77 dtemp=4\nl1 out mid lm nt=31 m=2.1 temp=55 dtemp=100\nr2 mid 0 1k\n.model rm r(r=271 tce=0.3 tc1=0.9 tnom=19)\n.model cm c(di=4.7 thick=20n del=0.1u cjsw=1n tc1=0.001 tc2=0.000013)\n.model lm l(dia=7.3m length=11.9m nt=19 mu=2.1 tc1=0.001 tc2=0.00002)";
+    let n = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("expanded-passives.cir"),
+            &format!("responses\n{body}\n.end\n"),
+        ))
+        .unwrap();
+    for context in [
+        AnalysisContext::default(),
+        AnalysisContext {
+            temperature: 77.0,
+            nominal_temperature: 22.0,
+            ..Default::default()
+        },
+    ] {
+        for (kind, args, command) in [
+            (AnalysisKind::OperatingPoint, vec![], "op"),
+            (
+                AnalysisKind::Ac,
+                vec!["dec", "3", "10", "1meg"],
+                "ac dec 3 10 1meg",
+            ),
+        ] {
+            let mut circuit =
+                Circuit::from_netlist_with_context(&n, &context.model_context()).unwrap();
+            let got = runner(kind)
+                .unwrap()
+                .run(
+                    &mut circuit,
+                    &AnalysisRequest::with_arguments(kind, args),
+                    &context,
+                )
+                .unwrap();
+            let text = format!(
+                "responses\n{body}\n.options temp={} tnom={}\n.control\nset filetype=ascii\nset numdgt=17\n{command}\nwrite response.raw\nquit\n.endc\n.end\n",
+                context.temperature, context.nominal_temperature
+            );
+            let scratch = Scratch::new();
+            scratch.run(&text);
+            let raw = RawFile::parse(&fs::read_to_string(scratch.0.join("response.raw")).unwrap())
+                .unwrap();
+            assert_eq!(raw.plots.len(), 1);
+            compare(&got, &raw.plots[0].plot, kind == AnalysisKind::Ac);
+        }
+    }
+}

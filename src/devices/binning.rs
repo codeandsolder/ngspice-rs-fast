@@ -36,6 +36,10 @@
 //! selected card can be simulated is decided by the ordinary level selector in
 //! [`crate::devices::models`], which keeps unported families `NotYetPorted`.
 
+use std::borrow::Cow;
+use std::collections::{BTreeMap, btree_map::Entry};
+use std::sync::OnceLock;
+
 use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
@@ -61,18 +65,88 @@ pub enum NameMatch {
 /// reference nor `<reference>.<one or more ASCII digits>`.
 #[must_use]
 pub fn model_name_match(reference: &str, model_name: &str) -> Option<NameMatch> {
-    let (reference, model_name) = (reference.as_bytes(), model_name.as_bytes());
-    if model_name.len() < reference.len()
-        || !model_name[..reference.len()].eq_ignore_ascii_case(reference)
-    {
-        return None;
+    if model_name.eq_ignore_ascii_case(reference) {
+        Some(NameMatch::Exact)
+    } else if bin_base(model_name).is_some_and(|base| base.eq_ignore_ascii_case(reference)) {
+        Some(NameMatch::Bin)
+    } else {
+        None
     }
-    match &model_name[reference.len()..] {
-        [] => Some(NameMatch::Exact),
-        [b'.', digits @ ..] if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) => {
-            Some(NameMatch::Bin)
+}
+
+/// The only possible bin base: strip the final dot and nonempty ASCII digit suffix.
+pub(super) fn bin_base(name: &str) -> Option<&str> {
+    let (base, suffix) = name.rsplit_once('.')?;
+    (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())).then_some(base)
+}
+
+fn canonical_name(name: &str) -> Cow<'_, str> {
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+/// A scope's first declarations and their ordered bin groups. IDs are private
+/// to the index and stable for its lifetime; names are never mutated in place.
+#[derive(Debug)]
+pub(super) struct DeclarationIndex<T> {
+    names: BTreeMap<String, usize>,
+    bins: BTreeMap<String, Vec<usize>>,
+    entries: Vec<T>,
+}
+
+impl<T> DeclarationIndex<T> {
+    pub(super) const fn new() -> Self {
+        Self {
+            names: BTreeMap::new(),
+            bins: BTreeMap::new(),
+            entries: Vec::new(),
         }
-        _ => None,
+    }
+
+    pub(super) fn insert_first(&mut self, name: &str, make: impl FnOnce() -> T) {
+        if let Entry::Vacant(slot) = self.names.entry(canonical_name(name).into_owned()) {
+            let id = self.entries.len();
+            if let Some(base) = bin_base(slot.key()) {
+                self.bins.entry(base.to_owned()).or_default().push(id);
+            }
+            self.entries.push(make());
+            slot.insert(id);
+        }
+    }
+
+    pub(super) fn get(&self, name: &str) -> Option<&T> {
+        self.names
+            .get(canonical_name(name).as_ref())
+            .map(|&id| &self.entries[id])
+    }
+
+    pub(super) fn get_mut(&mut self, name: &str) -> Option<&mut T> {
+        self.names
+            .get(canonical_name(name).as_ref())
+            .map(|&id| &mut self.entries[id])
+    }
+
+    pub(super) fn bins<'b>(
+        &'b self,
+        name: &str,
+    ) -> impl DoubleEndedIterator<Item = &'b T> + ExactSizeIterator + use<'b, T> {
+        self.bins
+            .get(canonical_name(name).as_ref())
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .map(|&id| &self.entries[id])
+    }
+
+    /// Borrow disjoint index and entry storage for ordered scoped emission.
+    pub(super) fn bin_slots_mut(&mut self, name: &str) -> (&[usize], &mut [T]) {
+        let ids = self
+            .bins
+            .get(canonical_name(name).as_ref())
+            .map_or(&[][..], Vec::as_slice);
+        (ids, &mut self.entries)
     }
 }
 
@@ -237,12 +311,38 @@ pub fn in_range(value: Real, min: Real, max: Real) -> bool {
         || (min < value && value < max)
 }
 
+/// Candidate metadata is local to the immutable declaration index. Bounds
+/// (including failures) are evaluated only when selection actually visits
+/// this binnable card, after geometry validation and in C's precedence order.
+#[derive(Debug)]
+pub(super) struct BinCandidate<'a> {
+    pub(super) card: &'a ModelCard,
+    binnable: bool,
+    bounds: OnceLock<SpiceResult<Option<BinBounds>>>,
+}
+
+impl<'a> BinCandidate<'a> {
+    pub(super) fn new(card: &'a ModelCard) -> Self {
+        Self {
+            card,
+            binnable: is_binnable(card),
+            bounds: OnceLock::new(),
+        }
+    }
+
+    fn bounds(&self) -> SpiceResult<Option<BinBounds>> {
+        self.bounds
+            .get_or_init(|| BinBounds::from_card(self.card))
+            .clone()
+    }
+}
+
 /// Result of [`select_bin`]; the non-`Selected` outcomes are C errors that
 /// the caller reports with its own location context.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BinOutcome<'a> {
+pub(super) enum BinOutcome<T> {
     /// The card C would bind.
-    Selected(&'a ModelCard),
+    Selected(T),
     /// No candidate is a binnable family/level.
     NoBinnableCandidate,
     /// The instance does not write both `l` and `w`.
@@ -258,16 +358,17 @@ pub enum BinOutcome<'a> {
 /// # Errors
 /// Invalid instance geometry or bound values (see [`BinGeometry`],
 /// [`BinBounds`]).
-pub fn select_bin<'a>(
-    candidates: &[&'a ModelCard],
+pub(super) fn select_bin<'a, 'b, T>(
+    candidates: impl DoubleEndedIterator<Item = (T, &'b BinCandidate<'a>)>,
     instance: &DeviceInstance,
     options: &BinOptions,
-) -> SpiceResult<BinOutcome<'a>> {
+) -> SpiceResult<BinOutcome<T>>
+where
+    'a: 'b,
+{
     let mut binnable = candidates
-        .iter()
         .rev()
-        .copied()
-        .filter(|card| is_binnable(card))
+        .filter(|(_, candidate)| candidate.binnable)
         .peekable();
     if binnable.peek().is_none() {
         return Ok(BinOutcome::NoBinnableCandidate);
@@ -275,9 +376,12 @@ pub fn select_bin<'a>(
     let Some(geometry) = BinGeometry::from_instance(instance, options)? else {
         return Ok(BinOutcome::MissingGeometry);
     };
-    for card in binnable {
-        if BinBounds::from_card(card)?.is_some_and(|bounds| bounds.contains(geometry)) {
-            return Ok(BinOutcome::Selected(card));
+    for (identity, candidate) in binnable {
+        if candidate
+            .bounds()?
+            .is_some_and(|bounds| bounds.contains(geometry))
+        {
+            return Ok(BinOutcome::Selected(identity));
         }
     }
     Ok(BinOutcome::NoMatch(geometry))
@@ -342,7 +446,22 @@ mod tests {
         }
     }
 
-    fn selected<'a>(outcome: BinOutcome<'a>) -> &'a str {
+    fn select_test_bin<'a>(
+        cards: &[&'a ModelCard],
+        instance: &DeviceInstance,
+        options: &BinOptions,
+    ) -> SpiceResult<BinOutcome<&'a ModelCard>> {
+        let candidates: Vec<_> = cards.iter().map(|card| BinCandidate::new(card)).collect();
+        select_bin(
+            candidates
+                .iter()
+                .map(|candidate| (candidate.card, candidate)),
+            instance,
+            options,
+        )
+    }
+
+    fn selected(outcome: BinOutcome<&ModelCard>) -> &str {
         match outcome {
             BinOutcome::Selected(card) => &card.name,
             other => panic!("expected a bin, got {other:?}"),
@@ -397,12 +516,12 @@ mod tests {
         let second = bsim3("nch.2", ("1u", "5u"), ("0.5u", "5u"));
         let edge = mos(&[("w", "1u"), ("l", "1u")]);
         let options = BinOptions::default();
-        let forward = select_bin(&[&first, &second], &edge, &options).unwrap();
+        let forward = select_test_bin(&[&first, &second], &edge, &options).unwrap();
         assert_eq!(selected(forward), "nch.2");
-        let reverse = select_bin(&[&second, &first], &edge, &options).unwrap();
+        let reverse = select_test_bin(&[&second, &first], &edge, &options).unwrap();
         assert_eq!(selected(reverse), "nch.1");
         let inside = mos(&[("w", "1u"), ("l", "0.7u")]);
-        let only = select_bin(&[&first, &second], &inside, &options).unwrap();
+        let only = select_test_bin(&[&first, &second], &inside, &options).unwrap();
         assert_eq!(selected(only), "nch.1");
     }
 
@@ -412,7 +531,7 @@ mod tests {
         let good = bsim3("nch.1", ("0.5u", "2u"), ("0.5u", "5u"));
         let no_l = mos(&[("w", "1u")]);
         assert_eq!(
-            select_bin(&[&good], &no_l, &options).unwrap(),
+            select_test_bin(&[&good], &no_l, &options).unwrap(),
             BinOutcome::MissingGeometry
         );
         let instance = mos(&[("w", "1u"), ("l", "1u"), ("m", "4")]);
@@ -424,11 +543,11 @@ mod tests {
         );
         // A candidate lacking a bound is skipped, even though it is declared last.
         assert_eq!(
-            selected(select_bin(&[&good, &partial], &instance, &options).unwrap()),
+            selected(select_test_bin(&[&good, &partial], &instance, &options).unwrap()),
             "nch.1"
         );
         assert!(matches!(
-            select_bin(&[&partial], &instance, &options).unwrap(),
+            select_test_bin(&[&partial], &instance, &options).unwrap(),
             BinOutcome::NoMatch(_)
         ));
         let level1 = card(
@@ -443,16 +562,17 @@ mod tests {
             ],
         );
         assert_eq!(
-            select_bin(&[&level1], &instance, &options).unwrap(),
+            select_test_bin(&[&level1], &instance, &options).unwrap(),
             BinOutcome::NoBinnableCandidate
         );
         // A level-1 card in range never shadows a binnable one.
         assert_eq!(
-            selected(select_bin(&[&good, &level1], &instance, &options).unwrap()),
+            selected(select_test_bin(&[&good, &level1], &instance, &options).unwrap()),
             "nch.1"
         );
         let wide = mos(&[("w", "10u"), ("l", "1u")]);
-        let BinOutcome::NoMatch(geometry) = select_bin(&[&good], &wide, &options).unwrap() else {
+        let BinOutcome::NoMatch(geometry) = select_test_bin(&[&good], &wide, &options).unwrap()
+        else {
             panic!("expected no match");
         };
         assert_eq!(geometry.length, 1e-6);
@@ -474,7 +594,7 @@ mod tests {
             ],
         );
         let instance = mos(&[("l", "9u"), ("w", "1u"), ("l", "1u")]);
-        let outcome = select_bin(&[&card], &instance, &BinOptions::default()).unwrap();
+        let outcome = select_test_bin(&[&card], &instance, &BinOptions::default()).unwrap();
         assert_eq!(selected(outcome), "nch.1");
     }
 
@@ -528,15 +648,17 @@ mod tests {
             ..options
         };
         assert_eq!(
-            select_bin(&[&unsupported], &instance, &invalid_options).unwrap(),
+            select_test_bin(&[&unsupported], &instance, &invalid_options).unwrap(),
             BinOutcome::NoBinnableCandidate
         );
-        assert!(select_bin(&[&good], &instance, &invalid_options).is_err());
+        assert!(select_test_bin(&[&good], &instance, &invalid_options).is_err());
         assert_eq!(
-            selected(select_bin(&[&malformed, &good, &unsupported], &instance, &options).unwrap()),
+            selected(
+                select_test_bin(&[&malformed, &good, &unsupported], &instance, &options).unwrap()
+            ),
             "n.3"
         );
-        assert!(select_bin(&[&good, &malformed], &instance, &options).is_err());
+        assert!(select_test_bin(&[&good, &malformed], &instance, &options).is_err());
     }
 
     #[test]

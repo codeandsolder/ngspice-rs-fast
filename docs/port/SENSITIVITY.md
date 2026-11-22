@@ -151,6 +151,22 @@ BSIM4 retains its native model, instance and size records (see below);
 there is no positional floating-point snapshot reconstruction. Consequences
 visible in C's (and the port's) output:
 
+The perturbation matrix now uses persistent checked first-touch numbering
+and a reusable row-chain workspace. Setup assigns an external row before
+its column; previously numbered identities remain stable across parameters
+and AC frequencies. The base and perturbed stamp phases are distinct:
+each row sums its base contributions, negates the results (including signed
+zeros), and adds the perturbed contributions in their original order. A
+direct-address column index is reused across rows, and only distinct folded
+columns are sorted into C's internal column order. Every external row is
+visited, even an empty row. Unknown non-ground coordinates are errors, not
+silently omitted setup entries. DC and AC reuse one isolated stamp system
+and RHS buffers across the walk; AC also reuses reset assembly and dynamic
+iteration avoids intermediate stamp vectors. DC nonfinite RHS entries still
+poison their entire connected block; the AC reset's finite path no longer
+allocates a second matrix merely to discover that no block is poisoned.
+
+
 * Restoring a parameter marks it *given*. A resistor's `ac` then fixes
   `RESacConduct`, so at later frequencies its `resistance` no longer reaches
   the AC load (`r1` reads 0 after the first frequency); an instance `tc`

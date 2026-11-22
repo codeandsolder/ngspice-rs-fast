@@ -97,9 +97,7 @@ impl Waveform {
                     && p.windows(2).all(|w| w[0].0 < w[1].0)
             }
             Self::PulseDefaults(spec) => {
-                // Resolve against unit timing: checks everything that does not
-                // depend on the analysis (finiteness, prefix, delay sign).
-                spec.resolve(&TransientTiming::new(1., 1.)?)?;
+                spec.validate()?;
                 true
             }
             // Pulse and PWL/function values are only constructed through
@@ -453,15 +451,31 @@ impl LinearSystem {
         }
         Ok(rhs)
     }
+    /// Clear the assembled operators and forcing, retaining outer storage.
+    pub(crate) fn clear(&mut self) {
+        self.a.clear();
+        self.e.clear();
+        self.sources.clear();
+        self.e_groups.clear();
+        self.has_initial_conditions = false;
+    }
+
     /// Complex AC forcing.
     pub fn ac_rhs(&self) -> Vec<Complex> {
-        let mut rhs = vec![Complex::ZERO; self.a.rows()];
+        let mut rhs = Vec::new();
+        self.ac_rhs_into(&mut rhs);
+        rhs
+    }
+
+    /// Rebuild the AC forcing using caller-owned storage.
+    pub(crate) fn ac_rhs_into(&self, rhs: &mut Vec<Complex>) {
+        rhs.clear();
+        rhs.resize(self.a.rows(), Complex::ZERO);
         for s in &self.sources {
             for (r, sign) in &s.rows {
                 rhs[*r] = rhs[*r] + Complex::real(*sign) * s.ac;
             }
         }
-        rhs
     }
     /// Lazily merges every source's corners and jumps in the closed window
     /// `[t0, t1]` into one ascending, duplicate-free sequence.

@@ -1,8 +1,10 @@
-# Bounded model-backed passives (#19)
+# Bounded model-backed passives (#19, #20)
 
-This checkout implements #19 on merged prerequisite PR #51 (#11/#17), pending
-merge. It extends the existing linear engine; no nonlinear passive/device
-physics, new solver backend or full M1/M3/SPICE-parity claim is implied.
+Model-backed passive inputs are projected into typed, immutable setup and
+temperature state. Ordinary loads, DC replacements and sensitivity replay
+share the C-ordered arithmetic in `devices/passive/physics.rs`; sensitivity
+still owns C's ordered setter/replay records and can visit unbounded perturbed
+states. Validation and diagnostic attribution remain separate from arithmetic.
 
 ## Supported surface
 
@@ -13,19 +15,22 @@ The first model declaration wins case-insensitively, as in `INPmakeMod`.
 
 | Family | Model setters | Instance setters |
 | --- | --- | --- |
-| R (`r`, `res`) | `r`, `rsh`, `defw`, `l`, `narrow`, `short`, `tc1`, `tc2`, `tnom` | `resistance` (parser maps `r`), `l`, `w`, `tc1`, `tc2`, `temp`, `scale`, `m` |
-| C | `cap`, `cj`, `cjsw`, `defw`, `narrow`, `short`, `tc1`, `tc2`, `tnom` | `capacitance` (parser maps `c`/`cap`), `l`, `w`, `tc1`, `tc2`, `temp`, `scale`, `m`, `ic` |
-| L | `ind`, `tc1`, `tc2`, `tnom` | `inductance` (parser maps `l`), `tc1`, `tc2`, `temp`, `scale`, `m`, `ic` |
+| R (`r`, `res`) | `r`, `rsh`, `defw`, `l`, `narrow`, `short`, `tc1`, `tc2`, `tce`, `tnom`, `kf`, `af`, `ef`, `lf`, `wf` | `resistance` (parser maps `r`), `l`, `w`, `tc1`, `tc2`, `tce`, `temp`, `dtemp`, `ac`, `scale`, `m`, `noisy` |
+| C | `cap`, `cj`, `cjsw`, `defw`, `narrow`, `short`, `del`, `di`, `thick`, `tc1`, `tc2`, `tnom` | `capacitance` (parser maps `c`/`cap`), `l`, `w`, `tc1`, `tc2`, `temp`, `dtemp`, `scale`, `m`, `ic` |
+| L | `ind`, `csect`, `dia`, `length`, `nt`, `mu`, `tc1`, `tc2`, `tnom` | `inductance` (parser maps `l`), `nt`, `tc1`, `tc2`, `temp`, `dtemp`, `scale`, `m`, `ic` |
 
 `level` is separately consumed by the existing resolver's bounded selector
 policy, not ignored as a physics setter; see [MODEL_SCHEMAS.md](MODEL_SCHEMAS.md).
 This expanded instance surface requires a declared model. Literal factory/API
-support is unchanged (primary scalar and C/L IC only); negative nonzero scalar
-instance R remains allowed. Model R and all base/effective C/L must be positive.
+support is unchanged (primary scalar, resistor noisy and C/L IC); negative nonzero scalar
+instance R remains allowed. Model R/C/L setters must be positive; explicit
+instance C/L may be zero. The AC resistance is independently nonzero.
 
 Units: R/RSH in ohms (RSH per square); C in farads; L in henries; geometry in
 metres; CJ in F/m²; CJSW in F/m; TC1 in K⁻¹; TC2 in K⁻²; TEMP/TNOM input in
-Celsius. Scale and multiplicity are positive finite dimensionless scalars, not
+Celsius, DTEMP in kelvin. TCE is a per-kelvin exponent coefficient.
+Coil dimensions are in metres (cross section in square metres);
+NT, MU and DI are dimensionless. Scale and multiplicity are positive finite dimensionless scalars, not
 integer-only. C IC is volts; L IC is amperes. Under companion `.tran ... uic`
 the instance IC seeds the model-backed C/L exactly as a literal one (charge
 from the effective, temperature-adjusted capacitance; inductor branch current),
@@ -50,14 +55,17 @@ L = instance l, else model l, else 10 um
 W = instance w, else model defw, else 10 um
 Leff = L - 2*short
 Weff = W - 2*narrow
-Rbase = RSH * Leff/Weff
+Rbase = (Leff / Weff) * RSH
 ```
 
 RSH defaults to zero (geometry disabled); short/narrow default to zero. RSH and
 corrections must be nonnegative; L/W and effective dimensions must be positive.
 The nominal value must be nonzero with representable finite reciprocal. Negative
 model R is rejected (C ignores that setter); negative instance R is retained.
-Tiny-resistor clamps and global frontend geometry scale are not applied.
+The explicit instance R setter clamps tiny magnitude to C's RESMIN.
+The model R setter remains bounded and global frontend geometry scale is not
+applied. C's sheet-geometry eligibility tests the uncorrected L*W*RSH product;
+Rust additionally checks effective dimensions before accepting the result.
 
 ### Capacitor
 
@@ -81,16 +89,26 @@ C stores model `defl` but does not apply it to instances: `CAPsetup` initializes
 missing instance length to zero. The live setup probe exposed this distinction.
 Rust therefore rejects `defl` and missing/degenerate L, rather than inventing a
 model-length default or accepting C's negative-area/sidewall corner cases.
-Dielectric/thickness-derived CJ (`di`, `thick`), `del` and geometry aliases are
-not part of this initial surface.
+At setup, an explicit CJ wins; otherwise positive THICK derives CJ from
+DI times C's vacuum permittivity (default silicon dioxide when DI is absent).
+DEL supplies twice its value to each missing NARROW/SHORT independently.
+The prepared geometry coefficients are immutable across ordinary temperature
+and instance-sweep evaluations; instance L/W are temperature-time inputs.
+Both C and Rust's sensitivity replay recompute the capacitance from those
+inputs, with C's left-to-right product grouping.
 
 ### Inductor
 
 References: `indsetup.c::INDsetup`, `indtemp.c::INDtemp`, `indacld.c::INDacLoad`.
-Last explicit instance L wins; otherwise explicit model IND is required.
-Coil geometry (`nt`, `csect`, `dia`, `length`, `mu`) needs C's specific-inductance
-and Lundin correction behavior and is **explicitly unsupported**, even alongside
-an explicit scalar. No invented simple-solenoid approximation is used.
+Last explicit instance L wins; otherwise written instance NT uses the
+setup-prepared specific inductance times NT twice, in that order. Without
+instance NT, use explicit model IND, or the model NT squared times specific
+inductance. DIA takes precedence over CSECT, and the prepared single-turn
+inductance is MU times vacuum permeability times cross section divided by
+LENGTH, with C's Lundin correction and its small-geometry cutoff. The normal
+path requires positive complete coil dimensions and turns when deriving L;
+it does not use C's missing-inductance zero fallback. Instance NT sweeps
+reuse the setup result without rerunning Lundin.
 K cards couple model-backed inductors through C's `INDinduct` (temperature- and
 scale-adjusted, before `/m`); see [MUTUAL_INDUCTANCE.md](MUTUAL_INDUCTANCE.md).
 
@@ -100,22 +118,31 @@ References: `restemp.c`, `captemp.c`, `indtemp.c`, `capacld.c`, `indacld.c`.
 
 ```text
 T = instance TEMP, else AnalysisContext.temperature
+DTEMP = 0 when TEMP was given, else written DTEMP or 0
 Tnom = model TNOM, else AnalysisContext.nominal_temperature
-DeltaT = (T+273.15) - (Tnom+273.15)
+DeltaT = ((T+273.15) + DTEMP) - (Tnom+273.15)
 TC1 = instance TC1, else model TC1, else 0
 TC2 = instance TC2, else model TC2, else 0
 f = 1 + TC1*DeltaT + TC2*DeltaT²
-Reffective = Rbase*f*scale/m
+Rscaled = Rbase*f*scale
+Gdc = m / Rscaled
+Gac = m / (ACbase*f*scale)  # ACbase = explicit AC or Rbase
+Reffective = Rscaled/m
 Ceffective = Cbase*f*scale*m
 Leffective = Lbase*f*scale/m
 ```
 
 Scale/M default to 1. TC1/TC2 are independent per-coefficient overrides; explicit
 zero overrides a nonzero model coefficient. TEMP does not change TNOM. R uses
-C's Horner polynomial evaluation order; C/L use the direct sum. All temperatures
+C's Horner polynomial evaluation order; C/L use the direct sum. A written
+resistor TCE (instance over model, including explicit zero) selects
+`pow(1.01, TCE*DeltaT)` instead of the polynomial. Normal stamps and sensitivity
+replay use conductance directly, not the reciprocal of rounded Reffective.
+AC and pole-zero use ACbase; DC/transient/noise current use Rbase. AC reactive
+stamps multiply by frequency before applying M, as C does. All temperatures
 must be finite and above absolute zero; factors must be positive and finite.
 Derived overflow, zero effective values and nonfinite conductance error explicitly;
-no clamps or cumulative correction can conceal them.
+no cumulative correction can conceal them.
 
 `CAPask` includes M in its capacitance query; `INDask` omits M in its inductance
 query. The oracle divides C's queried inductance by M before comparing the value
@@ -134,7 +161,8 @@ queried current verifies effective conductance instead.
   the 27 Celsius convenience API.
 - `LinearContext` carries explicit `ModelContext`; `StampContext` now carries
   both circuit and nominal temperatures. The wrapper derives scalar R/C/L and
-  delegates to existing stamps. Recipes are immutable across hot/cold/repeated
+  delegates to existing stamps, sharing C-ordered AC stamp kernels with
+  sensitivity replay. Recipes are immutable across hot/cold/repeated
   analyses; factors, node IDs, branch order/signs and accepted state are preserved.
 - Schema/geometry/constructor failures leave the caller's circuit/node table
   unchanged. Unused model declarations still error rather than discarding physics;
@@ -155,17 +183,18 @@ let plot = input.resolve()?.run(&mut circuit, &context)?;
 
 ## Explicit limits and verification
 
-Behavioral/nonlinear passives, advanced resistor levels, coil geometry, DTEMP,
-TCE/exponential temperature, AC-only resistance, breakdown fields (resistor noise `KF`/`AF`/`EF`/`LF`/`WF`
-and `noisy` are ported for `.noise`, [NOISE.md](NOISE.md)), unsupported
-aliases, global geometry scaling and `.option` parsing remain gaps. D/Q/M factories,
-Model-backed C/L delegate to the scalar trap/Gear-2 companion stamps, which have
-no transient driver yet; general DAEs remain unavailable.
+Behavioral/nonlinear passives, advanced resistor levels, breakdown fields (resistor noise `KF`/`AF`/`EF`/`LF`/`WF`
+and `noisy` are ported for `.noise`, [NOISE.md](NOISE.md)), unsupported aliases (such as `tc`), advanced setters on literal-only cards,
+global geometry scaling and general unported semantics remain gaps. The normal
+bounded path rejects invalid thermal/geometry values even where C's
+perturbation path permits them.
 
 Owner-crate tests check formulas, precedence, duplicates, signs, missing/invalid
 geometry, overflow, immutable recipes and atomic failures. Production tests compare
 literal/model DC, source sweeps and complex AC; a contextual RC step matches its
-analytic BDF transient bound. Live C tests check effective values and DC/AC responses
+analytic BDF transient bound. Bitwise ordinary-versus-replay tests vary model and instance precedence,
+geometry, polynomial/exponential TC, explicit TEMP and DTEMP, and per-point
+geometry/turns setters. Live C tests check effective values and DC/AC responses
 at default and nondefault TEMP/TNOM without changing committed goldens. They also
 exposed an existing logarithmic-AC integer-span roundoff bug; a bounded arithmetic
 snap preserves the endpoint, with a regression for integer/noninteger spans and

@@ -44,15 +44,7 @@ pub struct DynamicGroup {
 /// ([`DynamicGroup`]). The ordinary reference stamping path retains the
 /// individual product rounding and contribution order; it is not a fused
 /// dot product.
-pub(crate) fn dynamic_terms(
-    e: &SparseMatrix,
-    groups: &[DynamicGroup],
-    omega: f64,
-) -> Vec<(usize, usize, f64)> {
-    iter_dynamic_terms(e, groups, omega).collect()
-}
-
-fn iter_dynamic_terms<'a>(
+pub(crate) fn iter_dynamic_terms<'a>(
     e: &'a SparseMatrix,
     groups: &'a [DynamicGroup],
     omega: f64,
