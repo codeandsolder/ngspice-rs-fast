@@ -238,11 +238,13 @@ pub fn run_with_environment(
         let deadline = Instant::now()
             .checked_add(limits.timeout)
             .filter(|_| program.is_absolute() && !limits.timeout.is_zero())
-            .ok_or((
-                Failure::Configuration,
-                "expected absolute executable and representable nonzero timeout".into(),
-                None,
-            ))?;
+            .ok_or_else(|| {
+                (
+                    Failure::Configuration,
+                    "expected absolute executable and representable nonzero timeout".into(),
+                    None,
+                )
+            })?;
         let mut exec = Exec::cmd(program.as_os_str())
             .args(args.iter().map(AsRef::as_ref))
             .cwd(directory)
