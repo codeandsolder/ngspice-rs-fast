@@ -1284,101 +1284,52 @@ impl std::fmt::Display for ScopeOrderError {
     }
 }
 
+fn scope_entry<'a, T>(
+    entries: &'a [T],
+    index: usize,
+    collection: &'static str,
+) -> Result<&'a T, ScopeOrderError> {
+    entries
+        .get(index)
+        .ok_or(ScopeOrderError::Index { index, collection })
+}
+
 impl<'a> ScopeView<'a> {
     pub(crate) fn entry(self, kind: ScopedCardKind) -> Result<ScopeEntry<'a>, ScopeOrderError> {
         match kind {
             ScopedCardKind::Device(index) => {
-                self.devices
-                    .get(index)
-                    .map(ScopeEntry::Device)
-                    .ok_or(ScopeOrderError::Index {
-                        index,
-                        collection: "devices",
-                    })
+                scope_entry(self.devices, index, "devices").map(ScopeEntry::Device)
             }
             ScopedCardKind::Model(index) => {
-                self.models
-                    .get(index)
-                    .map(ScopeEntry::Model)
-                    .ok_or(ScopeOrderError::Index {
-                        index,
-                        collection: "models",
-                    })
+                scope_entry(self.models, index, "models").map(ScopeEntry::Model)
             }
-            ScopedCardKind::Subcircuit(index) => self
-                .subcircuits
-                .get(index)
-                .map(ScopeEntry::Subcircuit)
-                .ok_or(ScopeOrderError::Index {
-                    index,
-                    collection: "subcircuits",
-                }),
-            ScopedCardKind::Analysis(index) => self
-                .analyses
-                .get(index)
-                .map(ScopeEntry::Analysis)
-                .ok_or(ScopeOrderError::Index {
-                    index,
-                    collection: "analyses",
-                }),
-            ScopedCardKind::Include(index) => self
-                .includes
-                .get(index)
-                .map(ScopeEntry::Include)
-                .ok_or(ScopeOrderError::Index {
-                    index,
-                    collection: "includes",
-                }),
+            ScopedCardKind::Subcircuit(index) => {
+                scope_entry(self.subcircuits, index, "subcircuits").map(ScopeEntry::Subcircuit)
+            }
+            ScopedCardKind::Analysis(index) => {
+                scope_entry(self.analyses, index, "analyses").map(ScopeEntry::Analysis)
+            }
+            ScopedCardKind::Include(index) => {
+                scope_entry(self.includes, index, "includes").map(ScopeEntry::Include)
+            }
             ScopedCardKind::Param(index) => {
-                self.params
-                    .get(index)
-                    .map(ScopeEntry::Param)
-                    .ok_or(ScopeOrderError::Index {
-                        index,
-                        collection: "params",
-                    })
+                scope_entry(self.params, index, "params").map(ScopeEntry::Param)
             }
-            ScopedCardKind::Options(index) => self
-                .options
-                .get(index)
-                .map(ScopeEntry::Options)
-                .ok_or(ScopeOrderError::Index {
-                    index,
-                    collection: "options",
-                }),
+            ScopedCardKind::Options(index) => {
+                scope_entry(self.options, index, "options").map(ScopeEntry::Options)
+            }
             ScopedCardKind::Global(index) => {
-                self.globals
-                    .get(index)
-                    .map(ScopeEntry::Global)
-                    .ok_or(ScopeOrderError::Index {
-                        index,
-                        collection: "globals",
-                    })
+                scope_entry(self.globals, index, "globals").map(ScopeEntry::Global)
             }
-            ScopedCardKind::InitialCondition(index) => self
-                .initial_conditions
-                .get(index)
-                .map(ScopeEntry::InitialCondition)
-                .ok_or(ScopeOrderError::Index {
-                    index,
-                    collection: "initial_conditions",
-                }),
-            ScopedCardKind::Nodeset(index) => self
-                .nodesets
-                .get(index)
-                .map(ScopeEntry::Nodeset)
-                .ok_or(ScopeOrderError::Index {
-                    index,
-                    collection: "nodesets",
-                }),
+            ScopedCardKind::InitialCondition(index) => {
+                scope_entry(self.initial_conditions, index, "initial_conditions")
+                    .map(ScopeEntry::InitialCondition)
+            }
+            ScopedCardKind::Nodeset(index) => {
+                scope_entry(self.nodesets, index, "nodesets").map(ScopeEntry::Nodeset)
+            }
             ScopedCardKind::Func(index) => {
-                self.functions
-                    .get(index)
-                    .map(ScopeEntry::Func)
-                    .ok_or(ScopeOrderError::Index {
-                        index,
-                        collection: "functions",
-                    })
+                scope_entry(self.functions, index, "functions").map(ScopeEntry::Func)
             }
             ScopedCardKind::Save(index) => Ok(ScopeEntry::Save(index)),
             ScopedCardKind::Print(index) => Ok(ScopeEntry::Print(index)),

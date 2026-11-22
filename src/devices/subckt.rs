@@ -155,7 +155,7 @@ pub fn expand_with_output(
             .map_err(|error| SpiceError::parse(card.source.location.clone(), error.to_string()))?;
         match (card.kind, entry) {
             (_, ScopeEntry::Fourier(index)) => {
-                hoisted_fourier.extend(side_card(fourier, index, &card.source.location)?.cloned())
+                hoisted_fourier.extend(side_card(fourier, index, &card.source.location)?.cloned());
             }
             (ScopedCardKind::Subcircuit(index), ScopeEntry::Subcircuit(definition))
                 if active.contains(&index) =>
