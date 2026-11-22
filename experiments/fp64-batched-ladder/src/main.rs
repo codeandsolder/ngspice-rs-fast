@@ -5,6 +5,7 @@
 use std::{borrow::Cow, hint::black_box, simd::Simd, sync::mpsc, time::Instant};
 
 use anyhow::{Context, Result, ensure};
+use rayon::prelude::*;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 
 const N: usize = 64;
@@ -104,44 +105,53 @@ fn scalar(d: &[f64], b: &[f64], p: &mut [f64], x: &mut [f64]) {
     }
 }
 
-fn simd(d: &[f64], b: &[f64], p: &mut [f64], x: &mut [f64]) {
+// Row-major traversal keeps cache lines hot and allows independent vector
+// divisions to overlap instead of completing one four-system chain at a time.
+fn row_simd(d: &[f64], b: &[f64], p: &mut [f64], x: &mut [f64]) {
     type V = Simd<f64, 4>;
-    for base in (0..d.len()).step_by(CELLS) {
-        for lane in (0..TILE).step_by(4) {
-            let mut prev_p = V::splat(0.);
-            let mut prev_y = V::splat(0.);
-            for r in 0..N {
-                let i = base + r * TILE + lane;
-                let di = V::from_slice(&d[i..i + 4]);
-                let bi = V::from_slice(&b[i..i + 4]);
-                prev_p = V::splat(1.) / (di - prev_p);
-                prev_y = (bi + prev_y) * prev_p;
-                prev_p.copy_to_slice(&mut p[i..i + 4]);
-                prev_y.copy_to_slice(&mut x[i..i + 4]);
+    for (((d, b), p), x) in d
+        .chunks_exact(CELLS)
+        .zip(b.chunks_exact(CELLS))
+        .zip(p.chunks_exact_mut(CELLS))
+        .zip(x.chunks_exact_mut(CELLS))
+    {
+        let mut prev_p = [V::splat(0.); TILE / 4];
+        let mut prev_y = [V::splat(0.); TILE / 4];
+        for r in 0..N {
+            let offset = r * TILE;
+            let dr = &d[offset..offset + TILE];
+            let br = &b[offset..offset + TILE];
+            let pr = &mut p[offset..offset + TILE];
+            let xr = &mut x[offset..offset + TILE];
+            for j in 0..TILE / 4 {
+                let i = j * 4;
+                prev_p[j] = V::splat(1.) / (V::from_slice(&dr[i..i + 4]) - prev_p[j]);
+                prev_y[j] = (V::from_slice(&br[i..i + 4]) + prev_y[j]) * prev_p[j];
+                prev_p[j].copy_to_slice(&mut pr[i..i + 4]);
+                prev_y[j].copy_to_slice(&mut xr[i..i + 4]);
             }
-            let mut next = V::splat(0.);
-            for r in (0..N).rev() {
-                let i = base + r * TILE + lane;
-                next = V::from_slice(&x[i..i + 4]) + V::from_slice(&p[i..i + 4]) * next;
-                next.copy_to_slice(&mut x[i..i + 4]);
+        }
+        let mut next = [V::splat(0.); TILE / 4];
+        for r in (0..N).rev() {
+            let offset = r * TILE;
+            let pr = &p[offset..offset + TILE];
+            let xr = &mut x[offset..offset + TILE];
+            for (j, next) in next.iter_mut().enumerate() {
+                let i = j * 4;
+                *next = V::from_slice(&xr[i..i + 4]) + V::from_slice(&pr[i..i + 4]) * *next;
+                next.copy_to_slice(&mut xr[i..i + 4]);
             }
         }
     }
 }
 
+// The persistent Rayon pool is initialized before median_ms measures it.
 fn parallel_simd(d: &[f64], b: &[f64], p: &mut [f64], x: &mut [f64]) {
-    let workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let chunk = (d.len() / CELLS).div_ceil(workers) * CELLS;
-    std::thread::scope(|s| {
-        for (((d, b), p), x) in d
-            .chunks(chunk)
-            .zip(b.chunks(chunk))
-            .zip(p.chunks_mut(chunk))
-            .zip(x.chunks_mut(chunk))
-        {
-            s.spawn(move || simd(d, b, p, x));
-        }
-    });
+    d.par_chunks_exact(CELLS)
+        .zip(b.par_chunks_exact(CELLS))
+        .zip(p.par_chunks_exact_mut(CELLS))
+        .zip(x.par_chunks_exact_mut(CELLS))
+        .for_each(|(((d, b), p), x)| row_simd(d, b, p, x));
 }
 
 fn median_ms(mut f: impl FnMut() -> Result<()>) -> Result<f64> {
@@ -303,9 +313,10 @@ impl Gpu {
 
 fn main() -> Result<()> {
     let gpu = pollster::block_on(Gpu::new())?;
+    println!("persistent CPU workers: {}", rayon::current_num_threads());
     println!("nodes={N}, tile={TILE}, repeats={REPEATS}");
     println!(
-        "systems,scalar_ms,simd_ms,parallel_simd_ms,gpu_resident_ms,gpu_roundtrip_ms,max_error"
+        "systems,scalar_ms,row_simd_ms,parallel_row_simd_ms,gpu_resident_ms,gpu_roundtrip_ms,max_error"
     );
     for tiles in [1_u32, 4, 16, 64, 256, 1024] {
         let input = Input::new(tiles as usize);
@@ -315,7 +326,7 @@ fn main() -> Result<()> {
         let mut timings = Vec::new();
         for solve in [
             scalar as fn(&[f64], &[f64], &mut [f64], &mut [f64]),
-            simd,
+            row_simd,
             parallel_simd,
         ] {
             timings.push(median_ms(|| {

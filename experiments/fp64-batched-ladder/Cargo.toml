@@ -12,3 +12,4 @@ anyhow = "1"
 bytemuck = "1"
 pollster = "0.4"
 wgpu = { version = "=30.0.2", default-features = false, features = ["std", "vulkan", "wgsl", "parking_lot"] }
+rayon = "=1.11.0"
