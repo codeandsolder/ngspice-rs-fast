@@ -1,10 +1,15 @@
 //! Rust-engine verification against committed C data. Never executes C or
 //! writes a deck/rawfile. Extend the registry only with demonstrated coverage.
 
+use std::collections::HashSet;
+#[cfg(test)]
 use std::fs;
+use std::io::BufRead;
 use std::path::Path;
 
-use ngspice_rs::analysis::{AnalysisPlan, RawFile, RunConfig};
+#[cfg(test)]
+use ngspice_rs::analysis::RawFile;
+use ngspice_rs::analysis::{AnalysisPlan, RawPlotRows, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::primitives::AnalysisKind;
 
@@ -12,6 +17,9 @@ use ngspice_rs::primitives::AnalysisKind;
 use super::workspace_root;
 use super::{compare, tran};
 use ngspice_conformance::fixtures;
+
+mod stream;
+use stream::Golden;
 
 /// How a fixture's Rust result is compared with its C golden.
 enum Gate {
@@ -2034,30 +2042,10 @@ fn run_deck(root: &Path, path: &Path, fixture: &Supported) -> Result<String, Str
             request.kind()
         ));
     }
-    let want = load_golden(root, fixture.name)?;
-    if want.plots.len() != 1 {
-        return Err(format!("expected one C plot, found {}", want.plots.len()));
-    }
-    let gate = match &fixture.gate {
-        Gate::Transient(tolerance) => Gate::Transient(*tolerance),
-        Gate::Points { axis, tolerance } => Gate::Points {
-            axis: *axis,
-            tolerance: *tolerance,
-        },
-        Gate::Roots(tolerance) => Gate::Roots(*tolerance),
-        Gate::CompletedRoots {
-            tolerance,
-            additional_poles,
-        } => Gate::CompletedRoots {
-            tolerance: *tolerance,
-            additional_poles,
-        },
-        Gate::Echoes { tolerance, offsets } => Gate::Echoes {
-            tolerance: *tolerance,
-            offsets,
-        },
-    };
-    compare_plot(&gate, &circuit, &request, &got, &want.plots[0].plot)
+    let mut golden = Golden::open(root, fixture.name)?;
+    let detail = golden.compare(&fixture.gate, &circuit, &request, &got)?;
+    golden.finish()?;
+    Ok(detail)
 }
 
 /// Every plot of a multi-analysis fixture, in batch order, against the
@@ -2070,21 +2058,20 @@ fn batch_result(root: &Path, path: &Path, fixture: &Batch) -> Result<Vec<String>
         .plans_for(&netlist.analyses)
         .map_err(|e| e.to_string())?;
     let schedule = ngspice_rs::analysis::batch::schedule(&plans);
-    let want = load_golden(root, fixture.name)?;
+    let mut golden = Golden::open(root, fixture.name)?;
     let names: Vec<&str> = schedule
         .iter()
         .flat_map(ngspice_rs::analysis::batch::ScheduledAnalysis::plot_names)
         .collect();
-    if names.len() != fixture.stages.len() || want.plots.len() != fixture.stages.len() {
+    if names.len() != fixture.stages.len() {
         return Err(format!(
-            "expected {} plots: the deck schedules {}, the C golden has {}",
+            "expected {} plots: the deck schedules {}",
             fixture.stages.len(),
-            names.len(),
-            want.plots.len()
+            names.len()
         ));
     }
     let mut details = Vec::with_capacity(names.len());
-    let mut stages = fixture.stages.iter().zip(&want.plots);
+    let mut stages = fixture.stages.iter();
     // Inherit the actual matrix and device load snapshots, as the CLI does;
     // analysis-kind markers alone cannot reproduce transient instance fields.
     let mut previous = None;
@@ -2102,7 +2089,7 @@ fn batch_result(root: &Path, path: &Path, fixture: &Batch) -> Result<Vec<String>
             ));
         }
         for (got, name) in plots.iter().zip(own) {
-            let (stage, want) = stages.next().ok_or("more Rust plots than stages")?;
+            let stage = stages.next().ok_or("more Rust plots than stages")?;
             if request.kind() != stage.kind {
                 return Err(format!(
                     "{name}: registry expects {:?}, the batch schedule runs {:?}",
@@ -2110,18 +2097,14 @@ fn batch_result(root: &Path, path: &Path, fixture: &Batch) -> Result<Vec<String>
                     request.kind()
                 ));
             }
-            if got.plotname != want.plot.plotname {
-                return Err(format!(
-                    "{name}: plot name '{}' where C wrote '{}' at this position",
-                    got.plotname, want.plot.plotname
-                ));
-            }
-            let detail = compare_plot(&stage.gate, &circuit, request, got, &want.plot)
+            let detail = golden
+                .compare(&stage.gate, &circuit, request, got)
                 .map_err(|error| format!("{name}: {error}"))?;
             details.push(format!("{name} ({}): {detail}", got.plotname));
         }
         previous = Some(circuit);
     }
+    golden.finish()?;
     Ok(details)
 }
 
@@ -2151,7 +2134,7 @@ fn run_plan_plots(
     // an RF port's `#res`, a line's `#i1`/`#int1`, MESA's `#gate`/`#gs`/`#gd`
     // and BSIM4's `#gate`/`#midgate`/`#body`/`#charge`. Project only those;
     // every saved variable still goes through exact set checks.
-    let internal: Vec<_> = circuit
+    let internal: HashSet<_> = circuit
         .nodes()
         .nodes()
         .iter()
@@ -2186,11 +2169,11 @@ const C_UNSAVED_SUFFIXES: [&str; 7] = [
 ];
 
 /// Projects one Rust plot onto C's default save set (see
-/// [`run_card_plots`]). Vector names already follow C, including the DC
+/// [`run_plan_plots`]). Vector names already follow C, including the DC
 /// sweep scales (`dctrcurv.c`).
 fn project(
     got: ngspice_rs::analysis::Plot,
-    internal: &[String],
+    internal: &HashSet<String>,
 ) -> Result<ngspice_rs::analysis::Plot, String> {
     let columns: Vec<_> = got
         .variables()
@@ -2206,30 +2189,29 @@ fn project(
         .iter()
         .map(|&index| got.variables()[index].clone())
         .collect();
-    let mut output = ngspice_rs::analysis::Plot::new(
+    let output = ngspice_rs::analysis::Plot::new(
         got.name.clone(),
         got.plotname.clone(),
         got.flags(),
         variables,
     );
-    output
-        .reserve_points(got.point_count())
-        .map_err(|err| err.to_string())?;
-    let mut row = Vec::with_capacity(columns.len());
-    for values in got.rows() {
-        row.clear();
-        row.extend(columns.iter().map(|&column| values[column]));
-        output.push_point(&row).map_err(|err| err.to_string())?;
+    let width = got.variable_count();
+    let points = got.point_count();
+    let mut cells = got.into_cells();
+    // The selected indices are strictly increasing; every destination is at
+    // or before its source, so stable in-place compaction cannot overwrite
+    // any unread cell.
+    let mut destination = 0;
+    for point in 0..points {
+        for &column in &columns {
+            cells[destination] = cells[point * width + column];
+            destination += 1;
+        }
     }
-    Ok(output)
-}
-
-/// The committed C golden of `name`.
-fn load_golden(root: &Path, name: &str) -> Result<RawFile, String> {
-    let target = fixtures::golden_path(root, name);
-    let text =
-        fs::read_to_string(&target).map_err(|e| format!("reading {}: {e}", target.display()))?;
-    RawFile::parse(&text).map_err(|e| format!("{}: {e}", target.display()))
+    cells.truncate(destination);
+    output
+        .with_cells(points, cells)
+        .map_err(|error| error.to_string())
 }
 
 /// Preserve every C reference vector; append the explicitly certified
@@ -2277,7 +2259,7 @@ fn compare_plot(
     circuit: &ngspice_rs::devices::Circuit,
     request: &AnalysisPlan,
     got: &ngspice_rs::analysis::Plot,
-    want: &ngspice_rs::analysis::Plot,
+    rows: RawPlotRows<'_, impl BufRead>,
 ) -> Result<String, String> {
     // A transmission-line deck is a transient comparison whose breakpoints
     // also include the declared echoes.
@@ -2291,14 +2273,18 @@ fn compare_plot(
         gate
     };
     match *gate {
-        Gate::Points { axis, tolerance } => compare::plots(got, want, tolerance, axis)
+        Gate::Points { axis, tolerance } => compare::stream_points(got, rows, tolerance, axis)
             .map(|()| format!("{} point(s)", got.point_count())),
-        Gate::Roots(tolerance) => compare::roots(got, want, tolerance),
+        Gate::Roots(tolerance) => {
+            let want = stream::collect_plot(rows)?;
+            compare::roots(got, &want, tolerance)
+        }
         Gate::CompletedRoots {
             tolerance,
             additional_poles,
         } => {
-            let completed = complete_pole_reference(want, additional_poles)?;
+            let want = stream::collect_plot(rows)?;
+            let completed = complete_pole_reference(&want, additional_poles)?;
             compare::roots(got, &completed, tolerance).map(|summary| {
                 format!(
                     "{summary}; includes {} independently verified pole(s)",
@@ -2307,6 +2293,7 @@ fn compare_plot(
             })
         }
         Gate::Transient(tolerance) => {
+            let want = stream::collect_plot(rows)?;
             let transient = request.transient().ok_or("expected a transient plan")?;
             let (step, final_time) = (transient.step(), transient.stop());
             let timing = ngspice_rs::devices::TransientTiming::new(step, final_time)
@@ -2329,7 +2316,7 @@ fn compare_plot(
             };
             tran::transient(
                 got,
-                want,
+                &want,
                 tolerance,
                 &tran::Grid {
                     start,
@@ -2392,6 +2379,154 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn internal_projection_compacts_owned_cells_without_hiding_unsaved_columns() {
+        use ngspice_rs::analysis::{Plot, PlotFlags, Variable};
+        use ngspice_rs::primitives::Complex;
+        let plot = Plot::new(
+            "op",
+            "Operating Point",
+            PlotFlags::Real,
+            ["v(a#internal)", "v(out)", "v(b#drain)", "v(other)"]
+                .into_iter()
+                .map(|name| Variable::new(name, "voltage"))
+                .collect(),
+        )
+        .with_rows([[1., 2., 3., 4.], [5., 6., 7., 8.]].map(|row| row.map(Complex::real)))
+        .unwrap();
+        let allocation = plot.cells().as_ptr();
+        let result = project(
+            plot,
+            &HashSet::from(["v(a#internal)".into(), "v(b#drain)".into()]),
+        )
+        .unwrap();
+        assert_eq!(result.cells().as_ptr(), allocation);
+        assert_eq!(
+            result
+                .variables()
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>(),
+            ["v(out)", "v(other)"]
+        );
+        assert_eq!(result.cells(), &[2., 4., 6., 8.].map(Complex::real));
+    }
+
+    // Separate ignored tests make RSS and allocator measurements comparable
+    // across processes. Synthetic creation is identical in both modes.
+    fn pointwise_memory_fixture(stages: usize, streaming: bool) {
+        use ngspice_rs::analysis::{
+            BinaryByteOrder, Plot, PlotFlags, RawFileReader, RawFileWriter, RawFormat, Variable,
+        };
+        use ngspice_rs::primitives::Complex;
+        use std::io::BufReader;
+        let root = Temp::with(&[]);
+        let path = root.0.join("pointwise.raw");
+        let mut got = Plot::new(
+            "op",
+            "Operating Point",
+            PlotFlags::Real,
+            (0..16)
+                .map(|index| Variable::new(format!("v(n{index})"), "voltage"))
+                .collect(),
+        );
+        got.reserve_points(65_536).unwrap();
+        for point in 0..65_536_u32 {
+            got.push_point(&[Complex::real(f64::from(point)); 16])
+                .unwrap();
+        }
+        let got = RawFile::single(got);
+        let mut writer =
+            RawFileWriter::create(&path, RawFormat::Ascii, BinaryByteOrder::LittleEndian).unwrap();
+        for _ in 0..stages {
+            writer.write_plot(&got.plots[0]).unwrap();
+        }
+        writer.finish().unwrap();
+        let actual = &got.plots[0].plot;
+        if streaming {
+            let mut reader = RawFileReader::new(BufReader::new(fs::File::open(&path).unwrap()));
+            for _ in 0..stages {
+                compare::stream_points(
+                    actual,
+                    reader.next_plot().unwrap().unwrap(),
+                    compare::DC,
+                    None,
+                )
+                .unwrap();
+            }
+            assert!(reader.next_plot().unwrap().is_none());
+        } else {
+            let retained = RawFile::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(retained.plots.len(), stages);
+            for expected in &retained.plots {
+                compare::plots(actual, &expected.plot, compare::DC, None).unwrap();
+            }
+        }
+        eprintln!(
+            "comparison input: {} bytes, {stages} stages",
+            fs::metadata(&path).unwrap().len()
+        );
+    }
+
+    #[test]
+    #[ignore = "large pointwise resource benchmark; run alone"]
+    fn memory_pointwise_retained() {
+        pointwise_memory_fixture(1, false);
+    }
+
+    #[test]
+    #[ignore = "large pointwise resource benchmark; run alone"]
+    fn memory_pointwise_streamed() {
+        pointwise_memory_fixture(1, true);
+    }
+
+    #[test]
+    #[ignore = "large multistage resource benchmark; run alone"]
+    fn memory_batch_retained() {
+        pointwise_memory_fixture(4, false);
+    }
+
+    #[test]
+    #[ignore = "large multistage resource benchmark; run alone"]
+    fn memory_batch_streamed() {
+        pointwise_memory_fixture(4, true);
+    }
+
+    fn transient_memory_fixture(streaming: bool) {
+        use ngspice_rs::analysis::RawFileReader;
+        use std::io::BufReader;
+        let path = fixtures::golden_path(&workspace_root(), "m7_ic_mos1_uic_tran");
+        let got = if streaming {
+            let mut reader = RawFileReader::new(BufReader::new(fs::File::open(&path).unwrap()));
+            let plot = stream::collect_plot(reader.next_plot().unwrap().unwrap()).unwrap();
+            assert!(reader.next_plot().unwrap().is_none());
+            plot
+        } else {
+            let mut file = RawFile::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(file.plots.len(), 1);
+            file.plots.remove(0).plot
+        };
+        assert!(got.point_count() > 0);
+        assert!(got.cells().iter().all(|value| value.is_finite()));
+        eprintln!(
+            "real transient input: {} bytes; {} points",
+            fs::metadata(&path).unwrap().len(),
+            got.point_count()
+        );
+    }
+
+    #[test]
+    #[ignore = "transient decoder resource benchmark; run alone"]
+    fn memory_transient_retained() {
+        transient_memory_fixture(false);
+    }
+
+    #[test]
+    #[ignore = "transient decoder resource benchmark; run alone"]
+    fn memory_transient_streamed() {
+        transient_memory_fixture(true);
     }
 
     #[test]
@@ -2660,6 +2795,8 @@ mod tests {
             original.replace("v(out)", "v(wrong)"),
             original.replace("2.500000000000000e+00", "NaN"),
             "not a rawfile".into(),
+            original.trim_end().rsplit_once('\n').unwrap().0.to_owned(),
+            format!("{original}trailing junk\n"),
             format!("{original}{original}"),
         ] {
             fs::write(&raw, text).unwrap();
