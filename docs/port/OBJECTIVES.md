@@ -63,3 +63,20 @@ accepted points and 65 columns, in the same test executable. The
 baseline constructs a packed Plot and evaluates the retained
 measurement API. The streaming case binds once and reuses the plan.
 The benchmark isolates output reduction, not numerical solver cost.
+
+Acer, 2026-11-22, initial streaming implementation (prior to #92
+accuracy reconciliation), pinned nightly and managed sccache:
+
+| Metric | Retained | Streamed |
+|---|---:|---:|
+| Accepted cells held at once | 3,250,065 | 0 |
+| Median native batch wall time | 2.57 s | 0.81 s |
+| Median process RSS peak | 56,108 KiB | 4,688 KiB |
+| DHAT total allocated bytes, 20 candidates | 2,747,365,191 | 278,806 |
+| DHAT peak live heap bytes | 68,722,894 | 44,435 |
+
+Checksums match (61.54700538418677). DHAT includes fixed harness/plan
+costs. Host load is shared; these timings isolate the output stage,
+not the circuit solver. Run each ignored benchmark separately with
+`--exact --ignored --nocapture` on the test executable and profile
+heap allocations with `valgrind --tool=dhat`.
