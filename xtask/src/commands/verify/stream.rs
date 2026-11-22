@@ -10,14 +10,13 @@ use ngspice_rs::devices::Circuit;
 
 use super::{Gate, compare_plot, fixtures};
 
-pub(super) struct Golden {
+struct Capture {
     path: PathBuf,
     reader: RawFileReader<BufReader<File>>,
 }
 
-impl Golden {
-    pub(super) fn open(root: &Path, name: &str) -> Result<Self, String> {
-        let path = fixtures::golden_path(root, name);
+impl Capture {
+    fn open(path: PathBuf) -> Result<Self, String> {
         let file =
             File::open(&path).map_err(|error| format!("reading {}: {error}", path.display()))?;
         Ok(Self {
@@ -28,23 +27,14 @@ impl Golden {
         })
     }
 
-    pub(super) fn compare(
-        &mut self,
-        gate: &Gate,
-        circuit: &Circuit,
-        request: &AnalysisPlan,
-        got: &Plot,
-    ) -> Result<String, String> {
-        let rows = self
-            .reader
+    fn next_plot(&mut self) -> Result<RawPlotRows<'_, BufReader<File>>, String> {
+        self.reader
             .next_plot()
             .map_err(|error| format!("{}: {error}", self.path.display()))?
-            .ok_or_else(|| format!("{}: missing C plot", self.path.display()))?;
-        compare_plot(gate, circuit, request, got, rows)
-            .map_err(|error| format!("{}: {error}", self.path.display()))
+            .ok_or_else(|| format!("{}: missing C plot", self.path.display()))
     }
 
-    pub(super) fn finish(mut self) -> Result<(), String> {
+    fn finish(&mut self) -> Result<(), String> {
         match self
             .reader
             .next_plot()
@@ -53,6 +43,51 @@ impl Golden {
             None => Ok(()),
             Some(_) => Err(format!("{}: unexpected extra C plot", self.path.display())),
         }
+    }
+}
+
+pub(super) struct Golden {
+    primary: Capture,
+    alternates: Vec<Capture>,
+}
+
+impl Golden {
+    pub(super) fn open(root: &Path, name: &str) -> Result<Self, String> {
+        let mut paths = fixtures::numerical_golden_paths(root, name).into_iter();
+        let primary = Capture::open(paths.next().ok_or("no C reference")?)?;
+        let alternates = paths.map(Capture::open).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            primary,
+            alternates,
+        })
+    }
+
+    pub(super) fn compare(
+        &mut self,
+        gate: &Gate,
+        circuit: &Circuit,
+        request: &AnalysisPlan,
+        got: &Plot,
+        resolution: Option<&Plot>,
+    ) -> Result<String, String> {
+        // Ordinary pointwise fixtures still lend one C row at a time.
+        // The independently captured variants are bounded small plots.
+        let alternates = self
+            .alternates
+            .iter_mut()
+            .map(|capture| {
+                collect_plot(capture.next_plot()?)
+                    .map_err(|error| format!("{}: {error}", capture.path.display()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let rows = self.primary.next_plot()?;
+        compare_plot(gate, circuit, request, got, rows, resolution, &alternates)
+            .map_err(|error| format!("{}: {error}", self.primary.path.display()))
+    }
+
+    pub(super) fn finish(mut self) -> Result<(), String> {
+        self.primary.finish()?;
+        self.alternates.iter_mut().try_for_each(Capture::finish)
     }
 }
 

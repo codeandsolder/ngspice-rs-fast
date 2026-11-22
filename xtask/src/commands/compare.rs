@@ -63,12 +63,13 @@ pub(super) const SENSITIVITY: Tolerance = Tolerance {
     absolute: 1e-12,
 };
 
-/// `.sens` of nonlinear circuits: the nonlinear 1 ppm bias bound, with an
+/// `.sens` of nonlinear circuits: a 1 ppm target for resolved differences, with an
 /// absolute floor for weak parameters, whose numerator `dx` is only a few
 /// ulps of the node voltage: `ulp(x)/delta` is about `1e-16/2e-6 = 5e-11`
 /// for an O(1) parameter of an O(1) V output (C's own result for a diode's
 /// `nr` moves by 3e-10 between RELTOL 1e-6 and 1e-9 for that reason), which a
-/// 1e-9 floor covers.
+/// 1e-9 baseline floor covers. The per-column resolution diagnostic can
+/// dominate this target when the finite-difference numerator is unresolved.
 pub(super) const SENSITIVITY_NONLINEAR: Tolerance = Tolerance {
     relative: 1e-6,
     absolute: 1e-9,
@@ -428,6 +429,20 @@ fn check_column_sets(
     Ok(())
 }
 
+fn validate_resolution(got: &Plot, resolution: Option<&Plot>) -> Result<(), String> {
+    if let Some(resolution) = resolution
+        && (resolution.point_count() != got.point_count()
+            || resolution.variables() != got.variables()
+            || resolution
+                .cells()
+                .iter()
+                .any(|value| !value.is_finite() || value.re < 0. || value.im != 0.))
+    {
+        return Err("invalid sensitivity resolution diagnostic".to_owned());
+    }
+    Ok(())
+}
+
 /// Bind once, compare in C row/column order, and defer exact metadata checking
 /// until an ASCII complex stream has finalized its per-column realness.
 struct PointComparison<'a> {
@@ -439,6 +454,8 @@ struct PointComparison<'a> {
     axis: Option<(&'a str, usize, usize)>,
     previous: [Option<f64>; 2],
     tolerance: Tolerance,
+    resolution: Option<&'a Plot>,
+    alternates: Vec<(&'a Plot, Vec<usize>)>,
     first: Option<String>,
     worst: Option<String>,
     worst_ratio: f64,
@@ -452,6 +469,8 @@ impl<'a> PointComparison<'a> {
         point_count: usize,
         tolerance: Tolerance,
         axis: Option<&'a str>,
+        resolution: Option<&'a Plot>,
+        alternates: &'a [Plot],
     ) -> Result<Self, String> {
         let got_columns = validate(got, "Rust")?;
         if point_count == 0 {
@@ -469,6 +488,22 @@ impl<'a> PointComparison<'a> {
         for (key, &column) in &want_columns {
             order[column] = got_columns[key];
         }
+        validate_resolution(got, resolution)?;
+        let alternates = alternates
+            .iter()
+            .map(|alternate| {
+                let columns = validate(alternate, "alternate C")?;
+                check_structure(got, alternate, &got_columns, &columns)?;
+                if alternate.point_count() != point_count {
+                    return Err("alternate C point count mismatch".to_owned());
+                }
+                let mut order = vec![0; want.variable_count()];
+                for (key, &column) in &want_columns {
+                    order[column] = columns[key];
+                }
+                Ok((alternate, order))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let axis = axis
             .map(|name| {
                 let got = got_columns
@@ -489,6 +524,8 @@ impl<'a> PointComparison<'a> {
             axis,
             previous: [None; 2],
             tolerance,
+            resolution,
+            alternates,
             first: None,
             worst: None,
             worst_ratio: 0.0,
@@ -496,14 +533,25 @@ impl<'a> PointComparison<'a> {
         })
     }
 
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "retain the existing separately rounded component acceptance bounds; changing rounding can change golden classifications at the boundary"
-    )]
     fn observe(&mut self, point: usize, expected: &[Complex]) -> Result<(), String> {
         validate_row(&self.want, "C", point, expected, true)?;
         let actual = self.got.row(point).ok_or("missing Rust row")?;
+        let alternate_rows = self
+            .alternates
+            .iter()
+            .map(|(plot, columns)| {
+                plot.row(point)
+                    .map(|row| (row, columns))
+                    .ok_or("missing alternate C row")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         if let Some((axis, got, want)) = self.axis {
+            if alternate_rows
+                .iter()
+                .any(|(row, columns)| row[columns[want]] != expected[want])
+            {
+                return Err("independent C captures have different physical grids".to_owned());
+            }
             for ((value, label), previous) in [(actual[got], "Rust"), (expected[want], "C")]
                 .into_iter()
                 .zip(&mut self.previous)
@@ -520,9 +568,32 @@ impl<'a> PointComparison<'a> {
             let variable = &self.want.variables()[column];
             let got = actual[actual_column];
             let want = expected[column];
-            for (component, got, want) in [("re", got.re, want.re), ("im", got.im, want.im)] {
+            for (component, got, reference) in [("re", got.re, want.re), ("im", got.im, want.im)] {
+                let want = if alternate_rows.is_empty() {
+                    reference
+                } else {
+                    let observations = alternate_rows.iter().map(|(row, columns)| {
+                        let sample = row[columns[column]];
+                        if component == "re" {
+                            sample.re
+                        } else {
+                            sample.im
+                        }
+                    });
+                    ngspice_conformance::fixtures::nearest_reference(
+                        got,
+                        std::iter::once(reference).chain(observations),
+                    )?
+                };
+                let resolution_floor = self
+                    .resolution
+                    .and_then(|plot| plot.row(point))
+                    .map_or(0., |row| row[actual_column].re);
                 let error = (got - want).abs();
-                let limit = self.tolerance.relative * want.abs() + self.tolerance.absolute;
+                let limit = self
+                    .tolerance
+                    .relative
+                    .mul_add(want.abs(), self.tolerance.absolute.max(resolution_floor));
                 if error > limit {
                     self.mismatches += 1;
                     let ratio = error / limit;
@@ -569,6 +640,8 @@ pub(super) fn stream_points(
     mut rows: RawPlotRows<'_, impl BufRead>,
     tolerance: Tolerance,
     axis: Option<&str>,
+    resolution: Option<&Plot>,
+    alternates: &[Plot],
 ) -> Result<(), String> {
     let mut comparison = PointComparison::new(
         got,
@@ -576,6 +649,8 @@ pub(super) fn stream_points(
         rows.point_count(),
         tolerance,
         axis,
+        resolution,
+        alternates,
     )?;
     let mut point = 0;
     while let Some(row) = rows.next_row().map_err(|error| error.to_string())? {
@@ -590,11 +665,21 @@ pub(super) fn stream_points(
 pub(super) fn plots(
     got: &Plot,
     want: &Plot,
+    alternates: &[Plot],
     tolerance: Tolerance,
     axis: Option<&str>,
+    resolution: Option<&Plot>,
 ) -> Result<(), String> {
     validate(want, "C")?;
-    let mut comparison = PointComparison::new(got, want, want.point_count(), tolerance, axis)?;
+    let mut comparison = PointComparison::new(
+        got,
+        want,
+        want.point_count(),
+        tolerance,
+        axis,
+        resolution,
+        alternates,
+    )?;
     for (point, row) in want.rows().enumerate() {
         comparison.observe(point, row)?;
     }
@@ -637,7 +722,7 @@ mod tests {
     }
 
     fn compare(got: &Plot, want: &Plot) -> Result<(), String> {
-        plots(got, want, AC, Some("frequency"))
+        plots(got, want, &[], AC, Some("frequency"), None)
     }
 
     #[test]
@@ -652,6 +737,8 @@ mod tests {
                 reader.next_plot().unwrap().unwrap(),
                 AC,
                 Some("frequency"),
+                None,
+                &[],
             )
         };
         check(&want, &raw).unwrap();
@@ -802,17 +889,38 @@ mod tests {
                 };
                 let bound = tolerance.relative * value.abs() + tolerance.absolute;
                 *value += 0.5 * bound;
-                plots(&got, &want, tolerance, None).unwrap();
+                plots(&got, &want, &[], tolerance, None, None).unwrap();
                 *if component == "re" {
                     &mut got.point_mut(point).unwrap()[1].re
                 } else {
                     &mut got.point_mut(point).unwrap()[1].im
                 } += 2.0 * bound;
-                let error = plots(&got, &want, tolerance, None).unwrap_err();
+                let error = plots(&got, &want, &[], tolerance, None, None).unwrap_err();
                 assert!(error.contains(&format!("v(out).{component}")), "{error}");
                 assert!(error.contains("first:") && error.contains("worst"));
             }
         }
+    }
+
+    #[test]
+    fn sensitivity_resolution_applies_only_to_its_own_component_and_row() {
+        let want = plot();
+        let mut resolution = want.clone();
+        for row in resolution.rows_mut() {
+            row.fill(Complex::ZERO);
+        }
+        resolution.point_mut(0).unwrap()[1] = Complex::real(1e-5);
+        let mut got = want.clone();
+        got.point_mut(0).unwrap()[1].re += 3e-6;
+        assert!(compare(&got, &want).is_err());
+        plots(&got, &want, &[], AC, Some("frequency"), Some(&resolution)).unwrap();
+        got.point_mut(1).unwrap()[1].re += 3e-6;
+        assert!(plots(&got, &want, &[], AC, Some("frequency"), Some(&resolution)).is_err());
+        got = want.clone();
+        got.point_mut(0).unwrap()[1].re = 0.;
+        assert!(plots(&got, &want, &[], AC, Some("frequency"), Some(&resolution)).is_err());
+        resolution.point_mut(0).unwrap()[1].re = f64::INFINITY;
+        assert!(plots(&want, &want, &[], AC, Some("frequency"), Some(&resolution)).is_err());
     }
 
     #[test]
@@ -986,7 +1094,7 @@ mod tests {
     #[test]
     fn axis_identity_values_and_monotonicity_are_checked() {
         let want = plot();
-        assert!(plots(&want, &want, AC, Some("time")).is_err());
+        assert!(plots(&want, &want, &[], AC, Some("time"), None).is_err());
         for value in [Complex::ZERO, Complex::real(-1.0), Complex::new(100.0, 1.0)] {
             let mut got = want.clone();
             got.point_mut(0).unwrap()[0] = value;

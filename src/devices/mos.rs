@@ -55,8 +55,6 @@
 //! under `uic` (`mos1ic.c`) and are zero otherwise. An `off` instance starts
 //! at zero and is held there through `MODEINITFIX`.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -73,10 +71,6 @@
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
 )]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
 
 pub(super) mod bulk;
 mod charge;
@@ -91,7 +85,9 @@ use crate::devices::limiting;
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
-use crate::devices::nonlinear::cubic_reverse_junction;
+use crate::devices::nonlinear::{
+    cubic_reverse_junction, exponential_junction_at_argument, reverse_depletion,
+};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -358,26 +354,18 @@ pub(super) struct Junction {
     pub(super) fc: Real,
     /// C `MOS1tDepCap`.
     pub(super) depletion: Real,
-    /// C `MOS1f2d/f3d/f4d` (or the `s` set).
-    pub(super) f2: Real,
-    pub(super) f3: Real,
-    pub(super) f4: Real,
+    /// Anchor of the forward continuation, not the coefficients of the
+    /// ill-conditioned absolute-voltage quadratic used by C.
+    edge_charge: Real,
+    edge_capacitance: Real,
+    forward_slope: Real,
     pub(super) reverse: ReverseLaw,
-}
-
-/// `exp(-grading * ln(arg))`, with `mos1load.c`'s square-root shortcut.
-fn grading_power(arg: Real, grading: Real) -> Real {
-    if grading == 0.5 {
-        1. / arg.sqrt()
-    } else {
-        (-grading * arg.ln()).exp()
-    }
 }
 
 impl Junction {
     /// `mos1temp.c`/`mos3temp.c`: the junction of one side from its
-    /// zero-bias bottom and sidewall capacitances, with the `f2/f3/f4` linear
-    /// continuation above `FC * PB` in C's arithmetic.
+    /// zero-bias bottom and sidewall capacitances, with the linear
+    /// capacitance continuation above `FC * PB` anchored at its threshold.
     #[expect(
         clippy::too_many_arguments,
         reason = "keeps the positional interface explicit at the reference solver or device boundary"
@@ -394,17 +382,11 @@ impl Junction {
         reverse: ReverseLaw,
     ) -> Self {
         let depletion = fc * potential;
-        let arg = 1. - fc;
-        let sarg = (-mj * arg.ln()).exp();
-        let sargsw = (-mjsw * arg.ln()).exp();
-        let f2 = bottom * (1. - fc * (1. + mj)) * sarg / arg
-            + sidewall * (1. - fc * (1. + mjsw)) * sargsw / arg;
-        let f3 = bottom * mj * sarg / arg / potential + sidewall * mjsw * sargsw / arg / potential;
-        let depletion_squared = depletion * depletion;
-        let f4 = bottom * potential * (1. - arg * sarg) / (1. - mj)
-            + sidewall * potential * (1. - arg * sargsw) / (1. - mjsw)
-            - f3 / 2. * depletion_squared
-            - depletion * f2;
+        let (qb, cb) = reverse_depletion(depletion, bottom, potential, mj);
+        let (qs, cs) = reverse_depletion(depletion, sidewall, potential, mjsw);
+        let edge_charge = qb + qs;
+        let edge_capacitance = cb + cs;
+        let forward_slope = cb.mul_add(mj, cs * mjsw) / (potential * (1. - fc));
         Self {
             saturation,
             vcrit,
@@ -415,40 +397,31 @@ impl Junction {
             potential,
             fc,
             depletion,
-            f2,
-            f3,
-            f4,
+            edge_charge,
+            edge_capacitance,
+            forward_slope,
             reverse,
         }
     }
 
-    /// Depletion charge and capacitance at the device-frame bulk voltage `v`
-    /// (`mos1load.c`). Above `FC * PB` C writes the bulk-drain and
-    /// bulk-source polynomials with different association, kept here.
-    pub(super) fn charge(&self, v: Real, drain: bool) -> (Real, Real) {
+    /// Depletion charge and capacitance at the device-frame bulk voltage.
+    /// Both bulk junctions use the same threshold-anchored integral.
+    pub(super) fn charge(&self, v: Real) -> (Real, Real) {
         if self.bottom == 0. && self.sidewall == 0. {
             return (0., 0.);
         }
         if v < self.depletion {
-            let arg = 1. - v / self.potential;
-            let sarg = grading_power(arg, self.mj);
-            let sargsw = grading_power(arg, self.mjsw);
-            (
-                self.potential
-                    * (self.bottom * (1. - arg * sarg) / (1. - self.mj)
-                        + self.sidewall * (1. - arg * sargsw) / (1. - self.mjsw)),
-                self.bottom * sarg + self.sidewall * sargsw,
-            )
-        } else if drain {
-            (
-                self.f4 + v * (self.f2 + v * self.f3 / 2.),
-                self.f2 + v * self.f3,
-            )
+            let (qb, cb) = reverse_depletion(v, self.bottom, self.potential, self.mj);
+            let (qs, cs) = reverse_depletion(v, self.sidewall, self.potential, self.mjsw);
+            (qb + qs, cb + cs)
         } else {
-            (
-                self.f4 + v * (self.f2 + v * (self.f3 / 2.)),
-                self.f2 + self.f3 * v,
-            )
+            let delta = v - self.depletion;
+            let capacitance = self.forward_slope.mul_add(delta, self.edge_capacitance);
+            let charge = self
+                .edge_capacitance
+                .midpoint(capacitance)
+                .mul_add(delta, self.edge_charge);
+            (charge, capacitance)
         }
     }
 
@@ -457,18 +430,16 @@ impl Junction {
     pub(super) fn current(&self, v: Real, vt: Real, gmin: Real) -> (Real, Real) {
         if v <= -3. * vt {
             match self.reverse {
-                ReverseLaw::Constant => (gmin * v - self.saturation, gmin),
+                ReverseLaw::Constant => (gmin.mul_add(v, -self.saturation), gmin),
                 ReverseLaw::Cubic => {
                     let (current, conductance) = cubic_reverse_junction(v, vt, self.saturation);
-                    (current + gmin * v, conductance + gmin)
+                    (gmin.mul_add(v, current), conductance + gmin)
                 }
             }
         } else {
-            let e = (v / vt).min(MAX_EXP_ARG).exp();
-            (
-                self.saturation * (e - 1.) + gmin * v,
-                self.saturation * e / vt + gmin,
-            )
+            let (current, conductance) =
+                exponential_junction_at_argument((v / vt).min(MAX_EXP_ARG), vt, self.saturation);
+            (gmin.mul_add(v, current), conductance + gmin)
         }
     }
 }
@@ -530,8 +501,12 @@ impl<C> Operating<C> {
             self.drain.sidewall,
             self.source.bottom,
             self.source.sidewall,
-            self.drain.f4,
-            self.source.f4,
+            self.drain.edge_charge,
+            self.source.edge_charge,
+            self.drain.edge_capacitance,
+            self.source.edge_capacitance,
+            self.drain.forward_slope,
+            self.source.forward_slope,
             self.overlap[0],
             self.overlap[1],
             self.overlap[2],
@@ -826,39 +801,34 @@ pub(super) fn meyer(
         MEYER_MIN_VDSAT
     };
     if vgst <= -phi {
-        [0., 0., cox / 2.]
-    } else if vgst <= -phi / 2. {
-        [0., 0., -vgst * cox / (2. * phi)]
-    } else if vgst <= 0. {
-        let capgb = -vgst * cox / (2. * phi);
-        let capgs = vgst * cox / (1.5 * phi) + cox / 3.;
-        let vds = vgs - vgd;
-        if vds >= vdsat {
-            [capgs, 0., capgb]
-        } else {
-            let vddif = 2.0 * vdsat - vds;
-            let vddif1 = vdsat - vds;
-            let vddif2 = vddif * vddif;
-            [
-                capgs * (1.0 - vddif1 * vddif1 / vddif2),
-                capgs * (1.0 - vdsat * vdsat / vddif2),
-                capgb,
-            ]
-        }
+        return [0., 0., cox / 2.];
+    }
+    if vgst <= -phi / 2. {
+        return [0., 0., -vgst * cox / (2. * phi)];
+    }
+    let (channel_cap, bulk_cap) = if vgst <= 0. {
+        (
+            cox * ((vgst + phi / 2.) / (1.5 * phi)),
+            -vgst * cox / (2. * phi),
+        )
     } else {
-        let vds = vgs - vgd;
-        if vdsat <= vds {
-            [cox / 3., 0., 0.]
-        } else {
-            let vddif = 2.0 * vdsat - vds;
-            let vddif1 = vdsat - vds;
-            let vddif2 = vddif * vddif;
-            [
-                cox * (1.0 - vddif1 * vddif1 / vddif2) / 3.,
-                cox * (1.0 - vdsat * vdsat / vddif2) / 3.,
-                0.,
-            ]
-        }
+        (cox / 3., 0.)
+    };
+    let vds = vgs - vgd;
+    if vds >= vdsat {
+        [channel_cap, 0., bulk_cap]
+    } else {
+        // Factor both differences of squares and normalize before
+        // multiplying; preserve tiny drain capacitance near pinch-off.
+        let remaining = vdsat - vds;
+        let denominator = vdsat + remaining;
+        let source_ratio = remaining / denominator;
+        let drain_ratio = vdsat / denominator;
+        [
+            channel_cap * drain_ratio * (1. + source_ratio),
+            channel_cap * source_ratio * (1. + drain_ratio),
+            bulk_cap,
+        ]
     }
 }
 
@@ -1094,8 +1064,8 @@ impl<L: MosLevel> Mosfet<L> {
         } else {
             self.model.drain_current(op, vgx, vdsm, vbx)
         };
-        let (qbs, capbs) = op.source.charge(vbs, false);
-        let (qbd, capbd) = op.drain.charge(vbd, true);
+        let (qbs, capbs) = op.source.charge(vbs);
+        let (qbd, capbd) = op.drain.charge(vbd);
         let half = if normal {
             meyer(vgs, vgd, von, vdsat, op.phi, op.oxide)
         } else {
@@ -1118,7 +1088,7 @@ impl<L: MosLevel> Mosfet<L> {
             cbs,
             gbd,
             cbd,
-            cd: mode * cdrain - cbd,
+            cd: mode.mul_add(cdrain, -cbd),
             von,
             vdsat,
             qbs,
@@ -1635,19 +1605,27 @@ impl<L: MosLevel> Device for Mosfet<L> {
         // Current vector and Y matrix, in mos1load.c's order and arithmetic.
         let t = pol;
         let m = L::MULTIPLICITY.stamp(self.geometry.m);
-        let ceqbs = t * (e.cbs - e.gbs * e.vbs);
-        let ceqbd = t * (e.cbd - e.gbd * e.vbd);
+        let ceqbs = t * f64::mul_add(e.gbs, -e.vbs, e.cbs);
+        let ceqbd = t * f64::mul_add(e.gbd, -e.vbd, e.cbd);
         let (xnrm, xrev, cdreq) = if e.mode >= 0. {
             (
                 1.,
                 0.,
-                t * (e.cdrain - e.gds * e.vds - e.gm * e.vgs - e.gmbs * e.vbs),
+                t * f64::mul_add(
+                    e.gmbs,
+                    -e.vbs,
+                    f64::mul_add(e.gm, -e.vgs, f64::mul_add(e.gds, -e.vds, e.cdrain)),
+                ),
             )
         } else {
             (
                 0.,
                 1.,
-                -t * (e.cdrain - e.gds * (-e.vds) - e.gm * e.vgd - e.gmbs * e.vbd),
+                -t * f64::mul_add(
+                    e.gmbs,
+                    -e.vbd,
+                    f64::mul_add(e.gm, -e.vgd, f64::mul_add(e.gds, -(-e.vds), e.cdrain)),
+                ),
             )
         };
         let [d, g, s, b] = [
@@ -1660,17 +1638,25 @@ impl<L: MosLevel> Device for Mosfet<L> {
         let [gdr, gsr] = self.series;
         let (gm, gds, gmbs, gbd, gbs) = (e.gm, e.gds, e.gmbs, e.gbd, e.gbs);
         context.stamp_rhs(g, -(m * (t * (ceqgs + ceqgb + ceqgd))))?;
-        context.stamp_rhs(b, -(m * (ceqbs + ceqbd - t * ceqgb)))?;
-        context.stamp_rhs(dp, m * (ceqbd - cdreq + t * ceqgd))?;
-        context.stamp_rhs(sp, m * (cdreq + ceqbs + t * ceqgs))?;
+        context.stamp_rhs(b, -(m * t.mul_add(-ceqgb, ceqbs + ceqbd)))?;
+        context.stamp_rhs(dp, m * t.mul_add(ceqgd, ceqbd - cdreq))?;
+        context.stamp_rhs(sp, m * t.mul_add(ceqgs, cdreq + ceqbs))?;
         context.stamp_fixed(
             [
                 (d, d, gdr),
                 (g, g, gcgd + gcgs + gcgb),
                 (s, s, gsr),
                 (b, b, gbd + gbs + gcgb),
-                (dp, dp, gdr + gds + gbd + xrev * (gm + gmbs) + gcgd),
-                (sp, sp, gsr + gds + gbs + xnrm * (gm + gmbs) + gcgs),
+                (
+                    dp,
+                    dp,
+                    f64::mul_add(xrev, gm + gmbs, gdr + gds + gbd) + gcgd,
+                ),
+                (
+                    sp,
+                    sp,
+                    f64::mul_add(xnrm, gm + gmbs, gsr + gds + gbs) + gcgs,
+                ),
                 (d, dp, -gdr),
                 (g, b, -gcgb),
                 (g, dp, -gcgd),
@@ -1680,13 +1666,13 @@ impl<L: MosLevel> Device for Mosfet<L> {
                 (b, dp, -gbd),
                 (b, sp, -gbs),
                 (dp, d, -gdr),
-                (dp, g, (xnrm - xrev) * gm - gcgd),
-                (dp, b, -gbd + (xnrm - xrev) * gmbs),
-                (dp, sp, -gds - xnrm * (gm + gmbs)),
-                (sp, g, -(xnrm - xrev) * gm - gcgs),
+                (dp, g, f64::mul_add(xnrm - xrev, gm, -gcgd)),
+                (dp, b, f64::mul_add(xnrm - xrev, gmbs, -gbd)),
+                (dp, sp, f64::mul_add(xnrm, -(gm + gmbs), -gds)),
+                (sp, g, f64::mul_add(-(xnrm - xrev), gm, -gcgs)),
                 (sp, s, -gsr),
-                (sp, b, -gbs - (xnrm - xrev) * gmbs),
-                (sp, dp, -gds - xrev * (gm + gmbs)),
+                (sp, b, f64::mul_add(xnrm - xrev, -gmbs, -gbs)),
+                (sp, dp, f64::mul_add(xrev, -(gm + gmbs), -gds)),
             ]
             .map(|(r, c, value)| (r, c, m * value)),
         )?;
@@ -1722,16 +1708,32 @@ impl<L: MosLevel> Device for Mosfet<L> {
         );
         let (cbs, cbd, gbs) = (at(slot::CBS), at(slot::CBD), at(slot::GBS));
         let cdhat = if at(slot::MODE) >= 0. {
-            cd - gbd * delvbd + gmbs * delvbs + gm * delvgs + gds * delvds
+            f64::mul_add(
+                gds,
+                delvds,
+                f64::mul_add(
+                    gm,
+                    delvgs,
+                    f64::mul_add(gmbs, delvbs, f64::mul_add(gbd, -delvbd, cd)),
+                ),
+            )
         } else {
-            cd - (gbd - gmbs) * delvbd - gm * delvgd + gds * delvds
+            f64::mul_add(
+                gds,
+                delvds,
+                f64::mul_add(gm, -delvgd, f64::mul_add(gbd - gmbs, -delvbd, cd)),
+            )
         };
-        let cbhat = cbs + cbd + gbd * delvbd + gbs * delvbs;
-        let tol = context.reltol * cdhat.abs().max(cd.abs()) + context.abstol;
+        let cbhat = f64::mul_add(gbs, delvbs, f64::mul_add(gbd, delvbd, cbs + cbd));
+        let tol = context
+            .reltol
+            .mul_add(cdhat.abs().max(cd.abs()), context.abstol);
         if (cdhat - cd).abs() >= tol {
             return Ok(true);
         }
-        let tol = context.reltol * cbhat.abs().max((cbs + cbd).abs()) + context.abstol;
+        let tol = context
+            .reltol
+            .mul_add(cbhat.abs().max((cbs + cbd).abs()), context.abstol);
         Ok((cbhat - (cbs + cbd)).abs() > tol)
     }
 
@@ -1792,20 +1794,20 @@ impl<L: MosLevel> Device for Mosfet<L> {
             (d, d, gdr),
             (s, s, gsr),
             (b, b, gbd + gbs),
-            (dp, dp, gdr + gds + gbd + xrev * (gm + gmbs)),
-            (sp, sp, gsr + gds + gbs + xnrm * (gm + gmbs)),
+            (dp, dp, f64::mul_add(xrev, gm + gmbs, gdr + gds + gbd)),
+            (sp, sp, f64::mul_add(xnrm, gm + gmbs, gsr + gds + gbs)),
             (d, dp, -gdr),
             (s, sp, -gsr),
             (b, dp, -gbd),
             (b, sp, -gbs),
             (dp, d, -gdr),
             (dp, g, (xnrm - xrev) * gm),
-            (dp, b, -gbd + (xnrm - xrev) * gmbs),
-            (dp, sp, -(gds + xnrm * (gm + gmbs))),
+            (dp, b, f64::mul_add(xnrm - xrev, gmbs, -gbd)),
+            (dp, sp, -f64::mul_add(xnrm, gm + gmbs, gds)),
             (sp, g, -((xnrm - xrev) * gm)),
             (sp, s, -gsr),
-            (sp, b, -(gbs + (xnrm - xrev) * gmbs)),
-            (sp, dp, -(gds + xrev * (gm + gmbs))),
+            (sp, b, -f64::mul_add(xnrm - xrev, gmbs, gbs)),
+            (sp, dp, -f64::mul_add(xrev, gm + gmbs, gds)),
         ] {
             if let (Some(r), Some(c)) = (unknowns.node_row(row), unknowns.node_row(col)) {
                 context.system.a.add(r, c, m * value)?;
@@ -1862,7 +1864,8 @@ impl<L: MosLevel> Device for Mosfet<L> {
                 } else {
                     1.0 - (e.vds * e.mode / e.vdsat)
                 };
-                2.0 / 3.0 * shape.beta * vgst * (1.0 + alpha + alpha * alpha) / (1.0 + alpha)
+                2.0 / 3.0 * shape.beta * vgst * f64::mul_add(alpha, alpha, 1.0 + alpha)
+                    / (1.0 + alpha)
                     * common.gdsnoi
             } else {
                 0.
@@ -1951,22 +1954,37 @@ mod tests {
             junction(1e-12, 2e-13, 0.5, 0.33),
             junction(0., 3e-13, 0.4, 0.33),
         ] {
-            // Bulk-drain and bulk-source polynomials (C associates them
-            // differently above FC*PB).
-            for drain in [true, false] {
-                for v in [-3., -0.5, 0., 0.39, 0.4, 0.41, 0.7] {
-                    let h = 1e-6;
-                    let (_, c) = j.charge(v, drain);
-                    let numerical =
-                        (j.charge(v + h, drain).0 - j.charge(v - h, drain).0) / (2. * h);
-                    assert!((numerical - c).abs() <= 1e-7 * c, "{v}: {numerical} {c}");
-                }
-                // Charge and capacitance are continuous at FC*PB.
-                let edge = 0.5 * 0.8;
-                let (below, above) = (j.charge(edge - 1e-12, drain), j.charge(edge, drain));
-                assert!((below.0 - above.0).abs() <= 1e-9 * above.0.abs());
-                assert!((below.1 - above.1).abs() <= 1e-9 * above.1);
+            for v in [-3., -0.5, 0., 0.39, 0.4, 0.41, 0.7] {
+                let h = 1e-6;
+                let (_, c) = j.charge(v);
+                let numerical = (j.charge(v + h).0 - j.charge(v - h).0) / (2. * h);
+                assert!((numerical - c).abs() <= 1e-7 * c, "{v}: {numerical} {c}");
             }
+            let edge = 0.5 * 0.8;
+            let (below, above) = (j.charge(edge - 1e-12), j.charge(edge));
+            assert!((below.0 - above.0).abs() <= 1e-9 * above.0.abs());
+            assert!((below.1 - above.1).abs() <= 1e-9 * above.1);
+        }
+    }
+
+    #[test]
+    fn bulk_junction_keeps_small_charge_and_current_and_continuation_at_unity_grading() {
+        for grading in [0.5, 0.99, 1.] {
+            let j = junction(1e-12, 2e-13, grading, 0.5);
+            for voltage in [-1e-30, 1e-30, -1e-20, 1e-20] {
+                let (charge, cap) = j.charge(voltage);
+                let expected = voltage * 1.2e-12;
+                assert!((charge - expected).abs() <= 8. * Real::EPSILON * expected.abs());
+                assert!((cap - 1.2e-12).abs() < 1e-27);
+                let (current, conductance) = j.current(voltage, 0.025, 0.);
+                let expected = voltage * (j.saturation / 0.025);
+                assert!((current - expected).abs() <= 8. * Real::EPSILON * expected.abs());
+                assert!((conductance - j.saturation / 0.025).abs() < 1e-27);
+            }
+            let (q1, c1) = j.charge(j.depletion.next_down());
+            let (q2, c2) = j.charge(j.depletion);
+            assert!((q2 - q1).abs() <= 8. * Real::EPSILON * q2.abs());
+            assert!((c2 - c1).abs() <= 8. * Real::EPSILON * c2.abs());
         }
     }
 

@@ -2027,7 +2027,7 @@ fn run_deck(root: &Path, path: &Path, fixture: &Supported) -> Result<String, Str
     let request = config
         .plan_for(&netlist.analyses[0])
         .map_err(|error| error.to_string())?;
-    let (mut plots, circuit) = run_plan_plots(&netlist, &config, &request, None)?;
+    let (mut plots, circuit, resolution) = run_plan_plots(&netlist, &config, &request, None)?;
     if plots.len() != 1 {
         return Err(format!(
             "expected one Rust plot, the driver produced {} (register multi-plot analyses as batch fixtures)",
@@ -2043,7 +2043,7 @@ fn run_deck(root: &Path, path: &Path, fixture: &Supported) -> Result<String, Str
         ));
     }
     let mut golden = Golden::open(root, fixture.name)?;
-    let detail = golden.compare(&fixture.gate, &circuit, &request, &got)?;
+    let detail = golden.compare(&fixture.gate, &circuit, &request, &got, resolution.as_ref())?;
     golden.finish()?;
     Ok(detail)
 }
@@ -2077,8 +2077,9 @@ fn batch_result(root: &Path, path: &Path, fixture: &Batch) -> Result<Vec<String>
     let mut previous = None;
     for entry in &schedule {
         let request = &plans[entry.card_index];
-        let (plots, circuit) = run_plan_plots(&netlist, &config, request, previous.as_ref())
-            .map_err(|error| format!("{}: {error}", entry.plot_name))?;
+        let (plots, circuit, resolution) =
+            run_plan_plots(&netlist, &config, request, previous.as_ref())
+                .map_err(|error| format!("{}: {error}", entry.plot_name))?;
         let own: Vec<&str> = entry.plot_names().collect();
         if plots.len() != own.len() {
             return Err(format!(
@@ -2098,7 +2099,7 @@ fn batch_result(root: &Path, path: &Path, fixture: &Batch) -> Result<Vec<String>
                 ));
             }
             let detail = golden
-                .compare(&stage.gate, &circuit, request, got)
+                .compare(&stage.gate, &circuit, request, got, resolution.as_ref())
                 .map_err(|error| format!("{name}: {error}"))?;
             details.push(format!("{name} ({}): {detail}", got.plotname));
         }
@@ -2117,6 +2118,7 @@ fn run_plan_plots(
     (
         Vec<ngspice_rs::analysis::Plot>,
         ngspice_rs::devices::Circuit,
+        Option<ngspice_rs::analysis::Plot>,
     ),
     String,
 > {
@@ -2124,9 +2126,19 @@ fn run_plan_plots(
     if let Some(previous) = previous {
         circuit.inherit_from(previous);
     }
-    let plots = request
-        .run_plots(&mut circuit, &config.context())
-        .map_err(|e| e.to_string())?;
+    let (plots, resolution) = if request.kind() == AnalysisKind::Sensitivity {
+        let (plot, resolution) = request
+            .run_sensitivity_with_resolution(&mut circuit, &config.context())
+            .map_err(|e| e.to_string())?;
+        (vec![plot], Some(resolution))
+    } else {
+        (
+            request
+                .run_plots(&mut circuit, &config.context())
+                .map_err(|e| e.to_string())?,
+            None,
+        )
+    };
     circuit.note_completed(request.kind());
     // C's default save set omits device internal nodes by name
     // (`outitf.c`: `#internal`, `#source`, `#drain`, `#collector`,
@@ -2153,7 +2165,10 @@ fn run_plan_plots(
         .into_iter()
         .map(|plot| project(plot, &internal))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok((plots, circuit))
+    let resolution = resolution
+        .map(|plot| project(plot, &internal))
+        .transpose()?;
+    Ok((plots, circuit, resolution))
 }
 
 /// The internal-node name fragments `outitf.c` leaves out of C's default
@@ -2260,7 +2275,12 @@ fn compare_plot(
     request: &AnalysisPlan,
     got: &ngspice_rs::analysis::Plot,
     rows: RawPlotRows<'_, impl BufRead>,
+    resolution: Option<&ngspice_rs::analysis::Plot>,
+    alternates: &[ngspice_rs::analysis::Plot],
 ) -> Result<String, String> {
+    if !alternates.is_empty() && !matches!(gate, Gate::Points { .. }) {
+        return Err("independent reference envelopes require a point-wise gate".to_owned());
+    }
     // A transmission-line deck is a transient comparison whose breakpoints
     // also include the declared echoes.
     let (echo_gate, offsets) = match *gate {
@@ -2273,8 +2293,10 @@ fn compare_plot(
         gate
     };
     match *gate {
-        Gate::Points { axis, tolerance } => compare::stream_points(got, rows, tolerance, axis)
-            .map(|()| format!("{} point(s)", got.point_count())),
+        Gate::Points { axis, tolerance } => {
+            compare::stream_points(got, rows, tolerance, axis, resolution, alternates)
+                .map(|()| format!("{} point(s)", got.point_count()))
+        }
         Gate::Roots(tolerance) => {
             let want = stream::collect_plot(rows)?;
             compare::roots(got, &want, tolerance)
@@ -2368,9 +2390,11 @@ mod tests {
                     fs::create_dir_all(destination.parent().unwrap()).unwrap();
                     fs::copy(reference, destination).unwrap();
                 }
-                let target = fixtures::golden_path(&root, name);
-                fs::create_dir_all(target.parent().unwrap()).unwrap();
-                fs::copy(fixtures::golden_path(&workspace_root(), name), target).unwrap();
+                for target in fixtures::numerical_golden_paths(&root, name) {
+                    fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    let relative = target.strip_prefix(&root).unwrap();
+                    fs::copy(workspace_root().join(relative), &target).unwrap();
+                }
             }
             Self(root)
         }
@@ -2535,12 +2559,12 @@ mod tests {
             .unwrap()
             .into_iter()
             .flat_map(|p| {
-                let raw = fixtures::golden_path(
+                let paths = fixtures::numerical_golden_paths(
                     &workspace_root(),
                     p.file_stem().unwrap().to_str().unwrap(),
                 );
                 let reference = fixtures::reference_netlist_path(&workspace_root(), &p).unwrap();
-                [p, raw, reference]
+                [p, reference].into_iter().chain(paths)
             })
             .collect();
         let before: Vec<_> = paths.iter().map(|p| fs::read(p).unwrap()).collect();
@@ -2651,10 +2675,7 @@ mod tests {
             } else {
                 historical
             };
-            if name == "sens_bjt" {
-                fs::create_dir_all(alternative.parent().unwrap()).unwrap();
-                fs::write(&alternative, "not the selected reference").unwrap();
-            }
+            let other_bytes = (name == "sens_bjt").then(|| fs::read(&alternative).unwrap());
             let original = root.join(fixtures::NETLIST_DIR).join(format!("{name}.cir"));
             let reference = fixtures::reference_netlist_path(root, &original).unwrap();
             if reference != original && name != "sens_bjt" {
@@ -2670,7 +2691,9 @@ mod tests {
             golden::main(root, &c_command("check")).unwrap();
             run(root, Some(name)).unwrap();
             assert_eq!(fs::read(&selected).unwrap(), bytes);
-            if name == "sens_bjt" || reference != original {
+            if let Some(other_bytes) = other_bytes {
+                assert_eq!(fs::read(alternative).unwrap(), other_bytes);
+            } else if reference != original {
                 assert_eq!(
                     fs::read_to_string(alternative).unwrap(),
                     "not the selected reference"
@@ -2680,31 +2703,31 @@ mod tests {
     }
 
     #[test]
-    fn selected_bjt_reference_is_required_and_still_checked_strictly() {
+    fn every_bjt_capture_is_required_and_structurally_checked() {
         let temp = Temp::with(&["sens_bjt"]);
-        // On Linux keep the macOS reference present as well: a missing
-        // platform capture must be reported, never silently fall back to it.
-        let generic = temp.0.join("conformance/golden/sens_bjt.raw");
-        fs::copy(
-            workspace_root().join("conformance/golden/sens_bjt.raw"),
-            generic,
-        )
-        .unwrap();
-        let selected = fixtures::golden_path(&temp.0, "sens_bjt");
-        let original = fs::read_to_string(&selected).unwrap();
+        let paths = fixtures::numerical_golden_paths(&temp.0, "sens_bjt");
         run(&temp.0, Some("sens_bjt")).unwrap();
-        fs::remove_file(&selected).unwrap();
+        for path in &paths {
+            let original = fs::read_to_string(path).unwrap();
+            fs::remove_file(path).unwrap();
+            let error = run(&temp.0, Some("sens_bjt")).unwrap_err();
+            assert!(error.contains("reading"), "{error}");
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            fs::write(path, "not a rawfile").unwrap();
+            assert!(run(&temp.0, Some("sens_bjt")).is_err());
+            fs::write(path, original).unwrap();
+        }
+        // A prediction outside the recorded interval must still fail, even
+        // when both captures are present and their metadata is valid.
+        for path in &paths {
+            let mut raw = RawFile::parse(&fs::read_to_string(path).unwrap()).unwrap();
+            let plot = &mut raw.plots[0].plot;
+            let index = plot.variable_index("v(q1:rco)").unwrap();
+            plot.point_mut(0).unwrap()[index] = ngspice_rs::primitives::Complex::real(1.);
+            fs::write(path, raw.to_ascii().unwrap()).unwrap();
+        }
         let error = run(&temp.0, Some("sens_bjt")).unwrap_err();
-        assert!(error.contains("reading"), "{error}");
-        assert!(error.contains(&selected.display().to_string()), "{error}");
-
-        let mut raw = RawFile::parse(&original).unwrap();
-        let plot = &mut raw.plots[0].plot;
-        let index = plot.variable_index("v(q1:ise)").unwrap();
-        plot.point_mut(0).unwrap()[index] = ngspice_rs::primitives::Complex::ZERO;
-        fs::write(selected, raw.to_ascii().unwrap()).unwrap();
-        let error = run(&temp.0, Some("sens_bjt")).unwrap_err();
-        assert!(error.contains("v(q1:ise)"), "{error}");
+        assert!(error.contains("v(q1:rco)"), "{error}");
     }
 
     #[test]
