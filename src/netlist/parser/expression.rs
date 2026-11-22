@@ -26,7 +26,7 @@ use crate::netlist::token::{Token, TokenKind};
 
 pub(super) const C_REFERENCE: &str = "src/frontend/numparam/xpressn.c";
 
-/// Read-only position context plus the nesting counter.
+/// Position context, syntactic nesting, and remaining expression-tree budget.
 #[derive(Debug)]
 pub(super) struct Ctx<'a> {
     pub origin: SourcePosition<'a>,

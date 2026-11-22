@@ -724,3 +724,36 @@ fn macro_substitution_checks_height_and_amplification_before_cloning() {
     let error = literalize(&n).unwrap_err();
     assert!(error.to_string().contains("node limit"), "{error}");
 }
+
+#[test]
+fn wide_valid_pwl_constructs_resolves_and_compiles_on_bounded_stack() {
+    use std::fmt::Write as _;
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let points = 8192;
+            let mut body = "v1 in 0 1\nb1 o 0 v=pwl(v(in)".to_owned();
+            for i in 0..points {
+                write!(body, ",{i},{i}").unwrap();
+            }
+            body.push(')');
+            let start = std::time::Instant::now();
+            let n = parse(&body);
+            let parsed = start.elapsed();
+            assert_eq!(n, n.clone());
+            let written = write_netlist(&n).unwrap();
+            let reparsed = Parser::new()
+                .parse_deck(&parse_deck_text(Path::new("in.cir"), &written))
+                .unwrap();
+            assert!(semantic_diff(&n, &reparsed).is_none());
+            assert!(literalize(&n).is_ok());
+            assert!(ngspice_rs::devices::Circuit::from_netlist(&n).is_ok());
+            eprintln!(
+                "PWL {points} points: parsed {parsed:?}, full pipeline {:?}",
+                start.elapsed()
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

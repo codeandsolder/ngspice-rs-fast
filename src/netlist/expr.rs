@@ -144,7 +144,7 @@ impl Expr {
     pub(super) fn check_tree(&self, depth: usize, budget: &mut TreeBudget) -> SpiceResult<usize> {
         budget.charge(depth, 1, &self.span.start)?;
         let mut height = depth;
-        let mut child = |expr: &Self| {
+        let mut child = |expr: &Self| -> SpiceResult<()> {
             height = height.max(expr.check_tree(depth + 1, budget)?);
             Ok(())
         };
