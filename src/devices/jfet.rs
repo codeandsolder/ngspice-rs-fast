@@ -262,6 +262,40 @@ fn gate_diode(v: Real, vt_temp: Real, csat: Real, gmin: Real) -> (Real, Real) {
     (gmin.mul_add(v, current), conductance + gmin)
 }
 
+/// Smoothed maximum/minimum and partial derivatives of the maximum.
+pub(super) struct SmoothedExtrema {
+    pub(super) high: Real,
+    pub(super) low: Real,
+    pub(super) high_weights: [Real; 2],
+}
+
+/// The Statz gate-charge smoothing law used by JFET2 and MESFET.
+/// Retain the small correction and complementary derivative even when
+/// hypot(delta,width) rounds to abs(delta).
+pub(super) fn smoothed_extrema(a: Real, b: Real, width: Real) -> SmoothedExtrema {
+    let difference = a - b;
+    let square = difference.mul_add(difference, width * width);
+    let span = if square.is_normal() {
+        square.sqrt()
+    } else {
+        difference.hypot(width)
+    };
+    let scale = width / span;
+    let denominator = 2. * (1. + (difference / span).abs());
+    let correction = width * (scale / denominator);
+    let small_weight = scale * (scale / denominator);
+    let large_weight = 1. - small_weight;
+    SmoothedExtrema {
+        high: a.max(b) + correction,
+        low: a.min(b) - correction,
+        high_weights: if difference >= 0. {
+            [large_weight, small_weight]
+        } else {
+            [small_weight, large_weight]
+        },
+    }
+}
+
 impl Model {
     /// `jfetload.c`'s channel current and partials at normalized voltages.
     fn channel(&self, op: &Operating, vgs: Real, vgd: Real) -> Channel {
@@ -1540,6 +1574,21 @@ mod tests {
             let reverse = model.channel(&op, vgd, vgs).current;
             assert!((forward + reverse).abs() <= 1e-15, "{vgs} {vgd}");
         }
+    }
+
+    #[test]
+    fn smoothed_extrema_retain_the_small_branch_and_its_derivative() {
+        let forward = smoothed_extrema(1e16, 0., 1.);
+        let reverse = smoothed_extrema(0., 1e16, 1.);
+        for pair in [&forward, &reverse] {
+            assert_eq!(pair.high, 1e16);
+            assert!((pair.low + 2.5e-17).abs() < 1e-32);
+        }
+        assert!((forward.high_weights[1] - 2.5e-33).abs() < 1e-48);
+        assert_eq!(
+            forward.high_weights,
+            [reverse.high_weights[1], reverse.high_weights[0]]
+        );
     }
 
     #[test]
