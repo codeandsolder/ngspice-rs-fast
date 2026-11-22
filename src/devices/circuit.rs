@@ -2066,15 +2066,7 @@ impl Circuit {
     /// [`SpiceError::Circuit`] if `name` is not a resistor, or `supplied` is
     /// nonfinite, zero, or has a nonfinite conductance.
     pub fn resistor_override(&self, name: &str, supplied: Real) -> SpiceResult<ResistorOverride> {
-        let (index, _) = self
-            .resistor(name)
-            .ok_or_else(|| SpiceError::circuit(format!("{name} is not a resistor")))?;
-        if !supplied.is_finite() || supplied == 0.0 || !(1.0 / supplied).is_finite() {
-            return Err(SpiceError::circuit(format!(
-                "resistor {name}: supplied resistance must be finite and nonzero with finite conductance"
-            )));
-        }
-        Ok(ResistorOverride::new(self.topology_id()?, index, supplied))
+        self.bind_resistor_target(name)?.at_resistance(supplied)
     }
 
     /// The effective resistance (ohms) `target` stamps under `context`'s

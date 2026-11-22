@@ -981,6 +981,11 @@ fn resistance_only_preflight_validates_the_replacement_clamp() {
     // actual setter clamps them to 1e-12 before scale; validating an
     // unclamped scalar would incorrectly underflow the effective resistance.
     let mut c = circuit("i1 0 a 0\nr1 a 0 rm 1 scale=1e-290\n.model rm r");
+    let target = c.resistor_override("r1", 1e-200).unwrap();
+    let effective = c
+        .effective_resistance(&target, &AnalysisContext::default().model_context())
+        .unwrap();
+    assert_eq!(effective.to_bits(), (1e-12_f64 * 1e-290).to_bits());
     let result = run(&mut c, &["r1", "1e-200", "2e-200", "1e-200"]).unwrap();
     assert_eq!(result.point_count(), 2);
     assert_column(&result, "v(a)", &[0., 0.], 0., 0.);
