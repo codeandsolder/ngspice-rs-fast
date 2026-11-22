@@ -507,3 +507,49 @@ fn repeated_batches_and_late_ordinary_state_failure_preserve_finalized_bindings(
     assert_eq!(c.device_count(), 9);
     assert_eq!(c.state_len(), 4);
 }
+
+#[test]
+fn mixed_urc_txl_and_normal_records_share_the_complete_deck_budget() {
+    use ngspice_rs::devices::{ElaborationLimits, MutualLimits};
+    let body = "u1 a b 0 m l=1m n=2\ny1 b 0 c 0 ym\nrkeep c 0 1k\n.model m urc\n.model ym txl r=1e9 l=1e-2 c=1e-9 g=0 length=3e-11";
+    let netlist = parse(body).unwrap();
+    let limits = ElaborationLimits {
+        devices: 16,
+        nodes: 8,
+        state_slots: 14,
+    };
+    let c = Circuit::from_netlist_with_limits(
+        &netlist,
+        &ModelContext::default(),
+        MutualLimits::default(),
+        limits,
+    )
+    .unwrap();
+    assert_eq!(c.device_count(), limits.devices);
+    assert_eq!(c.nodes().len() - 1, limits.nodes);
+    assert_eq!(c.state_len(), limits.state_slots);
+    assert_eq!(names(&c), names(&circuit(body).unwrap()));
+    for limit in [
+        ElaborationLimits {
+            devices: 15,
+            ..limits
+        },
+        ElaborationLimits { nodes: 7, ..limits },
+        ElaborationLimits {
+            state_slots: 13,
+            ..limits
+        },
+    ] {
+        let error = Circuit::from_netlist_with_limits(
+            &netlist,
+            &ModelContext::default(),
+            MutualLimits::default(),
+            limit,
+        )
+        .unwrap_err();
+        assert!(
+            message(&error).contains("elaboration resource limit"),
+            "{error}"
+        );
+    }
+}

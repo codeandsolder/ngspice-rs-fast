@@ -95,6 +95,14 @@ impl ElaborationLimits {
         NodeId::from_index(size.nodes).map_err(|_| {
             resource_error(location, "node count exceeds compact node identity range")
         })?;
+        std::alloc::Layout::array::<super::circuit::ElaboratedDevice>(size.devices)
+            .map_err(|_| resource_error(location, "device storage allocation layout overflows"))?;
+        let node_records = size
+            .nodes
+            .checked_add(1)
+            .ok_or_else(|| resource_error(location, "node record count overflows"))?;
+        std::alloc::Layout::array::<crate::primitives::Node>(node_records)
+            .map_err(|_| resource_error(location, "node storage allocation layout overflows"))?;
         std::alloc::Layout::array::<Real>(size.states)
             .map_err(|_| resource_error(location, "state storage allocation layout overflows"))?;
         Ok(())
@@ -256,6 +264,11 @@ mod tests {
         assert!(
             unrestricted
                 .check(ElaborationSize::new(0, 0, usize::MAX), None)
+                .is_err()
+        );
+        assert!(
+            unrestricted
+                .check(ElaborationSize::new(usize::MAX, 0, 0), None)
                 .is_err()
         );
         if usize::BITS > u32::BITS {
