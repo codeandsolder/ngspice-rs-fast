@@ -376,56 +376,72 @@ impl StepHistory {
     }
 }
 
-/// The variable-step Gear (BDF) corrector of `order` on the points
-/// `t_{n+1} - s_i`, `s_0 = 0`, `s_i = deltas[0] + ... + deltas[i - 1]`.
+/// An exact binary64 power of two, including subnormals. The caller supplies
+/// an exponent within the representable range.
+fn span_power(exponent: i32) -> Real {
+    if exponent >= -1022 {
+        Real::from_bits(u64::from((exponent + 1023).cast_unsigned()) << 52)
+    } else {
+        Real::from_bits(1_u64 << (exponent + 1074).cast_unsigned())
+    }
+}
+
+/// Positive step interval as a sum scaled by the largest binary exponent.
+/// Summing separately avoids losing the interval between adjacent old
+/// timestamps when the trial step is much larger.
+fn scaled_span(steps: &[Real]) -> (Real, i32) {
+    let largest = steps.iter().copied().fold(0., Real::max);
+    let exponent = crate::primitives::numeric::binary_exponent(largest).unwrap_or(0);
+    let scale = span_power(exponent);
+    (steps.iter().map(|&step| step / scale).sum(), exponent)
+}
+
+/// Finish a scaled coefficient with one final rounding into the subnormal
+/// range. The intermediate significands of at most six span ratios stay
+/// bounded independently of the original step sizes.
+fn finish_weight(value: Real, exponent: i32) -> Real {
+    let Some(local) = crate::primitives::numeric::binary_exponent(value) else {
+        return value;
+    };
+    let normalized = value / span_power(local);
+    match exponent + local {
+        ..=-1076 => 0_f64.copysign(value),
+        -1075 => (normalized * 0.5) * span_power(-1074),
+        e @ -1074..=1023 => normalized * span_power(e),
+        _ => Real::INFINITY.copysign(value),
+    }
+}
+
+/// The variable-step Gear (BDF) corrector on points at distances
+/// `s_i = deltas[0] + ... + deltas[i-1]` from the trial point.
 ///
-/// `nicomcof.c` solves the Vandermonde system `sum_i ag_i (s_i/h)^j =
-/// -delta_{j1}/h`, `j = 0..=order`, in step-normalized form. The
-/// corrector follows the reference's unpivoted LU elimination and
-/// substitution, with fused product/subtraction to reduce rounding error.
+/// Differentiate the Lagrange basis at the trial point directly:
+/// `ag_0 = sum_i 1/s_i`, `ag_i = -(1/s_i) product_{j!=i} s_j/(s_j-s_i)`.
+/// Unlike the unpivoted Vandermonde solve in nicomcof.c, this does not raise
+/// long/short step ratios to high powers or subtract nearly equal nodes.
+/// Form differences from their original positive intervals and retain the
+/// binary exponent separately until the final coefficient.
 fn gear_corrector(deltas: &[Real; HISTORY_LEN + 1], order: usize) -> [Real; HISTORY_LEN + 1] {
-    // nicomcof.c, `case GEAR`, verbatim: the corrector matrix built from
-    // (sum of h)/h, LU-decomposed without pivoting (its first column is
-    // 1 0 0 ...), then forward and backward substitution on CKTag.
-    let delta = deltas[0];
-    let mut mat = [[0.0; HISTORY_LEN + 1]; HISTORY_LEN + 1];
-    let mut ag = [0.0; HISTORY_LEN + 1];
-    ag[1] = -1. / delta;
-    for entry in mat[0].iter_mut().take(order + 1) {
-        *entry = 1.;
-    }
-    let mut arg = 0.;
+    let mut ag = [0.; HISTORY_LEN + 1];
+    let mut spans = [(0., 0); HISTORY_LEN + 1];
     for i in 1..=order {
-        arg += deltas[i - 1];
-        let normalized = arg / delta;
-        let mut arg1 = 1.;
-        for row in mat.iter_mut().take(order + 1).skip(1) {
-            arg1 *= normalized;
-            row[i] = arg1;
-        }
+        spans[i] = scaled_span(&deltas[..i]);
+        let (mantissa, exponent) = spans[i];
+        ag[0] += finish_weight(1. / mantissa, -exponent);
     }
     for i in 1..=order {
-        let (head, tail) = mat[..=order].split_at_mut(i + 1);
-        let pivot = &head[i];
-        for row in tail {
-            row[i] /= pivot[i];
-            let multiplier = row[i];
-            for (entry, &p) in row[i + 1..=order].iter_mut().zip(&pivot[i + 1..=order]) {
-                *entry = (-multiplier).mul_add(p, *entry);
+        let (span, power) = spans[i];
+        let mut value = -1. / span;
+        let mut exponent = -power;
+        for (j, &(numerator, numerator_power)) in spans.iter().enumerate().take(order + 1).skip(1) {
+            if j != i {
+                let (interval, interval_power) = scaled_span(&deltas[i.min(j)..i.max(j)]);
+                let denominator = if j < i { -interval } else { interval };
+                value *= numerator / denominator;
+                exponent += numerator_power - interval_power;
             }
         }
-    }
-    for i in 1..=order {
-        for j in i + 1..=order {
-            ag[j] = (-mat[j][i]).mul_add(ag[i], ag[j]);
-        }
-    }
-    ag[order] /= mat[order][order];
-    for i in (0..order).rev() {
-        for j in i + 1..=order {
-            ag[i] = (-mat[i][j]).mul_add(ag[j], ag[i]);
-        }
-        ag[i] /= mat[i][i];
+        ag[i] = finish_weight(value, exponent);
     }
     ag
 }
@@ -941,13 +957,34 @@ mod tests {
         for (order, expected) in (1..=6).zip(expected) {
             let ag = super::gear_corrector(&deltas, order);
             // Independent exact rational Lagrange derivatives, rounded only
-            // once to binary64. The small Vandermonde solve need not match
-            // either the exact rounding or C's intermediate rounding bitwise.
+            // once to binary64. The direct span formula need not match
+            // the exact rounding bitwise.
             for (actual, reference) in ag.map(f64::to_bits).into_iter().zip(expected) {
                 assert!(
                     actual.abs_diff(reference) <= 4,
                     "order {order}: {actual:x} versus {reference:x}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn gear_weights_remain_accurate_for_uneven_and_extreme_steps() {
+        // Independent exact rational reference for the two-point historical
+        // interval: order 2 on s1=h and s2=h+k.
+        for k in [1e-15, 1e-12, 1e-6, 1e6, 1e12, 1e15] {
+            let d = [1., k, 1., 1., 1., 1., 1.];
+            let a = super::gear_corrector(&d, 2);
+            assert!((a[0] / (1. + 1. / (1. + k)) - 1.).abs() <= 4e-16);
+            assert!((a[1] / (-(1. + k) / k) - 1.).abs() <= 4e-16);
+            assert!((a[2] / (1. / (k * (1. + k))) - 1.).abs() <= 4e-16);
+        }
+        let ordinary = super::gear_corrector(&[1.; 7], 6);
+        for scale in [1e-300, 1e300, 1e308] {
+            let huge = super::gear_corrector(&[scale; 7], 6);
+            for (actual, expected) in huge.iter().zip(ordinary) {
+                assert!(actual.is_finite());
+                assert!((actual * scale - expected).abs() <= 2e-13 * (1. + expected.abs()));
             }
         }
     }
