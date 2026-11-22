@@ -97,7 +97,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
 
 /// C `CONSTvt0`: the thermal voltage at `REFTEMP`, `CONSTboltz * REFTEMP /
 /// CHARGE` (`main.c`). MES uses it whatever the circuit temperature.
@@ -370,7 +370,7 @@ pub struct Mesfet {
 impl Mesfet {
     pub(crate) fn instantiate(
         i: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         resolved: &ResolvedModel<'_>,
         _context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {

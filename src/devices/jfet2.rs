@@ -104,7 +104,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
 
 /// `psmodel.c` `FX`: below `FX` thermal voltages a junction exponential is
 /// dropped (and `FX * vst` is the numerical cut-off of the channel).
@@ -649,7 +649,7 @@ pub struct Jfet2 {
 impl Jfet2 {
     pub(crate) fn instantiate(
         i: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         resolved: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {

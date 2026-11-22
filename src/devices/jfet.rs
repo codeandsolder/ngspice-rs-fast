@@ -82,7 +82,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind};
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
 pub(super) use crate::devices::nonlinear::thermal::{
     BOLTZMANN, CELSIUS_TO_KELVIN, CHARGE, K_OVER_Q, REFTEMP,
@@ -383,7 +383,7 @@ pub struct Jfet {
 impl Jfet {
     pub(crate) fn instantiate(
         i: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         resolved: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -743,34 +743,34 @@ pub(super) fn instance_setters(
 /// first): returns the terminal list and the intrinsic d', g, s'.
 pub(super) fn intern_nodes(
     i: &DeviceInstance,
-    nodes: &mut NodeTable,
+    nodes: &mut NodeAppend<'_>,
     rd: Real,
     rs: Real,
 ) -> SpiceResult<(Vec<NodeId>, [NodeId; 3])> {
-    let mut staged = nodes.clone();
-    let external: Vec<NodeId> = i
-        .nodes
-        .iter()
-        .map(|n| staged.intern(n))
-        .collect::<SpiceResult<Vec<_>>>()?;
-    let mut terminals = external.clone();
-    let mut inner = [external[0], external[1], external[2]];
-    for (index, resistance, suffix) in [(2, rs, "source"), (0, rd, "drain")] {
-        if resistance != 0. {
-            let name = format!("{}#{suffix}", i.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "JFET internal-node name collision: {name}"
-                )));
+    nodes.transaction(|staged| {
+        let external: Vec<NodeId> = i
+            .nodes
+            .iter()
+            .map(|n| staged.intern(n))
+            .collect::<SpiceResult<Vec<_>>>()?;
+        let mut terminals = external.clone();
+        let mut inner = [external[0], external[1], external[2]];
+        for (index, resistance, suffix) in [(2, rs, "source"), (0, rd, "drain")] {
+            if resistance != 0. {
+                let name = format!("{}#{suffix}", i.name);
+                if staged.get(&name).is_some() {
+                    return Err(SpiceError::circuit(format!(
+                        "JFET internal-node name collision: {name}"
+                    )));
+                }
+                let prime = staged.intern(&name)?;
+                staged.set_kind(prime, NodeKind::Internal)?;
+                terminals.push(prime);
+                inner[index] = prime;
             }
-            let prime = staged.intern(&name)?;
-            staged.set_kind(prime, NodeKind::Internal);
-            terminals.push(prime);
-            inner[index] = prime;
         }
-    }
-    *nodes = staged;
-    Ok((terminals, inner))
+        Ok((terminals, inner))
+    })
 }
 
 /// The model's nominal and the instance's temperature in Kelvin: `TNOM`

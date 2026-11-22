@@ -22,7 +22,7 @@ pub mod numeric;
 pub mod value;
 
 pub use error::{SourceLoc, SpiceError, SpiceResult};
-pub use node::{GROUND_ALIAS, GROUND_NAME, Node, NodeId, NodeKind, NodeTable};
+pub use node::{GROUND_ALIAS, GROUND_NAME, Node, NodeAppend, NodeId, NodeKind, NodeTable};
 pub use numeric::{
     c_integer, exact_nonnegative_integer, exact_signed_integer, truncating_signed_integer,
 };
