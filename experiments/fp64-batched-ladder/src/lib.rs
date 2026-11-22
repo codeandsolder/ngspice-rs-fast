@@ -26,7 +26,7 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    pub async fn new(name: &str, shader: &str) -> Result<Self> {
+    pub async fn new(name: &str, shader: &str, shared_bytes: u32) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -43,9 +43,19 @@ impl Gpu {
             adapter.features().contains(wgpu::Features::SHADER_F64),
             "adapter lacks FP64"
         );
+        let mut required_limits = wgpu::Limits::default();
+        required_limits.max_compute_workgroup_storage_size = required_limits
+            .max_compute_workgroup_storage_size
+            .max(shared_bytes);
+        ensure!(
+            required_limits.max_compute_workgroup_storage_size
+                <= adapter.limits().max_compute_workgroup_storage_size,
+            "adapter lacks requested workgroup storage ({shared_bytes} bytes)"
+        );
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 required_features: wgpu::Features::SHADER_F64,
+                required_limits,
                 ..Default::default()
             })
             .await?;

@@ -100,13 +100,14 @@ impl Plan {
             assert_eq!((kind, row), (PIVOT, k as u32));
             cursor += 1;
             let mut neighbors = Vec::new();
+            let update_start = groups.len() as u32;
             while cursor < self.tape.len() && self.tape[cursor][0] == MULTIPLIER {
                 let [_, handle, row, _] = self.tape[cursor];
                 cursor += 1;
                 let start = groups.len() as u32;
                 while self.tape[cursor][0] == UPDATE {
                     let [_, dest, source, _] = self.tape[cursor];
-                    groups.push([dest, source, 0, 0]);
+                    groups.push([dest, source, neighbors.len() as u32, 0]);
                     cursor += 1;
                 }
                 assert_eq!(self.tape[cursor], [STORE, handle, 0, 0]);
@@ -115,7 +116,7 @@ impl Plan {
             }
             let start = groups.len() as u32;
             groups.extend(neighbors);
-            groups[k + 1] = [diag, start, groups.len() as u32, 0];
+            groups[k + 1] = [diag, start, groups.len() as u32, update_start];
         }
         // Reserve one range per original row; every entry in a row lists
         // the other column and its original lower-triangle coefficient.
@@ -503,16 +504,44 @@ fn main() -> Result<()> {
     let gpu = pollster::block_on(Gpu::new(
         "Complex FP64 RC mesh",
         include_str!("../mesh.wgsl"),
+        0,
     ))?;
     let grouped = plan.grouped();
     let grouped_gpu = pollster::block_on(Gpu::new("Grouped complex FP64", &grouped_shader(false)))?;
     let mixed_gpu = pollster::block_on(Gpu::new(
         "Grouped FP32 with FP64 refinement",
         &grouped_shader(true),
+        0,
     ))?;
+    const LOCAL_SYSTEMS: usize = 4;
+    let max_neighbours = grouped[1..=N]
+        .iter()
+        .map(|col| col[2] - col[1])
+        .max()
+        .unwrap() as usize;
+    let local_bytes =
+        ((plan.entries.len() + N + max_neighbours) * LOCAL_SYSTEMS * size_of::<[f64; 2]>()) as u32;
+    let local_source = include_str!("../mesh_local.wgsl")
+        .replace(
+            "MATRIX_CELLS",
+            &(plan.entries.len() * LOCAL_SYSTEMS).to_string(),
+        )
+        .replace("RHS_CELLS", &(N * LOCAL_SYSTEMS).to_string())
+        .replace(
+            "MULTIPLIER_CELLS",
+            &(max_neighbours * LOCAL_SYSTEMS).to_string(),
+        )
+        .replace("ROW_COUNT", &N.to_string())
+        .replace("ENTRY_COUNT", &plan.entries.len().to_string());
+    let local_gpu = pollster::block_on(Gpu::new(
+        "Workgroup-resident complex FP64",
+        &local_source,
+        local_bytes,
+    ))?;
+    println!("local shared memory bytes: {local_bytes}");
     println!("persistent CPU workers: {}", rayon::current_num_threads());
     println!(
-        "systems,scalar_ms,simd_ms,parallel_simd_ms,grouped_simd_ms,grouped_parallel_simd_ms,gpu_resident_ms,gpu_amortized_ms,gpu_roundtrip_ms,grouped_resident_ms,grouped_amortized_ms,grouped_roundtrip_ms,mixed_resident_ms,mixed_amortized_ms,mixed_roundtrip_ms,mixed_error,mixed_backward,max_solution_error,max_backward_error"
+        "systems,scalar_ms,simd_ms,parallel_simd_ms,grouped_simd_ms,grouped_parallel_simd_ms,gpu_resident_ms,gpu_amortized_ms,gpu_roundtrip_ms,grouped_resident_ms,grouped_amortized_ms,grouped_roundtrip_ms,mixed_resident_ms,mixed_amortized_ms,mixed_roundtrip_ms,mixed_error,mixed_backward,local_resident_ms,local_amortized_ms,local_roundtrip_ms,max_solution_error,max_backward_error"
     );
     for groups in [1_u32, 4, 16, 64] {
         let input = Input::new(&plan, groups as usize);
@@ -602,16 +631,24 @@ fn main() -> Result<()> {
             groups,
         )?;
         let (me, mb) = input.check(&plan, &x)?;
+        let (lr, la, lt) = local_gpu.trial(
+            &[&input.matrix, &input.rhs],
+            &[x.len()],
+            Some(&grouped),
+            &mut x,
+            groups * (TILE / LOCAL_SYSTEMS) as u32,
+        )?;
+        let (le, lb) = input.check(&plan, &x)?;
         println!(
-            "{},{:.4},{:.4},{:.4},{:.4},{:.4},{resident:.4},{amortized:.4},{roundtrip:.4},{gr:.4},{ga:.4},{gt:.4},{mr:.4},{ma:.4},{mt:.4},{me:.3e},{mb:.3e},{:.3e},{:.3e}",
+            "{},{:.4},{:.4},{:.4},{:.4},{:.4},{resident:.4},{amortized:.4},{roundtrip:.4},{gr:.4},{ga:.4},{gt:.4},{mr:.4},{ma:.4},{mt:.4},{me:.3e},{mb:.3e},{lr:.4},{la:.4},{lt:.4},{:.3e},{:.3e}",
             groups * TILE as u32,
             times[0],
             times[1],
             times[2],
             times[3],
             times[4],
-            error.max(e).max(ge).max(me),
-            backward.max(r).max(gb).max(mb)
+            error.max(e).max(ge).max(me).max(le),
+            backward.max(r).max(gb).max(mb).max(lb)
         );
     }
     Ok(())
