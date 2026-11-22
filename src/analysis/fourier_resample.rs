@@ -20,7 +20,10 @@ fn failure(message: &str) -> SpiceError {
 }
 
 enum Stencil {
-    Direct(Location),
+    Direct {
+        at: Real,
+        location: Location,
+    },
     Polynomial {
         start: usize,
         weights: Range<usize>,
@@ -32,6 +35,7 @@ enum Stencil {
 pub(super) struct PolynomialPlan {
     stencils: Vec<Stencil>,
     weights: Vec<Real>,
+    input_len: usize,
 }
 
 impl PolynomialPlan {
@@ -41,28 +45,56 @@ impl PolynomialPlan {
                 "insufficient samples for the requested polynomial degree",
             ));
         }
+        let grid_axis =
+            OrderedAxis::borrowed(grid).map_err(|_| failure("invalid polynomial grid"))?;
+        if grid_axis.has_duplicates() {
+            return Err(failure("polynomial grid is not strictly increasing"));
+        }
         let times = axis.as_slice();
-        let jumps: Vec<_> = times
-            .windows(2)
-            .enumerate()
-            .filter_map(|(i, pair)| same_coordinate(pair[0], pair[1]).then_some(i))
-            .collect();
-        let mut stencils = Vec::with_capacity(grid.len());
-        let mut weights = Vec::with_capacity(grid.len() * (degree + 1));
+        let mut jumps = Vec::new();
+        if degree > 1 {
+            let boundaries = || {
+                times
+                    .windows(2)
+                    .enumerate()
+                    .filter_map(|(i, pair)| same_coordinate(pair[0], pair[1]).then_some(i))
+            };
+            jumps
+                .try_reserve_exact(boundaries().count())
+                .map_err(|_| failure("cannot allocate polynomial jump boundaries"))?;
+            jumps.extend(boundaries());
+        }
+        let mut stencils = Vec::new();
+        stencils
+            .try_reserve_exact(grid.len())
+            .map_err(|_| failure("cannot allocate polynomial stencils"))?;
+        let mut weights = Vec::new();
+        if degree > 1 {
+            let capacity = grid
+                .len()
+                .checked_mul(degree + 1)
+                .ok_or_else(|| failure("polynomial weight count overflows"))?;
+            weights
+                .try_reserve_exact(capacity)
+                .map_err(|_| failure("cannot allocate polynomial weights"))?;
+        }
         let mut scratch = [0.; MAX_ORDER];
         for &x in grid {
             let location = axis
                 .locate(x)
                 .ok_or_else(|| failure("polynomial grid outside the time axis"))?;
             let Location::Between(pair) = location else {
-                stencils.push(Stencil::Direct(location));
+                stencils.push(Stencil::Direct { at: x, location });
                 continue;
             };
             let split = jumps.partition_point(|&left| left < pair.left);
             let lo = if split == 0 { 0 } else { jumps[split - 1] + 1 };
             let hi = jumps.get(split).map_or(times.len(), |&left| left + 1);
             let max_order = (degree + 1).min(hi - lo);
-            let mut stencil = Stencil::Direct(Location::Between(pair));
+            let mut stencil = Stencil::Direct {
+                at: x,
+                location: Location::Between(pair),
+            };
             for order in (3..=max_order).rev() {
                 let start = pair
                     .right()
@@ -90,29 +122,33 @@ impl PolynomialPlan {
             // continuous spans too short for the requested polynomial.
             stencils.push(stencil);
         }
-        Ok(Self { stencils, weights })
+        Ok(Self {
+            stencils,
+            weights,
+            input_len: times.len(),
+        })
     }
 
-    pub(super) fn sample(&self, grid: &[Real], input: &[Real]) -> SpiceResult<Vec<Real>> {
+    pub(super) fn sample(&self, input: &[Real]) -> SpiceResult<Vec<Real>> {
+        if input.len() != self.input_len {
+            return Err(failure("polynomial plan and input dimensions disagree"));
+        }
         self.stencils
             .iter()
-            .zip(grid)
-            .map(|(stencil, &x)| {
+            .map(|stencil| {
                 let value = match stencil {
-                    Stencil::Direct(location) => {
-                        location
-                            .sample(x, |i| Ok(input[i]))
-                            .map_err(|error| match error {
-                                SampleError::Discontinuous => {
-                                    failure("polynomial grid meets a discontinuity")
-                                }
-                                SampleError::OutOfRange => {
-                                    failure("polynomial grid outside the time axis")
-                                }
-                                SampleError::Nonfinite => failure("nonfinite linear interpolation"),
-                                SampleError::Operand(error) => error,
-                            })?
-                    }
+                    Stencil::Direct { at, location } => location
+                        .sample(*at, |i| Ok(input[i]))
+                        .map_err(|error| match error {
+                            SampleError::Discontinuous => {
+                                failure("polynomial grid meets a discontinuity")
+                            }
+                            SampleError::OutOfRange => {
+                                failure("polynomial grid outside the time axis")
+                            }
+                            SampleError::Nonfinite => failure("nonfinite linear interpolation"),
+                            SampleError::Operand(error) => error,
+                        })?,
                     Stencil::Polynomial {
                         start,
                         weights,
@@ -136,7 +172,9 @@ impl PolynomialPlan {
     pub(super) fn budget(rows: usize, count: usize, order: usize) -> (usize, usize) {
         let index_cost = rows.checked_ilog2().unwrap_or(0) as usize + 1;
         let polynomial_cost = (3..=order).map(|n| n * n).sum::<usize>();
-        let work = rows.saturating_add(count.saturating_mul(2 * index_cost + polynomial_cost));
+        let work = rows
+            .saturating_mul(2)
+            .saturating_add(count.saturating_mul(2 * index_cost + polynomial_cost));
         let bytes = rows
             .saturating_mul(size_of::<usize>())
             .saturating_add(count.saturating_mul(size_of::<Stencil>() + order * size_of::<Real>()));
@@ -176,7 +214,9 @@ fn weights_for(nodes: &[Real], x: Real, weights: &mut [Real]) -> bool {
     // error by 8 * order * epsilon * norm times the sample scale.
     // Reduce order rather than evaluate an ill-conditioned stencil whose
     // estimated rounding error exceeds sqrt(epsilon) of that scale.
-    let order = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+    let Ok(order) = u32::try_from(nodes.len()) else {
+        return false;
+    };
     let error_bound = 8. * Real::from(order) * Real::EPSILON * norm;
     error_bound <= Real::EPSILON.sqrt()
 }
@@ -231,7 +271,7 @@ mod tests {
         let grid = [0., 0.5, 2., 3.5, 8., 9.].map(|x| offset + x);
         let axis = OrderedAxis::borrowed(&times).unwrap();
         let plan = PolynomialPlan::new(&axis, &grid, 3).unwrap();
-        let actual = plan.sample(&grid, &values).unwrap();
+        let actual = plan.sample(&values).unwrap();
         for (&t, got) in grid.iter().zip(actual) {
             let want = polynomial(t);
             assert!((got - want).abs() <= 16. * f64::EPSILON * want.abs().max(1.));
@@ -244,18 +284,15 @@ mod tests {
         let grid = [0., 0.5, 1.5, 2.5, 3.5, 4.];
         let values = [-0., 1., 4., 10., 11., 14.];
         let plan = PolynomialPlan::new(&axis, &grid, 4).unwrap();
-        let result = plan.sample(&grid, &values).unwrap();
+        let result = plan.sample(&values).unwrap();
         assert_eq!(result[0].to_bits(), (-0_f64).to_bits());
         for (got, want) in result[1..].iter().zip([0.25, 2.25, 10.25, 12.25, 14.]) {
             assert!((got - want).abs() <= 8. * f64::EPSILON * want);
         }
         let exact = [2.];
         let plan = PolynomialPlan::new(&axis, &exact, 4).unwrap();
-        assert!(plan.sample(&exact, &values).is_err());
-        assert_eq!(
-            plan.sample(&exact, &[0., 1., 4., 4., 5., 7.]).unwrap(),
-            [4.]
-        );
+        assert!(plan.sample(&values).is_err());
+        assert_eq!(plan.sample(&[0., 1., 4., 4., 5., 7.]).unwrap(), [4.]);
     }
 
     #[test]
@@ -264,7 +301,7 @@ mod tests {
         let grid = [0.5];
         let axis = OrderedAxis::borrowed(&times).unwrap();
         let plan = PolynomialPlan::new(&axis, &grid, 4).unwrap();
-        assert_eq!(plan.sample(&grid, &times).unwrap(), [0.5]);
+        assert_eq!(plan.sample(&times).unwrap(), [0.5]);
         assert!(plan.weights.len() < 5);
     }
 
@@ -285,7 +322,7 @@ mod tests {
         let grid = [0.0039949, 0.003995];
         let axis = OrderedAxis::borrowed(&times).unwrap();
         let plan = PolynomialPlan::new(&axis, &grid, 3).unwrap();
-        let result = plan.sample(&grid, &values).unwrap();
+        let result = plan.sample(&values).unwrap();
         // Decimal 80-digit Lagrange evaluation of the exact binary64 inputs.
         // C's absolute-power fit differs from these by about 3e-13 and 8e-13.
         for (got, want) in result

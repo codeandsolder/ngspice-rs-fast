@@ -820,7 +820,14 @@ struct RowChain {
 struct RowEntry {
     col: ExternalIndex,
     internal_col: InternalIndex,
-    value: Complex,
+    real: CompensatedSum,
+    imaginary: CompensatedSum,
+}
+
+impl RowEntry {
+    const fn value(&self) -> Complex {
+        Complex::new(self.real.total(), self.imaginary.total())
+    }
 }
 
 /// Reusable sparse perturbation assembly.
@@ -891,13 +898,14 @@ impl DeltaMatrix {
             self.row_entries.push(RowEntry {
                 col,
                 internal_col: stamp.internal_col,
-                value: zero,
+                real: CompensatedSum::with_initial(zero.re),
+                imaginary: CompensatedSum::with_initial(zero.im),
             });
             i
         });
-        let value = &mut self.row_entries[i].value;
-        value.re += stamp.value.re;
-        value.im += stamp.value.im;
+        let entry = &mut self.row_entries[i];
+        entry.real.add(stamp.value.re);
+        entry.imaginary.add(stamp.value.im);
     }
 
     /// Fold the base load, negate it, then add the perturbed load. The
@@ -911,8 +919,10 @@ impl DeltaMatrix {
             next = stamp.next;
         }
         for entry in &mut self.row_entries {
-            entry.value.re *= -1.;
-            entry.value.im *= -1.;
+            // Negate both components of the accumulator. Rounding the base
+            // sum before subtracting would lose a small derivative entirely.
+            entry.real.negate();
+            entry.imaginary.negate();
         }
         while let Some(i) = next {
             let stamp = self.stamps[i];
@@ -978,7 +988,7 @@ impl PerturbedAssembly<'_> {
             // but compensate each component of the cancellation-prone dot.
             if self.matrix.rows[row].first.is_some() {
                 for entry in self.matrix.fold_row(row, self.base_count) {
-                    let product = entry.value * x[entry.col.0];
+                    let product = entry.value() * x[entry.col.0];
                     real.add(product.re);
                     imaginary.add(product.im);
                 }
@@ -1874,7 +1884,7 @@ mod tests {
     }
 
     #[test]
-    fn separate_base_and_perturbed_reductions_preserve_duplicates_and_signed_zeros() {
+    fn separate_base_and_perturbed_reductions_retain_small_differences_and_signed_zeros() {
         use super::DeltaMatrix;
         use crate::primitives::Complex;
         let mut matrix = DeltaMatrix::new(4);
@@ -1895,13 +1905,13 @@ mod tests {
             .unwrap();
         let cutoff = perturbed.base_count;
         assert_eq!(
-            perturbed.matrix.fold_row(0, cutoff)[0].value.re.to_bits(),
-            2_f64.to_bits()
+            perturbed.matrix.fold_row(0, cutoff)[0].value().re.to_bits(),
+            1_f64.to_bits()
         );
         for row in [1, 2] {
             let entry = &perturbed.matrix.fold_row(row, cutoff)[0];
-            assert_eq!(entry.value.re.to_bits(), (-0_f64).to_bits());
-            assert_eq!(entry.value.im.to_bits(), (-0_f64).to_bits());
+            assert_eq!(entry.value().re.to_bits(), (-0_f64).to_bits());
+            assert_eq!(entry.value().im.to_bits(), (-0_f64).to_bits());
         }
         let mut seen = Vec::new();
         perturbed
@@ -1910,11 +1920,36 @@ mod tests {
         assert_eq!(
             seen,
             [
-                (0, Complex::real(2.)),
+                (0, Complex::real(1.)),
                 (1, Complex::ZERO),
                 (2, Complex::ZERO),
                 (3, Complex::ZERO)
             ]
+        );
+    }
+
+    #[test]
+    fn perturbation_does_not_round_the_base_sum_before_subtraction() {
+        use super::DeltaMatrix;
+        use crate::primitives::Complex;
+        let mut matrix = DeltaMatrix::new(1);
+        let mut base = matrix.begin([(0, 0)]).unwrap();
+        base.add([
+            stamp(0, 0, Complex::new(1e16, -1e16)),
+            stamp(0, 0, Complex::new(1., -1.)),
+        ])
+        .unwrap();
+        let mut perturbed = base.negate();
+        perturbed
+            .add([
+                stamp(0, 0, Complex::new(1e16, -1e16)),
+                stamp(0, 0, Complex::new(2., -2.)),
+            ])
+            .unwrap();
+        let cutoff = perturbed.base_count;
+        assert_eq!(
+            perturbed.matrix.fold_row(0, cutoff)[0].value(),
+            Complex::new(1., -1.)
         );
     }
 

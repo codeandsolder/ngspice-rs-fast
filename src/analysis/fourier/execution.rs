@@ -16,14 +16,10 @@ use crate::primitives::{AnalysisKind, Real, SpiceError, SpiceResult};
 /// per requested harmonic, with the same maximum of 400 subintervals.
 const GRID_FLOOR: u32 = 50;
 
-/// How many ULPs of the quadrature's own sums a fundamental amplitude must
-/// exceed before a total harmonic distortion can be formed from it.
-///
-/// The sums accumulate at most `4 * MAX_HARMONICS + 1 = 401` terms, so a trace
-/// with no fundamental content leaves an amplitude of a few `f64::EPSILON`
-/// times the trace's own magnitude there; a THD formed from that residue would
-/// be pure noise (C prints whatever it computes). This is the arithmetic's
-/// resolution, not a physical tolerance.
+/// A fundamental amplitude must exceed the roundoff scale of the
+/// projection before THD is defined. Reduced phases and compensated sums
+/// prevent long grids or high DFT bins from accumulating large phase
+/// arguments or sequential summation error.
 const NOISE_ULPS: Real = 16.0;
 
 /// A positioned failure for a request this plot cannot answer.
@@ -451,8 +447,7 @@ fn sample(
 struct ConfiguredPlan {
     window: FourierWindow,
     harmonics: u32,
-    grid: Option<Vec<Real>>,
-    degree: usize,
+    polynomial: Option<PolynomialPlan>,
 }
 
 impl ConfiguredPlan {
@@ -503,7 +498,7 @@ impl ConfiguredPlan {
                 "Fourier grid undersamples requested harmonics".into(),
             ));
         }
-        let grid = if settings.polydegree == 0 {
+        let polynomial = if settings.polydegree == 0 {
             None
         } else {
             let step = (to - from) / Real::from(count);
@@ -520,13 +515,16 @@ impl ConfiguredPlan {
                 }
                 grid.push(x);
             }
-            Some(grid)
+            Some(PolynomialPlan::new(
+                axis,
+                &grid,
+                settings.polydegree as usize,
+            )?)
         };
         Ok(Self {
             window: FourierWindow { from, to },
             harmonics,
-            grid,
-            degree: settings.polydegree as usize,
+            polynomial,
         })
     }
 
@@ -534,10 +532,9 @@ impl ConfiguredPlan {
         &self,
         axis: &OrderedAxis<'_>,
         trace: &Trace<'_>,
-        polynomial: Option<&PolynomialPlan>,
         input: &mut Vec<Real>,
     ) -> SpiceResult<Vec<Real>> {
-        let Some(grid) = &self.grid else {
+        let Some(polynomial) = &self.polynomial else {
             return (0..axis.len()).map(|i| trace.value(i)).collect();
         };
         input.clear();
@@ -550,9 +547,7 @@ impl ConfiguredPlan {
         for i in 0..axis.len() {
             input.push(trace.value(i)?);
         }
-        polynomial
-            .ok_or_else(|| nonfinite(trace.name(), "missing polynomial sampling geometry".into()))?
-            .sample(grid, input)
+        polynomial.sample(input)
     }
 
     fn transform(
@@ -884,25 +879,16 @@ pub(super) fn resolve_plans(
 
 enum CardPlan {
     Closed(ClosedPlan),
-    Configured {
-        plan: ConfiguredPlan,
-        polynomial: Option<PolynomialPlan>,
-    },
+    Configured(ConfiguredPlan),
 }
 
 impl CardPlan {
     fn new(axis: &OrderedAxis<'_>, card: &FourierCard, mode: Mode) -> SpiceResult<Self> {
         match mode {
             Mode::Closed => Ok(Self::Closed(ClosedPlan::new(axis, card)?)),
-            Mode::Configured { settings, count } => {
-                let plan = ConfiguredPlan::new(axis, card, settings, count)?;
-                let polynomial = plan
-                    .grid
-                    .as_ref()
-                    .map(|grid| PolynomialPlan::new(axis, grid, plan.degree))
-                    .transpose()?;
-                Ok(Self::Configured { plan, polynomial })
-            }
+            Mode::Configured { settings, count } => Ok(Self::Configured(ConfiguredPlan::new(
+                axis, card, settings, count,
+            )?)),
         }
     }
 
@@ -918,9 +904,7 @@ impl CardPlan {
         let trace = Trace::resolve(plot, request)?;
         let values = match self {
             Self::Closed(plan) => plan.samples(card, &trace)?,
-            Self::Configured { plan, polynomial } => {
-                plan.samples(axis, &trace, polynomial.as_ref(), input)?
-            }
+            Self::Configured(plan) => plan.samples(axis, &trace, input)?,
         };
         Ok(PreparedTrace {
             trace,
@@ -937,7 +921,7 @@ impl CardPlan {
     ) -> SpiceResult<FourierAnalysis> {
         match self {
             Self::Closed(plan) => plan.finish(card, prepared),
-            Self::Configured { plan, .. } => plan.transform(
+            Self::Configured(plan) => plan.transform(
                 card,
                 &prepared.trace,
                 &prepared.values,
@@ -957,7 +941,7 @@ impl CardPlan {
     ) -> SpiceResult<()> {
         let harmonics = match self {
             Self::Closed(_) => card.harmonics,
-            Self::Configured { plan, .. } => plan.harmonics,
+            Self::Configured(plan) => plan.harmonics,
         };
         let batch_size = geometry.batch_size(harmonics);
         let mut batch = Vec::with_capacity(batch_size.min(card.vectors.len()));
