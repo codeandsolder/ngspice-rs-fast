@@ -458,6 +458,8 @@ pub struct InstanceNoise {
     pub device: usize,
     /// The instance name, as written in output names.
     pub name: String,
+    /// Reference device family, including its output naming convention.
+    pub family: NoiseFamily,
     /// The generators (without the instance total).
     pub sources: Vec<NoiseSource>,
     /// Whether the instance total follows the generators.
@@ -552,6 +554,7 @@ pub fn circuit_noise(
             InstanceNoise {
                 device: index,
                 name: device.name().to_owned(),
+                family,
                 sources,
                 total,
             },

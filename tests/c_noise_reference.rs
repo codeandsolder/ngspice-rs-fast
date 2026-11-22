@@ -182,7 +182,7 @@ fn bsim3_noise_sources_match_c_batch_mode() {
                  m1 d g s 0 nn {instance}\n\
                  .model nn nmos level=8 cgdo=1e-10 cgso=1e-10 cj=1e-3 {extra}\n\
                  .options reltol=1e-6\n\
-                 .noise v(d) vin dec 2 1k 10meg\n.end\n"
+                 .noise v(d) vin dec 2 1k 10meg 1\n.end\n"
             ),
         );
     }

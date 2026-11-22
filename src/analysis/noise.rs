@@ -519,6 +519,7 @@ impl Generators {
     fn refresh(&mut self, instance: InstanceNoise) -> SpiceResult<()> {
         let old = &self.instance;
         if old.device != instance.device
+            || old.family != instance.family
             || old.name != instance.name
             || old.total != instance.total
             || old.sources.len() != instance.sources.len()
@@ -610,9 +611,14 @@ fn plot_names(
             .chain(g.instance.total.then_some(""));
         for suffix in suffixes {
             let name = format!("{}{suffix}", g.instance.name);
-            spectrum.push(output(format!("onoise_{name}"), true));
-            integrated.push(output(format!("onoise_total_{name}"), false));
-            integrated.push(input(format!("inoise_total_{name}"), false));
+            let separator = match g.instance.family {
+                crate::devices::noise::NoiseFamily::Bsim3
+                | crate::devices::noise::NoiseFamily::Bsim4 => '.',
+                _ => '_',
+            };
+            spectrum.push(output(format!("onoise{separator}{name}"), true));
+            integrated.push(output(format!("onoise_total{separator}{name}"), false));
+            integrated.push(input(format!("inoise_total{separator}{name}"), false));
         }
     }
     spectrum.push(output("onoise_spectrum".into(), true));
@@ -895,6 +901,7 @@ mod tests {
     fn instance() -> InstanceNoise {
         InstanceNoise {
             device: 3,
+            family: crate::devices::noise::NoiseFamily::Resistor,
             name: "test".into(),
             sources: vec![
                 NoiseSource::new(
