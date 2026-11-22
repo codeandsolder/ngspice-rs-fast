@@ -105,7 +105,7 @@ pub(super) trait Semantic {
 }
 
 /// Exact equality for fields with no lexical/location metadata. In
-/// particular, real values use the same PartialEq semantics as the AST
+/// particular, real values use the same `PartialEq` semantics as the AST
 /// (signed zero compares equal and NaN does not).
 macro_rules! semantic_leaves {
     ($($ty:ty),+ $(,)?) => {
@@ -146,7 +146,7 @@ semantic_leaves!(
     BBinaryOp,
 );
 
-fn compare_lengths(left: usize, right: usize) -> Comparison {
+const fn compare_lengths(left: usize, right: usize) -> Comparison {
     if left == right {
         Ok(())
     } else {
