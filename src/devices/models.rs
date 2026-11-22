@@ -24,7 +24,6 @@
 //! # Ok::<(), ngspice_rs::primitives::SpiceError>(())
 //! ```
 
-use std::fmt::Write;
 use std::sync::OnceLock;
 
 use crate::devices::binning::{BinCandidate, BinOptions, BinOutcome, DeclarationIndex, select_bin};
@@ -253,10 +252,23 @@ impl<'a> ModelResolver<'a> {
         if !instance.designator.eq_ignore_ascii_case(&'m') || self.model(name).is_some() {
             return Ok(None);
         }
+        self.select_declaration(instance, name)
+            .map(|selected| selected.map(|declaration| declaration.bin.card))
+    }
+
+    /// Select one indexed declaration after exact-name resolution failed.
+    fn select_declaration(
+        &self,
+        instance: &DeviceInstance,
+        name: &str,
+    ) -> SpiceResult<Option<&Declaration<'a>>> {
+        if !instance.designator.eq_ignore_ascii_case(&'m') {
+            return Ok(None);
+        }
         let candidates = self
             .declarations
             .bins(name)
-            .map(|declaration| &declaration.bin);
+            .map(|declaration| (declaration, &declaration.bin));
         if candidates.len() == 0 {
             return Ok(None);
         }
@@ -273,14 +285,11 @@ impl<'a> ModelResolver<'a> {
                 geometry.length, geometry.width
             ),
         };
-        let mut listed = String::new();
-        for card in self.bin_candidates(name) {
-            if !listed.is_empty() {
-                listed.push_str(", ");
-            }
-            write!(listed, "'{}' ({})", card.name, card.location)
-                .expect("formatting a String cannot fail");
-        }
+        let listed = self
+            .bin_candidates(name)
+            .map(|card| format!("'{}' ({})", card.name, card.location))
+            .collect::<Vec<_>>()
+            .join(", ");
         Err(SpiceError::parse(
             instance.location.clone(),
             format!(
@@ -322,7 +331,7 @@ impl<'a> ModelResolver<'a> {
         let (declaration, binned) = if let Some(exact) = self.declarations.get(name) {
             (exact, false)
         } else {
-            let card = self.select_bin(instance)?.ok_or_else(|| {
+            let declaration = self.select_declaration(instance, name)?.ok_or_else(|| {
                 SpiceError::parse(
                     instance.location.clone(),
                     format!(
@@ -331,13 +340,7 @@ impl<'a> ModelResolver<'a> {
                     ),
                 )
             })?;
-            // The selected card necessarily belongs to this same immutable index.
-            (
-                self.declarations
-                    .get(&card.name)
-                    .expect("indexed bin declaration"),
-                true,
-            )
+            (declaration, true)
         };
         let card = declaration.bin.card;
         let family = declaration.family()?;

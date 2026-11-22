@@ -340,9 +340,9 @@ impl<'a> BinCandidate<'a> {
 /// Result of [`select_bin`]; the non-`Selected` outcomes are C errors that
 /// the caller reports with its own location context.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum BinOutcome<'a> {
+pub(super) enum BinOutcome<T> {
     /// The card C would bind.
-    Selected(&'a ModelCard),
+    Selected(T),
     /// No candidate is a binnable family/level.
     NoBinnableCandidate,
     /// The instance does not write both `l` and `w`.
@@ -358,17 +358,17 @@ pub(super) enum BinOutcome<'a> {
 /// # Errors
 /// Invalid instance geometry or bound values (see [`BinGeometry`],
 /// [`BinBounds`]).
-pub(super) fn select_bin<'a, 'b>(
-    candidates: impl DoubleEndedIterator<Item = &'b BinCandidate<'a>>,
+pub(super) fn select_bin<'a, 'b, T>(
+    candidates: impl DoubleEndedIterator<Item = (T, &'b BinCandidate<'a>)>,
     instance: &DeviceInstance,
     options: &BinOptions,
-) -> SpiceResult<BinOutcome<'a>>
+) -> SpiceResult<BinOutcome<T>>
 where
     'a: 'b,
 {
     let mut binnable = candidates
         .rev()
-        .filter(|candidate| candidate.binnable)
+        .filter(|(_, candidate)| candidate.binnable)
         .peekable();
     if binnable.peek().is_none() {
         return Ok(BinOutcome::NoBinnableCandidate);
@@ -376,12 +376,12 @@ where
     let Some(geometry) = BinGeometry::from_instance(instance, options)? else {
         return Ok(BinOutcome::MissingGeometry);
     };
-    for candidate in binnable {
+    for (identity, candidate) in binnable {
         if candidate
             .bounds()?
             .is_some_and(|bounds| bounds.contains(geometry))
         {
-            return Ok(BinOutcome::Selected(candidate.card));
+            return Ok(BinOutcome::Selected(identity));
         }
     }
     Ok(BinOutcome::NoMatch(geometry))
@@ -450,12 +450,18 @@ mod tests {
         cards: &[&'a ModelCard],
         instance: &DeviceInstance,
         options: &BinOptions,
-    ) -> SpiceResult<BinOutcome<'a>> {
+    ) -> SpiceResult<BinOutcome<&'a ModelCard>> {
         let candidates: Vec<_> = cards.iter().map(|card| BinCandidate::new(card)).collect();
-        select_bin(candidates.iter(), instance, options)
+        select_bin(
+            candidates
+                .iter()
+                .map(|candidate| (candidate.card, candidate)),
+            instance,
+            options,
+        )
     }
 
-    fn selected<'a>(outcome: BinOutcome<'a>) -> &'a str {
+    fn selected<'a>(outcome: BinOutcome<&'a ModelCard>) -> &'a str {
         match outcome {
             BinOutcome::Selected(card) => &card.name,
             other => panic!("expected a bin, got {other:?}"),
