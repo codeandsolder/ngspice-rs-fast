@@ -10,10 +10,6 @@
     reason = "C-translated equation symbols retain the original names for numerical review"
 )]
 #![expect(
-    clippy::float_cmp,
-    reason = "C device branches compare floating-point values exactly"
-)]
-#![expect(
     clippy::suboptimal_flops,
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
