@@ -163,23 +163,23 @@ scope root
         [8] name="isc" kind=scalar value="1e-14" @netlists/disto_bjt.cir:30:77
         [9] name="nc" kind=scalar value="1.8" @netlists/disto_bjt.cir:30:87
         [10] name="br" kind=scalar value="3" @netlists/disto_bjt.cir:30:94
-        [11] name="rb" kind=scalar value="100" @netlists/disto_bjt.cir:30:99
-        [12] name="rbm" kind=scalar value="20" @netlists/disto_bjt.cir:30:106
-        [13] name="irb" kind=scalar value="1m" @netlists/disto_bjt.cir:30:113
-        [14] name="re" kind=scalar value="1" @netlists/disto_bjt.cir:30:120
-        [15] name="rc" kind=scalar value="10" @netlists/disto_bjt.cir:30:125
-        [16] name="cje" kind=scalar value="2p" @netlists/disto_bjt.cir:30:131
-        [17] name="vje" kind=scalar value="0.8" @netlists/disto_bjt.cir:30:138
-        [18] name="mje" kind=scalar value="0.4" @netlists/disto_bjt.cir:30:146
-        [19] name="tf" kind=scalar value="0.4n" @netlists/disto_bjt.cir:30:154
-        [20] name="xtf" kind=scalar value="2" @netlists/disto_bjt.cir:30:162
-        [21] name="vtf" kind=scalar value="4" @netlists/disto_bjt.cir:30:168
-        [22] name="itf" kind=scalar value="50m" @netlists/disto_bjt.cir:30:174
-        [23] name="cjc" kind=scalar value="1p" @netlists/disto_bjt.cir:30:182
-        [24] name="vjc" kind=scalar value="0.7" @netlists/disto_bjt.cir:30:189
-        [25] name="mjc" kind=scalar value="0.35" @netlists/disto_bjt.cir:30:197
-        [26] name="xcjc" kind=scalar value="0.6" @netlists/disto_bjt.cir:30:206
-        [27] name="tr" kind=scalar value="10n" @netlists/disto_bjt.cir:30:215
+        [11] name="rb" kind=scalar value="100" @netlists/disto_bjt.cir:31:3
+        [12] name="rbm" kind=scalar value="20" @netlists/disto_bjt.cir:31:10
+        [13] name="irb" kind=scalar value="1m" @netlists/disto_bjt.cir:31:17
+        [14] name="re" kind=scalar value="1" @netlists/disto_bjt.cir:31:24
+        [15] name="rc" kind=scalar value="10" @netlists/disto_bjt.cir:31:29
+        [16] name="cje" kind=scalar value="2p" @netlists/disto_bjt.cir:31:35
+        [17] name="vje" kind=scalar value="0.8" @netlists/disto_bjt.cir:31:42
+        [18] name="mje" kind=scalar value="0.4" @netlists/disto_bjt.cir:31:50
+        [19] name="tf" kind=scalar value="0.4n" @netlists/disto_bjt.cir:31:58
+        [20] name="xtf" kind=scalar value="2" @netlists/disto_bjt.cir:31:66
+        [21] name="vtf" kind=scalar value="4" @netlists/disto_bjt.cir:31:72
+        [22] name="itf" kind=scalar value="50m" @netlists/disto_bjt.cir:31:78
+        [23] name="cjc" kind=scalar value="1p" @netlists/disto_bjt.cir:32:3
+        [24] name="vjc" kind=scalar value="0.7" @netlists/disto_bjt.cir:32:10
+        [25] name="mjc" kind=scalar value="0.35" @netlists/disto_bjt.cir:32:18
+        [26] name="xcjc" kind=scalar value="0.6" @netlists/disto_bjt.cir:32:27
+        [27] name="tr" kind=scalar value="10n" @netlists/disto_bjt.cir:32:36
     model [1] name="qb" base="npn" level=none @netlists/disto_bjt.cir:33:1
       parameters (14):
         [0] name="is" kind=scalar value="2e-15" @netlists/disto_bjt.cir:33:15
@@ -193,9 +193,9 @@ scope root
         [8] name="tf" kind=scalar value="1n" @netlists/disto_bjt.cir:33:71
         [9] name="xtf" kind=scalar value="1" @netlists/disto_bjt.cir:33:77
         [10] name="cjc" kind=scalar value="0.5p" @netlists/disto_bjt.cir:33:83
-        [11] name="cjs" kind=scalar value="0.8p" @netlists/disto_bjt.cir:33:92
-        [12] name="vjs" kind=scalar value="0.6" @netlists/disto_bjt.cir:33:101
-        [13] name="mjs" kind=scalar value="0.4" @netlists/disto_bjt.cir:33:109
+        [11] name="cjs" kind=scalar value="0.8p" @netlists/disto_bjt.cir:34:3
+        [12] name="vjs" kind=scalar value="0.6" @netlists/disto_bjt.cir:34:12
+        [13] name="mjs" kind=scalar value="0.4" @netlists/disto_bjt.cir:34:20
     model [2] name="qp" base="pnp" level=none @netlists/disto_bjt.cir:35:1
       parameters (12):
         [0] name="is" kind=scalar value="1e-15" @netlists/disto_bjt.cir:35:15

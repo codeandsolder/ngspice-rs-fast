@@ -100,48 +100,48 @@ card 7 @netlists/m11_bsim4_pz.cir:11:1 lines=11-13 continuations=2
   token 19 11:71 word "igbmod"
   token 20 11:77 equals "="
   token 21 11:78 number "1" value=1e0
-  token 22 11:80 word "xrcrg1"
-  token 23 11:86 equals "="
-  token 24 11:87 number "12" value=1.2e1
-  token 25 11:90 word "xrcrg2"
-  token 26 11:96 equals "="
-  token 27 11:97 number "5" value=5e0
-  token 28 11:99 word "rshg"
-  token 29 11:103 equals "="
-  token 30 11:104 number "0.4" value=4e-1
-  token 31 11:108 word "rbpb"
-  token 32 11:112 equals "="
-  token 33 11:113 number "5" value=5e0
-  token 34 11:115 word "rbpd"
-  token 35 11:119 equals "="
-  token 36 11:120 number "15" value=1.5e1
-  token 37 11:123 word "rbps"
-  token 38 11:127 equals "="
-  token 39 11:128 number "15" value=1.5e1
-  token 40 11:131 word "rbdb"
-  token 41 11:135 equals "="
-  token 42 11:136 number "15" value=1.5e1
-  token 43 11:139 word "rbsb"
-  token 44 11:143 equals "="
-  token 45 11:144 number "15" value=1.5e1
-  token 46 11:147 word "cgso"
-  token 47 11:151 equals "="
-  token 48 11:152 number "1.5e-10" value=1.5e-10
-  token 49 11:160 word "cgdo"
-  token 50 11:164 equals "="
-  token 51 11:165 number "1.5e-10" value=1.5e-10
-  token 52 11:173 word "cgbo"
-  token 53 11:177 equals "="
-  token 54 11:178 number "1e-11" value=1e-11
-  token 55 11:184 word "jss"
-  token 56 11:187 equals "="
-  token 57 11:188 number "1e-4" value=1e-4
-  token 58 11:193 word "cjs"
-  token 59 11:196 equals "="
-  token 60 11:197 number "1e-3" value=1e-3
-  token 61 11:202 word "cjsws"
-  token 62 11:207 equals "="
-  token 63 11:208 number "2e-10" value=2e-10
+  token 22 12:3 word "xrcrg1"
+  token 23 12:9 equals "="
+  token 24 12:10 number "12" value=1.2e1
+  token 25 12:13 word "xrcrg2"
+  token 26 12:19 equals "="
+  token 27 12:20 number "5" value=5e0
+  token 28 12:22 word "rshg"
+  token 29 12:26 equals "="
+  token 30 12:27 number "0.4" value=4e-1
+  token 31 12:31 word "rbpb"
+  token 32 12:35 equals "="
+  token 33 12:36 number "5" value=5e0
+  token 34 12:38 word "rbpd"
+  token 35 12:42 equals "="
+  token 36 12:43 number "15" value=1.5e1
+  token 37 12:46 word "rbps"
+  token 38 12:50 equals "="
+  token 39 12:51 number "15" value=1.5e1
+  token 40 12:54 word "rbdb"
+  token 41 12:58 equals "="
+  token 42 12:59 number "15" value=1.5e1
+  token 43 12:62 word "rbsb"
+  token 44 12:66 equals "="
+  token 45 12:67 number "15" value=1.5e1
+  token 46 13:3 word "cgso"
+  token 47 13:7 equals "="
+  token 48 13:8 number "1.5e-10" value=1.5e-10
+  token 49 13:16 word "cgdo"
+  token 50 13:20 equals "="
+  token 51 13:21 number "1.5e-10" value=1.5e-10
+  token 52 13:29 word "cgbo"
+  token 53 13:33 equals "="
+  token 54 13:34 number "1e-11" value=1e-11
+  token 55 13:40 word "jss"
+  token 56 13:43 equals "="
+  token 57 13:44 number "1e-4" value=1e-4
+  token 58 13:49 word "cjs"
+  token 59 13:52 equals "="
+  token 60 13:53 number "1e-3" value=1e-3
+  token 61 13:58 word "cjsws"
+  token 62 13:63 equals "="
+  token 63 13:64 number "2e-10" value=2e-10
 card 8 @netlists/m11_bsim4_pz.cir:14:1 lines=14-14 continuations=0
   raw: ".options reltol=1e-9 vntol=1e-12 abstol=1e-15"
   kind: dot(.options)

@@ -131,8 +131,8 @@ fn continuations_and_unicode_nodes_keep_byte_locations_and_raw_spelling() {
         panic!("PULSE AST")
     };
     assert_eq!(pulse.initial.location.column, 17);
-    assert_eq!(pulse.delay.as_ref().unwrap().location.line, 2);
-    assert_eq!(pulse.delay.as_ref().unwrap().location.column, 22);
+    assert_eq!(pulse.delay.as_ref().unwrap().location.line, 3);
+    assert_eq!(pulse.delay.as_ref().unwrap().location.column, 3);
     assert_eq!(netlist.devices[0].nodes, ["α", "0"]);
     for (body, bad) in [
         ("V1 α 0 pulse(0 1e999)", "1e999"),
@@ -143,7 +143,7 @@ fn continuations_and_unicode_nodes_keep_byte_locations_and_raw_spelling() {
         let expected = body.find(bad).unwrap() + 1 + usize::from(bad == ",,2");
         assert!(
             matches!(parse(body), Err(SpiceError::Parse { location, .. })
-            if location.column as usize == expected),
+            if location.column == expected),
             "{body}"
         );
     }
@@ -265,7 +265,7 @@ fn source_functions_keep_positioned_fields_and_omissions() {
         let setter = &netlist.devices[0].parameters[0];
         assert_eq!(setter.name, keyword, "{card}");
         assert_eq!(
-            setter.location.column as usize,
+            setter.location.column,
             card.to_ascii_lowercase().find(keyword).unwrap() + 1
         );
         let ParameterKind::Waveform(SourceWaveform::Function(wave)) = &setter.kind else {
@@ -276,7 +276,7 @@ fn source_functions_keep_positioned_fields_and_omissions() {
         assert!(count <= function.fields().len());
         // Every field keeps its spelling and byte column.
         for value in &wave.values {
-            let column = value.location.column as usize;
+            let column = value.location.column;
             assert_eq!(&card[column - 1..column - 1 + value.text.len()], value.text);
         }
     }

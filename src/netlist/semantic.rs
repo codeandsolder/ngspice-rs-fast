@@ -42,6 +42,7 @@ fn span() -> SourceSpan {
     SourceSpan {
         start: blank(),
         end: blank(),
+        logical: 0..0,
     }
 }
 
@@ -51,6 +52,7 @@ fn raw() -> RawCard {
         raw: String::new(),
         tokens: Vec::new(),
         kind: CardKind::Unknown,
+        source_map: crate::netlist::source::SourceMap::default(),
     }
 }
 

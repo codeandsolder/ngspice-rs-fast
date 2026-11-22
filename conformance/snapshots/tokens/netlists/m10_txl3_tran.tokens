@@ -206,27 +206,27 @@ card 21 @netlists/m10_txl3_tran.cir:22:1 lines=22-23 continuations=1
   token 13 22:45 word "PHI"
   token 14 22:48 equals "="
   token 15 22:49 number "0.55" value=5.5e-1
-  token 16 22:54 word "LAMBDA"
-  token 17 22:60 equals "="
-  token 18 22:61 number "0.00" value=0e0
-  token 19 22:66 word "CGSO"
-  token 20 22:70 equals "="
-  token 21 22:71 number "0" value=0e0
-  token 22 22:73 word "CGDO"
-  token 23 22:77 equals "="
-  token 24 22:78 number "0" value=0e0
-  token 25 22:80 word "CJ"
-  token 26 22:82 equals "="
-  token 27 22:83 number "0" value=0e0
-  token 28 22:85 word "CJSW"
-  token 29 22:89 equals "="
-  token 30 22:90 number "0" value=0e0
-  token 31 22:92 word "TOX"
-  token 32 22:95 equals "="
-  token 33 22:96 number "18000N" value=1.8e-5
-  token 34 22:103 word "LD"
-  token 35 22:105 equals "="
-  token 36 22:106 number "0.0U" value=0e0
+  token 16 23:2 word "LAMBDA"
+  token 17 23:8 equals "="
+  token 18 23:9 number "0.00" value=0e0
+  token 19 23:14 word "CGSO"
+  token 20 23:18 equals "="
+  token 21 23:19 number "0" value=0e0
+  token 22 23:21 word "CGDO"
+  token 23 23:25 equals "="
+  token 24 23:26 number "0" value=0e0
+  token 25 23:28 word "CJ"
+  token 26 23:30 equals "="
+  token 27 23:31 number "0" value=0e0
+  token 28 23:33 word "CJSW"
+  token 29 23:37 equals "="
+  token 30 23:38 number "0" value=0e0
+  token 31 23:40 word "TOX"
+  token 32 23:43 equals "="
+  token 33 23:44 number "18000N" value=1.8e-5
+  token 34 23:51 word "LD"
+  token 35 23:53 equals "="
+  token 36 23:54 number "0.0U" value=0e0
 card 22 @netlists/m10_txl3_tran.cir:24:1 lines=24-25 continuations=1
   raw: ".MODEL mp1p0 PMOS VTO=-0.8 KP=21U GAMMA=0.45 PHI=0.61 LAMBDA=0.00 CGSO=0 CGDO=0 CJ=0 CJSW=0 TOX=18000N LD=0.0U"
   kind: dot(.model)
@@ -245,27 +245,27 @@ card 22 @netlists/m10_txl3_tran.cir:24:1 lines=24-25 continuations=1
   token 13 24:46 word "PHI"
   token 14 24:49 equals "="
   token 15 24:50 number "0.61" value=6.1e-1
-  token 16 24:55 word "LAMBDA"
-  token 17 24:61 equals "="
-  token 18 24:62 number "0.00" value=0e0
-  token 19 24:67 word "CGSO"
-  token 20 24:71 equals "="
-  token 21 24:72 number "0" value=0e0
-  token 22 24:74 word "CGDO"
-  token 23 24:78 equals "="
-  token 24 24:79 number "0" value=0e0
-  token 25 24:81 word "CJ"
-  token 26 24:83 equals "="
-  token 27 24:84 number "0" value=0e0
-  token 28 24:86 word "CJSW"
-  token 29 24:90 equals "="
-  token 30 24:91 number "0" value=0e0
-  token 31 24:93 word "TOX"
-  token 32 24:96 equals "="
-  token 33 24:97 number "18000N" value=1.8e-5
-  token 34 24:104 word "LD"
-  token 35 24:106 equals "="
-  token 36 24:107 number "0.0U" value=0e0
+  token 16 25:2 word "LAMBDA"
+  token 17 25:8 equals "="
+  token 18 25:9 number "0.00" value=0e0
+  token 19 25:14 word "CGSO"
+  token 20 25:18 equals "="
+  token 21 25:19 number "0" value=0e0
+  token 22 25:21 word "CGDO"
+  token 23 25:25 equals "="
+  token 24 25:26 number "0" value=0e0
+  token 25 25:28 word "CJ"
+  token 26 25:30 equals "="
+  token 27 25:31 number "0" value=0e0
+  token 28 25:33 word "CJSW"
+  token 29 25:37 equals "="
+  token 30 25:38 number "0" value=0e0
+  token 31 25:40 word "TOX"
+  token 32 25:43 equals "="
+  token 33 25:44 number "18000N" value=1.8e-5
+  token 34 25:51 word "LD"
+  token 35 25:53 equals "="
+  token 36 25:54 number "0.0U" value=0e0
 card 23 @netlists/m10_txl3_tran.cir:26:1 lines=26-26 continuations=0
   raw: ".MODEL ymod txl R=12.45 L=8.972e-9 G=0 C=0.468e-12 length=16"
   kind: dot(.model)

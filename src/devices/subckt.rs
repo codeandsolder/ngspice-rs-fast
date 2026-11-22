@@ -1085,6 +1085,7 @@ fn formal_assignment(formal: &ParameterAssignment) -> SpiceResult<ParamAssignmen
             end: formal
                 .location
                 .at_column(formal.location.column + byte_len(&formal.name)),
+            logical: 0..formal.name.len(),
         },
         expression,
     })
@@ -1112,6 +1113,7 @@ fn literal_expression(text: &str, value: Real, start: &SourceLoc) -> ParameterEx
     let span = SourceSpan {
         start: start.clone(),
         end: start.at_column(start.column + byte_len(text)),
+        logical: 0..text.len(),
     };
     ParameterExpression {
         text: text.to_owned(),
@@ -1128,6 +1130,6 @@ fn literal_expression(text: &str, value: Real, start: &SourceLoc) -> ParameterEx
     }
 }
 
-fn byte_len(text: &str) -> u32 {
-    u32::try_from(text.len()).unwrap_or(u32::MAX)
+const fn byte_len(text: &str) -> usize {
+    text.len()
 }

@@ -86,31 +86,31 @@ card 5 @netlists/m7_mos1_meyer_ac.cir:6:1 lines=6-7 continuations=1
   token 26 6:78 word "ld"
   token 27 6:80 equals "="
   token 28 6:81 number "0.1u" value=1e-7
-  token 29 6:86 word "cgso"
-  token 30 6:90 equals "="
-  token 31 6:91 number "0.4n" value=4e-10
-  token 32 6:96 word "cgdo"
-  token 33 6:100 equals "="
-  token 34 6:101 number "0.4n" value=4e-10
-  token 35 6:106 word "cgbo"
-  token 36 6:110 equals "="
-  token 37 6:111 number "0.2n" value=2e-10
-  token 38 6:116 word "cj"
-  token 39 6:118 equals "="
-  token 40 6:119 number "0.5m" value=5e-4
-  token 41 6:124 word "cjsw"
-  token 42 6:128 equals "="
-  token 43 6:129 number "0.4n" value=4e-10
-  token 44 6:134 word "mjsw"
-  token 45 6:138 equals "="
-  token 46 6:139 number "0.33" value=3.3e-1
-  token 47 6:144 word "rd"
-  token 48 6:146 equals "="
-  token 49 6:147 number "50" value=5e1
-  token 50 6:150 word "rs"
-  token 51 6:152 equals "="
-  token 52 6:153 number "40" value=4e1
-  token 53 6:155 rparen ")"
+  token 29 7:3 word "cgso"
+  token 30 7:7 equals "="
+  token 31 7:8 number "0.4n" value=4e-10
+  token 32 7:13 word "cgdo"
+  token 33 7:17 equals "="
+  token 34 7:18 number "0.4n" value=4e-10
+  token 35 7:23 word "cgbo"
+  token 36 7:27 equals "="
+  token 37 7:28 number "0.2n" value=2e-10
+  token 38 7:33 word "cj"
+  token 39 7:35 equals "="
+  token 40 7:36 number "0.5m" value=5e-4
+  token 41 7:41 word "cjsw"
+  token 42 7:45 equals "="
+  token 43 7:46 number "0.4n" value=4e-10
+  token 44 7:51 word "mjsw"
+  token 45 7:55 equals "="
+  token 46 7:56 number "0.33" value=3.3e-1
+  token 47 7:61 word "rd"
+  token 48 7:63 equals "="
+  token 49 7:64 number "50" value=5e1
+  token 50 7:67 word "rs"
+  token 51 7:69 equals "="
+  token 52 7:70 number "40" value=4e1
+  token 53 7:72 rparen ")"
 card 6 @netlists/m7_mos1_meyer_ac.cir:8:1 lines=8-8 continuations=0
   raw: ".options temp=75"
   kind: dot(.options)

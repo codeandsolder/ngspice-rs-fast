@@ -68,9 +68,10 @@ pub(super) fn from_card(card: &RawCard, nodes: &mut NodeTable) -> SpiceResult<Bo
         title_location: card.location.clone(),
         lines: vec![LogicalLine {
             location: card.location.clone(),
-            end_line: card.location.line,
+            end_line: card.position().advance(card.raw.len()).location().line,
             continuations: 0,
             text: card.raw.clone(),
+            source_map: card.source_map.clone(),
         }],
     };
     let netlist = Parser::new().parse_deck(&deck)?;

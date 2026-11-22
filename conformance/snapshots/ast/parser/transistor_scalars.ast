@@ -93,11 +93,11 @@ scope root
         [7] name="nrd" kind=scalar value="2" @parser/transistor_scalars.cir:16:59
         [8] name="nrs" kind=scalar value="3" @parser/transistor_scalars.cir:16:65
         [9] name="m" kind=scalar value="4" @parser/transistor_scalars.cir:16:71
-        [10] name="icvds" kind=scalar value="2" @parser/transistor_scalars.cir:16:75
-        [11] name="icvgs" kind=scalar value="2" @parser/transistor_scalars.cir:16:83
-        [12] name="icvbs" kind=scalar value="0" @parser/transistor_scalars.cir:16:91
-        [13] name="temp" kind=scalar value="30" @parser/transistor_scalars.cir:16:99
-        [14] name="dtemp" kind=scalar value="2" @parser/transistor_scalars.cir:16:107
+        [10] name="icvds" kind=scalar value="2" @parser/transistor_scalars.cir:17:3
+        [11] name="icvgs" kind=scalar value="2" @parser/transistor_scalars.cir:17:11
+        [12] name="icvbs" kind=scalar value="0" @parser/transistor_scalars.cir:17:19
+        [13] name="temp" kind=scalar value="30" @parser/transistor_scalars.cir:17:27
+        [14] name="dtemp" kind=scalar value="2" @parser/transistor_scalars.cir:17:35
   models (4):
     model [0] name="qm" base="npn" level=none @parser/transistor_scalars.cir:18:1
       parameters (2):

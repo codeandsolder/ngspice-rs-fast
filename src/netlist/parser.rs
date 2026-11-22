@@ -165,7 +165,12 @@ impl Parser {
         location: &crate::primitives::SourceLoc,
         verbatim: bool,
     ) -> SpiceResult<crate::netlist::bexpr::BehaviouralExpression> {
-        bexpression::parse_complete(text, location, location.column, verbatim, self.auto_gnd)
+        bexpression::parse_complete(
+            text,
+            super::source::SourcePosition::physical(location),
+            verbatim,
+            self.auto_gnd,
+        )
     }
 
     /// Loads `path`, resolves source-relative `.include`/`.lib` directives and
@@ -240,7 +245,11 @@ pub fn parse_parameter_expression(
     text: &str,
     location: &crate::primitives::SourceLoc,
 ) -> SpiceResult<crate::netlist::expr::ParameterExpression> {
-    expression::parse_expression(text, location, location.column, false)
+    expression::parse_expression(
+        text,
+        super::source::SourcePosition::physical(location),
+        false,
+    )
 }
 
 /// Cache lexical results for ordered replay; later errors do not mask earlier

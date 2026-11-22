@@ -17,7 +17,7 @@ use std::fmt;
 
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
 
-use crate::netlist::source::LogicalLine;
+use crate::netlist::source::{LogicalLine, SourceMap, SourcePosition};
 
 /// What kind of token this is.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,28 +66,39 @@ impl fmt::Display for TokenKind {
     }
 }
 
-/// One lexical token, with its position in the (already joined) card.
+/// One lexical token, with physical position and a joined-card byte offset.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     /// The token's classification.
     pub kind: TokenKind,
     /// The exact source spelling.
     pub text: String,
-    /// Where the token starts. On a card that was joined from continuation
-    /// lines, the column is relative to the joined text, not to the original
-    /// file line.
+    /// Physical source position of the first byte.
     pub location: SourceLoc,
+    /// Zero-based byte offset in the joined card spelling.
+    pub raw_offset: usize,
+    source_map: SourceMap,
 }
 
 impl Token {
-    /// Builds a token.
-    #[must_use]
-    pub fn new(kind: TokenKind, text: impl Into<String>, location: SourceLoc) -> Self {
+    fn new(
+        kind: TokenKind,
+        text: impl Into<String>,
+        line: &LogicalLine,
+        raw_offset: usize,
+    ) -> Self {
         Self {
             kind,
             text: text.into(),
-            location,
+            location: line.location_at(raw_offset),
+            raw_offset,
+            source_map: line.source_map.clone(),
         }
+    }
+
+    pub(crate) fn position(&self) -> SourcePosition<'_> {
+        self.source_map
+            .token_position(&self.location, self.raw_offset)
     }
 
     /// The value, when this token is a number.
@@ -135,31 +146,29 @@ pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
         }
 
         let start = index;
-        let location = line
-            .location
-            .at_column(u32::try_from(start).unwrap_or(u32::MAX) + 1);
+        let location = || line.location_at(start);
 
         match bytes[index] {
             b'(' => {
-                tokens.push(Token::new(TokenKind::LParen, "(", location));
+                tokens.push(Token::new(TokenKind::LParen, "(", line, start));
                 index += 1;
             }
             b')' => {
-                tokens.push(Token::new(TokenKind::RParen, ")", location));
+                tokens.push(Token::new(TokenKind::RParen, ")", line, start));
                 index += 1;
             }
             b',' => {
-                tokens.push(Token::new(TokenKind::Comma, ",", location));
+                tokens.push(Token::new(TokenKind::Comma, ",", line, start));
                 index += 1;
             }
             b'=' => {
-                tokens.push(Token::new(TokenKind::Equals, "=", location));
+                tokens.push(Token::new(TokenKind::Equals, "=", line, start));
                 index += 1;
             }
             b'{' => {
                 let Some(end) = find_closing_brace(bytes, index) else {
                     return Err(SpiceError::parse(
-                        location,
+                        location(),
                         "unterminated '{' expression on this card",
                     ));
                 };
@@ -167,13 +176,14 @@ pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
                 tokens.push(Token::new(
                     TokenKind::Expression(inner),
                     &text[index..=end],
-                    location,
+                    line,
+                    start,
                 ));
                 index = end + 1;
             }
             b'}' => {
                 return Err(SpiceError::parse(
-                    location,
+                    location(),
                     "unmatched '}' without an opening '{' on this card",
                 ));
             }
@@ -198,14 +208,15 @@ pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
                 }
                 let Some(cursor) = end else {
                     return Err(SpiceError::parse(
-                        location,
+                        location(),
                         format!("unterminated {quote} quoted string on this card"),
                     ));
                 };
                 tokens.push(Token::new(
                     TokenKind::Quoted(value),
                     &text[index..cursor],
-                    location,
+                    line,
+                    start,
                 ));
                 index = cursor;
             }
@@ -218,7 +229,7 @@ pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
                 }
                 let word = &text[start..index];
                 let kind = parse_spice_number(word).map_or(TokenKind::Word, TokenKind::Number);
-                tokens.push(Token::new(kind, word, location));
+                tokens.push(Token::new(kind, word, line, start));
             }
         }
     }
@@ -363,6 +374,27 @@ mod tests {
         let tokens = tokens(r#""α \β \" γ" next"#);
         assert_eq!(tokens[0].kind, TokenKind::Quoted("α β \" γ".to_owned()));
         assert_eq!(tokens[1].text, "next");
+    }
+
+    #[test]
+    fn continued_quoted_tokens_keep_spelling_and_physical_positions() {
+        let tokens = tokens("  .title \"α \\\\β\n* between\n   + γ\" next");
+        assert_eq!(tokens[1].text, "\"α \\\\β γ\"");
+        assert_eq!(tokens[1].kind, TokenKind::Quoted("α \\β γ".into()));
+        assert_eq!(
+            (tokens[1].location.line, tokens[1].location.column),
+            (2, 10)
+        );
+        assert_eq!(
+            (tokens[2].location.line, tokens[2].location.column),
+            (4, 10)
+        );
+        let end = tokens[1]
+            .position()
+            .advance(tokens[1].text.len())
+            .location();
+        assert_eq!((end.line, end.column), (4, 9));
+        assert_eq!(tokens[2].raw_offset, ".title \"α \\\\β γ\" ".len());
     }
 
     #[test]

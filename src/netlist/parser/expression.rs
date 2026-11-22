@@ -23,6 +23,7 @@ use crate::netlist::expr::{
     BinaryOp, EXCLUDED_FUNCTIONS, Expr, ExprKind, Function, MAX_NESTING, ParameterExpression,
     SourceSpan, UnaryOp,
 };
+use crate::netlist::source::SourcePosition;
 use crate::netlist::token::{Token, TokenKind};
 
 pub(super) const C_REFERENCE: &str = "src/frontend/numparam/xpressn.c";
@@ -30,9 +31,7 @@ pub(super) const C_REFERENCE: &str = "src/frontend/numparam/xpressn.c";
 /// Read-only position context plus the nesting counter.
 #[derive(Debug)]
 pub(super) struct Ctx<'a> {
-    pub origin: &'a SourceLoc,
-    /// Column of the first byte of the parsed text.
-    pub column: u32,
+    pub origin: SourcePosition<'a>,
     /// Byte length of the parsed text.
     pub total: usize,
     pub depth: usize,
@@ -43,11 +42,11 @@ pub(super) struct Ctx<'a> {
 
 impl Ctx<'_> {
     pub(super) fn location(&self, remaining: usize) -> SourceLoc {
-        let offset = self.total.saturating_sub(remaining);
-        self.origin.at_column(
-            self.column
-                .saturating_add(u32::try_from(offset).unwrap_or(u32::MAX)),
-        )
+        self.position(remaining).location()
+    }
+
+    pub(super) const fn position(&self, remaining: usize) -> SourcePosition<'_> {
+        self.origin.advance(self.total - remaining)
     }
 }
 
@@ -109,18 +108,12 @@ pub(super) fn cut_unsupported(remaining: usize, message: impl Into<String>) -> E
 }
 
 /// Converts a grammar failure to the port's error type.
-pub(super) fn into_error(
-    ctx_origin: &SourceLoc,
-    column: u32,
-    total: usize,
-    fail: Fail,
-) -> SpiceError {
+pub(super) fn into_error(origin: SourcePosition<'_>, total: usize, fail: Fail) -> SpiceError {
     if let Some(error) = fail.resolved {
         return error;
     }
     let location = Ctx {
-        origin: ctx_origin,
-        column,
+        origin,
         total,
         depth: 0,
         shadowing: &[],
@@ -148,10 +141,7 @@ pub(super) const fn is_ident_continue(c: char) -> bool {
 }
 
 fn span(input: &In<'_>, start: usize, end: usize) -> SourceSpan {
-    SourceSpan {
-        start: input.state.location(start),
-        end: input.state.location(end),
-    }
+    SourceSpan::from_positions(input.state.position(start), input.state.position(end))
 }
 
 /// Describes the character that cannot start/continue an expression here.
@@ -222,6 +212,7 @@ fn sum(input: &mut In<'_>) -> Res<Expr> {
             let span = SourceSpan {
                 start: input.state.location(open),
                 end: first.span.end.clone(),
+                logical: input.state.position(open).logical_offset()..first.span.logical.end,
             };
             Expr {
                 kind: ExprKind::Unary {
@@ -256,6 +247,7 @@ fn binary(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
     let span = SourceSpan {
         start: lhs.span.start.clone(),
         end: rhs.span.end.clone(),
+        logical: lhs.span.logical.start..rhs.span.logical.end,
     };
     Expr {
         kind: ExprKind::Binary {
@@ -358,6 +350,7 @@ fn signed_number(input: &mut In<'_>) -> Res<Expr> {
     let span = SourceSpan {
         start: input.state.location(start),
         end: literal_value.span.end.clone(),
+        logical: input.state.position(start).logical_offset()..literal_value.span.logical.end,
     };
     Ok(Expr {
         kind: ExprKind::Unary {
@@ -498,7 +491,7 @@ fn user_call(input: &mut In<'_>, start: usize, name: String) -> Res<Expr> {
 }
 
 /// Parses `text` (the content of a `{...}` expression, or an unbraced `.param`
-/// value / bare name) whose first byte is at `column` on `origin`'s line.
+/// value / bare name) with the supplied logical-to-physical origin.
 ///
 /// # Errors
 ///
@@ -507,30 +500,27 @@ fn user_call(input: &mut In<'_>, start: usize, name: String) -> Res<Expr> {
 /// bounded subset).
 pub(super) fn parse_expression(
     text: &str,
-    origin: &SourceLoc,
-    column: u32,
+    origin: SourcePosition<'_>,
     braced: bool,
 ) -> SpiceResult<ParameterExpression> {
-    parse_delimited(text, origin, column, braced, false)
+    parse_delimited(text, origin, braced, false)
 }
 
 /// As [`parse_expression`], recording whether the delimiters were quotes.
 pub(super) fn parse_delimited(
     text: &str,
-    origin: &SourceLoc,
-    column: u32,
+    origin: SourcePosition<'_>,
     braced: bool,
     quoted: bool,
 ) -> SpiceResult<ParameterExpression> {
-    parse_func_body(text, origin, column, braced, quoted, &[])
+    parse_func_body(text, origin, braced, quoted, &[])
 }
 
 /// As [`parse_delimited`] for a `.func` body whose formals in `shadowing`
 /// reuse built-in function names.
 pub(super) fn parse_func_body(
     text: &str,
-    origin: &SourceLoc,
-    column: u32,
+    origin: SourcePosition<'_>,
     braced: bool,
     quoted: bool,
     shadowing: &[String],
@@ -539,7 +529,6 @@ pub(super) fn parse_func_body(
         input: text,
         state: Ctx {
             origin,
-            column,
             total: text.len(),
             depth: 0,
             shadowing,
@@ -559,26 +548,18 @@ pub(super) fn parse_func_body(
         Ok(root)
     };
     if text.trim().is_empty() {
-        return Err(SpiceError::parse(
-            origin.at_column(column),
-            "empty expression",
-        ));
+        return Err(SpiceError::parse(origin.location(), "empty expression"));
     }
     match run(&mut input) {
         Ok(root) => Ok(ParameterExpression {
             text: text.to_owned(),
             braced: braced || quoted,
             quoted,
-            span: SourceSpan {
-                start: origin.at_column(column),
-                end: origin.at_column(
-                    column.saturating_add(u32::try_from(text.len()).unwrap_or(u32::MAX)),
-                ),
-            },
+            span: SourceSpan::from_positions(origin, origin.advance(text.len())),
             root,
         }),
         Err(ErrMode::Backtrack(fail) | ErrMode::Cut(fail)) => {
-            Err(into_error(origin, column, text.len(), fail))
+            Err(into_error(origin, text.len(), fail))
         }
         Err(ErrMode::Incomplete(_)) => unreachable!("complete input"),
     }
@@ -609,23 +590,17 @@ pub(super) fn from_brace_token(token: &Token) -> SpiceResult<ParameterExpression
         .and_then(|rest| rest.strip_suffix('\''))
         .filter(|_| token.text.len() >= 2)
     {
-        return parse_delimited(
-            inner,
-            &token.location,
-            token.location.column + 1,
-            true,
-            true,
-        );
+        return parse_delimited(inner, token.position().advance(1), true, true);
     }
     let inner = token
         .text
         .strip_prefix('{')
         .and_then(|rest| rest.strip_suffix('}'))
         .unwrap_or(&token.text);
-    parse_expression(inner, &token.location, token.location.column + 1, true)
+    parse_expression(inner, token.position().advance(1), true)
 }
 
 /// Parses a token that is a bare identifier, as an unbraced expression.
 pub(super) fn from_name_token(token: &Token) -> SpiceResult<ParameterExpression> {
-    parse_expression(&token.text, &token.location, token.location.column, false)
+    parse_expression(&token.text, token.position(), false)
 }

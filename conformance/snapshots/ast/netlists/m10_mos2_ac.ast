@@ -69,19 +69,19 @@ scope root
         [5] name="ld" kind=scalar value="0.1u" @netlists/m10_mos2_ac.cir:8:61
         [6] name="uo" kind=scalar value="520" @netlists/m10_mos2_ac.cir:8:69
         [7] name="ucrit" kind=scalar value="2e4" @netlists/m10_mos2_ac.cir:8:76
-        [8] name="uexp" kind=scalar value="0.15" @netlists/m10_mos2_ac.cir:8:86
-        [9] name="vmax" kind=scalar value="5e4" @netlists/m10_mos2_ac.cir:8:96
-        [10] name="neff" kind=scalar value="2" @netlists/m10_mos2_ac.cir:8:105
-        [11] name="nfs" kind=scalar value="1e11" @netlists/m10_mos2_ac.cir:8:112
-        [12] name="delta" kind=scalar value="0.5" @netlists/m10_mos2_ac.cir:8:121
-        [13] name="cgso" kind=scalar value="0.4n" @netlists/m10_mos2_ac.cir:8:131
-        [14] name="cgdo" kind=scalar value="0.4n" @netlists/m10_mos2_ac.cir:8:141
-        [15] name="cgbo" kind=scalar value="0.2n" @netlists/m10_mos2_ac.cir:8:151
-        [16] name="cj" kind=scalar value="0.5m" @netlists/m10_mos2_ac.cir:8:161
-        [17] name="cjsw" kind=scalar value="0.4n" @netlists/m10_mos2_ac.cir:8:169
-        [18] name="mjsw" kind=scalar value="0.33" @netlists/m10_mos2_ac.cir:8:179
-        [19] name="rd" kind=scalar value="40" @netlists/m10_mos2_ac.cir:8:189
-        [20] name="rs" kind=scalar value="30" @netlists/m10_mos2_ac.cir:8:195
+        [8] name="uexp" kind=scalar value="0.15" @netlists/m10_mos2_ac.cir:9:3
+        [9] name="vmax" kind=scalar value="5e4" @netlists/m10_mos2_ac.cir:9:13
+        [10] name="neff" kind=scalar value="2" @netlists/m10_mos2_ac.cir:9:22
+        [11] name="nfs" kind=scalar value="1e11" @netlists/m10_mos2_ac.cir:9:29
+        [12] name="delta" kind=scalar value="0.5" @netlists/m10_mos2_ac.cir:9:38
+        [13] name="cgso" kind=scalar value="0.4n" @netlists/m10_mos2_ac.cir:9:48
+        [14] name="cgdo" kind=scalar value="0.4n" @netlists/m10_mos2_ac.cir:9:58
+        [15] name="cgbo" kind=scalar value="0.2n" @netlists/m10_mos2_ac.cir:9:68
+        [16] name="cj" kind=scalar value="0.5m" @netlists/m10_mos2_ac.cir:10:3
+        [17] name="cjsw" kind=scalar value="0.4n" @netlists/m10_mos2_ac.cir:10:11
+        [18] name="mjsw" kind=scalar value="0.33" @netlists/m10_mos2_ac.cir:10:21
+        [19] name="rd" kind=scalar value="40" @netlists/m10_mos2_ac.cir:10:31
+        [20] name="rs" kind=scalar value="30" @netlists/m10_mos2_ac.cir:10:37
     model [1] name="mp" base="pmos" level=2e0 @netlists/m10_mos2_ac.cir:11:1
       parameters (16):
         [0] name="level" kind=scalar value="2" @netlists/m10_mos2_ac.cir:11:16
@@ -92,14 +92,14 @@ scope root
         [5] name="ld" kind=scalar value="0.1u" @netlists/m10_mos2_ac.cir:11:62
         [6] name="uo" kind=scalar value="210" @netlists/m10_mos2_ac.cir:11:70
         [7] name="ucrit" kind=scalar value="3e4" @netlists/m10_mos2_ac.cir:11:77
-        [8] name="uexp" kind=scalar value="0.2" @netlists/m10_mos2_ac.cir:11:87
-        [9] name="lambda" kind=scalar value="0.04" @netlists/m10_mos2_ac.cir:11:96
-        [10] name="cgso" kind=scalar value="0.4n" @netlists/m10_mos2_ac.cir:11:108
-        [11] name="cgdo" kind=scalar value="0.4n" @netlists/m10_mos2_ac.cir:11:118
-        [12] name="cgbo" kind=scalar value="0.2n" @netlists/m10_mos2_ac.cir:11:128
-        [13] name="cj" kind=scalar value="0.6m" @netlists/m10_mos2_ac.cir:11:138
-        [14] name="cjsw" kind=scalar value="0.45n" @netlists/m10_mos2_ac.cir:11:146
-        [15] name="js" kind=scalar value="1e-4" @netlists/m10_mos2_ac.cir:11:157
+        [8] name="uexp" kind=scalar value="0.2" @netlists/m10_mos2_ac.cir:12:3
+        [9] name="lambda" kind=scalar value="0.04" @netlists/m10_mos2_ac.cir:12:12
+        [10] name="cgso" kind=scalar value="0.4n" @netlists/m10_mos2_ac.cir:12:24
+        [11] name="cgdo" kind=scalar value="0.4n" @netlists/m10_mos2_ac.cir:12:34
+        [12] name="cgbo" kind=scalar value="0.2n" @netlists/m10_mos2_ac.cir:12:44
+        [13] name="cj" kind=scalar value="0.6m" @netlists/m10_mos2_ac.cir:12:54
+        [14] name="cjsw" kind=scalar value="0.45n" @netlists/m10_mos2_ac.cir:12:62
+        [15] name="js" kind=scalar value="1e-4" @netlists/m10_mos2_ac.cir:12:73
   subcircuits (0):
   analyses (1):
     analysis [0] kind=ac @netlists/m10_mos2_ac.cir:16:1

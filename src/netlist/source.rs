@@ -31,6 +31,131 @@ pub struct PhysicalLine {
     pub text: String,
 }
 
+/// A retained physical run. Synthetic separator bytes map to the exclusive
+/// end of the preceding run; trimmed comments and whitespace own no bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceSegment {
+    logical_start: usize,
+    line: u32,
+    column: usize,
+}
+
+/// The first continuation is inline in the shared allocation. Only cards
+/// with several continuations need an additional segment buffer. The original
+/// physical run is already represented by the card's starting location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Continuations {
+    first: SourceSegment,
+    rest: Vec<SourceSegment>,
+}
+
+impl Continuations {
+    fn at(&self, offset: usize) -> Option<&SourceSegment> {
+        let index = self.rest.partition_point(|run| run.logical_start <= offset);
+        if index == 0 {
+            (self.first.logical_start <= offset).then_some(&self.first)
+        } else {
+            self.rest.get(index - 1)
+        }
+    }
+}
+
+/// Ordinary cards allocate no source map; a single continuation allocates one.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct SourceMap(Option<Arc<Continuations>>);
+
+impl SourceMap {
+    fn append(&mut self, logical_start: usize, line: u32, column: usize) {
+        let segment = SourceSegment {
+            logical_start,
+            line,
+            column,
+        };
+        if let Some(segments) = &mut self.0 {
+            Arc::make_mut(segments).rest.push(segment);
+        } else {
+            self.0 = Some(Arc::new(Continuations {
+                first: segment,
+                rest: Vec::new(),
+            }));
+        }
+    }
+
+    pub(crate) fn position<'a>(
+        &'a self,
+        origin: &'a SourceLoc,
+        offset: usize,
+    ) -> SourcePosition<'a> {
+        SourcePosition {
+            origin,
+            segments: self.0.as_deref(),
+            offset,
+            anchor_offset: 0,
+        }
+    }
+
+    pub(crate) fn token_position<'a>(
+        &'a self,
+        location: &'a SourceLoc,
+        raw_offset: usize,
+    ) -> SourcePosition<'a> {
+        SourcePosition {
+            anchor_offset: raw_offset,
+            ..self.position(location, raw_offset)
+        }
+    }
+}
+
+/// Borrowed coordinate origin; advances in logical bytes, resolves to physical
+/// coordinates. Standalone expressions have no folding map.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SourcePosition<'a> {
+    origin: &'a SourceLoc,
+    segments: Option<&'a Continuations>,
+    offset: usize,
+    anchor_offset: usize,
+}
+
+impl<'a> SourcePosition<'a> {
+    pub(crate) const fn physical(origin: &'a SourceLoc) -> Self {
+        Self {
+            origin,
+            segments: None,
+            offset: 0,
+            anchor_offset: 0,
+        }
+    }
+
+    pub(crate) const fn advance(self, bytes: usize) -> Self {
+        Self {
+            offset: self.offset + bytes,
+            ..self
+        }
+    }
+
+    pub(crate) const fn logical_offset(self) -> usize {
+        self.offset
+    }
+
+    pub(crate) fn location(self) -> SourceLoc {
+        self.segments
+            .and_then(|runs| runs.at(self.offset))
+            .map_or_else(
+                || {
+                    self.origin
+                        .at_column(self.origin.column + (self.offset - self.anchor_offset))
+                },
+                |run| {
+                    SourceLoc::new(
+                        self.origin.file.clone(),
+                        run.line,
+                        run.column + (self.offset - run.logical_start),
+                    )
+                },
+            )
+    }
+}
+
 /// One card: continuation lines joined, comments removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalLine {
@@ -42,9 +167,27 @@ pub struct LogicalLine {
     pub continuations: u32,
     /// The joined card text, free of comments and trailing whitespace.
     pub text: String,
+    pub(crate) source_map: SourceMap,
 }
 
 impl LogicalLine {
+    pub(crate) fn single(location: SourceLoc, text: String) -> Self {
+        Self {
+            end_line: location.line,
+            location,
+            continuations: 0,
+            text,
+            source_map: SourceMap::default(),
+        }
+    }
+
+    /// Resolves a logical byte offset (including EOF) to its physical location.
+    /// EOF denotes the exclusive end of the last retained text.
+    #[must_use]
+    pub fn location_at(&self, offset: usize) -> SourceLoc {
+        self.source_map.position(&self.location, offset).location()
+    }
+
     /// The card text with its first token removed, as ngspice's callers do.
     #[must_use]
     pub fn body(&self) -> &str {
@@ -239,10 +382,13 @@ fn fold_lines<'a>(
 
         if is_continuation(line) {
             let text = strip_comment(line, in_control);
-            let body = text.trim_start().trim_start_matches('+').trim();
+            let tail = text.trim_start().trim_start_matches('+');
+            let body = tail.trim();
+            let column = text.len() - tail.trim_start().len() + 1;
             if let Some(card) = pending.as_mut() {
                 if !body.is_empty() {
                     card.text.push(' ');
+                    card.source_map.append(card.text.len(), number, column);
                     card.text.push_str(body);
                 }
                 card.continuations += 1;
@@ -250,17 +396,16 @@ fn fold_lines<'a>(
             } else {
                 // ngspice would reject this while building the card list; there is
                 // no card to attach it to.
-                deck.lines.push(LogicalLine {
-                    location: SourceLoc::new(file.clone(), number, 1),
-                    end_line: number,
-                    continuations: 0,
-                    text: body.to_owned(),
-                });
+                deck.lines.push(LogicalLine::single(
+                    SourceLoc::new(file.clone(), number, column),
+                    body.to_owned(),
+                ));
             }
             continue;
         }
 
         let text = strip_comment(line, in_control);
+        let column = text.len() - text.trim_start().len() + 1;
         let text = text.trim();
         if text.is_empty() {
             // A blank line (or a line holding nothing but a comment) ends the
@@ -272,12 +417,10 @@ fn fold_lines<'a>(
             if let Some(card) = pending.take() {
                 deck.lines.push(card);
             }
-            pending = Some(LogicalLine {
-                location: SourceLoc::new(file.clone(), number, 1),
-                end_line: number,
-                continuations: 0,
-                text: text.to_owned(),
-            });
+            pending = Some(LogicalLine::single(
+                SourceLoc::new(file.clone(), number, column),
+                text.to_owned(),
+            ));
         }
 
         if begins_control {
@@ -355,6 +498,36 @@ mod tests {
         assert_eq!(fragment.lines[0].location.line, 2);
         assert_eq!(fragment.lines[0].end_line, 3);
         assert_eq!(fragment.lines[0].text, "R1 a 0 1k");
+    }
+
+    #[test]
+    fn physical_runs_map_trimmed_crlf_and_synthetic_separators() {
+        let deck = deck("title\r\n  R1 α 0  \r\n* skipped\r\n \t+  1k ; tail\r\n  + tc1=2  \r\n");
+        let card = &deck.lines[0];
+        assert_eq!(card.text, "R1 α 0 1k tc1=2");
+        let at = |offset| {
+            let loc = card.location_at(offset);
+            (loc.line, loc.column)
+        };
+        assert_eq!(at(0), (2, 3));
+        assert_eq!(at(3), (2, 6));
+        // Synthetic separator is anchored to the exclusive end of the
+        // previous retained physical run, not to removed comments.
+        assert_eq!(at(7), (2, 10));
+        assert_eq!(at(8), (4, 6));
+        assert_eq!(at(10), (4, 8));
+        assert_eq!(at(11), (5, 5));
+        assert_eq!(at(card.text.len()), (5, 10));
+        assert_eq!(card.source_map.0.as_ref().unwrap().rest.len(), 1);
+    }
+
+    #[test]
+    fn ordinary_cards_do_not_allocate_a_segment_map() {
+        let deck = deck("title\n  R1 a 0 1k ; trailing comment\n");
+        let card = &deck.lines[0];
+        assert!(card.source_map.0.is_none());
+        assert_eq!(card.location.column, 3);
+        assert_eq!(card.location_at(card.text.len()).column, 12);
     }
 
     #[test]

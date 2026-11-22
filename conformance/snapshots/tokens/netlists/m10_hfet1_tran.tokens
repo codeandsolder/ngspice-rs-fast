@@ -82,15 +82,15 @@ card 6 @netlists/m10_hfet1_tran.cir:7:1 lines=7-8 continuations=1
   token 22 7:60 word "cds"
   token 23 7:63 equals "="
   token 24 7:64 number "5e-14" value=5e-14
-  token 25 7:70 word "js1s"
-  token 26 7:74 equals "="
-  token 27 7:75 number "0" value=0e0
-  token 28 7:77 word "js1d"
-  token 29 7:81 equals "="
-  token 30 7:82 number "0" value=0e0
-  token 31 7:84 word "ggr"
-  token 32 7:87 equals "="
-  token 33 7:88 number "0" value=0e0
+  token 25 8:3 word "js1s"
+  token 26 8:7 equals "="
+  token 27 8:8 number "0" value=0e0
+  token 28 8:10 word "js1d"
+  token 29 8:14 equals "="
+  token 30 8:15 number "0" value=0e0
+  token 31 8:17 word "ggr"
+  token 32 8:20 equals "="
+  token 33 8:21 number "0" value=0e0
 card 7 @netlists/m10_hfet1_tran.cir:9:1 lines=9-9 continuations=0
   raw: ".options reltol=1e-6 vntol=1e-10 abstol=1e-14"
   kind: dot(.options)

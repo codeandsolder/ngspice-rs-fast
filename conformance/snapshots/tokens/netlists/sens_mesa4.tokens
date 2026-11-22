@@ -87,22 +87,22 @@ card 7 @netlists/sens_mesa4.cir:19:1 lines=19-20 continuations=1
   token 23 19:61 word "gamma"
   token 24 19:66 equals "="
   token 25 19:67 number "2.5" value=2.5e0
-  token 26 19:71 word "nmax"
-  token 27 19:75 equals "="
-  token 28 19:76 number "4e16" value=4e16
-  token 29 19:81 word "cas"
-  token 30 19:84 equals "="
-  token 31 19:85 number "0.9" value=9e-1
-  token 32 19:89 word "cbs"
-  token 33 19:92 equals "="
-  token 34 19:93 number "1.1" value=1.1e0
-  token 35 19:97 word "epsi"
-  token 36 19:101 equals "="
-  token 37 19:102 number "1.142189e-10" value=1.1421889999999999e-10
-  token 38 19:115 word "phib"
-  token 39 19:119 equals "="
-  token 40 19:120 number "3.1232e18" value=3.1232e18
-  token 41 19:129 rparen ")"
+  token 26 20:3 word "nmax"
+  token 27 20:7 equals "="
+  token 28 20:8 number "4e16" value=4e16
+  token 29 20:13 word "cas"
+  token 30 20:16 equals "="
+  token 31 20:17 number "0.9" value=9e-1
+  token 32 20:21 word "cbs"
+  token 33 20:24 equals "="
+  token 34 20:25 number "1.1" value=1.1e0
+  token 35 20:29 word "epsi"
+  token 36 20:33 equals "="
+  token 37 20:34 number "1.142189e-10" value=1.1421889999999999e-10
+  token 38 20:47 word "phib"
+  token 39 20:51 equals "="
+  token 40 20:52 number "3.1232e18" value=3.1232e18
+  token 41 20:61 rparen ")"
 card 8 @netlists/sens_mesa4.cir:21:1 lines=21-21 continuations=0
   raw: ".sens i(vids)"
   kind: dot(.sens)
