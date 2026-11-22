@@ -54,13 +54,13 @@ pub struct Ngspice {
 /// (including the environment override) must be usable; it never silently
 /// falls back to a different oracle.
 pub fn locate(explicit: Option<&Path>, workspace: &Path) -> Result<Ngspice, String> {
-    let candidates = if let Some(path) = explicit {
-        vec![path.to_path_buf()]
-    } else if let Some(from_env) = std::env::var_os("NGSPICE_BIN") {
-        vec![PathBuf::from(from_env)]
-    } else {
-        vec![PathBuf::from("build/src/ngspice"), PathBuf::from("ngspice")]
-    };
+    let selected = explicit
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("NGSPICE_BIN").map(PathBuf::from));
+    let candidates = selected.map_or_else(
+        || vec![PathBuf::from("build/src/ngspice"), PathBuf::from("ngspice")],
+        |path| vec![path],
+    );
 
     let mut tried = Vec::new();
     for candidate in candidates {
