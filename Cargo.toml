@@ -75,7 +75,7 @@ generated-lint-boundaries = ["src/devices/bsim4/fields.rs"]
 
 [workspace]
 resolver = "3"
-members = ["xtask"]
+members = ["xtask", "conformance/support"]
 
 [workspace.package]
 version = "0.4.0"
@@ -106,6 +106,9 @@ petgraph = "0.8.3"
 [dependencies]
 winnow.workspace = true
 petgraph.workspace = true
+
+[dev-dependencies]
+ngspice-conformance = { path = "conformance/support" }
 
 [workspace.lints.rust]
 missing_docs = "warn"
