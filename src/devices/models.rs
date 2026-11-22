@@ -177,8 +177,9 @@ impl<'a> Declaration<'a> {
     }
 }
 
-/// Immutable lookup over one deck's top-level declarations. Duplicate names
-/// retain the first card as INPmakeMod does; all cards stay visible in the AST.
+/// Immutable lookup over one deck's top-level declarations.
+///
+/// Duplicate names retain the first card as `INPmakeMod` does; all cards stay visible in the AST.
 /// Selector and bin metadata are scoped to this borrowed deck, and validated
 /// on demand. No geometry-dependent result or backend state is cached.
 #[derive(Debug)]

@@ -480,3 +480,38 @@ fn selector_failures_remain_declaration_local_and_follow_family_check() {
         "nch.1"
     );
 }
+
+#[test]
+fn scoped_bin_groups_emit_once_in_declaration_order_for_each_instance() {
+    use ngspice_rs::devices::subckt::{SubcircuitLimits, expand_subcircuits};
+    use ngspice_rs::netlist::eval::ParamScope;
+    use std::sync::Arc;
+
+    let deck = parse(
+        "\
+x1 d g inv
+x2 d g inv
+.subckt inv a b
+m1 a b 0 0 nch w=1u l=1u
+m2 a b 0 0 nch w=1u l=1u
+.model nch.10 nmos level=8 lmin=0.5u lmax=2u wmin=0.5u wmax=2u
+.model nch.2 nmos level=8 lmin=0.5u lmax=2u wmin=0.5u wmax=2u
+.model NCH.10 nmos level=8 lmin=10u lmax=20u wmin=10u wmax=20u
+.ends
+",
+    );
+    let scope = Arc::new(ParamScope::root(&deck.params).unwrap());
+    let expanded = expand_subcircuits(&deck, &scope, SubcircuitLimits::default()).unwrap();
+    assert_eq!(
+        names(expanded.models.iter()),
+        ["x1.nch.10", "x1.nch.2", "x2.nch.10", "x2.nch.2"]
+    );
+    let resolver = ModelResolver::new(&expanded.models).unwrap();
+    for instance in expanded.devices.iter().filter(|d| d.designator == 'm') {
+        let selected = resolver.resolve(instance).unwrap().unwrap();
+        assert_eq!(
+            selected.card().name,
+            format!("{}.2", instance.model.as_deref().unwrap())
+        );
+    }
+}

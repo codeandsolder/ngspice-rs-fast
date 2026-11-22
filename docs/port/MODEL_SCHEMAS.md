@@ -225,8 +225,9 @@ declarations whose final dotted suffix is nonempty ASCII digits. Groups retain
 declaration order, so bin selection can walk them in reverse without scanning
 unrelated models or sorting candidates. Exact and bin lookup expose borrowed
 iterators for declaration marking. Scoped expansion uses the same indexing rule
-for each individual frame; renamed cards are emitted in declaration order and
-cloned only at first use.
+for each individual frame; renamed cards are moved into the flattened deck at first use, with bin sets
+emitted in declaration order. Root frames retain only names, not duplicate
+model parameter lists.
 
 The resolver reuses declaration-local family, selector and bin-bound metadata.
 Family validation is performed when a declaration is resolved, selector

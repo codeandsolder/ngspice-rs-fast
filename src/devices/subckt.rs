@@ -217,12 +217,14 @@ pub fn expand_with_output(
     })
 }
 
-/// One frame's model declarations: canonical local name to flattened name and
-/// the card as it will be declared at top level.
-#[derive(Debug, Clone)]
+/// One frame's model identity and an owned card awaiting first use.
+///
+/// Root cards already reside in the flattened deck; local cards are moved
+/// there once, while their flattened names remain available for lookup.
+#[derive(Debug)]
 struct LocalModel {
-    card: ModelCard,
-    emitted: bool,
+    name: String,
+    pending: Option<ModelCard>,
 }
 
 #[derive(Default)]
@@ -644,8 +646,8 @@ impl Expander<'_> {
         let mut index = DeclarationIndex::new();
         for card in &self.netlist.models {
             index.insert_first(&card.name, || LocalModel {
-                card: card.clone(),
-                emitted: true,
+                name: card.name.clone(),
+                pending: None,
             });
         }
         index
@@ -654,15 +656,16 @@ impl Expander<'_> {
     /// One frame's literalized models, renamed to `<path>.<name>`. They stay
     /// out of the flattened deck until a device in this frame or a descendant
     /// frame references one, so unused declarations are not invented.
-    fn local_models(cards: &[ModelCard], path: &str) -> DeclarationIndex<LocalModel> {
+    fn local_models(cards: Vec<ModelCard>, path: &str) -> DeclarationIndex<LocalModel> {
         let mut index = DeclarationIndex::new();
-        for card in cards {
-            index.insert_first(&card.name, || LocalModel {
-                card: ModelCard {
-                    name: format!("{path}.{}", card.name),
-                    ..card.clone()
-                },
-                emitted: false,
+        for mut card in cards {
+            let source_name = std::mem::take(&mut card.name);
+            index.insert_first(&source_name, || {
+                card.name = format!("{path}.{source_name}");
+                LocalModel {
+                    name: card.name.clone(),
+                    pending: Some(card),
+                }
             });
         }
         index
@@ -840,7 +843,7 @@ impl Expander<'_> {
             format!("{path}.{}", instance.name)
         };
         let body = self.literalize_body(definition, &scope)?;
-        locals.push(Self::local_models(&body.models, &child_path));
+        locals.push(Self::local_models(body.models, &child_path));
         let result = self.expand_body(
             &child_path,
             depth + 1,
@@ -1005,13 +1008,8 @@ impl Expander<'_> {
         };
         for frame in locals.iter_mut().rev() {
             if let Some(local) = frame.get_mut(reference) {
-                if !local.emitted {
-                    self.models.push(local.card.clone());
-                    self.emitted_locals
-                        .insert(local.card.name.to_ascii_lowercase());
-                    local.emitted = true;
-                }
-                instance.model = Some(local.card.name.clone());
+                self.emit_model(local);
+                instance.model = Some(local.name.clone());
                 return;
             }
             // A frame declaring only `<name>.<digits>` bins also captures
@@ -1025,8 +1023,15 @@ impl Expander<'_> {
         }
     }
 
+    fn emit_model(&mut self, local: &mut LocalModel) {
+        if let Some(card) = local.pending.take() {
+            self.emitted_locals.insert(local.name.to_ascii_lowercase());
+            self.models.push(card);
+        }
+    }
+
     /// Bind an M reference to a frame's bin set, emitting the ordered
-    /// declarations once and leaving geometry selection to ModelResolver.
+    /// declarations once and leaving geometry selection to `ModelResolver`.
     fn rewrite_binned(
         &mut self,
         key: &str,
@@ -1034,15 +1039,9 @@ impl Expander<'_> {
     ) -> Option<String> {
         let (ids, entries) = frame.bin_slots_mut(key);
         let first = &entries[*ids.first()?];
-        let base = bin_base(&first.card.name)?.to_owned();
+        let base = bin_base(&first.name)?.to_owned();
         for &id in ids {
-            let local = &mut entries[id];
-            if !local.emitted {
-                self.models.push(local.card.clone());
-                self.emitted_locals
-                    .insert(local.card.name.to_ascii_lowercase());
-                local.emitted = true;
-            }
+            self.emit_model(&mut entries[id]);
         }
         if !base.eq_ignore_ascii_case(key) {
             self.binned_bases.insert(base.to_ascii_lowercase());
