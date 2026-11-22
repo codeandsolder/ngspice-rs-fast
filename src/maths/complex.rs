@@ -7,7 +7,8 @@
 use std::sync::Arc;
 
 use crate::maths::linear::{
-    ComplexFactors, PivotTolerances, check_status, numerical, order_fresh, square,
+    BatchSolveFailure, ComplexFactors, PivotTolerances, SolveBatchWorkspace, check_status,
+    numerical, order_fresh, square,
 };
 use crate::maths::sparse13::{Sparse, Status};
 use crate::maths::{FactorStorage, FactorWork, Pattern, SparseMatrix};
@@ -571,6 +572,26 @@ impl ComplexLu {
             ));
         }
         Ok(())
+    }
+
+    /// Solve consecutive RHS-major vectors using one factor traversal per tile.
+    ///
+    /// Output preserves RHS order and external matrix ordering. Transposition
+    /// does not conjugate the factors. Scratch and output capacities are reusable.
+    ///
+    /// # Errors
+    /// Invalid RHS length, non-finite input or solution, or insufficient storage.
+    pub fn solve_batch_into(
+        &self,
+        rhs: &[Complex],
+        workspace: &mut SolveBatchWorkspace<Complex>,
+        out: &mut Vec<Complex>,
+        transposed: bool,
+    ) -> Result<(), BatchSolveFailure> {
+        self.factors
+            .sparse
+            .factors()?
+            .solve_batch_into(rhs, workspace, out, transposed)
     }
 
     /// Binary-scaled determinant: `(mantissa, base-2 exponent)` with
