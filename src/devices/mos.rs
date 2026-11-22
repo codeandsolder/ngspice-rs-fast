@@ -610,7 +610,9 @@ impl Multiplicity {
 
 /// What a MOS level supplies to the shared shell. See the module
 /// documentation.
-pub(super) trait MosLevel: std::fmt::Debug + Clone + Copy + Sized + 'static {
+pub(super) trait MosLevel:
+    std::fmt::Debug + Clone + Copy + Sized + Send + Sync + 'static
+{
     /// The level's temperature-dependent channel parameters.
     type Params: std::fmt::Debug + Clone + Copy;
     /// The model `level` selector this implementation serves.
@@ -630,7 +632,7 @@ pub(super) trait MosLevel: std::fmt::Debug + Clone + Copy + Sized + 'static {
 
     /// The level's `mosXmparam.c` model table, for `inpgmod.c`'s instance
     /// fallback ([`crate::devices::schema::split_model_setters`]).
-    fn model_schema() -> ScalarSchema<'static>;
+    fn model_schema() -> &'static ScalarSchema<'static>;
 
     /// The level's validated model values plus the model-level **instance
     /// defaults** `inpgmod.c::create_model` collected from the same card.
@@ -650,17 +652,15 @@ pub(super) trait MosLevel: std::fmt::Debug + Clone + Copy + Sized + 'static {
         ScalarValues,
         Vec<&'a crate::netlist::ast::ParameterAssignment>,
     )> {
-        let instance = ScalarSchema {
-            parameters: INSTANCE,
-        };
+        let instance = &INSTANCE_SCHEMA;
         let (model_side, defaults) = crate::devices::schema::split_model_setters(
             resolved
                 .card()
                 .parameters
                 .iter()
                 .filter(|p| !p.name.eq_ignore_ascii_case("level")),
-            &Self::model_schema(),
-            &instance,
+            Self::model_schema(),
+            instance,
         );
         let values = Self::model_schema().validate(model_side, &resolved.card().location)?;
         Ok((values, defaults))
@@ -935,6 +935,13 @@ pub(super) struct Mosfet<L: MosLevel> {
     pub(super) derived: TemperatureCache<Operating<L::Params>>,
 }
 
+/// Model-only parse and ordered inherited setters. Every transistor
+/// still runs its own instance parser, geometry checks and thermal setup.
+struct MosPreparation<L> {
+    model: L,
+    defaults: Vec<crate::netlist::ast::ParameterAssignment>,
+}
+
 impl<L: MosLevel> Mosfet<L> {
     pub(crate) fn instantiate(
         i: &DeviceInstance,
@@ -950,15 +957,15 @@ impl<L: MosLevel> Mosfet<L> {
             )));
         }
         let (initial, setters) = crate::devices::initial::split(&i.parameters, &IC_COMPONENTS)?;
-        let (model, model_defaults) = L::from_card(resolved)?;
-        let v = crate::devices::schema::with_defaults(
-            &ScalarSchema {
-                parameters: INSTANCE,
-            },
-            &model_defaults,
-            setters.iter(),
-            &i.location,
-        )?;
+        let prepared = resolved.prepare(crate::devices::models::PreparationKey::Inputs, || {
+            let (model, defaults) = L::from_card(resolved)?;
+            Ok(MosPreparation {
+                model,
+                defaults: defaults.into_iter().cloned().collect(),
+            })
+        })?;
+        let model = prepared.model;
+        let v = INSTANCE_SCHEMA.validate(prepared.defaults.iter().chain(&setters), &i.location)?;
         let required = |name: &str| required(&v, name, L::LABEL);
         let geometry = Geometry {
             m: required("m")?,
@@ -1919,6 +1926,8 @@ impl<L: MosLevel> Device for Mosfet<L> {
         })
     }
 }
+
+static INSTANCE_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(INSTANCE);
 
 #[cfg(test)]
 mod tests {

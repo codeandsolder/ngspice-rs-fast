@@ -94,7 +94,15 @@ fn compare_with_c(
 fn ramp() -> (&'static str, Waveform) {
     (
         "PWL(0 0 1m 0 1.01m 1 6m 1)",
-        Waveform::Pwl(vec![(0., 0.), (0.001, 0.), (0.00101, 1.), (0.006, 1.)]),
+        Waveform::Pwl(
+            ngspice_rs::devices::PwlSource::plain(vec![
+                (0., 0.),
+                (0.001, 0.),
+                (0.00101, 1.),
+                (0.006, 1.),
+            ])
+            .unwrap(),
+        ),
     )
 }
 

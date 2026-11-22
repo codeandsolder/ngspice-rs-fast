@@ -267,12 +267,12 @@ fn every_r_setter_is_validated_in_order_like_c() {
     }
     // Valid setters: the last wins, and r=-1 switches repetition off again.
     let s = system("v1 a 0 pwl(0 0 1m 1 2m 0) r=1m r=0\nr1 a 0 1");
-    let Waveform::PwlSource(pwl) = &s.sources[0].waveform else {
+    let Waveform::Pwl(pwl) = &s.sources[0].waveform else {
         panic!("{:?}", s.sources[0].waveform);
     };
     assert_eq!(pwl.repeat(), Some(0));
     let s = system("v1 a 0 pwl(0 0 1m 1 2m 0) r=0 r=-1\nr1 a 0 1");
-    let Waveform::PwlSource(pwl) = &s.sources[0].waveform else {
+    let Waveform::Pwl(pwl) = &s.sources[0].waveform else {
         panic!("{:?}", s.sources[0].waveform);
     };
     assert_eq!(pwl.repeat(), None);

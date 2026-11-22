@@ -68,9 +68,10 @@ pub use fourier::{FourierAnalysis, FourierWindow, Harmonic};
 pub use measure::{MeasureEvents, MeasureSpan, Measurement};
 pub use plan::{AnalysisPlan, IntegrationFamily};
 pub use rawfile::{
-    BinaryByteOrder, RawFile, RawFileReader, RawFileWriter, RawFormat, RawPlot, RawPlotRows,
-    StreamedPlot,
+    BinaryByteOrder, RawCollectPolicy, RawFile, RawFileReader, RawFileWriter, RawFormat, RawPlot,
+    RawPlotRows, RawReadPolicy, StreamedPlot,
 };
+pub use rawfile::{FinishedPlot, RawFileTransaction};
 pub use results::{Plot, PlotBuilder, PlotFlags, PlotSchema, PointSink, Variable};
 pub use selection::{Selection, print_requests, write_requests};
 

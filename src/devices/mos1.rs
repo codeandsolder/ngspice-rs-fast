@@ -155,8 +155,8 @@ impl MosLevel for Level1 {
     /// `mos1set.c`: `CKTmkVolt(..., "drain")` / `"source"`.
     const PRIME_SUFFIXES: [&'static str; 2] = ["drain", "source"];
 
-    fn model_schema() -> ScalarSchema<'static> {
-        ScalarSchema { parameters: MODEL }
+    fn model_schema() -> &'static ScalarSchema<'static> {
+        &MODEL_SCHEMA
     }
 
     fn from_card<'a>(
@@ -342,3 +342,5 @@ impl MosLevel for Level1 {
         device.distortion_terms(context)
     }
 }
+
+static MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(MODEL);

@@ -14,7 +14,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use ngspice_rs::analysis::{
-    BinaryByteOrder, Plot, PlotFlags, RawFile, RawFileReader, RawFormat, Variable,
+    BinaryByteOrder, Plot, PlotFlags, RawCollectPolicy, RawFile, RawFileReader, RawFormat,
+    RawReadPolicy, Variable,
 };
 use ngspice_rs::primitives::Complex;
 
@@ -101,7 +102,15 @@ fn collect() {
 fn iterate() {
     let input = BufReader::new(File::open(fixture()).unwrap());
     let start = Instant::now();
-    let mut reader = RawFileReader::new(input);
+    let mut reader = RawFileReader::new(input).with_policy(RawReadPolicy {
+        collect: RawCollectPolicy {
+            cells: 0,
+            rows: 0,
+            header_bytes: 0,
+            variables: 0,
+        },
+        ..RawReadPolicy::DEFAULT
+    });
     let mut rows = reader.next_plot().unwrap().unwrap();
     let mut count = 0;
     while let Some(row) = rows.next_row().unwrap() {

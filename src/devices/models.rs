@@ -24,7 +24,9 @@
 //! # Ok::<(), ngspice_rs::primitives::SpiceError>(())
 //! ```
 
-use std::sync::OnceLock;
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::devices::binning::{BinCandidate, BinOptions, BinOutcome, DeclarationIndex, select_bin};
 
@@ -148,6 +150,59 @@ pub struct LevelSelection {
     pub applied: Option<u8>,
 }
 
+/// Identity of the immutable preparation behind one resolved declaration.
+/// A scalar schema is a static object with a stable address. Nominal keys
+/// retain the exact binary64 value, including signed zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum PreparationKey {
+    Inputs,
+    Scalar(usize),
+    Nominal(u64),
+}
+
+type PreparationCell<T> = OnceLock<SpiceResult<Arc<T>>>;
+
+/// Only immutable, declaration-scoped artifacts belong here. The value type
+/// distinguishes the backend and preparation stage; the key distinguishes
+/// schema/context variants of that stage. Never cache instance-local errors,
+/// resettable models, geometry, or solver state.
+#[derive(Default)]
+pub(super) struct PreparationCache {
+    entries: Mutex<HashMap<(TypeId, PreparationKey), Arc<dyn Any + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for PreparationCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparationCache").finish_non_exhaustive()
+    }
+}
+
+impl PreparationCache {
+    pub(super) fn get_or_prepare<T: Send + Sync + 'static>(
+        &self,
+        key: PreparationKey,
+        prepare: impl FnOnce() -> SpiceResult<T>,
+    ) -> SpiceResult<Arc<T>> {
+        let cell = {
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| SpiceError::circuit("model preparation cache poisoned"))?;
+            Arc::clone(
+                entries
+                    .entry((TypeId::of::<T>(), key))
+                    .or_insert_with(|| Arc::new(PreparationCell::<T>::new())),
+            )
+        };
+        let cell = cell
+            .downcast::<PreparationCell<T>>()
+            .map_err(|_| SpiceError::circuit("inconsistent model preparation cache type"))?;
+        // Initialization may itself use another preparation stage. Drop the
+        // map lock before running the closure; a single cell publishes once.
+        cell.get_or_init(|| prepare().map(Arc::new)).clone()
+    }
+}
+
 /// Declaration-local metadata. Validate family first, and defer level
 /// validation until an instance has passed the family/designator check.
 #[derive(Debug)]
@@ -155,6 +210,7 @@ struct Declaration<'a> {
     bin: BinCandidate<'a>,
     family: OnceLock<SpiceResult<ModelFamily>>,
     levels: OnceLock<SpiceResult<LevelSelection>>,
+    preparation: OnceLock<Arc<PreparationCache>>,
 }
 
 impl<'a> Declaration<'a> {
@@ -163,6 +219,7 @@ impl<'a> Declaration<'a> {
             bin: BinCandidate::new(card),
             family: OnceLock::new(),
             levels: OnceLock::new(),
+            preparation: OnceLock::new(),
         }
     }
 
@@ -181,7 +238,8 @@ impl<'a> Declaration<'a> {
 ///
 /// Duplicate names retain the first card as `INPmakeMod` does; all cards stay visible in the AST.
 /// Selector and bin metadata are scoped to this borrowed deck, and validated
-/// on demand. No geometry-dependent result or backend state is cached.
+/// on demand. Immutable preparation artifacts are shared by exact declaration;
+/// geometry-dependent results and mutable backend state remain instance-local.
 #[derive(Debug)]
 pub struct ModelResolver<'a> {
     declarations: DeclarationIndex<Declaration<'a>>,
@@ -370,17 +428,19 @@ impl<'a> ModelResolver<'a> {
             card,
             family,
             levels,
+            preparation: Arc::clone(declaration.preparation.get_or_init(Arc::default)),
         }))
     }
 }
 
 /// A resolved borrowed declaration. Parameter validation is an explicit,
 /// device-owned schema operation, separate from lookup and selector choice.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ResolvedModel<'a> {
     card: &'a ModelCard,
     family: ModelFamily,
     levels: LevelSelection,
+    preparation: Arc<PreparationCache>,
 }
 
 impl<'a> ResolvedModel<'a> {
@@ -402,19 +462,32 @@ impl<'a> ResolvedModel<'a> {
         self.levels
     }
 
+    /// Shared immutable data for this exact declaration (not its name).
+    pub(super) fn prepare<T: Send + Sync + 'static>(
+        &self,
+        key: PreparationKey,
+        prepare: impl FnOnce() -> SpiceResult<T>,
+    ) -> SpiceResult<Arc<T>> {
+        self.preparation.get_or_prepare(key, prepare)
+    }
+
     /// Apply a device-owned scalar schema, excluding `level` already consumed
     /// by selector/setter validation. Never ignores unknown physics keywords.
     ///
     /// # Errors
     /// The supplied schema's validation failures, with source provenance.
-    pub fn parameters(&self, schema: &ScalarSchema<'_>) -> SpiceResult<ScalarValues> {
-        schema.validate(
-            self.card
-                .parameters
-                .iter()
-                .filter(|p| !p.name.eq_ignore_ascii_case("level")),
-            &self.card.location,
-        )
+    pub fn parameters(&self, schema: &'static ScalarSchema<'static>) -> SpiceResult<ScalarValues> {
+        let key = PreparationKey::Scalar(std::ptr::from_ref(schema).addr());
+        self.prepare(key, || {
+            schema.validate(
+                self.card
+                    .parameters
+                    .iter()
+                    .filter(|p| !p.name.eq_ignore_ascii_case("level")),
+                &self.card.location,
+            )
+        })
+        .map(|values| (*values).clone())
     }
 
     /// Validate the initial diode core: IS/N/RS/TNOM only. Defaults follow
@@ -687,50 +760,46 @@ pub struct DiodeInstanceParameters {
     pub temperature_kelvin: Real,
 }
 
-const DIODE_MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema {
-    parameters: &[
-        ScalarParameter {
-            name: "is",
-            unit: ScalarUnit::Ampere,
-            domain: ScalarDomain::Positive,
-            default: Some(1e-14),
-        },
-        ScalarParameter {
-            name: "n",
-            unit: ScalarUnit::Dimensionless,
-            domain: ScalarDomain::Positive,
-            default: Some(1.0),
-        },
-        ScalarParameter {
-            name: "rs",
-            unit: ScalarUnit::Ohm,
-            domain: ScalarDomain::NonNegative,
-            default: Some(0.0),
-        },
-        ScalarParameter {
-            name: "tnom",
-            unit: ScalarUnit::Celsius,
-            domain: ScalarDomain::Temperature,
-            default: None,
-        },
-    ],
-};
-const DIODE_INSTANCE_SCHEMA: ScalarSchema<'static> = ScalarSchema {
-    parameters: &[
-        ScalarParameter {
-            name: "area",
-            unit: ScalarUnit::Dimensionless,
-            domain: ScalarDomain::Positive,
-            default: Some(1.0),
-        },
-        ScalarParameter {
-            name: "temp",
-            unit: ScalarUnit::Celsius,
-            domain: ScalarDomain::Temperature,
-            default: None,
-        },
-    ],
-};
+static DIODE_MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(&[
+    ScalarParameter {
+        name: "is",
+        unit: ScalarUnit::Ampere,
+        domain: ScalarDomain::Positive,
+        default: Some(1e-14),
+    },
+    ScalarParameter {
+        name: "n",
+        unit: ScalarUnit::Dimensionless,
+        domain: ScalarDomain::Positive,
+        default: Some(1.0),
+    },
+    ScalarParameter {
+        name: "rs",
+        unit: ScalarUnit::Ohm,
+        domain: ScalarDomain::NonNegative,
+        default: Some(0.0),
+    },
+    ScalarParameter {
+        name: "tnom",
+        unit: ScalarUnit::Celsius,
+        domain: ScalarDomain::Temperature,
+        default: None,
+    },
+]);
+static DIODE_INSTANCE_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(&[
+    ScalarParameter {
+        name: "area",
+        unit: ScalarUnit::Dimensionless,
+        domain: ScalarDomain::Positive,
+        default: Some(1.0),
+    },
+    ScalarParameter {
+        name: "temp",
+        unit: ScalarUnit::Celsius,
+        domain: ScalarDomain::Temperature,
+        default: None,
+    },
+]);
 
 fn required(values: &ScalarValues, name: &str, location: &SourceLoc) -> SpiceResult<Real> {
     values.get(name).map(|v| v.value).ok_or_else(|| {
