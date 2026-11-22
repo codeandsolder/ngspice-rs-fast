@@ -340,3 +340,40 @@ pub(super) fn select(model: &Model, here: &Instance, ckt: &mut dyn LoadCkt) -> L
         vses,
     }
 }
+
+/// Store limited terminal voltages and report limiting in C order.
+pub(super) fn commit(here: &Instance, ckt: &mut dyn LoadCkt, bias: &LoadBias) {
+    let &LoadBias {
+        Check,
+        qdef,
+        vbd,
+        vbs,
+        vdbd,
+        vdbs,
+        vdes,
+        vds,
+        vges,
+        vgms,
+        vgs,
+        vsbs,
+        vses,
+        ..
+    } = bias;
+    if (here.off == 0) || ((ckt.mode() & mode::MODEINITFIX) == 0) {
+        if Check == 1 {
+            ckt.noncon();
+        }
+    }
+    ckt.set_state0(state::VDS, vds);
+    ckt.set_state0(state::VGS, vgs);
+    ckt.set_state0(state::VBS, vbs);
+    ckt.set_state0(state::VBD, vbd);
+    ckt.set_state0(state::VGES, vges);
+    ckt.set_state0(state::VGMS, vgms);
+    ckt.set_state0(state::VDBS, vdbs);
+    ckt.set_state0(state::VDBD, vdbd);
+    ckt.set_state0(state::VSBS, vsbs);
+    ckt.set_state0(state::VSES, vses);
+    ckt.set_state0(state::VDES, vdes);
+    ckt.set_state0(state::QDEF, qdef);
+}
