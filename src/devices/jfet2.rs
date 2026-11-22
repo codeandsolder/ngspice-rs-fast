@@ -528,7 +528,7 @@ impl Model {
         );
         gds = f64::mul_add(gm, arg, gds);
         gm *= f64::mul_add(
-            (1. - h),
+            1. - h,
             f64::mul_add(lfg1, vgdtrap, f64::mul_add(hfg1, -dvgd, hfe2 * dvgs)),
             f64::mul_add(h, -eta, 1.),
         ) - arg;
