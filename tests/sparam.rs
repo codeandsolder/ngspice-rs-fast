@@ -709,3 +709,28 @@ fn reusable_rf_sweep_matches_independent_frequencies_with_noise() {
         }
     }
 }
+
+#[test]
+fn rf_parameter_observations_match_the_bound_schema() {
+    let deck = "RF observations\nv1 in 0 portnum 1 z0 50\nr1 in 0 100\n.sp lin 3 1k 3k\n.end\n";
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("rf-observations.cir"), deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let original = plan.run(&mut circuit, &config.context()).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    circuit
+        .set_observations(&["@r1[resistance]".into()])
+        .unwrap();
+    let observed = plan.run(&mut circuit, &config.context()).unwrap();
+    assert_eq!(observed.point_count(), original.point_count());
+    let index = observed.variable_index("@r1[resistance]").unwrap();
+    assert_eq!(index + 1, observed.variable_index("S_1_1").unwrap());
+    for (row, base) in observed.rows().zip(original.rows()) {
+        assert_eq!(row[index], Complex::real(100.));
+        assert_eq!(&row[..index], &base[..index]);
+        assert_eq!(&row[index + 1..], &base[index..]);
+    }
+}

@@ -304,12 +304,12 @@ pub(super) fn run(
     let settings = request.dc_settings().clone();
     circuit.finalize()?;
     let mut plan = RfPlan::bind(circuit, grid, donoise, include_bias, context.rf_limits)?;
-    let mut workspace = RfWorkspace::new(&plan)?;
-    let mut plot = parameter_plot(circuit, plan.ports.len(), donoise, plan.budget.width)?;
-    plot.reserve_points(plan.grid.len())?;
     let mut small_signal = SmallSignal::prepare(circuit, request, context, settings)?;
     let mut plots = small_signal.retained_bias(circuit, request, context, include_bias)?;
     reject_imaginary_current_excitation(small_signal.system())?;
+    let mut workspace = RfWorkspace::new(&plan)?;
+    let mut plot = parameter_plot(circuit, plan.ports.len(), donoise, plan.budget.width)?;
+    plot.reserve_points(plan.grid.len())?;
     let reference = plan.ports[0].z0;
     for &f in plan.grid {
         let factor = small_signal.at_frequency(circuit, context, f, |system| {
@@ -324,9 +324,11 @@ pub(super) fn run(
         workspace.point.clear();
         workspace.point.push(Complex::real(f));
         workspace.point.extend_from_slice(&workspace.solve.solution);
-        workspace
-            .point
-            .extend(circuit.observe_parameters(&context.model_context().with_frequency(f))?);
+        if !circuit.observations().is_empty() {
+            workspace
+                .point
+                .extend(circuit.observe_parameters(&context.model_context().with_frequency(f))?);
+        }
         for matrix in [
             &workspace.algebra.s,
             &workspace.algebra.y,
