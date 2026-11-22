@@ -153,9 +153,11 @@ node, are checked structurally first using a typed constraint graph. Its
 numeric spanning forest and structural components share the same edge
 provenance; E/H outputs connect the structural components without inventing
 a voltage. Redundant voltage checks walk from the positive terminal to the
-negative terminal, preserving each reference addition/subtraction and stopping
-at the requested endpoint. Traversal scratch is reused and only previously
-visited vertices are cleared. A weighted union-find would change rounding: an `.ic` that disagrees beyond
+negative terminal along rooted forest links, preserving each reference
+addition/subtraction and visiting only that path. Connecting two components
+re-roots only the smaller component; redundant checks allocate no full-size
+potential vector. Scratch is reused. A weighted union-find would change
+rounding: an `.ic` that disagrees beyond
 `reltol`/`vntol`, or two entries on rigidly tied nodes, is an explicit error
 instead of C's meaningless `1e10` compromise (`i(v1) = -1e10`). A node with
 only capacitors (no DC point) becomes solvable through its `.ic`.

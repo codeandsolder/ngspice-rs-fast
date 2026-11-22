@@ -51,7 +51,7 @@ struct Equation<'a> {
 }
 
 impl<'a> Equation<'a> {
-    fn new(origin: EquationOrigin<'a>, rhs: Real) -> Self {
+    const fn new(origin: EquationOrigin<'a>, rhs: Real) -> Self {
         Self {
             origin,
             rhs,
@@ -333,7 +333,7 @@ impl<'a> InstantaneousSystem<'a> {
             .bindings
             .iter()
             .map(|binding| match *binding {
-                Binding::FixedCurrent(value) => Some(value),
+                Binding::FixedCurrent(_) => None,
                 Binding::Unknown { variable, .. } => {
                     column_index[variable.0].map(|col| solution.as_slice()[col.0])
                 }

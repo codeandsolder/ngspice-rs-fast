@@ -70,36 +70,140 @@ pub(super) enum Join {
     Cycle { expected: Real },
 }
 
+type RelationGraph<'a> = UnGraph<(), Relation<'a>, usize>;
+
+#[derive(Clone, Copy, Default)]
+struct ForestNode {
+    parent: Option<(NodeIndex<usize>, EdgeIndex<usize>)>,
+    depth: usize,
+}
+
+/// Root the numeric forest without storing weighted potentials. Joining
+/// components re-roots only the smaller component (amortized O(n log n)).
+/// A redundant relation then follows exactly its unique path, not an entire
+/// connected component. Arithmetic is performed later in path order.
+struct KnownForest {
+    components: UnionFind<usize>,
+    sizes: Vec<usize>,
+    nodes: Vec<ForestNode>,
+    pending: Vec<NodeIndex<usize>>,
+    reverse: Vec<EdgeIndex<usize>>,
+}
+
+impl KnownForest {
+    fn new(vertices: usize) -> Self {
+        Self {
+            components: UnionFind::new(vertices),
+            sizes: vec![1; vertices],
+            nodes: vec![ForestNode::default(); vertices],
+            pending: Vec::new(),
+            reverse: Vec::new(),
+        }
+    }
+
+    fn equiv(&self, a: VoltageVertex, b: VoltageVertex) -> bool {
+        self.components.equiv(a.index(), b.index())
+    }
+
+    fn connect(
+        &mut self,
+        graph: &RelationGraph<'_>,
+        mut child: NodeIndex<usize>,
+        mut parent: NodeIndex<usize>,
+        edge: EdgeIndex<usize>,
+    ) {
+        let mut small = self.components.find(child.index());
+        let mut large = self.components.find(parent.index());
+        if self.sizes[small] > self.sizes[large] {
+            std::mem::swap(&mut small, &mut large);
+            std::mem::swap(&mut child, &mut parent);
+        }
+        let size = self.sizes[small] + self.sizes[large];
+        self.components.union(small, large);
+        self.sizes[self.components.find(small)] = size;
+
+        self.nodes[child.index()] = ForestNode {
+            parent: Some((parent, edge)),
+            depth: self.nodes[parent.index()].depth + 1,
+        };
+        self.pending.push(child);
+        while let Some(node) = self.pending.pop() {
+            let entry = self.nodes[node.index()];
+            for link in graph.edges(node) {
+                let next = link.target();
+                if !matches!(link.weight().voltage, Voltage::Known(_))
+                    || entry.parent.is_some_and(|(parent, _)| parent == next)
+                {
+                    continue;
+                }
+                // Known edges are acyclic. The new parent is the only edge
+                // leading outside the smaller component.
+                self.nodes[next.index()] = ForestNode {
+                    parent: Some((node, link.id())),
+                    depth: entry.depth + 1,
+                };
+                self.pending.push(next);
+            }
+        }
+    }
+
+    fn ascend(&self, node: NodeIndex<usize>) -> SpiceResult<(NodeIndex<usize>, EdgeIndex<usize>)> {
+        self.nodes[node.index()]
+            .parent
+            .ok_or_else(|| failure("constraint forest path reached an unrelated root"))
+    }
+
+    fn path(
+        &mut self,
+        mut a: NodeIndex<usize>,
+        mut b: NodeIndex<usize>,
+        output: &mut Vec<EdgeIndex<usize>>,
+    ) -> SpiceResult<()> {
+        output.clear();
+        self.reverse.clear();
+        while a != b {
+            let left_depth = self.nodes[a.index()].depth;
+            let right_depth = self.nodes[b.index()].depth;
+            if left_depth >= right_depth {
+                let (parent, edge) = self.ascend(a)?;
+                output.push(edge);
+                a = parent;
+            }
+            if right_depth >= left_depth {
+                let (parent, edge) = self.ascend(b)?;
+                self.reverse.push(edge);
+                b = parent;
+            }
+        }
+        output.extend(self.reverse.iter().rev().copied());
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Visit {
     node: NodeIndex<usize>,
     parent: Option<(usize, EdgeIndex<usize>)>,
-    potential: Real,
-}
-
-#[derive(Clone, Copy)]
-enum PathKind {
-    Known,
-    Rigid,
 }
 
 /// A single graph records both numeric and controlled voltage constraints.
 /// Known edges form a spanning forest; controlled edges add structural
 /// rigidity but never contribute a guessed numeric voltage. Component
-/// indexes answer connectivity queries without a traversal. Path scratch is
-/// allocated once, cleared only for vertices reached by the previous walk.
+/// indexes answer connectivity queries without a traversal. Numeric cycle
+/// checks use rooted-forest links; controlled paths use a targeted graph walk
+/// with reused scratch, clearing only previously visited vertices.
 pub(super) struct ConstraintGraph<'a> {
-    graph: UnGraph<(), Relation<'a>, usize>,
-    known: UnionFind<usize>,
+    graph: RelationGraph<'a>,
+    known: KnownForest,
     rigid: UnionFind<usize>,
     visited: Vec<bool>,
     visits: Vec<Visit>,
     pending: Vec<usize>,
-    end: Option<usize>,
+    path: Vec<EdgeIndex<usize>>,
 }
 
 impl<'a> ConstraintGraph<'a> {
-    pub(super) fn new(unknowns: usize) -> SpiceResult<Self> {
+    fn new(unknowns: usize) -> SpiceResult<Self> {
         let vertices = unknowns
             .checked_add(1)
             .ok_or_else(|| failure("constraint vertex count overflow"))?;
@@ -109,12 +213,12 @@ impl<'a> ConstraintGraph<'a> {
         }
         Ok(Self {
             graph,
-            known: UnionFind::new(vertices),
+            known: KnownForest::new(vertices),
             rigid: UnionFind::new(vertices),
             visited: vec![false; vertices],
             visits: Vec::new(),
             pending: Vec::new(),
-            end: None,
+            path: Vec::new(),
         })
     }
 
@@ -186,7 +290,7 @@ impl<'a> ConstraintGraph<'a> {
     }
 
     pub(super) fn controlled_implies(&self, a: VoltageVertex, b: VoltageVertex) -> bool {
-        !self.known.equiv(a.index(), b.index()) && self.rigid.equiv(a.index(), b.index())
+        !self.known.equiv(a, b) && self.rigid.equiv(a.index(), b.index())
     }
 
     pub(super) fn join(
@@ -199,10 +303,10 @@ impl<'a> ConstraintGraph<'a> {
         if !value.is_finite() {
             return Err(failure(format!("nonfinite voltage relation at {origin}")));
         }
-        if self.known.equiv(positive.index(), negative.index()) {
+        if self.known.equiv(positive, negative) {
             // The old traversal started at the positive terminal with +0,
             // followed the unique forest path and negated the final result.
-            let expected = -self.walk(positive, negative, PathKind::Known)?;
+            let expected = self.difference(positive, negative)?;
             if !expected.is_finite() {
                 return Err(failure(format!(
                     "nonfinite voltage cycle at {origin} (path: {})",
@@ -211,9 +315,8 @@ impl<'a> ConstraintGraph<'a> {
             }
             return Ok(Join::Cycle { expected });
         }
-        self.known.union(positive.index(), negative.index());
         self.rigid.union(positive.index(), negative.index());
-        self.graph.add_edge(
+        let edge = self.graph.add_edge(
             positive.graph_node(),
             negative.graph_node(),
             Relation {
@@ -222,94 +325,102 @@ impl<'a> ConstraintGraph<'a> {
                 origin,
             },
         );
+        self.known.connect(
+            &self.graph,
+            positive.graph_node(),
+            negative.graph_node(),
+            edge,
+        );
         Ok(Join::Tree)
     }
 
-    /// Walk only until the requested endpoint is reached. For a known voltage
-    /// path, its sequence of additions/subtractions is exactly the previous
-    /// DFS's sequence, regardless of which unrelated branches are visited.
-    fn walk(
+    /// Preserve the old full DFS's exact path-order arithmetic without
+    /// visiting its unrelated branches or reassociating any sum.
+    fn difference(&mut self, start: VoltageVertex, target: VoltageVertex) -> SpiceResult<Real> {
+        self.known
+            .path(start.graph_node(), target.graph_node(), &mut self.path)?;
+        let mut at = start.graph_node();
+        let mut potential = 0.;
+        for &edge in &self.path {
+            let relation = &self.graph[edge];
+            let Voltage::Known(value) = relation.voltage else {
+                return Err(failure("non-numeric edge in known voltage path"));
+            };
+            let (first, second) = self
+                .graph
+                .edge_endpoints(edge)
+                .ok_or_else(|| failure("missing voltage path edge"))?;
+            if at != first && at != second {
+                return Err(failure("disconnected voltage path edge"));
+            }
+            potential = if at == relation.positive.graph_node() {
+                potential - value
+            } else {
+                potential + value
+            };
+            at = if at == first { second } else { first };
+        }
+        Ok(-potential)
+    }
+
+    /// Controlled relations do not have a known numeric offset. Traverse the
+    /// rigid graph only to identify the relevant constraint provenance.
+    pub(super) fn controlled_path(
         &mut self,
         start: VoltageVertex,
         target: VoltageVertex,
-        kind: PathKind,
-    ) -> SpiceResult<Real> {
+    ) -> SpiceResult<String> {
         for visit in self.visits.drain(..) {
             self.visited[visit.node.index()] = false;
         }
         self.pending.clear();
-        self.end = None;
+        self.path.clear();
         self.visits.push(Visit {
             node: start.graph_node(),
             parent: None,
-            potential: 0.,
         });
         self.visited[start.index()] = true;
         self.pending.push(0);
         while let Some(index) = self.pending.pop() {
             let visit = self.visits[index];
             if visit.node == target.graph_node() {
-                self.end = Some(index);
-                return Ok(visit.potential);
+                let mut at = index;
+                while let Some((parent, edge)) = self.visits[at].parent {
+                    self.path.push(edge);
+                    at = parent;
+                }
+                self.path.reverse();
+                return Ok(self.path_description());
             }
             for edge in self.graph.edges(visit.node) {
                 let neighbor = edge.target();
                 if self.visited[neighbor.index()] {
                     continue;
                 }
-                let relation = edge.weight();
-                let potential = match relation.voltage {
-                    Voltage::Known(value) => {
-                        if relation.positive.graph_node() == visit.node {
-                            visit.potential - value
-                        } else {
-                            visit.potential + value
-                        }
-                    }
-                    Voltage::Controlled if matches!(kind, PathKind::Rigid) => 0.,
-                    Voltage::Controlled => continue,
-                };
                 let next = self.visits.len();
                 self.visits.push(Visit {
                     node: neighbor,
                     parent: Some((index, edge.id())),
-                    potential,
                 });
                 self.visited[neighbor.index()] = true;
-                if neighbor == target.graph_node() {
-                    self.end = Some(next);
-                    return Ok(potential);
-                }
                 self.pending.push(next);
+                if neighbor == target.graph_node() {
+                    break;
+                }
             }
         }
         Err(failure("constraint component has no connecting path"))
     }
 
-    pub(super) fn controlled_path(
-        &mut self,
-        start: VoltageVertex,
-        target: VoltageVertex,
-    ) -> SpiceResult<String> {
-        self.walk(start, target, PathKind::Rigid)?;
-        Ok(self.path_description())
-    }
-
     pub(super) fn path_description(&self) -> String {
-        let mut names = Vec::new();
-        let mut index = self.end;
-        while let Some(i) = index {
-            let Some((parent, edge)) = self.visits[i].parent else {
-                break;
-            };
-            names.push(self.graph[edge].origin.to_string());
-            index = Some(parent);
-        }
-        names.reverse();
-        if names.is_empty() {
+        if self.path.is_empty() {
             "same node".to_owned()
         } else {
-            names.join(" -> ")
+            self.path
+                .iter()
+                .map(|&edge| self.graph[edge].origin.to_string())
+                .collect::<Vec<_>>()
+                .join(" -> ")
         }
     }
 }
@@ -392,31 +503,34 @@ mod tests {
     #[test]
     fn path_local_walk_matches_old_full_traversal_bit_for_bit() {
         let size = 63;
-        let mut graph = ConstraintGraph::new(size).unwrap();
-        for row in 0..size {
-            let parent = if row == 0 {
-                VoltageVertex::Ground
-            } else {
-                vertex((row - 1) / 2)
-            };
-            let value = [1e16, -1e16, 1., -1., 1e-10, -1e-10][row % 6];
-            if row % 2 == 0 {
-                known(&mut graph, vertex(row), parent, value, "edge");
-            } else {
-                known(&mut graph, parent, vertex(row), value, "edge");
+        for reversed in [false, true] {
+            let mut graph = ConstraintGraph::new(size).unwrap();
+            for step in 0..size {
+                let row = if reversed { size - step - 1 } else { step };
+                let parent = if row == 0 {
+                    VoltageVertex::Ground
+                } else {
+                    vertex((row - 1) / 2)
+                };
+                let value = [1e16, -1e16, 1., -1., 1e-10, -1e-10][row % 6];
+                if row % 2 == 0 {
+                    known(&mut graph, vertex(row), parent, value, "edge");
+                } else {
+                    known(&mut graph, parent, vertex(row), value, "edge");
+                }
             }
-        }
-        let vertices: Vec<_> = std::iter::once(VoltageVertex::Ground)
-            .chain((0..size).map(vertex))
-            .collect();
-        for &a in &vertices {
-            for &b in &vertices {
-                let expected = reference(&graph, a, b);
-                assert_eq!(
-                    cycle(&mut graph, a, b).to_bits(),
-                    expected.to_bits(),
-                    "{a:?} to {b:?}"
-                );
+            let vertices: Vec<_> = std::iter::once(VoltageVertex::Ground)
+                .chain((0..size).map(vertex))
+                .collect();
+            for &a in &vertices {
+                for &b in &vertices {
+                    let expected = reference(&graph, a, b);
+                    assert_eq!(
+                        cycle(&mut graph, a, b).to_bits(),
+                        expected.to_bits(),
+                        "{a:?} to {b:?}"
+                    );
+                }
             }
         }
     }
@@ -457,7 +571,7 @@ mod tests {
         let mut visited = 0;
         for row in 1..N {
             assert_eq!(cycle(&mut graph, vertex(row), vertex((row - 1) / 2)), 1.);
-            visited += graph.visits.len();
+            visited += graph.path.len() + 1;
         }
         let local_time = started.elapsed();
         let started = Instant::now();
@@ -470,6 +584,6 @@ mod tests {
             N - 1,
             (N - 1) * (N + 1)
         );
-        assert!(visited <= 4 * N);
+        assert_eq!(visited, 2 * (N - 1));
     }
 }
