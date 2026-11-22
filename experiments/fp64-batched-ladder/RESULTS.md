@@ -117,3 +117,38 @@ in private variables and only saving eliminated factors for backsolve.
 Measure actual GPU compute pass timestamps separately from synchronized
 wall clock and pipeline creation API latency. The explicit --adapter selector
 allows comparative measurement on Asus's RTX 2060 Max-Q as well as Renoir.
+
+## 2026-11-22 — topology-specialized GPU kernel (research checkpoint)
+
+Source `27d4880`: symbolic schedule compiled to straight-line WGSL, no
+runtime instruction interpretation. Most intermediate Schur updates use
+private named variables; eliminated multipliers saved for backsolve. GPU
+compute-pass timestamps and pipeline creation API latency measured separately.
+Both CPU structural/numeric regression tests passed; all solutions and
+residuals validated on actual Acer RADV hardware.
+
+| Systems | Grouped pool SIMD ms | Grouped GPU amortized ms | Specialized GPU amortized ms | Specialized roundtrip ms | Specialized device timestamp ms |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 0.1241 | 3.1091 | 1.8954 | 2.7707 | 2.2330 |
+| 256 | 0.4922 | 4.9189 | 1.1252 | 2.1150 | 1.4431 |
+| 1024 | 1.8255 | 2.9943 | 1.2820 | 3.4221 | 1.2276 |
+| 4096 | 6.5240 | 20.9228 | 6.6934 | 33.9202 | 8.8400 |
+
+The 122,323-byte generated shader had 14.44 s pipeline creation API latency,
+versus 2.39 ms for the grouped shader. Correctness checks passed (worst
+solution error across variants 4.990e-15, backward error 6.200e-16).
+Timing is noisy under fleet load; neither the timestamp median nor the
+amortized wall-clock median is a direct per-dispatch pairwise comparison.
+Specialization approached CPU SIMD throughput, but construction cost and
+transfer overhead make it unsuitable for casual one-off runs. It is a
+plausible later backend for very large repeated topology-stable candidate
+ensembles with reused pipelines and resident matrix assembly.
+
+**Decision:** GPU work deferred in favor of the common CPU/SIMD architecture.
+Use this branch as an isolated experimental reference, not a production
+dependency. Revisit when repeated independent candidate evaluation,
+parameter recompilation/invalidation, reusable numeric workspaces,
+batchable device physics and objective-only output are available. #111–114
+track repeated optimization workloads and architecture; #97–100 and #104
+track common numerical execution and quality. RTX 2060 comparison deferred.
+The completed specialized experiment required no new compiler-cache daemon.
