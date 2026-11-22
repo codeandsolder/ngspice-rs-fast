@@ -15,9 +15,10 @@
 //!   cargo test -p ngspice-rs --test c_binary_rawfile_reference -- --ignored
 //! ```
 
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use ngspice_rs::analysis::{BinaryByteOrder, PlotFlags, RawFile, RawFormat};
 use ngspice_rs::primitives::Complex;
@@ -52,31 +53,23 @@ quit
 .end
 ";
 
-struct Cleanup(PathBuf);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN; runs temporary C decks out of process"]
 fn c_binary_rawfiles_match_the_c_ascii_oracle() {
     let binary = std::env::var_os("NGSPICE_BIN").expect("set absolute NGSPICE_BIN");
     assert!(Path::new(&binary).is_absolute());
 
-    let directory =
-        std::env::temp_dir().join(format!("spice-rawfile-oracle-{}", std::process::id()));
-    fs::create_dir_all(&directory).unwrap();
-    let _cleanup = Cleanup(directory.clone());
+    let scratch = Scratch::new("c-binary-rawfile-reference").unwrap();
+    let directory = scratch.path();
     fs::write(directory.join("oracle.cir"), DECK).unwrap();
 
-    let output = Command::new(&binary)
-        .args(["-b", "oracle.cir"])
-        .current_dir(&directory)
-        .output()
-        .expect("the C ngspice runs");
+    let output = run(
+        &binary,
+        directory,
+        &["-b", "oracle.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .expect("the C ngspice runs");
     assert!(
         output.status.success(),
         "ngspice failed:\n{}\n{}",

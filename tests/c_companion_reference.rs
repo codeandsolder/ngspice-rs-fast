@@ -12,12 +12,13 @@
 //! `xtask::compare::TRAN`): two correct trap/Gear solutions of one circuit can
 //! legitimately differ by about the accuracy ngspice itself targets. The decks
 //! use `tmax = tau/100` so linear resampling adds far less than that.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use ngspice_rs::analysis::{AnalysisContext, Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 /// A plot's `name` column at time `t`, linearly interpolated.
 fn at(plot: &Plot, name: &str, t: f64) -> f64 {
@@ -34,16 +35,9 @@ fn at(plot: &Plot, name: &str, t: f64) -> f64 {
 
 fn run_c(tag: &str, deck: &str) -> Plot {
     let binary = std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN");
-    let dir =
-        std::env::temp_dir().join(format!("spice-companion-ref-{}-{tag}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    struct Cleanup(std::path::PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-    let _cleanup = Cleanup(dir.clone());
+    let scratch =
+        Scratch::new("c-companion-reference").unwrap_or_else(|error| panic!("{tag}: {error}"));
+    let dir = scratch.path();
     // The .tran card is replaced by a .control block that writes an ASCII raw.
     let (cards, tran) = deck.split_once("\n.tran ").expect("deck has a .tran card");
     let (tran, rest) = tran.split_once('\n').unwrap_or((tran, ""));
@@ -54,11 +48,7 @@ fn run_c(tag: &str, deck: &str) -> Plot {
         ),
     )
     .unwrap();
-    let result = Command::new(binary)
-        .args(["-b", "c.cir"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
+    let result = run(binary, dir, &["-b", "c.cir"], ProcessLimits::ORACLE).unwrap();
     assert!(
         result.status.success(),
         "{}\n{}",

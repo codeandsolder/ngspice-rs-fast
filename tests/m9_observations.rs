@@ -1,4 +1,5 @@
 //! Device observations at solver points, checked by C goldens and analytic KCL.
+use ngspice_conformance::ngspice::Scratch;
 use ngspice_rs::analysis::{Plot, RawFile};
 use ngspice_rs::cli::simulate;
 use ngspice_rs::primitives::Complex;
@@ -9,11 +10,6 @@ fn root() -> PathBuf {
     ngspice_conformance::fixtures::workspace_root()
         .unwrap()
         .join("conformance/observations")
-}
-fn scratch(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("m9-observe-{}-{tag}", std::process::id()));
-    fs::create_dir_all(&p).unwrap();
-    p
 }
 fn column(plot: &ngspice_rs::analysis::Plot, name: &str) -> Vec<Complex> {
     let i = plot
@@ -50,17 +46,18 @@ fn compare(ours: &ngspice_rs::analysis::Plot, c: &ngspice_rs::analysis::Plot) {
 }
 #[test]
 fn saved_device_currents_and_parameters_match_committed_c_golden() {
-    let dir = scratch("golden");
+    let scratch = Scratch::new("m9-observe-golden").unwrap();
+    let dir = scratch.path();
     let raw = dir.join("out.raw");
     simulate::run(&root().join("m9_device_dc.cir"), &raw, true).unwrap();
     let ours = RawFile::load(&raw).unwrap();
     let c = RawFile::load(root().join("m9_device_dc.raw")).unwrap();
     compare(&ours.plots[0].plot, &c.plots[0].plot);
-    fs::remove_dir_all(dir).unwrap();
 }
 #[test]
 fn companion_currents_use_integrated_charge_and_satisfy_kcl() {
-    let dir = scratch("tran");
+    let scratch = Scratch::new("m9-observe-tran").unwrap();
+    let dir = scratch.path();
     let deck = dir.join("deck.cir");
     let raw = dir.join("out.raw");
     fs::write(&deck,"RC observations\nV1 in 0 pulse(0 1 1u .1u .1u 1m 2m)\nR1 in out 1k\nC1 out 0 1u\n.tran 1u 20u\n.save v(in) v(out) i(r1) @c1[i] @r1[p] @c1[capacitance]\n.measure tran imax max @c1[i]\n.end\n").unwrap();
@@ -79,11 +76,11 @@ fn companion_currents_use_integrated_charge_and_satisfy_kcl() {
         assert!((resistor[k].re - drop / 1000.).abs() < 1e-14);
         assert!((power[k].re - drop * resistor[k].re).abs() < 1e-14);
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 #[test]
 fn invalid_observations_fail_without_publishing() {
-    let dir = scratch("atomic");
+    let scratch = Scratch::new("m9-observe-atomic").unwrap();
+    let dir = scratch.path();
     let deck = dir.join("deck.cir");
     let raw = dir.join("out.raw");
     for request in ["@r1[unknown]", "i(missing)", "@missing[m]"] {
@@ -96,7 +93,6 @@ fn invalid_observations_fail_without_publishing() {
         assert!(simulate::run(&deck, &raw, true).is_err());
         assert_eq!(fs::read(&raw).unwrap(), b"previous");
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 // The capture oracle and a general live-C oracle serve different purposes:
 // a platform's native C build can be valid for parity without reproducing
@@ -107,15 +103,20 @@ fn run_c_oracle(variable: &str, dir: &Path) -> RawFile {
     );
     assert!(binary.is_absolute(), "{variable} must be absolute");
     let raw = dir.join("c.raw");
-    let run = Command::new(binary)
-        .current_dir(dir)
-        .env("LC_ALL", "C")
-        .env_remove("SPICE_ASCIIRAWFILE")
-        .args(["-n", "-b", "-r"])
-        .arg(&raw)
-        .arg(root().join("m9_device_dc.cir"))
-        .output()
-        .unwrap();
+    let run = ngspice_conformance::process::run_with_environment(
+        binary,
+        dir,
+        &[
+            std::ffi::OsStr::new("-n"),
+            std::ffi::OsStr::new("-b"),
+            std::ffi::OsStr::new("-r"),
+            raw.as_os_str(),
+            root().join("m9_device_dc.cir").as_os_str(),
+        ],
+        ngspice_conformance::process::ProcessLimits::ORACLE,
+        &[("LC_ALL", Some("C")), ("SPICE_ASCIIRAWFILE", None)],
+    )
+    .unwrap();
     assert!(
         run.status.success(),
         "{variable}: {}",
@@ -167,9 +168,10 @@ fn capture_comparison_distinguishes_signed_zero() {
 #[test]
 #[ignore = "requires absolute NGSPICE_CAPTURE_BIN; see conformance/observations/README.md"]
 fn device_golden_matches_capture_oracle_bit_exactly() {
-    let dir = scratch("capture-oracle");
-    let got = run_c_oracle("NGSPICE_CAPTURE_BIN", &dir);
-    fs::remove_dir_all(dir).unwrap();
+    let scratch = Scratch::new("m9-observe-capture-oracle").unwrap();
+    let dir = scratch.path();
+    let got = run_c_oracle("NGSPICE_CAPTURE_BIN", dir);
+
     let saved = RawFile::load(root().join("m9_device_dc.raw")).unwrap();
     assert_eq!(got.plots.len(), saved.plots.len());
     for (actual, expected) in got.plots.iter().zip(&saved.plots) {
@@ -181,12 +183,13 @@ fn device_golden_matches_capture_oracle_bit_exactly() {
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN"]
 fn device_observations_match_live_c() {
-    let dir = scratch("live-parity");
-    let c = run_c_oracle("NGSPICE_BIN", &dir);
+    let scratch = Scratch::new("m9-observe-live-parity").unwrap();
+    let dir = scratch.path();
+    let c = run_c_oracle("NGSPICE_BIN", dir);
     let raw = dir.join("rust.raw");
     simulate::run(&root().join("m9_device_dc.cir"), &raw, true).unwrap();
     let ours = RawFile::load(&raw).unwrap();
-    fs::remove_dir_all(dir).unwrap();
+
     assert_eq!(ours.plots.len(), c.plots.len());
     for (actual, expected) in ours.plots.iter().zip(&c.plots) {
         compare(&actual.plot, &expected.plot);
@@ -195,7 +198,8 @@ fn device_observations_match_live_c() {
 
 #[test]
 fn parameter_sweeps_observe_each_context_and_ac_rejects_current_asks() {
-    let dir = scratch("contexts");
+    let scratch = Scratch::new("m9-observe-contexts").unwrap();
+    let dir = scratch.path();
     let deck = dir.join("deck.cir");
     let raw = dir.join("out.raw");
     fs::write(&deck, "Sweep asks\nV1 out 0 1 ac 1\nR1 out 0 1k\n.dc r1 1k 2k 1k\n.save @r1[resistance] i(r1)\n.end\n").unwrap();
@@ -231,12 +235,12 @@ fn parameter_sweeps_observe_each_context_and_ac_rejects_current_asks() {
     let error = simulate::run(&deck, &raw, true).unwrap_err();
     assert!(error.is_not_yet_ported(), "{error}");
     assert_eq!(fs::read(&raw).unwrap(), previous);
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn device_observations_run_through_cli() {
-    let dir = scratch("process");
+    let scratch = Scratch::new("m9-observe-process").unwrap();
+    let dir = scratch.path();
     let raw = dir.join("out.raw");
     let run = Command::new(
         std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
@@ -255,5 +259,4 @@ fn device_observations_run_through_cli() {
     let ours = RawFile::load(&raw).unwrap();
     let c = RawFile::load(root().join("m9_device_dc.raw")).unwrap();
     compare(&ours.plots[0].plot, &c.plots[0].plot);
-    fs::remove_dir_all(dir).unwrap();
 }

@@ -141,8 +141,11 @@ fn compare_live(tag: &str, text: &str) {
     output
         .require_success(tag)
         .unwrap_or_else(|error| panic!("{error}"));
-    let report = measurement::parse(&output.stdout, &output.stderr)
-        .unwrap_or_else(|error| panic!("{tag}: {error}\n{}", output.transcript()));
+    let report = measurement::parse(
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+    .unwrap_or_else(|error| panic!("{tag}: {error}\n{}", output.transcript()));
     let ours = ngspice_rs::cli::simulate::run(&deck, &raw, true).unwrap();
     let [plot] = ours.plots.as_slice() else {
         panic!("{tag}: expected one analysis plot");

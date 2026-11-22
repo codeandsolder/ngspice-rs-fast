@@ -16,29 +16,16 @@
 //!
 //! Ordinary `cargo test` never needs C: everything here is `#[ignore]`d.
 
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use ngspice_rs::analysis::{Plot, RawFile};
 use ngspice_rs::cli::simulate;
 
 #[path = "support/c_parameter_sweep.rs"]
 mod c_parameter_sweep;
-
-struct Cleanup(PathBuf);
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn scratch(tag: &str) -> (PathBuf, Cleanup) {
-    let dir = std::env::temp_dir().join(format!("spice-jfet-{}-{tag}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir(&dir).unwrap();
-    (dir.clone(), Cleanup(dir))
-}
 
 /// Runs `deck` (title, cards and analysis, no `.end`) in C and in the port's
 /// `simulate` front end; returns (port, C) plots.
@@ -48,17 +35,14 @@ fn both(tag: &str, deck: &str) -> (Plot, Plot) {
         Path::new(&binary).is_absolute(),
         "NGSPICE_BIN must be absolute"
     );
-    let (dir, _cleanup) = scratch(tag);
+    let scratch = Scratch::new("c-jfet-reference").unwrap_or_else(|error| panic!("{tag}: {error}"));
+    let dir = scratch.path();
     fs::write(
         dir.join("c.cir"),
         format!("{deck}.control\nset filetype=ascii\nrun\nwrite c.raw\nquit\n.endc\n.end\n"),
     )
     .unwrap();
-    let output = Command::new(&binary)
-        .args(["-b", "c.cir"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
+    let output = run(&binary, dir, &["-b", "c.cir"], ProcessLimits::ORACLE).unwrap();
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
