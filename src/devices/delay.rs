@@ -25,7 +25,6 @@
 //!
 //! A device opts in through [`crate::devices::Device::delay_line`].
 
-use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -86,15 +85,18 @@ impl DelayHistory {
         self.times.get(index).copied()
     }
 
-    /// Borrow contiguous accepted times for convolution. Histories that
-    /// have wrapped after pruning are the only ones that require a copy.
-    pub(super) fn contiguous_times(&self) -> Cow<'_, [Real]> {
-        let (first, second) = self.times.as_slices();
-        if second.is_empty() {
-            Cow::Borrowed(first)
-        } else {
-            Cow::Owned(self.times.iter().copied().collect())
+    /// A width-checked, nonempty view of the accepted samples in logical
+    /// ring order. The update transaction guarantees finite values and
+    /// strictly increasing times.
+    pub(super) fn samples<const N: usize>(&self) -> SpiceResult<DelaySamples<'_, N>> {
+        if self.width != N || self.is_empty() {
+            return Err(delay_error(format!(
+                "expected nonempty history of width {N}, got width {} and length {}",
+                self.width,
+                self.len()
+            )));
         }
+        Ok(DelaySamples { history: self })
     }
 
     /// Value `component` of sample `index`.
@@ -202,6 +204,24 @@ impl DelayHistory {
     pub(crate) fn clear(&mut self) {
         self.times.clear();
         self.values.clear();
+    }
+}
+
+/// Width-checked accepted history, without materializing a contiguous copy.
+/// All indices are logical oldest-first indices, including after pruning.
+#[derive(Clone, Copy)]
+pub(super) struct DelaySamples<'a, const N: usize> {
+    history: &'a DelayHistory,
+}
+
+impl<'a, const N: usize> DelaySamples<'a, N> {
+    pub(super) const fn times(self) -> &'a VecDeque<Real> {
+        &self.history.times
+    }
+
+    pub(super) fn sample(self, index: usize) -> [Real; N] {
+        let start = index * N;
+        std::array::from_fn(|component| self.history.values[start + component])
     }
 }
 
@@ -317,12 +337,12 @@ mod tests {
     }
 
     #[test]
-    fn contiguous_times_preserve_ring_order_after_pruning() {
+    fn typed_samples_preserve_ring_order_after_pruning() {
         let mut history = DelayHistory::new(2);
         for time in 0_i32..32 {
             history
                 .apply(&DelayUpdate {
-                    append: Some(sample(f64::from(time), 1.)),
+                    append: Some(sample(f64::from(time), f64::from(time))),
                     drop_front: usize::from(time >= 4),
                     ..DelayUpdate::default()
                 })
@@ -330,13 +350,15 @@ mod tests {
             let expected = ((time - 3).max(0)..=time)
                 .map(f64::from)
                 .collect::<Vec<_>>();
-            assert_eq!(history.contiguous_times().as_ref(), expected);
+            let view = history.samples::<2>().unwrap();
+            assert_eq!(view.times().iter().copied().collect::<Vec<_>>(), expected);
+            for (index, &time) in expected.iter().enumerate() {
+                assert_eq!(view.sample(index), [time, -time]);
+            }
+            assert!(history.samples::<4>().is_err());
         }
         history.clear();
-        assert!(matches!(
-            history.contiguous_times(),
-            std::borrow::Cow::Borrowed(_)
-        ));
+        assert!(history.samples::<2>().is_err());
     }
 
     #[test]

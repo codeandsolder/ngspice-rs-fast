@@ -35,7 +35,7 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
-use std::f64::consts::PI;
+use std::{collections::VecDeque, f64::consts::PI};
 
 use crate::primitives::Real;
 
@@ -341,12 +341,9 @@ pub fn erfc(x: Real) -> Real {
 pub struct Coefficients {
     /// `LTRAh1dashFirstCoeff`, `LTRAh2FirstCoeff`, `LTRAh3dashFirstCoeff`.
     pub first: [Real; 3],
-    /// `LTRAh1dashCoeffs`.
-    pub h1dash: Vec<Real>,
-    /// `LTRAh2Coeffs`.
-    pub h2: Vec<Real>,
-    /// `LTRAh3dashCoeffs`.
-    pub h3dash: Vec<Real>,
+    /// Accepted-sample coefficients in h1', h2, h3' order. A single
+    /// allocation replaces three independent buffers.
+    pub weights: Vec<[Real; 3]>,
     /// `LTRAauxIndex`: the last accepted sample at least `TD` before the
     /// current time (RLC only; the `h2`/`h3'` sums stop there).
     pub aux_index: usize,
@@ -356,9 +353,7 @@ impl Coefficients {
     fn with_len(len: usize) -> Self {
         Self {
             first: [0.; 3],
-            h1dash: vec![0.; len],
-            h2: vec![0.; len],
-            h3dash: vec![0.; len],
+            weights: vec![[0.; 3]; len],
             aux_index: 0,
         }
     }
@@ -372,7 +367,7 @@ pub fn rc_coefficients(
     cbyr: Real,
     rclsqr: Real,
     curtime: Real,
-    times: &[Real],
+    times: &VecDeque<Real>,
     reltol: Real,
 ) -> Coefficients {
     let index = times.len() - 1;
@@ -432,8 +427,8 @@ pub fn rc_coefficients(
             let h1lovalue1 = h1hivalue2;
             h1hivalue1 = (4. * cbyr * hilimit1 / PI).sqrt();
             h1dummy1 = (h1hivalue1 - h1lovalue1) / delta1;
-            out.h1dash[i] = h1dummy1 - h1dummy2;
-            if out.h1dash[i].abs() < h1relval {
+            out.weights[i][0] = h1dummy1 - h1dummy2;
+            if out.weights[i][0].abs() < h1relval {
                 doh1 = false;
             }
         }
@@ -452,8 +447,8 @@ pub fn rc_coefficients(
             let h2lovalue1 = h2hivalue2;
             h2hivalue1 = h2value(hilimit1, temp2, temp3);
             h2dummy1 = (h2hivalue1 - h2lovalue1) / delta1;
-            out.h2[i] = h2dummy1 - h2dummy2;
-            if out.h2[i].abs() < h2relval {
+            out.weights[i][1] = h2dummy1 - h2dummy2;
+            if out.weights[i][1].abs() < h2relval {
                 doh2 = false;
             }
         }
@@ -463,14 +458,36 @@ pub fn rc_coefficients(
             let h3lovalue1 = h3hivalue2;
             h3hivalue1 = h3value(hilimit1, temp2, temp3);
             h3dummy1 = (h3hivalue1 - h3lovalue1) / delta1;
-            out.h3dash[i] = h3dummy1 - h3dummy2;
-            if out.h3dash[i].abs() < h3relval {
+            out.weights[i][2] = h3dummy1 - h3dummy2;
+            if out.weights[i][2].abs() < h3relval {
                 doh3 = false;
             }
         }
     }
     out.aux_index = index;
     out
+}
+
+/// Locate the newest accepted sample at least one delay back. Preserve C's
+/// subtraction and equality branches, including rounded equal-time plateaus.
+fn rlc_aux_index(t: Real, curtime: Real, times: &VecDeque<Real>) -> usize {
+    if t == 0.0 {
+        return times.len() - 1;
+    }
+    if curtime - t <= 0.0 {
+        return 0;
+    }
+    let Some(found) = times
+        .partition_point(|&sample_time| curtime - sample_time >= t)
+        .checked_sub(1)
+    else {
+        return 0;
+    };
+    if curtime - times[found] == t {
+        found.saturating_sub(1)
+    } else {
+        found
+    }
 }
 
 /// `LTRArlcCoeffsSetup` (the `G = 0` RLC line): coefficients at `curtime`
@@ -490,40 +507,14 @@ pub fn rlc_coefficients(
     alpha: Real,
     beta: Real,
     curtime: Real,
-    times: &[Real],
+    times: &VecDeque<Real>,
     reltol: Real,
 ) -> Coefficients {
     let index = times.len() - 1;
     let mut out = Coefficients::with_len(times.len());
     let (mut doh1, mut doh2, mut doh3) = (true, true, true);
 
-    let aux = if t == 0.0 {
-        index
-    } else if curtime - t <= 0.0 {
-        0
-    } else {
-        // The first sample (newest first) at least T back; one earlier when
-        // exactly T back. curtime > T and times[0] = 0, so it exists, and an
-        // exact hit cannot be sample 0.
-        let mut found = 0;
-        let mut exact = false;
-        for i in (0..=index).rev() {
-            if curtime - times[i] == t {
-                exact = true;
-                found = i;
-                break;
-            }
-            if curtime - times[i] > t {
-                found = i;
-                break;
-            }
-        }
-        if exact {
-            found.saturating_sub(1)
-        } else {
-            found
-        }
-    };
+    let aux = rlc_aux_index(t, curtime, times);
 
     let mut h2lovalue1 = 0.0;
     let mut h2hivalue1 = 0.0;
@@ -618,8 +609,8 @@ pub fn rlc_coefficients(
             h1lovalue1 = h1hivalue2;
             h1hivalue1 = h1value(hilimit1, exparg, expterm);
             h1dummy1 = (h1hivalue1 - h1lovalue1) / delta1;
-            out.h1dash[i] = h1dummy1 - h1dummy2;
-            if out.h1dash[i].abs() <= h1relval {
+            out.weights[i][0] = h1dummy1 - h1dummy2;
+            if out.weights[i][0].abs() <= h1relval {
                 doh1 = false;
             }
         }
@@ -646,11 +637,11 @@ pub fn rlc_coefficients(
                 h2dummy1 = twiceintlinfunc(
                     lolimit1, hilimit1, lolimit1, h2lovalue1, h2hivalue1, lolimit1, hilimit1,
                 ) / delta1;
-                out.h2[i] = h2dummy1 - h2dummy2
+                out.weights[i][1] = h2dummy1 - h2dummy2
                     + intlinfunc(
                         lolimit2, hilimit2, h2lovalue2, h2hivalue2, lolimit2, hilimit2,
                     );
-                if out.h2[i].abs() <= h2relval {
+                if out.weights[i][1].abs() <= h2relval {
                     doh2 = false;
                 }
             }
@@ -667,8 +658,8 @@ pub fn rlc_coefficients(
                 h3dummy1 = intlinfunc(
                     lolimit1, hilimit1, h3lovalue1, h3hivalue1, lolimit1, hilimit1,
                 ) / delta1;
-                out.h3dash[i] = h3dummy1 - h3dummy2;
-                if out.h3dash[i].abs() <= h3relval {
+                out.weights[i][2] = h3dummy1 - h3dummy2;
+                if out.weights[i][2].abs() <= h3relval {
                     doh3 = false;
                 }
             }
@@ -743,13 +734,42 @@ mod tests {
         // integral: the first coefficient plus the history coefficients
         // telescope to (H(t) - H(t - t0)) / dt differences; check the
         // telescoping identity sum_i c_i = (first window) sum directly.
-        let times = [0., 1e-9, 2e-9, 3e-9];
+        let times = VecDeque::from([0., 1e-9, 2e-9, 3e-9]);
         let c = rc_coefficients(1e-12 / 100., 100. * 1e-12, 4e-9, &times, 0.);
-        assert_eq!(c.h1dash.len(), 4);
+        assert_eq!(c.weights.len(), 4);
         assert!(c.first.iter().all(|v| v.is_finite()));
-        assert!(c.h1dash[1..].iter().all(|v| v.is_finite()));
+        assert!(c.weights[1..].iter().all(|v| v[0].is_finite()));
         // Second differences of a concave sqrt are negative.
-        assert!(c.h1dash[1..].iter().all(|v| *v < 0.));
+        assert!(c.weights[1..].iter().all(|v| v[0] < 0.));
+    }
+
+    #[test]
+    fn auxiliary_index_matches_reference_reverse_scan() {
+        // Closely spaced times may round to the same curtime - sample_time.
+        let times = VecDeque::from([0., 1e-20, 2e-20, 0.5, 1., 2., 3.]);
+        for current in [1., 2., 3., 4., 1e16] {
+            for delay in [0., 0.5, 1., 2., 3., 4., 1e16 - 2.] {
+                let expected = if delay == 0. {
+                    times.len() - 1
+                } else if current - delay <= 0. {
+                    0
+                } else {
+                    times
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, sample)| current - **sample >= delay)
+                        .map_or(0, |(index, sample)| {
+                            if current - sample == delay {
+                                index.saturating_sub(1)
+                            } else {
+                                index
+                            }
+                        })
+                };
+                assert_eq!(rlc_aux_index(delay, current, &times), expected);
+            }
+        }
     }
 
     #[test]
