@@ -37,7 +37,7 @@ fn ordered_overrides_are_case_insensitive_and_last_wins() {
         config(".options TEMP=10 tnom=20\n.OPTION Temp=50 RELTOL=1e-4\n.opt reltol=2e-4").unwrap();
     assert_eq!(c.context().temperature, 50.0);
     assert_eq!(c.context().nominal_temperature, 20.0);
-    assert_eq!(c.transient().rtol, Some(2e-4));
+    assert_eq!(c.context().reltol, 2e-4);
     assert_eq!(c.applied().len(), 5);
     assert_eq!(c.applied()[0].name, "temp");
     assert_eq!(c.applied()[0].value, "10");
@@ -66,6 +66,7 @@ fn overrides_beat_deck_and_request_arguments_beat_deck() {
 
     let request = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m", "RTOL=5e-5"]);
     let merged = c.plan(request).unwrap();
+    assert_eq!(c.context().model_context().reltol, 1e-3);
     assert_eq!(
         merged.dc_settings().newton.reltol,
         ngspice_rs::primitives::parse_spice_number("5e-5").unwrap()
@@ -82,7 +83,7 @@ fn overrides_beat_deck_and_request_arguments_beat_deck() {
     let op = c
         .plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
         .unwrap();
-    assert_eq!(op.dc_settings().newton.reltol, c.transient().rtol.unwrap());
+    assert_eq!(op.dc_settings().newton.reltol, c.context().reltol);
     assert_eq!(op.dc_settings().newton.vntol, c.transient().vntol.unwrap());
     assert_eq!(
         op.dc_settings().newton.abstol,
@@ -241,8 +242,11 @@ fn deck_options_take_effect_in_a_real_transient_and_do_not_leak() {
     };
     let (c_loose, loose_plot) = run(&loose);
     let (c_strict, strict_plot) = run(&strict);
-    assert_eq!(c_loose.transient().rtol, Some(0.5));
-    assert_eq!(c_strict.transient().rtol, None);
+    assert_eq!(c_loose.context().reltol, 0.5);
+    assert_eq!(
+        c_strict.context().reltol,
+        ngspice_rs::devices::DEFAULT_RELTOL
+    );
     // Both decks simulate; the strict deck is unaffected by the earlier one.
     assert!(
         loose_plot.is_ok() && strict_plot.is_ok(),

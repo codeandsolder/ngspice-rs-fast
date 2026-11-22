@@ -216,8 +216,6 @@ pub struct RunOverrides {
 /// BDF defaults are unchanged unless a deck sets them.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TransientSettings {
-    /// `reltol` → BDF relative tolerance.
-    pub rtol: Option<Real>,
     /// `vntol` → voltage absolute tolerance.
     pub vntol: Option<Real>,
     /// `abstol` → branch-current absolute tolerance.
@@ -954,7 +952,7 @@ impl RunConfig {
                     ));
                 }
                 match name {
-                    "reltol" => self.transient.rtol = Some(number),
+                    "reltol" => self.context.reltol = number,
                     "vntol" => self.transient.vntol = Some(number),
                     "abstol" => self.transient.abstol = Some(number),
                     "chgtol" => self.transient.chgtol = Some(number),
@@ -965,8 +963,8 @@ impl RunConfig {
         Ok(())
     }
 
-    /// Temperatures and junction `gmin` shared by all analyses; defaults are
-    /// 27 C / 27 C / 1e-12 S.
+    /// Resolved circuit temperatures, junction gmin, RELTOL and other
+    /// physical settings shared by all analyses.
     #[must_use]
     pub const fn context(&self) -> AnalysisContext {
         self.context

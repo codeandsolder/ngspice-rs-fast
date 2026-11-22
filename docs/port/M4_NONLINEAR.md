@@ -95,10 +95,13 @@ coefficients require `0 <= value < 1`.
   recombination current. The DC root is unaffected; the AC golden
   `m7_diode_temp_ac` fails if the exact derivative is used instead.
 
-Deliberate divergences: breakdown matching stops at C's default RELTOL (1e-3)
-because device temperature setup has no access to the run's RELTOL; a deck that
-changes `reltol` can see C's rapidly contracting match stop one iteration
-earlier or later (a knee shift within the matching tolerance).
+Breakdown matching uses the resolved circuit RELTOL (default 1e-3) and
+the exact C stopping criterion and 25-iteration cap. Thermal preparation
+keys include the exact RELTOL bits as well as circuit/nominal temperatures;
+other device temperature caches remain temperature-only. The immutable
+circuit RELTOL also reaches isolated sensitivity replays and prepared
+sweep loads. The analysis-local Newton `rtol` override changes solver
+convergence, not the circuit thermal derivation (#63).
 
 Not yet ported (`SpiceError::NotYetPorted`, naming the C file): soft reverse
 recovery (`VP`, `QPSCALE`), separate sidewall resistance (`RSW`), self-heating

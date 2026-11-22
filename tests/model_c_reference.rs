@@ -261,3 +261,52 @@ fn selector_aliases_match_pinned_c_dc_sweeps() {
         }
     }
 }
+
+/// The selected diode is close enough to the breakdown-current floor that
+/// changing CKTreltol materially changes the matched voltage. Compare
+/// currents and small-signal admittance, not merely the forced node voltage.
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN; C diode breakdown preparation"]
+fn diode_breakdown_uses_resolved_circuit_reltol() {
+    let c = Ngspice::pinned().unwrap();
+    let scratch = Scratch::new("diode-breakdown-reltol").unwrap();
+    for reltol in ["1e-3", "1e-9"] {
+        for (name, analysis) in [
+            ("reverse-dc", ".dc v1 -5.2 -5 0.05"),
+            ("reverse-ac", ".ac lin 3 1k 3k"),
+            ("temperature-dc", ".dc temp 27 35 2"),
+            ("area-dc", ".dc @d1[area] 1 1.2 0.05"),
+        ] {
+            let text = format!(
+                "{name}\n.options reltol={reltol} vntol=1e-15 abstol=1e-18\n\
+                 v1 a 0 dc -5.1 ac 1\nd1 a 0 dm\n\
+                 .model dm d(is=1e-11 bv=5 ibv=2e-9 nbv=1.3 cjo=20p)\n\
+                 {analysis}\n.end\n"
+            );
+            let path = scratch.path().join(format!("{name}-{reltol}.cir"));
+            fs::write(&path, &text).unwrap();
+            let reference = capture(&c, &path, scratch.path(), &[]).unwrap();
+            let raw = RawFile::parse(&reference.rawfile).unwrap();
+            let want = &raw.plots[0].plot;
+            let got = simulate_alias(&text);
+            assert_eq!(
+                got.point_count(),
+                want.point_count(),
+                "{name} RELTOL={reltol}"
+            );
+            for row in 0..want.point_count() {
+                let a = got.value("i(v1)", row).unwrap();
+                let b = want.value("i(v1)", row).unwrap();
+                // The ordinary nonlinear bound is applied per component,
+                // using a current-scale absolute floor so the regression
+                // cannot hide the old RELTOL-induced current discrepancy.
+                for (x, y) in [(a.re, b.re), (a.im, b.im)] {
+                    assert!(
+                        (x - y).abs() <= 1e-6 * y.abs() + 1e-16,
+                        "{name} RELTOL={reltol} row {row}: Rust {a:?}, C {b:?}"
+                    );
+                }
+            }
+        }
+    }
+}

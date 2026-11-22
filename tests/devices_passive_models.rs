@@ -353,6 +353,7 @@ fn real_stamp_uses_explicit_temperature_and_initial_conditions_remain_visible() 
         temperature: 77.0,
         nominal_temperature: 27.0,
         gmin: ngspice_rs::devices::DEFAULT_GMIN,
+        reltol: ngspice_rs::devices::DEFAULT_RELTOL,
         frequency: 0.,
         mode: AnalysisMode::OperatingPoint,
         branches: 0..0,
