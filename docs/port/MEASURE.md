@@ -433,7 +433,7 @@ source order. Scalars can read top-level `.param`/`.func` values, any vector
 measurement result, and earlier scalar results. Results are returned in source
 order; undefined/forward scalar references, domain errors and nonfinite results
 fail the run before publication. Library callers use `measure::resolve_with_scope`
-and `batch::resolve_outputs_with_scope` when deck parameters are needed.
+using the scheduled `batch::plan_outputs` and scoped `batch::resolve_outputs` for retained plots.
 The local C input preprocessor mishandles `EXPR` with a user function and a
 measurement-result argument; the live C regression uses its `PARAM` spelling.
 Numeric setters AT/VAL/TD/FROM/TO and crossing counts accept braced or

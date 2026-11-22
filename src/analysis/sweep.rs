@@ -10,7 +10,7 @@
 //! travel in an immutable per-point `ModelContext`, and every point runs
 //! `NIiter`, linear circuits included. See `docs/port/DC_SWEEPS.md`.
 use crate::analysis::linear::{number, plot, unsupported};
-use crate::analysis::{AnalysisContext, AnalysisPlan, Plot};
+use crate::analysis::{AnalysisContext, AnalysisPlan};
 use crate::devices::{Circuit, ModelContext};
 use crate::maths::Vector;
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
@@ -815,7 +815,8 @@ pub(super) fn run(
     context: &AnalysisContext,
     sweep: &DcSweepPlan,
     point_iterations: Option<usize>,
-) -> SpiceResult<Plot> {
+    sink: &mut dyn crate::analysis::PointSink,
+) -> SpiceResult<()> {
     circuit.finalize()?;
     let circuit: &Circuit = circuit;
     // Everything that can be rejected is rejected before the first sample.
@@ -839,7 +840,7 @@ pub(super) fn run(
     preflight(circuit, &axes, grids, context)?;
     // C order: the first axis is the inner (fast) loop, the second the outer.
     let GridPair { inner, outer } = GridPair::new(grids);
-    let mut result = plot(
+    let result = plot(
         circuit,
         "dc1",
         "DC transfer characteristic",
@@ -847,6 +848,7 @@ pub(super) fn run(
         Some(axes[0].target.scale()),
         false,
     )?;
+    sink.begin(&result)?;
     let mut previous = Vector::zeros(circuit.unknown_count());
     // dctrcurv.c rotates the state vectors before every point, so a point's
     // CKTstate1 is the previous point's state (the first point's own state is
@@ -903,11 +905,12 @@ pub(super) fn run(
             let mut point = vec![Complex::real(*inner_value)];
             point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));
             point.extend(observed);
-            result.push_point(point)?;
+            result.check_point(&point)?;
+            sink.point(point)?;
             previous = x;
         }
     }
-    Ok(result)
+    sink.end()
 }
 
 #[cfg(test)]
