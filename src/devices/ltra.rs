@@ -94,10 +94,6 @@
 // C-compatible numerical expressions are kept in their reference order:
 // Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
 )]
@@ -378,7 +374,7 @@ impl LtraModel {
                 self.attenuation = (-self.beta * self.td).exp();
                 // alpha > 0 (R, L > 0).
                 self.int_h1dash = -1.0;
-                self.int_h2 = 1.0 - self.attenuation;
+                self.int_h2 = -(-self.beta * self.td).exp_m1();
                 self.int_h3dash = -self.attenuation;
             }
             LtraCase::Rc => {
@@ -389,19 +385,18 @@ impl LtraModel {
                 self.int_h3dash = 0.0;
             }
             LtraCase::Rg => {
-                let mut dummy1 = self.length * (self.resist * self.conduct).sqrt();
-                let dummy2 = (-dummy1).exp();
-                dummy1 = dummy1.exp();
-                self.cosh_root_gr = 0.5 * (dummy1 + dummy2);
+                let argument = self.length * (self.resist * self.conduct).sqrt();
+                self.cosh_root_gr = argument.cosh();
+                let sinh = argument.sinh();
                 self.r_rs_lrgr_or_g = if self.conduct <= 1.0e-10 {
                     self.length * self.resist
                 } else {
-                    0.5 * (dummy1 - dummy2) * (self.resist / self.conduct).sqrt()
+                    sinh * (self.resist / self.conduct).sqrt()
                 };
                 self.r_gs_lrgr_or_r = if self.resist <= 1.0e-10 {
                     self.length * self.conduct
                 } else {
-                    0.5 * (dummy1 - dummy2) * (self.conduct / self.resist).sqrt()
+                    sinh * (self.conduct / self.resist).sqrt()
                 };
             }
         }
@@ -777,6 +772,12 @@ impl LossyLine {
         let (t2, t3) = (times[i], times[i + 1]);
         let middle = history.sample(i);
         let right = history.sample(i + 1);
+        if target == t2 {
+            return Ok(middle);
+        }
+        if target == t3 {
+            return Ok(right);
+        }
         let quadratic = matches!(
             m.interpolation,
             Interpolation::Quadratic | Interpolation::Mixed
@@ -806,11 +807,35 @@ impl LossyLine {
         } else {
             middle
         };
+        let t1 = if qf.is_some() { times[i - 1] } else { t2 };
+        let distances = [t1, t2, t3].map(|t| (target - t).abs());
+        let anchor = if distances[0] <= distances[1] && distances[0] <= distances[2] {
+            0
+        } else if distances[1] <= distances[2] {
+            1
+        } else {
+            2
+        };
         for (k, value) in delayed.iter_mut().enumerate() {
-            let (mut d, out_of_range) = if let Some([q1, q2, q3]) = qf {
-                let (a, b, c) = (left[k], middle[k], right[k]);
-                let d = a * q1 + b * q2 + c * q3;
-                (d, d > a.max(b).max(c) || d < a.min(b).min(c))
+            let (mut d, out_of_range) = if let Some(weights) = qf {
+                let values = [left[k], middle[k], right[k]];
+                let base = values[anchor];
+                let [a, b] = [(anchor + 1) % 3, (anchor + 2) % 3];
+                let da = values[a] - base;
+                let db = values[b] - base;
+                let d = if da.is_finite() && db.is_finite() {
+                    weights[b].mul_add(db, weights[a].mul_add(da, base))
+                } else {
+                    weights[2].mul_add(
+                        values[2],
+                        weights[1].mul_add(values[1], weights[0] * values[0]),
+                    )
+                };
+                (
+                    d,
+                    d > left[k].max(middle[k]).max(right[k])
+                        || d < left[k].min(middle[k]).min(right[k]),
+                )
             } else {
                 (0., false)
             };
@@ -819,8 +844,15 @@ impl LossyLine {
             // range (quadinterp keeps the out-of-range value).
             let linear = m.interpolation == Interpolation::Linear || i == 0 || out_of_range;
             if linear && !(i != 0 && m.interpolation == Interpolation::Quadratic) {
-                let [l2, l3] = lf.ok_or_else(|| self.internal("missing linear interpolation"))?;
-                d = middle[k] * l2 + right[k] * l3;
+                let [_, l3] = lf.ok_or_else(|| self.internal("missing linear interpolation"))?;
+                // Compute the small complement directly near the right
+                // endpoint instead of subtracting the rounded fraction.
+                d = if distances[1] <= distances[2] {
+                    super::functions::blend_from_anchor(middle[k], right[k], l3)
+                } else {
+                    let complement = (target - t3) / (t2 - t3);
+                    super::functions::blend_from_anchor(right[k], middle[k], complement)
+                };
             }
             *value = d;
         }
@@ -1421,6 +1453,29 @@ mod tests {
         line.model.interpolation = Interpolation::Linear;
         assert_eq!(line.delayed_values(view, 4.).unwrap(), [7., 3., 1., -3.]);
         assert!(line.delayed_values(view, 1.).is_err());
+    }
+
+    #[test]
+    fn delayed_values_keep_exact_signed_zeros_and_small_endpoint_values() {
+        let line = line("l=1 c=1 len=1 mixedinterp");
+        let mut history = WaveformHistory::new(4);
+        for (time, values) in [
+            (0., vec![1e16, 0., 1e16, 0.]),
+            (1., vec![1., -0., 1., -0.]),
+            (2., vec![-1e16, 0., -1e16, 0.]),
+        ] {
+            history
+                .apply(&WaveformUpdate {
+                    append: Some((time, values)),
+                    ..WaveformUpdate::default()
+                })
+                .unwrap();
+        }
+        let view = history.samples::<4>().unwrap();
+        assert_eq!(
+            line.delayed_values(view, 2.).unwrap().map(Real::to_bits),
+            [1_f64, -0., 1., -0.].map(Real::to_bits)
+        );
     }
 
     #[test]
