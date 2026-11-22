@@ -174,10 +174,11 @@ pub(super) fn malformed(input: &Input<'_>, message: &str) -> ErrMode<Failure> {
 #[cfg(test)]
 mod tests {
     use super::{named_device, token_designator};
+    use crate::netlist::parser::scopes::ModelVisibility;
     use crate::netlist::parser::{behavioural, grammar::Context};
     use crate::netlist::{RawCard, TokenKind, source::parse_deck_text};
     use crate::primitives::SpiceError;
-    use std::{collections::BTreeSet, path::Path};
+    use std::path::Path;
     use winnow::{Parser as _, error::ErrMode, stream::TokenSlice};
 
     fn card(text: &str) -> RawCard {
@@ -185,7 +186,7 @@ mod tests {
         RawCard::parse(&deck.lines[0]).unwrap()
     }
 
-    fn input<'a>(card: &'a RawCard, declared_models: &'a BTreeSet<String>) -> super::Input<'a> {
+    fn input<'a>(card: &'a RawCard, declared_models: ModelVisibility<'a>) -> super::Input<'a> {
         super::Input {
             input: TokenSlice::new(&card.tokens),
             state: Context {
@@ -199,8 +200,8 @@ mod tests {
     #[test]
     fn named_device_backtracks_and_returns_the_original_token() {
         let card = card("D1 a 0 model");
-        let models = BTreeSet::new();
-        let mut stream = input(&card, &models);
+        let models = ModelVisibility::default();
+        let mut stream = input(&card, models);
         let Err(ErrMode::Backtrack(failure)) = named_device("efgh").parse_next(&mut stream) else {
             panic!("a different device family must backtrack");
         };
@@ -219,8 +220,8 @@ mod tests {
     fn named_device_preserves_the_token_kind_filter() {
         let mut card = card("D1 a 0 model");
         card.tokens[0].kind = TokenKind::Quoted("D1".to_owned());
-        let models = BTreeSet::new();
-        let mut stream = input(&card, &models);
+        let models = ModelVisibility::default();
+        let mut stream = input(&card, models);
         assert_eq!(token_designator(&card.tokens[0]), Some('d'));
         assert!(matches!(
             named_device("d").parse_next(&mut stream),
@@ -231,16 +232,16 @@ mod tests {
 
     #[test]
     fn behavioural_prefix_requires_a_suffix_and_body_errors_cut() {
-        let models = BTreeSet::new();
+        let models = ModelVisibility::default();
         let bare = card("B a 0 v=1");
-        let mut stream = input(&bare, &models);
+        let mut stream = input(&bare, models);
         assert!(matches!(
             behavioural::behavioural_card(&mut stream),
             Err(ErrMode::Backtrack(_))
         ));
         assert_eq!(stream.input.first(), Some(&bare.tokens[0]));
         let named = card("B1 a");
-        let mut stream = input(&named, &models);
+        let mut stream = input(&named, models);
         assert!(matches!(
             behavioural::behavioural_card(&mut stream),
             Err(ErrMode::Cut(_))

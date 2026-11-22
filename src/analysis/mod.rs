@@ -45,6 +45,7 @@ mod linear;
 pub mod measure;
 pub mod newton;
 pub mod noise;
+pub mod optimization;
 mod ordered_samples;
 mod plan;
 mod pz;
