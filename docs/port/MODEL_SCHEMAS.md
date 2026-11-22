@@ -219,6 +219,27 @@ remain device work, not hidden schema corrections.
 
 ## Model binning (#109)
 
+Each literalized deck has a declaration index: canonical ASCII-case-insensitive
+names retain the first card, and a separate bin group contains only first
+declarations whose final dotted suffix is nonempty ASCII digits. Groups retain
+declaration order, so bin selection can walk them in reverse without scanning
+unrelated models or sorting candidates. Exact and bin lookup expose borrowed
+iterators for declaration marking. Scoped expansion uses the same indexing rule
+for each individual frame; renamed cards are emitted in declaration order and
+cloned only at first use.
+
+The resolver reuses declaration-local family, selector and bin-bound metadata.
+Family validation is performed when a declaration is resolved, selector
+validation only after a matched instance designator, and bounds only when the
+candidate is visited in reverse order after geometry validation. Failures
+remain declaration-local (instance-dependent error context is attached at
+resolution). No cached result changes the order of malformed-card diagnostics;
+exact references bypass binning, and unused or shadowed cards are not newly
+validated. Instance geometry, options, chosen bin and physical model
+preparation remain separate. The borrowed index is rebuilt from each immutable
+literalized deck; scope and parameter changes cannot reuse stale metadata.
+
+
 C: `spicelib/parser/inpgmod.c::INPgetModBin` (with `in_range`/`parse_line`),
 `misc/string.c::model_name_match`, `spicelib/parser/inp2m.c`,
 `spicelib/parser/inpmkmod.c::INPmakeMod`, `frontend/subckt.c`. Rust:

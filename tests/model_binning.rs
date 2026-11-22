@@ -5,13 +5,14 @@
 //! parse error. `tests/c_binning_reference.rs` checks the same selections
 //! against the C binary.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use ngspice_rs::analysis::RunConfig;
 use ngspice_rs::devices::binning::{BinOptions, model_name_match};
 use ngspice_rs::devices::{Circuit, ModelResolver};
 use ngspice_rs::netlist::Parser;
-use ngspice_rs::netlist::ast::Netlist;
+use ngspice_rs::netlist::ast::{DeviceInstance, ModelCard, Netlist};
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::SpiceError;
 
@@ -277,13 +278,15 @@ m1 a b 0 0 nch w=1u l=1u
     }
 }
 
+fn names<'a>(cards: impl Iterator<Item = &'a ModelCard>) -> Vec<String> {
+    cards.map(|card| card.name.clone()).collect()
+}
+
 #[test]
 fn resolver_exposes_candidates_and_selection() {
     let netlist = parse(&format!("m1 d g 0 0 nch w=2u l=2u\n{BINS}"));
     let resolver = ModelResolver::new(&netlist.models).unwrap();
-    let names = |cards: Vec<&ngspice_rs::netlist::ast::ModelCard>| {
-        cards.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
-    };
+
     assert_eq!(
         names(resolver.bin_candidates("NCH")),
         ["nch.1", "nch.2", "nch.3"]
@@ -311,4 +314,169 @@ fn resolver_exposes_candidates_and_selection() {
     let vd = netlist.devices.iter().find(|d| d.name == "vd").unwrap();
     assert!(resolver.select_bin(vd).unwrap().is_none());
     assert!(Circuit::from_netlist(&netlist).is_ok());
+}
+
+#[test]
+fn indexed_declarations_match_scan_for_dotted_and_case_insensitive_names() {
+    let example = parse(BINS);
+    let mut cards = Vec::new();
+    for name in [
+        "Nch.2",
+        "nch.01",
+        "NCH.2",
+        "nch.",
+        "nch.a",
+        "nch.1a",
+        "nch.2.0",
+        "nch.2.1",
+        "nch.2.01",
+        "nch.2.0",
+        "nch",
+        "nch.１２",
+        "µ.1",
+        "µ.2",
+        "Μ.1",
+        "unrelated.42",
+    ] {
+        let mut card = example.models[0].clone();
+        card.name = name.into();
+        cards.push(card);
+    }
+    let resolver = ModelResolver::new(&cards).unwrap();
+    let mut seen = BTreeSet::new();
+    let first: Vec<_> = cards
+        .iter()
+        .filter(|card| seen.insert(card.name.to_ascii_lowercase()))
+        .collect();
+    for query in [
+        "nch", "NCH", "nch.2", "NCH.2", "nch.01", "µ", "Μ", "missing", "nch.",
+    ] {
+        let mut exact = None;
+        let mut candidates = Vec::new();
+        for &card in &first {
+            match model_name_match(query, &card.name) {
+                Some(ngspice_rs::devices::binning::NameMatch::Exact) => exact = Some(card),
+                Some(ngspice_rs::devices::binning::NameMatch::Bin) => candidates.push(card),
+                None => {}
+            }
+        }
+        assert_eq!(resolver.model(query), exact);
+        assert_eq!(
+            resolver.bin_candidates(query).collect::<Vec<_>>(),
+            candidates
+        );
+        let expected: Vec<_> = exact.map_or(candidates, |card| vec![card]);
+        assert_eq!(
+            resolver.declarations_for(query).collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+fn setter_value(device: &mut DeviceInstance, name: &str, value: &str) {
+    device
+        .parameters
+        .iter_mut()
+        .find(|p| p.name == name)
+        .unwrap()
+        .value = value.into();
+}
+
+fn corrupt_bound(card: &mut ModelCard) {
+    card.parameters
+        .iter_mut()
+        .find(|p| p.name == "lmin")
+        .unwrap()
+        .value = "broken".into();
+}
+
+#[test]
+fn lazy_bound_validation_respects_precedence_and_geometry_changes() {
+    let mut deck = parse(&format!(
+        "m1 d g 0 0 nch w=1u l=1u
+{BINS}"
+    ));
+    let mut malformed = deck.models[0].clone();
+    malformed.name = "nch.0".into();
+    corrupt_bound(&mut malformed);
+    let mut shadowed = deck.models[1].clone();
+    shadowed.name = "NCH.2".into();
+    corrupt_bound(&mut shadowed);
+    deck.models.insert(0, malformed);
+    deck.models.push(shadowed);
+
+    let resolver = ModelResolver::new(&deck.models).unwrap();
+    let mut device = deck.device("m1").unwrap().clone();
+    device.model = Some("NCH".into());
+    for length in ["1u", "2u", "0.7u", "10u", "2u", "10u", "1u"] {
+        setter_value(&mut device, "l", length);
+        let result = resolver.resolve(&device);
+        match length {
+            "0.7u" => assert_eq!(result.unwrap().unwrap().card().name, "nch.1"),
+            "10u" => {
+                let error = result.unwrap_err();
+                let SpiceError::Parse { location, .. } = error else {
+                    panic!("expected malformed bound: {error}");
+                };
+                assert_eq!(
+                    location,
+                    deck.models[0]
+                        .parameters
+                        .iter()
+                        .find(|p| p.name == "lmin")
+                        .unwrap()
+                        .location
+                );
+            }
+            _ => assert_eq!(result.unwrap().unwrap().card().name, "nch.2"),
+        }
+    }
+    // Exact lookup bypasses geometry and bounds, even after the bound failure
+    // has been cached; wrong-family diagnostics precede level validation.
+    device.model = Some("nch.0".into());
+    setter_value(&mut device, "l", "broken");
+    assert_eq!(
+        resolver.resolve(&device).unwrap().unwrap().card().name,
+        "nch.0"
+    );
+    device.designator = 'q';
+    assert!(
+        resolver
+            .resolve(&device)
+            .unwrap_err()
+            .to_string()
+            .contains("wrong model family")
+    );
+}
+
+#[test]
+fn selector_failures_remain_declaration_local_and_follow_family_check() {
+    let mut deck = parse(&format!(
+        "m1 d g 0 0 nch w=1u l=1u
+{BINS}"
+    ));
+    // Make nch.2's ordered level setter disagree with the raw first-level
+    // cache. Selection of the bin remains valid; only resolution diagnoses it.
+    deck.models[1].level = Some(49.);
+    let resolver = ModelResolver::new(&deck.models).unwrap();
+    let mut device = deck.device("m1").unwrap().clone();
+    assert_eq!(resolver.select_bin(&device).unwrap().unwrap().name, "nch.2");
+    let error = resolver.resolve(&device).unwrap_err();
+    assert!(error.to_string().contains("raw level cache"));
+    device.model = Some("NCH.2".into());
+    device.designator = 'q';
+    assert!(
+        resolver
+            .resolve(&device)
+            .unwrap_err()
+            .to_string()
+            .contains("wrong model family")
+    );
+    device.designator = 'm';
+    assert_eq!(resolver.resolve(&device).unwrap_err(), error);
+    device.model = Some("nch.1".into());
+    assert_eq!(
+        resolver.resolve(&device).unwrap().unwrap().card().name,
+        "nch.1"
+    );
 }
