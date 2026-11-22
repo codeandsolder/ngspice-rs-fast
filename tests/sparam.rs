@@ -574,3 +574,62 @@ fn port_cosines_accumulate_in_c_load_order() {
         }
     }
 }
+
+fn benchmark_rf_sweep(ports: u32) {
+    use std::fmt::Write as _;
+    use std::time::Instant;
+    // Grounded reciprocal RC chain, distinct positive reference impedances,
+    // with resistor noise active. Every port drives one independent RHS.
+    let mut deck = String::from("RF workspace benchmark\n");
+    for i in 1..=ports {
+        writeln!(deck, "v{i} n{i} 0 dc 0 portnum {i} z0 {}", 40 + i).unwrap();
+        writeln!(deck, "r{i} n{i} 0 {}", 100 + i).unwrap();
+        writeln!(deck, "c{i} n{i} 0 1n").unwrap();
+        if i > 1 {
+            writeln!(deck, "rt{i} n{} n{i} 50", i - 1).unwrap();
+        }
+    }
+    deck.push_str(".sp lin 64 1000 1000000 1\n.end\n");
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("rf-bench.cir"), &deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+    for _ in 0..3 {
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let start = Instant::now();
+        let p = plan.run(&mut circuit, &config.context()).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(p.point_count(), 64);
+        assert!(p.cells().iter().all(|v| v.is_finite()));
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for cell in p.cells() {
+            for bits in [cell.re.to_bits(), cell.im.to_bits()] {
+                hash = (hash ^ bits).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        println!(
+            "ports={ports},cells={},elapsed_ns={},bits={hash:016x}",
+            p.cells().len(),
+            elapsed.as_nanos()
+        );
+    }
+}
+
+#[test]
+#[ignore = "opt-in RF allocation and timing workload"]
+fn rf_sweep_benchmark_02() {
+    benchmark_rf_sweep(2);
+}
+
+#[test]
+#[ignore = "opt-in RF allocation and timing workload"]
+fn rf_sweep_benchmark_08() {
+    benchmark_rf_sweep(8);
+}
+
+#[test]
+#[ignore = "opt-in RF allocation and timing workload"]
+fn rf_sweep_benchmark_32() {
+    benchmark_rf_sweep(32);
+}
