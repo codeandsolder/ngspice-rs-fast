@@ -159,7 +159,7 @@ impl<'a> InstantaneousSystem<'a> {
                     row.fixed.push(AbsoluteRow(triplet.col));
                 }
                 Binding::Unknown { variable, .. } => {
-                    system.add(equation, variable, triplet.value)?
+                    system.add(equation, variable, triplet.value)?;
                 }
             }
         }
