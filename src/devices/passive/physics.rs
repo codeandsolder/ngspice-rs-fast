@@ -53,7 +53,7 @@ pub(in crate::devices) struct Coefficients {
 }
 
 impl Coefficients {
-    fn resistor(self, difference: Real) -> Real {
+    const fn resistor(self, difference: Real) -> Real {
         self.quadratic
             .mul_add(difference, self.linear)
             .mul_add(difference, 1.)
@@ -70,7 +70,7 @@ impl Coefficients {
         )
     }
 
-    pub(in crate::devices) fn reactive(self, difference: Real) -> Real {
+    pub(in crate::devices) const fn reactive(self, difference: Real) -> Real {
         (self.quadratic * difference).mul_add(difference, self.linear.mul_add(difference, 1.))
     }
 }
@@ -96,7 +96,7 @@ pub(in crate::devices) struct SheetGeometry {
 }
 
 impl SheetGeometry {
-    pub(in crate::devices) fn dimensions(self) -> (Real, Real) {
+    pub(in crate::devices) const fn dimensions(self) -> (Real, Real) {
         (
             2.0_f64.mul_add(-self.short, self.length),
             2.0_f64.mul_add(-self.narrow, self.width),
@@ -107,7 +107,7 @@ impl SheetGeometry {
         self.length * self.width * self.sheet > 0.
     }
 
-    pub(in crate::devices) fn resistance(self) -> Real {
+    pub(in crate::devices) const fn resistance(self) -> Real {
         let (length, width) = self.dimensions();
         length / width * self.sheet
     }
@@ -157,7 +157,7 @@ impl CapacitorGeometry {
         (length - self.short, width - self.narrow)
     }
 
-    pub(in crate::devices) fn capacitance(self, length: Real, width: Real) -> Real {
+    pub(in crate::devices) const fn capacitance(self, length: Real, width: Real) -> Real {
         let (length, width) = self.dimensions(length, width);
         (self.cjsw * 2.).mul_add(length + width, self.cj * width * length)
     }

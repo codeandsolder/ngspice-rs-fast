@@ -22,7 +22,7 @@ pub(super) struct Linearization {
 impl Linearization {
     /// The common two-junction prediction (HFET1's thermionic cross terms
     /// require its own expression for the limited phase).
-    pub(super) fn predict(self, voltage: [Real; 2]) -> [Real; 2] {
+    pub(super) const fn predict(self, voltage: [Real; 2]) -> [Real; 2] {
         let source_delta = voltage[0] - self.voltage[0];
         let drain_delta = voltage[1] - self.voltage[1];
         let channel_delta = source_delta - drain_delta;
@@ -187,7 +187,7 @@ impl Start {
 
 /// The limited gate-current comparison is inclusive, unlike the held-off
 /// test and the drain-current comparison.
-fn exceeds(
+const fn exceeds(
     predicted: [Real; 2],
     point: Linearization,
     tolerances: (Real, Real),

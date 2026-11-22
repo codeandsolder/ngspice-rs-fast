@@ -412,7 +412,7 @@ fn held_sine(offset: Real, amplitude: Real, radians: Real) -> Real {
 }
 
 /// SFFM and AM both use the C left-associated carrier/modulator angle.
-fn modulation_angle(frequency: Real, time: Real, radians: Real) -> Real {
+const fn modulation_angle(frequency: Real, time: Real, radians: Real) -> Real {
     (2. * PI * frequency).mul_add(time, radians)
 }
 
@@ -743,10 +743,10 @@ impl PwlSource {
         let left = self.knots[1..].partition_point(|(t, _)| *t < time);
         let (t0, v0) = self.knots[left];
         self.knots.get(left + 1).map_or(v0, |&(t1, v1)| {
-            if time == t0 {
+            if time <= t0 {
                 return v0;
             }
-            if time == t1 {
+            if time >= t1 {
                 return v1;
             }
             // Start from the nearer endpoint so cancellation at the far
@@ -1251,10 +1251,10 @@ mod tests {
                     .find_map(|w| {
                         let ((a, x), (b, y)) = (w[0], w[1]);
                         (b >= t).then(|| {
-                            if t == a {
+                            if t <= a {
                                 return (x, x.abs());
                             }
-                            if t == b {
+                            if t >= b {
                                 return (y, y.abs());
                             }
                             let fraction = (t - a) / (b - a);
@@ -1375,7 +1375,7 @@ mod tests {
                     .find_map(|w| {
                         let ((t0, v0), (t1, v1)) = (w[0], w[1]);
                         (t1 >= time).then(|| {
-                            if time == t1 {
+                            if time >= t1 {
                                 return (v1, v1.abs());
                             }
                             let fraction = (time - t0) / (t1 - t0);
