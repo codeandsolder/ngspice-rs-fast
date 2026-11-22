@@ -178,7 +178,7 @@ impl ModelParameters {
     ) -> SpiceResult<setup::ModelSetup> {
         let defaults = self.model_defaults(context)?;
         let temperature = defaults.at_temperature(context.temperature, location)?;
-        setup::ModelSetup::new(defaults, temperature)
+        Ok(setup::ModelSetup::new(defaults, temperature))
     }
 
     /// Apply reversed model-level instance defaults, then instance setters

@@ -382,15 +382,30 @@ fn grouped_literal(value: f64) -> String {
     format!("{sign}{whole}{fraction}{exponent}")
 }
 
-/// The generated `defaults_data.rs` text: the setup file's literal model
-/// defaults, in C order, as interface facts only.
-pub(crate) fn literal_defaults(
+/// A literal numeric default extracted from a C model's setup pass.
+pub(crate) struct LiteralDefault {
+    /// Canonical interface name.
+    pub(crate) name: String,
+    /// Interface type, as recorded by the parameter table.
+    pub(crate) kind: String,
+    /// Literal C default.
+    pub(crate) value: f64,
+}
+
+impl LiteralDefault {
+    /// Render a numeric literal with the generator's standard formatting.
+    pub(crate) fn formatted(&self) -> String {
+        grouped_literal(self.value)
+    }
+}
+
+/// Extract literal defaults in C setup order with their interface types.
+pub(crate) fn literal_default_facts(
     spec: &Spec,
     tables: &str,
     mpar: &str,
     setup: &str,
-    revision: &str,
-) -> Result<String, String> {
+) -> Result<Vec<LiteralDefault>, String> {
     let model = table(tables, spec.model_table)?;
     let setters = setters(mpar, spec.prefix)?;
     let mut fields = BTreeMap::new();
@@ -409,10 +424,7 @@ pub(crate) fn literal_defaults(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
-    let mut out = format!(
-        "// Generated literal-default facts, not C implementation code.\n// Source: ngspice {revision}, {}/{}.\n// Dependent defaults and diagnostics are implemented separately.\n\n/// Canonical model keyword and literal default, in C setup order.\n#[rustfmt::skip]\npub(super) const LITERALS: &[(&str, f64)] = &[\n",
-        spec.directory, spec.setup_file
-    );
+    let mut defaults = Vec::with_capacity(spec.literal_expected);
     let mut seen = BTreeSet::new();
     for pair in lines.windows(2) {
         let Some(given) = pair[0]
@@ -445,8 +457,11 @@ pub(crate) fn literal_defaults(
         if !seen.insert(p.name.as_str()) {
             return Err(format!("duplicate literal default for {}", p.name));
         }
-        let formatted = grouped_literal(value);
-        writeln!(out, "    ({:?}, {formatted}),", p.name).map_err(|e| e.to_string())?;
+        defaults.push(LiteralDefault {
+            name: p.name.clone(),
+            kind: p.kind.clone(),
+            value,
+        });
     }
     if seen.len() != spec.literal_expected {
         return Err(format!(
@@ -454,6 +469,25 @@ pub(crate) fn literal_defaults(
             seen.len(),
             spec.literal_expected
         ));
+    }
+    Ok(defaults)
+}
+
+/// The generated `defaults_data.rs` text for models using keyword/value tables.
+pub(crate) fn literal_defaults(
+    spec: &Spec,
+    tables: &str,
+    mpar: &str,
+    setup: &str,
+    revision: &str,
+) -> Result<String, String> {
+    let mut out = format!(
+        "// Generated literal-default facts, not C implementation code.\n// Source: ngspice {revision}, {}/{}.\n// Dependent defaults and diagnostics are implemented separately.\n\n/// Canonical model keyword and literal default, in C setup order.\n#[rustfmt::skip]\npub(super) const LITERALS: &[(&str, f64)] = &[\n",
+        spec.directory, spec.setup_file
+    );
+    for default in literal_default_facts(spec, tables, mpar, setup)? {
+        writeln!(out, "    ({:?}, {}),", default.name, default.formatted())
+            .map_err(|e| e.to_string())?;
     }
     out.push_str("];\n");
     Ok(out)
