@@ -8,11 +8,11 @@ the live comparison helpers select the same equivalent deck, and verify
 selects its independently captured output in
 `conformance/golden/exact-input`. There is no fallback to the historical
 capture and no change to the numerical comparison policy.
- The live helper
+
+The live helper
 `DeckInputs::fixture` reads both paths through the shared selection before
 running either simulator; a missing registered reference input is an
 error. Generated decks explicitly use identical text on both sides.
-
 
 ## Reason
 
