@@ -407,47 +407,29 @@ pub(super) const fn phase_radians(degrees: Real) -> Real {
 }
 
 /// SIN before its delay and in DC share the same reference formula.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "C SIN offset addition follows a separately rounded amplitude product"
-)]
 fn held_sine(offset: Real, amplitude: Real, radians: Real) -> Real {
-    offset + amplitude * radians.sin()
+    amplitude.mul_add(radians.sin(), offset)
 }
 
 /// SFFM and AM both use the C left-associated carrier/modulator angle.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "preserve the separately rounded C carrier/modulator angle"
-)]
-const fn modulation_angle(frequency: Real, time: Real, radians: Real) -> Real {
-    2. * PI * frequency * time + radians
+fn modulation_angle(frequency: Real, time: Real, radians: Real) -> Real {
+    (2. * PI * frequency).mul_add(time, radians)
 }
 
 impl Sine {
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "C SIN time-frequency product, phase addition and damping have a fixed rounding order"
-    )]
     fn value_at(self, t: Real) -> Real {
         let time = t - self.delay;
         let phase = phase_radians(self.phase);
         if time <= 0. {
             held_sine(self.offset, self.amplitude, phase)
         } else {
-            self.offset
-                + self.amplitude
-                    * (self.frequency * time * 2. * PI + phase).sin()
-                    * (-time * self.damping).exp()
+            let angle = (self.frequency * time * 2.).mul_add(PI, phase);
+            (self.amplitude * angle.sin()).mul_add((-time * self.damping).exp(), self.offset)
         }
     }
 }
 
 impl Exponential {
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "C EXP adds the rise contribution before the separately rounded fall contribution"
-    )]
     fn value_at(self, time: Real) -> Real {
         let rise = |time: Real| {
             (self.pulsed - self.initial) * (1. - (-(time - self.rise_delay) / self.rise_tau).exp())
@@ -457,19 +439,15 @@ impl Exponential {
         } else if time <= self.fall_delay {
             self.initial + rise(time)
         } else {
-            self.initial
-                + rise(time)
-                + (self.initial - self.pulsed)
-                    * (1. - (-(time - self.fall_delay) / self.fall_tau).exp())
+            (self.initial - self.pulsed).mul_add(
+                1. - (-(time - self.fall_delay) / self.fall_tau).exp(),
+                self.initial + rise(time),
+            )
         }
     }
 }
 
 impl Sffm {
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "C SFFM separately rounds the modulation index product and the offset sum"
-    )]
     fn value_at(self, t: Real, limit: Limit) -> Real {
         let time = t - self.delay;
         if time < 0. || (time == 0. && limit == Limit::Left) {
@@ -477,16 +455,12 @@ impl Sffm {
         }
         let carrier_angle = modulation_angle(self.carrier, time, phase_radians(self.carrier_phase));
         let signal_angle = modulation_angle(self.signal, time, phase_radians(self.signal_phase));
-        let angle = carrier_angle + self.index * signal_angle.sin();
-        self.offset + self.amplitude * angle.sin()
+        let angle = self.index.mul_add(signal_angle.sin(), carrier_angle);
+        self.amplitude.mul_add(angle.sin(), self.offset)
     }
 }
 
 impl Am {
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "C AM rounds the modulation product and carrier amplitude before the final offset sum"
-    )]
     fn value_at(self, t: Real, limit: Limit) -> Real {
         let time = t - self.delay;
         if time < 0. || (time == 0. && limit == Limit::Left) {
@@ -502,9 +476,9 @@ impl Am {
             time,
             phase_radians(self.modulation_phase),
         );
-        self.offset
-            + (self.carrier_amplitude + self.modulation_amplitude * signal_angle.sin())
-                * carrier_angle.sin()
+        self.modulation_amplitude
+            .mul_add(signal_angle.sin(), self.carrier_amplitude)
+            .mul_add(carrier_angle.sin(), self.offset)
     }
 }
 
@@ -762,19 +736,18 @@ impl PwlSource {
     }
 
     /// Linear interpolation at an in-range local time (C's segment search).
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "C PWL interpolation rounds the scaled segment difference before adding its starting value"
-    )]
     fn interpolate(&self, time: Real) -> Real {
         // Strictly increasing finite knots are guaranteed by the constructor.
         // Search right endpoints, choosing the preceding segment at an exact
-        // knot just as C's first t1 >= time does (including its rounding).
+        // knot. Return the stored endpoint exactly rather than reconstruct it.
         let left = self.knots[1..].partition_point(|(t, _)| *t < time);
         let (t0, v0) = self.knots[left];
         self.knots.get(left + 1).map_or(v0, |&(t1, v1)| {
+            if time == t1 {
+                return v1;
+            }
             let fraction = (time - t0) / (t1 - t0);
-            v0 + fraction * (v1 - v0)
+            fraction.mul_add(v1 - v0, v0)
         })
     }
 

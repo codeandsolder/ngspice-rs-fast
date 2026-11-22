@@ -53,12 +53,10 @@ pub(in crate::devices) struct Coefficients {
 }
 
 impl Coefficients {
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "preserve the C resistor temperature polynomial and rounding order"
-    )]
-    const fn resistor(self, difference: Real) -> Real {
-        ((self.quadratic * difference) + self.linear) * difference + 1.
+    fn resistor(self, difference: Real) -> Real {
+        self.quadratic
+            .mul_add(difference, self.linear)
+            .mul_add(difference, 1.)
     }
 
     pub(in crate::devices) fn resistor_factor(
@@ -72,12 +70,8 @@ impl Coefficients {
         )
     }
 
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "preserve the C reactive temperature polynomial and rounding order"
-    )]
-    pub(in crate::devices) const fn reactive(self, difference: Real) -> Real {
-        1. + self.linear * difference + self.quadratic * difference * difference
+    pub(in crate::devices) fn reactive(self, difference: Real) -> Real {
+        (self.quadratic * difference).mul_add(difference, self.linear.mul_add(difference, 1.))
     }
 }
 
@@ -102,19 +96,18 @@ pub(in crate::devices) struct SheetGeometry {
 }
 
 impl SheetGeometry {
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "preserve the separately rounded C sheet geometry corrections"
-    )]
-    pub(in crate::devices) const fn dimensions(self) -> (Real, Real) {
-        (self.length - 2. * self.short, self.width - 2. * self.narrow)
+    pub(in crate::devices) fn dimensions(self) -> (Real, Real) {
+        (
+            2.0_f64.mul_add(-self.short, self.length),
+            2.0_f64.mul_add(-self.narrow, self.width),
+        )
     }
 
     pub(in crate::devices) const fn uses_sheet(self) -> bool {
         self.length * self.width * self.sheet > 0.
     }
 
-    pub(in crate::devices) const fn resistance(self) -> Real {
+    pub(in crate::devices) fn resistance(self) -> Real {
         let (length, width) = self.dimensions();
         length / width * self.sheet
     }
@@ -164,13 +157,9 @@ impl CapacitorGeometry {
         (length - self.short, width - self.narrow)
     }
 
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "preserve the separately rounded C area and perimeter capacitance products"
-    )]
-    pub(in crate::devices) const fn capacitance(self, length: Real, width: Real) -> Real {
+    pub(in crate::devices) fn capacitance(self, length: Real, width: Real) -> Real {
         let (length, width) = self.dimensions(length, width);
-        self.cj * width * length + self.cjsw * 2. * (length + width)
+        (self.cjsw * 2.).mul_add(length + width, self.cj * width * length)
     }
 }
 
