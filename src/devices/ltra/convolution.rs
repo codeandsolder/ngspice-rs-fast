@@ -12,8 +12,8 @@
 //! Preserve the C convolution and auxiliary-index policy, with local
 //! interval formulas and exponentially scaled Bessel products to avoid
 //! cancellation and overflow in finite physical responses. Modified Bessel
-//! functions use accurate Taylor polynomials at small arguments and the
-//! Abramowitz and Stegun large-argument approximations from `ltramisc.c`.
+//! functions use Taylor polynomials at small arguments and scaled polynomial
+//! approximations at large arguments, without C's approximation-boundary jumps.
 //! The complementary error function uses a separate implementation (see [`erfc`]).
 
 #![expect(
@@ -128,7 +128,14 @@ fn twiceintlinfunc(
 // Small-argument Taylor coefficients in y=(x/2)^2: I0 has 1/(k!)^2,
 // I1/x has 1/(2 k! (k+1)!). Through degree 14 the omitted absolute
 // terms at x=3.75 are below 9.3e-17 and 2.9e-18 respectively.
-// The A&S large-argument coefficients use y=3.75/x.
+// For x >= 3.75 approximate sqrt(x)*exp(-x)*I_n(x) in y=3.75/x.
+// The two intervals [0,1/4] and [1/4,1] map to [-1,1]. The coefficients
+// below are from a 65-decimal-digit, 40-node Chebyshev interpolation,
+// converted to the power basis after truncating the coefficient tail
+// below 4e-17. Samples use the convergent Taylor series through x=64,
+// and least-term asymptotics beyond it. Separate high-precision power
+// series references test the joins and far tails. This avoids the
+// 1e-7-scale jumps/errors in C's A&S polynomials.
 const I0_SMALL: [Real; 15] = [
     1.0,
     1.0,
@@ -145,17 +152,6 @@ const I0_SMALL: [Real; 15] = [
     4.358_389_823_304_995e-18,
     2.578_928_889_529_582_8e-20,
     1.315_780_045_678_358_6e-22,
-];
-const I0_LARGE: [Real; 9] = [
-    0.398_942_28,
-    0.132_859_2e-1,
-    0.225_319e-2,
-    -0.157_565e-2,
-    0.916_281e-2,
-    -0.205_770_6e-1,
-    0.263_553_7e-1,
-    -0.164_763_3e-1,
-    0.392_377e-2,
 ];
 const I1_SMALL: [Real; 15] = [
     0.5,
@@ -174,16 +170,92 @@ const I1_SMALL: [Real; 15] = [
     9.210_460_319_748_51e-22,
     4.385_933_485_594_529e-24,
 ];
-const I1_LARGE: [Real; 9] = [
-    0.398_942_28,
-    -0.398_802_4e-1,
-    -0.362_018e-2,
-    0.163_801e-2,
-    -0.103_155_5e-1,
-    0.228_296_7e-1,
-    -0.289_531_2e-1,
-    0.178_765_4e-1,
-    -0.420_059e-2,
+const I0_FAR: [Real; 13] = [
+    0.400_636_848_783_870_2,
+    0.001_728_082_560_688_748_8,
+    3.478_816_199_370_496e-05,
+    1.348_063_628_042_745_8e-06,
+    8.002_455_677_894_609e-08,
+    6.566_386_253_785_202e-09,
+    7.035_626_850_322_122e-10,
+    9.518_206_813_336_177e-11,
+    1.586_927_565_357_465_4e-11,
+    3.027_477_495_387_895_5e-12,
+    7.474_537_200_129_181e-13,
+    3.931_462_049_911_165e-13,
+    1.383_335_792_578_430_3e-13,
+];
+
+const I1_FAR: [Real; 13] = [
+    0.393_901_965_218_782_73,
+    -0.005_095_524_343_232_472_5,
+    -5.696_899_670_220_371e-05,
+    -1.853_700_271_953_035_5e-06,
+    -1.010_175_607_006_831_1e-07,
+    -7.876_192_800_299_644e-09,
+    -8.156_082_361_890_572e-10,
+    -1.076_623_097_165_227_6e-10,
+    -1.762_153_030_400_922e-11,
+    -3.318_723_515_051_029e-12,
+    -8.073_602_016_534_75e-13,
+    -4.187_948_248_426_715e-13,
+    -1.470_806_043_651_819e-13,
+];
+
+const I0_MID: [Real; 25] = [
+    0.408_225_671_809_809_1,
+    0.006_330_153_147_333_674,
+    0.000_620_304_210_560_012_7,
+    0.000_137_916_062_033_287_41,
+    7.817_416_343_577_205e-06,
+    -2.665_813_268_273_963_7e-05,
+    -7.231_258_876_351_193_4e-06,
+    6.912_085_207_242_919e-06,
+    9.272_537_917_098_441e-07,
+    -2.191_390_206_776_105_5e-06,
+    5.208_715_405_007_248e-07,
+    4.204_580_805_546_653_6e-07,
+    -3.665_443_343_784_350_5e-07,
+    7.309_513_589_242_414e-08,
+    6.836_067_092_188_111e-08,
+    -6.311_071_025_156_935e-08,
+    2.351_587_615_790_820_7e-08,
+    -1.667_603_537_198_518_5e-09,
+    -1.012_662_855_681_769_9e-08,
+    1.327_841_757_837_759_9e-08,
+    -3.183_855_488_055_551e-09,
+    -4.976_476_401_161_861e-09,
+    2.597_552_742_343_070_8e-09,
+    6.341_317_638_474_664e-10,
+    -4.597_455_221_395_759e-10,
+];
+
+const I1_MID: [Real; 25] = [
+    0.372_448_489_951_398_95,
+    -0.017_063_307_704_856_742,
+    -0.000_909_376_971_131_630_8,
+    -0.000_175_255_075_972_570_77,
+    -1.450_269_542_247_383_4e-05,
+    2.852_785_989_664_657_4e-05,
+    9.055_694_919_549_385e-06,
+    -7.152_353_752_486_529e-06,
+    -1.328_529_470_705_181e-06,
+    2.330_206_783_925_827_2e-06,
+    -4.601_834_204_373_003e-07,
+    -4.802_952_582_699_402e-07,
+    3.769_317_583_971_989_5e-07,
+    -6.176_041_935_726_063e-08,
+    -7.755_554_307_793_5e-08,
+    6.549_218_812_726_057e-08,
+    -2.245_990_110_602_49e-08,
+    3.837_192_633_419_541_7e-11,
+    1.109_476_121_117_65e-08,
+    -1.327_595_829_556_462e-08,
+    2.773_216_853_689_980_2e-09,
+    5.159_393_306_248_755e-09,
+    -2.559_937_378_360_323e-09,
+    -6.732_332_215_694_791e-10,
+    4.651_933_881_673_839_7e-10,
 ];
 
 #[inline]
@@ -200,6 +272,33 @@ fn polynomial<T: Copy + std::ops::Mul<Output = T> + std::ops::Add<Output = T>>(
         .fold(constant(last), |value, &c| constant(c) + y * value)
 }
 
+/// Polynomial approximations of sqrt(x)*exp(-x)*I_n(x).
+#[inline]
+fn large_bessel_pair(x: Real) -> (Real, Real) {
+    if x >= 15. {
+        let t = (30. / x) - 1.;
+        (
+            polynomial(t, &I0_FAR, std::convert::identity),
+            polynomial(t, &I1_FAR, std::convert::identity),
+        )
+    } else {
+        let t = (10. / x) - (5. / 3.);
+        (
+            polynomial(t, &I0_MID, std::convert::identity),
+            polynomial(t, &I1_MID, std::convert::identity),
+        )
+    }
+}
+
+/// Recover an unscaled value while avoiding overflow in exp(x) alone.
+fn unscale_bessel(scaled: Real, x: Real) -> Real {
+    if x.is_infinite() {
+        return Real::INFINITY;
+    }
+    let half = (0.5 * x).exp();
+    (scaled * half) * half
+}
+
 /// `bessI0` (Abramowitz and Stegun 9.8.1, 9.8.2).
 #[must_use]
 pub fn bess_i0(x: Real) -> Real {
@@ -208,7 +307,7 @@ pub fn bess_i0(x: Real) -> Real {
         let y = 0.5 * x;
         polynomial(y * y, &I0_SMALL, std::convert::identity)
     } else {
-        (ax.exp() / ax.sqrt()) * polynomial(3.75 / ax, &I0_LARGE, std::convert::identity)
+        unscale_bessel(large_bessel_pair(ax).0 / ax.sqrt(), ax)
     }
 }
 
@@ -220,7 +319,7 @@ pub fn bess_i1(x: Real) -> Real {
         let y = 0.5 * ax;
         ax * polynomial(y * y, &I1_SMALL, std::convert::identity)
     } else {
-        polynomial(3.75 / ax, &I1_LARGE, std::convert::identity) * (ax.exp() / ax.sqrt())
+        unscale_bessel(large_bessel_pair(ax).1 / ax.sqrt(), ax)
     };
     if x < 0.0 { -ans } else { ans }
 }
@@ -233,7 +332,7 @@ pub fn bess_i1_x_over_x(x: Real) -> Real {
         let y = 0.5 * ax;
         polynomial(y * y, &I1_SMALL, std::convert::identity)
     } else {
-        polynomial(3.75 / ax, &I1_LARGE, std::convert::identity) * (ax.exp() / (ax * ax.sqrt()))
+        unscale_bessel((large_bessel_pair(ax).1 / ax.sqrt()) / ax, ax)
     }
 }
 
@@ -261,10 +360,10 @@ fn weighted_bessel_pair<const DIVIDED: bool>(
         let i1 = polynomial(y, &I1_SMALL, std::convert::identity);
         (factor * i0, factor * if DIVIDED { i1 } else { x * i1 })
     } else {
-        let y = 3.75 / x;
+        let (p0, p1) = large_bessel_pair(x);
         let factor = combined_exponent.exp() / x.sqrt();
-        let i0 = factor * polynomial(y, &I0_LARGE, std::convert::identity);
-        let i1 = factor * polynomial(y, &I1_LARGE, std::convert::identity);
+        let i0 = factor * p0;
+        let i1 = factor * p1;
         (i0, if DIVIDED { i1 / x } else { i1 })
     }
 }
@@ -279,7 +378,8 @@ fn rlc_self_endpoint(lag: Real, beta: Real) -> Real {
     let x = beta * lag;
     if x < 3.75 {
         let delta = small_i0_delta(x) + bess_i1(x);
-        lag * (-x).exp().mul_add(delta, (-x).exp_m1())
+        let minus_one = (-x).exp_m1();
+        lag * (1. + minus_one).mul_add(delta, minus_one)
     } else {
         let (i0, i1) = weighted_bessel_pair::<false>(x, -x, 0.);
         lag * (i0 + i1 - 1.)
@@ -798,7 +898,7 @@ mod tests {
     fn bessel_approximations_match_known_values() {
         // I0(1) = 1.2660658777520082, I1(1) = 0.5651591039924851,
         // I0(5) = 27.239871823604442, I1(5) = 24.335642142450524.
-        // The A&S polynomials are accurate to about 1e-7 relative.
+        // Check both polynomial regions against high-precision reference values.
         for (got, expected) in [
             (bess_i0(1.), 1.266_065_877_752_008_2),
             (bess_i1(1.), 0.565_159_103_992_485_1),
@@ -808,10 +908,53 @@ mod tests {
             (bess_i1(-1.), -0.565_159_103_992_485_1),
         ] {
             assert!(
-                ((got - expected) / expected).abs() < 2e-7,
+                ((got - expected) / expected).abs() < 4e-15,
                 "{got} {expected}"
             );
         }
+    }
+
+    #[test]
+    fn scaled_bessel_approximations_are_accurate_at_joins_and_in_the_far_tail() {
+        // Independent convergent 65-digit power-series references at the
+        // exact binary64 arguments, not values from the fitted polynomials.
+        for (x, expected) in [
+            (
+                3.749_999_999_999_999_6,
+                [0.415_294_293_945_364_77, 0.354_316_823_573_604_5],
+            ),
+            (3.75, [0.415_294_293_945_364_77, 0.354_316_823_573_604_5]),
+            (
+                3.750_000_000_000_000_4,
+                [0.415_294_293_945_364_77, 0.354_316_823_573_604_5],
+            ),
+            (5.0, [0.410_409_733_640_008_77, 0.366_653_135_312_738_47]),
+            (8.0, [0.405_686_342_354_593_9, 0.379_412_266_610_151_37]),
+            (
+                14.999_999_999_999_998,
+                [0.402_401_154_980_044_2, 0.388_747_508_339_238_55],
+            ),
+            (15.0, [0.402_401_154_980_044_2, 0.388_747_508_339_238_55]),
+            (
+                15.000_000_000_000_002,
+                [0.402_401_154_980_044_2, 0.388_747_508_339_238_55],
+            ),
+            (30.0, [0.400_636_848_783_870_2, 0.393_901_965_218_782_73]),
+            (64.0, [0.399_728_427_058_858_97, 0.396_593_154_562_499_3]),
+            (100.0, [0.399_443_792_990_966_83, 0.397_441_530_251_302_5]),
+            (1000.0, [0.398_992_176_266_376_2, 0.398_792_630_254_268_87]),
+        ] {
+            let (i0, i1) = weighted_bessel_pair::<false>(x, -x, 0.);
+            for (actual, reference) in [i0 * x.sqrt(), i1 * x.sqrt()].into_iter().zip(expected) {
+                assert!(
+                    (actual - reference).abs() <= 4e-15 * reference.abs(),
+                    "x={x:e}, {actual:e} != {reference:e}"
+                );
+            }
+        }
+        // exp(710) overflows, but both unscaled Bessel values are finite.
+        assert!(bess_i0(710.).is_finite());
+        assert!(bess_i1(710.).is_finite());
     }
 
     #[test]
@@ -844,7 +987,7 @@ mod tests {
             let got = kernels.at(lag, [true; 3]);
             for (actual, reference) in got.into_iter().zip(expected) {
                 assert!(
-                    (actual - reference).abs() <= 3e-7 * reference.abs(),
+                    (actual - reference).abs() <= 4e-14 * reference.abs(),
                     "beta={beta:e}, lag={lag:e}, {actual:e} != {reference:e}"
                 );
             }

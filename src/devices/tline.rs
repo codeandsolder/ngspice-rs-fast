@@ -397,6 +397,10 @@ impl TransmissionLine {
     /// quadratically through the history samples `i-2, i-1, i` where `i` is
     /// the first sample (from the third on) later than `time - TD`, or the
     /// last one (extrapolation).
+    #[expect(
+        clippy::float_cmp,
+        reason = "exact accepted knots preserve stored samples and signed zero"
+    )]
     fn delayed(&self, history: &WaveformHistory, time: Real) -> SpiceResult<[Real; 2]> {
         let samples = history.samples::<2>()?;
         let size = samples
@@ -429,13 +433,13 @@ impl TransmissionLine {
         // Preserve exact accepted waves, including signed zeros. Form
         // Lagrange weights from dimensionless ratios: products of tiny
         // time differences can underflow before their denominators cancel.
-        if target - t1 == 0. {
+        if target == t1 {
             return Ok(first.values);
         }
-        if target - t2 == 0. {
+        if target == t2 {
             return Ok(second.values);
         }
-        if target - t3 == 0. {
+        if target == t3 {
             return Ok(third.values);
         }
         let weights = [
