@@ -181,6 +181,14 @@ two unit right-hand sides and a single reused forward/adjoint solve workspace.
 The forward gain is consumed before overwriting the solution with the
 adjoint. C visitation, arithmetic grouping and summary cadence are unchanged.
 
+The opt-in `noise_workspace_bench` compares rebuilding the layout at each
+frequency with refreshing it in place, through the same generator API.
+On Acer (512 modeled resistors, 32 models, 256 frequencies), DHAT reported
+155,432,113 versus 3,275,427 allocated bytes and 441,775 versus 41,903
+allocation blocks (including setup). Peak live heap was 1,509,206 versus
+1,225,721 bytes. The measured loop took 180.6 versus 48.6 ms on a loaded host;
+these are single measurements, not a whole-simulator speedup claim.
+
 ## Verification
 
 * `tests/noise_analysis.rs` (production path, closed forms): resistor-divider
