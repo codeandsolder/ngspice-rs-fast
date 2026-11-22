@@ -327,7 +327,11 @@ fn qgg(
     let veff = gamma.mul_add(vds, gate.high);
     let vnr = d1_xc * (veff - vto);
     let threshold = jfet::smoothed_extrema(vnr, 0., 0.2);
-    let vnew = veff - threshold.low;
+    let vnew = if vnr < 0. {
+        xc.mul_add(veff, d1_xc * vto) + threshold.high
+    } else {
+        veff - threshold.low
+    };
     let derivative = d1_xc.mul_add(threshold.high_weights[0], xc);
     let voltage = vnew.min(vmax);
     let qrt = (1. - voltage / pb).sqrt();
