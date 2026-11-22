@@ -1062,6 +1062,32 @@ fn bias_independent_behavioural_overflow_is_rejected_before_samples() {
     );
 }
 
+#[test]
+fn repeated_scalar_context_still_validates_changed_couplings() {
+    let body = "v1 a 0 1\nr1 a b 1\nl1 b 0 1m\nr2 a c 1\nl2 c 0 1m\nr3 a d 1\nl3 d 0 1m\nk1 l1 l2 0.5\nk2 l1 l3 0.5\nk3 l2 l3 0.5";
+    let context = AnalysisContext::default();
+    for args in [
+        vec!["@k3[k]", "0.5", "-0.9", "-0.7"],
+        vec![
+            "temp",
+            "27",
+            "29",
+            "1",
+            "@k3[coefficient]",
+            "0.5",
+            "-0.9",
+            "-0.7",
+        ],
+        vec!["@k3[k]", "0.5", "-0.9", "-0.7", "temp", "27", "29", "1"],
+    ] {
+        let error = rejected(body, &args, &context);
+        assert!(
+            error.to_string().contains("positive semidefinite"),
+            "{error}"
+        );
+    }
+}
+
 // ---- product and work limits ------------------------------------------------------------
 
 #[test]

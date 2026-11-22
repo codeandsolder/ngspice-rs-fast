@@ -734,12 +734,31 @@ fn preflight(
         axes.get(1).is_some_and(|axis| axis.binding.is_source()),
     ];
     let contexts = GridPair::new(grids).physical_contexts(sources);
-    // Temperature and general setters can change physical derivations and
-    // coupling constraints. Validate every actual effective combination.
+    let start = [contexts.inner[0], contexts.outer[0]];
+    // Check every coupled physical combination, but unchanged devices only
+    // need validation once at each scalar temperature context. The grids
+    // are strictly monotone, so the first value of the other axis identifies
+    // the first visit to each temperature in either C traversal order.
+    // Rebuild replacements every visit; no live device or trial state is
+    // reused for a different ModelContext.
     if axes.iter().any(|axis| axis.binding.changes_physics()) {
+        let temperature = axes
+            .iter()
+            .position(|axis| matches!(axis.binding, AxisBinding::Temperature));
+        let coupling_may_change = axes
+            .iter()
+            .any(|axis| matches!(axis.binding, AxisBinding::Device(_)));
         for values in contexts.points() {
             let point = point_context(circuit, axes, values, base)?;
-            prepared.validate_dc_inputs(&point.model)?;
+            let first_scalar_context = temperature.map_or_else(
+                || values.map(Real::to_bits) == start.map(Real::to_bits),
+                |axis| values[1 - axis].to_bits() == start[1 - axis].to_bits(),
+            );
+            if first_scalar_context {
+                prepared.validate_dc_inputs(&point.model)?;
+            } else {
+                prepared.validate_dc_replacements(&point.model, coupling_may_change)?;
+            }
         }
         return Ok(());
     }
@@ -750,7 +769,6 @@ fn preflight(
     // through the actual ordered setter/replacement path, not an approximate
     // resistance formula. This also validates C's clamping and any recipe
     // metadata. Avoid a full Cartesian product of unrelated resistors.
-    let start = [contexts.inner[0], contexts.outer[0]];
     let point = point_context(circuit, axes, start, base)?;
     prepared.validate_dc_inputs(&point.model)?;
     for (index, (axis, grid)) in axes.iter().zip(grids).enumerate() {
@@ -761,7 +779,7 @@ fn preflight(
             let mut values = start;
             values[index] = value;
             let point = point_context(circuit, axes, values, base)?;
-            prepared.validate_dc_replacements(&point.model)?;
+            prepared.validate_dc_replacements(&point.model, false)?;
         }
     }
     Ok(())
@@ -1031,10 +1049,14 @@ mod grid_tests {
             ("v1 0 2 1", 1, 1, 0),
             ("r1 1000 1002 1", 1, 1, 2),
             ("temp 27 29 1", 0, 3, 0),
-            ("@d1[area] 1 3 1", 1, 3, 0),
+            ("@d1[area] 1 3 1", 1, 1, 2),
             ("v1 0 3 1 temp 27 29 1", 1, 3, 0),
-            ("r1 1000 1002 1 temp 27 29 1", 1, 9, 0),
-            ("@d1[area] 1 3 1 v1 0 3 1", 2, 3, 0),
+            ("r1 1000 1002 1 temp 27 29 1", 1, 3, 6),
+            ("@d1[area] 1 3 1 v1 0 3 1", 2, 1, 2),
+            ("temp 27 29 1 r1 1000 1002 1", 1, 3, 6),
+            ("temp 27 29 1 @d1[area] 1 3 1", 1, 3, 6),
+            ("@d1[area] 1 3 1 temp 27 29 1", 1, 3, 6),
+            ("@d1[area] 1 3 1 @d1[m] 1 3 1", 2, 1, 8),
             ("@v1[dc] 0 3 1 v2 0 2 1", 2, 1, 0),
             ("r1 1000 1002 1 @r2[resistance] 2000 2002 1", 2, 1, 4),
         ] {
@@ -1096,7 +1118,7 @@ mod grid_tests {
 
     #[test]
     fn bound_handles_replay_values_and_reject_foreign_topologies() {
-        let a = fixture();
+        let mut a = fixture();
         let b = fixture();
         let resistance = a.bind_resistor_target("R1").unwrap();
         let area = a.bind_instance_target("D1", "AREA").unwrap();
@@ -1115,6 +1137,18 @@ mod grid_tests {
             assert!(b.prepare_run().validate_dc_inputs(&context).is_err());
             assert_eq!(a.resistor("r1").unwrap().1.supplied, 1000.);
         }
+        drop(run);
+        let node = a.nodes().get("a").unwrap();
+        a.add_device(Box::new(
+            crate::devices::Resistor::new("r_stale", [node, crate::primitives::NodeId::GROUND], 1.)
+                .unwrap(),
+        ))
+        .unwrap();
+        a.finalize().unwrap();
+        let stale = base
+            .with_instance_override(voltage.at(1.).unwrap())
+            .unwrap();
+        assert!(a.prepare_run().validate_context(&stale).is_err());
         assert!(resistance.at_resistance(0.).is_err());
         assert!(area.at(Real::NAN).is_err());
         assert!(voltage.at_resistance(1.).is_err());

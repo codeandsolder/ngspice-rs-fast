@@ -371,25 +371,45 @@ impl<'a> PreparedRun<'a> {
         preparation_metrics::record(|counts| counts.physical_validations += 1);
         let point = self.point(context)?;
         point.mutual(self.circuit)?;
+        let inputs = Self::dc_device_context(context);
         for index in self.circuit.load_order() {
             point
                 .device(self.circuit, index)
-                .validate_dc_inputs(context)?;
+                .validate_dc_inputs(&inputs)?;
         }
         Ok(())
     }
 
-    /// Validate only replaced devices when already-validated unchanged
-    /// recipes and mutual terms are invariant. Used for independent resistor
-    /// axes at a fixed temperature after validating one full context.
-    pub(crate) fn validate_dc_replacements(&self, context: &ModelContext) -> SpiceResult<()> {
+    /// Validate replaced devices after confirming the unchanged recipes at
+    /// the same scalar context. General setters can change mutual coupling;
+    /// independent resistance/source replacements cannot.
+    pub(crate) fn validate_dc_replacements(
+        &self,
+        context: &ModelContext,
+        coupling_may_change: bool,
+    ) -> SpiceResult<()> {
         #[cfg(test)]
         preparation_metrics::record(|counts| counts.replacement_validations += 1);
         let point = self.point(context)?;
+        if coupling_may_change {
+            point.mutual(self.circuit)?;
+        }
+        let inputs = Self::dc_device_context(context);
         for (_, device) in &point.replacements {
-            device.validate_dc_inputs(context)?;
+            device.validate_dc_inputs(&inputs)?;
         }
         Ok(())
+    }
+
+    // Each effective recipe already incorporates its own setters. A device's
+    // pure input check deliberately sees shared scalar inputs, not the other
+    // devices' override tables, just as its real DC load does.
+    const fn dc_device_context(context: &ModelContext) -> ModelContext {
+        ModelContext {
+            resistor_overrides: [None; crate::devices::MAX_RESISTOR_OVERRIDES],
+            instance_overrides: [None; crate::devices::MAX_INSTANCE_OVERRIDES],
+            ..*context
+        }
     }
 
     /// Load a disposable trial using this run's prepared effective devices.

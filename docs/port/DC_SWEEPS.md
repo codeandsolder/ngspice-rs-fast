@@ -188,7 +188,12 @@ remaining independent resistor values through the actual replacement path.
 For two resistor axes at fixed temperature this is one full validation
 plus the sum of the remaining axis lengths, not their Cartesian product.
 Temperature or general device-parameter axes validate every physical
-combination, with source-only axes still projected. No numerical matrix,
+combination, with source-only axes still projected. Unchanged recipes are
+validated once per scalar temperature context in the original C traversal
+order; later combinations at that temperature validate the actual replaced
+devices and, for general setters, the effective mutual system. This retains
+only the last exact prepared context rather than storing any Cartesian
+product of live devices or reusing mutable state. No numerical matrix,
 zero-bias AC Jacobian or fictitious accepted state is constructed during
 preflight.
 
