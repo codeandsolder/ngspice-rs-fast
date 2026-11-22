@@ -107,6 +107,10 @@ active counts. Topology and complete plans remain shared across snapshots
 and scalar conversions; pivot traversal order, fill-in creation order,
 arithmetic, determinant parity and untranslated RHS bits are unchanged.
 
+The [November 22 comparative workload measurements](performance-baselines/2026-11-22-sparse-lifecycle.md)
+record unchanged residuals and allocation counts for the recovered lifecycle
+candidate versus the accepted scalar baseline.
+
 ## Error policy (C's)
 
 - `spSINGULAR` and `spZERO_DIAG` are errors (`E_SINGULAR`). Circuit solves
