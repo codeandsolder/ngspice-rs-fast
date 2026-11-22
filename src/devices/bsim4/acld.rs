@@ -605,31 +605,7 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
     ckt.real(bp, sp, -(mult_i * (gjbs - gbbsp + gIbtots)));
     ckt.imag(bp, bp, mult_q * xcbbb);
     ckt.real(bp, bp, mult_i * (gjbd + gjbs - h.gbbs - gIbtotb));
-    let ggidld = h.ggidld;
-    let ggidlg = h.ggidlg;
-    let ggidlb = h.ggidlb;
-    let ggislg = h.ggislg;
-    let ggisls = h.ggisls;
-    let ggislb = h.ggislb;
-
-    // stamp gidl
-    ckt.real(dp, dp, mult_i * ggidld);
-    ckt.real(dp, gp, mult_i * ggidlg);
-    ckt.real(dp, sp, -(mult_i * ((ggidlg + ggidld) + ggidlb)));
-    ckt.real(dp, bp, mult_i * ggidlb);
-    ckt.real(bp, dp, -(mult_i * ggidld));
-    ckt.real(bp, gp, -(mult_i * ggidlg));
-    ckt.real(bp, sp, mult_i * ((ggidlg + ggidld) + ggidlb));
-    ckt.real(bp, bp, -(mult_i * ggidlb));
-    // stamp gisl
-    ckt.real(sp, dp, -(mult_i * ((ggisls + ggislg) + ggislb)));
-    ckt.real(sp, gp, mult_i * ggislg);
-    ckt.real(sp, sp, mult_i * ggisls);
-    ckt.real(sp, bp, mult_i * ggislb);
-    ckt.real(bp, dp, mult_i * ((ggislg + ggisls) + ggislb));
-    ckt.real(bp, gp, -(mult_i * ggislg));
-    ckt.real(bp, sp, -(mult_i * ggisls));
-    ckt.real(bp, bp, -(mult_i * ggislb));
+    super::stamp_common::leakage(h, mult_i, |row, col, value| ckt.real(row, col, value));
 
     if h.rbodyMod != 0 {
         ckt.imag(dp, db, mult_q * xcdbdb);

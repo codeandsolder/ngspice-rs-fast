@@ -178,12 +178,6 @@ pub(super) fn apply(
     let mut gbdpg: f64;
     let mut gbdpb: f64;
     let mut gbdpsp: f64;
-    let mut ggidld: f64;
-    let mut ggidlg: f64;
-    let mut ggidlb: f64;
-    let mut ggislg: f64;
-    let mut ggislb: f64;
-    let mut ggisls: f64;
     let mut m: f64;
     let mut mult_i: f64;
     let mut mult_q: f64;
@@ -705,44 +699,9 @@ pub(super) fn apply(
         here.bNodePrime,
         mult_i * (gjbd + gjbs - here.gbbs - gIbtotb) + mult_q * gcbbb,
     );
-    ggidld = here.ggidld;
-    ggidlg = here.ggidlg;
-    ggidlb = here.ggidlb;
-    ggislg = here.ggislg;
-    ggisls = here.ggisls;
-    ggislb = here.ggislb;
-    ckt.matrix(here.dNodePrime, here.dNodePrime, mult_i * ggidld);
-    ckt.matrix(here.dNodePrime, here.gNodePrime, mult_i * ggidlg);
-    ckt.matrix(
-        here.dNodePrime,
-        here.sNodePrime,
-        -(mult_i * (ggidlg + ggidld + ggidlb)),
-    );
-    ckt.matrix(here.dNodePrime, here.bNodePrime, mult_i * ggidlb);
-    ckt.matrix(here.bNodePrime, here.dNodePrime, -(mult_i * ggidld));
-    ckt.matrix(here.bNodePrime, here.gNodePrime, -(mult_i * ggidlg));
-    ckt.matrix(
-        here.bNodePrime,
-        here.sNodePrime,
-        mult_i * (ggidlg + ggidld + ggidlb),
-    );
-    ckt.matrix(here.bNodePrime, here.bNodePrime, -(mult_i * ggidlb));
-    ckt.matrix(
-        here.sNodePrime,
-        here.dNodePrime,
-        -(mult_i * (ggisls + ggislg + ggislb)),
-    );
-    ckt.matrix(here.sNodePrime, here.gNodePrime, mult_i * ggislg);
-    ckt.matrix(here.sNodePrime, here.sNodePrime, mult_i * ggisls);
-    ckt.matrix(here.sNodePrime, here.bNodePrime, mult_i * ggislb);
-    ckt.matrix(
-        here.bNodePrime,
-        here.dNodePrime,
-        mult_i * (ggislg + ggisls + ggislb),
-    );
-    ckt.matrix(here.bNodePrime, here.gNodePrime, -(mult_i * ggislg));
-    ckt.matrix(here.bNodePrime, here.sNodePrime, -(mult_i * ggisls));
-    ckt.matrix(here.bNodePrime, here.bNodePrime, -(mult_i * ggislb));
+    super::super::stamp_common::leakage(here, mult_i, |row, col, value| {
+        ckt.matrix(row, col, value);
+    });
     if here.rbodyMod != 0 {
         ckt.matrix(
             here.dNodePrime,
