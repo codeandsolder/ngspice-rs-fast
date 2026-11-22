@@ -297,6 +297,36 @@ rc c 0 10k
     );
 }
 
+/// DIOsetup's conductance and instance knees survive DIOparam/DIOtemp
+/// perturbations, including a zero perimeter and model defaults overridden
+/// by instance geometry. Do not reconstruct them by inverting or rescaling.
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN; runs C batch mode out of process"]
+fn diode_setup_quantities_survive_perturbations() {
+    for (name, analysis) in [
+        ("diode-setup-dc", "dc"),
+        ("diode-setup-ac", "ac dec 1 1k 10k"),
+    ] {
+        for (group, filters) in [
+            ("knees", "d1:rs d1:ikf d1:ikr d1:ikp"),
+            (
+                "geometry",
+                "d1_area d1_pj d1_m d1:eg d1:nbv d1_temp d1_dtemp",
+            ),
+        ] {
+            let deck = format!(
+                "{name}\n.options reltol=1e-9 temp=79\n\
+             v1 in 0 dc 2 ac 1\nr1 in a 500\nr2 a b 1k\n\
+             d1 a 0 dm area=3.7 pj=0 m=2.1 dtemp=0.13\nd2 b 0 dm\n\
+             .model dm d(is=1e-14 jsw=3e-14 ns=1.25 n=1.3 rs=7.3 trs=0.003 \
+             ikf=1.37m ikr=2.19m ikp=123u area=2.3 pj=1.2 tlev=2 tlevc=1 tnom=31)\n\
+             .sens v(a) {filters} {analysis}\n.end\n"
+            );
+            compare_with_c(&format!("{name}-{group}"), &deck, NONLINEAR);
+        }
+    }
+}
+
 /// AC: literal and model-backed R/C/L, AC phasors, controlled sources, and
 /// C's `lin` stepping (which multiplies by the step).
 #[test]
