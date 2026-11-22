@@ -48,34 +48,25 @@ use crate::netlist::token::{Token, TokenKind};
 
 use super::behavioural;
 use super::grammar::{Failure, Input, ParsedCard, Result, location};
-use super::syntax::{assignment, canonical_node, equals, leading_value, name, named, value};
+use super::syntax::{
+    assignment, canonical_node, equals, leading_value, malformed, named, named_device,
+    terminal_name, value,
+};
 
 /// C reference for the still unported LAPLACE rewrite.
 const NONLINEAR_REFERENCE: &str =
     "src/frontend/inpcom.c (inp_compat); src/xspice/icm/xtradev (s_xfer, LAPLACE)";
 
 pub(super) fn controlled_card(input: &mut Input<'_>) -> Result<ParsedCard> {
-    let (instance, designator) = any
-        .verify_map(|token: &Token| {
-            if !token.is_name_like() {
-                return None;
-            }
-            controlled_designator(token).map(|designator| (token, designator))
-        })
-        .parse_next(input)?;
+    let (instance, designator) = named_device("efgh").parse_next(input)?;
     // The designator matched: every failure below is definitive.
     cut_err(move |input: &mut Input<'_>| body(input, instance, designator)).parse_next(input)
 }
 
-fn controlled_designator(token: &Token) -> Option<char> {
-    let designator = token.text.chars().next()?.to_ascii_lowercase();
-    matches!(designator, 'e'..='h').then_some(designator)
-}
-
 fn body(input: &mut Input<'_>, instance: &Token, designator: char) -> Result<ParsedCard> {
     let auto_gnd = input.state.auto_gnd;
-    let positive = terminal(input, "positive output terminal")?;
-    let negative = terminal(input, "negative output terminal")?;
+    let positive = terminal_name(input, "positive output terminal")?;
+    let negative = terminal_name(input, "negative output terminal")?;
     let mut nodes = vec![
         canonical_node(positive, auto_gnd),
         canonical_node(negative, auto_gnd),
@@ -96,13 +87,13 @@ fn body(input: &mut Input<'_>, instance: &Token, designator: char) -> Result<Par
     hspice_keyword(input, designator)?;
     let mut parameters = Vec::new();
     if matches!(designator, 'e' | 'g') {
-        let control_positive = terminal(input, "positive controlling node")?;
-        let control_negative = terminal(input, "negative controlling node")?;
+        let control_positive = terminal_name(input, "positive controlling node")?;
+        let control_negative = terminal_name(input, "negative controlling node")?;
         nodes.push(canonical_node(control_positive, auto_gnd));
         nodes.push(canonical_node(control_negative, auto_gnd));
         if input.input.first().is_some_and(|t| t.is_keyword("table")) {
             if designator == 'g' {
-                return Err(parse_error(
+                return Err(malformed(
                     input,
                     "a four-node G TABLE is not accepted (C: bad syntax; only the LTspice \
                      E form Ename n+ n- nc+ nc- table=(...) exists)",
@@ -112,7 +103,7 @@ fn body(input: &mut Input<'_>, instance: &Token, designator: char) -> Result<Par
             return Ok(device(nodes, parameters, input));
         }
     } else {
-        let control = terminal(input, "controlling voltage source name")?;
+        let control = terminal_name(input, "controlling voltage source name")?;
         parameters.push(ParameterAssignment {
             name: "control".to_owned(),
             value: control.text.to_ascii_lowercase(),
@@ -199,7 +190,7 @@ fn nonlinear_form(
                 _ => false,
             };
             if !accepted {
-                return Err(parse_error(
+                return Err(malformed(
                     input,
                     &format!(
                         "'{lowered}=' is not a form of a '{designator}' source (C: E accepts \
@@ -216,23 +207,6 @@ fn nonlinear_form(
         "laplace" => Err(nonlinear(input, "LAPLACE controlled sources")),
         _ => Ok(None),
     }
-}
-
-/// A node or instance name, after any `(`, `)` or `,` that C's token readers
-/// skip.
-fn terminal<'a>(input: &mut Input<'a>, expected: &'static str) -> Result<&'a Token> {
-    let _: () = repeat(0.., punctuation).parse_next(input)?;
-    name(expected).parse_next(input)
-}
-
-fn punctuation<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
-    any.verify(|token: &Token| {
-        matches!(
-            token.kind,
-            TokenKind::LParen | TokenKind::RParen | TokenKind::Comma
-        )
-    })
-    .parse_next(input)
 }
 
 fn closing_punctuation<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
@@ -340,12 +314,12 @@ fn gain_and_setters(
         setters.push(named_setter(input)?);
         None
     } else if input.input.is_empty() {
-        return Err(parse_error(
+        return Err(malformed(
             input,
             "expected the gain (C: not enough parameters)",
         ));
     } else {
-        return Err(parse_error(
+        return Err(malformed(
             input,
             "expected the gain as a number, {expression} or gain=value right after the controls",
         ));
@@ -364,7 +338,7 @@ fn gain_and_setters(
     }
     if peek_named(input, "m") || peek_named(input, "ic") {
         let token = &input.input[0];
-        return Err(parse_error(
+        return Err(malformed(
             input,
             &format!(
                 "unknown parameter '{}' on a '{designator}' instance",
@@ -372,7 +346,7 @@ fn gain_and_setters(
             ),
         ));
     }
-    Err(parse_error(
+    Err(malformed(
         input,
         &format!(
             "unexpected '{}' after the gain",
@@ -403,7 +377,7 @@ fn tail_setter(input: &mut Input<'_>) -> Result<ParameterAssignment> {
             "src/spicelib/devices/cccs/cccspar.c",
         ))));
     }
-    Err(parse_error(
+    Err(malformed(
         input,
         "expected m=value or gain=value after the gain",
     ))
@@ -424,8 +398,4 @@ fn named_setter(input: &mut Input<'_>) -> Result<ParameterAssignment> {
         token.location.clone(),
         value,
     ))
-}
-
-fn parse_error(input: &Input<'_>, message: &str) -> ErrMode<Failure> {
-    ErrMode::Cut(Failure(SpiceError::parse(location(input), message)))
 }

@@ -17,6 +17,7 @@ use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterKind};
 use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
 use std::collections::BTreeSet;
+pub use transient::{TxlHistory, TxlUpdate};
 
 const fn scalar(name: &'static str, unit: ScalarUnit, domain: ScalarDomain) -> ScalarParameter {
     ScalarParameter {

@@ -44,10 +44,6 @@
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
 )]
 #![expect(
-    clippy::float_cmp,
-    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
-)]
-#![expect(
     clippy::manual_midpoint,
     reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
 )]
@@ -68,12 +64,12 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
+use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step, prime_prime};
 use super::{CELSIUS_TO_KELVIN, HFET_INSTANCE as INSTANCE, HfetInstance as Instance};
 use super::{NodeSetup, TemperatureCache, ask_hfet, set_hfet, stamp_reset};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{self, BOLTZMANN, CHARGE, p};
 use crate::devices::limiting;
-use crate::devices::nonlinear::{JunctionPoint, junction_companion};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
@@ -82,8 +78,7 @@ use crate::devices::sensitivity::{
     SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
-    AnalysisMode, Device, DeviceState, IterationPhase, LinearContext, ModelContext, ResolvedModel,
-    StampContext,
+    AnalysisMode, Device, DeviceState, LinearContext, ModelContext, ResolvedModel, StampContext,
 };
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
@@ -996,23 +991,6 @@ struct Point {
     gmd: Real,
 }
 
-/// C's initialization and limiting, which for HFET1 is `DEVfetlim` alone: the
-/// gate junctions are never `pnjlim`-limited, so `icheck` stays 0 and only the
-/// `cghat`/`cdhat` comparison decides convergence.
-#[derive(Debug, Clone, Copy)]
-enum Start {
-    /// The `uic` initial load.
-    Conditions,
-    /// A load with limiting inactive: the solution itself.
-    Exact,
-    /// `MODEINITJCT`/`MODEINITFIX`: always nonconvergent.
-    Fixed,
-    /// A held `off` load.
-    HeldOff { raw: [Real; 2] },
-    /// The `hfeta` channel's own `cghat`/`cdhat` test.
-    Limited { cghat: Real, cdhat: Real },
-}
-
 impl Hfet1 {
     /// `HFETAload`'s initialization and limiting. `raw` and `ic` are already
     /// type-normalized (`HFETAload` multiplies every node difference by the
@@ -1024,85 +1002,52 @@ impl Hfet1 {
         raw: [Real; 2],
         ic: [Real; 2],
     ) -> ([Real; 2], Start) {
-        if states.initial_conditions() {
-            let vds = ic[0];
-            let vgs = ic[1];
-            return ([vgs, vgs - vds], Start::Conditions);
-        }
-        if !states.device_limiting() {
-            return (raw, Start::Exact);
-        }
-        let new = match states.phase() {
-            IterationPhase::Junction => {
-                let v = if self.initial.off { 0. } else { -1. };
-                return ([v, v], Start::Fixed);
-            }
-            IterationPhase::Fix if self.initial.off => return ([0.; 2], Start::HeldOff { raw }),
-            IterationPhase::Predict => [
-                states.predicted(slot::VGS, 1.),
-                states.predicted(slot::VGD, 1.),
+        Start::select(
+            states,
+            raw,
+            ic,
+            self.initial.off,
+            [slot::VGS, slot::VGD],
+            [
+                slot::CG,
+                slot::CD,
+                slot::GM,
+                slot::GDS,
+                slot::GGS,
+                slot::GGD,
+                slot::GMG,
+                slot::GMD,
+                slot::GGSPP,
+                slot::GGDPP,
             ],
-            IterationPhase::Fix | IterationPhase::Float => raw.map(Some),
-        };
-        let old = |index: usize| match states.phase() {
-            IterationPhase::Predict => states.accepted(1, index),
-            _ => states.iterate(index),
-        };
-        let [Some(vgs), Some(vgd)] = new else {
-            return (raw, Start::Exact);
-        };
-        let previous: Option<Vec<Real>> = [
-            slot::VGS,
-            slot::VGD,
-            slot::CG,
-            slot::CD,
-            slot::GM,
-            slot::GDS,
-            slot::GGS,
-            slot::GGD,
-            slot::GMG,
-            slot::GMD,
-            slot::GGSPP,
-            slot::GGDPP,
-        ]
-        .into_iter()
-        .map(|index| old(index).filter(|v| v.is_finite()))
-        .collect();
-        let Some(
-            &[
-                vgs0,
-                vgd0,
-                cg0,
-                cd0,
-                gm0,
-                gds0,
-                ggs0,
-                ggd0,
-                gmg0,
-                gmd0,
-                ggspp0,
-                ggdpp0,
-            ],
-        ) = previous.as_deref()
-        else {
-            return ([vgs, vgd], Start::Exact);
-        };
-        let delvgs = vgs - vgs0;
-        let delvgd = vgd - vgd0;
-        let delvds = delvgs - delvgd;
-        let delvgspp = raw[0] - vgs0;
-        let delvgdpp = raw[1] - vgd0;
-        let cghat = cg0 + gmg0 * delvgs - gmd0 * delvds
-            + ggd0 * delvgd
-            + ggs0 * delvgs
-            + ggdpp0 * delvgdpp
-            + ggspp0 * delvgspp;
-        let cdhat =
-            cd0 + gm0 * delvgs + gds0 * delvds - ggd0 * delvgd - (gmg0 * delvgs - gmd0 * delvds);
-        // `HFETAload` limits only through `DEVfetlim`.
-        let vgs = limiting::fetlim(vgs, vgs0, derived.tvto);
-        let vgd = limiting::fetlim(vgd, vgd0, derived.tvto);
-        ([vgs, vgd], Start::Limited { cghat, cdhat })
+            |[vgs, vgd],
+             [vgs0, vgd0],
+             [cg0, cd0, gm0, gds0, ggs0, ggd0, gmg0, gmd0, ggspp0, ggdpp0]| {
+                let delvgs = vgs - vgs0;
+                let delvgd = vgd - vgd0;
+                let delvds = delvgs - delvgd;
+                let delvgspp = raw[0] - vgs0;
+                let delvgdpp = raw[1] - vgd0;
+                let cghat = cg0 + gmg0 * delvgs - gmd0 * delvds
+                    + ggd0 * delvgd
+                    + ggs0 * delvgs
+                    + ggdpp0 * delvgdpp
+                    + ggspp0 * delvgspp;
+                let cdhat = cd0 + gm0 * delvgs + gds0 * delvds
+                    - ggd0 * delvgd
+                    - (gmg0 * delvgs - gmd0 * delvds);
+                // `HFETAload` limits only through `DEVfetlim`.
+                let vgs = limiting::fetlim(vgs, vgs0, derived.tvto);
+                let vgd = limiting::fetlim(vgd, vgd0, derived.tvto);
+                (
+                    [vgs, vgd],
+                    Start::Limited {
+                        junction_limited: false,
+                        currents: [cghat, cdhat],
+                    },
+                )
+            },
+        )
     }
 
     /// `HFETAload`'s device evaluation: the gate junctions, the `hfeta`
@@ -1365,35 +1310,21 @@ impl Device for Hfet1 {
             self.initial.values[1].unwrap_or_else(|| voltage(self.nodes.g) - voltage(self.nodes.s)),
         ];
         let ([vgs, vgd], start) = self.select_junctions(&derived, &context.states, raw, ic);
-        let initial_transient =
-            context.states.initial_transient() && context.states.phase() == IterationPhase::Predict;
         // `HFETAload` reads the prime-prime pair from the solution like the
         // prime pair (MESA's rule, with HFET1's predictor slots).
-        let pp = |aliased: bool, node: NodeId, limited: Real, slot: usize| {
-            if aliased {
-                return limited;
-            }
-            let solved = || pol * (voltage(self.nodes.gp) - voltage(node));
-            if context.states.phase() == IterationPhase::Predict {
-                return context
-                    .states
-                    .accepted(1, slot)
-                    .filter(|v| v.is_finite())
-                    .unwrap_or_else(solved);
-            }
-            solved()
-        };
-        let vgspp = pp(
+        let vgspp = prime_prime(
+            &context.states,
             self.nodes.spp == self.nodes.sp,
-            self.nodes.spp,
             vgs,
             slot::VGSPP,
+            || pol * (voltage(self.nodes.gp) - voltage(self.nodes.spp)),
         );
-        let vgdpp = pp(
+        let vgdpp = prime_prime(
+            &context.states,
             self.nodes.dpp == self.nodes.dp,
-            self.nodes.dpp,
             vgd,
             slot::VGDPP,
+            || pol * (voltage(self.nodes.gp) - voltage(self.nodes.dpp)),
         );
         let mut point = self.point(&derived, vgs, vgd, gmin)?;
         // `HFETAload`'s charge storage, which C runs before its convergence
@@ -1411,108 +1342,35 @@ impl Device for Hfet1 {
             context.mode,
             AnalysisMode::Transient { .. } | AnalysisMode::DcSweep
         ) {
-            let vgs1 = context
-                .states
-                .accepted(1, slot::VGSPP)
-                .filter(|v| v.is_finite())
-                .unwrap_or(vgspp);
-            let vgd1 = context
-                .states
-                .accepted(1, slot::VGDPP)
-                .filter(|v| v.is_finite())
-                .unwrap_or(vgdpp);
-            let vds1 = context
-                .states
-                .accepted(1, slot::VGS)
-                .filter(|v| v.is_finite())
-                .unwrap_or(vgs)
-                - context
-                    .states
-                    .accepted(1, slot::VGD)
-                    .filter(|v| v.is_finite())
-                    .unwrap_or(vgd);
-            if initial_transient {
-                context
-                    .states
-                    .patch_state1(slot::QGS, point.capgs * vgspp)?;
-                context
-                    .states
-                    .patch_state1(slot::QGD, point.capgd * vgdpp)?;
-                context
-                    .states
-                    .patch_state1(slot::QDS, self.model.cds * point.vds)?;
-            }
-            qgs = context
-                .states
-                .accepted(1, slot::QGS)
-                .filter(|v| v.is_finite())
-                .unwrap_or(0.)
-                + point.capgs * (vgspp - vgs1);
-            qgd = context
-                .states
-                .accepted(1, slot::QGD)
-                .filter(|v| v.is_finite())
-                .unwrap_or(0.)
-                + point.capgd * (vgdpp - vgd1);
-            qds = context
-                .states
-                .accepted(1, slot::QDS)
-                .filter(|v| v.is_finite())
-                .unwrap_or(0.)
-                + self.model.cds * (point.vds - vds1);
-            if initial_transient {
-                context.states.patch_state1(slot::QGS, qgs)?;
-                context.states.patch_state1(slot::QGD, qgd)?;
-                context.states.patch_state1(slot::QDS, qds)?;
-            }
-            if let Some(coefficients) = context.integration {
-                let AnalysisMode::Transient { dt, .. } = context.mode else {
-                    return Err(SpiceError::circuit(
-                        "HFET1 charge companion outside transient",
-                    ));
-                };
-                if dt != coefficients.dt() {
-                    return Err(SpiceError::circuit("HFET1 charge timestep mismatch"));
-                }
-                let junction = |charge, capacitance| JunctionPoint {
-                    current: 0.,
-                    conductance: 0.,
-                    charge,
-                    capacitance,
-                };
-                let (geq, cqgs) = junction_companion(
-                    context,
-                    coefficients,
-                    junction(qgs, point.capgs),
-                    slot::QGS,
-                )?;
-                ggspp = geq;
-                cgspp = cqgs;
-                cg += cqgs;
-                let (geq, cqgd) = junction_companion(
-                    context,
-                    coefficients,
-                    junction(qgd, point.capgd),
-                    slot::QGD,
-                )?;
-                ggdpp = geq;
-                cgdpp = cqgd;
-                cg += cqgd;
-                cd -= cqgd;
-                let (geq, cq) = junction_companion(
-                    context,
-                    coefficients,
-                    junction(qds, self.model.cds),
-                    slot::QDS,
-                )?;
-                gds += geq;
-                cqds = cq;
+            let previous = [
+                accepted(&context.states, slot::VGSPP, vgspp),
+                accepted(&context.states, slot::VGDPP, vgdpp),
+                accepted(&context.states, slot::VGS, vgs)
+                    - accepted(&context.states, slot::VGD, vgd),
+            ];
+            let step = charge_step(
+                &mut context.states,
+                context.mode,
+                context.integration,
+                "HFET1",
+                [
+                    ChargeInput::new(slot::QGS, vgspp, previous[0], point.capgs),
+                    ChargeInput::new(slot::QGD, vgdpp, previous[1], point.capgd),
+                    ChargeInput::new(slot::QDS, point.vds, previous[2], self.model.cds),
+                ],
+            )?;
+            [qgs, qgd, qds] = step.charges;
+            if let Some([gs, gd, ds]) = step.companions {
+                ggspp = gs.conductance;
+                cgspp = gs.derivative;
+                cg += gs.derivative;
+                ggdpp = gd.conductance;
+                cgdpp = gd.derivative;
+                cg += gd.derivative;
+                cd -= gd.derivative;
+                gds += ds.conductance;
+                cqds = ds.derivative;
                 cd += cqds;
-                if initial_transient {
-                    context.states.patch_state1(slot::CQGS, cqgs)?;
-                    context.states.patch_state1(slot::CQGD, cqgd)?;
-                    context.states.patch_state1(slot::CQDS, cqds)?;
-                }
             }
         }
         point = Point {
@@ -1521,39 +1379,18 @@ impl Device for Hfet1 {
             gds,
             ..point
         };
-        let nonconvergent = match start {
-            Start::Fixed => true,
-            Start::Conditions | Start::Exact => false,
-            Start::HeldOff { raw } => {
-                let delvgs = raw[0] - point.vgs;
-                let delvgd = raw[1] - point.vgd;
-                let delvds = delvgs - delvgd;
-                let cghat = point.cg + point.ggd * delvgd + point.ggs * delvgs;
-                let cdhat = point.cd + point.gm * delvgs + point.gds * delvds - point.ggd * delvgd;
-                context
-                    .states
-                    .convergence_tolerances()
-                    .is_some_and(|(reltol, abstol)| {
-                        (cghat - point.cg).abs() > reltol * cghat.abs().max(point.cg.abs()) + abstol
-                            || (cdhat - point.cd).abs()
-                                > reltol * cdhat.abs().max(point.cd.abs()) + abstol
-                    })
-            }
-            Start::Limited { cghat, cdhat } => {
-                context
-                    .states
-                    .convergence_tolerances()
-                    .is_some_and(|(reltol, abstol)| {
-                        (cghat - point.cg).abs()
-                            >= reltol * cghat.abs().max(point.cg.abs()) + abstol
-                            || (cdhat - point.cd).abs()
-                                > reltol * cdhat.abs().max(point.cd.abs()) + abstol
-                    })
-            }
-        };
-        if nonconvergent {
-            context.states.report_nonconvergence()?;
-        }
+        start.report(
+            &mut context.states,
+            Linearization {
+                voltage: [point.vgs, point.vgd],
+                gate_current: point.cg,
+                drain_current: point.cd,
+                transconductance: point.gm,
+                output_conductance: point.gds,
+                source_conductance: point.ggs,
+                drain_conductance: point.ggd,
+            },
+        )?;
         for (index, value) in [
             (slot::VGS, point.vgs),
             (slot::VGSPP, vgspp),

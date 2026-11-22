@@ -121,11 +121,21 @@ and each load recomputes the branch RHS from the samples around
 `right_consts_txl` updates the `h1`/`h2`/`h3` "cnv" accumulators with
 `exp(x*h)` factors. `lsl` lines use the plain `atten3*v + atten2*i` form.
 
-The port keeps each accepted sample's *whole* convolution state in the
-device's delay history, so a Newton trial is pure: nothing a rejected trial
-does can change the convolution, the interpolation cursors or the history.
-That is the port's own contract (`docs/port/TRANSIENT.md`) applied to a
-device whose C state is a mutable pair of `TXLine` snapshots.
+TXL uses its own typed accepted history: a ring of integer picosecond ticks
+and four terminal values, separate DC prehistory, and one latest convolution
+snapshot and clamp flag. TRA and LTRA keep their continuous-time waveform
+history. Real and conjugate-pair propagation coefficients and accumulators
+have distinct representations. The fractional propagation delay is still a
+real number of picoseconds. Binary search directly on accepted ticks finds
+the interpolation bracket and oldest retained sample without recasting
+historical times. The checked time conversion truncates before checking the
+signed integer range (including the fractional interval above its largest
+integer). Repeated sub-picosecond times do not advance the history.
+
+A Newton trial is pure: nothing a rejected trial does can change the
+convolution, interpolation or history. Acceptance publishes the new sample,
+recurrence and clamp together through the same checked transaction used by
+other delay lines. The C multiply, add and recurrence order remains intact.
 
 Three C behaviours are reproduced deliberately:
 
@@ -147,8 +157,8 @@ Three C behaviours are reproduced deliberately:
   triggering gap leaves the pruned history.
 
 `TXLaccept` (which records node slopes for the next load) has no analogue:
-the slopes are recomputed from the history when needed, so nothing is
-committed at acceptance beyond the sample itself.
+the slopes are recomputed from the latest accepted and newly converged
+terminal values. No separate slope cache is needed.
 
 ## Refused analyses
 

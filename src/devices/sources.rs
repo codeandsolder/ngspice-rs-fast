@@ -166,6 +166,86 @@ pub struct IndependentSource {
     /// `distof1`/`distof2` distortion inputs (C `VSRCdF1given`, ...).
     distortion: [Option<crate::devices::distortion::DistortionInput>; 2],
 }
+/// Validated excitation before circuit topology is bound.
+pub(super) struct SourceExcitation {
+    voltage: bool,
+    dc: DcExcitation,
+    ac: AcExcitation,
+    function_given: bool,
+    waveform: Waveform,
+}
+
+impl SourceExcitation {
+    fn rectangular(voltage: bool, dc: Real, ac: Complex, waveform: Waveform) -> SpiceResult<Self> {
+        waveform.validate()?;
+        Self::from_resolved(
+            voltage,
+            DcExcitation::Explicit(dc),
+            AcExcitation::rectangular(ac),
+            !matches!(waveform, Waveform::Constant(_)),
+            waveform,
+        )
+    }
+
+    pub(super) fn from_inputs(voltage: bool, inputs: SourceInputs) -> SpiceResult<Self> {
+        let function_given = inputs.waveform.is_some();
+        let waveform = inputs
+            .waveform
+            .unwrap_or_else(|| Waveform::Constant(inputs.dc.unwrap_or(0.)));
+        waveform.validate()?;
+        let dc = match inputs.dc {
+            Some(value) => DcExcitation::Explicit(value),
+            None => DcExcitation::Waveform {
+                time_zero: waveform.time_zero()?,
+                accumulated: None,
+            },
+        };
+        Self::from_resolved(
+            voltage,
+            dc,
+            AcExcitation::resolve(inputs.ac)?,
+            function_given,
+            waveform,
+        )
+    }
+
+    fn from_resolved(
+        voltage: bool,
+        dc: DcExcitation,
+        ac: AcExcitation,
+        function_given: bool,
+        waveform: Waveform,
+    ) -> SpiceResult<Self> {
+        if !dc.value().is_finite() || !ac.phasor.is_finite() {
+            return Err(SpiceError::circuit("non-finite source excitation"));
+        }
+        Ok(Self {
+            voltage,
+            dc,
+            ac,
+            function_given,
+            waveform,
+        })
+    }
+
+    pub(super) fn bind(self, name: impl Into<String>, terminals: [NodeId; 2]) -> IndependentSource {
+        IndependentSource {
+            name: name.into(),
+            terminals: [terminals[0], terminals[1], NodeId::GROUND],
+            voltage: self.voltage,
+            dc: self.dc,
+            ac: self.ac,
+            multiplier: None,
+            function_given: self.function_given,
+            accumulated_waveform: None,
+            power_tone: None,
+            waveform: self.waveform,
+            port: None,
+            distortion: [None, None],
+        }
+    }
+}
+
 impl IndependentSource {
     /// Creates an independent source. `voltage=false` selects a current source.
     /// A directly supplied rectangular AC coefficient is retained exactly;
@@ -180,21 +260,11 @@ impl IndependentSource {
         ac: Complex,
         waveform: Waveform,
     ) -> SpiceResult<Self> {
-        waveform.validate()?;
-        Self::from_resolved(
-            name.into(),
-            terminals,
-            voltage,
-            DcExcitation::Explicit(dc),
-            AcExcitation::rectangular(ac),
-            !matches!(waveform, Waveform::Constant(_)),
-            waveform,
-        )
+        Ok(SourceExcitation::rectangular(voltage, dc, ac, waveform)?.bind(name, terminals))
     }
 
     /// Creates a source from polar AC inputs and explicit or derived DC.
     /// Keeps transient-dependent waveform defaults unresolved until analysis.
-    ///
     /// # Errors
     /// Nonfinite resolved excitation or invalid waveform.
     pub fn from_inputs(
@@ -203,55 +273,7 @@ impl IndependentSource {
         voltage: bool,
         inputs: SourceInputs,
     ) -> SpiceResult<Self> {
-        let function_given = inputs.waveform.is_some();
-        let waveform = inputs
-            .waveform
-            .unwrap_or_else(|| Waveform::Constant(inputs.dc.unwrap_or(0.)));
-        waveform.validate()?;
-        let dc = match inputs.dc {
-            Some(value) => DcExcitation::Explicit(value),
-            None => DcExcitation::Waveform {
-                time_zero: waveform.time_zero()?,
-                accumulated: None,
-            },
-        };
-        Self::from_resolved(
-            name.into(),
-            terminals,
-            voltage,
-            dc,
-            AcExcitation::resolve(inputs.ac)?,
-            function_given,
-            waveform,
-        )
-    }
-
-    fn from_resolved(
-        name: String,
-        terminals: [NodeId; 2],
-        voltage: bool,
-        dc: DcExcitation,
-        ac: AcExcitation,
-        function_given: bool,
-        waveform: Waveform,
-    ) -> SpiceResult<Self> {
-        if !dc.value().is_finite() || !ac.phasor.is_finite() {
-            return Err(SpiceError::circuit("non-finite source excitation"));
-        }
-        Ok(Self {
-            name,
-            terminals: [terminals[0], terminals[1], NodeId::GROUND],
-            voltage,
-            dc,
-            ac,
-            multiplier: None,
-            function_given,
-            accumulated_waveform: None,
-            power_tone: None,
-            waveform,
-            port: None,
-            distortion: [None, None],
-        })
+        Ok(SourceExcitation::from_inputs(voltage, inputs)?.bind(name, terminals))
     }
 
     /// Selects C's PORT cosine time function, including its zero-amplitude

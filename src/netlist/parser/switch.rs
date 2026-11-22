@@ -28,24 +28,11 @@ use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind};
 use crate::netlist::token::{Token, TokenKind};
 
 use super::grammar::{Failure, Input, ParsedCard, Result, location};
-use super::syntax::{canonical_node, malformed, name};
+use super::syntax::{canonical_node, malformed, name, named_device};
 
 pub(super) fn switch_card(input: &mut Input<'_>) -> Result<ParsedCard> {
-    let (instance, designator) = any
-        .verify_map(|token: &Token| {
-            if token.is_name_like() {
-                switch_designator(token).map(|designator| (token, designator))
-            } else {
-                None
-            }
-        })
-        .parse_next(input)?;
+    let (instance, designator) = named_device("sw").parse_next(input)?;
     cut_err(move |input: &mut Input<'_>| body(input, instance, designator)).parse_next(input)
-}
-
-fn switch_designator(token: &Token) -> Option<char> {
-    let designator = token.text.chars().next()?.to_ascii_lowercase();
-    matches!(designator, 's' | 'w').then_some(designator)
 }
 
 fn body(input: &mut Input<'_>, instance: &Token, designator: char) -> Result<ParsedCard> {

@@ -35,9 +35,7 @@
 
 use crate::maths::SparseMatrix;
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
-use crate::primitives::{
-    NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
-};
+use crate::primitives::{NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 
 use crate::devices::linear::LinearContext;
 use crate::devices::traits::{ControlReference, Device, MnaUnknowns, StampContext};
@@ -104,14 +102,14 @@ impl ControlledKind {
 /// Fixed topology: the controlling reference or node pair cannot disagree
 /// with the device kind, and linear sources need no heap terminal array.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Topology {
-    Vcvs([NodeId; 4]),
-    Vccs([NodeId; 4]),
-    Cccs([NodeId; 2], ControlReference),
-    Ccvs([NodeId; 2], ControlReference),
+enum Topology<N> {
+    Vcvs([N; 4]),
+    Vccs([N; 4]),
+    Cccs([N; 2], ControlReference),
+    Ccvs([N; 2], ControlReference),
 }
 
-impl Topology {
+impl<N> Topology<N> {
     const fn kind(&self) -> ControlledKind {
         match self {
             Self::Vcvs(_) => ControlledKind::Vcvs,
@@ -121,7 +119,7 @@ impl Topology {
         }
     }
 
-    const fn terminals(&self) -> &[NodeId] {
+    const fn terminals(&self) -> &[N] {
         match self {
             Self::Vcvs(nodes) | Self::Vccs(nodes) => nodes,
             Self::Cccs(nodes, _) | Self::Ccvs(nodes, _) => nodes,
@@ -140,7 +138,7 @@ impl Topology {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControlledSource {
     name: String,
-    topology: Topology,
+    topology: Topology<NodeId>,
     gain: Real,
     /// The G/F instance `m`, if given (`VCCSmGiven`/`CCCSmGiven`): a gain set
     /// later through `@g1[gain]` is multiplied by it.
@@ -197,18 +195,15 @@ impl ControlledSource {
         Self::checked(name.into(), topology, gain)
     }
 
-    fn checked(name: String, topology: Topology, gain: Real) -> SpiceResult<Self> {
-        if !gain.is_finite() {
-            return Err(SpiceError::circuit(format!("{name}: non-finite gain")));
-        }
-        let kind = topology.kind();
+    fn checked(name: String, topology: Topology<NodeId>, gain: Real) -> SpiceResult<Self> {
         let terminals = topology.terminals();
-        if kind.has_branch() && terminals[0] == terminals[1] {
-            return Err(SpiceError::Unsupported {
-                feature: format!("instance {name} is a shorted {}", kind.c_name()),
-                location: None,
-            });
-        }
+        validate_source(
+            &name,
+            topology.kind(),
+            gain,
+            terminals[0] == terminals[1],
+            None,
+        )?;
         Ok(Self {
             name,
             topology,
@@ -477,12 +472,34 @@ impl Device for ControlledSource {
     }
 }
 
-/// Builds an E/F/G/H from its parsed (and literalized) AST instance, binding
-/// terminals in `nodes` only on success.
-pub(crate) fn instantiate(
-    instance: &DeviceInstance,
-    nodes: &mut NodeTable,
-) -> SpiceResult<Box<dyn Device>> {
+/// Normalized, validated coefficients and unbound topology. Node allocation
+/// is a separate step; the ordered setters cannot inspect or mutate nodes.
+struct ControlledInput<'a> {
+    topology: Topology<&'a str>,
+    gain: Real,
+    multiplier: Option<Real>,
+}
+
+fn validate_source(
+    name: &str,
+    kind: ControlledKind,
+    gain: Real,
+    output_short: bool,
+    location: Option<SourceLoc>,
+) -> SpiceResult<()> {
+    if !gain.is_finite() {
+        return Err(SpiceError::circuit(format!("{name}: non-finite gain")));
+    }
+    if kind.has_branch() && output_short {
+        return Err(SpiceError::Unsupported {
+            feature: format!("instance {name} is a shorted {}", kind.c_name()),
+            location,
+        });
+    }
+    Ok(())
+}
+
+fn parse_controlled_input(instance: &DeviceInstance) -> SpiceResult<ControlledInput<'_>> {
     let Some(kind) = ControlledKind::from_designator(instance.designator) else {
         return Err(SpiceError::circuit(format!(
             "{} is not a controlled source",
@@ -509,12 +526,12 @@ pub(crate) fn instantiate(
                 });
             }
             (ParameterKind::Scalar, "gain") => {
-                let value = literal(parameter.value.as_str(), &parameter.location, "gain")?;
+                let value = super::factory::scalar_number(parameter)?;
                 // VCCSparam/CCCSparam: an already-given m scales the new gain.
                 gain = Some(value * multiplier.unwrap_or(1.));
             }
             (ParameterKind::Scalar, "m") if multiplier_allowed => {
-                multiplier = Some(literal(parameter.value.as_str(), &parameter.location, "m")?);
+                multiplier = Some(super::factory::scalar_number(parameter)?);
             }
             (ParameterKind::Expression(_) | ParameterKind::Textual, _) => {
                 return Err(SpiceError::Unsupported {
@@ -539,41 +556,85 @@ pub(crate) fn instantiate(
             location: Some(instance.location.clone()),
         });
     };
-    let mark = nodes.len();
-    let result = (|| {
-        let output = [
-            nodes.intern(&instance.nodes[0])?,
-            nodes.intern(&instance.nodes[1])?,
-        ];
-        if kind.voltage_controlled() {
-            let control = [
-                nodes.intern(&instance.nodes[2])?,
-                nodes.intern(&instance.nodes[3])?,
-            ];
-            ControlledSource::voltage_controlled(&instance.name, kind, output, control, gain)
-        } else {
-            let control = control.ok_or_else(|| SpiceError::Unsupported {
-                feature: format!("{} has no controlling source", instance.name),
-                location: Some(instance.location.clone()),
-            })?;
-            ControlledSource::current_controlled(&instance.name, kind, output, control, gain)
-        }
-    })();
-    let device = result.map_err(|error| {
-        nodes.truncate(mark);
-        match error {
-            SpiceError::Unsupported { feature, .. } => SpiceError::Unsupported {
-                feature,
-                location: Some(instance.location.clone()),
-            },
-            other => other,
-        }
-    })?;
-    let device = ControlledSource {
-        multiplier,
-        ..device
+    let control = || {
+        control.ok_or_else(|| SpiceError::Unsupported {
+            feature: format!("{} has no controlling source", instance.name),
+            location: Some(instance.location.clone()),
+        })
     };
-    Ok(Box::new(device))
+    let output = [instance.nodes[0].as_str(), instance.nodes[1].as_str()];
+    let topology = match kind {
+        ControlledKind::Vcvs | ControlledKind::Vccs => {
+            let terminals = [
+                output[0],
+                output[1],
+                instance.nodes[2].as_str(),
+                instance.nodes[3].as_str(),
+            ];
+            if kind == ControlledKind::Vcvs {
+                Topology::Vcvs(terminals)
+            } else {
+                Topology::Vccs(terminals)
+            }
+        }
+        ControlledKind::Cccs => Topology::Cccs(output, control()?),
+        ControlledKind::Ccvs => Topology::Ccvs(output, control()?),
+    };
+    Ok(ControlledInput {
+        topology,
+        gain,
+        multiplier,
+    })
+}
+
+impl Topology<&str> {
+    fn bind(self, nodes: &mut NodeTable) -> SpiceResult<Topology<NodeId>> {
+        fn intern<const N: usize>(
+            nodes: &mut NodeTable,
+            names: [&str; N],
+        ) -> SpiceResult<[NodeId; N]> {
+            let mut result = [NodeId::GROUND; N];
+            for (slot, name) in result.iter_mut().zip(names) {
+                *slot = nodes.intern(name)?;
+            }
+            Ok(result)
+        }
+        Ok(match self {
+            Self::Vcvs(names) => Topology::Vcvs(intern(nodes, names)?),
+            Self::Vccs(names) => Topology::Vccs(intern(nodes, names)?),
+            Self::Cccs(names, control) => Topology::Cccs(intern(nodes, names)?, control),
+            Self::Ccvs(names, control) => Topology::Ccvs(intern(nodes, names)?, control),
+        })
+    }
+}
+
+/// Builds an E/F/G/H from its parsed (and literalized) AST instance, binding
+/// terminals in an append-only transaction only after semantic validation.
+pub(crate) fn instantiate(
+    instance: &DeviceInstance,
+    nodes: &mut NodeTable,
+) -> SpiceResult<Box<dyn Device>> {
+    let input = parse_controlled_input(instance)?;
+    let terminals = input.topology.terminals();
+    let kind = input.topology.kind();
+    let shorted = kind.has_branch()
+        && NodeTable::canonical_name(terminals[0], nodes.auto_gnd())
+            == NodeTable::canonical_name(terminals[1], nodes.auto_gnd());
+    validate_source(
+        &instance.name,
+        kind,
+        input.gain,
+        shorted,
+        Some(instance.location.clone()),
+    )?;
+    super::factory::append_nodes(nodes, |nodes| {
+        Ok(Box::new(ControlledSource {
+            name: instance.name.clone(),
+            topology: input.topology.bind(nodes)?,
+            gain: input.gain,
+            multiplier: input.multiplier,
+        }) as Box<dyn Device>)
+    })
 }
 
 fn validate_linear_form(instance: &DeviceInstance, kind: ControlledKind) -> SpiceResult<()> {
@@ -606,15 +667,6 @@ fn validate_linear_form(instance: &DeviceInstance, kind: ControlledKind) -> Spic
         });
     }
     Ok(())
-}
-
-fn literal(text: &str, location: &SourceLoc, what: &str) -> SpiceResult<Real> {
-    parse_spice_number(text)
-        .filter(|value| value.is_finite())
-        .ok_or_else(|| SpiceError::Unsupported {
-            feature: format!("non-finite or nonliteral {what}={text}"),
-            location: Some(location.clone()),
-        })
 }
 
 #[cfg(test)]

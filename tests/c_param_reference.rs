@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::expr::{BinaryOp, Expr, ExprKind, Function, UnaryOp};
+use ngspice_rs::netlist::parse_parameter_expression;
 use ngspice_rs::primitives::SourceLoc;
 
 struct Scratch(PathBuf);
@@ -142,7 +142,7 @@ fn expression_tree_shape_agrees_with_c_numparam() {
     .enumerate()
     {
         let parsed =
-            Parser::parse_expression(text, &origin).unwrap_or_else(|e| panic!("{text}: {e}"));
+            parse_parameter_expression(text, &origin).unwrap_or_else(|e| panic!("{text}: {e}"));
         let rust = evaluate(&parsed.root, &names);
         let c = c_value(&format!("e{index}"), text);
         assert!(
@@ -160,7 +160,7 @@ fn c_rejects_the_sign_forms_the_parser_rejects() {
         .into_iter()
         .enumerate()
     {
-        assert!(Parser::parse_expression(text, &origin).is_err(), "{text}");
+        assert!(parse_parameter_expression(text, &origin).is_err(), "{text}");
         let result = std::panic::catch_unwind(|| c_value(&format!("r{index}"), text));
         assert!(result.is_err(), "C unexpectedly accepted {text}");
     }

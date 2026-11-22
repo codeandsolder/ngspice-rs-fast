@@ -5,24 +5,17 @@
 
 use winnow::Parser as _;
 use winnow::combinator::{cut_err, opt, peek, repeat};
-use winnow::error::ErrMode;
 use winnow::token::any;
 
 use crate::netlist::ast::PositionedValue;
 use crate::netlist::token::{Token, TokenKind};
 
-use super::grammar::{Failure, Input, Result};
-use super::syntax::{literal, malformed};
+use super::grammar::{Input, Result};
+use super::syntax::{literal, malformed, punctuation};
 
 pub(super) struct NumericVector<'a> {
     pub values: Vec<&'a Token>,
     pub text: String,
-}
-
-pub(super) fn punctuation<'a>(
-    kind: TokenKind,
-) -> impl winnow::Parser<Input<'a>, &'a Token, ErrMode<Failure>> {
-    any.verify(move |token: &Token| token.kind == kind)
 }
 
 pub(super) fn positioned(token: &Token) -> PositionedValue {

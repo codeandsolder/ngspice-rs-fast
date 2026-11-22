@@ -15,14 +15,17 @@ use crate::netlist::token::{Token, TokenKind};
 
 use super::grammar::{Failure, Input, ParsedCard, Result, gap, keyword, location};
 use super::syntax::{
-    assignment, canonical_node, equals, leading_value, malformed, name as node, named, value,
+    assignment, canonical_node, equals, leading_value, malformed, name as node, named,
+    token_designator, value,
 };
 
 pub(super) fn device_card(input: &mut Input<'_>) -> Result<ParsedCard> {
-    let name = any
-        .verify(|token: &Token| matches!(designator(token), 'r' | 'c' | 'l' | 'v' | 'i'))
+    let (name, designator) = any
+        .verify_map(|token: &Token| {
+            let designator = token_designator(token)?;
+            matches!(designator, 'r' | 'c' | 'l' | 'v' | 'i').then_some((token, designator))
+        })
         .parse_next(input)?;
-    let designator = designator(name);
     // Once the device prefix matches, failure is definitive. Without this cut,
     // alt could fall through to the generic unported-device branch.
     let (positive, negative) =
@@ -46,15 +49,6 @@ pub(super) fn device_card(input: &mut Input<'_>) -> Result<ParsedCard> {
         parameters,
         location: input.state.card.location.clone(),
     }))
-}
-
-fn designator(token: &Token) -> char {
-    token
-        .text
-        .chars()
-        .next()
-        .unwrap_or('\0')
-        .to_ascii_lowercase()
 }
 
 const fn primary_name(designator: char) -> &'static str {

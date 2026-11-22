@@ -42,20 +42,13 @@ use winnow::token::any;
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind};
 use crate::netlist::token::{Token, TokenKind};
 
-use super::grammar::{Failure, Input, ParsedCard, Result, location};
-use super::syntax::{assignment, equals, leading_value, name, named, value};
+use super::grammar::{Failure, Input, ParsedCard, Result};
+use super::syntax::{
+    assignment, equals, leading_value, malformed, name, named, named_device, value,
+};
 
 pub(super) fn mutual_card(input: &mut Input<'_>) -> Result<ParsedCard> {
-    let instance = any
-        .verify(|token: &Token| {
-            token.is_name_like()
-                && token
-                    .text
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.eq_ignore_ascii_case(&'k'))
-        })
-        .parse_next(input)?;
+    let (instance, _) = named_device("k").parse_next(input)?;
     // The designator matched: every failure below is definitive.
     cut_err(move |input: &mut Input<'_>| body(input, instance)).parse_next(input)
 }
@@ -64,7 +57,7 @@ fn body(input: &mut Input<'_>, instance: &Token) -> Result<ParsedCard> {
     let mut parameters: Vec<ParameterAssignment> = Vec::new();
     let coupling = loop {
         if input.input.is_empty() {
-            return Err(parse_error(
+            return Err(malformed(
                 input,
                 if parameters.len() < 2 {
                     "expected an inductor name (a K card couples at least two inductors)"
@@ -96,7 +89,7 @@ fn body(input: &mut Input<'_>, instance: &Token) -> Result<ParsedCard> {
         ))));
     }
     if !input.input.is_empty() {
-        return Err(parse_error(
+        return Err(malformed(
             input,
             "unexpected token after the coupling coefficient (the coupling must be the \
              last word of a K card)",
@@ -123,8 +116,4 @@ fn peek_coupling_setter(input: &Input<'_>) -> bool {
             .input
             .get(1)
             .is_some_and(|t| t.kind == TokenKind::Equals)
-}
-
-fn parse_error(input: &Input<'_>, message: &str) -> ErrMode<Failure> {
-    ErrMode::Cut(Failure(SpiceError::parse(location(input), message)))
 }

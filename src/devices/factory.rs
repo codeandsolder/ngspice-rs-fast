@@ -2,10 +2,10 @@
 use crate::devices::models::ModelFamily;
 use crate::devices::passive::PassiveKind;
 use crate::devices::rlc::ResistorNoise;
-use crate::devices::sources::SourceInputs;
+use crate::devices::sources::{SourceExcitation, SourceInputs};
 use crate::devices::{
-    AmSpec, Capacitor, Device, ExpSpec, FunctionSpec, IndependentSource, Inductor, PulseSpec,
-    PwlSource, Resistor, SffmSpec, SineSpec, Waveform,
+    AmSpec, Capacitor, Device, ExpSpec, FunctionSpec, Inductor, PulseSpec, PwlSource, Resistor,
+    SffmSpec, SineSpec, Waveform,
 };
 use crate::netlist::ast::{
     DeviceInstance, FunctionWaveform, ParameterKind, PositionedValue, SourceFunction,
@@ -249,7 +249,7 @@ pub(super) fn line_terminals<const N: usize>(
 
 /// Parse the shared scalar parameter syntax without conflating the two
 /// factories' supported setter lists or dropping intermediate errors.
-fn scalar_number(p: &crate::netlist::ast::ParameterAssignment) -> SpiceResult<Real> {
+pub(super) fn scalar_number(p: &crate::netlist::ast::ParameterAssignment) -> SpiceResult<Real> {
     parse_spice_number(&p.value)
         .filter(|v| v.is_finite())
         .ok_or_else(|| SpiceError::Unsupported {
@@ -324,6 +324,48 @@ fn instantiate_passive(
     })
 }
 
+enum SourceSetter {
+    Dc,
+    AcMagnitude,
+    AcPhase,
+    DistortionMagnitude(usize),
+    DistortionPhase(usize),
+    Delay,
+    Repeat,
+    Port(PortSetter),
+}
+
+impl SourceSetter {
+    fn parse(name: &str, voltage: bool) -> Option<Self> {
+        Some(match name {
+            "dc" => Self::Dc,
+            "acmag" => Self::AcMagnitude,
+            "acphase" => Self::AcPhase,
+            "distof1mag" => Self::DistortionMagnitude(0),
+            "distof1phase" => Self::DistortionPhase(0),
+            "distof2mag" => Self::DistortionMagnitude(1),
+            "distof2phase" => Self::DistortionPhase(1),
+            "td" => Self::Delay,
+            "r" => Self::Repeat,
+            "portnum" if voltage => Self::Port(PortSetter::Number),
+            "z0" if voltage => Self::Port(PortSetter::Impedance),
+            "pwr" if voltage => Self::Port(PortSetter::Power),
+            "freq" if voltage => Self::Port(PortSetter::Frequency),
+            "phase" if voltage => Self::Port(PortSetter::Phase),
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PortSetter {
+    Number,
+    Impedance,
+    Power,
+    Frequency,
+    Phase,
+}
+
 struct SourceSetters {
     inputs: SourceInputs,
     port: PortSetters,
@@ -371,54 +413,38 @@ fn parse_source_setters(instance: &DeviceInstance) -> SpiceResult<SourceSetters>
                 },
             ));
         }
-        let allowed = matches!(
-            p.name.as_str(),
-            "dc" | "acmag"
-                | "acphase"
-                | "r"
-                | "td"
-                | "distof1mag"
-                | "distof1phase"
-                | "distof2mag"
-                | "distof2phase"
-        ) || (instance.designator == 'v'
-            && matches!(p.name.as_str(), "portnum" | "z0" | "pwr" | "freq" | "phase"));
-        if !allowed {
-            return Err(unsupported_parameter(instance, p));
-        }
+        let setter = SourceSetter::parse(&p.name, instance.designator == 'v')
+            .ok_or_else(|| unsupported_parameter(instance, p))?;
         let number = scalar_number(p)?;
-        match p.name.as_str() {
-            "acmag" => {
+        match setter {
+            SourceSetter::AcMagnitude => {
                 inputs.ac.get_or_insert_default().magnitude = Some(number);
             }
-            "acphase" => {
+            SourceSetter::AcPhase => {
                 inputs.ac.get_or_insert_default().phase = Some(number);
             }
-            "distof1mag" | "distof2mag" | "distof1phase" | "distof2phase" => {
-                let slot = &mut distortion[usize::from(p.name.starts_with("distof2"))];
-                let input = slot.get_or_insert(crate::devices::distortion::DistortionInput {
-                    magnitude: 1.,
+            SourceSetter::DistortionMagnitude(index) => {
+                // A new setter replaces both values (vsrcpar.c).
+                distortion[index] = Some(crate::devices::distortion::DistortionInput {
+                    magnitude: number,
                     phase: 0.,
                 });
-                if p.name.ends_with("mag") {
-                    // A new setter replaces both values (`vsrcpar.c`).
-                    *input = crate::devices::distortion::DistortionInput {
-                        magnitude: number,
+            }
+            SourceSetter::DistortionPhase(index) => {
+                distortion[index]
+                    .get_or_insert(crate::devices::distortion::DistortionInput {
+                        magnitude: 1.,
                         phase: 0.,
-                    };
-                } else {
-                    input.phase = number;
-                }
+                    })
+                    .phase = number;
             }
-            "td" => pwl_delay = Some((number, p.location.clone())),
-            "portnum" | "z0" | "pwr" | "freq" | "phase" => {
-                port.set(&p.name, number, &p.location)?;
-            }
-            "r" => {
+            SourceSetter::Delay => pwl_delay = Some((number, p.location.clone())),
+            SourceSetter::Port(setter) => port.set(setter, number, &p.location)?,
+            SourceSetter::Repeat => {
                 validate_pwl_repeat(instance, p, inputs.waveform.as_ref(), number)?;
                 pwl_repeat = Some((number, p.location.clone()));
             }
-            _ => inputs.dc = Some(number),
+            SourceSetter::Dc => inputs.dc = Some(number),
         }
     }
     if pwl_delay.is_some() || pwl_repeat.is_some() {
@@ -466,39 +492,65 @@ fn instantiate_source(
         port,
         distortion,
     } = parse_source_setters(instance)?;
-    // Intern in place and roll back on failure, so the caller's node table is
-    // untouched by an error without cloning it per instance.
-    append_nodes(nodes, |new_nodes| {
+    let power_function = port.power_function.is_some();
+    let rf = port.resolve(instance)?;
+    let excitation = SourceExcitation::from_inputs(instance.designator == 'v', inputs)?;
+    // Only topology binding now needs the append-only transaction.
+    append_nodes(nodes, |nodes| {
         let terminals = [
-            new_nodes.intern(&instance.nodes[0])?,
-            new_nodes.intern(&instance.nodes[1])?,
+            nodes.intern(&instance.nodes[0])?,
+            nodes.intern(&instance.nodes[1])?,
         ];
-        let power_function = port.power_function.is_some();
-        let rf = port.finish(instance, new_nodes)?;
-        // Real port coefficients are resolved by with_port; a nonport
-        // PORT setter selects the C zero-amplitude tone.
-        let tone = (power_function && rf.is_none()).then_some((0., 0.));
-        let device: Box<dyn Device> = {
-            let source = IndependentSource::from_inputs(
-                instance.name.clone(),
-                terminals,
-                instance.designator == 'v',
-                inputs,
-            )?
-            .with_power_tone(tone)
+        let source = excitation
+            .bind(&instance.name, terminals)
             .with_distortion(distortion[0], distortion[1])?;
-            // Only V cards accept port setters (parser and allow-list above).
-            match rf {
-                Some(rf) => Box::new(source.with_port(rf)?),
-                None => Box::new(source),
-            }
+        let device: Box<dyn Device> = match rf {
+            Some(rf) => Box::new(source.with_port(rf.bind(instance, nodes)?)?),
+            // A PORT setter without an enabled port still selects C's
+            // zero-amplitude function; no second tone calculation is needed.
+            None => Box::new(source.with_power_tone(power_function.then_some((0., 0.)))),
         };
         Ok(device)
     })
 }
 
+struct PortInput {
+    number: usize,
+    z0: Real,
+    power: Real,
+    frequency: Real,
+    phase: Real,
+    power_function: bool,
+}
+
+impl PortInput {
+    fn bind(
+        self,
+        instance: &DeviceInstance,
+        nodes: &mut NodeTable,
+    ) -> SpiceResult<crate::devices::RfPort> {
+        let name = format!("{}#res", instance.name);
+        if nodes.get(&name).is_some() {
+            return Err(SpiceError::circuit(format!(
+                "RF port internal-node name collision: {name}"
+            )));
+        }
+        let internal = nodes.intern(&name)?;
+        nodes.set_kind(internal, NodeKind::Internal);
+        Ok(crate::devices::RfPort {
+            number: self.number,
+            z0: self.z0,
+            internal,
+            power: self.power,
+            frequency: self.frequency,
+            phase: self.phase,
+            power_function: self.power_function,
+        })
+    }
+}
+
 /// The ordered RFSPICE port setters of one V card (`vsrcpar.c`), resolved by
-/// [`PortSetters::finish`] with `vsrctemp.c`'s rules.
+/// [`PortSetters::resolve`] with `vsrctemp.c`'s rules.
 #[derive(Debug, Default)]
 struct PortSetters {
     number: Option<(i64, SourceLoc)>,
@@ -514,10 +566,10 @@ struct PortSetters {
 }
 
 impl PortSetters {
-    fn set(&mut self, name: &str, number: Real, at: &SourceLoc) -> SpiceResult<()> {
+    fn set(&mut self, setter: PortSetter, number: Real, at: &SourceLoc) -> SpiceResult<()> {
         self.any.get_or_insert_with(|| at.clone());
-        match name {
-            "portnum" => {
+        match setter {
+            PortSetter::Number => {
                 // INPgetValue(IF_INTEGER): (int) floor(0.5 + value).
                 let rounded = crate::primitives::c_integer(number).ok_or_else(|| {
                     SpiceError::Unsupported {
@@ -532,31 +584,27 @@ impl PortSetters {
                     self.z0 = 50.;
                 }
             }
-            "z0" => {
+            PortSetter::Impedance => {
                 self.z0 = number;
                 self.z0_given = true;
             }
-            "pwr" => {
+            PortSetter::Power => {
                 self.power = Some(number);
                 self.power_function = Some(at.clone());
             }
-            "freq" => {
+            PortSetter::Frequency => {
                 self.frequency = Some(number);
                 self.power_function = Some(at.clone());
             }
-            _ => self.phase = Some(number),
+            PortSetter::Phase => self.phase = Some(number),
         }
         Ok(())
     }
 
     /// `vsrctemp.c`: a source is a port when `portnum` was given, is positive
-    /// and its `z0` (50 when not given) is positive. Creates the port's
-    /// internal `<name>#res` node in `nodes` (`vsrcset.c` `CKTmkVolt`).
-    fn finish(
-        self,
-        instance: &DeviceInstance,
-        nodes: &mut NodeTable,
-    ) -> SpiceResult<Option<crate::devices::RfPort>> {
+    /// and its `z0` (50 when not given) is positive. This resolves the
+    /// setters before the port's internal node is allocated.
+    fn resolve(self, instance: &DeviceInstance) -> SpiceResult<Option<PortInput>> {
         let Some(at) = self.any else {
             return Ok(None);
         };
@@ -576,18 +624,9 @@ impl PortSetters {
                 location: Some(at),
             });
         }
-        let name = format!("{}#res", instance.name);
-        if nodes.get(&name).is_some() {
-            return Err(SpiceError::circuit(format!(
-                "RF port internal-node name collision: {name}"
-            )));
-        }
-        let internal = nodes.intern(&name)?;
-        nodes.set_kind(internal, NodeKind::Internal);
-        Ok(Some(crate::devices::RfPort {
+        Ok(Some(PortInput {
             number,
             z0,
-            internal,
             power: self.power.unwrap_or(1e-3),
             frequency: self.frequency.unwrap_or(1e9),
             phase: self.phase.unwrap_or(0.),
@@ -637,7 +676,9 @@ fn source_waveform(
     setter: &SourceLoc,
 ) -> SpiceResult<Waveform> {
     match (name, source) {
-        (_, SourceWaveform::Function(f)) => function_waveform(f, setter),
+        (name, SourceWaveform::Function(f)) if name == f.function.keyword() => {
+            function_waveform(f, setter)
+        }
         ("pulse", SourceWaveform::Pulse(p)) => {
             let optional = |v: &Option<PositionedValue>, what| v.as_ref().map(|v| field(v, what));
             let spec = PulseSpec {
@@ -662,12 +703,14 @@ fn source_waveform(
                 .map(|p| Ok((field(&p.time, "pwl time")?, field(&p.value, "pwl value")?)))
                 .collect::<SpiceResult<Vec<_>>>()?;
             let waveform = Waveform::Pwl(knots);
-            if let Some(first) = points.first() {
-                waveform.validate().map_err(|_| SpiceError::Unsupported {
-                    feature: "PWL times must be nonnegative and strictly increasing".to_string(),
-                    location: Some(first.time.location.clone()),
-                })?;
-            }
+            waveform.validate().map_err(|_| SpiceError::Unsupported {
+                feature: "PWL times must be nonnegative and strictly increasing".to_owned(),
+                location: Some(
+                    points
+                        .first()
+                        .map_or_else(|| setter.clone(), |p| p.time.location.clone()),
+                ),
+            })?;
             Ok(waveform)
         }
         _ => Err(SpiceError::not_yet_ported(
@@ -750,5 +793,52 @@ fn waveform_error(at: &PositionedValue, error: &SpiceError) -> SpiceError {
     SpiceError::Unsupported {
         feature: error.to_string(),
         location: Some(at.location.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::netlist::source::parse_deck_text;
+    use std::path::Path;
+
+    #[test]
+    fn source_setters_are_ordered_and_bad_ast_does_not_bind_nodes() {
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("source.cir"),
+                "title\nv1 a 0 dc 0 ac 0 portnum=1 z0=75 pwr=1m\n.end\n",
+            ))
+            .unwrap();
+        let instance = &deck.devices[0];
+        let input = parse_source_setters(instance).unwrap();
+        assert!(input.ac_given);
+        assert_eq!(input.mag.to_bits(), 0_f64.to_bits());
+        assert!(input.port.power_function.is_some());
+        let mut nodes = NodeTable::new();
+        let existing = nodes.intern("v1#res").unwrap();
+        nodes.set_kind(existing, NodeKind::Internal);
+        let before = nodes.nodes().to_vec();
+        let error = instantiate_source(instance, &mut nodes).unwrap_err();
+        assert!(error.to_string().contains("collision"));
+        assert_eq!(nodes.nodes(), before);
+
+        let mut malformed = instance.clone();
+        let mut invalid = malformed.parameters[0].clone();
+        invalid.name = "acmag".into();
+        invalid.value = "not-a-number".into();
+        malformed.parameters.insert(0, invalid);
+        let error = instantiate_source(&malformed, &mut nodes).unwrap_err();
+        assert!(
+            error.to_string().contains("non-finite or nonliteral acmag"),
+            "{error}"
+        );
+        assert_eq!(nodes.nodes(), before);
+
+        let mut nodes = NodeTable::new();
+        let source = instantiate_source(instance, &mut nodes).unwrap();
+        let port = source.rf_port().unwrap();
+        assert_eq!(port.z0.to_bits(), 75_f64.to_bits());
+        assert_eq!(port.internal, nodes.get("v1#res").unwrap());
     }
 }
