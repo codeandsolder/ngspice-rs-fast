@@ -343,3 +343,27 @@ c1 out 0 1n
         LINEAR,
     );
 }
+
+/// Restoring TNOM at each frequency changes BSIM4's subsequent reset load.
+/// Compare the finite columns and the subsequent C NaNs rather than
+/// restarting device records independently at each frequency.
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN; runs C batch mode out of process"]
+fn bsim4_ac_temperature_drift_matches_c() {
+    compare_with_c(
+        "bsim4-ac-drift",
+        "\
+bsim4 filtered drift
+vdd dd 0 1
+rl dd d 1k
+vg g 0 dc 0.7 ac 1
+vs s 0 0
+vb b 0 -0.1
+m1 d g s b nch l=0.1u w=1u
+.model nch nmos level=54 version=4.8.3 tnom=27 cgdo=1e-10 cgso=1e-10
+.sens v(d) m1:tnom m1:cgdo m1:cgso m1_w ac dec 3 1e3 1e9
+.end
+",
+        (1e-4, 1e-9),
+    );
+}
