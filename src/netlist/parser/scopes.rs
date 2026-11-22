@@ -1,5 +1,6 @@
 //! Ordered scope assembly; parsing X references is deliberately not elaboration.
 
+use super::ParsedDeck;
 use super::grammar::{self, ParsedCard};
 use super::save::OutputCard;
 use crate::netlist::ast::{
@@ -111,11 +112,11 @@ pub(super) fn assemble(
     deck: &Deck,
     cards: &[SpiceResult<InputCard>],
     auto_gnd: bool,
-) -> SpiceResult<(Netlist, OutputCards, Vec<MeasureCard>, Vec<FourierCard>)> {
+) -> SpiceResult<ParsedDeck> {
     let mut cursor = 0;
     let scope = scope(cards, &mut cursor, auto_gnd, &BTreeSet::new(), None, 0)?;
-    Ok((
-        Netlist {
+    Ok(ParsedDeck {
+        netlist: Netlist {
             title: deck.title.clone(),
             path: deck.path.clone(),
             location: deck.title_location.clone(),
@@ -132,10 +133,10 @@ pub(super) fn assemble(
             initial_conditions: scope.initial_conditions,
             nodesets: scope.nodesets,
         },
-        scope.output,
-        scope.measurements,
-        scope.fourier,
-    ))
+        output: scope.output,
+        measurements: scope.measurements,
+        fourier: scope.fourier,
+    })
 }
 
 // Read-only forward-name scan, bounded to this body and excluding children and

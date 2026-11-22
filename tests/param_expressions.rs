@@ -6,10 +6,10 @@
 
 use std::path::Path;
 
-use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::{Netlist, ParameterKind, ScopedCardKind};
 use ngspice_rs::netlist::expr::{BinaryOp, Expr, ExprKind, Function, ParameterExpression, UnaryOp};
 use ngspice_rs::netlist::source::parse_deck_text;
+use ngspice_rs::netlist::{Parser, parse_parameter_expression};
 use ngspice_rs::primitives::{SourceLoc, SpiceError, parse_numparam_number};
 
 fn parse(body: &str) -> Result<Netlist, SpiceError> {
@@ -21,7 +21,7 @@ fn parse(body: &str) -> Result<Netlist, SpiceError> {
 
 /// Expression text at line 5, column 10 so offsets are visible in columns.
 fn expression(text: &str) -> Result<ParameterExpression, SpiceError> {
-    Parser::parse_expression(
+    parse_parameter_expression(
         text,
         &SourceLoc::new(Path::new("e.cir").to_path_buf(), 5, 10),
     )

@@ -28,7 +28,7 @@ use crate::netlist::ast::{DeviceInstance, InitialCondition, ParameterAssignment,
 use crate::netlist::token::{Token, TokenKind};
 
 use super::grammar::{Failure, Input, ParsedCard, Result, keyword, location};
-use super::syntax::{canonical_node, equals, malformed, name, named, value};
+use super::syntax::{canonical_node, equals, malformed, name, named, named_device, value};
 use super::vector::{numeric, positioned};
 
 /// Scalar setters of `TRApTable` (`zo` is C's redundant alias of `z0`).
@@ -40,16 +40,7 @@ const SCALARS: [&str; 11] = [
 const IC_COMPONENTS: [&str; 4] = ["v1", "i1", "v2", "i2"];
 
 pub(super) fn tline_card(input: &mut Input<'_>) -> Result<ParsedCard> {
-    let instance = any
-        .verify(|token: &Token| {
-            token.is_name_like()
-                && token
-                    .text
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.eq_ignore_ascii_case(&'t'))
-        })
-        .parse_next(input)?;
+    let (instance, _) = named_device("t").parse_next(input)?;
     cut_err(move |input: &mut Input<'_>| body(input, instance)).parse_next(input)
 }
 

@@ -8,7 +8,7 @@ use winnow::token::any;
 
 use super::expression::{is_ident_continue, is_ident_start};
 use super::grammar::{Failure, Input, ParsedCard, Result, keyword};
-use super::syntax::{canonical_node, equals, malformed, name};
+use super::syntax::{canonical_node, equals, malformed, name, named_device};
 use crate::netlist::ast::{
     DeviceInstance, IncludeDirective, OutputCards, ParameterAssignment, ParameterKind, Subcircuit,
 };
@@ -77,9 +77,7 @@ fn ends(input: &mut Input<'_>) -> Result<ParsedCard> {
 }
 
 fn instance(input: &mut Input<'_>) -> Result<ParsedCard> {
-    let instance = any
-        .verify(|t: &Token| t.is_name_like() && t.text.starts_with(['x', 'X']))
-        .parse_next(input)?;
+    let (instance, _) = named_device("x").parse_next(input)?;
     cut_err(|input: &mut Input<'_>| {
         let (mut connections, parameters): (Vec<_>, _) =
             (repeat(1.., connection), parameters).parse_next(input)?;

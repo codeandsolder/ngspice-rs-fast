@@ -17,7 +17,7 @@ use crate::netlist::ast::{ModelCard, ParameterAssignment, ParameterKind};
 use crate::netlist::token::{Token, TokenKind};
 
 use super::grammar::{Failure, Input, ParsedCard, Result, gap, keyword};
-use super::syntax::{equals, malformed, name, named, value};
+use super::syntax::{equals, malformed, name, named, punctuation, value};
 
 pub(super) fn model_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     keyword(".model").parse_next(input)?;
@@ -216,10 +216,4 @@ fn invalid_parameter(input: &mut Input<'_>) -> Result<Option<ParameterAssignment
         return Err(gap(input, "non-scalar model parameters"));
     }
     Err(malformed(input, "expected a scalar model assignment"))
-}
-
-fn punctuation<'a>(
-    kind: TokenKind,
-) -> impl winnow::Parser<Input<'a>, &'a Token, ErrMode<super::grammar::Failure>> {
-    any.verify(move |token: &Token| token.kind == kind)
 }

@@ -13,20 +13,11 @@ use crate::netlist::token::{Token, TokenKind};
 
 use super::grammar::{Input, ParsedCard, Result, gap};
 use super::syntax::{
-    assignment, canonical_node, equals, leading_value, malformed, name, named, value,
+    assignment, canonical_node, equals, leading_value, malformed, name, named, named_device, value,
 };
 
 pub(super) fn diode_card(input: &mut Input<'_>) -> Result<ParsedCard> {
-    let instance = any
-        .verify(|token: &Token| {
-            token.is_name_like()
-                && token
-                    .text
-                    .as_bytes()
-                    .first()
-                    .is_some_and(|c| c.eq_ignore_ascii_case(&b'd'))
-        })
-        .parse_next(input)?;
+    let (instance, _) = named_device("d").parse_next(input)?;
     let (anode, cathode, model, parameters) = cut_err((
         name("anode terminal"),
         name("cathode terminal"),

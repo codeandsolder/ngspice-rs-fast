@@ -106,7 +106,6 @@ use std::fmt::Write as _;
 
 use crate::primitives::{AnalysisKind, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
 
-use crate::netlist::Parser;
 use crate::netlist::ast::{
     AnalysisCard, DeviceInstance, FuncCard, FuncSpelling, GlobalCard, IncludeDirective, ModelCard,
     Netlist, NodeHintCard, NodeHintValue, OptionCard, ParamCard, ParameterAssignment,
@@ -117,6 +116,7 @@ use crate::netlist::expr::ParameterExpression;
 use crate::netlist::semantic::{bexpr_form, expr_form};
 use crate::netlist::source::{LogicalLine, parse_deck_text, strip_comment};
 use crate::netlist::token::{Token, TokenKind, tokenize};
+use crate::netlist::{Parser, parse_parameter_expression};
 
 /// Serializes `netlist` as a normalized deck. See the [module documentation](self)
 /// for the contract.
@@ -987,7 +987,7 @@ fn node(name: &str, location: &SourceLoc) -> SpiceResult<String> {
 /// The expression text must re-parse to the stored tree, so writing the text
 /// preserves the grouping (parentheses) of the source.
 fn check_expression(expression: &ParameterExpression, location: &SourceLoc) -> SpiceResult<()> {
-    let reparsed = Parser::parse_expression(&expression.text, location).map_err(|error| {
+    let reparsed = parse_parameter_expression(&expression.text, location).map_err(|error| {
         refuse(
             format!(
                 "expression {:?} does not re-parse: {error}",
