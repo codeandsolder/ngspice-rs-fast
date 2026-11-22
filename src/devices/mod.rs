@@ -95,8 +95,8 @@ pub use functions::{
     AmSpec, ExpSpec, FunctionSpec, PwlBreakpoints, PwlSource, SffmSpec, SineSpec, SourceFunction,
 };
 pub use linear::{
-    Forcing, Limit, LinearContext, LinearSource, LinearSystem, SourceKind, SystemBreakpoints,
-    Waveform, WaveformBreakpoints,
+    Forcing, Limit, LinearContext, LinearSource, LinearSystem, SourceKind, SourceTimeline,
+    SystemBreakpoints, Waveform, WaveformBreakpoints, WaveformEvent, WaveformEventKind,
 };
 pub use pulse::{Pulse, PulseBreakpoints, PulseSpec, TransientTiming};
 pub use sources::{IndependentSource, RfPort};
