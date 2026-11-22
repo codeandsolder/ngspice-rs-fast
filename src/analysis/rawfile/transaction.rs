@@ -155,7 +155,7 @@ fn anchor(output: &Path) -> SpiceResult<PathBuf> {
 /// One transaction-owned report spool, with byte ranges for consecutive plots.
 /// Text is never exposed until the simulation and rawfile publication succeed.
 #[derive(Debug)]
-pub(crate) struct TextSpool {
+pub struct TextSpool {
     file: BufWriter<File>,
     temporary: OwnedTemporary,
 }

@@ -54,7 +54,7 @@
     reason = "the ASCII ngspice rawfile documentation demonstrates literal tab separator bytes"
 )]
 
-pub(crate) mod transaction;
+mod transaction;
 
 use transaction::OwnedTemporary;
 pub use transaction::RawFileTransaction;
