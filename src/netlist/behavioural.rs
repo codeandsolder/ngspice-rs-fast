@@ -503,8 +503,7 @@ impl Resolver<'_> {
                 &expr.span,
                 format!(
                     "behavioural expression too large after .func expansion \
-                     (more than {MAX_TREE_NODES} nodes or nesting deeper than {})",
-                    MAX_TREE_DEPTH
+                     (more than {MAX_TREE_NODES} nodes or nesting deeper than {MAX_TREE_DEPTH})"
                 ),
             ));
         }

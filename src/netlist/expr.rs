@@ -275,6 +275,7 @@ pub enum BinaryOp {
 pub const MAX_NESTING: usize = 64;
 
 /// Maximum structural height (including leaves) of a parsed expression.
+///
 /// Flat left-associative chains count toward this limit, independently of
 /// syntactic nesting. Matches the behavioural compiler's depth envelope.
 pub const MAX_TREE_DEPTH: usize = 4 * MAX_NESTING;
