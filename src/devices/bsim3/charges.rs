@@ -185,10 +185,9 @@ impl ChargeModel<'_> {
     ///
     /// # Errors
     /// A `capMod` other than 3 or any NQS mode (`NotYetPorted` naming the C
-    /// file), a missing internal model field or instance parameter, or a
-    /// nonfinite result.
+    /// file), or a nonfinite result.
     pub fn evaluate(&self, dc: &DcEvaluation, bias: Bias) -> SpiceResult<ChargeEvaluation> {
-        let cap_mod = self.model.integer("capmod")?;
+        let cap_mod = self.model.values.capmod.value;
         if cap_mod != 3 {
             return Err(SpiceError::not_yet_ported(
                 format!(
@@ -207,8 +206,6 @@ impl ChargeModel<'_> {
         let p = self.setup;
         let m = self.model;
         let t = self.temperature;
-        let number = |name: &str| required(m.get(name), "model field", name);
-        let param = |name: &str| required(p.pparam(name), "instance parameter", name);
         let cv = &dc.cv;
         // C's junction C-V and overlap charges use the raw terminal bias;
         // the CTM block uses the mode-selected magnitudes (`Vgs`, `Vds`).
@@ -227,11 +224,11 @@ impl ChargeModel<'_> {
         let cox = m.oxide_capacitance;
         let cox_wl = cox * p.weff_cv * p.leff_cv;
 
-        let noff = cv.n * param("noff")?;
-        let dnoff_dvd = param("noff")? * cv.d_n_dvd;
-        let dnoff_dvb = param("noff")? * cv.d_n_dvb;
+        let noff = cv.n * p.binned.noff;
+        let dnoff_dvd = p.binned.noff * cv.d_n_dvd;
+        let dnoff_dvb = p.binned.noff * cv.d_n_dvb;
         let t0 = cv.vtm * noff;
-        let voffcv = param("voffcv")?;
+        let voffcv = p.binned.voffcv;
         let vgst_nvt = (cv.vgst - voffcv) / t0;
         let (vgsteff, dvgsteff_dvg, dvgsteff_dvd, dvgsteff_dvb) = if vgst_nvt > EXP_THRESHOLD {
             (
@@ -268,15 +265,15 @@ impl ChargeModel<'_> {
         let dvfbeff_dvg = t1 * cv.d_vgs_eff_dvg;
         let dvfbeff_dvb = -t1 * dvbseff_cv_dvb;
 
-        let tox = number("tox")?;
+        let tox = m.values.tox.value;
         // C `Tox = 1.0e8 * model->BSIM3tox` (centimetres for the ACDE exponent).
         let mut tox_cm = 1.0e8 * tox;
         let t0 = (cv.vgs_eff - vbseff_cv - vfbzb) / tox_cm;
         let dt0_dvg = cv.d_vgs_eff_dvg / tox_cm;
         let dt0_dvb = -dvbseff_cv_dvb / tox_cm;
 
-        let acde = param("acde")?;
-        let ldeb = param("ldeb")?;
+        let acde = p.binned.acde;
+        let ldeb = p.derived.ldeb;
         let tmp = t0 * acde;
         let (tcen, mut dtcen_dvg, mut dtcen_dvb) = if tmp > -EXP_THRESHOLD && tmp < EXP_THRESHOLD {
             let tcen = ldeb * tmp.exp();
@@ -314,7 +311,7 @@ impl ChargeModel<'_> {
         let dqac0_dvb = cox_wl_cen * dvfbeff_dvb + qov_cox * dcoxeff_dvb;
 
         // Poly-gate depletion share of the bulk charge.
-        let k1ox = param("k1ox")?;
+        let k1ox = p.derived.k1ox;
         let t0 = 0.5 * k1ox;
         let t3 = cv.vgs_eff - vfbeff - vbseff_cv - vgsteff;
         let (t1, t2) = if k1ox == 0.0 {
@@ -336,11 +333,11 @@ impl ChargeModel<'_> {
 
         // Gate-bias-dependent surface potential (C's "Delta Phis").
         let (denomi, t0) = if k1ox <= 0.0 {
-            (0.25 * param("moin")? * cv.vtm, 0.5 * param("sqrtphi")?)
+            (0.25 * p.binned.moin * cv.vtm, 0.5 * p.derived.sqrtphi)
         } else {
             (
-                param("moin")? * cv.vtm * k1ox * k1ox,
-                k1ox * param("sqrtphi")?,
+                p.binned.moin * cv.vtm * k1ox * k1ox,
+                k1ox * p.derived.sqrtphi,
             )
         };
         let t1 = 2.0 * t0 + vgsteff;
@@ -391,8 +388,8 @@ impl ChargeModel<'_> {
         let cox_wl_cen = cox_wl * coxeff / cox;
 
         // Effective drain voltage for C-V.
-        let abulk_cv = cv.abulk0 * param("abulkcvfactor")?;
-        let dabulk_cv_dvb = param("abulkcvfactor")? * cv.d_abulk0_dvb;
+        let abulk_cv = cv.abulk0 * p.thermal.abulkcvfactor;
+        let dabulk_cv_dvb = p.thermal.abulkcvfactor * cv.d_abulk0_dvb;
         let vdsat_cv = vgdp / abulk_cv;
         let t0 = vdsat_cv - vds_mode - DELTA_4;
         let dt0_dvg = dvgdp_dvg / abulk_cv;
@@ -466,7 +463,7 @@ impl ChargeModel<'_> {
         cbg1 = cbg1 * dvgsteff_dvg + qov_cox * dcoxeff_dvg;
 
         // Source charge partition (XPART: > 0.5 = 0/100, < 0.5 = 40/60).
-        let xpart = number("xpart")?;
+        let xpart = m.values.xpart.value;
         let (qsrc, csg, csd, mut csb);
         if xpart > 0.5 {
             let qsrc0 = -cox_wl_cen * (t1 / 2.0 + t0 / 4.0 - 0.5 * t0 * t0 / t2);
@@ -547,15 +544,15 @@ impl ChargeModel<'_> {
         let cbdb = cbd;
 
         // ---- Overlap capacitances (capMod 3 uses the capMod >= 2 branch).
-        let cgdo_param = param("cgdo")?;
-        let cgso_param = param("cgso")?;
-        let ck = param("ckappa")?;
+        let cgdo_param = p.cgdo;
+        let cgso_param = p.cgso;
+        let ck = p.binned.ckappa;
         let vgd = vgs - vds;
 
         let t0 = vgd + DELTA_1;
         let t1 = (t0 * t0 + 4.0 * DELTA_1).sqrt();
         let t2 = 0.5 * (t0 - t1);
-        let t3 = p.weff_cv * param("cgdl")?;
+        let t3 = p.weff_cv * p.binned.cgdl;
         let t4 = (1.0 - 4.0 * t2 / ck).sqrt();
         let cgdo = cgdo_param + t3 - t3 * (1.0 - 1.0 / t4) * (0.5 - 0.5 * t0 / t1);
         let qgdo = (cgdo_param + t3) * vgd - t3 * (t2 + 0.5 * ck * (t4 - 1.0));
@@ -563,27 +560,27 @@ impl ChargeModel<'_> {
         let t0 = vgs + DELTA_1;
         let t1 = (t0 * t0 + 4.0 * DELTA_1).sqrt();
         let t2 = 0.5 * (t0 - t1);
-        let t3 = p.weff_cv * param("cgsl")?;
+        let t3 = p.weff_cv * p.binned.cgsl;
         let t4 = (1.0 - 4.0 * t2 / ck).sqrt();
         let cgso = cgso_param + t3 - t3 * (1.0 - 1.0 / t4) * (0.5 - 0.5 * t0 / t1);
         let qgso = (cgso_param + t3) * vgs - t3 * (t2 + 0.5 * ck * (t4 - 1.0));
 
-        let cgbo = param("cgbo")?;
+        let cgbo = p.derived.cgbo;
 
         // ---- Junction C-V (b3ld.c "bulk-drain and bulk-source depletion
         // capacitances"). C uses the un-temperature-scaled gate-sidewall field
         // (`BSIM3unitLengthGateSidewallJctCap`, not `...TempJctCap`); that
         // quirk is reproduced.
         let (czbd, czbdsw, czbdswg) =
-            junction_zero_bias(t, m, p.drain_area, p.drain_perimeter, param("weff")?)?;
+            junction_zero_bias(t, m, p.drain_area, p.drain_perimeter, p.weff);
         let (czbs, czbssw, czbsswg) =
-            junction_zero_bias(t, m, p.source_area, p.source_perimeter, param("weff")?)?;
-        let mj = number("mj")?;
-        let mjsw = number("mjsw")?;
-        let mjswg = number("mjswg")?;
-        let phib = required(t.get("phi_b"), "temperature field", "phi_b")?;
-        let phibsw = required(t.get("phi_bsw"), "temperature field", "phi_bsw")?;
-        let phibswg = required(t.get("phi_bswg"), "temperature field", "phi_bswg")?;
+            junction_zero_bias(t, m, p.source_area, p.source_perimeter, p.weff);
+        let mj = m.values.mj.value;
+        let mjsw = m.values.mjsw.value;
+        let mjswg = m.values.mjswg.value;
+        let phib = t.phi_b;
+        let phibsw = t.phi_bsw;
+        let phibswg = t.phi_bswg;
 
         let vbd = vbs - vds;
         let (qbs, capbs) = junction_cv(
@@ -650,11 +647,6 @@ impl ChargeModel<'_> {
     }
 }
 
-/// Missing entries are internal setup/schema errors, never panics in load.
-fn required(value: Option<Real>, kind: &str, name: &str) -> SpiceResult<Real> {
-    value.ok_or_else(|| SpiceError::circuit(format!("missing BSIM3 charge {kind} {name}")))
-}
-
 /// `b3ld.c`'s zero-bias junction capacitances for one junction, split into the
 /// bottom, sidewall and gate-sidewall parts.
 fn junction_zero_bias(
@@ -663,24 +655,16 @@ fn junction_zero_bias(
     area: Real,
     perimeter: Real,
     weff: Real,
-) -> SpiceResult<(Real, Real, Real)> {
-    let czb = required(
-        temperature.get("unit_area_temp_jct_cap"),
-        "temperature field",
-        "unit_area_temp_jct_cap",
-    )? * area;
-    let sidewall = required(
-        temperature.get("unit_length_sidewall_temp_jct_cap"),
-        "temperature field",
-        "unit_length_sidewall_temp_jct_cap",
-    )?;
+) -> (Real, Real, Real) {
+    let czb = temperature.unit_area_temp_jct_cap * area;
+    let sidewall = temperature.unit_length_sidewall_temp_jct_cap;
     // C reads the *model* field here (no CJSWG temperature scaling).
-    let gate_sidewall = required(model.get("cjswg"), "model field", "cjswg")?;
-    Ok(if perimeter < weff {
+    let gate_sidewall = model.values.cjswg.value;
+    if perimeter < weff {
         (czb, 0.0, gate_sidewall * perimeter)
     } else {
         (czb, sidewall * (perimeter - weff), gate_sidewall * weff)
-    })
+    }
 }
 
 /// `b3ld.c`'s source/drain bulk junction C-V for one junction, returning

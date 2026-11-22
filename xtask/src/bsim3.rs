@@ -43,13 +43,13 @@ pub(crate) fn main(args: &[String]) -> Result<(), String> {
         &read("b3par.c")?,
         &revision,
     )?;
-    let defaults = ifparm::literal_defaults(
-        &SPEC,
+    let mut defaults = typed_literal_defaults(
         &read("b3.c")?,
         &read("b3mpar.c")?,
         &read("b3set.c")?,
         &revision,
     )?;
+    defaults.push_str(&typed_model_fields(&read("b3.c")?, &read("b3mpar.c")?)?);
     let size = size_dependent(
         &read("b3.c")?,
         &read("b3mpar.c")?,
@@ -67,6 +67,80 @@ pub(crate) fn main(args: &[String]) -> Result<(), String> {
         println!("BSIM3 schema/default facts match {revision} (429 model, 49 instance entries)");
     }
     Ok(())
+}
+
+// The C area coefficient of UB is literally "pub".
+fn rust_field(name: &str) -> &str {
+    if name == "pub" { "r#pub" } else { name }
+}
+
+/// Emit direct field assignments so model defaults do not perform keyword lookups.
+fn typed_literal_defaults(
+    tables: &str,
+    mpar: &str,
+    setup: &str,
+    revision: &str,
+) -> Result<String, String> {
+    let mut out = format!(
+        "// Generated literal-default facts, not C implementation code.\n// Source: ngspice {revision}, bsim3/b3set.c.\n// Dependent defaults and diagnostics are implemented separately.\n\n#[rustfmt::skip]\nmacro_rules! apply_literal_defaults {{\n    ($values:ident) => {{\n"
+    );
+    for default in ifparm::literal_default_facts(&SPEC, tables, mpar, setup)? {
+        let literal = match default.kind.as_str() {
+            "Real" => default.formatted(),
+            "Integer" if default.value.fract() == 0.0 => {
+                let value = format!("{:.0}", default.value)
+                    .parse::<i32>()
+                    .map_err(|_| format!("integer default out of range: {}", default.name))?;
+                value.to_string()
+            }
+            _ => return Err(format!("invalid numeric default for {}", default.name)),
+        };
+        writeln!(
+            out,
+            "        $values.{}.apply_default({literal});",
+            rust_field(&default.name)
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    out.push_str("    };\n}\npub(super) use apply_literal_defaults;\n");
+    Ok(out)
+}
+
+/// Derive the typed storage declaration from the same schema rows and
+/// setter destinations. Canonical numeric fields must have distinct C given
+/// bits; aliases are resolved by the interface table, not stored twice.
+fn typed_model_fields(tables: &str, mpar: &str) -> Result<String, String> {
+    let model = ifparm::table(tables, SPEC.model_table)?;
+    let setters = ifparm::setters(mpar, SPEC.prefix)?;
+    let mut given = BTreeSet::new();
+    let mut out = String::from(
+        "\n// Canonical typed numeric storage, derived from the same IFparm table.\n#[rustfmt::skip]\nmacro_rules! model_fields {\n    ($define:ident) => {\n        $define! {\n",
+    );
+    for (kind, group) in [("Real", "real"), ("Integer", "integer")] {
+        writeln!(out, "            {group} {{").map_err(|e| e.to_string())?;
+        for entry in model.iter().filter(|p| !p.alias && p.kind == kind) {
+            let (_, flag) = setters.get(&entry.symbol).ok_or("missing model setter")?;
+            if !given.insert(
+                flag.as_ref()
+                    .ok_or("numeric model field has no given bit")?,
+            ) {
+                return Err(format!(
+                    "numeric model given-bit alias requires review: {}",
+                    entry.name
+                ));
+            }
+            writeln!(
+                out,
+                "                ({:?}, {}),",
+                entry.name,
+                rust_field(&entry.name)
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        out.push_str("            }\n");
+    }
+    out.push_str("        }\n    };\n}\npub(super) use model_fields;\n");
+    Ok(out)
 }
 
 /// `b3temp.c` builds each instance's size-dependent parameter from the model
@@ -96,7 +170,7 @@ fn size_dependent(
         .find("pParam->BSIM3abulkCVfactor")
         .ok_or("missing BSIM3 size-dependent end")?;
     let mut out = format!(
-        "// Generated size-dependent coefficient facts, not C implementation code.\n// Source: ngspice {revision}, bsim3/b3temp.c.\n// Each row is a canonical parameter plus its L, W and reciprocal-area\n// coefficients. Dependent formulas live in setup.rs, not here.\n\n/// Canonical base keyword and its L, W, P coefficient keywords, in C order.\n#[rustfmt::skip]\npub(crate) const SIZE_DEPENDENT: &[(&str, &str, &str, &str)] = &[\n"
+        "// Generated size-dependent coefficient facts, not C implementation code.\n// Source: ngspice {revision}, bsim3/b3temp.c.\n// Each row is a canonical parameter plus its L, W and reciprocal-area\n// coefficients. Dependent formulas live in setup.rs, not here.\n\n// Canonical base keyword and its L, W, P coefficients, in C order.\n#[rustfmt::skip]\nmacro_rules! binned_fields {{\n    ($define:ident) => {{\n        $define! {{\n"
     );
     let mut seen = BTreeSet::new();
     let body = &clean[start..end];
@@ -150,8 +224,11 @@ fn size_dependent(
         }
         writeln!(
             out,
-            "    ({base:?}, {:?}, {:?}, {:?}),",
-            coefficients[0].1, coefficients[1].1, coefficients[2].1
+            "            ({}, {}, {}, {}),",
+            rust_field(base),
+            rust_field(coefficients[0].1),
+            rust_field(coefficients[1].1),
+            rust_field(coefficients[2].1)
         )
         .map_err(|e| e.to_string())?;
     }
@@ -161,6 +238,6 @@ fn size_dependent(
             seen.len()
         ));
     }
-    out.push_str("];\n");
+    out.push_str("        }\n    };\n}\npub(super) use binned_fields;\n");
     Ok(out)
 }

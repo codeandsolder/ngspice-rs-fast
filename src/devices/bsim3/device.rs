@@ -401,7 +401,7 @@ impl Bsim3 {
 fn limit(raw: [Real; 3], old: [Real; 3], von: Real, cached: &Cached) -> ([Real; 3], bool) {
     let [vbs_in, vgs_in, vds_in] = raw;
     let [old_vbs, old_vgs, old_vds] = old;
-    let vcrit = cached.temperature_model.get("vcrit").unwrap_or(0.);
+    let vcrit = cached.temperature_model.vcrit;
     let vgd_raw = vgs_in - vds_in;
     let mut check = false;
     let (vgs, vds);
@@ -745,7 +745,7 @@ impl Device for Bsim3 {
         // refuses only where charges are required.
         let integration = context.integration;
         let transient = integration.is_some();
-        let cap_mod = cached.defaults.integer("capmod")?;
+        let cap_mod = cached.defaults.values.capmod.value;
         let charge_ready = cap_mod == 3 && cached.setup.nqs_mod == 0 && cached.setup.acnqs_mod == 0;
         let charge = if transient || charge_ready {
             Some(

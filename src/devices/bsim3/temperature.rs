@@ -18,8 +18,6 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
-use std::collections::BTreeMap;
-
 use super::Diagnostic;
 use super::defaults::ModelDefaults;
 use crate::devices::schema::temperature_kelvin;
@@ -43,7 +41,26 @@ pub(super) const METER2MICRON: Real = 1.0e6;
 /// constants the size-dependent setup needs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TemperatureModel {
-    values: BTreeMap<&'static str, Real>,
+    pub(super) pb: Real,
+    pub(super) pbsw: Real,
+    pub(super) pbswg: Real,
+    pub(super) jct_temp_sat_cur_density: Real,
+    pub(super) jct_sidewall_temp_sat_cur_density: Real,
+    pub(super) unit_area_temp_jct_cap: Real,
+    pub(super) unit_length_sidewall_temp_jct_cap: Real,
+    pub(super) unit_length_gate_sidewall_temp_jct_cap: Real,
+    pub(super) vcrit: Real,
+    pub(super) factor1: Real,
+    pub(super) vtm: Real,
+    pub(super) vtm0: Real,
+    pub(super) ni: Real,
+    pub(super) eg0: Real,
+    pub(super) eg: Real,
+    pub(super) phi_b: Real,
+    pub(super) phi_bsw: Real,
+    pub(super) phi_bswg: Real,
+    pub(super) temp: Real,
+    pub(super) tnom: Real,
     /// Nonfatal `b3temp.c` messages in C order.
     pub warnings: Vec<Diagnostic>,
 }
@@ -60,36 +77,18 @@ impl TemperatureModel {
         location: &SourceLoc,
     ) -> SpiceResult<Self> {
         let temp = temperature_kelvin(temperature, location)?;
-        let tnom = defaults.get("tnom").ok_or_else(|| {
-            crate::primitives::SpiceError::circuit("BSIM3 model defaults lost tnom")
-        })?;
+        let tnom = defaults.values.tnom.value;
         if tnom <= 0. || !temp.is_finite() {
             return Err(crate::primitives::SpiceError::parse(
                 location.clone(),
                 "BSIM3 temperature processing needs a positive TNOM",
             ));
         }
-        let number = |name: &str| {
-            defaults.get(name).ok_or_else(|| {
-                crate::primitives::SpiceError::circuit(format!("BSIM3 model defaults lost {name}"))
-            })
-        };
-        let mut values = BTreeMap::new();
         let mut warnings = Vec::new();
-        let mut clamped = BTreeMap::new();
 
-        // Junction potentials are clamped before anything uses them. C prints
-        // to stderr and keeps going.
-        for (name, message) in [
-            ("pb", "Given pb is less than 0.1. Pb is set to 0.1."),
-            ("pbsw", "Given pbsw is less than 0.1. Pbsw is set to 0.1."),
-            (
-                "pbswg",
-                "Given pbswg is less than 0.1. Pbswg is set to 0.1.",
-            ),
-        ] {
-            let given = number(name)?;
-            let value = if given < 0.1 {
+        // Junction potentials are clamped before anything uses them.
+        let mut clamp_potential = |given: Real, message: &'static str| {
+            if given < 0.1 {
                 warnings.push(Diagnostic::warning(
                     message,
                     "src/spicelib/devices/bsim3/b3temp.c",
@@ -97,13 +96,23 @@ impl TemperatureModel {
                 0.1
             } else {
                 given
-            };
-            values.insert(name, value);
-            clamped.insert(name, value);
-        }
+            }
+        };
+        let pb = clamp_potential(
+            defaults.values.pb.value,
+            "Given pb is less than 0.1. Pb is set to 0.1.",
+        );
+        let pbsw = clamp_potential(
+            defaults.values.pbsw.value,
+            "Given pbsw is less than 0.1. Pbsw is set to 0.1.",
+        );
+        let pbswg = clamp_potential(
+            defaults.values.pbswg.value,
+            "Given pbswg is less than 0.1. Pbswg is set to 0.1.",
+        );
 
         let vcrit = CONST_VT0 * (CONST_VT0 / (CONST_ROOT2 * 1.0e-14)).ln();
-        let factor1 = (EPS_SI / EPS_OX * number("tox")?).sqrt();
+        let factor1 = (EPS_SI / EPS_OX * defaults.values.tox.value).sqrt();
 
         let vtm0 = KB_OVER_Q * tnom;
         let eg0 = 1.16 - 7.02e-4 * tnom * tnom / (tnom + 1108.0);
@@ -115,42 +124,22 @@ impl TemperatureModel {
         let eg = 1.16 - 7.02e-4 * temp * temp / (temp + 1108.0);
 
         let (jct_temp_sat_cur, jct_sidewall_temp_sat_cur) = if temp == tnom {
-            (number("js")?, number("jsw")?)
+            (defaults.values.js.value, defaults.values.jsw.value)
         } else {
-            let exponent = eg0 / vtm0 - eg / vtm + number("xti")? * (temp / tnom).ln();
-            let scale = (exponent / number("nj")?).exp();
-            (number("js")? * scale, number("jsw")? * scale)
+            let exponent = eg0 / vtm0 - eg / vtm + defaults.values.xti.value * (temp / tnom).ln();
+            let scale = (exponent / defaults.values.nj.value).exp();
+            (
+                defaults.values.js.value * scale,
+                defaults.values.jsw.value * scale,
+            )
         };
-        values.insert("jct_temp_sat_cur_density", jct_temp_sat_cur.max(0.));
-        values.insert(
-            "jct_sidewall_temp_sat_cur_density",
-            jct_sidewall_temp_sat_cur.max(0.),
-        );
+        let jct_temp_sat_cur_density = jct_temp_sat_cur.max(0.);
+        let jct_sidewall_temp_sat_cur_density = jct_sidewall_temp_sat_cur.max(0.);
 
         let delta_temp = temp - tnom;
-        for (base, coefficient, temp_name, message) in [
-            (
-                "cj",
-                "tcj",
-                "unit_area_temp_jct_cap",
-                "Temperature effect has caused cj to be negative. Cj is clamped to zero.",
-            ),
-            (
-                "cjsw",
-                "tcjsw",
-                "unit_length_sidewall_temp_jct_cap",
-                "Temperature effect has caused cjsw to be negative. Cjsw is clamped to zero.",
-            ),
-            (
-                "cjswg",
-                "tcjswg",
-                "unit_length_gate_sidewall_temp_jct_cap",
-                "Temperature effect has caused cjswg to be negative. Cjswg is clamped to zero.",
-            ),
-        ] {
-            let scaled = number(coefficient)? * delta_temp;
-            let cap = number(base)?;
-            let value = if scaled >= -1.0 {
+        let mut scale_capacitance = |cap: Real, coefficient: Real, message: &'static str| {
+            let scaled = coefficient * delta_temp;
+            if scaled >= -1.0 {
                 cap * (1.0 + scaled)
             } else {
                 // C only overwrites the field when the base cap is positive;
@@ -162,26 +151,40 @@ impl TemperatureModel {
                     ));
                 }
                 0.0
-            };
-            values.insert(temp_name, value);
-        }
+            }
+        };
+        let unit_area_temp_jct_cap = scale_capacitance(
+            defaults.values.cj.value,
+            defaults.values.tcj.value,
+            "Temperature effect has caused cj to be negative. Cj is clamped to zero.",
+        );
+        let unit_length_sidewall_temp_jct_cap = scale_capacitance(
+            defaults.values.cjsw.value,
+            defaults.values.tcjsw.value,
+            "Temperature effect has caused cjsw to be negative. Cjsw is clamped to zero.",
+        );
+        let unit_length_gate_sidewall_temp_jct_cap = scale_capacitance(
+            defaults.values.cjswg.value,
+            defaults.values.tcjswg.value,
+            "Temperature effect has caused cjswg to be negative. Cjswg is clamped to zero.",
+        );
 
-        let phi_b = (clamped["pb"] - number("tpb")? * delta_temp).max(0.01);
-        let phi_bsw = (clamped["pbsw"] - number("tpbsw")? * delta_temp).max(0.01);
-        let phi_bswg = (clamped["pbswg"] - number("tpbswg")? * delta_temp).max(0.01);
-        if clamped["pb"] - number("tpb")? * delta_temp < 0.01 {
+        let phi_b = (pb - defaults.values.tpb.value * delta_temp).max(0.01);
+        let phi_bsw = (pbsw - defaults.values.tpbsw.value * delta_temp).max(0.01);
+        let phi_bswg = (pbswg - defaults.values.tpbswg.value * delta_temp).max(0.01);
+        if pb - defaults.values.tpb.value * delta_temp < 0.01 {
             warnings.push(Diagnostic::warning(
                 "Temperature effect has caused pb to be less than 0.01. Pb is clamped to 0.01.",
                 "src/spicelib/devices/bsim3/b3temp.c",
             ));
         }
-        if clamped["pbsw"] - number("tpbsw")? * delta_temp <= 0.01 {
+        if pbsw - defaults.values.tpbsw.value * delta_temp <= 0.01 {
             warnings.push(Diagnostic::warning(
                 "Temperature effect has caused pbsw to be less than 0.01. Pbsw is clamped to 0.01.",
                 "src/spicelib/devices/bsim3/b3temp.c",
             ));
         }
-        if clamped["pbswg"] - number("tpbswg")? * delta_temp <= 0.01 {
+        if pbswg - defaults.values.tpbswg.value * delta_temp <= 0.01 {
             warnings.push(Diagnostic::warning(
                 "Temperature effect has caused pbswg to be less than 0.01. Pbswg is clamped to 0.01.",
                 "src/spicelib/devices/bsim3/b3temp.c",
@@ -208,15 +211,60 @@ impl TemperatureModel {
                     format!("BSIM3 temperature processing produced nonfinite {name}"),
                 ));
             }
-            values.insert(name, value);
         }
-        Ok(Self { values, warnings })
+        Ok(Self {
+            pb,
+            pbsw,
+            pbswg,
+            jct_temp_sat_cur_density,
+            jct_sidewall_temp_sat_cur_density,
+            unit_area_temp_jct_cap,
+            unit_length_sidewall_temp_jct_cap,
+            unit_length_gate_sidewall_temp_jct_cap,
+            vcrit,
+            factor1,
+            vtm,
+            vtm0,
+            ni,
+            eg0,
+            eg,
+            phi_b,
+            phi_bsw,
+            phi_bswg,
+            temp,
+            tnom,
+            warnings,
+        })
     }
 
     /// A processed value by its stable name (a model keyword or an internal
     /// name such as `vcrit`, `phi_b`).
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Real> {
-        self.values.get(name).copied()
+        match name {
+            "pb" => Some(self.pb),
+            "pbsw" => Some(self.pbsw),
+            "pbswg" => Some(self.pbswg),
+            "jct_temp_sat_cur_density" => Some(self.jct_temp_sat_cur_density),
+            "jct_sidewall_temp_sat_cur_density" => Some(self.jct_sidewall_temp_sat_cur_density),
+            "unit_area_temp_jct_cap" => Some(self.unit_area_temp_jct_cap),
+            "unit_length_sidewall_temp_jct_cap" => Some(self.unit_length_sidewall_temp_jct_cap),
+            "unit_length_gate_sidewall_temp_jct_cap" => {
+                Some(self.unit_length_gate_sidewall_temp_jct_cap)
+            }
+            "vcrit" => Some(self.vcrit),
+            "factor1" => Some(self.factor1),
+            "vtm" => Some(self.vtm),
+            "vtm0" => Some(self.vtm0),
+            "ni" => Some(self.ni),
+            "eg0" => Some(self.eg0),
+            "eg" => Some(self.eg),
+            "phi_b" => Some(self.phi_b),
+            "phi_bsw" => Some(self.phi_bsw),
+            "phi_bswg" => Some(self.phi_bswg),
+            "temp" => Some(self.temp),
+            "tnom" => Some(self.tnom),
+            _ => None,
+        }
     }
 }
