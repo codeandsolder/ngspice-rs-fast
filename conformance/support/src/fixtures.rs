@@ -4,6 +4,7 @@
 //! fixtures may have an independently captured platform or input variant. Missing
 //! data is an error at the caller, not permission to fall back to another variant.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -129,6 +130,83 @@ pub fn reference_netlist_path(root: &Path, original: &Path) -> Result<PathBuf, S
     })
 }
 
+/// Input texts for a numerical comparison.
+///
+/// The original Rust text is never replaced by a C-only variant. Ordinary
+/// fixtures and explicit ad-hoc inputs share a single text allocation.
+#[derive(Debug)]
+pub struct DeckInputs<'a> {
+    original: Cow<'a, str>,
+    reference: Option<String>,
+}
+
+impl<'a> DeckInputs<'a> {
+    /// Use the same explicit ad-hoc deck on both sides.
+    #[must_use]
+    pub const fn same(text: &'a str) -> Self {
+        Self {
+            original: Cow::Borrowed(text),
+            reference: None,
+        }
+    }
+
+    /// Text supplied to Rust.
+    #[must_use]
+    pub fn rust(&self) -> &str {
+        &self.original
+    }
+
+    /// Text supplied to the C executable.
+    #[must_use]
+    pub fn reference(&self) -> &str {
+        self.reference.as_deref().unwrap_or(&self.original)
+    }
+
+    /// Derive a test deck from each selected input, applying the same edits
+    /// without replacing the original fixture's decimal spellings.
+    #[must_use]
+    pub fn transformed(&self, edit: impl Fn(&str) -> String) -> DeckInputs<'static> {
+        DeckInputs {
+            original: Cow::Owned(edit(self.rust())),
+            reference: self.reference.as_deref().map(edit),
+        }
+    }
+}
+
+impl DeckInputs<'static> {
+    /// Select a committed fixture by its explicit ID in the current workspace.
+    ///
+    /// # Errors
+    /// Workspace discovery, fixture selection, or selected input reading fails.
+    pub fn fixture(name: &str) -> Result<Self, String> {
+        Self::fixture_at(&workspace_root()?, name)
+    }
+
+    /// Read both inputs for a committed fixture at an explicit workspace root.
+    ///
+    /// # Errors
+    /// Fixture discovery or either selected file cannot be read. In particular,
+    /// a missing C-only variant is an error, never a fallback to the original.
+    pub fn fixture_at(root: &Path, name: &str) -> Result<Self, String> {
+        let original = netlist_paths_at(root, Some(name))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("no fixture named '{name}'"))?;
+        let reference = reference_netlist_path(root, &original)?;
+        let read = |path: &Path| {
+            fs::read_to_string(path).map_err(|error| format!("reading {}: {error}", path.display()))
+        };
+        let original_text = read(&original)?;
+        let reference_text = (original != reference)
+            .then(|| read(&reference))
+            .transpose()?;
+        Ok(Self {
+            original: Cow::Owned(original_text),
+            reference: reference_text,
+        })
+    }
+}
+
 /// The C golden for `name` on the verifier/capture target.
 ///
 /// Capture, drift checks and numerical verification must use the same path.
@@ -252,6 +330,47 @@ mod tests {
             super::reference_netlist_path(root, &original).unwrap(),
             original
         );
+    }
+
+    #[test]
+    fn comparison_inputs_are_selected_explicitly_and_never_fall_back() {
+        use super::{DeckInputs, NETLIST_DIR, REFERENCE_INPUT_DIR};
+        use std::fs;
+
+        let scratch = crate::ngspice::Scratch::new("comparison-inputs").unwrap();
+        let root = scratch.path();
+        let originals = root.join(NETLIST_DIR);
+        let alternates = root.join(REFERENCE_INPUT_DIR);
+        fs::create_dir_all(&originals).unwrap();
+        fs::create_dir_all(&alternates).unwrap();
+        fs::write(originals.join("rc_divider.cir"), "ordinary").unwrap();
+        // An unregistered alternate must not change an ordinary fixture.
+        fs::write(alternates.join("rc_divider.cir"), "unregistered").unwrap();
+        let inputs = DeckInputs::fixture_at(root, "RC_DIVIDER.CIR").unwrap();
+        assert_eq!(inputs.rust(), "ordinary");
+        assert_eq!(inputs.reference(), "ordinary");
+        for name in ["sens_mos3", "sens_mos9", "sens_hfet2"] {
+            let original = originals.join(format!("{name}.cir"));
+            let alternate = alternates.join(format!("{name}.cir"));
+            fs::write(&original, "r1 a b 20u").unwrap();
+            let error = DeckInputs::fixture_at(root, name).unwrap_err();
+            assert!(error.contains(alternate.to_str().unwrap()), "{error}");
+            fs::write(&alternate, "r1 a b 2000e-8").unwrap();
+            let inputs = DeckInputs::fixture_at(root, name).unwrap();
+            assert_eq!(inputs.rust(), "r1 a b 20u");
+            assert_eq!(inputs.reference(), "r1 a b 2000e-8");
+            let edited = inputs.transformed(|deck| format!("{deck}\n.end"));
+            assert_eq!(edited.rust(), "r1 a b 20u\n.end");
+            assert_eq!(edited.reference(), "r1 a b 2000e-8\n.end");
+            fs::remove_file(original).unwrap();
+            assert!(DeckInputs::fixture_at(root, name).is_err());
+        }
+        // The fixture name inside an arbitrary generated deck has no role in
+        // selection, and the two simulators receive exactly the supplied text.
+        let text = "sens_mos3\nr1 a b 20u";
+        let inputs = DeckInputs::same(text);
+        assert_eq!(inputs.rust(), text);
+        assert_eq!(inputs.reference(), text);
     }
 
     #[test]

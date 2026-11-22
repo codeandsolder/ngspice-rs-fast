@@ -20,16 +20,13 @@ fn value(plot: &Plot, name: &str) -> f64 {
     .re
 }
 fn fixture(level: u8, per_device: usize) {
-    let root = ngspice_conformance::fixtures::workspace_root().unwrap();
-    let deck =
-        std::fs::read_to_string(root.join(format!("conformance/netlists/sens_mos{level}.cir")))
-            .unwrap();
-    let golden = RawFile::parse(
-        &std::fs::read_to_string(root.join(format!("conformance/golden/sens_mos{level}.raw")))
-            .unwrap(),
-    )
-    .unwrap();
-    let plot = run(&deck).unwrap();
+    use ngspice_conformance::fixtures::{self, DeckInputs};
+
+    let root = fixtures::workspace_root().unwrap();
+    let name = format!("sens_mos{level}");
+    let inputs = DeckInputs::fixture_at(&root, &name).unwrap();
+    let golden = RawFile::load(fixtures::golden_path(&root, &name)).unwrap();
+    let plot = run(inputs.rust()).unwrap();
     let reference = &golden.plots[0].plot;
     assert_eq!(plot.plotname, reference.plotname);
     // The control `write` used to capture goldens sorts vectors after the
