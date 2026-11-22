@@ -10,28 +10,103 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 
-/// Receives an analysis's points as they are produced, in place of a [`Plot`]
-/// storing them.
+/// Ordered output lifecycle for every plot produced by an analysis.
 ///
-/// C's batch output (`outitf.c`: `OUTpBeginPlot`, then `OUTpData` per point)
-/// writes every point to the rawfile as it is computed and keeps no plot in
-/// memory; [`crate::analysis::AnalysisPlan::run_into`] offers the same, so a long
-/// transient costs memory for one point rather than for the whole run.
+/// A successful plot is announced, receives owned rows in order, then ends.
+/// Errors abort the analysis; no successful end event follows a failed row.
+/// Drivers that intrinsically collect a plot transfer it by value instead.
 pub trait PointSink {
-    /// Called once, before the first point, with the plot's names, flags and
-    /// variables. The header holds no points.
+    /// Announce a point-free header before producing the first row.
     ///
     /// # Errors
-    ///
-    /// Whatever the sink reports; the analysis stops with that error.
+    /// Whatever the consumer reports; the analysis stops with that error.
     fn begin(&mut self, header: &Plot) -> SpiceResult<()>;
 
-    /// One point, one value per variable of the header, in point order.
+    /// One owned row, with one value per variable of the active header.
     ///
     /// # Errors
+    /// Whatever the consumer reports; the analysis stops with that error.
+    fn point(&mut self, values: Vec<Complex>) -> SpiceResult<()>;
+
+    /// Complete the active plot, including when it has no rows.
     ///
-    /// Whatever the sink reports; the analysis stops with that error.
-    fn point(&mut self, values: &[Complex]) -> SpiceResult<()>;
+    /// # Errors
+    /// Whatever the consumer reports; the analysis stops with that error.
+    fn end(&mut self) -> SpiceResult<()>;
+
+    /// Transfer an already materialized plot. Consumers that retain it can
+    /// take its row allocations directly rather than copying or replaying.
+    ///
+    /// # Errors
+    /// As the begin/point/end lifecycle.
+    fn complete(&mut self, mut plot: Plot) -> SpiceResult<()> {
+        let points = plot.take_points();
+        self.begin(&plot)?;
+        for point in points {
+            self.point(point)?;
+        }
+        self.end()
+    }
+}
+
+pub(super) fn lifecycle_error(message: &str) -> SpiceError {
+    SpiceError::Numerical {
+        context: "analysis output".into(),
+        message: message.into(),
+    }
+}
+
+/// Collect only when requested by the caller, never inside a streaming driver.
+#[derive(Default)]
+pub(super) struct PlotCollector {
+    plots: Vec<Plot>,
+    active: Option<Plot>,
+}
+
+impl PlotCollector {
+    pub(super) fn finish(self, expected: usize) -> SpiceResult<Vec<Plot>> {
+        if self.active.is_some() || self.plots.len() != expected {
+            return Err(lifecycle_error(
+                "driver did not complete the planned number of plots",
+            ));
+        }
+        Ok(self.plots)
+    }
+}
+
+impl PointSink for PlotCollector {
+    fn begin(&mut self, header: &Plot) -> SpiceResult<()> {
+        if self.active.is_some() {
+            return Err(lifecycle_error(
+                "began a plot before completing the previous one",
+            ));
+        }
+        self.active = Some(header.header());
+        Ok(())
+    }
+
+    fn point(&mut self, values: Vec<Complex>) -> SpiceResult<()> {
+        self.active
+            .as_mut()
+            .ok_or_else(|| lifecycle_error("point without an active plot"))?
+            .push_point(values)
+    }
+
+    fn end(&mut self) -> SpiceResult<()> {
+        let plot = self
+            .active
+            .take()
+            .ok_or_else(|| lifecycle_error("end without an active plot"))?;
+        self.complete(plot)
+    }
+
+    fn complete(&mut self, plot: Plot) -> SpiceResult<()> {
+        if self.active.is_some() {
+            return Err(lifecycle_error("completed a plot while another is active"));
+        }
+        self.plots.push(plot);
+        Ok(())
+    }
 }
 
 /// Whether a plot's data is real or complex.

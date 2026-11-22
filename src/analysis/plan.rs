@@ -673,7 +673,10 @@ impl AnalysisPlan {
         circuit: &mut crate::devices::Circuit,
         context: &crate::analysis::AnalysisContext,
     ) -> SpiceResult<crate::analysis::Plot> {
-        self.execute(circuit, context, false)?
+        let mut collector = super::results::PlotCollector::default();
+        self.execute(circuit, context, false, &mut collector)?;
+        collector
+            .finish(self.plot_count() - usize::from(self.retains_bias()))?
             .into_iter()
             .next()
             .ok_or_else(|| crate::primitives::SpiceError::Numerical {
@@ -691,7 +694,9 @@ impl AnalysisPlan {
         circuit: &mut crate::devices::Circuit,
         context: &crate::analysis::AnalysisContext,
     ) -> SpiceResult<Vec<crate::analysis::Plot>> {
-        self.execute(circuit, context, self.retains_bias())
+        let mut collector = super::results::PlotCollector::default();
+        self.run_into(circuit, context, &mut collector)?;
+        collector.finish(self.plot_count())
     }
 
     fn execute(
@@ -699,82 +704,66 @@ impl AnalysisPlan {
         circuit: &mut crate::devices::Circuit,
         context: &crate::analysis::AnalysisContext,
         retain_bias: bool,
-    ) -> SpiceResult<Vec<crate::analysis::Plot>> {
+        sink: &mut dyn crate::analysis::PointSink,
+    ) -> SpiceResult<()> {
         use crate::analysis::{ac, disto, linear, noise, pz, sens, sparam, sweep, tf};
-        match &self.analysis {
-            PlanKind::OperatingPoint => Ok(vec![linear::op(circuit, self, context)?]),
+        // Large sweeps emit rows directly. Drivers whose numerical method
+        // still requires a materialized output transfer ownership instead.
+        let plots = match &self.analysis {
+            PlanKind::OperatingPoint => vec![linear::op(circuit, self, context)?],
             PlanKind::Dc {
                 axes,
                 point_iterations,
-            } => Ok(vec![sweep::run(
-                circuit,
-                self,
-                context,
-                axes,
-                *point_iterations,
-            )?]),
+            } => return sweep::run(circuit, self, context, axes, *point_iterations, sink),
             PlanKind::Ac { frequencies, .. } => {
-                ac::run(circuit, self, context, frequencies, retain_bias)
+                return ac::run(circuit, self, context, frequencies, retain_bias, sink);
             }
-            PlanKind::Transient { .. } => Ok(vec![
-                crate::analysis::companion_transient(circuit, self, context)?.0,
-            ]),
-            PlanKind::PoleZero { card, .. } => pz::run(circuit, self, context, card, retain_bias),
-            PlanKind::TransferFunction(card) => Ok(vec![tf::run(circuit, self, context, card)?]),
+            PlanKind::Transient { .. } => {
+                return crate::analysis::companion_transient_into(circuit, self, context, sink)
+                    .map(|_| ());
+            }
+            PlanKind::PoleZero { card, .. } => pz::run(circuit, self, context, card, retain_bias)?,
+            PlanKind::TransferFunction(card) => vec![tf::run(circuit, self, context, card)?],
             PlanKind::SParameter {
                 frequencies,
                 donoise,
                 ..
-            } => sparam::run(circuit, self, context, frequencies, *donoise, retain_bias),
+            } => sparam::run(circuit, self, context, frequencies, *donoise, retain_bias)?,
             PlanKind::Noise {
-                card,
-                frequencies,
-                options,
-                ..
-            } => noise::run(
-                circuit,
-                self,
-                context,
-                card,
-                frequencies,
-                *options,
-                retain_bias,
-            ),
+                card, frequencies, ..
+            } => {
+                return noise::run(circuit, self, context, card, frequencies, retain_bias, sink);
+            }
             PlanKind::Distortion {
                 card, frequencies, ..
-            } => disto::run(circuit, self, context, card, frequencies, retain_bias),
-            PlanKind::Sensitivity { card, frequencies } => Ok(vec![sens::run(
+            } => disto::run(circuit, self, context, card, frequencies, retain_bias)?,
+            PlanKind::Sensitivity { card, frequencies } => vec![sens::run(
                 circuit,
                 self,
                 context,
                 card,
                 frequencies.as_deref(),
-            )?]),
+            )?],
+        };
+        for plot in plots {
+            sink.complete(plot)?;
         }
+        Ok(())
     }
 
-    /// Run the primary analysis, sending accepted points to a sink.
-    /// Transients stream directly; other analyses replay their completed plot.
+    /// Execute all planned outputs in order through a single sink lifecycle.
+    /// Transient, DC, AC and noise spectrum rows are delivered as produced;
+    /// other drivers transfer their completed plots. The sink controls retention.
     ///
     /// # Errors
-    /// As [`Self::run`], or an error from the point sink.
+    /// Circuit binding/elaboration, numerical or sink errors.
     pub fn run_into(
         &self,
         circuit: &mut crate::devices::Circuit,
         context: &crate::analysis::AnalysisContext,
         sink: &mut dyn crate::analysis::PointSink,
-    ) -> SpiceResult<crate::analysis::Plot> {
-        if matches!(self.analysis, PlanKind::Transient { .. }) {
-            return crate::analysis::companion_transient_into(circuit, self, context, sink)
-                .map(|(plot, _)| plot);
-        }
-        let mut plot = self.run(circuit, context)?;
-        let points = plot.take_points();
-        sink.begin(&plot)?;
-        for point in &points {
-            sink.point(point)?;
-        }
-        Ok(plot)
+    ) -> SpiceResult<()> {
+        self.execute(circuit, context, self.retains_bias(), sink)
     }
 }
 

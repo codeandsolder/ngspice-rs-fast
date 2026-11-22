@@ -6,7 +6,7 @@
 //! prepares its operating point exactly as `acan.c` does.
 use crate::analysis::frequency::{Advance, FrequencyGrid};
 use crate::analysis::linear::{number, plot, unsupported};
-use crate::analysis::{AnalysisPlan, Plot};
+use crate::analysis::{AnalysisPlan, Plot, PointSink};
 use crate::devices::Circuit;
 use crate::devices::linear::LinearSystem;
 use crate::maths::Vector;
@@ -19,17 +19,21 @@ pub(super) fn run(
     context: &crate::analysis::AnalysisContext,
     grid: &[Real],
     include_bias: bool,
-) -> SpiceResult<Vec<Plot>> {
+    sink: &mut dyn PointSink,
+) -> SpiceResult<()> {
     let settings = request.dc_settings().clone();
     let mut small_signal = SmallSignal::prepare(circuit, request, context, settings)?;
-    let mut plots = small_signal.retained_bias(circuit, request, context, include_bias)?;
-    let mut plot = plot(
+    for bias in small_signal.retained_bias(circuit, request, context, include_bias)? {
+        sink.complete(bias)?;
+    }
+    let plot = plot(
         circuit,
         "ac1",
         "AC Analysis",
         Some(("frequency", "frequency")),
         true,
     )?;
+    sink.begin(&plot)?;
     // NIacIter on the circuit's own matrix: the first AC solve of the
     // circuit reorders (`SMPcReorder`, starting from the real pivot order),
     // later frequencies refactor (`SMPcLUfac`) and reorder only after a zero
@@ -44,10 +48,10 @@ pub(super) fn run(
         let mut point = vec![Complex::real(f)];
         point.extend(x);
         point.extend(circuit.observe_parameters(&context.model_context().with_frequency(f))?);
-        plot.push_point(point)?;
+        plot.check_point(&point)?;
+        sink.point(point)?;
     }
-    plots.push(plot);
-    Ok(plots)
+    sink.end()
 }
 
 /// Which C frequency loop a grid follows: `acan.c` has a special decade delta

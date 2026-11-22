@@ -1952,7 +1952,15 @@ fn rawfile_without_date(dir: &Path, name: &str, deck: &Path, format: &str) -> Ve
             .position(|byte| *byte == b'\n')
             .unwrap()
         + 1;
-    [&bytes[..date], &bytes[end..]].concat()
+    let stamp = &bytes[date..end];
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut rest = bytes.as_slice();
+    while let Some(index) = rest.windows(stamp.len()).position(|window| window == stamp) {
+        normalized.extend_from_slice(&rest[..index]);
+        rest = &rest[index + stamp.len()..];
+    }
+    normalized.extend_from_slice(rest);
+    normalized
 }
 
 #[test]
@@ -2063,4 +2071,60 @@ fn concurrent_simulations_to_one_destination_publish_complete_runs() {
     }
     assert_eq!(entries(&dir), ["first.cir", "same.raw", "second.cir"]);
     fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn mixed_batch_streaming_and_retention_are_byte_identical() {
+    let dir = scratch("mixed-output-plan");
+    let input = "mixed outputs\nv1 in 0 dc 1 ac 1 pulse(0 1 1m 1u 1u 1m 2m)\nr1 in out 1k\nc1 out 0 1u\n.options keepopinfo\n.ac dec 8 1 1k\n.dc v1 0 1 0.1\n.op\n.tran 0.1m 6m\n.tran 0.1m 4m\n.noise v(out) v1 dec 4 1 1k 3\n.noise v(out) v1 lin 1 1k 1k\n";
+    for flags in ["", ".control\nset sqrnoise\n.endc\n"] {
+        let streamed = dir.join("streamed.cir");
+        fs::write(&streamed, format!("{input}{flags}.end\n")).unwrap();
+        let retained = write_deck(
+            &dir,
+            &format!(
+                "{input}{flags}.print ac all\n.print dc all\n.print noise all\n.measure tran top max v(out)\n.end\n"
+            ),
+        );
+        for format in ["ascii", "binary"] {
+            let actual = rawfile_without_date(&dir, "streamed.raw", &streamed, format);
+            let expected = rawfile_without_date(&dir, "retained.raw", &retained, format);
+            assert_eq!(actual, expected, "{format} {flags}");
+        }
+        let raw = RawFile::load(dir.join("streamed.raw")).unwrap();
+        assert_eq!(raw.len(), 11);
+        assert_eq!(raw.plots[0].plot.plotname, "AC Operating Point");
+        assert_eq!(raw.plots[1].plot.plotname, "AC Analysis");
+        assert_eq!(raw.plots[9].plot.point_count(), 5);
+        assert_eq!(raw.plots[10].plot.point_count(), 1);
+    }
+    assert_eq!(
+        entries(&dir),
+        ["deck.cir", "retained.raw", "streamed.cir", "streamed.raw"]
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn projected_ac_and_dc_streaming_matches_retained_outputs() {
+    let dir = scratch("projected-sweeps");
+    let input = "projected outputs\nv1 in 0 dc 1 ac 1\nr1 in out 1k\nr2 out 0 1k\n.ac dec 10 1 1k\n.dc v1 0 5 0.1\n.save v(out)\n";
+    let streamed = dir.join("streamed.cir");
+    fs::write(&streamed, format!("{input}.end\n")).unwrap();
+    let retained = write_deck(
+        &dir,
+        &format!("{input}.print ac v(out)\n.measure dc hidden max v(in)\n.end\n"),
+    );
+    for format in ["ascii", "binary"] {
+        assert_eq!(
+            rawfile_without_date(&dir, "streamed.raw", &streamed, format),
+            rawfile_without_date(&dir, "retained.raw", &retained, format),
+        );
+    }
+    let raw = RawFile::load(dir.join("streamed.raw")).unwrap();
+    assert_eq!(variable_names(&raw.plots[0].plot), ["frequency", "v(out)"]);
+    assert_eq!(raw.plots[1].plot.variable_count(), 2);
+    let run = simulate(&dir.join("retained.raw"), &retained);
+    assert!(stdout(&run).contains("hidden"), "{}", stdout(&run));
+    fs::remove_dir_all(dir).unwrap();
 }

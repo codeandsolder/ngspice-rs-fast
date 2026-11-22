@@ -436,7 +436,13 @@ pub fn companion_transient(
     request: &AnalysisPlan,
     context: &AnalysisContext,
 ) -> SpiceResult<(Plot, TransientStats)> {
-    companion(circuit, request, context, None)
+    let mut collector = super::results::PlotCollector::default();
+    let stats = companion_transient_into(circuit, request, context, &mut collector)?;
+    let plot = collector
+        .finish(1)?
+        .pop()
+        .ok_or_else(|| super::results::lifecycle_error("transient driver returned no plot"))?;
+    Ok((plot, stats))
 }
 
 /// [`companion_transient`], handing every accepted point to `sink` as it is
@@ -444,8 +450,8 @@ pub fn companion_transient(
 /// `CKTdump`/`OUTpData`.
 ///
 /// `sink` receives the plot header before the initial operating point is
-/// solved and then exactly the rows [`companion_transient`] would store. The
-/// returned plot has the variables but no points.
+/// solved, then exactly the rows [`companion_transient`] would store, followed
+/// by a successful end event. The returned statistics contain no plot data.
 ///
 /// # Errors
 ///
@@ -455,16 +461,7 @@ pub fn companion_transient_into(
     request: &AnalysisPlan,
     context: &AnalysisContext,
     sink: &mut dyn PointSink,
-) -> SpiceResult<(Plot, TransientStats)> {
-    companion(circuit, request, context, Some(sink))
-}
-
-fn companion(
-    circuit: &mut Circuit,
-    request: &AnalysisPlan,
-    context: &AnalysisContext,
-    sink: Option<&mut dyn PointSink>,
-) -> SpiceResult<(Plot, TransientStats)> {
+) -> SpiceResult<TransientStats> {
     let settings = *request
         .transient()
         .ok_or_else(|| unsupported("companion requires a transient plan"))?;
@@ -540,22 +537,20 @@ fn companion(
 }
 
 impl Driver<'_> {
-    fn run(mut self, mut sink: Option<&mut dyn PointSink>) -> SpiceResult<(Plot, TransientStats)> {
+    fn run(mut self, sink: &mut dyn PointSink) -> SpiceResult<TransientStats> {
         let TransientPlan { stop, start, .. } = self.settings;
         // traninit.c: CKTdelmin; dctran.c (XSPICE build): CKTminBreak.
         let min_step = self.settings.min_step();
         let mut breaks = BreakTable::new(stop, 10.0 * min_step);
         let mut sources = SourceBreaks::new(self.system);
-        let mut plot = plot(
+        let plot = plot(
             self.circuit,
             "tran1",
             "Transient Analysis",
             Some(("time", "time")),
             false,
         )?;
-        if let Some(sink) = sink.as_deref_mut() {
-            sink.begin(&plot)?;
-        }
+        sink.begin(&plot)?;
         let mut cursor = StepControl::new(&self.settings);
         let mut x = self.initialize()?;
         // The accepted point's forcing limit and observations.
@@ -612,16 +607,10 @@ impl Driver<'_> {
                         )),
                         None,
                     )?;
-                    push(&mut plot, sink.as_deref_mut(), 0., &x, observed)?;
+                    push(&plot, sink, 0., &x, observed)?;
                 }
             } else if cursor.time >= start {
-                push(
-                    &mut plot,
-                    sink.as_deref_mut(),
-                    cursor.time,
-                    &x,
-                    std::mem::take(&mut observed),
-                )?;
+                push(&plot, sink, cursor.time, &x, std::mem::take(&mut observed))?;
             }
             if almost_equal_ulps(cursor.time, stop, 100) {
                 break;
@@ -629,11 +618,12 @@ impl Driver<'_> {
             cursor.prepare(&self.settings, &mut breaks, self.uic)?;
             (observed, device_breaks) = self.advance(&mut cursor, &mut x)?;
         }
+        sink.end()?;
         // C keeps the final load's instance fields, not values re-evaluated
         // at the final solution (the load can lag that solution by an iterate).
         // Publish only after the entire run and every sink write succeeded.
         self.circuit.record_final_transient_state(&self.history)?;
-        Ok((plot, self.stats))
+        Ok(self.stats)
     }
 
     /// Advance through rejected trials until the next accepted point.
@@ -1098,10 +1088,10 @@ impl Driver<'_> {
     }
 }
 
-/// Stores an accepted point in `plot`, or hands it to `sink` when there is one.
-fn push<'s>(
-    plot: &mut Plot,
-    sink: Option<&mut (dyn PointSink + 's)>,
+/// Deliver an accepted row to the consumer without copying it.
+fn push(
+    header: &Plot,
+    sink: &mut dyn PointSink,
     time: Real,
     x: &Vector,
     observed: Vec<Complex>,
@@ -1109,13 +1099,8 @@ fn push<'s>(
     let mut point = vec![Complex::real(time)];
     point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));
     point.extend(observed);
-    match sink {
-        Some(sink) => {
-            plot.check_point(&point)?;
-            sink.point(&point)
-        }
-        None => plot.push_point(point),
-    }
+    header.check_point(&point)?;
+    sink.point(point)
 }
 
 #[cfg(test)]
