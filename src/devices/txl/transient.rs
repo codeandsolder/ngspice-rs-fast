@@ -2,16 +2,13 @@
 //! Only the newest accepted point needs the recurrence accumulators. The
 //! waveform ring stores integer picosecond coordinates and terminal values;
 //! preparing or rejecting a trial never mutates either accepted state.
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
 
 use std::collections::VecDeque;
 
 use super::Txl;
 use super::pade::{LossyPade, Propagation, Term};
 use crate::devices::delay::{DelayContext, DelayHistory, DelayLine, DelayUpdate};
+use crate::devices::functions::blend_from_anchor;
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 #[cfg(test)]
 mod tests;
@@ -65,8 +62,9 @@ impl TerminalValues {
     }
 
     fn interpolate(self, next: Self, fraction: Real) -> Self {
-        let interpolate =
-            |a: [Real; 2], b: [Real; 2]| std::array::from_fn(|k| a[k] + fraction * (b[k] - a[k]));
+        let interpolate = |a: [Real; 2], b: [Real; 2]| {
+            std::array::from_fn(|k| blend_from_anchor(a[k], b[k], fraction))
+        };
         Self {
             voltage: interpolate(self.voltage, next.voltage),
             current: interpolate(self.current, next.current),
@@ -145,7 +143,8 @@ impl<const N: usize, const R: usize> PropagationState<N, R> {
             for (term, value) in terms.iter().zip(values) {
                 let exp = (term.x * dt).exp();
                 for k in 0..2 {
-                    value[k] = value[k] * exp + half * term.c * (before[k] * exp + after[k]);
+                    value[k] =
+                        (half * term.c).mul_add(before[k].mul_add(exp, after[k]), value[k] * exp);
                     sums[k] += value[k];
                 }
             }
@@ -161,15 +160,14 @@ impl<const N: usize, const R: usize> PropagationState<N, R> {
             ) => {
                 advance_real(terms, real);
                 let exp = (term.pole.re * dt).exp();
-                let exp = Complex::new(
-                    exp * (term.pole.im * dt).cos(),
-                    exp * (term.pole.im * dt).sin(),
-                );
+                let (sin, cos) = (term.pole.im * dt).sin_cos();
+                let exp = Complex::new(exp * cos, exp * sin);
                 let residue = Complex::new(half * term.residue.re, half * term.residue.im);
                 for k in 0..2 {
                     pair[k] = pair[k] * exp
-                        + residue * Complex::new(before[k] * exp.re + after[k], before[k] * exp.im);
-                    sums[k] += 2. * pair[k].re;
+                        + residue
+                            * Complex::new(before[k].mul_add(exp.re, after[k]), before[k] * exp.im);
+                    sums[k] = 2_f64.mul_add(pair[k].re, sums[k]);
                 }
             }
             _ => return Err(error("incompatible TXL recurrence coefficients")),
@@ -246,7 +244,7 @@ impl Convolution {
         for (term, state) in model.h1.iter().zip(&self.h1) {
             let exp = (term.x * dt).exp();
             for k in 0..2 {
-                rhs[k] -= state[k] * exp + 0.5 * dt * term.c * exp * old.voltage[k];
+                rhs[k] -= state[k].mul_add(exp, 0.5 * dt * term.c * exp * old.voltage[k]);
             }
         }
         let h3 = self
@@ -273,12 +271,15 @@ impl Convolution {
         let mut slopes: [Real; 2] =
             std::array::from_fn(|k| (new.voltage[k] - old.voltage[k]) / delta);
         for (term, state) in model.h1.iter().zip(&mut self.h1) {
-            let exp = (term.x * dt).exp();
+            let exponent = term.x * dt;
+            let exp = exponent.exp();
+            let change = exponent.exp_m1();
             let factor = term.c / term.x;
             for k in 0..2 {
                 slopes[k] *= factor;
-                state[k] = (state[k] - slopes[k] * delta) * exp
-                    + (exp - 1.) * (new.voltage[k] * factor + 1e12 * slopes[k] / term.x);
+                let previous = slopes[k].mul_add(-delta, state[k]);
+                let input = new.voltage[k].mul_add(factor, 1e12 * slopes[k] / term.x);
+                state[k] = change.mul_add(input, previous * exp);
             }
         }
         if ratio > 0. {
@@ -439,8 +440,13 @@ impl TxlHistory {
         let Some(right) = self.samples.get(index + 1) else {
             return Ok((left.values, 0.));
         };
-        let fraction = (target - left.tick.ps()) / (right.tick.ps() - left.tick.ps());
-        Ok((left.values.interpolate(right.values, fraction), 0.))
+        let (near, far) = if target <= Real::midpoint(left.tick.ps(), right.tick.ps()) {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        let fraction = (target - near.tick.ps()) / (far.tick.ps() - near.tick.ps());
+        Ok((near.values.interpolate(far.values, fraction), 0.))
     }
 }
 
@@ -469,8 +475,12 @@ impl Txl {
             (None, None) => [0.; 2],
             _ => return Err(error("incompatible TXL accepted state")),
         };
-        rhs[0] += c.atten3 * after.voltage[1] + c.atten2 * after.current[1];
-        rhs[1] += c.atten3 * after.voltage[0] + c.atten2 * after.current[0];
+        rhs[0] += c
+            .atten3
+            .mul_add(after.voltage[1], c.atten2 * after.current[1]);
+        rhs[1] += c
+            .atten3
+            .mul_add(after.voltage[0], c.atten2 * after.current[0]);
         if !convolution.as_ref().is_none_or(Convolution::finite)
             || !rhs.iter().all(|v| v.is_finite())
         {
@@ -500,9 +510,10 @@ impl Txl {
         let (h1c, h2c, h3c) = coefficients.lossy.as_ref().map_or((0., 0., 0.), |model| {
             (model.h1c, model.h2.residue_sum(), model.h3.residue_sum())
         });
-        let admittance = coefficients.admit + 0.5 * dt * h1c;
-        let voltage = trial.ratio * (coefficients.atten3 + 0.5 * dt * h3c);
-        let current = trial.ratio * (coefficients.atten2 + 0.5 * dt * h2c);
+        let half = 0.5 * dt;
+        let admittance = half.mul_add(h1c, coefficients.admit);
+        let voltage = trial.ratio * half.mul_add(h3c, coefficients.atten3);
+        let current = trial.ratio * half.mul_add(h2c, coefficients.atten2);
         let leakage = 0.1 * gmin;
         Ok((
             [

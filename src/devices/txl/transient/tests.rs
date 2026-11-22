@@ -190,7 +190,7 @@ fn wrapped_history_retains_exact_delay_brackets_and_prehistory() {
 }
 
 #[test]
-fn recurrence_conjugate_slots_keep_c_initialization_update_and_sum_order() {
+fn recurrence_conjugate_slots_keep_initialization_update_and_sum_order() {
     use super::super::pade::ComplexTerm;
     let term = Term { c: 0.25, x: -2. };
     let model = Propagation::<3, 1>::Conjugate {
@@ -218,13 +218,16 @@ fn recurrence_conjugate_slots_keep_c_initialization_update_and_sum_order() {
     let residue = Complex::new(0.5 * dt * 0.5, 0.5 * dt * 0.125);
     let pair: [Complex; 2] = std::array::from_fn(|k| {
         old_pair[k] * exp
-            + residue * Complex::new(before[k] * exp.re + after[k], before[k] * exp.im)
+            + residue * Complex::new(before[k].mul_add(exp.re, after[k]), before[k] * exp.im)
     });
     let exp = (-2. * dt).exp();
     let real: [Real; 2] = std::array::from_fn(|k| {
-        dc_term(term, voltage)[k] * exp + 0.5 * dt * term.c * (before[k] * exp + after[k])
+        (0.5 * dt * term.c).mul_add(
+            before[k].mul_add(exp, after[k]),
+            dc_term(term, voltage)[k] * exp,
+        )
     });
-    let expected: [Real; 2] = std::array::from_fn(|k| real[k] + 2. * pair[k].re);
+    let expected: [Real; 2] = std::array::from_fn(|k| 2_f64.mul_add(pair[k].re, real[k]));
     assert_eq!(
         state
             .advance(&model, before, after, dt)
@@ -329,10 +332,9 @@ fn long_history_storage_and_search_comparison() {
 }
 
 #[test]
-fn exact_delayed_tick_uses_the_preceding_c_bracket() {
-    // C loops while next.time < target, then evaluates the interpolation
-    // expression even at fraction 1. A direct return of the right value
-    // is not bit-equivalent when cancellation is significant.
+fn exact_delayed_tick_preserves_the_accepted_sample() {
+    // C evaluates the preceding bracket at fraction 1 and loses the small
+    // stored endpoint. The history must return its exact accepted value.
     let mut left = sample(10);
     left.values.voltage[0] = 1e16;
     let mut right = sample(20);
@@ -342,10 +344,29 @@ fn exact_delayed_tick_uses_the_preceding_c_bracket() {
         state: Some(empty_state()),
     };
     let (value, _) = history.delayed(20., Tick(30), Tick(40)).unwrap();
-    let expected = left.values.voltage[0] + (right.values.voltage[0] - left.values.voltage[0]);
-    assert_eq!(value.voltage[0].to_bits(), expected.to_bits());
-    assert_ne!(
+    assert_eq!(
         value.voltage[0].to_bits(),
         right.values.voltage[0].to_bits()
     );
+}
+
+#[test]
+fn recurrence_retains_small_exponential_increment() {
+    let term = Term { c: 1., x: -1. };
+    let zero = Term { c: 0., x: -1. };
+    let model = LossyPade {
+        h1: [term, zero, zero],
+        h2: Propagation::Real([zero; 3]),
+        h3: Propagation::Real([zero; 6]),
+        h1c: 1.,
+    };
+    let mut convolution = Convolution::initial(&model, [0.; 2]);
+    let constant = TerminalValues {
+        voltage: [1.; 2],
+        current: [0.; 2],
+    };
+    convolution
+        .accept(&model, constant, constant, 1., 1e-20, 0.)
+        .unwrap();
+    assert_eq!(convolution.h1[0], [1e-20; 2]);
 }

@@ -455,7 +455,7 @@ impl Sine {
 
 /// Affine evaluation from an anchor. Use the half difference only when
 /// the ordinary difference of two finite ordinates overflows.
-fn blend_from_anchor(anchor: Real, other: Real, fraction: Real) -> Real {
+pub(super) fn blend_from_anchor(anchor: Real, other: Real, fraction: Real) -> Real {
     if fraction == 0. {
         return anchor;
     }
