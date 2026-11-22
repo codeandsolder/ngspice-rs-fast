@@ -86,9 +86,9 @@ pub(super) fn from_card(card: &RawCard, nodes: &mut NodeTable) -> SpiceResult<Bo
 
 /// Resolve and validate before any node interning. Bounded R/C/L and M4 D/Q/M
 /// factories reject unsupported physics before committing staged nodes.
-/// Every builtin must honor the append-only node contract: intern nodes and
-/// change only the kinds of newly created nodes. Circuit batch elaboration
-/// uses that contract to roll back an entire failed batch.
+/// The append-only capability permits interning nodes and changing only
+/// newly created node kinds. Circuit batch elaboration can roll back the
+/// entire suffix without copying or changing pre-existing nodes.
 pub(super) fn instantiate_with_models(
     instance: &DeviceInstance,
     nodes: &mut NodeAppend<'_>,

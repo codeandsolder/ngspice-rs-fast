@@ -312,6 +312,7 @@ impl NodeTable {
 }
 
 /// Append-only access to a node table during device construction.
+///
 /// A nested transaction treats the outer transaction's nodes as pre-existing.
 /// Only the successful suffix is published; existing identity, order, names
 /// and kinds cannot be mutated through this capability.
