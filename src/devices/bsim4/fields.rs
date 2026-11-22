@@ -12281,10 +12281,6 @@ impl Instance {
         "BSIM4geoMod",
         "BSIM4rgeoMod",
         "BSIM4min",
-        "BSIM4drainSquaresGiven",
-        "BSIM4trnqsModGiven",
-        "BSIM4rbodyModGiven",
-        "BSIM4rgateModGiven",
     ];
     /// Scalar write set derived from the translated routine.
     #[cfg(test)]
