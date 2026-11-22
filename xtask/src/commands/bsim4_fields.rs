@@ -151,7 +151,7 @@ pub(super) fn independent_defaults(
     let header = super::ifparm::strip_comments(header)?;
     let model = members(&header, "typedef struct sBSIM4model\n{", "} BSIM4model")?;
     let mut out = String::from(
-        "\nuse super::fields::Model;\n\n/// Independent given-guarded defaults, extracted from the model-loop body.\n#[rustfmt::skip]\n#[expect(clippy::too_many_lines, reason = \"generated typed field assignments; no handwritten physics\")]\npub(super) fn apply_independent_defaults(m: &mut Model) {\n",
+        "\nuse super::fields::Model;\n\n/// Independent given-guarded defaults, extracted from the model-loop body.\n#[rustfmt::skip]\n#[expect(clippy::too_many_lines, reason = \"generated typed field assignments; no handwritten physics\")]\npub(super) const fn apply_independent_defaults(m: &mut Model) {\n",
     );
     let mut seen = BTreeSet::new();
     let mut prior_members = BTreeSet::new();
@@ -512,7 +512,7 @@ fn item_writes(
     for item in items {
         match item {
             syn::Item::Fn(function) if !test_only(&function.attrs) => {
-                visitor.visit_item_fn(function)
+                visitor.visit_item_fn(function);
             }
             syn::Item::Mod(module) if !test_only(&module.attrs) => {
                 let name = module.ident.to_string();

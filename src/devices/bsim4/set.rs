@@ -168,7 +168,7 @@ fn normalize_model_selectors(m: &mut Model, warnings: &mut Vec<String>) {
 
 /// The remaining expressions depend on polarity, selectors, nominal
 /// temperature or other already initialized model fields. Keep their C order.
-fn apply_dependent_defaults(m: &mut Model, nominal_temperature: f64) {
+const fn apply_dependent_defaults(m: &mut Model, nominal_temperature: f64) {
     electrical_dependent_defaults(m);
     length_dependent_defaults(m);
     width_dependent_defaults(m);
@@ -177,7 +177,7 @@ fn apply_dependent_defaults(m: &mut Model, nominal_temperature: f64) {
     junction_and_noise_defaults(m);
 }
 
-fn electrical_dependent_defaults(m: &mut Model) {
+const fn electrical_dependent_defaults(m: &mut Model) {
     if !m.vddeotGiven {
         m.vddeot = if m.r#type == 1 { 1.5 } else { -1.5 };
     }
@@ -241,7 +241,7 @@ fn electrical_dependent_defaults(m: &mut Model) {
     leakage_defaults(m);
 }
 
-fn leakage_defaults(m: &mut Model) {
+const fn leakage_defaults(m: &mut Model) {
     if !m.agislGiven {
         m.agisl = m.agidl;
     }
@@ -328,7 +328,7 @@ fn leakage_defaults(m: &mut Model) {
     }
 }
 
-fn length_dependent_defaults(m: &mut Model) {
+const fn length_dependent_defaults(m: &mut Model) {
     if !m.lketacGiven {
         m.lketac = m.lketa;
     }
@@ -397,7 +397,7 @@ fn length_dependent_defaults(m: &mut Model) {
     }
 }
 
-fn width_dependent_defaults(m: &mut Model) {
+const fn width_dependent_defaults(m: &mut Model) {
     if !m.wketacGiven {
         m.wketac = m.wketa;
     }
@@ -466,7 +466,7 @@ fn width_dependent_defaults(m: &mut Model) {
     }
 }
 
-fn cross_dependent_defaults(m: &mut Model) {
+const fn cross_dependent_defaults(m: &mut Model) {
     if !m.pketacGiven {
         m.pketac = m.pketa;
     }
@@ -535,7 +535,7 @@ fn cross_dependent_defaults(m: &mut Model) {
     }
 }
 
-fn geometry_defaults(m: &mut Model, nominal_temperature: f64) {
+const fn geometry_defaults(m: &mut Model, nominal_temperature: f64) {
     if !m.tnomGiven {
         m.tnom = nominal_temperature;
     }
@@ -578,7 +578,7 @@ fn geometry_defaults(m: &mut Model, nominal_temperature: f64) {
     }
 }
 
-fn junction_and_noise_defaults(m: &mut Model) {
+const fn junction_and_noise_defaults(m: &mut Model) {
     if !m.DunitAreaJctCapGiven {
         m.DunitAreaJctCap = m.SunitAreaJctCap;
     }
@@ -633,7 +633,7 @@ fn junction_and_noise_defaults(m: &mut Model) {
     tunnelling_and_noise_defaults(m);
 }
 
-fn tunnelling_and_noise_defaults(m: &mut Model) {
+const fn tunnelling_and_noise_defaults(m: &mut Model) {
     if !m.jtsdGiven {
         m.jtsd = m.jtss;
     }
@@ -733,7 +733,7 @@ fn setup_instance(
     apply_topology(h, plan)
 }
 
-fn instance_defaults(m: &Model, h: &mut Instance) {
+const fn instance_defaults(m: &Model, h: &mut Instance) {
     if !h.lGiven {
         h.l = 5.0e-6;
     }
@@ -836,7 +836,7 @@ fn normalize_instance_selectors(m: &Model, h: &mut Instance, warnings: &mut Vec<
     }
 }
 
-fn layout_defaults(m: &Model, h: &mut Instance) {
+const fn layout_defaults(m: &Model, h: &mut Instance) {
     // Stress effect.
     if !h.saGiven {
         h.sa = 0.0;
@@ -862,12 +862,14 @@ fn layout_defaults(m: &Model, h: &mut Instance) {
     }
 }
 
+#[derive(Clone, Copy)]
 enum GateNodes {
     External,
     Prime,
     PrimeAndMid,
 }
 
+#[derive(Clone, Copy)]
 struct TopologyPlan {
     series: [bool; 2],
     gate: GateNodes,
@@ -957,11 +959,11 @@ fn apply_topology(h: &mut Instance, plan: TopologyPlan) -> Vec<(i32, &'static st
     } else {
         h.sNodePrime = h.sNode;
     }
-    if !matches!(plan.gate, GateNodes::External) {
+    if matches!(plan.gate, GateNodes::External) {
+        h.gNodePrime = h.gNodeExt;
+    } else {
         h.gNodePrime = node::GP;
         created.push((node::GP, "gate"));
-    } else {
-        h.gNodePrime = h.gNodeExt;
     }
 
     if matches!(plan.gate, GateNodes::PrimeAndMid) {

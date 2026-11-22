@@ -789,7 +789,7 @@ use super::fields::Model;
 /// Independent given-guarded defaults, extracted from the model-loop body.
 #[rustfmt::skip]
 #[expect(clippy::too_many_lines, reason = "generated typed field assignments; no handwritten physics")]
-pub(super) fn apply_independent_defaults(m: &mut Model) {
+pub(super) const fn apply_independent_defaults(m: &mut Model) {
     if !m.binUnitGiven { m.binUnit = 1; }
     if !m.paramChkGiven { m.paramChk = 1; }
     if !m.cvchargeModGiven { m.cvchargeMod = 0; }
