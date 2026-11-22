@@ -303,3 +303,32 @@ existing goldens and bounds remain unchanged.
 NGSPICE_BIN=/absolute/path/to/ngspice cargo test -p ngspice-rs \
   --test c_dc_sweep_reference --locked -- --ignored
 ```
+
+## Run-owned effective devices
+
+A finalized circuit lends an immutable topology to `Circuit::prepare_run`.
+The resulting `PreparedRun` retains only the latest successfully prepared
+`ModelContext`, whose identity includes the exact binary64 representation of
+each numerical setting and each ordered override slot, target identity and
+parameter. It validates the ordered setters once per context transition,
+checks that replacement devices preserve finalized topology, and indexes
+replacements by their ordinals. Failed context transitions do not replace a
+valid preparation. A topology edit requires ending the immutable borrow;
+foreign or stale override identities are rejected on a subsequent run.
+
+The DC sweep driver binds the source and instance setters at each point
+and uses the same scope for preflight, warm-start Newton, fallback
+continuation and real observation. Different continuation settings are
+different contexts, not an excuse to reuse a replacement derived for a
+different junction conductance or source scale. The transient driver retains
+a scope across timepoints and rejected trials. Newton convergence uses the
+same effective devices that stamped its matrices; it does not fall back to
+the unswept originals. Coupled-inductor terms are lazily prepared once for
+the effective context. Spectral preparation shares the scope between bias,
+small-signal state/assembly and observations (including noise generators).
+
+The scope contains immutable effective device recipes and derived caches,
+not trial vectors, time histories, Newton workspaces or accepted state.
+Independent runs and sensitivity perturbations do not share a live
+replacement scope. The public one-shot load and observation methods remain
+useful for isolated probes; repeated callers should use a prepared run.
