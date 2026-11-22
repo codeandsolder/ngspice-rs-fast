@@ -887,10 +887,10 @@ impl SparseLu {
         solve_real(&self.symbolic.sparse, self.symbolic.n, rhs, workspace, true)
     }
 
-    /// `spDeterminant`: `(mantissa, decimal exponent)`.
+    /// Binary-scaled determinant: `(mantissa, base-2 exponent)`.
     /// # Errors
     /// Non-finite/invalid inverse factors or an out-of-range exponent.
-    pub fn determinant(&self) -> SpiceResult<(f64, i32)> {
+    pub fn determinant(&self) -> SpiceResult<(f64, i64)> {
         self.symbolic.sparse.factors()?.determinant()
     }
 }

@@ -159,6 +159,7 @@ impl Sub for Complex {
 impl Mul for Complex {
     type Output = Self;
 
+    #[inline]
     fn mul(self, rhs: Self) -> Self {
         Self::new(
             product_sum(self.re, rhs.re, -self.im, rhs.im),
@@ -170,6 +171,7 @@ impl Mul for Complex {
 impl Div for Complex {
     type Output = Self;
 
+    #[inline]
     fn div(self, rhs: Self) -> Self {
         let cc = rhs.re * rhs.re;
         let dd = rhs.im * rhs.im;
@@ -185,10 +187,14 @@ impl Div for Complex {
         // materializing either could erase a representable quotient component.
         if (!denominator.is_normal()
             || !result.is_finite()
-            || lost_product(ac, self.re, rhs.re)
-            || lost_product(bd, self.im, rhs.im)
-            || lost_product(bc, self.im, rhs.re)
-            || lost_product(ad, self.re, rhs.im))
+            || (!real.is_normal()
+                && (lost_product(ac, self.re, rhs.re)
+                    || lost_product(bd, self.im, rhs.im)
+                    || quotient_numerator_lost_range(real, ac, bd)))
+            || (!imag.is_normal()
+                && (lost_product(bc, self.im, rhs.re)
+                    || lost_product(ad, self.re, rhs.im)
+                    || quotient_numerator_lost_range(imag, bc, ad))))
             && self.is_finite()
             && rhs.is_finite()
             && rhs != Self::ZERO
@@ -202,30 +208,56 @@ impl Div for Complex {
 /// Recover the rounding residual in a cancellation-prone sum of two
 /// products. The IEEE sum is sufficient for well-conditioned sums; avoid
 /// software FMA calls on generic targets for these common cases.
-fn compensated_sum(a: Real, b: Real, c: Real, d: Real, p: Real, q: Real) -> Real {
-    let sum = p + q;
-    if p.is_normal() && q.is_normal() && sum.abs() <= 0.5 * p.abs().max(q.abs()) {
-        a.mul_add(b, q) + c.mul_add(d, -q)
+#[inline]
+fn compensated_sum(a: Real, b: Real, c: Real, d: Real, first: Real, second: Real) -> Real {
+    let sum = first + second;
+    if sum.abs() <= 0.5 * first.abs().max(second.abs()) && first.is_normal() && second.is_normal() {
+        a.mul_add(b, second) + c.mul_add(d, -second)
     } else {
         sum
     }
 }
 
+#[inline]
 fn product_sum(a: Real, b: Real, c: Real, d: Real) -> Real {
-    let p = a * b;
-    let q = c * d;
-    let sum = compensated_sum(a, b, c, d, p, q);
-    if (!sum.is_finite() || lost_product(p, a, b) || lost_product(q, c, d))
-        && [a, b, c, d].into_iter().all(Real::is_finite)
-    {
-        let scaled = ScaledProduct::product(a, b).add(ScaledProduct::product(c, d));
-        return scale_power(scaled.mantissa, scaled.exponent);
+    let first = a * b;
+    let second = c * d;
+    let sum = first + second;
+    // A normal sum of rounded products cannot conceal an overflowing
+    // intermediate. A subnormal product can affect a normal sum by at
+    // most one ulp; reserve exponent recovery for the result near a
+    // representability boundary, where a component could disappear.
+    if sum.is_normal() {
+        return compensated_sum(a, b, c, d, first, second);
     }
-    sum
+    if !sum.is_finite() || lost_product(first, a, b) || lost_product(second, c, d) {
+        return exceptional_product_sum(a, b, c, d, sum);
+    }
+    compensated_sum(a, b, c, d, first, second)
 }
 
+#[cold]
+fn exceptional_product_sum(a: Real, b: Real, c: Real, d: Real, sum: Real) -> Real {
+    if [a, b, c, d].into_iter().all(Real::is_finite) {
+        let scaled = ScaledProduct::product(a, b).add(ScaledProduct::product(c, d));
+        scale_power(scaled.mantissa, scaled.exponent)
+    } else {
+        sum
+    }
+}
+
+#[inline]
 fn lost_product(product: Real, a: Real, b: Real) -> bool {
     !product.is_normal() && a != 0.0 && b != 0.0
+}
+
+/// A cancellation residual below the normal range must not be rounded
+/// before division by a potentially tiny denominator.
+fn quotient_numerator_lost_range(sum: Real, first: Real, second: Real) -> bool {
+    !sum.is_normal()
+        && first != 0.0
+        && second != 0.0
+        && first.abs().max(second.abs()) < Real::from_bits(54_u64 << 52)
 }
 
 /// A number represented outside the native binary64 exponent range.
@@ -653,11 +685,9 @@ mod tests {
     fn complex_division_handles_normal_and_extreme_components() {
         let a = Complex::new(1.23456789, -9.87654321);
         let b = Complex::new(-0.371, 2.415);
-        let d = b.re * b.re + b.im * b.im;
-        let expected = Complex::new(
-            (a.re * b.re + a.im * b.im) / d,
-            (a.im * b.re - a.re * b.im) / d,
-        );
+        // Correct rounding of the exact rational quotient of the binary64
+        // input values (not the original cancellation-prone calculation).
+        let expected = Complex::new(-4.072_097_521_006_333_5, 0.114_360_368_651_490_67);
         let actual = a / b;
         assert!(almost_equal_ulps(actual.re, expected.re, 2));
         assert!(almost_equal_ulps(actual.im, expected.im, 2));

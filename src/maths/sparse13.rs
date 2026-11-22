@@ -39,8 +39,6 @@
 //! one; and `SearchForSingleton` stops on a structurally missing diagonal,
 //! which is where ngspice's version either breaks or dereferences `NULL`.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::float_cmp,
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
@@ -48,10 +46,6 @@
 #![expect(
     clippy::while_float,
     reason = "the C iterative floating-point loop must preserve its original termination and rounding order"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use super::linear::numerical;
@@ -2613,96 +2607,49 @@ impl<T: Scalar> FactorView<'_, T> {
         self.frame.scatter_solution(rhs, workspace, transposed, out)
     }
 
-    /// `spDeterminant`: normalized decimal mantissa and exponent.
-    /// Preserve C's multiplication/division and
-    /// decimal scaling on every representable intermediate. If an individual
-    /// step would overflow or underflow, normalize its inverse pivot first.
-    pub(super) fn determinant(&self) -> SpiceResult<(T, i32)>
+    /// Binary-scaled determinant, with `1 <= max(|component|) < 2`.
+    /// Normalize each inverse pivot before dividing and renormalize the
+    /// product after every step. Binary shifts do not perturb the mantissa
+    /// as decimal scaling followed by logarithmic base conversion does.
+    pub(super) fn determinant(&self) -> SpiceResult<(T, i64)>
     where
         T: DeterminantScale,
     {
-        use crate::maths::linear::numerical;
         let mut exponent = 0_i64;
         let mut det = T::one();
         for i in 1..=self.frame.size {
             let inverse = self.frame.values[self.frame.topology.diag[i]];
-            if !inverse.is_finite() || inverse.is_zero() {
-                return Err(numerical(
-                    "SPARSE determinant",
-                    "non-finite or zero inverse pivot",
-                ));
-            }
-            let mut next = T::det_step(det, inverse);
-            if !next.is_finite() || next.is_zero() || next.norm().is_subnormal() {
-                let mut shift = 0;
-                let normalized = normalize_decimal(inverse, &mut shift, DecimalScale::Coarse);
-                next = T::det_step(det, normalized);
-                exponent -= shift;
-                if !next.is_finite() || next.is_zero() {
-                    return Err(numerical(
-                        "SPARSE determinant",
-                        "unrepresentable determinant step",
-                    ));
-                }
-            }
-            det = normalize_decimal(next, &mut exponent, DecimalScale::Coarse);
+            let (inverse, shift) = normalize_binary(inverse)?;
+            exponent -= i64::from(shift);
+            let (next, shift) = normalize_binary(T::det_step(det, inverse))?;
+            exponent += i64::from(shift);
+            det = next;
         }
-        det = normalize_decimal(det, &mut exponent, DecimalScale::Final);
         if self.frame.parity == PermutationParity::Odd {
-            det = det.scale(-1.0);
+            det = -det;
         }
-        let exponent = i32::try_from(exponent)
-            .map_err(|_| numerical("SPARSE determinant", "decimal exponent out of range"))?;
         Ok((det, exponent))
     }
 }
 
-/// Decimal normalization stages in C's spDeterminant. The constants and
-/// order of multiplications are intentional: replacing them with logarithms,
-/// powi, or a reciprocal changes rounding on ordinary matrices.
-#[derive(Clone, Copy)]
-enum DecimalScale {
-    Coarse,
-    Final,
-}
-
-fn normalize_decimal<T: DeterminantScale>(
-    mut value: T,
-    exponent: &mut i64,
-    scale: DecimalScale,
-) -> T {
-    debug_assert!(value.is_finite());
-    let (low, high, up, down, step) = match scale {
-        DecimalScale::Coarse => (1.0e-12, 1.0e12, 1.0e12, 1.0e-12, 12),
-        DecimalScale::Final => (1.0, 10.0, 10.0, 0.1, 1),
-    };
-    let mut norm = value.norm();
-    if norm != 0.0 {
-        while norm >= high {
-            value = value.scale(down);
-            *exponent += step;
-            norm = value.norm();
-        }
-        while norm < low {
-            value = value.scale(up);
-            *exponent -= step;
-            norm = value.norm();
-        }
+fn normalize_binary<T: DeterminantScale>(value: T) -> SpiceResult<(T, i32)> {
+    if !value.is_finite() {
+        return Err(numerical(
+            "SPARSE determinant",
+            "non-finite determinant factor",
+        ));
     }
-    value
+    let exponent = crate::primitives::numeric::binary_exponent(value.norm())
+        .ok_or_else(|| numerical("SPARSE determinant", "zero determinant factor"))?;
+    Ok((value.scale_power(-exponent), exponent))
 }
 
-/// Scalar operations used only by [`Sparse::determinant`].
-pub(super) trait DeterminantScale: Scalar {
-    /// One.
+/// Scalar operations used only by the checked determinant accumulation.
+pub(super) trait DeterminantScale: Scalar + std::ops::Neg<Output = Self> {
     fn one() -> Self;
-    /// C's per-pivot update: real `det /= diag` (diag holds `1/pivot`), complex
-    /// `det *= CMPLX_RECIPROCAL(diag)`.
     fn det_step(det: Self, inverse_pivot: Self) -> Self;
-    /// `NORM`: `max(|re|, |im|)` (real: `|x|`).
     fn norm(self) -> f64;
-    /// Multiply by a real factor.
-    fn scale(self, factor: f64) -> Self;
+    fn scale_power(self, exponent: i32) -> Self;
 }
 
 impl DeterminantScale for f64 {
@@ -2715,8 +2662,8 @@ impl DeterminantScale for f64 {
     fn norm(self) -> f64 {
         self.abs()
     }
-    fn scale(self, factor: f64) -> Self {
-        self * factor
+    fn scale_power(self, exponent: i32) -> Self {
+        crate::primitives::numeric::scale_power(self, exponent)
     }
 }
 
@@ -2725,14 +2672,17 @@ impl DeterminantScale for Complex {
         Self::real(1.0)
     }
     fn det_step(det: Self, inverse_pivot: Self) -> Self {
-        // CMPLX_MULT_ASSIGN(det, reciprocal).
-        det.mul(inverse_pivot.recip())
+        det / inverse_pivot
     }
     fn norm(self) -> f64 {
         self.re.abs().max(self.im.abs())
     }
-    fn scale(self, factor: f64) -> Self {
-        Self::new(self.re * factor, self.im * factor)
+    fn scale_power(self, exponent: i32) -> Self {
+        use crate::primitives::numeric::scale_power;
+        Self::new(
+            scale_power(self.re, exponent),
+            scale_power(self.im, exponent),
+        )
     }
 }
 
@@ -3035,11 +2985,14 @@ mod tests {
 
     #[test]
     fn determinant_rescales_extreme_pivots_without_nonfinite_loops() {
-        for (a, b, expected) in [(1e307, 1e308, 615), (1e-307, 1e-308, -615)] {
+        for (a, b) in [(1e307, 1e308), (1e-307, 1e-308)] {
             let mut m = build(2, &[(1, 1, a), (2, 2, b)]);
             assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
             let (mantissa, exponent) = m.factors().unwrap().determinant().unwrap();
-            assert!((mantissa * 10_f64.powi(exponent - expected) - 1.).abs() < 1e-12);
+            let (am, ae) = normalize_binary(a).unwrap();
+            let (bm, be) = normalize_binary(b).unwrap();
+            let shift = i32::try_from(exponent - i64::from(ae + be)).unwrap();
+            assert!((mantissa * 2_f64.powi(shift) / (am * bm) - 1.).abs() < 1e-14);
         }
         let mut m = build(1, &[(1, 1, f64::from_bits(1))]);
         assert_eq!(m.order_and_factor(1e-3, 0.), Status::NonFinite);
@@ -3056,9 +3009,11 @@ mod tests {
         }
         assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
         let (mantissa, exponent) = m.factors().unwrap().determinant().unwrap();
-        let imag = mantissa.im * 10_f64.powi(exponent - 614);
-        assert!((imag - 2.).abs() < 1e-12);
-        assert!((mantissa.re * 10_f64.powi(exponent - 614)).abs() < 1e-12);
+        let (m, e) = normalize_binary(1e307).unwrap();
+        let shift = i32::try_from(exponent - 2 * i64::from(e)).unwrap();
+        let imag = mantissa.im * 2_f64.powi(shift);
+        assert!((imag / (m * m) - 2.).abs() < 1e-14);
+        assert!(mantissa.re.abs() < 1e-14);
     }
 
     #[test]
@@ -3638,7 +3593,7 @@ mod tests {
         assert!((2.0 * x[0] + x[2] - 3.0).abs() < 1e-15 && (x[0] + 4.0 * x[2] - 5.0).abs() < 1e-15);
         assert_eq!(m.solve_transposed(&[3.0, -1.0, 5.0])[1], -1.0);
         let (mantissa, exponent) = m.factors().unwrap().determinant().unwrap();
-        assert!((mantissa * 10f64.powi(exponent) - 7.0).abs() < 1e-12);
+        assert!((mantissa * 2f64.powi(i32::try_from(exponent).unwrap()) - 7.0).abs() < 1e-12);
     }
 
     /// No element passes the absolute threshold, so `SearchEntireMatrix`
@@ -3661,7 +3616,7 @@ mod tests {
         let mut m = build(2, &[(1, 1, 3.0), (1, 2, 1.0), (2, 1, 2.0), (2, 2, 4.0)]);
         assert_eq!(m.order_and_factor(1e-3, 0.0), Status::Okay);
         let (mantissa, exponent) = m.factors().unwrap().determinant().unwrap();
-        assert!((mantissa * 10f64.powi(exponent) - 10.0).abs() < 1e-12);
+        assert!((mantissa * 2f64.powi(i32::try_from(exponent).unwrap()) - 10.0).abs() < 1e-12);
     }
 
     #[test]
