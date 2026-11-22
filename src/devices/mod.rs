@@ -119,8 +119,8 @@ pub use state::{
     ACCEPTED_DEPTH, DeviceState, IterationPhase, StateHistory, StateSnapshot, TrialState,
 };
 pub use sweep::{
-    InstanceOverride, MAX_INSTANCE_OVERRIDES, MAX_RESISTOR_OVERRIDES, ResistorMetadata,
-    ResistorOrigin, ResistorOverride,
+    InstanceOverride, InstanceTarget, MAX_INSTANCE_OVERRIDES, MAX_RESISTOR_OVERRIDES,
+    ResistorMetadata, ResistorOrigin, ResistorOverride,
 };
 pub use switch::{Switch, SwitchKind, SwitchState};
 pub use traits::{

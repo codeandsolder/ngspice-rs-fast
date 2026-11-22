@@ -33,7 +33,7 @@ use crate::devices::mutual::{CouplingSite, MutualLimits, pair_count};
 use crate::devices::state::{
     DeviceState, HistoryPublication, StateHistory, StateSnapshot, TrialState,
 };
-use crate::devices::sweep::{InstanceOverride, ResistorMetadata, ResistorOverride};
+use crate::devices::sweep::{InstanceOverride, InstanceTarget, ResistorMetadata, ResistorOverride};
 use crate::devices::traits::{
     AcceptContext, AnalysisMode, Device, InductanceValue, MnaUnknowns, MutualTerm, StampContext,
     StampRhs,
@@ -2119,21 +2119,38 @@ impl Circuit {
         Ok(target)
     }
 
-    /// Bind a typed target without constructing a throwaway device. The
-    /// ordered point preparation validates the value at its actual context.
+    /// Bind the device's canonical numeric setter to this finalized topology.
+    /// No trial value or throwaway device construction is needed.
+    ///
+    /// # Errors
+    /// Unfinalized topology, unknown device or unsupported parameter.
+    pub fn bind_instance_target(&self, name: &str, keyword: &str) -> SpiceResult<InstanceTarget> {
+        let (index, parameter) = self.instance_parameter(name, keyword)?;
+        Ok(InstanceTarget::new(self.topology_id()?, index, parameter))
+    }
+
+    /// Bind a resistor's supplied (not effective) resistance via its metadata.
+    ///
+    /// # Errors
+    /// Unfinalized topology or target is not a resistor.
+    pub fn bind_resistor_target(&self, name: &str) -> SpiceResult<InstanceTarget> {
+        let (index, _) = self
+            .resistor(name)
+            .ok_or_else(|| SpiceError::circuit(format!("{name} is not a resistor")))?;
+        Ok(InstanceTarget::new(
+            self.topology_id()?,
+            index,
+            "resistance",
+        ))
+    }
+
     pub(crate) fn bind_instance_override(
         &self,
         name: &str,
         keyword: &str,
         value: Real,
     ) -> SpiceResult<InstanceOverride> {
-        let (index, parameter) = self.instance_parameter(name, keyword)?;
-        Ok(InstanceOverride::new(
-            self.topology_id()?,
-            index,
-            parameter,
-            value,
-        ))
+        self.bind_instance_target(name, keyword)?.at(value)
     }
 
     /// A DC value override of the independent V or I source `name`, as
@@ -2153,24 +2170,26 @@ impl Circuit {
         Ok(target)
     }
 
-    pub(crate) fn bind_source_override(
-        &self,
-        name: &str,
-        value: Real,
-    ) -> SpiceResult<InstanceOverride> {
+    /// Bind an independent V/I source's DC setter without a trial value.
+    ///
+    /// # Errors
+    /// Unfinalized topology, unknown name or non-source device.
+    pub fn bind_source_target(&self, name: &str) -> SpiceResult<InstanceTarget> {
         let index = self
             .devices
             .iter()
             .position(|d| d.name().eq_ignore_ascii_case(name))
             .filter(|&i| matches!(self.devices[i].designator().to_ascii_lowercase(), 'v' | 'i'))
-            .filter(|_| value.is_finite())
             .ok_or_else(|| SpiceError::circuit("invalid or unknown DC source override"))?;
-        Ok(InstanceOverride::new(
-            self.topology_id()?,
-            index,
-            "dc",
-            value,
-        ))
+        Ok(InstanceTarget::new(self.topology_id()?, index, "dc"))
+    }
+
+    pub(crate) fn bind_source_override(
+        &self,
+        name: &str,
+        value: Real,
+    ) -> SpiceResult<InstanceOverride> {
+        self.bind_source_target(name)?.at(value)
     }
 
     /// The Newton load of the single device at ordinal `index`, with `device`
