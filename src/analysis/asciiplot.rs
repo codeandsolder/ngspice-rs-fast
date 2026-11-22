@@ -29,22 +29,25 @@ pub fn render(plot: &Plot) -> SpiceResult<String> {
         feature: format!(".plot: {message}"),
         location: None,
     };
-    if plot.variables().len() < 2 || plot.points().is_empty() {
+    if plot.variables().len() < 2 || plot.point_count() == 0 {
         return Err(invalid("needs a scale and at least one dependent vector"));
     }
     if plot
-        .points()
-        .iter()
+        .rows()
         .any(|row| row.len() != plot.variables().len() || row.iter().any(|v| !v.is_finite()))
     {
         return Err(invalid("inconsistent or nonfinite plot values"));
     }
-    if plot.points().windows(2).any(|p| p[1][0].re < p[0][0].re) {
+    if plot
+        .rows()
+        .zip(plot.rows().skip(1))
+        .any(|(left, right)| right[0].re < left[0].re)
+    {
         return Err(invalid("scale must be nondecreasing"));
     }
     let mut low = f64::INFINITY;
     let mut high = f64::NEG_INFINITY;
-    for row in plot.points() {
+    for row in plot.rows() {
         for value in &row[1..] {
             low = low.min(value.re);
             high = high.max(value.re);
@@ -73,7 +76,7 @@ pub fn render(plot: &Plot) -> SpiceResult<String> {
         "\n{}     {low:.3e} .. {high:.3e}",
         plot.variables()[0].name
     );
-    for row in plot.points() {
+    for row in plot.rows() {
         let mut field = [b' '; LAST_COLUMN as usize + 1];
         for i in (0..=usize::from(LAST_COLUMN)).step_by(15) {
             field[i] = b'.';
@@ -110,10 +113,10 @@ mod tests {
         plot.push_variable(Variable::new("time", "time"));
         plot.push_variable(Variable::new("v(out)", "voltage"));
         let mut plot = plot.build();
-        plot.push_point(vec![Complex::real(0.), Complex::real(1.)])
+        plot.push_point(&[Complex::real(0.), Complex::real(1.)])
             .unwrap();
-        assert!(plot.push_point(Vec::new()).is_err());
-        plot.push_point(vec![Complex::real(f64::NAN), Complex::ZERO])
+        assert!(plot.push_point(&[]).is_err());
+        plot.push_point(&[Complex::real(f64::NAN), Complex::ZERO])
             .unwrap();
         let error = render(&plot).expect_err("inconsistent row");
         assert!(error.to_string().contains("inconsistent or nonfinite"));

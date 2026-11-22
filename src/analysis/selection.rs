@@ -262,10 +262,16 @@ impl Selection {
         if self.full {
             return Ok(plot.clone());
         }
+        self.project(plot)
+    }
+
+    fn project(&self, plot: &Plot) -> SpiceResult<Plot> {
         let mut selected = self.header(plot)?;
-        selected.reserve_points(plot.points().len());
-        for point in plot.points() {
-            selected.push_point(self.project_row(point)?)?;
+        selected.reserve_points(plot.point_count())?;
+        let mut row = self.row_buffer()?;
+        for point in plot.rows() {
+            self.fill_row(point, &mut row)?;
+            selected.push_point(&row)?;
         }
         Ok(selected)
     }
@@ -285,29 +291,36 @@ impl Selection {
     ///
     /// # Errors
     /// Schema mismatch or a nonfinite computed result.
-    pub fn into_plot(self, mut plot: Plot) -> SpiceResult<Plot> {
+    pub fn into_plot(self, plot: Plot) -> SpiceResult<Plot> {
         self.check_schema(&plot)?;
         if self.full {
             return Ok(plot);
         }
-        // Consume source rows one at a time; a narrowed result need not keep
-        // all the original row allocations alive until projection finishes.
-        let points = plot
-            .take_points()
-            .into_iter()
-            .map(|point| self.project_row(&point))
-            .collect::<SpiceResult<Vec<_>>>()?;
-        let variables = self
-            .columns
-            .into_iter()
-            .map(|column| Variable {
-                name: column.name,
-                unit: column.unit,
-                is_real: column.is_real,
-            })
-            .collect();
-        let flags = plot.flags();
-        Plot::new(plot.name, plot.plotname, flags, variables).with_points(points)
+        let header = self.header(&plot)?;
+        let count = plot.point_count();
+        let source_width = plot.variable_count();
+        let width = header.variable_count();
+        let cell_count = header.cell_count(count)?;
+        if width > source_width {
+            return self.project(&plot);
+        }
+        // Read the entire source row into scratch before overwriting its
+        // first cell. With a non-expanding projection, the output prefix
+        // never crosses the next unread source row, regardless of column
+        // order, differential operands or duplicate requests.
+        let mut scratch = self.row_buffer()?;
+        let mut cells = plot.into_cells();
+        for index in 0..count {
+            let start = index * source_width;
+            self.fill_row(&cells[start..start + source_width], &mut scratch)?;
+            let destination = index * width;
+            cells[destination..destination + width].copy_from_slice(&scratch);
+        }
+        cells.truncate(cell_count);
+        if width < source_width {
+            cells.shrink_to_fit();
+        }
+        header.with_cells(count, cells)
     }
 
     /// The selected header, after verifying the original ordered schema.
@@ -351,12 +364,26 @@ impl Selection {
         }
     }
 
-    fn project_row(&self, point: &[Complex]) -> SpiceResult<Vec<Complex>> {
+    fn row_buffer(&self) -> SpiceResult<Vec<Complex>> {
+        let mut buffer = Vec::new();
+        if !self.full {
+            buffer
+                .try_reserve_exact(self.columns.len())
+                .map_err(|error| SpiceError::Numerical {
+                    context: "selection row".into(),
+                    message: error.to_string(),
+                })?;
+        }
+        Ok(buffer)
+    }
+
+    fn fill_row(&self, point: &[Complex], buffer: &mut Vec<Complex>) -> SpiceResult<()> {
         self.check_width(point)?;
-        self.columns
-            .iter()
-            .map(|column| column.value(point))
-            .collect()
+        buffer.clear();
+        for column in &self.columns {
+            buffer.push(column.value(point)?);
+        }
+        Ok(())
     }
 
     /// Bind this selection to a driver header before projecting streamed rows.
@@ -365,10 +392,10 @@ impl Selection {
     /// The driver header has a different schema.
     pub fn bind(self, header: &Plot) -> SpiceResult<RowProjection> {
         self.check_schema(header)?;
-        let capacity = if self.full { 0 } else { self.columns.len() };
+        let buffer = self.row_buffer()?;
         Ok(RowProjection {
             selection: self,
-            buffer: Vec::with_capacity(capacity),
+            buffer,
         })
     }
 
@@ -413,7 +440,7 @@ impl Selection {
             return Ok(out);
         }
         let _ = writeln!(out, "{:>7}  {}", "point", names.join("  "));
-        for (index, point) in plot.points().iter().enumerate() {
+        for (index, point) in plot.rows().enumerate() {
             let _ = write!(out, "{index:>7}");
             for column in &self.columns {
                 let value = column.value(point)?;
@@ -443,14 +470,11 @@ impl RowProjection {
     /// # Errors
     /// Row width mismatch or a nonfinite computed result.
     pub fn project<'a>(&'a mut self, point: &'a [Complex]) -> SpiceResult<&'a [Complex]> {
-        self.selection.check_width(point)?;
         if self.selection.full {
+            self.selection.check_width(point)?;
             return Ok(point);
         }
-        self.buffer.clear();
-        for column in &self.selection.columns {
-            self.buffer.push(column.value(point)?);
-        }
+        self.selection.fill_row(point, &mut self.buffer)?;
         Ok(&self.buffer)
     }
 }
@@ -750,7 +774,7 @@ mod tests {
         plot.push_variable(Variable::new("v(out)", "voltage"));
         plot.push_variable(Variable::new("i(v1)", "current"));
         let mut plot = plot.build();
-        plot.push_point(vec![
+        plot.push_point(&[
             Complex::real(5.0),
             Complex::real(2.5),
             Complex::real(-2.5e-3),
@@ -766,7 +790,7 @@ mod tests {
         plot.push_variable(Variable::new("v(out)", "voltage"));
         let mut plot = plot.build();
         for (time, out) in [(0.0, 0.0), (1e-6, 0.5), (2e-6, 1.0)] {
-            plot.push_point(vec![Complex::real(time), Complex::real(out)])
+            plot.push_point(&[Complex::real(time), Complex::real(out)])
                 .unwrap();
         }
         plot
@@ -781,7 +805,7 @@ mod tests {
         plot.push_variable(Variable::complex("i(v1)", "current"));
         // 3, 4 -> magnitude 5, phase atan2(4, 3) = 0.9272952180016122 rad.
         let mut plot = plot.build();
-        plot.push_point(vec![
+        plot.push_point(&[
             Complex::new(100.0, 0.0),
             Complex::new(3.0, 4.0),
             Complex::new(-2e-3, -1e-3),
@@ -887,16 +911,16 @@ mod tests {
         let written = selection.apply(&op).unwrap();
         assert_eq!(written.variables()[0].unit, "voltage");
         assert_eq!(written.point_count(), 1);
-        assert_eq!(written.points()[0][1], Complex::real(-2.5e-3));
+        assert_eq!(written.row(0).unwrap()[1], Complex::real(-2.5e-3));
 
         let tran = tran_plot();
         let selection = resolve(&tran, AnalysisKind::Transient, &[voltage("out", None)]);
         assert_eq!(names(&selection), ["time", "v(out)"]);
         let written = selection.apply(&tran).unwrap();
         assert_eq!(written.variables()[0].unit, "time");
-        assert_eq!(written.points().len(), 3);
+        assert_eq!(written.point_count(), 3);
         assert_eq!(
-            written.points()[2],
+            written.row(2).unwrap(),
             [Complex::real(2e-6), Complex::real(1.0)]
         );
 
@@ -924,7 +948,7 @@ mod tests {
         );
         let written = selection.apply(&plot).unwrap();
         assert_eq!(
-            written.points()[0],
+            written.row(0).unwrap(),
             [
                 Complex::real(2.5),
                 Complex::real(2.5),
@@ -953,7 +977,7 @@ mod tests {
         let written = selection.apply(&plot).unwrap();
         // C prints `i(v1)` as the current into the positive terminal: -2.5 mA
         // through a 5 V source feeding a 2 k divider.
-        assert_eq!(written.points()[0][0], Complex::real(-2.5e-3));
+        assert_eq!(written.row(0).unwrap()[0], Complex::real(-2.5e-3));
         assert_eq!(written.variables()[0].unit, "current");
         assert!(written.variables()[0].is_real);
     }
@@ -983,7 +1007,7 @@ mod tests {
         );
         let written = selection.apply(&plot).unwrap();
         assert_eq!(
-            written.points()[0],
+            written.row(0).unwrap(),
             [2.5, -2.5, 2.5, -2.5, 0.].map(Complex::real)
         );
     }
@@ -1053,7 +1077,7 @@ mod tests {
         // rawfile writes as `re,0.0`.
         assert!(written.variables()[1].is_real);
         assert!(!written.variables()[0].is_real);
-        let point = &written.points()[0];
+        let point = written.row(0).unwrap();
         assert_eq!(point[1], Complex::real(5.0));
         assert!((point[2].re - 4.0f64.atan2(3.0)).abs() < 1e-15);
         assert_eq!(point[3], Complex::real(3.0));
@@ -1136,7 +1160,7 @@ mod tests {
         assert!(full.is_full());
         assert_eq!(names(&full), ["v(in)", "v(out)", "i(v1)"]);
         let written = full.apply(&plot).unwrap();
-        assert_eq!(written.points(), plot.points());
+        assert_eq!(written.cells(), plot.cells());
         assert_eq!(
             full.to_text(&plot).unwrap().lines().next().unwrap(),
             "print: 3 vector(s): v(in) v(out) i(v1)"
@@ -1175,9 +1199,47 @@ mod tests {
                 assert!(selection.clone().bind(wrong).is_err());
             }
             let equivalent = Plot::new("other", "other", plot.flags(), plot.variables().to_vec())
-                .with_points(plot.points().to_vec())
+                .with_rows(plot.rows())
                 .unwrap();
             assert!(selection.apply(&equivalent).is_ok());
+        }
+    }
+
+    #[test]
+    fn consuming_projection_compacts_reordered_and_differential_rows() {
+        let mut plot = op_plot();
+        plot.push_point(&[Complex::real(-1.), Complex::real(4.), Complex::real(-0.)])
+            .unwrap();
+        plot.push_point(&[Complex::real(3.), Complex::real(1.), Complex::real(2.)])
+            .unwrap();
+        for requests in [
+            vec![current("v1"), voltage("out", Some("in"))],
+            vec![
+                current("v1"),
+                voltage("out", Some("in")),
+                voltage("in", None),
+            ],
+            vec![
+                current("v1"),
+                voltage("out", Some("in")),
+                voltage("in", None),
+                voltage("0", None),
+            ],
+        ] {
+            let selection = resolve(&plot, AnalysisKind::OperatingPoint, &requests);
+            let expected = selection.apply(&plot).unwrap();
+            let owned = plot.clone();
+            let pointer = owned.cells().as_ptr();
+            let actual = selection.into_plot(owned).unwrap();
+            assert_eq!(actual, expected);
+            for (a, b) in actual.cells().iter().zip(expected.cells()) {
+                assert_eq!(a.re.to_bits(), b.re.to_bits());
+                assert_eq!(a.im.to_bits(), b.im.to_bits());
+            }
+            // Equal-width nonidentity projection must retain the original allocation.
+            if requests.len() == plot.variable_count() {
+                assert_eq!(actual.cells().as_ptr(), pointer);
+            }
         }
     }
 
@@ -1186,7 +1248,7 @@ mod tests {
         let plot = op_plot();
         let selection = resolve(&plot, AnalysisKind::OperatingPoint, &[voltage("out", None)]);
         let mut rows = selection.bind(&plot.header()).unwrap();
-        let point = &plot.points()[0];
+        let point = plot.row(0).unwrap();
         let first = rows.project(point).unwrap();
         assert_eq!(first, &[Complex::real(2.5)]);
         let address = first.as_ptr();
@@ -1199,9 +1261,9 @@ mod tests {
         assert!(rows.project(&[Complex::ZERO; 4]).is_err());
         assert_eq!(rows.project(point).unwrap().as_ptr(), point.as_ptr());
         let owned = plot.clone();
-        let points_address = owned.points().as_ptr();
+        let points_address = owned.cells().as_ptr();
         let written = full.into_plot(owned).unwrap();
-        assert_eq!(written.points().as_ptr(), points_address);
+        assert_eq!(written.cells().as_ptr(), points_address);
     }
     #[test]
     #[ignore = "opt-in large-deck projection benchmark"]
@@ -1266,7 +1328,14 @@ mod tests {
         let row = vec![Complex::real(2.); plot.variable_count()];
         let start = Instant::now();
         for _ in 0..ROWS {
-            black_box(selection.project_row(black_box(&row)).unwrap());
+            black_box(
+                selection
+                    .columns
+                    .iter()
+                    .map(|column| column.value(black_box(&row)))
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+            );
         }
         let allocated_elapsed = start.elapsed();
         let mut stream = selection.bind(&plot).unwrap();

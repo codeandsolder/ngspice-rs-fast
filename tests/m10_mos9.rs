@@ -120,7 +120,7 @@ fn level_nine_equals_level_three_bit_for_bit_on_a_shared_card() {
          .model pch pmos(level=9 vto=-0.75 tox=9n nsub=2.5e16 uo=180 kappa=0.4 cgso=0.3n \
          cgdo=0.3n cj=1m rd=30 rs=30)\n.tran 0.05n 3n";
     let (t9, t3) = (run(inverter).unwrap(), run(&level(inverter, 3)).unwrap());
-    assert_eq!(t9[0].points(), t3[0].points());
+    assert_eq!(t9[0].cells(), t3[0].cells());
 }
 
 #[test]
@@ -253,7 +253,7 @@ fn noise_uses_the_pre_nlev_spice3_generators() {
     assert_eq!(nine.len(), three.len());
     for (a, b) in nine.iter().zip(&three) {
         assert_eq!(a.variables(), b.variables());
-        assert_eq!(a.points(), b.points());
+        assert_eq!(a.cells(), b.cells());
     }
     for name in [
         "onoise_m1_rd",
@@ -265,7 +265,7 @@ fn noise_uses_the_pre_nlev_spice3_generators() {
     }
     // Without the compatibility mode level 3 uses its NLEV = 2 flicker law.
     let modern = run(&level(stage, 3)).unwrap();
-    assert_ne!(modern[0].points(), nine[0].points());
+    assert_ne!(modern[0].cells(), nine[0].cells());
 }
 
 #[test]

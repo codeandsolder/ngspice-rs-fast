@@ -857,6 +857,7 @@ pub(super) fn run(
     for hint in hints.nodesets {
         previous.as_mut_slice()[hint.row] = hint.value;
     }
+    let mut point = Vec::with_capacity(result.variable_count());
     for outer_value in outer {
         // dctrcurv.c: when the inner sweep wraps to its start for the next
         // outer value, `firstTime` is set again and the mode is MODEINITJCT,
@@ -902,11 +903,12 @@ pub(super) fn run(
                 history.clear();
             }
             circuit.accept_point(&x, None, &mut history, trial)?;
-            let mut point = vec![Complex::real(*inner_value)];
+            point.clear();
+            point.push(Complex::real(*inner_value));
             point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));
             point.extend(observed);
             result.check_point(&point)?;
-            sink.point(point)?;
+            sink.point(&point)?;
             previous = x;
         }
     }

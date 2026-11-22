@@ -33,7 +33,7 @@ fn value(plot: &Plot, name: &str, point: usize) -> f64 {
     let index = plot
         .variable_index(name)
         .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
-    plot.points()[point][index].re
+    plot.row(point).unwrap()[index].re
 }
 fn close(a: f64, b: f64, relative: f64, absolute: f64) {
     assert!(
@@ -294,8 +294,8 @@ fn gate_lag_makes_the_ac_transconductance_frequency_dependent() {
     let mut c = circuit(body).unwrap();
     let plot = run(&mut c, AnalysisKind::Ac, &["dec", "1", "1", "1g"]).unwrap();
     let index = plot.variable_index("i(vd)").unwrap();
-    let first = plot.points()[0][index];
-    let last = plot.points()[plot.points().len() - 1][index];
+    let first = plot.row(0).unwrap()[index];
+    let last = plot.row(plot.point_count() - 1).unwrap()[index];
     // psmodel.c: gm(0) = gmo (1 - lfgam) and gm(inf) = gmo (1 - hfgam).
     let ratio =
         (last.re.powi(2) + last.im.powi(2)).sqrt() / (first.re.powi(2) + first.im.powi(2)).sqrt();
@@ -315,10 +315,10 @@ fn self_heating_relaxes_after_a_step_and_settles_at_the_dc_point() {
     .unwrap();
     let plot = run(&mut c, AnalysisKind::Transient, &["5n", "2u"]).unwrap();
     let current = |k: usize| -value(&plot, "i(vd)", k);
-    let after = (0..plot.points().len())
+    let after = (0..plot.point_count())
         .find(|k| value(&plot, "time", *k) >= 15e-9)
         .unwrap();
-    let last = plot.points().len() - 1;
+    let last = plot.point_count() - 1;
     let mut dc = circuit(&format!("vd d 0 5\nvg g 0 -0.5\nj1 d g 0 jm\n{model}")).unwrap();
     let hot = -value(
         &run(&mut dc, AnalysisKind::OperatingPoint, &[]).unwrap(),

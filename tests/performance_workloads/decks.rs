@@ -50,7 +50,7 @@ impl PointSink for Counts {
         self.width = Some(header.variable_count());
         Ok(())
     }
-    fn point(&mut self, values: Vec<Complex>) -> SpiceResult<()> {
+    fn point(&mut self, values: &[Complex]) -> SpiceResult<()> {
         assert_eq!(Some(values.len()), self.width);
         self.rows += 1;
         self.cells += values.len();

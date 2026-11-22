@@ -551,6 +551,7 @@ impl Driver<'_> {
             false,
         )?;
         sink.begin(&plot)?;
+        let mut point = Vec::with_capacity(plot.variable_count());
         let mut cursor = StepControl::new(&self.settings);
         let mut x = self.initialize()?;
         // The accepted point's forcing limit and observations.
@@ -607,10 +608,10 @@ impl Driver<'_> {
                         )),
                         None,
                     )?;
-                    push(&plot, sink, 0., &x, observed)?;
+                    push(&plot, sink, &mut point, 0., &x, &observed)?;
                 }
             } else if cursor.time >= start {
-                push(&plot, sink, cursor.time, &x, std::mem::take(&mut observed))?;
+                push(&plot, sink, &mut point, cursor.time, &x, &observed)?;
             }
             if almost_equal_ulps(cursor.time, stop, 100) {
                 break;
@@ -1092,14 +1093,16 @@ impl Driver<'_> {
 fn push(
     header: &Plot,
     sink: &mut dyn PointSink,
+    point: &mut Vec<Complex>,
     time: Real,
     x: &Vector,
-    observed: Vec<Complex>,
+    observed: &[Complex],
 ) -> SpiceResult<()> {
-    let mut point = vec![Complex::real(time)];
+    point.clear();
+    point.push(Complex::real(time));
     point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));
-    point.extend(observed);
-    header.check_point(&point)?;
+    point.extend_from_slice(observed);
+    header.check_point(point)?;
     sink.point(point)
 }
 
