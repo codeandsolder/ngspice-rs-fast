@@ -63,8 +63,8 @@ remain explicit errors.
   `spice-rs parse` uses this resolved API; summary/cards/tokens still inspect the
   original deck without source expansion.
 - Only the root file has a title. Included sources are **fragments**, including
-  their first physical line. Existing comment/continuation rules and joined-card
-  byte columns remain unchanged.
+  their first physical line. Existing comment/continuation rules and physical
+  byte columns are retained.
 - Paths resolve relative to the **containing source file**, not the process
   working directory. Resolved fragments carry canonical paths and original
   physical line numbers. A directive stays in its insertion scope and its
