@@ -292,8 +292,7 @@ impl ProjectionGrid {
         let residue = (k * periods * i) % length;
         let phase = Real::from(residue) / Real::from(length);
         let angle = std::f64::consts::TAU * phase;
-        let (sin, cos) = angle.sin_cos();
-        [sin, cos]
+        angle.sin_cos().into()
     }
 }
 

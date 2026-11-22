@@ -262,3 +262,19 @@ and physical windows or grids whose coordinates cannot be represented
 as distinct increasing floating-point times, are explicitly refused.
 Degree zero retains C's sample-index semantics and does not require a
 physical interpolation grid.
+
+
+### Numerical verification on C-saved samples (#92)
+
+The pinned 059066b5 reference generated 4008 transient rows for
+v(t)=0.5+sin(2*pi*1000*t) on [0, 4 ms]. An independent 80-digit decimal
+Lagrange evaluation of the exact stored binary64 samples followed by
+compensated DFT gave maximum analytic coefficient errors of 4.1e-16
+(degree 5) and 4.3e-16 (degree 7). C's absolute-power fit produced spurious
+harmonics up to 1.54e-6 and 2.16e-5, respectively, and degree-7 DC 0.499993.
+The high-degree live fixture therefore checks against the analytic sine,
+with a per-grid bound from the polynomial derivative remainder, L1 weight
+norm, saved-sample error and floating-point phase/reduction error.
+The original C tolerances for degrees 0–3 and period/grid settings are
+unchanged. Degree zero retains C's sample-index transform, so it is not
+compared with the physical-time sine spectrum.

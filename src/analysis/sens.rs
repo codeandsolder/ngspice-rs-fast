@@ -29,9 +29,9 @@
 //!    its current records, the result negated, the parameter set to
 //!    `p + delta` with `delta = 1e-6 p` (`1e-6` when `p = 0`), the device
 //!    loaded again on top, and the parameter set back to `p`: element by
-//!    element `delta_Y = -dY0 + dY1` and `delta_I = -dI0 + dI1` in C's
-//!    accumulation order. The sensitivity is `Y^-1 (delta_I - delta_Y x)`
-//!    read at the output and divided by `delta`, with `delta_Y x` summed per
+//!    element `delta_Y = -dY0 + dY1` and `delta_I = -dI0 + dI1` in original
+//!    stamp order with compensated accumulation. The sensitivity is `Y^-1 (delta_I - delta_Y x)`
+//!    read at the output and divided by `delta`, with `delta_Y x` summed with compensation per
 //!    row in the internal column order of C's `delta_Y` (see
 //!    [`DeltaNumbering`]).
 //!
@@ -232,7 +232,7 @@ pub(super) fn parse(arguments: &[String]) -> SpiceResult<SensCard> {
 /// divides `ln(fstop/fstart)` by `M_LOG2E` instead of multiplying.
 #[expect(
     clippy::suboptimal_flops,
-    reason = "count_steps truncates a discrete sweep length; changing frequency grid membership requires a separate policy change"
+    reason = "count_steps truncates a discrete sweep length: 3 * log10(4.6060996915966586) + 1.01 is 3 separately rounded but 2.9999999999999996 fused"
 )]
 fn frequencies(sweep: &Sweep) -> SpiceResult<Vec<Real>> {
     let steps = Real::from(sweep.steps.max(1));
@@ -2045,6 +2045,26 @@ mod tests {
         assert!(scan(b"v1", b"v1"));
         assert!(scan(b"*_m", b"r2_m"));
         assert!(!scan(b"*_m", b"r2_ms"));
+    }
+
+    #[test]
+    fn frequency_count_rounding_is_a_discrete_grid_policy() {
+        // Exact binary64 log10(4.6060996915966586) on the reference platform.
+        let log = f64::from_bits(0x3fe5_3a06_d3a0_6d39);
+        let scaled = 3. * log;
+        assert_eq!((scaled + 1.01).trunc(), 3.);
+        assert_eq!(3_f64.mul_add(log, 1.01).trunc(), 2.);
+        let sweep = super::Sweep {
+            stepping: super::Stepping::Decade,
+            steps: 3,
+            start: 1.,
+            stop: 4.6060996915966586,
+        };
+        // On platforms whose log10 differs, still check the grid policy
+        // against the separately rounded product on that platform.
+        let scaled = 3. * sweep.stop.log10();
+        let want = (scaled + 1.01).trunc();
+        assert_eq!(super::frequencies(&sweep).unwrap().len() as f64, want);
     }
 
     #[test]
