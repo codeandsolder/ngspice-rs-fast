@@ -841,7 +841,7 @@ mod tests {
     }
     #[test]
     fn finite_train_event_kinds_and_long_inactive_window() {
-        let finite = pulse(1., 2., 3., 10.).with_count(1.4).unwrap();
+        let finite = pulse(1., 2., 3., 10.).with_count(1.25).unwrap();
         let mut iterator = finite.breakpoints_in(0., 1e30).unwrap();
         let mut events = Vec::new();
         while let Some(event) = iterator.next_event() {
@@ -857,11 +857,16 @@ mod tests {
                 (8., PulseEdge),
                 (12., PulsePeriodStart),
                 (13., PulseEdge),
-                (16., PulseCountCut),
-                (18., PulseTrailingRequest),
+                (14.5, PulseCountCut),
+                (16., PulseTrailingRequest),
             ]
         );
         assert_eq!(finite.breakpoints_in(1e29, 1e30).unwrap().next(), None);
+        let coincident = pulse(1., 2., 3., 10.).with_count(1.4).unwrap();
+        let mut corners = coincident.breakpoints_in(16., 18.).unwrap();
+        assert_eq!(corners.next_event().unwrap().kind, PulseEdge);
+        assert_eq!(corners.next_event().unwrap().kind, PulseTrailingRequest);
+        assert!(corners.next_event().is_none());
     }
 
     #[test]
