@@ -5,7 +5,7 @@
 use std::{hint::black_box, simd::Simd};
 
 use anyhow::{Result, ensure};
-use fp64_batched_ladder::{Gpu, median_ms};
+use fp64_batched_ladder::{Gpu, adapter_selector, median_ms};
 use rayon::prelude::*;
 
 const N: usize = 64;
@@ -154,10 +154,12 @@ fn parallel_simd(d: &[f64], b: &[f64], p: &mut [f64], x: &mut [f64]) {
 }
 
 fn main() -> Result<()> {
+    let selector = adapter_selector()?;
     let gpu = pollster::block_on(Gpu::new(
         "FP64 ladder solver",
         include_str!("ladder.wgsl"),
         0,
+        selector.as_deref(),
     ))?;
     println!("persistent CPU workers: {}", rayon::current_num_threads());
     println!("nodes={N}, tile={TILE}, repeats=7");

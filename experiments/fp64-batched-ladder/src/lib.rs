@@ -19,6 +19,16 @@ pub fn median_ms(mut f: impl FnMut() -> Result<()>) -> Result<f64> {
     Ok(times[3])
 }
 
+/// Optional explicit Vulkan adapter name substring, without environment configuration.
+pub fn adapter_selector() -> Result<Option<String>> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        [] => Ok(None),
+        [flag, name] if flag == "--adapter" && !name.is_empty() => Ok(Some(name.clone())),
+        _ => anyhow::bail!("usage: benchmark [--adapter NAME_SUBSTRING]"),
+    }
+}
+
 pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -26,14 +36,35 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    pub async fn new(name: &str, shader: &str, shared_bytes: u32) -> Result<Self> {
+    pub async fn new(
+        name: &str,
+        shader: &str,
+        shared_bytes: u32,
+        selector: Option<&str>,
+    ) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await?;
+        let adapter = if let Some(selector) = selector {
+            let mut matches = instance
+                .enumerate_adapters(wgpu::Backends::VULKAN)
+                .await
+                .into_iter()
+                .filter(|a| {
+                    a.get_info()
+                        .name
+                        .to_lowercase()
+                        .contains(&selector.to_lowercase())
+                });
+            let first = matches.next().context("no matching Vulkan adapter")?;
+            ensure!(matches.next().is_none(), "adapter selector is ambiguous");
+            first
+        } else {
+            instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await?
+        };
         let info = adapter.get_info();
         println!(
             "adapter: {} ({:?}, {})",

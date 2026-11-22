@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Result, ensure};
-use fp64_batched_ladder::{Gpu, median_ms};
+use fp64_batched_ladder::{Gpu, adapter_selector, median_ms};
 use rayon::prelude::*;
 use std::{
     collections::BTreeMap,
@@ -578,6 +578,7 @@ fn specialized_shader(plan: &Plan) -> String {
 }
 
 fn main() -> Result<()> {
+    let selector = adapter_selector()?;
     let plan = Plan::new();
     println!(
         "mesh: {SIDE}x{SIDE}, nodes={N}, original lower entries={}, filled lower entries={}, updates={}, tape operations={}",
@@ -590,14 +591,20 @@ fn main() -> Result<()> {
         "Complex FP64 RC mesh",
         include_str!("../mesh.wgsl"),
         0,
+        selector.as_deref(),
     ))?;
     let grouped = plan.grouped();
-    let grouped_gpu =
-        pollster::block_on(Gpu::new("Grouped complex FP64", &grouped_shader(false), 0))?;
+    let grouped_gpu = pollster::block_on(Gpu::new(
+        "Grouped complex FP64",
+        &grouped_shader(false),
+        0,
+        selector.as_deref(),
+    ))?;
     let mixed_gpu = pollster::block_on(Gpu::new(
         "Grouped FP32 with FP64 refinement",
         &grouped_shader(true),
         0,
+        selector.as_deref(),
     ))?;
     const LOCAL_SYSTEMS: usize = 4;
     let max_neighbours = grouped[1..=N]
@@ -623,10 +630,16 @@ fn main() -> Result<()> {
         "Workgroup-resident complex FP64",
         &local_source,
         local_bytes,
+        selector.as_deref(),
     ))?;
     let generated = specialized_shader(&plan);
     println!("generated shader bytes: {}", generated.len());
-    let specialized_gpu = pollster::block_on(Gpu::new("Specialized sparse FP64", &generated, 0))?;
+    let specialized_gpu = pollster::block_on(Gpu::new(
+        "Specialized sparse FP64",
+        &generated,
+        0,
+        selector.as_deref(),
+    ))?;
     println!("local shared memory bytes: {local_bytes}");
     println!("persistent CPU workers: {}", rayon::current_num_threads());
     println!(
