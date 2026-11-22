@@ -148,7 +148,10 @@ fn measured_complex_and_real_cache_transitions_preserve_snapshot_work() {
     assert_eq!(first.solve(&b).unwrap(), before);
     let s = first.factor_storage();
     assert_eq!(s.original_entries, 4);
-    assert_eq!(s.numeric_bytes, s.factor_entries * size_of::<Complex>());
+    assert_eq!(
+        s.numeric_bytes,
+        (s.factor_entries + s.translated_order + 1) * size_of::<Complex>()
+    );
     assert_eq!(p.factor_telemetry().storage, Some(second.factor_storage()));
 
     let empty = SparseMatrix::new(2, 2);
@@ -166,7 +169,8 @@ fn measured_complex_and_real_cache_transitions_preserve_snapshot_work() {
     assert_eq!(after.work.complex_to_real, 1);
     assert_eq!(
         after.storage.unwrap().numeric_bytes,
-        retry.factor_storage().factor_entries * size_of::<f64>()
+        (retry.factor_storage().factor_entries + retry.factor_storage().translated_order + 1)
+            * size_of::<f64>()
     );
     assert_eq!(after.work.factor.successful_factors, 5);
     assert_eq!(after.work.rhs_solves, 2);

@@ -152,7 +152,7 @@ fn measured_cache_work_distinguishes_order_refactor_exact_hit_and_retained_pivot
     assert_eq!(storage.translated_order, 3);
     assert_eq!(
         storage.numeric_bytes,
-        storage.factor_entries * size_of::<f64>()
+        (storage.factor_entries + storage.translated_order + 1) * size_of::<f64>()
     );
     assert_eq!(first.work.rhs_solves, 1);
 
@@ -305,7 +305,10 @@ fn retained_factors_report_their_own_work_and_known_fill() {
         ),
         (12, 14, 2)
     );
-    assert_eq!(storage.numeric_bytes, 14 * size_of::<f64>());
+    assert_eq!(
+        storage.numeric_bytes,
+        (14 + storage.translated_order + 1) * size_of::<f64>()
+    );
 }
 
 #[test]

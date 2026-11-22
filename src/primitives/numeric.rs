@@ -282,7 +282,7 @@ pub(super) fn split_power(value: Real) -> (Real, i32) {
 /// Multiply by a power of two without first forming an unrepresentable
 /// power. The final multiply is the only one that can round into subnormals
 /// for the normalized significands used by the scaled division.
-pub(super) fn scale_power(mut value: Real, mut exponent: i32) -> Real {
+pub(crate) fn scale_power(mut value: Real, mut exponent: i32) -> Real {
     while exponent > 1023 {
         value *= Real::from_bits(0x7fe0_0000_0000_0000);
         exponent -= 1023;
