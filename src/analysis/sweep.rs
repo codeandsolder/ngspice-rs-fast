@@ -853,7 +853,7 @@ pub(super) fn run(
     // dctrcurv.c rotates the state vectors before every point, so a point's
     // CKTstate1 is the previous point's state (the first point's own state is
     // copied in after it). Only devices with discrete state (switches) read it.
-    let mut history = circuit.state_history();
+    let mut history = circuit.state_history()?;
     for hint in hints.nodesets {
         previous.as_mut_slice()[hint.row] = hint.value;
     }
@@ -899,10 +899,10 @@ pub(super) fn run(
             // sweep C copies CKTstate0 into CKTstate1, so after the next
             // rotation CKTstate2 equals CKTstate1 (DEVpred extrapolates
             // flat) instead of holding the previous outer value's last point.
-            if first_point {
-                history.clear();
-            }
             circuit.accept_point(&x, None, &mut history, trial)?;
+            if first_point {
+                history.retain_latest();
+            }
             point.clear();
             point.push(Complex::real(*inner_value));
             point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));

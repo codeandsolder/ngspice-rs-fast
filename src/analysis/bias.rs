@@ -953,6 +953,10 @@ pub fn solve_dc_forced(
     forcing: Option<Forcing>,
     nodes: &NodeForcing,
 ) -> Result<DcSolution, DcFailure> {
+    let history = circuit.state_history().map_err(|error| DcFailure {
+        error,
+        report: Box::new(DcReport::default()),
+    })?;
     solve(
         circuit,
         context,
@@ -961,7 +965,7 @@ pub fn solve_dc_forced(
         &Start {
             initial,
             forcing,
-            history: &circuit.state_history(),
+            history: &history,
             policy: PhasePolicy::OperatingPoint,
             nodes,
         },

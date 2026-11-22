@@ -170,7 +170,7 @@ impl AnalysisMode {
 /// Ground is not an unknown: it is the reference and its row is eliminated.
 /// Branch currents are unknowns too, and get rows after the nodes; the circuit
 /// numbers them, and device-internal nodes, in C's setup order
-/// ([`crate::devices::Circuit::rebuild_unknowns`]).
+/// ([`crate::devices::Circuit::finalize`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MnaUnknowns {
     node_rows: Vec<Option<usize>>,
@@ -256,22 +256,35 @@ impl MnaUnknowns {
         self.node_rows.get(node.index()).copied().flatten()
     }
 
+    /// Resolve a node at an analysis boundary. Only ground has no row;
+    /// a non-ground node absent from the finalized mapping is an error.
+    ///
+    /// # Errors
+    /// The node is unknown or has no validated MNA row.
+    pub fn checked_node_row(&self, node: NodeId) -> SpiceResult<Option<usize>> {
+        if node == NodeId::GROUND {
+            return Ok(None);
+        }
+        self.node_row(node)
+            .map(Some)
+            .ok_or_else(|| SpiceError::circuit(format!("unmapped MNA node {node}")))
+    }
+
     /// Reserves `count` rows after every node row, for branch currents.
     ///
     /// Returns the first reserved row, or `None` when `count` is zero.
-    pub const fn add_rows(&mut self, count: usize) -> Option<usize> {
+    ///
+    /// # Errors
+    /// MNA row count overflow.
+    pub fn add_rows(&mut self, count: usize) -> SpiceResult<Option<usize>> {
         if count == 0 {
-            return None;
+            return Ok(None);
         }
         let first = self.next_row;
-        self.next_row += count;
-        Some(first)
-    }
-
-    /// Whether every node slot in the table has been numbered (including
-    /// the eliminated ground slot).
-    pub(super) const fn covers_nodes(&self, nodes: &NodeTable) -> bool {
-        self.node_rows.len() == nodes.len()
+        self.next_row = first
+            .checked_add(count)
+            .ok_or_else(|| SpiceError::circuit("MNA row count overflow"))?;
+        Ok(Some(first))
     }
 
     /// Number of unknowns, i.e. the size of the MNA system.
@@ -1085,9 +1098,9 @@ mod tests {
     #[test]
     fn rows_can_be_reserved_for_branch_currents() {
         let mut unknowns = MnaUnknowns::new();
-        assert_eq!(unknowns.add_rows(0), None);
-        assert_eq!(unknowns.add_rows(2), Some(0));
-        assert_eq!(unknowns.add_rows(1), Some(2));
+        assert_eq!(unknowns.add_rows(0).unwrap(), None);
+        assert_eq!(unknowns.add_rows(2).unwrap(), Some(0));
+        assert_eq!(unknowns.add_rows(1).unwrap(), Some(2));
         assert_eq!(unknowns.len(), 3);
     }
 

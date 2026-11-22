@@ -29,6 +29,7 @@
 //! opt-in live comparisons in `tests/c_dc_sweep_reference.rs`
 //! and by the analytic tests listed in `docs/port/DC_SWEEPS.md`.
 
+use crate::devices::circuit::TopologyId;
 use crate::primitives::Real;
 
 /// Largest number of resistors one [`crate::devices::ModelContext`] can override at once
@@ -66,13 +67,22 @@ pub struct ResistorMetadata {
 /// override is rejected when it is used.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ResistorOverride {
+    topology: TopologyId,
     device: usize,
     supplied: Real,
 }
 
 impl ResistorOverride {
-    pub(crate) const fn new(device: usize, supplied: Real) -> Self {
-        Self { device, supplied }
+    pub(crate) const fn new(topology: TopologyId, device: usize, supplied: Real) -> Self {
+        Self {
+            topology,
+            device,
+            supplied,
+        }
+    }
+
+    pub(super) const fn topology(self) -> TopologyId {
+        self.topology
     }
 
     /// The overridden device's ordinal in [`crate::devices::Circuit::devices`].
@@ -104,18 +114,29 @@ pub const MAX_INSTANCE_OVERRIDES: usize = 2;
 /// that made it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InstanceOverride {
+    topology: TopologyId,
     device: usize,
     parameter: &'static str,
     value: Real,
 }
 
 impl InstanceOverride {
-    pub(crate) const fn new(device: usize, parameter: &'static str, value: Real) -> Self {
+    pub(crate) const fn new(
+        topology: TopologyId,
+        device: usize,
+        parameter: &'static str,
+        value: Real,
+    ) -> Self {
         Self {
+            topology,
             device,
             parameter,
             value,
         }
+    }
+
+    pub(super) const fn topology(self) -> TopologyId {
+        self.topology
     }
 
     /// The overridden device's ordinal in [`crate::devices::Circuit::devices`].

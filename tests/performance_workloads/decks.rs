@@ -165,7 +165,7 @@ fn load_kernel(name: &str, text: &str, repeats: u32) {
         dc.report.stages.len()
     );
     let x = dc.solution.values;
-    let history = circuit.state_history();
+    let history = circuit.state_history().unwrap();
     let request = LoadRequest {
         mode: AnalysisMode::OperatingPoint,
         solution: &x,

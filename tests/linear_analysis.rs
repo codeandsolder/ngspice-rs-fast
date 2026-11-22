@@ -100,17 +100,21 @@ fn dc_sweep_reuses_factors_without_mutating_sources() {
 fn waveform(c: &mut Circuit, w: ngspice_rs::devices::Waveform) {
     let t = c.devices()[0].terminals();
     let t = [t[0], t[1]];
-    c.devices_mut()[0] = Box::new(
-        ngspice_rs::devices::IndependentSource::new(
-            "v1",
-            t,
-            true,
-            0.,
-            ngspice_rs::primitives::Complex::real(1.),
-            w,
-        )
-        .unwrap(),
-    );
+    c.replace_device(
+        0,
+        Box::new(
+            ngspice_rs::devices::IndependentSource::new(
+                "v1",
+                t,
+                true,
+                0.,
+                ngspice_rs::primitives::Complex::real(1.),
+                w,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
 }
 fn transient(c: &mut Circuit) -> ngspice_rs::primitives::SpiceResult<Plot> {
     run(
@@ -297,10 +301,14 @@ fn accept_sees_the_initial_point_and_every_accepted_step_and_dc_has_no_time() {
     );
     let times = std::rc::Rc::default();
     let t = c.devices()[1].terminals();
-    c.devices_mut()[1] = Box::new(AcceptProbe {
-        inner: ngspice_rs::devices::Resistor::new("r1", [t[0], t[1]], 1e3).unwrap(),
-        times: std::rc::Rc::clone(&times),
-    });
+    c.replace_device(
+        1,
+        Box::new(AcceptProbe {
+            inner: ngspice_rs::devices::Resistor::new("r1", [t[0], t[1]], 1e3).unwrap(),
+            times: std::rc::Rc::clone(&times),
+        }),
+    )
+    .unwrap();
     let p = transient(&mut c).unwrap();
     let times: Vec<f64> = times.borrow().iter().map(|t| t.unwrap()).collect();
     assert_eq!(times[0], 0.);
@@ -312,10 +320,14 @@ fn accept_sees_the_initial_point_and_every_accepted_step_and_dc_has_no_time() {
     let mut c = circuit("v1 in 0 1\nr1 in 0 1k");
     let times = std::rc::Rc::default();
     let t = c.devices()[1].terminals();
-    c.devices_mut()[1] = Box::new(AcceptProbe {
-        inner: ngspice_rs::devices::Resistor::new("r1", [t[0], t[1]], 1e3).unwrap(),
-        times: std::rc::Rc::clone(&times),
-    });
+    c.replace_device(
+        1,
+        Box::new(AcceptProbe {
+            inner: ngspice_rs::devices::Resistor::new("r1", [t[0], t[1]], 1e3).unwrap(),
+            times: std::rc::Rc::clone(&times),
+        }),
+    )
+    .unwrap();
     run(&mut c, AnalysisKind::OperatingPoint, &[]).unwrap();
     assert_eq!(*times.borrow(), vec![None]);
 }

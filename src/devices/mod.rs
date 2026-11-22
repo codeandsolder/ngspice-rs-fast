@@ -107,7 +107,7 @@ pub mod state;
 pub mod traits;
 
 pub use behavioural::{Behavioural, BehaviouralOutput, BehaviouralScale};
-pub use circuit::{Circuit, CircuitGraph, CircuitVertex};
+pub use circuit::{Circuit, CircuitGraph, CircuitVertex, ElaboratedDevice};
 pub use circuit::{ConvergenceRequest, DelayAcceptance, LoadRequest};
 pub use controlled::{ControlledKind, ControlledSource};
 pub use mutual::{MutualInductance, MutualLimits};

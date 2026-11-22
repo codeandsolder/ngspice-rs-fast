@@ -324,21 +324,26 @@ fn hints_naming_unknown_or_ground_nodes_are_explicit_errors_in_every_analysis() 
 /// Replaces `v1` (device 0) by an ideal step from 0 to 5 V at `time`.
 fn step_source(circuit: &mut Circuit, time: f64) {
     let t = circuit.devices()[0].terminals().to_vec();
-    circuit.devices_mut()[0] = Box::new(
-        IndependentSource::new(
-            "v1",
-            [t[0], t[1]],
-            true,
-            0.,
-            Complex::real(1.),
-            Waveform::Step {
-                before: 0.,
-                after: 5.,
-                time,
-            },
+    circuit
+        .replace_device(
+            0,
+            Box::new(
+                IndependentSource::new(
+                    "v1",
+                    [t[0], t[1]],
+                    true,
+                    0.,
+                    Complex::real(1.),
+                    Waveform::Step {
+                        before: 0.,
+                        after: 5.,
+                        time,
+                    },
+                )
+                .unwrap(),
+            ),
         )
-        .unwrap(),
-    );
+        .unwrap();
 }
 
 fn uic_request(args: &[&str]) -> ngspice_rs::analysis::AnalysisPlan {

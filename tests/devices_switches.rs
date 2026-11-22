@@ -94,7 +94,7 @@ fn switches_elaborate_with_c_defaults_and_two_state_slots() {
     );
     // Defaults: RON 1 ohm, ROFF = gmin, VT/VH = 0 (on above 0 V).
     let d = circuit("vc c 0 0\nvin in 0 1\nr1 in a 1k\ns1 a 0 c 0 sm\n.model sm sw").unwrap();
-    let history = d.state_history();
+    let history = d.state_history().unwrap();
     let (_, open) = load(&d, &history, -1., IterationPhase::Predict, None);
     close(open, ModelContext::default().gmin);
     let (_, closed) = load(&d, &history, 1., IterationPhase::Predict, None);
@@ -139,7 +139,7 @@ fn invalid_switch_instances_and_models_fail_before_elaboration() {
 #[test]
 fn trial_loads_never_flip_the_accepted_state() {
     let c = circuit(BAND).unwrap();
-    let mut history = c.state_history();
+    let mut history = c.state_history().unwrap();
     // Operating point at 0 V: really off (code 0), committed as accepted.
     let (op, g) = load(&c, &history, 0., IterationPhase::Junction, None);
     close(g, 1e-6);
@@ -168,7 +168,7 @@ fn trial_loads_never_flip_the_accepted_state() {
 #[test]
 fn hysteresis_and_threshold_crossings_follow_swload() {
     let c = circuit(BAND).unwrap();
-    let mut history = c.state_history();
+    let mut history = c.state_history().unwrap();
     let mut sweep = |controls: &[f64]| -> Vec<bool> {
         controls
             .iter()
@@ -192,7 +192,7 @@ fn hysteresis_and_threshold_crossings_follow_swload() {
 #[test]
 fn initial_flags_decide_inside_the_band_and_float_flips_report_nonconvergence() {
     let on = circuit(&BAND.replace(" sm\n", " sm on\n")).unwrap();
-    let history = on.state_history();
+    let history = on.state_history().unwrap();
     // MODEINITJCT inside the band: the ON flag closes the switch (code 3).
     let (first, g) = load(&on, &history, 1.0, IterationPhase::Junction, None);
     close(g, 0.1);
@@ -240,7 +240,7 @@ fn current_switches_sense_their_controlling_branch() {
          .model wm csw(it=1m ih=0.2m ron=5)",
     )
     .unwrap();
-    let history = c.state_history();
+    let history = c.state_history().unwrap();
     let branch = c.branch_rows(3).unwrap().start;
     let n = c.unknown_count();
     let a = c.unknowns().node_row(c.nodes().get("a").unwrap()).unwrap();

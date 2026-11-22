@@ -199,7 +199,7 @@ impl SmallSignal {
         // a switch is that of the accepted history, not of the converged
         // operating point (`swacload.c`/`cswacld.c`). The operating point's own
         // trial state is therefore deliberately not used here.
-        let history = circuit.state_history();
+        let history = circuit.state_history()?;
         let state1 = history
             .accepted(1)
             .map_or_else(|| vec![0.; history.len()], <[Real]>::to_vec);
@@ -347,10 +347,14 @@ mod tests {
     }
 
     fn carried(circuit: &Circuit) -> Vec<Option<Real>> {
-        let history = circuit.state_history();
+        let history = circuit.state_history().unwrap();
         let mut trial = history.trial();
-        let state = history.device(&mut trial, 0..history.len()).unwrap();
-        (0..history.len()).map(|slot| state.carried(slot)).collect()
+        let mut values = Vec::new();
+        for index in 0..circuit.device_count() {
+            let state = history.device_of(&mut trial, index).unwrap();
+            values.extend((0..state.len()).map(|slot| state.carried(slot)));
+        }
+        values
     }
 
     #[test]

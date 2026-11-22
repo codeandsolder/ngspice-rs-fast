@@ -116,14 +116,14 @@ fn slots_and_branch_ranges_are_separate_namespaces() {
     assert_eq!(circuit.state_rows(0), Some(0..1));
     assert_eq!(circuit.state_rows(1), Some(1..2));
     assert_eq!(circuit.state_len(), 2);
-    assert_eq!(circuit.state_history().len(), 2);
+    assert_eq!(circuit.state_history().unwrap().len(), 2);
 }
 
 #[test]
 fn newton_trials_and_rejected_steps_never_advance_accepted_history() {
     let log = Log::default();
     let circuit = circuit(&log);
-    let mut history = circuit.state_history();
+    let mut history = circuit.state_history().unwrap();
     let first = load(&circuit, &history, &[1.0, 2.0, 0.0]).unwrap();
     circuit
         .accept_point(
@@ -172,7 +172,7 @@ fn newton_trials_and_rejected_steps_never_advance_accepted_history() {
 fn failed_commits_and_accept_hooks_are_atomic() {
     let log = Log::default();
     let circuit = circuit(&log);
-    let mut history = circuit.state_history();
+    let mut history = circuit.state_history().unwrap();
     let x = Vector::from_slice(&[1.0, 1.0, 0.0]);
     // An unloaded trial has unset slots: rejected before any hook runs.
     let unloaded = history.trial();
@@ -223,7 +223,7 @@ fn failed_commits_and_accept_hooks_are_atomic() {
 fn loads_validate_dimensions_and_stale_numbering() {
     let log = Log::default();
     let mut circuit = circuit(&log);
-    let history = circuit.state_history();
+    let history = circuit.state_history().unwrap();
     assert!(load(&circuit, &history, &[1.0, 1.0]).is_err());
     assert!(load(&circuit, &history, &[f64::NAN, 1.0, 0.0]).is_err());
     assert!(load(&circuit, &StateHistory::new(1), &[1.0, 1.0, 0.0]).is_err());

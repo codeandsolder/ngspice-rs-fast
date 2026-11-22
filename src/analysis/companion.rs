@@ -524,7 +524,7 @@ pub fn companion_transient_into(
         timing,
         model_context,
         bias,
-        history: circuit.state_history(),
+        history: circuit.state_history()?,
         steps: StepHistory::with_fill(settings.max_step),
         hints,
         uic: request.uic(),
@@ -892,9 +892,7 @@ impl Driver<'_> {
             trial.clone(),
             &acceptance,
         )?;
-        for _ in 1..crate::devices::ACCEPTED_DEPTH {
-            self.history.commit(trial.clone())?;
-        }
+        self.history.seed_accepted_history()?;
         Ok(x)
     }
 
@@ -926,9 +924,7 @@ impl Driver<'_> {
             &mut trial,
         )?;
         for (slot, value) in overrides {
-            self.history
-                .device(&mut trial, *slot..*slot + 1)?
-                .set(0, *value)?;
+            self.history.set_initial_slot(&mut trial, *slot, *value)?;
         }
         Ok(trial)
     }

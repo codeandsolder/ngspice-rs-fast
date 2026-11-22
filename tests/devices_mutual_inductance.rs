@@ -297,7 +297,7 @@ fn coupled_flux_drives_dc_state_companions_and_linear_assembly() {
     x[b1] = 2.0;
     x[b2] = -1.0;
     // DC: shorts, no mutual matrix entry; the recorded flux is coupled.
-    let mut history = c.state_history();
+    let mut history = c.state_history().unwrap();
     let (matrix, _, trial) = load(&c, &history, &x, None);
     assert_eq!(matrix.get(b1, b2), 0.0);
     close(trial.values()[s1], 1e-3 * 2.0 - m);
@@ -481,12 +481,10 @@ fn failed_binding_does_not_publish_partial_terms_or_setup() {
     circuit
         .add_instances(&netlist.devices, &models, &ModelContext::default())
         .unwrap();
-    circuit.rebuild_unknowns();
-    resource_error(
-        circuit.mutual_terms(&ModelContext::default()).unwrap_err(),
-        "mutual pair limit",
-    );
-    resource_error(circuit.setup_elements(2).unwrap_err(), "mutual pair limit");
+    resource_error(circuit.finalize().unwrap_err(), "mutual pair limit");
+    assert!(circuit.mutual_terms(&ModelContext::default()).is_err());
+    assert!(circuit.setup_elements(2).is_err());
+    assert!(circuit.new_matrix().is_err());
     resource_error(circuit.finalize().unwrap_err(), "mutual pair limit");
 }
 

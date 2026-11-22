@@ -341,7 +341,7 @@ fn dc_jacobian_matches_finite_differences() {
     ] {
         let c = circuit(body);
         let context = ModelContext::default();
-        let history = c.state_history();
+        let history = c.state_history().unwrap();
         let solved = bias(&c);
         let system = c.small_signal_system(&context, &solved.values).unwrap();
         let n = c.unknown_count();
@@ -578,7 +578,7 @@ fn reference_jacobian_omits_gamma1_only_on_the_clamped_body_branch() {
         ));
         let n = c.unknown_count();
         let context = ModelContext::default();
-        let history = c.state_history();
+        let history = c.state_history().unwrap();
         for vd in [0.3_f64, 3.0, -0.3, -3.0] {
             for vb in [-0.2, 0.1, 0.65] {
                 let mut x = Vector::zeros(n);

@@ -202,7 +202,7 @@ fn the_dc_jacobian_matches_finite_differences_over_a_bias_grid() {
     for body in bodies {
         let c = circuit(&body).unwrap();
         let context = ModelContext::default();
-        let history = c.state_history();
+        let history = c.state_history().unwrap();
         let solved = ngspice_rs::analysis::bias::solve_dc(
             &c,
             &context,
@@ -474,10 +474,9 @@ fn the_transient_jacobian_matches_finite_differences_with_filters() {
             None,
         )
         .unwrap();
-        let mut history = c.state_history();
-        for _ in 0..ngspice_rs::devices::ACCEPTED_DEPTH {
-            history.commit(solved.trial.clone()).unwrap();
-        }
+        let mut history = c.state_history().unwrap();
+        history.commit(solved.trial.clone()).unwrap();
+        history.seed_accepted_history().unwrap();
         let dt = 1e-9;
         let mut steps = StepHistory::new();
         let first = steps

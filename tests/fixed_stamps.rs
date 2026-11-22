@@ -46,7 +46,7 @@ fn bias(circuit: &Circuit) -> Vector {
 /// Loads `circuit` at `x` into `matrix` and returns every entry's bits.
 fn load(circuit: &Circuit, mut matrix: SparseMatrix, x: &Vector) -> Vec<u64> {
     let n = circuit.unknown_count();
-    let history = circuit.state_history();
+    let history = circuit.state_history().unwrap();
     // MODEINITFLOAT: devices load at `x` (MODEINITJCT would give every
     // MOSFET the same starting voltages).
     let mut trial = history.trial_in(IterationPhase::Float, None).unwrap();
@@ -108,6 +108,8 @@ fn replacing_devices_forgets_the_verified_batches() {
             .unwrap()
     };
     let (first, second) = (position("mn1"), position("mn2"));
-    circuit.devices_mut().swap(first, second);
+    circuit.swap_devices(first, second).unwrap();
+    assert!(circuit.new_matrix().is_err());
+    circuit.finalize().unwrap();
     assert_bound_loads_match(&circuit, &x);
 }

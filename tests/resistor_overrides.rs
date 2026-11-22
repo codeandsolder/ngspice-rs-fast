@@ -58,7 +58,7 @@ fn misnamed() -> Circuit {
     c
 }
 fn load_a00(c: &Circuit, context: &ModelContext) -> f64 {
-    let history = c.state_history();
+    let history = c.state_history().unwrap();
     let mut trial = history.trial();
     let mut matrix = SparseMatrix::new(c.unknown_count(), c.unknown_count());
     c.load(

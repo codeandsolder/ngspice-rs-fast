@@ -134,7 +134,7 @@ fn every_analysis_mode_loads_the_same_static_stamp() {
     .unwrap();
     let linear = c.linear_system().unwrap().a;
     let n = c.unknown_count();
-    let history = c.state_history();
+    let history = c.state_history().unwrap();
     let solution = Vector::zeros(n);
     let context = ModelContext::default();
     for mode in [
