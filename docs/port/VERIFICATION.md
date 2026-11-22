@@ -356,6 +356,26 @@ changed), all under `compare::NONLINEAR`, `compare::TRAN`,
 `#collector`, `#collCX`, `#emitter`, `#base` are not saved) instead of a
 per-device list of exceptions; the existing corpus verifies unchanged.
 
+### Bounded golden verification (#127)
+
+The selected C ASCII reference is decoded from a buffered reader in schedule
+order. Each pointwise gate binds occurrence-aware column indices once and
+compares a reusable C row with the corresponding Rust row; final complex
+realness is checked after decoding. Roots and transient interpolation retain
+only the current C plot under the explicit default rawfile collection budget.
+A missing, extra, malformed or truncated plot is an error, including data
+after the final registered stage. Internal-node projection compacts the owned
+Rust cell buffer in place while preserving every other column and occurrence.
+
+The `commands::verify::tests::memory_*` ignored tests exercise one and four
+65,536-point, 16-column pointwise plots and the committed
+`m7_ic_mos1_uic_tran` transient decoder. Run individual tests from the same
+compiled test executable under `/usr/bin/time -v` and an allocation profiler
+(e.g. Valgrind DHAT) to compare peak RSS and allocation volume. The synthetic
+tests write identical inputs in both modes; the retained baseline uses the
+former read-to-string/collect-all path and the same numerical comparator.
+
+
 ## BSIM3 B3-0 input foundation (#90)
 
 The schema-only BSIM3 path has generated IFparm metadata for all 429 model
