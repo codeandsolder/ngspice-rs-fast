@@ -1,3 +1,14 @@
+## Current nonlinear sensitivity reference policy (#146)
+
+C finite-difference derivatives are compared at 0.1% relative plus the
+existing 1e-9 absolute budget; the MESA level-2 cancellation floor remains
+5e-8. Both the stored golden and live C suites use the shared policy in
+`conformance/support/src/tolerance.rs`. Linear sensitivity, sweep
+coordinates, structure, and independent analytic checks retain their
+original stricter budgets. The historical captures remain unchanged.
+See [SENSITIVITY.md](SENSITIVITY.md#reference-agreement-versus-physical-accuracy-146).
+Historical measurements below describe the policies at the time of capture.
+
 ## Bounded reference-process execution (#80)
 
 All live C reference invocations use the development-only
