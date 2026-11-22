@@ -33,9 +33,13 @@ fn compare_with_c(
     let mut c = Circuit::from_netlist(&netlist).unwrap();
     let nodes = c.devices()[0].terminals();
     let nodes = [nodes[0], nodes[1]];
-    c.devices_mut()[0] = Box::new(
-        IndependentSource::new("v1", nodes, true, 0., Complex::ZERO, rust_waveform).unwrap(),
-    );
+    c.replace_device(
+        0,
+        Box::new(
+            IndependentSource::new("v1", nodes, true, 0., Complex::ZERO, rust_waveform).unwrap(),
+        ),
+    )
+    .unwrap();
     let request =
         AnalysisInput::with_arguments(AnalysisKind::Transient, ["0.0001", "0.006", "0", "0.00005"]);
     let got = request

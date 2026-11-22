@@ -226,7 +226,7 @@ fn the_history_holds_only_accepted_points() {
 fn failed_acceptance_leaves_every_history_unchanged() {
     let (circuit, _) = with_probe(RC, None, None);
     let n = circuit.unknown_count();
-    let mut history = circuit.state_history();
+    let mut history = circuit.state_history().unwrap();
     assert!(history.delay(3).is_some_and(DelayHistory::is_empty));
     let context = ModelContext::default();
     let x = Vector::from_slice(&vec![0.5; n]);

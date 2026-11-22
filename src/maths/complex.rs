@@ -542,22 +542,35 @@ impl ComplexLu {
         transposed: bool,
         workspace: &mut Vec<Complex>,
     ) -> SpiceResult<Vec<Complex>> {
+        let mut out = Vec::new();
+        self.solve_into(rhs, workspace, &mut out, transposed)?;
+        Ok(out)
+    }
+
+    /// Solve into caller-owned buffers, retaining both internal scratch and
+    /// external-order result capacity between port excitations. The result
+    /// and scratch contents are unspecified on error.
+    pub(crate) fn solve_into(
+        &self,
+        rhs: &[Complex],
+        workspace: &mut Vec<Complex>,
+        out: &mut Vec<Complex>,
+        transposed: bool,
+    ) -> SpiceResult<()> {
         if rhs.len() != self.n || rhs.iter().any(|v| !v.is_finite()) {
             return Err(numerical("complex solve", "invalid RHS"));
         }
-        let factors = self.factors.sparse.factors()?;
-        let x = if transposed {
-            factors.solve_transposed(rhs, workspace)?
-        } else {
-            factors.solve(rhs, workspace)?
-        };
-        if x.iter().any(|v| !v.is_finite()) {
+        self.factors
+            .sparse
+            .factors()?
+            .solve_into(rhs, workspace, out, transposed)?;
+        if out.iter().any(|v| !v.is_finite()) {
             return Err(numerical(
                 "complex solve",
                 "non-finite solution/singular system",
             ));
         }
-        Ok(x)
+        Ok(())
     }
 
     /// `spDeterminant`: `(mantissa, decimal exponent)`, with C's

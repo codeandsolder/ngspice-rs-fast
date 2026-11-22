@@ -2604,18 +2604,24 @@ impl<T: Scalar> Sparse<T> {
 
     /// Emit external-order values sequentially. Untranslated unknowns keep
     /// exactly their original RHS bits, including signed zeros.
-    fn scatter_solution(&self, rhs: &[T], x: &[T], transposed: bool) -> SpiceResult<Vec<T>> {
+    fn scatter_solution(
+        &self,
+        rhs: &[T],
+        x: &[T],
+        transposed: bool,
+        result: &mut Vec<T>,
+    ) -> SpiceResult<()> {
         let indices = if transposed {
             &self.topology.ext_to_int_row
         } else {
             &self.topology.ext_to_int_col
         };
-        let mut result = Vec::new();
-        sparse_reserve(&mut result, rhs.len())?;
+        result.clear();
+        sparse_reserve(result, rhs.len())?;
         result.extend(rhs.iter().zip(&indices[1..]).map(|(&value, &internal)| {
             if internal == NONE { value } else { x[internal] }
         }));
-        Ok(result)
+        Ok(())
     }
 }
 
@@ -2628,16 +2634,9 @@ pub(super) struct FactorView<'a, T> {
 
 impl<T: Scalar> FactorView<'_, T> {
     pub(super) fn solve(&self, rhs: &[T], workspace: &mut Vec<T>) -> SpiceResult<Vec<T>> {
-        self.frame.gather_rhs(rhs, workspace, false)?;
-        match self.plan {
-            FactorPlan::Compact(runs) => {
-                runs.solve(&self.frame.values, &self.frame.topology.diag, workspace);
-            }
-            FactorPlan::Wide(runs) => {
-                runs.solve(&self.frame.values, &self.frame.topology.diag, workspace);
-            }
-        }
-        self.frame.scatter_solution(rhs, workspace, false)
+        let mut out = Vec::new();
+        self.solve_into(rhs, workspace, &mut out, false)?;
+        Ok(out)
     }
 
     pub(super) fn solve_transposed(
@@ -2645,16 +2644,34 @@ impl<T: Scalar> FactorView<'_, T> {
         rhs: &[T],
         workspace: &mut Vec<T>,
     ) -> SpiceResult<Vec<T>> {
-        self.frame.gather_rhs(rhs, workspace, true)?;
-        match self.plan {
-            FactorPlan::Compact(runs) => {
+        let mut out = Vec::new();
+        self.solve_into(rhs, workspace, &mut out, true)?;
+        Ok(out)
+    }
+
+    pub(super) fn solve_into(
+        &self,
+        rhs: &[T],
+        workspace: &mut Vec<T>,
+        out: &mut Vec<T>,
+        transposed: bool,
+    ) -> SpiceResult<()> {
+        self.frame.gather_rhs(rhs, workspace, transposed)?;
+        match (self.plan, transposed) {
+            (FactorPlan::Compact(runs), false) => {
+                runs.solve(&self.frame.values, &self.frame.topology.diag, workspace);
+            }
+            (FactorPlan::Wide(runs), false) => {
+                runs.solve(&self.frame.values, &self.frame.topology.diag, workspace);
+            }
+            (FactorPlan::Compact(runs), true) => {
                 runs.solve_transposed(&self.frame.values, &self.frame.topology.diag, workspace);
             }
-            FactorPlan::Wide(runs) => {
+            (FactorPlan::Wide(runs), true) => {
                 runs.solve_transposed(&self.frame.values, &self.frame.topology.diag, workspace);
             }
         }
-        self.frame.scatter_solution(rhs, workspace, true)
+        self.frame.scatter_solution(rhs, workspace, transposed, out)
     }
 
     /// `spDeterminant`: normalized decimal mantissa and exponent.

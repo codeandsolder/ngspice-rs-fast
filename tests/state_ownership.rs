@@ -116,14 +116,14 @@ fn slots_and_branch_ranges_are_separate_namespaces() {
     assert_eq!(circuit.state_rows(0), Some(0..1));
     assert_eq!(circuit.state_rows(1), Some(1..2));
     assert_eq!(circuit.state_len(), 2);
-    assert_eq!(circuit.state_history().len(), 2);
+    assert_eq!(circuit.state_history().unwrap().len(), 2);
 }
 
 #[test]
 fn newton_trials_and_rejected_steps_never_advance_accepted_history() {
     let log = Log::default();
     let circuit = circuit(&log);
-    let mut history = circuit.state_history();
+    let mut history = circuit.state_history().unwrap();
     let first = load(&circuit, &history, &[1.0, 2.0, 0.0]).unwrap();
     circuit
         .accept_point(
@@ -172,7 +172,7 @@ fn newton_trials_and_rejected_steps_never_advance_accepted_history() {
 fn failed_commits_and_accept_hooks_are_atomic() {
     let log = Log::default();
     let circuit = circuit(&log);
-    let mut history = circuit.state_history();
+    let mut history = circuit.state_history().unwrap();
     let x = Vector::from_slice(&[1.0, 1.0, 0.0]);
     // An unloaded trial has unset slots: rejected before any hook runs.
     let unloaded = history.trial();
@@ -223,7 +223,7 @@ fn failed_commits_and_accept_hooks_are_atomic() {
 fn loads_validate_dimensions_and_stale_numbering() {
     let log = Log::default();
     let mut circuit = circuit(&log);
-    let history = circuit.state_history();
+    let history = circuit.state_history().unwrap();
     assert!(load(&circuit, &history, &[1.0, 1.0]).is_err());
     assert!(load(&circuit, &history, &[f64::NAN, 1.0, 0.0]).is_err());
     assert!(load(&circuit, &StateHistory::new(1), &[1.0, 1.0, 0.0]).is_err());
@@ -237,4 +237,117 @@ fn loads_validate_dimensions_and_stale_numbering() {
         .unwrap();
     let error = load(&circuit, &history, &[1.0, 1.0, 0.0]).unwrap_err();
     assert!(error.to_string().contains("stale"), "{error}");
+}
+
+#[test]
+fn equal_length_foreign_histories_and_trials_are_rejected() {
+    let log = Log::default();
+    let a = circuit(&log);
+    let b = circuit(&log);
+    let mut history = a.state_history().unwrap();
+    let mut foreign = b.state_history().unwrap();
+    let x = [1., 2., 0.];
+    let trial = load(&a, &history, &x).unwrap();
+    assert_eq!(history.len(), foreign.len());
+    assert!(load(&a, &foreign, &x).is_err());
+    assert!(foreign.commit(trial.clone()).is_err());
+    assert!(
+        b.accept_point(&Vector::from_slice(&x), None, &mut history, trial.clone())
+            .is_err()
+    );
+    assert!(
+        a.accept_point(&Vector::from_slice(&x), None, &mut foreign, trial)
+            .is_err()
+    );
+    assert!(log.borrow().is_empty());
+}
+
+#[test]
+fn accepted_revisions_distinguish_sibling_histories() {
+    use ngspice_rs::devices::IterationPhase;
+
+    let circuit = circuit(&Log::default());
+    let mut left = circuit.state_history().unwrap();
+    let mut right = left.clone();
+    let initial = load(&circuit, &left, &[1., 2., 0.]).unwrap();
+    let alternative = load(&circuit, &right, &[3., 4., 0.]).unwrap();
+    left.commit(initial.clone()).unwrap();
+    right.commit(alternative).unwrap();
+    assert_eq!(left.depth(), right.depth());
+    let next = load(&circuit, &left, &[1., 1., 0.]).unwrap();
+    assert!(right.trial_in(IterationPhase::Float, Some(&next)).is_err());
+    assert!(right.commit(next.clone()).is_err());
+    assert!(left.commit(initial).is_err());
+    let mut next_copy = next.clone();
+    assert!(right.device_of(&mut next_copy, 0).is_err());
+    assert!(left.device_of(&mut next_copy, 2).is_err());
+    assert!(left.device(&mut next_copy, 0..1).is_err());
+    assert!(left.device_of(&mut next_copy, 0).is_ok());
+    left.clear();
+    assert!(left.commit(next).is_err());
+}
+
+#[test]
+fn a_same_size_edit_invalidates_state_and_failed_setup_publishes_nothing() {
+    let mut circuit = circuit(&Log::default());
+    let previous = circuit.state_history().unwrap();
+    let x = [1., 2., 0.];
+    circuit.finalize().unwrap();
+    assert!(load(&circuit, &previous, &x).is_ok());
+    circuit.swap_devices(0, 1).unwrap();
+    assert!(circuit.state_history().is_err());
+    assert!(circuit.new_matrix().is_err());
+    assert_eq!(circuit.state_rows(0), None);
+    assert!(load(&circuit, &previous, &x).is_err());
+    circuit.finalize().unwrap();
+    assert_eq!(circuit.state_len(), previous.len());
+    assert!(load(&circuit, &previous, &x).is_err());
+    assert!(load(&circuit, &circuit.state_history().unwrap(), &x).is_ok());
+
+    let node = circuit.nodes().get("a").unwrap();
+    circuit
+        .replace_device(
+            1,
+            Box::new(Resistor::new("x2", [node, NodeId::GROUND], 1.).unwrap()),
+        )
+        .unwrap();
+    assert!(circuit.finalize().is_err());
+    assert!(circuit.new_matrix().is_err());
+    assert!(circuit.state_history().is_err());
+    assert!(circuit.matrix_pattern().is_none());
+}
+
+#[test]
+fn explicit_snapshots_and_changed_branch_and_state_counts_follow_topology() {
+    let mut a = circuit(&Log::default());
+    let b = circuit(&Log::default());
+    let history = a.state_history().unwrap();
+    let trial = load(&a, &history, &[1., 2., 0.]).unwrap();
+    let snapshot = trial.snapshot().unwrap();
+    assert_eq!(snapshot.values(), &[1., 2.]);
+    assert!(history.trial().snapshot().is_err());
+    assert!(
+        b.small_signal_system_at(&ModelContext::default(), &Vector::zeros(3), Some(&snapshot))
+            .is_err()
+    );
+    assert!(a.bind_state(vec![0.]).is_err());
+    assert!(a.bind_state(vec![0., f64::NAN]).is_err());
+    let node = a.nodes().get("a").unwrap();
+    a.replace_device(
+        1,
+        Box::new(Resistor::new("r2", [node, NodeId::GROUND], 1.).unwrap()),
+    )
+    .unwrap();
+    assert!(a.new_matrix().is_err());
+    a.finalize().unwrap();
+    assert_eq!(a.unknown_count(), 2);
+    assert_eq!(a.state_len(), 1);
+    assert!(
+        a.small_signal_system_at(&ModelContext::default(), &Vector::zeros(2), Some(&snapshot))
+            .is_err()
+    );
+    assert!(load(&a, &history, &[1., 2.]).is_err());
+    assert_eq!(a.unknowns().checked_node_row(NodeId::GROUND).unwrap(), None);
+    assert!(a.unknowns().checked_node_row(NodeId::new(99)).is_err());
+    assert!(a.unknowns().checked_node_row(node).unwrap().is_some());
 }

@@ -486,16 +486,12 @@ pub fn circuit_noise(
     circuit: &Circuit,
     context: &ModelContext,
     bias: &Vector,
-    state: Option<&[Real]>,
+    state: Option<&crate::devices::StateSnapshot>,
 ) -> SpiceResult<Vec<InstanceNoise>> {
     if bias.len() != circuit.unknown_count() || !bias.is_finite() {
         return Err(SpiceError::circuit("invalid noise bias dimensions/values"));
     }
-    if state.is_some_and(|state| state.len() != circuit.state_len()) {
-        return Err(SpiceError::circuit(
-            "noise bias state does not match the circuit numbering",
-        ));
-    }
+    let state = circuit.snapshot_values(state)?;
     // (family, model creation rank, instance rank, entry)
     let mut models = std::collections::BTreeMap::new();
     let replacements = circuit.replacements(context)?;

@@ -63,8 +63,9 @@ configuration matches ngspice's `spconfig.h`: `TRANSLATE`, `EXPANDABLE`,
   last `NIiter` pass, as `tfanal.c` does.
 - **`.pz`.** `maths::pencil` ports C's deflated Muller search: each trial
   loads `A + s E`, reorders as `SMPcReorder(1e-30, 0)` and takes the
-  determinant. It reproduces C's failure modes too (the 201-trial iteration
-  limit, "numerical aberrations"), returning the roots found so far.
+  determinant. It retains C's 200-iteration limit (reported after 201
+  sequence numbers), returning the roots found so far. The reference's
+  aberration flag has no producer in the trial evaluator.
 - **Transient.** The only backend is the trapezoidal/Gear companion driver
   ([TRANSIENT.md](TRANSIENT.md), `dctran.c`); each timepoint is a Newton
   solve through `solve_ni`. `backend=diffsol` is an explicit `Unsupported`
@@ -157,6 +158,54 @@ retained. The counters do not include assembly validation outside the cache
 (e.g. construction of a complex operator), detached snapshots, or earlier
 pattern epochs. See [PERFORMANCE.md](PERFORMANCE.md) for benchmark output
 and interpretation.
+
+## Pole-zero trial lifecycle (#27)
+
+The pole-zero search is split into the reusable affine matrix load and
+determinant evaluator (`maths::pencil`), scheduler
+(`maths::pencil::search`), linked trial arena (`search::arena`) and the
+deflated quadratic/Muller kernels (`search::kernels`). A proposal is a
+frequency until its determinant is evaluated; an accepted trial receives a
+stable arena identity. A collision with a previously accepted root increments
+its positive multiplicity without creating a detached trial. The arena owns
+both links, immutable linked frequencies and the anchor. Insertions check
+finite frequencies and live link targets; pruning retires an ID permanently.
+C’s sample-collision scan can stop before visiting a lower-frequency
+complex trial, so link order is not a strict frequency-order invariant.
+The arena preserves the scanned predecessor, including this collision path,
+until root verification prunes nearby and complex samples. Invalid or retired
+trial identities produce numerical errors.
+
+Neighborhoods distinguish missing-middle, missing-right and missing-left
+initialization (in that priority), a complete real bracket, incomplete complex
+seeds, the complete Muller triple, and a center minimum. A strategy is either
+navigation along the linked list or an evaluation with its required IDs.
+Bracket regions and movement directions are explicit. C's selection predicate
+uses the center minimum before the imaginary part of the left slot; the other
+slot values retain their original meanings. Real-bracket ties, collision
+shifts, repeated-root deflation and link order are preserved. The reference
+`CKTpzVerify` always accepts a root, so there is no unsuccessful verification
+state. The reference never sets `ISANABERRATION`; its `NFlat` counter is only
+used in debug printing. Neither is a fabricated production transition.
+
+`conformance/pencil_search_traces.txt` pins five complete traces from C
+commit `059066b532f7073fccf4173ef269309eafdc7f0c` on x86_64 Linux using the
+SPARSE backend. The ordinary unit test
+`analysis::pz::tests::pinned_c_trial_sequences` constructs the same production
+pencil loads and compares every binary64 proposal, actual load frequency,
+determinant mantissa (including signed zero) and binary exponent. The cases
+cover repeated and near-coincident roots, a complex pair, a singular pencil,
+and C's iteration-limited notch. The 697 records were captured from the pinned
+C binary without modifying its code: function-entry/return breakpoints on
+`PZeval` (return: third argument's `PZtrial*`, first two doubles),
+`CKTpzLoad` (entry: second argument points to two doubles), and `SMPcDProd`
+(return: second argument's complex mantissa and third argument's exponent).
+On System V x86_64 those pointers enter via `rdx`, `rsi`, and
+`rsi`/`rdx` respectively. Each deck was run with `.control; run; quit; .endc`
+before `.end`. Both the pre-refactor Rust trace and the typed search reproduce
+all 697 records exactly. A different compiler/libm/architecture should be
+investigated if it produces a divergent trace rather than relaxing the
+convergence criteria.
 
 ## Error policy (C's)
 

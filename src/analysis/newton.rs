@@ -395,6 +395,7 @@ impl CircuitNewton<'_> {
                     solution: new,
                     previous: old,
                     trial,
+                    history: self.history,
                     model_context: self.context,
                     time,
                     reltol: options.reltol,

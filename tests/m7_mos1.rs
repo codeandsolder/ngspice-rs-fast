@@ -169,10 +169,9 @@ fn transient_meyer_charge_advances_with_the_averaged_half_capacitances() {
          .model mm nmos(vto=0.8 kp=50u tox=20n cgso=0.4n cgdo=0.3n)",
     );
     let solved = bias(&c);
-    let mut history = c.state_history();
-    for _ in 0..ngspice_rs::devices::ACCEPTED_DEPTH {
-        history.commit(solved.trial.clone()).unwrap();
-    }
+    let mut history = c.state_history().unwrap();
+    history.commit(solved.trial.clone()).unwrap();
+    history.seed_accepted_history().unwrap();
     let cox = 3.9 * EPS0 / 20e-9 * 2e-6 * 10e-6;
     let (ovs, ovd) = (0.4e-9 * 10e-6, 0.3e-9 * 10e-6);
     let (gs1, gd1) = meyer_linear(2. - 0.8, 0.2, cox);
@@ -229,10 +228,9 @@ fn transient_companion_jacobian_is_exact_where_the_meyer_halves_are_constant() {
          + cj=0.5m cjsw=0.4n mjsw=0.33 cgso=0.4n cgdo=0.3n cgbo=0.2n)",
     );
     let solved = bias(&c);
-    let mut history = c.state_history();
-    for _ in 0..ngspice_rs::devices::ACCEPTED_DEPTH {
-        history.commit(solved.trial.clone()).unwrap();
-    }
+    let mut history = c.state_history().unwrap();
+    history.commit(solved.trial.clone()).unwrap();
+    history.seed_accepted_history().unwrap();
     let dt = 1e-9;
     let mut steps = StepHistory::new();
     let first = steps
@@ -292,7 +290,7 @@ fn dc_jacobian_with_series_resistance_body_bias_geometry_and_temperature() {
         let c_gmbs = case == 1;
         let c = circuit(body);
         let context = ModelContext::default();
-        let history = c.state_history();
+        let history = c.state_history().unwrap();
         let solved = bias(&c);
         let system = c.small_signal_system(&context, &solved.values).unwrap();
         let n = c.unknown_count();
@@ -523,7 +521,7 @@ fn meyer_predictor_preserves_history_and_initial_transient_omits_gate_companions
     );
     let n = c.unknown_count();
     let context = ModelContext::default();
-    let mut history = c.state_history();
+    let mut history = c.state_history().unwrap();
     let point = |vg, vd, vb| {
         let mut x = Vector::zeros(n);
         for (terminal, value) in [("g", vg), ("d", vd), ("s", 0.), ("b", vb)] {

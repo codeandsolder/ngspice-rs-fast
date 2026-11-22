@@ -158,6 +158,8 @@ pub struct AnalysisContext {
     /// `pivrel`, C `CKTpivotAbsTol`/`CKTpivotRelTol`), default
     /// [`crate::maths::PivotTolerances::DEFAULT`].
     pub pivot: crate::maths::PivotTolerances,
+    /// Limits for retained RF sweeps and their port algebra.
+    pub rf_limits: crate::analysis::RfLimits,
 }
 
 impl AnalysisContext {
@@ -179,6 +181,7 @@ impl Default for AnalysisContext {
             nominal_temperature: 27.0,
             gmin: crate::devices::DEFAULT_GMIN,
             pivot: crate::maths::PivotTolerances::DEFAULT,
+            rf_limits: crate::analysis::RfLimits::default(),
         }
     }
 }

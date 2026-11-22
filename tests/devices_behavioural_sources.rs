@@ -374,7 +374,7 @@ fn branch(circuit: &Circuit, name: &str) -> usize {
 /// One operating-point load of `circuit` at `x`.
 fn load(circuit: &Circuit, x: &Vector, context: &ModelContext) -> (SparseMatrix, Vector) {
     let n = circuit.unknown_count();
-    let history = circuit.state_history();
+    let history = circuit.state_history().unwrap();
     let mut trial = history.trial();
     let mut a = SparseMatrix::new(n, n);
     let mut b = Vector::zeros(n);

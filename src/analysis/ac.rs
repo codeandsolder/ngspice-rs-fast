@@ -168,7 +168,7 @@ pub(super) fn ac_matrix(
 pub(super) struct SmallSignal {
     settings: crate::analysis::bias::DcSettings,
     start: crate::analysis::bias::OperatingPointStart,
-    state1: Vec<Real>,
+    state1: crate::devices::StateSnapshot,
     system: LinearSystem,
     /// A `hertz`-dependent device forces a new operating point per frequency.
     varies: bool,
@@ -199,10 +199,12 @@ impl SmallSignal {
         // a switch is that of the accepted history, not of the converged
         // operating point (`swacload.c`/`cswacld.c`). The operating point's own
         // trial state is therefore deliberately not used here.
-        let history = circuit.state_history();
-        let state1 = history
-            .accepted(1)
-            .map_or_else(|| vec![0.; history.len()], <[Real]>::to_vec);
+        let history = circuit.state_history()?;
+        let state1 = circuit.bind_state(
+            history
+                .accepted(1)
+                .map_or_else(|| vec![0.; history.len()], <[Real]>::to_vec),
+        )?;
         let system = circuit.small_signal_system_at(
             &context.model_context(),
             &solved.values,
@@ -271,7 +273,7 @@ impl SmallSignal {
 
     /// The small-signal state (C's `CKTstate0` after the `MODEINITSMSIG`
     /// load): the zero accepted state.
-    pub(crate) fn state(&self) -> &[Real] {
+    pub(crate) const fn state(&self) -> &crate::devices::StateSnapshot {
         &self.state1
     }
 
@@ -347,10 +349,14 @@ mod tests {
     }
 
     fn carried(circuit: &Circuit) -> Vec<Option<Real>> {
-        let history = circuit.state_history();
+        let history = circuit.state_history().unwrap();
         let mut trial = history.trial();
-        let state = history.device(&mut trial, 0..history.len()).unwrap();
-        (0..history.len()).map(|slot| state.carried(slot)).collect()
+        let mut values = Vec::new();
+        for index in 0..circuit.device_count() {
+            let state = history.device_of(&mut trial, index).unwrap();
+            values.extend((0..state.len()).map(|slot| state.carried(slot)));
+        }
+        values
     }
 
     #[test]

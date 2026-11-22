@@ -414,7 +414,7 @@ fn model_backed_capacitors_and_inductors_own_companion_state() {
     let circuit = Circuit::from_netlist(&n).unwrap();
     assert_eq!(circuit.state_rows(0), Some(0..2));
     assert_eq!(circuit.state_rows(1), Some(2..4));
-    let mut history = circuit.state_history();
+    let mut history = circuit.state_history().unwrap();
     let solution = Vector::from_slice(&[1.0, 0.5]);
     let context = ModelContext::default();
     fn request<'a>(
@@ -495,7 +495,7 @@ fn fixed_passive_batches_match_unbound_stamps() {
     let n = circuit.unknown_count();
     let solution = Vector::from_slice(&[2., -1., 0.5]);
     assert_eq!(n, solution.len());
-    let mut history = circuit.state_history();
+    let mut history = circuit.state_history().unwrap();
     let model = ModelContext::default();
     let mut initial = history.trial();
     circuit
