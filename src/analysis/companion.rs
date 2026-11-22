@@ -885,13 +885,8 @@ impl Driver<'_> {
         // The t = 0 point also starts every transmission line's delay
         // history (traload.c, MODEINITTRAN); it requests no breakpoints.
         let acceptance = self.delay_acceptance(self.settings.max_step, true);
-        self.circuit.accept_transient_point(
-            &x,
-            0.,
-            &mut self.history,
-            trial.clone(),
-            &acceptance,
-        )?;
+        self.circuit
+            .accept_transient_point(&x, 0., &mut self.history, trial, &acceptance)?;
         self.history.seed_accepted_history()?;
         Ok(x)
     }
