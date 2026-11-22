@@ -247,6 +247,22 @@ fn transient_stats(name: &str, text: &str) {
         "workload={name},accepted={},rejected={},breakpoints={},min_step={:e},max_step={:e}",
         stats.accepted, stats.rejected, stats.breakpoints, stats.min_step, stats.max_step
     );
+    if name == "ltra_history" {
+        let work = stats.ltra;
+        println!(
+            "workload={name},attempts={},newton_loads={},line_loads={},coefficient_preparations={},convolution_evaluations={}",
+            work.attempts,
+            work.newton_loads,
+            work.line_loads,
+            work.coefficient_preparations,
+            work.convolution_evaluations
+        );
+        assert_eq!(work.attempts, stats.accepted + stats.rejected);
+        assert_eq!(work.coefficient_preparations, work.attempts);
+        assert_eq!(work.convolution_evaluations, work.attempts);
+        assert_eq!(work.line_loads, work.newton_loads);
+        assert!(work.line_loads > work.convolution_evaluations);
+    }
 }
 
 pub(super) fn rc() {

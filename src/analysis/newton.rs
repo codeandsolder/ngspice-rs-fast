@@ -14,11 +14,12 @@
 //! ([`IterationPhase`], `niiter.c`), hands it the previous load's trial (C's
 //! `CKTstate0` survives between iterations) and refuses to converge on a load
 //! a device marked nonconvergent (C `CKTnoncon`), as the S/W switches need.
+use crate::devices::circuit::PreparedTransient;
 use crate::devices::{
     AnalysisMode, ConvergenceRequest, Forcing, IterationPhase, LoadRequest, ModelContext,
     PreparedRun, StateHistory, TrialState,
 };
-use crate::maths::{Coefficients, SparseMatrix, Vector};
+use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// Largest accepted per-solve Newton iteration limit (`maxiter`, deck `itl1`).
@@ -296,14 +297,15 @@ pub fn solve_phased(
 /// The two circuit-load modes driven by the real Newton solver. Keeping
 /// transient-only state together prevents DC callers from accidentally
 /// providing integration coefficients or the transient convergence time.
-pub(super) enum CircuitLoad<'a> {
+pub(super) enum CircuitLoad<'a, 'p> {
     Bias {
+        prepared: &'a PreparedRun<'a>,
+        context: &'a ModelContext,
+        history: &'a StateHistory,
         forcing: Option<Forcing>,
     },
     Transient {
-        time: Real,
-        coefficients: &'a Coefficients,
-        forcing: Forcing,
+        attempt: &'a mut PreparedTransient<'p>,
         uic: bool,
     },
 }
@@ -312,46 +314,45 @@ pub(super) enum CircuitLoad<'a> {
 /// from accepted history and the previous disposable trial, stamps the circuit,
 /// and runs device convergence tests with the same options that loaded it.
 /// Acceptance is deliberately left to the outer analysis.
-pub(super) struct CircuitNewton<'a> {
-    pub prepared: &'a PreparedRun<'a>,
-    pub context: &'a ModelContext,
-    pub history: &'a StateHistory,
+pub(super) struct CircuitNewton<'a, 'p> {
     pub branch_rows: &'a [bool],
     pub limited_rows: Option<&'a [bool]>,
     pub options: &'a NewtonOptions,
-    pub load: CircuitLoad<'a>,
+    pub load: CircuitLoad<'a, 'p>,
 }
 
-impl CircuitNewton<'_> {
+impl CircuitNewton<'_, '_> {
     /// The bias point may add forcing rows after the circuit load; ordinary
     /// transient trials pass a no-op postload. The phase sequence and device
     /// state never escape the common driver until Newton has converged.
     pub(super) fn solve(
-        &self,
+        &mut self,
         initial: &Vector,
         policy: PhasePolicy,
         continued: Option<TrialState>,
         mut after_load: impl FnMut(IterationPhase, &mut SparseMatrix, &mut Vector) -> SpiceResult<()>,
     ) -> Result<NewtonSolution<TrialState>, NewtonFailure> {
-        let (mode, integration, forcing, time) = match self.load {
-            CircuitLoad::Bias { forcing } => (AnalysisMode::OperatingPoint, None, forcing, 0.),
-            CircuitLoad::Transient {
-                time,
-                coefficients,
+        // Both stamping and convergence read the same attempt-bound model
+        // and accepted history, with no second caller-supplied identity.
+        let (prepared, context, history, forcing, time, uic, mut attempt) = match &mut self.load {
+            CircuitLoad::Bias {
+                prepared,
+                context,
+                history,
                 forcing,
-                ..
-            } => (
-                AnalysisMode::Transient {
-                    time,
-                    dt: coefficients.dt(),
-                },
-                Some(coefficients),
-                Some(forcing),
-                time,
+            } => (*prepared, *context, *history, *forcing, 0., None, None),
+            CircuitLoad::Transient { attempt, uic } => (
+                attempt.run(),
+                attempt.context(),
+                attempt.history(),
+                None,
+                attempt.time(),
+                Some(*uic),
+                Some(&mut **attempt),
             ),
         };
         let options = self.options;
-        let circuit = self.prepared.circuit();
+        let circuit = prepared.circuit();
         solve_phased(
             initial,
             self.branch_rows,
@@ -362,12 +363,11 @@ impl CircuitNewton<'_> {
             |guess, phase, previous| {
                 let mut matrix = circuit.new_matrix()?;
                 let mut rhs = Vector::zeros(circuit.unknown_count());
-                let mut trial = self
-                    .history
+                let mut trial = history
                     .trial_in(phase, previous)?
                     .with_device_limiting(options.limiting.is_device())
                     .with_convergence_tolerances(options.reltol, options.abstol);
-                if let CircuitLoad::Transient { uic, .. } = self.load {
+                if let Some(uic) = uic {
                     trial = trial
                         .with_initial_transient(
                             policy == PhasePolicy::InitialTransient
@@ -375,29 +375,33 @@ impl CircuitNewton<'_> {
                         )
                         .with_uic(uic);
                 }
-                self.prepared.load(
-                    &LoadRequest {
-                        mode,
-                        solution: guess,
-                        model_context: self.context,
-                        integration,
-                        history: self.history,
-                        forcing,
-                    },
-                    &mut matrix,
-                    &mut rhs,
-                    &mut trial,
-                )?;
+                if let Some(attempt) = &mut attempt {
+                    attempt.load(guess, &mut matrix, &mut rhs, &mut trial)?;
+                } else {
+                    prepared.load(
+                        &LoadRequest {
+                            mode: AnalysisMode::OperatingPoint,
+                            solution: guess,
+                            model_context: context,
+                            integration: None,
+                            history,
+                            forcing,
+                        },
+                        &mut matrix,
+                        &mut rhs,
+                        &mut trial,
+                    )?;
+                }
                 after_load(phase, &mut matrix, &mut rhs)?;
                 Ok((matrix, rhs, trial))
             },
             |new, old, trial| {
-                self.prepared.convergence_test(&ConvergenceRequest {
+                prepared.convergence_test(&ConvergenceRequest {
                     solution: new,
                     previous: old,
                     trial,
-                    history: self.history,
-                    model_context: self.context,
+                    history,
+                    model_context: context,
                     time,
                     reltol: options.reltol,
                     abstol: options.abstol,

@@ -115,6 +115,7 @@ struct PointLoads<'a, 'b> {
     mutual: Option<crate::devices::circuit::PreparedMutualTerms>,
     scratch: Option<(SparseMatrix, Vector)>,
     currents: BTreeMap<usize, Vec<Real>>,
+    ltra: Option<&'a mut super::ltra::LtraWorkspace>,
 }
 
 impl PointLoads<'_, '_> {
@@ -159,6 +160,7 @@ impl PointLoads<'_, '_> {
             rhs,
             &mut trial,
             self.mutual.as_deref().unwrap_or(&[]),
+            self.ltra.as_deref_mut(),
         )?;
         if device.designator() == 'i' {
             let value = device
@@ -294,6 +296,7 @@ impl Circuit {
         sources: &[(&str, Real)],
         time: Option<(Real, Forcing)>,
         previous: Option<&TrialState>,
+        ltra: Option<&mut super::ltra::LtraWorkspace>,
     ) -> SpiceResult<Vec<Complex>> {
         self.validate_history(request.history)?;
         if let Some(trial) = previous {
@@ -313,6 +316,7 @@ impl Circuit {
             mutual: None,
             scratch: None,
             currents: BTreeMap::new(),
+            ltra,
         };
         self.runtime
             .observations
@@ -423,6 +427,26 @@ impl Circuit {
     }
 }
 
+impl super::circuit::PreparedTransient<'_> {
+    /// Observe the converged solution with the same immutable delay inputs.
+    pub(crate) fn observe(
+        &mut self,
+        solution: &Vector,
+        previous: &TrialState,
+    ) -> SpiceResult<Vec<Complex>> {
+        let request = self.request(solution);
+        let time = request.forcing.map(|forcing| (self.time(), forcing));
+        self.run.circuit().observe_real_prepared(
+            self.run,
+            &request,
+            &[],
+            time,
+            Some(previous),
+            Some(&mut self.workspace),
+        )
+    }
+}
+
 impl PreparedRun<'_> {
     /// Observe a real point with the run's already prepared devices.
     /// # Errors
@@ -435,7 +459,7 @@ impl PreparedRun<'_> {
         previous: Option<&TrialState>,
     ) -> SpiceResult<Vec<Complex>> {
         self.circuit()
-            .observe_real_prepared(self, request, sources, time, previous)
+            .observe_real_prepared(self, request, sources, time, previous, None)
     }
 
     /// Observe scalar device parameters in the prepared context.

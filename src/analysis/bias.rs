@@ -1367,13 +1367,13 @@ impl Engine<'_> {
             .map_or(*self.context, |junction| self.context.with_gmin(junction))
             .with_source_factor(scale);
         let result = CircuitNewton {
-            prepared: self.prepared,
-            context: &context,
-            history: self.history,
             branch_rows: &self.branches,
             limited_rows: self.limited.as_deref(),
             options: &options,
             load: CircuitLoad::Bias {
+                prepared: self.prepared,
+                context: &context,
+                history: self.history,
                 forcing: self.forcing,
             },
         }

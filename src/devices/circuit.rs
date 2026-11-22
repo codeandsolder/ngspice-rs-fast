@@ -27,6 +27,7 @@ use crate::devices::elaboration::{
     ElaborationLimits, ElaborationSize, ExpansionKind, PlannedBatch, reserve, resource_error,
 };
 use crate::devices::linear::Forcing;
+use crate::devices::ltra::{LtraWork, LtraWorkspace};
 use crate::devices::models::ModelContext;
 use crate::devices::mutual::validation::ValidationBudget;
 use crate::devices::mutual::{CouplingSite, MutualLimits, pair_count};
@@ -240,11 +241,88 @@ impl std::ops::Deref for PreparedMutualTerms {
 /// Analysis-owned effective device preparation.
 ///
 /// The circuit is borrowed immutably for the run, so no topology edit can invalidate a live view.
-/// Only the most recent exact context is retained; neither trial history nor
-/// solver workspaces are owned by this object.
+/// Only the most recent exact model context is retained. Transient attempts
+/// borrow their accepted history and reuse this run's LTRA scratch allocation;
+/// the prepared inputs themselves remain local to a single attempt.
 pub struct PreparedRun<'a> {
     circuit: &'a Circuit,
     point: std::cell::RefCell<Option<PreparedPoint>>,
+    ltra: std::cell::RefCell<LtraWorkspace>,
+}
+
+/// One transient proposal, binding exact time, physical context and immutable
+/// accepted history for repeated Newton loads and isolated observations.
+/// Exclusive scratch ownership prevents another proposal from reusing it.
+pub(crate) struct PreparedTransient<'a> {
+    pub(super) run: &'a PreparedRun<'a>,
+    history: &'a StateHistory,
+    context: &'a ModelContext,
+    coefficients: &'a Coefficients,
+    time: Real,
+    forcing: Forcing,
+    pub(super) workspace: std::cell::RefMut<'a, LtraWorkspace>,
+}
+
+impl Drop for PreparedTransient<'_> {
+    fn drop(&mut self) {
+        self.workspace.finish();
+    }
+}
+
+impl<'a> PreparedTransient<'a> {
+    pub(crate) const fn time(&self) -> Real {
+        self.time
+    }
+
+    pub(crate) const fn run(&self) -> &'a PreparedRun<'a> {
+        self.run
+    }
+
+    pub(crate) const fn history(&self) -> &'a StateHistory {
+        self.history
+    }
+
+    pub(crate) const fn context(&self) -> &'a ModelContext {
+        self.context
+    }
+
+    /// A request can vary the Newton solution but never the accepted history
+    /// or model/time parameters that determine a prepared delay input.
+    pub(super) const fn request<'s>(&self, solution: &'s Vector) -> LoadRequest<'s>
+    where
+        'a: 's,
+    {
+        LoadRequest {
+            mode: AnalysisMode::Transient {
+                time: self.time,
+                dt: self.coefficients.dt(),
+            },
+            solution,
+            model_context: self.context,
+            integration: Some(self.coefficients),
+            history: self.history,
+            forcing: Some(self.forcing),
+        }
+    }
+
+    pub(crate) fn load(
+        &mut self,
+        solution: &Vector,
+        matrix: &mut SparseMatrix,
+        rhs: &mut Vector,
+        trial: &mut TrialState,
+    ) -> SpiceResult<()> {
+        let request = self.request(solution);
+        self.workspace.work.newton_loads += 1;
+        self.run.circuit.load_prepared(
+            self.run,
+            &request,
+            matrix,
+            rhs,
+            trial,
+            Some(&mut self.workspace),
+        )
+    }
 }
 
 pub(super) struct PreparedPoint {
@@ -311,6 +389,36 @@ impl<'a> PreparedRun<'a> {
             .map_err(|_| SpiceError::circuit("missing prepared model context"))
     }
 
+    /// Begin a proposal without eagerly evaluating devices: preserve load-order
+    /// errors and avoid allocating convolution weights for non-LTRA devices.
+    pub(crate) fn transient_attempt<'s>(
+        &'s self,
+        history: &'s StateHistory,
+        context: &'s ModelContext,
+        time: Real,
+        coefficients: &'s Coefficients,
+        forcing: Forcing,
+    ) -> SpiceResult<PreparedTransient<'s>> {
+        let mut workspace = self
+            .ltra
+            .try_borrow_mut()
+            .map_err(|_| SpiceError::circuit("a transient proposal is already active"))?;
+        workspace.begin();
+        Ok(PreparedTransient {
+            run: self,
+            history,
+            context,
+            coefficients,
+            time,
+            forcing,
+            workspace,
+        })
+    }
+
+    pub(crate) fn ltra_work(&self) -> LtraWork {
+        self.ltra.borrow().work
+    }
+
     /// Validate the ordered overrides at a physical point without stamping.
     /// # Errors
     /// Invalid model context, foreign targets, conflicting setters, or device physics.
@@ -329,7 +437,7 @@ impl<'a> PreparedRun<'a> {
         trial: &mut TrialState,
     ) -> SpiceResult<()> {
         self.circuit
-            .load_prepared(self, request, matrix, rhs, trial)
+            .load_prepared(self, request, matrix, rhs, trial, None)
     }
 
     /// Check convergence using the same effective devices as the load.
@@ -684,6 +792,7 @@ impl Circuit {
         PreparedRun {
             circuit: self,
             point: std::cell::RefCell::new(None),
+            ltra: std::cell::RefCell::new(LtraWorkspace::new()),
         }
     }
 
@@ -2181,7 +2290,7 @@ impl Circuit {
             ));
         }
         let mutual = self.prepared_mutual_terms(request.model_context)?;
-        self.stamp_isolated(index, device, request, matrix, rhs, trial, &mutual)
+        self.stamp_isolated(index, device, request, matrix, rhs, trial, &mutual, None)
     }
 
     /// A checked isolated load's shared stamping path. Observations reuse the
@@ -2199,8 +2308,13 @@ impl Circuit {
         rhs: &mut Vector,
         trial: &mut TrialState,
         mutual: &[Vec<MutualTerm>],
+        ltra: Option<&mut LtraWorkspace>,
     ) -> SpiceResult<()> {
-        let states = request.history.device_of(trial, index)?;
+        let states =
+            request
+                .history
+                .device_of(trial, index)?
+                .with_ltra(ltra, request.history, index);
         device.stamp(&mut StampContext {
             matrix,
             rhs,
@@ -2438,6 +2552,7 @@ impl Circuit {
         matrix: &mut SparseMatrix,
         rhs: &mut Vector,
         trial: &mut TrialState,
+        ltra: Option<&mut LtraWorkspace>,
     ) -> SpiceResult<()> {
         self.validate_history(request.history)?;
         request.history.check_trial(trial)?;
@@ -2469,6 +2584,7 @@ impl Circuit {
             &point,
             &mutual,
             &mut voltage_source_value,
+            ltra,
         );
         self.runtime
             .fixed_stamps
@@ -2493,10 +2609,15 @@ impl Circuit {
         point: &PreparedPoint,
         mutual: &[Vec<MutualTerm>],
         voltage_source_value: &mut Real,
+        mut ltra: Option<&mut LtraWorkspace>,
     ) -> SpiceResult<()> {
         for (position, index) in self.load_order().enumerate() {
             let device = point.device(self, index);
-            let states = request.history.device_of(trial, index)?;
+            let states = request.history.device_of(trial, index)?.with_ltra(
+                ltra.as_deref_mut(),
+                request.history,
+                index,
+            );
             matrix.begin_device(position)?;
             device.stamp(&mut StampContext {
                 matrix: &mut *matrix,
@@ -3618,6 +3739,205 @@ mod tests {
     use petgraph::algo::{connected_components, has_path_connecting};
     use petgraph::graph::NodeIndex;
     use petgraph::visit::EdgeRef;
+
+    // Compare the actual production load and observation paths, not just a
+    // synthetic cache lookup. Synthetic accepted histories intentionally
+    // include equal-length timelines with different interior knots.
+    #[test]
+    fn ltra_attempts_preserve_stamps_and_separate_histories() {
+        use super::{LoadRequest, ModelContext};
+        use crate::devices::{
+            Forcing, Limit, StateHistory, TransientTiming,
+            delay::{DelayUpdate, WaveformUpdate},
+            state::HistoryPublication,
+        };
+        use crate::maths::{IntegrationMethod, SparseMatrix, StepHistory, Vector};
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use crate::primitives::Real;
+        use std::path::Path;
+
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("attempts.cir"),
+                "LTRA preparations
+o1 a 0 b 0 rc
+o2 c 0 d 0 rc
+o3 e 0 f 0 rc
+o4 g 0 h 0 rc2
+o5 i 0 j 0 rlc
+o6 k 0 l 0 lc
+o7 m 0 n 0 rg
+.model rc ltra r=1 c=1 len=1
+.model rc2 ltra r=1 c=1 len=1
+.model rlc ltra r=0.1 l=1 c=1 len=1
+.model lc ltra l=1 c=1 len=1
+.model rg ltra r=1 g=1 len=1
+.end
+",
+            ))
+            .unwrap();
+        let mut circuit = Circuit::from_netlist(&deck).unwrap();
+        circuit.finalize().unwrap();
+        circuit
+            .set_observations(&["i(o1)".into(), "i(o2)".into()])
+            .unwrap();
+        let initialize = |history: &mut StateHistory, scale: Real| {
+            let updates = circuit
+                .devices()
+                .iter()
+                .enumerate()
+                .map(|(ordinal, device)| {
+                    let middle = if device.name() == "o3" { 0.75 } else { 1. };
+                    let factor = scale * Real::from(u32::try_from(ordinal + 1).unwrap());
+                    (
+                        ordinal,
+                        DelayUpdate::Waveform(WaveformUpdate {
+                            reset: Some(
+                                [0., middle, 2.]
+                                    .into_iter()
+                                    .map(|time| {
+                                        (
+                                            time,
+                                            vec![
+                                                factor * time,
+                                                0.5 * factor * time,
+                                                -factor * time * time,
+                                                -0.25 * factor * time,
+                                            ],
+                                        )
+                                    })
+                                    .collect(),
+                            ),
+                            ..WaveformUpdate::default()
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let trial = history.trial();
+            history
+                .accept_transaction(
+                    trial,
+                    HistoryPublication::Initialize,
+                    |_, _| Ok(updates),
+                    |_| Ok(()),
+                )
+                .unwrap();
+        };
+        let mut history = circuit.state_history().unwrap();
+        initialize(&mut history, 1.);
+        let original = history.clone();
+        let run = circuit.prepare_run();
+        let n = circuit.unknown_count();
+        let forcing = Forcing {
+            limit: Limit::Right,
+            timing: TransientTiming::new(0.25, 4.).unwrap(),
+        };
+        let coefficients = StepHistory::with_fill(0.25)
+            .trial(IntegrationMethod::Trapezoidal, 1, 0.25, 0.5)
+            .unwrap();
+        let model = ModelContext::default();
+        let changed_gmin = model.with_gmin(1e-6);
+
+        let compare = |history: &StateHistory, time: Real, context: &ModelContext| {
+            let before = run.ltra_work();
+            let mut attempt = run
+                .transient_attempt(history, context, time, &coefficients, forcing)
+                .unwrap();
+            assert!(
+                run.transient_attempt(history, context, time, &coefficients, forcing)
+                    .is_err()
+            );
+            let mut result = Vec::new();
+            for iteration in 0..3_u32 {
+                let x = Vector::from_slice(
+                    &(0..n)
+                        .map(|row| {
+                            0.01 * Real::from(u32::try_from(row).unwrap()) + Real::from(iteration)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let request: LoadRequest<'_> = attempt.request(&x);
+                let mut expected = SparseMatrix::new(n, n);
+                let mut actual = SparseMatrix::new(n, n);
+                let mut rhs_expected = Vector::zeros(n);
+                let mut rhs_actual = Vector::zeros(n);
+                let mut trial_expected = history.trial();
+                let mut trial_actual = history.trial();
+                run.load(
+                    &request,
+                    &mut expected,
+                    &mut rhs_expected,
+                    &mut trial_expected,
+                )
+                .unwrap();
+                attempt
+                    .load(&x, &mut actual, &mut rhs_actual, &mut trial_actual)
+                    .unwrap();
+                let signatures = |matrix: &SparseMatrix| {
+                    matrix
+                        .triplets()
+                        .iter()
+                        .map(|t| (t.row, t.col, t.value.to_bits()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(signatures(&actual), signatures(&expected));
+                let bits = |rhs: &Vector| {
+                    rhs.as_slice()
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(&rhs_actual), bits(&rhs_expected));
+                assert_eq!(trial_actual, trial_expected);
+                let expected_obs = run
+                    .observe_real(&request, &[], Some((time, forcing)), Some(&trial_expected))
+                    .unwrap();
+                let actual_obs = attempt.observe(&x, &trial_actual).unwrap();
+                let obs_bits = |values: &[crate::primitives::Complex]| {
+                    values
+                        .iter()
+                        .map(|value| (value.re.to_bits(), value.im.to_bits()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(obs_bits(&actual_obs), obs_bits(&expected_obs));
+                result = bits(&rhs_actual);
+            }
+            drop(attempt);
+            let after = run.ltra_work();
+            assert_eq!(after.attempts - before.attempts, 1);
+            assert_eq!(after.newton_loads - before.newton_loads, 3);
+            assert_eq!(after.line_loads - before.line_loads, 24); // 6 transient lines × 3, plus 2 isolated observations × 3
+            assert_eq!(
+                after.convolution_evaluations - before.convolution_evaluations,
+                6
+            );
+            assert_eq!(
+                after.coefficient_preparations - before.coefficient_preparations,
+                4
+            );
+            result
+        };
+
+        let a = compare(&history, 2.25, &model);
+        let b = compare(&history, 2.5, &model);
+        assert_ne!(a, b);
+        assert_eq!(a, compare(&history, 2.25, &model));
+        assert_eq!(history, original);
+        // Same times and same length, different accepted waveform contents.
+        // A failed/rejected trial has not modified the original/fork.
+        let mut fork = history.clone();
+        fork.clear();
+        initialize(&mut fork, 3.);
+        assert_ne!(a, compare(&fork, 2.25, &model));
+        assert_eq!(a, compare(&history, 2.25, &model));
+        // Context changes must not retain a stale numeric stamp. The LTRA
+        // inputs are unchanged by gmin, which is read by the stamp itself.
+        compare(&history, 2.25, &changed_gmin);
+        history.clear();
+        initialize(&mut history, 2.);
+        assert_ne!(a, compare(&history, 2.25, &model));
+        assert_eq!(a, compare(&original, 2.25, &model));
+    }
 
     #[test]
     fn mutual_pair_and_payload_arithmetic_are_checked() {
