@@ -218,13 +218,13 @@ const GILLESPIE_MIN_PROGRESS: Real = 1e-8;
 /// `gillespie_src`'s zero-source gmin ladder spans ten decades above `gmin`.
 const GILLESPIE_GMIN_DECADES: usize = 10;
 
-/// ngspice's CKTop strategies: adaptive gmin tries both nodal and junction
+/// ngspice's `CKTop` strategies: adaptive gmin tries both nodal and junction
 /// gmin, adaptive source stepping uses Gillespie; fixed counts use Spice3.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NgspiceStepping {
-    /// C CKTnumGminSteps, decoded at construction.
+    /// C `CKTnumGminSteps`, decoded at construction.
     pub gmin: Stepping<MAX_GMIN_STAGES>,
-    /// C CKTnumSrcSteps, decoded at construction.
+    /// C `CKTnumSrcSteps`, decoded at construction.
     pub source: Stepping<MAX_SOURCE_STEPS>,
     gmin_factor: Real,
     adapt_iterations: IterationLimit,
@@ -312,10 +312,10 @@ impl NgspiceStepping {
     }
 }
 
-/// Disjoint strategies: custom ladder data cannot coexist with CKTop data.
+/// Disjoint strategies: custom ladder data cannot coexist with `CKTop` data.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContinuationSchedule {
-    /// ngspice's CKTop strategies.
+    /// ngspice's `CKTop` strategies.
     Ngspice(NgspiceStepping),
     /// The port's fixed, deterministic ladders.
     Ladder {
@@ -470,7 +470,7 @@ impl ContinuationPolicy {
             gmin_factor.unwrap_or(DEFAULT_GMIN_FACTOR),
             gmin_steps.unwrap_or(DEFAULT_GMIN_SCHEDULE.len()),
         )?;
-        let steps = source_steps.unwrap_or(usize::from(DEFAULT_SOURCE_STEPS));
+        let steps = source_steps.unwrap_or_else(|| usize::from(DEFAULT_SOURCE_STEPS));
         let source = (steps > 0)
             .then(|| SourceStepping::uniform(steps, DEFAULT_SOURCE_GMIN))
             .transpose()?;
@@ -1356,7 +1356,7 @@ impl ContinuationPolicy {
     }
 }
 
-/// NIiter may take its configured limit plus the failing extra pass.
+/// `NIiter` may take its configured limit plus the failing extra pass.
 fn iteration_budget(plan: &[Plan<'_>], direct: usize, stage: usize) -> usize {
     plan.iter().fold(0_usize, |total, planned| {
         let (direct_count, stage_count) = planned.solve_counts();
@@ -1626,7 +1626,7 @@ impl Engine<'_> {
             match self.step(
                 report,
                 Some(&saved),
-                if scale == 1. {
+                if scale.to_bits() == 1.0_f64.to_bits() {
                     Stage::CloseSource
                 } else {
                     Stage::Source { scale, gmin: 0. }
@@ -1784,13 +1784,12 @@ fn run(
     let seed = initial.unwrap_or(&zero);
     let stage_limit = policy
         .stage_max_iterations
-        .map(IterationLimit::get)
-        .unwrap_or(options.max_iterations);
+        .map_or(options.max_iterations, IterationLimit::get);
     let plan = policy.plan(seed, &zero, context.gmin)?;
-    let budget = policy
-        .max_total_iterations
-        .map(IterationBudget::get)
-        .unwrap_or_else(|| iteration_budget(&plan, options.max_iterations, stage_limit));
+    let budget = policy.max_total_iterations.map_or_else(
+        || iteration_budget(&plan, options.max_iterations, stage_limit),
+        IterationBudget::get,
+    );
     report.budget = budget;
     let mut engine = Engine {
         circuit,

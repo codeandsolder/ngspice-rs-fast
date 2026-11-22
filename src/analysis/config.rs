@@ -575,7 +575,7 @@ impl RunConfig {
             crate::analysis::bias::ContinuationSchedule::Ngspice(stepping) => {
                 stepping.fixed_gmin_ladder(config.context.gmin).map(|_| ())
             }
-            _ => Ok(()),
+            crate::analysis::bias::ContinuationSchedule::Ladder { .. } => Ok(()),
         }) {
             let location = config
                 .applied
