@@ -2,8 +2,6 @@
 //! `y_pade`, `exp_pade`, `get_h3` and `update_h1C_c`.
 //! Local arrays replace C's file-global scratch variables. Setup failures
 //! return contextual errors instead of terminating the process.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
@@ -11,10 +9,6 @@
 #![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
@@ -286,6 +280,19 @@ impl Pade {
         if !a.is_finite() || !b.is_finite() {
             return Err(error("nonfinite line rates"));
         }
+        if delta == 0. {
+            // Heaviside's distortionless condition R/L = G/C.
+            // Z0 is constant and propagation is exp(-a*tau*length)
+            // times the pure delay. No Padé poles or residues are needed.
+            let attenuation = (-a * tau * length).exp();
+            return Ok(Self {
+                admit,
+                delay_ps,
+                lossy: None,
+                atten2: attenuation,
+                atten3: attenuation * admit,
+            });
+        }
         let dc = a.sqrt() / b.sqrt();
         let dc_complement = if dc > 0.5 && dc < 2. {
             (-delta / b) / (1. + dc)
@@ -304,9 +311,9 @@ impl Pade {
         let half_delta = 0.5 * delta;
         let y2 = -half_delta * half_delta;
         let y3 = -3. * y1 * y2;
-        let y4 = -3. * y2 * y2 - 4. * y1 * y3;
-        let y5 = -5. * y1 * y4 - 10. * y2 * y3;
-        let y6 = -10. * y3 * y3 - 15. * y2 * y4 - 6. * y1 * y5;
+        let y4 = (-3. * y2).mul_add(y2, -4. * y1 * y3);
+        let y5 = (-5. * y1).mul_add(y4, -10. * y2 * y3);
+        let y6 = (-10. * y3).mul_add(y3, (-15. * y2).mul_add(y4, -6. * y1 * y5));
         let a0 = y1 * tau * length;
         let mut aa = [0.; 6];
         let mut power = tau * tau;
@@ -324,7 +331,7 @@ impl Pade {
             let row = usize::from(i);
             for j in 1..=i {
                 let col = usize::from(j);
-                bb[row] += Real::from(j) * aa[col] * bb[row - col];
+                bb[row] = (Real::from(j) * aa[col]).mul_add(bb[row - col], bb[row]);
             }
             bb[row] /= Real::from(i);
         }
@@ -358,13 +365,10 @@ impl Pade {
             if pair {
                 let [u, v, w] = h2;
                 let single_pole = u.c / (t.x - u.x);
-                let v_residue = v.c * t.x;
-                let w_residue = w.x * w.c;
-                let v_shifted_residue = v.x * v.c;
-                let pair_numerator = v_residue - w_residue - v_shifted_residue;
                 let difference = t.x - v.x;
+                let pair_numerator = v.c.mul_add(difference, -w.x * w.c);
                 let denominator = difference.mul_add(difference, w.x * w.x);
-                sum += single_pole + 2. * pair_numerator / denominator;
+                sum += 2_f64.mul_add(pair_numerator / denominator, single_pole);
             } else {
                 for u in h2 {
                     sum += u.c / (t.x - u.x);
@@ -465,6 +469,15 @@ mod tests {
         for (actual, expected) in poles.into_iter().zip([-2., -1., 2.]) {
             assert!((actual - expected).abs() <= 32. * Real::EPSILON);
         }
+    }
+
+    #[test]
+    fn matched_loss_rates_use_the_analytic_attenuated_delay() {
+        let model = Pade::new(1., 1e-8, 0.01, 1e-10, 2.).unwrap();
+        assert!(model.lossy.is_none());
+        assert!((model.delay_ps - 2000.).abs() < 1e-12);
+        assert!((model.atten2 - (-0.2_f64).exp()).abs() <= 2. * Real::EPSILON);
+        assert_eq!(model.atten3, model.atten2 * model.admit);
     }
 
     #[test]

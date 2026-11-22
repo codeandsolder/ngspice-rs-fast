@@ -91,8 +91,6 @@
 //!   as the operating point it copied into them (`ltraload.c`
 //!   `MODEINITTRAN`); the port offers no instance observations.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
@@ -100,10 +98,6 @@
 #![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 pub mod convolution;
@@ -909,19 +903,29 @@ impl LossyLine {
         mut sum: [Real; 2],
     ) -> [Real; 2] {
         let [a, b] = components;
+        let mut correction = [0.; 2];
         for (i, weight) in weights.iter().enumerate().skip(1).rev() {
             let weight = weight[kernel];
             if weight != 0.0 {
                 let sample = history.sample(i);
-                sum[0] += weight * (sample[a] - initial[a]);
-                sum[1] += weight * (sample[b] - initial[b]);
+                let contribution =
+                    [a, b].map(|component| weight * (sample[component] - initial[component]));
+                for k in 0..2 {
+                    let next = sum[k] + contribution[k];
+                    correction[k] += if sum[k].abs() >= contribution[k].abs() {
+                        (sum[k] - next) + contribution[k]
+                    } else {
+                        (contribution[k] - next) + sum[k]
+                    };
+                    sum[k] = next;
+                }
             }
         }
-        sum
+        [sum[0] + correction[0], sum[1] + correction[1]]
     }
 
     /// Apply the history sums in C's original reverse traversal and
-    /// arithmetic order. No accepted or trial state is mutated.
+    /// order, with compensated reductions. No accepted or trial state is mutated.
     fn convolution_inputs(
         &self,
         history: DelaySamples<'_, 4>,
@@ -940,12 +944,12 @@ impl LossyLine {
                 // h1' with v1 and v2.
                 let [mut d1, mut d2] =
                     Self::history_sum(history, &c.weights, 0, [0, 2], initial, [0.; 2]);
-                d1 += iv1 * m.int_h1dash;
-                d2 += iv2 * m.int_h1dash;
-                d1 -= iv1 * c.first[0];
-                d2 -= iv2 * c.first[0];
-                inputs[0] -= d1 * m.admit;
-                inputs[1] -= d2 * m.admit;
+                d1 = iv1.mul_add(m.int_h1dash, d1);
+                d2 = iv2.mul_add(m.int_h1dash, d2);
+                d1 = iv1.mul_add(-c.first[0], d1);
+                d2 = iv2.mul_add(-c.first[0], d2);
+                inputs[0] = (-d1).mul_add(m.admit, inputs[0]);
+                inputs[1] = (-d2).mul_add(m.admit, inputs[1]);
                 // h2 with i2 and i1.
                 let (mut d1, mut d2) = (0., 0.);
                 if tdover {
@@ -960,8 +964,8 @@ impl LossyLine {
                         [d1, d2],
                     );
                 }
-                d1 += ii2 * m.int_h2;
-                d2 += ii1 * m.int_h2;
+                d1 = ii2.mul_add(m.int_h2, d1);
+                d2 = ii1.mul_add(m.int_h2, d2);
                 inputs[0] += d1;
                 inputs[1] += d2;
                 // h3' with v2 and v1.
@@ -978,10 +982,10 @@ impl LossyLine {
                         [d1, d2],
                     );
                 }
-                d1 += iv2 * m.int_h3dash;
-                d2 += iv1 * m.int_h3dash;
-                inputs[0] += m.admit * d1;
-                inputs[1] += m.admit * d2;
+                d1 = iv2.mul_add(m.int_h3dash, d1);
+                d2 = iv1.mul_add(m.int_h3dash, d2);
+                inputs[0] = m.admit.mul_add(d1, inputs[0]);
+                inputs[1] = m.admit.mul_add(d2, inputs[1]);
                 self.lossless_inputs(&mut inputs, tdover, [iv1, ii1, iv2, ii2], delayed);
             }
             LtraCase::Lc => {
@@ -991,26 +995,26 @@ impl LossyLine {
                 let c = coefficients;
                 let [mut d1, mut d2] =
                     Self::history_sum(history, &c.weights, 0, [0, 2], initial, [0.; 2]);
-                d1 += iv1 * m.int_h1dash;
-                d2 += iv2 * m.int_h1dash;
-                d1 -= iv1 * c.first[0];
-                d2 -= iv2 * c.first[0];
+                d1 = iv1.mul_add(m.int_h1dash, d1);
+                d2 = iv2.mul_add(m.int_h1dash, d2);
+                d1 = iv1.mul_add(-c.first[0], d1);
+                d2 = iv2.mul_add(-c.first[0], d2);
                 inputs[0] -= d1;
                 inputs[1] -= d2;
                 let [mut d1, mut d2] =
                     Self::history_sum(history, &c.weights, 1, [3, 1], initial, [0.; 2]);
-                d1 += ii2 * m.int_h2;
-                d2 += ii1 * m.int_h2;
-                d1 -= ii2 * c.first[1];
-                d2 -= ii1 * c.first[1];
+                d1 = ii2.mul_add(m.int_h2, d1);
+                d2 = ii1.mul_add(m.int_h2, d2);
+                d1 = ii2.mul_add(-c.first[1], d1);
+                d2 = ii1.mul_add(-c.first[1], d2);
                 inputs[0] += d1;
                 inputs[1] += d2;
                 let [mut d1, mut d2] =
                     Self::history_sum(history, &c.weights, 2, [2, 0], initial, [0.; 2]);
-                d1 += iv2 * m.int_h3dash;
-                d2 += iv1 * m.int_h3dash;
-                d1 -= iv2 * c.first[2];
-                d2 -= iv1 * c.first[2];
+                d1 = iv2.mul_add(m.int_h3dash, d1);
+                d2 = iv1.mul_add(m.int_h3dash, d2);
+                d1 = iv2.mul_add(-c.first[2], d1);
+                d2 = iv1.mul_add(-c.first[2], d2);
                 inputs[0] += d1;
                 inputs[1] += d2;
             }
@@ -1029,11 +1033,11 @@ impl LossyLine {
     ) {
         let m = &self.model;
         if tdover {
-            inputs[0] += m.attenuation * (v2d * m.admit + i2d);
-            inputs[1] += m.attenuation * (v1d * m.admit + i1d);
+            inputs[0] = m.attenuation.mul_add(v2d.mul_add(m.admit, i2d), inputs[0]);
+            inputs[1] = m.attenuation.mul_add(v1d.mul_add(m.admit, i1d), inputs[1]);
         } else {
-            inputs[0] += m.attenuation * (iv2 * m.admit + ii2);
-            inputs[1] += m.attenuation * (iv1 * m.admit + ii1);
+            inputs[0] = m.attenuation.mul_add(iv2.mul_add(m.admit, ii2), inputs[0]);
+            inputs[1] = m.attenuation.mul_add(iv1.mul_add(m.admit, ii1), inputs[1]);
         }
     }
 
@@ -1044,13 +1048,15 @@ impl LossyLine {
         let (y0_r, y0_i, lambda_r, lambda_i) = match m.case {
             LtraCase::Lc => (m.admit, 0.0, 0.0, (m.induct * m.capac).sqrt() * omega),
             LtraCase::Rlc => {
-                let theta = 0.5 * (m.resist / (omega * m.induct)).atan();
-                let root = (m.resist * m.resist + omega * omega * m.induct * m.induct).sqrt();
-                let mut mag = (omega * m.capac / root).sqrt();
-                let y0 = (mag * theta.cos(), mag * theta.sin());
-                let theta = std::f64::consts::PI / 2. - theta;
-                mag *= root;
-                (y0.0, y0.1, mag * theta.cos(), mag * theta.sin())
+                let inductive = omega * m.induct;
+                let theta = 0.5 * m.resist.atan2(inductive);
+                let root = m.resist.hypot(inductive);
+                let mag = (omega * m.capac / root).sqrt();
+                let (sin, cos) = theta.sin_cos();
+                let lambda = mag * root;
+                // sin(theta) is cos(pi/2-theta), without losing a weak
+                // attenuation angle when it is too small to subtract.
+                (mag * cos, mag * sin, lambda * sin, lambda * cos)
             }
             LtraCase::Rc => {
                 let y = (0.5 * omega * m.cbyr).sqrt();
@@ -1062,10 +1068,12 @@ impl LossyLine {
         };
         let exparg_r = -lambda_r * m.length;
         let exparg_i = -lambda_i * m.length;
-        let explambda_r = exparg_r.exp() * exparg_i.cos();
-        let explambda_i = exparg_r.exp() * exparg_i.sin();
-        let y0exp_r = y0_r * explambda_r - y0_i * explambda_i;
-        let y0exp_i = y0_r * explambda_i + y0_i * explambda_r;
+        let decay = exparg_r.exp();
+        let (sin, cos) = exparg_i.sin_cos();
+        let explambda_r = decay * cos;
+        let explambda_i = decay * sin;
+        let y0exp_r = y0_r.mul_add(explambda_r, -y0_i * explambda_i);
+        let y0exp_i = y0_r.mul_add(explambda_i, y0_i * explambda_r);
         let (p1, n1, p2, n2, b1, b2) = (
             self.pos1(),
             self.neg1(),
@@ -1472,6 +1480,31 @@ mod tests {
         assert_eq!(
             line.delayed_values(view, 2.).unwrap().map(Real::to_bits),
             [1_f64, -0., 1., -0.].map(Real::to_bits)
+        );
+    }
+
+    #[test]
+    fn history_reduction_preserves_small_contribution_between_large_opposing_waves() {
+        let mut history = WaveformHistory::new(4);
+        for (time, value) in [(0., 0.), (1., 1e16), (2., 1.), (3., -1e16)] {
+            history
+                .apply(&WaveformUpdate {
+                    append: Some((time, vec![value, 0., -value, 0.])),
+                    ..WaveformUpdate::default()
+                })
+                .unwrap();
+        }
+        let weights = [[0.; 3], [1., 0., 0.], [1., 0., 0.], [1., 0., 0.]];
+        assert_eq!(
+            LossyLine::history_sum(
+                history.samples::<4>().unwrap(),
+                &weights,
+                0,
+                [0, 2],
+                [0.; 4],
+                [0.; 2]
+            ),
+            [1., -1.]
         );
     }
 

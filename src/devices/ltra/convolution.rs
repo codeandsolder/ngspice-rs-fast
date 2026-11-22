@@ -16,8 +16,6 @@
 //! (`bessI0`, `bessI1`, `bessI1xOverX`); `erfc` is a separate implementation
 //! (see [`erfc`]).
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::float_cmp,
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
@@ -25,10 +23,6 @@
 #![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use std::{collections::VecDeque, f64::consts::PI};
@@ -365,7 +359,7 @@ pub fn rlc_h2(time: Real, t: Real, alpha: Real, beta: Real) -> Real {
 
 /// `LTRAstraightLineCheck`: whether three points lie close enough to a
 /// straight line, by comparing the triangle they span with the trapezoid area
-/// under them (`area * reltol + abstol > triangle`).
+/// under them (`area.mul_add(reltol, abstol) > triangle`).
 #[must_use]
 #[expect(
     clippy::too_many_arguments,
@@ -386,7 +380,7 @@ pub fn straight_line_check(
     let quad3 = y3.abs().midpoint(y1.abs()) * (x3 - x1).abs();
     let triangle = (quad3 - quad1 - quad2).abs();
     let area = quad1 + quad2;
-    area * reltol + abstol > triangle
+    area.mul_add(reltol, abstol) > triangle
 }
 
 /// The RLC line's `LTRAmaxSafeStep` (`ltratemp.c`): bisect `[TD, 10 TD]`
@@ -398,7 +392,7 @@ pub fn straight_line_check(
 /// port keeps that.
 #[must_use]
 pub fn rlc_max_safe_step(td: Real, alpha: Real, beta: Real, reltol: Real, abstol: Real) -> Real {
-    let mut xbig = td + 9. * td;
+    let mut xbig = 10. * td;
     let xsmall = td;
     let mut xmid = xbig.midpoint(xsmall);
     let y1small = rlc_h2(xsmall, td, alpha, beta);
@@ -443,13 +437,13 @@ pub fn erfc(x: Real) -> Real {
         loop {
             n += 1.;
             term *= -x2 / n;
-            let add = term / (2. * n + 1.);
+            let add = term / 2_f64.mul_add(n, 1.);
             sum += add;
             if add.abs() <= 1e-17 * sum.abs() || n > 200. {
                 break;
             }
         }
-        return 1. - 2. / PI.sqrt() * sum;
+        return (-2. / PI.sqrt()).mul_add(sum, 1.);
     }
     if !x.is_finite() {
         return 0.;
@@ -668,10 +662,6 @@ fn rlc_aux_index(t: Real, curtime: Real, times: &VecDeque<Real>) -> usize {
 /// the previous window `[lolimit2, hilimit2]` with the values at `TD` and at
 /// the auxiliary time (C's commented-out `lolimit2 = T` fix is not applied).
 #[must_use]
-#[expect(
-    clippy::too_many_lines,
-    reason = "keeps the causal coupled coefficient recurrence and its auxiliary window together for audit"
-)]
 pub fn rlc_coefficients(
     t: Real,
     alpha: Real,
@@ -835,7 +825,7 @@ mod tests {
                 [
                     -974.771_829_287_180_1,
                     1.260_463_581_744_048_3e-5,
-                    -0.355_268_504_606_938_87,
+                    -0.355_268_504_606_938_9,
                 ],
             ),
             (1e-20, 0.5, 1., [-5e-21, 2.5e-41, -5e-21]),
@@ -942,7 +932,7 @@ mod tests {
             ),
             (
                 25.,
-                [5.611_686_074_310_081_5e-14, 2.962_685_867_369_868_2e-13],
+                [5.611_686_074_310_081_5e-14, 2.962_685_867_369_868e-13],
             ),
             (
                 100.,
