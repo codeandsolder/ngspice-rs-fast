@@ -48,12 +48,32 @@ Repeat steady-state phases three times; use medians per operation.
 - Fresh order/factor includes factor-frame construction; retained solve uses a
   factor snapshot with caller-owned scratch. The two NI solve phases exercise
   the same bound matrix with changed and then identical coefficients.
-- Complex assembly, factorization and solve are measured independently. The
-  orders_requested and reuse_requested fields count controlled requests, not
-  internal fallback decisions. The public solver API does not expose actual LU
-  fill-in, reorder/refactor/cache-hit counts; those diagnostics should follow
-  concurrent matrix lifecycle work (#34). Do not infer LU fill from coefficient
-  density or invent internal counters.
+- FactorStorage records structural original handle creations, total stored LU
+  entries, fill-in handle creations, translated/external order and logical
+  numeric bytes. The fill ratio is factor_entries / original_entries
+  (including structurally allocated zeroes). It is not heap allocation
+  capacity, a count of nonzero values, or a process-wide memory measurement.
+- FactorWork records actual order calls, searches, fixed-plan refactors,
+  outcomes, and immediate zero-pivot retries. Retaining every existing pivot
+  during threshold ordering counts an order attempt but no search. The
+  complex phase sums producing-operation snapshots across frequencies and
+  reports the observed storage range. Each successful independent snapshot
+  solve is counted by the harness after the solve succeeds.
+- Real NI measurements read the shared pattern's cumulative work before and
+  after the timed pair of changed/identical coefficient solves. They assert
+  exactly one numerical refactor and one exact-input hit per pair, plus two
+  successful RHS solves and no additional order/search. The warmup and
+  post-repeat records are cumulative within the pattern's cache epoch, so their
+  difference isolates the measured pair work.
+- Full-deck retained, streamed, bias and transient measurements report the
+  final pattern cache epoch; an extended/replaced pattern starts a new epoch.
+  Those records do not count discarded predecessor epochs, or independent
+  snapshot RHS solves (including RF). They must not be interpreted as totals
+  of all internal operations in an entire analysis.
+- All telemetry reads occur outside the timed kernels. Counter definitions
+  and snapshot/reset semantics are documented in [NATIVE_SOLVER.md](NATIVE_SOLVER.md).
+  Workload timings and process-wide DHAT measures remain separate from
+  numeric storage and work counters.
 - Device load excludes solver time and uses the finalized circuit matrix and
   state history. Parse, elaboration, retained analysis, streamed analysis, and
   rawfile codec have separate measurements. Every retained and streaming trial

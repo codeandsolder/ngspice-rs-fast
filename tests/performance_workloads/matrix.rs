@@ -13,7 +13,7 @@ use ngspice_rs::primitives::Complex;
 
 use super::report;
 
-fn report_storage(name: &str, phase: &str, storage: FactorStorage) {
+pub(super) fn report_storage(name: &str, phase: &str, storage: FactorStorage) {
     let fill_ratio = f64::from(u32::try_from(storage.factor_entries).unwrap())
         / f64::from(u32::try_from(storage.original_entries).unwrap());
     println!(
@@ -27,7 +27,7 @@ fn report_storage(name: &str, phase: &str, storage: FactorStorage) {
     );
 }
 
-fn report_work(name: &str, phase: &str, work: FactorWork) {
+pub(super) fn report_work(name: &str, phase: &str, work: FactorWork) {
     println!(
         "workload={name},phase={phase},order_attempts={},pivot_searches={},fixed_refactors={},successful_factors={},zero_pivots={},singular_failures={},nonfinite_failures={},resource_failures={},invalid_failures={},assembly_rejections={},zero_pivot_retries={}",
         work.order_attempts,
@@ -44,7 +44,7 @@ fn report_work(name: &str, phase: &str, work: FactorWork) {
     );
 }
 
-fn report_cache(name: &str, phase: &str, telemetry: PatternTelemetry) {
+pub(super) fn report_cache(name: &str, phase: &str, telemetry: PatternTelemetry) {
     report_work(name, phase, telemetry.work.factor);
     println!(
         "workload={name},phase={phase},cache_totals=true,exact_input_hits={},cache_rhs_solves={},cache_rhs_failures={},real_to_complex={},complex_to_real={}",
@@ -54,7 +54,11 @@ fn report_cache(name: &str, phase: &str, telemetry: PatternTelemetry) {
         telemetry.work.real_to_complex,
         telemetry.work.complex_to_real
     );
-    report_storage(name, phase, telemetry.storage.unwrap());
+    if let Some(storage) = telemetry.storage {
+        report_storage(name, phase, storage);
+    } else {
+        println!("workload={name},phase={phase},valid_factor_storage=false");
+    }
 }
 
 struct Mesh {

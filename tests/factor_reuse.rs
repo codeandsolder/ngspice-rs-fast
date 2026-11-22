@@ -307,3 +307,51 @@ fn retained_factors_report_their_own_work_and_known_fill() {
     );
     assert_eq!(storage.numeric_bytes, 14 * size_of::<f64>());
 }
+
+#[test]
+fn factor_storage_distinguishes_external_and_translated_order() {
+    use ngspice_rs::maths::SparseLu;
+    let pattern = Arc::new(Pattern::new(3, [(0, 0), (2, 2)]).unwrap());
+    let mut matrix = SparseMatrix::bound(pattern).unwrap();
+    matrix.set(0, 0, 2.).unwrap();
+    matrix.set(2, 2, 4.).unwrap();
+    let lu = SparseLu::new(&matrix, None).unwrap();
+    let stats = lu.factor_storage();
+    assert_eq!((stats.external_order, stats.translated_order), (3, 2));
+    assert_eq!((stats.original_entries, stats.factor_entries), (2, 2));
+    assert_eq!(
+        lu.solve(&Vector::from_slice(&[2., 7.5, 4.]))
+            .unwrap()
+            .as_slice(),
+        [1., 7.5, 1.]
+    );
+}
+
+#[test]
+fn shared_cache_telemetry_is_transactional_across_concurrent_solves() {
+    let p = pattern();
+    // Establish a clean refactor and exact-input eligibility before any
+    // concurrent requests, so scheduling cannot alter the expected work.
+    solve(&p, &A, false, 0.);
+    let reference = solve(&p, &A, false, 0.);
+    let start = p.factor_telemetry();
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            let p = &p;
+            let reference = &reference;
+            scope.spawn(move || {
+                for _ in 0..16 {
+                    assert_eq!(bits(&solve(p, &A, false, 0.)), bits(reference));
+                }
+            });
+        }
+    });
+    let after = p.factor_telemetry();
+    assert_eq!(after.work.factor, start.work.factor);
+    assert_eq!(
+        after.work.exact_input_hits - start.work.exact_input_hits,
+        64
+    );
+    assert_eq!(after.work.rhs_solves - start.work.rhs_solves, 64);
+    assert_eq!(after.storage, start.storage);
+}

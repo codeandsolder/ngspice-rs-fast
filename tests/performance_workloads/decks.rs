@@ -10,11 +10,14 @@ use ngspice_rs::analysis::{
     AnalysisPlan, Plot, PointSink, RawFile, RunConfig, companion_transient,
 };
 use ngspice_rs::devices::{AnalysisMode, Circuit, IterationPhase, LoadRequest};
-use ngspice_rs::maths::Vector;
+use ngspice_rs::maths::{FactorStorage, FactorWork, Vector};
 use ngspice_rs::netlist::{Parser, ast::Netlist, source::parse_deck_text};
 use ngspice_rs::primitives::{Complex, SpiceResult};
 
-use super::report;
+use super::{
+    matrix::{report_cache, report_storage, report_work},
+    report,
+};
 
 fn setup(name: &str, text: &str) -> (Netlist, RunConfig, AnalysisPlan, Circuit) {
     let start = Instant::now();
@@ -35,6 +38,16 @@ fn setup(name: &str, text: &str) -> (Netlist, RunConfig, AnalysisPlan, Circuit) 
         circuit.matrix_pattern().map_or(0, |pattern| pattern.len())
     );
     (netlist, config, plan, circuit)
+}
+
+// The final pattern can have replaced a learned/extended predecessor.
+// These are final-cache-epoch counts, not whole-analysis totals.
+fn report_final_cache(name: &str, phase: &str, circuit: &Circuit) {
+    if let Some(pattern) = circuit.matrix_pattern() {
+        report_cache(name, phase, pattern.factor_telemetry());
+    } else {
+        println!("workload={name},phase={phase},pattern_present=false");
+    }
 }
 
 #[derive(Default)]
@@ -70,6 +83,7 @@ fn run(name: &str, text: &str, verify: impl Fn(&Plot)) {
         let started = Instant::now();
         let plots = plan.run_plots(&mut circuit, &config.context()).unwrap();
         report(name, "analysis_retained", 1, started.elapsed());
+        report_final_cache(name, "retained_final_cache_epoch", &circuit);
         assert!(!plots.is_empty());
         for plot in &plots {
             assert!(plot.is_finite());
@@ -91,6 +105,7 @@ fn run(name: &str, text: &str, verify: impl Fn(&Plot)) {
         plan.run_into(&mut streaming, &config.context(), &mut counts)
             .unwrap();
         report(name, "analysis_streamed", 1, start.elapsed());
+        report_final_cache(name, "streamed_final_cache_epoch", &streaming);
         assert_eq!(
             (counts.plots, counts.rows, counts.cells),
             (plots.len(), rows, cells)
@@ -159,6 +174,7 @@ fn load_kernel(name: &str, text: &str, repeats: u32) {
     let start = Instant::now();
     let dc = solve_dc_with(&circuit, &model, plan.dc_settings(), &[], None, None).unwrap();
     report(name, "bias_initialization", 1, start.elapsed());
+    report_final_cache(name, "bias_final_cache_epoch", &circuit);
     println!(
         "workload={name},dc_iterations={},dc_stages={}",
         dc.report.total_iterations,
@@ -231,6 +247,7 @@ fn transient_stats(name: &str, text: &str) {
     let start = Instant::now();
     let (plot, stats) = companion_transient(&mut circuit, &plan, &config.context()).unwrap();
     report(name, "transient_with_stats", 1, start.elapsed());
+    report_final_cache(name, "transient_final_cache_epoch", &circuit);
     assert!(plot.is_finite() && stats.accepted > 0);
     println!(
         "workload={name},accepted={},rejected={},breakpoints={},min_step={:e},max_step={:e}",
@@ -381,6 +398,11 @@ pub(super) fn parameters() {
         let mut preparation = Duration::ZERO;
         let mut solve = Duration::ZERO;
         let mut iterations = 0;
+        let mut factor_work = FactorWork::default();
+        let mut cache_rhs_solves = 0;
+        let mut exact_input_hits = 0;
+        let mut measured_epochs = 0;
+        let mut largest_storage: Option<FactorStorage> = None;
         let mut worst = 0.0_f64;
         for source in 1..=8_u32 {
             for resistor in 1..=16_u32 {
@@ -409,6 +431,19 @@ pub(super) fn parameters() {
                 )
                 .unwrap();
                 solve += start.elapsed();
+                if let Some(pattern) = circuit.matrix_pattern() {
+                    let telemetry = pattern.factor_telemetry();
+                    measured_epochs += 1;
+                    factor_work += telemetry.work.factor;
+                    cache_rhs_solves += telemetry.work.rhs_solves;
+                    exact_input_hits += telemetry.work.exact_input_hits;
+                    if let Some(storage) = telemetry.storage
+                        && largest_storage
+                            .is_none_or(|prior| storage.factor_entries > prior.factor_entries)
+                    {
+                        largest_storage = Some(storage);
+                    }
+                }
                 let node = circuit.nodes().get("out").unwrap();
                 let row = circuit.unknowns().node_row(node).unwrap();
                 let value = dc.solution.values.as_slice()[row];
@@ -420,6 +455,18 @@ pub(super) fn parameters() {
         assert!(worst < 1e-9);
         report("independent_parameters", "prepare", 128, preparation);
         report("independent_parameters", "solve", 128, solve);
+        let phase = "independent_final_cache_epochs";
+        report_work("independent_parameters", phase, factor_work);
+        println!(
+            "workload=independent_parameters,phase={phase},measured_epochs={measured_epochs},cache_rhs_solves={cache_rhs_solves},exact_input_hits={exact_input_hits}"
+        );
+        if let Some(storage) = largest_storage {
+            report_storage(
+                "independent_parameters",
+                "largest_independent_factor",
+                storage,
+            );
+        }
         println!(
             "workload=independent_parameters,dc_iterations={iterations},forward_abs={worst:e}"
         );

@@ -71,7 +71,7 @@ pub(super) struct FactorAttempt {
 }
 
 impl FactorWork {
-    pub(super) fn record(&mut self, attempt: FactorAttempt) {
+    pub(super) const fn record(&mut self, attempt: FactorAttempt) {
         let start = match attempt.path {
             AttemptPath::Order { searched } => {
                 if searched {
@@ -105,29 +105,30 @@ impl FactorWork {
 
 impl std::ops::AddAssign for FactorWork {
     fn add_assign(&mut self, other: Self) {
-        self.order_attempts = self.order_attempts.saturating_add(other.order_attempts);
-        self.pivot_searches = self.pivot_searches.saturating_add(other.pivot_searches);
-        self.fixed_refactors = self.fixed_refactors.saturating_add(other.fixed_refactors);
-        self.successful_factors = self
-            .successful_factors
-            .saturating_add(other.successful_factors);
-        self.zero_pivots = self.zero_pivots.saturating_add(other.zero_pivots);
-        self.singular_failures = self
-            .singular_failures
-            .saturating_add(other.singular_failures);
-        self.nonfinite_failures = self
-            .nonfinite_failures
-            .saturating_add(other.nonfinite_failures);
-        self.resource_failures = self
-            .resource_failures
-            .saturating_add(other.resource_failures);
-        self.invalid_failures = self.invalid_failures.saturating_add(other.invalid_failures);
-        self.assembly_rejections = self
-            .assembly_rejections
-            .saturating_add(other.assembly_rejections);
-        self.zero_pivot_retries = self
-            .zero_pivot_retries
-            .saturating_add(other.zero_pivot_retries);
+        let Self {
+            order_attempts,
+            pivot_searches,
+            fixed_refactors,
+            successful_factors,
+            zero_pivots,
+            singular_failures,
+            nonfinite_failures,
+            resource_failures,
+            invalid_failures,
+            assembly_rejections,
+            zero_pivot_retries,
+        } = other;
+        self.order_attempts = self.order_attempts.saturating_add(order_attempts);
+        self.pivot_searches = self.pivot_searches.saturating_add(pivot_searches);
+        self.fixed_refactors = self.fixed_refactors.saturating_add(fixed_refactors);
+        self.successful_factors = self.successful_factors.saturating_add(successful_factors);
+        self.zero_pivots = self.zero_pivots.saturating_add(zero_pivots);
+        self.singular_failures = self.singular_failures.saturating_add(singular_failures);
+        self.nonfinite_failures = self.nonfinite_failures.saturating_add(nonfinite_failures);
+        self.resource_failures = self.resource_failures.saturating_add(resource_failures);
+        self.invalid_failures = self.invalid_failures.saturating_add(invalid_failures);
+        self.assembly_rejections = self.assembly_rejections.saturating_add(assembly_rejections);
+        self.zero_pivot_retries = self.zero_pivot_retries.saturating_add(zero_pivot_retries);
     }
 }
 
@@ -150,7 +151,7 @@ pub struct PatternWork {
 }
 
 impl PatternWork {
-    pub(super) fn record_rhs<T>(&mut self, result: &SpiceResult<T>) {
+    pub(super) const fn record_rhs<T>(&mut self, result: &SpiceResult<T>) {
         let counter = if result.is_ok() {
             &mut self.rhs_solves
         } else {
