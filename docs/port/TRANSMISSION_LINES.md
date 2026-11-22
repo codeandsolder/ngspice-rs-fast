@@ -230,9 +230,11 @@ C's `t + (bp - t)` can take different branches.
   comes out two orders of magnitude off; checked live in
   `c_ltra_reference`). An RG line alone is right in C, but the device cannot
   see the other lines, so the port refuses RG lines in AC/`.sp`.
-* Nonfinite convolution terms: C's Bessel approximations overflow once
-  `beta t` exceeds about 700 and C continues with NaN; the port stops with an
-  error.
+* Nonfinite convolution terms produce an explicit numerical error. The RLC
+  endpoints evaluate exponentially scaled Bessel products, retaining finite
+  physical responses beyond C's intermediate overflow near `beta t = 700`.
+  Local interpolation and integral formulas also retain small loss terms
+  and avoid cancellation in differences of time powers.
 * No instance observations: C's `@o1[v1]` etc. return the operating point
   it copied into them during a transient, not the card values.
 

@@ -627,7 +627,7 @@ fn rlc_aux_index(t: Real, curtime: Real, times: &VecDeque<Real>) -> usize {
 #[must_use]
 #[expect(
     clippy::too_many_lines,
-    reason = "keeps the reference numerical routine in the original statement and rounding order"
+    reason = "keeps the causal coupled coefficient recurrence and its auxiliary window together for audit"
 )]
 pub fn rlc_coefficients(
     t: Real,

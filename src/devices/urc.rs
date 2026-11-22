@@ -222,7 +222,7 @@ impl UrcSections {
                 3
             } else {
                 let ratio = (p - 1.) / p;
-                let count = 3.0_f64.max((wnorm * (ratio * ratio)).ln() / p.ln());
+                let count = 3.0_f64.max((wnorm * (ratio * ratio)).log(p));
                 if !count.is_finite()
                     || count
                         > Real::from(
