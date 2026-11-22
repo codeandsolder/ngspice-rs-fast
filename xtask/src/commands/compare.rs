@@ -444,6 +444,7 @@ pub(super) fn plots(
     alternates: &[&Plot],
     tolerance: Tolerance,
     axis: Option<&str>,
+    resolution: Option<&Plot>,
 ) -> Result<(), String> {
     let got_columns = validate(got, "Rust")?;
     let want_columns = validate(want, "C")?;
@@ -456,6 +457,17 @@ pub(super) fn plots(
         ));
     }
     let alternate_columns = validate_alternate_captures(want, &want_columns, alternates, axis)?;
+    if let Some(resolution) = resolution {
+        if resolution.point_count() != got.point_count()
+            || resolution.variables() != got.variables()
+            || resolution
+                .cells()
+                .iter()
+                .any(|value| !value.is_finite() || value.re < 0. || value.im != 0.)
+        {
+            return Err("invalid sensitivity resolution diagnostic".to_owned());
+        }
+    }
     if let Some(axis) = axis {
         for (plot, columns, label) in [(got, &got_columns, "Rust"), (want, &want_columns, "C")] {
             let &column = columns
@@ -513,7 +525,11 @@ pub(super) fn plots(
                     )?
                 };
                 let error = (got - want).abs();
-                let limit = tolerance.relative * want.abs() + tolerance.absolute;
+                let resolution_floor = resolution
+                    .and_then(|plot| plot.row(point))
+                    .map_or(0., |row| row[got_columns[*key]].re);
+                let limit =
+                    tolerance.relative * want.abs() + tolerance.absolute.max(resolution_floor);
                 if error > limit {
                     mismatches += 1;
                     let report = format!(
@@ -577,7 +593,7 @@ mod tests {
     }
 
     fn compare(got: &Plot, want: &Plot) -> Result<(), String> {
-        plots(got, want, &[], AC, Some("frequency"))
+        plots(got, want, &[], AC, Some("frequency"), None)
     }
 
     #[test]
@@ -710,13 +726,13 @@ mod tests {
                 };
                 let bound = tolerance.relative * value.abs() + tolerance.absolute;
                 *value += 0.5 * bound;
-                plots(&got, &want, &[], tolerance, None).unwrap();
+                plots(&got, &want, &[], tolerance, None, None).unwrap();
                 *if component == "re" {
                     &mut got.point_mut(point).unwrap()[1].re
                 } else {
                     &mut got.point_mut(point).unwrap()[1].im
                 } += 2.0 * bound;
-                let error = plots(&got, &want, &[], tolerance, None).unwrap_err();
+                let error = plots(&got, &want, &[], tolerance, None, None).unwrap_err();
                 assert!(error.contains(&format!("v(out).{component}")), "{error}");
                 assert!(error.contains("first:") && error.contains("worst"));
             }
@@ -894,7 +910,7 @@ mod tests {
     #[test]
     fn axis_identity_values_and_monotonicity_are_checked() {
         let want = plot();
-        assert!(plots(&want, &want, &[], AC, Some("time")).is_err());
+        assert!(plots(&want, &want, &[], AC, Some("time"), None).is_err());
         for value in [Complex::ZERO, Complex::real(-1.0), Complex::new(100.0, 1.0)] {
             let mut got = want.clone();
             got.point_mut(0).unwrap()[0] = value;

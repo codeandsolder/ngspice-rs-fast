@@ -1991,7 +1991,7 @@ fn run_deck(root: &Path, path: &Path, fixture: &Supported) -> Result<String, Str
     let request = config
         .plan_for(&netlist.analyses[0])
         .map_err(|error| error.to_string())?;
-    let (mut plots, circuit) = run_plan_plots(&netlist, &config, &request, None)?;
+    let (mut plots, circuit, resolution) = run_plan_plots(&netlist, &config, &request, None)?;
     if plots.len() != 1 {
         return Err(format!(
             "expected one Rust plot, the driver produced {} (register multi-plot analyses as batch fixtures)",
@@ -2039,6 +2039,7 @@ fn run_deck(root: &Path, path: &Path, fixture: &Supported) -> Result<String, Str
         &got,
         &primary.plots[0].plot,
         &alternate_plots,
+        resolution.as_ref(),
     )
 }
 
@@ -2072,8 +2073,9 @@ fn batch_result(root: &Path, path: &Path, fixture: &Batch) -> Result<Vec<String>
     let mut previous = None;
     for entry in &schedule {
         let request = &plans[entry.card_index];
-        let (plots, circuit) = run_plan_plots(&netlist, &config, request, previous.as_ref())
-            .map_err(|error| format!("{}: {error}", entry.plot_name))?;
+        let (plots, circuit, resolution) =
+            run_plan_plots(&netlist, &config, request, previous.as_ref())
+                .map_err(|error| format!("{}: {error}", entry.plot_name))?;
         let own: Vec<&str> = entry.plot_names().collect();
         if plots.len() != own.len() {
             return Err(format!(
@@ -2098,8 +2100,16 @@ fn batch_result(root: &Path, path: &Path, fixture: &Batch) -> Result<Vec<String>
                     got.plotname, want.plot.plotname
                 ));
             }
-            let detail = compare_plot(&stage.gate, &circuit, request, got, &want.plot, &[])
-                .map_err(|error| format!("{name}: {error}"))?;
+            let detail = compare_plot(
+                &stage.gate,
+                &circuit,
+                request,
+                got,
+                &want.plot,
+                &[],
+                resolution.as_ref(),
+            )
+            .map_err(|error| format!("{name}: {error}"))?;
             details.push(format!("{name} ({}): {detail}", got.plotname));
         }
         previous = Some(circuit);
@@ -2116,6 +2126,7 @@ fn run_plan_plots(
     (
         Vec<ngspice_rs::analysis::Plot>,
         ngspice_rs::devices::Circuit,
+        Option<ngspice_rs::analysis::Plot>,
     ),
     String,
 > {
@@ -2123,9 +2134,19 @@ fn run_plan_plots(
     if let Some(previous) = previous {
         circuit.inherit_from(previous);
     }
-    let plots = request
-        .run_plots(&mut circuit, &config.context())
-        .map_err(|e| e.to_string())?;
+    let (plots, resolution) = if request.kind() == AnalysisKind::Sensitivity {
+        let (plot, resolution) = request
+            .run_sensitivity_with_resolution(&mut circuit, &config.context())
+            .map_err(|e| e.to_string())?;
+        (vec![plot], Some(resolution))
+    } else {
+        (
+            request
+                .run_plots(&mut circuit, &config.context())
+                .map_err(|e| e.to_string())?,
+            None,
+        )
+    };
     circuit.note_completed(request.kind());
     // C's default save set omits device internal nodes by name
     // (`outitf.c`: `#internal`, `#source`, `#drain`, `#collector`,
@@ -2152,7 +2173,10 @@ fn run_plan_plots(
         .into_iter()
         .map(|plot| project(plot, &internal))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok((plots, circuit))
+    let resolution = resolution
+        .map(|plot| project(plot, &internal))
+        .transpose()?;
+    Ok((plots, circuit, resolution))
 }
 
 /// The internal-node name fragments `outitf.c` leaves out of C's default
@@ -2225,6 +2249,7 @@ fn compare_plot(
     got: &ngspice_rs::analysis::Plot,
     want: &ngspice_rs::analysis::Plot,
     alternates: &[&ngspice_rs::analysis::Plot],
+    resolution: Option<&ngspice_rs::analysis::Plot>,
 ) -> Result<String, String> {
     if !alternates.is_empty() && !matches!(gate, Gate::Points { .. }) {
         return Err("independent reference envelopes require a point-wise gate".to_owned());
@@ -2241,8 +2266,10 @@ fn compare_plot(
         gate
     };
     match *gate {
-        Gate::Points { axis, tolerance } => compare::plots(got, want, alternates, tolerance, axis)
-            .map(|()| format!("{} point(s)", got.point_count())),
+        Gate::Points { axis, tolerance } => {
+            compare::plots(got, want, alternates, tolerance, axis, resolution)
+                .map(|()| format!("{} point(s)", got.point_count()))
+        }
         Gate::Roots(tolerance) => compare::roots(got, want, tolerance),
         Gate::Transient(tolerance) => {
             let transient = request.transient().ok_or("expected a transient plan")?;

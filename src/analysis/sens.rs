@@ -338,6 +338,23 @@ impl Probe {
         .flatten()
     }
 
+    /// Output-scale estimate before subtracting the two voltage terminals.
+    fn resolution_scale(self, values: &[Complex]) -> Real {
+        self.rows()
+            .map(|row| {
+                let value = values.get(row).copied().unwrap_or(Complex::ZERO);
+                value.re.abs().max(value.im.abs())
+            })
+            .sum()
+    }
+
+    fn absolute_resolution(self, options: &crate::analysis::newton::NewtonOptions) -> Real {
+        match self {
+            Self::Voltage { .. } => options.vntol,
+            Self::Current { .. } => options.abstol,
+        }
+    }
+
     fn read<T: Copy + std::ops::Sub<Output = T>>(&self, x: &[T], zero: T) -> T {
         let at = |row: Option<usize>| row.and_then(|row| x.get(row).copied()).unwrap_or(zero);
         match *self {
@@ -1326,6 +1343,26 @@ impl AcState<'_> {
     }
 }
 
+/// An estimated output-resolution floor divided by the actual finite-
+/// difference denominator. This is a conformance diagnostic, not a bound on
+/// the true derivative or a change to the sensitivity algorithm.
+struct Resolution {
+    plot: Plot,
+    absolute: Real,
+}
+
+impl Resolution {
+    fn row(&self, probe: Probe, solution: &[Complex]) -> (Real, Vec<Complex>) {
+        // Allow several rounding operations, including independent reference
+        // arithmetic. No claim of a certified forward-error bound.
+        let roundoff = 32. * Real::EPSILON * probe.resolution_scale(solution);
+        (
+            self.absolute.max(roundoff),
+            Vec::with_capacity(self.plot.variable_count()),
+        )
+    }
+}
+
 /// Runs `.sens` on `circuit`; see the module documentation.
 ///
 /// # Errors
@@ -1337,7 +1374,8 @@ pub(super) fn run(
     context: &AnalysisContext,
     card: &SensCard,
     grid: Option<&[Real]>,
-) -> SpiceResult<Plot> {
+    estimate_resolution: bool,
+) -> SpiceResult<(Plot, Option<Plot>)> {
     let settings = request.dc_settings();
     let ac = grid.is_some();
     circuit.finalize()?;
@@ -1359,6 +1397,17 @@ pub(super) fn run(
     )?;
 
     let mut plot = workspace.plot(ac);
+    if estimate_resolution {
+        workspace.resolution = Some(Resolution {
+            plot: workspace.plot(ac),
+            // AC is a linear small-signal solve, not a Newton convergence test.
+            absolute: if ac {
+                0.
+            } else {
+                probe.absolute_resolution(&settings.newton)
+            },
+        });
+    }
     if let Some(grid) = grid {
         run_ac(
             &mut workspace,
@@ -1379,7 +1428,7 @@ pub(super) fn run(
             &mut plot,
         )?;
     }
-    Ok(plot)
+    Ok((plot, workspace.resolution.map(|resolution| resolution.plot)))
 }
 
 /// One analysis's parameter sequence, owning all live mutable C records and
@@ -1392,6 +1441,7 @@ struct ParameterWalk<'a> {
     entries: Vec<Entry>,
     couplings: Vec<Option<Coupling>>,
     delta: DeltaMatrix,
+    resolution: Option<Resolution>,
 }
 
 impl<'a> ParameterWalk<'a> {
@@ -1416,6 +1466,7 @@ impl<'a> ParameterWalk<'a> {
             entries,
             couplings,
             delta: DeltaMatrix::new(circuit.unknown_count()),
+            resolution: None,
         })
     }
 
@@ -1569,6 +1620,15 @@ fn run_ac(
         };
         let mut point = Vec::with_capacity(plot.variables().len());
         point.push(Complex::real(frequency));
+        let mut resolution = walk.resolution.as_ref().map(|resolution| {
+            let (floor, mut row) = resolution.row(
+                probe,
+                at.as_ref()
+                    .map_or(&[][..], |state| state.solution.as_slice()),
+            );
+            row.push(Complex::ZERO); // frequency is not a derivative
+            (floor, row)
+        });
         walk.sweep(
             |slot, member, setup, current| {
                 sweep.load(
@@ -1581,6 +1641,9 @@ fn run_ac(
                 )
             },
             |assembly, index, base, perturbed, delta| {
+                if let Some((floor, row)) = &mut resolution {
+                    row.push(Complex::real(*floor / delta.abs()));
+                }
                 let Some(at) = &at else {
                     point.push(Complex::new(Real::NAN, Real::NAN));
                     return Ok(());
@@ -1592,6 +1655,9 @@ fn run_ac(
             },
         )?;
         plot.push_point(&point)?;
+        if let (Some(resolution), Some((_, row))) = (&mut walk.resolution, resolution) {
+            resolution.plot.push_point(&row)?;
+        }
     }
     Ok(())
 }
@@ -1651,15 +1717,25 @@ fn run_dc(
     };
     let mut point = Vec::with_capacity(plot.variables().len());
     let mut scratch = DcAssembly::new(n);
+    let mut resolution = walk
+        .resolution
+        .as_ref()
+        .map(|resolution| resolution.row(probe, &at.solution));
     walk.sweep(
         |_, member, setup, current| member.sensitivity.load(setup, current, SensitivityMode::Dc),
         |assembly, index, base, perturbed, delta| {
+            if let Some((floor, row)) = &mut resolution {
+                row.push(Complex::real(*floor / delta.abs()));
+            }
             let dx = at.delta(assembly, &mut scratch, index, base, perturbed)?;
             point.push(Complex::real(probe.read(dx.as_slice(), 0.) / delta));
             Ok(())
         },
     )?;
     plot.push_point(&point)?;
+    if let (Some(resolution), Some((_, row))) = (&mut walk.resolution, resolution) {
+        resolution.plot.push_point(&row)?;
+    }
     Ok(())
 }
 
