@@ -1,6 +1,7 @@
 //! Classic-MOS `.sens` (#164), through the production analysis driver.
 //! The five C goldens pin the complete parameter walk, including restoration
 //! side effects that are deliberately not physical central derivatives.
+use ngspice_conformance::tolerance::SENSITIVITY_NONLINEAR;
 use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -47,7 +48,7 @@ fn fixture(level: u8, per_device: usize) {
         let a = value(&plot, &variable.name);
         let b = value(reference, &variable.name);
         assert!(
-            (a - b).abs() <= 1e-9 + 1e-6 * b.abs(),
+            (a - b).abs() <= SENSITIVITY_NONLINEAR.bound(b),
             "level {level} {}: {a:e} vs {b:e}",
             variable.name
         );
@@ -186,7 +187,7 @@ fn filtering_the_doping_parameter_avoids_the_failed_temperature_callback() {
         .unwrap();
         let actual = value(&plot, name);
         assert!(
-            (actual - reference).abs() <= 1e-9 + 1e-6 * reference.abs(),
+            (actual - reference).abs() <= SENSITIVITY_NONLINEAR.bound(reference),
             "level {level} {name}: {actual} vs {reference}"
         );
     }

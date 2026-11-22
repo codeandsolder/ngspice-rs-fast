@@ -9,11 +9,9 @@ use ngspice_rs::analysis::{Plot, PlotFlags, RawPlotRows};
 use ngspice_rs::primitives::Complex;
 use std::io::BufRead;
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Tolerance {
-    relative: f64,
-    absolute: f64,
-}
+pub(super) use ngspice_conformance::tolerance::{
+    SENSITIVITY, SENSITIVITY_CANCELLED, SENSITIVITY_NONLINEAR, Tolerance,
+};
 
 pub(super) const DC: Tolerance = Tolerance {
     relative: 1e-12,
@@ -49,46 +47,6 @@ pub(super) const NOISE: Tolerance = Tolerance {
 pub(super) const NOISE_NONLINEAR: Tolerance = Tolerance {
     relative: 1e-6,
     absolute: 1e-20,
-};
-
-/// `.sens` (#102), linear circuits. A sensitivity is a forward difference
-/// `dx/delta` with `delta = 1e-6 p` (C's `Sens_Delta`), so the rounding of the
-/// solution `x` reaches it amplified by `1/delta`: for a parameter with a
-/// strong effect that is about `1e-10` relative, which the 1e-8 bound covers
-/// with margin. Parameters C perturbs without effect read exactly 0 (or a
-/// rounding residue, e.g. about 4e-14 from the cosine of a 1e-6 degree AC
-/// phase), which the 1e-12 floor accepts.
-pub(super) const SENSITIVITY: Tolerance = Tolerance {
-    relative: 1e-8,
-    absolute: 1e-12,
-};
-
-/// `.sens` of nonlinear circuits: the nonlinear 1 ppm bias bound, with an
-/// absolute floor for weak parameters, whose numerator `dx` is only a few
-/// ulps of the node voltage: `ulp(x)/delta` is about `1e-16/2e-6 = 5e-11`
-/// for an O(1) parameter of an O(1) V output (C's own result for a diode's
-/// `nr` moves by 3e-10 between RELTOL 1e-6 and 1e-9 for that reason), which a
-/// 1e-9 floor covers.
-pub(super) const SENSITIVITY_NONLINEAR: Tolerance = Tolerance {
-    relative: 1e-6,
-    absolute: 1e-9,
-};
-
-/// `.sens` of MESA level 2 (#164): the nonlinear bound with a wider floor for
-/// three columns. `mesatemp.c` computes its derived quantities once per
-/// `DEVtemperature` and the load reuses them, while the port recomputes them
-/// from the records at every load; the two agree to ~1e-16, but a column whose
-/// answer is a difference of much larger terms amplifies that. Measured on
-/// `sens_mesa` against the reference binary: `z::level` 3.4e-6 relative (the
-/// perturbation disables the channel, so its answer is a difference of whole
-/// device currents) and `z::teta1`/`z::xtm0` 4.6e-8/6e-9 absolute (parameters
-/// level 2 does not read, where C reports its own rounding residue); every
-/// other column is inside [`SENSITIVITY_NONLINEAR`]. The bound still rejects a
-/// real model difference - it is 1e-5, and the MESA `tRsi` defect this fixture
-/// family exposed sat at 1e-2..2e-1.
-pub(super) const SENSITIVITY_CANCELLED: Tolerance = Tolerance {
-    relative: 1e-5,
-    absolute: 5e-8,
 };
 
 /// `.disto` (#104): the nonlinear 1 ppm operating-point bound (every Taylor
@@ -496,10 +454,6 @@ impl<'a> PointComparison<'a> {
         })
     }
 
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "retain the existing separately rounded component acceptance bounds; changing rounding can change golden classifications at the boundary"
-    )]
     fn observe(&mut self, point: usize, expected: &[Complex]) -> Result<(), String> {
         validate_row(&self.want, "C", point, expected, true)?;
         let actual = self.got.row(point).ok_or("missing Rust row")?;
@@ -520,9 +474,17 @@ impl<'a> PointComparison<'a> {
             let variable = &self.want.variables()[column];
             let got = actual[actual_column];
             let want = expected[column];
+            // Sweep coordinates are inputs, not approximate device derivatives.
+            let tolerance = if self.want.plotname == "Sensitivity Analysis"
+                && self.axis.is_some_and(|(_, _, index)| index == column)
+            {
+                SENSITIVITY
+            } else {
+                self.tolerance
+            };
             for (component, got, want) in [("re", got.re, want.re), ("im", got.im, want.im)] {
                 let error = (got - want).abs();
-                let limit = self.tolerance.relative * want.abs() + self.tolerance.absolute;
+                let limit = tolerance.bound(want);
                 if error > limit {
                     self.mismatches += 1;
                     let ratio = error / limit;
@@ -791,7 +753,13 @@ mod tests {
 
     #[test]
     fn components_and_zero_use_relative_plus_absolute_bounds() {
-        for tolerance in [DC, AC] {
+        for tolerance in [
+            DC,
+            AC,
+            SENSITIVITY,
+            SENSITIVITY_NONLINEAR,
+            SENSITIVITY_CANCELLED,
+        ] {
             let want = plot();
             for (point, component) in [(0, "re"), (0, "im"), (1, "re"), (1, "im")] {
                 let mut got = want.clone();
@@ -800,7 +768,7 @@ mod tests {
                 } else {
                     &mut got.point_mut(point).unwrap()[1].im
                 };
-                let bound = tolerance.relative * value.abs() + tolerance.absolute;
+                let bound = tolerance.bound(*value);
                 *value += 0.5 * bound;
                 plots(&got, &want, tolerance, None).unwrap();
                 *if component == "re" {
@@ -813,6 +781,26 @@ mod tests {
                 assert!(error.contains("first:") && error.contains("worst"));
             }
         }
+    }
+
+    #[test]
+    fn nonlinear_sensitivity_accepts_cancellation_not_wrong_sweep_coordinates() {
+        let mut want = plot();
+        want.plotname = "Sensitivity Analysis".into();
+        let mut got = want.clone();
+        got.point_mut(0).unwrap()[1].re *= 1.0005;
+        plots(&got, &want, SENSITIVITY_NONLINEAR, Some("frequency")).unwrap();
+        assert!(plots(&got, &want, SENSITIVITY, Some("frequency")).is_err());
+        got.point_mut(0).unwrap()[0].re *= 1.0005;
+        let error = plots(&got, &want, SENSITIVITY_NONLINEAR, Some("frequency")).unwrap_err();
+        assert!(error.contains("frequency.re"), "{error}");
+        got = want.clone();
+        got.point_mut(0).unwrap()[1].re *= 1.002;
+        assert!(plots(&got, &want, SENSITIVITY_NONLINEAR, Some("frequency")).is_err());
+        got = want.clone();
+        got.point_mut(1).unwrap()[1].re = 2e-8;
+        assert!(plots(&got, &want, SENSITIVITY_NONLINEAR, Some("frequency")).is_err());
+        assert!(plots(&got, &want, SENSITIVITY_CANCELLED, Some("frequency")).is_ok());
     }
 
     #[test]
