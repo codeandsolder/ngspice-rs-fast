@@ -42,13 +42,6 @@
 //! The last rule of the numbered list is how limiting stays compatible with the port's
 //! physical-residual convergence test: a converged iterate is always reloaded
 //! with limiting inactive, i.e. exactly at the returned solution.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
-
 use crate::devices::{DeviceState, IterationPhase};
 use crate::primitives::{Real, SpiceResult};
 
@@ -60,7 +53,15 @@ const ROOT2: Real = std::f64::consts::SQRT_2;
 /// `MOS1sourceVcrit`/`MOS1drainVcrit`).
 #[must_use]
 pub fn critical_voltage(vt: Real, saturation_current: Real) -> Real {
-    vt * (vt / (ROOT2 * saturation_current)).ln()
+    let ratio = (vt / ROOT2) / saturation_current;
+    let logarithm = if ratio.is_normal() {
+        ratio.ln()
+    } else {
+        // The logarithm can be finite even when the ratio overflows or
+        // underflows, particularly for subnormal saturation currents.
+        vt.ln() - saturation_current.ln() - ROOT2.ln()
+    };
+    vt * logarithm
 }
 
 /// A [`pnjlim`] result: the voltage to evaluate and C's `icheck` flag.
@@ -80,9 +81,9 @@ pub fn pnjlim(vnew: Real, vold: Real, vt: Real, vcrit: Real) -> Limited {
         let value = if vold > 0. {
             let arg = (vnew - vold) / vt;
             if arg > 0. {
-                vold + vt * (2. + (arg - 2.).ln())
+                vt.mul_add(2. + (arg - 2.).ln(), vold)
             } else {
-                vold - vt * (2. + (2. - arg).ln())
+                (-vt).mul_add(2. + (2. - arg).ln(), vold)
             }
         } else {
             vt * (vnew / vt).ln()
@@ -96,7 +97,7 @@ pub fn pnjlim(vnew: Real, vold: Real, vt: Real, vcrit: Real) -> Limited {
         let floor = if vold > 0. {
             -vold - 1.
         } else {
-            2. * vold - 1.
+            2_f64.mul_add(vold, -1.)
         };
         if vnew < floor {
             return Limited {
@@ -115,7 +116,7 @@ pub fn pnjlim(vnew: Real, vold: Real, vt: Real, vcrit: Real) -> Limited {
 /// relative to the threshold `vto` (Gillespie's `vtstlo`).
 #[must_use]
 pub fn fetlim(vnew: Real, vold: Real, vto: Real) -> Real {
-    let vtsthi = (2. * (vold - vto)).abs() + 2.;
+    let vtsthi = 2_f64.mul_add((vold - vto).abs(), 2.);
     let vtstlo = (vold - vto).abs() + 1.;
     let vtox = vto + 3.5;
     let delv = vnew - vold;
@@ -162,7 +163,7 @@ pub fn fetlim(vnew: Real, vold: Real, vto: Real) -> Real {
 pub fn limvds(vnew: Real, vold: Real) -> Real {
     if vold >= 3.5 {
         if vnew > vold {
-            vnew.min(3. * vold + 2.)
+            vnew.min(3_f64.mul_add(vold, 2.))
         } else if vnew < 3.5 {
             vnew.max(2.)
         } else {
@@ -303,7 +304,7 @@ impl Limiter {
             return;
         };
         if currents.iter().any(|(held, predicted)| {
-            (predicted - held).abs() > reltol * predicted.abs().max(held.abs()) + abstol
+            (predicted - held).abs() > reltol.mul_add(predicted.abs().max(held.abs()), abstol)
         }) {
             self.exempt = false;
             self.nonconvergent = true;
@@ -394,6 +395,18 @@ mod tests {
     use crate::devices::StateHistory;
 
     const VT: Real = crate::devices::nonlinear::thermal::K_OVER_Q * 300.15;
+
+    #[test]
+    fn critical_voltage_retains_finite_logarithm_of_extreme_ratios() {
+        let minimum = Real::from_bits(1);
+        let expected = VT * (VT.ln() + 1074. * std::f64::consts::LN_2 - ROOT2.ln());
+        assert!((critical_voltage(VT, minimum) - expected).abs() < 8. * Real::EPSILON * expected);
+        let expected = minimum * (minimum.ln() - Real::MAX.ln() - ROOT2.ln());
+        assert_eq!(
+            critical_voltage(minimum, Real::MAX).to_bits(),
+            expected.to_bits()
+        );
+    }
 
     #[test]
     fn pnjlim_follows_devsup() {

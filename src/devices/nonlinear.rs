@@ -1415,8 +1415,30 @@ pub(super) fn cubic_reverse_junction(v: Real, vt: Real, is: Real) -> (Real, Real
 
 /// Current and conductance without gmin or an exponential clamp.
 pub(super) fn exponential_junction(v: Real, vt: Real, is: Real) -> (Real, Real) {
-    let exp = (v / vt).exp();
-    (is * (exp - 1.), is * exp / vt)
+    let argument = v / vt;
+    let exp = argument.exp();
+    if exp.is_finite() {
+        // Around equilibrium the current is O(v); subtracting one from
+        // exp(v/vt) would round it to zero long before it underflows.
+        let current = if argument.abs() < 0.5 {
+            is * argument.exp_m1()
+        } else {
+            is * (exp - 1.)
+        };
+        (current, is * exp / vt)
+    } else if is > 0. && argument.is_finite() {
+        // A small saturation current can cancel the exponential's
+        // intermediate overflow. Delay multiplying the exponentials.
+        let factor = (argument * 0.5).exp();
+        let scaled = if factor.is_finite() {
+            (is * factor) * factor
+        } else {
+            (is.ln() + argument).exp()
+        };
+        (scaled - is, scaled / vt)
+    } else {
+        (is * (exp - 1.), is * exp / vt)
+    }
 }
 
 /// Which region owns the exact -3 Vt boundary in the reference load.
@@ -1451,13 +1473,25 @@ pub(super) fn junction_current(
     }
     Ok(result)
 }
+/// Integral of the depletion capacitance, with its logarithmic limit
+/// when the grading exponent is exactly one.
+fn depletion_integral(logarithm: Real, grading: Real) -> Real {
+    let exponent = 1. - grading;
+    if exponent == 0. {
+        -logarithm
+    } else {
+        -(exponent * logarithm).exp_m1() / exponent
+    }
+}
+
 /// Reverse depletion charge and capacitance for the logarithmic grading law
 /// in `dioload.c` and `bjtload.c` (not the MOS or JFET square-root shortcuts).
 pub(super) fn reverse_depletion(v: Real, cz: Real, pot: Real, m: Real) -> (Real, Real) {
-    let arg = 1. - v / pot;
-    let sarg = (-m * arg.ln()).exp();
-    let normalized = arg * sarg;
-    (pot * cz * (1. - normalized) / (1. - m), cz * sarg)
+    let logarithm = (-v / pot).ln_1p();
+    (
+        pot * cz * depletion_integral(logarithm, m),
+        cz * (-m * logarithm).exp(),
+    )
 }
 
 /// Temperature-adjusted depletion continuation shared by diode and BJT.
@@ -1474,15 +1508,15 @@ pub(super) struct DepletionLaw {
 
 impl DepletionLaw {
     pub(super) fn new(potential: Real, grading: Real, fc: Real) -> Self {
-        let xfc = (1. - fc).ln();
-        let forward_factor = fc * (1. + grading);
+        let xfc = (-fc).ln_1p();
+        let forward_factor = 1. + grading;
         Self {
             potential,
             grading,
             threshold: fc * potential,
-            f1: potential * (1. - ((1. - grading) * xfc).exp()) / (1. - grading),
+            f1: potential * depletion_integral(xfc, grading),
             f2: ((1. + grading) * xfc).exp(),
-            f3: 1. - forward_factor,
+            f3: (-fc).mul_add(forward_factor, 1.),
         }
     }
 
@@ -1510,14 +1544,14 @@ impl DepletionLaw {
             add_diffusion(charge, capacitance)
         } else {
             let czf2 = cz / self.f2;
-            let slope = grading * v / potential;
-            let (charge, capacitance) = add_diffusion(cz * self.f1, czf2 * (self.f3 + slope));
-            let linear = self.f3 * (v - threshold);
-            let voltage_squared = v * v;
-            let threshold_squared = threshold * threshold;
-            let quadratic =
-                (grading / (potential + potential)) * (voltage_squared - threshold_squared);
-            let forward_charge = czf2 * (linear + quadratic);
+            let delta = v - threshold;
+            let slope = grading / potential;
+            let edge = self.f3 + grading * threshold / potential;
+            let relative_capacitance = slope.mul_add(delta, edge);
+            let (charge, capacitance) = add_diffusion(cz * self.f1, czf2 * relative_capacitance);
+            // Integrate the linear capacitance from the forward threshold
+            // instead of subtracting squares of large absolute voltages.
+            let forward_charge = (czf2 * delta) * edge.midpoint(relative_capacitance);
             (charge + forward_charge, capacitance)
         }
     }
@@ -2088,14 +2122,14 @@ mod tests {
                     (is * (ev - 1.), is * ev / vt)
                 };
                 let actual = junction_current(v, vt, is, boundary).unwrap();
-                assert_eq!(actual.0.to_bits(), expected.0.to_bits());
+                assert!((actual.0 - expected.0).abs() <= 4. * Real::EPSILON * expected.0.abs());
                 assert_eq!(actual.1.to_bits(), expected.1.to_bits());
             }
         }
     }
 
     #[test]
-    fn depletion_keeps_the_reference_diffusion_addition_order() {
+    fn depletion_matches_reference_and_preserves_diffusion_cancellation() {
         for (p, m, fc) in [(0.7, 0.33, 0.5), (1.1, 0.5, 0.8), (0.9, 0.999, 0.2)] {
             let law = DepletionLaw::new(p, m, fc);
             let fcp = fc * p;
@@ -2129,12 +2163,42 @@ mod tests {
                             }
                         };
                         let actual = law.charge(v, cz, diffusion);
-                        assert_eq!(actual.0.to_bits(), expected.0.to_bits());
-                        assert_eq!(actual.1.to_bits(), expected.1.to_bits());
+                        // The old subtraction is ill-conditioned when
+                        // grading approaches one or diffusion cancels charge.
+                        let charge_scale = (p * cz).abs().max(q0.abs());
+                        assert!((actual.0 - expected.0).abs() <= 2e-12 * charge_scale);
+                        assert!(
+                            (actual.1 - expected.1).abs() <= 8. * Real::EPSILON * expected.1.abs()
+                        );
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn junction_and_depletion_keep_the_linear_response_near_equilibrium() {
+        for voltage in [-1e-30, 1e-30, -1e-20, 1e-20] {
+            let (current, conductance) = exponential_junction(voltage, 0.026, 1e-14);
+            let expected = voltage * (1e-14 / 0.026);
+            assert!((current - expected).abs() <= 4. * Real::EPSILON * expected.abs());
+            assert!((conductance - 1e-14 / 0.026).abs() <= 4. * Real::EPSILON * conductance);
+            for grading in [0., 0.5, 0.999, 1.] {
+                let (q, cap) = reverse_depletion(voltage, 2e-12, 0.7, grading);
+                let expected = voltage * 2e-12;
+                assert!((q - expected).abs() <= 4. * Real::EPSILON * expected.abs());
+                assert_eq!(cap.to_bits(), (2e-12_f64).to_bits());
+            }
+        }
+        let (current, conductance) = exponential_junction(720., 1., 1e-300);
+        // exp(720)*1e-300, independently calculated in decimal.
+        let expected = 4.920_700_930_263_816e12;
+        assert!((current - expected).abs() < 2e-14 * expected);
+        assert_eq!(current.to_bits(), conductance.to_bits());
+        let law = DepletionLaw::new(0.7, 1., 0.5);
+        let (q, c) = law.charge(0.35, 2e-12, None);
+        assert!((q - 0.7 * 2e-12 * std::f64::consts::LN_2).abs() < 1e-27);
+        assert!((c - 4e-12).abs() < 1e-27);
     }
 
     #[test]
