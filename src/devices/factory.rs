@@ -2,20 +2,19 @@
 use crate::devices::models::ModelFamily;
 use crate::devices::passive::PassiveKind;
 use crate::devices::rlc::ResistorNoise;
-use crate::devices::sources::SourceExcitation;
+use crate::devices::sources::{SourceExcitation, SourceInputs};
 use crate::devices::{
     AmSpec, Capacitor, Device, ExpSpec, FunctionSpec, Inductor, PulseSpec, PwlSource, Resistor,
     SffmSpec, SineSpec, Waveform,
 };
 use crate::netlist::ast::{
     DeviceInstance, FunctionWaveform, ParameterKind, PositionedValue, SourceFunction,
-    SourceWaveform,
+    SourceWaveform, WaveformKind,
 };
 use crate::netlist::source::{Deck, LogicalLine};
 use crate::netlist::{Parser, RawCard};
 use crate::primitives::{
-    Complex, NodeAppend, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult,
-    parse_spice_number,
+    NodeAppend, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
 };
 
 /// Designators [`instantiate`] builds from the card alone (the registry's
@@ -354,23 +353,14 @@ enum PortSetter {
 }
 
 struct SourceSetters {
-    value: Option<Real>,
-    mag: Real,
-    phase: Real,
-    ac_given: bool,
-    waveform: Option<Waveform>,
+    inputs: SourceInputs,
     port: PortSetters,
     distortion: [Option<crate::devices::distortion::DistortionInput>; 2],
 }
 
 fn parse_source_setters(instance: &DeviceInstance) -> SpiceResult<SourceSetters> {
-    let mut value = None;
-    let mut mag = 0.;
-    let mut phase: f64 = 0.;
-    // C `VSRCacGiven`/`ISRCacGiven`: any AC setter, even `ac 0`.
-    let mut ac_given = false;
+    let mut inputs = SourceInputs::default();
     // C applies waveform setters in order, so the last one wins.
-    let mut waveform = None;
     // PWL `td=` (any order) and `r=` (applies to the PWL already set), as the
     // ordered VSRC_TD/VSRC_R setters of vsrcpar.c/isrcpar.c.
     let mut pwl_delay: Option<(f64, SourceLoc)> = None;
@@ -391,7 +381,7 @@ fn parse_source_setters(instance: &DeviceInstance) -> SpiceResult<SourceSetters>
                     location: Some(at.clone()),
                 });
             }
-            waveform = Some(source_waveform(&p.name, source, &p.location)?);
+            inputs.waveform = Some(source_waveform(&p.name, source, &p.location)?);
             // A later waveform setter replaces C's PORT function type.
             port.power_function = None;
             continue;
@@ -414,12 +404,10 @@ fn parse_source_setters(instance: &DeviceInstance) -> SpiceResult<SourceSetters>
         let number = scalar_number(p)?;
         match setter {
             SourceSetter::AcMagnitude => {
-                mag = number;
-                ac_given = true;
+                inputs.ac.get_or_insert_default().magnitude = Some(number);
             }
             SourceSetter::AcPhase => {
-                phase = number;
-                ac_given = true;
+                inputs.ac.get_or_insert_default().phase = Some(number);
             }
             SourceSetter::DistortionMagnitude(index) => {
                 // A new setter replaces both values (vsrcpar.c).
@@ -439,21 +427,17 @@ fn parse_source_setters(instance: &DeviceInstance) -> SpiceResult<SourceSetters>
             SourceSetter::Delay => pwl_delay = Some((number, p.location.clone())),
             SourceSetter::Port(setter) => port.set(setter, number, &p.location)?,
             SourceSetter::Repeat => {
-                validate_pwl_repeat(instance, p, waveform.as_ref(), number)?;
+                validate_pwl_repeat(instance, p, inputs.waveform.as_ref(), number)?;
                 pwl_repeat = Some((number, p.location.clone()));
             }
-            SourceSetter::Dc => value = Some(number),
+            SourceSetter::Dc => inputs.dc = Some(number),
         }
     }
     if pwl_delay.is_some() || pwl_repeat.is_some() {
-        waveform = Some(pwl_options(waveform, pwl_delay, pwl_repeat)?);
+        inputs.waveform = Some(pwl_options(inputs.waveform, pwl_delay, pwl_repeat)?);
     }
     Ok(SourceSetters {
-        value,
-        mag,
-        phase,
-        ac_given,
-        waveform,
+        inputs,
         port,
         distortion,
     })
@@ -490,35 +474,13 @@ fn instantiate_source(
     nodes: &mut NodeAppend<'_>,
 ) -> SpiceResult<Box<dyn Device>> {
     let SourceSetters {
-        value,
-        mag,
-        phase,
-        ac_given,
-        waveform,
+        inputs,
         port,
         distortion,
     } = parse_source_setters(instance)?;
-    let dc_given = value.is_some();
-    let waveform_given = waveform.is_some();
-    // An explicit DC value is kept apart from time forcing. Without one, DC
-    // analyses see the waveform's time-zero level (vsrcload.c evaluates the
-    // transient function at time 0 when DC is not given).
-    let value = match (value, &waveform) {
-        (Some(v), _) => v,
-        (None, Some(w)) => w.time_zero()?,
-        (None, None) => 0.,
-    };
     let power_function = port.power_function.is_some();
     let rf = port.resolve(instance)?;
-    let excitation = SourceExcitation::new(
-        instance.designator == 'v',
-        value,
-        Complex::new(
-            mag * phase.to_radians().cos(),
-            mag * phase.to_radians().sin(),
-        ),
-        waveform.unwrap_or(Waveform::Constant(value)),
-    )?;
+    let excitation = SourceExcitation::from_inputs(instance.designator == 'v', inputs)?;
     // Only topology binding now needs the append-only transaction.
     nodes.transaction(|nodes| {
         let terminals = [
@@ -527,12 +489,6 @@ fn instantiate_source(
         ];
         let source = excitation
             .bind(&instance.name, terminals)
-            .with_ac_given(ac_given)
-            .with_sensitivity_inputs(crate::devices::sensitivity::SourceInputs {
-                dc_given,
-                function_given: waveform_given,
-                ac: ac_given.then_some((mag, phase)),
-            })
             .with_distortion(distortion[0], distortion[1])?;
         let device: Box<dyn Device> = match rf {
             Some(rf) => Box::new(source.with_port(rf.bind(instance, nodes)?)?),
@@ -705,11 +661,15 @@ fn source_waveform(
     source: &SourceWaveform,
     setter: &SourceLoc,
 ) -> SpiceResult<Waveform> {
-    match (name, source) {
-        (name, SourceWaveform::Function(f)) if name == f.function.keyword() => {
-            function_waveform(f, setter)
-        }
-        ("pulse", SourceWaveform::Pulse(p)) => {
+    if WaveformKind::from_keyword(name) != Some(source.kind()) {
+        return Err(SpiceError::parse(
+            setter.clone(),
+            format!("source waveform '{name}' does not match its typed coefficients"),
+        ));
+    }
+    match source {
+        SourceWaveform::Function(f) => function_waveform(f, setter),
+        SourceWaveform::Pulse(p) => {
             let optional = |v: &Option<PositionedValue>, what| v.as_ref().map(|v| field(v, what));
             let spec = PulseSpec {
                 initial: field(&p.initial, "pulse v1")?,
@@ -727,7 +687,7 @@ fn source_waveform(
                 .map_err(|e| waveform_error(&p.initial, &e))?;
             Ok(waveform)
         }
-        ("pwl", SourceWaveform::Pwl(points)) => {
+        SourceWaveform::Pwl(points) => {
             let knots = points
                 .iter()
                 .map(|p| Ok((field(&p.time, "pwl time")?, field(&p.value, "pwl value")?)))
@@ -743,10 +703,6 @@ fn source_waveform(
             })?;
             Ok(waveform)
         }
-        _ => Err(SpiceError::not_yet_ported(
-            format!("source waveform '{name}'"),
-            "src/spicelib/devices/vsrc/vsrcload.c",
-        )),
     }
 }
 
@@ -842,8 +798,12 @@ mod tests {
             .unwrap();
         let instance = &deck.devices[0];
         let input = parse_source_setters(instance).unwrap();
-        assert!(input.ac_given);
-        assert_eq!(input.mag.to_bits(), 0_f64.to_bits());
+        let ac = input
+            .inputs
+            .ac
+            .expect("explicit AC magnitude must be retained");
+        assert_eq!(ac.magnitude.map(f64::to_bits), Some(0_f64.to_bits()));
+        assert_eq!(ac.phase.map(f64::to_bits), Some(0_f64.to_bits()));
         assert!(input.port.power_function.is_some());
         let mut nodes = NodeTable::new();
         let existing = nodes.intern("v1#res").unwrap();
@@ -877,6 +837,39 @@ mod tests {
         assert_eq!(port.z0.to_bits(), 75_f64.to_bits());
         assert_eq!(port.internal, nodes.get("v1#res").unwrap());
     }
+    #[test]
+    fn waveform_alias_uses_shared_kind_and_mismatched_ast_is_rejected() {
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("waveform-alias.cir"),
+                "title\nv1 a 0 sine(0 1 1k)\n.end\n",
+            ))
+            .unwrap();
+        let mut instance = deck.devices[0].clone();
+        assert!(
+            NodeTable::new()
+                .transaction(|nodes| instantiate_source(&instance, nodes))
+                .is_ok()
+        );
+        let parameter = instance
+            .parameters
+            .iter_mut()
+            .find(|p| matches!(p.kind, ParameterKind::Waveform(_)))
+            .unwrap();
+        parameter.name = "exp".to_owned();
+        let mut nodes = NodeTable::new();
+        let before = nodes.nodes().to_vec();
+        let error = nodes
+            .transaction(|nodes| instantiate_source(&instance, nodes))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its typed coefficients")
+        );
+        assert_eq!(nodes.nodes(), before);
+    }
+
     #[test]
     fn late_semiconductor_collisions_rollback_factory_and_enclosing_batch() {
         use crate::devices::{ModelContext, ModelResolver};

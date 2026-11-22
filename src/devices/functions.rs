@@ -60,7 +60,7 @@ fn invalid(kind: &str, message: impl Into<String>) -> SpiceError {
 
 /// Checks that optional fields are a contiguous, finite prefix and returns how
 /// many were supplied.
-fn prefix(kind: &str, fields: &[Real], optional: &[Option<Real>]) -> SpiceResult<usize> {
+pub(super) fn prefix(kind: &str, fields: &[Real], optional: &[Option<Real>]) -> SpiceResult<usize> {
     let given = optional.iter().take_while(|v| v.is_some()).count();
     if optional[given..].iter().any(Option::is_some) {
         return Err(invalid(kind, "optional fields must be a contiguous prefix"));
@@ -336,7 +336,7 @@ impl FunctionSpec {
                 carrier_phase: a.carrier_phase.unwrap_or(0.),
             }),
         };
-        if !resolved.parameters().iter().all(|v| v.is_finite()) {
+        if !resolved.parameters().all(Real::is_finite) {
             return Err(invalid(kind, "a resolved field is not finite"));
         }
         Ok(resolved)
@@ -397,13 +397,13 @@ pub struct Am {
     carrier_phase: Real,
 }
 
-/// The phase conversion in `vsrcload.c` and `isrcload.c` rounds the product
+/// The phase conversion in VSRC/ISRC temperature and load routines rounds the product
 /// before dividing by 180, rather than multiplying by a precomputed ratio.
 #[expect(
     clippy::suboptimal_flops,
     reason = "retain C phase conversion multiplication and division order"
 )]
-const fn phase_radians(degrees: Real) -> Real {
+pub(super) const fn phase_radians(degrees: Real) -> Real {
     degrees * PI / 180.
 }
 
@@ -530,46 +530,62 @@ impl SourceFunction {
 
     /// The resolved coefficients in C order (after defaults and, for SFFM,
     /// the modulation-index limit). Phases are in degrees.
-    #[must_use]
-    pub fn parameters(&self) -> Vec<Real> {
-        match *self {
-            Self::Sine(s) => vec![
-                s.offset,
-                s.amplitude,
-                s.frequency,
-                s.delay,
-                s.damping,
-                s.phase,
-            ],
-            Self::Exp(e) => vec![
-                e.initial,
-                e.pulsed,
-                e.rise_delay,
-                e.rise_tau,
-                e.fall_delay,
-                e.fall_tau,
-            ],
-            Self::Sffm(f) => vec![
-                f.offset,
-                f.amplitude,
-                f.carrier,
-                f.index,
-                f.signal,
-                f.delay,
-                f.signal_phase,
-                f.carrier_phase,
-            ],
-            Self::Am(a) => vec![
-                a.offset,
-                a.carrier_amplitude,
-                a.modulation_amplitude,
-                a.modulation_frequency,
-                a.carrier_frequency,
-                a.delay,
-                a.modulation_phase,
-                a.carrier_phase,
-            ],
-        }
+    pub fn parameters(&self) -> impl ExactSizeIterator<Item = Real> {
+        let (values, len) = match *self {
+            Self::Sine(s) => (
+                [
+                    s.offset,
+                    s.amplitude,
+                    s.frequency,
+                    s.delay,
+                    s.damping,
+                    s.phase,
+                    0.,
+                    0.,
+                ],
+                6,
+            ),
+            Self::Exp(e) => (
+                [
+                    e.initial,
+                    e.pulsed,
+                    e.rise_delay,
+                    e.rise_tau,
+                    e.fall_delay,
+                    e.fall_tau,
+                    0.,
+                    0.,
+                ],
+                6,
+            ),
+            Self::Sffm(f) => (
+                [
+                    f.offset,
+                    f.amplitude,
+                    f.carrier,
+                    f.index,
+                    f.signal,
+                    f.delay,
+                    f.signal_phase,
+                    f.carrier_phase,
+                ],
+                8,
+            ),
+            Self::Am(a) => (
+                [
+                    a.offset,
+                    a.carrier_amplitude,
+                    a.modulation_amplitude,
+                    a.modulation_frequency,
+                    a.carrier_frequency,
+                    a.delay,
+                    a.modulation_phase,
+                    a.carrier_phase,
+                ],
+                8,
+            ),
+        };
+        values.into_iter().take(len)
     }
 
     /// Forcing at `t` with the requested one-sided limit. Only SFFM/AM jump
@@ -898,13 +914,16 @@ mod tests {
     fn sine_defaults_values_and_corners() {
         // Two fields: FREQ = 1/stop, no delay/damping/phase.
         let s = sine([None; 4]).resolve(&timing()).unwrap();
-        assert_eq!(s.parameters(), [0.5, 2., 1., 0., 0., 0.]);
+        assert_eq!(
+            s.parameters().collect::<Vec<_>>(),
+            [0.5, 2., 1., 0., 0., 0.]
+        );
         assert!(close(s.value_at(0.25, R).unwrap(), 2.5));
         // An explicit zero frequency is also replaced.
         let s = sine([Some(0.), None, None, None])
             .resolve(&timing())
             .unwrap();
-        assert_eq!(s.parameters()[2], 1.);
+        assert_eq!(s.parameters().nth(2).unwrap(), 1.);
         // Delay, damping and phase.
         let spec = sine([Some(10.), Some(0.1), Some(2.), Some(30.)]);
         let s = spec.resolve(&timing()).unwrap();
@@ -935,12 +954,18 @@ mod tests {
         };
         // Two fields: TD1 = TAU1 = TAU2 = step, TD2 = TD1 + step.
         let e = spec([None; 4]).resolve(&timing()).unwrap();
-        assert_eq!(e.parameters(), [1., 3., 1e-3, 1e-3, 2e-3, 1e-3]);
+        assert_eq!(
+            e.parameters().collect::<Vec<_>>(),
+            [1., 3., 1e-3, 1e-3, 2e-3, 1e-3]
+        );
         // Explicit zeros are replaced; TD2 follows the resolved TD1.
         let e = spec([Some(0.5), Some(0.), Some(0.), Some(0.)])
             .resolve(&timing())
             .unwrap();
-        assert_eq!(e.parameters(), [1., 3., 0.5, 1e-3, 0.501, 1e-3]);
+        assert_eq!(
+            e.parameters().collect::<Vec<_>>(),
+            [1., 3., 0.5, 1e-3, 0.501, 1e-3]
+        );
         let spec = spec([Some(0.1), Some(0.2), Some(0.5), Some(0.3)]);
         assert_eq!(spec.time_zero().unwrap(), 1.);
         let e = spec.resolve(&timing()).unwrap();
@@ -972,17 +997,23 @@ mod tests {
         };
         // FC = 5/stop, MDI = 90 limited to FC/FM = 5/500, FM = 500/stop.
         let f = spec([None; 6]).resolve(&timing()).unwrap();
-        assert_eq!(f.parameters(), [1., 2., 5., 0.01, 500., 0., 0., 0.]);
+        assert_eq!(
+            f.parameters().collect::<Vec<_>>(),
+            [1., 2., 5., 0.01, 500., 0., 0., 0.]
+        );
         // Explicit FC = 0 stays (then MDI is limited to 0); explicit FM = 0 is
         // replaced; a negative MDI becomes 0.
         let f = spec([Some(0.), Some(3.), Some(0.), None, None, None])
             .resolve(&timing())
             .unwrap();
-        assert_eq!(f.parameters()[2..5], [0., 0., 500.]);
+        assert_eq!(
+            f.parameters().skip(2).take(3).collect::<Vec<_>>(),
+            [0., 0., 500.]
+        );
         let f = spec([Some(100.), Some(-1.), Some(10.), None, None, None])
             .resolve(&timing())
             .unwrap();
-        assert_eq!(f.parameters()[3], 0.);
+        assert_eq!(f.parameters().nth(3).unwrap(), 0.);
         // Zero before TD (C returns 0, not VO), a jump at TD.
         let spec = spec([
             Some(100.),
@@ -1022,12 +1053,18 @@ mod tests {
             })
         };
         let a = spec([None; 6]).resolve(&timing()).unwrap();
-        assert_eq!(a.parameters(), [0.1, 1., 1., 5., 500., 0., 0., 0.]);
+        assert_eq!(
+            a.parameters().collect::<Vec<_>>(),
+            [0.1, 1., 1., 5., 500., 0., 0., 0.]
+        );
         // AM replaces only omitted fields: explicit zeros stay.
         let a = spec([Some(0.), Some(0.), Some(0.), None, None, None])
             .resolve(&timing())
             .unwrap();
-        assert_eq!(a.parameters()[2..5], [0., 0., 0.]);
+        assert_eq!(
+            a.parameters().skip(2).take(3).collect::<Vec<_>>(),
+            [0., 0., 0.]
+        );
         let spec = spec([
             Some(0.5),
             Some(10.),
