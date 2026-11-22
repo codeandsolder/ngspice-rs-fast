@@ -137,9 +137,17 @@ fn compare(c: &Plot, rust: &Plot, label: &str) {
     let grid: Vec<f64> = rust
         .column("time")
         .map_or_else(Vec::new, |t| t.iter().map(|v| v.re).collect());
-    for variable in c.variables() {
+    for (column, variable) in c.variables().iter().enumerate() {
         let name = variable.name.as_str();
-        let expected = c.column(name).unwrap();
+        let mut expected = c.column(name).unwrap();
+        for sample in &mut expected {
+            let [re, im] = ngspice_conformance::ngspice::batch_reference_sample(
+                column,
+                name,
+                [sample.re, sample.im],
+            );
+            *sample = ngspice_rs::primitives::Complex::new(re, im);
+        }
         let actual = rust
             .column(name)
             .unwrap_or_else(|| panic!("{label}: port has no {name}"));
@@ -171,9 +179,6 @@ fn compare(c: &Plot, rust: &Plot, label: &str) {
         assert_eq!(actual.len(), expected.len(), "{label} {name}: point count");
         for (k, (a, e)) in actual.iter().zip(&expected).enumerate() {
             for (x, y, part) in [(a.re, e.re, "re"), (a.im, e.im, "im")] {
-                if name == "frequency" && part == "im" {
-                    continue;
-                }
                 assert!(
                     (x - y).abs() <= 1e-6 * y.abs() + floor,
                     "{label} {name}[{k}].{part}: port {x:e}, C {y:e}"

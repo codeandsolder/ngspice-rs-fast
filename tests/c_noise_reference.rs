@@ -114,20 +114,21 @@ fn compare(name: &str, deck_text: &str) {
         // the nonlinear DC/AC bound. Values are compared by C's names (the
         // port writes simulator-internal nodes that C's batch plots omit).
         let floor = if is_noise(want) { 1e-20 } else { 1e-12 };
-        for variable in want.variables() {
+        for (column, variable) in want.variables().iter().enumerate() {
             let want_column = want.column(&variable.name).unwrap();
             let got_column = got
                 .column(&variable.name)
                 .unwrap_or_else(|| panic!("{name}: plot {index} lacks {}", variable.name));
             for (point, (a, b)) in got_column.iter().zip(&want_column).enumerate() {
-                // C's batch writer leaves the AC scale's imaginary half unset.
-                let difference = if variable.name == "frequency" {
-                    (a.re - b.re).abs()
-                } else {
-                    (*a - *b).magnitude()
-                };
+                let [re, im] = ngspice_conformance::ngspice::batch_reference_sample(
+                    column,
+                    &variable.name,
+                    [b.re, b.im],
+                );
+                let reference = ngspice_rs::primitives::Complex::new(re, im);
+                let difference = (*a - reference).magnitude();
                 assert!(
-                    difference <= 1e-6 * b.magnitude() + floor,
+                    difference <= 1e-6 * reference.magnitude() + floor,
                     "{name}: plot {index} '{}' point {point}: {a} != {b}",
                     variable.name
                 );

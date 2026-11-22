@@ -154,8 +154,14 @@ fn compare_with_c(name: &str, deck_text: &str, (relative, absolute): (f64, f64))
         );
         assert_eq!(got.point_count(), want.point_count(), "{name}");
         for (point, (a, b)) in got.points().iter().zip(want.points()).enumerate() {
-            for ((x, y), variable) in a.iter().zip(b).zip(want.variables()) {
-                if y.re.is_nan() || y.im.is_nan() {
+            for (column, ((x, y), variable)) in a.iter().zip(b).zip(want.variables()).enumerate() {
+                let [re, im] = ngspice_conformance::ngspice::batch_reference_sample(
+                    column,
+                    &variable.name,
+                    [y.re, y.im],
+                );
+                let reference = ngspice_rs::primitives::Complex::new(re, im);
+                if reference.re.is_nan() || reference.im.is_nan() {
                     assert!(
                         x.re.is_nan(),
                         "{name}: '{}' point {point}: C NaN, Rust {x}",
@@ -163,9 +169,9 @@ fn compare_with_c(name: &str, deck_text: &str, (relative, absolute): (f64, f64))
                     );
                     continue;
                 }
-                let difference = (*x - *y).magnitude();
+                let difference = (*x - reference).magnitude();
                 assert!(
-                    difference <= relative * y.magnitude() + absolute,
+                    difference <= relative * reference.magnitude() + absolute,
                     "{name}: '{}' point {point}: Rust {x} != C {y}",
                     variable.name
                 );

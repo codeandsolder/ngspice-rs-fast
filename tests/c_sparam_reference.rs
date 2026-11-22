@@ -121,7 +121,7 @@ fn compare_with_bound(name: &str, deck_text: &str, singular_z: bool, relative: f
             want.plotname
         );
         assert_eq!(got.point_count(), want.point_count(), "{name}: points");
-        for variable in want.variables() {
+        for (column, variable) in want.variables().iter().enumerate() {
             let want_column = want.column(&variable.name).unwrap();
             let got_column = got.column(&variable.name).unwrap();
             let unit = &got.variables()[got.variable_index(&variable.name).unwrap()].unit;
@@ -141,16 +141,16 @@ fn compare_with_bound(name: &str, deck_text: &str, singular_z: bool, relative: f
                     );
                     continue;
                 }
-                // C's batch writer leaves a complex scale's imaginary half
-                // uninitialised (see c_batch_reference.rs).
-                let difference = if variable.name == "frequency" {
-                    (a.re - b.re).abs()
-                } else {
-                    (*a - *b).magnitude()
-                };
+                let [re, im] = ngspice_conformance::ngspice::batch_reference_sample(
+                    column,
+                    &variable.name,
+                    [b.re, b.im],
+                );
+                let reference = ngspice_rs::primitives::Complex::new(re, im);
+                let difference = (*a - reference).magnitude();
                 assert!(
                     difference
-                        <= relative * b.magnitude()
+                        <= relative * reference.magnitude()
                             + if variable.name.starts_with("i(Cy_") {
                                 1e-30
                             } else {

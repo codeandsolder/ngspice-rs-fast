@@ -2082,3 +2082,17 @@ runtime `CARGO_BIN_EXE_*` environment to select the exact built executable,
 never a binary found through PATH. Source inputs to the BSIM4 generator
 use source-relative `include_str!` paths. No checkout or executable paths
 are embedded through compile-time Cargo environment macros.
+
+### Incremental C batch frequency axes
+
+The pinned C reference's `CKTacDump` and AC sensitivity output assign only
+the real member of the frequency's `IFvalue` union. In incremental
+`ngspice -b -r` output, `OUTpData` writes the complex union member when the
+plot is complex, including uninitialized bytes after the real frequency.
+
+Live batch comparisons therefore normalize only the C reference's first
+column named `frequency` to a zero imaginary component. Both differences
+and relative scales use the normalized value, and Rust's imaginary component
+is still checked. All other samples retain their existing comparison
+policies. This is not a rawfile decoder change: stored rawfiles, especially
+bit-exact captures, retain their actual payload.

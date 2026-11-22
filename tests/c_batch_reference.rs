@@ -113,15 +113,15 @@ fn compare_with_c_batch(name: &str, deck_text: &str) {
             let want_column = want.column(&want.variables()[column].name).unwrap();
             let got_column = got.column(&variable.name).unwrap();
             for (point, (a, b)) in got_column.iter().zip(&want_column).enumerate() {
-                // C's incremental batch writer leaves the AC scale's imaginary
-                // half uninitialised, so the scale is compared by real part.
-                let difference = if column == 0 && want_name == "frequency" {
-                    (a.re - b.re).abs()
-                } else {
-                    (*a - *b).magnitude()
-                };
+                let [re, im] = ngspice_conformance::ngspice::batch_reference_sample(
+                    column,
+                    want_name,
+                    [b.re, b.im],
+                );
+                let reference = ngspice_rs::primitives::Complex::new(re, im);
+                let difference = (*a - reference).magnitude();
                 assert!(
-                    difference <= 1e-9 * b.magnitude() + 1e-12,
+                    difference <= 1e-9 * reference.magnitude() + 1e-12,
                     "{name}: plot {index} '{want_name}' point {point}: {a} != {b}"
                 );
             }

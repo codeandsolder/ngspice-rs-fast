@@ -34,6 +34,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Normalize the reference frequency axis of an incremental batch rawfile.
+///
+/// The pinned C oracle assigns only `IFvalue.rValue` for the frequency.
+/// `OUTpData` writes `cValue` when the plot is complex, reading an
+/// uninitialized imaginary component. Only the first column named frequency
+/// has this known real-valued domain. Use its normalized sample both for
+/// the absolute error and the relative tolerance.
+#[must_use]
+pub fn batch_reference_sample(column: usize, name: &str, mut sample: [f64; 2]) -> [f64; 2] {
+    if column == 0 && name == "frequency" {
+        sample[1] = 0.0;
+    }
+    sample
+}
+
 /// The C binary, and what it says it is.
 #[derive(Debug, Clone)]
 pub struct Ngspice {
@@ -411,6 +426,28 @@ mod tests {
     use super::{
         first_difference, instrument, instrument_plots, rawfiles_match, requested_codemodels,
     };
+
+    #[test]
+    fn batch_reference_preserves_every_component_except_frequency_axis_imaginary() {
+        for imaginary in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1e213, 1e-300] {
+            let sample = super::batch_reference_sample(0, "frequency", [10., imaginary]);
+            assert_eq!(
+                sample.map(f64::to_bits),
+                [10.0_f64.to_bits(), 0.0_f64.to_bits()]
+            );
+            let tolerance = 1e-6 * sample[0].hypot(sample[1]) + 1e-12;
+            assert!((11. - sample[0]).abs() > tolerance);
+            assert!((10. - sample[0]).abs() <= tolerance);
+            assert_eq!(
+                super::batch_reference_sample(1, "frequency", [10., imaginary])[1].to_bits(),
+                imaginary.to_bits()
+            );
+            assert_eq!(
+                super::batch_reference_sample(0, "v(out)", [10., imaginary])[1].to_bits(),
+                imaginary.to_bits()
+            );
+        }
+    }
 
     #[test]
     fn fixtures_request_code_models_by_a_marker_comment() {

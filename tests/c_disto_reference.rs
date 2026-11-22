@@ -97,7 +97,7 @@ fn compare(name: &str, deck_text: &str) {
         } else {
             1e-12
         };
-        for variable in want.variables() {
+        for (column, variable) in want.variables().iter().enumerate() {
             let want_column = want.column(&variable.name).unwrap();
             let got_column = got
                 .column(&variable.name)
@@ -109,13 +109,15 @@ fn compare(name: &str, deck_text: &str) {
                 variable.name
             );
             for (point, (a, b)) in got_column.iter().zip(&want_column).enumerate() {
-                let difference = if variable.name == "frequency" {
-                    (a.re - b.re).abs()
-                } else {
-                    (*a - *b).magnitude()
-                };
+                let [re, im] = ngspice_conformance::ngspice::batch_reference_sample(
+                    column,
+                    &variable.name,
+                    [b.re, b.im],
+                );
+                let reference = ngspice_rs::primitives::Complex::new(re, im);
+                let difference = (*a - reference).magnitude();
                 assert!(
-                    difference <= 1e-6 * b.magnitude() + floor,
+                    difference <= 1e-6 * reference.magnitude() + floor,
                     "{name}: plot {index} '{}' point {point}: {a} != {b}",
                     variable.name
                 );

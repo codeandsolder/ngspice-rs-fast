@@ -103,13 +103,19 @@ fn compare_with_c(name: &str, deck_text: &str, relative: f64) {
             want.point_count(),
             "{name}: plot {index}"
         );
-        for variable in want.variables() {
+        for (column, variable) in want.variables().iter().enumerate() {
             let want_column = want.column(&variable.name).unwrap();
             let got_column = got.column(&variable.name).unwrap();
             for (point, (a, b)) in got_column.iter().zip(&want_column).enumerate() {
-                let difference = (*a - *b).magnitude();
+                let [re, im] = ngspice_conformance::ngspice::batch_reference_sample(
+                    column,
+                    &variable.name,
+                    [b.re, b.im],
+                );
+                let reference = ngspice_rs::primitives::Complex::new(re, im);
+                let difference = (*a - reference).magnitude();
                 assert!(
-                    difference <= relative * b.magnitude() + 1e-12,
+                    difference <= relative * reference.magnitude() + 1e-12,
                     "{name}: plot {index} '{}' point {point}: Rust {a} != C {b}",
                     variable.name
                 );
