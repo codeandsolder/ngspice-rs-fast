@@ -78,7 +78,11 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
-use crate::devices::jfet::{self, BOLTZMANN, CHARGE, REFTEMP, p};
+use crate::devices::jfet::{
+    self, BOLTZMANN, CHARGE, REFTEMP,
+    lifecycle::{self, GateStamp, GateUpdate, LoadPhase},
+    p,
+};
 use crate::devices::limiting;
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
@@ -113,7 +117,7 @@ const N_MINLOG: Real = 1e-38;
 // The state vector follows the shared JFET-family layout
 // ([`crate::devices::jfet::slot`]) -- `VGS`/`VGD`, the load currents and
 // conductances, then the gate charges -- so that `mesload.c`'s port shares
-// `jfet::select_junctions` and `jfet::finish_load` with the JFETs. C's
+// `lifecycle::select_junctions` and `lifecycle::GateStamp` with the JFETs. C's
 // `MESnumStates` carries the same slots in a different order, which the port
 // does not need to reproduce.
 use crate::devices::jfet::slot;
@@ -533,7 +537,7 @@ impl Mesfet {
     }
 
     fn normalized(&self, v: [Real; 3]) -> [Real; 2] {
-        jfet::normalized(self.model.pol, v)
+        lifecycle::normalized(self.model.pol, v)
     }
 
     /// Normalized `[vgs, vgd]` at a solution vector (no limiting).
@@ -604,7 +608,7 @@ impl Device for Mesfet {
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
     ) -> SpiceResult<bool> {
-        jfet::setup_gate_matrix(setup, &self.terminals, self.inner);
+        lifecycle::setup_gate_matrix(setup, &self.terminals, self.inner);
         Ok(true)
     }
 
@@ -718,49 +722,34 @@ impl Device for Mesfet {
         Ok(Box::new(device))
     }
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        if context.mode.is_ac() {
-            return Err(SpiceError::circuit("MESFET AC needs small-signal assembly"));
-        }
+        let phase = LoadPhase::new(context.mode, context.integration, &context.states, "MESFET")?;
         let op = self.operating()?;
         let pol = self.model.pol;
-        let raw = self.normalized(self.inner.map(|n| context.node_voltage(n)));
-        // mesgetic.c: unset initial conditions come from the external nodes.
-        let ic =
-            jfet::start_conditions(&self.terminals, &self.initial, |n| context.node_voltage(n));
-        let integration = context.integration;
-        // C `xfact = CKTdelta / CKTdeltaOld[1]`; one in a `.dc` sweep.
-        let xfact = integration.map_or(1., crate::maths::integrator::Coefficients::predictor_ratio);
-        let ([vgs, vgd], start) = jfet::select_junctions(
-            jfet::Junctions {
+        let ([vgs, vgd], start) = phase.junctions(
+            lifecycle::Junctions {
                 pol,
                 off: self.initial.off,
                 vt: VT0,
                 vcrit: op.vcrit,
                 vto: self.model.vto,
             },
-            &context.states,
-            raw,
-            ic,
-            xfact,
+            context,
+            &self.terminals,
+            self.inner,
+            &self.initial,
         );
-        let transient = context.mode.is_transient();
-        if transient && integration.is_none() {
-            return Err(SpiceError::circuit(
-                "MESFET transient needs companion integration",
-            ));
-        }
         let point = self.point(&op, vgs, vgd, context.gmin)?;
-        let mut l = jfet::Loaded::from_currents(
+        let mut l = lifecycle::Loaded::from_currents(
             [vgs, vgd],
             (point.channel.current, point.channel.gm, point.channel.gds),
             point.gs,
             point.gd,
         );
-        let gates = if transient {
-            jfet::incremental_statz(
+        let gates = if phase.step().is_some() {
+            lifecycle::incremental_statz(
                 &context.states,
                 [vgs, vgd],
-                jfet::StatzCapacitance::Present,
+                lifecycle::StatzCapacitance::Present,
                 |what| self.numerical(&format!("missing accepted {what}")),
                 |gs, gd| self.charge(&op, gs, gd),
             )?
@@ -770,32 +759,17 @@ impl Device for Mesfet {
             // DC fallback; transient charge() instead rejects that case.
             let q = self.model.qgg(&op, vgs, vgd).0;
             let q = if q.is_finite() { q } else { 0. };
-            jfet::gate_charges(q, q, 0., 0.)
+            lifecycle::gate_charges(q, q, 0., 0.)
         };
-        if transient {
-            let coefficients = integration.ok_or_else(|| {
-                SpiceError::circuit("MESFET transient needs companion integration")
-            })?;
-            l.integrate_gates(&mut context.states, coefficients, gates)?;
-            for branch in gates {
-                branch.store(&mut context.states)?;
-            }
-        } else {
-            for branch in gates {
-                branch.store(&mut context.states)?;
-                branch.zero_derivative(&mut context.states)?;
-            }
+        GateUpdate::Statz(gates).apply(phase, &mut context.states, &mut l)?;
+        GateStamp {
+            terminals: &self.terminals,
+            inner: self.inner,
+            polarity: pol,
+            multiplicity: self.instance.m,
+            series: jfet::series_conductances(self.instance.area, self.model.rd, self.model.rs),
         }
-        jfet::finish_load(
-            context,
-            start,
-            &l,
-            &self.terminals,
-            self.inner,
-            pol,
-            self.instance.m,
-            jfet::series_conductances(self.instance.area, self.model.rd, self.model.rs),
-        )
+        .finish(context, start, &l)
     }
     /// `mesacl.c`: conductances at the bias plus `j omega` times `qggnew`'s
     /// gate-source and gate-drain capacitances (each a two-terminal element,
