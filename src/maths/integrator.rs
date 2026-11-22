@@ -400,30 +400,34 @@ fn span_power(exponent: i32) -> Real {
     }
 }
 
-/// Positive step interval as a sum scaled by the largest binary exponent.
-/// Summing separately avoids losing the interval between adjacent old
-/// timestamps when the trial step is much larger.
-fn scaled_span(steps: &[Real]) -> (Real, i32) {
-    let largest = steps.iter().copied().fold(0., Real::max);
-    let exponent = crate::primitives::numeric::binary_exponent(largest).unwrap_or(0);
-    let scale = span_power(exponent);
-    (steps.iter().map(|&step| step / scale).sum(), exponent)
-}
-
-/// Finish a scaled coefficient with one final rounding into the subnormal
-/// range. The intermediate significands of at most six span ratios stay
-/// bounded independently of the original step sizes.
-fn finish_weight(value: Real, exponent: i32) -> Real {
-    let Some(local) = crate::primitives::numeric::binary_exponent(value) else {
+/// Round a normalized signed significand with its binary exponent.
+fn compose_scaled(value: Real, exponent: i32) -> Real {
+    if value == 0. {
         return value;
-    };
-    let normalized = value / span_power(local);
-    match exponent + local {
+    }
+    match exponent {
         ..=-1076 => 0_f64.copysign(value),
-        -1075 => (normalized * 0.5) * span_power(-1074),
-        e @ -1074..=1023 => normalized * span_power(e),
+        -1075 => (value * 0.5) * span_power(-1074),
+        e @ -1074..=1023 => value * span_power(e),
         _ => Real::INFINITY.copysign(value),
     }
+}
+
+/// Sum each positive interval once, never by subtracting cumulative times.
+fn scaled_spans(steps: &[Real]) -> [[ScaledReal; HISTORY_LEN + 2]; HISTORY_LEN + 2] {
+    let mut spans = [[ScaledReal::ZERO; HISTORY_LEN + 2]; HISTORY_LEN + 2];
+    let mut terms = [ScaledReal::ZERO; HISTORY_LEN + 1];
+    for (slot, &step) in terms.iter_mut().zip(steps) {
+        *slot = ScaledReal::new(step, 0);
+    }
+    for (start, row) in spans.iter_mut().enumerate().take(steps.len()) {
+        let mut sum = ScaledReal::ZERO;
+        for (end, &step) in terms[..steps.len()].iter().enumerate().skip(start) {
+            sum = sum.add(step);
+            row[end + 1] = sum;
+        }
+    }
+    spans
 }
 
 /// The variable-step Gear (BDF) corrector on points at distances
@@ -437,22 +441,24 @@ fn finish_weight(value: Real, exponent: i32) -> Real {
 /// binary exponent separately until the final coefficient.
 fn gear_weights(deltas: &[Real; HISTORY_LEN + 1], order: usize) -> [ScaledReal; HISTORY_LEN + 1] {
     let mut ag = [ScaledReal::ZERO; HISTORY_LEN + 1];
-    let mut spans = [(0., 0); HISTORY_LEN + 1];
-    for i in 1..=order {
-        spans[i] = scaled_span(&deltas[..i]);
-        let (mantissa, exponent) = spans[i];
-        ag[0] = ag[0].add(ScaledReal::new(1. / mantissa, -exponent));
+    let spans = scaled_spans(&deltas[..order]);
+    for span in &spans[0][1..=order] {
+        ag[0] = ag[0].add(ScaledReal::new(1. / span.value, -span.power));
     }
     for i in 1..=order {
-        let (span, power) = spans[i];
-        let mut value = -1. / span;
-        let mut exponent = -power;
-        for (j, &(numerator, numerator_power)) in spans.iter().enumerate().take(order + 1).skip(1) {
+        let span = spans[0][i];
+        let mut value = -1. / span.value;
+        let mut exponent = -span.power;
+        for (j, &numerator) in spans[0].iter().enumerate().take(order + 1).skip(1) {
             if j != i {
-                let (interval, interval_power) = scaled_span(&deltas[i.min(j)..i.max(j)]);
-                let denominator = if j < i { -interval } else { interval };
-                value *= numerator / denominator;
-                exponent += numerator_power - interval_power;
+                let interval = spans[i.min(j)][i.max(j)];
+                let denominator = if j < i {
+                    -interval.value
+                } else {
+                    interval.value
+                };
+                value *= numerator.value / denominator;
+                exponent += numerator.power - interval.power;
             }
         }
         ag[i] = ScaledReal::new(value, exponent);
@@ -618,8 +624,16 @@ impl ScaledReal {
         let Some(local) = crate::primitives::numeric::binary_exponent(value) else {
             return Self { value, power: 0 };
         };
+        // Multiplication by an exactly representable reciprocal power of
+        // two is exact for normalization and cheaper than division. Only
+        // the smallest subnormals need the direct division.
+        let normalized = if local >= -1023 {
+            value * span_power(-local)
+        } else {
+            value / span_power(local)
+        };
         Self {
-            value: value / span_power(local),
+            value: normalized,
             power: power + local,
         }
     }
@@ -631,10 +645,13 @@ impl ScaledReal {
         if other.value == 0. {
             return self;
         }
-        let power = self.power.max(other.power);
-        let left = finish_weight(self.value, self.power - power);
-        let right = finish_weight(other.value, other.power - power);
-        Self::new(left + right, power)
+        if self.power >= other.power {
+            let right = compose_scaled(other.value, other.power - self.power);
+            Self::new(self.value + right, self.power)
+        } else {
+            let left = compose_scaled(self.value, self.power - other.power);
+            Self::new(left + other.value, other.power)
+        }
     }
 
     fn subtract(self, other: Self) -> Self {
@@ -648,17 +665,17 @@ impl ScaledReal {
         Self::new(self.value * other.value, self.power + other.power)
     }
 
-    fn extrapolate(self, right: Self, distance: (Real, i32), interval: (Real, i32)) -> Self {
+    fn extrapolate(self, right: Self, distance: Self, interval: Self) -> Self {
         let difference = self.subtract(right);
         let increment = Self::new(
-            difference.value * (distance.0 / interval.0),
-            difference.power + distance.1 - interval.1,
+            difference.value * (distance.value / interval.value),
+            difference.power + distance.power - interval.power,
         );
         self.add(increment)
     }
 
     fn finish(self) -> Real {
-        finish_weight(self.value, self.power)
+        compose_scaled(self.value, self.power)
     }
 }
 
@@ -886,10 +903,11 @@ impl Coefficients {
                 for (value, &solution) in values.iter_mut().zip(x) {
                     *value = ScaledReal::new(solution, 0);
                 }
+                let spans = scaled_spans(&d[..=order]);
                 for width in 1..=order {
                     for i in 0..=order - width {
-                        let distance = scaled_span(&d[..=i]);
-                        let interval = scaled_span(&d[i + 1..=i + width]);
+                        let distance = spans[0][i + 1];
+                        let interval = spans[i + 1][i + width + 1];
                         values[i] = values[i].extrapolate(values[i + 1], distance, interval);
                     }
                 }
