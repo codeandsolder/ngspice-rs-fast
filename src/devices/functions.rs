@@ -416,6 +416,10 @@ fn held_sine(offset: Real, amplitude: Real, radians: Real) -> Real {
 }
 
 /// SFFM and AM both use the C left-associated carrier/modulator angle.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "preserve the separately rounded C carrier/modulator angle"
+)]
 const fn modulation_angle(frequency: Real, time: Real, radians: Real) -> Real {
     2. * PI * frequency * time + radians
 }

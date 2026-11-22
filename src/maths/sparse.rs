@@ -236,10 +236,7 @@ impl Pattern {
     }
 
     fn trace(&self) -> Arc<Trace> {
-        self.trace
-            .lock()
-            .map(|trace| Arc::clone(&trace))
-            .unwrap_or_default()
+        self.trace.lock().map_or_default(|trace| Arc::clone(&trace))
     }
 
     fn store_trace(&self, trace: Arc<Trace>) {
@@ -864,8 +861,7 @@ impl SparseMatrix {
     pub fn return_fixed(&mut self) -> FixedStamps {
         self.bound
             .as_mut()
-            .map(|bound| std::mem::take(&mut bound.fixed))
-            .unwrap_or_default()
+            .map_or_default(|bound| std::mem::take(&mut bound.fixed))
     }
 
     /// Adds a device's fixed batch by element when an earlier load verified
