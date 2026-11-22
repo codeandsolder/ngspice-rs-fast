@@ -975,6 +975,47 @@ fn invalid_resistor_and_temperature_values_are_rejected_before_any_sample() {
     );
 }
 
+#[test]
+fn resistance_only_preflight_validates_the_replacement_clamp() {
+    // The supplied values are below C's model-backed resistor floor. The
+    // actual setter clamps them to 1e-12 before scale; validating an
+    // unclamped scalar would incorrectly underflow the effective resistance.
+    let mut c = circuit("i1 0 a 0\nr1 a 0 rm 1 scale=1e-290\n.model rm r");
+    let result = run(&mut c, &["r1", "1e-200", "2e-200", "1e-200"]).unwrap();
+    assert_eq!(result.point_count(), 2);
+    assert_column(&result, "v(a)", &[0., 0.], 0., 0.);
+    assert_eq!(c.resistor("r1").unwrap().1.supplied, 1.);
+}
+
+#[test]
+fn late_independent_source_forcing_overflow_is_an_input_error() {
+    let context = AnalysisContext::default();
+    for (body, args) in [
+        (
+            "i1 0 a 0 m=1e200\nr1 a 0 1",
+            vec!["i1", "0", "1e200", "1e200"],
+        ),
+        (
+            "i1 0 a 0\nr1 a 0 1",
+            vec!["i1", "0", "1e200", "1e200", "@i1[m]", "0", "1e200", "1e200"],
+        ),
+        (
+            "i1 0 a 0\nr1 a 0 1",
+            vec![
+                "@i1[m]", "0", "1e200", "1e200", "i1", "0", "-1e200", "-1e200",
+            ],
+        ),
+    ] {
+        let error = rejected(body, &args, &context);
+        assert!(
+            error
+                .to_string()
+                .contains("nonfinite independent DC forcing"),
+            "{error}"
+        );
+    }
+}
+
 // ---- product and work limits ------------------------------------------------------------
 
 #[test]

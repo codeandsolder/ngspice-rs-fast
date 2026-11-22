@@ -401,6 +401,29 @@ impl IndependentSource {
 }
 
 impl Device for IndependentSource {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        // The independent DC value is a bias-independent input. The current
+        // source additionally scales it by its instance multiplier, just as
+        // ISRCload does. Reject an unrepresentable forcing before solving.
+        let value = if self.dc.given() {
+            self.dc.value() * context.source_factor
+        } else {
+            self.dc.value()
+        };
+        let forcing = if self.voltage {
+            value
+        } else {
+            value * self.multiplier.unwrap_or(1.)
+        };
+        if !forcing.is_finite() {
+            return Err(SpiceError::circuit(format!(
+                "{}: nonfinite independent DC forcing",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
     /// `vsrcset.c` (an RF port first stamps its reference resistor towards
     /// its internal node, whose branch replaces the positive terminal);
     /// current sources allocate nothing.

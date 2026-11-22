@@ -669,9 +669,10 @@ fn point_context<'a>(
     })
 }
 
-/// The same Cartesian traversal serves validation and execution. Source-only
-/// axes do not affect bias-independent temperature/physical validation: project those axes
-/// onto one representative value during preflight.
+/// The same Cartesian traversal serves validation and execution. Independent
+/// DC source values do not change thermal derivations; their largest absolute
+/// value additionally validates the worst-case linear forcing (including a
+/// concurrently swept current-source multiplier).
 struct GridPair<'a> {
     inner: &'a [Real],
     outer: &'a [Real],
@@ -688,7 +689,17 @@ impl<'a> GridPair<'a> {
     fn physical_contexts(self, sources: [bool; 2]) -> Self {
         let unique = |grid: &'a [Real], is_source| {
             if is_source {
-                &grid[..grid.len().min(1)]
+                let first = &grid[..grid.len().min(1)];
+                let last = &grid[grid.len().saturating_sub(1)..];
+                if last
+                    .first()
+                    .zip(first.first())
+                    .is_some_and(|(last, first)| last.abs() > first.abs())
+                {
+                    last
+                } else {
+                    first
+                }
             } else {
                 grid
             }
@@ -717,33 +728,45 @@ fn preflight(
     context: &AnalysisContext,
 ) -> SpiceResult<()> {
     let circuit = prepared.circuit();
-    // A temperature or device-parameter axis changes the devices themselves:
-    // validate actual Cartesian point contexts, not the original recipes at
-    // each temperature (those recipes are replaced by the sweep).
+    let base = context.model_context();
+    let sources = [
+        axes[0].binding.is_source(),
+        axes.get(1).is_some_and(|axis| axis.binding.is_source()),
+    ];
+    let contexts = GridPair::new(grids).physical_contexts(sources);
+    // Temperature and general setters can change physical derivations and
+    // coupling constraints. Validate every actual effective combination.
     if axes.iter().any(|axis| axis.binding.changes_physics()) {
-        let sources = [
-            axes[0].binding.is_source(),
-            axes.get(1).is_some_and(|axis| axis.binding.is_source()),
-        ];
-        let contexts = GridPair::new(grids).physical_contexts(sources);
         for values in contexts.points() {
-            let point = point_context(circuit, axes, values, context.model_context())?;
+            let point = point_context(circuit, axes, values, base)?;
             prepared.validate_dc_inputs(&point.model)?;
         }
         return Ok(());
     }
-    let model = context.model_context();
-    validate_start(prepared, axes, model)?;
-    for (axis, grid) in axes.iter().zip(grids) {
-        let AxisBinding::Resistor(target) = axis.binding else {
+
+    // Only independent resistances and source values (or both) vary. Their
+    // physical recipes are independent at fixed temperature. Validate the
+    // whole effective circuit once, then each resistor's remaining values
+    // through the actual ordered setter/replacement path, not an approximate
+    // resistance formula. This also validates C's clamping and any recipe
+    // metadata. Avoid a full Cartesian product of unrelated resistors.
+    let start = [contexts.inner[0], contexts.outer[0]];
+    let point = point_context(circuit, axes, start, base)?;
+    prepared.validate_dc_inputs(&point.model)?;
+    for (index, (axis, grid)) in axes.iter().zip(grids).enumerate() {
+        if !matches!(axis.binding, AxisBinding::Resistor(_)) {
             continue;
-        };
-        for &value in grid {
-            circuit.effective_resistance(&target.at_resistance(value)?, &model)?;
+        }
+        for &value in &grid[1..] {
+            let mut values = start;
+            values[index] = value;
+            let point = point_context(circuit, axes, values, base)?;
+            prepared.validate_dc_replacements(&point.model)?;
         }
     }
     Ok(())
 }
+
 fn warm_start_settings(
     point_iterations: Option<usize>,
     settings: &crate::analysis::bias::DcSettings,
@@ -967,14 +990,14 @@ mod grid_tests {
                 .physical_contexts([true, false])
                 .points()
                 .collect::<Vec<_>>(),
-            [[1., 10.], [1., 20.]]
+            [[3., 10.], [3., 20.]]
         );
         assert_eq!(
             GridPair::new(&grids)
                 .physical_contexts([false, true])
                 .points()
                 .collect::<Vec<_>>(),
-            [[1., 10.], [2., 10.], [3., 10.]]
+            [[1., 20.], [2., 20.], [3., 20.]]
         );
         assert_eq!(
             GridPair::new(&grids)
@@ -998,17 +1021,17 @@ mod grid_tests {
     fn actual_sweep_binding_and_preflight_work_follows_axes_not_points() {
         use crate::devices::circuit::preparation_metrics::take;
         use crate::primitives::AnalysisKind;
-        // (request, target bindings, physical validation contexts, direct R checks)
+        // (request, target bindings, physical validation contexts, replacement-only checks)
         for (args, bindings, physical, resistances) in [
-            ("v1 0 2 1", 1, 0, 0),
-            ("r1 1000 1002 1", 1, 0, 3),
+            ("v1 0 2 1", 1, 1, 0),
+            ("r1 1000 1002 1", 1, 1, 2),
             ("temp 27 29 1", 0, 3, 0),
             ("@d1[area] 1 3 1", 1, 3, 0),
             ("v1 0 3 1 temp 27 29 1", 1, 3, 0),
             ("r1 1000 1002 1 temp 27 29 1", 1, 9, 0),
             ("@d1[area] 1 3 1 v1 0 3 1", 2, 3, 0),
-            ("@v1[dc] 0 3 1 v2 0 2 1", 2, 0, 0),
-            ("r1 1000 1002 1 @r2[resistance] 2000 2002 1", 2, 0, 6),
+            ("@v1[dc] 0 3 1 v2 0 2 1", 2, 1, 0),
+            ("r1 1000 1002 1 @r2[resistance] 2000 2002 1", 2, 1, 4),
         ] {
             let mut circuit = fixture();
             let context = AnalysisContext::default();
@@ -1030,7 +1053,7 @@ mod grid_tests {
             assert_eq!(pre.name_lookups, 0, "{args}: {pre:?}");
             assert_eq!(pre.bindings, 0, "{args}: {pre:?}");
             assert_eq!(pre.physical_validations, physical, "{args}: {pre:?}");
-            assert_eq!(pre.resistance_checks, resistances, "{args}: {pre:?}");
+            assert_eq!(pre.replacement_validations, resistances, "{args}: {pre:?}");
             assert_eq!(pre.small_signal_assemblies, 0, "{args}: {pre:?}");
             for values in GridPair::new(&plan.grids).points() {
                 let point =

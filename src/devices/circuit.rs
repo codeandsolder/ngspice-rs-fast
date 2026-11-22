@@ -68,7 +68,7 @@ pub(crate) mod preparation_metrics {
         pub(crate) bindings: usize,
         pub(crate) contexts: usize,
         pub(crate) setters: usize,
-        pub(crate) resistance_checks: usize,
+        pub(crate) replacement_validations: usize,
         pub(crate) physical_validations: usize,
         pub(crate) small_signal_assemblies: usize,
     }
@@ -76,7 +76,7 @@ pub(crate) mod preparation_metrics {
     thread_local! {
         static COUNTS: std::cell::Cell<Counts> = const { std::cell::Cell::new(Counts {
             name_lookups: 0, bindings: 0, contexts: 0, setters: 0,
-            resistance_checks: 0, physical_validations: 0, small_signal_assemblies: 0,
+            replacement_validations: 0, physical_validations: 0, small_signal_assemblies: 0,
         }) };
     }
 
@@ -375,6 +375,19 @@ impl<'a> PreparedRun<'a> {
             point
                 .device(self.circuit, index)
                 .validate_dc_inputs(context)?;
+        }
+        Ok(())
+    }
+
+    /// Validate only replaced devices when already-validated unchanged
+    /// recipes and mutual terms are invariant. Used for independent resistor
+    /// axes at a fixed temperature after validating one full context.
+    pub(crate) fn validate_dc_replacements(&self, context: &ModelContext) -> SpiceResult<()> {
+        #[cfg(test)]
+        preparation_metrics::record(|counts| counts.replacement_validations += 1);
+        let point = self.point(context)?;
+        for (_, device) in &point.replacements {
+            device.validate_dc_inputs(context)?;
         }
         Ok(())
     }
@@ -2075,8 +2088,6 @@ impl Circuit {
         target: &ResistorOverride,
         context: &ModelContext,
     ) -> SpiceResult<Real> {
-        #[cfg(test)]
-        preparation_metrics::record(|counts| counts.resistance_checks += 1);
         if target.topology() != self.topology_id()? {
             return Err(SpiceError::circuit("foreign or stale resistor override"));
         }

@@ -167,8 +167,8 @@ swept source in load order. Temperature is the per-point
 
 Besides target/grid checks, the driver rejects input-validity failures that would
 otherwise surface mid-run: actual Cartesian R/TEMP point contexts are prepared
-and validated without a matrix assembly, and every swept resistance is evaluated
-over the whole grid. Contextual device hooks reuse the DC load's thermal and
+and validated without a matrix assembly, and every swept resistance is validated through its actual replacement
+recipe over the whole grid (including the model-backed resistor floor). Contextual device hooks reuse the DC load's thermal and
 effective-value derivations; mutual-inductance constraints use the same prepared
 replacement view as the solve. A DC-only device does not need an AC load, and
 solution-dependent device failures are not inferred from an artificial zero bias. Original resistor
@@ -178,6 +178,19 @@ with `tc1=-0.03` swept to 67 C, or `scale=1e300` swept to 1e10 ohm, is rejected
 up front with zero accepted points. Convergence failures of nonlinear points
 remain run-time errors; they return `Err` and no plot, and device accept hooks
 have run only for points that were solved.
+
+Source axes are projected onto the largest absolute endpoint for physical
+input validation: their values do not alter thermal derivation, while that
+endpoint checks the worst-case finite independent current-source forcing
+(including a separately swept current multiplier). Pure source/resistor
+sweeps validate one complete effective context, followed by only the
+remaining independent resistor values through the actual replacement path.
+For two resistor axes at fixed temperature this is one full validation
+plus the sum of the remaining axis lengths, not their Cartesian product.
+Temperature or general device-parameter axes validate every physical
+combination, with source-only axes still projected. No numerical matrix,
+zero-bias AC Jacobian or fictitious accepted state is constructed during
+preflight.
 
 ## Newton at every point and warm starts
 
@@ -320,8 +333,14 @@ replacements by their ordinals. Failed context transitions do not replace a
 valid preparation. A topology edit requires ending the immutable borrow;
 foreign or stale override identities are rejected on a subsequent run.
 
-The DC sweep driver binds the source and instance setters at each point
-and uses the same scope for preflight, warm-start Newton, fallback
+The DC sweep driver binds each source, resistance and instance setter to a
+topology-scoped `InstanceTarget` once, using the same handle definitions as
+candidate optimization. The finalized name index serves binding; no name
+lookup or setter registry lookup occurs during per-point construction.
+Resistance axes retain their dedicated supplied-value override route, while
+the generic device setters and source setters are applied afterward in
+the original order. The per-point source observation uses its ordinal.
+The same prepared run serves preflight, warm-start Newton, fallback
 continuation and real observation. Different continuation settings are
 different contexts, not an excuse to reuse a replacement derived for a
 different junction conductance or source scale. The transient driver retains
