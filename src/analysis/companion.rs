@@ -295,7 +295,7 @@ impl Order {
     }
 }
 
-/// C retains CKTbreak on rejection, but no longer requests left-limit forcing.
+/// C retains `CKTbreak` on rejection, but no longer requests left-limit forcing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Boundary {
     Ordinary,
@@ -468,7 +468,7 @@ impl AttemptedStep {
         })
     }
 
-    fn accept(self, next: NextStep) -> AcceptedCursor {
+    const fn accept(self, next: NextStep) -> AcceptedCursor {
         let mut clock = self.clock;
         clock.phase = Phase::Continuing;
         clock.next = next;
@@ -516,6 +516,7 @@ struct AcceptedPoint {
     device_breaks: Vec<Real>,
 }
 
+#[derive(Clone, Copy)]
 enum Acceptance<'a> {
     Initial,
     Step(&'a AttemptedStep),
