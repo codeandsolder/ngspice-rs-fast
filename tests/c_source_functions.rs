@@ -520,7 +520,7 @@ fn elaborated_waveform_timeline_matches_independent_c_landings() {
 
     const STEP: Real = 1e-5;
     const STOP: Real = 4e-3;
-    let cases: [(&str, &str, &[Real]); 4] = [
+    let cases: [(&str, &str, &[Real]); 6] = [
         (
             "pulse-default",
             "v1 in 0 pulse(0 1 0.3m 0 0)\nr1 in 0 1k\n",
@@ -537,6 +537,30 @@ fn elaborated_waveform_timeline_matches_independent_c_landings() {
         (
             "pwl-repeat",
             "v1 in 0 pwl(0 0 0.5m 1 1m 0) r=0 td=0.2m\nr1 in 0 1k\n",
+            &[
+                0.2e-3, 0.7e-3, 1.2e-3, 1.7e-3, 2.2e-3, 2.7e-3, 3.2e-3, 3.7e-3,
+            ],
+        ),
+        (
+            "adjacent-pwl",
+            "v1 in 0 pwl(0 0 0.3m 1 0.300001m 0 1m 0) r=-0 td=0\nr1 in 0 1k\n",
+            &[
+                0.3e-3,
+                0.300_001e-3,
+                1e-3,
+                1.3e-3,
+                1.300_001e-3,
+                2e-3,
+                2.3e-3,
+                2.300_001e-3,
+                3e-3,
+                3.3e-3,
+                3.300_001e-3,
+            ],
+        ),
+        (
+            "current-repeat",
+            "i1 in 0 pwl(0 0 0.5m 1m 1m 0) r=-0 td=0.2m\nr1 in 0 1k\n",
             &[
                 0.2e-3, 0.7e-3, 1.2e-3, 1.7e-3, 2.2e-3, 2.7e-3, 3.2e-3, 3.7e-3,
             ],

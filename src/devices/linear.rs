@@ -290,7 +290,9 @@ impl Waveform {
 /// corners nor a synthetic fractional pulse-count cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventRole {
-    /// Physical corner requested by the C accept routines.
+    /// Nominal physical corner eligible for a request by C's accept routines.
+    /// Actual landing is checked independently; C may merge close requests
+    /// or miss a current-source corner through its exact `SAMETIME` test.
     Landable,
     /// Physical transition without a guaranteed C landing.
     Unscheduled,

@@ -160,10 +160,7 @@ impl<'a> Series<'a> {
     }
 
     fn breakpoint_near(&self, t: f64) -> Option<f64> {
-        self.breakpoints
-            .iter()
-            .copied()
-            .find(|b| (b - t).abs() <= self.eps)
+        nearby_breakpoint(self.breakpoints, t, self.eps)
     }
 
     /// Value of column `column` at `t` on `side`.
@@ -199,11 +196,8 @@ impl<'a> Series<'a> {
             return Err(format!("{}: time {t:e} precedes the samples", self.label));
         }
         let (t0, t1) = (self.times[upper - 1], self.times[upper]);
-        if let Some(b) = self
-            .breakpoints
-            .iter()
-            .find(|&&b| b > t0 + self.eps && b < t1 - self.eps)
-        {
+        let next = self.breakpoints.partition_point(|&b| b <= t0 + self.eps);
+        if let Some(b) = self.breakpoints.get(next).filter(|&&b| b < t1 - self.eps) {
             return Err(format!(
                 "{}: samples [{t0:e}, {t1:e}] straddle breakpoint {b:e}; refusing to interpolate across it",
                 self.label
@@ -214,6 +208,16 @@ impl<'a> Series<'a> {
         let right = fraction * at(upper);
         Ok(left + right)
     }
+}
+
+/// Find the first matching corner in an already validated sorted timeline.
+/// Use the original subtraction predicate rather than rounding a new bound.
+fn nearby_breakpoint(breakpoints: &[f64], time: f64, eps: f64) -> Option<f64> {
+    let index = breakpoints.partition_point(|&event| event < time && time - event > eps);
+    breakpoints
+        .get(index)
+        .copied()
+        .filter(|event| (event - time).abs() <= eps)
 }
 
 fn comparison_instants(
@@ -250,7 +254,7 @@ fn comparison_instants(
         let t = f64::from(index) * grid.step;
         if t > grid.start + eps
             && t < grid.stop - eps
-            && !breakpoints.iter().any(|b| (b - t).abs() <= eps)
+            && nearby_breakpoint(breakpoints, t, eps).is_none()
         {
             check_event_capacity(instants.len(), 1)?;
             instants.push((t, Side::Interior));
@@ -499,6 +503,21 @@ mod tests {
             }
         }
         plot(&rows)
+    }
+
+    #[test]
+    fn breakpoint_search_preserves_first_match_and_rounding() {
+        let events: [f64; 5] = [0.5, 1.0, 1.125, 2.0, 4.0];
+        for eps in [0.0, 0.125, 1e-9] {
+            for event in events {
+                for boundary in [event - eps, event, event + eps] {
+                    for time in [boundary.next_down(), boundary, boundary.next_up()] {
+                        let expected = events.iter().copied().find(|b| (b - time).abs() <= eps);
+                        assert_eq!(nearby_breakpoint(&events, time, eps), expected);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
