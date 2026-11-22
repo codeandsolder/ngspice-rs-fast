@@ -104,8 +104,9 @@ impl AsRef<dyn Device> for ElaboratedDevice {
     }
 }
 
-/// Elaborated devices and derived bindings have separate lifecycles. The
-/// bindings are inaccessible to analysis until finalization publishes a layout.
+/// Elaborated devices and finalized bindings have separate lifecycles.
+///
+/// Bindings are inaccessible until finalization publishes a layout.
 #[derive(Default)]
 pub struct Circuit {
     nodes: NodeTable,
@@ -115,8 +116,9 @@ pub struct Circuit {
     pub(super) runtime: CircuitRuntime,
 }
 
-/// Setup-only numbering and topology. The presence of an identity is the
-/// publication marker, set only after every validation and allocation succeeds.
+/// Setup-only numbering and topology.
+///
+/// The identity is published only after every validation and allocation succeeds.
 #[derive(Default)]
 struct TopologyBindings {
     unknowns: MnaUnknowns,
@@ -144,7 +146,8 @@ pub(super) struct CircuitRuntime {
 }
 
 /// A process-local, never recycled identity for a validated topology.
-/// It fits in Copy analysis requests; exhaustion is an explicit error.
+///
+/// It fits in `Copy` analysis requests; exhaustion is an explicit error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TopologyId(u64);
 
@@ -152,9 +155,16 @@ impl TopologyId {
     fn allocate() -> SpiceResult<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map(Self)
-            .map_err(|_| SpiceError::circuit("topology identity space exhausted"))
+        let mut id = NEXT.load(Ordering::Relaxed);
+        loop {
+            let next = id
+                .checked_add(1)
+                .ok_or_else(|| SpiceError::circuit("topology identity space exhausted"))?;
+            match NEXT.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Ok(Self(id)),
+                Err(observed) => id = observed,
+            }
+        }
     }
 }
 
@@ -586,8 +596,10 @@ impl Circuit {
             }))
     }
 
-    /// Replace one elaborated device. Invalidate all bindings and analysis
-    /// state before making the edit; finalize again before analysis.
+    /// Replace one elaborated device.
+    ///
+    /// Invalidate all bindings and analysis state before the edit;
+    /// finalize again before analysis.
     ///
     /// Private nodes and generated device groups are owned by their original
     /// elaboration recipe. Replace such a group by elaborating a new deck.
@@ -619,8 +631,9 @@ impl Circuit {
         Ok(())
     }
 
-    /// Reorder two devices together with their origins and generated-owner
-    /// references. No positional binding survives the edit.
+    /// Reorder two devices and their provenance.
+    ///
+    /// Update generated-owner references; no positional binding survives the edit.
     ///
     /// # Errors
     /// An ordinal is outside the elaborated device list.
@@ -1571,6 +1584,7 @@ impl Circuit {
     }
 
     /// Create an empty history bound to the finalized circuit.
+    ///
     /// Identical fresh histories share the immutable initial revision.
     ///
     /// # Errors

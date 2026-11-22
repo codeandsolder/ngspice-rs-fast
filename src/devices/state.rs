@@ -495,6 +495,7 @@ impl StateHistory {
     }
 
     /// Get a circuit-bound device window from its finalized ordinal.
+    ///
     /// The slot range and delay ordinal cannot be supplied independently.
     ///
     /// # Errors
