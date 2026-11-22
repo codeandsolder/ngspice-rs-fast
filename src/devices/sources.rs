@@ -206,7 +206,7 @@ impl IndependentSource {
         let function_given = inputs.waveform.is_some();
         let waveform = inputs
             .waveform
-            .unwrap_or(Waveform::Constant(inputs.dc.unwrap_or(0.)));
+            .unwrap_or_else(|| Waveform::Constant(inputs.dc.unwrap_or(0.)));
         waveform.validate()?;
         let dc = match inputs.dc {
             Some(value) => DcExcitation::Explicit(value),
@@ -306,7 +306,7 @@ impl IndependentSource {
         Ok(self)
     }
 
-    /// Whether the source has an AC excitation (C VSRCacGiven).
+    /// Whether the source has an AC excitation (C `VSRCacGiven`).
     #[must_use]
     pub const fn ac_given(&self) -> bool {
         self.ac.input.is_some()
