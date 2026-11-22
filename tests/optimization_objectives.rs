@@ -695,12 +695,22 @@ fn streaming_extreme_rms_crossing_and_derivative_keep_conditioned_arithmetic() {
     let fixtures = [
         (
             ".meas tran m RMS v(out)",
-            vec![(0., 1e308, 0.), (tiny, 1e308, 0.), (tiny, 0., 0.), (1e308, 0., 0.)],
+            vec![
+                (0., 1e308, 0.),
+                (tiny, 1e308, 0.),
+                (tiny, 0., 0.),
+                (1e308, 0., 0.),
+            ],
             vec![tiny.sqrt() * 1e154],
         ),
         (
             ".meas tran m RMS v(out)",
-            vec![(0., tiny, 0.), (1., tiny, 0.), (2., tiny, 0.), (3., tiny, 0.)],
+            vec![
+                (0., tiny, 0.),
+                (1., tiny, 0.),
+                (2., tiny, 0.),
+                (3., tiny, 0.),
+            ],
             vec![tiny],
         ),
         (
@@ -710,7 +720,11 @@ fn streaming_extreme_rms_crossing_and_derivative_keep_conditioned_arithmetic() {
         ),
         (
             ".meas tran m DERIV v(out) AT=2",
-            vec![(0., offset, 0.), (1., offset + 1., 0.), (3., offset + 9., 0.)],
+            vec![
+                (0., offset, 0.),
+                (1., offset + 1., 0.),
+                (3., offset + 9., 0.),
+            ],
             vec![4.],
         ),
     ];
@@ -718,18 +732,29 @@ fn streaming_extreme_rms_crossing_and_derivative_keep_conditioned_arithmetic() {
         let parsed = parsed(cards);
         let full = plot(&rows, 3);
         let bound = PlotObjectivePlan::bind(
-            &full, AnalysisKind::Transient,
-            ObjectiveRequests { measurements: parsed.measurements.clone(), ..ObjectiveRequests::default() },
-        ).unwrap();
+            &full,
+            AnalysisKind::Transient,
+            ObjectiveRequests {
+                measurements: parsed.measurements.clone(),
+                ..ObjectiveRequests::default()
+            },
+        )
+        .unwrap();
         assert!(bound.retained_columns().is_empty());
         let actual = finish(&ScenarioPlan::new(vec![bound]), &full, &scope);
         assert_eq!(actual.retained_cells, 0);
         let measurements = actual.measurements.unwrap();
-        assert_eq!(measurements, measure::resolve(&full, AnalysisKind::Transient, &parsed.measurements).unwrap());
+        assert_eq!(
+            measurements,
+            measure::resolve(&full, AnalysisKind::Transient, &parsed.measurements).unwrap()
+        );
         assert_eq!(measurements.len(), expected.len());
         for (measured, wanted) in measurements.iter().zip(expected) {
-            assert!((measured.value - wanted).abs() <= 8. * Real::EPSILON * wanted.abs(),
-                "{cards}: {:?} != {wanted}", measured.value);
+            assert!(
+                (measured.value - wanted).abs() <= 8. * Real::EPSILON * wanted.abs(),
+                "{cards}: {:?} != {wanted}",
+                measured.value
+            );
         }
     }
 }
