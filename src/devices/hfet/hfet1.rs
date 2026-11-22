@@ -68,7 +68,7 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
-use super::lifecycle::{Linearization, Start, accepted, charge_step, prime_prime};
+use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step, prime_prime};
 use super::{CELSIUS_TO_KELVIN, HFET_INSTANCE as INSTANCE, HfetInstance as Instance};
 use super::{NodeSetup, TemperatureCache, ask_hfet, set_hfet, stamp_reset};
 use crate::devices::initial::InstanceInitial;
@@ -1013,8 +1013,6 @@ impl Hfet1 {
             self.initial.off,
             [slot::VGS, slot::VGD],
             [
-                slot::VGS,
-                slot::VGD,
                 slot::CG,
                 slot::CD,
                 slot::GM,
@@ -1027,20 +1025,8 @@ impl Hfet1 {
                 slot::GGDPP,
             ],
             |[vgs, vgd],
-             [
-                vgs0,
-                vgd0,
-                cg0,
-                cd0,
-                gm0,
-                gds0,
-                ggs0,
-                ggd0,
-                gmg0,
-                gmd0,
-                ggspp0,
-                ggdpp0,
-            ]| {
+             [vgs0, vgd0],
+             [cg0, cd0, gm0, gds0, ggs0, ggd0, gmg0, gmd0, ggspp0, ggdpp0]| {
                 let delvgs = vgs - vgs0;
                 let delvgd = vgd - vgd0;
                 let delvds = delvgs - delvgd;
@@ -1367,12 +1353,15 @@ impl Device for Hfet1 {
                     - accepted(&context.states, slot::VGD, vgd),
             ];
             let step = charge_step(
-                context,
+                &mut context.states,
+                context.mode,
+                context.integration,
                 "HFET1",
-                [slot::QGS, slot::QGD, slot::QDS],
-                [vgspp, vgdpp, point.vds],
-                previous,
-                [point.capgs, point.capgd, self.model.cds],
+                [
+                    ChargeInput::new(slot::QGS, vgspp, previous[0], point.capgs),
+                    ChargeInput::new(slot::QGD, vgdpp, previous[1], point.capgd),
+                    ChargeInput::new(slot::QDS, point.vds, previous[2], self.model.cds),
+                ],
             )?;
             [qgs, qgd, qds] = step.charges;
             if let Some([gs, gd, ds]) = step.companions {

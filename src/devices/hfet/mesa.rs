@@ -52,12 +52,11 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
-use super::lifecycle::{Linearization, Start, accepted, charge_step, prime_prime};
+use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step, prime_prime};
 use super::{NodeSetup, TemperatureCache, given_celsius, physical_temperature, stamp_reset};
 use crate::devices::hfet::{Instance, Model};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{BOLTZMANN, CHARGE};
-use crate::devices::limiting;
 use crate::devices::sensitivity::{
     AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
     SensitivityMode, SensitivityParameter, SensitivityRecord,
@@ -505,8 +504,6 @@ impl Mesa {
             self.initial.off,
             [slot::VGS, slot::VGD],
             [
-                slot::VGS,
-                slot::VGD,
                 slot::CG,
                 slot::CD,
                 slot::GM,
@@ -514,27 +511,14 @@ impl Mesa {
                 slot::GGS,
                 slot::GGD,
             ],
-            |[vgs, vgd], [vgs0, vgd0, cg0, cd0, gm0, gds0, ggs0, ggd0]| {
-                let currents = Linearization {
-                    voltage: [vgs0, vgd0],
-                    gate_current: cg0,
-                    drain_current: cd0,
-                    transconductance: gm0,
-                    output_conductance: gds0,
-                    source_conductance: ggs0,
-                    drain_conductance: ggd0,
-                }
-                .predict([vgs, vgd]);
-                let gs = limiting::pnjlim(vgs, vgs0, derived.vtes, derived.vcrits);
-                let gd = limiting::pnjlim(vgd, vgd0, derived.vted, derived.vcritd);
-                let vgs = limiting::fetlim(gs.value, vgs0, derived.tvto);
-                let vgd = limiting::fetlim(gd.value, vgd0, derived.tvto);
-                (
-                    [vgs, vgd],
-                    Start::Limited {
-                        junction_limited: gs.limited || gd.limited,
-                        currents,
-                    },
+            |voltage, previous, history| {
+                Start::limit_junctions(
+                    voltage,
+                    previous,
+                    history,
+                    [derived.vtes, derived.vted],
+                    [derived.vcrits, derived.vcritd],
+                    derived.tvto,
                 )
             },
         )
@@ -1335,12 +1319,14 @@ impl Device for Mesa {
                 accepted(&context.states, slot::VGDPP, vgdpp),
             ];
             let step = charge_step(
-                context,
+                &mut context.states,
+                context.mode,
+                context.integration,
                 "MESA",
-                [slot::QGS, slot::QGD],
-                [vgspp, vgdpp],
-                previous,
-                [point.capgs, point.capgd],
+                [
+                    ChargeInput::new(slot::QGS, vgspp, previous[0], point.capgs),
+                    ChargeInput::new(slot::QGD, vgdpp, previous[1], point.capgd),
+                ],
             )?;
             [qgs, qgd] = step.charges;
             if let Some([gs, gd]) = step.companions {

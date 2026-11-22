@@ -1,9 +1,10 @@
 //! Shared load lifecycle for the HFET and MESA families. Device-specific
 //! limiting, current equations and matrix/state stamping remain in each model.
 
+use crate::devices::limiting;
 use crate::devices::nonlinear::charge::ChargeBranch;
-use crate::devices::{AnalysisMode, DeviceState, IterationPhase, StampContext};
-use crate::maths::integrator::Companion;
+use crate::devices::{AnalysisMode, DeviceState, IterationPhase};
+use crate::maths::integrator::{Coefficients, Companion};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// Gate/drain voltage and current linearization used by the C convergence test.
@@ -66,7 +67,7 @@ impl Start {
         off: bool,
         voltage_slots: [usize; 2],
         history_slots: [usize; N],
-        limit: impl FnOnce([Real; 2], [Real; N]) -> ([Real; 2], Self),
+        limit: impl FnOnce([Real; 2], [Real; 2], [Real; N]) -> ([Real; 2], Self),
     ) -> ([Real; 2], Self) {
         if states.initial_conditions() {
             let [vds, vgs] = ic;
@@ -89,19 +90,69 @@ impl Start {
             return (raw, Self::Exact);
         };
         let voltage = [source, drain];
-        let mut previous = [0.; N];
-        for (value, slot) in previous.iter_mut().zip(history_slots) {
+        let read_history = |slot| {
             let old = if phase == IterationPhase::Predict {
                 states.accepted(1, slot)
             } else {
                 states.iterate(slot)
             };
-            let Some(old) = old.filter(|value| value.is_finite()) else {
+            old.filter(|value| value.is_finite())
+        };
+        let [Some(previous_source), Some(previous_drain)] = voltage_slots.map(read_history) else {
+            return (voltage, Self::Exact);
+        };
+        let mut previous = [0.; N];
+        for (value, slot) in previous.iter_mut().zip(history_slots) {
+            let Some(old) = read_history(slot) else {
                 return (voltage, Self::Exact);
             };
             *value = old;
         }
-        limit(voltage, previous)
+        limit(voltage, [previous_source, previous_drain], previous)
+    }
+
+    /// HFET2 and MESA use the same current linearization and two pnjlim calls
+    /// followed by fetlim. The model supplies each junction's thermal and
+    /// critical voltages and the threshold.
+    pub(super) fn limit_junctions(
+        voltage: [Real; 2],
+        previous: [Real; 2],
+        history: [Real; 6],
+        thermal: [Real; 2],
+        critical: [Real; 2],
+        threshold: Real,
+    ) -> ([Real; 2], Self) {
+        let [
+            gate_current,
+            drain_current,
+            transconductance,
+            output_conductance,
+            source_conductance,
+            drain_conductance,
+        ] = history;
+        let currents = Linearization {
+            voltage: previous,
+            gate_current,
+            drain_current,
+            transconductance,
+            output_conductance,
+            source_conductance,
+            drain_conductance,
+        }
+        .predict(voltage);
+        let source = limiting::pnjlim(voltage[0], previous[0], thermal[0], critical[0]);
+        let drain = limiting::pnjlim(voltage[1], previous[1], thermal[1], critical[1]);
+        let limited = [
+            limiting::fetlim(source.value, previous[0], threshold),
+            limiting::fetlim(drain.value, previous[1], threshold),
+        ];
+        (
+            limited,
+            Self::Limited {
+                junction_limited: source.limited || drain.limited,
+                currents,
+            },
+        )
     }
 
     pub(super) fn report(
@@ -186,6 +237,27 @@ pub(super) fn prime_prime(
     solved()
 }
 
+/// An incremental junction or drain-source charge and its state slot.
+/// Previous voltage is resolved before any initial-transient history writes.
+#[derive(Clone, Copy)]
+pub(super) struct ChargeInput {
+    slot: usize,
+    voltage: Real,
+    previous: Real,
+    capacitance: Real,
+}
+
+impl ChargeInput {
+    pub(super) const fn new(slot: usize, voltage: Real, previous: Real, capacitance: Real) -> Self {
+        Self {
+            slot,
+            voltage,
+            previous,
+            capacitance,
+        }
+    }
+}
+
 /// Charge and optional integration results in the caller's reference order.
 pub(super) struct ChargeStep<const N: usize> {
     pub(super) charges: [Real; N],
@@ -201,36 +273,39 @@ pub(super) struct ChargeStep<const N: usize> {
 )]
 #[expect(clippy::float_cmp, reason = "C companion timestep identity is exact")]
 pub(super) fn charge_step<const N: usize>(
-    context: &mut StampContext<'_>,
+    states: &mut DeviceState<'_>,
+    mode: AnalysisMode,
+    integration: Option<&Coefficients>,
     family: &str,
-    slots: [usize; N],
-    voltage: [Real; N],
-    previous: [Real; N],
-    capacitance: [Real; N],
+    inputs: [ChargeInput; N],
 ) -> SpiceResult<ChargeStep<N>> {
-    let seed =
-        context.states.initial_transient() && context.states.phase() == IterationPhase::Predict;
+    let seed = states.initial_transient() && states.phase() == IterationPhase::Predict;
     if seed {
-        for ((slot, voltage), cap) in slots.into_iter().zip(voltage).zip(capacitance) {
-            ChargeBranch::new(slot, cap * voltage, cap).seed(&mut context.states)?;
+        for input in inputs {
+            ChargeBranch::new(
+                input.slot,
+                input.capacitance * input.voltage,
+                input.capacitance,
+            )
+            .seed(states)?;
         }
     }
-    let branches: [ChargeBranch; N] = std::array::from_fn(|i| {
+    let branches = inputs.map(|input| {
         let charge =
-            accepted(&context.states, slots[i], 0.) + capacitance[i] * (voltage[i] - previous[i]);
-        ChargeBranch::new(slots[i], charge, capacitance[i])
+            accepted(states, input.slot, 0.) + input.capacitance * (input.voltage - input.previous);
+        ChargeBranch::new(input.slot, charge, input.capacitance)
     });
     if seed {
         for branch in branches {
-            branch.seed(&mut context.states)?;
+            branch.seed(states)?;
         }
     }
     let mut result = ChargeStep {
         charges: branches.map(|branch| branch.charge),
         companions: None,
     };
-    if let Some(coefficients) = context.integration {
-        let AnalysisMode::Transient { dt, .. } = context.mode else {
+    if let Some(coefficients) = integration {
+        let AnalysisMode::Transient { dt, .. } = mode else {
             return Err(SpiceError::circuit(format!(
                 "{family} charge companion outside transient"
             )));
@@ -246,11 +321,11 @@ pub(super) fn charge_step<const N: usize>(
             current: 0.,
         }; N];
         for (companion, branch) in companions.iter_mut().zip(branches) {
-            *companion = branch.integrate(&mut context.states, coefficients)?;
+            *companion = branch.integrate(states, coefficients)?;
         }
         if seed {
             for (branch, companion) in branches.into_iter().zip(companions) {
-                branch.seed_derivative(&mut context.states, companion.derivative)?;
+                branch.seed_derivative(states, companion.derivative)?;
             }
         }
         result.companions = Some(companions);
@@ -286,7 +361,7 @@ mod tests {
                 .with_device_limiting(limiting);
             let states = history.device(&mut trial, 0..2).unwrap();
             let (voltage, start) =
-                Start::select(&states, raw, ic, off, SLOTS, SLOTS, |_, _| unreachable!());
+                Start::select(&states, raw, ic, off, SLOTS, [], |_, _, _| unreachable!());
             assert_eq!(voltage, expected);
             match (conditions, limiting, phase, off) {
                 (true, _, _, _) => assert!(matches!(start, Start::Conditions)),
@@ -322,8 +397,8 @@ mod tests {
             [0.; 2],
             false,
             SLOTS,
-            SLOTS,
-            |predicted, previous| {
+            [],
+            |predicted, previous, []| {
                 assert_eq!(predicted, [5., 6.]);
                 assert_eq!(previous, [3., 4.]);
                 (
@@ -396,5 +471,64 @@ mod tests {
                 .unwrap();
             assert_eq!(trial.is_nonconvergent(), expected);
         }
+    }
+
+    #[test]
+    fn incremental_charges_seed_and_integrate_without_accepting_trial() {
+        use crate::maths::integrator::{IntegrationMethod, StepHistory};
+
+        let mut history = StateHistory::new(6);
+        let mut initial = history.trial();
+        {
+            let mut states = history.device(&mut initial, 0..6).unwrap();
+            for (slot, value) in [2., 1., 4., 2., 8., 3.].into_iter().enumerate() {
+                states.set(slot, value).unwrap();
+            }
+        }
+        history.commit(initial).unwrap();
+        let inputs = [
+            ChargeInput::new(0, 3., 1., 2.),
+            ChargeInput::new(2, 4., 2., 3.),
+            ChargeInput::new(4, 5., 3., 4.),
+        ];
+        {
+            let mut trial = history.trial();
+            let mut states = history.device(&mut trial, 0..6).unwrap();
+            let step =
+                charge_step(&mut states, AnalysisMode::DcSweep, None, "HFET1", inputs).unwrap();
+            assert_eq!(step.charges, [6., 10., 16.]);
+            assert!(step.companions.is_none());
+            assert_eq!(states.accepted(1, 0), Some(2.));
+        }
+        let coefficients = StepHistory::new()
+            .trial(IntegrationMethod::Trapezoidal, 1, 0.25, 0.5)
+            .unwrap();
+        {
+            let mut trial = history
+                .trial_in(IterationPhase::Predict, None)
+                .unwrap()
+                .with_initial_transient(true);
+            let mut states = history.device(&mut trial, 0..6).unwrap();
+            let step = charge_step(
+                &mut states,
+                AnalysisMode::Transient {
+                    time: 0.25,
+                    dt: 0.25,
+                },
+                Some(&coefficients),
+                "HFET1",
+                inputs,
+            )
+            .unwrap();
+            assert_eq!(step.charges, [10., 18., 28.]);
+            let companions = step.companions.unwrap();
+            assert_eq!(companions.map(|branch| branch.conductance), [8., 12., 16.]);
+            assert_eq!(companions.map(|branch| branch.derivative), [0.; 3]);
+            for (slot, charge) in [0, 2, 4].into_iter().zip(step.charges) {
+                assert_eq!(states.accepted(1, slot), Some(charge));
+                assert_eq!(states.accepted(1, slot + 1), Some(0.));
+            }
+        }
+        assert_eq!(history.accepted(1), Some(&[2., 1., 4., 2., 8., 3.][..]));
     }
 }

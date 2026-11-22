@@ -67,12 +67,11 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
-use super::lifecycle::{Linearization, Start, accepted, charge_step};
+use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step};
 use super::{CELSIUS_TO_KELVIN, HFET_INSTANCE as INSTANCE, HfetInstance as Instance};
 use super::{NodeSetup, TemperatureCache, ask_hfet, set_hfet, stamp_reset};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{BOLTZMANN, CHARGE, p};
-use crate::devices::limiting;
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
@@ -603,8 +602,6 @@ impl Hfet2 {
             self.initial.off,
             [slot::VGS, slot::VGD],
             [
-                slot::VGS,
-                slot::VGD,
                 slot::CG,
                 slot::CD,
                 slot::GM,
@@ -612,27 +609,14 @@ impl Hfet2 {
                 slot::GGS,
                 slot::GGD,
             ],
-            |[vgs, vgd], [vgs0, vgd0, cg0, cd0, gm0, gds0, ggs0, ggd0]| {
-                let currents = Linearization {
-                    voltage: [vgs0, vgd0],
-                    gate_current: cg0,
-                    drain_current: cd0,
-                    transconductance: gm0,
-                    output_conductance: gds0,
-                    source_conductance: ggs0,
-                    drain_conductance: ggd0,
-                }
-                .predict([vgs, vgd]);
-                let gs = limiting::pnjlim(vgs, vgs0, K_OVER_Q * derived.temp, derived.vcrit);
-                let gd = limiting::pnjlim(vgd, vgd0, K_OVER_Q * derived.temp, derived.vcrit);
-                let vgs = limiting::fetlim(gs.value, vgs0, derived.tvto);
-                let vgd = limiting::fetlim(gd.value, vgd0, derived.tvto);
-                (
-                    [vgs, vgd],
-                    Start::Limited {
-                        junction_limited: gs.limited || gd.limited,
-                        currents,
-                    },
+            |voltage, previous, history| {
+                Start::limit_junctions(
+                    voltage,
+                    previous,
+                    history,
+                    [K_OVER_Q * derived.temp; 2],
+                    [derived.vcrit; 2],
+                    derived.tvto,
                 )
             },
         )
@@ -847,12 +831,14 @@ impl Device for Hfet2 {
                 accepted(&context.states, slot::VGD, vgd),
             ];
             let step = charge_step(
-                context,
+                &mut context.states,
+                context.mode,
+                context.integration,
                 "HFET2",
-                [slot::QGS, slot::QGD],
-                [vgs, vgd],
-                previous,
-                [point.capgs, point.capgd],
+                [
+                    ChargeInput::new(slot::QGS, vgs, previous[0], point.capgs),
+                    ChargeInput::new(slot::QGD, vgd, previous[1], point.capgd),
+                ],
             )?;
             [qgs, qgd] = step.charges;
             if let Some([gs, gd]) = step.companions {
