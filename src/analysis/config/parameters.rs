@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use super::RunConfig;
 use crate::analysis::AnalysisPlan;
 use crate::devices::Circuit;
+use crate::devices::circuit::CandidateTopology;
 use crate::netlist::ast::{Netlist, ParameterAssignment, ParameterKind, ScopeView};
 use crate::netlist::eval::{
     CandidateParameters, EvalBudget, FunctionScope, ParameterPlan, ParameterScopeId,
@@ -232,7 +233,9 @@ impl<'a> CandidatePlan<'a> {
             Default::default(),
             Default::default(),
             Some(scope),
+            None,
         )?;
+        let baseline = CandidateTopology::new(baseline)?;
         config.plans_for(&self.deck.analyses)?;
         Ok(CandidateSession {
             plan: self,
@@ -270,7 +273,7 @@ pub struct PreparedCandidate {
 pub struct CandidateSession<'a> {
     plan: &'a CandidatePlan<'a>,
     evaluator: CandidateParameters<'a>,
-    baseline: Circuit,
+    baseline: CandidateTopology,
 }
 
 impl CandidateSession<'_> {
@@ -302,9 +305,10 @@ impl CandidateSession<'_> {
             Default::default(),
             Default::default(),
             Some(scope),
+            Some(&self.baseline),
         )?;
         let analyses = config.plans_for(&deck.analyses)?;
-        let layout = if circuit.same_candidate_layout(&self.baseline) {
+        let layout = if self.baseline.shares_layout(&circuit) {
             CandidateLayout::Same
         } else {
             CandidateLayout::Changed

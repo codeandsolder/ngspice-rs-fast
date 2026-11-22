@@ -60,7 +60,7 @@ pub type CircuitGraph = UnGraph<CircuitVertex, usize, usize>;
 
 /// Name-to-ordinal index built during setup and retained only for the
 /// lifetime of the finalized topology.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct DeviceNames(BTreeMap<String, usize>);
 
 impl DeviceNames {
@@ -123,11 +123,16 @@ pub struct Circuit {
     pub(super) runtime: CircuitRuntime,
 }
 
-/// Setup-only numbering and topology.
-///
-/// The identity is published only after every validation and allocation succeeds.
+/// The topology identity remains circuit-local, even if validated immutable
+/// numbering and setup bindings are shared by independent candidates.
 #[derive(Default)]
 struct TopologyBindings {
+    layout: Arc<TopologyLayout>,
+    identity: Option<TopologyId>,
+}
+
+#[derive(Default, Clone)]
+struct TopologyLayout {
     unknowns: MnaUnknowns,
     names: DeviceNames,
     order: Vec<usize>,
@@ -136,7 +141,43 @@ struct TopologyBindings {
     state_rows: Arc<[std::ops::Range<usize>]>,
     state_len: usize,
     mutual: MutualBinding,
-    identity: Option<TopologyId>,
+}
+
+impl std::ops::Deref for TopologyBindings {
+    type Target = TopologyLayout;
+
+    fn deref(&self) -> &Self::Target {
+        &self.layout
+    }
+}
+
+/// Never-simulated reference circuit and its exact per-device setup
+/// declaration stream. Only the immutable layout may be shared.
+pub(crate) struct CandidateTopology {
+    circuit: Circuit,
+    stamps: Vec<(usize, usize)>,
+    ends: Vec<(bool, usize)>,
+}
+
+impl CandidateTopology {
+    pub(crate) fn new(circuit: Circuit) -> SpiceResult<Self> {
+        circuit.check_numbering()?;
+        let mut stamps = Vec::new();
+        let mut ends = Vec::with_capacity(circuit.devices.len());
+        for &index in &circuit.bindings.order {
+            let declared = circuit.declare_elements(index, 0, &mut stamps)?;
+            ends.push((declared, stamps.len()));
+        }
+        Ok(Self {
+            circuit,
+            stamps,
+            ends,
+        })
+    }
+
+    pub(crate) fn shares_layout(&self, candidate: &Circuit) -> bool {
+        Arc::ptr_eq(&self.circuit.bindings.layout, &candidate.bindings.layout)
+    }
 }
 
 /// Analysis state and caches, never a source of topology truth.
@@ -739,7 +780,7 @@ impl Circuit {
 
     /// The MNA unknown numbering. Only valid after [`Circuit::finalize`].
     #[must_use]
-    pub const fn unknowns(&self) -> &MnaUnknowns {
+    pub fn unknowns(&self) -> &MnaUnknowns {
         &self.bindings.unknowns
     }
 
@@ -865,7 +906,7 @@ impl Circuit {
 
     /// Size of the MNA system.
     #[must_use]
-    pub const fn unknown_count(&self) -> usize {
+    pub fn unknown_count(&self) -> usize {
         self.bindings.unknowns.len()
     }
 
@@ -913,10 +954,11 @@ impl Circuit {
                 *slot = true;
             }
         }
-        self.bindings
+        let layout = Arc::make_mut(&mut self.bindings.layout);
+        layout
             .unknowns
             .rebuild_deferring(&self.nodes, |node| owned[node.index()]);
-        self.bindings.branch_rows = vec![0..0; self.devices.len()];
+        layout.branch_rows = vec![0..0; self.devices.len()];
         // `CKTmkCur` runs once per device: in its own DEVsetup, or earlier
         // when a CCCS/CCVS/CSW/ASRC setup asks `CKTfndBranch` for it
         // (`VSRCfindBr`, `VCVSfindBr`, `CCVSfindBr` and `ASRCfindBr` create the
@@ -931,7 +973,7 @@ impl Circuit {
             let count = self.devices[index].branch_currents();
             let start = unknowns.len();
             unknowns.add_rows(count)?;
-            self.bindings.branch_rows[index] = start..unknowns.len();
+            layout.branch_rows[index] = start..unknowns.len();
             Ok(())
         };
         for &index in order {
@@ -941,7 +983,7 @@ impl Circuit {
             let branches_first = matches!(kind, CDeviceType::Vsrc | CDeviceType::Ccvs)
                 || (kind == CDeviceType::Asrc && self.devices[index].branch_currents() > 0);
             if branches_first {
-                allocate_branch(&mut self.bindings.unknowns, index)?;
+                allocate_branch(&mut layout.unknowns, index)?;
             }
             // cccsset.c, ccvsset.c, cswsetup.c and asrcset.c call
             // CKTfndBranch for each controlling source, in order.
@@ -949,33 +991,34 @@ impl Circuit {
                 if let Some(target) = names.get(&control.name)
                     && self.devices[target].findable_branch().is_some()
                 {
-                    allocate_branch(&mut self.bindings.unknowns, target)?;
+                    allocate_branch(&mut layout.unknowns, target)?;
                 }
             }
             for &node in &self.devices[index].origin.internal_nodes {
-                self.bindings.unknowns.assign_deferred(node);
+                layout.unknowns.assign_deferred(node);
             }
-            allocate_branch(&mut self.bindings.unknowns, index)?;
+            allocate_branch(&mut layout.unknowns, index)?;
         }
         let mut state_rows = Vec::with_capacity(self.devices.len());
-        self.bindings.state_len = 0;
+        layout.state_len = 0;
         for device in &self.devices {
             let states = device.state_count();
-            let end = self
-                .bindings
+            let end = layout
                 .state_len
                 .checked_add(states)
                 .ok_or_else(|| SpiceError::circuit("device state slot count overflow"))?;
-            state_rows.push(self.bindings.state_len..end);
-            self.bindings.state_len = end;
+            state_rows.push(layout.state_len..end);
+            layout.state_len = end;
         }
-        self.bindings.state_rows = state_rows.into();
-        self.bindings.control_rows = self
+        layout.state_rows = state_rows.into();
+        let controls = self
             .devices
             .iter()
             .map(|device| self.resolve_controls(device.as_ref(), names))
             .collect::<SpiceResult<_>>()?;
-        self.bindings.mutual = self.resolve_mutual(names)?;
+        Arc::make_mut(&mut self.bindings.layout).control_rows = controls;
+        let mutual = self.resolve_mutual(names)?;
+        Arc::make_mut(&mut self.bindings.layout).mutual = mutual;
         Ok(())
     }
 
@@ -1374,6 +1417,20 @@ impl Circuit {
         self.elaboration_limits
             .check(self.elaboration_size()?, None)?;
         let names = self.validate_topology()?;
+        self.bind_voltage_predecessors()?;
+        let order = self.setup_order();
+        self.rebuild_unknowns_in_order(&order, &names)?;
+        for node in self.nodes.nodes() {
+            self.bindings.unknowns.checked_node_row(node.id)?;
+        }
+        self.check_port_numbering()?;
+        self.allocate_matrix(order)?;
+        Arc::make_mut(&mut self.bindings.layout).names = names;
+        self.bindings.identity = Some(TopologyId::allocate()?);
+        Ok(())
+    }
+
+    fn bind_voltage_predecessors(&mut self) -> SpiceResult<()> {
         let mut previous = crate::devices::Waveform::Constant(0.);
         let mut previous_dc = 0.;
         for entry in self.devices.iter_mut().rev() {
@@ -1385,16 +1442,47 @@ impl Circuit {
                 previous_dc = dc;
             }
         }
-        let order = self.setup_order();
-        self.rebuild_unknowns_in_order(&order, &names)?;
-        for node in self.nodes.nodes() {
-            self.bindings.unknowns.checked_node_row(node.id)?;
-        }
-        self.check_port_numbering()?;
-        self.allocate_matrix(order)?;
-        self.bindings.names = names;
-        self.bindings.identity = Some(TopologyId::allocate()?);
         Ok(())
+    }
+
+    /// Reuse only a verified structural layout, not the original device
+    /// records or any of its mutable analysis caches. Every candidate has
+    /// freshly constructed device records and its own topology identity.
+    fn try_candidate_layout(&mut self, baseline: &CandidateTopology) -> SpiceResult<bool> {
+        let original = &baseline.circuit;
+        if self.elaboration_limits != original.elaboration_limits
+            || self.mutual_limits != original.mutual_limits
+            || !self.same_device_structure(original)
+        {
+            return Ok(false);
+        }
+        self.elaboration_limits
+            .check(self.elaboration_size()?, None)?;
+        self.runtime = CircuitRuntime::default();
+        self.bind_voltage_predecessors()?;
+        self.bindings.layout = Arc::clone(&original.bindings.layout);
+
+        // Factories can change setup elements without changing terminal or
+        // state counts. Verify the exact stream and per-device boundaries
+        // using the borrowed original numbering before sharing the layout.
+        let mut stamps = Vec::new();
+        let mut start = 0;
+        for (&index, &(declared, end)) in original.bindings.order.iter().zip(&baseline.ends) {
+            stamps.clear();
+            let actual = self.declare_elements(index, 0, &mut stamps)?;
+            if actual != declared || stamps != baseline.stamps[start..end] {
+                self.bindings = TopologyBindings::default();
+                return Ok(false);
+            }
+            start = end;
+        }
+        // Pattern::clone copies the immutable handle index, not pivot order,
+        // traces or numeric factors; each candidate owns its own caches.
+        *self.runtime.pattern.get_mut() = original
+            .matrix_pattern()
+            .map(|pattern| Arc::new((*pattern).clone()));
+        self.bindings.identity = Some(TopologyId::allocate()?);
+        Ok(true)
     }
 
     /// Device ordinals in C's `CKTsetup`/`CKTload` order.
@@ -1461,7 +1549,7 @@ impl Circuit {
     /// (C sets a circuit up once).
     fn allocate_matrix(&mut self, order: Vec<usize>) -> SpiceResult<()> {
         let elements = self.ordered_elements(&order, 0)?;
-        self.bindings.order = order;
+        Arc::make_mut(&mut self.bindings.layout).order = order;
         let n = self.unknown_count();
         let mut slot = self.runtime.pattern.borrow_mut();
         if elements.is_empty() || n == 0 {
@@ -1794,7 +1882,7 @@ impl Circuit {
 
     /// Total number of state slots, after finalization.
     #[must_use]
-    pub const fn state_len(&self) -> usize {
+    pub fn state_len(&self) -> usize {
         self.bindings.state_len
     }
 
@@ -2577,8 +2665,42 @@ impl Circuit {
         }
     }
 
-    // Only explicit cross-analysis inheritance compares structure. Finalization
-    // and loads never duplicate or rescan a layout to establish its identity.
+    /// Structural inputs from the new device factories, before assigning
+    /// numerical rows. No parameter value or mutable backend state enters
+    /// this test; every field used by setup numbering is compared exactly.
+    fn same_device_structure(&self, previous: &Self) -> bool {
+        self.nodes.nodes() == previous.nodes.nodes()
+            && self.devices.len() == previous.devices.len()
+            && self
+                .devices
+                .iter()
+                .zip(&previous.devices)
+                .all(|(left, right)| {
+                    left.origin == right.origin
+                        && left.name() == right.name()
+                        && left.as_ref().type_id() == right.as_ref().type_id()
+                        && left.c_device_type() == right.c_device_type()
+                        && left.designator() == right.designator()
+                        && left.model_name() == right.model_name()
+                        && left.terminals() == right.terminals()
+                        && left.branch_currents() == right.branch_currents()
+                        && left.state_count() == right.state_count()
+                        && left.findable_branch() == right.findable_branch()
+                        && left
+                            .controlling_sources()
+                            .iter()
+                            .map(|c| &c.name)
+                            .eq(right.controlling_sources().iter().map(|c| &c.name))
+                        && left.rf_port().map(|port| (port.number, port.internal))
+                            == right.rf_port().map(|port| (port.number, port.internal))
+                        && left.mutual_coupling().map(|coupling| coupling.inductors)
+                            == right.mutual_coupling().map(|coupling| coupling.inductors)
+                        && left.delay_line().is_some() == right.delay_line().is_some()
+                })
+    }
+
+    // Only explicit cross-analysis inheritance compares independently
+    // finalized structures. Ordinary loads check the topology identity.
     fn compatible_topology(&self, previous: &Self) -> bool {
         let a = &self.bindings;
         let b = &previous.bindings;
@@ -2591,39 +2713,7 @@ impl Circuit {
                 && a.branch_rows == b.branch_rows
                 && a.control_rows == b.control_rows
                 && a.state_rows == b.state_rows
-                && self.nodes.nodes() == previous.nodes.nodes()
-                && self.devices.len() == previous.devices.len()
-                && self
-                    .devices
-                    .iter()
-                    .zip(&previous.devices)
-                    .all(|(left, right)| {
-                        left.origin == right.origin
-                            && left.name() == right.name()
-                            && left.as_ref().type_id() == right.as_ref().type_id()
-                            && left.c_device_type() == right.c_device_type()
-                            && left.designator() == right.designator()
-                            && left.terminals() == right.terminals()
-                            && left.findable_branch() == right.findable_branch()
-                            && left.rf_port().map(|port| (port.number, port.internal))
-                                == right.rf_port().map(|port| (port.number, port.internal))
-                            && left.mutual_coupling().map(|coupling| coupling.inductors)
-                                == right.mutual_coupling().map(|coupling| coupling.inductors)
-                            && left.delay_line().is_some() == right.delay_line().is_some()
-                    }))
-    }
-
-    /// Compare complete independently finalized layouts, including the
-    /// selected model bins and the exact creation-order stamp pattern.
-    /// Numeric factors and accepted state are not part of this equivalence.
-    pub(crate) fn same_candidate_layout(&self, baseline: &Self) -> bool {
-        self.compatible_topology(baseline)
-            && self
-                .devices
-                .iter()
-                .zip(&baseline.devices)
-                .all(|(a, b)| a.model_name() == b.model_name())
-            && self.matrix_pattern().as_deref() == baseline.matrix_pattern().as_deref()
+                && self.same_device_structure(previous))
     }
 
     /// Takes over `previous`'s matrix (C's one `CKTmatrix`, with its pivot
@@ -3576,7 +3666,14 @@ impl Circuit {
         mutual_limits: MutualLimits,
         elaboration_limits: ElaborationLimits,
     ) -> SpiceResult<Self> {
-        Self::from_netlist_with_scope(netlist, context, mutual_limits, elaboration_limits, None)
+        Self::from_netlist_with_scope(
+            netlist,
+            context,
+            mutual_limits,
+            elaboration_limits,
+            None,
+            None,
+        )
     }
 
     /// Elaborate from the same validated AST and an optionally pre-resolved
@@ -3588,6 +3685,7 @@ impl Circuit {
         mutual_limits: MutualLimits,
         elaboration_limits: ElaborationLimits,
         scope: Option<Arc<crate::netlist::eval::ParamScope>>,
+        baseline: Option<&CandidateTopology>,
     ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
         if !netlist.includes.is_empty() {
@@ -3658,7 +3756,13 @@ impl Circuit {
                 location: Some(model.location.clone()),
             });
         }
-        circuit.finalize()?;
+        if let Some(baseline) = baseline {
+            if !circuit.try_candidate_layout(baseline)? {
+                circuit.finalize()?;
+            }
+        } else {
+            circuit.finalize()?;
+        }
         // Reject an invalid inductive system (K coupling) before any analysis.
         circuit.prepared_mutual_terms(context)?;
         Ok(circuit)
