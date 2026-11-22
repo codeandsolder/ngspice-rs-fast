@@ -225,13 +225,10 @@ fn expanded_model_passive_inputs_match_c() {
         ] {
             let mut circuit =
                 Circuit::from_netlist_with_context(&n, &context.model_context()).unwrap();
-            let got = runner(kind)
+            let got = AnalysisInput::with_arguments(kind, args)
+                .resolve()
                 .unwrap()
-                .run(
-                    &mut circuit,
-                    &AnalysisRequest::with_arguments(kind, args),
-                    &context,
-                )
+                .run(&mut circuit, &context)
                 .unwrap();
             let text = format!(
                 "responses\n{body}\n.options temp={} tnom={}\n.control\nset filetype=ascii\nset numdgt=17\n{command}\nwrite response.raw\nquit\n.endc\n.end\n",
