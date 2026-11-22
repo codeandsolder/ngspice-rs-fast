@@ -101,7 +101,7 @@ impl<'a> OrderedAxis<'a> {
 
     /// The exact group is a range (including signed zeros), never a snapped
     /// coordinate. A bracket uses the last left and first right sample.
-    fn locate(&self, x: Real) -> Option<Location> {
+    pub(super) fn locate(&self, x: Real) -> Option<Location> {
         if !x.is_finite()
             || !self
                 .values
@@ -166,11 +166,29 @@ impl<'a> OrderedAxis<'a> {
     pub(super) fn linear_sample(
         &self,
         x: Real,
+        value: impl FnMut(usize) -> SpiceResult<Real>,
+    ) -> Result<Real, SampleError> {
+        self.locate(x)
+            .ok_or(SampleError::OutOfRange)?
+            .sample(x, value)
+    }
+}
+
+/// A reusable exact group or adjacent interpolation bracket.
+pub(super) enum Location {
+    Exact(Range<usize>),
+    Between(Segment),
+}
+
+impl Location {
+    pub(super) fn sample(
+        &self,
+        x: Real,
         mut value: impl FnMut(usize) -> SpiceResult<Real>,
     ) -> Result<Real, SampleError> {
         let mut get = |index| value(index).map_err(SampleError::Operand);
-        match self.locate(x).ok_or(SampleError::OutOfRange)? {
-            Location::Exact(group) => {
+        match self {
+            Self::Exact(group) => {
                 let first = get(group.start)?;
                 for index in group.start + 1..group.end {
                     if !same_coordinate(get(index)?, first) {
@@ -179,7 +197,7 @@ impl<'a> OrderedAxis<'a> {
                 }
                 Ok(first)
             }
-            Location::Between(pair) => {
+            Self::Between(pair) => {
                 let result = interpolate(pair.x0, get(pair.left)?, pair.x1, get(pair.right())?, x);
                 if !result.is_finite() {
                     return Err(SampleError::Nonfinite);
@@ -188,11 +206,6 @@ impl<'a> OrderedAxis<'a> {
             }
         }
     }
-}
-
-enum Location {
-    Exact(Range<usize>),
-    Between(Segment),
 }
 
 /// A pair of adjacent stored samples, retaining zero-width jump segments.
