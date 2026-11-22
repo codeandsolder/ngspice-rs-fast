@@ -42,6 +42,36 @@ compile. The port reproduces `sens_sens()`.
 So a sensitivity is a first-order forward difference (relative error about
 `1e-6`), not an exact derivative.
 
+
+### Numerical conformance resolution
+
+A reference sensitivity is a quotient of a small change in output by the
+step recorded in the actual parameter walk. A fixed percentage tolerance
+alone is meaningless when that change is below the output resolution.
+The conformance runner now obtains an optional, same-shaped diagnostic
+from the ordinary sensitivity evaluation, without changing its returned
+values, rawfile schema, parameter order, or numerical algorithm.
+
+For each column the comparison floor is `max(A, 32 eps × S) / |delta|`:
+`A` is the configured ABSTOL (current output) or VNTOL (voltage output)
+for nonlinear DC, zero for linear DC and AC; `S` is the magnitude of the
+probe's solved output components before any differential subtraction.
+The 32-epsilon term is a roundoff-scale estimate, not a rigorous
+forward-error bound. The existing relative target and baseline absolute
+floor remain; the latter is replaced by the larger of it and the
+diagnostic. Frequency axes get no extra budget. Independently captured
+C envelopes and mandatory exact-input captures are still checked, as are
+shape, metadata and finite values. A material discrepancy above the
+resolution still fails.
+
+For MOS3 TOX, `delta = 2e-14 m` and the deck specifies ABSTOL = 1e-16 A.
+The resulting resolution is 0.005 A/m, rather than insisting on an
+unresolvable 6.46e-20 A difference in the numerator. This is deliberately
+an engineering comparison criterion, not a claim that C's historical
+restoration-order-dependent derivative is physically correct. Independent
+Jacobian/central-difference tests remain the evidence for physical
+accuracy; do not tune individual model expressions to C roundoff.
+
 ## The AC reset state (#102)
 
 `CKTunsetup` frees the state vectors and solution, `CKTsetup` allocates them

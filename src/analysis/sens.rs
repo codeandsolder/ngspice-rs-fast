@@ -348,7 +348,7 @@ impl Probe {
             .sum()
     }
 
-    fn absolute_resolution(self, options: &crate::analysis::newton::NewtonOptions) -> Real {
+    const fn absolute_resolution(self, options: &crate::analysis::newton::NewtonOptions) -> Real {
         match self {
             Self::Voltage { .. } => options.vntol,
             Self::Current { .. } => options.abstol,
@@ -1401,7 +1401,7 @@ pub(super) fn run(
         workspace.resolution = Some(Resolution {
             plot: workspace.plot(ac),
             // AC is a linear small-signal solve, not a Newton convergence test.
-            absolute: if ac {
+            absolute: if ac || !circuit.devices().iter().any(|device| device.is_nonlinear()) {
                 0.
             } else {
                 probe.absolute_resolution(&settings.newton)
@@ -1870,6 +1870,35 @@ mod tests {
 
     const fn stamp(row: usize, col: usize, value: crate::primitives::Complex) -> super::Stamp {
         super::Stamp { row, col, value }
+    }
+
+    #[test]
+    fn resolution_is_measured_in_output_units_and_scaled_by_perturbation() {
+        use super::{Complex, Plot, PlotFlags, Probe, Real, Resolution};
+        let plot = Plot::new("test", "test", PlotFlags::Real, vec![]);
+        let probe = Probe::Current { row: 0 };
+        let options = crate::analysis::newton::NewtonOptions {
+            abstol: 1e-16,
+            vntol: 1e-13,
+            ..Default::default()
+        };
+        let resolution = Resolution {
+            plot,
+            absolute: probe.absolute_resolution(&options),
+        };
+        let (floor, _) = resolution.row(probe, &[Complex::real(1e-4)]);
+        let tox_denominator = 20e-9 * super::RELATIVE_DELTA;
+        assert!((floor / tox_denominator - 0.005).abs() < 8. * Real::EPSILON);
+        let voltage = Probe::Voltage {
+            pos: Some(0),
+            neg: Some(1),
+        };
+        let scale = voltage.resolution_scale(&[Complex::real(2.), Complex::real(2.)]);
+        assert_eq!(scale.to_bits(), 4_f64.to_bits());
+        assert_eq!(
+            voltage.absolute_resolution(&options).to_bits(),
+            options.vntol.to_bits()
+        );
     }
 
     #[test]

@@ -61,12 +61,13 @@ pub(super) const SENSITIVITY: Tolerance = Tolerance {
     absolute: 1e-12,
 };
 
-/// `.sens` of nonlinear circuits: the nonlinear 1 ppm bias bound, with an
+/// `.sens` of nonlinear circuits: a 1 ppm target for resolved differences, with an
 /// absolute floor for weak parameters, whose numerator `dx` is only a few
 /// ulps of the node voltage: `ulp(x)/delta` is about `1e-16/2e-6 = 5e-11`
 /// for an O(1) parameter of an O(1) V output (C's own result for a diode's
 /// `nr` moves by 3e-10 between RELTOL 1e-6 and 1e-9 for that reason), which a
-/// 1e-9 floor covers.
+/// 1e-9 baseline floor covers. The per-column resolution diagnostic can
+/// dominate this target when the finite-difference numerator is unresolved.
 pub(super) const SENSITIVITY_NONLINEAR: Tolerance = Tolerance {
     relative: 1e-6,
     absolute: 1e-9,
@@ -429,15 +430,29 @@ fn validate_alternate_captures(
         .collect()
 }
 
+fn validate_resolution(got: &Plot, resolution: Option<&Plot>) -> Result<(), String> {
+    if let Some(resolution) = resolution {
+        if resolution.point_count() != got.point_count()
+            || resolution.variables() != got.variables()
+            || resolution
+                .cells()
+                .iter()
+                .any(|value| !value.is_finite() || value.re < 0. || value.im != 0.)
+        {
+            return Err("invalid sensitivity resolution diagnostic".to_owned());
+        }
+    }
+    Ok(())
+}
+
 /// Compare one production plot with committed independent C captures. Header dates,
 /// commands, titles and internal plot IDs are not numerical metadata.
 /// Axis identity is explicit in the fixture registry, not inferred from order.
+///
 /// Complex components each satisfy the ordinary bound against the nearest
-/// point in the observed per-component C reference interval.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "retain the existing separately rounded component acceptance bounds; changing rounding can change golden classifications at the boundary"
-)]
+/// point in the observed per-component C reference interval. Sensitivity
+/// comparisons additionally use the output resolution divided by the actual
+/// finite-difference denominator for that component.
 pub(super) fn plots(
     got: &Plot,
     want: &Plot,
@@ -457,17 +472,7 @@ pub(super) fn plots(
         ));
     }
     let alternate_columns = validate_alternate_captures(want, &want_columns, alternates, axis)?;
-    if let Some(resolution) = resolution {
-        if resolution.point_count() != got.point_count()
-            || resolution.variables() != got.variables()
-            || resolution
-                .cells()
-                .iter()
-                .any(|value| !value.is_finite() || value.re < 0. || value.im != 0.)
-        {
-            return Err("invalid sensitivity resolution diagnostic".to_owned());
-        }
-    }
+    validate_resolution(got, resolution)?;
     if let Some(axis) = axis {
         for (plot, columns, label) in [(got, &got_columns, "Rust"), (want, &want_columns, "C")] {
             let &column = columns
@@ -737,6 +742,27 @@ mod tests {
                 assert!(error.contains("first:") && error.contains("worst"));
             }
         }
+    }
+
+    #[test]
+    fn sensitivity_resolution_applies_only_to_its_own_component_and_row() {
+        let want = plot();
+        let mut resolution = want.clone();
+        for row in resolution.rows_mut() {
+            row.fill(Complex::ZERO);
+        }
+        resolution.point_mut(0).unwrap()[1] = Complex::real(1e-5);
+        let mut got = want.clone();
+        got.point_mut(0).unwrap()[1].re += 3e-6;
+        assert!(compare(&got, &want).is_err());
+        plots(&got, &want, &[], AC, Some("frequency"), Some(&resolution)).unwrap();
+        got.point_mut(1).unwrap()[1].re += 3e-6;
+        assert!(plots(&got, &want, &[], AC, Some("frequency"), Some(&resolution)).is_err());
+        got = want.clone();
+        got.point_mut(0).unwrap()[1].re = 0.;
+        assert!(plots(&got, &want, &[], AC, Some("frequency"), Some(&resolution)).is_err());
+        resolution.point_mut(0).unwrap()[1].re = f64::INFINITY;
+        assert!(plots(&want, &want, &[], AC, Some("frequency"), Some(&resolution)).is_err());
     }
 
     #[test]
