@@ -9,9 +9,9 @@
 //! the impulse responses; the coefficient of the newest (unknown) sample goes
 //! into the matrix, the rest into the right-hand side.
 //!
-//! Every routine follows its C counterpart operation by operation, including
-//! C's quirks (noted where they matter), so that the port reproduces ngspice's
-//! coefficients to rounding. The modified Bessel functions are the polynomial
+//! Preserve the C convolution and auxiliary-index policy, with local
+//! interval formulas and exponentially scaled Bessel products to avoid
+//! cancellation and overflow in finite physical responses. The modified Bessel functions are the polynomial
 //! approximations of Abramowitz and Stegun 9.8.1-9.8.4 that `ltramisc.c` uses
 //! (`bessI0`, `bessI1`, `bessI1xOverX`); `erfc` is a separate implementation
 //! (see [`erfc`]).
@@ -131,37 +131,73 @@ fn twiceintlinfunc(
     width * width.mul_add(weighted, initial_integral)
 }
 
+// A&S coefficients shared by scalar and parallel endpoint evaluation.
+// Each polynomial retains the original nested multiply/add order.
+const I0_SMALL: [Real; 7] = [
+    1.,
+    3.515_622_9,
+    3.089_942_4,
+    1.206_749_2,
+    0.265_973_2,
+    0.360_768e-1,
+    0.45813e-2,
+];
+const I0_LARGE: [Real; 9] = [
+    0.398_942_28,
+    0.132_859_2e-1,
+    0.225_319e-2,
+    -0.157_565e-2,
+    0.916_281e-2,
+    -0.205_770_6e-1,
+    0.263_553_7e-1,
+    -0.164_763_3e-1,
+    0.392_377e-2,
+];
+const I1_SMALL: [Real; 7] = [
+    0.5,
+    0.878_905_94,
+    0.514_988_69,
+    0.150_849_34,
+    0.265_873_3e-1,
+    0.301_532e-2,
+    0.32411e-3,
+];
+const I1_LARGE: [Real; 9] = [
+    0.398_942_28,
+    -0.398_802_4e-1,
+    -0.362_018e-2,
+    0.163_801e-2,
+    -0.103_155_5e-1,
+    0.228_296_7e-1,
+    -0.289_531_2e-1,
+    0.178_765_4e-1,
+    -0.420_059e-2,
+];
+
+#[inline]
+fn polynomial<T: Copy + std::ops::Mul<Output = T> + std::ops::Add<Output = T>>(
+    y: T,
+    coefficients: &[Real],
+    constant: impl Fn(Real) -> T,
+) -> T {
+    let Some((&last, rest)) = coefficients.split_last() else {
+        return constant(0.);
+    };
+    rest.iter()
+        .rev()
+        .fold(constant(last), |value, &c| constant(c) + y * value)
+}
+
 /// `bessI0` (Abramowitz and Stegun 9.8.1, 9.8.2).
 #[must_use]
 pub fn bess_i0(x: Real) -> Real {
     let ax = x.abs();
     if ax < 3.75 {
-        let mut y = x / 3.75;
-        y *= y;
-        1.0 + y
-            * (3.515_622_9
-                + y * (3.089_942_4
-                    + y * (1.206_749_2 + y * (0.265_973_2 + y * (0.360_768e-1 + y * 0.45813e-2)))))
+        let y = x / 3.75;
+        polynomial(y * y, &I0_SMALL, std::convert::identity)
     } else {
-        let y = 3.75 / ax;
-        (ax.exp() / ax.sqrt())
-            * (0.398_942_28
-                + y * (0.132_859_2e-1
-                    + y * (0.225_319e-2
-                        + y * (-0.157_565e-2
-                            + y * (0.916_281e-2
-                                + y * (-0.205_770_6e-1
-                                    + y * (0.263_553_7e-1
-                                        + y * (-0.164_763_3e-1 + y * 0.392_377e-2))))))))
+        (ax.exp() / ax.sqrt()) * polynomial(3.75 / ax, &I0_LARGE, std::convert::identity)
     }
-}
-
-/// The large-argument series shared by `bessI1` and `bessI1xOverX`.
-fn bess_i1_tail(y: Real) -> Real {
-    let ans = 0.228_296_7e-1 + y * (-0.289_531_2e-1 + y * (0.178_765_4e-1 - y * 0.420_059e-2));
-    0.398_942_28
-        + y * (-0.398_802_4e-1
-            + y * (-0.362_018e-2 + y * (0.163_801e-2 + y * (-0.103_155_5e-1 + y * ans))))
 }
 
 /// `bessI1` (Abramowitz and Stegun 9.8.3, 9.8.4).
@@ -169,16 +205,10 @@ fn bess_i1_tail(y: Real) -> Real {
 pub fn bess_i1(x: Real) -> Real {
     let ax = x.abs();
     let ans = if ax < 3.75 {
-        let mut y = x / 3.75;
-        y *= y;
-        ax * (0.5
-            + y * (0.878_905_94
-                + y * (0.514_988_69
-                    + y * (0.150_849_34
-                        + y * (0.265_873_3e-1 + y * (0.301_532e-2 + y * 0.32411e-3))))))
+        let y = ax / 3.75;
+        ax * polynomial(y * y, &I1_SMALL, std::convert::identity)
     } else {
-        let y = 3.75 / ax;
-        bess_i1_tail(y) * (ax.exp() / ax.sqrt())
+        polynomial(3.75 / ax, &I1_LARGE, std::convert::identity) * (ax.exp() / ax.sqrt())
     };
     if x < 0.0 { -ans } else { ans }
 }
@@ -188,32 +218,131 @@ pub fn bess_i1(x: Real) -> Real {
 pub fn bess_i1_x_over_x(x: Real) -> Real {
     let ax = x.abs();
     if ax < 3.75 {
-        let mut y = x / 3.75;
-        y *= y;
-        0.5 + y
-            * (0.878_905_94
-                + y * (0.514_988_69
-                    + y * (0.150_849_34
-                        + y * (0.265_873_3e-1 + y * (0.301_532e-2 + y * 0.32411e-3)))))
+        let y = ax / 3.75;
+        polynomial(y * y, &I1_SMALL, std::convert::identity)
     } else {
-        let y = 3.75 / ax;
-        bess_i1_tail(y) * (ax.exp() / (ax * ax.sqrt()))
+        polynomial(3.75 / ax, &I1_LARGE, std::convert::identity) * (ax.exp() / (ax * ax.sqrt()))
     }
 }
 
-/// `LTRArlcH2Func`: `h2(t)` of the RLC line, zero before `T`.
+/// I0(x) - 1 in the small-argument polynomial, without adding a unit
+/// that would round away the correction.
+fn small_i0_delta(x: Real) -> Real {
+    let y = x / 3.75;
+    let y = y * y;
+    y * polynomial(y, &I0_SMALL[1..], std::convert::identity)
+}
+
+/// Evaluate exp(decay)*I0(x) and exp(decay)*I1(x) (or I1(x)/x).
+/// For large x the combined exponent is supplied independently, so the
+/// physical product never forms an exponentially large Bessel value.
+fn weighted_bessel_pair<const DIVIDED: bool>(
+    x: Real,
+    decay: Real,
+    combined_exponent: Real,
+) -> (Real, Real) {
+    if x < 3.75 {
+        let y = x / 3.75;
+        let y = y * y;
+        let factor = decay.exp();
+        let i0 = polynomial(y, &I0_SMALL, std::convert::identity);
+        let i1 = polynomial(y, &I1_SMALL, std::convert::identity);
+        (factor * i0, factor * if DIVIDED { i1 } else { x * i1 })
+    } else {
+        let y = 3.75 / x;
+        let factor = combined_exponent.exp() / x.sqrt();
+        let i0 = factor * polynomial(y, &I0_LARGE, std::convert::identity);
+        let i1 = factor * polynomial(y, &I1_LARGE, std::convert::identity);
+        (i0, if DIVIDED { i1 / x } else { i1 })
+    }
+}
+
+/// The RLC self endpoint is lag * [exp(-x)*(I0(x)+I1(x))-1],
+/// with x=beta*lag. Preserve the small loss correction and evaluate
+/// the large-argument product in exponentially scaled form.
+fn rlc_self_endpoint(lag: Real, beta: Real) -> Real {
+    if beta == 0. {
+        return lag;
+    }
+    let x = beta * lag;
+    if x < 3.75 {
+        let delta = small_i0_delta(x) + bess_i1(x);
+        lag * (-x).exp().mul_add(delta, (-x).exp_m1())
+    } else {
+        let (i0, i1) = weighted_bessel_pair::<false>(x, -x, 0.);
+        lag * (i0 + i1 - 1.)
+    }
+}
+
+/// RLC coupled endpoints. The large-argument exponent is rationalized:
+/// alpha*sqrt(lag^2-delay^2)-beta*lag equals
+/// (alpha-beta)*lag-alpha*delay^2/(lag+sqrt(lag^2-delay^2)).
+#[derive(Clone, Copy)]
+struct RlcKernels {
+    delay: Real,
+    alpha: Real,
+    beta: Real,
+    alpha_squared_delay: Real,
+    delay_decay: Real,
+}
+
+impl RlcKernels {
+    fn new(delay: Real, alpha: Real, beta: Real) -> Self {
+        Self {
+            delay,
+            alpha,
+            beta,
+            alpha_squared_delay: alpha * alpha * delay,
+            delay_decay: (-beta * delay).exp(),
+        }
+    }
+
+    fn at(self, lag: Real, active: [bool; 3]) -> [Real; 3] {
+        let h1 = if active[0] {
+            rlc_self_endpoint(lag, self.beta)
+        } else {
+            0.
+        };
+        if lag < self.delay || !(active[1] || active[2]) {
+            return [h1, 0., 0.];
+        }
+        let (argument, combined) = if lag == self.delay {
+            (0., -self.beta * lag)
+        } else {
+            let ratio = self.delay / lag;
+            let root_ratio = (((lag - self.delay) / lag) * (1. + ratio)).sqrt().min(1.);
+            let argument = self.alpha * (lag * root_ratio);
+            let lag_difference = self.delay * ratio / (1. + root_ratio);
+            (
+                argument,
+                (self.alpha - self.beta).mul_add(lag, -self.alpha * lag_difference),
+            )
+        };
+        let (i0, i1_over_x) = weighted_bessel_pair::<true>(argument, -self.beta * lag, combined);
+        let h2 = if active[1] && self.alpha != 0. {
+            self.alpha_squared_delay * i1_over_x
+        } else {
+            0.
+        };
+        let h3 = if !active[2] || lag <= self.delay || self.beta == 0. {
+            0.
+        } else if argument < 3.75 {
+            let local = -self.beta * (lag - self.delay);
+            self.delay_decay
+                * local
+                    .exp()
+                    .mul_add(small_i0_delta(argument), local.exp_m1())
+        } else {
+            i0 - self.delay_decay
+        };
+        [h1, h2, h3]
+    }
+}
+
+/// `LTRArlcH2Func`: h2(t) of the RLC line, zero before TD.
 #[must_use]
 pub fn rlc_h2(time: Real, t: Real, alpha: Real, beta: Real) -> Real {
-    if alpha == 0.0 || time < t {
-        return 0.0;
-    }
-    let besselarg = if time == t {
-        0.0
-    } else {
-        alpha * (time * time - t * t).sqrt()
-    };
-    let exparg = -beta * time;
-    alpha * alpha * t * exparg.exp() * bess_i1_x_over_x(besselarg)
+    RlcKernels::new(t, alpha, beta).at(time, [false, true, false])[1]
 }
 
 /// `LTRAstraightLineCheck`: whether three points lie close enough to a
@@ -514,75 +643,33 @@ pub fn rlc_coefficients(
 
     let aux = rlc_aux_index(t, curtime, times);
 
-    let mut h2lovalue1 = 0.0;
-    let mut h2hivalue1 = 0.0;
-    let mut h2dummy1 = 0.0;
-    let mut h3hivalue1 = 0.0;
-    let mut h3dummy1 = 0.0;
-    let mut alphasq_t = 0.0;
-    let mut exp_beta_t = 0.0;
-    let mut h2relval = 0.0;
-    let mut h3relval = 0.0;
-    let mut besselarg;
-
-    if aux != 0 {
-        let lolimit1 = t;
-        let hilimit1 = curtime - times[aux];
-        let delta1 = hilimit1 - lolimit1;
-
-        h2lovalue1 = rlc_h2(t, t, alpha, beta);
-        besselarg = if hilimit1 > t {
-            alpha * (hilimit1 * hilimit1 - t * t).sqrt()
-        } else {
-            0.0
-        };
-        let expterm = (-beta * hilimit1).exp();
-        let bessi1overxterm = bess_i1_x_over_x(besselarg);
-        alphasq_t = alpha * alpha * t;
-        h2hivalue1 = if alpha == 0.0 || hilimit1 < t {
-            0.0
-        } else {
-            alphasq_t * expterm * bessi1overxterm
-        };
-        h2dummy1 = twiceintlinfunc(
-            lolimit1, hilimit1, lolimit1, h2lovalue1, h2hivalue1, lolimit1, hilimit1,
-        ) / delta1;
-        out.first[1] = h2dummy1;
-        h2relval = (reltol * h2dummy1).abs();
-
-        let h3lovalue1 = 0.0; // E3dash is consistent with this (C).
-        let bessi0term = bess_i0(besselarg);
-        exp_beta_t = (-beta * t).exp();
-        h3hivalue1 = if hilimit1 <= t || beta == 0.0 {
-            0.0
-        } else {
-            expterm * bessi0term - exp_beta_t
-        };
-        h3dummy1 = intlinfunc(
-            lolimit1, hilimit1, h3lovalue1, h3hivalue1, lolimit1, hilimit1,
-        ) / delta1;
-        out.first[2] = h3dummy1;
-        h3relval = (h3dummy1 * reltol).abs();
-    }
-
-    let h1value = |hilimit: Real, exparg: Real, expterm: Real| {
-        if beta == 0.0 {
-            hilimit
-        } else if hilimit == 0.0 {
-            0.0
-        } else {
-            (bess_i1(-exparg) + bess_i0(-exparg)) * hilimit * expterm - hilimit
-        }
+    let kernels = RlcKernels::new(t, alpha, beta);
+    let [
+        mut h2lovalue1,
+        mut h2hivalue1,
+        mut h2dummy1,
+        mut h3hivalue1,
+        mut h3dummy1,
+    ] = if aux != 0 {
+        let hilimit = curtime - times[aux];
+        let delta = hilimit - t;
+        let h2low = rlc_h2(t, t, alpha, beta);
+        let [_, h2high, h3high] = kernels.at(hilimit, [false, true, true]);
+        let h2first = twiceintlinfunc(t, hilimit, t, h2low, h2high, t, hilimit) / delta;
+        let h3first = intlinfunc(t, hilimit, 0., h3high, t, hilimit) / delta;
+        [h2low, h2high, h2first, h3high, h3first]
+    } else {
+        [0.; 5]
     };
+    out.first[1] = h2dummy1;
+    out.first[2] = h3dummy1;
+    let h2relval = (reltol * h2dummy1).abs();
+    let h3relval = (reltol * h3dummy1).abs();
 
     let mut lolimit1 = 0.0;
     let mut hilimit1 = curtime - times[index];
     let mut delta1 = hilimit1 - lolimit1;
-    let mut exparg = -beta * hilimit1;
-    let mut expterm = exparg.exp();
-
-    let mut h1lovalue1;
-    let mut h1hivalue1 = h1value(hilimit1, exparg, expterm);
+    let mut h1hivalue1 = kernels.at(hilimit1, [true, false, false])[0];
     let mut h1dummy1 = h1hivalue1 / delta1;
     out.first[0] = h1dummy1;
     let h1relval = (h1dummy1 * reltol).abs();
@@ -598,14 +685,12 @@ pub fn rlc_coefficients(
             lolimit1 = hilimit2;
             hilimit1 = curtime - times[i - 1];
             delta1 = times[i] - times[i - 1];
-            exparg = -beta * hilimit1;
-            expterm = exparg.exp();
         }
+        let endpoint = kernels.at(hilimit1, [doh1, doh2 && i <= aux, doh3 && i <= aux]);
         if doh1 {
-            let h1hivalue2 = h1hivalue1;
+            let h1lovalue1 = h1hivalue1;
             let h1dummy2 = h1dummy1;
-            h1lovalue1 = h1hivalue2;
-            h1hivalue1 = h1value(hilimit1, exparg, expterm);
+            h1hivalue1 = endpoint[0];
             h1dummy1 = (h1hivalue1 - h1lovalue1) / delta1;
             out.weights[i][0] = h1dummy1 - h1dummy2;
             if out.weights[i][0].abs() <= h1relval {
@@ -613,25 +698,12 @@ pub fn rlc_coefficients(
             }
         }
         if i <= aux {
-            besselarg = 0.0;
-            if doh2 || doh3 {
-                besselarg = if hilimit1 > t {
-                    alpha * (hilimit1 * hilimit1 - t * t).sqrt()
-                } else {
-                    0.0
-                };
-            }
             if doh2 {
                 let h2lovalue2 = h2lovalue1;
                 let h2hivalue2 = h2hivalue1;
                 let h2dummy2 = h2dummy1;
                 h2lovalue1 = h2hivalue2;
-                let bessi1overxterm = bess_i1_x_over_x(besselarg);
-                h2hivalue1 = if alpha == 0.0 || hilimit1 < t {
-                    0.0
-                } else {
-                    alphasq_t * expterm * bessi1overxterm
-                };
+                h2hivalue1 = endpoint[1];
                 h2dummy1 = twiceintlinfunc(
                     lolimit1, hilimit1, lolimit1, h2lovalue1, h2hivalue1, lolimit1, hilimit1,
                 ) / delta1;
@@ -647,12 +719,7 @@ pub fn rlc_coefficients(
                 let h3hivalue2 = h3hivalue1;
                 let h3dummy2 = h3dummy1;
                 let h3lovalue1 = h3hivalue2;
-                let bessi0term = bess_i0(besselarg);
-                h3hivalue1 = if hilimit1 <= t || beta == 0.0 {
-                    0.0
-                } else {
-                    expterm * bessi0term - exp_beta_t
-                };
+                h3hivalue1 = endpoint[2];
                 h3dummy1 = intlinfunc(
                     lolimit1, hilimit1, h3lovalue1, h3hivalue1, lolimit1, hilimit1,
                 ) / delta1;
@@ -712,6 +779,52 @@ mod tests {
                 "{got} {expected}"
             );
         }
+    }
+
+    #[test]
+    fn rlc_endpoints_remain_finite_and_accurate_across_loss_scales() {
+        // 90-digit independent Bessel power-series evaluations.
+        for (beta, delay, lag, expected) in [
+            (
+                1.,
+                1.,
+                1000.,
+                [
+                    -974.771_829_287_180_1,
+                    1.260_463_581_744_048_3e-5,
+                    -0.355_268_504_606_938_87,
+                ],
+            ),
+            (1e-20, 0.5, 1., [-5e-21, 2.5e-41, -5e-21]),
+            (
+                1.,
+                1.,
+                1_f64.next_up(),
+                [
+                    -0.326_329_977_056_651_23,
+                    0.183_939_720_585_721_14,
+                    -4.084_282_258_747_71e-17,
+                ],
+            ),
+        ] {
+            let kernels = RlcKernels::new(delay, beta, beta);
+            let got = kernels.at(lag, [true; 3]);
+            for (actual, reference) in got.into_iter().zip(expected) {
+                assert!(
+                    (actual - reference).abs() <= 3e-7 * reference.abs(),
+                    "beta={beta:e}, lag={lag:e}, {actual:e} != {reference:e}"
+                );
+            }
+            assert_eq!(kernels.at(delay.next_down(), [false, true, true]), [0.; 3]);
+        }
+        let times = VecDeque::from([0., 1., 10., 100., 900.]);
+        let c = rlc_coefficients(1., 1., 1., 1000., &times, 0.);
+        assert!(
+            c.first
+                .iter()
+                .chain(c.weights.iter().flatten())
+                .all(|v| v.is_finite())
+        );
     }
 
     #[test]

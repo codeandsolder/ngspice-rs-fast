@@ -85,8 +85,8 @@
 //! * RG lines in AC/`.sp`: C's `LTRAacLoad` loads the DC stamp of every LTRA
 //!   model and returns at the first RG model, corrupting any other lossy
 //!   line's AC load; the device cannot see the other lines, so it refuses.
-//! * A nonfinite convolution input, which C's Bessel approximations produce
-//!   once `beta t` exceeds about 700 (`exp` overflow); C continues with NaN.
+//! * A nonfinite convolution input is an explicit numerical error. Scaled
+//!   Bessel products remain finite past C's intermediate exponential overflow.
 //! * C reports `@o1[v1]` and the other initial conditions after a transient
 //!   as the operating point it copied into them (`ltraload.c`
 //!   `MODEINITTRAN`); the port offers no instance observations.
@@ -890,10 +890,7 @@ impl LossyLine {
         if !(inputs.iter().all(|v| v.is_finite())
             && coefficients.first.iter().all(|v| v.is_finite()))
         {
-            return Err(self.internal(format!(
-                "nonfinite convolution at t = {time:e} (ltramisc.c Bessel/erfc terms overflow once \
-                 beta t exceeds about 700; C continues with NaN)"
-            )));
+            return Err(self.internal(format!("nonfinite convolution at t = {time:e}")));
         }
         Ok(Load {
             first: coefficients.first,
