@@ -874,7 +874,9 @@ mod tests {
                 while expected < last && samples.time(expected).unwrap() < time - line.td {
                     expected += 1;
                 }
-                let DelayUpdate::Waveform(update) = line.accept(&history, &context).unwrap() else {
+                let DelayUpdate::Waveform(update) =
+                    DelayLine::accept(&line, &history, &context).unwrap()
+                else {
                     unreachable!()
                 };
                 assert_eq!(update.drop_front, expected - 2);
