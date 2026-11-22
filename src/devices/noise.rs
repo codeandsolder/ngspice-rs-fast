@@ -184,11 +184,19 @@ impl FlickerLaw {
 }
 
 impl NoiseKind {
-    /// The output-referred density `gain * density(f)`, in C's evaluation
-    /// order (`nevalsrc.c`), for a squared transfer magnitude `gain`.
-    #[must_use]
-    pub fn output_density(&self, gain: Real, frequency: Real) -> Real {
-        match *self {
+    /// Evaluate a scalar generator at a squared transfer magnitude.
+    ///
+    /// Arithmetic follows `NevalSrc`, including signed scalar densities.
+    ///
+    /// # Errors
+    ///
+    /// A coherent generator requires two complex transfers. Invalid inputs
+    /// or nonfinite densities also return an error.
+    fn scalar_output_density(&self, gain: Real, frequency: Real) -> SpiceResult<Real> {
+        if !gain.is_finite() || gain < 0. || !valid_frequency(frequency) || !self.validate() {
+            return Err(noise_error("invalid scalar generator, gain or frequency"));
+        }
+        let density = match *self {
             Self::Thermal {
                 conductance,
                 temperature,
@@ -197,11 +205,46 @@ impl NoiseKind {
             // C: `noizDens = gain; noizDens *= <numerator> / <denominator>`.
             Self::Flicker { numerator, law } => gain * law.apply(numerator, frequency),
             Self::Gain { factor } => gain * factor,
-            // Needs both node pairs' transfer values: see
-            // `NoiseSource::output_density`. A plain squared gain cannot
-            // express it, so it never reaches here from that path.
-            Self::CorrelatedThermal { .. } => Real::NAN,
+            Self::CorrelatedThermal { .. } => {
+                return Err(SpiceError::circuit(
+                    "coherent thermal noise requires two complex transfers",
+                ));
+            }
+        };
+        finite_density(density)
+    }
+
+    /// RFSPICE's independent-source amplitude before port transformation.
+    ///
+    /// Unlike the adjoint density evaluator, this omits `N_GAIN` generators
+    /// and does not multiply by the squared output transfer.
+    ///
+    /// # Errors
+    ///
+    /// Invalid parameters, a nonfinite or negative density, or a coherent
+    /// generator (the distinct RFSPICE `NevalSrc2` path is not yet ported).
+    pub(crate) fn rf_amplitude(&self) -> SpiceResult<Option<Real>> {
+        if !self.validate() {
+            return Err(noise_error("invalid RFSPICE generator"));
         }
+        let density = match *self {
+            Self::Thermal {
+                conductance,
+                temperature,
+            } => 4. * BOLTZMANN * temperature * conductance,
+            Self::Shot { current } => 2. * CHARGE * current.abs(),
+            Self::Flicker { .. } | Self::Gain { .. } => return Ok(None),
+            // Do not substitute the ordinary NevalSrc2 expression: the RF
+            // branch builds complex port amplitudes and the C implementation
+            // even uses param1 for both amplitude scales.
+            Self::CorrelatedThermal { .. } => {
+                return Err(SpiceError::not_yet_ported(
+                    "correlated (NevalSrc2) noise in S-parameter noise analysis",
+                    "src/spicelib/analysis/nevalsrc.c (NevalSrc2, RFSPICE branch)",
+                ));
+            }
+        };
+        finite_density(density.sqrt()).map(Some)
     }
 
     fn validate(&self) -> bool {
@@ -221,7 +264,9 @@ impl NoiseKind {
                 ..
             } => {
                 conductance.is_finite()
+                    && conductance >= 0.
                     && second_conductance.is_finite()
+                    && second_conductance >= 0.
                     && phase.is_finite()
                     && temperature.is_finite()
                     && temperature > 0.0
@@ -237,14 +282,33 @@ impl NoiseKind {
 pub struct NoiseSource {
     /// C's generator name suffix, including the leading underscore.
     pub suffix: &'static str,
-    /// The node pair the generator connects (the order does not matter).
+    /// The first node pair, in reference order (sign matters for coherent noise).
     pub nodes: [NodeId; 2],
     /// The generator's law at the bias point.
     pub kind: NoiseKind,
 }
 
+const fn valid_frequency(frequency: Real) -> bool {
+    frequency.is_finite() && frequency > 0.
+}
+
+fn noise_error(message: &str) -> SpiceError {
+    SpiceError::Numerical {
+        context: "noise transfer".into(),
+        message: message.into(),
+    }
+}
+
+fn finite_density(density: Real) -> SpiceResult<Real> {
+    if density.is_finite() {
+        Ok(density)
+    } else {
+        Err(noise_error("nonfinite noise density"))
+    }
+}
+
 /// Squared transfer gain in the reference noise evaluator's operation order.
-const fn squared_gain(transfer: Complex) -> Real {
+pub(crate) const fn squared_gain(transfer: Complex) -> Real {
     transfer.re * transfer.re + transfer.im * transfer.im
 }
 
@@ -283,12 +347,15 @@ impl NoiseSource {
     /// The output-referred density given the adjoint transfer value
     /// `difference(nodes)` (C's `CKTrhs[n1] - CKTrhs[n2]` plus `j` times the
     /// `CKTirhs` difference) of a node pair, in `nevalsrc.c`'s order.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Invalid generator parameters or frequency, or nonfinite density.
     pub fn output_density(
         &self,
         difference: impl Fn([NodeId; 2]) -> Complex,
         frequency: Real,
-    ) -> Real {
+    ) -> SpiceResult<Real> {
         if let NoiseKind::CorrelatedThermal {
             conductance,
             second,
@@ -297,6 +364,9 @@ impl NoiseSource {
             temperature,
         } = self.kind
         {
+            if !valid_frequency(frequency) || !self.kind.validate() {
+                return Err(noise_error("invalid coherent generator or frequency"));
+            }
             let gain = correlated_gain(
                 difference(self.nodes),
                 difference(second),
@@ -304,10 +374,10 @@ impl NoiseSource {
                 second_conductance,
                 phase,
             );
-            return 4.0 * BOLTZMANN * temperature * gain;
+            return finite_density(4.0 * BOLTZMANN * temperature * gain);
         }
         self.kind
-            .output_density(squared_gain(difference(self.nodes)), frequency)
+            .scalar_output_density(squared_gain(difference(self.nodes)), frequency)
     }
 }
 
@@ -494,8 +564,10 @@ pub fn circuit_noise(
 
 #[cfg(test)]
 mod tests {
-    use super::{BOLTZMANN, CHARGE, FlickerLaw, NoiseKind, correlated_gain};
-    use crate::primitives::Complex;
+    use super::{
+        BOLTZMANN, CHARGE, FlickerLaw, NoiseKind, NoiseSource, correlated_gain, squared_gain,
+    };
+    use crate::primitives::{Complex, NodeId, SpiceError};
 
     #[test]
     fn densities_follow_nevalsrc() {
@@ -504,16 +576,19 @@ mod tests {
             temperature: 300.15,
         };
         assert_eq!(
-            thermal.output_density(2.0, 10.0),
+            thermal.scalar_output_density(2.0, 10.0).unwrap(),
             2.0 * 4.0 * BOLTZMANN * 300.15 * 1e-3
         );
         let shot = NoiseKind::Shot { current: -1e-3 };
-        assert_eq!(shot.output_density(1.0, 1.0), 2.0 * CHARGE * 1e-3);
+        assert_eq!(
+            shot.scalar_output_density(1.0, 1.0).unwrap(),
+            2.0 * CHARGE * 1e-3
+        );
         let flicker = NoiseKind::Flicker {
             numerator: 1e-12,
             law: FlickerLaw::PerHertz,
         };
-        assert_eq!(flicker.output_density(1.0, 100.0), 1e-14);
+        assert_eq!(flicker.scalar_output_density(1.0, 100.0).unwrap(), 1e-14);
         let steep = NoiseKind::Flicker {
             numerator: 1e-12,
             law: FlickerLaw::Area {
@@ -521,7 +596,7 @@ mod tests {
                 exponent: 2.0,
             },
         };
-        assert!((steep.output_density(1.0, 10.0) - 1e-14).abs() < 1e-28);
+        assert!((steep.scalar_output_density(1.0, 10.0).unwrap() - 1e-14).abs() < 1e-28);
     }
 
     #[test]
@@ -544,6 +619,143 @@ mod tests {
             correlated_gain(first, second, 4., 9., angle).to_bits(),
             reference.to_bits()
         );
+    }
+
+    #[test]
+    fn scalar_evaluation_rejects_coherent_sources_and_invalid_inputs() {
+        let coherent = NoiseKind::CorrelatedThermal {
+            conductance: 1.,
+            second: [NodeId::new(2), NodeId::GROUND],
+            second_conductance: 1.,
+            phase: 0.,
+            temperature: 300.,
+        };
+        assert!(matches!(
+            coherent.scalar_output_density(1., 100.),
+            Err(SpiceError::Circuit { .. })
+        ));
+        let scalar = NoiseKind::Gain { factor: 2. };
+        for (gain, frequency) in [
+            (-1., 1.),
+            (f64::INFINITY, 1.),
+            (f64::NAN, 1.),
+            (1., 0.),
+            (1., f64::NAN),
+            (1., f64::INFINITY),
+            (f64::MAX, 1.),
+        ] {
+            assert!(matches!(
+                scalar.scalar_output_density(gain, frequency),
+                Err(SpiceError::Numerical { .. })
+            ));
+        }
+        // Signed scalar values remain meaningful to the C integration path.
+        let signed = NoiseKind::Gain { factor: -0. };
+        assert_eq!(
+            signed.scalar_output_density(1., 1.).unwrap().to_bits(),
+            (-0_f64).to_bits()
+        );
+        assert_eq!(
+            squared_gain(Complex::new(-0., -0.)).to_bits(),
+            0_f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn coherent_source_evaluation_observes_both_ordered_transfers() {
+        let first = [NodeId::new(1), NodeId::GROUND];
+        let second = [NodeId::new(2), NodeId::GROUND];
+        let source = NoiseSource::new(
+            ".corl",
+            first,
+            NoiseKind::CorrelatedThermal {
+                conductance: 4.,
+                second,
+                second_conductance: 4.,
+                phase: 0.,
+                temperature: 300.,
+            },
+        );
+        let cancellation = |nodes| {
+            if nodes == first {
+                Complex::new(2., -3.)
+            } else {
+                assert_eq!(nodes, second);
+                Complex::new(-2., 3.)
+            }
+        };
+        assert_eq!(
+            source.output_density(cancellation, 100.).unwrap().to_bits(),
+            0_f64.to_bits()
+        );
+        assert_eq!(
+            source
+                .output_density(|_| Complex::new(2., -3.), 100.)
+                .unwrap()
+                .to_bits(),
+            (4. * BOLTZMANN * 300. * 208.).to_bits()
+        );
+        assert!(
+            source
+                .output_density(|_| Complex::real(f64::MAX), 100.)
+                .is_err()
+        );
+        assert!(source.output_density(cancellation, 0.).is_err());
+
+        let invalid = NoiseSource::new(
+            ".corl",
+            first,
+            NoiseKind::CorrelatedThermal {
+                conductance: -1.,
+                second,
+                second_conductance: 4.,
+                phase: 0.,
+                temperature: 300.,
+            },
+        );
+        assert!(matches!(
+            invalid.output_density(cancellation, 100.),
+            Err(SpiceError::Numerical { .. })
+        ));
+    }
+
+    #[test]
+    fn rf_amplitude_uses_only_independent_thermal_and_shot_sources() {
+        let thermal = NoiseKind::Thermal {
+            conductance: 1e-3,
+            temperature: 300.,
+        };
+        assert_eq!(
+            thermal.rf_amplitude().unwrap(),
+            Some((4. * BOLTZMANN * 300. * 1e-3).sqrt())
+        );
+        let shot = NoiseKind::Shot { current: -1e-3 };
+        assert_eq!(
+            shot.rf_amplitude().unwrap(),
+            Some((2. * CHARGE * 1e-3).sqrt())
+        );
+        let flicker = NoiseKind::Flicker {
+            numerator: 1e-12,
+            law: FlickerLaw::PerHertz,
+        };
+        assert_eq!(flicker.rf_amplitude().unwrap(), None);
+        assert_eq!(NoiseKind::Gain { factor: 1. }.rf_amplitude().unwrap(), None);
+        let invalid = NoiseKind::Thermal {
+            conductance: -1.,
+            temperature: 300.,
+        };
+        assert!(invalid.rf_amplitude().is_err());
+        let coherent = NoiseKind::CorrelatedThermal {
+            conductance: 1.,
+            second: [NodeId::new(2), NodeId::GROUND],
+            second_conductance: 1.,
+            phase: 0.,
+            temperature: 300.,
+        };
+        assert!(matches!(
+            coherent.rf_amplitude(),
+            Err(SpiceError::NotYetPorted { .. })
+        ));
     }
 
     #[test]

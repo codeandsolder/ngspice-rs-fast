@@ -402,3 +402,28 @@ fn spice3_mos1_flicker_matches_c() {
         &deck.replace(".end", ".control\nset ngbehavior=s3\n.endc\n.end"),
     );
 }
+
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN; runs C batch mode out of process"]
+fn bsim4_correlated_noise_preserves_ordered_generators_and_integration() {
+    let deck =
+        fs::read_to_string(workspace().join("conformance/netlists/m11_bsim4_noise.cir")).unwrap();
+    // Compare individual generators (including the frequency-local coherent
+    // pair), totals and input referral over a frequency sweep, not just the
+    // final output spectrum. Exercise both BSIM4 flicker formulations.
+    for (name, flicker) in [
+        ("bsim4-correlated-fnoimod0", "fnoimod=0 kf=1e-26"),
+        ("bsim4-correlated-fnoimod1", "fnoimod=1"),
+    ] {
+        let deck = deck
+            .replace(
+                ".options reltol",
+                &format!("+ tnoimod=2 {flicker}\n.options reltol"),
+            )
+            .replace(
+                ".noise v(d) vg dec 4 1e3 1e10",
+                ".noise v(d) vg dec 4 1e3 1e10 1",
+            );
+        compare(name, &deck);
+    }
+}
