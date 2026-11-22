@@ -163,15 +163,22 @@ pub(crate) const RES_MIN: Real = 1e-12;
 /// raised to `RESMIN`, one in `(-RESMIN, 0)` lowered to `-RESMIN`, each with
 /// C's warning on standard error. Other values pass unchanged.
 pub(crate) fn res_resist(name: &str, value: Real) -> Real {
-    let clamped = if (0.0..RES_MIN).contains(&value) {
+    let clamped = clamp_resistance(value);
+    if clamped.to_bits() != value.to_bits() {
+        eprintln!("warning: Value of resistor {name} is too small, set to {clamped:.6e}");
+    }
+    clamped
+}
+
+/// The numerical part of the C resistance setter, without diagnostics.
+pub(super) fn clamp_resistance(value: Real) -> Real {
+    if (0.0..RES_MIN).contains(&value) {
         RES_MIN
     } else if value < 0.0 && value > -RES_MIN {
         -RES_MIN
     } else {
-        return value;
-    };
-    eprintln!("warning: Value of resistor {name} is too small, set to {clamped:.6e}");
-    clamped
+        value
+    }
 }
 
 fn validate_resistance(name: &str, resistance: Real) -> SpiceResult<()> {
@@ -324,13 +331,13 @@ impl Device for Resistor {
     }
 
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        stamp_resistor(self.terminals, self.resistance, context)
+        stamp_conductance(self.terminals, 1. / self.resistance, context)
     }
     fn assemble_linear(
         &self,
         context: &mut crate::devices::linear::LinearContext<'_>,
     ) -> SpiceResult<()> {
-        assemble_resistor(self.terminals, self.resistance, context)
+        assemble_conductance(self.terminals, 1. / self.resistance, context)
     }
 
     fn resistor_metadata(&self) -> Option<crate::devices::sweep::ResistorMetadata> {
@@ -386,10 +393,11 @@ impl Device for Resistor {
     fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
         Ok(resistor_noise(
             self.terminals,
-            self.resistance,
+            1. / self.resistance,
             &self.noise,
             self.noise.model.as_deref(),
             context,
+            None,
         ))
     }
 }
@@ -405,40 +413,41 @@ fn stamp_nodal(
     context.stamp_fixed([(p, p, value), (p, n, -value), (n, p, -value), (n, n, value)])
 }
 
-pub(super) fn stamp_resistor(
+pub(super) fn stamp_conductance(
     terminals: [NodeId; 2],
-    resistance: Real,
+    conductance: Real,
     context: &mut StampContext<'_>,
 ) -> SpiceResult<()> {
     if context.mode.is_ac() {
         return Err(SpiceError::circuit("use complex equation assembly for AC"));
     }
-    stamp_nodal(context, terminals, 1.0 / resistance)
+    stamp_nodal(context, terminals, conductance)
 }
-pub(super) fn assemble_resistor(
+pub(super) fn assemble_conductance(
     terminals: [NodeId; 2],
-    resistance: Real,
+    conductance: Real,
     context: &mut crate::devices::linear::LinearContext<'_>,
 ) -> SpiceResult<()> {
-    context.nodal(terminals, 1.0 / resistance, false)
+    context.nodal(terminals, conductance, false)
 }
 
 /// Evaluate the resistor's generators at the operating point.
 pub(super) fn resistor_noise(
     terminals: [NodeId; 2],
-    resistance: Real,
+    conductance: Real,
     n: &ResistorNoise,
     model: Option<&str>,
     context: &NoiseContext<'_>,
+    temperature_kelvin: Option<Real>,
 ) -> DeviceNoise {
     if !n.noisy {
         return DeviceNoise::Noiseless;
     }
-    let conductance = 1.0 / resistance;
     let current = (context.voltage(terminals[0]) - context.voltage(terminals[1])) * conductance;
-    let temperature = n
-        .temperature
-        .map_or_else(|| context.circuit_kelvin(), |t| t + CELSIUS_TO_KELVIN);
+    let temperature = temperature_kelvin.unwrap_or_else(|| {
+        n.temperature
+            .map_or_else(|| context.circuit_kelvin(), |t| t + CELSIUS_TO_KELVIN)
+    });
     // resnoise.c: `RESm * RESfNcoef * pow(fabs(REScurrent / RESm), RESfNexp)
     // / (RESeffNoiseArea * pow(freq, RESef))`.
     let numerator = n.multiplicity * n.kf * (current / n.multiplicity).abs().powf(n.af);
@@ -617,6 +626,36 @@ impl ReactiveLoad<'_> {
         context.system.has_initial_conditions |= self.initial.is_some();
         Ok(())
     }
+}
+
+/// `CAPacLoad`: multiply by frequency before applying the parallel multiplier.
+pub(super) fn assemble_capacitor_ac(
+    terminals: [NodeId; 2],
+    value: Real,
+    m: Real,
+    context: &mut crate::devices::linear::LinearContext<'_>,
+) -> SpiceResult<()> {
+    let [p, n] = terminals;
+    let terms = [value];
+    context.scaled_dynamic_sum(p, p, &terms, m)?;
+    context.scaled_dynamic_sum(n, n, &terms, m)?;
+    context.scaled_dynamic_sum(p, n, &terms, -m)?;
+    context.scaled_dynamic_sum(n, p, &terms, -m)
+}
+
+/// `INDacLoad`: multiply by frequency before dividing by the parallel multiplier.
+pub(super) fn assemble_inductor_ac(
+    terminals: [NodeId; 2],
+    value: Real,
+    m: Real,
+    context: &mut crate::devices::linear::LinearContext<'_>,
+) -> SpiceResult<()> {
+    let branch = context.branch(terminals)?;
+    context.dynamic_group(branch, branch, &[value], -1., m)?;
+    for term in context.mutual {
+        context.system.e.add(branch, term.row, -term.inductance)?;
+    }
+    Ok(())
 }
 
 /// A capacitor, `c1 n1 n2 <value> [ic=…]`.

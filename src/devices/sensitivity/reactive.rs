@@ -10,6 +10,10 @@ use super::{
     SensitivityKernel, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
     SensitivityRecord,
 };
+use crate::devices::passive::physics::{
+    CapacitorGeometry, CapacitorSetup, Coefficients, CoilGeometry, CoilSetup, TemperaturePoint,
+    scaled,
+};
 use crate::devices::{Device, LinearContext, StampContext};
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
 
@@ -67,12 +71,6 @@ const IND_INSTANCE: &[P] = &[
     P::dc("scale"),
     P::dc("nt"),
 ];
-
-/// `CONSTepsZero`, `CONSTepsSiO2` (`const.h`).
-const EPS_ZERO: Real = 8.854_214_871e-12;
-const EPS_SIO2: Real = 3.9 * EPS_ZERO;
-/// `CONSTmuZero`.
-const MU_ZERO: Real = 4.0 * std::f64::consts::PI * 1e-7;
 
 /// Which reactive element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,45 +151,6 @@ impl<'a> ReactiveSensitivity<'a> {
             ),
         }
     }
-}
-
-/// `Lundin()` of `indsetup.c`: Lundin's geometry correction of a solenoid.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "indsetup.c Lundin correction evaluates the original separately rounded polynomial"
-)]
-fn lundin(length: Real, csect: Real) -> Real {
-    if csect < 1e-12 || length < 1e-6 {
-        return 1.;
-    }
-    let x = (csect / std::f64::consts::PI).sqrt() * 2. / length;
-    let xx = x * x;
-    let xxxx = xx * xx;
-    if x < 1. {
-        let num = 1. + 0.383_901 * xx + 0.017_108 * xxxx;
-        let den = 1. + 0.258_952 * xx;
-        num / den - 4. * x / (3. * std::f64::consts::PI)
-    } else {
-        let num = ((4. * x).ln() - 0.5) * (1. + 0.383_901 / xx + 0.017_108 / xxxx);
-        let den = 1. + 0.258_952 / xx;
-        let kk = 0.093_842 / xx + 0.002_029 / xxxx - 0.000_801 / (xx * xxxx);
-        2. * (num / den + kk) / (std::f64::consts::PI * x)
-    }
-}
-
-/// Area and perimeter contributions after model geometry corrections.
-const fn geometry_capacitance(
-    width: Real,
-    length: Real,
-    area_density: Real,
-    sidewall_density: Real,
-) -> Real {
-    area_density * width * length + sidewall_density * 2. * (length + width)
-}
-
-/// The temperature factor shared by `CAPtemp` and `INDtemp`.
-const fn reactive_temperature_factor(tc1: Real, tc2: Real, difference: Real) -> Real {
-    1.0 + tc1 * difference + tc2 * difference * difference
 }
 
 impl SensitivityKernel for ReactiveSensitivity<'_> {
@@ -325,24 +284,20 @@ impl SensitivityKernel for ReactiveSensitivity<'_> {
                 ] {
                     default(model, keyword, value)?;
                 }
-                if !model.given("cj") {
-                    let thick = model.value("thick")?;
-                    let cj = if model.given("thick") && thick > 0. {
-                        if model.given("di") {
-                            model.value("di")? * EPS_ZERO / thick
-                        } else {
-                            EPS_SIO2 / thick
-                        }
-                    } else {
-                        0.
-                    };
-                    model.store("cj", cj)?;
+                let given = |key| model.given(key).then(|| model.value(key)).transpose();
+                let geometry = CapacitorSetup {
+                    cj: given("cj")?,
+                    cjsw: model.value("cjsw")?,
+                    narrow: given("narrow")?,
+                    short: given("short")?,
+                    del: given("del")?,
+                    dielectric: given("di")?,
+                    thickness: given("thick")?,
                 }
-                if model.given("del") {
-                    let del = model.value("del")?;
-                    default(model, "narrow", 2. * del)?;
-                    default(model, "short", 2. * del)?;
-                }
+                .prepare();
+                model.store("cj", geometry.cj)?;
+                model.store("narrow", geometry.narrow)?;
+                model.store("short", geometry.short)?;
                 default(instance, "l", 0.)?;
                 let bv_max = model.value("bv_max")?;
                 default(instance, "bv_max", bv_max)
@@ -361,24 +316,19 @@ impl SensitivityKernel for ReactiveSensitivity<'_> {
                 ] {
                     default(model, keyword, value)?;
                 }
-                if model.given("dia") {
-                    let dia = model.value("dia")?;
-                    model.store("csect", std::f64::consts::PI * dia * dia / 4.)?;
+                let given = |key| model.given(key).then(|| model.value(key)).transpose();
+                let geometry = CoilSetup {
+                    inductance: given("ind")?,
+                    cross_section: given("csect")?,
+                    diameter: given("dia")?,
+                    length: given("length")?,
+                    turns: model.value("nt")?,
+                    permeability: model.value("mu")?,
                 }
-                let length = model.value("length")?;
-                let mut spec = if model.given("length") && length > 0. {
-                    model.value("mu")? * MU_ZERO * model.value("csect")? / length
-                } else {
-                    0.
-                };
-                if model.given("length") && (model.given("dia") || model.given("csect")) {
-                    spec *= lundin(length, model.value("csect")?);
-                }
-                model.store("spec", spec)?;
-                if !model.given("ind") {
-                    let nt = model.value("nt")?;
-                    model.store("ind", nt * nt * spec)?;
-                }
+                .prepare();
+                model.store("csect", geometry.cross_section)?;
+                model.store("spec", geometry.specific)?;
+                model.store("ind", geometry.model_inductance)?;
                 Ok(())
             }
         }
@@ -390,14 +340,19 @@ impl SensitivityKernel for ReactiveSensitivity<'_> {
         model: &mut SensitivityRecord,
         instance: &mut SensitivityRecord,
     ) -> SpiceResult<()> {
-        if instance.given("temp") {
-            instance.store("dtemp", 0.)?;
-        } else {
-            instance.store("temp", self.circuit_kelvin)?;
-            if !instance.given("dtemp") {
-                instance.store("dtemp", 0.)?;
-            }
-        }
+        let temperature = TemperaturePoint::resolve(
+            instance
+                .given("temp")
+                .then(|| instance.value("temp"))
+                .transpose()?,
+            instance
+                .given("dtemp")
+                .then(|| instance.value("dtemp"))
+                .transpose()?,
+            self.circuit_kelvin,
+        );
+        instance.store("temp", temperature.kelvin)?;
+        instance.store("dtemp", temperature.offset)?;
         if !instance.given("scale") {
             instance.store("scale", 1.)?;
         }
@@ -414,32 +369,37 @@ impl SensitivityKernel for ReactiveSensitivity<'_> {
                 } else if model.given("cap") {
                     model.value("cap")?
                 } else {
-                    let (w, l) = (instance.value("w")?, instance.value("l")?);
-                    let (narrow, short) = (model.value("narrow")?, model.value("short")?);
-                    geometry_capacitance(
-                        w - narrow,
-                        l - short,
-                        model.value("cj")?,
-                        model.value("cjsw")?,
-                    )
+                    CapacitorGeometry {
+                        cj: model.value("cj")?,
+                        cjsw: model.value("cjsw")?,
+                        narrow: model.value("narrow")?,
+                        short: model.value("short")?,
+                    }
+                    .capacitance(instance.value("l")?, instance.value("w")?)
                 }
             }
             ReactiveKind::Inductor => {
                 if !instance.given("nt") {
                     instance.store("nt", 0.)?;
                 }
-                if instance.given("inductance") {
-                    instance.value("inductance")?
-                } else if instance.given("nt") {
-                    let nt = instance.value("nt")?;
-                    model.value("spec")? * nt * nt
-                } else {
-                    model.value("ind")?
-                }
+                let geometry = CoilGeometry {
+                    cross_section: model.value("csect")?,
+                    specific: model.value("spec")?,
+                    model_inductance: model.value("ind")?,
+                };
+                geometry.inductance(
+                    instance
+                        .given("inductance")
+                        .then(|| instance.value("inductance"))
+                        .transpose()?,
+                    instance
+                        .given("nt")
+                        .then(|| instance.value("nt"))
+                        .transpose()?,
+                )
             }
         };
-        let difference =
-            (instance.value("temp")? + instance.value("dtemp")?) - model.value("tnom")?;
+        let difference = temperature.difference(model.value("tnom")?);
         let pick = |keyword: &str| -> SpiceResult<Real> {
             if instance.given(keyword) {
                 instance.value(keyword)
@@ -447,9 +407,12 @@ impl SensitivityKernel for ReactiveSensitivity<'_> {
                 model.value(keyword)
             }
         };
-        let (tc1, tc2) = (pick("tc1")?, pick("tc2")?);
-        let factor = reactive_temperature_factor(tc1, tc2, difference);
-        let value = base * factor * instance.value("scale")?;
+        let coefficients = Coefficients {
+            linear: pick("tc1")?,
+            quadratic: pick("tc2")?,
+        };
+        let factor = coefficients.reactive(difference);
+        let value = scaled(base, factor, instance.value("scale")?);
         match self.kind {
             ReactiveKind::Capacitor => instance.store("capac", value),
             ReactiveKind::Inductor => instance.store("induct", value),
@@ -535,24 +498,18 @@ impl Device for ReactiveStandIn {
 
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         match self.kind {
-            // capacld.c: `m * (CKTomega * CAPcapac)` into the four elements.
-            ReactiveKind::Capacitor => {
-                let [p, n] = self.terminals;
-                let terms = [self.value];
-                context.scaled_dynamic_sum(p, p, &terms, self.m)?;
-                context.scaled_dynamic_sum(n, n, &terms, self.m)?;
-                context.scaled_dynamic_sum(p, n, &terms, -self.m)?;
-                context.scaled_dynamic_sum(n, p, &terms, -self.m)
-            }
-            // indacld.c: `-= CKTomega * INDinduct / m` on the branch diagonal.
-            ReactiveKind::Inductor => {
-                let branch = context.branch(self.terminals)?;
-                context.dynamic_group(branch, branch, &[self.value], -1., self.m)?;
-                for term in context.mutual {
-                    context.system.e.add(branch, term.row, -term.inductance)?;
-                }
-                Ok(())
-            }
+            ReactiveKind::Capacitor => crate::devices::rlc::assemble_capacitor_ac(
+                self.terminals,
+                self.value,
+                self.m,
+                context,
+            ),
+            ReactiveKind::Inductor => crate::devices::rlc::assemble_inductor_ac(
+                self.terminals,
+                self.value,
+                self.m,
+                context,
+            ),
         }
     }
 }

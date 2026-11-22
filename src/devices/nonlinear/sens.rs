@@ -15,7 +15,9 @@
 //! it leaves it on for every later parameter of the model).
 
 use super::thermal::TemperatureCache;
-use super::{Diode, DiodeParameters, EPSMIN};
+use super::{
+    Diode, DiodeGeometry, DiodeInstanceParameters, DiodeParameters, DiodeSetup, EPSMIN, default_eg,
+};
 use crate::devices::sensitivity::{
     AcReset, CELSIUS_TO_KELVIN, ParameterScope, RecordPair, ResetStamp, ResetStamps,
     SensitivityFamily, SensitivityKernel, SensitivityLoad, SensitivityMode,
@@ -181,6 +183,14 @@ fn port_name(keyword: &str) -> &str {
     }
 }
 
+fn record_key(keyword: &str) -> &str {
+    match keyword {
+        "cjsw" => "cjp",
+        "vjsw" => "php",
+        other => other,
+    }
+}
+
 /// A diode's `.sens` description.
 #[derive(Debug)]
 pub(in crate::devices) struct DiodeSensitivity<'a> {
@@ -213,28 +223,31 @@ fn setup_diode_instance(
     instance: &mut SensitivityRecord,
 ) -> SpiceResult<()> {
     let geometry = instance.given("w") || instance.given("l");
-    if !instance.given("area") {
-        let area = if geometry { 1. } else { model.value("area")? };
-        instance.store("area", area)?;
-    }
-    if !instance.given("pj") {
-        let pj = if geometry { 0. } else { model.value("pj")? };
-        instance.store("pj", pj)?;
-    }
-    if !instance.given("m") || instance.value("m")? <= 0. {
-        instance.store("m", 1.)?;
-    }
-    if instance.value("area")? <= 0. {
-        instance.store("area", 1.)?;
-    }
-    let (area, pj, m) = (
-        instance.value("area")?,
-        instance.value("pj")?,
-        instance.value("m")?,
+    let supplied = |key| -> SpiceResult<Option<Real>> {
+        instance.given(key).then(|| instance.value(key)).transpose()
+    };
+    let defaults = if geometry {
+        [1., 0.]
+    } else {
+        [model.value("area")?, model.value("pj")?]
+    };
+    let geometry =
+        DiodeGeometry::setup(supplied("area")?, supplied("pj")?, supplied("m")?, defaults);
+    instance.store("area", geometry.area)?;
+    instance.store("pj", geometry.perimeter)?;
+    instance.store("m", geometry.multiplier)?;
+    let knees = DiodeSetup::scale_knees(
+        [
+            model.value("ikf")?,
+            model.value("ikr")?,
+            model.value("ikp")?,
+        ],
+        geometry,
     );
-    instance.store("ikf", model.value("ikf")? * area * m)?;
-    instance.store("ikr", model.value("ikr")? * area * m)?;
-    instance.store("ikp", model.value("ikp")? * pj * m)
+    for (key, value) in ["ikf", "ikr", "ikp"].into_iter().zip(knees) {
+        instance.store(key, value)?;
+    }
+    Ok(())
 }
 
 impl SensitivityKernel for DiodeSensitivity<'_> {
@@ -255,12 +268,15 @@ impl SensitivityKernel for DiodeSensitivity<'_> {
     }
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
-        let (m, i) = &*self.diode.written;
+        let m = &self.diode.written_model;
+        let i = self.diode.parameters.instance;
         let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for keyword in MODEL_FIELDS {
             let value = written(m, port_name(keyword));
             let value = match (*keyword, value) {
                 ("tnom", Some(celsius)) => Some(celsius + CELSIUS_TO_KELVIN),
+                ("tlev", Some(_)) => Some(Real::from(self.diode.parameters.model.tlev)),
+                ("tlevc", Some(_)) => Some(Real::from(self.diode.parameters.model.tlevc)),
                 (_, value) => value,
             };
             model = model.with(keyword, value.unwrap_or(0.), value.is_some())?;
@@ -268,10 +284,15 @@ impl SensitivityKernel for DiodeSensitivity<'_> {
         let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
         for keyword in INSTANCE_FIELDS {
             let value = match *keyword {
-                "ikf" | "ikr" | "ikp" => None,
                 "ic" => self.diode.initial.values.first().copied().flatten(),
-                "temp" => written(i, "temp").map(|t| t + CELSIUS_TO_KELVIN),
-                other => written(i, other),
+                "temp" => i.temperature,
+                "dtemp" => i.dtemp,
+                "area" => i.geometry_given[0].then_some(i.geometry.area),
+                "pj" => i.geometry_given[1].then_some(i.geometry.perimeter),
+                "m" => i.geometry_given[2].then_some(i.geometry.multiplier),
+                "w" => i.width,
+                "l" => i.length,
+                _ => None,
             };
             instance = instance.with(keyword, value.unwrap_or(0.), value.is_some())?;
         }
@@ -321,27 +342,10 @@ impl SensitivityKernel for DiodeSensitivity<'_> {
         model: &mut SensitivityRecord,
         instance: &mut SensitivityRecord,
     ) -> SpiceResult<()> {
-        for (keyword, value) in [
-            ("n", 1.),
-            ("is", 1e-14),
-            ("jsw", 0.),
-            ("ns", 1.),
-            ("ibv", 1e-3),
-            ("vj", 1.),
-            ("m", 0.5),
-            ("tm1", 0.),
-            ("tm2", 0.),
-            ("fc", 0.5),
-            ("fcs", 0.5),
-            ("tt", 0.),
-            ("ttt1", 0.),
-            ("ttt2", 0.),
-            ("cjo", 0.),
-            ("cjp", 0.),
-            ("php", 1.),
-            ("mjsw", 0.33),
-        ] {
-            default(model, keyword, value)?;
+        for parameter in super::MODEL.parameters {
+            if let Some(value) = parameter.default {
+                default(model, record_key(parameter.name), value)?;
+            }
         }
         for knee in ["ikf", "ikr", "ikp"] {
             if model.given(knee) && model.value(knee)? < EPSMIN {
@@ -352,34 +356,18 @@ impl SensitivityKernel for DiodeSensitivity<'_> {
         default(model, "nbv", n)?;
         default(model, "tlev", 0.)?;
         default(model, "tlevc", 0.)?;
-        let eg = if matches!(model.value("tlev")?, 2.) {
-            1.16
+        let tlev = if matches!(model.value("tlev")?, 2.) {
+            2
         } else {
-            1.11
+            0
         };
+        default(model, "eg", default_eg(tlev))?;
+        // Disabled physics still has C ask/set defaults in the sensitivity table.
         for (keyword, value) in [
-            ("eg", eg),
-            ("gap1", 7.02e-4),
-            ("gap2", 1108.),
-            ("xti", 3.),
-            ("cta", 0.),
-            ("ctp", 0.),
-            ("tpb", 0.),
-            ("tphp", 0.),
-            ("kf", 0.),
-            ("af", 1.),
-            ("trs", 0.),
-            ("trs2", 0.),
-            ("tcv", 0.),
-            ("area", 1.),
-            ("pj", 0.),
+            ("isr", 1e-14),
+            ("jsw", 0.),
             ("jtun", 0.),
             ("jtunsw", 0.),
-            ("ntun", 30.),
-            ("xtitun", 3.),
-            ("keg", 1.),
-            ("nr", 2.),
-            ("isr", 1e-14),
             ("vp", 0.),
             ("lm", 0.),
             ("lp", 0.),
@@ -401,11 +389,7 @@ impl SensitivityKernel for DiodeSensitivity<'_> {
         }
         default(model, "tnom", self.nominal_kelvin)?;
         let rs = model.value("rs")?;
-        let conductance = if model.given("rs") && rs != 0. {
-            1. / rs
-        } else {
-            0.
-        };
+        let conductance = DiodeSetup::conductance(if model.given("rs") { rs } else { 0. });
         model.store("conductance", conductance)?;
         setup_diode_instance(model, instance)
     }
@@ -462,93 +446,41 @@ impl DiodeSensitivity<'_> {
     /// The port's diode with the records' parameters.
     fn diode(&self, current: RecordPair<'_>) -> SpiceResult<Diode> {
         let (m, i) = (current.model, current.instance);
-        let given = |keyword: &str| -> SpiceResult<Option<Real>> {
-            model_given(m, keyword)
-                .then(|| m.value(keyword))
-                .transpose()
+        let selector = |key: &str, max: u8| -> SpiceResult<u8> {
+            let value = m.value(key)?;
+            crate::primitives::c_integer(value)
+                .and_then(|rounded| u8::try_from(rounded).ok())
+                .filter(|&rounded| rounded <= max)
+                .ok_or_else(|| SpiceError::circuit(format!("diode {key}={value} in .sens")))
         };
-        let selector = |keyword: &str| -> SpiceResult<u8> {
-            let value = m.value(keyword)?;
-            match value {
-                0. => Ok(0),
-                1. => Ok(1),
-                2. => Ok(2),
-                _ => Err(SpiceError::circuit(format!(
-                    "diode {keyword}={value} in .sens"
-                ))),
-            }
-        };
-        let (area, pj, multiplier) = (i.value("area")?, i.value("pj")?, i.value("m")?);
-        let conductance = m.value("conductance")?;
-        // The instance knee currents of the last setup, scaled back for the
-        // port's `knee * area * m` (`m` and `area` may have moved since).
-        let knee = |keyword: &str, scale: Real| -> SpiceResult<Option<Real>> {
-            Ok(m.given(keyword)
-                .then(|| i.value(keyword))
-                .transpose()?
-                .map(|k| k / scale))
-        };
-        let parameters = DiodeParameters {
-            is: m.value("is")?,
-            jsw: given("jsw")?,
-            n: m.value("n")?,
-            ns: m.value("ns")?,
-            ns_given: m.given("ns"),
-            // diosetup.c alone derives 1/RS; diotemp.c divides by the TRS
-            // factor only when RS is (still) given and non-zero.
-            rs: if conductance != 0. && m.given("rs") && m.value("rs")? != 0. {
-                1. / conductance
-            } else {
-                0.
+        let instance = DiodeInstanceParameters {
+            geometry: DiodeGeometry {
+                area: i.value("area")?,
+                perimeter: i.value("pj")?,
+                multiplier: i.value("m")?,
             },
-            trs1: m.value("trs")?,
-            trs2: m.value("trs2")?,
-            tt: m.value("tt")?,
-            ttt1: m.value("ttt1")?,
-            ttt2: m.value("ttt2")?,
-            cjo: m.value("cjo")?,
-            vj: m.value("vj")?,
-            grading: m.value("m")?,
-            tm1: m.value("tm1")?,
-            tm2: m.value("tm2")?,
-            fc: m.value("fc")?,
-            cjsw: m.value("cjp")?,
-            vjsw: m.value("php")?,
-            mjsw: m.value("mjsw")?,
-            fcs: m.value("fcs")?,
-            bv: given("bv")?,
-            ibv: m.value("ibv")?,
-            nbv: m.value("nbv")?,
-            tcv: m.value("tcv")?,
-            tlev: selector("tlev")?,
-            tlevc: selector("tlevc")?,
-            eg: m.value("eg")?,
-            gap1: m.value("gap1")?,
-            gap2: m.value("gap2")?,
-            xti: m.value("xti")?,
-            cta: m.value("cta")?,
-            ctp: m.value("ctp")?,
-            tpb: m.value("tpb")?,
-            tphp: m.value("tphp")?,
-            isr: given("isr")?,
-            nr: m.value("nr")?,
-            ikf: knee("ikf", area * multiplier)?,
-            ikr: knee("ikr", area * multiplier)?,
-            ikp: knee("ikp", pj * multiplier)?,
-            jtun: given("jtun")?,
-            jtunsw: given("jtunsw")?,
-            ntun: m.value("ntun")?,
-            xtitun: m.value("xtitun")?,
-            keg: m.value("keg")?,
-            area,
-            perimeter: pj,
-            multiplier,
-            temperature: Some(i.value("temp")? - CELSIUS_TO_KELVIN),
-            dtemp: 0.,
-            nominal: Some(m.value("tnom")? - CELSIUS_TO_KELVIN),
-            kf: m.value("kf")?,
-            af: m.value("af")?,
+            geometry_given: ["area", "pj", "m"].map(|key| i.given(key)),
+            temperature: Some(i.value("temp")?),
+            dtemp: None,
+            width: i.given("w").then(|| i.value("w")).transpose()?,
+            length: i.given("l").then(|| i.value("l")).transpose()?,
         };
+        let parameters = DiodeParameters::from_defaulted_model(
+            |key| m.value(record_key(key)),
+            |key| {
+                m.given(record_key(key))
+                    .then(|| m.value(record_key(key)))
+                    .transpose()
+            },
+            [selector("tlev", 2)?, selector("tlevc", 1)?],
+            instance,
+            DiodeSetup {
+                conductance: m.value("conductance")?,
+                knees: [i.value("ikf")?, i.value("ikr")?, i.value("ikp")?],
+            },
+            ["ikf", "ikr", "ikp"].map(|key| m.given(key)),
+            Some(m.value("tnom")?),
+        )?;
         parameters.check(&self.diode.location)?;
         Ok(Diode {
             name: self.diode.name.clone(),
@@ -559,7 +491,7 @@ impl DiodeSensitivity<'_> {
             derived: TemperatureCache::new(),
             initial: self.diode.initial.clone(),
             location: self.diode.location.clone(),
-            written: self.diode.written.clone(),
+            written_model: self.diode.written_model.clone(),
             lenient: true,
         })
     }
@@ -600,11 +532,7 @@ impl Device for ResetDiode {
     /// imaginary parts are zero).
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         let model = context.model_context;
-        let gspr = if self.current.parameters.rs > 0. {
-            self.current.thermal(model)?.conductance
-        } else {
-            0.
-        };
+        let gspr = self.current.thermal(model)?.conductance;
         let geq = self
             .state
             .thermal(model)?
@@ -636,7 +564,204 @@ impl Device for ResetDiode {
     }
 }
 
-/// A model field's *given* flag, with the knees' flag as `DIOsetup` left it.
-fn model_given(model: &SensitivityRecord, keyword: &str) -> bool {
-    model.given(keyword)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::{ModelContext, initial::InstanceInitial};
+    use crate::primitives::{NodeTable, SourceLoc};
+    use std::path::PathBuf;
+
+    fn diode(model: &[(&str, Real)], instance: &[(&str, Real)], context: &ModelContext) -> Diode {
+        let location = SourceLoc::new(PathBuf::from("diode-setup.cir"), 1, 1);
+        let m = super::super::MODEL
+            .validate_numeric(
+                model.iter().map(|&(key, value)| (key, value, &location)),
+                &location,
+            )
+            .unwrap();
+        let i = super::super::INSTANCE
+            .validate_numeric(
+                instance.iter().map(|&(key, value)| (key, value, &location)),
+                &location,
+            )
+            .unwrap();
+        let input = super::super::DiodeInput::prepare(
+            "d1",
+            "dm",
+            &location,
+            m,
+            &i,
+            InstanceInitial {
+                off: false,
+                values: vec![None],
+            },
+            context,
+        )
+        .unwrap();
+        NodeTable::new()
+            .transaction(|nodes| {
+                let anode = nodes.intern("a")?;
+                input.bind(nodes, [anode, NodeId::GROUND])
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn swept_instance_preserves_given_flags_without_mutating_original() {
+        let context = ModelContext::new(27., 27.);
+        let original = diode(&[("area", 2.)], &[], &context);
+        let swept = original
+            .with_instance_parameter("area", 3., &context)
+            .unwrap();
+        let swept = swept
+            .with_instance_parameter("dtemp", 0., &context)
+            .unwrap();
+        let (_, before) = original.sensitivity(&context).unwrap().records().unwrap();
+        let (_, after) = swept.sensitivity(&context).unwrap().records().unwrap();
+        assert!(!before.given("area"));
+        assert!(!before.given("dtemp"));
+        assert!(after.given("area"));
+        assert!(after.given("dtemp"));
+        assert_eq!(before.value("area").unwrap().to_bits(), 2_f64.to_bits());
+        assert_eq!(after.value("area").unwrap().to_bits(), 3_f64.to_bits());
+        assert_eq!(after.value("dtemp").unwrap().to_bits(), 0_f64.to_bits());
+    }
+
+    #[test]
+    fn setup_quantities_are_not_reconstructed_during_replay() {
+        let context = ModelContext::new(79., 27.);
+        let diode = diode(
+            &[
+                ("rs", 7.3),
+                ("trs", 0.003),
+                ("ikf", 1.37e-3),
+                ("ikr", 2.19e-3),
+                ("ikp", 1.23e-4),
+                ("area", 2.3),
+                ("pj", 1.2),
+                ("n", 1.3),
+                ("tlev", 1.7),
+                ("tlevc", 0.7),
+            ],
+            &[("area", 3.7), ("pj", 0.), ("m", 2.1), ("dtemp", 0.13)],
+            &context,
+        );
+        let kernel = DiodeSensitivity::new(&diode, &context);
+        let (mut model, mut instance) = kernel.records().unwrap();
+        let ordinary = diode.thermal(&context).unwrap();
+        let replay = kernel
+            .diode(RecordPair {
+                model: &model,
+                instance: &instance,
+            })
+            .unwrap();
+        let original = replay.thermal(&context).unwrap();
+        assert_eq!(ordinary.vt.to_bits(), original.vt.to_bits());
+        assert_eq!(ordinary.csat.to_bits(), original.csat.to_bits());
+        assert_eq!(
+            ordinary.conductance.to_bits(),
+            original.conductance.to_bits()
+        );
+        for (ordinary, replay) in [
+            (ordinary.ikf, original.ikf),
+            (ordinary.ikr, original.ikr),
+            (ordinary.ikp, original.ikp),
+        ] {
+            assert_eq!(ordinary.map(Real::to_bits), replay.map(Real::to_bits));
+        }
+        assert_eq!(original.ikp.map(Real::to_bits), Some(0_f64.to_bits()));
+        assert_eq!(replay.parameters.model.tlev, 2);
+        assert_eq!(replay.parameters.model.tlevc, 1);
+        assert_eq!(replay.parameters.model.nbv.to_bits(), 1.3_f64.to_bits());
+        assert_eq!(replay.parameters.model.eg.to_bits(), 1.16_f64.to_bits());
+        let saved = replay.parameters.setup;
+        for (scope, keyword, value) in [
+            (ParameterScope::Model, "rs", 0.),
+            (ParameterScope::Model, "ikf", 0.1),
+            (ParameterScope::Instance, "area", 2.7),
+            (ParameterScope::Instance, "pj", 1.4),
+            (ParameterScope::Instance, "m", 4.1),
+        ] {
+            kernel
+                .set(scope, keyword, value, &mut model, &mut instance)
+                .unwrap();
+        }
+        kernel.temperature(&mut model, &mut instance).unwrap();
+        let changed = kernel
+            .diode(RecordPair {
+                model: &model,
+                instance: &instance,
+            })
+            .unwrap();
+        let thermal = changed.thermal(&context).unwrap();
+        assert_eq!(
+            changed.parameters.setup.conductance.to_bits(),
+            saved.conductance.to_bits()
+        );
+        assert_eq!(
+            changed.parameters.setup.knees.map(Real::to_bits),
+            saved.knees.map(Real::to_bits)
+        );
+        // When RS is set to zero, C skips the temperature divisor but retains
+        // DIOconductance from the last setup. Geometry is temperature-time.
+        assert_eq!(
+            thermal.conductance.to_bits(),
+            (saved.conductance * 2.7 * 4.1).to_bits()
+        );
+        assert_eq!(
+            thermal.ikf.map(Real::to_bits),
+            Some(saved.knees[0].to_bits())
+        );
+        assert_eq!(thermal.ikp.map(Real::to_bits), Some(0_f64.to_bits()));
+
+        kernel.setup(&mut model, &mut instance).unwrap();
+        kernel.temperature(&mut model, &mut instance).unwrap();
+        let refreshed = kernel
+            .diode(RecordPair {
+                model: &model,
+                instance: &instance,
+            })
+            .unwrap();
+        assert_eq!(
+            refreshed.parameters.setup.conductance.to_bits(),
+            0_f64.to_bits()
+        );
+        assert_eq!(
+            refreshed.parameters.setup.knees[0].to_bits(),
+            (0.1_f64 * 2.7 * 4.1).to_bits()
+        );
+        assert_eq!(
+            refreshed.parameters.setup.knees[2].to_bits(),
+            (1.23e-4_f64 * 1.4 * 4.1).to_bits()
+        );
+    }
+
+    #[test]
+    fn setup_floor_and_disabled_knee_keep_distinct_given_state() {
+        let context = ModelContext::default();
+        let diode = diode(
+            &[("is", 1e-30), ("ikf", 1e-30)],
+            &[("area", 2.), ("m", 3.)],
+            &context,
+        );
+        let kernel = DiodeSensitivity::new(&diode, &context);
+        let (mut model, mut instance) = kernel.records().unwrap();
+        assert_eq!(model.value("is").unwrap().to_bits(), EPSMIN.to_bits());
+        assert!(!model.given("ikf"));
+        let saved = instance.value("ikf").unwrap();
+        assert_eq!(saved.to_bits(), (1e-30_f64 * 2. * 3.).to_bits());
+        kernel
+            .set(ParameterScope::Model, "ikf", 0.1, &mut model, &mut instance)
+            .unwrap();
+        let replay = kernel
+            .diode(RecordPair {
+                model: &model,
+                instance: &instance,
+            })
+            .unwrap();
+        assert_eq!(
+            replay.thermal(&context).unwrap().ikf.map(Real::to_bits),
+            Some(saved.to_bits())
+        );
+    }
 }
