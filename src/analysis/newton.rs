@@ -46,7 +46,7 @@ pub const SKIP_DIRECT_KEY: &str = "noopiter";
 
 /// Request key of the ngspice schedule's adaptation base, C's raw
 /// `CKTdcTrcvMaxIter` (deck `itl2` as written, default 50;
-/// [`crate::analysis::bias::NgspiceStepping::adapt_iterations`]).
+/// [`crate::analysis::bias::NgspiceStepping::adapt_iterations()`]).
 pub const ADAPT_ITERATIONS_KEY: &str = "adaptiter";
 
 /// Select how Newton iterations limit voltage changes.

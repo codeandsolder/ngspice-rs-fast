@@ -377,7 +377,13 @@ fn stage_iteration_limit_is_separate_from_the_direct_limit() {
     ))
     .unwrap();
     assert_eq!(settings.newton.max_iterations, 3);
-    assert_eq!(settings.continuation.stage_max_iterations, Some(40));
+    assert_eq!(
+        settings
+            .continuation
+            .stage_max_iterations
+            .map(ngspice_rs::analysis::bias::IterationLimit::get),
+        Some(40)
+    );
     let context = AnalysisContext::default().model_context();
     let solved = solve_dc_with(&circuit, &context, &settings, &[], None, None).unwrap();
     let stages = &solved.report.stages;
