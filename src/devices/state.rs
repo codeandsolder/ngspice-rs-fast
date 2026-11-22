@@ -174,14 +174,13 @@ impl StateHistory {
             .cloned()
     }
 
-    /// The same history with an empty [`DelayHistory`] of `width` values per
-    /// sample for each `(device ordinal, width)`.
+    /// The same state history with model-specific delay histories.
     #[must_use]
-    pub fn with_delay_lines(mut self, lines: impl IntoIterator<Item = (usize, usize)>) -> Self {
-        self.delays = lines
-            .into_iter()
-            .map(|(device, width)| (device, DelayHistory::new(width)))
-            .collect();
+    pub fn with_delay_lines(
+        mut self,
+        lines: impl IntoIterator<Item = (usize, DelayHistory)>,
+    ) -> Self {
+        self.delays = lines.into_iter().collect();
         self
     }
 
@@ -247,7 +246,7 @@ impl StateHistory {
         }
         Ok(updates
             .into_iter()
-            .flat_map(|(_, update)| update.breakpoints)
+            .flat_map(|(_, update)| update.into_breakpoints())
             .collect())
     }
 
@@ -972,9 +971,12 @@ mod tests {
 
     #[test]
     fn duplicate_delay_updates_never_commit_fixed_or_delay_state() {
-        use crate::devices::delay::DelayUpdate;
+        use crate::devices::delay::{DelayHistory, DelayUpdate, WaveformUpdate};
 
-        let mut history = StateHistory::new(1).with_delay_lines([(0, 1), (1, 1)]);
+        let mut history = StateHistory::new(1).with_delay_lines([
+            (0, DelayHistory::waveform(1)),
+            (1, DelayHistory::waveform(1)),
+        ]);
         let mut trial = history.trial();
         history
             .device(&mut trial, 0..1)
@@ -982,10 +984,12 @@ mod tests {
             .set(0, 42.)
             .unwrap();
         let original = history.clone();
-        let update = |time, breakpoint| DelayUpdate {
-            append: Some((time, vec![time])),
-            breakpoints: vec![breakpoint],
-            ..DelayUpdate::default()
+        let update = |time, breakpoint| {
+            DelayUpdate::Waveform(WaveformUpdate {
+                append: Some((time, vec![time])),
+                breakpoints: vec![breakpoint],
+                ..WaveformUpdate::default()
+            })
         };
         let mut hook_ran = false;
         let error = history
@@ -1019,7 +1023,15 @@ mod tests {
         assert_eq!(breaks, vec![4., 3.]);
         assert_eq!(history.accepted(1), Some(&[42.][..]));
         for device in [0, 1] {
-            assert_eq!(history.delay(device).unwrap().last_time(), Some(1.));
+            assert_eq!(
+                history
+                    .delay(device)
+                    .unwrap()
+                    .as_waveform()
+                    .unwrap()
+                    .last_time(),
+                Some(1.)
+            );
         }
     }
 

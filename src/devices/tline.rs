@@ -49,7 +49,9 @@
 //! then has coincident times and skips the source load), nonfinite values,
 //! and a leading positional value (C ignores it silently).
 
-use crate::devices::delay::{DelayContext, DelayHistory, DelayLine, DelayUpdate};
+use crate::devices::delay::{
+    DelayContext, DelayHistory, DelayLine, DelayUpdate, WaveformHistory, WaveformUpdate,
+};
 use crate::devices::linear::LinearContext;
 use crate::devices::traits::{AnalysisMode, Device, StampContext};
 use crate::maths::Vector;
@@ -395,7 +397,7 @@ impl TransmissionLine {
     /// quadratically through the history samples `i-2, i-1, i` where `i` is
     /// the first sample (from the third on) later than `time - TD`, or the
     /// last one (extrapolation).
-    fn delayed(&self, history: &DelayHistory, time: Real) -> SpiceResult<[Real; 2]> {
+    fn delayed(&self, history: &WaveformHistory, time: Real) -> SpiceResult<[Real; 2]> {
         let size = history
             .len()
             .checked_sub(1)
@@ -592,7 +594,7 @@ impl Device for TransmissionLine {
                         self.name
                     ))
                 })?;
-                let [input1, input2] = self.delayed(history, time)?;
+                let [input1, input2] = self.delayed(history.as_waveform()?, time)?;
                 context.stamp_rhs(self.ibr1(), input1)?;
                 context.stamp_rhs(self.ibr2(), input2)?;
             }
@@ -650,8 +652,8 @@ impl Device for TransmissionLine {
 }
 
 impl DelayLine for TransmissionLine {
-    fn width(&self) -> usize {
-        2
+    fn new_history(&self) -> DelayHistory {
+        DelayHistory::waveform(2)
     }
 
     fn start(&self, context: &DelayContext<'_>) -> SpiceResult<DelayUpdate> {
@@ -665,14 +667,14 @@ impl DelayLine for TransmissionLine {
             self.waves(context)
         };
         // traload.c MODEINITTRAN: three equal samples at -2TD, -TD and 0.
-        Ok(DelayUpdate {
+        Ok(DelayUpdate::Waveform(WaveformUpdate {
             reset: Some(vec![
                 (-2. * self.td, wave.to_vec()),
                 (-self.td, wave.to_vec()),
                 (0., wave.to_vec()),
             ]),
-            ..DelayUpdate::default()
-        })
+            ..WaveformUpdate::default()
+        }))
     }
 
     /// `traacct.c` (the `#else` branch C compiles).
@@ -681,6 +683,7 @@ impl DelayLine for TransmissionLine {
         history: &DelayHistory,
         context: &DelayContext<'_>,
     ) -> SpiceResult<DelayUpdate> {
+        let history = history.as_waveform()?;
         let time = context.time;
         let size = history
             .len()
@@ -692,7 +695,7 @@ impl DelayLine for TransmissionLine {
         let at = |index: usize| history.time(index).unwrap_or(Real::NAN);
         let value =
             |index: usize, component: usize| history.value(index, component).unwrap_or(Real::NAN);
-        let mut update = DelayUpdate::default();
+        let mut update = WaveformUpdate::default();
         // Shift out samples no later interpolation can reach, keeping two
         // before the first one at or after `time - TD`.
         if time - self.td > at(2) {
@@ -721,7 +724,7 @@ impl DelayLine for TransmissionLine {
                 }
             }
         }
-        Ok(update)
+        Ok(DelayUpdate::Waveform(update))
     }
 
     /// `tratrunc.c`, with C's step indices (`CKTdeltaOld[1]` and `[2]`, the
@@ -731,6 +734,7 @@ impl DelayLine for TransmissionLine {
         history: &DelayHistory,
         context: &DelayContext<'_>,
     ) -> SpiceResult<Option<Real>> {
+        let history = history.as_waveform()?;
         let size = history
             .len()
             .checked_sub(1)
