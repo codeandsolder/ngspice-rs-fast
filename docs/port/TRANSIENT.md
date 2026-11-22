@@ -157,7 +157,13 @@ negative terminal along rooted forest links, preserving each reference
 addition/subtraction and visiting only that path. Connecting two components
 re-roots only the smaller component; redundant checks allocate no full-size
 potential vector. Scratch is reused. A weighted union-find would change
-rounding: an `.ic` that disagrees beyond
+rounding. In the opt-in `redundant_constraint_graph_benchmark` (Acer,
+optimized test profile, 2026-11-22), 9,999 adjacent redundant checks on
+a 10,001-vertex forest took 23.77 ms instead of 5.912 s for full DFS;
+19,998 path vertices versus 99,999,999 full traversal vertices. The ordinary
+rounding test compares all 8,192 ordered endpoint pairs in two insertion
+orders against the previous DFS. These local identity types do not preempt
+the wider MNA row API changes proposed in upstream issue #198. In particular, an `.ic` that disagrees beyond
 `reltol`/`vntol`, or two entries on rigidly tied nodes, is an explicit error
 instead of C's meaningless `1e10` compromise (`i(v1) = -1e10`). A node with
 only capacitors (no DC point) becomes solvable through its `.ic`.
