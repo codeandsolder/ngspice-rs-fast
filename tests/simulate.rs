@@ -2011,3 +2011,56 @@ fn a_streamed_transient_that_fails_publishes_nothing_and_leaves_no_spool() {
     }
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn concurrent_simulations_to_one_destination_publish_complete_runs() {
+    let dir = scratch("concurrent-publish");
+    let output = dir.join("same.raw");
+    let first = dir.join("first.cir");
+    let second = dir.join("second.cir");
+    fs::write(
+        &first,
+        "first\nv1 in 0 dc 1\nr1 in out 1k\nc1 out 0 1u\n.op\n.tran 0.1m 1m\n.end\n",
+    )
+    .unwrap();
+    fs::write(
+        &second,
+        "second\nv1 in 0 dc 2\nr1 in out 1k\nc1 out 0 1u\n.op\n.tran 0.1m 1m\n.end\n",
+    )
+    .unwrap();
+    fs::write(&output, "PREVIOUS").unwrap();
+    let barrier = std::sync::Barrier::new(6);
+    std::thread::scope(|scope| {
+        let mut runs = Vec::new();
+        for i in 0..6 {
+            let deck = if i % 2 == 0 { &first } else { &second };
+            let output = &output;
+            let barrier = &barrier;
+            runs.push(scope.spawn(move || {
+                barrier.wait();
+                simulate(output, deck)
+            }));
+        }
+        for run in runs {
+            let run = run.join().unwrap();
+            assert!(run.status.success(), "{}", stderr(&run));
+        }
+    });
+    let written = RawFile::load(&output).unwrap();
+    assert_eq!(written.len(), 2);
+    let title = &written.plots[0].title;
+    let voltage = match title.as_str() {
+        "first" => 1.,
+        "second" => 2.,
+        other => panic!("unexpected title {other}"),
+    };
+    for raw in &written.plots {
+        assert_eq!(&raw.title, title);
+        assert!(raw.plot.point_count() > 0);
+        for value in raw.plot.column("v(in)").unwrap() {
+            assert!((value.re - voltage).abs() < 1e-12);
+        }
+    }
+    assert_eq!(entries(&dir), ["first.cir", "same.raw", "second.cir"]);
+    fs::remove_dir_all(&dir).unwrap();
+}

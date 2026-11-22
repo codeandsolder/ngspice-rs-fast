@@ -335,3 +335,39 @@ fn a_streamed_binary_plot_cannot_cross_byte_orders() {
     assert_eq!(fs::metadata(dir.join("dest.raw")).unwrap().len(), 0);
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn atomic_transaction_matches_stored_and_streamed_encodings() {
+    use ngspice_rs::analysis::RawFileTransaction;
+
+    let dir = scratch("transaction-encodings");
+    let rawfile = sample_plots();
+    let output = dir.join("out.raw");
+    for (format, order) in [
+        (RawFormat::Ascii, BinaryByteOrder::LittleEndian),
+        (RawFormat::Binary, BinaryByteOrder::LittleEndian),
+        (RawFormat::Binary, BinaryByteOrder::BigEndian),
+    ] {
+        fs::write(&output, "PREVIOUS").unwrap();
+        let mut transaction = RawFileTransaction::create(&output, format, order).unwrap();
+        transaction.write_plot(&rawfile.plots[0]).unwrap();
+        for raw in &rawfile.plots[1..] {
+            transaction.begin_plot(raw.clone()).unwrap();
+            for row in raw.plot.points() {
+                transaction.push_point(row).unwrap();
+            }
+            let completed = transaction.finish_plot().unwrap();
+            assert_eq!(completed.point_count, raw.plot.point_count());
+            assert!(completed.header.plot.points().is_empty());
+        }
+        assert_eq!(fs::read_to_string(&output).unwrap(), "PREVIOUS");
+        transaction.publish().unwrap();
+        let expected = match format {
+            RawFormat::Ascii => rawfile.to_ascii().unwrap().into_bytes(),
+            RawFormat::Binary => rawfile.to_binary_with(order).unwrap(),
+        };
+        assert_eq!(fs::read(&output).unwrap(), expected);
+        assert_eq!(entries(&dir), ["out.raw"]);
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}

@@ -47,8 +47,6 @@
 //! * an unadorned `.tran` runs the companion trap/Gear driver the engine
 //!   defaults to; this command never injects a `backend=`.
 
-use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -58,8 +56,7 @@ use crate::analysis::fourier::{self, FourierAnalysis};
 use crate::analysis::measure::{self, Measurement};
 use crate::analysis::selection::RowProjection;
 use crate::analysis::{
-    BinaryByteOrder, Plot, PointSink, RawFileWriter, RawFormat, RawPlot, RunConfig, StreamedPlot,
-    runner,
+    BinaryByteOrder, Plot, PointSink, RawFileTransaction, RawFormat, RawPlot, RunConfig, runner,
 };
 use crate::netlist::eval::ParamScope;
 use crate::netlist::{ParsedDeck, Parser};
@@ -221,7 +218,7 @@ pub fn run_with_format(
     let date = now_header();
     // Each plot is written as soon as its analysis has finished, into a
     // temporary file that is renamed into place only after the last one.
-    let mut rawfile = PendingRawfile::create(output, format)?;
+    let mut rawfile = RawFileTransaction::create(output, format, BinaryByteOrder::LittleEndian)?;
     let mut plots = Vec::with_capacity(jobs.len());
     for (entry, request, driver) in jobs {
         // Each analysis starts from a freshly elaborated circuit; only what C
@@ -252,8 +249,7 @@ pub fn run_with_format(
                 config: &config,
                 scope: &scope,
                 date: &date,
-                writer: &mut rawfile.writer,
-                spool: &rawfile.spool,
+                writer: &mut rawfile,
             };
             plots.push(output.stream(entry, names[0], &mut circuit, &request, driver.as_ref())?);
             circuit.note_completed(entry.kind);
@@ -276,8 +272,7 @@ pub fn run_with_format(
             config: &config,
             scope: &scope,
             date: &date,
-            writer: &mut rawfile.writer,
-            spool: &rawfile.spool,
+            writer: &mut rawfile,
         }
         .write(entry, produced, names, &mut plots)?;
         circuit.note_completed(entry.kind);
@@ -299,8 +294,7 @@ struct BatchOutput<'a> {
     config: &'a RunConfig,
     scope: &'a ParamScope,
     date: &'a str,
-    writer: &'a mut RawFileWriter,
-    spool: &'a Path,
+    writer: &'a mut RawFileTransaction,
 }
 
 impl BatchOutput<'_> {
@@ -313,29 +307,27 @@ impl BatchOutput<'_> {
         driver: &dyn crate::analysis::Analysis,
     ) -> SpiceResult<PlotReport> {
         let mut sink = RawfileSink {
-            writer: &*self.writer,
-            spool: self.spool,
+            writer: self.writer,
             entry,
             output: &self.parsed.output,
             title: &self.parsed.netlist.title,
             date: self.date,
-            plot: None,
+            selection: None,
         };
         driver.run_into(circuit, request, &self.config.context(), &mut sink)?;
-        let Some((_, streamed)) = sink.plot else {
+        if sink.selection.is_none() {
             return Err(SpiceError::Numerical {
                 context: format!(".{} analysis", entry.kind.as_str()),
                 message: "the driver produced no plot".to_owned(),
             });
-        };
-        let report = PlotReport::written(
+        }
+        let completed = self.writer.finish_plot()?;
+        Ok(PlotReport::written(
             name,
             entry.kind,
-            &streamed.header().plot,
-            streamed.point_count(),
-        );
-        self.writer.finish_plot(streamed)?;
-        Ok(report)
+            &completed.header.plot,
+            completed.point_count,
+        ))
     }
 
     fn write(
@@ -456,19 +448,18 @@ fn raw_format_from_env(value: &str) -> RawFormat {
 /// ([`PointSink::begin`]), which names the same variables as the full plot, so
 /// an unresolvable request fails before the first point.
 struct RawfileSink<'a> {
-    writer: &'a RawFileWriter,
-    spool: &'a Path,
+    writer: &'a mut RawFileTransaction,
     entry: &'a batch::ScheduledAnalysis,
     output: &'a crate::netlist::ast::OutputCards,
     title: &'a str,
     date: &'a str,
-    /// The written selection and the plot, once the driver has begun it.
-    plot: Option<(RowProjection, StreamedPlot)>,
+    /// Bound written selection once the driver has begun its plot.
+    selection: Option<RowProjection>,
 }
 
 impl PointSink for RawfileSink<'_> {
     fn begin(&mut self, header: &Plot) -> SpiceResult<()> {
-        if self.plot.is_some() {
+        if self.selection.is_some() {
             return Err(SpiceError::Numerical {
                 context: format!(".{} analysis", self.entry.kind.as_str()),
                 message: "the driver began a second plot".to_owned(),
@@ -476,19 +467,20 @@ impl PointSink for RawfileSink<'_> {
         }
         let selection = batch::written_selection(header, self.entry, self.output)?;
         let raw_plot = raw_plot_for(self.title, selection.header(header)?, self.date);
-        let streamed = self.writer.begin_plot(raw_plot, self.spool)?;
-        self.plot = Some((selection.bind(header)?, streamed));
+        let projection = selection.bind(header)?;
+        self.writer.begin_plot(raw_plot)?;
+        self.selection = Some(projection);
         Ok(())
     }
 
     fn point(&mut self, values: &[Complex]) -> SpiceResult<()> {
-        let Some((selection, streamed)) = self.plot.as_mut() else {
+        let Some(selection) = self.selection.as_mut() else {
             return Err(SpiceError::Numerical {
                 context: format!(".{} analysis", self.entry.kind.as_str()),
                 message: "the driver produced a point before its plot header".to_owned(),
             });
         };
-        streamed.push_point(selection.project(values)?)
+        self.writer.push_point(selection.project(values)?)
     }
 }
 
@@ -510,122 +502,6 @@ fn raw_plot_for(title: &str, plot: crate::analysis::Plot, date: &str) -> RawPlot
         ),
         plot,
     }
-}
-
-/// The rawfile of one run, written into a temporary file in the destination's
-/// directory.
-///
-/// [`PendingRawfile::publish`] renames the temporary file into place only after
-/// every plot was written, so a failure anywhere in the run cannot leave a
-/// truncated or partial destination, and an existing destination survives
-/// untouched. Dropping it unpublished, which every early error return does,
-/// removes the temporary file; a streamed plot removes its spool file the same
-/// way.
-struct PendingRawfile {
-    writer: RawFileWriter,
-    /// Where a streamed plot spools its points until its point count is known.
-    spool: PathBuf,
-    output: PathBuf,
-    temporary: TemporaryFile,
-}
-
-impl PendingRawfile {
-    /// Creates the temporary file beside `output`.
-    ///
-    /// # Errors
-    ///
-    /// [`SpiceError::Io`] when the destination names no file, when its
-    /// directory is missing, or when the temporary file cannot be created.
-    fn create(output: &Path, format: RawFormat) -> SpiceResult<Self> {
-        let (directory, temporary) = temporary_path(output)?;
-        if !directory.is_dir() {
-            return Err(SpiceError::io(
-                output,
-                &std::io::Error::new(
-                    ErrorKind::NotFound,
-                    format!(
-                        "the output directory {} does not exist or is not a directory",
-                        directory.display()
-                    ),
-                ),
-            ));
-        }
-        let writer = RawFileWriter::create(&temporary, format, BinaryByteOrder::LittleEndian)?;
-        let mut spool = temporary.clone().into_os_string();
-        spool.push(".points");
-        Ok(Self {
-            writer,
-            spool: PathBuf::from(spool),
-            output: output.to_path_buf(),
-            temporary: TemporaryFile {
-                path: temporary,
-                keep: false,
-            },
-        })
-    }
-
-    /// Flushes the rawfile and renames it into place.
-    ///
-    /// # Errors
-    ///
-    /// [`SpiceError::Io`] when the flush or the rename fails; the temporary
-    /// file is removed then.
-    fn publish(self) -> SpiceResult<()> {
-        let Self {
-            writer,
-            output,
-            mut temporary,
-            ..
-        } = self;
-        writer.finish()?;
-        fs::rename(&temporary.path, &output).map_err(|error| SpiceError::io(&output, &error))?;
-        temporary.keep = true;
-        Ok(())
-    }
-}
-
-/// A file removed when dropped, unless it was kept.
-struct TemporaryFile {
-    path: PathBuf,
-    keep: bool,
-}
-
-impl Drop for TemporaryFile {
-    fn drop(&mut self) {
-        if !self.keep {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// The directory `output` lives in and a unique temporary path beside it.
-///
-/// The temporary file must share the destination's directory so that the final
-/// rename stays inside one filesystem and cannot copy a partial file.
-///
-/// # Errors
-///
-/// [`SpiceError::Io`] when `output` names no file (for instance `.` or `/`).
-fn temporary_path(output: &Path) -> SpiceResult<(PathBuf, PathBuf)> {
-    let directory = match output.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let Some(name) = output.file_name() else {
-        return Err(SpiceError::io(
-            output,
-            &std::io::Error::new(ErrorKind::InvalidInput, "the output path names no file"),
-        ));
-    };
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since_epoch| since_epoch.subsec_nanos());
-    let temporary = directory.join(format!(
-        ".{}.spice-rs-{}-{nanos}.tmp",
-        name.to_string_lossy(),
-        std::process::id()
-    ));
-    Ok((directory, temporary))
 }
 
 /// The `Date:` header for a rawfile written now: standard `ctime` spelling
