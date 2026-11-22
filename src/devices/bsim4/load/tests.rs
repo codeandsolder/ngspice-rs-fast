@@ -109,7 +109,7 @@ fn load_event_sequence_and_field_values() {
         ("4.8.1", 1, 1, 2, 1, 0, 496, 0x18d3_cb9c_9da8_6fc1),
         ("4.8.3", 2, 2, 3, 2, 1, 603, 0x1cab_191b_0771_eb2f),
     ] {
-        let mut model = Model {
+        let model = Model {
             version: version.into(),
             versionGiven: true,
             dioMod: diode,
@@ -126,7 +126,7 @@ fn load_event_sequence_and_field_values() {
             acnqsModGiven: true,
             ..Model::default()
         };
-        let mut instance = Instance {
+        let instance = Instance {
             l: 0.5e-6,
             lGiven: true,
             w: 2e-6,
@@ -141,9 +141,12 @@ fn load_event_sequence_and_field_values() {
             sourcePerimeterGiven: true,
             ..super::super::acld::tests::shaped(gate, body, nqs)
         };
-        let mut warnings = Vec::new();
-        set::setup_model(&mut model, 300.15, &mut warnings).unwrap();
-        set::setup_instance(&model, &mut instance, false, &mut warnings).unwrap();
+        let set::PreparedSetup {
+            mut model,
+            mut instance,
+            mut warnings,
+            ..
+        } = set::prepare_model(model, 300.15).prepare_instance(instance, false);
         let size = temp::temperature(
             &mut model,
             &mut instance,

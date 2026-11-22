@@ -48,29 +48,22 @@ fn entries(dir: &Path) -> Vec<String> {
 struct Recorder {
     header: Option<Plot>,
     plots: Vec<Plot>,
-    points: Vec<Vec<Complex>>,
 }
 
 impl PointSink for Recorder {
     fn begin(&mut self, header: &Plot) -> SpiceResult<()> {
         assert!(self.header.is_none(), "begin is called once");
-        assert!(header.points().is_empty(), "the header holds no points");
+        assert!(header.point_count() == 0, "the header holds no points");
         self.header = Some(header.clone());
         Ok(())
     }
 
-    fn point(&mut self, values: Vec<Complex>) -> SpiceResult<()> {
+    fn point(&mut self, values: &[Complex]) -> SpiceResult<()> {
         assert!(self.header.is_some(), "begin precedes the points");
-        self.points.push(values);
-        Ok(())
+        self.header.as_mut().unwrap().push_point(values)
     }
     fn end(&mut self) -> SpiceResult<()> {
-        self.plots.push(
-            self.header
-                .take()
-                .unwrap()
-                .with_points(std::mem::take(&mut self.points))?,
-        );
+        self.plots.push(self.header.take().unwrap());
         Ok(())
     }
 }
@@ -96,15 +89,10 @@ fn assert_streams_the_stored_plot(body: &str) {
     for (streamed, stored) in recorder.plots.iter().zip(stored) {
         assert_eq!(streamed.variables(), stored.variables());
         assert_eq!(streamed.plotname, stored.plotname);
-        assert!(!stored.points().is_empty());
+        assert!(stored.point_count() != 0);
         // Bit-exact row values, including signed zero.
         assert_eq!(streamed.point_count(), stored.point_count());
-        for (a, b) in streamed
-            .points()
-            .iter()
-            .flatten()
-            .zip(stored.points().iter().flatten())
-        {
+        for (a, b) in streamed.rows().flatten().zip(stored.rows().flatten()) {
             assert_eq!(a.re.to_bits(), b.re.to_bits());
             assert_eq!(a.im.to_bits(), b.im.to_bits());
         }
@@ -174,7 +162,7 @@ fn spectral_and_dc_sink_failures_stop_before_completing_a_plot() {
             self.begun += 1;
             Ok(())
         }
-        fn point(&mut self, _values: Vec<Complex>) -> SpiceResult<()> {
+        fn point(&mut self, _values: &[Complex]) -> SpiceResult<()> {
             self.points += 1;
             if self.points == 3 {
                 return Err(SpiceError::circuit("stop on third row"));
@@ -221,7 +209,7 @@ fn a_failed_end_event_does_not_publish_transient_state() {
         fn begin(&mut self, _header: &Plot) -> SpiceResult<()> {
             Ok(())
         }
-        fn point(&mut self, _values: Vec<Complex>) -> SpiceResult<()> {
+        fn point(&mut self, _values: &[Complex]) -> SpiceResult<()> {
             Ok(())
         }
         fn end(&mut self) -> SpiceResult<()> {
@@ -250,7 +238,7 @@ impl PointSink for Refusing {
         Ok(())
     }
 
-    fn point(&mut self, _values: Vec<Complex>) -> SpiceResult<()> {
+    fn point(&mut self, _values: &[Complex]) -> SpiceResult<()> {
         self.0 += 1;
         if self.0 == 3 {
             return Err(SpiceError::Unsupported {
@@ -301,7 +289,7 @@ fn sample_plots() -> RawFile {
     let mut real = real.build();
     for index in 0..5 {
         let t = f64::from(index) * 1e-4;
-        real.push_point(vec![Complex::real(t), Complex::real((-t / 1e-3).exp())])
+        real.push_point(&[Complex::real(t), Complex::real((-t / 1e-3).exp())])
             .unwrap();
     }
     let mut complex = Plot::builder("ac1", "AC Analysis", PlotFlags::Complex);
@@ -311,7 +299,7 @@ fn sample_plots() -> RawFile {
     for index in 0..3 {
         let f = 10f64.powi(index);
         complex
-            .push_point(vec![Complex::real(f), Complex::new(1.0 / f, -0.5 / f)])
+            .push_point(&[Complex::real(f), Complex::new(1.0 / f, -0.5 / f)])
             .unwrap();
     }
     let mut empty = Plot::builder("tran2", "Transient Analysis", PlotFlags::Real);
@@ -349,11 +337,11 @@ fn streamed_and_stored_plots_write_the_same_bytes() {
         writer.write_plot(&rawfile.plots[0]).unwrap();
         for raw_plot in &rawfile.plots[1..] {
             let mut plot = writer.begin_plot(raw_plot.clone(), &spool).unwrap();
-            assert!(plot.header().plot.points().is_empty());
-            for point in raw_plot.plot.points() {
+            assert!(plot.header().plot.point_count() == 0);
+            for point in raw_plot.plot.rows() {
                 plot.push_point(point).unwrap();
             }
-            assert_eq!(plot.point_count(), raw_plot.plot.points().len());
+            assert_eq!(plot.point_count(), raw_plot.plot.point_count());
             writer.finish_plot(plot).unwrap();
             assert!(!spool.exists(), "finishing removes the spool");
         }
@@ -383,7 +371,7 @@ fn streamed_and_stored_plots_write_the_same_bytes() {
         );
         if format.is_binary() {
             for (actual, expected) in parsed.plots.iter().zip(&rawfile.plots) {
-                assert_eq!(actual.plot.points(), expected.plot.points());
+                assert_eq!(actual.plot.cells(), expected.plot.cells());
             }
         }
     }
@@ -443,7 +431,8 @@ fn a_streamed_binary_plot_cannot_cross_byte_orders() {
     )
     .unwrap();
     let mut plot = origin.begin_plot(rawfile.plots[0].clone(), &spool).unwrap();
-    plot.push_point(&rawfile.plots[0].plot.points()[0]).unwrap();
+    plot.push_point(rawfile.plots[0].plot.row(0).unwrap())
+        .unwrap();
     assert!(writer.finish_plot(plot).is_err());
     writer.finish().unwrap();
     origin.finish().unwrap();
@@ -469,12 +458,12 @@ fn atomic_transaction_matches_stored_and_streamed_encodings() {
         transaction.write_plot(&rawfile.plots[0]).unwrap();
         for raw in &rawfile.plots[1..] {
             transaction.begin_plot(raw.clone()).unwrap();
-            for row in raw.plot.points() {
+            for row in raw.plot.rows() {
                 transaction.push_point(row).unwrap();
             }
             let completed = transaction.finish_plot().unwrap();
             assert_eq!(completed.point_count, raw.plot.point_count());
-            assert!(completed.header.plot.points().is_empty());
+            assert!(completed.header.plot.point_count() == 0);
         }
         assert_eq!(fs::read_to_string(&output).unwrap(), "PREVIOUS");
         transaction.publish().unwrap();

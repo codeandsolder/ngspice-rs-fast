@@ -56,9 +56,9 @@ pub enum ModelFamily {
     Npn,
     /// PNP classic BJT.
     Pnp,
-    /// NMOS (classic backends, plus schema-only BSIM3 levels 8/49).
+    /// NMOS (classic, BSIM3 and BSIM4 backends).
     Nmos,
-    /// PMOS (classic backends, plus schema-only BSIM3 levels 8/49).
+    /// PMOS (classic, BSIM3 and BSIM4 backends).
     Pmos,
     /// Voltage-controlled switch (`sw`, `sw/sw.c`).
     Switch,
@@ -133,6 +133,155 @@ impl ModelFamily {
     }
 }
 
+/// Concrete device implementation chosen by the validated model selector.
+/// Different raw selectors may name one implementation (C's `INPdomodel`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModelBackend {
+    /// Scalar resistor.
+    Resistor,
+    /// Scalar capacitor.
+    Capacitor,
+    /// Scalar inductor.
+    Inductor,
+    /// Junction diode.
+    Diode,
+    /// Gummel-Poon.
+    Bjt,
+    /// MOS1.
+    Mos1,
+    /// MOS2.
+    Mos2,
+    /// MOS3.
+    Mos3,
+    /// MOS6.
+    Mos6,
+    /// MOS9.
+    Mos9,
+    /// BSIM3v3.3.
+    Bsim3,
+    /// BSIM4.8.
+    Bsim4,
+    /// JFET.
+    Jfet,
+    /// JFET2.
+    Jfet2,
+    /// MESFET.
+    Mesfet,
+    /// MESA.
+    Mesa,
+    /// HFET1.
+    Hfet1,
+    /// HFET2.
+    Hfet2,
+    /// Voltage-controlled switch.
+    Switch,
+    /// Current-controlled switch.
+    CurrentSwitch,
+    /// Uniform RC expansion.
+    Urc,
+    /// Lossy line.
+    Ltra,
+    /// TXL lossy line.
+    Txl,
+}
+
+/// Authoritative backend catalog entry. Selector aliases are the C levels
+/// supported by this implementation, not promises about every model parameter.
+pub(crate) struct BackendSpec {
+    pub(crate) backend: ModelBackend,
+    pub(crate) name: &'static str,
+    pub(crate) selectors: &'static [u8],
+}
+
+impl BackendSpec {
+    const fn new(backend: ModelBackend, name: &'static str, selectors: &'static [u8]) -> Self {
+        Self {
+            backend,
+            name,
+            selectors,
+        }
+    }
+}
+
+impl ModelBackend {
+    /// Backend options for the model's compatible instance designator.
+    /// Families differing only in polarity share the same selector catalog.
+    pub(crate) const fn catalog(designator: char) -> &'static [BackendSpec] {
+        match designator.to_ascii_lowercase() {
+            'r' => const { &[BackendSpec::new(Self::Resistor, "Scalar resistor", &[0, 1])] },
+            'c' => const { &[BackendSpec::new(Self::Capacitor, "Scalar capacitor", &[1])] },
+            'l' => const { &[BackendSpec::new(Self::Inductor, "Scalar inductor", &[1])] },
+            'd' => const { &[BackendSpec::new(Self::Diode, "Junction diode", &[1])] },
+            'q' => const { &[BackendSpec::new(Self::Bjt, "Gummel-Poon", &[0, 1, 2])] },
+            'm' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Mos1, "MOS1", &[0, 1]),
+                        BackendSpec::new(Self::Mos2, "MOS2", &[2]),
+                        BackendSpec::new(Self::Mos3, "MOS3", &[3]),
+                        BackendSpec::new(Self::Mos6, "MOS6", &[6]),
+                        BackendSpec::new(Self::Mos9, "MOS9", &[9]),
+                        BackendSpec::new(Self::Bsim3, "BSIM3v3.3", &[8, 49]),
+                        BackendSpec::new(Self::Bsim4, "BSIM4.8", &[14, 54]),
+                    ]
+                }
+            }
+            'j' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Jfet, "JFET", &[0, 1]),
+                        BackendSpec::new(Self::Jfet2, "JFET2", &[2]),
+                    ]
+                }
+            }
+            'z' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Mesfet, "MESFET", &[0, 1]),
+                        BackendSpec::new(Self::Mesa, "MESA", &[2, 3, 4]),
+                        BackendSpec::new(Self::Hfet1, "HFET1", &[5]),
+                        BackendSpec::new(Self::Hfet2, "HFET2", &[6]),
+                    ]
+                }
+            }
+            's' => {
+                const {
+                    &[BackendSpec::new(
+                        Self::Switch,
+                        "Voltage-controlled switch",
+                        &[1],
+                    )]
+                }
+            }
+            'w' => {
+                const {
+                    &[BackendSpec::new(
+                        Self::CurrentSwitch,
+                        "Current-controlled switch",
+                        &[1],
+                    )]
+                }
+            }
+            'u' => const { &[BackendSpec::new(Self::Urc, "Uniform RC expansion", &[1])] },
+            'o' => const { &[BackendSpec::new(Self::Ltra, "Lossy line", &[1])] },
+            'y' => const { &[BackendSpec::new(Self::Txl, "TXL lossy line", &[1])] },
+            _ => &[],
+        }
+    }
+
+    fn select(family: ModelFamily, selector: u8) -> Option<Self> {
+        Self::catalog(family.designator())
+            .iter()
+            .find(|spec| spec.selectors.contains(&selector))
+            .map(|spec| spec.backend)
+    }
+
+    pub(super) const fn requires_model(designator: char) -> bool {
+        !matches!(designator.to_ascii_lowercase(), 'r' | 'c' | 'l')
+            && !Self::catalog(designator).is_empty()
+    }
+}
+
 /// Keep model-backend selection separate from model parameter setters.
 ///
 /// Backend selection is distinct from ordered model setters. Only diode has a
@@ -142,9 +291,11 @@ impl ModelFamily {
 pub struct LevelSelection {
     /// First raw scalar level, or `None` if omitted. No AST mutation occurs.
     pub first_raw: Option<Real>,
-    /// Backend selector: first-level rounding for BJT/MOS/`r`; fixed 1 for
-    /// diode, capacitor, inductor and `res`.
+    /// First rounded level for selector-based families (including aliases);
+    /// fixed 1 for families whose C backend does not scan the level.
     pub selector: u8,
+    /// Concrete implementation for the validated selector.
+    pub backend: ModelBackend,
     /// Diode's last integer setter (`floor(raw + 0.5)`), defaulting to 1.
     /// `None` for families with no level setter.
     pub applied: Option<u8>,
@@ -376,10 +527,7 @@ impl<'a> ModelResolver<'a> {
     /// Diagnostics retain the instance/card/setter location as appropriate.
     pub fn resolve(&self, instance: &DeviceInstance) -> SpiceResult<Option<ResolvedModel<'a>>> {
         let Some(name) = &instance.model else {
-            if matches!(
-                instance.designator.to_ascii_lowercase(),
-                'd' | 'q' | 'm' | 's' | 'w' | 'j' | 'u' | 'o' | 'z' | 'y'
-            ) {
+            if ModelBackend::requires_model(instance.designator) {
                 return Err(SpiceError::parse(
                     instance.location.clone(),
                     format!("device {} requires a model", instance.name),
@@ -833,15 +981,9 @@ fn rounded_level(raw: Real, location: &SourceLoc) -> SpiceResult<u8> {
 /// level.
 const fn mos_level_reference(selector: u8) -> &'static str {
     match selector {
-        0 => "src/spicelib/parser/inpdomod.c (level 0 selects src/spicelib/devices/mos1/)",
-        2 => "src/spicelib/devices/mos2/",
         4 => "src/spicelib/devices/bsim1/",
         5 => "src/spicelib/devices/bsim2/",
-        6 => "src/spicelib/devices/mos6/",
-        8 | 49 => "src/spicelib/devices/bsim3/ (bsim3v0/, bsim3v1/, bsim3v32/ by VERSION)",
-        9 => "src/spicelib/devices/mos9/",
         10 | 58 => "src/spicelib/devices/bsimsoi/",
-        14 | 54 => "src/spicelib/devices/bsim4/ (bsim4v5/, bsim4v6/, bsim4v7/ by VERSION)",
         55 => "src/spicelib/devices/bsim3soi_fd/",
         56 => "src/spicelib/devices/bsim3soi_dd/",
         57 => "src/spicelib/devices/bsim3soi_pd/",
@@ -872,60 +1014,43 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
     }
     let first_integer = first.map_or(1, |(_, integer, _)| integer);
     let location = first.map_or(&card.location, |(_, _, location)| location);
-    let selector = match family {
-        ModelFamily::Npn | ModelFamily::Pnp | ModelFamily::Nmos | ModelFamily::Pmos => {
-            first_integer
+    // Preserve the first rounded selector, including aliases. Fixed-backend
+    // families have separate level setter policy.
+    let (selector, valid_setter, applied) = match family {
+        ModelFamily::Npn
+        | ModelFamily::Pnp
+        | ModelFamily::Nmos
+        | ModelFamily::Pmos
+        | ModelFamily::Njf
+        | ModelFamily::Pjf
+        | ModelFamily::Nmf
+        | ModelFamily::Pmf => (first_integer, true, None),
+        ModelFamily::Resistor if card.base.eq_ignore_ascii_case("r") => (first_integer, true, None),
+        ModelFamily::Diode => {
+            let applied = last.unwrap_or(1);
+            (1, applied == 1, Some(applied))
         }
-        ModelFamily::Resistor if card.base.eq_ignore_ascii_case("r") => first_integer,
-        // inpdomod.c: NJF/PJF level 0 or 1 is JFET, 2 is JFET2;
-        // NMF/PMF level 0 or 1 is MES, 2-4 MESA, 5 HFET1, 6 HFET2.
-        ModelFamily::Njf | ModelFamily::Pjf | ModelFamily::Nmf | ModelFamily::Pmf => {
-            first_integer.max(1)
-        }
-        _ => 1,
+        _ => (1, first_integer == 1, None),
     };
-    let applied = (family == ModelFamily::Diode).then_some(last.unwrap_or(1));
-    if matches!(family, ModelFamily::Njf | ModelFamily::Pjf) && selector > 2 {
-        // inpdomod.c accepts levels 0-2 (JFET, JFET2) and rejects the rest.
-        return Err(SpiceError::not_yet_ported(
-            format!(
-                "{location}: {family:?} model '{}' level {selector}",
-                card.name
-            ),
-            "src/spicelib/parser/inpdomod.c (only JFET levels 1-2 exist in C)",
-        ));
-    }
-    if matches!(family, ModelFamily::Nmf | ModelFamily::Pmf) && !matches!(selector, 1..=6) {
-        // inpdomod.c maps levels 3-6 to MESA levels 3-4 and HFET1/HFET2, and
-        // rejects the rest.
-        let reference = "src/spicelib/parser/inpdomod.c (only MESFET levels 1-4 and HFET levels 5-6 exist in C)";
-        return Err(SpiceError::not_yet_ported(
-            format!(
-                "{location}: {family:?} model '{}' level {selector}",
-                card.name
-            ),
-            reference,
-        ));
-    }
-    if matches!(family, ModelFamily::Nmos | ModelFamily::Pmos) && matches!(selector, 8 | 49) {
-        crate::devices::bsim3::select_version(card)?;
-    }
-    if matches!(family, ModelFamily::Nmos | ModelFamily::Pmos) && matches!(selector, 14 | 54) {
-        crate::devices::bsim4::select_version(card)?;
-    }
-    let supported = match family {
-        ModelFamily::Npn | ModelFamily::Pnp => selector <= 2,
-        // Classic backends and the BSIM3/BSIM4 input schemas. Successful
-        // selection never implies a simulation load: BSIM4's factory refuses.
-        ModelFamily::Nmos | ModelFamily::Pmos => {
-            matches!(selector, 1..=3 | 6 | 8 | 9 | 14 | 49 | 54)
+    let Some(backend) = ModelBackend::select(family, selector).filter(|_| valid_setter) else {
+        if matches!(family, ModelFamily::Njf | ModelFamily::Pjf) {
+            return Err(SpiceError::not_yet_ported(
+                format!(
+                    "{location}: {family:?} model '{}' level {selector}",
+                    card.name
+                ),
+                "src/spicelib/parser/inpdomod.c (only JFET levels 1-2 exist in C)",
+            ));
         }
-        ModelFamily::Njf | ModelFamily::Pjf | ModelFamily::Nmf | ModelFamily::Pmf => true,
-        ModelFamily::Diode => applied == Some(1),
-        ModelFamily::Resistor if card.base.eq_ignore_ascii_case("r") => selector <= 1,
-        _ => selector == 1 && first_integer == 1,
-    };
-    if !supported {
+        if matches!(family, ModelFamily::Nmf | ModelFamily::Pmf) {
+            return Err(SpiceError::not_yet_ported(
+                format!(
+                    "{location}: {family:?} model '{}' level {selector}",
+                    card.name
+                ),
+                "src/spicelib/parser/inpdomod.c (only MESFET levels 1-4 and HFET levels 5-6 exist in C)",
+            ));
+        }
         let setter_location = if family == ModelFamily::Diode {
             card.parameters
                 .iter()
@@ -947,10 +1072,20 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
             ),
             reference,
         ));
+    };
+    match backend {
+        ModelBackend::Bsim3 => {
+            crate::devices::bsim3::select_version(card)?;
+        }
+        ModelBackend::Bsim4 => {
+            crate::devices::bsim4::select_version(card)?;
+        }
+        _ => {}
     }
     Ok(LevelSelection {
         first_raw: raw,
         selector,
+        backend,
         applied,
     })
 }

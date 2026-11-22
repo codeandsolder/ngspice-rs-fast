@@ -48,6 +48,15 @@ scale factors (unit letters swallowed), `v(node)`, `v(n1, n2)`, `i(source)`,
 Comparisons and logic become C's `eq0`/`ne0`/`gt0`/`lt0`/`ge0`/`le0` of a
 difference (`a && b` is `eq0(eq0(a) + eq0(b))`).
 
+The parser bounds syntactic nesting (64), structural height (256 nodes),
+and total expression nodes (100,000) independently. Every binary parent is
+checked before boxing; embedded numparam values share the outer budget.
+POLY/TABLE lowering checks generated nodes before constructing them, and
+macro substitution checks borrowed arguments at their replacement depth
+before cloning, with a cumulative expansion budget. These limits match the
+device compiler's source envelope and preserve the original C evaluation
+order rather than balancing the tree.
+
 As after `inp_modify_exp()`:
 
 - braces and single quotes are **whitespace**, not grouping: `v=2*{1+1}` is

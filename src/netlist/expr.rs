@@ -30,7 +30,7 @@
 //! literal, which then binds tightest (`2*-3^2` is `2*((-3)^2)`); the parser
 //! rejects the other C-erroring forms (`2*+3`, `2*-a`, `2*-(3)`).
 
-use crate::primitives::{Real, SourceLoc};
+use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 /// A half-open source span.
 ///
@@ -139,6 +139,31 @@ pub struct Expr {
 }
 
 impl Expr {
+    /// Measure an existing subtree against the remaining construction budget.
+    /// Used before copying it into a generated behavioural expression.
+    pub(super) fn check_tree(&self, depth: usize, budget: &mut TreeBudget) -> SpiceResult<usize> {
+        budget.charge(depth, 1, &self.span.start)?;
+        let mut height = depth;
+        let mut child = |expr: &Self| -> SpiceResult<()> {
+            height = height.max(expr.check_tree(depth + 1, budget)?);
+            Ok(())
+        };
+        match &self.kind {
+            ExprKind::Number { .. } | ExprKind::Identifier(_) => {}
+            ExprKind::Unary { operand, .. } | ExprKind::Group(operand) => child(operand)?,
+            ExprKind::Binary { lhs, rhs, .. } => {
+                child(lhs)?;
+                child(rhs)?;
+            }
+            ExprKind::Call { arguments, .. } | ExprKind::UserCall { arguments, .. } => {
+                for argument in arguments {
+                    child(argument)?;
+                }
+            }
+        }
+        Ok(height)
+    }
+
     /// Visit a syntax tree in source order without recursive stack growth.
     /// A binary node visits its left subtree before the right; a call is
     /// visited before its arguments.
@@ -164,8 +189,7 @@ impl Expr {
     }
 }
 
-/// Node shapes. Children are owned; trees are bounded by the parser's nesting
-/// limit ([`MAX_NESTING`]).
+/// Node shapes. Parsed trees obey both syntax nesting and structural limits.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     /// A finite numeric literal. `value` already includes the SPICE scale
@@ -249,6 +273,49 @@ pub enum BinaryOp {
 /// Maximum parenthesis/call nesting accepted by the parser; deeper input is a
 /// committed error instead of unbounded recursion.
 pub const MAX_NESTING: usize = 64;
+
+/// Maximum structural height (including leaves) of a parsed expression.
+///
+/// Flat left-associative chains count toward this limit, independently of
+/// syntactic nesting. Matches the behavioural compiler's depth envelope.
+pub const MAX_TREE_DEPTH: usize = 4 * MAX_NESTING;
+
+/// Maximum number of syntax nodes in one expression, including embedded
+/// numparam values. Wide calls are limited independently of tree height.
+pub const MAX_TREE_NODES: usize = 100_000;
+
+/// A cumulative node budget for generated trees. Depth is checked separately
+/// because even a small left-deep tree can exhaust a recursive consumer.
+pub(super) struct TreeBudget {
+    remaining: usize,
+}
+
+impl TreeBudget {
+    pub(super) const fn new(remaining: usize) -> Self {
+        Self { remaining }
+    }
+
+    pub(super) fn charge(
+        &mut self,
+        depth: usize,
+        nodes: usize,
+        location: &SourceLoc,
+    ) -> SpiceResult<()> {
+        if depth > MAX_TREE_DEPTH {
+            return Err(SpiceError::parse(
+                location.clone(),
+                format!("expression structural depth limit ({MAX_TREE_DEPTH}) exceeded"),
+            ));
+        }
+        self.remaining = self.remaining.checked_sub(nodes).ok_or_else(|| {
+            SpiceError::parse(
+                location.clone(),
+                format!("expression node limit ({MAX_TREE_NODES}) exceeded"),
+            )
+        })?;
+        Ok(())
+    }
+}
 
 macro_rules! functions {
     ($($variant:ident => $name:literal / $arity:literal,)*) => {

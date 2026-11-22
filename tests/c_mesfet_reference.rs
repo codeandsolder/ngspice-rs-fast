@@ -93,7 +93,7 @@ fn both(tag: &str, deck: &str, setplot: Option<&str>, plotname: &str) -> (Plot, 
 /// absolute`, matched by name through C's `i(@...)`/`v(@...)`/`#branch`
 /// spellings.
 fn same(ours: &Plot, c: &Plot, relative: f64, absolute: f64) {
-    assert_eq!(ours.points().len(), c.points().len());
+    assert_eq!(ours.point_count(), c.point_count());
     for (i, variable) in ours.variables().iter().enumerate() {
         let name = variable.name.as_str();
         // Fresh C operating points have no synthetic Rust .dc parameter axis.
@@ -112,7 +112,7 @@ fn same(ours: &Plot, c: &Plot, relative: f64, absolute: f64) {
             .iter()
             .find_map(|n| c.variable_index(n))
             .unwrap_or_else(|| panic!("C has no {name}: {:?}", c.variables()));
-        for (point, (a, b)) in ours.points().iter().zip(c.points()).enumerate() {
+        for (point, (a, b)) in ours.rows().zip(c.rows()).enumerate() {
             let (x, y) = (a[i], b[k]);
             let error = ((x.re - y.re).powi(2) + (x.im - y.im).powi(2)).sqrt();
             let scale = (y.re * y.re + y.im * y.im).sqrt();

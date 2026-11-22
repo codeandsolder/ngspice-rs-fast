@@ -53,8 +53,9 @@ mod temp;
 
 /// The generated literal model defaults in C setup order (`b4set.c`).
 ///
-/// Generated from `b4set.c`'s given-guarded literal assignments, which
-/// `set.rs` reproduces in C order (a unit test there checks they agree).
+/// Generated from `b4set.c`'s given-guarded literal assignments. Independent
+/// defaults execute as typed generated assignments; selector fallbacks and
+/// conditional defaults remain in the ordered setup stages.
 #[must_use]
 pub const fn literal_defaults() -> &'static [(&'static str, f64)] {
     defaults_data::LITERALS
@@ -155,15 +156,12 @@ pub fn model_parameters(model: &ResolvedModel<'_>) -> SpiceResult<ModelParameter
 }
 
 fn parse_model_parameters(model: &ResolvedModel<'_>) -> SpiceResult<ModelParameters> {
-    if !matches!(model.family(), ModelFamily::Nmos | ModelFamily::Pmos)
-        || !matches!(model.levels().selector, 14 | 54)
-    {
+    if model.levels().backend != crate::devices::ModelBackend::Bsim4 {
         return Err(SpiceError::parse(
             model.card().location.clone(),
             "BSIM4 input schema requires NMOS/PMOS level 14 or 54",
         ));
     }
-    select_version(model.card())?;
     let mut result = ModelParameters {
         inputs: Inputs::new(&DEVICE, true),
         polarity: if model.family() == ModelFamily::Nmos {

@@ -182,7 +182,12 @@ fn c_binary_rawfiles_match_the_c_ascii_oracle() {
     assert_eq!(plot.point_count(), 4);
     let frequencies = plot.column("frequency").unwrap();
     assert_eq!(frequencies[0], Complex::new(1e2, 0.0));
-    assert!(frequencies.windows(2).all(|pair| pair[0].re < pair[1].re));
+    assert!(
+        frequencies
+            .iter()
+            .zip(frequencies.iter().skip(1))
+            .all(|(a, b)| a.re < b.re)
+    );
     // The source is 1 V AC, and the RC network attenuates it.
     let input = plot.value("v(in)", 0).unwrap();
     assert!(

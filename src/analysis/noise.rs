@@ -697,7 +697,7 @@ fn integrated_plot(
         }
     }
     integrated_power.append(&mut values);
-    integrated.push_point(values.values)?;
+    integrated.push_point(&values.values)?;
     if !integrated.is_finite() {
         return Err(SpiceError::Numerical {
             context: ".noise".into(),
@@ -789,6 +789,7 @@ pub(super) fn run(
 
     let mut integrated_power = Power::default();
     let mut last = card.start;
+    let mut row = NoiseRow::new(representation, spectrum.variable_count());
     for (step, &freq) in frequencies.iter().enumerate() {
         let input_name = card.input.as_str();
         let (forward, adjoint) = small.at_frequency(circuit, context, freq, |system| {
@@ -819,10 +820,7 @@ pub(super) fn run(
         let print_summary = card.summary != 0 && step.is_multiple_of(card.summary);
         let mut out_density = 0.;
         let emit = card.summary == 0 || print_summary;
-        let mut row = NoiseRow::new(
-            representation,
-            if emit { spectrum.variables().len() } else { 0 },
-        );
+        row.values.clear();
         if emit {
             row.values.push(Complex::real(freq));
         }
@@ -844,7 +842,7 @@ pub(super) fn run(
                     message: "nonfinite noise density".into(),
                 });
             }
-            sink.point(row.values)?;
+            sink.point(&row.values)?;
         }
         last = freq;
     }
@@ -1064,7 +1062,7 @@ mod tests {
                 assert_eq!(plots.len(), expected, "{mode} {distance}");
                 assert_eq!(plots[0].point_count(), 1);
                 if let Some(integrated) = plots.get(1) {
-                    assert_eq!(integrated.points()[0], [Complex::ZERO; 2]);
+                    assert_eq!(integrated.row(0).unwrap(), [Complex::ZERO; 2]);
                 }
             }
         }

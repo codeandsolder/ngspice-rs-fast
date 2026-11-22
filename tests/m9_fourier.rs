@@ -28,7 +28,7 @@ fn configured_fourier_recovers_multiple_periods_and_polynomial_interpolation() {
         let value = 0.5
             + (std::f64::consts::TAU * 1000. * t).sin()
             + 0.25 * (std::f64::consts::TAU * 2000. * t).sin();
-        plot.push_point(vec![Complex::real(t), Complex::real(value)])
+        plot.push_point(&[Complex::real(t), Complex::real(value)])
             .unwrap();
     }
     for degree in [1, 2, 3, 5] {

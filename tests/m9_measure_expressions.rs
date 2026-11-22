@@ -18,7 +18,7 @@ fn evaluate(body: &str) -> ngspice_rs::primitives::SpiceResult<Vec<measure::Meas
     plot.push_variable(Variable::new("v(out)", "voltage"));
     let mut plot = plot.build();
     for t in [0., 0.5, 1.] {
-        plot.push_point(vec![Complex::real(t), Complex::real(2. * t)])?;
+        plot.push_point(&[Complex::real(t), Complex::real(2. * t)])?;
     }
     measure::resolve_with_scope(&plot, AnalysisKind::Transient, &parsed.measurements, &scope)
 }

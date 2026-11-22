@@ -88,7 +88,7 @@ fn roots(plot: &Plot, kind: &str) -> Vec<Complex> {
         .iter()
         .enumerate()
         .filter(|(_, v)| v.name.starts_with(&format!("v({kind}(")))
-        .map(|(i, _)| plot.points()[0][i])
+        .map(|(i, _)| plot.row(0).unwrap()[i])
         .collect()
 }
 
@@ -104,7 +104,9 @@ fn same_roots(ours: &Plot, theirs: &Plot) -> Result<(), String> {
             names(theirs)
         ));
     }
-    let scale = theirs.points()[0]
+    let scale = theirs
+        .row(0)
+        .unwrap()
         .iter()
         .fold(0.0_f64, |m, z| m.max(z.magnitude()));
     for kind in ["pole", "zero"] {

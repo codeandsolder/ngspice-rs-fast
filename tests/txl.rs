@@ -51,7 +51,7 @@ fn value(plot: &Plot, name: &str, point: usize) -> f64 {
     let index = plot
         .variable_index(name)
         .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
-    plot.points()[point][index].re
+    plot.row(point).unwrap()[index].re
 }
 /// The `occurrence`-th variable with this name (`i(y1)` twice).
 fn values(plot: &Plot, name: &str, point: usize) -> Vec<f64> {
@@ -59,7 +59,7 @@ fn values(plot: &Plot, name: &str, point: usize) -> Vec<f64> {
         .iter()
         .enumerate()
         .filter(|(_, variable)| variable.name == name)
-        .map(|(index, _)| plot.points()[point][index].re)
+        .map(|(index, _)| plot.row(point).unwrap()[index].re)
         .collect()
 }
 /// The TXL instance of a circuit (`v1` and the load come first in deck order).
@@ -577,7 +577,7 @@ fn the_registry_reports_a_bounded_y() {
     assert!(entry.c_reference.contains("inp2y.c"), "{entry:?}");
     assert!(matches!(
         entry.support,
-        ngspice_rs::devices::registry::DeviceSupport::Bounded { .. }
+        ngspice_rs::devices::registry::DeviceSupport::Bounded
     ));
     assert!(!entry.description.is_empty());
 }

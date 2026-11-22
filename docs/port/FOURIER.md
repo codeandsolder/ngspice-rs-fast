@@ -215,3 +215,44 @@ C-compatible defaults. A second run, settings after run, Fourier before run,
 quit before run and commands after quit are explicit failures. Source round trips
 and process tests cover this subset. Loading arbitrary plots, reruns and the
 general interactive command interpreter remain unsupported.
+
+## Shared execution plans and aggregate resource limits (#81)
+
+A Fourier call validates and extracts the physical time axis once, across
+all cards. Each card selects its own closed or configured sampling geometry.
+The closed grid binds coordinates to exact coincident-sample groups or
+adjacent interpolation brackets; every vector reads the same locations, but
+equal-time values are still checked independently. The stable polynomial
+path similarly binds the time-dependent stencil starts and Lagrange weights.
+C-compatible moving polynomial fits, including their degree fallback and
+coefficient-tail behavior, remain signal-dependent. The source trace buffer
+is reused across configured interpolations.
+
+Projection processes vectors in bounded batches (at most 4 MiB of numeric
+sample and accumulator storage plus trace descriptors) and constructs one
+sine/cosine row per harmonic for each batch. The largest configured grid
+requires at most 1.6 MB for that row; no grid-by-harmonic-by-vector coefficient
+array is built. Each vector's accumulators still consume samples in the
+original order, with the original separately rounded sine/cosine products;
+the closed trapezoid and configured half-open DFT keep their distinct phase
+expressions and normalization. There is no FFT, approximation of
+trigonometric coefficients, or numerical tolerance change.
+
+Before processing any vectors, an aggregate preflight across all cards
+bounds estimated work (500 million weighted units) and additional numeric
+workspace plus result structures (128 MiB). This is a conservative
+resource policy rather than a wall-clock prediction. It charges source
+rows, requested grid/harmonic products, per-vector sample reads, shared
+stable stencil construction, worst-case moving polynomial fits and
+degree retries, and retained result entries. Estimates saturate rather than
+wrap. Existing per-grid, degree, and harmonic limits remain; the aggregate
+policy additionally rejects a collection of otherwise individually valid
+requests when their total cost exceeds the budget. A failure reports the
+card and estimated resource cost. These limits apply only to Fourier
+postprocessing, not to the original simulation or other output consumers.
+
+Finite fundamentals whose highest requested harmonic frequency overflows,
+and physical windows or grids whose coordinates cannot be represented
+as distinct increasing floating-point times, are explicitly refused.
+Degree zero retains C's sample-index semantics and does not require a
+physical interpolation grid.

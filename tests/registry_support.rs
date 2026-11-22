@@ -73,8 +73,7 @@ fn every_designator_is_built_exactly_as_the_registry_reports() {
                 elaborated.unwrap_or_else(|error| panic!("'{designator}' ported: {error}"));
                 from_card.unwrap_or_else(|error| panic!("'{designator}' card: {error}"));
             }
-            DeviceSupport::Bounded { scope } => {
-                assert!(!scope.is_empty(), "'{designator}'");
+            DeviceSupport::Bounded => {
                 elaborated.unwrap_or_else(|error| panic!("'{designator}' bounded: {error}"));
                 let Err(error) = from_card else {
                     panic!("'{designator}': a bounded card needs its deck")

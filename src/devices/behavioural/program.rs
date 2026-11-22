@@ -245,8 +245,8 @@ impl Node {
 // The derivative rule for each source node performs a fixed amount of work,
 // with each child differentiated at most once per quantity. The separate
 // instruction cap also limits the size of the retained execution plan.
-const MAX_SOURCE_DEPTH: usize = 4 * crate::netlist::expr::MAX_NESTING;
-const MAX_SOURCE_NODES: usize = 100_000;
+const MAX_SOURCE_DEPTH: usize = crate::netlist::expr::MAX_TREE_DEPTH;
+const MAX_SOURCE_NODES: usize = crate::netlist::expr::MAX_TREE_NODES;
 const MAX_DERIVATIVE_VISITS: usize = 131_072;
 
 fn check_source_limits(root: &BExpr) -> SpiceResult<()> {

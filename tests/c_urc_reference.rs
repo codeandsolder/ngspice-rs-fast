@@ -84,7 +84,7 @@ fn compare(tag: &str, cards: &str, asks: &[&str], relative: Real) {
     let (rust, circuit) = run_rust(cards);
     let mut compared = 0;
     for (index, variable) in c.variables().iter().enumerate() {
-        let want = c.points()[0][index].re;
+        let want = c.row(0).unwrap()[index].re;
         let name = variable.name.as_str();
         // C writes an ask as `v(@dev[key])` or bare `@dev[key]` by its unit.
         let ask = name

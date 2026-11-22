@@ -898,9 +898,8 @@ pub struct PwlBreakpoints {
     done: bool,
 }
 
-impl Iterator for PwlBreakpoints {
-    type Item = Real;
-    fn next(&mut self) -> Option<Real> {
+impl PwlBreakpoints {
+    pub(super) fn next_event(&mut self) -> Option<crate::devices::WaveformEvent> {
         let knots = &self.source.knots;
         while !self.done && self.last.is_none_or(|last| last < self.t1) {
             if self.index >= knots.len() {
@@ -931,10 +930,22 @@ impl Iterator for PwlBreakpoints {
                 self.done = true;
             } else if t >= self.t0 && self.last.is_none_or(|last| t > last) {
                 self.last = Some(t);
-                return Some(t);
+                let kind = if self.index == knots.len() && self.source.repeat().is_some() {
+                    crate::devices::WaveformEventKind::PwlRepeatBoundary
+                } else {
+                    crate::devices::WaveformEventKind::PwlKnot
+                };
+                return Some(crate::devices::WaveformEvent { time: t, kind });
             }
         }
         None
+    }
+}
+
+impl Iterator for PwlBreakpoints {
+    type Item = Real;
+    fn next(&mut self) -> Option<Real> {
+        self.next_event().map(|event| event.time)
     }
 }
 

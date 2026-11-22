@@ -149,7 +149,7 @@ fn compare_with_c(name: &str, deck_text: &str, (relative, absolute): (f64, f64))
             "{name}: plot {index} names in order"
         );
         assert_eq!(got.point_count(), want.point_count(), "{name}");
-        for (point, (a, b)) in got.points().iter().zip(want.points()).enumerate() {
+        for (point, (a, b)) in got.rows().zip(want.rows()).enumerate() {
             for ((x, y), variable) in a.iter().zip(b).zip(want.variables()) {
                 if y.re.is_nan() || y.im.is_nan() {
                     assert!(

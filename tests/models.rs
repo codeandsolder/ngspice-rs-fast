@@ -2,7 +2,9 @@
 use ngspice_rs::devices::schema::{
     ScalarDomain, ScalarParameter, ScalarSchema, ScalarUnit, temperature_kelvin,
 };
-use ngspice_rs::devices::{Circuit, ModelContext, ModelFamily, ModelResolver, Registry};
+use ngspice_rs::devices::{
+    Circuit, ModelBackend, ModelContext, ModelFamily, ModelResolver, Registry,
+};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::Netlist;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -24,6 +26,13 @@ fn instance(d: char) -> &'static str {
         'l' => "l1 a 0 mdl",
         'd' => "d1 a 0 mdl",
         'q' => "q1 c b e mdl",
+        'j' => "j1 d g s mdl",
+        'z' => "z1 d g s mdl",
+        's' => "s1 a 0 ctrl 0 mdl",
+        'w' => "w1 a 0 v1 mdl",
+        'u' => "u1 a b 0 mdl l=1m",
+        'o' => "o1 a 0 b 0 mdl",
+        'y' => "y1 a 0 b 0 mdl",
         _ => "m1 drain gate source bulk mdl",
     }
 }
@@ -169,6 +178,71 @@ fn model_symbols_do_not_share_numeric_or_ground_node_namespaces() {
         resolver.model("gnd").unwrap().parameters,
         resolver.model("0").unwrap().parameters
     );
+}
+
+#[test]
+fn every_validated_level_selects_exactly_one_concrete_backend() {
+    use ModelBackend::{
+        Bjt, Bsim3, Bsim4, Capacitor, CurrentSwitch, Diode, Hfet1, Hfet2, Inductor, Jfet, Jfet2,
+        Ltra, Mesa, Mesfet, Mos1, Mos2, Mos3, Mos6, Mos9, Resistor, Switch, Txl, Urc,
+    };
+    type Entries = &'static [(ModelBackend, &'static [u8])];
+    let cases: &[(char, &[&str], Entries)] = &[
+        ('r', &["r"], &[(Resistor, &[0, 1])]),
+        ('r', &["res"], &[(Resistor, &[1])]),
+        ('c', &["c"], &[(Capacitor, &[1])]),
+        ('l', &["l"], &[(Inductor, &[1])]),
+        ('d', &["d"], &[(Diode, &[1])]),
+        ('q', &["npn", "pnp"], &[(Bjt, &[0, 1, 2])]),
+        (
+            'm',
+            &["nmos", "pmos"],
+            &[
+                (Mos1, &[0, 1]),
+                (Mos2, &[2]),
+                (Mos3, &[3]),
+                (Mos6, &[6]),
+                (Mos9, &[9]),
+                (Bsim3, &[8, 49]),
+                (Bsim4, &[14, 54]),
+            ],
+        ),
+        ('j', &["njf", "pjf"], &[(Jfet, &[0, 1]), (Jfet2, &[2])]),
+        (
+            'z',
+            &["nmf", "pmf", "nhfet", "phfet"],
+            &[
+                (Mesfet, &[0, 1]),
+                (Mesa, &[2, 3, 4]),
+                (Hfet1, &[5]),
+                (Hfet2, &[6]),
+            ],
+        ),
+        ('s', &["sw"], &[(Switch, &[1])]),
+        ('w', &["csw"], &[(CurrentSwitch, &[1])]),
+        ('u', &["urc"], &[(Urc, &[1])]),
+        ('o', &["ltra"], &[(Ltra, &[1])]),
+        ('y', &["txl"], &[(Txl, &[1])]),
+    ];
+    for &(designator, families, backends) in cases {
+        for family in families {
+            for level in 0..=99 {
+                let expected = backends
+                    .iter()
+                    .find(|(_, selectors)| selectors.contains(&level));
+                let actual = selection(designator, family, &format!("level={level}"));
+                if let Some(&(backend, _)) = expected {
+                    let actual = actual.unwrap_or_else(|e| panic!("{family} level {level}: {e}"));
+                    assert_eq!(actual.backend, backend, "{family} level {level}");
+                    assert_eq!(actual.first_raw, Some(f64::from(level)));
+                    assert_eq!(actual.selector, level, "{family} retained selector");
+                } else {
+                    let error = actual.unwrap_err();
+                    assert!(error.is_not_yet_ported(), "{family} level {level}: {error}");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -579,7 +653,7 @@ fn unavailable_factories_and_failures_leave_existing_circuit_state_unchanged() {
         let registry = Registry::with_builtins();
         assert!(matches!(
             registry.get(d).unwrap().support,
-            ngspice_rs::devices::DeviceSupport::Bounded { .. }
+            ngspice_rs::devices::DeviceSupport::Bounded
         ));
         let n = deck(&format!(
             "{}\n.model mdl {}",
