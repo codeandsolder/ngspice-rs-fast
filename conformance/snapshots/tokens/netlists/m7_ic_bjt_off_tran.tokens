@@ -21,11 +21,11 @@ card 2 @netlists/m7_ic_bjt_off_tran.cir:11:1 lines=11-11 continuations=0
   token 7 11:18 lparen "("
   token 8 11:19 number "0" value=0e0
   token 9 11:21 number "-5" value=-5e0
-  token 10 11:24 number "30u" value=2.9999999999999997e-5
+  token 10 11:24 number "30u" value=3e-5
   token 11 11:28 number "1u" value=1e-6
   token 12 11:31 number "1u" value=1e-6
-  token 13 11:34 number "5u" value=4.9999999999999996e-6
-  token 14 11:37 number "100u" value=9.999999999999999e-5
+  token 13 11:34 number "5u" value=5e-6
+  token 14 11:37 number "100u" value=1e-4
   token 15 11:41 rparen ")"
 card 3 @netlists/m7_ic_bjt_off_tran.cir:12:1 lines=12-12 continuations=0
   raw: "rc1 vcc c1 1k"
@@ -128,7 +128,7 @@ card 14 @netlists/m7_ic_bjt_off_tran.cir:23:1 lines=23-23 continuations=0
   kind: dot(.tran)
   token 1 23:1 word ".tran"
   token 2 23:7 number "0.5u" value=5e-7
-  token 3 23:12 number "60u" value=5.9999999999999995e-5
+  token 3 23:12 number "60u" value=6e-5
   token 4 23:16 number "0" value=0e0
   token 5 23:18 number "10n" value=1e-8
 card 15 @netlists/m7_ic_bjt_off_tran.cir:24:1 lines=24-24 continuations=0

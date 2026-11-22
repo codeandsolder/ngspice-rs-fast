@@ -1,4 +1,8 @@
 # ngspice 059066b532f7073fccf4173ef269309eafdc7f0c; SPARSE backend, x86_64.
+# The original notch deck used 100n; C INPevaluate loaded 0x1.ad7f29abcaf49p-24.
+# Spell the exact captured binary64 input in the diagnostic deck so changes to
+# decimal conversion do not change the matrix of this historical trace. The
+# spelling below was also checked against pinned C using @c2[capacitance].
 # TRIAL: PZeval return frequency; LOAD: CKTpzLoad input; DET: SMPcDProd mantissa (real, imag), binary exponent.
 case repeat
 RC oracle
@@ -145,7 +149,7 @@ r1 in a 1k
 c1 a out 1u
 l1 a out 10m
 r2 out 0 1k
-c2 out 0 100n
+c2 out 0 1000000000000000100e-25
 .pz in 0 out 0 vol pol
 .end
 trace

@@ -8,7 +8,7 @@ card 1 @netlists/sens_ac_reset.cir:9:1 lines=9-9 continuations=0
   token 2 9:4 number "1" value=1e0
   token 3 9:6 number "0" value=0e0
   token 4 9:8 word "dc"
-  token 5 9:11 number "0.7" value=7.000000000000001e-1
+  token 5 9:11 number "0.7" value=7e-1
   token 6 9:15 word "ac"
   token 7 9:18 number "1" value=1e0
 card 2 @netlists/sens_ac_reset.cir:10:1 lines=10-10 continuations=0
@@ -158,7 +158,7 @@ card 16 @netlists/sens_ac_reset.cir:24:1 lines=24-24 continuations=0
   token 6 24:19 number "0" value=0e0
   token 7 24:21 word "vh"
   token 8 24:23 equals "="
-  token 9 24:24 number "-0.3" value=-3.0000000000000004e-1
+  token 9 24:24 number "-0.3" value=-3e-1
   token 10 24:29 word "ron"
   token 11 24:32 equals "="
   token 12 24:33 number "5" value=5e0

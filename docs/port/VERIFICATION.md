@@ -368,10 +368,10 @@ table from four clean inputs at upstream revision
 ask-only rejection, ordered aliases/flags/defaults/IC, setter conversions,
 integer/scale errors, literal VERSION selection/round-trip, actual model-bin
 resolution and factory atomicity. A device-layer unit test injects exact
-binary64 doping thresholds: `INPevaluate` deliberately uses platform
-`pow(10, exponent)`, so a textual `1e23` is not a portable way to construct
-that exact threshold. The live C query checks the textual boundary on both
-platforms instead. No numeric-parser or comparison tolerance was changed.
+binary64 doping thresholds: C's `INPevaluate` uses platform
+`pow(10, exponent)`, so a textual `1e23` in C is not a portable way to
+construct that exact threshold. Rust now rounds the exact decimal once.
+The live C query checks the textual boundary separately.
 
 `conformance/parser/bsim3_schema.cir` is hand-authored PDK-shaped input,
 not a calibrated/foundry card or simulation golden. It adds two snapshots;
@@ -2137,3 +2137,19 @@ and relative scales use the normalized value, and Rust's imaginary component
 is still checked. All other samples retain their existing comparison
 policies. This is not a rawfile decoder change: stored rawfiles, especially
 bit-exact captures, retain their actual payload.
+
+### Decimal input equivalence for cancellation-sensitive sensitivity fixtures
+
+Correct decimal conversion (architecture issue #94) independently rounds
+the input to binary64. The historical C frontend can round that same decimal
+to a neighboring binary64 value. For sens_hfet2, sens_mos3 and sens_mos9 this
+difference is amplified by the sensitivity walk. The explicit C-only input
+variants in [conformance/reference-inputs](../../conformance/reference-inputs/README.md)
+use mathematically equivalent decimal spellings that produce the intended
+inputs with the pinned reference executable. The original decks and rawfiles
+remain available unchanged. Capture/check/verify deterministically select
+the corresponding independent captures, and Rust runs the original deck.
+All output columns, shape checks and numerical bounds are unchanged. The
+variant test verifies equivalent numeric token values and unchanged
+non-numeric tokens; missing selected captures are errors, not fallback
+opportunities.

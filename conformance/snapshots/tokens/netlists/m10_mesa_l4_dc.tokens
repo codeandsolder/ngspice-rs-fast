@@ -14,7 +14,7 @@ card 1 @netlists/m10_mesa_l4_dc.cir:2:1 lines=2-2 continuations=0
   token 8 2:15 number "2u" value=2e-6
   token 9 2:18 word "w"
   token 10 2:19 equals "="
-  token 11 2:20 number "40u" value=3.9999999999999996e-5
+  token 11 2:20 number "40u" value=4e-5
   token 12 2:24 word "m"
   token 13 2:25 equals "="
   token 14 2:26 number "2" value=2e0
@@ -25,7 +25,7 @@ card 2 @netlists/m10_mesa_l4_dc.cir:3:1 lines=3-3 continuations=0
   token 2 3:5 number "2" value=2e0
   token 3 3:7 number "0" value=0e0
   token 4 3:9 word "dc"
-  token 5 3:12 number "0.3" value=3.0000000000000004e-1
+  token 5 3:12 number "0.3" value=3e-1
 card 3 @netlists/m10_mesa_l4_dc.cir:4:1 lines=4-4 continuations=0
   raw: "vds 1 0 dc 2.0"
   kind: device(v)
@@ -57,7 +57,7 @@ card 4 @netlists/m10_mesa_l4_dc.cir:5:1 lines=5-6 continuations=1
   token 18 5:46 number "30" value=3e1
   token 19 5:49 word "mu"
   token 20 5:51 equals "="
-  token 21 5:52 number "0.35" value=3.5000000000000003e-1
+  token 21 5:52 number "0.35" value=3.5e-1
   token 22 5:57 word "nmax"
   token 23 5:61 equals "="
   token 24 5:62 number "3e16" value=3e16

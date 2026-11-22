@@ -21,11 +21,11 @@ card 2 @netlists/m7_ic_bjt_flipflop_tran.cir:8:1 lines=8-8 continuations=0
   token 7 8:18 lparen "("
   token 8 8:19 number "0" value=0e0
   token 9 8:21 number "5" value=5e0
-  token 10 8:23 number "30u" value=2.9999999999999997e-5
+  token 10 8:23 number "30u" value=3e-5
   token 11 8:27 number "1u" value=1e-6
   token 12 8:30 number "1u" value=1e-6
-  token 13 8:33 number "5u" value=4.9999999999999996e-6
-  token 14 8:36 number "100u" value=9.999999999999999e-5
+  token 13 8:33 number "5u" value=5e-6
+  token 14 8:36 number "100u" value=1e-4
   token 15 8:40 rparen ")"
 card 3 @netlists/m7_ic_bjt_flipflop_tran.cir:9:1 lines=9-9 continuations=0
   raw: "rc1 vcc c1 1k"
@@ -136,7 +136,7 @@ card 14 @netlists/m7_ic_bjt_flipflop_tran.cir:20:1 lines=20-20 continuations=0
   kind: dot(.tran)
   token 1 20:1 word ".tran"
   token 2 20:7 number "0.5u" value=5e-7
-  token 3 20:12 number "60u" value=5.9999999999999995e-5
+  token 3 20:12 number "60u" value=6e-5
   token 4 20:16 number "0" value=0e0
   token 5 20:18 number "10n" value=1e-8
 card 15 @netlists/m7_ic_bjt_flipflop_tran.cir:21:1 lines=21-21 continuations=0

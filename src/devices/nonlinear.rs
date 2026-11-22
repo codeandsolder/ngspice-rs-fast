@@ -2347,10 +2347,9 @@ mod tests {
     #[test]
     fn aliases_keep_last_set_precedence() {
         let p = parameters("cj0=1p cjo=2p cj=3p pb=0.6 mj=0.3 vb=7 ib=1u nz=2", "").unwrap();
-        // INPevaluate values: `0.6` is 6 * 0.1 and `0.3` is 3 * 0.1.
         assert_eq!(
             (p.model.cjo, p.model.vj, p.model.grading),
-            (3e-12, 6. * 0.1, 3. * 0.1)
+            (3e-12, 0.6, 0.3)
         );
         assert_eq!((p.model.bv, p.model.ibv, p.model.nbv), (Some(7.), 1e-6, 2.));
         let p = parameters("cjo=2p cj0=1p", "").unwrap();

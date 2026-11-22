@@ -11,11 +11,11 @@ card 1 @netlists/options_xmu_tran.cir:4:1 lines=4-4 continuations=0
   token 5 4:14 lparen "("
   token 6 4:15 number "0" value=0e0
   token 7 4:17 number "10" value=1e1
-  token 8 4:20 number "100u" value=9.999999999999999e-5
-  token 9 4:25 number "10u" value=9.999999999999999e-6
-  token 10 4:29 number "10u" value=9.999999999999999e-6
+  token 8 4:20 number "100u" value=1e-4
+  token 9 4:25 number "10u" value=1e-5
+  token 10 4:29 number "10u" value=1e-5
   token 11 4:33 number "300u" value=3e-4
-  token 12 4:38 number "800u" value=7.999999999999999e-4
+  token 12 4:38 number "800u" value=8e-4
   token 13 4:42 rparen ")"
 card 2 @netlists/options_xmu_tran.cir:5:1 lines=5-5 continuations=0
   raw: "r1 in out 1k"
@@ -46,7 +46,7 @@ card 5 @netlists/options_xmu_tran.cir:8:1 lines=8-8 continuations=0
   kind: dot(.tran)
   token 1 8:1 word ".tran"
   token 2 8:7 number "2u" value=2e-6
-  token 3 8:10 number "1.2m" value=1.2000000000000001e-3
+  token 3 8:10 number "1.2m" value=1.2e-3
 card 6 @netlists/options_xmu_tran.cir:9:1 lines=9-9 continuations=0
   raw: ".end"
   kind: dot(.end)

@@ -7,7 +7,7 @@ card 1 @netlists/m11_bsim4_ac.cir:6:1 lines=6-6 continuations=0
   token 1 6:1 word "vdd"
   token 2 6:5 word "dd"
   token 3 6:8 number "0" value=0e0
-  token 4 6:10 number "1.2" value=1.2000000000000002e0
+  token 4 6:10 number "1.2" value=1.2e0
 card 2 @netlists/m11_bsim4_ac.cir:7:1 lines=7-7 continuations=0
   raw: "rl dd d 2k"
   kind: device(r)
@@ -22,7 +22,7 @@ card 3 @netlists/m11_bsim4_ac.cir:8:1 lines=8-8 continuations=0
   token 2 8:4 word "g"
   token 3 8:6 number "0" value=0e0
   token 4 8:8 word "dc"
-  token 5 8:11 number "0.6" value=6.000000000000001e-1
+  token 5 8:11 number "0.6" value=6e-1
   token 6 8:15 word "ac"
   token 7 8:18 number "1" value=1e0
 card 4 @netlists/m11_bsim4_ac.cir:9:1 lines=9-9 continuations=0
@@ -75,7 +75,7 @@ card 6 @netlists/m11_bsim4_ac.cir:11:1 lines=11-11 continuations=0
   token 1 11:1 word "cl"
   token 2 11:4 word "d"
   token 3 11:6 number "0" value=0e0
-  token 4 11:8 number "5f" value=5.000000000000001e-15
+  token 4 11:8 number "5f" value=5e-15
 card 7 @netlists/m11_bsim4_ac.cir:12:1 lines=12-14 continuations=2
   raw: ".model nch nmos level=54 version=4.8.3 rgatemod=1 rbodymod=1 igcmod=1 igbmod=1 xrcrg1=12 xrcrg2=5 rshg=0.4 rbpb=5 rbpd=15 rbps=15 rbdb=15 rbsb=15 cgso=1.5e-10 cgdo=1.5e-10 cgbo=1e-11 jss=1e-4 cjs=1e-3 cjsws=2e-10"
   kind: dot(.model)

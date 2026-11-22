@@ -7,7 +7,7 @@ card 1 @netlists/m7_mos1_ring_tran.cir:2:1 lines=2-2 continuations=0
   token 1 2:1 word "vdd"
   token 2 2:5 word "vdd"
   token 3 2:9 number "0" value=0e0
-  token 4 2:11 number "3.3" value=3.3000000000000003e0
+  token 4 2:11 number "3.3" value=3.3e0
 card 2 @netlists/m7_mos1_ring_tran.cir:3:1 lines=3-3 continuations=0
   raw: "ikick 0 n1 pulse(0 200u 0.2n 0.1n 0.1n 0.3n 1)"
   kind: device(i)
@@ -17,7 +17,7 @@ card 2 @netlists/m7_mos1_ring_tran.cir:3:1 lines=3-3 continuations=0
   token 4 3:12 word "pulse"
   token 5 3:17 lparen "("
   token 6 3:18 number "0" value=0e0
-  token 7 3:20 number "200u" value=1.9999999999999998e-4
+  token 7 3:20 number "200u" value=2e-4
   token 8 3:25 number "0.2n" value=2e-10
   token 9 3:30 number "0.1n" value=1e-10
   token 10 3:35 number "0.1n" value=1e-10
@@ -62,7 +62,7 @@ card 4 @netlists/m7_mos1_ring_tran.cir:5:1 lines=5-5 continuations=0
   token 6 5:19 word "pch"
   token 7 5:23 word "w"
   token 8 5:24 equals "="
-  token 9 5:25 number "5u" value=4.9999999999999996e-6
+  token 9 5:25 number "5u" value=5e-6
   token 10 5:28 word "l"
   token 11 5:29 equals "="
   token 12 5:30 number "0.5u" value=5e-7
@@ -123,7 +123,7 @@ card 7 @netlists/m7_mos1_ring_tran.cir:8:1 lines=8-8 continuations=0
   token 6 8:19 word "pch"
   token 7 8:23 word "w"
   token 8 8:24 equals "="
-  token 9 8:25 number "5u" value=4.9999999999999996e-6
+  token 9 8:25 number "5u" value=5e-6
   token 10 8:28 word "l"
   token 11 8:29 equals "="
   token 12 8:30 number "0.5u" value=5e-7
@@ -184,7 +184,7 @@ card 10 @netlists/m7_mos1_ring_tran.cir:11:1 lines=11-11 continuations=0
   token 6 11:19 word "pch"
   token 7 11:23 word "w"
   token 8 11:24 equals "="
-  token 9 11:25 number "5u" value=4.9999999999999996e-6
+  token 9 11:25 number "5u" value=5e-6
   token 10 11:28 word "l"
   token 11 11:29 equals "="
   token 12 11:30 number "0.5u" value=5e-7
@@ -219,22 +219,22 @@ card 12 @netlists/m7_mos1_ring_tran.cir:13:1 lines=13-14 continuations=1
   token 7 13:23 number "1" value=1e0
   token 8 13:25 word "vto"
   token 9 13:28 equals "="
-  token 10 13:29 number "0.7" value=7.000000000000001e-1
+  token 10 13:29 number "0.7" value=7e-1
   token 11 13:33 word "kp"
   token 12 13:35 equals "="
-  token 13 13:36 number "110u" value=1.0999999999999999e-4
+  token 13 13:36 number "110u" value=1.1e-4
   token 14 13:41 word "gamma"
   token 15 13:46 equals "="
   token 16 13:47 number "0.4" value=4e-1
   token 17 13:51 word "phi"
   token 18 13:54 equals "="
-  token 19 13:55 number "0.7" value=7.000000000000001e-1
+  token 19 13:55 number "0.7" value=7e-1
   token 20 13:59 word "lambda"
   token 21 13:65 equals "="
   token 22 13:66 number "0.04" value=4e-2
   token 23 13:71 word "tox"
   token 24 13:74 equals "="
-  token 25 13:75 number "9n" value=9.000000000000001e-9
+  token 25 13:75 number "9n" value=9e-9
   token 26 13:78 word "ld"
   token 27 13:80 equals "="
   token 28 13:81 number "0.05u" value=5e-8
@@ -249,13 +249,13 @@ card 12 @netlists/m7_mos1_ring_tran.cir:13:1 lines=13-14 continuations=1
   token 37 14:28 number "0.1n" value=1e-10
   token 38 14:33 word "cj"
   token 39 14:35 equals "="
-  token 40 14:36 number "0.9m" value=9.000000000000001e-4
+  token 40 14:36 number "0.9m" value=9e-4
   token 41 14:41 word "mj"
   token 42 14:43 equals "="
   token 43 14:44 number "0.5" value=5e-1
   token 44 14:48 word "cjsw"
   token 45 14:52 equals "="
-  token 46 14:53 number "0.25n" value=2.4999999999999996e-10
+  token 46 14:53 number "0.25n" value=2.5e-10
   token 47 14:59 word "mjsw"
   token 48 14:63 equals "="
   token 49 14:64 number "0.33" value=3.3e-1
@@ -278,19 +278,19 @@ card 13 @netlists/m7_mos1_ring_tran.cir:15:1 lines=15-16 continuations=1
   token 10 15:29 number "-0.8" value=-8e-1
   token 11 15:34 word "kp"
   token 12 15:36 equals "="
-  token 13 15:37 number "40u" value=3.9999999999999996e-5
+  token 13 15:37 number "40u" value=4e-5
   token 14 15:41 word "gamma"
   token 15 15:46 equals "="
   token 16 15:47 number "0.5" value=5e-1
   token 17 15:51 word "phi"
   token 18 15:54 equals "="
-  token 19 15:55 number "0.7" value=7.000000000000001e-1
+  token 19 15:55 number "0.7" value=7e-1
   token 20 15:59 word "lambda"
   token 21 15:65 equals "="
   token 22 15:66 number "0.05" value=5e-2
   token 23 15:71 word "tox"
   token 24 15:74 equals "="
-  token 25 15:75 number "9n" value=9.000000000000001e-9
+  token 25 15:75 number "9n" value=9e-9
   token 26 15:78 word "ld"
   token 27 15:80 equals "="
   token 28 15:81 number "0.05u" value=5e-8
@@ -324,7 +324,7 @@ card 14 @netlists/m7_mos1_ring_tran.cir:17:1 lines=17-17 continuations=0
   kind: dot(.tran)
   token 1 17:1 word ".tran"
   token 2 17:7 number "0.02n" value=2e-11
-  token 3 17:13 number "6n" value=6.000000000000001e-9
+  token 3 17:13 number "6n" value=6e-9
   token 4 17:16 number "0" value=0e0
   token 5 17:18 number "0.5p" value=5e-13
 card 15 @netlists/m7_mos1_ring_tran.cir:18:1 lines=18-18 continuations=0
