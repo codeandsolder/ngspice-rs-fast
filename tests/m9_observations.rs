@@ -1,5 +1,5 @@
 //! Device observations at solver points, checked by C goldens and analytic KCL.
-use ngspice_rs::analysis::RawFile;
+use ngspice_rs::analysis::{Plot, RawFile};
 use ngspice_rs::cli::simulate;
 use ngspice_rs::primitives::Complex;
 use std::fs;
@@ -96,28 +96,99 @@ fn invalid_observations_fail_without_publishing() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
-#[test]
-#[ignore = "requires absolute NGSPICE_BIN"]
-fn device_golden_matches_live_c_without_recapture() {
-    let binary = std::env::var("NGSPICE_BIN").unwrap();
-    assert!(Path::new(&binary).is_absolute());
-    let dir = scratch("live");
+// The capture oracle and a general live-C oracle serve different purposes:
+// a platform's native C build can be valid for parity without reproducing
+// another platform's binary64 rounding.
+fn run_c_oracle(variable: &str, dir: &Path) -> RawFile {
+    let binary = PathBuf::from(
+        std::env::var_os(variable).unwrap_or_else(|| panic!("set {variable} to an absolute path")),
+    );
+    assert!(binary.is_absolute(), "{variable} must be absolute");
     let raw = dir.join("c.raw");
     let run = Command::new(binary)
-        .args(["-b", "-r"])
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .env_remove("SPICE_ASCIIRAWFILE")
+        .args(["-n", "-b", "-r"])
         .arg(&raw)
         .arg(root().join("m9_device_dc.cir"))
         .output()
         .unwrap();
     assert!(
         run.status.success(),
-        "{}",
+        "{variable}: {}",
         String::from_utf8_lossy(&run.stderr)
     );
-    let got = RawFile::load(&raw).unwrap();
+    RawFile::load(&raw).unwrap()
+}
+
+fn assert_plot_bits(actual: &Plot, expected: &Plot) {
+    assert_eq!(actual.name, expected.name);
+    assert_eq!(actual.plotname, expected.plotname);
+    assert_eq!(actual.flags, expected.flags);
+    assert_eq!(actual.variables, expected.variables);
+    assert_eq!(actual.points.len(), expected.points.len());
+    for (row, (actual, expected)) in actual.points.iter().zip(&expected.points).enumerate() {
+        assert_eq!(actual.len(), expected.len());
+        for (column, (a, b)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                [a.re.to_bits(), a.im.to_bits()],
+                [b.re.to_bits(), b.im.to_bits()],
+                "point {row}, column {column}: {a:?} != {b:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "point 2, column 2")]
+fn capture_comparison_rejects_single_ulp_drift() {
     let saved = RawFile::load(root().join("m9_device_dc.raw")).unwrap();
-    assert_eq!(got.plots[0].plot, saved.plots[0].plot);
+    let expected = &saved.plots[0].plot;
+    let mut actual = expected.clone();
+    let value = &mut actual.points[2][2].re;
+    *value = f64::from_bits(value.to_bits() - 1);
+    assert_plot_bits(&actual, expected);
+}
+
+#[test]
+#[should_panic(expected = "point 0, column 0")]
+fn capture_comparison_distinguishes_signed_zero() {
+    let saved = RawFile::load(root().join("m9_device_dc.raw")).unwrap();
+    let expected = &saved.plots[0].plot;
+    let mut actual = expected.clone();
+    assert_eq!(actual.points[0][0].re.to_bits(), 0.0_f64.to_bits());
+    actual.points[0][0].re = -0.0;
+    assert_plot_bits(&actual, expected);
+}
+
+#[test]
+#[ignore = "requires absolute NGSPICE_CAPTURE_BIN; see conformance/observations/README.md"]
+fn device_golden_matches_capture_oracle_bit_exactly() {
+    let dir = scratch("capture-oracle");
+    let got = run_c_oracle("NGSPICE_CAPTURE_BIN", &dir);
     fs::remove_dir_all(dir).unwrap();
+    let saved = RawFile::load(root().join("m9_device_dc.raw")).unwrap();
+    assert_eq!(got.plots.len(), saved.plots.len());
+    for (actual, expected) in got.plots.iter().zip(&saved.plots) {
+        assert_eq!(actual.title, expected.title);
+        assert_plot_bits(&actual.plot, &expected.plot);
+    }
+}
+
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN"]
+fn device_observations_match_live_c() {
+    let dir = scratch("live-parity");
+    let c = run_c_oracle("NGSPICE_BIN", &dir);
+    let raw = dir.join("rust.raw");
+    simulate::run(&root().join("m9_device_dc.cir"), &raw, true).unwrap();
+    let ours = RawFile::load(&raw).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+    assert_eq!(ours.plots.len(), c.plots.len());
+    for (actual, expected) in ours.plots.iter().zip(&c.plots) {
+        compare(&actual.plot, &expected.plot);
+    }
 }
 
 #[test]

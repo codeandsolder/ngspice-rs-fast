@@ -31,8 +31,7 @@ use crate::netlist::ast::{PrintCard, RequestedVector, SaveCard, VectorComponent,
 use crate::netlist::token::{Token, TokenKind};
 
 use super::grammar::{Failure, Input, ParsedCard, Result, keyword};
-use super::syntax::canonical_node;
-use super::vector::punctuation;
+use super::syntax::{canonical_node, punctuation};
 
 /// A parsed `.save` or `.print` card.
 pub(super) enum OutputCard {

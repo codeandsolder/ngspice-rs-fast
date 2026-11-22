@@ -44,7 +44,9 @@ pub mod writer;
 
 pub use card::{CardKind, DEVICE_DESIGNATORS, DotCommand, RawCard};
 pub use expr::{Expr, ExprKind, ParameterExpression, SourceSpan};
-pub use parser::{ParsedDeck, Parser, SourceLimits, classify_deck, load_classified};
+pub use parser::{
+    ParsedDeck, Parser, SourceLimits, classify_deck, load_classified, parse_parameter_expression,
+};
 pub use semantic::{semantic_diff, semantic_eq, semantic_form};
 pub use source::{Deck, LogicalLine, PhysicalLine, load};
 pub use token::{Token, TokenKind, tokenize};

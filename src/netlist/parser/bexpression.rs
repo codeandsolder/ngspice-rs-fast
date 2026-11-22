@@ -152,6 +152,18 @@ fn joined(lhs: &BExpr, rhs: &BExpr) -> SourceSpan {
     }
 }
 
+fn binary(op: BBinaryOp, lhs: BExpr, rhs: BExpr) -> BExpr {
+    let span = joined(&lhs, &rhs);
+    BExpr {
+        kind: BExprKind::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        },
+        span,
+    }
+}
+
 fn enter(input: &mut In<'_>, at: usize) -> Res<()> {
     input.state.depth += 1;
     if input.state.depth > MAX_NESTING {
@@ -250,15 +262,7 @@ fn binary_level(input: &mut In<'_>, options: Options, level: usize) -> Res<BExpr
         };
         take(symbol.len()).void().parse_next(input)?;
         let rhs = binary_level(input, options, level + 1)?;
-        let span = joined(&lhs, &rhs);
-        lhs = BExpr {
-            kind: BExprKind::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            },
-            span,
-        };
+        lhs = binary(op, lhs, rhs);
     }
 }
 
@@ -317,15 +321,7 @@ fn power(input: &mut In<'_>, options: Options) -> Res<BExpr> {
         } else {
             primary(input, options)?
         };
-        let span = joined(&lhs, &rhs);
-        lhs = BExpr {
-            kind: BExprKind::Binary {
-                op: BBinaryOp::Pow,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            },
-            span,
-        };
+        lhs = binary(BBinaryOp::Pow, lhs, rhs);
     }
 }
 

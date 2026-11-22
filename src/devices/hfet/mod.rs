@@ -38,6 +38,7 @@
 
 pub(crate) mod hfet1;
 pub(crate) mod hfet2;
+mod lifecycle;
 pub(crate) mod mesa;
 
 use std::cell::Cell;

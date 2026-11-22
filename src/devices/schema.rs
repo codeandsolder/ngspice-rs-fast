@@ -190,6 +190,36 @@ impl ScalarSchema<'_> {
         parameters: impl IntoIterator<Item = &'a ParameterAssignment>,
         owner: &SourceLoc,
     ) -> SpiceResult<ScalarValues> {
+        self.validate_ordered(
+            parameters.into_iter().map(|assignment| {
+                (assignment.name.as_str(), &assignment.location, move || {
+                    finite_literal(assignment)
+                })
+            }),
+            owner,
+        )
+    }
+
+    /// The same schema and last-set precedence for already-numeric generated
+    /// devices: no formatting to SPICE text and reparsing.
+    pub(super) fn validate_numeric<'a>(
+        &self,
+        parameters: impl IntoIterator<Item = (&'a str, Real, &'a SourceLoc)>,
+        owner: &SourceLoc,
+    ) -> SpiceResult<ScalarValues> {
+        self.validate_ordered(
+            parameters
+                .into_iter()
+                .map(|(name, value, location)| (name, location, move || Ok(value))),
+            owner,
+        )
+    }
+
+    fn validate_ordered<'a, F: FnOnce() -> SpiceResult<Real>>(
+        &self,
+        parameters: impl IntoIterator<Item = (&'a str, &'a SourceLoc, F)>,
+        owner: &SourceLoc,
+    ) -> SpiceResult<ScalarValues> {
         let mut definitions = BTreeMap::new();
         let mut values = BTreeMap::new();
         for parameter in self.parameters {
@@ -214,21 +244,21 @@ impl ScalarSchema<'_> {
                 );
             }
         }
-        for assignment in parameters {
-            let parameter = definitions
-                .get(ascii_key(&assignment.name).as_ref())
-                .ok_or_else(|| SpiceError::Unsupported {
-                    feature: format!("unsupported setter '{}'", assignment.name),
-                    location: Some(assignment.location.clone()),
-                })?;
-            let value = finite_literal(assignment)?;
-            validate_value(value, parameter, &assignment.location)?;
+        for (name, location, number) in parameters {
+            let parameter = definitions.get(ascii_key(name).as_ref()).ok_or_else(|| {
+                SpiceError::Unsupported {
+                    feature: format!("unsupported setter '{name}'"),
+                    location: Some(location.clone()),
+                }
+            })?;
+            let value = number()?;
+            validate_value(value, parameter, location)?;
             values.insert(
                 parameter.name.into(),
                 ScalarValue {
                     value,
                     unit: parameter.unit,
-                    location: Some(assignment.location.clone()),
+                    location: Some(location.clone()),
                 },
             );
         }
@@ -411,6 +441,30 @@ mod tests {
         assert_eq!(original.get("m").unwrap().value.to_bits(), 1_f64.to_bits());
         assert_eq!(original.get("m").unwrap().location, None);
         assert_eq!(copy.get("r"), original.get("r"));
+    }
+
+    #[test]
+    fn ordered_numeric_validation_preserves_exact_values_and_given_locations() {
+        let schema = ScalarSchema {
+            parameters: PARAMETERS,
+        };
+        let exact = 1.379_310_344_827_586_2e-20_f64;
+        let values = schema
+            .validate_numeric([("R", 2., &loc(2)), ("r", exact, &loc(3))], &loc(1))
+            .unwrap();
+        assert_eq!(values.get("r").unwrap().value.to_bits(), exact.to_bits());
+        assert_eq!(values.get("r").unwrap().location, Some(loc(3)));
+        assert_eq!(values.get("m").unwrap().location, None);
+        assert!(
+            schema
+                .validate_numeric([("r", -1., &loc(2)), ("r", exact, &loc(3))], &loc(1),)
+                .is_err()
+        );
+        assert!(
+            schema
+                .validate_numeric([("r", Real::NAN, &loc(2))], &loc(1))
+                .is_err()
+        );
     }
 
     #[test]

@@ -149,31 +149,7 @@ impl Parser {
     ///
     /// The same failures as [`Parser::parse_deck`].
     pub fn parse_deck_with_output(self, deck: &Deck) -> SpiceResult<ParsedDeck> {
-        let (netlist, output, measurements, fourier) =
-            scopes::assemble(deck, &prepare_cards(deck), self.auto_gnd)?;
-        Ok(ParsedDeck {
-            netlist,
-            output,
-            measurements,
-            fourier,
-        })
-    }
-
-    /// Parses one unevaluated parameter expression, for instance the text of a
-    /// `{...}` value. `location` is the position of the first byte of `text`
-    /// (its column anchors every span and diagnostic). Whitespace is allowed
-    /// between tokens, as inside braces. See [`crate::netlist::expr`] for the grammar.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::primitives::SpiceError::Parse`] for malformed syntax and
-    /// [`crate::primitives::SpiceError::NotYetPorted`] for valid numparam outside the
-    /// bounded subset (other operators, functions or quoting).
-    pub fn parse_expression(
-        text: &str,
-        location: &crate::primitives::SourceLoc,
-    ) -> SpiceResult<crate::netlist::expr::ParameterExpression> {
-        expression::parse_expression(text, location, location.column, false)
+        scopes::assemble(deck, &prepare_cards(deck), self.auto_gnd)
     }
 
     /// Parses `text` (whose first byte is at `location`) as one complete
@@ -244,15 +220,27 @@ impl Parser {
         limits: SourceLimits,
     ) -> SpiceResult<ParsedDeck> {
         let (deck, cards) = resolution::resolve(path.as_ref(), limits)?;
-        let (netlist, output, measurements, fourier) =
-            scopes::assemble(&deck, &cards, self.auto_gnd)?;
-        Ok(ParsedDeck {
-            netlist,
-            output,
-            measurements,
-            fourier,
-        })
+        scopes::assemble(&deck, &cards, self.auto_gnd)
     }
+}
+
+/// Parses one unevaluated parameter expression.
+///
+/// For instance, parse the text of a
+/// `{...}` value. `location` is the position of the first byte of `text`
+/// (its column anchors every span and diagnostic). Whitespace is allowed
+/// between tokens, as inside braces. See [`crate::netlist::expr`] for the grammar.
+///
+/// # Errors
+///
+/// [`crate::primitives::SpiceError::Parse`] for malformed syntax and
+/// [`crate::primitives::SpiceError::NotYetPorted`] for valid numparam outside the
+/// bounded subset (other operators, functions or quoting).
+pub fn parse_parameter_expression(
+    text: &str,
+    location: &crate::primitives::SourceLoc,
+) -> SpiceResult<crate::netlist::expr::ParameterExpression> {
+    expression::parse_expression(text, location, location.column, false)
 }
 
 /// Cache lexical results for ordered replay; later errors do not mask earlier

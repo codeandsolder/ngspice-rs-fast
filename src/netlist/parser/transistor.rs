@@ -16,21 +16,13 @@ use crate::netlist::token::{Token, TokenKind};
 
 use super::grammar::{Input, ParsedCard, Result, gap};
 use super::syntax::{
-    assignment, canonical_node, equals, leading_value, malformed, name, named, value,
+    assignment, canonical_node, equals, leading_value, malformed, name, named, named_device, value,
 };
 
 type Connections<'a> = (Vec<&'a Token>, &'a Token);
 
 pub(super) fn transistor_card<'a>(input: &mut Input<'a>) -> Result<ParsedCard> {
-    let (instance, designator) = any
-        .verify_map(|token: &Token| {
-            match token.text.as_bytes().first().map(u8::to_ascii_lowercase) {
-                Some(b'q') if token.is_name_like() => Some((token, 'q')),
-                Some(b'm') if token.is_name_like() => Some((token, 'm')),
-                _ => None,
-            }
-        })
-        .parse_next(input)?;
+    let (instance, designator) = named_device("qm").parse_next(input)?;
     let (connections, parameters) = cut_err(|input: &mut Input<'a>| {
         let connections = if designator == 'q' {
             bjt_connections(input)?

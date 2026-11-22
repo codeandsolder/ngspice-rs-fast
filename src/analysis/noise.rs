@@ -55,7 +55,7 @@ use crate::analysis::frequency::{Advance, FrequencyGrid, MAX_POINTS};
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{Plot, PlotFlags, Variable};
 use crate::analysis::{AnalysisContext, AnalysisRequest};
-use crate::devices::noise::{InstanceNoise, circuit_noise};
+use crate::devices::noise::{InstanceNoise, circuit_noise, squared_gain};
 use crate::devices::{Circuit, LinearSystem, SourceKind};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult, parse_spice_number};
 
@@ -519,6 +519,7 @@ impl Generators {
     fn refresh(&mut self, instance: InstanceNoise) -> SpiceResult<()> {
         let old = &self.instance;
         if old.device != instance.device
+            || old.family != instance.family
             || old.name != instance.name
             || old.total != instance.total
             || old.sources.len() != instance.sources.len()
@@ -546,7 +547,7 @@ impl Generators {
         difference: impl Fn([NodeId; 2]) -> Complex,
         integrated: &mut Power,
         mut summary_row: Option<&mut NoiseRow>,
-    ) -> Real {
+    ) -> SpiceResult<Real> {
         let mut density_sum = 0.;
         if sample.reset
             && sample.step.width == 0.
@@ -555,7 +556,7 @@ impl Generators {
             *total = Power::default();
         }
         for (source, history) in self.instance.sources.iter().zip(&mut self.history) {
-            let density = source.output_density(&difference, sample.frequency);
+            let density = source.output_density(&difference, sample.frequency)?;
             density_sum += density;
             let contribution = history.advance(density, sample);
             if sample.step.width != 0. {
@@ -575,7 +576,7 @@ impl Generators {
         {
             row.push_power(density_sum);
         }
-        density_sum
+        Ok(density_sum)
     }
 
     fn append_integrated(&self, row: &mut NoiseRow) {
@@ -610,9 +611,14 @@ fn plot_names(
             .chain(g.instance.total.then_some(""));
         for suffix in suffixes {
             let name = format!("{}{suffix}", g.instance.name);
-            spectrum.push(output(format!("onoise_{name}"), true));
-            integrated.push(output(format!("onoise_total_{name}"), false));
-            integrated.push(input(format!("inoise_total_{name}"), false));
+            let separator = match g.instance.family {
+                crate::devices::noise::NoiseFamily::Bsim3
+                | crate::devices::noise::NoiseFamily::Bsim4 => '.',
+                _ => '_',
+            };
+            spectrum.push(output(format!("onoise{separator}{name}"), true));
+            integrated.push(output(format!("onoise_total{separator}{name}"), false));
+            integrated.push(input(format!("inoise_total{separator}{name}"), false));
         }
     }
     spectrum.push(output("onoise_spectrum".into(), true));
@@ -623,11 +629,16 @@ fn plot_names(
 }
 
 /// The squared magnitude of `y[n1] - y[n2]`, ground being zero.
-fn gain(circuit: &Circuit, y: &[Complex], nodes: [NodeId; 2]) -> Real {
-    let difference = difference(circuit, y, nodes);
-    let real_power = difference.re * difference.re;
-    let imaginary_power = difference.im * difference.im;
-    real_power + imaginary_power
+fn gain(circuit: &Circuit, y: &[Complex], nodes: [NodeId; 2]) -> SpiceResult<Real> {
+    let gain = squared_gain(difference(circuit, y, nodes));
+    if gain.is_finite() {
+        Ok(gain)
+    } else {
+        Err(SpiceError::Numerical {
+            context: ".noise".into(),
+            message: "nonfinite input transfer gain".into(),
+        })
+    }
 }
 
 /// `y[n1] - y[n2]`, ground reading zero (C's `CKTrhs`/`CKTirhs`
@@ -831,7 +842,7 @@ pub(crate) fn run(
                 )?,
             )?;
         }
-        let gain_sq_inv = 1. / gain(circuit, &forward, output).max(N_MINGAIN);
+        let gain_sq_inv = 1. / gain(circuit, &forward, output)?.max(N_MINGAIN);
         let sample = NoiseSample::new(freq, last, gain_sq_inv, card.start, card.summary != 0);
         let print_summary = card.summary != 0 && step.is_multiple_of(card.summary);
         let mut out_density = 0.;
@@ -849,7 +860,7 @@ pub(crate) fn run(
                 |nodes| difference(circuit, &adjoint, nodes),
                 &mut integrated_power,
                 print_summary.then_some(&mut row),
-            );
+            )?;
         }
         if emit {
             row.push_power(out_density);
@@ -893,6 +904,7 @@ mod tests {
     fn instance() -> InstanceNoise {
         InstanceNoise {
             device: 3,
+            family: crate::devices::noise::NoiseFamily::Resistor,
             name: "test".into(),
             sources: vec![
                 NoiseSource::new(
@@ -918,7 +930,9 @@ mod tests {
         let transfer = |_| Complex::real(1.);
         let first = NoiseSample::new(10., 10., 0.25, 10., true);
         assert_eq!(
-            generators.accumulate(&first, transfer, &mut integrated, Some(&mut row)),
+            generators
+                .accumulate(&first, transfer, &mut integrated, Some(&mut row))
+                .unwrap(),
             5.
         );
         assert_eq!(
@@ -926,13 +940,19 @@ mod tests {
             [2_f64.sqrt(), 3_f64.sqrt(), 5_f64.sqrt()].map(Complex::real)
         );
         let mut fresh = instance();
-        fresh.sources[0].kind = NoiseKind::Gain { factor: 2. };
-        fresh.sources[0].nodes = [NodeId::new(2), NodeId::GROUND];
+        // Change both the law and the transfer pair while leaving the
+        // resulting output power unchanged: 8 * (0.5)^2 == 2.
+        fresh.sources[0].kind = NoiseKind::Gain { factor: 8. };
+        let new_nodes = [NodeId::new(2), NodeId::GROUND];
+        fresh.sources[0].nodes = new_nodes;
         generators.refresh(fresh).unwrap();
         let second = NoiseSample::new(20., 10., 0.25, 10., true);
+        let refreshed_transfer = |nodes| Complex::real(if nodes == new_nodes { 0.5 } else { 1. });
         // Integrate even when this frequency has no printed summary row.
         assert_eq!(
-            generators.accumulate(&second, transfer, &mut integrated, None),
+            generators
+                .accumulate(&second, refreshed_transfer, &mut integrated, None)
+                .unwrap(),
             5.
         );
         assert_eq!(integrated.output, 50.);
@@ -954,18 +974,35 @@ mod tests {
     }
 
     #[test]
+    fn invalid_generator_is_rejected_even_without_a_summary_row() {
+        let mut generators = Generators::new(instance());
+        let mut integrated = Power::default();
+        let sample = NoiseSample::new(10., 10., 0.25, 10., true);
+        let invalid_transfer = |_| Complex::real(f64::NAN);
+        assert!(
+            generators
+                .accumulate(&sample, invalid_transfer, &mut integrated, None)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn squared_noise_preserves_original_powers_in_every_slot() {
         let mut generators = Generators::new(instance());
         let mut integrated = Power::default();
         let mut row = NoiseRow::new(Representation::Power, 6);
         let transfer = |_| Complex::real(1.);
         let first = NoiseSample::new(10., 10., 0.25, 10., true);
-        generators.accumulate(&first, transfer, &mut integrated, Some(&mut row));
+        generators
+            .accumulate(&first, transfer, &mut integrated, Some(&mut row))
+            .unwrap();
         // sqrt(2)^2 != 2 in binary64: the former rendering lost this bit.
         assert_ne!(2_f64.sqrt().powi(2), 2.);
         assert_eq!(row.values, [2., 3., 5.].map(Complex::real));
         let second = NoiseSample::new(20., 10., 0.25, 10., true);
-        generators.accumulate(&second, transfer, &mut integrated, None);
+        generators
+            .accumulate(&second, transfer, &mut integrated, None)
+            .unwrap();
         row.values.clear();
         generators.append_integrated(&mut row);
         integrated.append(&mut row);

@@ -72,15 +72,17 @@ pub struct IndependentSource {
     /// `distof1`/`distof2` distortion inputs (C `VSRCdF1given`, ...).
     distortion: [Option<crate::devices::distortion::DistortionInput>; 2],
 }
-impl IndependentSource {
-    /// Creates an independent source. `voltage=false` selects a current source.
-    /// The source counts as having an AC value ([`Self::ac_given`]) when `ac`
-    /// is nonzero; [`Self::with_ac_given`] records an explicit `ac 0`.
-    /// # Errors
-    /// Non-finite excitation or invalid waveform.
-    pub fn new(
-        name: impl Into<String>,
-        terminals: [NodeId; 2],
+/// Validated excitation without circuit topology. Card setters resolve this
+/// before node allocation; the direct source constructor uses the same path.
+pub(super) struct SourceExcitation {
+    voltage: bool,
+    dc: Real,
+    ac: Complex,
+    waveform: Waveform,
+}
+
+impl SourceExcitation {
+    pub(super) fn new(
         voltage: bool,
         dc: Real,
         ac: Complex,
@@ -91,6 +93,21 @@ impl IndependentSource {
             return Err(SpiceError::circuit("non-finite source excitation"));
         }
         Ok(Self {
+            voltage,
+            dc,
+            ac,
+            waveform,
+        })
+    }
+
+    pub(super) fn bind(self, name: impl Into<String>, terminals: [NodeId; 2]) -> IndependentSource {
+        let Self {
+            voltage,
+            dc,
+            ac,
+            waveform,
+        } = self;
+        IndependentSource {
             name: name.into(),
             terminals: [terminals[0], terminals[1], NodeId::GROUND],
             voltage,
@@ -110,7 +127,25 @@ impl IndependentSource {
             waveform,
             port: None,
             distortion: [None, None],
-        })
+        }
+    }
+}
+
+impl IndependentSource {
+    /// Creates an independent source. `voltage=false` selects a current source.
+    /// The source counts as having an AC value ([`Self::ac_given`]) when `ac`
+    /// is nonzero; [`Self::with_ac_given`] records an explicit `ac 0`.
+    /// # Errors
+    /// Non-finite excitation or invalid waveform.
+    pub fn new(
+        name: impl Into<String>,
+        terminals: [NodeId; 2],
+        voltage: bool,
+        dc: Real,
+        ac: Complex,
+        waveform: Waveform,
+    ) -> SpiceResult<Self> {
+        Ok(SourceExcitation::new(voltage, dc, ac, waveform)?.bind(name, terminals))
     }
 
     /// Selects C's PORT cosine time function, including its zero-amplitude

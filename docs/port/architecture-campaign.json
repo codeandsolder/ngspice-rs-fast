@@ -4,8 +4,8 @@
     "title": "Pole-zero conformance: replace greedy root pairing with exact bounded multiset matching",
     "depends": [],
     "paths": [
-      "xtask/src/compare.rs",
-      "xtask/src/verify.rs"
+      "xtask/src/commands/compare.rs",
+      "xtask/src/commands/verify.rs"
     ],
     "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/18",
     "area": "Reference matching reliability"
@@ -75,7 +75,7 @@
     "depends": [],
     "paths": [
       "src/devices/bsim4/",
-      "xtask/src/bsim4_fields.rs"
+      "xtask/src/commands/bsim4_fields.rs"
     ],
     "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/16",
     "area": "BSIM4 state ownership"
@@ -263,7 +263,7 @@
     "paths": [
       "xtask/src/",
       "xtask/Cargo.toml",
-      "conformance/reference.rs",
+      "conformance/support/src/fixtures.rs",
       "Cargo.toml",
       "Cargo.lock",
       "tests/bjt_gummel_poon.rs"
@@ -278,9 +278,9 @@
       "24"
     ],
     "paths": [
-      "conformance/reference.rs",
-      "xtask/src/ngspice.rs",
-      "xtask/src/golden.rs",
+      "conformance/support/src/fixtures.rs",
+      "conformance/support/src/ngspice.rs",
+      "xtask/src/commands/golden.rs",
       "tests/support/",
       "tests/common/",
       "tests/c_measure_reference.rs"
@@ -392,7 +392,7 @@
       "src/devices/bsim3/",
       "src/devices/bsim4/sens.rs",
       "src/devices/bsim4/fields.rs",
-      "xtask/src/bsim4_fields.rs"
+      "xtask/src/commands/bsim4_fields.rs"
     ],
     "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/51",
     "area": "Typed sensitivity snapshots"
@@ -488,7 +488,7 @@
       "src/devices/pulse.rs",
       "src/devices/breaks.rs",
       "src/netlist/elaborate.rs",
-      "xtask/src/tran.rs"
+      "xtask/src/commands/tran.rs"
     ],
     "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/33",
     "area": "Shared waveform timeline"
@@ -501,8 +501,8 @@
       "33"
     ],
     "paths": [
-      "xtask/src/tran.rs",
-      "xtask/src/verify.rs"
+      "xtask/src/commands/tran.rs",
+      "xtask/src/commands/verify.rs"
     ],
     "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/39",
     "area": "Indexed conformance plan"

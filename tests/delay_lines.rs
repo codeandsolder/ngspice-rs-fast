@@ -9,7 +9,9 @@ use std::rc::Rc;
 use ngspice_rs::analysis::{
     AnalysisContext, AnalysisRequest, Plot, TransientStats, companion_transient,
 };
-use ngspice_rs::devices::delay::{DelayContext, DelayHistory, DelayLine, DelayUpdate};
+use ngspice_rs::devices::delay::{
+    DelayContext, DelayHistory, DelayLine, DelayUpdate, WaveformUpdate,
+};
 use ngspice_rs::devices::{
     AcceptContext, AnalysisMode, Circuit, DelayAcceptance, Device, LinearContext, LoadRequest,
     ModelContext, StampContext, StateHistory,
@@ -63,7 +65,7 @@ impl Device for Probe {
             self.log.borrow_mut().push(Event::Load {
                 time,
                 len: history.len(),
-                last: history.last_time().unwrap_or(f64::NAN),
+                last: history.as_waveform()?.last_time().unwrap_or(f64::NAN),
             });
         }
         Ok(())
@@ -80,17 +82,17 @@ impl Device for Probe {
 }
 
 impl DelayLine for Probe {
-    fn width(&self) -> usize {
-        1
+    fn new_history(&self) -> DelayHistory {
+        DelayHistory::waveform(1)
     }
     fn start(&self, context: &DelayContext<'_>) -> SpiceResult<DelayUpdate> {
-        Ok(DelayUpdate {
+        Ok(DelayUpdate::Waveform(WaveformUpdate {
             reset: Some(vec![(
                 context.time,
                 vec![context.node_voltage(self.terminals[0])],
             )]),
-            ..DelayUpdate::default()
-        })
+            ..WaveformUpdate::default()
+        }))
     }
     fn accept(
         &self,
@@ -104,15 +106,15 @@ impl DelayLine for Probe {
             time: context.time,
             len: history.len(),
         });
-        Ok(DelayUpdate {
+        Ok(DelayUpdate::Waveform(WaveformUpdate {
             append: Some((context.time, vec![context.node_voltage(self.terminals[0])])),
             breakpoints: self
                 .request
                 .filter(|t| *t > context.time)
                 .into_iter()
                 .collect(),
-            ..DelayUpdate::default()
-        })
+            ..WaveformUpdate::default()
+        }))
     }
     fn timestep_limit(
         &self,
@@ -284,7 +286,12 @@ fn failed_acceptance_leaves_every_history_unchanged() {
         .accept_transient_point(&x, 1e-6, &mut history, next, &acceptance(false))
         .unwrap();
     assert_eq!(history.delay(3).map(DelayHistory::len), Some(2));
-    assert_eq!(history.delay(3).and_then(|h| h.value(1, 0)), Some(0.5));
+    assert_eq!(
+        history
+            .delay(3)
+            .and_then(|h| h.as_waveform().ok()?.value(1, 0)),
+        Some(0.5)
+    );
 }
 
 #[test]

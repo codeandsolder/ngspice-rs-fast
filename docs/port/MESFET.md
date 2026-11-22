@@ -485,7 +485,7 @@ skip list is a mainline-device list: `#source`, `#drain`, `#collector`,
 `rd=1e6 rs=1e6` looked like a nodaless resistance. `show z1` disproves it:
 `dprimenode`/`sprimenode` are real nodes, and the current collapses to
 `0.5/(rd + rs) = 2.5e-7 A` because the 1 MOhm pair starves the channel.
-`xtask/src/verify.rs` projects the port's extra columns away for exactly that
+`xtask/src/commands/verify.rs` projects the port's extra columns away for exactly that
 list, while keeping `#gate`, `#gs` and `#gd` compared.
 
 Three fixtures cover the paths (`m10_mesa_res_op`, `m10_mesa_res_dc`,

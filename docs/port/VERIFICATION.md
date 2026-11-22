@@ -422,7 +422,7 @@ comparison, while C and Rust agree on the same platform.
 The original fixture and macOS golden remain unchanged. A new independent C
 capture lives in `conformance/golden/linux-x86_64-gnu/sens_bjt.raw`, with exact
 source/compiler/libc/configuration provenance in that directory's README.
-`conformance/reference.rs` is shared only by tests and xtask, not the simulator;
+`conformance/support/src/fixtures.rs` is shared only by tests and xtask, not the simulator;
 its explicit target/fixture selection is used by capture/check/list/verify
 and the BJT test. It never silently substitutes another file when the selected
 capture is missing. All 291 columns keep the existing bound; no comparison
@@ -484,7 +484,7 @@ reproduced; all **6** opt-in live sensitivity tests passed. Snapshot update:
   entry (`.ac`, `.op`, filtered `.sens`); the others are single-analysis
   entries under the new `compare::SENSITIVITY` (1e-8 relative, 1e-12
   absolute) and `compare::SENSITIVITY_NONLINEAR` (1e-6 relative, 1e-9
-  absolute), justified in `xtask/src/compare.rs` by the `1/delta`
+  absolute), justified in `xtask/src/commands/compare.rs` by the `1/delta`
   amplification of rounding in a forward difference.
 - `cargo xtask golden verify`: **119 verified / 0 unsupported / 0 failures**;
   `cargo xtask golden check --netlist <each new fixture>` reproduces all five.
@@ -509,7 +509,7 @@ reproduced; all **6** opt-in live sensitivity tests passed. Snapshot update:
   recaptured and no tolerance changed. All four are `BATCH` entries (an IM and
   a harmonic card each; `disto_multi` with `.ac` and `.op`) under the new
   `compare::DISTORTION` (1 ppm relative, 1e-18 absolute floor, justified in
-  `xtask/src/compare.rs`).
+  `xtask/src/commands/compare.rs`).
 - `cargo xtask golden verify`: **114 verified / 0 unsupported / 0 failures**;
   `cargo xtask golden check --netlist <each new fixture>` reproduces all four;
   `cargo xtask snapshots --bless` created only the eight token/AST snapshots
@@ -560,7 +560,7 @@ Seven new C goldens, each captured once with `cargo xtask golden capture
 scratch copy; no existing golden was recaptured and no tolerance changed.
 `golden verify` compares pole-zero plots as unordered root sets under
 `compare::POLE_ZERO` (`|Rust - C| <= 1e-6 |C| + 1e-9 max|C root|`, justified in
-`xtask/src/compare.rs` and [POLE_ZERO_ADR.md](POLE_ZERO_ADR.md)); the plot name,
+`xtask/src/commands/compare.rs` and [POLE_ZERO_ADR.md](POLE_ZERO_ADR.md)); the plot name,
 flags, variable names, units and root counts must match exactly.
 
 | Fixture | Exercises | Worst error |
@@ -1007,7 +1007,7 @@ transfer characteristic`, `Operating Point`, `Transient Analysis`.
   re-runs the deck after `.endc` because of the `.op` card and fails). The
   capture refuses a rawfile whose plot count differs from the schedule.
   Single-analysis fixtures are instrumented exactly as before.
-* **Verify.** `xtask/src/verify.rs` has a `BATCH` registry beside `SUPPORTED`:
+* **Verify.** `xtask/src/commands/verify.rs` has a `BATCH` registry beside `SUPPORTED`:
   one `Stage` (analysis type and gate) per plot. The fixture's schedule, the
   golden's plot count and the stage count must agree; each plot must carry the
   same `Plotname:` as the C plot at its position, and is then compared under
@@ -1058,7 +1058,7 @@ fixture(s), 0 failure(s)** with the gate.
 ## Historical bounded M5 gate (#18, #6, #45, #42, #43, #44)
 
 `cargo xtask golden verify` reports **26 verified fixture(s), 0 unsupported
-fixture(s), 0 failure(s)**: `EXCLUDED` in `xtask/src/verify.rs` is empty, so
+fixture(s), 0 failure(s)**: `EXCLUDED` in `xtask/src/commands/verify.rs` is empty, so
 `subckt_divider` runs through the production `.op` path and matches its committed
 C golden. `cargo test --workspace --locked` reports **799 passed, 0 failed, 37
 ignored** on stable (rustc 1.99.0) and Rust 1.89.0; the 37 opt-in live-C
@@ -1222,7 +1222,8 @@ write <fixture>.raw
 ```
 
 immediately before the first `.end` card, runs `ngspice -b` on it with a scratch
-directory (`target/xtask/golden/<fixture>/`) as the working directory, and reads
+directory (`target/xtask/golden/<fixture>/` by default, under `CARGO_TARGET_DIR`
+or `CARGO_BUILD_TARGET_DIR` when set) as the working directory, and reads
 the ASCII rawfile that `write` produced. A deck with several analysis cards
 writes every plot by name instead and ends the block with `quit` (see
 "Multi-analysis batch decks (#96)"). A fixture that already contains a
@@ -1231,6 +1232,16 @@ writes every plot by name instead and ends the block with `quit` (see
 The scratch directory is also why `write` takes a bare file name: the path never
 needs quoting, and `.include`-style relative paths would resolve the same way
 every time (they are out of scope for fixtures anyway).
+
+Fixture discovery, platform-specific golden selection, scratch paths, external
+C invocation and textual capture comparison are provided by the unpublished
+`ngspice-conformance` workspace library in `conformance/support`. It has
+no dependency on the simulator. `xtask` supplies the analysis schedule and
+validates the decoded plots; integration tests may use the same reference
+selector without including another crate's source. The verifier compares
+against the selected platform reference only, never falling back to a different
+platform. Stale rawfiles and obsolete `.spiceinit` must be removed successfully
+(or already be absent) before a capture starts.
 
 ## Storage and comparison
 
@@ -1259,7 +1270,10 @@ For **capture/check only**, locate the reference binary with `--ngspice <PATH>` 
 exists inside a built ngspice checkout), then `ngspice` on `PATH`.
 A relative `--ngspice` is resolved against the workspace root, not the caller's
 directory, and stored as an absolute path so it still resolves inside the scratch
-directory.
+directory. An explicitly selected binary (including the environment override)
+must be usable; capture and check do not silently switch to another oracle.
+Fixture IDs are ASCII-case-insensitive, with collisions rejected before
+processing any deck.
 
 ## What the tests check
 
@@ -1654,7 +1668,7 @@ unregistered new fixtures and missing default supported decks fail explicitly.
 Verify accepts only `--netlist`; it neither locates/executes C nor writes fixtures,
 goldens or scratch output. Capture/check/list retain their existing behavior.
 
-The extension registry is `xtask/src/verify.rs` (`SUPPORTED`/`BATCH`/
+The extension registry is `xtask/src/commands/verify.rs` (`SUPPORTED`/`BATCH`/
 `EXCLUDED`). The Rust-only `Variant` runs (`backend=diffsol method=bdf` against
 the same golden) were removed with the diffsol backend in M10 wave 0.5.
 `EXCLUDED` holds `multi_analysis_pz`: the port matches a `-ffp-contract=off` C
@@ -1664,7 +1678,7 @@ empty `pz2` plot, while the committed golden came from the FMA-built reference
 analysis kind, axis identity and comparison policy only after demonstrating
 production support, not merely parser support. A `SUPPORTED` entry requires
 exactly one deck analysis and one C plot; multi-analysis decks are registered in
-`BATCH` instead (see "Multi-analysis batch decks (#96)"). `xtask/src/compare.rs` centralizes metadata, shape,
+`BATCH` instead (see "Multi-analysis batch decks (#96)"). `xtask/src/commands/compare.rs` centralizes metadata, shape,
 finite-value and numerical checks: plot name/flags, point count, unique variable
 names, units and real-vector flags must match. Internal plot IDs and rawfile
 Title/Date/Command headers are intentionally not numerical comparisons.
@@ -1710,7 +1724,7 @@ the port-internal tests in `options_coverage.rs`.
 
 ## Transient comparison tooling (#48 item 1)
 
-`xtask/src/tran.rs` is the event-aware comparator for the M3 transient exit gate.
+`xtask/src/commands/tran.rs` is the event-aware comparator for the M3 transient exit gate.
 All twelve transient fixtures (`rc_transient`, seven gate decks, four initialized-state decks) are
 registered in `golden verify` against their committed goldens (see above). The opt-in live comparisons in
 `tests/c_companion_reference.rs` cover the PULSE/PWL RC and
