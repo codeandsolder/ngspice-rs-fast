@@ -553,3 +553,31 @@ fn mixed_urc_txl_and_normal_records_share_the_complete_deck_budget() {
         );
     }
 }
+
+#[test]
+fn shared_model_defaults_keep_instance_geometry_and_failures_independent() {
+    let parsed = parse(
+        "u1 a b 0 m\nu2 b c 0 m l=3m n=1\nu3 c d 0 m n=0\nu4 c e 0 m\n.model m urc l=1m l=2m n=2 n=3",
+    )
+    .unwrap();
+    let models = ngspice_rs::devices::ModelResolver::new(&parsed.models).unwrap();
+    let context = ModelContext::default();
+    let mut c = Circuit::new();
+    c.add_instances(&parsed.devices[..2], &models, &context)
+        .unwrap();
+    assert_eq!(parameter(&c, "u1", "l"), 1e-3);
+    assert_eq!(parameter(&c, "u1", "n"), 2.);
+    assert_eq!(parameter(&c, "u2", "l"), 3e-3);
+    assert_eq!(parameter(&c, "u2", "n"), 1.);
+    assert_eq!(c.device_count(), 12);
+    assert!(
+        c.add_instances(&parsed.devices[2..3], &models, &context)
+            .is_err()
+    );
+    assert_eq!(c.device_count(), 12);
+    c.add_instances(&parsed.devices[3..], &models, &context)
+        .unwrap();
+    assert_eq!(parameter(&c, "u4", "l"), 1e-3);
+    assert_eq!(parameter(&c, "u4", "n"), 2.);
+    assert_eq!(c.device_count(), 20);
+}

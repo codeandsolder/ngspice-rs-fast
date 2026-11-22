@@ -10,7 +10,7 @@ mod pade;
 mod transient;
 use super::elaboration::{ElaborationSize, reserve};
 use crate::devices::linear::LinearContext;
-use crate::devices::models::{ModelContext, ModelResolver, ResolvedModel};
+use crate::devices::models::{ModelContext, ModelResolver, PreparationKey, ResolvedModel};
 use crate::devices::rlc::{Capacitor, Resistor};
 use crate::devices::schema::{ScalarDomain, ScalarParameter, ScalarSchema, ScalarUnit};
 use crate::devices::traits::{AnalysisMode, Device, StampContext};
@@ -45,8 +45,14 @@ struct Model {
     c: Real,
     length: Real,
 }
-impl Model {
-    fn read(card: &ModelCard) -> SpiceResult<(Self, Vec<&ParameterAssignment>)> {
+/// Immutable declaration data, separate from instance-specific length.
+struct ModelInputs {
+    model: Model,
+    defaults: Vec<ParameterAssignment>,
+}
+
+impl ModelInputs {
+    fn read(card: &ModelCard) -> SpiceResult<Self> {
         let mut setters = Vec::new();
         for p in &card.parameters {
             if p.kind == ParameterKind::Flag && p.name == "txl" {
@@ -67,16 +73,16 @@ impl Model {
                 )
             })
         };
-        Ok((
-            Self {
+        Ok(Self {
+            model: Model {
                 r: get("r")?,
                 l: get("l")?,
                 g: get("g")?,
                 c: get("c")?,
                 length: get("length")?,
             },
-            defaults,
-        ))
+            defaults: defaults.into_iter().cloned().collect(),
+        })
     }
 }
 /// A validated native line input. Its physical setup is deferred until the
@@ -95,11 +101,10 @@ impl NativePlan {
                 "TXL requires four written terminals (inp2y.c)",
             ));
         }
-        let (m, model_defaults) = Model::read(model.card())?;
-        let values = crate::devices::schema::with_defaults(
-            &INSTANCE,
-            &model_defaults,
-            instance.parameters.iter(),
+        let inputs = model.prepare(PreparationKey::Inputs, || ModelInputs::read(model.card()))?;
+        let m = inputs.model;
+        let values = INSTANCE.validate(
+            inputs.defaults.iter().chain(&instance.parameters),
             &instance.location,
         )?;
         let given = values.get("len").map(|v| v.value);

@@ -656,3 +656,34 @@ fn txl_fallback_and_native_plans_have_exact_distinct_resource_costs() {
         }
     }
 }
+
+#[test]
+fn shared_model_defaults_do_not_capture_instance_lengths() {
+    let parsed = deck(
+        "y1 a 0 b 0 m\ny2 b 0 c 0 m len=3\ny3 c 0 d 0 m len=0\ny4 c 0 e 0 m\n.model m txl r=1 l=250e-9 c=100e-12 g=0 length=1 len=2 len=4",
+    )
+    .unwrap();
+    let models = ngspice_rs::devices::ModelResolver::new(&parsed.models).unwrap();
+    let context = ngspice_rs::devices::ModelContext::default();
+    let mut c = Circuit::new();
+    c.add_instances(&parsed.devices[..2], &models, &context)
+        .unwrap();
+    let length = |c: &Circuit, name| {
+        c.device(name)
+            .unwrap()
+            .observation_parameter("length", &context)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(length(&c, "y1"), 2.);
+    assert_eq!(length(&c, "y2"), 3.);
+    assert!(
+        c.add_instances(&parsed.devices[2..3], &models, &context)
+            .is_err()
+    );
+    assert_eq!(c.device_count(), 2);
+    c.add_instances(&parsed.devices[3..], &models, &context)
+        .unwrap();
+    assert_eq!(length(&c, "y4"), 2.);
+    assert_eq!(c.device_count(), 3);
+}

@@ -87,12 +87,12 @@ use std::collections::BTreeSet;
 
 use super::elaboration::{ElaborationSize, reserve, resource_error};
 use crate::devices::linear::LinearContext;
-use crate::devices::models::{ModelContext, ModelFamily, ModelResolver};
+use crate::devices::models::{ModelContext, ModelFamily, ModelResolver, PreparationKey};
 use crate::devices::rlc::{Capacitor, Resistor};
 use crate::devices::schema::{ScalarDomain, ScalarParameter, ScalarSchema, ScalarUnit};
 use crate::devices::traits::{Device, StampContext};
 use crate::maths::Vector;
-use crate::netlist::ast::{DeviceInstance, ParameterKind};
+use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment, ParameterKind};
 use crate::primitives::{NodeAppend, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// The most sections one instance may expand into. C has no limit; the bound
@@ -317,6 +317,39 @@ impl UrcSections {
     }
 }
 
+/// Immutable declaration data with model defaults in C's application order.
+struct ModelInputs {
+    values: crate::devices::schema::ScalarValues,
+    defaults: Vec<ParameterAssignment>,
+}
+
+impl ModelInputs {
+    fn read(card: &ModelCard) -> SpiceResult<Self> {
+        let mut setters = Vec::with_capacity(card.parameters.len());
+        for parameter in &card.parameters {
+            if parameter.kind == ParameterKind::Flag && parameter.name == "urc" {
+                continue; // URC_MOD_URC: a no-op type flag (urcmpar.c).
+            }
+            if parameter.name.eq_ignore_ascii_case("level") {
+                return Err(SpiceError::Unsupported {
+                    feature: "level on a urc model (URCmPTable has no level; C ignores it)".into(),
+                    location: Some(parameter.location.clone()),
+                });
+            }
+            setters.push(parameter);
+        }
+        // `inpgmod.c::create_model`: `l`/`n` on the `.model` card are instance
+        // defaults there, applied before the instance card's own setters.
+        let (setters, model_defaults) =
+            crate::devices::schema::split_model_setters(setters, &MODEL, &INSTANCE);
+        let m = MODEL.validate(setters, &card.location)?;
+        Ok(Self {
+            values: m,
+            defaults: model_defaults.into_iter().cloned().collect(),
+        })
+    }
+}
+
 /// Validated section arithmetic and provenance, without allocating ladder
 /// nodes, devices or state. Every device in this plan has an exact size.
 pub(super) struct UrcPlan {
@@ -350,28 +383,10 @@ impl UrcPlan {
             ));
         }
         let card = model.card();
-        let mut setters = Vec::with_capacity(card.parameters.len());
-        for parameter in &card.parameters {
-            if parameter.kind == ParameterKind::Flag && parameter.name == "urc" {
-                continue; // URC_MOD_URC: a no-op type flag (urcmpar.c).
-            }
-            if parameter.name.eq_ignore_ascii_case("level") {
-                return Err(SpiceError::Unsupported {
-                    feature: "level on a urc model (URCmPTable has no level; C ignores it)".into(),
-                    location: Some(parameter.location.clone()),
-                });
-            }
-            setters.push(parameter);
-        }
-        // `inpgmod.c::create_model`: `l`/`n` on the `.model` card are instance
-        // defaults there, applied before the instance card's own setters.
-        let (setters, model_defaults) =
-            crate::devices::schema::split_model_setters(setters, &MODEL, &INSTANCE);
-        let m = MODEL.validate(setters, &card.location)?;
-        let i = crate::devices::schema::with_defaults(
-            &INSTANCE,
-            &model_defaults,
-            instance.parameters.iter(),
+        let inputs = model.prepare(PreparationKey::Inputs, || ModelInputs::read(card))?;
+        let m = &inputs.values;
+        let i = INSTANCE.validate(
+            inputs.defaults.iter().chain(&instance.parameters),
             &instance.location,
         )?;
         let value = |name: &str| m.get(name).map(|v| v.value);
