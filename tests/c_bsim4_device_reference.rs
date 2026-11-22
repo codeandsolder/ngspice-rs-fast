@@ -134,14 +134,21 @@ fn compare(c: &Plot, rust: &Plot, label: &str) {
     let grid: Vec<f64> = rust
         .column("time")
         .map_or_else(Vec::new, |t| t.iter().map(|v| v.re).collect());
-    for variable in c.variables() {
+    for (column, variable) in c.variables().iter().enumerate() {
         let name = variable.name.as_str();
-        let expected = c.column(name).unwrap();
+        let expected = c.column_at(column).unwrap().into_iter().map(|sample| {
+            let [re, im] = ngspice_conformance::ngspice::batch_reference_sample(
+                column,
+                name,
+                [sample.re, sample.im],
+            );
+            ngspice_rs::primitives::Complex::new(re, im)
+        });
         let actual = rust
             .column(name)
             .unwrap_or_else(|| panic!("{label}: port has no {name}"));
         let scale = expected
-            .iter()
+            .clone()
             .map(|v| v.re.abs().max(v.im.abs()))
             .fold(0.0, f64::max);
         // Picoamp branch currents are gmin-level cancellations, which the
@@ -149,7 +156,7 @@ fn compare(c: &Plot, rust: &Plot, label: &str) {
         let floor = 1e-6 * scale + if name.starts_with("i(") { 1e-15 } else { 1e-30 };
         if transient {
             let times = c.column("time").unwrap();
-            for (time, value) in times.iter().zip(&expected) {
+            for (time, value) in times.iter().zip(expected) {
                 let k = grid
                     .partition_point(|&t| t < time.re)
                     .clamp(1, grid.len() - 1);
@@ -166,11 +173,8 @@ fn compare(c: &Plot, rust: &Plot, label: &str) {
             continue;
         }
         assert_eq!(actual.len(), expected.len(), "{label} {name}: point count");
-        for (k, (a, e)) in actual.iter().zip(&expected).enumerate() {
+        for (k, (a, e)) in actual.iter().zip(expected).enumerate() {
             for (x, y, part) in [(a.re, e.re, "re"), (a.im, e.im, "im")] {
-                if name == "frequency" && part == "im" {
-                    continue;
-                }
                 assert!(
                     (x - y).abs() <= 1e-6 * y.abs() + floor,
                     "{label} {name}[{k}].{part}: port {x:e}, C {y:e}"

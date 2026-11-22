@@ -37,7 +37,9 @@ fn close(a: f64, b: f64, relative: f64, absolute: f64) {
 }
 #[test]
 fn diode_dc_obeys_junction_law_kcl_and_matches_c() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/netlists/diode_dc.cir");
+    let path = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance/netlists/diode_dc.cir");
     let n = Parser::new().parse_file(path).unwrap();
     let mut c = Circuit::from_netlist(&n).unwrap();
     // With ngspice's default Newton tolerances (reltol 1e-3, vntol 1e-6) the
@@ -601,7 +603,8 @@ fn new_m4_fixtures_parse_write_parse_with_a_fixed_point() {
     ] {
         let n = Parser::new()
             .parse_file(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
+                ngspice_conformance::fixtures::workspace_root()
+                    .unwrap()
                     .join(format!("conformance/netlists/{name}.cir")),
             )
             .unwrap();

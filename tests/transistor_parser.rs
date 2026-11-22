@@ -23,7 +23,9 @@ fn pairs(parameters: &[ParameterAssignment]) -> Vec<(&str, &str)> {
 
 #[test]
 fn bjt_fixture_retains_three_terminals_model_and_operating_point() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/netlists/bjt_ce.cir");
+    let path = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance/netlists/bjt_ce.cir");
     let netlist = Parser::new().parse_file(&path).unwrap();
     assert_eq!(netlist.path, path);
     assert_eq!(netlist.top_level_device_count(), 4);
@@ -39,7 +41,9 @@ fn bjt_fixture_retains_three_terminals_model_and_operating_point() {
 
 #[test]
 fn mos_fixture_retains_four_terminals_model_and_geometry() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/netlists/mos_inverter.cir");
+    let path = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance/netlists/mos_inverter.cir");
     let netlist = Parser::new().parse_file(&path).unwrap();
     assert_eq!(netlist.path, path);
     assert_eq!(netlist.top_level_device_count(), 4);

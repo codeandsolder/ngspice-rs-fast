@@ -8,7 +8,9 @@ use std::path::Path;
 
 #[test]
 fn the_committed_subcircuit_deck_now_elaborates_and_includes_stay_explicit() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance");
+    let root = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance");
     let n = Parser::new()
         .parse_file(root.join("netlists/subckt_divider.cir"))
         .unwrap();

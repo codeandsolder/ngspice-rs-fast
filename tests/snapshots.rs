@@ -7,7 +7,9 @@ use ngspice_rs::netlist::dump::{AST_DUMP_HEADER, TOKEN_DUMP_HEADER};
 use ngspice_rs::netlist::snapshot::{self, SNAPSHOT_DIR};
 
 fn conformance() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance")
+    ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance")
 }
 
 const HINT: &str = "If the change is intentional, review it and run `cargo xtask snapshots --bless` \

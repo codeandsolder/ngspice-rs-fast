@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ngspice_rs::analysis::{RawFile, RawFormat};
+use ngspice_rs::primitives::Complex;
 
 struct Cleanup(PathBuf);
 
@@ -59,13 +60,15 @@ fn compare_with_c(name: &str, deck_text: &str, relative: f64) {
         !log.contains("aborted") && !log.to_ascii_lowercase().contains("error"),
         "{name}: ngspice reported a problem:\n{log}"
     );
-    let rust = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("simulate")
-        .arg("--output")
-        .arg(directory.join("rust.raw"))
-        .arg(&deck)
-        .output()
-        .expect("spice-rs runs");
+    let rust = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("simulate")
+    .arg("--output")
+    .arg(directory.join("rust.raw"))
+    .arg(&deck)
+    .output()
+    .expect("spice-rs runs");
     assert!(
         rust.status.success(),
         "{name}: {}",
@@ -101,13 +104,22 @@ fn compare_with_c(name: &str, deck_text: &str, relative: f64) {
             want.point_count(),
             "{name}: plot {index}"
         );
-        for variable in want.variables() {
-            let want_column = want.column(&variable.name).unwrap();
+        for (column, variable) in want.variables().iter().enumerate() {
+            let want_column = want.column_at(column).unwrap();
             let got_column = got.column(&variable.name).unwrap();
             for (point, (a, b)) in got_column.iter().zip(&want_column).enumerate() {
-                let difference = (*a - *b).magnitude();
+                let [re, im] = ngspice_conformance::ngspice::batch_reference_sample(
+                    column,
+                    &variable.name,
+                    [b.re, b.im],
+                );
+                if column == 0 && variable.name == "frequency" {
+                    assert_eq!(a.im.to_bits() & !(1_u64 << 63), 0);
+                }
+                let reference = Complex::new(re, im);
+                let difference = (*a - reference).magnitude();
                 assert!(
-                    difference <= relative * b.magnitude() + 1e-12,
+                    difference <= relative * reference.magnitude() + 1e-12,
                     "{name}: plot {index} '{}' point {point}: Rust {a} != C {b}",
                     variable.name
                 );

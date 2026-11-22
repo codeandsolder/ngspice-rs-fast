@@ -24,10 +24,7 @@ use std::process::Command;
 use ngspice_rs::analysis::{RawFile, RawFormat};
 
 fn workspace() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".")
-        .canonicalize()
-        .expect("the workspace root exists")
+    ngspice_conformance::fixtures::workspace_root().unwrap()
 }
 
 struct Cleanup(PathBuf);
@@ -74,13 +71,15 @@ fn compare_with_c_batch(name: &str, deck_text: &str) {
         String::from_utf8_lossy(&c.stdout),
         String::from_utf8_lossy(&c.stderr)
     );
-    let rust = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("simulate")
-        .arg("--output")
-        .arg(directory.join("rust.raw"))
-        .arg(&deck)
-        .output()
-        .expect("spice-rs runs");
+    let rust = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("simulate")
+    .arg("--output")
+    .arg(directory.join("rust.raw"))
+    .arg(&deck)
+    .output()
+    .expect("spice-rs runs");
     assert!(
         rust.status.success(),
         "{name}: {}",
@@ -109,20 +108,20 @@ fn compare_with_c_batch(name: &str, deck_text: &str) {
             "{name}: plot {index} ({})",
             got.plotname
         );
-        for (column, variable) in got.variables().iter().enumerate() {
-            let want_name = &names(want)[column];
-            let want_column = want.column(&want.variables()[column].name).unwrap();
-            let got_column = got.column(&variable.name).unwrap();
+        for (column, variable) in want.variables().iter().enumerate() {
+            let want_name = &variable.name;
+            let want_column = want.column_at(column).unwrap();
+            let got_column = got.column_at(column).unwrap();
             for (point, (a, b)) in got_column.iter().zip(&want_column).enumerate() {
-                // C's incremental batch writer leaves the AC scale's imaginary
-                // half uninitialised, so the scale is compared by real part.
-                let difference = if column == 0 && want_name == "frequency" {
-                    (a.re - b.re).abs()
-                } else {
-                    (*a - *b).magnitude()
-                };
+                let [re, im] = ngspice_conformance::ngspice::batch_reference_sample(
+                    column,
+                    want_name,
+                    [b.re, b.im],
+                );
+                let reference = ngspice_rs::primitives::Complex::new(re, im);
+                let difference = (*a - reference).magnitude();
                 assert!(
-                    difference <= 1e-9 * b.magnitude() + 1e-12,
+                    difference <= 1e-9 * reference.magnitude() + 1e-12,
                     "{name}: plot {index} '{want_name}' point {point}: {a} != {b}"
                 );
             }

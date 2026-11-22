@@ -41,15 +41,10 @@ OPTIONS (golden capture/check):
     --verbose          echo each ngspice invocation
 ";
 
-/// The workspace root: the parent of this crate's directory.
-#[must_use]
+/// Resolve the fixture workspace from the runtime directory.
 #[cfg(test)]
 fn workspace_root() -> PathBuf {
-    // Cargo supplies the absolute manifest directory of the xtask member,
-    // which lives directly under the workspace root.
-    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    root.pop();
-    root
+    ngspice_conformance::fixtures::workspace_root().unwrap()
 }
 
 /// Run one workspace command against the supplied workspace root.

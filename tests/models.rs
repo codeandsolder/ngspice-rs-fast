@@ -323,7 +323,9 @@ fn invalid_selector_values_and_programmatic_cache_errors_are_explicit() {
 
 #[test]
 fn diode_fixture_and_context_defaults_are_typed_without_simulation() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/netlists/diode_dc.cir");
+    let fixture = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance/netlists/diode_dc.cir");
     let n = Parser::new().parse_file(fixture).unwrap();
     let resolver = ModelResolver::new(&n.models).unwrap();
     let instance = n.device("d1").unwrap();
