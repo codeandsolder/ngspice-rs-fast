@@ -776,10 +776,10 @@ impl ActivePlot {
                 .as_ref()
                 .ok_or_else(|| invalid("Fourier requires retained samples"))?;
             let cards = fourier::resolve_cards(&plan.fourier, scope)?;
-            match settings {
-                Some(settings) => fourier::resolve_with_settings(plot, plan.kind, &cards, settings),
-                None => fourier::resolve(plot, plan.kind, &cards),
-            }
+            settings.map_or_else(
+                || fourier::resolve(plot, plan.kind, &cards),
+                |settings| fourier::resolve_with_settings(plot, plan.kind, &cards, settings),
+            )
         })();
         PlotObjectives {
             measurements,

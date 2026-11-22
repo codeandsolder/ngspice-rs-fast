@@ -775,7 +775,7 @@ impl MeasureState {
                 }
             }
             (Reduction::When(state), BoundMeasure::When { event, .. }) => {
-                state.observe(event, x, row, card)
+                state.observe(event, x, row, card);
             }
             (Reduction::Delay(trig_state, targ_state), BoundMeasure::Delay { trig, targ, .. }) => {
                 trig_state.observe(trig, x, row, card);

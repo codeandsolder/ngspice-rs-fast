@@ -595,11 +595,11 @@ pub(crate) struct ObjectiveReports {
 }
 
 impl BoundConsumers {
-    pub(crate) fn has_text(&self) -> bool {
+    pub(crate) const fn has_text(&self) -> bool {
         self.table.is_some() || !self.graphs.is_empty()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         !self.has_text() && self.objectives.is_none()
     }
 
