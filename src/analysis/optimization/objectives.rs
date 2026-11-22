@@ -11,6 +11,7 @@ use crate::analysis::measure::online::{
     AxisTracker, BoundMeasure, MeasureState, PointQuery, QueryFailure,
 };
 use crate::analysis::measure::{self, Axis, Measurement};
+use crate::analysis::ordered_samples::same_coordinate;
 use crate::analysis::results::{Plot, PointSink, lifecycle_error};
 use crate::analysis::selection::{Column, resolve_request};
 use crate::analysis::{AnalysisContext, AnalysisPlan, FourierAnalysis, fourier};
@@ -18,6 +19,7 @@ use crate::devices::Circuit;
 use crate::netlist::ast::{FourierCard, MeasureCard, MeasureEvent, MeasureRequest, VectorRequest};
 use crate::netlist::eval::ParamScope;
 use crate::primitives::{AnalysisKind, Complex, Real, SpiceError, SpiceResult};
+use std::ops::Range;
 
 /// A requested observation independent of measurement-card expression bindings.
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +124,131 @@ struct BoundObservation {
     reduction: ObservationReduction,
 }
 
+/// Direct point queries are scheduled by coordinate, independent of result
+/// order. Their operands are bound to the union of their raw dependencies;
+/// last/trace observations still use the producer row directly.
+struct QueryPlan {
+    targets: Vec<(Real, usize)>,
+    columns: Vec<usize>,
+    ordinary: Vec<usize>,
+}
+
+impl QueryPlan {
+    fn bind(observations: &mut [BoundObservation]) -> SpiceResult<Self> {
+        let mut targets = Vec::new();
+        let mut columns = Vec::new();
+        let mut ordinary = Vec::new();
+        for (index, observation) in observations.iter().enumerate() {
+            if let ObservationReduction::At(at) = observation.reduction {
+                targets.push((at, index));
+                columns.extend(observation.column.input_columns());
+            } else {
+                ordinary.push(index);
+            }
+        }
+        targets.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        columns.sort_unstable();
+        columns.dedup();
+        for &(_, index) in &targets {
+            observations[index].column.remap_inputs(&columns)?;
+        }
+        Ok(Self {
+            targets,
+            columns,
+            ordinary,
+        })
+    }
+}
+
+/// Two compact raw rows and the sorted query range at the previous coordinate.
+/// On a monotonic stream each query is dispatched once, plus validation of
+/// every sample of an exact coordinate group. No scan of unrelated targets.
+struct QueryRows {
+    previous_x: Option<Real>,
+    group: Range<usize>,
+    previous: Vec<Complex>,
+    current: Vec<Complex>,
+}
+
+impl QueryRows {
+    fn new(plan: &QueryPlan) -> Self {
+        Self {
+            previous_x: None,
+            group: 0..0,
+            previous: Vec::with_capacity(plan.columns.len()),
+            current: Vec::with_capacity(plan.columns.len()),
+        }
+    }
+
+    fn intervals(&self, targets: &[(Real, usize)], x: Real) -> (Range<usize>, Range<usize>) {
+        match self.previous_x {
+            None => {
+                let lo = targets.partition_point(|target| target.0 < x);
+                let hi = lo + targets[lo..].partition_point(|target| target.0 <= x);
+                (lo..hi, lo..hi)
+            }
+            Some(previous) if x > previous => {
+                let start = self.group.end;
+                let mut lo = start;
+                while targets.get(lo).is_some_and(|target| target.0 < x) {
+                    lo += 1;
+                }
+                let mut hi = lo;
+                while targets
+                    .get(hi)
+                    .is_some_and(|target| same_coordinate(target.0, x))
+                {
+                    hi += 1;
+                }
+                (start..hi, lo..hi)
+            }
+            Some(previous) if x < previous => {
+                let end = self.group.start;
+                let mut hi = end;
+                while hi > 0 && targets[hi - 1].0 > x {
+                    hi -= 1;
+                }
+                let mut lo = hi;
+                while lo > 0 && same_coordinate(targets[lo - 1].0, x) {
+                    lo -= 1;
+                }
+                (lo..end, lo..hi)
+            }
+            Some(_) => (self.group.clone(), self.group.clone()),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        plan: &QueryPlan,
+        bound: &[BoundObservation],
+        states: &mut [ObservationState],
+        x: Real,
+        row: &[Complex],
+    ) {
+        if plan.targets.is_empty() {
+            return;
+        }
+        self.current.clear();
+        self.current
+            .extend(plan.columns.iter().map(|&index| row[index]));
+        let (visit, group) = self.intervals(&plan.targets, x);
+        for &(at, index) in &plan.targets[visit] {
+            let state = &mut states[index];
+            let observation = &bound[index];
+            if !same_coordinate(at, x)
+                && let Some(previous_x) = self.previous_x
+            {
+                state.observe(observation, &self.previous, Some(previous_x), None);
+            }
+            state.observe(observation, &self.current, Some(x), None);
+        }
+        std::mem::swap(&mut self.previous, &mut self.current);
+        self.previous_x = Some(x);
+        self.group = group;
+    }
+}
+
 struct Projection {
     header: Plot,
     columns: Vec<usize>,
@@ -135,6 +262,7 @@ pub struct PlotObjectivePlan {
     measurements: Vec<MeasureCard>,
     reductions: Vec<Option<BoundMeasure>>,
     observations: Vec<BoundObservation>,
+    queries: QueryPlan,
     fourier: Vec<FourierCard>,
     axis: Option<AxisTracker>,
     trace_axis: Option<usize>,
@@ -319,7 +447,7 @@ impl PlotObjectivePlan {
             }
             reductions.push(bound);
         }
-        let observations = observations
+        let mut observations = observations
             .into_iter()
             .map(|request| {
                 if let ObservationReduction::At(at) = request.reduction
@@ -336,6 +464,7 @@ impl PlotObjectivePlan {
                 })
             })
             .collect::<SpiceResult<Vec<_>>>()?;
+        let queries = QueryPlan::bind(&mut observations)?;
         if !fourier.is_empty() {
             if kind != AnalysisKind::Transient {
                 return Err(invalid("Fourier objectives require a transient plot"));
@@ -362,6 +491,7 @@ impl PlotObjectivePlan {
             measurements,
             reductions,
             observations,
+            queries,
             fourier,
             axis,
             trace_axis,
@@ -529,6 +659,7 @@ struct ActivePlot<'a> {
     axis: Option<AxisTracker>,
     measurements: Vec<Option<MeasureState<'a>>>,
     observations: Vec<ObservationState>,
+    query_rows: QueryRows,
     retained: SpiceResult<Option<Plot>>,
     scratch: Vec<Complex>,
     rows: usize,
@@ -553,6 +684,7 @@ impl<'a> ActivePlot<'a> {
             axis: plan.axis.as_ref().map(AxisTracker::fresh),
             measurements,
             observations,
+            query_rows: QueryRows::new(&plan.queries),
             retained: Ok(plan
                 .projection
                 .as_ref()
@@ -580,8 +712,22 @@ impl<'a> ActivePlot<'a> {
                 measure.observe(x, row);
             }
         }
-        for (state, bound) in self.observations.iter_mut().zip(&self.plan.observations) {
-            state.observe(bound, row, axis, self.plan.trace_axis);
+        for &index in &self.plan.queries.ordinary {
+            self.observations[index].observe(
+                &self.plan.observations[index],
+                row,
+                None,
+                self.plan.trace_axis,
+            );
+        }
+        if let Some(x) = axis {
+            self.query_rows.observe(
+                &self.plan.queries,
+                &self.plan.observations,
+                &mut self.observations,
+                x,
+                row,
+            );
         }
         if let (Ok(Some(retained)), Some(projection)) = (&mut self.retained, &self.plan.projection)
         {

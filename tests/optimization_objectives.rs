@@ -7,7 +7,7 @@ use ngspice_rs::analysis::{Plot, PlotFlags, PointSink, RunConfig, Variable, four
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::{
     MeasureCard, MeasureEvent, MeasureRequest, MeasureStatistic, MeasureTransition, MeasureWindow,
-    RequestedVector, VectorRequest,
+    RequestedVector, VectorComponent, VectorRequest,
 };
 use ngspice_rs::netlist::eval::ParamScope;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -627,6 +627,154 @@ fn directional_queries_use_adjacent_limits_and_reject_direction_changes() {
         Err(ObservationFailure::Invalid(ngspice_rs::primitives::SpiceError::Numerical { message, .. }))
             if message.contains("point 5")
     )));
+}
+
+#[test]
+fn many_coordinate_queries_share_sparse_rows_and_preserve_request_order() {
+    let scope = ParamScope::root(&[]).unwrap();
+    let mut builder = Plot::builder("ac1", "AC Analysis", PlotFlags::Complex);
+    builder.push_variable(Variable::new("frequency", "frequency"));
+    for column in 0..64 {
+        builder.push_variable(Variable::new(format!("v(c{column})"), "voltage"));
+    }
+    let header = builder.build();
+    let mut observations = Vec::new();
+    let mut expected = Vec::new();
+    for index in 0..257_u32 {
+        let at = f64::from((index * 41) % 257) / 64.;
+        let (vector, value) = match index % 4 {
+            0 => (
+                RequestedVector::Named {
+                    name: "v(c47)".into(),
+                    component: None,
+                },
+                Complex::new(at * 48., at.mul_add(2., 47.)),
+            ),
+            1 => (
+                RequestedVector::Voltage {
+                    positive: "c47".into(),
+                    negative: Some("c3".into()),
+                },
+                Complex::new(at * 44., 44.),
+            ),
+            2 => (
+                RequestedVector::Named {
+                    name: "v(c61)".into(),
+                    component: Some(VectorComponent::Imaginary),
+                },
+                Complex::real(at.mul_add(2., 61.)),
+            ),
+            _ => (
+                RequestedVector::Voltage {
+                    positive: "0".into(),
+                    negative: None,
+                },
+                Complex::ZERO,
+            ),
+        };
+        observations.push(Observation {
+            name: format!("query{index}"),
+            vector: VectorRequest {
+                vector,
+                location: request_location(),
+            },
+            reduction: ObservationReduction::At(at),
+        });
+        expected.push((at, value));
+    }
+    // A repeated target and name is still a separate observation.
+    observations.push(observations[137].clone());
+    expected.push(expected[137]);
+    observations.push(observation(
+        "outside",
+        "v(c47)",
+        ObservationReduction::At(5.),
+    ));
+    observations.push(observation("last", "v(c63)", ObservationReduction::Last));
+    let bound = PlotObjectivePlan::bind(
+        &header,
+        AnalysisKind::Ac,
+        ObjectiveRequests {
+            observations,
+            ..ObjectiveRequests::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(bound.required_columns(), [0, 4, 48, 62, 64]);
+    assert_eq!(bound.retained_columns(), []);
+    let plan = ScenarioPlan::new(vec![bound]);
+    for coordinates in [[0., 1., 2., 2., 4.], [4., 2., 2., 1., 0.]] {
+        let mut sink = plan.sink(&scope);
+        sink.begin(&header).unwrap();
+        let mut row = vec![Complex::ZERO; 65];
+        for x in coordinates {
+            row[0] = Complex::real(x);
+            for (c, v) in (0_u32..64).zip(&mut row[1..]) {
+                let c = f64::from(c);
+                *v = Complex::new(x * (c + 1.), x.mul_add(2., c));
+            }
+            sink.point(&row).unwrap();
+        }
+        sink.end().unwrap();
+        let result = sink.finish().unwrap().remove(0);
+        assert_eq!(result.retained_cells, 0);
+        for (index, (at, expected)) in expected.iter().enumerate() {
+            let got = &result.observations[index];
+            assert_eq!(
+                got.name,
+                format!("query{}", if index == 257 { 137 } else { index })
+            );
+            assert!(
+                matches!(got.value, Ok(ObservationValue::Scalar(p))
+                if p.coordinate == Some(*at) && p.value == *expected),
+                "{index}: {got:?}"
+            );
+        }
+        assert_eq!(
+            result.observations[258].value,
+            Err(ObservationFailure::OutOfRange {
+                at: 5.,
+                range: Some((0., 4.)),
+            })
+        );
+        assert!(
+            matches!(result.observations[259].value, Ok(ObservationValue::Scalar(p))
+            if p.coordinate == Some(coordinates[4]) && p.value == row[64])
+        );
+    }
+}
+
+#[test]
+fn coordinate_queries_can_project_zero_raw_operand_columns() {
+    let scope = ParamScope::root(&[]).unwrap();
+    let full = plot(&[(0., 1., 2.), (1., 3., 4.)], 3);
+    let query = Observation {
+        name: "ground".into(),
+        vector: VectorRequest {
+            vector: RequestedVector::Voltage {
+                positive: "0".into(),
+                negative: None,
+            },
+            location: request_location(),
+        },
+        reduction: ObservationReduction::At(0.5),
+    };
+    let bound = PlotObjectivePlan::bind(
+        &full,
+        AnalysisKind::Transient,
+        ObjectiveRequests {
+            observations: vec![query],
+            ..ObjectiveRequests::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(bound.required_columns(), [0]);
+    assert_eq!(bound.retained_columns(), []);
+    let result = finish(&ScenarioPlan::new(vec![bound]), &full, &scope);
+    assert!(
+        matches!(result.observations[0].value, Ok(ObservationValue::Scalar(p))
+        if p.value == Complex::ZERO && p.coordinate == Some(0.5))
+    );
 }
 
 #[test]

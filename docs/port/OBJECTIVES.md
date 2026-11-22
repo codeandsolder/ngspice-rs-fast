@@ -28,8 +28,13 @@ observation does not turn a different valid observation into a NaN.
   exact-coordinate group agreement, not an invented value at a jump.
   Direction changes (e.g. nested DC sweep resets), nonfinite coordinates,
   and queries outside the interval are explicit errors. Trace/last
-  observations need not have an ordered axis. Deck measurements retain
-  the separate nondecreasing-axis policy of the retained evaluator.
+  observations need not have an ordered axis. A sorted coordinate
+  schedule dispatches only the targets bracketed by each adjacent sample,
+  retaining two rows of only the query operand columns. Results stay in
+  request order, including duplicate names/targets. Dispatch work is
+  linear in accepted rows and targets (plus validation of exact duplicate
+  groups), not their Cartesian product. Deck measurements retain the
+  separate nondecreasing-axis policy of the retained evaluator.
 - Static measurements: extrema (including tie and time policy), AVG,
   INTEG, RMS, FIND, WHEN, TRIG/TARG, derivatives and event-triggered
   value queries, and AC/SP phase/gain margins. Retain bounded per-card
