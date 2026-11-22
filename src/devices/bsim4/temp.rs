@@ -16,20 +16,12 @@
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
 )]
 #![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
 )]
 #![expect(
     clippy::while_float,
     reason = "the C iterative floating-point loop must preserve its original termination and rounding order"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 #![expect(
     non_snake_case,
@@ -85,10 +77,6 @@ const fn fabs(x: f64) -> f64 {
 fn atan(x: f64) -> f64 {
     x.atan()
 }
-/// `ABS` from `ngspice.h`.
-fn ABS(x: f64) -> f64 {
-    if x >= 0.0 { x } else { -x }
-}
 
 /// b4temp.c's two-argument `DEXP(A, B)`: `B = dexp(A)`.
 fn dexp(a: f64) -> f64 {
@@ -103,10 +91,66 @@ fn dexp(a: f64) -> f64 {
 
 /// `BSIM4DioIjthVjmEval`: the diode limiting voltage `Vjm`.
 fn dio_ijth_vjm_eval(Nvtm: f64, Ijth: f64, Isb: f64, XExpBV: f64) -> f64 {
+    let ratio = Ijth / Isb;
+    if ratio.is_finite() && ratio >= 0. && XExpBV.is_finite() && XExpBV >= 0. {
+        // Solve for exp(V/Nvtm) - 1, rather than subtracting one from a
+        // rounded root near unity. Rationalize the negative-root branch.
+        let b = (ratio - XExpBV) - 1.;
+        let discriminant = b.hypot(2. * ratio.sqrt());
+        let delta = if b >= 0. {
+            b.midpoint(discriminant)
+        } else {
+            ratio / (-b).midpoint(discriminant)
+        };
+        return Nvtm * delta.ln_1p();
+    }
     let Tc = XExpBV;
-    let Tb = 1.0 + Ijth / Isb - Tc;
-    let EVjmovNv = 0.5 * (Tb + sqrt(Tb * Tb + 4.0 * Tc));
+    let Tb = 1.0 + ratio - Tc;
+    let EVjmovNv = f64::midpoint(Tb, sqrt(4.0f64.mul_add(Tc, Tb * Tb)));
     Nvtm * log(EVjmovNv)
+}
+
+/// The BSIM inverse-length/width binning polynomial. Keep the coefficients
+/// in their physical order while fusing each product into the accumulation.
+fn bin_parameter(base: f64, coefficients: [f64; 3], inverse: [f64; 3]) -> f64 {
+    coefficients
+        .into_iter()
+        .zip(inverse)
+        .fold(base, |sum, (coefficient, dimension)| {
+            coefficient.mul_add(dimension, sum)
+        })
+}
+
+/// Averaged well-proximity integral. Direct subtraction of the exponential
+/// antiderivative loses the entire effect when width is much smaller than
+/// the reference spacing.
+fn well_proximity_average(spacing: f64, width: f64, reference: f64, order: f64) -> f64 {
+    let x = order * (spacing / reference);
+    let u = order * (width / reference);
+    let scale = order.recip();
+    if x.is_finite() && x >= 0. && u.is_finite() && u >= 0. && width > 0. {
+        let mean = if u == 0. { 1. } else { -(-u).exp_m1() / u };
+        let tail = if u < 1e-3 {
+            // (1-exp(-u))/u - exp(-u), evaluated without cancellation.
+            u * u.mul_add(
+                u.mul_add(
+                    u.mul_add(u.mul_add(1. / 144., -1. / 30.), 1. / 8.),
+                    -1. / 3.,
+                ),
+                0.5,
+            )
+        } else {
+            mean - (-u).exp()
+        };
+        return scale * (-x).exp() * x.mul_add(mean, tail);
+    }
+    // Retain the original expression for nonphysical/nonfinite parameters.
+    let end = spacing + width;
+    let offset = scale * scale * reference;
+    scale.mul_add(end, offset).mul_add(
+        -(-order * (end / reference)).exp(),
+        scale.mul_add(spacing, offset) * (-x).exp(),
+    ) / width
 }
 
 /// A C `printf("%g")` spelling for the ported messages.
@@ -310,11 +354,11 @@ pub(super) fn temperature_model(
             if (m.eotGiven)
                 && (m.toxpGiven)
                 && (m.dtoxGiven)
-                && (ABS(m.eot * T0 - (m.toxp + m.dtox)) > 1.0e-20)
+                && (m.eot.mul_add(T0, -(m.toxp + m.dtox)).abs() > 1.0e-20)
             {
                 warnings.push("Warning: eot, toxp and dtox all given and eot * EPSROX / 3.9 != toxp + dtox; dtox ignored.".to_string());
             } else if (m.eotGiven) && (!m.toxpGiven) {
-                m.toxp = T0 * m.eot - m.dtox;
+                m.toxp = f64::mul_add(T0, m.eot, -m.dtox);
             } else if (!m.eotGiven) && (m.toxpGiven) {
                 m.eot = (m.toxp + m.dtox) / T0;
                 if !m.toxmGiven {
@@ -340,14 +384,14 @@ pub(super) fn temperature_model(
         }
         if !m.cgdoGiven {
             if m.dlcGiven && (m.dlc > 0.0) {
-                m.cgdo = m.dlc * m.coxe - m.cgdl;
+                m.cgdo = m.dlc.mul_add(m.coxe, -m.cgdl);
             } else {
                 m.cgdo = 0.6 * m.xj * m.coxe;
             }
         }
         if !m.cgsoGiven {
             if m.dlcGiven && (m.dlc > 0.0) {
-                m.cgso = m.dlc * m.coxe - m.cgsl;
+                m.cgso = m.dlc.mul_add(m.coxe, -m.cgsl);
             } else {
                 m.cgso = 0.6 * m.xj * m.coxe;
             }
@@ -390,12 +434,12 @@ pub(super) fn temperature_model(
         } else {
             T0 = Eg0 / Vtm0 - Eg / m.vtm;
             T1 = log(Temp / Tnom);
-            T2 = T0 + m.SjctTempExponent * T1;
+            T2 = m.SjctTempExponent.mul_add(T1, T0);
             T3 = exp(T2 / m.SjctEmissionCoeff);
             m.SjctTempSatCurDensity = m.SjctSatCurDensity * T3;
             m.SjctSidewallTempSatCurDensity = m.SjctSidewallSatCurDensity * T3;
             m.SjctGateSidewallTempSatCurDensity = m.SjctGateSidewallSatCurDensity * T3;
-            T2 = T0 + m.DjctTempExponent * T1;
+            T2 = m.DjctTempExponent.mul_add(T1, T0);
             T3 = exp(T2 / m.DjctEmissionCoeff);
             m.DjctTempSatCurDensity = m.DjctSatCurDensity * T3;
             m.DjctSidewallTempSatCurDensity = m.DjctSidewallSatCurDensity * T3;
@@ -482,7 +526,7 @@ pub(super) fn temperature_model(
                 warnings.push("Temperature effect has caused cjswgd to be negative. Cjswgd is clamped to zero.".to_string());
             }
         }
-        m.PhiBS = m.SbulkJctPotential - m.tpb * delTemp;
+        m.PhiBS = m.tpb.mul_add(-delTemp, m.SbulkJctPotential);
         if m.PhiBS < 0.01 {
             m.PhiBS = 0.01;
             warnings.push(
@@ -490,7 +534,7 @@ pub(super) fn temperature_model(
                     .to_string(),
             );
         }
-        m.PhiBD = m.DbulkJctPotential - m.tpb * delTemp;
+        m.PhiBD = m.tpb.mul_add(-delTemp, m.DbulkJctPotential);
         if m.PhiBD < 0.01 {
             m.PhiBD = 0.01;
             warnings.push(
@@ -498,22 +542,22 @@ pub(super) fn temperature_model(
                     .to_string(),
             );
         }
-        m.PhiBSWS = m.SsidewallJctPotential - m.tpbsw * delTemp;
+        m.PhiBSWS = m.tpbsw.mul_add(-delTemp, m.SsidewallJctPotential);
         if m.PhiBSWS < 0.01 {
             m.PhiBSWS = 0.01;
             warnings.push("Temperature effect has caused pbsws to be less than 0.01. Pbsws is clamped to 0.01.".to_string());
         }
-        m.PhiBSWD = m.DsidewallJctPotential - m.tpbsw * delTemp;
+        m.PhiBSWD = m.tpbsw.mul_add(-delTemp, m.DsidewallJctPotential);
         if m.PhiBSWD < 0.01 {
             m.PhiBSWD = 0.01;
             warnings.push("Temperature effect has caused pbswd to be less than 0.01. Pbswd is clamped to 0.01.".to_string());
         }
-        m.PhiBSWGS = m.SGatesidewallJctPotential - m.tpbswg * delTemp;
+        m.PhiBSWGS = m.tpbswg.mul_add(-delTemp, m.SGatesidewallJctPotential);
         if m.PhiBSWGS < 0.01 {
             m.PhiBSWGS = 0.01;
             warnings.push("Temperature effect has caused pbswgs to be less than 0.01. Pbswgs is clamped to 0.01.".to_string());
         }
-        m.PhiBSWGD = m.DGatesidewallJctPotential - m.tpbswg * delTemp;
+        m.PhiBSWGD = m.tpbswg.mul_add(-delTemp, m.DGatesidewallJctPotential);
         if m.PhiBSWGD < 0.01 {
             m.PhiBSWGD = 0.01;
             warnings.push("Temperature effect has caused pbswgd to be less than 0.01. Pbswgd is clamped to 0.01.".to_string());
@@ -716,31 +760,31 @@ pub(super) fn temperature_instance(
             tmp2 = m.Wlc / T2 + m.Wwc / T3 + m.Wwlc / (T2 * T3);
             p.dwc = m.dwc + tmp2;
             p.dwj = m.dwj + tmp2;
-            p.leff = Lnew - 2.0 * p.dl;
+            p.leff = 2.0f64.mul_add(-p.dl, Lnew);
             if p.leff <= 0.0 {
                 return Err(bad_parameter(format!(
                     "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel length <= 0"
                 )));
             }
-            p.weff = Wnew - 2.0 * p.dw;
+            p.weff = 2.0f64.mul_add(-p.dw, Wnew);
             if p.weff <= 0.0 {
                 return Err(bad_parameter(format!(
                     "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel width <= 0"
                 )));
             }
-            p.leffCV = Lnew - 2.0 * p.dlc;
+            p.leffCV = 2.0f64.mul_add(-p.dlc, Lnew);
             if p.leffCV <= 0.0 {
                 return Err(bad_parameter(format!(
                     "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel length for C-V <= 0"
                 )));
             }
-            p.weffCV = Wnew - 2.0 * p.dwc;
+            p.weffCV = 2.0f64.mul_add(-p.dwc, Wnew);
             if p.weffCV <= 0.0 {
                 return Err(bad_parameter(format!(
                     "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel width for C-V <= 0"
                 )));
             }
-            p.weffCJ = Wnew - 2.0 * p.dwj;
+            p.weffCJ = 2.0f64.mul_add(-p.dwj, Wnew);
             if p.weffCJ <= 0.0 {
                 return Err(bad_parameter(format!(
                     "BSIM4: mosfet {model_name}, model {instance_name}: Effective channel width for S/D junctions <= 0"
@@ -755,169 +799,169 @@ pub(super) fn temperature_instance(
                 Inv_W = 1.0 / p.weff;
                 Inv_LW = 1.0 / (p.leff * p.weff);
             }
-            p.cdsc = m.cdsc + m.lcdsc * Inv_L + m.wcdsc * Inv_W + m.pcdsc * Inv_LW;
-            p.cdscb = m.cdscb + m.lcdscb * Inv_L + m.wcdscb * Inv_W + m.pcdscb * Inv_LW;
-            p.cdscd = m.cdscd + m.lcdscd * Inv_L + m.wcdscd * Inv_W + m.pcdscd * Inv_LW;
-            p.cit = m.cit + m.lcit * Inv_L + m.wcit * Inv_W + m.pcit * Inv_LW;
-            p.nfactor = m.nfactor + m.lnfactor * Inv_L + m.wnfactor * Inv_W + m.pnfactor * Inv_LW;
-            p.tnfactor =
-                m.tnfactor + m.ltnfactor * Inv_L + m.wtnfactor * Inv_W + m.ptnfactor * Inv_LW;
-            p.xj = m.xj + m.lxj * Inv_L + m.wxj * Inv_W + m.pxj * Inv_LW;
-            p.vsat = m.vsat + m.lvsat * Inv_L + m.wvsat * Inv_W + m.pvsat * Inv_LW;
-            p.at = m.at + m.lat * Inv_L + m.wat * Inv_W + m.pat * Inv_LW;
-            p.a0 = m.a0 + m.la0 * Inv_L + m.wa0 * Inv_W + m.pa0 * Inv_LW;
-            p.ags = m.ags + m.lags * Inv_L + m.wags * Inv_W + m.pags * Inv_LW;
-            p.a1 = m.a1 + m.la1 * Inv_L + m.wa1 * Inv_W + m.pa1 * Inv_LW;
-            p.a2 = m.a2 + m.la2 * Inv_L + m.wa2 * Inv_W + m.pa2 * Inv_LW;
-            p.keta = m.keta + m.lketa * Inv_L + m.wketa * Inv_W + m.pketa * Inv_LW;
-            p.ketac = m.ketac + m.lketac * Inv_L + m.wketac * Inv_W + m.pketac * Inv_LW;
-            p.nsub = m.nsub + m.lnsub * Inv_L + m.wnsub * Inv_W + m.pnsub * Inv_LW;
-            p.ndep = m.ndep + m.lndep * Inv_L + m.wndep * Inv_W + m.pndep * Inv_LW;
-            p.nsd = m.nsd + m.lnsd * Inv_L + m.wnsd * Inv_W + m.pnsd * Inv_LW;
-            p.phin = m.phin + m.lphin * Inv_L + m.wphin * Inv_W + m.pphin * Inv_LW;
-            p.ngate = m.ngate + m.lngate * Inv_L + m.wngate * Inv_W + m.pngate * Inv_LW;
-            p.gamma1 = m.gamma1 + m.lgamma1 * Inv_L + m.wgamma1 * Inv_W + m.pgamma1 * Inv_LW;
-            p.gamma2 = m.gamma2 + m.lgamma2 * Inv_L + m.wgamma2 * Inv_W + m.pgamma2 * Inv_LW;
-            p.vbx = m.vbx + m.lvbx * Inv_L + m.wvbx * Inv_W + m.pvbx * Inv_LW;
-            p.vbm = m.vbm + m.lvbm * Inv_L + m.wvbm * Inv_W + m.pvbm * Inv_LW;
-            p.xt = m.xt + m.lxt * Inv_L + m.wxt * Inv_W + m.pxt * Inv_LW;
-            p.vfb = m.vfb + m.lvfb * Inv_L + m.wvfb * Inv_W + m.pvfb * Inv_LW;
-            p.k1 = m.k1 + m.lk1 * Inv_L + m.wk1 * Inv_W + m.pk1 * Inv_LW;
-            p.kt1 = m.kt1 + m.lkt1 * Inv_L + m.wkt1 * Inv_W + m.pkt1 * Inv_LW;
-            p.kt1l = m.kt1l + m.lkt1l * Inv_L + m.wkt1l * Inv_W + m.pkt1l * Inv_LW;
-            p.k2 = m.k2 + m.lk2 * Inv_L + m.wk2 * Inv_W + m.pk2 * Inv_LW;
-            p.kt2 = m.kt2 + m.lkt2 * Inv_L + m.wkt2 * Inv_W + m.pkt2 * Inv_LW;
-            p.k3 = m.k3 + m.lk3 * Inv_L + m.wk3 * Inv_W + m.pk3 * Inv_LW;
-            p.k3b = m.k3b + m.lk3b * Inv_L + m.wk3b * Inv_W + m.pk3b * Inv_LW;
-            p.w0 = m.w0 + m.lw0 * Inv_L + m.ww0 * Inv_W + m.pw0 * Inv_LW;
-            p.lpe0 = m.lpe0 + m.llpe0 * Inv_L + m.wlpe0 * Inv_W + m.plpe0 * Inv_LW;
-            p.lpeb = m.lpeb + m.llpeb * Inv_L + m.wlpeb * Inv_W + m.plpeb * Inv_LW;
-            p.dvtp0 = m.dvtp0 + m.ldvtp0 * Inv_L + m.wdvtp0 * Inv_W + m.pdvtp0 * Inv_LW;
-            p.dvtp1 = m.dvtp1 + m.ldvtp1 * Inv_L + m.wdvtp1 * Inv_W + m.pdvtp1 * Inv_LW;
-            p.dvtp2 = m.dvtp2 + m.ldvtp2 * Inv_L + m.wdvtp2 * Inv_W + m.pdvtp2 * Inv_LW;
-            p.dvtp3 = m.dvtp3 + m.ldvtp3 * Inv_L + m.wdvtp3 * Inv_W + m.pdvtp3 * Inv_LW;
-            p.dvtp4 = m.dvtp4 + m.ldvtp4 * Inv_L + m.wdvtp4 * Inv_W + m.pdvtp4 * Inv_LW;
-            p.dvtp5 = m.dvtp5 + m.ldvtp5 * Inv_L + m.wdvtp5 * Inv_W + m.pdvtp5 * Inv_LW;
-            p.dvt0 = m.dvt0 + m.ldvt0 * Inv_L + m.wdvt0 * Inv_W + m.pdvt0 * Inv_LW;
-            p.dvt1 = m.dvt1 + m.ldvt1 * Inv_L + m.wdvt1 * Inv_W + m.pdvt1 * Inv_LW;
-            p.dvt2 = m.dvt2 + m.ldvt2 * Inv_L + m.wdvt2 * Inv_W + m.pdvt2 * Inv_LW;
-            p.dvt0w = m.dvt0w + m.ldvt0w * Inv_L + m.wdvt0w * Inv_W + m.pdvt0w * Inv_LW;
-            p.dvt1w = m.dvt1w + m.ldvt1w * Inv_L + m.wdvt1w * Inv_W + m.pdvt1w * Inv_LW;
-            p.dvt2w = m.dvt2w + m.ldvt2w * Inv_L + m.wdvt2w * Inv_W + m.pdvt2w * Inv_LW;
-            p.drout = m.drout + m.ldrout * Inv_L + m.wdrout * Inv_W + m.pdrout * Inv_LW;
-            p.dsub = m.dsub + m.ldsub * Inv_L + m.wdsub * Inv_W + m.pdsub * Inv_LW;
-            p.vth0 = m.vth0 + m.lvth0 * Inv_L + m.wvth0 * Inv_W + m.pvth0 * Inv_LW;
-            p.ua = m.ua + m.lua * Inv_L + m.wua * Inv_W + m.pua * Inv_LW;
-            p.ua1 = m.ua1 + m.lua1 * Inv_L + m.wua1 * Inv_W + m.pua1 * Inv_LW;
-            p.ub = m.ub + m.lub * Inv_L + m.wub * Inv_W + m.r#pub * Inv_LW;
-            p.ub1 = m.ub1 + m.lub1 * Inv_L + m.wub1 * Inv_W + m.pub1 * Inv_LW;
-            p.uc = m.uc + m.luc * Inv_L + m.wuc * Inv_W + m.puc * Inv_LW;
-            p.uc1 = m.uc1 + m.luc1 * Inv_L + m.wuc1 * Inv_W + m.puc1 * Inv_LW;
-            p.ud = m.ud + m.lud * Inv_L + m.wud * Inv_W + m.pud * Inv_LW;
-            p.ud1 = m.ud1 + m.lud1 * Inv_L + m.wud1 * Inv_W + m.pud1 * Inv_LW;
-            p.up = m.up + m.lup * Inv_L + m.wup * Inv_W + m.pup * Inv_LW;
-            p.lp = m.lp + m.llp * Inv_L + m.wlp * Inv_W + m.plp * Inv_LW;
-            p.eu = m.eu + m.leu * Inv_L + m.weu * Inv_W + m.peu * Inv_LW;
-            p.u0 = m.u0 + m.lu0 * Inv_L + m.wu0 * Inv_W + m.pu0 * Inv_LW;
-            p.ute = m.ute + m.lute * Inv_L + m.wute * Inv_W + m.pute * Inv_LW;
-            p.ucs = m.ucs + m.lucs * Inv_L + m.wucs * Inv_W + m.pucs * Inv_LW;
-            p.ucste = m.ucste + m.lucste * Inv_L + m.wucste * Inv_W + m.pucste * Inv_LW;
-            p.voff = m.voff + m.lvoff * Inv_L + m.wvoff * Inv_W + m.pvoff * Inv_LW;
-            p.tvoff = m.tvoff + m.ltvoff * Inv_L + m.wtvoff * Inv_W + m.ptvoff * Inv_LW;
-            p.minv = m.minv + m.lminv * Inv_L + m.wminv * Inv_W + m.pminv * Inv_LW;
-            p.minvcv = m.minvcv + m.lminvcv * Inv_L + m.wminvcv * Inv_W + m.pminvcv * Inv_LW;
-            p.fprout = m.fprout + m.lfprout * Inv_L + m.wfprout * Inv_W + m.pfprout * Inv_LW;
-            p.pdits = m.pdits + m.lpdits * Inv_L + m.wpdits * Inv_W + m.ppdits * Inv_LW;
-            p.pditsd = m.pditsd + m.lpditsd * Inv_L + m.wpditsd * Inv_W + m.ppditsd * Inv_LW;
-            p.delta = m.delta + m.ldelta * Inv_L + m.wdelta * Inv_W + m.pdelta * Inv_LW;
-            p.rdsw = m.rdsw + m.lrdsw * Inv_L + m.wrdsw * Inv_W + m.prdsw * Inv_LW;
-            p.rdw = m.rdw + m.lrdw * Inv_L + m.wrdw * Inv_W + m.prdw * Inv_LW;
-            p.rsw = m.rsw + m.lrsw * Inv_L + m.wrsw * Inv_W + m.prsw * Inv_LW;
-            p.prwg = m.prwg + m.lprwg * Inv_L + m.wprwg * Inv_W + m.pprwg * Inv_LW;
-            p.prwb = m.prwb + m.lprwb * Inv_L + m.wprwb * Inv_W + m.pprwb * Inv_LW;
-            p.prt = m.prt + m.lprt * Inv_L + m.wprt * Inv_W + m.pprt * Inv_LW;
-            p.eta0 = m.eta0 + m.leta0 * Inv_L + m.weta0 * Inv_W + m.peta0 * Inv_LW;
-            p.teta0 = m.teta0 + m.lteta0 * Inv_L + m.wteta0 * Inv_W + m.pteta0 * Inv_LW;
-            p.tvoffcv = m.tvoffcv + m.ltvoffcv * Inv_L + m.wtvoffcv * Inv_W + m.ptvoffcv * Inv_LW;
-            p.etab = m.etab + m.letab * Inv_L + m.wetab * Inv_W + m.petab * Inv_LW;
-            p.pclm = m.pclm + m.lpclm * Inv_L + m.wpclm * Inv_W + m.ppclm * Inv_LW;
-            p.pdibl1 = m.pdibl1 + m.lpdibl1 * Inv_L + m.wpdibl1 * Inv_W + m.ppdibl1 * Inv_LW;
-            p.pdibl2 = m.pdibl2 + m.lpdibl2 * Inv_L + m.wpdibl2 * Inv_W + m.ppdibl2 * Inv_LW;
-            p.pdiblb = m.pdiblb + m.lpdiblb * Inv_L + m.wpdiblb * Inv_W + m.ppdiblb * Inv_LW;
-            p.pscbe1 = m.pscbe1 + m.lpscbe1 * Inv_L + m.wpscbe1 * Inv_W + m.ppscbe1 * Inv_LW;
-            p.pscbe2 = m.pscbe2 + m.lpscbe2 * Inv_L + m.wpscbe2 * Inv_W + m.ppscbe2 * Inv_LW;
-            p.pvag = m.pvag + m.lpvag * Inv_L + m.wpvag * Inv_W + m.ppvag * Inv_LW;
-            p.wr = m.wr + m.lwr * Inv_L + m.wwr * Inv_W + m.pwr * Inv_LW;
-            p.dwg = m.dwg + m.ldwg * Inv_L + m.wdwg * Inv_W + m.pdwg * Inv_LW;
-            p.dwb = m.dwb + m.ldwb * Inv_L + m.wdwb * Inv_W + m.pdwb * Inv_LW;
-            p.b0 = m.b0 + m.lb0 * Inv_L + m.wb0 * Inv_W + m.pb0 * Inv_LW;
-            p.b1 = m.b1 + m.lb1 * Inv_L + m.wb1 * Inv_W + m.pb1 * Inv_LW;
-            p.alpha0 = m.alpha0 + m.lalpha0 * Inv_L + m.walpha0 * Inv_W + m.palpha0 * Inv_LW;
-            p.alpha1 = m.alpha1 + m.lalpha1 * Inv_L + m.walpha1 * Inv_W + m.palpha1 * Inv_LW;
-            p.beta0 = m.beta0 + m.lbeta0 * Inv_L + m.wbeta0 * Inv_W + m.pbeta0 * Inv_LW;
-            p.agidl = m.agidl + m.lagidl * Inv_L + m.wagidl * Inv_W + m.pagidl * Inv_LW;
-            p.bgidl = m.bgidl + m.lbgidl * Inv_L + m.wbgidl * Inv_W + m.pbgidl * Inv_LW;
-            p.cgidl = m.cgidl + m.lcgidl * Inv_L + m.wcgidl * Inv_W + m.pcgidl * Inv_LW;
-            p.egidl = m.egidl + m.legidl * Inv_L + m.wegidl * Inv_W + m.pegidl * Inv_LW;
-            p.rgidl = m.rgidl + m.lrgidl * Inv_L + m.wrgidl * Inv_W + m.prgidl * Inv_LW;
-            p.kgidl = m.kgidl + m.lkgidl * Inv_L + m.wkgidl * Inv_W + m.pkgidl * Inv_LW;
-            p.fgidl = m.fgidl + m.lfgidl * Inv_L + m.wfgidl * Inv_W + m.pfgidl * Inv_LW;
-            p.agisl = m.agisl + m.lagisl * Inv_L + m.wagisl * Inv_W + m.pagisl * Inv_LW;
-            p.bgisl = m.bgisl + m.lbgisl * Inv_L + m.wbgisl * Inv_W + m.pbgisl * Inv_LW;
-            p.cgisl = m.cgisl + m.lcgisl * Inv_L + m.wcgisl * Inv_W + m.pcgisl * Inv_LW;
-            p.egisl = m.egisl + m.legisl * Inv_L + m.wegisl * Inv_W + m.pegisl * Inv_LW;
-            p.rgisl = m.rgisl + m.lrgisl * Inv_L + m.wrgisl * Inv_W + m.prgisl * Inv_LW;
-            p.kgisl = m.kgisl + m.lkgisl * Inv_L + m.wkgisl * Inv_W + m.pkgisl * Inv_LW;
-            p.fgisl = m.fgisl + m.lfgisl * Inv_L + m.wfgisl * Inv_W + m.pfgisl * Inv_LW;
-            p.aigc = m.aigc + m.laigc * Inv_L + m.waigc * Inv_W + m.paigc * Inv_LW;
-            p.bigc = m.bigc + m.lbigc * Inv_L + m.wbigc * Inv_W + m.pbigc * Inv_LW;
-            p.cigc = m.cigc + m.lcigc * Inv_L + m.wcigc * Inv_W + m.pcigc * Inv_LW;
-            p.aigsd = m.aigsd + m.laigsd * Inv_L + m.waigsd * Inv_W + m.paigsd * Inv_LW;
-            p.bigsd = m.bigsd + m.lbigsd * Inv_L + m.wbigsd * Inv_W + m.pbigsd * Inv_LW;
-            p.cigsd = m.cigsd + m.lcigsd * Inv_L + m.wcigsd * Inv_W + m.pcigsd * Inv_LW;
-            p.aigs = m.aigs + m.laigs * Inv_L + m.waigs * Inv_W + m.paigs * Inv_LW;
-            p.bigs = m.bigs + m.lbigs * Inv_L + m.wbigs * Inv_W + m.pbigs * Inv_LW;
-            p.cigs = m.cigs + m.lcigs * Inv_L + m.wcigs * Inv_W + m.pcigs * Inv_LW;
-            p.aigd = m.aigd + m.laigd * Inv_L + m.waigd * Inv_W + m.paigd * Inv_LW;
-            p.bigd = m.bigd + m.lbigd * Inv_L + m.wbigd * Inv_W + m.pbigd * Inv_LW;
-            p.cigd = m.cigd + m.lcigd * Inv_L + m.wcigd * Inv_W + m.pcigd * Inv_LW;
-            p.aigbacc = m.aigbacc + m.laigbacc * Inv_L + m.waigbacc * Inv_W + m.paigbacc * Inv_LW;
-            p.bigbacc = m.bigbacc + m.lbigbacc * Inv_L + m.wbigbacc * Inv_W + m.pbigbacc * Inv_LW;
-            p.cigbacc = m.cigbacc + m.lcigbacc * Inv_L + m.wcigbacc * Inv_W + m.pcigbacc * Inv_LW;
-            p.aigbinv = m.aigbinv + m.laigbinv * Inv_L + m.waigbinv * Inv_W + m.paigbinv * Inv_LW;
-            p.bigbinv = m.bigbinv + m.lbigbinv * Inv_L + m.wbigbinv * Inv_W + m.pbigbinv * Inv_LW;
-            p.cigbinv = m.cigbinv + m.lcigbinv * Inv_L + m.wcigbinv * Inv_W + m.pcigbinv * Inv_LW;
-            p.nigc = m.nigc + m.lnigc * Inv_L + m.wnigc * Inv_W + m.pnigc * Inv_LW;
-            p.nigbacc = m.nigbacc + m.lnigbacc * Inv_L + m.wnigbacc * Inv_W + m.pnigbacc * Inv_LW;
-            p.nigbinv = m.nigbinv + m.lnigbinv * Inv_L + m.wnigbinv * Inv_W + m.pnigbinv * Inv_LW;
-            p.ntox = m.ntox + m.lntox * Inv_L + m.wntox * Inv_W + m.pntox * Inv_LW;
-            p.eigbinv = m.eigbinv + m.leigbinv * Inv_L + m.weigbinv * Inv_W + m.peigbinv * Inv_LW;
-            p.pigcd = m.pigcd + m.lpigcd * Inv_L + m.wpigcd * Inv_W + m.ppigcd * Inv_LW;
-            p.poxedge = m.poxedge + m.lpoxedge * Inv_L + m.wpoxedge * Inv_W + m.ppoxedge * Inv_LW;
-            p.xrcrg1 = m.xrcrg1 + m.lxrcrg1 * Inv_L + m.wxrcrg1 * Inv_W + m.pxrcrg1 * Inv_LW;
-            p.xrcrg2 = m.xrcrg2 + m.lxrcrg2 * Inv_L + m.wxrcrg2 * Inv_W + m.pxrcrg2 * Inv_LW;
-            p.lambda = m.lambda + m.llambda * Inv_L + m.wlambda * Inv_W + m.plambda * Inv_LW;
-            p.vtl = m.vtl + m.lvtl * Inv_L + m.wvtl * Inv_W + m.pvtl * Inv_LW;
-            p.xn = m.xn + m.lxn * Inv_L + m.wxn * Inv_W + m.pxn * Inv_LW;
-            p.vfbsdoff =
-                m.vfbsdoff + m.lvfbsdoff * Inv_L + m.wvfbsdoff * Inv_W + m.pvfbsdoff * Inv_LW;
-            p.tvfbsdoff =
-                m.tvfbsdoff + m.ltvfbsdoff * Inv_L + m.wtvfbsdoff * Inv_W + m.ptvfbsdoff * Inv_LW;
-            p.cgsl = m.cgsl + m.lcgsl * Inv_L + m.wcgsl * Inv_W + m.pcgsl * Inv_LW;
-            p.cgdl = m.cgdl + m.lcgdl * Inv_L + m.wcgdl * Inv_W + m.pcgdl * Inv_LW;
-            p.ckappas = m.ckappas + m.lckappas * Inv_L + m.wckappas * Inv_W + m.pckappas * Inv_LW;
-            p.ckappad = m.ckappad + m.lckappad * Inv_L + m.wckappad * Inv_W + m.pckappad * Inv_LW;
-            p.cf = m.cf + m.lcf * Inv_L + m.wcf * Inv_W + m.pcf * Inv_LW;
-            p.clc = m.clc + m.lclc * Inv_L + m.wclc * Inv_W + m.pclc * Inv_LW;
-            p.cle = m.cle + m.lcle * Inv_L + m.wcle * Inv_W + m.pcle * Inv_LW;
-            p.vfbcv = m.vfbcv + m.lvfbcv * Inv_L + m.wvfbcv * Inv_W + m.pvfbcv * Inv_LW;
-            p.acde = m.acde + m.lacde * Inv_L + m.wacde * Inv_W + m.pacde * Inv_LW;
-            p.moin = m.moin + m.lmoin * Inv_L + m.wmoin * Inv_W + m.pmoin * Inv_LW;
-            p.noff = m.noff + m.lnoff * Inv_L + m.wnoff * Inv_W + m.pnoff * Inv_LW;
-            p.voffcv = m.voffcv + m.lvoffcv * Inv_L + m.wvoffcv * Inv_W + m.pvoffcv * Inv_LW;
-            p.kvth0we = m.kvth0we + m.lkvth0we * Inv_L + m.wkvth0we * Inv_W + m.pkvth0we * Inv_LW;
-            p.k2we = m.k2we + m.lk2we * Inv_L + m.wk2we * Inv_W + m.pk2we * Inv_LW;
-            p.ku0we = m.ku0we + m.lku0we * Inv_L + m.wku0we * Inv_W + m.pku0we * Inv_LW;
+            let bin = |base, length, width, cross| {
+                bin_parameter(base, [length, width, cross], [Inv_L, Inv_W, Inv_LW])
+            };
+            p.cdsc = bin(m.cdsc, m.lcdsc, m.wcdsc, m.pcdsc);
+            p.cdscb = bin(m.cdscb, m.lcdscb, m.wcdscb, m.pcdscb);
+            p.cdscd = bin(m.cdscd, m.lcdscd, m.wcdscd, m.pcdscd);
+            p.cit = bin(m.cit, m.lcit, m.wcit, m.pcit);
+            p.nfactor = bin(m.nfactor, m.lnfactor, m.wnfactor, m.pnfactor);
+            p.tnfactor = bin(m.tnfactor, m.ltnfactor, m.wtnfactor, m.ptnfactor);
+            p.xj = bin(m.xj, m.lxj, m.wxj, m.pxj);
+            p.vsat = bin(m.vsat, m.lvsat, m.wvsat, m.pvsat);
+            p.at = bin(m.at, m.lat, m.wat, m.pat);
+            p.a0 = bin(m.a0, m.la0, m.wa0, m.pa0);
+            p.ags = bin(m.ags, m.lags, m.wags, m.pags);
+            p.a1 = bin(m.a1, m.la1, m.wa1, m.pa1);
+            p.a2 = bin(m.a2, m.la2, m.wa2, m.pa2);
+            p.keta = bin(m.keta, m.lketa, m.wketa, m.pketa);
+            p.ketac = bin(m.ketac, m.lketac, m.wketac, m.pketac);
+            p.nsub = bin(m.nsub, m.lnsub, m.wnsub, m.pnsub);
+            p.ndep = bin(m.ndep, m.lndep, m.wndep, m.pndep);
+            p.nsd = bin(m.nsd, m.lnsd, m.wnsd, m.pnsd);
+            p.phin = bin(m.phin, m.lphin, m.wphin, m.pphin);
+            p.ngate = bin(m.ngate, m.lngate, m.wngate, m.pngate);
+            p.gamma1 = bin(m.gamma1, m.lgamma1, m.wgamma1, m.pgamma1);
+            p.gamma2 = bin(m.gamma2, m.lgamma2, m.wgamma2, m.pgamma2);
+            p.vbx = bin(m.vbx, m.lvbx, m.wvbx, m.pvbx);
+            p.vbm = bin(m.vbm, m.lvbm, m.wvbm, m.pvbm);
+            p.xt = bin(m.xt, m.lxt, m.wxt, m.pxt);
+            p.vfb = bin(m.vfb, m.lvfb, m.wvfb, m.pvfb);
+            p.k1 = bin(m.k1, m.lk1, m.wk1, m.pk1);
+            p.kt1 = bin(m.kt1, m.lkt1, m.wkt1, m.pkt1);
+            p.kt1l = bin(m.kt1l, m.lkt1l, m.wkt1l, m.pkt1l);
+            p.k2 = bin(m.k2, m.lk2, m.wk2, m.pk2);
+            p.kt2 = bin(m.kt2, m.lkt2, m.wkt2, m.pkt2);
+            p.k3 = bin(m.k3, m.lk3, m.wk3, m.pk3);
+            p.k3b = bin(m.k3b, m.lk3b, m.wk3b, m.pk3b);
+            p.w0 = bin(m.w0, m.lw0, m.ww0, m.pw0);
+            p.lpe0 = bin(m.lpe0, m.llpe0, m.wlpe0, m.plpe0);
+            p.lpeb = bin(m.lpeb, m.llpeb, m.wlpeb, m.plpeb);
+            p.dvtp0 = bin(m.dvtp0, m.ldvtp0, m.wdvtp0, m.pdvtp0);
+            p.dvtp1 = bin(m.dvtp1, m.ldvtp1, m.wdvtp1, m.pdvtp1);
+            p.dvtp2 = bin(m.dvtp2, m.ldvtp2, m.wdvtp2, m.pdvtp2);
+            p.dvtp3 = bin(m.dvtp3, m.ldvtp3, m.wdvtp3, m.pdvtp3);
+            p.dvtp4 = bin(m.dvtp4, m.ldvtp4, m.wdvtp4, m.pdvtp4);
+            p.dvtp5 = bin(m.dvtp5, m.ldvtp5, m.wdvtp5, m.pdvtp5);
+            p.dvt0 = bin(m.dvt0, m.ldvt0, m.wdvt0, m.pdvt0);
+            p.dvt1 = bin(m.dvt1, m.ldvt1, m.wdvt1, m.pdvt1);
+            p.dvt2 = bin(m.dvt2, m.ldvt2, m.wdvt2, m.pdvt2);
+            p.dvt0w = bin(m.dvt0w, m.ldvt0w, m.wdvt0w, m.pdvt0w);
+            p.dvt1w = bin(m.dvt1w, m.ldvt1w, m.wdvt1w, m.pdvt1w);
+            p.dvt2w = bin(m.dvt2w, m.ldvt2w, m.wdvt2w, m.pdvt2w);
+            p.drout = bin(m.drout, m.ldrout, m.wdrout, m.pdrout);
+            p.dsub = bin(m.dsub, m.ldsub, m.wdsub, m.pdsub);
+            p.vth0 = bin(m.vth0, m.lvth0, m.wvth0, m.pvth0);
+            p.ua = bin(m.ua, m.lua, m.wua, m.pua);
+            p.ua1 = bin(m.ua1, m.lua1, m.wua1, m.pua1);
+            p.ub = bin(m.ub, m.lub, m.wub, m.r#pub);
+            p.ub1 = bin(m.ub1, m.lub1, m.wub1, m.pub1);
+            p.uc = bin(m.uc, m.luc, m.wuc, m.puc);
+            p.uc1 = bin(m.uc1, m.luc1, m.wuc1, m.puc1);
+            p.ud = bin(m.ud, m.lud, m.wud, m.pud);
+            p.ud1 = bin(m.ud1, m.lud1, m.wud1, m.pud1);
+            p.up = bin(m.up, m.lup, m.wup, m.pup);
+            p.lp = bin(m.lp, m.llp, m.wlp, m.plp);
+            p.eu = bin(m.eu, m.leu, m.weu, m.peu);
+            p.u0 = bin(m.u0, m.lu0, m.wu0, m.pu0);
+            p.ute = bin(m.ute, m.lute, m.wute, m.pute);
+            p.ucs = bin(m.ucs, m.lucs, m.wucs, m.pucs);
+            p.ucste = bin(m.ucste, m.lucste, m.wucste, m.pucste);
+            p.voff = bin(m.voff, m.lvoff, m.wvoff, m.pvoff);
+            p.tvoff = bin(m.tvoff, m.ltvoff, m.wtvoff, m.ptvoff);
+            p.minv = bin(m.minv, m.lminv, m.wminv, m.pminv);
+            p.minvcv = bin(m.minvcv, m.lminvcv, m.wminvcv, m.pminvcv);
+            p.fprout = bin(m.fprout, m.lfprout, m.wfprout, m.pfprout);
+            p.pdits = bin(m.pdits, m.lpdits, m.wpdits, m.ppdits);
+            p.pditsd = bin(m.pditsd, m.lpditsd, m.wpditsd, m.ppditsd);
+            p.delta = bin(m.delta, m.ldelta, m.wdelta, m.pdelta);
+            p.rdsw = bin(m.rdsw, m.lrdsw, m.wrdsw, m.prdsw);
+            p.rdw = bin(m.rdw, m.lrdw, m.wrdw, m.prdw);
+            p.rsw = bin(m.rsw, m.lrsw, m.wrsw, m.prsw);
+            p.prwg = bin(m.prwg, m.lprwg, m.wprwg, m.pprwg);
+            p.prwb = bin(m.prwb, m.lprwb, m.wprwb, m.pprwb);
+            p.prt = bin(m.prt, m.lprt, m.wprt, m.pprt);
+            p.eta0 = bin(m.eta0, m.leta0, m.weta0, m.peta0);
+            p.teta0 = bin(m.teta0, m.lteta0, m.wteta0, m.pteta0);
+            p.tvoffcv = bin(m.tvoffcv, m.ltvoffcv, m.wtvoffcv, m.ptvoffcv);
+            p.etab = bin(m.etab, m.letab, m.wetab, m.petab);
+            p.pclm = bin(m.pclm, m.lpclm, m.wpclm, m.ppclm);
+            p.pdibl1 = bin(m.pdibl1, m.lpdibl1, m.wpdibl1, m.ppdibl1);
+            p.pdibl2 = bin(m.pdibl2, m.lpdibl2, m.wpdibl2, m.ppdibl2);
+            p.pdiblb = bin(m.pdiblb, m.lpdiblb, m.wpdiblb, m.ppdiblb);
+            p.pscbe1 = bin(m.pscbe1, m.lpscbe1, m.wpscbe1, m.ppscbe1);
+            p.pscbe2 = bin(m.pscbe2, m.lpscbe2, m.wpscbe2, m.ppscbe2);
+            p.pvag = bin(m.pvag, m.lpvag, m.wpvag, m.ppvag);
+            p.wr = bin(m.wr, m.lwr, m.wwr, m.pwr);
+            p.dwg = bin(m.dwg, m.ldwg, m.wdwg, m.pdwg);
+            p.dwb = bin(m.dwb, m.ldwb, m.wdwb, m.pdwb);
+            p.b0 = bin(m.b0, m.lb0, m.wb0, m.pb0);
+            p.b1 = bin(m.b1, m.lb1, m.wb1, m.pb1);
+            p.alpha0 = bin(m.alpha0, m.lalpha0, m.walpha0, m.palpha0);
+            p.alpha1 = bin(m.alpha1, m.lalpha1, m.walpha1, m.palpha1);
+            p.beta0 = bin(m.beta0, m.lbeta0, m.wbeta0, m.pbeta0);
+            p.agidl = bin(m.agidl, m.lagidl, m.wagidl, m.pagidl);
+            p.bgidl = bin(m.bgidl, m.lbgidl, m.wbgidl, m.pbgidl);
+            p.cgidl = bin(m.cgidl, m.lcgidl, m.wcgidl, m.pcgidl);
+            p.egidl = bin(m.egidl, m.legidl, m.wegidl, m.pegidl);
+            p.rgidl = bin(m.rgidl, m.lrgidl, m.wrgidl, m.prgidl);
+            p.kgidl = bin(m.kgidl, m.lkgidl, m.wkgidl, m.pkgidl);
+            p.fgidl = bin(m.fgidl, m.lfgidl, m.wfgidl, m.pfgidl);
+            p.agisl = bin(m.agisl, m.lagisl, m.wagisl, m.pagisl);
+            p.bgisl = bin(m.bgisl, m.lbgisl, m.wbgisl, m.pbgisl);
+            p.cgisl = bin(m.cgisl, m.lcgisl, m.wcgisl, m.pcgisl);
+            p.egisl = bin(m.egisl, m.legisl, m.wegisl, m.pegisl);
+            p.rgisl = bin(m.rgisl, m.lrgisl, m.wrgisl, m.prgisl);
+            p.kgisl = bin(m.kgisl, m.lkgisl, m.wkgisl, m.pkgisl);
+            p.fgisl = bin(m.fgisl, m.lfgisl, m.wfgisl, m.pfgisl);
+            p.aigc = bin(m.aigc, m.laigc, m.waigc, m.paigc);
+            p.bigc = bin(m.bigc, m.lbigc, m.wbigc, m.pbigc);
+            p.cigc = bin(m.cigc, m.lcigc, m.wcigc, m.pcigc);
+            p.aigsd = bin(m.aigsd, m.laigsd, m.waigsd, m.paigsd);
+            p.bigsd = bin(m.bigsd, m.lbigsd, m.wbigsd, m.pbigsd);
+            p.cigsd = bin(m.cigsd, m.lcigsd, m.wcigsd, m.pcigsd);
+            p.aigs = bin(m.aigs, m.laigs, m.waigs, m.paigs);
+            p.bigs = bin(m.bigs, m.lbigs, m.wbigs, m.pbigs);
+            p.cigs = bin(m.cigs, m.lcigs, m.wcigs, m.pcigs);
+            p.aigd = bin(m.aigd, m.laigd, m.waigd, m.paigd);
+            p.bigd = bin(m.bigd, m.lbigd, m.wbigd, m.pbigd);
+            p.cigd = bin(m.cigd, m.lcigd, m.wcigd, m.pcigd);
+            p.aigbacc = bin(m.aigbacc, m.laigbacc, m.waigbacc, m.paigbacc);
+            p.bigbacc = bin(m.bigbacc, m.lbigbacc, m.wbigbacc, m.pbigbacc);
+            p.cigbacc = bin(m.cigbacc, m.lcigbacc, m.wcigbacc, m.pcigbacc);
+            p.aigbinv = bin(m.aigbinv, m.laigbinv, m.waigbinv, m.paigbinv);
+            p.bigbinv = bin(m.bigbinv, m.lbigbinv, m.wbigbinv, m.pbigbinv);
+            p.cigbinv = bin(m.cigbinv, m.lcigbinv, m.wcigbinv, m.pcigbinv);
+            p.nigc = bin(m.nigc, m.lnigc, m.wnigc, m.pnigc);
+            p.nigbacc = bin(m.nigbacc, m.lnigbacc, m.wnigbacc, m.pnigbacc);
+            p.nigbinv = bin(m.nigbinv, m.lnigbinv, m.wnigbinv, m.pnigbinv);
+            p.ntox = bin(m.ntox, m.lntox, m.wntox, m.pntox);
+            p.eigbinv = bin(m.eigbinv, m.leigbinv, m.weigbinv, m.peigbinv);
+            p.pigcd = bin(m.pigcd, m.lpigcd, m.wpigcd, m.ppigcd);
+            p.poxedge = bin(m.poxedge, m.lpoxedge, m.wpoxedge, m.ppoxedge);
+            p.xrcrg1 = bin(m.xrcrg1, m.lxrcrg1, m.wxrcrg1, m.pxrcrg1);
+            p.xrcrg2 = bin(m.xrcrg2, m.lxrcrg2, m.wxrcrg2, m.pxrcrg2);
+            p.lambda = bin(m.lambda, m.llambda, m.wlambda, m.plambda);
+            p.vtl = bin(m.vtl, m.lvtl, m.wvtl, m.pvtl);
+            p.xn = bin(m.xn, m.lxn, m.wxn, m.pxn);
+            p.vfbsdoff = bin(m.vfbsdoff, m.lvfbsdoff, m.wvfbsdoff, m.pvfbsdoff);
+            p.tvfbsdoff = bin(m.tvfbsdoff, m.ltvfbsdoff, m.wtvfbsdoff, m.ptvfbsdoff);
+            p.cgsl = bin(m.cgsl, m.lcgsl, m.wcgsl, m.pcgsl);
+            p.cgdl = bin(m.cgdl, m.lcgdl, m.wcgdl, m.pcgdl);
+            p.ckappas = bin(m.ckappas, m.lckappas, m.wckappas, m.pckappas);
+            p.ckappad = bin(m.ckappad, m.lckappad, m.wckappad, m.pckappad);
+            p.cf = bin(m.cf, m.lcf, m.wcf, m.pcf);
+            p.clc = bin(m.clc, m.lclc, m.wclc, m.pclc);
+            p.cle = bin(m.cle, m.lcle, m.wcle, m.pcle);
+            p.vfbcv = bin(m.vfbcv, m.lvfbcv, m.wvfbcv, m.pvfbcv);
+            p.acde = bin(m.acde, m.lacde, m.wacde, m.pacde);
+            p.moin = bin(m.moin, m.lmoin, m.wmoin, m.pmoin);
+            p.noff = bin(m.noff, m.lnoff, m.wnoff, m.pnoff);
+            p.voffcv = bin(m.voffcv, m.lvoffcv, m.wvoffcv, m.pvoffcv);
+            p.kvth0we = bin(m.kvth0we, m.lkvth0we, m.wkvth0we, m.pkvth0we);
+            p.k2we = bin(m.k2we, m.lk2we, m.wk2we, m.pk2we);
+            p.ku0we = bin(m.ku0we, m.lku0we, m.wku0we, m.pku0we);
             p.abulkCVfactor = 1.0 + pow((p.clc / p.leffCV), p.cle);
             T0 = (TRatio - 1.0);
             PowWeffWr = pow(p.weffCJ * 1.0e6, p.wr) * h.nf;
@@ -927,11 +971,11 @@ pub(super) fn temperature_instance(
             T1 = T4;
             p.ucs = p.ucs * pow(TRatio, p.ucste);
             if m.tempMod == 0 {
-                p.ua = p.ua + p.ua1 * T0;
-                p.ub = p.ub + p.ub1 * T0;
-                p.uc = p.uc + p.uc1 * T0;
-                p.ud = p.ud + p.ud1 * T0;
-                p.vsattemp = p.vsat - p.at * T0;
+                p.ua = f64::mul_add(p.ua1, T0, p.ua);
+                p.ub = f64::mul_add(p.ub1, T0, p.ub);
+                p.uc = f64::mul_add(p.uc1, T0, p.uc);
+                p.ud = f64::mul_add(p.ud1, T0, p.ud);
+                p.vsattemp = f64::mul_add(p.at, -T0, p.vsat);
                 T10 = p.prt * T0;
                 if m.rdsMod != 0 {
                     T1 = p.rdw + T10;
@@ -948,13 +992,13 @@ pub(super) fn temperature_instance(
                     p.uc = p.uc * pow(TRatio, p.uc1);
                     p.ud = p.ud * pow(TRatio, p.ud1);
                 } else {
-                    p.ua = p.ua * (1.0 + p.ua1 * delTemp);
-                    p.ub = p.ub * (1.0 + p.ub1 * delTemp);
-                    p.uc = p.uc * (1.0 + p.uc1 * delTemp);
-                    p.ud = p.ud * (1.0 + p.ud1 * delTemp);
+                    p.ua = p.ua * f64::mul_add(p.ua1, delTemp, 1.0);
+                    p.ub = p.ub * f64::mul_add(p.ub1, delTemp, 1.0);
+                    p.uc = p.uc * f64::mul_add(p.uc1, delTemp, 1.0);
+                    p.ud = p.ud * f64::mul_add(p.ud1, delTemp, 1.0);
                 }
-                p.vsattemp = p.vsat * (1.0 - p.at * delTemp);
-                T10 = 1.0 + p.prt * delTemp;
+                p.vsattemp = p.vsat * f64::mul_add(p.at, -delTemp, 1.0);
+                T10 = f64::mul_add(p.prt, delTemp, 1.0);
                 if m.rdsMod != 0 {
                     T1 = p.rdw * T10;
                     T2 = m.rdwmin * T10;
@@ -993,7 +1037,7 @@ pub(super) fn temperature_instance(
             if p.u0 > 1.0 {
                 p.u0 = p.u0 / 1.0e4;
             }
-            T5 = 1.0 - p.up * exp(-p.leff / p.lp);
+            T5 = f64::mul_add(p.up, -exp(-p.leff / p.lp), 1.0);
             p.u0temp = p.u0 * T5 * pow(TRatio, p.ute);
             if p.eu < 0.0 {
                 p.eu = 0.0;
@@ -1003,10 +1047,10 @@ pub(super) fn temperature_instance(
                 p.ucs = 0.0;
                 warnings.push("Warning: ucs has been negative; reset to 0.0.".to_string());
             }
-            p.vfbsdoff = p.vfbsdoff * (1.0 + p.tvfbsdoff * delTemp);
-            p.voff = p.voff * (1.0 + p.tvoff * delTemp);
+            p.vfbsdoff = p.vfbsdoff * f64::mul_add(p.tvfbsdoff, delTemp, 1.0);
+            p.voff = p.voff * f64::mul_add(p.tvoff, delTemp, 1.0);
             p.nfactor = p.nfactor + p.tnfactor * delTemp / Tnom;
-            p.voffcv = p.voffcv * (1.0 + p.tvoffcv * delTemp);
+            p.voffcv = p.voffcv * f64::mul_add(p.tvoffcv, delTemp, 1.0);
             p.eta0 = p.eta0 + p.teta0 * delTemp / Tnom;
             if (m.vtlGiven) && (m.vtl > 0.0) {
                 if m.lc < 0.0 {
@@ -1014,7 +1058,7 @@ pub(super) fn temperature_instance(
                 } else {
                     p.lc = m.lc;
                 }
-                T0 = p.leff / (p.xn * p.leff + p.lc);
+                T0 = p.leff / f64::mul_add(p.xn, p.leff, p.lc);
                 p.tfactor = (1.0 - T0) / (1.0 + T0);
             }
             p.cgdo = (m.cgdo + p.cf) * p.weffCV;
@@ -1024,7 +1068,7 @@ pub(super) fn temperature_instance(
                 T0 = p.gamma1 * m.coxe;
                 p.ndep = 3.01248e22 * T0 * T0;
             }
-            p.phi = Vtm0 * log(p.ndep / ni) + p.phin + 0.4;
+            p.phi = f64::mul_add(Vtm0, log(p.ndep / ni), p.phin) + 0.4;
             if p.phi <= 0.0 {
                 warnings.push(format!(
                     "Fatal: Phi = {} is not positive. Please check Phin and Ndep",
@@ -1059,7 +1103,7 @@ pub(super) fn temperature_instance(
                 if T0 > T1 {
                     T0 = T1;
                 }
-                T2 = m.easub + T1 - f64::from(m.r#type) * T0;
+                T2 = f64::mul_add(f64::from(m.r#type), -T0, m.easub + T1);
                 p.vfbsd = m.phig - T2;
             }
             p.cdep0 = sqrt(Charge_q * epssub * p.ndep * 1.0e6 / 2.0 / p.phi);
@@ -1137,7 +1181,7 @@ pub(super) fn temperature_instance(
                 }
             } else {
                 if !m.vbxGiven {
-                    p.vbx = p.phi - 7.7348e-4 * p.ndep * p.xt * p.xt;
+                    p.vbx = f64::mul_add((7.7348e-4 * p.ndep * p.xt), -p.xt, p.phi);
                 }
                 if p.vbx > 0.0 {
                     p.vbx = -p.vbx;
@@ -1154,12 +1198,16 @@ pub(super) fn temperature_instance(
                 T0 = p.gamma1 - p.gamma2;
                 T1 = sqrt(p.phi - p.vbx) - p.sqrtPhi;
                 T2 = sqrt(p.phi * (p.phi - p.vbm)) - p.phi;
-                p.k2 = T0 * T1 / (2.0 * T2 + p.vbm);
-                p.k1 = p.gamma2 - 2.0 * p.k2 * sqrt(p.phi - p.vbm);
+                p.k2 = T0 * T1 / 2.0f64.mul_add(T2, p.vbm);
+                p.k1 = f64::mul_add((2.0 * p.k2), -sqrt(p.phi - p.vbm), p.gamma2);
             }
             if !m.vfbGiven {
                 if m.vth0Given {
-                    p.vfb = f64::from(m.r#type) * p.vth0 - p.phi - p.k1 * p.sqrtPhi;
+                    p.vfb = f64::mul_add(
+                        p.k1,
+                        -p.sqrtPhi,
+                        f64::mul_add(f64::from(m.r#type), p.vth0, -p.phi),
+                    );
                 } else {
                     if (m.mtrlMod != 0) && (m.phigGiven) && (m.nsubGiven) {
                         T0 = Vtm0 * log(p.nsub / ni);
@@ -1167,7 +1215,7 @@ pub(super) fn temperature_instance(
                         if T0 > T1 {
                             T0 = T1;
                         }
-                        T2 = m.easub + T1 + f64::from(m.r#type) * T0;
+                        T2 = f64::mul_add(f64::from(m.r#type), T0, m.easub + T1);
                         p.vfb = m.phig - T2;
                     } else {
                         p.vfb = -1.0;
@@ -1175,7 +1223,7 @@ pub(super) fn temperature_instance(
                 }
             }
             if !m.vth0Given {
-                p.vth0 = f64::from(m.r#type) * (p.vfb + p.phi + p.k1 * p.sqrtPhi);
+                p.vth0 = f64::from(m.r#type) * f64::mul_add(p.k1, p.sqrtPhi, p.vfb + p.phi);
             }
             p.k1ox = p.k1 * toxe / m.toxm;
             tmp = sqrt(epssub / (epsrox * EPS0) * toxe * p.Xdep0);
@@ -1184,7 +1232,7 @@ pub(super) fn temperature_instance(
                 T1 = exp(T0);
                 T2 = T1 - 1.0;
                 T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
+                T4 = f64::mul_add((2.0 * T1), MIN_EXP, T3);
                 p.theta0vb0 = T1 / T4;
             } else {
                 p.theta0vb0 = 1.0 / (MAX_EXP - 2.0);
@@ -1194,12 +1242,12 @@ pub(super) fn temperature_instance(
                 T1 = exp(T0);
                 T2 = T1 - 1.0;
                 T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
+                T4 = f64::mul_add((2.0 * T1), MIN_EXP, T3);
                 T5 = T1 / T4;
             } else {
                 T5 = 1.0 / (MAX_EXP - 2.0);
             }
-            p.thetaRout = p.pdibl1 * T5 + p.pdibl2;
+            p.thetaRout = f64::mul_add(p.pdibl1, T5, p.pdibl2);
             tmp = sqrt(p.Xdep0);
             tmp1 = p.vbi - p.phi;
             tmp2 = m.factor1 * tmp;
@@ -1208,7 +1256,7 @@ pub(super) fn temperature_instance(
                 T1 = exp(T0);
                 T2 = T1 - 1.0;
                 T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
+                T4 = f64::mul_add((2.0 * T1), MIN_EXP, T3);
                 T8 = T1 / T4;
             } else {
                 T8 = 1.0 / (MAX_EXP - 2.0);
@@ -1220,7 +1268,7 @@ pub(super) fn temperature_instance(
                 T1 = exp(T0);
                 T2 = T1 - 1.0;
                 T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
+                T4 = f64::mul_add((2.0 * T1), MIN_EXP, T3);
                 T9 = T1 / T4;
             } else {
                 T9 = 1.0 / (MAX_EXP - 2.0);
@@ -1234,8 +1282,12 @@ pub(super) fn temperature_instance(
             if (m.tempMod == 2) || (m.tempMod == 3) {
                 T3 = -p.kt1 * (TRatio - 1.0);
             }
-            T5 = p.k1ox * (T0 - 1.0) * p.sqrtPhi + T3;
-            p.vfbzbfactor = -T8 - T9 + p.k3 * T4 + T5 - p.phi - p.k1 * p.sqrtPhi;
+            T5 = f64::mul_add((p.k1ox * (T0 - 1.0)), p.sqrtPhi, T3);
+            p.vfbzbfactor = f64::mul_add(
+                p.k1,
+                -p.sqrtPhi,
+                f64::mul_add(p.k3, T4, -T8 - T9) + T5 - p.phi,
+            );
             wlod = m.wlod;
             if m.wlod < 0.0 {
                 warnings.push(format!(
@@ -1253,11 +1305,11 @@ pub(super) fn temperature_instance(
             T1 = pow(W_tmp, m.wlodvth);
             tmp1 = m.lkvth0 / T0 + m.wkvth0 / T1 + m.pkvth0 / (T0 * T1);
             p.kvth0 = 1.0 + tmp1;
-            p.kvth0 = sqrt(p.kvth0 * p.kvth0 + DELTA);
+            p.kvth0 = sqrt(f64::mul_add(p.kvth0, p.kvth0, DELTA));
             T0 = (TRatio - 1.0);
-            p.ku0temp = p.ku0 * (1.0 + m.tku0 * T0) + DELTA;
-            Inv_saref = 1.0 / (m.saref + 0.5 * Ldrn);
-            Inv_sbref = 1.0 / (m.sbref + 0.5 * Ldrn);
+            p.ku0temp = p.ku0.mul_add(m.tku0.mul_add(T0, 1.), DELTA);
+            Inv_saref = 1.0 / 0.5f64.mul_add(Ldrn, m.saref);
+            Inv_sbref = 1.0 / 0.5f64.mul_add(Ldrn, m.sbref);
             p.inv_od_ref = Inv_saref + Inv_sbref;
             p.rho_ref = m.ku0 / p.ku0temp * p.inv_od_ref;
             if m.mobMod == 3 {
@@ -1267,19 +1319,19 @@ pub(super) fn temperature_instance(
                     T1 = exp(T0);
                     T2 = T1 - 1.0;
                     T3 = T2 * T2;
-                    T4 = T3 + 2.0 * T1 * MIN_EXP;
+                    T4 = f64::mul_add((2.0 * T1), MIN_EXP, T3);
                     Theta0 = T1 / T4;
                 } else {
                     Theta0 = 1.0 / (MAX_EXP - 2.0);
                 }
                 tmp1 = epssub / p.Xdep0;
                 tmp2 = p.nfactor * tmp1;
-                tmp3 = (tmp2 + p.cdsc * Theta0 + p.cit) / m.coxe;
+                tmp3 = (f64::mul_add(p.cdsc, Theta0, tmp2) + p.cit) / m.coxe;
                 if tmp3 >= -0.5 {
                     n0 = 1.0 + tmp3;
                 } else {
-                    T0 = 1.0 / (3.0 + 8.0 * tmp3);
-                    n0 = (1.0 + 3.0 * tmp3) * T0;
+                    T0 = 1.0 / 8.0f64.mul_add(tmp3, 3.0);
+                    n0 = 3.0f64.mul_add(tmp3, 1.0) * T0;
                 }
                 T0 = n0 * m.vtm;
                 T1 = p.voffcbn;
@@ -1291,12 +1343,12 @@ pub(super) fn temperature_instance(
                 } else {
                     T3 = exp(T2) * m.coxe / p.cdep0;
                 }
-                T4 = p.mstar + T3 * n0;
+                T4 = f64::mul_add(T3, n0, p.mstar);
                 p.VgsteffVth = T0 * log(2.0) / T4;
             }
             T0 = -p.dvtp3 * log(p.leff);
             T1 = dexp(T0);
-            p.dvtp2factor = p.dvtp5 + p.dvtp2 * T1;
+            p.dvtp2factor = f64::mul_add(p.dvtp2, T1, p.dvtp5);
         }
         if (h.sa > 0.0) && (h.sb > 0.0) && ((h.nf == 1.0) || ((h.nf > 1.0) && (h.sd > 0.0))) {
             Inv_sa = 0.0;
@@ -1318,8 +1370,12 @@ pub(super) fn temperature_instance(
             }
             i = 0;
             while f64::from(i) < h.nf {
-                T0 = 1.0 / h.nf / (h.sa + 0.5 * Ldrn + f64::from(i) * (h.sd + Ldrn));
-                T1 = 1.0 / h.nf / (h.sb + 0.5 * Ldrn + f64::from(i) * (h.sd + Ldrn));
+                T0 = 1.0
+                    / h.nf
+                    / f64::mul_add(f64::from(i), h.sd + Ldrn, 0.5f64.mul_add(Ldrn, h.sa));
+                T1 = 1.0
+                    / h.nf
+                    / f64::mul_add(f64::from(i), h.sd + Ldrn, 0.5f64.mul_add(Ldrn, h.sb));
                 Inv_sa += T0;
                 Inv_sb += T1;
                 i += 1;
@@ -1328,7 +1384,7 @@ pub(super) fn temperature_instance(
             rho = m.ku0 / p.ku0temp * Inv_ODeff;
             T0 = (1.0 + rho) / (1.0 + p.rho_ref);
             h.u0temp = p.u0temp * T0;
-            T1 = (1.0 + kvsat * rho) / (1.0 + kvsat * p.rho_ref);
+            T1 = f64::mul_add(kvsat, rho, 1.0) / f64::mul_add(kvsat, p.rho_ref, 1.0);
             h.vsattemp = p.vsattemp * T1;
             OD_offset = Inv_ODeff - p.inv_od_ref;
             dvth0_lod = m.kvth0 / p.kvth0 * OD_offset;
@@ -1348,14 +1404,9 @@ pub(super) fn temperature_instance(
             if (!h.scaGiven) && (!h.scbGiven) && (!h.sccGiven) {
                 if (h.scGiven) && (h.sc > 0.0) {
                     T1 = h.sc + Wdrn;
-                    T2 = 1.0 / m.scref;
                     h.sca = m.scref * m.scref / (h.sc * T1);
-                    h.scb = ((0.1 * h.sc + 0.01 * m.scref) * exp(-10.0 * h.sc * T2)
-                        - (0.1 * T1 + 0.01 * m.scref) * exp(-10.0 * T1 * T2))
-                        / Wdrn;
-                    h.scc = ((0.05 * h.sc + 0.0025 * m.scref) * exp(-20.0 * h.sc * T2)
-                        - (0.05 * T1 + 0.0025 * m.scref) * exp(-20.0 * T1 * T2))
-                        / Wdrn;
+                    h.scb = well_proximity_average(h.sc, Wdrn, m.scref, 10.);
+                    h.scc = well_proximity_average(h.sc, Wdrn, m.scref, 20.);
                 } else {
                     warnings.push("Warning: No WPE as none of SCA, SCB, SCC, SC is given and/or SC not positive.".to_string());
                 }
@@ -1388,10 +1439,10 @@ pub(super) fn temperature_instance(
                 ));
                 h.sc = 0.0;
             }
-            sceff = h.sca + m.web * h.scb + m.wec * h.scc;
-            h.vth0 += p.kvth0we * sceff;
-            h.k2 += p.k2we * sceff;
-            T3 = 1.0 + p.ku0we * sceff;
+            sceff = m.wec.mul_add(h.scc, m.web.mul_add(h.scb, h.sca));
+            h.vth0 = f64::mul_add(p.kvth0we, sceff, h.vth0);
+            h.k2 = f64::mul_add(p.k2we, sceff, h.k2);
+            T3 = f64::mul_add(p.ku0we, sceff, 1.0);
             if T3 <= 0.0 {
                 T3 = 0.0;
                 warnings.push(format!(
@@ -1402,9 +1453,9 @@ pub(super) fn temperature_instance(
             h.u0temp *= T3;
         }
         h.vth0 += h.delvto;
-        h.vfb = p.vfb + f64::from(m.r#type) * h.delvto;
+        h.vfb = f64::mul_add(f64::from(m.r#type), h.delvto, p.vfb);
         h.u0temp = p.u0temp * h.mulu0;
-        T3 = f64::from(m.r#type) * h.vth0 - h.vfb - p.phi;
+        T3 = f64::mul_add(f64::from(m.r#type), h.vth0, -h.vfb) - p.phi;
         T4 = T3 + T3;
         T5 = 2.5 * T3;
         h.vtfbphi1 = if m.r#type == NMOS { T4 } else { T5 };
@@ -1417,7 +1468,7 @@ pub(super) fn temperature_instance(
         }
         if h.k2 < 0.0 {
             T0 = 0.5 * p.k1 / h.k2;
-            h.vbsc = 0.9 * (p.phi - T0 * T0);
+            h.vbsc = 0.9 * f64::mul_add(T0, -T0, p.phi);
             if h.vbsc > -3.0 {
                 h.vbsc = -3.0;
             } else if h.vbsc < -30.0 {
@@ -1430,7 +1481,7 @@ pub(super) fn temperature_instance(
             h.vbsc = p.vbm;
         }
         h.k2ox = h.k2 * toxe / m.toxm;
-        h.vfbzb = p.vfbzbfactor + f64::from(m.r#type) * h.vth0;
+        h.vfbzb = f64::mul_add(f64::from(m.r#type), h.vth0, p.vfbzbfactor);
         h.cgso = p.cgso;
         h.cgdo = p.cgdo;
         lnl = log(p.leff * 1.0e6);
@@ -1444,19 +1495,37 @@ pub(super) fn temperature_instance(
         }
         if h.rbodyMod == 2 {
             if bodymode == 5.0 {
-                rbsbx = m.rbsbx0 * exp(m.rbsdbxl * lnl + m.rbsdbxw * lnw + m.rbsdbxnf * lnnf);
-                rbsby = m.rbsby0 * exp(m.rbsdbyl * lnl + m.rbsdbyw * lnw + m.rbsdbynf * lnnf);
+                rbsbx = m.rbsbx0
+                    * exp(m
+                        .rbsdbxnf
+                        .mul_add(lnnf, m.rbsdbxw.mul_add(lnw, m.rbsdbxl * lnl)));
+                rbsby = m.rbsby0
+                    * exp(m
+                        .rbsdbynf
+                        .mul_add(lnnf, m.rbsdbyw.mul_add(lnw, m.rbsdbyl * lnl)));
                 h.rbsb = rbsbx * rbsby / (rbsbx + rbsby);
-                rbdbx = m.rbdbx0 * exp(m.rbsdbxl * lnl + m.rbsdbxw * lnw + m.rbsdbxnf * lnnf);
-                rbdby = m.rbdby0 * exp(m.rbsdbyl * lnl + m.rbsdbyw * lnw + m.rbsdbynf * lnnf);
+                rbdbx = m.rbdbx0
+                    * exp(m
+                        .rbsdbxnf
+                        .mul_add(lnnf, m.rbsdbxw.mul_add(lnw, m.rbsdbxl * lnl)));
+                rbdby = m.rbdby0
+                    * exp(m
+                        .rbsdbynf
+                        .mul_add(lnnf, m.rbsdbyw.mul_add(lnw, m.rbsdbyl * lnl)));
                 h.rbdb = rbdbx * rbdby / (rbdbx + rbdby);
             }
             if (bodymode == 3.0) || (bodymode == 5.0) {
-                h.rbps = m.rbps0 * exp(m.rbpsl * lnl + m.rbpsw * lnw + m.rbpsnf * lnnf);
-                h.rbpd = m.rbpd0 * exp(m.rbpdl * lnl + m.rbpdw * lnw + m.rbpdnf * lnnf);
+                h.rbps = m.rbps0 * exp(m.rbpsnf.mul_add(lnnf, m.rbpsw.mul_add(lnw, m.rbpsl * lnl)));
+                h.rbpd = m.rbpd0 * exp(m.rbpdnf.mul_add(lnnf, m.rbpdw.mul_add(lnw, m.rbpdl * lnl)));
             }
-            rbpbx = m.rbpbx0 * exp(m.rbpbxl * lnl + m.rbpbxw * lnw + m.rbpbxnf * lnnf);
-            rbpby = m.rbpby0 * exp(m.rbpbyl * lnl + m.rbpbyw * lnw + m.rbpbynf * lnnf);
+            rbpbx = m.rbpbx0
+                * exp(m
+                    .rbpbxnf
+                    .mul_add(lnnf, m.rbpbxw.mul_add(lnw, m.rbpbxl * lnl)));
+            rbpby = m.rbpby0
+                * exp(m
+                    .rbpbynf
+                    .mul_add(lnnf, m.rbpbyw.mul_add(lnw, m.rbpbyl * lnl)));
             h.rbpb = rbpbx * rbpby / (rbpbx + rbpby);
         }
         if (h.rbodyMod == 1) || ((h.rbodyMod == 2) && (bodymode == 5.0)) {
@@ -1541,7 +1610,7 @@ pub(super) fn temperature_instance(
                 if m.perMod == 0 {
                     h.Pseff = h.sourcePerimeter;
                 } else {
-                    h.Pseff = h.sourcePerimeter - p.weffCJ * h.nf;
+                    h.Pseff = f64::mul_add(p.weffCJ, -h.nf, h.sourcePerimeter);
                 }
             }
         } else {
@@ -1574,7 +1643,7 @@ pub(super) fn temperature_instance(
                 if m.perMod == 0 {
                     h.Pdeff = h.drainPerimeter;
                 } else {
-                    h.Pdeff = h.drainPerimeter - p.weffCJ * h.nf;
+                    h.Pdeff = f64::mul_add(p.weffCJ, -h.nf, h.drainPerimeter);
                 }
             }
         } else {
@@ -1696,9 +1765,13 @@ pub(super) fn temperature_instance(
         if (h.Aseff <= 0.0) && (h.Pseff <= 0.0) {
             SourceSatCurrent = 0.0;
         } else {
-            SourceSatCurrent = h.Aseff * m.SjctTempSatCurDensity
-                + h.Pseff * m.SjctSidewallTempSatCurDensity
-                + p.weffCJ * h.nf * m.SjctGateSidewallTempSatCurDensity;
+            SourceSatCurrent = (p.weffCJ * h.nf).mul_add(
+                m.SjctGateSidewallTempSatCurDensity,
+                h.Pseff.mul_add(
+                    m.SjctSidewallTempSatCurDensity,
+                    h.Aseff * m.SjctTempSatCurDensity,
+                ),
+            );
         }
         if SourceSatCurrent > 0.0 {
             match m.dioMod {
@@ -1733,7 +1806,7 @@ pub(super) fn temperature_instance(
                             "Warning: ijthsrev too small and set to 10 times IsbSat.".to_string(),
                         );
                     }
-                    h.vjsmRev = -m.bvs - Nvtms * log((T2 - 1.0) / m.xjbvs);
+                    h.vjsmRev = f64::mul_add(Nvtms, -log((T2 - 1.0) / m.xjbvs), -m.bvs);
                     T1 = m.xjbvs * exp(-(m.bvs + h.vjsmRev) / Nvtms);
                     h.IVjsmRev = SourceSatCurrent * (1.0 + T1);
                     h.SslpRev = -SourceSatCurrent * T1 / Nvtms;
@@ -1747,9 +1820,13 @@ pub(super) fn temperature_instance(
         if (h.Adeff <= 0.0) && (h.Pdeff <= 0.0) {
             DrainSatCurrent = 0.0;
         } else {
-            DrainSatCurrent = h.Adeff * m.DjctTempSatCurDensity
-                + h.Pdeff * m.DjctSidewallTempSatCurDensity
-                + p.weffCJ * h.nf * m.DjctGateSidewallTempSatCurDensity;
+            DrainSatCurrent = (p.weffCJ * h.nf).mul_add(
+                m.DjctGateSidewallTempSatCurDensity,
+                h.Pdeff.mul_add(
+                    m.DjctSidewallTempSatCurDensity,
+                    h.Adeff * m.DjctTempSatCurDensity,
+                ),
+            );
         }
         if DrainSatCurrent > 0.0 {
             match m.dioMod {
@@ -1784,7 +1861,7 @@ pub(super) fn temperature_instance(
                             "Warning: ijthdrev too small and set to 10 times IdbSat.".to_string(),
                         );
                     }
-                    h.vjdmRev = -m.bvd - Nvtmd * log((T2 - 1.0) / m.xjbvd);
+                    h.vjdmRev = f64::mul_add(Nvtmd, -log((T2 - 1.0) / m.xjbvd), -m.bvd);
                     T1 = m.xjbvd * exp(-(m.bvd + h.vjdmRev) / Nvtmd);
                     h.IVjdmRev = DrainSatCurrent * (1.0 + T1);
                     h.DslpRev = -DrainSatCurrent * T1 / Nvtmd;
@@ -1795,12 +1872,12 @@ pub(super) fn temperature_instance(
             }
         }
         T0 = (TRatio - 1.0);
-        m.njtsstemp = m.njts * (1.0 + m.tnjts * T0);
-        m.njtsswstemp = m.njtssw * (1.0 + m.tnjtssw * T0);
-        m.njtsswgstemp = m.njtsswg * (1.0 + m.tnjtsswg * T0);
-        m.njtsdtemp = m.njtsd * (1.0 + m.tnjtsd * T0);
-        m.njtsswdtemp = m.njtsswd * (1.0 + m.tnjtsswd * T0);
-        m.njtsswgdtemp = m.njtsswgd * (1.0 + m.tnjtsswgd * T0);
+        m.njtsstemp = m.njts * m.tnjts.mul_add(T0, 1.0);
+        m.njtsswstemp = m.njtssw * m.tnjtssw.mul_add(T0, 1.0);
+        m.njtsswgstemp = m.njtsswg * m.tnjtsswg.mul_add(T0, 1.0);
+        m.njtsdtemp = m.njtsd * m.tnjtsd.mul_add(T0, 1.0);
+        m.njtsswdtemp = m.njtsswd * m.tnjtsswd.mul_add(T0, 1.0);
+        m.njtsswgdtemp = m.njtsswgd * m.tnjtsswgd.mul_add(T0, 1.0);
         T7 = Eg0 / m.vtm * T0;
         T9 = m.xtss * T7;
         T1 = dexp(T9);
@@ -1832,7 +1909,7 @@ pub(super) fn temperature_instance(
             Vtm0eot = KboQ * m.tempeot;
             Vtmeot = Vtm0eot;
             vbieot = Vtm0eot * log(p.nsd * p.ndep / (ni * ni));
-            phieot = Vtm0eot * log(p.ndep / ni) + p.phin + 0.4;
+            phieot = f64::mul_add(Vtm0eot, log(p.ndep / ni), p.phin) + 0.4;
             if phieot <= 0.0 {
                 warnings.push(format!(
                     "Fatal: phieot = {} is not positive. Please Check Phin and Ndep",
@@ -1851,8 +1928,8 @@ pub(super) fn temperature_instance(
                 T2 = 2.0 * T8 / (T4 + 1.0);
                 T3 = 0.5 * T2 * T2 / T1;
                 T7 = 1.12 - T3 - 0.05;
-                T6 = sqrt(T7 * T7 + 0.224);
-                T5 = 1.12 - 0.5 * (T7 + T6);
+                T6 = sqrt(f64::mul_add(T7, T7, 0.224));
+                T5 = 1.12 - T7.midpoint(T6);
                 Vgs_eff = vddeot - T5;
             } else {
                 Vgs_eff = vddeot;
@@ -1865,7 +1942,7 @@ pub(super) fn temperature_instance(
                 T1 = exp(T0);
                 T2 = T1 - 1.0;
                 T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
+                T4 = f64::mul_add((2.0 * T1), MIN_EXP, T3);
                 Theta0 = T1 / T4;
             } else {
                 Theta0 = 1.0 / (MAX_EXP - 2.0);
@@ -1876,7 +1953,7 @@ pub(super) fn temperature_instance(
                 T1 = exp(T0);
                 T2 = T1 - 1.0;
                 T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
+                T4 = f64::mul_add((2.0 * T1), MIN_EXP, T3);
                 T5 = T1 / T4;
             } else {
                 T5 = 1.0 / (MAX_EXP - 2.0);
@@ -1884,35 +1961,38 @@ pub(super) fn temperature_instance(
             T2 = p.dvt0w * T5 * V0;
             TempRatioeot = m.tempeot / m.tnom - 1.0;
             T0 = sqrt(1.0 + p.lpe0 / m.leffeot);
-            T1 = p.k1ox * (T0 - 1.0) * sqrt(phieot) + (p.kt1 + p.kt1l / m.leffeot) * TempRatioeot;
+            T1 = (p.kt1 + p.kt1l / m.leffeot)
+                .mul_add(TempRatioeot, p.k1ox * (T0 - 1.0) * sqrt(phieot));
             let width_with_offset = m.weffeot + p.w0;
             Vth_NarrowW = toxe * phieot / width_with_offset;
             Lpe_Vb = sqrt(1.0 + p.lpeb / m.leffeot);
-            Vth = f64::from(m.r#type) * h.vth0 + (p.k1ox - p.k1) * sqrt(phieot) * Lpe_Vb
-                - Delt_vth
-                - T2
-                + p.k3 * Vth_NarrowW
-                + T1;
+            Vth = f64::mul_add(
+                p.k3,
+                Vth_NarrowW,
+                ((p.k1ox - p.k1) * sqrt(phieot)).mul_add(Lpe_Vb, f64::from(m.r#type) * h.vth0)
+                    - Delt_vth
+                    - T2,
+            ) + T1;
             tmp1 = epssub / p.Xdep0;
             tmp2 = p.nfactor * tmp1;
-            tmp3 = (tmp2 + p.cdsc * Theta0 + p.cit) / m.coxe;
+            tmp3 = (f64::mul_add(p.cdsc, Theta0, tmp2) + p.cit) / m.coxe;
             if tmp3 >= -0.5 {
                 n = 1.0 + tmp3;
             } else {
-                T0 = 1.0 / (3.0 + 8.0 * tmp3);
-                n = (1.0 + 3.0 * tmp3) * T0;
+                T0 = 1.0 / 8.0f64.mul_add(tmp3, 3.0);
+                n = 3.0f64.mul_add(tmp3, 1.0) * T0;
             }
             if p.dvtp0 > 0.0 {
-                T3 = m.leffeot + p.dvtp0 * 2.0;
+                T3 = f64::mul_add(p.dvtp0, 2.0, m.leffeot);
                 if m.tempMod < 2 {
                     T4 = Vtmeot * log(m.leffeot / T3);
                 } else {
                     T4 = Vtm0eot * log(m.leffeot / T3);
                 }
-                Vth -= n * T4;
+                Vth = f64::mul_add(n, -T4, Vth);
             }
             Vgsteff = Vgs_eff - Vth;
-            T3 = f64::from(m.r#type) * h.vth0 - h.vfb - phieot;
+            T3 = f64::mul_add(f64::from(m.r#type), h.vth0, -h.vfb) - phieot;
             T4 = T3 + T3;
             T5 = 2.5 * T3;
             vtfbphi2eot = 4.0 * T3;
@@ -1927,9 +2007,9 @@ pub(super) fn temperature_instance(
                 T0 = (Vgsteff + vtfbphi2eot) / tmp2;
                 T1 = 1.0 + exp(m.bdos * 0.7 * log(T0));
                 Tcen = m.ados * 1.9e-9 / T1;
-                toxpf = toxe - epsrox / m.epsrsub * Tcen;
+                toxpf = (epsrox / m.epsrsub).mul_add(-Tcen, toxe);
                 niter += 1.0;
-                if !((niter <= 4.0) && (ABS(toxpf - toxpi) > 1e-12)) {
+                if !((niter <= 4.0) && ((toxpf - toxpi).abs() > 1e-12)) {
                     break;
                 }
             }
@@ -2066,6 +2146,30 @@ mod tests {
         let v = dio_ijth_vjm_eval(0.025, 0.1, 1e-14, 0.0);
         let current = 1e-14 * ((v / 0.025).exp() - 1.0);
         assert!((current - 0.1).abs() < 1e-12, "{current}");
+    }
+
+    #[test]
+    fn small_diode_current_and_narrow_well_integrals_do_not_round_to_zero() {
+        let voltage = dio_ijth_vjm_eval(0.025, 1e-20, 1., 3.);
+        assert!((voltage / (0.025 * 2.5e-21) - 1.).abs() < 1e-14);
+        assert_eq!(dio_ijth_vjm_eval(0.025, 0., 1., 3.), 0.);
+        for order in [10., 20.] {
+            let average = well_proximity_average(0.2, 1e-20, 1., order);
+            assert!((average / (0.2 * (-0.2 * order).exp()) - 1.).abs() < 1e-14);
+            let ordinary = well_proximity_average(0.2, 0.03, 1., order);
+            let coeff = order.recip();
+            let f = |x: f64| coeff * (x + coeff) * (-order * x).exp();
+            assert!((ordinary / ((f(0.2) - f(0.23)) / 0.03) - 1.).abs() < 1e-13);
+        }
+    }
+
+    #[test]
+    fn binning_retains_product_residual() {
+        let epsilon = 2_f64.powi(-27);
+        assert_eq!(
+            bin_parameter(-1., [1. + epsilon, 0., 0.], [1. - epsilon, 1., 1.]),
+            -epsilon * epsilon
+        );
     }
 
     #[test]
