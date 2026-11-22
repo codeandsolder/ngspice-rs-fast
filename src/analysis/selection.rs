@@ -268,17 +268,9 @@ impl Selection {
     fn project(&self, plot: &Plot) -> SpiceResult<Plot> {
         let mut selected = self.header(plot)?;
         selected.reserve_points(plot.point_count())?;
-        let mut row = Vec::new();
-        row.try_reserve_exact(self.columns.len())
-            .map_err(|error| SpiceError::Numerical {
-                context: "selection row".into(),
-                message: error.to_string(),
-            })?;
+        let mut row = self.row_buffer()?;
         for point in plot.rows() {
-            row.clear();
-            for column in &self.columns {
-                row.push(column.value(point)?);
-            }
+            self.fill_row(point, &mut row)?;
             selected.push_point(&row)?;
         }
         Ok(selected)
@@ -316,21 +308,11 @@ impl Selection {
         // first cell. With a non-expanding projection, the output prefix
         // never crosses the next unread source row, regardless of column
         // order, differential operands or duplicate requests.
-        let mut scratch = Vec::new();
-        scratch
-            .try_reserve_exact(width)
-            .map_err(|error| SpiceError::Numerical {
-                context: "selection row".into(),
-                message: error.to_string(),
-            })?;
+        let mut scratch = self.row_buffer()?;
         let mut cells = plot.into_cells();
         for index in 0..count {
             let start = index * source_width;
-            let source = &cells[start..start + source_width];
-            scratch.clear();
-            for column in &self.columns {
-                scratch.push(column.value(source)?);
-            }
+            self.fill_row(&cells[start..start + source_width], &mut scratch)?;
             let destination = index * width;
             cells[destination..destination + width].copy_from_slice(&scratch);
         }
@@ -382,25 +364,38 @@ impl Selection {
         }
     }
 
+    fn row_buffer(&self) -> SpiceResult<Vec<Complex>> {
+        let mut buffer = Vec::new();
+        if !self.full {
+            buffer
+                .try_reserve_exact(self.columns.len())
+                .map_err(|error| SpiceError::Numerical {
+                    context: "selection row".into(),
+                    message: error.to_string(),
+                })?;
+        }
+        Ok(buffer)
+    }
+
+    fn fill_row(&self, point: &[Complex], buffer: &mut Vec<Complex>) -> SpiceResult<()> {
+        self.check_width(point)?;
+        buffer.clear();
+        for column in &self.columns {
+            buffer.push(column.value(point)?);
+        }
+        Ok(())
+    }
+
     /// Bind this selection to a driver header before projecting streamed rows.
     ///
     /// # Errors
     /// The driver header has a different schema.
     pub fn bind(self, header: &Plot) -> SpiceResult<RowProjection> {
         self.check_schema(header)?;
-        let capacity = if self.full { 0 } else { self.columns.len() };
+        let buffer = self.row_buffer()?;
         Ok(RowProjection {
             selection: self,
-            buffer: {
-                let mut buffer = Vec::new();
-                buffer
-                    .try_reserve_exact(capacity)
-                    .map_err(|error| SpiceError::Numerical {
-                        context: "selection row".into(),
-                        message: error.to_string(),
-                    })?;
-                buffer
-            },
+            buffer,
         })
     }
 
@@ -475,14 +470,11 @@ impl RowProjection {
     /// # Errors
     /// Row width mismatch or a nonfinite computed result.
     pub fn project<'a>(&'a mut self, point: &'a [Complex]) -> SpiceResult<&'a [Complex]> {
-        self.selection.check_width(point)?;
         if self.selection.full {
+            self.selection.check_width(point)?;
             return Ok(point);
         }
-        self.buffer.clear();
-        for column in &self.selection.columns {
-            self.buffer.push(column.value(point)?);
-        }
+        self.selection.fill_row(point, &mut self.buffer)?;
         Ok(&self.buffer)
     }
 }
