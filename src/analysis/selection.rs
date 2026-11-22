@@ -285,13 +285,29 @@ impl Selection {
     ///
     /// # Errors
     /// Schema mismatch or a nonfinite computed result.
-    pub fn into_plot(&self, plot: Plot) -> SpiceResult<Plot> {
+    pub fn into_plot(self, mut plot: Plot) -> SpiceResult<Plot> {
         self.check_schema(&plot)?;
         if self.full {
-            Ok(plot)
-        } else {
-            self.apply(&plot)
+            return Ok(plot);
         }
+        // Consume source rows one at a time; a narrowed result need not keep
+        // all the original row allocations alive until projection finishes.
+        let points = plot
+            .take_points()
+            .into_iter()
+            .map(|point| self.project_row(&point))
+            .collect::<SpiceResult<Vec<_>>>()?;
+        let variables = self
+            .columns
+            .into_iter()
+            .map(|column| Variable {
+                name: column.name,
+                unit: column.unit,
+                is_real: column.is_real,
+            })
+            .collect();
+        let flags = plot.flags();
+        Plot::new(plot.name, plot.plotname, flags, variables).with_points(points)
     }
 
     /// The selected header, after verifying the original ordered schema.
@@ -1186,5 +1202,85 @@ mod tests {
         let points_address = owned.points().as_ptr();
         let written = full.into_plot(owned).unwrap();
         assert_eq!(written.points().as_ptr(), points_address);
+    }
+    #[test]
+    #[ignore = "opt-in large-deck projection benchmark"]
+    fn large_schema_lookup_and_streaming_benchmark() {
+        use std::fmt::Write as _;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const NODES: u32 = 16_384;
+        const ROWS: usize = 65_536;
+        let mut deck = String::from("large saved-vector deck\nv1 input 0 1\n");
+        for i in 0..NODES {
+            writeln!(deck, "r{i} input n{i} 1k").unwrap();
+        }
+        for i in (0..NODES).rev().step_by(2) {
+            writeln!(deck, ".save v(n{i})").unwrap();
+        }
+        deck.push_str(".op\n.end\n");
+        let parsed = crate::netlist::Parser::new()
+            .parse_deck_with_output(&crate::netlist::source::parse_deck_text(
+                std::path::Path::new("projection-bench.cir"),
+                &deck,
+            ))
+            .unwrap();
+        let mut circuit = crate::devices::Circuit::from_netlist(&parsed.netlist).unwrap();
+        circuit.finalize().unwrap();
+        let start = Instant::now();
+        let plot =
+            crate::analysis::linear::plot(&circuit, "op1", "Operating Point", None, false).unwrap();
+        let setup = start.elapsed();
+        let requests = write_requests(&parsed.output, AnalysisKind::OperatingPoint).unwrap();
+        let names = requests.iter().map(|r| r.vector.name()).collect::<Vec<_>>();
+        let start = Instant::now();
+        let linear = names
+            .iter()
+            .map(|name| {
+                plot.variables()
+                    .iter()
+                    .position(|variable| variable.name.eq_ignore_ascii_case(name))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let linear_elapsed = start.elapsed();
+        let start = Instant::now();
+        let indexed = names
+            .iter()
+            .map(|name| plot.variable_index(name).unwrap())
+            .collect::<Vec<_>>();
+        let indexed_elapsed = start.elapsed();
+        assert_eq!(linear, indexed);
+        let start = Instant::now();
+        let selection = resolve(&plot, AnalysisKind::OperatingPoint, &requests);
+        let resolve_elapsed = start.elapsed();
+        assert_eq!(selection.variable_names().len(), names.len());
+        println!(
+            "{} columns, {} requests; schema {setup:?}, linear lookup {linear_elapsed:?}, indexed lookup {indexed_elapsed:?}, full resolution {resolve_elapsed:?}",
+            plot.variable_count(),
+            requests.len()
+        );
+        // Small output from the same wide input: isolate per-row allocation.
+        let selection = resolve(&plot, AnalysisKind::OperatingPoint, &requests[..32]);
+        let row = vec![Complex::real(2.); plot.variable_count()];
+        let start = Instant::now();
+        for _ in 0..ROWS {
+            black_box(selection.project_row(black_box(&row)).unwrap());
+        }
+        let allocated_elapsed = start.elapsed();
+        let mut stream = selection.bind(&plot).unwrap();
+        let address = stream.project(&row).unwrap().as_ptr();
+        let start = Instant::now();
+        for _ in 0..ROWS {
+            let output = stream.project(black_box(&row)).unwrap();
+            assert_eq!(output.as_ptr(), address);
+            black_box(output);
+        }
+        let reuse_elapsed = start.elapsed();
+        println!(
+            "{ROWS} x 32 projected values: allocated row {allocated_elapsed:?}, reused row {reuse_elapsed:?}; row allocations eliminated: {}",
+            ROWS - 1
+        );
     }
 }

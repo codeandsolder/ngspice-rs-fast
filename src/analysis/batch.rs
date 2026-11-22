@@ -420,21 +420,40 @@ pub fn resolve_outputs_with_scope(
     } else {
         Vec::new()
     };
-    let fourier = if scheduled.last_of_kind && kind == AnalysisKind::Transient {
-        match fourier_settings {
-            Some(settings) => fourier::resolve_with_settings(&plot, kind, fourier_cards, settings)?,
-            None => fourier::resolve(&plot, kind, fourier_cards)?,
-        }
-    } else {
-        Vec::new()
-    };
-    let written = selection.into_plot(plot)?;
+    let (written, fourier) =
+        finish_projection(plot, selection, scheduled, fourier_cards, fourier_settings)?;
     Ok(PlotOutputs {
         written,
         printed,
         measurements,
         fourier,
     })
+}
+
+// The configured Fourier path historically projected the output before
+// evaluating Fourier settings. Keep that error order for narrowed output;
+// an identity projection cannot fail after its own schema was resolved.
+fn finish_projection(
+    plot: Plot,
+    selection: Selection,
+    scheduled: &ScheduledAnalysis,
+    cards: &[FourierCard],
+    settings: Option<fourier::FourierSettings>,
+) -> SpiceResult<(Plot, Vec<FourierAnalysis>)> {
+    if !scheduled.last_of_kind || scheduled.kind != AnalysisKind::Transient {
+        return Ok((selection.into_plot(plot)?, Vec::new()));
+    }
+    if let Some(settings) = settings {
+        if !selection.is_full() {
+            let written = selection.apply(&plot)?;
+            let fourier = fourier::resolve_with_settings(&plot, scheduled.kind, cards, settings)?;
+            return Ok((written, fourier));
+        }
+        let fourier = fourier::resolve_with_settings(&plot, scheduled.kind, cards, settings)?;
+        return Ok((selection.into_plot(plot)?, fourier));
+    }
+    let fourier = fourier::resolve(&plot, scheduled.kind, cards)?;
+    Ok((selection.into_plot(plot)?, fourier))
 }
 
 /// The `.save`/`.print` selection one scheduled plot is written with: the

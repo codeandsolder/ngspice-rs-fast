@@ -171,12 +171,12 @@ fn cli_expands_save_measure_and_fourier_cards_before_running() {
     assert_eq!(report.plots[0].fourier_results.len(), 1);
     assert!(
         report.plots[0]
-            .variables()
+            .variables
             .contains(&"v(x1.local)".to_owned())
     );
     assert!(
         report.plots[0]
-            .variables()
+            .variables
             .contains(&"v(x2.local)".to_owned())
     );
 }

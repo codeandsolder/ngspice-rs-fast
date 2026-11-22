@@ -274,7 +274,7 @@ impl Plot {
 
     /// The immutable schema, shared by clones and bound projections.
     #[must_use]
-    pub fn schema(&self) -> &Arc<PlotSchema> {
+    pub const fn schema(&self) -> &Arc<PlotSchema> {
         &self.schema
     }
 
