@@ -166,7 +166,7 @@ impl Gpu {
     async fn new() -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions::default())
@@ -274,7 +274,7 @@ impl Gpu {
             Ok(())
         };
         let resident = median_ms(|| dispatch(false))?;
-        let mut measured_error = 0.;
+        let mut host_result = vec![0.; input.expected.len()];
         let transfer = median_ms(|| {
             self.queue
                 .write_buffer(&diagonal, 0, bytemuck::cast_slice(&input.diagonal));
@@ -290,27 +290,13 @@ impl Gpu {
             rx.recv().context("readback callback dropped")??;
             {
                 let mapped = slice.get_mapped_range()?;
-                // Copy out the complete result inside the transfer timing; validate
-                // separately below so residual work is not charged to the GPU.
-                let values: &[f64] = bytemuck::cast_slice(&mapped);
-                black_box(values.iter().fold(0., |sum, v| sum + v));
+                host_result.copy_from_slice(bytemuck::cast_slice(&mapped));
+                black_box(&host_result);
             }
             staging.unmap();
             Ok(())
         })?;
-        dispatch(true)?;
-        let slice = staging.slice(..);
-        let (tx, rx) = mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        self.device.poll(wgpu::PollType::wait_indefinitely())?;
-        rx.recv().context("validation callback dropped")??;
-        {
-            let mapped = slice.get_mapped_range()?;
-            measured_error = input.check(bytemuck::cast_slice(&mapped))?;
-        }
-        staging.unmap();
+        let measured_error = input.check(&host_result)?;
         Ok((resident, transfer, measured_error))
     }
 }
