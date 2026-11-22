@@ -474,8 +474,8 @@ impl Jfet {
         let mut tcgd = model.cgd * cjfact;
         tcgs *= cjfact1;
         tcgd *= cjfact1;
-        let vto = model.vtotc.map_or(
-            f64::mul_add(model.tcv, -(temp - tnom), model.vto),
+        let vto = model.vtotc.map_or_else(
+            || model.tcv.mul_add(-(temp - tnom), model.vto),
             |vtotc| f64::mul_add(vtotc, temp - tnom, model.vto),
         );
         let beta = model.betatce.map_or_else(
