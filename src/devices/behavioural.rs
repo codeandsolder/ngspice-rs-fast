@@ -48,7 +48,8 @@ use crate::primitives::{
 
 use crate::devices::linear::LinearContext;
 use crate::devices::traits::{AnalysisMode, ControlReference, Device, MnaUnknowns, StampContext};
-use program::{Environment, Evaluation, Program, Quantity};
+use program::{Environment, Evaluation, Program, Quantity, Workspace};
+use std::cell::RefCell;
 
 /// C reference used in diagnostics.
 pub const C_REFERENCE: &str = "src/spicelib/devices/asrc/ (asrcload.c, asrcacld.c, asrcpar.c), \
@@ -154,6 +155,7 @@ pub struct Behavioural {
     variables: Vec<Variable>,
     controls: Vec<ControlReference>,
     program: Program,
+    workspace: RefCell<Workspace>,
     scale: BehaviouralScale,
 }
 
@@ -201,17 +203,20 @@ impl Behavioural {
             .collect();
         let evaluation = self
             .program
-            .evaluate(&Environment {
-                values: &values,
-                time,
-                temperature: context.temperature,
-                gmin: context.gmin,
-                // ifeval.c PTeval: `hertz` is `CKTomega / 2. / M_PI`, with
-                // `CKTomega = 2.0 * M_PI * freq` (acan.c), not `freq` itself.
-                frequency: 2.0 * std::f64::consts::PI * context.frequency
-                    / 2.
-                    / std::f64::consts::PI,
-            })
+            .evaluate_with_workspace(
+                &Environment {
+                    values: &values,
+                    time,
+                    temperature: context.temperature,
+                    gmin: context.gmin,
+                    // ifeval.c PTeval: `hertz` is `CKTomega / 2. / M_PI`, with
+                    // `CKTomega = 2.0 * M_PI * freq` (acan.c), not `freq` itself.
+                    frequency: 2.0 * std::f64::consts::PI * context.frequency
+                        / 2.
+                        / std::f64::consts::PI,
+                },
+                &mut self.workspace.borrow_mut(),
+            )
             .map_err(|error| match error {
                 SpiceError::Numerical { message, .. } => SpiceError::Numerical {
                     context: format!("behavioural source {}", self.name),
@@ -769,6 +774,7 @@ pub(crate) fn instantiate(
             variables,
             controls,
             program,
+            workspace: RefCell::default(),
             scale,
         }) as Box<dyn Device>)
     })

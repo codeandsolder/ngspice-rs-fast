@@ -6,8 +6,9 @@
 //! the port keeps the parse tree unsimplified, differentiates it symbolically
 //! once per quantity with C's rules and its `mkb`/`mkf` simplifications
 //! (constant folding, the 0/1 identities), and evaluates the value tree and
-//! each derivative tree node by node, so values and derivatives are C's
-//! operation for operation. That includes the deliberate non-derivatives
+//! each derivative with the same operation order as C. The temporary trees
+//! are lowered to a shared indexed DAG; successful finite results are
+//! reused only within one environment, with lazy branch traversal. That includes the deliberate non-derivatives
 //! (`floor`, comparisons, `u` and `pwl_derivative` are zero or piecewise) and
 //! the domain quirks of the value functions:
 //!
@@ -37,6 +38,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::xspice::XspicePwl;
+
+mod plan;
+pub(super) use plan::Workspace;
+use plan::{Plan, PlanBuilder, Slot};
 
 /// A circuit quantity an expression reads, in first-use order (C
 /// `mkvnode`/`mkinode` deduplicate them the same way).
@@ -73,7 +78,7 @@ pub struct Evaluation {
 }
 
 /// One-argument functions (`inpptree.c` `funcs[]`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Unary {
     Abs,
     Acos,
@@ -183,7 +188,7 @@ impl Unary {
 }
 
 /// Binary operators (`PT_PLUS` ... `PT_POWER`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Operator {
     Plus,
     Minus,
@@ -193,7 +198,7 @@ enum Operator {
 }
 
 /// Two-argument functions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Binary {
     Pow,
     Pwr,
@@ -236,12 +241,79 @@ impl Node {
     }
 }
 
-/// A compiled behavioural expression: the value tree and, per quantity, the
-/// derivative tree `PTdifferentiate` builds for it (`INPgetTree`).
+// Bound recursive lowering/differentiation before constructing any trees.
+// The derivative rule for each source node performs a fixed amount of work,
+// with each child differentiated at most once per quantity. The separate
+// instruction cap also limits the size of the retained execution plan.
+const MAX_SOURCE_DEPTH: usize = 4 * crate::netlist::expr::MAX_NESTING;
+const MAX_SOURCE_NODES: usize = 100_000;
+const MAX_DERIVATIVE_VISITS: usize = 131_072;
+
+fn check_source_limits(root: &BExpr) -> SpiceResult<()> {
+    fn walk(expr: &BExpr, depth: usize, remaining: &mut usize) -> SpiceResult<()> {
+        if depth > MAX_SOURCE_DEPTH || *remaining == 0 {
+            return Err(unsupported(
+                expr,
+                "behavioural expression source size/depth limit exceeded",
+            ));
+        }
+        *remaining -= 1;
+        let mut child = |node| walk(node, depth + 1, remaining);
+        match &expr.kind {
+            BExprKind::Unary { operand, .. } | BExprKind::Group(operand) => child(operand)?,
+            BExprKind::Binary { lhs, rhs, .. } => {
+                child(lhs)?;
+                child(rhs)?;
+            }
+            BExprKind::Ternary {
+                condition,
+                then,
+                otherwise,
+            } => {
+                child(condition)?;
+                child(then)?;
+                child(otherwise)?;
+            }
+            BExprKind::Call { arguments, .. } => {
+                for argument in arguments {
+                    child(argument)?;
+                }
+            }
+            BExprKind::Table(table) => {
+                child(&table.input)?;
+                for (x, y) in &table.points {
+                    child(x)?;
+                    child(y)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut remaining = MAX_SOURCE_NODES;
+    walk(root, 1, &mut remaining)
+}
+
+fn tree_size(node: &Node) -> usize {
+    1 + match node {
+        Node::Unary(_, arg)
+        | Node::Pwl(arg, _)
+        | Node::PwlDerivative(arg, _)
+        | Node::Table(arg, _)
+        | Node::TableSlope(arg, _) => tree_size(arg),
+        Node::Operator(_, a, b) | Node::Binary(_, a, b) => tree_size(a) + tree_size(b),
+        Node::Ternary(c, a, b) => tree_size(c) + tree_size(a) + tree_size(b),
+        _ => 0,
+    }
+}
+
+/// A compiled behavioural value and its symbolic partial derivatives,
+/// sharing one immutable, indexed execution plan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
-    root: Tree,
-    derivatives: Vec<Tree>,
+    plan: Arc<Plan>,
+    root: Slot,
+    derivatives: Vec<Slot>,
     quantities: Vec<Quantity>,
     uses_frequency: bool,
 }
@@ -259,7 +331,7 @@ fn parse_error(expr: &BExpr, message: impl Into<String>) -> SpiceError {
 
 impl Program {
     /// Compiles a front-end-resolved expression tree and builds its
-    /// derivative trees.
+    /// derivative trees, then lowers them to the shared execution plan.
     ///
     /// # Errors
     /// Names the front end should have resolved (`.param` values, `.func`
@@ -267,14 +339,26 @@ impl Program {
     /// errors), non-literal or non-monotonic `pwl()` points (C:
     /// `prepare_PTF_PWL`), and [`SpiceError::NotYetPorted`] for `ddt()` and
     /// the statistical functions (`agauss`, `gauss`, `aunif`, `unif`,
-    /// `limit`; normally already rejected by the front end).
+    /// `limit`; normally already rejected by the front end). Expressions
+    /// exceeding the source depth, size or symbolic expansion limits are
+    /// explicitly rejected before unbounded work can occur.
     pub fn compile(expr: &BExpr) -> SpiceResult<Self> {
+        check_source_limits(expr)?;
         let mut compiler = Compiler::default();
-        let root = Arc::new(compile(expr, &mut compiler)?);
+        let value_tree = Arc::new(compile(expr, &mut compiler)?);
+        if compiler.quantities.len() > MAX_DERIVATIVE_VISITS / tree_size(&value_tree) {
+            return Err(unsupported(
+                expr,
+                "behavioural derivative expansion limit exceeded",
+            ));
+        }
+        let mut builder = PlanBuilder::default();
+        let root = builder.lower_value(&value_tree)?;
         let derivatives = (0..compiler.quantities.len())
-            .map(|variable| differentiate(&root, variable))
-            .collect();
+            .map(|variable| builder.lower_derivative(&differentiate(&value_tree, variable)))
+            .collect::<SpiceResult<_>>()?;
         Ok(Self {
+            plan: Arc::new(builder.finish()),
             root,
             derivatives,
             quantities: compiler.quantities,
@@ -301,22 +385,21 @@ impl Program {
     /// [`SpiceError::Numerical`] when a function is evaluated outside its
     /// domain or any value/derivative is not finite.
     pub fn evaluate(&self, environment: &Environment<'_>) -> SpiceResult<Evaluation> {
+        self.evaluate_with_workspace(environment, &mut Workspace::default())
+    }
+
+    pub(super) fn evaluate_with_workspace(
+        &self,
+        environment: &Environment<'_>,
+        workspace: &mut Workspace,
+    ) -> SpiceResult<Evaluation> {
         if environment.values.len() != self.quantities.len() {
             return Err(SpiceError::circuit(
                 "behavioural expression evaluated with the wrong number of values",
             ));
         }
-        let evaluator = Evaluator {
-            environment,
-            fudge: environment.gmin * 1e-20,
-        };
-        let value = evaluator.eval(&self.root)?;
-        let gradient = self
-            .derivatives
-            .iter()
-            .map(|tree| evaluator.eval(tree))
-            .collect::<SpiceResult<Vec<_>>>()?;
-        Ok(Evaluation { value, gradient })
+        self.plan
+            .evaluate(self.root, &self.derivatives, environment, workspace)
     }
 }
 
@@ -1151,139 +1234,6 @@ fn differentiate(p: &Tree, variable: usize) -> Tree {
         Node::PwlDerivative(u, _) | Node::TableSlope(u, _) => {
             times(zero(), differentiate(u, variable))
         }
-    }
-}
-
-struct Evaluator<'a> {
-    environment: &'a Environment<'a>,
-    fudge: Real,
-}
-
-fn out_of_range(node: &Node, arguments: &[Real]) -> SpiceError {
-    let arguments: Vec<String> = arguments.iter().map(ToString::to_string).collect();
-    SpiceError::Numerical {
-        context: "behavioural source".into(),
-        message: format!(
-            "{} out of range for {}",
-            arguments.join(", "),
-            describe(node)
-        ),
-    }
-}
-
-impl Evaluator<'_> {
-    /// `PTeval` (`ifeval.c`): a `HUGE` function or operator result is an
-    /// error, as in C; any other non-finite value is one too (C would carry
-    /// on with a NaN or an infinity).
-    fn eval(&self, node: &Node) -> SpiceResult<Real> {
-        let value = match node {
-            Node::Constant(value) => *value,
-            Node::Variable(index) => self.environment.values[*index],
-            Node::Time => self.environment.time,
-            Node::Temperature => self.environment.temperature,
-            Node::Frequency => self.environment.frequency,
-            Node::Unary(function, argument) => {
-                let x = self.eval(argument)?;
-                let value = unary_value(*function, x);
-                if value == Real::INFINITY {
-                    return Err(out_of_range(node, &[x]));
-                }
-                value
-            }
-            Node::Operator(op, lhs, rhs) => {
-                let a = self.eval(lhs)?;
-                let b = self.eval(rhs)?;
-                let value = match op {
-                    Operator::Plus => a + b,
-                    Operator::Minus => a - b,
-                    Operator::Times => a * b,
-                    Operator::Divide => divide(a, b, self.fudge),
-                    Operator::Power => power_h(a, b),
-                };
-                if value == Real::INFINITY {
-                    return Err(out_of_range(node, &[a, b]));
-                }
-                value
-            }
-            Node::Binary(function, lhs, rhs) => {
-                let a = self.eval(lhs)?;
-                let b = self.eval(rhs)?;
-                let value = match function {
-                    Binary::Pow => power(a, b),
-                    Binary::Pwr => pwr(a, b),
-                    Binary::Min => {
-                        if a > b {
-                            b
-                        } else {
-                            a
-                        }
-                    }
-                    Binary::Max => {
-                        if a > b {
-                            a
-                        } else {
-                            b
-                        }
-                    }
-                };
-                if value == Real::INFINITY {
-                    return Err(out_of_range(node, &[a, b]));
-                }
-                value
-            }
-            Node::Ternary(condition, then, otherwise) => {
-                if self.eval(condition)? == 0. {
-                    self.eval(otherwise)?
-                } else {
-                    self.eval(then)?
-                }
-            }
-            Node::Pwl(argument, table) => table.value(self.eval(argument)?),
-            Node::PwlDerivative(argument, table) => table.slope(self.eval(argument)?),
-            Node::Table(argument, map) => map.evaluate(self.eval(argument)?).0,
-            Node::TableSlope(argument, map) => map.evaluate(self.eval(argument)?).1,
-        };
-        if !value.is_finite() {
-            return Err(SpiceError::Numerical {
-                context: "behavioural source".into(),
-                message: format!("non-finite value {value} in {}", describe(node)),
-            });
-        }
-        Ok(value)
-    }
-}
-
-fn describe(node: &Node) -> String {
-    match node {
-        Node::Constant(_) => "a constant".into(),
-        Node::Variable(_) => "a circuit quantity".into(),
-        Node::Time => "time".into(),
-        Node::Temperature => "temper".into(),
-        Node::Frequency => "hertz".into(),
-        Node::Unary(function, _) => format!("{}()", function.name()),
-        Node::Operator(op, _, _) => format!(
-            "'{}'",
-            match op {
-                Operator::Plus => "+",
-                Operator::Minus => "-",
-                Operator::Times => "*",
-                Operator::Divide => "/",
-                Operator::Power => "^",
-            }
-        ),
-        Node::Binary(function, _, _) => format!(
-            "{}()",
-            match function {
-                Binary::Pow => "pow",
-                Binary::Pwr => "pwr",
-                Binary::Min => "min",
-                Binary::Max => "max",
-            }
-        ),
-        Node::Ternary(..) => "'?:'".into(),
-        Node::Pwl(..) => "pwl()".into(),
-        Node::PwlDerivative(..) => "pwl_derivative()".into(),
-        Node::Table(..) | Node::TableSlope(..) => "a TABLE".into(),
     }
 }
 
