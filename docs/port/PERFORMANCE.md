@@ -80,7 +80,9 @@ Repeat steady-state phases three times; use medians per operation.
   gets a fresh circuit. Transient-specific runs report actual accepted/rejected
   work and do not reuse the prior trial's history.
 - The independent parameter ensemble carries no earlier Newton seed or factor
-  cache across jobs. The sequential sweep is measured separately.
+  cache across jobs. The final cache epochs of independent jobs are summed,
+  and the largest observed factor storage is reported separately. The sequential
+  sweep is measured separately.
 
 ## Reproduction
 
@@ -127,3 +129,4 @@ belong in the issue/worklog.
 
 - [2026-11-22 scalar reference](performance-baselines/2026-11-22.md):
   generic/native release timing, nine allocation profiles and numerical records.
+- [2026-11-22 sparse factor telemetry](performance-baselines/2026-11-22-factor-telemetry.md): actual storage and work counters, release workload timings and numerical signatures.
