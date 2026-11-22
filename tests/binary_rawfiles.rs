@@ -805,14 +805,53 @@ fn header_work_and_declared_columns_are_bounded() {
             .point_count(),
         0
     );
-    let malformed = empty.replace("No. Points: 0", "No. Points: 1");
-    assert!(
-        RawFile::parse(&malformed)
-            .unwrap_err()
-            .to_string()
-            .contains("zero variables")
-    );
-    assert!(RawFile::parse_bytes(malformed.replace("Values:", "Binary:").as_bytes()).is_err());
+}
+
+#[test]
+fn empty_plots_have_no_rows_regardless_of_declared_count() {
+    for points in [0, 1, usize::MAX] {
+        let header = format!(
+            "Plotname: Pole-Zero Analysis\nFlags: real\nNo. Variables: 0\nNo. Points: {points}\nVariables:\n"
+        );
+        for (mut bytes, following, expected_rows, expected_cells, encoding) in [
+            (
+                format!("{header}Values:\n").into_bytes(),
+                ASCII_RAWFILE.as_bytes().to_vec(),
+                1,
+                1,
+                RawFormat::Ascii,
+            ),
+            (
+                binary_rawfile(&header, &[]),
+                binary_rawfile(OP_HEADER, &OP_VALUES),
+                2,
+                6,
+                RawFormat::Binary,
+            ),
+        ] {
+            bytes.extend_from_slice(&following);
+            let mut policy = RawReadPolicy::DEFAULT;
+            policy.collect.rows = expected_rows;
+            policy.collect.cells = expected_cells;
+            assert_eq!(RawFormat::detect(&bytes).unwrap(), encoding);
+            let mut reader = RawFileReader::new(bytes.as_slice()).with_policy(policy);
+            let mut empty = reader.next_plot().unwrap().unwrap();
+            assert_eq!(empty.point_count(), 0);
+            assert!(empty.next_row().unwrap().is_none());
+            assert_eq!(empty.finish().unwrap().plot.point_count(), 0);
+            let following_plot = reader.next_plot().unwrap().unwrap();
+            assert_eq!(following_plot.point_count(), expected_rows);
+            following_plot.finish().unwrap();
+            assert!(reader.next_plot().unwrap().is_none());
+            let collected = RawFileReader::new(bytes.as_slice())
+                .with_policy(policy)
+                .read()
+                .unwrap();
+            assert_eq!(collected.len(), 2);
+            assert_eq!(collected.plots[0].plot.point_count(), 0);
+            assert_eq!(collected.plots[1].plot.point_count(), expected_rows);
+        }
+    }
 }
 
 #[test]

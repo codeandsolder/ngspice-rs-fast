@@ -916,11 +916,10 @@ fn parse_header(cursor: &mut Cursor<impl BufRead>) -> SpiceResult<Option<(Header
     if variable_count > cursor.policy.variables {
         return Err(limit("variables per plot"));
     }
-    if variable_count == 0 && point_count != 0 {
-        return Err(unsupported(
-            "rawfile declares zero variables with nonzero points",
-        ));
-    }
+    // Empty pole-zero plots may declare one point yet contain no
+    // variables or payload. Normalize at the header boundary so even
+    // usize::MAX cannot trigger zero-width row iteration or allocations.
+    let point_count = if variable_count == 0 { 0 } else { point_count };
     let variables = parse_variables(cursor, variable_count)?;
 
     let Some(line) = cursor.next(false)? else {
