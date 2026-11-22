@@ -539,15 +539,15 @@ fn sensitivity_matches_the_reference_on_the_fixture_card() {
     let expected = &raw.plots[0].plot;
     assert_eq!(plot.variable_count(), expected.variable_count());
     assert_eq!(plot.point_count(), expected.point_count());
+    let mut mismatches = Vec::new();
     for variable in expected.variables() {
         let actual = column(&plot, &variable.name);
         let reference = column(expected, &variable.name);
-        assert!(
-            (actual - reference).abs() <= 1e-6 * reference.abs() + 1e-9,
-            "{}: {actual:e} != {reference:e}",
-            variable.name
-        );
+        if (actual - reference).abs() > 1e-6 * reference.abs() + 1e-9 || !actual.is_finite() {
+            mismatches.push(format!("{}: {actual:e} != {reference:e}", variable.name));
+        }
     }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     assert_eq!(column(&plot, "v(q1:rco)"), 0., "sens_setp skips RCO");
 }
 
