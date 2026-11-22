@@ -207,6 +207,51 @@ fn channel_derivatives_agree_with_central_differences() {
     }
 }
 
+/// Check the physical D2 derivative by re-solving the operating point,
+/// independently of the historical 1-ppm forward-difference sensitivity walk.
+/// With matching binary64 inputs, pinned C central differences at 2%, 1%,
+/// and 0.5% of D2 converge to -0.71587986 A/m (Richardson: -0.715879861
+/// and -0.715879870). The historical C sensitivity column instead reports
+/// -0.715869679, outside its own nonlinear sensitivity precision bound.
+/// See #144 for the sensitivity policy repair, not a changed C tolerance.
+#[test]
+fn p_channel_d2_physical_derivative_matches_independent_operating_points() {
+    let fixture = include_str!("../conformance/netlists/sens_hfet2.cir");
+    let current = |d2: f64| {
+        let text = fixture
+            .replace(
+                "phfet level=6 eta2=2 d2=0.3e-6",
+                &format!("phfet level=6 eta2=2 d2={d2:.17e}"),
+            )
+            .replace(".sens i(vids)", ".op")
+            .replace(
+                "reltol=1e-10 vntol=1e-13 abstol=1e-16",
+                "reltol=1e-13 vntol=1e-15 abstol=1e-19",
+            );
+        let netlist = Parser::new()
+            .parse_deck(&parse_deck_text(Path::new("hfet2-d2.cir"), &text))
+            .unwrap();
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let plot = plan.run(&mut circuit, &config.context()).unwrap();
+        value(&plot, "i(vids)", 0)
+    };
+    let central = |fraction: f64| {
+        let center = 0.3e-6;
+        let h = fraction * center;
+        let hi = center + h;
+        let lo = center - h;
+        (current(hi) - current(lo)) / (hi - lo)
+    };
+    let (coarse, medium, fine) = (central(0.02), central(0.01), central(0.005));
+    let a = (4. * medium - coarse) / 3.;
+    let b = (4. * fine - medium) / 3.;
+    close(a, b, 1e-6, 1e-9);
+    close(a, -0.715_879_861, 1e-6, 1e-9);
+    close(b, -0.715_879_870, 1e-6, 1e-9);
+}
+
 /// HFET2 limits with `DEVpnjlim` *and* `DEVfetlim` (HFET1 has only the
 /// latter), so a strongly forward-biased gate exercises a code path the other
 /// levels do not have. The reference binary answers
