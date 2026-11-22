@@ -19,9 +19,10 @@ fn cards() -> Vec<ngspice_rs::netlist::ast::FourierCard> {
 }
 #[test]
 fn configured_fourier_recovers_multiple_periods_and_polynomial_interpolation() {
-    let mut plot = Plot::new("tran1", "Transient Analysis", PlotFlags::Real);
+    let mut plot = Plot::builder("tran1", "Transient Analysis", PlotFlags::Real);
     plot.push_variable(Variable::new("time", "time"));
     plot.push_variable(Variable::new("v(out)", "voltage"));
+    let mut plot = plot.build();
     for i in 0..=4000 {
         let t = i as f64 * 1e-6;
         let value = 0.5

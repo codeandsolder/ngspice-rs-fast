@@ -65,8 +65,10 @@ impl SensitivityLevel for Level6 {
         P::dc("temp"),
         P::dc("dtemp"),
     ];
-    fn record(&self, context: &ModelContext) -> Record {
-        let mut r = self.surface.record(record_common(&self.common, context));
+    fn record(&self, family: SensitivityFamily, context: &ModelContext) -> SpiceResult<Record> {
+        let mut r = self
+            .surface
+            .record(record_common(family, &self.common, context)?)?;
         for (k, value, given) in [
             ("kc", self.kc.unwrap_or(5e-5), self.kc.is_some()),
             ("tox", self.tox.unwrap_or(0.), self.tox.is_some()),
@@ -82,9 +84,9 @@ impl SensitivityLevel for Level6 {
             ("lambda0", self.lambda0, self.lambda0_given),
             ("lambda1", self.lambda1, true),
         ] {
-            r = r.with(k, value, given);
+            r = r.with(k, value, given)?;
         }
-        r
+        Ok(r)
     }
     fn with_record(&self, r: &Record, derived: bool) -> SpiceResult<Self> {
         let mut m = *self;

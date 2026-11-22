@@ -46,6 +46,105 @@ impl RfPort {
     }
 }
 
+/// AC polar input with independently optional magnitude and phase.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AcInput {
+    /// Magnitude, default 1 when AC is given.
+    pub magnitude: Option<Real>,
+    /// Degrees, default 0 when AC is given.
+    pub phase: Option<Real>,
+}
+
+impl AcInput {
+    pub(super) fn defaults(self) -> (Real, Real) {
+        (self.magnitude.unwrap_or(1.), self.phase.unwrap_or(0.))
+    }
+
+    pub(super) fn resolve(self) -> SpiceResult<Complex> {
+        let (magnitude, phase) = self.defaults();
+        let radians = crate::devices::functions::phase_radians(phase);
+        let ac = Complex::new(magnitude * radians.cos(), magnitude * radians.sin());
+        if !ac.is_finite() {
+            return Err(SpiceError::circuit("non-finite source excitation"));
+        }
+        Ok(ac)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct AcExcitation {
+    pub(super) input: Option<AcInput>,
+    pub(super) phasor: Complex,
+}
+
+impl AcExcitation {
+    fn resolve(input: Option<AcInput>) -> SpiceResult<Self> {
+        Ok(Self {
+            input,
+            phasor: input.map_or(Ok(Complex::ZERO), AcInput::resolve)?,
+        })
+    }
+
+    // Do not round-trip a directly supplied rectangular excitation.
+    fn rectangular(phasor: Complex) -> Self {
+        Self {
+            input: (phasor != Complex::ZERO).then(|| AcInput {
+                magnitude: Some(phasor.magnitude()),
+                phase: Some(phasor.im.atan2(phasor.re).to_degrees()),
+            }),
+            phasor,
+        }
+    }
+}
+
+/// Explicit DC is independent of time forcing. Derived DC may change when
+/// the preceding PORT excitation changes; the original level is preserved.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum DcExcitation {
+    Explicit(Real),
+    Waveform {
+        time_zero: Real,
+        accumulated: Option<Real>,
+    },
+}
+
+impl DcExcitation {
+    pub(super) const fn value(self) -> Real {
+        match self {
+            Self::Explicit(v)
+            | Self::Waveform {
+                accumulated: Some(v),
+                ..
+            } => v,
+            Self::Waveform {
+                time_zero,
+                accumulated: None,
+            } => time_zero,
+        }
+    }
+
+    pub(super) const fn given(self) -> bool {
+        matches!(self, Self::Explicit(_))
+    }
+
+    const fn accumulate(&mut self, value: Option<Real>) {
+        if let Self::Waveform { accumulated, .. } = self {
+            *accumulated = value;
+        }
+    }
+}
+
+/// Source card inputs after ordered setters, before coefficient resolution.
+#[derive(Debug, Default)]
+pub struct SourceInputs {
+    /// Explicit DC level; omitted uses the waveform at time zero.
+    pub dc: Option<Real>,
+    /// AC inputs; omitted means no AC setter, unlike explicit zero magnitude.
+    pub ac: Option<AcInput>,
+    /// Time forcing; omitted uses the explicit DC level or implicit zero.
+    pub waveform: Option<Waveform>,
+}
+
 /// Independent V or I source. AC, DC and transient excitations are distinct.
 #[derive(Debug, Clone)]
 pub struct IndependentSource {
@@ -53,29 +152,104 @@ pub struct IndependentSource {
     /// Inline `[positive, negative, internal]`. The third entry is exposed
     /// only when a port is present.
     terminals: [NodeId; 3],
-    voltage: bool,
-    dc: Real,
-    ac: Complex,
-    multiplier: Real,
-    /// Whether an AC value was written (C `VSRCacGiven`), even `ac 0`.
-    ac_given: bool,
+    pub(super) voltage: bool,
+    pub(super) dc: DcExcitation,
+    pub(super) ac: AcExcitation,
+    pub(super) multiplier: Option<Real>,
+    pub(super) function_given: bool,
     /// The source's immutable original function. Only PORT accumulation
     /// has a second, derived waveform.
     waveform: Waveform,
     accumulated_waveform: Option<Box<Waveform>>,
-    original_dc: Real,
     power_tone: Option<(Real, Real)>,
     port: Option<RfPort>,
-    /// What the card gave, as `.sens` replays C's records
-    /// ([`crate::devices::sensitivity`]).
-    sensitivity: crate::devices::sensitivity::SourceInputs,
     /// `distof1`/`distof2` distortion inputs (C `VSRCdF1given`, ...).
     distortion: [Option<crate::devices::distortion::DistortionInput>; 2],
 }
+/// Validated excitation before circuit topology is bound.
+pub(super) struct SourceExcitation {
+    voltage: bool,
+    dc: DcExcitation,
+    ac: AcExcitation,
+    function_given: bool,
+    waveform: Waveform,
+}
+
+impl SourceExcitation {
+    fn rectangular(voltage: bool, dc: Real, ac: Complex, waveform: Waveform) -> SpiceResult<Self> {
+        waveform.validate()?;
+        Self::from_resolved(
+            voltage,
+            DcExcitation::Explicit(dc),
+            AcExcitation::rectangular(ac),
+            !matches!(waveform, Waveform::Constant(_)),
+            waveform,
+        )
+    }
+
+    pub(super) fn from_inputs(voltage: bool, inputs: SourceInputs) -> SpiceResult<Self> {
+        let function_given = inputs.waveform.is_some();
+        let waveform = inputs
+            .waveform
+            .unwrap_or_else(|| Waveform::Constant(inputs.dc.unwrap_or(0.)));
+        waveform.validate()?;
+        let dc = match inputs.dc {
+            Some(value) => DcExcitation::Explicit(value),
+            None => DcExcitation::Waveform {
+                time_zero: waveform.time_zero()?,
+                accumulated: None,
+            },
+        };
+        Self::from_resolved(
+            voltage,
+            dc,
+            AcExcitation::resolve(inputs.ac)?,
+            function_given,
+            waveform,
+        )
+    }
+
+    fn from_resolved(
+        voltage: bool,
+        dc: DcExcitation,
+        ac: AcExcitation,
+        function_given: bool,
+        waveform: Waveform,
+    ) -> SpiceResult<Self> {
+        if !dc.value().is_finite() || !ac.phasor.is_finite() {
+            return Err(SpiceError::circuit("non-finite source excitation"));
+        }
+        Ok(Self {
+            voltage,
+            dc,
+            ac,
+            function_given,
+            waveform,
+        })
+    }
+
+    pub(super) fn bind(self, name: impl Into<String>, terminals: [NodeId; 2]) -> IndependentSource {
+        IndependentSource {
+            name: name.into(),
+            terminals: [terminals[0], terminals[1], NodeId::GROUND],
+            voltage: self.voltage,
+            dc: self.dc,
+            ac: self.ac,
+            multiplier: None,
+            function_given: self.function_given,
+            accumulated_waveform: None,
+            power_tone: None,
+            waveform: self.waveform,
+            port: None,
+            distortion: [None, None],
+        }
+    }
+}
+
 impl IndependentSource {
     /// Creates an independent source. `voltage=false` selects a current source.
-    /// The source counts as having an AC value ([`Self::ac_given`]) when `ac`
-    /// is nonzero; [`Self::with_ac_given`] records an explicit `ac 0`.
+    /// A directly supplied rectangular AC coefficient is retained exactly;
+    /// a nonzero coefficient counts as an AC excitation.
     /// # Errors
     /// Non-finite excitation or invalid waveform.
     pub fn new(
@@ -86,31 +260,20 @@ impl IndependentSource {
         ac: Complex,
         waveform: Waveform,
     ) -> SpiceResult<Self> {
-        waveform.validate()?;
-        if !dc.is_finite() || !ac.is_finite() {
-            return Err(SpiceError::circuit("non-finite source excitation"));
-        }
-        Ok(Self {
-            name: name.into(),
-            terminals: [terminals[0], terminals[1], NodeId::GROUND],
-            voltage,
-            dc,
-            ac,
-            multiplier: 1.,
-            ac_given: ac != Complex::ZERO,
-            sensitivity: crate::devices::sensitivity::SourceInputs {
-                dc_given: true,
-                function_given: !matches!(waveform, Waveform::Constant(_)),
-                ac: (ac != Complex::ZERO)
-                    .then(|| (ac.magnitude(), ac.im.atan2(ac.re).to_degrees())),
-            },
-            accumulated_waveform: None,
-            original_dc: dc,
-            power_tone: None,
-            waveform,
-            port: None,
-            distortion: [None, None],
-        })
+        Ok(SourceExcitation::rectangular(voltage, dc, ac, waveform)?.bind(name, terminals))
+    }
+
+    /// Creates a source from polar AC inputs and explicit or derived DC.
+    /// Keeps transient-dependent waveform defaults unresolved until analysis.
+    /// # Errors
+    /// Nonfinite resolved excitation or invalid waveform.
+    pub fn from_inputs(
+        name: impl Into<String>,
+        terminals: [NodeId; 2],
+        voltage: bool,
+        inputs: SourceInputs,
+    ) -> SpiceResult<Self> {
+        Ok(SourceExcitation::from_inputs(voltage, inputs)?.bind(name, terminals))
     }
 
     /// Selects C's PORT cosine time function, including its zero-amplitude
@@ -120,31 +283,23 @@ impl IndependentSource {
         self
     }
 
-    /// Records what the card wrote for `.sens`: an explicit DC value, a
-    /// transient function, and the AC magnitude and phase (degrees) when any
-    /// AC setter was written.
-    #[must_use]
-    pub const fn with_sensitivity_inputs(
-        mut self,
-        inputs: crate::devices::sensitivity::SourceInputs,
-    ) -> Self {
-        self.sensitivity = inputs;
-        self
-    }
-
-    /// A copy driving `dc` in DC analyses and `ac` in AC analyses, for a
-    /// `.sens` load.
-    pub(crate) fn sensitivity_copy(&self, dc: Real, ac: Complex) -> SpiceResult<Self> {
-        if !dc.is_finite() || !ac.is_finite() {
+    /// A copy with the replayed DC level, AC phasor and source multiplier.
+    pub(super) fn sensitivity_copy(
+        &self,
+        dc: Real,
+        ac: AcExcitation,
+        multiplier: Option<Real>,
+    ) -> SpiceResult<Self> {
+        if !dc.is_finite() || !ac.phasor.is_finite() || multiplier.is_some_and(|m| !m.is_finite()) {
             return Err(SpiceError::circuit(format!(
                 "{}: nonfinite perturbed source value",
                 self.name
             )));
         }
         Ok(Self {
-            dc,
-            original_dc: dc,
+            dc: DcExcitation::Explicit(dc),
             ac,
+            multiplier,
             ..self.clone()
         })
     }
@@ -173,20 +328,10 @@ impl IndependentSource {
         Ok(self)
     }
 
-    /// Records whether the card wrote an AC value (`ac`, `acmag` or
-    /// `acphase`; C `VSRCacGiven`/`ISRCacGiven`, even `ac 0`), which decides
-    /// how pole-zero analysis treats a voltage source (`vsrcpzld.c`) and
-    /// whether a `.noise` input reference is valid (`noisean.c`).
-    #[must_use]
-    pub const fn with_ac_given(mut self, given: bool) -> Self {
-        self.ac_given = given;
-        self
-    }
-
-    /// Whether the card wrote an AC value (C `VSRCacGiven`).
+    /// Whether the source has an AC excitation (C `VSRCacGiven`).
     #[must_use]
     pub const fn ac_given(&self) -> bool {
-        self.ac_given
+        self.ac.input.is_some()
     }
 
     /// Makes this voltage source an RF port (see the module documentation);
@@ -277,8 +422,8 @@ impl Device for IndependentSource {
         _context: &crate::devices::ModelContext,
     ) -> SpiceResult<Option<Real>> {
         Ok(match keyword {
-            "dc" => Some(self.dc),
-            "m" if !self.voltage => Some(self.multiplier),
+            "dc" => Some(self.dc.value()),
+            "m" if !self.voltage => Some(self.multiplier.unwrap_or(1.)),
             _ => None,
         })
     }
@@ -293,12 +438,12 @@ impl Device for IndependentSource {
             Some((t, f)) => self
                 .effective_waveform()
                 .value_at_timed(t, f.limit, &f.timing)?,
-            None => self.dc,
+            None => self.dc.value(),
         };
-        Ok(Some(value * self.multiplier))
+        Ok(Some(value * self.multiplier.unwrap_or(1.)))
     }
     fn observation_source_multiplier(&self) -> Real {
-        self.multiplier
+        self.multiplier.unwrap_or(1.)
     }
 
     fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
@@ -319,25 +464,19 @@ impl Device for IndependentSource {
         let mut copy = self.clone();
         match parameter {
             "acmag" | "acphase" => {
-                let (mag, phase) = copy.sensitivity.ac.unwrap_or((1., 0.));
-                let (mag, phase) = if parameter == "acmag" {
-                    (value, phase)
+                let mut input = copy.ac.input.unwrap_or_default();
+                if parameter == "acmag" {
+                    input.magnitude = Some(value);
                 } else {
-                    (mag, value)
-                };
-                copy.ac = Complex::new(
-                    mag * phase.to_radians().cos(),
-                    mag * phase.to_radians().sin(),
-                );
-                copy.ac_given = true;
-                copy.sensitivity.ac = Some((mag, phase));
+                    input.phase = Some(value);
+                }
+                copy.ac = AcExcitation::resolve(Some(input))?;
             }
-            "m" if !self.voltage => copy.multiplier = value,
+            "m" if !self.voltage => copy.multiplier = Some(value),
             // dctrcurv.c sets VSRCdcValue/ISRCdcValue and the dcGiven flag
             // for each swept point.
             "dc" => {
-                copy.dc = value;
-                copy.sensitivity.dc_given = true;
+                copy.dc = DcExcitation::Explicit(value);
             }
             _ => {
                 return Err(SpiceError::circuit(format!(
@@ -372,12 +511,7 @@ impl Device for IndependentSource {
             ));
         }
         Ok(Box::new(
-            crate::devices::sensitivity::SourceSensitivity::new(
-                self,
-                self.voltage,
-                self.dc,
-                self.sensitivity,
-            ),
+            crate::devices::sensitivity::SourceSensitivity::new(self),
         ))
     }
 
@@ -400,7 +534,7 @@ impl Device for IndependentSource {
             } else {
                 crate::devices::linear::SourceKind::Current
             },
-            ac_given: self.ac_given,
+            ac_given: self.ac_given(),
         })
     }
 
@@ -428,7 +562,7 @@ impl Device for IndependentSource {
         if !self.voltage {
             return Ok(None);
         }
-        self.dc = self.original_dc;
+        self.dc.accumulate(None);
         self.accumulated_waveform = None;
         if let Some(tone) = self.power_tone {
             let (baseline, mut tones) = match previous {
@@ -439,14 +573,12 @@ impl Device for IndependentSource {
             let accumulated = Waveform::PortSeries { baseline, tones };
             accumulated.validate()?;
             self.accumulated_waveform = Some(Box::new(accumulated));
-            if !self.sensitivity.dc_given {
-                self.dc = previous_dc + tone.0;
-            }
-            if !self.dc.is_finite() {
+            self.dc.accumulate(Some(previous_dc + tone.0));
+            if !self.dc.value().is_finite() {
                 return Err(SpiceError::circuit("nonfinite PORT DC accumulation"));
             }
         }
-        Ok(Some((self.effective_waveform().clone(), self.dc)))
+        Ok(Some((self.effective_waveform().clone(), self.dc.value())))
     }
     fn rf_port(&self) -> Option<&RfPort> {
         self.port.as_ref()
@@ -471,8 +603,8 @@ impl Device for IndependentSource {
             }
         };
         let dc_mode = !matches!(context.mode, AnalysisMode::Transient { .. });
-        let value = if dc_mode && !transient_op && self.sensitivity.dc_given {
-            self.dc * context.source_factor
+        let value = if dc_mode && !transient_op && self.dc.given() {
+            self.dc.value() * context.source_factor
         } else {
             let mut value = match (self.voltage, self.power_tone) {
                 (true, Some((amplitude, two_pi_frequency))) => {
@@ -487,7 +619,7 @@ impl Device for IndependentSource {
                     )?,
                     // DC without a given value: the function at time 0,
                     // which the factory stored as `dc`.
-                    None if dc_mode => self.dc,
+                    None if dc_mode => self.dc.value(),
                     None => {
                         return Err(SpiceError::circuit(format!(
                             "{}: transient source load without a forcing context",
@@ -522,8 +654,8 @@ impl Device for IndependentSource {
             )?;
             context.rhs.add_to(branch, value)
         } else {
-            context.stamp_rhs(self.terminals[0], -value * self.multiplier)?;
-            context.stamp_rhs(self.terminals[1], value * self.multiplier)
+            context.stamp_rhs(self.terminals[0], -value * self.multiplier.unwrap_or(1.))?;
+            context.stamp_rhs(self.terminals[1], value * self.multiplier.unwrap_or(1.))
         }
     }
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
@@ -539,7 +671,7 @@ impl Device for IndependentSource {
                     context
                         .unknowns
                         .node_row(node)
-                        .map(|r| (r, sign * self.multiplier))
+                        .map(|r| (r, sign * self.multiplier.unwrap_or(1.)))
                 })
                 .collect()
         };
@@ -551,8 +683,8 @@ impl Device for IndependentSource {
                 crate::devices::linear::SourceKind::Current
             },
             rows,
-            dc: self.dc,
-            ac: self.ac,
+            dc: self.dc.value(),
+            ac: self.ac.phasor,
             waveform: self.effective_waveform().clone(),
         });
         Ok(())
@@ -583,7 +715,7 @@ impl Device for IndependentSource {
                 location: None,
             });
         }
-        if !self.ac_given {
+        if !self.ac_given() {
             context.branch(self.ideal())?;
             return Ok(());
         }
@@ -639,5 +771,204 @@ mod tests {
         assert_eq!(actual, original);
         assert_eq!(dc, 0.);
         assert!(source.accumulated_waveform.is_none());
+    }
+    fn coefficients(device: Box<dyn Device>) -> crate::devices::LinearSource {
+        let mut circuit = crate::devices::Circuit::new();
+        circuit.add_node("a").unwrap();
+        circuit.add_device(device).unwrap();
+        circuit
+            .linear_system()
+            .unwrap()
+            .sources
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    fn polar_source(
+        voltage: bool,
+        ac: Option<AcInput>,
+        dc: Option<Real>,
+        waveform: Option<Waveform>,
+    ) -> IndependentSource {
+        IndependentSource::from_inputs(
+            if voltage { "v1" } else { "i1" }.to_owned(),
+            [NodeId::new(1), NodeId::GROUND],
+            voltage,
+            SourceInputs { dc, ac, waveform },
+        )
+        .unwrap()
+    }
+
+    fn ac_bits(ac: Complex) -> [u64; 2] {
+        [ac.re.to_bits(), ac.im.to_bits()]
+    }
+
+    #[test]
+    fn source_ac_construction_sweep_and_replay_share_reference_coefficients() {
+        use crate::devices::sensitivity::{
+            ParameterScope, RecordPair, SensitivityLoad, SensitivityMode,
+        };
+
+        let context = crate::devices::ModelContext::default();
+        for voltage in [true, false] {
+            for (magnitude, phase) in [
+                (2., 123_456_789_012_345.),
+                (-0., -0.),
+                (0., -720.25),
+                (-3., 1e300),
+            ] {
+                let input = AcInput {
+                    magnitude: Some(magnitude),
+                    phase: Some(phase),
+                };
+                let source = polar_source(voltage, Some(input), None, None);
+                let expected = ac_bits(source.ac.phasor);
+                assert!(source.ac_given());
+                let baseline = polar_source(
+                    voltage,
+                    Some(AcInput {
+                        magnitude: Some(magnitude),
+                        phase: None,
+                    }),
+                    None,
+                    None,
+                );
+                let swept = baseline
+                    .with_instance_parameter("acphase", phase, &context)
+                    .unwrap();
+                assert_eq!(ac_bits(coefficients(swept).ac), expected);
+                let sensitivity = baseline.sensitivity(&context).unwrap();
+                let (mut model, mut instance) = sensitivity.records().unwrap();
+                sensitivity
+                    .set(
+                        ParameterScope::Instance,
+                        "acphase",
+                        phase,
+                        &mut model,
+                        &mut instance,
+                    )
+                    .unwrap();
+                sensitivity.temperature(&mut model, &mut instance).unwrap();
+                let records = RecordPair {
+                    model: &model,
+                    instance: &instance,
+                };
+                let SensitivityLoad::Replacement(replayed) = sensitivity
+                    .load(records, records, SensitivityMode::Ac)
+                    .unwrap()
+                else {
+                    panic!("expected replacement");
+                };
+                assert_eq!(ac_bits(coefficients(replayed).ac), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_ac_and_explicit_zero_are_distinct_and_overflow_is_rejected() {
+        let context = crate::devices::ModelContext::default();
+        let absent = polar_source(true, None, None, None);
+        assert!(!absent.ac_given());
+        let explicit_zero = polar_source(
+            true,
+            Some(AcInput {
+                magnitude: Some(-0.),
+                phase: Some(-0.),
+            }),
+            None,
+            None,
+        );
+        assert!(explicit_zero.ac_given());
+        assert_eq!(
+            ac_bits(explicit_zero.ac.phasor),
+            [(-0.0_f64).to_bits(), 0.0_f64.to_bits()]
+        );
+        let swept = absent
+            .with_instance_parameter("acphase", -0.0, &context)
+            .unwrap();
+        assert_eq!(
+            ac_bits(coefficients(swept).ac),
+            [1.0_f64.to_bits(), (-0.0_f64).to_bits()]
+        );
+        assert!(
+            absent
+                .with_instance_parameter("acphase", Real::MAX, &context)
+                .is_err()
+        );
+        assert!(
+            AcInput {
+                magnitude: Some(0.),
+                phase: Some(Real::MAX)
+            }
+            .resolve()
+            .is_err()
+        );
+        // The exact binary64 intermediate distinguishes C from to_radians().
+        assert_eq!(
+            crate::devices::functions::phase_radians(123_456_789_012_345.).to_bits(),
+            2_154_727_452_205.378_4_f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn explicit_dc_and_port_accumulation_do_not_overwrite_each_other() {
+        let waveform = Waveform::Constant(4.);
+        let mut source =
+            polar_source(true, None, None, Some(waveform.clone())).with_power_tone(Some((2., 3.)));
+        assert_eq!(source.dc.value(), 4.);
+        assert!(!source.dc.given());
+        source.bind_voltage_predecessor(&waveform, 4.).unwrap();
+        assert_eq!(source.dc.value(), 6.);
+        source.power_tone = None;
+        source.bind_voltage_predecessor(&waveform, 7.).unwrap();
+        assert_eq!(source.dc.value(), 4.);
+
+        let mut explicit = polar_source(true, None, Some(-0.), Some(waveform.clone()))
+            .with_power_tone(Some((2., 3.)));
+        explicit.bind_voltage_predecessor(&waveform, 4.).unwrap();
+        assert!(explicit.dc.given());
+        assert_eq!(explicit.dc.value().to_bits(), (-0.0_f64).to_bits());
+        let swept = explicit
+            .with_instance_parameter("dc", 7., &crate::devices::ModelContext::default())
+            .unwrap();
+        assert_eq!(coefficients(swept).dc, 7.);
+    }
+    #[test]
+    fn current_multiplier_is_replayed_once_with_its_given_state() {
+        use crate::devices::sensitivity::{RecordPair, SensitivityLoad, SensitivityMode};
+        let context = crate::devices::ModelContext::default();
+        let source = polar_source(
+            false,
+            Some(AcInput {
+                magnitude: Some(2.),
+                phase: None,
+            }),
+            Some(3.),
+            None,
+        );
+        let swept = source.with_instance_parameter("m", 2.5, &context).unwrap();
+        let sensitivity = swept.sensitivity(&context).unwrap();
+        let (model, instance) = sensitivity.records().unwrap();
+        assert!(instance.given("m"));
+        assert_eq!(instance.value("m").unwrap(), 2.5);
+        let records = RecordPair {
+            model: &model,
+            instance: &instance,
+        };
+        let SensitivityLoad::Replacement(replayed) = sensitivity
+            .load(records, records, SensitivityMode::Dc)
+            .unwrap()
+        else {
+            panic!("expected replacement");
+        };
+        assert_eq!(
+            replayed.observation_source_current(None).unwrap(),
+            Some(7.5)
+        );
+        let linear = coefficients(replayed);
+        assert_eq!(linear.dc, 3.);
+        assert_eq!(linear.rows[0].1, -2.5);
+        assert_eq!(linear.ac, Complex::new(2., 0.));
     }
 }

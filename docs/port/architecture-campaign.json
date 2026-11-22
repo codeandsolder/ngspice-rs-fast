@@ -1,0 +1,645 @@
+[
+  {
+    "id": "18",
+    "title": "Pole-zero conformance: replace greedy root pairing with exact bounded multiset matching",
+    "depends": [],
+    "paths": [
+      "xtask/src/commands/compare.rs",
+      "xtask/src/commands/verify.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/18",
+    "area": "Reference matching reliability"
+  },
+  {
+    "id": "25",
+    "title": "Define reusable numeric conversion and reference-rounding kernels",
+    "depends": [],
+    "paths": [
+      "src/primitives/value.rs",
+      "src/primitives/mod.rs",
+      "src/maths/complex.rs",
+      "src/maths/polynomial.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/25",
+    "area": "Numeric primitives"
+  },
+  {
+    "id": "14",
+    "title": "Use a deterministic bounded dependency resolver for parameter and macro scopes",
+    "depends": [],
+    "paths": [
+      "src/netlist/eval.rs",
+      "src/netlist/expr.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/14",
+    "area": "Bounded graph resolver"
+  },
+  {
+    "id": "19",
+    "title": "Postprocessing: shared validated ordered-axis and discontinuity/segment traversal abstractions",
+    "depends": [],
+    "paths": [
+      "src/analysis/ordered_samples.rs",
+      "src/analysis/measure.rs",
+      "src/analysis/fourier_resample.rs",
+      "src/analysis/fourier.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/19",
+    "area": "Validated sample axis"
+  },
+  {
+    "id": "12",
+    "title": "Compile behavioral value and derivative expressions into a bounded shared execution plan",
+    "depends": [],
+    "paths": [
+      "src/devices/behavioural/program.rs",
+      "src/devices/behavioural.rs",
+      "src/netlist/bexpr.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/12",
+    "area": "Shared behavioral execution"
+  },
+  {
+    "id": "10",
+    "title": "Replace BSIM3 string-keyed internal parameter state with typed setup stages",
+    "depends": [],
+    "paths": [
+      "src/devices/bsim3/"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/10",
+    "area": "Typed BSIM3 setup"
+  },
+  {
+    "id": "16",
+    "title": "BSIM4: model load-state ownership explicitly instead of copying a hand-maintained member list",
+    "depends": [],
+    "paths": [
+      "src/devices/bsim4/",
+      "xtask/src/commands/bsim4_fields.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/16",
+    "area": "BSIM4 state ownership"
+  },
+  {
+    "id": "31",
+    "title": "Separate LTRA history interpolation, convolution workspace and timestep policy",
+    "depends": [],
+    "paths": [
+      "src/devices/ltra.rs",
+      "src/devices/ltra/",
+      "src/devices/delay.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/31",
+    "area": "Delay/convolution lifecycle"
+  },
+  {
+    "id": "47",
+    "title": "Unify rawfile codec traversal and eliminate per-cell text allocations",
+    "depends": [],
+    "paths": [
+      "src/analysis/rawfile/",
+      "src/analysis/results.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/47",
+    "area": "Shared rawfile codec"
+  },
+  {
+    "id": "42",
+    "title": "Make dense matrix allocation and node interning fallible at construction boundaries",
+    "depends": [
+      "25"
+    ],
+    "paths": [
+      "src/maths/dense.rs",
+      "src/maths/dense_complex.rs",
+      "src/primitives/node.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/42",
+    "area": "Fallible dimensions and node identities"
+  },
+  {
+    "id": "11",
+    "title": "Make sparse matrix construction and compact element handles fallible by design",
+    "depends": [
+      "42"
+    ],
+    "paths": [
+      "src/maths/sparse.rs",
+      "src/maths/sparse13.rs",
+      "src/maths/complex.rs",
+      "src/maths/linear.rs",
+      "src/devices/circuit.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/11",
+    "area": "Checked compact handles"
+  },
+  {
+    "id": "34",
+    "title": "Encode SPARSE ordering and factor validity in the matrix lifecycle",
+    "depends": [
+      "11"
+    ],
+    "paths": [
+      "src/maths/sparse13.rs",
+      "src/maths/linear.rs",
+      "src/maths/complex.rs",
+      "src/maths/sparse.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/34",
+    "area": "Legal factor states"
+  },
+  {
+    "id": "41",
+    "title": "Make circuit elaboration, finalized topology and mutable analysis state explicit",
+    "depends": [
+      "11",
+      "34"
+    ],
+    "paths": [
+      "src/devices/circuit.rs",
+      "src/devices/state.rs",
+      "src/devices/traits.rs",
+      "src/devices/setup.rs",
+      "src/devices/observe.rs",
+      "src/devices/registry.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/41",
+    "area": "Finalized topology and state"
+  },
+  {
+    "id": "15",
+    "title": "Separate ordered device setter validation from normalized instance construction",
+    "depends": [
+      "41"
+    ],
+    "paths": [
+      "src/devices/factory.rs",
+      "src/devices/registry.rs",
+      "src/devices/schema.rs",
+      "src/devices/ifparam.rs",
+      "src/devices/circuit.rs",
+      "src/devices/sources.rs",
+      "src/devices/controlled.rs",
+      "src/devices/tline.rs",
+      "src/devices/urc.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/15",
+    "area": "Ordered construction"
+  },
+  {
+    "id": "23",
+    "title": "Separate parser configuration from stateless syntax entry points and shared grammar adapters",
+    "depends": [
+      "14"
+    ],
+    "paths": [
+      "src/netlist/parser.rs",
+      "src/netlist/parser/"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/23",
+    "area": "Parser boundary"
+  },
+  {
+    "id": "35",
+    "title": "Unify scope traversal and parameter-elaboration boundaries",
+    "depends": [
+      "14",
+      "23"
+    ],
+    "paths": [
+      "src/netlist/ast.rs",
+      "src/netlist/parser/scopes.rs",
+      "src/netlist/elaborate.rs",
+      "src/netlist/semantic.rs",
+      "src/netlist/eval.rs",
+      "src/netlist/writer.rs",
+      "src/netlist/dump.rs",
+      "src/devices/subckt.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/35",
+    "area": "Ordered scopes"
+  },
+  {
+    "id": "17",
+    "title": "Netlist frontend: typed nonlinear-source lowering and consistent scoped card identities",
+    "depends": [
+      "35",
+      "12"
+    ],
+    "paths": [
+      "src/netlist/behavioural.rs",
+      "src/netlist/parser/behavioural.rs",
+      "src/netlist/parser/controlled.rs",
+      "src/netlist/elaborate.rs",
+      "src/devices/behavioural.rs",
+      "src/devices/controlled.rs",
+      "src/devices/subckt.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/17",
+    "area": "Typed nonlinear lowering"
+  },
+  {
+    "id": "52",
+    "title": "Index model/bin lookup and reuse validated declaration metadata",
+    "depends": [
+      "35"
+    ],
+    "paths": [
+      "src/devices/models.rs",
+      "src/devices/binning.rs",
+      "src/devices/subckt.rs",
+      "src/netlist/elaborate.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/52",
+    "area": "Indexed model selection"
+  },
+  {
+    "id": "24",
+    "title": "Establish a shared conformance tooling crate and deliberate xtask module boundaries",
+    "depends": [
+      "18",
+      "16"
+    ],
+    "paths": [
+      "xtask/src/",
+      "xtask/Cargo.toml",
+      "conformance/support/src/fixtures.rs",
+      "Cargo.toml",
+      "Cargo.lock",
+      "tests/bjt_gummel_poon.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/24",
+    "area": "Shared conformance library"
+  },
+  {
+    "id": "38",
+    "title": "Consolidate live C-reference test execution and structured measurement-report parsing",
+    "depends": [
+      "24"
+    ],
+    "paths": [
+      "conformance/support/src/fixtures.rs",
+      "conformance/support/src/ngspice.rs",
+      "xtask/src/commands/golden.rs",
+      "tests/support/",
+      "tests/common/",
+      "tests/c_measure_reference.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/38",
+    "area": "C reference runner"
+  },
+  {
+    "id": "45",
+    "title": "Make DC continuation policies and execution plans valid by construction",
+    "depends": [
+      "25",
+      "41"
+    ],
+    "paths": [
+      "src/analysis/bias.rs",
+      "src/analysis/newton.rs",
+      "src/analysis/config.rs",
+      "src/analysis/driver.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/45",
+    "area": "Continuation domain"
+  },
+  {
+    "id": "32",
+    "title": "Replace string-round-tripped analysis requests with typed resolved plans",
+    "depends": [
+      "45",
+      "35"
+    ],
+    "paths": [
+      "src/analysis/driver.rs",
+      "src/analysis/config.rs",
+      "src/analysis/ac.rs",
+      "src/analysis/bias.rs",
+      "src/analysis/batch.rs",
+      "src/analysis/transient.rs",
+      "src/analysis/sweep.rs",
+      "src/analysis/noise.rs",
+      "src/analysis/sens.rs",
+      "src/analysis/sparam.rs",
+      "src/analysis/pz.rs",
+      "src/analysis/tf.rs",
+      "src/analysis/disto.rs",
+      "src/cli/args.rs",
+      "src/cli/simulate.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/32",
+    "area": "Typed analysis plans"
+  },
+  {
+    "id": "44",
+    "title": "Model transient trial/retry/acceptance as an explicit step state machine",
+    "depends": [
+      "41",
+      "32",
+      "31"
+    ],
+    "paths": [
+      "src/analysis/companion.rs",
+      "src/analysis/transient.rs",
+      "src/analysis/newton.rs",
+      "src/devices/state.rs",
+      "src/devices/delay.rs",
+      "src/maths/integrator.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/44",
+    "area": "Transient state machine"
+  },
+  {
+    "id": "48",
+    "title": "Represent UIC consistency as a typed constraint graph and compact system",
+    "depends": [
+      "41",
+      "11"
+    ],
+    "paths": [
+      "src/analysis/initial.rs",
+      "src/devices/initial.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/48",
+    "area": "Typed UIC constraint graph"
+  },
+  {
+    "id": "27",
+    "title": "Make pole-zero search strategies and trial neighborhoods typed state transitions",
+    "depends": [
+      "34",
+      "32"
+    ],
+    "paths": [
+      "src/analysis/pz.rs",
+      "src/maths/pencil.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/27",
+    "area": "Pole-zero search lifecycle"
+  },
+  {
+    "id": "51",
+    "title": "Replace untyped sensitivity snapshots with validated family-specific record layouts",
+    "depends": [
+      "10",
+      "16",
+      "15"
+    ],
+    "paths": [
+      "src/devices/sensitivity.rs",
+      "src/devices/sensitivity/",
+      "src/devices/bsim3/",
+      "src/devices/bsim4/sens.rs",
+      "src/devices/bsim4/fields.rs",
+      "xtask/src/commands/bsim4_fields.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/51",
+    "area": "Typed sensitivity snapshots"
+  },
+  {
+    "id": "30",
+    "title": "Decompose BSIM4 translated load into physics stages with explicit data flow",
+    "depends": [
+      "16",
+      "51"
+    ],
+    "paths": [
+      "src/devices/bsim4/"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/30",
+    "area": "Physics stages"
+  },
+  {
+    "id": "20",
+    "title": "Unify passive-device setup and temperature evaluation with sensitivity replay",
+    "depends": [
+      "51",
+      "15"
+    ],
+    "paths": [
+      "src/devices/passive.rs",
+      "src/devices/passive/",
+      "src/devices/rlc.rs",
+      "src/devices/sensitivity/res.rs",
+      "src/devices/sensitivity/reactive.rs",
+      "src/devices/models.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/20",
+    "area": "Passive thermal replay"
+  },
+  {
+    "id": "43",
+    "title": "Unify diode defaulting and setup-state ownership between ordinary loads and sensitivity replay",
+    "depends": [
+      "51",
+      "15"
+    ],
+    "paths": [
+      "src/devices/nonlinear.rs",
+      "src/devices/nonlinear/",
+      "src/devices/models.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/43",
+    "area": "Diode setup and replay"
+  },
+  {
+    "id": "21",
+    "title": "Consolidate independent-source phasor and waveform coefficient resolution",
+    "depends": [
+      "15",
+      "25"
+    ],
+    "paths": [
+      "src/devices/sources.rs",
+      "src/devices/functions.rs",
+      "src/devices/pulse.rs",
+      "src/devices/sensitivity/source.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/21",
+    "area": "Resolved source coefficients"
+  },
+  {
+    "id": "29",
+    "title": "Unify validated PWL waveform storage and exact breakpoint scheduling",
+    "depends": [
+      "19",
+      "21"
+    ],
+    "paths": [
+      "src/devices/functions.rs",
+      "src/devices/pulse.rs",
+      "src/devices/breaks.rs",
+      "src/devices/sources.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/29",
+    "area": "Validated PWL and scheduler"
+  },
+  {
+    "id": "33",
+    "title": "Use one resolved waveform timeline for simulation and transient conformance",
+    "depends": [
+      "29",
+      "35",
+      "24"
+    ],
+    "paths": [
+      "src/devices/functions.rs",
+      "src/devices/pulse.rs",
+      "src/devices/breaks.rs",
+      "src/netlist/elaborate.rs",
+      "xtask/src/commands/tran.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/33",
+    "area": "Shared waveform timeline"
+  },
+  {
+    "id": "39",
+    "title": "Make transient conformance sampling a reusable indexed comparison plan",
+    "depends": [
+      "19",
+      "33"
+    ],
+    "paths": [
+      "xtask/src/commands/tran.rs",
+      "xtask/src/commands/verify.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/39",
+    "area": "Indexed conformance plan"
+  },
+  {
+    "id": "53",
+    "title": "Prepare sweep overrides once per immutable analysis context instead of once per load",
+    "depends": [
+      "41",
+      "15",
+      "45",
+      "51"
+    ],
+    "paths": [
+      "src/devices/circuit.rs",
+      "src/devices/models.rs",
+      "src/devices/sweep.rs",
+      "src/analysis/newton.rs",
+      "src/analysis/sweep.rs",
+      "src/devices/observe.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/53",
+    "area": "Prepared sweep contexts"
+  },
+  {
+    "id": "54",
+    "title": "Bind typed observation queries and reuse isolated device-load workspaces",
+    "depends": [
+      "53",
+      "41"
+    ],
+    "paths": [
+      "src/devices/observe.rs",
+      "src/analysis/observations.rs",
+      "src/devices/circuit.rs",
+      "src/devices/traits.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/54",
+    "area": "Typed observations"
+  },
+  {
+    "id": "13",
+    "title": "Introduce a common analysis output plan for streaming and retained plots",
+    "depends": [
+      "32",
+      "47",
+      "54"
+    ],
+    "paths": [
+      "src/analysis/batch.rs",
+      "src/analysis/results.rs",
+      "src/analysis/transient.rs",
+      "src/analysis/noise.rs",
+      "src/analysis/selection.rs",
+      "src/analysis/rawfile/",
+      "src/cli/simulate.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/13",
+    "area": "Output planning"
+  },
+  {
+    "id": "22",
+    "title": "Make noise transfer evaluation type-safe and share the reference gain kernel",
+    "depends": [
+      "41",
+      "53"
+    ],
+    "paths": [
+      "src/devices/noise.rs",
+      "src/analysis/noise.rs",
+      "src/analysis/sparam.rs",
+      "src/devices/bsim4/noise.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/22",
+    "area": "Noise transfer types"
+  },
+  {
+    "id": "50",
+    "title": "Validate and bind distortion terms and Volterra kernel inputs before evaluation",
+    "depends": [
+      "41",
+      "32"
+    ],
+    "paths": [
+      "src/devices/distortion.rs",
+      "src/devices/distortion/",
+      "src/analysis/disto.rs",
+      "src/devices/traits.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/50",
+    "area": "Bound distortion terms"
+  },
+  {
+    "id": "49",
+    "title": "Separate BJT current, base-charge and transit-time kernels from load orchestration",
+    "depends": [
+      "50",
+      "51"
+    ],
+    "paths": [
+      "src/devices/bjt.rs",
+      "src/devices/bjt/"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/49",
+    "area": "BJT physics kernels"
+  },
+  {
+    "id": "37",
+    "title": "Extract shared HFET/MESA load lifecycle without merging physical models",
+    "depends": [
+      "44",
+      "51"
+    ],
+    "paths": [
+      "src/devices/hfet/",
+      "src/devices/limiting.rs",
+      "src/devices/nonlinear/charge.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/37",
+    "area": "HFET/MESA lifecycle"
+  },
+  {
+    "id": "46",
+    "title": "Introduce reusable ordered sensitivity perturbation assembly and explicit numbering",
+    "depends": [
+      "51",
+      "41",
+      "53"
+    ],
+    "paths": [
+      "src/analysis/sens.rs",
+      "src/devices/sensitivity.rs",
+      "src/devices/sensitivity/",
+      "src/maths/sparse.rs",
+      "src/maths/linear.rs"
+    ],
+    "url": "https://github.com/codeandsolder/ngspice-rs-fast/issues/46",
+    "area": "Ordered sensitivity assembly"
+  }
+]

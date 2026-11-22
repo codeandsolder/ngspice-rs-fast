@@ -38,7 +38,7 @@ use crate::devices::nonlinear::{JunctionPoint, junction_companion};
 use crate::devices::state::{DeviceState, IterationPhase};
 use crate::devices::traits::{Device, StampContext};
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// State slots. The first block is `b3ld.c`'s DC state; the charge block
 /// follows C's `bsim3def.h` order, with each integrated charge immediately
@@ -157,7 +157,7 @@ impl Bsim3 {
     /// or a nonpositive effective size (`b3check.c`).
     pub(crate) fn instantiate(
         instance: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         model: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -166,7 +166,7 @@ impl Bsim3 {
 
     fn build(
         instance: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         model: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Self> {
@@ -191,33 +191,34 @@ impl Bsim3 {
             })
         };
         let ic = [component("icvbs"), component("icvgs"), component("icvds")];
-        let mut staged = nodes.clone();
-        let mut terminals: Vec<NodeId> = instance
-            .nodes
-            .iter()
-            .map(|n| staged.intern(n))
-            .collect::<SpiceResult<Vec<_>>>()?;
-        let mut primes = [None; 2];
-        for (index, conductance, suffix) in [
-            (0, setup.drain_conductance, "drain"),
-            (1, setup.source_conductance, "source"),
-        ] {
-            if conductance <= 0. {
-                continue;
+        let (terminals, primes) = nodes.transaction(|staged| {
+            let mut terminals: Vec<NodeId> = instance
+                .nodes
+                .iter()
+                .map(|n| staged.intern(n))
+                .collect::<SpiceResult<Vec<_>>>()?;
+            let mut primes = [None; 2];
+            for (index, conductance, suffix) in [
+                (0, setup.drain_conductance, "drain"),
+                (1, setup.source_conductance, "source"),
+            ] {
+                if conductance <= 0. {
+                    continue;
+                }
+                let name = format!("{}#{suffix}", instance.name);
+                if staged.get(&name).is_some() {
+                    return Err(SpiceError::circuit(format!(
+                        "{}: internal node name collision: {name}",
+                        instance.name
+                    )));
+                }
+                let prime = staged.intern(&name)?;
+                staged.set_kind(prime, NodeKind::Internal)?;
+                terminals.push(prime);
+                primes[index] = Some(prime);
             }
-            let name = format!("{}#{suffix}", instance.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "{}: internal node name collision: {name}",
-                    instance.name
-                )));
-            }
-            let prime = staged.intern(&name)?;
-            staged.set_kind(prime, NodeKind::Internal);
-            terminals.push(prime);
-            primes[index] = Some(prime);
-        }
-        *nodes = staged;
+            Ok((terminals, primes))
+        })?;
         let device = Self {
             name: instance.name.clone(),
             model_name: model.card().name.clone(),
@@ -401,7 +402,7 @@ impl Bsim3 {
 fn limit(raw: [Real; 3], old: [Real; 3], von: Real, cached: &Cached) -> ([Real; 3], bool) {
     let [vbs_in, vgs_in, vds_in] = raw;
     let [old_vbs, old_vgs, old_vds] = old;
-    let vcrit = cached.temperature_model.get("vcrit").unwrap_or(0.);
+    let vcrit = cached.temperature_model.vcrit;
     let vgd_raw = vgs_in - vds_in;
     let mut check = false;
     let (vgs, vds);
@@ -745,7 +746,7 @@ impl Device for Bsim3 {
         // refuses only where charges are required.
         let integration = context.integration;
         let transient = integration.is_some();
-        let cap_mod = cached.defaults.integer("capmod")?;
+        let cap_mod = cached.defaults.values.capmod.value;
         let charge_ready = cap_mod == 3 && cached.setup.nqs_mod == 0 && cached.setup.acnqs_mod == 0;
         let charge = if transient || charge_ready {
             Some(
@@ -1325,13 +1326,9 @@ mod tests {
         let resolver = ModelResolver::new(&deck.models).unwrap();
         let inst = &deck.devices[0];
         let resolved = resolver.resolve(inst).unwrap().unwrap();
-        let device = Bsim3::build(
-            inst,
-            &mut NodeTable::new(),
-            &resolved,
-            &ModelContext::new(27., 27.),
-        )
-        .unwrap();
+        let device = crate::primitives::NodeTable::new()
+            .transaction(|nodes| Bsim3::build(inst, nodes, &resolved, &ModelContext::new(27., 27.)))
+            .unwrap();
         let initial = device.ensure(27., 27.).unwrap();
         assert!(Rc::ptr_eq(&initial, &device.ensure(27., 27.).unwrap()));
         let hot = device.ensure(127., 27.).unwrap();
@@ -1342,13 +1339,11 @@ mod tests {
         assert!(Rc::ptr_eq(&hot, &device.ensure(127., 27.).unwrap()));
         let new_nominal = device.ensure(127., 42.).unwrap();
         assert!(!Rc::ptr_eq(&hot.defaults, &new_nominal.defaults));
-        let fresh = Bsim3::build(
-            inst,
-            &mut NodeTable::new(),
-            &resolved,
-            &ModelContext::new(127., 42.),
-        )
-        .unwrap();
+        let fresh = crate::primitives::NodeTable::new()
+            .transaction(|nodes| {
+                Bsim3::build(inst, nodes, &resolved, &ModelContext::new(127., 42.))
+            })
+            .unwrap();
         let fresh = fresh.ensure(127., 42.).unwrap();
         assert_eq!(new_nominal.defaults, fresh.defaults);
         assert_eq!(new_nominal.setup, fresh.setup);

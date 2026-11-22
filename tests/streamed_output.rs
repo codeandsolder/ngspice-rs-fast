@@ -8,8 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ngspice_rs::analysis::{
-    Plot, PlotFlags, PointSink, RawFile, RawFileWriter, RawFormat, RawPlot, RunConfig, Variable,
-    runner,
+    BinaryByteOrder, Plot, PlotFlags, PointSink, RawFile, RawFileReader, RawFileWriter, RawFormat,
+    RawPlot, RunConfig, Variable, runner,
 };
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::Netlist;
@@ -53,7 +53,7 @@ struct Recorder {
 impl PointSink for Recorder {
     fn begin(&mut self, header: &Plot) -> SpiceResult<()> {
         assert!(self.header.is_none(), "begin is called once");
-        assert!(header.points.is_empty(), "the header holds no points");
+        assert!(header.points().is_empty(), "the header holds no points");
         self.header = Some(header.clone());
         Ok(())
     }
@@ -85,14 +85,14 @@ fn assert_streams_the_stored_plot(body: &str) {
         .run_into(&mut circuit, &request, &config.context(), &mut recorder)
         .unwrap();
 
-    assert!(returned.points.is_empty(), "run_into returns no points");
+    assert!(returned.points().is_empty(), "run_into returns no points");
     let header = recorder.header.expect("the sink saw a header");
-    assert_eq!(header.variables, stored.variables);
+    assert_eq!(header.variables(), stored.variables());
     assert_eq!(header.plotname, stored.plotname);
-    assert_eq!(returned.variables, stored.variables);
-    assert!(!stored.points.is_empty());
+    assert_eq!(returned.variables(), stored.variables());
+    assert!(!stored.points().is_empty());
     // Bit-identical rows: streaming changes where points go, not what they are.
-    assert_eq!(recorder.points, stored.points);
+    assert_eq!(recorder.points, stored.points());
     assert_eq!(circuit.final_transient_state(), final_state);
 }
 
@@ -179,25 +179,28 @@ fn a_sink_error_stops_the_transient_with_that_error() {
 }
 
 fn sample_plots() -> RawFile {
-    let mut real = Plot::new("tran1", "Transient Analysis", PlotFlags::Real);
+    let mut real = Plot::builder("tran1", "Transient Analysis", PlotFlags::Real);
     real.push_variable(Variable::new("time", "time"));
     real.push_variable(Variable::new("v(out)", "voltage"));
+    let mut real = real.build();
     for index in 0..5 {
         let t = f64::from(index) * 1e-4;
         real.push_point(vec![Complex::real(t), Complex::real((-t / 1e-3).exp())])
             .unwrap();
     }
-    let mut complex = Plot::new("ac1", "AC Analysis", PlotFlags::Complex);
+    let mut complex = Plot::builder("ac1", "AC Analysis", PlotFlags::Complex);
     complex.push_variable(Variable::new("frequency", "frequency"));
     complex.push_variable(Variable::complex("v(out)", "voltage"));
+    let mut complex = complex.build();
     for index in 0..3 {
         let f = 10f64.powi(index);
         complex
             .push_point(vec![Complex::real(f), Complex::new(1.0 / f, -0.5 / f)])
             .unwrap();
     }
-    let mut empty = Plot::new("tran2", "Transient Analysis", PlotFlags::Real);
+    let mut empty = Plot::builder("tran2", "Transient Analysis", PlotFlags::Real);
     empty.push_variable(Variable::new("time", "time"));
+    let empty = empty.build();
     RawFile {
         plots: [real, complex, empty]
             .into_iter()
@@ -215,39 +218,58 @@ fn sample_plots() -> RawFile {
 fn streamed_and_stored_plots_write_the_same_bytes() {
     let dir = scratch("writer");
     let rawfile = sample_plots();
-    for format in [RawFormat::Ascii, RawFormat::Binary] {
+    for (format, order) in [
+        (RawFormat::Ascii, BinaryByteOrder::LittleEndian),
+        (RawFormat::Binary, BinaryByteOrder::LittleEndian),
+        (RawFormat::Binary, BinaryByteOrder::BigEndian),
+    ] {
         let stored = dir.join("stored.raw");
-        rawfile.write_with_format(&stored, format).unwrap();
+        rawfile.write_with_format(&stored, format, order).unwrap();
 
         // The first plot whole, the rest streamed point by point.
         let streamed = dir.join("streamed.raw");
         let spool = dir.join("points.spool");
-        let mut writer = RawFileWriter::create(&streamed, format).unwrap();
+        let mut writer = RawFileWriter::create(&streamed, format, order).unwrap();
         writer.write_plot(&rawfile.plots[0]).unwrap();
         for raw_plot in &rawfile.plots[1..] {
             let mut plot = writer.begin_plot(raw_plot.clone(), &spool).unwrap();
-            assert!(plot.header().plot.points.is_empty());
-            for point in &raw_plot.plot.points {
+            assert!(plot.header().plot.points().is_empty());
+            for point in raw_plot.plot.points() {
                 plot.push_point(point).unwrap();
             }
-            assert_eq!(plot.point_count(), raw_plot.plot.points.len());
+            assert_eq!(plot.point_count(), raw_plot.plot.points().len());
             writer.finish_plot(plot).unwrap();
             assert!(!spool.exists(), "finishing removes the spool");
         }
         writer.finish().unwrap();
 
+        let expected_bytes = match format {
+            RawFormat::Ascii => rawfile.to_ascii().unwrap().into_bytes(),
+            RawFormat::Binary => rawfile.to_binary_with(order).unwrap(),
+        };
+        let stored_bytes = fs::read(&stored).unwrap();
+        let streamed_bytes = fs::read(&streamed).unwrap();
+        assert_eq!(stored_bytes, expected_bytes, "{format:?} {order:?}");
+        assert_eq!(streamed_bytes, expected_bytes, "{format:?} {order:?}");
+        // The binary format does not record its byte order; use the selected order
+        // when verifying real and complex rows.
+        let parsed = RawFileReader::new(streamed_bytes.as_slice())
+            .with_byte_order(order)
+            .read()
+            .unwrap();
         assert_eq!(
-            fs::read(&streamed).unwrap(),
-            fs::read(&stored).unwrap(),
-            "{format:?}"
+            parsed,
+            RawFileReader::new(stored_bytes.as_slice())
+                .with_byte_order(order)
+                .read()
+                .unwrap(),
+            "{format:?} {order:?}"
         );
-        // Loading renames the plots and ASCII rounds decimals (both known
-        // round-trip limits), so the loaded files are compared with each other.
-        assert_eq!(
-            RawFile::load(&streamed).unwrap(),
-            RawFile::load(&stored).unwrap(),
-            "{format:?}"
-        );
+        if format.is_binary() {
+            for (actual, expected) in parsed.plots.iter().zip(&rawfile.plots) {
+                assert_eq!(actual.plot.points(), expected.plot.points());
+            }
+        }
     }
     assert_eq!(entries(&dir), ["stored.raw", "streamed.raw"]);
     fs::remove_dir_all(&dir).unwrap();
@@ -258,7 +280,12 @@ fn a_streamed_plot_rejects_ragged_points_and_cleans_up_when_abandoned() {
     let dir = scratch("abandon");
     let rawfile = sample_plots();
     let spool = dir.join("points.spool");
-    let writer = RawFileWriter::create(dir.join("out.raw"), RawFormat::Binary).unwrap();
+    let writer = RawFileWriter::create(
+        dir.join("out.raw"),
+        RawFormat::Binary,
+        BinaryByteOrder::LittleEndian,
+    )
+    .unwrap();
     let mut plot = writer.begin_plot(rawfile.plots[0].clone(), &spool).unwrap();
     plot.push_point(&[Complex::real(0.0), Complex::real(1.0)])
         .unwrap();
@@ -280,5 +307,31 @@ fn a_streamed_plot_rejects_ragged_points_and_cleans_up_when_abandoned() {
     );
     drop(writer);
     assert_eq!(entries(&dir), ["out.raw"]);
+    fs::remove_dir_all(&dir).unwrap();
+}
+#[test]
+fn a_streamed_binary_plot_cannot_cross_byte_orders() {
+    let dir = scratch("byte-order");
+    let rawfile = sample_plots();
+    let spool = dir.join("points.spool");
+    let origin = RawFileWriter::create(
+        dir.join("source.raw"),
+        RawFormat::Binary,
+        BinaryByteOrder::BigEndian,
+    )
+    .unwrap();
+    let mut writer = RawFileWriter::create(
+        dir.join("dest.raw"),
+        RawFormat::Binary,
+        BinaryByteOrder::LittleEndian,
+    )
+    .unwrap();
+    let mut plot = origin.begin_plot(rawfile.plots[0].clone(), &spool).unwrap();
+    plot.push_point(&rawfile.plots[0].plot.points()[0]).unwrap();
+    assert!(writer.finish_plot(plot).is_err());
+    writer.finish().unwrap();
+    origin.finish().unwrap();
+    assert!(!spool.exists());
+    assert_eq!(fs::metadata(dir.join("dest.raw")).unwrap().len(), 0);
     fs::remove_dir_all(&dir).unwrap();
 }

@@ -2,18 +2,19 @@
 use crate::devices::models::ModelFamily;
 use crate::devices::passive::PassiveKind;
 use crate::devices::rlc::ResistorNoise;
+use crate::devices::sources::{SourceExcitation, SourceInputs};
 use crate::devices::{
-    AmSpec, Capacitor, Device, ExpSpec, FunctionSpec, IndependentSource, Inductor, PulseSpec,
-    PwlSource, Resistor, SffmSpec, SineSpec, Waveform,
+    AmSpec, Capacitor, Device, ExpSpec, FunctionSpec, Inductor, PulseSpec, PwlSource, Resistor,
+    SffmSpec, SineSpec, Waveform,
 };
 use crate::netlist::ast::{
     DeviceInstance, FunctionWaveform, ParameterKind, PositionedValue, SourceFunction,
-    SourceWaveform,
+    SourceWaveform, WaveformKind,
 };
 use crate::netlist::source::{Deck, LogicalLine};
 use crate::netlist::{Parser, RawCard};
 use crate::primitives::{
-    Complex, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
+    NodeAppend, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
 };
 
 /// Designators [`instantiate`] builds from the card alone (the registry's
@@ -67,9 +68,10 @@ pub(super) fn from_card(card: &RawCard, nodes: &mut NodeTable) -> SpiceResult<Bo
         title_location: card.location.clone(),
         lines: vec![LogicalLine {
             location: card.location.clone(),
-            end_line: card.location.line,
+            end_line: card.position().advance(card.raw.len()).location().line,
             continuations: 0,
             text: card.raw.clone(),
+            source_map: card.source_map.clone(),
         }],
     };
     let netlist = Parser::new().parse_deck(&deck)?;
@@ -79,17 +81,17 @@ pub(super) fn from_card(card: &RawCard, nodes: &mut NodeTable) -> SpiceResult<Bo
             "device card must elaborate to exactly one instance",
         ));
     };
-    instantiate(instance, nodes)
+    nodes.transaction(|nodes| instantiate(instance, nodes))
 }
 
 /// Resolve and validate before any node interning. Bounded R/C/L and M4 D/Q/M
 /// factories reject unsupported physics before committing staged nodes.
-/// Every builtin must honor the append-only node contract: intern nodes and
-/// change only the kinds of newly created nodes. Circuit batch elaboration
-/// uses that contract to roll back an entire failed batch.
+/// The append-only capability permits interning nodes and changing only
+/// newly created node kinds. Circuit batch elaboration can roll back the
+/// entire suffix without copying or changing pre-existing nodes.
 pub(super) fn instantiate_with_models(
     instance: &DeviceInstance,
-    nodes: &mut NodeTable,
+    nodes: &mut NodeAppend<'_>,
     models: &crate::devices::models::ModelResolver<'_>,
     context: &crate::devices::models::ModelContext,
 ) -> SpiceResult<Box<dyn Device>> {
@@ -151,6 +153,7 @@ pub(super) fn instantiate_with_models(
         ModelFamily::Txl => crate::devices::txl::Txl::instantiate(instance, nodes, &model),
         ModelFamily::Ltra => {
             crate::devices::ltra::LossyLine::instantiate(instance, nodes, models, context)
+                .map(|line| Box::new(line) as Box<dyn Device>)
         }
         // URC elaborates to a ladder, not a single device.
         ModelFamily::Urc => Err(SpiceError::circuit(format!(
@@ -162,7 +165,7 @@ pub(super) fn instantiate_with_models(
 
 pub(super) fn instantiate(
     instance: &DeviceInstance,
-    nodes: &mut NodeTable,
+    nodes: &mut NodeAppend<'_>,
 ) -> SpiceResult<Box<dyn Device>> {
     if matches!(instance.designator, 'e'..='h') {
         return crate::devices::controlled::instantiate(instance, nodes);
@@ -196,26 +199,11 @@ pub(super) fn instantiate(
     }
 }
 
-/// Execute an append-only node-table transaction. Builders may intern
-/// nodes and assign newly created node kinds, but must not modify existing
-/// nodes. An error discards just the appended suffix, not the entire table.
-pub(super) fn append_nodes<T>(
-    nodes: &mut NodeTable,
-    build: impl FnOnce(&mut NodeTable) -> SpiceResult<T>,
-) -> SpiceResult<T> {
-    let mark = nodes.len();
-    let result = build(nodes);
-    if result.is_err() {
-        nodes.truncate(mark);
-    }
-    result
-}
-
 /// Build a four-terminal line's internal unknowns in C setup order. On a
 /// generated-name collision, rollback only the newly interned nodes.
 pub(super) fn line_terminals<const N: usize>(
     instance: &DeviceInstance,
-    nodes: &mut NodeTable,
+    nodes: &mut NodeAppend<'_>,
     suffixes: &[&str],
     label: &str,
 ) -> SpiceResult<[crate::primitives::NodeId; N]> {
@@ -225,7 +213,7 @@ pub(super) fn line_terminals<const N: usize>(
             "invalid transmission-line terminal layout",
         ));
     }
-    append_nodes(nodes, |nodes| {
+    nodes.transaction(|nodes| {
         let mut terminals = [NodeId::GROUND; N];
         for (slot, node) in instance.nodes.iter().enumerate() {
             terminals[slot] = nodes.intern(node)?;
@@ -238,7 +226,7 @@ pub(super) fn line_terminals<const N: usize>(
                 )));
             }
             let node = nodes.intern(&name)?;
-            nodes.set_kind(node, NodeKind::Internal);
+            nodes.set_kind(node, NodeKind::Internal)?;
             terminals[4 + slot] = node;
         }
         Ok(terminals)
@@ -247,7 +235,7 @@ pub(super) fn line_terminals<const N: usize>(
 
 /// Parse the shared scalar parameter syntax without conflating the two
 /// factories' supported setter lists or dropping intermediate errors.
-fn scalar_number(p: &crate::netlist::ast::ParameterAssignment) -> SpiceResult<Real> {
+pub(super) fn scalar_number(p: &crate::netlist::ast::ParameterAssignment) -> SpiceResult<Real> {
     parse_spice_number(&p.value)
         .filter(|v| v.is_finite())
         .ok_or_else(|| SpiceError::Unsupported {
@@ -268,7 +256,7 @@ fn unsupported_parameter(
 
 fn instantiate_passive(
     instance: &DeviceInstance,
-    nodes: &mut NodeTable,
+    nodes: &mut NodeAppend<'_>,
     kind: PassiveKind,
 ) -> SpiceResult<Box<dyn Device>> {
     let mut value = 0.;
@@ -302,7 +290,7 @@ fn instantiate_passive(
             _ => return Err(unsupported_parameter(instance, p)),
         }
     }
-    append_nodes(nodes, |nodes| {
+    nodes.transaction(|nodes| {
         let terminals = [
             nodes.intern(&instance.nodes[0])?,
             nodes.intern(&instance.nodes[1])?,
@@ -322,24 +310,57 @@ fn instantiate_passive(
     })
 }
 
+enum SourceSetter {
+    Dc,
+    AcMagnitude,
+    AcPhase,
+    DistortionMagnitude(usize),
+    DistortionPhase(usize),
+    Delay,
+    Repeat,
+    Port(PortSetter),
+}
+
+impl SourceSetter {
+    fn parse(name: &str, voltage: bool) -> Option<Self> {
+        Some(match name {
+            "dc" => Self::Dc,
+            "acmag" => Self::AcMagnitude,
+            "acphase" => Self::AcPhase,
+            "distof1mag" => Self::DistortionMagnitude(0),
+            "distof1phase" => Self::DistortionPhase(0),
+            "distof2mag" => Self::DistortionMagnitude(1),
+            "distof2phase" => Self::DistortionPhase(1),
+            "td" => Self::Delay,
+            "r" => Self::Repeat,
+            "portnum" if voltage => Self::Port(PortSetter::Number),
+            "z0" if voltage => Self::Port(PortSetter::Impedance),
+            "pwr" if voltage => Self::Port(PortSetter::Power),
+            "freq" if voltage => Self::Port(PortSetter::Frequency),
+            "phase" if voltage => Self::Port(PortSetter::Phase),
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PortSetter {
+    Number,
+    Impedance,
+    Power,
+    Frequency,
+    Phase,
+}
+
 struct SourceSetters {
-    value: Option<Real>,
-    mag: Real,
-    phase: Real,
-    ac_given: bool,
-    waveform: Option<Waveform>,
+    inputs: SourceInputs,
     port: PortSetters,
     distortion: [Option<crate::devices::distortion::DistortionInput>; 2],
 }
 
 fn parse_source_setters(instance: &DeviceInstance) -> SpiceResult<SourceSetters> {
-    let mut value = None;
-    let mut mag = 0.;
-    let mut phase: f64 = 0.;
-    // C `VSRCacGiven`/`ISRCacGiven`: any AC setter, even `ac 0`.
-    let mut ac_given = false;
+    let mut inputs = SourceInputs::default();
     // C applies waveform setters in order, so the last one wins.
-    let mut waveform = None;
     // PWL `td=` (any order) and `r=` (applies to the PWL already set), as the
     // ordered VSRC_TD/VSRC_R setters of vsrcpar.c/isrcpar.c.
     let mut pwl_delay: Option<(f64, SourceLoc)> = None;
@@ -360,7 +381,7 @@ fn parse_source_setters(instance: &DeviceInstance) -> SpiceResult<SourceSetters>
                     location: Some(at.clone()),
                 });
             }
-            waveform = Some(source_waveform(&p.name, source, &p.location)?);
+            inputs.waveform = Some(source_waveform(&p.name, source, &p.location)?);
             // A later waveform setter replaces C's PORT function type.
             port.power_function = None;
             continue;
@@ -378,67 +399,45 @@ fn parse_source_setters(instance: &DeviceInstance) -> SpiceResult<SourceSetters>
                 },
             ));
         }
-        let allowed = matches!(
-            p.name.as_str(),
-            "dc" | "acmag"
-                | "acphase"
-                | "r"
-                | "td"
-                | "distof1mag"
-                | "distof1phase"
-                | "distof2mag"
-                | "distof2phase"
-        ) || (instance.designator == 'v'
-            && matches!(p.name.as_str(), "portnum" | "z0" | "pwr" | "freq" | "phase"));
-        if !allowed {
-            return Err(unsupported_parameter(instance, p));
-        }
+        let setter = SourceSetter::parse(&p.name, instance.designator == 'v')
+            .ok_or_else(|| unsupported_parameter(instance, p))?;
         let number = scalar_number(p)?;
-        match p.name.as_str() {
-            "acmag" => {
-                mag = number;
-                ac_given = true;
+        match setter {
+            SourceSetter::AcMagnitude => {
+                inputs.ac.get_or_insert_default().magnitude = Some(number);
             }
-            "acphase" => {
-                phase = number;
-                ac_given = true;
+            SourceSetter::AcPhase => {
+                inputs.ac.get_or_insert_default().phase = Some(number);
             }
-            "distof1mag" | "distof2mag" | "distof1phase" | "distof2phase" => {
-                let slot = &mut distortion[usize::from(p.name.starts_with("distof2"))];
-                let input = slot.get_or_insert(crate::devices::distortion::DistortionInput {
-                    magnitude: 1.,
+            SourceSetter::DistortionMagnitude(index) => {
+                // A new setter replaces both values (vsrcpar.c).
+                distortion[index] = Some(crate::devices::distortion::DistortionInput {
+                    magnitude: number,
                     phase: 0.,
                 });
-                if p.name.ends_with("mag") {
-                    // A new setter replaces both values (`vsrcpar.c`).
-                    *input = crate::devices::distortion::DistortionInput {
-                        magnitude: number,
+            }
+            SourceSetter::DistortionPhase(index) => {
+                distortion[index]
+                    .get_or_insert(crate::devices::distortion::DistortionInput {
+                        magnitude: 1.,
                         phase: 0.,
-                    };
-                } else {
-                    input.phase = number;
-                }
+                    })
+                    .phase = number;
             }
-            "td" => pwl_delay = Some((number, p.location.clone())),
-            "portnum" | "z0" | "pwr" | "freq" | "phase" => {
-                port.set(&p.name, number, &p.location)?;
-            }
-            "r" => {
-                validate_pwl_repeat(instance, p, waveform.as_ref(), number)?;
+            SourceSetter::Delay => pwl_delay = Some((number, p.location.clone())),
+            SourceSetter::Port(setter) => port.set(setter, number, &p.location)?,
+            SourceSetter::Repeat => {
+                validate_pwl_repeat(instance, p, inputs.waveform.as_ref(), number)?;
                 pwl_repeat = Some((number, p.location.clone()));
             }
-            _ => value = Some(number),
+            SourceSetter::Dc => inputs.dc = Some(number),
         }
     }
     if pwl_delay.is_some() || pwl_repeat.is_some() {
-        waveform = Some(pwl_options(waveform, pwl_delay, pwl_repeat)?);
+        inputs.waveform = Some(pwl_options(inputs.waveform, pwl_delay, pwl_repeat)?);
     }
     Ok(SourceSetters {
-        value,
-        mag,
-        phase,
-        ac_given,
-        waveform,
+        inputs,
         port,
         distortion,
     })
@@ -472,77 +471,72 @@ fn validate_pwl_repeat(
 
 fn instantiate_source(
     instance: &DeviceInstance,
-    nodes: &mut NodeTable,
+    nodes: &mut NodeAppend<'_>,
 ) -> SpiceResult<Box<dyn Device>> {
     let SourceSetters {
-        value,
-        mag,
-        phase,
-        ac_given,
-        waveform,
+        inputs,
         port,
         distortion,
     } = parse_source_setters(instance)?;
-    let dc_given = value.is_some();
-    let waveform_given = waveform.is_some();
-    // An explicit DC value is kept apart from time forcing. Without one, DC
-    // analyses see the waveform's time-zero level (vsrcload.c evaluates the
-    // transient function at time 0 when DC is not given).
-    let value = match (value, &waveform) {
-        (Some(v), _) => v,
-        (None, Some(w)) => w.time_zero()?,
-        (None, None) => 0.,
-    };
-    // Intern in place and roll back on failure, so the caller's node table is
-    // untouched by an error without cloning it per instance.
-    append_nodes(nodes, |new_nodes| {
+    let power_function = port.power_function.is_some();
+    let rf = port.resolve(instance)?;
+    let excitation = SourceExcitation::from_inputs(instance.designator == 'v', inputs)?;
+    // Only topology binding now needs the append-only transaction.
+    nodes.transaction(|nodes| {
         let terminals = [
-            new_nodes.intern(&instance.nodes[0])?,
-            new_nodes.intern(&instance.nodes[1])?,
+            nodes.intern(&instance.nodes[0])?,
+            nodes.intern(&instance.nodes[1])?,
         ];
-        let power_function = port.power_function.is_some();
-        let rf = port.finish(instance, new_nodes)?;
-        let tone = power_function.then(|| {
-            rf.as_ref().map_or((0., 0.), |p| {
-                (
-                    // vsrctemp.c: sqrt(VSRCportPower * 4.0 * VSRCportZ0).
-                    (p.power * 4. * p.z0).sqrt(),
-                    2. * std::f64::consts::PI * p.frequency,
-                )
-            })
-        });
-        let device: Box<dyn Device> = {
-            let source = IndependentSource::new(
-                &instance.name,
-                terminals,
-                instance.designator == 'v',
-                value,
-                Complex::new(
-                    mag * phase.to_radians().cos(),
-                    mag * phase.to_radians().sin(),
-                ),
-                waveform.unwrap_or(Waveform::Constant(value)),
-            )?
-            .with_power_tone(tone)
-            .with_ac_given(ac_given)
-            .with_sensitivity_inputs(crate::devices::sensitivity::SourceInputs {
-                dc_given,
-                function_given: waveform_given,
-                ac: ac_given.then_some((mag, phase)),
-            })
+        let source = excitation
+            .bind(&instance.name, terminals)
             .with_distortion(distortion[0], distortion[1])?;
-            // Only V cards accept port setters (parser and allow-list above).
-            match rf {
-                Some(rf) => Box::new(source.with_port(rf)?),
-                None => Box::new(source),
-            }
+        let device: Box<dyn Device> = match rf {
+            Some(rf) => Box::new(source.with_port(rf.bind(instance, nodes)?)?),
+            // A PORT setter without an enabled port still selects C's
+            // zero-amplitude function; no second tone calculation is needed.
+            None => Box::new(source.with_power_tone(power_function.then_some((0., 0.)))),
         };
         Ok(device)
     })
 }
 
+struct PortInput {
+    number: usize,
+    z0: Real,
+    power: Real,
+    frequency: Real,
+    phase: Real,
+    power_function: bool,
+}
+
+impl PortInput {
+    fn bind(
+        self,
+        instance: &DeviceInstance,
+        nodes: &mut NodeAppend<'_>,
+    ) -> SpiceResult<crate::devices::RfPort> {
+        let name = format!("{}#res", instance.name);
+        if nodes.get(&name).is_some() {
+            return Err(SpiceError::circuit(format!(
+                "RF port internal-node name collision: {name}"
+            )));
+        }
+        let internal = nodes.intern(&name)?;
+        nodes.set_kind(internal, NodeKind::Internal)?;
+        Ok(crate::devices::RfPort {
+            number: self.number,
+            z0: self.z0,
+            internal,
+            power: self.power,
+            frequency: self.frequency,
+            phase: self.phase,
+            power_function: self.power_function,
+        })
+    }
+}
+
 /// The ordered RFSPICE port setters of one V card (`vsrcpar.c`), resolved by
-/// [`PortSetters::finish`] with `vsrctemp.c`'s rules.
+/// [`PortSetters::resolve`] with `vsrctemp.c`'s rules.
 #[derive(Debug, Default)]
 struct PortSetters {
     number: Option<(i64, SourceLoc)>,
@@ -558,10 +552,10 @@ struct PortSetters {
 }
 
 impl PortSetters {
-    fn set(&mut self, name: &str, number: Real, at: &SourceLoc) -> SpiceResult<()> {
+    fn set(&mut self, setter: PortSetter, number: Real, at: &SourceLoc) -> SpiceResult<()> {
         self.any.get_or_insert_with(|| at.clone());
-        match name {
-            "portnum" => {
+        match setter {
+            PortSetter::Number => {
                 // INPgetValue(IF_INTEGER): (int) floor(0.5 + value).
                 let rounded = crate::primitives::c_integer(number).ok_or_else(|| {
                     SpiceError::Unsupported {
@@ -576,31 +570,27 @@ impl PortSetters {
                     self.z0 = 50.;
                 }
             }
-            "z0" => {
+            PortSetter::Impedance => {
                 self.z0 = number;
                 self.z0_given = true;
             }
-            "pwr" => {
+            PortSetter::Power => {
                 self.power = Some(number);
                 self.power_function = Some(at.clone());
             }
-            "freq" => {
+            PortSetter::Frequency => {
                 self.frequency = Some(number);
                 self.power_function = Some(at.clone());
             }
-            _ => self.phase = Some(number),
+            PortSetter::Phase => self.phase = Some(number),
         }
         Ok(())
     }
 
     /// `vsrctemp.c`: a source is a port when `portnum` was given, is positive
-    /// and its `z0` (50 when not given) is positive. Creates the port's
-    /// internal `<name>#res` node in `nodes` (`vsrcset.c` `CKTmkVolt`).
-    fn finish(
-        self,
-        instance: &DeviceInstance,
-        nodes: &mut NodeTable,
-    ) -> SpiceResult<Option<crate::devices::RfPort>> {
+    /// and its `z0` (50 when not given) is positive. This resolves the
+    /// setters before the port's internal node is allocated.
+    fn resolve(self, instance: &DeviceInstance) -> SpiceResult<Option<PortInput>> {
         let Some(at) = self.any else {
             return Ok(None);
         };
@@ -620,18 +610,9 @@ impl PortSetters {
                 location: Some(at),
             });
         }
-        let name = format!("{}#res", instance.name);
-        if nodes.get(&name).is_some() {
-            return Err(SpiceError::circuit(format!(
-                "RF port internal-node name collision: {name}"
-            )));
-        }
-        let internal = nodes.intern(&name)?;
-        nodes.set_kind(internal, NodeKind::Internal);
-        Ok(Some(crate::devices::RfPort {
+        Ok(Some(PortInput {
             number,
             z0,
-            internal,
             power: self.power.unwrap_or(1e-3),
             frequency: self.frequency.unwrap_or(1e9),
             phase: self.phase.unwrap_or(0.),
@@ -680,9 +661,15 @@ fn source_waveform(
     source: &SourceWaveform,
     setter: &SourceLoc,
 ) -> SpiceResult<Waveform> {
-    match (name, source) {
-        (_, SourceWaveform::Function(f)) => function_waveform(f, setter),
-        ("pulse", SourceWaveform::Pulse(p)) => {
+    if WaveformKind::from_keyword(name) != Some(source.kind()) {
+        return Err(SpiceError::parse(
+            setter.clone(),
+            format!("source waveform '{name}' does not match its typed coefficients"),
+        ));
+    }
+    match source {
+        SourceWaveform::Function(f) => function_waveform(f, setter),
+        SourceWaveform::Pulse(p) => {
             let optional = |v: &Option<PositionedValue>, what| v.as_ref().map(|v| field(v, what));
             let spec = PulseSpec {
                 initial: field(&p.initial, "pulse v1")?,
@@ -700,24 +687,22 @@ fn source_waveform(
                 .map_err(|e| waveform_error(&p.initial, &e))?;
             Ok(waveform)
         }
-        ("pwl", SourceWaveform::Pwl(points)) => {
+        SourceWaveform::Pwl(points) => {
             let knots = points
                 .iter()
                 .map(|p| Ok((field(&p.time, "pwl time")?, field(&p.value, "pwl value")?)))
                 .collect::<SpiceResult<Vec<_>>>()?;
             let waveform = Waveform::Pwl(knots);
-            if let Some(first) = points.first() {
-                waveform.validate().map_err(|_| SpiceError::Unsupported {
-                    feature: "PWL times must be nonnegative and strictly increasing".to_string(),
-                    location: Some(first.time.location.clone()),
-                })?;
-            }
+            waveform.validate().map_err(|_| SpiceError::Unsupported {
+                feature: "PWL times must be nonnegative and strictly increasing".to_owned(),
+                location: Some(
+                    points
+                        .first()
+                        .map_or_else(|| setter.clone(), |p| p.time.location.clone()),
+                ),
+            })?;
             Ok(waveform)
         }
-        _ => Err(SpiceError::not_yet_ported(
-            format!("source waveform '{name}'"),
-            "src/spicelib/devices/vsrc/vsrcload.c",
-        )),
     }
 }
 
@@ -794,5 +779,254 @@ fn waveform_error(at: &PositionedValue, error: &SpiceError) -> SpiceError {
     SpiceError::Unsupported {
         feature: error.to_string(),
         location: Some(at.location.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::netlist::source::parse_deck_text;
+    use std::path::Path;
+
+    #[test]
+    fn source_setters_are_ordered_and_bad_ast_does_not_bind_nodes() {
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("source.cir"),
+                "title\nv1 a 0 dc 0 ac 0 portnum=1 z0=75 pwr=1m\n.end\n",
+            ))
+            .unwrap();
+        let instance = &deck.devices[0];
+        let input = parse_source_setters(instance).unwrap();
+        let ac = input
+            .inputs
+            .ac
+            .expect("explicit AC magnitude must be retained");
+        assert_eq!(ac.magnitude.map(f64::to_bits), Some(0_f64.to_bits()));
+        assert_eq!(ac.phase.map(f64::to_bits), Some(0_f64.to_bits()));
+        assert!(input.port.power_function.is_some());
+        let mut nodes = NodeTable::new();
+        let existing = nodes.intern("v1#res").unwrap();
+        nodes.set_kind(existing, NodeKind::Internal);
+        let before = nodes.nodes().to_vec();
+        let error = nodes
+            .transaction(|nodes| instantiate_source(instance, nodes))
+            .unwrap_err();
+        assert!(error.to_string().contains("collision"));
+        assert_eq!(nodes.nodes(), before);
+
+        let mut malformed = instance.clone();
+        let mut invalid = malformed.parameters[0].clone();
+        invalid.name = "acmag".into();
+        invalid.value = "not-a-number".into();
+        malformed.parameters.insert(0, invalid);
+        let error = nodes
+            .transaction(|nodes| instantiate_source(&malformed, nodes))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("non-finite or nonliteral acmag"),
+            "{error}"
+        );
+        assert_eq!(nodes.nodes(), before);
+
+        let mut nodes = NodeTable::new();
+        let source = nodes
+            .transaction(|nodes| instantiate_source(instance, nodes))
+            .unwrap();
+        let port = source.rf_port().unwrap();
+        assert_eq!(port.z0.to_bits(), 75_f64.to_bits());
+        assert_eq!(port.internal, nodes.get("v1#res").unwrap());
+    }
+    #[test]
+    fn waveform_alias_uses_shared_kind_and_mismatched_ast_is_rejected() {
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("waveform-alias.cir"),
+                "title\nv1 a 0 sine(0 1 1k)\n.end\n",
+            ))
+            .unwrap();
+        let mut instance = deck.devices[0].clone();
+        assert!(
+            NodeTable::new()
+                .transaction(|nodes| instantiate_source(&instance, nodes))
+                .is_ok()
+        );
+        let parameter = instance
+            .parameters
+            .iter_mut()
+            .find(|p| matches!(p.kind, ParameterKind::Waveform(_)))
+            .unwrap();
+        parameter.name = "exp".to_owned();
+        let mut nodes = NodeTable::new();
+        let before = nodes.nodes().to_vec();
+        let error = nodes
+            .transaction(|nodes| instantiate_source(&instance, nodes))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its typed coefficients")
+        );
+        assert_eq!(nodes.nodes(), before);
+    }
+
+    #[test]
+    fn late_semiconductor_collisions_rollback_factory_and_enclosing_batch() {
+        use crate::devices::{ModelContext, ModelResolver};
+        let context = ModelContext::default();
+        for (card, model) in [
+            ("q1 c b e test", "npn rc=2 rb=10 re=1"),
+            ("j1 d g s test", "njf rd=10 rs=20"),
+            ("j1 d g s test", "njf level=2 rd=10 rs=20"),
+            ("z1 d g s test", "nmf level=1 rd=10 rs=20"),
+            ("z1 d g s test", "nmf level=2 rd=10 rs=20 rg=30"),
+            ("z1 d g s test", "nhfet level=5 rd=10 rs=20 rg=30"),
+            ("z1 d g s test", "nhfet level=6 rd=10 rs=20"),
+            ("m1 d g s b test l=1u w=10u", "nmos level=1 rd=10 rs=20"),
+            (
+                "m1 d g s b test l=1u w=10u nrd=2 nrs=3",
+                "nmos level=8 rsh=10",
+            ),
+            ("m1 d g s b test l=1u w=10u", "nmos level=14 rdsmod=1"),
+            ("d1 a b test", "d rs=10"),
+        ] {
+            let deck = Parser::new()
+                .parse_deck(&parse_deck_text(
+                    Path::new("node-rollback.cir"),
+                    &format!("t\n{card}\n.model test {model}\n.end\n"),
+                ))
+                .unwrap();
+            let instance = &deck.devices[0];
+            let models = ModelResolver::new(&deck.models).unwrap();
+            let mut clean = NodeTable::new();
+            let device = clean
+                .transaction(|nodes| instantiate_with_models(instance, nodes, &models, &context))
+                .unwrap_or_else(|error| panic!("{model}: {error}"));
+            let collision = clean
+                .nodes()
+                .iter()
+                .rev()
+                .find(|node| node.kind == NodeKind::Internal)
+                .unwrap_or_else(|| panic!("{model}: no internal nodes"))
+                .name
+                .clone();
+            assert!(device.terminals().len() > instance.nodes.len());
+            let mut table = NodeTable::new();
+            // A pre-existing mixed-case internal name and an ordinary terminal.
+            let existing = table.intern(&collision.to_ascii_uppercase()).unwrap();
+            table.set_kind(existing, NodeKind::BranchCurrent);
+            table.intern("keep").unwrap();
+            let before = table.nodes().to_vec();
+            table
+                .transaction(|parent| {
+                    let parent_id = parent.intern("parent")?;
+                    let parent_before = parent.nodes().to_vec();
+                    let error =
+                        instantiate_with_models(instance, parent, &models, &context).unwrap_err();
+                    assert!(error.to_string().contains("collision"), "{model}: {error}");
+                    assert_eq!(parent.nodes(), parent_before, "{model}");
+                    assert_eq!(parent.get(&collision), Some(existing));
+                    assert_eq!(parent.get("PARENT"), Some(parent_id));
+                    assert_eq!(parent.get("gnd"), Some(crate::primitives::NodeId::GROUND));
+                    Err::<(), _>(SpiceError::circuit("enclosing batch failed"))
+                })
+                .unwrap_err();
+            assert_eq!(table.nodes(), before, "{model}");
+            // The enclosing circuit transaction rolls back a successfully
+            // constructed device too, including its internal nodes.
+            let mut empty = NodeTable::new();
+            let before = empty.nodes().to_vec();
+            empty
+                .transaction(|parent| {
+                    let device = instantiate_with_models(instance, parent, &models, &context)?;
+                    assert_eq!(parent.nodes(), clean.nodes(), "{model}");
+                    assert!(device.terminals().len() > instance.nodes.len());
+                    Err::<(), _>(SpiceError::circuit("later card failed"))
+                })
+                .unwrap_err();
+            assert_eq!(empty.nodes(), before);
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in semiconductor elaboration scaling benchmark"]
+    fn semiconductor_node_transaction_scaling() {
+        use crate::devices::{ModelContext, ModelResolver};
+        use std::hint::black_box;
+        use std::time::Instant;
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("node-bench.cir"),
+                "t\nj1 d g s jm\n.model jm njf rd=10 rs=20\n.end\n",
+            ))
+            .unwrap();
+        let resolver = ModelResolver::new(&deck.models).unwrap();
+        let context = ModelContext::default();
+        for count in [1_000_u32, 10_000, 100_000] {
+            let instance_template = &deck.devices[0];
+            let instances: Vec<_> = (0..count)
+                .map(|index| {
+                    let mut instance = instance_template.clone();
+                    instance.name = format!("j{index:06}");
+                    instance.nodes = ["d", "g", "s"]
+                        .map(|prefix| format!("{prefix}{index:06}"))
+                        .to_vec();
+                    instance
+                })
+                .collect();
+            let mut table = NodeTable::new();
+            let start = Instant::now();
+            table
+                .transaction(|nodes| {
+                    for instance in &instances {
+                        black_box(instantiate_with_models(
+                            instance, nodes, &resolver, &context,
+                        )?);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let elapsed = start.elapsed();
+            assert_eq!(table.len(), 1 + 5 * count as usize);
+            // Every old clone copied each existing Node plus each map key/id
+            // and both name strings. Count logical payload bytes, excluding
+            // allocator and hash bucket overhead. New internal names are
+            // fixed width, so the old cumulative copy traffic is exact.
+            let n = u64::from(count);
+            let copied_entries = n + 5 * n * (n - 1) / 2;
+            let entry_size = (std::mem::size_of::<crate::primitives::Node>()
+                + std::mem::size_of::<(String, crate::primitives::NodeId)>())
+                as u64;
+            let names_per_device = table.nodes()[1..6]
+                .iter()
+                .map(|node| node.name.len() as u64)
+                .sum::<u64>();
+            let cloned_bytes =
+                entry_size * copied_entries + 2 * (n + names_per_device * n * (n - 1) / 2);
+            println!(
+                "{count} instances, {} nodes: transaction {elapsed:?}, old clone path {copied_entries} existing nodes plus map entries, >= {cloned_bytes} copied bytes, new path 0 existing entries copied",
+                table.len()
+            );
+            if count <= 10_000 {
+                let mut baseline = NodeTable::new();
+                let start = Instant::now();
+                for instance in &instances {
+                    // Reconstruct the removed clone-and-replace operation,
+                    // keeping the same factory body and model validation.
+                    let mut cloned = baseline.clone();
+                    cloned
+                        .transaction(|nodes| {
+                            instantiate_with_models(instance, nodes, &resolver, &context)
+                        })
+                        .unwrap();
+                    baseline = cloned;
+                }
+                println!(
+                    "{count} instances: clone-and-replace baseline {:?}",
+                    start.elapsed()
+                );
+                assert_eq!(table.nodes(), baseline.nodes());
+            }
+        }
     }
 }

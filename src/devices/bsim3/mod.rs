@@ -178,7 +178,7 @@ impl ModelParameters {
     ) -> SpiceResult<setup::ModelSetup> {
         let defaults = self.model_defaults(context)?;
         let temperature = defaults.at_temperature(context.temperature, location)?;
-        setup::ModelSetup::new(defaults, temperature)
+        Ok(setup::ModelSetup::new(defaults, temperature))
     }
 
     /// Apply reversed model-level instance defaults, then instance setters
@@ -266,7 +266,7 @@ pub fn model_parameters(model: &ResolvedModel<'_>) -> SpiceResult<ModelParameter
 /// circuit: the missing setup/load is an explicit factory error.
 pub(crate) fn instantiate(
     instance: &DeviceInstance,
-    nodes: &mut crate::primitives::NodeTable,
+    nodes: &mut crate::primitives::NodeAppend<'_>,
     model: &ResolvedModel<'_>,
     context: &crate::devices::ModelContext,
 ) -> SpiceResult<Box<dyn crate::devices::Device>> {

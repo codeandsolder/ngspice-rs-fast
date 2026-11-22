@@ -13,3 +13,5 @@ workspace = true
 
 [dependencies]
 ngspice-rs = { path = ".." }
+ngspice-conformance = { path = "../conformance/support" }
+syn = { version = "3", features = ["full", "visit"] }

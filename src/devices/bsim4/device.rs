@@ -30,7 +30,7 @@ use crate::devices::schema::temperature_kelvin;
 use crate::devices::state::IterationPhase;
 use crate::devices::traits::{AnalysisMode, ConvergenceContext, Device, StampContext};
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// One temperature's setup: the model after `b4set.c` and `b4temp.c`, this
 /// instance after both, and its size-dependent parameters.
@@ -120,11 +120,7 @@ impl Shared {
     fn live_copy(&self, prepared: &Rc<Prepared>) -> Instance {
         match &self.live {
             Some((owner, h)) if Rc::ptr_eq(owner, prepared) => h.clone(),
-            Some((_, h)) => {
-                let mut fresh = prepared.instance.clone();
-                carry_load_members(h, &mut fresh);
-                fresh
-            }
+            Some((_, h)) => prepared.instance.with_previous_load_state(h),
             None => prepared.instance.clone(),
         }
     }
@@ -165,7 +161,7 @@ impl Bsim4 {
     /// Invalid input, setup or temperature failures, node name collisions.
     pub(crate) fn instantiate(
         instance: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         model: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -199,43 +195,44 @@ impl Bsim4 {
             context.nominal_temperature,
             Some(setup),
         )?;
-        let mut staged = nodes.clone();
-        let external: Vec<NodeId> = instance
-            .nodes
-            .iter()
-            .map(|n| staged.intern(n))
-            .collect::<SpiceResult<Vec<_>>>()?;
-        device.terminals.clone_from(&external);
-        for (local, id) in [node::D, node::G_EXT, node::S, node::B]
-            .into_iter()
-            .zip(external)
-        {
-            let index = usize::try_from(local)
-                .ok()
-                .filter(|&i| i < node::COUNT)
-                .ok_or_else(|| {
-                    SpiceError::circuit("BSIM4 setup mapped an invalid external node")
-                })?;
-            device.nodes[index] = id;
-        }
-        for &(local, suffix) in &created {
-            let name = format!("{}#{suffix}", instance.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "{}: internal node name collision: {name}",
-                    instance.name
-                )));
+        nodes.transaction(|staged| {
+            let external: Vec<NodeId> = instance
+                .nodes
+                .iter()
+                .map(|n| staged.intern(n))
+                .collect::<SpiceResult<Vec<_>>>()?;
+            device.terminals.clone_from(&external);
+            for (local, id) in [node::D, node::G_EXT, node::S, node::B]
+                .into_iter()
+                .zip(external)
+            {
+                let index = usize::try_from(local)
+                    .ok()
+                    .filter(|&i| i < node::COUNT)
+                    .ok_or_else(|| {
+                        SpiceError::circuit("BSIM4 setup mapped an invalid external node")
+                    })?;
+                device.nodes[index] = id;
             }
-            let id = staged.intern(&name)?;
-            staged.set_kind(id, NodeKind::Internal);
-            let index = usize::try_from(local)
-                .ok()
-                .filter(|&i| i < node::COUNT)
-                .ok_or_else(|| SpiceError::circuit("BSIM4 setup created an invalid node"))?;
-            device.nodes[index] = id;
-            device.terminals.push(id);
-        }
-        *nodes = staged;
+            for &(local, suffix) in &created {
+                let name = format!("{}#{suffix}", instance.name);
+                if staged.get(&name).is_some() {
+                    return Err(SpiceError::circuit(format!(
+                        "{}: internal node name collision: {name}",
+                        instance.name
+                    )));
+                }
+                let id = staged.intern(&name)?;
+                staged.set_kind(id, NodeKind::Internal)?;
+                let index = usize::try_from(local)
+                    .ok()
+                    .filter(|&i| i < node::COUNT)
+                    .ok_or_else(|| SpiceError::circuit("BSIM4 setup created an invalid node"))?;
+                device.nodes[index] = id;
+                device.terminals.push(id);
+            }
+            Ok(())
+        })?;
         device.shared.borrow_mut().setups.push(Rc::new(prepared));
         Ok(Box::new(device))
     }
@@ -571,139 +568,6 @@ impl Prepared {
     fn model_temperature(&self) -> Real {
         self.temperature + 273.15
     }
-}
-
-/// Every `here->` member `b4ld.c` writes (`load.rs`), copied from C's
-/// instance struct as the last load left it onto a freshly temperature-
-/// processed one: C runs `BSIM4temp` on its single struct, which rewrites
-/// the temperature-derived members and leaves these (the next load reads
-/// `BSIM4von` for `DEVfetlim`).
-const fn carry_load_members(from: &Instance, to: &mut Instance) {
-    carry_charge_members(from, to);
-    carry_current_members(from, to);
-}
-
-/// Charge, capacitance and charge-relaxation results left by the load.
-const fn carry_charge_members(from: &Instance, to: &mut Instance) {
-    to.Coxeff = from.Coxeff;
-    to.capbd = from.capbd;
-    to.capbs = from.capbs;
-    to.cbbb = from.cbbb;
-    to.cbdb = from.cbdb;
-    to.cbgb = from.cbgb;
-    to.cbsb = from.cbsb;
-    to.cdbb = from.cdbb;
-    to.cddb = from.cddb;
-    to.cdgb = from.cdgb;
-    to.cdsb = from.cdsb;
-    to.cgbb = from.cgbb;
-    to.cgdb = from.cgdb;
-    to.cgdo = from.cgdo;
-    to.cggb = from.cggb;
-    to.cgsb = from.cgsb;
-    to.cgso = from.cgso;
-    to.cqbb = from.cqbb;
-    to.cqdb = from.cqdb;
-    to.cqgb = from.cqgb;
-    to.cqsb = from.cqsb;
-    to.csbb = from.csbb;
-    to.csdb = from.csdb;
-    to.csgb = from.csgb;
-    to.cssb = from.cssb;
-    to.gtau = from.gtau;
-    to.gtb = from.gtb;
-    to.gtd = from.gtd;
-    to.gtg = from.gtg;
-    to.gts = from.gts;
-    to.qbulk = from.qbulk;
-    to.qchqs = from.qchqs;
-    to.qdrn = from.qdrn;
-    to.qgate = from.qgate;
-    to.qgdo = from.qgdo;
-    to.qgso = from.qgso;
-    to.qinv = from.qinv;
-    to.qsrc = from.qsrc;
-    to.taunet = from.taunet;
-}
-
-/// Current, conductance and remaining operating-point results left by the load.
-const fn carry_current_members(from: &Instance, to: &mut Instance) {
-    to.AbovVgst2Vtm = from.AbovVgst2Vtm;
-    to.Abulk = from.Abulk;
-    to.EsatL = from.EsatL;
-    to.IdovVds = from.IdovVds;
-    to.Igb = from.Igb;
-    to.Igcd = from.Igcd;
-    to.Igcs = from.Igcs;
-    to.Igd = from.Igd;
-    to.Igidl = from.Igidl;
-    to.Igisl = from.Igisl;
-    to.Igs = from.Igs;
-    to.Vdseff = from.Vdseff;
-    to.Vgsteff = from.Vgsteff;
-    to.cbd = from.cbd;
-    to.cbs = from.cbs;
-    to.cd = from.cd;
-    to.csub = from.csub;
-    to.dvgd_eff_dvg = from.dvgd_eff_dvg;
-    to.dvgs_eff_dvg = from.dvgs_eff_dvg;
-    to.gIgbb = from.gIgbb;
-    to.gIgbd = from.gIgbd;
-    to.gIgbg = from.gIgbg;
-    to.gIgbs = from.gIgbs;
-    to.gIgcdb = from.gIgcdb;
-    to.gIgcdd = from.gIgcdd;
-    to.gIgcdg = from.gIgcdg;
-    to.gIgcds = from.gIgcds;
-    to.gIgcsb = from.gIgcsb;
-    to.gIgcsd = from.gIgcsd;
-    to.gIgcsg = from.gIgcsg;
-    to.gIgcss = from.gIgcss;
-    to.gIgdd = from.gIgdd;
-    to.gIgdg = from.gIgdg;
-    to.gIgsg = from.gIgsg;
-    to.gIgss = from.gIgss;
-    to.gbbs = from.gbbs;
-    to.gbd = from.gbd;
-    to.gbds = from.gbds;
-    to.gbgs = from.gbgs;
-    to.gbs = from.gbs;
-    to.gcrg = from.gcrg;
-    to.gcrgb = from.gcrgb;
-    to.gcrgd = from.gcrgd;
-    to.gcrgg = from.gcrgg;
-    to.gcrgs = from.gcrgs;
-    to.gds = from.gds;
-    to.gdtot = from.gdtot;
-    to.gdtotb = from.gdtotb;
-    to.gdtotd = from.gdtotd;
-    to.gdtotg = from.gdtotg;
-    to.gdtots = from.gdtots;
-    to.ggidlb = from.ggidlb;
-    to.ggidld = from.ggidld;
-    to.ggidlg = from.ggidlg;
-    to.ggidls = from.ggidls;
-    to.ggislb = from.ggislb;
-    to.ggisld = from.ggisld;
-    to.ggislg = from.ggislg;
-    to.ggisls = from.ggisls;
-    to.gm = from.gm;
-    to.gmbs = from.gmbs;
-    to.grdsw = from.grdsw;
-    to.gstot = from.gstot;
-    to.gstotb = from.gstotb;
-    to.gstotd = from.gstotd;
-    to.gstotg = from.gstotg;
-    to.gstots = from.gstots;
-    to.mode = from.mode;
-    to.noiGd0 = from.noiGd0;
-    to.nstar = from.nstar;
-    to.thetavth = from.thetavth;
-    to.ueff = from.ueff;
-    to.vdsat = from.vdsat;
-    to.vgd_eff = from.vgd_eff;
-    to.vgs_eff = from.vgs_eff;
-    to.von = from.von;
 }
 
 /// C's `CKTmode` for a load, and whether limiting is allowed.
@@ -1616,6 +1480,8 @@ mod tests {
             model: Model::default(),
             instance: Instance {
                 l: length,
+                cgdo: length * 2.,
+                cgso: length * 3.,
                 ..Instance::default()
             },
             size: SizeParam::default(),
@@ -1656,6 +1522,41 @@ mod tests {
     }
 
     #[test]
+    fn ownership_projection_covers_every_instance_member() {
+        let mut prepared = Instance::default();
+        let mut previous = Instance::default();
+        previous.seed_test_members();
+        prepared.cgdo = -0.;
+        previous.gm = f64::from_bits(0x7ff8_0000_0000_0001);
+        let projected = prepared.with_previous_load_state(&previous);
+        let fresh_values = prepared.to_values();
+        let previous_values = previous.to_values();
+        let actual = projected.to_values();
+        for (index, name) in Instance::MEMBERS.iter().enumerate() {
+            let carries = Instance::LOAD_WRITES.contains(name)
+                && !Instance::SETUP_WRITES.contains(name)
+                && !Instance::TEMPERATURE_WRITES.contains(name)
+                && !Instance::CHECK_WRITES.contains(name);
+            let expected = if carries {
+                previous_values[index]
+            } else {
+                fresh_values[index]
+            };
+            assert_eq!(actual[index].to_bits(), expected.to_bits(), "{name}");
+        }
+        assert_eq!(projected.cgdo.to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(projected.gm.to_bits(), previous.gm.to_bits());
+        let overlap: Vec<_> = Instance::LOAD_WRITES
+            .iter()
+            .copied()
+            .filter(|member| Instance::TEMPERATURE_WRITES.contains(member))
+            .collect();
+        assert_eq!(overlap.len(), 2);
+        assert!(overlap.contains(&"BSIM4cgdo"));
+        assert!(overlap.contains(&"BSIM4cgso"));
+    }
+
+    #[test]
     fn live_snapshot_changes_keep_load_members_not_geometry() {
         let first = prepared(1e-6);
         let second = prepared(2e-6);
@@ -1663,6 +1564,8 @@ mod tests {
         let live = shared.live_instance(&first).unwrap();
         live.gm = 0.123;
         live.qgate = 0.456;
+        live.cgdo = 123.;
+        live.cgso = 456.;
         assert_eq!(
             shared.live_instance(&first).unwrap().gm.to_bits(),
             0.123_f64.to_bits()
@@ -1671,6 +1574,8 @@ mod tests {
         assert_eq!(probe.gm.to_bits(), 0.123_f64.to_bits());
         assert_eq!(probe.qgate.to_bits(), 0.456_f64.to_bits());
         assert_eq!(probe.l.to_bits(), 2e-6_f64.to_bits());
+        assert_eq!(probe.cgdo.to_bits(), second.instance.cgdo.to_bits());
+        assert_eq!(probe.cgso.to_bits(), second.instance.cgso.to_bits());
         probe.gm = 0.456;
         assert_eq!(probe.gm.to_bits(), 0.456_f64.to_bits());
         assert_eq!(shared.live_copy(&first).gm.to_bits(), 0.123_f64.to_bits());
@@ -1678,5 +1583,11 @@ mod tests {
         assert_eq!(live.l.to_bits(), 2e-6_f64.to_bits());
         assert_eq!(live.gm.to_bits(), 0.123_f64.to_bits());
         assert_eq!(second.instance.gm.to_bits(), 0.0_f64.to_bits());
+        live.gm = 0.789;
+        live.cgdo = 789.;
+        let live = shared.live_instance(&first).unwrap();
+        assert_eq!(live.gm.to_bits(), 0.789_f64.to_bits());
+        assert_eq!(live.cgdo.to_bits(), first.instance.cgdo.to_bits());
+        assert_eq!(live.cgso.to_bits(), first.instance.cgso.to_bits());
     }
 }

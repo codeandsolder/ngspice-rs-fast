@@ -128,7 +128,7 @@ pub(super) fn run(
                     matrix,
                 ))
             })?;
-        let mut point = Vec::with_capacity(plot.variables.len());
+        let mut point = Vec::with_capacity(plot.variables().len());
         point.push(Complex::real(f));
         point.extend(last);
         for matrix in &matrices {
@@ -159,25 +159,26 @@ pub(super) fn run(
 
 /// Schema in the same order as the per-frequency point assembly.
 fn parameter_plot(circuit: &Circuit, port_count: usize, donoise: bool) -> SpiceResult<Plot> {
-    let mut plot = plot(
+    let plot = plot(
         circuit,
         "sp1",
         "SP Analysis",
         Some(("frequency", "frequency")),
         true,
     )?;
+    let mut variables = plot.variables().to_vec();
     for (prefix, unit) in [("S", "s-param"), ("Y", "admittance"), ("Z", "impedance")] {
         for i in 1..=port_count {
             for j in 1..=port_count {
-                plot.push_variable(Variable::complex(format!("{prefix}_{i}_{j}"), unit));
+                variables.push(Variable::complex(format!("{prefix}_{i}_{j}"), unit));
             }
         }
     }
-    plot.push_variable(Variable::complex("v(Rbase)", "voltage"));
+    variables.push(Variable::complex("v(Rbase)", "voltage"));
     if donoise {
         for i in 1..=port_count {
             for j in 1..=port_count {
-                plot.push_variable(Variable::complex(format!("i(Cy_{i}_{j})"), "current"));
+                variables.push(Variable::complex(format!("i(Cy_{i}_{j})"), "current"));
             }
         }
         if port_count == 2 {
@@ -187,11 +188,16 @@ fn parameter_plot(circuit: &Circuit, port_count: usize, donoise: bool) -> SpiceR
                 ("NFmin", "decibel"),
                 ("Rn", "impedance"),
             ] {
-                plot.push_variable(Variable::complex(name, unit));
+                variables.push(Variable::complex(name, unit));
             }
         }
     }
-    Ok(plot)
+    Ok(Plot::new(
+        plot.name.clone(),
+        plot.plotname.clone(),
+        plot.flags(),
+        variables,
+    ))
 }
 
 /// The circuit's RF ports in port-number order, bound to their rows.
@@ -321,7 +327,7 @@ fn noise_parameters(
     generators: &[crate::devices::noise::InstanceNoise],
     context: &crate::analysis::AnalysisContext,
 ) -> SpiceResult<Vec<Complex>> {
-    use crate::devices::noise::{BOLTZMANN, NoiseKind};
+    use crate::devices::noise::BOLTZMANN;
     let count = ports.len();
     let n = circuit.unknown_count();
     let mut adjoints = Vec::with_capacity(count);
@@ -338,19 +344,9 @@ fn noise_parameters(
     let mut cy = DenseComplex::zeros(count)?;
     for instance in generators {
         for source in &instance.sources {
-            if matches!(
-                source.kind,
-                NoiseKind::Flicker { .. } | NoiseKind::Gain { .. }
-            ) {
+            let Some(amplitude) = source.kind.rf_amplitude()? else {
                 continue;
-            }
-            if matches!(source.kind, NoiseKind::CorrelatedThermal { .. }) {
-                return Err(SpiceError::not_yet_ported(
-                    "correlated (NevalSrc2) noise in S-parameter noise analysis",
-                    "src/spicelib/analysis/nevalsrc.c (NevalSrc2, RFSPICE branch)",
-                ));
-            }
-            let density = source.kind.output_density(1., 1.);
+            };
             let mut voltage = Vec::with_capacity(count);
             for adjoint in &adjoints {
                 let at = |node| {
@@ -359,9 +355,8 @@ fn noise_parameters(
                         .node_row(node)
                         .map_or(Complex::ZERO, |r| adjoint[r])
                 };
-                voltage.push(
-                    (at(source.nodes[0]) - at(source.nodes[1])) * Complex::real(density.sqrt()),
-                );
+                voltage
+                    .push((at(source.nodes[0]) - at(source.nodes[1])) * Complex::real(amplitude));
             }
             let mut current = vec![Complex::ZERO; count];
             for i in 0..count {

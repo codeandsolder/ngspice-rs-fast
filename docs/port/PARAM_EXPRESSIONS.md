@@ -84,8 +84,8 @@ parentheses; spaces inside `(...)` and `{...}` are kept. The port applies this
 rule to every card. C is more permissive on a card with a single assignment
 (`.param a = 1 + 2` works there; with several assignments `b = a * 3` silently
 means `b = a`), so here such input is an explicit error that tells you to use
-`{...}`. Continuation lines are joined first; reported columns are byte columns
-in the joined card, like all token locations.
+`{...}`. Continuation lines are joined for grammar recognition, but reported positions
+retain their physical source line and one-based UTF-8 byte column.
 
 `.param` cards in a `.subckt` body are stored in `Subcircuit::params` and
 referenced as `ScopedCardKind::Param(index)` in that scope; the root uses
@@ -195,7 +195,7 @@ Remaining limits: no comparison/ternary operators or random functions.
 `BinaryOp`, `Function`, `SourceSpan`, `MAX_NESTING`. Cards:
 `Netlist::params`/`Subcircuit::params: Vec<ParamCard>`, each with
 `assignments: Vec<ParamAssignment { name, name_span, expression }>`.
-`Parser::parse_expression(text, &SourceLoc)` parses a standalone expression.
+`netlist::parse_parameter_expression(text, &SourceLoc)` parses a standalone expression.
 
 ## `.func` and quoted values (#107)
 

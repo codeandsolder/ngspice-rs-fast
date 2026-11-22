@@ -13,8 +13,7 @@ use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::{AnalysisKind, NodeKind};
 use std::path::Path;
 
-#[path = "../conformance/reference.rs"]
-mod reference;
+use ngspice_conformance::fixtures;
 
 const VT: f64 = (1.38064852e-23 / 1.6021766208e-19) * 300.15;
 
@@ -475,8 +474,8 @@ fn sensitivity(body: &str) -> Plot {
 fn column(plot: &Plot, name: &str) -> f64 {
     let index = plot
         .variable_index(name)
-        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables));
-    plot.points[0][index].re
+        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
+    plot.points()[0][index].re
 }
 
 /// `.sens` over `bjt.c`'s tables (#164): 103 model setters and six instance
@@ -491,7 +490,7 @@ fn sensitivity_covers_the_bjt_tables() {
          rb 4 3 1k\n.model qn npn level=1\n.sens i(vids)",
     );
     let names: Vec<&str> = plot
-        .variables
+        .variables()
         .iter()
         .map(|variable| variable.name.as_str())
         .filter(|name| name.starts_with("v(q1"))
@@ -544,7 +543,7 @@ fn sensitivity_matches_the_reference_on_the_fixture_card() {
          tbf1=0.01 tbf2=1e-5\n\
          .model qp pnp level=1 tnom=50 tbr1=0.02 tbr2=2e-5\n.sens i(vids)",
     );
-    let raw = ngspice_rs::analysis::RawFile::load(reference::golden_path(
+    let raw = ngspice_rs::analysis::RawFile::load(fixtures::golden_path(
         Path::new(env!("CARGO_MANIFEST_DIR")),
         "sens_bjt",
     ))
@@ -552,7 +551,7 @@ fn sensitivity_matches_the_reference_on_the_fixture_card() {
     let expected = &raw.plots[0].plot;
     assert_eq!(plot.variable_count(), expected.variable_count());
     assert_eq!(plot.point_count(), expected.point_count());
-    for variable in &expected.variables {
+    for variable in expected.variables() {
         close(
             column(&plot, &variable.name),
             column(expected, &variable.name),

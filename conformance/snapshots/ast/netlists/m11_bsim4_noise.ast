@@ -63,20 +63,20 @@ scope root
         [3] name="rbodymod" kind=scalar value="1" @netlists/m11_bsim4_noise.cir:12:51
         [4] name="igcmod" kind=scalar value="1" @netlists/m11_bsim4_noise.cir:12:62
         [5] name="igbmod" kind=scalar value="1" @netlists/m11_bsim4_noise.cir:12:71
-        [6] name="xrcrg1" kind=scalar value="12" @netlists/m11_bsim4_noise.cir:12:80
-        [7] name="xrcrg2" kind=scalar value="5" @netlists/m11_bsim4_noise.cir:12:90
-        [8] name="rshg" kind=scalar value="0.4" @netlists/m11_bsim4_noise.cir:12:99
-        [9] name="rbpb" kind=scalar value="5" @netlists/m11_bsim4_noise.cir:12:108
-        [10] name="rbpd" kind=scalar value="15" @netlists/m11_bsim4_noise.cir:12:115
-        [11] name="rbps" kind=scalar value="15" @netlists/m11_bsim4_noise.cir:12:123
-        [12] name="rbdb" kind=scalar value="15" @netlists/m11_bsim4_noise.cir:12:131
-        [13] name="rbsb" kind=scalar value="15" @netlists/m11_bsim4_noise.cir:12:139
-        [14] name="cgso" kind=scalar value="1.5e-10" @netlists/m11_bsim4_noise.cir:12:147
-        [15] name="cgdo" kind=scalar value="1.5e-10" @netlists/m11_bsim4_noise.cir:12:160
-        [16] name="cgbo" kind=scalar value="1e-11" @netlists/m11_bsim4_noise.cir:12:173
-        [17] name="jss" kind=scalar value="1e-4" @netlists/m11_bsim4_noise.cir:12:184
-        [18] name="cjs" kind=scalar value="1e-3" @netlists/m11_bsim4_noise.cir:12:193
-        [19] name="cjsws" kind=scalar value="2e-10" @netlists/m11_bsim4_noise.cir:12:202
+        [6] name="xrcrg1" kind=scalar value="12" @netlists/m11_bsim4_noise.cir:13:3
+        [7] name="xrcrg2" kind=scalar value="5" @netlists/m11_bsim4_noise.cir:13:13
+        [8] name="rshg" kind=scalar value="0.4" @netlists/m11_bsim4_noise.cir:13:22
+        [9] name="rbpb" kind=scalar value="5" @netlists/m11_bsim4_noise.cir:13:31
+        [10] name="rbpd" kind=scalar value="15" @netlists/m11_bsim4_noise.cir:13:38
+        [11] name="rbps" kind=scalar value="15" @netlists/m11_bsim4_noise.cir:13:46
+        [12] name="rbdb" kind=scalar value="15" @netlists/m11_bsim4_noise.cir:13:54
+        [13] name="rbsb" kind=scalar value="15" @netlists/m11_bsim4_noise.cir:13:62
+        [14] name="cgso" kind=scalar value="1.5e-10" @netlists/m11_bsim4_noise.cir:14:3
+        [15] name="cgdo" kind=scalar value="1.5e-10" @netlists/m11_bsim4_noise.cir:14:16
+        [16] name="cgbo" kind=scalar value="1e-11" @netlists/m11_bsim4_noise.cir:14:29
+        [17] name="jss" kind=scalar value="1e-4" @netlists/m11_bsim4_noise.cir:14:40
+        [18] name="cjs" kind=scalar value="1e-3" @netlists/m11_bsim4_noise.cir:14:49
+        [19] name="cjsws" kind=scalar value="2e-10" @netlists/m11_bsim4_noise.cir:14:58
   subcircuits (0):
   analyses (1):
     analysis [0] kind=noise @netlists/m11_bsim4_noise.cir:16:1

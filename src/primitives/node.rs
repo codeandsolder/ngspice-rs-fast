@@ -11,7 +11,7 @@
 //!   space.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::primitives::{SpiceError, SpiceResult};
@@ -36,6 +36,16 @@ impl NodeId {
     #[must_use]
     pub const fn new(index: u32) -> Self {
         Self(index)
+    }
+
+    /// Convert an index without truncating the compact identity.
+    ///
+    /// # Errors
+    /// An index outside the representable node identity range.
+    pub fn from_index(index: usize) -> SpiceResult<Self> {
+        u32::try_from(index)
+            .map(Self)
+            .map_err(|_| SpiceError::circuit("node table exceeds compact identity range"))
     }
 
     /// The raw index, for use as a row/column in the MNA matrix.
@@ -89,10 +99,12 @@ pub struct Node {
 ///
 /// SPICE node names are case-insensitive, so `In`, `IN` and `in` are one node.
 /// Names are stored in canonical lowercase for display and rawfile output.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
 pub struct NodeTable {
     nodes: Vec<Node>,
-    index: BTreeMap<String, NodeId>,
+    // Only lookup/removal use this index; the Vec determines all node order.
+    index: HashMap<String, NodeId>,
     auto_gnd: bool,
 }
 
@@ -114,7 +126,7 @@ impl NodeTable {
             name: GROUND_NAME.to_owned(),
             kind: NodeKind::Ground,
         };
-        let mut index = BTreeMap::new();
+        let mut index = HashMap::new();
         index.insert(GROUND_NAME.to_owned(), NodeId::GROUND);
         Self {
             nodes: vec![ground],
@@ -136,24 +148,54 @@ impl NodeTable {
         Self::canonical(name, auto_gnd).into_owned()
     }
 
-    fn canonical(name: &str, auto_gnd: bool) -> Cow<'_, str> {
+    fn canonical_borrowed(name: &str, auto_gnd: bool) -> Option<&str> {
         if auto_gnd && name.eq_ignore_ascii_case(GROUND_ALIAS) {
-            Cow::Borrowed(GROUND_NAME)
+            Some(GROUND_NAME)
         } else if name
             .bytes()
             .all(|b| b.is_ascii() && !b.is_ascii_uppercase())
         {
-            Cow::Borrowed(name)
+            Some(name)
         } else {
-            // Unicode lowercase includes contextual mappings (e.g. final
-            // sigma), so do not substitute per-character ASCII folding.
-            let lowered = name.to_lowercase();
-            if auto_gnd && lowered == GROUND_ALIAS {
-                Cow::Borrowed(GROUND_NAME)
-            } else {
-                Cow::Owned(lowered)
-            }
+            None
         }
+    }
+
+    fn canonical(name: &str, auto_gnd: bool) -> Cow<'_, str> {
+        if let Some(name) = Self::canonical_borrowed(name, auto_gnd) {
+            return Cow::Borrowed(name);
+        }
+        // Unicode lowercase includes contextual mappings (e.g. final
+        // sigma), so do not substitute per-character ASCII folding.
+        let lowered = name.to_lowercase();
+        if auto_gnd && lowered == GROUND_ALIAS {
+            Cow::Borrowed(GROUND_NAME)
+        } else {
+            Cow::Owned(lowered)
+        }
+    }
+
+    fn try_copy_name(name: &str) -> SpiceResult<String> {
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(name.len())
+            .map_err(|error| SpiceError::circuit(format!("cannot allocate node name: {error}")))?;
+        owned.push_str(name);
+        Ok(owned)
+    }
+
+    fn canonical_for_intern(name: &str, auto_gnd: bool) -> SpiceResult<Cow<'_, str>> {
+        if let Some(name) = Self::canonical_borrowed(name, auto_gnd) {
+            return Ok(Cow::Borrowed(name));
+        }
+        if name.is_ascii() {
+            let mut owned = Self::try_copy_name(name)?;
+            owned.make_ascii_lowercase();
+            return Ok(Cow::Owned(owned));
+        }
+        // The standard library's contextual Unicode lowercase conversion
+        // has no fallible variant. Preserve its exact spelling semantics.
+        Ok(Self::canonical(name, auto_gnd))
     }
 
     /// Returns the id of `name`, creating the node if needed.
@@ -162,54 +204,55 @@ impl NodeTable {
     /// [`NodeTable::set_kind`] to mark simulator-internal nodes.
     ///
     /// # Errors
-    /// The compact node identity space or node storage is exhausted.
+    /// The compact node identity space or node storage is exhausted. On error,
+    /// existing identities and the name index are unchanged. Context-sensitive
+    /// Unicode normalization uses the standard library's infallible allocation.
     pub fn intern(&mut self, name: &str) -> SpiceResult<NodeId> {
-        let canonical = Self::canonical(name, self.auto_gnd);
+        let canonical = Self::canonical_for_intern(name, self.auto_gnd)?;
         if let Some(id) = self.index.get(canonical.as_ref()) {
             return Ok(*id);
         }
-        let canonical = canonical.into_owned();
-        let id = NodeId::new(
-            u32::try_from(self.nodes.len())
-                .map_err(|_| SpiceError::circuit("node table exceeds compact identity range"))?,
-        );
+        let id = NodeId::from_index(self.nodes.len())?;
+        // Reserve both containers and prepare both names before changing
+        // either the ordered nodes or their lookup index.
         self.nodes
             .try_reserve(1)
             .map_err(|error| SpiceError::circuit(format!("cannot allocate node: {error}")))?;
-        let kind = if canonical == GROUND_NAME {
-            NodeKind::Ground
-        } else {
-            NodeKind::Terminal
+        self.index
+            .try_reserve(1)
+            .map_err(|error| SpiceError::circuit(format!("cannot allocate node index: {error}")))?;
+        let node_name = Self::try_copy_name(canonical.as_ref())?;
+        let key = match canonical {
+            Cow::Borrowed(name) => Self::try_copy_name(name)?,
+            Cow::Owned(name) => name,
         };
         self.nodes.push(Node {
             id,
-            name: canonical.clone(),
-            kind,
+            name: node_name,
+            kind: NodeKind::Terminal,
         });
-        self.index.insert(canonical, id);
+        self.index.insert(key, id);
         Ok(id)
     }
 
-    /// Intern a fixed terminal layout transactionally.
-    pub(crate) fn intern_array<const N: usize>(
+    /// Execute a construction transaction: existing node identities and kinds
+    /// cannot be changed, and the appended suffix is discarded on error or unwind.
+    ///
+    /// # Errors
+    /// Propagates the builder's error after restoring the original node table.
+    pub fn transaction<T>(
         &mut self,
-        names: &[String],
-    ) -> SpiceResult<[NodeId; N]> {
-        if names.len() != N {
-            return Err(SpiceError::circuit("invalid terminal layout"));
-        }
+        build: impl FnOnce(&mut NodeAppend<'_>) -> SpiceResult<T>,
+    ) -> SpiceResult<T> {
         let mark = self.len();
-        let mut ids = [NodeId::GROUND; N];
-        for (id, name) in ids.iter_mut().zip(names) {
-            match self.intern(name) {
-                Ok(node) => *id = node,
-                Err(error) => {
-                    self.truncate(mark);
-                    return Err(error);
-                }
-            }
-        }
-        Ok(ids)
+        let mut transaction = NodeAppend {
+            table: self,
+            mark,
+            committed: false,
+        };
+        let result = build(&mut transaction);
+        transaction.committed = result.is_ok();
+        result
     }
 
     /// Looks up a node without creating it.
@@ -239,7 +282,7 @@ impl NodeTable {
 
     /// Removes every node interned after the table had `len` entries, so a
     /// failed construction can roll back without cloning the whole table.
-    pub(crate) fn truncate(&mut self, len: usize) {
+    fn truncate(&mut self, len: usize) {
         for node in self.nodes.drain(len.max(1)..) {
             self.index.remove(&node.name);
         }
@@ -264,6 +307,86 @@ impl NodeTable {
     pub fn set_kind(&mut self, id: NodeId, kind: NodeKind) {
         if let Some(node) = self.nodes.get_mut(id.index()) {
             node.kind = kind;
+        }
+    }
+}
+
+/// Append-only access to a node table during device construction.
+///
+/// A nested transaction treats the outer transaction's nodes as pre-existing.
+/// Only the successful suffix is published; existing identity, order, names
+/// and kinds cannot be mutated through this capability.
+pub struct NodeAppend<'a> {
+    table: &'a mut NodeTable,
+    mark: usize,
+    committed: bool,
+}
+
+impl NodeAppend<'_> {
+    /// Intern an external name, reusing its identity if already present.
+    ///
+    /// # Errors
+    /// As [`NodeTable::intern`].
+    pub fn intern(&mut self, name: &str) -> SpiceResult<NodeId> {
+        self.table.intern(name)
+    }
+
+    /// Intern exactly the requested terminal layout atomically.
+    ///
+    /// # Errors
+    /// Incorrect terminal count or a failed interning operation.
+    pub fn intern_array<const N: usize>(&mut self, names: &[String]) -> SpiceResult<[NodeId; N]> {
+        if names.len() != N {
+            return Err(SpiceError::circuit("invalid terminal layout"));
+        }
+        self.transaction(|nodes| {
+            let mut ids = [NodeId::GROUND; N];
+            for (id, name) in ids.iter_mut().zip(names) {
+                *id = nodes.intern(name)?;
+            }
+            Ok(ids)
+        })
+    }
+
+    /// Mark a newly created node; an existing ID (including ground or a
+    /// parent transaction's node) cannot be reclassified.
+    ///
+    /// # Errors
+    /// The ID is outside this transaction's appended suffix.
+    pub fn set_kind(&mut self, id: NodeId, kind: NodeKind) -> SpiceResult<()> {
+        if id.index() < self.mark || id.index() >= self.table.len() {
+            return Err(SpiceError::circuit(format!(
+                "cannot change existing or invalid {id} in node transaction"
+            )));
+        }
+        self.table.set_kind(id, kind);
+        Ok(())
+    }
+
+    /// A nested construction scope: on failure only its own suffix is removed.
+    ///
+    /// # Errors
+    /// Propagates the builder's error after discarding its appended nodes.
+    pub fn transaction<T>(
+        &mut self,
+        build: impl FnOnce(&mut NodeAppend<'_>) -> SpiceResult<T>,
+    ) -> SpiceResult<T> {
+        self.table.transaction(build)
+    }
+}
+
+impl std::ops::Deref for NodeAppend<'_> {
+    type Target = NodeTable;
+
+    fn deref(&self) -> &Self::Target {
+        self.table
+    }
+}
+
+impl Drop for NodeAppend<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.table.truncate(self.mark);
         }
     }
 }
@@ -306,14 +429,46 @@ mod tests {
         let mut table = NodeTable::new();
         let existing = table.intern("Out").unwrap();
         let names = ["new".to_owned()];
-        assert!(table.intern_array::<2>(&names).is_err());
+        assert!(
+            table
+                .transaction(|nodes| nodes.intern_array::<2>(&names))
+                .is_err()
+        );
         assert!(table.get("new").is_none());
         assert_eq!(table.len(), 2);
         let names = ["OUT".to_owned(), "new".to_owned(), "New".to_owned()];
-        let ids = table.intern_array::<3>(&names).unwrap();
+        let ids = table
+            .transaction(|nodes| nodes.intern_array::<3>(&names))
+            .unwrap();
         assert_eq!(ids[0], existing);
         assert_eq!(ids[1], ids[2]);
         assert_eq!(table.len(), 3);
+    }
+
+    #[test]
+    fn compact_identity_boundary_never_truncates() {
+        let max = NodeId::new(u32::MAX).index();
+        assert_eq!(NodeId::from_index(max).unwrap(), NodeId::new(u32::MAX));
+        if let Some(overflow) = max.checked_add(1) {
+            assert!(NodeId::from_index(overflow).is_err());
+        }
+    }
+
+    #[test]
+    fn rollback_removes_index_entries_and_reuses_dense_ids() {
+        let mut table = NodeTable::new();
+        let retained = table.intern("Keep").unwrap();
+        let mark = table.len();
+        let removed = table.intern("Remove").unwrap();
+        table.intern("ΟΣ").unwrap();
+        table.truncate(mark);
+        assert_eq!(table.get("keep"), Some(retained));
+        assert!(table.get("REMOVE").is_none());
+        assert!(table.get("ος").is_none());
+        assert!(table.node(removed).is_none());
+        assert_eq!(table.intern("Replacement").unwrap(), removed);
+        assert_eq!(table.intern("REPLACEMENT").unwrap(), removed);
+        assert_eq!(table.intern("GND").unwrap(), NodeId::GROUND);
     }
 
     #[test]
@@ -369,5 +524,65 @@ mod tests {
         assert_eq!(table.unknown_count(), 2);
         table.set_kind(terminal, NodeKind::Terminal);
         assert_eq!(table.node(internal).unwrap().kind, NodeKind::Internal);
+    }
+    #[test]
+    fn nested_node_transactions_protect_parent_kinds_and_rollback_only_the_suffix() {
+        use crate::primitives::SpiceError;
+        let mut table = NodeTable::with_auto_gnd(false);
+        let retained = table.intern("GND").unwrap();
+        table.set_kind(retained, NodeKind::BranchCurrent);
+        let before = table.nodes().to_vec();
+        let failed = table.transaction(|outer| {
+            let parent = outer.intern("Parent")?;
+            outer.set_kind(parent, NodeKind::Internal)?;
+            assert!(outer.set_kind(retained, NodeKind::Terminal).is_err());
+            assert!(outer.set_kind(NodeId::GROUND, NodeKind::Terminal).is_err());
+            assert!(
+                outer
+                    .set_kind(NodeId::new(u32::MAX), NodeKind::Internal)
+                    .is_err()
+            );
+            let parent_state = outer.nodes().to_vec();
+            let failed = outer.transaction(|inner| {
+                let removed = inner.intern("ΟΣ")?;
+                inner.set_kind(removed, NodeKind::Internal)?;
+                assert!(inner.set_kind(parent, NodeKind::Terminal).is_err());
+                assert_eq!(inner.get("ος"), Some(removed));
+                Err::<(), _>(SpiceError::circuit("injected late failure"))
+            });
+            assert!(failed.is_err());
+            assert_eq!(outer.nodes(), parent_state);
+            assert_eq!(outer.get("ΟΣ"), None);
+            let child = outer.transaction(|inner| {
+                let id = inner.intern("Replacement")?;
+                inner.set_kind(id, NodeKind::Internal)?;
+                Ok(id)
+            })?;
+            assert_eq!(child.index(), parent.index() + 1);
+            assert_eq!(outer.get("replacement"), Some(child));
+            Err::<(), _>(SpiceError::circuit("enclosing batch failed"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(table.nodes(), before);
+        assert_eq!(table.get("PARENT"), None);
+        assert_eq!(table.get("replacement"), None);
+        assert_eq!(table.get("gnd"), Some(retained));
+        assert_eq!(table.intern("next").unwrap().index(), before.len());
+    }
+
+    #[test]
+    fn unwind_rolls_back_a_partial_node_append() {
+        let mut table = NodeTable::new();
+        let before = table.nodes().to_vec();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = table.transaction(|nodes| -> crate::primitives::SpiceResult<()> {
+                assert_eq!(nodes.intern("GND").unwrap(), NodeId::GROUND);
+                nodes.intern("partial").unwrap();
+                panic!("injected construction unwind");
+            });
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(table.nodes(), before);
+        assert_eq!(table.get("partial"), None);
     }
 }

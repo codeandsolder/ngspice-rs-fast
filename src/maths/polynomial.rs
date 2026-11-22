@@ -80,6 +80,9 @@ fn eliminate(row: &mut [Real], pivot: &[Real], col: usize, rhs: &mut Real, pivot
 }
 
 /// Evaluates coefficients ordered from constant to highest power using Horner's rule.
+///
+/// Retain the existing separately rounded multiplication and addition in
+/// evaluation; elimination above deliberately uses fused operations.
 #[must_use]
 pub fn evaluate(coefficients: &[Real], x: Real) -> Real {
     coefficients.iter().rev().fold(0., |sum, c| sum * x + c)
@@ -88,6 +91,15 @@ pub fn evaluate(coefficients: &[Real], x: Real) -> Real {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn evaluation_keeps_separate_product_rounding() {
+        let epsilon = f64::EPSILON;
+        let x = 1. - epsilon;
+        let coefficients = [-1., 1. + epsilon];
+        assert_eq!(evaluate(&coefficients, x).to_bits(), 0_f64.to_bits());
+        assert!(coefficients[1].mul_add(x, coefficients[0]) < 0.);
+    }
+
     // Frozen coefficient bits from the original elimination, independently
     // reproduced with IEEE binary64 fused multiply-add. Includes pivot ties,
     // unsorted abscissas, and the largest supported fit.

@@ -87,15 +87,9 @@ fn card(input: &mut Input<'_>) -> Result<ParsedCard> {
     let fundamental_expression = if let Some(token) = input.input.first() {
         let expression = match &token.kind {
             TokenKind::Expression(_) => Some(super::expression::from_brace_token(token)),
-            TokenKind::Quoted(inner) if token.text == format!("'{inner}'") => {
-                Some(super::expression::parse_delimited(
-                    inner,
-                    &token.location,
-                    token.location.column + 1,
-                    false,
-                    true,
-                ))
-            }
+            TokenKind::Quoted(inner) if token.text == format!("'{inner}'") => Some(
+                super::expression::parse_delimited(inner, token.position().advance(1), false, true),
+            ),
             _ => None,
         };
         expression
@@ -253,15 +247,8 @@ fn harmonics_value(input: &mut Input<'_>, at: &SourceLoc) -> Result<u32> {
                     location: Some(value.location),
                 })));
             }
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "finite integral harmonic count was checked against MAX_HARMONICS"
-            )]
-            #[expect(
-                clippy::cast_sign_loss,
-                reason = "harmonic count was checked to be at least one"
-            )]
-            Ok(number as u32)
+            crate::primitives::exact_nonnegative_integer(number)
+                .ok_or_else(|| fail(&value.location, "HARMONICS= is outside the integer range"))
         }
         _ if super::expression::is_expression_token(&value) => Err(gap(
             &value.location,

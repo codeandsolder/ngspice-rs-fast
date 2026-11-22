@@ -4,20 +4,11 @@
 //! `@device[parameter]` axes. A fresh C circuit at each grid point is more
 //! general than `alter`: some devices (including MESFET) do not recompute
 //! their area-dependent setup state after an `alter` command.
+use ngspice_conformance::ngspice::{Ngspice, Scratch};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use ngspice_rs::analysis::{Plot, RawFile};
 use ngspice_rs::cli::simulate;
-
-struct Scratch(PathBuf);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// A concrete instance parameter `@instance[keyword]` from a typed sweep.
 fn parameter(axis: &str) -> (&str, &str) {
@@ -83,18 +74,12 @@ pub(crate) fn nested(
     inner: (&str, &[f64]),
     outer: (&str, &[f64]),
 ) -> (Plot, Plot) {
-    let binary = std::env::var_os("NGSPICE_BIN").expect("set absolute NGSPICE_BIN");
-    assert!(Path::new(&binary).is_absolute());
+    let binary = Ngspice::pinned().expect("pinned C reference");
     assert!(!inner.1.is_empty() && !outer.1.is_empty());
     assert!(inner.1.iter().chain(outer.1).all(|v| v.is_finite()));
 
-    let dir = std::env::temp_dir().join(format!(
-        "spice-parameter-sweep-{}-{tag}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir(&dir).unwrap();
-    let _cleanup = Scratch(dir.clone());
+    let scratch = Scratch::new(tag).expect("scratch directory");
+    let dir = scratch.path();
 
     let mut reference: Option<Plot> = None;
     let mut index = 0;
@@ -108,16 +93,11 @@ pub(crate) fn nested(
             );
             let input = format!("point-{index}.cir");
             fs::write(dir.join(&input), text).unwrap();
-            let output = Command::new(&binary)
-                .args(["-b", &input])
-                .current_dir(&dir)
-                .output()
-                .unwrap();
-            let transcript = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            let output = binary.run(dir, &["-b", &input]).expect("run C");
+            let transcript = output.transcript();
+            output
+                .require_success(&format!("C point {index}"))
+                .unwrap_or_else(|error| panic!("{error}"));
             assert!(output.status.success(), "C point {index}: {transcript}");
             assert!(
                 !transcript.contains("Fatal error:") && !transcript.contains("Error:"),
@@ -128,13 +108,14 @@ pub(crate) fn nested(
             assert_eq!(raw.plots.len(), 1, "C point {index}: one OP plot");
             let sample = raw.plots.into_iter().next().unwrap().plot;
             assert_eq!(sample.plotname, "Operating Point");
-            assert_eq!(sample.points.len(), 1);
+            assert_eq!(sample.points().len(), 1);
             if let Some(reference) = &mut reference {
                 assert_eq!(
-                    reference.variables, sample.variables,
+                    reference.variables(),
+                    sample.variables(),
                     "C vectors changed at point {index}"
                 );
-                reference.points.push(sample.points[0].clone());
+                reference.push_point(sample.points()[0].clone()).unwrap();
             } else {
                 reference = Some(sample);
             }
@@ -148,14 +129,14 @@ pub(crate) fn nested(
     let raw = RawFile::load(dir.join("r.raw")).unwrap();
     assert_eq!(raw.plots.len(), 1);
     let ours = raw.plots.into_iter().next().unwrap().plot;
-    assert_eq!(ours.points.len(), index);
+    assert_eq!(ours.points().len(), index);
 
     // Only the inner axis is written to the Rust DC plot. Check that its
     // order agrees with the explicit C point order, not merely its count.
     let axis = ours
         .variable_index("v(param-sweep)")
         .expect("inner parameter scale");
-    for (point, expected) in ours.points.iter().zip(inner.1.iter().cycle()) {
+    for (point, expected) in ours.points().iter().zip(inner.1.iter().cycle()) {
         assert_eq!(point[axis].re, *expected, "parameter sweep point order");
     }
 

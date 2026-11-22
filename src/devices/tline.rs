@@ -49,13 +49,15 @@
 //! then has coincident times and skips the source load), nonfinite values,
 //! and a leading positional value (C ignores it silently).
 
-use crate::devices::delay::{DelayContext, DelayHistory, DelayLine, DelayUpdate};
+use crate::devices::delay::{
+    DelayContext, DelayHistory, DelayLine, DelayUpdate, WaveformHistory, WaveformUpdate,
+};
 use crate::devices::linear::LinearContext;
 use crate::devices::traits::{AnalysisMode, Device, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::primitives::{
-    NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
+    NodeAppend, NodeId, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
 };
 
 /// C reference for errors.
@@ -98,14 +100,103 @@ struct LineParameters {
     abstol: Real,
 }
 
+/// Ordered line setters before the C setup defaults are resolved. Keep td
+/// optional: an explicit delay wins over frequency and normalized length.
+struct LineSetters {
+    z0: Option<Real>,
+    td: Option<Real>,
+    nl: Real,
+    f: Real,
+    initial: [Real; 4],
+    reltol: Real,
+    abstol: Real,
+}
+
+impl Default for LineSetters {
+    fn default() -> Self {
+        Self {
+            z0: None,
+            td: None,
+            nl: 0.25,
+            f: 1e9,
+            initial: [0.; 4],
+            reltol: 1.,
+            abstol: 1.,
+        }
+    }
+}
+
+fn initial_slot(name: &str) -> Option<usize> {
+    ["v1", "i1", "v2", "i2"]
+        .iter()
+        .position(|component| *component == name)
+}
+
+impl LineSetters {
+    fn apply_scalar(&mut self, name: &str, value: Real, at: &SourceLoc) -> SpiceResult<()> {
+        match name {
+            "z0" | "zo" => self.z0 = Some(value),
+            "td" => self.td = Some(value),
+            "nl" => self.nl = value,
+            "f" => self.f = value,
+            "rel" => self.reltol = value,
+            "abs" => self.abstol = value,
+            other => {
+                let slot = initial_slot(other).ok_or_else(|| {
+                    invalid(at, format!("unknown transmission-line parameter {other}"))
+                })?;
+                self.initial[slot] = value;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve(self, instance: &DeviceInstance) -> SpiceResult<LineParameters> {
+        let Self {
+            z0,
+            td,
+            nl,
+            f,
+            initial,
+            reltol,
+            abstol,
+        } = self;
+        let Some(z0) = z0 else {
+            return Err(invalid(
+                &instance.location,
+                format!(
+                    "{}: transmission line z0 must be given (trasetup.c)",
+                    instance.name
+                ),
+            ));
+        };
+        if z0 <= 0. || !(1. / z0).is_finite() {
+            return Err(invalid(
+                &instance.location,
+                format!("{}: z0 must be positive, got {z0}", instance.name),
+            ));
+        }
+        let td = line_delay(instance, td, f, nl)?;
+        if reltol < 0. || abstol < 0. {
+            return Err(invalid(
+                &instance.location,
+                format!("{}: rel and abs must not be negative", instance.name),
+            ));
+        }
+        Ok(LineParameters {
+            z0,
+            td,
+            nl,
+            f,
+            initial,
+            reltol,
+            abstol,
+        })
+    }
+}
+
 fn parse_line_parameters(instance: &DeviceInstance) -> SpiceResult<LineParameters> {
-    let mut z0 = None;
-    let mut td = None;
-    let mut nl = 0.25;
-    let mut f = 1e9;
-    let mut initial = [0.; 4];
-    let mut reltol = 1.;
-    let mut abstol = 1.;
+    let mut setters = LineSetters::default();
     let number = |text: &str, at: &SourceLoc, name: &str| {
         parse_spice_number(text)
             .filter(|v| v.is_finite())
@@ -115,41 +206,18 @@ fn parse_line_parameters(instance: &DeviceInstance) -> SpiceResult<LineParameter
         match (&p.kind, p.name.as_str()) {
             (ParameterKind::InitialConditions(values), "ic") => {
                 for value in values {
-                    let slot = match value.name.as_str() {
-                        "v1" => 0,
-                        "i1" => 1,
-                        "v2" => 2,
-                        "i2" => 3,
-                        other => {
-                            return Err(invalid(
-                                &value.value.location,
-                                format!("unexpected ic component {other}"),
-                            ));
-                        }
-                    };
-                    initial[slot] = number(&value.value.text, &value.value.location, "ic")?;
+                    let slot = initial_slot(&value.name).ok_or_else(|| {
+                        invalid(
+                            &value.value.location,
+                            format!("unexpected ic component {}", value.name),
+                        )
+                    })?;
+                    setters.initial[slot] = number(&value.value.text, &value.value.location, "ic")?;
                 }
             }
             (ParameterKind::Scalar, name) => {
                 let value = number(&p.value, &p.location, name)?;
-                match name {
-                    "z0" | "zo" => z0 = Some(value),
-                    "td" => td = Some(value),
-                    "nl" => nl = value,
-                    "f" => f = value,
-                    "v1" => initial[0] = value,
-                    "i1" => initial[1] = value,
-                    "v2" => initial[2] = value,
-                    "i2" => initial[3] = value,
-                    "rel" => reltol = value,
-                    "abs" => abstol = value,
-                    other => {
-                        return Err(invalid(
-                            &p.location,
-                            format!("unknown transmission-line parameter {other}"),
-                        ));
-                    }
-                }
+                setters.apply_scalar(name, value, &p.location)?;
             }
             _ => {
                 return Err(SpiceError::not_yet_ported(
@@ -162,37 +230,7 @@ fn parse_line_parameters(instance: &DeviceInstance) -> SpiceResult<LineParameter
             }
         }
     }
-    let Some(z0) = z0 else {
-        return Err(invalid(
-            &instance.location,
-            format!(
-                "{}: transmission line z0 must be given (trasetup.c)",
-                instance.name
-            ),
-        ));
-    };
-    if z0 <= 0. || !(1. / z0).is_finite() {
-        return Err(invalid(
-            &instance.location,
-            format!("{}: z0 must be positive, got {z0}", instance.name),
-        ));
-    }
-    let td = line_delay(instance, td, f, nl)?;
-    if reltol < 0. || abstol < 0. {
-        return Err(invalid(
-            &instance.location,
-            format!("{}: rel and abs must not be negative", instance.name),
-        ));
-    }
-    Ok(LineParameters {
-        z0,
-        td,
-        nl,
-        f,
-        initial,
-        reltol,
-        abstol,
-    })
+    setters.resolve(instance)
 }
 
 fn line_delay(instance: &DeviceInstance, td: Option<Real>, f: Real, nl: Real) -> SpiceResult<Real> {
@@ -230,7 +268,7 @@ impl TransmissionLine {
     /// Missing `z0`, invalid values, unknown setters or node-name collisions.
     pub fn instantiate(
         instance: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
     ) -> SpiceResult<Box<dyn Device>> {
         if instance.nodes.len() != 4 || instance.model.is_some() {
             return Err(SpiceError::circuit(format!(
@@ -359,7 +397,7 @@ impl TransmissionLine {
     /// quadratically through the history samples `i-2, i-1, i` where `i` is
     /// the first sample (from the third on) later than `time - TD`, or the
     /// last one (extrapolation).
-    fn delayed(&self, history: &DelayHistory, time: Real) -> SpiceResult<[Real; 2]> {
+    fn delayed(&self, history: &WaveformHistory, time: Real) -> SpiceResult<[Real; 2]> {
         let size = history
             .len()
             .checked_sub(1)
@@ -556,7 +594,7 @@ impl Device for TransmissionLine {
                         self.name
                     ))
                 })?;
-                let [input1, input2] = self.delayed(history, time)?;
+                let [input1, input2] = self.delayed(history.as_waveform()?, time)?;
                 context.stamp_rhs(self.ibr1(), input1)?;
                 context.stamp_rhs(self.ibr2(), input2)?;
             }
@@ -614,8 +652,8 @@ impl Device for TransmissionLine {
 }
 
 impl DelayLine for TransmissionLine {
-    fn width(&self) -> usize {
-        2
+    fn new_history(&self) -> DelayHistory {
+        DelayHistory::waveform(2)
     }
 
     fn start(&self, context: &DelayContext<'_>) -> SpiceResult<DelayUpdate> {
@@ -629,14 +667,14 @@ impl DelayLine for TransmissionLine {
             self.waves(context)
         };
         // traload.c MODEINITTRAN: three equal samples at -2TD, -TD and 0.
-        Ok(DelayUpdate {
+        Ok(DelayUpdate::Waveform(WaveformUpdate {
             reset: Some(vec![
                 (-2. * self.td, wave.to_vec()),
                 (-self.td, wave.to_vec()),
                 (0., wave.to_vec()),
             ]),
-            ..DelayUpdate::default()
-        })
+            ..WaveformUpdate::default()
+        }))
     }
 
     /// `traacct.c` (the `#else` branch C compiles).
@@ -645,6 +683,7 @@ impl DelayLine for TransmissionLine {
         history: &DelayHistory,
         context: &DelayContext<'_>,
     ) -> SpiceResult<DelayUpdate> {
+        let history = history.as_waveform()?;
         let time = context.time;
         let size = history
             .len()
@@ -656,7 +695,7 @@ impl DelayLine for TransmissionLine {
         let at = |index: usize| history.time(index).unwrap_or(Real::NAN);
         let value =
             |index: usize, component: usize| history.value(index, component).unwrap_or(Real::NAN);
-        let mut update = DelayUpdate::default();
+        let mut update = WaveformUpdate::default();
         // Shift out samples no later interpolation can reach, keeping two
         // before the first one at or after `time - TD`.
         if time - self.td > at(2) {
@@ -685,7 +724,7 @@ impl DelayLine for TransmissionLine {
                 }
             }
         }
-        Ok(update)
+        Ok(DelayUpdate::Waveform(update))
     }
 
     /// `tratrunc.c`, with C's step indices (`CKTdeltaOld[1]` and `[2]`, the
@@ -695,6 +734,7 @@ impl DelayLine for TransmissionLine {
         history: &DelayHistory,
         context: &DelayContext<'_>,
     ) -> SpiceResult<Option<Real>> {
+        let history = history.as_waveform()?;
         let size = history
             .len()
             .checked_sub(1)

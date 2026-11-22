@@ -48,7 +48,7 @@
 //! ([`ExprKind::UserCall`], or a built-in name a `.func` redefines) are
 //! evaluated by value, with the body's free names resolved at the call site,
 //! as C's textual expansion (`inpcom.c` `inp_expand_macro_in_str()`) implies.
-//! Recursion is rejected with the cycle (petgraph SCC) instead of C's
+//! Recursion is rejected with the cycle (iterative petgraph SCC) instead of C's
 //! unbounded expansion. [`ParamScope::for_netlist`] is the entry point for
 //! evaluating anything against a deck's top-level parameters and functions.
 
@@ -59,7 +59,7 @@ use std::sync::Arc;
 
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 use petgraph::Direction;
-use petgraph::algo::{tarjan_scc, toposort};
+use petgraph::algo::{kosaraju_scc, toposort};
 use petgraph::graph::{DiGraph, NodeIndex};
 
 use crate::netlist::ast::{FuncCard, Netlist, ParamCard};
@@ -216,9 +216,44 @@ fn source_text(expression: &ParameterExpression) -> String {
     }
 }
 
+struct PendingParamEntry<'a> {
+    name: String,
+    location: SourceLoc,
+    source: Option<String>,
+    state: DefinitionState<'a>,
+}
+
+enum DefinitionState<'a> {
+    Pending(&'a ParameterExpression),
+    Complete(ParamState),
+}
+
+impl PendingParamEntry<'_> {
+    const fn value(&self) -> Option<Real> {
+        match self.state {
+            DefinitionState::Complete(ParamState::Resolved(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn finish(self) -> SpiceResult<ParamEntry> {
+        let DefinitionState::Complete(state) = self.state else {
+            return Err(SpiceError::circuit(format!(
+                "parameter '{}' was not evaluated",
+                self.name
+            )));
+        };
+        Ok(ParamEntry {
+            name: self.name,
+            location: self.location,
+            source: self.source,
+            state,
+        })
+    }
+}
+
 struct ScopeDefinitions<'a> {
-    entries: Vec<ParamEntry>,
-    exprs: Vec<Option<&'a ParameterExpression>>,
+    entries: Vec<PendingParamEntry<'a>>,
     active: HashMap<String, usize>,
     binding_count: usize,
 }
@@ -229,8 +264,7 @@ fn collect_definitions<'a>(
     limits: EvalLimits,
     policy: Bindings,
 ) -> SpiceResult<ScopeDefinitions<'a>> {
-    let mut entries: Vec<ParamEntry> = Vec::new();
-    let mut exprs: Vec<Option<&ParameterExpression>> = Vec::new();
+    let mut entries: Vec<PendingParamEntry<'_>> = Vec::new();
     let mut active: HashMap<String, usize> = HashMap::new();
     for binding in bindings {
         if !binding.value.is_finite() {
@@ -240,18 +274,17 @@ fn collect_definitions<'a>(
             ));
         }
         if let Some(&old) = active.get(&binding.name) {
-            entries[old].state = ParamState::Superseded {
+            entries[old].state = DefinitionState::Complete(ParamState::Superseded {
                 by: binding.location.clone(),
-            };
+            });
         }
         active.insert(binding.name.clone(), entries.len());
-        entries.push(ParamEntry {
+        entries.push(PendingParamEntry {
             name: binding.name.clone(),
             location: binding.location.clone(),
             source: None,
-            state: ParamState::Resolved(binding.value),
+            state: DefinitionState::Complete(ParamState::Resolved(binding.value)),
         });
-        exprs.push(None);
     }
     let binding_count = entries.len();
 
@@ -281,40 +314,125 @@ fn collect_definitions<'a>(
                 }
                 // The instance value wins, so the card is dropped unevaluated.
                 let e = &assignment.expression;
-                entries.push(ParamEntry {
+                entries.push(PendingParamEntry {
                     name: assignment.name.clone(),
                     location,
                     source: Some(source_text(e)),
-                    state: ParamState::Superseded { by: bound },
+                    state: DefinitionState::Complete(ParamState::Superseded { by: bound }),
                 });
-                exprs.push(None);
                 continue;
             }
-            entries[old].state = ParamState::Superseded {
+            entries[old].state = DefinitionState::Complete(ParamState::Superseded {
                 by: location.clone(),
-            };
+            });
         }
         active.insert(assignment.name.clone(), entries.len());
         let e = &assignment.expression;
-        entries.push(ParamEntry {
+        entries.push(PendingParamEntry {
             name: assignment.name.clone(),
             location,
             source: Some(source_text(e)),
-            // Placeholder until evaluated; replaced below.
-            state: ParamState::Resolved(0.0),
+            state: DefinitionState::Pending(e),
         });
-        exprs.push(Some(e));
     }
 
     Ok(ScopeDefinitions {
         entries,
-        exprs,
         active,
         binding_count,
     })
 }
 
-type DependencyGraph = (DiGraph<usize, ()>, HashMap<usize, NodeIndex>);
+/// Dense, deck-ordered graph of live definitions. Edges point from a
+/// definition to its dependencies; callers add edges in source deck order.
+struct DependencyGraph {
+    graph: DiGraph<usize, ()>,
+    node_of: Vec<Option<NodeIndex>>,
+    // Each source is visited once, so one dense stamp per target suppresses
+    // duplicate references without hashing or scanning its adjacency list.
+    last_source: Vec<Option<NodeIndex>>,
+}
+
+impl DependencyGraph {
+    fn new(definitions: usize, live: &[usize]) -> Self {
+        let mut graph = DiGraph::new();
+        let mut node_of = vec![None; definitions];
+        for &i in live {
+            node_of[i] = Some(graph.add_node(i));
+        }
+        Self {
+            graph,
+            node_of,
+            last_source: vec![None; live.len()],
+        }
+    }
+
+    /// Both entries must be live; finish all edges from a source before
+    /// moving to the next source.
+    fn add_dependency(&mut self, source: usize, target: usize) {
+        if let (Some(a), Some(b)) = (self.node_of[source], self.node_of[target])
+            && self.last_source[b.index()] != Some(a)
+        {
+            self.last_source[b.index()] = Some(a);
+            self.graph.add_edge(a, b, ());
+        }
+    }
+
+    /// Walk the earliest unseen dependent at each step for an undefined name.
+    fn dependent_chain(&self, entry: usize) -> Vec<usize> {
+        let Some(mut at) = self.node_of[entry] else {
+            return Vec::new();
+        };
+        let mut seen = vec![false; self.graph.node_count()];
+        seen[at.index()] = true;
+        let mut chain = Vec::new();
+        while let Some(next) = self
+            .graph
+            .neighbors_directed(at, Direction::Incoming)
+            .filter(|n| !seen[n.index()])
+            .min_by_key(|&n| self.graph[n])
+        {
+            seen[next.index()] = true;
+            chain.push(self.graph[next]);
+            at = next;
+        }
+        chain
+    }
+
+    fn cycle(&self) -> Option<Vec<usize>> {
+        // Kosaraju uses iterative DFS, including for very long chains.
+        let (component, start) = kosaraju_scc(&self.graph)
+            .into_iter()
+            .filter_map(|component| {
+                let start = *component.iter().min_by_key(|&&n| self.graph[n])?;
+                (component.len() > 1 || self.graph.contains_edge(start, start))
+                    .then_some((component, start))
+            })
+            .min_by_key(|(_, start)| self.graph[*start])?;
+        let mut member = vec![false; self.graph.node_count()];
+        for n in component {
+            member[n.index()] = true;
+        }
+        shortest_cycle(&self.graph, &member, start)
+            .map(|path| path.into_iter().map(|n| self.graph[n]).collect())
+    }
+
+    fn evaluation_order(&self) -> Result<Vec<usize>, usize> {
+        let order = toposort(&self.graph, None).map_err(|cycle| self.graph[cycle.node_id()])?;
+        let mut level = vec![0; self.graph.node_count()];
+        for &n in order.iter().rev() {
+            level[n.index()] = self
+                .graph
+                .neighbors(n)
+                .map(|m| level[m.index()] + 1)
+                .max()
+                .unwrap_or(0);
+        }
+        let mut order = order;
+        order.sort_unstable_by_key(|&n| (level[n.index()], self.graph[n]));
+        Ok(order.into_iter().map(|n| self.graph[n]).collect())
+    }
+}
 
 impl ScopeDefinitions<'_> {
     fn dependency_graph(
@@ -326,17 +444,12 @@ impl ScopeDefinitions<'_> {
     ) -> SpiceResult<DependencyGraph> {
         let Self {
             entries,
-            exprs,
             active,
             binding_count,
         } = self;
         let binding_count = *binding_count;
         // Dependency graph: edge a -> b means "a references b".
-        let mut graph: DiGraph<usize, ()> = DiGraph::new();
-        let mut node_of: HashMap<usize, NodeIndex> = HashMap::new();
-        for &i in live {
-            node_of.insert(i, graph.add_node(i));
-        }
+        let mut graph = DependencyGraph::new(entries.len(), live);
         let mut undefined: Option<(usize, &str, &SourceLoc)> = None;
         let mut scan = RefScan {
             use_site: scope_functions,
@@ -346,18 +459,10 @@ impl ScopeDefinitions<'_> {
             cuts: 0,
         };
         for &i in live {
-            let Some(expr) = exprs[i] else { continue };
-            let mut refs = Vec::new();
-            scan.refs(&expr.root, 0, &mut refs).map_err(|f| {
-                f.context(|| {
-                    format!(
-                        "while collecting the dependencies of parameter '{}' defined at {}",
-                        entries[i].name, entries[i].location
-                    )
-                })
-                .into_error()
-            })?;
-            for (name, loc) in refs {
+            let DefinitionState::Pending(expr) = entries[i].state else {
+                continue;
+            };
+            scan.refs(&expr.root, 0, &mut |name, loc| {
                 let known = |n: &str| {
                     active.get(n).is_some_and(|&j| j < binding_count)
                         || scope_parent.is_some_and(|p| p.get(n).is_some())
@@ -366,40 +471,37 @@ impl ScopeDefinitions<'_> {
                     && let Some(&j) = active.get(name)
                     && j >= binding_count
                 {
-                    let (a, b) = (node_of[&i], node_of[&j]);
-                    if !graph.contains_edge(a, b) {
-                        graph.add_edge(a, b, ());
-                    }
+                    graph.add_dependency(i, j);
                 } else if !known(name) && undefined.is_none() {
                     undefined = Some((i, name, loc));
                 }
-            }
+            })
+            .map_err(|f| {
+                f.context(|| {
+                    format!(
+                        "while collecting the dependencies of parameter '{}' defined at {}",
+                        entries[i].name, entries[i].location
+                    )
+                })
+                .into_error()
+            })?;
         }
         if let Some((i, name, loc)) = undefined {
             let mut message = format!(
                 "undefined parameter '{name}' (in the definition of '{}' at {})",
                 entries[i].name, entries[i].location
             );
-            let mut seen = vec![i];
-            let mut at = i;
-            while let Some(next) = graph
-                .neighbors_directed(node_of[&at], Direction::Incoming)
-                .map(|n| graph[n])
-                .filter(|j| !seen.contains(j))
-                .min()
-            {
+            for next in graph.dependent_chain(i) {
                 let _ = write!(
                     message,
                     "\n  required by parameter '{}' defined at {}",
                     entries[next].name, entries[next].location
                 );
-                seen.push(next);
-                at = next;
             }
             return Err(SpiceError::parse(loc.clone(), message));
         }
 
-        Ok((graph, node_of))
+        Ok(graph)
     }
 }
 
@@ -517,81 +619,57 @@ impl ParamScope {
         policy: Bindings,
     ) -> SpiceResult<Self> {
         let defs = collect_definitions(bindings, cards, budget.limits, policy)?;
-        let ScopeDefinitions {
-            entries,
-            exprs,
-            active,
-            binding_count,
-        } = &defs;
-        let binding_count = *binding_count;
         let scope_parent = parent.as_deref();
         let scope_functions = functions.as_deref();
-        let is_active_def = |i: usize| {
-            i >= binding_count && exprs[i].is_some() && active.get(&entries[i].name) == Some(&i)
-        };
-        let live: Vec<usize> = (binding_count..entries.len())
-            .filter(|&i| is_active_def(i))
+        let live: Vec<usize> = defs
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, entry)| {
+                matches!(entry.state, DefinitionState::Pending(_)).then_some(i)
+            })
             .collect();
 
-        let (graph, node_of) =
-            defs.dependency_graph(&live, scope_parent, scope_functions, budget)?;
+        let graph = defs.dependency_graph(&live, scope_parent, scope_functions, budget)?;
         let ScopeDefinitions {
             mut entries,
-            exprs,
             active,
-            binding_count,
+            ..
         } = defs;
         // Cycles: report the one containing the earliest definition.
-        if let Some((component, start)) = earliest_cycle(&graph, false) {
-            let path = shortest_cycle(&graph, &component, start);
+        if let Some(path) = graph.cycle() {
+            let start = path[0];
             let chain: Vec<String> = path
                 .iter()
-                .map(|&n| {
-                    format!(
-                        "'{}' ({})",
-                        entries[graph[n]].name, entries[graph[n]].location
-                    )
-                })
+                .map(|&n| format!("'{}' ({})", entries[n].name, entries[n].location))
                 .collect();
             return Err(SpiceError::parse(
-                entries[graph[start]].location.clone(),
+                entries[start].location.clone(),
                 format!("circular parameter definition: {}", chain.join(" -> ")),
             ));
         }
 
         // Evaluate by (dependency level, deck order) like inp_sort_params.
-        let order = toposort(&graph, None).map_err(|cycle| {
+        let sequence = graph.evaluation_order().map_err(|entry| {
             SpiceError::parse(
-                entries[graph[cycle.node_id()]].location.clone(),
+                entries[entry].location.clone(),
                 "circular parameter definition",
             )
         })?;
-        let mut level: HashMap<NodeIndex, usize> = HashMap::new();
-        for &n in order.iter().rev() {
-            let l = graph
-                .neighbors_directed(n, Direction::Outgoing)
-                .map(|m| level[&m] + 1)
-                .max()
-                .unwrap_or(0);
-            level.insert(n, l);
-        }
-        let mut sequence: Vec<usize> = live.clone();
-        sequence.sort_by_key(|&i| (level[&node_of[&i]], i));
 
-        let mut values: Vec<Option<Real>> = (0..entries.len())
-            .map(|i| match entries[i].state {
-                ParamState::Resolved(v) if i < binding_count => Some(v),
-                _ => None,
-            })
-            .collect();
-        for &i in &sequence {
-            let Some(expr) = exprs[i] else { continue };
+        for i in sequence {
+            let DefinitionState::Pending(expr) = entries[i].state else {
+                return Err(SpiceError::circuit(format!(
+                    "parameter '{}' is not a pending definition",
+                    entries[i].name
+                )));
+            };
             let name = entries[i].name.as_str();
             let lookup = |n: &str| -> Option<Real> {
                 if n != name
                     && let Some(&j) = active.get(n)
                 {
-                    return values[j];
+                    return entries[j].value();
                 }
                 scope_parent.and_then(|p| p.get(n))
             };
@@ -604,14 +682,12 @@ impl ParamScope {
                 })
                 .into_error()
             })?;
-            values[i] = Some(value);
+            entries[i].state = DefinitionState::Complete(ParamState::Resolved(value));
         }
-        for &i in &live {
-            let value = values[i].ok_or_else(|| {
-                SpiceError::circuit(format!("parameter '{}' was not evaluated", entries[i].name))
-            })?;
-            entries[i].state = ParamState::Resolved(value);
-        }
+        let entries = entries
+            .into_iter()
+            .map(PendingParamEntry::finish)
+            .collect::<SpiceResult<Vec<_>>>()?;
         Ok(Self {
             parent,
             entries,
@@ -773,11 +849,7 @@ impl FunctionScope {
     fn check(&self) -> SpiceResult<()> {
         let mut live: Vec<usize> = self.active.values().copied().collect();
         live.sort_unstable();
-        let mut graph: DiGraph<usize, ()> = DiGraph::new();
-        let mut node_of: HashMap<usize, NodeIndex> = HashMap::new();
-        for &i in &live {
-            node_of.insert(i, graph.add_node(i));
-        }
+        let mut graph = DependencyGraph::new(self.definitions.len(), &live);
         for &i in &live {
             let def = &self.definitions[i];
             for (name, arguments, location) in collect_calls(&def.body.root) {
@@ -807,26 +879,23 @@ impl FunctionScope {
                     ));
                 }
                 if let Some(j) = local {
-                    let (a, b) = (node_of[&i], node_of[&j]);
-                    if !graph.contains_edge(a, b) {
-                        graph.add_edge(a, b, ());
-                    }
+                    graph.add_dependency(i, j);
                 }
             }
         }
-        let Some((component, start)) = earliest_cycle(&graph, true) else {
+        let Some(path) = graph.cycle() else {
             return Ok(());
         };
-        let path = shortest_cycle(&graph, &component, start);
+        let start = path[0];
         let chain: Vec<String> = path
             .iter()
             .map(|&n| {
-                let def = &self.definitions[graph[n]];
+                let def = &self.definitions[n];
                 format!("'{}' ({})", def.name, def.location)
             })
             .collect();
         Err(SpiceError::parse(
-            self.definitions[graph[start]].location.clone(),
+            self.definitions[start].location.clone(),
             format!("recursive .func definition: {}", chain.join(" -> ")),
         ))
     }
@@ -911,7 +980,9 @@ impl<'a> FreeNames<'a> {
 /// [`EvalLimits::depth`] levels (expression nesting plus call nesting,
 /// counted as in [`eval`]), and the free names
 /// of each definition are computed once per scope (memoized), so a DAG of
-/// functions costs linear rather than exponential work.
+/// functions avoids expanding every call path. Work to merge free-name
+/// sets is proportional to the sizes of the sets consumed. The dependency
+/// graph itself stores only distinct edges.
 struct RefScan<'a, 'b> {
     /// The site's `.func` scope; also where a body's unresolved call names
     /// are looked up (C expands what is left at the outermost call).
@@ -968,12 +1039,12 @@ impl<'a> RefScan<'a, '_> {
         &mut self,
         expr: &'a Expr,
         depth: usize,
-        out: &mut Vec<(&'a str, &'a SourceLoc)>,
+        out: &mut impl FnMut(&'a str, &'a SourceLoc),
     ) -> Result<(), Failure> {
         self.charge(expr, depth, false)?;
         match &expr.kind {
             ExprKind::Number { .. } => {}
-            ExprKind::Identifier(name) => out.push((name, &expr.span.start)),
+            ExprKind::Identifier(name) => out(name, &expr.span.start),
             ExprKind::Unary { operand, .. } | ExprKind::Group(operand) => {
                 self.refs(operand, depth + 1, out)?;
             }
@@ -988,7 +1059,9 @@ impl<'a> RefScan<'a, '_> {
                 let name = call_name(&expr.kind);
                 if let Some((def, scope)) = self.use_site.and_then(|f| f.get(name)) {
                     let free = self.free_names(def, scope, depth)?;
-                    out.extend(free.iter().map(|&name| (name, &expr.span.start)));
+                    for &name in free.iter() {
+                        out(name, &expr.span.start);
+                    }
                 }
             }
         }
@@ -1079,53 +1152,38 @@ fn call_name(kind: &ExprKind) -> &str {
     }
 }
 
-/// Shortest cycle through `start` inside `component` (BFS), as `start .. start`.
-fn earliest_cycle(
-    graph: &DiGraph<usize, ()>,
-    include_self: bool,
-) -> Option<(Vec<NodeIndex>, NodeIndex)> {
-    tarjan_scc(graph)
-        .into_iter()
-        .filter_map(|component| {
-            let start = *component.iter().min_by_key(|&&node| graph[node])?;
-            (component.len() > 1 || (include_self && graph.contains_edge(start, start)))
-                .then_some((component, start))
-        })
-        .min_by_key(|(_, start)| graph[*start])
-}
-
+/// Shortest cycle through the earliest member of a cyclic SCC, breaking
+/// equal-length ties by deck order.
 fn shortest_cycle(
     graph: &DiGraph<usize, ()>,
-    component: &[NodeIndex],
+    member: &[bool],
     start: NodeIndex,
-) -> Vec<NodeIndex> {
-    let mut parent: HashMap<NodeIndex, NodeIndex> = HashMap::new();
+) -> Option<Vec<NodeIndex>> {
+    let mut parent = vec![None; graph.node_count()];
+    parent[start.index()] = Some(start);
     let mut queue = std::collections::VecDeque::from([start]);
     while let Some(n) = queue.pop_front() {
-        let mut next: Vec<NodeIndex> = graph
-            .neighbors_directed(n, Direction::Outgoing)
-            .filter(|m| component.contains(m))
-            .collect();
-        next.sort_by_key(|&m| graph[m]);
+        let mut next: Vec<NodeIndex> = graph.neighbors(n).filter(|m| member[m.index()]).collect();
+        next.sort_unstable_by_key(|&m| graph[m]);
         for m in next {
             if m == start {
                 let mut chain = vec![n];
                 let mut at = n;
                 while at != start {
-                    at = parent[&at];
+                    at = parent[at.index()]?;
                     chain.push(at);
                 }
                 chain.reverse();
                 chain.push(start);
-                return chain;
+                return Some(chain);
             }
-            if let std::collections::hash_map::Entry::Vacant(e) = parent.entry(m) {
-                e.insert(n);
+            if parent[m.index()].is_none() {
+                parent[m.index()] = Some(n);
                 queue.push_back(m);
             }
         }
     }
-    vec![start, start]
+    None
 }
 
 /// Depth units a `.func` call adds before its body, against
@@ -1198,10 +1256,10 @@ fn evaluate_root(
 }
 
 fn snippet<'a>(root: &'a ParameterExpression, node: &Expr) -> &'a str {
-    let base = root.span.start.column as usize;
-    let s = (node.span.start.column as usize).saturating_sub(base);
-    let e = (node.span.end.column as usize).saturating_sub(base);
-    root.text.get(s..e).unwrap_or(root.text.as_str())
+    node.span
+        .relative_to(&root.span)
+        .and_then(|range| root.text.get(range))
+        .unwrap_or(root.text.as_str())
 }
 
 fn fail(node: &Expr, root: &ParameterExpression, message: impl std::fmt::Display) -> Failure {

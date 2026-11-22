@@ -6,10 +6,10 @@
 
 use std::path::Path;
 
-use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::{Netlist, ParameterKind, ScopedCardKind};
 use ngspice_rs::netlist::expr::{BinaryOp, Expr, ExprKind, Function, ParameterExpression, UnaryOp};
 use ngspice_rs::netlist::source::parse_deck_text;
+use ngspice_rs::netlist::{Parser, parse_parameter_expression};
 use ngspice_rs::primitives::{SourceLoc, SpiceError, parse_numparam_number};
 
 fn parse(body: &str) -> Result<Netlist, SpiceError> {
@@ -21,7 +21,7 @@ fn parse(body: &str) -> Result<Netlist, SpiceError> {
 
 /// Expression text at line 5, column 10 so offsets are visible in columns.
 fn expression(text: &str) -> Result<ParameterExpression, SpiceError> {
-    Parser::parse_expression(
+    parse_parameter_expression(
         text,
         &SourceLoc::new(Path::new("e.cir").to_path_buf(), 5, 10),
     )
@@ -358,7 +358,7 @@ fn param_card_keeps_ordered_assignments_and_duplicates() {
 }
 
 #[test]
-fn param_cards_join_continuation_lines_with_joined_card_columns() {
+fn param_cards_retain_physical_spans_across_continuations() {
     let n = parse(".param a=1\n+ b={2 +\n+ a}\n+ c=3").unwrap();
     let card = &n.params[0];
     assert_eq!(card.location.line, 2);
@@ -369,12 +369,21 @@ fn param_cards_join_continuation_lines_with_joined_card_columns() {
             .collect::<Vec<_>>(),
         ["a", "b", "c"]
     );
-    // Joined text: `.param a=1 b={2 + a} c=3`; columns are joined-card bytes.
+    // Logical spelling stays joined; diagnostic endpoints follow physical runs.
     let b = &card.assignments[1];
     assert_eq!(b.expression.text, "2 + a");
-    assert_eq!(b.expression.span.start.column, 15);
-    assert_eq!(b.name_span.start.column, 12);
-    assert_eq!(card.assignments[2].name_span.start.column, 22);
+    assert_eq!(
+        (b.expression.span.start.line, b.expression.span.start.column),
+        (3, 6)
+    );
+    assert_eq!(
+        (b.expression.span.end.line, b.expression.span.end.column),
+        (4, 4)
+    );
+    assert_eq!(b.expression.span.len(), 5);
+    assert_eq!((b.name_span.start.line, b.name_span.start.column), (3, 3));
+    let c = &card.assignments[2].name_span.start;
+    assert_eq!((c.line, c.column), (5, 3));
 }
 
 #[test]
@@ -748,4 +757,19 @@ fn arbitrary_short_inputs_never_panic_or_hang() {
         }
     }
     assert!(total > 40_000);
+}
+
+#[test]
+fn invalid_nested_expression_on_continuation_retains_real_coordinates() {
+    let error = parse("  R1 a 0 {1+\n* between\n  + )}").unwrap_err();
+    let SpiceError::Parse { location, .. } = error else {
+        panic!("expected located expression error");
+    };
+    assert_eq!((location.line, location.column), (4, 5));
+
+    let error = parse(".param a={1 +\n  + )}").unwrap_err();
+    let SpiceError::Parse { location, .. } = error else {
+        panic!("expected located parameter error");
+    };
+    assert_eq!((location.line, location.column), (3, 5));
 }

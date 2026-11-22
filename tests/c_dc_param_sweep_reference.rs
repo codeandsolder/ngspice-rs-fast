@@ -77,10 +77,10 @@ fn compare(tag: &str, deck: &str, (relative, absolute): (f64, f64)) {
     let rust = run_rust(deck);
     assert_eq!(rust.point_count(), c.point_count(), "{tag}: point counts");
     // The port names the scale as C's dctrcurv.c does, so it compares by name.
-    let scale = c.variables[0].name.to_ascii_lowercase();
-    assert_eq!(rust.variables[0].name, scale, "{tag}: scale name");
+    let scale = c.variables()[0].name.to_ascii_lowercase();
+    assert_eq!(rust.variables()[0].name, scale, "{tag}: scale name");
     let mut compared = 0;
-    for variable in &c.variables {
+    for variable in c.variables() {
         let name = variable.name.to_ascii_lowercase();
         if !(name == scale || name.starts_with("v(") || name.starts_with("i(")) {
             continue;
@@ -115,6 +115,21 @@ fn diode_instance_parameter_sweeps_match_c() {
         ("instance-temp", "@d1[temp] -40 125 15"),
         ("diode-pj", "@d1[pj] 0 4 1"),
         ("dtemp-source", "@d1[dtemp] 0 50 10 v1 1 3 1"),
+    ] {
+        compare(tag, &format!("{diode}\n.dc {sweep}"), NONLINEAR);
+    }
+}
+
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN; runs temporary C decks out of process"]
+fn diode_knee_currents_are_setup_only_in_instance_sweeps() {
+    let diode = "Diode setup-time knee currents\n.options reltol=1e-8 temp=50\n\
+                 v1 in 0 3\nr1 in a 100\nd1 a 0 dx area=2 pj=1 m=1.5\n\
+                 .model dx d(is=1e-14 jsw=2e-14 n=1.1 ns=1.2 rs=7.3 trs=3m ikf=1m ikr=2m ikp=0.8m)";
+    for (tag, sweep) in [
+        ("knee-area", "@d1[area] 0.5 4 0.5"),
+        ("knee-multiplier", "@d1[m] 0.5 3 0.5"),
+        ("knee-perimeter", "@d1[pj] 0 4 1"),
     ] {
         compare(tag, &format!("{diode}\n.dc {sweep}"), NONLINEAR);
     }

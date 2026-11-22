@@ -87,26 +87,27 @@ fn run_rust(deck: &str) -> Plot {
 }
 
 fn roots(plot: &Plot, kind: &str) -> Vec<Complex> {
-    plot.variables
+    plot.variables()
         .iter()
         .enumerate()
         .filter(|(_, v)| v.name.starts_with(&format!("v({kind}(")))
-        .map(|(i, _)| plot.points[0][i])
+        .map(|(i, _)| plot.points()[0][i])
         .collect()
 }
 
 /// Whether the two plots have the same variables and every C root has its
 /// own Rust root within the bound.
 fn same_roots(ours: &Plot, theirs: &Plot) -> Result<(), String> {
-    let names = |p: &Plot| -> Vec<String> { p.variables.iter().map(|v| v.name.clone()).collect() };
-    if names(ours) != names(theirs) || ours.flags != theirs.flags {
+    let names =
+        |p: &Plot| -> Vec<String> { p.variables().iter().map(|v| v.name.clone()).collect() };
+    if names(ours) != names(theirs) || ours.flags() != theirs.flags() {
         return Err(format!(
             "layout: port {:?}, C {:?}",
             names(ours),
             names(theirs)
         ));
     }
-    let scale = theirs.points[0]
+    let scale = theirs.points()[0]
         .iter()
         .fold(0.0_f64, |m, z| m.max(z.magnitude()));
     for kind in ["pole", "zero"] {

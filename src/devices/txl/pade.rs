@@ -32,17 +32,59 @@ pub(super) struct Term {
     pub c: Real,
     pub x: Real,
 }
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ComplexTerm {
+    pub residue: Complex,
+    pub pole: Complex,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum Propagation<const N: usize, const R: usize> {
+    Real([Term; N]),
+    Conjugate { real: [Term; R], pair: ComplexTerm },
+}
+impl<const N: usize, const R: usize> Propagation<N, R> {
+    fn from_c(terms: [Term; N], pair: bool) -> Self {
+        if pair {
+            Self::Conjugate {
+                real: std::array::from_fn(|i| terms[i]),
+                pair: ComplexTerm {
+                    residue: Complex::new(terms[R].c, terms[R + 1].c),
+                    pole: Complex::new(terms[R].x, terms[R + 1].x),
+                },
+            }
+        } else {
+            Self::Real(terms)
+        }
+    }
+
+    // C sums the scalar storage slots, including the imaginary residue.
+    pub(super) fn residue_sum(&self) -> Real {
+        match self {
+            Self::Real(terms) => terms.iter().map(|t| t.c).sum(),
+            Self::Conjugate { real, pair } => real
+                .iter()
+                .map(|t| t.c)
+                .chain([pair.residue.re, pair.residue.im])
+                .sum(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct LossyPade {
+    pub h1: [Term; 3],
+    pub h2: Propagation<3, 1>,
+    pub h3: Propagation<6, 4>,
+    pub h1c: Real,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct Pade {
     pub admit: Real,
-    /// Delay in picoseconds (C's `taul`).
-    pub delay: Real,
-    pub lossless: bool,
-    pub complex: bool,
-    pub h1: [Term; 3],
-    pub h2: [Term; 3],
-    pub h3: [Term; 6],
-    pub h1c: Real,
+    /// Delay in picoseconds (C's `taul`), not rounded to integer ticks.
+    pub delay_ps: Real,
+    pub lossy: Option<LossyPade>,
     pub atten2: Real,
     pub atten3: Real,
 }
@@ -184,24 +226,24 @@ impl Pade {
         let l = l.max(1e-12);
         let admit = (c / l).sqrt();
         let tau = (l * c).sqrt();
-        let mut h = Self {
-            admit,
-            delay: tau * length * 1e12,
-            lossless: r / l < 5e5 && g < 1e-2,
-            complex: false,
-            h1: [Term::default(); 3],
-            h2: [Term::default(); 3],
-            h3: [Term::default(); 6],
-            h1c: 0.,
-            atten2: 1.,
-            atten3: admit,
-        };
-        if !h.admit.is_finite() || h.admit <= 0. || !h.delay.is_finite() || h.delay <= 0. {
+        let delay_ps = tau * length * 1e12;
+        if !admit.is_finite() || admit <= 0. || !delay_ps.is_finite() || delay_ps <= 0. {
             return Err(error("nonfinite or degenerate line admittance/delay"));
         }
-        if h.lossless {
-            return Ok(h);
+        if r / l < 5e5 && g < 1e-2 {
+            return Ok(Self {
+                admit,
+                delay_ps,
+                lossy: None,
+                atten2: 1.,
+                atten3: admit,
+            });
         }
+        // C-shaped temporary arrays are only used during coefficient construction.
+        let mut h1 = [Term::default(); 3];
+        let mut h2 = [Term::default(); 3];
+        let mut h3 = [Term::default(); 6];
+        let mut h1c = 0.;
         // mac(): derivatives of sqrt((1+a z)/(1+b z)), before factorials.
         let a = g / c;
         let b = r / l;
@@ -229,7 +271,7 @@ impl Pade {
         let (x, _) = roots(p, false)?;
         let cs = residues(p, q, x, false);
         for i in 0..3 {
-            h.h1[i] = Term { c: cs[i], x: x[i] };
+            h1[i] = Term { c: cs[i], x: x[i] };
         }
         // exp_pade(): expansion of exp(-length*sqrt((sL+R)(sC+G))).
         let y1 = 0.5 * (a + b);
@@ -268,19 +310,18 @@ impl Pade {
             q[i] /= divisor;
         }
         let (x, pair) = roots(p, true)?;
-        h.complex = pair;
         let cs = residues(p, q, x, pair);
         for i in 0..3 {
-            h.h2[i] = Term { c: cs[i], x: x[i] };
+            h2[i] = Term { c: cs[i], x: x[i] };
         }
-        h.atten2 = (-a0).exp();
-        h.atten3 = h.atten2 * admit;
+        let atten2 = (-a0).exp();
+        let atten3 = atten2 * admit;
         // get_h3(): residues of the product H1*H2, before attenuation.
         for i in 0..3 {
-            let t = h.h1[i];
+            let t = h1[i];
             let mut sum = 0.;
             if pair {
-                let [u, v, w] = h.h2;
+                let [u, v, w] = h2;
                 let single_pole = u.c / (t.x - u.x);
                 let v_residue = v.c * t.x;
                 let w_residue = w.x * w.c;
@@ -289,57 +330,66 @@ impl Pade {
                 sum += single_pole
                     + 2. * pair_numerator / (t.x * t.x - 2. * v.x * t.x + v.x * v.x + w.x * w.x);
             } else {
-                for u in h.h2 {
+                for u in h2 {
                     sum += u.c / (t.x - u.x);
                 }
             }
-            h.h3[i] = Term {
+            h3[i] = Term {
                 x: t.x,
                 c: t.c + t.c * sum,
             };
         }
         for i in 0..3 {
-            let t = h.h2[i];
+            let t = h2[i];
             let mut sum = 0.;
-            for u in h.h1 {
+            for u in h1 {
                 sum += u.c / (t.x - u.x);
             }
-            h.h3[i + 3] = Term {
+            h3[i + 3] = Term {
                 x: t.x,
                 c: t.c + t.c * sum,
             };
         }
         if pair {
-            let c = Complex::new(h.h2[1].c, h.h2[2].c);
-            let x = Complex::new(h.h2[1].x, h.h2[2].x);
+            let c = Complex::new(h2[1].c, h2[2].c);
+            let x = Complex::new(h2[1].x, h2[2].x);
             let mut res = c;
-            for u in h.h1 {
+            for u in h1 {
                 res = res + (c / (x - Complex::real(u.x))) * Complex::real(u.c);
             }
-            h.h3[4].c = res.re;
-            h.h3[5].c = res.im;
+            h3[4].c = res.re;
+            h3[5].c = res.im;
         }
-        for t in &mut h.h1 {
+        for t in &mut h1 {
             t.c *= admit;
-            h.h1c += t.c;
+            h1c += t.c;
         }
-        for t in &mut h.h2 {
-            t.c *= h.atten2;
+        for t in &mut h2 {
+            t.c *= atten2;
         }
-        for t in &mut h.h3 {
-            t.c *= h.atten3;
+        for t in &mut h3 {
+            t.c *= atten3;
         }
-        if !h.delay.is_finite()
-            || h.delay <= 0.
-            || h.h1
-                .iter()
-                .chain(&h.h2)
-                .chain(&h.h3)
-                .any(|t| !t.c.is_finite() || !t.x.is_finite() || t.x == 0.)
-            || !h.h1c.is_finite()
+        if h1
+            .iter()
+            .chain(&h2)
+            .chain(&h3)
+            .any(|t| !t.c.is_finite() || !t.x.is_finite() || t.x == 0.)
+            || !h1c.is_finite()
         {
             return Err(error("nonfinite or degenerate Padé coefficients"));
         }
-        Ok(h)
+        Ok(Self {
+            admit,
+            delay_ps,
+            lossy: Some(LossyPade {
+                h1,
+                h2: Propagation::from_c(h2, pair),
+                h3: Propagation::from_c(h3, pair),
+                h1c,
+            }),
+            atten2,
+            atten3,
+        })
     }
 }

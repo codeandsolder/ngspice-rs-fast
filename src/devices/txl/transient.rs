@@ -1,204 +1,488 @@
 //! `txlload.c`/`txlacct.c`: recursive convolution over accepted V/I history.
-//! C keeps two mutable `TXLine` snapshots and advances one on the next load.
-//! Here each accepted sample carries the snapshot; trials are pure and a
-//! rejected trial cannot change convolutions, interpolation cursors or history.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
-#![expect(
-    clippy::many_single_char_names,
-    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
+//! Only the newest accepted point needs the recurrence accumulators. The
+//! waveform ring stores integer picosecond coordinates and terminal values;
+//! preparing or rejecting a trial never mutates either accepted state.
 #![expect(
     clippy::suboptimal_flops,
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
+use std::collections::VecDeque;
+
 use super::Txl;
-use super::pade::Term;
+use super::pade::{LossyPade, Propagation, Term};
 use crate::devices::delay::{DelayContext, DelayHistory, DelayLine, DelayUpdate};
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 #[cfg(test)]
 mod tests;
 
-const CLAMPED: usize = 30;
-const WIDTH: usize = 31;
-const H1: usize = 6;
-const H2: usize = 12;
-const H3: usize = 18;
 fn error(message: &str) -> SpiceError {
     SpiceError::Numerical {
         context: "TXL txlload.c".into(),
         message: message.into(),
     }
 }
-/// C uses signed integer picoseconds for its history, truncating toward zero.
-/// Reject out-of-range time rather than C's undefined float-to-int overflow.
-fn ticks(time: Real) -> SpiceResult<Real> {
-    let t = time * 1e12;
-    if !t.is_finite() || t < 0. || t > f64::from(i32::MAX) {
-        return Err(error(
-            "time is outside C's signed picosecond history range (about 2.147 ms)",
-        ));
+
+/// C stores integer picoseconds, truncating toward zero. Check the
+/// truncated integer, including the fractional interval above `i32::MAX`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Tick(i32);
+
+impl Tick {
+    fn from_seconds(time: Real) -> SpiceResult<Self> {
+        let ps = time * 1e12;
+        crate::primitives::numeric::truncating_signed_integer::<i32>(ps)
+            .map(Self)
+            .ok_or_else(|| {
+                error("time is outside C's signed picosecond history range (about 2.147 ms)")
+            })
     }
-    Ok(t.trunc())
+
+    fn accepted(time: Real) -> SpiceResult<Self> {
+        if time < 0. {
+            return Err(error("negative TXL history time"));
+        }
+        Self::from_seconds(time)
+    }
+
+    fn ps(self) -> Real {
+        Real::from(self.0)
+    }
 }
-fn sample(h: &DelayHistory, i: usize) -> SpiceResult<[Real; WIDTH]> {
-    let mut a = [0.; WIDTH];
-    for (k, v) in a.iter_mut().enumerate() {
-        *v = h
-            .value(i, k)
-            .ok_or_else(|| error("incomplete accepted history"))?;
-    }
-    Ok(a)
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TerminalValues {
+    voltage: [Real; 2],
+    current: [Real; 2],
 }
-fn last(h: &DelayHistory) -> SpiceResult<[Real; WIDTH]> {
-    sample(
-        h,
-        h.len()
-            .checked_sub(1)
-            .ok_or_else(|| error("empty accepted history"))?,
-    )
-}
-/// `get_pvs_vi_txl`, with a read-only binary-search cursor instead of C's
-/// linked-list cursor. Values are [input V, output V, input I, output I].
-fn delayed(h: &DelayHistory, t: Real, previous: Real, now: Real) -> SpiceResult<([Real; 4], Real)> {
-    let s = last(h)?;
-    if t <= 0. {
-        return Ok(([s[4], s[5], 0., 0.], 0.));
-    }
-    if t > previous {
-        let ratio = (t - previous) / (now - previous);
-        return Ok((
-            [
-                s[0] * (1. - ratio),
-                s[1] * (1. - ratio),
-                s[2] * (1. - ratio),
-                s[3] * (1. - ratio),
-            ],
-            ratio,
-        ));
-    }
-    let mut lo = 0;
-    let mut hi = h.len() - 1;
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        if ticks(h.time(mid).ok_or_else(|| error("missing history time"))?)? <= t {
-            lo = mid;
-        } else {
-            hi = mid - 1;
+
+impl TerminalValues {
+    fn map(self, f: impl Fn(Real) -> Real) -> Self {
+        Self {
+            voltage: self.voltage.map(&f),
+            current: self.current.map(f),
         }
     }
-    if lo + 1 == h.len() {
-        return Ok(([s[0], s[1], s[2], s[3]], 0.));
-    }
-    let a = sample(h, lo)?;
-    let b = sample(h, lo + 1)?;
-    let t0 = ticks(h.time(lo).ok_or_else(|| error("missing history time"))?)?;
-    let t1 = ticks(
-        h.time(lo + 1)
-            .ok_or_else(|| error("missing history time"))?,
-    )?;
-    if t1 <= t0 {
-        return Err(error("non-increasing integer-picosecond history"));
-    }
-    let f = (t - t0) / (t1 - t0);
-    Ok((std::array::from_fn(|k| a[k] + f * (b[k] - a[k])), 0.))
-}
-fn exp_pair(x: Real, y: Real, h: Real) -> Complex {
-    let e = (x * h).exp();
-    Complex::new(e * (y * h).cos(), e * (y * h).sin())
-}
-/// `right_consts_txl`: trapezoidal recurrence, including C's compressed
-/// representation of the complex conjugate pair.
-fn convolve(
-    terms: &[Term],
-    old: &[Real],
-    out: &mut [Real],
-    v1: [Real; 2],
-    v2: [Real; 2],
-    h: Real,
-    pair: bool,
-) -> [Real; 2] {
-    let n = terms.len();
-    let real = if pair { n - 2 } else { n };
-    let half = 0.5 * h;
-    let mut sums = [0.; 2];
-    for i in 0..real {
-        let t = terms[i];
-        let e = (t.x * h).exp();
-        for k in 0..2 {
-            out[2 * i + k] = old[2 * i + k] * e + half * t.c * (v1[k] * e + v2[k]);
-            sums[k] += out[2 * i + k];
+
+    fn interpolate(self, next: Self, fraction: Real) -> Self {
+        let interpolate =
+            |a: [Real; 2], b: [Real; 2]| std::array::from_fn(|k| a[k] + fraction * (b[k] - a[k]));
+        Self {
+            voltage: interpolate(self.voltage, next.voltage),
+            current: interpolate(self.current, next.current),
         }
     }
-    if pair {
-        let a = n - 2;
-        let b = n - 1;
-        let e = exp_pair(terms[a].x, terms[b].x, h);
-        let c = Complex::new(half * terms[a].c, half * terms[b].c);
-        for k in 0..2 {
-            let z = Complex::new(old[2 * a + k], old[2 * b + k]) * e
-                + c * Complex::new(v1[k] * e.re + v2[k], v1[k] * e.im);
-            out[2 * a + k] = z.re;
-            out[2 * b + k] = z.im;
-            sums[k] += 2. * z.re;
+
+    fn finite(self) -> bool {
+        self.voltage
+            .into_iter()
+            .chain(self.current)
+            .all(Real::is_finite)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Sample {
+    tick: Tick,
+    values: TerminalValues,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PropagationState<const N: usize, const R: usize> {
+    Real([[Real; 2]; N]),
+    Conjugate {
+        real: [[Real; 2]; R],
+        pair: [Complex; 2],
+    },
+}
+
+fn dc_term(term: Term, voltage: [Real; 2]) -> [Real; 2] {
+    voltage.map(|v| -v * term.c / term.x)
+}
+
+impl<const N: usize, const R: usize> PropagationState<N, R> {
+    fn initial(terms: &Propagation<N, R>, voltage: Option<[Real; 2]>) -> Self {
+        let real_state = |term| voltage.map_or([0.; 2], |v| dc_term(term, v));
+        match terms {
+            Propagation::Real(terms) => Self::Real(terms.map(real_state)),
+            Propagation::Conjugate { real, pair } => Self::Conjugate {
+                real: real.map(real_state),
+                // C initializes the real and imaginary storage slots
+                // independently, not using complex division.
+                pair: voltage.map_or([Complex::new(0., 0.); 2], |v| {
+                    v.map(|v| {
+                        Complex::new(
+                            -v * pair.residue.re / pair.pole.re,
+                            -v * pair.residue.im / pair.pole.im,
+                        )
+                    })
+                }),
+            },
         }
     }
-    sums
-}
-impl Txl {
-    /// The future convolution state and branch RHS at a trial point.
-    fn trial(
-        &self,
-        history: &DelayHistory,
-        time: Real,
+
+    fn finite(&self) -> bool {
+        match self {
+            Self::Real(values) => values.iter().flatten().all(|v| v.is_finite()),
+            Self::Conjugate { real, pair } => {
+                real.iter().flatten().all(|v| v.is_finite())
+                    && pair.iter().all(|v| v.re.is_finite() && v.im.is_finite())
+            }
+        }
+    }
+
+    /// `right_consts_txl`: trapezoidal recurrence in C storage order.
+    fn advance(
+        &mut self,
+        terms: &Propagation<N, R>,
+        before: [Real; 2],
+        after: [Real; 2],
         dt: Real,
-    ) -> SpiceResult<([Real; WIDTH], [Real; 2], Real)> {
-        let old = last(history)?;
-        let mut state = old;
-        let c = &self.coefficients;
-        let now = ticks(time)?;
-        let previous = ticks((time - dt).max(0.))?.max(ticks(
-            history.last_time().ok_or_else(|| error("empty history"))?,
-        )?);
-        let (v1, _) = delayed(history, previous - c.delay, previous, now)?;
-        let (v2, ratio) = delayed(history, now - c.delay, previous, now)?;
-        let mut rhs = [0.; 2];
-        if !c.lossless {
-            for (i, t) in c.h1.iter().enumerate() {
-                let e = (t.x * dt).exp();
+    ) -> SpiceResult<[Real; 2]> {
+        let half = 0.5 * dt;
+        let mut sums = [0.; 2];
+        let mut advance_real = |terms: &[Term], values: &mut [[Real; 2]]| {
+            for (term, value) in terms.iter().zip(values) {
+                let exp = (term.x * dt).exp();
                 for k in 0..2 {
-                    rhs[k] -= old[H1 + 2 * i + k] * e + 0.5 * dt * t.c * e * old[k];
+                    value[k] = value[k] * exp + half * term.c * (before[k] * exp + after[k]);
+                    sums[k] += value[k];
                 }
             }
-            let h3 = convolve(
-                &c.h3,
-                &old[H3..CLAMPED],
-                &mut state[H3..CLAMPED],
-                [v1[0], v1[1]],
-                [v2[0], v2[1]],
-                dt,
-                c.complex,
-            );
-            let h2 = convolve(
-                &c.h2,
-                &old[H2..H3],
-                &mut state[H2..H3],
-                [v1[2], v1[3]],
-                [v2[2], v2[3]],
-                dt,
-                c.complex,
-            );
-            rhs[0] += h3[1] + h2[1];
-            rhs[1] += h3[0] + h2[0];
+        };
+        match (self, terms) {
+            (Self::Real(values), Propagation::Real(terms)) => advance_real(terms, values),
+            (
+                Self::Conjugate { real, pair },
+                Propagation::Conjugate {
+                    real: terms,
+                    pair: term,
+                },
+            ) => {
+                advance_real(terms, real);
+                let exp = (term.pole.re * dt).exp();
+                let exp = Complex::new(
+                    exp * (term.pole.im * dt).cos(),
+                    exp * (term.pole.im * dt).sin(),
+                );
+                let residue = Complex::new(half * term.residue.re, half * term.residue.im);
+                for k in 0..2 {
+                    pair[k] = pair[k] * exp
+                        + residue * Complex::new(before[k] * exp.re + after[k], before[k] * exp.im);
+                    sums[k] += 2. * pair[k].re;
+                }
+            }
+            _ => return Err(error("incompatible TXL recurrence coefficients")),
         }
-        rhs[0] += c.atten3 * v2[1] + c.atten2 * v2[3];
-        rhs[1] += c.atten3 * v2[0] + c.atten2 * v2[2];
-        if state.iter().chain(&rhs).any(|v| !v.is_finite()) {
+        Ok(sums)
+    }
+
+    /// The unknown fraction stamped into the matrix is only known at accept.
+    fn correct(
+        &mut self,
+        terms: &Propagation<N, R>,
+        values: [Real; 2],
+        delta: Real,
+        ratio: Real,
+    ) -> SpiceResult<()> {
+        let correction = |value, residue| delta * 0.5e-12 * ratio * value * residue;
+        let update_real = |terms: &[Term], state: &mut [[Real; 2]]| {
+            for (term, state) in terms.iter().zip(state) {
+                for k in 0..2 {
+                    state[k] += correction(values[k], term.c);
+                }
+            }
+        };
+        match (self, terms) {
+            (Self::Real(state), Propagation::Real(terms)) => update_real(terms, state),
+            (
+                Self::Conjugate { real, pair },
+                Propagation::Conjugate {
+                    real: terms,
+                    pair: term,
+                },
+            ) => {
+                update_real(terms, real);
+                for k in 0..2 {
+                    pair[k].re += correction(values[k], term.residue.re);
+                    pair[k].im += correction(values[k], term.residue.im);
+                }
+            }
+            _ => return Err(error("incompatible TXL recurrence coefficients")),
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Convolution {
+    h1: [[Real; 2]; 3],
+    h2: PropagationState<3, 1>,
+    h3: PropagationState<6, 4>,
+}
+
+impl Convolution {
+    fn initial(model: &LossyPade, voltage: [Real; 2]) -> Self {
+        Self {
+            h1: model.h1.map(|term| dc_term(term, voltage)),
+            h2: PropagationState::initial(&model.h2, None),
+            h3: PropagationState::initial(&model.h3, Some(voltage)),
+        }
+    }
+
+    fn finite(&self) -> bool {
+        self.h1.iter().flatten().all(|v| v.is_finite()) && self.h2.finite() && self.h3.finite()
+    }
+
+    fn advance(
+        &mut self,
+        model: &LossyPade,
+        old: TerminalValues,
+        before: TerminalValues,
+        after: TerminalValues,
+        dt: Real,
+    ) -> SpiceResult<[Real; 2]> {
+        let mut rhs = [0.; 2];
+        for (term, state) in model.h1.iter().zip(&self.h1) {
+            let exp = (term.x * dt).exp();
+            for k in 0..2 {
+                rhs[k] -= state[k] * exp + 0.5 * dt * term.c * exp * old.voltage[k];
+            }
+        }
+        let h3 = self
+            .h3
+            .advance(&model.h3, before.voltage, after.voltage, dt)?;
+        let h2 = self
+            .h2
+            .advance(&model.h2, before.current, after.current, dt)?;
+        rhs[0] += h3[1] + h2[1];
+        rhs[1] += h3[0] + h2[0];
+        Ok(rhs)
+    }
+
+    fn accept(
+        &mut self,
+        model: &LossyPade,
+        old: TerminalValues,
+        new: TerminalValues,
+        delta: Real,
+        dt: Real,
+        ratio: Real,
+    ) -> SpiceResult<()> {
+        // update_cnv_txl deliberately rescales the slope in each iteration.
+        let mut slopes: [Real; 2] =
+            std::array::from_fn(|k| (new.voltage[k] - old.voltage[k]) / delta);
+        for (term, state) in model.h1.iter().zip(&mut self.h1) {
+            let exp = (term.x * dt).exp();
+            let factor = term.c / term.x;
+            for k in 0..2 {
+                slopes[k] *= factor;
+                state[k] = (state[k] - slopes[k] * delta) * exp
+                    + (exp - 1.) * (new.voltage[k] * factor + 1e12 * slopes[k] / term.x);
+            }
+        }
+        if ratio > 0. {
+            self.h2.correct(&model.h2, new.current, delta, ratio)?;
+            self.h3.correct(&model.h3, new.voltage, delta, ratio)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AcceptedState {
+    prehistory: [Real; 2],
+    convolution: Option<Convolution>,
+    clamped: bool,
+}
+
+impl AcceptedState {
+    fn finite(&self) -> bool {
+        self.prehistory.iter().all(|v| v.is_finite())
+            && self.convolution.as_ref().is_none_or(Convolution::finite)
+    }
+}
+
+/// TXL accepted integer-picosecond waveform and latest recurrence state.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct TxlHistory {
+    samples: VecDeque<Sample>,
+    state: Option<AcceptedState>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Change {
+    Reset {
+        sample: Sample,
+        state: AcceptedState,
+    },
+    Append {
+        drop_front: usize,
+        sample: Sample,
+        state: AcceptedState,
+    },
+    Unchanged,
+}
+
+/// Prepared TXL history change, published only on transient acceptance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TxlUpdate(Change);
+
+impl TxlUpdate {
+    pub(in crate::devices) const fn is_reset(&self) -> bool {
+        matches!(self.0, Change::Reset { .. })
+    }
+}
+
+impl TxlHistory {
+    /// Number of accepted waveform points.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// Whether transient initialization has supplied a waveform.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    fn latest(&self) -> SpiceResult<(&Sample, &AcceptedState)> {
+        self.samples
+            .back()
+            .zip(self.state.as_ref())
+            .ok_or_else(|| error("empty TXL history"))
+    }
+
+    pub(in crate::devices) fn check(&self, update: &TxlUpdate) -> SpiceResult<()> {
+        let (sample, state) = match &update.0 {
+            Change::Reset { sample, state } => (sample, state),
+            Change::Append {
+                drop_front,
+                sample,
+                state,
+            } => {
+                let (last, _) = self.latest()?;
+                if *drop_front >= self.len() || sample.tick <= last.tick {
+                    return Err(error("invalid TXL history advancement"));
+                }
+                (sample, state)
+            }
+            Change::Unchanged => return Ok(()),
+        };
+        if !sample.values.finite() || !state.finite() {
+            return Err(error("nonfinite accepted convolution"));
+        }
+        Ok(())
+    }
+
+    pub(in crate::devices) fn apply_validated(&mut self, update: &TxlUpdate) {
+        match update.0 {
+            Change::Reset { sample, state } => {
+                self.samples.clear();
+                self.samples.push_back(sample);
+                self.state = Some(state);
+            }
+            Change::Append {
+                drop_front,
+                sample,
+                state,
+            } => {
+                self.samples.drain(..drop_front);
+                self.samples.push_back(sample);
+                self.state = Some(state);
+            }
+            Change::Unchanged => {}
+        }
+    }
+
+    pub(in crate::devices) fn clear(&mut self) {
+        self.samples.clear();
+        self.state = None;
+    }
+
+    /// Keep the preceding interpolation point even when the cutoff is
+    /// exactly equal to an accepted point.
+    fn drop_before(&self, cutoff: Real) -> usize {
+        self.samples
+            .partition_point(|s| s.tick.ps() < cutoff)
+            .saturating_sub(1)
+    }
+
+    /// `get_pvs_vi_txl`: integer coordinates are already stored, and
+    /// fractional delay coordinates are never rounded.
+    fn delayed(
+        &self,
+        target: Real,
+        previous: Tick,
+        now: Tick,
+    ) -> SpiceResult<(TerminalValues, Real)> {
+        let (last, state) = self.latest()?;
+        if target <= 0. {
+            return Ok((
+                TerminalValues {
+                    voltage: state.prehistory,
+                    current: [0.; 2],
+                },
+                0.,
+            ));
+        }
+        if target > previous.ps() {
+            let ratio = (target - previous.ps()) / (now.ps() - previous.ps());
+            return Ok((last.values.map(|v| v * (1. - ratio)), ratio));
+        }
+        let index = self
+            .samples
+            .partition_point(|s| s.tick.ps() < target)
+            .saturating_sub(1);
+        let left = &self.samples[index];
+        let Some(right) = self.samples.get(index + 1) else {
+            return Ok((left.values, 0.));
+        };
+        let fraction = (target - left.tick.ps()) / (right.tick.ps() - left.tick.ps());
+        Ok((left.values.interpolate(right.values, fraction), 0.))
+    }
+}
+
+struct Trial {
+    convolution: Option<Convolution>,
+    rhs: [Real; 2],
+    ratio: Real,
+}
+
+impl Txl {
+    fn trial(
+        &self,
+        history: &TxlHistory,
+        now: Tick,
+        previous: Tick,
+        dt: Real,
+    ) -> SpiceResult<Trial> {
+        let (last, accepted) = history.latest()?;
+        let previous = previous.max(last.tick);
+        let c = &self.coefficients;
+        let (before, _) = history.delayed(previous.ps() - c.delay_ps, previous, now)?;
+        let (after, ratio) = history.delayed(now.ps() - c.delay_ps, previous, now)?;
+        let mut convolution = accepted.convolution;
+        let mut rhs = match (&mut convolution, &c.lossy) {
+            (Some(state), Some(model)) => state.advance(model, last.values, before, after, dt)?,
+            (None, None) => [0.; 2],
+            _ => return Err(error("incompatible TXL accepted state")),
+        };
+        rhs[0] += c.atten3 * after.voltage[1] + c.atten2 * after.current[1];
+        rhs[1] += c.atten3 * after.voltage[0] + c.atten2 * after.current[0];
+        if !convolution.as_ref().is_none_or(Convolution::finite)
+            || !rhs.iter().all(|v| v.is_finite())
+        {
             return Err(error("nonfinite convolution"));
         }
-        Ok((state, rhs, ratio))
+        Ok(Trial {
+            convolution,
+            rhs,
+            ratio,
+        })
     }
+
     pub(super) fn transient_stamp(
         &self,
         history: &DelayHistory,
@@ -206,145 +490,122 @@ impl Txl {
         dt: Real,
         gmin: Real,
     ) -> SpiceResult<([Real; 14], [Real; 2])> {
-        let (_, rhs, ratio) = self.trial(history, time, dt)?;
-        let c = &self.coefficients;
-        let y = c.admit + 0.5 * dt * c.h1c;
-        let v = ratio * (c.atten3 + 0.5 * dt * c.h3.iter().map(|t| t.c).sum::<Real>());
-        let i = ratio * (c.atten2 + 0.5 * dt * c.h2.iter().map(|t| t.c).sum::<Real>());
-        let g = 0.1 * gmin;
-        Ok(([g, g, g, g, y, y, 1., 1., -1., -1., -v, -v, -i, -i], rhs))
+        let trial = self.trial(
+            history.as_txl()?,
+            Tick::accepted(time)?,
+            Tick::from_seconds(time - dt)?,
+            dt,
+        )?;
+        let coefficients = &self.coefficients;
+        let (h1c, h2c, h3c) = coefficients.lossy.as_ref().map_or((0., 0., 0.), |model| {
+            (model.h1c, model.h2.residue_sum(), model.h3.residue_sum())
+        });
+        let admittance = coefficients.admit + 0.5 * dt * h1c;
+        let voltage = trial.ratio * (coefficients.atten3 + 0.5 * dt * h3c);
+        let current = trial.ratio * (coefficients.atten2 + 0.5 * dt * h2c);
+        let leakage = 0.1 * gmin;
+        Ok((
+            [
+                leakage, leakage, leakage, leakage, admittance, admittance, 1., 1., -1., -1.,
+                -voltage, -voltage, -current, -current,
+            ],
+            trial.rhs,
+        ))
     }
-    fn values(&self, ctx: &DelayContext<'_>) -> SpiceResult<[Real; 4]> {
+
+    fn values(&self, ctx: &DelayContext<'_>) -> SpiceResult<TerminalValues> {
         let a = ctx.branches.start;
         if ctx.branches.len() < 2 {
             return Err(error("missing branch-current binding"));
         }
-        Ok([
-            ctx.node_voltage(self.terminals[0]),
-            ctx.node_voltage(self.terminals[1]),
-            ctx.solution
-                .get(a)
-                .ok_or_else(|| error("missing input current"))?,
-            ctx.solution
-                .get(a + 1)
-                .ok_or_else(|| error("missing output current"))?,
-        ])
+        Ok(TerminalValues {
+            voltage: self.terminals.map(|node| ctx.node_voltage(node)),
+            current: [
+                ctx.solution
+                    .get(a)
+                    .ok_or_else(|| error("missing input current"))?,
+                ctx.solution
+                    .get(a + 1)
+                    .ok_or_else(|| error("missing output current"))?,
+            ],
+        })
     }
 }
+
 impl DelayLine for Txl {
-    fn width(&self) -> usize {
-        WIDTH
+    fn new_history(&self) -> DelayHistory {
+        DelayHistory::Txl(Box::default())
     }
+
     fn start(&self, ctx: &DelayContext<'_>) -> SpiceResult<DelayUpdate> {
         if ctx.initial_conditions {
             return Err(self.unsupported("transient uic (TXL has no initial-condition setters)"));
         }
-        let v = self.values(ctx)?;
-        let mut state = [0.; WIDTH];
-        state[..4].copy_from_slice(&v);
-        state[4] = v[0];
-        state[5] = v[1];
-        if !self.coefficients.lossless {
-            for (base, terms) in [
-                (H1, self.coefficients.h1.as_slice()),
-                (H3, self.coefficients.h3.as_slice()),
-            ] {
-                for (i, t) in terms.iter().enumerate() {
-                    state[base + 2 * i] = -v[0] * t.c / t.x;
-                    state[base + 2 * i + 1] = -v[1] * t.c / t.x;
-                }
-            }
-        }
-        Ok(DelayUpdate {
-            reset: Some(vec![(0., state.to_vec())]),
-            ..DelayUpdate::default()
-        })
+        let values = self.values(ctx)?;
+        let state = AcceptedState {
+            prehistory: values.voltage,
+            convolution: self
+                .coefficients
+                .lossy
+                .as_ref()
+                .map(|model| Convolution::initial(model, values.voltage)),
+            clamped: false,
+        };
+        Ok(DelayUpdate::Txl(TxlUpdate(Change::Reset {
+            sample: Sample {
+                tick: Tick(0),
+                values,
+            },
+            state,
+        })))
     }
+
     fn accept(&self, history: &DelayHistory, ctx: &DelayContext<'_>) -> SpiceResult<DelayUpdate> {
-        let old = last(history)?;
-        let before = ticks(history.last_time().ok_or_else(|| error("empty history"))?)?;
-        let now = ticks(ctx.time)?;
+        let history = history.as_txl()?;
+        let (last, accepted) = history.latest()?;
+        let now = Tick::accepted(ctx.time)?;
         // C adds V/I records only when the integer history time advances.
-        if now <= before {
-            return Ok(DelayUpdate::default());
+        if now <= last.tick {
+            return Ok(DelayUpdate::Txl(TxlUpdate(Change::Unchanged)));
         }
         let dt = ctx.steps[0];
-        let (mut state, _, ratio) = self.trial(history, ctx.time, dt)?;
+        let trial = self.trial(history, now, Tick::from_seconds(ctx.time - dt)?, dt)?;
         let values = self.values(ctx)?;
-        if !self.coefficients.lossless {
-            // update_cnv_txl: C deliberately reuses (and rescales) bi/bo in
-            // each loop iteration. Retain that order rather than substituting
-            // the analytically exact, but different, integration formula.
-            let delta = now - before;
-            let mut slopes = [(values[0] - old[0]) / delta, (values[1] - old[1]) / delta];
-            for (i, t) in self.coefficients.h1.iter().enumerate() {
-                let e = (t.x * dt).exp();
-                let factor = t.c / t.x;
-                for k in 0..2 {
-                    slopes[k] *= factor;
-                    state[H1 + 2 * i + k] = (old[H1 + 2 * i + k] - slopes[k] * delta) * e
-                        + (e - 1.) * (values[k] * factor + 1e12 * slopes[k] / t.x);
-                }
-            }
-            if ratio > 0. {
-                // update_delayed_cnv_txl's correction for the unknown part
-                // of the delayed sample that the trial stamped in the matrix.
-                for (base, terms, offset) in [
-                    (H2, self.coefficients.h2.as_slice(), 2),
-                    (H3, self.coefficients.h3.as_slice(), 0),
-                ] {
-                    for (i, t) in terms.iter().enumerate() {
-                        for k in 0..2 {
-                            state[base + 2 * i + k] +=
-                                delta * 0.5e-12 * ratio * values[offset + k] * t.c;
-                        }
-                    }
-                }
-            }
-        }
-        // CKTmaxStep stays clamped even after the triggering gap is pruned.
-        if dt > self.coefficients.delay * 1e-12 {
-            state[CLAMPED] = 1.;
-        }
-        state[..4].copy_from_slice(&values);
-        if state.iter().any(|v| !v.is_finite()) {
-            return Err(error("nonfinite accepted convolution"));
-        }
-        // Keep the interpolation bracket before the next delayed time. DC
-        // prehistory is carried explicitly in slots 4/5 after pruning.
-        let cutoff = now - self.coefficients.delay;
-        let mut drop = 0;
-        while drop + 1 < history.len()
-            && ticks(
-                history
-                    .time(drop + 1)
-                    .ok_or_else(|| error("missing history time"))?,
-            )? < cutoff
+        let mut state = *accepted;
+        state.convolution = trial.convolution;
+        if let (Some(convolution), Some(model)) = (&mut state.convolution, &self.coefficients.lossy)
         {
-            drop += 1;
+            convolution.accept(
+                model,
+                last.values,
+                values,
+                now.ps() - last.tick.ps(),
+                dt,
+                trial.ratio,
+            )?;
         }
-        Ok(DelayUpdate {
-            drop_front: drop,
-            append: Some((ctx.time, state.to_vec())),
-            ..DelayUpdate::default()
-        })
+        // Clamp persists even after the triggering history gap is pruned.
+        state.clamped |= dt * 1e12 > self.coefficients.delay_ps;
+        Ok(DelayUpdate::Txl(TxlUpdate(Change::Append {
+            drop_front: history.drop_before(now.ps() - self.coefficients.delay_ps),
+            sample: Sample { tick: now, values },
+            state,
+        })))
     }
-    /// `TXLload`'s step control: when a load's `h` exceeds `taul`, C prints
-    /// "your time step is too large for TXL tau." and sets
-    /// `CKTmaxStep = 0.9 * taul`, which then governs the *following* steps.
-    /// The first oversized step is therefore taken in C. Reproducing that
-    /// ordering matters (it decides whether the run has one extra point), so
-    /// the bound is offered only once an accepted sample gap already exceeded
-    /// `taul`; before that the trial passes through unclamped.
+
+    /// The first oversized step is accepted in C; its clamp governs only
+    /// following steps, even after pruning.
     fn timestep_limit(
         &self,
         history: &DelayHistory,
         _ctx: &DelayContext<'_>,
     ) -> SpiceResult<Option<Real>> {
-        if self.coefficients.lossless {
+        if self.coefficients.lossy.is_none() {
             return Ok(None);
         }
-        let taul = self.coefficients.delay * 1e-12;
-        Ok((last(history)?[CLAMPED] != 0.).then_some(0.9 * taul))
+        let (_, state) = history.as_txl()?.latest()?;
+        Ok(state
+            .clamped
+            .then_some(0.9 * self.coefficients.delay_ps * 1e-12))
     }
 }

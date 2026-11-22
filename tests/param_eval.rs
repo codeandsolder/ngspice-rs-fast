@@ -271,3 +271,91 @@ fn site_errors_carry_card_context() {
             .contains("argument 1")
     );
 }
+
+#[test]
+fn dependency_diagnostics_keep_deck_order_and_shortest_cycles() {
+    // b wins the equal-length tie even though the reference to c comes first.
+    let e = scope(".param a={c+b+b}\n.param b={a}\n.param c={a}\n.param z={w}\n.param w={z}")
+        .unwrap_err();
+    assert!(
+        e.contains("'a' (e.cir:2:8) -> 'b' (e.cir:3:8) -> 'a'"),
+        "{e}"
+    );
+    let e = scope(".param a={b+c}\n.param b={d}\n.param c={a}\n.param d={a}").unwrap_err();
+    assert!(
+        e.contains("'a' (e.cir:2:8) -> 'c' (e.cir:4:8) -> 'a'"),
+        "{e}"
+    );
+    let e =
+        scope(".param a={missing}\n.param b={a}\n.param c={a}\n.param d={b+unknown}").unwrap_err();
+    assert!(e.contains("undefined parameter 'missing'"), "{e}");
+    assert!(e.contains("required by parameter 'b'"), "{e}");
+    assert!(e.contains("required by parameter 'd'"), "{e}");
+    assert!(!e.contains("required by parameter 'c'"), "{e}");
+
+    let n = deck(".func a() {c()+b()+b()}\n.func b() {a()}\n.func c() {a()}");
+    let e = ParamScope::for_netlist(&n).unwrap_err().to_string();
+    assert!(
+        e.contains("'a' (e.cir:2:7) -> 'b' (e.cir:3:7) -> 'a'"),
+        "{e}"
+    );
+    let n = deck(".func a() {a()}");
+    let e = ParamScope::for_netlist(&n).unwrap_err().to_string();
+    assert!(e.contains("recursive .func definition"), "{e}");
+}
+
+#[test]
+fn large_parameter_graph_preserves_budget_and_uses_bounded_stack() {
+    use std::fmt::Write as _;
+    use std::time::{Duration, Instant};
+
+    let count = EvalLimits::default().definitions;
+    // The first entry depends on the last through a 100,000-definition chain.
+    // Duplicate references and the backwards deck ordering exercise edge
+    // de-duplication and evaluation levels.
+    let mut source = String::new();
+    for i in 0..count - 1 {
+        let next = i + 1;
+        writeln!(source, ".param p{i}={{p{next}+p{next}-p{next}}}").unwrap();
+    }
+    let last = count - 1;
+    writeln!(source, ".param p{last}=1").unwrap();
+    let start = Instant::now();
+    let n = deck(&source);
+    let mut budget = EvalBudget::default();
+    let resolved = ParamScope::resolve(None, &[], &n.params, &mut budget).unwrap();
+    assert_eq!(resolved.get("p0"), Some(1.0));
+    assert_eq!(budget.nodes_used(), 5 * (count - 1) + 1);
+    assert!(start.elapsed() < Duration::from_secs(60));
+}
+
+#[test]
+fn large_cycle_and_undefined_chain_are_bounded() {
+    use std::fmt::Write as _;
+    use std::time::{Duration, Instant};
+
+    let count = EvalLimits::default().definitions;
+    let mut params = String::new();
+    let mut macros = String::new();
+    for i in 0..count - 1 {
+        let next = i + 1;
+        writeln!(params, ".param p{i}={{p{next}}}").unwrap();
+        writeln!(macros, ".func f{i}() {{f{next}()}}").unwrap();
+    }
+    let last = count - 1;
+    let start = Instant::now();
+    let cycle = scope(&format!("{params}.param p{last}={{p0}}")).unwrap_err();
+    assert!(cycle.contains("circular parameter definition"));
+    assert_eq!(cycle.matches(" -> ").count(), count);
+    let undefined = scope(&format!("{params}.param p{last}={{missing}}")).unwrap_err();
+    assert!(undefined.contains("undefined parameter 'missing'"));
+    assert_eq!(
+        undefined.matches("required by parameter").count(),
+        count - 1
+    );
+    let n = deck(&format!("{macros}.func f{last}() {{f0()}}"));
+    let e = ParamScope::for_netlist(&n).unwrap_err().to_string();
+    assert!(e.contains("recursive .func definition"));
+    assert_eq!(e.matches(" -> ").count(), count);
+    assert!(start.elapsed() < Duration::from_secs(90));
+}

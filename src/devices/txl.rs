@@ -15,8 +15,9 @@ use crate::devices::schema::{ScalarDomain, ScalarParameter, ScalarSchema, Scalar
 use crate::devices::traits::{AnalysisMode, Device, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterKind};
-use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, NodeTable, Real, SpiceError, SpiceResult};
 use std::collections::BTreeSet;
+pub use transient::{TxlHistory, TxlUpdate};
 
 const fn scalar(name: &'static str, unit: ScalarUnit, domain: ScalarDomain) -> ScalarParameter {
     ScalarParameter {
@@ -108,7 +109,7 @@ fn inputs(
 /// The Y instance is absent on this path. Generated nodes remain visible.
 pub(crate) fn fallback(
     instance: &DeviceInstance,
-    nodes: &mut NodeTable,
+    nodes: &mut NodeAppend<'_>,
     models: &ModelResolver<'_>,
     deck_nodes: &BTreeSet<String>,
 ) -> SpiceResult<Option<Vec<Box<dyn Device>>>> {
@@ -119,7 +120,7 @@ pub(crate) fn fallback(
     if !(m.r != 0. && m.l != 0. && m.r / m.l > 1.6e10) {
         return Ok(None);
     }
-    crate::devices::factory::append_nodes(nodes, |nodes| {
+    nodes.transaction(|nodes| {
         let terminals: [NodeId; 4] = nodes.intern_array(&instance.nodes)?;
         let mut line = [terminals[0], NodeId::GROUND, NodeId::GROUND, terminals[2]];
         for (k, node) in line.iter_mut().enumerate().take(3).skip(1) {
@@ -169,7 +170,7 @@ pub struct Txl {
 impl Txl {
     pub(crate) fn instantiate(
         instance: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         model: &ResolvedModel<'_>,
     ) -> SpiceResult<Box<dyn Device>> {
         let (m, length, instance_length) = inputs(instance, model)?;

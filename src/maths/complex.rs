@@ -41,16 +41,10 @@ pub struct DynamicGroup {
 /// `omega` times each of `e`'s contributions in stamp order, except that
 /// the contributions of one of `groups` are scaled one by one, summed and
 /// multiplied by the group's scale into a single value first
-/// ([`DynamicGroup`]).
-pub(crate) fn dynamic_terms(
-    e: &SparseMatrix,
-    groups: &[DynamicGroup],
-    omega: f64,
-) -> Vec<(usize, usize, f64)> {
-    iter_dynamic_terms(e, groups, omega).collect()
-}
-
-fn iter_dynamic_terms<'a>(
+/// ([`DynamicGroup`]). The ordinary reference stamping path retains the
+/// individual product rounding and contribution order; it is not a fused
+/// dot product.
+pub(crate) fn iter_dynamic_terms<'a>(
     e: &'a SparseMatrix,
     groups: &'a [DynamicGroup],
     omega: f64,

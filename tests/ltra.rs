@@ -434,13 +434,11 @@ fn generated_node_collision_rolls_back_just_appended_nodes() {
     let collision = nodes.intern("o1#i2").unwrap();
     nodes.set_kind(collision, NodeKind::Internal);
     let before = nodes.nodes().to_vec();
-    let err = LossyLine::instantiate(
-        &parsed.devices[0],
-        &mut nodes,
-        &models,
-        &ModelContext::default(),
-    )
-    .unwrap_err();
+    let err = nodes
+        .transaction(|nodes| {
+            LossyLine::instantiate(&parsed.devices[0], nodes, &models, &ModelContext::default())
+        })
+        .unwrap_err();
     assert!(err.to_string().contains("collision"));
     assert_eq!(nodes.nodes(), before);
     for name in ["a", "b", "o1#i1"] {

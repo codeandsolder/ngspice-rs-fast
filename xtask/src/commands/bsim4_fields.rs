@@ -6,7 +6,12 @@
 //! field names (without the `BSIM4` prefix) so that `b4set.c`, `b4temp.c` and
 //! `b4ld.c` can be followed statement by statement. No formula, default or
 //! comment text is copied; pointers, arrays and matrix bindings are skipped.
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use syn::{
+    BinOp, Expr, Member,
+    visit::{self, Visit},
+};
 
 /// One scalar field of a C struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,36 +137,51 @@ fn emit_struct(
         }
         out.push_str("            _ => return None,\n        })\n    }\n");
     }
-    // Positional access over the scalar (non-string) members, for records
-    // that hold the whole struct as numbers (`.sens`).
-    let scalars: Vec<&Field> = fields.iter().filter(|f| f.kind != "String").collect();
-    out.push_str("    /// C member names of the scalar members, in declaration order.\n    #[allow(dead_code, reason = \"uniform generated schema accessors may be unused by a particular device path\")]\n    pub(crate) const MEMBERS: &[&str] = &[\n");
-    for field in &scalars {
-        writeln!(out, "        \"{}\",", field.c_name).map_err(|e| e.to_string())?;
+    if name != "SizeParam" {
+        out.push_str("    /// The value of a real C member by name.\n    pub(crate) fn real(&self, c_name: &str) -> Option<f64> {\n        Some(match c_name {\n");
+        for field in fields.iter().filter(|f| f.kind == "f64") {
+            writeln!(
+                out,
+                "            \"{}\" => self.{},",
+                field.c_name,
+                rust_name(&field.c_name)
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        out.push_str("            _ => return None,\n        })\n    }\n");
     }
-    out.push_str("    ];\n\n");
-    out.push_str("    /// The scalar members as numbers, in [`Self::MEMBERS`] order (`i32` exactly,\n    /// a given bit as 0 or 1).\n    #[allow(dead_code, reason = \"uniform generated schema accessors may be unused by a particular device path\")]\n    pub(crate) fn to_values(&self) -> Vec<f64> {\n        vec![\n");
-    for field in &scalars {
-        let name = rust_name(&field.c_name);
-        let expression = match field.kind {
-            "f64" => format!("self.{name}"),
-            "i32" => format!("f64::from(self.{name})"),
-            _ => format!("f64::from(u8::from(self.{name}))"),
-        };
-        writeln!(out, "            {expression},").map_err(|e| e.to_string())?;
+    if name == "Instance" {
+        // Positional access over the scalar (non-string) members, for records
+        // that hold the whole struct as numbers (`.sens`).
+        let scalars: Vec<&Field> = fields.iter().filter(|f| f.kind != "String").collect();
+        out.push_str("    /// C member names of the scalar members, in declaration order.\n    #[cfg(test)]\n    pub(crate) const MEMBERS: &[&str] = &[\n");
+        for field in &scalars {
+            writeln!(out, "        \"{}\",", field.c_name).map_err(|e| e.to_string())?;
+        }
+        out.push_str("    ];\n\n");
+        out.push_str("    /// The scalar members as numbers, in [`Self::MEMBERS`] order (`i32` exactly,\n    /// a given bit as 0 or 1).\n    #[cfg(test)]\n    pub(crate) fn to_values(&self) -> Vec<f64> {\n        vec![\n");
+        for field in &scalars {
+            let name = rust_name(&field.c_name);
+            let expression = match field.kind {
+                "f64" => format!("self.{name}"),
+                "i32" => format!("f64::from(self.{name})"),
+                _ => format!("f64::from(u8::from(self.{name}))"),
+            };
+            writeln!(out, "            {expression},").map_err(|e| e.to_string())?;
+        }
+        out.push_str("        ]\n    }\n\n");
+        out.push_str("    /// Nonzero typed members for exhaustive ownership tests.\n    #[cfg(test)]\n    pub(crate) const fn seed_test_members(&mut self) {\n");
+        for field in &scalars {
+            let name = rust_name(&field.c_name);
+            let value = match field.kind {
+                "f64" => "1.",
+                "i32" => "1",
+                _ => "true",
+            };
+            writeln!(out, "        self.{name} = {value};").map_err(|e| e.to_string())?;
+        }
+        out.push_str("    }\n");
     }
-    out.push_str("        ]\n    }\n\n");
-    out.push_str("    /// Stores numbers produced by [`Self::to_values`]; `values` must have\n    /// `Self::MEMBERS.len()` entries.\n    #[allow(dead_code, clippy::cast_possible_truncation, reason = \"generated numeric snapshots round-trip exact i32 fields and may be unused for some record types\")]\n    pub(crate) const fn set_values(&mut self, values: &[f64]) {\n");
-    for (index, field) in scalars.iter().enumerate() {
-        let name = rust_name(&field.c_name);
-        let expression = match field.kind {
-            "f64" => format!("values[{index}]"),
-            "i32" => format!("values[{index}] as i32"),
-            _ => format!("values[{index}] != 0.0"),
-        };
-        writeln!(out, "        self.{name} = {expression};").map_err(|e| e.to_string())?;
-    }
-    out.push_str("    }\n");
     out.push_str("}\n");
     Ok(())
 }
@@ -169,7 +189,7 @@ fn emit_struct(
 /// `(C parameter ID, member)` for every `case` of an ask routine that reads
 /// one real member (`value->rValue = <prefix>X;`), in source order.
 fn real_asks(source: &str, prefix: &str) -> Result<Vec<(String, String)>, String> {
-    let source = crate::ifparm::strip_comments(source)?;
+    let source = super::ifparm::strip_comments(source)?;
     let mut asks: Vec<(String, String)> = Vec::new();
     let mut pending: Vec<&str> = Vec::new();
     // The asks recorded for the last case group, dropped again when C goes
@@ -211,7 +231,7 @@ fn real_asks(source: &str, prefix: &str) -> Result<Vec<(String, String)>, String
 
 /// The generated `asks.rs` text: the real asks of `b4mask.c` and `b4ask.c`
 /// that read a member directly (`sens_getp()` succeeds only for these).
-pub(crate) fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, String> {
+pub(super) fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, String> {
     let model = real_asks(mask, "model->")?;
     let instance = real_asks(ask, "here->")?;
     if model.len() != 869 || instance.len() != 40 {
@@ -227,12 +247,12 @@ pub(crate) fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, Stri
          // bsim4/{{b4mask.c,b4ask.c}}.\n\
          // Regenerate: cargo xtask bsim4-schema --source /path/to/ngspice\n\n\
          /// `b4mask.c`: `(model parameter ID, member)` asks that read one real member.\n\
-         #[rustfmt::skip]\npub(crate) const MODEL: &[(&str, &str)] = &[\n"
+         #[rustfmt::skip]\npub(super) const MODEL: &[(&str, &str)] = &[\n"
     );
     for (id, member) in &model {
         writeln!(out, "    (\"{id}\", \"{member}\"),").map_err(|e| e.to_string())?;
     }
-    out.push_str("];\n\n/// `b4ask.c`: `(instance parameter ID, member)` asks that read one real member.\n#[rustfmt::skip]\npub(crate) const INSTANCE: &[(&str, &str)] = &[\n");
+    out.push_str("];\n\n/// `b4ask.c`: `(instance parameter ID, member)` asks that read one real member.\n#[rustfmt::skip]\npub(super) const INSTANCE: &[(&str, &str)] = &[\n");
     for (id, member) in &instance {
         writeln!(out, "    (\"{id}\", \"{member}\"),").map_err(|e| e.to_string())?;
     }
@@ -240,9 +260,192 @@ pub(crate) fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, Stri
     Ok(out)
 }
 
+/// Direct scalar writes in the statement-by-statement translation.
+///
+/// The routines use a named instance argument, with no mutable field aliases
+/// or writes hidden in macros. Setup, temperature, validation and load
+/// are visited separately, including their conditional branches.
+struct InstanceWrites<'a> {
+    owner: &'a str,
+    fields: BTreeSet<String>,
+}
+
+impl InstanceWrites<'_> {
+    fn record(&mut self, expression: &Expr) {
+        match expression {
+            Expr::Field(field) => {
+                if let (Expr::Path(base), Member::Named(member)) = (&*field.base, &field.member)
+                    && base.path.is_ident(self.owner)
+                {
+                    self.fields.insert(member.to_string());
+                }
+            }
+            Expr::Paren(paren) => self.record(&paren.expr),
+            Expr::Tuple(tuple) => {
+                for element in &tuple.elems {
+                    self.record(element);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for InstanceWrites<'_> {
+    fn visit_expr_assign(&mut self, expression: &'ast syn::ExprAssign) {
+        self.record(&expression.left);
+        visit::visit_expr_assign(self, expression);
+    }
+
+    fn visit_expr_binary(&mut self, expression: &'ast syn::ExprBinary) {
+        if matches!(
+            expression.op,
+            BinOp::AddAssign(_)
+                | BinOp::SubAssign(_)
+                | BinOp::MulAssign(_)
+                | BinOp::DivAssign(_)
+                | BinOp::RemAssign(_)
+                | BinOp::BitXorAssign(_)
+                | BinOp::BitAndAssign(_)
+                | BinOp::BitOrAssign(_)
+                | BinOp::ShlAssign(_)
+                | BinOp::ShrAssign(_)
+        ) {
+            self.record(&expression.left);
+        }
+        visit::visit_expr_binary(self, expression);
+    }
+
+    fn visit_expr_reference(&mut self, expression: &'ast syn::ExprReference) {
+        if expression.mutability.is_some() {
+            self.record(&expression.expr);
+        }
+        visit::visit_expr_reference(self, expression);
+    }
+}
+
+fn instance_writes(source: &str, owner: &str) -> Result<BTreeSet<String>, String> {
+    let syntax = syn::parse_file(source).map_err(|error| error.to_string())?;
+    let mut visitor = InstanceWrites {
+        owner,
+        fields: BTreeSet::new(),
+    };
+    // Only the production routines participate in the projection; nested
+    // test/verification modules construct their own unrelated instances.
+    for item in &syntax.items {
+        if let syn::Item::Fn(function) = item {
+            visitor.visit_item_fn(function);
+        }
+    }
+    Ok(visitor.fields)
+}
+
+fn emit_instance_ownership(out: &mut String, fields: &[Field]) -> Result<(), String> {
+    let phases = [
+        (
+            "SETUP_WRITES",
+            instance_writes(
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../src/devices/bsim4/set.rs"
+                )),
+                "h",
+            )?,
+        ),
+        (
+            "TEMPERATURE_WRITES",
+            instance_writes(
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../src/devices/bsim4/temp.rs"
+                )),
+                "h",
+            )?,
+        ),
+        (
+            "CHECK_WRITES",
+            instance_writes(
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../src/devices/bsim4/check.rs"
+                )),
+                "h",
+            )?,
+        ),
+        (
+            "LOAD_WRITES",
+            instance_writes(
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../src/devices/bsim4/load.rs"
+                )),
+                "here",
+            )?,
+        ),
+    ];
+    let known: BTreeSet<_> = fields
+        .iter()
+        .map(|field| rust_name(&field.c_name))
+        .collect();
+    for (stage, writes) in &phases {
+        if let Some(unknown) = writes.difference(&known).next() {
+            return Err(format!("{stage}: unknown instance member {unknown}"));
+        }
+    }
+    // b4temp.c assigns both overlap capacitances unconditionally. A new
+    // overlap needs review of whether preparation actually resets it on
+    // every path; a conditional write is not enough to discard live state.
+    let overlap: BTreeSet<_> = phases[3]
+        .1
+        .iter()
+        .filter(|name| phases[..3].iter().any(|(_, writes)| writes.contains(*name)))
+        .map(String::as_str)
+        .collect();
+    if overlap != BTreeSet::from(["cgdo", "cgso"]) {
+        return Err(format!(
+            "BSIM4 load/preparation overlap changed: {overlap:?}; review reset ownership"
+        ));
+    }
+    let persistent: BTreeSet<_> = phases[3]
+        .1
+        .iter()
+        .filter(|name| !phases[..3].iter().any(|(_, writes)| writes.contains(*name)))
+        .cloned()
+        .collect();
+    out.push_str("\n#[rustfmt::skip]\nimpl Instance {\n");
+    for (stage, writes) in &phases {
+        writeln!(out, "    /// Scalar write set derived from the translated routine.\n    #[cfg(test)]\n    pub(crate) const {stage}: &[&str] = &[").map_err(|e| e.to_string())?;
+        for field in fields
+            .iter()
+            .filter(|field| writes.contains(&rust_name(&field.c_name)))
+        {
+            writeln!(out, "        \"{}\",", field.c_name).map_err(|e| e.to_string())?;
+        }
+        out.push_str("    ];\n");
+    }
+    out.push_str("    /// Rebase persistent load state onto a fresh setup/temperature snapshot.\n    ///\n    /// Fields also written by preparation belong to that fresh snapshot.\n    pub(crate) const fn with_previous_load_state(&self, previous: &Self) -> Self {\n        Self {\n");
+    for field in fields {
+        let name = rust_name(&field.c_name);
+        if field.kind == "String" {
+            return Err(format!(
+                "instance member {} needs explicit ownership review",
+                field.c_name
+            ));
+        }
+        let owner = if persistent.contains(&name) {
+            "previous"
+        } else {
+            "self"
+        };
+        writeln!(out, "            {name}: {owner}.{name},").map_err(|e| e.to_string())?;
+    }
+    out.push_str("        }\n    }\n}\n");
+    Ok(())
+}
+
 /// The generated `fields.rs` text.
-pub(crate) fn fields(header: &str, revision: &str) -> Result<String, String> {
-    let header = crate::ifparm::strip_comments(header)?;
+pub(super) fn fields(header: &str, revision: &str) -> Result<String, String> {
+    let header = super::ifparm::strip_comments(header)?;
     let instance = members(
         &header,
         "typedef struct sBSIM4instance\n{",
@@ -272,17 +475,28 @@ pub(crate) fn fields(header: &str, revision: &str) -> Result<String, String> {
     // Only the generated schema may retain these C-field spelling and
     // monolithic accessor patterns. The source policy verifies provenance.
     out.push_str(
-        "#![allow(\n    non_snake_case,\n    clippy::struct_excessive_bools,\n    clippy::used_underscore_binding,\n    clippy::too_many_lines,\n    clippy::large_stack_arrays,\n    clippy::redundant_pub_crate,\n    reason = \"generated C schema preserves member spelling, layout and uniform positional accessors\"\n)]\n",
+        "#![allow(\n    non_snake_case,\n    clippy::struct_excessive_bools,\n    clippy::used_underscore_binding,\n    clippy::too_many_lines,\n    clippy::large_stack_arrays,\n    clippy::redundant_pub_crate,\n    reason = \"generated C schema preserves member spelling, layout and uniform typed accessors\"\n)]\n",
     );
     emit_struct(&mut out, "Model", "struct sBSIM4model", &model)?;
     emit_struct(&mut out, "SizeParam", "struct bsim4SizeDependParam", &size)?;
     emit_struct(&mut out, "Instance", "struct sBSIM4instance", &instance)?;
+    emit_instance_ownership(&mut out, &instance)?;
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::real_asks;
+    use super::{instance_writes, real_asks};
+
+    #[test]
+    fn ownership_includes_conditional_and_compound_writes_but_not_reads() {
+        let source = r#"fn f() { if h.read == 1 { h.a = 0; h.b += 1; f(&mut h.c); } /* h.fake = 0; */ let _ = "h.fake = 0"; (h.d, h.e) = (1, 2); }"#;
+        let writes = instance_writes(source, "h").unwrap();
+        assert_eq!(
+            writes.into_iter().collect::<Vec<_>>(),
+            ["a", "b", "c", "d", "e"]
+        );
+    }
 
     #[test]
     fn real_asks_keeps_case_aliases_and_discards_scaled_values() {

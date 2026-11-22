@@ -56,6 +56,7 @@ fn an_empty_geometric_schedule_still_validates_its_start() {
     assert!(
         ContinuationPolicy::geometric_gmin(1e-3, 10., 0)
             .unwrap()
+            .as_slice()
             .is_empty()
     );
 }

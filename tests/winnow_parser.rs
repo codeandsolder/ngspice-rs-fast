@@ -43,7 +43,7 @@ fn repeat_cannot_swallow_a_missing_assignment_value() {
     ] {
         match parse(card).unwrap_err() {
             SpiceError::Parse { location, message } => {
-                assert_eq!(location.column as usize, card.len() + 1, "{card}");
+                assert_eq!(location.column, card.len() + 1, "{card}");
                 assert!(message.contains("finite numeric literal"), "{message}");
             }
             other => panic!("{card}: incomplete assignment was replaced with {other}"),
@@ -63,7 +63,7 @@ fn optional_numeric_slots_commit_non_finite_values() {
         let expected_column = card.find("1e999").unwrap() + 1;
         match parse(card).unwrap_err() {
             SpiceError::Parse { location, .. } => {
-                assert_eq!(location.column as usize, expected_column, "{card}");
+                assert_eq!(location.column, expected_column, "{card}");
             }
             other => panic!("{card}: non-finite literal became {other}"),
         }
@@ -136,7 +136,7 @@ fn trailing_tokens_are_never_ignored_on_device_cards() {
 fn error_columns_remain_byte_based_for_unicode_nodes() {
     let card = "R1 α 0 1k tc1=";
     match parse(card).unwrap_err() {
-        SpiceError::Parse { location, .. } => assert_eq!(location.column as usize, card.len() + 1),
+        SpiceError::Parse { location, .. } => assert_eq!(location.column, card.len() + 1),
         other => panic!("expected located parse error, got {other}"),
     }
 }
@@ -150,4 +150,17 @@ fn independent_calls_do_not_share_backtracking_state() {
     let first = parser.parse_deck(&valid).unwrap();
     assert!(parser.parse_deck(&deck("V1 a 0 ac \"gain\"")).is_err());
     assert_eq!(parser.parse_deck(&valid).unwrap(), first);
+}
+
+#[test]
+fn indented_and_continued_setter_eof_points_to_real_line() {
+    for (card, expected) in [
+        ("  R1 a 0 1k tc1= ; comment", (2, 17)),
+        ("  R1 α 0 1k\n* between\n  + tc1= ; comment", (4, 9)),
+    ] {
+        let SpiceError::Parse { location, .. } = parse(card).unwrap_err() else {
+            panic!("expected a parse error for {card}");
+        };
+        assert_eq!((location.line, location.column), expected, "{card}");
+    }
 }

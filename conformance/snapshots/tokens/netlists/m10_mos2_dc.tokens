@@ -214,28 +214,28 @@ card 17 @netlists/m10_mos2_dc.cir:18:1 lines=18-19 continuations=1
   token 26 18:76 word "ucrit"
   token 27 18:81 equals "="
   token 28 18:82 number "2e4" value=2e4
-  token 29 18:86 word "uexp"
-  token 30 18:90 equals "="
-  token 31 18:91 number "0.15" value=1.5e-1
-  token 32 18:96 word "vmax"
-  token 33 18:100 equals "="
-  token 34 18:101 number "5e4" value=5e4
-  token 35 18:105 word "neff"
-  token 36 18:109 equals "="
-  token 37 18:110 number "2" value=2e0
-  token 38 18:112 word "nfs"
-  token 39 18:115 equals "="
-  token 40 18:116 number "2e11" value=2e11
-  token 41 18:121 word "delta"
-  token 42 18:126 equals "="
-  token 43 18:127 number "0.6" value=6.000000000000001e-1
-  token 44 18:131 word "gamma"
-  token 45 18:136 equals "="
-  token 46 18:137 number "0.6" value=6.000000000000001e-1
-  token 47 18:141 word "phi"
-  token 48 18:144 equals "="
-  token 49 18:145 number "0.7" value=7.000000000000001e-1
-  token 50 18:148 rparen ")"
+  token 29 19:3 word "uexp"
+  token 30 19:7 equals "="
+  token 31 19:8 number "0.15" value=1.5e-1
+  token 32 19:13 word "vmax"
+  token 33 19:17 equals "="
+  token 34 19:18 number "5e4" value=5e4
+  token 35 19:22 word "neff"
+  token 36 19:26 equals "="
+  token 37 19:27 number "2" value=2e0
+  token 38 19:29 word "nfs"
+  token 39 19:32 equals "="
+  token 40 19:33 number "2e11" value=2e11
+  token 41 19:38 word "delta"
+  token 42 19:43 equals "="
+  token 43 19:44 number "0.6" value=6.000000000000001e-1
+  token 44 19:48 word "gamma"
+  token 45 19:53 equals "="
+  token 46 19:54 number "0.6" value=6.000000000000001e-1
+  token 47 19:58 word "phi"
+  token 48 19:61 equals "="
+  token 49 19:62 number "0.7" value=7.000000000000001e-1
+  token 50 19:65 rparen ")"
 card 18 @netlists/m10_mos2_dc.cir:20:1 lines=20-21 continuations=1
   raw: ".model mclm nmos(level=2 tox=30n nsub=2e16 tpg=1 nss=1e10 xj=0.4u u0=500 ucrit=1.5e4 uexp=0.1 delta=0.3 tnom=20)"
   kind: dot(.model)
@@ -267,16 +267,16 @@ card 18 @netlists/m10_mos2_dc.cir:20:1 lines=20-21 continuations=1
   token 26 20:74 word "ucrit"
   token 27 20:79 equals "="
   token 28 20:80 number "1.5e4" value=1.5e4
-  token 29 20:86 word "uexp"
-  token 30 20:90 equals "="
-  token 31 20:91 number "0.1" value=1e-1
-  token 32 20:95 word "delta"
-  token 33 20:100 equals "="
-  token 34 20:101 number "0.3" value=3.0000000000000004e-1
-  token 35 20:105 word "tnom"
-  token 36 20:109 equals "="
-  token 37 20:110 number "20" value=2e1
-  token 38 20:112 rparen ")"
+  token 29 21:3 word "uexp"
+  token 30 21:7 equals "="
+  token 31 21:8 number "0.1" value=1e-1
+  token 32 21:12 word "delta"
+  token 33 21:17 equals "="
+  token 34 21:18 number "0.3" value=3.0000000000000004e-1
+  token 35 21:22 word "tnom"
+  token 36 21:26 equals "="
+  token 37 21:27 number "20" value=2e1
+  token 38 21:29 rparen ")"
 card 19 @netlists/m10_mos2_dc.cir:22:1 lines=22-23 continuations=1
   raw: ".model mp pmos(level=2 vto=-0.8 tox=25n nsub=1.5e16 xj=0.3u ld=0.08u u0=220 ucrit=3e4 uexp=0.2 vmax=4e4 nfs=1e11 lambda=0.03 rd=20 rsh=15)"
   kind: dot(.model)
@@ -308,25 +308,25 @@ card 19 @netlists/m10_mos2_dc.cir:22:1 lines=22-23 continuations=1
   token 26 22:77 word "ucrit"
   token 27 22:82 equals "="
   token 28 22:83 number "3e4" value=3e4
-  token 29 22:87 word "uexp"
-  token 30 22:91 equals "="
-  token 31 22:92 number "0.2" value=2e-1
-  token 32 22:96 word "vmax"
-  token 33 22:100 equals "="
-  token 34 22:101 number "4e4" value=4e4
-  token 35 22:105 word "nfs"
-  token 36 22:108 equals "="
-  token 37 22:109 number "1e11" value=1e11
-  token 38 22:114 word "lambda"
-  token 39 22:120 equals "="
-  token 40 22:121 number "0.03" value=3e-2
-  token 41 22:126 word "rd"
-  token 42 22:128 equals "="
-  token 43 22:129 number "20" value=2e1
-  token 44 22:132 word "rsh"
-  token 45 22:135 equals "="
-  token 46 22:136 number "15" value=1.5e1
-  token 47 22:138 rparen ")"
+  token 29 23:3 word "uexp"
+  token 30 23:7 equals "="
+  token 31 23:8 number "0.2" value=2e-1
+  token 32 23:12 word "vmax"
+  token 33 23:16 equals "="
+  token 34 23:17 number "4e4" value=4e4
+  token 35 23:21 word "nfs"
+  token 36 23:24 equals "="
+  token 37 23:25 number "1e11" value=1e11
+  token 38 23:30 word "lambda"
+  token 39 23:36 equals "="
+  token 40 23:37 number "0.03" value=3e-2
+  token 41 23:42 word "rd"
+  token 42 23:44 equals "="
+  token 43 23:45 number "20" value=2e1
+  token 44 23:48 word "rsh"
+  token 45 23:51 equals "="
+  token 46 23:52 number "15" value=1.5e1
+  token 47 23:54 rparen ")"
 card 20 @netlists/m10_mos2_dc.cir:24:1 lines=24-25 continuations=1
   raw: ".model mvsat nmos(level=2 vto=0.6 kp=60u gamma=0.4 phi=0.65 tox=20n vmax=6e4 neff=1.5 xj=0.25u nsub=3e16)"
   kind: dot(.model)
@@ -358,13 +358,13 @@ card 20 @netlists/m10_mos2_dc.cir:24:1 lines=24-25 continuations=1
   token 26 24:78 word "neff"
   token 27 24:82 equals "="
   token 28 24:83 number "1.5" value=1.5e0
-  token 29 24:87 word "xj"
-  token 30 24:89 equals "="
-  token 31 24:90 number "0.25u" value=2.5e-7
-  token 32 24:96 word "nsub"
-  token 33 24:100 equals "="
-  token 34 24:101 number "3e16" value=3e16
-  token 35 24:105 rparen ")"
+  token 29 25:3 word "xj"
+  token 30 25:5 equals "="
+  token 31 25:6 number "0.25u" value=2.5e-7
+  token 32 25:12 word "nsub"
+  token 33 25:16 equals "="
+  token 34 25:17 number "3e16" value=3e16
+  token 35 25:21 rparen ")"
 card 21 @netlists/m10_mos2_dc.cir:26:1 lines=26-26 continuations=0
   raw: ".model mplain nmos(level=2 vto=0.8 kp=40u gamma=0.5 phi=0.6 lambda=0.02 delta=0.4 ucrit=1e4 uexp=0.1)"
   kind: dot(.model)

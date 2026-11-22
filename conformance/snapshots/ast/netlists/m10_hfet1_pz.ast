@@ -57,8 +57,8 @@ scope root
         [5] name="rf" kind=scalar value="2e3" @netlists/m10_hfet1_pz.cir:8:52
         [6] name="rdi" kind=scalar value="50" @netlists/m10_hfet1_pz.cir:8:59
         [7] name="rsi" kind=scalar value="50" @netlists/m10_hfet1_pz.cir:8:66
-        [8] name="js1s" kind=scalar value="1e-12" @netlists/m10_hfet1_pz.cir:8:73
-        [9] name="js1d" kind=scalar value="1e-12" @netlists/m10_hfet1_pz.cir:8:84
+        [8] name="js1s" kind=scalar value="1e-12" @netlists/m10_hfet1_pz.cir:9:3
+        [9] name="js1d" kind=scalar value="1e-12" @netlists/m10_hfet1_pz.cir:9:14
   subcircuits (0):
   analyses (1):
     analysis [0] kind=pz @netlists/m10_hfet1_pz.cir:10:1

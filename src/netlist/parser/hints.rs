@@ -30,8 +30,7 @@ use crate::netlist::ast::{NodeHint, NodeHintCard, NodeHintValue};
 use crate::netlist::token::TokenKind;
 
 use super::grammar::{Failure, Input, ParsedCard, Result, keyword, location};
-use super::syntax::{canonical_node, equals};
-use super::vector::punctuation;
+use super::syntax::{canonical_node, equals, punctuation};
 
 pub(super) fn hint_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     let token = winnow::combinator::alt((keyword(".ic"), keyword(".nodeset"))).parse_next(input)?;

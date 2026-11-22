@@ -418,7 +418,7 @@ fn sgn(x: Real) -> i32 {
 
 /// C `logb`: the unbiased binary exponent of a nonzero finite value.
 fn logb(x: Real) -> SpiceResult<Real> {
-    crate::primitives::value::binary_exponent(x)
+    crate::primitives::numeric::binary_exponent(x)
         .map(Real::from)
         .ok_or_else(|| numerical("pole-zero search", "invalid determinant component exponent"))
 }
@@ -439,16 +439,11 @@ fn base2_determinant(mantissa: Complex, p: i32) -> SpiceResult<(Cx, i64)> {
     if y < z {
         y = z;
     }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the decimal exponent is i32, so its base-2 conversion fits exactly in i64"
-    )]
-    let exponent = (x + y) as i64;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the C pole-zero scaling algorithm intentionally truncates its exponent to i32"
-    )]
-    let shift = 2.0_f64.powi(-(y as i32));
+    let exponent = crate::primitives::exact_signed_integer(x + y)
+        .ok_or_else(|| numerical("pole-zero search", "invalid determinant exponent"))?;
+    let shift = crate::primitives::truncating_signed_integer::<i32>(y)
+        .map(|shift| 2.0_f64.powi(-shift))
+        .ok_or_else(|| numerical("pole-zero search", "invalid determinant shift"))?;
     Ok((Cx::new(re * shift, im * shift), exponent))
 }
 

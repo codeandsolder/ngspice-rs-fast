@@ -51,12 +51,12 @@ scope root
         [5] name="mu" kind=scalar value="0.3" @netlists/sens_mesa4_ts.cir:17:54
         [6] name="gamma" kind=scalar value="2.5" @netlists/sens_mesa4_ts.cir:17:61
         [7] name="nmax" kind=scalar value="4e16" @netlists/sens_mesa4_ts.cir:17:71
-        [8] name="cas" kind=scalar value="0.9" @netlists/sens_mesa4_ts.cir:17:81
-        [9] name="cbs" kind=scalar value="1.1" @netlists/sens_mesa4_ts.cir:17:89
-        [10] name="epsi" kind=scalar value="1.142189e-10" @netlists/sens_mesa4_ts.cir:17:97
-        [11] name="phib" kind=scalar value="3.1232e18" @netlists/sens_mesa4_ts.cir:17:115
-        [12] name="rtc1" kind=scalar value="1e-3" @netlists/sens_mesa4_ts.cir:17:130
-        [13] name="rtc2" kind=scalar value="1e-5" @netlists/sens_mesa4_ts.cir:17:140
+        [8] name="cas" kind=scalar value="0.9" @netlists/sens_mesa4_ts.cir:18:3
+        [9] name="cbs" kind=scalar value="1.1" @netlists/sens_mesa4_ts.cir:18:11
+        [10] name="epsi" kind=scalar value="1.142189e-10" @netlists/sens_mesa4_ts.cir:18:19
+        [11] name="phib" kind=scalar value="3.1232e18" @netlists/sens_mesa4_ts.cir:18:37
+        [12] name="rtc1" kind=scalar value="1e-3" @netlists/sens_mesa4_ts.cir:18:52
+        [13] name="rtc2" kind=scalar value="1e-5" @netlists/sens_mesa4_ts.cir:18:62
   subcircuits (0):
   analyses (1):
     analysis [0] kind=sens @netlists/sens_mesa4_ts.cir:19:1

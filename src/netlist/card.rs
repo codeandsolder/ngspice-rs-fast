@@ -7,7 +7,7 @@
 
 use crate::primitives::{AnalysisKind, SourceLoc, SpiceResult};
 
-use crate::netlist::source::LogicalLine;
+use crate::netlist::source::{LogicalLine, SourceMap, SourcePosition};
 use crate::netlist::token::{Token, tokenize};
 
 /// Device designator letters recognised by the C front end.
@@ -267,6 +267,7 @@ pub struct RawCard {
     pub tokens: Vec<Token>,
     /// What the first token says the card is.
     pub kind: CardKind,
+    pub(crate) source_map: SourceMap,
 }
 
 impl RawCard {
@@ -283,7 +284,12 @@ impl RawCard {
             raw: line.text.clone(),
             tokens,
             kind,
+            source_map: line.source_map.clone(),
         })
+    }
+
+    pub(crate) fn position(&self) -> SourcePosition<'_> {
+        self.source_map.position(&self.location, 0)
     }
 
     /// The card's first token.

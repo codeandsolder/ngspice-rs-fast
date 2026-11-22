@@ -518,7 +518,7 @@ fn scalar_schema_extension_retains_units_last_set_sources_and_defaults() {
 #[test]
 fn unavailable_factories_and_failures_leave_existing_circuit_state_unchanged() {
     let mut circuit = Circuit::from_netlist(&deck("v1 old 0 1\nr1 old 0 1k")).unwrap();
-    let nodes = circuit.nodes().clone();
+    let nodes = circuit.nodes().nodes().to_vec();
     let count = circuit.device_count();
     let unknowns = circuit.unknown_count();
     let branches: Vec<_> = (0..count).map(|i| circuit.branch_rows(i)).collect();
@@ -557,7 +557,7 @@ fn unavailable_factories_and_failures_leave_existing_circuit_state_unchanged() {
                 .is_err(),
             "{body}"
         );
-        assert_eq!(circuit.nodes().nodes(), nodes.nodes());
+        assert_eq!(circuit.nodes().nodes(), nodes);
         assert_eq!(circuit.device_count(), count);
         assert_eq!(circuit.unknown_count(), unknowns);
         assert_eq!(

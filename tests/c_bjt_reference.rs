@@ -67,7 +67,7 @@ fn compare(tag: &str, deck: &str) {
     let rust = run_rust(deck);
     assert_eq!(rust.point_count(), c.point_count(), "{tag}: point counts");
     let mut compared = 0;
-    for variable in &c.variables {
+    for variable in c.variables() {
         let name = variable.name.to_ascii_lowercase();
         if !(name.starts_with("v(") || name.starts_with("i(")) || name.contains("-sweep") {
             continue;

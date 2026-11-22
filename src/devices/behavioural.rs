@@ -43,12 +43,13 @@ use crate::maths::{SparseMatrix, Vector};
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::netlist::bexpr::BehaviouralExpression;
 use crate::primitives::{
-    NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
+    NodeAppend, NodeId, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
 };
 
 use crate::devices::linear::LinearContext;
 use crate::devices::traits::{AnalysisMode, ControlReference, Device, MnaUnknowns, StampContext};
-use program::{Environment, Evaluation, Program, Quantity};
+use program::{Environment, Evaluation, Program, Quantity, Workspace};
+use std::cell::RefCell;
 
 /// C reference used in diagnostics.
 pub const C_REFERENCE: &str = "src/spicelib/devices/asrc/ (asrcload.c, asrcacld.c, asrcpar.c), \
@@ -154,6 +155,7 @@ pub struct Behavioural {
     variables: Vec<Variable>,
     controls: Vec<ControlReference>,
     program: Program,
+    workspace: RefCell<Workspace>,
     scale: BehaviouralScale,
 }
 
@@ -201,17 +203,20 @@ impl Behavioural {
             .collect();
         let evaluation = self
             .program
-            .evaluate(&Environment {
-                values: &values,
-                time,
-                temperature: context.temperature,
-                gmin: context.gmin,
-                // ifeval.c PTeval: `hertz` is `CKTomega / 2. / M_PI`, with
-                // `CKTomega = 2.0 * M_PI * freq` (acan.c), not `freq` itself.
-                frequency: 2.0 * std::f64::consts::PI * context.frequency
-                    / 2.
-                    / std::f64::consts::PI,
-            })
+            .evaluate_with_workspace(
+                &Environment {
+                    values: &values,
+                    time,
+                    temperature: context.temperature,
+                    gmin: context.gmin,
+                    // ifeval.c PTeval: `hertz` is `CKTomega / 2. / M_PI`, with
+                    // `CKTomega = 2.0 * M_PI * freq` (acan.c), not `freq` itself.
+                    frequency: 2.0 * std::f64::consts::PI * context.frequency
+                        / 2.
+                        / std::f64::consts::PI,
+                },
+                &mut self.workspace.borrow_mut(),
+            )
             .map_err(|error| match error {
                 SpiceError::Numerical { message, .. } => SpiceError::Numerical {
                     context: format!("behavioural source {}", self.name),
@@ -719,7 +724,7 @@ fn parse_parameters(
 /// literalized AST instance, binding nodes in `nodes` only on success.
 pub(crate) fn instantiate(
     instance: &DeviceInstance,
-    nodes: &mut NodeTable,
+    nodes: &mut NodeAppend<'_>,
 ) -> SpiceResult<Box<dyn Device>> {
     let location = &instance.location;
     if instance.model.is_some() || instance.nodes.len() != 2 {
@@ -730,7 +735,7 @@ pub(crate) fn instantiate(
     }
     let (output, tree, scale) = parse_parameters(instance)?;
     let program = Program::compile(&tree.root)?;
-    crate::devices::factory::append_nodes(nodes, |nodes| {
+    nodes.transaction(|nodes| {
         let positive = nodes.intern(&instance.nodes[0])?;
         let negative = nodes.intern(&instance.nodes[1])?;
         if output == BehaviouralOutput::Voltage && positive == negative {
@@ -769,6 +774,7 @@ pub(crate) fn instantiate(
             variables,
             controls,
             program,
+            workspace: RefCell::default(),
             scale,
         }) as Box<dyn Device>)
     })
@@ -782,7 +788,7 @@ mod tests {
 
     #[test]
     fn failed_behavioural_binding_preserves_existing_nodes() {
-        let mut nodes = NodeTable::new();
+        let mut nodes = crate::primitives::NodeTable::new();
         nodes.intern("present").unwrap();
         let before = nodes.nodes().to_vec();
         let deck = Parser::new()
@@ -791,9 +797,15 @@ mod tests {
                 "title\nb1 fresh fresh v=v(sense)\nb2 fresh 0 v=v(sense)+i(vx)\n.end\n",
             ))
             .unwrap();
-        assert!(instantiate(&deck.devices[0], &mut nodes).is_err());
+        assert!(
+            nodes
+                .transaction(|nodes| instantiate(&deck.devices[0], nodes))
+                .is_err()
+        );
         assert_eq!(nodes.nodes(), before);
-        let device = instantiate(&deck.devices[1], &mut nodes).unwrap();
+        let device = nodes
+            .transaction(|nodes| instantiate(&deck.devices[1], nodes))
+            .unwrap();
         assert_eq!(
             device.terminals(),
             &[NodeId::new(2), NodeId::GROUND, NodeId::new(3)]

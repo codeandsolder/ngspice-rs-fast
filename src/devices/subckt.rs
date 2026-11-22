@@ -41,11 +41,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::devices::binning::{NameMatch, model_name_match};
+use crate::devices::binning::{DeclarationIndex, bin_base};
 use crate::netlist::ast::{
     DeviceInstance, FourierCard, MeasureCard, ModelCard, Netlist, NodeHintCard, OptionCard,
-    OutputCards, ParamAssignment, ParamCard, ParameterAssignment, ParameterKind, RequestedVector,
-    ScopedCard, ScopedCardKind, Subcircuit,
+    OutputCards, ParamAssignment, ParamCard, ParameterAssignment, ParameterKind, PrintCard,
+    RequestedVector, SaveCard, ScopeEntry, ScopeView, ScopedCardKind, Subcircuit,
 };
 use crate::netlist::bexpr::BExprKind;
 use crate::netlist::eval::{EvalBudget, FunctionScope, ParamBinding, ParamScope};
@@ -143,20 +143,24 @@ pub fn expand_with_output(
     measurements: &[MeasureCard],
     fourier: &[FourierCard],
 ) -> SpiceResult<ExpandedNetlist> {
+    let sequence = expansion_plan(ScopeView::from(netlist), output, measurements)?;
     let definitions = definitions(netlist);
     check_acyclic(&definitions, &netlist.devices)?;
     let active = netlist.active_subcircuit_indices();
     let mut hoisted_fourier = Vec::new();
+    let root_view = ScopeView::from(netlist);
     for card in &netlist.cards {
-        match card.kind {
-            ScopedCardKind::Fourier => hoisted_fourier.extend(
-                fourier
-                    .iter()
-                    .filter(|fourier| fourier.location == card.source.location)
-                    .cloned(),
-            ),
-            ScopedCardKind::Subcircuit(index) if active.contains(&index) => {
-                hoisted_fourier.extend(netlist.subcircuits[index].fourier.iter().cloned());
+        let entry = root_view
+            .entry(card.kind)
+            .map_err(|error| SpiceError::parse(card.source.location.clone(), error.to_string()))?;
+        match (card.kind, entry) {
+            (_, ScopeEntry::Fourier(index)) => {
+                hoisted_fourier.extend(side_card(fourier, index, &card.source.location)?.cloned());
+            }
+            (ScopedCardKind::Subcircuit(index), ScopeEntry::Subcircuit(definition))
+                if active.contains(&index) =>
+            {
+                hoisted_fourier.extend(definition.fourier.iter().cloned());
             }
             _ => {}
         }
@@ -185,18 +189,14 @@ pub fn expand_with_output(
         emitted_locals: BTreeSet::new(),
         binned_bases: BTreeSet::new(),
         root_functions: root.functions().cloned(),
-        functions: BTreeMap::new(),
+        plans: BTreeMap::new(),
     };
     let mut locals = vec![expander.root_models()];
-    let devices = netlist.devices.clone();
     let directives = Directives {
-        devices: &devices,
-        cards: &netlist.cards,
-        options: &netlist.options,
+        devices: &netlist.devices,
+        sequence: &sequence,
         initial_conditions: &netlist.initial_conditions,
         nodesets: &netlist.nodesets,
-        output,
-        measurements,
     };
     expander.expand_body("", 0, &BTreeMap::new(), root, &mut locals, &directives)?;
     check_flattened_model_names(&expander.models, &expander.emitted_locals)?;
@@ -217,16 +217,14 @@ pub fn expand_with_output(
     })
 }
 
-/// One frame's model declarations: canonical local name to flattened name and
-/// the card as it will be declared at top level.
-#[derive(Debug, Clone)]
+/// One frame's model identity and an owned card awaiting first use.
+///
+/// Root cards already reside in the flattened deck; local cards are moved
+/// there once, while their flattened names remain available for lookup.
+#[derive(Debug)]
 struct LocalModel {
     name: String,
-    card: ModelCard,
-    emitted: bool,
-    /// Declaration index of the (first) card within its frame; binned sets are
-    /// emitted in this order because C's last declared matching bin wins.
-    order: usize,
+    pending: Option<ModelCard>,
 }
 
 #[derive(Default)]
@@ -241,56 +239,94 @@ struct Frontend {
 
 struct Directives<'a> {
     devices: &'a [DeviceInstance],
-    cards: &'a [ScopedCard],
-    options: &'a [OptionCard],
+    sequence: &'a [ExpansionItem<'a>],
     initial_conditions: &'a [NodeHintCard],
     nodesets: &'a [NodeHintCard],
-    output: &'a OutputCards,
-    measurements: &'a [MeasureCard],
 }
 
+#[derive(Clone, Copy)]
 enum ExpansionItem<'a> {
     Device(usize),
-    Directive(&'a ScopedCard),
+    Frontend {
+        location: &'a SourceLoc,
+        action: FrontendAction<'a>,
+    },
 }
 
-impl Directives<'_> {
-    /// Parsed cards determine expansion precedence. Lowering may associate
-    /// several devices with a single location, and programmatic netlists may
-    /// have no ordered cards at all.
-    fn sequence(&self) -> Vec<ExpansionItem<'_>> {
-        let mut sequence = Vec::new();
-        let mut emitted = vec![false; self.devices.len()];
-        let mut by_location: BTreeMap<_, Vec<usize>> = BTreeMap::new();
-        for (index, device) in self.devices.iter().enumerate() {
-            let location = &device.location;
-            by_location
-                .entry((location.file.clone(), location.line, location.column))
-                .or_default()
-                .push(index);
-        }
-        for card in self.cards {
-            if matches!(card.kind, ScopedCardKind::Device(_)) {
-                let location = &card.source.location;
-                if let Some(indices) =
-                    by_location.remove(&(location.file.clone(), location.line, location.column))
-                {
-                    for index in indices {
-                        sequence.push(ExpansionItem::Device(index));
-                        emitted[index] = true;
-                    }
-                }
-            } else {
-                sequence.push(ExpansionItem::Directive(card));
-            }
-        }
-        for (index, used) in emitted.into_iter().enumerate() {
-            if !used {
-                sequence.push(ExpansionItem::Device(index));
-            }
-        }
-        sequence
+#[derive(Clone, Copy)]
+enum FrontendAction<'a> {
+    Options(&'a OptionCard),
+    InitialCondition(usize),
+    Nodeset(usize),
+    Save(&'a SaveCard),
+    Print(&'a PrintCard),
+    Measure(&'a MeasureCard),
+    NoOutput,
+}
+
+fn side_card<'a, T>(
+    cards: &'a [T],
+    index: usize,
+    location: &SourceLoc,
+) -> SpiceResult<Option<&'a T>> {
+    if cards.is_empty() {
+        return Ok(None);
     }
+    cards
+        .get(index)
+        .map(Some)
+        .ok_or_else(|| SpiceError::parse(location.clone(), "invalid frontend side-card index"))
+}
+
+/// Compile immutable lexical order once. Indexed entries are validated at
+/// the boundary; output side channels follow their original occurrence order
+/// rather than matching physical source locations.
+fn expansion_plan<'a>(
+    scope: ScopeView<'a>,
+    output: &'a OutputCards,
+    measurements: &'a [MeasureCard],
+) -> SpiceResult<Vec<ExpansionItem<'a>>> {
+    if scope.cards.is_empty() {
+        // Programmatically constructed decks may have no source cards.
+        return Ok((0..scope.devices.len())
+            .map(ExpansionItem::Device)
+            .collect());
+    }
+    scope
+        .validate_order()
+        .map_err(|error| SpiceError::circuit(error.to_string()))?;
+    let mut sequence = Vec::new();
+    for card in scope.cards {
+        let location = &card.source.location;
+        let entry = scope
+            .entry(card.kind)
+            .map_err(|error| SpiceError::parse(location.clone(), error.to_string()))?;
+        let action = match (card.kind, entry) {
+            (ScopedCardKind::Device(index), _) => {
+                sequence.push(ExpansionItem::Device(index));
+                continue;
+            }
+            (_, ScopeEntry::Options(option)) => FrontendAction::Options(option),
+            (ScopedCardKind::InitialCondition(index), _) => FrontendAction::InitialCondition(index),
+            (ScopedCardKind::Nodeset(index), _) => FrontendAction::Nodeset(index),
+            (_, ScopeEntry::Save(index)) => side_card(&output.saves, index, location)?
+                .map_or(FrontendAction::NoOutput, FrontendAction::Save),
+            (_, ScopeEntry::Print(index)) => side_card(&output.prints, index, location)?
+                .map_or(FrontendAction::NoOutput, FrontendAction::Print),
+            (_, ScopeEntry::Measure(index)) => side_card(measurements, index, location)?
+                .map_or(FrontendAction::NoOutput, FrontendAction::Measure),
+            (_, ScopeEntry::Control) => FrontendAction::NoOutput,
+            _ => continue,
+        };
+        sequence.push(ExpansionItem::Frontend { location, action });
+    }
+    Ok(sequence)
+}
+
+struct DefinitionPlan<'a> {
+    sequence: Vec<ExpansionItem<'a>>,
+    parameters: Vec<ParamCard>,
+    functions: Option<Arc<FunctionScope>>,
 }
 
 struct Expander<'a> {
@@ -309,9 +345,8 @@ struct Expander<'a> {
     binned_bases: BTreeSet<String>,
     /// The deck's top-level `.func` definitions.
     root_functions: Option<Arc<FunctionScope>>,
-    /// Each definition's own `.func` scope (lexically inside the root's),
-    /// built and checked once per definition name.
-    functions: BTreeMap<String, Arc<FunctionScope>>,
+    /// Lexical declarations are independent of an instance's bound values.
+    plans: BTreeMap<String, Arc<DefinitionPlan<'a>>>,
 }
 
 /// Definition lookup: first declaration wins, like `ModelResolver` and C's
@@ -422,9 +457,11 @@ fn check_binned_bases(
         if renamed.contains(&name) {
             continue;
         }
-        if let Some(base) = bases
-            .iter()
-            .find(|base| model_name_match(base, &name).is_some())
+        // The strict-prefix base precedes the exact name in the old sorted
+        // collision scan when both happen to match.
+        if let Some(base) = bin_base(&name)
+            .filter(|base| bases.contains(*base))
+            .or_else(|| bases.get(&name).map(String::as_str))
         {
             return Err(SpiceError::parse(
                 card.location.clone(),
@@ -503,42 +540,29 @@ fn shortest_cycle(
     vec![start, start]
 }
 
-impl Expander<'_> {
+impl<'a> Expander<'a> {
     fn directive(
         &mut self,
-        card: &ScopedCard,
+        location: &SourceLoc,
+        action: FrontendAction<'_>,
         directives: &Directives<'_>,
         terminals: &BTreeMap<String, String>,
         path: &str,
         scope: &Arc<ParamScope>,
     ) -> SpiceResult<()> {
-        if matches!(
-            card.kind,
-            ScopedCardKind::Options(_)
-                | ScopedCardKind::InitialCondition(_)
-                | ScopedCardKind::Nodeset(_)
-                | ScopedCardKind::Output
-                | ScopedCardKind::Measure
-        ) {
-            self.frontend_cards += 1;
-            if self.frontend_cards > self.limits.max_devices {
-                return Err(SpiceError::parse(
-                    card.source.location.clone(),
-                    format!(
-                        "subcircuit expansion exceeds the front-end card budget ({})",
-                        self.limits.max_devices
-                    ),
-                ));
-            }
+        self.frontend_cards += 1;
+        if self.frontend_cards > self.limits.max_devices {
+            return Err(SpiceError::parse(
+                location.clone(),
+                format!(
+                    "subcircuit expansion exceeds the front-end card budget ({})",
+                    self.limits.max_devices
+                ),
+            ));
         }
-        let location = &card.source.location;
-        match card.kind {
-            ScopedCardKind::Options(index) => {
-                let mut option = directives
-                    .options
-                    .get(index)
-                    .ok_or_else(|| SpiceError::parse(location.clone(), "invalid option index"))?
-                    .clone();
+        match action {
+            FrontendAction::Options(option) => {
+                let mut option = option.clone();
                 for setting in &mut option.settings {
                     if let Some(expression) = setting.expression.take() {
                         let value = scope.evaluate(&expression, &mut self.budget)?;
@@ -550,17 +574,14 @@ impl Expander<'_> {
                 }
                 self.frontend.options.push(option);
             }
-            ScopedCardKind::InitialCondition(index) | ScopedCardKind::Nodeset(index) => {
-                let initial = matches!(card.kind, ScopedCardKind::InitialCondition(_));
+            FrontendAction::InitialCondition(index) | FrontendAction::Nodeset(index) => {
+                let initial = matches!(action, FrontendAction::InitialCondition(_));
                 let cards = if initial {
                     directives.initial_conditions
                 } else {
                     directives.nodesets
                 };
-                let mut hint = cards
-                    .get(index)
-                    .ok_or_else(|| SpiceError::parse(location.clone(), "invalid node-hint index"))?
-                    .clone();
+                let mut hint = cards[index].clone();
                 for entry in &mut hint.entries {
                     entry.node = self.rewrite_node(&entry.node, terminals, path);
                 }
@@ -570,17 +591,10 @@ impl Expander<'_> {
                     self.frontend.nodesets.push(hint);
                 }
             }
-            ScopedCardKind::Output => {
-                self.output_directive(directives.output, location, terminals, path);
-            }
-            ScopedCardKind::Measure => self.frontend.measurements.extend(
-                directives
-                    .measurements
-                    .iter()
-                    .filter(|measure| &measure.location == location)
-                    .cloned(),
-            ),
-            _ => {}
+            FrontendAction::Save(save) => self.output_directive(save, terminals, path),
+            FrontendAction::Print(print) => self.frontend.output.prints.push(print.clone()),
+            FrontendAction::Measure(measure) => self.frontend.measurements.push(measure.clone()),
+            FrontendAction::NoOutput => {}
         }
         Ok(())
     }
@@ -589,93 +603,67 @@ impl Expander<'_> {
     /// reference behavior and order.
     fn output_directive(
         &mut self,
-        output: &OutputCards,
-        location: &SourceLoc,
+        save: &SaveCard,
         terminals: &BTreeMap<String, String>,
         path: &str,
     ) {
-        for save in output
-            .saves
-            .iter()
-            .filter(|save| &save.location == location)
-        {
-            let mut save = save.clone();
-            for request in &mut save.requests {
-                match &mut request.vector {
-                    RequestedVector::Voltage { positive, negative }
-                    | RequestedVector::Component {
-                        positive, negative, ..
-                    } => {
-                        *positive = self.rewrite_node(positive, terminals, path);
-                        if let Some(negative) = negative {
-                            *negative = self.rewrite_node(negative, terminals, path);
-                        }
+        let mut save = save.clone();
+        for request in &mut save.requests {
+            match &mut request.vector {
+                RequestedVector::Voltage { positive, negative }
+                | RequestedVector::Component {
+                    positive, negative, ..
+                } => {
+                    *positive = self.rewrite_node(positive, terminals, path);
+                    if let Some(negative) = negative {
+                        *negative = self.rewrite_node(negative, terminals, path);
                     }
-                    RequestedVector::Current { device } => {
-                        *device =
-                            device_name(device, device.chars().next().unwrap_or_default(), path);
-                    }
-                    RequestedVector::Named { name, .. } if name.starts_with('@') => {
-                        if let Some((device, parameter)) = name[1..].split_once('[') {
-                            *name = format!(
-                                "@{}[{parameter}",
-                                device_name(
-                                    device,
-                                    device.chars().next().unwrap_or_default(),
-                                    path
-                                )
-                            );
-                        }
-                    }
-                    RequestedVector::All | RequestedVector::Named { .. } => {}
                 }
+                RequestedVector::Current { device } => {
+                    *device = device_name(device, device.chars().next().unwrap_or_default(), path);
+                }
+                RequestedVector::Named { name, .. } if name.starts_with('@') => {
+                    if let Some((device, parameter)) = name[1..].split_once('[') {
+                        *name = format!(
+                            "@{}[{parameter}",
+                            device_name(device, device.chars().next().unwrap_or_default(), path)
+                        );
+                    }
+                }
+                RequestedVector::All | RequestedVector::Named { .. } => {}
             }
-            self.frontend.output.saves.push(save);
         }
-        self.frontend.output.prints.extend(
-            output
-                .prints
-                .iter()
-                .filter(|print| &print.location == location)
-                .cloned(),
-        );
+        self.frontend.output.saves.push(save);
     }
 
     /// The root frame's models: every top-level declaration, unrenamed.
-    fn root_models(&self) -> BTreeMap<String, LocalModel> {
-        let mut map: BTreeMap<String, LocalModel> = BTreeMap::new();
-        for (order, card) in self.netlist.models.iter().enumerate() {
-            map.entry(card.name.to_ascii_lowercase())
-                .or_insert_with(|| LocalModel {
-                    name: card.name.clone(),
-                    card: card.clone(),
-                    emitted: true,
-                    order,
-                });
+    fn root_models(&self) -> DeclarationIndex<LocalModel> {
+        let mut index = DeclarationIndex::new();
+        for card in &self.netlist.models {
+            index.insert_first(&card.name, || LocalModel {
+                name: card.name.clone(),
+                pending: None,
+            });
         }
-        map
+        index
     }
 
     /// One frame's literalized models, renamed to `<path>.<name>`. They stay
     /// out of the flattened deck until a device in this frame or a descendant
     /// frame references one, so unused declarations are not invented.
-    fn local_models(cards: &[ModelCard], path: &str) -> BTreeMap<String, LocalModel> {
-        let mut map: BTreeMap<String, LocalModel> = BTreeMap::new();
-        for (order, card) in cards.iter().enumerate() {
-            let name = format!("{path}.{}", card.name);
-            let renamed = ModelCard {
-                name: name.clone(),
-                ..card.clone()
-            };
-            map.entry(card.name.to_ascii_lowercase())
-                .or_insert_with(|| LocalModel {
-                    name,
-                    card: renamed,
-                    emitted: false,
-                    order,
-                });
+    fn local_models(cards: Vec<ModelCard>, path: &str) -> DeclarationIndex<LocalModel> {
+        let mut index = DeclarationIndex::new();
+        for mut card in cards {
+            let source_name = std::mem::take(&mut card.name);
+            index.insert_first(&source_name, || {
+                card.name = format!("{path}.{source_name}");
+                LocalModel {
+                    name: card.name.clone(),
+                    pending: Some(card),
+                }
+            });
         }
-        map
+        index
     }
 
     /// Expand one scope level: top-level devices at the root, a definition's
@@ -686,15 +674,15 @@ impl Expander<'_> {
         depth: usize,
         terminals: &BTreeMap<String, String>,
         scope: &Arc<ParamScope>,
-        locals: &mut Vec<BTreeMap<String, LocalModel>>,
+        locals: &mut Vec<DeclarationIndex<LocalModel>>,
         directives: &Directives<'_>,
     ) -> SpiceResult<()> {
         let devices = directives.devices;
-        for item in directives.sequence() {
+        for &item in directives.sequence {
             let index = match item {
                 ExpansionItem::Device(index) => index,
-                ExpansionItem::Directive(card) => {
-                    self.directive(card, directives, terminals, path, scope)?;
+                ExpansionItem::Frontend { location, action } => {
+                    self.directive(location, action, directives, terminals, path, scope)?;
                     continue;
                 }
             };
@@ -784,12 +772,12 @@ impl Expander<'_> {
     /// literalize its body and recurse.
     fn expand_instance(
         &mut self,
-        definition: &Subcircuit,
+        definition: &'a Subcircuit,
         instance: &DeviceInstance,
         path: &str,
         depth: usize,
         parent: &Arc<ParamScope>,
-        locals: &mut Vec<BTreeMap<String, LocalModel>>,
+        locals: &mut Vec<DeclarationIndex<LocalModel>>,
     ) -> SpiceResult<()> {
         if depth + 1 > self.limits.max_depth {
             return Err(SpiceError::parse(
@@ -843,14 +831,15 @@ impl Expander<'_> {
         for (formal, actual) in definition.terminals.iter().zip(&instance.nodes) {
             terminals.insert(formal.clone(), actual.clone());
         }
-        let scope = self.instance_scope(definition, instance, parent)?;
+        let (scope, plan) = self.instance_scope(definition, instance, parent)?;
         let child_path = if path.is_empty() {
             instance.name.clone()
         } else {
             format!("{path}.{}", instance.name)
         };
-        let body = self.literalize_body(definition, &scope)?;
-        locals.push(Self::local_models(&body.models, &child_path));
+        let body =
+            crate::netlist::elaborate::literalize_body(definition, &scope, &mut self.budget)?;
+        locals.push(Self::local_models(body.models, &child_path));
         let result = self.expand_body(
             &child_path,
             depth + 1,
@@ -859,12 +848,9 @@ impl Expander<'_> {
             locals,
             &Directives {
                 devices: &body.devices,
-                cards: &definition.cards,
-                options: &definition.options,
+                sequence: &plan.sequence,
                 initial_conditions: &body.initial_conditions,
                 nodesets: &body.nodesets,
-                output: &definition.output,
-                measurements: &definition.measurements,
             },
         );
         locals.pop();
@@ -875,10 +861,10 @@ impl Expander<'_> {
     /// defaults as the first `.param` card, body `.param` cards after them.
     fn instance_scope(
         &mut self,
-        definition: &Subcircuit,
+        definition: &'a Subcircuit,
         instance: &DeviceInstance,
         parent: &Arc<ParamScope>,
-    ) -> SpiceResult<Arc<ParamScope>> {
+    ) -> SpiceResult<(Arc<ParamScope>, Arc<DefinitionPlan<'a>>)> {
         let mut bindings = Vec::with_capacity(instance.parameters.len());
         for parameter in &instance.parameters {
             bindings.push(ParamBinding {
@@ -887,50 +873,62 @@ impl Expander<'_> {
                 location: parameter.location.clone(),
             });
         }
-        let mut cards = Vec::new();
+        let plan = self.definition_plan(definition)?;
+        let scope = Arc::new(ParamScope::resolve_instance_scoped(
+            Some(Arc::clone(parent)),
+            plan.functions.clone(),
+            &bindings,
+            &plan.parameters,
+            &mut self.budget,
+        )?);
+        Ok((scope, plan))
+    }
+
+    /// Cache only immutable lexical syntax. Formal defaults and body
+    /// parameters are still evaluated with each caller's bindings and budget.
+    fn definition_plan(
+        &mut self,
+        definition: &'a Subcircuit,
+    ) -> SpiceResult<Arc<DefinitionPlan<'a>>> {
+        let key = definition.name.to_ascii_lowercase();
+        if let Some(plan) = self.plans.get(&key) {
+            return Ok(Arc::clone(plan));
+        }
+        let mut parameters = Vec::new();
         if !definition.parameters.is_empty() {
-            let mut assignments = Vec::with_capacity(definition.parameters.len());
-            for formal in &definition.parameters {
-                assignments.push(formal_assignment(formal)?);
-            }
-            cards.push(ParamCard {
+            let assignments = definition
+                .parameters
+                .iter()
+                .map(formal_assignment)
+                .collect::<SpiceResult<_>>()?;
+            parameters.push(ParamCard {
                 assignments,
                 location: definition.location.clone(),
             });
         }
-        cards.extend(definition.params.iter().cloned());
-        let functions = self.definition_functions(definition)?;
-        Ok(Arc::new(ParamScope::resolve_instance_scoped(
-            Some(Arc::clone(parent)),
+        parameters.extend(definition.params.iter().cloned());
+        // Functions see their lexical definition and root, not the caller's local functions.
+        let functions = if definition.functions.is_empty() {
+            self.root_functions.clone()
+        } else {
+            Some(Arc::new(FunctionScope::new(
+                self.root_functions.clone(),
+                &definition.functions,
+                &self.budget,
+            )?))
+        };
+        let sequence = expansion_plan(
+            ScopeView::from(definition),
+            &definition.output,
+            &definition.measurements,
+        )?;
+        let plan = Arc::new(DefinitionPlan {
+            sequence,
+            parameters,
             functions,
-            &bindings,
-            &cards,
-            &mut self.budget,
-        )?))
-    }
-
-    /// The `.func` definitions a definition's body sees: its own, then the
-    /// deck's. C (`inpcom.c` `inp_expand_macros_in_deck()`) scopes functions
-    /// by the lexical `.subckt` nesting, not by the instantiating body, so a
-    /// caller's local functions never leak into the callee.
-    fn definition_functions(
-        &mut self,
-        definition: &Subcircuit,
-    ) -> SpiceResult<Option<Arc<FunctionScope>>> {
-        if definition.functions.is_empty() {
-            return Ok(self.root_functions.clone());
-        }
-        let key = definition.name.to_ascii_lowercase();
-        if let Some(scope) = self.functions.get(&key) {
-            return Ok(Some(Arc::clone(scope)));
-        }
-        let scope = Arc::new(FunctionScope::new(
-            self.root_functions.clone(),
-            &definition.functions,
-            &self.budget,
-        )?);
-        self.functions.insert(key, Arc::clone(&scope));
-        Ok(Some(scope))
+        });
+        self.plans.insert(key, Arc::clone(&plan));
+        Ok(plan)
     }
 
     /// One instance parameter's value, evaluated at the call site.
@@ -950,39 +948,6 @@ impl Expander<'_> {
                 "src/frontend/numparam/spicenum.c",
             )),
         }
-    }
-
-    /// A body's devices and models with every `{...}` site evaluated against
-    /// the instance scope. Locations and card order survive the copy.
-    fn literalize_body(&mut self, body: &Subcircuit, scope: &Arc<ParamScope>) -> SpiceResult<Body> {
-        let netlist = Netlist {
-            title: String::new(),
-            path: self.netlist.path.clone(),
-            devices: body.devices.clone(),
-            models: body.models.clone(),
-            subcircuits: Vec::new(),
-            analyses: Vec::new(),
-            includes: Vec::new(),
-            params: Vec::new(),
-            functions: Vec::new(),
-            options: Vec::new(),
-            globals: Vec::new(),
-            initial_conditions: body.initial_conditions.clone(),
-            nodesets: body.nodesets.clone(),
-            cards: Vec::new(),
-            location: body.location.clone(),
-        };
-        let elaborated = crate::netlist::elaborate::literalize_with(
-            &netlist,
-            Arc::clone(scope),
-            &mut self.budget,
-        )?;
-        Ok(Body {
-            devices: elaborated.netlist.devices,
-            models: elaborated.netlist.models,
-            initial_conditions: elaborated.netlist.initial_conditions,
-            nodesets: elaborated.netlist.nodesets,
-        })
     }
 
     /// Rename a body node. Ground and `.global` nodes are exempt; a formal
@@ -1008,81 +973,53 @@ impl Expander<'_> {
     fn rewrite_model(
         &mut self,
         instance: &mut DeviceInstance,
-        locals: &mut [BTreeMap<String, LocalModel>],
+        locals: &mut [DeclarationIndex<LocalModel>],
     ) {
-        let Some(reference) = instance.model.clone() else {
+        let Some(reference) = instance.model.as_deref() else {
             return;
         };
-        let key = reference.to_ascii_lowercase();
-        for index in (0..locals.len()).rev() {
-            let Some(local) = locals[index].get(&key) else {
-                // subckt.c matches M models with model_name_match, so a frame
-                // declaring only `<name>.<digits>` bins also captures the name.
-                if instance.designator.eq_ignore_ascii_case(&'m')
-                    && self.rewrite_binned(instance, &key, &mut locals[index])
-                {
-                    return;
-                }
-                continue;
-            };
-            let name = local.name.clone();
-            let emitted = local.emitted;
-            let card = local.card.clone();
-            if !emitted {
-                self.models.push(card);
-                self.emitted_locals.insert(name.to_ascii_lowercase());
-                if let Some(slot) = locals[index].get_mut(&key) {
-                    slot.emitted = true;
-                }
+        for frame in locals.iter_mut().rev() {
+            if let Some(local) = frame.get_mut(reference) {
+                self.emit_model(local);
+                instance.model = Some(local.name.clone());
+                return;
             }
-            instance.model = Some(name);
-            return;
+            // A frame declaring only `<name>.<digits>` bins also captures
+            // MOS model names. Each group is already in declaration order.
+            if instance.designator.eq_ignore_ascii_case(&'m')
+                && let Some(base) = self.rewrite_binned(reference, frame)
+            {
+                instance.model = Some(base);
+                return;
+            }
         }
     }
 
-    /// Bind an `M` reference to one frame's `<key>.<digits>` binning set:
-    /// emit every bin of the set (declaration order) and rewrite the reference
-    /// to the set's flattened base name, leaving the choice of bin to
-    /// `ModelResolver`. `false` when the frame has no such bin.
+    fn emit_model(&mut self, local: &mut LocalModel) {
+        if let Some(card) = local.pending.take() {
+            self.emitted_locals.insert(local.name.to_ascii_lowercase());
+            self.models.push(card);
+        }
+    }
+
+    /// Bind an M reference to a frame's bin set, emitting the ordered
+    /// declarations once and leaving geometry selection to `ModelResolver`.
     fn rewrite_binned(
         &mut self,
-        instance: &mut DeviceInstance,
         key: &str,
-        frame: &mut BTreeMap<String, LocalModel>,
-    ) -> bool {
-        let mut bins: Vec<(&String, &mut LocalModel)> = frame
-            .iter_mut()
-            .filter(|(name, _)| model_name_match(key, name) == Some(NameMatch::Bin))
-            .collect();
-        bins.sort_by_key(|(_, local)| local.order);
-        let Some((first_key, first)) = bins.first() else {
-            return false;
-        };
-        // `<path>.nch.1` minus the `.1` the original `nch.1` adds to `nch`.
-        let suffix = first_key.len() - key.len();
-        let base = first.name[..first.name.len() - suffix].to_owned();
-        let renamed = !first.name.eq_ignore_ascii_case(first_key);
-        for (_, local) in &mut bins {
-            if !local.emitted {
-                self.models.push(local.card.clone());
-                self.emitted_locals.insert(local.name.to_ascii_lowercase());
-                local.emitted = true;
-            }
+        frame: &mut DeclarationIndex<LocalModel>,
+    ) -> Option<String> {
+        let (ids, entries) = frame.bin_slots_mut(key);
+        let first = &entries[*ids.first()?];
+        let base = bin_base(&first.name)?.to_owned();
+        for &id in ids {
+            self.emit_model(&mut entries[id]);
         }
-        if renamed {
+        if !base.eq_ignore_ascii_case(key) {
             self.binned_bases.insert(base.to_ascii_lowercase());
         }
-        instance.model = Some(base);
-        true
+        Some(base)
     }
-}
-
-/// A literalized definition body.
-struct Body {
-    devices: Vec<DeviceInstance>,
-    models: Vec<ModelCard>,
-    initial_conditions: Vec<NodeHintCard>,
-    nodesets: Vec<NodeHintCard>,
 }
 
 /// `translate_inst_name`: the designator prefix is not repeated for an `X`.
@@ -1121,6 +1058,7 @@ fn formal_assignment(formal: &ParameterAssignment) -> SpiceResult<ParamAssignmen
             end: formal
                 .location
                 .at_column(formal.location.column + byte_len(&formal.name)),
+            logical: 0..formal.name.len(),
         },
         expression,
     })
@@ -1148,6 +1086,7 @@ fn literal_expression(text: &str, value: Real, start: &SourceLoc) -> ParameterEx
     let span = SourceSpan {
         start: start.clone(),
         end: start.at_column(start.column + byte_len(text)),
+        logical: 0..text.len(),
     };
     ParameterExpression {
         text: text.to_owned(),
@@ -1164,6 +1103,6 @@ fn literal_expression(text: &str, value: Real, start: &SourceLoc) -> ParameterEx
     }
 }
 
-fn byte_len(text: &str) -> u32 {
-    u32::try_from(text.len()).unwrap_or(u32::MAX)
+const fn byte_len(text: &str) -> usize {
+    text.len()
 }

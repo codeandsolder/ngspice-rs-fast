@@ -56,21 +56,12 @@ use super::host::node;
 use super::{Access, InputType, asks, elements, parameters, set, temp};
 use crate::devices::schema::temperature_kelvin;
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
-    SensitivityMode, SensitivityParameter as P, SensitivityRecord as Record,
+    AcReset, Bsim4InstanceSnapshot, ParameterScope, RecordPair, SensitivityFamily,
+    SensitivityKernel, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
+    SensitivityRecord as Record,
 };
 use crate::devices::{Device, LinearContext, ModelContext, StampContext};
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
-
-/// The instance record's next-to-last field: set by `DEVunsetup` (the node
-/// members are zero, so the next `BSIM4setup` creates nodes), cleared by
-/// setup.
-const UNSET: &str = "unsetup";
-
-/// The instance record's last field: a bit per internal node (in
-/// [`INTERNAL`] order) that the last `CKTsetup` created, which
-/// `BSIM4unsetup` must delete again.
-const CREATED: &str = "created";
 
 /// The internal nodes as `(own index, member)`: drain, source, gate and
 /// mid-gate primes, the three body nodes and the NQS node.
@@ -99,7 +90,7 @@ const fn internal_members(h: &Instance) -> [i32; 8] {
     ]
 }
 
-/// The [`CREATED`] bits for the members that hold their own node.
+/// The creation bits for the members that hold their own node.
 fn created_bits(h: &Instance) -> u32 {
     internal_members(h)
         .into_iter()
@@ -108,125 +99,6 @@ fn created_bits(h: &Instance) -> u32 {
         .filter(|(_, (member, own))| member == own)
         .fold(0, |bits, (k, _)| bits | (1 << k))
 }
-
-/// Members `b4ld.c` writes that neither `b4set.c` nor `b4temp.c` writes
-/// (`cgdo`/`cgso` are written by both): a per-parameter AC load reads them
-/// as the frequency's reset load left them.
-const LOAD_ONLY: &[&str] = &[
-    "BSIM4AbovVgst2Vtm",
-    "BSIM4Abulk",
-    "BSIM4Coxeff",
-    "BSIM4EsatL",
-    "BSIM4IdovVds",
-    "BSIM4Igb",
-    "BSIM4Igcd",
-    "BSIM4Igcs",
-    "BSIM4Igd",
-    "BSIM4Igidl",
-    "BSIM4Igisl",
-    "BSIM4Igs",
-    "BSIM4Vdseff",
-    "BSIM4Vgsteff",
-    "BSIM4capbd",
-    "BSIM4capbs",
-    "BSIM4cbbb",
-    "BSIM4cbd",
-    "BSIM4cbdb",
-    "BSIM4cbgb",
-    "BSIM4cbs",
-    "BSIM4cbsb",
-    "BSIM4cd",
-    "BSIM4cdbb",
-    "BSIM4cddb",
-    "BSIM4cdgb",
-    "BSIM4cdsb",
-    "BSIM4cgbb",
-    "BSIM4cgdb",
-    "BSIM4cggb",
-    "BSIM4cgsb",
-    "BSIM4cqbb",
-    "BSIM4cqdb",
-    "BSIM4cqgb",
-    "BSIM4cqsb",
-    "BSIM4csbb",
-    "BSIM4csdb",
-    "BSIM4csgb",
-    "BSIM4cssb",
-    "BSIM4csub",
-    "BSIM4dvgd_eff_dvg",
-    "BSIM4dvgs_eff_dvg",
-    "BSIM4gIgbb",
-    "BSIM4gIgbd",
-    "BSIM4gIgbg",
-    "BSIM4gIgbs",
-    "BSIM4gIgcdb",
-    "BSIM4gIgcdd",
-    "BSIM4gIgcdg",
-    "BSIM4gIgcds",
-    "BSIM4gIgcsb",
-    "BSIM4gIgcsd",
-    "BSIM4gIgcsg",
-    "BSIM4gIgcss",
-    "BSIM4gIgdd",
-    "BSIM4gIgdg",
-    "BSIM4gIgsg",
-    "BSIM4gIgss",
-    "BSIM4gbbs",
-    "BSIM4gbd",
-    "BSIM4gbds",
-    "BSIM4gbgs",
-    "BSIM4gbs",
-    "BSIM4gcrg",
-    "BSIM4gcrgb",
-    "BSIM4gcrgd",
-    "BSIM4gcrgg",
-    "BSIM4gcrgs",
-    "BSIM4gds",
-    "BSIM4gdtot",
-    "BSIM4gdtotb",
-    "BSIM4gdtotd",
-    "BSIM4gdtotg",
-    "BSIM4gdtots",
-    "BSIM4ggidlb",
-    "BSIM4ggidld",
-    "BSIM4ggidlg",
-    "BSIM4ggidls",
-    "BSIM4ggislb",
-    "BSIM4ggisld",
-    "BSIM4ggislg",
-    "BSIM4ggisls",
-    "BSIM4gm",
-    "BSIM4gmbs",
-    "BSIM4grdsw",
-    "BSIM4gstot",
-    "BSIM4gstotb",
-    "BSIM4gstotd",
-    "BSIM4gstotg",
-    "BSIM4gstots",
-    "BSIM4gtau",
-    "BSIM4gtb",
-    "BSIM4gtd",
-    "BSIM4gtg",
-    "BSIM4gts",
-    "BSIM4mode",
-    "BSIM4noiGd0",
-    "BSIM4nstar",
-    "BSIM4qbulk",
-    "BSIM4qchqs",
-    "BSIM4qdrn",
-    "BSIM4qgate",
-    "BSIM4qgdo",
-    "BSIM4qgso",
-    "BSIM4qinv",
-    "BSIM4qsrc",
-    "BSIM4taunet",
-    "BSIM4thetavth",
-    "BSIM4ueff",
-    "BSIM4vdsat",
-    "BSIM4vgd_eff",
-    "BSIM4vgs_eff",
-    "BSIM4von",
-];
 
 /// `sgen`'s parameters of one table: real, settable and askable entries
 /// that are not redundant, in table order.
@@ -256,8 +128,6 @@ fn instance_table() -> &'static [P] {
 pub(super) struct Bsim4Sensitivity<'a> {
     device: &'a Bsim4,
     context: ModelContext,
-    /// The model's VERSION string (not a numeric member).
-    version: String,
     model: Model,
     instance: Instance,
     size: SizeParam,
@@ -271,15 +141,6 @@ impl std::fmt::Debug for Bsim4Sensitivity<'_> {
     }
 }
 
-fn record(members: &[&'static str], values: &[Real]) -> Record {
-    members
-        .iter()
-        .zip(values)
-        .fold(Record::new(), |record, (&name, &value)| {
-            record.with(name, value, false)
-        })
-}
-
 impl<'a> Bsim4Sensitivity<'a> {
     /// The device's structs as the deck's own setup and temperature pass
     /// left them.
@@ -291,46 +152,10 @@ impl<'a> Bsim4Sensitivity<'a> {
         Ok(Self {
             device,
             context: *context,
-            version: prepared.model.version.clone(),
             model: prepared.model.clone(),
             instance: device.live_copy(&prepared),
             size: prepared.size.clone(),
         })
-    }
-
-    fn model_of(&self, record: &Record) -> Model {
-        let mut model = Model {
-            version: self.version.clone(),
-            ..Model::default()
-        };
-        model.set_values(&record.values());
-        model
-    }
-
-    /// The instance, its size-dependent parameters and the unsetup flag.
-    fn instance_of(record: &Record) -> (Instance, SizeParam, bool) {
-        let values = record.values();
-        let (instance_values, rest) = values.split_at(Instance::MEMBERS.len());
-        let (size_values, flags) = rest.split_at(SizeParam::MEMBERS.len());
-        let mut instance = Instance::default();
-        instance.set_values(instance_values);
-        let mut size = SizeParam::default();
-        size.set_values(size_values);
-        (instance, size, flags.first().is_some_and(|v| *v != 0.))
-    }
-
-    fn store_instance(
-        record: &mut Record,
-        instance: &Instance,
-        size: &SizeParam,
-        unset: bool,
-    ) -> SpiceResult<()> {
-        let created = record.value(CREATED)?;
-        let mut values = instance.to_values();
-        values.extend(size.to_values());
-        values.push(if unset { 1. } else { 0. });
-        values.push(created);
-        record.store_values(&values)
     }
 
     fn kelvin(&self, celsius: Real) -> SpiceResult<Real> {
@@ -343,22 +168,49 @@ impl<'a> Bsim4Sensitivity<'a> {
     }
 
     /// The structs of `pair` as one load sees them.
-    fn structs(&self, pair: RecordPair<'_>) -> (Model, Instance, SizeParam) {
-        let (instance, size, _) = Self::instance_of(pair.instance);
-        (self.model_of(pair.model), instance, size)
+    fn structs(pair: RecordPair<'_>) -> SpiceResult<(Model, Instance, SizeParam)> {
+        let snapshot = pair.instance.bsim4_instance()?;
+        Ok((
+            pair.model.bsim4_model()?.clone(),
+            snapshot.instance.clone(),
+            snapshot.size.clone(),
+        ))
     }
 }
 
-fn descriptor(scope: ParameterScope, keyword: &str) -> SpiceResult<&'static super::Parameter> {
-    let table = match scope {
-        ParameterScope::Model => parameters::MODEL,
-        ParameterScope::Instance => parameters::INSTANCE,
-    };
-    super::descriptor(table, keyword)
-        .ok_or_else(|| SpiceError::circuit(format!("BSIM4 has no parameter {keyword}")))
+#[derive(Clone, Copy)]
+struct Accessor {
+    parameter: &'static super::Parameter,
+    ask: &'static str,
 }
 
-impl DeviceSensitivity for Bsim4Sensitivity<'_> {
+fn accessor(scope: ParameterScope, keyword: &str) -> SpiceResult<Accessor> {
+    use std::collections::BTreeMap;
+    static ACCESSORS: OnceLock<[BTreeMap<&'static str, Accessor>; 2]> = OnceLock::new();
+    let tables = ACCESSORS.get_or_init(|| {
+        [
+            (parameters::MODEL, asks::MODEL),
+            (parameters::INSTANCE, asks::INSTANCE),
+        ]
+        .map(|(rows, asks)| {
+            rows.iter()
+                .filter_map(|p| {
+                    let (_, ask) = asks.iter().find(|(id, _)| *id == p.c_id)?;
+                    Some((p.name, Accessor { parameter: p, ask }))
+                })
+                .collect()
+        })
+    });
+    let index = match scope {
+        ParameterScope::Model => 0,
+        ParameterScope::Instance => 1,
+    };
+    tables[index].get(keyword).copied().ok_or_else(|| {
+        SpiceError::circuit(format!("BSIM4 has no real ask/set parameter {keyword}"))
+    })
+}
+
+impl SensitivityKernel for Bsim4Sensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Bsim4
     }
@@ -376,17 +228,14 @@ impl DeviceSensitivity for Bsim4Sensitivity<'_> {
     }
 
     fn records(&self) -> SpiceResult<(Record, Record)> {
-        let mut values = self.instance.to_values();
-        values.extend(self.size.to_values());
-        values.push(0.);
-        values.push(Real::from(created_bits(&self.instance)));
-        let mut members: Vec<&'static str> = Instance::MEMBERS.to_vec();
-        members.extend(SizeParam::MEMBERS);
-        members.push(UNSET);
-        members.push(CREATED);
         Ok((
-            record(Model::MEMBERS, &self.model.to_values()),
-            record(&members, &values),
+            Record::from_bsim4_model(self.model.clone()),
+            Record::from_bsim4_instance(Bsim4InstanceSnapshot {
+                instance: self.instance.clone(),
+                size: self.size.clone(),
+                unset: false,
+                created: created_bits(&self.instance),
+            }),
         ))
     }
 
@@ -397,17 +246,14 @@ impl DeviceSensitivity for Bsim4Sensitivity<'_> {
         keyword: &str,
         records: RecordPair<'_>,
     ) -> SpiceResult<Real> {
-        let p = descriptor(scope, keyword)?;
-        let (asks, record) = match scope {
-            ParameterScope::Model => (asks::MODEL, records.model),
-            ParameterScope::Instance => (asks::INSTANCE, records.instance),
-        };
-        let member = asks
-            .iter()
-            .find(|(id, _)| *id == p.c_id)
-            .map(|(_, member)| *member)
-            .ok_or_else(|| SpiceError::circuit(format!("BSIM4 cannot ask {keyword}")))?;
-        record.value(member)
+        let accessor = accessor(scope, keyword)?;
+        let model = records.model.bsim4_model()?;
+        let instance = records.instance.bsim4_instance()?;
+        match scope {
+            ParameterScope::Model => model.real(accessor.ask),
+            ParameterScope::Instance => instance.instance.real(accessor.ask),
+        }
+        .ok_or_else(|| SpiceError::circuit(format!("BSIM4 cannot ask {keyword}")))
     }
 
     /// `BSIM4mParam`/`BSIM4param`: the setter's conversion, then the member
@@ -420,21 +266,37 @@ impl DeviceSensitivity for Bsim4Sensitivity<'_> {
         model: &mut Record,
         instance: &mut Record,
     ) -> SpiceResult<()> {
-        let p = descriptor(scope, keyword)?;
+        // Resolve both typed fields before mutating either. A generated
+        // descriptor cannot write an integer or a given bit as a real.
+        let p = accessor(scope, keyword)?.parameter;
         let field = p
             .c_field
             .ok_or_else(|| SpiceError::circuit(format!("BSIM4 has no setter for {keyword}")))?;
-        let (record, value) = match scope {
-            ParameterScope::Model => (
-                model,
-                super::bsim4_model_real(p, value, &self.device.location)?,
-            ),
-            // b4par.c scales geometry by `.options scale`, which is 1 here.
-            ParameterScope::Instance => (instance, value),
-        };
-        record.store(field, value)?;
-        if let Some(given) = p.c_given {
-            record.store(given, 1.)?;
+        let model = model.bsim4_model_mut()?;
+        let instance = instance.bsim4_instance_mut()?;
+        let invalid =
+            || SpiceError::circuit(format!("BSIM4 invalid real setter layout for {keyword}"));
+        match scope {
+            ParameterScope::Model => {
+                let value = super::bsim4_model_real(p, value, &self.device.location)?;
+                if model.real(field).is_none() {
+                    return Err(invalid());
+                }
+                if let Some(given) = p.c_given {
+                    *model.flag_mut(given).ok_or_else(invalid)? = true;
+                }
+                *model.real_mut(field).ok_or_else(invalid)? = value;
+            }
+            ParameterScope::Instance => {
+                let h = &mut instance.instance;
+                if h.real(field).is_none() {
+                    return Err(invalid());
+                }
+                if let Some(given) = p.c_given {
+                    *h.flag_mut(given).ok_or_else(invalid)? = true;
+                }
+                *h.real_mut(field).ok_or_else(invalid)? = value;
+            }
         }
         Ok(())
     }
@@ -443,18 +305,12 @@ impl DeviceSensitivity for Bsim4Sensitivity<'_> {
     /// still differs from the external node, then zeroes every member.
     /// `CKTunsetup` exits when a node the last `CKTsetup` created survives,
     /// which happens once a `.sens` setup re-run has aliased it.
-    fn unsetup(&self, _model: &mut Record, instance: &mut Record) -> SpiceResult<()> {
-        let (mut h, size, _) = Self::instance_of(instance);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "CREATED encodes the BSIM4-local 12-node creation bitmask"
-        )]
-        #[expect(
-            clippy::cast_sign_loss,
-            reason = "CREATED contains only nonnegative node-creation bits"
-        )]
-        let created = instance.value(CREATED)? as u32;
-        let survives = internal_members(&h)
+    fn unsetup(&self, model: &mut Record, instance: &mut Record) -> SpiceResult<()> {
+        model.bsim4_model()?;
+        let snapshot = instance.bsim4_instance_mut()?;
+        let h = &mut snapshot.instance;
+        let created = snapshot.created;
+        let survives = internal_members(h)
             .into_iter()
             .zip(INTERNAL)
             .enumerate()
@@ -467,7 +323,7 @@ impl DeviceSensitivity for Bsim4Sensitivity<'_> {
                 self.device.name
             )));
         }
-        instance.store(CREATED, 0.)?;
+        snapshot.created = 0;
         h.dNodePrime = node::GROUND;
         h.sNodePrime = node::GROUND;
         h.gNodePrime = node::GROUND;
@@ -476,20 +332,23 @@ impl DeviceSensitivity for Bsim4Sensitivity<'_> {
         h.bNodePrime = node::GROUND;
         h.sbNode = node::GROUND;
         h.qNode = node::GROUND;
-        Self::store_instance(instance, &h, &size, true)
+        snapshot.unset = true;
+        Ok(())
     }
 
     /// `BSIM4setup` on the isolated model and instance, run again: the
     /// defaults, then the node members as C's re-run leaves them.
     fn setup(&self, model: &mut Record, instance: &mut Record) -> SpiceResult<()> {
         let mut warnings = Vec::new();
-        let mut m = self.model_of(model);
+        let mut m = model.bsim4_model()?.clone();
         set::setup_model(
             &mut m,
             self.kelvin(self.context.nominal_temperature)?,
             &mut warnings,
         )?;
-        let (mut h, size, unset) = Self::instance_of(instance);
+        let snapshot = instance.bsim4_instance_mut()?;
+        let mut h = snapshot.instance.clone();
+        let unset = snapshot.unset;
         let previous = [
             h.dNodePrime,
             h.sNodePrime,
@@ -541,19 +400,22 @@ impl DeviceSensitivity for Bsim4Sensitivity<'_> {
             h.gNodeMid,
             h.qNode,
         ] = result;
-        model.store_values(&m.to_values())?;
+        *model.bsim4_model_mut()? = m;
         if unset {
-            instance.store(CREATED, Real::from(created_bits(&h)))?;
+            snapshot.created = created_bits(&h);
         }
-        Self::store_instance(instance, &h, &size, false)
+        snapshot.instance = h;
+        snapshot.unset = false;
+        Ok(())
     }
 
     /// `BSIM4temp` on the isolated model and instance, without
     /// `BSIM4checkModel` (its `static` model name is already set).
     fn temperature(&self, model: &mut Record, instance: &mut Record) -> SpiceResult<()> {
         let mut warnings = Vec::new();
-        let mut m = self.model_of(model);
-        let (mut h, _, unset) = Self::instance_of(instance);
+        let mut m = model.bsim4_model()?.clone();
+        let snapshot = instance.bsim4_instance_mut()?;
+        let mut h = snapshot.instance.clone();
         let locals = temp::temperature_model(
             &mut m,
             self.kelvin(self.context.temperature)?,
@@ -585,20 +447,23 @@ impl DeviceSensitivity for Bsim4Sensitivity<'_> {
                 rejected_size(&m, &h)
             }
         };
-        model.store_values(&m.to_values())?;
-        Self::store_instance(instance, &h, &size, unset)
+        *model.bsim4_model_mut()? = m;
+        snapshot.instance = h;
+        snapshot.size = size;
+        Ok(())
     }
 
-    fn setup_elements(&self, setup: RecordPair<'_>) -> Option<Vec<(NodeId, NodeId)>> {
-        let (m, h, _) = self.structs(setup);
-        Some(
-            elements::matrix_elements(&m, &h)
+    fn setup_elements(&self, setup: RecordPair<'_>) -> SpiceResult<Option<Vec<(NodeId, NodeId)>>> {
+        let m = setup.model.bsim4_model()?;
+        let h = &setup.instance.bsim4_instance()?.instance;
+        Ok(Some(
+            elements::matrix_elements(m, h)
                 .into_iter()
                 .filter_map(|(row, col)| {
                     Some((self.device.node_id(row)?, self.device.node_id(col)?))
                 })
                 .collect(),
-        )
+        ))
     }
 
     /// `BSIM4load` (`MODEDCOP | MODEINITFLOAT`) on the present structs.
@@ -613,7 +478,7 @@ impl DeviceSensitivity for Bsim4Sensitivity<'_> {
                 "BSIM4 AC sensitivity loads go through the reset load",
             ));
         }
-        let (m, h, size) = self.structs(current);
+        let (m, h, size) = Self::structs(current)?;
         Ok(SensitivityLoad::Replacement(Box::new(
             self.device.stand_in(m, h, size, &self.context),
         )))
@@ -639,8 +504,8 @@ impl DeviceSensitivity for Bsim4Sensitivity<'_> {
                 "src/spicelib/analysis/cktsens.c and src/spicelib/devices/bsim4/b4acld.c",
             ));
         }
-        let (rm, rh, rsize) = self.structs(reset.state);
-        let (m, h, size) = self.structs(current);
+        let (rm, rh, rsize) = Self::structs(reset.state)?;
+        let (m, h, size) = Self::structs(current)?;
         Ok(SensitivityLoad::Replacement(Box::new(ResetBsim4 {
             device: self.device.stand_in(m, h, size, &self.context),
             original: self.device.stand_in(
@@ -789,15 +654,9 @@ impl Device for ResetBsim4 {
             .device
             .ensure(model_context.temperature, model_context.nominal_temperature)?;
         let prepared: &Rc<_> = &prepared;
-        let mut merged = prepared.instance.to_values();
-        let from_reset = rh.to_values();
-        for (index, name) in Instance::MEMBERS.iter().enumerate() {
-            if LOAD_ONLY.contains(name) {
-                merged[index] = from_reset[index];
-            }
-        }
-        let mut h = Instance::default();
-        h.set_values(&merged);
+        // Generated ownership projection is precisely the load-only member
+        // set (LOAD_WRITES - SETUP/TEMPERATURE/CHECK_WRITES).
+        let h = prepared.instance.with_previous_load_state(&rh);
         ac_stamp(
             context,
             &self.device.nodes,

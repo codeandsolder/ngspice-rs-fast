@@ -8,7 +8,10 @@ use ngspice_rs::analysis::{AnalysisRequest, RawFile, RunConfig, runner};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::primitives::{AnalysisKind, parse_spice_number};
 
-use crate::{compare, golden, tran, workspace_root};
+#[cfg(test)]
+use super::workspace_root;
+use super::{compare, tran};
+use ngspice_conformance::fixtures;
 
 /// How a fixture's Rust result is compared with its C golden.
 enum Gate {
@@ -1850,13 +1853,13 @@ const EXCLUDED: &[(&str, &str)] = &[(
      but not the FMA-built golden (3 poles)",
 )];
 
-pub(crate) fn main(arguments: &[String]) -> Result<(), String> {
+pub(super) fn main(root: &Path, arguments: &[String]) -> Result<(), String> {
     let only = match arguments {
         [] => None,
         [flag, name] if flag == "--netlist" && !name.starts_with('-') => Some(name.as_str()),
         _ => return Err("usage: cargo xtask golden verify [--netlist <NAME>]".into()),
     };
-    run(&workspace_root(), only)
+    run(root, only)
 }
 
 fn run(root: &Path, only: Option<&str>) -> Result<(), String> {
@@ -1885,7 +1888,7 @@ fn run_with_registries(
     batch: &[Batch],
     excluded: &[(&str, &str)],
 ) -> Result<(), String> {
-    let paths = golden::netlist_paths_at(root, only)?;
+    let paths = fixtures::netlist_paths_at(root, only)?;
     let mut verified = 0;
     let mut unsupported = 0;
     let mut failures = Vec::new();
@@ -1895,10 +1898,10 @@ fn run_with_registries(
             .map(|fixture| fixture.name)
             .chain(batch.iter().map(|fixture| fixture.name))
         {
-            if !paths
-                .iter()
-                .any(|path| path.file_stem().is_some_and(|stem| stem == name))
-            {
+            if !paths.iter().any(|path| {
+                path.file_stem()
+                    .is_some_and(|stem| stem.eq_ignore_ascii_case(name))
+            }) {
                 failures.push(format!("missing supported fixture '{name}'"));
             }
         }
@@ -1908,7 +1911,10 @@ fn run_with_registries(
             .file_stem()
             .and_then(|s| s.to_str())
             .ok_or("invalid fixture name")?;
-        if let Some(fixture) = supported.iter().find(|fixture| fixture.name == name) {
+        if let Some(fixture) = supported
+            .iter()
+            .find(|fixture| fixture.name.eq_ignore_ascii_case(name))
+        {
             match fixture_result(root, &path, fixture) {
                 Ok(details) => {
                     verified += 1;
@@ -1922,7 +1928,10 @@ fn run_with_registries(
                     failures.push(format!("{name}: {error}"));
                 }
             }
-        } else if let Some(fixture) = batch.iter().find(|fixture| fixture.name == name) {
+        } else if let Some(fixture) = batch
+            .iter()
+            .find(|fixture| fixture.name.eq_ignore_ascii_case(name))
+        {
             match batch_result(root, &path, fixture) {
                 Ok(details) => {
                     verified += 1;
@@ -1936,7 +1945,10 @@ fn run_with_registries(
                     failures.push(format!("{name}: {error}"));
                 }
             }
-        } else if let Some((_, reason)) = excluded.iter().find(|(fixture, _)| *fixture == name) {
+        } else if let Some((_, reason)) = excluded
+            .iter()
+            .find(|(fixture, _)| fixture.eq_ignore_ascii_case(name))
+        {
             unsupported += 1;
             println!("  unsupported {name}: {reason}");
             if only.is_some() {
@@ -2142,7 +2154,7 @@ fn run_card_plots(
     let plots = plots
         .into_iter()
         .map(|plot| project(plot, &internal))
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((request, plots, circuit))
 }
 
@@ -2161,21 +2173,33 @@ const C_UNSAVED_SUFFIXES: [&str; 7] = [
 /// Projects one Rust plot onto C's default save set (see
 /// [`run_card_plots`]). Vector names already follow C, including the DC
 /// sweep scales (`dctrcurv.c`).
-fn project(mut got: ngspice_rs::analysis::Plot, internal: &[String]) -> ngspice_rs::analysis::Plot {
-    for column in (0..got.variables.len()).rev() {
-        if internal.contains(&got.variables[column].name) {
-            got.variables.remove(column);
-            for row in &mut got.points {
+fn project(
+    mut got: ngspice_rs::analysis::Plot,
+    internal: &[String],
+) -> Result<ngspice_rs::analysis::Plot, String> {
+    let mut variables = got.variables().to_vec();
+    let mut points = got.take_points();
+    for column in (0..variables.len()).rev() {
+        if internal.contains(&variables[column].name) {
+            variables.remove(column);
+            for row in &mut points {
                 row.remove(column);
             }
         }
     }
-    got
+    ngspice_rs::analysis::Plot::new(
+        got.name.clone(),
+        got.plotname.clone(),
+        got.flags(),
+        variables,
+    )
+    .with_points(points)
+    .map_err(|err| err.to_string())
 }
 
 /// The committed C golden of `name`.
 fn load_golden(root: &Path, name: &str) -> Result<RawFile, String> {
-    let target = crate::reference::golden_path(root, name);
+    let target = fixtures::golden_path(root, name);
     let text =
         fs::read_to_string(&target).map_err(|e| format!("reading {}: {e}", target.display()))?;
     RawFile::parse(&text).map_err(|e| format!("{}: {e}", target.display()))
@@ -2269,18 +2293,14 @@ mod tests {
                 std::process::id(),
                 ID.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::create_dir_all(root.join(golden::NETLIST_DIR)).unwrap();
-            fs::create_dir_all(root.join(golden::GOLDEN_DIR)).unwrap();
+            fs::create_dir_all(root.join(fixtures::NETLIST_DIR)).unwrap();
+            fs::create_dir_all(root.join(fixtures::GOLDEN_DIR)).unwrap();
             for name in names {
                 let deck = format!("conformance/netlists/{name}.cir");
                 fs::copy(workspace_root().join(&deck), root.join(&deck)).unwrap();
-                let target = crate::reference::golden_path(&root, name);
+                let target = fixtures::golden_path(&root, name);
                 fs::create_dir_all(target.parent().unwrap()).unwrap();
-                fs::copy(
-                    crate::reference::golden_path(&workspace_root(), name),
-                    target,
-                )
-                .unwrap();
+                fs::copy(fixtures::golden_path(&workspace_root(), name), target).unwrap();
             }
             Self(root)
         }
@@ -2293,11 +2313,11 @@ mod tests {
 
     #[test]
     fn production_fixtures_pass_without_modifying_inputs() {
-        let paths: Vec<_> = golden::netlist_paths_at(&workspace_root(), None)
+        let paths: Vec<_> = fixtures::netlist_paths_at(&workspace_root(), None)
             .unwrap()
             .into_iter()
             .flat_map(|p| {
-                let raw = crate::reference::golden_path(
+                let raw = fixtures::golden_path(
                     &workspace_root(),
                     p.file_stem().unwrap().to_str().unwrap(),
                 );
@@ -2316,6 +2336,47 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the independent C oracle in NGSPICE_BIN"]
+    fn capture_check_verify_use_the_same_selected_reference() {
+        use super::super::golden;
+        let temp = Temp::with(&["rc_divider", "multi_analysis_rc", "sens_bjt"]);
+        let root = &temp.0;
+        let binary = std::env::var("NGSPICE_BIN").unwrap();
+        assert!(Path::new(&binary).is_absolute());
+        // Exercise case-insensitive deck IDs without perturbing the real fixtures.
+        let netlists = root.join(fixtures::NETLIST_DIR);
+        fs::rename(netlists.join("sens_bjt.cir"), netlists.join("SENS_BJT.CIR")).unwrap();
+        for name in ["rc_divider", "multi_analysis_rc", "sens_bjt"] {
+            let selected = fixtures::golden_path(root, name);
+            let alternative = if selected == root.join("conformance/golden/sens_bjt.raw") {
+                root.join("conformance/golden/linux-x86_64-gnu/sens_bjt.raw")
+            } else {
+                root.join("conformance/golden/sens_bjt.raw")
+            };
+            if name == "sens_bjt" {
+                fs::create_dir_all(alternative.parent().unwrap()).unwrap();
+                fs::write(&alternative, "not the selected reference").unwrap();
+            }
+            fs::remove_file(&selected).unwrap();
+            let c_command = |command: &str| {
+                [command, "--netlist", name, "--ngspice", &binary].map(str::to_owned)
+            };
+            assert!(golden::main(root, &c_command("check")).is_err());
+            golden::main(root, &c_command("capture")).unwrap();
+            let bytes = fs::read(&selected).unwrap();
+            golden::main(root, &c_command("check")).unwrap();
+            run(root, Some(name)).unwrap();
+            assert_eq!(fs::read(&selected).unwrap(), bytes);
+            if name == "sens_bjt" {
+                assert_eq!(
+                    fs::read_to_string(alternative).unwrap(),
+                    "not the selected reference"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn selected_bjt_reference_is_required_and_still_checked_strictly() {
         let temp = Temp::with(&["sens_bjt"]);
         // On Linux keep the macOS reference present as well: a missing
@@ -2326,7 +2387,7 @@ mod tests {
             generic,
         )
         .unwrap();
-        let selected = crate::reference::golden_path(&temp.0, "sens_bjt");
+        let selected = fixtures::golden_path(&temp.0, "sens_bjt");
         let original = fs::read_to_string(&selected).unwrap();
         run(&temp.0, Some("sens_bjt")).unwrap();
         fs::remove_file(&selected).unwrap();
@@ -2337,8 +2398,8 @@ mod tests {
         let mut raw = RawFile::parse(&original).unwrap();
         let plot = &mut raw.plots[0].plot;
         let index = plot.variable_index("v(q1:ise)").unwrap();
-        plot.points[0][index] = ngspice_rs::primitives::Complex::ZERO;
-        fs::write(selected, raw.to_ascii()).unwrap();
+        plot.point_mut(0).unwrap()[index] = ngspice_rs::primitives::Complex::ZERO;
+        fs::write(selected, raw.to_ascii().unwrap()).unwrap();
         let error = run(&temp.0, Some("sens_bjt")).unwrap_err();
         assert!(error.contains("v(q1:ise)"), "{error}");
     }
@@ -2405,7 +2466,13 @@ mod tests {
             vec!["--netlist", "--verbose"],
             vec!["--netlist", "rc_divider", "extra"],
         ] {
-            assert!(main(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err());
+            assert!(
+                main(
+                    &workspace_root(),
+                    &args.into_iter().map(String::from).collect::<Vec<_>>()
+                )
+                .is_err()
+            );
         }
     }
 

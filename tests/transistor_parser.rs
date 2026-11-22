@@ -334,12 +334,12 @@ fn continuations_and_unicode_nodes_preserve_byte_locations() {
     let q = netlist.device("q1").unwrap();
     assert_eq!(q.nodes, ["α", "b", "e"]);
     assert_eq!(q.location.line, 2);
-    assert_eq!(q.parameters[0].location.line, 2);
-    assert_eq!(q.parameters[0].location.column, 14);
+    assert_eq!(q.parameters[0].location.line, 3);
+    assert_eq!(q.parameters[0].location.column, 3);
     let m = netlist.device("m1").unwrap();
     assert_eq!(m.location.line, 4);
-    assert_eq!(m.parameters[0].location.line, 4);
-    assert_eq!(m.parameters[0].location.column, 15);
+    assert_eq!(m.parameters[0].location.line, 5);
+    assert_eq!(m.parameters[0].location.column, 3);
 }
 
 #[test]

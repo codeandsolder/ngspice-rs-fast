@@ -29,22 +29,22 @@ pub fn render(plot: &Plot) -> SpiceResult<String> {
         feature: format!(".plot: {message}"),
         location: None,
     };
-    if plot.variables.len() < 2 || plot.points.is_empty() {
+    if plot.variables().len() < 2 || plot.points().is_empty() {
         return Err(invalid("needs a scale and at least one dependent vector"));
     }
     if plot
-        .points
+        .points()
         .iter()
-        .any(|row| row.len() != plot.variables.len() || row.iter().any(|v| !v.is_finite()))
+        .any(|row| row.len() != plot.variables().len() || row.iter().any(|v| !v.is_finite()))
     {
         return Err(invalid("inconsistent or nonfinite plot values"));
     }
-    if plot.points.windows(2).any(|p| p[1][0].re < p[0][0].re) {
+    if plot.points().windows(2).any(|p| p[1][0].re < p[0][0].re) {
         return Err(invalid("scale must be nondecreasing"));
     }
     let mut low = f64::INFINITY;
     let mut high = f64::NEG_INFINITY;
-    for row in &plot.points {
+    for row in plot.points() {
         for value in &row[1..] {
             low = low.min(value.re);
             high = high.max(value.re);
@@ -60,7 +60,7 @@ pub fn render(plot: &Plot) -> SpiceResult<String> {
         return Err(invalid("dependent range overflows"));
     }
     let mut text = format!("plot: {}\nLegend:  ", plot.plotname);
-    for (i, variable) in plot.variables[1..].iter().enumerate() {
+    for (i, variable) in plot.variables()[1..].iter().enumerate() {
         let _ = write!(
             text,
             "{} = {}  ",
@@ -71,9 +71,9 @@ pub fn render(plot: &Plot) -> SpiceResult<String> {
     let _ = writeln!(
         text,
         "\n{}     {low:.3e} .. {high:.3e}",
-        plot.variables[0].name
+        plot.variables()[0].name
     );
-    for row in &plot.points {
+    for row in plot.points() {
         let mut field = [b' '; LAST_COLUMN as usize + 1];
         for i in (0..=usize::from(LAST_COLUMN)).step_by(15) {
             field[i] = b'.';
@@ -106,12 +106,15 @@ mod tests {
 
     #[test]
     fn malformed_rows_are_rejected_before_scale_ordering() {
-        let mut plot = Plot::new("tran1", "Transient", PlotFlags::Real);
+        let mut plot = Plot::builder("tran1", "Transient", PlotFlags::Real);
         plot.push_variable(Variable::new("time", "time"));
         plot.push_variable(Variable::new("v(out)", "voltage"));
+        let mut plot = plot.build();
         plot.push_point(vec![Complex::real(0.), Complex::real(1.)])
             .unwrap();
-        plot.points.push(Vec::new());
+        assert!(plot.push_point(Vec::new()).is_err());
+        plot.push_point(vec![Complex::real(f64::NAN), Complex::ZERO])
+            .unwrap();
         let error = render(&plot).expect_err("inconsistent row");
         assert!(error.to_string().contains("inconsistent or nonfinite"));
     }

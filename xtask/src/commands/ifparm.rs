@@ -14,41 +14,41 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// One model family's generator configuration.
-pub(crate) struct Spec {
+pub(super) struct Spec {
     /// The device directory under `src/spicelib/devices`.
-    pub(crate) directory: &'static str,
+    pub(super) directory: &'static str,
     /// The C identifier prefix, including the trailing underscore.
-    pub(crate) prefix: &'static str,
+    pub(super) prefix: &'static str,
     /// The `cargo xtask` subcommand that regenerates these files.
-    pub(crate) command: &'static str,
+    pub(super) command: &'static str,
     /// The interface source set named in the generated header.
-    pub(crate) interface_inputs: &'static str,
+    pub(super) interface_inputs: &'static str,
     /// The model table's C name.
-    pub(crate) model_table: &'static str,
+    pub(super) model_table: &'static str,
     /// The instance table's C name.
-    pub(crate) instance_table: &'static str,
+    pub(super) instance_table: &'static str,
     /// The setup file whose literal defaults are extracted.
-    pub(crate) setup_file: &'static str,
+    pub(super) setup_file: &'static str,
     /// The text that ends the model-default block in the setup file.
-    pub(crate) instance_boundary: &'static str,
+    pub(super) instance_boundary: &'static str,
     /// Reviewed model-table row count; a change must be reviewed.
-    pub(crate) model_expected: usize,
+    pub(super) model_expected: usize,
     /// Reviewed instance-table row count.
-    pub(crate) instance_expected: usize,
+    pub(super) instance_expected: usize,
     /// Reviewed literal-default count.
-    pub(crate) literal_expected: usize,
+    pub(super) literal_expected: usize,
 }
 
 /// A parsed `cargo xtask <dev>-schema` invocation.
-pub(crate) struct Args {
+pub(super) struct Args {
     /// The ngspice checkout holding the C sources.
-    pub(crate) source: PathBuf,
+    pub(super) source: PathBuf,
     /// Compare instead of writing.
-    pub(crate) check: bool,
+    pub(super) check: bool,
 }
 
 /// Parses `--source <dir> [--check]`.
-pub(crate) fn args(args: &[String], usage: &str) -> Result<Args, String> {
+pub(super) fn args(args: &[String], usage: &str) -> Result<Args, String> {
     let (mut source, mut check) = (None, false);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -67,7 +67,7 @@ pub(crate) fn args(args: &[String], usage: &str) -> Result<Args, String> {
 }
 
 /// The upstream Git revision of the named clean input files.
-pub(crate) fn revision(source: &Path, files: &[String]) -> Result<String, String> {
+pub(super) fn revision(source: &Path, files: &[String]) -> Result<String, String> {
     // Only the named read inputs must be clean; unrelated reference-tree work
     // is neither inspected nor modified. Record the Git revision, not a date.
     let status = Command::new("git")
@@ -98,20 +98,20 @@ pub(crate) fn revision(source: &Path, files: &[String]) -> Result<String, String
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Entry {
-    pub(crate) name: String,
-    pub(crate) symbol: String,
-    pub(crate) kind: String,
-    pub(crate) access: &'static str,
-    pub(crate) alias: bool,
+pub(super) struct Entry {
+    pub(super) name: String,
+    pub(super) symbol: String,
+    pub(super) kind: String,
+    pub(super) access: &'static str,
+    pub(super) alias: bool,
     /// C's `IF_UNINTERESTING` (`IOPU`/`IOPUR`): settable and askable but
     /// omitted from `show all`. Recorded, not dropped.
-    pub(crate) uninteresting: bool,
+    pub(super) uninteresting: bool,
 }
 
 /// Restricted `IFparm` reader: one declarator per line, four comma-separated
 /// leading arguments. Descriptions are deliberately not copied into Rust.
-pub(crate) fn table(text: &str, name: &str) -> Result<Vec<Entry>, String> {
+pub(super) fn table(text: &str, name: &str) -> Result<Vec<Entry>, String> {
     let marker = format!("IFparm {name}[] = {{");
     let body = text
         .split_once(&marker)
@@ -192,7 +192,7 @@ fn ids<'a>(header: &'a str, prefix: &str) -> Result<BTreeMap<&'a str, u16>, Stri
 
 /// A setter case's destination and given bit. No RHS expression, control
 /// flow, formula or source comment is emitted into the generated table.
-pub(crate) fn setters(
+pub(super) fn setters(
     text: &str,
     prefix: &str,
 ) -> Result<BTreeMap<String, (String, Option<String>)>, String> {
@@ -254,7 +254,7 @@ pub(crate) fn setters(
 
 /// Strip C block comments without changing physical line boundaries, so that
 /// statement windows stay intact.
-pub(crate) fn strip_comments(text: &str) -> Result<String, String> {
+pub(super) fn strip_comments(text: &str) -> Result<String, String> {
     let mut clean = String::new();
     let mut input = text.chars().peekable();
     let mut comment = false;
@@ -276,7 +276,7 @@ pub(crate) fn strip_comments(text: &str) -> Result<String, String> {
 }
 
 /// The generated `parameters.rs` text.
-pub(crate) fn parameters(
+pub(super) fn parameters(
     spec: &Spec,
     table_text: &str,
     header: &str,
@@ -382,15 +382,30 @@ fn grouped_literal(value: f64) -> String {
     format!("{sign}{whole}{fraction}{exponent}")
 }
 
-/// The generated `defaults_data.rs` text: the setup file's literal model
-/// defaults, in C order, as interface facts only.
-pub(crate) fn literal_defaults(
+/// A literal numeric default extracted from a C model's setup pass.
+pub(super) struct LiteralDefault {
+    /// Canonical interface name.
+    pub(super) name: String,
+    /// Interface type, as recorded by the parameter table.
+    pub(super) kind: String,
+    /// Literal C default.
+    pub(super) value: f64,
+}
+
+impl LiteralDefault {
+    /// Render a numeric literal with the generator's standard formatting.
+    pub(super) fn formatted(&self) -> String {
+        grouped_literal(self.value)
+    }
+}
+
+/// Extract literal defaults in C setup order with their interface types.
+pub(super) fn literal_default_facts(
     spec: &Spec,
     tables: &str,
     mpar: &str,
     setup: &str,
-    revision: &str,
-) -> Result<String, String> {
+) -> Result<Vec<LiteralDefault>, String> {
     let model = table(tables, spec.model_table)?;
     let setters = setters(mpar, spec.prefix)?;
     let mut fields = BTreeMap::new();
@@ -409,10 +424,7 @@ pub(crate) fn literal_defaults(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
-    let mut out = format!(
-        "// Generated literal-default facts, not C implementation code.\n// Source: ngspice {revision}, {}/{}.\n// Dependent defaults and diagnostics are implemented separately.\n\n/// Canonical model keyword and literal default, in C setup order.\n#[rustfmt::skip]\npub(super) const LITERALS: &[(&str, f64)] = &[\n",
-        spec.directory, spec.setup_file
-    );
+    let mut defaults = Vec::with_capacity(spec.literal_expected);
     let mut seen = BTreeSet::new();
     for pair in lines.windows(2) {
         let Some(given) = pair[0]
@@ -445,8 +457,11 @@ pub(crate) fn literal_defaults(
         if !seen.insert(p.name.as_str()) {
             return Err(format!("duplicate literal default for {}", p.name));
         }
-        let formatted = grouped_literal(value);
-        writeln!(out, "    ({:?}, {formatted}),", p.name).map_err(|e| e.to_string())?;
+        defaults.push(LiteralDefault {
+            name: p.name.clone(),
+            kind: p.kind.clone(),
+            value,
+        });
     }
     if seen.len() != spec.literal_expected {
         return Err(format!(
@@ -455,13 +470,32 @@ pub(crate) fn literal_defaults(
             spec.literal_expected
         ));
     }
+    Ok(defaults)
+}
+
+/// The generated `defaults_data.rs` text for models using keyword/value tables.
+pub(super) fn literal_defaults(
+    spec: &Spec,
+    tables: &str,
+    mpar: &str,
+    setup: &str,
+    revision: &str,
+) -> Result<String, String> {
+    let mut out = format!(
+        "// Generated literal-default facts, not C implementation code.\n// Source: ngspice {revision}, {}/{}.\n// Dependent defaults and diagnostics are implemented separately.\n\n/// Canonical model keyword and literal default, in C setup order.\n#[rustfmt::skip]\npub(super) const LITERALS: &[(&str, f64)] = &[\n",
+        spec.directory, spec.setup_file
+    );
+    for default in literal_default_facts(spec, tables, mpar, setup)? {
+        writeln!(out, "    ({:?}, {}),", default.name, default.formatted())
+            .map_err(|e| e.to_string())?;
+    }
     out.push_str("];\n");
     Ok(out)
 }
 
 /// Writes or checks one generated file.
-pub(crate) fn emit(path: &str, text: &str, check: bool) -> Result<(), String> {
-    let output = crate::workspace_root().join(path);
+pub(super) fn emit(root: &Path, path: &str, text: &str, check: bool) -> Result<(), String> {
+    let output = root.join(path);
     if check {
         let existing =
             fs::read_to_string(&output).map_err(|e| format!("{}: {e}", output.display()))?;
@@ -493,7 +527,7 @@ pub(crate) fn emit(path: &str, text: &str, check: bool) -> Result<(), String> {
 }
 
 /// Reads one input file from the device directory.
-pub(crate) fn read(source: &Path, spec: &Spec, name: &str) -> Result<String, String> {
+pub(super) fn read(source: &Path, spec: &Spec, name: &str) -> Result<String, String> {
     let path = source
         .join("src/spicelib/devices")
         .join(spec.directory)

@@ -43,14 +43,14 @@ scope root
         [3] name="mu" kind=scalar value="0.2" @netlists/m10_mesa_l3_op.cir:6:43
         [4] name="m" kind=scalar value="2.2" @netlists/m10_mesa_l3_op.cir:6:50
         [5] name="vto" kind=scalar value="-2.04" @netlists/m10_mesa_l3_op.cir:6:56
-        [6] name="eta" kind=scalar value="1.5" @netlists/m10_mesa_l3_op.cir:6:66
-        [7] name="lambda" kind=scalar value="0.04" @netlists/m10_mesa_l3_op.cir:6:74
-        [8] name="tc" kind=scalar value="0.001" @netlists/m10_mesa_l3_op.cir:6:86
-        [9] name="sigma0" kind=scalar value="0.02" @netlists/m10_mesa_l3_op.cir:6:95
-        [10] name="vsigma" kind=scalar value="0.1" @netlists/m10_mesa_l3_op.cir:6:107
-        [11] name="vsigmat" kind=scalar value="1.37" @netlists/m10_mesa_l3_op.cir:6:118
-        [12] name="delta" kind=scalar value="5" @netlists/m10_mesa_l3_op.cir:6:131
-        [13] name="beta" kind=scalar value="0.0085" @netlists/m10_mesa_l3_op.cir:6:139
+        [6] name="eta" kind=scalar value="1.5" @netlists/m10_mesa_l3_op.cir:7:3
+        [7] name="lambda" kind=scalar value="0.04" @netlists/m10_mesa_l3_op.cir:7:11
+        [8] name="tc" kind=scalar value="0.001" @netlists/m10_mesa_l3_op.cir:7:23
+        [9] name="sigma0" kind=scalar value="0.02" @netlists/m10_mesa_l3_op.cir:7:32
+        [10] name="vsigma" kind=scalar value="0.1" @netlists/m10_mesa_l3_op.cir:7:44
+        [11] name="vsigmat" kind=scalar value="1.37" @netlists/m10_mesa_l3_op.cir:7:55
+        [12] name="delta" kind=scalar value="5" @netlists/m10_mesa_l3_op.cir:8:3
+        [13] name="beta" kind=scalar value="0.0085" @netlists/m10_mesa_l3_op.cir:8:11
   subcircuits (0):
   analyses (1):
     analysis [0] kind=op @netlists/m10_mesa_l3_op.cir:11:1

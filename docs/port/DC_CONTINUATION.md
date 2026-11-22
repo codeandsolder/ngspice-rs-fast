@@ -85,7 +85,7 @@ The default `itl1` is C's 100 (it was 200 before #106).
 
 ### `ngspice` (default): `cktop.c`
 
-`NgspiceStepping { gmin_steps, source_steps, gmin_factor, adapt_iterations }`,
+`NgspiceStepping::new(gmin_steps, source_steps, gmin_factor, adapt_iterations)`,
 from deck `gminsteps` (default 1), `srcsteps`/`itl6` (default 1), `gminfactor`
 (default 10) and `itl2` as written (default 50):
 
@@ -123,10 +123,7 @@ use ngspice_rs::analysis::bias::{ContinuationPolicy, DcSettings, NgspiceStepping
 
 let settings = DcSettings {
     newton: NewtonOptions::default(),                 // limiting: Device, itl1 = 100
-    continuation: ContinuationPolicy::ngspice(NgspiceStepping {
-        gmin_steps: 4,                                // spice3_gmin
-        ..NgspiceStepping::default()
-    }),
+    continuation: ContinuationPolicy::ngspice(NgspiceStepping::new(4, 1, 10., 50)?),
 };
 match solve_dc_with(&circuit, &context, &settings, &[], Some(&seed), None) {
     Ok(solved) => { /* solved.solution.{values,trial,iterations}, solved.report */ }
@@ -136,7 +133,7 @@ match solve_dc_with(&circuit, &context, &settings, &[], Some(&seed), None) {
 
 - `ContinuationPolicy::default()` is the ngspice schedule with C's defaults;
   `ContinuationPolicy::ladder()` the fixed ladders; `disabled()` no continuation.
-  `skip_direct` is `noopiter`.
+  `skip_direct` is `noopiter`. The schedule carries either validated CKTop modes or a custom `GminSchedule` and optional `SourceStepping`; these cannot be mixed. `IterationBudget::new` and `IterationLimit::new` check optional total and per-stage bounds before a policy is constructed. Fixed source stepping ends with its full-scale stage; a custom source ladder has an additional original-equation solve.
 - `DcSettings::from_request(&AnalysisRequest)` resolves `rtol`, `vntol`,
   `abstol`, `maxiter`, `limiting`, `continuation`, `srcsteps`, `gminsteps`,
   `gminfactor`, `stagemaxiter`, `adaptiter` and `noopiter` (`0`/`1`).

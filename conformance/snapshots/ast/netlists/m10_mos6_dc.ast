@@ -122,11 +122,11 @@ scope root
         [5] name="nc" kind=scalar value="1.25" @netlists/m10_mos6_dc.cir:17:57
         [6] name="gamma" kind=scalar value="0.5" @netlists/m10_mos6_dc.cir:17:65
         [7] name="gamma1" kind=scalar value="0.03" @netlists/m10_mos6_dc.cir:17:75
-        [8] name="sigma" kind=scalar value="0.02" @netlists/m10_mos6_dc.cir:17:87
-        [9] name="phi" kind=scalar value="0.7" @netlists/m10_mos6_dc.cir:17:98
-        [10] name="lambda0" kind=scalar value="0.04" @netlists/m10_mos6_dc.cir:17:106
-        [11] name="lambda1" kind=scalar value="0.01" @netlists/m10_mos6_dc.cir:17:119
-        [12] name="ld" kind=scalar value="0.08u" @netlists/m10_mos6_dc.cir:17:132
+        [8] name="sigma" kind=scalar value="0.02" @netlists/m10_mos6_dc.cir:18:3
+        [9] name="phi" kind=scalar value="0.7" @netlists/m10_mos6_dc.cir:18:14
+        [10] name="lambda0" kind=scalar value="0.04" @netlists/m10_mos6_dc.cir:18:22
+        [11] name="lambda1" kind=scalar value="0.01" @netlists/m10_mos6_dc.cir:18:35
+        [12] name="ld" kind=scalar value="0.08u" @netlists/m10_mos6_dc.cir:18:48
     model [1] name="mproc" base="nmos" level=6e0 @netlists/m10_mos6_dc.cir:19:1
       parameters (11):
         [0] name="level" kind=scalar value="6" @netlists/m10_mos6_dc.cir:19:19
@@ -138,8 +138,8 @@ scope root
         [6] name="kv" kind=scalar value="1.2" @netlists/m10_mos6_dc.cir:19:67
         [7] name="nv" kind=scalar value="0.7" @netlists/m10_mos6_dc.cir:19:74
         [8] name="nc" kind=scalar value="1.4" @netlists/m10_mos6_dc.cir:19:81
-        [9] name="lambda" kind=scalar value="0.03" @netlists/m10_mos6_dc.cir:19:88
-        [10] name="tnom" kind=scalar value="20" @netlists/m10_mos6_dc.cir:19:100
+        [9] name="lambda" kind=scalar value="0.03" @netlists/m10_mos6_dc.cir:20:3
+        [10] name="tnom" kind=scalar value="20" @netlists/m10_mos6_dc.cir:20:15
     model [2] name="mp" base="pmos" level=6e0 @netlists/m10_mos6_dc.cir:21:1
       parameters (13):
         [0] name="level" kind=scalar value="6" @netlists/m10_mos6_dc.cir:21:16
@@ -151,10 +151,10 @@ scope root
         [6] name="nc" kind=scalar value="1.2" @netlists/m10_mos6_dc.cir:21:62
         [7] name="gamma" kind=scalar value="0.4" @netlists/m10_mos6_dc.cir:21:69
         [8] name="sigma" kind=scalar value="0.01" @netlists/m10_mos6_dc.cir:21:79
-        [9] name="lambda0" kind=scalar value="0.05" @netlists/m10_mos6_dc.cir:21:90
-        [10] name="rd" kind=scalar value="20" @netlists/m10_mos6_dc.cir:21:103
-        [11] name="rsh" kind=scalar value="15" @netlists/m10_mos6_dc.cir:21:109
-        [12] name="ld" kind=scalar value="0.06u" @netlists/m10_mos6_dc.cir:21:116
+        [9] name="lambda0" kind=scalar value="0.05" @netlists/m10_mos6_dc.cir:22:3
+        [10] name="rd" kind=scalar value="20" @netlists/m10_mos6_dc.cir:22:16
+        [11] name="rsh" kind=scalar value="15" @netlists/m10_mos6_dc.cir:22:22
+        [12] name="ld" kind=scalar value="0.06u" @netlists/m10_mos6_dc.cir:22:29
     model [3] name="mlam" base="nmos" level=6e0 @netlists/m10_mos6_dc.cir:23:1
       parameters (13):
         [0] name="level" kind=scalar value="6" @netlists/m10_mos6_dc.cir:23:18
@@ -166,10 +166,10 @@ scope root
         [6] name="gamma" kind=scalar value="0.4" @netlists/m10_mos6_dc.cir:23:63
         [7] name="phi" kind=scalar value="0.65" @netlists/m10_mos6_dc.cir:23:73
         [8] name="gamma1" kind=scalar value="0.02" @netlists/m10_mos6_dc.cir:23:82
-        [9] name="lambda0" kind=scalar value="0.05" @netlists/m10_mos6_dc.cir:23:94
-        [10] name="lambda1" kind=scalar value="0.02" @netlists/m10_mos6_dc.cir:23:107
-        [11] name="sigma" kind=scalar value="0.03" @netlists/m10_mos6_dc.cir:23:120
-        [12] name="is" kind=scalar value="1e-15" @netlists/m10_mos6_dc.cir:23:131
+        [9] name="lambda0" kind=scalar value="0.05" @netlists/m10_mos6_dc.cir:24:3
+        [10] name="lambda1" kind=scalar value="0.02" @netlists/m10_mos6_dc.cir:24:16
+        [11] name="sigma" kind=scalar value="0.03" @netlists/m10_mos6_dc.cir:24:29
+        [12] name="is" kind=scalar value="1e-15" @netlists/m10_mos6_dc.cir:24:40
   subcircuits (0):
   analyses (1):
     analysis [0] kind=dc @netlists/m10_mos6_dc.cir:26:1

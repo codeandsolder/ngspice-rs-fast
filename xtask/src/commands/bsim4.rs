@@ -1,6 +1,6 @@
 //! Extract BSIM4 interface facts, not C implementation code. The committed
 //! tables are offline input-schema artifacts; Cargo never needs the C tree.
-use crate::ifparm::{self, Spec};
+use super::ifparm::{self, Spec};
 
 const USAGE: &str = "usage: cargo xtask bsim4-schema --source <ngspice-checkout> [--check]";
 
@@ -18,7 +18,7 @@ const SPEC: Spec = Spec {
     literal_expected: 777,
 };
 
-pub(crate) fn main(args: &[String]) -> Result<(), String> {
+pub(super) fn main(root: &std::path::Path, args: &[String]) -> Result<(), String> {
     let parsed = ifparm::args(args, USAGE)?;
     let source = parsed.source;
     let files = [
@@ -49,15 +49,15 @@ pub(crate) fn main(args: &[String]) -> Result<(), String> {
         &read("b4set.c")?,
         &revision,
     )?;
-    let fields = crate::bsim4_fields::fields(&read("bsim4def.h")?, &revision)?;
-    let asks = crate::bsim4_fields::asks(&read("b4mask.c")?, &read("b4ask.c")?, &revision)?;
+    let fields = super::bsim4_fields::fields(&read("bsim4def.h")?, &revision)?;
+    let asks = super::bsim4_fields::asks(&read("b4mask.c")?, &read("b4ask.c")?, &revision)?;
     for (path, text) in [
         ("src/devices/bsim4/asks.rs", asks),
         ("src/devices/bsim4/parameters.rs", text),
         ("src/devices/bsim4/defaults_data.rs", defaults),
         ("src/devices/bsim4/fields.rs", fields),
     ] {
-        ifparm::emit(path, &text, parsed.check)?;
+        ifparm::emit(root, path, &text, parsed.check)?;
     }
     if parsed.check {
         println!("BSIM4 schema/default facts match {revision}");

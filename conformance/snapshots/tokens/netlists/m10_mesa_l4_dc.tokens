@@ -61,12 +61,12 @@ card 4 @netlists/m10_mesa_l4_dc.cir:5:1 lines=5-6 continuations=1
   token 22 5:57 word "nmax"
   token 23 5:61 equals "="
   token 24 5:62 number "3e16" value=3e16
-  token 25 5:67 word "cas"
-  token 26 5:70 equals "="
-  token 27 5:71 number "1" value=1e0
-  token 28 5:73 word "cbs"
-  token 29 5:76 equals "="
-  token 30 5:77 number "1" value=1e0
+  token 25 6:3 word "cas"
+  token 26 6:6 equals "="
+  token 27 6:7 number "1" value=1e0
+  token 28 6:9 word "cbs"
+  token 29 6:12 equals "="
+  token 30 6:13 number "1" value=1e0
 card 5 @netlists/m10_mesa_l4_dc.cir:7:1 lines=7-7 continuations=0
   raw: ".save all"
   kind: dot(.save)

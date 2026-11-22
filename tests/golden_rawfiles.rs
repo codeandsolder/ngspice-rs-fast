@@ -85,16 +85,16 @@ fn production_linear_drivers_match_c_goldens() {
         let want = &golden.plots[0].plot;
         assert_eq!(got.variable_count(), want.variable_count(), "{name}");
         assert_eq!(got.point_count(), want.point_count());
-        for variable in &want.variables {
+        for variable in want.variables() {
             let index = got.variable_index(&variable.name).unwrap();
-            assert_eq!(&got.variables[index], variable);
+            assert_eq!(&got.variables()[index], variable);
             for (a, b) in got
                 .column(&variable.name)
                 .unwrap()
                 .iter()
                 .zip(want.column(&variable.name).unwrap())
             {
-                let (rtol, atol) = if got.flags.is_complex() {
+                let (rtol, atol) = if got.flags().is_complex() {
                     (1e-10, 1e-12)
                 } else {
                     (1e-12, 1e-15)
@@ -143,10 +143,10 @@ fn platform_bjt_goldens_keep_their_independent_c_values() {
     assert_eq!(linux.len(), 1);
     let (a, b) = (&mac.plots[0].plot, &linux.plots[0].plot);
     assert_eq!(a.plotname, b.plotname);
-    assert_eq!(a.flags, b.flags);
+    assert_eq!(a.flags(), b.flags());
     // `write`'s ordering differs across C platforms; compare the exact
     // name/unit/realness sets, not rawfile column ordinals.
-    let (mut av, mut bv) = (a.variables.clone(), b.variables.clone());
+    let (mut av, mut bv) = (a.variables().to_vec(), b.variables().to_vec());
     av.sort_by(|x, y| x.name.cmp(&y.name));
     bv.sort_by(|x, y| x.name.cmp(&y.name));
     assert_eq!(av, bv);
@@ -211,7 +211,7 @@ fn the_writer_agrees_with_ngspice_apart_from_non_round_trippable_decimals() {
     for name in fixture_names() {
         let text = golden_text(&name);
         let rawfile = RawFile::parse(&text).unwrap_or_else(|error| panic!("{name}: {error}"));
-        let rendered = rawfile.to_ascii();
+        let rendered = rawfile.to_ascii().unwrap();
 
         assert_eq!(
             rendered.lines().count(),
@@ -286,11 +286,11 @@ fn known_golden_tokens_are_not_round_trippable() {
 fn the_writer_reaches_a_fixed_point() {
     for name in fixture_names() {
         let first = RawFile::parse(&golden_text(&name)).expect("parses");
-        let once = first.to_ascii();
+        let once = first.to_ascii().unwrap();
         let reparsed = RawFile::parse(&once).expect("reparses");
         assert_eq!(
             once,
-            reparsed.to_ascii(),
+            reparsed.to_ascii().unwrap(),
             "{name}: the second pass changed the bytes"
         );
         assert_eq!(first, reparsed, "{name}: the values changed");
@@ -328,7 +328,7 @@ fn goldens_are_well_formed_and_finite() {
             assert!(plot.variable_count() > 0, "{name}: no variables");
             assert!(plot.is_finite(), "{name}: non-finite value");
             assert!(
-                plot.variables
+                plot.variables()
                     .iter()
                     .all(|variable| !variable.unit.is_empty()),
                 "{name}: a variable has no unit"
@@ -12097,7 +12097,8 @@ fn check_plot(expectation: &Expectation, plot: &ngspice_rs::analysis::Plot) {
         expectation.fixture
     );
     assert_eq!(
-        plot.flags, expectation.flags,
+        plot.flags(),
+        expectation.flags,
         "{}: flags",
         expectation.fixture
     );
@@ -12108,7 +12109,7 @@ fn check_plot(expectation: &Expectation, plot: &ngspice_rs::analysis::Plot) {
         expectation.fixture
     );
     let names: Vec<&str> = plot
-        .variables
+        .variables()
         .iter()
         .map(|variable| variable.name.as_str())
         .collect();
@@ -12177,7 +12178,7 @@ fn multi_plot_goldens_round_trip_through_both_encodings() {
     for plots in MULTI_EXPECTATIONS {
         let fixture = plots[0].fixture;
         let rawfile = RawFile::parse(&golden_text(fixture)).expect("parses");
-        let ascii = RawFile::parse(&rawfile.to_ascii()).expect("the ASCII form parses");
+        let ascii = RawFile::parse(&rawfile.to_ascii().unwrap()).expect("the ASCII form parses");
         assert_eq!(ascii, rawfile, "{fixture}: ASCII round trip");
         let binary = RawFile::parse_bytes(&rawfile.to_binary().expect("binary encodes"))
             .expect("the binary form parses");
@@ -12186,9 +12187,9 @@ fn multi_plot_goldens_round_trip_through_both_encodings() {
             assert_eq!(got.title, want.title, "{fixture}");
             assert_eq!(got.command, want.command, "{fixture}");
             assert_eq!(got.plot.plotname, want.plot.plotname, "{fixture}");
-            assert_eq!(got.plot.flags, want.plot.flags, "{fixture}");
+            assert_eq!(got.plot.flags(), want.plot.flags(), "{fixture}");
             assert_eq!(got.plot.point_count(), want.plot.point_count());
-            for variable in &want.plot.variables {
+            for variable in want.plot.variables() {
                 assert_eq!(
                     got.plot.column(&variable.name),
                     want.plot.column(&variable.name),

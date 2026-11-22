@@ -3,28 +3,28 @@
 //! Names/units follow `src/frontend/rawfile.c`; Rust MNA column order is not
 //! ngspice's vector order. Bounds retain the production DC/AC regression policy.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use ngspice_rs::analysis::{Plot, PlotFlags};
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Tolerance {
+pub(super) struct Tolerance {
     relative: f64,
     absolute: f64,
 }
 
-pub(crate) const DC: Tolerance = Tolerance {
+pub(super) const DC: Tolerance = Tolerance {
     relative: 1e-12,
     absolute: 1e-15,
 };
-pub(crate) const AC: Tolerance = Tolerance {
+pub(super) const AC: Tolerance = Tolerance {
     relative: 1e-10,
     absolute: 1e-12,
 };
 
 /// Nonlinear bias/AC allow 1 ppm for independently converged bias Jacobians,
 /// plus a 1 p-unit floor. The linear LU-only tolerances remain unchanged.
-pub(crate) const NONLINEAR: Tolerance = Tolerance {
+pub(super) const NONLINEAR: Tolerance = Tolerance {
     relative: 1e-6,
     absolute: 1e-12,
 };
@@ -36,7 +36,7 @@ pub(crate) const NONLINEAR: Tolerance = Tolerance {
 /// density yet above the residue C's adjoint leaves for a generator whose
 /// transfer is exactly zero (e.g. about 2e-25 V/sqrt(Hz) for a resistor in
 /// series with the current-source input).
-pub(crate) const NOISE: Tolerance = Tolerance {
+pub(super) const NOISE: Tolerance = Tolerance {
     relative: 1e-10,
     absolute: 1e-20,
 };
@@ -44,7 +44,7 @@ pub(crate) const NOISE: Tolerance = Tolerance {
 /// `.noise` of nonlinear circuits: the nonlinear 1 ppm bias bound (the
 /// generators are evaluated at independently converged operating points)
 /// with the noise floor of [`NOISE`].
-pub(crate) const NOISE_NONLINEAR: Tolerance = Tolerance {
+pub(super) const NOISE_NONLINEAR: Tolerance = Tolerance {
     relative: 1e-6,
     absolute: 1e-20,
 };
@@ -56,7 +56,7 @@ pub(crate) const NOISE_NONLINEAR: Tolerance = Tolerance {
 /// with margin. Parameters C perturbs without effect read exactly 0 (or a
 /// rounding residue, e.g. about 4e-14 from the cosine of a 1e-6 degree AC
 /// phase), which the 1e-12 floor accepts.
-pub(crate) const SENSITIVITY: Tolerance = Tolerance {
+pub(super) const SENSITIVITY: Tolerance = Tolerance {
     relative: 1e-8,
     absolute: 1e-12,
 };
@@ -67,7 +67,7 @@ pub(crate) const SENSITIVITY: Tolerance = Tolerance {
 /// for an O(1) parameter of an O(1) V output (C's own result for a diode's
 /// `nr` moves by 3e-10 between RELTOL 1e-6 and 1e-9 for that reason), which a
 /// 1e-9 floor covers.
-pub(crate) const SENSITIVITY_NONLINEAR: Tolerance = Tolerance {
+pub(super) const SENSITIVITY_NONLINEAR: Tolerance = Tolerance {
     relative: 1e-6,
     absolute: 1e-9,
 };
@@ -84,7 +84,7 @@ pub(crate) const SENSITIVITY_NONLINEAR: Tolerance = Tolerance {
 /// other column is inside [`SENSITIVITY_NONLINEAR`]. The bound still rejects a
 /// real model difference - it is 1e-5, and the MESA `tRsi` defect this fixture
 /// family exposed sat at 1e-2..2e-1.
-pub(crate) const SENSITIVITY_CANCELLED: Tolerance = Tolerance {
+pub(super) const SENSITIVITY_CANCELLED: Tolerance = Tolerance {
     relative: 1e-5,
     absolute: 5e-8,
 };
@@ -97,7 +97,7 @@ pub(crate) const SENSITIVITY_CANCELLED: Tolerance = Tolerance {
 /// stays below every such response yet above the residue (about 1e-28) a
 /// node fixed by a voltage source keeps in the Rust LU solve where C writes
 /// an exact zero.
-pub(crate) const DISTORTION: Tolerance = Tolerance {
+pub(super) const DISTORTION: Tolerance = Tolerance {
     relative: 1e-6,
     absolute: 1e-18,
 };
@@ -107,7 +107,7 @@ pub(crate) const DISTORTION: Tolerance = Tolerance {
 /// more accurate Rust root, not its equations, causes the 0.062% last-point
 /// current difference. This bound applies only to that legacy golden; newly
 /// demonstrated DC/AC decks retain NONLINEAR's 1 ppm requirement.
-pub(crate) const LEGACY_DIODE_DC: Tolerance = Tolerance {
+pub(super) const LEGACY_DIODE_DC: Tolerance = Tolerance {
     relative: 1e-3,
     absolute: 1e-12,
 };
@@ -131,14 +131,14 @@ pub(crate) const LEGACY_DIODE_DC: Tolerance = Tolerance {
 /// `peak_relative` adds `peak_relative * max|C signal|` to the bound (0 for
 /// [`TRAN`]).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct TranTolerance {
-    pub(crate) peak_relative: f64,
-    pub(crate) relative: f64,
-    pub(crate) voltage_absolute: f64,
-    pub(crate) current_absolute: f64,
+pub(super) struct TranTolerance {
+    pub(super) peak_relative: f64,
+    pub(super) relative: f64,
+    pub(super) voltage_absolute: f64,
+    pub(super) current_absolute: f64,
 }
 
-pub(crate) const TRAN: TranTolerance = TranTolerance {
+pub(super) const TRAN: TranTolerance = TranTolerance {
     peak_relative: 0.0,
     relative: 1e-3,
     voltage_absolute: 1e-6,
@@ -165,12 +165,12 @@ pub(crate) const TRAN: TranTolerance = TranTolerance {
 /// and of perturbed multiple roots is not meaningful); never loosen these to
 /// absorb a missing or extra root, which is a count mismatch.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RootTolerance {
+pub(super) struct RootTolerance {
     relative: f64,
     scale_relative: f64,
 }
 
-pub(crate) const POLE_ZERO: RootTolerance = RootTolerance {
+pub(super) const POLE_ZERO: RootTolerance = RootTolerance {
     relative: 1e-6,
     scale_relative: 1e-9,
 };
@@ -179,12 +179,56 @@ pub(crate) const POLE_ZERO: RootTolerance = RootTolerance {
 /// order.
 fn root_set(plot: &Plot, kind: &str) -> Vec<(String, ngspice_rs::primitives::Complex)> {
     let prefix = format!("v({kind}(");
-    plot.variables
+    plot.variables()
         .iter()
         .enumerate()
         .filter(|(_, variable)| variable.name.to_ascii_lowercase().starts_with(&prefix))
-        .map(|(index, variable)| (variable.name.clone(), plot.points[0][index]))
+        .map(|(index, variable)| (variable.name.clone(), plot.points()[0][index]))
         .collect()
+}
+
+/// Find a perfect matching in reference-column order using breadth-first
+/// augmenting paths. Only admissible edges enter the graph. The reported
+/// maximum ratio is for the resulting assignment, not an optimized bottleneck.
+/// Search is iterative (no root-count-dependent recursion), O(n³) time in the
+/// dense worst case and O(n) additional space beyond the edge lists.
+fn perfect_root_matching(edges: &[Vec<(usize, f64)>]) -> Result<f64, usize> {
+    let n = edges.len();
+    let mut reference_match: Vec<Option<(usize, f64)>> = vec![None; n];
+    let mut candidate_match: Vec<Option<usize>> = vec![None; n];
+    for start in 0..n {
+        let mut parent = vec![None; n];
+        let mut queue = VecDeque::from([start]);
+        let mut free = None;
+        'search: while let Some(reference) = queue.pop_front() {
+            for &(candidate, ratio) in &edges[reference] {
+                if parent[candidate].is_some() {
+                    continue;
+                }
+                parent[candidate] = Some((reference, ratio));
+                if let Some(next) = candidate_match[candidate] {
+                    queue.push_back(next);
+                } else {
+                    free = Some(candidate);
+                    break 'search;
+                }
+            }
+        }
+        let mut candidate = free.ok_or(start)?;
+        while let Some((reference, ratio)) = parent[candidate] {
+            candidate_match[candidate] = Some(reference);
+            if let Some((previous, _)) = reference_match[reference].replace((candidate, ratio)) {
+                candidate = previous;
+            } else {
+                break;
+            }
+        }
+    }
+    Ok(reference_match
+        .into_iter()
+        .flatten()
+        .map(|(_, ratio)| ratio)
+        .fold(0.0_f64, f64::max))
 }
 
 /// Compares a Rust pole-zero plot with a C one as two unordered root sets
@@ -195,7 +239,7 @@ fn root_set(plot: &Plot, kind: &str) -> Vec<(String, ngspice_rs::primitives::Com
     clippy::suboptimal_flops,
     reason = "retain the existing separately rounded pole-zero acceptance bounds; changing rounding can change golden classifications at the boundary"
 )]
-pub(crate) fn roots(got: &Plot, want: &Plot, tolerance: RootTolerance) -> Result<String, String> {
+pub(super) fn roots(got: &Plot, want: &Plot, tolerance: RootTolerance) -> Result<String, String> {
     let got_columns = validate(got, "Rust")?;
     let want_columns = validate(want, "C")?;
     check_structure(got, want, &got_columns, &want_columns)?;
@@ -208,7 +252,7 @@ pub(crate) fn roots(got: &Plot, want: &Plot, tolerance: RootTolerance) -> Result
     }
     let mut worst_ratio: f64 = 0.0;
     let mut counts = Vec::new();
-    let scale = want.points[0]
+    let scale = want.points()[0]
         .iter()
         .fold(0.0_f64, |m, z| m.max(z.magnitude()));
     for kind in ["pole", "zero"] {
@@ -223,30 +267,32 @@ pub(crate) fn roots(got: &Plot, want: &Plot, tolerance: RootTolerance) -> Result
         let bound = |c: ngspice_rs::primitives::Complex| {
             tolerance.relative * c.magnitude() + tolerance.scale_relative * scale
         };
-        // Greedy assignment by error/bound ratio over every pair.
-        let mut pairs = Vec::with_capacity(rust.len() * c.len());
-        for (i, (_, r)) in rust.iter().enumerate() {
-            for (j, (_, w)) in c.iter().enumerate() {
-                pairs.push(((*r - *w).magnitude() / bound(*w), i, j));
+        let mut edges = Vec::with_capacity(c.len());
+        for (_, w) in &c {
+            let limit = bound(*w);
+            if !limit.is_finite() {
+                return Err(format!("{kind}: nonfinite reference bound"));
             }
+            let mut admissible = Vec::new();
+            for (i, (_, r)) in rust.iter().enumerate() {
+                let error = (*r - *w).magnitude();
+                if limit == 0.0 {
+                    if r == w {
+                        admissible.push((i, 0.0));
+                    }
+                } else if error <= limit {
+                    admissible.push((i, error / limit));
+                }
+            }
+            edges.push(admissible);
         }
-        pairs.sort_by(|x, y| x.0.total_cmp(&y.0));
-        let (mut rust_used, mut c_used) = (vec![false; rust.len()], vec![false; c.len()]);
-        for (ratio, i, j) in pairs {
-            if rust_used[i] || c_used[j] {
-                continue;
-            }
-            rust_used[i] = true;
-            c_used[j] = true;
-            if ratio.is_nan() || ratio > 1.0 {
-                return Err(format!(
-                    "{kind} mismatch: C {} = {:.17e}{:+.17e}j has no Rust root within the bound \
-                     (nearest unmatched Rust {} = {:.17e}{:+.17e}j, {ratio:.6e}x bound)",
-                    c[j].0, c[j].1.re, c[j].1.im, rust[i].0, rust[i].1.re, rust[i].1.im
-                ));
-            }
-            worst_ratio = worst_ratio.max(ratio);
-        }
+        let ratio = perfect_root_matching(&edges).map_err(|j| {
+            format!(
+                "{kind} mismatch: no perfect matching when including C {} = {:.17e}{:+.17e}j ({} admissible Rust candidates)",
+                c[j].0, c[j].1.re, c[j].1.im, edges[j].len()
+            )
+        })?;
+        worst_ratio = worst_ratio.max(ratio);
         counts.push(format!("{} {kind}(s)", c.len()));
     }
     Ok(format!(
@@ -255,13 +301,13 @@ pub(crate) fn roots(got: &Plot, want: &Plot, tolerance: RootTolerance) -> Result
     ))
 }
 
-pub(crate) fn validate(plot: &Plot, label: &str) -> Result<BTreeMap<String, usize>, String> {
+pub(super) fn validate(plot: &Plot, label: &str) -> Result<BTreeMap<String, usize>, String> {
     if plot.is_empty() {
         return Err(format!("{label}: empty plot"));
     }
     let mut columns = BTreeMap::new();
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-    for (index, variable) in plot.variables.iter().enumerate() {
+    for (index, variable) in plot.variables().iter().enumerate() {
         let name = variable.name.to_ascii_lowercase();
         if name.is_empty() {
             return Err(format!("{label}: empty variable name"));
@@ -281,18 +327,18 @@ pub(crate) fn validate(plot: &Plot, label: &str) -> Result<BTreeMap<String, usiz
             return Err(format!("{label}: ambiguous variable occurrence '{key}'"));
         }
     }
-    for (index, point) in plot.points.iter().enumerate() {
+    for (index, point) in plot.points().iter().enumerate() {
         if point.len() != plot.variable_count() {
             return Err(format!("{label}: point {index} has invalid row shape"));
         }
-        for (variable, value) in plot.variables.iter().zip(point) {
+        for (variable, value) in plot.variables().iter().zip(point) {
             if !value.is_finite() {
                 return Err(format!(
                     "{label}: point {index}, {} has nonfinite value",
                     variable.name
                 ));
             }
-            if (plot.flags == PlotFlags::Real || variable.is_real) && value.im != 0.0 {
+            if (plot.flags() == PlotFlags::Real || variable.is_real) && value.im != 0.0 {
                 return Err(format!(
                     "{label}: point {index}, {} has imaginary data flagged real",
                     variable.name
@@ -305,19 +351,19 @@ pub(crate) fn validate(plot: &Plot, label: &str) -> Result<BTreeMap<String, usiz
 
 /// Plot name/flags, variable-name set, units and real-vector flags must match
 /// (shared by the point-wise and transient comparators).
-pub(crate) fn check_structure(
+pub(super) fn check_structure(
     got: &Plot,
     want: &Plot,
     got_columns: &BTreeMap<String, usize>,
     want_columns: &BTreeMap<String, usize>,
 ) -> Result<(), String> {
-    if got.plotname != want.plotname || got.flags != want.flags {
+    if got.plotname != want.plotname || got.flags() != want.flags() {
         return Err(format!(
             "plot metadata mismatch: Rust '{}'/{}; C '{}'/{}",
             got.plotname,
-            got.flags.as_rawfile(),
+            got.flags().as_rawfile(),
             want.plotname,
-            want.flags.as_rawfile()
+            want.flags().as_rawfile()
         ));
     }
     let missing: Vec<_> = want_columns
@@ -334,8 +380,8 @@ pub(crate) fn check_structure(
         ));
     }
     for (name, &want_index) in want_columns {
-        let actual = &got.variables[got_columns[name]];
-        let expected = &want.variables[want_index];
+        let actual = &got.variables()[got_columns[name]];
+        let expected = &want.variables()[want_index];
         if actual.unit != expected.unit || actual.is_real != expected.is_real {
             return Err(format!(
                 "variable metadata mismatch for '{name}': Rust {actual:?}; C {expected:?}"
@@ -353,7 +399,7 @@ pub(crate) fn check_structure(
     clippy::suboptimal_flops,
     reason = "retain the existing separately rounded component acceptance bounds; changing rounding can change golden classifications at the boundary"
 )]
-pub(crate) fn plots(
+pub(super) fn plots(
     got: &Plot,
     want: &Plot,
     tolerance: Tolerance,
@@ -375,7 +421,7 @@ pub(crate) fn plots(
                 .get(axis)
                 .ok_or_else(|| format!("{label}: missing axis '{axis}'"))?;
             let mut previous = None;
-            for (index, row) in plot.points.iter().enumerate() {
+            for (index, row) in plot.points().iter().enumerate() {
                 let value = row[column];
                 if value.im != 0.0 || value.re <= 0.0 || previous.is_some_and(|p| p >= value.re) {
                     return Err(format!(
@@ -395,9 +441,9 @@ pub(crate) fn plots(
     // device with two branch currents is compared position by position.
     let mut order: Vec<(&String, &usize)> = want_columns.iter().collect();
     order.sort_by_key(|(_, index)| **index);
-    for (point, (actual, expected)) in got.points.iter().zip(&want.points).enumerate() {
+    for (point, (actual, expected)) in got.points().iter().zip(want.points()).enumerate() {
         for (key, column) in &order {
-            let variable = &want.variables[**column];
+            let variable = &want.variables()[**column];
             let got = actual[got_columns[*key]];
             let want = expected[**column];
             for (component, got, want) in [("re", got.re, want.re), ("im", got.im, want.im)] {
@@ -436,17 +482,35 @@ mod tests {
     use ngspice_rs::primitives::Complex;
 
     fn plot() -> Plot {
-        let mut plot = Plot::new("ac1", "AC Analysis", PlotFlags::Complex);
-        plot.variables = vec![
-            Variable::complex("frequency", "frequency"),
-            Variable::complex("v(out)", "voltage"),
-        ];
-        plot.points = vec![
+        Plot::new(
+            "ac1",
+            "AC Analysis",
+            PlotFlags::Complex,
+            vec![
+                Variable::complex("frequency", "frequency"),
+                Variable::complex("v(out)", "voltage"),
+            ],
+        )
+        .with_points(vec![
             vec![Complex::real(100.0), Complex::new(0.5, -0.25)],
             vec![Complex::real(1000.0), Complex::ZERO],
-        ];
-        plot
+        ])
+        .unwrap()
     }
+
+    fn edit(
+        plot: &Plot,
+        change: impl FnOnce(&mut PlotFlags, &mut Vec<Variable>, &mut Vec<Vec<Complex>>),
+    ) -> Plot {
+        let mut flags = plot.flags();
+        let mut variables = plot.variables().to_vec();
+        let mut points = plot.points().to_vec();
+        change(&mut flags, &mut variables, &mut points);
+        Plot::new(plot.name.clone(), plot.plotname.clone(), flags, variables)
+            .with_points(points)
+            .unwrap()
+    }
+
     fn compare(got: &Plot, want: &Plot) -> Result<(), String> {
         plots(got, want, AC, Some("frequency"))
     }
@@ -454,24 +518,23 @@ mod tests {
     #[test]
     fn order_and_case_do_not_matter_but_metadata_does() {
         let want = plot();
-        let mut got = want.clone();
-        got.variables.swap(0, 1);
-        got.variables[0].name = "V(OUT)".into();
-        for row in &mut got.points {
-            row.swap(0, 1);
-        }
+        let mut got = edit(&want, |_, variables, points| {
+            variables.swap(0, 1);
+            variables[0].name = "V(OUT)".into();
+            for row in points {
+                row.swap(0, 1);
+            }
+        });
         got.name = "unrelated internal ID".into();
         compare(&got, &want).unwrap();
-        got.variables[0].unit = "current".into();
+        got = edit(&got, |_, v, _| v[0].unit = "current".into());
         assert!(compare(&got, &want).unwrap_err().contains("metadata"));
-        got = want.clone();
-        got.variables[1].is_real = true;
+        got = edit(&want, |_, v, _| v[1].is_real = true);
         assert!(compare(&got, &want).is_err());
         got = want.clone();
         got.plotname = "Operating Point".into();
         assert!(compare(&got, &want).is_err());
-        got = want.clone();
-        got.flags = PlotFlags::Real;
+        got = edit(&want, |flags, _, _| *flags = PlotFlags::Real);
         assert!(compare(&got, &want).is_err());
     }
 
@@ -479,53 +542,59 @@ mod tests {
     fn missing_extra_renamed_and_duplicate_columns_fail() {
         let want = plot();
         for name in ["renamed", "FREQUENCY", ""] {
-            let mut got = want.clone();
-            got.variables[1].name = name.into();
+            let got = edit(&want, |_, v, _| v[1].name = name.into());
             assert!(compare(&got, &want).is_err());
         }
-        let mut got = want.clone();
-        got.variables.pop();
-        for row in &mut got.points {
-            row.pop();
-        }
+        let got = edit(&want, |_, v, rows| {
+            v.pop();
+            for row in rows {
+                row.pop();
+            }
+        });
         assert!(compare(&got, &want).unwrap_err().contains("missing"));
         assert!(compare(&want, &got).unwrap_err().contains("extra"));
     }
 
     #[test]
     fn repeated_branch_names_compare_every_occurrence() {
-        let mut want = plot();
-        want.variables.push(Variable::complex("i(y1)", "current"));
-        want.variables.push(Variable::complex("i(y1)", "current"));
-        for row in &mut want.points {
-            row.extend([Complex::real(0.02), Complex::real(-0.02)]);
-        }
-        let mut got = want.clone();
-        got.variables.swap(0, 2);
-        for row in &mut got.points {
-            row.swap(0, 2);
-        }
+        let want = edit(&plot(), |_, v, rows| {
+            v.extend([
+                Variable::complex("i(y1)", "current"),
+                Variable::complex("i(y1)", "current"),
+            ]);
+            for row in rows {
+                row.extend([Complex::real(0.02), Complex::real(-0.02)]);
+            }
+        });
+        let mut got = edit(&want, |_, v, rows| {
+            v.swap(0, 2);
+            for row in rows {
+                row.swap(0, 2);
+            }
+        });
         compare(&got, &want).unwrap();
-        got.points[0][3] = Complex::real(0.03);
+        got.point_mut(0).unwrap()[3] = Complex::real(0.03);
         assert!(compare(&got, &want).unwrap_err().contains("i(y1)"));
         assert!(compare(&want, &got).is_err());
-        got = want.clone();
-        got.variables.pop();
-        for row in &mut got.points {
-            row.pop();
-        }
+        got = edit(&want, |_, v, rows| {
+            v.pop();
+            for row in rows {
+                row.pop();
+            }
+        });
         assert!(compare(&got, &want).unwrap_err().contains("missing"));
     }
 
     #[test]
     fn occurrence_keys_must_not_hide_a_literal_name() {
-        let mut p = plot();
-        p.variables[0].name = "i(y1)".into();
-        p.variables[1].name = "i(y1)".into();
-        p.variables.push(Variable::complex("i(y1)#2", "current"));
-        for row in &mut p.points {
-            row.push(Complex::ZERO);
-        }
+        let p = edit(&plot(), |_, v, rows| {
+            v[0].name = "i(y1)".into();
+            v[1].name = "i(y1)".into();
+            v.push(Variable::complex("i(y1)#2", "current"));
+            for row in rows {
+                row.push(Complex::ZERO);
+            }
+        });
         assert!(validate(&p, "C").unwrap_err().contains("ambiguous"));
     }
 
@@ -533,25 +602,30 @@ mod tests {
     fn shape_empty_and_nonfinite_data_fail_on_either_side() {
         let want = plot();
         let mut cases = Vec::new();
+        assert!(
+            want.header()
+                .with_points(vec![vec![Complex::ZERO]])
+                .is_err()
+        );
         let mut bad = want.clone();
-        bad.points[0].pop();
+        bad.truncate_points(1);
         cases.push(bad);
         let mut bad = want.clone();
-        bad.points.pop();
+        bad.clear_points();
         cases.push(bad);
-        let mut bad = want.clone();
-        bad.points.clear();
-        cases.push(bad);
-        let mut bad = want.clone();
-        bad.variables.clear();
-        cases.push(bad);
+        cases.push(Plot::new(
+            "ac1",
+            "AC Analysis",
+            PlotFlags::Complex,
+            Vec::new(),
+        ));
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             for imaginary in [false, true] {
                 let mut bad = want.clone();
                 if imaginary {
-                    bad.points[0][1].im = value;
+                    bad.point_mut(0).unwrap()[1].im = value;
                 } else {
-                    bad.points[0][1].re = value;
+                    bad.point_mut(0).unwrap()[1].re = value;
                 }
                 cases.push(bad);
             }
@@ -569,17 +643,17 @@ mod tests {
             for (point, component) in [(0, "re"), (0, "im"), (1, "re"), (1, "im")] {
                 let mut got = want.clone();
                 let value = if component == "re" {
-                    &mut got.points[point][1].re
+                    &mut got.point_mut(point).unwrap()[1].re
                 } else {
-                    &mut got.points[point][1].im
+                    &mut got.point_mut(point).unwrap()[1].im
                 };
                 let bound = tolerance.relative * value.abs() + tolerance.absolute;
                 *value += 0.5 * bound;
                 plots(&got, &want, tolerance, None).unwrap();
                 *if component == "re" {
-                    &mut got.points[point][1].re
+                    &mut got.point_mut(point).unwrap()[1].re
                 } else {
-                    &mut got.points[point][1].im
+                    &mut got.point_mut(point).unwrap()[1].im
                 } += 2.0 * bound;
                 let error = plots(&got, &want, tolerance, None).unwrap_err();
                 assert!(error.contains(&format!("v(out).{component}")), "{error}");
@@ -592,29 +666,30 @@ mod tests {
     fn first_and_worst_mismatches_are_distinct() {
         let want = plot();
         let mut got = want.clone();
-        got.points[0][1].re += 0.01;
-        got.points[1][1].im = 1.0;
+        got.point_mut(0).unwrap()[1].re += 0.01;
+        got.point_mut(1).unwrap()[1].im = 1.0;
         let report = compare(&got, &want).unwrap_err();
         assert!(report.contains("first: point 0, v(out).re"), "{report}");
         assert!(report.contains("x bound): point 1, v(out).im"), "{report}");
     }
 
     fn pole_zero(poles: &[Complex], zeros: &[Complex]) -> Plot {
-        let mut plot = Plot::new("pz1", "Pole-Zero Analysis", PlotFlags::Complex);
+        let mut plot = Plot::builder("pz1", "Pole-Zero Analysis", PlotFlags::Complex);
         for (index, _) in poles.iter().enumerate() {
-            plot.variables.push(Variable::complex(
+            plot.push_variable(Variable::complex(
                 format!("v(pole({}))", index + 1),
                 "voltage",
             ));
         }
         for (index, _) in zeros.iter().enumerate() {
-            plot.variables.push(Variable::complex(
+            plot.push_variable(Variable::complex(
                 format!("v(zero({}))", index + 1),
                 "voltage",
             ));
         }
-        plot.points = vec![poles.iter().chain(zeros).copied().collect()];
-        plot
+        plot.build()
+            .with_points(vec![poles.iter().chain(zeros).copied().collect()])
+            .unwrap()
     }
 
     #[test]
@@ -660,19 +735,115 @@ mod tests {
     }
 
     #[test]
+    fn root_matching_reassigns_greedy_counterexample() {
+        let reference = [Complex::real(1_000_000.0), Complex::real(1_000_001.5)];
+        let candidates = [Complex::real(1_000_000.6), Complex::real(999_999.2)];
+        for expected in [reference, [reference[1], reference[0]]] {
+            for actual in [candidates, [candidates[1], candidates[0]]] {
+                let want = pole_zero(&expected, &expected);
+                let got = pole_zero(&actual, &actual);
+                let report = roots(&got, &want, POLE_ZERO).unwrap();
+                assert!(report.contains("2 pole(s) + 2 zero(s)"), "{report}");
+            }
+        }
+        let impossible = pole_zero(&[candidates[0]; 2], &[]);
+        // Both C roots can take the same candidate value here; use a
+        // reference for which only one of the two candidates is admissible.
+        let want = pole_zero(&reference, &[]);
+        assert!(roots(&impossible, &want, POLE_ZERO).is_ok());
+        let deficient = pole_zero(&[candidates[0], Complex::real(999_990.0)], &[]);
+        let error = roots(&deficient, &want, POLE_ZERO).unwrap_err();
+        assert!(error.contains("no perfect matching"), "{error}");
+    }
+
+    #[test]
+    fn root_matching_zero_bounds_and_repeated_roots() {
+        let want = pole_zero(&[Complex::ZERO; 3], &[Complex::ZERO; 2]);
+        let got = pole_zero(&[Complex::real(-0.0); 3], &[Complex::ZERO; 2]);
+        let report = roots(&got, &want, POLE_ZERO).unwrap();
+        assert!(report.contains("worst error 0.000e0"), "{report}");
+        let mut bad = got.clone();
+        bad.point_mut(0).unwrap()[0] = Complex::real(f64::from_bits(1));
+        assert!(
+            roots(&bad, &want, POLE_ZERO)
+                .unwrap_err()
+                .contains("pole mismatch")
+        );
+        bad.point_mut(0).unwrap()[0] = Complex::real(f64::NAN);
+        assert!(
+            roots(&bad, &want, POLE_ZERO)
+                .unwrap_err()
+                .contains("nonfinite")
+        );
+        assert!(bad.header().with_points(vec![vec![]]).is_err());
+
+        let repeated = Complex::new(-1e6, 1e6);
+        let nearby = Complex::new(-1_000_000.25, 999_999.75);
+        let want = pole_zero(&[repeated, nearby, repeated], &[]);
+        let got = pole_zero(&[nearby, repeated, nearby], &[]);
+        assert!(roots(&got, &want, POLE_ZERO).is_ok());
+    }
+
+    fn exhaustive_matching(edges: &[Vec<(usize, f64)>], used: u32) -> bool {
+        let Some((first, rest)) = edges.split_first() else {
+            return true;
+        };
+        first.iter().any(|&(candidate, _)| {
+            let bit = 1 << candidate;
+            used & bit == 0 && exhaustive_matching(rest, used | bit)
+        })
+    }
+
+    #[test]
+    fn root_matching_agrees_with_exhaustive_assignments() {
+        let graph = |size: usize, mask: u32| {
+            (0..size)
+                .map(|i| {
+                    (0..size)
+                        .filter(|&j| mask & (1 << (i * size + j)) != 0)
+                        .map(|j| (j, 0.5))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        for size in 0..=3 {
+            for mask in 0..(1 << (size * size)) {
+                let edges = graph(size, mask);
+                assert_eq!(
+                    perfect_root_matching(&edges).is_ok(),
+                    exhaustive_matching(&edges, 0)
+                );
+            }
+        }
+        let mut seed = 0x1234_5678_u32;
+        for _ in 0..512 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let edges = graph(5, seed >> 7);
+            assert_eq!(
+                perfect_root_matching(&edges).is_ok(),
+                exhaustive_matching(&edges, 0)
+            );
+        }
+        // The low-ratio edge for C[0] must be displaced. The summary
+        // must describe the final matching, not the initial greedy choice.
+        let edges = [vec![(0, 0.1), (1, 0.8)], vec![(0, 0.9)]];
+        assert!((perfect_root_matching(&edges).unwrap() - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn axis_identity_values_and_monotonicity_are_checked() {
         let want = plot();
         assert!(plots(&want, &want, AC, Some("time")).is_err());
         for value in [Complex::ZERO, Complex::real(-1.0), Complex::new(100.0, 1.0)] {
             let mut got = want.clone();
-            got.points[0][0] = value;
+            got.point_mut(0).unwrap()[0] = value;
             assert!(compare(&got, &want).unwrap_err().contains("axis"));
         }
         let mut got = want.clone();
-        got.points[1][0] = got.points[0][0];
+        got.point_mut(1).unwrap()[0] = got.points()[0][0];
         assert!(compare(&got, &want).unwrap_err().contains("axis"));
         got = want.clone();
-        got.points[1][0].re += 1.0;
+        got.point_mut(1).unwrap()[0].re += 1.0;
         assert!(compare(&got, &want).unwrap_err().contains("frequency.re"));
     }
 }

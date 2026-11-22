@@ -79,15 +79,15 @@ card 6 @netlists/m10_mesa_l4_tran.cir:7:1 lines=7-8 continuations=1
   token 19 7:52 word "nmax"
   token 20 7:56 equals "="
   token 21 7:57 number "4e16" value=4e16
-  token 22 7:62 word "cas"
-  token 23 7:65 equals "="
-  token 24 7:66 number "0.9" value=9e-1
-  token 25 7:70 word "cbs"
-  token 26 7:73 equals "="
-  token 27 7:74 number "1.1" value=1.1e0
-  token 28 7:78 word "epsi"
-  token 29 7:82 equals "="
-  token 30 7:83 number "1.142189e-10" value=1.1421889999999999e-10
+  token 22 8:3 word "cas"
+  token 23 8:6 equals "="
+  token 24 8:7 number "0.9" value=9e-1
+  token 25 8:11 word "cbs"
+  token 26 8:14 equals "="
+  token 27 8:15 number "1.1" value=1.1e0
+  token 28 8:19 word "epsi"
+  token 29 8:23 equals "="
+  token 30 8:24 number "1.142189e-10" value=1.1421889999999999e-10
 card 7 @netlists/m10_mesa_l4_tran.cir:9:1 lines=9-9 continuations=0
   raw: ".options reltol=1e-6 vntol=1e-10 abstol=1e-14"
   kind: dot(.options)

@@ -419,10 +419,11 @@ pub(super) fn run(
         pos_name.as_deref().unwrap_or_default(),
         neg_name.as_deref(),
     );
-    let mut plot = Plot::new("tf1", "Transfer Function", PlotFlags::Real);
+    let mut plot = Plot::builder("tf1", "Transfer Function", PlotFlags::Real);
     for name in names {
         plot.push_variable(Variable::new(name, "voltage"));
     }
+    let mut plot = plot.build();
     plot.push_point(values.into_iter().map(Complex::real).collect())?;
     Ok(plot)
 }

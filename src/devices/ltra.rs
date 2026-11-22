@@ -112,7 +112,10 @@
 
 pub mod convolution;
 
-use crate::devices::delay::{DelayContext, DelayHistory, DelayLine, DelayUpdate};
+use crate::devices::delay::{
+    DelayContext, DelayHistory, DelayLine, DelaySamples, DelayUpdate, WaveformHistory,
+    WaveformUpdate,
+};
 use crate::devices::linear::LinearContext;
 use crate::devices::models::{ModelContext, ModelFamily, ModelResolver};
 use crate::devices::schema::{ScalarDomain, ScalarParameter, ScalarSchema, ScalarUnit};
@@ -120,7 +123,7 @@ use crate::devices::traits::{AnalysisMode, Device, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::primitives::{
-    NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, almost_equal_ulps,
+    NodeAppend, NodeId, Real, SourceLoc, SpiceError, SpiceResult, almost_equal_ulps,
     parse_spice_number,
 };
 
@@ -496,10 +499,10 @@ impl LossyLine {
     /// setters or node-name collisions.
     pub fn instantiate(
         instance: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         models: &ModelResolver<'_>,
         context: &ModelContext,
-    ) -> SpiceResult<Box<dyn Device>> {
+    ) -> SpiceResult<Self> {
         context.validate(&instance.location)?;
         if instance.nodes.len() != 4 {
             return Err(SpiceError::circuit(format!(
@@ -580,13 +583,13 @@ impl LossyLine {
             &INTERNAL_SUFFIXES,
             "lossy-line",
         )?;
-        Ok(Box::new(Self {
+        Ok(Self {
             name: instance.name.clone(),
             terminals,
             model,
             initial,
             location: instance.location.clone(),
-        }))
+        })
     }
 
     /// The validated model.
@@ -753,206 +756,107 @@ impl LossyLine {
         }
     }
 
-    /// `ltraload.c` for a transient load at `time` (C's `MODEINITPRED`
-    /// computation of the coefficients and `LTRAinput1/2`, which C then keeps
-    /// for the remaining iterations of the time point).
-    #[expect(
-        clippy::too_many_lines,
-        reason = "keeps the reference numerical routine in the original statement and rounding order"
-    )]
-    fn transient_load(&self, history: &DelayHistory, time: Real) -> SpiceResult<Load> {
+    /// Evaluate the delayed waveform using C's strict lower bracket and
+    /// last-two extrapolation, independent of coefficient preparation.
+    fn delayed_values(&self, history: DelaySamples<'_, 4>, time: Real) -> SpiceResult<[Real; 4]> {
         let m = &self.model;
-        let count = history.len();
-        if count == 0 {
-            return Err(SpiceError::circuit(format!(
-                "{}: delay history used before the transient start",
-                self.name
-            )));
-        }
-        let index = count - 1;
-        let times = history.contiguous_times();
-        let sample = |i: usize, k: usize| history.value(i, k).unwrap_or(Real::NAN);
-        // The operating point C copies into LTRAinitVolt/Cur at MODEINITTRAN
-        // is the t = 0 sample.
-        let [iv1, ii1, iv2, ii2] = [0, 1, 2, 3].map(|k| sample(0, k));
-        let tdover = matches!(m.case, LtraCase::Lc | LtraCase::Rlc) && time > m.td;
-        let reltol_chop = 0.; // LTRAchopReltol: no deck setter.
-        let coefficients = match m.case {
-            LtraCase::Rlc => {
-                convolution::rlc_coefficients(m.td, m.alpha, m.beta, time, &times, reltol_chop)
-            }
-            LtraCase::Rc => {
-                convolution::rc_coefficients(m.cbyr, m.rclsqr, time, &times, reltol_chop)
-            }
-            LtraCase::Lc | LtraCase::Rg => convolution::Coefficients::default(),
-        };
-        // The delayed values v1d i1d v2d i2d.
+        let times = history.times();
+        let index = times.len() - 1;
         let mut delayed = [0.; 4];
-        if tdover {
-            let target = time - m.td;
-            let mut found = None;
-            for i in (0..=index).rev() {
-                if times[i] < target {
-                    found = Some(i);
-                    break;
-                }
-            }
-            let mut i = found.ok_or_else(|| {
+        let target = time - m.td;
+        let mut i = times
+            .partition_point(|&t| t < target)
+            .checked_sub(1)
+            .ok_or_else(|| {
                 self.internal("cannot find the delayed time point (ltraload.c E_INTERN)")
             })?;
-            if i == index {
-                // Step larger than the delay: extrapolate from the last two.
-                i = i.checked_sub(1).ok_or_else(|| {
-                    self.internal(
-                        "the first time step exceeds the line delay (ltraload.c E_INTERN)",
-                    )
-                })?;
-            }
-            let (t2, t3) = (times[i], times[i + 1]);
-            let quadratic = matches!(
-                m.interpolation,
-                Interpolation::Quadratic | Interpolation::Mixed
-            );
-            let qf = if i != 0 && quadratic {
-                Some(
-                    convolution::quad_interp(target, times[i - 1], t2, t3)
-                        .ok_or_else(|| self.internal("coincident history times"))?,
-                )
-            } else {
-                None
-            };
-            let lf = if i == 0
-                || matches!(
-                    m.interpolation,
-                    Interpolation::Mixed | Interpolation::Linear
-                ) {
-                Some(
-                    convolution::lin_interp(target, t2, t3)
-                        .ok_or_else(|| self.internal("coincident history times"))?,
-                )
-            } else {
-                None
-            };
-            for (k, value) in delayed.iter_mut().enumerate() {
-                let (mut d, out_of_range) = if let Some([q1, q2, q3]) = qf {
-                    let (a, b, c) = (sample(i - 1, k), sample(i, k), sample(i + 1, k));
-                    let d = a * q1 + b * q2 + c * q3;
-                    (d, d > a.max(b).max(c) || d < a.min(b).min(c))
-                } else {
-                    (0., false)
-                };
-                // C falls back to linear for lininterp, at the first sample,
-                // and for mixedinterp when the quadratic leaves the samples'
-                // range (quadinterp keeps the out-of-range value).
-                let linear = m.interpolation == Interpolation::Linear || i == 0 || out_of_range;
-                if linear && !(i != 0 && m.interpolation == Interpolation::Quadratic) {
-                    let [l2, l3] =
-                        lf.ok_or_else(|| self.internal("missing linear interpolation"))?;
-                    d = sample(i, k) * l2 + sample(i + 1, k) * l3;
-                }
-                *value = d;
-            }
+        if i == index {
+            // Step larger than the delay: extrapolate from the last two.
+            i = i.checked_sub(1).ok_or_else(|| {
+                self.internal("the first time step exceeds the line delay (ltraload.c E_INTERN)")
+            })?;
         }
-        let [v1d, i1d, v2d, i2d] = delayed;
-        let mut inputs = [0.; 2];
+        let (t2, t3) = (times[i], times[i + 1]);
+        let middle = history.sample(i);
+        let right = history.sample(i + 1);
+        let quadratic = matches!(
+            m.interpolation,
+            Interpolation::Quadratic | Interpolation::Mixed
+        );
+        let qf = if i != 0 && quadratic {
+            Some(
+                convolution::quad_interp(target, times[i - 1], t2, t3)
+                    .ok_or_else(|| self.internal("coincident history times"))?,
+            )
+        } else {
+            None
+        };
+        let lf = if i == 0
+            || matches!(
+                m.interpolation,
+                Interpolation::Mixed | Interpolation::Linear
+            ) {
+            Some(
+                convolution::lin_interp(target, t2, t3)
+                    .ok_or_else(|| self.internal("coincident history times"))?,
+            )
+        } else {
+            None
+        };
+        let left = if qf.is_some() {
+            history.sample(i - 1)
+        } else {
+            middle
+        };
+        for (k, value) in delayed.iter_mut().enumerate() {
+            let (mut d, out_of_range) = if let Some([q1, q2, q3]) = qf {
+                let (a, b, c) = (left[k], middle[k], right[k]);
+                let d = a * q1 + b * q2 + c * q3;
+                (d, d > a.max(b).max(c) || d < a.min(b).min(c))
+            } else {
+                (0., false)
+            };
+            // C falls back to linear for lininterp, at the first sample,
+            // and for mixedinterp when the quadratic leaves the samples'
+            // range (quadinterp keeps the out-of-range value).
+            let linear = m.interpolation == Interpolation::Linear || i == 0 || out_of_range;
+            if linear && !(i != 0 && m.interpolation == Interpolation::Quadratic) {
+                let [l2, l3] = lf.ok_or_else(|| self.internal("missing linear interpolation"))?;
+                d = middle[k] * l2 + right[k] * l3;
+            }
+            *value = d;
+        }
+        Ok(delayed)
+    }
+
+    /// Prepare the coefficients independently of the waveform history.
+    fn coefficients(&self, history: DelaySamples<'_, 4>, time: Real) -> convolution::Coefficients {
+        let m = &self.model;
+        let times = history.times();
+        let reltol_chop = 0.; // LTRAchopReltol: no deck setter.
         match m.case {
             LtraCase::Rlc => {
-                let c = &coefficients;
-                // h1' with v1 and v2.
-                let (mut d1, mut d2) = (0., 0.);
-                for i in (1..=index).rev() {
-                    if c.h1dash[i] != 0.0 {
-                        d1 += c.h1dash[i] * (sample(i, 0) - iv1);
-                        d2 += c.h1dash[i] * (sample(i, 2) - iv2);
-                    }
-                }
-                d1 += iv1 * m.int_h1dash;
-                d2 += iv2 * m.int_h1dash;
-                d1 -= iv1 * c.first[0];
-                d2 -= iv2 * c.first[0];
-                inputs[0] -= d1 * m.admit;
-                inputs[1] -= d2 * m.admit;
-                // h2 with i2 and i1.
-                let (mut d1, mut d2) = (0., 0.);
-                if tdover {
-                    d1 = (i2d - ii2) * c.first[1];
-                    d2 = (i1d - ii1) * c.first[1];
-                    for i in (1..=c.aux_index).rev() {
-                        if c.h2[i] != 0.0 {
-                            d1 += c.h2[i] * (sample(i, 3) - ii2);
-                            d2 += c.h2[i] * (sample(i, 1) - ii1);
-                        }
-                    }
-                }
-                d1 += ii2 * m.int_h2;
-                d2 += ii1 * m.int_h2;
-                inputs[0] += d1;
-                inputs[1] += d2;
-                // h3' with v2 and v1.
-                let (mut d1, mut d2) = (0., 0.);
-                if tdover {
-                    d1 = (v2d - iv2) * c.first[2];
-                    d2 = (v1d - iv1) * c.first[2];
-                    for i in (1..=c.aux_index).rev() {
-                        if c.h3dash[i] != 0.0 {
-                            d1 += c.h3dash[i] * (sample(i, 2) - iv2);
-                            d2 += c.h3dash[i] * (sample(i, 0) - iv1);
-                        }
-                    }
-                }
-                d1 += iv2 * m.int_h3dash;
-                d2 += iv1 * m.int_h3dash;
-                inputs[0] += m.admit * d1;
-                inputs[1] += m.admit * d2;
-                self.lossless_inputs(&mut inputs, tdover, [iv1, ii1, iv2, ii2], delayed);
-            }
-            LtraCase::Lc => {
-                self.lossless_inputs(&mut inputs, tdover, [iv1, ii1, iv2, ii2], delayed);
+                convolution::rlc_coefficients(m.td, m.alpha, m.beta, time, times, reltol_chop)
             }
             LtraCase::Rc => {
-                let c = &coefficients;
-                let (mut d1, mut d2) = (0., 0.);
-                for i in (1..=index).rev() {
-                    if c.h1dash[i] != 0.0 {
-                        d1 += c.h1dash[i] * (sample(i, 0) - iv1);
-                        d2 += c.h1dash[i] * (sample(i, 2) - iv2);
-                    }
-                }
-                d1 += iv1 * m.int_h1dash;
-                d2 += iv2 * m.int_h1dash;
-                d1 -= iv1 * c.first[0];
-                d2 -= iv2 * c.first[0];
-                inputs[0] -= d1;
-                inputs[1] -= d2;
-                let (mut d1, mut d2) = (0., 0.);
-                for i in (1..=index).rev() {
-                    if c.h2[i] != 0.0 {
-                        d1 += c.h2[i] * (sample(i, 3) - ii2);
-                        d2 += c.h2[i] * (sample(i, 1) - ii1);
-                    }
-                }
-                d1 += ii2 * m.int_h2;
-                d2 += ii1 * m.int_h2;
-                d1 -= ii2 * c.first[1];
-                d2 -= ii1 * c.first[1];
-                inputs[0] += d1;
-                inputs[1] += d2;
-                let (mut d1, mut d2) = (0., 0.);
-                for i in (1..=index).rev() {
-                    if c.h3dash[i] != 0.0 {
-                        d1 += c.h3dash[i] * (sample(i, 2) - iv2);
-                        d2 += c.h3dash[i] * (sample(i, 0) - iv1);
-                    }
-                }
-                d1 += iv2 * m.int_h3dash;
-                d2 += iv1 * m.int_h3dash;
-                d1 -= iv2 * c.first[2];
-                d2 -= iv1 * c.first[2];
-                inputs[0] += d1;
-                inputs[1] += d2;
+                convolution::rc_coefficients(m.cbyr, m.rclsqr, time, times, reltol_chop)
             }
-            LtraCase::Rg => {}
+            LtraCase::Lc | LtraCase::Rg => convolution::Coefficients::default(),
         }
+    }
+
+    /// `ltraload.c` for a transient load at `time`.
+    fn transient_load(&self, history: &WaveformHistory, time: Real) -> SpiceResult<Load> {
+        let history = history.samples::<4>()?;
+        let coefficients = self.coefficients(history, time);
+        let tdover =
+            matches!(self.model.case, LtraCase::Lc | LtraCase::Rlc) && time > self.model.td;
+        let delayed = if tdover {
+            self.delayed_values(history, time)?
+        } else {
+            [0.; 4]
+        };
+        let inputs = self.convolution_inputs(history, &coefficients, tdover, delayed);
         if !(inputs.iter().all(|v| v.is_finite())
             && coefficients.first.iter().all(|v| v.is_finite()))
         {
@@ -965,6 +869,127 @@ impl LossyLine {
             first: coefficients.first,
             inputs,
         })
+    }
+
+    /// Sum a pair of port components in reverse history order; initial
+    /// accumulators include the delayed contribution for RLC h2/h3'.
+    fn history_sum(
+        history: DelaySamples<'_, 4>,
+        weights: &[[Real; 3]],
+        kernel: usize,
+        components: [usize; 2],
+        initial: [Real; 4],
+        mut sum: [Real; 2],
+    ) -> [Real; 2] {
+        let [a, b] = components;
+        for (i, weight) in weights.iter().enumerate().skip(1).rev() {
+            let weight = weight[kernel];
+            if weight != 0.0 {
+                let sample = history.sample(i);
+                sum[0] += weight * (sample[a] - initial[a]);
+                sum[1] += weight * (sample[b] - initial[b]);
+            }
+        }
+        sum
+    }
+
+    /// Apply the history sums in C's original reverse traversal and
+    /// arithmetic order. No accepted or trial state is mutated.
+    fn convolution_inputs(
+        &self,
+        history: DelaySamples<'_, 4>,
+        coefficients: &convolution::Coefficients,
+        tdover: bool,
+        delayed: [Real; 4],
+    ) -> [Real; 2] {
+        let m = &self.model;
+        let initial = history.sample(0);
+        let [iv1, ii1, iv2, ii2] = initial;
+        let [v1d, i1d, v2d, i2d] = delayed;
+        let mut inputs = [0.; 2];
+        match m.case {
+            LtraCase::Rlc => {
+                let c = coefficients;
+                // h1' with v1 and v2.
+                let [mut d1, mut d2] =
+                    Self::history_sum(history, &c.weights, 0, [0, 2], initial, [0.; 2]);
+                d1 += iv1 * m.int_h1dash;
+                d2 += iv2 * m.int_h1dash;
+                d1 -= iv1 * c.first[0];
+                d2 -= iv2 * c.first[0];
+                inputs[0] -= d1 * m.admit;
+                inputs[1] -= d2 * m.admit;
+                // h2 with i2 and i1.
+                let (mut d1, mut d2) = (0., 0.);
+                if tdover {
+                    d1 = (i2d - ii2) * c.first[1];
+                    d2 = (i1d - ii1) * c.first[1];
+                    [d1, d2] = Self::history_sum(
+                        history,
+                        &c.weights[..=c.aux_index],
+                        1,
+                        [3, 1],
+                        initial,
+                        [d1, d2],
+                    );
+                }
+                d1 += ii2 * m.int_h2;
+                d2 += ii1 * m.int_h2;
+                inputs[0] += d1;
+                inputs[1] += d2;
+                // h3' with v2 and v1.
+                let (mut d1, mut d2) = (0., 0.);
+                if tdover {
+                    d1 = (v2d - iv2) * c.first[2];
+                    d2 = (v1d - iv1) * c.first[2];
+                    [d1, d2] = Self::history_sum(
+                        history,
+                        &c.weights[..=c.aux_index],
+                        2,
+                        [2, 0],
+                        initial,
+                        [d1, d2],
+                    );
+                }
+                d1 += iv2 * m.int_h3dash;
+                d2 += iv1 * m.int_h3dash;
+                inputs[0] += m.admit * d1;
+                inputs[1] += m.admit * d2;
+                self.lossless_inputs(&mut inputs, tdover, [iv1, ii1, iv2, ii2], delayed);
+            }
+            LtraCase::Lc => {
+                self.lossless_inputs(&mut inputs, tdover, [iv1, ii1, iv2, ii2], delayed);
+            }
+            LtraCase::Rc => {
+                let c = coefficients;
+                let [mut d1, mut d2] =
+                    Self::history_sum(history, &c.weights, 0, [0, 2], initial, [0.; 2]);
+                d1 += iv1 * m.int_h1dash;
+                d2 += iv2 * m.int_h1dash;
+                d1 -= iv1 * c.first[0];
+                d2 -= iv2 * c.first[0];
+                inputs[0] -= d1;
+                inputs[1] -= d2;
+                let [mut d1, mut d2] =
+                    Self::history_sum(history, &c.weights, 1, [3, 1], initial, [0.; 2]);
+                d1 += ii2 * m.int_h2;
+                d2 += ii1 * m.int_h2;
+                d1 -= ii2 * c.first[1];
+                d2 -= ii1 * c.first[1];
+                inputs[0] += d1;
+                inputs[1] += d2;
+                let [mut d1, mut d2] =
+                    Self::history_sum(history, &c.weights, 2, [2, 0], initial, [0.; 2]);
+                d1 += iv2 * m.int_h3dash;
+                d2 += iv1 * m.int_h3dash;
+                d1 -= iv2 * c.first[2];
+                d2 -= iv1 * c.first[2];
+                inputs[0] += d1;
+                inputs[1] += d2;
+            }
+            LtraCase::Rg => {}
+        }
+        inputs
     }
 
     /// The lossless-like part of `ltraload.c` (LC and the end of RLC).
@@ -1144,7 +1169,7 @@ impl Device for LossyLine {
                         self.name
                     ))
                 })?;
-                let load = self.transient_load(history, time)?;
+                let load = self.transient_load(history.as_waveform()?, time)?;
                 self.transient_entries(load.first, context.gmin)
                     .stamp(context)?;
                 context.stamp_rhs(self.ibr1(), load.inputs[0])?;
@@ -1205,8 +1230,8 @@ impl Device for LossyLine {
 }
 
 impl DelayLine for LossyLine {
-    fn width(&self) -> usize {
-        4
+    fn new_history(&self) -> DelayHistory {
+        DelayHistory::waveform(4)
     }
 
     /// The `t = 0` sample (C stores the operating point at `CKTtimeIndex`
@@ -1219,10 +1244,10 @@ impl DelayLine for LossyLine {
                 "src/spicelib/devices/ltra/ltraload.c (MODEINITTRAN | MODEUIC)",
             ));
         }
-        Ok(DelayUpdate {
+        Ok(DelayUpdate::Waveform(WaveformUpdate {
             reset: Some(vec![(context.time, self.port_values(context).to_vec())]),
-            ..DelayUpdate::default()
-        })
+            ..WaveformUpdate::default()
+        }))
     }
 
     /// `ltraacct.c` (without `trytocompact`): record the point, and request a
@@ -1233,60 +1258,49 @@ impl DelayLine for LossyLine {
         history: &DelayHistory,
         context: &DelayContext<'_>,
     ) -> SpiceResult<DelayUpdate> {
+        let history = history.as_waveform()?;
         let m = &self.model;
         let values = self.port_values(context);
-        let count = history.len();
-        if count == 0 {
-            return Err(SpiceError::circuit(format!(
-                "{}: delay history too short",
-                self.name
-            )));
-        }
+        let history = history.samples::<4>()?;
+        let times = history.times();
+        let count = times.len();
         let time = context.time;
-        let at = |index: usize| history.time(index).unwrap_or(Real::NAN);
-        let value = |index: usize, k: usize| history.value(index, k).unwrap_or(Real::NAN);
         let wave = |v: Real, i: Real| (v + i * m.imped) * m.attenuation;
         // The new sample is index `count`; C's CKTtimeIndex.
         let previous = count - 1;
+        let [pv1, pi1, pv2, pi2] = history.sample(previous);
+        let [ov1, oi1, ov2, oi2] = history.sample(previous.saturating_sub(1));
         let v1 = wave(values[0], values[1]);
-        let v2 = wave(value(previous, 0), value(previous, 1));
-        let v3 = if count < 2 {
-            v2
-        } else {
-            wave(value(previous - 1, 0), value(previous - 1, 1))
-        };
+        let v2 = wave(pv1, pi1);
+        let v3 = wave(ov1, oi1);
         let v4 = wave(values[2], values[3]);
-        let v5 = wave(value(previous, 2), value(previous, 3));
-        let v6 = if count < 2 {
-            v5
-        } else {
-            wave(value(previous - 1, 2), value(previous - 1, 3))
-        };
-        let h = time - at(previous);
+        let v5 = wave(pv2, pi2);
+        let v6 = wave(ov2, oi2);
+        let h = time - times[previous];
         let d1 = (v1 - v2) / h;
         let d2 = if count < 2 {
             0.
         } else {
-            (v2 - v3) / (at(previous) - at(previous - 1))
+            (v2 - v3) / (times[previous] - times[previous - 1])
         };
         let d3 = (v4 - v5) / h;
         let d4 = if count < 2 {
             0.
         } else {
-            (v5 - v6) / (at(previous) - at(previous - 1))
+            (v5 - v6) / (times[previous] - times[previous - 1])
         };
         let check = |a: Real, b: Real, c: Real| {
             a.max(b).max(c) - a.min(b).min(c)
                 >= (50.0 * (context.reltol / 3.0 * (a + b + c) + context.abstol)).abs()
         };
-        let mut update = DelayUpdate {
+        let mut update = WaveformUpdate {
             append: Some((time, values.to_vec())),
-            ..DelayUpdate::default()
+            ..WaveformUpdate::default()
         };
         let fire = (self.slope_changed(d1, d2) && check(v1, v2, v3))
             || (self.slope_changed(d3, d4) && check(v4, v5, v6));
         if fire {
-            let when = at(previous) + m.td;
+            let when = times[previous] + m.td;
             // CKTsetBreak: a request equal to now (3 ULPs) is ignored, one
             // before now is C's "breakpoint in the past" error.
             if !almost_equal_ulps(when, time, 3) {
@@ -1299,7 +1313,7 @@ impl DelayLine for LossyLine {
                 update.breakpoints.push(when);
             }
         }
-        Ok(update)
+        Ok(DelayUpdate::Waveform(update))
     }
 
     /// `ltratrun.c` (the reachable part: `LTRAlteConType` is always
@@ -1309,6 +1323,7 @@ impl DelayLine for LossyLine {
         history: &DelayHistory,
         context: &DelayContext<'_>,
     ) -> SpiceResult<Option<Real>> {
+        let history = history.as_waveform()?;
         let m = &self.model;
         if !matches!(m.case, LtraCase::Lc | LtraCase::Rlc) {
             return Ok(None);
@@ -1316,26 +1331,25 @@ impl DelayLine for LossyLine {
         let mut bound = if m.step_limit {
             Some(m.td)
         } else {
-            let count = history.len();
+            let history = history.samples::<4>()?;
+            let times = history.times();
+            let count = times.len();
             if count < 2 {
-                return Err(SpiceError::circuit(format!(
-                    "{}: delay history too short",
-                    self.name
-                )));
+                return Err(self.internal("delay history too short"));
             }
             let index = count - 1;
-            let at = |i: usize| history.time(i).unwrap_or(Real::NAN);
-            let value = |i: usize, k: usize| history.value(i, k).unwrap_or(Real::NAN);
             let values = self.port_values(context);
             let wave = |v: Real, i: Real| (v * m.admit + i) * m.attenuation;
+            let [pv1, pi1, pv2, pi2] = history.sample(index);
+            let [ov1, oi1, ov2, oi2] = history.sample(index - 1);
             let i1 = wave(values[2], values[3]);
-            let i2 = wave(value(index, 2), value(index, 3));
-            let i3 = wave(value(index - 1, 2), value(index - 1, 3));
+            let i2 = wave(pv2, pi2);
+            let i3 = wave(ov2, oi2);
             let i4 = wave(values[0], values[1]);
-            let i5 = wave(value(index, 0), value(index, 1));
-            let i6 = wave(value(index - 1, 0), value(index - 1, 1));
-            let h = context.time - at(index);
-            let h_old = at(index) - at(index - 1);
+            let i5 = wave(pv1, pi1);
+            let i6 = wave(ov1, oi1);
+            let h = context.time - times[index];
+            let h_old = times[index] - times[index - 1];
             let (d1, d2) = ((i1 - i2) / h, (i2 - i3) / h_old);
             let (d3, d4) = ((i4 - i5) / h, (i5 - i6) / h_old);
             (self.slope_changed(d1, d2) || self.slope_changed(d3, d4)).then_some(m.td)
@@ -1356,5 +1370,93 @@ impl DelayLine for LossyLine {
             bound = Some(bound.map_or(safe, |b: Real| b.min(safe)));
         }
         Ok(bound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+
+    fn line(model: &str) -> LossyLine {
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("history.cir"),
+                &format!("history\no1 a 0 b 0 m\n.model m ltra {model}\n.end\n"),
+            ))
+            .unwrap();
+        let models = ModelResolver::new(&deck.models).unwrap();
+        crate::primitives::NodeTable::default()
+            .transaction(|nodes| {
+                LossyLine::instantiate(&deck.devices[0], nodes, &models, &ModelContext::default())
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn delayed_values_preserve_strict_bracket_and_mixed_fallback() {
+        let mut line = line("l=1 c=1 len=1 mixedinterp");
+        let mut history = WaveformHistory::new(4);
+        // At t=2.5 the interpolated third component overshoots the [0,1]
+        // interval, whereas the first component follows a quadratic.
+        for (time, values) in [
+            (0., vec![0., 0., 0., 0.]),
+            (1., vec![1., 1., 1., -1.]),
+            (2., vec![4., 2., 1., -2.]),
+        ] {
+            history
+                .apply(&WaveformUpdate {
+                    append: Some((time, values)),
+                    ..WaveformUpdate::default()
+                })
+                .unwrap();
+        }
+        let view = history.samples::<4>().unwrap();
+        assert_eq!(line.delayed_values(view, 2.).unwrap(), [1., 1., 1., -1.]);
+        assert_eq!(line.delayed_values(view, 3.).unwrap(), [4., 2., 1., -2.]);
+        assert_eq!(
+            line.delayed_values(view, 2.5).unwrap(),
+            [2.25, 1.5, 1., -1.5]
+        );
+        // Extrapolation uses the last two accepted samples in linear mode.
+        line.model.interpolation = Interpolation::Linear;
+        assert_eq!(line.delayed_values(view, 4.).unwrap(), [7., 3., 1., -3.]);
+        assert!(line.delayed_values(view, 1.).is_err());
+    }
+
+    #[test]
+    fn rejected_loads_leave_history_unchanged_for_every_line_case() {
+        for model in [
+            "l=1 c=1 len=1",
+            "r=0.1 l=1 c=1 len=1",
+            "r=1 c=1 len=1",
+            "r=1 g=1 len=1",
+        ] {
+            let line = line(model);
+            let mut history = WaveformHistory::new(4);
+            for time in 0..4 {
+                let t = Real::from(time);
+                history
+                    .apply(&WaveformUpdate {
+                        append: Some((t, vec![t, 0.5 * t, -t, -0.5 * t])),
+                        ..WaveformUpdate::default()
+                    })
+                    .unwrap();
+            }
+            let before = history.clone();
+            let first = line.transient_load(&history, 3.25).unwrap();
+            let _discarded = line.transient_load(&history, 3.75).unwrap();
+            let retry = line.transient_load(&history, 3.25).unwrap();
+            assert_eq!(history, before);
+            assert_eq!(
+                first.first.map(Real::to_bits),
+                retry.first.map(Real::to_bits)
+            );
+            assert_eq!(
+                first.inputs.map(Real::to_bits),
+                retry.inputs.map(Real::to_bits)
+            );
+        }
     }
 }

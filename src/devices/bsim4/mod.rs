@@ -36,7 +36,7 @@ mod check;
 mod cvtest;
 mod device;
 mod elements;
-mod fields;
+pub(super) mod fields;
 mod geo;
 mod host;
 mod load;
@@ -46,6 +46,7 @@ pub mod parameters;
 mod pzld;
 mod sens;
 mod set;
+mod stamp_common;
 mod temp;
 
 /// The generated literal model defaults in C setup order (`b4set.c`).
@@ -226,7 +227,7 @@ pub fn select_version(card: &ModelCard) -> SpiceResult<&str> {
 /// circuit exists.
 pub(crate) fn instantiate(
     instance: &DeviceInstance,
-    nodes: &mut crate::primitives::NodeTable,
+    nodes: &mut crate::primitives::NodeAppend<'_>,
     model: &ResolvedModel<'_>,
     context: &crate::devices::ModelContext,
 ) -> SpiceResult<Box<dyn crate::devices::Device>> {

@@ -204,12 +204,17 @@ impl Equilibration {
             }
             norm = next;
         }
-        if x.iter().any(|v| !v.is_finite()) {
-            return Err(numerical("equilibration", "non-finite balancing exponent"));
-        }
         Ok(Self {
-            rows: x[..n].iter().copied().map(balanced_factor).collect(),
-            columns: x[n..].iter().copied().map(balanced_factor).collect(),
+            rows: x[..n]
+                .iter()
+                .copied()
+                .map(balanced_factor)
+                .collect::<SpiceResult<_>>()?,
+            columns: x[n..]
+                .iter()
+                .copied()
+                .map(balanced_factor)
+                .collect::<SpiceResult<_>>()?,
         })
     }
 
@@ -252,18 +257,18 @@ fn floor_log2(v: f64, what: impl FnOnce() -> String) -> SpiceResult<i32> {
             format!("nonpositive/non-finite {}", what()),
         ));
     }
-    crate::primitives::value::binary_exponent(v)
+    crate::primitives::numeric::binary_exponent(v)
         .ok_or_else(|| numerical("equilibration", "invalid binary exponent"))
 }
 
-/// Quantize a finite least-squares exponent to the supported power-of-two range.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the rounded exponent is finite and clamped to the exact i32 interval -512..=512"
-)]
-fn balanced_factor(exponent: f64) -> f64 {
-    let limit = f64::from(MAX_SCALING_EXPONENT);
-    2.0_f64.powi(exponent.round().clamp(-limit, limit) as i32)
+/// Quantize a least-squares exponent without changing the supported scale range.
+fn balanced_factor(exponent: f64) -> SpiceResult<f64> {
+    crate::primitives::numeric::bounded_rounded_exponent(
+        exponent,
+        -MAX_SCALING_EXPONENT..=MAX_SCALING_EXPONENT,
+    )
+    .map(|exponent| 2.0_f64.powi(exponent))
+    .ok_or_else(|| numerical("equilibration", "non-finite balancing exponent"))
 }
 
 fn factors(maxima: &[f64], namespace: &str) -> SpiceResult<Vec<f64>> {

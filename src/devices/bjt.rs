@@ -60,24 +60,27 @@
 )]
 
 mod disto;
+mod physics;
+
+#[cfg(test)]
+use physics::Point;
+use physics::{Junction, Transport, c_point};
 
 use crate::devices::limiting::{self, Limiter, Linearization};
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
+use crate::devices::nonlinear::DepletionLaw;
 use crate::devices::nonlinear::charge::ChargeBranch;
 use crate::devices::nonlinear::thermal::{
     BOLTZMANN, CELSIUS_TO_KELVIN, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureCache,
     TemperatureKey, band_gap, potential_shift,
 };
-use crate::devices::nonlinear::{
-    DepletionLaw, cubic_reverse_junction, exponential_junction, reverse_depletion,
-};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
@@ -85,10 +88,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
-
-/// ngspice `MAX_EXP_ARG`, the substrate exponential clamp of `bjtload.c`.
-const MAX_EXP_ARG: Real = 709.;
+use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
 const fn p(name: &'static str, unit: U, domain: D, default: Option<Real>) -> P {
     P {
@@ -845,7 +845,7 @@ impl Thermal {
 /// `vbx` from the external base to the internal collector and `vsub` across
 /// the substrate junction, each multiplied by the device polarity (and the
 /// substrate geometry sign for `vsub`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct Bias {
     vbe: Real,
     vbc: Real,
@@ -909,7 +909,7 @@ fn reject_unported(parameters: &[ParameterAssignment]) -> SpiceResult<()> {
 impl Bjt {
     pub(crate) fn instantiate(
         i: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         model: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -975,34 +975,35 @@ impl Bjt {
         };
         // Validate the temperature model and one evaluation before interning.
         let thermal = parameters.thermal(&instance, subs > 0., context)?;
-        c_point(&thermal, 0., 0., 0., 0., context.gmin)?;
-        let mut staged = nodes.clone();
-        let external: Vec<_> = i
-            .nodes
-            .iter()
-            .map(|n| staged.intern(n))
-            .collect::<SpiceResult<Vec<_>>>()?;
-        let mut terminals = external.clone();
-        let mut internal = |resistance: Real, suffix: &str, external: NodeId| {
-            if resistance == 0. {
-                return Ok(external);
-            }
-            let name = format!("{}#{suffix}", i.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "BJT internal-node name collision: {name}"
-                )));
-            }
-            let node = staged.intern(&name)?;
-            staged.set_kind(node, NodeKind::Internal);
-            terminals.push(node);
-            Ok(node)
-        };
-        // bjtsetup.c creates collCX, base, emitter in this order.
-        let cp = internal(parameters.rc, "collCX", external[0])?;
-        let bp = internal(parameters.rb, "base", external[1])?;
-        let ep = internal(parameters.re, "emitter", external[2])?;
-        *nodes = staged;
+        c_point(&thermal, Bias::default(), context.gmin)?;
+        let (terminals, external, cp, bp, ep) = nodes.transaction(|staged| {
+            let external: Vec<_> = i
+                .nodes
+                .iter()
+                .map(|n| staged.intern(n))
+                .collect::<SpiceResult<Vec<_>>>()?;
+            let mut terminals = external.clone();
+            let mut internal = |resistance: Real, suffix: &str, external: NodeId| {
+                if resistance == 0. {
+                    return Ok(external);
+                }
+                let name = format!("{}#{suffix}", i.name);
+                if staged.get(&name).is_some() {
+                    return Err(SpiceError::circuit(format!(
+                        "BJT internal-node name collision: {name}"
+                    )));
+                }
+                let node = staged.intern(&name)?;
+                staged.set_kind(node, NodeKind::Internal)?;
+                terminals.push(node);
+                Ok(node)
+            };
+            // bjtsetup.c creates collCX, base, emitter in this order.
+            let cp = internal(parameters.rc, "collCX", external[0])?;
+            let bp = internal(parameters.rb, "base", external[1])?;
+            let ep = internal(parameters.re, "emitter", external[2])?;
+            Ok((terminals, external, cp, bp, ep))
+        })?;
         let nodes = Nodes {
             c: external[0],
             b: external[1],
@@ -1143,227 +1144,6 @@ impl Bjt {
     }
 }
 
-/// The quantities `bjtload.c` computes at one set of branch voltages, in
-/// its variable names, before any transient companion is folded in (and
-/// what `bjtacld.c` reads back from `CKTstate0` after the `MODEINITSMSIG`
-/// load).
-#[derive(Debug, Clone, Copy)]
-struct Point {
-    cc: Real,
-    cb: Real,
-    gpi: Real,
-    gmu: Real,
-    gm: Real,
-    go: Real,
-    gx: Real,
-    gdsub: Real,
-    cdsub: Real,
-    /// The transit-time transcapacitance `d(qbe)/d(vbc)` (zero unless
-    /// `TF != 0` and `vbe > 0`), not yet multiplied by `ag0`.
-    geqcb: Real,
-    capbe: Real,
-    capbc: Real,
-    capbx: Real,
-    capsub: Real,
-    qbe: Real,
-    qbc: Real,
-    qbx: Real,
-    qsub: Real,
-}
-
-/// `bjtload.c`'s junction exponential with the cubic reverse continuation
-/// below `-3 vtn`, in C's arithmetic.
-fn c_junction(v: Real, vtn: Real, is: Real) -> (Real, Real) {
-    if v >= -3. * vtn {
-        exponential_junction(v, vtn, is)
-    } else {
-        cubic_reverse_junction(v, vtn, is)
-    }
-}
-
-/// `bjtload.c` from "determine dc current and derivatives" through the
-/// charge storage block, expression for expression (excess phase and
-/// quasi-saturation are rejected at elaboration).
-#[expect(
-    clippy::too_many_lines,
-    reason = "keeps the reference numerical routine in the original statement and rounding order"
-)]
-fn c_point(
-    t: &Thermal,
-    vbe: Real,
-    vbc: Real,
-    vbx: Real,
-    vsub: Real,
-    gmin: Real,
-) -> SpiceResult<Point> {
-    let vt = t.vt;
-    let rbpi = t.rb - t.rbm;
-    let vte = t.ne * vt;
-    let vtc = t.nc * vt;
-    let vtn = vt * t.nf;
-    let (mut cbe, mut gbe) = c_junction(vbe, vtn, t.is_be);
-    let (mut cben, mut gben) = if t.ise == 0. {
-        (0., 0.)
-    } else {
-        c_junction(vbe, vte, t.ise)
-    };
-    gben += gmin;
-    cben += gmin * vbe;
-    let vtn = vt * t.nr;
-    let (cbc, gbc) = c_junction(vbc, vtn, t.is_bc);
-    let (mut cbcn, mut gbcn) = if t.isc == 0. {
-        (0., 0.)
-    } else {
-        c_junction(vbc, vtc, t.isc)
-    };
-    gbcn += gmin;
-    cbcn += gmin * vbc;
-    let (gdsub, cdsub) = t.iss.map_or((gmin, gmin * vsub), |iss| {
-        let vts = vt * t.ns;
-        if vsub <= -3. * vts {
-            let (current, conductance) = cubic_reverse_junction(vsub, vts, iss);
-            (conductance + gmin, current + gmin * vsub)
-        } else {
-            let evsub = (vsub / vts).min(MAX_EXP_ARG).exp();
-            (iss * evsub / vts + gmin, iss * (evsub - 1.) + gmin * vsub)
-        }
-    });
-    // Base charge terms.
-    let q1 = 1. / (1. - t.inv_vaf * vbc - t.inv_var * vbe);
-    let (qb, dqbdve, dqbdvc);
-    if t.inv_ikf == 0. && t.inv_ikr == 0. {
-        qb = q1;
-        dqbdve = q1 * qb * t.inv_var;
-        dqbdvc = q1 * qb * t.inv_vaf;
-    } else {
-        let q2 = t.inv_ikf * cbe + t.inv_ikr * cbc;
-        let x = 1. + 4. * q2;
-        // C's MAX(0, x).
-        let arg = if 0. > x { 0. } else { x };
-        let mut sqarg = 1.;
-        match t.nkf {
-            None => {
-                if arg != 0. {
-                    sqarg = arg.sqrt();
-                }
-                qb = q1 * (1. + sqarg) / 2.;
-                dqbdve = q1 * (qb * t.inv_var + t.inv_ikf * gbe / sqarg);
-                dqbdvc = q1 * (qb * t.inv_vaf + t.inv_ikr * gbc / sqarg);
-            }
-            Some(nkf) => {
-                if arg != 0. {
-                    sqarg = arg.powf(nkf);
-                }
-                qb = q1 * (1. + sqarg) / 2.;
-                dqbdve = q1 * (qb * t.inv_var + t.inv_ikf * gbe * 2. * sqarg * nkf / arg);
-                dqbdvc = q1 * (qb * t.inv_vaf + t.inv_ikr * gbc * 2. * sqarg * nkf / arg);
-            }
-        }
-    }
-    // Excess phase is rejected, so cc starts at zero and cex/gex are cbe/gbe.
-    let mut cc = 0.;
-    let cex = cbe;
-    let gex = gbe;
-    cc = cc + (cex - cbc) / qb - cbc / t.br - cbcn;
-    let cb = cbe / t.bf + cben + cbc / t.br + cbcn;
-    let gx = if t.irb == 0. {
-        t.rbm + rbpi / qb
-    } else {
-        let ratio = cb / t.irb;
-        // C's MAX(cb/irb, 1e-9).
-        let arg1 = if ratio > 1e-9 { ratio } else { 1e-9 };
-        let arg2 = (-1. + (1. + 14.59025 * arg1).sqrt()) / 2.4317 / arg1.sqrt();
-        let arg1 = arg2.tan();
-        t.rbm + 3. * rbpi * (arg1 - arg2) / arg2 / arg1 / arg1
-    };
-    let gx = if gx == 0. { gx } else { 1. / gx };
-    let gpi = gbe / t.bf + gben;
-    let gmu = gbc / t.br + gbcn;
-    let go = (gbc + (cex - cbc) * dqbdvc / qb) / qb;
-    let gm = (gex - (cex - cbc) * dqbdve / qb) / qb - go;
-    // Charge storage elements.
-    let tf = t.tf;
-    let tr = t.tr;
-    let czbe = t.cje;
-    let ctot = t.cjc;
-    let czbc = ctot * t.xcjc;
-    let czbx = ctot - czbc;
-    let czsub = t.cjs;
-    let ps = t.vjs;
-    let xms = t.mjs;
-    let xtf = t.xtf;
-    let ovtf = t.vtf_factor;
-    let xjtf = t.itf;
-    let geqcb = if tf != 0. && vbe > 0. {
-        let (argtf, arg2, arg3) = if xtf == 0. {
-            (0., 0., 0.)
-        } else {
-            let argtf = if ovtf == 0. {
-                xtf
-            } else {
-                xtf * (vbc * ovtf).exp()
-            };
-            let (argtf, arg2) = if xjtf == 0. {
-                (argtf, argtf)
-            } else {
-                let temp = cbe / (cbe + xjtf);
-                let argtf = argtf * temp * temp;
-                (argtf, argtf * (3. - temp - temp))
-            };
-            (argtf, arg2, cbe * argtf * ovtf)
-        };
-        cbe = cbe * (1. + argtf) / qb;
-        gbe = (gbe * (1. + arg2) - cbe * dqbdve) / qb;
-        tf * (arg3 - cbe * dqbdvc) / qb
-    } else {
-        0.
-    };
-    let (qbe, capbe) = t.be.charge(vbe, czbe, Some((tf * cbe, tf * gbe)));
-    let (qbc, capbc) = t.bc.charge(vbc, czbc, Some((tr * cbc, tr * gbc)));
-    let (qbx, capbx) = t.bc.charge(vbx, czbx, None);
-    let (qsub, capsub) = if vsub < 0. {
-        reverse_depletion(vsub, czsub, ps, xms)
-    } else {
-        (
-            vsub * czsub * (1. + xms * vsub / (2. * ps)),
-            czsub * (1. + xms * vsub / ps),
-        )
-    };
-    let point = Point {
-        cc,
-        cb,
-        gpi,
-        gmu,
-        gm,
-        go,
-        gx,
-        gdsub,
-        cdsub,
-        geqcb,
-        capbe,
-        capbc,
-        capbx,
-        capsub,
-        qbe,
-        qbc,
-        qbx,
-        qsub,
-    };
-    let finite = [
-        cc, cb, gpi, gmu, gm, go, gx, gdsub, cdsub, geqcb, capbe, capbc, capbx, capsub, qbe, qbc,
-        qbx, qsub,
-    ]
-    .iter()
-    .all(|v| v.is_finite());
-    if !finite {
-        return Err(SpiceError::Numerical {
-            context: "BJT".into(),
-            message: "nonfinite Gummel-Poon current, charge or conductance".into(),
-        });
-    }
-    Ok(point)
-}
-
 impl Device for Bjt {
     /// `bjtsetup.c` without quasi-saturation (`RCO`, which the port rejects),
     /// so `collCX` is the collector prime; a three-terminal device's
@@ -1427,7 +1207,10 @@ impl Device for Bjt {
     /// column of that card agrees, so the refusal is narrow - and a card
     /// without `RC` has no `collCX` node for the terms to use, which is why
     /// the rest of the tables verify.
-    fn sensitivity(&self, context: &ModelContext) -> SpiceResult<Box<dyn DeviceSensitivity + '_>> {
+    fn sensitivity(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
         if self.model.rc != 0. {
             return Err(SpiceError::not_yet_ported(
                 format!("{}: BJT sensitivity with RC != 0", self.name),
@@ -1558,7 +1341,7 @@ impl Device for Bjt {
             derived: TemperatureCache::new(),
             initial,
         };
-        c_point(&device.thermal(context)?, 0., 0., 0., 0., context.gmin)?;
+        c_point(&device.thermal(context)?, Bias::default(), context.gmin)?;
         Ok(Box::new(device))
     }
     /// `bjtload.c`: [`Bjt::voltages`], [`c_point`], the transient companions
@@ -1578,8 +1361,17 @@ impl Device for Bjt {
         let t = self.thermal(&model_context)?;
         let mut limiter = Limiter::new(&context.states);
         let (vbe, vbc, vbx, vsub) = self.voltages(&t, &mut limiter, context)?;
-        let p = c_point(&t, vbe, vbc, vbx, vsub, context.gmin)?;
-        let Point {
+        let p = c_point(
+            &t,
+            Bias {
+                vbe,
+                vbc,
+                vbx,
+                vsub,
+            },
+            context.gmin,
+        )?;
+        let Transport {
             mut cc,
             mut cb,
             mut gpi,
@@ -1587,10 +1379,12 @@ impl Device for Bjt {
             gm,
             go,
             gx,
-            gdsub,
-            cdsub,
+        } = p.transport;
+        let Junction {
+            conductance: gdsub,
+            current: cdsub,
             ..
-        } = p;
+        } = p.substrate;
         // BJTconvTest for an `off` instance held in MODEINITFIX: the held
         // currents against their linearization at the iterate's voltages.
         {
@@ -1601,10 +1395,10 @@ impl Device for Bjt {
             let cbhat = cb + gpi * delvbe + gmu * delvbc;
             limiter.test_held(&context.states, &[(cc, cchat), (cb, cbhat)]);
         }
-        let be = ChargeBranch::new(slot::QBE, p.qbe, p.capbe);
-        let bc = ChargeBranch::new(slot::QBC, p.qbc, p.capbc);
-        let bx = ChargeBranch::new(slot::QBX, p.qbx, p.capbx);
-        let sub = ChargeBranch::new(slot::QSUB, p.qsub, p.capsub);
+        let be = ChargeBranch::new(slot::QBE, p.charges.qbe, p.charges.capbe);
+        let bc = ChargeBranch::new(slot::QBC, p.charges.qbc, p.charges.capbc);
+        let bx = ChargeBranch::new(slot::QBX, p.charges.qbx, p.charges.capbx);
+        let sub = ChargeBranch::new(slot::QSUB, p.charges.qsub, p.charges.capsub);
         let mut geqcb = 0.;
         let (mut gcsub, mut geqbx) = (0., 0.);
         let (cqsub, cqbx);
@@ -1625,7 +1419,7 @@ impl Device for Bjt {
                 }
             }
             let be_comp = be.integrate(&mut context.states, coefficients)?;
-            geqcb = p.geqcb * coefficients.ag()[0];
+            geqcb = p.charges.geqcb * coefficients.ag()[0];
             gpi += be_comp.conductance;
             cb += be_comp.derivative;
             let bc_comp = bc.integrate(&mut context.states, coefficients)?;
@@ -1749,26 +1543,28 @@ impl Device for Bjt {
                 .unwrap_or(0.)
         };
         let v = self.bias(voltage);
-        let p = c_point(&t, v.vbe, v.vbc, v.vbx, v.vsub, context.model_context.gmin)?;
+        let p = c_point(&t, v, context.model_context.gmin)?;
         let m = self.instance.multiplier;
         let gcpr = t.gc;
         let gepr = t.ge;
-        let Point {
+        let Transport {
             gpi,
             gmu,
             gm,
             go,
             gx,
-            gdsub,
             ..
-        } = p;
+        } = p.transport;
+        let Junction {
+            conductance: gdsub, ..
+        } = p.substrate;
         // C's `xc*` before the `CKTomega` factor, which the complex assembly
         // applies term by term (`LinearContext::scaled_dynamic_sum`).
-        let xcpi = p.capbe;
-        let xcmu = p.capbc;
-        let xcbx = p.capbx;
-        let xcsub = p.capsub;
-        let xcmcb = p.geqcb;
+        let xcpi = p.charges.capbe;
+        let xcmu = p.charges.capbc;
+        let xcbx = p.charges.capbx;
+        let xcsub = p.charges.capsub;
+        let xcmcb = p.charges.geqcb;
         let Nodes {
             c,
             b,
@@ -1853,8 +1649,11 @@ impl Device for Bjt {
     ) -> SpiceResult<()> {
         let t = self.thermal(context.model_context)?;
         let v = self.bias(|node| context.voltage(node));
-        let p = c_point(&t, v.vbe, v.vbc, v.vbx, v.vsub, context.model_context.gmin)?;
-        for (slot, value) in [(slot::QSUB + 1, p.capsub), (slot::QBX + 1, p.capbx)] {
+        let p = c_point(&t, v, context.model_context.gmin)?;
+        for (slot, value) in [
+            (slot::QSUB + 1, p.charges.capsub),
+            (slot::QBX + 1, p.charges.capbx),
+        ] {
             if let Some(target) = slots.get_mut(slot) {
                 *target = value;
             }
@@ -1881,16 +1680,9 @@ impl Device for Bjt {
     fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
         let thermal = self.thermal(context.model_context)?;
         let v = self.bias(|node| context.voltage(node));
-        let p = c_point(
-            &thermal,
-            v.vbe,
-            v.vbc,
-            v.vbx,
-            v.vsub,
-            context.model_context.gmin,
-        )?;
+        let p = c_point(&thermal, v, context.model_context.gmin)?;
         let m = self.instance.multiplier;
-        let (cc, cb) = (p.cc, p.cb);
+        let (cc, cb) = (p.transport.cc, p.transport.cb);
         let temperature = self
             .instance
             .temp
@@ -1908,7 +1700,7 @@ impl Device for Bjt {
             sources: vec![
                 NoiseSource::new("_rc", [n.cp, n.c], thermal_noise(thermal.gc * m)),
                 NoiseSource::new("_rci", [n.cp, n.cp], thermal_noise(0.)),
-                NoiseSource::new("_rb", [n.bp, n.b], thermal_noise(p.gx * m)),
+                NoiseSource::new("_rb", [n.bp, n.b], thermal_noise(p.transport.gx * m)),
                 NoiseSource::new("_re", [n.ep, n.e], thermal_noise(thermal.ge * m)),
                 NoiseSource::new("_ic", [n.cp, n.ep], NoiseKind::Shot { current: cc * m }),
                 NoiseSource::new("_ib", [n.bp, n.ep], NoiseKind::Shot { current: cb * m }),
@@ -2099,7 +1891,7 @@ impl<'a> BjtSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for BjtSensitivity<'_> {
+impl SensitivityKernel for BjtSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Bjt
     }
@@ -2126,7 +1918,7 @@ impl DeviceSensitivity for BjtSensitivity<'_> {
         let ibc = m.ibc.unwrap_or(0.);
         let (ibe_given, ibc_given) = (m.ibe.is_some(), m.ibc.is_some());
         let npn = self.device.pol > 0.;
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for (keyword, value, given) in [
             (
                 "tnom",
@@ -2261,9 +2053,9 @@ impl DeviceSensitivity for BjtSensitivity<'_> {
             ("te_max", 1e99, false),
             ("rth0", 0., false),
         ] {
-            model = model.with(keyword, value, given);
+            model = model.with(keyword, value, given)?;
         }
-        let mut instance = SensitivityRecord::new();
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
         let ic = |k: usize| self.device.initial.values.get(k).copied().flatten();
         for (keyword, value, given) in [
             ("icvbe", ic(0).unwrap_or(0.), ic(0).is_some()),
@@ -2280,7 +2072,7 @@ impl DeviceSensitivity for BjtSensitivity<'_> {
             ),
             ("dtemp", i.dtemp, true),
         ] {
-            instance = instance.with(keyword, value, given);
+            instance = instance.with(keyword, value, given)?;
         }
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
@@ -2541,7 +2333,7 @@ impl BjtSensitivity<'_> {
 }
 
 /// A BJT's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetBjt {
     /// Built from the reset load's records: the junction conductances.
@@ -2582,19 +2374,21 @@ impl Device for ResetBjt {
         use crate::devices::sensitivity::{ResetStamp, ResetStamps, StampAt, StampPart};
         let gmin = context.model_context.gmin;
         let t = self.state.thermal(context.model_context)?;
-        let p = c_point(&t, 0., 0., 0., 0., gmin)?;
+        let p = c_point(&t, Bias::default(), gmin)?;
         let current = self.current.thermal(context.model_context)?;
         let m = self.multiplier;
         let (gcpr, gepr) = (current.gc, current.ge);
-        let Point {
+        let Transport {
             gpi,
             gmu,
             mut gm,
             go,
             gx,
-            gdsub,
             ..
-        } = p;
+        } = p.transport;
+        let Junction {
+            conductance: gdsub, ..
+        } = p.substrate;
         let mut xgm = 0.;
         let td = self.excess_phase;
         if td != 0. {
@@ -2672,7 +2466,7 @@ impl Device for ResetBjt {
 mod tests {
     use super::*;
 
-    fn thermal(body: &str, temperature: Real, vertical: bool) -> Thermal {
+    pub(super) fn thermal(body: &str, temperature: Real, vertical: bool) -> Thermal {
         let deck = crate::netlist::source::parse_deck_text(
             std::path::Path::new("bjt.cir"),
             &format!("bjt\nq1 c b e qm\n.model qm npn({body})\n.end\n"),
@@ -2721,7 +2515,19 @@ mod tests {
             );
         };
         for (vbe, vbc) in biases {
-            let at = |vbe: Real, vbc: Real| c_point(t, vbe, vbc, vbc, -vbc, gmin).unwrap();
+            let at = |vbe: Real, vbc: Real| {
+                c_point(
+                    t,
+                    Bias {
+                        vbe,
+                        vbc,
+                        vbx: vbc,
+                        vsub: -vbc,
+                    },
+                    gmin,
+                )
+                .unwrap()
+            };
             let p = at(vbe, vbc);
             let d = |f: fn(&Point) -> Real, dvbe: Real, dvbc: Real| {
                 (f(&at(vbe + dvbe, vbc + dvbc)) - f(&at(vbe - dvbe, vbc - dvbc))) / (2. * h)
@@ -2729,63 +2535,80 @@ mod tests {
             let at_bias = format!("at ({vbe}, {vbc})");
             close(
                 &format!("dcb/dvbe {at_bias}"),
-                p.gpi,
-                d(|p| p.cb, h, 0.),
-                p.cb,
+                p.transport.gpi,
+                d(|p| p.transport.cb, h, 0.),
+                p.transport.cb,
             );
             close(
                 &format!("dcb/dvbc {at_bias}"),
-                p.gmu,
-                d(|p| p.cb, 0., h),
-                p.cb,
+                p.transport.gmu,
+                d(|p| p.transport.cb, 0., h),
+                p.transport.cb,
             );
             close(
                 &format!("dcc/dvbe {at_bias}"),
-                p.gm + p.go,
-                d(|p| p.cc, h, 0.),
-                p.cc,
+                p.transport.gm + p.transport.go,
+                d(|p| p.transport.cc, h, 0.),
+                p.transport.cc,
             );
             close(
                 &format!("dcc/dvbc {at_bias}"),
-                -(p.go + p.gmu),
-                d(|p| p.cc, 0., h),
-                p.cc,
+                -(p.transport.go + p.transport.gmu),
+                d(|p| p.transport.cc, 0., h),
+                p.transport.cc,
             );
             close(
                 &format!("dqbe/dvbe {at_bias}"),
-                p.capbe,
-                d(|p| p.qbe, h, 0.),
-                p.qbe,
+                p.charges.capbe,
+                d(|p| p.charges.qbe, h, 0.),
+                p.charges.qbe,
             );
             close(
                 &format!("dqbe/dvbc {at_bias}"),
-                p.geqcb,
-                d(|p| p.qbe, 0., h),
-                p.qbe,
+                p.charges.geqcb,
+                d(|p| p.charges.qbe, 0., h),
+                p.charges.qbe,
             );
             close(
                 &format!("dqbc/dvbc {at_bias}"),
-                p.capbc,
-                d(|p| p.qbc, 0., h),
-                p.qbc,
+                p.charges.capbc,
+                d(|p| p.charges.qbc, 0., h),
+                p.charges.qbc,
             );
             // Single-voltage junctions: vbx (qbx) and vsub (substrate).
             for v in [vbc, -vbc, 0.3, -0.7] {
-                let single = |v: Real| c_point(t, vbe, vbc, v, v, gmin).unwrap();
+                let single = |v: Real| {
+                    c_point(
+                        t,
+                        Bias {
+                            vbe,
+                            vbc,
+                            vbx: v,
+                            vsub: v,
+                        },
+                        gmin,
+                    )
+                    .unwrap()
+                };
                 let (lo, mid, hi) = (single(v - h), single(v), single(v + h));
                 let fd = |f: fn(&Point) -> Real| (f(&hi) - f(&lo)) / (2. * h);
-                close(&format!("dqbx at {v}"), mid.capbx, fd(|p| p.qbx), mid.qbx);
+                close(
+                    &format!("dqbx at {v}"),
+                    mid.charges.capbx,
+                    fd(|p| p.charges.qbx),
+                    mid.charges.qbx,
+                );
                 close(
                     &format!("dqsub at {v}"),
-                    mid.capsub,
-                    fd(|p| p.qsub),
-                    mid.qsub,
+                    mid.charges.capsub,
+                    fd(|p| p.charges.qsub),
+                    mid.charges.qsub,
                 );
                 close(
                     &format!("dcdsub at {v}"),
-                    mid.gdsub,
-                    fd(|p| p.cdsub),
-                    mid.cdsub,
+                    mid.substrate.conductance,
+                    fd(|p| p.substrate.current),
+                    mid.substrate.current,
                 );
             }
         }
@@ -2807,6 +2630,10 @@ mod tests {
             // Bias-dependent transit time.
             "is=1e-15 vaf=40 ikf=3m tf=0.4n xtf=3 vtf=2 itf=20m cje=2p mje=0.4 fc=0.6",
             "is=1e-15 tf=0.4n xtf=3",
+            "is=1e-15 tf=0.4n xtf=3 vtf=2",
+            "is=1e-15 tf=0.4n xtf=3 itf=20m",
+            "is=1e-15 tf=0.4n vtf=2 itf=20m",
+            "is=1e-15 xtf=3 vtf=2 itf=20m",
             // Split base-collector charge and substrate junction.
             "is=1e-15 cjc=3p xcjc=0.4 mjc=0.5 cjs=2p mjs=0.3 vjs=0.6 iss=1e-17 ns=1.1",
         ] {
@@ -2814,6 +2641,101 @@ mod tests {
             // Temperature scaling must keep the equations consistent too.
             check_jacobian(&thermal(body, 85., true));
         }
+    }
+
+    #[test]
+    #[ignore = "matched-baseline kernel microbenchmark; run explicitly with --ignored --nocapture"]
+    fn bjt_physics_benchmark() {
+        use crate::devices::distortion::DistortionContext;
+        use std::{hint::black_box, time::Instant};
+
+        let model = "is=1e-15 bf=80 br=2 vaf=40 var=8 ikf=3m ikr=0.5m ise=1e-14 isc=2e-14 rb=200 rbm=20 irb=50u rc=5 re=2 tf=0.4n xtf=3 vtf=2 itf=20m cje=2p cjc=3p xcjc=0.4 cjs=2p mjs=0.3 iss=1e-17";
+        let t = thermal(model, 85., true);
+        let circuit = crate::devices::Circuit::from_netlist(
+            &crate::netlist::Parser::new()
+                .parse_deck(&crate::netlist::source::parse_deck_text(
+                    std::path::Path::new("bjt-bench.cir"),
+                    &format!(
+                        "bjt bench
+q1 c b e s qm area=1.3 m=2 temp=85
+.model qm npn({model})
+.end
+"
+                    ),
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        let device = circuit.device("q1").unwrap();
+        let model_context = ModelContext::new(85., 27.);
+        let mut solution = Vector::zeros(circuit.unknown_count());
+        for (name, voltage) in [
+            ("b", 0.8),
+            ("c", 2.),
+            ("e", 0.),
+            ("s", 0.2),
+            ("q1#base", 0.75),
+            ("q1#collcx", 1.95),
+            ("q1#emitter", 0.01),
+        ] {
+            let node = circuit.nodes().get(name).unwrap();
+            let row = circuit.unknowns().node_row(node).unwrap();
+            solution.set(row, voltage).unwrap();
+        }
+        let distortion = DistortionContext {
+            model_context: &model_context,
+            unknowns: circuit.unknowns(),
+            bias: &solution,
+        };
+        let biases = [
+            Bias {
+                vbe: 0.74,
+                vbc: -1.2,
+                vbx: -1.15,
+                vsub: -1.75,
+            },
+            Bias {
+                vbe: 0.8,
+                vbc: 0.2,
+                vbx: 0.25,
+                vsub: -0.1,
+            },
+            Bias {
+                vbe: -0.4,
+                vbc: 0.62,
+                vbx: 0.65,
+                vsub: 0.3,
+            },
+            Bias {
+                vbe: -0.2,
+                vbc: -2.,
+                vbx: -1.9,
+                vsub: -2.,
+            },
+        ];
+        // Warm the temperature cache before measuring the distortion setup.
+        black_box(device.distortion(&distortion).unwrap());
+        let mut load_times = Vec::new();
+        let mut distortion_times = Vec::new();
+        for _ in 0..7 {
+            let started = Instant::now();
+            for index in 0..100_000 {
+                let bias = black_box(biases[index % biases.len()]);
+                black_box(c_point(black_box(&t), bias, black_box(1e-12)).unwrap());
+            }
+            load_times.push(started.elapsed());
+            let started = Instant::now();
+            for _ in 0..20_000 {
+                black_box(device.distortion(black_box(&distortion)).unwrap());
+            }
+            distortion_times.push(started.elapsed());
+        }
+        load_times.sort_unstable();
+        distortion_times.sort_unstable();
+        eprintln!(
+            "BJT ordinary 100000 points: median {:?}, min {:?}; distortion 20000 setups: median {:?}, min {:?}",
+            load_times[3], load_times[0], distortion_times[3], distortion_times[0]
+        );
     }
 
     #[test]
