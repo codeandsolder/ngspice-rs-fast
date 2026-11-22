@@ -25,6 +25,8 @@ use petgraph::graph::UnGraph;
 
 use crate::devices::linear::Forcing;
 use crate::devices::models::ModelContext;
+use crate::devices::mutual::validation::ValidationBudget;
+use crate::devices::mutual::{CouplingSite, MutualLimits, pair_count};
 use crate::devices::state::{StateHistory, TrialState};
 use crate::devices::sweep::{InstanceOverride, ResistorMetadata, ResistorOverride};
 use crate::devices::traits::{
@@ -107,6 +109,7 @@ pub struct Circuit {
     /// Inductor pairs coupled by K devices, or why the K references could not
     /// be resolved (reported by `finalize` and every load).
     mutual: MutualBinding,
+    mutual_limits: MutualLimits,
     /// Element positions, numbered in C's `TSTALLOC` order: allocated by
     /// `finalize` from [`Device::setup_matrix`] in setup order, extended when
     /// a load touches a position no device declared. See
@@ -214,6 +217,7 @@ struct MutualPair {
 struct MutualBinding {
     pairs: Vec<MutualPair>,
     groups: Vec<CoupledGroup>,
+    degrees: BTreeMap<usize, usize>,
     setup_rows: BTreeMap<usize, Vec<(usize, usize)>>,
     evaluation: std::cell::RefCell<Option<MutualEvaluation>>,
     error: Option<SpiceError>,
@@ -266,13 +270,21 @@ impl std::ops::Deref for PreparedMutualTerms {
     }
 }
 
-/// A fixed connected component of the K-card graph. Its local rows are
-/// increasing device ordinals, and edges keep original pair visitation order
-/// (including repeated and reversed couplings).
-#[derive(Debug, Clone, Default)]
+/// A K card resolved without expanding its complete graph.
+struct ResolvedCard {
+    coupling: usize,
+    inductors: Vec<usize>,
+    pairs: usize,
+}
+
+/// A fixed connected component. Local rows are increasing device ordinals.
+/// Edges are grouped by unordered matrix cell and retain the original pair
+/// order within a cell, including repeated and reversed K cards.
+#[derive(Debug, Clone)]
 struct CoupledGroup {
     inductors: Vec<usize>,
     edges: Vec<GroupEdge>,
+    first_coupling: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -282,58 +294,205 @@ struct GroupEdge {
     second_row: usize,
 }
 
-impl MutualBinding {
-    fn from_pairs(pairs: Vec<MutualPair>, branch_rows: &[std::ops::Range<usize>]) -> Self {
-        let inductors: Vec<_> = pairs
-            .iter()
-            .flat_map(|pair| [pair.first, pair.second])
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let positions: BTreeMap<_, _> = inductors
-            .iter()
+struct GroupPlan {
+    first_coupling: usize,
+    nodes: usize,
+    pairs: usize,
+}
+
+/// Count the mutual-specific payload before any pair expansion. The plan
+/// charges both orientations of stamp terms, the current and cached evaluation,
+/// matrix position declarations, per-reference indices and group work arrays.
+/// Actual allocator/tree overhead and unrelated circuit storage are separate.
+fn mutual_storage_bytes(
+    pairs: usize,
+    references: usize,
+    cards: usize,
+    devices: usize,
+) -> Option<usize> {
+    let pair_bytes = size_of::<MutualPair>()
+        + size_of::<GroupEdge>()
+        + 3 * size_of::<(usize, usize)>()
+        + 2 * size_of::<Real>()
+        + 4 * size_of::<MutualTerm>();
+    let reference_bytes =
+        12 * size_of::<usize>() + 2 * size_of::<InductanceValue>() + 2 * size_of::<Real>();
+    let card_bytes = size_of::<ResolvedCard>()
+        + size_of::<GroupPlan>()
+        + size_of::<CoupledGroup>()
+        + size_of::<Vec<(usize, usize)>>();
+    pairs
+        .checked_mul(pair_bytes)?
+        .checked_add(references.checked_mul(reference_bytes)?)?
+        .checked_add(cards.checked_mul(card_bytes)?)?
+        .checked_add(devices.checked_mul(3 * size_of::<Vec<MutualTerm>>())?)
+}
+
+/// Linear-reference connectivity and group sizes, checked before pair expansion.
+struct CouplingTopology {
+    degrees: BTreeMap<usize, usize>,
+    positions: BTreeMap<usize, usize>,
+    labels: Vec<usize>,
+    plans: BTreeMap<usize, GroupPlan>,
+}
+
+impl CouplingTopology {
+    fn plan(
+        cards: &[ResolvedCard],
+        devices: &[Box<dyn Device>],
+        limits: MutualLimits,
+        first_site: CouplingSite<'_>,
+    ) -> SpiceResult<Self> {
+        let site = |coupling: usize| CouplingSite::of(devices[coupling].as_ref());
+        // The connectivity of a K clique is exactly the connectivity of
+        // its star. Do this before any quadratic expansion.
+        let mut degrees = BTreeMap::<usize, usize>::new();
+        for card in cards {
+            for &inductor in &card.inductors {
+                *degrees.entry(inductor).or_default() += card.inductors.len() - 1;
+            }
+        }
+        let positions: BTreeMap<_, _> = degrees
+            .keys()
             .copied()
             .enumerate()
             .map(|(position, device)| (device, position))
             .collect();
-        let mut systems = petgraph::unionfind::UnionFind::<usize>::new(inductors.len());
-        for pair in &pairs {
-            systems.union(positions[&pair.first], positions[&pair.second]);
+        let mut systems = petgraph::unionfind::UnionFind::<usize>::new(positions.len());
+        for card in cards {
+            let first = positions[&card.inductors[0]];
+            for second in &card.inductors[1..] {
+                systems.union(first, positions[second]);
+            }
         }
         let labels = systems.into_labeling();
-        let mut groups = BTreeMap::<_, CoupledGroup>::new();
-        let mut local = vec![0; inductors.len()];
-        for (slot, (&label, &device)) in labels.iter().zip(&inductors).enumerate() {
-            let group = groups.entry(label).or_default();
-            local[slot] = group.inductors.len();
+        let mut plans = BTreeMap::<usize, GroupPlan>::new();
+        for card in cards {
+            let label = labels[positions[&card.inductors[0]]];
+            let plan = plans.entry(label).or_insert(GroupPlan {
+                first_coupling: card.coupling,
+                nodes: 0,
+                pairs: 0,
+            });
+            // Already covered by the checked aggregate pair count.
+            plan.pairs += card.pairs;
+        }
+        for &label in &labels {
+            plans
+                .get_mut(&label)
+                .ok_or_else(|| first_site.resource("missing coupled group"))?
+                .nodes += 1;
+        }
+
+        // Charge the minimum validation work, even if every group will be
+        // certified by a sparse bound. Dense fallback is charged separately
+        // before its matrix allocation, once actual coefficients are known.
+        let mut minimum_work = ValidationBudget::new(limits);
+        for plan in plans.values() {
+            let group_site = site(plan.first_coupling);
+            if plan.nodes > limits.group_inductors || u32::try_from(plan.nodes).is_err() {
+                return Err(group_site.resource(format_args!(
+                    "mutual connected-group size limit exceeded ({} inductors, limit {})",
+                    plan.nodes, limits.group_inductors
+                )));
+            }
+            minimum_work.charge_sparse(plan.nodes, plan.pairs, group_site)?;
+        }
+
+        Ok(Self {
+            degrees,
+            positions,
+            labels,
+            plans,
+        })
+    }
+}
+
+impl MutualBinding {
+    fn from_cards(
+        cards: Vec<ResolvedCard>,
+        total_pairs: usize,
+        branch_rows: &[std::ops::Range<usize>],
+        devices: &[Box<dyn Device>],
+        limits: MutualLimits,
+    ) -> SpiceResult<Self> {
+        let Some(first_card) = cards.first() else {
+            return Ok(Self::default());
+        };
+        let site = |coupling: usize| CouplingSite::of(devices[coupling].as_ref());
+        let first_site = site(first_card.coupling);
+
+        let CouplingTopology {
+            degrees,
+            positions,
+            labels,
+            plans,
+        } = CouplingTopology::plan(&cards, devices, limits, first_site)?;
+
+        let mut groups = BTreeMap::new();
+        for (label, plan) in plans {
+            let group_site = site(plan.first_coupling);
+            groups.insert(
+                label,
+                CoupledGroup {
+                    inductors: group_site.reserve(plan.nodes)?,
+                    edges: group_site.reserve(plan.pairs)?,
+                    first_coupling: plan.first_coupling,
+                },
+            );
+        }
+        let mut local = first_site.reserve(positions.len())?;
+        for (&device, &label) in positions.keys().zip(&labels) {
+            let group = groups
+                .get_mut(&label)
+                .ok_or_else(|| first_site.resource("missing coupled group"))?;
+            local.push(group.inductors.len());
             group.inductors.push(device);
         }
-        for (index, pair) in pairs.iter().enumerate() {
-            let (first, second) = (positions[&pair.first], positions[&pair.second]);
-            groups
-                .entry(labels[first])
-                .or_default()
+
+        let mut pairs = first_site.reserve(total_pairs)?;
+        let mut setup_rows = BTreeMap::new();
+        for card in cards {
+            let group_site = site(card.coupling);
+            let label = labels[positions[&card.inductors[0]]];
+            let group = groups
+                .get_mut(&label)
+                .ok_or_else(|| group_site.resource("missing coupled group"))?;
+            let mut rows = group_site.reserve(card.pairs)?;
+            for (position, &first) in card.inductors.iter().enumerate() {
+                for &second in &card.inductors[position + 1..] {
+                    let a = local[positions[&first]];
+                    let b = local[positions[&second]];
+                    group.edges.push(GroupEdge {
+                        pair: pairs.len(),
+                        first_row: a.min(b),
+                        second_row: a.max(b),
+                    });
+                    pairs.push(MutualPair {
+                        coupling: card.coupling,
+                        first,
+                        second,
+                    });
+                    rows.push((branch_rows[first].start, branch_rows[second].start));
+                }
+            }
+            // C's instance list visits each K card's original pairs in reverse.
+            rows.reverse();
+            setup_rows.insert(card.coupling, rows);
+        }
+        for group in groups.values_mut() {
+            group
                 .edges
-                .push(GroupEdge {
-                    pair: index,
-                    first_row: local[first],
-                    second_row: local[second],
-                });
+                .sort_unstable_by_key(|edge| (edge.first_row, edge.second_row, edge.pair));
         }
-        let mut setup_rows = BTreeMap::<_, Vec<_>>::new();
-        for pair in pairs.iter().rev() {
-            setup_rows.entry(pair.coupling).or_default().push((
-                branch_rows[pair.first].start,
-                branch_rows[pair.second].start,
-            ));
-        }
-        Self {
+        Ok(Self {
             pairs,
             groups: groups.into_values().collect(),
+            degrees,
             setup_rows,
             evaluation: std::cell::RefCell::default(),
             error: None,
-        }
+        })
     }
 }
 
@@ -415,6 +574,15 @@ impl Circuit {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct an empty circuit with explicit mutual-inductor budgets.
+    #[must_use]
+    pub fn with_mutual_limits(limits: MutualLimits) -> Self {
+        Self {
+            mutual_limits: limits,
+            ..Self::default()
+        }
     }
 
     /// The node table.
@@ -552,7 +720,7 @@ impl Circuit {
             .map(|device| self.resolve_controls(device.as_ref(), names))
             .collect();
         self.mutual = match self.resolve_mutual(names) {
-            Ok(pairs) => MutualBinding::from_pairs(pairs, &self.branch_rows),
+            Ok(binding) => binding,
             Err(error) => MutualBinding {
                 error: Some(error),
                 ..MutualBinding::default()
@@ -560,17 +728,66 @@ impl Circuit {
         };
     }
 
-    /// The inductor pairs of every K device (C `MUTsetup`, which looks the
-    /// inductors up with `CKTfndDev`; a card with more than two inductors
-    /// couples every pair, as `inp_compat()` expands it). Names are matched
-    /// case-insensitively after subcircuit renaming.
-    fn resolve_mutual(&self, names: &DeviceNames) -> Result<Vec<MutualPair>, SpiceError> {
-        let mut pairs = Vec::new();
+    /// Preflight every K card in linear input work before expanding any
+    /// pairs, then resolve its names in original card order.
+    fn resolve_mutual(&self, names: &DeviceNames) -> SpiceResult<MutualBinding> {
+        let limits = self.mutual_limits;
+        let mut total_pairs = 0_usize;
+        let mut references = 0_usize;
+        let mut card_count = 0_usize;
+        for device in &self.devices {
+            let Some(description) = device.mutual_coupling() else {
+                continue;
+            };
+            let site = CouplingSite::of(device.as_ref());
+            let count = description.inductors.len();
+            if count < 2 {
+                return Err(site.resource("a K card couples at least two inductors"));
+            }
+            let pairs =
+                pair_count(count).ok_or_else(|| site.resource("mutual pair count overflows"))?;
+            total_pairs = total_pairs
+                .checked_add(pairs)
+                .ok_or_else(|| site.resource("aggregate mutual pair count overflows"))?;
+            if total_pairs > limits.pairs {
+                return Err(site.resource(format_args!(
+                    "mutual pair limit exceeded (aggregate {total_pairs} pairs, limit {})",
+                    limits.pairs
+                )));
+            }
+            references = references
+                .checked_add(count)
+                .ok_or_else(|| site.resource("mutual reference count overflows"))?;
+            card_count = card_count
+                .checked_add(1)
+                .ok_or_else(|| site.resource("mutual card count overflows"))?;
+            let bytes =
+                mutual_storage_bytes(total_pairs, references, card_count, self.devices.len())
+                    .ok_or_else(|| site.resource("mutual storage byte count overflows"))?;
+            if bytes > limits.storage_bytes {
+                return Err(site.resource(format_args!(
+                    "mutual storage limit exceeded (planned {bytes} bytes, limit {})",
+                    limits.storage_bytes
+                )));
+            }
+        }
+        if card_count == 0 {
+            return Ok(MutualBinding::default());
+        }
+
+        // Every card passed aggregate resource preflight. Only resolved
+        // references, not pairs, are materialized until group bounds pass.
+        let mut cards = Vec::new();
         for (coupling, device) in self.devices.iter().enumerate() {
             let Some(description) = device.mutual_coupling() else {
                 continue;
             };
-            let mut inductors = Vec::with_capacity(description.inductors.len());
+            let site = CouplingSite::of(device.as_ref());
+            if cards.is_empty() {
+                cards = site.reserve(card_count)?;
+            }
+            let mut inductors = site.reserve(description.inductors.len())?;
+            let mut seen = BTreeSet::new();
             for reference in description.inductors {
                 let failure = |message: String| match &reference.location {
                     Some(location) => SpiceError::parse(location.clone(), message),
@@ -593,7 +810,7 @@ impl Circuit {
                         target.name()
                     )));
                 }
-                if inductors.contains(&index) {
+                if !seen.insert(index) {
                     return Err(failure(format!(
                         "{}: couples inductor {} to itself",
                         device.name(),
@@ -602,17 +819,15 @@ impl Circuit {
                 }
                 inductors.push(index);
             }
-            for (position, first) in inductors.iter().enumerate() {
-                for second in &inductors[position + 1..] {
-                    pairs.push(MutualPair {
-                        coupling,
-                        first: *first,
-                        second: *second,
-                    });
-                }
-            }
+            let pairs = pair_count(inductors.len())
+                .ok_or_else(|| site.resource("mutual pair count overflows"))?;
+            cards.push(ResolvedCard {
+                coupling,
+                inductors,
+                pairs,
+            });
         }
-        Ok(pairs)
+        MutualBinding::from_cards(cards, total_pairs, &self.branch_rows, &self.devices, limits)
     }
 
     /// The mutual-inductance terms of every device's branch equation under
@@ -661,21 +876,16 @@ impl Circuit {
                 .find(|(i, _)| *i == index)
                 .map_or_else(|| self.devices[index].as_ref(), |(_, d)| d.as_ref())
         };
-        let mut values: std::collections::BTreeMap<usize, InductanceValue> =
-            std::collections::BTreeMap::new();
-        for pair in &self.mutual.pairs {
-            for index in [pair.first, pair.second] {
-                if values.contains_key(&index) {
-                    continue;
-                }
-                let device = device_at(index);
-                let value = device.inductance(context).ok_or_else(|| {
-                    SpiceError::circuit(format!("{} is not an inductor", device.name()))
-                })??;
-                values.insert(index, value);
-            }
+        let mut values = BTreeMap::new();
+        for &index in self.mutual.degrees.keys() {
+            let device = device_at(index);
+            let value = device.inductance(context).ok_or_else(|| {
+                SpiceError::circuit(format!("{} is not an inductor", device.name()))
+            })??;
+            values.insert(index, value);
         }
-        let mut mutuals = Vec::with_capacity(self.mutual.pairs.len());
+        let site = CouplingSite::of(self.devices[self.mutual.pairs[0].coupling].as_ref());
+        let mut mutuals = site.reserve(self.mutual.pairs.len())?;
         // INDload adds each K's flux in the MUT instance list's order, the
         // last card first (instances are prepended).
         for pair in self.mutual.pairs.iter().rev() {
@@ -702,7 +912,11 @@ impl Circuit {
             return Ok(cached.terms.clone());
         }
         self.check_inductive_systems(&values, &mutuals)?;
-        let mut terms = vec![Vec::new(); self.devices.len()];
+        let mut terms = site.reserve(self.devices.len())?;
+        terms.resize_with(self.devices.len(), Vec::new);
+        for (&device, &degree) in &self.mutual.degrees {
+            terms[device] = site.reserve(degree)?;
+        }
         for (pair, &inductance) in self.mutual.pairs.iter().zip(&mutuals).rev() {
             let (a, b) = (values[&pair.first], values[&pair.second]);
             terms[pair.first].push(MutualTerm {
@@ -739,46 +953,41 @@ impl Circuit {
         values: &std::collections::BTreeMap<usize, InductanceValue>,
         mutuals: &[Real],
     ) -> SpiceResult<()> {
+        let mut budget = ValidationBudget::new(self.mutual_limits);
         for group in &self.mutual.groups {
-            let n = group.inductors.len();
-            // The smallest eigenvalue of the group's matrix normalized by
-            // `diagonal` (`M_ij / sqrt(d_i d_j)` off the unit diagonal), and
-            // its rounding tolerance.
-            let smallest = |diagonal: &dyn Fn(&InductanceValue) -> Real| -> SpiceResult<_> {
-                let mut matrix = crate::maths::Matrix::zeros(n, n)?;
-                for row in 0..n {
-                    matrix.set(row, row, 1.0)?;
-                }
-                for edge in &group.edges {
-                    let pair = &self.mutual.pairs[edge.pair];
-                    let mutual = mutuals[edge.pair];
-                    let (i, j) = (edge.first_row, edge.second_row);
-                    let scale =
-                        (diagonal(&values[&pair.first]) * diagonal(&values[&pair.second])).sqrt();
-                    // A zero inductance (accepted, as in C) couples with
-                    // M = k sqrt(L1 L2) = 0: its row stays a unit diagonal,
-                    // which keeps the rest's definiteness.
-                    let normalized = if scale == 0.0 { 0.0 } else { mutual / scale };
-                    matrix.add_to(i, j, normalized)?;
-                    matrix.add_to(j, i, normalized)?;
-                }
-                let eigenvalues = matrix.symmetric_eigenvalues()?;
-                let largest = eigenvalues.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "in-memory system size is converted to binary64 when defining a numerical tolerance"
-                )]
-                let tolerance = 64.0 * n as Real * Real::EPSILON * largest;
-                let smallest = eigenvalues.first().copied().unwrap_or(0.0);
-                Ok((smallest, tolerance))
-            };
-            // The matrix actually simulated: self-inductances as stamped
-            // (`INDinduct / m`), mutuals from `INDinduct` (as C).
-            let (stamped, tolerance) = smallest(&|value| value.effective)?;
-            if stamped < -tolerance {
-                // C's own check (`muttemp.c`) puts `INDinduct` (before `/m`)
-                // on the diagonal; it warns only when that matrix fails too.
-                let (c_matrix, c_tolerance) = smallest(&|value| value.coupling_base.abs())?;
+            let site = CouplingSite::of(self.devices[group.first_coupling].as_ref());
+            let mut smallest =
+                |diagonal: fn(&InductanceValue) -> Real| -> SpiceResult<Option<Real>> {
+                    // Coalesce only for PSD validation, not for the stamped or
+                    // stored mutual terms. Each cell sees the same additions in
+                    // the same order as the original dense construction.
+                    let cells = group
+                        .edges
+                        .chunk_by(|a, b| (a.first_row, a.second_row) == (b.first_row, b.second_row))
+                        .map(|edges| {
+                            let first = &edges[0];
+                            let value = edges.iter().fold(0.0, |sum, edge| {
+                                let pair = &self.mutual.pairs[edge.pair];
+                                let scale = (diagonal(&values[&pair.first])
+                                    * diagonal(&values[&pair.second]))
+                                .sqrt();
+                                // A zero self inductance leaves a unit diagonal and
+                                // zero normalized coupling, exactly as before.
+                                let normalized = if scale == 0.0 {
+                                    0.0
+                                } else {
+                                    mutuals[edge.pair] / scale
+                                };
+                                sum + normalized
+                            });
+                            (first.first_row, first.second_row, value)
+                        });
+                    budget.check(group.inductors.len(), group.edges.len(), cells, site)
+                };
+            // Compare the actually stamped matrix first, and the undivided
+            // C diagonal only when needed for diagnostic classification.
+            if let Some(stamped) = smallest(|value| value.effective)? {
+                let c_indefinite = smallest(|value| value.coupling_base.abs())?.is_some();
                 let mut couplings: Vec<_> = group
                     .edges
                     .iter()
@@ -799,7 +1008,7 @@ impl Circuit {
                         .mutual_coupling()
                         .and_then(|coupling| coupling.location.cloned())
                 });
-                let cause = if c_matrix < -c_tolerance {
+                let cause = if c_indefinite {
                     "a coupling with |k| > 1 or an inconsistent set of couplings stores \
                      negative energy; C only warns, see muttemp.c"
                 } else {
@@ -1432,6 +1641,9 @@ impl Circuit {
             return Err(SpiceError::circuit(
                 "circuit numbering is stale; finalize after adding devices",
             ));
+        }
+        if let Some(error) = &self.mutual.error {
+            return Err(error.clone());
         }
         Ok(())
     }
@@ -2521,7 +2733,7 @@ impl Circuit {
             .map(|device| device.name().to_lowercase())
             .collect();
         let base = self.devices.len();
-        let staged = crate::devices::factory::append_nodes(&mut self.nodes, |nodes| {
+        let staged = self.nodes.transaction(|nodes| {
             Self::elaborate_batch(instances, models, context, nodes, base, seen)
         })?;
         self.devices.reserve(staged.len());
@@ -2540,7 +2752,7 @@ impl Circuit {
         instances: &[crate::netlist::ast::DeviceInstance],
         models: &crate::devices::models::ModelResolver<'_>,
         context: &ModelContext,
-        nodes: &mut NodeTable,
+        nodes: &mut crate::primitives::NodeAppend<'_>,
         base: usize,
         mut seen: BTreeSet<String>,
     ) -> SpiceResult<Vec<PendingDevice>> {
@@ -2732,6 +2944,19 @@ impl Circuit {
         netlist: &crate::netlist::ast::Netlist,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<Self> {
+        Self::from_netlist_with_mutual_limits(netlist, context, MutualLimits::default())
+    }
+
+    /// Elaborate with explicit K-card construction and validation limits.
+    ///
+    /// # Errors
+    /// The same errors as [`Self::from_netlist_with_context`], including any
+    /// exceeded mutual-inductor budget before allocating an oversized system.
+    pub fn from_netlist_with_mutual_limits(
+        netlist: &crate::netlist::ast::Netlist,
+        context: &ModelContext,
+        mutual_limits: MutualLimits,
+    ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
         if !netlist.includes.is_empty() {
             return Err(SpiceError::Unsupported {
@@ -2756,7 +2981,7 @@ impl Circuit {
             crate::devices::subckt::SubcircuitLimits::default(),
         )?;
         let models = crate::devices::models::ModelResolver::new(&expanded.models)?;
-        let mut circuit = Self::new();
+        let mut circuit = Self::with_mutual_limits(mutual_limits);
         // `b4set.c` reads the task's analysis list (`noiseAnalGiven`).
         let mut setup = *context;
         setup.noise_analysis = netlist
@@ -2820,6 +3045,75 @@ mod tests {
     use petgraph::algo::{connected_components, has_path_connecting};
     use petgraph::graph::NodeIndex;
     use petgraph::visit::EdgeRef;
+
+    #[test]
+    fn mutual_pair_and_payload_arithmetic_are_checked() {
+        assert_eq!(super::pair_count(0), Some(0));
+        assert_eq!(super::pair_count(1), Some(0));
+        assert_eq!(super::pair_count(10_000), Some(49_995_000));
+        assert_eq!(super::pair_count(usize::MAX), None);
+        assert_eq!(super::mutual_storage_bytes(usize::MAX, 0, 0, 0), None);
+        assert_eq!(super::mutual_storage_bytes(0, usize::MAX, 0, 0), None);
+    }
+
+    #[test]
+    #[ignore = "manual coupling setup scaling measurement"]
+    fn mutual_setup_scaling() {
+        use crate::devices::{ModelContext, MutualLimits};
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use std::{fmt::Write, path::Path, time::Instant};
+
+        for (clique, nodes) in [
+            (false, 1_000),
+            (false, 10_000),
+            (true, 100),
+            (true, 300),
+            (true, 1_000),
+        ] {
+            let mut deck = String::from("coupling benchmark\n");
+            for i in 0..nodes {
+                writeln!(deck, "l{i} n{i} 0 1").unwrap();
+            }
+            let (pairs, references, cards) = if clique {
+                deck.push_str("k1");
+                for i in 0..nodes {
+                    write!(deck, " l{i}").unwrap();
+                }
+                deck.push_str(" 0.0005\n");
+                (super::pair_count(nodes).unwrap(), nodes, 1)
+            } else {
+                for i in 1..nodes {
+                    writeln!(deck, "k{i} l{} l{i} 0.5", i - 1).unwrap();
+                }
+                (nodes - 1, 2 * (nodes - 1), nodes - 1)
+            };
+            deck.push_str(".end\n");
+            let netlist = Parser::new()
+                .parse_deck(&parse_deck_text(Path::new("bench.cir"), &deck))
+                .unwrap();
+            let start = Instant::now();
+            let circuit = Circuit::from_netlist_with_mutual_limits(
+                &netlist,
+                &ModelContext::default(),
+                MutualLimits {
+                    dense_bytes: 0,
+                    ..MutualLimits::default()
+                },
+            )
+            .unwrap();
+            let elapsed = start.elapsed();
+            assert_eq!(circuit.mutual.pairs.len(), pairs);
+            let accounted =
+                super::mutual_storage_bytes(pairs, references, cards, nodes + cards).unwrap();
+            let dense_bytes = crate::maths::dense::symmetric_eigenvalue_cost(nodes)
+                .unwrap()
+                .0;
+            eprintln!(
+                "{} n={nodes} pairs={pairs} elapsed={elapsed:?} accounted_payload={accounted} dense_payload_avoided={dense_bytes}",
+                if clique { "clique" } else { "chain" }
+            );
+        }
+    }
 
     /// A test double with arbitrary terminals that never stamps.
     #[derive(Debug)]

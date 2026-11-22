@@ -5,7 +5,7 @@
 //! Geometry/precedence follows those routines, without C's missing-resistance
 //! fallback, global geometry scale or ignored keywords. A tiny instance
 //! resistance is clamped to `RESMIN` as `resparam.c` does (`rlc::res_resist`).
-//! Coil/Lundin geometry, exponential TC, DTEMP and AC-only resistance are gaps.
+//! Ordinary setup and sensitivity replay share C-ordered passive arithmetic.
 //!
 //! ```
 //! use std::path::Path;
@@ -23,13 +23,20 @@
 //! ```
 
 mod device;
+pub(super) mod physics;
+
 pub(super) use device::{instantiate, swept_literal, swept_resistor};
+use physics::{
+    CapacitorGeometry, CapacitorSetup, Coefficients, CoilGeometry, CoilSetup, SheetGeometry,
+    TemperaturePoint, conductance, scaled,
+};
 
 use crate::devices::models::{ModelContext, ModelFamily, ResolvedModel};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter, ScalarSchema, ScalarUnit as U, ScalarValues,
     temperature_kelvin,
 };
+use crate::devices::sensitivity::written;
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
@@ -87,8 +94,11 @@ pub struct PassiveParameters {
     nominal_value: Real,
     temperature: Option<Real>,
     nominal_temperature: Option<Real>,
-    tc1: Real,
-    tc2: Real,
+    coefficients: Coefficients,
+    exponential: Option<Real>,
+    delta_temperature: Option<Real>,
+    ac_resistance: Option<Real>,
+    prepared: PreparedModel,
     scale: Real,
     multiplicity: Real,
     initial_condition: Option<Real>,
@@ -99,11 +109,143 @@ pub struct PassiveParameters {
     ef: Real,
     noise_area: Real,
     location: SourceLoc,
-    /// The validated model and instance setters as written (schema defaults
+    /// The validated model and instance setters (schema defaults
     /// unlocated), for `.sens`, which replays C's own records
     /// ([`crate::devices::sensitivity`]).
     model_values: ScalarValues,
     instance_values: ScalarValues,
+}
+
+/// The setup-only model input projection. Geometry used by temperature and
+/// per-point setters is read from this immutable prepared state.
+#[derive(Debug, Clone, PartialEq)]
+enum PreparedModel {
+    Resistance {
+        scalar: Option<Real>,
+        geometry: SheetGeometry,
+    },
+    Capacitance {
+        scalar: Option<Real>,
+        default_width: Real,
+        geometry: CapacitorGeometry,
+    },
+    Inductance {
+        geometry: CoilGeometry,
+        has_model_value: bool,
+        has_coil: bool,
+    },
+}
+
+impl PreparedModel {
+    fn prepare(kind: PassiveKind, model: &ScalarValues) -> Self {
+        match kind {
+            PassiveKind::Resistor => Self::Resistance {
+                scalar: optional(model, "r"),
+                geometry: SheetGeometry {
+                    length: value(model, "l", 10e-6),
+                    width: value(model, "defw", 10e-6),
+                    short: value(model, "short", 0.),
+                    narrow: value(model, "narrow", 0.),
+                    sheet: value(model, "rsh", 0.),
+                },
+            },
+            PassiveKind::Capacitor => Self::Capacitance {
+                scalar: optional(model, "cap"),
+                default_width: value(model, "defw", 10e-6),
+                geometry: CapacitorSetup {
+                    cj: written(model, "cj"),
+                    cjsw: value(model, "cjsw", 0.),
+                    narrow: written(model, "narrow"),
+                    short: written(model, "short"),
+                    del: written(model, "del"),
+                    dielectric: written(model, "di"),
+                    thickness: written(model, "thick"),
+                }
+                .prepare(),
+            },
+            PassiveKind::Inductor => {
+                let setup = CoilSetup {
+                    inductance: written(model, "ind"),
+                    cross_section: written(model, "csect"),
+                    diameter: written(model, "dia"),
+                    length: written(model, "length"),
+                    turns: value(model, "nt", 0.),
+                    permeability: value(model, "mu", 1.),
+                };
+                Self::Inductance {
+                    geometry: setup.prepare(),
+                    has_model_value: setup.inductance.is_some()
+                        || (setup.turns > 0.
+                            && setup.length.is_some()
+                            && (setup.diameter.is_some() || setup.cross_section.is_some())),
+                    has_coil: setup.length.is_some()
+                        && (setup.diameter.is_some() || setup.cross_section.is_some()),
+                }
+            }
+        }
+    }
+
+    /// Validate bounded geometry separately from C's arithmetic, retaining
+    /// the original error location. Missing resistance/inductance is not
+    /// silently substituted by a C warning fallback.
+    fn nominal(&self, instance: &ScalarValues, location: &SourceLoc) -> SpiceResult<Real> {
+        match *self {
+            Self::Resistance {
+                scalar,
+                mut geometry,
+            } => {
+                geometry.length = value(instance, "l", geometry.length);
+                geometry.width = value(instance, "w", geometry.width);
+                if geometry.uses_sheet() {
+                    let (length, width) = geometry.dimensions();
+                    positive(length, location, "effective resistor length")?;
+                    positive(width, location, "effective resistor width")?;
+                    finite(geometry.resistance(), location, "sheet resistance")
+                } else {
+                    scalar.ok_or_else(|| SpiceError::parse(location.clone(), "resistor requires an instance resistance, model r or positive sheet geometry; no implicit 1 mOhm fallback"))
+                }
+            }
+            Self::Capacitance {
+                scalar,
+                default_width,
+                geometry,
+            } => {
+                if let Some(capacitance) = scalar {
+                    return Ok(capacitance);
+                }
+                let length = optional(instance, "l").ok_or_else(|| {
+                    SpiceError::parse(
+                        location.clone(),
+                        "capacitor geometry requires instance l; C setup does not apply model defl",
+                    )
+                })?;
+                let width = value(instance, "w", default_width);
+                let (effective_length, effective_width) = geometry.dimensions(length, width);
+                positive(effective_length, location, "effective capacitor length")?;
+                positive(effective_width, location, "effective capacitor width")?;
+                finite(
+                    geometry.capacitance(length, width),
+                    location,
+                    "geometry capacitance",
+                )
+            }
+            Self::Inductance {
+                geometry,
+                has_model_value,
+                has_coil,
+            } => {
+                let turns = optional(instance, "nt");
+                if (turns.is_some() && !has_coil) || (turns.is_none() && !has_model_value) {
+                    return Err(SpiceError::parse(
+                        location.clone(),
+                        "inductor requires an explicit inductance or complete coil geometry and turns",
+                    ));
+                }
+                let nominal = geometry.inductance(None, turns);
+                positive(nominal, location, "derived inductance")
+            }
+        }
+    }
 }
 
 impl PassiveParameters {
@@ -115,13 +257,20 @@ impl PassiveParameters {
         if let (Some(ic), Some(parameter)) = (ic, kind.initial()) {
             instance_values.set(parameter.name, ic, parameter.unit, location.clone());
         }
+        let model_values = model_schema(kind).validate(&[], &location)?;
         Ok(Self {
             kind,
             nominal_value: value,
             temperature: None,
             nominal_temperature: None,
-            tc1: 0.,
-            tc2: 0.,
+            coefficients: Coefficients {
+                linear: 0.,
+                quadratic: 0.,
+            },
+            exponential: None,
+            delta_temperature: None,
+            ac_resistance: None,
+            prepared: PreparedModel::prepare(kind, &model_values),
             scale: 1.,
             multiplicity: 1.,
             initial_condition: ic,
@@ -130,7 +279,7 @@ impl PassiveParameters {
             af: 1.,
             ef: 1.,
             noise_area: 1.,
-            model_values: model_schema(kind).validate(&[], &location)?,
+            model_values,
             instance_values,
             location,
         })
@@ -156,10 +305,12 @@ impl PassiveParameters {
             "passive",
             parameter,
             value,
-            match parameter {
-                "temp" => value > -273.15,
-                "w" | "l" | "m" | "scale" => value > 0.,
-                _ => true,
+            match definition.domain {
+                D::Positive => value > 0.,
+                D::NonNegative => value >= 0.,
+                D::NonZero => value != 0.,
+                D::Temperature => value > -273.15,
+                D::Finite => true,
             },
             "in its finite physical domain",
         )?;
@@ -167,23 +318,30 @@ impl PassiveParameters {
             .set(parameter, value, definition.unit, self.location.clone());
         match parameter {
             name if name == primary => {
+                let value = if self.kind == PassiveKind::Resistor {
+                    crate::devices::rlc::clamp_resistance(value)
+                } else {
+                    value
+                };
                 valid_value(self.kind, value, &self.location)?;
                 p.nominal_value = value;
+                p.instance_values
+                    .set(primary, value, definition.unit, self.location.clone());
             }
             "temp" => p.temperature = Some(value),
-            "tc1" => p.tc1 = value,
-            "tc2" => p.tc2 = value,
+            "tc1" => p.coefficients.linear = value,
+            "tc2" => p.coefficients.quadratic = value,
+            "tce" => p.exponential = Some(value),
+            "dtemp" => p.delta_temperature = Some(value),
+            "ac" => p.ac_resistance = Some(value),
             "m" => p.multiplicity = value,
             "scale" => p.scale = value,
             "ic" => p.initial_condition = Some(value),
-            "w" | "l" => {
-                // restemp.c re-derives geometry only without a given resistance;
-                // CAPsetup's geometry is setup-only, not rerun by a DC setter.
-                if self.kind == PassiveKind::Resistor
-                    && optional(&p.instance_values, primary).is_none()
-                {
-                    p.nominal_value =
-                        model_value(self.kind, &p.model_values, &p.instance_values, &p.location)?;
+            "w" | "l" | "nt" => {
+                // R/C geometry and instance coil turns are temperature-time
+                // quantities. Prepared model geometry is not rerun by DEVparam.
+                if optional(&p.instance_values, primary).is_none() {
+                    p.nominal_value = p.prepared.nominal(&p.instance_values, &p.location)?;
                 }
             }
             _ => {
@@ -192,7 +350,7 @@ impl PassiveParameters {
                 )));
             }
         }
-        p.effective_value(context)?;
+        p.validate_effective(context)?;
         Ok(p)
     }
 
@@ -221,6 +379,11 @@ impl PassiveParameters {
     /// must be nonzero with finite conductance; C/L must be nonnegative).
     pub fn with_nominal_value(&self, value: Real) -> SpiceResult<Self> {
         valid_value(self.kind, value, &self.location)?;
+        let value = if self.kind == PassiveKind::Resistor {
+            crate::devices::rlc::clamp_resistance(value)
+        } else {
+            value
+        };
         let mut recipe = self.clone();
         let principal = self.kind.principal();
         recipe.nominal_value = value;
@@ -234,7 +397,8 @@ impl PassiveParameters {
     pub const fn model_values(&self) -> &ScalarValues {
         &self.model_values
     }
-    /// The validated instance setters (schema defaults have no location).
+    /// The validated instance setters (schema defaults have no location;
+    /// resistor principal is clamped by the C setter).
     #[must_use]
     pub const fn instance_values(&self) -> &ScalarValues {
         &self.instance_values
@@ -270,11 +434,13 @@ impl PassiveParameters {
         }
     }
 
-    /// Effective value to pass to the existing scalar equation stamps.
+    /// Effective scalar value including temperature, scale and multiplicity.
+    ///
     /// `f=1+TC1*dT+TC2*dT^2`; R/L use `nominal*f*scale/m`, C uses
     /// `nominal*f*scale*m`. R's polynomial uses C's Horner evaluation order.
-    /// Instance TEMP overrides circuit TEMP; model TNOM overrides context TNOM.
-    /// Temperature subtraction uses Kelvin conversions just like the C setters.
+    /// Instance TEMP overrides circuit TEMP and DTEMP; model TNOM overrides context TNOM.
+    /// A written TCE selects the exponential resistor law. Temperature
+    /// subtraction uses Kelvin conversions just like the C setters.
     ///
     /// # Errors
     /// Invalid context, nonpositive/nonfinite factor, overflow, underflow to
@@ -293,7 +459,10 @@ impl PassiveParameters {
     }
 
     fn effective_value_for(&self, nominal: Real, context: &ModelContext) -> SpiceResult<Real> {
-        let scaled = self.scaled_value_for(nominal, context)?;
+        self.effective_scaled(self.scaled_value_for(nominal, context)?)
+    }
+
+    fn effective_scaled(&self, scaled: Real) -> SpiceResult<Real> {
         let value = if self.kind == PassiveKind::Capacitor {
             scaled * self.multiplicity
         } else {
@@ -301,6 +470,12 @@ impl PassiveParameters {
         };
         valid_value(self.kind, value, &self.location)?;
         Ok(value)
+    }
+
+    fn checked_scaled(&self, context: &ModelContext) -> SpiceResult<Real> {
+        let scaled = self.scaled_value(context)?;
+        self.effective_scaled(scaled)?;
+        Ok(scaled)
     }
 
     /// The temperature-adjusted and scaled value before multiplicity: C's
@@ -320,36 +495,71 @@ impl PassiveParameters {
         self.scaled_value_for(self.nominal_value, context)
     }
 
-    fn scaled_value_for(&self, nominal_value: Real, context: &ModelContext) -> SpiceResult<Real> {
+    fn temperature_point(&self, context: &ModelContext) -> SpiceResult<TemperaturePoint> {
         context.validate(&self.location)?;
-        let temperature = temperature_kelvin(
-            self.temperature.unwrap_or(context.temperature),
+        let explicit = self
+            .temperature
+            .map(|temperature| temperature_kelvin(temperature, &self.location))
+            .transpose()?;
+        let circuit = temperature_kelvin(context.temperature, &self.location)?;
+        let temperature = TemperaturePoint::resolve(explicit, self.delta_temperature, circuit);
+        positive(
+            temperature.effective(),
             &self.location,
+            "instance temperature (kelvin)",
         )?;
+        Ok(temperature)
+    }
+
+    fn factor(&self, context: &ModelContext) -> SpiceResult<Real> {
+        let temperature = self.temperature_point(context)?;
         let nominal = temperature_kelvin(
             self.nominal_temperature
                 .unwrap_or(context.nominal_temperature),
             &self.location,
         )?;
-        let dt = temperature - nominal;
+        let dt = temperature.difference(nominal);
         finite(dt, &self.location, "temperature difference")?;
         let factor = if self.kind == PassiveKind::Resistor {
-            let quadratic = finite(self.tc2 * dt, &self.location, "quadratic coefficient")?;
-            let slope = finite(quadratic + self.tc1, &self.location, "temperature slope")?;
-            finite(slope * dt, &self.location, "temperature correction")? + 1.0
+            self.coefficients.resistor_factor(dt, self.exponential)
         } else {
-            let linear = finite(self.tc1 * dt, &self.location, "linear correction")?;
-            let quadratic = finite(self.tc2 * dt, &self.location, "quadratic coefficient")?;
-            let quadratic = finite(quadratic * dt, &self.location, "quadratic correction")?;
-            finite(1.0 + linear, &self.location, "linear temperature factor")? + quadratic
+            self.coefficients.reactive(dt)
         };
-        positive(factor, &self.location, "temperature factor")?;
-        let adjusted = finite(
-            nominal_value * factor,
+        positive(factor, &self.location, "temperature factor")
+    }
+
+    fn scaled_value_for(&self, nominal_value: Real, context: &ModelContext) -> SpiceResult<Real> {
+        finite(
+            scaled(nominal_value, self.factor(context)?, self.scale),
             &self.location,
-            "temperature-adjusted value",
-        )?;
-        finite(adjusted * self.scale, &self.location, "scaled value")
+            "scaled value",
+        )
+    }
+
+    /// Ordinary loads use C's conductance expression directly, so the
+    /// multiplier is not rounded once into an effective resistance.
+    fn resistor_conductance(&self, context: &ModelContext, ac: bool) -> SpiceResult<Real> {
+        let nominal = if ac {
+            self.ac_resistance.unwrap_or(self.nominal_value)
+        } else {
+            self.nominal_value
+        };
+        let adjusted = self.scaled_value_for(nominal, context)?;
+        valid_value(self.kind, adjusted / self.multiplicity, &self.location)?;
+        finite(
+            conductance(adjusted, self.multiplicity),
+            &self.location,
+            "resistor conductance",
+        )
+    }
+
+    fn validate_effective(&self, context: &ModelContext) -> SpiceResult<()> {
+        self.effective_value(context)?;
+        if self.kind == PassiveKind::Resistor {
+            self.resistor_conductance(context, false)?;
+            self.resistor_conductance(context, true)?;
+        }
+        Ok(())
     }
 }
 
@@ -385,9 +595,10 @@ impl ResolvedModel<'_> {
             ));
         }
         let model = self.parameters(&model_schema(kind))?;
-        let instance_values =
+        let mut instance_values =
             instance_schema(kind).validate(&instance.parameters, &instance.location)?;
         let location = &instance.location;
+        let prepared = PreparedModel::prepare(kind, &model);
         let base = if let Some(value) = optional(&instance_values, primary) {
             if kind == PassiveKind::Resistor {
                 crate::devices::rlc::res_resist(&instance.name, value)
@@ -395,8 +606,14 @@ impl ResolvedModel<'_> {
                 value
             }
         } else {
-            model_value(kind, &model, &instance_values, location)?
+            prepared.nominal(&instance_values, location)?
         };
+        if kind == PassiveKind::Resistor
+            && let Some(written) = instance_values.get(primary)
+            && let Some(source) = &written.location
+        {
+            instance_values.set(primary, base, kind.principal().unit, source.clone());
+        }
         valid_value(kind, base, location)?;
         // ressetup.c: RESeffNoiseArea uses the instance geometry (L/W
         // defaulting to the model's) only when the instance gives L or W.
@@ -408,10 +625,14 @@ impl ResolvedModel<'_> {
                 optional(&instance_values, "l").unwrap_or_else(|| value(&model, "l", 10e-6));
             let width =
                 optional(&instance_values, "w").unwrap_or_else(|| value(&model, "defw", 10e-6));
-            let length_correction = 2.0 * value(&model, "short", 0.0);
-            let width_correction = 2.0 * value(&model, "narrow", 0.0);
-            let effective_length = length - length_correction;
-            let effective_width = width - width_correction;
+            let (effective_length, effective_width) = SheetGeometry {
+                length,
+                width,
+                short: value(&model, "short", 0.),
+                narrow: value(&model, "narrow", 0.),
+                sheet: value(&model, "rsh", 0.),
+            }
+            .dimensions();
             effective_length.powf(value(&model, "lf", 1.0))
                 * effective_width.powf(value(&model, "wf", 1.0))
         } else {
@@ -422,8 +643,16 @@ impl ResolvedModel<'_> {
             nominal_value: base,
             temperature: optional(&instance_values, "temp"),
             nominal_temperature: optional(&model, "tnom"),
-            tc1: optional(&instance_values, "tc1").unwrap_or_else(|| value(&model, "tc1", 0.0)),
-            tc2: optional(&instance_values, "tc2").unwrap_or_else(|| value(&model, "tc2", 0.0)),
+            coefficients: Coefficients {
+                linear: optional(&instance_values, "tc1")
+                    .unwrap_or_else(|| value(&model, "tc1", 0.)),
+                quadratic: optional(&instance_values, "tc2")
+                    .unwrap_or_else(|| value(&model, "tc2", 0.)),
+            },
+            exponential: optional(&instance_values, "tce").or_else(|| optional(&model, "tce")),
+            delta_temperature: optional(&instance_values, "dtemp"),
+            ac_resistance: optional(&instance_values, "ac"),
+            prepared,
             scale: value(&instance_values, "scale", 1.0),
             multiplicity: value(&instance_values, "m", 1.0),
             initial_condition: optional(&instance_values, "ic"),
@@ -437,46 +666,6 @@ impl ResolvedModel<'_> {
             model_values: model,
             instance_values,
         })
-    }
-}
-
-fn model_value(
-    kind: PassiveKind,
-    model: &ScalarValues,
-    instance: &ScalarValues,
-    location: &SourceLoc,
-) -> SpiceResult<Real> {
-    match kind {
-        PassiveKind::Resistor => {
-            let sheet = value(model, "rsh", 0.0);
-            // RESsetup supplies positive default L/W (10 um); positive RSH
-            // therefore takes precedence over model R, even without L/W given.
-            if sheet > 0.0 {
-                let length = optional(instance, "l").unwrap_or_else(|| value(model, "l", 10e-6));
-                let width = optional(instance, "w").unwrap_or_else(|| value(model, "defw", 10e-6));
-                let length = corrected(length, 2.0 * value(model, "short", 0.0), location, "effective resistor length")?;
-                let width = corrected(width, 2.0 * value(model, "narrow", 0.0), location, "effective resistor width")?;
-                let squares = finite(length / width, location, "resistor square count")?;
-                finite(squares * sheet, location, "sheet resistance")
-            } else {
-                optional(model, "r").ok_or_else(|| SpiceError::parse(location.clone(), "resistor requires an instance resistance, model r or positive rsh; no implicit 1 mOhm fallback"))
-            }
-        }
-        PassiveKind::Capacitor => {
-            if let Some(cap) = optional(model, "cap") { return Ok(cap); }
-            // CAPsetup stores DEFL but initializes missing instance length to
-            // zero without applying it. Require explicit positive L instead.
-            let length = optional(instance, "l").ok_or_else(|| SpiceError::parse(location.clone(), "capacitor geometry requires instance l; C setup does not apply model defl"))?;
-            let width = optional(instance, "w").unwrap_or_else(|| value(model, "defw", 10e-6));
-            let length = corrected(length, value(model, "short", 0.0), location, "effective capacitor length")?;
-            let width = corrected(width, value(model, "narrow", 0.0), location, "effective capacitor width")?;
-            let area = finite(width * length, location, "capacitor area")?;
-            let bottom = finite(value(model, "cj", 0.0) * area, location, "bottom capacitance")?;
-            let perimeter = finite(2.0 * finite(length + width, location, "capacitor dimension sum")?, location, "capacitor perimeter")?;
-            let sidewall = finite(value(model, "cjsw", 0.0) * perimeter, location, "sidewall capacitance")?;
-            finite(bottom + sidewall, location, "geometry capacitance")
-        }
-        PassiveKind::Inductor => optional(model, "ind").ok_or_else(|| SpiceError::parse(location.clone(), "inductor requires an instance inductance or model ind; coil geometry is unsupported")),
     }
 }
 
@@ -498,6 +687,7 @@ const fn model_schema(kind: PassiveKind) -> ScalarSchema<'static> {
         p("short", U::Metre, D::NonNegative, Some(0.0)),
         p("tc1", U::InverseKelvin, D::Finite, Some(0.0)),
         p("tc2", U::InverseKelvinSquared, D::Finite, Some(0.0)),
+        p("tce", U::InverseKelvin, D::Finite, None),
         p("tnom", U::Celsius, D::Temperature, None),
         p("kf", U::Dimensionless, D::Finite, Some(0.0)),
         p("af", U::Dimensionless, D::Finite, Some(1.0)),
@@ -512,12 +702,20 @@ const fn model_schema(kind: PassiveKind) -> ScalarSchema<'static> {
         p("defw", U::Metre, D::Positive, Some(10e-6)),
         p("narrow", U::Metre, D::NonNegative, Some(0.0)),
         p("short", U::Metre, D::NonNegative, Some(0.0)),
+        p("del", U::Metre, D::NonNegative, None),
+        p("thick", U::Metre, D::Positive, None),
+        p("di", U::Dimensionless, D::NonNegative, None),
         p("tc1", U::InverseKelvin, D::Finite, Some(0.0)),
         p("tc2", U::InverseKelvinSquared, D::Finite, Some(0.0)),
         p("tnom", U::Celsius, D::Temperature, None),
     ];
     const L: &[ScalarParameter] = &[
         p("ind", U::Henry, D::Positive, None),
+        p("csect", U::SquareMetre, D::Positive, None),
+        p("dia", U::Metre, D::Positive, None),
+        p("length", U::Metre, D::Positive, None),
+        p("nt", U::Dimensionless, D::Positive, None),
+        p("mu", U::Dimensionless, D::Positive, Some(1.)),
         p("tc1", U::InverseKelvin, D::Finite, Some(0.0)),
         p("tc2", U::InverseKelvinSquared, D::Finite, Some(0.0)),
         p("tnom", U::Celsius, D::Temperature, None),
@@ -532,6 +730,7 @@ const fn model_schema(kind: PassiveKind) -> ScalarSchema<'static> {
 }
 const fn instance_schema(kind: PassiveKind) -> ScalarSchema<'static> {
     const TEMP: ScalarParameter = p("temp", U::Celsius, D::Temperature, None);
+    const DTEMP: ScalarParameter = p("dtemp", U::Kelvin, D::Finite, None);
     const TC1: ScalarParameter = p("tc1", U::InverseKelvin, D::Finite, None);
     const TC2: ScalarParameter = p("tc2", U::InverseKelvinSquared, D::Finite, None);
     const M: ScalarParameter = p("m", U::Dimensionless, D::Positive, Some(1.));
@@ -541,6 +740,7 @@ const fn instance_schema(kind: PassiveKind) -> ScalarSchema<'static> {
     const R: &[ScalarParameter] = &[
         PassiveKind::Resistor.principal(),
         TEMP,
+        DTEMP,
         TC1,
         TC2,
         M,
@@ -548,10 +748,13 @@ const fn instance_schema(kind: PassiveKind) -> ScalarSchema<'static> {
         L,
         W,
         p("noisy", U::Dimensionless, D::Finite, None),
+        p("tce", U::InverseKelvin, D::Finite, None),
+        p("ac", U::Ohm, D::NonZero, None),
     ];
     const C: &[ScalarParameter] = &[
         PassiveKind::Capacitor.principal(),
         TEMP,
+        DTEMP,
         TC1,
         TC2,
         M,
@@ -563,11 +766,13 @@ const fn instance_schema(kind: PassiveKind) -> ScalarSchema<'static> {
     const I: &[ScalarParameter] = &[
         PassiveKind::Inductor.principal(),
         TEMP,
+        DTEMP,
         TC1,
         TC2,
         M,
         SCALE,
         p("ic", U::Ampere, D::Finite, None),
+        p("nt", U::Dimensionless, D::Positive, None),
     ];
     ScalarSchema {
         parameters: match kind {
@@ -603,10 +808,6 @@ fn positive(value: Real, location: &SourceLoc, name: &str) -> SpiceResult<Real> 
             format!("{name} must be positive"),
         ))
     }
-}
-fn corrected(value: Real, correction: Real, location: &SourceLoc, name: &str) -> SpiceResult<Real> {
-    finite(correction, location, "geometry correction")?;
-    positive(value - correction, location, name)
 }
 fn valid_value(kind: PassiveKind, value: Real, location: &SourceLoc) -> SpiceResult<()> {
     finite(value, location, "effective passive value")?;

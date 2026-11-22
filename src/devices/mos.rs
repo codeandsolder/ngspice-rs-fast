@@ -102,7 +102,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
 pub(super) use crate::devices::nonlinear::thermal::{
     CELSIUS_TO_KELVIN, CHARGE, K_OVER_Q, band_gap,
@@ -938,7 +938,7 @@ pub(super) struct Mosfet<L: MosLevel> {
 impl<L: MosLevel> Mosfet<L> {
     pub(crate) fn instantiate(
         i: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         resolved: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -989,33 +989,34 @@ impl<L: MosLevel> Mosfet<L> {
         };
         // Validate every derivation before interning nodes.
         device.operating(context)?;
-        let mut staged = nodes.clone();
-        let external: Vec<NodeId> = i
-            .nodes
-            .iter()
-            .map(|n| staged.intern(n))
-            .collect::<SpiceResult<Vec<_>>>()?;
-        device.terminals.clone_from(&external);
-        device.inner = [external[0], external[1], external[2], external[3]];
-        for (index, conductance, suffix) in [
-            (0, series[0], L::PRIME_SUFFIXES[0]),
-            (2, series[1], L::PRIME_SUFFIXES[1]),
-        ] {
-            if conductance > 0. {
-                let name = format!("{}#{suffix}", i.name);
-                if staged.get(&name).is_some() {
-                    return Err(SpiceError::circuit(format!(
-                        "{} internal-node name collision: {name}",
-                        L::LABEL
-                    )));
+        nodes.transaction(|staged| {
+            let external: Vec<NodeId> = i
+                .nodes
+                .iter()
+                .map(|n| staged.intern(n))
+                .collect::<SpiceResult<Vec<_>>>()?;
+            device.terminals.clone_from(&external);
+            device.inner = [external[0], external[1], external[2], external[3]];
+            for (index, conductance, suffix) in [
+                (0, series[0], L::PRIME_SUFFIXES[0]),
+                (2, series[1], L::PRIME_SUFFIXES[1]),
+            ] {
+                if conductance > 0. {
+                    let name = format!("{}#{suffix}", i.name);
+                    if staged.get(&name).is_some() {
+                        return Err(SpiceError::circuit(format!(
+                            "{} internal-node name collision: {name}",
+                            L::LABEL
+                        )));
+                    }
+                    let prime = staged.intern(&name)?;
+                    staged.set_kind(prime, NodeKind::Internal)?;
+                    device.terminals.push(prime);
+                    device.inner[index] = prime;
                 }
-                let prime = staged.intern(&name)?;
-                staged.set_kind(prime, NodeKind::Internal);
-                device.terminals.push(prime);
-                device.inner[index] = prime;
             }
-        }
-        *nodes = staged;
+            Ok(())
+        })?;
         Ok(Box::new(device))
     }
 

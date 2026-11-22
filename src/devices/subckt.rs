@@ -41,7 +41,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::devices::binning::{NameMatch, model_name_match};
+use crate::devices::binning::{DeclarationIndex, bin_base};
 use crate::netlist::ast::{
     DeviceInstance, FourierCard, MeasureCard, ModelCard, Netlist, NodeHintCard, OptionCard,
     OutputCards, ParamAssignment, ParamCard, ParameterAssignment, ParameterKind, PrintCard,
@@ -217,16 +217,14 @@ pub fn expand_with_output(
     })
 }
 
-/// One frame's model declarations: canonical local name to flattened name and
-/// the card as it will be declared at top level.
-#[derive(Debug, Clone)]
+/// One frame's model identity and an owned card awaiting first use.
+///
+/// Root cards already reside in the flattened deck; local cards are moved
+/// there once, while their flattened names remain available for lookup.
+#[derive(Debug)]
 struct LocalModel {
     name: String,
-    card: ModelCard,
-    emitted: bool,
-    /// Declaration index of the (first) card within its frame; binned sets are
-    /// emitted in this order because C's last declared matching bin wins.
-    order: usize,
+    pending: Option<ModelCard>,
 }
 
 #[derive(Default)]
@@ -459,9 +457,11 @@ fn check_binned_bases(
         if renamed.contains(&name) {
             continue;
         }
-        if let Some(base) = bases
-            .iter()
-            .find(|base| model_name_match(base, &name).is_some())
+        // The strict-prefix base precedes the exact name in the old sorted
+        // collision scan when both happen to match.
+        if let Some(base) = bin_base(&name)
+            .filter(|base| bases.contains(*base))
+            .or_else(|| bases.get(&name).map(String::as_str))
         {
             return Err(SpiceError::parse(
                 card.location.clone(),
@@ -637,40 +637,33 @@ impl<'a> Expander<'a> {
     }
 
     /// The root frame's models: every top-level declaration, unrenamed.
-    fn root_models(&self) -> BTreeMap<String, LocalModel> {
-        let mut map: BTreeMap<String, LocalModel> = BTreeMap::new();
-        for (order, card) in self.netlist.models.iter().enumerate() {
-            map.entry(card.name.to_ascii_lowercase())
-                .or_insert_with(|| LocalModel {
-                    name: card.name.clone(),
-                    card: card.clone(),
-                    emitted: true,
-                    order,
-                });
+    fn root_models(&self) -> DeclarationIndex<LocalModel> {
+        let mut index = DeclarationIndex::new();
+        for card in &self.netlist.models {
+            index.insert_first(&card.name, || LocalModel {
+                name: card.name.clone(),
+                pending: None,
+            });
         }
-        map
+        index
     }
 
     /// One frame's literalized models, renamed to `<path>.<name>`. They stay
     /// out of the flattened deck until a device in this frame or a descendant
     /// frame references one, so unused declarations are not invented.
-    fn local_models(cards: &[ModelCard], path: &str) -> BTreeMap<String, LocalModel> {
-        let mut map: BTreeMap<String, LocalModel> = BTreeMap::new();
-        for (order, card) in cards.iter().enumerate() {
-            let name = format!("{path}.{}", card.name);
-            let renamed = ModelCard {
-                name: name.clone(),
-                ..card.clone()
-            };
-            map.entry(card.name.to_ascii_lowercase())
-                .or_insert_with(|| LocalModel {
-                    name,
-                    card: renamed,
-                    emitted: false,
-                    order,
-                });
+    fn local_models(cards: Vec<ModelCard>, path: &str) -> DeclarationIndex<LocalModel> {
+        let mut index = DeclarationIndex::new();
+        for mut card in cards {
+            let source_name = std::mem::take(&mut card.name);
+            index.insert_first(&source_name, || {
+                card.name = format!("{path}.{source_name}");
+                LocalModel {
+                    name: card.name.clone(),
+                    pending: Some(card),
+                }
+            });
         }
-        map
+        index
     }
 
     /// Expand one scope level: top-level devices at the root, a definition's
@@ -681,7 +674,7 @@ impl<'a> Expander<'a> {
         depth: usize,
         terminals: &BTreeMap<String, String>,
         scope: &Arc<ParamScope>,
-        locals: &mut Vec<BTreeMap<String, LocalModel>>,
+        locals: &mut Vec<DeclarationIndex<LocalModel>>,
         directives: &Directives<'_>,
     ) -> SpiceResult<()> {
         let devices = directives.devices;
@@ -784,7 +777,7 @@ impl<'a> Expander<'a> {
         path: &str,
         depth: usize,
         parent: &Arc<ParamScope>,
-        locals: &mut Vec<BTreeMap<String, LocalModel>>,
+        locals: &mut Vec<DeclarationIndex<LocalModel>>,
     ) -> SpiceResult<()> {
         if depth + 1 > self.limits.max_depth {
             return Err(SpiceError::parse(
@@ -846,7 +839,7 @@ impl<'a> Expander<'a> {
         };
         let body =
             crate::netlist::elaborate::literalize_body(definition, &scope, &mut self.budget)?;
-        locals.push(Self::local_models(&body.models, &child_path));
+        locals.push(Self::local_models(body.models, &child_path));
         let result = self.expand_body(
             &child_path,
             depth + 1,
@@ -980,72 +973,52 @@ impl<'a> Expander<'a> {
     fn rewrite_model(
         &mut self,
         instance: &mut DeviceInstance,
-        locals: &mut [BTreeMap<String, LocalModel>],
+        locals: &mut [DeclarationIndex<LocalModel>],
     ) {
-        let Some(reference) = instance.model.clone() else {
+        let Some(reference) = instance.model.as_deref() else {
             return;
         };
-        let key = reference.to_ascii_lowercase();
-        for index in (0..locals.len()).rev() {
-            let Some(local) = locals[index].get(&key) else {
-                // subckt.c matches M models with model_name_match, so a frame
-                // declaring only `<name>.<digits>` bins also captures the name.
-                if instance.designator.eq_ignore_ascii_case(&'m')
-                    && self.rewrite_binned(instance, &key, &mut locals[index])
-                {
-                    return;
-                }
-                continue;
-            };
-            let name = local.name.clone();
-            let emitted = local.emitted;
-            let card = local.card.clone();
-            if !emitted {
-                self.models.push(card);
-                self.emitted_locals.insert(name.to_ascii_lowercase());
-                if let Some(slot) = locals[index].get_mut(&key) {
-                    slot.emitted = true;
-                }
+        for frame in locals.iter_mut().rev() {
+            if let Some(local) = frame.get_mut(reference) {
+                self.emit_model(local);
+                instance.model = Some(local.name.clone());
+                return;
             }
-            instance.model = Some(name);
-            return;
+            // A frame declaring only `<name>.<digits>` bins also captures
+            // MOS model names. Each group is already in declaration order.
+            if instance.designator.eq_ignore_ascii_case(&'m')
+                && let Some(base) = self.rewrite_binned(reference, frame)
+            {
+                instance.model = Some(base);
+                return;
+            }
         }
     }
 
-    /// Bind an `M` reference to one frame's `<key>.<digits>` binning set:
-    /// emit every bin of the set (declaration order) and rewrite the reference
-    /// to the set's flattened base name, leaving the choice of bin to
-    /// `ModelResolver`. `false` when the frame has no such bin.
+    fn emit_model(&mut self, local: &mut LocalModel) {
+        if let Some(card) = local.pending.take() {
+            self.emitted_locals.insert(local.name.to_ascii_lowercase());
+            self.models.push(card);
+        }
+    }
+
+    /// Bind an M reference to a frame's bin set, emitting the ordered
+    /// declarations once and leaving geometry selection to `ModelResolver`.
     fn rewrite_binned(
         &mut self,
-        instance: &mut DeviceInstance,
         key: &str,
-        frame: &mut BTreeMap<String, LocalModel>,
-    ) -> bool {
-        let mut bins: Vec<(&String, &mut LocalModel)> = frame
-            .iter_mut()
-            .filter(|(name, _)| model_name_match(key, name) == Some(NameMatch::Bin))
-            .collect();
-        bins.sort_by_key(|(_, local)| local.order);
-        let Some((first_key, first)) = bins.first() else {
-            return false;
-        };
-        // `<path>.nch.1` minus the `.1` the original `nch.1` adds to `nch`.
-        let suffix = first_key.len() - key.len();
-        let base = first.name[..first.name.len() - suffix].to_owned();
-        let renamed = !first.name.eq_ignore_ascii_case(first_key);
-        for (_, local) in &mut bins {
-            if !local.emitted {
-                self.models.push(local.card.clone());
-                self.emitted_locals.insert(local.name.to_ascii_lowercase());
-                local.emitted = true;
-            }
+        frame: &mut DeclarationIndex<LocalModel>,
+    ) -> Option<String> {
+        let (ids, entries) = frame.bin_slots_mut(key);
+        let first = &entries[*ids.first()?];
+        let base = bin_base(&first.name)?.to_owned();
+        for &id in ids {
+            self.emit_model(&mut entries[id]);
         }
-        if renamed {
+        if !base.eq_ignore_ascii_case(key) {
             self.binned_bases.insert(base.to_ascii_lowercase());
         }
-        instance.model = Some(base);
-        true
+        Some(base)
     }
 }
 

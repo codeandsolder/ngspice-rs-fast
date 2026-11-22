@@ -35,7 +35,7 @@
 
 use crate::maths::SparseMatrix;
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
-use crate::primitives::{NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 
 use crate::devices::linear::LinearContext;
 use crate::devices::traits::{ControlReference, Device, MnaUnknowns, StampContext};
@@ -588,9 +588,9 @@ fn parse_controlled_input(instance: &DeviceInstance) -> SpiceResult<ControlledIn
 }
 
 impl Topology<&str> {
-    fn bind(self, nodes: &mut NodeTable) -> SpiceResult<Topology<NodeId>> {
+    fn bind(self, nodes: &mut NodeAppend<'_>) -> SpiceResult<Topology<NodeId>> {
         fn intern<const N: usize>(
-            nodes: &mut NodeTable,
+            nodes: &mut NodeAppend<'_>,
             names: [&str; N],
         ) -> SpiceResult<[NodeId; N]> {
             let mut result = [NodeId::GROUND; N];
@@ -612,7 +612,7 @@ impl Topology<&str> {
 /// terminals in an append-only transaction only after semantic validation.
 pub(crate) fn instantiate(
     instance: &DeviceInstance,
-    nodes: &mut NodeTable,
+    nodes: &mut NodeAppend<'_>,
 ) -> SpiceResult<Box<dyn Device>> {
     let input = parse_controlled_input(instance)?;
     let terminals = input.topology.terminals();
@@ -627,7 +627,7 @@ pub(crate) fn instantiate(
         shorted,
         Some(instance.location.clone()),
     )?;
-    super::factory::append_nodes(nodes, |nodes| {
+    nodes.transaction(|nodes| {
         Ok(Box::new(ControlledSource {
             name: instance.name.clone(),
             topology: input.topology.bind(nodes)?,
@@ -684,13 +684,23 @@ mod tests {
             "title\ne1 fresh fresh newcontrol present 2\nf1 fresh 0 vs 3\ng1 fresh 0 newcontrol present 2\n.end\n"
         )).unwrap();
         let before = nodes.nodes().to_vec();
-        assert!(instantiate(&deck.devices[0], &mut nodes).is_err());
+        assert!(
+            nodes
+                .transaction(|nodes| instantiate(&deck.devices[0], nodes))
+                .is_err()
+        );
         assert_eq!(nodes.nodes(), before);
         let mut malformed = deck.devices[1].clone();
         malformed.parameters.retain(|p| p.name != "control");
-        assert!(instantiate(&malformed, &mut nodes).is_err());
+        assert!(
+            nodes
+                .transaction(|nodes| instantiate(&malformed, nodes))
+                .is_err()
+        );
         assert_eq!(nodes.nodes(), before);
-        let device = instantiate(&deck.devices[2], &mut nodes).unwrap();
+        let device = nodes
+            .transaction(|nodes| instantiate(&deck.devices[2], nodes))
+            .unwrap();
         assert_eq!(
             device.terminals(),
             &[NodeId::new(2), NodeId::GROUND, NodeId::new(3), present]

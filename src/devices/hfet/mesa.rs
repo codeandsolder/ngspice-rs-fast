@@ -58,7 +58,7 @@ use crate::devices::hfet::{Instance, Model};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{BOLTZMANN, CHARGE};
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::sweep::check_swept;
@@ -67,7 +67,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
 
 /// `mesaload.c`'s `#define EPSILONGAAS (12.244*8.85418e-12)`, the same value
 /// `mesasetup.c` defaults `MESAepsi` to. The modern `eps0`
@@ -238,7 +238,7 @@ pub(in crate::devices) struct Mesa {
 impl Mesa {
     pub(crate) fn instantiate(
         i: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         resolved: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -258,41 +258,42 @@ impl Mesa {
         let (model, model_defaults) = Model::resolve(resolved)?;
         let (initial, setters) = Instance::resolve(i)?;
         let instance = Instance::validate(&model_defaults, &setters, &i.location)?;
-        let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "MESA")?;
-        // C creates source and drain primes in this order.
-        // Gate and prime-prime nodes follow, aliasing the corresponding prime
-        // when RG, RI or RF is zero. RDI/RSI do not create nodes.
-        let sp = topology.prime(model.rs, "source", s)?;
-        let dp = topology.prime(model.rd, "drain", d)?;
-        let gp = topology.prime(model.rg, "gate", g)?;
-        let spp = topology.prime(model.ri, "gs", sp)?;
-        let dpp = topology.prime(model.rf, "gd", dp)?;
-        let nodes_of = Nodes {
-            d,
-            g,
-            s,
-            sp,
-            dp,
-            gp,
-            spp,
-            dpp,
-        };
-        let (staged, terminals) = topology.finish();
-        let device = Self {
-            name: i.name.clone(),
-            model_name: resolved.card().name.clone(),
-            level: Real::from(level),
-            terminals,
-            nodes: nodes_of,
-            model,
-            instance,
-            initial,
-            temperature_cache: TemperatureCache::new(),
-        };
-        // Validate the derivations before the device joins the circuit.
-        device.derived(context.temperature, context.nominal_temperature)?;
-        *nodes = staged;
-        Ok(Box::new(device))
+        nodes.transaction(|nodes| {
+            let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "MESA")?;
+            // C creates source and drain primes in this order.
+            // Gate and prime-prime nodes follow, aliasing the corresponding prime
+            // when RG, RI or RF is zero. RDI/RSI do not create nodes.
+            let sp = topology.prime(model.rs, "source", s)?;
+            let dp = topology.prime(model.rd, "drain", d)?;
+            let gp = topology.prime(model.rg, "gate", g)?;
+            let spp = topology.prime(model.ri, "gs", sp)?;
+            let dpp = topology.prime(model.rf, "gd", dp)?;
+            let nodes_of = Nodes {
+                d,
+                g,
+                s,
+                sp,
+                dp,
+                gp,
+                spp,
+                dpp,
+            };
+            let terminals = topology.finish();
+            let device = Self {
+                name: i.name.clone(),
+                model_name: resolved.card().name.clone(),
+                level: Real::from(level),
+                terminals,
+                nodes: nodes_of,
+                model,
+                instance,
+                initial,
+                temperature_cache: TemperatureCache::new(),
+            };
+            // Validate the derivations before the device joins the circuit.
+            device.derived(context.temperature, context.nominal_temperature)?;
+            Ok(Box::new(device) as Box<dyn Device>)
+        })
     }
 
     /// `mesatemp.c`. `temperature` and `nominal` are Celsius
@@ -1192,7 +1193,10 @@ impl Device for Mesa {
     /// (level 3) and `sens_mesa4` (level 4, including a shifted instance
     /// temperature, whose `rtc1`/`rtc2` rows exposed the channel's use of the
     /// raw `rsi` where C uses the temperature-scaled `tRsi`).
-    fn sensitivity(&self, context: &ModelContext) -> SpiceResult<Box<dyn DeviceSensitivity + '_>> {
+    fn sensitivity(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
         if !matches!(self.level, l if l == 2. || l == 3. || l == 4.) {
             return Err(SpiceError::not_yet_ported(
                 format!("{}: MESA level {} sensitivity", self.name, self.level),
@@ -1651,7 +1655,7 @@ impl<'a> MesaSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for MesaSensitivity<'_> {
+impl SensitivityKernel for MesaSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Mesa
     }
@@ -1670,7 +1674,7 @@ impl DeviceSensitivity for MesaSensitivity<'_> {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (m, i) = (&self.device.model, &self.device.instance);
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for (keyword, value, given) in [
             ("vto", m.threshold, true),
             ("lambda", m.lambda, true),
@@ -1742,9 +1746,9 @@ impl DeviceSensitivity for MesaSensitivity<'_> {
             ("cas", m.cas, true),
             ("cbs", m.cbs, true),
         ] {
-            model = model.with(keyword, value, given);
+            model = model.with(keyword, value, given)?;
         }
-        let mut instance = SensitivityRecord::new();
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
         for (keyword, value, given) in [
             ("l", i.l, true),
             ("w", i.w, true),
@@ -1763,7 +1767,7 @@ impl DeviceSensitivity for MesaSensitivity<'_> {
             ),
             ("dtemp", i.dtemp, true),
         ] {
-            instance = instance.with(keyword, value, given);
+            instance = instance.with(keyword, value, given)?;
         }
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
@@ -2001,7 +2005,7 @@ impl MesaSensitivity<'_> {
 }
 
 /// A MESA's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetMesa {
     /// Built from the reset load's records: the gate and channel

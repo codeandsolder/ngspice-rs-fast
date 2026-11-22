@@ -5,8 +5,9 @@
 //! hooks or edits a source value.
 use ngspice_rs::analysis::bias::{
     AttemptOutcome, ContinuationPolicy, ContinuationSchedule, DEFAULT_GMIN_SCHEDULE, DcOutcome,
-    DcReport, DcSettings, DcStrategy, MAX_GMIN_STAGES, MAX_SOURCE_STEPS, MAX_TOTAL_ITERATIONS,
-    NgspiceStepping, SourceStepping, solve_dc, solve_dc_with,
+    DcReport, DcSettings, DcStrategy, GminSchedule, IterationBudget, IterationLimit,
+    MAX_GMIN_STAGES, MAX_SOURCE_STEPS, MAX_TOTAL_ITERATIONS, NgspiceStepping, SourceStepping,
+    Stepping, solve_dc, solve_dc_with,
 };
 use ngspice_rs::analysis::newton::{NewtonOptions, StepLimiting};
 use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, RunConfig, runner};
@@ -74,6 +75,23 @@ fn settings(newton: NewtonOptions, continuation: ContinuationPolicy) -> DcSettin
         continuation,
     }
 }
+fn custom_ladder(gmin: Vec<f64>, source: Option<SourceStepping>) -> ContinuationPolicy {
+    ContinuationPolicy {
+        schedule: ContinuationSchedule::Ladder {
+            gmin: GminSchedule::new(gmin).unwrap(),
+            source,
+        },
+        ..ContinuationPolicy::disabled()
+    }
+}
+
+fn ladder_parts(policy: &ContinuationPolicy) -> (&[f64], Option<&SourceStepping>) {
+    let ContinuationSchedule::Ladder { gmin, source } = &policy.schedule else {
+        panic!("expected custom ladder");
+    };
+    (gmin.as_slice(), source.as_ref())
+}
+
 fn attempts(report: &DcReport) -> Vec<(DcStrategy, AttemptOutcome)> {
     report
         .attempts
@@ -239,7 +257,7 @@ fn structural_device_errors_are_not_retried_by_continuation() {
         panic!("the default policy is ngspice's CKTop schedule");
     };
     assert!(
-        stepping.gmin_steps > 0 && stepping.source_steps > 0,
+        stepping.gmin != Stepping::Disabled && stepping.source != Stepping::Disabled,
         "this test only proves skipping when the default policy would otherwise continue"
     );
 }
@@ -333,10 +351,7 @@ fn difficult_diode_fails_bounded_direct_newton_but_the_configured_policy_solves_
     assert!(message.contains("iteration limit"), "{message}");
 
     // The gmin schedule alone cannot rescue it within the same iteration budget.
-    let gmin_only = ContinuationPolicy {
-        source_stepping: None,
-        ..ContinuationPolicy::ladder()
-    };
+    let gmin_only = custom_ladder(DEFAULT_GMIN_SCHEDULE.to_vec(), None);
     let failure = run(gmin_only).unwrap_err();
     assert_eq!(failure.report.outcome, DcOutcome::Exhausted);
     assert_eq!(failure.report.stages.len(), 2);
@@ -354,13 +369,7 @@ fn difficult_diode_fails_bounded_direct_newton_but_the_configured_policy_solves_
     );
 
     // Configured source stepping (no gmin stepping) succeeds in the same budget.
-    let source_only = ContinuationPolicy {
-        gmin_schedule: Vec::new(),
-        source_stepping: Some(SourceStepping::uniform(20, 1e-8).unwrap()),
-        max_total_iterations: None,
-        stage_max_iterations: None,
-        ..ContinuationPolicy::disabled()
-    };
+    let source_only = custom_ladder(Vec::new(), Some(SourceStepping::uniform(20, 1e-8).unwrap()));
     let solved = run(source_only).unwrap();
     let report = &solved.report;
     assert_eq!(
@@ -423,10 +432,7 @@ fn configured_gmin_schedule_rescues_a_singular_jacobian_without_source_stepping(
     let accepted = Rc::new(Cell::new(0));
     let c = cubic(&accepted);
     let context = ModelContext::default();
-    let gmin_only = ContinuationPolicy {
-        source_stepping: None,
-        ..ContinuationPolicy::ladder()
-    };
+    let gmin_only = custom_ladder(DEFAULT_GMIN_SCHEDULE.to_vec(), None);
     let solved = solve_dc_with(
         &c,
         &context,
@@ -455,13 +461,7 @@ fn configured_gmin_schedule_rescues_a_singular_jacobian_without_source_stepping(
     assert_original_equations_solved(&solved.report);
 
     // A custom, shorter schedule is honoured exactly.
-    let custom = ContinuationPolicy {
-        gmin_schedule: vec![1e-2, 1e-6],
-        source_stepping: None,
-        max_total_iterations: None,
-        stage_max_iterations: None,
-        ..ContinuationPolicy::disabled()
-    };
+    let custom = custom_ladder(vec![1e-2, 1e-6], None);
     let solved = solve_dc_with(
         &c,
         &context,
@@ -498,7 +498,7 @@ fn exhausted_schedules_and_total_budget_are_bounded_and_reported() {
     // NIiter makes before failing) plus two more: the gmin stage is cut
     // short, the attempt stops and nothing further runs.
     let policy = ContinuationPolicy {
-        max_total_iterations: Some(7),
+        max_total_iterations: Some(IterationBudget::new(7).unwrap()),
         ..ContinuationPolicy::ladder()
     };
     let failure =
@@ -517,7 +517,7 @@ fn exhausted_schedules_and_total_budget_are_bounded_and_reported() {
 
     // A one-iteration budget leaves nothing for continuation.
     let policy = ContinuationPolicy {
-        max_total_iterations: Some(1),
+        max_total_iterations: Some(IterationBudget::new(1).unwrap()),
         ..ContinuationPolicy::ladder()
     };
     let failure =
@@ -562,36 +562,26 @@ fn default_budget_distinguishes_direct_and_continuation_iteration_limits() {
         // One direct solve, two gmin stages plus their direct-limit
         // closing solve, three source stages plus a stage-limit closing solve.
         (
-            ContinuationPolicy {
-                gmin_schedule: vec![1e-6, 1e-9],
-                source_stepping: Some(SourceStepping {
-                    scales: vec![0., 0.5, 1.],
-                    gmin: 1e-8,
-                }),
-                ..ContinuationPolicy::disabled()
-            },
+            custom_ladder(
+                vec![1e-6, 1e-9],
+                Some(SourceStepping::new(vec![0., 0.5, 1.], 1e-8).unwrap()),
+            ),
             2,
             6,
         ),
         (
             ContinuationPolicy {
                 skip_direct: true,
-                gmin_schedule: vec![1e-6, 1e-9],
-                source_stepping: Some(SourceStepping {
-                    scales: vec![0., 0.5, 1.],
-                    gmin: 1e-8,
-                }),
-                ..ContinuationPolicy::disabled()
+                ..custom_ladder(
+                    vec![1e-6, 1e-9],
+                    Some(SourceStepping::new(vec![0., 0.5, 1.], 1e-8).unwrap()),
+                )
             },
             1,
             6,
         ),
         (
-            ContinuationPolicy::ngspice(NgspiceStepping {
-                gmin_steps: 2,
-                source_steps: 3,
-                ..NgspiceStepping::default()
-            }),
+            ContinuationPolicy::ngspice(NgspiceStepping::new(2, 3, 10., 50).unwrap()),
             2,
             3 + 4,
         ),
@@ -606,7 +596,7 @@ fn default_budget_distinguishes_direct_and_continuation_iteration_limits() {
         (ContinuationPolicy::disabled(), 1, 0),
     ];
     for (mut policy, direct_count, stage_count) in cases {
-        policy.stage_max_iterations = Some(stage_limit);
+        policy.stage_max_iterations = Some(IterationLimit::new(stage_limit).unwrap());
         let expected = direct_count * (direct_limit + 1) + stage_count * (stage_limit + 1);
         let settings = settings(
             NewtonOptions {
@@ -622,7 +612,7 @@ fn default_budget_distinguishes_direct_and_continuation_iteration_limits() {
 }
 
 #[test]
-fn invalid_schedules_scales_and_budgets_are_rejected_before_any_load() {
+fn invalid_schedules_scales_and_budgets_cannot_be_constructed() {
     let c = circuit(DIFFICULT);
     let context = ModelContext::default();
     let bad_gmin: [Vec<f64>; 8] = [
@@ -635,20 +625,9 @@ fn invalid_schedules_scales_and_budgets_are_rejected_before_any_load() {
         vec![1e-6, 1e-3],
         vec![1e-3; MAX_GMIN_STAGES + 1],
     ];
-    let mut policies: Vec<ContinuationPolicy> = bad_gmin
-        .into_iter()
-        .map(|gmin_schedule| ContinuationPolicy {
-            gmin_schedule,
-            ..ContinuationPolicy::ladder()
-        })
-        .collect();
-    let scales = |scales: &[f64], gmin: f64| ContinuationPolicy {
-        source_stepping: Some(SourceStepping {
-            scales: scales.to_vec(),
-            gmin,
-        }),
-        ..ContinuationPolicy::ladder()
-    };
+    for bad in bad_gmin {
+        assert!(GminSchedule::new(bad).is_err());
+    }
     let bad_scales: [&[f64]; 7] = [
         &[],
         &[f64::NAN],
@@ -659,27 +638,16 @@ fn invalid_schedules_scales_and_budgets_are_rejected_before_any_load() {
         &[0.5, 0.25],
     ];
     for bad in bad_scales {
-        policies.push(scales(bad, 1e-8));
+        assert!(SourceStepping::new(bad.to_vec(), 1e-8).is_err());
     }
     for gmin in [f64::NAN, -1e-8, 2.] {
-        policies.push(scales(&[0., 1.], gmin));
+        assert!(SourceStepping::new(vec![0., 1.], gmin).is_err());
     }
     for total in [0, MAX_TOTAL_ITERATIONS + 1] {
-        policies.push(ContinuationPolicy {
-            max_total_iterations: Some(total),
-            ..ContinuationPolicy::ladder()
-        });
+        assert!(IterationBudget::new(total).is_err());
     }
-    for (index, policy) in policies.into_iter().enumerate() {
-        assert!(policy.validate().is_err(), "policy {index}");
-        let failure =
-            solve_dc_with(&c, &context, &settings(bounded(), policy), &[], None, None).unwrap_err();
-        assert_eq!(
-            failure.report.outcome,
-            DcOutcome::Rejected,
-            "policy {index}"
-        );
-        assert!(failure.report.stages.is_empty() && failure.report.attempts.is_empty());
+    for stage in [0, ngspice_rs::analysis::newton::MAX_ITERATIONS + 1] {
+        assert!(IterationLimit::new(stage).is_err());
     }
     assert!(SourceStepping::uniform(0, 1e-8).is_err());
     assert!(SourceStepping::uniform(MAX_SOURCE_STEPS + 1, 1e-8).is_err());
@@ -711,12 +679,12 @@ fn invalid_schedules_scales_and_budgets_are_rejected_before_any_load() {
 #[test]
 fn ladder_policy_is_the_historical_schedule_and_geometric_builders_are_exact() {
     let default = ContinuationPolicy::ladder();
-    assert_eq!(default.schedule, ContinuationSchedule::Ladder);
-    assert_eq!(default.gmin_schedule, DEFAULT_GMIN_SCHEDULE);
-    let source = default.source_stepping.as_ref().unwrap();
-    assert_eq!(source.gmin, 1e-8);
+    let (gmin, source) = ladder_parts(&default);
+    assert_eq!(gmin, DEFAULT_GMIN_SCHEDULE);
+    let source = source.unwrap();
+    assert_eq!(source.gmin(), 1e-8);
     assert_eq!(
-        source.scales,
+        source.scales(),
         (0..=20).map(|k| f64::from(k) / 20.).collect::<Vec<_>>()
     );
     assert_eq!(default.max_total_iterations, None);
@@ -729,21 +697,23 @@ fn ladder_policy_is_the_historical_schedule_and_geometric_builders_are_exact() {
         default
     );
     assert_eq!(
-        ContinuationPolicy::geometric_gmin(1e-3, 2., 3).unwrap(),
+        ContinuationPolicy::geometric_gmin(1e-3, 2., 3)
+            .unwrap()
+            .as_slice(),
         [1e-3, 1e-3 / 2., 1e-3 / 4.]
     );
     let none = ContinuationPolicy::from_steps(Some(0), Some(0), None).unwrap();
     assert_eq!(none, ContinuationPolicy::disabled());
     let four = ContinuationPolicy::from_steps(Some(4), Some(3), None).unwrap();
-    assert_eq!(four.gmin_schedule, DEFAULT_GMIN_SCHEDULE[..3].to_vec());
+    assert_eq!(ladder_parts(&four).0, &DEFAULT_GMIN_SCHEDULE[..3]);
     assert_eq!(
-        four.source_stepping.unwrap().scales,
+        ladder_parts(&four).1.unwrap().scales(),
         [0., 0.25, 0.5, 0.75, 1.]
     );
     // A factor alone rebuilds the default number of stages.
     let wide = ContinuationPolicy::from_steps(None, None, Some(100.)).unwrap();
-    assert_eq!(wide.gmin_schedule.len(), 10);
-    close(wide.gmin_schedule[1], 1e-5, 1e-14, 0.);
+    assert_eq!(ladder_parts(&wide).0.len(), 10);
+    close(ladder_parts(&wide).0[1], 1e-5, 1e-14, 0.);
 }
 
 #[test]
@@ -891,9 +861,7 @@ fn easy_nonlinear_and_linear_solves_stay_direct_and_exact() {
     // A linear circuit is solved by the same NIiter (three passes), so a
     // total budget of one stops it and one of four solves it.
     let budget = |total| ContinuationPolicy {
-        gmin_schedule: Vec::new(),
-        source_stepping: None,
-        max_total_iterations: Some(total),
+        max_total_iterations: Some(IterationBudget::new(total).unwrap()),
         stage_max_iterations: None,
         ..ContinuationPolicy::disabled()
     };
@@ -1040,25 +1008,24 @@ fn request(arguments: &[&str]) -> AnalysisRequest {
 
 #[test]
 fn ngspice_maximum_gmin_steps_include_both_ladder_endpoints() {
-    let stepping = NgspiceStepping {
-        gmin_steps: MAX_GMIN_STAGES,
-        gmin_factor: 1.01,
-        ..NgspiceStepping::default()
-    };
-    stepping.validate().unwrap();
-    let ladder = stepping.spice3_ladder(1e-12).unwrap();
+    let stepping = NgspiceStepping::new(MAX_GMIN_STAGES, 1, 1.01, 50).unwrap();
+    let ladder = stepping.fixed_gmin_ladder(1e-12).unwrap().unwrap();
     assert_eq!(ladder.len(), MAX_GMIN_STAGES + 1);
     assert!(ladder.windows(2).all(|pair| pair[0] > pair[1]));
     close(ladder[0], 1e-12 * 1.01_f64.powi(100), 1e-12, 0.);
     close(*ladder.last().unwrap(), 1e-12, 1e-12, 0.);
 
-    // This public method may be invoked before ContinuationPolicy::validate.
-    // Reject an impossible count before looping or adding one to its length.
-    let bad = NgspiceStepping {
-        gmin_steps: usize::MAX,
-        ..stepping
-    };
-    assert!(bad.spice3_ladder(1e-12).is_err());
+    // Out-of-range counts cannot reach the execution planner.
+    assert!(NgspiceStepping::new(usize::MAX, 1, 1.01, 50).is_err());
+    assert!(NgspiceStepping::new(1, MAX_SOURCE_STEPS + 1, 1.01, 50).is_err());
+    assert!(NgspiceStepping::new(1, 1, 1., 50).is_err());
+    assert!(NgspiceStepping::new(1, 1, 10., 0).is_err());
+    assert!(
+        NgspiceStepping::default()
+            .fixed_gmin_ladder(1e-12)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1074,19 +1041,12 @@ fn request_arguments_resolve_and_invalid_ones_fail() {
     .unwrap();
     assert_eq!(resolved.newton.max_iterations, 4);
     assert_eq!(resolved.newton.reltol, 1e-6);
-    assert_eq!(resolved.continuation.gmin_schedule.len(), 3);
-    for (got, want) in resolved
-        .continuation
-        .gmin_schedule
-        .iter()
-        .zip([1e-3, 1e-5, 1e-7])
-    {
+    let (gmin, source) = ladder_parts(&resolved.continuation);
+    assert_eq!(gmin.len(), 3);
+    for (got, want) in gmin.iter().zip([1e-3, 1e-5, 1e-7]) {
         close(*got, want, 1e-14, 0.);
     }
-    assert_eq!(
-        resolved.continuation.source_stepping.unwrap().scales,
-        [0., 0.2, 0.4, 0.6, 0.8, 1.]
-    );
+    assert_eq!(source.unwrap().scales(), [0., 0.2, 0.4, 0.6, 0.8, 1.]);
     let off = DcSettings::from_request(&request(&[
         "srcsteps=0",
         "gminsteps=0",
@@ -1105,15 +1065,9 @@ fn request_arguments_resolve_and_invalid_ones_fail() {
     .unwrap();
     assert_eq!(
         ngspice.continuation.schedule,
-        ContinuationSchedule::Ngspice(NgspiceStepping {
-            gmin_steps: 3,
-            source_steps: 0,
-            gmin_factor: 100.,
-            adapt_iterations: 60,
-        })
+        ContinuationSchedule::Ngspice(NgspiceStepping::new(3, 0, 100., 60).unwrap())
     );
     assert!(ngspice.continuation.skip_direct);
-    assert!(ngspice.continuation.gmin_schedule.is_empty());
     assert_eq!(
         DcSettings::from_request(&request(&[])).unwrap(),
         DcSettings::default()
@@ -1405,4 +1359,79 @@ fn ac_bias_uses_the_configured_continuation() {
         ])
         .is_err()
     );
+}
+
+#[test]
+fn typed_fixed_source_and_custom_ladder_close_at_their_own_stage_limit() {
+    let c = circuit("v1 a 0 1\nr1 a 0 1k");
+    let context = ModelContext::default();
+    for (schedule, expected_scales, gmin) in [
+        (
+            ContinuationPolicy::from_ngspice_steps(Some(4), Some(0), None, None).unwrap(),
+            vec![0., 0.25, 0.5, 0.75, 1.],
+            0.,
+        ),
+        (
+            custom_ladder(Vec::new(), Some(SourceStepping::uniform(4, 1e-8).unwrap())),
+            vec![0., 0.25, 0.5, 0.75, 1., 1.],
+            1e-8,
+        ),
+    ] {
+        let continuation = ContinuationPolicy {
+            skip_direct: true,
+            stage_max_iterations: Some(IterationLimit::new(10).unwrap()),
+            ..schedule
+        };
+        let settings = settings(
+            NewtonOptions {
+                max_iterations: 1,
+                ..NewtonOptions::default()
+            },
+            continuation,
+        );
+        let solved = solve_dc_with(&c, &context, &settings, &[], None, None).unwrap();
+        let report = &solved.report;
+        assert_eq!(
+            attempts(report),
+            [
+                (DcStrategy::Direct, AttemptOutcome::Disabled),
+                (DcStrategy::GminStepping, AttemptOutcome::Disabled),
+                (DcStrategy::SourceStepping, AttemptOutcome::Converged),
+            ]
+        );
+        assert_eq!(report.budget, expected_scales.len() * 11);
+        assert_eq!(
+            report
+                .stages
+                .iter()
+                .map(|s| s.source_scale)
+                .collect::<Vec<_>>(),
+            expected_scales
+        );
+        let (closing, warmup) = report.stages.split_last().unwrap();
+        assert!(warmup.iter().all(|s| s.gmin == gmin));
+        assert!(closing.is_unregularized());
+        assert_original_equations_solved(report);
+        close(solved.solution.values.as_slice()[0], 1., 1e-12, 1e-15);
+    }
+}
+
+#[test]
+fn c_step_encoding_is_decoded_once_into_bounded_modes() {
+    assert_eq!(
+        Stepping::<MAX_GMIN_STAGES>::from_count(0).unwrap(),
+        Stepping::Disabled
+    );
+    assert_eq!(
+        Stepping::<MAX_GMIN_STAGES>::from_count(1).unwrap(),
+        Stepping::Adaptive
+    );
+    for count in [2, MAX_GMIN_STAGES] {
+        let Stepping::Fixed(steps) = Stepping::<MAX_GMIN_STAGES>::from_count(count).unwrap() else {
+            panic!("fixed count");
+        };
+        assert_eq!(steps.get(), count);
+    }
+    assert!(Stepping::<MAX_GMIN_STAGES>::from_count(MAX_GMIN_STAGES + 1).is_err());
+    assert!(ngspice_rs::analysis::bias::FixedSteps::<MAX_GMIN_STAGES>::new(1).is_err());
 }

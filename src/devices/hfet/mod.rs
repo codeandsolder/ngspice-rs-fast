@@ -51,28 +51,27 @@ use crate::devices::schema::{
 use crate::devices::sensitivity::{ParameterScope, RecordPair, SensitivityRecord};
 use crate::devices::{LinearContext, ModelFamily, ResolvedModel};
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
 /// Staged node setup common to the three MESA/HFET levels.
-/// The caller publishes the table only after temperature derivation succeeds.
-struct NodeSetup<'a> {
-    staged: NodeTable,
+/// The caller commits the transaction only after temperature derivation succeeds.
+struct NodeSetup<'a, 'table> {
+    staged: &'a mut NodeAppend<'table>,
     terminals: Vec<NodeId>,
     name: &'a str,
     family: &'static str,
 }
 
-impl<'a> NodeSetup<'a> {
+impl<'a, 'table> NodeSetup<'a, 'table> {
     fn new(
-        nodes: &NodeTable,
+        nodes: &'a mut NodeAppend<'table>,
         instance: &'a DeviceInstance,
         family: &'static str,
     ) -> SpiceResult<(Self, [NodeId; 3])> {
-        let mut staged = nodes.clone();
-        let external = staged.intern_array(&instance.nodes)?;
+        let external = nodes.intern_array(&instance.nodes)?;
         Ok((
             Self {
-                staged,
+                staged: nodes,
                 terminals: external.to_vec(),
                 name: &instance.name,
                 family,
@@ -94,13 +93,13 @@ impl<'a> NodeSetup<'a> {
             )));
         }
         let internal = self.staged.intern(&name)?;
-        self.staged.set_kind(internal, NodeKind::Internal);
+        self.staged.set_kind(internal, NodeKind::Internal)?;
         self.terminals.push(internal);
         Ok(internal)
     }
 
-    fn finish(self) -> (NodeTable, Vec<NodeId>) {
-        (self.staged, self.terminals)
+    fn finish(self) -> Vec<NodeId> {
+        self.terminals
     }
 }
 
@@ -240,28 +239,29 @@ impl HfetInstance {
 
     fn sensitivity_record(
         &self,
+        family: crate::devices::sensitivity::SensitivityFamily,
         initial: &InstanceInitial,
         circuit_kelvin: Real,
-    ) -> SensitivityRecord {
-        SensitivityRecord::new()
-            .with("l", self.l, true)
-            .with("w", self.w, true)
-            .with("m", self.m, true)
+    ) -> SpiceResult<SensitivityRecord> {
+        SensitivityRecord::new(family, ParameterScope::Instance)
+            .with("l", self.l, true)?
+            .with("w", self.w, true)?
+            .with("m", self.m, true)?
             .with(
                 "icvds",
                 initial.values[0].unwrap_or(0.),
                 initial.values[0].is_some(),
-            )
+            )?
             .with(
                 "icvgs",
                 initial.values[1].unwrap_or(0.),
                 initial.values[1].is_some(),
-            )
+            )?
             .with(
                 "temp",
                 self.temperature_at_kelvin(circuit_kelvin),
                 self.temp.is_some(),
-            )
+            )?
             .with("dtemp", self.dtemp, true)
     }
 
@@ -705,6 +705,7 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::NodeTable;
 
     #[test]
     fn borrowed_reset_stamps_match_owned_assembly_and_validate_before_mutation() {
@@ -811,12 +812,21 @@ mod tests {
             off: false,
             values: vec![Some(0.5), None],
         };
-        let mut record = instance.sensitivity_record(&initial, 300.15);
+        let mut record = instance
+            .sensitivity_record(
+                crate::devices::sensitivity::SensitivityFamily::Hfet1,
+                &initial,
+                300.15,
+            )
+            .unwrap();
         assert!(!record.given("temp"));
         assert!(record.given("icvds"));
         assert!(!record.given("icvgs"));
         assert!(HfetInstance::from_record(&record).unwrap().temp.is_none());
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(
+            crate::devices::sensitivity::SensitivityFamily::Hfet1,
+            ParameterScope::Model,
+        );
         set_hfet(
             ParameterScope::Instance,
             "temp",
@@ -912,7 +922,7 @@ mod tests {
 
         type Instantiate = fn(
             &DeviceInstance,
-            &mut NodeTable,
+            &mut NodeAppend<'_>,
             &ResolvedModel<'_>,
             &ModelContext,
         ) -> SpiceResult<Box<dyn Device>>;
@@ -931,12 +941,14 @@ mod tests {
             let mut nodes = NodeTable::new();
             let existing = nodes.intern("existing").unwrap();
             let count = nodes.len();
-            let Err(error) = instantiate(
-                instance,
-                &mut nodes,
-                &resolved,
-                &ModelContext::new(-CELSIUS_TO_KELVIN, 27.),
-            ) else {
+            let Err(error) = nodes.transaction(|nodes| {
+                instantiate(
+                    instance,
+                    nodes,
+                    &resolved,
+                    &ModelContext::new(-CELSIUS_TO_KELVIN, 27.),
+                )
+            }) else {
                 panic!("invalid temperature accepted for level {level}");
             };
             assert!(
@@ -947,13 +959,11 @@ mod tests {
             assert_eq!(nodes.get("existing"), Some(existing));
             assert_eq!(nodes.get("drain"), None);
             assert_eq!(nodes.get("z1#source"), None);
-            let device = instantiate(
-                instance,
-                &mut nodes,
-                &resolved,
-                &ModelContext::new(27., 27.),
-            )
-            .unwrap();
+            let device = nodes
+                .transaction(|nodes| {
+                    instantiate(instance, nodes, &resolved, &ModelContext::new(27., 27.))
+                })
+                .unwrap();
             assert_eq!(device.terminals().len(), 5);
             assert_eq!(device.terminals()[3], nodes.get("z1#source").unwrap());
             assert_eq!(device.terminals()[4], nodes.get("z1#drain").unwrap());

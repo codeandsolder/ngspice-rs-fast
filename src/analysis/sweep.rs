@@ -658,7 +658,7 @@ fn warm_start_settings(
         crate::analysis::bias::ContinuationSchedule::Ngspice(_) => {
             Some(crate::analysis::config::C_DEFAULT_ITL2_EFFECTIVE)
         }
-        crate::analysis::bias::ContinuationSchedule::Ladder => None,
+        crate::analysis::bias::ContinuationSchedule::Ladder { .. } => None,
     });
     // The direct warm-start policy is invariant across sweep points. Build it
     // once; only the previous accepted solution and model overrides change.

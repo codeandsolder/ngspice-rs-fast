@@ -515,6 +515,103 @@ fn current_references_insert_measurement_sources_like_inp_meas_current() {
 }
 
 #[test]
+fn malformed_nonlinear_shapes_are_rejected_by_both_writer_and_lowering() {
+    let table = parse("g1 out 0 table {v(a)} = (0,1) (2,3) m=4");
+    let mut malformed = Vec::new();
+
+    let mut duplicate_x = table.clone();
+    let extra = duplicate_x.devices[0].parameters[1].clone();
+    duplicate_x.devices[0].parameters.insert(2, extra);
+    malformed.push(duplicate_x);
+
+    let mut duplicate_input = table.clone();
+    let extra = duplicate_input.devices[0].parameters[0].clone();
+    duplicate_input.devices[0].parameters.insert(1, extra);
+    malformed.push(duplicate_input);
+
+    let mut misplaced_point = table.clone();
+    misplaced_point.devices[0].parameters.swap(4, 5);
+    malformed.push(misplaced_point);
+
+    let mut bad_singleton = parse("e1 out 0 table {v(a)} = (0,3)");
+    bad_singleton.devices[0].parameters[0].kind = ParameterKind::Flag;
+    malformed.push(bad_singleton);
+
+    let mut bad_y = parse("e1 out 0 table {v(a)} = (0,3)");
+    bad_y.devices[0].parameters[2].kind = ParameterKind::Instance;
+    malformed.push(bad_y);
+
+    let mut bad_poly = parse("f1 out 0 poly(2) va vb 1 2 3 m=4");
+    bad_poly.devices[0].parameters[1].kind = ParameterKind::Scalar;
+    malformed.push(bad_poly);
+
+    let mut bad_dimension = parse("e1 out 0 poly(1) in 0 1 2");
+    bad_dimension.devices[0].parameters[0].kind = ParameterKind::Flag;
+    malformed.push(bad_dimension);
+
+    let mut duplicate_form = parse("e1 out 0 value={v(a)} m=2");
+    let extra = duplicate_form.devices[0].parameters[0].clone();
+    duplicate_form.devices[0].parameters.push(extra);
+    malformed.push(duplicate_form);
+
+    let mut misplaced_form = parse("e1 out 0 value={v(a)} m=2");
+    misplaced_form.devices[0].parameters.swap(0, 1);
+    malformed.push(misplaced_form);
+
+    let mut bad_value = parse("e1 out 0 value={v(a)}");
+    bad_value.devices[0].parameters[0].kind = ParameterKind::Scalar;
+    malformed.push(bad_value);
+
+    let mut four_node_g = parse("e1 out 0 in 0 table=(0,1,2,3)");
+    four_node_g.devices[0].name = "g1".into();
+    four_node_g.devices[0].designator = 'g';
+    malformed.push(four_node_g);
+
+    for deck in malformed {
+        let err = lower_nonlinear_sources(&deck).expect_err("accepted malformed nonlinear source");
+        assert!(matches!(err, SpiceError::Parse { .. }), "{err}");
+        assert!(write_netlist(&deck).is_err());
+    }
+}
+
+#[test]
+fn repeated_duplicate_targets_advance_serial_without_reinsertion() {
+    let deck = lowered(
+        "r1 a 0 1k\nr1 b 0 2k\nb1 out 0 v=i(r1)+i(r1)\n\
+         e1 e 0 value={i(r1)}\nb2 z 0 v=i(e1)\nr2 c 0 3k\nb3 out2 0 v=i(r2)",
+    );
+    let lines = summary(&deck);
+    assert_eq!(lines[0], "r1 a_vmeas_0 0 [resistance=1k]");
+    assert_eq!(lines[1], "v_r1 a a_vmeas_0 [dc=0]");
+    assert_eq!(lines[2], "r1 b_vmeas_1 0 [resistance=2k]");
+    assert_eq!(
+        expression(&deck.devices[3], "v").root.current_references(),
+        ["v_r1", "v_r1"]
+    );
+    // Lowering a measured nonlinear E must put its own expansion before
+    // the sense source, with the same measured first terminal.
+    assert_eq!(lines[4], "e1 e_vmeas_6 0 e1_int1 0 [gain=1]");
+    assert_eq!(lines[5], "be1 e1_int1 0 [v={i(r1)}]");
+    assert_eq!(lines[6], "v_e1 e e_vmeas_6 [dc=0]");
+    assert_eq!(lines[8], "r2 c_vmeas_7 0 [resistance=3k]");
+    assert_eq!(lines[9], "v_r2 c c_vmeas_7 [dc=0]");
+}
+
+#[test]
+fn generated_instance_names_do_not_silently_overwrite_existing_devices() {
+    let input = parse("r1 a 0 1k\nv_r1 a 0 0\nb1 out 0 v=i(r1)");
+    let lowered = lower_nonlinear_sources(&input).unwrap();
+    assert_eq!(
+        lowered.devices.iter().filter(|d| d.name == "v_r1").count(),
+        2
+    );
+    let Err(err) = ngspice_rs::devices::Circuit::from_netlist(&input) else {
+        panic!("generated device name collision");
+    };
+    assert!(err.to_string().contains("duplicate instance name"), "{err}");
+}
+
+#[test]
 fn behavioural_expression_and_setters_use_separate_physical_and_logical_offsets() {
     let device = device("  B1 out 0 v=2*\n* comment\n  + v(in) m=3");
     let expr = expression(&device, "v");
@@ -524,4 +621,19 @@ fn behavioural_expression_and_setters_use_separate_physical_and_logical_offsets(
     assert_eq!(expr.span.len(), expr.text.len());
     let setter = &device.parameters[1].location;
     assert_eq!((setter.line, setter.column), (4, 11));
+}
+
+#[test]
+fn folded_current_references_use_logical_offsets_for_the_c_rewrite() {
+    let netlist =
+        lowered("r1 a 0 1k\nr2 b 0 1k\nb1 out 0 v=max(1,\n* comment\n    + i(r1)) +\n + i(r2)");
+    // The first reference follows a comma inside a call and remains unchanged.
+    // The second follows an arithmetic operator and inserts a sense source.
+    assert!(!netlist.devices.iter().any(|d| d.name == "v_r1"));
+    assert!(netlist.devices.iter().any(|d| d.name == "v_r2"));
+    let source = netlist.devices.iter().find(|d| d.name == "b1").unwrap();
+    assert_eq!(
+        expression(source, "v").root.current_references(),
+        ["r1", "v_r2"]
+    );
 }

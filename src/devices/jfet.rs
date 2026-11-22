@@ -73,8 +73,8 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, RecordPair, SensitivityFamily, SensitivityLoad, SensitivityMode,
-    SensitivityParameter, SensitivityRecord,
+    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
+    SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
     AnalysisMode, Device, DeviceState, IterationPhase, LinearContext, ModelContext, ModelFamily,
@@ -82,7 +82,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind};
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
 pub(super) use crate::devices::nonlinear::thermal::{
     BOLTZMANN, CELSIUS_TO_KELVIN, CHARGE, K_OVER_Q, REFTEMP,
@@ -383,7 +383,7 @@ pub struct Jfet {
 impl Jfet {
     pub(crate) fn instantiate(
         i: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         resolved: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -743,34 +743,34 @@ pub(super) fn instance_setters(
 /// first): returns the terminal list and the intrinsic d', g, s'.
 pub(super) fn intern_nodes(
     i: &DeviceInstance,
-    nodes: &mut NodeTable,
+    nodes: &mut NodeAppend<'_>,
     rd: Real,
     rs: Real,
 ) -> SpiceResult<(Vec<NodeId>, [NodeId; 3])> {
-    let mut staged = nodes.clone();
-    let external: Vec<NodeId> = i
-        .nodes
-        .iter()
-        .map(|n| staged.intern(n))
-        .collect::<SpiceResult<Vec<_>>>()?;
-    let mut terminals = external.clone();
-    let mut inner = [external[0], external[1], external[2]];
-    for (index, resistance, suffix) in [(2, rs, "source"), (0, rd, "drain")] {
-        if resistance != 0. {
-            let name = format!("{}#{suffix}", i.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "JFET internal-node name collision: {name}"
-                )));
+    nodes.transaction(|staged| {
+        let external: Vec<NodeId> = i
+            .nodes
+            .iter()
+            .map(|n| staged.intern(n))
+            .collect::<SpiceResult<Vec<_>>>()?;
+        let mut terminals = external.clone();
+        let mut inner = [external[0], external[1], external[2]];
+        for (index, resistance, suffix) in [(2, rs, "source"), (0, rd, "drain")] {
+            if resistance != 0. {
+                let name = format!("{}#{suffix}", i.name);
+                if staged.get(&name).is_some() {
+                    return Err(SpiceError::circuit(format!(
+                        "JFET internal-node name collision: {name}"
+                    )));
+                }
+                let prime = staged.intern(&name)?;
+                staged.set_kind(prime, NodeKind::Internal)?;
+                terminals.push(prime);
+                inner[index] = prime;
             }
-            let prime = staged.intern(&name)?;
-            staged.set_kind(prime, NodeKind::Internal);
-            terminals.push(prime);
-            inner[index] = prime;
         }
-    }
-    *nodes = staged;
-    Ok((terminals, inner))
+        Ok((terminals, inner))
+    })
 }
 
 /// The model's nominal and the instance's temperature in Kelvin: `TNOM`
@@ -1365,7 +1365,10 @@ impl Device for Jfet {
         instance_parameter(keyword)
     }
     /// `jfet.c`'s `IFparm` tables under C's `sgen` walk (#164).
-    fn sensitivity(&self, context: &ModelContext) -> SpiceResult<Box<dyn DeviceSensitivity + '_>> {
+    fn sensitivity(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
         Ok(Box::new(JfetSensitivity::new(self, context)))
     }
     /// `JFETparam` then `JFETtemp`, with the instance schema domains.
@@ -1610,7 +1613,7 @@ impl<'a> JfetSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for JfetSensitivity<'_> {
+impl SensitivityKernel for JfetSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Jfet
     }
@@ -1629,7 +1632,7 @@ impl DeviceSensitivity for JfetSensitivity<'_> {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (m, i) = (&self.device.model, &self.device.instance);
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for keyword in SENSITIVITY_MODEL_FIELDS {
             // `tnom` is celsius in the port and kelvin in C, like the diode.
             let (value, given) = match *keyword {
@@ -1666,9 +1669,9 @@ impl DeviceSensitivity for JfetSensitivity<'_> {
                     true,
                 ),
             };
-            model = model.with(keyword, value, given);
+            model = model.with(keyword, value, given)?;
         }
-        let mut instance = SensitivityRecord::new();
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
         for keyword in SENSITIVITY_INSTANCE_FIELDS {
             let (value, given) = match *keyword {
                 "area" => (i.area, true),
@@ -1682,7 +1685,7 @@ impl DeviceSensitivity for JfetSensitivity<'_> {
                 "ic-vds" => (self.device.initial.values[0].unwrap_or(0.), true),
                 _ => (self.device.initial.values[1].unwrap_or(0.), true),
             };
-            instance = instance.with(keyword, value, given);
+            instance = instance.with(keyword, value, given)?;
         }
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
@@ -1832,7 +1835,7 @@ impl JfetSensitivity<'_> {
 }
 
 /// A JFET's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetJfet {
     /// Built from the reset load's records: the junction conductances.

@@ -3,9 +3,12 @@
 //! `resload.c` (`RESload`, `RESacload`).
 
 use super::{
-    CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, PassiveInputs, RecordPair,
-    SensitivityConductance, SensitivityFamily, SensitivityLoad, SensitivityMode,
+    CELSIUS_TO_KELVIN, ParameterScope, PassiveInputs, RecordPair, SensitivityConductance,
+    SensitivityFamily, SensitivityKernel, SensitivityLoad, SensitivityMode,
     SensitivityParameter as P, SensitivityRecord,
+};
+use crate::devices::passive::physics::{
+    Coefficients, SheetGeometry, TemperaturePoint, conductance, scaled,
 };
 use crate::primitives::{NodeId, Real, SpiceResult};
 
@@ -43,9 +46,6 @@ const INSTANCE: &[P] = &[
     P::dc("scale"),
 ];
 
-/// `RESMIN` of `resparam.c`.
-const RESMIN: Real = 1e-12;
-
 /// A resistor's `.sens` description, borrowing the device's immutable card.
 #[derive(Debug)]
 pub(in crate::devices) struct ResistorSensitivity<'a> {
@@ -78,23 +78,7 @@ fn field(value: Option<Real>, default: Real) -> (Real, bool) {
     value.map_or((default, false), |value| (value, true))
 }
 
-/// Sheet resistance scaled by the corrected aspect ratio.
-const fn sheet_resistance(
-    length: Real,
-    width: Real,
-    short: Real,
-    narrow: Real,
-    sheet: Real,
-) -> Real {
-    (length - 2. * short) / (width - 2. * narrow) * sheet
-}
-
-/// `REStemp`'s Horner-form polynomial differs from the capacitor/inductor form.
-const fn resistance_temperature_factor(tc1: Real, tc2: Real, difference: Real) -> Real {
-    ((tc2 * difference) + tc1) * difference + 1.0
-}
-
-impl DeviceSensitivity for ResistorSensitivity<'_> {
+impl SensitivityKernel for ResistorSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Resistor
     }
@@ -118,41 +102,41 @@ impl DeviceSensitivity for ResistorSensitivity<'_> {
             let (value, given) = field(value, default);
             record.with(keyword, value, given)
         };
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         let (tnom, tnom_given) = field(i.model_value("tnom").map(|t| t + CELSIUS_TO_KELVIN), 0.);
-        model = model.with("tnom", tnom, tnom_given);
-        model = entry(model, "rsh", i.model_value("rsh"), 0.);
-        model = entry(model, "defw", i.model_value("defw"), 0.);
-        model = entry(model, "defl", i.model_value("l"), 0.);
-        model = entry(model, "narrow", i.model_value("narrow"), 0.);
-        model = entry(model, "short", i.model_value("short"), 0.);
-        model = entry(model, "tc1", i.model_value("tc1"), 0.);
-        model = entry(model, "tc2", i.model_value("tc2"), 0.);
-        model = entry(model, "tce", None, 0.);
-        model = entry(model, "kf", i.model_value("kf"), 0.);
-        model = entry(model, "af", i.model_value("af"), 0.);
-        model = entry(model, "r", i.model_value("r"), 0.);
-        model = entry(model, "bv_max", None, 0.);
-        model = entry(model, "lf", i.model_value("lf"), 0.);
-        model = entry(model, "wf", i.model_value("wf"), 0.);
-        model = entry(model, "ef", i.model_value("ef"), 0.);
-        let mut instance = SensitivityRecord::new();
-        instance = entry(instance, "resistance", instance_value("resistance"), 0.);
-        instance = entry(instance, "ac", None, 0.);
+        model = model.with("tnom", tnom, tnom_given)?;
+        model = entry(model, "rsh", i.model_value("rsh"), 0.)?;
+        model = entry(model, "defw", i.model_value("defw"), 0.)?;
+        model = entry(model, "defl", i.model_value("l"), 0.)?;
+        model = entry(model, "narrow", i.model_value("narrow"), 0.)?;
+        model = entry(model, "short", i.model_value("short"), 0.)?;
+        model = entry(model, "tc1", i.model_value("tc1"), 0.)?;
+        model = entry(model, "tc2", i.model_value("tc2"), 0.)?;
+        model = entry(model, "tce", i.model_value("tce"), 0.)?;
+        model = entry(model, "kf", i.model_value("kf"), 0.)?;
+        model = entry(model, "af", i.model_value("af"), 0.)?;
+        model = entry(model, "r", i.model_value("r"), 0.)?;
+        model = entry(model, "bv_max", None, 0.)?;
+        model = entry(model, "lf", i.model_value("lf"), 0.)?;
+        model = entry(model, "wf", i.model_value("wf"), 0.)?;
+        model = entry(model, "ef", i.model_value("ef"), 0.)?;
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
+        instance = entry(instance, "resistance", instance_value("resistance"), 0.)?;
+        instance = entry(instance, "ac", instance_value("ac"), 0.)?;
         let (temp, temp_given) = field(instance_value("temp").map(|t| t + CELSIUS_TO_KELVIN), 0.);
-        instance = instance.with("temp", temp, temp_given);
-        instance = entry(instance, "dtemp", None, 0.);
-        instance = entry(instance, "l", instance_value("l"), 0.);
-        instance = entry(instance, "w", instance_value("w"), 0.);
-        instance = entry(instance, "m", instance_value("m"), 0.);
-        instance = entry(instance, "tc", instance_value("tc1"), 0.);
-        instance = entry(instance, "tc2", instance_value("tc2"), 0.);
-        instance = entry(instance, "tce", None, 0.);
-        instance = entry(instance, "bv_max", None, 0.);
-        instance = entry(instance, "scale", instance_value("scale"), 0.);
+        instance = instance.with("temp", temp, temp_given)?;
+        instance = entry(instance, "dtemp", instance_value("dtemp"), 0.)?;
+        instance = entry(instance, "l", instance_value("l"), 0.)?;
+        instance = entry(instance, "w", instance_value("w"), 0.)?;
+        instance = entry(instance, "m", instance_value("m"), 0.)?;
+        instance = entry(instance, "tc", instance_value("tc1"), 0.)?;
+        instance = entry(instance, "tc2", instance_value("tc2"), 0.)?;
+        instance = entry(instance, "tce", instance_value("tce"), 0.)?;
+        instance = entry(instance, "bv_max", None, 0.)?;
+        instance = entry(instance, "scale", instance_value("scale"), 0.)?;
         instance = instance
-            .with("conduct", 0., false)
-            .with("acconduct", 0., false);
+            .with("conduct", 0., false)?
+            .with("acconduct", 0., false)?;
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
         Ok((model, instance))
@@ -204,14 +188,7 @@ impl DeviceSensitivity for ResistorSensitivity<'_> {
                 instance.set("temp", if kelvin < 1e-6 { 0. } else { kelvin })
             }
             (ParameterScope::Instance, "resistance") => {
-                let value = if (0. ..RESMIN).contains(&value) {
-                    RESMIN
-                } else if value < 0. && value > -RESMIN {
-                    -RESMIN
-                } else {
-                    value
-                };
-                instance.set("resistance", value)
+                instance.set("resistance", crate::devices::rlc::clamp_resistance(value))
             }
             (ParameterScope::Instance, _) => instance.set(keyword, value),
         }
@@ -268,25 +245,29 @@ impl DeviceSensitivity for ResistorSensitivity<'_> {
         model: &mut SensitivityRecord,
         instance: &mut SensitivityRecord,
     ) -> SpiceResult<()> {
-        if instance.given("temp") {
-            instance.store("dtemp", 0.)?;
-        } else {
-            instance.store("temp", self.circuit_kelvin)?;
-            if !instance.given("dtemp") {
-                instance.store("dtemp", 0.)?;
-            }
-        }
+        let temperature = TemperaturePoint::resolve(
+            instance
+                .given("temp")
+                .then(|| instance.value("temp"))
+                .transpose()?,
+            instance
+                .given("dtemp")
+                .then(|| instance.value("dtemp"))
+                .transpose()?,
+            self.circuit_kelvin,
+        );
+        instance.store("temp", temperature.kelvin)?;
+        instance.store("dtemp", temperature.offset)?;
         if !instance.given("resistance") {
-            let (length, width) = (instance.value("l")?, instance.value("w")?);
-            let sheet = model.value("rsh")?;
-            let resist = if length * width * sheet > 0. {
-                sheet_resistance(
-                    length,
-                    width,
-                    model.value("short")?,
-                    model.value("narrow")?,
-                    sheet,
-                )
+            let geometry = SheetGeometry {
+                length: instance.value("l")?,
+                width: instance.value("w")?,
+                short: model.value("short")?,
+                narrow: model.value("narrow")?,
+                sheet: model.value("rsh")?,
+            };
+            let resist = if geometry.uses_sheet() {
+                geometry.resistance()
             } else if model.given("r") {
                 model.value("r")?
             } else {
@@ -294,8 +275,7 @@ impl DeviceSensitivity for ResistorSensitivity<'_> {
             };
             instance.store("resistance", resist)?;
         }
-        let difference =
-            (instance.value("temp")? + instance.value("dtemp")?) - model.value("tnom")?;
+        let difference = temperature.difference(model.value("tnom")?);
         let pick = |instance_key: &str, model_key: &str| -> SpiceResult<Real> {
             if instance.given(instance_key) {
                 instance.value(instance_key)
@@ -303,22 +283,25 @@ impl DeviceSensitivity for ResistorSensitivity<'_> {
                 model.value(model_key)
             }
         };
-        let tc1 = pick("tc", "tc1")?;
-        let tc2 = pick("tc2", "tc2")?;
-        let tce = pick("tce", "tce")?;
-        let factor = if instance.given("tce") || model.given("tce") {
-            1.01_f64.powf(tce * difference)
-        } else {
-            resistance_temperature_factor(tc1, tc2, difference)
+        let coefficients = Coefficients {
+            linear: pick("tc", "tc1")?,
+            quadratic: pick("tc2", "tc2")?,
         };
+        let exponential = (instance.given("tce") || model.given("tce"))
+            .then(|| pick("tce", "tce"))
+            .transpose()?;
+        let factor = coefficients.resistor_factor(difference, exponential);
         if !instance.given("scale") {
             instance.store("scale", 1.)?;
         }
         let (m, scale) = (instance.value("m")?, instance.value("scale")?);
-        let conduct = m / (instance.value("resistance")? * factor * scale);
+        let conduct = conductance(scaled(instance.value("resistance")?, factor, scale), m);
         instance.store("conduct", conduct)?;
         if instance.given("ac") {
-            instance.store("acconduct", m / (instance.value("ac")? * factor * scale))?;
+            instance.store(
+                "acconduct",
+                conductance(scaled(instance.value("ac")?, factor, scale), m),
+            )?;
         } else {
             instance.store("acconduct", conduct)?;
             instance.store("ac", instance.value("resistance")?)?;

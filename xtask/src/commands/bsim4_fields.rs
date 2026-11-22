@@ -137,36 +137,51 @@ fn emit_struct(
         }
         out.push_str("            _ => return None,\n        })\n    }\n");
     }
-    // Positional access over the scalar (non-string) members, for records
-    // that hold the whole struct as numbers (`.sens`).
-    let scalars: Vec<&Field> = fields.iter().filter(|f| f.kind != "String").collect();
-    out.push_str("    /// C member names of the scalar members, in declaration order.\n    #[allow(dead_code, reason = \"uniform generated schema accessors may be unused by a particular device path\")]\n    pub(crate) const MEMBERS: &[&str] = &[\n");
-    for field in &scalars {
-        writeln!(out, "        \"{}\",", field.c_name).map_err(|e| e.to_string())?;
+    if name != "SizeParam" {
+        out.push_str("    /// The value of a real C member by name.\n    pub(crate) fn real(&self, c_name: &str) -> Option<f64> {\n        Some(match c_name {\n");
+        for field in fields.iter().filter(|f| f.kind == "f64") {
+            writeln!(
+                out,
+                "            \"{}\" => self.{},",
+                field.c_name,
+                rust_name(&field.c_name)
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        out.push_str("            _ => return None,\n        })\n    }\n");
     }
-    out.push_str("    ];\n\n");
-    out.push_str("    /// The scalar members as numbers, in [`Self::MEMBERS`] order (`i32` exactly,\n    /// a given bit as 0 or 1).\n    #[allow(dead_code, reason = \"uniform generated schema accessors may be unused by a particular device path\")]\n    pub(crate) fn to_values(&self) -> Vec<f64> {\n        vec![\n");
-    for field in &scalars {
-        let name = rust_name(&field.c_name);
-        let expression = match field.kind {
-            "f64" => format!("self.{name}"),
-            "i32" => format!("f64::from(self.{name})"),
-            _ => format!("f64::from(u8::from(self.{name}))"),
-        };
-        writeln!(out, "            {expression},").map_err(|e| e.to_string())?;
+    if name == "Instance" {
+        // Positional access over the scalar (non-string) members, for records
+        // that hold the whole struct as numbers (`.sens`).
+        let scalars: Vec<&Field> = fields.iter().filter(|f| f.kind != "String").collect();
+        out.push_str("    /// C member names of the scalar members, in declaration order.\n    #[cfg(test)]\n    pub(crate) const MEMBERS: &[&str] = &[\n");
+        for field in &scalars {
+            writeln!(out, "        \"{}\",", field.c_name).map_err(|e| e.to_string())?;
+        }
+        out.push_str("    ];\n\n");
+        out.push_str("    /// The scalar members as numbers, in [`Self::MEMBERS`] order (`i32` exactly,\n    /// a given bit as 0 or 1).\n    #[cfg(test)]\n    pub(crate) fn to_values(&self) -> Vec<f64> {\n        vec![\n");
+        for field in &scalars {
+            let name = rust_name(&field.c_name);
+            let expression = match field.kind {
+                "f64" => format!("self.{name}"),
+                "i32" => format!("f64::from(self.{name})"),
+                _ => format!("f64::from(u8::from(self.{name}))"),
+            };
+            writeln!(out, "            {expression},").map_err(|e| e.to_string())?;
+        }
+        out.push_str("        ]\n    }\n\n");
+        out.push_str("    /// Nonzero typed members for exhaustive ownership tests.\n    #[cfg(test)]\n    pub(crate) const fn seed_test_members(&mut self) {\n");
+        for field in &scalars {
+            let name = rust_name(&field.c_name);
+            let value = match field.kind {
+                "f64" => "1.",
+                "i32" => "1",
+                _ => "true",
+            };
+            writeln!(out, "        self.{name} = {value};").map_err(|e| e.to_string())?;
+        }
+        out.push_str("    }\n");
     }
-    out.push_str("        ]\n    }\n\n");
-    out.push_str("    /// Stores numbers produced by [`Self::to_values`]; `values` must have\n    /// `Self::MEMBERS.len()` entries.\n    #[allow(dead_code, clippy::cast_possible_truncation, reason = \"generated numeric snapshots round-trip exact i32 fields and may be unused for some record types\")]\n    pub(crate) const fn set_values(&mut self, values: &[f64]) {\n");
-    for (index, field) in scalars.iter().enumerate() {
-        let name = rust_name(&field.c_name);
-        let expression = match field.kind {
-            "f64" => format!("values[{index}]"),
-            "i32" => format!("values[{index}] as i32"),
-            _ => format!("values[{index}] != 0.0"),
-        };
-        writeln!(out, "        self.{name} = {expression};").map_err(|e| e.to_string())?;
-    }
-    out.push_str("    }\n");
     out.push_str("}\n");
     Ok(())
 }
@@ -436,7 +451,7 @@ pub(super) fn fields(header: &str, revision: &str) -> Result<String, String> {
     // Only the generated schema may retain these C-field spelling and
     // monolithic accessor patterns. The source policy verifies provenance.
     out.push_str(
-        "#![allow(\n    non_snake_case,\n    clippy::struct_excessive_bools,\n    clippy::used_underscore_binding,\n    clippy::too_many_lines,\n    clippy::large_stack_arrays,\n    clippy::redundant_pub_crate,\n    reason = \"generated C schema preserves member spelling, layout and uniform positional accessors\"\n)]\n",
+        "#![allow(\n    non_snake_case,\n    clippy::struct_excessive_bools,\n    clippy::used_underscore_binding,\n    clippy::too_many_lines,\n    clippy::large_stack_arrays,\n    clippy::redundant_pub_crate,\n    reason = \"generated C schema preserves member spelling, layout and uniform typed accessors\"\n)]\n",
     );
     emit_struct(&mut out, "Model", "struct sBSIM4model", &model)?;
     emit_struct(&mut out, "SizeParam", "struct bsim4SizeDependParam", &size)?;
