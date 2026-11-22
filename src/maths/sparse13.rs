@@ -839,15 +839,19 @@ impl PivotProducts {
     // than maintaining summaries. Amortize them over longer scans.
     const MIN_INDEXED_PRODUCTS: usize = Self::BLOCK * 8 + 2;
 
-    fn new(len: usize) -> Self {
-        Self {
-            values: vec![0; len],
+    fn new(len: usize) -> SpiceResult<Self> {
+        Ok(Self {
+            values: crate::primitives::filled_vec(len, 0, "SPARSE Markowitz products")?,
             summaries: if len > Self::MIN_INDEXED_PRODUCTS {
-                vec![None; len.div_ceil(Self::BLOCK)]
+                crate::primitives::filled_vec(
+                    len.div_ceil(Self::BLOCK),
+                    None,
+                    "SPARSE product summaries",
+                )?
             } else {
                 Vec::new()
             },
-        }
+        })
     }
 
     fn set(&mut self, i: usize, value: i64) {
@@ -1598,8 +1602,11 @@ impl<T: Scalar> Sparse<T> {
             // A failed partial reorder may have invalidated the plan.
             // Retain its numbering like C; initialize scratch in case
             // completing the previously attempted prefix creates fill-ins.
-            if self.plan.is_none() && self.markowitz_row.len() <= self.size {
-                self.create_internal_vectors();
+            if self.plan.is_none()
+                && self.markowitz_row.len() <= self.size
+                && self.create_internal_vectors().is_err()
+            {
+                return self.resource_failure();
             }
             while step <= size {
                 let pivot = self.topology.diag[step];
@@ -1628,8 +1635,8 @@ impl<T: Scalar> Sparse<T> {
         }
         // Reordering always rebuilds all active counts. A snapshot fork
         // needs no copy of the previous ordering's scratch arrays.
-        if self.markowitz_row.len() <= self.size {
-            self.create_internal_vectors();
+        if self.markowitz_row.len() <= self.size && self.create_internal_vectors().is_err() {
+            return self.resource_failure();
         }
         self.count_markowitz(step);
         self.markowitz_products(step);
@@ -1653,10 +1660,14 @@ impl<T: Scalar> Sparse<T> {
 
     fn done(&mut self) -> Status {
         if self.plan.is_none() {
-            let Some(plan) = self.compile_plan() else {
-                self.factored = false;
-                self.status = Status::InvalidPlan;
-                return self.status;
+            let plan = match self.compile_plan() {
+                Ok(plan) => plan,
+                Err(status) => {
+                    self.factored = false;
+                    self.needs_ordering = true;
+                    self.status = status;
+                    return status;
+                }
             };
             self.plan = Some(std::sync::Arc::new(plan));
         }
@@ -1665,34 +1676,32 @@ impl<T: Scalar> Sparse<T> {
         self.status
     }
 
-    fn compile_plan(&self) -> Option<FactorPlan> {
+    fn compile_plan(&self) -> Result<FactorPlan, Status> {
         // Offsets include the exclusive end of the entry array, so both
         // counts (not just the largest existing handles) must fit.
-        if u32::try_from(self.size).is_ok()
-            && u32::try_from(self.topology.elements.len()).is_ok()
-            && let Some(runs) = self.compile_runs()
-        {
-            return Some(FactorPlan::Compact(runs));
+        if u32::try_from(self.size).is_ok() && u32::try_from(self.topology.elements.len()).is_ok() {
+            self.compile_runs().map(FactorPlan::Compact)
+        } else {
+            self.compile_runs().map(FactorPlan::Wide)
         }
-        self.compile_runs().map(FactorPlan::Wide)
     }
 
-    fn compile_runs<I: PlanIndex>(&self) -> Option<FactorRuns<I>> {
+    fn compile_runs<I: PlanIndex>(&self) -> Result<FactorRuns<I>, Status> {
         let mut columns = Vec::new();
-        columns.try_reserve_exact(self.size).ok()?;
+        columns
+            .try_reserve_exact(self.size)
+            .map_err(|_| Status::Resource)?;
         let mut column_entries = Vec::new();
         column_entries
             .try_reserve_exact(self.topology.elements.len())
-            .ok()?;
+            .map_err(|_| Status::Resource)?;
         let mut upper_row_start = Vec::new();
         upper_row_start
-            .try_reserve_exact(self.size.checked_add(1)?)
-            .ok()?;
+            .try_reserve_exact(self.size.checked_add(1).ok_or(Status::Resource)?)
+            .map_err(|_| Status::Resource)?;
         let mut upper_row_entries = Vec::new();
-        upper_row_entries
-            .try_reserve_exact(self.topology.elements.len())
-            .ok()?;
-        upper_row_start.push(I::pack(0)?);
+
+        upper_row_start.push(I::pack(0).ok_or(Status::InvalidPlan)?);
         for i in 1..=self.size {
             let start = column_entries.len();
             let diagonal = self.topology.diag[i];
@@ -1702,22 +1711,32 @@ impl<T: Scalar> Sparse<T> {
                 if e == diagonal {
                     diagonal_offset = Some(column_entries.len());
                 }
-                column_entries.push(RunEntry::new(e, self.topology.elements[e].row)?);
+                column_entries.push(
+                    RunEntry::new(e, self.topology.elements[e].row).ok_or(Status::InvalidPlan)?,
+                );
                 e = self.topology.elements[e].next_in_col;
             }
             columns.push(ColumnRun {
-                start: I::pack(start)?,
-                diagonal: I::pack(diagonal_offset?)?,
-                end: I::pack(column_entries.len())?,
+                start: I::pack(start).ok_or(Status::InvalidPlan)?,
+                diagonal: I::pack(diagonal_offset.ok_or(Status::InvalidPlan)?)
+                    .ok_or(Status::InvalidPlan)?,
+                end: I::pack(column_entries.len()).ok_or(Status::InvalidPlan)?,
             });
             let mut e = self.topology.elements[diagonal].next_in_row;
             while e != NONE {
-                upper_row_entries.push(RunEntry::new(e, self.topology.elements[e].col)?);
+                if upper_row_entries.len() == upper_row_entries.capacity() {
+                    upper_row_entries
+                        .try_reserve(1)
+                        .map_err(|_| Status::Resource)?;
+                }
+                upper_row_entries.push(
+                    RunEntry::new(e, self.topology.elements[e].col).ok_or(Status::InvalidPlan)?,
+                );
                 e = self.topology.elements[e].next_in_row;
             }
-            upper_row_start.push(I::pack(upper_row_entries.len())?);
+            upper_row_start.push(I::pack(upper_row_entries.len()).ok_or(Status::InvalidPlan)?);
         }
-        Some(FactorRuns {
+        Ok(FactorRuns {
             columns,
             column_entries,
             upper_row_start,
@@ -1762,6 +1781,10 @@ impl<T: Scalar> Sparse<T> {
         // the lower-column updates cannot read an unscattered row.
         // Existing scratch may hold the previous solve's internal RHS;
         // no blanket initialization is required.
+        let additional = (size + 1).saturating_sub(workspace.len());
+        if sparse_reserve(workspace, additional).is_err() {
+            return self.resource_failure();
+        }
         workspace.resize(size + 1, T::ZERO);
         let dest = workspace;
         let result = match plan {
@@ -1795,11 +1818,15 @@ impl<T: Scalar> Sparse<T> {
     }
 
     /// `spcCreateInternalVectors`.
-    fn create_internal_vectors(&mut self) {
-        let size = self.size;
-        self.markowitz_row = vec![0; size + 1];
-        self.markowitz_col = vec![0; size + 1];
-        self.markowitz_prod = PivotProducts::new(size + 2);
+    fn create_internal_vectors(&mut self) -> SpiceResult<()> {
+        let rows = sparse_rows(self.size)?;
+        let row = crate::primitives::filled_vec(rows, 0, "SPARSE Markowitz row counts")?;
+        let col = crate::primitives::filled_vec(rows, 0, "SPARSE Markowitz column counts")?;
+        let products = PivotProducts::new(rows + 1)?;
+        self.markowitz_row = row;
+        self.markowitz_col = col;
+        self.markowitz_prod = products;
+        Ok(())
     }
 
     /// `CountMarkowitz` (no RHS).
@@ -2348,45 +2375,49 @@ impl<T: Scalar> Sparse<T> {
             .ok_or_else(|| {
                 crate::primitives::SpiceError::circuit("sparse solve has no valid factor plan")
             })?;
-        self.gather_rhs(rhs, x, false);
+        self.gather_rhs(rhs, x, false)?;
         match plan {
             FactorPlan::Compact(runs) => runs.solve(&self.values, &self.topology.diag, x),
             FactorPlan::Wide(runs) => runs.solve(&self.values, &self.topology.diag, x),
         }
-        Ok(self.scatter_solution(rhs, x, false))
+        self.scatter_solution(rhs, x, false)
     }
 
     /// Gather directly into the internal 1-based work vector without
     /// first zero-initializing every translated entry.
-    fn gather_rhs(&self, rhs: &[T], x: &mut Vec<T>, transposed: bool) {
-        debug_assert!(self.factored && rhs.len() == self.ext_size);
+    fn gather_rhs(&self, rhs: &[T], x: &mut Vec<T>, transposed: bool) -> SpiceResult<()> {
+        if rhs.len() != self.ext_size {
+            return Err(numerical(
+                "SPARSE solve",
+                "RHS length differs from external matrix order",
+            ));
+        }
         let indices = if transposed {
             &self.topology.int_to_ext_col
         } else {
             &self.topology.int_to_ext_row
         };
         x.clear();
-        x.reserve(self.size + 1);
+        sparse_reserve(x, self.size + 1)?;
         x.push(T::ZERO);
         x.extend(indices[1..=self.size].iter().map(|&ext| rhs[ext - 1]));
+        Ok(())
     }
 
     /// Emit external-order values sequentially. Untranslated unknowns keep
     /// exactly their original RHS bits, including signed zeros.
-    fn scatter_solution(&self, rhs: &[T], x: &[T], transposed: bool) -> Vec<T> {
+    fn scatter_solution(&self, rhs: &[T], x: &[T], transposed: bool) -> SpiceResult<Vec<T>> {
         let indices = if transposed {
             &self.topology.ext_to_int_row
         } else {
             &self.topology.ext_to_int_col
         };
-        rhs.iter()
-            .zip(&indices[1..])
-            .map(
-                |(&value, &internal)| {
-                    if internal == NONE { value } else { x[internal] }
-                },
-            )
-            .collect()
+        let mut result = Vec::new();
+        sparse_reserve(&mut result, rhs.len())?;
+        result.extend(rhs.iter().zip(&indices[1..]).map(|(&value, &internal)| {
+            if internal == NONE { value } else { x[internal] }
+        }));
+        Ok(result)
     }
 
     /// `spSolveTransposed`: `A^T x = b` with the same factors (in place like
@@ -2409,14 +2440,14 @@ impl<T: Scalar> Sparse<T> {
             .ok_or_else(|| {
                 crate::primitives::SpiceError::circuit("sparse solve has no valid factor plan")
             })?;
-        self.gather_rhs(rhs, x, true);
+        self.gather_rhs(rhs, x, true)?;
         match plan {
             FactorPlan::Compact(runs) => {
                 runs.solve_transposed(&self.values, &self.topology.diag, x);
             }
             FactorPlan::Wide(runs) => runs.solve_transposed(&self.values, &self.topology.diag, x),
         }
-        Ok(self.scatter_solution(rhs, x, true))
+        self.scatter_solution(rhs, x, true)
     }
 }
 
@@ -2524,6 +2555,27 @@ mod tests {
     }
 
     #[test]
+    fn sparse_construction_rejects_invalid_dimensions_and_external_coordinates() {
+        assert!(Sparse::<f64>::new(usize::MAX).is_err());
+        assert!(Sparse::<f64>::new(usize::MAX / size_of::<usize>()).is_err());
+        assert!(Sparse::<f64>::from_originals(2, [(0, 1, 1.)]).is_err());
+        assert!(Sparse::<f64>::from_originals(2, [(2, 3, 1.)]).is_err());
+        let pattern = crate::maths::Pattern::new(2, [(0, 0), (1, 1)]).unwrap();
+        assert!(Sparse::<f64>::from_pattern(&pattern, &[1.]).is_err());
+        let mut sparse = Sparse::<f64>::new(2).unwrap();
+        assert!(sparse.get_element(1, usize::MAX).is_err());
+        assert!(sparse.get_element(0, 1).is_err());
+        assert_eq!(sparse.size, 0);
+        let first = sparse.get_element(2, 1).unwrap();
+        sparse.set(first, 2.);
+        let second = sparse.get_element(1, 1).unwrap();
+        sparse.add(first, 3.);
+        assert_eq!(sparse.get_element(2, 1).unwrap(), first);
+        assert_ne!(second, first);
+        assert_eq!(sparse.value(first), 5.);
+    }
+
+    #[test]
     fn unfactored_solve_rejects_without_touching_workspace() {
         let m = Sparse::<f64>::new(1).unwrap();
         let mut workspace = vec![42.0];
@@ -2534,7 +2586,7 @@ mod tests {
     #[test]
     fn pivot_product_summaries_match_reference_reverse_searches() {
         for size in [1, 63, 64, 323, 514, 515, 1027] {
-            let mut products = PivotProducts::new(size);
+            let mut products = PivotProducts::new(size).unwrap();
             let mut seed = 71_u64;
             for i in 0..6000 {
                 seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -3083,7 +3135,7 @@ mod tests {
         // step must be returned from that sentinel before scanning other
         // positions. Otherwise the scan proceeds from the highest index.
         let mut m = build(4, &[(1, 1, 5.), (2, 2, 2.), (3, 3, 3.), (4, 4, 4.)]);
-        m.create_internal_vectors();
+        m.create_internal_vectors().unwrap();
         for i in 1..=4 {
             m.markowitz_prod.set(i, 0);
         }

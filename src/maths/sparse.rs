@@ -166,17 +166,13 @@ impl Pattern {
     /// # Errors
     /// Unsupported dimensions, coordinates, compact handle count or allocation.
     pub fn new(n: usize, positions: impl IntoIterator<Item = (usize, usize)>) -> SpiceResult<Self> {
-        compact_count(n)?;
+        pattern_rows(n)?;
         let mut seen = std::collections::HashSet::new();
         let mut unique = Vec::new();
         for (row, col) in positions {
             let position = compact_position(n, row, col)?;
-            if !seen.contains(&position) {
-                seen.try_reserve(1).map_err(|error| {
-                    pattern_error(format!("cannot reserve sparse position index: {error}"))
-                })?;
+            if insert_position(&mut seen, position)? {
                 push_compact(&mut unique, position)?;
-                seen.insert(position);
             }
         }
         Self::index(n, unique)
@@ -184,10 +180,7 @@ impl Pattern {
 
     fn index(n: usize, positions: Vec<(u32, u32)>) -> SpiceResult<Self> {
         let len = compact_count(positions.len())?;
-        compact_count(n)?;
-        let rows = n
-            .checked_add(1)
-            .ok_or_else(|| pattern_error("row offsets overflow"))?;
+        let rows = pattern_rows(n)?;
         let mut row_start = crate::primitives::filled_vec(rows, 0_u32, "sparse pattern")?;
         for &(row, _) in &positions {
             row_start[row as usize + 1] += 1;
@@ -293,14 +286,8 @@ impl Pattern {
         let mut appended = std::collections::HashSet::new();
         for (row, col) in extra {
             let position = compact_position(self.index.n, row, col)?;
-            if self.find(row, col).is_none() && !appended.contains(&position) {
-                appended.try_reserve(1).map_err(|error| {
-                    pattern_error(format!(
-                        "cannot reserve appended sparse position index: {error}"
-                    ))
-                })?;
+            if self.find(row, col).is_none() && insert_position(&mut appended, position)? {
                 push_compact(&mut positions, position)?;
-                appended.insert(position);
             }
         }
         Self::index(self.index.n, positions)
@@ -372,6 +359,33 @@ fn pattern_error(message: impl Into<String>) -> SpiceError {
         context: "sparse pattern".to_owned(),
         message: message.into(),
     }
+}
+
+fn pattern_rows(n: usize) -> SpiceResult<usize> {
+    compact_count(n)?;
+    let rows = n
+        .checked_add(1)
+        .ok_or_else(|| pattern_error("row offsets overflow"))?;
+    std::alloc::Layout::array::<u32>(rows)
+        .map_err(|error| pattern_error(format!("row offset capacity: {error}")))?;
+    Ok(rows)
+}
+
+fn insert_position(
+    seen: &mut std::collections::HashSet<(u32, u32)>,
+    position: (u32, u32),
+) -> SpiceResult<bool> {
+    // A duplicate does not require storage; on the usual path there is just
+    // one hash lookup, as in the original infallible builder.
+    if seen.len() == seen.capacity() {
+        if seen.contains(&position) {
+            return Ok(false);
+        }
+        seen.try_reserve(1).map_err(|error| {
+            pattern_error(format!("cannot reserve sparse position index: {error}"))
+        })?;
+    }
+    Ok(seen.insert(position))
 }
 
 fn reserve<T>(values: &mut Vec<T>, additional: usize) -> SpiceResult<()> {
@@ -1279,7 +1293,11 @@ impl SparseMatrix {
                 ),
             });
         }
-        let mut result = Vector::zeros(self.rows);
+        let mut result = Vector::from(crate::primitives::filled_vec(
+            self.rows,
+            0.,
+            "sparse matrix-vector output",
+        )?);
         let y = result.as_mut_slice();
         let x = vector.as_slice();
         if let Some(bound) = &self.bound
@@ -1328,6 +1346,117 @@ impl SparseMatrix {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    #[ignore = "manual sparse construction and replay throughput benchmark"]
+    fn sparse_construction_and_replay_bench() {
+        use std::{hint::black_box, time::Instant};
+        const N: usize = 32_768;
+        const LOADS: usize = 100;
+        let entries: Vec<_> = (0..N)
+            .flat_map(|row| [2, 0, 1, N - 1, 2].map(move |offset| (row, (row + offset) % N)))
+            .collect();
+        for _ in 0..5 {
+            let start = Instant::now();
+            let pattern = Pattern::new(N, black_box(entries.iter().copied())).unwrap();
+            let setup = start.elapsed();
+            let start = Instant::now();
+            let extended = pattern
+                .extended((0..N).map(|row| (row, (row + 7) % N)))
+                .unwrap();
+            let extension = start.elapsed();
+            assert_eq!(pattern.len(), 4 * N);
+            assert_eq!(extended.len(), 5 * N);
+            for position in [entries[0], entries[N], entries[entries.len() - 1]] {
+                assert_eq!(
+                    pattern.find(position.0, position.1),
+                    extended.find(position.0, position.1)
+                );
+            }
+            let pattern = Arc::new(pattern);
+            let start = Instant::now();
+            let mut matrix = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+            let bound = start.elapsed();
+            let load = |matrix: &mut SparseMatrix| {
+                for (row, stamps) in entries.chunks_exact(5).enumerate() {
+                    matrix.begin_device(row).unwrap();
+                    for &(r, c) in stamps {
+                        matrix.add(r, c, black_box(0.5)).unwrap();
+                    }
+                }
+                matrix.record_trace().unwrap();
+            };
+            let start = Instant::now();
+            load(&mut matrix);
+            let record = start.elapsed();
+            let start = Instant::now();
+            for _ in 0..LOADS {
+                matrix.clear();
+                load(&mut matrix);
+                black_box(matrix.bound_values());
+            }
+            let replay = start.elapsed();
+            assert_eq!(matrix.get(0, 2).to_bits(), 1.0_f64.to_bits());
+            assert_eq!(matrix.nnz(), 4 * N);
+            eprintln!(
+                "setup_ms={:.3} extension_ms={:.3} bound_ms={:.3} trace_ms={:.3} replay_ms={:.3} stamps={}",
+                setup.as_secs_f64() * 1e3,
+                extension.as_secs_f64() * 1e3,
+                bound.as_secs_f64() * 1e3,
+                record.as_secs_f64() * 1e3,
+                replay.as_secs_f64() * 1e3,
+                LOADS * entries.len()
+            );
+        }
+    }
+
+    #[test]
+    fn compact_capacity_and_trace_offsets_are_checked_before_allocation() {
+        assert_eq!(compact_count(0).unwrap(), 0);
+        assert_eq!(compact_count(u32::MAX as usize).unwrap(), u32::MAX);
+        if let Some(beyond) = (u32::MAX as usize).checked_add(1) {
+            assert!(compact_count(beyond).is_err());
+            assert!(pattern_rows(beyond).is_err());
+        }
+        assert!(offsets_len(usize::MAX).is_err());
+        assert!(offsets_len(u32::MAX as usize).is_err());
+        assert!(reserve::<u64>(&mut Vec::new(), usize::MAX).is_err());
+
+        let pattern = Arc::new(Pattern::new(2, [(1, 0), (0, 1)]).unwrap());
+        let mut matrix = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        assert!(matrix.begin_device(usize::MAX).is_err());
+        assert!(
+            matrix
+                .lend_fixed(FixedStamps::default(), usize::MAX)
+                .is_err()
+        );
+        let foreign = Pattern::new(2, [(0, 0), (0, 1), (1, 1)]).unwrap();
+        assert!(matrix.add_element(foreign.find(1, 1).unwrap(), 1.).is_err());
+        matrix.begin_device(0).unwrap();
+        matrix.add(1, 0, 3.).unwrap();
+        matrix.record_trace().unwrap();
+        assert_eq!(matrix.get(1, 0), 3.);
+        assert_eq!(pattern.trace().starts, [0, 1]);
+    }
+
+    #[test]
+    fn extension_preserves_first_appearance_and_rejects_bad_coordinates() {
+        let pattern = Pattern::new(4, [(3, 2), (0, 0), (3, 2)]).unwrap();
+        assert!(pattern.extended([(2, 1), (4, 0)]).is_err());
+        assert_eq!(pattern.len(), 2);
+        let extended = pattern.extended([(2, 1), (0, 0), (3, 1), (2, 1)]).unwrap();
+        assert_eq!(
+            extended.positions().collect::<Vec<_>>(),
+            [(3, 2), (0, 0), (2, 1), (3, 1)]
+        );
+        for (position, index) in extended.positions().zip(0..) {
+            assert_eq!(
+                extended.find(position.0, position.1).unwrap().index(),
+                index
+            );
+        }
+    }
+
     #[test]
     fn poisoned_ordering_discards_cache_and_unlocks_after_recovery() {
         let pattern = Pattern::new(1, [(0, 0)]).unwrap();
@@ -1561,7 +1690,10 @@ mod tests {
 
     use std::sync::Arc;
 
-    use super::{ElementId, FixedStamps, Pattern, SparseMatrix, Triplet};
+    use super::{
+        ElementId, FixedStamps, Pattern, SparseMatrix, Triplet, compact_count, offsets_len,
+        pattern_rows, reserve,
+    };
     use crate::maths::dense::Vector;
 
     /// One device's load of `stamps` into a fresh matrix bound to `pattern`,
