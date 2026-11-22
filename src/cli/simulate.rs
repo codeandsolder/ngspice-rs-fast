@@ -31,10 +31,11 @@
 //!   changes the written rawfile (C registers the named vectors for the
 //!   transient plot instead);
 //! * each scheduled output has a consumer plan. Transient, AC, DC and noise
-//!   spectrum drivers produce rows directly; the sink retains only a plot
-//!   that needs print, measurement or Fourier processing. Other drivers
-//!   transfer their completed plots without copying rows. Rawfile-only rows
-//!   are projected and spooled without retaining a complete result;
+//!   spectrum drivers produce rows directly. The sink projects rawfile rows,
+//!   spools print tables and evaluates online measurements without retaining
+//!   complete results. Only nonlocal objectives and ASCII plots need bounded
+//!   selected history. Other drivers transfer completed plots without copying
+//!   the rawfile projection when the selection is full;
 //!   every successful plot is written in its scheduled order.
 //! * publication is atomic: every analysis runs and every output card resolves
 //!   before anything is printed or published, so one failing analysis publishes
@@ -47,13 +48,16 @@
 //! * an unadorned `.tran` runs the companion trap/Gear driver the engine
 //!   defaults to; this command never injects a `backend=`.
 
+use std::io::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::analysis::batch;
+use crate::analysis::batch::{self, BoundConsumers, ObjectiveReports};
 use crate::analysis::fourier::{self, FourierAnalysis};
 use crate::analysis::measure::{self, Measurement};
+use crate::analysis::rawfile::TextSpool;
 use crate::analysis::selection::RowProjection;
 use crate::analysis::{
     BinaryByteOrder, Plot, PointSink, RawFileTransaction, RawFormat, RawPlot, RunConfig,
@@ -65,7 +69,7 @@ use crate::primitives::{AnalysisKind, Complex, SpiceError, SpiceResult};
 use crate::cli::args::kind_name;
 
 /// What one successful run produced, for the report printed afterwards.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct Report {
     /// The deck that was simulated.
     pub deck: PathBuf,
@@ -77,6 +81,7 @@ pub struct Report {
     pub format: RawFormat,
     /// One entry per plot, in rawfile (ngspice batch) order.
     pub plots: Vec<PlotReport>,
+    spool: Option<TextSpool>,
 }
 
 /// What one analysis of a run produced.
@@ -94,10 +99,8 @@ pub struct PlotReport {
     pub variables: Vec<String>,
     /// How many points the plot has.
     pub points: usize,
-    /// The `.print` table, when the deck asked for one for this analysis type.
-    /// `None` without an applicable `.print` card, which keeps the report
-    /// unchanged.
-    pub printed: Option<String>,
+    // Byte range of this plot's text in the report-owned spool.
+    printed: Option<Range<u64>>,
     /// The `.measure` results, when the deck asked for any of this analysis
     /// type. `None` otherwise, which keeps the report unchanged.
     pub measured: Option<String>,
@@ -202,24 +205,22 @@ pub fn run_with_format(
     let schedule = batch::schedule(&plans);
     let mut first_circuit = Some(config.circuit(netlist)?);
     let mut previous_circuit: Option<crate::devices::Circuit> = None;
-    batch::check_targets(
+    let routes = batch::OutputRoutes::new(
         &schedule,
         &parsed.output,
         &parsed.measurements,
         &parsed.fourier,
     )?;
-
     let output_plans = schedule
         .iter()
-        .map(|entry| {
-            batch::plan_outputs(entry, &parsed.output, &parsed.measurements, &parsed.fourier)
-        })
-        .collect::<SpiceResult<Vec<_>>>()?;
+        .map(|entry| routes.plan_outputs(entry))
+        .collect::<Vec<_>>();
     let date = now_header();
     // Each plot is written as soon as its analysis has finished, into a
     // temporary file that is renamed into place only after the last one.
     let mut rawfile = RawFileTransaction::create(output, format, BinaryByteOrder::LittleEndian)?;
     let mut plots = Vec::with_capacity(output_plans.iter().map(Vec::len).sum());
+    let mut spool = None;
     for (entry, planned) in schedule.iter().zip(&output_plans) {
         let request = &plans[entry.card_index];
         // Each analysis starts from a freshly elaborated circuit; only what C
@@ -245,6 +246,8 @@ pub fn run_with_format(
             title: &netlist.title,
             date: &date,
             writer: &mut rawfile,
+            spool: &mut spool,
+            output,
             scope: &scope,
             fourier_settings: config.fourier_settings(),
         };
@@ -254,6 +257,9 @@ pub fn run_with_format(
         previous_circuit = Some(circuit);
     }
 
+    if let Some(spool) = &mut spool {
+        spool.flush()?;
+    }
     rawfile.publish()?;
     Ok(Report {
         deck: netlist.path.clone(),
@@ -261,12 +267,14 @@ pub fn run_with_format(
         output: output.to_path_buf(),
         format,
         plots,
+        spool,
     })
 }
 
-enum ActiveOutput {
-    Retained(Plot),
-    Streamed(RowProjection),
+struct ActiveOutput {
+    projection: RowProjection,
+    consumers: BoundConsumers,
+    print_start: Option<u64>,
 }
 
 /// One job's consumer: an ordered output plan, one active plot, and one
@@ -279,6 +287,8 @@ struct BatchOutput<'a> {
     title: &'a str,
     date: &'a str,
     writer: &'a mut RawFileTransaction,
+    spool: &'a mut Option<TextSpool>,
+    output: &'a Path,
     scope: &'a ParamScope,
     fourier_settings: Option<fourier::FourierSettings>,
 }
@@ -306,31 +316,69 @@ impl BatchOutput<'_> {
         Ok(())
     }
 
-    fn record(&mut self, report: PlotReport) {
-        self.reports.push(report);
-        self.next += 1;
+    fn begin_text(&mut self, consumers: &BoundConsumers) -> SpiceResult<Option<u64>> {
+        if !consumers.has_text() {
+            return Ok(None);
+        }
+        if self.spool.is_none() {
+            *self.spool = Some(TextSpool::create(self.output)?);
+        }
+        let spool = self
+            .spool
+            .as_mut()
+            .ok_or_else(|| output_error("missing report spool"))?;
+        let start = spool.position()?;
+        consumers.begin_text(|text| spool.append(text))?;
+        Ok(Some(start))
     }
 
-    fn write_completed(&mut self, plot: Plot) -> SpiceResult<()> {
+    fn finish_consumers(
+        &mut self,
+        consumers: BoundConsumers,
+        start: Option<u64>,
+    ) -> SpiceResult<(ObjectiveReports, Option<Range<u64>>)> {
+        let reports = consumers.finish(self.scope, self.fourier_settings, |text| {
+            append_text(self.spool, text)
+        })?;
+        let printed = start
+            .map(|start| -> SpiceResult<_> {
+                let spool = self
+                    .spool
+                    .as_mut()
+                    .ok_or_else(|| output_error("missing report spool"))?;
+                Ok(start..spool.position()?)
+            })
+            .transpose()?;
+        Ok((reports, printed))
+    }
+
+    fn record(
+        &mut self,
+        plot: &Plot,
+        points: usize,
+        objectives: ObjectiveReports,
+        printed: Option<Range<u64>>,
+    ) -> SpiceResult<()> {
         let planned = self.current()?;
-        let outputs = batch::resolve_outputs(plot, planned, self.scope, self.fourier_settings)?;
-        let raw_plot = raw_plot_for(self.title, outputs.written, self.date);
-        let mut report = PlotReport::written(
-            planned.name,
-            planned.kind,
-            &raw_plot.plot,
-            raw_plot.plot.point_count(),
-        );
-        report.printed = outputs.printed;
-        report.measured =
-            (!outputs.measurements.is_empty()).then(|| measure::to_text(&outputs.measurements));
-        report.measurements = outputs.measurements;
-        report.fourier = (!outputs.fourier.is_empty()).then(|| fourier::to_text(&outputs.fourier));
-        report.fourier_results = outputs.fourier;
-        self.writer.write_plot(&raw_plot)?;
-        self.record(report);
+        let mut report = PlotReport::written(planned.name, planned.kind, plot, points);
+        report.printed = printed;
+        report.measured = (!objectives.measurements.is_empty())
+            .then(|| measure::to_text(&objectives.measurements));
+        report.measurements = objectives.measurements;
+        report.fourier =
+            (!objectives.fourier.is_empty()).then(|| fourier::to_text(&objectives.fourier));
+        report.fourier_results = objectives.fourier;
+        self.reports.push(report);
+        self.next += 1;
         Ok(())
     }
+}
+
+fn append_text(spool: &mut Option<TextSpool>, text: &str) -> SpiceResult<()> {
+    spool
+        .as_mut()
+        .ok_or_else(|| output_error("missing report spool"))?
+        .append(text)
 }
 
 impl PointSink for BatchOutput<'_> {
@@ -341,51 +389,46 @@ impl PointSink for BatchOutput<'_> {
             ));
         }
         let planned = self.current()?;
-        self.active = Some(if planned.requires_retention() {
-            ActiveOutput::Retained(header.header())
-        } else {
-            let selection = planned.selection(header)?;
-            let raw_plot = raw_plot_for(self.title, selection.header(header)?, self.date);
-            let projection = selection.bind(header)?;
-            self.writer.begin_plot(raw_plot)?;
-            ActiveOutput::Streamed(projection)
+        let selection = planned.selection(header)?;
+        let raw_plot = raw_plot_for(self.title, selection.header(header)?, self.date);
+        let projection = selection.bind(header)?;
+        let consumers = planned.bind_consumers(header)?;
+        let print_start = self.begin_text(&consumers)?;
+        self.writer.begin_plot(raw_plot)?;
+        self.active = Some(ActiveOutput {
+            projection,
+            consumers,
+            print_start,
         });
         Ok(())
     }
 
     fn point(&mut self, values: &[Complex]) -> SpiceResult<()> {
-        match self
+        let active = self
             .active
             .as_mut()
-            .ok_or_else(|| output_error("point before plot header"))?
-        {
-            ActiveOutput::Retained(plot) => plot.push_point(values),
-            ActiveOutput::Streamed(projection) => {
-                self.writer.push_point(projection.project(values)?)
-            }
+            .ok_or_else(|| output_error("point before plot header"))?;
+        if !active.consumers.is_empty() {
+            active
+                .consumers
+                .point(values, |text| append_text(self.spool, text))?;
         }
+        self.writer.push_point(active.projection.project(values)?)
     }
 
     fn end(&mut self) -> SpiceResult<()> {
-        match self
+        let active = self
             .active
             .take()
-            .ok_or_else(|| output_error("end without an active plot"))?
-        {
-            ActiveOutput::Retained(plot) => self.write_completed(plot),
-            ActiveOutput::Streamed(_) => {
-                let completed = self.writer.finish_plot()?;
-                let planned = self.current()?;
-                let report = PlotReport::written(
-                    planned.name,
-                    planned.kind,
-                    &completed.header.plot,
-                    completed.point_count,
-                );
-                self.record(report);
-                Ok(())
-            }
-        }
+            .ok_or_else(|| output_error("end without an active plot"))?;
+        let (objectives, printed) = self.finish_consumers(active.consumers, active.print_start)?;
+        let completed = self.writer.finish_plot()?;
+        self.record(
+            &completed.header.plot,
+            completed.point_count,
+            objectives,
+            printed,
+        )
     }
 
     fn complete(&mut self, plot: Plot) -> SpiceResult<()> {
@@ -394,7 +437,24 @@ impl PointSink for BatchOutput<'_> {
                 "completed a plot before ending the previous one",
             ));
         }
-        self.write_completed(plot)
+        let planned = self.current()?;
+        let selection = planned.selection(&plot)?;
+        let mut consumers = planned.bind_consumers(&plot.header())?;
+        let start = self.begin_text(&consumers)?;
+        if !consumers.is_empty() {
+            for point in plot.rows() {
+                consumers.point(point, |text| append_text(self.spool, text))?;
+            }
+        }
+        let (objectives, printed) = self.finish_consumers(consumers, start)?;
+        let raw_plot = raw_plot_for(self.title, selection.into_plot(plot)?, self.date);
+        self.writer.write_plot(&raw_plot)?;
+        self.record(
+            &raw_plot.plot,
+            raw_plot.plot.point_count(),
+            objectives,
+            printed,
+        )
     }
 }
 
@@ -564,8 +624,10 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
 /// A multi-analysis deck prints the deck, title and output lines, the plot
 /// names in rawfile order, and then one section per plot (headed by its C plot
 /// name, e.g. `[tran1]`) with that plot's lines and blocks.
-#[must_use]
-pub fn report_text(report: &Report) -> String {
+///
+/// # Errors
+/// An error reading the completed report spool or writing to the destination.
+pub fn write_report(report: &mut Report, to: &mut impl Write) -> SpiceResult<()> {
     use std::fmt::Write as _;
 
     let mut out = String::new();
@@ -588,28 +650,38 @@ pub fn report_text(report: &Report) -> String {
                 "binary"
             }
         );
-        plot_blocks(&mut out, plot);
-        return out;
+        report_write(to, &out)?;
+        plot_blocks(to, plot, &mut report.spool)?;
+    } else {
+        let _ = writeln!(
+            out,
+            "output:    {} (ngspice {} rawfile with {} plots)",
+            report.output.display(),
+            if report.format == RawFormat::Ascii {
+                "ASCII"
+            } else {
+                "binary"
+            },
+            report.plots.len()
+        );
+        let names: Vec<&str> = report.plots.iter().map(|plot| plot.name.as_str()).collect();
+        let _ = writeln!(out, "plots:     {} (ngspice batch order)", names.join(" "));
+        report_write(to, &out)?;
+        for plot in &report.plots {
+            out.clear();
+            let _ = writeln!(out, "[{}]", plot.name);
+            plot_lines(&mut out, plot);
+            report_write(to, &out)?;
+            plot_blocks(to, plot, &mut report.spool)?;
+        }
     }
-    let _ = writeln!(
-        out,
-        "output:    {} (ngspice {} rawfile with {} plots)",
-        report.output.display(),
-        if report.format == RawFormat::Ascii {
-            "ASCII"
-        } else {
-            "binary"
-        },
-        report.plots.len()
-    );
-    let names: Vec<&str> = report.plots.iter().map(|plot| plot.name.as_str()).collect();
-    let _ = writeln!(out, "plots:     {} (ngspice batch order)", names.join(" "));
-    for plot in &report.plots {
-        let _ = writeln!(out, "[{}]", plot.name);
-        plot_lines(&mut out, plot);
-        plot_blocks(&mut out, plot);
-    }
-    out
+    to.flush()
+        .map_err(|error| SpiceError::io("<report>", &error))
+}
+
+fn report_write(to: &mut impl Write, text: &str) -> SpiceResult<()> {
+    to.write_all(text.as_bytes())
+        .map_err(|error| SpiceError::io("<report>", &error))
 }
 
 /// The analysis, plot and variable lines of one plot.
@@ -638,20 +710,28 @@ fn plot_lines(out: &mut String, plot: &PlotReport) {
 /// `.measure` results has a measurement block, and only one with `.four`
 /// results has a Fourier block; a deck without any of them keeps the report
 /// unchanged.
-fn plot_blocks(out: &mut String, plot: &PlotReport) {
-    for block in [&plot.printed, &plot.measured, &plot.fourier]
-        .into_iter()
-        .flatten()
-    {
-        out.push_str(block);
+fn plot_blocks(
+    to: &mut impl Write,
+    plot: &PlotReport,
+    spool: &mut Option<TextSpool>,
+) -> SpiceResult<()> {
+    if let Some(range) = &plot.printed {
+        spool
+            .as_mut()
+            .ok_or_else(|| output_error("missing report spool"))?
+            .copy_range(range.clone(), to)?;
     }
+    for block in [&plot.measured, &plot.fourier].into_iter().flatten() {
+        report_write(to, block)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         PlotReport, RawFormat, Report, civil_from_days, format_ctime, raw_format_from_env,
-        report_text,
+        write_report,
     };
     use crate::primitives::AnalysisKind;
     use std::path::PathBuf;
@@ -662,7 +742,7 @@ mod tests {
         plotname: String,
         variables: Vec<String>,
         points: usize,
-        printed: Option<String>,
+        printed: Option<std::ops::Range<u64>>,
         measured: Option<String>,
     ) -> PlotReport {
         PlotReport {
@@ -677,6 +757,20 @@ mod tests {
             fourier: None,
             fourier_results: Vec::new(),
         }
+    }
+
+    fn report_text(mut report: Report) -> String {
+        let mut out = Vec::new();
+        write_report(&mut report, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn attach_print(report: &mut Report, plot: usize, text: &str) {
+        let path = std::env::temp_dir().join("report-test.raw");
+        let mut spool = super::TextSpool::create(&path).unwrap();
+        spool.append(text).unwrap();
+        report.plots[plot].printed = Some(0..spool.position().unwrap());
+        report.spool = Some(spool);
     }
 
     #[test]
@@ -734,6 +828,7 @@ mod tests {
             title: "RC divider".to_owned(),
             output: PathBuf::from("out.raw"),
             format: crate::analysis::RawFormat::Ascii,
+            spool: None,
             plots: vec![plot(
                 AnalysisKind::OperatingPoint,
                 "Operating Point".to_owned(),
@@ -743,7 +838,7 @@ mod tests {
                 None,
             )],
         };
-        let text = report_text(&report);
+        let text = report_text(report);
         assert!(text.contains("deck:      rc.cir"), "{text}");
         assert!(text.contains("title:     RC divider"), "{text}");
         assert!(
@@ -768,21 +863,23 @@ mod tests {
 
     #[test]
     fn a_print_table_is_appended_after_the_report() {
-        let report = Report {
+        let mut report = Report {
             deck: PathBuf::from("rc.cir"),
             title: "RC divider".to_owned(),
             output: PathBuf::from("out.raw"),
             format: crate::analysis::RawFormat::Ascii,
+            spool: None,
             plots: vec![plot(
                 AnalysisKind::OperatingPoint,
                 "Operating Point".to_owned(),
                 vec!["v(out)".to_owned()],
                 1,
-                Some("print: 1 vector(s): v(out)\nvalues: real\n".to_owned()),
+                None,
                 Some("measure: 1 result(s)\n".to_owned()),
             )],
         };
-        let text = report_text(&report);
+        attach_print(&mut report, 0, "print: 1 vector(s): v(out)\nvalues: real\n");
+        let text = report_text(report);
         let report_end = text.find("output:    out.raw").expect("the report");
         let table = text.find("print: 1 vector(s): v(out)").expect("the table");
         let measured = text.find("measure: 1 result(s)").expect("the block");
@@ -797,6 +894,7 @@ mod tests {
             title: String::new(),
             output: PathBuf::from("out.raw"),
             format: crate::analysis::RawFormat::Ascii,
+            spool: None,
             plots: vec![plot(
                 AnalysisKind::Transient,
                 "Transient Analysis".to_owned(),
@@ -806,7 +904,7 @@ mod tests {
                 None,
             )],
         };
-        assert!(report_text(&report).contains("title:     <empty title line>"));
+        assert!(report_text(report).contains("title:     <empty title line>"));
     }
 
     #[test]
@@ -825,18 +923,20 @@ mod tests {
             "AC Analysis".to_owned(),
             vec!["frequency".to_owned(), "v(out)".to_owned()],
             3,
-            Some("print: 1 vector(s): vm(out)\n".to_owned()),
+            None,
             None,
         );
         ac.name = "ac1".to_owned();
-        let report = Report {
+        let mut report = Report {
             deck: PathBuf::from("rc.cir"),
             title: "RC".to_owned(),
             output: PathBuf::from("out.raw"),
             format: crate::analysis::RawFormat::Ascii,
+            spool: None,
             plots: vec![ac, tran],
         };
-        let text = report_text(&report);
+        attach_print(&mut report, 0, "print: 1 vector(s): vm(out)\n");
+        let text = report_text(report);
         assert!(
             text.contains("output:    out.raw (ngspice ASCII rawfile with 2 plots"),
             "{text}"

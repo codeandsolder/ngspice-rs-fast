@@ -332,13 +332,12 @@ impl EventPlan {
     }
 }
 
-enum EventState<'a> {
+enum EventState {
     At {
         at: Real,
         window: MeasureWindow,
     },
     Cross {
-        plan: &'a EventPlan,
         selector: CrossingSelector,
         previous: Option<(Real, SpiceResult<Real>)>,
         error: Option<SpiceError>,
@@ -346,8 +345,8 @@ enum EventState<'a> {
     },
 }
 
-impl<'a> EventState<'a> {
-    fn new(plan: &'a EventPlan, card: &MeasureCard) -> SpiceResult<Self> {
+impl EventState {
+    fn new(plan: &EventPlan, card: &MeasureCard) -> SpiceResult<Self> {
         match plan {
             EventPlan::At { at, window } => Ok(Self::At {
                 at: *at,
@@ -365,7 +364,6 @@ impl<'a> EventState<'a> {
                     ));
                 }
                 Ok(Self::Cross {
-                    plan,
                     selector: CrossingSelector::new(*transition, card)?,
                     previous: None,
                     error: None,
@@ -375,21 +373,22 @@ impl<'a> EventState<'a> {
         }
     }
 
-    fn observe(&mut self, x: Real, row: &[Complex], card: &MeasureCard) {
-        let Self::Cross {
-            plan:
-                EventPlan::Cross {
-                    left,
-                    right,
-                    threshold,
-                    window,
-                    ..
-                },
-            selector,
-            previous,
-            error,
-            in_window,
-        } = self
+    fn observe(&mut self, plan: &EventPlan, x: Real, row: &[Complex], card: &MeasureCard) {
+        let (
+            Self::Cross {
+                selector,
+                previous,
+                error,
+                in_window,
+            },
+            EventPlan::Cross {
+                left,
+                right,
+                threshold,
+                window,
+                ..
+            },
+        ) = (self, plan)
         else {
             return;
         };
@@ -429,29 +428,25 @@ impl<'a> EventState<'a> {
         }
     }
 
-    fn finish(self, axis: &AxisTracker, card: &MeasureCard) -> SpiceResult<Real> {
+    fn finish(self, plan: &EventPlan, axis: &AxisTracker, card: &MeasureCard) -> SpiceResult<Real> {
         let range = axis.range()?;
-        match self {
-            Self::At { at, window } => {
+        match (self, plan) {
+            (Self::At { at, window }, EventPlan::At { .. }) => {
                 let window = Window::from_range(&window, range, axis.name, card)?;
-                if !at.is_finite() || at < window.from || at > window.to {
-                    return Err(unsupported(
-                        card,
-                        "the event AT= is outside the measurement window (out of interval)".into(),
-                    ));
-                }
+                window.check_at(range, axis.name, at, card, "the event AT=")?;
                 Ok(at)
             }
-            Self::Cross {
-                plan:
-                    EventPlan::Cross {
-                        window, transition, ..
-                    },
-                selector,
-                error,
-                in_window,
-                ..
-            } => {
+            (
+                Self::Cross {
+                    selector,
+                    error,
+                    in_window,
+                    ..
+                },
+                EventPlan::Cross {
+                    window, transition, ..
+                },
+            ) => {
                 let bounds = Window::from_range(window, range, axis.name, card)?;
                 if !in_window {
                     return Err(no_samples(card));
@@ -461,7 +456,7 @@ impl<'a> EventState<'a> {
                 }
                 selector.selected.ok_or_else(|| unsupported(card, format!(".measure {}: no {} crossing found from the window's lower bound [{}, {}]", card.name, transition.name(), bounds.from, bounds.to)))
             }
-            Self::Cross { .. } => Err(unsupported(card, "invalid bound event".into())),
+            _ => Err(unsupported(card, "invalid bound event".into())),
         }
     }
 }
@@ -700,10 +695,7 @@ impl BoundMeasure {
         }
     }
 
-    pub(in crate::analysis) fn start<'a>(
-        &'a self,
-        card: &'a MeasureCard,
-    ) -> SpiceResult<MeasureState<'a>> {
+    pub(in crate::analysis) fn start(&self, card: &MeasureCard) -> SpiceResult<MeasureState> {
         let state = match self {
             Self::Find { at, .. } => Reduction::Find(PointQuery::new(*at, true)),
             Self::Statistic { statistic, .. }
@@ -726,76 +718,79 @@ impl BoundMeasure {
                 Reduction::Delay(EventState::new(trig, card)?, EventState::new(targ, card)?)
             }
         };
-        Ok(MeasureState {
-            plan: self,
-            card,
-            state,
-            error: None,
-        })
+        Ok(MeasureState { state, error: None })
     }
 }
 
-struct EventQueryState<'a> {
-    event: EventState<'a>,
+struct EventQueryState {
+    event: EventState,
     history: LocalHistory,
 }
 
-enum Reduction<'a> {
-    AtEvent(Box<EventQueryState<'a>>),
+enum Reduction {
+    AtEvent(Box<EventQueryState>),
     Find(PointQuery),
     Statistic(StatisticState),
     Margin(MarginScan),
-    When(EventState<'a>),
-    Delay(EventState<'a>, EventState<'a>),
+    When(EventState),
+    Delay(EventState, EventState),
 }
 
-pub(in crate::analysis) struct MeasureState<'a> {
-    plan: &'a BoundMeasure,
-    card: &'a MeasureCard,
-    state: Reduction<'a>,
+pub(in crate::analysis) struct MeasureState {
+    state: Reduction,
     error: Option<SpiceError>,
 }
 
-impl MeasureState<'_> {
-    pub(in crate::analysis) fn observe(&mut self, x: Real, row: &[Complex]) {
+impl MeasureState {
+    pub(in crate::analysis) fn observe(
+        &mut self,
+        plan: &BoundMeasure,
+        card: &MeasureCard,
+        x: Real,
+        row: &[Complex],
+    ) {
         if self.error.is_some() {
             return;
         }
-        match (&mut self.state, self.plan) {
+        match (&mut self.state, plan) {
             (Reduction::Find(query), BoundMeasure::Find { column, .. }) => {
-                query.observe(x, || read(column, row, self.card).map(Complex::real));
+                query.observe(x, || read(column, row, card).map(Complex::real));
             }
             (Reduction::Margin(scan), BoundMeasure::Statistic { column, window, .. }) => {
                 if scan.selected.is_none() {
                     self.error = column
                         .value(row)
-                        .and_then(|value| scan.observe(x, value, &raw_window(window), self.card))
+                        .and_then(|value| scan.observe(x, value, &raw_window(window), card))
                         .err();
                 }
             }
             (Reduction::Statistic(state), BoundMeasure::Statistic { column, window, .. }) => {
-                self.error = state
-                    .observe(x, || read(column, row, self.card), window)
-                    .err();
+                self.error = state.observe(x, || read(column, row, card), window).err();
             }
-            (Reduction::AtEvent(state), BoundMeasure::AtEvent { column, .. }) => {
-                state.event.observe(x, row, self.card);
-                state.history.observe(x, read(column, row, self.card));
+            (Reduction::AtEvent(state), BoundMeasure::AtEvent { column, event, .. }) => {
+                state.event.observe(event, x, row, card);
+                state.history.observe(x, read(column, row, card));
                 if let Some(at) = state.event.selected() {
                     state.history.select(at);
                 }
             }
-            (Reduction::When(event), _) => event.observe(x, row, self.card),
-            (Reduction::Delay(trig, targ), _) => {
-                trig.observe(x, row, self.card);
-                targ.observe(x, row, self.card);
+            (Reduction::When(state), BoundMeasure::When { event, .. }) => {
+                state.observe(event, x, row, card)
+            }
+            (Reduction::Delay(trig_state, targ_state), BoundMeasure::Delay { trig, targ, .. }) => {
+                trig_state.observe(trig, x, row, card);
+                targ_state.observe(targ, x, row, card);
             }
             _ => self.error = Some(SpiceError::circuit("measurement reduction mismatch")),
         }
     }
 
-    pub(in crate::analysis) fn finish(self, axis: &AxisTracker) -> SpiceResult<Measurement> {
-        let card = self.card;
+    pub(in crate::analysis) fn finish(
+        self,
+        plan: &BoundMeasure,
+        card: &MeasureCard,
+        axis: &AxisTracker,
+    ) -> SpiceResult<Measurement> {
         let mut result = Measurement {
             name: card.name.clone(),
             value: 0.,
@@ -805,15 +800,10 @@ impl MeasureState<'_> {
             events: None,
         };
         let range = axis.range()?;
-        match (self.state, self.plan) {
+        match (self.state, plan) {
             (Reduction::Find(query), BoundMeasure::Find { column, at, window }) => {
                 let window = Window::from_range(window, range, axis.name, card)?;
-                if !at.is_finite() || *at < window.from || *at > window.to {
-                    return Err(unsupported(
-                        card,
-                        "AT= is outside the measurement window (out of interval)".into(),
-                    ));
-                }
+                window.check_at(range, axis.name, *at, card, "AT=")?;
                 result.value = query_value(query, card)?;
                 result.at = Some(*at);
                 result.unit = column.unit().into();
@@ -856,11 +846,11 @@ impl MeasureState<'_> {
                     column,
                     derivative,
                     window,
-                    ..
+                    event,
                 },
             ) => {
                 Window::from_range(window, range, axis.name, card)?;
-                let at = state.event.finish(axis, card)?;
+                let at = state.event.finish(event, axis, card)?;
                 result.value = state.history.finish(at, *derivative, card)?;
                 result.at = Some(at);
                 result.unit = if *derivative {
@@ -869,14 +859,17 @@ impl MeasureState<'_> {
                     column.unit().into()
                 };
             }
-            (Reduction::When(event), BoundMeasure::When { window, .. }) => {
+            (Reduction::When(state), BoundMeasure::When { window, event }) => {
                 Window::from_range(window, range, axis.name, card)?;
-                result.value = event.finish(axis, card)?;
+                result.value = state.finish(event, axis, card)?;
             }
-            (Reduction::Delay(trig, targ), BoundMeasure::Delay { window, .. }) => {
+            (
+                Reduction::Delay(trig_state, targ_state),
+                BoundMeasure::Delay { window, trig, targ },
+            ) => {
                 Window::from_range(window, range, axis.name, card)?;
-                let trig = trig.finish(axis, card)?;
-                let targ = targ.finish(axis, card)?;
+                let trig = trig_state.finish(trig, axis, card)?;
+                let targ = targ_state.finish(targ, axis, card)?;
                 result.value = targ - trig;
                 result.events = Some(MeasureEvents { trig, targ });
             }

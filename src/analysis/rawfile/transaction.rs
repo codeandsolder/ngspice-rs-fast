@@ -3,7 +3,8 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind};
+use std::io::{self, BufWriter, ErrorKind, Read, Seek, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -149,6 +150,61 @@ fn anchor(output: &Path) -> SpiceResult<PathBuf> {
         )));
     }
     Ok(parent.join(name))
+}
+
+/// One transaction-owned report spool, with byte ranges for consecutive plots.
+/// Text is never exposed until the simulation and rawfile publication succeed.
+#[derive(Debug)]
+pub(crate) struct TextSpool {
+    file: BufWriter<File>,
+    temporary: OwnedTemporary,
+}
+
+impl TextSpool {
+    pub(crate) fn create(output: &Path) -> SpiceResult<Self> {
+        let (file, temporary) = create_beside(&anchor(output)?, names("report"))?;
+        Ok(Self {
+            file: BufWriter::new(file),
+            temporary,
+        })
+    }
+
+    pub(crate) fn append(&mut self, text: &str) -> SpiceResult<()> {
+        self.file
+            .write_all(text.as_bytes())
+            .map_err(|error| SpiceError::io(self.temporary.path(), &error))
+    }
+
+    pub(crate) fn position(&mut self) -> SpiceResult<u64> {
+        self.file
+            .stream_position()
+            .map_err(|error| SpiceError::io(self.temporary.path(), &error))
+    }
+
+    pub(crate) fn flush(&mut self) -> SpiceResult<()> {
+        self.file
+            .flush()
+            .map_err(|error| SpiceError::io(self.temporary.path(), &error))
+    }
+
+    pub(crate) fn copy_range(&mut self, range: Range<u64>, to: &mut impl Write) -> SpiceResult<()> {
+        let length = range
+            .end
+            .checked_sub(range.start)
+            .ok_or_else(|| unsupported("invalid report spool range"))?;
+        let copy = (|| -> io::Result<()> {
+            self.file.seek(io::SeekFrom::Start(range.start))?;
+            let count = io::copy(&mut self.file.get_mut().take(length), to)?;
+            if count != length {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "incomplete report spool",
+                ));
+            }
+            Ok(())
+        })();
+        copy.map_err(|error| SpiceError::io(self.temporary.path(), &error))
+    }
 }
 
 /// An atomic output transaction for one complete rawfile.
@@ -333,6 +389,39 @@ mod tests {
             .collect();
         entries.sort_unstable();
         entries
+    }
+
+    #[test]
+    fn report_spool_replays_ranges_and_removes_owned_path_after_sink_failure() {
+        struct FailedWriter;
+
+        impl Write for FailedWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(ErrorKind::BrokenPipe, "closed report sink"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = Scratch::new("report-spool-ranges").unwrap();
+        let mut spool = TextSpool::create(&dir.path().join("final.raw")).unwrap();
+        let path = spool.temporary.path().to_path_buf();
+        let start = spool.position().unwrap();
+        spool.append("first plot\n").unwrap();
+        let boundary = spool.position().unwrap();
+        spool.append("second plot\n").unwrap();
+        let end = spool.position().unwrap();
+        spool.flush().unwrap();
+        let mut replay = Vec::new();
+        spool.copy_range(boundary..end, &mut replay).unwrap();
+        spool.copy_range(start..boundary, &mut replay).unwrap();
+        assert_eq!(replay, b"second plot\nfirst plot\n");
+        assert!(spool.copy_range(start..end, &mut FailedWriter).is_err());
+        drop(spool);
+        assert!(!path.exists());
+        assert!(entries(dir.path()).is_empty());
     }
 
     #[test]

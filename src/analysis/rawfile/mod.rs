@@ -58,6 +58,7 @@ mod transaction;
 
 use transaction::OwnedTemporary;
 pub use transaction::RawFileTransaction;
+pub(crate) use transaction::TextSpool;
 
 use std::fmt;
 use std::fs::File;

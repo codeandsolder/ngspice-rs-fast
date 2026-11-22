@@ -598,10 +598,10 @@ pub struct PlotObjectives {
     pub retained_cells: usize,
 }
 
-struct ActivePlot<'a> {
-    plan: &'a PlotObjectivePlan,
+/// Mutable row state, independent of where the immutable plan is stored.
+pub(in crate::analysis) struct ActivePlot {
     axis: Option<AxisTracker>,
-    measurements: Vec<Option<MeasureState<'a>>>,
+    measurements: Vec<Option<MeasureState>>,
     observations: Vec<ObservationState>,
     query_rows: QueryRows,
     last_row: Vec<Complex>,
@@ -611,8 +611,8 @@ struct ActivePlot<'a> {
     peak_retained: usize,
 }
 
-impl<'a> ActivePlot<'a> {
-    fn new(plan: &'a PlotObjectivePlan) -> SpiceResult<Self> {
+impl ActivePlot {
+    pub(in crate::analysis) fn new(plan: &PlotObjectivePlan) -> SpiceResult<Self> {
         let measurements = plan
             .reductions
             .iter()
@@ -625,7 +625,6 @@ impl<'a> ActivePlot<'a> {
             .map(ObservationState::new)
             .collect();
         Ok(Self {
-            plan,
             axis: plan.axis.as_ref().map(AxisTracker::fresh),
             measurements,
             observations,
@@ -641,8 +640,12 @@ impl<'a> ActivePlot<'a> {
         })
     }
 
-    fn point(&mut self, row: &[Complex]) -> SpiceResult<()> {
-        self.plan.source.check_point(row)?;
+    pub(in crate::analysis) fn point(
+        &mut self,
+        plan: &PlotObjectivePlan,
+        row: &[Complex],
+    ) -> SpiceResult<()> {
+        plan.source.check_point(row)?;
         self.rows = self
             .rows
             .checked_add(1)
@@ -654,34 +657,35 @@ impl<'a> ActivePlot<'a> {
                 .as_ref()
                 .is_some_and(AxisTracker::is_nondecreasing)
         {
-            for measure in self.measurements.iter_mut().flatten() {
-                measure.observe(x, row);
+            for ((state, bound), card) in self
+                .measurements
+                .iter_mut()
+                .zip(&plan.reductions)
+                .zip(&plan.measurements)
+            {
+                if let (Some(state), Some(bound)) = (state, bound) {
+                    state.observe(bound, card, x, row);
+                }
             }
         }
-        if let Some(last) = &self.plan.last {
+        if let Some(last) = &plan.last {
             self.last_row.clear();
             self.last_row
                 .extend(last.columns.iter().map(|&index| row[index]));
         }
-        for &index in &self.plan.traces {
-            self.observations[index].observe(
-                &self.plan.observations[index],
-                row,
-                None,
-                self.plan.trace_axis,
-            );
+        for &index in &plan.traces {
+            self.observations[index].observe(&plan.observations[index], row, None, plan.trace_axis);
         }
         if let Some(x) = axis {
             self.query_rows.observe(
-                &self.plan.queries,
-                &self.plan.observations,
+                &plan.queries,
+                &plan.observations,
                 &mut self.observations,
                 x,
                 row,
             );
         }
-        if let (Ok(Some(retained)), Some(projection)) = (&mut self.retained, &self.plan.projection)
-        {
+        if let (Ok(Some(retained)), Some(projection)) = (&mut self.retained, &plan.projection) {
             let next = retained.cells().len().checked_add(projection.columns.len());
             if next.is_none_or(|next| next > projection.limit) {
                 self.retained = Err(invalid(format!(
@@ -701,9 +705,14 @@ impl<'a> ActivePlot<'a> {
         Ok(())
     }
 
-    fn finish(self, scope: &ParamScope) -> PlotObjectives {
+    pub(in crate::analysis) fn finish(
+        self,
+        plan: &PlotObjectivePlan,
+        scope: &ParamScope,
+        settings: Option<fourier::FourierSettings>,
+    ) -> PlotObjectives {
         let measurements = (|| {
-            if self.plan.measurements.is_empty() {
+            if plan.measurements.is_empty() {
                 return Ok(Vec::new());
             }
             let axis = self
@@ -717,35 +726,35 @@ impl<'a> ActivePlot<'a> {
             let mut online = self
                 .measurements
                 .into_iter()
-                .map(|measure| measure.map(|measure| measure.finish(axis)))
+                .zip(&plan.reductions)
+                .zip(&plan.measurements)
+                .map(|((state, bound), card)| {
+                    state
+                        .zip(bound.as_ref())
+                        .map(|(state, bound)| state.finish(bound, card, axis))
+                })
                 .collect::<Vec<_>>();
             let mut retained_axis = None;
-            measure::resolve_ordered(
-                self.plan.kind,
-                self.plan.measurements.iter(),
-                scope,
-                |index, card| {
-                    if let Some(result) = online[index].take() {
-                        return result;
-                    }
-                    let retained = self
-                        .retained
-                        .as_ref()
-                        .map_err(Clone::clone)?
-                        .as_ref()
-                        .ok_or_else(|| invalid("measurement requires retained samples"))?;
-                    if retained_axis.is_none() {
-                        retained_axis = Some(Axis::of(retained, self.plan.kind)?);
-                    }
-                    let axis = retained_axis
-                        .as_ref()
-                        .ok_or_else(|| invalid("missing retained axis"))?;
-                    measure::evaluate(retained, axis, card)
-                },
-            )
+            measure::resolve_ordered(plan.kind, plan.measurements.iter(), scope, |index, card| {
+                if let Some(result) = online[index].take() {
+                    return result;
+                }
+                let retained = self
+                    .retained
+                    .as_ref()
+                    .map_err(Clone::clone)?
+                    .as_ref()
+                    .ok_or_else(|| invalid("measurement requires retained samples"))?;
+                if retained_axis.is_none() {
+                    retained_axis = Some(Axis::of(retained, plan.kind)?);
+                }
+                let axis = retained_axis
+                    .as_ref()
+                    .ok_or_else(|| invalid("missing retained axis"))?;
+                measure::evaluate(retained, axis, card)
+            })
         })();
-        let last = self
-            .plan
+        let last = plan
             .last
             .as_ref()
             .filter(|_| self.rows != 0)
@@ -753,11 +762,11 @@ impl<'a> ActivePlot<'a> {
         let observations = self
             .observations
             .into_iter()
-            .zip(&self.plan.observations)
+            .zip(&plan.observations)
             .map(|(state, bound)| state.finish(bound, self.axis.as_ref(), last))
             .collect();
         let fourier = (|| {
-            if self.plan.fourier.is_empty() {
+            if plan.fourier.is_empty() {
                 return Ok(Vec::new());
             }
             let plot = self
@@ -766,8 +775,11 @@ impl<'a> ActivePlot<'a> {
                 .map_err(Clone::clone)?
                 .as_ref()
                 .ok_or_else(|| invalid("Fourier requires retained samples"))?;
-            let cards = fourier::resolve_cards(&self.plan.fourier, scope)?;
-            fourier::resolve(plot, self.plan.kind, &cards)
+            let cards = fourier::resolve_cards(&plan.fourier, scope)?;
+            match settings {
+                Some(settings) => fourier::resolve_with_settings(plot, plan.kind, &cards, settings),
+                None => fourier::resolve(plot, plan.kind, &cards),
+            }
         })();
         PlotObjectives {
             measurements,
@@ -865,7 +877,7 @@ pub enum ScenarioFailure {
 pub struct ScenarioSink<'a> {
     plan: &'a ScenarioPlan,
     scope: &'a ParamScope,
-    active: Option<ActivePlot<'a>>,
+    active: Option<ActivePlot>,
     results: Vec<PlotObjectives>,
     failed: bool,
 }
@@ -922,7 +934,7 @@ impl PointSink for ScenarioSink<'_> {
             self.active
                 .as_mut()
                 .ok_or_else(|| lifecycle_error("objective row without an active plot"))
-                .and_then(|active| active.point(values))
+                .and_then(|active| active.point(&self.plan.plots[self.results.len()], values))
         };
         self.checked(result)
     }
@@ -936,7 +948,11 @@ impl PointSink for ScenarioSink<'_> {
                 .active
                 .take()
                 .ok_or_else(|| lifecycle_error("objective completion without active plot"))?;
-            self.results.push(active.finish(self.scope));
+            self.results.push(active.finish(
+                &self.plan.plots[self.results.len()],
+                self.scope,
+                None,
+            ));
             Ok(())
         })();
         self.checked(result)

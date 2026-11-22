@@ -381,12 +381,12 @@ impl Axis {
         Ok(Self { name, values })
     }
 
-    fn first(&self) -> Real {
-        self.values.as_slice().first().copied().unwrap_or(0.0)
-    }
-
-    fn last(&self) -> Real {
-        self.values.as_slice().last().copied().unwrap_or(0.0)
+    fn range(&self) -> Option<(Real, Real)> {
+        self.values
+            .as_slice()
+            .first()
+            .copied()
+            .zip(self.values.as_slice().last().copied())
     }
 }
 
@@ -399,13 +399,7 @@ struct Window {
 
 impl Window {
     fn resolve(window: &MeasureWindow, axis: &Axis, card: &MeasureCard) -> SpiceResult<Self> {
-        let range = axis
-            .values
-            .as_slice()
-            .first()
-            .copied()
-            .zip(axis.values.as_slice().last().copied());
-        Self::from_range(window, range, axis.name, card)
+        Self::from_range(window, axis.range(), axis.name, card)
     }
 
     fn from_range(
@@ -455,6 +449,30 @@ impl Window {
             from: from.max(first),
             to: to.min(last),
         })
+    }
+
+    fn check_at(
+        &self,
+        range: Option<(Real, Real)>,
+        axis: &str,
+        at: Real,
+        card: &MeasureCard,
+        what: &str,
+    ) -> SpiceResult<()> {
+        check_range_values(range, axis, at, card, what)?;
+        if at < self.from || at > self.to {
+            return Err(unsupported(
+                card,
+                format!(
+                    ".measure {}: {what}{} is outside the measurement window [{}, {}]",
+                    card.name,
+                    crate::primitives::format_spice_number(at),
+                    crate::primitives::format_spice_number(self.from),
+                    crate::primitives::format_spice_number(self.to)
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// The index range of the samples inside the window, inclusive.
@@ -687,19 +705,7 @@ fn evaluate_find(
 ) -> SpiceResult<Measurement> {
     let operand = Operand::resolve(plot, operand, &card.name)?;
     let window = Window::resolve(window, axis, card)?;
-    check_range(axis, at, card, "AT=")?;
-    if at < window.from || at > window.to {
-        return Err(unsupported(
-            card,
-            format!(
-                ".measure {}: AT={} is outside the measurement window [{}, {}]",
-                card.name,
-                crate::primitives::format_spice_number(at),
-                crate::primitives::format_spice_number(window.from),
-                crate::primitives::format_spice_number(window.to)
-            ),
-        ));
-    }
+    window.check_at(axis.range(), axis.name, at, card, "AT=")?;
     Ok(Measurement {
         name: card.name.clone(),
         value: value_at(axis, &operand, at, card)?,
@@ -732,22 +738,31 @@ fn value_at(axis: &Axis, operand: &Operand<'_>, x: Real, card: &MeasureCard) -> 
 
 /// Rejects an axis value outside the plot's own range.
 fn check_range(axis: &Axis, x: Real, card: &MeasureCard, what: &str) -> SpiceResult<()> {
-    if axis.values.is_empty() {
+    check_range_values(axis.range(), axis.name, x, card, what)
+}
+
+fn check_range_values(
+    range: Option<(Real, Real)>,
+    axis: &str,
+    x: Real,
+    card: &MeasureCard,
+    what: &str,
+) -> SpiceResult<()> {
+    let Some((first, last)) = range else {
         return Err(unsupported(
             card,
             format!(".measure {}: the plot has no points", card.name),
         ));
-    }
-    if !x.is_finite() || x < axis.first() || x > axis.last() {
+    };
+    if !x.is_finite() || x < first || x > last {
         return Err(unsupported(
             card,
             format!(
-                ".measure {}: {what}{} is outside the {} range [{}, {}] (out of interval)",
+                ".measure {}: {what}{} is outside the {axis} range [{}, {}] (out of interval)",
                 card.name,
                 crate::primitives::format_spice_number(x),
-                axis.name,
-                crate::primitives::format_spice_number(axis.first()),
-                crate::primitives::format_spice_number(axis.last())
+                crate::primitives::format_spice_number(first),
+                crate::primitives::format_spice_number(last)
             ),
         ));
     }
@@ -1146,19 +1161,7 @@ fn event_at(
             event_at(plot, axis, event, &window, card)
         }
         MeasureEvent::At { at, .. } => {
-            check_range(axis, *at, card, "the event AT=")?;
-            if *at < window.from || *at > window.to {
-                return Err(unsupported(
-                    card,
-                    format!(
-                        ".measure {}: the event AT={} is outside the measurement window [{}, {}]",
-                        card.name,
-                        crate::primitives::format_spice_number(*at),
-                        crate::primitives::format_spice_number(window.from),
-                        crate::primitives::format_spice_number(window.to)
-                    ),
-                ));
-            }
+            window.check_at(axis.range(), axis.name, *at, card, "the event AT=")?;
             Ok(*at)
         }
         MeasureEvent::VectorCrossing {
