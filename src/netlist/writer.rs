@@ -102,7 +102,7 @@
 //! indexes, names that are not single tokens or would be treated as comments,
 //! and scopes crossing include boundaries.
 
-use std::fmt::Write as _;
+use std::io::{self, Write};
 
 use crate::primitives::{AnalysisKind, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
 
@@ -117,29 +117,93 @@ use crate::netlist::behavioural::forms::{
 };
 use crate::netlist::expr::ParameterExpression;
 use crate::netlist::semantic::equal as semantic_equal;
-use crate::netlist::source::{LogicalLine, parse_deck_text, strip_comment};
-use crate::netlist::token::{Token, TokenKind, tokenize};
+use crate::netlist::source::{parse_deck_text, strip_comment};
+use crate::netlist::token::{Lexeme, TokenKind, scan_next};
 use crate::netlist::{Parser, parse_parameter_expression};
 
-/// Serializes `netlist` as a normalized deck. See the [module documentation](self)
-/// for the contract.
+/// Resource limits for normalized emission.
+///
+/// Byte limits count emitted UTF-8
+/// bytes, including indentation and newlines. The title consumes bytes but
+/// is not a card. The card budget counts visited ordered card occurrences,
+/// including skipped include content in a visited scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteLimits {
+    /// Maximum total emitted bytes.
+    pub bytes: usize,
+    /// Maximum bytes in any emitted line (including the title).
+    pub card_bytes: usize,
+    /// Maximum visited logical cards.
+    pub cards: usize,
+    /// Maximum nested subcircuit depth; capped at the parser's limit of 64.
+    pub depth: usize,
+}
+
+impl Default for WriteLimits {
+    fn default() -> Self {
+        Self {
+            bytes: 64 * 1024 * 1024,
+            card_bytes: 16 * 1024 * 1024,
+            cards: 1_000_000,
+            depth: 64,
+        }
+    }
+}
+
+/// Serializes a normalized deck to a string using the bounded emission kernel.
 ///
 /// # Errors
-///
-/// [`SpiceError::Unsupported`] for constructs that cannot be written so that
-/// they re-parse to the same semantics.
+/// Invalid or unrepresentable AST, exceeded resource limits or allocation failure.
 pub fn write_netlist(netlist: &Netlist) -> SpiceResult<String> {
+    let mut collector = Collector(Vec::new());
+    write_netlist_to(netlist, &mut collector, WriteLimits::default())?;
+    String::from_utf8(collector.0)
+        .map_err(|error| refuse(error.to_string(), Some(&netlist.location)))
+}
+
+/// Emit normalized cards to a caller-owned sink without flushing it.
+///
+/// On error the sink may already contain a prefix of the deck (including a
+/// partially written card on I/O failure); atomic publication belongs to the
+/// caller. The same validation and order apply as in [`write_netlist`].
+///
+/// # Errors
+/// Invalid/unrepresentable AST, exceeded resource limits or sink I/O failure.
+pub fn write_netlist_to(
+    netlist: &Netlist,
+    sink: &mut dyn Write,
+    limits: WriteLimits,
+) -> SpiceResult<()> {
     if netlist.title.contains(['\n', '\r']) || netlist.title != netlist.title.trim_end() {
         return Err(refuse(
             "the title must be one line without trailing whitespace",
             Some(&netlist.location),
         ));
     }
-    let mut writer = Writer { out: String::new() };
-    writer.out.push_str(&netlist.title);
-    writer.out.push('\n');
-    writer.scope(ScopeView::from(netlist), 0, false)?;
-    Ok(writer.out)
+    let mut writer = Writer {
+        sink,
+        buffer: String::new(),
+        remaining: limits.bytes,
+        cards: limits.cards,
+        card_bytes: limits.card_bytes,
+        depth: limits.depth.min(64),
+    };
+    writer.emit(0, &netlist.title, &netlist.location, true)?;
+    writer.scope(ScopeView::from(netlist), 0, false)
+}
+
+struct Collector(Vec<u8>);
+
+impl Write for Collector {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.try_reserve(bytes.len()).map_err(io::Error::other)?;
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn refuse(what: impl Into<String>, location: Option<&SourceLoc>) -> SpiceError {
@@ -149,27 +213,171 @@ fn refuse(what: impl Into<String>, location: Option<&SourceLoc>) -> SpiceError {
     }
 }
 
-struct Writer {
-    out: String,
+struct Card<'a> {
+    text: &'a mut String,
+    limit: usize,
+    location: &'a SourceLoc,
 }
 
-impl Writer {
-    fn line(&mut self, depth: usize, text: &str, location: &SourceLoc) -> SpiceResult<()> {
-        if text.contains(['\n', '\r']) || strip_comment(text, false) != text {
+impl Card<'_> {
+    fn check_length(&self, additional: usize) -> SpiceResult<()> {
+        if additional > self.limit.saturating_sub(self.text.len()) {
             return Err(refuse(
-                format!("card would not survive comment/line handling: {text:?}"),
-                Some(location),
+                "card/total byte limit exceeded",
+                Some(self.location),
             ));
         }
-        for _ in 0..depth {
-            self.out.push_str("  ");
-        }
-        self.out.push_str(text);
-        self.out.push('\n');
         Ok(())
     }
 
+    fn push_str(&mut self, text: &str) -> SpiceResult<()> {
+        self.check_length(text.len())?;
+        let needed = self.text.len() + text.len();
+        if needed > self.text.capacity() {
+            // Amortized growth within the configured card budget.
+            let capacity = needed
+                .max(self.text.capacity().saturating_mul(2))
+                .min(self.limit);
+            self.text
+                .try_reserve_exact(capacity - self.text.len())
+                .map_err(|error| {
+                    refuse(
+                        format!("card buffer allocation: {error}"),
+                        Some(self.location),
+                    )
+                })?;
+        }
+        self.text.push_str(text);
+        Ok(())
+    }
+
+    fn push(&mut self, character: char) -> SpiceResult<()> {
+        self.push_str(character.encode_utf8(&mut [0; 4]))
+    }
+
+    fn word(&mut self, word: &str) -> SpiceResult<()> {
+        if !self.text.is_empty() {
+            self.push(' ')?;
+        }
+        self.push_str(word)
+    }
+
+    fn expression(&mut self, expression: &ParameterExpression) -> SpiceResult<()> {
+        match (expression.braced, expression.quoted) {
+            (true, true) => {
+                self.push('\'')?;
+                self.push_str(&expression.text)?;
+                self.push('\'')
+            }
+            (true, false) => {
+                self.push('{')?;
+                self.push_str(&expression.text)?;
+                self.push('}')
+            }
+            (false, false) => self.push_str(&expression.text),
+            (false, true) => Err(refuse(
+                "quoted expression without delimiters",
+                Some(self.location),
+            )),
+        }
+    }
+}
+
+struct Writer<'a> {
+    sink: &'a mut dyn Write,
+    buffer: String,
+    remaining: usize,
+    cards: usize,
+    card_bytes: usize,
+    depth: usize,
+}
+
+fn emit_line(
+    sink: &mut dyn Write,
+    remaining: &mut usize,
+    card_bytes: usize,
+    depth: usize,
+    text: &str,
+    location: &SourceLoc,
+    title: bool,
+) -> SpiceResult<()> {
+    let indent = 2 * depth; // depth is checked against the parser limit
+    let bytes = text
+        .len()
+        .checked_add(indent + 1)
+        .filter(|&size| size <= card_bytes && size <= *remaining)
+        .ok_or_else(|| refuse("card/total byte limit exceeded", Some(location)))?;
+    if !title && (text.contains(['\n', '\r']) || strip_comment(text, false) != text) {
+        return Err(refuse(
+            format!("card would not survive comment/line handling: {text:?}"),
+            Some(location),
+        ));
+    }
+    sink.write_all(&[b' '; 128][..indent])
+        .and_then(|()| sink.write_all(text.as_bytes()))
+        .and_then(|()| sink.write_all(b"\n"))
+        .map_err(|error| SpiceError::io(location.path(), &error))?;
+    *remaining -= bytes;
+    Ok(())
+}
+
+impl Writer<'_> {
+    fn emit(
+        &mut self,
+        depth: usize,
+        text: &str,
+        location: &SourceLoc,
+        title: bool,
+    ) -> SpiceResult<()> {
+        emit_line(
+            self.sink,
+            &mut self.remaining,
+            self.card_bytes,
+            depth,
+            text,
+            location,
+            title,
+        )
+    }
+
+    fn line(&mut self, depth: usize, text: &str, location: &SourceLoc) -> SpiceResult<()> {
+        self.emit(depth, text, location, false)
+    }
+
+    fn card<'a>(&'a mut self, depth: usize, location: &'a SourceLoc) -> SpiceResult<Card<'a>> {
+        let limit = self
+            .card_bytes
+            .min(self.remaining)
+            .checked_sub(2 * depth + 1)
+            .ok_or_else(|| refuse("card/total byte limit exceeded", Some(location)))?;
+        self.buffer.clear();
+        Ok(Card {
+            text: &mut self.buffer,
+            limit,
+            location,
+        })
+    }
+
+    fn finish_card(&mut self, depth: usize, location: &SourceLoc) -> SpiceResult<()> {
+        emit_line(
+            self.sink,
+            &mut self.remaining,
+            self.card_bytes,
+            depth,
+            &self.buffer,
+            location,
+            false,
+        )
+    }
+
     fn scope(&mut self, scope: ScopeView<'_>, depth: usize, body: bool) -> SpiceResult<()> {
+        if depth > self.depth {
+            return Err(refuse("subcircuit depth limit exceeded", None));
+        }
+        self.cards = self
+            .cards
+            .checked_sub(scope.cards.len())
+            .ok_or_else(|| refuse("card count limit exceeded", None))?;
         scope
             .validate_order()
             .map_err(|error| refuse(error.to_string(), None))?;
@@ -182,87 +390,12 @@ impl Writer {
                 .entry(card.kind)
                 .map_err(|error| refuse(error.to_string(), Some(location)))?
             {
-                ScopeEntry::Device(item) => {
-                    if !skip {
-                        self.device(item, depth)?;
-                    }
-                }
-                ScopeEntry::Model(item) => {
-                    if !skip {
-                        self.model(item, depth)?;
-                    }
-                }
                 ScopeEntry::Subcircuit(sub) => {
                     check_closed(sub, &card.include_chain)?;
                     if !skip {
                         self.subcircuit(sub, depth)?;
                     }
                 }
-                ScopeEntry::Analysis(item) => {
-                    if !skip {
-                        self.analysis(item, depth)?;
-                    }
-                }
-                ScopeEntry::Include(item) => {
-                    if !skip {
-                        self.include(item, depth)?;
-                    }
-                }
-                ScopeEntry::Param(item) => {
-                    if !skip {
-                        self.param(item, depth)?;
-                    }
-                }
-                ScopeEntry::Func(item) => {
-                    if !skip {
-                        self.func(item, depth)?;
-                    }
-                }
-                ScopeEntry::Options(options) => {
-                    if !skip {
-                        if card
-                            .source
-                            .tokens
-                            .first()
-                            .is_some_and(|token| token.text.eq_ignore_ascii_case("set"))
-                        {
-                            self.settings(options, depth, "set")?;
-                        } else {
-                            self.options(options, depth)?;
-                        }
-                    }
-                }
-                ScopeEntry::Global(item) => {
-                    if !skip {
-                        self.global(item, depth)?;
-                    }
-                }
-                ScopeEntry::InitialCondition(card_) => {
-                    if !skip {
-                        self.hints(".ic", card_, depth)?;
-                    }
-                }
-                ScopeEntry::Nodeset(card_) => {
-                    if !skip {
-                        self.hints(".nodeset", card_, depth)?;
-                    }
-                }
-                // `.save`/`.print` requests (`ast::OutputCards`), `.measure`
-                // requests (`ParsedDeck::measurements`) and `.four` requests
-                // (`ParsedDeck::fourier`) are returned beside the netlist, so
-                // their typed index lives outside the netlist and the card is
-                // reproduced from its own spelling.
-                ScopeEntry::Save(_)
-                | ScopeEntry::Print(_)
-                | ScopeEntry::Measure(_)
-                | ScopeEntry::Fourier(_)
-                | ScopeEntry::Control => {
-                    if !skip {
-                        self.line(depth, card.source.raw.trim(), location)?;
-                    }
-                }
-                // The closing `.ends` is written by `subcircuit`; it was
-                // verified there to be the final card.
                 ScopeEntry::Ends => {
                     if !body {
                         return Err(refuse("`.ends` outside a subcircuit", Some(location)));
@@ -276,6 +409,35 @@ impl Writer {
                         self.line(depth, ".end", location)?;
                     }
                 }
+                _ if skip => {}
+                ScopeEntry::Device(item) => self.device(item, depth)?,
+                ScopeEntry::Model(item) => self.model(item, depth)?,
+                ScopeEntry::Analysis(item) => self.analysis(item, depth)?,
+                ScopeEntry::Include(item) => self.include(item, depth)?,
+                ScopeEntry::Param(item) => self.param(item, depth)?,
+                ScopeEntry::Func(item) => self.func(item, depth)?,
+                ScopeEntry::Options(options) => {
+                    if card
+                        .source
+                        .tokens
+                        .first()
+                        .is_some_and(|token| token.text.eq_ignore_ascii_case("set"))
+                    {
+                        self.settings(options, depth, "set")?;
+                    } else {
+                        self.options(options, depth)?;
+                    }
+                }
+                ScopeEntry::Global(item) => self.global(item, depth)?,
+                ScopeEntry::InitialCondition(item) => self.hints(".ic", item, depth)?,
+                ScopeEntry::Nodeset(item) => self.hints(".nodeset", item, depth)?,
+                // The typed output indexes live outside the netlist.
+                // Reproduce the original output or control card spelling.
+                ScopeEntry::Save(_)
+                | ScopeEntry::Print(_)
+                | ScopeEntry::Measure(_)
+                | ScopeEntry::Fourier(_)
+                | ScopeEntry::Control => self.line(depth, card.source.raw.trim(), location)?,
             }
         }
         Ok(())
@@ -283,94 +445,118 @@ impl Writer {
 
     fn subcircuit(&mut self, sub: &Subcircuit, depth: usize) -> SpiceResult<()> {
         let location = &sub.location;
-        let mut parts = vec![".subckt".to_owned(), node(&sub.name, location)?];
+        let mut parts = self.card(depth, location)?;
+        parts.word(".subckt")?;
+        parts.word(node(&parts, &sub.name, location)?)?;
         for terminal in &sub.terminals {
-            parts.push(node(terminal, location)?);
+            parts.word(node(&parts, terminal, location)?)?;
         }
         if !sub.parameters.is_empty() {
-            parts.push("params:".to_owned());
+            parts.word("params:")?;
             for parameter in &sub.parameters {
-                parts.push(named_value(parameter, true)?);
+                named_value(&mut parts, parameter, true)?;
             }
         }
-        self.line(depth, &parts.join(" "), location)?;
+        self.finish_card(depth, location)?;
         self.scope(ScopeView::from(sub), depth + 1, true)?;
-        self.line(depth, &format!(".ends {}", sub.name), &sub.end_location)
+        let mut parts = self.card(depth, &sub.end_location)?;
+        parts.word(".ends")?;
+        parts.word(&sub.name)?;
+        self.finish_card(depth, &sub.end_location)
     }
 
     fn analysis(&mut self, card: &AnalysisCard, depth: usize) -> SpiceResult<()> {
-        let mut text = format!(".{}", card.kind.as_str());
-        let mut arguments: Vec<&str> = card.arguments.iter().map(String::as_str).collect();
-        if card.uic {
+        let location = &card.location;
+        let at = if card.uic {
             if card.kind != AnalysisKind::Transient {
-                return Err(refuse("uic is only valid on .tran", Some(&card.location)));
+                return Err(refuse("uic is only valid on .tran", Some(location)));
             }
-            // The flag follows the positional arguments and precedes any
-            // `name=value` driver options, where the parser accepts it.
-            let mut at = 0;
-            while at < arguments.len() && arguments.get(at + 1) != Some(&"=") {
-                at += 1;
-            }
-            arguments.insert(at, "uic");
-        }
-        let mut previous: Option<&str> = None;
-        for argument in &arguments {
+            card.arguments
+                .windows(2)
+                .position(|pair| pair[1] == "=")
+                .unwrap_or(card.arguments.len())
+        } else {
+            card.arguments.len()
+        };
+        let arguments = || {
+            card.arguments[..at]
+                .iter()
+                .map(String::as_str)
+                .chain(card.uic.then_some("uic"))
+                .chain(card.arguments[at..].iter().map(String::as_str))
+        };
+        let mut parts = self.card(depth, location)?;
+        parts.push('.')?;
+        parts.push_str(card.kind.as_str())?;
+        let mut previous = None;
+        for argument in arguments() {
             let glued =
-                matches!(*argument, "(" | ")" | "," | "=") || matches!(previous, Some("(" | "="));
+                matches!(argument, "(" | ")" | "," | "=") || matches!(previous, Some("(" | "="));
             if !glued {
-                text.push(' ');
+                parts.push(' ')?;
             }
-            text.push_str(argument);
+            parts.push_str(argument)?;
             previous = Some(argument);
         }
-        // The arguments must re-tokenize to exactly the stored tokens.
-        let tokens = lex(&text, &card.location)?;
-        if tokens
-            .iter()
-            .skip(1)
-            .map(|t| t.text.as_str())
-            .ne(arguments.iter().copied())
-        {
+        let mut cursor = 0;
+        let text = parts.text.as_str();
+        let mut next = || scan_next(text, &mut cursor, |_| location.clone());
+        let _ = next()?;
+        for expected in arguments() {
+            if next()?.is_none_or(|token| token.text != expected) {
+                return Err(refuse(
+                    "analysis arguments do not re-tokenize to the stored tokens",
+                    Some(location),
+                ));
+            }
+        }
+        if next()?.is_some() {
             return Err(refuse(
                 "analysis arguments do not re-tokenize to the stored tokens",
-                Some(&card.location),
+                Some(location),
             ));
         }
-        self.line(depth, &text, &card.location)
+        self.finish_card(depth, location)
     }
 
     fn include(&mut self, include: &IncludeDirective, depth: usize) -> SpiceResult<()> {
         let location = &include.location;
-        let path = match single_token(&include.path_spelling, location) {
-            Some(token) if path_token(&token) == Some(include.path.as_str()) => {
-                include.path_spelling.clone()
-            }
-            _ => quote_path(&include.path, location)?,
-        };
-        let text = match &include.section {
-            Some(section) => format!(".lib {path} {}", quote_path(section, location)?),
-            None => format!(".include {path}"),
-        };
         if include.path.is_empty() {
             return Err(refuse("empty include path", Some(location)));
         }
-        self.line(depth, &text, location)
+        let mut parts = self.card(depth, location)?;
+        parts.word(if include.section.is_some() {
+            ".lib"
+        } else {
+            ".include"
+        })?;
+        parts.check_length(include.path_spelling.len())?;
+        if single_token(&include.path_spelling, location)
+            .is_some_and(|token| path_token(&token) == Some(include.path.as_str()))
+        {
+            parts.word(&include.path_spelling)?;
+        } else {
+            quote_path(&mut parts, &include.path, location)?;
+        }
+        if let Some(section) = &include.section {
+            quote_path(&mut parts, section, location)?;
+        }
+        self.finish_card(depth, location)
     }
 
     fn param(&mut self, card: &ParamCard, depth: usize) -> SpiceResult<()> {
         let location = &card.location;
-        let mut text = ".param".to_owned();
+        let mut parts = self.card(depth, location)?;
+        parts.word(".param")?;
         for assignment in &card.assignments {
-            check_expression(&assignment.expression, location)?;
-            let value = assignment.expression.spelling();
-            let _ = write!(text, " {}={value}", assignment.name);
+            parts.word(&assignment.name)?;
+            parts.push('=')?;
+            parts.expression(&assignment.expression)?;
         }
         if card.assignments.is_empty() {
             return Err(refuse("empty .param card", Some(location)));
         }
-        // The whole card, including the extent of each unbraced value, must
-        // re-parse to the same assignments.
-        let deck = parse_deck_text(location.path(), &format!("t\n{text}\n"));
+        let deck = parse_deck_text(location.path(), &format!("t\n{}\n", parts.text));
         let reparsed = Parser::new().parse_deck(&deck).map_err(|error| {
             refuse(
                 format!("`.param` card does not re-parse: {error}"),
@@ -386,42 +572,35 @@ impl Writer {
                 .all(|(a, b)| a.name == b.name && semantic_equal(&a.expression, &b.expression));
         if !same {
             return Err(refuse(
-                "`.param` card does not re-parse to the same assignments",
+                "`.param` card does not match the stored assignments",
                 Some(location),
             ));
         }
-        self.line(depth, &text, location)
+        self.finish_card(depth, location)
     }
 
     /// `.func name(p1,p2) body`, the body in its original delimiters. Like
     /// `.param`, the card is verified to re-parse to the same definition.
     fn func(&mut self, card: &FuncCard, depth: usize) -> SpiceResult<()> {
         let location = &card.location;
-        // A formal named like a built-in only parses inside its own card;
-        // the whole-card re-parse below still compares the tree.
-        let shadows = card.parameters.iter().any(|p| {
-            crate::netlist::expr::Function::from_name(&p.name).is_some()
-                || crate::netlist::expr::EXCLUDED_FUNCTIONS.contains(&p.name.as_str())
-        });
-        if !shadows {
-            check_expression(&card.body, location)?;
-        }
-        let formals: Vec<&str> = card.parameters.iter().map(|p| p.name.as_str()).collect();
-        let text = match card.spelling {
-            FuncSpelling::Func => format!(
-                ".func {}({}) {}",
-                card.name,
-                formals.join(","),
-                card.body.spelling()
-            ),
-            FuncSpelling::Param => format!(
-                ".param {}({})={}",
-                card.name,
-                formals.join(","),
-                card.body.spelling()
-            ),
+        let mut parts = self.card(depth, location)?;
+        let (prefix, delimiter) = match card.spelling {
+            FuncSpelling::Func => (".func", ' '),
+            FuncSpelling::Param => (".param", '='),
         };
-        let deck = parse_deck_text(location.path(), &format!("t\n{text}\n"));
+        parts.word(prefix)?;
+        parts.word(&card.name)?;
+        parts.push('(')?;
+        for (i, parameter) in card.parameters.iter().enumerate() {
+            if i != 0 {
+                parts.push(',')?;
+            }
+            parts.push_str(&parameter.name)?;
+        }
+        parts.push(')')?;
+        parts.push(delimiter)?;
+        parts.expression(&card.body)?;
+        let deck = parse_deck_text(location.path(), &format!("t\n{}\n", parts.text));
         let reparsed = Parser::new().parse_deck(&deck).map_err(|error| {
             refuse(
                 format!("`.func` card does not re-parse: {error}"),
@@ -436,7 +615,7 @@ impl Writer {
                     .parameters
                     .iter()
                     .map(|p| p.name.as_str())
-                    .eq(formals.iter().copied())
+                    .eq(card.parameters.iter().map(|p| p.name.as_str()))
                 && semantic_equal(&other.body, &card.body)
         };
         if !same {
@@ -445,7 +624,7 @@ impl Writer {
                 Some(location),
             ));
         }
-        self.line(depth, &text, location)
+        self.finish_card(depth, location)
     }
 
     fn options(&mut self, card: &OptionCard, depth: usize) -> SpiceResult<()> {
@@ -457,7 +636,8 @@ impl Writer {
         if card.settings.is_empty() {
             return Err(refuse("empty .options card", Some(location)));
         }
-        let mut text = prefix.to_owned();
+        let mut parts = self.card(depth, location)?;
+        parts.word(prefix)?;
         for setting in &card.settings {
             if prefix == "set"
                 && !matches!(
@@ -473,9 +653,10 @@ impl Writer {
             {
                 return Err(refuse("unsupported front-end setting", Some(location)));
             }
+            parts.check_length(setting.name.len())?;
             if !matches!(
                 single_token(&setting.name, location),
-                Some(Token {
+                Some(Lexeme {
                     kind: TokenKind::Word,
                     ..
                 })
@@ -485,8 +666,7 @@ impl Writer {
                     Some(location),
                 ));
             }
-            text.push(' ');
-            text.push_str(&setting.name);
+            parts.word(&setting.name)?;
             if setting.expression.is_some() && setting.value.is_none() {
                 return Err(refuse(
                     format!(
@@ -497,17 +677,18 @@ impl Writer {
                 ));
             }
             if let Some(value) = &setting.value {
+                parts.check_length(value.text.len())?;
                 let expression = setting.expression.is_some();
                 let ok = match single_token(&value.text, location) {
-                    Some(Token {
+                    Some(Lexeme {
                         kind: TokenKind::Word,
                         ..
                     }) => !expression,
-                    Some(Token {
+                    Some(Lexeme {
                         kind: TokenKind::Number(v),
                         ..
                     }) => v.is_finite() && !expression,
-                    Some(Token {
+                    Some(Lexeme {
                         kind: TokenKind::Expression(_) | TokenKind::Quoted(_),
                         ..
                     }) => expression,
@@ -523,50 +704,69 @@ impl Writer {
                         Some(location),
                     ));
                 }
-                text.push('=');
-                text.push_str(&value.text);
+                if let Some(expression) = &setting.expression {
+                    check_value_expression(&parts, &value.text, expression, location)?;
+                }
+                parts.push('=')?;
+                parts.push_str(&value.text)?;
             }
         }
-        self.line(depth, &text, location)
+        self.finish_card(depth, location)
     }
 
     fn hints(&mut self, name: &str, card: &NodeHintCard, depth: usize) -> SpiceResult<()> {
         if card.entries.is_empty() {
             return Err(refuse(format!("empty {name} card"), Some(&card.location)));
         }
-        let mut text = name.to_owned();
+        let mut parts = self.card(depth, &card.location)?;
+        parts.word(name)?;
         for hint in &card.entries {
-            let (kind, value) = match &hint.value {
-                NodeHintValue::Literal { text, .. } => (ParameterKind::Scalar, text.clone()),
-                NodeHintValue::Expression(expression) => (
-                    ParameterKind::Expression(expression.clone()),
-                    expression.spelling(),
-                ),
-            };
-            let value = value_text(
-                &ParameterAssignment {
-                    name: format!("v({})", hint.node),
-                    value,
-                    kind,
-                    location: hint.value_location.clone(),
-                },
-                false,
-            )?;
-            let _ = write!(text, " v({})={value}", node(&hint.node, &hint.location)?);
+            parts.word("v(")?;
+            parts.push_str(node(&parts, &hint.node, &hint.location)?)?;
+            parts.push_str(")=")?;
+            match &hint.value {
+                NodeHintValue::Literal { text, value } => {
+                    parts.check_length(text.len())?;
+                    if !matches!(single_token(text, &hint.value_location), Some(Lexeme {kind: TokenKind::Number(v), ..}) if v.is_finite() && v.to_bits() == value.to_bits())
+                    {
+                        return Err(refuse(
+                            "node hint literal does not match its finite numeric value",
+                            Some(&hint.value_location),
+                        ));
+                    }
+                    parts.push_str(text)?;
+                }
+                NodeHintValue::Expression(expression) => {
+                    parts.check_length(expression.text.len())?;
+                    check_expression(expression, &hint.value_location)?;
+                    let start = parts.text.len();
+                    parts.expression(expression)?;
+                    if !expression_token_matches(
+                        &parts.text[start..],
+                        expression,
+                        &hint.value_location,
+                    ) {
+                        return Err(refuse(
+                            "node hint value text does not match its expression",
+                            Some(&hint.value_location),
+                        ));
+                    }
+                }
+            }
         }
-        self.line(depth, &text, &card.location)
+        self.finish_card(depth, &card.location)
     }
 
     fn global(&mut self, card: &GlobalCard, depth: usize) -> SpiceResult<()> {
         if card.nodes.is_empty() {
             return Err(refuse("empty .global card", Some(&card.location)));
         }
-        let mut text = ".global".to_owned();
+        let mut parts = self.card(depth, &card.location)?;
+        parts.word(".global")?;
         for global in &card.nodes {
-            text.push(' ');
-            text.push_str(&node(&global.name, &card.location)?);
+            parts.word(node(&parts, &global.name, &card.location)?)?;
         }
-        self.line(depth, &text, &card.location)
+        self.finish_card(depth, &card.location)
     }
 
     fn model(&mut self, model: &ModelCard, depth: usize) -> SpiceResult<()> {
@@ -600,47 +800,35 @@ impl Writer {
                 Some(location),
             ));
         }
-        let mut items = Vec::new();
-        for parameter in &model.parameters {
+        let mut parts = self.card(depth, location)?;
+        parts.word(".model")?;
+        parts.word(node(&parts, &model.name, location)?)?;
+        parts.word(base)?;
+        if !model.parameters.is_empty() {
+            parts.push('(')?;
+        }
+        for (index, parameter) in model.parameters.iter().enumerate() {
+            if index != 0 {
+                parts.push(' ')?;
+            }
             match &parameter.kind {
                 ParameterKind::Flag => {
-                    let allowed: &[&str] = match base {
-                        "d" => &["d"],
-                        "npn" | "pnp" => &["npn", "pnp"],
-                        "nmos" | "pmos" => &["nmos", "pmos"],
-                        "sw" => &["sw"],
-                        "csw" => &["csw"],
-                        "njf" | "pjf" => &["njf", "pjf"],
-                        "urc" => &["urc"],
-                        "txl" => &["txl"],
-                        "ltra" => &[
-                            "ltra",
-                            "nocontrol",
-                            "steplimit",
-                            "nosteplimit",
-                            "lininterp",
-                            "quadinterp",
-                            "mixedinterp",
-                            "truncnr",
-                            "truncdontcut",
-                        ],
-                        "nmf" | "pmf" | "nhfet" | "phfet" => &["nmf", "pmf", "nhfet", "phfet"],
-                        _ => &[],
-                    };
+                    let allowed = model_flags(base);
                     if !allowed.contains(&parameter.name.as_str()) || !parameter.value.is_empty() {
                         return Err(refuse(
                             format!("flag {:?} is not valid for a {base} model", parameter.name),
                             Some(location),
                         ));
                     }
-                    items.push(parameter.name.clone());
+                    parts.push_str(&parameter.name)?;
                 }
                 ParameterKind::Textual
                     if matches!(base, "nmos" | "pmos") && parameter.name == "version" =>
                 {
+                    parts.check_length(parameter.value.len())?;
                     if !matches!(
                         single_token(&parameter.value, &parameter.location),
-                        Some(Token {
+                        Some(Lexeme {
                             kind: TokenKind::Word,
                             ..
                         })
@@ -650,25 +838,31 @@ impl Writer {
                             Some(location),
                         ));
                     }
-                    items.push(named_value(parameter, true)?);
+                    append_named_value(&mut parts, parameter, true)?;
                 }
                 ParameterKind::Expression(_) if parameter.name == "level" => {
                     return Err(refuse("expression-valued model level", Some(location)));
                 }
-                _ => items.push(named_value(parameter, false)?),
+                _ => append_named_value(&mut parts, parameter, false)?,
             }
         }
-        let mut text = format!(".model {} {base}", node(&model.name, location)?);
-        if !items.is_empty() {
-            let _ = write!(text, "({})", items.join(" "));
+        if !model.parameters.is_empty() {
+            parts.push(')')?;
         }
-        self.line(depth, &text, location)
+        self.finish_card(depth, location)
     }
 
     fn device(&mut self, device: &DeviceInstance, depth: usize) -> SpiceResult<()> {
         let location = &device.location;
         let designator = device.designator;
-        if !device.name.to_ascii_lowercase().starts_with(designator) {
+        let mut parts = self.card(depth, location)?;
+        parts.check_length(device.name.len())?;
+        if device
+            .name
+            .chars()
+            .next()
+            .is_none_or(|c| c.to_ascii_lowercase() != designator)
+        {
             return Err(refuse(
                 format!(
                     "instance {:?} does not start with '{designator}'",
@@ -677,12 +871,22 @@ impl Writer {
                 Some(location),
             ));
         }
+        if matches!(designator, 'e'..='h')
+            && device.parameters.first().is_some_and(|parameter| {
+                matches!(parameter.name.as_str(), "value" | "table" | "poly")
+            })
+        {
+            parts.check_length(device.parameters.len().saturating_sub(1))?;
+            for parameter in &device.parameters {
+                parts.check_length(parameter.value.len())?;
+            }
+        }
         let nonlinear = NonlinearForm::validate(device)?;
         if designator == 'b' || nonlinear.is_some() {
-            let line = behavioural_card(device, nonlinear)?;
-            return self.line(depth, &line, location);
+            behavioural_card(device, nonlinear, &mut parts)?;
+            return self.finish_card(depth, location);
         }
-        let mut parts = vec![node(&device.name, location)?];
+        parts.word(node(&parts, &device.name, location)?)?;
         let setters = device_prefix(device, &mut parts)?;
         match designator {
             'r' | 'c' | 'l' => passive_parameters(device, &mut parts)?,
@@ -700,24 +904,50 @@ impl Writer {
                     {
                         return Err(refuse("TXL instance setter (only len=)", Some(&p.location)));
                     }
-                    parts.push(named_value(p, false)?);
+                    named_value(&mut parts, p, false)?;
                 }
             }
             'x' => {
                 for parameter in &device.parameters {
-                    parts.push(named_value(parameter, true)?);
+                    named_value(&mut parts, parameter, true)?;
                 }
             }
             _ => transistor_parameters(device, &mut parts)?,
         }
-        self.line(depth, &parts.join(" "), location)
+        self.finish_card(depth, location)
+    }
+}
+
+fn model_flags(base: &str) -> &'static [&'static str] {
+    match base {
+        "d" => &["d"],
+        "npn" | "pnp" => &["npn", "pnp"],
+        "nmos" | "pmos" => &["nmos", "pmos"],
+        "sw" => &["sw"],
+        "csw" => &["csw"],
+        "njf" | "pjf" => &["njf", "pjf"],
+        "urc" => &["urc"],
+        "txl" => &["txl"],
+        "ltra" => &[
+            "ltra",
+            "nocontrol",
+            "steplimit",
+            "nosteplimit",
+            "lininterp",
+            "quadinterp",
+            "mixedinterp",
+            "truncnr",
+            "truncdontcut",
+        ],
+        "nmf" | "pmf" | "nhfet" | "phfet" => &["nmf", "pmf", "nhfet", "phfet"],
+        _ => &[],
     }
 }
 
 // Write and validate the common positional device fields before its setters.
 fn device_prefix<'a>(
     device: &'a DeviceInstance,
-    parts: &mut Vec<String>,
+    parts: &mut Card<'_>,
 ) -> SpiceResult<&'a [ParameterAssignment]> {
     let location = &device.location;
     let designator = device.designator;
@@ -743,7 +973,7 @@ fn device_prefix<'a>(
         ));
     }
     for n in &device.nodes {
-        parts.push(node(n, location)?);
+        parts.word(node(parts, n, location)?)?;
     }
     let mut setters = device.parameters.as_slice();
     if designator == 'w' {
@@ -752,7 +982,7 @@ fn device_prefix<'a>(
             Some((control, rest))
                 if control.name == "control" && control.kind == ParameterKind::Instance =>
             {
-                parts.push(node(&control.value, &control.location)?);
+                parts.word(node(parts, &control.value, &control.location)?)?;
                 setters = rest;
             }
             _ => {
@@ -783,7 +1013,7 @@ fn device_prefix<'a>(
             if designator == 'm' && parse_spice_number(model).is_some() {
                 return Err(refuse("numeric-looking MOS model name", Some(location)));
             }
-            parts.push(node(model, location)?);
+            parts.word(node(parts, model, location)?)?;
         }
         (_, None) => {}
     }
@@ -809,64 +1039,52 @@ fn check_closed(sub: &Subcircuit, chain: &[SourceLoc]) -> SpiceResult<()> {
     }
 }
 
-fn lex(text: &str, location: &SourceLoc) -> SpiceResult<Vec<Token>> {
-    tokenize(&LogicalLine::single(location.clone(), text.to_owned())).map_err(|error| {
-        refuse(
-            format!("text {text:?} does not tokenize: {error}"),
-            Some(location),
-        )
-    })
-}
-
-/// `text` as one token whose spelling is exactly `text`, safe from comment
-/// stripping.
-fn single_token(text: &str, location: &SourceLoc) -> Option<Token> {
+fn single_token<'a>(text: &'a str, location: &SourceLoc) -> Option<Lexeme<'a>> {
     if text.is_empty() || strip_comment(text, false) != text {
         return None;
     }
-    let mut tokens = lex(text, location).ok()?;
-    (tokens.len() == 1 && tokens[0].text == text).then(|| tokens.remove(0))
+    let mut cursor = 0;
+    let token = scan_next(text, &mut cursor, |_| location.clone()).ok()??;
+    (token.text == text && cursor == text.len()).then_some(token)
 }
 
-fn path_token(token: &Token) -> Option<&str> {
+fn path_token<'a>(token: &'a Lexeme<'_>) -> Option<&'a str> {
     match &token.kind {
         TokenKind::Quoted(decoded) => Some(decoded),
-        TokenKind::Word | TokenKind::Number(_) => Some(&token.text),
+        TokenKind::Word | TokenKind::Number(_) => Some(token.text),
         _ => None,
     }
 }
 
-fn quote_path(path: &str, location: &SourceLoc) -> SpiceResult<String> {
+fn quote_path(parts: &mut Card<'_>, path: &str, location: &SourceLoc) -> SpiceResult<()> {
+    parts.check_length(path.len())?;
     if path.is_empty() || path.contains(['\n', '\r']) {
-        return Err(refuse(
-            "path or section is empty or contains a line break",
-            Some(location),
-        ));
+        return Err(refuse("empty or multiline include path", Some(location)));
     }
     if let Some(token) = single_token(path, location)
         && path_token(&token) == Some(path)
         && !matches!(token.kind, TokenKind::Quoted(_))
     {
-        return Ok(path.to_owned());
+        return parts.word(path);
     }
-    let mut quoted = String::from("\"");
+    parts.word("\"")?;
     for character in path.chars() {
         if matches!(character, '"' | '\\') {
-            quoted.push('\\');
+            parts.push('\\')?;
         }
-        quoted.push(character);
+        parts.push(character)?;
     }
-    quoted.push('"');
-    Ok(quoted)
+    parts.push('"')
 }
 
 /// A node/instance/model name: one word or number token.
-fn node(name: &str, location: &SourceLoc) -> SpiceResult<String> {
+fn node<'a>(parts: &Card<'_>, name: &'a str, location: &SourceLoc) -> SpiceResult<&'a str> {
+    parts.check_length(name.len())?;
     match single_token(name, location) {
-        Some(Token {
+        Some(Lexeme {
             kind: TokenKind::Word | TokenKind::Number(_),
             ..
-        }) => Ok(name.to_owned()),
+        }) => Ok(name),
         _ => Err(refuse(
             format!("{name:?} is not a single name token"),
             Some(location),
@@ -900,7 +1118,52 @@ fn check_expression(expression: &ParameterExpression, location: &SourceLoc) -> S
 
 /// The spelling of a scalar-or-expression value (`text_ok` also allows a
 /// single `Textual` token, used at `.subckt`/X parameter sites).
-fn value_text(parameter: &ParameterAssignment, text_ok: bool) -> SpiceResult<String> {
+fn expression_token_matches(
+    text: &str,
+    expression: &ParameterExpression,
+    location: &SourceLoc,
+) -> bool {
+    let inner = match (expression.braced, expression.quoted) {
+        (true, true) => text.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')),
+        (true, false) => text.strip_prefix('{').and_then(|s| s.strip_suffix('}')),
+        (false, false) => Some(text),
+        (false, true) => None,
+    };
+    inner == Some(expression.text.as_str())
+        && matches!(
+            (
+                single_token(text, location).map(|token| token.kind),
+                expression.braced,
+                expression.quoted
+            ),
+            (Some(TokenKind::Expression(_)), true, false)
+                | (Some(TokenKind::Quoted(_)), true, true)
+                | (Some(TokenKind::Word), false, false)
+        )
+}
+
+fn check_value_expression(
+    parts: &Card<'_>,
+    text: &str,
+    expression: &ParameterExpression,
+    location: &SourceLoc,
+) -> SpiceResult<()> {
+    parts.check_length(expression.text.len())?;
+    check_expression(expression, location)?;
+    if !expression_token_matches(text, expression, location) {
+        return Err(refuse(
+            "value text does not match its expression",
+            Some(location),
+        ));
+    }
+    Ok(())
+}
+
+fn value_text<'a>(
+    parts: &Card<'_>,
+    parameter: &'a ParameterAssignment,
+    text_ok: bool,
+) -> SpiceResult<&'a str> {
     let location = &parameter.location;
     let bad = |what: &str| {
         refuse(
@@ -908,10 +1171,10 @@ fn value_text(parameter: &ParameterAssignment, text_ok: bool) -> SpiceResult<Str
             Some(location),
         )
     };
-    let token = single_token(&parameter.value, location);
+    parts.check_length(parameter.value.len())?;
     match &parameter.kind {
-        ParameterKind::Scalar => match token {
-            Some(Token {
+        ParameterKind::Scalar => match single_token(&parameter.value, location) {
+            Some(Lexeme {
                 kind: TokenKind::Number(v),
                 ..
             }) if v.is_finite() => {}
@@ -919,8 +1182,8 @@ fn value_text(parameter: &ParameterAssignment, text_ok: bool) -> SpiceResult<Str
         },
         ParameterKind::Textual if text_ok => {
             if !matches!(
-                token,
-                Some(Token {
+                single_token(&parameter.value, location),
+                Some(Lexeme {
                     kind: TokenKind::Word | TokenKind::Quoted(_),
                     ..
                 })
@@ -929,47 +1192,23 @@ fn value_text(parameter: &ParameterAssignment, text_ok: bool) -> SpiceResult<Str
             }
         }
         ParameterKind::Expression(expression) => {
-            check_expression(expression, location)?;
-            let consistent = parameter.value == expression.spelling();
-            let kind_ok = matches!(
-                (&token, expression.braced, expression.quoted),
-                (
-                    Some(Token {
-                        kind: TokenKind::Expression(_),
-                        ..
-                    }),
-                    true,
-                    false
-                ) | (
-                    Some(Token {
-                        kind: TokenKind::Quoted(_),
-                        ..
-                    }),
-                    true,
-                    true
-                ) | (
-                    Some(Token {
-                        kind: TokenKind::Word,
-                        ..
-                    }),
-                    false,
-                    false
-                )
-            );
-            if !consistent || !kind_ok {
-                return Err(bad("value text does not match its expression"));
-            }
+            check_value_expression(parts, &parameter.value, expression, location)?;
         }
         _ => return Err(bad("value kind is not allowed here")),
     }
-    Ok(parameter.value.clone())
+    Ok(&parameter.value)
 }
 
-fn named_value(parameter: &ParameterAssignment, text_ok: bool) -> SpiceResult<String> {
+fn append_named_value(
+    parts: &mut Card<'_>,
+    parameter: &ParameterAssignment,
+    text_ok: bool,
+) -> SpiceResult<()> {
     let location = &parameter.location;
+    parts.check_length(parameter.name.len())?;
     if !matches!(
         single_token(&parameter.name, location),
-        Some(Token {
+        Some(Lexeme {
             kind: TokenKind::Word,
             ..
         })
@@ -979,16 +1218,28 @@ fn named_value(parameter: &ParameterAssignment, text_ok: bool) -> SpiceResult<St
             Some(location),
         ));
     }
-    Ok(format!(
-        "{}={}",
-        parameter.name,
-        value_text(parameter, text_ok)?
-    ))
+    parts.push_str(&parameter.name)?;
+    parts.push('=')?;
+    parts.push_str(value_text(parts, parameter, text_ok)?)
 }
 
-fn positioned_number<'a>(value: &'a PositionedValue, location: &SourceLoc) -> SpiceResult<&'a str> {
+fn named_value(
+    parts: &mut Card<'_>,
+    parameter: &ParameterAssignment,
+    text_ok: bool,
+) -> SpiceResult<()> {
+    parts.push(' ')?;
+    append_named_value(parts, parameter, text_ok)
+}
+
+fn positioned_number<'a>(
+    parts: &Card<'_>,
+    value: &'a PositionedValue,
+    location: &SourceLoc,
+) -> SpiceResult<&'a str> {
+    parts.check_length(value.text.len())?;
     match single_token(&value.text, location) {
-        Some(Token {
+        Some(Lexeme {
             kind: TokenKind::Number(v),
             ..
         }) if v.is_finite() => Ok(&value.text),
@@ -1002,27 +1253,25 @@ fn positioned_number<'a>(value: &'a PositionedValue, location: &SourceLoc) -> Sp
     }
 }
 
-/// Write validated positioned numeric literals without intermediate owned
-/// strings, shared by waveform and initial-condition vectors.
 fn numeric_vector_text<'a>(
+    parts: &mut Card<'_>,
     prefix: &str,
     fields: impl IntoIterator<Item = &'a PositionedValue>,
     separator: char,
     location: &SourceLoc,
-) -> SpiceResult<String> {
-    let mut text = String::from(prefix);
-    text.push('(');
+) -> SpiceResult<()> {
+    parts.word(prefix)?;
+    parts.push('(')?;
     for (index, field) in fields.into_iter().enumerate() {
         if index != 0 {
-            text.push(separator);
+            parts.push(separator)?;
         }
-        text.push_str(positioned_number(field, location)?);
+        parts.push_str(positioned_number(parts, field, location)?)?;
     }
-    text.push(')');
-    Ok(text)
+    parts.push(')')
 }
 
-fn passive_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceResult<()> {
+fn passive_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResult<()> {
     let designator = device.designator;
     let primary = match designator {
         'r' => "resistance",
@@ -1058,9 +1307,9 @@ fn passive_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> Spice
             .is_some_and(|parameter| parameter.name == primary);
     for (index, parameter) in device.parameters.iter().enumerate() {
         if positional && index == 0 {
-            parts.push(value_text(parameter, false)?);
+            parts.word(value_text(parts, parameter, false)?)?;
         } else {
-            parts.push(named_value(parameter, false)?);
+            named_value(parts, parameter, false)?;
         }
     }
     Ok(())
@@ -1069,7 +1318,7 @@ fn passive_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> Spice
 /// S/W (`parser/switch.rs`): only bare `on`/`off` flags follow the model, in
 /// their written order; W's `control` was already written before the model.
 /// U (`parser/urc.rs`): the ordered `l=`/`n=` setters, nothing else.
-fn urc_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceResult<()> {
+fn urc_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResult<()> {
     for parameter in &device.parameters {
         if !matches!(
             parameter.kind,
@@ -1081,7 +1330,7 @@ fn urc_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceResu
                 Some(&parameter.location),
             ));
         }
-        parts.push(named_value(parameter, false)?);
+        named_value(parts, parameter, false)?;
     }
     Ok(())
 }
@@ -1089,7 +1338,7 @@ fn urc_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceResu
 fn switch_parameters(
     setters: &[ParameterAssignment],
     designator: char,
-    parts: &mut Vec<String>,
+    parts: &mut Card<'_>,
 ) -> SpiceResult<()> {
     for parameter in setters {
         if parameter.kind != ParameterKind::Flag
@@ -1101,13 +1350,13 @@ fn switch_parameters(
                 Some(&parameter.location),
             ));
         }
-        parts.push(parameter.name.clone());
+        parts.word(&parameter.name)?;
     }
     Ok(())
 }
 
 /// T (`parser/tline.rs`): `TRApTable` scalars and the `ic` vector, in order.
-fn tline_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceResult<()> {
+fn tline_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResult<()> {
     const SCALARS: [&str; 11] = [
         "z0", "zo", "td", "f", "nl", "v1", "v2", "i1", "i2", "rel", "abs",
     ];
@@ -1115,7 +1364,7 @@ fn tline_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceRe
 }
 
 /// O (`parser/ltra.rs`): `LTRApTable` scalars and the `ic` vector, in order.
-fn ltra_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceResult<()> {
+fn ltra_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResult<()> {
     line_parameters(device, &["v1", "v2", "i1", "i2"], parts)
 }
 
@@ -1123,7 +1372,7 @@ fn ltra_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceRes
 fn line_parameters(
     device: &DeviceInstance,
     scalars: &[&str],
-    parts: &mut Vec<String>,
+    parts: &mut Card<'_>,
 ) -> SpiceResult<()> {
     const IC: [&str; 4] = ["v1", "i1", "v2", "i2"];
     for parameter in &device.parameters {
@@ -1136,17 +1385,18 @@ fn line_parameters(
                 {
                     return Err(refuse("malformed ic vector", Some(location)));
                 }
-                parts.push(numeric_vector_text(
+                numeric_vector_text(
+                    parts,
                     "ic=",
                     components.iter().map(|component| &component.value),
                     ',',
                     location,
-                )?);
+                )?;
             }
             ParameterKind::Scalar | ParameterKind::Expression(_)
                 if scalars.contains(&parameter.name.as_str()) =>
             {
-                parts.push(named_value(parameter, false)?);
+                named_value(parts, parameter, false)?;
             }
             _ => {
                 return Err(refuse(
@@ -1167,7 +1417,7 @@ fn line_parameters(
 /// setters was C's leading value (applied after the named setters), so it is
 /// written positionally; a gain stored first is written as `gain=`. Any other
 /// order cannot be re-parsed to the same setter sequence and is refused.
-fn controlled_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceResult<()> {
+fn controlled_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResult<()> {
     let designator = device.designator;
     let mut setters = device.parameters.as_slice();
     if matches!(designator, 'f' | 'h') {
@@ -1175,7 +1425,7 @@ fn controlled_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> Sp
             Some((control, rest))
                 if control.name == "control" && control.kind == ParameterKind::Instance =>
             {
-                parts.push(node(&control.value, &control.location)?);
+                parts.word(node(parts, &control.value, &control.location)?)?;
                 setters = rest;
             }
             _ => {
@@ -1208,21 +1458,21 @@ fn controlled_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> Sp
         )
     };
     match setters {
-        [gain] if gain.name == "gain" => parts.push(value_text(gain, false)?),
+        [gain] if gain.name == "gain" => parts.word(value_text(parts, gain, false)?)?,
         [first, rest @ ..] if first.name == "gain" => {
             if rest.first().is_some_and(|next| next.name != "m") {
                 return Err(unrepresentable());
             }
             for parameter in setters {
-                parts.push(named_value(parameter, false)?);
+                named_value(parts, parameter, false)?;
             }
         }
         [tail @ .., gain]
             if gain.name == "gain" && tail.first().is_some_and(|first| first.name == "m") =>
         {
-            parts.push(value_text(gain, false)?);
+            parts.word(value_text(parts, gain, false)?)?;
             for parameter in tail {
-                parts.push(named_value(parameter, false)?);
+                named_value(parts, parameter, false)?;
             }
         }
         _ if !setters.iter().any(|parameter| parameter.name == "gain") => {
@@ -1237,7 +1487,10 @@ fn controlled_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> Sp
 }
 
 /// The behavioural expression text must re-parse to the stored tree.
-fn behavioural_text(parameter: &ParameterAssignment) -> SpiceResult<String> {
+fn behavioural_text<'a>(
+    parts: &Card<'_>,
+    parameter: &'a ParameterAssignment,
+) -> SpiceResult<&'a str> {
     let location = &parameter.location;
     let ParameterKind::Behavioural(expression) = &parameter.kind else {
         return Err(refuse(
@@ -1248,6 +1501,7 @@ fn behavioural_text(parameter: &ParameterAssignment) -> SpiceResult<String> {
             Some(location),
         ));
     };
+    parts.check_length(expression.text.len())?;
     let reparsed = Parser::new()
         .parse_behavioural_expression(&expression.text, location, expression.verbatim)
         .map_err(|error| {
@@ -1268,7 +1522,7 @@ fn behavioural_text(parameter: &ParameterAssignment) -> SpiceResult<String> {
             Some(location),
         ));
     }
-    Ok(expression.text.clone())
+    Ok(&expression.text)
 }
 
 /// B sources and the nonlinear E/G/F/H forms (`parser/behavioural.rs`):
@@ -1279,30 +1533,32 @@ fn behavioural_text(parameter: &ParameterAssignment) -> SpiceResult<String> {
 fn behavioural_card(
     device: &DeviceInstance,
     nonlinear: Option<NonlinearForm<'_>>,
-) -> SpiceResult<String> {
+    parts: &mut Card<'_>,
+) -> SpiceResult<()> {
     let location = &device.location;
     let designator = device.designator;
     if device.model.is_some() {
         return Err(refuse("behavioural source with a model", Some(location)));
     }
-    let mut parts = vec![node(&device.name, location)?];
+    parts.word(node(parts, &device.name, location)?)?;
     let [positive, negative, controls @ ..] = device.nodes.as_slice() else {
         return Err(refuse(
             format!("'{designator}' instance with fewer than two nodes"),
             Some(location),
         ));
     };
-    parts.push(node(positive, location)?);
-    parts.push(node(negative, location)?);
+    parts.word(node(parts, positive, location)?)?;
+    parts.word(node(parts, negative, location)?)?;
     match nonlinear {
         Some(NonlinearForm::Value(form)) => {
-            parts.push(format!("value={}", behavioural_text(form.input)?));
+            parts.word("value=")?;
+            parts.push_str(behavioural_text(parts, form.input)?)?;
             for parameter in form.setters {
-                parts.push(named_value(parameter, false)?);
+                named_value(parts, parameter, false)?;
             }
         }
-        Some(NonlinearForm::Table(form)) => behavioural_table(device, form, &mut parts)?,
-        Some(NonlinearForm::Poly(form)) => behavioural_poly(device, form, &mut parts)?,
+        Some(NonlinearForm::Table(form)) => behavioural_table(device, form, parts)?,
+        Some(NonlinearForm::Poly(form)) => behavioural_poly(device, form, parts)?,
         None => {
             let Some((first, setters)) = device.parameters.split_first() else {
                 return Err(refuse("B source without behavioural form", Some(location)));
@@ -1313,22 +1569,25 @@ fn behavioural_card(
             {
                 return Err(refuse("invalid B source form", Some(location)));
             }
-            parts.push(format!("{}={}", first.name, behavioural_text(first)?));
+            parts.word(&first.name)?;
+            parts.push('=')?;
+            parts.push_str(behavioural_text(parts, first)?)?;
             for parameter in setters {
-                parts.push(behavioural_setter(parameter, designator, B_SETTERS)?);
+                behavioural_setter(parts, parameter, designator, B_SETTERS)?;
             }
         }
     }
-    Ok(parts.join(" "))
+    Ok(())
 }
 
 fn behavioural_setter(
+    parts: &mut Card<'_>,
     parameter: &ParameterAssignment,
     designator: char,
     allowed: &[&str],
-) -> SpiceResult<String> {
+) -> SpiceResult<()> {
     if allowed.contains(&parameter.name.as_str()) {
-        named_value(parameter, false)
+        named_value(parts, parameter, false)
     } else {
         Err(refuse(
             format!("parameter {:?} on '{designator}' instance", parameter.name),
@@ -1340,30 +1599,38 @@ fn behavioural_setter(
 fn behavioural_table(
     device: &DeviceInstance,
     form: TableForm<'_>,
-    parts: &mut Vec<String>,
+    parts: &mut Card<'_>,
 ) -> SpiceResult<()> {
     match form.input {
         TableInput::Voltage([positive, negative]) => {
-            parts.push(node(positive, &device.location)?);
-            parts.push(node(negative, &device.location)?);
-            let mut values = Vec::with_capacity(form.points.len() * 2);
-            for (x, y) in form.points {
-                values.push(value_text(x.parameter, false)?);
-                values.push(value_text(y.parameter, false)?);
+            parts.word(node(parts, positive, &device.location)?)?;
+            parts.word(node(parts, negative, &device.location)?)?;
+            parts.word("table=(")?;
+            for (index, (x, y)) in form.points.into_iter().enumerate() {
+                if index != 0 {
+                    parts.push_str(", ")?;
+                }
+                parts.push_str(value_text(parts, x.parameter, false)?)?;
+                parts.push_str(", ")?;
+                parts.push_str(value_text(parts, y.parameter, false)?)?;
             }
-            parts.push(format!("table=({})", values.join(", ")));
+            parts.push(')')?;
         }
         TableInput::Expression(parameter, _) => {
-            parts.push(format!("table {{{}}} =", behavioural_text(parameter)?));
+            parts.word("table {")?;
+            parts.push_str(behavioural_text(parts, parameter)?)?;
+            parts.push_str("} =")?;
             for (x, y) in form.points {
-                let x = value_text(x.parameter, false)?;
-                let y = value_text(y.parameter, false)?;
-                parts.push(format!("({x}, {y})"));
+                parts.word("(")?;
+                parts.push_str(value_text(parts, x.parameter, false)?)?;
+                parts.push_str(", ")?;
+                parts.push_str(value_text(parts, y.parameter, false)?)?;
+                parts.push(')')?;
             }
         }
     }
     for parameter in form.setters {
-        parts.push(named_value(parameter, false)?);
+        named_value(parts, parameter, false)?;
     }
     Ok(())
 }
@@ -1371,27 +1638,28 @@ fn behavioural_table(
 fn behavioural_poly(
     device: &DeviceInstance,
     form: PolyForm<'_>,
-    parts: &mut Vec<String>,
+    parts: &mut Card<'_>,
 ) -> SpiceResult<()> {
-    let spelling = value_text(form.spelling, false)?;
-    parts.push(format!("poly({spelling})"));
+    parts.word("poly(")?;
+    parts.push_str(value_text(parts, form.spelling, false)?)?;
+    parts.push(')')?;
     match form.controls {
         PolyControls::Voltage(pairs) => {
             for control in pairs.iter().flatten() {
-                parts.push(node(control, &device.location)?);
+                parts.word(node(parts, control, &device.location)?)?;
             }
         }
         PolyControls::Current(sources) => {
             for control in sources {
-                parts.push(node(&control.value, &control.location)?);
+                parts.word(node(parts, &control.value, &control.location)?)?;
             }
         }
     }
     for coefficient in form.coefficients {
-        parts.push(value_text(coefficient.parameter, false)?);
+        parts.word(value_text(parts, coefficient.parameter, false)?)?;
     }
     for parameter in form.setters {
-        parts.push(named_value(parameter, false)?);
+        named_value(parts, parameter, false)?;
     }
     Ok(())
 }
@@ -1399,7 +1667,7 @@ fn behavioural_poly(
 /// K (`parser/mutual.rs`): the inductor references `inductor1`, `inductor2`,
 /// … in order, then exactly one `coefficient`, written positionally (a named
 /// `k=`/`coefficient=` setter re-parses to the same setter).
-fn mutual_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceResult<()> {
+fn mutual_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResult<()> {
     let Some((coupling, inductors)) = device.parameters.split_last() else {
         return Err(refuse(
             "'k' instance without inductors and a coupling",
@@ -1427,7 +1695,7 @@ fn mutual_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceR
                 Some(&inductor.location),
             ));
         }
-        parts.push(node(&inductor.value, &inductor.location)?);
+        parts.word(node(parts, &inductor.value, &inductor.location)?)?;
     }
     if coupling.name != "coefficient"
         || !matches!(
@@ -1440,26 +1708,26 @@ fn mutual_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceR
             Some(&coupling.location),
         ));
     }
-    parts.push(value_text(coupling, false)?);
+    parts.word(value_text(parts, coupling, false)?)?;
     Ok(())
 }
 
-fn source_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceResult<()> {
+fn source_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResult<()> {
     let mut parameters = device.parameters.iter().peekable();
     while let Some(parameter) = parameters.next() {
         let location = &parameter.location;
         match (&parameter.kind, parameter.name.as_str()) {
             (ParameterKind::Scalar | ParameterKind::Expression(_), "dc") => {
-                parts.push("dc".to_owned());
-                parts.push(value_text(parameter, false)?);
+                parts.word("dc")?;
+                parts.word(value_text(parts, parameter, false)?)?;
             }
             (ParameterKind::Scalar | ParameterKind::Expression(_), "acmag") => {
                 let Some(phase) = parameters.next_if(|next| next.name == "acphase") else {
                     return Err(refuse("acmag without acphase", Some(location)));
                 };
-                parts.push("ac".to_owned());
-                parts.push(value_text(parameter, false)?);
-                parts.push(value_text(phase, false)?);
+                parts.word("ac")?;
+                parts.word(value_text(parts, parameter, false)?)?;
+                parts.word(value_text(parts, phase, false)?)?;
             }
             (
                 ParameterKind::Scalar | ParameterKind::Expression(_),
@@ -1476,23 +1744,23 @@ fn source_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceR
                         Some(location),
                     ));
                 };
-                parts.push(name.trim_end_matches("mag").to_owned());
-                parts.push(value_text(parameter, false)?);
-                parts.push(value_text(phase, false)?);
+                parts.word(name.trim_end_matches("mag"))?;
+                parts.word(value_text(parts, parameter, false)?)?;
+                parts.word(value_text(parts, phase, false)?)?;
             }
             (ParameterKind::Waveform(waveform), name) => {
-                parts.push(waveform_text(waveform, name, location)?);
+                waveform_text(parts, waveform, name, location)?;
             }
             // PWL delay/repeat setters stay separate ordered scalars (vsrc.c).
-            (ParameterKind::Scalar | ParameterKind::Expression(_), name @ ("r" | "td")) => {
-                parts.push(format!("{name}={}", value_text(parameter, false)?));
+            (ParameterKind::Scalar | ParameterKind::Expression(_), "r" | "td") => {
+                named_value(parts, parameter, false)?;
             }
             // RFSPICE port setters of a V source, ordered like the PWL ones.
             (
                 ParameterKind::Scalar | ParameterKind::Expression(_),
-                name @ ("portnum" | "z0" | "pwr" | "freq" | "phase"),
+                "portnum" | "z0" | "pwr" | "freq" | "phase",
             ) if device.designator == 'v' => {
-                parts.push(format!("{name}={}", value_text(parameter, false)?));
+                named_value(parts, parameter, false)?;
             }
             _ => {
                 return Err(refuse(
@@ -1506,13 +1774,20 @@ fn source_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceR
 }
 
 fn waveform_text(
+    parts: &mut Card<'_>,
     waveform: &SourceWaveform,
     name: &str,
     location: &SourceLoc,
-) -> SpiceResult<String> {
+) -> SpiceResult<()> {
     let kind = waveform.kind();
     let keyword = kind.keyword(name);
-    let fields = match waveform {
+    if name != keyword {
+        return Err(refuse(
+            format!("waveform setter named {name:?} holds a {keyword}"),
+            Some(location),
+        ));
+    }
+    match waveform {
         SourceWaveform::Pulse(pulse) => {
             let optional = [
                 &pulse.delay,
@@ -1522,27 +1797,38 @@ fn waveform_text(
                 &pulse.period,
                 &pulse.count,
             ];
-            let mut fields = vec![&pulse.initial, &pulse.pulsed];
             let mut omitted = false;
             for value in optional {
-                match value {
-                    Some(value) if !omitted => fields.push(value),
-                    Some(_) => {
-                        return Err(refuse(
-                            "PULSE field present after an omitted field",
-                            Some(location),
-                        ));
-                    }
-                    None => omitted = true,
+                if value.is_none() {
+                    omitted = true;
+                } else if omitted {
+                    return Err(refuse(
+                        "PULSE field present after an omitted field",
+                        Some(location),
+                    ));
                 }
             }
-            fields
+            numeric_vector_text(
+                parts,
+                keyword,
+                [&pulse.initial, &pulse.pulsed]
+                    .into_iter()
+                    .chain(optional.into_iter().filter_map(Option::as_ref)),
+                ' ',
+                location,
+            )
         }
         SourceWaveform::Pwl(points) => {
             if points.is_empty() || points.len() > kind.maximum_fields() / 2 {
                 return Err(refuse("PWL needs 1 to 2048 points", Some(location)));
             }
-            points.iter().flat_map(|p| [&p.time, &p.value]).collect()
+            numeric_vector_text(
+                parts,
+                keyword,
+                points.iter().flat_map(|p| [&p.time, &p.value]),
+                ' ',
+                location,
+            )
         }
         SourceWaveform::Function(function) => {
             let maximum = kind.maximum_fields();
@@ -1555,19 +1841,12 @@ fn waveform_text(
                     Some(location),
                 ));
             }
-            function.values.iter().collect()
+            numeric_vector_text(parts, keyword, &function.values, ' ', location)
         }
-    };
-    if name != keyword {
-        return Err(refuse(
-            format!("waveform setter named {name:?} holds a {keyword}"),
-            Some(location),
-        ));
     }
-    numeric_vector_text(keyword, fields, ' ', location)
 }
 
-fn transistor_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> SpiceResult<()> {
+fn transistor_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResult<()> {
     let designator = device.designator;
     let scalars: &[&str] = match designator {
         'd' => &[
@@ -1593,7 +1872,7 @@ fn transistor_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> Sp
         let location = &parameter.location;
         match &parameter.kind {
             ParameterKind::Flag if parameter.name == "off" && parameter.value.is_empty() => {
-                parts.push("off".to_owned());
+                parts.word("off")?;
             }
             ParameterKind::InitialConditions(components) if parameter.name == "ic" => {
                 let names: &[&str] = match designator {
@@ -1609,17 +1888,18 @@ fn transistor_parameters(device: &DeviceInstance, parts: &mut Vec<String>) -> Sp
                 {
                     return Err(refuse("malformed ic vector", Some(location)));
                 }
-                parts.push(numeric_vector_text(
+                numeric_vector_text(
+                    parts,
                     "ic=",
                     components.iter().map(|component| &component.value),
                     ',',
                     location,
-                )?);
+                )?;
             }
             ParameterKind::Scalar | ParameterKind::Expression(_)
                 if scalars.contains(&parameter.name.as_str()) =>
             {
-                parts.push(named_value(parameter, false)?);
+                named_value(parts, parameter, false)?;
             }
             _ => {
                 return Err(refuse(

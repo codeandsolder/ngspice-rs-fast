@@ -13,6 +13,7 @@
 //! original spelling, so the parser can rely on it when the classification is
 //! merely a hint.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
@@ -21,7 +22,7 @@ use crate::netlist::source::{LogicalLine, SourceMap, SourcePosition};
 
 /// What kind of token this is.
 #[derive(Debug, Clone, PartialEq)]
-pub enum TokenKind {
+pub enum TokenKind<S = String> {
     /// An identifier, node name, model name or keyword.
     Word,
     /// A numeric literal. [`Token::text`] keeps the original spelling, which may
@@ -30,9 +31,9 @@ pub enum TokenKind {
     /// A `{ ... }` numparam expression, kept verbatim. The tokenizer only
     /// matches braces; grammar-level consumers parse the text (see
     /// [`crate::netlist::expr`]).
-    Expression(String),
+    Expression(S),
     /// A quoted string, with its quotes removed and escapes resolved.
-    Quoted(String),
+    Quoted(S),
     /// `(`
     LParen,
     /// `)`
@@ -43,7 +44,7 @@ pub enum TokenKind {
     Equals,
 }
 
-impl TokenKind {
+impl<S> TokenKind<S> {
     /// A short human-readable name, for diagnostics and the CLI's token dump.
     #[must_use]
     pub const fn name(&self) -> &'static str {
@@ -60,7 +61,7 @@ impl TokenKind {
     }
 }
 
-impl fmt::Display for TokenKind {
+impl<S> fmt::Display for TokenKind<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
@@ -127,113 +128,140 @@ impl Token {
 /// Characters that end a bare word.
 const DELIMITERS: &[u8] = b"(),={}\"'";
 
+/// A borrowed spelling and its classification, before source provenance
+/// and owned token storage are attached.
+pub(super) struct Lexeme<'a> {
+    pub(super) kind: TokenKind<Cow<'a, str>>,
+    pub(super) text: &'a str,
+    pub(super) start: usize,
+}
+
+impl TokenKind<Cow<'_, str>> {
+    fn into_owned(self) -> TokenKind {
+        match self {
+            Self::Word => TokenKind::Word,
+            Self::Number(value) => TokenKind::Number(value),
+            Self::Expression(text) => TokenKind::Expression(text.into_owned()),
+            Self::Quoted(text) => TokenKind::Quoted(text.into_owned()),
+            Self::LParen => TokenKind::LParen,
+            Self::RParen => TokenKind::RParen,
+            Self::Comma => TokenKind::Comma,
+            Self::Equals => TokenKind::Equals,
+        }
+    }
+}
+
+/// Scan a single token using the production lexical rules, without
+/// allocating an owned spelling or source map. Only escaped quoted
+/// contents need an intermediate owned string. The location callback runs
+/// only for a lexical error.
+pub(super) fn scan_next<'a>(
+    text: &'a str,
+    cursor: &mut usize,
+    location: impl FnOnce(usize) -> SourceLoc,
+) -> SpiceResult<Option<Lexeme<'a>>> {
+    let bytes = text.as_bytes();
+    while bytes.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
+        *cursor += 1;
+    }
+    let start = *cursor;
+    let Some(&first) = bytes.get(start) else {
+        return Ok(None);
+    };
+    let (kind, end) = match first {
+        b'(' => (TokenKind::LParen, start + 1),
+        b')' => (TokenKind::RParen, start + 1),
+        b',' => (TokenKind::Comma, start + 1),
+        b'=' => (TokenKind::Equals, start + 1),
+        b'{' => {
+            let Some(end) = find_closing_brace(bytes, start) else {
+                return Err(SpiceError::parse(
+                    location(start),
+                    "unterminated '{' expression on this card",
+                ));
+            };
+            (
+                TokenKind::Expression(Cow::Borrowed(text[start + 1..end].trim())),
+                end + 1,
+            )
+        }
+        b'}' => {
+            return Err(SpiceError::parse(
+                location(start),
+                "unmatched '}' without an opening '{' on this card",
+            ));
+        }
+        quote @ (b'"' | b'\'') => {
+            let quote = char::from(quote);
+            let inner = &text[start + 1..];
+            let mut characters = inner.char_indices();
+            let mut decoded: Option<String> = None;
+            let mut closing = None;
+            while let Some((offset, character)) = characters.next() {
+                if character == '\\'
+                    && let Some((_, escaped)) = characters.next()
+                {
+                    decoded
+                        .get_or_insert_with(|| inner[..offset].to_owned())
+                        .push(escaped);
+                    continue;
+                }
+                if character == quote {
+                    closing = Some(offset);
+                    break;
+                }
+                if let Some(value) = &mut decoded {
+                    value.push(character);
+                }
+            }
+            let Some(closing) = closing else {
+                return Err(SpiceError::parse(
+                    location(start),
+                    format!("unterminated {quote} quoted string on this card"),
+                ));
+            };
+            let value = decoded.map_or_else(|| Cow::Borrowed(&inner[..closing]), Cow::Owned);
+            (TokenKind::Quoted(value), start + closing + 2)
+        }
+        _ => {
+            let mut end = start + 1;
+            while end < bytes.len()
+                && !bytes[end].is_ascii_whitespace()
+                && !DELIMITERS.contains(&bytes[end])
+            {
+                end += 1;
+            }
+            let kind =
+                parse_spice_number(&text[start..end]).map_or(TokenKind::Word, TokenKind::Number);
+            (kind, end)
+        }
+    };
+    *cursor = end;
+    Ok(Some(Lexeme {
+        kind,
+        text: &text[start..end],
+        start,
+    }))
+}
+
 /// Splits a logical card into tokens.
 ///
 /// # Errors
 ///
-/// Returns [`SpiceError::Parse`] for an unterminated `{` expression, an
-/// unmatched `}` or an unterminated quoted string.
+/// Returns [`SpiceError::Parse`] for an unterminated expression or quote,
+/// or an unmatched closing brace.
 pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
-    let text = line.text.as_str();
-    let bytes = text.as_bytes();
     let mut tokens = Vec::new();
-    let mut index = 0;
-
-    while index < bytes.len() {
-        if bytes[index].is_ascii_whitespace() {
-            index += 1;
-            continue;
-        }
-
-        let start = index;
-        let location = || line.location_at(start);
-
-        match bytes[index] {
-            b'(' => {
-                tokens.push(Token::new(TokenKind::LParen, "(", line, start));
-                index += 1;
-            }
-            b')' => {
-                tokens.push(Token::new(TokenKind::RParen, ")", line, start));
-                index += 1;
-            }
-            b',' => {
-                tokens.push(Token::new(TokenKind::Comma, ",", line, start));
-                index += 1;
-            }
-            b'=' => {
-                tokens.push(Token::new(TokenKind::Equals, "=", line, start));
-                index += 1;
-            }
-            b'{' => {
-                let Some(end) = find_closing_brace(bytes, index) else {
-                    return Err(SpiceError::parse(
-                        location(),
-                        "unterminated '{' expression on this card",
-                    ));
-                };
-                let inner = text[index + 1..end].trim().to_owned();
-                tokens.push(Token::new(
-                    TokenKind::Expression(inner),
-                    &text[index..=end],
-                    line,
-                    start,
-                ));
-                index = end + 1;
-            }
-            b'}' => {
-                return Err(SpiceError::parse(
-                    location(),
-                    "unmatched '}' without an opening '{' on this card",
-                ));
-            }
-            quote @ (b'"' | b'\'') => {
-                let quote = quote as char;
-                let content_start = index + 1;
-                let mut characters = text[content_start..].char_indices();
-                let mut value = String::new();
-                let mut end = None;
-                while let Some((offset, character)) = characters.next() {
-                    if character == '\\'
-                        && let Some((_, escaped)) = characters.next()
-                    {
-                        value.push(escaped);
-                        continue;
-                    }
-                    if character == quote {
-                        end = Some(content_start + offset + character.len_utf8());
-                        break;
-                    }
-                    value.push(character);
-                }
-                let Some(cursor) = end else {
-                    return Err(SpiceError::parse(
-                        location(),
-                        format!("unterminated {quote} quoted string on this card"),
-                    ));
-                };
-                tokens.push(Token::new(
-                    TokenKind::Quoted(value),
-                    &text[index..cursor],
-                    line,
-                    start,
-                ));
-                index = cursor;
-            }
-            _ => {
-                while index < bytes.len()
-                    && !bytes[index].is_ascii_whitespace()
-                    && !DELIMITERS.contains(&bytes[index])
-                {
-                    index += 1;
-                }
-                let word = &text[start..index];
-                let kind = parse_spice_number(word).map_or(TokenKind::Word, TokenKind::Number);
-                tokens.push(Token::new(kind, word, line, start));
-            }
-        }
+    let mut cursor = 0;
+    while let Some(lexeme) = scan_next(&line.text, &mut cursor, |offset| line.location_at(offset))?
+    {
+        tokens.push(Token::new(
+            lexeme.kind.into_owned(),
+            lexeme.text,
+            line,
+            lexeme.start,
+        ));
     }
-
     Ok(tokens)
 }
 
