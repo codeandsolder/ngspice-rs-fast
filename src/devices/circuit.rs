@@ -24,7 +24,7 @@ use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResu
 use petgraph::graph::UnGraph;
 
 use crate::devices::elaboration::{
-    ElaborationLimits, ElaborationSize, PlannedBatch, PlannedKind, reserve, resource_error,
+    ElaborationLimits, ElaborationSize, ExpansionKind, PlannedBatch, reserve, resource_error,
 };
 use crate::devices::linear::Forcing;
 use crate::devices::models::ModelContext;
@@ -3042,10 +3042,11 @@ impl Circuit {
         reserve(
             &mut staged,
             plan.devices,
-            plan.instances.first().map(|i| &i.instance.location),
+            plan.instances.first().map(|i| &i.location),
         )?;
-        for prepared in plan.instances {
-            let instance = prepared.instance;
+        let mut expansions = plan.expansions.into_iter().peekable();
+        for (ordinal, instance) in plan.instances.iter().enumerate() {
+            let expansion = expansions.next_if(|prepared| prepared.ordinal == ordinal);
             let at = Some(&instance.location);
             if !seen.insert(instance.name.to_lowercase()) {
                 return Err(SpiceError::circuit(format!(
@@ -3055,11 +3056,15 @@ impl Circuit {
             }
             let first_node = nodes.len();
             let first_device = staged.len();
-            let exact = prepared.is_exact();
-            let expected = prepared.size_at_bind(nodes)?;
+            let exact = expansion.is_some();
+            let expected = expansion
+                .as_ref()
+                .map_or(Ok(ElaborationSize::new(1, 0, 0)), |prepared| {
+                    prepared.size_at_bind(instance, nodes)
+                })?;
             limits.check(usage.checked_add(expected, at)?, at)?;
-            match prepared.kind {
-                PlannedKind::Txl(crate::devices::txl::TxlPlan::Fallback(plan_txl)) => {
+            match expansion.map(|prepared| prepared.kind) {
+                Some(ExpansionKind::Txl(crate::devices::txl::TxlPlan::Fallback(plan_txl))) => {
                     let expanded = plan_txl.bind(instance, nodes, &plan.deck_nodes)?;
                     for device in expanded {
                         if !seen.insert(device.name().to_ascii_lowercase()) {
@@ -3074,7 +3079,7 @@ impl Circuit {
                         });
                     }
                 }
-                PlannedKind::Urc(plan_urc) => {
+                Some(ExpansionKind::Urc(plan_urc)) => {
                     let expanded = plan_urc.bind(instance, nodes, context, &plan.deck_nodes)?;
                     let line = base + staged.len();
                     Self::stage_urc(
@@ -3087,13 +3092,13 @@ impl Circuit {
                         &mut staged,
                     )?;
                 }
-                PlannedKind::Ordinary => {
+                None => {
                     let device = crate::devices::factory::instantiate_with_models(
                         instance, nodes, models, context,
                     )?;
                     Self::stage_single(instance, nodes, device, first_node, &mut staged)?;
                 }
-                PlannedKind::Txl(crate::devices::txl::TxlPlan::Native(native)) => {
+                Some(ExpansionKind::Txl(crate::devices::txl::TxlPlan::Native(native))) => {
                     let device = native.bind(instance, nodes)?;
                     Self::stage_single(instance, nodes, device, first_node, &mut staged)?;
                 }

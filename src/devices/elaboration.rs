@@ -115,55 +115,50 @@ pub(super) fn reserve<T>(
     })
 }
 
-pub(super) enum PlannedKind {
-    Ordinary,
+pub(super) enum ExpansionKind {
     Urc(UrcPlan),
     Txl(TxlPlan),
 }
 
-/// The generated plan owns validated setters and exact internal resource
-/// counts; ordinary devices have a one-record lower bound until factory bind.
-pub(super) struct PlannedInstance<'a> {
-    pub(super) instance: &'a DeviceInstance,
-    pub(super) kind: PlannedKind,
+/// Only special expansion cards need a stored plan. Ordinary decks borrow
+/// their original instance slice, with no per-card plan allocation.
+pub(super) struct PlannedExpansion {
+    pub(super) ordinal: usize,
+    pub(super) kind: ExpansionKind,
     size: ElaborationSize,
 }
 
-impl<'a> PlannedInstance<'a> {
+impl PlannedExpansion {
     fn prepare(
-        instance: &'a DeviceInstance,
+        ordinal: usize,
+        instance: &DeviceInstance,
         models: &ModelResolver<'_>,
         context: &ModelContext,
-    ) -> SpiceResult<Self> {
+    ) -> SpiceResult<Option<Self>> {
         let kind = match instance.designator.to_ascii_lowercase() {
-            'u' => PlannedKind::Urc(UrcPlan::prepare(instance, models, context)?),
-            'y' => PlannedKind::Txl(TxlPlan::prepare(instance, models, context)?),
-            _ => PlannedKind::Ordinary,
+            'u' => ExpansionKind::Urc(UrcPlan::prepare(instance, models, context)?),
+            'y' => ExpansionKind::Txl(TxlPlan::prepare(instance, models, context)?),
+            _ => return Ok(None),
         };
         let size = match &kind {
-            PlannedKind::Ordinary => ElaborationSize::new(1, 0, 0),
-            PlannedKind::Urc(plan) => plan.size(&instance.location)?,
-            PlannedKind::Txl(plan) => plan.size(),
+            ExpansionKind::Urc(plan) => plan.size(&instance.location)?,
+            ExpansionKind::Txl(plan) => plan.size(),
         };
-        Ok(Self {
-            instance,
+        Ok(Some(Self {
+            ordinal,
             kind,
             size,
-        })
-    }
-
-    pub(super) const fn is_exact(&self) -> bool {
-        !matches!(self.kind, PlannedKind::Ordinary)
+        }))
     }
 
     /// At bind time count only missing distinct terminals. Both generated
     /// plan kinds always intern their entire written terminal list.
-    pub(super) fn size_at_bind(&self, nodes: &NodeTable) -> SpiceResult<ElaborationSize> {
-        if !self.is_exact() {
-            return Ok(self.size);
-        }
-        let missing = self
-            .instance
+    pub(super) fn size_at_bind(
+        &self,
+        instance: &DeviceInstance,
+        nodes: &NodeTable,
+    ) -> SpiceResult<ElaborationSize> {
+        let missing = instance
             .nodes
             .iter()
             .filter(|name| nodes.get(name).is_none())
@@ -172,7 +167,7 @@ impl<'a> PlannedInstance<'a> {
             .len();
         self.size.checked_add(
             ElaborationSize::new(0, missing, 0),
-            Some(&self.instance.location),
+            Some(&instance.location),
         )
     }
 }
@@ -182,7 +177,8 @@ impl<'a> PlannedInstance<'a> {
 /// written terminals of the generated groups. Ordinary private node/state
 /// sizes are checked as each factory binds.
 pub(super) struct PlannedBatch<'a> {
-    pub(super) instances: Vec<PlannedInstance<'a>>,
+    pub(super) instances: &'a [DeviceInstance],
+    pub(super) expansions: Vec<PlannedExpansion>,
     pub(super) devices: usize,
     pub(super) deck_nodes: BTreeSet<String>,
 }
@@ -199,27 +195,28 @@ impl<'a> PlannedBatch<'a> {
         let first = instances.first().map(|i| &i.location);
         let mut known = existing.checked_add(ElaborationSize::new(instances.len(), 0, 0), first)?;
         limits.check(known, first)?;
-        let mut plans = Vec::new();
-        reserve(&mut plans, instances.len(), first)?;
+        let mut expansions = Vec::new();
         let mut generated_terminals = BTreeSet::new();
-        for instance in instances {
+        for (ordinal, instance) in instances.iter().enumerate() {
             let at = Some(&instance.location);
-            let plan = PlannedInstance::prepare(instance, models, context)?;
-            if plan.is_exact() {
-                let mut extra = plan.size;
-                extra.devices -= 1; // the minimum counted every input card already
-                for name in &instance.nodes {
-                    if nodes.get(name).is_none()
-                        && generated_terminals
-                            .insert(NodeTable::canonical_name(name, nodes.auto_gnd()))
-                    {
-                        extra = extra.checked_add(ElaborationSize::new(0, 1, 0), at)?;
-                    }
+            let Some(plan) = PlannedExpansion::prepare(ordinal, instance, models, context)? else {
+                continue;
+            };
+            let mut extra = plan.size;
+            extra.devices -= 1; // the minimum counted every input card already
+            for name in &instance.nodes {
+                if nodes.get(name).is_none()
+                    && generated_terminals.insert(NodeTable::canonical_name(name, nodes.auto_gnd()))
+                {
+                    extra = extra.checked_add(ElaborationSize::new(0, 1, 0), at)?;
                 }
-                known = known.checked_add(extra, at)?;
-                limits.check(known, at)?;
             }
-            plans.push(plan);
+            known = known.checked_add(extra, at)?;
+            limits.check(known, at)?;
+            expansions.try_reserve(1).map_err(|error| {
+                resource_error(at, format!("cannot reserve expansion plan: {error}"))
+            })?;
+            expansions.push(plan);
         }
         let deck_nodes = instances
             .iter()
@@ -227,7 +224,8 @@ impl<'a> PlannedBatch<'a> {
             .map(|name| NodeTable::canonical_name(name, nodes.auto_gnd()))
             .collect();
         Ok(Self {
-            instances: plans,
+            instances,
+            expansions,
             devices: known.devices - existing.devices,
             deck_nodes,
         })
