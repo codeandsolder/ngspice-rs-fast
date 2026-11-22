@@ -3,8 +3,7 @@
 
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -18,42 +17,17 @@ use super::grammar::{self, ParsedCard};
 use super::scopes::InputCard;
 use crate::netlist::ast::LibrarySection;
 use crate::netlist::card::{DotCommand, RawCard};
-use crate::netlist::source::{Deck, parse_deck_text, parse_fragment_text};
+use crate::netlist::source::{Deck, fold_bounded, read_text};
 
-/// Per-parse source work limits. Repeated includes consume budgets again;
-/// sharing a dependency never suppresses its ordered content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SourceLimits {
-    /// Maximum nested includes below the root. Values above 64 are rejected.
-    pub depth: usize,
-    /// Total logical file visits including the root and repeated includes.
-    pub files: usize,
-    /// Total logical UTF-8 source bytes, including unselected library sections.
-    pub bytes: usize,
-    /// Total processed cards, including directives and structural terminators.
-    ///
-    /// C ngspice (`inpcom.c`, `inp_readall`) has no such cap; the port keeps one
-    /// only as a budget against runaway repeated includes. The default is four
-    /// times the default subcircuit device budget (`SubcircuitLimits::max_devices`
-    /// in the devices layer, 250,000), so a flat deck that the expansion budget
-    /// accepts is not rejected here for its size.
-    pub cards: usize,
-}
-
-impl Default for SourceLimits {
-    fn default() -> Self {
-        Self {
-            depth: 64,
-            files: 1024,
-            bytes: 16 * 1024 * 1024,
-            cards: 1_000_000,
-        }
-    }
-}
+use crate::netlist::source::budget::{SourceBudget, SourceLimits};
 
 type SourceKey = (PathBuf, Option<String>);
 type CardResult = SpiceResult<Arc<RawCard>>;
-type CachedCard = OnceCell<Result<Arc<RawCard>, Box<SpiceError>>>;
+type CachedCard = OnceCell<CachedLexical>;
+struct CachedLexical {
+    card: Result<Arc<RawCard>, Box<SpiceError>>,
+    cost: usize,
+}
 type SectionIndex = BTreeMap<String, Section>;
 
 #[derive(Clone)]
@@ -72,30 +46,55 @@ struct Fragment {
 }
 
 impl Fragment {
-    fn new(deck: Deck) -> Self {
-        let cards = (0..deck.lines.len()).map(|_| OnceCell::new()).collect();
-        Self {
+    fn new(deck: Deck, budget: &mut SourceBudget) -> SpiceResult<Self> {
+        let mut cards = Vec::new();
+        budget.allocation(
+            cards.try_reserve_exact(deck.lines.len()),
+            &deck.title_location,
+        )?;
+        cards.resize_with(deck.lines.len(), OnceCell::new);
+        Ok(Self {
             deck,
             cards,
             sections: OnceCell::new(),
-        }
+        })
     }
 
-    fn card(&self, index: usize) -> CardResult {
-        self.cards[index]
-            .get_or_init(|| {
-                RawCard::parse(&self.deck.lines[index])
-                    .map(Arc::new)
-                    .map_err(Box::new)
-            })
+    fn card(&self, index: usize, budget: &mut SourceBudget) -> CardResult {
+        let line = &self.deck.lines[index];
+        let slot = &self.cards[index];
+        if let Some(cached) = slot.get() {
+            budget.tokens(cached.cost, &line.location)?;
+            return cached
+                .card
+                .as_ref()
+                .map(Arc::clone)
+                .map_err(|error| error.as_ref().clone());
+        }
+        let before = budget.remaining_tokens();
+        let card = RawCard::parse_bounded(line, budget).map(Arc::new);
+        if budget.exhausted() {
+            return card;
+        }
+        let cached = slot.get_or_init(|| CachedLexical {
+            cost: before - budget.remaining_tokens(),
+            card: card.map_err(Box::new),
+        });
+        cached
+            .card
             .as_ref()
             .map(Arc::clone)
             .map_err(|error| error.as_ref().clone())
     }
 
-    fn section(&self, name: &str, location: &SourceLoc) -> SpiceResult<Section> {
+    fn section(
+        &self,
+        name: &str,
+        location: &SourceLoc,
+        budget: &mut SourceBudget,
+    ) -> SpiceResult<Section> {
         self.sections
-            .get_or_init(|| index_sections(self))
+            .get_or_init(|| index_sections(self, budget))
             .as_ref()
             .map_err(Clone::clone)?
             .get(name)
@@ -122,13 +121,16 @@ struct SourceSnapshot {
 }
 
 impl SourceSnapshot {
-    fn fragment(&mut self, path: &Path) -> Rc<Fragment> {
+    fn fragment(&mut self, path: &Path, budget: &mut SourceBudget) -> SpiceResult<Rc<Fragment>> {
         match &self.content {
-            SnapshotContent::Folded(fragment) => Rc::clone(fragment),
+            SnapshotContent::Folded(fragment) => Ok(Rc::clone(fragment)),
             SnapshotContent::RootText(text) => {
-                let fragment = Rc::new(Fragment::new(parse_fragment_text(path, text)));
+                let fragment = Rc::new(Fragment::new(
+                    fold_bounded(path, text, false, budget)?,
+                    budget,
+                )?);
                 self.content = SnapshotContent::Folded(Rc::clone(&fragment));
-                fragment
+                Ok(fragment)
             }
         }
     }
@@ -142,10 +144,7 @@ struct Expansion {
 }
 
 struct Resolver {
-    limits: SourceLimits,
-    files: usize,
-    bytes: usize,
-    cards: usize,
+    budget: SourceBudget,
     sources: BTreeMap<PathBuf, SourceSnapshot>,
     dependencies: DiGraph<SourceKey, ()>,
     nodes: BTreeMap<SourceKey, NodeIndex>,
@@ -156,20 +155,16 @@ pub(super) fn resolve(
     limits: SourceLimits,
 ) -> SpiceResult<(Deck, Vec<SpiceResult<InputCard>>)> {
     let location = SourceLoc::new(path.to_path_buf(), 1, 1);
-    if limits.depth > 64 {
-        return Err(SpiceError::parse(
-            location,
-            "source depth limit must be at most 64",
-        ));
-    }
     let mut resolver = Resolver::new(limits);
+    resolver.budget.validate(&location)?;
     let canonical = fs::canonicalize(path).map_err(|e| SpiceError::io(path, &e))?;
-    let remaining = resolver.begin_file(&location)?;
+    let remaining = resolver.budget.begin_file(&location)?;
     let text = read_text(&canonical, remaining, &location)?;
     let bytes = text.len();
-    resolver.bytes += bytes;
+    resolver.budget.bytes(bytes, &location)?;
     // Keep the caller's root path/title API; fragments use canonical paths.
-    let fragment = Fragment::new(parse_deck_text(path, &text));
+    let deck = fold_bounded(path, &text, true, &mut resolver.budget)?;
+    let fragment = Fragment::new(deck, &mut resolver.budget)?;
     resolver.sources.insert(
         canonical.clone(),
         SourceSnapshot {
@@ -188,71 +183,37 @@ pub(super) fn resolve(
     ) {
         // Replay resolution errors alongside cards so an earlier unsupported
         // directive/device keeps its diagnostic instead of a later I/O error.
+        resolver
+            .budget
+            .allocation(output.try_reserve(1), &location)?;
         output.push(Err(error));
     }
     Ok((fragment.deck, output))
 }
 
-fn byte_limit(location: &SourceLoc) -> SpiceError {
-    SpiceError::parse(location.clone(), "source byte work limit exceeded")
-}
-
-fn read_text(path: &Path, remaining: usize, location: &SourceLoc) -> SpiceResult<String> {
-    let mut bytes = Vec::new();
-    let file = File::open(path).map_err(|e| SpiceError::io(path, &e))?;
-    file.take(
-        u64::try_from(remaining)
-            .unwrap_or(u64::MAX)
-            .saturating_add(1),
-    )
-    .read_to_end(&mut bytes)
-    .map_err(|e| SpiceError::io(path, &e))?;
-    if bytes.len() > remaining {
-        return Err(byte_limit(location));
-    }
-    String::from_utf8(bytes)
-        .map_err(|e| SpiceError::parse(location.clone(), format!("source is not UTF-8: {e}")))
-}
-
 impl Resolver {
     fn new(limits: SourceLimits) -> Self {
         Self {
-            limits,
-            files: 0,
-            bytes: 0,
-            cards: 0,
+            budget: SourceBudget::new(limits),
             sources: BTreeMap::new(),
             dependencies: DiGraph::new(),
             nodes: BTreeMap::new(),
         }
     }
 
-    fn begin_file(&mut self, location: &SourceLoc) -> SpiceResult<usize> {
-        if self.files >= self.limits.files {
-            return Err(SpiceError::parse(
-                location.clone(),
-                "source file work limit exceeded",
-            ));
-        }
-        self.files += 1;
-        Ok(self.limits.bytes.saturating_sub(self.bytes))
-    }
-
     /// Each visit consumes the original full file length, even a cache hit
     /// selecting an empty library section. Only physical I/O is deduplicated.
     fn fragment(&mut self, path: &Path, location: &SourceLoc) -> SpiceResult<Rc<Fragment>> {
-        let remaining = self.begin_file(location)?;
+        let remaining = self.budget.begin_file(location)?;
         if let Some(source) = self.sources.get_mut(path) {
-            if source.bytes > remaining {
-                return Err(byte_limit(location));
-            }
-            self.bytes += source.bytes;
-            return Ok(source.fragment(path));
+            self.budget.bytes(source.bytes, location)?;
+            return source.fragment(path, &mut self.budget);
         }
         let text = read_text(path, remaining, location)?;
         let bytes = text.len();
-        self.bytes += bytes;
-        let fragment = Rc::new(Fragment::new(parse_fragment_text(path, &text)));
+        self.budget.bytes(bytes, location)?;
+        let deck = fold_bounded(path, &text, false, &mut self.budget)?;
+        let fragment = Rc::new(Fragment::new(deck, &mut self.budget)?);
         self.sources.insert(
             path.to_path_buf(),
             SourceSnapshot {
@@ -280,7 +241,7 @@ impl Resolver {
         let ParsedCard::Include(directive) = parsed else {
             return Ok(None);
         };
-        if chain.len() >= self.limits.depth {
+        if chain.len() >= self.budget.limits.depth {
             return Err(SpiceError::parse(
                 directive.location,
                 "source include depth limit exceeded",
@@ -325,7 +286,7 @@ impl Resolver {
         entry.resolved_path = Some(canonical);
         let range = match directive.section {
             Some(section) => {
-                let selected = fragment.section(&section, &directive.location)?;
+                let selected = fragment.section(&section, &directive.location, &mut self.budget)?;
                 entry.selected_section = Some(selected.boundaries);
                 selected.range
             }
@@ -354,19 +315,17 @@ impl Resolver {
     ) -> SpiceResult<bool> {
         for index in range {
             let line = &fragment.deck.lines[index];
-            if self.cards >= self.limits.cards {
-                return Err(SpiceError::parse(
-                    line.location.clone(),
-                    format!(
-                        "source card work limit exceeded ({} cards, counting repeated includes)",
-                        self.limits.cards
-                    ),
-                ));
-            }
-            self.cards += 1;
-            let card = match fragment.card(index) {
+            self.budget.card(&line.location)?;
+            // Reserve a result slot before attempting lexing. A terminal
+            // error is replayed once, not cached or repeated for every card.
+            self.budget
+                .allocation(output.try_reserve(1), &line.location)?;
+            let card = match fragment.card(index, &mut self.budget) {
                 Ok(card) => card,
                 Err(error) => {
+                    if self.budget.exhausted() {
+                        return Err(error);
+                    }
                     output.push(Err(error));
                     continue;
                 }
@@ -408,13 +367,13 @@ impl Resolver {
 
 /// Validate section boundaries even in unselected blocks; do not tokenize or
 /// resolve ordinary cards in those blocks. Section names are case-insensitive.
-fn index_sections(fragment: &Fragment) -> SpiceResult<SectionIndex> {
+fn index_sections(fragment: &Fragment, budget: &mut SourceBudget) -> SpiceResult<SectionIndex> {
     let mut current: Option<(String, Arc<RawCard>, usize)> = None;
     let mut sections = BTreeMap::new();
     for (index, line) in fragment.deck.lines.iter().enumerate() {
         let keyword = line.text.split_whitespace().next().unwrap_or_default();
         if keyword.eq_ignore_ascii_case(".lib") || keyword.eq_ignore_ascii_case(".endl") {
-            let card = fragment.card(index)?;
+            let card = fragment.card(index, budget)?;
             match grammar::parse_card(&card, true, &BTreeSet::new())? {
                 ParsedCard::LibStart(name) => {
                     if current.is_some() {
@@ -499,8 +458,12 @@ mod tests {
         });
         let location = SourceLoc::new(PathBuf::from("root.cir"), 2, 1);
         let first = resolver.fragment(&path, &location).unwrap();
-        let selected = first.section("tt", &location).unwrap();
-        let card = first.card(selected.range.start).unwrap();
+        let selected = first
+            .section("tt", &location, &mut resolver.budget)
+            .unwrap();
+        let card = first
+            .card(selected.range.start, &mut resolver.budget)
+            .unwrap();
         assert_eq!(card.tokens.last().unwrap().location.line, 3);
         assert!(first.cards[3].get().is_some());
         assert!(
@@ -511,18 +474,21 @@ mod tests {
         let second = resolver.fragment(&path, &location).unwrap();
         fs::remove_file(&path).unwrap();
         assert!(Rc::ptr_eq(&first, &second));
-        let second_section = second.section("tt", &location).unwrap();
+        let second_section = second
+            .section("tt", &location, &mut resolver.budget)
+            .unwrap();
         assert!(Arc::ptr_eq(
             &selected.boundaries.opening,
             &second_section.boundaries.opening
         ));
         assert!(Arc::ptr_eq(
             &card,
-            &second.card(second_section.range.start).unwrap()
+            &second
+                .card(second_section.range.start, &mut resolver.budget)
+                .unwrap()
         ));
         assert_eq!(resolver.sources.len(), 1);
-        assert_eq!(resolver.files, 2);
-        assert_eq!(resolver.bytes, 2 * original.len());
+        assert_eq!(resolver.budget.begin_file(&location).unwrap(), 0);
         assert!(
             resolver
                 .fragment(&path, &location)

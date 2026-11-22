@@ -17,6 +17,7 @@ use std::fmt;
 
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
 
+use crate::netlist::source::budget::{SourceBudget, SourceLimits, copy_text};
 use crate::netlist::source::{LogicalLine, SourceMap, SourcePosition};
 
 /// What kind of token this is.
@@ -83,14 +84,15 @@ pub struct Token {
 impl Token {
     fn new(
         kind: TokenKind,
-        text: impl Into<String>,
+        text: String,
         line: &LogicalLine,
         raw_offset: usize,
+        location: SourceLoc,
     ) -> Self {
         Self {
             kind,
-            text: text.into(),
-            location: line.location_at(raw_offset),
+            text,
+            location,
             raw_offset,
             source_map: line.source_map.clone(),
         }
@@ -134,6 +136,14 @@ const DELIMITERS: &[u8] = b"(),={}\"'";
 /// Returns [`SpiceError::Parse`] for an unterminated `{` expression, an
 /// unmatched `}` or an unterminated quoted string.
 pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
+    tokenize_bounded(line, &mut SourceBudget::new(SourceLimits::default()))
+}
+
+pub(crate) fn tokenize_bounded(
+    line: &LogicalLine,
+    budget: &mut SourceBudget,
+) -> SpiceResult<Vec<Token>> {
+    budget.card_size(line.text.len(), &line.location)?;
     let text = line.text.as_str();
     let bytes = text.as_bytes();
     let mut tokens = Vec::new();
@@ -146,44 +156,71 @@ pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
         }
 
         let start = index;
-        let location = || line.location_at(start);
+        let location = line.location_at(start);
+        budget.tokens(1, &location)?;
+        budget.allocation(tokens.try_reserve(1), &location)?;
 
         match bytes[index] {
             b'(' => {
-                tokens.push(Token::new(TokenKind::LParen, "(", line, start));
+                tokens.push(Token::new(
+                    TokenKind::LParen,
+                    copy_text("(", budget, &location)?,
+                    line,
+                    start,
+                    location,
+                ));
                 index += 1;
             }
             b')' => {
-                tokens.push(Token::new(TokenKind::RParen, ")", line, start));
+                tokens.push(Token::new(
+                    TokenKind::RParen,
+                    copy_text(")", budget, &location)?,
+                    line,
+                    start,
+                    location,
+                ));
                 index += 1;
             }
             b',' => {
-                tokens.push(Token::new(TokenKind::Comma, ",", line, start));
+                tokens.push(Token::new(
+                    TokenKind::Comma,
+                    copy_text(",", budget, &location)?,
+                    line,
+                    start,
+                    location,
+                ));
                 index += 1;
             }
             b'=' => {
-                tokens.push(Token::new(TokenKind::Equals, "=", line, start));
+                tokens.push(Token::new(
+                    TokenKind::Equals,
+                    copy_text("=", budget, &location)?,
+                    line,
+                    start,
+                    location,
+                ));
                 index += 1;
             }
             b'{' => {
                 let Some(end) = find_closing_brace(bytes, index) else {
                     return Err(SpiceError::parse(
-                        location(),
+                        location.clone(),
                         "unterminated '{' expression on this card",
                     ));
                 };
-                let inner = text[index + 1..end].trim().to_owned();
+                let inner = copy_text(text[index + 1..end].trim(), budget, &location)?;
                 tokens.push(Token::new(
                     TokenKind::Expression(inner),
-                    &text[index..=end],
+                    copy_text(&text[index..=end], budget, &location)?,
                     line,
                     start,
+                    location,
                 ));
                 index = end + 1;
             }
             b'}' => {
                 return Err(SpiceError::parse(
-                    location(),
+                    location.clone(),
                     "unmatched '}' without an opening '{' on this card",
                 ));
             }
@@ -197,6 +234,7 @@ pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
                     if character == '\\'
                         && let Some((_, escaped)) = characters.next()
                     {
+                        budget.allocation(value.try_reserve(escaped.len_utf8()), &location)?;
                         value.push(escaped);
                         continue;
                     }
@@ -204,19 +242,21 @@ pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
                         end = Some(content_start + offset + character.len_utf8());
                         break;
                     }
+                    budget.allocation(value.try_reserve(character.len_utf8()), &location)?;
                     value.push(character);
                 }
                 let Some(cursor) = end else {
                     return Err(SpiceError::parse(
-                        location(),
+                        location.clone(),
                         format!("unterminated {quote} quoted string on this card"),
                     ));
                 };
                 tokens.push(Token::new(
                     TokenKind::Quoted(value),
-                    &text[index..cursor],
+                    copy_text(&text[index..cursor], budget, &location)?,
                     line,
                     start,
+                    location,
                 ));
                 index = cursor;
             }
@@ -229,7 +269,13 @@ pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
                 }
                 let word = &text[start..index];
                 let kind = parse_spice_number(word).map_or(TokenKind::Word, TokenKind::Number);
-                tokens.push(Token::new(kind, word, line, start));
+                tokens.push(Token::new(
+                    kind,
+                    copy_text(word, budget, &location)?,
+                    line,
+                    start,
+                    location,
+                ));
             }
         }
     }

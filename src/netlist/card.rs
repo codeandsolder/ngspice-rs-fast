@@ -7,8 +7,9 @@
 
 use crate::primitives::{AnalysisKind, SourceLoc, SpiceResult};
 
+use crate::netlist::source::budget::{SourceBudget, SourceLimits, copy_text};
 use crate::netlist::source::{LogicalLine, SourceMap, SourcePosition};
-use crate::netlist::token::{Token, tokenize};
+use crate::netlist::token::{Token, tokenize_bounded};
 
 /// Device designator letters recognised by the C front end.
 ///
@@ -277,11 +278,18 @@ impl RawCard {
     ///
     /// Propagates tokenizer errors, for instance an unterminated `{` expression.
     pub fn parse(line: &LogicalLine) -> SpiceResult<Self> {
-        let tokens = tokenize(line)?;
+        Self::parse_bounded(line, &mut SourceBudget::new(SourceLimits::default()))
+    }
+
+    pub(crate) fn parse_bounded(
+        line: &LogicalLine,
+        budget: &mut SourceBudget,
+    ) -> SpiceResult<Self> {
+        let tokens = tokenize_bounded(line, budget)?;
         let kind = tokens.first().map_or(CardKind::Unknown, CardKind::classify);
         Ok(Self {
             location: line.location.clone(),
-            raw: line.text.clone(),
+            raw: copy_text(&line.text, budget, &line.location)?,
             tokens,
             kind,
             source_map: line.source_map.clone(),

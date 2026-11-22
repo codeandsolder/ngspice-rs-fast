@@ -326,6 +326,7 @@ fn file_depth_byte_and_card_work_limits_include_repeated_sources() {
         files: 3,
         bytes: 56,
         cards: 4,
+        ..defaults
     };
     assert_eq!(
         Parser::new()
