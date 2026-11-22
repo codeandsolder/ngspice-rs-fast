@@ -46,6 +46,7 @@ pub mod parameters;
 mod pzld;
 mod sens;
 mod set;
+mod stamp_common;
 mod temp;
 
 /// The generated literal model defaults in C setup order (`b4set.c`).
