@@ -598,14 +598,18 @@ pub fn rc_coefficients(
             let new_slope = kernel.scale / (root + previous[0]);
             let root_difference = (delta + previous_delta) / (root + earlier_root);
             weight[0] = -new_slope * (root_difference / old_den);
-            active[0] = weight[0].abs() >= thresholds[0];
+            if weight[0].abs() < thresholds[0] {
+                active[0] = false;
+            }
         }
         for k in 1..3 {
             if active[k] {
                 let slope = (endpoint[k] - previous[k]) / delta;
                 weight[k] = slope - slopes[k];
                 slopes[k] = slope;
-                active[k] = weight[k].abs() >= thresholds[k];
+                if weight[k].abs() < thresholds[k] {
+                    active[k] = false;
+                }
             }
         }
         earlier_root = previous[0];
@@ -909,15 +913,41 @@ mod tests {
     fn rc_diffusion_tails_remain_positive_and_match_precise_integrals() {
         let lag = 1.;
         let cbyr = 1.;
-        for z in [0.01, 1., 4., 25., 100., 400.] {
+        // Independent 510-decimal-digit erf power-series evaluations,
+        // with the original analytic integral formulas.
+        for (z, expected) in [
+            (0.01, [0.793_572_664_982_455_7, 0.939_644_189_992_593_9]),
+            (1., [0.056_790_123_730_260_69, 0.100_509_083_320_024_44]),
+            (
+                4.,
+                [0.000_765_644_121_241_284_8, 0.001_956_045_429_902_990_4],
+            ),
+            (
+                25.,
+                [5.611_686_074_310_081_5e-14, 2.962_685_867_369_868_2e-13],
+            ),
+            (
+                100.,
+                [2.038_120_082_980_714_8e-47, 2.068_106_382_932_737_4e-46],
+            ),
+            (
+                400.,
+                [1.340_612_433_172_205_8e-178, 2.691_229_743_638_089_2e-177],
+            ),
+        ] {
             let kernel = RcKernel::new(cbyr, 4. * z);
             let [_, h2, h3] = kernel.at(lag, [true; 3]);
-            assert!(h2 > 0. && h3 > 0., "z={z} h2={h2:e} h3={h3:e}");
+            for (actual, reference) in [h2, h3].into_iter().zip(expected) {
+                assert!(
+                    (actual - reference).abs() <= 2e-12 * reference,
+                    "z={z} {actual:e} != {reference:e}"
+                );
+            }
         }
         // erfc(27) is a positive subnormal, not zero.
         assert!(erfc(27.) > 0.);
-        let kernel = RcKernel::new(1., 4000. * 1e100);
-        let [_, h2, h3] = kernel.at(1e100, [true; 3]);
+        let kernel = RcKernel::new(1., 4000. * 1e150);
+        let [_, h2, h3] = kernel.at(1e150, [true; 3]);
         assert!(h2 > 0.);
         assert_eq!(h3, 0.);
     }
