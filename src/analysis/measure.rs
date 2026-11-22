@@ -837,12 +837,18 @@ impl Integral {
                     2 => &[1. / 6., 2. / 3., 1. / 6.],
                     _ => &[0.5, 0.5],
                 };
-                let root_span = span.sqrt();
-                for (&(_, value), &weight) in self.panel.iter().zip(weights) {
-                    let magnitude = value.abs();
-                    self.rms_maximum = self.rms_maximum.max(magnitude);
-                    self.rms.add_product(magnitude, root_span * weight.sqrt());
-                }
+                let maximum = &mut self.rms_maximum;
+                self.rms.add_weighted(
+                    span,
+                    self.panel
+                        .iter()
+                        .zip(weights)
+                        .map(|(&(_, value), &weight)| {
+                            let magnitude = value.abs();
+                            *maximum = maximum.max(magnitude);
+                            (magnitude, weight)
+                        }),
+                );
             } else {
                 let y = |i: usize| self.panel[i].1;
                 let mean = match consumed {
@@ -868,7 +874,7 @@ impl Integral {
             // Positive normalized quadrature cannot exceed the largest sample.
             // Rounding of the weights/norm can otherwise overflow a constant MAX trace.
             MeasureStatistic::Rms => {
-                let norm = self.rms.norm_over(width.sqrt());
+                let norm = self.rms.root_mean(width);
                 if norm > self.rms_maximum {
                     self.rms_maximum
                 } else {

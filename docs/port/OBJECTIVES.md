@@ -80,3 +80,21 @@ costs. Host load is shared; these timings isolate the output stage,
 not the circuit solver. Run each ignored benchmark separately with
 `--exact --ignored --nocapture` on the test executable and profile
 heap allocations with `valgrind --tool=dhat`.
+
+### Numerical reconciliation
+
+Retained and streaming integration now use the same compensated panel
+accumulator, including weighted RMS evaluated in binary exponent units.
+RMS normalizes using the covered axis width only after all panels have
+been consumed. No squared ordinate or span-weighted square must be
+representable in binary64. Positive normalized quadrature is bounded
+by the maximum sampled magnitude. The shared crossing and divided-
+difference geometry preserves endpoint and extreme-scale behavior.
+
+The exponent-range regression tests constant panels at all 2,098
+binary64 binade exponents and five span scales, including subnormals
+and the largest normal binade (10,490 bit-exact cases). An isolated
+matched-checksum weighted-square kernel probe on Acer (20 repetitions
+of 100,000 four-point panels) measured median CPU time of 84.87 ms
+versus 91.07 ms for the intermediate square-root-product formulation.
+These kernel timings are not the end-to-end output benchmark above.

@@ -66,10 +66,9 @@ impl CompensatedSum {
     }
 }
 
-/// Square-sum in binary exponent units. Products can exceed the binary64
-/// range or fall below its smallest subnormal without losing their norm
-/// after normalization. The final divisor need not be known while adding
-/// samples (for example, an adaptive integration window).
+/// Weighted square-sum in binary exponent units. Neither a squared
+/// ordinate nor its product with a physical span has to fit in binary64.
+/// Normalize only at the end, when the actual covered window is known.
 pub(super) struct ScaledSquares {
     exponent: Option<i32>,
     squares: CompensatedSum,
@@ -97,49 +96,61 @@ impl ScaledSquares {
         }
     }
 
-    /// Add the square of a product without forming the product in its
-    /// original units. Both factors are finite and nonnegative.
-    pub(super) fn add_product(&mut self, magnitude: Real, factor: Real) {
-        let (Some((m, me)), Some((f, fe))) = (split(magnitude), split(factor)) else {
+    /// Add a group of squared ordinates with a common positive scale and
+    /// individual nonnegative weights. Inputs are finite; split the three
+    /// factors before multiplying, including subnormal scales.
+    pub(super) fn add_weighted(
+        &mut self,
+        scale: Real,
+        samples: impl Iterator<Item = (Real, Real)>,
+    ) {
+        let Some((sm, se)) = split(scale) else {
             return;
         };
-        let mantissa = m * f;
-        let exponent = me + fe;
-        let scale = match self.exponent {
-            Some(old) if exponent > old => {
-                // The old accumulator may have collected many terms. Split
-                // its total as well, before applying the exponent difference.
-                let total = self.squares.total();
-                let rescaled =
-                    split(total).map_or(0., |(m, e)| m * power_of_two(e + 2 * (old - exponent)));
-                self.squares = CompensatedSum::with_initial(rescaled);
-                self.exponent = Some(exponent);
-                exponent
-            }
-            Some(old) => old,
-            None => {
-                self.exponent = Some(exponent);
-                exponent
-            }
-        };
-        self.squares
-            .add(mantissa * mantissa * power_of_two(2 * (exponent - scale)));
+        for (value, weight) in samples {
+            let (Some((m, me)), Some((w, we))) = (split(value.abs()), split(weight)) else {
+                continue;
+            };
+            let term = m * m * sm * w;
+            let exponent = 2 * me + se + we;
+            let scale = match self.exponent {
+                Some(old) if exponent > old => {
+                    // The old accumulator may have collected many terms.
+                    // Split its total as well before rescaling.
+                    let total = self.squares.total();
+                    let rescaled =
+                        split(total).map_or(0., |(m, e)| m * power_of_two(e + old - exponent));
+                    self.squares = CompensatedSum::with_initial(rescaled);
+                    self.exponent = Some(exponent);
+                    exponent
+                }
+                Some(old) => old,
+                None => {
+                    self.exponent = Some(exponent);
+                    exponent
+                }
+            };
+            self.squares.add(term * power_of_two(exponent - scale));
+        }
     }
 
-    /// Euclidean norm divided by a finite positive factor. The final
-    /// multiplication performs the only rounding into the subnormal range.
-    pub(super) fn norm_over(self, divisor: Real) -> Real {
+    /// Square root of the normalized positive sum. Split the remaining
+    /// exponent by two before taking the root, so a small weighted term
+    /// is not rounded to zero before normalization.
+    pub(super) fn root_mean(self, divisor: Real) -> Real {
         let Some(exponent) = self.exponent else {
             return 0.;
         };
         let Some((d, de)) = split(divisor) else {
             return Real::NAN;
         };
-        let norm = self.squares.total().sqrt() / d;
-        let Some((m, e)) = split(norm) else {
-            return norm;
+        let exponent = exponent - de;
+        let odd = if exponent.rem_euclid(2) == 0 { 1. } else { 2. };
+        let root = (self.squares.total() / d * odd).sqrt();
+        let Some((m, e)) = split(root) else {
+            return root;
         };
-        let exponent = exponent - de + e;
+        let exponent = exponent.div_euclid(2) + e;
         if exponent < -1022 {
             (m * power_of_two(exponent + 1022)) * Real::MIN_POSITIVE
         } else {
@@ -153,19 +164,26 @@ mod tests {
     use super::CompensatedSum;
 
     #[test]
-    fn scaled_products_survive_exponents_outside_binary64() {
-        use super::ScaledSquares;
-        for (value, factor) in [(f64::MAX, 2_f64.powi(500)), (f64::from_bits(1), 1e-150)] {
-            let mut norm = ScaledSquares::new();
-            norm.add_product(value, factor);
-            let actual = norm.norm_over(factor);
-            assert!((actual - value).abs() <= 4. * f64::EPSILON * value);
+    fn scaled_weighted_constant_panels_cover_every_binary64_exponent() {
+        use super::{ScaledSquares, power_of_two};
+        for ye in -1074..=1023 {
+            let value = power_of_two(ye);
+            for se in [-1074, -536, 0, 536, 1023] {
+                let span = power_of_two(se);
+                let mut norm = ScaledSquares::new();
+                norm.add_weighted(
+                    span,
+                    [0.125, 0.375, 0.375, 0.125]
+                        .into_iter()
+                        .map(|weight| (value, weight)),
+                );
+                assert_eq!(norm.root_mean(span).to_bits(), value.to_bits());
+            }
         }
-        // An initially tiny scale must not overflow when rebased.
         let mut norm = ScaledSquares::new();
-        norm.add_product(1e-300, 1e-100);
-        norm.add_product(1e300, 1e100);
-        assert!((norm.norm_over(1e100) - 1e300).abs() <= 4. * f64::EPSILON * 1e300);
+        norm.add_weighted(1e-100, [(1e-300, 1.)].into_iter());
+        norm.add_weighted(1e100, [(1e300, 1.)].into_iter());
+        assert!((norm.root_mean(1e100) - 1e300).abs() <= 4. * f64::EPSILON * 1e300);
     }
 
     #[test]
