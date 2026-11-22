@@ -6,7 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/observations")
+    ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance/observations")
 }
 fn scratch(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("m9-observe-{}-{tag}", std::process::id()));
@@ -236,13 +238,15 @@ fn parameter_sweeps_observe_each_context_and_ac_rejects_current_asks() {
 fn device_observations_run_through_cli() {
     let dir = scratch("process");
     let raw = dir.join("out.raw");
-    let run = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("simulate")
-        .arg(root().join("m9_device_dc.cir"))
-        .arg("--output")
-        .arg(&raw)
-        .output()
-        .unwrap();
+    let run = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("simulate")
+    .arg(root().join("m9_device_dc.cir"))
+    .arg("--output")
+    .arg(&raw)
+    .output()
+    .unwrap();
     assert!(
         run.status.success(),
         "{}",

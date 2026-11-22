@@ -2081,3 +2081,28 @@ are not established by the bounded linear implementation; subcircuit elaboration
 and parameter scoping are covered by the #18 gate ([SUBCIRCUITS.md](SUBCIRCUITS.md)).
 Track those remaining
 gates in the central [TODO.md](../../TODO.md); do not claim full SPICE parity.
+
+### Runtime paths
+
+Conformance tests and xtask discover the checkout at runtime from the
+current directory (Cargo runs tests from their package directories).
+Run xtask from inside the intended checkout, including when invoking a
+previously built executable directly. Process-level tests use Cargo's
+runtime `CARGO_BIN_EXE_*` environment to select the exact built executable,
+never a binary found through PATH. The BSIM4 ownership generator reads its source inputs from the explicitly
+resolved workspace root (the ordered BSIM4 setup change). No checkout or executable paths
+are embedded through compile-time Cargo environment macros.
+
+### Incremental C batch frequency axes
+
+The pinned C reference's `CKTacDump` and AC sensitivity output assign only
+the real member of the frequency's `IFvalue` union. In incremental
+`ngspice -b -r` output, `OUTpData` writes the complex union member when the
+plot is complex, including uninitialized bytes after the real frequency.
+
+Live batch comparisons therefore normalize only the C reference's first
+column named `frequency` to a zero imaginary component. Both differences
+and relative scales use the normalized value, and Rust's imaginary component
+is still checked. All other samples retain their existing comparison
+policies. This is not a rawfile decoder change: stored rawfiles, especially
+bit-exact captures, retain their actual payload.

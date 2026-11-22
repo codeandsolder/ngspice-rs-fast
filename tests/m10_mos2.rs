@@ -365,7 +365,8 @@ fn m10_mos2_fixtures_parse_write_parse_with_a_fixed_point() {
     for name in ["m10_mos2_dc", "m10_mos2_ac", "m10_mos2_tran"] {
         let n = Parser::new()
             .parse_file(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
+                ngspice_conformance::fixtures::workspace_root()
+                    .unwrap()
                     .join(format!("conformance/netlists/{name}.cir")),
             )
             .unwrap();

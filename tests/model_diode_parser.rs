@@ -23,7 +23,9 @@ fn pairs(parameters: &[ParameterAssignment]) -> Vec<(&str, &str)> {
 
 #[test]
 fn diode_dc_fixture_builds_devices_model_and_sweep() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/netlists/diode_dc.cir");
+    let path = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance/netlists/diode_dc.cir");
     let netlist = Parser::new().parse_file(&path).unwrap();
     assert_eq!(netlist.path, path);
     assert_eq!(netlist.title, "Diode DC sweep");
@@ -188,11 +190,11 @@ fn continuations_keep_model_and_assignment_provenance() {
     let netlist = parse(".model DM D(IS=1e-14\n+ N=1)\nD1 A 0 DM\n+ AREA=2\n").unwrap();
     let model = &netlist.models[0];
     assert_eq!(model.location.line, 2);
-    assert_eq!(model.parameters[1].location.line, 2);
-    assert_eq!(model.parameters[1].location.column, 22);
+    assert_eq!(model.parameters[1].location.line, 3);
+    assert_eq!(model.parameters[1].location.column, 3);
     assert_eq!(netlist.devices[0].location.line, 4);
-    assert_eq!(netlist.devices[0].parameters[0].location.line, 4);
-    assert_eq!(netlist.devices[0].parameters[0].location.column, 11);
+    assert_eq!(netlist.devices[0].parameters[0].location.line, 5);
+    assert_eq!(netlist.devices[0].parameters[0].location.column, 3);
 }
 
 #[test]
