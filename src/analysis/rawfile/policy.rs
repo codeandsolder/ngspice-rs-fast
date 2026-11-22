@@ -68,7 +68,7 @@ impl Default for RawReadPolicy {
     }
 }
 
-/// A remaining budget cannot wrap, even for a caller-selected usize::MAX.
+/// A remaining budget cannot wrap, even for a caller-selected `usize::MAX`.
 pub(super) fn spend(remaining: &mut usize, amount: usize, resource: &str) -> SpiceResult<()> {
     *remaining = remaining
         .checked_sub(amount)

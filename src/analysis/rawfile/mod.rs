@@ -607,12 +607,13 @@ fn render_header(
     out.write_all(section_line(format))
 }
 
-/// Byte-aware line reader: only the current line is decoded as text.
+/// Remaining physical bytes and lines in the current header.
 struct HeaderBudget {
     bytes: usize,
     lines: usize,
 }
 
+/// Byte-aware line reader: only the current line is decoded as text.
 struct Cursor<R> {
     input: R,
     line: Vec<u8>,
@@ -630,7 +631,7 @@ impl<R: BufRead> Cursor<R> {
         }
     }
 
-    fn begin_header(&mut self) {
+    const fn begin_header(&mut self) {
         self.header = Some(HeaderBudget {
             bytes: self.policy.header_bytes,
             lines: self.policy.header_lines,
@@ -656,6 +657,9 @@ impl<R: BufRead> Cursor<R> {
             if available.is_empty() {
                 return Ok(!self.line.is_empty());
             }
+            if self.header.as_ref().is_some_and(|work| work.lines == 0) {
+                return Err(limit("header lines per plot"));
+            }
             let line_remaining = self.policy.line_bytes - self.line.len();
             let header_remaining = self.header.as_ref().map_or(usize::MAX, |work| work.bytes);
             let remaining = line_remaining.min(header_remaining);
@@ -669,7 +673,20 @@ impl<R: BufRead> Cursor<R> {
                     "header bytes per plot"
                 }));
             }
-            reserve(&mut self.line, count, "text line")?;
+            let needed = self.line.len() + count;
+            if needed > self.line.capacity() {
+                let capacity = self
+                    .line
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(needed)
+                    .min(self.policy.line_bytes);
+                self.line
+                    .try_reserve_exact(capacity - self.line.len())
+                    .map_err(|error| {
+                        unsupported(format!("rawfile allocation failed for text line: {error}"))
+                    })?;
+            }
             self.line.extend_from_slice(&available[..count]);
             if let Some(work) = &mut self.header {
                 work.bytes -= count;
@@ -681,6 +698,24 @@ impl<R: BufRead> Cursor<R> {
         }
     }
 
+    fn is_blank(&self) -> SpiceResult<bool> {
+        // Most data lines begin with ASCII whitespace followed by a number.
+        // A single non-whitespace ASCII byte proves the line is not blank.
+        for &byte in &self.line {
+            if byte.is_ascii() {
+                if !byte.is_ascii_whitespace() && byte != b'\x0b' {
+                    return Ok(false);
+                }
+            } else {
+                // Preserve the original Unicode trim semantics.
+                return std::str::from_utf8(&self.line)
+                    .map(|line| line.trim().is_empty())
+                    .map_err(|_| unsupported("rawfile header or ASCII value is not UTF-8 text"));
+            }
+        }
+        Ok(true)
+    }
+
     fn next(&mut self, skip_blank: bool) -> SpiceResult<Option<&str>> {
         let mut blank_remaining = self.policy.blank_bytes;
         loop {
@@ -690,9 +725,7 @@ impl<R: BufRead> Cursor<R> {
             if let Some(work) = &mut self.header {
                 spend(&mut work.lines, 1, "header lines per plot")?;
             }
-            let line = std::str::from_utf8(&self.line)
-                .map_err(|_| unsupported("rawfile header or ASCII value is not UTF-8 text"))?;
-            if !skip_blank || !line.trim().is_empty() {
+            if !skip_blank || !self.is_blank()? {
                 break;
             }
             spend(
@@ -788,7 +821,7 @@ struct Header {
     padded: bool,
     point_count: usize,
     variables: Vec<Variable>,
-    header_bytes: usize,
+    text_bytes: usize,
 }
 
 /// Parses one plot header, up to and including its `Values:` or `Binary:` line.
@@ -897,7 +930,7 @@ fn parse_header(cursor: &mut Cursor<impl BufRead>) -> SpiceResult<Option<(Header
             padded,
             point_count,
             variables,
-            header_bytes: cursor.end_header(),
+            text_bytes: cursor.end_header(),
         },
         format,
     )))
@@ -1023,7 +1056,7 @@ impl<R: BufRead> RawFileReader<R> {
             padded,
             point_count,
             mut variables,
-            header_bytes,
+            text_bytes: header_bytes,
         } = header;
         if format.is_binary() && !padded {
             return Err(unsupported(
@@ -1093,7 +1126,11 @@ impl<R: BufRead> RawFileReader<R> {
                 spend(&mut budget.rows, 1, "collected rows")?;
                 spend(&mut budget.cells, row.len(), "collected cells")?;
                 let mut copy = Vec::new();
-                reserve(&mut copy, row.len(), "collected row")?;
+                copy.try_reserve_exact(row.len()).map_err(|error| {
+                    unsupported(format!(
+                        "rawfile allocation failed for collected row: {error}"
+                    ))
+                })?;
                 copy.extend_from_slice(row);
                 reserve(&mut points, 1, "collected row list")?;
                 points.push(copy);
@@ -1362,6 +1399,12 @@ Values:
         assert!(cursor.next(false).is_err());
         assert_eq!(cursor.input.len(), data.len());
         assert!(cursor.line.capacity() <= 64);
+
+        let mut cursor = super::Cursor::new(std::io::BufReader::with_capacity(3, data.as_slice()));
+        cursor.policy.line_bytes = 63;
+        assert!(cursor.next(false).is_err());
+        assert!(cursor.line.len() <= 63);
+        assert!(cursor.line.capacity() <= 63);
 
         // A line exactly at the limit is accepted, with either LF or CRLF.
         for text in ["1234567\n", "123456\r\n", "12345678"] {
