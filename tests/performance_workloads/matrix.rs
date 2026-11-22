@@ -5,10 +5,57 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ngspice_rs::maths::complex::{ComplexLu, ComplexMatrix};
-use ngspice_rs::maths::{NiStep, Pattern, SparseLu, SparseMatrix, Vector, solve_ni};
+use ngspice_rs::maths::{
+    FactorStorage, FactorWork, NiStep, Pattern, PatternTelemetry, SparseLu, SparseMatrix, Vector,
+    solve_ni,
+};
 use ngspice_rs::primitives::Complex;
 
 use super::report;
+
+fn report_storage(name: &str, phase: &str, storage: FactorStorage) {
+    let fill_ratio = f64::from(u32::try_from(storage.factor_entries).unwrap())
+        / f64::from(u32::try_from(storage.original_entries).unwrap());
+    println!(
+        "workload={name},phase={phase},external_order={},translated_order={},original_entries={},factor_entries={},fill_entries={},numeric_bytes={},fill_ratio={fill_ratio:.6}",
+        storage.external_order,
+        storage.translated_order,
+        storage.original_entries,
+        storage.factor_entries,
+        storage.fill_entries(),
+        storage.numeric_bytes
+    );
+}
+
+fn report_work(name: &str, phase: &str, work: FactorWork) {
+    println!(
+        "workload={name},phase={phase},order_attempts={},pivot_searches={},fixed_refactors={},successful_factors={},zero_pivots={},singular_failures={},nonfinite_failures={},resource_failures={},invalid_failures={},assembly_rejections={},zero_pivot_retries={}",
+        work.order_attempts,
+        work.pivot_searches,
+        work.fixed_refactors,
+        work.successful_factors,
+        work.zero_pivots,
+        work.singular_failures,
+        work.nonfinite_failures,
+        work.resource_failures,
+        work.invalid_failures,
+        work.assembly_rejections,
+        work.zero_pivot_retries
+    );
+}
+
+fn report_cache(name: &str, phase: &str, telemetry: PatternTelemetry) {
+    report_work(name, phase, telemetry.work.factor);
+    println!(
+        "workload={name},phase={phase},cache_totals=true,exact_input_hits={},cache_rhs_solves={},cache_rhs_failures={},real_to_complex={},complex_to_real={}",
+        telemetry.work.exact_input_hits,
+        telemetry.work.rhs_solves,
+        telemetry.work.rhs_failures,
+        telemetry.work.real_to_complex,
+        telemetry.work.complex_to_real
+    );
+    report_storage(name, phase, telemetry.storage.unwrap());
+}
 
 struct Mesh {
     n: usize,
@@ -124,16 +171,25 @@ pub(super) fn real(name: &str, width: u32, height: u32, repeats: u32) {
         report(name, "bound_assembly", repeats, start.elapsed());
 
         let mut ordering_time = Duration::ZERO;
+        let mut fresh_work = FactorWork::default();
         let mut worst = (0.0_f64, 0.0_f64);
         for _ in 0..repeats {
             let start = Instant::now();
             let lu = SparseLu::new(black_box(&bound), None).unwrap();
             ordering_time += start.elapsed();
+            fresh_work += lu.factor_work();
             let (f, r) = error(&bound, &rhs, &lu.solve(&rhs).unwrap(), &mesh.exact);
             worst = (worst.0.max(f), worst.1.max(r));
         }
         report(name, "fresh_order_factor", repeats, ordering_time);
         let factors = SparseLu::new(&bound, None).unwrap();
+        assert_eq!(fresh_work.successful_factors, u64::from(repeats));
+        assert_eq!(fresh_work.pivot_searches, u64::from(repeats));
+        report_work(name, "fresh_order_factor", fresh_work);
+        report_storage(name, "fresh_order_factor", factors.factor_storage());
+        println!(
+            "workload={name},phase=fresh_order_factor,successful_snapshot_rhs_solves={repeats}"
+        );
         let mut workspace = Vec::new();
         let start = Instant::now();
         let mut last = Vector::zeros(mesh.n);
@@ -145,13 +201,16 @@ pub(super) fn real(name: &str, width: u32, height: u32, repeats: u32) {
             );
         }
         report(name, "retained_solve", repeats, start.elapsed());
+        println!("workload={name},phase=retained_solve,successful_snapshot_rhs_solves={repeats}");
         error(&bound, &rhs, &last, &mesh.exact);
 
         // Warm the exact pattern and exercise the two distinct NIiter paths.
         // Each changed diagonal forces new numeric factors; repeated values
-        // after that refactor can retain the factors. Report requested calls,
-        // not inferred internal instrumentation.
+        // after that refactor can retain the factors. The actual work is
+        // read transactionally outside the timed loops.
         let _ = ni(&bound, &rhs, true);
+        let warm = mesh.pattern.factor_telemetry();
+        report_cache(name, "cache_after_warmup_cumulative", warm);
         let mut refactor_time = Duration::ZERO;
         let mut reuse_time = Duration::ZERO;
         for k in 0..repeats {
@@ -176,6 +235,32 @@ pub(super) fn real(name: &str, width: u32, height: u32, repeats: u32) {
             refactor_time,
         );
         report(name, "identical_coefficients_ni_solve", repeats, reuse_time);
+        let end = mesh.pattern.factor_telemetry();
+        assert_eq!(
+            end.work.factor.fixed_refactors - warm.work.factor.fixed_refactors,
+            u64::from(repeats)
+        );
+        assert_eq!(
+            end.work.factor.successful_factors - warm.work.factor.successful_factors,
+            u64::from(repeats)
+        );
+        assert_eq!(
+            end.work.exact_input_hits - warm.work.exact_input_hits,
+            u64::from(repeats)
+        );
+        assert_eq!(
+            end.work.rhs_solves - warm.work.rhs_solves,
+            2 * u64::from(repeats)
+        );
+        assert_eq!(
+            end.work.factor.order_attempts,
+            warm.work.factor.order_attempts
+        );
+        assert_eq!(
+            end.work.factor.pivot_searches,
+            warm.work.factor.pivot_searches
+        );
+        report_cache(name, "cache_after_ni_repeats_cumulative", end);
         println!(
             "workload={name},forward_abs={:e},residual_abs={:e}",
             worst.0, worst.1
@@ -212,6 +297,10 @@ pub(super) fn frequency_ensemble(width: u32, height: u32, count: u32) {
             let mut assemble = Duration::ZERO;
             let mut factor = Duration::ZERO;
             let mut solve = Duration::ZERO;
+            let mut work = FactorWork::default();
+            let mut last_storage = None;
+            let mut factor_entries_min = usize::MAX;
+            let mut factor_entries_max = 0;
             let mut worst = 0.0_f64;
             let mut residual = 0.0_f64;
             for i in 0..count {
@@ -235,6 +324,11 @@ pub(super) fn frequency_ensemble(width: u32, height: u32, count: u32) {
                     m.factorize().unwrap()
                 };
                 factor += start.elapsed();
+                work += lu.factor_work();
+                let storage = lu.factor_storage();
+                factor_entries_min = factor_entries_min.min(storage.factor_entries);
+                factor_entries_max = factor_entries_max.max(storage.factor_entries);
+                last_storage = Some(storage);
                 let start = Instant::now();
                 let x = black_box(lu.solve(&rhs).unwrap());
                 solve += start.elapsed();
@@ -259,10 +353,11 @@ pub(super) fn frequency_ensemble(width: u32, height: u32, count: u32) {
             report(name, &format!("{mode}_assembly"), count, assemble);
             report(name, &format!("{mode}_factor"), count, factor);
             report(name, &format!("{mode}_solve"), count, solve);
+            assert_eq!(work.successful_factors, u64::from(count));
+            report_work(name, mode, work);
+            report_storage(name, mode, last_storage.unwrap());
             println!(
-                "workload={name},mode={mode},orders_requested={},reuse_requested={},forward_abs={worst:e},residual_abs={residual:e}",
-                if reuse { 1 } else { count },
-                if reuse { count - 1 } else { 0 }
+                "workload={name},mode={mode},factor_entries_min={factor_entries_min},factor_entries_max={factor_entries_max},successful_snapshot_rhs_solves={count},forward_abs={worst:e},residual_abs={residual:e}"
             );
         }
     }

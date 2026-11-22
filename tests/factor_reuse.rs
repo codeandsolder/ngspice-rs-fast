@@ -128,3 +128,182 @@ fn a_complex_factorization_in_the_shared_frame_invalidates_the_factors() {
     let x = solve(&p, &A, false, 0.0);
     assert!(residual(&A, 0.0, &x) < 1e-15, "{x:?}");
 }
+
+#[test]
+fn measured_cache_work_distinguishes_order_refactor_exact_hit_and_retained_pivots() {
+    use ngspice_rs::maths::{FactorWork, PatternTelemetry, solve_last_factors};
+
+    let p = pattern();
+    assert_eq!(p.factor_telemetry(), PatternTelemetry::default());
+    let initial = solve(&p, &A, false, 0.);
+    let first = p.factor_telemetry();
+    assert_eq!(
+        first.work.factor,
+        FactorWork {
+            order_attempts: 1,
+            pivot_searches: 1,
+            successful_factors: 1,
+            ..Default::default()
+        }
+    );
+    let storage = first.storage.unwrap();
+    assert_eq!(storage.original_entries, POSITIONS.len());
+    assert_eq!(storage.external_order, 3);
+    assert_eq!(storage.translated_order, 3);
+    assert_eq!(
+        storage.numeric_bytes,
+        storage.factor_entries * size_of::<f64>()
+    );
+    assert_eq!(first.work.rhs_solves, 1);
+
+    let changed = solve(&p, &B, false, 0.);
+    let reused = solve(&p, &B, false, 0.);
+    assert_eq!(bits(&changed), bits(&reused));
+    let after_hit = p.factor_telemetry();
+    assert_eq!(after_hit.work.factor.fixed_refactors, 1);
+    assert_eq!(after_hit.work.factor.successful_factors, 2);
+    assert_eq!(after_hit.work.exact_input_hits, 1);
+    assert_eq!(after_hit.work.rhs_solves, 3);
+
+    let reordered = solve(&p, &A, true, 0.);
+    let after_order = p.factor_telemetry();
+    assert_eq!(bits(&reordered), bits(&initial));
+    assert_eq!(after_order.work.factor.order_attempts, 2);
+    assert_eq!(after_order.work.factor.pivot_searches, 1);
+    assert_eq!(after_order.work.factor.successful_factors, 3);
+    assert_eq!(after_order.work.rhs_solves, 4);
+    assert_eq!(after_order.storage, Some(storage));
+
+    let retained = solve_last_factors(&p, &rhs()).unwrap().unwrap();
+    assert_eq!(bits(retained.as_slice()), bits(&reordered));
+    assert!(solve_last_factors(&p, &Vector::zeros(1)).is_err());
+    let after_retained = p.factor_telemetry();
+    assert_eq!(after_retained.work.rhs_solves, 5);
+    assert_eq!(after_retained.work.rhs_failures, 1);
+    assert_eq!(after_retained.work.factor, after_order.work.factor);
+    assert_eq!(
+        p.as_ref().clone().factor_telemetry(),
+        PatternTelemetry::default()
+    );
+    assert_eq!(
+        p.extended([(0, 2)]).unwrap().factor_telemetry(),
+        PatternTelemetry::default()
+    );
+}
+
+fn two_by_two(p: &Arc<Pattern>, values: [f64; 4]) -> SparseMatrix {
+    let mut m = SparseMatrix::bound(Arc::clone(p)).unwrap();
+    for ((row, col), value) in [(0, 0), (0, 1), (1, 0), (1, 1)].into_iter().zip(values) {
+        m.set(row, col, value).unwrap();
+    }
+    m
+}
+
+#[test]
+fn zero_pivot_search_and_failed_factors_are_measured_not_counted_as_success() {
+    let p = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
+    let rhs = Vector::from_slice(&[2., 1.]);
+    let initial = two_by_two(&p, [4., 1., 1., 5.]);
+    let changed = two_by_two(&p, [0., 2., 1., 0.]);
+    let mut old = None;
+    assert!(matches!(
+        solve_ni(&initial, &rhs, &mut old, true, 0.).unwrap(),
+        NiStep::Solved(_)
+    ));
+    assert!(matches!(
+        solve_ni(&changed, &rhs, &mut old, false, 0.).unwrap(),
+        NiStep::ZeroPivot
+    ));
+    let failed = p.factor_telemetry();
+    assert_eq!(failed.work.factor.successful_factors, 1);
+    assert_eq!(failed.work.factor.zero_pivots, 1);
+    assert_eq!(failed.work.factor.fixed_refactors, 1);
+    assert_eq!(failed.work.rhs_solves, 1);
+    assert!(failed.storage.is_none());
+
+    let NiStep::Solved(x) = solve_ni(&changed, &rhs, &mut old, true, 0.).unwrap() else {
+        panic!("threshold reorder did not recover the nonsingular matrix");
+    };
+    assert_eq!(x.as_slice(), [1., 1.]);
+    let recovered = p.factor_telemetry();
+    assert_eq!(recovered.work.factor.order_attempts, 2);
+    assert_eq!(recovered.work.factor.pivot_searches, 2);
+    assert_eq!(recovered.work.factor.successful_factors, 2);
+    assert_eq!(recovered.storage.unwrap().original_entries, 4);
+    assert_eq!(changed.nnz(), 2);
+
+    let singular = two_by_two(&p, [0.; 4]);
+    assert!(solve_ni(&singular, &rhs, &mut old, true, 0.).is_err());
+    let failed = p.factor_telemetry();
+    assert_eq!(failed.work.factor.successful_factors, 2);
+    assert_eq!(failed.work.factor.singular_failures, 1);
+    assert!(failed.storage.is_none());
+
+    let nonfinite = two_by_two(&p, [f64::NAN, 1., 1., 1.]);
+    assert!(solve_ni(&nonfinite, &rhs, &mut old, true, 0.).is_err());
+    let rejected = p.factor_telemetry();
+    assert_eq!(rejected.work.factor.assembly_rejections, 1);
+    assert_eq!(rejected.work.factor.successful_factors, 2);
+    assert!(rejected.storage.is_none());
+
+    let tiny = two_by_two(&p, [f64::from_bits(1), 0., 0., 1.]);
+    assert!(solve_ni(&tiny, &rhs, &mut old, true, 0.).is_err());
+    let nonfinite = p.factor_telemetry();
+    assert_eq!(nonfinite.work.factor.nonfinite_failures, 1);
+    assert_eq!(nonfinite.work.factor.successful_factors, 2);
+    assert!(nonfinite.storage.is_none());
+}
+
+#[test]
+fn retained_factors_report_their_own_work_and_known_fill() {
+    use ngspice_rs::maths::{FactorWork, SparseLu};
+
+    let p = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
+    let original = two_by_two(&p, [4., 1., 1., 5.]);
+    let changed = two_by_two(&p, [0., 2., 1., 0.]);
+    let a = SparseLu::new(&original, None).unwrap();
+    let before = a.solve(&Vector::from_slice(&[5., 6.])).unwrap();
+    let b = SparseLu::new(&changed, Some(a.symbolic())).unwrap();
+    assert_eq!(
+        b.factor_work(),
+        FactorWork {
+            fixed_refactors: 1,
+            order_attempts: 1,
+            pivot_searches: 1,
+            successful_factors: 1,
+            zero_pivots: 1,
+            zero_pivot_retries: 1,
+            ..Default::default()
+        }
+    );
+    assert_eq!(a.factor_work().order_attempts, 1);
+    assert_eq!(a.factor_work().zero_pivots, 0);
+    assert_eq!(a.solve(&Vector::from_slice(&[5., 6.])).unwrap(), before);
+    assert_eq!(
+        b.solve_transposed(&Vector::from_slice(&[1., 2.]))
+            .unwrap()
+            .as_slice(),
+        [1., 1.]
+    );
+    assert_eq!(p.factor_telemetry().work.factor, FactorWork::default());
+
+    // Elimination of any vertex of the four-cycle adds both directed
+    // links between its neighbors. A tree or clique would not test fill.
+    let mut cycle = SparseMatrix::new(4, 4);
+    for i in 0..4 {
+        cycle.add(i, i, 4.).unwrap();
+        cycle.add(i, (i + 1) % 4, -1.).unwrap();
+        cycle.add((i + 1) % 4, i, -1.).unwrap();
+    }
+    let lu = SparseLu::new(&cycle, None).unwrap();
+    let storage = lu.factor_storage();
+    assert_eq!(
+        (
+            storage.original_entries,
+            storage.factor_entries,
+            storage.fill_entries()
+        ),
+        (12, 14, 2)
+    );
+    assert_eq!(storage.numeric_bytes, 14 * size_of::<f64>());
+}

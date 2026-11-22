@@ -423,6 +423,7 @@ enum Slot {
 /// ordering that changes their structure detaches only the writer.
 #[derive(Debug, Clone)]
 struct Topology {
+    original_entries: usize,
     elements: Vec<Element>,
     diag: Vec<usize>,
     first_in_col: Vec<usize>,
@@ -1133,6 +1134,7 @@ pub(super) struct Sparse<T> {
     abs_threshold: f64,
     parity: PermutationParity,
     diagnostic: Diagnostic,
+    last_attempt: Option<crate::maths::telemetry::FactorAttempt>,
 }
 
 impl<T: Clone> Clone for Sparse<T> {
@@ -1148,6 +1150,7 @@ impl<T: Clone> Clone for Sparse<T> {
             abs_threshold: self.abs_threshold,
             parity: self.parity,
             diagnostic: self.diagnostic,
+            last_attempt: self.last_attempt,
         }
     }
 }
@@ -1166,6 +1169,7 @@ impl<T: Scalar> Sparse<T> {
             size: 0,
             ext_size: size,
             topology: std::sync::Arc::new(Topology {
+                original_entries: 0,
                 elements: Vec::new(),
                 diag: empty()?,
                 first_in_col: empty()?,
@@ -1182,6 +1186,7 @@ impl<T: Scalar> Sparse<T> {
             abs_threshold: 0.0,
             parity: PermutationParity::Even,
             diagnostic: Diagnostic::Okay,
+            last_attempt: None,
         })
     }
 
@@ -1294,6 +1299,7 @@ impl<T: Scalar> Sparse<T> {
         let topology = std::sync::Arc::make_mut(&mut self.topology);
         let e = topology.create_element(row, col, last, self.lifecycle.rows_linked());
         if !fillin {
+            topology.original_entries += 1;
             self.note_numeric_write();
         }
         self.lifecycle.invalidate_structure(!fillin);
@@ -1326,6 +1332,7 @@ impl<T: Scalar> Sparse<T> {
     fn reset_numeric_status(&mut self) {
         self.lifecycle.invalidate_numeric();
         self.diagnostic = Diagnostic::Okay;
+        self.last_attempt = None;
     }
 
     /// A write into existing LU storage revokes its factor view but does
@@ -1376,6 +1383,7 @@ impl<T: Scalar> Sparse<T> {
             sparse.values.push(value);
         }
         topology.finish_original_columns(&tails[..=sparse.size])?;
+        topology.original_entries = topology.elements.len();
         Ok(sparse)
     }
 
@@ -1428,6 +1436,7 @@ impl<T: Scalar> Sparse<T> {
             abs_threshold: self.abs_threshold,
             parity: self.parity,
             diagnostic: Diagnostic::Okay,
+            last_attempt: None,
         }
     }
 
@@ -1444,6 +1453,7 @@ impl<T: Scalar> Sparse<T> {
             abs_threshold: self.abs_threshold,
             parity: self.parity,
             diagnostic: Diagnostic::Okay,
+            last_attempt: None,
         }
     }
 
@@ -1703,13 +1713,43 @@ impl<T: Scalar> Sparse<T> {
 
     /// `spOrderAndFactor(Matrix, NULL, rel, abs, DiagPivoting = YES)`.
     pub(crate) fn order_and_factor(&mut self, rel_threshold: f64, abs_threshold: f64) -> Status {
-        if !self.coefficients_loaded() {
-            return Status::NeedsReload;
-        }
-        let mut scratch = std::mem::take(&mut self.ordering_scratch);
-        let status = self.order_with_scratch(rel_threshold, abs_threshold, &mut scratch);
-        self.ordering_scratch = scratch;
+        use crate::maths::telemetry::{AttemptPath, FactorAttempt};
+
+        let mut searched = false;
+        let status = if self.coefficients_loaded() {
+            let mut scratch = std::mem::take(&mut self.ordering_scratch);
+            let status =
+                self.order_with_scratch(rel_threshold, abs_threshold, &mut scratch, &mut searched);
+            self.ordering_scratch = scratch;
+            status
+        } else {
+            Status::NeedsReload
+        };
+        self.last_attempt = Some(FactorAttempt {
+            path: AttemptPath::Order { searched },
+            status,
+        });
         status
+    }
+
+    /// The most recent actual factor attempt, not a lifetime count.
+    pub(super) fn last_attempt(&self) -> crate::maths::FactorWork {
+        let mut work = crate::maths::FactorWork::default();
+        if let Some(attempt) = self.last_attempt {
+            work.record(attempt);
+        }
+        work
+    }
+
+    /// Storage of this frame; callers expose it only for valid factors.
+    pub(super) fn storage(&self) -> crate::maths::FactorStorage {
+        crate::maths::FactorStorage {
+            external_order: self.ext_size,
+            translated_order: self.size,
+            original_entries: self.topology.original_entries,
+            factor_entries: self.values.len(),
+            numeric_bytes: std::mem::size_of_val(self.values.as_slice()),
+        }
     }
 
     fn order_with_scratch(
@@ -1717,6 +1757,7 @@ impl<T: Scalar> Sparse<T> {
         rel_threshold: f64,
         abs_threshold: f64,
         scratch: &mut Markowitz,
+        searched: &mut bool,
     ) -> Status {
         if !self.values_are_finite() {
             return self.nonfinite_factor();
@@ -1768,6 +1809,7 @@ impl<T: Scalar> Sparse<T> {
         if scratch.ensure_size(size).is_err() {
             return self.resource_failure();
         }
+        *searched = step <= size;
         self.count_markowitz(scratch, step);
         self.markowitz_products(scratch, step);
         while step <= size {
@@ -1921,14 +1963,32 @@ impl<T: Scalar> Sparse<T> {
     /// `spFactor`: refactor with the existing pivot order (no threshold
     /// test). Scratch belongs to the operation, not to factor snapshots.
     pub(super) fn factor_with_workspace(&mut self, workspace: &mut Vec<T>) -> Status {
+        use crate::maths::telemetry::{AttemptPath, FactorAttempt};
+
         // C retains a partial order after a singular reordering. If
         // topology changed, no complete numeric traversal is available;
         // retry the threshold path, preserving C's existing pivot prefix.
         if !self.coefficients_loaded() {
+            self.last_attempt = Some(FactorAttempt {
+                path: AttemptPath::Rejected,
+                status: Status::NeedsReload,
+            });
             return Status::NeedsReload;
         }
-        let Lifecycle::Symbolic(plan) = &self.lifecycle else {
+        if !matches!(self.lifecycle, Lifecycle::Symbolic(_)) {
             return self.order_and_factor(0.0, 0.0);
+        }
+        let status = self.refactor_with_workspace(workspace);
+        self.last_attempt = Some(FactorAttempt {
+            path: AttemptPath::Refactor,
+            status,
+        });
+        status
+    }
+
+    fn refactor_with_workspace(&mut self, workspace: &mut Vec<T>) -> Status {
+        let Lifecycle::Symbolic(plan) = &self.lifecycle else {
+            return self.invalid_plan();
         };
         let size = self.size;
         if size == 0 {
@@ -3239,6 +3299,33 @@ mod tests {
     }
 
     #[test]
+    fn original_handles_added_after_fill_keep_storage_attribution() {
+        let entries = (1..=6).flat_map(|i| {
+            let next = i % 6 + 1;
+            [(i, i, 4.), (i, next, -1.), (next, i, -1.)]
+        });
+        let mut frame = Sparse::from_originals(6, entries).unwrap();
+        assert_eq!(frame.order_and_factor(1e-3, 0.), Status::Okay);
+        let initial = frame.storage();
+        assert_eq!(initial.original_entries, 18);
+        assert_eq!(initial.fill_entries(), 6);
+        frame.clear();
+        let (row, col) = (1..=6)
+            .flat_map(|row| (1..=6).map(move |col| (row, col)))
+            .find(|&(row, col)| {
+                let r = frame.topology.ext_to_int_row[row];
+                let c = frame.topology.ext_to_int_col[col];
+                frame.topology.locate_in_col(Slot::Head(c), r).1 == NONE
+            })
+            .unwrap();
+        frame.get_element(row, col).unwrap();
+        let extended = frame.storage();
+        assert_eq!(extended.original_entries, initial.original_entries + 1);
+        assert_eq!(extended.factor_entries, initial.factor_entries + 1);
+        assert_eq!(extended.fill_entries(), initial.fill_entries());
+    }
+
+    #[test]
     fn failed_reorder_cannot_publish_a_partial_traversal() {
         let entries = [
             (1, 1, 4.),
@@ -3274,6 +3361,10 @@ mod tests {
         threshold.reload_originals(&input);
         assert_eq!(threshold.order_and_factor(0., 0.), Status::Okay);
         assert_eq!(a.factor(), Status::Okay);
+        let work = a.last_attempt();
+        assert_eq!(work.order_attempts, 1);
+        assert_eq!(work.fixed_refactors, 0);
+        assert_eq!(work.successful_factors, 1);
         assert_eq!(a.topology.int_to_ext_row, threshold.topology.int_to_ext_row);
         assert_eq!(a.topology.int_to_ext_col, threshold.topology.int_to_ext_col);
         assert_eq!(a.values, threshold.values);

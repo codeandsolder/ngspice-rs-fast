@@ -103,3 +103,75 @@ fn exactly_singular_homogeneous_systems_are_rejected() {
         assert!(result.is_err(), "singular system accepted: {entries:?}");
     }
 }
+
+#[test]
+fn measured_complex_and_real_cache_transitions_preserve_snapshot_work() {
+    use ngspice_rs::maths::{FactorWork, Pattern, SparseLu, Vector, solve_ni};
+    use std::sync::Arc;
+    let p = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
+    let mut g = SparseMatrix::bound(Arc::clone(&p)).unwrap();
+    for ((r, c), value) in [(0, 0), (0, 1), (1, 0), (1, 1)]
+        .into_iter()
+        .zip([4., 1., 1., 5.])
+    {
+        g.set(r, c, value).unwrap();
+    }
+    let mut e = SparseMatrix::new(2, 2);
+    e.add(0, 0, 1.).unwrap();
+    e.add(1, 1, 2.).unwrap();
+    let r = Vector::from_slice(&[5., 6.]);
+    solve_ni(&g, &r, &mut None, true, 0.).unwrap();
+    let ac = |g: &SparseMatrix, e: &SparseMatrix, omega| {
+        ComplexMatrix::from_operators_on(&p, g, e, omega)
+            .unwrap()
+            .unwrap()
+            .factorize()
+            .unwrap()
+    };
+    let first = ac(&g, &e, 1.);
+    let first_work = first.factor_work();
+    let b = [Complex::new(5., 1.), Complex::new(6., 2.)];
+    let before = first.solve(&b).unwrap();
+    assert_eq!(p.factor_telemetry().work.real_to_complex, 1);
+    assert_eq!(first_work.order_attempts, 1);
+    assert_eq!(first_work.pivot_searches, 0);
+    let second = ac(&g, &e, 2.);
+    assert_eq!(
+        second.factor_work(),
+        FactorWork {
+            fixed_refactors: 1,
+            successful_factors: 1,
+            ..Default::default()
+        }
+    );
+    assert_eq!(first.factor_work(), first_work);
+    assert_eq!(first.solve(&b).unwrap(), before);
+    let s = first.factor_storage();
+    assert_eq!(s.original_entries, 4);
+    assert_eq!(s.numeric_bytes, s.factor_entries * size_of::<Complex>());
+    assert_eq!(p.factor_telemetry().storage, Some(second.factor_storage()));
+
+    let empty = SparseMatrix::new(2, 2);
+    g.set(0, 0, 0.).unwrap();
+    g.set(1, 1, 0.).unwrap();
+    let retry = ac(&g, &empty, 0.);
+    assert_eq!(retry.factor_work().zero_pivots, 1);
+    assert_eq!(retry.factor_work().zero_pivot_retries, 1);
+    assert_eq!(retry.factor_work().pivot_searches, 1);
+    assert_eq!(retry.factor_work().successful_factors, 1);
+    assert_eq!(retry.factor_storage().original_entries, 4);
+    assert_eq!(first.solve(&b).unwrap(), before);
+    solve_ni(&g, &r, &mut None, false, 0.).unwrap();
+    let after = p.factor_telemetry();
+    assert_eq!(after.work.complex_to_real, 1);
+    assert_eq!(
+        after.storage.unwrap().numeric_bytes,
+        retry.factor_storage().factor_entries * size_of::<f64>()
+    );
+    assert_eq!(after.work.factor.successful_factors, 5);
+    assert_eq!(after.work.rhs_solves, 2);
+    // An independent factor built on the same input is not a cache event.
+    let independent = SparseLu::new(&g, None).unwrap();
+    assert_eq!(independent.factor_work().successful_factors, 1);
+    assert_eq!(p.factor_telemetry(), after);
+}
