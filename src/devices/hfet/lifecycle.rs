@@ -27,13 +27,19 @@ impl Linearization {
         let drain_delta = voltage[1] - self.voltage[1];
         let channel_delta = source_delta - drain_delta;
         [
-            self.gate_current
-                + self.drain_conductance * drain_delta
-                + self.source_conductance * source_delta,
-            self.drain_current
-                + self.transconductance * source_delta
-                + self.output_conductance * channel_delta
-                - self.drain_conductance * drain_delta,
+            self.source_conductance.mul_add(
+                source_delta,
+                self.drain_conductance
+                    .mul_add(drain_delta, self.gate_current),
+            ),
+            (-self.drain_conductance).mul_add(
+                drain_delta,
+                self.output_conductance.mul_add(
+                    channel_delta,
+                    self.transconductance
+                        .mul_add(source_delta, self.drain_current),
+                ),
+            ),
         ]
     }
 }
@@ -180,7 +186,7 @@ impl Start {
 }
 
 /// The limited gate-current comparison is inclusive, unlike the held-off
-/// test and the drain-current comparison. Never reorder or fuse C arithmetic.
+/// test and the drain-current comparison.
 const fn exceeds(
     predicted: [Real; 2],
     point: Linearization,
@@ -190,7 +196,7 @@ const fn exceeds(
     let [gate, drain] = predicted;
     let (relative, absolute) = tolerances;
     let gate_error = (gate - point.gate_current).abs();
-    let gate_limit = relative * gate.abs().max(point.gate_current.abs()) + absolute;
+    let gate_limit = relative.mul_add(gate.abs().max(point.gate_current.abs()), absolute);
     let gate_failed = if inclusive_gate {
         gate_error >= gate_limit
     } else {
@@ -198,7 +204,7 @@ const fn exceeds(
     };
     gate_failed
         || (drain - point.drain_current).abs()
-            > relative * drain.abs().max(point.drain_current.abs()) + absolute
+            > relative.mul_add(drain.abs().max(point.drain_current.abs()), absolute)
 }
 
 /// Latest accepted finite value, or the same fallback used in the C port.

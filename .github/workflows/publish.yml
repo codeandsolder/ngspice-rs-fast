@@ -35,7 +35,15 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  strict-rust:
+    name: Strict Rust and workflow policy
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@073d436b3d759343900bdc5e4ddecfa120792b8c # pinned
+    with:
+      rust-toolchain: nightly-2026-11-20
+      allow-test-panics: true
+
   verify:
+    needs: strict-rust
     name: Release gate
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -45,13 +53,16 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - name: Install pinned nightly Rust
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: nightly-2026-11-20
           components: clippy, rustfmt
 
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
+        with:
+          rust-toolchain: nightly-2026-11-20
 
       - name: Read crate version
         id: version
@@ -71,12 +82,6 @@ jobs:
             echo "::error::Tag $TAG does not match Cargo.toml version $VERSION"
             exit 1
           fi
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run workspace tests and doctests
         run: cargo test --workspace --locked
@@ -110,11 +115,15 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - name: Install pinned nightly Rust
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: nightly-2026-11-20
 
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
+        with:
+          rust-toolchain: nightly-2026-11-20
 
       - name: Authenticate with crates.io
         id: auth

@@ -313,9 +313,7 @@ impl StateHistory {
             mode: LoadMode::newton(phase),
             previous: previous.map(|previous| Arc::clone(&previous.values)),
             nonconvergent: false,
-            patches: previous
-                .map(|previous| previous.patches.clone())
-                .unwrap_or_default(),
+            patches: previous.map_or_default(|previous| previous.patches.clone()),
         })
     }
 

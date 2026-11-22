@@ -16,29 +16,19 @@ permissions:
 
 jobs:
   rust:
-    name: Stable Rust build, tests, lint, docs and goldens
+    name: Nightly Rust build, tests, docs and goldens
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@d168449633a47de6c0166f0c0cff903e96983820 # main
     with:
-      rust-toolchain: "1.100.0"
-      rust-components: "clippy rustfmt"
+      rust-toolchain: "nightly-2026-11-20"
       command: |
-        cargo fmt --all -- --check
-        cargo clippy --workspace --all-targets --locked -- -D warnings
         cargo test --workspace --locked
         cargo xtask golden verify
         cargo doc --workspace --no-deps --locked
         cargo build --workspace --locked --release
 
-  msrv:
-    name: MSRV on release tags
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@d168449633a47de6c0166f0c0cff903e96983820 # main
-    with:
-      validation-tier: release
-      rust-toolchain: "1.89.0"
-      command: cargo test --workspace --locked
-
   strict-rust:
     name: Strict Rust and workflow policy
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@c9dbc011bec3c43a65b62a16cbf2a3f2e31a13cb # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@073d436b3d759343900bdc5e4ddecfa120792b8c # main
     with:
       allow-test-panics: true
+      rust-toolchain: nightly-2026-11-20

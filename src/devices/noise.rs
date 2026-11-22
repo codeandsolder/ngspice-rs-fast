@@ -307,9 +307,9 @@ fn finite_density(density: Real) -> SpiceResult<Real> {
     }
 }
 
-/// Squared transfer gain in the reference noise evaluator's operation order.
+/// Squared magnitude of the transfer gain.
 pub(crate) const fn squared_gain(transfer: Complex) -> Real {
-    transfer.re * transfer.re + transfer.im * transfer.im
+    transfer.im.mul_add(transfer.im, transfer.re * transfer.re)
 }
 
 /// Coherent sum of both thermal generators, following `NevalSrc2`.

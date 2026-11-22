@@ -2,8 +2,22 @@
 
 Current capabilities and numerical limits are recorded in
 [NATIVE_SOLVER.md](NATIVE_SOLVER.md); the central
-[TODO.md](../../TODO.md) tracks remaining work. Rust edition 2024 / MSRV **1.89**
+[TODO.md](../../TODO.md) tracks remaining work. Rust edition 2024 / pinned nightly (`rust-toolchain.toml`)
 applies to the locked workspace, not the historical dependency-free scaffold.
+
+## Numerical equivalence
+
+C/ngspice is the behavioral reference, not a mandated floating-point
+evaluation order. Prefer accurate, efficient arithmetic, including FMA and
+portable SIMD. Preserve topology, physical units, model equations, output
+semantics, convergence and error boundaries. Compare physical values with
+analytically justified tolerances; do not require bitwise C equality solely
+for matching historical rounding. Exact comparisons remain appropriate for
+stored input values, discrete phase/branch decisions, and internal invariants
+that genuinely require exactness. Qualitative solver differences (missing
+roots, false convergence, unstable timesteps) require investigation, not
+looser tolerances. Any remaining `suboptimal_flops` expectation must explain
+the specific correctness or measured performance reason.
 
 ## Layering
 
@@ -133,8 +147,8 @@ remains dependency-free and SPICE node IDs/ground aliasing remain unchanged.
 
 The semantic parser is implemented with winnow 1.0.4 (MIT), replacing M1a's
 manual token cursor. Only `netlist` directly depends on it; default
-features are disabled and only `std`/`parser` enabled. Its declared MSRV is 1.65,
-below the workspace's declared MSRV of 1.89, which minimum-version CI tests. `Cargo.lock` pins the resolved graph;
+features are disabled and only `std`/`parser` enabled. The workspace uses pinned
+nightly; stable/MSRV CI is retired. `Cargo.lock` pins the resolved graph;
 offline builds require the registry dependencies to have been cached first.
 
 - `parser/grammar.rs`: `Stateful<TokenSlice<Token>, Context>` over borrowed

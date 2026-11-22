@@ -4,12 +4,13 @@
 [`.github/workflows/publish.yml`](../../.github/workflows/publish.yml). The
 `xtask` workspace member has `publish = false` and is never uploaded.
 
+All builds and checks use the pinned nightly compiler in `rust-toolchain.toml`.
+
 ## What the workflow does
 
 1. **Release gate** (`verify` job, no credentials):
    - checks that the pushed tag equals `v` + `version` in `Cargo.toml`;
-   - `cargo fmt --all -- --check`;
-   - `cargo clippy --workspace --all-targets --locked -- -D warnings`;
+   - the central strict nightly lint, source policy and format gate;
    - `cargo test --workspace --locked`;
    - `cargo xtask golden verify`;
    - `cargo publish --dry-run --locked`, which builds the packaged crate in
