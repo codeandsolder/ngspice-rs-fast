@@ -280,7 +280,9 @@ impl Waveform {
     }
 }
 
-/// Provenance of an event in a resolved source waveform. A waveform corner
+/// Provenance of an event in a resolved source waveform.
+///
+/// A waveform corner
 /// is not necessarily an accepted simulator breakpoint: C's accept callbacks
 /// apply their own rounding, coalescing and source-specific scheduling policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,6 +333,7 @@ pub struct WaveformEvent {
 }
 
 /// A finalized circuit's independent source, resolved for one transient plan.
+///
 /// The same validated waveform type supplies simulation forcing and events.
 /// Source identity is separate from time because different sources may have
 /// coincident corners.
