@@ -122,6 +122,57 @@ attribute for `dec`/`oct` scales.
   The residual threshold and complete-basis rank/conditioning policy are
   unchanged; unresolved numerical systems still fail explicitly.
 
+## RF resource and workspace policy
+
+The finalized circuit's port numbers, response rows, excitation branches,
+reference-impedance factors and frequency grid are bound once by the RF
+execution plan. `AnalysisContext::rf_limits` (Rust API; not an ngspice
+`.option`) configures `RfLimits` for each retained RF sweep:
+
+| Limit | Default |
+| --- | ---: |
+| Weighted RF work | 500,000,000 units |
+| Retained numeric cells plus RF-specific numeric workspace | 256 MiB |
+| Main RF plot variables | 65,536 |
+
+Let P be the port count, U the finalized external MNA order, F the grid length,
+O the extra scalar observation columns, and N either 0 (no noise) or 1.
+The main plot width is W = U + O + 2 + (3 + N) P² + 4 when N = 1 and P = 2,
+otherwise without that last 4. Numeric memory is preflighted using checked
+integer arithmetic: F W retained cells, U + O for optional bias, one W-cell
+row buffer, (13 + N) P² dense complex cells, N P U adjoints, 3 U + 1
+RHS/internal-work/external-solution cells, O temporary observation values,
+and (6 + 2 N) P bound impedance and noise-vector coefficients. Each complex
+cell occupies 16 bytes. The separate variable limit bounds the number of
+metadata records; strings, general circuit assembly, model state, sparse
+factor storage and device-noise enumeration are not included in the RF numeric
+byte count.
+
+The preflight work estimate is F [9 P³ + 32 P² + 4 U P (1 + N) + W].
+These are weighted traversal/update units rather than CPU instructions, so
+this is not a wall-clock bound or a cap on general MNA factorization. After
+each factorization and before its RF solve loops, charge 2 E P (1 + N)
+additional units for the stored factor entries E (including fill-ins).
+When noise generators become available at each frequency, charge
+G P (2 P + 2) units for G generators before forming the adjoint/covariance
+loops, including generators that RFSPICE omits. Bias-dependent generator
+counts cannot be inferred solely from the netlist dimensions. All
+overflow and budget excesses return a diagnostic, before any oversized RF
+schema or dense workspace is allocated, or before the corresponding dynamic
+loop. Angular frequency must be finite.
+
+The output storage is reserved once. Dense inversion and products retain
+shape-checked scratch across frequencies; diagonal products use quadratic
+traversal but preserve the generic product's finite checks, operand order,
+and addition from positive zero. A singular conversion clears the old result
+block. Each port solve reuses its excitation, internal triangular-solve
+scratch and external-order solution buffers; the last port's ordinary
+solution is copied to the output before any noise adjoint solves. Noise
+adjoints occupy one contiguous port-major buffer, with reuse of covariance
+and generator-vector scratch and one row binding per generator. The original
+covariance accumulation and scalar noise formulas are unchanged.
+See [the measured RF baseline](performance-baselines/2026-11-22-rf-plans.md).
+
 ## Verification
 
 * `tests/sparam.rs`: analytic series and shunt resistors (with the zero Z/Y
