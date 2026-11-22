@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 
 use ngspice_rs::analysis::{Plot, PlotFlags};
 use ngspice_rs::devices::{Circuit, TransientTiming};
-use ngspice_rs::primitives::exact_nonnegative_integer;
+use ngspice_rs::primitives::{Complex, exact_nonnegative_integer};
 
 use super::compare::{self, TranTolerance};
 
@@ -70,6 +70,59 @@ enum Side {
     Right,
 }
 
+/// Bound rows and weights for one instant. Every signal uses the same plan,
+/// and sampling two plots needs only two plans live at a time.
+#[derive(Debug)]
+enum SamplePlan<'a> {
+    Exact(&'a [Complex]),
+    Linear {
+        lower: &'a [Complex],
+        upper: &'a [Complex],
+        fraction: f64,
+    },
+}
+
+impl SamplePlan<'_> {
+    fn value(&self, column: usize) -> f64 {
+        match self {
+            Self::Exact(row) => row[column].re,
+            Self::Linear {
+                lower,
+                upper,
+                fraction,
+            } => {
+                // Preserve the original arithmetic order and rounding.
+                let left = (1.0 - fraction) * lower[column].re;
+                let right = fraction * upper[column].re;
+                left + right
+            }
+        }
+    }
+}
+
+type EventRows = Option<(usize, usize)>;
+
+/// Index the first and last original row matching each event. Iterate rows
+/// in storage order: small time reversals are legal at corners, so a binary
+/// search of the time axis cannot establish the one-sided limits. A row may
+/// belong to two nearby event windows; retain both rather than only the
+/// first matching event. The event timeline is strictly ordered.
+fn index_event_rows(times: &[f64], events: &[f64], eps: f64) -> Vec<EventRows> {
+    let mut rows: Vec<EventRows> = vec![None; events.len()];
+    if !events.is_empty() {
+        for (row, &time) in times.iter().enumerate() {
+            let start = first_possible_breakpoint(events, time, eps);
+            for (&event, endpoints) in events[start..].iter().zip(&mut rows[start..]) {
+                if (event - time).abs() > eps {
+                    break;
+                }
+                *endpoints = Some((endpoints.map_or(row, |(first, _)| first), row));
+            }
+        }
+    }
+    rows
+}
+
 /// One validated transient plot.
 struct Series<'a> {
     label: &'static str,
@@ -77,6 +130,7 @@ struct Series<'a> {
     columns: BTreeMap<String, usize>,
     times: Vec<f64>,
     breakpoints: &'a [f64],
+    event_rows: Vec<EventRows>,
     eps: f64,
 }
 
@@ -112,15 +166,17 @@ impl<'a> Series<'a> {
                 grid.stop
             ));
         }
-        let series = Self {
+        let mut series = Self {
             label,
             plot,
             columns,
             times,
             breakpoints,
+            event_rows: Vec::new(),
             eps,
         };
         series.check_times()?;
+        series.event_rows = index_event_rows(&series.times, breakpoints, eps);
         Ok(series)
     }
 
@@ -162,34 +218,35 @@ impl<'a> Series<'a> {
         nearby_breakpoint(self.breakpoints, t, self.eps)
     }
 
-    /// Value of column `column` at `t` on `side`.
-    fn value(&self, column: usize, t: f64, side: Side) -> Result<f64, String> {
-        let at = |index: usize| self.plot.points()[index][column].re;
-        if let Some(b) = self.breakpoint_near(t) {
-            let near: Vec<usize> = (0..self.times.len())
-                .filter(|&i| (self.times[i] - b).abs() <= self.eps)
-                .collect();
-            let (Some(&first), Some(&last)) = (near.first(), near.last()) else {
+    /// Bind the sample once, independent of the requested signal.
+    fn sample(&self, t: f64, side: Side) -> Result<SamplePlan<'a>, String> {
+        let row = |index: usize| self.plot.points()[index].as_slice();
+        if let Some(index) = nearby_breakpoint_index(self.breakpoints, t, self.eps) {
+            let b = self.breakpoints[index];
+            let Some((first, last)) = self.event_rows[index] else {
                 return Err(format!(
                     "{}: no sample at breakpoint {b:e}; cannot form a one-sided limit",
                     self.label
                 ));
             };
             return match side {
-                Side::Left => Ok(at(first)),
-                Side::Right => Ok(at(last)),
+                Side::Left => Ok(SamplePlan::Exact(row(first))),
+                Side::Right => Ok(SamplePlan::Exact(row(last))),
                 Side::Interior => Err(format!(
                     "{}: interior evaluation requested at breakpoint {b:e}",
                     self.label
                 )),
             };
         }
+        // Keep the original interior bracket-selection rule, including its
+        // behavior for the tiny reversals allowed by check_times. Only the
+        // event lookup above requires a complete scan of matching rows.
         let upper = self.times.partition_point(|&x| x < t - self.eps);
         if upper == self.times.len() {
             return Err(format!("{}: time {t:e} is beyond the samples", self.label));
         }
         if (self.times[upper] - t).abs() <= self.eps {
-            return Ok(at(upper));
+            return Ok(SamplePlan::Exact(row(upper)));
         }
         if upper == 0 {
             return Err(format!("{}: time {t:e} precedes the samples", self.label));
@@ -203,20 +260,30 @@ impl<'a> Series<'a> {
             ));
         }
         let fraction = (t - t0) / (t1 - t0);
-        let left = (1.0 - fraction) * at(upper - 1);
-        let right = fraction * at(upper);
-        Ok(left + right)
+        Ok(SamplePlan::Linear {
+            lower: row(upper - 1),
+            upper: row(upper),
+            fraction,
+        })
     }
 }
 
 /// Find the first matching corner in an already validated sorted timeline.
 /// Use the original subtraction predicate rather than rounding a new bound.
-fn nearby_breakpoint(breakpoints: &[f64], time: f64, eps: f64) -> Option<f64> {
-    let index = breakpoints.partition_point(|&event| event < time && time - event > eps);
+fn first_possible_breakpoint(breakpoints: &[f64], time: f64, eps: f64) -> usize {
+    breakpoints.partition_point(|&event| event < time && time - event > eps)
+}
+
+fn nearby_breakpoint_index(breakpoints: &[f64], time: f64, eps: f64) -> Option<usize> {
+    let index = first_possible_breakpoint(breakpoints, time, eps);
     breakpoints
         .get(index)
-        .copied()
-        .filter(|event| (event - time).abs() <= eps)
+        .filter(|&&event| (event - time).abs() <= eps)
+        .map(|_| index)
+}
+
+fn nearby_breakpoint(breakpoints: &[f64], time: f64, eps: f64) -> Option<f64> {
+    nearby_breakpoint_index(breakpoints, time, eps).map(|index| breakpoints[index])
 }
 
 fn comparison_instants(
@@ -245,33 +312,39 @@ fn comparison_instants(
         }
         previous = b;
     }
-    let mut instants: Vec<(f64, Side)> = Vec::new();
-    // The first instant is `start` itself (0 for an ordinary run); grid times
-    // before it do not exist in either plot.
-    instants.push((grid.start, Side::Interior));
-    for index in 0..=count {
-        let t = f64::from(index) * grid.step;
-        if t > grid.start + eps
-            && t < grid.stop - eps
-            && nearby_breakpoint(breakpoints, t, eps).is_none()
-        {
-            check_event_capacity(instants.len(), 1)?;
-            instants.push((t, Side::Interior));
-        }
-    }
-    check_event_capacity(instants.len(), 1)?;
-    instants.push((grid.stop, Side::Interior));
     let limit_count = breakpoints
         .len()
         .checked_mul(2)
         .ok_or("too many breakpoint limits")?;
-    check_event_capacity(instants.len(), limit_count)?;
-    for &b in breakpoints {
-        instants.push((b, Side::Left));
-        instants.push((b, Side::Right));
+    check_event_capacity(2, limit_count)?;
+    let mandatory = limit_count + 2;
+    let mut instants = Vec::with_capacity(mandatory);
+    instants.push((grid.start, Side::Interior));
+    let mut interiors = 0;
+    let mut events = breakpoints.iter().copied().peekable();
+    // Merge monotonically increasing grid times with the event timeline.
+    // A grid time near a breakpoint is omitted, using exactly the original
+    // subtraction test (not a rounded t +/- eps bound).
+    for index in 0..=count {
+        let t = f64::from(index) * grid.step;
+        if !(t > grid.start + eps && t < grid.stop - eps) {
+            continue;
+        }
+        while events.peek().is_some_and(|&b| b < t && t - b > eps) {
+            if let Some(b) = events.next() {
+                instants.extend([(b, Side::Left), (b, Side::Right)]);
+            }
+        }
+        if events.peek().is_none_or(|&b| (b - t).abs() > eps) {
+            check_event_capacity(mandatory, interiors + 1)?;
+            interiors += 1;
+            instants.push((t, Side::Interior));
+        }
     }
-    // Stable sort keeps Left before Right at equal times.
-    instants.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for b in events {
+        instants.extend([(b, Side::Left), (b, Side::Right)]);
+    }
+    instants.push((grid.stop, Side::Interior));
     Ok(instants)
 }
 
@@ -324,9 +397,15 @@ pub(super) fn transient(
         } else {
             summary.limits += 1;
         }
+        // With no compared signals the old comparator never bound samples.
+        if signals.is_empty() {
+            continue;
+        }
+        let got_sample = rust.sample(t, side)?;
+        let want_sample = c.sample(t, side)?;
         for &(name, got_column, want_column, absolute) in &signals {
-            let actual = rust.value(got_column, t, side)?;
-            let expected = c.value(want_column, t, side)?;
+            let actual = got_sample.value(got_column);
+            let expected = want_sample.value(want_column);
             let relative_allowance = tolerance.relative * expected.abs();
             let limit = relative_allowance + absolute;
             let error = (actual - expected).abs();
@@ -500,6 +579,297 @@ mod tests {
         plot(&rows)
     }
 
+    // Pre-refactor oracle. Keep the original row scan, arithmetic and
+    // per-call bracket lookup independent of the indexed implementation.
+    fn legacy_value(series: &Series<'_>, column: usize, t: f64, side: Side) -> Result<f64, String> {
+        let at = |index: usize| series.plot.points()[index][column].re;
+        if let Some(b) = series.breakpoint_near(t) {
+            let near: Vec<usize> = (0..series.times.len())
+                .filter(|&i| (series.times[i] - b).abs() <= series.eps)
+                .collect();
+            let (Some(&first), Some(&last)) = (near.first(), near.last()) else {
+                return Err(format!(
+                    "{}: no sample at breakpoint {b:e}; cannot form a one-sided limit",
+                    series.label
+                ));
+            };
+            return match side {
+                Side::Left => Ok(at(first)),
+                Side::Right => Ok(at(last)),
+                Side::Interior => Err(format!(
+                    "{}: interior evaluation requested at breakpoint {b:e}",
+                    series.label
+                )),
+            };
+        }
+        let upper = series.times.partition_point(|&x| x < t - series.eps);
+        if upper == series.times.len() {
+            return Err(format!(
+                "{}: time {t:e} is beyond the samples",
+                series.label
+            ));
+        }
+        if (series.times[upper] - t).abs() <= series.eps {
+            return Ok(at(upper));
+        }
+        if upper == 0 {
+            return Err(format!("{}: time {t:e} precedes the samples", series.label));
+        }
+        let (t0, t1) = (series.times[upper - 1], series.times[upper]);
+        let next = series
+            .breakpoints
+            .partition_point(|&b| b <= t0 + series.eps);
+        if let Some(b) = series
+            .breakpoints
+            .get(next)
+            .filter(|&&b| b < t1 - series.eps)
+        {
+            return Err(format!(
+                "{}: samples [{t0:e}, {t1:e}] straddle breakpoint {b:e}; refusing to interpolate across it",
+                series.label
+            ));
+        }
+        let fraction = (t - t0) / (t1 - t0);
+        let left = (1.0 - fraction) * at(upper - 1);
+        let right = fraction * at(upper);
+        Ok(left + right)
+    }
+
+    fn legacy_instants(
+        grid: &Grid,
+        breakpoints: &[f64],
+        eps: f64,
+    ) -> Result<Vec<(f64, Side)>, String> {
+        if !(grid.stop.is_finite() && grid.stop > 0.0 && grid.step.is_finite() && grid.step > 0.0) {
+            return Err("grid stop and step must be finite and positive".into());
+        }
+        if !(grid.start.is_finite() && grid.start >= 0.0 && grid.start < grid.stop - eps) {
+            return Err("grid start must be finite and lie in [0, stop)".into());
+        }
+        let count = (grid.stop / grid.step + 1e-9).floor();
+        if count >= f64::from(MAX_POINTS) {
+            return Err(format!("grid needs more than {MAX_POINTS} points"));
+        }
+        let count = exact_nonnegative_integer::<u32>(count)
+            .ok_or_else(|| "invalid grid point count".to_owned())?;
+        let mut previous = grid.start;
+        for &b in breakpoints {
+            if !(b.is_finite() && b > eps && b < grid.stop - eps && b > previous + eps) {
+                return Err(format!(
+                    "breakpoint {b:e} must be finite, strictly inside (start, stop) and strictly increasing"
+                ));
+            }
+            previous = b;
+        }
+        let mut instants: Vec<(f64, Side)> = Vec::new();
+        // The first instant is `start` itself (0 for an ordinary run); grid times
+        // before it do not exist in either plot.
+        instants.push((grid.start, Side::Interior));
+        for index in 0..=count {
+            let t = f64::from(index) * grid.step;
+            if t > grid.start + eps
+                && t < grid.stop - eps
+                && !breakpoints.iter().any(|&b| (b - t).abs() <= eps)
+            {
+                check_event_capacity(instants.len(), 1)?;
+                instants.push((t, Side::Interior));
+            }
+        }
+        check_event_capacity(instants.len(), 1)?;
+        instants.push((grid.stop, Side::Interior));
+        let limit_count = breakpoints
+            .len()
+            .checked_mul(2)
+            .ok_or("too many breakpoint limits")?;
+        check_event_capacity(instants.len(), limit_count)?;
+        for &b in breakpoints {
+            instants.push((b, Side::Left));
+            instants.push((b, Side::Right));
+        }
+        // Stable sort keeps Left before Right at equal times.
+        instants.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Ok(instants)
+    }
+
+    #[test]
+    fn indexed_event_rows_match_full_scans_at_rounding_boundaries() {
+        let eps = 0.125;
+        let events = [0.5, 1.0, 1.1875, 2.0, 4.0];
+        let mut times = vec![-0.0, 0.0, 3.0];
+        for event in events {
+            for boundary in [event - eps, event, event + eps] {
+                for time in [boundary.next_down(), boundary, boundary.next_up()] {
+                    times.push(time);
+                }
+            }
+        }
+        // This deliberately permutes storage order, to exercise the
+        // first/last index invariant independently of time validation.
+        times.reverse();
+        let indexed = index_event_rows(&times, &events, eps);
+        for (&event, actual) in events.iter().zip(indexed) {
+            let matching: Vec<_> = times
+                .iter()
+                .enumerate()
+                .filter(|(_, time)| (**time - event).abs() <= eps)
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(
+                actual,
+                matching.first().zip(matching.last()).map(|(&a, &b)| (a, b))
+            );
+        }
+    }
+
+    #[test]
+    fn planned_samples_preserve_legacy_results_including_reversed_limits() {
+        let eps = TIME_EPS_REL * STOP;
+        let b = 5.0;
+        let cases = [
+            (
+                vec![b],
+                vec![
+                    (-0.0, -0.0),
+                    (3.0, 1.0),
+                    (b, 2.0),
+                    (b, 3.0),
+                    (7.0, 4.0),
+                    (STOP, 5.0),
+                ],
+            ),
+            (
+                vec![b],
+                vec![
+                    (-0.0, -0.0),
+                    (3.0, 1.0),
+                    (b + eps * 0.25, 2.0),
+                    (b - eps * 0.25, 3.0),
+                    (7.0, 4.0),
+                    (STOP, 5.0),
+                ],
+            ),
+            (
+                vec![b, b + eps * 1.5],
+                vec![
+                    (-0.0, -0.0),
+                    (3.0, 1.0),
+                    (b + eps * 0.75, 2.0),
+                    (7.0, 4.0),
+                    (STOP, 5.0),
+                ],
+            ),
+            (
+                vec![b],
+                vec![(-0.0, -0.0), (3.0, 1.0), (7.0, 4.0), (STOP, 5.0)],
+            ),
+        ];
+        for (events, rows) in cases {
+            let p = plot(&rows);
+            let series = Series::new("test", &p, &events, &grid(), eps).unwrap();
+            let mut queries = vec![-0.0, 0.0, 1.5, 4.0, 6.0, 8.0, STOP];
+            for event in &events {
+                for boundary in [event - eps, *event, event + eps] {
+                    queries.extend([boundary.next_down(), boundary, boundary.next_up()]);
+                }
+            }
+            for t in queries {
+                for side in [Side::Interior, Side::Left, Side::Right] {
+                    for column in 0..2 {
+                        let expected = legacy_value(&series, column, t, side).map(f64::to_bits);
+                        let actual = series
+                            .sample(t, side)
+                            .map(|plan| plan.value(column).to_bits());
+                        assert_eq!(actual, expected, "{events:?}, {t:e}, {side:?}, {column}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn merged_instants_match_legacy_sort_and_coincidence_rules() {
+        for start in [-0.0, 0.0, 0.4] {
+            for step in [0.125, 0.3, 0.5, 1.0, 20.0] {
+                let grid = Grid {
+                    start,
+                    stop: STOP,
+                    step,
+                };
+                let eps = TIME_EPS_REL * grid.stop;
+                let mut events = vec![1.0_f64, 3.5, 8.0];
+                for delta in [-eps, eps] {
+                    for edge in [
+                        (5.0 + delta).next_down(),
+                        5.0 + delta,
+                        (5.0 + delta).next_up(),
+                    ] {
+                        events[1] = edge;
+                        let expected = legacy_instants(&grid, &events, eps).unwrap();
+                        let actual = comparison_instants(&grid, &events, eps).unwrap();
+                        let bits = |v: Vec<(f64, Side)>| {
+                            v.into_iter()
+                                .map(|(t, side)| (t.to_bits(), side))
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(bits(actual), bits(expected));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run explicitly"]
+    fn indexed_dense_transient_comparison_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        let grid = Grid {
+            start: 0.0,
+            stop: STOP,
+            step: STOP / 20_000.0,
+        };
+        let eps = TIME_EPS_REL * grid.stop;
+        let events: Vec<_> = (1..500).map(|i| f64::from(i * 40) * grid.step).collect();
+        let mut variables = vec![Variable::new("time", "time")];
+        variables.extend((0..32).map(|i| Variable::new(format!("v({i})"), "voltage")));
+        let points = (0..=20_000)
+            .map(|i| {
+                let t = f64::from(i) * grid.step;
+                std::iter::once(Complex::real(t))
+                    .chain((0..32).map(|j| Complex::real(t * f64::from(j + 1))))
+                    .collect()
+            })
+            .collect();
+        let p = Plot::new("tran1", "Transient Analysis", PlotFlags::Real, variables)
+            .with_points(points)
+            .unwrap();
+        let baseline = Series::new("test", &p, &events, &grid, eps).unwrap();
+        let start = Instant::now();
+        let queries = legacy_instants(&grid, &events, eps).unwrap();
+        let mut old_sum = 0.0;
+        for &(t, side) in &queries {
+            for col in 1..33 {
+                old_sum += black_box(legacy_value(black_box(&baseline), col, t, side).unwrap());
+            }
+        }
+        let old_time = start.elapsed();
+        let start = Instant::now();
+        let queries = comparison_instants(&grid, &events, eps).unwrap();
+        let indexed = Series::new("test", &p, &events, &grid, eps).unwrap();
+        let mut new_sum = 0.0;
+        for &(t, side) in &queries {
+            let sample = indexed.sample(t, side).unwrap();
+            for col in 1..33 {
+                new_sum += black_box(sample.value(col));
+            }
+        }
+        let new_time = start.elapsed();
+        assert_eq!(old_sum.to_bits(), new_sum.to_bits());
+        eprintln!(
+            "20,001 rows, 499 events, 32 signals; old {old_time:?}, indexed including validation {new_time:?}, {:.2}x",
+            old_time.as_secs_f64() / new_time.as_secs_f64()
+        );
+    }
+
     #[test]
     fn breakpoint_search_preserves_first_match_and_rounding() {
         let events: [f64; 5] = [0.5, 1.0, 1.125, 2.0, 4.0];
@@ -595,10 +965,10 @@ mod tests {
         let p = plot(&[(0.0, 0.0), (3.0, 0.0), (6.0, 9.0), (10.0, 9.0)]);
         let bps = [5.0];
         let series = Series::new("Rust", &p, &bps, &grid(), 1e-8).unwrap();
-        let error = series.value(1, 4.0, Side::Interior).unwrap_err();
+        let error = series.sample(4.0, Side::Interior).unwrap_err();
         assert!(error.contains("refusing to interpolate"), "{error}");
-        assert_eq!(series.value(1, 1.5, Side::Interior).unwrap(), 0.0);
-        assert_eq!(series.value(1, 8.0, Side::Interior).unwrap(), 9.0);
+        assert_eq!(series.sample(1.5, Side::Interior).unwrap().value(1), 0.0);
+        assert_eq!(series.sample(8.0, Side::Interior).unwrap().value(1), 9.0);
     }
 
     #[test]
