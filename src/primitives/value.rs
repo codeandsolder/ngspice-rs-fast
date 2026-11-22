@@ -960,8 +960,9 @@ pub fn format_spice_number(value: Real) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Complex, almost_equal_ulps, approx_eq, format_spice_number, parse_numparam_number_prefix,
-        parse_spice_number, parse_spice_number_prefix,
+        Complex, Real, almost_equal_ulps, approx_eq, complex_schur, exact_product_sum,
+        format_spice_number, parse_numparam_number_prefix, parse_spice_number,
+        parse_spice_number_prefix, real_schur, scale_power,
     };
 
     #[test]
