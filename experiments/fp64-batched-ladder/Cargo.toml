@@ -1,0 +1,14 @@
+[package]
+name = "fp64-batched-ladder"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# An isolated feasibility experiment, not a default simulator dependency.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+bytemuck = "1"
+pollster = "0.4"
+wgpu = { version = "=30.0.2", default-features = false, features = ["std", "vulkan", "wgsl", "parking_lot"] }
