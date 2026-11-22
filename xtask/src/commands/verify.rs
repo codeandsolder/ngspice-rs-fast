@@ -1777,6 +1777,35 @@ const BATCH: &[Batch] = &[
             },
         ],
     },
+    // The former FMA-dependent exclusion is now covered by the
+    // independently validated pole search (#91), including both PZ cards.
+    Batch {
+        name: "multi_analysis_pz",
+        stages: &[
+            Stage {
+                kind: AnalysisKind::Ac,
+                gate: Gate::Points {
+                    axis: Some("frequency"),
+                    tolerance: compare::AC,
+                },
+            },
+            Stage {
+                kind: AnalysisKind::OperatingPoint,
+                gate: Gate::Points {
+                    axis: None,
+                    tolerance: compare::DC,
+                },
+            },
+            Stage {
+                kind: AnalysisKind::PoleZero,
+                gate: Gate::Roots(compare::POLE_ZERO),
+            },
+            Stage {
+                kind: AnalysisKind::PoleZero,
+                gate: Gate::Roots(compare::POLE_ZERO),
+            },
+        ],
+    },
     // `.sp` (#105) beside `.ac`, `.op` and `.tran` on the same RF ports: the
     // series z0 of each port in every analysis, and `sp1` last in batch order.
     Batch {
@@ -1835,23 +1864,7 @@ const fn noise_stages(tolerance: compare::Tolerance) -> [Stage; 2] {
 /// Fixtures whose deck the Rust engine does not reproduce. A requested excluded
 /// fixture still fails the run, so an entry cannot be reported as a success by
 /// accident.
-///
-/// `multi_analysis_pz` (`.op`, `.ac` and two `.pz` cards, #103) is excluded
-/// because its pole search is decided by floating-point contraction, not by the
-/// C source. The port of the deflated Muller search (`cktpzstr.c`,
-/// `nipzmeth.c`) reproduces a `-ffp-contract=off` build of the same ngspice
-/// commit bit for bit: both list the zeros, then give up on the poles after 201
-/// trials ("Pole-zero iteration limit reached") and write an empty `pz2` plot.
-/// The committed golden comes from the reference build, whose fused
-/// multiply-adds let the search converge to three poles (the real pole near
-/// -7.97e4 and a complex pair), and its zeros differ from the port's in the last
-/// digits. The golden is unchanged; the AC and operating-point stages of this
-/// deck are covered by the other fixtures.
-const EXCLUDED: &[(&str, &str)] = &[(
-    "multi_analysis_pz",
-    "FMA-dependent: matches -ffp-contract=off C (pole search gives up after 201 trials) \
-     but not the FMA-built golden (3 poles)",
-)];
+const EXCLUDED: &[(&str, &str)] = &[];
 
 pub(super) fn main(root: &Path, arguments: &[String]) -> Result<(), String> {
     let only = match arguments {

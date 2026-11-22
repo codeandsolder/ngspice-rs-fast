@@ -167,16 +167,18 @@ impl Mul for Complex {
         let bc = self.im * rhs.re;
         let real = ac + bd;
         let imag = ad + bc;
-        // An axial operand has only one potentially nonzero product in
-        // each component: no two-product cancellation or range recovery
-        // is possible. Preserve the IEEE zero/nonfinite signs of the sum.
-        if self.re == 0. || self.im == 0. || rhs.re == 0. || rhs.im == 0. {
+        // A well-conditioned sum stays within a small relative error
+        // bound without evaluating product rounding residuals. Use the
+        // first product as the scale: |second| <= |sum| + |first|.
+        if (well_conditioned(real, ac) & well_conditioned(imag, ad))
+            || self.re == 0.
+            || self.im == 0.
+            || rhs.re == 0.
+            || rhs.im == 0.
+        {
             return Self::new(real, imag);
         }
-        Self::new(
-            refine_product(self.re, rhs.re, -self.im, rhs.im, ac, bd, real),
-            refine_product(self.re, rhs.im, self.im, rhs.re, ad, bc, imag),
-        )
+        compensated_complex_product(self, rhs)
     }
 }
 
@@ -231,19 +233,29 @@ fn compensated_sum(a: Real, b: Real, c: Real, d: Real, first: Real, second: Real
 }
 
 #[inline]
-fn refine_product(
-    a: Real,
-    b: Real,
-    c: Real,
-    d: Real,
-    first: Real,
-    second: Real,
-    sum: Real,
-) -> Real {
-    if sum.is_normal() && sum.abs() > 0.5 * first.abs().max(second.abs()) {
-        return sum;
-    }
-    refine_product_sum(a, b, c, d, first, second, sum)
+fn well_conditioned(sum: Real, first: Real) -> bool {
+    // Positive binary64 encodings are ordered by magnitude. Subtract
+    // one exponent unit to obtain the half-product comparison without
+    // extra floating-point operations or a NaN-sensitive max.
+    const SIGN: u64 = 1 << 63;
+    const MIN_NORMAL: u64 = 1 << 52;
+    const INFINITY: u64 = 0x7ff0_0000_0000_0000;
+    let magnitude = sum.to_bits() & !SIGN;
+    let product = first.to_bits() & !SIGN;
+    (magnitude.wrapping_sub(MIN_NORMAL) < INFINITY - MIN_NORMAL)
+        & (magnitude > product.saturating_sub(MIN_NORMAL))
+}
+
+#[cold]
+fn compensated_complex_product(a: Complex, b: Complex) -> Complex {
+    let ac = a.re * b.re;
+    let bd = -a.im * b.im;
+    let ad = a.re * b.im;
+    let bc = a.im * b.re;
+    Complex::new(
+        refine_product_sum(a.re, b.re, -a.im, b.im, ac, bd, ac + bd),
+        refine_product_sum(a.re, b.im, a.im, b.re, ad, bc, ad + bc),
+    )
 }
 
 #[cold]
