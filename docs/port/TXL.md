@@ -80,8 +80,15 @@ approximation:
 The cubic solvers (`find_roots`, `exp_find_roots`) are Cardano seeds with at
 most 31 Newton updates and a stable deflation; two Gauss-Jordan solves follow
 C's two pivot thresholds (`1e-16`, `1e-28`) and its partial-row swaps.
-`pade.rs` keeps C's operation order so the coefficients are bit-compatible,
-but returns `Numerical` errors where C calls `controlled_exit`.
+`pade.rs` retains the reference degrees, partial-fraction and pivot policy,
+but computes the series without division by the difference of the loss
+rates, and solves the cubics in dimensionless coordinates. Numerical errors
+replace C's `controlled_exit`. Outside the existing low-loss shortcut,
+equal loss rates `R/L = G/C` have constant characteristic admittance and
+propagation `exp(-R/L * sqrt(LC) * length) * exp(-s * sqrt(LC) * length)`.
+This transient case uses the analytic attenuated delay instead of forming
+singular Padé coefficients. The reference DC stamp is unchanged (in
+particular, it does not incorporate shunt conductance).
 
 `m10_txl_op`/`m10_txl_dc` pin the DC answer and `m10_txl_tran`/
 `m10_txl_early_tran`/`m10_txl_tran_step`/`m10_txl3_tran` the transient.
@@ -135,7 +142,9 @@ integer). Repeated sub-picosecond times do not advance the history.
 A Newton trial is pure: nothing a rejected trial does can change the
 convolution, interpolation or history. Acceptance publishes the new sample,
 recurrence and clamp together through the same checked transaction used by
-other delay lines. The C multiply, add and recurrence order remains intact.
+other delay lines. The recurrence and accepted-time ordering follow C;
+fused arithmetic, a stable exponential increment, and exact samples at
+accepted interpolation knots reduce avoidable numerical error.
 
 Three C behaviours are reproduced deliberately:
 

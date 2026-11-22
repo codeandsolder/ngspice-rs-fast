@@ -231,7 +231,9 @@ C's `t + (bp - t)` can take different branches.
   `c_ltra_reference`). An RG line alone is right in C, but the device cannot
   see the other lines, so the port refuses RG lines in AC/`.sp`.
 * Nonfinite convolution terms produce an explicit numerical error. The RLC
-  endpoints evaluate exponentially scaled Bessel products, retaining finite
+  endpoints evaluate exponentially scaled Bessel products using high-accuracy
+  piecewise polynomials (including transitions tested against independent
+  high-precision values), retaining finite
   physical responses beyond C's intermediate overflow near `beta t = 700`.
   Local interpolation and integral formulas also retain small loss terms
   and avoid cancellation in differences of time powers.

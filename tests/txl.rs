@@ -534,6 +534,32 @@ fn the_lossless_shortcut_transmits_the_matched_wave() {
     close(values(&plot, "i(y1)", last)[1], -0.02, 1e-9, 1e-12);
 }
 
+/// At equal loss rates the exact propagation function is a constant
+/// attenuation times a pure delay, with no Padé poles. This is an analytic
+/// extension of the transient branch; C's DC stamp is kept unchanged.
+#[test]
+fn matched_loss_rates_transmit_the_exact_attenuated_pulse() {
+    let plot = run_with_options(
+        "v1 1 0 dc 0 pulse(0 1 1n 0.1n 0.1n 100n 200n)\ny1 1 0 2 0 ym\nrl 2 0 1\n\
+         .model ym txl r=1 l=1n c=1n g=1 length=1\n\
+         .options reltol=1e-6 vntol=1e-9 abstol=1e-14",
+        AnalysisKind::Transient,
+        &["0.05n", "5n"],
+    );
+    let attenuation = (-1_f64).exp();
+    for point in 0..plot.point_count() {
+        let time = value(&plot, "time", point);
+        // Away from the finite ramp and picosecond quantization boundary,
+        // the matched-line response is identically zero or exp(-1).
+        if time < 1.99e-9 {
+            close(value(&plot, "v(2)", point), 0., 0., 1e-12);
+        } else if time > 2.11e-9 {
+            close(value(&plot, "v(2)", point), attenuation, 1e-9, 1e-12);
+            close(values(&plot, "i(y1)", point)[1], -attenuation, 1e-9, 1e-12);
+        }
+    }
+}
+
 #[test]
 fn invalid_domains_overflow_and_uic_are_explicit_errors() {
     for (from, to) in [
