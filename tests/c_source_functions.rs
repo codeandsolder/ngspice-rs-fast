@@ -565,7 +565,7 @@ fn elaborated_waveform_timeline_matches_independent_c_landings() {
         ),
         (
             "nested-param",
-            ".subckt inner b td=1m\nv1 b 0 pulse(0 1 {td} 10u 20u 1m)\n.ends\n.subckt outer a d=1m\nx1 a inner td={d}\n.ends\nx1 n outer d=0.5m\nx2 m outer d=1m\nr1 n 0 1k\nr2 m 0 1k\n",
+            ".subckt inner b params: td=1m\nv1 b 0 pwl(0 0 10u 1 1.01m 1 1.03m 0) td={td}\n.ends\n.subckt outer a params: d=1m\nx1 a inner td={d}\n.ends\nx1 n outer d=0.5m\nx2 m outer d=1m\nr1 n 0 1k\nr2 m 0 1k\n",
             &[
                 0.5e-3, 0.51e-3, 1e-3, 1.01e-3, 1.51e-3, 1.53e-3, 2.01e-3, 2.03e-3,
             ],

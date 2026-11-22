@@ -817,7 +817,7 @@ mod tests {
         );
         // Nested instances resolve their own formal parameters and names.
         let netlist = deck(
-            ".subckt inner b td=1m\nv1 b 0 pulse(0 1 {td} 1u 2u 1m)\n.ends\n.subckt outer a d=1m\nx1 a inner td={d}\n.ends\nx1 n outer d=0.5m\nx2 m outer d=1m",
+            ".subckt inner b params: td=1m\nv1 b 0 pwl(0 0 1u 1 1.001m 1 1.003m 0) td={td}\n.ends\n.subckt outer a params: d=1m\nx1 a inner td={d}\n.ends\nx1 n outer d=0.5m\nx2 m outer d=1m",
         );
         let found = deck_breakpoints(&netlist, 1e-5, 4e-3).unwrap();
         assert_eq!(found.len(), 8);
