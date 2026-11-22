@@ -321,7 +321,7 @@ fn noise_parameters(
     generators: &[crate::devices::noise::InstanceNoise],
     context: &crate::analysis::AnalysisContext,
 ) -> SpiceResult<Vec<Complex>> {
-    use crate::devices::noise::{BOLTZMANN, NoiseKind};
+    use crate::devices::noise::BOLTZMANN;
     let count = ports.len();
     let n = circuit.unknown_count();
     let mut adjoints = Vec::with_capacity(count);
@@ -338,19 +338,9 @@ fn noise_parameters(
     let mut cy = DenseComplex::zeros(count)?;
     for instance in generators {
         for source in &instance.sources {
-            if matches!(
-                source.kind,
-                NoiseKind::Flicker { .. } | NoiseKind::Gain { .. }
-            ) {
+            let Some(amplitude) = source.kind.rf_amplitude()? else {
                 continue;
-            }
-            if matches!(source.kind, NoiseKind::CorrelatedThermal { .. }) {
-                return Err(SpiceError::not_yet_ported(
-                    "correlated (NevalSrc2) noise in S-parameter noise analysis",
-                    "src/spicelib/analysis/nevalsrc.c (NevalSrc2, RFSPICE branch)",
-                ));
-            }
-            let density = source.kind.output_density(1., 1.);
+            };
             let mut voltage = Vec::with_capacity(count);
             for adjoint in &adjoints {
                 let at = |node| {
@@ -359,9 +349,8 @@ fn noise_parameters(
                         .node_row(node)
                         .map_or(Complex::ZERO, |r| adjoint[r])
                 };
-                voltage.push(
-                    (at(source.nodes[0]) - at(source.nodes[1])) * Complex::real(density.sqrt()),
-                );
+                voltage
+                    .push((at(source.nodes[0]) - at(source.nodes[1])) * Complex::real(amplitude));
             }
             let mut current = vec![Complex::ZERO; count];
             for i in 0..count {
