@@ -1353,5 +1353,14 @@ mod tests {
         assert_eq!(new_nominal.defaults, fresh.defaults);
         assert_eq!(new_nominal.setup, fresh.setup);
         assert_eq!(new_nominal.temperature_model, fresh.temperature_model);
+        // Build independent instances at A/B/A. Only the immutable model
+        // defaults are shared; each instance retains its own setup state.
+        let again = crate::primitives::NodeTable::new()
+            .transaction(|nodes| Bsim3::build(inst, nodes, &resolved, &ModelContext::new(27., 27.)))
+            .unwrap();
+        let again = again.ensure(27., 27.).unwrap();
+        assert!(Arc::ptr_eq(&initial.defaults, &again.defaults));
+        assert!(!Rc::ptr_eq(&initial, &again));
+        assert_eq!(initial.setup, again.setup);
     }
 }

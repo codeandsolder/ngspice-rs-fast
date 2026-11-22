@@ -498,6 +498,19 @@ mod tests {
     }
 
     #[test]
+    fn default_snapshots_share_compiled_slots_and_indices() {
+        let schema = ScalarSchema::new(PARAMETERS);
+        let first = schema.validate([], &loc(1)).unwrap();
+        let second = schema.validate([], &loc(2)).unwrap();
+        let explicit = schema.validate([&setter("r", "2", 3)], &loc(3)).unwrap();
+        assert!(Arc::ptr_eq(&first.values, &second.values));
+        assert!(Arc::ptr_eq(&first.indices, &explicit.indices));
+        assert!(!Arc::ptr_eq(&first.values, &explicit.values));
+        assert_eq!(first.get("r").unwrap().location, None);
+        assert_eq!(explicit.get("r").unwrap().location, Some(loc(3)));
+    }
+
+    #[test]
     fn cloned_snapshots_share_until_changed_and_keep_provenance() {
         let schema = ScalarSchema::new(PARAMETERS);
         let assignments = [setter("R", "2", 2), setter("r", "3", 3)];

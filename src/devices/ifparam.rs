@@ -262,7 +262,7 @@ impl Inputs {
         }
     }
 
-    fn table(&self) -> &ParameterTable {
+    const fn table(&self) -> &ParameterTable {
         if self.is_model {
             &self.device.model
         } else {
@@ -409,4 +409,32 @@ pub(super) fn version_text(p: &ParameterAssignment) -> SpiceResult<&str> {
         finite_literal(p)?;
     }
     Ok(&p.value)
+}
+
+#[cfg(test)]
+mod indexed_tests {
+
+    #[test]
+    fn generated_indexes_match_first_linear_keyword_and_alias() {
+        for device in [
+            &crate::devices::bsim3::DEVICE,
+            &crate::devices::bsim4::DEVICE,
+        ] {
+            for table in [&device.model, &device.instance] {
+                for parameter in table.definitions {
+                    let expected = table
+                        .definitions
+                        .iter()
+                        .find(|p| p.name.eq_ignore_ascii_case(parameter.name))
+                        .unwrap();
+                    assert!(std::ptr::eq(table.get(parameter.name).unwrap(), expected));
+                    assert!(std::ptr::eq(
+                        table.get(&parameter.name.to_ascii_uppercase()).unwrap(),
+                        expected
+                    ));
+                }
+                assert!(table.get("not-a-parameter").is_none());
+            }
+        }
+    }
 }

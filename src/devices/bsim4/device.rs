@@ -1497,6 +1497,36 @@ impl Device for Bsim4 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn model_setup_prototypes_share_only_exact_nominal_context() {
+        use crate::devices::ModelResolver;
+        use crate::netlist::{Parser, source::parse_deck_text};
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                std::path::Path::new("bsim4-cache.cir"),
+                "BSIM4 cache\nm1 d g s 0 model l=1u w=10u\n.model model nmos level=54 mobmod=99\n.end\n",
+            ))
+            .unwrap();
+        let resolver = ModelResolver::new(&deck.models).unwrap();
+        let inst = &deck.devices[0];
+        let resolved = resolver.resolve(inst).unwrap().unwrap();
+        let params = super::super::model_parameters(&resolved).unwrap();
+        let a = Bsim4::model_setup(&resolved, &params, &inst.location, 27.).unwrap();
+        let b = Bsim4::model_setup(&resolved, &params, &inst.location, 42.).unwrap();
+        let again = Bsim4::model_setup(&resolved, &params, &inst.location, 27.).unwrap();
+        assert!(Arc::ptr_eq(&a, &again));
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_ne!(a.model.tnom.to_bits(), b.model.tnom.to_bits());
+        assert!(!a.warnings.is_empty());
+        assert_eq!(a.warnings, b.warnings);
+        let inputs = params.instance_parameters(inst, 1.).unwrap();
+        let mut first = Bsim4::setup(&a, &inputs, false).unwrap();
+        let second = Bsim4::setup(&again, &inputs, false).unwrap();
+        first.model.tnom = 0.;
+        assert_eq!(second.model.tnom.to_bits(), a.model.tnom.to_bits());
+        assert_eq!(first.warnings, second.warnings);
+    }
+
     fn prepared(length: Real) -> Rc<Prepared> {
         Rc::new(Prepared {
             temperature: 27.,
