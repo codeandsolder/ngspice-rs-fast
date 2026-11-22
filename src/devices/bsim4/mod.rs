@@ -53,8 +53,9 @@ mod temp;
 
 /// The generated literal model defaults in C setup order (`b4set.c`).
 ///
-/// Generated from `b4set.c`'s given-guarded literal assignments, which
-/// `set.rs` reproduces in C order (a unit test there checks they agree).
+/// Generated from `b4set.c`'s given-guarded literal assignments. Independent
+/// defaults execute as typed generated assignments; selector fallbacks and
+/// conditional defaults remain in the ordered setup stages.
 #[must_use]
 pub const fn literal_defaults() -> &'static [(&'static str, f64)] {
     defaults_data::LITERALS

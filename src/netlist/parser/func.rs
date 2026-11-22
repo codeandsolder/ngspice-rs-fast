@@ -74,6 +74,7 @@ pub(super) fn definition(
             origin,
             total: text.len(),
             depth: 0,
+            remaining_nodes: crate::netlist::expr::MAX_TREE_NODES,
             shadowing: &[],
         },
     };

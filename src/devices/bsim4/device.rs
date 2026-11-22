@@ -53,21 +53,6 @@ pub(super) struct Prepared {
     pub(super) warnings: Vec<String>,
 }
 
-/// Immutable model-only setup, before instance-dependent resets and temperature.
-struct ModelSetupPrototype {
-    model: Model,
-    warnings: Vec<String>,
-}
-
-/// `BSIM4setup`'s result: the model, the instance and the messages so far.
-struct SetUp {
-    model: Model,
-    instance: Instance,
-    warnings: Vec<String>,
-    /// Internal nodes C creates, `(local index, suffix)` in order.
-    created: Vec<(i32, &'static str)>,
-}
-
 /// One BSIM4 instance.
 pub(in crate::devices) struct Bsim4 {
     pub(super) name: String,
@@ -257,36 +242,25 @@ impl Bsim4 {
         params: &ModelParameters,
         location: &SourceLoc,
         nominal: Real,
-    ) -> SpiceResult<Arc<ModelSetupPrototype>> {
+    ) -> SpiceResult<Arc<set::PreparedModel>> {
         let raw = resolved.prepare(PreparationKey::Inputs, || apply::model(params))?;
         let kelvin = temperature_kelvin(nominal, location)?;
         resolved.prepare(PreparationKey::Nominal(nominal.to_bits()), || {
-            let mut model = (*raw).clone();
-            let mut warnings = Vec::new();
-            set::setup_model(&mut model, kelvin, &mut warnings)?;
-            Ok(ModelSetupPrototype { model, warnings })
+            Ok(set::prepare_model((*raw).clone(), kelvin))
         })
     }
 
     fn setup(
-        prototype: &ModelSetupPrototype,
+        prototype: &set::PreparedModel,
         inputs: &Inputs,
         noise_analysis: bool,
-    ) -> SpiceResult<SetUp> {
-        let m = prototype.model.clone();
-        let mut warnings = prototype.warnings.clone();
+    ) -> SpiceResult<set::PreparedSetup> {
         let mut h = apply::instance(inputs)?;
         h.dNode = node::D;
         h.gNodeExt = node::G_EXT;
         h.sNode = node::S;
         h.bNode = node::B;
-        let created = set::setup_instance(&m, &mut h, noise_analysis, &mut warnings)?;
-        Ok(SetUp {
-            model: m,
-            instance: h,
-            warnings,
-            created,
-        })
+        Ok(prototype.clone().prepare_instance(h, noise_analysis))
     }
 
     /// `BSIM4temp` at these temperatures (Celsius) on C's structs.
@@ -304,7 +278,7 @@ impl Bsim4 {
         &self,
         temperature: Real,
         nominal: Real,
-        initial: Option<SetUp>,
+        initial: Option<set::PreparedSetup>,
     ) -> SpiceResult<Prepared> {
         let (mut model, mut instance, mut warnings, check) = if let Some(setup) = initial {
             (setup.model, setup.instance, setup.warnings, true)
@@ -1516,14 +1490,16 @@ mod tests {
         let again = Bsim4::model_setup(&resolved, &params, &inst.location, 27.).unwrap();
         assert!(Arc::ptr_eq(&a, &again));
         assert!(!Arc::ptr_eq(&a, &b));
-        assert_ne!(a.model.tnom.to_bits(), b.model.tnom.to_bits());
-        assert!(!a.warnings.is_empty());
-        assert_eq!(a.warnings, b.warnings);
         let inputs = params.instance_parameters(inst, 1.).unwrap();
         let mut first = Bsim4::setup(&a, &inputs, false).unwrap();
+        let different = Bsim4::setup(&b, &inputs, false).unwrap();
         let second = Bsim4::setup(&again, &inputs, false).unwrap();
+        assert_ne!(first.model.tnom.to_bits(), different.model.tnom.to_bits());
+        assert!(!first.warnings.is_empty());
+        assert_eq!(first.warnings, different.warnings);
+        let nominal = first.model.tnom.to_bits();
         first.model.tnom = 0.;
-        assert_eq!(second.model.tnom.to_bits(), a.model.tnom.to_bits());
+        assert_eq!(second.model.tnom.to_bits(), nominal);
         assert_eq!(first.warnings, second.warnings);
     }
 

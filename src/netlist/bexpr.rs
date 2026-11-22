@@ -33,9 +33,9 @@
 //! `.func` calls ([`crate::netlist::elaborate`]); `devices` compiles the resolved
 //! tree into its value-and-derivative evaluator.
 
-use crate::primitives::Real;
+use crate::primitives::{Real, SpiceResult};
 
-use crate::netlist::expr::{ParameterExpression, SourceSpan};
+use crate::netlist::expr::{ParameterExpression, SourceSpan, TreeBudget};
 
 /// A parsed behavioural expression with the text it was written as.
 #[derive(Debug, Clone, PartialEq)]
@@ -284,6 +284,45 @@ pub fn is_builtin_function(name: &str) -> bool {
 pub const SPECIAL_NAMES: &[&str] = &["time", "temper", "hertz", "pi", "e"];
 
 impl BExpr {
+    /// Check a subtree before recursively cloning it at its destination depth.
+    pub(super) fn check_tree(&self, depth: usize, budget: &mut TreeBudget) -> SpiceResult<()> {
+        budget.charge(depth, 1, &self.span.start)?;
+        let mut child = |expr: &Self| expr.check_tree(depth + 1, budget);
+        match &self.kind {
+            BExprKind::Unary { operand, .. } | BExprKind::Group(operand) => child(operand)?,
+            BExprKind::Binary { lhs, rhs, .. } => {
+                child(lhs)?;
+                child(rhs)?;
+            }
+            BExprKind::Ternary {
+                condition,
+                then,
+                otherwise,
+            } => {
+                child(condition)?;
+                child(then)?;
+                child(otherwise)?;
+            }
+            BExprKind::Call { arguments, .. } => {
+                for argument in arguments {
+                    child(argument)?;
+                }
+            }
+            BExprKind::Table(table) => {
+                child(&table.input)?;
+                for (x, y) in &table.points {
+                    child(x)?;
+                    child(y)?;
+                }
+            }
+            BExprKind::Value(value) => {
+                value.root.check_tree(depth + 1, budget)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Visits every node, parents before children.
     pub fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Self)) {
         visitor(self);
