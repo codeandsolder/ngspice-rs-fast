@@ -339,15 +339,12 @@ impl SensitivityKernel for Bsim4Sensitivity<'_> {
     /// `BSIM4setup` on the isolated model and instance, run again: the
     /// defaults, then the node members as C's re-run leaves them.
     fn setup(&self, model: &mut Record, instance: &mut Record) -> SpiceResult<()> {
-        let mut warnings = Vec::new();
-        let mut m = model.bsim4_model()?.clone();
-        set::setup_model(
-            &mut m,
+        let prepared = set::prepare_model(
+            model.bsim4_model()?.clone(),
             self.kelvin(self.context.nominal_temperature)?,
-            &mut warnings,
-        )?;
+        );
         let snapshot = instance.bsim4_instance_mut()?;
-        let mut h = snapshot.instance.clone();
+        let h = snapshot.instance.clone();
         let unset = snapshot.unset;
         let previous = [
             h.dNodePrime,
@@ -356,7 +353,11 @@ impl SensitivityKernel for Bsim4Sensitivity<'_> {
             h.gNodeMid,
             h.qNode,
         ];
-        set::setup_instance(&m, &mut h, self.device.noise_analysis, &mut warnings)?;
+        let set::PreparedSetup {
+            model: m,
+            instance: mut h,
+            ..
+        } = prepared.prepare_instance(h, self.device.noise_analysis);
         // `if (create && field == 0) CKTmkVolt(...) else field = alias;`
         let primes = [
             (node::DP, h.dNode),

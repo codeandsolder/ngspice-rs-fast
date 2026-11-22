@@ -85,6 +85,157 @@ fn rust_name(c_name: &str) -> String {
     }
 }
 
+/// Brace depth of setup source lines, ignoring braces in quoted C strings
+/// and character literals. The source has already had block comments removed.
+fn setup_depths(lines: &[&str]) -> Result<Vec<usize>, String> {
+    let mut depth = 0_usize;
+    let mut depths = Vec::with_capacity(lines.len());
+    let mut quote = None;
+    let mut escaped = false;
+    for line in lines {
+        depths.push(depth);
+        for byte in line.bytes() {
+            if let Some(end) = quote {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == end {
+                    quote = None;
+                }
+            } else {
+                match byte {
+                    b'"' | b'\'' => quote = Some(byte),
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth = depth
+                            .checked_sub(1)
+                            .ok_or("unbalanced BSIM4 setup braces")?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(depths)
+}
+
+/// Whole-identifier member references in one cleaned C source line.
+fn model_members(line: &str) -> impl Iterator<Item = &str> {
+    line.split("model->").skip(1).map(|tail| {
+        let end = tail
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(tail.len());
+        &tail[..end]
+    })
+}
+
+/// Extract only independent model defaults. A literal within a selector
+/// fallback or another conditional branch is not an unconditional fact.
+/// The complete reviewed member count is checked before emitting typed code.
+pub(super) fn independent_defaults(
+    header: &str,
+    setup: &str,
+    facts: &[super::ifparm::LiteralDefault],
+) -> Result<String, String> {
+    let clean = super::ifparm::strip_comments(setup)?;
+    let end = clean
+        .find("for (here = BSIM4instances")
+        .ok_or("missing BSIM4 instance boundary")?;
+    let lines: Vec<_> = clean[..end]
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let depths = setup_depths(&lines)?;
+    let header = super::ifparm::strip_comments(header)?;
+    let model = members(&header, "typedef struct sBSIM4model\n{", "} BSIM4model")?;
+    let mut out = String::from(
+        "\nuse super::fields::Model;\n\n/// Independent given-guarded defaults, extracted from the model-loop body.\n#[rustfmt::skip]\n#[expect(clippy::too_many_lines, reason = \"generated typed field assignments; no handwritten physics\")]\npub(super) fn apply_independent_defaults(m: &mut Model) {\n",
+    );
+    let mut seen = BTreeSet::new();
+    let mut prior_members = BTreeSet::new();
+    for (index, triple) in lines.windows(3).enumerate() {
+        if index > 0 {
+            prior_members.extend(model_members(lines[index - 1]));
+        }
+        // The first statement is a direct child of the outer model loop.
+        // Require a completed predecessor, excluding unbraced nested ifs.
+        if depths[index] != 2
+            || index == 0
+            || !lines[index - 1].ends_with([';', '{', '}'])
+            || triple[2].starts_with("else")
+        {
+            continue;
+        }
+        let Some(given) = triple[0]
+            .strip_prefix("if (!model->")
+            .and_then(|s| s.strip_suffix(')'))
+        else {
+            continue;
+        };
+        let Some((field, literal)) = triple[1]
+            .strip_prefix("model->")
+            .and_then(|s| s.split_once('='))
+        else {
+            continue;
+        };
+        let field = field.trim();
+        let Some(value) = literal
+            .trim()
+            .strip_suffix(';')
+            .and_then(|s| s.trim().parse::<f64>().ok())
+        else {
+            continue;
+        };
+        // Hoisting is safe only if the destination and controlling given
+        // bit have not been referenced earlier. New dependencies require review.
+        if prior_members.contains(field) || prior_members.contains(given) {
+            return Err(format!("BSIM4 default no longer independent: {field}"));
+        }
+        let fact = facts
+            .iter()
+            .find(|fact| fact.field == field && fact.given == given)
+            .ok_or_else(|| {
+                format!("BSIM4 independent default without verified schema fact: {field}")
+            })?;
+        if value.to_bits() != fact.value.to_bits() || !seen.insert(field) {
+            return Err(format!("inconsistent BSIM4 independent default: {field}"));
+        }
+        let member = model
+            .iter()
+            .find(|member| member.c_name == field)
+            .ok_or_else(|| format!("missing BSIM4 member {field}"))?;
+        let literal = match member.kind {
+            "f64" => fact.formatted(),
+            "i32" => literal
+                .trim()
+                .strip_suffix(';')
+                .ok_or("missing semicolon")?
+                .trim()
+                .parse::<i32>()
+                .map_err(|e| e.to_string())?
+                .to_string(),
+            kind => return Err(format!("unexpected BSIM4 literal destination type {kind}")),
+        };
+        writeln!(
+            out,
+            "    if !m.{} {{ m.{} = {literal}; }}",
+            rust_name(given),
+            rust_name(field)
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if seen.len() != 733 {
+        return Err(format!(
+            "BSIM4 independent default count changed: {} (expected 733); review dependency ordering",
+            seen.len()
+        ));
+    }
+    out.push_str("}\n");
+    Ok(out)
+}
+
 fn emit_struct(
     out: &mut String,
     name: &str,

@@ -74,6 +74,20 @@ fn cards() -> Vec<(&'static str, String)> {
                 .into(),
         ),
         (
+            "combined leakage and repeated aliases",
+            ".model nn nmos level=14 version=4.82 mobmod=6 vtho=.50 vth0=.51 \\
+             aigsd=.013 aigs=.012 aigd=.011 laigs=2e-12 laigd=3e-12 laigsd=1e-12 \\
+             waigsd=1e-12 paigsd=1e-19 keta=-.03 drout=.6 lint=1e-9 dlcig=2e-9"
+                .into(),
+        ),
+        (
+            "separate leakage and reversed aliases",
+            ".model nn pmos level=54 version=4.80 mobmod=5 vth0=-.51 vtho=-.50 \\
+             aigs=.010 aigd=.009 laigs=2e-12 laigd=3e-12 waigsd=1e-12 paigsd=1e-19 \\
+             agidl=1e-9 lagidl=1e-12 wagidl=1e-12 pagidl=1e-19 lint=1e-9"
+                .into(),
+        ),
+        (
             "clamps",
             ".model nn nmos level=14 mobmod=6 capmod=2 tempmod=1 version=4.8.0 \
              pbs=0.05 ijthsrev=-1 bvs=-2 xjbvs=-1"
