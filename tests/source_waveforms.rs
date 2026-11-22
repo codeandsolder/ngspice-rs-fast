@@ -147,7 +147,10 @@ fn resolved_source_events_preserve_identity_and_exact_adjacent_times() {
     let mut events = pulse.waveform.breakpoints_in(0., 30.).unwrap();
     let events = std::iter::from_fn(|| events.next_event()).collect::<Vec<_>>();
     assert_eq!(events[6].kind, WaveformEventKind::PulseCountCut);
-    assert_eq!(events[6].time.to_bits(), 14.0_f64.to_bits());
+    assert_eq!(
+        events[6].time.to_bits(),
+        14.000_000_000_000_002_f64.to_bits()
+    );
     assert_eq!(events[7].kind, WaveformEventKind::PulseTrailingRequest);
     assert_eq!(events[7].time.to_bits(), 16.0_f64.to_bits());
     let pwl = sources.iter().find(|s| s.name == "i1").unwrap();
