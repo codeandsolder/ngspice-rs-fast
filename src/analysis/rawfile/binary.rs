@@ -124,6 +124,14 @@ pub(super) fn read_row(
             return Ok(false);
         }
         let mut bytes = &available[..count];
+        // The ordinary in-memory or fully buffered row needs no fragment
+        // arithmetic or local copy at all.
+        if filled == 0 && count == remaining {
+            decode_cells(bytes, flags, order, row);
+            input.consume(count);
+            *consumed += count;
+            return Ok(true);
+        }
         if filled != 0 {
             let take = (width - filled).min(bytes.len());
             tail[filled..filled + take].copy_from_slice(&bytes[..take]);
@@ -161,21 +169,25 @@ const BLOCK_BYTES: usize = 32 * 1024;
 #[derive(Debug, Default)]
 pub(super) struct Encoder {
     bytes: Vec<u8>,
+    used: usize,
 }
 
 impl Encoder {
     pub(super) const fn new() -> Self {
-        Self { bytes: Vec::new() }
+        Self {
+            bytes: Vec::new(),
+            used: 0,
+        }
     }
 
     /// Emit a full or final partial block. On failure, discard that block
     /// rather than retrying a partially written prefix on a subsequent call.
     pub(super) fn flush(&mut self, out: &mut impl Write) -> io::Result<()> {
-        if self.bytes.is_empty() {
+        if self.used == 0 {
             return Ok(());
         }
-        let result = out.write_all(&self.bytes);
-        self.bytes.clear();
+        let result = out.write_all(&self.bytes[..self.used]);
+        self.used = 0;
         result
     }
 
@@ -190,18 +202,20 @@ impl Encoder {
         if point.is_empty() {
             return Ok(());
         }
-        if self.bytes.capacity() == 0 {
-            self.bytes.reserve_exact(BLOCK_BYTES);
+        if self.bytes.is_empty() {
+            // Initialize the storage once; every active word is subsequently
+            // overwritten, so neither a row nor a flush clears its bytes.
+            self.bytes.resize(BLOCK_BYTES, 0);
         }
         let flags = plot.flags();
         let width = value_width(flags);
         let mut offset = 0;
         while offset < point.len() {
-            let count = ((BLOCK_BYTES - self.bytes.len()) / width).min(point.len() - offset);
+            let count = ((BLOCK_BYTES - self.used) / width).min(point.len() - offset);
             let end = offset + count;
-            let start = self.bytes.len();
-            self.bytes.resize(start + count * width, 0);
-            let (words, _) = self.bytes[start..].as_chunks_mut::<DOUBLE_BYTES>();
+            let start = self.used;
+            self.used += count * width;
+            let (words, _) = self.bytes[start..self.used].as_chunks_mut::<DOUBLE_BYTES>();
             let values = &point[offset..end];
             match flags {
                 PlotFlags::Real => {
@@ -221,7 +235,7 @@ impl Encoder {
                     }
                 }
             }
-            if self.bytes.len() == BLOCK_BYTES {
+            if self.used == BLOCK_BYTES {
                 self.flush(out)?;
             }
             offset = end;
@@ -270,7 +284,7 @@ mod tests {
         let mut builder = Plot::builder("p", "AC Analysis", flags);
         for i in 0..columns {
             let name = format!("v{i}");
-            builder.push_variable(if i % 2 == 0 {
+            builder.push_variable(if !flags.is_complex() || i % 2 == 0 {
                 Variable::new(name, "voltage")
             } else {
                 Variable::complex(name, "voltage")
@@ -364,7 +378,17 @@ mod tests {
                             )
                             .unwrap()
                         );
-                        assert_eq!(reference(&plot, &decoded, order), expected);
+                        for ((value, original), variable) in
+                            decoded.iter().zip(&row).zip(plot.variables())
+                        {
+                            assert_eq!(value.re.to_bits(), original.re.to_bits());
+                            let im = if flags.is_complex() && !variable.is_real {
+                                original.im
+                            } else {
+                                0.
+                            };
+                            assert_eq!(value.im.to_bits(), Real::to_bits(im));
+                        }
                     }
                     assert_eq!(consumed, expected.len() * 2);
                     assert_eq!(input, b"Title: next\n");
@@ -380,6 +404,12 @@ mod tests {
         let order = BinaryByteOrder::BigEndian;
         let expected = reference(&plot, &row, order);
         let mut encoder = Encoder::new();
+        let mut zero = Fragments::default();
+        let error = encoder
+            .write_row(&mut zero, &plot, &row, order)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(encoder.used, 0);
         for stop in [0, 1, 15, BLOCK_BYTES - 1, BLOCK_BYTES, expected.len() - 1] {
             let mut out = Fragments {
                 limit: 31,
@@ -393,7 +423,7 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.to_string(), "injected write failure");
             assert_eq!(out.bytes, expected[..stop]);
-            assert!(encoder.bytes.is_empty());
+            assert_eq!(encoder.used, 0);
             // Higher-level transactions poison on errors; even a directly
             // reused encoder must not replay any partially written block.
             let mut next = Vec::new();
