@@ -33,7 +33,9 @@ observation does not turn a different valid observation into a NaN.
   retaining two rows of only the query operand columns. Results stay in
   request order, including duplicate names/targets. Dispatch work is
   linear in accepted rows and targets (plus validation of exact duplicate
-  groups), not their Cartesian product. Deck measurements retain the
+  groups), not their Cartesian product. When the last target in
+  the traversal direction is passed, the query cursor stops copying rows;
+  axis validation still covers every accepted coordinate. Deck measurements retain the
   separate nondecreasing-axis policy of the retained evaluator.
 - Static measurements: extrema (including tie and time policy), AVG,
   INTEG, RMS, FIND, WHEN, TRIG/TARG, derivatives and event-triggered
