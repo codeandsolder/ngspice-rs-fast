@@ -7,6 +7,7 @@ use super::{
     SensitivityMode, SensitivityParameter as P, SensitivityRecord,
 };
 use crate::devices::IndependentSource;
+use crate::devices::sources::{AcExcitation, AcInput};
 use crate::primitives::{Complex, Real, SpiceResult};
 
 /// `VSRCpTable` entries `set_param()` accepts (`portnum` is an integer).
@@ -28,46 +29,37 @@ const CURRENT: &[P] = &[
     P::ac("acphase"),
 ];
 
-/// What the source card gave.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct SourceInputs {
-    /// An explicit DC value (`VSRCdcGiven`).
-    pub dc_given: bool,
-    /// A transient function (`VSRCfuncTGiven`).
-    pub function_given: bool,
-    /// Any AC setter (`VSRCacGiven`), with the magnitude and phase in degrees.
-    pub ac: Option<(Real, Real)>,
-}
-
-/// An independent source's `.sens` description.
+/// An independent source's replay, borrowing its actual excitation state.
 #[derive(Debug)]
 pub(in crate::devices) struct SourceSensitivity<'a> {
     source: &'a IndependentSource,
-    voltage: bool,
-    /// The card's DC value (the function's time-zero value when not given).
-    level: Real,
-    inputs: SourceInputs,
 }
 
 impl<'a> SourceSensitivity<'a> {
-    pub(crate) const fn new(
-        source: &'a IndependentSource,
-        voltage: bool,
-        level: Real,
-        inputs: SourceInputs,
-    ) -> Self {
-        Self {
-            source,
-            voltage,
-            level,
-            inputs,
+    pub(in crate::devices) const fn new(source: &'a IndependentSource) -> Self {
+        Self { source }
+    }
+
+    fn ac_input(instance: &SensitivityRecord) -> SpiceResult<Option<AcInput>> {
+        if !instance.given("ac") {
+            return Ok(None);
         }
+        Ok(Some(AcInput {
+            magnitude: instance
+                .given("acmag")
+                .then(|| instance.value("acmag"))
+                .transpose()?,
+            phase: instance
+                .given("acphase")
+                .then(|| instance.value("acphase"))
+                .transpose()?,
+        }))
     }
 }
 
 impl DeviceSensitivity for SourceSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
-        if self.voltage {
+        if self.source.voltage {
             SensitivityFamily::VoltageSource
         } else {
             SensitivityFamily::CurrentSource
@@ -83,19 +75,31 @@ impl DeviceSensitivity for SourceSensitivity<'_> {
     }
 
     fn instance_parameters(&self) -> &'static [P] {
-        if self.voltage { VOLTAGE } else { CURRENT }
+        if self.source.voltage {
+            VOLTAGE
+        } else {
+            CURRENT
+        }
     }
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
-        let i = &self.inputs;
-        let (mag, phase) = i.ac.unwrap_or((0., 0.));
-        let given = i.ac.is_some();
+        let dc = self.source.dc;
+        let ac = self.source.ac.input;
+        let input = ac.unwrap_or_default();
         let mut instance = SensitivityRecord::new()
-            .with("dc", if i.dc_given { self.level } else { 0. }, i.dc_given)
-            .with("acmag", mag, given)
-            .with("acphase", phase, given)
-            .with("ac", 0., given)
-            .with("m", 1., false)
+            .with("dc", if dc.given() { dc.value() } else { 0. }, dc.given())
+            .with(
+                "acmag",
+                input.magnitude.unwrap_or(0.),
+                input.magnitude.is_some(),
+            )
+            .with("acphase", input.phase.unwrap_or(0.), input.phase.is_some())
+            .with("ac", 0., ac.is_some())
+            .with(
+                "m",
+                self.source.multiplier.unwrap_or(1.),
+                self.source.multiplier.is_some(),
+            )
             .with("z0", 0., false)
             .with("pwr", 0., false)
             .with("freq", 0., false)
@@ -125,28 +129,21 @@ impl DeviceSensitivity for SourceSensitivity<'_> {
     }
 
     /// `VSRCtemp`/`ISRCtemp`: the AC defaults, the phasor and the default `m`.
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "VSRCtemp and ISRCtemp convert phase by multiplying by pi before dividing by 180"
-    )]
     fn temperature(
         &self,
         _model: &mut SensitivityRecord,
         instance: &mut SensitivityRecord,
     ) -> SpiceResult<()> {
-        if instance.given("ac") && !instance.given("acmag") {
-            instance.store("acmag", 1.)?;
-        }
-        if instance.given("ac") && !instance.given("acphase") {
-            instance.store("acphase", 0.)?;
-        }
+        let input = Self::ac_input(instance)?;
+        let (mag, phase) = input.map_or((0., 0.), AcInput::defaults);
+        instance.store("acmag", mag)?;
+        instance.store("acphase", phase)?;
         if !instance.given("m") {
             instance.store("m", 1.)?;
         }
-        let radians = instance.value("acphase")? * std::f64::consts::PI / 180.0;
-        let magnitude = instance.value("acmag")?;
-        instance.store("acreal", magnitude * radians.cos())?;
-        instance.store("acimag", magnitude * radians.sin())
+        let ac = input.map_or(Ok(Complex::ZERO), AcInput::resolve)?;
+        instance.store("acreal", ac.re)?;
+        instance.store("acimag", ac.im)
     }
 
     /// The DC load drives the DC value when given, otherwise the transient
@@ -161,16 +158,20 @@ impl DeviceSensitivity for SourceSensitivity<'_> {
         _mode: SensitivityMode,
     ) -> SpiceResult<SensitivityLoad> {
         let i = current.instance;
-        let dc = if i.given("dc") || !self.inputs.function_given {
+        let dc = if i.given("dc") || !self.source.function_given {
             i.value("dc")?
         } else {
-            self.level
+            self.source.dc.value()
         };
-        let ac = Complex::new(i.value("acreal")?, i.value("acimag")?);
-        let m = if self.voltage { 1. } else { i.value("m")? };
+        let ac = AcExcitation {
+            input: Self::ac_input(i)?,
+            phasor: Complex::new(i.value("acreal")?, i.value("acimag")?),
+        };
+        let multiplier = (!self.source.voltage && i.given("m"))
+            .then(|| i.value("m"))
+            .transpose()?;
         Ok(SensitivityLoad::Replacement(Box::new(
-            self.source
-                .sensitivity_copy(m * dc, Complex::new(m * ac.re, m * ac.im))?,
+            self.source.sensitivity_copy(dc, ac, multiplier)?,
         )))
     }
 }

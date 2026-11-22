@@ -2,6 +2,7 @@
 use crate::devices::models::ModelFamily;
 use crate::devices::passive::PassiveKind;
 use crate::devices::rlc::ResistorNoise;
+use crate::devices::sources::SourceInputs;
 use crate::devices::{
     AmSpec, Capacitor, Device, ExpSpec, FunctionSpec, IndependentSource, Inductor, PulseSpec,
     PwlSource, Resistor, SffmSpec, SineSpec, Waveform,
@@ -13,7 +14,7 @@ use crate::netlist::ast::{
 use crate::netlist::source::{Deck, LogicalLine};
 use crate::netlist::{Parser, RawCard};
 use crate::primitives::{
-    Complex, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
+    NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
 };
 
 /// Designators [`instantiate`] builds from the card alone (the registry's
@@ -324,23 +325,14 @@ fn instantiate_passive(
 }
 
 struct SourceSetters {
-    value: Option<Real>,
-    mag: Real,
-    phase: Real,
-    ac_given: bool,
-    waveform: Option<Waveform>,
+    inputs: SourceInputs,
     port: PortSetters,
     distortion: [Option<crate::devices::distortion::DistortionInput>; 2],
 }
 
 fn parse_source_setters(instance: &DeviceInstance) -> SpiceResult<SourceSetters> {
-    let mut value = None;
-    let mut mag = 0.;
-    let mut phase: f64 = 0.;
-    // C `VSRCacGiven`/`ISRCacGiven`: any AC setter, even `ac 0`.
-    let mut ac_given = false;
+    let mut inputs = SourceInputs::default();
     // C applies waveform setters in order, so the last one wins.
-    let mut waveform = None;
     // PWL `td=` (any order) and `r=` (applies to the PWL already set), as the
     // ordered VSRC_TD/VSRC_R setters of vsrcpar.c/isrcpar.c.
     let mut pwl_delay: Option<(f64, SourceLoc)> = None;
@@ -361,7 +353,7 @@ fn parse_source_setters(instance: &DeviceInstance) -> SpiceResult<SourceSetters>
                     location: Some(at.clone()),
                 });
             }
-            waveform = Some(source_waveform(&p.name, source, &p.location)?);
+            inputs.waveform = Some(source_waveform(&p.name, source, &p.location)?);
             // A later waveform setter replaces C's PORT function type.
             port.power_function = None;
             continue;
@@ -397,12 +389,10 @@ fn parse_source_setters(instance: &DeviceInstance) -> SpiceResult<SourceSetters>
         let number = scalar_number(p)?;
         match p.name.as_str() {
             "acmag" => {
-                mag = number;
-                ac_given = true;
+                inputs.ac.get_or_insert_default().magnitude = Some(number);
             }
             "acphase" => {
-                phase = number;
-                ac_given = true;
+                inputs.ac.get_or_insert_default().phase = Some(number);
             }
             "distof1mag" | "distof2mag" | "distof1phase" | "distof2phase" => {
                 let slot = &mut distortion[usize::from(p.name.starts_with("distof2"))];
@@ -425,21 +415,17 @@ fn parse_source_setters(instance: &DeviceInstance) -> SpiceResult<SourceSetters>
                 port.set(&p.name, number, &p.location)?;
             }
             "r" => {
-                validate_pwl_repeat(instance, p, waveform.as_ref(), number)?;
+                validate_pwl_repeat(instance, p, inputs.waveform.as_ref(), number)?;
                 pwl_repeat = Some((number, p.location.clone()));
             }
-            _ => value = Some(number),
+            _ => inputs.dc = Some(number),
         }
     }
     if pwl_delay.is_some() || pwl_repeat.is_some() {
-        waveform = Some(pwl_options(waveform, pwl_delay, pwl_repeat)?);
+        inputs.waveform = Some(pwl_options(inputs.waveform, pwl_delay, pwl_repeat)?);
     }
     Ok(SourceSetters {
-        value,
-        mag,
-        phase,
-        ac_given,
-        waveform,
+        inputs,
         port,
         distortion,
     })
@@ -476,24 +462,10 @@ fn instantiate_source(
     nodes: &mut NodeTable,
 ) -> SpiceResult<Box<dyn Device>> {
     let SourceSetters {
-        value,
-        mag,
-        phase,
-        ac_given,
-        waveform,
+        inputs,
         port,
         distortion,
     } = parse_source_setters(instance)?;
-    let dc_given = value.is_some();
-    let waveform_given = waveform.is_some();
-    // An explicit DC value is kept apart from time forcing. Without one, DC
-    // analyses see the waveform's time-zero level (vsrcload.c evaluates the
-    // transient function at time 0 when DC is not given).
-    let value = match (value, &waveform) {
-        (Some(v), _) => v,
-        (None, Some(w)) => w.time_zero()?,
-        (None, None) => 0.,
-    };
     // Intern in place and roll back on failure, so the caller's node table is
     // untouched by an error without cloning it per instance.
     append_nodes(nodes, |new_nodes| {
@@ -503,34 +475,17 @@ fn instantiate_source(
         ];
         let power_function = port.power_function.is_some();
         let rf = port.finish(instance, new_nodes)?;
-        let tone = power_function.then(|| {
-            rf.as_ref().map_or((0., 0.), |p| {
-                (
-                    // vsrctemp.c: sqrt(VSRCportPower * 4.0 * VSRCportZ0).
-                    (p.power * 4. * p.z0).sqrt(),
-                    2. * std::f64::consts::PI * p.frequency,
-                )
-            })
-        });
+        // Real port coefficients are resolved by with_port; a nonport
+        // PORT setter selects the C zero-amplitude tone.
+        let tone = (power_function && rf.is_none()).then_some((0., 0.));
         let device: Box<dyn Device> = {
-            let source = IndependentSource::new(
-                &instance.name,
+            let source = IndependentSource::from_inputs(
+                instance.name.clone(),
                 terminals,
                 instance.designator == 'v',
-                value,
-                Complex::new(
-                    mag * phase.to_radians().cos(),
-                    mag * phase.to_radians().sin(),
-                ),
-                waveform.unwrap_or(Waveform::Constant(value)),
+                inputs,
             )?
             .with_power_tone(tone)
-            .with_ac_given(ac_given)
-            .with_sensitivity_inputs(crate::devices::sensitivity::SourceInputs {
-                dc_given,
-                function_given: waveform_given,
-                ac: ac_given.then_some((mag, phase)),
-            })
             .with_distortion(distortion[0], distortion[1])?;
             // Only V cards accept port setters (parser and allow-list above).
             match rf {

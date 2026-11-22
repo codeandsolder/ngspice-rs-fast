@@ -97,9 +97,7 @@ impl Waveform {
                     && p.windows(2).all(|w| w[0].0 < w[1].0)
             }
             Self::PulseDefaults(spec) => {
-                // Resolve against unit timing: checks everything that does not
-                // depend on the analysis (finiteness, prefix, delay sign).
-                spec.resolve(&TransientTiming::new(1., 1.)?)?;
+                spec.validate()?;
                 true
             }
             // Pulse and PWL/function values are only constructed through

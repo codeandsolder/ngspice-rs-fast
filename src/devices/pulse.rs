@@ -86,12 +86,9 @@ pub struct PulseSpec {
     pub count: Option<Real>,
 }
 impl PulseSpec {
-    /// Resolves C's defaults (`vsrcload.c`, `case PULSE`) for one transient run.
-    ///
-    /// # Errors
-    /// Nonfinite fields, a gap in the supplied prefix, negative delay, or
-    /// resolved timing that fails [`Pulse::new`].
-    pub fn resolve(&self, timing: &TransientTiming) -> SpiceResult<Pulse> {
+    /// Validate input-only constraints and return the number of optional
+    /// coefficients. Timing-dependent sums/products are checked at resolve.
+    pub(super) fn validate(&self) -> SpiceResult<usize> {
         let optional = [
             self.delay,
             self.rise,
@@ -100,13 +97,38 @@ impl PulseSpec {
             self.period,
             self.count,
         ];
-        let given = optional.iter().take_while(|v| v.is_some()).count();
-        if optional[given..].iter().any(Option::is_some) {
-            return Err(invalid("optional fields must be a contiguous prefix"));
+        let given =
+            crate::devices::functions::prefix("PULSE", &[self.initial, self.pulsed], &optional)?;
+        if self.delay.is_some_and(|delay| delay < 0.) {
+            return Err(invalid(
+                "delay/rise/fall/width must be nonnegative and period positive",
+            ));
         }
-        if optional.iter().flatten().any(|v| !v.is_finite()) {
-            return Err(invalid("nonfinite field"));
+        let explicit_rise = self.rise.unwrap_or(0.).max(0.);
+        let explicit_width = self.width.unwrap_or(0.).max(0.);
+        let explicit_fall = self.fall.unwrap_or(0.).max(0.);
+        if !(self.pulsed - self.initial).is_finite()
+            || !(explicit_rise + explicit_width + explicit_fall).is_finite()
+        {
+            return Err(invalid("level difference or edge sum overflows"));
         }
+        if let (Some(count), Some(period)) = (self.count, self.period)
+            && count > 0.
+            && period > 0.
+            && !(count * period).is_finite()
+        {
+            return Err(invalid("pulse count times period overflows"));
+        }
+        Ok(given)
+    }
+
+    /// Resolves C's defaults (vsrcload.c, case PULSE) for one transient run.
+    ///
+    /// # Errors
+    /// Nonfinite fields, a gap in the supplied prefix, negative delay, or
+    /// resolved timing that fails the validating pulse constructor.
+    pub fn resolve(&self, timing: &TransientTiming) -> SpiceResult<Pulse> {
+        let given = self.validate()?;
         let positive_or = |value: Option<Real>, default: Real| match value {
             Some(v) if v > 0. => v,
             _ => default,

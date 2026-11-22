@@ -37,7 +37,6 @@ pub(super) use controlled::ControlledSensitivity;
 pub(super) use misc::{BehaviouralSensitivity, MutualSensitivity, SwitchSensitivity};
 pub(super) use reactive::{ReactiveKind, ReactiveSensitivity};
 pub(super) use res::ResistorSensitivity;
-pub use source::SourceInputs;
 pub(super) use source::SourceSensitivity;
 
 use crate::devices::{Device, LinearContext, StampContext};
