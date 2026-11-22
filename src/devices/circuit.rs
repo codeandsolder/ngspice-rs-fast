@@ -603,6 +603,28 @@ impl Circuit {
         &self.devices
     }
 
+    /// Resolve the effective source timelines in a finalized circuit, without
+    /// constructing a linear system or re-elaborating a deck. Expanded
+    /// subcircuit names and the source setter/PORT ordering are retained.
+    /// Each yielded result can fail when analysis-specific defaults are invalid.
+    pub fn source_timelines(
+        &self,
+        timing: crate::devices::TransientTiming,
+    ) -> impl Iterator<Item = SpiceResult<crate::devices::SourceTimeline<'_>>> + '_ {
+        self.devices.iter().filter_map(move |device| {
+            let (kind, waveform) = device.independent_waveform()?;
+            Some(
+                waveform
+                    .resolve(&timing)
+                    .map(|waveform| crate::devices::SourceTimeline {
+                        name: device.name(),
+                        kind,
+                        waveform,
+                    }),
+            )
+        })
+    }
+
     /// The device instances, mutable, so an analysis can refresh them.
     pub fn devices_mut(&mut self) -> &mut [Box<dyn Device>] {
         // A replaced device may stamp other positions.

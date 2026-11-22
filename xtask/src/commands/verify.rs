@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::Path;
 
-use ngspice_rs::analysis::{AnalysisInput, AnalysisPlan, RawFile, RunConfig};
+use ngspice_rs::analysis::{AnalysisPlan, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::primitives::AnalysisKind;
 
@@ -1988,7 +1988,17 @@ fn run_deck(root: &Path, path: &Path, fixture: &Supported) -> Result<String, Str
         ));
     }
     let config = RunConfig::from_netlist(&netlist).map_err(|e| e.to_string())?;
-    let (request, got) = run_card(&netlist, &config, &netlist.analyses[0], &[])?;
+    let request = config
+        .plan_for(&netlist.analyses[0])
+        .map_err(|error| error.to_string())?;
+    let (mut plots, circuit) = run_plan_plots(&netlist, &config, &request, None)?;
+    if plots.len() != 1 {
+        return Err(format!(
+            "expected one Rust plot, the driver produced {} (register multi-plot analyses as batch fixtures)",
+            plots.len()
+        ));
+    }
+    let got = plots.remove(0);
     if request.kind() != fixture.kind {
         return Err(format!(
             "registry expects {:?}, deck requests {:?}",
@@ -2012,7 +2022,7 @@ fn run_deck(root: &Path, path: &Path, fixture: &Supported) -> Result<String, Str
             offsets,
         },
     };
-    compare_plot(&gate, &netlist, &request, &got, &want.plots[0].plot)
+    compare_plot(&gate, &circuit, &request, &got, &want.plots[0].plot)
 }
 
 /// Every plot of a multi-analysis fixture, in batch order, against the
@@ -2047,7 +2057,6 @@ fn batch_result(root: &Path, path: &Path, fixture: &Batch) -> Result<Vec<String>
         let request = &plans[entry.card_index];
         let (plots, circuit) = run_plan_plots(&netlist, &config, request, previous.as_ref())
             .map_err(|error| format!("{}: {error}", entry.plot_name))?;
-        previous = Some(circuit);
         let own: Vec<&str> = entry.plot_names().collect();
         if plots.len() != own.len() {
             return Err(format!(
@@ -2072,61 +2081,13 @@ fn batch_result(root: &Path, path: &Path, fixture: &Batch) -> Result<Vec<String>
                     got.plotname, want.plot.plotname
                 ));
             }
-            let detail = compare_plot(&stage.gate, &netlist, request, got, &want.plot)
+            let detail = compare_plot(&stage.gate, &circuit, request, got, &want.plot)
                 .map_err(|error| format!("{name}: {error}"))?;
             details.push(format!("{name} ({}): {detail}", got.plotname));
         }
+        previous = Some(circuit);
     }
     Ok(details)
-}
-
-/// Runs one single-plot analysis card through [`run_card_plots`].
-fn run_card(
-    netlist: &ngspice_rs::netlist::ast::Netlist,
-    config: &RunConfig,
-    card: &ngspice_rs::netlist::ast::AnalysisCard,
-    extra: &[&str],
-) -> Result<(AnalysisPlan, ngspice_rs::analysis::Plot), String> {
-    let (request, mut plots, _) = run_card_plots(netlist, config, card, extra, None)?;
-    if plots.len() != 1 {
-        return Err(format!(
-            "expected one Rust plot, the driver produced {} (register multi-plot analyses \
-             as batch fixtures)",
-            plots.len()
-        ));
-    }
-    Ok((request, plots.remove(0)))
-}
-
-/// Runs one analysis card through the production driver and projects every
-/// plot it produces (`.noise` produces two) onto C's default save set and
-/// naming. `extra` tokens are appended to the request after the deck's own
-/// settings; `previous` supplies the batch's prior circuit, inherited exactly
-/// as `spice-rs simulate` inherits it.
-fn run_card_plots(
-    netlist: &ngspice_rs::netlist::ast::Netlist,
-    config: &RunConfig,
-    card: &ngspice_rs::netlist::ast::AnalysisCard,
-    extra: &[&str],
-    previous: Option<&ngspice_rs::devices::Circuit>,
-) -> Result<
-    (
-        AnalysisPlan,
-        Vec<ngspice_rs::analysis::Plot>,
-        ngspice_rs::devices::Circuit,
-    ),
-    String,
-> {
-    if !card.expressions.is_empty() {
-        return Err("braced analysis arguments are not supported in verification fixtures".into());
-    }
-    let mut request: AnalysisInput = AnalysisInput::from(card);
-    request
-        .arguments
-        .extend(extra.iter().map(|token| (*token).to_owned()));
-    let request = config.plan(request).map_err(|e| e.to_string())?;
-    let (plots, circuit) = run_plan_plots(netlist, config, &request, previous)?;
-    Ok((request, plots, circuit))
 }
 
 fn run_plan_plots(
@@ -2239,7 +2200,7 @@ fn load_golden(root: &Path, name: &str) -> Result<RawFile, String> {
 /// Compares one Rust plot with one C plot under `gate`.
 fn compare_plot(
     gate: &Gate,
-    netlist: &ngspice_rs::netlist::ast::Netlist,
+    circuit: &ngspice_rs::devices::Circuit,
     request: &AnalysisPlan,
     got: &ngspice_rs::analysis::Plot,
     want: &ngspice_rs::analysis::Plot,
@@ -2262,7 +2223,9 @@ fn compare_plot(
         Gate::Transient(tolerance) => {
             let transient = request.transient().ok_or("expected a transient plan")?;
             let (step, final_time) = (transient.step(), transient.stop());
-            let mut breakpoints = tran::breakpoints(netlist, step, final_time)?;
+            let timing = ngspice_rs::devices::TransientTiming::new(step, final_time)
+                .map_err(|e| e.to_string())?;
+            let mut breakpoints = tran::breakpoints(circuit, &timing)?;
             if !offsets.is_empty() {
                 breakpoints = tran::echoes(&breakpoints, offsets, final_time)?;
             }
