@@ -91,3 +91,35 @@ costs. Host load is shared; these timings isolate the output stage,
 not the circuit solver. Run each ignored benchmark separately with
 `--exact --ignored --nocapture` on the test executable and profile
 heap allocations with `valgrind --tool=dhat`.
+
+### Indexed direct-coordinate dispatch
+
+Acer, 2026-11-22: native optimized dev profile, pinned nightly and
+managed sccache. Compare commit `54e7845` (direction-independent
+individual query scans) with `db39d74` (coordinate cursor). Each plot
+has 50,001 accepted rows and 65 raw columns; the requested operands span
+1–64 distinct columns. Five alternating process CPU measurements after
+warmup, medians below. Candidate repetition counts vary across cases,
+not between variants; includes constructing rows and reducing/finishing
+the scenario, excludes actual circuit solving.
+
+| Queries | Raw operand columns | Candidates | Before (ms) | Cursor (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 1 | 20 | 34.505 | 35.180 |
+| 2 | 1 | 20 | 47.834 | 37.424 |
+| 16 | 4 | 10 | 122.666 | 24.490 |
+| 64 | 64 | 4 | 194.140 | 42.723 |
+| 256 | 1 | 3 | 517.413 | 7.564 |
+| 2,048 | 8 | 1 | 1,430.632 | 6.473 |
+
+All checksum strings match for both variants and all repetitions. The
+single-query case requests the initial sample and is effectively
+unchanged; the largest case is 221x faster. The cursor retains two
+compact operand rows, plus per-target result states. It has no
+accepted-row history and does not skip subsequent physical-axis
+validation after all targets are dispatched. Exact-coordinate groups
+still require all their accepted samples to agree.
+
+Probe source `query_batch.rs`, link script, timing script and raw
+logs are in the campaign evidence folder
+`logs/worker-arch-1122-b6d9-issue114/probe/`.
