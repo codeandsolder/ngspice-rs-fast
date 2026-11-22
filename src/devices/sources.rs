@@ -738,7 +738,8 @@ mod tests {
 
     #[test]
     fn port_accumulation_rebuilds_from_predecessor_not_previous_result() {
-        let original = Waveform::Pwl(vec![(0., 1.), (1., 2.)]);
+        let original =
+            Waveform::Pwl(crate::devices::PwlSource::plain(vec![(0., 1.), (1., 2.)]).unwrap());
         let mut source = IndependentSource::new(
             "v1",
             [NodeId::new(1), NodeId::GROUND],

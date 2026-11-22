@@ -1,4 +1,7 @@
 //! Immutable linear MNA assembly, distinct from timestep-dependent companions.
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
+
 use crate::devices::MnaUnknowns;
 use crate::devices::functions::{FunctionSpec, PwlSource, SourceFunction};
 use crate::devices::pulse::{Pulse, PulseSpec, TransientTiming};
@@ -58,16 +61,14 @@ pub enum Waveform {
         /// Jump time.
         time: Real,
     },
-    /// Continuous piecewise linear points, held constant outside the range.
-    Pwl(Vec<(Real, Real)>),
+    /// Validated PWL knots, with optional C delay and repetition.
+    Pwl(PwlSource),
     /// A fully specified periodic pulse; see [`Pulse`].
     Pulse(Pulse),
     /// A PULSE as written, with C's analysis-dependent defaults still pending.
     /// [`LinearSystem::bind_transient_timing`] (or [`Waveform::resolve`]) turns
     /// it into [`Waveform::Pulse`]; evaluating it earlier is an error.
     PulseDefaults(PulseSpec),
-    /// PWL with C's `td=` delay and optional `r=` repetition; see [`PwlSource`].
-    PwlSource(PwlSource),
     /// A fully specified SIN/EXP/SFFM/AM; see [`SourceFunction`].
     Function(SourceFunction),
     /// SIN/EXP/SFFM/AM as written, with C's analysis-dependent defaults
@@ -90,19 +91,13 @@ impl Waveform {
                 after,
                 time,
             } => before.is_finite() && after.is_finite() && time.is_finite() && *time >= 0.,
-            Self::Pwl(p) => {
-                !p.is_empty()
-                    && p.iter()
-                        .all(|(t, v)| t.is_finite() && *t >= 0. && v.is_finite())
-                    && p.windows(2).all(|w| w[0].0 < w[1].0)
-            }
             Self::PulseDefaults(spec) => {
                 spec.validate()?;
                 true
             }
             // Pulse and PWL/function values are only constructed through
             // validating constructors, so they need no further checks here.
-            Self::Pulse(_) | Self::PwlSource(_) | Self::Function(_) => true,
+            Self::Pulse(_) | Self::Pwl(_) | Self::Function(_) => true,
             Self::FunctionDefaults(spec) => {
                 spec.validate()?;
                 true
@@ -190,22 +185,8 @@ impl Waveform {
                 let before_jump = if left { t <= *time } else { t < *time };
                 if before_jump { *before } else { *after }
             }
-            Self::Pwl(p) => {
-                if t <= p[0].0 {
-                    return Ok(p[0].1);
-                }
-                // vsrcload.c, `case PWL`, in C's operation order.
-                for w in p.windows(2) {
-                    if w[1].0 >= t {
-                        let fraction = (t - w[0].0) / (w[1].0 - w[0].0);
-                        let increment = fraction * (w[1].1 - w[0].1);
-                        return Ok(w[0].1 + increment);
-                    }
-                }
-                p.last().map_or(0., |p| p.1)
-            }
+            Self::Pwl(pwl) => return pwl.value_at(t, limit),
             Self::Pulse(pulse) => return pulse.value_at(t, limit),
-            Self::PwlSource(pwl) => return pwl.value_at(t, limit),
             Self::Function(function) => return function.value_at(t, limit),
             Self::PulseDefaults(_) => {
                 return Err(SpiceError::circuit(
@@ -273,13 +254,12 @@ impl Waveform {
             Self::Constant(_) => vec![],
             Self::PortSeries { baseline, .. } => return baseline.breakpoints_in(t0, t1),
             Self::Step { time, .. } => vec![*time],
-            Self::Pwl(p) => p.iter().map(|p| p.0).collect(),
             Self::Pulse(pulse) => {
                 return Ok(WaveformBreakpoints(Inner::Pulse(
                     pulse.breakpoints_in(t0, t1)?,
                 )));
             }
-            Self::PwlSource(pwl) => {
+            Self::Pwl(pwl) => {
                 return Ok(WaveformBreakpoints(Inner::Pwl(pwl.breakpoints_in(t0, t1)?)));
             }
             Self::Function(function) => function.corners(),
@@ -319,28 +299,77 @@ impl Iterator for WaveformBreakpoints {
     }
 }
 
+/// A finite event ordered by its time bits and then source ordinal.
+#[derive(Debug, Clone, Copy)]
+struct ScheduledCorner {
+    time: Real,
+    source: usize,
+}
+
+impl PartialEq for ScheduledCorner {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for ScheduledCorner {}
+impl PartialOrd for ScheduledCorner {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ScheduledCorner {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.time
+            .total_cmp(&other.time)
+            .then_with(|| self.source.cmp(&other.source))
+    }
+}
+
 /// Lazy, merged breakpoints of every source in a [`LinearSystem`].
+///
+/// One heap entry per nonempty source. Advancement is logarithmic in the
+/// number of active sources, not a scan over every source for every event.
 #[derive(Debug, Clone)]
 pub struct SystemBreakpoints {
-    sources: Vec<std::iter::Peekable<WaveformBreakpoints>>,
+    sources: Vec<WaveformBreakpoints>,
+    pending: BinaryHeap<Reverse<ScheduledCorner>>,
+}
+impl SystemBreakpoints {
+    fn new(mut sources: Vec<WaveformBreakpoints>) -> Self {
+        let pending = BinaryHeap::from(
+            sources
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(source, iterator)| {
+                    iterator
+                        .next()
+                        .map(|time| Reverse(ScheduledCorner { time, source }))
+                })
+                .collect::<Vec<_>>(),
+        );
+        Self { sources, pending }
+    }
+
+    fn advance(&mut self, source: usize) {
+        if let Some(time) = self.sources[source].next() {
+            self.pending.push(Reverse(ScheduledCorner { time, source }));
+        }
+    }
 }
 impl Iterator for SystemBreakpoints {
     type Item = Real;
     fn next(&mut self) -> Option<Real> {
-        let next = self
-            .sources
-            .iter_mut()
-            .filter_map(|s| s.peek().copied())
-            .min_by(f64::total_cmp)?;
-        for source in &mut self.sources {
-            // The validated time domain is finite. Exact numeric equality
-            // (rather than total_cmp) also coalesces the two signed zeros.
-            while source
-                .next_if(|t| t.partial_cmp(&next) == Some(std::cmp::Ordering::Equal))
-                .is_some()
-            {}
+        let Reverse(first) = self.pending.pop()?;
+        self.advance(first.source);
+        // Match the old total-order minimum, including -0 ahead of +0,
+        // but coalesce both signed zeros by numeric equality.
+        while self.pending.peek().is_some_and(|Reverse(event)| {
+            event.time.partial_cmp(&first.time) == Some(Ordering::Equal)
+        }) {
+            let Reverse(event) = self.pending.pop()?;
+            self.advance(event.source);
         }
-        Some(next)
+        Some(first.time)
     }
 }
 
@@ -486,13 +515,12 @@ impl LinearSystem {
     /// # Errors
     /// Invalid window or unresolved PULSE defaults.
     pub fn breakpoints_in(&self, t0: Real, t1: Real) -> SpiceResult<SystemBreakpoints> {
-        Ok(SystemBreakpoints {
-            sources: self
-                .sources
-                .iter()
-                .map(|s| s.waveform.breakpoints_in(t0, t1).map(Iterator::peekable))
-                .collect::<SpiceResult<_>>()?,
-        })
+        let sources = self
+            .sources
+            .iter()
+            .map(|s| s.waveform.breakpoints_in(t0, t1))
+            .collect::<SpiceResult<_>>()?;
+        Ok(SystemBreakpoints::new(sources))
     }
 }
 
@@ -702,4 +730,77 @@ pub(crate) fn branch_stamp(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan_merge(mut sources: Vec<std::iter::Peekable<WaveformBreakpoints>>) -> Vec<u64> {
+        let mut result = Vec::new();
+        while let Some(time) = sources
+            .iter_mut()
+            .filter_map(|source| source.peek().copied())
+            .min_by(Real::total_cmp)
+        {
+            result.push(time.to_bits());
+            for source in &mut sources {
+                while source
+                    .next_if(|t| t.partial_cmp(&time) == Some(Ordering::Equal))
+                    .is_some()
+                {}
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn heap_schedule_matches_scan_with_signed_zero_ties_and_fractional_cycles() {
+        let mut waveforms = vec![
+            Waveform::Pwl(PwlSource::plain(vec![(-0., 1.), (1., 2.)]).unwrap()),
+            Waveform::Pwl(PwlSource::new(vec![(-0., 1.), (1., 2.)], 0., Some(0.)).unwrap()),
+            Waveform::Pulse(
+                Pulse::new(0., 2., 0., 0., 0., 1., 2.)
+                    .unwrap()
+                    .with_count(2.25)
+                    .unwrap(),
+            ),
+            Waveform::Constant(0.),
+        ];
+        for i in 0..128 {
+            let i = Real::from(i);
+            waveforms.push(Waveform::Pwl(
+                PwlSource::plain(vec![(i * 0.125, 0.), (i * 0.125 + 0.1, 1.)]).unwrap(),
+            ));
+        }
+        for (start, end) in [
+            (-0., 20.),
+            (0.01, 1.),
+            (2., 8.25),
+            (10., 100.),
+            (150., 200.),
+        ] {
+            let iterators = waveforms
+                .iter()
+                .map(|waveform| waveform.breakpoints_in(start, end).unwrap())
+                .collect::<Vec<_>>();
+            let expected = scan_merge(iterators.iter().cloned().map(Iterator::peekable).collect());
+            let mut actual = SystemBreakpoints::new(iterators);
+            let first = actual.next();
+            let clone = actual.clone();
+            let tail = actual.map(Real::to_bits).collect::<Vec<_>>();
+            assert_eq!(tail, clone.map(Real::to_bits).collect::<Vec<_>>());
+            assert_eq!(
+                first
+                    .into_iter()
+                    .map(Real::to_bits)
+                    .chain(tail)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            if start == 0. {
+                assert_eq!(first.unwrap().to_bits(), (-0.0_f64).to_bits());
+            }
+        }
+    }
 }

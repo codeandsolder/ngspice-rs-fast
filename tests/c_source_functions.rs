@@ -446,3 +446,66 @@ fn polar_ac_coefficients_and_phase_overrides_match_c() {
         }
     }
 }
+
+/// Binary samples preserve the exact C solver times and forcing bits, unlike
+/// the ASCII comparison above.
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN"]
+fn pwl_and_pulse_match_c_binary_samples_bit_for_bit() {
+    use ngspice_conformance::ngspice::{Ngspice, Scratch};
+
+    let deck = "Exact source samples\n\
+vplain a 0 pwl(0 1.25 0.3m 2.75 0.6m 1.5)\n\
+vshift b 0 pwl(0 1.25 0.3m 2.75 0.6m 1.5) td=0.2m\n\
+vrepeat c 0 pwl(0 1.25 0.3m 2.75 0.6m 1.5) td=0.1m r=0.3m\n\
+vpulse d 0 pulse(1.25 2.75 0.1m 20u 30u 0.1m 0.3m 2.5)\n\
+ra a 0 1\nrb b 0 1\nrc c 0 1\nrd d 0 1\n.tran 10u 2m\n.end\n";
+    let scratch = Scratch::new("waveform-bits").unwrap();
+    fs::write(scratch.path().join("wave.cir"), deck).unwrap();
+    Ngspice::pinned()
+        .unwrap()
+        .run(
+            scratch.path(),
+            &["-n", "-b", "-r", "result.raw", "wave.cir"],
+        )
+        .unwrap()
+        .require_success("binary source samples")
+        .unwrap();
+    let raw = RawFile::load(scratch.path().join("result.raw")).unwrap();
+    let plot = &raw.plots[0].plot;
+    let times = plot.column("time").unwrap();
+    assert!(times.len() > 200);
+    let netlist = rust_netlist(deck);
+    let mut system = Circuit::from_netlist(&netlist)
+        .unwrap()
+        .linear_system()
+        .unwrap();
+    system
+        .bind_transient_timing(&TransientTiming::new(10e-6, 2e-3).unwrap())
+        .unwrap();
+    assert_eq!(system.sources.len(), 4);
+    for (source_name, node) in [
+        ("vplain", "v(a)"),
+        ("vshift", "v(b)"),
+        ("vrepeat", "v(c)"),
+        ("vpulse", "v(d)"),
+    ] {
+        let source = system
+            .sources
+            .iter()
+            .find(|s| s.name == source_name)
+            .unwrap();
+        let expected = plot.column(node).unwrap();
+        assert_eq!(times.len(), expected.len());
+        for (time, value) in times.iter().zip(expected) {
+            let actual = source.waveform.value_at(time.re, Limit::Right).unwrap();
+            assert_eq!(
+                actual.to_bits(),
+                value.re.to_bits(),
+                "{source_name} at {:.17e}",
+                time.re
+            );
+        }
+    }
+    println!("{} exact C binary source samples", 4 * times.len());
+}
