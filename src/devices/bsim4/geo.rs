@@ -5,8 +5,6 @@
 //! caller-supplied list instead, which the setup stages turn into
 //! diagnostics.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -18,10 +16,6 @@
 #![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 /// `BSIM4NumFingerDiff`: the numbers of interior and end source/drain
@@ -39,6 +33,37 @@ fn num_finger_diff(nf: f64, min_sd: i32) -> (f64, f64, f64, f64) {
         (2.0 * f64::max(nf / 2.0 - 1.0, 0.0), 2.0, nf, 0.0)
     } else {
         (nf, 0.0, 2.0 * f64::max(nf / 2.0 - 1.0, 0.0), 2.0)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Diffusion {
+    perimeter: f64,
+    area: f64,
+}
+
+#[derive(Clone, Copy)]
+enum End {
+    Isolated,
+    Shared,
+    Merged,
+}
+
+impl Diffusion {
+    fn scaled(self, count: f64) -> Self {
+        Self {
+            perimeter: self.perimeter * count,
+            area: self.area * count,
+        }
+    }
+
+    /// The end and interior diffusions are either identical (factor the
+    /// common shape) or distinct (fuse the interior contribution).
+    fn total(shared: Self, end: Self, end_count: f64, interior_count: f64) -> Self {
+        Self {
+            perimeter: interior_count.mul_add(shared.perimeter, end_count * end.perimeter),
+            area: interior_count.mul_add(shared.area, end_count * end.area),
+        }
     }
 }
 
@@ -60,101 +85,59 @@ pub(super) fn pa_eff_geo(
     initial: (f64, f64, f64, f64),
     warnings: &mut Vec<String>,
 ) -> (f64, f64, f64, f64) {
-    // For geo = 9 and 10 the numbers of diffusions are already known.
-    let (nu_int_d, nu_end_d, nu_int_s, nu_end_s) = if geo < 9 {
-        num_finger_diff(nf, min_sd)
-    } else {
-        (0.0, 0.0, 0.0, 0.0)
-    };
     let t0 = dmcg + dmci;
-    let t1 = dmcg + dmcg;
-    let t2 = dmdg + dmdg;
-
-    let ps_iso = t0 + t0 + weffcj;
-    let pd_iso = ps_iso;
-    let (ps_sha, pd_sha) = (t1, t1);
-    let (ps_mer, pd_mer) = (t2, t2);
-
-    let as_iso = t0 * weffcj;
-    let ad_iso = as_iso;
-    let as_sha = dmcg * weffcj;
-    let ad_sha = as_sha;
-    let as_mer = dmdg * weffcj;
-    let ad_mer = as_mer;
-
-    match geo {
-        0 => (
-            nu_end_s * ps_iso + nu_int_s * ps_sha,
-            nu_end_d * pd_iso + nu_int_d * pd_sha,
-            nu_end_s * as_iso + nu_int_s * as_sha,
-            nu_end_d * ad_iso + nu_int_d * ad_sha,
-        ),
-        1 => (
-            nu_end_s * ps_iso + nu_int_s * ps_sha,
-            (nu_end_d + nu_int_d) * pd_sha,
-            nu_end_s * as_iso + nu_int_s * as_sha,
-            (nu_end_d + nu_int_d) * ad_sha,
-        ),
-        2 => (
-            (nu_end_s + nu_int_s) * ps_sha,
-            nu_end_d * pd_iso + nu_int_d * pd_sha,
-            (nu_end_s + nu_int_s) * as_sha,
-            nu_end_d * ad_iso + nu_int_d * ad_sha,
-        ),
-        3 => (
-            (nu_end_s + nu_int_s) * ps_sha,
-            (nu_end_d + nu_int_d) * pd_sha,
-            (nu_end_s + nu_int_s) * as_sha,
-            (nu_end_d + nu_int_d) * ad_sha,
-        ),
-        4 => (
-            nu_end_s * ps_iso + nu_int_s * ps_sha,
-            nu_end_d * pd_mer + nu_int_d * pd_sha,
-            nu_end_s * as_iso + nu_int_s * as_sha,
-            nu_end_d * ad_mer + nu_int_d * ad_sha,
-        ),
-        5 => (
-            (nu_end_s + nu_int_s) * ps_sha,
-            nu_end_d * pd_mer + nu_int_d * pd_sha,
-            (nu_end_s + nu_int_s) * as_sha,
-            nu_end_d * ad_mer + nu_int_d * ad_sha,
-        ),
-        6 => (
-            nu_end_s * ps_mer + nu_int_s * ps_sha,
-            nu_end_d * pd_iso + nu_int_d * pd_sha,
-            nu_end_s * as_mer + nu_int_s * as_sha,
-            nu_end_d * ad_iso + nu_int_d * ad_sha,
-        ),
-        7 => (
-            nu_end_s * ps_mer + nu_int_s * ps_sha,
-            (nu_end_d + nu_int_d) * pd_sha,
-            nu_end_s * as_mer + nu_int_s * as_sha,
-            (nu_end_d + nu_int_d) * ad_sha,
-        ),
-        8 => (
-            nu_end_s * ps_mer + nu_int_s * ps_sha,
-            nu_end_d * pd_mer + nu_int_d * pd_sha,
-            nu_end_s * as_mer + nu_int_s * as_sha,
-            nu_end_d * ad_mer + nu_int_d * ad_sha,
-        ),
-        // geo = 9 and 10 happen only when nf is even.
+    let isolated = Diffusion {
+        perimeter: t0 + t0 + weffcj,
+        area: t0 * weffcj,
+    };
+    let shared = Diffusion {
+        perimeter: dmcg + dmcg,
+        area: dmcg * weffcj,
+    };
+    let merged = Diffusion {
+        perimeter: dmdg + dmdg,
+        area: dmdg * weffcj,
+    };
+    // GEO codes 9 and 10 are asymmetric even-finger layouts with fixed
+    // diffusion counts. Other codes define the independent end shapes.
+    let (source, drain) = match geo {
         9 => (
-            ps_iso + (nf - 1.0) * ps_sha,
-            nf * pd_sha,
-            as_iso + (nf - 1.0) * as_sha,
-            nf * ad_sha,
+            Diffusion::total(shared, isolated, 1., nf - 1.),
+            shared.scaled(nf),
         ),
         10 => (
-            nf * ps_sha,
-            pd_iso + (nf - 1.0) * pd_sha,
-            nf * as_sha,
-            ad_iso + (nf - 1.0) * ad_sha,
+            shared.scaled(nf),
+            Diffusion::total(shared, isolated, 1., nf - 1.),
         ),
         _ => {
-            warnings.push(format!("Warning: Specified GEO = {geo} not matched"));
-            initial
+            let (source_end, drain_end) = match geo {
+                0 => (End::Isolated, End::Isolated),
+                1 => (End::Isolated, End::Shared),
+                2 => (End::Shared, End::Isolated),
+                3 => (End::Shared, End::Shared),
+                4 => (End::Isolated, End::Merged),
+                5 => (End::Shared, End::Merged),
+                6 => (End::Merged, End::Isolated),
+                7 => (End::Merged, End::Shared),
+                8 => (End::Merged, End::Merged),
+                _ => {
+                    warnings.push(format!("Warning: Specified GEO = {geo} not matched"));
+                    return initial;
+                }
+            };
+            let (int_d, end_d, int_s, end_s) = num_finger_diff(nf, min_sd);
+            let total = |end, n_end, n_int| match end {
+                End::Isolated => Diffusion::total(shared, isolated, n_end, n_int),
+                End::Shared => shared.scaled(n_end + n_int),
+                End::Merged => Diffusion::total(shared, merged, n_end, n_int),
+            };
+            (
+                total(source_end, end_s, int_s),
+                total(drain_end, end_d, int_d),
+            )
         }
-    }
+    };
+    (source.perimeter, drain.perimeter, source.area, drain.area)
 }
 
 /// `BSIM4RdseffGeo`: the total source (`ty == 1`) or drain diffusion

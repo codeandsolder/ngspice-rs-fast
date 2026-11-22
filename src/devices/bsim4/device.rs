@@ -767,14 +767,13 @@ impl LoadCkt for StampHost<'_, '_> {
 /// whatever `CKTag` the last transient left; a fresh circuit's is zero,
 /// which is what every non-transient analysis of a deck without an earlier
 /// `.tran` sees.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "preserve NIintegrate's separate multiply, sum and subtraction, including signed-zero and nonfinite behavior"
-)]
 fn zero_coefficient_integrate(cap: f64, q0: f64, q1: f64) -> (f64, f64, f64) {
-    let ag = [0.0_f64; 2];
-    let derivative = ag[0] * q0 + ag[1] * q1;
-    (ag[0] * cap, derivative - ag[0] * q0, derivative)
+    // These products are signed zeros for every finite charge, hence there
+    // is no multiplication rounding to eliminate by fusing. Reuse the
+    // first product; infinities and NaNs still propagate through 0 * q.
+    let [q0, q1] = [q0, q1].map(|charge| 0. * charge);
+    let derivative = q0 + q1;
+    (0. * cap, derivative - q0, derivative)
 }
 
 /// [`LoadCkt`] for C's evaluation-only loads (`MODEINITSMSIG`, and the
