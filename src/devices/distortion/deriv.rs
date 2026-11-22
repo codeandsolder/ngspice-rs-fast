@@ -1,22 +1,8 @@
-//! C's `Dderivs` derivative arithmetic (`src/include/ngspice/distodef.h`,
-//! `src/maths/deriv/*.c`), transcribed expression by expression so that the
-//! distortion Taylor coefficients built from it (`bjtdset.c`) round as C's
-//! do. Each value carries a function of three variables `p`, `q`, `r` and
+//! Third-order derivative arithmetic for the distortion Taylor coefficients.
+//! Differentiate the defining product, quotient and composition identities
+//! rather than preserving the operation order of C's generated expressions. Each value carries a function of three variables `p`, `q`, `r` and
 //! its partial derivatives up to the third order (derivatives, not Taylor
 //! coefficients: `d2_p2` is the second derivative).
-
-// The statement-by-statement transcription (fields assigned in C's order,
-// later ones reading earlier ones) is deliberate.
-// The source C derivative formulas retain their exact multiply/add order:
-// replacing them with fused operations changes the rounded Taylor terms.
-#![expect(
-    clippy::suspicious_operation_groupings,
-    reason = "mixed partial derivatives are intentional in the source C tensor equations"
-)]
-#![expect(
-    clippy::field_reassign_with_default,
-    reason = "C derivative initialization retains its exact field-assignment sequence"
-)]
 
 use crate::primitives::Real;
 
@@ -130,455 +116,504 @@ impl Dderivs {
         }
     }
 
-    /// C `expderiv.c`.
+    /// Compose a scalar function using its first three derivatives.
+    fn compose(&self, value: Real, first: Real, second: Real, third: Real) -> Self {
+        Self {
+            value,
+            d1_p: first * self.d1_p,
+            d1_q: first * self.d1_q,
+            d1_r: first * self.d1_r,
+            d2_p2: (first).mul_add(self.d2_p2, second * self.d1_p * self.d1_p),
+            d2_q2: (first).mul_add(self.d2_q2, second * self.d1_q * self.d1_q),
+            d2_r2: (first).mul_add(self.d2_r2, second * self.d1_r * self.d1_r),
+            d2_pq: (first).mul_add(self.d2_pq, second * self.d1_p * self.d1_q),
+            d2_qr: (first).mul_add(self.d2_qr, second * self.d1_q * self.d1_r),
+            d2_pr: (first).mul_add(self.d2_pr, second * self.d1_p * self.d1_r),
+            d3_p3: (first).mul_add(
+                self.d3_p3,
+                (second).mul_add(
+                    (3. * self.d2_p2 * self.d1_p),
+                    third * self.d1_p * self.d1_p * self.d1_p,
+                ),
+            ),
+            d3_q3: (first).mul_add(
+                self.d3_q3,
+                (second).mul_add(
+                    (3. * self.d2_q2 * self.d1_q),
+                    third * self.d1_q * self.d1_q * self.d1_q,
+                ),
+            ),
+            d3_r3: (first).mul_add(
+                self.d3_r3,
+                (second).mul_add(
+                    (3. * self.d2_r2 * self.d1_r),
+                    third * self.d1_r * self.d1_r * self.d1_r,
+                ),
+            ),
+            d3_p2r: (first).mul_add(
+                self.d3_p2r,
+                (second).mul_add(
+                    ((self.d2_p2).mul_add(self.d1_r, 2. * self.d2_pr * self.d1_p)),
+                    third * self.d1_p * self.d1_p * self.d1_r,
+                ),
+            ),
+            d3_p2q: (first).mul_add(
+                self.d3_p2q,
+                (second).mul_add(
+                    ((self.d2_p2).mul_add(self.d1_q, 2. * self.d2_pq * self.d1_p)),
+                    third * self.d1_p * self.d1_p * self.d1_q,
+                ),
+            ),
+            d3_q2r: (first).mul_add(
+                self.d3_q2r,
+                (second).mul_add(
+                    ((self.d2_q2).mul_add(self.d1_r, 2. * self.d2_qr * self.d1_q)),
+                    third * self.d1_q * self.d1_q * self.d1_r,
+                ),
+            ),
+            d3_pq2: (first).mul_add(
+                self.d3_pq2,
+                (second).mul_add(
+                    ((2. * self.d2_pq).mul_add(self.d1_q, self.d2_q2 * self.d1_p)),
+                    third * self.d1_p * self.d1_q * self.d1_q,
+                ),
+            ),
+            d3_pr2: (first).mul_add(
+                self.d3_pr2,
+                (second).mul_add(
+                    ((2. * self.d2_pr).mul_add(self.d1_r, self.d2_r2 * self.d1_p)),
+                    third * self.d1_p * self.d1_r * self.d1_r,
+                ),
+            ),
+            d3_qr2: (first).mul_add(
+                self.d3_qr2,
+                (second).mul_add(
+                    ((2. * self.d2_qr).mul_add(self.d1_r, self.d2_r2 * self.d1_q)),
+                    third * self.d1_q * self.d1_r * self.d1_r,
+                ),
+            ),
+            d3_pqr: (first).mul_add(
+                self.d3_pqr,
+                (second).mul_add(
+                    ((self.d2_pq).mul_add(
+                        self.d1_r,
+                        (self.d2_pr).mul_add(self.d1_q, self.d2_qr * self.d1_p),
+                    )),
+                    third * self.d1_p * self.d1_q * self.d1_r,
+                ),
+            ),
+        }
+    }
+
     pub(crate) fn exp(&self) -> Self {
-        let t = *self;
-        let mut n = Self::default();
-        n.value = t.value.exp();
-        n.d1_p = n.value * t.d1_p;
-        n.d1_q = n.value * t.d1_q;
-        n.d1_r = n.value * t.d1_r;
-        n.d2_p2 = n.value * t.d2_p2 + t.d1_p * n.d1_p;
-        n.d2_q2 = n.value * t.d2_q2 + t.d1_q * n.d1_q;
-        n.d2_r2 = n.value * t.d2_r2 + t.d1_r * n.d1_r;
-        n.d2_pq = n.value * t.d2_pq + t.d1_p * n.d1_q;
-        n.d2_qr = n.value * t.d2_qr + t.d1_q * n.d1_r;
-        n.d2_pr = n.value * t.d2_pr + t.d1_p * n.d1_r;
-        n.d3_p3 = n.value * t.d3_p3 + t.d2_p2 * n.d1_p + t.d2_p2 * n.d1_p + n.d2_p2 * t.d1_p;
-        n.d3_q3 = n.value * t.d3_q3 + t.d2_q2 * n.d1_q + t.d2_q2 * n.d1_q + n.d2_q2 * t.d1_q;
-        n.d3_r3 = n.value * t.d3_r3 + t.d2_r2 * n.d1_r + t.d2_r2 * n.d1_r + n.d2_r2 * t.d1_r;
-        n.d3_p2r = n.value * t.d3_p2r + t.d2_p2 * n.d1_r + t.d2_pr * n.d1_p + n.d2_pr * t.d1_p;
-        n.d3_p2q = n.value * t.d3_p2q + t.d2_p2 * n.d1_q + t.d2_pq * n.d1_p + n.d2_pq * t.d1_p;
-        n.d3_q2r = n.value * t.d3_q2r + t.d2_q2 * n.d1_r + t.d2_qr * n.d1_q + n.d2_qr * t.d1_q;
-        n.d3_pq2 = n.value * t.d3_pq2 + t.d2_q2 * n.d1_p + t.d2_pq * n.d1_q + n.d2_pq * t.d1_q;
-        n.d3_pr2 = n.value * t.d3_pr2 + t.d2_r2 * n.d1_p + t.d2_pr * n.d1_r + n.d2_pr * t.d1_r;
-        n.d3_qr2 = n.value * t.d3_qr2 + t.d2_r2 * n.d1_q + t.d2_qr * n.d1_r + n.d2_qr * t.d1_r;
-        n.d3_pqr = n.value * t.d3_pqr + t.d2_pq * n.d1_r + t.d2_pr * n.d1_q + n.d2_qr * t.d1_p;
-        n
+        let value = self.value.exp();
+        self.compose(value, value, value, value)
     }
 
-    /// C `invderiv.c`.
     pub(crate) fn inv(&self) -> Self {
-        let t = *self;
-        let mut n = Self::default();
-        n.value = 1.0 / t.value;
-        n.d1_p = -n.value * n.value * t.d1_p;
-        n.d1_q = -n.value * n.value * t.d1_q;
-        n.d1_r = -n.value * n.value * t.d1_r;
-        n.d2_p2 = -n.value * (2.0 * n.d1_p * t.d1_p + n.value * t.d2_p2);
-        n.d2_q2 = -n.value * (2.0 * n.d1_q * t.d1_q + n.value * t.d2_q2);
-        n.d2_r2 = -n.value * (2.0 * n.d1_r * t.d1_r + n.value * t.d2_r2);
-        n.d2_pq = -n.value * (2.0 * n.d1_q * t.d1_p + n.value * t.d2_pq);
-        n.d2_qr = -n.value * (2.0 * n.d1_r * t.d1_q + n.value * t.d2_qr);
-        n.d2_pr = -n.value * (2.0 * n.d1_r * t.d1_p + n.value * t.d2_pr);
-        n.d3_p3 = -(2.0
-            * (t.d1_p * n.d1_p * n.d1_p
-                + n.value * (n.d2_p2 * t.d1_p + n.d1_p * t.d2_p2 + n.d1_p * t.d2_p2))
-            + n.value * n.value * t.d3_p3);
-        n.d3_q3 = -(2.0
-            * (t.d1_q * n.d1_q * n.d1_q
-                + n.value * (n.d2_q2 * t.d1_q + n.d1_q * t.d2_q2 + n.d1_q * t.d2_q2))
-            + n.value * n.value * t.d3_q3);
-        n.d3_r3 = -(2.0
-            * (t.d1_r * n.d1_r * n.d1_r
-                + n.value * (n.d2_r2 * t.d1_r + n.d1_r * t.d2_r2 + n.d1_r * t.d2_r2))
-            + n.value * n.value * t.d3_r3);
-        n.d3_p2r = -(2.0
-            * (t.d1_p * n.d1_p * n.d1_r
-                + n.value * (n.d2_pr * t.d1_p + n.d1_p * t.d2_pr + n.d1_r * t.d2_p2))
-            + n.value * n.value * t.d3_p2r);
-        n.d3_p2q = -(2.0
-            * (t.d1_p * n.d1_p * n.d1_q
-                + n.value * (n.d2_pq * t.d1_p + n.d1_p * t.d2_pq + n.d1_q * t.d2_p2))
-            + n.value * n.value * t.d3_p2q);
-        n.d3_q2r = -(2.0
-            * (t.d1_q * n.d1_q * n.d1_r
-                + n.value * (n.d2_qr * t.d1_q + n.d1_q * t.d2_qr + n.d1_r * t.d2_q2))
-            + n.value * n.value * t.d3_q2r);
-        n.d3_pq2 = -(2.0
-            * (t.d1_q * n.d1_q * n.d1_p
-                + n.value * (n.d2_pq * t.d1_q + n.d1_q * t.d2_pq + n.d1_p * t.d2_q2))
-            + n.value * n.value * t.d3_pq2);
-        n.d3_pr2 = -(2.0
-            * (t.d1_r * n.d1_r * n.d1_p
-                + n.value * (n.d2_pr * t.d1_r + n.d1_r * t.d2_pr + n.d1_p * t.d2_r2))
-            + n.value * n.value * t.d3_pr2);
-        n.d3_qr2 = -(2.0
-            * (t.d1_r * n.d1_r * n.d1_q
-                + n.value * (n.d2_qr * t.d1_r + n.d1_r * t.d2_qr + n.d1_q * t.d2_r2))
-            + n.value * n.value * t.d3_qr2);
-        n.d3_pqr = -(2.0
-            * (t.d1_p * n.d1_q * n.d1_r
-                + n.value * (n.d2_qr * t.d1_p + n.d1_q * t.d2_pr + n.d1_r * t.d2_pq))
-            + n.value * n.value * t.d3_pqr);
-        n
+        Self {
+            value: 1.,
+            ..Self::default()
+        }
+        .div(self)
     }
 
-    /// C `multder.c`.
+    /// The multivariate Leibniz rule. Repeated terms use their multiplicity
+    /// instead of computing and adding the same product twice.
     pub(crate) fn mul(&self, other: &Self) -> Self {
-        let (a, b) = (*self, *other);
-        let mut n = Self::default();
-        n.value = a.value * b.value;
-        n.d1_p = a.d1_p * b.value + a.value * b.d1_p;
-        n.d1_q = a.d1_q * b.value + a.value * b.d1_q;
-        n.d1_r = a.d1_r * b.value + a.value * b.d1_r;
-        n.d2_p2 = a.d2_p2 * b.value + a.d1_p * b.d1_p + a.d1_p * b.d1_p + a.value * b.d2_p2;
-        n.d2_q2 = a.d2_q2 * b.value + a.d1_q * b.d1_q + a.d1_q * b.d1_q + a.value * b.d2_q2;
-        n.d2_r2 = a.d2_r2 * b.value + a.d1_r * b.d1_r + a.d1_r * b.d1_r + a.value * b.d2_r2;
-        n.d2_pq = a.d2_pq * b.value + a.d1_p * b.d1_q + a.d1_q * b.d1_p + a.value * b.d2_pq;
-        n.d2_qr = a.d2_qr * b.value + a.d1_q * b.d1_r + a.d1_r * b.d1_q + a.value * b.d2_qr;
-        n.d2_pr = a.d2_pr * b.value + a.d1_p * b.d1_r + a.d1_r * b.d1_p + a.value * b.d2_pr;
-        n.d3_p3 = a.d3_p3 * b.value
-            + a.d2_p2 * b.d1_p
-            + a.d2_p2 * b.d1_p
-            + b.d2_p2 * a.d1_p
-            + b.d2_p2 * a.d1_p
-            + a.d2_p2 * b.d1_p
-            + b.d2_p2 * a.d1_p
-            + a.value * b.d3_p3;
-        n.d3_q3 = a.d3_q3 * b.value
-            + a.d2_q2 * b.d1_q
-            + a.d2_q2 * b.d1_q
-            + b.d2_q2 * a.d1_q
-            + b.d2_q2 * a.d1_q
-            + a.d2_q2 * b.d1_q
-            + b.d2_q2 * a.d1_q
-            + a.value * b.d3_q3;
-        n.d3_r3 = a.d3_r3 * b.value
-            + a.d2_r2 * b.d1_r
-            + a.d2_r2 * b.d1_r
-            + b.d2_r2 * a.d1_r
-            + b.d2_r2 * a.d1_r
-            + a.d2_r2 * b.d1_r
-            + b.d2_r2 * a.d1_r
-            + a.value * b.d3_r3;
-        n.d3_p2r = a.d3_p2r * b.value
-            + a.d2_p2 * b.d1_r
-            + a.d2_pr * b.d1_p
-            + b.d2_p2 * a.d1_r
-            + b.d2_pr * a.d1_p
-            + a.d2_pr * b.d1_p
-            + b.d2_pr * a.d1_p
-            + a.value * b.d3_p2r;
-        n.d3_p2q = a.d3_p2q * b.value
-            + a.d2_p2 * b.d1_q
-            + a.d2_pq * b.d1_p
-            + b.d2_p2 * a.d1_q
-            + b.d2_pq * a.d1_p
-            + a.d2_pq * b.d1_p
-            + b.d2_pq * a.d1_p
-            + a.value * b.d3_p2q;
-        n.d3_q2r = a.d3_q2r * b.value
-            + a.d2_q2 * b.d1_r
-            + a.d2_qr * b.d1_q
-            + b.d2_q2 * a.d1_r
-            + b.d2_qr * a.d1_q
-            + a.d2_qr * b.d1_q
-            + b.d2_qr * a.d1_q
-            + a.value * b.d3_q2r;
-        n.d3_pq2 = a.d3_pq2 * b.value
-            + a.d2_q2 * b.d1_p
-            + a.d2_pq * b.d1_q
-            + b.d2_q2 * a.d1_p
-            + b.d2_pq * a.d1_q
-            + a.d2_pq * b.d1_q
-            + b.d2_pq * a.d1_q
-            + a.value * b.d3_pq2;
-        n.d3_pr2 = a.d3_pr2 * b.value
-            + a.d2_r2 * b.d1_p
-            + a.d2_pr * b.d1_r
-            + b.d2_r2 * a.d1_p
-            + b.d2_pr * a.d1_r
-            + a.d2_pr * b.d1_r
-            + b.d2_pr * a.d1_r
-            + a.value * b.d3_pr2;
-        n.d3_qr2 = a.d3_qr2 * b.value
-            + a.d2_r2 * b.d1_q
-            + a.d2_qr * b.d1_r
-            + b.d2_r2 * a.d1_q
-            + b.d2_qr * a.d1_r
-            + a.d2_qr * b.d1_r
-            + b.d2_qr * a.d1_r
-            + a.value * b.d3_qr2;
-        n.d3_pqr = a.d3_pqr * b.value
-            + a.d2_pq * b.d1_r
-            + a.d2_pr * b.d1_q
-            + b.d2_pq * a.d1_r
-            + b.d2_qr * a.d1_p
-            + a.d2_qr * b.d1_p
-            + b.d2_pr * a.d1_q
-            + a.value * b.d3_pqr;
-        n
+        let (a, b) = (self, other);
+        Self {
+            value: a.value * b.value,
+            d1_p: (a.d1_p).mul_add(b.value, a.value * b.d1_p),
+            d1_q: (a.d1_q).mul_add(b.value, a.value * b.d1_q),
+            d1_r: (a.d1_r).mul_add(b.value, a.value * b.d1_r),
+            d2_p2: (2. * a.d1_p).mul_add(b.d1_p, (a.d2_p2).mul_add(b.value, a.value * b.d2_p2)),
+            d2_q2: (2. * a.d1_q).mul_add(b.d1_q, (a.d2_q2).mul_add(b.value, a.value * b.d2_q2)),
+            d2_r2: (2. * a.d1_r).mul_add(b.d1_r, (a.d2_r2).mul_add(b.value, a.value * b.d2_r2)),
+            d2_pq: (a.d1_q).mul_add(
+                b.d1_p,
+                (a.d1_p).mul_add(b.d1_q, (a.d2_pq).mul_add(b.value, a.value * b.d2_pq)),
+            ),
+            d2_qr: (a.d1_r).mul_add(
+                b.d1_q,
+                (a.d1_q).mul_add(b.d1_r, (a.d2_qr).mul_add(b.value, a.value * b.d2_qr)),
+            ),
+            d2_pr: (a.d1_r).mul_add(
+                b.d1_p,
+                (a.d1_p).mul_add(b.d1_r, (a.d2_pr).mul_add(b.value, a.value * b.d2_pr)),
+            ),
+            d3_p3: (3. * a.d2_p2).mul_add(
+                b.d1_p,
+                (3. * a.d1_p).mul_add(b.d2_p2, (a.d3_p3).mul_add(b.value, a.value * b.d3_p3)),
+            ),
+            d3_q3: (3. * a.d2_q2).mul_add(
+                b.d1_q,
+                (3. * a.d1_q).mul_add(b.d2_q2, (a.d3_q3).mul_add(b.value, a.value * b.d3_q3)),
+            ),
+            d3_r3: (3. * a.d2_r2).mul_add(
+                b.d1_r,
+                (3. * a.d1_r).mul_add(b.d2_r2, (a.d3_r3).mul_add(b.value, a.value * b.d3_r3)),
+            ),
+            d3_p2r: (2. * a.d2_pr).mul_add(
+                b.d1_p,
+                (a.d2_p2).mul_add(
+                    b.d1_r,
+                    (a.d1_r).mul_add(
+                        b.d2_p2,
+                        (2. * a.d1_p)
+                            .mul_add(b.d2_pr, (a.d3_p2r).mul_add(b.value, a.value * b.d3_p2r)),
+                    ),
+                ),
+            ),
+            d3_p2q: (2. * a.d2_pq).mul_add(
+                b.d1_p,
+                (a.d2_p2).mul_add(
+                    b.d1_q,
+                    (a.d1_q).mul_add(
+                        b.d2_p2,
+                        (2. * a.d1_p)
+                            .mul_add(b.d2_pq, (a.d3_p2q).mul_add(b.value, a.value * b.d3_p2q)),
+                    ),
+                ),
+            ),
+            d3_q2r: (2. * a.d2_qr).mul_add(
+                b.d1_q,
+                (a.d2_q2).mul_add(
+                    b.d1_r,
+                    (a.d1_r).mul_add(
+                        b.d2_q2,
+                        (2. * a.d1_q)
+                            .mul_add(b.d2_qr, (a.d3_q2r).mul_add(b.value, a.value * b.d3_q2r)),
+                    ),
+                ),
+            ),
+            d3_pq2: (a.d2_q2).mul_add(
+                b.d1_p,
+                (2. * a.d2_pq).mul_add(
+                    b.d1_q,
+                    (2. * a.d1_q).mul_add(
+                        b.d2_pq,
+                        (a.d1_p).mul_add(b.d2_q2, (a.d3_pq2).mul_add(b.value, a.value * b.d3_pq2)),
+                    ),
+                ),
+            ),
+            d3_pr2: (a.d2_r2).mul_add(
+                b.d1_p,
+                (2. * a.d2_pr).mul_add(
+                    b.d1_r,
+                    (2. * a.d1_r).mul_add(
+                        b.d2_pr,
+                        (a.d1_p).mul_add(b.d2_r2, (a.d3_pr2).mul_add(b.value, a.value * b.d3_pr2)),
+                    ),
+                ),
+            ),
+            d3_qr2: (a.d2_r2).mul_add(
+                b.d1_q,
+                (2. * a.d2_qr).mul_add(
+                    b.d1_r,
+                    (2. * a.d1_r).mul_add(
+                        b.d2_qr,
+                        (a.d1_q).mul_add(b.d2_r2, (a.d3_qr2).mul_add(b.value, a.value * b.d3_qr2)),
+                    ),
+                ),
+            ),
+            d3_pqr: (a.d2_qr).mul_add(
+                b.d1_p,
+                (a.d2_pr).mul_add(
+                    b.d1_q,
+                    (a.d2_pq).mul_add(
+                        b.d1_r,
+                        (a.d1_r).mul_add(
+                            b.d2_pq,
+                            (a.d1_q).mul_add(
+                                b.d2_pr,
+                                (a.d1_p).mul_add(
+                                    b.d2_qr,
+                                    (a.d3_pqr).mul_add(b.value, a.value * b.d3_pqr),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        }
     }
 
-    /// C `divderiv.c`.
+    /// Solve the derivative of b*n = a in increasing derivative order.
+    /// This avoids dividing repeatedly by powers of b or re-evaluating
+    /// the same nearly cancelling numerator.
     pub(crate) fn div(&self, other: &Self) -> Self {
-        let (a, b) = (*self, *other);
-        let mut n = Self::default();
-        n.value = a.value / b.value;
-        n.d1_p = (a.d1_p - a.value * b.d1_p / b.value) / b.value;
-        n.d1_q = (a.d1_q - a.value * b.d1_q / b.value) / b.value;
-        n.d1_r = (a.d1_r - a.value * b.d1_r / b.value) / b.value;
-        n.d2_p2 = (a.d2_p2 - b.d1_p * n.d1_p - n.value * b.d2_p2
-            + (b.d1_p * (n.value * b.d1_p - a.d1_p) / b.value))
-            / b.value;
-        n.d2_q2 = (a.d2_q2 - b.d1_q * n.d1_q - n.value * b.d2_q2
-            + (b.d1_q * (n.value * b.d1_q - a.d1_q) / b.value))
-            / b.value;
-        n.d2_r2 = (a.d2_r2 - b.d1_r * n.d1_r - n.value * b.d2_r2
-            + b.d1_r * (n.value * b.d1_r - a.d1_r) / b.value)
-            / b.value;
-        n.d2_pq = (a.d2_pq - b.d1_q * n.d1_p - n.value * b.d2_pq
-            + b.d1_p * (n.value * b.d1_q - a.d1_q) / b.value)
-            / b.value;
-        n.d2_qr = (a.d2_qr - b.d1_r * n.d1_q - n.value * b.d2_qr
-            + b.d1_q * (n.value * b.d1_r - a.d1_r) / b.value)
-            / b.value;
-        n.d2_pr = (a.d2_pr - b.d1_r * n.d1_p - n.value * b.d2_pr
-            + b.d1_p * (n.value * b.d1_r - a.d1_r) / b.value)
-            / b.value;
-        n.div_third_order(&a, &b);
+        let (a, b) = (self, other);
+        let mut n = Self {
+            value: a.value / b.value,
+            ..Self::default()
+        };
+        n.d1_p = ((-n.value).mul_add(b.d1_p, a.d1_p)) / b.value;
+        n.d1_q = ((-n.value).mul_add(b.d1_q, a.d1_q)) / b.value;
+        n.d1_r = ((-n.value).mul_add(b.d1_r, a.d1_r)) / b.value;
+        n.d2_p2 = ((-2. * n.d1_p).mul_add(b.d1_p, (-n.value).mul_add(b.d2_p2, a.d2_p2))) / b.value;
+        n.d2_q2 = ((-2. * n.d1_q).mul_add(b.d1_q, (-n.value).mul_add(b.d2_q2, a.d2_q2))) / b.value;
+        n.d2_r2 = ((-2. * n.d1_r).mul_add(b.d1_r, (-n.value).mul_add(b.d2_r2, a.d2_r2))) / b.value;
+        n.d2_pq = ((-n.d1_q).mul_add(
+            b.d1_p,
+            (-n.d1_p).mul_add(b.d1_q, (-n.value).mul_add(b.d2_pq, a.d2_pq)),
+        )) / b.value;
+        n.d2_qr = ((-n.d1_r).mul_add(
+            b.d1_q,
+            (-n.d1_q).mul_add(b.d1_r, (-n.value).mul_add(b.d2_qr, a.d2_qr)),
+        )) / b.value;
+        n.d2_pr = ((-n.d1_r).mul_add(
+            b.d1_p,
+            (-n.d1_p).mul_add(b.d1_r, (-n.value).mul_add(b.d2_pr, a.d2_pr)),
+        )) / b.value;
+        n.d3_p3 = ((-3. * n.d2_p2).mul_add(
+            b.d1_p,
+            (-3. * n.d1_p).mul_add(b.d2_p2, (-n.value).mul_add(b.d3_p3, a.d3_p3)),
+        )) / b.value;
+        n.d3_q3 = ((-3. * n.d2_q2).mul_add(
+            b.d1_q,
+            (-3. * n.d1_q).mul_add(b.d2_q2, (-n.value).mul_add(b.d3_q3, a.d3_q3)),
+        )) / b.value;
+        n.d3_r3 = ((-3. * n.d2_r2).mul_add(
+            b.d1_r,
+            (-3. * n.d1_r).mul_add(b.d2_r2, (-n.value).mul_add(b.d3_r3, a.d3_r3)),
+        )) / b.value;
+        n.d3_p2r = ((-2. * n.d2_pr).mul_add(
+            b.d1_p,
+            (-n.d2_p2).mul_add(
+                b.d1_r,
+                (-n.d1_r).mul_add(
+                    b.d2_p2,
+                    (-2. * n.d1_p).mul_add(b.d2_pr, (-n.value).mul_add(b.d3_p2r, a.d3_p2r)),
+                ),
+            ),
+        )) / b.value;
+        n.d3_p2q = ((-2. * n.d2_pq).mul_add(
+            b.d1_p,
+            (-n.d2_p2).mul_add(
+                b.d1_q,
+                (-n.d1_q).mul_add(
+                    b.d2_p2,
+                    (-2. * n.d1_p).mul_add(b.d2_pq, (-n.value).mul_add(b.d3_p2q, a.d3_p2q)),
+                ),
+            ),
+        )) / b.value;
+        n.d3_q2r = ((-2. * n.d2_qr).mul_add(
+            b.d1_q,
+            (-n.d2_q2).mul_add(
+                b.d1_r,
+                (-n.d1_r).mul_add(
+                    b.d2_q2,
+                    (-2. * n.d1_q).mul_add(b.d2_qr, (-n.value).mul_add(b.d3_q2r, a.d3_q2r)),
+                ),
+            ),
+        )) / b.value;
+        n.d3_pq2 = ((-n.d2_q2).mul_add(
+            b.d1_p,
+            (-2. * n.d2_pq).mul_add(
+                b.d1_q,
+                (-2. * n.d1_q).mul_add(
+                    b.d2_pq,
+                    (-n.d1_p).mul_add(b.d2_q2, (-n.value).mul_add(b.d3_pq2, a.d3_pq2)),
+                ),
+            ),
+        )) / b.value;
+        n.d3_pr2 = ((-n.d2_r2).mul_add(
+            b.d1_p,
+            (-2. * n.d2_pr).mul_add(
+                b.d1_r,
+                (-2. * n.d1_r).mul_add(
+                    b.d2_pr,
+                    (-n.d1_p).mul_add(b.d2_r2, (-n.value).mul_add(b.d3_pr2, a.d3_pr2)),
+                ),
+            ),
+        )) / b.value;
+        n.d3_qr2 = ((-n.d2_r2).mul_add(
+            b.d1_q,
+            (-2. * n.d2_qr).mul_add(
+                b.d1_r,
+                (-2. * n.d1_r).mul_add(
+                    b.d2_qr,
+                    (-n.d1_q).mul_add(b.d2_r2, (-n.value).mul_add(b.d3_qr2, a.d3_qr2)),
+                ),
+            ),
+        )) / b.value;
+        n.d3_pqr = ((-n.d2_qr).mul_add(
+            b.d1_p,
+            (-n.d2_pr).mul_add(
+                b.d1_q,
+                (-n.d2_pq).mul_add(
+                    b.d1_r,
+                    (-n.d1_r).mul_add(
+                        b.d2_pq,
+                        (-n.d1_q).mul_add(
+                            b.d2_pr,
+                            (-n.d1_p).mul_add(b.d2_qr, (-n.value).mul_add(b.d3_pqr, a.d3_pqr)),
+                        ),
+                    ),
+                ),
+            ),
+        )) / b.value;
         n
     }
 
-    // Third-order quotient derivatives consume the already computed lower orders.
-    fn div_third_order(&mut self, a: &Self, b: &Self) {
-        self.d3_p3 = (-b.d1_p * self.d2_p2 + a.d3_p3
-            - b.d2_p2 * self.d1_p
-            - b.d1_p * self.d2_p2
-            - self.d1_p * b.d2_p2
-            - self.value * b.d3_p3
-            + (b.d1_p * (self.d1_p * b.d1_p + self.value * b.d2_p2 - a.d2_p2)
-                + (self.value * b.d1_p - a.d1_p) * (b.d2_p2 - b.d1_p * b.d1_p / b.value))
-                / b.value)
-            / b.value;
-        self.d3_q3 = (-b.d1_q * self.d2_q2 + a.d3_q3
-            - b.d2_q2 * self.d1_q
-            - b.d1_q * self.d2_q2
-            - self.d1_q * b.d2_q2
-            - self.value * b.d3_q3
-            + (b.d1_q * (self.d1_q * b.d1_q + self.value * b.d2_q2 - a.d2_q2)
-                + (self.value * b.d1_q - a.d1_q) * (b.d2_q2 - b.d1_q * b.d1_q / b.value))
-                / b.value)
-            / b.value;
-        self.d3_r3 = (-b.d1_r * self.d2_r2 + a.d3_r3
-            - b.d2_r2 * self.d1_r
-            - b.d1_r * self.d2_r2
-            - self.d1_r * b.d2_r2
-            - self.value * b.d3_r3
-            + (b.d1_r * (self.d1_r * b.d1_r + self.value * b.d2_r2 - a.d2_r2)
-                + (self.value * b.d1_r - a.d1_r) * (b.d2_r2 - b.d1_r * b.d1_r / b.value))
-                / b.value)
-            / b.value;
-        self.d3_p2r = (-b.d1_r * self.d2_p2 + a.d3_p2r
-            - b.d2_pr * self.d1_p
-            - b.d1_p * self.d2_pr
-            - self.d1_r * b.d2_p2
-            - self.value * b.d3_p2r
-            + (b.d1_p * (self.d1_r * b.d1_p + self.value * b.d2_pr - a.d2_pr)
-                + (self.value * b.d1_p - a.d1_p) * (b.d2_pr - b.d1_p * b.d1_r / b.value))
-                / b.value)
-            / b.value;
-        self.d3_p2q = (-b.d1_q * self.d2_p2 + a.d3_p2q
-            - b.d2_pq * self.d1_p
-            - b.d1_p * self.d2_pq
-            - self.d1_q * b.d2_p2
-            - self.value * b.d3_p2q
-            + (b.d1_p * (self.d1_q * b.d1_p + self.value * b.d2_pq - a.d2_pq)
-                + (self.value * b.d1_p - a.d1_p) * (b.d2_pq - b.d1_p * b.d1_q / b.value))
-                / b.value)
-            / b.value;
-        self.d3_q2r = (-b.d1_r * self.d2_q2 + a.d3_q2r
-            - b.d2_qr * self.d1_q
-            - b.d1_q * self.d2_qr
-            - self.d1_r * b.d2_q2
-            - self.value * b.d3_q2r
-            + (b.d1_q * (self.d1_r * b.d1_q + self.value * b.d2_qr - a.d2_qr)
-                + (self.value * b.d1_q - a.d1_q) * (b.d2_qr - b.d1_q * b.d1_r / b.value))
-                / b.value)
-            / b.value;
-        self.d3_pq2 = (-b.d1_p * self.d2_q2 + a.d3_pq2
-            - b.d2_pq * self.d1_q
-            - b.d1_q * self.d2_pq
-            - self.d1_p * b.d2_q2
-            - self.value * b.d3_pq2
-            + (b.d1_q * (self.d1_p * b.d1_q + self.value * b.d2_pq - a.d2_pq)
-                + (self.value * b.d1_q - a.d1_q) * (b.d2_pq - b.d1_q * b.d1_p / b.value))
-                / b.value)
-            / b.value;
-        self.d3_pr2 = (-b.d1_p * self.d2_r2 + a.d3_pr2
-            - b.d2_pr * self.d1_r
-            - b.d1_r * self.d2_pr
-            - self.d1_p * b.d2_r2
-            - self.value * b.d3_pr2
-            + (b.d1_r * (self.d1_p * b.d1_r + self.value * b.d2_pr - a.d2_pr)
-                + (self.value * b.d1_r - a.d1_r) * (b.d2_pr - b.d1_r * b.d1_p / b.value))
-                / b.value)
-            / b.value;
-        self.d3_qr2 = (-b.d1_q * self.d2_r2 + a.d3_qr2
-            - b.d2_qr * self.d1_r
-            - b.d1_r * self.d2_qr
-            - self.d1_q * b.d2_r2
-            - self.value * b.d3_qr2
-            + (b.d1_r * (self.d1_q * b.d1_r + self.value * b.d2_qr - a.d2_qr)
-                + (self.value * b.d1_r - a.d1_r) * (b.d2_qr - b.d1_r * b.d1_q / b.value))
-                / b.value)
-            / b.value;
-        self.d3_pqr = (-b.d1_r * self.d2_pq + a.d3_pqr
-            - b.d2_qr * self.d1_p
-            - b.d1_q * self.d2_pr
-            - self.d1_r * b.d2_pq
-            - self.value * b.d3_pqr
-            + (b.d1_p * (self.d1_r * b.d1_q + self.value * b.d2_qr - a.d2_qr)
-                + (self.value * b.d1_q - a.d1_q) * (b.d2_pr - b.d1_p * b.d1_r / b.value))
-                / b.value)
-            / b.value;
-    }
-
-    /// C `sqrtder.c`.
+    /// Differentiate n*n = self. The source model defines the derivatives
+    /// as zero at a zero argument, including the singular square-root limit.
     pub(crate) fn sqrt(&self) -> Self {
-        let t = *self;
-        let mut n = Self::default();
-        n.value = t.value.sqrt();
-        if t.value == 0.0 {
+        let mut n = Self {
+            value: self.value.sqrt(),
+            ..Self::default()
+        };
+        if self.value == 0. {
             return n;
         }
-        n.d1_p = 0.5 * t.d1_p / n.value;
-        n.d1_q = 0.5 * t.d1_q / n.value;
-        n.d1_r = 0.5 * t.d1_r / n.value;
-        n.d2_p2 = 0.5 / n.value * (t.d2_p2 - 0.5 * t.d1_p * t.d1_p / t.value);
-        n.d2_q2 = 0.5 / n.value * (t.d2_q2 - 0.5 * t.d1_q * t.d1_q / t.value);
-        n.d2_r2 = 0.5 / n.value * (t.d2_r2 - 0.5 * t.d1_r * t.d1_r / t.value);
-        n.d2_pq = 0.5 / n.value * (t.d2_pq - 0.5 * t.d1_p * t.d1_q / t.value);
-        n.d2_qr = 0.5 / n.value * (t.d2_qr - 0.5 * t.d1_q * t.d1_r / t.value);
-        n.d2_pr = 0.5 / n.value * (t.d2_pr - 0.5 * t.d1_p * t.d1_r / t.value);
-        n.d3_p3 = 0.5
-            * (t.d3_p3 / n.value
-                - 0.5 / (t.value * n.value)
-                    * (-1.5 / t.value * t.d1_p * t.d1_p * t.d1_p
-                        + t.d1_p * t.d2_p2
-                        + t.d1_p * t.d2_p2
-                        + t.d1_p * t.d2_p2));
-        n.d3_q3 = 0.5
-            * (t.d3_q3 / n.value
-                - 0.5 / (t.value * n.value)
-                    * (-1.5 / t.value * t.d1_q * t.d1_q * t.d1_q
-                        + t.d1_q * t.d2_q2
-                        + t.d1_q * t.d2_q2
-                        + t.d1_q * t.d2_q2));
-        n.d3_r3 = 0.5
-            * (t.d3_r3 / n.value
-                - 0.5 / (t.value * n.value)
-                    * (-1.5 / t.value * t.d1_r * t.d1_r * t.d1_r
-                        + t.d1_r * t.d2_r2
-                        + t.d1_r * t.d2_r2
-                        + t.d1_r * t.d2_r2));
-        n.d3_p2r = 0.5
-            * (t.d3_p2r / n.value
-                - 0.5 / (t.value * n.value)
-                    * (-1.5 / t.value * t.d1_p * t.d1_p * t.d1_r
-                        + t.d1_p * t.d2_pr
-                        + t.d1_p * t.d2_pr
-                        + t.d1_r * t.d2_p2));
-        n.d3_p2q = 0.5
-            * (t.d3_p2q / n.value
-                - 0.5 / (t.value * n.value)
-                    * (-1.5 / t.value * t.d1_p * t.d1_p * t.d1_q
-                        + t.d1_p * t.d2_pq
-                        + t.d1_p * t.d2_pq
-                        + t.d1_q * t.d2_p2));
-        n.d3_q2r = 0.5
-            * (t.d3_q2r / n.value
-                - 0.5 / (t.value * n.value)
-                    * (-1.5 / t.value * t.d1_q * t.d1_q * t.d1_r
-                        + t.d1_q * t.d2_qr
-                        + t.d1_q * t.d2_qr
-                        + t.d1_r * t.d2_q2));
-        n.d3_pq2 = 0.5
-            * (t.d3_pq2 / n.value
-                - 0.5 / (t.value * n.value)
-                    * (-1.5 / t.value * t.d1_q * t.d1_q * t.d1_p
-                        + t.d1_q * t.d2_pq
-                        + t.d1_q * t.d2_pq
-                        + t.d1_p * t.d2_q2));
-        n.d3_pr2 = 0.5
-            * (t.d3_pr2 / n.value
-                - 0.5 / (t.value * n.value)
-                    * (-1.5 / t.value * t.d1_r * t.d1_r * t.d1_p
-                        + t.d1_r * t.d2_pr
-                        + t.d1_r * t.d2_pr
-                        + t.d1_p * t.d2_r2));
-        n.d3_qr2 = 0.5
-            * (t.d3_qr2 / n.value
-                - 0.5 / (t.value * n.value)
-                    * (-1.5 / t.value * t.d1_r * t.d1_r * t.d1_q
-                        + t.d1_r * t.d2_qr
-                        + t.d1_r * t.d2_qr
-                        + t.d1_q * t.d2_r2));
-        n.d3_pqr = 0.5
-            * (t.d3_pqr / n.value
-                - 0.5 / (t.value * n.value)
-                    * (-1.5 / t.value * t.d1_p * t.d1_q * t.d1_r
-                        + t.d1_p * t.d2_qr
-                        + t.d1_q * t.d2_pr
-                        + t.d1_r * t.d2_pq));
+        let denominator = 2. * n.value;
+        n.d1_p = (self.d1_p) / denominator;
+        n.d1_q = (self.d1_q) / denominator;
+        n.d1_r = (self.d1_r) / denominator;
+        n.d2_p2 = ((-2. * n.d1_p).mul_add(n.d1_p, self.d2_p2)) / denominator;
+        n.d2_q2 = ((-2. * n.d1_q).mul_add(n.d1_q, self.d2_q2)) / denominator;
+        n.d2_r2 = ((-2. * n.d1_r).mul_add(n.d1_r, self.d2_r2)) / denominator;
+        n.d2_pq = ((-2. * n.d1_p).mul_add(n.d1_q, self.d2_pq)) / denominator;
+        n.d2_qr = ((-2. * n.d1_q).mul_add(n.d1_r, self.d2_qr)) / denominator;
+        n.d2_pr = ((-2. * n.d1_p).mul_add(n.d1_r, self.d2_pr)) / denominator;
+        n.d3_p3 = ((-6. * n.d1_p).mul_add(n.d2_p2, self.d3_p3)) / denominator;
+        n.d3_q3 = ((-6. * n.d1_q).mul_add(n.d2_q2, self.d3_q3)) / denominator;
+        n.d3_r3 = ((-6. * n.d1_r).mul_add(n.d2_r2, self.d3_r3)) / denominator;
+        n.d3_p2r = ((-2. * n.d2_p2).mul_add(n.d1_r, (-4. * n.d1_p).mul_add(n.d2_pr, self.d3_p2r)))
+            / denominator;
+        n.d3_p2q = ((-2. * n.d2_p2).mul_add(n.d1_q, (-4. * n.d1_p).mul_add(n.d2_pq, self.d3_p2q)))
+            / denominator;
+        n.d3_q2r = ((-2. * n.d2_q2).mul_add(n.d1_r, (-4. * n.d1_q).mul_add(n.d2_qr, self.d3_q2r)))
+            / denominator;
+        n.d3_pq2 = ((-4. * n.d2_pq).mul_add(n.d1_q, (-2. * n.d1_p).mul_add(n.d2_q2, self.d3_pq2)))
+            / denominator;
+        n.d3_pr2 = ((-4. * n.d2_pr).mul_add(n.d1_r, (-2. * n.d1_p).mul_add(n.d2_r2, self.d3_pr2)))
+            / denominator;
+        n.d3_qr2 = ((-4. * n.d2_qr).mul_add(n.d1_r, (-2. * n.d1_q).mul_add(n.d2_r2, self.d3_qr2)))
+            / denominator;
+        n.d3_pqr = ((-2. * n.d2_pr).mul_add(
+            n.d1_q,
+            (-2. * n.d2_pq).mul_add(n.d1_r, (-2. * n.d1_p).mul_add(n.d2_qr, self.d3_pqr)),
+        )) / denominator;
         n
     }
 
-    /// C `tanderiv.c`.
     pub(crate) fn tan(&self) -> Self {
-        let t = *self;
-        let mut n = Self::default();
-        n.value = t.value.tan();
-        n.d1_p = (1.0 + n.value * n.value) * t.d1_p;
-        n.d1_q = (1.0 + n.value * n.value) * t.d1_q;
-        n.d1_r = (1.0 + n.value * n.value) * t.d1_r;
-        n.d2_p2 = (1.0 + n.value * n.value) * t.d2_p2 + 2.0 * n.value * t.d1_p * n.d1_p;
-        n.d2_q2 = (1.0 + n.value * n.value) * t.d2_q2 + 2.0 * n.value * t.d1_q * n.d1_q;
-        n.d2_r2 = (1.0 + n.value * n.value) * t.d2_r2 + 2.0 * n.value * t.d1_r * n.d1_r;
-        n.d2_pq = (1.0 + n.value * n.value) * t.d2_pq + 2.0 * n.value * t.d1_p * n.d1_q;
-        n.d2_qr = (1.0 + n.value * n.value) * t.d2_qr + 2.0 * n.value * t.d1_q * n.d1_r;
-        n.d2_pr = (1.0 + n.value * n.value) * t.d2_pr + 2.0 * n.value * t.d1_p * n.d1_r;
-        n.d3_p3 = (1.0 + n.value * n.value) * t.d3_p3
-            + 2.0
-                * (n.value * (t.d2_p2 * n.d1_p + t.d2_p2 * n.d1_p + n.d2_p2 * t.d1_p)
-                    + t.d1_p * n.d1_p * n.d1_p);
-        n.d3_q3 = (1.0 + n.value * n.value) * t.d3_q3
-            + 2.0
-                * (n.value * (t.d2_q2 * n.d1_q + t.d2_q2 * n.d1_q + n.d2_q2 * t.d1_q)
-                    + t.d1_q * n.d1_q * n.d1_q);
-        n.d3_r3 = (1.0 + n.value * n.value) * t.d3_r3
-            + 2.0
-                * (n.value * (t.d2_r2 * n.d1_r + t.d2_r2 * n.d1_r + n.d2_r2 * t.d1_r)
-                    + t.d1_r * n.d1_r * n.d1_r);
-        n.d3_p2r = (1.0 + n.value * n.value) * t.d3_p2r
-            + 2.0
-                * (n.value * (t.d2_p2 * n.d1_r + t.d2_pr * n.d1_p + n.d2_pr * t.d1_p)
-                    + t.d1_p * n.d1_p * n.d1_r);
-        n.d3_p2q = (1.0 + n.value * n.value) * t.d3_p2q
-            + 2.0
-                * (n.value * (t.d2_p2 * n.d1_q + t.d2_pq * n.d1_p + n.d2_pq * t.d1_p)
-                    + t.d1_p * n.d1_p * n.d1_q);
-        n.d3_q2r = (1.0 + n.value * n.value) * t.d3_q2r
-            + 2.0
-                * (n.value * (t.d2_q2 * n.d1_r + t.d2_qr * n.d1_q + n.d2_qr * t.d1_q)
-                    + t.d1_q * n.d1_q * n.d1_r);
-        n.d3_pq2 = (1.0 + n.value * n.value) * t.d3_pq2
-            + 2.0
-                * (n.value * (t.d2_q2 * n.d1_p + t.d2_pq * n.d1_q + n.d2_pq * t.d1_q)
-                    + t.d1_q * n.d1_q * n.d1_p);
-        n.d3_pr2 = (1.0 + n.value * n.value) * t.d3_pr2
-            + 2.0
-                * (n.value * (t.d2_r2 * n.d1_p + t.d2_pr * n.d1_r + n.d2_pr * t.d1_r)
-                    + t.d1_r * n.d1_r * n.d1_p);
-        n.d3_qr2 = (1.0 + n.value * n.value) * t.d3_qr2
-            + 2.0
-                * (n.value * (t.d2_r2 * n.d1_q + t.d2_qr * n.d1_r + n.d2_qr * t.d1_r)
-                    + t.d1_r * n.d1_r * n.d1_q);
-        n.d3_pqr = (1.0 + n.value * n.value) * t.d3_pqr
-            + 2.0
-                * (n.value * (t.d2_pq * n.d1_r + t.d2_pr * n.d1_q + n.d2_qr * t.d1_p)
-                    + t.d1_p * n.d1_q * n.d1_r);
-        n
+        let value = self.value.tan();
+        let squared = value * value;
+        let first = 1. + squared;
+        self.compose(
+            value,
+            first,
+            2. * value * first,
+            2. * first * 3_f64.mul_add(squared, 1.),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quotient_and_square_root_recover_all_mixed_derivatives() {
+        let a = Dderivs {
+            value: 2.,
+            d1_p: 0.2,
+            d1_q: -0.3,
+            d1_r: 0.4,
+            d2_p2: 0.5,
+            d2_q2: -0.6,
+            d2_r2: 0.7,
+            d2_pq: 0.8,
+            d2_qr: -0.9,
+            d2_pr: 1.1,
+            d3_p3: -0.2,
+            d3_q3: 0.3,
+            d3_r3: -0.4,
+            d3_p2r: 0.5,
+            d3_p2q: -0.6,
+            d3_q2r: 0.7,
+            d3_pq2: -0.8,
+            d3_pr2: 0.9,
+            d3_qr2: -1.1,
+            d3_pqr: 1.2,
+        };
+        let b = Dderivs {
+            value: 3.,
+            d1_p: -0.3,
+            d1_q: 0.8,
+            d1_r: 0.1,
+            d2_pq: -0.4,
+            d2_pr: 0.5,
+            d2_q2: 0.2,
+            d3_pqr: -1.4,
+            ..Dderivs::default()
+        };
+        for result in [a.mul(&b).div(&b), a.mul(&a).sqrt()] {
+            assert!((result.value - a.value).abs() <= 8e-15, "value: {result:?}");
+            assert!((result.d1_p - a.d1_p).abs() <= 8e-15, "d1_p: {result:?}");
+            assert!((result.d1_q - a.d1_q).abs() <= 8e-15, "d1_q: {result:?}");
+            assert!((result.d1_r - a.d1_r).abs() <= 8e-15, "d1_r: {result:?}");
+            assert!((result.d2_p2 - a.d2_p2).abs() <= 8e-15, "d2_p2: {result:?}");
+            assert!((result.d2_q2 - a.d2_q2).abs() <= 8e-15, "d2_q2: {result:?}");
+            assert!((result.d2_r2 - a.d2_r2).abs() <= 8e-15, "d2_r2: {result:?}");
+            assert!((result.d2_pq - a.d2_pq).abs() <= 8e-15, "d2_pq: {result:?}");
+            assert!((result.d2_qr - a.d2_qr).abs() <= 8e-15, "d2_qr: {result:?}");
+            assert!((result.d2_pr - a.d2_pr).abs() <= 8e-15, "d2_pr: {result:?}");
+            assert!((result.d3_p3 - a.d3_p3).abs() <= 8e-15, "d3_p3: {result:?}");
+            assert!((result.d3_q3 - a.d3_q3).abs() <= 8e-15, "d3_q3: {result:?}");
+            assert!((result.d3_r3 - a.d3_r3).abs() <= 8e-15, "d3_r3: {result:?}");
+            assert!(
+                (result.d3_p2r - a.d3_p2r).abs() <= 8e-15,
+                "d3_p2r: {result:?}"
+            );
+            assert!(
+                (result.d3_p2q - a.d3_p2q).abs() <= 8e-15,
+                "d3_p2q: {result:?}"
+            );
+            assert!(
+                (result.d3_q2r - a.d3_q2r).abs() <= 8e-15,
+                "d3_q2r: {result:?}"
+            );
+            assert!(
+                (result.d3_pq2 - a.d3_pq2).abs() <= 8e-15,
+                "d3_pq2: {result:?}"
+            );
+            assert!(
+                (result.d3_pr2 - a.d3_pr2).abs() <= 8e-15,
+                "d3_pr2: {result:?}"
+            );
+            assert!(
+                (result.d3_qr2 - a.d3_qr2).abs() <= 8e-15,
+                "d3_qr2: {result:?}"
+            );
+            assert!(
+                (result.d3_pqr - a.d3_pqr).abs() <= 8e-15,
+                "d3_pqr: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quotient_does_not_overflow_squared_denominator_at_extreme_scale() {
+        let a = Dderivs {
+            value: 1e200,
+            d1_p: 1e200,
+            ..Dderivs::default()
+        };
+        let b = Dderivs {
+            value: 1e200,
+            d1_q: 1e200,
+            ..Dderivs::default()
+        };
+        let q = a.div(&b);
+        assert_eq!(q.value.to_bits(), 1_f64.to_bits());
+        assert_eq!(q.d1_p.to_bits(), 1_f64.to_bits());
+        assert_eq!(q.d1_q.to_bits(), (-1_f64).to_bits());
+        assert_eq!(q.d2_q2.to_bits(), 2_f64.to_bits());
+        assert_eq!(q.d2_pq.to_bits(), (-1_f64).to_bits());
+        assert_eq!(q.d3_q3.to_bits(), (-6_f64).to_bits());
     }
 }
