@@ -9,10 +9,6 @@
     clippy::similar_names,
     reason = "C-translated equation symbols retain the original names for numerical review"
 )]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
 
 use super::{Bias, Thermal};
 use crate::devices::nonlinear::{cubic_reverse_junction, exponential_junction, reverse_depletion};
@@ -102,7 +98,7 @@ fn intrinsic_junctions(t: &Thermal, bias: Bias, gmin: Real) -> IntrinsicJunction
         c_junction(vbe, vte, t.ise)
     };
     gben += gmin;
-    cben += gmin * vbe;
+    cben = gmin.mul_add(vbe, cben);
     let vtn = vt * t.nr;
     let (cbc, gbc) = c_junction(vbc, vtn, t.is_bc);
     let (mut cbcn, mut gbcn) = if t.isc == 0. {
@@ -111,7 +107,7 @@ fn intrinsic_junctions(t: &Thermal, bias: Bias, gmin: Real) -> IntrinsicJunction
         c_junction(vbc, vtc, t.isc)
     };
     gbcn += gmin;
-    cbcn += gmin * vbc;
+    cbcn = gmin.mul_add(vbc, cbcn);
     IntrinsicJunctions {
         be: Junction {
             current: cbe,
@@ -138,10 +134,19 @@ fn substrate_junction(t: &Thermal, vsub: Real, gmin: Real) -> Junction {
         let vts = vt * t.ns;
         if vsub <= -3. * vts {
             let (current, conductance) = cubic_reverse_junction(vsub, vts, iss);
-            (conductance + gmin, current + gmin * vsub)
+            (conductance + gmin, gmin.mul_add(vsub, current))
         } else {
-            let evsub = (vsub / vts).min(MAX_EXP_ARG).exp();
-            (iss * evsub / vts + gmin, iss * (evsub - 1.) + gmin * vsub)
+            let argument = (vsub / vts).min(MAX_EXP_ARG);
+            let exponential = argument.exp();
+            let incremental = if argument.abs() < 0.5 {
+                argument.exp_m1()
+            } else {
+                exponential - 1.
+            };
+            (
+                iss * exponential / vts + gmin,
+                gmin.mul_add(vsub, iss * incremental),
+            )
         }
     });
     Junction {
@@ -150,10 +155,10 @@ fn substrate_junction(t: &Thermal, vsub: Real, gmin: Real) -> Junction {
     }
 }
 
-/// Identical denominator in bjtload.c and bjtdset.c. Each caller
-/// retains its own inverse and derivative operation order.
+/// Identical denominator in bjtload.c and bjtdset.c. Fused subtraction
+/// retains the residual when the Early terms approach unity.
 pub(super) fn early_denominator(t: &Thermal, vbe: Real, vbc: Real) -> Real {
-    1. - t.inv_vaf * vbc - t.inv_var * vbe
+    (-t.inv_var).mul_add(vbe, (-t.inv_vaf).mul_add(vbc, 1.))
 }
 
 /// Base current in C's addition order. Inputs already obey the
@@ -180,8 +185,8 @@ fn base_charge(t: &Thermal, bias: Bias, junctions: IntrinsicJunctions) -> BaseCh
         dqbdve = q1 * qb * t.inv_var;
         dqbdvc = q1 * qb * t.inv_vaf;
     } else {
-        let q2 = t.inv_ikf * cbe + t.inv_ikr * cbc;
-        let x = 1. + 4. * q2;
+        let q2 = t.inv_ikf.mul_add(cbe, t.inv_ikr * cbc);
+        let x = 4_f64.mul_add(q2, 1.);
         // C's MAX(0, x).
         let arg = if 0. > x { 0. } else { x };
         let mut sqarg = 1.;
@@ -191,20 +196,44 @@ fn base_charge(t: &Thermal, bias: Bias, junctions: IntrinsicJunctions) -> BaseCh
                     sqarg = arg.sqrt();
                 }
                 qb = q1 * (1. + sqarg) / 2.;
-                dqbdve = q1 * (qb * t.inv_var + t.inv_ikf * gbe / sqarg);
-                dqbdvc = q1 * (qb * t.inv_vaf + t.inv_ikr * gbc / sqarg);
+                dqbdve = q1 * (qb.mul_add(t.inv_var, t.inv_ikf * gbe / sqarg));
+                dqbdvc = q1 * (qb.mul_add(t.inv_vaf, t.inv_ikr * gbc / sqarg));
             }
             Some(nkf) => {
                 if arg != 0. {
                     sqarg = arg.powf(nkf);
                 }
                 qb = q1 * (1. + sqarg) / 2.;
-                dqbdve = q1 * (qb * t.inv_var + t.inv_ikf * gbe * 2. * sqarg * nkf / arg);
-                dqbdvc = q1 * (qb * t.inv_vaf + t.inv_ikr * gbc * 2. * sqarg * nkf / arg);
+                dqbdve = q1 * (qb.mul_add(t.inv_var, t.inv_ikf * gbe * 2. * sqarg * nkf / arg));
+                dqbdvc = q1 * (qb.mul_add(t.inv_vaf, t.inv_ikr * gbc * 2. * sqarg * nkf / arg));
             }
         }
     }
     BaseCharge { qb, dqbdve, dqbdvc }
+}
+
+pub(super) const RESISTANCE_REDUCTION_SERIES: [Real; 5] =
+    [1., -4. / 15., -4. / 105., -8. / 1575., -4. / 6237.];
+pub(super) const RESISTANCE_SERIES_LIMIT: Real = 0.05;
+
+/// Rationalized current-dependent base resistance. The reference angle
+/// (sqrt(1+14.59025*r)-1)/(2.4317*sqrt(r)) loses digits as r -> 0.
+/// Dividing the rationalized denominator by sqrt(r) also handles r -> inf.
+fn resistance_reduction(ratio: Real) -> Real {
+    let inverse_root = ratio.sqrt().recip();
+    let angle =
+        (14.59025 / 2.4317) / (inverse_root + inverse_root.mul_add(inverse_root, 14.59025).sqrt());
+    if angle.abs() < RESISTANCE_SERIES_LIMIT {
+        let squared = angle * angle;
+        // The omitted z^10 term is below 8e-18 for |z|<0.05.
+        RESISTANCE_REDUCTION_SERIES
+            .iter()
+            .rev()
+            .fold(0., |value: Real, &c| value.mul_add(squared, c))
+    } else {
+        let tangent = angle.tan();
+        3. * (tangent - angle) / angle / tangent / tangent
+    }
 }
 
 fn transport(t: &Thermal, junctions: IntrinsicJunctions, base: BaseCharge) -> Transport {
@@ -238,15 +267,14 @@ fn transport(t: &Thermal, junctions: IntrinsicJunctions, base: BaseCharge) -> Tr
         let ratio = cb / t.irb;
         // C's MAX(cb/irb, 1e-9).
         let arg1 = if ratio > 1e-9 { ratio } else { 1e-9 };
-        let arg2 = (-1. + (1. + 14.59025 * arg1).sqrt()) / 2.4317 / arg1.sqrt();
-        let arg1 = arg2.tan();
-        t.rbm + 3. * rbpi * (arg1 - arg2) / arg2 / arg1 / arg1
+        rbpi.mul_add(resistance_reduction(arg1), t.rbm)
     };
     let gx = if gx == 0. { gx } else { 1. / gx };
     let gpi = gbe / t.bf + gben;
     let gmu = gbc / t.br + gbcn;
-    let go = (gbc + (cex - cbc) * dqbdvc / qb) / qb;
-    let gm = (gex - (cex - cbc) * dqbdve / qb) / qb - go;
+    let transport_current = (cex - cbc) / qb;
+    let go = transport_current.mul_add(dqbdvc, gbc) / qb;
+    let gm = (-transport_current).mul_add(dqbdve, gex) / qb - go;
     Transport {
         cc,
         cb,
@@ -295,8 +323,8 @@ fn forward_diffusion(t: &Thermal, bias: Bias, be: Junction, base: BaseCharge) ->
             (argtf, arg2, cbe * argtf * ovtf)
         };
         cbe = cbe * (1. + argtf) / qb;
-        gbe = (gbe * (1. + arg2) - cbe * dqbdve) / qb;
-        tf * (arg3 - cbe * dqbdvc) / qb
+        gbe = gbe.mul_add(1. + arg2, -cbe * dqbdve) / qb;
+        tf * (-cbe).mul_add(dqbdvc, arg3) / qb
     } else {
         0.
     };
@@ -338,8 +366,8 @@ fn charges(t: &Thermal, bias: Bias, junctions: IntrinsicJunctions, base: BaseCha
         reverse_depletion(vsub, czsub, ps, xms)
     } else {
         (
-            vsub * czsub * (1. + xms * vsub / (2. * ps)),
-            czsub * (1. + xms * vsub / ps),
+            vsub * czsub * (xms / (2. * ps)).mul_add(vsub, 1.),
+            czsub * (xms / ps).mul_add(vsub, 1.),
         )
     };
     Charges {
@@ -412,6 +440,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn base_resistance_retains_the_low_current_limit() {
+        // High-precision independent evaluation of the original
+        // tan-angle formula at C's positive clamp.
+        let expected = 0.999_999_997_600_046_1;
+        let actual = resistance_reduction(1e-9);
+        assert!((actual - expected).abs() < 5e-12, "{actual:.17}");
+        assert!(resistance_reduction(1e-9) <= 1.);
+        let at_large_current = resistance_reduction(Real::MAX);
+        assert!(at_large_current.is_finite() && at_large_current >= 0. && at_large_current < 1e-3);
+    }
+
+    #[test]
     fn junction_policies_use_their_own_reverse_boundary_and_gmin() {
         let t = thermal("is=1e-15 ise=1e-14 ne=2 iss=2e-16 ns=1.3", 27., true);
         let gmin = 1e-12;
@@ -435,9 +475,9 @@ mod tests {
             assert_eq!(actual.be.current.to_bits(), expected.0.to_bits());
             assert_eq!(actual.be.conductance.to_bits(), expected.1.to_bits());
             let (leak, conductance) = exponential_junction(voltage, t.ne * t.vt, t.ise);
-            assert_eq!(
-                actual.be_leakage.current.to_bits(),
-                (leak + gmin * voltage).to_bits()
+            let expected = leak + gmin * voltage;
+            assert!(
+                (actual.be_leakage.current - expected).abs() <= 4. * Real::EPSILON * expected.abs()
             );
             assert_eq!(
                 actual.be_leakage.conductance.to_bits(),
@@ -449,10 +489,8 @@ mod tests {
         let boundary = -3. * vts;
         let actual = substrate_junction(&t, boundary, gmin);
         let (current, conductance) = cubic_reverse_junction(boundary, vts, iss);
-        assert_eq!(
-            actual.current.to_bits(),
-            (current + gmin * boundary).to_bits()
-        );
+        let expected = current + gmin * boundary;
+        assert!((actual.current - expected).abs() <= 4. * Real::EPSILON * expected.abs());
         assert_eq!(actual.conductance.to_bits(), (conductance + gmin).to_bits());
     }
 }
