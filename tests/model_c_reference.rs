@@ -163,6 +163,51 @@ const ALIAS_CASES: &[(&str, &str, &[u8])] = &[
         "vd d 0 -1.5\nvg g 0 0\nm1 d g 0 0 mdl l=1u w=5u\n.model mdl pmos(vto=-0.5 kp=100u lambda=0.02 level=LEVEL)\n.dc vg 0 -2 -0.25",
         &[0, 1],
     ),
+    (
+        "r",
+        "v1 a 0 1\nr1 a b mdl l=10u w=2u\nr2 b 0 1k\n.model mdl r(rsh=100 level=LEVEL)\n.dc v1 0.5 2 0.25",
+        &[0, 1],
+    ),
+    (
+        "njf",
+        "vd d 0 3\nvg g 0 0\nj1 d g 0 mdl\n.model mdl njf(vto=-2 beta=1m lambda=0.02 b=0.8 level=LEVEL)\n.dc vg -2.5 0 0.25",
+        &[0, 1],
+    ),
+    (
+        "pjf",
+        "vd d 0 -3\nvg g 0 0\nj1 d g 0 mdl\n.model mdl pjf(vto=-2 beta=1m lambda=0.02 b=0.8 level=LEVEL)\n.dc vg 2.5 0 -0.25",
+        &[0, 1],
+    ),
+    (
+        "nmf",
+        "vd d 0 3\nvg g 0 0\nz1 d g 0 mdl\n.model mdl nmf(vto=-1.8 beta=3m lambda=0.05 alpha=2.5 b=0.4 level=LEVEL)\n.dc vg -2.5 0 0.25",
+        &[0, 1],
+    ),
+    (
+        "pmf",
+        "vd d 0 -3\nvg g 0 0\nz1 d g 0 mdl\n.model mdl pmf(vto=-1.8 beta=3m lambda=0.05 alpha=2.5 b=0.4 level=LEVEL)\n.dc vg 2.5 0 -0.25",
+        &[0, 1],
+    ),
+    (
+        "bsim3_nmos",
+        "vd d 0 1.2\nvg g 0 0\nm1 d g 0 0 mdl l=0.18u w=1u ad=1e-13 as=1e-13 pd=1.4u ps=1.4u\n.model mdl nmos(version=3.3.0 capmod=3 mobmod=1 tox=4.1n nch=2.3549e17 vth0=0.3694 u0=268.7 level=LEVEL)\n.dc vg 0 1.2 0.15",
+        &[8, 49],
+    ),
+    (
+        "bsim4_nmos",
+        "vd d 0 1.2\nvg g 0 0\nm1 d g 0 0 mdl l=0.18u w=1u ad=1e-13 as=1e-13 pd=1.4u ps=1.4u\n.model mdl nmos(version=4.8.3 vth0=0.45 toxe=4n level=LEVEL)\n.dc vg 0 1.2 0.15",
+        &[14, 54],
+    ),
+    (
+        "bsim3_pmos",
+        "vd d 0 -1.2\nvg g 0 0\nm1 d g 0 0 mdl l=0.18u w=1u ad=1e-13 as=1e-13 pd=1.4u ps=1.4u\n.model mdl pmos(version=3.3.0 capmod=3 mobmod=1 tox=4.1n nch=2.3549e17 vth0=-0.3694 u0=268.7 level=LEVEL)\n.dc vg 0 -1.2 -0.15",
+        &[8, 49],
+    ),
+    (
+        "bsim4_pmos",
+        "vd d 0 -1.2\nvg g 0 0\nm1 d g 0 0 mdl l=0.18u w=1u ad=1e-13 as=1e-13 pd=1.4u ps=1.4u\n.model mdl pmos(version=4.8.3 vth0=-0.45 toxe=4n level=LEVEL)\n.dc vg 0 -1.2 -0.15",
+        &[14, 54],
+    ),
 ];
 
 fn alias_deck(body: &str, level: u8) -> String {
@@ -188,7 +233,7 @@ fn simulate_alias(text: &str) -> Plot {
 #[test]
 fn selector_aliases_use_identical_rust_physics() {
     for &(name, body, levels) in ALIAS_CASES {
-        let expected = simulate_alias(&alias_deck(body, 1));
+        let expected = simulate_alias(&alias_deck(body, levels[0]));
         assert!(expected.point_count() >= 7);
         for &level in levels {
             assert_eq!(
