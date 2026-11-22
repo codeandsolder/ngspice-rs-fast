@@ -125,10 +125,10 @@ fn run_c_oracle(variable: &str, dir: &Path) -> RawFile {
 fn assert_plot_bits(actual: &Plot, expected: &Plot) {
     assert_eq!(actual.name, expected.name);
     assert_eq!(actual.plotname, expected.plotname);
-    assert_eq!(actual.flags, expected.flags);
-    assert_eq!(actual.variables, expected.variables);
-    assert_eq!(actual.points.len(), expected.points.len());
-    for (row, (actual, expected)) in actual.points.iter().zip(&expected.points).enumerate() {
+    assert_eq!(actual.flags(), expected.flags());
+    assert_eq!(actual.variables(), expected.variables());
+    assert_eq!(actual.point_count(), expected.point_count());
+    for (row, (actual, expected)) in actual.points().iter().zip(expected.points()).enumerate() {
         assert_eq!(actual.len(), expected.len());
         for (column, (a, b)) in actual.iter().zip(expected).enumerate() {
             assert_eq!(
@@ -146,7 +146,7 @@ fn capture_comparison_rejects_single_ulp_drift() {
     let saved = RawFile::load(root().join("m9_device_dc.raw")).unwrap();
     let expected = &saved.plots[0].plot;
     let mut actual = expected.clone();
-    let value = &mut actual.points[2][2].re;
+    let value = &mut actual.point_mut(2).unwrap()[2].re;
     *value = f64::from_bits(value.to_bits() - 1);
     assert_plot_bits(&actual, expected);
 }
@@ -157,8 +157,8 @@ fn capture_comparison_distinguishes_signed_zero() {
     let saved = RawFile::load(root().join("m9_device_dc.raw")).unwrap();
     let expected = &saved.plots[0].plot;
     let mut actual = expected.clone();
-    assert_eq!(actual.points[0][0].re.to_bits(), 0.0_f64.to_bits());
-    actual.points[0][0].re = -0.0;
+    assert_eq!(actual.points()[0][0].re.to_bits(), 0.0_f64.to_bits());
+    actual.point_mut(0).unwrap()[0].re = -0.0;
     assert_plot_bits(&actual, expected);
 }
 
