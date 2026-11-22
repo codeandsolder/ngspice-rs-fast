@@ -216,25 +216,60 @@ impl CoilGeometry {
 }
 
 /// `Lundin()` of `indsetup.c`: the correction factor of a solenoid.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "indsetup.c Lundin correction evaluates the original separately rounded polynomial"
-)]
+/// Horner form avoids a separately rounded fourth power. For short
+/// coils the reciprocal aspect ratio avoids overflowing its powers.
 fn lundin(length: Real, csect: Real) -> Real {
     if csect < 1e-12 || length < 1e-6 {
         return 1.;
     }
     let x = (csect / std::f64::consts::PI).sqrt() * 2. / length;
-    let xx = x * x;
-    let xxxx = xx * xx;
     if x < 1. {
-        let num = 1. + 0.383_901 * xx + 0.017_108 * xxxx;
-        let den = 1. + 0.258_952 * xx;
-        num / den - 4. * x / (3. * std::f64::consts::PI)
+        let xx = x * x;
+        let num = 0.017_108_f64.mul_add(xx, 0.383_901).mul_add(xx, 1.);
+        let den = 0.258_952_f64.mul_add(xx, 1.);
+        (-4. / (3. * std::f64::consts::PI)).mul_add(x, num / den)
     } else {
-        let num = ((4. * x).ln() - 0.5) * (1. + 0.383_901 / xx + 0.017_108 / xxxx);
-        let den = 1. + 0.258_952 / xx;
-        let kk = 0.093_842 / xx + 0.002_029 / xxxx - 0.000_801 / (xx * xxxx);
-        2. * (num / den + kk) / (std::f64::consts::PI * x)
+        let inverse = x.recip();
+        let xx = inverse * inverse;
+        let num = ((4. * x).ln() - 0.5) * 0.017_108_f64.mul_add(xx, 0.383_901).mul_add(xx, 1.);
+        let den = 0.258_952_f64.mul_add(xx, 1.);
+        let kk = (-0.000_801_f64)
+            .mul_add(xx, 0.002_029)
+            .mul_add(xx, 0.093_842)
+            * xx;
+        (2. / std::f64::consts::PI) * inverse * (num / den + kk)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lundin_matches_independent_polynomial_and_short_coil_limit() {
+        let pi = std::f64::consts::PI;
+        for x in [0.01_f64, 0.1, 0.999, 1., 2., 10., 1e20, 1e150] {
+            let length = 2. / x;
+            // Set length above the reference cutoff by using cross-section
+            // rather than shrinking the coil out of the model's domain.
+            let (length, area) = if length >= 1e-6 {
+                (length, pi)
+            } else {
+                (2., pi * x * x)
+            };
+            let expected = if x < 1. {
+                (1. + 0.383_901 * x.powi(2) + 0.017_108 * x.powi(4)) / (1. + 0.258_952 * x.powi(2))
+                    - 4. * x / (3. * pi)
+            } else {
+                let inverse = x.recip();
+                let numerator = ((4. * x).ln() - 0.5)
+                    * (1. + 0.383_901 * inverse.powi(2) + 0.017_108 * inverse.powi(4));
+                let denominator = 1. + 0.258_952 * inverse.powi(2);
+                let correction = 0.093_842 * inverse.powi(2) + 0.002_029 * inverse.powi(4)
+                    - 0.000_801 * inverse.powi(6);
+                2. * (numerator / denominator + correction) / (pi * x)
+            };
+            assert!((lundin(length, area) - expected).abs() <= 8. * Real::EPSILON * expected.abs());
+        }
     }
 }

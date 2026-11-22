@@ -312,11 +312,29 @@ pub(crate) const fn squared_gain(transfer: Complex) -> Real {
     transfer.re * transfer.re + transfer.im * transfer.im
 }
 
-/// Coherent sum of both thermal generators, following `NevalSrc2`.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "NevalSrc2 adds the first generator before the second generator's imaginary contribution"
-)]
+/// Error-free addition of two finite binary64 values (unless the sum
+/// overflows). Paired with the fused product residual this preserves
+/// near-cancellation in the coherent thermal amplitude, before squaring.
+fn sum_with_residual(a: Real, b: Real) -> (Real, Real) {
+    let sum = a + b;
+    let tail = sum - a;
+    (sum, (a - (sum - tail)) + (b - tail))
+}
+
+fn coherent_component(terms: [(Real, Real); 3]) -> Real {
+    let [(a, b), (c, d), (e, f)] = terms;
+    let (p, q, r) = (a * b, c * d, e * f);
+    let (first, first_error) = sum_with_residual(p, q);
+    let (sum, sum_error) = sum_with_residual(first, r);
+    if !sum.is_finite() {
+        return sum;
+    }
+    let product_error = a.mul_add(b, -p) + c.mul_add(d, -q) + e.mul_add(f, -r);
+    sum + (first_error + sum_error + product_error)
+}
+
+/// Coherent sum of both thermal generators, following `NevalSrc2`'s
+/// complex transfer convention with compensated product summation.
 fn correlated_gain(
     first: Complex,
     second: Complex,
@@ -326,10 +344,19 @@ fn correlated_gain(
 ) -> Real {
     let first_scale = conductance.sqrt();
     let second_scale = second_conductance.sqrt();
-    let in_phase = second_scale * phase.cos();
-    let quadrature = second_scale * phase.sin();
-    let real = first_scale * first.re + in_phase * second.re - quadrature * second.im;
-    let imag = first_scale * first.im + in_phase * second.im + quadrature * second.re;
+    let (sin, cos) = phase.sin_cos();
+    let in_phase = second_scale * cos;
+    let quadrature = second_scale * sin;
+    let real = coherent_component([
+        (first_scale, first.re),
+        (in_phase, second.re),
+        (-quadrature, second.im),
+    ]);
+    let imag = coherent_component([
+        (first_scale, first.im),
+        (in_phase, second.im),
+        (quadrature, second.re),
+    ]);
     squared_gain(Complex::new(real, imag))
 }
 
@@ -621,10 +648,16 @@ mod tests {
         let real = 2. * first.re + in_phase * second.re - quadrature * second.im;
         let imag = 2. * first.im + in_phase * second.im + quadrature * second.re;
         let reference = real * real + imag * imag;
-        assert_eq!(
-            correlated_gain(first, second, 4., 9., angle).to_bits(),
-            reference.to_bits()
+        assert!(
+            (correlated_gain(first, second, 4., 9., angle) - reference).abs()
+                <= 8. * Real::EPSILON * reference
         );
+        // Each scaled product is about 2^52; the original rounded
+        // products obscure the one-unit input difference.
+        let a = Complex::real(4_503_599_627_370_496.);
+        let b = Complex::real(-4_503_599_627_370_495.);
+        assert!((correlated_gain(a, b, 2., 2., 0.) - 2.).abs() <= 4. * Real::EPSILON);
+        assert_eq!(correlated_gain(a, Complex::real(-a.re), 2., 2., 0.), 0.);
     }
 
     #[test]
