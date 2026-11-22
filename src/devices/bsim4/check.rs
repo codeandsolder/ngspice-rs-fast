@@ -121,11 +121,12 @@ fn check_required(
     p: &mut SizeParam,
     messages: &mut Vec<String>,
 ) -> bool {
-    let mut Fatal_Flag: i32 = 0;
-    if m.toxe <= 0.0 {
+    let mut Fatal_Flag = if m.toxe <= 0.0 {
         messages.push(format!("Fatal: Toxe = {} is not positive.", c_g(m.toxe)));
-        Fatal_Flag = 1;
-    }
+        1
+    } else {
+        0
+    };
     if h.toxp <= 0.0 {
         messages.push(format!("Fatal: Toxp = {} is not positive.", c_g(h.toxp)));
         Fatal_Flag = 1;
