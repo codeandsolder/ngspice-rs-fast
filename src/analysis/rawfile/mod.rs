@@ -624,7 +624,7 @@ impl<R: BufRead> Cursor<R> {
                 if error.kind() == io::ErrorKind::InvalidData {
                     unsupported("rawfile header or ASCII value is not UTF-8 text")
                 } else {
-                    input_error(error)
+                    input_error(&error)
                 }
             })? == 0
             {
@@ -644,8 +644,8 @@ impl<R: BufRead> Cursor<R> {
     }
 }
 
-fn input_error(error: io::Error) -> SpiceError {
-    SpiceError::io("<rawfile input>", &error)
+fn input_error(error: &io::Error) -> SpiceError {
+    SpiceError::io("<rawfile input>", error)
 }
 
 fn parse_count(key: &str, value: &str) -> SpiceResult<usize> {
@@ -1072,7 +1072,7 @@ impl<R: BufRead> RawPlotRows<'_, R> {
                 self.reader.byte_order,
                 &mut self.consumed,
             )
-            .map_err(input_error)?
+            .map_err(|error| input_error(&error))?
             else {
                 return Err(unsupported(format!(
                     "truncated binary rawfile: No. Variables: {columns} x No. Points: {} needs {} byte(s) of data, but only {} byte(s) remain",
