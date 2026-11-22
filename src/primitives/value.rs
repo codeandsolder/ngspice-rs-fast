@@ -26,6 +26,7 @@
 //! `1kohm` is `1000`. Anything else after the literal — `1k2` — is rejected by
 //! [`parse_spice_number`]; see the RKM note on that function.
 
+use super::exact::{ScaledNumber, exact_product_sum};
 use super::numeric::{DecimalMultiplier, rounded_decimal, scale_power, split_power};
 use std::fmt;
 use std::ops::{Add, Div, Mul, Neg, Sub};
@@ -279,19 +280,6 @@ fn quotient_numerator_lost_range(sum: Real, first: Real, second: Real) -> bool {
         && first.abs().max(second.abs()) < Real::from_bits(54_u64 << 52)
 }
 
-/// A number represented outside the native binary64 exponent range.
-#[derive(Clone, Copy)]
-struct ScaledNumber {
-    mantissa: Real,
-    exponent: i32,
-}
-
-impl ScaledNumber {
-    fn divide(self, rhs: Self) -> Real {
-        scale_power(self.mantissa / rhs.mantissa, self.exponent - rhs.exponent)
-    }
-}
-
 /// An exponent-scaled product with its exact rounding residual. Keeping
 /// products independent preserves each quotient component even with a
 /// very large dynamic range between the real and imaginary inputs. The
@@ -369,180 +357,6 @@ fn scaled_complex_div(a: Complex, b: Complex) -> Complex {
         p(a.re, b.re).add(p(a.im, b.im)).divide(denominator),
         p(a.im, b.re).add(p(-a.re, b.im)).divide(denominator),
     )
-}
-
-/// Exact signed binary64 product as an integer significand and exponent.
-/// The input pair is finite; its product needs at most 106 bits.
-#[derive(Clone, Copy)]
-struct ExactTerm {
-    significand: i128,
-    exponent: i32,
-}
-
-impl ExactTerm {
-    fn new(a: Real, b: Real) -> Self {
-        let unpack = |v: Real| {
-            let bits = v.to_bits();
-            let biased = i32::try_from((bits >> 52) & 0x7ff).unwrap_or_default();
-            let fraction = bits & 0x000f_ffff_ffff_ffff;
-            let significand = if biased == 0 {
-                fraction
-            } else {
-                fraction | (1 << 52)
-            };
-            (significand, biased.max(1) - 1075)
-        };
-        let (a_int, a_exp) = unpack(a);
-        let (b_int, b_exp) = unpack(b);
-        let abs = i128::from(a_int) * i128::from(b_int);
-        Self {
-            significand: if a.is_sign_negative() == b.is_sign_negative() {
-                abs
-            } else {
-                -abs
-            },
-            exponent: a_exp + b_exp,
-        }
-    }
-}
-
-/// Exact sum of up to four products, before normalization and rounding.
-/// With exponents within 19 bits, four 106-bit significands fit in a
-/// signed i128. Use the full finite-binary64 superaccumulator only when
-/// the products span a wider range.
-#[cold]
-fn exact_product_sum<const N: usize>(pairs: [(Real, Real); N]) -> ScaledNumber {
-    let terms = pairs.map(|(a, b)| ExactTerm::new(a, b));
-    let mut min = i32::MAX;
-    let mut max = i32::MIN;
-    for term in terms.iter().filter(|term| term.significand != 0) {
-        min = min.min(term.exponent);
-        max = max.max(term.exponent);
-    }
-    if min > max {
-        return ScaledNumber {
-            mantissa: 0.,
-            exponent: 0,
-        };
-    }
-    if max - min <= 19 {
-        let sum = terms
-            .iter()
-            .filter(|term| term.significand != 0)
-            .map(|term| term.significand << (term.exponent - min))
-            .sum::<i128>();
-        return scaled_integer(sum, min);
-    }
-    wide_product_sum(&terms)
-}
-
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "round the exact integer sum once to binary64"
-)]
-fn scaled_integer(sum: i128, exponent: i32) -> ScaledNumber {
-    if sum == 0 {
-        return ScaledNumber {
-            mantissa: 0.,
-            exponent: 0,
-        };
-    }
-    let (mantissa, shift) = split_power(sum as Real);
-    ScaledNumber {
-        mantissa,
-        exponent: exponent + shift,
-    }
-}
-
-/// 66 limbs cover the full finite binary64 product range, including
-/// four maximal products. Positive and negative sums stay separate
-/// until subtraction, so even cancellation across a huge exponent
-/// spread cannot erase a nonzero determinant.
-#[cold]
-fn wide_product_sum(terms: &[ExactTerm]) -> ScaledNumber {
-    const LIMBS: usize = 66;
-    const MIN_EXP: i32 = -2148;
-    let mut positive = [0_u64; LIMBS];
-    let mut negative = [0_u64; LIMBS];
-    for term in terms.iter().filter(|term| term.significand != 0) {
-        let product = term.significand.unsigned_abs();
-        let shift = usize::try_from(term.exponent - MIN_EXP).unwrap_or_default();
-        let index = shift / 64;
-        let offset = shift % 64;
-        let bytes = product.to_le_bytes();
-        let lo = u64::from_le_bytes(*bytes.first_chunk::<8>().unwrap_or(&[0; 8]));
-        let hi = u64::from_le_bytes(*bytes.last_chunk::<8>().unwrap_or(&[0; 8]));
-        let parts = if offset == 0 {
-            [lo, hi, 0]
-        } else {
-            [
-                lo << offset,
-                (hi << offset) | (lo >> (64 - offset)),
-                hi >> (64 - offset),
-            ]
-        };
-        let out = if term.significand > 0 {
-            &mut positive
-        } else {
-            &mut negative
-        };
-        let mut carry = false;
-        for (i, slot) in out[index..].iter_mut().enumerate() {
-            let (value, overflow) = slot.overflowing_add(parts.get(i).copied().unwrap_or_default());
-            let (value, next) = value.overflowing_add(u64::from(carry));
-            *slot = value;
-            carry = overflow || next;
-            if i >= 2 && !carry {
-                break;
-            }
-        }
-    }
-    let negative_sign = positive.iter().rev().cmp(negative.iter().rev()).is_lt();
-    let (mut magnitude, subtrahend) = if negative_sign {
-        (negative, positive)
-    } else {
-        (positive, negative)
-    };
-    let mut borrow = false;
-    for (value, other) in magnitude.iter_mut().zip(subtrahend) {
-        let (diff, underflow) = value.overflowing_sub(other);
-        let (diff, next) = diff.overflowing_sub(u64::from(borrow));
-        *value = diff;
-        borrow = underflow || next;
-    }
-    let Some(index) = magnitude.iter().rposition(|&word| word != 0) else {
-        return ScaledNumber {
-            mantissa: 0.,
-            exponent: 0,
-        };
-    };
-    let high_bit = index * 64 + usize::try_from(magnitude[index].ilog2()).unwrap_or_default();
-    let exponent = i32::try_from(high_bit).unwrap_or_default() + MIN_EXP;
-    let shift = high_bit.saturating_sub(52);
-    let limb = shift / 64;
-    let offset = shift % 64;
-    let mut significand = magnitude[limb] >> offset;
-    if offset != 0 {
-        significand |= magnitude.get(limb + 1).copied().unwrap_or_default() << (64 - offset);
-    }
-    if high_bit < 52 {
-        significand <<= 52 - high_bit;
-    } else if shift != 0 {
-        let halfway = shift - 1;
-        let halfway_limb = halfway / 64;
-        let halfway_mask = 1_u64 << (halfway % 64);
-        let halfway_set = magnitude[halfway_limb] & halfway_mask != 0;
-        let sticky = magnitude[halfway_limb] & (halfway_mask - 1) != 0
-            || magnitude[..halfway_limb].iter().any(|&word| word != 0);
-        significand += u64::from(halfway_set && (sticky || significand & 1 != 0));
-    }
-    // The implicit bit at 52 supplies the low exponent bit; adding
-    // rather than masking also handles rounding the significand to 2.
-    let mantissa = Real::from_bits((1022_u64 << 52) + significand);
-    ScaledNumber {
-        mantissa: if negative_sign { -mantissa } else { mantissa },
-        exponent,
-    }
 }
 
 /// Accurate (value * pivot - upper * lower) / pivot. All four inputs

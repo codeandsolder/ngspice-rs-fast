@@ -97,8 +97,11 @@ heap allocations with `valgrind --tool=dhat`.
 
 ### Numerical reconciliation
 
-Retained and streaming integration now use the same compensated panel
-accumulator, including weighted RMS evaluated in binary exponent units.
+Retained and streaming integration use the same bounded panel reducer.
+Signed areas are accumulated as exact weighted products (#138); AVG
+normalizes before rounding, while RMS evaluates weighted squares in binary
+exponent units. Signed streaming quadrature uses one fixed-size accumulator
+per active integral, independent of the number of accepted points.
 RMS normalizes using the covered axis width only after all panels have
 been consumed. No squared ordinate or span-weighted square must be
 representable in binary64. Positive normalized quadrature is bounded

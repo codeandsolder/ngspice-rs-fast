@@ -485,21 +485,21 @@ fn no_samples(card: &MeasureCard) -> SpiceError {
 /// interpolation is emitted only after a real in-window sample is seen.
 struct StatisticState {
     extrema: Option<Extrema>,
-    integral: Option<Integral>,
+    integral: Option<Box<Integral>>,
     previous: Option<(Real, SpiceResult<Real>)>,
     seen: bool,
     done: bool,
 }
 
 impl StatisticState {
-    const fn new(statistic: MeasureStatistic) -> Self {
+    fn new(statistic: MeasureStatistic) -> Self {
         Self {
             extrema: None,
             integral: if matches!(
                 statistic,
                 MeasureStatistic::Avg | MeasureStatistic::Rms | MeasureStatistic::Integ
             ) {
-                Some(Integral::new(statistic))
+                Some(Box::new(Integral::new(statistic)))
             } else {
                 None
             },

@@ -39,9 +39,10 @@ use crate::primitives::{AnalysisKind, Complex, Real, SpiceError, SpiceResult};
 use super::ordered_samples::{
     AxisError, OrderedAxis, SampleError, SampleWindow, column_names, same_coordinate,
 };
-use super::reduction::{CompensatedSum, ScaledSquares};
+use super::reduction::ScaledSquares;
 use crate::analysis::results::Plot;
 use crate::analysis::selection::{self, Column};
+use crate::primitives::ExactSum;
 
 /// One named measurement result.
 #[derive(Debug, Clone, PartialEq)]
@@ -478,8 +479,7 @@ impl Window {
     /// The window's samples, with both boundaries interpolated exactly.
     ///
     /// A boundary strictly inside a bracket is interpolated, as C's
-    /// Enhancement-302 does, so `AVG` over `[from, to]` equals
-    /// `INTEG/(to - from)` exactly. The bracket always has positive width here:
+    /// Enhancement-302 does. AVG and INTEG share the same clipped endpoints. The bracket always has positive width here:
     /// a zero-width bracket is a jump and its value *is* the boundary.
     fn clipped<'a>(
         &self,
@@ -807,11 +807,11 @@ fn extrema(
 
 /// Shared incremental panel reducer. Simpson uses four lookahead samples,
 /// with one overlapping endpoint, and the positive span from the actual
-/// stored coordinates. AVG uses the same midpoint/compensated trapezoids.
+/// stored coordinates. AVG uses exact weighted trapezoids.
 struct Integral {
     panel: [(Real, Real); 4],
     count: usize,
-    area: CompensatedSum,
+    area: ExactSum,
     rms: ScaledSquares,
     rms_maximum: Real,
     statistic: MeasureStatistic,
@@ -822,7 +822,7 @@ impl Integral {
         Self {
             panel: [(0., 0.); 4],
             count: 0,
-            area: CompensatedSum::with_initial(0.),
+            area: ExactSum::new(),
             rms: ScaledSquares::new(),
             rms_maximum: 0.,
             statistic,
@@ -850,35 +850,27 @@ impl Integral {
         };
         if h > 0. {
             let span = self.panel[consumed].0 - self.panel[0].0;
+            // Exact integer numerators for the normalized quadrature rules.
+            let weights = match consumed {
+                3 => [3, 9, 9, 3],
+                2 => [4, 16, 4, 0],
+                _ => [12, 12, 0, 0],
+            };
             if self.statistic == MeasureStatistic::Rms {
-                let weights: &[Real] = match consumed {
-                    3 => &[1. / 8., 3. / 8., 3. / 8., 1. / 8.],
-                    2 => &[1. / 6., 2. / 3., 1. / 6.],
-                    _ => &[0.5, 0.5],
-                };
                 let maximum = &mut self.rms_maximum;
                 self.rms.add_weighted(
                     span,
-                    self.panel
-                        .iter()
-                        .zip(weights)
-                        .map(|(&(_, value), &weight)| {
+                    self.panel.iter().zip(weights).take(consumed + 1).map(
+                        |(&(_, value), weight)| {
                             let magnitude = value.abs();
                             *maximum = maximum.max(magnitude);
-                            (magnitude, weight)
-                        }),
+                            (magnitude, Real::from(weight) / 24.)
+                        },
+                    ),
                 );
             } else {
-                let y = |i: usize| self.panel[i].1;
-                let mean = match consumed {
-                    3 => 0.25_f64.mul_add(
-                        Real::midpoint(y(0), y(3)),
-                        0.75 * Real::midpoint(y(1), y(2)),
-                    ),
-                    2 => (1. / 3_f64).mul_add(Real::midpoint(y(0), y(2)), (2. / 3.) * y(1)),
-                    _ => Real::midpoint(y(0), y(1)),
-                };
-                self.area.add(mean * span);
+                self.area
+                    .add_weighted(span, self.panel.map(|(_, value)| value), weights);
             }
         }
         self.panel.copy_within(consumed..self.count, 0);
@@ -888,7 +880,6 @@ impl Integral {
         while self.count >= 2 {
             self.consume();
         }
-        let area = self.area.total();
         let result = match self.statistic {
             // Positive normalized quadrature cannot exceed the largest sample.
             // Rounding of the weights/norm can otherwise overflow a constant MAX trace.
@@ -900,8 +891,8 @@ impl Integral {
                     norm
                 }
             }
-            MeasureStatistic::Avg => area / width,
-            _ => area,
+            MeasureStatistic::Avg => self.area.panel_result(width),
+            _ => self.area.panel_result(1.),
         };
         if !result.is_finite() {
             return Err(nonfinite(

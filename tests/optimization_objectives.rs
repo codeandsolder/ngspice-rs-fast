@@ -1203,3 +1203,86 @@ fn streaming_extreme_rms_crossing_and_derivative_keep_conditioned_arithmetic() {
         }
     }
 }
+
+#[test]
+fn signed_panel_range_survives_both_measurement_paths() {
+    let scope = ParamScope::root(&[]).unwrap();
+    let tiny = Real::from_bits(1);
+    let fixtures = [
+        ("AVG", vec![(0., 1e308, 0.), (2., 1e308, 0.)], Some(1e308)),
+        (
+            "AVG",
+            vec![(0., 1e-300, 0.), (1e-100, 1e-300, 0.)],
+            Some(1e-300),
+        ),
+        ("AVG", vec![(0., tiny, 0.), (tiny, tiny, 0.)], Some(tiny)),
+        ("INTEG", vec![(0., 1e308, 0.), (2., 1e308, 0.)], None),
+        (
+            "INTEG",
+            vec![
+                (0., 1e308, 0.),
+                (2., 1e308, 0.),
+                (2., -1e308, 0.),
+                (4., -1e308, 0.),
+                (4., 1., 0.),
+                (5., 1., 0.),
+            ],
+            Some(1.),
+        ),
+        (
+            "INTEG",
+            vec![
+                (0., 1., 0.),
+                (1., 1., 0.),
+                (1., 1e308, 0.),
+                (3., 1e308, 0.),
+                (3., -1e308, 0.),
+                (5., -1e308, 0.),
+            ],
+            Some(1.),
+        ),
+        (
+            "INTEG",
+            vec![
+                (0., 1e308, 0.),
+                (2., 1e308, 0.),
+                (2., 1., 0.),
+                (3., 1., 0.),
+                (3., -1e308, 0.),
+                (5., -1e308, 0.),
+            ],
+            Some(1.),
+        ),
+        (
+            "AVG",
+            vec![(0., -Real::MAX, 0.), (2., -Real::MAX, 0.)],
+            Some(-Real::MAX),
+        ),
+        (
+            "INTEG",
+            vec![(0., 0., 0.), (1., 1., 0.), (2., 8., 0.), (3., 27., 0.)],
+            Some(20.25),
+        ),
+    ];
+    for (statistic, rows, expected) in fixtures {
+        let parsed = parsed(&format!(".meas tran metric {statistic} v(out)"));
+        let full = plot(&rows, 3);
+        let bound = PlotObjectivePlan::bind(
+            &full,
+            AnalysisKind::Transient,
+            ObjectiveRequests {
+                measurements: parsed.measurements.clone(),
+                ..ObjectiveRequests::default()
+            },
+        )
+        .unwrap();
+        let actual = finish(&ScenarioPlan::new(vec![bound]), &full, &scope);
+        assert_eq!(actual.retained_cells, 0);
+        let retained = measure::resolve(&full, AnalysisKind::Transient, &parsed.measurements);
+        assert_eq!(actual.measurements, retained);
+        match expected {
+            Some(value) => assert_eq!(retained.unwrap()[0].value.to_bits(), value.to_bits()),
+            None => assert!(retained.is_err()),
+        }
+    }
+}
