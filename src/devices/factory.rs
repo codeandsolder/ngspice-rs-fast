@@ -845,4 +845,30 @@ mod tests {
         assert_eq!(port.z0.to_bits(), 75_f64.to_bits());
         assert_eq!(port.internal, nodes.get("v1#res").unwrap());
     }
+    #[test]
+    fn waveform_alias_uses_shared_kind_and_mismatched_ast_is_rejected() {
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("waveform-alias.cir"),
+                "title\nv1 a 0 sine(0 1 1k)\n.end\n",
+            ))
+            .unwrap();
+        let mut instance = deck.devices[0].clone();
+        assert!(instantiate_source(&instance, &mut NodeTable::new()).is_ok());
+        let parameter = instance
+            .parameters
+            .iter_mut()
+            .find(|p| matches!(p.kind, ParameterKind::Waveform(_)))
+            .unwrap();
+        parameter.name = "exp".to_owned();
+        let mut nodes = NodeTable::new();
+        let before = nodes.nodes().to_vec();
+        let error = instantiate_source(&instance, &mut nodes).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its typed coefficients")
+        );
+        assert_eq!(nodes.nodes(), before);
+    }
 }
