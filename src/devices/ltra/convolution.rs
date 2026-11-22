@@ -11,10 +11,10 @@
 //!
 //! Preserve the C convolution and auxiliary-index policy, with local
 //! interval formulas and exponentially scaled Bessel products to avoid
-//! cancellation and overflow in finite physical responses. The modified Bessel functions are the polynomial
-//! approximations of Abramowitz and Stegun 9.8.1-9.8.4 that `ltramisc.c` uses
-//! (`bessI0`, `bessI1`, `bessI1xOverX`); `erfc` is a separate implementation
-//! (see [`erfc`]).
+//! cancellation and overflow in finite physical responses. Modified Bessel
+//! functions use accurate Taylor polynomials at small arguments and the
+//! Abramowitz and Stegun large-argument approximations from `ltramisc.c`.
+//! The complementary error function uses a separate implementation (see [`erfc`]).
 
 #![expect(
     clippy::float_cmp,

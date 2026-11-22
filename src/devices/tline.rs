@@ -429,13 +429,13 @@ impl TransmissionLine {
         // Preserve exact accepted waves, including signed zeros. Form
         // Lagrange weights from dimensionless ratios: products of tiny
         // time differences can underflow before their denominators cancel.
-        if target == t1 {
+        if target - t1 == 0. {
             return Ok(first.values);
         }
-        if target == t2 {
+        if target - t2 == 0. {
             return Ok(second.values);
         }
-        if target == t3 {
+        if target - t3 == 0. {
             return Ok(third.values);
         }
         let weights = [

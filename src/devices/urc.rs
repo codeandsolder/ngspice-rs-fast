@@ -170,6 +170,30 @@ pub struct UrcSections {
     pub diode: Option<(Real, Real)>,
 }
 
+/// Sum the actual rounded geometric sequence and its prefix.
+fn geometric_normalization(p: Real, lumps: usize) -> Option<(Real, Real)> {
+    // Normalize the actual sequence of rounded section weights, not
+    // p^n-1 (cancellation near unity) or expm1(n*ln(p)) (amplifies
+    // logarithm rounding for large n). Setup already visits every
+    // section to validate it, and this bounded pass uses constant space.
+    let mut prop = 1.;
+    let mut sum = 0.;
+    let mut correction = 0.;
+    for _ in 1..lumps {
+        let adjusted = prop - correction;
+        let next = sum + adjusted;
+        correction = (next - sum) - adjusted;
+        sum = next;
+        prop *= p;
+    }
+    let before_last = sum;
+    let all = sum + (prop - correction);
+    if !all.is_finite() {
+        return None;
+    }
+    Some((all, before_last))
+}
+
 impl UrcSections {
     /// Applies `urcsetup.c` to validated model and instance values.
     ///
@@ -257,25 +281,8 @@ impl UrcSections {
             reason = "the number of URC sections is bounded by MAX_LUMPS and represented in the C real-valued formula"
         )]
         let n = lumps as Real;
-        // Normalize the actual sequence of rounded section weights, not
-        // p^n-1 (cancellation near unity) or expm1(n*ln(p)) (amplifies
-        // logarithm rounding for large n). Setup already visits every
-        // section to validate it, and this bounded pass uses constant space.
-        let mut prop = 1.;
-        let mut sum = 0.;
-        let mut correction = 0.;
-        for _ in 1..lumps {
-            let adjusted = prop - correction;
-            let next = sum + adjusted;
-            correction = (next - sum) - adjusted;
-            sum = next;
-            prop *= p;
-        }
-        let before_last = sum;
-        let all = sum + (prop - correction);
-        if !all.is_finite() {
-            return Err(invalid("nonfinite geometric normalization".into()));
-        }
+        let (all, before_last) = geometric_normalization(p, lumps)
+            .ok_or_else(|| invalid("nonfinite geometric normalization".into()))?;
         // R has two of every section, C/I have two except the middle.
         let rden = 2. * all;
         let cden = all + before_last;

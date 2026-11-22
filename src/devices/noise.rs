@@ -322,14 +322,16 @@ fn sum_with_residual(a: Real, b: Real) -> (Real, Real) {
 }
 
 fn coherent_component(terms: [(Real, Real); 3]) -> Real {
-    let [(a, b), (c, d), (e, f)] = terms;
-    let (p, q, r) = (a * b, c * d, e * f);
+    let [first_term, second_term, third_term] = terms;
+    let [p, q, r] = terms.map(|(left, right)| left * right);
     let (first, first_error) = sum_with_residual(p, q);
     let (sum, sum_error) = sum_with_residual(first, r);
     if !sum.is_finite() {
         return sum;
     }
-    let product_error = a.mul_add(b, -p) + c.mul_add(d, -q) + e.mul_add(f, -r);
+    let product_error = first_term.0.mul_add(first_term.1, -p)
+        + second_term.0.mul_add(second_term.1, -q)
+        + third_term.0.mul_add(third_term.1, -r);
     sum + (first_error + sum_error + product_error)
 }
 

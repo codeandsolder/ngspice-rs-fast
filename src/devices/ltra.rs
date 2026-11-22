@@ -745,6 +745,10 @@ impl LossyLine {
 
     /// Evaluate the delayed waveform using C's strict lower bracket and
     /// last-two extrapolation, independent of coefficient preparation.
+    #[expect(
+        clippy::float_cmp,
+        reason = "exact accepted knots preserve stored samples and signed zero"
+    )]
     fn delayed_values(&self, history: DelaySamples<'_, 4>, time: Real) -> SpiceResult<[Real; 4]> {
         let m = &self.model;
         let times = history.times();
@@ -811,7 +815,7 @@ impl LossyLine {
             2
         };
         for (k, value) in delayed.iter_mut().enumerate() {
-            let (mut d, out_of_range) = if let Some(weights) = qf {
+            let (mut d, out_of_range) = qf.map_or((0., false), |weights| {
                 let values = [left[k], middle[k], right[k]];
                 let base = values[anchor];
                 let [a, b] = [(anchor + 1) % 3, (anchor + 2) % 3];
@@ -830,9 +834,7 @@ impl LossyLine {
                     d > left[k].max(middle[k]).max(right[k])
                         || d < left[k].min(middle[k]).min(right[k]),
                 )
-            } else {
-                (0., false)
-            };
+            });
             // C falls back to linear for lininterp, at the first sample,
             // and for mixedinterp when the quadratic leaves the samples'
             // range (quadinterp keeps the out-of-range value).
@@ -1161,7 +1163,11 @@ impl LossyLine {
 
     /// `ltraacct.c`'s slope-change test on the attenuated waves of one port.
     fn slope_changed(&self, d1: Real, d2: Real) -> bool {
-        (d1 - d2).abs() >= self.model.reltol * d1.abs().max(d2.abs()) + self.model.abstol
+        (d1 - d2).abs()
+            >= self
+                .model
+                .reltol
+                .mul_add(d1.abs().max(d2.abs()), self.model.abstol)
     }
 }
 
@@ -1300,7 +1306,7 @@ impl DelayLine for LossyLine {
         let times = history.times();
         let count = times.len();
         let time = context.time;
-        let wave = |v: Real, i: Real| (v + i * m.imped) * m.attenuation;
+        let wave = |v: Real, i: Real| i.mul_add(m.imped, v) * m.attenuation;
         // The new sample is index `count`; C's CKTtimeIndex.
         let previous = count - 1;
         let [pv1, pi1, pv2, pi2] = history.sample(previous);
@@ -1326,7 +1332,7 @@ impl DelayLine for LossyLine {
         };
         let check = |a: Real, b: Real, c: Real| {
             a.max(b).max(c) - a.min(b).min(c)
-                >= (50.0 * (context.reltol / 3.0 * (a + b + c) + context.abstol)).abs()
+                >= (50.0 * ((context.reltol / 3.0).mul_add(a + b + c, context.abstol))).abs()
         };
         let mut update = WaveformUpdate {
             append: Some((time, values.to_vec())),
@@ -1374,7 +1380,7 @@ impl DelayLine for LossyLine {
             }
             let index = count - 1;
             let values = self.port_values(context);
-            let wave = |v: Real, i: Real| (v * m.admit + i) * m.attenuation;
+            let wave = |v: Real, i: Real| v.mul_add(m.admit, i) * m.attenuation;
             let [pv1, pi1, pv2, pi2] = history.sample(index);
             let [ov1, oi1, ov2, oi2] = history.sample(index - 1);
             let i1 = wave(values[2], values[3]);
