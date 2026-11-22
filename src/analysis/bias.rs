@@ -1723,7 +1723,7 @@ fn run(
     let zero = Vector::zeros(n);
     let mut loaded = *context;
     for (name, value) in overrides {
-        loaded = loaded.with_instance_override(circuit.source_override(name, *value, context)?)?;
+        loaded = loaded.with_instance_override(circuit.bind_source_override(name, *value)?)?;
     }
     let context = &loaded;
     // Linear circuits take the same CKTop/NIiter path as nonlinear ones, as

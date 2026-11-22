@@ -624,9 +624,15 @@ fn point_context<'a>(
         } = &axis.target
         {
             model = model.with_instance_override(
-                circuit.instance_override(instance, parameter, value, &model)?,
+                circuit.bind_instance_override(instance, parameter, value)?,
             )?;
         }
+    }
+    // The source overrides follow other instance setters, as in the bias
+    // solver. Observation sees the same effective view, but still receives
+    // the written source values for its C raw-source ask conventions.
+    for &(name, value) in &sources[..source_count] {
+        model = model.with_instance_override(circuit.bind_source_override(name, value)?)?;
     }
     Ok(PointContext {
         model,
@@ -766,14 +772,13 @@ impl SweepSolver<'_> {
     ) -> SpiceResult<crate::analysis::newton::NewtonSolution<crate::devices::TrialState>> {
         use crate::analysis::bias::{DcOutcome, solve_dc_from};
         use crate::analysis::newton::PhasePolicy;
-        let overrides = point.source_values();
         // After the first point, C tries a bounded warm Newton solve before CKTop.
         if let Some(direct) = self.warm_settings.filter(|_| !first) {
             match solve_dc_from(
                 &self.prepared,
                 &point.model,
                 direct,
-                overrides,
+                &[],
                 Some(previous),
                 history,
                 PhasePolicy::Predicted,
@@ -799,7 +804,7 @@ impl SweepSolver<'_> {
             &self.prepared,
             &point.model,
             self.settings,
-            overrides,
+            &[],
             Some(previous),
             history,
             phase,

@@ -1993,8 +1993,24 @@ impl Circuit {
         value: Real,
         context: &ModelContext,
     ) -> SpiceResult<InstanceOverride> {
+        let target = self.bind_instance_override(name, keyword, value)?;
+        self.devices[target.device()].with_instance_parameter(
+            target.parameter(),
+            value,
+            context,
+        )?;
+        Ok(target)
+    }
+
+    /// Bind a typed target without constructing a throwaway device. The
+    /// ordered point preparation validates the value at its actual context.
+    pub(crate) fn bind_instance_override(
+        &self,
+        name: &str,
+        keyword: &str,
+        value: Real,
+    ) -> SpiceResult<InstanceOverride> {
         let (index, parameter) = self.instance_parameter(name, keyword)?;
-        self.devices[index].with_instance_parameter(parameter, value, context)?;
         Ok(InstanceOverride::new(
             self.topology_id()?,
             index,
@@ -2015,6 +2031,16 @@ impl Circuit {
         value: Real,
         context: &ModelContext,
     ) -> SpiceResult<InstanceOverride> {
+        let target = self.bind_source_override(name, value)?;
+        self.devices[target.device()].with_instance_parameter("dc", value, context)?;
+        Ok(target)
+    }
+
+    pub(crate) fn bind_source_override(
+        &self,
+        name: &str,
+        value: Real,
+    ) -> SpiceResult<InstanceOverride> {
         let index = self
             .devices
             .iter()
@@ -2022,7 +2048,6 @@ impl Circuit {
             .filter(|&i| matches!(self.devices[i].designator().to_ascii_lowercase(), 'v' | 'i'))
             .filter(|_| value.is_finite())
             .ok_or_else(|| SpiceError::circuit("invalid or unknown DC source override"))?;
-        self.devices[index].with_instance_parameter("dc", value, context)?;
         Ok(InstanceOverride::new(
             self.topology_id()?,
             index,
