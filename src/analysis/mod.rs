@@ -50,6 +50,7 @@ mod ordered_samples;
 mod plan;
 mod pz;
 pub mod rawfile;
+mod reduction;
 pub mod results;
 pub mod selection;
 mod sens;

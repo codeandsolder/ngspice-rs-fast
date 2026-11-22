@@ -29,15 +29,16 @@
 //!    its current records, the result negated, the parameter set to
 //!    `p + delta` with `delta = 1e-6 p` (`1e-6` when `p = 0`), the device
 //!    loaded again on top, and the parameter set back to `p`: element by
-//!    element `delta_Y = -dY0 + dY1` and `delta_I = -dI0 + dI1` in C's
-//!    accumulation order. The sensitivity is `Y^-1 (delta_I - delta_Y x)`
-//!    read at the output and divided by `delta`, with `delta_Y x` summed per
+//!    element `delta_Y = -dY0 + dY1` and `delta_I = -dI0 + dI1` in original
+//!    stamp order with compensated accumulation. The sensitivity is `Y^-1 (delta_I - delta_Y x)`
+//!    read at the output and divided by `delta`, with `delta_Y x` summed with compensation per
 //!    row in the internal column order of C's `delta_Y` (see
 //!    [`DeltaNumbering`]).
 //!
 //! The device side, including C's side effects of the in-place perturbation,
 //! lives in [`crate::devices::sensitivity`]; see `docs/port/SENSITIVITY.md`.
 
+use super::reduction::CompensatedSum;
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{PlotFlags, Variable};
 use crate::analysis::{AnalysisContext, AnalysisPlan, Plot};
@@ -231,7 +232,7 @@ pub(super) fn parse(arguments: &[String]) -> SpiceResult<SensCard> {
 /// divides `ln(fstop/fstart)` by `M_LOG2E` instead of multiplying.
 #[expect(
     clippy::suboptimal_flops,
-    reason = "preserve C count_steps and inc_freq rounding, including pow and truncation"
+    reason = "count_steps truncates a discrete sweep length: 3 * log10(4.6060996915966586) + 1.01 is 3 separately rounded but 2.9999999999999996 fused"
 )]
 fn frequencies(sweep: &Sweep) -> SpiceResult<Vec<Real>> {
     let steps = Real::from(sweep.steps.max(1));
@@ -819,7 +820,15 @@ struct RowChain {
 struct RowEntry {
     col: ExternalIndex,
     internal_col: InternalIndex,
-    value: Complex,
+    real: CompensatedSum,
+    imaginary: CompensatedSum,
+}
+
+#[cfg(test)]
+impl RowEntry {
+    const fn value(&self) -> Complex {
+        Complex::new(self.real.total(), self.imaginary.total())
+    }
 }
 
 /// Reusable sparse perturbation assembly.
@@ -890,13 +899,14 @@ impl DeltaMatrix {
             self.row_entries.push(RowEntry {
                 col,
                 internal_col: stamp.internal_col,
-                value: zero,
+                real: CompensatedSum::with_initial(zero.re),
+                imaginary: CompensatedSum::with_initial(zero.im),
             });
             i
         });
-        let value = &mut self.row_entries[i].value;
-        value.re += stamp.value.re;
-        value.im += stamp.value.im;
+        let entry = &mut self.row_entries[i];
+        entry.real.add(stamp.value.re);
+        entry.imaginary.add(stamp.value.im);
     }
 
     /// Fold the base load, negate it, then add the perturbed load. The
@@ -910,8 +920,10 @@ impl DeltaMatrix {
             next = stamp.next;
         }
         for entry in &mut self.row_entries {
-            entry.value.re *= -1.;
-            entry.value.im *= -1.;
+            // Negate both components of the accumulator. Rounding the base
+            // sum before subtracting would lose a small derivative entirely.
+            entry.real.negate();
+            entry.imaginary.negate();
         }
         while let Some(i) = next {
             let stamp = self.stamps[i];
@@ -962,7 +974,7 @@ impl PerturbedAssembly<'_> {
     fn visit_products(
         self,
         x: &[Complex],
-        mut visit: impl FnMut(usize, Complex),
+        mut visit: impl FnMut(usize, [CompensatedSum; 2]),
     ) -> SpiceResult<()> {
         if x.len() != self.matrix.numbering.internal.len() {
             return Err(SpiceError::Numerical {
@@ -971,15 +983,20 @@ impl PerturbedAssembly<'_> {
             });
         }
         for row in 0..x.len() {
-            let mut sum = Complex::ZERO;
-            // This is the ordinary C complex product and sum, not a fused
-            // dot product; each contribution is reduced before multiplication.
+            let mut real = CompensatedSum::default();
+            let mut imaginary = CompensatedSum::default();
+            // Preserve the sparse visitation and perturbation semantics,
+            // but compensate each component of the cancellation-prone dot.
             if self.matrix.rows[row].first.is_some() {
                 for entry in self.matrix.fold_row(row, self.base_count) {
-                    sum = sum + entry.value * x[entry.col.0];
+                    let value = x[entry.col.0];
+                    entry.real.multiply_into(value.re, &mut real);
+                    entry.imaginary.multiply_into(-value.im, &mut real);
+                    entry.real.multiply_into(value.im, &mut imaginary);
+                    entry.imaginary.multiply_into(value.re, &mut imaginary);
                 }
             }
-            visit(row, sum);
+            visit(row, [real, imaginary]);
         }
         Ok(())
     }
@@ -1221,8 +1238,13 @@ impl DcState<'_> {
         scratch.matrix.clear();
         self.load(index, perturbed, &mut scratch.matrix, &mut scratch.rhs)?;
         assembly.add(real_stamps(&scratch.matrix))?;
-        assembly.visit_products(&self.solution, |row, product| {
-            scratch.rhs.as_mut_slice()[row] -= product.re;
+        assembly.visit_products(&self.solution, |row, [mut real, _]| {
+            // Round delta_I - delta_Y E only after the residual is assembled,
+            // not after the potentially cancelling matrix-vector product.
+            let value = &mut scratch.rhs.as_mut_slice()[row];
+            real.negate();
+            real.add(*value);
+            *value = real.total();
         })?;
         // Nonfinite loads poison the entire connected block, as in C.
         // The mask remains unallocated on the normal path and reuses capacity.
@@ -1317,9 +1339,13 @@ impl AcState<'_> {
             *base = Complex::new(-base.re + perturbed.re, -base.im + perturbed.im);
         }
         assembly.add(self.stamps(&scratch.system))?;
-        assembly.visit_products(&self.solution, |row, product| {
-            scratch.rhs[row].re -= product.re;
-            scratch.rhs[row].im -= product.im;
+        assembly.visit_products(&self.solution, |row, [mut real, mut imaginary]| {
+            let value = &mut scratch.rhs[row];
+            real.negate();
+            imaginary.negate();
+            real.add(value.re);
+            imaginary.add(value.im);
+            *value = Complex::new(real.total(), imaginary.total());
         })?;
         self.factors
             .solve_with_workspace(&scratch.rhs, &mut scratch.solve)
@@ -1814,7 +1840,9 @@ mod tests {
         let x = [Complex::real(1.); 3];
         let mut result = [Complex::ZERO; 3];
         perturbed
-            .visit_products(&x, |row, sum| result[row] = sum)
+            .visit_products(&x, |row, [real, imaginary]| {
+                result[row] = Complex::new(real.total(), imaginary.total())
+            })
             .unwrap();
         assert_eq!(result, [Complex::real(1.), Complex::ZERO, Complex::ZERO]);
         let stamp_capacity = matrix.stamps.capacity();
@@ -1823,7 +1851,9 @@ mod tests {
             .begin([(1, 0)])
             .unwrap()
             .negate()
-            .visit_products(&x, |row, sum| result[row] = sum)
+            .visit_products(&x, |row, [real, imaginary]| {
+                result[row] = Complex::new(real.total(), imaginary.total())
+            })
             .unwrap();
         assert_eq!(result, [Complex::ZERO; 3]);
         assert_eq!(matrix.stamps.capacity(), stamp_capacity);
@@ -1836,6 +1866,26 @@ mod tests {
                 Some(super::InternalIndex(0))
             ]
         );
+    }
+
+    #[test]
+    fn perturbation_residual_retains_product_roundoff_across_rhs_cancellation() {
+        use super::DeltaMatrix;
+        use crate::primitives::Complex;
+
+        let small = 2_f64.powi(-27);
+        let mut matrix = DeltaMatrix::new(1);
+        let mut perturbed = matrix.begin([]).unwrap().negate();
+        perturbed
+            .add([stamp(0, 0, Complex::real(1. + small))])
+            .unwrap();
+        perturbed
+            .visit_products(&[Complex::real(1. - small)], |_, [mut real, _]| {
+                real.negate();
+                real.add(1.);
+                assert_eq!(real.total(), small * small);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -1873,7 +1923,7 @@ mod tests {
     }
 
     #[test]
-    fn separate_base_and_perturbed_reductions_preserve_duplicates_and_signed_zeros() {
+    fn separate_base_and_perturbed_reductions_retain_small_differences_and_signed_zeros() {
         use super::DeltaMatrix;
         use crate::primitives::Complex;
         let mut matrix = DeltaMatrix::new(4);
@@ -1894,26 +1944,53 @@ mod tests {
             .unwrap();
         let cutoff = perturbed.base_count;
         assert_eq!(
-            perturbed.matrix.fold_row(0, cutoff)[0].value.re.to_bits(),
-            2_f64.to_bits()
+            perturbed.matrix.fold_row(0, cutoff)[0].value().re.to_bits(),
+            1_f64.to_bits()
         );
         for row in [1, 2] {
             let entry = &perturbed.matrix.fold_row(row, cutoff)[0];
-            assert_eq!(entry.value.re.to_bits(), (-0_f64).to_bits());
-            assert_eq!(entry.value.im.to_bits(), (-0_f64).to_bits());
+            assert_eq!(entry.value().re.to_bits(), (-0_f64).to_bits());
+            assert_eq!(entry.value().im.to_bits(), (-0_f64).to_bits());
         }
         let mut seen = Vec::new();
         perturbed
-            .visit_products(&[Complex::real(1.); 4], |row, sum| seen.push((row, sum)))
+            .visit_products(&[Complex::real(1.); 4], |row, [real, imaginary]| {
+                seen.push((row, Complex::new(real.total(), imaginary.total())))
+            })
             .unwrap();
         assert_eq!(
             seen,
             [
-                (0, Complex::real(2.)),
+                (0, Complex::real(1.)),
                 (1, Complex::ZERO),
                 (2, Complex::ZERO),
                 (3, Complex::ZERO)
             ]
+        );
+    }
+
+    #[test]
+    fn perturbation_does_not_round_the_base_sum_before_subtraction() {
+        use super::DeltaMatrix;
+        use crate::primitives::Complex;
+        let mut matrix = DeltaMatrix::new(1);
+        let mut base = matrix.begin([(0, 0)]).unwrap();
+        base.add([
+            stamp(0, 0, Complex::new(1e16, -1e16)),
+            stamp(0, 0, Complex::new(1., -1.)),
+        ])
+        .unwrap();
+        let mut perturbed = base.negate();
+        perturbed
+            .add([
+                stamp(0, 0, Complex::new(1e16, -1e16)),
+                stamp(0, 0, Complex::new(2., -2.)),
+            ])
+            .unwrap();
+        let cutoff = perturbed.base_count;
+        assert_eq!(
+            perturbed.matrix.fold_row(0, cutoff)[0].value(),
+            Complex::new(1., -1.)
         );
     }
 
@@ -2009,6 +2086,26 @@ mod tests {
         assert!(scan(b"v1", b"v1"));
         assert!(scan(b"*_m", b"r2_m"));
         assert!(!scan(b"*_m", b"r2_ms"));
+    }
+
+    #[test]
+    fn frequency_count_rounding_is_a_discrete_grid_policy() {
+        // Exact binary64 log10(4.6060996915966586) on the reference platform.
+        let log = f64::from_bits(0x3fe5_3a06_d3a0_6d39);
+        let scaled = 3. * log;
+        assert_eq!((scaled + 1.01).trunc(), 3.);
+        assert_eq!(3_f64.mul_add(log, 1.01).trunc(), 2.);
+        let sweep = super::Sweep {
+            stepping: super::Stepping::Decade,
+            steps: 3,
+            start: 1.,
+            stop: 4.6060996915966586,
+        };
+        // On platforms whose log10 differs, still check the grid policy
+        // against the separately rounded product on that platform.
+        let scaled = 3. * sweep.stop.log10();
+        let want = (scaled + 1.01).trunc();
+        assert_eq!(super::frequencies(&sweep).unwrap().len() as f64, want);
     }
 
     #[test]
