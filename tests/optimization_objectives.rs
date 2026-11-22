@@ -778,6 +778,161 @@ fn coordinate_queries_can_project_zero_raw_operand_columns() {
 }
 
 #[test]
+fn last_observations_use_only_the_final_sparse_row() {
+    let scope = ParamScope::root(&[]).unwrap();
+    let mut builder = Plot::builder("ac1", "AC Analysis", PlotFlags::Complex);
+    builder.push_variable(Variable::new("frequency", "frequency"));
+    for c in 0..64 {
+        builder.push_variable(Variable::new(format!("v(c{c})"), "voltage"));
+    }
+    let full = builder.build();
+    let observations = vec![
+        Observation {
+            name: "mag".into(),
+            vector: VectorRequest {
+                vector: RequestedVector::Named {
+                    name: "v(c47)".into(),
+                    component: Some(VectorComponent::Magnitude),
+                },
+                location: request_location(),
+            },
+            reduction: ObservationReduction::Last,
+        },
+        Observation {
+            name: "diff".into(),
+            vector: VectorRequest {
+                vector: RequestedVector::Voltage {
+                    positive: "c47".into(),
+                    negative: Some("c3".into()),
+                },
+                location: request_location(),
+            },
+            reduction: ObservationReduction::Last,
+        },
+        observation(
+            "trace",
+            "v(c47)",
+            ObservationReduction::Trace { max_points: 3 },
+        ),
+        observation("query", "v(c3)", ObservationReduction::At(2.)),
+        observation("last", "v(c61)", ObservationReduction::Last),
+        observation("last", "v(c47)", ObservationReduction::Last),
+    ];
+    let bound = PlotObjectivePlan::bind(
+        &full,
+        AnalysisKind::Ac,
+        ObjectiveRequests {
+            observations,
+            ..ObjectiveRequests::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(bound.required_columns(), [0, 4, 48, 62]);
+    assert_eq!(bound.retained_columns(), []);
+    let plan = ScenarioPlan::new(vec![bound]);
+    let mut row = vec![Complex::ZERO; 65];
+    row[0] = Complex::real(Real::NAN);
+    row[48] = Complex::real(Real::NAN);
+    let first = row.clone();
+    row[0] = Complex::real(2.);
+    row[4] = Complex::new(1., 2.);
+    row[48] = Complex::new(3., 4.);
+    row[62] = Complex::new(5., 6.);
+    let run = |rows: &[&[Complex]]| {
+        let mut sink = plan.sink(&scope);
+        sink.begin(&full).unwrap();
+        for row in rows {
+            sink.point(row).unwrap();
+        }
+        sink.end().unwrap();
+        sink.finish().unwrap().remove(0)
+    };
+    let result = run(&[&first, &row]);
+    assert_eq!(result.retained_cells, 0);
+    for (i, value) in [
+        (0, Complex::real(5.)),
+        (1, Complex::new(2., 2.)),
+        (4, Complex::new(5., 6.)),
+        (5, Complex::new(3., 4.)),
+    ] {
+        assert!(
+            matches!(result.observations[i].value, Ok(ObservationValue::Scalar(p))
+            if p.coordinate == Some(2.) && p.value == value)
+        );
+    }
+    for i in [2, 3] {
+        assert!(matches!(
+            result.observations[i].value,
+            Err(ObservationFailure::Invalid(_))
+        ));
+    }
+    let empty = run(&[]);
+    for i in [0, 1, 4, 5] {
+        assert_eq!(empty.observations[i].value, Err(ObservationFailure::Empty));
+    }
+    let mut bad = row.clone();
+    bad[48] = Complex::real(Real::NAN);
+    let result = run(&[&row, &bad]);
+    for i in [0, 1, 5] {
+        assert!(matches!(
+            result.observations[i].value,
+            Err(ObservationFailure::Invalid(_))
+        ));
+    }
+    assert!(
+        matches!(result.observations[4].value, Ok(ObservationValue::Scalar(p))
+        if p.value == Complex::new(5., 6.))
+    );
+    bad[0] = Complex::real(Real::NAN);
+    let result = run(&[&row, &bad]);
+    for i in [0, 1, 4, 5] {
+        assert!(matches!(
+            result.observations[i].value,
+            Err(ObservationFailure::Invalid(_))
+        ));
+    }
+}
+
+#[test]
+fn last_ground_observation_on_axisless_plot_needs_no_raw_columns() {
+    let scope = ParamScope::root(&[]).unwrap();
+    let mut builder = Plot::builder("op1", "Operating Point", PlotFlags::Real);
+    builder.push_variable(Variable::new("v(out)", "voltage"));
+    let mut full = builder.build();
+    let bound = PlotObjectivePlan::bind(
+        &full,
+        AnalysisKind::OperatingPoint,
+        ObjectiveRequests {
+            observations: vec![Observation {
+                name: "ground".into(),
+                vector: VectorRequest {
+                    vector: RequestedVector::Voltage {
+                        positive: "0".into(),
+                        negative: None,
+                    },
+                    location: request_location(),
+                },
+                reduction: ObservationReduction::Last,
+            }],
+            ..ObjectiveRequests::default()
+        },
+    )
+    .unwrap();
+    assert!(bound.required_columns().is_empty());
+    let plan = ScenarioPlan::new(vec![bound]);
+    assert_eq!(
+        finish(&plan, &full, &scope).observations[0].value,
+        Err(ObservationFailure::Empty)
+    );
+    full.push_point(&[Complex::real(Real::NAN)]).unwrap();
+    let result = finish(&plan, &full, &scope);
+    assert!(
+        matches!(result.observations[0].value, Ok(ObservationValue::Scalar(p))
+        if p.coordinate.is_none() && p.value == Complex::ZERO)
+    );
+}
+
+#[test]
 fn prepared_rc_scenario_reuses_scalar_objectives_across_candidates() {
     let parsed = parsed(
         "V1 in 0 dc 1 ac 1\nR1 in out 1k\nC1 out 0 1u\n.op\n.ac lin 3 100 300\n.meas ac gain FIND vm(out) AT=200",

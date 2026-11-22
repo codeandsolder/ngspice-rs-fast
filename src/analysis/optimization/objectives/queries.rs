@@ -7,24 +7,20 @@ use std::ops::Range;
 
 /// Direct point queries are scheduled by coordinate, independent of result
 /// order. Their operands are bound to the union of their raw dependencies;
-/// last/trace observations still use the producer row directly.
+/// last/trace observations have independent dispatch policies.
 pub(super) struct QueryPlan {
     targets: Vec<(Real, usize)>,
     columns: Vec<usize>,
-    pub(super) ordinary: Vec<usize>,
 }
 
 impl QueryPlan {
     pub(super) fn bind(observations: &mut [BoundObservation]) -> SpiceResult<Self> {
         let mut targets = Vec::new();
         let mut columns = Vec::new();
-        let mut ordinary = Vec::new();
         for (index, observation) in observations.iter().enumerate() {
             if let ObservationReduction::At(at) = observation.reduction {
                 targets.push((at, index));
                 columns.extend(observation.column.input_columns());
-            } else {
-                ordinary.push(index);
             }
         }
         targets.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
@@ -33,11 +29,7 @@ impl QueryPlan {
         for &(_, index) in &targets {
             observations[index].column.remap_inputs(&columns)?;
         }
-        Ok(Self {
-            targets,
-            columns,
-            ordinary,
-        })
+        Ok(Self { targets, columns })
     }
 }
 

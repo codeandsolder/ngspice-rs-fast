@@ -28,7 +28,10 @@ observation does not turn a different valid observation into a NaN.
   exact-coordinate group agreement, not an invented value at a jump.
   Direction changes (e.g. nested DC sweep resets), nonfinite coordinates,
   and queries outside the interval are explicit errors. Trace/last
-  observations need not have an ordered axis. A sorted coordinate
+  observations need not have an ordered axis. Last values capture one
+  compact row of shared dependencies and evaluate each requested expression
+  only once at finish; invalid earlier rows cannot poison the last value.
+  A sorted coordinate
   schedule dispatches only the targets bracketed by each adjacent sample,
   retaining two rows of only the query operand columns. Results stay in
   request order, including duplicate names/targets. Dispatch work is
