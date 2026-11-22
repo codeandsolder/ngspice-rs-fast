@@ -158,7 +158,7 @@ setters now (they were `NotYetPorted` before #100). MOS1 `NLEV` must round to
   (current input, tightened RELTOL), `noise_mos1` (every NLEV, PMOS at its own
   temperature) and `noise_multi` (`.ac`, `.op`, a single-frequency and a decade
   `.noise` card, S/W switches) under `compare::NOISE_NONLINEAR`. Both bounds use
-  a `1e-20` absolute floor sized for noise values (see `xtask/src/compare.rs`).
+  a `1e-20` absolute floor sized for noise values (see `xtask/src/commands/compare.rs`).
 * Opt-in live C (`NGSPICE_BIN=... cargo test --test c_noise_reference -- --ignored`):
   the five fixtures plus an octave-swept BJT/diode/MOS1 deck and a PNP stage
   with a current input against ngspice batch mode (`-b -r`), names **in order**,

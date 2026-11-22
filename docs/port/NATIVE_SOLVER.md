@@ -141,7 +141,7 @@ singular systems).
   the FMA build a few ulp remain. Some decks are decided by that rounding:
   on `multi_analysis_pz` the no-FMA C build and the port both give up on the
   poles after 201 trials while the FMA build finds three, so that golden is
-  excluded from `golden verify` (`xtask/src/verify.rs`).
+  excluded from `golden verify` (`xtask/src/commands/verify.rs`).
 - libm functions (`exp`, `log`, `pow`) differ between platforms, so
   bit-exact assertions on results that depend on them hold only on the
   oracle's platform (macOS arm64); elsewhere the tests use tolerances.

@@ -174,7 +174,7 @@ fn emit_struct(
 /// `(C parameter ID, member)` for every `case` of an ask routine that reads
 /// one real member (`value->rValue = <prefix>X;`), in source order.
 fn real_asks(source: &str, prefix: &str) -> Result<Vec<(String, String)>, String> {
-    let source = crate::ifparm::strip_comments(source)?;
+    let source = super::ifparm::strip_comments(source)?;
     let mut asks: Vec<(String, String)> = Vec::new();
     let mut pending: Vec<&str> = Vec::new();
     // The asks recorded for the last case group, dropped again when C goes
@@ -216,7 +216,7 @@ fn real_asks(source: &str, prefix: &str) -> Result<Vec<(String, String)>, String
 
 /// The generated `asks.rs` text: the real asks of `b4mask.c` and `b4ask.c`
 /// that read a member directly (`sens_getp()` succeeds only for these).
-pub(crate) fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, String> {
+pub(super) fn asks(mask: &str, ask: &str, revision: &str) -> Result<String, String> {
     let model = real_asks(mask, "model->")?;
     let instance = real_asks(ask, "here->")?;
     if model.len() != 869 || instance.len() != 40 {
@@ -329,19 +329,43 @@ fn emit_instance_ownership(out: &mut String, fields: &[Field]) -> Result<(), Str
     let phases = [
         (
             "SETUP_WRITES",
-            instance_writes(include_str!("../../src/devices/bsim4/set.rs"), "h")?,
+            instance_writes(
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../src/devices/bsim4/set.rs"
+                )),
+                "h",
+            )?,
         ),
         (
             "TEMPERATURE_WRITES",
-            instance_writes(include_str!("../../src/devices/bsim4/temp.rs"), "h")?,
+            instance_writes(
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../src/devices/bsim4/temp.rs"
+                )),
+                "h",
+            )?,
         ),
         (
             "CHECK_WRITES",
-            instance_writes(include_str!("../../src/devices/bsim4/check.rs"), "h")?,
+            instance_writes(
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../src/devices/bsim4/check.rs"
+                )),
+                "h",
+            )?,
         ),
         (
             "LOAD_WRITES",
-            instance_writes(include_str!("../../src/devices/bsim4/load.rs"), "here")?,
+            instance_writes(
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../src/devices/bsim4/load.rs"
+                )),
+                "here",
+            )?,
         ),
     ];
     let known: BTreeSet<_> = fields
@@ -405,8 +429,8 @@ fn emit_instance_ownership(out: &mut String, fields: &[Field]) -> Result<(), Str
 }
 
 /// The generated `fields.rs` text.
-pub(crate) fn fields(header: &str, revision: &str) -> Result<String, String> {
-    let header = crate::ifparm::strip_comments(header)?;
+pub(super) fn fields(header: &str, revision: &str) -> Result<String, String> {
+    let header = super::ifparm::strip_comments(header)?;
     let instance = members(
         &header,
         "typedef struct sBSIM4instance\n{",

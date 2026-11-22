@@ -10,8 +10,6 @@ use std::path::Path;
 
 use ngspice_rs::netlist::snapshot::{self, SNAPSHOT_DIR};
 
-use crate::workspace_root;
-
 const USAGE: &str = "\
 usage: cargo xtask snapshots [--bless]
 
@@ -19,7 +17,7 @@ usage: cargo xtask snapshots [--bless]
                 write nothing; exit non-zero on any difference
     --bless     write created/changed snapshots, delete orphans, report each";
 
-pub(crate) fn main(arguments: &[String]) -> Result<(), String> {
+pub(super) fn main(root: &Path, arguments: &[String]) -> Result<(), String> {
     let mut bless = false;
     for argument in arguments {
         match argument.as_str() {
@@ -27,7 +25,7 @@ pub(crate) fn main(arguments: &[String]) -> Result<(), String> {
             other => return Err(format!("usage: unknown option '{other}'\n\n{USAGE}")),
         }
     }
-    let conformance = workspace_root().join("conformance");
+    let conformance = root.join("conformance");
     let generated = snapshot::generate(&conformance).map_err(|e| format!("generating: {e}"))?;
     let orphans = snapshot::orphans(&conformance, &generated)
         .map_err(|e| format!("scanning snapshots: {e}"))?;

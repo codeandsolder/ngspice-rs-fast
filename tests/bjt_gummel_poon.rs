@@ -13,8 +13,7 @@ use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::{AnalysisKind, NodeKind};
 use std::path::Path;
 
-#[path = "../conformance/reference.rs"]
-mod reference;
+use ngspice_conformance::fixtures;
 
 const VT: f64 = (1.38064852e-23 / 1.6021766208e-19) * 300.15;
 
@@ -544,7 +543,7 @@ fn sensitivity_matches_the_reference_on_the_fixture_card() {
          tbf1=0.01 tbf2=1e-5\n\
          .model qp pnp level=1 tnom=50 tbr1=0.02 tbr2=2e-5\n.sens i(vids)",
     );
-    let raw = ngspice_rs::analysis::RawFile::load(reference::golden_path(
+    let raw = ngspice_rs::analysis::RawFile::load(fixtures::golden_path(
         Path::new(env!("CARGO_MANIFEST_DIR")),
         "sens_bjt",
     ))
