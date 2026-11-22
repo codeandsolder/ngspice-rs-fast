@@ -1490,14 +1490,16 @@ mod tests {
         let again = Bsim4::model_setup(&resolved, &params, &inst.location, 27.).unwrap();
         assert!(Arc::ptr_eq(&a, &again));
         assert!(!Arc::ptr_eq(&a, &b));
-        assert_ne!(a.model.tnom.to_bits(), b.model.tnom.to_bits());
-        assert!(!a.warnings.is_empty());
-        assert_eq!(a.warnings, b.warnings);
         let inputs = params.instance_parameters(inst, 1.).unwrap();
         let mut first = Bsim4::setup(&a, &inputs, false).unwrap();
+        let different = Bsim4::setup(&b, &inputs, false).unwrap();
         let second = Bsim4::setup(&again, &inputs, false).unwrap();
+        assert_ne!(first.model.tnom.to_bits(), different.model.tnom.to_bits());
+        assert!(!first.warnings.is_empty());
+        assert_eq!(first.warnings, different.warnings);
+        let nominal = first.model.tnom.to_bits();
         first.model.tnom = 0.;
-        assert_eq!(second.model.tnom.to_bits(), a.model.tnom.to_bits());
+        assert_eq!(second.model.tnom.to_bits(), nominal);
         assert_eq!(first.warnings, second.warnings);
     }
 
