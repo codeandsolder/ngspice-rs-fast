@@ -19,6 +19,7 @@
 //!   `analysis` interpret them, because their grammars differ per card.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::primitives::{AnalysisKind, Real, SourceLoc};
 
@@ -381,9 +382,9 @@ pub struct LibrarySection {
     /// Canonical section name.
     pub name: String,
     /// Positioned opening card, including its original spelling.
-    pub opening: crate::netlist::card::RawCard,
+    pub opening: Arc<crate::netlist::card::RawCard>,
     /// Positioned closing card.
-    pub closing: crate::netlist::card::RawCard,
+    pub closing: Arc<crate::netlist::card::RawCard>,
 }
 
 /// A source-ordered .param card whose expressions remain unevaluated.
@@ -1093,9 +1094,9 @@ pub struct ScopedCard {
     /// Semantic kind and scope-local index, including frontend side channels.
     pub kind: ScopedCardKind,
     /// Positioned source spelling/tokens of this card.
-    pub source: crate::netlist::card::RawCard,
+    pub source: Arc<crate::netlist::card::RawCard>,
     /// Include directives traversed, outermost first; empty for root cards.
-    pub include_chain: Vec<SourceLoc>,
+    pub include_chain: Arc<[SourceLoc]>,
 }
 
 /// Scope-local semantic card references, including structural terminators.
