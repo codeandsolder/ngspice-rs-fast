@@ -48,6 +48,36 @@ impl CompensatedSum {
     }
 }
 
+/// One-pass norm with a running magnitude scale, so neither large nor tiny
+/// terms need to be squared in the original units.
+#[derive(Default)]
+pub(super) struct ScaledSquares {
+    scale: Real,
+    squares: CompensatedSum,
+}
+
+impl ScaledSquares {
+    pub(super) fn add(&mut self, magnitude: Real) {
+        if magnitude == 0. {
+            return;
+        }
+        if magnitude > self.scale {
+            let ratio = self.scale / magnitude;
+            let previous = self.squares.total() * ratio * ratio;
+            self.scale = magnitude;
+            self.squares = CompensatedSum::with_initial(previous);
+            self.squares.add(1.);
+        } else {
+            let ratio = magnitude / self.scale;
+            self.squares.add(ratio * ratio);
+        }
+    }
+
+    pub(super) fn norm(&self) -> Real {
+        self.scale * self.squares.total().sqrt()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::CompensatedSum;

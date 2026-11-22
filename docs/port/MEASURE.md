@@ -468,7 +468,15 @@ AVG retains trapezoidal panels, and INTEG/RMS retain the existing greedy
 Simpson 3/8, 1/3 and trapezoid selection based on 100-ULP positive widths.
 Midpoint and normalized panel weights avoid intermediate sample-sum
 overflow; compensated accumulation retains small signed areas during
-cancellation. Zero-width panels contribute zero, including at discontinuities.
+cancellation. Nearly equal steps retain the same Simpson selection, but
+the panel's actual covered span scales its normalized weights. RMS uses a
+weighted, scaled Euclidean norm instead of integrating squared raw samples:
+the square-root time fraction is calculated before multiplication and a
+power-of-two shifted accumulator retains subnormal weighted terms. The
+positive normalized quadrature is bounded by the largest absolute sample.
+RMS therefore accepts finite extreme magnitudes even when their squares
+would overflow or underflow. Zero-width panels contribute zero, including
+at discontinuities.
 Linear interpolation takes its fraction from the nearer endpoint and uses
 a fused multiply-add; scaled coordinate differences handle an otherwise
 overflowing finite span. Exact sample groups, clipping, crossing selection

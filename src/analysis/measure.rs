@@ -37,7 +37,7 @@ use crate::netlist::ast::{
 use crate::primitives::{AnalysisKind, Real, SpiceError, SpiceResult};
 
 use super::ordered_samples::{AxisError, OrderedAxis, SampleError, SampleWindow, column_names};
-use super::reduction::CompensatedSum;
+use super::reduction::{CompensatedSum, ScaledSquares};
 use crate::analysis::results::Plot;
 use crate::analysis::selection::{self, Column};
 
@@ -604,18 +604,11 @@ fn evaluate_statistic(
             // failure rather than a division by zero.
             let width = span_width(span, card)?;
             let points = window.clipped(axis, &operand, card)?;
-            let squared = statistic == MeasureStatistic::Rms;
-            let area = if statistic == MeasureStatistic::Avg {
-                trapezoid_integral(points, card)?
-            } else {
-                simpson_integral(points, squared, card)?
+            let value = match statistic {
+                MeasureStatistic::Avg => trapezoid_integral(points, card)? / width,
+                MeasureStatistic::Rms => simpson_rms(points, width)?,
+                _ => simpson_integral(points, card)?,
             };
-            let mean = if statistic == MeasureStatistic::Integ {
-                area
-            } else {
-                area / width
-            };
-            let value = if squared { mean.sqrt() } else { mean };
             (value, None, Some(span))
         }
     };
@@ -776,15 +769,13 @@ fn trapezoid_integral(
 /// Four samples are sufficient to select a panel; retain an overlapping
 /// endpoint and refill only consumed slots. Only positive widths within
 /// 100 ULPs share a Simpson panel. Duplicate coordinates use trapezoids.
-fn simpson_integral(
+fn simpson_panels(
     points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
-    square: bool,
-    card: &MeasureCard,
-) -> SpiceResult<Real> {
+    mut consume: impl FnMut(&[(Real, Real)], Real),
+) -> SpiceResult<()> {
     let mut points = points.fuse();
     let mut panel = [(0., 0.); 4];
     let mut count = 0;
-    let mut area = CompensatedSum::default();
     let equal = |a: Real, b: Real| a > 0. && b > 0. && a.to_bits().abs_diff(b.to_bits()) <= 100;
     loop {
         for slot in &mut panel[count..] {
@@ -797,43 +788,113 @@ fn simpson_integral(
         if count < 2 {
             break;
         }
-        let y = |index: usize| {
-            let value = panel[index].1;
-            if square { value * value } else { value }
-        };
         let width = |index: usize| panel[index + 1].0 - panel[index].0;
         let h = width(0);
         let consumed = if count == 4 && equal(h, width(1)) && equal(h, width(2)) {
-            // The weights sum to one: apply them before combining samples
-            // rather than overflowing an unscaled weighted ordinate.
-            let mean = 0.25_f64.mul_add(
-                Real::midpoint(y(0), y(3)),
-                0.75 * Real::midpoint(y(1), y(2)),
-            );
-            area.add(mean * (3. * h));
             3
         } else if count >= 3 && equal(h, width(1)) {
-            let mean = (1. / 3_f64).mul_add(Real::midpoint(y(0), y(2)), (2. / 3.) * y(1));
-            area.add(mean * (2. * h));
             2
         } else {
-            if h > 0. {
-                area.add(Real::midpoint(y(0), y(1)) * h);
-            }
             1
         };
+        if h > 0. {
+            consume(&panel[..=consumed], panel[consumed].0 - panel[0].0);
+        }
         panel.copy_within(consumed..count, 0);
         count -= consumed;
     }
+    Ok(())
+}
+
+fn simpson_integral(
+    points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
+    card: &MeasureCard,
+) -> SpiceResult<Real> {
+    let mut area = CompensatedSum::default();
+    simpson_panels(points, |panel, width| {
+        let y = |index: usize| panel[index].1;
+        let mean = match panel.len() {
+            4 => 0.25_f64.mul_add(
+                Real::midpoint(y(0), y(3)),
+                0.75 * Real::midpoint(y(1), y(2)),
+            ),
+            3 => (1. / 3_f64).mul_add(Real::midpoint(y(0), y(2)), (2. / 3.) * y(1)),
+            _ => Real::midpoint(y(0), y(1)),
+        };
+        area.add(mean * width);
+    })?;
     let area = area.total();
     if !area.is_finite() {
         return Err(nonfinite(
             card,
-            "INTEG/RMS",
+            "INTEG",
             "the integrated value is not finite".into(),
         ));
     }
     Ok(area)
+}
+
+/// A Euclidean norm of the square-root quadrature weights times the samples.
+/// Scale the sum of squares rather than squaring the raw ordinates. Compute
+/// the time ratio after taking square roots to retain very narrow panels.
+/// Panel weights are normalized by the covered span, including when nearly
+/// equal steps differ by a few ULPs.
+fn simpson_rms(
+    points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
+    width: Real,
+) -> SpiceResult<Real> {
+    // A second norm in power-of-two units preserves subnormal weighted
+    // contributions until after the reduction, including constant tiny traces.
+    const SMALL_SCALE: Real = Real::from_bits(1535_u64 << 52); // 2^512
+    let mut normal = ScaledSquares::default();
+    let mut small = ScaledSquares::default();
+    let denominator = width.sqrt();
+    let mut maximum = 0_f64;
+    simpson_panels(points, |panel, span| {
+        let weights: &[Real] = match panel.len() {
+            4 => &[1. / 8., 3. / 8., 3. / 8., 1. / 8.],
+            3 => &[1. / 6., 2. / 3., 1. / 6.],
+            _ => &[0.5, 0.5],
+        };
+        let root_h = span.sqrt();
+        let ratio = root_h / denominator;
+        for (&(_, value), &weight) in panel.iter().zip(weights) {
+            let magnitude = value.abs();
+            maximum = maximum.max(magnitude);
+            let root_weight = weight.sqrt();
+            let weighted = magnitude * (ratio * root_weight);
+            if weighted < Real::MIN_POSITIVE || ratio < Real::MIN_POSITIVE {
+                // Shift before multiplying to avoid rounding either the tiny
+                // time fraction or the tiny weighted value to zero.
+                let shifted = if ratio < Real::MIN_POSITIVE {
+                    (root_h / (denominator / SMALL_SCALE)) * root_weight
+                } else {
+                    (ratio * SMALL_SCALE) * root_weight
+                };
+                let term = magnitude * shifted;
+                if weighted < Real::MIN_POSITIVE {
+                    small.add(term);
+                } else {
+                    normal.add(term / SMALL_SCALE);
+                }
+            } else {
+                normal.add(weighted);
+            }
+        }
+    })?;
+    let norm = normal.norm();
+    let tiny = small.norm();
+    // Combine in shifted units when the final result is subnormal or near
+    // the normal/subnormal boundary, so it is rounded only once.
+    let rms = if norm < Real::MIN_POSITIVE * SMALL_SCALE {
+        (norm * SMALL_SCALE).hypot(tiny) / SMALL_SCALE
+    } else {
+        norm
+    };
+    // The positive normalized quadrature cannot exceed the largest sample.
+    // Account for rounding in the square-root weights at this bound, including
+    // a constant MAX trace whose rounded norm would otherwise overflow.
+    Ok(rms.min(maximum))
 }
 
 /// C `measure_margin`: unwrap phase, interpolate dB/degrees and log frequency.
@@ -1353,7 +1414,12 @@ mod tests {
             for i in 5..8 {
                 expected += h(i) * (y(i) + y(i + 1)) / 2.;
             }
-            let got = super::simpson_integral(points.into_iter().map(Ok), square, &card).unwrap();
+            let got = if square {
+                let rms = super::simpson_rms(points.into_iter().map(Ok), 8.).unwrap();
+                rms * rms * 8.
+            } else {
+                super::simpson_integral(points.into_iter().map(Ok), &card).unwrap()
+            };
             assert!((got - expected).abs() <= 8. * Real::EPSILON * expected.abs());
         }
     }
@@ -1374,14 +1440,14 @@ mod tests {
             1.
         );
         assert_eq!(
-            super::simpson_integral(points.into_iter().map(Ok), false, &card).unwrap(),
+            super::simpson_integral(points.into_iter().map(Ok), &card).unwrap(),
             1.
         );
         let cubic = (0..=3).map(|i| {
             let t = Real::from(i);
             Ok((t, t.powi(3)))
         });
-        let result = super::simpson_integral(cubic, false, &card).unwrap();
+        let result = super::simpson_integral(cubic, &card).unwrap();
         assert!((result - 81. / 4.).abs() <= 4. * Real::EPSILON * 81. / 4.);
     }
 
@@ -1925,12 +1991,27 @@ mod tests {
         );
         assert!(error.to_string().contains("measure m: v(out)"), "{error}");
         assert!(error.to_string().contains("not finite"), "{error}");
+    }
 
-        // An operand that is finite everywhere still cannot be integrated when
-        // squaring overflows.
-        let huge = tran(&[(0.0, 0.0), (1.0, 1e200)]);
-        let error = failure(&huge, "m", request(MeasureStatistic::Rms, None, None));
-        assert!(error.to_string().contains("not finite"), "{error}");
+    #[test]
+    fn rms_retains_representable_extreme_magnitudes() {
+        let tiny = Real::from_bits(1);
+        for scale in [1e200, 1e-200, Real::MAX, tiny] {
+            let plot = tran(&[(0., 0.), (1., scale)]);
+            let actual = measure(&plot, "m", request(MeasureStatistic::Rms, None, None)).value;
+            let expected = scale * 0.5_f64.sqrt();
+            assert!((actual - expected).abs() <= 4. * Real::EPSILON * expected);
+            // Multiple weighted subnormals must not round independently to zero.
+            let plot = tran(&[(0., scale), (1., scale), (2., scale), (3., scale)]);
+            let actual = measure(&plot, "m", request(MeasureStatistic::Rms, None, None)).value;
+            assert!((actual - scale).abs() <= 4. * Real::EPSILON * scale);
+        }
+        // The time fraction itself underflows. Its square root and the
+        // weighted amplitude remain representable.
+        let points = [(0., 1e308), (tiny, 1e308), (tiny, 0.), (1e308, 0.)];
+        let actual = super::simpson_rms(points.into_iter().map(Ok), 1e308).unwrap();
+        let expected = tiny.sqrt() * 1e154;
+        assert!((actual - expected).abs() <= 8. * Real::EPSILON * expected);
     }
 
     #[test]
