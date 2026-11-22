@@ -101,50 +101,46 @@ pub const MAX_LUMPS: usize = 10_000;
 
 /// `urc.c` `URCmPTable` with `urcsetup.c`'s defaults. `ISPERL` has no default:
 /// whether it is given selects the diode ladder.
-const MODEL: ScalarSchema<'static> = ScalarSchema {
-    parameters: &[
-        scalar(
-            "k",
-            ScalarUnit::Dimensionless,
-            ScalarDomain::Positive,
-            Some(1.5),
-        ),
-        scalar("fmax", ScalarUnit::Hertz, ScalarDomain::Finite, Some(1e9)),
-        scalar(
-            "rperl",
-            ScalarUnit::OhmPerMetre,
-            ScalarDomain::Positive,
-            Some(1000.),
-        ),
-        scalar(
-            "cperl",
-            ScalarUnit::FaradPerMetre,
-            ScalarDomain::NonNegative,
-            Some(1e-12),
-        ),
-        scalar(
-            "isperl",
-            ScalarUnit::AmperePerMetre,
-            ScalarDomain::Positive,
-            None,
-        ),
-        scalar(
-            "rsperl",
-            ScalarUnit::OhmPerMetre,
-            ScalarDomain::NonNegative,
-            Some(0.),
-        ),
-    ],
-};
+static MODEL: ScalarSchema<'static> = ScalarSchema::new(&[
+    scalar(
+        "k",
+        ScalarUnit::Dimensionless,
+        ScalarDomain::Positive,
+        Some(1.5),
+    ),
+    scalar("fmax", ScalarUnit::Hertz, ScalarDomain::Finite, Some(1e9)),
+    scalar(
+        "rperl",
+        ScalarUnit::OhmPerMetre,
+        ScalarDomain::Positive,
+        Some(1000.),
+    ),
+    scalar(
+        "cperl",
+        ScalarUnit::FaradPerMetre,
+        ScalarDomain::NonNegative,
+        Some(1e-12),
+    ),
+    scalar(
+        "isperl",
+        ScalarUnit::AmperePerMetre,
+        ScalarDomain::Positive,
+        None,
+    ),
+    scalar(
+        "rsperl",
+        ScalarUnit::OhmPerMetre,
+        ScalarDomain::NonNegative,
+        Some(0.),
+    ),
+]);
 
 /// `urc.c` `URCpTable` setters: `l` (`IF_REAL`) and `n` (`IF_INTEGER`, range
 /// checked after rounding).
-const INSTANCE: ScalarSchema<'static> = ScalarSchema {
-    parameters: &[
-        scalar("l", ScalarUnit::Metre, ScalarDomain::Positive, None),
-        scalar("n", ScalarUnit::Dimensionless, ScalarDomain::Finite, None),
-    ],
-};
+static INSTANCE: ScalarSchema<'static> = ScalarSchema::new(&[
+    scalar("l", ScalarUnit::Metre, ScalarDomain::Positive, None),
+    scalar("n", ScalarUnit::Dimensionless, ScalarDomain::Finite, None),
+]);
 
 const fn scalar(
     name: &'static str,

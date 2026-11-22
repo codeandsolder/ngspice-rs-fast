@@ -94,7 +94,7 @@ impl Device for ModelPassive {
             keyword
         };
         super::instance_schema(self.parameters.kind)
-            .parameters
+            .parameters()
             .iter()
             .find(|d| d.name != "noisy" && d.name.eq_ignore_ascii_case(keyword))
             .map(|d| d.name)

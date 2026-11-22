@@ -136,24 +136,22 @@ pub const INTERNAL_SUFFIXES: [&str; 2] = ["i1", "i2"];
 /// `LTRAmPTable` scalars (`ltra.c`). `r`, `l`, `g`, `c` default to 0, `len` is
 /// required, `rel`/`abs` default to 1 (`ltraset.c`), and `compactrel`/
 /// `compactabs` of 0 mean C's `reltol`/`abstol`.
-const MODEL: ScalarSchema<'static> = ScalarSchema {
-    parameters: &[
-        scalar("r", ScalarUnit::OhmPerMetre, Some(0.)),
-        scalar("l", ScalarUnit::HenryPerMetre, Some(0.)),
-        scalar("g", ScalarUnit::SiemensPerMetre, Some(0.)),
-        scalar("c", ScalarUnit::FaradPerMetre, Some(0.)),
-        ScalarParameter {
-            name: "len",
-            unit: ScalarUnit::Metre,
-            domain: ScalarDomain::Positive,
-            default: None,
-        },
-        scalar("rel", ScalarUnit::Dimensionless, Some(1.)),
-        scalar("abs", ScalarUnit::Dimensionless, Some(1.)),
-        scalar("compactrel", ScalarUnit::Dimensionless, Some(0.)),
-        scalar("compactabs", ScalarUnit::Dimensionless, Some(0.)),
-    ],
-};
+static MODEL: ScalarSchema<'static> = ScalarSchema::new(&[
+    scalar("r", ScalarUnit::OhmPerMetre, Some(0.)),
+    scalar("l", ScalarUnit::HenryPerMetre, Some(0.)),
+    scalar("g", ScalarUnit::SiemensPerMetre, Some(0.)),
+    scalar("c", ScalarUnit::FaradPerMetre, Some(0.)),
+    ScalarParameter {
+        name: "len",
+        unit: ScalarUnit::Metre,
+        domain: ScalarDomain::Positive,
+        default: None,
+    },
+    scalar("rel", ScalarUnit::Dimensionless, Some(1.)),
+    scalar("abs", ScalarUnit::Dimensionless, Some(1.)),
+    scalar("compactrel", ScalarUnit::Dimensionless, Some(0.)),
+    scalar("compactabs", ScalarUnit::Dimensionless, Some(0.)),
+]);
 
 const fn scalar(name: &'static str, unit: ScalarUnit, default: Option<Real>) -> ScalarParameter {
     ScalarParameter {

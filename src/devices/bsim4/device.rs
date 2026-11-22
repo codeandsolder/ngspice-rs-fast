@@ -20,12 +20,13 @@
 //! load on a copy, so they never disturb a running solve.
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use super::fields::{Instance, Model, SizeParam};
 use super::host::{LoadCkt, SmallSignalCkt, mode, node, state};
 use super::{Inputs, ModelParameters, acld, apply, cvtest, elements, load, noise, pzld, set, temp};
 use crate::devices::linear::LinearContext;
-use crate::devices::models::{ModelContext, ResolvedModel};
+use crate::devices::models::{ModelContext, PreparationKey, ResolvedModel};
 use crate::devices::schema::temperature_kelvin;
 use crate::devices::state::IterationPhase;
 use crate::devices::traits::{AnalysisMode, ConvergenceContext, Device, StampContext};
@@ -50,6 +51,12 @@ pub(super) struct Prepared {
         reason = "retains BSIM4 model diagnostics with their setup for a future public warning channel"
     )]
     pub(super) warnings: Vec<String>,
+}
+
+/// Immutable model-only setup, before instance-dependent resets and temperature.
+struct ModelSetupPrototype {
+    model: Model,
+    warnings: Vec<String>,
 }
 
 /// `BSIM4setup`'s result: the model, the instance and the messages so far.
@@ -177,7 +184,13 @@ impl Bsim4 {
             .applied()
             .iter()
             .any(|a| matches!(a.parameter.canonical, "off" | "icvds" | "icvgs" | "icvbs"));
-        let mut setup = Self::setup(&params, &inputs, &instance.location, context)?;
+        let prototype = Self::model_setup(
+            model,
+            &params,
+            &instance.location,
+            context.nominal_temperature,
+        )?;
+        let mut setup = Self::setup(&prototype, &inputs, context.noise_analysis)?;
         let created = std::mem::take(&mut setup.created);
         let mut device = Self {
             name: instance.name.clone(),
@@ -237,27 +250,37 @@ impl Bsim4 {
         Ok(Box::new(device))
     }
 
-    /// `b4mpar.c`/`b4par.c` setters and `BSIM4setup` at this nominal
-    /// temperature (C's `CKTnomTemp`, the TNOM default).
-    fn setup(
+    /// Model-only setters and defaults. Every consumer clones the prototype
+    /// before running the instance setup and temperature/check passes.
+    fn model_setup(
+        resolved: &ResolvedModel<'_>,
         params: &ModelParameters,
-        inputs: &Inputs,
         location: &SourceLoc,
-        context: &ModelContext,
+        nominal: Real,
+    ) -> SpiceResult<Arc<ModelSetupPrototype>> {
+        let raw = resolved.prepare(PreparationKey::Inputs, || apply::model(params))?;
+        let kelvin = temperature_kelvin(nominal, location)?;
+        resolved.prepare(PreparationKey::Nominal(nominal.to_bits()), || {
+            let mut model = (*raw).clone();
+            let mut warnings = Vec::new();
+            set::setup_model(&mut model, kelvin, &mut warnings)?;
+            Ok(ModelSetupPrototype { model, warnings })
+        })
+    }
+
+    fn setup(
+        prototype: &ModelSetupPrototype,
+        inputs: &Inputs,
+        noise_analysis: bool,
     ) -> SpiceResult<SetUp> {
-        let mut warnings = Vec::new();
-        let mut m = apply::model(params)?;
-        set::setup_model(
-            &mut m,
-            temperature_kelvin(context.nominal_temperature, location)?,
-            &mut warnings,
-        )?;
+        let m = prototype.model.clone();
+        let mut warnings = prototype.warnings.clone();
         let mut h = apply::instance(inputs)?;
         h.dNode = node::D;
         h.gNodeExt = node::G_EXT;
         h.sNode = node::S;
         h.bNode = node::B;
-        let created = set::setup_instance(&m, &mut h, context.noise_analysis, &mut warnings)?;
+        let created = set::setup_instance(&m, &mut h, noise_analysis, &mut warnings)?;
         Ok(SetUp {
             model: m,
             instance: h,
@@ -995,7 +1018,7 @@ impl Bsim4 {
         h: &Instance,
         s0: &[Real; state::COUNT],
     ) -> Option<Real> {
-        let p = super::descriptor(super::parameters::INSTANCE, keyword)?;
+        let p = super::DEVICE.instance.get(keyword)?;
         let mi = h.mult_i * h.m;
         let mq = h.mult_q * h.m;
         let size = &prepared.size;
@@ -1265,7 +1288,7 @@ impl Device for Bsim4 {
     /// Every real instance setter of `b4.c`'s table (`DCTfindInstParam`
     /// accepts any settable instance parameter).
     fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
-        let p = super::descriptor(super::parameters::INSTANCE, keyword)?;
+        let p = super::DEVICE.instance.get(keyword)?;
         (p.input_type == super::InputType::Real
             && p.access != super::Access::Output
             && p.c_field.is_some())
@@ -1283,7 +1306,9 @@ impl Device for Bsim4 {
         value: Real,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        let p = super::descriptor(super::parameters::INSTANCE, parameter)
+        let p = super::DEVICE
+            .instance
+            .get(parameter)
             .filter(|p| self.instance_parameter(p.name).is_some())
             .ok_or_else(|| {
                 SpiceError::circuit(format!(
@@ -1318,7 +1343,7 @@ impl Device for Bsim4 {
         key: &str,
         context: &ModelContext,
     ) -> SpiceResult<Option<Real>> {
-        let Some(p) = super::descriptor(super::parameters::INSTANCE, key) else {
+        let Some(p) = super::DEVICE.instance.get(key) else {
             return Ok(None);
         };
         let prepared = self.ensure(context.temperature, context.nominal_temperature)?;
