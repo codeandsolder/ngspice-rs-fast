@@ -9,7 +9,7 @@ use crate::devices::{
 };
 use crate::netlist::ast::{
     DeviceInstance, FunctionWaveform, ParameterKind, PositionedValue, SourceFunction,
-    SourceWaveform,
+    SourceWaveform, WaveformKind,
 };
 use crate::netlist::source::{Deck, LogicalLine};
 use crate::netlist::{Parser, RawCard};
@@ -675,11 +675,15 @@ fn source_waveform(
     source: &SourceWaveform,
     setter: &SourceLoc,
 ) -> SpiceResult<Waveform> {
-    match (name, source) {
-        (name, SourceWaveform::Function(f)) if name == f.function.keyword() => {
-            function_waveform(f, setter)
-        }
-        ("pulse", SourceWaveform::Pulse(p)) => {
+    if WaveformKind::from_keyword(name) != Some(source.kind()) {
+        return Err(SpiceError::parse(
+            setter.clone(),
+            format!("source waveform '{name}' does not match its typed coefficients"),
+        ));
+    }
+    match source {
+        SourceWaveform::Function(f) => function_waveform(f, setter),
+        SourceWaveform::Pulse(p) => {
             let optional = |v: &Option<PositionedValue>, what| v.as_ref().map(|v| field(v, what));
             let spec = PulseSpec {
                 initial: field(&p.initial, "pulse v1")?,
@@ -697,7 +701,7 @@ fn source_waveform(
                 .map_err(|e| waveform_error(&p.initial, &e))?;
             Ok(waveform)
         }
-        ("pwl", SourceWaveform::Pwl(points)) => {
+        SourceWaveform::Pwl(points) => {
             let knots = points
                 .iter()
                 .map(|p| Ok((field(&p.time, "pwl time")?, field(&p.value, "pwl value")?)))
@@ -713,10 +717,6 @@ fn source_waveform(
             })?;
             Ok(waveform)
         }
-        _ => Err(SpiceError::not_yet_ported(
-            format!("source waveform '{name}'"),
-            "src/spicelib/devices/vsrc/vsrcload.c",
-        )),
     }
 }
 

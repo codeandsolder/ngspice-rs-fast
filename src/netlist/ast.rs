@@ -141,14 +141,14 @@ pub enum SourceWaveform {
 /// Shared lexical classification for parsing and serializing waveform
 /// setters. Runtime default resolution is independent of these field limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WaveformKind {
+pub(crate) enum WaveformKind {
     Pulse,
     Pwl,
     Function(SourceFunction),
 }
 
 impl WaveformKind {
-    pub(super) fn from_keyword(keyword: &str) -> Option<Self> {
+    pub(crate) fn from_keyword(keyword: &str) -> Option<Self> {
         [
             ("pulse", Self::Pulse),
             ("pwl", Self::Pwl),
@@ -182,7 +182,7 @@ impl WaveformKind {
 }
 
 impl SourceWaveform {
-    pub(super) fn kind(&self) -> WaveformKind {
+    pub(crate) fn kind(&self) -> WaveformKind {
         match self {
             Self::Pulse(_) => WaveformKind::Pulse,
             Self::Pwl(_) => WaveformKind::Pwl,
