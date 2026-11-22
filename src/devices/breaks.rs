@@ -97,6 +97,7 @@ impl Events {
 }
 
 /// C's breakpoint table `CKTbreaks`: at least two entries, normally ascending.
+///
 /// Lookup and removal use the ordered index rather than scanning or shifting
 /// the pending events. Equal entries and the terminal sentinel retain C order.
 #[derive(Debug, Clone)]
@@ -109,9 +110,11 @@ pub struct BreakTable {
 
 impl PartialEq for BreakTable {
     fn eq(&self, other: &Self) -> bool {
-        [self.min_break, self.final_time] == [other.min_break, other.final_time]
-            && self.len == other.len
-            && self.times().eq(other.times())
+        (self.min_break, self.final_time, self.len).eq(&(
+            other.min_break,
+            other.final_time,
+            other.len,
+        )) && self.times().eq(other.times())
     }
 }
 

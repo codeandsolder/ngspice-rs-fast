@@ -96,6 +96,31 @@ the run with an error; no partial plot is returned.
   SIN/EXP/SFFM/AM request none. Devices add entries through the same
   `CKTsetBreak` rules when they accept a point (transmission lines, see
   [Device-driven breakpoints](#device-driven-breakpoints-and-delay-history-adr-84)).
+  The pending table uses an ordered index with logarithmic predecessor/
+  successor lookup and front removal (#126), rather than scanning and
+  shifting an entire vector. A successor within the merge distance takes
+  priority over a predecessor, including an equal predecessor; duplicate
+  entries retain insertion order and the original signed-zero bits. The
+  two-entry clear appends the final-time sentinel even when an already
+  queued event lies beyond it: two ascending runs preserve the resulting
+  sequence. Diagnostic iteration borrows this sequence without allocating
+  a snapshot. Construction rejects non-finite or negative final times
+  and merge distances. Source traversal and corner calculations are unchanged.
+  In the opt-in release breakpoint benchmark on Acer, three trials each
+  at 4096, 16384 and 65536 distinct events in ascending and shuffled order
+  used 9.09 s of CPU time with the former vector and 0.37 s with the index;
+  peak process RSS was 3640 and 9664 KiB respectively. Median elapsed
+  insertion/draining times (ms), under concurrent build load:
+
+  | Order | Events | Insert, vector → index | Drain, vector → index |
+  | --- | ---: | ---: | ---: |
+  | Ascending | 4096 | 8.451 → 1.545 | 0.811 → 2.434 |
+  | Ascending | 16384 | 193.370 → 52.555 | 32.557 → 10.674 |
+  | Ascending | 65536 | 2155.333 → 114.531 | 653.328 → 19.558 |
+  | Shuffled | 4096 | 3.573 → 2.697 | 0.870 → 0.410 |
+  | Shuffled | 16384 | 75.649 → 26.197 | 27.349 → 5.030 |
+  | Shuffled | 65536 | 1156.176 → 165.627 | 705.961 → 42.209 |
+
   At each step the driver clears entries at or
   within `CKTminBreak` of the current time, cuts the step to `CKTbreaks[0] -
   CKTtime` when it would pass it (the landing time is `CKTtime + CKTdelta`,
