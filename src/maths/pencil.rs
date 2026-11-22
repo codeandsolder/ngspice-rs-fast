@@ -7,7 +7,7 @@
 //! does (keeping the previous pivots when they pass the threshold test) and
 //! takes the determinant (`SMPcDProd`: SPARSE's base-10 mantissa converted to
 //! a base-2 mantissa/exponent pair). The search walks the real axis with the
-//! trial list kept sorted by `s`, brackets sign changes with a deflated
+//! trial list built by a frequency scan, brackets sign changes with a deflated
 //! quadratic fit (`NIpzSym2`), deflates every found root out of the stored
 //! trials (`CKTpzVerify`), and continues into the complex plane with Muller's
 //! method from the curvature hint `NIpzK`.

@@ -1335,6 +1335,41 @@ mod tests {
     }
 
     #[test]
+    fn sample_collision_preserves_early_scan_insertion_before_pruning() {
+        let load = load();
+        let mut search = Search::new(&load).unwrap();
+        let first = search.arena.insert_after(None, sample(1.0, 0.5)).unwrap();
+        let between = search
+            .arena
+            .insert_after(
+                Some(first),
+                Trial::new(
+                    Cx::new(1.0 + 1e-13, 1.0),
+                    Cx::new(1.0, 0.0),
+                    0,
+                    TrialKind::Sample,
+                ),
+            )
+            .unwrap();
+        // The real sample collides before the scan visits the intervening
+        // complex sample, even though the proposed real frequency is larger.
+        // C inserts at the last predecessor visited, then verifies and prunes.
+        let frequency = Cx::new(1.0 + 2e-13, 0.0);
+        let root = search.run_trial(frequency, None).unwrap();
+        assert_eq!(search.arena.frequency(root).unwrap(), frequency);
+        assert!(search.arena.get(root).unwrap().is_root());
+        assert_eq!(search.arena.get(first).unwrap().next(), Some(root));
+        assert_eq!(search.arena.get(root).unwrap().next(), Some(between));
+        assert!(search.trace.is_empty());
+        search.verify(root).unwrap();
+        assert_eq!(search.arena.head(), Some(root));
+        assert_eq!(search.arena.anchor(), Some(root));
+        assert!(search.arena.get(first).is_err());
+        assert!(search.arena.get(between).is_err());
+        assert_eq!(search.arena.get(root).unwrap().next(), None);
+    }
+
+    #[test]
     fn root_collisions_reuse_identity_and_verification_prunes_and_deflates() {
         let load = load();
         let mut search = Search::new(&load).unwrap();

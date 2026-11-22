@@ -64,7 +64,7 @@ fn invalid_trial() -> crate::primitives::SpiceError {
     numerical("pole-zero search", "invalid or removed trial identity")
 }
 
-/// Owns linked trials and their sorted traversal. A proposed frequency
+/// Owns linked trials and their reference traversal. A proposed frequency
 /// stays outside the arena until it is evaluated and linked; collisions
 /// may return an existing ID without allocating an abandoned candidate.
 #[derive(Default)]
@@ -102,33 +102,18 @@ impl TrialArena {
         prev: Option<TrialId>,
         mut trial: Trial,
     ) -> SpiceResult<TrialId> {
-        // The arena owns both the linked order and the accepted frequency.
-        // Validate the insertion interval before allocating the ID.
+        // A collision can stop the reference scan before reaching another
+        // lower-frequency trial. Preserve that insertion point, rather than
+        // imposing a total order that the numerical search does not require.
         if !trial.s.re.is_finite() || !trial.s.im.is_finite() {
             return Err(numerical("pole-zero search", "non-finite linked trial"));
         }
-        let key = (trial.s.re, trial.s.im);
-        let unordered = || {
-            numerical(
-                "pole-zero search",
-                "trial insertion is outside its linked interval",
-            )
-        };
         let next = match prev {
-            Some(id) => {
-                let previous = self.get(id)?;
-                if (previous.s.re, previous.s.im) > key {
-                    return Err(unordered());
-                }
-                previous.next
-            }
+            Some(id) => self.get(id)?.next,
             None => self.head,
         };
         if let Some(id) = next {
-            let following = self.get(id)?;
-            if (following.s.re, following.s.im) < key {
-                return Err(unordered());
-            }
+            self.get(id)?;
         }
         let id = TrialId(self.entries.len());
         trial.prev = prev;
@@ -237,16 +222,6 @@ mod tests {
         let right = arena
             .insert_after(Some(root), sample(3.0, TrialKind::Sample))
             .unwrap();
-        assert!(
-            arena
-                .insert_after(Some(right), sample(0.0, TrialKind::Sample))
-                .is_err()
-        );
-        assert!(
-            arena
-                .insert_after(None, sample(9.0, TrialKind::Sample))
-                .is_err()
-        );
         assert!(
             arena
                 .insert_after(None, sample(Real::NAN, TrialKind::Sample))

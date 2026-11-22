@@ -121,10 +121,13 @@ deflated quadratic/Muller kernels (`search::kernels`). A proposal is a
 frequency until its determinant is evaluated; an accepted trial receives a
 stable arena identity. A collision with a previously accepted root increments
 its positive multiplicity without creating a detached trial. The arena owns
-both links, immutable linked frequencies and the anchor. Insertions are
-checked against their finite, sorted adjacent interval; pruning retires an ID
-permanently. Invalid, unordered or retired trial transitions produce numerical
-errors.
+both links, immutable linked frequencies and the anchor. Insertions check
+finite frequencies and live link targets; pruning retires an ID permanently.
+C’s sample-collision scan can stop before visiting a lower-frequency
+complex trial, so link order is not a strict frequency-order invariant.
+The arena preserves the scanned predecessor, including this collision path,
+until root verification prunes nearby and complex samples. Invalid or retired
+trial identities produce numerical errors.
 
 Neighborhoods distinguish missing-middle, missing-right and missing-left
 initialization (in that priority), a complete real bracket, incomplete complex
