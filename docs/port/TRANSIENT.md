@@ -245,7 +245,11 @@ except the noise/random/external ones. Syntax lives in
 | `PULSE` 8th field | `NP` | positive: only `NP` periods, then V1; zero/negative/omitted: unlimited |
 | PWL `td=` / `r=` | ordered scalar setters | `td` shifts every knot; `r` (a knot time below the last) repeats `[r, t_last]`; `r < -0.5` disables repetition |
 
-Phases are degrees. Before its delay a SIN holds `VO + VA sin(PHASE)` and an
+Phases are degrees. AC and transient phases are reduced modulo 360 before
+conversion to radians, and periodic time-dependent angles reduce the
+frequency/time product in turns, retaining its FMA residual. This deliberately
+avoids C's loss of fractional phase for very large finite inputs.
+Before its delay a SIN holds `VO + VA sin(PHASE)` and an
 EXP holds V1, but SFFM and AM hold **zero** (C returns 0 for `time <= TD`), so
 they jump at their delay unless `VO + VA sin(...)` vanishes there. A repeating
 PWL jumps at each repetition boundary when `v(r) != v(t_last)`. Like C, the
@@ -253,7 +257,11 @@ source is evaluated once at a boundary (`vsrcload.c`'s fold: `v(t_last)` or
 `v(r)` depending on which side the landing time rounds to); since the driver
 reproduces C's breakpoint chain and `CKTtime += CKTdelta` landing arithmetic,
 discontinuous repeats (`pwl(0 0 1m 1) r=0`, `pwl(0 0 0.3m 1) r=0`, a delayed
-partial repeat) are bit-identical to ngspice.
+partial repeat) retain the reference boundary-side choice. Interpolation
+between knots uses the nearer endpoint and fused arithmetic; exact knots
+return the original stored ordinate, including signed zero. The exponential
+source retains small initial increments and late decay tails using
+cancellation-safe exponential differences.
 OP/DC analyses without an explicit DC
 value use C's time-zero value (`Waveform::time_zero`); the transient initial
 point uses the left limit at `t = 0`, as C's `MODETRANOP` load does (an explicit
