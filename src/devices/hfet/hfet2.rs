@@ -43,10 +43,6 @@
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
 )]
 #![expect(
-    clippy::float_cmp,
-    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
-)]
-#![expect(
     clippy::manual_midpoint,
     reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
 )]
