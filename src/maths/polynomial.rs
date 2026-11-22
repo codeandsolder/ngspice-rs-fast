@@ -80,6 +80,7 @@ fn eliminate(row: &mut [Real], pivot: &[Real], col: usize, rhs: &mut Real, pivot
 }
 
 /// Evaluates coefficients ordered from constant to highest power using Horner's rule.
+///
 /// Retain the existing separately rounded multiplication and addition in
 /// evaluation; elimination above deliberately uses fused operations.
 #[must_use]
