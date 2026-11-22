@@ -227,15 +227,12 @@ pub fn model_parameters(model: &ResolvedModel<'_>) -> SpiceResult<ModelParameter
 }
 
 fn parse_model_parameters(model: &ResolvedModel<'_>) -> SpiceResult<ModelParameters> {
-    if !matches!(model.family(), ModelFamily::Nmos | ModelFamily::Pmos)
-        || !matches!(model.levels().selector, 8 | 49)
-    {
+    if model.levels().backend != crate::devices::ModelBackend::Bsim3 {
         return Err(SpiceError::parse(
             model.card().location.clone(),
             "BSIM3 input schema requires NMOS/PMOS level 8 or 49",
         ));
     }
-    select_version(model.card())?;
     let mut result = ModelParameters {
         inputs: Inputs::new(&DEVICE, true),
         polarity: if model.family() == ModelFamily::Nmos {

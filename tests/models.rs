@@ -235,6 +235,7 @@ fn every_validated_level_selects_exactly_one_concrete_backend() {
                     let actual = actual.unwrap_or_else(|e| panic!("{family} level {level}: {e}"));
                     assert_eq!(actual.backend, backend, "{family} level {level}");
                     assert_eq!(actual.first_raw, Some(f64::from(level)));
+                    assert_eq!(actual.selector, level, "{family} retained selector");
                 } else {
                     let error = actual.unwrap_err();
                     assert!(error.is_not_yet_ported(), "{family} level {level}: {error}");
