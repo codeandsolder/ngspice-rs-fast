@@ -1380,7 +1380,7 @@ mod tests {
             let mut matrix = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
             let bound = start.elapsed();
             let load = |matrix: &mut SparseMatrix| {
-                for (row, stamps) in entries.chunks_exact(5).enumerate() {
+                for (row, stamps) in entries.as_chunks::<5>().0.iter().enumerate() {
                     matrix.begin_device(row).unwrap();
                     for &(r, c) in stamps {
                         matrix.add(r, c, black_box(0.5)).unwrap();
