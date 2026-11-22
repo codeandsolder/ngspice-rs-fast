@@ -2477,6 +2477,8 @@ mod tests {
                     reader.next_plot().unwrap().unwrap(),
                     compare::DC,
                     None,
+                    None,
+                    &[],
                 )
                 .unwrap();
             }
@@ -2485,7 +2487,7 @@ mod tests {
             let retained = RawFile::parse(&fs::read_to_string(&path).unwrap()).unwrap();
             assert_eq!(retained.plots.len(), stages);
             for expected in &retained.plots {
-                compare::plots(actual, &expected.plot, compare::DC, None).unwrap();
+                compare::plots(actual, &expected.plot, &[], compare::DC, None, None).unwrap();
             }
         }
         eprintln!(
