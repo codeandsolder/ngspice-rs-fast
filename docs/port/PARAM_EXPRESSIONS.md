@@ -84,8 +84,8 @@ parentheses; spaces inside `(...)` and `{...}` are kept. The port applies this
 rule to every card. C is more permissive on a card with a single assignment
 (`.param a = 1 + 2` works there; with several assignments `b = a * 3` silently
 means `b = a`), so here such input is an explicit error that tells you to use
-`{...}`. Continuation lines are joined first; reported columns are byte columns
-in the joined card, like all token locations.
+`{...}`. Continuation lines are joined for grammar recognition, but reported positions
+retain their physical source line and one-based UTF-8 byte column.
 
 `.param` cards in a `.subckt` body are stored in `Subcircuit::params` and
 referenced as `ScopedCardKind::Param(index)` in that scope; the root uses

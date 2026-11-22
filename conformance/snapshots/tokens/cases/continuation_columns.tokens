@@ -1,6 +1,6 @@
 # ngspice-rs token-dump v1
 file: cases/continuation_columns.cir
-title: "Continuation lines and comments: columns are relative to the joined card" @cases/continuation_columns.cir:1:1
+title: "Continuation lines and comments: columns are relative to physical source lines" @cases/continuation_columns.cir:1:1
 card 1 @cases/continuation_columns.cir:3:1 lines=3-4 continuations=1
   raw: "v1 in 0 dc 5"
   kind: device(v)
