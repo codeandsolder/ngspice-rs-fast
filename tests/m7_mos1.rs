@@ -170,8 +170,7 @@ fn transient_meyer_charge_advances_with_the_averaged_half_capacitances() {
     );
     let solved = bias(&c);
     let mut history = c.state_history().unwrap();
-    history.commit(solved.trial.clone()).unwrap();
-    history.seed_accepted_history().unwrap();
+    history.initialize(solved.trial.clone()).unwrap();
     let cox = 3.9 * EPS0 / 20e-9 * 2e-6 * 10e-6;
     let (ovs, ovd) = (0.4e-9 * 10e-6, 0.3e-9 * 10e-6);
     let (gs1, gd1) = meyer_linear(2. - 0.8, 0.2, cox);
@@ -229,8 +228,7 @@ fn transient_companion_jacobian_is_exact_where_the_meyer_halves_are_constant() {
     );
     let solved = bias(&c);
     let mut history = c.state_history().unwrap();
-    history.commit(solved.trial.clone()).unwrap();
-    history.seed_accepted_history().unwrap();
+    history.initialize(solved.trial.clone()).unwrap();
     let dt = 1e-9;
     let mut steps = StepHistory::new();
     let first = steps

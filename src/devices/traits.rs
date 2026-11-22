@@ -840,20 +840,19 @@ pub trait Device: fmt::Debug + std::any::Any {
         })
     }
 
-    /// Observes an accepted solution point before its state is committed.
-    ///
-    /// Called by [`crate::devices::Circuit::accept_point`] for the accepted initial
-    /// state, accepted adaptive steps and changed event (right-limit) states;
-    /// never for Newton trials, rejected steps or interpolated output samples.
-    /// Any error aborts the acceptance and nothing is committed. Device history
-    /// lives in state slots, so the hook cannot mutate the device.
+    /// Validate a prospective accepted point without observable side effects.
+    /// All devices must approve before any accept notification is delivered.
     ///
     /// # Errors
-    ///
     /// Device-specific failures.
-    fn accept(&self, _context: &AcceptContext<'_>) -> SpiceResult<()> {
+    fn validate_accept(&self, _context: &AcceptContext<'_>) -> SpiceResult<()> {
         Ok(())
     }
+
+    /// Infallible notification of an accepted point, after all acceptance
+    /// checks succeeded and immediately before the histories are published.
+    /// Never called for Newton trials or rejected steps.
+    fn accept(&self, _context: &AcceptContext<'_>) {}
 
     /// An upper bound on the next transient step from this device's discrete
     /// state (C `DEVtrunc` of devices without charge storage, e.g.

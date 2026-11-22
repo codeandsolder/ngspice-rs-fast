@@ -594,14 +594,16 @@ impl Device for Probe {
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         context.nodal(self.terminals, 1e-3, false)
     }
-    fn accept(&self, context: &AcceptContext<'_>) -> SpiceResult<()> {
+    fn validate_accept(&self, context: &AcceptContext<'_>) -> SpiceResult<()> {
         if context.time.is_some_and(|t| t > self.fail_after) {
             return Err(SpiceError::circuit("probe refused"));
         }
+        Ok(())
+    }
+    fn accept(&self, context: &AcceptContext<'_>) {
         self.log
             .borrow_mut()
             .push((context.time, context.states.map(|s| s[0])));
-        Ok(())
     }
 }
 fn add_probe(c: &mut Circuit, log: &Log, fail_after: f64) {

@@ -690,8 +690,7 @@ fn the_transient_jacobian_follows_mesloads_matrix() {
         )
         .unwrap();
         let mut history = c.state_history().unwrap();
-        history.commit(solved.trial.clone()).unwrap();
-        history.seed_accepted_history().unwrap();
+        history.initialize(solved.trial.clone()).unwrap();
         let dt = 1e-9;
         let mut steps = StepHistory::new();
         let first = steps

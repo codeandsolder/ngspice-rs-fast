@@ -194,8 +194,7 @@ fn all_device_charge_pairs_are_disposable_and_integrate_actual_nonlinear_q() {
         )
         .unwrap();
         let mut history = c.state_history().unwrap();
-        history.commit(solved.trial.clone()).unwrap();
-        history.seed_accepted_history().unwrap();
+        history.initialize(solved.trial.clone()).unwrap();
         let before = history.clone();
         let mut x = solved.values;
         let row = c.unknowns().node_row(c.nodes().get("a").unwrap()).unwrap();
