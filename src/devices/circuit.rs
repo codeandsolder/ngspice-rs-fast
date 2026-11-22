@@ -307,6 +307,13 @@ impl<'a> PreparedRun<'a> {
             .map_err(|_| SpiceError::circuit("missing prepared model context"))
     }
 
+    /// Validate the ordered overrides at a physical point without stamping.
+    /// # Errors
+    /// Invalid model context, foreign targets, conflicting setters, or device physics.
+    pub fn validate_context(&self, context: &ModelContext) -> SpiceResult<()> {
+        self.point(context).map(|_| ())
+    }
+
     /// Load a disposable trial using this run's prepared effective devices.
     /// # Errors
     /// As [`Circuit::load`]; a changed context is revalidated before use.

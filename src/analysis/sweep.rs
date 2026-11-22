@@ -526,14 +526,15 @@ pub fn resolve(
     let crate::analysis::plan::PlanKind::Dc { axes, .. } = request.analysis() else {
         return Err(unsupported("typed sweep requires a DC request"));
     };
-    bind_axes(circuit, axes, context)
+    bind_axes(&circuit.prepare_run(), axes, context)
 }
 
 fn bind_axes(
-    circuit: &Circuit,
+    prepared: &crate::devices::PreparedRun<'_>,
     plan: &DcSweepPlan,
     context: &AnalysisContext,
 ) -> SpiceResult<Vec<SweepSpec>> {
+    let circuit = prepared.circuit();
     // Targets are physical metadata, not an AC matrix. Do not require an
     // otherwise DC-capable device to implement a small-signal load merely to
     // discover which name denotes an independent source.
@@ -565,7 +566,8 @@ fn bind_axes(
     // Validate the first point's actual replacements at its temperature.
     // The run's preflight validates the remaining physical contexts.
     let start = [axes[0].start, axes.get(1).map_or(0., |axis| axis.start)];
-    point_context(circuit, &axes, start, context.model_context())?;
+    let point = point_context(circuit, &axes, start, context.model_context())?;
+    prepared.validate_context(&point.model)?;
     Ok(axes)
 }
 
@@ -685,11 +687,12 @@ impl<'a> GridPair<'a> {
 /// circuit that cannot be assembled at some swept temperature. Convergence
 /// failures remain run-time errors.
 fn preflight(
-    circuit: &Circuit,
+    prepared: &crate::devices::PreparedRun<'_>,
     axes: &[SweepSpec],
     grids: &[Vec<Real>],
     context: &AnalysisContext,
 ) -> SpiceResult<()> {
+    let circuit = prepared.circuit();
     let zero = Vector::zeros(circuit.unknown_count());
     // A temperature or device-parameter axis changes the devices themselves:
     // validate actual Cartesian point contexts, not the original recipes at
@@ -707,7 +710,7 @@ fn preflight(
         let contexts = GridPair::new(grids).physical_contexts(axes);
         for values in contexts.points() {
             let point = point_context(circuit, axes, values, context.model_context())?;
-            circuit.small_signal_system(&point.model, &zero)?;
+            prepared.small_signal_system_at(&point.model, &zero, None)?;
         }
         return Ok(());
     }
@@ -832,17 +835,18 @@ pub(super) fn run(
         initial: Vec::new(),
         nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
     };
-    let axes = bind_axes(circuit, sweep, context)?;
+    let prepared = circuit.prepare_run();
+    let axes = bind_axes(&prepared, sweep, context)?;
     let settings = request.dc_settings();
     let warm_settings = warm_start_settings(point_iterations, settings);
     let solver = SweepSolver {
-        prepared: circuit.prepare_run(),
+        prepared,
         settings,
         warm_settings: warm_settings.as_ref(),
         nodes: &nodes,
     };
     let grids = &sweep.grids;
-    preflight(circuit, &axes, grids, context)?;
+    preflight(&solver.prepared, &axes, grids, context)?;
     // C order: the first axis is the inner (fast) loop, the second the outer.
     let GridPair { inner, outer } = GridPair::new(grids);
     let result = plot(
