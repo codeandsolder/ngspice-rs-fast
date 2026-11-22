@@ -588,9 +588,8 @@ impl Device for Probe {
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         context.nodal([self.node, NodeId::GROUND], 1e-3, false)
     }
-    fn accept(&self, _: &AcceptContext<'_>) -> SpiceResult<()> {
+    fn accept(&self, _: &AcceptContext<'_>) {
         self.accepted.set(self.accepted.get() + 1);
-        Ok(())
     }
 }
 fn probe(c: &mut Circuit, node: &str) -> (Rc<Cell<usize>>, Rc<Cell<usize>>) {
@@ -640,9 +639,8 @@ impl Device for Gate {
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         context.nodal([self.node, NodeId::GROUND], 1e-3, false)
     }
-    fn accept(&self, _: &AcceptContext<'_>) -> SpiceResult<()> {
+    fn accept(&self, _: &AcceptContext<'_>) {
         self.accepted.set(self.accepted.get() + 1);
-        Ok(())
     }
 }
 fn gated(body: &str, limit: f64) -> (Circuit, Rc<Cell<usize>>) {

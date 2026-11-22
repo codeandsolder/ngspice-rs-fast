@@ -431,9 +431,8 @@ impl Device for Probe {
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         context.nodal(self.terminals, 1e-3, false)
     }
-    fn accept(&self, context: &AcceptContext<'_>) -> SpiceResult<()> {
+    fn accept(&self, context: &AcceptContext<'_>) {
         self.log.borrow_mut().push(context.time);
-        Ok(())
     }
 }
 

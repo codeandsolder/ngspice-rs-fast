@@ -73,7 +73,7 @@ impl Device for Probe {
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         context.nodal(self.terminals, 1., false)
     }
-    fn accept(&self, context: &AcceptContext<'_>) -> SpiceResult<()> {
+    fn validate_accept(&self, context: &AcceptContext<'_>) -> SpiceResult<()> {
         if context.time == Some(99.) {
             return Err(SpiceError::circuit("accept hook refused"));
         }
@@ -263,11 +263,33 @@ fn failed_acceptance_leaves_every_history_unchanged() {
             .accept_transient_point(&x, 1e-6, &mut history.clone(), first, &acceptance(false))
             .is_err()
     );
+    let before = history.clone();
+    assert!(
+        circuit
+            .accept_transient_point(&x, 1e-6, &mut history, trial(&before), &acceptance(true))
+            .is_err()
+    );
+    assert_eq!(history, before);
     let first = trial(&history);
     let requested = circuit
         .accept_transient_point(&x, 0., &mut history, first, &acceptance(true))
         .unwrap();
     assert!(requested.is_empty());
+    assert!(history.depth() > 1);
+    for age in 2..=history.depth() {
+        assert_eq!(history.accepted(age), history.accepted(1));
+        assert!(std::ptr::eq(
+            history.accepted(age).unwrap(),
+            history.accepted(1).unwrap()
+        ));
+    }
+    let before = history.clone();
+    assert!(
+        circuit
+            .accept_transient_point(&x, 0., &mut history, trial(&before), &acceptance(true))
+            .is_err()
+    );
+    assert_eq!(history, before);
     assert_eq!(history.delay(3).map(DelayHistory::len), Some(1));
     for time in [98., 99.] {
         let before = history.clone();

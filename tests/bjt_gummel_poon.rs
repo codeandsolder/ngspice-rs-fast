@@ -121,8 +121,7 @@ fn solved(c: &Circuit, context: &ModelContext) -> (Vector, StateHistory) {
         ngspice_rs::analysis::bias::solve_dc(c, context, &Default::default(), &[], None, None)
             .unwrap();
     let mut history = c.state_history().unwrap();
-    history.commit(solved.trial.clone()).unwrap();
-    history.seed_accepted_history().unwrap();
+    history.initialize(solved.trial).unwrap();
     (solved.values, history)
 }
 

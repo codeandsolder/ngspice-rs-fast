@@ -27,7 +27,7 @@ use crate::devices::linear::Forcing;
 use crate::devices::models::ModelContext;
 use crate::devices::mutual::validation::ValidationBudget;
 use crate::devices::mutual::{CouplingSite, MutualLimits, pair_count};
-use crate::devices::state::{StateHistory, StateSnapshot, TrialState};
+use crate::devices::state::{HistoryPublication, StateHistory, StateSnapshot, TrialState};
 use crate::devices::sweep::{InstanceOverride, ResistorMetadata, ResistorOverride};
 use crate::devices::traits::{
     AcceptContext, AnalysisMode, Device, InductanceValue, MnaUnknowns, MutualTerm, StampContext,
@@ -2435,12 +2435,7 @@ impl Circuit {
         Ok(())
     }
 
-    fn run_accept_hooks(
-        &self,
-        solution: &Vector,
-        time: Option<Real>,
-        trial: Option<&TrialState>,
-    ) -> SpiceResult<()> {
+    fn validate_accept_point(&self, solution: &Vector, time: Option<Real>) -> SpiceResult<()> {
         self.check_numbering()?;
         if solution.len() != self.unknown_count() || !solution.is_finite() {
             return Err(SpiceError::circuit(
@@ -2450,21 +2445,28 @@ impl Circuit {
         if time.is_some_and(|t| !t.is_finite()) {
             return Err(SpiceError::circuit("accepted time is nonfinite"));
         }
+        Ok(())
+    }
+
+    fn run_accept_hooks(
+        &self,
+        solution: &Vector,
+        time: Option<Real>,
+        trial: Option<&TrialState>,
+    ) -> SpiceResult<()> {
+        // All fallible device-specific checks precede any notifications.
+        // The caller has validated the trial against the finalized state layout.
+        let context = |index: usize| AcceptContext {
+            solution,
+            time,
+            branches: &self.bindings.branch_rows[index],
+            states: trial.map(|trial| &trial.values()[self.bindings.state_rows[index].clone()]),
+        };
         for (index, device) in self.devices.iter().enumerate() {
-            let states = match trial {
-                Some(trial) => Some(
-                    trial
-                        .slice(self.bindings.state_rows[index].clone())
-                        .ok_or_else(|| SpiceError::circuit("trial state is too short"))?,
-                ),
-                None => None,
-            };
-            device.accept(&AcceptContext {
-                solution,
-                time,
-                branches: &self.bindings.branch_rows[index],
-                states,
-            })?;
+            device.validate_accept(&context(index))?;
+        }
+        for (index, device) in self.devices.iter().enumerate() {
+            device.accept(&context(index));
         }
         Ok(())
     }
@@ -2485,9 +2487,11 @@ impl Circuit {
         trial: TrialState,
     ) -> SpiceResult<()> {
         self.validate_history(history)?;
+        self.validate_accept_point(solution, time)?;
         history
             .accept_transaction(
                 trial,
+                HistoryPublication::Rotate,
                 |_, _| Ok(Vec::new()),
                 |trial| self.run_accept_hooks(solution, time, Some(trial)),
             )
@@ -2497,7 +2501,8 @@ impl Circuit {
     /// Accepts a companion-transient point: [`Self::accept_point`] plus the
     /// delay histories of transmission lines ([`crate::devices::delay`]).
     ///
-    /// With `delay.start` (the `t = 0` point) every delay line initializes
+    /// With `delay.start` (the `t = 0` point), the initial state fills the
+    /// integration history and every delay line initializes
     /// its history ([`crate::devices::delay::DelayLine::start`]); otherwise it
     /// records the accepted sample ([`crate::devices::delay::DelayLine::accept`]).
     /// Every update is computed and validated first, then the hooks run, the
@@ -2519,8 +2524,25 @@ impl Circuit {
         delay: &DelayAcceptance,
     ) -> SpiceResult<Vec<Real>> {
         self.validate_history(history)?;
+        self.validate_accept_point(solution, Some(time))?;
+        let publication = if delay.start {
+            if time != 0. {
+                return Err(SpiceError::circuit(
+                    "transient initial point must be at t = 0",
+                ));
+            }
+            HistoryPublication::Initialize
+        } else {
+            if history.accepted(1).is_none() {
+                return Err(SpiceError::circuit(
+                    "transient step requires initial accepted history",
+                ));
+            }
+            HistoryPublication::Rotate
+        };
         history.accept_transaction(
             trial,
+            publication,
             |history, trial| self.delay_updates(solution, time, history, trial, delay),
             |trial| self.run_accept_hooks(solution, Some(time), Some(trial)),
         )
@@ -2641,6 +2663,7 @@ impl Circuit {
     ///
     /// Invalid solution/time or a hook failure.
     pub fn accept_solution(&self, solution: &Vector, time: Option<Real>) -> SpiceResult<()> {
+        self.validate_accept_point(solution, time)?;
         self.run_accept_hooks(solution, time, None)
     }
 
