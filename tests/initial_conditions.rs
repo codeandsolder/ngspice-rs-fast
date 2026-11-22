@@ -496,3 +496,49 @@ fn uic_adds_the_print_step_breakpoint_like_dctran() {
             .any(|t| (t - 100e-6).abs() < 1e-15)
     );
 }
+
+#[test]
+fn redundant_capacitor_cycle_names_the_actual_voltage_constraint_path() {
+    let deck = |last| {
+        format!(
+            "t\nv1 p 0 3\nc1 p a 1u ic=1\nc2 a b 1u ic=1\nc3 b 0 1u ic={last}\nr1 b 0 1k\n.tran 1u 10u uic\n.end\n"
+        )
+    };
+    assert!(run(&deck(1)).is_ok());
+    let error = error_of(&deck(2));
+    for name in ["impulse", "c3", "c2", "c1", "v1", "path:"] {
+        assert!(error.contains(name), "missing {name} in {error}");
+    }
+}
+
+#[test]
+fn controlled_output_diagnostic_does_not_name_disconnected_sources() {
+    let deck = |ic| {
+        format!(
+            "t\nv1 ctl 0 2\ne1 out 0 ctl 0 2\ne2 unused 0 ctl 0 3\nr1 out 0 1k\nr2 unused 0 1k\nc1 out 0 1u ic={ic}\n.tran 1u 10u uic\n.end\n"
+        )
+    };
+    assert!(run(&deck(4)).is_ok());
+    let error = error_of(&deck(3));
+    assert!(
+        error.contains("c1") && error.contains("e1") && error.contains("impulse"),
+        "{error}"
+    );
+    assert!(!error.contains("e2"), "{error}");
+}
+
+#[test]
+fn coupled_fixed_inductor_currents_have_row_local_provenance() {
+    let deck = |ic| {
+        format!(
+            "t\ni1 0 a 1m\ni2 0 b 2m\nl1 a 0 1m ic=1m\nl2 b 0 2m ic={ic}m\nk1 l1 l2 0.5\n.tran 1u 10u uic\n.end\n"
+        )
+    };
+    assert!(run(&deck(2)).is_ok());
+    let error = error_of(&deck(3));
+    assert!(
+        error.contains("impulse") && error.contains("l2") && error.contains("node b"),
+        "{error}"
+    );
+    assert!(!error.contains("l1"), "{error}");
+}
