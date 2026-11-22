@@ -1654,11 +1654,11 @@ impl Circuit {
                 || vec![0.; self.bindings.state_len],
                 |snapshot| snapshot.values.to_vec(),
             );
-        let operating = crate::devices::distortion::DistortionContext {
-            model_context: context,
-            unknowns: &self.bindings.unknowns,
+        let operating = crate::devices::distortion::DistortionContext::new(
+            context,
+            &self.bindings.unknowns,
             bias,
-        };
+        )?;
         for (index, device) in self.devices.iter().enumerate() {
             let rows = self.bindings.state_rows[index].clone();
             if let Some(slots) = state.get_mut(rows) {
