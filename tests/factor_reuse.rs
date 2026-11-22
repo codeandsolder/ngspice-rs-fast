@@ -20,7 +20,7 @@ fn pattern() -> Arc<Pattern> {
 }
 
 fn bound(pattern: &Arc<Pattern>, values: &[f64; 7]) -> SparseMatrix {
-    let mut matrix = SparseMatrix::bound(pattern.clone());
+    let mut matrix = SparseMatrix::bound(pattern.clone()).unwrap();
     for (&(row, col), &value) in POSITIONS.iter().zip(values) {
         matrix.add(row, col, value).unwrap();
     }

@@ -359,7 +359,7 @@ impl CircuitNewton<'_> {
             policy,
             continued,
             |guess, phase, previous| {
-                let mut matrix = self.circuit.new_matrix();
+                let mut matrix = self.circuit.new_matrix()?;
                 let mut rhs = Vector::zeros(self.circuit.unknown_count());
                 let mut trial = self
                     .history

@@ -930,7 +930,7 @@ impl Driver<'_> {
                 history: &self.history,
                 forcing: None,
             },
-            &mut self.circuit.new_matrix(),
+            &mut self.circuit.new_matrix()?,
             &mut Vector::zeros(n),
             &mut trial,
         )?;
