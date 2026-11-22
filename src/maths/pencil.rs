@@ -467,33 +467,37 @@ type Set = [Option<usize>; 3];
 struct LoadedPencil<'a> {
     load: &'a PencilLoad,
     sparse: Sparse<Complex>,
-    handles: Vec<usize>,
-    drive: [Option<usize>; 2],
+    handles: Vec<super::sparse13::SolverElement>,
+    drive: [Option<super::sparse13::SolverElement>; 2],
 }
 
 impl<'a> LoadedPencil<'a> {
-    fn new(load: &'a PencilLoad) -> Self {
-        let mut sparse = Sparse::new(load.order);
+    fn new(load: &'a PencilLoad) -> SpiceResult<Self> {
+        let mut sparse = Sparse::new(load.order)?;
         for &(row, col) in &load.elements {
-            sparse.get_element(row + 1, col + 1);
+            sparse.get_element(row + 1, col + 1)?;
         }
         let handles = load
             .terms
             .iter()
             .map(|t| sparse.get_element(t.row + 1, t.col + 1))
-            .collect();
-        let drive = load.solution.map_or([None, None], |col| {
-            load.drive
-                .map(|row| row.map(|row| sparse.get_element(row + 1, col + 1)))
-        });
+            .collect::<SpiceResult<_>>()?;
+        let mut drive = [None, None];
+        if let Some(col) = load.solution {
+            for (slot, row) in drive.iter_mut().zip(load.drive) {
+                if let Some(row) = row {
+                    *slot = Some(sparse.get_element(row + 1, col + 1)?);
+                }
+            }
+        }
         // As in C, external rows not referenced by elements do not enter
         // the determinant.
-        Self {
+        Ok(Self {
             load,
             sparse,
             handles,
             drive,
-        }
+        })
     }
 
     /// `CKTpzLoad` + `SMPcReorder` + `SMPcDProd`; no MNA preorder.
@@ -513,9 +517,9 @@ impl<'a> LoadedPencil<'a> {
         }
         if let Some(solution) = load.solution {
             if let Some(balance) = load.balance {
-                sparse.add_col(balance + 1, solution + 1);
+                sparse.add_col(balance + 1, solution + 1)?;
             }
-            sparse.zero_col(solution + 1);
+            sparse.zero_col(solution + 1)?;
         }
         for (element, value) in drive.iter().zip([1.0, -1.0]) {
             if let Some(element) = *element {
@@ -528,6 +532,10 @@ impl<'a> LoadedPencil<'a> {
         }
         match sparse.order_and_factor(load.relative_threshold, 1.0e-30) {
             Status::Singular | Status::ZeroDiag => Ok(None),
+            Status::Resource => Err(numerical(
+                "pole-zero search",
+                "sparse factor storage capacity exceeded",
+            )),
             Status::InvalidPlan => Err(numerical(
                 "pole-zero search",
                 "ordered sparse topology lacks a valid traversal plan",
@@ -587,7 +595,7 @@ pub fn pencil_load_roots(load: &PencilLoad) -> SpiceResult<PencilRoots> {
     load.validate()?;
     let n = load.order;
     let mut search = Search {
-        pencil: LoadedPencil::new(load),
+        pencil: LoadedPencil::new(load)?,
         trials: Vec::new(),
         head: None,
         zero_trial: None,
@@ -1559,7 +1567,7 @@ mod tests {
             }],
             ..PencilLoad::default()
         };
-        let mut compiled = LoadedPencil::new(&load);
+        let mut compiled = LoadedPencil::new(&load).unwrap();
         assert!(compiled.determinant_at(Cx::new(f64::MAX, 0.)).is_err());
         assert!(compiled.determinant_at(Cx::new(f64::INFINITY, 0.)).is_err());
         assert!(c_norm(&mut Cx::new(f64::INFINITY, 0.), &mut 0).is_err());

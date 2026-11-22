@@ -51,8 +51,7 @@ use std::sync::Arc;
 use crate::devices::{Limit, TransientTiming};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
-/// The largest cycle index whose start time is still resolvable in `f64`.
-const MAX_CYCLE: Real = 4_503_599_627_370_496.0; // 2^52
+use super::pulse::{MAX_CYCLE, cycle_position, seek_cycle};
 
 fn invalid(kind: &str, message: impl Into<String>) -> SpiceError {
     SpiceError::circuit(format!("invalid {kind} waveform: {}", message.into()))
@@ -639,8 +638,15 @@ impl SourceFunction {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PwlSource {
     knots: Arc<[(Real, Real)]>,
-    delay: Real,
-    repeat: Option<usize>,
+    timing: PwlTiming,
+}
+
+/// Plain knots have exactly their given time bits. Explicit C delay/repeat
+/// setters use the C arithmetic even when delay is numerically zero.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PwlTiming {
+    Plain,
+    Shifted { delay: Real, repeat: Option<usize> },
 }
 
 impl PwlSource {
@@ -659,6 +665,14 @@ impl PwlSource {
         delay: Real,
         repeat_from: Option<Real>,
     ) -> SpiceResult<Self> {
+        Self::plain(knots)?.with_timing(delay, repeat_from)
+    }
+
+    /// Construct continuous, undelayed, nonrepeating PWL forcing.
+    ///
+    /// # Errors
+    /// Empty, nonfinite, negative-time or non-strictly-ordered knots.
+    pub fn plain(knots: Vec<(Real, Real)>) -> SpiceResult<Self> {
         let kind = "PWL";
         if knots.is_empty()
             || !knots
@@ -671,23 +685,42 @@ impl PwlSource {
                 "times must be finite, nonnegative and strictly increasing with finite values",
             ));
         }
+        Ok(Self {
+            knots: knots.into(),
+            timing: PwlTiming::Plain,
+        })
+    }
+
+    /// Bind explicit source delay and repeat setters to the existing immutable
+    /// knots. No revalidation, cloning or allocation of the knots is needed.
+    ///
+    /// # Errors
+    /// Nonfinite delay or an invalid repeat start.
+    pub fn with_timing(mut self, delay: Real, repeat_from: Option<Real>) -> SpiceResult<Self> {
+        let kind = "PWL";
         if !delay.is_finite() {
             return Err(invalid(kind, "nonfinite td"));
         }
+        let repeat = self.repeat_index(repeat_from)?;
+        self.timing = PwlTiming::Shifted { delay, repeat };
+        Ok(self)
+    }
+
+    /// Resolve a repeat setter against this validated knot sequence.
+    pub(super) fn repeat_index(&self, repeat_from: Option<Real>) -> SpiceResult<Option<usize>> {
+        let kind = "PWL";
         let repeat = match repeat_from {
             Some(r) if !r.is_finite() => return Err(invalid(kind, "nonfinite r")),
             Some(r) if r >= -0.5 => {
-                let end = knots[knots.len() - 1].0;
+                let end = self.knots[self.knots.len() - 1].0;
                 if r >= end {
                     return Err(invalid(
                         kind,
                         format!("repeat start r={r} must be smaller than the last time point"),
                     ));
                 }
-                // Knots are finite and ordered. Locate the exact time without
-                // changing IEEE equality for the two representations of zero.
-                let index = knots.partition_point(|(time, _)| *time < r);
-                if knots.get(index).is_none_or(|(time, _)| *time > r) {
+                let index = self.knots.partition_point(|(time, _)| *time < r);
+                if self.knots.get(index).is_none_or(|(time, _)| *time > r) {
                     return Err(invalid(
                         kind,
                         format!("repeat start r={r} matches no time point"),
@@ -697,11 +730,7 @@ impl PwlSource {
             }
             _ => None,
         };
-        Ok(Self {
-            knots: knots.into(),
-            delay,
-            repeat,
-        })
+        Ok(repeat)
     }
 
     /// The knots as given (before the delay).
@@ -713,13 +742,19 @@ impl PwlSource {
     /// The `td=` delay.
     #[must_use]
     pub const fn delay(&self) -> Real {
-        self.delay
+        match self.timing {
+            PwlTiming::Plain => 0.,
+            PwlTiming::Shifted { delay, .. } => delay,
+        }
     }
 
     /// The knot index repetition restarts from, if repeating.
     #[must_use]
     pub const fn repeat(&self) -> Option<usize> {
-        self.repeat
+        match self.timing {
+            PwlTiming::Plain => None,
+            PwlTiming::Shifted { repeat, .. } => repeat,
+        }
     }
 
     /// Linear interpolation at an in-range local time (C's segment search).
@@ -744,10 +779,6 @@ impl PwlSource {
     /// # Errors
     /// `t` nonfinite, or so many repetitions from the origin that the
     /// in-cycle position is unresolvable.
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "C PWL repeat folding subtracts the rounded period times cycle"
-    )]
     pub fn value_at(&self, t: Real, limit: Limit) -> SpiceResult<Real> {
         let kind = "PWL";
         // vsrcload.c evaluates a single value; see the type documentation.
@@ -755,7 +786,10 @@ impl PwlSource {
         if !t.is_finite() {
             return Err(invalid(kind, "nonfinite evaluation time"));
         }
-        let mut time = t - self.delay;
+        let mut time = match self.timing {
+            PwlTiming::Plain => t,
+            PwlTiming::Shifted { delay, .. } => t - delay,
+        };
         if !time.is_finite() {
             return Err(invalid(kind, "evaluation time overflows"));
         }
@@ -765,22 +799,21 @@ impl PwlSource {
         }
         let end = last.0;
         if time > end {
-            let Some(index) = self.repeat else {
+            let Some(index) = self.repeat() else {
                 return Ok(last.1);
             };
             // Repeating (vsrcload.c, `case PWL`, in C's operation order).
             let start = self.knots[index].0;
             let period = end - start;
             time -= start;
-            let cycle = (time / period).floor();
-            if !cycle.is_finite() || cycle >= MAX_CYCLE {
+            let cycle = cycle_position(time, period);
+            if !cycle.resolvable() {
                 return Err(invalid(
                     kind,
                     "evaluation time is too many repetitions from the origin",
                 ));
             }
-            time -= period * cycle;
-            time += start;
+            time = cycle.phase + start;
             // Prevent glitches.
             if time > end {
                 time = end;
@@ -803,10 +836,10 @@ impl PwlSource {
             ));
         }
         let mut first_cycle = 1.;
-        if let Some(index) = self.repeat {
+        if let Some(index) = self.repeat() {
             let last = self.knots[self.knots.len() - 1].0;
             let period = last - self.knots[index].0;
-            let cycles = ((t1 - self.delay - last) / period).ceil();
+            let cycles = ((t1 - self.delay() - last) / period).ceil();
             if !cycles.is_finite() || cycles >= MAX_CYCLE {
                 return Err(invalid(
                     "PWL",
@@ -814,21 +847,40 @@ impl PwlSource {
                 ));
             }
             // Skip whole repetitions before the window (one early for rounding).
-            let skip = ((t0 - self.delay - last) / period).floor() - 1.;
+            let skip = ((t0 - self.delay() - last) / period).floor() - 1.;
             if skip > 1. {
                 first_cycle = skip;
             }
         }
+        let index = self
+            .knots
+            .partition_point(|(time, _)| self.event_time(*time, 0.) < t0);
         Ok(PwlBreakpoints {
             source: self.clone(),
             t0,
             t1,
             cycle: 0.,
             first_cycle,
-            index: 0,
+            index,
             last: None,
             done: false,
         })
+    }
+    /// Repetition offset; no arithmetic is applied to the original plain knots.
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "C PWL event times use separate rounded additions and multiplication"
+    )]
+    fn event_time(&self, knot: Real, cycle: Real) -> Real {
+        match self.timing {
+            PwlTiming::Plain => knot,
+            PwlTiming::Shifted { delay, repeat } => {
+                let period = repeat.map_or(0., |index| {
+                    self.knots[self.knots.len() - 1].0 - self.knots[index].0
+                });
+                delay + knot + period * cycle
+            }
+        }
     }
 }
 
@@ -848,32 +900,32 @@ pub struct PwlBreakpoints {
 
 impl Iterator for PwlBreakpoints {
     type Item = Real;
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "retain separate rounded period offsets for repeat-boundary comparisons"
-    )]
     fn next(&mut self) -> Option<Real> {
         let knots = &self.source.knots;
-        while !self.done {
+        while !self.done && self.last.is_none_or(|last| last < self.t1) {
             if self.index >= knots.len() {
-                let Some(repeat) = self.source.repeat else {
+                let Some(repeat) = self.source.repeat() else {
                     self.done = true;
                     break;
                 };
-                self.cycle = if self.cycle == 0. {
+                let first = if self.cycle == 0. {
                     self.first_cycle
                 } else {
                     self.cycle + 1.
                 };
+                let Some(cycle) = seek_cycle(first, |cycle| {
+                    let end = self.source.event_time(knots[knots.len() - 1].0, cycle);
+                    end < self.t0 || self.last.is_some_and(|last| end <= last)
+                }) else {
+                    self.done = true;
+                    break;
+                };
+                self.cycle = cycle;
                 // Knots after the restart point; the restart itself coincides
                 // with the previous repetition's last knot.
                 self.index = repeat + 1;
             }
-            let period = self
-                .source
-                .repeat
-                .map_or(0., |repeat| knots[knots.len() - 1].0 - knots[repeat].0);
-            let t = self.source.delay + knots[self.index].0 + period * self.cycle;
+            let t = self.source.event_time(knots[self.index].0, self.cycle);
             self.index += 1;
             if !t.is_finite() || t > self.t1 {
                 self.done = true;
@@ -1271,5 +1323,150 @@ mod tests {
         let tiny = PwlSource::new(vec![(0., 0.), (1e-300, 1.)], 0., Some(0.)).unwrap();
         assert!(tiny.value_at(1e10, R).is_err());
         assert!(tiny.breakpoints_in(0., 1.).is_err());
+    }
+    #[test]
+    fn plain_and_explicit_zero_delay_preserve_their_original_time_bits() {
+        let knots = vec![(-0., -0.), (1., 1e25), (2., -1.)];
+        let plain = PwlSource::plain(knots.clone()).unwrap();
+        let shifted = plain.clone().with_timing(0., None).unwrap();
+        assert!(Arc::ptr_eq(&plain.knots, &shifted.knots));
+        assert_eq!(
+            plain
+                .breakpoints_in(-0., 2.)
+                .unwrap()
+                .next()
+                .unwrap()
+                .to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        assert_eq!(
+            shifted
+                .breakpoints_in(-0., 2.)
+                .unwrap()
+                .next()
+                .unwrap()
+                .to_bits(),
+            0.0_f64.to_bits()
+        );
+        for time in [
+            -1.,
+            -0.,
+            0.,
+            0.5,
+            1.,
+            1_f64.next_down(),
+            1_f64.next_up(),
+            2.,
+            2_f64.next_up(),
+            7.,
+        ] {
+            // The former plain Waveform::Pwl search, including the deliberately
+            // rounded result of interpolation at the exact right endpoint.
+            let expected = if time <= knots[0].0 {
+                knots[0].1
+            } else {
+                knots
+                    .windows(2)
+                    .find_map(|w| {
+                        let ((t0, v0), (t1, v1)) = (w[0], w[1]);
+                        (t1 >= time).then(|| {
+                            let fraction = (time - t0) / (t1 - t0);
+                            let increment = fraction * (v1 - v0);
+                            v0 + increment
+                        })
+                    })
+                    .unwrap_or(knots[2].1)
+            };
+            assert_eq!(
+                plain.value_at(time, L).unwrap().to_bits(),
+                expected.to_bits(),
+                "{time}"
+            );
+            assert_eq!(
+                shifted.value_at(time, R).unwrap().to_bits(),
+                expected.to_bits(),
+                "{time}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_constructor_rejects_all_invalid_knot_shapes() {
+        for knots in [
+            vec![],
+            vec![(0., 1.), (-0., 2.)],
+            vec![(2., 1.), (1., 2.)],
+            vec![(f64::NAN, 1.)],
+            vec![(f64::INFINITY, 1.)],
+            vec![(0., f64::NEG_INFINITY)],
+            vec![(0., f64::NAN)],
+            vec![(-1., 2.)],
+        ] {
+            assert!(PwlSource::plain(knots.clone()).is_err());
+            assert!(PwlSource::new(knots, 0., None).is_err());
+        }
+    }
+
+    #[test]
+    fn indexed_window_matches_original_delayed_repeat_iterator() {
+        let knots = vec![(-0., 0.), (0.0012, 1.), (0.0025, 0.), (0.0031, 2.)];
+        for delay in [-0.000013, 0., 0.000013] {
+            let source = PwlSource::new(knots.clone(), delay, Some(0.0012)).unwrap();
+            let period = knots[3].0 - knots[1].0;
+            let mut complete = Vec::<Real>::new();
+            for cycle in 0..=100 {
+                let first = if cycle == 0 { 0 } else { 2 };
+                for &(knot, _) in &knots[first..] {
+                    let t = delay + knot + period * Real::from(cycle);
+                    if complete.last().is_none_or(|last| t > *last) {
+                        complete.push(t);
+                    }
+                }
+            }
+            for pair in complete[..150].windows(2) {
+                for t0 in [pair[0].next_down(), pair[0], pair[0].next_up()] {
+                    let t1 = (pair[1] + period).next_up();
+                    let expected = complete
+                        .iter()
+                        .copied()
+                        .filter(|t| *t >= t0 && *t <= t1)
+                        .map(Real::to_bits)
+                        .collect::<Vec<_>>();
+                    let actual = source
+                        .breakpoints_in(t0, t1)
+                        .unwrap()
+                        .map(Real::to_bits)
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual, expected, "delay={delay}, window={t0}..{t1}");
+                }
+            }
+        }
+    }
+    #[test]
+    fn repeated_knots_skip_collapsed_cycles_at_large_delays() {
+        let delay = 1e16_f64;
+        let next = delay.next_up();
+        let source = PwlSource::new(vec![(0., 0.), (1e-12, 1.)], delay, Some(0.)).unwrap();
+        assert_eq!(
+            source
+                .breakpoints_in(delay, next)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [delay, next]
+        );
+        assert_eq!(
+            source
+                .breakpoints_in(delay, delay)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [delay]
+        );
+        assert_eq!(
+            source
+                .breakpoints_in(next, next)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [next]
+        );
     }
 }

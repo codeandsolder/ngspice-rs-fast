@@ -21,6 +21,7 @@
 //! ngspice's `xs` compatibility mode (PULSE phase in degrees) is not modelled,
 //! matching [`crate::devices::Pulse`].
 
+use super::pulse::cycle_position;
 use crate::devices::{LinearSystem, SourceKind, TransientTiming, Waveform};
 use crate::primitives::{Real, SpiceError, SpiceResult, almost_equal_ulps};
 
@@ -202,8 +203,7 @@ impl Request<'_> {
                 SourceKind::Voltage => self.vsrc_pulse(pulse, break_time, table),
                 SourceKind::Current => self.isrc_pulse(pulse, table),
             },
-            Waveform::Pwl(knots) => self.pwl(knots, 0., None, break_time, table),
-            Waveform::PwlSource(pwl) => {
+            Waveform::Pwl(pwl) => {
                 self.pwl(pwl.knots(), pwl.delay(), pwl.repeat(), break_time, table)
             }
             Waveform::Step { time, .. } => self.pwl(&[(*time, 0.)], 0., None, break_time, table),
@@ -238,8 +238,7 @@ impl Request<'_> {
         if now >= *break_time {
             if time >= per {
                 // Repeating signal: where in period are we?
-                let basetime = per * (time / per).floor();
-                time -= basetime;
+                time = cycle_position(time, per).phase;
             }
             // A request very close to the current time would be ignored:
             // adjust so the next corner is selected.
@@ -287,8 +286,9 @@ impl Request<'_> {
             return Ok(());
         }
         if time >= per {
-            basetime = per * (time / per).floor();
-            time -= basetime;
+            let cycle = cycle_position(time, per);
+            basetime = cycle.base;
+            time = cycle.phase;
         }
         if !self.at_break {
             return Ok(());
@@ -356,10 +356,7 @@ impl Request<'_> {
                 let start = knots[index].0;
                 let period = end - start;
                 time -= start;
-                let elapsed_periods = (time / period).floor();
-                let elapsed_time = period * elapsed_periods;
-                time -= elapsed_time;
-                time += start;
+                time = cycle_position(time, period).phase + start;
             } else {
                 *break_time = self.timing.final_time();
                 return Ok(());
@@ -367,7 +364,11 @@ impl Request<'_> {
         }
         let min_break = table.min_break();
         let atime = time + min_break;
-        if let Some(&(knot, _)) = knots.iter().find(|(knot, _)| *knot > atime) {
+        if atime.is_nan() {
+            return Ok(());
+        }
+        let next = knots.partition_point(|(knot, _)| *knot <= atime);
+        if let Some(&(knot, _)) = knots.get(next) {
             *break_time = now + knot - time;
             table.set(now, *break_time)?;
             *break_time -= min_break;
