@@ -536,6 +536,10 @@ impl<'a> LoadedPencil<'a> {
                 "pole-zero search",
                 "sparse factor storage capacity exceeded",
             )),
+            Status::NeedsReload => Err(numerical(
+                "pole-zero search",
+                "matrix coefficients must be reloaded before factorization",
+            )),
             Status::InvalidPlan => Err(numerical(
                 "pole-zero search",
                 "ordered sparse topology lacks a valid traversal plan",
@@ -545,7 +549,7 @@ impl<'a> LoadedPencil<'a> {
                 "non-finite or unrepresentable LU factor",
             )),
             Status::Okay | Status::SmallPivot => {
-                let (mantissa, exponent) = sparse.determinant()?;
+                let (mantissa, exponent) = sparse.factors()?.determinant()?;
                 base2_determinant(mantissa, exponent).map(Some)
             }
         }
