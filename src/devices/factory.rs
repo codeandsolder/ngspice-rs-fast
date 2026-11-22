@@ -111,7 +111,10 @@ pub(super) fn instantiate_with_models(
         ModelBackend::Switch | ModelBackend::CurrentSwitch => {
             crate::devices::switch::Switch::instantiate(instance, nodes, &model, context)
         }
-        ModelBackend::Txl => crate::devices::txl::Txl::instantiate(instance, nodes, &model),
+        ModelBackend::Txl => Err(SpiceError::circuit(format!(
+            "TXL {} is prepared by Circuit::add_instances",
+            instance.name
+        ))),
         ModelBackend::Ltra => {
             crate::devices::ltra::LossyLine::instantiate(instance, nodes, models, context)
                 .map(|line| Box::new(line) as Box<dyn Device>)

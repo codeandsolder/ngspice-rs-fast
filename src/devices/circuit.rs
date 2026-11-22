@@ -23,6 +23,9 @@ use crate::maths::{Coefficients, SparseMatrix, Vector};
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
 use petgraph::graph::UnGraph;
 
+use crate::devices::elaboration::{
+    ElaborationLimits, ElaborationSize, ExpansionKind, PlannedBatch, reserve, resource_error,
+};
 use crate::devices::linear::Forcing;
 use crate::devices::models::ModelContext;
 use crate::devices::mutual::validation::ValidationBudget;
@@ -113,6 +116,7 @@ pub struct Circuit {
     devices: Vec<ElaboratedDevice>,
     bindings: TopologyBindings,
     mutual_limits: MutualLimits,
+    elaboration_limits: ElaborationLimits,
     pub(super) runtime: CircuitRuntime,
 }
 
@@ -692,6 +696,34 @@ impl Circuit {
         }
     }
 
+    /// Construct an empty circuit with explicit aggregate elaboration limits.
+    #[must_use]
+    pub fn with_elaboration_limits(limits: ElaborationLimits) -> Self {
+        Self {
+            elaboration_limits: limits,
+            ..Self::default()
+        }
+    }
+
+    fn declared_state_slots(
+        devices: &[ElaboratedDevice],
+        at: Option<&crate::primitives::SourceLoc>,
+    ) -> SpiceResult<usize> {
+        devices.iter().try_fold(0_usize, |total, device| {
+            total
+                .checked_add(device.state_count())
+                .ok_or_else(|| resource_error(at, "aggregate state slots overflow"))
+        })
+    }
+
+    fn elaboration_size(&self) -> SpiceResult<ElaborationSize> {
+        Ok(ElaborationSize::new(
+            self.devices.len(),
+            self.nodes.len() - 1,
+            Self::declared_state_slots(&self.devices, None)?,
+        ))
+    }
+
     /// The node table.
     #[must_use]
     pub const fn nodes(&self) -> &NodeTable {
@@ -767,6 +799,13 @@ impl Circuit {
                 "replace generated or private-node devices by re-elaboration",
             ));
         }
+        let mut size = self.elaboration_size()?;
+        size.states = size
+            .states
+            .checked_sub(self.devices[index].state_count())
+            .and_then(|n| n.checked_add(device.state_count()))
+            .ok_or_else(|| resource_error(None, "replacement state slots overflow"))?;
+        self.elaboration_limits.check(size, None)?;
         self.invalidate_topology();
         self.devices[index] = ElaboratedDevice {
             device,
@@ -831,7 +870,17 @@ impl Circuit {
     /// Node identity or allocation capacity is exhausted.
     pub fn add_node(&mut self, name: &str) -> SpiceResult<NodeId> {
         let before = self.nodes.len();
-        let node = self.nodes.intern(name)?;
+        let limit = self.elaboration_limits.nodes;
+        let node = self.nodes.transaction(|nodes| {
+            let node = nodes.intern(name)?;
+            if nodes.len() - 1 > limit {
+                return Err(resource_error(
+                    None,
+                    format!("aggregate non-ground nodes exceed {limit}"),
+                ));
+            }
+            Ok(node)
+        })?;
         if self.nodes.len() != before {
             self.invalidate_topology();
         }
@@ -1315,6 +1364,8 @@ impl Circuit {
 
     fn prepare_topology(&mut self) -> SpiceResult<()> {
         // Validate graph before any predecessor binding or numbering mutation.
+        self.elaboration_limits
+            .check(self.elaboration_size()?, None)?;
         let names = self.validate_topology()?;
         let mut previous = crate::devices::Waveform::Constant(0.);
         let mut previous_dc = 0.;
@@ -1657,6 +1708,13 @@ impl Circuit {
                 device.name()
             )));
         }
+        let size = self
+            .elaboration_size()?
+            .checked_add(ElaborationSize::new(1, 0, device.state_count()), None)?;
+        self.elaboration_limits.check(size, None)?;
+        self.devices
+            .try_reserve(1)
+            .map_err(|error| resource_error(None, format!("cannot reserve device: {error}")))?;
         let internal = device
             .terminals()
             .iter()
@@ -3145,8 +3203,8 @@ impl Circuit {
     /// numbering. Finalize after adding instances.
     ///
     /// # Errors
-    /// [`SpiceError::Circuit`] on a duplicate instance name (against the
-    /// existing devices and within the batch), or whatever
+    /// Aggregate resource limits, unavailable storage, a duplicate instance
+    /// name (against the existing devices and within the batch), or whatever
     /// [`crate::devices::factory::instantiate_with_models`] reports.
     pub fn add_instances(
         &mut self,
@@ -3154,14 +3212,30 @@ impl Circuit {
         models: &crate::devices::models::ModelResolver<'_>,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<()> {
+        let existing = self.elaboration_size()?;
+        let limits = self.elaboration_limits;
+        // All generated plans are parsed and budgeted before any of them
+        // create a ladder. Ordinary factories keep their existing order.
+        let plan =
+            PlannedBatch::prepare(instances, models, context, &self.nodes, existing, limits)?;
         let seen: BTreeSet<String> = self
             .devices
             .iter()
             .map(|device| device.name().to_lowercase())
             .collect();
-        let base = self.devices.len();
+        let devices = &mut self.devices;
         let staged = self.nodes.transaction(|nodes| {
-            Self::elaborate_batch(instances, models, context, nodes, base, seen)
+            let staged =
+                Self::elaborate_batch(plan, models, context, nodes, existing, limits, seen)?;
+            // The node transaction commits only after the final device and
+            // provenance vector can hold the entire staged suffix.
+            devices.try_reserve(staged.len()).map_err(|error| {
+                resource_error(
+                    instances.last().map(|i| &i.location),
+                    format!("cannot reserve final device storage: {error}"),
+                )
+            })?;
+            Ok(staged)
         })?;
         if !staged.is_empty() {
             self.invalidate_topology();
@@ -3170,86 +3244,106 @@ impl Circuit {
         Ok(())
     }
 
-    /// Build each device and its provenance in deck order. All node mutations
-    /// are append-only, as required by the surrounding transaction.
+    /// Build each prepared group and its provenance in deck order. All node
+    /// mutations are append-only, as required by the surrounding transaction.
     fn elaborate_batch(
-        instances: &[crate::netlist::ast::DeviceInstance],
+        plan: PlannedBatch<'_>,
         models: &crate::devices::models::ModelResolver<'_>,
         context: &ModelContext,
         nodes: &mut crate::primitives::NodeAppend<'_>,
-        base: usize,
+        mut usage: ElaborationSize,
+        limits: ElaborationLimits,
         mut seen: BTreeSet<String>,
     ) -> SpiceResult<Vec<ElaboratedDevice>> {
         let mark = nodes.len();
-        let mut staged = Vec::with_capacity(instances.len());
-        // C parses every external node before DEVsetup creates private nodes:
-        // canonicalize future names as well as those already interned.
-        let deck_nodes: BTreeSet<String> = instances
-            .iter()
-            .flat_map(|instance| &instance.nodes)
-            .map(|name| NodeTable::canonical_name(name, nodes.auto_gnd()))
-            .collect();
-        for instance in instances {
+        let base = usage.devices;
+        let mut staged = Vec::new();
+        reserve(
+            &mut staged,
+            plan.devices,
+            plan.instances.first().map(|i| &i.location),
+        )?;
+        let mut expansions = plan.expansions.into_iter().peekable();
+        for (ordinal, instance) in plan.instances.iter().enumerate() {
+            let expansion = expansions.next_if(|prepared| prepared.ordinal == ordinal);
+            let at = Some(&instance.location);
             if !seen.insert(instance.name.to_lowercase()) {
                 return Err(SpiceError::circuit(format!(
                     "duplicate instance name '{}'",
                     instance.name
                 )));
             }
-            let first = nodes.len();
-            if instance.designator == 'y'
-                && let Some(expanded) =
-                    crate::devices::txl::fallback(instance, nodes, models, &deck_nodes)?
-            {
-                for device in expanded {
-                    if !seen.insert(device.name().to_ascii_lowercase()) {
-                        return Err(SpiceError::circuit(format!(
-                            "duplicate TXL generated instance {}",
-                            device.name()
-                        )));
+            let first_node = nodes.len();
+            let first_device = staged.len();
+            let exact = expansion.is_some();
+            let expected = expansion
+                .as_ref()
+                .map_or(Ok(ElaborationSize::new(1, 0, 0)), |prepared| {
+                    prepared.size_at_bind(instance, nodes)
+                })?;
+            limits.check(usage.checked_add(expected, at)?, at)?;
+            match expansion.map(|prepared| prepared.kind) {
+                Some(ExpansionKind::Txl(crate::devices::txl::TxlPlan::Fallback(plan_txl))) => {
+                    let expanded = plan_txl.bind(instance, nodes, &plan.deck_nodes)?;
+                    for device in expanded {
+                        if !seen.insert(device.name().to_ascii_lowercase()) {
+                            return Err(SpiceError::circuit(format!(
+                                "duplicate TXL generated instance {}",
+                                device.name()
+                            )));
+                        }
+                        staged.push(ElaboratedDevice {
+                            device,
+                            origin: DeviceOrigin::default(),
+                        });
                     }
-                    staged.push(ElaboratedDevice {
-                        device,
-                        origin: DeviceOrigin::default(),
-                    });
                 }
-                continue;
+                Some(ExpansionKind::Urc(plan_urc)) => {
+                    let expanded = plan_urc.bind(instance, nodes, context, &plan.deck_nodes)?;
+                    let line = base + staged.len();
+                    Self::stage_urc(
+                        instance,
+                        nodes,
+                        expanded,
+                        first_node,
+                        line,
+                        &mut seen,
+                        &mut staged,
+                    )?;
+                }
+                None => {
+                    let device = crate::devices::factory::instantiate_with_models(
+                        instance, nodes, models, context,
+                    )?;
+                    Self::stage_single(instance, nodes, device, first_node, &mut staged)?;
+                }
+                Some(ExpansionKind::Txl(crate::devices::txl::TxlPlan::Native(native))) => {
+                    let device = native.bind(instance, nodes)?;
+                    Self::stage_single(instance, nodes, device, first_node, &mut staged)?;
+                }
             }
-            if instance.designator == 'u' {
-                let expanded =
-                    crate::devices::urc::expand(instance, nodes, models, context, &deck_nodes)?;
-                let line = base + staged.len();
-                Self::stage_urc(
-                    instance,
-                    nodes,
-                    expanded,
-                    first,
-                    line,
-                    &mut seen,
-                    &mut staged,
-                )?;
-                continue;
+            let actual = ElaborationSize::new(
+                staged.len() - first_device,
+                nodes.len() - first_node,
+                Self::declared_state_slots(&staged[first_device..], at)?,
+            );
+            if exact && actual != expected {
+                return Err(SpiceError::parse(
+                    instance.location.clone(),
+                    format!(
+                        "{}: prepared expansion size {expected:?} differs from materialized {actual:?}",
+                        instance.name
+                    ),
+                ));
             }
-            let device =
-                crate::devices::factory::instantiate_with_models(instance, nodes, models, context)?;
-            let origin = DeviceOrigin {
-                internal_nodes: nodes.nodes()[first..]
-                    .iter()
-                    .filter(|node| node.kind == NodeKind::Internal)
-                    .map(|node| node.id)
-                    .collect(),
-                model: instance.model.as_ref().map(|m| m.to_ascii_lowercase()),
-                generated_by: None,
-            };
-            staged.push(ElaboratedDevice { device, origin });
+            usage = usage.checked_add(actual, at)?;
+            limits.check(usage, at)?;
         }
         // Factories already reject existing names. Check private nodes which
         // were created before a later parsed card could introduce its name.
-        // This includes semiconductor and transmission-line setup, not just
-        // the explicit URC/TXL expansions.
         if let Some(collision) = nodes.nodes()[mark..]
             .iter()
-            .find(|node| node.kind == NodeKind::Internal && deck_nodes.contains(&node.name))
+            .find(|node| node.kind == NodeKind::Internal && plan.deck_nodes.contains(&node.name))
         {
             return Err(SpiceError::circuit(format!(
                 "internal-node name collision: {}",
@@ -3257,6 +3351,34 @@ impl Circuit {
             )));
         }
         Ok(staged)
+    }
+
+    fn stage_single(
+        instance: &crate::netlist::ast::DeviceInstance,
+        nodes: &NodeTable,
+        device: Box<dyn Device>,
+        first: usize,
+        staged: &mut Vec<ElaboratedDevice>,
+    ) -> SpiceResult<()> {
+        let mut internal_nodes = Vec::new();
+        let internal = nodes.nodes()[first..]
+            .iter()
+            .filter(|node| node.kind == NodeKind::Internal);
+        reserve(
+            &mut internal_nodes,
+            internal.clone().count(),
+            Some(&instance.location),
+        )?;
+        internal_nodes.extend(internal.map(|node| node.id));
+        staged.push(ElaboratedDevice {
+            device,
+            origin: DeviceOrigin {
+                internal_nodes,
+                model: instance.model.as_ref().map(|m| m.to_ascii_lowercase()),
+                generated_by: None,
+            },
+        });
+        Ok(())
     }
 
     // Preserve ownership and insertion order of a URC's generated devices.
@@ -3287,13 +3409,15 @@ impl Circuit {
             let origin = if is_line {
                 // URCsetup's own ladder nodes: defer until the URC's setup.
                 DeviceOrigin {
-                    internal_nodes: nodes.nodes()[first..]
-                        .iter()
-                        .filter(|node| {
+                    internal_nodes: {
+                        let internal = nodes.nodes()[first..].iter().filter(|node| {
                             node.kind != NodeKind::Internal && !parsed_terminals.contains(&node.id)
-                        })
-                        .map(|node| node.id)
-                        .collect(),
+                        });
+                        let mut ids = Vec::new();
+                        reserve(&mut ids, internal.clone().count(), Some(&instance.location))?;
+                        ids.extend(internal.map(|node| node.id));
+                        ids
+                    },
                     model: instance.model.as_ref().map(|m| m.to_ascii_lowercase()),
                     generated_by: None,
                 }
@@ -3381,6 +3505,24 @@ impl Circuit {
         context: &ModelContext,
         mutual_limits: MutualLimits,
     ) -> SpiceResult<Self> {
+        Self::from_netlist_with_limits(
+            netlist,
+            context,
+            mutual_limits,
+            ElaborationLimits::default(),
+        )
+    }
+
+    /// Elaborate with both mutual-inductor and aggregate materialized-device
+    /// resource limits. The latter also bounds input subcircuit expansion.
+    /// # Errors
+    /// Invalid deck/context, failed factory or expansion, or exceeded resource limits.
+    pub fn from_netlist_with_limits(
+        netlist: &crate::netlist::ast::Netlist,
+        context: &ModelContext,
+        mutual_limits: MutualLimits,
+        elaboration_limits: ElaborationLimits,
+    ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
         if !netlist.includes.is_empty() {
             return Err(SpiceError::Unsupported {
@@ -3402,10 +3544,17 @@ impl Circuit {
         let expanded = crate::devices::subckt::expand_subcircuits(
             netlist,
             &elaborated.scope,
-            crate::devices::subckt::SubcircuitLimits::default(),
+            crate::devices::subckt::SubcircuitLimits {
+                max_devices: elaboration_limits.devices,
+                ..Default::default()
+            },
         )?;
         let models = crate::devices::models::ModelResolver::new(&expanded.models)?;
-        let mut circuit = Self::with_mutual_limits(mutual_limits);
+        let mut circuit = Self {
+            mutual_limits,
+            elaboration_limits,
+            ..Self::default()
+        };
         // `b4set.c` reads the task's analysis list (`noiseAnalGiven`).
         let mut setup = *context;
         setup.noise_analysis = netlist

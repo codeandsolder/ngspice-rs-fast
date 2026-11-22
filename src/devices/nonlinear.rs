@@ -588,6 +588,9 @@ impl DiodeInput {
     }
 }
 
+/// Number of state slots of a diode, including generated URC shunts.
+pub(super) const DIODE_STATE_COUNT: usize = 3;
+
 /// The shared generated URC diode model. Validate its numeric setters once;
 /// each section supplies just its own area, with the same sensitivity
 /// provenance and thermal checks as an ordinary diode card.
@@ -1567,7 +1570,7 @@ impl Device for Diode {
     }
     fn state_count(&self) -> usize {
         // Charge, its derivative and the limited junction voltage.
-        3
+        DIODE_STATE_COUNT
     }
     fn truncation_slot(&self) -> Option<usize> {
         Some(0)
