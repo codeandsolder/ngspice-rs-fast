@@ -3,10 +3,6 @@
 //!
 //! Ported statement by statement from BSIM4 4.8.3 (`b4check.c`, Copyright
 //! (c) 2025 University of California, Educational Community License 2.0).
-#![expect(
-    non_snake_case,
-    reason = "preserves upstream C identifiers for equation-by-equation comparison"
-)]
 
 use super::fields::{Instance, Model, SizeParam};
 use super::temp::c_g;
