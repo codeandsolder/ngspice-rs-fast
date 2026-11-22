@@ -67,13 +67,13 @@ scope root
         [4] name="b" kind=scalar value="0.4" @netlists/sens_mesfet.cir:14:54
         [5] name="rd" kind=scalar value="5" @netlists/sens_mesfet.cir:14:60
         [6] name="rs" kind=scalar value="4" @netlists/sens_mesfet.cir:14:65
-        [7] name="cgs" kind=scalar value="2p" @netlists/sens_mesfet.cir:14:70
-        [8] name="cgd" kind=scalar value="0.5p" @netlists/sens_mesfet.cir:14:77
-        [9] name="pb" kind=scalar value="0.8" @netlists/sens_mesfet.cir:14:86
-        [10] name="is" kind=scalar value="1e-14" @netlists/sens_mesfet.cir:14:93
-        [11] name="fc" kind=scalar value="0.4" @netlists/sens_mesfet.cir:14:102
-        [12] name="kf" kind=scalar value="1e-26" @netlists/sens_mesfet.cir:14:109
-        [13] name="af" kind=scalar value="1.1" @netlists/sens_mesfet.cir:14:118
+        [7] name="cgs" kind=scalar value="2p" @netlists/sens_mesfet.cir:15:3
+        [8] name="cgd" kind=scalar value="0.5p" @netlists/sens_mesfet.cir:15:10
+        [9] name="pb" kind=scalar value="0.8" @netlists/sens_mesfet.cir:15:19
+        [10] name="is" kind=scalar value="1e-14" @netlists/sens_mesfet.cir:15:26
+        [11] name="fc" kind=scalar value="0.4" @netlists/sens_mesfet.cir:15:35
+        [12] name="kf" kind=scalar value="1e-26" @netlists/sens_mesfet.cir:15:42
+        [13] name="af" kind=scalar value="1.1" @netlists/sens_mesfet.cir:15:51
     model [1] name="zp" base="pmf" level=none @netlists/sens_mesfet.cir:16:1
       parameters (6):
         [0] name="vto" kind=scalar value="-1.2" @netlists/sens_mesfet.cir:16:15

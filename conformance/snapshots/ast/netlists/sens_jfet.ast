@@ -68,21 +68,21 @@ scope root
         [4] name="rs" kind=scalar value="20" @netlists/sens_jfet.cir:16:50
         [5] name="cgs" kind=scalar value="2p" @netlists/sens_jfet.cir:16:56
         [6] name="cgd" kind=scalar value="1p" @netlists/sens_jfet.cir:16:63
-        [7] name="pb" kind=scalar value="0.8" @netlists/sens_jfet.cir:16:70
-        [8] name="is" kind=scalar value="1e-14" @netlists/sens_jfet.cir:16:77
-        [9] name="n" kind=scalar value="1.2" @netlists/sens_jfet.cir:16:86
-        [10] name="fc" kind=scalar value="0.4" @netlists/sens_jfet.cir:16:92
-        [11] name="b" kind=scalar value="0.9" @netlists/sens_jfet.cir:16:99
-        [12] name="tnom" kind=scalar value="30" @netlists/sens_jfet.cir:16:105
-        [13] name="tcv" kind=scalar value="-2e-3" @netlists/sens_jfet.cir:16:113
-        [14] name="vtotc" kind=scalar value="1e-3" @netlists/sens_jfet.cir:16:123
-        [15] name="bex" kind=scalar value="0.5" @netlists/sens_jfet.cir:16:134
-        [16] name="betatce" kind=scalar value="0.7" @netlists/sens_jfet.cir:16:142
-        [17] name="xti" kind=scalar value="2.5" @netlists/sens_jfet.cir:16:154
-        [18] name="eg" kind=scalar value="1.15" @netlists/sens_jfet.cir:16:162
-        [19] name="kf" kind=scalar value="1e-26" @netlists/sens_jfet.cir:16:170
-        [20] name="af" kind=scalar value="1.1" @netlists/sens_jfet.cir:16:179
-        [21] name="gdsnoi" kind=scalar value="2" @netlists/sens_jfet.cir:16:186
+        [7] name="pb" kind=scalar value="0.8" @netlists/sens_jfet.cir:17:3
+        [8] name="is" kind=scalar value="1e-14" @netlists/sens_jfet.cir:17:10
+        [9] name="n" kind=scalar value="1.2" @netlists/sens_jfet.cir:17:19
+        [10] name="fc" kind=scalar value="0.4" @netlists/sens_jfet.cir:17:25
+        [11] name="b" kind=scalar value="0.9" @netlists/sens_jfet.cir:17:32
+        [12] name="tnom" kind=scalar value="30" @netlists/sens_jfet.cir:17:38
+        [13] name="tcv" kind=scalar value="-2e-3" @netlists/sens_jfet.cir:17:46
+        [14] name="vtotc" kind=scalar value="1e-3" @netlists/sens_jfet.cir:17:56
+        [15] name="bex" kind=scalar value="0.5" @netlists/sens_jfet.cir:18:3
+        [16] name="betatce" kind=scalar value="0.7" @netlists/sens_jfet.cir:18:11
+        [17] name="xti" kind=scalar value="2.5" @netlists/sens_jfet.cir:18:23
+        [18] name="eg" kind=scalar value="1.15" @netlists/sens_jfet.cir:18:31
+        [19] name="kf" kind=scalar value="1e-26" @netlists/sens_jfet.cir:18:39
+        [20] name="af" kind=scalar value="1.1" @netlists/sens_jfet.cir:18:48
+        [21] name="gdsnoi" kind=scalar value="2" @netlists/sens_jfet.cir:18:55
     model [1] name="jp" base="pjf" level=none @netlists/sens_jfet.cir:19:1
       parameters (6):
         [0] name="vto" kind=scalar value="-1.5" @netlists/sens_jfet.cir:19:15

@@ -92,7 +92,7 @@ use crate::devices::schema::{ScalarDomain, ScalarParameter, ScalarSchema, Scalar
 use crate::devices::traits::{Device, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
-use crate::primitives::{NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// The most sections one instance may expand into. C has no limit; the bound
 /// keeps a mistyped `n=` or an extreme `FMAX` from building an unbounded
@@ -331,7 +331,7 @@ impl UrcSections {
 /// generated element's own validation.
 pub(crate) fn expand(
     instance: &DeviceInstance,
-    nodes: &mut NodeTable,
+    nodes: &mut NodeAppend<'_>,
     models: &ModelResolver<'_>,
     context: &ModelContext,
     deck_nodes: &BTreeSet<String>,
@@ -438,7 +438,7 @@ fn build(
     instance: &DeviceInstance,
     sections: &UrcSections,
     model_location: &SourceLoc,
-    nodes: &mut NodeTable,
+    nodes: &mut NodeAppend<'_>,
     context: &ModelContext,
     deck_nodes: &BTreeSet<String>,
 ) -> SpiceResult<Vec<Box<dyn Device>>> {
@@ -457,10 +457,10 @@ fn build(
             )
         })
         .transpose()?;
-    crate::devices::factory::append_nodes(nodes, |nodes| {
+    nodes.transaction(|nodes| {
         // The terminals exist before setup in C (INP2U binds them at parse time).
         let [mut lowl, mut hir, reference] = nodes.intern_array(&instance.nodes)?;
-        let fresh = |staged: &mut NodeTable, suffix: String| {
+        let fresh = |staged: &mut NodeAppend<'_>, suffix: String| {
             let node = format!("{name}#{suffix}");
             // C's CKTmkVolt fails (E_EXISTS) on a name the deck already uses,
             // whichever card comes first.
@@ -739,14 +739,17 @@ mod tests {
         let existing = nodes.intern("u1#dlo3#internal").unwrap();
         nodes.set_kind(existing, NodeKind::Internal);
         let before = nodes.nodes().to_vec();
-        let error = expand(
-            &netlist.devices[0],
-            &mut nodes,
-            &models,
-            &ModelContext::default(),
-            &BTreeSet::new(),
-        )
-        .unwrap_err();
+        let error = nodes
+            .transaction(|nodes| {
+                expand(
+                    &netlist.devices[0],
+                    nodes,
+                    &models,
+                    &ModelContext::default(),
+                    &BTreeSet::new(),
+                )
+            })
+            .unwrap_err();
         assert!(
             error
                 .to_string()

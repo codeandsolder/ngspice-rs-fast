@@ -74,11 +74,11 @@ scope root
         [5] name="cgs" kind=scalar value="2p" @netlists/sens_ac_fet.cir:9:56
         [6] name="cgd" kind=scalar value="1p" @netlists/sens_ac_fet.cir:9:63
         [7] name="pb" kind=scalar value="0.8" @netlists/sens_ac_fet.cir:9:70
-        [8] name="is" kind=scalar value="1e-14" @netlists/sens_ac_fet.cir:9:77
-        [9] name="n" kind=scalar value="1.2" @netlists/sens_ac_fet.cir:9:86
-        [10] name="fc" kind=scalar value="0.4" @netlists/sens_ac_fet.cir:9:92
-        [11] name="b" kind=scalar value="0.9" @netlists/sens_ac_fet.cir:9:99
-        [12] name="tnom" kind=scalar value="30" @netlists/sens_ac_fet.cir:9:105
+        [8] name="is" kind=scalar value="1e-14" @netlists/sens_ac_fet.cir:10:3
+        [9] name="n" kind=scalar value="1.2" @netlists/sens_ac_fet.cir:10:12
+        [10] name="fc" kind=scalar value="0.4" @netlists/sens_ac_fet.cir:10:18
+        [11] name="b" kind=scalar value="0.9" @netlists/sens_ac_fet.cir:10:25
+        [12] name="tnom" kind=scalar value="30" @netlists/sens_ac_fet.cir:10:31
     model [1] name="zn" base="nmf" level=none @netlists/sens_ac_fet.cir:13:1
       parameters (12):
         [0] name="vto" kind=scalar value="-1.8" @netlists/sens_ac_fet.cir:13:15
@@ -88,11 +88,11 @@ scope root
         [4] name="b" kind=scalar value="0.4" @netlists/sens_ac_fet.cir:13:54
         [5] name="rd" kind=scalar value="5" @netlists/sens_ac_fet.cir:13:60
         [6] name="rs" kind=scalar value="4" @netlists/sens_ac_fet.cir:13:65
-        [7] name="cgs" kind=scalar value="2p" @netlists/sens_ac_fet.cir:13:70
-        [8] name="cgd" kind=scalar value="0.5p" @netlists/sens_ac_fet.cir:13:77
-        [9] name="pb" kind=scalar value="0.8" @netlists/sens_ac_fet.cir:13:86
-        [10] name="is" kind=scalar value="1e-14" @netlists/sens_ac_fet.cir:13:93
-        [11] name="fc" kind=scalar value="0.4" @netlists/sens_ac_fet.cir:13:102
+        [7] name="cgs" kind=scalar value="2p" @netlists/sens_ac_fet.cir:14:3
+        [8] name="cgd" kind=scalar value="0.5p" @netlists/sens_ac_fet.cir:14:10
+        [9] name="pb" kind=scalar value="0.8" @netlists/sens_ac_fet.cir:14:19
+        [10] name="is" kind=scalar value="1e-14" @netlists/sens_ac_fet.cir:14:26
+        [11] name="fc" kind=scalar value="0.4" @netlists/sens_ac_fet.cir:14:35
     model [2] name="zh" base="nhfet" level=6e0 @netlists/sens_ac_fet.cir:17:1
       parameters (4):
         [0] name="level" kind=scalar value="6" @netlists/sens_ac_fet.cir:17:17

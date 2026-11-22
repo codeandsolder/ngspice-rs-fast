@@ -49,7 +49,7 @@ fn column(plot: &Plot, name: &str) -> Vec<f64> {
 }
 
 fn names(plot: &Plot) -> Vec<&str> {
-    plot.variables.iter().map(|v| v.name.as_str()).collect()
+    plot.variables().iter().map(|v| v.name.as_str()).collect()
 }
 
 fn close(got: f64, want: f64, relative: f64) {
@@ -72,9 +72,10 @@ fn resistor_divider_thermal_noise_is_4ktr_of_the_parallel_resistance() {
         ["frequency", "onoise_spectrum", "inoise_spectrum"]
     );
     assert_eq!(
-        spectrum.variables[1].unit, "voltage-density",
+        spectrum.variables()[1].unit,
+        "voltage-density",
         "{:?}",
-        spectrum.variables
+        spectrum.variables()
     );
     assert_eq!(column(spectrum, "frequency"), [1e3, 2e3, 3e3, 4e3]);
     let parallel = 1e3 * 3e3 / 4e3;
@@ -239,7 +240,7 @@ fn current_inputs_refer_noise_to_amperes() {
     let plots =
         run("current\ni1 0 out dc 0 ac 1\nr1 out 0 2k\n.noise v(out) i1 dec 1 1 10\n.end\n");
     let spectrum = &plots[0];
-    assert_eq!(spectrum.variables[2].unit, "current-density");
+    assert_eq!(spectrum.variables()[2].unit, "current-density");
     let density = 4.0 * BOLTZMANN * KELVIN * 2e3;
     close(
         column(spectrum, "inoise_spectrum")[0],
@@ -247,7 +248,7 @@ fn current_inputs_refer_noise_to_amperes() {
         1e-12,
     );
     assert_eq!(names(&plots[1]), ["v(onoise_total)", "i(inoise_total)"]);
-    assert_eq!(plots[1].variables[1].unit, "current");
+    assert_eq!(plots[1].variables()[1].unit, "current");
 }
 
 #[test]
@@ -403,7 +404,7 @@ fn simulate_writes_both_plots_and_composes_with_other_analyses() {
     let raw = ngspice_rs::analysis::RawFile::load(&output).unwrap();
     assert_eq!(raw.plots[2].plot.plotname, "Noise Spectral Density Curves");
     assert_eq!(raw.plots[3].plot.plotname, "Integrated Noise");
-    assert_eq!(raw.plots[3].plot.variables[0].name, "v(onoise_total)");
+    assert_eq!(raw.plots[3].plot.variables()[0].name, "v(onoise_total)");
     let _ = std::fs::remove_dir_all(&directory);
 }
 

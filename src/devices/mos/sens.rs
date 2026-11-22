@@ -20,8 +20,8 @@ use super::{CELSIUS_TO_KELVIN, Common, MosLevel, Mosfet};
 use crate::devices::ModelContext;
 use crate::devices::nonlinear::thermal::TemperatureCache;
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, ParameterScope, RecordPair, ResetStamp, ResetStamps,
-    SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
+    AcReset, ParameterScope, RecordPair, ResetStamp, ResetStamps, SensitivityFamily,
+    SensitivityKernel, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
     SensitivityRecord as Record, StampAt, StampPart,
 };
 use crate::devices::{Device, LinearContext, StampContext};
@@ -37,7 +37,7 @@ pub(in crate::devices) trait SensitivityLevel: MosLevel {
     fn ask_instance(&self, r: &Record, k: &str) -> SpiceResult<Real> {
         r.value(k)
     }
-    fn record(&self, context: &ModelContext) -> Record;
+    fn record(&self, family: SensitivityFamily, context: &ModelContext) -> SpiceResult<Record>;
     fn with_record(&self, record: &Record, derived: bool) -> SpiceResult<Self>;
     fn temperature(&self, record: &mut Record) -> SpiceResult<()>;
     fn setup(&self, record: &mut Record) -> SpiceResult<()>;
@@ -68,8 +68,12 @@ pub(in crate::devices) const INSTANCE: &[P] = &[
 ];
 
 /// Common `mosXset.c` fields, retaining optional resistance flags.
-pub(in crate::devices) fn record_common(c: &Common, context: &ModelContext) -> Record {
-    let mut record = Record::new();
+pub(in crate::devices) fn record_common(
+    family: SensitivityFamily,
+    c: &Common,
+    context: &ModelContext,
+) -> SpiceResult<Record> {
+    let mut record = Record::new(family, ParameterScope::Model);
     for (k, value, given) in [
         ("rd", c.rd.unwrap_or(0.), c.rd.is_some()),
         ("rs", c.rs.unwrap_or(0.), c.rs.is_some()),
@@ -100,9 +104,9 @@ pub(in crate::devices) fn record_common(c: &Common, context: &ModelContext) -> R
         ("cj", c.cj.unwrap_or(0.), c.cj.is_some()),
         ("cjsw", c.cjsw.unwrap_or(0.), c.cjsw.is_some()),
     ] {
-        record = record.with(k, value, given);
+        record = record.with(k, value, given)?;
     }
-    record
+    Ok(record)
 }
 
 /// The common fields read by `mosXtemp.c` and `mosXload.c`.
@@ -132,7 +136,7 @@ pub(in crate::devices) fn update_common(c: &mut Common, r: &Record) -> SpiceResu
 /// The surface-process card's sensitivity record, excluding TPG (not
 /// exposed as a C sensitivity parameter).
 impl SurfaceCard {
-    pub(in crate::devices) fn record(self, mut record: Record) -> Record {
+    pub(in crate::devices) fn record(self, mut record: Record) -> SpiceResult<Record> {
         for (keyword, field, default) in [
             ("vto", self.vto, 0.),
             ("gamma", self.gamma, 0.),
@@ -140,9 +144,9 @@ impl SurfaceCard {
             ("nsub", self.nsub, 0.),
             ("nss", self.nss, 0.),
         ] {
-            record = record.with(keyword, field.unwrap_or(default), field.is_some());
+            record = record.with(keyword, field.unwrap_or(default), field.is_some())?;
         }
-        record
+        Ok(record)
     }
 
     pub(in crate::devices) fn update(&mut self, record: &Record, derived: bool) -> SpiceResult<()> {
@@ -201,7 +205,7 @@ pub(in crate::devices) struct MosSensitivity<'a, L: SensitivityLevel> {
     pub(crate) context: ModelContext,
 }
 
-impl<L: SensitivityLevel> DeviceSensitivity for MosSensitivity<'_, L> {
+impl<L: SensitivityLevel> SensitivityKernel for MosSensitivity<'_, L> {
     fn family(&self) -> SensitivityFamily {
         L::FAMILY
     }
@@ -217,8 +221,8 @@ impl<L: SensitivityLevel> DeviceSensitivity for MosSensitivity<'_, L> {
 
     fn records(&self) -> SpiceResult<(Record, Record)> {
         let g = &self.device.geometry;
-        let mut model = self.device.model.record(&self.context);
-        let mut instance = Record::new();
+        let mut model = self.device.model.record(L::FAMILY, &self.context)?;
+        let mut instance = Record::new(self.family(), ParameterScope::Instance);
         for (k, value) in [
             ("m", g.m),
             ("l", g.l),
@@ -231,14 +235,14 @@ impl<L: SensitivityLevel> DeviceSensitivity for MosSensitivity<'_, L> {
             ("nrs", g.nrs),
             ("dtemp", g.dtemp),
         ] {
-            instance = instance.with(k, value, true);
+            instance = instance.with(k, value, true)?;
         }
-        instance = instance.with("temp", g.kelvin(&self.context), g.temp.is_some());
+        instance = instance.with("temp", g.kelvin(&self.context), g.temp.is_some())?;
         for (k, v) in ["icvds", "icvgs", "icvbs"]
             .into_iter()
             .zip(self.device.initial.values.iter().copied())
         {
-            instance = instance.with(k, v.unwrap_or(0.), v.is_some());
+            instance = instance.with(k, v.unwrap_or(0.), v.is_some())?;
         }
         self.temperature(&mut model, &mut instance)?;
         Ok((model, instance))
@@ -419,7 +423,7 @@ impl<L: SensitivityLevel> MosSensitivity<'_, L> {
 }
 
 /// A classic MOSFET's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetMosfet<L: MosLevel> {
     /// Built from the reset load's records: the conductances and the mode.

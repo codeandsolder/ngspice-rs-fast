@@ -111,25 +111,25 @@ mod tests {
 
     #[test]
     fn discovery_handles_case_and_rejects_colliding_ids() {
-        let root = crate::Temp::new();
-        let directory = root.0.join(super::NETLIST_DIR);
+        let root = crate::ngspice::Scratch::new("conformance-fixtures").unwrap();
+        let directory = root.path().join(super::NETLIST_DIR);
         std::fs::create_dir_all(&directory).unwrap();
         let a = directory.join("a.CIR");
         let b = directory.join("b.cir");
         std::fs::write(&b, "").unwrap();
         std::fs::write(&a, "").unwrap();
         assert_eq!(
-            super::netlist_paths_at(&root.0, None).unwrap(),
+            super::netlist_paths_at(root.path(), None).unwrap(),
             [a.clone(), b]
         );
         assert_eq!(
-            super::netlist_paths_at(&root.0, Some("A.CIR")).unwrap(),
+            super::netlist_paths_at(root.path(), Some("A.CIR")).unwrap(),
             [a]
         );
         let collision = directory.join("A.cir");
         if !collision.exists() {
             std::fs::write(collision, "").unwrap();
-            let error = super::netlist_paths_at(&root.0, Some("b")).unwrap_err();
+            let error = super::netlist_paths_at(root.path(), Some("b")).unwrap_err();
             assert!(error.contains("duplicate fixture ID"), "{error}");
         }
     }

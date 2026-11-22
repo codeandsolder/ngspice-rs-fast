@@ -69,7 +69,7 @@ fn compare_by_name(tag: &str, deck: &str, relative: f64, absolute: f64) {
     let rust = run_rust(deck);
     assert_eq!(rust.point_count(), c.point_count(), "{tag}: point counts");
     let mut compared = 0;
-    for variable in &c.variables {
+    for variable in c.variables() {
         let name = variable.name.to_ascii_lowercase();
         if !(name.starts_with("v(") || name.starts_with("i(")) {
             continue;
@@ -227,7 +227,7 @@ fn compare_tran(tag: &str, deck: &str, times: &[f64], min_current: f64) {
     let c = run_c_tran(tag, deck);
     let rust = run_rust(deck);
     let mut compared = 0;
-    for variable in &c.variables {
+    for variable in c.variables() {
         let name = variable.name.to_ascii_lowercase();
         if !(name.starts_with("v(") || name.starts_with("i(")) {
             continue;

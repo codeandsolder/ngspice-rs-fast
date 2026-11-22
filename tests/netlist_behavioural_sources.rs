@@ -610,3 +610,30 @@ fn generated_instance_names_do_not_silently_overwrite_existing_devices() {
         .expect("generated device name collision");
     assert!(err.to_string().contains("duplicate instance name"), "{err}");
 }
+
+#[test]
+fn behavioural_expression_and_setters_use_separate_physical_and_logical_offsets() {
+    let device = device("  B1 out 0 v=2*\n* comment\n  + v(in) m=3");
+    let expr = expression(&device, "v");
+    assert_eq!(expr.text, "2* v(in)");
+    assert_eq!((expr.span.start.line, expr.span.start.column), (2, 14));
+    assert_eq!((expr.span.end.line, expr.span.end.column), (4, 10));
+    assert_eq!(expr.span.len(), expr.text.len());
+    let setter = &device.parameters[1].location;
+    assert_eq!((setter.line, setter.column), (4, 11));
+}
+
+#[test]
+fn folded_current_references_use_logical_offsets_for_the_c_rewrite() {
+    let netlist =
+        lowered("r1 a 0 1k\nr2 b 0 1k\nb1 out 0 v=max(1,\n* comment\n    + i(r1)) +\n + i(r2)");
+    // The first reference follows a comma inside a call and remains unchanged.
+    // The second follows an arithmetic operator and inserts a sense source.
+    assert!(!netlist.devices.iter().any(|d| d.name == "v_r1"));
+    assert!(netlist.devices.iter().any(|d| d.name == "v_r2"));
+    let source = netlist.devices.iter().find(|d| d.name == "b1").unwrap();
+    assert_eq!(
+        expression(source, "v").root.current_references(),
+        ["r1", "v_r2"]
+    );
+}

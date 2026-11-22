@@ -35,8 +35,8 @@ fn run(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> Plot {
 fn value(plot: &Plot, name: &str, point: usize) -> f64 {
     let index = plot
         .variable_index(name)
-        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables));
-    plot.points[point][index].re
+        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
+    plot.points()[point][index].re
 }
 fn close(a: f64, b: f64, relative: f64, absolute: f64) {
     assert!(
@@ -546,7 +546,7 @@ fn noise_follows_mesnoise_and_distortion_and_sensitivity_are_refused() {
         assert!(
             plot.variable_index(name).is_some(),
             "{name}: {:?}",
-            plot.variables
+            plot.variables()
         );
     }
     let mut c = circuit(&body.replace("ac 1", "distof1 1")).unwrap();
@@ -568,7 +568,7 @@ fn noise_follows_mesnoise_and_distortion_and_sensitivity_are_refused() {
         .unwrap()
         .run(&mut c, &request, &config.context())
         .unwrap()
-        .variables
+        .variables()
         .iter()
         .map(|variable| variable.name.clone())
         .filter(|name| name.starts_with("v(z1"))
@@ -589,15 +589,15 @@ fn transient_gate_charge_delays_the_common_source_stage() {
     let mut c = circuit(body).unwrap();
     let plot = run(&mut c, AnalysisKind::Transient, &["2n", "300n"]);
     let index = |t: f64| {
-        plot.points
+        plot.points()
             .iter()
             .position(|p| p[0].re >= t)
-            .unwrap_or(plot.points.len() - 1)
+            .unwrap_or(plot.points().len() - 1)
     };
     // 2 ns after the edge the gate lags the 0 V source level (RG CGS ~ 10 ns).
     let early = value(&plot, "v(g)", index(13e-9));
     assert!(early < -1., "{early}");
-    let last = plot.points.len() - 1;
+    let last = plot.points().len() - 1;
     close(value(&plot, "v(g)", last), 0., 0., 1e-3);
     assert!(value(&plot, "v(d)", last) < value(&plot, "v(d)", 0));
     // With PB below qggnew's 0.5 V vmax a forward-biased gate takes the
@@ -819,7 +819,7 @@ fn the_sensitivity_table_is_mes_cs_parameter_list() {
         .run(&mut c, &request, &config.context())
         .unwrap();
     let names: Vec<&str> = plot
-        .variables
+        .variables()
         .iter()
         .map(|variable| variable.name.as_str())
         .filter(|name| name.starts_with("v(z1"))

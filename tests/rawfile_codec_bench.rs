@@ -26,7 +26,7 @@ fn fixture() -> PathBuf {
 }
 
 fn workload() -> RawFile {
-    let mut plot = Plot::new("bench1", "AC Analysis", PlotFlags::Complex);
+    let mut plot = Plot::builder("bench1", "AC Analysis", PlotFlags::Complex);
     for column in 0..COLUMNS {
         let name = format!("v({column})");
         plot.push_variable(if column % 2 == 0 {
@@ -35,6 +35,7 @@ fn workload() -> RawFile {
             Variable::complex(name, "voltage")
         });
     }
+    let mut plot = plot.build();
     for row in 0..ROWS {
         let values = (0..COLUMNS)
             .map(|column| {
@@ -89,8 +90,8 @@ fn collect() {
     let start = Instant::now();
     let raw = RawFile::load(&path).unwrap();
     let plot = raw.single_plot().unwrap();
-    assert_eq!(plot.points.len(), usize::try_from(ROWS).unwrap());
-    assert_eq!(plot.variables.len(), usize::try_from(COLUMNS).unwrap());
+    assert_eq!(plot.points().len(), usize::try_from(ROWS).unwrap());
+    assert_eq!(plot.variables().len(), usize::try_from(COLUMNS).unwrap());
     black_box(&raw);
     report(start);
 }
@@ -110,7 +111,7 @@ fn iterate() {
     }
     assert_eq!(count, ROWS);
     assert_eq!(
-        rows.finish().unwrap().plot.variables.len(),
+        rows.finish().unwrap().plot.variables().len(),
         usize::try_from(COLUMNS).unwrap()
     );
     assert!(reader.next_plot().unwrap().is_none());

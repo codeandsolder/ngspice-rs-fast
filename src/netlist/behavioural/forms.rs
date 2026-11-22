@@ -57,6 +57,7 @@ impl<'a> Numeric<'a> {
             span: SourceSpan {
                 start: parameter.location.clone(),
                 end: parameter.location.clone(),
+                logical: 0..0,
             },
         }
     }

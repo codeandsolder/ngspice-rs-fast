@@ -400,7 +400,7 @@ impl<'a> Trace<'a> {
 
     /// The vector's value at one plot point, as a real.
     fn value(&self, index: usize) -> SpiceResult<Real> {
-        let Some(point) = self.plot.points.get(index) else {
+        let Some(point) = self.plot.points().get(index) else {
             return Err(nonfinite(
                 self.name(),
                 format!("the plot has no point {index}"),
@@ -915,10 +915,11 @@ mod tests {
 
     /// A real transient plot: `time`, `v(out)` and `i(v1)`, from rows.
     fn tran(rows: &[(Real, Real)]) -> Plot {
-        let mut plot = Plot::new("tran1", "Transient Analysis", PlotFlags::Real);
+        let mut plot = Plot::builder("tran1", "Transient Analysis", PlotFlags::Real);
         plot.push_variable(Variable::new("time", "time"));
         plot.push_variable(Variable::new("v(out)", "voltage"));
         plot.push_variable(Variable::new("i(v1)", "current"));
+        let mut plot = plot.build();
         for (time, value) in rows {
             plot.push_point(vec![
                 Complex::real(*time),
@@ -1180,7 +1181,7 @@ mod tests {
         let result = one(&plot);
         assert_eq!(result.window.to, 5.0 * PERIOD);
         assert_eq!(result.window.from, 4.0 * PERIOD);
-        assert!(result.samples < plot.points.len(), "{result:?}");
+        assert!(result.samples < plot.points().len(), "{result:?}");
         assert!(result.samples > 2 * 9, "{result:?}");
     }
 
@@ -1276,15 +1277,16 @@ mod tests {
 
     #[test]
     fn a_plot_without_a_time_axis_or_with_one_point_is_refused() {
-        let mut plot = Plot::new("tran1", "Transient Analysis", PlotFlags::Real);
+        let mut plot = Plot::builder("tran1", "Transient Analysis", PlotFlags::Real);
         plot.push_variable(Variable::new("v(out)", "voltage"));
+        let mut plot = plot.build();
         plot.push_point(vec![Complex::real(1.0)]).unwrap();
         plot.push_point(vec![Complex::real(2.0)]).unwrap();
         let error = failed(&plot, &[out()], 9);
         assert!(error.to_string().contains("no 'time' axis"), "{error}");
 
         let mut plot = tran(&[(0.0, 0.0)]);
-        plot.points.truncate(1);
+        plot.truncate_points(1);
         let error = failed(&plot, &[out()], 9);
         assert!(
             error.to_string().contains("at least 2 data points"),

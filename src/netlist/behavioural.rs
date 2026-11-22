@@ -186,6 +186,7 @@ fn generated(root: BExpr, text: String, location: &SourceLoc) -> ParameterKind {
         span: SourceSpan {
             start: location.clone(),
             end: location.clone(),
+            logical: 0..0,
         },
         verbatim: true,
         root,
@@ -198,6 +199,7 @@ fn quantity(kind: BExprKind, location: &SourceLoc) -> BExpr {
         span: SourceSpan {
             start: location.clone(),
             end: location.clone(),
+            logical: 0..0,
         },
     }
 }

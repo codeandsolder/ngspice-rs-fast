@@ -263,7 +263,7 @@ pub(super) fn run(
     } else {
         PlotFlags::Complex
     };
-    let mut plot = Plot::new("pz1", "Pole-Zero Analysis", flags);
+    let mut plot = Plot::builder("pz1", "Pole-Zero Analysis", flags);
     for (index, _) in poles.iter().enumerate() {
         plot.push_variable(Variable::complex(
             format!("v(pole({}))", index + 1),
@@ -276,6 +276,7 @@ pub(super) fn run(
             "voltage",
         ));
     }
+    let mut plot = plot.build();
     poles.extend(zeros);
     plot.push_point(poles)?;
     plots.push(plot);

@@ -137,7 +137,7 @@ fn compare(c: &Plot, rust: &Plot, label: &str) {
     let grid: Vec<f64> = rust
         .column("time")
         .map_or_else(Vec::new, |t| t.iter().map(|v| v.re).collect());
-    for variable in &c.variables {
+    for variable in c.variables() {
         let name = variable.name.as_str();
         let expected = c.column(name).unwrap();
         let actual = rust

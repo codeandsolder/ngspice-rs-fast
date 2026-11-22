@@ -130,13 +130,13 @@ scope root
         [5] name="ld" kind=scalar value="0.1u" @netlists/m10_mos2_dc.cir:18:61
         [6] name="uo" kind=scalar value="550" @netlists/m10_mos2_dc.cir:18:69
         [7] name="ucrit" kind=scalar value="2e4" @netlists/m10_mos2_dc.cir:18:76
-        [8] name="uexp" kind=scalar value="0.15" @netlists/m10_mos2_dc.cir:18:86
-        [9] name="vmax" kind=scalar value="5e4" @netlists/m10_mos2_dc.cir:18:96
-        [10] name="neff" kind=scalar value="2" @netlists/m10_mos2_dc.cir:18:105
-        [11] name="nfs" kind=scalar value="2e11" @netlists/m10_mos2_dc.cir:18:112
-        [12] name="delta" kind=scalar value="0.6" @netlists/m10_mos2_dc.cir:18:121
-        [13] name="gamma" kind=scalar value="0.6" @netlists/m10_mos2_dc.cir:18:131
-        [14] name="phi" kind=scalar value="0.7" @netlists/m10_mos2_dc.cir:18:141
+        [8] name="uexp" kind=scalar value="0.15" @netlists/m10_mos2_dc.cir:19:3
+        [9] name="vmax" kind=scalar value="5e4" @netlists/m10_mos2_dc.cir:19:13
+        [10] name="neff" kind=scalar value="2" @netlists/m10_mos2_dc.cir:19:22
+        [11] name="nfs" kind=scalar value="2e11" @netlists/m10_mos2_dc.cir:19:29
+        [12] name="delta" kind=scalar value="0.6" @netlists/m10_mos2_dc.cir:19:38
+        [13] name="gamma" kind=scalar value="0.6" @netlists/m10_mos2_dc.cir:19:48
+        [14] name="phi" kind=scalar value="0.7" @netlists/m10_mos2_dc.cir:19:58
     model [1] name="mclm" base="nmos" level=2e0 @netlists/m10_mos2_dc.cir:20:1
       parameters (11):
         [0] name="level" kind=scalar value="2" @netlists/m10_mos2_dc.cir:20:18
@@ -147,9 +147,9 @@ scope root
         [5] name="xj" kind=scalar value="0.4u" @netlists/m10_mos2_dc.cir:20:59
         [6] name="u0" kind=scalar value="500" @netlists/m10_mos2_dc.cir:20:67
         [7] name="ucrit" kind=scalar value="1.5e4" @netlists/m10_mos2_dc.cir:20:74
-        [8] name="uexp" kind=scalar value="0.1" @netlists/m10_mos2_dc.cir:20:86
-        [9] name="delta" kind=scalar value="0.3" @netlists/m10_mos2_dc.cir:20:95
-        [10] name="tnom" kind=scalar value="20" @netlists/m10_mos2_dc.cir:20:105
+        [8] name="uexp" kind=scalar value="0.1" @netlists/m10_mos2_dc.cir:21:3
+        [9] name="delta" kind=scalar value="0.3" @netlists/m10_mos2_dc.cir:21:12
+        [10] name="tnom" kind=scalar value="20" @netlists/m10_mos2_dc.cir:21:22
     model [2] name="mp" base="pmos" level=2e0 @netlists/m10_mos2_dc.cir:22:1
       parameters (14):
         [0] name="level" kind=scalar value="2" @netlists/m10_mos2_dc.cir:22:16
@@ -160,12 +160,12 @@ scope root
         [5] name="ld" kind=scalar value="0.08u" @netlists/m10_mos2_dc.cir:22:61
         [6] name="u0" kind=scalar value="220" @netlists/m10_mos2_dc.cir:22:70
         [7] name="ucrit" kind=scalar value="3e4" @netlists/m10_mos2_dc.cir:22:77
-        [8] name="uexp" kind=scalar value="0.2" @netlists/m10_mos2_dc.cir:22:87
-        [9] name="vmax" kind=scalar value="4e4" @netlists/m10_mos2_dc.cir:22:96
-        [10] name="nfs" kind=scalar value="1e11" @netlists/m10_mos2_dc.cir:22:105
-        [11] name="lambda" kind=scalar value="0.03" @netlists/m10_mos2_dc.cir:22:114
-        [12] name="rd" kind=scalar value="20" @netlists/m10_mos2_dc.cir:22:126
-        [13] name="rsh" kind=scalar value="15" @netlists/m10_mos2_dc.cir:22:132
+        [8] name="uexp" kind=scalar value="0.2" @netlists/m10_mos2_dc.cir:23:3
+        [9] name="vmax" kind=scalar value="4e4" @netlists/m10_mos2_dc.cir:23:12
+        [10] name="nfs" kind=scalar value="1e11" @netlists/m10_mos2_dc.cir:23:21
+        [11] name="lambda" kind=scalar value="0.03" @netlists/m10_mos2_dc.cir:23:30
+        [12] name="rd" kind=scalar value="20" @netlists/m10_mos2_dc.cir:23:42
+        [13] name="rsh" kind=scalar value="15" @netlists/m10_mos2_dc.cir:23:48
     model [3] name="mvsat" base="nmos" level=2e0 @netlists/m10_mos2_dc.cir:24:1
       parameters (10):
         [0] name="level" kind=scalar value="2" @netlists/m10_mos2_dc.cir:24:19
@@ -176,8 +176,8 @@ scope root
         [5] name="tox" kind=scalar value="20n" @netlists/m10_mos2_dc.cir:24:61
         [6] name="vmax" kind=scalar value="6e4" @netlists/m10_mos2_dc.cir:24:69
         [7] name="neff" kind=scalar value="1.5" @netlists/m10_mos2_dc.cir:24:78
-        [8] name="xj" kind=scalar value="0.25u" @netlists/m10_mos2_dc.cir:24:87
-        [9] name="nsub" kind=scalar value="3e16" @netlists/m10_mos2_dc.cir:24:96
+        [8] name="xj" kind=scalar value="0.25u" @netlists/m10_mos2_dc.cir:25:3
+        [9] name="nsub" kind=scalar value="3e16" @netlists/m10_mos2_dc.cir:25:12
     model [4] name="mplain" base="nmos" level=2e0 @netlists/m10_mos2_dc.cir:26:1
       parameters (9):
         [0] name="level" kind=scalar value="2" @netlists/m10_mos2_dc.cir:26:20

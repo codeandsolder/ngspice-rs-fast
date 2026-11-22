@@ -288,11 +288,12 @@ pub(super) fn keyword<'a>(
 pub(super) fn location(input: &Input<'_>) -> SourceLoc {
     input.input.first().map_or_else(
         || {
-            input.state.card.location.at_column(
-                u32::try_from(input.state.card.raw.len())
-                    .unwrap_or(u32::MAX)
-                    .saturating_add(1),
-            )
+            input
+                .state
+                .card
+                .position()
+                .advance(input.state.card.raw.len())
+                .location()
         },
         |token| token.location.clone(),
     )

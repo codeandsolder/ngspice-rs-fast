@@ -133,7 +133,7 @@ fn quoted_expression(token: &Token, inner: &str) -> SpiceResult<ParameterExpress
             "only single-quoted 'expression' option values (without escapes) are accepted",
         ));
     }
-    super::expression::parse_expression(inner, &token.location, token.location.column + 1, false)
+    super::expression::parse_expression(inner, token.position().advance(1), false)
 }
 
 fn global(input: &mut Input<'_>) -> Result<ParsedCard> {

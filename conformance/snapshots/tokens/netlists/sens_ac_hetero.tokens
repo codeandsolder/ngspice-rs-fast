@@ -74,45 +74,45 @@ card 6 @netlists/sens_ac_hetero.cir:15:1 lines=15-17 continuations=2
   token 22 15:64 word "cds"
   token 23 15:67 equals "="
   token 24 15:68 number "1p" value=1e-12
-  token 25 15:71 word "cgs"
-  token 26 15:74 equals "="
-  token 27 15:75 number "2p" value=2e-12
-  token 28 15:78 word "cgd"
-  token 29 15:81 equals "="
-  token 30 15:82 number "1p" value=1e-12
-  token 31 15:85 word "vbi"
-  token 32 15:88 equals "="
-  token 33 15:89 number "0.8" value=8e-1
-  token 34 15:93 word "is"
-  token 35 15:95 equals "="
-  token 36 15:96 number "1e-14" value=1e-14
-  token 37 15:102 word "n"
-  token 38 15:103 equals "="
-  token 39 15:104 number "1.2" value=1.2000000000000002e0
-  token 40 15:108 word "fc"
-  token 41 15:110 equals "="
-  token 42 15:111 number "0.4" value=4e-1
-  token 43 15:115 word "ibd"
-  token 44 15:118 equals "="
-  token 45 15:119 number "1e-9" value=1e-9
-  token 46 15:124 word "vbd"
-  token 47 15:127 equals "="
-  token 48 15:128 number "1.2" value=1.2000000000000002e0
-  token 49 15:132 word "taud"
-  token 50 15:136 equals "="
-  token 51 15:137 number "1e-9" value=1e-9
-  token 52 15:142 word "taug"
-  token 53 15:146 equals "="
-  token 54 15:147 number "1e-9" value=1e-9
-  token 55 15:152 word "vst"
-  token 56 15:155 equals "="
-  token 57 15:156 number "0.5" value=5e-1
-  token 58 15:160 word "ver"
-  token 59 15:163 equals "="
-  token 60 15:164 number "1" value=1e0
-  token 61 15:166 word "tnom"
-  token 62 15:170 equals "="
-  token 63 15:171 number "30" value=3e1
+  token 25 16:3 word "cgs"
+  token 26 16:6 equals "="
+  token 27 16:7 number "2p" value=2e-12
+  token 28 16:10 word "cgd"
+  token 29 16:13 equals "="
+  token 30 16:14 number "1p" value=1e-12
+  token 31 16:17 word "vbi"
+  token 32 16:20 equals "="
+  token 33 16:21 number "0.8" value=8e-1
+  token 34 16:25 word "is"
+  token 35 16:27 equals "="
+  token 36 16:28 number "1e-14" value=1e-14
+  token 37 16:34 word "n"
+  token 38 16:35 equals "="
+  token 39 16:36 number "1.2" value=1.2000000000000002e0
+  token 40 16:40 word "fc"
+  token 41 16:42 equals "="
+  token 42 16:43 number "0.4" value=4e-1
+  token 43 16:47 word "ibd"
+  token 44 16:50 equals "="
+  token 45 16:51 number "1e-9" value=1e-9
+  token 46 16:56 word "vbd"
+  token 47 16:59 equals "="
+  token 48 16:60 number "1.2" value=1.2000000000000002e0
+  token 49 17:3 word "taud"
+  token 50 17:7 equals "="
+  token 51 17:8 number "1e-9" value=1e-9
+  token 52 17:13 word "taug"
+  token 53 17:17 equals "="
+  token 54 17:18 number "1e-9" value=1e-9
+  token 55 17:23 word "vst"
+  token 56 17:26 equals "="
+  token 57 17:27 number "0.5" value=5e-1
+  token 58 17:31 word "ver"
+  token 59 17:34 equals "="
+  token 60 17:35 number "1" value=1e0
+  token 61 17:37 word "tnom"
+  token 62 17:41 equals "="
+  token 63 17:42 number "30" value=3e1
 card 7 @netlists/sens_ac_hetero.cir:18:1 lines=18-18 continuations=0
   raw: "z2 2 3 0 me2 l=1u w=20u"
   kind: device(z)
@@ -192,10 +192,10 @@ card 10 @netlists/sens_ac_hetero.cir:21:1 lines=21-22 continuations=1
   token 23 21:60 word "rtc2"
   token 24 21:64 equals "="
   token 25 21:65 number "1e-5" value=1e-5
-  token 26 21:70 word "phib"
-  token 27 21:74 equals "="
-  token 28 21:75 number "3.1232e18" value=3.1232e18
-  token 29 21:84 rparen ")"
+  token 26 22:3 word "phib"
+  token 27 22:7 equals "="
+  token 28 22:8 number "3.1232e18" value=3.1232e18
+  token 29 22:17 rparen ")"
 card 11 @netlists/sens_ac_hetero.cir:23:1 lines=23-23 continuations=0
   raw: "z4 2 3 0 me4 l=1u w=20u"
   kind: device(z)
@@ -238,22 +238,22 @@ card 12 @netlists/sens_ac_hetero.cir:24:1 lines=24-25 continuations=1
   token 23 24:57 word "gamma"
   token 24 24:62 equals "="
   token 25 24:63 number "2.5" value=2.5e0
-  token 26 24:67 word "nmax"
-  token 27 24:71 equals "="
-  token 28 24:72 number "4e16" value=4e16
-  token 29 24:77 word "cas"
-  token 30 24:80 equals "="
-  token 31 24:81 number "0.9" value=9e-1
-  token 32 24:85 word "cbs"
-  token 33 24:88 equals "="
-  token 34 24:89 number "1.1" value=1.1e0
-  token 35 24:93 word "epsi"
-  token 36 24:97 equals "="
-  token 37 24:98 number "1.142189e-10" value=1.1421889999999999e-10
-  token 38 24:111 word "phib"
-  token 39 24:115 equals "="
-  token 40 24:116 number "3.1232e18" value=3.1232e18
-  token 41 24:125 rparen ")"
+  token 26 25:3 word "nmax"
+  token 27 25:7 equals "="
+  token 28 25:8 number "4e16" value=4e16
+  token 29 25:13 word "cas"
+  token 30 25:16 equals "="
+  token 31 25:17 number "0.9" value=9e-1
+  token 32 25:21 word "cbs"
+  token 33 25:24 equals "="
+  token 34 25:25 number "1.1" value=1.1e0
+  token 35 25:29 word "epsi"
+  token 36 25:33 equals "="
+  token 37 25:34 number "1.142189e-10" value=1.1421889999999999e-10
+  token 38 25:47 word "phib"
+  token 39 25:51 equals "="
+  token 40 25:52 number "3.1232e18" value=3.1232e18
+  token 41 25:61 rparen ")"
 card 13 @netlists/sens_ac_hetero.cir:26:1 lines=26-26 continuations=0
   raw: "z5 2 3 0 hf l=1u w=20u"
   kind: device(z)
@@ -301,18 +301,18 @@ card 14 @netlists/sens_ac_hetero.cir:27:1 lines=27-28 continuations=1
   token 28 27:71 word "vt0"
   token 29 27:74 equals "="
   token 30 27:75 number "-0.5" value=-5e-1
-  token 31 27:80 word "cds"
-  token 32 27:83 equals "="
-  token 33 27:84 number "1p" value=1e-12
-  token 34 27:87 word "kappa"
-  token 35 27:92 equals "="
-  token 36 27:93 number "0.2" value=2e-1
-  token 37 27:97 word "delf"
-  token 38 27:101 equals "="
-  token 39 27:102 number "1e5" value=1e5
-  token 40 27:106 word "fgds"
-  token 41 27:110 equals "="
-  token 42 27:111 number "1e5" value=1e5
+  token 31 28:3 word "cds"
+  token 32 28:6 equals "="
+  token 33 28:7 number "1p" value=1e-12
+  token 34 28:10 word "kappa"
+  token 35 28:15 equals "="
+  token 36 28:16 number "0.2" value=2e-1
+  token 37 28:20 word "delf"
+  token 38 28:24 equals "="
+  token 39 28:25 number "1e5" value=1e5
+  token 40 28:29 word "fgds"
+  token 41 28:33 equals "="
+  token 42 28:34 number "1e5" value=1e5
 card 15 @netlists/sens_ac_hetero.cir:29:1 lines=29-29 continuations=0
   raw: ".sens i(vsense) ac dec 1 1k 1meg"
   kind: dot(.sens)

@@ -87,15 +87,9 @@ fn card(input: &mut Input<'_>) -> Result<ParsedCard> {
     let fundamental_expression = if let Some(token) = input.input.first() {
         let expression = match &token.kind {
             TokenKind::Expression(_) => Some(super::expression::from_brace_token(token)),
-            TokenKind::Quoted(inner) if token.text == format!("'{inner}'") => {
-                Some(super::expression::parse_delimited(
-                    inner,
-                    &token.location,
-                    token.location.column + 1,
-                    false,
-                    true,
-                ))
-            }
+            TokenKind::Quoted(inner) if token.text == format!("'{inner}'") => Some(
+                super::expression::parse_delimited(inner, token.position().advance(1), false, true),
+            ),
             _ => None,
         };
         expression

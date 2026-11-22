@@ -13,7 +13,7 @@
 
 use std::cell::Cell;
 
-use crate::primitives::{SourceLoc, SpiceResult};
+use crate::primitives::SpiceResult;
 use winnow::Parser as _;
 use winnow::combinator::{opt, peek, preceded, repeat};
 use winnow::error::ErrMode;
@@ -21,7 +21,7 @@ use winnow::stream::Stream;
 use winnow::token::{any, literal, one_of, take_while};
 
 use crate::netlist::ast::{FuncSpelling, ParamAssignment, ParamCard};
-use crate::netlist::card::DotCommand;
+use crate::netlist::card::{DotCommand, RawCard};
 use crate::netlist::expr::{ParameterExpression, SourceSpan};
 use crate::netlist::token::Token;
 
@@ -37,7 +37,7 @@ pub(super) fn param_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     })
     .parse_next(input)?;
     let location = input.state.card.location.clone();
-    let Some(first) = input.input.first().map(|token| token.location.column) else {
+    let Some(start) = input.input.first().map(|token| token.raw_offset) else {
         return Err(super::syntax::malformed(
             input,
             "expected a name=expression assignment after .param",
@@ -47,14 +47,13 @@ pub(super) fn param_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     // The text grammar owns the whole tail; drain the token slice so the card
     // is fully consumed (the tokenizer already matched braces and quotes).
     winnow::token::rest.parse_next(input)?;
-    let start = (first as usize).saturating_sub(1).min(raw.len());
     if defines_function(&raw[start..]) {
-        let card = super::func::definition(raw, start, &location, FuncSpelling::Param)
+        let card = super::func::definition(input.state.card, start, FuncSpelling::Param)
             .map_err(|error| ErrMode::Cut(Failure(error)))?;
         return Ok(ParsedCard::Func(card));
     }
     let assignments =
-        assignments(raw, start, &location).map_err(|error| ErrMode::Cut(Failure(error)))?;
+        assignments(input.state.card, start).map_err(|error| ErrMode::Cut(Failure(error)))?;
     Ok(ParsedCard::Param(ParamCard {
         assignments,
         location,
@@ -70,19 +69,14 @@ fn defines_function(text: &str) -> bool {
         .any(|c| c == '(')
 }
 
-/// Parses `raw[start..]` (columns are 1-based bytes of the joined card).
-pub(super) fn assignments(
-    raw: &str,
-    start: usize,
-    origin: &SourceLoc,
-) -> SpiceResult<Vec<ParamAssignment>> {
-    let text = &raw[start..];
-    let column = u32::try_from(start).unwrap_or(u32::MAX).saturating_add(1);
+/// Parses the joined card tail, retaining its physical source mapping.
+fn assignments(card: &RawCard, start: usize) -> SpiceResult<Vec<ParamAssignment>> {
+    let text = &card.raw[start..];
+    let origin = card.position().advance(start);
     let mut input = In {
         input: text,
         state: Ctx {
             origin,
-            column,
             total: text.len(),
             depth: 0,
             shadowing: &[],
@@ -91,7 +85,7 @@ pub(super) fn assignments(
     match list(&mut input) {
         Ok(assignments) => Ok(assignments),
         Err(ErrMode::Backtrack(fail) | ErrMode::Cut(fail)) => {
-            Err(into_error(origin, column, text.len(), fail))
+            Err(into_error(origin, text.len(), fail))
         }
         Err(ErrMode::Incomplete(_)) => unreachable!("complete input"),
     }
@@ -168,10 +162,10 @@ fn assignment(input: &mut In<'_>) -> Res<ParamAssignment> {
     let expression = value(input)?;
     Ok(ParamAssignment {
         name: name.to_ascii_lowercase(),
-        name_span: SourceSpan {
-            start: input.state.location(start),
-            end: input.state.location(end),
-        },
+        name_span: SourceSpan::from_positions(
+            input.state.position(start),
+            input.state.position(end),
+        ),
         expression,
     })
 }
@@ -231,8 +225,7 @@ fn quoted(input: &mut In<'_>) -> Res<ParameterExpression> {
             },
         ));
     }
-    let column = input.state.location(body_start).column;
-    parse_delimited(body, input.state.origin, column, true, true).map_err(resolved)
+    parse_delimited(body, input.state.position(body_start), true, true).map_err(resolved)
 }
 
 /// Extent rule from `inp_split_multi_param_lines()`: whitespace and commas end
@@ -265,8 +258,7 @@ fn parse_slice(
     start_remaining: usize,
     braced: bool,
 ) -> Res<ParameterExpression> {
-    let column = input.state.location(start_remaining).column;
-    parse_expression(slice, input.state.origin, column, braced).map_err(resolved)
+    parse_expression(slice, input.state.position(start_remaining), braced).map_err(resolved)
 }
 
 /// Wraps an already positioned error from a nested parse.

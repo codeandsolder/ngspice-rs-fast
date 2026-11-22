@@ -121,8 +121,8 @@ pub(super) fn write_point(
     point: &[Complex],
     byte_order: BinaryByteOrder,
 ) -> io::Result<()> {
-    for (variable, value) in plot.variables.iter().zip(point) {
-        match plot.flags {
+    for (variable, value) in plot.variables().iter().zip(point) {
+        match plot.flags() {
             PlotFlags::Real => out.write_all(&byte_order.encode(value.re))?,
             PlotFlags::Complex => {
                 // `raw_write()` writes `(re, 0.0)` for a vector it has flagged

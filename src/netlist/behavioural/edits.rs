@@ -116,18 +116,14 @@ impl ScopeEdits {
                     return;
                 }
                 if let BExprKind::Current(name) = &node.kind {
-                    let offset = node
-                        .span
-                        .start
-                        .column
-                        .saturating_sub(expression.span.start.column)
-                        as usize;
-                    result = (|| {
-                        if !name.starts_with('v')
-                            && measured_reference(&expression.text, offset).ok_or_else(|| {
+                    result =
+                        (|| {
+                            if !name.starts_with('v')
+                            && let Some(range) = node.span.relative_to(&expression.span)
+                            && measured_reference(&expression.text, range.start).ok_or_else(|| {
                                 SpiceError::parse(
                                     node.span.start.clone(),
-                                    "current-reference position splits a UTF-8 character",
+                                    "current-reference position is not a valid text boundary",
                                 )
                             })?
                         {
@@ -145,9 +141,9 @@ impl ScopeEdits {
                                 serial,
                             )?;
                         }
-                        occurrence += 1;
-                        Ok(())
-                    })();
+                            occurrence += 1;
+                            Ok(())
+                        })();
                 }
             });
             result?;
@@ -275,7 +271,7 @@ impl ScopeEdits {
 /// expression's text: after stripping whitespace inside parentheses, the
 /// previous character must be arithmetic, `{`, `=` or an outside space.
 fn measured_reference(text: &str, offset: usize) -> Option<bool> {
-    let before = text.get(..offset.min(text.len()))?;
+    let before = text.get(..offset)?;
     let trimmed = before.trim_end();
     let Some(previous) = trimmed.chars().last() else {
         return Some(true);

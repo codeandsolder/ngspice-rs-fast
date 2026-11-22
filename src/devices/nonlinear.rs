@@ -32,7 +32,7 @@ use crate::devices::schema::{
 use crate::devices::{Device, LinearContext, ModelContext, ResolvedModel, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SourceLoc, SpiceError, SpiceResult};
 
 pub(super) mod charge;
 mod sens;
@@ -404,7 +404,7 @@ impl Diode {
 
     pub(crate) fn instantiate(
         instance: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         model: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -442,7 +442,7 @@ impl Diode {
             initial,
             context,
         )?;
-        super::factory::append_nodes(nodes, |nodes| {
+        nodes.transaction(|nodes| {
             let external = nodes.intern_array(&instance.nodes)?;
             input.bind(nodes, external)
         })
@@ -487,7 +487,11 @@ impl DiodeInput {
     }
 
     /// The caller owns the append-only topology transaction.
-    fn bind(self, nodes: &mut NodeTable, external: [NodeId; 2]) -> SpiceResult<Box<dyn Device>> {
+    fn bind(
+        self,
+        nodes: &mut NodeAppend<'_>,
+        external: [NodeId; 2],
+    ) -> SpiceResult<Box<dyn Device>> {
         let mut terminals = external.to_vec();
         let positive = if self.parameters.rs > 0. {
             // diosetup.c: CKTmkVolt(ckt, &tmp, DIOname, "internal").
@@ -496,7 +500,7 @@ impl DiodeInput {
                 return Err(SpiceError::circuit("diode internal-node name collision"));
             }
             let prime = nodes.intern(&name)?;
-            nodes.set_kind(prime, NodeKind::Internal);
+            nodes.set_kind(prime, NodeKind::Internal)?;
             terminals.push(prime);
             prime
         } else {
@@ -549,7 +553,7 @@ impl UrcDiodeModel {
         name: &str,
         area: Real,
         location: &SourceLoc,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         terminals: [NodeId; 2],
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -1878,12 +1882,9 @@ mod tests {
         let n = deck(model, instance);
         let resolver = ModelResolver::new(&n.models)?;
         let resolved = resolver.resolve(&n.devices[0])?.unwrap();
-        Diode::instantiate(
-            &n.devices[0],
-            &mut NodeTable::new(),
-            &resolved,
-            &ModelContext::default(),
-        )
+        crate::primitives::NodeTable::new().transaction(|nodes| {
+            Diode::instantiate(&n.devices[0], nodes, &resolved, &ModelContext::default())
+        })
     }
 
     /// Central differences of current and charge against the analytic

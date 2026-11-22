@@ -73,7 +73,7 @@ fn run_rust(cards: &str, analysis: &str) -> Plot {
 
 fn column(plot: &Plot, name: &str) -> Vec<Complex> {
     plot.column(name)
-        .unwrap_or_else(|| panic!("no {name} in {:?}", plot.variables))
+        .unwrap_or_else(|| panic!("no {name} in {:?}", plot.variables()))
 }
 
 /// Same rows, and every C vector within `relative |C| + absolute`. Both
@@ -81,7 +81,7 @@ fn column(plot: &Plot, name: &str) -> Vec<Complex> {
 /// C's DC sweep names since M10 wave 0.5h.
 fn same_rows(ours: &Plot, theirs: &Plot, relative: f64, absolute: f64) {
     assert_eq!(ours.point_count(), theirs.point_count());
-    for variable in &theirs.variables {
+    for variable in theirs.variables() {
         let name = variable.name.to_ascii_lowercase();
         let mine = name.as_str();
         for (k, (x, y)) in column(ours, mine)

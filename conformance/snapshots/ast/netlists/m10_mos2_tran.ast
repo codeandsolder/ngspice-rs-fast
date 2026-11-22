@@ -70,20 +70,20 @@ scope root
         [5] name="ld" kind=scalar value="0.05u" @netlists/m10_mos2_tran.cir:11:59
         [6] name="uo" kind=scalar value="500" @netlists/m10_mos2_tran.cir:11:68
         [7] name="ucrit" kind=scalar value="2e4" @netlists/m10_mos2_tran.cir:11:75
-        [8] name="uexp" kind=scalar value="0.12" @netlists/m10_mos2_tran.cir:11:85
-        [9] name="vmax" kind=scalar value="6e4" @netlists/m10_mos2_tran.cir:11:95
-        [10] name="neff" kind=scalar value="1.5" @netlists/m10_mos2_tran.cir:11:104
-        [11] name="nfs" kind=scalar value="1e11" @netlists/m10_mos2_tran.cir:11:113
-        [12] name="delta" kind=scalar value="0.4" @netlists/m10_mos2_tran.cir:11:122
-        [13] name="cgso" kind=scalar value="0.3n" @netlists/m10_mos2_tran.cir:11:132
-        [14] name="cgdo" kind=scalar value="0.3n" @netlists/m10_mos2_tran.cir:11:142
-        [15] name="cgbo" kind=scalar value="0.1n" @netlists/m10_mos2_tran.cir:11:152
-        [16] name="cj" kind=scalar value="0.9m" @netlists/m10_mos2_tran.cir:11:162
-        [17] name="mj" kind=scalar value="0.5" @netlists/m10_mos2_tran.cir:11:170
-        [18] name="cjsw" kind=scalar value="0.25n" @netlists/m10_mos2_tran.cir:11:177
-        [19] name="pb" kind=scalar value="0.9" @netlists/m10_mos2_tran.cir:11:188
-        [20] name="rsh" kind=scalar value="20" @netlists/m10_mos2_tran.cir:11:195
-        [21] name="js" kind=scalar value="1e-4" @netlists/m10_mos2_tran.cir:11:202
+        [8] name="uexp" kind=scalar value="0.12" @netlists/m10_mos2_tran.cir:12:3
+        [9] name="vmax" kind=scalar value="6e4" @netlists/m10_mos2_tran.cir:12:13
+        [10] name="neff" kind=scalar value="1.5" @netlists/m10_mos2_tran.cir:12:22
+        [11] name="nfs" kind=scalar value="1e11" @netlists/m10_mos2_tran.cir:12:31
+        [12] name="delta" kind=scalar value="0.4" @netlists/m10_mos2_tran.cir:12:40
+        [13] name="cgso" kind=scalar value="0.3n" @netlists/m10_mos2_tran.cir:12:50
+        [14] name="cgdo" kind=scalar value="0.3n" @netlists/m10_mos2_tran.cir:12:60
+        [15] name="cgbo" kind=scalar value="0.1n" @netlists/m10_mos2_tran.cir:12:70
+        [16] name="cj" kind=scalar value="0.9m" @netlists/m10_mos2_tran.cir:13:3
+        [17] name="mj" kind=scalar value="0.5" @netlists/m10_mos2_tran.cir:13:11
+        [18] name="cjsw" kind=scalar value="0.25n" @netlists/m10_mos2_tran.cir:13:18
+        [19] name="pb" kind=scalar value="0.9" @netlists/m10_mos2_tran.cir:13:29
+        [20] name="rsh" kind=scalar value="20" @netlists/m10_mos2_tran.cir:13:36
+        [21] name="js" kind=scalar value="1e-4" @netlists/m10_mos2_tran.cir:13:43
     model [1] name="pch" base="pmos" level=2e0 @netlists/m10_mos2_tran.cir:14:1
       parameters (18):
         [0] name="level" kind=scalar value="2" @netlists/m10_mos2_tran.cir:14:17
@@ -94,16 +94,16 @@ scope root
         [5] name="ld" kind=scalar value="0.05u" @netlists/m10_mos2_tran.cir:14:62
         [6] name="uo" kind=scalar value="200" @netlists/m10_mos2_tran.cir:14:71
         [7] name="ucrit" kind=scalar value="3e4" @netlists/m10_mos2_tran.cir:14:78
-        [8] name="uexp" kind=scalar value="0.15" @netlists/m10_mos2_tran.cir:14:88
-        [9] name="lambda" kind=scalar value="0.03" @netlists/m10_mos2_tran.cir:14:98
-        [10] name="cgso" kind=scalar value="0.3n" @netlists/m10_mos2_tran.cir:14:110
-        [11] name="cgdo" kind=scalar value="0.3n" @netlists/m10_mos2_tran.cir:14:120
-        [12] name="cgbo" kind=scalar value="0.1n" @netlists/m10_mos2_tran.cir:14:130
-        [13] name="cj" kind=scalar value="1m" @netlists/m10_mos2_tran.cir:14:140
-        [14] name="cjsw" kind=scalar value="0.3n" @netlists/m10_mos2_tran.cir:14:146
-        [15] name="pb" kind=scalar value="0.9" @netlists/m10_mos2_tran.cir:14:156
-        [16] name="rd" kind=scalar value="30" @netlists/m10_mos2_tran.cir:14:163
-        [17] name="rs" kind=scalar value="30" @netlists/m10_mos2_tran.cir:14:169
+        [8] name="uexp" kind=scalar value="0.15" @netlists/m10_mos2_tran.cir:15:3
+        [9] name="lambda" kind=scalar value="0.03" @netlists/m10_mos2_tran.cir:15:13
+        [10] name="cgso" kind=scalar value="0.3n" @netlists/m10_mos2_tran.cir:15:25
+        [11] name="cgdo" kind=scalar value="0.3n" @netlists/m10_mos2_tran.cir:15:35
+        [12] name="cgbo" kind=scalar value="0.1n" @netlists/m10_mos2_tran.cir:15:45
+        [13] name="cj" kind=scalar value="1m" @netlists/m10_mos2_tran.cir:16:3
+        [14] name="cjsw" kind=scalar value="0.3n" @netlists/m10_mos2_tran.cir:16:9
+        [15] name="pb" kind=scalar value="0.9" @netlists/m10_mos2_tran.cir:16:19
+        [16] name="rd" kind=scalar value="30" @netlists/m10_mos2_tran.cir:16:26
+        [17] name="rs" kind=scalar value="30" @netlists/m10_mos2_tran.cir:16:32
   subcircuits (0):
   analyses (1):
     analysis [0] kind=tran @netlists/m10_mos2_tran.cir:18:1

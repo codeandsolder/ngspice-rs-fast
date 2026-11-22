@@ -289,7 +289,7 @@ fn typed_nested_source_and_temperature_sweeps_are_bounded_and_nonmutating() {
     .unwrap();
     assert_eq!(p.point_count(), 6);
     // C (dctrcurv.c) writes only the inner scale; v(b) carries the outer v2.
-    assert_eq!(p.variables[0].name, "v(v-sweep)");
+    assert_eq!(p.variables()[0].name, "v(v-sweep)");
     assert!(p.variable_index("sweep(v2)").is_none());
     for row in 0..6 {
         let inner = (row % 3) as f64 * 0.5;

@@ -714,11 +714,13 @@ fn integrated_plot(
     summary: bool,
     integrated_power: Power,
 ) -> SpiceResult<Plot> {
-    let mut integrated = Plot::new("noise2", representation.plotname(false), PlotFlags::Real);
     let mut values = NoiseRow::new(representation, integrated_variables.len());
-    for variable in integrated_variables {
-        integrated.push_variable(variable);
-    }
+    let mut integrated = Plot::new(
+        "noise2",
+        representation.plotname(false),
+        PlotFlags::Real,
+        integrated_variables,
+    );
     if summary {
         for g in generators {
             g.append_integrated(&mut values);
@@ -760,11 +762,12 @@ fn output_excitation(circuit: &Circuit, output: [NodeId; 2]) -> Vec<Complex> {
 }
 
 fn spectrum_plot(representation: Representation, spectrum_variables: Vec<Variable>) -> Plot {
-    let mut spectrum = Plot::new("noise1", representation.plotname(true), PlotFlags::Real);
-    for variable in spectrum_variables {
-        spectrum.push_variable(variable);
-    }
-    spectrum
+    Plot::new(
+        "noise1",
+        representation.plotname(true),
+        PlotFlags::Real,
+        spectrum_variables,
+    )
 }
 
 /// Runs `.noise` and returns its plots: the spectrum and, unless the sweep is
@@ -846,7 +849,7 @@ pub(crate) fn run(
         let emit = card.summary == 0 || print_summary;
         let mut row = NoiseRow::new(
             representation,
-            if emit { spectrum.variables.len() } else { 0 },
+            if emit { spectrum.variables().len() } else { 0 },
         );
         if emit {
             row.values.push(Complex::real(freq));
@@ -1077,7 +1080,7 @@ mod tests {
                 assert_eq!(plot_count(&arguments), expected);
                 assert_eq!(plots[0].point_count(), 1);
                 if let Some(integrated) = plots.get(1) {
-                    assert_eq!(integrated.points[0], [Complex::ZERO; 2]);
+                    assert_eq!(integrated.points()[0], [Complex::ZERO; 2]);
                 }
             }
         }

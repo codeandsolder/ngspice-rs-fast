@@ -58,18 +58,18 @@ card 4 @netlists/m10_mesa_l4_op.cir:5:1 lines=5-6 continuations=1
   token 22 5:56 word "gamma"
   token 23 5:61 equals "="
   token 24 5:62 number "2.5" value=2.5e0
-  token 25 5:66 word "nmax"
-  token 26 5:70 equals "="
-  token 27 5:71 number "4e16" value=4e16
-  token 28 5:76 word "cas"
-  token 29 5:79 equals "="
-  token 30 5:80 number "0.9" value=9e-1
-  token 31 5:84 word "cbs"
-  token 32 5:87 equals "="
-  token 33 5:88 number "1.1" value=1.1e0
-  token 34 5:92 word "epsi"
-  token 35 5:96 equals "="
-  token 36 5:97 number "1.142189e-10" value=1.1421889999999999e-10
+  token 25 6:3 word "nmax"
+  token 26 6:7 equals "="
+  token 27 6:8 number "4e16" value=4e16
+  token 28 6:13 word "cas"
+  token 29 6:16 equals "="
+  token 30 6:17 number "0.9" value=9e-1
+  token 31 6:21 word "cbs"
+  token 32 6:24 equals "="
+  token 33 6:25 number "1.1" value=1.1e0
+  token 34 6:29 word "epsi"
+  token 35 6:33 equals "="
+  token 36 6:34 number "1.142189e-10" value=1.1421889999999999e-10
 card 5 @netlists/m10_mesa_l4_op.cir:7:1 lines=7-7 continuations=0
   raw: ".save all"
   kind: dot(.save)

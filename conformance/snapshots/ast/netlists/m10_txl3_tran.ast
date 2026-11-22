@@ -134,26 +134,26 @@ scope root
         [1] name="kp" kind=scalar value="48U" @netlists/m10_txl3_tran.cir:22:27
         [2] name="gamma" kind=scalar value="0.30" @netlists/m10_txl3_tran.cir:22:34
         [3] name="phi" kind=scalar value="0.55" @netlists/m10_txl3_tran.cir:22:45
-        [4] name="lambda" kind=scalar value="0.00" @netlists/m10_txl3_tran.cir:22:54
-        [5] name="cgso" kind=scalar value="0" @netlists/m10_txl3_tran.cir:22:66
-        [6] name="cgdo" kind=scalar value="0" @netlists/m10_txl3_tran.cir:22:73
-        [7] name="cj" kind=scalar value="0" @netlists/m10_txl3_tran.cir:22:80
-        [8] name="cjsw" kind=scalar value="0" @netlists/m10_txl3_tran.cir:22:85
-        [9] name="tox" kind=scalar value="18000N" @netlists/m10_txl3_tran.cir:22:92
-        [10] name="ld" kind=scalar value="0.0U" @netlists/m10_txl3_tran.cir:22:103
+        [4] name="lambda" kind=scalar value="0.00" @netlists/m10_txl3_tran.cir:23:2
+        [5] name="cgso" kind=scalar value="0" @netlists/m10_txl3_tran.cir:23:14
+        [6] name="cgdo" kind=scalar value="0" @netlists/m10_txl3_tran.cir:23:21
+        [7] name="cj" kind=scalar value="0" @netlists/m10_txl3_tran.cir:23:28
+        [8] name="cjsw" kind=scalar value="0" @netlists/m10_txl3_tran.cir:23:33
+        [9] name="tox" kind=scalar value="18000N" @netlists/m10_txl3_tran.cir:23:40
+        [10] name="ld" kind=scalar value="0.0U" @netlists/m10_txl3_tran.cir:23:51
     model [1] name="mp1p0" base="pmos" level=none @netlists/m10_txl3_tran.cir:24:1
       parameters (11):
         [0] name="vto" kind=scalar value="-0.8" @netlists/m10_txl3_tran.cir:24:19
         [1] name="kp" kind=scalar value="21U" @netlists/m10_txl3_tran.cir:24:28
         [2] name="gamma" kind=scalar value="0.45" @netlists/m10_txl3_tran.cir:24:35
         [3] name="phi" kind=scalar value="0.61" @netlists/m10_txl3_tran.cir:24:46
-        [4] name="lambda" kind=scalar value="0.00" @netlists/m10_txl3_tran.cir:24:55
-        [5] name="cgso" kind=scalar value="0" @netlists/m10_txl3_tran.cir:24:67
-        [6] name="cgdo" kind=scalar value="0" @netlists/m10_txl3_tran.cir:24:74
-        [7] name="cj" kind=scalar value="0" @netlists/m10_txl3_tran.cir:24:81
-        [8] name="cjsw" kind=scalar value="0" @netlists/m10_txl3_tran.cir:24:86
-        [9] name="tox" kind=scalar value="18000N" @netlists/m10_txl3_tran.cir:24:93
-        [10] name="ld" kind=scalar value="0.0U" @netlists/m10_txl3_tran.cir:24:104
+        [4] name="lambda" kind=scalar value="0.00" @netlists/m10_txl3_tran.cir:25:2
+        [5] name="cgso" kind=scalar value="0" @netlists/m10_txl3_tran.cir:25:14
+        [6] name="cgdo" kind=scalar value="0" @netlists/m10_txl3_tran.cir:25:21
+        [7] name="cj" kind=scalar value="0" @netlists/m10_txl3_tran.cir:25:28
+        [8] name="cjsw" kind=scalar value="0" @netlists/m10_txl3_tran.cir:25:33
+        [9] name="tox" kind=scalar value="18000N" @netlists/m10_txl3_tran.cir:25:40
+        [10] name="ld" kind=scalar value="0.0U" @netlists/m10_txl3_tran.cir:25:51
     model [2] name="ymod" base="txl" level=none @netlists/m10_txl3_tran.cir:26:1
       parameters (5):
         [0] name="r" kind=scalar value="12.45" @netlists/m10_txl3_tran.cir:26:17

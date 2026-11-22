@@ -327,17 +327,17 @@ fn repeated_contextual_assembly_is_immutable_and_numbering_stays_bound() {
 #[test]
 fn real_stamp_uses_explicit_temperature_and_initial_conditions_remain_visible() {
     let n = deck("r1 a 0 mdl\n.model mdl r(r=1k tc1=0.01)");
-    let mut circuit = Circuit::from_netlist(&n).unwrap();
-    let unknowns = circuit.unknowns().clone();
-    let nodes = circuit.nodes().clone();
+    let circuit = Circuit::from_netlist(&n).unwrap();
+    let unknowns = circuit.unknowns();
+    let nodes = circuit.nodes();
     let mut matrix = SparseMatrix::new(1, 1);
     let mut rhs = Vector::zeros(1);
     let solution = Vector::zeros(1);
     let mut context = StampContext {
         matrix: &mut matrix,
         rhs: &mut rhs,
-        unknowns: &unknowns,
-        nodes: &nodes,
+        unknowns,
+        nodes,
         solution: &solution,
         temperature: 77.0,
         nominal_temperature: 27.0,
@@ -353,7 +353,7 @@ fn real_stamp_uses_explicit_temperature_and_initial_conditions_remain_visible() 
         source_factor: 1.,
         voltage_source_value: &mut 0.,
     };
-    circuit.devices_mut()[0].stamp(&mut context).unwrap();
+    circuit.devices()[0].stamp(&mut context).unwrap();
     close(matrix.get(0, 0), 1.0 / 1500.0);
     for (d, setter, model) in [('c', "cap", "1u"), ('l', "ind", "1m")] {
         let n = deck(&format!(

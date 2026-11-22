@@ -55,8 +55,8 @@ scope root
         [5] name="rf" kind=scalar value="2e3" @netlists/m10_hfet1_op.cir:7:51
         [6] name="rdi" kind=scalar value="50" @netlists/m10_hfet1_op.cir:7:58
         [7] name="rsi" kind=scalar value="50" @netlists/m10_hfet1_op.cir:7:65
-        [8] name="js1s" kind=scalar value="1e-10" @netlists/m10_hfet1_op.cir:7:72
-        [9] name="js1d" kind=scalar value="1e-10" @netlists/m10_hfet1_op.cir:7:83
+        [8] name="js1s" kind=scalar value="1e-10" @netlists/m10_hfet1_op.cir:8:3
+        [9] name="js1d" kind=scalar value="1e-10" @netlists/m10_hfet1_op.cir:8:14
     model [1] name="pch" base="phfet" level=5e0 @netlists/m10_hfet1_op.cir:9:1
       parameters (10):
         [0] name="level" kind=scalar value="5" @netlists/m10_hfet1_op.cir:9:18
@@ -67,8 +67,8 @@ scope root
         [5] name="rf" kind=scalar value="2e3" @netlists/m10_hfet1_op.cir:9:51
         [6] name="rdi" kind=scalar value="50" @netlists/m10_hfet1_op.cir:9:58
         [7] name="rsi" kind=scalar value="50" @netlists/m10_hfet1_op.cir:9:65
-        [8] name="js1s" kind=scalar value="1e-10" @netlists/m10_hfet1_op.cir:9:72
-        [9] name="js1d" kind=scalar value="1e-10" @netlists/m10_hfet1_op.cir:9:83
+        [8] name="js1s" kind=scalar value="1e-10" @netlists/m10_hfet1_op.cir:10:3
+        [9] name="js1d" kind=scalar value="1e-10" @netlists/m10_hfet1_op.cir:10:14
   subcircuits (0):
   analyses (1):
     analysis [0] kind=op @netlists/m10_hfet1_op.cir:13:1

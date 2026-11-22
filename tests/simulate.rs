@@ -108,7 +108,7 @@ fn assert_plots_match(
     let want = committed.single_plot().expect("one golden plot");
     let got = written.single_plot().expect("one written plot");
     assert_eq!(got.plotname, want.plotname, "{name}: plot name");
-    assert_eq!(got.flags, want.flags, "{name}: flags");
+    assert_eq!(got.flags(), want.flags(), "{name}: flags");
     assert_eq!(
         got.variable_count(),
         want.variable_count(),
@@ -116,22 +116,23 @@ fn assert_plots_match(
     );
     assert_eq!(got.point_count(), want.point_count(), "{name}: points");
     assert_eq!(
-        got.variables
+        got.variables()
             .iter()
             .map(|variable| variable.name.as_str())
             .collect::<Vec<_>>(),
-        want.variables
+        want.variables()
             .iter()
             .map(|variable| variable.name.as_str())
             .collect::<Vec<_>>(),
         "{name}: column order must match the golden, not just the names"
     );
-    for variable in &want.variables {
+    for variable in want.variables() {
         let Some(index) = got.variable_index(&variable.name) else {
             panic!("{name}: the rawfile has no variable '{}'", variable.name);
         };
         assert_eq!(
-            &got.variables[index], variable,
+            &got.variables()[index],
+            variable,
             "{name}: metadata of '{}'",
             variable.name
         );
@@ -201,8 +202,8 @@ fn the_forward_dc_sweep_writes_the_requested_grid() {
     let written = RawFile::load(&output).expect("parses");
     let plot = written.single_plot().unwrap();
     assert_eq!(plot.plotname, "DC transfer characteristic");
-    assert_eq!(plot.flags, PlotFlags::Real);
-    let names: Vec<&str> = plot.variables.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(plot.flags(), PlotFlags::Real);
+    let names: Vec<&str> = plot.variables().iter().map(|v| v.name.as_str()).collect();
     // C's dctrcurv.c scale for a voltage-source sweep, as its rawfile names it.
     assert_eq!(names, ["v(v-sweep)", "v(in)", "v(out)", "i(v1)"]);
     assert_eq!(plot.point_count(), 6, "0, 1, 2, 3, 4 and 5 volts");
@@ -256,7 +257,7 @@ fn a_complex_ac_rawfile_matches_the_committed_golden() {
     );
 
     let written = RawFile::load(&output).expect("parses");
-    assert_eq!(written.single_plot().unwrap().flags, PlotFlags::Complex);
+    assert_eq!(written.single_plot().unwrap().flags(), PlotFlags::Complex);
     assert_matches_golden("rc_lowpass_ac", &written, 1e-10, 1e-12);
     // The complex ASCII form spells values as `re,im`, as `raw_write()` does.
     let text = fs::read_to_string(&output).unwrap();
@@ -382,7 +383,7 @@ fn plotnames(rawfile: &RawFile) -> Vec<&str> {
 
 /// The variable names of one plot, in column order.
 fn variable_names(plot: &ngspice_rs::analysis::Plot) -> Vec<&str> {
-    plot.variables
+    plot.variables()
         .iter()
         .map(|variable| variable.name.as_str())
         .collect()
@@ -433,9 +434,9 @@ fn a_multi_analysis_deck_writes_one_plot_per_analysis_in_c_batch_order() {
             "{raw_plot:?}"
         );
     }
-    assert_eq!(written.plots[1].plot.variables[0].name, "v(v-sweep)");
+    assert_eq!(written.plots[1].plot.variables()[0].name, "v(v-sweep)");
     for (index, (got, want)) in written.plots.iter().zip(&committed.plots).enumerate() {
-        let (relative, absolute) = if got.plot.flags == PlotFlags::Complex {
+        let (relative, absolute) = if got.plot.flags() == PlotFlags::Complex {
             (1e-10, 1e-12)
         } else {
             (1e-12, 1e-15)
@@ -790,7 +791,7 @@ fn save_narrows_an_operating_point_to_the_requested_vectors_in_request_order() {
 
     let written = RawFile::load(&output).expect("parses");
     let plot = written.single_plot().unwrap();
-    let names: Vec<&str> = plot.variables.iter().map(|v| v.name.as_str()).collect();
+    let names: Vec<&str> = plot.variables().iter().map(|v| v.name.as_str()).collect();
     assert_eq!(names, ["v(out)", "i(v1)", "v(in,out)", "v(0,out)"]);
     let want = golden("rc_divider").single_plot().unwrap().clone();
     // Values still come from the driver, addressed by name.
@@ -969,8 +970,8 @@ fn an_ac_print_card_prints_the_complex_components() {
 
     let written = RawFile::load(&output).expect("parses");
     let plot = written.single_plot().unwrap();
-    assert_eq!(plot.flags, PlotFlags::Complex);
-    let names: Vec<&str> = plot.variables.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(plot.flags(), PlotFlags::Complex);
+    let names: Vec<&str> = plot.variables().iter().map(|v| v.name.as_str()).collect();
     assert_eq!(
         names,
         [
@@ -984,9 +985,9 @@ fn an_ac_print_card_prints_the_complex_components() {
     );
     // The computed components are real vectors inside a complex plot, so the
     // rawfile writes them as `re,0.0` and the text table spells them `re`.
-    assert!(plot.variables[2].is_real);
-    assert_eq!(plot.variables[3].unit, "phase");
-    assert_eq!(plot.variables[4].unit, "db");
+    assert!(plot.variables()[2].is_real);
+    assert_eq!(plot.variables()[3].unit, "phase");
+    assert_eq!(plot.variables()[4].unit, "db");
     for point in 0..plot.point_count() {
         let out = plot.value("v(out)", point).unwrap();
         let magnitude = out.magnitude();
@@ -1674,7 +1675,7 @@ fn the_m6_gate_deck_runs_every_analysis_end_to_end() {
         close("dc sense", isense[point].re, lim[point].re / 10., 1e-9);
     }
     // The operating point is at rest: every source is 0 V at DC.
-    for value in &written.plots[2].plot.points[0] {
+    for value in &written.plots[2].plot.points()[0] {
         assert!(value.magnitude() < 1e-9, "{value}");
     }
     // Transient: the 0.1 V, 1 kHz drive reaches about 2 V at v(out), where
