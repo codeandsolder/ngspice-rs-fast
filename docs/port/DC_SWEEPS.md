@@ -166,8 +166,12 @@ swept source in load order. Temperature is the per-point
 ## Validation before samples
 
 Besides target/grid checks, the driver rejects input-validity failures that would
-otherwise surface mid-run: actual Cartesian R/TEMP point contexts are assembled
-and every swept resistance is evaluated over the whole grid. Original resistor
+otherwise surface mid-run: actual Cartesian R/TEMP point contexts are prepared
+and validated without a matrix assembly, and every swept resistance is evaluated
+over the whole grid. Contextual device hooks reuse the DC load's thermal and
+effective-value derivations; mutual-inductance constraints use the same prepared
+replacement view as the solve. A DC-only device does not need an AC load, and
+solution-dependent device failures are not inferred from an artificial zero bias. Original resistor
 recipes are not evaluated in place of the replacements; an otherwise invalid
 original resistance at a swept temperature must not reject valid replacement points. A model
 with `tc1=-0.03` swept to 67 C, or `scale=1e300` swept to 1e10 ohm, is rejected
@@ -256,7 +260,7 @@ two parameters of one device are allowed, the same parameter twice is not.
 terminals, branch rows and state layout — in place of the original for that
 point. A temperature axis is applied before the instance parameters of the
 same point. Every Cartesian point of a sweep with a device-parameter or
-temperature axis is assembled once before the first sample, so an invalid
+temperature axis is validated without stamping before the first sample, so an invalid
 value anywhere in the grid is an up-front error.
 
 Tests: `tests/dc_parameter_sweeps.rs` (diode junction law over AREA, AREA/M

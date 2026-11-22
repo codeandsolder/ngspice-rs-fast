@@ -918,6 +918,10 @@ impl Jfet2 {
 /// untouched there): the previous load's, else the accepted or carried one,
 /// else zero.
 impl Device for Jfet2 {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.operating(context).map(|_| ())
+    }
+
     /// `jfet2set.c`: C's device type and `TSTALLOC` order.
     fn c_device_type(&self) -> crate::devices::setup::CDeviceType {
         crate::devices::setup::CDeviceType::Jfet2

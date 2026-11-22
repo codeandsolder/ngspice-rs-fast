@@ -1539,6 +1539,10 @@ pub(crate) fn junction_companion(
 }
 
 impl Device for Diode {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.thermal(context).map(|_| ())
+    }
+
     /// `diosetup.c` (without sidewall resistance or self-heating, which the
     /// port rejects); `posPrime` is the external anode when `RS = 0`.
     fn setup_matrix(

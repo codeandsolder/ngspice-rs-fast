@@ -324,6 +324,22 @@ impl<'a> PreparedRun<'a> {
         self.point(context).map(|_| ())
     }
 
+    /// Validate effective device inputs for DC, independently of any bias.
+    /// The prepared replacement view and mutual-term validation are exactly
+    /// those used by the real load; AC-only laws are not evaluated.
+    /// # Errors
+    /// Invalid context, replacement, contextual device input or mutual coupling.
+    pub fn validate_dc_inputs(&self, context: &ModelContext) -> SpiceResult<()> {
+        let point = self.point(context)?;
+        point.mutual(self.circuit)?;
+        for index in self.circuit.load_order() {
+            point
+                .device(self.circuit, index)
+                .validate_dc_inputs(context)?;
+        }
+        Ok(())
+    }
+
     /// Load a disposable trial using this run's prepared effective devices.
     /// # Errors
     /// As [`Circuit::load`]; a changed context is revalidated before use.

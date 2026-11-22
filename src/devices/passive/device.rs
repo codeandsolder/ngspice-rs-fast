@@ -42,6 +42,18 @@ impl ModelPassive {
     }
 }
 impl Device for ModelPassive {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        match self.parameters.kind {
+            PassiveKind::Resistor => self
+                .parameters
+                .resistor_conductance(context, false)
+                .map(|_| ()),
+            PassiveKind::Capacitor | PassiveKind::Inductor => {
+                self.parameters.effective_value(context).map(|_| ())
+            }
+        }
+    }
+
     /// `ressetup.c`, `capsetup.c` or `indsetup.c` by family.
     fn setup_matrix(
         &self,

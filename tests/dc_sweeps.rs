@@ -605,6 +605,109 @@ fn probe(c: &mut Circuit, node: &str) -> (Rc<Cell<usize>>, Rc<Cell<usize>>) {
     (loads, accepted)
 }
 
+/// A DC-capable device deliberately lacking AC assembly. A physical sweep
+/// must not require an unrelated analysis implementation at zero bias.
+#[derive(Debug)]
+struct DcOnlyProbe(NodeId);
+
+impl Device for DcOnlyProbe {
+    fn name(&self) -> &str {
+        "x_dc_only"
+    }
+    fn designator(&self) -> char {
+        'x'
+    }
+    fn terminals(&self) -> &[NodeId] {
+        std::slice::from_ref(&self.0)
+    }
+    fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
+        context.stamp(self.0, self.0, 1e-3)
+    }
+}
+
+#[test]
+fn physical_dc_sweeps_do_not_require_small_signal_assembly() {
+    for args in [["temp", "27", "47", "20"], ["@d1[area]", "1", "2", "1"]] {
+        let mut c = circuit("v1 a 0 1\nd1 0 a dm\n.model dm d");
+        let node = c.nodes().get("a").unwrap();
+        c.add_device(Box::new(DcOnlyProbe(node))).unwrap();
+        c.finalize().unwrap();
+        // Establish that this topology really does support operating point.
+        let bias = op(&mut c, &AnalysisContext::default());
+        close(bias.value("v(a)", 0).unwrap().re, 1., 1e-12, 1e-15);
+        let swept = run(&mut c, &args).unwrap();
+        assert_column(&swept, "v(a)", &[1., 1.], 1e-12, 1e-15);
+    }
+}
+
+/// Input validation is distinct from stamping and solver acceptance. Count
+/// validations, forbid AC assembly, and reject the last physical context.
+#[derive(Debug)]
+struct ContextProbe {
+    node: NodeId,
+    validations: Rc<Cell<usize>>,
+    loads: Rc<Cell<usize>>,
+    accepted: Rc<Cell<usize>>,
+}
+impl Device for ContextProbe {
+    fn name(&self) -> &str {
+        "x_context"
+    }
+    fn designator(&self) -> char {
+        'x'
+    }
+    fn terminals(&self) -> &[NodeId] {
+        std::slice::from_ref(&self.node)
+    }
+    fn validate_dc_inputs(&self, context: &ngspice_rs::devices::ModelContext) -> SpiceResult<()> {
+        self.validations.set(self.validations.get() + 1);
+        if context.temperature > 60. {
+            return Err(SpiceError::circuit("context probe temperature limit"));
+        }
+        Ok(())
+    }
+    fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
+        self.loads.set(self.loads.get() + 1);
+        context.stamp(self.node, self.node, 1e-3)
+    }
+    fn accept(&self, _: &AcceptContext<'_>) {
+        self.accepted.set(self.accepted.get() + 1);
+    }
+}
+
+#[test]
+fn late_physical_input_error_precedes_newton_and_acceptance() {
+    for args in [
+        ["v1", "0", "2", "1", "temp", "27", "67", "20"],
+        ["temp", "27", "67", "20", "v1", "0", "2", "1"],
+    ] {
+        let mut c = circuit("v1 a 0 1\nr1 a 0 1k");
+        let (validations, loads, accepted) = (
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        c.add_device(Box::new(ContextProbe {
+            node: c.nodes().get("a").unwrap(),
+            validations: validations.clone(),
+            loads: loads.clone(),
+            accepted: accepted.clone(),
+        }))
+        .unwrap();
+        c.finalize().unwrap();
+        let error = run(&mut c, &args).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("context probe temperature limit"),
+            "{error}"
+        );
+        assert_eq!(validations.get(), 3);
+        assert_eq!(loads.get(), 0);
+        assert_eq!(accepted.get(), 0);
+    }
+}
+
 /// A nonlinear-flagged 1 mS device that fails numerically when |v| exceeds `limit`,
 /// as a stand-in for a point the nonlinear solver cannot converge.
 #[derive(Debug)]

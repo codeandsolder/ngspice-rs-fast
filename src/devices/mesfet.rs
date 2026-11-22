@@ -589,6 +589,10 @@ impl Mesfet {
 }
 
 impl Device for Mesfet {
+    fn validate_dc_inputs(&self, _context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.operating().map(|_| ())
+    }
+
     /// MES occupies its own C device type, before MESA and MOS.
     fn c_device_type(&self) -> crate::devices::setup::CDeviceType {
         crate::devices::setup::CDeviceType::Mes

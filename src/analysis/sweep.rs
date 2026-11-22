@@ -644,7 +644,7 @@ fn point_context<'a>(
 }
 
 /// The same Cartesian traversal serves validation and execution. Source-only
-/// axes do not affect the small-signal validation matrix: project those axes
+/// axes do not affect bias-independent temperature/physical validation: project those axes
 /// onto one representative value during preflight.
 struct GridPair<'a> {
     inner: &'a [Real],
@@ -684,7 +684,7 @@ impl<'a> GridPair<'a> {
 
 /// Reject every point the run would later fail on for *input* reasons: a swept
 /// resistance whose effective value is invalid at some swept temperature, or a
-/// circuit that cannot be assembled at some swept temperature. Convergence
+/// circuit whose contextual device inputs are invalid at some swept temperature. Convergence
 /// failures remain run-time errors.
 fn preflight(
     prepared: &crate::devices::PreparedRun<'_>,
@@ -693,7 +693,6 @@ fn preflight(
     context: &AnalysisContext,
 ) -> SpiceResult<()> {
     let circuit = prepared.circuit();
-    let zero = Vector::zeros(circuit.unknown_count());
     // A temperature or device-parameter axis changes the devices themselves:
     // validate actual Cartesian point contexts, not the original recipes at
     // each temperature (those recipes are replaced by the sweep).
@@ -710,7 +709,7 @@ fn preflight(
         let contexts = GridPair::new(grids).physical_contexts(axes);
         for values in contexts.points() {
             let point = point_context(circuit, axes, values, context.model_context())?;
-            prepared.small_signal_system_at(&point.model, &zero, None)?;
+            prepared.validate_dc_inputs(&point.model)?;
         }
         return Ok(());
     }

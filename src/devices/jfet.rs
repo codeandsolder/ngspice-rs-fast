@@ -879,6 +879,10 @@ pub(super) fn instance_parameter(keyword: &str) -> Option<&'static str> {
 }
 
 impl Device for Jfet {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.operating(context).map(|_| ())
+    }
+
     /// `jfetset.c`: C's device type and `TSTALLOC` order.
     fn c_device_type(&self) -> crate::devices::setup::CDeviceType {
         crate::devices::setup::CDeviceType::Jfet

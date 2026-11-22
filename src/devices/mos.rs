@@ -1360,6 +1360,10 @@ fn series_conductance(
 }
 
 impl<L: MosLevel> Device for Mosfet<L> {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.operating(context).map(|_| ())
+    }
+
     /// `mos1set.c`, `mos3set.c`.
     fn c_device_type(&self) -> CDeviceType {
         L::DEVICE_TYPE

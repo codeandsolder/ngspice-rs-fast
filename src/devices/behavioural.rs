@@ -330,6 +330,10 @@ impl Behavioural {
 }
 
 impl Device for Behavioural {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.checked_factor(context.temperature).map(|_| ())
+    }
+
     /// `asrc`: `inpcom.c` rewrites the E/G/F/H VALUE/TABLE/POLY forms into
     /// B sources before parsing.
     fn c_device_type(&self) -> crate::devices::setup::CDeviceType {
