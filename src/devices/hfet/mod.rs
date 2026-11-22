@@ -58,25 +58,43 @@ use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceRes
 /// charge when exp(x)/2 is smaller than one ULP of 1.
 fn soft_density(n0: Real, voltage: Real, thermal: Real) -> (Real, Real) {
     let x = voltage / thermal;
-    let (logarithm, fraction) = if x <= 1. {
-        let b = 0.5 * x.exp();
-        (b.ln_1p(), b / (1. + b))
-    } else {
-        let reciprocal = 2. * (-x).exp();
-        (
-            (x - std::f64::consts::LN_2) + reciprocal.ln_1p(),
-            1. / (1. + reciprocal),
-        )
-    };
-    let density = 2. * n0 * logarithm;
-    let slope = 2. * n0 / thermal * fraction;
-    (density, slope)
+    // At b = exp(x)/2 <= 2^-55, replacing ln(1+b) and
+    // b/(1+b) by b incurs less than one binary64 rounding unit.
+    if x <= -54. * std::f64::consts::LN_2 {
+        let density = if x < -1022. * std::f64::consts::LN_2 {
+            // Preserve a large density scale even when exp(x) itself
+            // would round to zero before multiplication.
+            let half = (0.5 * x).exp();
+            (n0 * half) * half
+        } else {
+            n0 * x.exp()
+        };
+        return (density, density / thermal);
+    }
+    // For x >= 55 ln(2), the reciprocal correction 2 exp(-x)
+    // is at most 2^-54: below half an ULP of 1, and even further
+    // below half an ULP of x-ln(2). Avoid both transcendental calls.
+    if x >= 55. * std::f64::consts::LN_2 {
+        return (
+            n0 * (2. * (x - std::f64::consts::LN_2)),
+            2. * (n0 / thermal),
+        );
+    }
+    let b = 0.5 * x.exp();
+    let sum = 1. + b;
+    let logarithm = if x <= 1. { b.ln_1p() } else { sum.ln() };
+    (n0 * (2. * logarithm), (n0 / thermal) * (2. * (b / sum)))
 }
 
 /// Combine the two carrier populations in series, with derivative of
 /// the second population equal to its density divided by thermal voltage.
 /// Ratios avoid forming the product or squared sum of two large densities.
 fn series_density(first: Real, slope: Real, second: Real, thermal: Real) -> (Real, Real) {
+    // Both positive populations can underflow under a reverse gate bias.
+    // Their series density is then below the channel cutoff, not 0/0.
+    if first == 0. && second == 0. {
+        return (0., 0.);
+    }
     let (density, first_fraction, second_fraction) = if first.abs() <= second.abs() {
         let ratio = first / second;
         let fraction = 1. / (1. + ratio);
@@ -750,6 +768,12 @@ mod tests {
         let (density, slope) = super::soft_density(2., 1000., 1.);
         assert_eq!(density, 4. * (1000. - std::f64::consts::LN_2));
         assert_eq!(slope, 4.);
+        // exp(-750) rounds to zero, but the scaled density need not.
+        // Decimal 100-digit evaluation gives 1.9016849634750064e-18.
+        let (density, slope) = super::soft_density(1e308, -750., 1.);
+        let reference = 1.901_684_963_475_006_4e-18;
+        assert!((density / reference - 1.).abs() <= 4. * Real::EPSILON);
+        assert_eq!(slope, density);
     }
 
     #[test]
@@ -763,6 +787,19 @@ mod tests {
         let (density, slope) = super::series_density(1., 2., f64::INFINITY, 0.5);
         assert_eq!(density, 1.);
         assert_eq!(slope, 2.);
+    }
+
+    #[test]
+    fn series_density_has_a_zero_population_limit() {
+        for (first, slope, second) in [(0., 0., 0.), (0., 0., 1.), (1., 2., 0.)] {
+            assert_eq!(series_density(first, slope, second, 0.5), (0., 0.));
+        }
+        // At strong reverse gate bias both exponentials underflow even
+        // with ordinary room-temperature carrier scales.
+        let v = -100.;
+        let (first, slope) = soft_density(1e15, v, 0.026);
+        let second = 1e15 * (v / 0.04).exp();
+        assert_eq!(series_density(first, slope, second, 0.04), (0., 0.));
     }
 
     #[test]

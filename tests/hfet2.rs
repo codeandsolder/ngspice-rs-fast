@@ -207,6 +207,44 @@ fn channel_derivatives_agree_with_central_differences() {
     }
 }
 
+/// Both carrier populations underflow far below cutoff. No current or
+/// small-signal channel derivative may be manufactured by a 0/0 ratio.
+#[test]
+fn both_hfet_levels_have_a_finite_reverse_gate_cutoff() {
+    use ngspice_rs::devices::ModelContext;
+
+    for level in [5, 6] {
+        let c = circuit(&format!(
+            "vd d 0 1\nvg g 0 0\nz1 d g 0 model l=2u w=20u\n\
+             .model model nhfet level={level} eta2=1.5 d2=0.1u del=0 ggr=0"
+        ))
+        .unwrap();
+        let device = c.device("z1").unwrap();
+        let drain = c.nodes().get("d").unwrap();
+        let gate = c.nodes().get("g").unwrap();
+        for key in ["gm", "gds"] {
+            let derivative = device
+                .observation_operating(
+                    key,
+                    &ModelContext::default(),
+                    &|node| {
+                        if node == drain {
+                            1.
+                        } else if node == gate {
+                            -100.
+                        } else {
+                            0.
+                        }
+                    },
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(derivative, 0., "level={level} {key}");
+        }
+    }
+}
+
 /// Check the physical D2 derivative by re-solving the operating point,
 /// independently of the historical 1-ppm forward-difference sensitivity walk.
 /// With matching binary64 inputs, pinned C central differences at 2%, 1%,
