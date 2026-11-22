@@ -18,7 +18,7 @@
 //! [`DeviceDistortion`]: a list of [`DistortionTerm`]s, each a Taylor
 //! polynomial ([`Taylor`]) of a current or charge flowing between two nodes in
 //! up to three [`Control`] voltages. The analysis owns the kernels, the
-//! frequencies and the polynomial evaluation ([`add_products`], C
+//! frequencies and the polynomial evaluation ([`CircuitDistortion::add_products`], C
 //! `dloadfns.c`). Linear devices, which C distorts only through their AC
 //! matrix, return [`DeviceDistortion::Linear`]; independent sources with
 //! `distof1`/`distof2` inputs return [`DeviceDistortion::Input`]. The trait
@@ -88,41 +88,59 @@ impl Control {
         self.unconjugated_in_f1_minus_f2.extend(pairs);
         self
     }
+}
 
-    fn sum_of(pairs: &[[NodeId; 2]], unknowns: &MnaUnknowns, x: &[Complex]) -> Complex {
-        let at = |node: NodeId| {
-            unknowns
-                .node_row(node)
-                .and_then(|row| x.get(row).copied())
-                .unwrap_or(Complex::ZERO)
+/// A control with node identities resolved once, in the original pair order.
+type RowPair = [Option<usize>; 2];
+
+#[derive(Debug)]
+struct BoundControl {
+    pairs: Vec<RowPair>,
+    unconjugated: Vec<RowPair>,
+    minus: Vec<RowPair>,
+}
+
+fn bind_pair(unknowns: &MnaUnknowns, [a, b]: [NodeId; 2]) -> SpiceResult<RowPair> {
+    Ok([unknowns.checked_node_row(a)?, unknowns.checked_node_row(b)?])
+}
+
+impl BoundControl {
+    fn bind(control: Control, unknowns: &MnaUnknowns) -> SpiceResult<Self> {
+        let bind = |pairs: Vec<[NodeId; 2]>| {
+            pairs
+                .into_iter()
+                .map(|pair| bind_pair(unknowns, pair))
+                .collect::<SpiceResult<Vec<_>>>()
         };
+        Ok(Self {
+            pairs: bind(control.pairs)?,
+            unconjugated: bind(control.unconjugated_in_f1_minus_f2)?,
+            minus: bind(control.minus)?,
+        })
+    }
+
+    fn sum_of(pairs: &[RowPair], x: &[Complex]) -> Complex {
+        let at = |row: Option<usize>| row.map_or(Complex::ZERO, |row| x[row]);
         pairs
             .iter()
             .fold(Complex::ZERO, |sum, [a, b]| sum + (at(*a) - at(*b)))
     }
 
-    /// The control's value in the node solution `x` (ground is zero).
-    #[must_use]
-    pub fn value(&self, unknowns: &MnaUnknowns, x: &[Complex]) -> Complex {
-        self.signed(unknowns, x) + Self::sum_of(&self.unconjugated_in_f1_minus_f2, unknowns, x)
-    }
-
-    /// The [`Self::pairs`] sum less the [`Self::minus`] sum.
-    fn signed(&self, unknowns: &MnaUnknowns, x: &[Complex]) -> Complex {
-        let sum = Self::sum_of(&self.pairs, unknowns, x);
+    fn signed(&self, x: &[Complex]) -> Complex {
+        let sum = Self::sum_of(&self.pairs, x);
         if self.minus.is_empty() {
             sum
         } else {
-            sum - Self::sum_of(&self.minus, unknowns, x)
+            sum - Self::sum_of(&self.minus, x)
         }
     }
 
-    /// The control's `H1(-f2)` value from the `H1(f2)` solution `x` in the
-    /// `f1 - f2` product: conjugated, except the
-    /// [`Self::unconjugated_in_f1_minus_f2`] pairs.
-    fn minus_f2_value(&self, unknowns: &MnaUnknowns, x: &[Complex]) -> Complex {
-        self.signed(unknowns, x).conj()
-            + Self::sum_of(&self.unconjugated_in_f1_minus_f2, unknowns, x)
+    fn value(&self, x: &[Complex]) -> Complex {
+        self.signed(x) + Self::sum_of(&self.unconjugated, x)
+    }
+
+    fn minus_f2_value(&self, x: &[Complex]) -> Complex {
+        self.signed(x).conj() + Self::sum_of(&self.unconjugated, x)
     }
 }
 
@@ -206,9 +224,26 @@ impl Taylor {
         ]
     }
 
-    fn is_finite(&self) -> bool {
-        self.second().iter().all(|c| c.2.is_finite())
-            && self.third().iter().all(|c| c.3.is_finite())
+    fn validate(&self, arity: usize) -> SpiceResult<()> {
+        if !self.second().iter().all(|c| c.2.is_finite())
+            || !self.third().iter().all(|c| c.3.is_finite())
+        {
+            return Err(SpiceError::circuit("nonfinite Taylor coefficient"));
+        }
+        if self
+            .second()
+            .iter()
+            .any(|&(i, j, c)| c != 0. && (i >= arity || j >= arity))
+            || self
+                .third()
+                .iter()
+                .any(|&(i, j, k, c)| c != 0. && (i >= arity || j >= arity || k >= arity))
+        {
+            return Err(SpiceError::circuit(
+                "Taylor coefficient refers to an absent control",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -323,70 +358,158 @@ pub enum DeviceDistortion {
     Terms(Vec<DistortionTerm>),
 }
 
-/// What [`crate::devices::Device::distortion`] sees: the converged operating
-/// point (C's `CKTrhsOld` at `D_SETUP`).
+/// A validated operating-point view for device distortion and carried state.
 #[derive(Debug, Clone, Copy)]
 pub struct DistortionContext<'a> {
     /// Circuit/nominal temperature and junction `gmin`.
     pub model_context: &'a ModelContext,
-    /// Node numbering, with ground eliminated.
-    pub unknowns: &'a MnaUnknowns,
-    /// The operating-point solution.
-    pub bias: &'a Vector,
+    unknowns: &'a MnaUnknowns,
+    bias: &'a Vector,
 }
 
-impl DistortionContext<'_> {
-    /// The operating-point voltage of `node`, zero at ground.
-    #[must_use]
-    pub fn voltage(&self, node: NodeId) -> Real {
-        self.unknowns
-            .node_row(node)
-            .and_then(|row| self.bias.get(row))
-            .unwrap_or(0.)
+impl<'a> DistortionContext<'a> {
+    /// Construct a checked operating-point view.
+    ///
+    /// # Errors
+    /// Bias dimensions or values do not match the numbering.
+    pub fn new(
+        model_context: &'a ModelContext,
+        unknowns: &'a MnaUnknowns,
+        bias: &'a Vector,
+    ) -> SpiceResult<Self> {
+        if bias.len() != unknowns.len() || !bias.is_finite() {
+            return Err(SpiceError::circuit(
+                "invalid distortion bias dimensions/values",
+            ));
+        }
+        Ok(Self {
+            model_context,
+            unknowns,
+            bias,
+        })
+    }
+
+    /// The operating-point voltage, zero only for ground.
+    ///
+    /// # Errors
+    /// A non-ground node is not mapped to the operating point.
+    pub fn voltage(&self, node: NodeId) -> SpiceResult<Real> {
+        self.unknowns.checked_node_row(node)?.map_or(Ok(0.), |row| {
+            self.bias.get(row).ok_or_else(|| {
+                SpiceError::circuit(format!("missing bias row for distortion node {node}"))
+            })
+        })
     }
 }
 
-/// Every device's distortion description at the bias: the nonlinear terms of
-/// the whole circuit and the sources' inputs, by source name.
-#[derive(Debug, Clone, Default)]
-pub struct CircuitDistortion {
-    /// All nonlinear terms.
-    pub terms: Vec<DistortionTerm>,
-    /// `(source name, distof1, distof2)` of the sources with an input.
-    pub inputs: Vec<(String, Option<DistortionInput>, Option<DistortionInput>)>,
+/// One validated current/charge term in finalized MNA rows.
+#[derive(Debug)]
+struct BoundTerm {
+    response: Response,
+    rows: RowPair,
+    controls: Vec<BoundControl>,
+    taylor: Taylor,
+    first_order_im3_kernel: bool,
+    charge: Option<Taylor>,
 }
 
-/// Collects [`CircuitDistortion`] at the operating point `bias`.
+impl BoundTerm {
+    fn bind(term: DistortionTerm, unknowns: &MnaUnknowns) -> SpiceResult<Self> {
+        let arity = term.controls.len();
+        if !(1..=3).contains(&arity) {
+            return Err(SpiceError::circuit(
+                "a distortion term needs one to three controls",
+            ));
+        }
+        term.taylor.validate(arity)?;
+        if let Some(charge) = term.charge {
+            if term.response != Response::Current {
+                return Err(SpiceError::circuit(
+                    "folded charge requires a current response",
+                ));
+            }
+            charge.validate(arity)?;
+        }
+        Ok(Self {
+            response: term.response,
+            rows: bind_pair(unknowns, term.nodes)?,
+            controls: term
+                .controls
+                .into_iter()
+                .map(|control| BoundControl::bind(control, unknowns))
+                .collect::<SpiceResult<_>>()?,
+            taylor: term.taylor,
+            first_order_im3_kernel: term.first_order_im3_kernel,
+            charge: term.charge,
+        })
+    }
+
+    fn values(&self, kernel: &[Complex]) -> dloadfns::Values {
+        let mut values = [Complex::ZERO; 3];
+        for (slot, control) in values.iter_mut().zip(&self.controls) {
+            *slot = control.value(kernel);
+        }
+        values
+    }
+
+    fn minus_f2(&self, kernel: &[Complex]) -> dloadfns::Values {
+        let mut values = [Complex::ZERO; 3];
+        for (slot, control) in values.iter_mut().zip(&self.controls) {
+            *slot = control.minus_f2_value(kernel);
+        }
+        values
+    }
+}
+
+/// Bound distortion terms tied to the immutable finalized circuit borrow.
+/// Neither topology nor the bound row interpretation can change while it lives.
+pub struct CircuitDistortion<'a> {
+    circuit: &'a Circuit,
+    terms: Vec<BoundTerm>,
+    inputs: Vec<(String, Option<DistortionInput>, Option<DistortionInput>)>,
+}
+
+impl CircuitDistortion<'_> {
+    /// The source names and their first- and second-tone inputs.
+    #[must_use]
+    pub fn inputs(&self) -> &[(String, Option<DistortionInput>, Option<DistortionInput>)] {
+        &self.inputs
+    }
+
+    /// Number of bound nonlinear terms.
+    #[must_use]
+    pub const fn term_count(&self) -> usize {
+        self.terms.len()
+    }
+}
+
+/// Collect and bind distortion terms once at the operating point.
 ///
 /// # Errors
-/// Stale numbering, a bias of the wrong size, a device whose distortion is
-/// not ported (the [`crate::devices::Device::distortion`] default), invalid
-/// device physics at the bias, or a nonfinite coefficient.
-pub fn circuit_distortion(
-    circuit: &Circuit,
+/// Stale numbering, invalid bias/device physics, unsupported distortion,
+/// invalid node identities, control arity, or Taylor/input coefficients.
+pub fn circuit_distortion<'a>(
+    circuit: &'a Circuit,
     context: &ModelContext,
     bias: &Vector,
-) -> SpiceResult<CircuitDistortion> {
-    if bias.len() != circuit.unknown_count() || !bias.is_finite() {
-        return Err(SpiceError::circuit(
-            "invalid distortion bias dimensions/values",
-        ));
-    }
-    let mut result = CircuitDistortion::default();
-    let distortion_context = DistortionContext {
-        model_context: context,
-        unknowns: circuit.unknowns(),
-        bias,
+) -> SpiceResult<CircuitDistortion<'a>> {
+    circuit.check_numbering()?;
+    let mut result = CircuitDistortion {
+        circuit,
+        terms: Vec::new(),
+        inputs: Vec::new(),
     };
-    // CKTdisto visits the devices in CKTload order, which fixes the order the
-    // terms accumulate into each right-hand-side entry.
+    let distortion_context = DistortionContext::new(context, circuit.unknowns(), bias)?;
+    // CKTdisto visits the devices in CKTload order.
     for index in circuit.load_order() {
         let device = &circuit.devices()[index];
         match device.distortion(&distortion_context)? {
             DeviceDistortion::Linear => {}
             DeviceDistortion::Input { f1, f2 } => {
                 let finite = |input: Option<DistortionInput>| {
-                    input.is_none_or(|i| i.magnitude.is_finite() && i.phase.is_finite())
+                    input.is_none_or(|i| {
+                        i.magnitude.is_finite() && i.phase.is_finite() && i.phasor().is_finite()
+                    })
                 };
                 if !finite(f1) || !finite(f2) {
                     return Err(SpiceError::circuit(format!(
@@ -400,18 +523,9 @@ pub fn circuit_distortion(
             }
             DeviceDistortion::Terms(terms) => {
                 for term in terms {
-                    if term.controls.is_empty() || term.controls.len() > 3 {
-                        return Err(SpiceError::circuit(format!(
-                            "{}: a distortion term needs one to three controls",
-                            device.name()
-                        )));
-                    }
-                    if !term.taylor.is_finite() || !term.charge.is_none_or(|c| c.is_finite()) {
-                        return Err(SpiceError::Numerical {
-                            context: format!("distortion of {}", device.name()),
-                            message: "nonfinite Taylor coefficient".into(),
-                        });
-                    }
+                    let term = BoundTerm::bind(term, circuit.unknowns()).map_err(|error| {
+                        SpiceError::circuit(format!("distortion of {}: {error}", device.name()))
+                    })?;
                     result.terms.push(term);
                 }
             }
@@ -420,33 +534,109 @@ pub fn circuit_distortion(
     Ok(result)
 }
 
-/// The higher-order response being solved for (C's `D_TWOF1` ... modes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Product {
-    /// `2 f1`: second-order kernel `H2(f1, f1)`.
-    TwoF1,
-    /// `3 f1`: third-order kernel `H3(f1, f1, f1)`.
-    ThreeF1,
-    /// `f1 + f2`: `H2(f1, f2)`.
-    F1PlusF2,
-    /// `f1 - f2`: `H2(f1, -f2)`.
-    F1MinusF2,
-    /// `2 f1 - f2`: `H3(f1, f1, -f2)`.
-    TwoF1MinusF2,
+/// Exactly the lower-order kernels required for one higher-order product.
+/// Missing kernels are unrepresentable.
+#[derive(Debug, Clone, Copy)]
+pub enum Product<'a> {
+    /// Second harmonic.
+    TwoF1 {
+        /// H1(f1).
+        h1: &'a [Complex],
+    },
+    /// Third harmonic.
+    ThreeF1 {
+        /// H1(f1).
+        h1: &'a [Complex],
+        /// H2(f1,f1).
+        h2: &'a [Complex],
+    },
+    /// Sum-frequency intermodulation.
+    F1PlusF2 {
+        /// H1(f1).
+        h1: &'a [Complex],
+        /// H1(f2).
+        h1_f2: &'a [Complex],
+    },
+    /// Difference-frequency intermodulation.
+    F1MinusF2 {
+        /// H1(f1).
+        h1: &'a [Complex],
+        /// H1(f2), conjugated according to the control's C semantics.
+        h1_f2: &'a [Complex],
+    },
+    /// Third-order intermodulation.
+    TwoF1MinusF2 {
+        /// H1(f1).
+        h1: &'a [Complex],
+        /// H1(f2).
+        h1_f2: &'a [Complex],
+        /// H2(f1,f1).
+        h2: &'a [Complex],
+        /// H2(f1,-f2).
+        h2_minus: &'a [Complex],
+    },
 }
 
-/// The lower-order kernels a [`Product`] is built from: node solutions of
-/// the earlier solves at the same `f1`.
-#[derive(Debug, Clone, Copy)]
-pub struct Kernels<'a> {
-    /// `H1(f1)`.
-    pub h1: &'a [Complex],
-    /// `H1(f2)` (the IM products; conjugated for `-f2` by [`add_products`]).
-    pub h1_f2: Option<&'a [Complex]>,
-    /// `H2(f1, f1)` (`3 f1` and `2 f1 - f2`).
-    pub h2: Option<&'a [Complex]>,
-    /// `H2(f1, -f2)` (`2 f1 - f2`).
-    pub h2_minus: Option<&'a [Complex]>,
+impl Product<'_> {
+    fn validate(self, n: usize) -> SpiceResult<()> {
+        let check = |kernel: &[Complex]| {
+            if kernel.len() != n {
+                return Err(SpiceError::circuit("distortion kernel size"));
+            }
+            if !kernel.iter().all(|value| value.is_finite()) {
+                return Err(SpiceError::circuit("nonfinite distortion kernel"));
+            }
+            Ok(())
+        };
+        match self {
+            Self::TwoF1 { h1 } => check(h1),
+            Self::ThreeF1 { h1, h2 } => {
+                check(h1)?;
+                check(h2)
+            }
+            Self::F1PlusF2 { h1, h1_f2 } | Self::F1MinusF2 { h1, h1_f2 } => {
+                check(h1)?;
+                check(h1_f2)
+            }
+            Self::TwoF1MinusF2 {
+                h1,
+                h1_f2,
+                h2,
+                h2_minus,
+            } => {
+                check(h1)?;
+                check(h1_f2)?;
+                check(h2)?;
+                check(h2_minus)
+            }
+        }
+    }
+
+    fn values(self, term: &BoundTerm) -> KernelValues {
+        match self {
+            Self::TwoF1 { h1 } => KernelValues::TwoF1(term.values(h1)),
+            Self::ThreeF1 { h1, h2 } => KernelValues::ThreeF1(term.values(h1), term.values(h2)),
+            Self::F1PlusF2 { h1, h1_f2 } => KernelValues::F12(term.values(h1), term.values(h1_f2)),
+            Self::F1MinusF2 { h1, h1_f2 } => {
+                KernelValues::F12(term.values(h1), term.minus_f2(h1_f2))
+            }
+            Self::TwoF1MinusF2 {
+                h1,
+                h1_f2,
+                h2,
+                h2_minus,
+            } => {
+                let x = term.values(h1);
+                let b = term.values(h1_f2).map(Complex::conj);
+                let x2 = if term.first_order_im3_kernel {
+                    x
+                } else {
+                    term.values(h2)
+                };
+                KernelValues::TwoF1MinusF2(x, b, x2, term.values(h2_minus))
+            }
+        }
+    }
 }
 
 /// A term's control values in the kernels a [`Product`] reads.
@@ -473,108 +663,75 @@ impl KernelValues {
     }
 }
 
-/// Adds every term's contribution to `rhs` for `product` (C `DEVdisto` with
-/// the `dloadfns.c` polynomial evaluators, [`dloadfns`]): with `X`, `B`,
-/// `X2`, `M` the control values in `H1(f1)`, `H1(+-f2)`, `H2(f1,f1)` and
-/// `H2(f1,-f2)`,
-///
-/// | product | value of `c_ij v_i v_j` / `c_ijk v_i v_j v_k` |
-/// | --- | --- |
-/// | `2f1` | `X_i X_j` / 0 |
-/// | `3f1` | `X_i X2_j + X_j X2_i` / `X_i X_j X_k` |
-/// | `f1 +- f2` | `(X_i B_j + X_j B_i) / 2` / 0 |
-/// | `2f1 - f2` | `(2 (X_i M_j + X_j M_i) + B_i X2_j + B_j X2_i) / 3` / `(X_i X_j B_k + X_i X_k B_j + X_j X_k B_i) / 3` |
-///
-/// A charge's value is multiplied by `j omega`, `omega` being the response's
-/// angular frequency (negative for `f1 - f2` below `f2`, as in C). The sums
-/// are evaluated in C's operand order and grouping, so the right-hand side
-/// rounds exactly as C's does.
-///
-/// # Errors
-/// A kernel the product needs is missing, or `rhs` has the wrong size.
-pub fn add_products(
-    terms: &[DistortionTerm],
-    product: Product,
-    kernels: Kernels<'_>,
-    omega: Real,
-    unknowns: &MnaUnknowns,
-    rhs: &mut [Complex],
-) -> SpiceResult<()> {
-    let missing = || SpiceError::circuit("distortion kernel missing for this product");
-    if rhs.len() != kernels.h1.len() {
-        return Err(SpiceError::circuit("distortion right-hand side size"));
+impl CircuitDistortion<'_> {
+    /// Adds every term's contribution to `rhs` for `product` (C `DEVdisto` with
+    /// the `dloadfns.c` polynomial evaluators, [`dloadfns`]): with `X`, `B`,
+    /// `X2`, `M` the control values in `H1(f1)`, `H1(+-f2)`, `H2(f1,f1)` and
+    /// `H2(f1,-f2)`,
+    ///
+    /// | product | value of `c_ij v_i v_j` / `c_ijk v_i v_j v_k` |
+    /// | --- | --- |
+    /// | `2f1` | `X_i X_j` / 0 |
+    /// | `3f1` | `X_i X2_j + X_j X2_i` / `X_i X_j X_k` |
+    /// | `f1 +- f2` | `(X_i B_j + X_j B_i) / 2` / 0 |
+    /// | `2f1 - f2` | `(2 (X_i M_j + X_j M_i) + B_i X2_j + B_j X2_i) / 3` / `(X_i X_j B_k + X_i X_k B_j + X_j X_k B_i) / 3` |
+    ///
+    /// A charge's value is multiplied by `j omega`, `omega` being the response's
+    /// angular frequency (negative for `f1 - f2` below `f2`, as in C). The sums
+    /// are evaluated in C's operand order and grouping, so the right-hand side
+    /// rounds exactly as C's does.
+    ///
+    /// # Errors
+    /// Invalid kernel/RHS dimensions, nonfinite inputs, or nonfinite frequency.
+    pub fn add_products(
+        &self,
+        product: Product<'_>,
+        omega: Real,
+        rhs: &mut [Complex],
+    ) -> SpiceResult<()> {
+        let n = self.circuit.unknown_count();
+        if rhs.len() != n || !rhs.iter().all(|value| value.is_finite()) {
+            return Err(SpiceError::circuit(
+                "invalid distortion right-hand side dimensions/values",
+            ));
+        }
+        if !omega.is_finite() {
+            return Err(SpiceError::circuit(
+                "nonfinite distortion angular frequency",
+            ));
+        }
+        product.validate(n)?;
+        // No validation or node lookups remain in the stamping loop.
+        for term in &self.terms {
+            let inputs = product.values(term);
+            let value = inputs.evaluate(&term.taylor);
+            // A charge's current is `j omega` times its polynomial: C's `temp =
+            // -omega * DFi(...)`, `itemp = omega * DFn(...)`.
+            let (mut temp, mut itemp) = match term.response {
+                Response::Current => (value.re, value.im),
+                Response::Charge => (-omega * value.im, omega * value.re),
+            };
+            if let Some(charge) = &term.charge {
+                // diodisto.c: `temp += -omega * D1i(...)`, `itemp += omega *
+                // D1n(...)` onto the junction current's polynomial.
+                let charge = inputs.evaluate(charge);
+                let charge_real = -omega * charge.im;
+                let charge_imag = omega * charge.re;
+                temp += charge_real;
+                itemp += charge_imag;
+            }
+            let [a, b] = term.rows;
+            if let Some(row) = a {
+                rhs[row].re -= temp;
+                rhs[row].im -= itemp;
+            }
+            if let Some(row) = b {
+                rhs[row].re += temp;
+                rhs[row].im += itemp;
+            }
+        }
+        Ok(())
     }
-    let need = |kernel: Option<&[Complex]>| -> SpiceResult<Option<()>> {
-        match kernel {
-            Some(k) if k.len() == rhs.len() => Ok(Some(())),
-            Some(_) => Err(SpiceError::circuit("distortion kernel size")),
-            None => Ok(None),
-        }
-    };
-    need(kernels.h1_f2)?;
-    need(kernels.h2)?;
-    need(kernels.h2_minus)?;
-    for term in terms {
-        let values = |kernel: &[Complex]| -> dloadfns::Values {
-            let mut v = [Complex::ZERO; 3];
-            for (slot, control) in v.iter_mut().zip(&term.controls) {
-                *slot = control.value(unknowns, kernel);
-            }
-            v
-        };
-        let minus_f2 = |kernel: &[Complex]| -> dloadfns::Values {
-            let mut v = [Complex::ZERO; 3];
-            for (slot, control) in v.iter_mut().zip(&term.controls) {
-                *slot = control.minus_f2_value(unknowns, kernel);
-            }
-            v
-        };
-        let x = values(kernels.h1);
-        let inputs = match product {
-            Product::TwoF1 => KernelValues::TwoF1(x),
-            Product::ThreeF1 => KernelValues::ThreeF1(x, values(kernels.h2.ok_or_else(missing)?)),
-            Product::F1PlusF2 => KernelValues::F12(x, values(kernels.h1_f2.ok_or_else(missing)?)),
-            Product::F1MinusF2 => {
-                KernelValues::F12(x, minus_f2(kernels.h1_f2.ok_or_else(missing)?))
-            }
-            Product::TwoF1MinusF2 => {
-                let b = values(kernels.h1_f2.ok_or_else(missing)?).map(Complex::conj);
-                let x2 = if term.first_order_im3_kernel {
-                    x
-                } else {
-                    values(kernels.h2.ok_or_else(missing)?)
-                };
-                let m = values(kernels.h2_minus.ok_or_else(missing)?);
-                KernelValues::TwoF1MinusF2(x, b, x2, m)
-            }
-        };
-        let value = inputs.evaluate(&term.taylor);
-        // A charge's current is `j omega` times its polynomial: C's `temp =
-        // -omega * DFi(...)`, `itemp = omega * DFn(...)`.
-        let (mut temp, mut itemp) = match term.response {
-            Response::Current => (value.re, value.im),
-            Response::Charge => (-omega * value.im, omega * value.re),
-        };
-        if let Some(charge) = &term.charge {
-            // diodisto.c: `temp += -omega * D1i(...)`, `itemp += omega *
-            // D1n(...)` onto the junction current's polynomial.
-            let charge = inputs.evaluate(charge);
-            let charge_real = -omega * charge.im;
-            let charge_imag = omega * charge.re;
-            temp += charge_real;
-            itemp += charge_imag;
-        }
-        let [a, b] = term.nodes;
-        if let Some(row) = unknowns.node_row(a) {
-            rhs[row].re -= temp;
-            rhs[row].im -= itemp;
-        }
-        if let Some(row) = unknowns.node_row(b) {
-            rhs[row].re += temp;
-            rhs[row].im += itemp;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
