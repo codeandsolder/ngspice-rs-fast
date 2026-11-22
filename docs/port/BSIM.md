@@ -333,6 +333,21 @@ terms of use, which allow modified redistribution with attribution (see
   an `off` instance is skipped) reads the last load's members and C's
   `CKTrhsOld`. The device keeps that struct and shares it with its
   `.dc @inst[param]` stand-ins.
+- **Typed, ordered setup (#74).** Model preparation produces an immutable
+  model-only prototype after independent defaults, selector normalization and
+  dependent-default stages. The schema generator identifies 733 unconditional
+  literal assignments from the pinned C model loop, checks the verified
+  field/given pairs, exact numeric bits and absence of preceding member
+  dependencies, and emits direct typed assignments. The public 777-literal
+  fact table still includes conditional/selector defaults; those are not
+  blindly applied. Given bits and explicitly supplied values are untouched
+  by the independent stage. Dependent L/W/P leakage precedence, polarity,
+  geometry and source-to-drain expressions remain explicit in C order.
+  Prepared instances choose series, gate, body and NQS nodes before
+  applying all aliases and returning node-creation requests in C order.
+  Both setup stages are infallible after input/temperature validation.
+  The instance ownership generator follows production Rust module declarations
+  (including split load phases) at runtime and excludes test-only modules.
 - **Setup once, check once.** `BSIM4setup` runs once; later `BSIM4temp`
   passes (another temperature, `.dc temp`, an instance-parameter point) work
   on the structs as left and skip `BSIM4checkModel`, whose `static` model

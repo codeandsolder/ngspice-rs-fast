@@ -85,6 +85,157 @@ fn rust_name(c_name: &str) -> String {
     }
 }
 
+/// Brace depth of setup source lines, ignoring braces in quoted C strings
+/// and character literals. The source has already had block comments removed.
+fn setup_depths(lines: &[&str]) -> Result<Vec<usize>, String> {
+    let mut depth = 0_usize;
+    let mut depths = Vec::with_capacity(lines.len());
+    let mut quote = None;
+    let mut escaped = false;
+    for line in lines {
+        depths.push(depth);
+        for byte in line.bytes() {
+            if let Some(end) = quote {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == end {
+                    quote = None;
+                }
+            } else {
+                match byte {
+                    b'"' | b'\'' => quote = Some(byte),
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth = depth
+                            .checked_sub(1)
+                            .ok_or("unbalanced BSIM4 setup braces")?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(depths)
+}
+
+/// Whole-identifier member references in one cleaned C source line.
+fn model_members(line: &str) -> impl Iterator<Item = &str> {
+    line.split("model->").skip(1).map(|tail| {
+        let end = tail
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(tail.len());
+        &tail[..end]
+    })
+}
+
+/// Extract only independent model defaults. A literal within a selector
+/// fallback or another conditional branch is not an unconditional fact.
+/// The complete reviewed member count is checked before emitting typed code.
+pub(super) fn independent_defaults(
+    header: &str,
+    setup: &str,
+    facts: &[super::ifparm::LiteralDefault],
+) -> Result<String, String> {
+    let clean = super::ifparm::strip_comments(setup)?;
+    let end = clean
+        .find("for (here = BSIM4instances")
+        .ok_or("missing BSIM4 instance boundary")?;
+    let lines: Vec<_> = clean[..end]
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let depths = setup_depths(&lines)?;
+    let header = super::ifparm::strip_comments(header)?;
+    let model = members(&header, "typedef struct sBSIM4model\n{", "} BSIM4model")?;
+    let mut out = String::from(
+        "\nuse super::fields::Model;\n\n/// Independent given-guarded defaults, extracted from the model-loop body.\n#[rustfmt::skip]\n#[expect(clippy::too_many_lines, reason = \"generated typed field assignments; no handwritten physics\")]\npub(super) const fn apply_independent_defaults(m: &mut Model) {\n",
+    );
+    let mut seen = BTreeSet::new();
+    let mut prior_members = BTreeSet::new();
+    for (index, triple) in lines.windows(3).enumerate() {
+        if index > 0 {
+            prior_members.extend(model_members(lines[index - 1]));
+        }
+        // The first statement is a direct child of the outer model loop.
+        // Require a completed predecessor, excluding unbraced nested ifs.
+        if depths[index] != 2
+            || index == 0
+            || !lines[index - 1].ends_with([';', '{', '}'])
+            || triple[2].starts_with("else")
+        {
+            continue;
+        }
+        let Some(given) = triple[0]
+            .strip_prefix("if (!model->")
+            .and_then(|s| s.strip_suffix(')'))
+        else {
+            continue;
+        };
+        let Some((field, literal)) = triple[1]
+            .strip_prefix("model->")
+            .and_then(|s| s.split_once('='))
+        else {
+            continue;
+        };
+        let field = field.trim();
+        let Some(value) = literal
+            .trim()
+            .strip_suffix(';')
+            .and_then(|s| s.trim().parse::<f64>().ok())
+        else {
+            continue;
+        };
+        // Hoisting is safe only if the destination and controlling given
+        // bit have not been referenced earlier. New dependencies require review.
+        if prior_members.contains(field) || prior_members.contains(given) {
+            return Err(format!("BSIM4 default no longer independent: {field}"));
+        }
+        let fact = facts
+            .iter()
+            .find(|fact| fact.field == field && fact.given == given)
+            .ok_or_else(|| {
+                format!("BSIM4 independent default without verified schema fact: {field}")
+            })?;
+        if value.to_bits() != fact.value.to_bits() || !seen.insert(field) {
+            return Err(format!("inconsistent BSIM4 independent default: {field}"));
+        }
+        let member = model
+            .iter()
+            .find(|member| member.c_name == field)
+            .ok_or_else(|| format!("missing BSIM4 member {field}"))?;
+        let literal = match member.kind {
+            "f64" => fact.formatted(),
+            "i32" => literal
+                .trim()
+                .strip_suffix(';')
+                .ok_or("missing semicolon")?
+                .trim()
+                .parse::<i32>()
+                .map_err(|e| e.to_string())?
+                .to_string(),
+            kind => return Err(format!("unexpected BSIM4 literal destination type {kind}")),
+        };
+        writeln!(
+            out,
+            "    if !m.{} {{ m.{} = {literal}; }}",
+            rust_name(given),
+            rust_name(field)
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if seen.len() != 733 {
+        return Err(format!(
+            "BSIM4 independent default count changed: {} (expected 733); review dependency ordering",
+            seen.len()
+        ));
+    }
+    out.push_str("}\n");
+    Ok(out)
+}
+
 fn emit_struct(
     out: &mut String,
     name: &str,
@@ -324,63 +475,121 @@ impl<'ast> Visit<'ast> for InstanceWrites<'_> {
     }
 }
 
-fn instance_writes(source: &str, owner: &str) -> Result<BTreeSet<String>, String> {
-    let syntax = syn::parse_file(source).map_err(|error| error.to_string())?;
+fn test_only(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("test")
+            || (attr.path().is_ident("cfg")
+                && attr
+                    .parse_args::<syn::Ident>()
+                    .is_ok_and(|ident| ident == "test"))
+    })
+}
+
+/// Resolve the same module tree Rust compiles, excluding test-only branches.
+/// Reading at generator runtime also avoids embedding the build checkout path.
+fn source_writes(path: &std::path::Path, visitor: &mut InstanceWrites<'_>) -> Result<(), String> {
+    let source =
+        std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let syntax = syn::parse_file(&source).map_err(|err| format!("{}: {err}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or("module source lacks parent directory")?;
+    let stem = path.file_stem().ok_or("module source lacks file stem")?;
+    let module_dir = if stem == "mod" {
+        parent.to_path_buf()
+    } else {
+        parent.join(stem)
+    };
+    item_writes(&syntax.items, parent, &module_dir, visitor)
+}
+
+fn item_writes(
+    items: &[syn::Item],
+    source_dir: &std::path::Path,
+    module_dir: &std::path::Path,
+    visitor: &mut InstanceWrites<'_>,
+) -> Result<(), String> {
+    for item in items {
+        match item {
+            syn::Item::Fn(function) if !test_only(&function.attrs) => {
+                visitor.visit_item_fn(function);
+            }
+            syn::Item::Mod(module) if !test_only(&module.attrs) => {
+                let name = module.ident.to_string();
+                if let Some((_, children)) = &module.content {
+                    let child_dir = module_dir.join(&name);
+                    item_writes(children, &child_dir, &child_dir, visitor)?;
+                    continue;
+                }
+                let explicit = module
+                    .attrs
+                    .iter()
+                    .find(|attr| attr.path().is_ident("path"));
+                let path = if let Some(attr) = explicit {
+                    let syn::Meta::NameValue(value) = &attr.meta else {
+                        return Err(format!("invalid path attribute on {name}"));
+                    };
+                    let Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(path),
+                        ..
+                    }) = &value.value
+                    else {
+                        return Err(format!("nonliteral path attribute on {name}"));
+                    };
+                    source_dir.join(path.value())
+                } else {
+                    let flat = module_dir.join(format!("{name}.rs"));
+                    let nested = module_dir.join(&name).join("mod.rs");
+                    match (flat.is_file(), nested.is_file()) {
+                        (true, false) => flat,
+                        (false, true) => nested,
+                        _ => {
+                            return Err(format!(
+                                "missing or ambiguous BSIM4 module {name} under {}",
+                                module_dir.display()
+                            ));
+                        }
+                    }
+                };
+                source_writes(&path, visitor)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn instance_writes(path: &std::path::Path, owner: &str) -> Result<BTreeSet<String>, String> {
     let mut visitor = InstanceWrites {
         owner,
         fields: BTreeSet::new(),
     };
-    // Only the production routines participate in the projection; nested
-    // test/verification modules construct their own unrelated instances.
-    for item in &syntax.items {
-        if let syn::Item::Fn(function) = item {
-            visitor.visit_item_fn(function);
-        }
-    }
+    source_writes(path, &mut visitor)?;
     Ok(visitor.fields)
 }
 
-fn emit_instance_ownership(out: &mut String, fields: &[Field]) -> Result<(), String> {
+fn emit_instance_ownership(
+    root: &std::path::Path,
+    out: &mut String,
+    fields: &[Field],
+) -> Result<(), String> {
+    let device = root.join("src/devices/bsim4");
     let phases = [
         (
             "SETUP_WRITES",
-            instance_writes(
-                include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../src/devices/bsim4/set.rs"
-                )),
-                "h",
-            )?,
+            instance_writes(&device.join("set.rs"), "h")?,
         ),
         (
             "TEMPERATURE_WRITES",
-            instance_writes(
-                include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../src/devices/bsim4/temp.rs"
-                )),
-                "h",
-            )?,
+            instance_writes(&device.join("temp.rs"), "h")?,
         ),
         (
             "CHECK_WRITES",
-            instance_writes(
-                include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../src/devices/bsim4/check.rs"
-                )),
-                "h",
-            )?,
+            instance_writes(&device.join("check.rs"), "h")?,
         ),
         (
             "LOAD_WRITES",
-            instance_writes(
-                include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../src/devices/bsim4/load.rs"
-                )),
-                "here",
-            )?,
+            instance_writes(&device.join("load.rs"), "here")?,
         ),
     ];
     let known: BTreeSet<_> = fields
@@ -444,7 +653,11 @@ fn emit_instance_ownership(out: &mut String, fields: &[Field]) -> Result<(), Str
 }
 
 /// The generated `fields.rs` text.
-pub(super) fn fields(header: &str, revision: &str) -> Result<String, String> {
+pub(super) fn fields(
+    root: &std::path::Path,
+    header: &str,
+    revision: &str,
+) -> Result<String, String> {
     let header = super::ifparm::strip_comments(header)?;
     let instance = members(
         &header,
@@ -480,22 +693,40 @@ pub(super) fn fields(header: &str, revision: &str) -> Result<String, String> {
     emit_struct(&mut out, "Model", "struct sBSIM4model", &model)?;
     emit_struct(&mut out, "SizeParam", "struct bsim4SizeDependParam", &size)?;
     emit_struct(&mut out, "Instance", "struct sBSIM4instance", &instance)?;
-    emit_instance_ownership(&mut out, &instance)?;
+    emit_instance_ownership(root, &mut out, &instance)?;
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{instance_writes, real_asks};
+    use super::{InstanceWrites, instance_writes, item_writes, real_asks};
 
     #[test]
     fn ownership_includes_conditional_and_compound_writes_but_not_reads() {
-        let source = r#"fn f() { if h.read == 1 { h.a = 0; h.b += 1; f(&mut h.c); } /* h.fake = 0; */ let _ = "h.fake = 0"; (h.d, h.e) = (1, 2); }"#;
-        let writes = instance_writes(source, "h").unwrap();
+        let source = r#"fn f() { if h.read == 1 { h.a = 0; h.b += 1; f(&mut h.c); } /* h.fake = 0; */ let _ = "h.fake = 0"; (h.d, h.e) = (1, 2); } mod nested { fn f() { h.f = 1; } } #[cfg(test)] mod hidden { fn f() { h.test_only = 1; } } #[cfg(test)] mod missing_test_file;"#;
+        let syntax = syn::parse_file(source).unwrap();
+        let mut visitor = InstanceWrites {
+            owner: "h",
+            fields: Default::default(),
+        };
+        let path = std::path::Path::new(".");
+        item_writes(&syntax.items, path, path, &mut visitor).unwrap();
+        let writes = visitor.fields;
         assert_eq!(
             writes.into_iter().collect::<Vec<_>>(),
-            ["a", "b", "c", "d", "e"]
+            ["a", "b", "c", "d", "e", "f"]
         );
+    }
+
+    #[test]
+    fn nested_production_modules_do_not_lose_load_writes() {
+        // Exercise the real split module graph as well as inline test exclusion.
+        let root = super::super::workspace_root();
+        let load = root.join("src/devices/bsim4/load.rs");
+        let writes = instance_writes(&load, "here").unwrap();
+        assert!(writes.contains("cgdo"));
+        assert!(writes.contains("cgso"));
+        assert!(writes.contains("gm"));
     }
 
     #[test]
