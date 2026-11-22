@@ -58,7 +58,8 @@ use crate::analysis::fourier::{self, FourierAnalysis};
 use crate::analysis::measure::{self, Measurement};
 use crate::analysis::selection::Selection;
 use crate::analysis::{
-    Plot, PointSink, RawFileWriter, RawFormat, RawPlot, RunConfig, StreamedPlot, runner,
+    BinaryByteOrder, Plot, PointSink, RawFileWriter, RawFormat, RawPlot, RunConfig, StreamedPlot,
+    runner,
 };
 use crate::netlist::eval::ParamScope;
 use crate::netlist::{ParsedDeck, Parser};
@@ -567,7 +568,7 @@ impl PendingRawfile {
                 ),
             ));
         }
-        let writer = RawFileWriter::create(&temporary, format)?;
+        let writer = RawFileWriter::create(&temporary, format, BinaryByteOrder::LittleEndian)?;
         let mut spool = temporary.clone().into_os_string();
         spool.push(".points");
         Ok(Self {

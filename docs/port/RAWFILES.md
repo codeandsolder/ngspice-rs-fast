@@ -9,8 +9,8 @@ Route map:
 
 | Item | Where |
 | --- | --- |
-| ASCII parse/write (frozen behaviour) | `src/analysis/rawfile/mod.rs` |
-| Binary codec, format detection, byte order | `src/analysis/rawfile/binary.rs` |
+| Shared header, ASCII values, buffered plot rows | `src/analysis/rawfile/mod.rs` |
+| Binary cells and byte order | `src/analysis/rawfile/binary.rs` |
 | Hand-built byte-buffer tests | `tests/binary_rawfiles.rs` |
 | Opt-in live-C cross-check (`#[ignore]`) | `tests/c_binary_rawfile_reference.rs` |
 | ASCII conformance against committed goldens | `tests/golden_rawfiles.rs`, `cargo xtask golden verify` |
@@ -70,10 +70,10 @@ The payload is point-major and unaligned; it starts at the byte after the
 Byte order is the writing machine's: `raw_write()` stores each value with a plain
 `fwrite(&dd, sizeof(double), 1, fp)` (`rawfile.c:232` for a real plot, `:234-238`
 for a real vector inside a complex plot, `:241-244` for a complex vector), so the
-file records nothing about its order. The port reads and writes
-little-endian (x86-64 and aarch64, the platforms it builds on) and exposes
-`BinaryByteOrder::BigEndian` / `RawFileReader::with_byte_order` for a file from a
-big-endian machine. Endianness is never guessed: a big-endian file read with the
+file records nothing about its order. Little-endian is the default for reads
+and in-memory binary encoding; file and streamed writers take an explicit byte
+order. Use `BinaryByteOrder::BigEndian` and `RawFileReader::with_byte_order` for a
+file from a big-endian machine. Endianness is never guessed: a big-endian file read with the
 default produces other values, one 8-byte group at a time, not an error.
 
 The padding rule is `raw_write()`'s: when a vector is shorter than
@@ -113,20 +113,21 @@ data and the scale is compared by real part only.
 // Detect the encoding, or select it.
 let format = RawFormat::detect(&bytes)?;                  // Ascii | Binary
 let rawfile = RawFile::parse_bytes(&bytes)?;              // detection + read
-let rawfile = RawFile::load(path)?;                       // reads bytes, both forms
-let rawfile = RawFileReader::new(&bytes)
-    .with_format(RawFormat::Binary)                       // skip detection
+let rawfile = RawFile::load(path)?;                       // buffered decoding
+let rawfile = RawFileReader::new(bytes.as_slice())
+    .with_format(RawFormat::Binary)                       // require binary plots
     .with_byte_order(BinaryByteOrder::BigEndian)          // explicit order
     .read()?;
 
 // Write either encoding.
-rawfile.write_with_format(path, RawFormat::Binary)?;      // == to_binary()
-rawfile.write_with_format(path, RawFormat::Ascii)?;       // == to_ascii()
+rawfile.write_with_format(path, RawFormat::Binary, BinaryByteOrder::LittleEndian)?;
+rawfile.write(path)?;                                    // ASCII
+let text = rawfile.to_ascii()?;
 let bytes = rawfile.to_binary()?;                         // little-endian
 let bytes = rawfile.to_binary_with(BinaryByteOrder::BigEndian)?;
 
 // Write plot by plot; a streamed plot spools its points until its count is known.
-let mut writer = RawFileWriter::create(path, RawFormat::Binary)?;
+let mut writer = RawFileWriter::create(path, RawFormat::Binary, BinaryByteOrder::LittleEndian)?;
 writer.write_plot(&raw_plot)?;                            // a finished plot
 let mut streamed = writer.begin_plot(header, spool_path)?; // header: no points
 streamed.push_point(&values)?;                            // one row at a time
@@ -142,8 +143,9 @@ instead of being patched in place as C's batch writer (`outitf.c`) does.
 
 `RawFile::parse` still sees text only and still refuses a binary file; binary
 bytes never pass through `str` beyond the (text) header, and the header is the
-same text the ASCII form carries. Detection is a byte scan for the first
-`Values:` or `Binary:` line, so a payload is never inspected as text.
+same text the ASCII form carries. The decoder parses each header once, choosing the format from its section
+marker. Binary payload bytes never enter the text decoder. `RawFormat::detect`
+uses the same validated header parser without consuming the payload.
 
 The header renderer is shared (`render_header`), so a binary file's header is
 byte-identical to the ASCII file's header for the same plot. `to_binary()` of a
@@ -154,22 +156,37 @@ that file was already in this canonical form: per-variable options are dropped
 a batch-written file parses correctly but re-renders canonically rather than
 byte for byte.
 
-## Validation before allocation
+## Incremental decoding and validation
 
-For a binary plot the codec computes the payload length with checked
-multiplication and refuses the plot before allocating anything when
+For both formats, a single header parser validates the declared shape. Binary
+payload length is calculated with checked multiplication; overflow and
+`unpadded` binary plots are rejected before decoding the rows. Variable metadata
+grows only as actual variable lines are read. The collecting reader allocates
+rows as they are decoded, not according to the declared point count. A
+truncated binary payload reports the total required and actually consumed bytes.
 
-- `No. Points x No. Variables x width` overflows a `usize` ("overflows a usize");
-- the result exceeds the bytes remaining in the file ("truncated binary rawfile:
-  … needs N byte(s) of data, but only M byte(s) remain");
-- the `Flags:` line carries `unpadded`;
-- a declared `No. Variables:` is larger than the number of lines the file
-  actually holds (the variable list grows as lines are read, so a bogus count
-  cannot request a huge allocation).
+To process large files without retaining either the source file or the plot's
+complete payload, use the lending row decoder:
 
-Only after that does the reader allocate `No. Points` rows. The ASCII reader's
-behaviour is unchanged, including its historical habit of preallocating from a
-declared count; the port does not yet validate ASCII counts the same way.
+```rust
+let mut reader = RawFileReader::new(std::io::BufReader::new(std::fs::File::open(path)?));
+while let Some(mut rows) = reader.next_plot()? {
+    while let Some(row) = rows.next_row()? {
+        // Consume the borrowed row before requesting the next one.
+        process(row);
+    }
+    let metadata = rows.finish()?;
+    // ASCII complex column flags are fully inferred only at this point.
+    process_metadata(&metadata);
+}
+```
+
+The reader reuses a row buffer. Finishing a plot is required before requesting
+another; abandoned or failed decoders cannot silently advance into a payload.
+All encoders validate row width against the variable schema, including in-memory
+ASCII output. ASCII cells are formatted directly through a bounded stack buffer,
+with the same scientific rounding and exponent spelling as before. Streaming
+and stored encoders share the exact header and row rendering paths.
 
 ## Rejected variants
 
@@ -252,3 +269,10 @@ cargo xtask golden verify
 
 `cargo xtask golden verify` stays at `0 failure(s)` and the committed ASCII
 goldens parse to identical values: the ASCII parse and write paths are unchanged.
+## Codec workload
+
+`tests/rawfile_codec_bench.rs` provides ignored encode, collect and lending-row
+workloads over 2,097,152 complex cells. Set `NGSPICE_RAWFILE_BENCH` to a scratch
+file path. Run `encode_ascii` or `encode_binary` before the corresponding
+`collect` and `iterate` tests. Measure each in a separate process; use
+`/usr/bin/time -v` for peak RSS and Valgrind DHAT for allocation counts.
