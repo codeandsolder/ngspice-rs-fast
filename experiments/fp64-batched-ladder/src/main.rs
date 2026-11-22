@@ -154,7 +154,11 @@ fn parallel_simd(d: &[f64], b: &[f64], p: &mut [f64], x: &mut [f64]) {
 }
 
 fn main() -> Result<()> {
-    let gpu = pollster::block_on(Gpu::new("FP64 ladder solver", include_str!("ladder.wgsl")))?;
+    let gpu = pollster::block_on(Gpu::new(
+        "FP64 ladder solver",
+        include_str!("ladder.wgsl"),
+        0,
+    ))?;
     println!("persistent CPU workers: {}", rayon::current_num_threads());
     println!("nodes={N}, tile={TILE}, repeats=7");
     println!(

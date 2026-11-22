@@ -507,7 +507,8 @@ fn main() -> Result<()> {
         0,
     ))?;
     let grouped = plan.grouped();
-    let grouped_gpu = pollster::block_on(Gpu::new("Grouped complex FP64", &grouped_shader(false)))?;
+    let grouped_gpu =
+        pollster::block_on(Gpu::new("Grouped complex FP64", &grouped_shader(false), 0))?;
     let mixed_gpu = pollster::block_on(Gpu::new(
         "Grouped FP32 with FP64 refinement",
         &grouped_shader(true),
