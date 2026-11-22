@@ -35,7 +35,15 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
-use std::{collections::VecDeque, f64::consts::PI};
+use std::{
+    collections::VecDeque,
+    f64::consts::PI,
+    simd::{
+        Select, Simd, StdFloat,
+        cmp::{SimdPartialEq, SimdPartialOrd},
+        num::SimdFloat,
+    },
+};
 
 use crate::primitives::Real;
 
@@ -133,29 +141,104 @@ fn twiceintlinfunc(
     dummy * 0.5
 }
 
-/// `bessI0` (Abramowitz and Stegun 9.8.1, 9.8.2).
-#[must_use]
-pub fn bess_i0(x: Real) -> Real {
-    let ax = x.abs();
-    if ax < 3.75 {
-        let mut y = x / 3.75;
-        y *= y;
-        1.0 + y
-            * (3.515_622_9
-                + y * (3.089_942_4
-                    + y * (1.206_749_2 + y * (0.265_973_2 + y * (0.360_768e-1 + y * 0.45813e-2)))))
-    } else {
-        let y = 3.75 / ax;
-        (ax.exp() / ax.sqrt())
-            * (0.398_942_28
-                + y * (0.132_859_2e-1
-                    + y * (0.225_319e-2
-                        + y * (-0.157_565e-2
-                            + y * (0.916_281e-2
-                                + y * (-0.205_770_6e-1
-                                    + y * (0.263_553_7e-1
-                                        + y * (-0.164_763_3e-1 + y * 0.392_377e-2))))))))
+/// Shared argument preparation for the Bessel functions. LTRA evaluates
+/// I0 together with I1 or I1/x at the same knot; the expensive exponential
+/// and square root for the asymptotic series must only be evaluated once.
+#[derive(Clone, Copy)]
+enum BesselArgument {
+    Small {
+        squared: Real,
+        abs: Real,
+    },
+    Large {
+        y: Real,
+        abs: Real,
+        exponential: Real,
+        root: Real,
+    },
+}
+
+impl BesselArgument {
+    #[inline]
+    fn new(x: Real) -> Self {
+        let abs = x.abs();
+        if abs < 3.75 {
+            let y = x / 3.75;
+            Self::Small {
+                squared: y * y,
+                abs,
+            }
+        } else {
+            Self::Large {
+                y: 3.75 / abs,
+                abs,
+                exponential: abs.exp(),
+                root: abs.sqrt(),
+            }
+        }
     }
+
+    #[inline]
+    fn i0(self) -> Real {
+        match self {
+            Self::Small { squared: y, .. } => {
+                1.0 + y
+                    * (3.515_622_9
+                        + y * (3.089_942_4
+                            + y * (1.206_749_2
+                                + y * (0.265_973_2 + y * (0.360_768e-1 + y * 0.45813e-2)))))
+            }
+            Self::Large {
+                y,
+                exponential,
+                root,
+                ..
+            } => {
+                (exponential / root)
+                    * (0.398_942_28
+                        + y * (0.132_859_2e-1
+                            + y * (0.225_319e-2
+                                + y * (-0.157_565e-2
+                                    + y * (0.916_281e-2
+                                        + y * (-0.205_770_6e-1
+                                            + y * (0.263_553_7e-1
+                                                + y * (-0.164_763_3e-1 + y * 0.392_377e-2))))))))
+            }
+        }
+    }
+
+    #[inline]
+    fn i1(self) -> Real {
+        match self {
+            Self::Small { squared, abs } => abs * bess_i1_small(squared),
+            Self::Large {
+                y,
+                exponential,
+                root,
+                ..
+            } => bess_i1_tail(y) * (exponential / root),
+        }
+    }
+
+    #[inline]
+    fn i1_over_x(self) -> Real {
+        match self {
+            Self::Small { squared, .. } => bess_i1_small(squared),
+            Self::Large {
+                y,
+                abs,
+                exponential,
+                root,
+            } => bess_i1_tail(y) * (exponential / (abs * root)),
+        }
+    }
+}
+
+fn bess_i1_small(y: Real) -> Real {
+    0.5 + y
+        * (0.878_905_94
+            + y * (0.514_988_69
+                + y * (0.150_849_34 + y * (0.265_873_3e-1 + y * (0.301_532e-2 + y * 0.32411e-3)))))
 }
 
 /// The large-argument series shared by `bessI1` and `bessI1xOverX`.
@@ -166,41 +249,23 @@ fn bess_i1_tail(y: Real) -> Real {
             + y * (-0.362_018e-2 + y * (0.163_801e-2 + y * (-0.103_155_5e-1 + y * ans))))
 }
 
+/// `bessI0` (Abramowitz and Stegun 9.8.1, 9.8.2).
+#[must_use]
+pub fn bess_i0(x: Real) -> Real {
+    BesselArgument::new(x).i0()
+}
+
 /// `bessI1` (Abramowitz and Stegun 9.8.3, 9.8.4).
 #[must_use]
 pub fn bess_i1(x: Real) -> Real {
-    let ax = x.abs();
-    let ans = if ax < 3.75 {
-        let mut y = x / 3.75;
-        y *= y;
-        ax * (0.5
-            + y * (0.878_905_94
-                + y * (0.514_988_69
-                    + y * (0.150_849_34
-                        + y * (0.265_873_3e-1 + y * (0.301_532e-2 + y * 0.32411e-3))))))
-    } else {
-        let y = 3.75 / ax;
-        bess_i1_tail(y) * (ax.exp() / ax.sqrt())
-    };
+    let ans = BesselArgument::new(x).i1();
     if x < 0.0 { -ans } else { ans }
 }
 
 /// `bessI1xOverX`: `I1(x) / x` for `x >= 0` (C uses `|x|`).
 #[must_use]
 pub fn bess_i1_x_over_x(x: Real) -> Real {
-    let ax = x.abs();
-    if ax < 3.75 {
-        let mut y = x / 3.75;
-        y *= y;
-        0.5 + y
-            * (0.878_905_94
-                + y * (0.514_988_69
-                    + y * (0.150_849_34
-                        + y * (0.265_873_3e-1 + y * (0.301_532e-2 + y * 0.32411e-3)))))
-    } else {
-        let y = 3.75 / ax;
-        bess_i1_tail(y) * (ax.exp() / (ax * ax.sqrt()))
-    }
+    BesselArgument::new(x).i1_over_x()
 }
 
 /// `LTRArlcH2Func`: `h2(t)` of the RLC line, zero before `T`.
@@ -283,55 +348,72 @@ pub fn rlc_max_safe_step(td: Real, alpha: Real, beta: Real, reltol: Real, abstol
 /// inside the simulation tolerances, but it is not bit-identical to `libm`.
 #[must_use]
 pub fn erfc(x: Real) -> Real {
-    if x.is_nan() {
-        return x;
-    }
-    if x < 0. {
-        return 2. - erfc(-x);
-    }
-    if x < 2. {
-        // erf(x) = 2/sqrt(pi) sum (-1)^n x^(2n+1) / (n! (2n+1)).
-        let x2 = x * x;
-        let mut term = x;
-        let mut sum = x;
-        let mut n = 0.;
-        loop {
-            n += 1.;
-            term *= -x2 / n;
-            let add = term / (2. * n + 1.);
-            sum += add;
-            if add.abs() <= 1e-17 * sum.abs() || n > 200. {
-                break;
-            }
-        }
-        return 1. - 2. / PI.sqrt() * sum;
-    }
-    if x > 27. {
-        return 0.;
-    }
-    // Lentz: f = x + a1/(x + a2/(x + ...)), a_n = n/2.
-    let tiny = 1e-300;
-    let mut f = x;
-    let mut c = f;
-    let mut d = 0.;
-    for n in 1..=500 {
-        let a = Real::from(n) / 2.;
-        d = x + a * d;
-        if d == 0. {
-            d = tiny;
-        }
-        c = x + a / c;
-        if c == 0. {
-            c = tiny;
-        }
-        d = 1. / d;
-        let delta = c * d;
-        f *= delta;
-        if (delta - 1.).abs() < 1e-16 {
+    erfc_lanes(Simd::from_array([x]))[0]
+}
+
+/// Each lane keeps its own convergence state, including the exact final
+/// iteration of the reference scalar series/continued fraction.
+fn erfc_lanes<const N: usize>(input: Simd<Real, N>) -> Simd<Real, N> {
+    let x = input.abs();
+    let zero = Simd::splat(0.);
+    let one = Simd::splat(1.);
+    let two = Simd::splat(2.);
+    let mut series = x.simd_lt(two);
+    let mut fraction = x.simd_ge(two) & x.simd_le(Simd::splat(27.));
+    let small = series;
+    let large = fraction;
+    let x2 = x * x;
+    let mut term = x;
+    let mut sum = x;
+    let mut n = 0.;
+    while series.any() {
+        n += 1.;
+        term *= -x2 / Simd::splat(n);
+        let add = term / Simd::splat(2. * n + 1.);
+        sum = series.select(sum + add, sum);
+        series &= !add.abs().simd_le(Simd::splat(1e-17) * sum.abs());
+        if n > 200. {
             break;
         }
     }
-    (-x * x).exp() / (PI.sqrt() * f)
+
+    let tiny = Simd::splat(1e-300);
+    let mut f = x;
+    let mut c = f;
+    let mut d = zero;
+    for n in 1..=500 {
+        if !fraction.any() {
+            break;
+        }
+        let a = Simd::splat(Real::from(n) / 2.);
+        d = x + a * d;
+        d = d.simd_eq(zero).select(tiny, d);
+        c = x + a / c;
+        c = c.simd_eq(zero).select(tiny, c);
+        d = one / d;
+        let delta = c * d;
+        f = fraction.select(f * delta, f);
+        fraction &= !(delta - one).abs().simd_lt(Simd::splat(1e-16));
+    }
+    let series_value = one - Simd::splat(2. / PI.sqrt()) * sum;
+    // Retain the original scalar exp implementation on each lane.
+    let fraction_value = if large.any() {
+        let exponents = (-x * x).to_array();
+        let active = large.to_array();
+        let exponential = Simd::from_array(std::array::from_fn(|lane| {
+            if active[lane] {
+                exponents[lane].exp()
+            } else {
+                0.
+            }
+        }));
+        exponential / (Simd::splat(PI.sqrt()) * f)
+    } else {
+        zero
+    };
+    let result = small.select(series_value, large.select(fraction_value, zero));
+    let signed = input.simd_lt(zero).select(two - result, result);
+    input.is_nan().select(input, signed)
 }
 
 /// The coefficients of one convolution step: the factor of the newest
@@ -359,6 +441,47 @@ impl Coefficients {
     }
 }
 
+/// Independent endpoint integrals for all three RC impulse responses.
+struct RcKernel {
+    cbyr: Real,
+    rclsqr: Real,
+    root_rclsqr: Real,
+    root_cbyr: Real,
+}
+
+impl RcKernel {
+    fn new(cbyr: Real, rclsqr: Real) -> Self {
+        Self {
+            cbyr,
+            rclsqr,
+            root_rclsqr: rclsqr.sqrt(),
+            root_cbyr: cbyr.sqrt(),
+        }
+    }
+
+    fn endpoints<const N: usize>(&self, limits: [Real; N]) -> [[Real; 3]; N] {
+        let hi = Simd::from_array(limits);
+        let pi = Simd::splat(PI);
+        let zero = Simd::splat(0.);
+        let h1 = (Simd::splat(4. * self.cbyr) * hi / pi).sqrt();
+        let temp = Simd::splat(self.rclsqr) / (Simd::splat(4.) * hi);
+        // The C cutoff is before erfc, not merely an approximation to it.
+        let x = temp
+            .simd_ge(Simd::splat(100.))
+            .select(Simd::splat(Real::INFINITY), temp.sqrt());
+        let temp2 = erfc_lanes(x);
+        let temp3 = Simd::from_array((-temp).to_array().map(Real::exp));
+        let h2 = (hi + Simd::splat(self.rclsqr * 0.5)) * temp2
+            - (hi * Simd::splat(self.rclsqr) / pi).sqrt() * temp3;
+        let h3 = Simd::splat(self.root_cbyr)
+            * (Simd::splat(2.) * (hi / pi).sqrt() * temp3 - Simd::splat(self.root_rclsqr) * temp2);
+        let nonzero = hi.simd_ne(zero);
+        let h2 = nonzero.select(h2, zero);
+        let h3 = nonzero.select(h3, zero);
+        std::array::from_fn(|lane| [h1[lane], h2[lane], h3[lane]])
+    }
+}
+
 /// `LTRArcCoeffsSetup` (the `L = G = 0` line): coefficients at `curtime` over
 /// the accepted times `times[0..=index]`, with C's chopping tolerance
 /// `reltol` (C's `LTRAchopReltol`, always 0 from a deck).
@@ -370,97 +493,53 @@ pub fn rc_coefficients(
     times: &VecDeque<Real>,
     reltol: Real,
 ) -> Coefficients {
+    const LANES: usize = 4;
     let index = times.len() - 1;
     let mut out = Coefficients::with_len(times.len());
-    let (mut doh1, mut doh2, mut doh3) = (true, true, true);
+    let kernel = RcKernel::new(cbyr, rclsqr);
+    let delta = curtime - times[index];
+    let [mut previous] = kernel.endpoints([delta]);
+    let mut slopes = previous.map(|value| value / delta);
+    out.first = slopes;
+    let thresholds = slopes.map(|value| (value * reltol).abs());
+    let mut active = [true; 3];
 
-    let mut delta1 = curtime - times[index];
-    let mut hilimit1 = delta1;
-
-    let mut h1hivalue1 = (4. * cbyr * hilimit1 / PI).sqrt();
-    let mut h1dummy1 = h1hivalue1 / delta1;
-    out.first[0] = h1dummy1;
-    let h1relval = (h1dummy1 * reltol).abs();
-
-    let mut temp = rclsqr / (4. * hilimit1);
-    let mut temp2 = if temp >= 100.0 {
-        0.0
-    } else {
-        erfc(temp.sqrt())
-    };
-    let mut temp3 = (-temp).exp();
-    let temp4 = rclsqr.sqrt();
-    let temp5 = cbyr.sqrt();
-
-    let h2value = |hilimit: Real, temp2: Real, temp3: Real| {
-        if hilimit == 0.0 {
-            0.0
+    // The expensive endpoint integrals are independent. Evaluate four at
+    // a time, then apply divided differences in the original reverse order.
+    // No extra history-sized workspace is needed.
+    for (block_index, block) in out.weights[1..].rchunks_mut(LANES).enumerate() {
+        if !active.into_iter().any(|on| on) {
+            break;
+        }
+        let newest = index - block_index * LANES;
+        let count = block.len();
+        let limits = std::array::from_fn::<_, LANES, _>(|lane| {
+            curtime - times[newest - lane.min(count - 1) - 1]
+        });
+        let endpoints = if count == LANES {
+            kernel.endpoints(limits)
         } else {
-            (hilimit + rclsqr * 0.5) * temp2 - (hilimit * rclsqr / PI).sqrt() * temp3
-        }
-    };
-    let h3value = |hilimit: Real, temp2: Real, temp3: Real| {
-        if hilimit == 0.0 {
-            0.0
-        } else {
-            temp5 * (2. * (hilimit / PI).sqrt() * temp3 - temp4 * temp2)
-        }
-    };
-
-    let mut h2hivalue1 = h2value(hilimit1, temp2, temp3);
-    let mut h2dummy1 = h2hivalue1 / delta1;
-    out.first[1] = h2dummy1;
-    let h2relval = (h2dummy1 * reltol).abs();
-
-    let mut h3hivalue1 = h3value(hilimit1, temp2, temp3);
-    let mut h3dummy1 = h3hivalue1 / delta1;
-    out.first[2] = h3dummy1;
-    let h3relval = (h3dummy1 * reltol).abs();
-
-    for i in (1..=index).rev() {
-        delta1 = times[i] - times[i - 1];
-        hilimit1 = curtime - times[i - 1];
-
-        if doh1 {
-            let h1hivalue2 = h1hivalue1;
-            let h1dummy2 = h1dummy1;
-            let h1lovalue1 = h1hivalue2;
-            h1hivalue1 = (4. * cbyr * hilimit1 / PI).sqrt();
-            h1dummy1 = (h1hivalue1 - h1lovalue1) / delta1;
-            out.weights[i][0] = h1dummy1 - h1dummy2;
-            if out.weights[i][0].abs() < h1relval {
-                doh1 = false;
-            }
-        }
-        if doh2 || doh3 {
-            temp = rclsqr / (4. * hilimit1);
-            temp2 = if temp >= 100.0 {
-                0.0
-            } else {
-                erfc(temp.sqrt())
-            };
-            temp3 = (-temp).exp();
-        }
-        if doh2 {
-            let h2hivalue2 = h2hivalue1;
-            let h2dummy2 = h2dummy1;
-            let h2lovalue1 = h2hivalue2;
-            h2hivalue1 = h2value(hilimit1, temp2, temp3);
-            h2dummy1 = (h2hivalue1 - h2lovalue1) / delta1;
-            out.weights[i][1] = h2dummy1 - h2dummy2;
-            if out.weights[i][1].abs() < h2relval {
-                doh2 = false;
-            }
-        }
-        if doh3 {
-            let h3hivalue2 = h3hivalue1;
-            let h3dummy2 = h3dummy1;
-            let h3lovalue1 = h3hivalue2;
-            h3hivalue1 = h3value(hilimit1, temp2, temp3);
-            h3dummy1 = (h3hivalue1 - h3lovalue1) / delta1;
-            out.weights[i][2] = h3dummy1 - h3dummy2;
-            if out.weights[i][2].abs() < h3relval {
-                doh3 = false;
+            std::array::from_fn(|lane| {
+                if lane < count {
+                    kernel.endpoints([limits[lane]])[0]
+                } else {
+                    [0.; 3]
+                }
+            })
+        };
+        for (offset, (weight, endpoint)) in block.iter_mut().rev().zip(endpoints).enumerate() {
+            let sample = newest - offset;
+            let delta = times[sample] - times[sample - 1];
+            for channel in 0..3 {
+                if active[channel] {
+                    let slope = (endpoint[channel] - previous[channel]) / delta;
+                    weight[channel] = slope - slopes[channel];
+                    if weight[channel].abs() < thresholds[channel] {
+                        active[channel] = false;
+                    }
+                    slopes[channel] = slope;
+                    previous[channel] = endpoint[channel];
+                }
             }
         }
     }
@@ -525,7 +604,6 @@ pub fn rlc_coefficients(
     let mut exp_beta_t = 0.0;
     let mut h2relval = 0.0;
     let mut h3relval = 0.0;
-    let mut besselarg;
 
     if aux != 0 {
         let lolimit1 = t;
@@ -533,13 +611,14 @@ pub fn rlc_coefficients(
         let delta1 = hilimit1 - lolimit1;
 
         h2lovalue1 = rlc_h2(t, t, alpha, beta);
-        besselarg = if hilimit1 > t {
+        let besselarg = if hilimit1 > t {
             alpha * (hilimit1 * hilimit1 - t * t).sqrt()
         } else {
             0.0
         };
         let expterm = (-beta * hilimit1).exp();
-        let bessi1overxterm = bess_i1_x_over_x(besselarg);
+        let bessel = BesselArgument::new(besselarg);
+        let bessi1overxterm = bessel.i1_over_x();
         alphasq_t = alpha * alpha * t;
         h2hivalue1 = if alpha == 0.0 || hilimit1 < t {
             0.0
@@ -553,7 +632,7 @@ pub fn rlc_coefficients(
         h2relval = (reltol * h2dummy1).abs();
 
         let h3lovalue1 = 0.0; // E3dash is consistent with this (C).
-        let bessi0term = bess_i0(besselarg);
+        let bessi0term = bessel.i0();
         exp_beta_t = (-beta * t).exp();
         h3hivalue1 = if hilimit1 <= t || beta == 0.0 {
             0.0
@@ -573,7 +652,11 @@ pub fn rlc_coefficients(
         } else if hilimit == 0.0 {
             0.0
         } else {
-            (bess_i1(-exparg) + bess_i0(-exparg)) * hilimit * expterm - hilimit
+            let argument = -exparg;
+            let bessel = BesselArgument::new(argument);
+            let i1 = bessel.i1();
+            let i1 = if argument < 0. { -i1 } else { i1 };
+            (i1 + bessel.i0()) * hilimit * expterm - hilimit
         }
     };
 
@@ -614,21 +697,19 @@ pub fn rlc_coefficients(
                 doh1 = false;
             }
         }
-        if i <= aux {
-            besselarg = 0.0;
-            if doh2 || doh3 {
-                besselarg = if hilimit1 > t {
-                    alpha * (hilimit1 * hilimit1 - t * t).sqrt()
-                } else {
-                    0.0
-                };
-            }
+        if i <= aux && (doh2 || doh3) {
+            let besselarg = if hilimit1 > t {
+                alpha * (hilimit1 * hilimit1 - t * t).sqrt()
+            } else {
+                0.0
+            };
+            let bessel = BesselArgument::new(besselarg);
             if doh2 {
                 let h2lovalue2 = h2lovalue1;
                 let h2hivalue2 = h2hivalue1;
                 let h2dummy2 = h2dummy1;
                 h2lovalue1 = h2hivalue2;
-                let bessi1overxterm = bess_i1_x_over_x(besselarg);
+                let bessi1overxterm = bessel.i1_over_x();
                 h2hivalue1 = if alpha == 0.0 || hilimit1 < t {
                     0.0
                 } else {
@@ -649,7 +730,7 @@ pub fn rlc_coefficients(
                 let h3hivalue2 = h3hivalue1;
                 let h3dummy2 = h3dummy1;
                 let h3lovalue1 = h3hivalue2;
-                let bessi0term = bess_i0(besselarg);
+                let bessi0term = bessel.i0();
                 h3hivalue1 = if hilimit1 <= t || beta == 0.0 {
                     0.0
                 } else {
@@ -778,5 +859,45 @@ mod tests {
         let alpha = 0.5 * 10. / 250e-9;
         let step = rlc_max_safe_step(td, alpha, alpha, 1e-3, 1e-12);
         assert!(step > 0. && step <= 9. * td, "{step}");
+    }
+    #[test]
+    fn erfc_lanes_retains_each_scalar_convergence() {
+        let values = [
+            -Real::INFINITY,
+            -27.,
+            -2.,
+            -0.,
+            0.,
+            1.,
+            1.999_999_9,
+            2.,
+            2.1,
+            5.,
+            9.999,
+            10.,
+            27.,
+            28.,
+            Real::INFINITY,
+            Real::NAN,
+        ];
+        for block in values.chunks_exact(4) {
+            let input: [Real; 4] = block.try_into().unwrap();
+            let vector = erfc_lanes(Simd::from_array(input)).to_array();
+            let scalar = input.map(erfc);
+            assert_eq!(vector.map(Real::to_bits), scalar.map(Real::to_bits));
+        }
+        let kernel = RcKernel::new(0.015, 0.003);
+        for values in [
+            [0., 1e-9, 1e-3, 1.],
+            [1e-6, 5e-6, 8e-6, 0.1],
+            [0.01, 0.018, 0.03, 0.2],
+        ] {
+            let actual = kernel.endpoints(values);
+            let expected = values.map(|value| kernel.endpoints([value])[0]);
+            assert_eq!(
+                actual.map(|v| v.map(Real::to_bits)),
+                expected.map(|v| v.map(Real::to_bits))
+            );
+        }
     }
 }

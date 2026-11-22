@@ -204,7 +204,7 @@ impl WaveformHistory {
     /// ring order. The update transaction guarantees finite values and
     /// strictly increasing times.
     pub(super) fn samples<const N: usize>(&self) -> SpiceResult<DelaySamples<'_, N>> {
-        if self.width != N || self.is_empty() {
+        if N == 0 || self.width != N || self.is_empty() {
             return Err(delay_error(format!(
                 "expected nonempty history of width {N}, got width {} and length {}",
                 self.width,
@@ -336,6 +336,13 @@ pub(super) struct DelaySample<const N: usize> {
     pub(super) values: [Real; N],
 }
 
+/// Logical oldest-to-newest sample slices; only a split sample is copied.
+pub(super) struct SampleSegments<'a, const N: usize> {
+    pub(super) first: &'a [[Real; N]],
+    pub(super) bridge: Option<[Real; N]>,
+    pub(super) last: &'a [[Real; N]],
+}
+
 impl<'a, const N: usize> DelaySamples<'a, N> {
     pub(super) const fn times(self) -> &'a VecDeque<Real> {
         &self.history.times
@@ -368,6 +375,40 @@ impl<'a, const N: usize> DelaySamples<'a, N> {
                 values: self.sample(index),
             }
         }))
+    }
+
+    /// Borrow a logical sample range as at most two contiguous slices and
+    /// a single stack-sized sample if the ring split is not width-aligned.
+    pub(super) fn segments(self, range: std::ops::Range<usize>) -> SampleSegments<'a, N> {
+        let (front, back) = self.history.values.as_slices();
+        let start = range.start * N;
+        let end = range.end * N;
+        let front_len = front.len();
+        let front = &front[start.min(front_len)..end.min(front_len)];
+        let back = &back[start.saturating_sub(front_len)..end.saturating_sub(front_len)];
+        let (first, remainder) = front.as_chunks::<N>();
+        let bridge_len = if remainder.is_empty() {
+            0
+        } else {
+            N - remainder.len()
+        };
+        let (bridge_tail, back) = back.split_at(bridge_len);
+        let bridge = (!remainder.is_empty()).then(|| {
+            std::array::from_fn(|component| {
+                if component < remainder.len() {
+                    remainder[component]
+                } else {
+                    bridge_tail[component - remainder.len()]
+                }
+            })
+        });
+        let (last, tail) = back.as_chunks::<N>();
+        debug_assert!(tail.is_empty());
+        SampleSegments {
+            first,
+            bridge,
+            last,
+        }
     }
 
     pub(super) fn sample(self, index: usize) -> [Real; N] {
@@ -699,5 +740,39 @@ mod tests {
         }
         history.clear();
         assert!(history.is_empty());
+    }
+    #[test]
+    fn reverse_prefix_crosses_misaligned_sample_splits() {
+        let mut history = WaveformHistory::new(3);
+        // Width 3 deliberately does not divide the ring capacity.
+        for tick in 0..100 {
+            let t = Real::from(tick);
+            history
+                .apply(&WaveformUpdate {
+                    append: Some((t, vec![t, -t, t + 1.])),
+                    drop_front: usize::from(tick >= 13),
+                    ..WaveformUpdate::default()
+                })
+                .unwrap();
+            let view = history.samples::<3>().unwrap();
+            for len in 0..=history.len() {
+                for start in 0..=len {
+                    let expected = (start..len)
+                        .rev()
+                        .map(|index| view.sample(index))
+                        .collect::<Vec<_>>();
+                    let segments = view.segments(start..len);
+                    let actual = segments
+                        .last
+                        .iter()
+                        .rev()
+                        .copied()
+                        .chain(segments.bridge)
+                        .chain(segments.first.iter().rev().copied())
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
     }
 }

@@ -112,6 +112,8 @@
 
 pub mod convolution;
 
+use std::simd::Simd;
+
 use crate::devices::delay::{
     DelayContext, DelayHistory, DelayLine, DelaySamples, DelayUpdate, WaveformHistory,
     WaveformUpdate,
@@ -126,6 +128,70 @@ use crate::primitives::{
     NodeAppend, NodeId, Real, SourceLoc, SpiceError, SpiceResult, almost_equal_ulps,
     parse_spice_number,
 };
+
+/// Three independent two-port reductions. Keep h3 in the same lane order
+/// as h1 internally so that both can reuse the voltage difference.
+struct HistorySums {
+    voltage: Simd<Real, 2>,
+    current: Simd<Real, 2>,
+    h1: Simd<Real, 2>,
+    h2: Simd<Real, 2>,
+    h3: Simd<Real, 2>,
+}
+
+impl HistorySums {
+    fn new([v1, i1, v2, i2]: [Real; 4], [h1, h2, [h3b, h3a]]: [[Real; 2]; 3]) -> Self {
+        Self {
+            voltage: Simd::from_array([v1, v2]),
+            current: Simd::from_array([i2, i1]),
+            h1: Simd::from_array(h1),
+            h2: Simd::from_array(h2),
+            h3: Simd::from_array([h3a, h3b]),
+        }
+    }
+
+    fn add_block(&mut self, samples: &[[Real; 4]], weights: &[[Real; 3]], aux: usize) {
+        let split = aux.min(samples.len());
+        let (older_samples, newer_samples) = samples.split_at(split);
+        let (older_weights, newer_weights) = weights.split_at(split);
+        let mut h1_sum = self.h1;
+        let mut h2_sum = self.h2;
+        let mut h3_sum = self.h3;
+        let initial_voltage = self.voltage;
+        let initial_current = self.current;
+        // Avoid preparing or loading current and cross-port terms newer
+        // than the delay cutoff.
+        for (&[v1, _, v2, _], &[h1, ..]) in newer_samples.iter().zip(newer_weights).rev() {
+            if h1 != 0. {
+                h1_sum += Simd::splat(h1) * (Simd::from_array([v1, v2]) - initial_voltage);
+            }
+        }
+        for (&[v1, i1, v2, i2], &[h1, h2, h3]) in older_samples.iter().zip(older_weights).rev() {
+            // Skipping a zero weight is semantic: signed zero is retained,
+            // and even a finite sample difference can overflow.
+            if h1 != 0. || h3 != 0. {
+                let voltage = Simd::from_array([v1, v2]) - initial_voltage;
+                if h1 != 0. {
+                    h1_sum += Simd::splat(h1) * voltage;
+                }
+                if h3 != 0. {
+                    h3_sum += Simd::splat(h3) * voltage;
+                }
+            }
+            if h2 != 0. {
+                h2_sum += Simd::splat(h2) * (Simd::from_array([i2, i1]) - initial_current);
+            }
+        }
+        self.h1 = h1_sum;
+        self.h2 = h2_sum;
+        self.h3 = h3_sum;
+    }
+
+    fn finish(self) -> [[Real; 2]; 3] {
+        let [h3a, h3b] = self.h3.to_array();
+        [self.h1.to_array(), self.h2.to_array(), [h3b, h3a]]
+    }
+}
 
 /// C reference for errors.
 const C_REFERENCE: &str = "src/spicelib/devices/ltra/";
@@ -869,26 +935,52 @@ impl LossyLine {
         })
     }
 
-    /// Sum a pair of port components in reverse history order; initial
-    /// accumulators include the delayed contribution for RLC h2/h3'.
-    fn history_sum(
+    /// Direct scalar reduction for histories too short to amortize the
+    /// contiguous-slice and SIMD accumulator setup.
+    fn scalar_history_sums(
         history: DelaySamples<'_, 4>,
         weights: &[[Real; 3]],
-        kernel: usize,
-        components: [usize; 2],
+        aux: usize,
         initial: [Real; 4],
-        mut sum: [Real; 2],
-    ) -> [Real; 2] {
-        let [a, b] = components;
-        for (i, weight) in weights.iter().enumerate().skip(1).rev() {
-            let weight = weight[kernel];
-            if weight != 0.0 {
-                let sample = history.sample(i);
-                sum[0] += weight * (sample[a] - initial[a]);
-                sum[1] += weight * (sample[b] - initial[b]);
+        mut sums: [[Real; 2]; 3],
+    ) -> [[Real; 2]; 3] {
+        for (kernel, components) in [[0, 2], [3, 1], [2, 0]].into_iter().enumerate() {
+            let end = if kernel == 0 { weights.len() } else { aux + 1 };
+            for (index, weight) in weights[..end].iter().enumerate().skip(1).rev() {
+                let weight = weight[kernel];
+                if weight != 0. {
+                    let sample = history.sample(index);
+                    for (sum, component) in sums[kernel].iter_mut().zip(components) {
+                        *sum += weight * (sample[component] - initial[component]);
+                    }
+                }
             }
         }
-        sum
+        sums
+    }
+
+    /// All three impulse-response reductions in one reverse pass. SIMD lanes
+    /// are independent port accumulators, not successive terms of a dot
+    /// product: each retains C's original addition order and delayed seed.
+    fn history_sums(
+        history: DelaySamples<'_, 4>,
+        weights: &[[Real; 3]],
+        aux: usize,
+        initial: [Real; 4],
+        seeds: [[Real; 2]; 3],
+    ) -> [[Real; 2]; 3] {
+        if weights.len() <= 8 {
+            return Self::scalar_history_sums(history, weights, aux, initial, seeds);
+        }
+        let mut sums = HistorySums::new(initial, seeds);
+        let segments = history.segments(1..weights.len());
+        let mut weights = &weights[1..];
+        for samples in [segments.last, segments.bridge.as_slice(), segments.first] {
+            let (remaining, block) = weights.split_at(weights.len() - samples.len());
+            sums.add_block(samples, block, aux.saturating_sub(remaining.len()));
+            weights = remaining;
+        }
+        sums.finish()
     }
 
     /// Apply the history sums in C's original reverse traversal and
@@ -908,76 +1000,57 @@ impl LossyLine {
         match m.case {
             LtraCase::Rlc => {
                 let c = coefficients;
-                // h1' with v1 and v2.
-                let [mut d1, mut d2] =
-                    Self::history_sum(history, &c.weights, 0, [0, 2], initial, [0.; 2]);
-                d1 += iv1 * m.int_h1dash;
-                d2 += iv2 * m.int_h1dash;
-                d1 -= iv1 * c.first[0];
-                d2 -= iv2 * c.first[0];
-                inputs[0] -= d1 * m.admit;
-                inputs[1] -= d2 * m.admit;
-                // h2 with i2 and i1.
-                let (mut d1, mut d2) = (0., 0.);
-                if tdover {
-                    d1 = (i2d - ii2) * c.first[1];
-                    d2 = (i1d - ii1) * c.first[1];
-                    [d1, d2] = Self::history_sum(
-                        history,
-                        &c.weights[..=c.aux_index],
-                        1,
-                        [3, 1],
-                        initial,
-                        [d1, d2],
-                    );
-                }
-                d1 += ii2 * m.int_h2;
-                d2 += ii1 * m.int_h2;
-                inputs[0] += d1;
-                inputs[1] += d2;
-                // h3' with v2 and v1.
-                let (mut d1, mut d2) = (0., 0.);
-                if tdover {
-                    d1 = (v2d - iv2) * c.first[2];
-                    d2 = (v1d - iv1) * c.first[2];
-                    [d1, d2] = Self::history_sum(
-                        history,
-                        &c.weights[..=c.aux_index],
-                        2,
-                        [2, 0],
-                        initial,
-                        [d1, d2],
-                    );
-                }
-                d1 += iv2 * m.int_h3dash;
-                d2 += iv1 * m.int_h3dash;
-                inputs[0] += m.admit * d1;
-                inputs[1] += m.admit * d2;
-                self.lossless_inputs(&mut inputs, tdover, [iv1, ii1, iv2, ii2], delayed);
+                let (aux, seeds) = if tdover {
+                    (
+                        c.aux_index,
+                        [
+                            [0.; 2],
+                            [(i2d - ii2) * c.first[1], (i1d - ii1) * c.first[1]],
+                            [(v2d - iv2) * c.first[2], (v1d - iv1) * c.first[2]],
+                        ],
+                    )
+                } else {
+                    (0, [[0.; 2]; 3])
+                };
+                let [[mut h1a, mut h1b], [mut h2a, mut h2b], [mut h3a, mut h3b]] =
+                    Self::history_sums(history, &c.weights, aux, initial, seeds);
+                h1a += iv1 * m.int_h1dash;
+                h1b += iv2 * m.int_h1dash;
+                h1a -= iv1 * c.first[0];
+                h1b -= iv2 * c.first[0];
+                inputs[0] -= h1a * m.admit;
+                inputs[1] -= h1b * m.admit;
+                h2a += ii2 * m.int_h2;
+                h2b += ii1 * m.int_h2;
+                inputs[0] += h2a;
+                inputs[1] += h2b;
+                h3a += iv2 * m.int_h3dash;
+                h3b += iv1 * m.int_h3dash;
+                inputs[0] += m.admit * h3a;
+                inputs[1] += m.admit * h3b;
+                self.lossless_inputs(&mut inputs, tdover, initial, delayed);
             }
             LtraCase::Lc => {
                 self.lossless_inputs(&mut inputs, tdover, [iv1, ii1, iv2, ii2], delayed);
             }
             LtraCase::Rc => {
                 let c = coefficients;
-                let [mut d1, mut d2] =
-                    Self::history_sum(history, &c.weights, 0, [0, 2], initial, [0.; 2]);
+                let [[mut d1, mut d2], h2, h3] =
+                    Self::history_sums(history, &c.weights, c.aux_index, initial, [[0.; 2]; 3]);
                 d1 += iv1 * m.int_h1dash;
                 d2 += iv2 * m.int_h1dash;
                 d1 -= iv1 * c.first[0];
                 d2 -= iv2 * c.first[0];
                 inputs[0] -= d1;
                 inputs[1] -= d2;
-                let [mut d1, mut d2] =
-                    Self::history_sum(history, &c.weights, 1, [3, 1], initial, [0.; 2]);
+                let [mut d1, mut d2] = h2;
                 d1 += ii2 * m.int_h2;
                 d2 += ii1 * m.int_h2;
                 d1 -= ii2 * c.first[1];
                 d2 -= ii1 * c.first[1];
                 inputs[0] += d1;
                 inputs[1] += d2;
-                let [mut d1, mut d2] =
-                    Self::history_sum(history, &c.weights, 2, [2, 0], initial, [0.; 2]);
+                let [mut d1, mut d2] = h3;
                 d1 += iv2 * m.int_h3dash;
                 d2 += iv1 * m.int_h3dash;
                 d1 -= iv2 * c.first[2];
@@ -1455,6 +1528,149 @@ mod tests {
                 first.inputs.map(Real::to_bits),
                 retry.inputs.map(Real::to_bits)
             );
+        }
+    }
+    fn history_for_test(len: usize, pruned: usize) -> WaveformHistory {
+        let mut history = WaveformHistory::new(4);
+        for index in 0..len + pruned {
+            let time = index as Real * 0.001;
+            history
+                .apply(&WaveformUpdate {
+                    append: Some((
+                        time,
+                        vec![time.sin(), time.cos(), -time.cos(), time.sin() * 1e-3],
+                    )),
+                    drop_front: usize::from(index >= len),
+                    ..WaveformUpdate::default()
+                })
+                .unwrap();
+        }
+        history
+    }
+
+    #[test]
+    fn simd_history_is_bit_exact_for_wrapped_prefixes_and_kernel_cutoffs() {
+        for len in [1, 2, 3, 7, 8, 15, 16, 17, 127, 128, 129] {
+            for pruned in [0, 1, 3, len / 2, len + 3] {
+                let history = history_for_test(len, pruned);
+                let view = history.samples::<4>().unwrap();
+                for end in [1, len.div_ceil(2), len] {
+                    let weights = (0..end)
+                        .map(|i| {
+                            [
+                                if i % 5 == 0 {
+                                    -0.
+                                } else {
+                                    1. / (i + 1) as Real
+                                },
+                                if i % 7 == 0 { 0. } else { -(i as Real).sin() },
+                                if i % 3 == 0 { 0. } else { (i as Real).cos() },
+                            ]
+                        })
+                        .collect::<Vec<_>>();
+                    let initial = view.sample(0);
+                    let seeds = [[-0., 0.], [1e-9, -1e30], [-1e-200, 1e-3]];
+                    for aux in [0, end / 2, end - 1] {
+                        let got = LossyLine::history_sums(view, &weights, aux, initial, seeds);
+                        let want =
+                            LossyLine::scalar_history_sums(view, &weights, aux, initial, seeds);
+                        assert_eq!(
+                            got.map(|pair| pair.map(Real::to_bits)),
+                            want.map(|pair| pair.map(Real::to_bits)),
+                            "len={len} pruned={pruned} end={end} aux={aux}"
+                        );
+                    }
+                }
+            }
+        }
+        let history = history_for_test(3, 0);
+        let view = history.samples::<4>().unwrap();
+        let initial = [Real::MAX, -Real::MAX, Real::MAX, -Real::MAX];
+        let seeds = [[-0., 0.], [-0., 0.], [-0., 0.]];
+        let weights = [[0.; 3]; 3];
+        assert_eq!(
+            LossyLine::history_sums(view, &weights, 2, initial, seeds)
+                .map(|p| p.map(Real::to_bits)),
+            seeds.map(|p| p.map(Real::to_bits))
+        );
+        let mut extreme = WaveformHistory::new(4);
+        extreme
+            .apply(&WaveformUpdate {
+                reset: Some(vec![
+                    (0., initial.to_vec()),
+                    (1., initial.map(|x| -x).to_vec()),
+                ]),
+                ..WaveformUpdate::default()
+            })
+            .unwrap();
+        assert_eq!(
+            LossyLine::history_sums(
+                extreme.samples::<4>().unwrap(),
+                &weights[..2],
+                1,
+                initial,
+                seeds
+            )
+            .map(|p| p.map(Real::to_bits)),
+            seeds.map(|p| p.map(Real::to_bits))
+        );
+    }
+
+    #[test]
+    #[ignore = "opt-in LTRA history microbenchmark"]
+    fn benchmark_history_reduction() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for len in [4, 16, 64, 1024, 16_384, 65_536] {
+            for pruned in [0, len / 3] {
+                let history = history_for_test(len, pruned);
+                let view = history.samples::<4>().unwrap();
+                let weights = (0..len)
+                    .map(|i| {
+                        let time = i as Real * 0.01;
+                        [time.sin(), time.cos() * 1e-2, -time.sin() * 0.3]
+                    })
+                    .collect::<Vec<_>>();
+                for aux in [0, len / 2, len - 1] {
+                    let initial = view.sample(0);
+                    let seeds = [[0.; 2], [0.1, 0.2], [0.3, 0.4]];
+                    let reference =
+                        LossyLine::scalar_history_sums(view, &weights, aux, initial, seeds);
+                    assert_eq!(
+                        LossyLine::history_sums(view, &weights, aux, initial, seeds),
+                        reference
+                    );
+                    let repeats = (1_000_000 / len).max(20);
+                    let start = Instant::now();
+                    for _ in 0..repeats {
+                        black_box(LossyLine::scalar_history_sums(
+                            black_box(view),
+                            black_box(&weights),
+                            aux,
+                            initial,
+                            seeds,
+                        ));
+                    }
+                    let scalar = start.elapsed().as_secs_f64();
+                    let start = Instant::now();
+                    for _ in 0..repeats {
+                        black_box(LossyLine::history_sums(
+                            black_box(view),
+                            black_box(&weights),
+                            aux,
+                            initial,
+                            seeds,
+                        ));
+                    }
+                    let simd = start.elapsed().as_secs_f64();
+                    println!(
+                        "history len={len} pruned={pruned} aux={aux} scalar={:.1}ns simd={:.1}ns speedup={:.2}x",
+                        scalar * 1e9 / repeats as Real,
+                        simd * 1e9 / repeats as Real,
+                        scalar / simd
+                    );
+                }
+            }
         }
     }
 }
