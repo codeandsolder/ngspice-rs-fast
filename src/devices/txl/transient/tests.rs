@@ -210,7 +210,7 @@ fn recurrence_conjugate_slots_keep_initialization_update_and_sum_order() {
             pair: old_pair
         }
     );
-    let before = [0.25, 0.5];
+    let before: [Real; 2] = [0.25, 0.5];
     let after = [0.75, 1.25];
     let dt: Real = 0.125;
     let exp = (-3. * dt).exp();
