@@ -156,7 +156,7 @@ pub(super) fn real(name: &str, width: u32, height: u32, repeats: u32) {
         let mut reuse_time = Duration::ZERO;
         for k in 0..repeats {
             bound
-                .add(0, 0, if k % 2 == 0 { 0.0625 } else { -0.0625 })
+                .add(0, 0, if k.is_multiple_of(2) { 0.0625 } else { -0.0625 })
                 .unwrap();
             let rhs = bound.mul_vector(&mesh.exact).unwrap();
             let start = Instant::now();

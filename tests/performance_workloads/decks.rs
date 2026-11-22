@@ -113,15 +113,33 @@ fn run(name: &str, text: &str, verify: impl Fn(&Plot)) {
             let want = &raw.plots[0].plot;
             assert_eq!(got.plotname, want.plotname);
             assert_eq!(got.flags(), want.flags());
-            assert_eq!(got.variables(), want.variables());
+            assert_eq!(got.variable_count(), want.variable_count());
+            // Binary rawfiles encode real/complex at plot granularity.
+            // Per-column realness is not serialized in the complex format.
+            for (a, b) in got.variables().iter().zip(want.variables()) {
+                assert_eq!((&a.name, &a.unit), (&b.name, &b.unit));
+            }
             assert_eq!(got.point_count(), want.point_count());
             for variable in want.variables() {
+                assert_eq!(
+                    want.variables()
+                        .iter()
+                        .filter(|candidate| candidate.name == variable.name)
+                        .count(),
+                    1,
+                    "benchmark requires unique serialized column identities"
+                );
                 let want_column = want.column(&variable.name).unwrap();
                 let got_column = got.column(&variable.name).unwrap();
                 for (row, (a, b)) in got_column.into_iter().zip(want_column).enumerate() {
+                    let imaginary = if !want.flags().is_complex() || variable.is_real {
+                        0.0
+                    } else {
+                        b.im
+                    };
                     assert_eq!(
                         (a.re.to_bits(), a.im.to_bits()),
-                        (b.re.to_bits(), b.im.to_bits()),
+                        (b.re.to_bits(), imaginary.to_bits()),
                         "{name}: codec mismatch at {} row {row}",
                         variable.name
                     );
@@ -158,7 +176,10 @@ fn load_kernel(name: &str, text: &str, repeats: u32) {
     };
     let mut matrix = circuit.new_matrix().unwrap();
     let mut rhs = Vector::zeros(circuit.unknown_count());
-    let mut trial = history.trial_in(IterationPhase::Float, None).unwrap();
+    let mut trial = history
+        .trial_in(IterationPhase::Float, Some(&dc.solution.trial))
+        .unwrap()
+        .with_device_limiting(false);
     let mut stamp = || {
         matrix.clear();
         rhs.clear();
@@ -262,7 +283,7 @@ fn compact_text(copies: u32, sweeps: u32) -> String {
         "repeated BSIM3/BSIM4 devices\nvdd supply 0 1.2\nvg g 0 0.7\n.model n3 nmos level=49 version=3.3.0 capmod=3 mobmod=1 tox=4.1n nch=2.3549e17 vth0=0.3694 u0=268.7 rsh=6.8\n.model n4 nmos level=54 version=4.8.3 vth0=0.45 toxe=4n rgatemod=1 rbodymod=1 xrcrg1=12 xrcrg2=5 rshg=0.4 rbpb=5 rbpd=15 rbps=15 rbdb=15 rbsb=15\n",
     );
     for i in 0..copies {
-        let model = if i % 2 == 0 { "n3" } else { "n4" };
+        let model = if i.is_multiple_of(2) { "n3" } else { "n4" };
         writeln!(deck,"r{i} supply d{i} 1k\nm{i} d{i} g 0 0 {model} l=0.18u w=1u ad=1e-13 as=1e-13 pd=1.4u ps=1.4u").unwrap();
     }
     writeln!(deck, ".dc vg 0.4 1.0 {}\n.end", 0.6 / f64::from(sweeps)).unwrap();
@@ -339,7 +360,7 @@ pub(super) fn ltra() {
 
 pub(super) fn parameters() {
     let text = "independent resistor and stimulus ensemble\nv1 in 0 1\nr1 in out 1k\nr2 out 0 1k\n.dc @r1[resistance] 1k 16k 1k v1 1 8 1\n.end\n";
-    run("parameter_ensemble", &text, |plot| {
+    run("parameter_ensemble", text, |plot| {
         assert_eq!(plot.point_count(), 128);
         for outer in 0..8_u32 {
             for inner in 0..16_u32 {
