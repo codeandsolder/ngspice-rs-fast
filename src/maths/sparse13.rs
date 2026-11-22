@@ -273,6 +273,19 @@ struct ColumnRun<I> {
     end: I,
 }
 
+impl<I: PlanIndex> ColumnRun<I> {
+    fn new(start: usize, diagonal: usize, end: usize) -> Option<Self> {
+        if !(start <= diagonal && diagonal < end) {
+            return None;
+        }
+        Some(Self {
+            start: I::pack(start)?,
+            diagonal: I::pack(diagonal)?,
+            end: I::pack(end)?,
+        })
+    }
+}
+
 /// Immutable packed traversal, derived from linked topology after ordering.
 #[derive(Debug)]
 struct FactorRuns<I> {
@@ -1057,9 +1070,48 @@ impl Diagnostic {
     }
 }
 
+/// Scratch for an ordering attempt, returned to the frame for allocation reuse.
+/// A snapshot never needs the previous operation's counts or search sentinels.
+#[derive(Debug, Default)]
+struct Markowitz {
+    row: Vec<i64>,
+    col: Vec<i64>,
+    products: PivotProducts,
+    singletons: i64,
+}
+
+impl Markowitz {
+    fn ensure_size(&mut self, size: usize) -> SpiceResult<()> {
+        if self.row.len() <= size {
+            let rows = sparse_rows(size)?;
+            let row = crate::primitives::filled_vec(rows, 0, "SPARSE Markowitz row counts")?;
+            let col = crate::primitives::filled_vec(rows, 0, "SPARSE Markowitz column counts")?;
+            let products = PivotProducts::new(rows + 1)?;
+            self.row = row;
+            self.col = col;
+            self.products = products;
+        }
+        Ok(())
+    }
+
+    fn product_of(&self, i: usize) -> i64 {
+        self.row[i].saturating_mul(self.col[i])
+    }
+
+    const fn track_singleton(&mut self, new: i64, old: i64) {
+        if (new == 0) != (old == 0) {
+            if old == 0 {
+                self.singletons -= 1;
+            } else {
+                self.singletons += 1;
+            }
+        }
+    }
+}
+
 /// A SPARSE matrix frame (`struct MatrixFrame`) with 1-based internal and
 /// external indices; external index 0 (ground) is never used here.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct Sparse<T> {
     /// Internal order (C `Size`): the rows translated so far. An external
     /// index never referenced by an element has no internal row; as in
@@ -1072,14 +1124,28 @@ pub(super) struct Sparse<T> {
     topology: std::sync::Arc<Topology>,
     values: Vec<T>,
     lifecycle: Lifecycle,
-    markowitz_row: Vec<i64>,
-    markowitz_col: Vec<i64>,
-    markowitz_prod: PivotProducts,
-    singletons: i64,
+    ordering_scratch: Markowitz,
     rel_threshold: f64,
     abs_threshold: f64,
     parity: PermutationParity,
     diagnostic: Diagnostic,
+}
+
+impl<T: Clone> Clone for Sparse<T> {
+    fn clone(&self) -> Self {
+        Self {
+            size: self.size,
+            ext_size: self.ext_size,
+            topology: self.topology.clone(),
+            values: self.values.clone(),
+            lifecycle: self.lifecycle.clone(),
+            ordering_scratch: Markowitz::default(),
+            rel_threshold: self.rel_threshold,
+            abs_threshold: self.abs_threshold,
+            parity: self.parity,
+            diagnostic: self.diagnostic,
+        }
+    }
 }
 
 impl<T: Scalar> Sparse<T> {
@@ -1107,10 +1173,7 @@ impl<T: Scalar> Sparse<T> {
             }),
             values: Vec::new(),
             lifecycle: Lifecycle::ColumnsOnly,
-            markowitz_row: Vec::new(),
-            markowitz_col: Vec::new(),
-            markowitz_prod: PivotProducts::default(),
-            singletons: 0,
+            ordering_scratch: Markowitz::default(),
             rel_threshold: DEFAULT_THRESHOLD,
             abs_threshold: 0.0,
             parity: PermutationParity::Even,
@@ -1342,10 +1405,7 @@ impl<T: Scalar> Sparse<T> {
             values,
             topology: self.topology,
             lifecycle: self.lifecycle.into_loaded(),
-            markowitz_row: self.markowitz_row,
-            markowitz_col: self.markowitz_col,
-            markowitz_prod: self.markowitz_prod,
-            singletons: self.singletons,
+            ordering_scratch: self.ordering_scratch,
             rel_threshold: self.rel_threshold,
             abs_threshold: self.abs_threshold,
             parity: self.parity,
@@ -1361,10 +1421,7 @@ impl<T: Scalar> Sparse<T> {
             topology: self.topology.clone(),
             values,
             lifecycle: self.lifecycle.clone().into_loaded(),
-            markowitz_row: Vec::new(),
-            markowitz_col: Vec::new(),
-            markowitz_prod: PivotProducts::default(),
-            singletons: 0,
+            ordering_scratch: Markowitz::default(),
             rel_threshold: self.rel_threshold,
             abs_threshold: self.abs_threshold,
             parity: self.parity,
@@ -1628,6 +1685,18 @@ impl<T: Scalar> Sparse<T> {
 
     /// `spOrderAndFactor(Matrix, NULL, rel, abs, DiagPivoting = YES)`.
     pub(crate) fn order_and_factor(&mut self, rel_threshold: f64, abs_threshold: f64) -> Status {
+        let mut scratch = std::mem::take(&mut self.ordering_scratch);
+        let status = self.order_with_scratch(rel_threshold, abs_threshold, &mut scratch);
+        self.ordering_scratch = scratch;
+        status
+    }
+
+    fn order_with_scratch(
+        &mut self,
+        rel_threshold: f64,
+        abs_threshold: f64,
+        scratch: &mut Markowitz,
+    ) -> Status {
         self.reset_numeric_status();
         if !self.values_are_finite() {
             return self.nonfinite_factor();
@@ -1647,14 +1716,8 @@ impl<T: Scalar> Sparse<T> {
             }
         } else {
             // A failed partial reorder may have invalidated the plan.
-            // Retain its numbering like C; initialize scratch in case
-            // completing the previously attempted prefix creates fill-ins.
-            if self.lifecycle.plan().is_none()
-                && self.markowitz_row.len() <= self.size
-                && self.create_internal_vectors().is_err()
-            {
-                return self.resource_failure();
-            }
+            // Retain its numbering like C. The accepted prefix needs
+            // no Markowitz counts; compute them only if a search begins.
             while step <= size {
                 let pivot = self.topology.diag[step];
                 if pivot == NONE {
@@ -1663,7 +1726,7 @@ impl<T: Scalar> Sparse<T> {
                 }
                 let largest = self.find_largest_in_col(self.topology.elements[pivot].next_in_col);
                 if largest * self.rel_threshold < self.mag(pivot) {
-                    self.row_col_elimination(pivot);
+                    self.row_col_elimination(None, pivot);
                     if matches!(
                         self.diagnostic.status(),
                         Status::Singular | Status::NonFinite | Status::Resource
@@ -1682,24 +1745,24 @@ impl<T: Scalar> Sparse<T> {
         }
         // Reordering always rebuilds all active counts. A snapshot fork
         // needs no copy of the previous ordering's scratch arrays.
-        if self.markowitz_row.len() <= self.size && self.create_internal_vectors().is_err() {
+        if scratch.ensure_size(size).is_err() {
             return self.resource_failure();
         }
-        self.count_markowitz(step);
-        self.markowitz_products(step);
+        self.count_markowitz(scratch, step);
+        self.markowitz_products(scratch, step);
         while step <= size {
-            let Some(pivot) = self.search_for_pivot(step) else {
+            let Some(pivot) = self.search_for_pivot(scratch, step) else {
                 return self.matrix_is_singular(step);
             };
-            self.exchange_rows_and_cols(pivot, step);
-            self.row_col_elimination(pivot);
+            self.exchange_rows_and_cols(scratch, pivot, step);
+            self.row_col_elimination(Some(scratch), pivot);
             if matches!(
                 self.diagnostic.status(),
                 Status::Singular | Status::NonFinite | Status::Resource
             ) {
                 return self.diagnostic.status();
             }
-            self.update_markowitz_numbers(pivot);
+            self.update_markowitz_numbers(scratch, pivot);
             step += 1;
         }
         self.done()
@@ -1738,6 +1801,10 @@ impl<T: Scalar> Sparse<T> {
     }
 
     fn compile_runs<I: PlanIndex>(&self) -> Result<FactorRuns<I>, Status> {
+        let elements = &self.topology.elements;
+        if self.values.len() != elements.len() || !self.lifecycle.rows_linked() {
+            return Err(Status::InvalidPlan);
+        }
         let mut columns = Vec::new();
         columns
             .try_reserve_exact(self.size)
@@ -1752,40 +1819,71 @@ impl<T: Scalar> Sparse<T> {
             .map_err(|_| Status::Resource)?;
         let mut upper_row_entries = Vec::new();
 
+        let mut column_upper_count = 0;
         upper_row_start.push(I::pack(0).ok_or(Status::InvalidPlan)?);
         for i in 1..=self.size {
             let start = column_entries.len();
-            let diagonal = self.topology.diag[i];
+            let diagonal = *self.topology.diag.get(i).ok_or(Status::InvalidPlan)?;
             let mut diagonal_offset = None;
-            let mut e = self.topology.first_in_col[i];
+            let mut e = *self
+                .topology
+                .first_in_col
+                .get(i)
+                .ok_or(Status::InvalidPlan)?;
+            let mut previous = 0;
             while e != NONE {
-                if e == diagonal {
-                    diagonal_offset = Some(column_entries.len());
+                let element = elements.get(e).ok_or(Status::InvalidPlan)?;
+                // Strict coordinate order also rules out cyclic links and
+                // duplicate handles, before constructing packed offsets.
+                if element.col != i || element.row <= previous || element.row > self.size {
+                    return Err(Status::InvalidPlan);
                 }
-                column_entries.push(
-                    RunEntry::new(e, self.topology.elements[e].row).ok_or(Status::InvalidPlan)?,
-                );
-                e = self.topology.elements[e].next_in_col;
+                previous = element.row;
+                if element.row == i {
+                    if e != diagonal {
+                        return Err(Status::InvalidPlan);
+                    }
+                    diagonal_offset = Some(column_entries.len());
+                } else if element.row < i {
+                    column_upper_count += 1;
+                }
+                if column_entries.len() == elements.len() {
+                    return Err(Status::InvalidPlan);
+                }
+                column_entries.push(RunEntry::new(e, element.row).ok_or(Status::InvalidPlan)?);
+                e = element.next_in_col;
             }
-            columns.push(ColumnRun {
-                start: I::pack(start).ok_or(Status::InvalidPlan)?,
-                diagonal: I::pack(diagonal_offset.ok_or(Status::InvalidPlan)?)
-                    .ok_or(Status::InvalidPlan)?,
-                end: I::pack(column_entries.len()).ok_or(Status::InvalidPlan)?,
-            });
-            let mut e = self.topology.elements[diagonal].next_in_row;
+            columns.push(
+                ColumnRun::new(
+                    start,
+                    diagonal_offset.ok_or(Status::InvalidPlan)?,
+                    column_entries.len(),
+                )
+                .ok_or(Status::InvalidPlan)?,
+            );
+            let mut e = elements
+                .get(diagonal)
+                .ok_or(Status::InvalidPlan)?
+                .next_in_row;
+            let mut previous = i;
             while e != NONE {
+                let element = elements.get(e).ok_or(Status::InvalidPlan)?;
+                if element.row != i || element.col <= previous || element.col > self.size {
+                    return Err(Status::InvalidPlan);
+                }
+                previous = element.col;
                 if upper_row_entries.len() == upper_row_entries.capacity() {
                     upper_row_entries
                         .try_reserve(1)
                         .map_err(|_| Status::Resource)?;
                 }
-                upper_row_entries.push(
-                    RunEntry::new(e, self.topology.elements[e].col).ok_or(Status::InvalidPlan)?,
-                );
-                e = self.topology.elements[e].next_in_row;
+                upper_row_entries.push(RunEntry::new(e, element.col).ok_or(Status::InvalidPlan)?);
+                e = element.next_in_row;
             }
             upper_row_start.push(I::pack(upper_row_entries.len()).ok_or(Status::InvalidPlan)?);
+        }
+        if column_entries.len() != elements.len() || upper_row_entries.len() != column_upper_count {
+            return Err(Status::InvalidPlan);
         }
         Ok(FactorRuns {
             columns,
@@ -1862,20 +1960,8 @@ impl<T: Scalar> Sparse<T> {
         self.zero_pivot(step)
     }
 
-    /// `spcCreateInternalVectors`.
-    fn create_internal_vectors(&mut self) -> SpiceResult<()> {
-        let rows = sparse_rows(self.size)?;
-        let row = crate::primitives::filled_vec(rows, 0, "SPARSE Markowitz row counts")?;
-        let col = crate::primitives::filled_vec(rows, 0, "SPARSE Markowitz column counts")?;
-        let products = PivotProducts::new(rows + 1)?;
-        self.markowitz_row = row;
-        self.markowitz_col = col;
-        self.markowitz_prod = products;
-        Ok(())
-    }
-
     /// `CountMarkowitz` (no RHS).
-    fn count_markowitz(&mut self, step: usize) {
+    fn count_markowitz(&self, scratch: &mut Markowitz, step: usize) {
         for i in step..=self.size {
             let mut count = -1;
             let mut e = self.topology.first_in_row[i];
@@ -1886,7 +1972,7 @@ impl<T: Scalar> Sparse<T> {
                 count += 1;
                 e = self.topology.elements[e].next_in_row;
             }
-            self.markowitz_row[i] = count;
+            scratch.row[i] = count;
         }
         for i in step..=self.size {
             let mut count = -1;
@@ -1898,36 +1984,36 @@ impl<T: Scalar> Sparse<T> {
                 count += 1;
                 e = self.topology.elements[e].next_in_col;
             }
-            self.markowitz_col[i] = count;
+            scratch.col[i] = count;
         }
     }
 
     /// `MarkowitzProducts`.
-    fn markowitz_products(&mut self, step: usize) {
-        self.singletons = 0;
+    fn markowitz_products(&self, scratch: &mut Markowitz, step: usize) {
+        scratch.singletons = 0;
         for i in step..=self.size {
-            let product = self.markowitz_row[i].saturating_mul(self.markowitz_col[i]);
-            self.markowitz_prod.set(i, product);
+            let product = scratch.row[i].saturating_mul(scratch.col[i]);
+            scratch.products.set(i, product);
             if product == 0 {
-                self.singletons += 1;
+                scratch.singletons += 1;
             }
         }
     }
 
     /// `SearchForPivot` with diagonal pivoting.
-    fn search_for_pivot(&mut self, step: usize) -> Option<usize> {
-        if self.singletons != 0
-            && let Some(pivot) = self.search_for_singleton(step)
+    fn search_for_pivot(&mut self, scratch: &mut Markowitz, step: usize) -> Option<usize> {
+        if scratch.singletons != 0
+            && let Some(pivot) = self.search_for_singleton(scratch, step)
         {
             return Some(pivot);
         }
-        if let Some(pivot) = self.quickly_search_diagonal(step) {
+        if let Some(pivot) = self.quickly_search_diagonal(scratch, step) {
             return Some(pivot);
         }
-        if let Some(pivot) = self.search_diagonal(step) {
+        if let Some(pivot) = self.search_diagonal(scratch, step) {
             return Some(pivot);
         }
-        self.search_entire_matrix(step)
+        self.search_entire_matrix(scratch, step)
     }
 
     fn acceptable(&self, pivot: usize, step: usize) -> bool {
@@ -1937,12 +2023,12 @@ impl<T: Scalar> Sparse<T> {
     }
 
     /// `SearchForSingleton`.
-    fn search_for_singleton(&mut self, step: usize) -> Option<usize> {
+    fn search_for_singleton(&self, scratch: &mut Markowitz, step: usize) -> Option<usize> {
         let size = self.size;
-        self.markowitz_prod.set(size + 1, self.markowitz_prod[step]);
-        let mut singletons = self.singletons;
-        self.singletons -= 1;
-        self.markowitz_prod.set(step - 1, 0);
+        scratch.products.set(size + 1, scratch.products[step]);
+        let mut singletons = scratch.singletons;
+        scratch.singletons -= 1;
+        scratch.products.set(step - 1, 0);
         // C advances a pointer *after* testing each product. Track the
         // next index plus one instead: the first read is size + 1 and each
         // subsequent read moves left, preserving C's sentinel and pivot
@@ -1950,7 +2036,7 @@ impl<T: Scalar> Sparse<T> {
         let mut cursor = size + 2;
         while singletons > 0 {
             singletons -= 1;
-            let Some(next) = self.markowitz_prod.previous_zero(cursor) else {
+            let Some(next) = scratch.products.previous_zero(cursor) else {
                 break;
             };
             cursor = next;
@@ -1971,19 +2057,19 @@ impl<T: Scalar> Sparse<T> {
                 return Some(diag);
             }
         }
-        self.singletons += 1;
+        scratch.singletons += 1;
         None
     }
 
     /// `QuicklySearchDiagonal` (without `MODIFIED_MARKOWITZ`).
-    fn quickly_search_diagonal(&mut self, step: usize) -> Option<usize> {
+    fn quickly_search_diagonal(&self, scratch: &mut Markowitz, step: usize) -> Option<usize> {
         let size = self.size;
         let mut chosen = NONE;
         let mut min = i64::MAX;
-        self.markowitz_prod.set(size + 1, self.markowitz_prod[step]);
-        self.markowitz_prod.set(step - 1, -1);
+        scratch.products.set(size + 1, scratch.products[step]);
+        scratch.products.set(step - 1, -1);
         let mut p = size + 2;
-        while let Some(next) = self.markowitz_prod.previous_below(p, min) {
+        while let Some(next) = scratch.products.previous_below(p, min) {
             p = next;
             let mut i = p;
             if i < step {
@@ -2000,7 +2086,7 @@ impl<T: Scalar> Sparse<T> {
             if magnitude <= self.abs_threshold {
                 continue;
             }
-            if self.markowitz_prod[p] == 1 {
+            if scratch.products[p] == 1 {
                 let mut other_row = self.topology.elements[diag].next_in_row;
                 let mut other_col = self.topology.elements[diag].next_in_col;
                 if other_row == NONE && other_col == NONE {
@@ -2032,7 +2118,7 @@ impl<T: Scalar> Sparse<T> {
                     }
                 }
             }
-            min = self.markowitz_prod[p];
+            min = scratch.products[p];
             chosen = diag;
         }
         if chosen != NONE {
@@ -2046,15 +2132,15 @@ impl<T: Scalar> Sparse<T> {
     }
 
     /// `SearchDiagonal`.
-    fn search_diagonal(&mut self, step: usize) -> Option<usize> {
+    fn search_diagonal(&self, scratch: &mut Markowitz, step: usize) -> Option<usize> {
         let size = self.size;
         let mut chosen = NONE;
         let mut min = i64::MAX;
         let mut ties = 0;
         let mut accepted_ratio = 0.0;
-        self.markowitz_prod.set(size + 1, self.markowitz_prod[step]);
+        scratch.products.set(size + 1, scratch.products[step]);
         for j in (step + 1..=size + 1).rev() {
-            let product = self.markowitz_prod[j];
+            let product = scratch.products[j];
             if product > min {
                 continue;
             }
@@ -2092,7 +2178,7 @@ impl<T: Scalar> Sparse<T> {
     }
 
     /// `SearchEntireMatrix`. Sets `SmallPivot`/`Singular` like C.
-    fn search_entire_matrix(&mut self, step: usize) -> Option<usize> {
+    fn search_entire_matrix(&mut self, scratch: &Markowitz, step: usize) -> Option<usize> {
         let mut chosen = NONE;
         let mut largest_element = NONE;
         let mut largest_mag = 0.0;
@@ -2115,8 +2201,7 @@ impl<T: Scalar> Sparse<T> {
                     largest_element = e;
                 }
                 let element = &self.topology.elements[e];
-                let product =
-                    self.markowitz_row[element.row].saturating_mul(self.markowitz_col[element.col]);
+                let product = scratch.row[element.row].saturating_mul(scratch.col[element.col]);
                 if product <= min
                     && magnitude > self.rel_threshold * largest_in_col
                     && magnitude > self.abs_threshold
@@ -2194,22 +2279,8 @@ impl<T: Scalar> Sparse<T> {
         largest
     }
 
-    fn product_of(&self, i: usize) -> i64 {
-        self.markowitz_row[i].saturating_mul(self.markowitz_col[i])
-    }
-
-    const fn track_singleton(&mut self, new: i64, old: i64) {
-        if (new == 0) != (old == 0) {
-            if old == 0 {
-                self.singletons -= 1;
-            } else {
-                self.singletons += 1;
-            }
-        }
-    }
-
     /// `ExchangeRowsAndCols`.
-    fn exchange_rows_and_cols(&mut self, pivot: usize, step: usize) {
+    fn exchange_rows_and_cols(&mut self, scratch: &mut Markowitz, pivot: usize, step: usize) {
         let row = self.topology.elements[pivot].row;
         let col = self.topology.elements[pivot].col;
         if row == step && col == step {
@@ -2217,27 +2288,27 @@ impl<T: Scalar> Sparse<T> {
         }
         self.lifecycle.invalidate_structure(false);
         if row == col {
-            self.row_exchange(step, row);
-            self.col_exchange(step, col);
-            self.markowitz_prod.swap(step, row);
+            self.row_exchange(scratch, step, row);
+            self.col_exchange(scratch, step, col);
+            scratch.products.swap(step, row);
             std::sync::Arc::make_mut(&mut self.topology)
                 .diag
                 .swap(row, step);
         } else {
-            let old_step = self.markowitz_prod[step];
-            let old_row = self.markowitz_prod[row];
-            let old_col = self.markowitz_prod[col];
+            let old_step = scratch.products[step];
+            let old_row = scratch.products[row];
+            let old_col = scratch.products[col];
             if row != step {
-                self.row_exchange(step, row);
+                self.row_exchange(scratch, step, row);
                 self.parity.toggle();
-                self.markowitz_prod.set(row, self.product_of(row));
-                self.track_singleton(self.markowitz_prod[row], old_row);
+                scratch.products.set(row, scratch.product_of(row));
+                scratch.track_singleton(scratch.products[row], old_row);
             }
             if col != step {
-                self.col_exchange(step, col);
+                self.col_exchange(scratch, step, col);
                 self.parity.toggle();
-                self.markowitz_prod.set(col, self.product_of(col));
-                self.track_singleton(self.markowitz_prod[col], old_col);
+                scratch.products.set(col, scratch.product_of(col));
+                scratch.track_singleton(scratch.products[col], old_col);
                 std::sync::Arc::make_mut(&mut self.topology).diag[col] =
                     self.find_element_in_col(Slot::Head(col), col);
             }
@@ -2247,24 +2318,24 @@ impl<T: Scalar> Sparse<T> {
             }
             std::sync::Arc::make_mut(&mut self.topology).diag[step] =
                 self.find_element_in_col(Slot::Head(step), step);
-            self.markowitz_prod.set(step, self.product_of(step));
-            self.track_singleton(self.markowitz_prod[step], old_step);
+            scratch.products.set(step, scratch.product_of(step));
+            scratch.track_singleton(scratch.products[step], old_step);
         }
     }
 
     /// Exchange rows in the linked topology and Markowitz counts.
-    fn row_exchange(&mut self, a: usize, b: usize) {
+    fn row_exchange(&mut self, scratch: &mut Markowitz, a: usize, b: usize) {
         std::sync::Arc::make_mut(&mut self.topology).row_exchange(a, b);
-        self.markowitz_row.swap(a, b);
+        scratch.row.swap(a, b);
     }
 
-    fn col_exchange(&mut self, a: usize, b: usize) {
+    fn col_exchange(&mut self, scratch: &mut Markowitz, a: usize, b: usize) {
         std::sync::Arc::make_mut(&mut self.topology).col_exchange(a, b);
-        self.markowitz_col.swap(a, b);
+        scratch.col.swap(a, b);
     }
 
     /// `RealRowColElimination` / `ComplexRowColElimination`.
-    fn row_col_elimination(&mut self, pivot: usize) {
+    fn row_col_elimination(&mut self, mut scratch: Option<&mut Markowitz>, pivot: usize) {
         if self.values[pivot].mag() == 0.0 {
             let row = self.topology.elements[pivot].row;
             self.matrix_is_singular(row);
@@ -2295,7 +2366,12 @@ impl<T: Scalar> Sparse<T> {
                     sub = self.topology.elements[sub].next_in_col;
                 }
                 if sub == NONE || self.topology.elements[sub].row > row {
-                    let Ok(element) = self.create_fillin(row, upper_col, Slot::After(above)) else {
+                    let Ok(element) = self.create_fillin(
+                        scratch.as_deref_mut(),
+                        row,
+                        upper_col,
+                        Slot::After(above),
+                    ) else {
                         self.resource_failure();
                         return;
                     };
@@ -2317,24 +2393,24 @@ impl<T: Scalar> Sparse<T> {
     }
 
     /// `UpdateMarkowitzNumbers`.
-    fn update_markowitz_numbers(&mut self, pivot: usize) {
+    fn update_markowitz_numbers(&self, scratch: &mut Markowitz, pivot: usize) {
         let mut e = self.topology.elements[pivot].next_in_col;
         while e != NONE {
             let row = self.topology.elements[e].row;
-            self.markowitz_row[row] -= 1;
-            self.markowitz_prod.set(row, self.product_of(row));
-            if self.markowitz_row[row] == 0 {
-                self.singletons += 1;
+            scratch.row[row] -= 1;
+            scratch.products.set(row, scratch.product_of(row));
+            if scratch.row[row] == 0 {
+                scratch.singletons += 1;
             }
             e = self.topology.elements[e].next_in_col;
         }
         let mut e = self.topology.elements[pivot].next_in_row;
         while e != NONE {
             let col = self.topology.elements[e].col;
-            self.markowitz_col[col] -= 1;
-            self.markowitz_prod.set(col, self.product_of(col));
-            if self.markowitz_col[col] == 0 && self.markowitz_row[col] != 0 {
-                self.singletons += 1;
+            scratch.col[col] -= 1;
+            scratch.products.set(col, scratch.product_of(col));
+            if scratch.col[col] == 0 && scratch.row[col] != 0 {
+                scratch.singletons += 1;
             }
             e = self.topology.elements[e].next_in_row;
         }
@@ -2342,22 +2418,30 @@ impl<T: Scalar> Sparse<T> {
 
     /// `CreateFillin`: the elimination merge has already located the
     /// exact predecessor in its sorted column. Do not rescan its prefix.
-    fn create_fillin(&mut self, row: usize, col: usize, above: Slot) -> SpiceResult<usize> {
+    fn create_fillin(
+        &mut self,
+        scratch: Option<&mut Markowitz>,
+        row: usize,
+        col: usize,
+        above: Slot,
+    ) -> SpiceResult<usize> {
         debug_assert!(matches!(above, Slot::After(e) if self.topology.elements[e].row < row));
         debug_assert!({
             let next = self.topology.col_get(above);
             next == NONE || self.topology.elements[next].row > row
         });
         let element = self.create_element(row, col, above, true)?;
-        self.markowitz_row[row] += 1;
-        self.markowitz_prod.set(row, self.product_of(row));
-        if self.markowitz_row[row] == 1 && self.markowitz_col[row] != 0 {
-            self.singletons -= 1;
-        }
-        self.markowitz_col[col] += 1;
-        self.markowitz_prod.set(col, self.product_of(col));
-        if self.markowitz_row[col] != 0 && self.markowitz_col[col] == 1 {
-            self.singletons -= 1;
+        if let Some(scratch) = scratch {
+            scratch.row[row] += 1;
+            scratch.products.set(row, scratch.product_of(row));
+            if scratch.row[row] == 1 && scratch.col[row] != 0 {
+                scratch.singletons -= 1;
+            }
+            scratch.col[col] += 1;
+            scratch.products.set(col, scratch.product_of(col));
+            if scratch.row[col] != 0 && scratch.col[col] == 1 {
+                scratch.singletons -= 1;
+            }
         }
         Ok(element)
     }
@@ -2671,6 +2755,114 @@ mod tests {
                 .is_err()
         );
         assert_eq!(workspace, vec![42.0]);
+    }
+
+    #[test]
+    fn lifecycle_rejects_stale_factors_after_every_numeric_edit() {
+        let entries = [(1, 1, 3.), (1, 2, 1.), (2, 1, 2.), (2, 2, 4.)];
+        let input = entries.map(|(_, _, v)| v);
+        let mut m = build(2, &entries);
+        assert!(matches!(m.lifecycle, Lifecycle::ColumnsOnly));
+        assert!(m.factors().is_err());
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        assert!(matches!(m.lifecycle, Lifecycle::Factored(_)));
+        let plan = m.lifecycle.plan().unwrap().clone();
+        let handle = m.get_element(1, 1).unwrap();
+        assert!(m.factors().is_ok(), "existing-handle lookup is read-only");
+        let edits: [fn(&mut Sparse<f64>, SolverElement); 6] = [
+            |frame: &mut Sparse<f64>, h| frame.set(h, 1.),
+            |frame: &mut Sparse<f64>, h| frame.add(h, 1.),
+            |frame: &mut Sparse<f64>, _| frame.load_gmin(1.),
+            |frame: &mut Sparse<f64>, _| frame.zero_col(1).unwrap(),
+            |frame: &mut Sparse<f64>, _| frame.add_col(1, 2).unwrap(),
+            |frame: &mut Sparse<f64>, _| frame.clear(),
+        ];
+        for edit in edits {
+            let saved = m.clone();
+            let rhs = [4., 6.];
+            let expected = saved.solve(&rhs);
+            edit(&mut m, handle);
+            assert!(m.factors().is_err());
+            assert!(matches!(m.lifecycle, Lifecycle::Symbolic(_)));
+            assert!(std::sync::Arc::ptr_eq(m.lifecycle.plan().unwrap(), &plan));
+            assert_eq!(saved.solve(&rhs), expected);
+            m.reload_originals(&input);
+            assert_eq!(m.factor(), Status::Okay);
+            assert_eq!(m.solve(&rhs), expected);
+        }
+        let retyped: Sparse<Complex> = m.into_retyped();
+        assert!(matches!(retyped.lifecycle, Lifecycle::Symbolic(_)));
+        assert!(retyped.factors().is_err());
+    }
+
+    #[test]
+    fn plan_construction_rejects_inconsistent_links_and_offsets() {
+        let entries = [(1, 1, 3.), (1, 2, 1.), (2, 1, 2.), (2, 2, 4.)];
+        let mut original = build(2, &entries);
+        assert_eq!(original.order_and_factor(1e-3, 0.), Status::Okay);
+        let corruptions: [fn(&mut Topology); 6] = [
+            |topology: &mut Topology| topology.diag[1] = NONE,
+            |topology: &mut Topology| topology.first_in_col[1] = topology.elements.len(),
+            |topology: &mut Topology| {
+                let head = topology.first_in_col[1];
+                topology.elements[head].next_in_col = head;
+            },
+            |topology: &mut Topology| {
+                let head = topology.first_in_col[1];
+                topology.elements[head].row = 0;
+            },
+            |topology: &mut Topology| {
+                let h = topology.diag[1];
+                topology.elements[h].next_in_row = NONE;
+            },
+            |topology: &mut Topology| {
+                let h = topology.diag[1];
+                topology.elements[h].next_in_row = h;
+            },
+        ];
+        for corrupt in corruptions {
+            let mut frame = original.clone();
+            corrupt(std::sync::Arc::make_mut(&mut frame.topology));
+            frame.lifecycle = Lifecycle::Unordered;
+            assert!(matches!(
+                frame.compile_runs::<u32>(),
+                Err(Status::InvalidPlan)
+            ));
+            assert!(matches!(
+                frame.compile_runs::<usize>(),
+                Err(Status::InvalidPlan)
+            ));
+        }
+        assert!(ColumnRun::<u32>::new(0, 0, 0).is_none());
+        assert!(ColumnRun::<usize>::new(3, 2, 4).is_none());
+        if let Ok(max) = usize::try_from(u64::from(u32::MAX) + 1) {
+            assert!(ColumnRun::<u32>::new(0, 0, max).is_none());
+            assert!(ColumnRun::<usize>::new(0, 0, max).is_some());
+        }
+    }
+
+    #[test]
+    fn zero_diagonal_and_nonfinite_failures_have_distinct_retry_states() {
+        let entries = [(1, 1, 2.), (2, 2, 3.)];
+        let input = entries.map(|(_, _, v)| v);
+        let mut m = build(2, &entries);
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        let plan = m.lifecycle.plan().unwrap().clone();
+        m.reload_originals(&[0., 3.]);
+        assert_eq!(m.factor(), Status::ZeroDiag);
+        assert!(matches!(m.lifecycle, Lifecycle::Symbolic(_)));
+        assert!(m.factors().is_err());
+        assert_ne!(m.where_singular(), (0, 0));
+        m.reload_originals(&[f64::NAN, 3.]);
+        assert_eq!(m.factor(), Status::NonFinite);
+        assert!(matches!(m.lifecycle, Lifecycle::ReorderRequired(_)));
+        assert!(m.factors().is_err());
+        assert_eq!(m.where_singular(), (0, 0));
+        m.reload_originals(&input);
+        assert!(!m.can_refactor());
+        assert_eq!(m.factor(), Status::Okay);
+        assert!(std::sync::Arc::ptr_eq(m.lifecycle.plan().unwrap(), &plan));
+        assert!(m.factors().is_ok());
     }
 
     #[test]
@@ -3109,9 +3301,9 @@ mod tests {
         let next = std::sync::Arc::get_mut(&mut changed).unwrap();
         assert_eq!(&next.values[..4], &[8., 1., 2., 5.]);
         assert!(next.values[4..].iter().all(|v| *v == 0.));
-        assert!(next.markowitz_row.is_empty());
-        assert!(next.markowitz_col.is_empty());
-        assert!(next.markowitz_prod.is_empty());
+        assert!(next.ordering_scratch.row.is_empty());
+        assert!(next.ordering_scratch.col.is_empty());
+        assert!(next.ordering_scratch.products.is_empty());
         assert_eq!(next.factor(), Status::Okay);
         assert_ne!(next.solve(&rhs), expected);
         assert!(std::sync::Arc::ptr_eq(
@@ -3123,11 +3315,11 @@ mod tests {
         // must be allocated before searching and creating fill-ins.
         next.reload_originals(&[0., 1., 2., 5.]);
         assert_eq!(next.order_and_factor(1e-3, 0.), Status::Okay);
-        assert!(!next.markowitz_row.is_empty());
+        assert!(!next.ordering_scratch.row.is_empty());
         assert_eq!(saved.solve(&rhs), expected);
         let c: Sparse<Complex> = Sparse::retype_shared(std::sync::Arc::clone(&saved));
         assert!(c.values.iter().all(|v| *v == Complex::ZERO));
-        assert!(c.markowitz_row.is_empty());
+        assert!(c.ordering_scratch.row.is_empty());
         assert_eq!(saved.solve(&rhs), expected);
     }
 
@@ -3227,21 +3419,22 @@ mod tests {
         // step must be returned from that sentinel before scanning other
         // positions. Otherwise the scan proceeds from the highest index.
         let mut m = build(4, &[(1, 1, 5.), (2, 2, 2.), (3, 3, 3.), (4, 4, 4.)]);
-        m.create_internal_vectors().unwrap();
+        let mut scratch = Markowitz::default();
+        scratch.ensure_size(m.size).unwrap();
         for i in 1..=4 {
-            m.markowitz_prod.set(i, 0);
+            scratch.products.set(i, 0);
         }
-        m.singletons = 4;
-        let pivot = m.search_for_singleton(1).unwrap();
+        scratch.singletons = 4;
+        let pivot = m.search_for_singleton(&mut scratch, 1).unwrap();
         assert_eq!(m.topology.elements[pivot].row, 1);
 
         // The sentinel is not a singleton: the search selects the highest
         // remaining zero-product diagonal, never reading a negative index.
         for (i, v) in [1, 1, 0, 0].into_iter().enumerate() {
-            m.markowitz_prod.set(i + 1, v);
+            scratch.products.set(i + 1, v);
         }
-        m.singletons = 2;
-        let pivot = m.search_for_singleton(1).unwrap();
+        scratch.singletons = 2;
+        let pivot = m.search_for_singleton(&mut scratch, 1).unwrap();
         assert_eq!(m.topology.elements[pivot].row, 4);
     }
 

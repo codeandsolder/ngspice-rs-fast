@@ -72,6 +72,38 @@ configuration matches ngspice's `spconfig.h`: `TRANSLATE`, `EXPANDABLE`,
   whatever the deck's options, and `method=bdf` is an explicit error from the
   companion driver: ngspice has no BDF integrator.
 
+## SPARSE frame lifecycle (#34)
+
+A frame has one explicit ordering/factor lifecycle. Original columns are
+unlinked; row linking makes an unordered topology. A threshold reorder
+that changes a previously ordered topology and then encounters singularity
+retains its partial numbering for a subsequent retry. A complete symbolic
+state holds an immutable packed traversal; only a factored state holds
+valid numeric LU together with that traversal. Nonfinite or resource
+failures require a full ordering again, retaining the old traversal only
+if its topology remains unchanged. A zero diagonal in fixed-order
+refactor preserves the complete symbolic order for reload/retry.
+
+Reload, clear, scalar conversion and any coefficient mutation invalidate
+numeric factors; adding an original structural entry requires a new
+ordering. Obtaining an existing element handle alone does not invalidate
+factors. Immutable factor views borrow the topology and numeric values,
+so only a valid factor view can solve, transpose-solve or compute the
+determinant. Singular, zero-diagonal and small-pivot diagnostics carry
+their respective external coordinates; nonfinite/resource failures
+cannot inherit a stale singular coordinate.
+
+Packed runs validate handle bounds, strict row/column traversal order,
+diagonal placement and offset representability at construction. Compact
+and wide runs have the same numeric kernels; plan validation is not
+repeated on numeric refactor. Markowitz arrays are borrowed for a single
+ordering operation, then retained for allocation reuse. They are never
+cloned into a retained snapshot and are not consulted while eliminating
+an accepted pivot prefix. Only an actual new search initializes their
+active counts. Topology and complete plans remain shared across snapshots
+and scalar conversions; pivot traversal order, fill-in creation order,
+arithmetic, determinant parity and untranslated RHS bits are unchanged.
+
 ## Error policy (C's)
 
 - `spSINGULAR` and `spZERO_DIAG` are errors (`E_SINGULAR`). Circuit solves
