@@ -233,6 +233,39 @@ fn bind_projection(
     })
 }
 
+fn bind_axes(
+    header: &Plot,
+    kind: AnalysisKind,
+    has_measurements: bool,
+    observations: &[Observation],
+) -> SpiceResult<(Option<AxisTracker>, Option<usize>)> {
+    // Direct observations are not restricted to the .measure grammar.
+    // Frequency-bearing noise, distortion and AC sensitivity plots use
+    // their physical scale; integrated/one-point plots have none.
+    let scale = measure::axis_name(header, kind).ok().or_else(|| {
+        (matches!(
+            kind,
+            AnalysisKind::Noise | AnalysisKind::Distortion | AnalysisKind::Sensitivity
+        ) && header.variable_index("frequency").is_some())
+        .then_some("frequency")
+    });
+    let axis = if has_measurements {
+        Some(AxisTracker::bind(header, kind)?)
+    } else if observations
+        .iter()
+        .any(|request| matches!(request.reduction, ObservationReduction::At(_)))
+    {
+        Some(AxisTracker::bind_named(
+            header,
+            scale.ok_or_else(|| invalid("point query requires a physical scale"))?,
+        )?)
+    } else {
+        None
+    };
+    let trace_axis = scale.and_then(|name| header.variable_index(name));
+    Ok((axis, trace_axis))
+}
+
 impl PlotObjectivePlan {
     /// Bind one output's requirements against its immutable column schema.
     /// The header may come from a prepared schema or a representative run;
@@ -253,30 +286,7 @@ impl PlotObjectivePlan {
             retained_cell_limit,
         } = requests;
         measure::bounded_count(measurements.iter())?;
-        // Direct observations are not restricted to the .measure grammar.
-        // Frequency-bearing noise, distortion and AC sensitivity plots use
-        // their physical scale; integrated/one-point plots have none.
-        let scale = measure::axis_name(header, kind).ok().or_else(|| {
-            (matches!(
-                kind,
-                AnalysisKind::Noise | AnalysisKind::Distortion | AnalysisKind::Sensitivity
-            ) && header.variable_index("frequency").is_some())
-            .then_some("frequency")
-        });
-        let axis = if !measurements.is_empty() {
-            Some(AxisTracker::bind(header, kind)?)
-        } else if observations
-            .iter()
-            .any(|request| matches!(request.reduction, ObservationReduction::At(_)))
-        {
-            Some(AxisTracker::bind_named(
-                header,
-                scale.ok_or_else(|| invalid("point query requires a physical scale"))?,
-            )?)
-        } else {
-            None
-        };
-        let trace_axis = scale.and_then(|name| header.variable_index(name));
+        let (axis, trace_axis) = bind_axes(header, kind, !measurements.is_empty(), &observations)?;
         let mut required = Vec::new();
         if let Some(axis) = &axis {
             required.push(axis.column());
