@@ -595,7 +595,7 @@ fn weighted_difference(weight: Real, left: Real, right: Real, addend: Real) -> R
     if difference.is_finite() {
         weight.mul_add(difference, addend)
     } else {
-        (weight + weight).mul_add(left * 0.5 - right * 0.5, addend)
+        (weight + weight).mul_add(right.mul_add(-0.5, left * 0.5), addend)
     }
 }
 
