@@ -3,7 +3,7 @@
 //! loads (`vsrcload.c`, `vsrcacld.c`, `isrcload.c`, `isrcacld.c`).
 
 use super::{
-    DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter as P, SensitivityRecord,
 };
 use crate::devices::IndependentSource;
@@ -57,7 +57,7 @@ impl<'a> SourceSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for SourceSensitivity<'_> {
+impl SensitivityKernel for SourceSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         if self.source.voltage {
             SensitivityFamily::VoltageSource
@@ -86,27 +86,27 @@ impl DeviceSensitivity for SourceSensitivity<'_> {
         let dc = self.source.dc;
         let ac = self.source.ac.input;
         let input = ac.unwrap_or_default();
-        let mut instance = SensitivityRecord::new()
-            .with("dc", if dc.given() { dc.value() } else { 0. }, dc.given())
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance)
+            .with("dc", if dc.given() { dc.value() } else { 0. }, dc.given())?
             .with(
                 "acmag",
                 input.magnitude.unwrap_or(0.),
                 input.magnitude.is_some(),
-            )
-            .with("acphase", input.phase.unwrap_or(0.), input.phase.is_some())
-            .with("ac", 0., ac.is_some())
+            )?
+            .with("acphase", input.phase.unwrap_or(0.), input.phase.is_some())?
+            .with("ac", 0., ac.is_some())?
             .with(
                 "m",
                 self.source.multiplier.unwrap_or(1.),
                 self.source.multiplier.is_some(),
-            )
-            .with("z0", 0., false)
-            .with("pwr", 0., false)
-            .with("freq", 0., false)
-            .with("phase", 0., false)
-            .with("acreal", 0., false)
-            .with("acimag", 0., false);
-        let mut model = SensitivityRecord::new();
+            )?
+            .with("z0", 0., false)?
+            .with("pwr", 0., false)?
+            .with("freq", 0., false)?
+            .with("phase", 0., false)?
+            .with("acreal", 0., false)?
+            .with("acimag", 0., false)?;
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         self.temperature(&mut model, &mut instance)?;
         Ok((model, instance))
     }

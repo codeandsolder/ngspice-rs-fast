@@ -17,9 +17,9 @@
 use super::thermal::TemperatureCache;
 use super::{Diode, DiodeParameters, EPSMIN};
 use crate::devices::sensitivity::{
-    AcReset, CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, RecordPair, ResetStamp,
-    ResetStamps, SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
-    SensitivityRecord, StampAt, StampPart, written,
+    AcReset, CELSIUS_TO_KELVIN, ParameterScope, RecordPair, ResetStamp, ResetStamps,
+    SensitivityFamily, SensitivityKernel, SensitivityLoad, SensitivityMode,
+    SensitivityParameter as P, SensitivityRecord, StampAt, StampPart, written,
 };
 use crate::devices::{Device, LinearContext, StampContext};
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
@@ -237,7 +237,7 @@ fn setup_diode_instance(
     instance.store("ikp", model.value("ikp")? * pj * m)
 }
 
-impl DeviceSensitivity for DiodeSensitivity<'_> {
+impl SensitivityKernel for DiodeSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Diode
     }
@@ -256,16 +256,16 @@ impl DeviceSensitivity for DiodeSensitivity<'_> {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (m, i) = &*self.diode.written;
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for keyword in MODEL_FIELDS {
             let value = written(m, port_name(keyword));
             let value = match (*keyword, value) {
                 ("tnom", Some(celsius)) => Some(celsius + CELSIUS_TO_KELVIN),
                 (_, value) => value,
             };
-            model = model.with(keyword, value.unwrap_or(0.), value.is_some());
+            model = model.with(keyword, value.unwrap_or(0.), value.is_some())?;
         }
-        let mut instance = SensitivityRecord::new();
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
         for keyword in INSTANCE_FIELDS {
             let value = match *keyword {
                 "ikf" | "ikr" | "ikp" => None,
@@ -273,7 +273,7 @@ impl DeviceSensitivity for DiodeSensitivity<'_> {
                 "temp" => written(i, "temp").map(|t| t + CELSIUS_TO_KELVIN),
                 other => written(i, other),
             };
-            instance = instance.with(keyword, value.unwrap_or(0.), value.is_some());
+            instance = instance.with(keyword, value.unwrap_or(0.), value.is_some())?;
         }
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
@@ -566,7 +566,7 @@ impl DiodeSensitivity<'_> {
 }
 
 /// A diode's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetDiode {
     /// Built from the records of the reset load, which sets the junction

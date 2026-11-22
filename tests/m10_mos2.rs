@@ -394,7 +394,7 @@ fn model_card_current(body: &str) -> f64 {
     let plot = op(&mut circuit(&format!(
         "vd d 0 3\nvg g 0 2\nvsense s 0 0\n{body}"
     )));
-    plot.points[0][plot.variable_index("i(vsense)").unwrap()].re
+    plot.points()[0][plot.variable_index("i(vsense)").unwrap()].re
 }
 
 #[test]

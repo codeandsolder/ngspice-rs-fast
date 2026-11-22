@@ -36,8 +36,8 @@ fn run(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> Plot {
 fn value(plot: &Plot, name: &str, point: usize) -> f64 {
     let index = plot
         .variable_index(name)
-        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables));
-    plot.points[point][index].re
+        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
+    plot.points()[point][index].re
 }
 fn close(a: f64, b: f64, relative: f64, absolute: f64) {
     assert!(
@@ -319,7 +319,7 @@ fn a_hfet1_card_is_noiseless_and_linear_in_distortion() {
         .run(&mut c, &request, &config.context())
         .unwrap();
     let names: Vec<&str> = plot
-        .variables
+        .variables()
         .iter()
         .map(|variable| variable.name.as_str())
         .collect();
@@ -371,7 +371,7 @@ fn sensitivity_follows_hfet1s_table_and_cs_temperature_quirks() {
         .run(&mut circuit, &request, &config.context())
         .unwrap();
     let names: Vec<&str> = plot
-        .variables
+        .variables()
         .iter()
         .map(|variable| variable.name.as_str())
         .filter(|name| name.starts_with("v(z1"))
@@ -408,7 +408,7 @@ fn sensitivity_runs_for_a_p_channel_card() {
         .run(&mut circuit, &request, &config.context())
         .unwrap();
     let index = plot.variable_index("v(z2:vt0)").expect("vt0 column");
-    let value = plot.points[0][index].re;
+    let value = plot.points()[0][index].re;
     // The first step multiplies the stored -0.15 by -1 once, so the column is
     // the finite difference across that product rather than across `vt0`.
     assert!(value.is_finite(), "{value}");

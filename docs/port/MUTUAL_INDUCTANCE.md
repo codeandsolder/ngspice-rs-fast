@@ -80,6 +80,56 @@ its transient grows without bound and its AC answer has no physical meaning,
 so the port refuses it in every analysis rather than reproducing C's numbers.
 The opt-in test `c_mutual_inductance` shows that C only warns for `k = 1.5`.
 
+## Resource-bounded coupling setup and validation
+
+Each K card declares a clique, but connectivity is found by joining only its
+first inductor to each of the others. Case-insensitive duplicate-name checks
+and resolved-device checks use ordered sets; reference resolution and
+connectivity do not expand the clique. Checked arithmetic preflights pair
+counts, estimated mutual-specific payload, connected-group sizes and minimum
+sparse validation work before allocating pair records or matrix positions.
+
+`MutualLimits` configures five independent limits. The defaults are:
+
+| Limit | Default |
+| --- | ---: |
+| Pair contributions (including repeated K cards) | 1,000,000 |
+| Inductors per connected group | 250,000 |
+| Estimated coupled-system storage payload | 512 MiB |
+| Dense validation payload (matrix plus Jacobi workspace) | 64 MiB |
+| Validation element-visit and rotation work budget | 1,000,000,000 |
+
+The storage estimate accounts for typed pair/edge records, reference indices,
+matrix position declarations, current and cached mutual terms, and validation
+vectors. It is not a process RSS bound: allocator overhead, unrelated circuit
+storage and arbitrary external clones are excluded. Pair expansion and
+ordering are bounded by the pair count (at most O(P log P) work); the
+validation work budget is shared across all groups and, when necessary, both
+diagonal conventions. Pass explicit limits to
+`Circuit::from_netlist_with_mutual_limits` or `Circuit::with_mutual_limits`
+for programmatic circuit construction. The first failing K card or group's
+first K card supplies the resource error's location.
+
+For PSD validation only, repeated contributions to an unordered matrix cell
+are summed in their original pair order. Simulation stamps retain each
+individual contribution and C's reverse instance order. The normalized matrix
+keeps its unit diagonal, including zero self-inductance rows. Gershgorin
+bounds, first unweighted and then with positive row-sum-derived weights,
+accumulate absolute cell values with upward-rounded products, sums and
+quotients. A radius no larger than `1 + 32 n eps` proves all eigenvalues
+lie within a stricter region than the original tolerance (`max|lambda| >= 1`
+by the unit diagonal). Sparse certificates need O(n + P) scalar visits and
+O(n) validation storage, with no dense matrix.
+
+Uncertified systems use the existing Jacobi eigensolver and exactly its
+original tolerance. Before allocating the matrix the implementation charges
+the peak dense payload and worst-case cost of 100 full Jacobi sweeps;
+insufficient budget is a resource error, never acceptance of an unchecked
+matrix. Large valid but non-diagonally-dominant systems may therefore need an
+explicitly larger budget. The undivided C-diagonal classification is still
+performed only when the actual stamped matrix is found indefinite. A proof
+can accept a matrix for which the old iterative solver failed to converge.
+
 ## Verification
 
 - C goldens in `cargo xtask golden verify`: `transformer_ac` (1:2 transformer,

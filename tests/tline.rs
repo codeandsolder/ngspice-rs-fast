@@ -335,7 +335,9 @@ fn generated_node_collision_rolls_back_just_appended_nodes() {
     let collision = nodes.intern("t1#int2").unwrap();
     nodes.set_kind(collision, NodeKind::Internal);
     let before = nodes.nodes().to_vec();
-    let err = TransmissionLine::instantiate(&parsed.devices[0], &mut nodes).unwrap_err();
+    let err = nodes
+        .transaction(|nodes| TransmissionLine::instantiate(&parsed.devices[0], nodes))
+        .unwrap_err();
     assert!(err.to_string().contains("collision"));
     assert_eq!(nodes.nodes(), before);
     for name in ["a", "b", "t1#i1", "t1#i2", "t1#int1"] {

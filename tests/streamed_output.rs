@@ -53,7 +53,7 @@ struct Recorder {
 impl PointSink for Recorder {
     fn begin(&mut self, header: &Plot) -> SpiceResult<()> {
         assert!(self.header.is_none(), "begin is called once");
-        assert!(header.points.is_empty(), "the header holds no points");
+        assert!(header.points().is_empty(), "the header holds no points");
         self.header = Some(header.clone());
         Ok(())
     }
@@ -85,14 +85,14 @@ fn assert_streams_the_stored_plot(body: &str) {
         .run_into(&mut circuit, &request, &config.context(), &mut recorder)
         .unwrap();
 
-    assert!(returned.points.is_empty(), "run_into returns no points");
+    assert!(returned.points().is_empty(), "run_into returns no points");
     let header = recorder.header.expect("the sink saw a header");
-    assert_eq!(header.variables, stored.variables);
+    assert_eq!(header.variables(), stored.variables());
     assert_eq!(header.plotname, stored.plotname);
-    assert_eq!(returned.variables, stored.variables);
-    assert!(!stored.points.is_empty());
+    assert_eq!(returned.variables(), stored.variables());
+    assert!(!stored.points().is_empty());
     // Bit-identical rows: streaming changes where points go, not what they are.
-    assert_eq!(recorder.points, stored.points);
+    assert_eq!(recorder.points, stored.points());
     assert_eq!(circuit.final_transient_state(), final_state);
 }
 
@@ -179,25 +179,28 @@ fn a_sink_error_stops_the_transient_with_that_error() {
 }
 
 fn sample_plots() -> RawFile {
-    let mut real = Plot::new("tran1", "Transient Analysis", PlotFlags::Real);
+    let mut real = Plot::builder("tran1", "Transient Analysis", PlotFlags::Real);
     real.push_variable(Variable::new("time", "time"));
     real.push_variable(Variable::new("v(out)", "voltage"));
+    let mut real = real.build();
     for index in 0..5 {
         let t = f64::from(index) * 1e-4;
         real.push_point(vec![Complex::real(t), Complex::real((-t / 1e-3).exp())])
             .unwrap();
     }
-    let mut complex = Plot::new("ac1", "AC Analysis", PlotFlags::Complex);
+    let mut complex = Plot::builder("ac1", "AC Analysis", PlotFlags::Complex);
     complex.push_variable(Variable::new("frequency", "frequency"));
     complex.push_variable(Variable::complex("v(out)", "voltage"));
+    let mut complex = complex.build();
     for index in 0..3 {
         let f = 10f64.powi(index);
         complex
             .push_point(vec![Complex::real(f), Complex::new(1.0 / f, -0.5 / f)])
             .unwrap();
     }
-    let mut empty = Plot::new("tran2", "Transient Analysis", PlotFlags::Real);
+    let mut empty = Plot::builder("tran2", "Transient Analysis", PlotFlags::Real);
     empty.push_variable(Variable::new("time", "time"));
+    let empty = empty.build();
     RawFile {
         plots: [real, complex, empty]
             .into_iter()
@@ -230,11 +233,11 @@ fn streamed_and_stored_plots_write_the_same_bytes() {
         writer.write_plot(&rawfile.plots[0]).unwrap();
         for raw_plot in &rawfile.plots[1..] {
             let mut plot = writer.begin_plot(raw_plot.clone(), &spool).unwrap();
-            assert!(plot.header().plot.points.is_empty());
-            for point in &raw_plot.plot.points {
+            assert!(plot.header().plot.points().is_empty());
+            for point in raw_plot.plot.points() {
                 plot.push_point(point).unwrap();
             }
-            assert_eq!(plot.point_count(), raw_plot.plot.points.len());
+            assert_eq!(plot.point_count(), raw_plot.plot.points().len());
             writer.finish_plot(plot).unwrap();
             assert!(!spool.exists(), "finishing removes the spool");
         }
@@ -264,7 +267,7 @@ fn streamed_and_stored_plots_write_the_same_bytes() {
         );
         if format.is_binary() {
             for (actual, expected) in parsed.plots.iter().zip(&rawfile.plots) {
-                assert_eq!(actual.plot.points, expected.plot.points);
+                assert_eq!(actual.plot.points(), expected.plot.points());
             }
         }
     }
@@ -324,7 +327,7 @@ fn a_streamed_binary_plot_cannot_cross_byte_orders() {
     )
     .unwrap();
     let mut plot = origin.begin_plot(rawfile.plots[0].clone(), &spool).unwrap();
-    plot.push_point(&rawfile.plots[0].plot.points[0]).unwrap();
+    plot.push_point(&rawfile.plots[0].plot.points()[0]).unwrap();
     assert!(writer.finish_plot(plot).is_err());
     writer.finish().unwrap();
     origin.finish().unwrap();

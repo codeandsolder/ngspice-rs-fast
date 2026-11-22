@@ -242,7 +242,7 @@ fn xmu_matches_c_on_a_common_grid() {
 
 /// Exact equality of two plots (same points, same values).
 fn identical(a: &Plot, b: &Plot) -> bool {
-    a.point_count() == b.point_count() && a.points == b.points
+    a.point_count() == b.point_count() && a.points() == b.points()
 }
 
 #[test]

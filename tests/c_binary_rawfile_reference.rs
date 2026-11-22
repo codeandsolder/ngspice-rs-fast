@@ -114,7 +114,7 @@ fn c_binary_rawfiles_match_the_c_ascii_oracle() {
         let got_plot = &got_header.plot;
         let want_plot = &want_header.plot;
         assert_eq!(got_plot.plotname, want_plot.plotname, "{binary_file}");
-        assert_eq!(got_plot.flags, want_plot.flags, "{binary_file}: flags");
+        assert_eq!(got_plot.flags(), want_plot.flags(), "{binary_file}: flags");
         assert_eq!(
             got_plot.variable_count(),
             want_plot.variable_count(),
@@ -125,7 +125,8 @@ fn c_binary_rawfiles_match_the_c_ascii_oracle() {
             want_plot.point_count(),
             "{binary_file}: point count"
         );
-        for (got_variable, want_variable) in got_plot.variables.iter().zip(&want_plot.variables) {
+        for (got_variable, want_variable) in got_plot.variables().iter().zip(want_plot.variables())
+        {
             assert_eq!(got_variable.name, want_variable.name, "{binary_file}: name");
             assert_eq!(got_variable.unit, want_variable.unit, "{binary_file}: unit");
         }
@@ -133,7 +134,7 @@ fn c_binary_rawfiles_match_the_c_ascii_oracle() {
         // The payload is exact; the ASCII oracle prints `%.15e`, so only it can
         // be off by a ULP or two.
         for row in 0..want_plot.point_count() {
-            for variable in &want_plot.variables {
+            for variable in want_plot.variables() {
                 let read = got_plot.value(&variable.name, row).unwrap();
                 let printed = want_plot.value(&variable.name, row).unwrap();
                 let tolerance = 1e-14 * printed.magnitude() + 1e-300;
@@ -167,7 +168,7 @@ fn c_binary_rawfiles_match_the_c_ascii_oracle() {
     // The operating point is not only self-consistent: it is the divider's.
     let op = RawFile::load(directory.join("op_bin.raw")).unwrap();
     let plot = &op.plots[0].plot;
-    assert_eq!(plot.flags, PlotFlags::Real);
+    assert_eq!(plot.flags(), PlotFlags::Real);
     assert_eq!(plot.point_count(), 1);
     assert_eq!(plot.value("v(in)", 0), Some(Complex::real(2.0)));
     assert_eq!(plot.value("v(out)", 0), Some(Complex::real(1.0)));
@@ -176,8 +177,8 @@ fn c_binary_rawfiles_match_the_c_ascii_oracle() {
     // The AC plot is complex and holds the swept frequencies.
     let ac = RawFile::load(directory.join("ac_bin.raw")).unwrap();
     let plot = &ac.plots[0].plot;
-    assert_eq!(plot.flags, PlotFlags::Complex);
-    assert!(plot.variables.iter().all(|variable| !variable.is_real));
+    assert_eq!(plot.flags(), PlotFlags::Complex);
+    assert!(plot.variables().iter().all(|variable| !variable.is_real));
     assert_eq!(plot.point_count(), 4);
     let frequencies = plot.column("frequency").unwrap();
     assert_eq!(frequencies[0], Complex::new(1e2, 0.0));

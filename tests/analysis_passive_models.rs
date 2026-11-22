@@ -36,7 +36,7 @@ fn close(got: f64, want: f64, relative: f64, absolute: f64) {
 fn equal(got: &Plot, want: &Plot, ac: bool) {
     assert_eq!(got.point_count(), want.point_count());
     assert_eq!(got.variable_count(), want.variable_count());
-    for var in &want.variables {
+    for var in want.variables() {
         for point in 0..want.point_count() {
             let a = got.value(&var.name, point).unwrap();
             let b = want.value(&var.name, point).unwrap();
@@ -207,7 +207,7 @@ fn modeled_rlc_uic_matches_literal_coupled_transient_bitwise() {
         .unwrap();
     assert_eq!(a.point_count(), b.point_count());
     assert_eq!(a.variable_count(), b.variable_count());
-    for var in &b.variables {
+    for var in b.variables() {
         for point in 0..b.point_count() {
             let got = a.value(&var.name, point).unwrap();
             let expected = b.value(&var.name, point).unwrap();

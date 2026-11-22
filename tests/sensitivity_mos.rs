@@ -14,7 +14,7 @@ fn run(text: &str) -> SpiceResult<Plot> {
     runner(request.kind)?.run(&mut config.circuit(&netlist)?, &request, &config.context())
 }
 fn value(plot: &Plot, name: &str) -> f64 {
-    plot.points[0][plot
+    plot.points()[0][plot
         .variable_index(name)
         .unwrap_or_else(|| panic!("missing {name}"))]
     .re
@@ -35,7 +35,7 @@ fn fixture(level: u8, per_device: usize) {
     // The control `write` used to capture goldens sorts vectors after the
     // scale; batch-mode table order is checked separately by c_sens_reference.
     let variables = |p: &Plot| {
-        p.variables
+        p.variables()
             .iter()
             .map(|v| (v.name.clone(), v.unit.clone(), v.is_real))
             .collect::<std::collections::BTreeSet<_>>()
@@ -45,8 +45,8 @@ fn fixture(level: u8, per_device: usize) {
         variables(reference),
         "level {level}: names/units"
     );
-    assert_eq!(plot.points.len(), 1);
-    for variable in &reference.variables {
+    assert_eq!(plot.points().len(), 1);
+    for variable in reference.variables() {
         let a = value(&plot, &variable.name);
         let b = value(reference, &variable.name);
         assert!(
@@ -57,7 +57,7 @@ fn fixture(level: u8, per_device: usize) {
     }
     for instance in ["m1", "m2", "m3"] {
         let count = plot
-            .variables
+            .variables()
             .iter()
             .filter(|v| v.name.starts_with(&format!("v({instance}")))
             .count();
@@ -213,7 +213,7 @@ fn a_model_card_multiplier_does_not_scale_the_columns() {
         .model mm nmos level=1 {}\n.sens i(vsense)\n.end\n";
     let with = run(&body.replace("{}", "m=3 w=25u l=12u")).unwrap();
     let without = run(&body.replace("{}", "w=25u l=12u")).unwrap();
-    assert_eq!(with.variables.len(), without.variables.len());
+    assert_eq!(with.variables().len(), without.variables().len());
     for name in [
         "v(m1:kp)",
         "v(m1:vto)",

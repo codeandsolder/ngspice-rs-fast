@@ -123,7 +123,7 @@ use crate::devices::traits::{AnalysisMode, Device, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::primitives::{
-    NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, almost_equal_ulps,
+    NodeAppend, NodeId, Real, SourceLoc, SpiceError, SpiceResult, almost_equal_ulps,
     parse_spice_number,
 };
 
@@ -499,7 +499,7 @@ impl LossyLine {
     /// setters or node-name collisions.
     pub fn instantiate(
         instance: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         models: &ModelResolver<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Self> {
@@ -1387,13 +1387,11 @@ mod tests {
             ))
             .unwrap();
         let models = ModelResolver::new(&deck.models).unwrap();
-        LossyLine::instantiate(
-            &deck.devices[0],
-            &mut NodeTable::default(),
-            &models,
-            &ModelContext::default(),
-        )
-        .unwrap()
+        crate::primitives::NodeTable::default()
+            .transaction(|nodes| {
+                LossyLine::instantiate(&deck.devices[0], nodes, &models, &ModelContext::default())
+            })
+            .unwrap()
     }
 
     #[test]

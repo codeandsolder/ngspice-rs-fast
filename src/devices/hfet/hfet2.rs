@@ -72,7 +72,7 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
@@ -80,7 +80,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
 
 /// C `CONSTKoverQ`.
 const K_OVER_Q: Real = BOLTZMANN / CHARGE;
@@ -345,7 +345,7 @@ pub(in crate::devices) struct Hfet2 {
 impl Hfet2 {
     pub(crate) fn instantiate(
         i: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         resolved: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -364,25 +364,26 @@ impl Hfet2 {
         let (model, model_defaults) = Model::resolve(resolved)?;
         let (initial, setters) = Instance::resolve(i)?;
         let instance = Instance::validate(&model_defaults, &setters, &i.location)?;
-        let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "HFET2")?;
-        // C creates source and drain primes in this order.
-        let sp = topology.prime(model.rs, "source", s)?;
-        let dp = topology.prime(model.rd, "drain", d)?;
-        let nodes_of = Nodes { d, g, s, sp, dp };
-        let (staged, terminals) = topology.finish();
-        let device = Self {
-            name: i.name.clone(),
-            model_name: resolved.card().name.clone(),
-            terminals,
-            nodes: nodes_of,
-            model,
-            instance,
-            initial,
-            temperature_cache: TemperatureCache::new(),
-        };
-        device.derived(context.temperature)?;
-        *nodes = staged;
-        Ok(Box::new(device))
+        nodes.transaction(|nodes| {
+            let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "HFET2")?;
+            // C creates source and drain primes in this order.
+            let sp = topology.prime(model.rs, "source", s)?;
+            let dp = topology.prime(model.rd, "drain", d)?;
+            let nodes_of = Nodes { d, g, s, sp, dp };
+            let terminals = topology.finish();
+            let device = Self {
+                name: i.name.clone(),
+                model_name: resolved.card().name.clone(),
+                terminals,
+                nodes: nodes_of,
+                model,
+                instance,
+                initial,
+                temperature_cache: TemperatureCache::new(),
+            };
+            device.derived(context.temperature)?;
+            Ok(Box::new(device) as Box<dyn Device>)
+        })
     }
 
     /// `hfet2temp.c`. `temperature` is Celsius (`CKTtemp`), while `TEMP` is
@@ -933,7 +934,10 @@ impl Device for Hfet2 {
     ///   `hfet2param.c` stores it in kelvin.
     /// - `HFET2_VT1`/`VT2` are model fields that follow the raw `VTO` (not the
     ///   type-scaled `TVTO`) whenever they are not given.
-    fn sensitivity(&self, context: &ModelContext) -> SpiceResult<Box<dyn DeviceSensitivity + '_>> {
+    fn sensitivity(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
         Ok(Box::new(Hfet2Sensitivity::new(self, context)))
     }
 
@@ -1074,7 +1078,7 @@ impl<'a> Hfet2Sensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for Hfet2Sensitivity<'_> {
+impl SensitivityKernel for Hfet2Sensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Hfet2
     }
@@ -1093,7 +1097,7 @@ impl DeviceSensitivity for Hfet2Sensitivity<'_> {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let m = &self.device.model;
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for (keyword, value, given) in [
             ("cf", m.cf, true),
             ("d1", m.d1, true),
@@ -1136,12 +1140,13 @@ impl DeviceSensitivity for Hfet2Sensitivity<'_> {
             ("vt1", m.vt1.unwrap_or(0.), m.vt1.is_some()),
             ("vt2", m.vt2.unwrap_or(0.), m.vt2.is_some()),
         ] {
-            model = model.with(keyword, value, given);
+            model = model.with(keyword, value, given)?;
         }
-        let mut instance = self
-            .device
-            .instance
-            .sensitivity_record(&self.device.initial, self.circuit_kelvin);
+        let mut instance = self.device.instance.sensitivity_record(
+            self.family(),
+            &self.device.initial,
+            self.circuit_kelvin,
+        )?;
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
         Ok((model, instance))
@@ -1295,7 +1300,7 @@ impl Hfet2Sensitivity<'_> {
 }
 
 /// An HFET2's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetHfet2 {
     /// Built from the reset load's records: the gate and channel

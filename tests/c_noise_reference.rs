@@ -93,7 +93,7 @@ fn compare(name: &str, deck_text: &str) {
     assert_eq!(titles(&got), titles(&want), "{name}: plot sequence");
     for (index, (got, want)) in got.plots.iter().zip(&want.plots).enumerate() {
         let (got, want) = (&got.plot, &want.plot);
-        assert_eq!(got.flags, want.flags, "{name}: plot {index}");
+        assert_eq!(got.flags(), want.flags(), "{name}: plot {index}");
         assert_eq!(
             got.point_count(),
             want.point_count(),
@@ -102,7 +102,7 @@ fn compare(name: &str, deck_text: &str) {
         if is_noise(want) {
             // The noise layout is C's own: names, order and units.
             let layout = |plot: &Plot| -> Vec<(String, String)> {
-                plot.variables
+                plot.variables()
                     .iter()
                     .map(|v| (v.name.clone(), v.unit.clone()))
                     .collect()
@@ -114,7 +114,7 @@ fn compare(name: &str, deck_text: &str) {
         // the nonlinear DC/AC bound. Values are compared by C's names (the
         // port writes simulator-internal nodes that C's batch plots omit).
         let floor = if is_noise(want) { 1e-20 } else { 1e-12 };
-        for variable in &want.variables {
+        for variable in want.variables() {
             let want_column = want.column(&variable.name).unwrap();
             let got_column = got
                 .column(&variable.name)

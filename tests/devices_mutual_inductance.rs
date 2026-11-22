@@ -5,7 +5,8 @@
 use std::path::Path;
 
 use ngspice_rs::devices::{
-    AnalysisMode, Circuit, LoadRequest, ModelContext, MutualInductance, Registry, StorageKind,
+    AnalysisMode, Circuit, LoadRequest, ModelContext, MutualInductance, MutualLimits, Registry,
+    StorageKind,
 };
 use ngspice_rs::maths::integrator::DEFAULT_XMU;
 use ngspice_rs::maths::{IntegrationMethod, SparseMatrix, StepHistory, Vector};
@@ -363,4 +364,179 @@ fn independent_coupling_groups_keep_pair_order_and_local_diagnostics() {
     close(updated[index("l3")][0].inductance, 0.002);
     assert_eq!(updated[index("l1")], terms[index("l1")]);
     assert_eq!(c.mutual_terms(&ModelContext::default()).unwrap(), terms);
+}
+
+fn bounded_circuit(body: &str, limits: MutualLimits) -> SpiceResult<Circuit> {
+    let netlist = Parser::new().parse_deck(&parse_deck_text(
+        Path::new("limits.cir"),
+        &format!("mutual limits\n{body}\n.end\n"),
+    ))?;
+    Circuit::from_netlist_with_mutual_limits(&netlist, &ModelContext::default(), limits)
+}
+
+fn resource_error(error: SpiceError, expected: &str) {
+    assert!(
+        matches!(
+            error,
+            SpiceError::Unsupported {
+                location: Some(_),
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(error.to_string().contains(expected), "{error}");
+}
+
+#[test]
+fn pair_and_group_limits_are_preflighted_before_expansion() {
+    use std::fmt::Write;
+    let mut large = String::from("klarge");
+    for i in 0..10_000 {
+        write!(large, " l{i}").unwrap();
+    }
+    large.push_str(" 0.01");
+    resource_error(
+        bounded_circuit(&large, MutualLimits::default()).unwrap_err(),
+        "mutual pair limit exceeded",
+    );
+    let overlap = "l1 a 0 1\nl2 b 0 1\nl3 c 0 1\nl4 d 0 1\nk1 l1 l2 l3 0.1\nk2 l2 l3 l4 0.1";
+    resource_error(
+        bounded_circuit(
+            overlap,
+            MutualLimits {
+                pairs: 5,
+                ..MutualLimits::default()
+            },
+        )
+        .unwrap_err(),
+        "k2: mutual pair limit exceeded",
+    );
+    resource_error(
+        bounded_circuit(
+            overlap,
+            MutualLimits {
+                group_inductors: 3,
+                ..MutualLimits::default()
+            },
+        )
+        .unwrap_err(),
+        "connected-group size limit exceeded",
+    );
+    bounded_circuit(
+        overlap,
+        MutualLimits {
+            pairs: 6,
+            group_inductors: 4,
+            ..MutualLimits::default()
+        },
+    )
+    .unwrap();
+    resource_error(
+        bounded_circuit(
+            overlap,
+            MutualLimits {
+                storage_bytes: 0,
+                ..MutualLimits::default()
+            },
+        )
+        .unwrap_err(),
+        "mutual storage limit exceeded",
+    );
+    resource_error(
+        bounded_circuit(
+            overlap,
+            MutualLimits {
+                validation_work: 0,
+                ..MutualLimits::default()
+            },
+        )
+        .unwrap_err(),
+        "mutual validation work limit exceeded",
+    );
+    bounded_circuit(
+        "l1 a 0 1",
+        MutualLimits {
+            storage_bytes: 0,
+            validation_work: 0,
+            ..MutualLimits::default()
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn failed_binding_does_not_publish_partial_terms_or_setup() {
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("limits.cir"),
+            "mutual limits\nl1 a 0 1\nl2 b 0 1\nk1 l1 l2 0.5\n.end\n",
+        ))
+        .unwrap();
+    let models = ngspice_rs::devices::models::ModelResolver::new(&netlist.models).unwrap();
+    let mut circuit = Circuit::with_mutual_limits(MutualLimits {
+        pairs: 0,
+        ..MutualLimits::default()
+    });
+    circuit
+        .add_instances(&netlist.devices, &models, &ModelContext::default())
+        .unwrap();
+    circuit.rebuild_unknowns();
+    resource_error(
+        circuit.mutual_terms(&ModelContext::default()).unwrap_err(),
+        "mutual pair limit",
+    );
+    resource_error(circuit.setup_elements(2).unwrap_err(), "mutual pair limit");
+    resource_error(circuit.finalize().unwrap_err(), "mutual pair limit");
+}
+
+#[test]
+fn sparse_validation_preserves_repeated_pair_order_and_zero_inductance() {
+    let c = bounded_circuit(
+        "l1 a 0 1\nl2 b 0 1\nl0 c 0 0\nk1 l1 l2 1e16\nk2 l2 l1 -1e16\nk3 l1 l2 0.25\nk0 l0 l1 100",
+        MutualLimits {
+            dense_bytes: 0,
+            ..MutualLimits::default()
+        },
+    )
+    .unwrap();
+    let terms = c.mutual_terms(&ModelContext::default()).unwrap();
+    assert_eq!(
+        terms[0]
+            .iter()
+            .map(|term| term.inductance.to_bits())
+            .collect::<Vec<_>>(),
+        [0.0_f64, 0.25, -1e16, 1e16].map(f64::to_bits)
+    );
+    assert_eq!(
+        terms[1]
+            .iter()
+            .map(|term| term.inductance.to_bits())
+            .collect::<Vec<_>>(),
+        [0.25_f64, -1e16, 1e16].map(f64::to_bits)
+    );
+    assert_eq!(terms[2][0].inductance, 0.0);
+}
+
+#[test]
+fn large_sparse_chain_needs_no_dense_matrix() {
+    use std::fmt::Write;
+    let nodes = 10_000;
+    let mut deck = String::new();
+    for i in 0..nodes {
+        writeln!(deck, "l{i} n{i} 0 1").unwrap();
+    }
+    for i in 1..nodes {
+        writeln!(deck, "k{i} l{} l{i} 0.5", i - 1).unwrap();
+    }
+    let c = bounded_circuit(
+        &deck,
+        MutualLimits {
+            dense_bytes: 0,
+            ..MutualLimits::default()
+        },
+    )
+    .unwrap();
+    let terms = c.mutual_terms(&ModelContext::default()).unwrap();
+    assert_eq!(terms.iter().map(Vec::len).sum::<usize>(), 2 * (nodes - 1));
 }

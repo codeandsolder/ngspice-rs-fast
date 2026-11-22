@@ -84,7 +84,7 @@ fn compare(name: &str, deck_text: &str) {
     assert_eq!(titles(&got), titles(&want), "{name}: plot sequence");
     for (index, (got, want)) in got.plots.iter().zip(&want.plots).enumerate() {
         let (got, want): (&Plot, &Plot) = (&got.plot, &want.plot);
-        assert_eq!(got.flags, want.flags, "{name}: plot {index}");
+        assert_eq!(got.flags(), want.flags(), "{name}: plot {index}");
         assert_eq!(
             got.point_count(),
             want.point_count(),
@@ -97,13 +97,13 @@ fn compare(name: &str, deck_text: &str) {
         } else {
             1e-12
         };
-        for variable in &want.variables {
+        for variable in want.variables() {
             let want_column = want.column(&variable.name).unwrap();
             let got_column = got
                 .column(&variable.name)
                 .unwrap_or_else(|| panic!("{name}: plot {index} lacks {}", variable.name));
             assert_eq!(
-                got.variables[got.variable_index(&variable.name).unwrap()].unit,
+                got.variables()[got.variable_index(&variable.name).unwrap()].unit,
                 variable.unit,
                 "{name}: plot {index} '{}'",
                 variable.name

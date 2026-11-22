@@ -37,8 +37,8 @@ fn run(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> Plot {
 fn value(plot: &Plot, name: &str, point: usize) -> f64 {
     let index = plot
         .variable_index(name)
-        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables));
-    plot.points[point][index].re
+        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
+    plot.points()[point][index].re
 }
 fn close(a: f64, b: f64, relative: f64, absolute: f64) {
     assert!(
@@ -271,7 +271,7 @@ fn sensitivity_covers_hfet2s_tables() {
         .run(&mut circuit, &request, &config.context())
         .unwrap();
     let names: Vec<&str> = plot
-        .variables
+        .variables()
         .iter()
         .map(|variable| variable.name.as_str())
         .filter(|name| name.starts_with("v(z1"))

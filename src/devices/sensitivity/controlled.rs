@@ -9,7 +9,7 @@
 //! after `m` was perturbed zeroes the coefficient). The port replays this.
 
 use super::{
-    DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter as P, SensitivityRecord,
 };
 use crate::devices::{ControlledKind, ControlledSource};
@@ -49,7 +49,7 @@ impl<'a> ControlledSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for ControlledSensitivity<'_> {
+impl SensitivityKernel for ControlledSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         match self.source.kind() {
             ControlledKind::Vcvs => SensitivityFamily::Vcvs,
@@ -74,10 +74,10 @@ impl DeviceSensitivity for ControlledSensitivity<'_> {
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (m, m_given) = self.multiplier.map_or((0., false), |m| (m, true));
         Ok((
-            SensitivityRecord::new(),
-            SensitivityRecord::new()
-                .with("gain", self.coefficient, true)
-                .with("m", m, m_given),
+            SensitivityRecord::new(self.family(), ParameterScope::Model),
+            SensitivityRecord::new(self.family(), ParameterScope::Instance)
+                .with("gain", self.coefficient, true)?
+                .with("m", m, m_given)?,
         ))
     }
 

@@ -6,8 +6,8 @@
 //! every DC sensitivity of theirs is exactly zero.
 
 use super::{
-    CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, PassiveInputs, RecordPair,
-    SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
+    CELSIUS_TO_KELVIN, ParameterScope, PassiveInputs, RecordPair, SensitivityFamily,
+    SensitivityKernel, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
     SensitivityRecord,
 };
 use crate::devices::{Device, LinearContext, StampContext};
@@ -194,7 +194,7 @@ const fn reactive_temperature_factor(tc1: Real, tc2: Real, difference: Real) -> 
     1.0 + tc1 * difference + tc2 * difference * difference
 }
 
-impl DeviceSensitivity for ReactiveSensitivity<'_> {
+impl SensitivityKernel for ReactiveSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         match self.kind {
             ReactiveKind::Capacitor => SensitivityFamily::Capacitor,
@@ -227,7 +227,7 @@ impl DeviceSensitivity for ReactiveSensitivity<'_> {
             ReactiveKind::Inductor => "inductance",
         };
         let build = |fields: &[&'static str], scope| {
-            let mut record = SensitivityRecord::new();
+            let mut record = SensitivityRecord::new(self.family(), scope);
             for keyword in fields {
                 let value = match scope {
                     ParameterScope::Model => self.inputs.model_value(keyword),
@@ -237,12 +237,12 @@ impl DeviceSensitivity for ReactiveSensitivity<'_> {
                     ("temp" | "tnom", Some(celsius)) => Some(celsius + CELSIUS_TO_KELVIN),
                     (_, value) => value,
                 };
-                record = record.with(keyword, value.unwrap_or(0.), value.is_some());
+                record = record.with(keyword, value.unwrap_or(0.), value.is_some())?;
             }
-            record
+            Ok::<_, SpiceError>(record)
         };
-        let mut model = build(model_fields, ParameterScope::Model);
-        let mut instance = build(instance_fields, ParameterScope::Instance);
+        let mut model = build(model_fields, ParameterScope::Model)?;
+        let mut instance = build(instance_fields, ParameterScope::Instance)?;
         // The instance value is kept as C's `CAPcapacinst`/`INDinductinst`.
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;

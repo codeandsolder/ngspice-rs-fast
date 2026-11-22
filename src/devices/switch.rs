@@ -69,7 +69,7 @@
 
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
-use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
 
 use crate::devices::noise::{DeviceNoise, NoiseContext, NoiseFamily, NoiseKind, NoiseSource};
 use crate::devices::schema::{ScalarDomain, ScalarParameter, ScalarSchema, ScalarUnit};
@@ -364,7 +364,7 @@ impl Switch {
     /// Validation happens before any node is interned.
     pub(crate) fn instantiate(
         instance: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         model: &ResolvedModel<'_>,
         _context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -428,13 +428,14 @@ impl Switch {
                 format!("{} needs a controlling voltage source", instance.name),
             ));
         }
-        let mut staged = nodes.clone();
-        let terminals = instance
-            .nodes
-            .iter()
-            .map(|node| staged.intern(node))
-            .collect::<SpiceResult<Vec<_>>>()?;
-        *nodes = staged;
+        let terminals = nodes.transaction(|staged| {
+            let terminals = instance
+                .nodes
+                .iter()
+                .map(|node| staged.intern(node))
+                .collect::<SpiceResult<Vec<_>>>()?;
+            Ok(terminals)
+        })?;
         Ok(Box::new(Self {
             name: instance.name.clone(),
             model_name: card.name.clone(),

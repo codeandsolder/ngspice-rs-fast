@@ -57,7 +57,7 @@ use crate::devices::traits::{AnalysisMode, Device, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::primitives::{
-    NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
+    NodeAppend, NodeId, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
 };
 
 /// C reference for errors.
@@ -268,7 +268,7 @@ impl TransmissionLine {
     /// Missing `z0`, invalid values, unknown setters or node-name collisions.
     pub fn instantiate(
         instance: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
     ) -> SpiceResult<Box<dyn Device>> {
         if instance.nodes.len() != 4 || instance.model.is_some() {
             return Err(SpiceError::circuit(format!(

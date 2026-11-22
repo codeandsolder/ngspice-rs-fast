@@ -41,14 +41,14 @@ fn run(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> Plot {
 fn value(plot: &Plot, name: &str, point: usize) -> f64 {
     let index = plot
         .variable_index(name)
-        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables));
-    plot.points[point][index].re
+        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
+    plot.points()[point][index].re
 }
 fn phase(plot: &Plot, name: &str, point: usize) -> (f64, f64) {
     let index = plot
         .variable_index(name)
-        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables));
-    let value = plot.points[point][index];
+        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
+    let value = plot.points()[point][index];
     (value.re, value.im)
 }
 fn close(a: f64, b: f64, relative: f64, absolute: f64) {
@@ -812,7 +812,7 @@ fn sensitivity_follows_mesa_cs_table_for_every_level() {
             .run(&mut c, &request, &config.context())
             .unwrap();
         let names: Vec<&str> = plot
-            .variables
+            .variables()
             .iter()
             .map(|variable| variable.name.as_str())
             .filter(|name| name.starts_with("v(z1"))
@@ -854,7 +854,7 @@ fn sensitivity_accepts_a_level_four_instance_at_a_shifted_temperature() {
             .run(&mut c, &request, &config.context())
             .unwrap();
         let names: Vec<&str> = plot
-            .variables
+            .variables()
             .iter()
             .map(|variable| variable.name.as_str())
             .collect();
