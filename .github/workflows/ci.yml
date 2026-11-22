@@ -17,7 +17,7 @@ permissions:
 jobs:
   rust:
     name: Stable Rust build, tests, lint, docs and goldens
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@d168449633a47de6c0166f0c0cff903e96983820 # main
     with:
       rust-toolchain: "1.100.0"
       rust-components: "clippy rustfmt"
@@ -31,7 +31,7 @@ jobs:
 
   msrv:
     name: MSRV on release tags
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@d168449633a47de6c0166f0c0cff903e96983820 # main
     with:
       validation-tier: release
       rust-toolchain: "1.89.0"
@@ -39,6 +39,6 @@ jobs:
 
   strict-rust:
     name: Strict Rust and workflow policy
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@3119e52afb16c956bd072363d1f64f0fd916afbb # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@c9dbc011bec3c43a65b62a16cbf2a3f2e31a13cb # main
     with:
       allow-test-panics: true
