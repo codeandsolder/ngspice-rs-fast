@@ -790,6 +790,49 @@ mod tests {
     }
 
     #[test]
+    fn predictor_uses_accepted_voltages_and_nonunit_ratio() {
+        let mut history = history();
+        let mut accepted = history.trial();
+        {
+            let mut states = history.device(&mut accepted, 0..COUNT).unwrap();
+            for slot in 0..COUNT {
+                states.set(slot, 0.).unwrap();
+            }
+            states.set(slot::VGS, -0.125).unwrap();
+            states.set(slot::VGD, -0.375).unwrap();
+            states.set(slot::CG, 1.).unwrap();
+            states.set(slot::CD, 2.).unwrap();
+            states.set(slot::GGS, 4.).unwrap();
+            states.set(slot::GGD, 8.).unwrap();
+            states.set(slot::GM, 16.).unwrap();
+        }
+        history.commit(accepted).unwrap();
+        let mut trial = history
+            .trial_in(IterationPhase::Predict, None)
+            .unwrap()
+            .with_device_limiting(true);
+        let states = history.device(&mut trial, 0..COUNT).unwrap();
+        let junctions = Junctions {
+            pol: 1.,
+            off: false,
+            vt: 0.025,
+            vcrit: 0.7,
+            vto: -2.,
+        };
+        let expected = [-0.0625, -0.3125];
+        let (voltage, start) = select_junctions(junctions, &states, [-0.9, -0.8], [0.; 2], 0.5);
+        assert_eq!(voltage, expected);
+        assert_eq!(
+            start,
+            Start::Limited {
+                icheck: false,
+                cghat: 1.75,
+                cdhat: 2.5
+            }
+        );
+    }
+
+    #[test]
     fn initial_transient_seed_is_family_specific_and_trial_local() {
         let history = history();
         let coefficients = StepHistory::new()

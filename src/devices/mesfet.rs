@@ -38,14 +38,13 @@
 //!
 //! # Deliberate divergences
 //!
-//! - As for the JFET (see [`crate::devices::jfet`]): no `MODEINITPRED`
-//!   extrapolation or bypass, any limited step keeps the load nonconvergent,
-//!   and `off` uses the shared held-load rule.
-//! - The transient Newton matrix is the exact Jacobian of C's equations: it
-//!   includes the cross derivatives of the incremental gate charges
-//!   (`d qgs / d vgd`, `d qgd / d vgs`) where `mesload.c` stamps each charge
-//!   as a two-terminal capacitance `qggnew` reports at the iterate. The
-//!   equations and their solution are C's; only the iteration differs.
+//! - As for the JFET (see [`crate::devices::jfet`]): no bypass, and
+//!   `off` uses the shared held-load rule. Predictor extrapolation and
+//!   the junction/current convergence checks use the shared lifecycle.
+//! - The transient matrix retains the two-terminal capacitance stamps
+//!   and the present-voltage Statz partials of `mesload.c`. The accepted
+//!   charge offset is carried into the first transient step rather than
+//!   reseeded by the gate integration routine.
 //! - An unlabeled leading value on the card is refused by the parser
 //!   ([`crate::netlist`]): INP2Z only reaches the `area` setter for a
 //!   non-MES model, and none of the MESA/HFET tables has that setter, so C
@@ -60,8 +59,7 @@
 //! - `FC` only feeds `mestemp.c`'s `depl_cap`/`f1`-`f3`, which `mesload.c`
 //!   never reads: it is validated as finite and has no effect, as in C.
 //!
-//! `.disto` (`mesdset.c`, `mesdisto.c`) and `.sens` fail with explicit
-//! errors.
+//! `.disto` and `.sens` use the separate model-specific reference paths.
 
 // C-compatible numerical expressions are kept in their reference order:
 // Clippy's fused multiply-add suggestions change IEEE-754 rounding.

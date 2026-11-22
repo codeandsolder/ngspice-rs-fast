@@ -580,8 +580,7 @@ impl Jfet {
         Ok(e)
     }
 
-    /// The `uic` initial conditions `[IC-VDS, IC-VGS]`; see
-    /// `jfetic.c`.
+    /// Conductances and gate capacitances at the retained bias.
     fn linearization(
         &self,
         context: &LinearContext<'_>,

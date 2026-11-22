@@ -60,8 +60,9 @@
 //!   `Q` positive; `Z`, `TAUD`, `TAUG`, `VST`, `DELTA`, `IBD`, `CDS`
 //!   nonnegative), and any nonfinite evaluation is an error.
 //!
-//! `.noise` (`jfet2noi.c`), `.disto` (C has no `DEVdisto` for level 2) and
-//! `.sens` fail with explicit errors.
+//! `.sens` replays the family-specific DC and AC reset loads; gate-lag
+//! and thermal memory remain part of the Parker model, not the shared
+//! gate lifecycle.
 
 // C-compatible numerical expressions are kept in their reference order:
 // Clippy's fused multiply-add suggestions change IEEE-754 rounding.
