@@ -1,4 +1,6 @@
 //! Explicit Fourier settings on analytic traces and C's exact saved sample grid.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run as run_process};
 use ngspice_rs::analysis::fourier::FourierSettings;
 use ngspice_rs::analysis::{Plot, PlotFlags, Variable, fourier};
 use ngspice_rs::netlist::Parser;
@@ -76,8 +78,8 @@ fn explicit_fourier_settings_match_c_on_c_samples() {
     use ngspice_rs::analysis::RawFile;
     let binary = std::env::var("NGSPICE_BIN").expect("NGSPICE_BIN");
     assert!(Path::new(&binary).is_absolute());
-    let dir = std::env::temp_dir().join(format!("m9-fourier-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let scratch = Scratch::new("m9-fourier").unwrap();
+    let dir = scratch.path();
     let raw = dir.join("samples.raw");
     let deck = dir.join("deck.cir");
     fs::write(
@@ -85,12 +87,18 @@ fn explicit_fourier_settings_match_c_on_c_samples() {
         "Four samples\nV1 out 0 sin(.5 1 1k)\nR1 out 0 1k\n.tran 1u 4m\n.end\n",
     )
     .unwrap();
-    let run = Command::new(&binary)
-        .args(["-b", "-r"])
-        .arg(&raw)
-        .arg(&deck)
-        .output()
-        .unwrap();
+    let run = run_process(
+        &binary,
+        dir,
+        &[
+            std::ffi::OsStr::new("-b"),
+            std::ffi::OsStr::new("-r"),
+            raw.as_os_str(),
+            deck.as_os_str(),
+        ],
+        ProcessLimits::ORACLE,
+    )
+    .unwrap();
     assert!(
         run.status.success(),
         "{}",
@@ -137,11 +145,13 @@ fn explicit_fourier_settings_match_c_on_c_samples() {
     {
         let control = dir.join(format!("read{index}.cir"));
         fs::write(&control,format!("Four compare\n.control\nload {}\nset nfreqs={} nperiods={} polydegree={} fourgridsize={}\nfourier 1k v(out)\nquit\n.endc\n.end\n",raw.display(),settings.nfreqs,settings.nperiods,settings.polydegree,settings.gridsize)).unwrap();
-        let run = Command::new(&binary)
-            .arg("-b")
-            .arg(&control)
-            .output()
-            .unwrap();
+        let run = run_process(
+            &binary,
+            dir,
+            &[std::ffi::OsStr::new("-b"), control.as_os_str()],
+            ProcessLimits::ORACLE,
+        )
+        .unwrap();
         let text = String::from_utf8_lossy(&run.stdout);
         assert!(run.status.success(), "{text}");
         let ours =
@@ -170,7 +180,6 @@ fn explicit_fourier_settings_match_c_on_c_samples() {
             );
         }
     }
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -208,8 +217,8 @@ fn fundamental_expressions_are_resolved_before_simulation() {
 
 #[test]
 fn cli_evaluates_fourier_parameters_and_preserves_output_on_failure() {
-    let dir = std::env::temp_dir().join(format!("m9-four-expr-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let scratch = Scratch::new("m9-fourier").unwrap();
+    let dir = scratch.path();
     let deck = dir.join("deck.cir");
     let raw = dir.join("out.raw");
     fs::write(&deck, "Expressions\n.param base=500\nV1 out 0 sin(0 1 1k)\nR1 out 0 1k\n.tran 1u 4m\n.four {2*base} v(out)\n.end\n").unwrap();
@@ -226,13 +235,12 @@ fn cli_evaluates_fourier_parameters_and_preserves_output_on_failure() {
     .unwrap();
     assert!(ngspice_rs::cli::simulate::run(&deck, &raw, true).is_err());
     assert_eq!(fs::read(&raw).unwrap(), original);
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn control_fourier_command_runs_through_the_process_interface() {
-    let dir = std::env::temp_dir().join(format!("m9-four-control-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let scratch = Scratch::new("m9-fourier").unwrap();
+    let dir = scratch.path();
     let deck = dir.join("deck.cir");
     let raw = dir.join("out.raw");
     let text = "Control Fourier\nV1 out 0 sin(.5 1 1k)\nR1 out 0 1k\n.tran 1u 4m\n.control\nset nfreqs=5 nperiods=2 polydegree=3 fourgridsize=256\nrun\nfourier 1k v(out)\nquit\n.endc\n.end\n";
@@ -284,5 +292,4 @@ fn control_fourier_command_runs_through_the_process_interface() {
         assert!(ngspice_rs::cli::simulate::run(&deck, &raw, true).is_err());
         assert_eq!(fs::read(&raw).unwrap(), b"previous");
     }
-    fs::remove_dir_all(dir).unwrap();
 }

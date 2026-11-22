@@ -1850,9 +1850,10 @@ fn extended_measurements_use_full_data_and_physical_axis() {
 fn c_reads_the_cli_binary_rawfile() {
     let binary = std::env::var("NGSPICE_BIN").expect("NGSPICE_BIN");
     assert!(Path::new(&binary).is_absolute());
-    let dir = scratch("c-binary-read");
+    let scratch = ngspice_conformance::ngspice::Scratch::new("c-binary-read").unwrap();
+    let dir = scratch.path();
     let deck = write_deck(
-        &dir,
+        dir,
         "binary C test\nV1 in 0 1 ac 1\nR1 in 0 1k\n.op\n.ac lin 2 1 2\n.end\n",
     );
     let raw = dir.join("out.raw");
@@ -1867,33 +1868,56 @@ fn c_reads_the_cli_binary_rawfile() {
     assert!(run.status.success(), "{}", stderr(&run));
     let control = dir.join("read.cir");
     fs::write(&control, format!("Read Rust binary\n.control\nload {}\nsetplot op1\nprint v(in)\nsetplot ac1\nprint v(in)\nquit\n.endc\n.end\n", raw.display())).unwrap();
-    let run = Command::new(binary)
-        .args(["-b"])
-        .arg(control)
-        .output()
-        .unwrap();
-    assert!(run.status.success(), "{}", stderr(&run));
+    let run = ngspice_conformance::process::run(
+        binary,
+        dir,
+        &[std::ffi::OsStr::new("-b"), control.as_os_str()],
+        ngspice_conformance::process::ProcessLimits::ORACLE,
+    )
+    .unwrap();
     assert!(
-        !stderr(&run).to_lowercase().contains("error"),
+        run.status.success(),
         "{}",
-        stderr(&run)
+        String::from_utf8_lossy(&run.stderr)
     );
-    assert!(stdout(&run).contains("1.000000e+00"), "{}", stdout(&run));
+    assert!(
+        !String::from_utf8_lossy(&run.stderr)
+            .to_lowercase()
+            .contains("error"),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("1.000000e+00"),
+        "{}",
+        String::from_utf8_lossy(&run.stdout)
+    );
 }
 
 #[test]
 #[ignore = "requires NGSPICE_BIN; compare ASCII plot legend and physical rows"]
 fn ascii_plot_data_match_c_text_output() {
     let binary = std::env::var("NGSPICE_BIN").expect("NGSPICE_BIN");
-    let dir = scratch("c-asciiplot");
+    let scratch = ngspice_conformance::ngspice::Scratch::new("c-asciiplot").unwrap();
+    let dir = scratch.path();
     let deck = write_deck(
-        &dir,
+        dir,
         "plot test\nV1 in 0 0\nR1 in 0 1k\n.dc v1 0 1 .25\n.plot dc v(in)\n.end\n",
     );
     let ours = simulate(&dir.join("out.raw"), &deck);
-    let theirs = Command::new(binary).arg("-b").arg(&deck).output().unwrap();
+    let theirs = ngspice_conformance::process::run(
+        binary,
+        dir,
+        &[std::ffi::OsStr::new("-b"), deck.as_os_str()],
+        ngspice_conformance::process::ProcessLimits::ORACLE,
+    )
+    .unwrap();
     assert!(ours.status.success(), "{}", stderr(&ours));
-    assert!(theirs.status.success(), "{}", stderr(&theirs));
+    assert!(
+        theirs.status.success(),
+        "{}",
+        String::from_utf8_lossy(&theirs.stderr)
+    );
     let rows = |text: String| -> Vec<(f64, f64)> {
         text.lines()
             .filter_map(|line| {
@@ -1905,9 +1929,20 @@ fn ascii_plot_data_match_c_text_output() {
             })
             .collect()
     };
-    assert!(stdout(&theirs).contains("Legend:"));
-    assert!(stdout(&theirs).contains("+ = v(in)"));
-    assert_eq!(rows(stdout(&ours)), rows(stdout(&theirs)));
+    assert!(
+        String::from_utf8_lossy(&theirs.stdout)
+            .into_owned()
+            .contains("Legend:")
+    );
+    assert!(
+        String::from_utf8_lossy(&theirs.stdout)
+            .into_owned()
+            .contains("+ = v(in)")
+    );
+    assert_eq!(
+        rows(stdout(&ours)),
+        rows(String::from_utf8_lossy(&theirs.stdout).into_owned())
+    );
     assert_eq!(rows(stdout(&ours)).len(), 5);
 }
 

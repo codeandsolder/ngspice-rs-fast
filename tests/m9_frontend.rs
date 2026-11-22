@@ -1,4 +1,5 @@
 //! M9 front-end cards in subcircuits: preserve syntax, expand per instance.
+use ngspice_conformance::ngspice::Scratch;
 use ngspice_rs::analysis::RunConfig;
 use ngspice_rs::devices::subckt::{SubcircuitLimits, expand_with_output};
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -144,27 +145,15 @@ fn unused_definitions_do_not_emit_frontend_requests() {
     assert_eq!(expanded.options.len(), 2);
 }
 
-struct Scratch(std::path::PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-fn scratch(tag: &str) -> Scratch {
-    let path = std::env::temp_dir().join(format!("spice-m9-frontend-{}-{tag}", std::process::id()));
-    std::fs::create_dir_all(&path).unwrap();
-    Scratch(path)
-}
-
 #[test]
 fn cli_expands_save_measure_and_fourier_cards_before_running() {
-    let scratch = scratch("cli");
+    let scratch = Scratch::new("m9-frontend-cli").unwrap();
     // A nonzero fundamental exercises the complete Fourier path.
     let deck = DECK
         .replace("i(vlocal)", "i(vlocal) v(a)")
         .replace("V1 out 0 1", "V1 out 0 sin(0 1 1k)");
-    let input = scratch.0.join("deck.cir");
-    let output = scratch.0.join("output.raw");
+    let input = scratch.path().join("deck.cir");
+    let output = scratch.path().join("output.raw");
     std::fs::write(&input, deck).unwrap();
     let report = ngspice_rs::cli::simulate::run(&input, &output, true).unwrap();
     assert_eq!(report.plots[0].measurements.len(), 2);
@@ -186,19 +175,20 @@ fn cli_expands_save_measure_and_fourier_cards_before_running() {
 fn scoped_frontend_translation_and_repetition_match_c() {
     let binary = std::env::var_os("NGSPICE_BIN").expect("absolute NGSPICE_BIN");
     assert!(Path::new(&binary).is_absolute());
-    let scratch = scratch("c");
-    let input = scratch.0.join("deck.cir");
+    let scratch = Scratch::new("m9-frontend-c").unwrap();
+    let input = scratch.path().join("deck.cir");
     let deck = DECK.replace(
         ".end\n",
         ".control\nlisting e\nrun\nwrite output.raw\nquit\n.endc\n.end\n",
     );
     std::fs::write(&input, deck).unwrap();
-    let run = std::process::Command::new(&binary)
-        .args(["-b"])
-        .arg(&input)
-        .current_dir(&scratch.0)
-        .output()
-        .unwrap();
+    let run = ngspice_conformance::process::run(
+        &binary,
+        scratch.path(),
+        &[std::ffi::OsStr::new("-b"), input.as_os_str()],
+        ngspice_conformance::process::ProcessLimits::ORACLE,
+    )
+    .unwrap();
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&run.stdout),
@@ -222,7 +212,7 @@ fn scoped_frontend_translation_and_repetition_match_c() {
         2,
         "{text}"
     );
-    let raw = ngspice_rs::analysis::RawFile::load(scratch.0.join("output.raw")).unwrap();
+    let raw = ngspice_rs::analysis::RawFile::load(scratch.path().join("output.raw")).unwrap();
     let variables: Vec<_> = raw.plots[0]
         .plot
         .variables()
@@ -243,12 +233,13 @@ fn scoped_frontend_translation_and_repetition_match_c() {
     // Batch Fourier post-processing runs after the control block; quit above
     // deliberately ends it, so run the original deck separately for .four.
     std::fs::write(&input, DECK).unwrap();
-    let run = std::process::Command::new(&binary)
-        .args(["-b"])
-        .arg(&input)
-        .current_dir(&scratch.0)
-        .output()
-        .unwrap();
+    let run = ngspice_conformance::process::run(
+        &binary,
+        scratch.path(),
+        &[std::ffi::OsStr::new("-b"), input.as_os_str()],
+        ngspice_conformance::process::ProcessLimits::ORACLE,
+    )
+    .unwrap();
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&run.stdout),
@@ -306,9 +297,9 @@ fn front_end_expansion_has_a_budget_even_without_body_devices() {
 
 #[test]
 fn body_measurement_names_are_not_silently_reinterpreted_as_local_nodes() {
-    let scratch = scratch("missing-local");
-    let input = scratch.0.join("deck.cir");
-    let output = scratch.0.join("output.raw");
+    let scratch = Scratch::new("m9-frontend-missing-local").unwrap();
+    let input = scratch.path().join("deck.cir");
+    let output = scratch.path().join("output.raw");
     std::fs::write(&input, "Scope\n.subckt cell a\nR1 a local 1k\nR2 local 0 1k\n.measure tran m max v(local)\n.ends\nX1 out cell\nV1 out 0 1\n.tran 1u 10u\n.end\n").unwrap();
     std::fs::write(&output, "keep me").unwrap();
     let error = ngspice_rs::cli::simulate::run(&input, &output, true).unwrap_err();

@@ -3,21 +3,15 @@
 //! `b4set.c`/`b4temp.c` defaults and the `b4ld.c` load are not ported, so this
 //! compares only the **explicit setter projection**: the values `b4mpar.c`/
 //! `b4par.c` store, read back from C's model and instance fields.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use ngspice_rs::devices::{ModelResolver, bsim4};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
-
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN; BSIM4 setter fields, no Rust simulation"]
@@ -70,16 +64,15 @@ fn explicit_bsim4_setters_match_c_fields_for_both_level_aliases() {
             ".end\n",
             &format!(".control\nset numdgt=17\nop\nprint {queries}\nquit\n.endc\n.end\n"),
         );
-        let directory = Scratch(
-            std::env::temp_dir().join(format!("bsim4-setters-{}-{level}", std::process::id())),
-        );
-        fs::create_dir_all(&directory.0).unwrap();
-        fs::write(directory.0.join("probe.cir"), instrumented).unwrap();
-        let output = Command::new(&binary)
-            .args(["-b", "probe.cir"])
-            .current_dir(&directory.0)
-            .output()
-            .unwrap();
+        let directory = Scratch::new("c-bsim4-schema-reference").unwrap();
+        fs::write(directory.path().join("probe.cir"), instrumented).unwrap();
+        let output = run(
+            &binary,
+            directory.path(),
+            &["-b", "probe.cir"],
+            ProcessLimits::ORACLE,
+        )
+        .unwrap();
         let log = String::from_utf8_lossy(&output.stdout).into_owned()
             + &String::from_utf8_lossy(&output.stderr);
         assert!(

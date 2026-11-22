@@ -25,19 +25,12 @@
 //!   cargo test -p ngspice-rs --test c_sparam_reference -- --ignored
 //! ```
 
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use ngspice_rs::analysis::{Plot, RawFile};
-
-struct Cleanup(PathBuf);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn workspace() -> PathBuf {
     ngspice_conformance::fixtures::workspace_root().unwrap()
@@ -54,17 +47,16 @@ fn run_both_decks(name: &str, deck_text: &str, rust_deck: &str) -> (RawFile, Raw
         Path::new(&binary).is_absolute(),
         "NGSPICE_BIN must be absolute"
     );
-    let directory =
-        std::env::temp_dir().join(format!("spice-rs-c-sparam-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&directory);
-    fs::create_dir_all(&directory).unwrap();
-    let _cleanup = Cleanup(directory.clone());
+    let scratch = Scratch::new("c-sparam-reference").unwrap();
+    let directory = scratch.path();
     fs::write(directory.join("deck.cir"), deck_text).unwrap();
-    let c = Command::new(&binary)
-        .args(["-b", "-r", "c.raw", "deck.cir"])
-        .current_dir(&directory)
-        .output()
-        .expect("the C ngspice runs");
+    let c = run(
+        &binary,
+        directory,
+        &["-b", "-r", "c.raw", "deck.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .expect("the C ngspice runs");
     assert!(
         c.status.success(),
         "{name}: ngspice failed:\n{}\n{}",
@@ -72,14 +64,17 @@ fn run_both_decks(name: &str, deck_text: &str, rust_deck: &str) -> (RawFile, Raw
         String::from_utf8_lossy(&c.stderr)
     );
     fs::write(directory.join("rust.cir"), rust_deck).unwrap();
-    let rust = Command::new(
+    let rust = run(
         std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+        directory,
+        &[
+            std::ffi::OsStr::new("simulate"),
+            std::ffi::OsStr::new("--output"),
+            directory.join("rust.raw").as_os_str(),
+            directory.join("rust.cir").as_os_str(),
+        ],
+        ProcessLimits::ORACLE,
     )
-    .arg("simulate")
-    .arg("--output")
-    .arg(directory.join("rust.raw"))
-    .arg(directory.join("rust.cir"))
-    .output()
     .expect("spice-rs runs");
     assert!(
         rust.status.success(),

@@ -5,21 +5,15 @@
 //! from the solver wiring. `@m1[qg]`/`[qb]`/`[qd]` are `CKTstate0` charges and
 //! `@m1[cgg]`..`[cbs]` are the nine `c*xb` derivatives after the overlap
 //! adjustment, exactly what `b3ld.c` leaves for a later `MODEINITSMSIG` load.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use ngspice_rs::devices::bsim3::{self, charges, dc};
 use ngspice_rs::devices::{ModelContext, ModelResolver};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
-
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// C's askable charge/C-V keywords.
 const ASKS: [&str; 12] = [
@@ -208,16 +202,15 @@ fn run_case(binary: &Path, index: usize, case: &Case, vgs: f64, vds: f64, family
         case.temp,
         ASKS.map(|ask| format!("@m1[{ask}]")).join(" "),
     );
-    let directory = Scratch(
-        std::env::temp_dir().join(format!("bsim3-q-{}-{index}-{family}", std::process::id())),
-    );
-    fs::create_dir_all(&directory.0).unwrap();
-    fs::write(directory.0.join("probe.cir"), &deck).unwrap();
-    let output = Command::new(binary)
-        .args(["-b", "probe.cir"])
-        .current_dir(&directory.0)
-        .output()
-        .unwrap();
+    let directory = Scratch::new("c-bsim3-charge-reference").unwrap();
+    fs::write(directory.path().join("probe.cir"), &deck).unwrap();
+    let output = run(
+        binary,
+        directory.path(),
+        &["-b", "probe.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .unwrap();
     let log = String::from_utf8_lossy(&output.stdout).into_owned()
         + &String::from_utf8_lossy(&output.stderr);
     assert!(
