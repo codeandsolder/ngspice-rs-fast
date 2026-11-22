@@ -260,3 +260,31 @@ fn device_observations_run_through_cli() {
     let c = RawFile::load(root().join("m9_device_dc.raw")).unwrap();
     compare(&ours.plots[0].plot, &c.plots[0].plot);
 }
+
+#[test]
+fn swept_sources_keep_terminal_sign_multiplier_and_bound_units() {
+    let scratch = Scratch::new("m9-observe-source-sweep").unwrap();
+    let dir = scratch.path();
+    let deck = dir.join("deck.cir");
+    let raw = dir.join("out.raw");
+    fs::write(&deck, "Swept current\ni1 0 a dc 1m m=2\nr1 a 0 1k\n.dc i1 -1m 1m 1m\n.save v(a) @i1[dc] @i1[i] i(i1) @i1[p] @r1[resistance] @r1[p]\n.end\n").unwrap();
+    simulate::run(&deck, &raw, true).unwrap();
+    let file = RawFile::load(&raw).unwrap();
+    let plot = &file.plots[0].plot;
+    assert_eq!(plot.point_count(), 3);
+    for (name, unit, expected) in [
+        ("v(a)", "voltage", [-2., 0., 2.]),
+        ("@i1[dc]", "parameter", [-0.001, 0., 0.001]),
+        ("@i1[i]", "current", [-0.002, 0., 0.002]),
+        ("i(i1)", "current", [-0.002, 0., 0.002]),
+        ("@i1[p]", "power", [-0.004, 0., -0.004]),
+        ("@r1[resistance]", "resistance", [1000.; 3]),
+        ("@r1[p]", "power", [0.004, 0., 0.004]),
+    ] {
+        let index = plot.variable_index(name).unwrap();
+        assert_eq!(plot.variables()[index].unit, unit, "{name}");
+        for (row, value) in plot.rows().zip(expected) {
+            assert!((row[index].re - value).abs() < 1e-12, "{name}: {row:?}");
+        }
+    }
+}

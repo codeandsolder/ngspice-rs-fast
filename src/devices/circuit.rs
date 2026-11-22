@@ -27,10 +27,13 @@ use crate::devices::linear::Forcing;
 use crate::devices::models::ModelContext;
 use crate::devices::mutual::validation::ValidationBudget;
 use crate::devices::mutual::{CouplingSite, MutualLimits, pair_count};
-use crate::devices::state::{HistoryPublication, StateHistory, StateSnapshot, TrialState};
+use crate::devices::state::{
+    DeviceState, HistoryPublication, StateHistory, StateSnapshot, TrialState,
+};
 use crate::devices::sweep::{InstanceOverride, ResistorMetadata, ResistorOverride};
 use crate::devices::traits::{
     AcceptContext, AnalysisMode, Device, InductanceValue, MnaUnknowns, MutualTerm, StampContext,
+    StampRhs,
 };
 
 /// A vertex in the circuit's bipartite incidence graph.
@@ -52,8 +55,8 @@ pub enum CircuitVertex {
 /// Connectivity is structural, not proof of a conductive DC path or solvability.
 pub type CircuitGraph = UnGraph<CircuitVertex, usize, usize>;
 
-/// A transient setup index, rebuilt from the current devices. No cache
-/// survives a topology change or a caller's use of device edits.
+/// Name-to-ordinal index built during setup and retained only for the
+/// lifetime of the finalized topology.
 #[derive(Default)]
 struct DeviceNames(BTreeMap<String, usize>);
 
@@ -122,6 +125,7 @@ pub struct Circuit {
 #[derive(Default)]
 struct TopologyBindings {
     unknowns: MnaUnknowns,
+    names: DeviceNames,
     order: Vec<usize>,
     branch_rows: Vec<std::ops::Range<usize>>,
     control_rows: Vec<Vec<usize>>,
@@ -236,11 +240,13 @@ impl std::ops::Deref for PreparedMutualTerms {
 /// Analysis-owned effective device preparation.
 ///
 /// The circuit is borrowed immutably for the run, so no topology edit can invalidate a live view.
-/// Only the most recent exact context is retained; neither trial history nor
-/// solver workspaces are owned by this object.
+/// Only the most recent exact context is retained. Isolated observation
+/// scratch retains capacity, never accepted or previous trial state.
 pub struct PreparedRun<'a> {
     circuit: &'a Circuit,
     point: std::cell::RefCell<Option<PreparedPoint>>,
+    pub(super) observation_work:
+        std::cell::RefCell<Option<crate::devices::observe::ObservationWorkspace>>,
 }
 
 pub(super) struct PreparedPoint {
@@ -680,6 +686,7 @@ impl Circuit {
         PreparedRun {
             circuit: self,
             point: std::cell::RefCell::new(None),
+            observation_work: std::cell::RefCell::new(None),
         }
     }
 
@@ -1334,6 +1341,7 @@ impl Circuit {
         }
         self.check_port_numbering()?;
         self.allocate_matrix(order)?;
+        self.bindings.names = names;
         self.bindings.identity = Some(TopologyId::allocate()?);
         Ok(())
     }
@@ -1904,6 +1912,10 @@ impl Circuit {
             .ok_or_else(|| SpiceError::circuit("circuit topology is stale or not finalized"))
     }
 
+    pub(super) fn observation_device_index(&self, name: &str) -> Option<usize> {
+        self.bindings.names.get(name)
+    }
+
     pub(super) fn check_numbering(&self) -> SpiceResult<()> {
         self.topology_id().map(drop)
     }
@@ -2123,7 +2135,15 @@ impl Circuit {
             ));
         }
         let mutual = self.prepared_mutual_terms(request.model_context)?;
-        self.stamp_isolated(index, device, request, matrix, rhs, trial, &mutual)
+        self.stamp_isolated(
+            index,
+            device,
+            request,
+            matrix,
+            StampRhs::dense(rhs),
+            request.history.device_of(trial, index)?,
+            &mutual,
+        )
     }
 
     /// A checked isolated load's shared stamping path. Observations reuse the
@@ -2138,11 +2158,10 @@ impl Circuit {
         device: &dyn Device,
         request: &LoadRequest<'_>,
         matrix: &mut SparseMatrix,
-        rhs: &mut Vector,
-        trial: &mut TrialState,
+        rhs: StampRhs<'_>,
+        states: DeviceState<'_>,
         mutual: &[Vec<MutualTerm>],
     ) -> SpiceResult<()> {
-        let states = request.history.device_of(trial, index)?;
         device.stamp(&mut StampContext {
             matrix,
             rhs,
@@ -2442,7 +2461,7 @@ impl Circuit {
             matrix.begin_device(position)?;
             device.stamp(&mut StampContext {
                 matrix: &mut *matrix,
-                rhs: &mut *rhs,
+                rhs: StampRhs::dense(rhs),
                 unknowns: &self.bindings.unknowns,
                 nodes: &self.nodes,
                 solution: request.solution,
