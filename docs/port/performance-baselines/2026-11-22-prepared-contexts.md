@@ -21,3 +21,23 @@ setters across repeated loads, convergence, observations and linearization.
 No numerical tolerances altered.
 
 Reproduce: `cargo +nightly test --locked --test resistor_overrides prepared_context_load_benchmark -- --ignored --nocapture`.
+
+## Reconciled revision (0c624b4)
+
+Repeat after integrating the transient step lifecycle and distortion context
+changes, again 3,000 loads and three alternating samples:
+
+| Device | One-shot (ms) | Prepared (ms) | Ratio |
+|---|---:|---:|---:|
+| Contextual resistor | 15.809 | 13.254 | 1.193x |
+| BJT | 12.533 | 4.217 | 2.972x |
+| MOS1 | 11.927 | 8.941 | 1.334x |
+| BSIM4 | 16.225 | 13.518 | 1.200x |
+
+All stamp/RHS/trial checks bit-identical again. Concurrent build load
+remains high. The broad spread between the two runs is a reason not to
+interpret individual ratios as precise estimates. Complete reconciled
+suite: 943 passed across 20 test binaries, including live C comparisons;
+one distinct historical-capture reproduction test excluded because no
+matching capture executable is available (see conformance/observations).
+Strict production Clippy passed.
