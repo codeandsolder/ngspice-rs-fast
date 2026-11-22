@@ -272,7 +272,7 @@ fn polynomial<T: Copy + std::ops::Mul<Output = T> + std::ops::Add<Output = T>>(
         .fold(constant(last), |value, &c| constant(c) + y * value)
 }
 
-/// Polynomial approximations of sqrt(x)*exp(-x)*I_n(x).
+/// Polynomial approximations of `sqrt(x)*exp(-x)*I_n(x)`.
 #[inline]
 fn large_bessel_pair(x: Real) -> (Real, Real) {
     if x >= 15. {
