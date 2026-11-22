@@ -408,7 +408,7 @@ mod tests {
         let mut circuit = config.circuit(&netlist).unwrap();
         circuit.finalize().unwrap();
         let signal = crate::analysis::ac::SmallSignal::prepare(
-            &mut circuit,
+            &circuit,
             &plan,
             &context,
             plan.dc_settings().clone(),
