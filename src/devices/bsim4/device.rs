@@ -1524,7 +1524,7 @@ mod tests {
     fn ownership_projection_covers_every_instance_member() {
         let mut prepared = Instance::default();
         let mut previous = Instance::default();
-        previous.set_values(&vec![1.; Instance::MEMBERS.len()]);
+        previous.seed_test_members();
         prepared.cgdo = -0.;
         previous.gm = f64::from_bits(0x7ff8_0000_0000_0001);
         let projected = prepared.with_previous_load_state(&previous);

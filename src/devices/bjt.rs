@@ -80,7 +80,7 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
@@ -1206,7 +1206,10 @@ impl Device for Bjt {
     /// column of that card agrees, so the refusal is narrow - and a card
     /// without `RC` has no `collCX` node for the terms to use, which is why
     /// the rest of the tables verify.
-    fn sensitivity(&self, context: &ModelContext) -> SpiceResult<Box<dyn DeviceSensitivity + '_>> {
+    fn sensitivity(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
         if self.model.rc != 0. {
             return Err(SpiceError::not_yet_ported(
                 format!("{}: BJT sensitivity with RC != 0", self.name),
@@ -1887,7 +1890,7 @@ impl<'a> BjtSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for BjtSensitivity<'_> {
+impl SensitivityKernel for BjtSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Bjt
     }
@@ -1914,7 +1917,7 @@ impl DeviceSensitivity for BjtSensitivity<'_> {
         let ibc = m.ibc.unwrap_or(0.);
         let (ibe_given, ibc_given) = (m.ibe.is_some(), m.ibc.is_some());
         let npn = self.device.pol > 0.;
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for (keyword, value, given) in [
             (
                 "tnom",
@@ -2049,9 +2052,9 @@ impl DeviceSensitivity for BjtSensitivity<'_> {
             ("te_max", 1e99, false),
             ("rth0", 0., false),
         ] {
-            model = model.with(keyword, value, given);
+            model = model.with(keyword, value, given)?;
         }
-        let mut instance = SensitivityRecord::new();
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
         let ic = |k: usize| self.device.initial.values.get(k).copied().flatten();
         for (keyword, value, given) in [
             ("icvbe", ic(0).unwrap_or(0.), ic(0).is_some()),
@@ -2068,7 +2071,7 @@ impl DeviceSensitivity for BjtSensitivity<'_> {
             ),
             ("dtemp", i.dtemp, true),
         ] {
-            instance = instance.with(keyword, value, given);
+            instance = instance.with(keyword, value, given)?;
         }
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
@@ -2329,7 +2332,7 @@ impl BjtSensitivity<'_> {
 }
 
 /// A BJT's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetBjt {
     /// Built from the reset load's records: the junction conductances.

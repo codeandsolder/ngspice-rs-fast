@@ -89,8 +89,8 @@ use crate::devices::schema::{
     self, ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, RecordPair, SensitivityFamily, SensitivityLoad, SensitivityMode,
-    SensitivityParameter, SensitivityRecord,
+    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
+    SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
     Device, LinearContext, ModelContext, ModelFamily, ResolvedModel, StampContext,
@@ -667,7 +667,10 @@ impl Device for Mesfet {
             .find(|name| name.eq_ignore_ascii_case(keyword))
     }
     /// `mes.c`'s `IFparm` tables under C's `sgen` walk (#164).
-    fn sensitivity(&self, _context: &ModelContext) -> SpiceResult<Box<dyn DeviceSensitivity + '_>> {
+    fn sensitivity(
+        &self,
+        _context: &ModelContext,
+    ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
         Ok(Box::new(MesfetSensitivity::new(self)))
     }
     /// `MESparam` with the instance schema domains.
@@ -931,7 +934,7 @@ impl<'a> MesfetSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for MesfetSensitivity<'_> {
+impl SensitivityKernel for MesfetSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Mes
     }
@@ -950,7 +953,7 @@ impl DeviceSensitivity for MesfetSensitivity<'_> {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (m, i) = (&self.device.model, &self.device.instance);
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for keyword in SENSITIVITY_MODEL_FIELDS {
             let value = match *keyword {
                 "vt0" => m.vto,
@@ -970,15 +973,15 @@ impl DeviceSensitivity for MesfetSensitivity<'_> {
                 "kf" => m.kf,
                 _ => m.af,
             };
-            model = model.with(keyword, value, true);
+            model = model.with(keyword, value, true)?;
         }
-        let mut instance = SensitivityRecord::new();
-        instance = instance.with("area", i.area, true);
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
+        instance = instance.with("area", i.area, true)?;
         // C's `MES_M` is `IOPUR`: enumerated by no analysis, but the load reads
         // it, so the record carries it unperturbed.
-        instance = instance.with("m", i.m, true);
-        instance = instance.with("icvds", self.device.initial.values[0].unwrap_or(0.), true);
-        instance = instance.with("icvgs", self.device.initial.values[1].unwrap_or(0.), true);
+        instance = instance.with("m", i.m, true)?;
+        instance = instance.with("icvds", self.device.initial.values[0].unwrap_or(0.), true)?;
+        instance = instance.with("icvgs", self.device.initial.values[1].unwrap_or(0.), true)?;
         self.setup(&mut model, &mut instance)?;
         Ok((model, instance))
     }
@@ -1102,7 +1105,7 @@ impl MesfetSensitivity<'_> {
 }
 
 /// A MESFET's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetMesfet {
     /// Built from the reset load's records: the junction conductances.

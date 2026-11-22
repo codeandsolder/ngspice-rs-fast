@@ -58,7 +58,7 @@ use crate::devices::hfet::{Instance, Model};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{BOLTZMANN, CHARGE};
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::sweep::check_swept;
@@ -1192,7 +1192,10 @@ impl Device for Mesa {
     /// (level 3) and `sens_mesa4` (level 4, including a shifted instance
     /// temperature, whose `rtc1`/`rtc2` rows exposed the channel's use of the
     /// raw `rsi` where C uses the temperature-scaled `tRsi`).
-    fn sensitivity(&self, context: &ModelContext) -> SpiceResult<Box<dyn DeviceSensitivity + '_>> {
+    fn sensitivity(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
         if !matches!(self.level, l if l == 2. || l == 3. || l == 4.) {
             return Err(SpiceError::not_yet_ported(
                 format!("{}: MESA level {} sensitivity", self.name, self.level),
@@ -1651,7 +1654,7 @@ impl<'a> MesaSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for MesaSensitivity<'_> {
+impl SensitivityKernel for MesaSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Mesa
     }
@@ -1670,7 +1673,7 @@ impl DeviceSensitivity for MesaSensitivity<'_> {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (m, i) = (&self.device.model, &self.device.instance);
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for (keyword, value, given) in [
             ("vto", m.threshold, true),
             ("lambda", m.lambda, true),
@@ -1742,9 +1745,9 @@ impl DeviceSensitivity for MesaSensitivity<'_> {
             ("cas", m.cas, true),
             ("cbs", m.cbs, true),
         ] {
-            model = model.with(keyword, value, given);
+            model = model.with(keyword, value, given)?;
         }
-        let mut instance = SensitivityRecord::new();
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
         for (keyword, value, given) in [
             ("l", i.l, true),
             ("w", i.w, true),
@@ -1763,7 +1766,7 @@ impl DeviceSensitivity for MesaSensitivity<'_> {
             ),
             ("dtemp", i.dtemp, true),
         ] {
-            instance = instance.with(keyword, value, given);
+            instance = instance.with(keyword, value, given)?;
         }
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
@@ -2001,7 +2004,7 @@ impl MesaSensitivity<'_> {
 }
 
 /// A MESA's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetMesa {
     /// Built from the reset load's records: the gate and channel

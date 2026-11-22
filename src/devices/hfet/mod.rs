@@ -240,28 +240,29 @@ impl HfetInstance {
 
     fn sensitivity_record(
         &self,
+        family: crate::devices::sensitivity::SensitivityFamily,
         initial: &InstanceInitial,
         circuit_kelvin: Real,
-    ) -> SensitivityRecord {
-        SensitivityRecord::new()
-            .with("l", self.l, true)
-            .with("w", self.w, true)
-            .with("m", self.m, true)
+    ) -> SpiceResult<SensitivityRecord> {
+        SensitivityRecord::new(family, ParameterScope::Instance)
+            .with("l", self.l, true)?
+            .with("w", self.w, true)?
+            .with("m", self.m, true)?
             .with(
                 "icvds",
                 initial.values[0].unwrap_or(0.),
                 initial.values[0].is_some(),
-            )
+            )?
             .with(
                 "icvgs",
                 initial.values[1].unwrap_or(0.),
                 initial.values[1].is_some(),
-            )
+            )?
             .with(
                 "temp",
                 self.temperature_at_kelvin(circuit_kelvin),
                 self.temp.is_some(),
-            )
+            )?
             .with("dtemp", self.dtemp, true)
     }
 
@@ -811,12 +812,21 @@ mod tests {
             off: false,
             values: vec![Some(0.5), None],
         };
-        let mut record = instance.sensitivity_record(&initial, 300.15);
+        let mut record = instance
+            .sensitivity_record(
+                crate::devices::sensitivity::SensitivityFamily::Hfet1,
+                &initial,
+                300.15,
+            )
+            .unwrap();
         assert!(!record.given("temp"));
         assert!(record.given("icvds"));
         assert!(!record.given("icvgs"));
         assert!(HfetInstance::from_record(&record).unwrap().temp.is_none());
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(
+            crate::devices::sensitivity::SensitivityFamily::Hfet1,
+            ParameterScope::Model,
+        );
         set_hfet(
             ParameterScope::Instance,
             "temp",

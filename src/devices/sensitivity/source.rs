@@ -3,7 +3,7 @@
 //! loads (`vsrcload.c`, `vsrcacld.c`, `isrcload.c`, `isrcacld.c`).
 
 use super::{
-    DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter as P, SensitivityRecord,
 };
 use crate::devices::IndependentSource;
@@ -65,7 +65,7 @@ impl<'a> SourceSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for SourceSensitivity<'_> {
+impl SensitivityKernel for SourceSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         if self.voltage {
             SensitivityFamily::VoltageSource
@@ -90,19 +90,19 @@ impl DeviceSensitivity for SourceSensitivity<'_> {
         let i = &self.inputs;
         let (mag, phase) = i.ac.unwrap_or((0., 0.));
         let given = i.ac.is_some();
-        let mut instance = SensitivityRecord::new()
-            .with("dc", if i.dc_given { self.level } else { 0. }, i.dc_given)
-            .with("acmag", mag, given)
-            .with("acphase", phase, given)
-            .with("ac", 0., given)
-            .with("m", 1., false)
-            .with("z0", 0., false)
-            .with("pwr", 0., false)
-            .with("freq", 0., false)
-            .with("phase", 0., false)
-            .with("acreal", 0., false)
-            .with("acimag", 0., false);
-        let mut model = SensitivityRecord::new();
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance)
+            .with("dc", if i.dc_given { self.level } else { 0. }, i.dc_given)?
+            .with("acmag", mag, given)?
+            .with("acphase", phase, given)?
+            .with("ac", 0., given)?
+            .with("m", 1., false)?
+            .with("z0", 0., false)?
+            .with("pwr", 0., false)?
+            .with("freq", 0., false)?
+            .with("phase", 0., false)?
+            .with("acreal", 0., false)?
+            .with("acimag", 0., false)?;
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         self.temperature(&mut model, &mut instance)?;
         Ok((model, instance))
     }

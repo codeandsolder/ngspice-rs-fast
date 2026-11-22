@@ -72,7 +72,7 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
@@ -933,7 +933,10 @@ impl Device for Hfet2 {
     ///   `hfet2param.c` stores it in kelvin.
     /// - `HFET2_VT1`/`VT2` are model fields that follow the raw `VTO` (not the
     ///   type-scaled `TVTO`) whenever they are not given.
-    fn sensitivity(&self, context: &ModelContext) -> SpiceResult<Box<dyn DeviceSensitivity + '_>> {
+    fn sensitivity(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
         Ok(Box::new(Hfet2Sensitivity::new(self, context)))
     }
 
@@ -1074,7 +1077,7 @@ impl<'a> Hfet2Sensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for Hfet2Sensitivity<'_> {
+impl SensitivityKernel for Hfet2Sensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Hfet2
     }
@@ -1093,7 +1096,7 @@ impl DeviceSensitivity for Hfet2Sensitivity<'_> {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let m = &self.device.model;
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for (keyword, value, given) in [
             ("cf", m.cf, true),
             ("d1", m.d1, true),
@@ -1136,12 +1139,13 @@ impl DeviceSensitivity for Hfet2Sensitivity<'_> {
             ("vt1", m.vt1.unwrap_or(0.), m.vt1.is_some()),
             ("vt2", m.vt2.unwrap_or(0.), m.vt2.is_some()),
         ] {
-            model = model.with(keyword, value, given);
+            model = model.with(keyword, value, given)?;
         }
-        let mut instance = self
-            .device
-            .instance
-            .sensitivity_record(&self.device.initial, self.circuit_kelvin);
+        let mut instance = self.device.instance.sensitivity_record(
+            self.family(),
+            &self.device.initial,
+            self.circuit_kelvin,
+        )?;
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
         Ok((model, instance))
@@ -1295,7 +1299,7 @@ impl Hfet2Sensitivity<'_> {
 }
 
 /// An HFET2's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetHfet2 {
     /// Built from the reset load's records: the gate and channel

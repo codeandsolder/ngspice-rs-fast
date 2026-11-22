@@ -12,15 +12,15 @@
 //!   coupling to `M + delta` and "restores" it to `M`.
 //!
 //! In an AC sweep these devices load what `cktsens.c`'s per-frequency reset
-//! left ([`DeviceSensitivity::reset_ac_load`]): a B source's `ASRCacValues`
+//! left ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]): a B source's `ASRCacValues`
 //! are reallocated (zeroed) by every `ASRCsetup` and written only by a
 //! small-signal load, so only a voltage source's branch incidences remain; a
 //! switch keeps the state its `MODEINITFLOAT` load chose for a zero control.
 
 use super::{
-    AcReset, CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, RecordPair, ResetStamp,
-    ResetStamps, SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
-    SensitivityRecord, StampAt, StampPart,
+    AcReset, CELSIUS_TO_KELVIN, ParameterScope, RecordPair, ResetStamp, ResetStamps,
+    SensitivityFamily, SensitivityKernel, SensitivityLoad, SensitivityMode,
+    SensitivityParameter as P, SensitivityRecord, StampAt, StampPart,
 };
 use crate::devices::{
     Behavioural, BehaviouralOutput, BehaviouralScale, Device, MutualInductance, Switch, SwitchKind,
@@ -69,7 +69,7 @@ impl<'a> BehaviouralSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for BehaviouralSensitivity<'_> {
+impl SensitivityKernel for BehaviouralSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Asrc
     }
@@ -91,13 +91,13 @@ impl DeviceSensitivity for BehaviouralSensitivity<'_> {
         let (temp, temp_given) = scale
             .temperature
             .map_or((0., false), |t| (t + CELSIUS_TO_KELVIN, true));
-        let mut instance = SensitivityRecord::new()
-            .with("temp", temp, temp_given)
-            .with("dtemp", scale.dtemp, scale.dtemp != 0.)
-            .with("tc1", scale.tc1, scale.tc1 != 0.)
-            .with("tc2", scale.tc2, scale.tc2 != 0.)
-            .with("m", scale.m, !matches!(scale.m, 1.));
-        let mut model = SensitivityRecord::new();
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance)
+            .with("temp", temp, temp_given)?
+            .with("dtemp", scale.dtemp, scale.dtemp != 0.)?
+            .with("tc1", scale.tc1, scale.tc1 != 0.)?
+            .with("tc2", scale.tc2, scale.tc2 != 0.)?
+            .with("m", scale.m, !matches!(scale.m, 1.))?;
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         self.temperature(&mut model, &mut instance)?;
         Ok((model, instance))
     }
@@ -234,7 +234,7 @@ impl<'a> SwitchSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for SwitchSensitivity<'_> {
+impl SensitivityKernel for SwitchSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         match self.switch.kind() {
             SwitchKind::Voltage => SensitivityFamily::VoltageSwitch,
@@ -260,23 +260,29 @@ impl DeviceSensitivity for SwitchSensitivity<'_> {
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (threshold, hysteresis) = self.keys();
         let values = self.switch.model_values();
-        let mut model = SensitivityRecord::new()
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model)
             .with(
                 threshold,
                 values.threshold.unwrap_or(0.),
                 values.threshold.is_some(),
-            )
+            )?
             .with(
                 hysteresis,
                 values.hysteresis.unwrap_or(0.),
                 values.hysteresis.is_some(),
-            )
-            .with("ron", values.on.unwrap_or(0.), values.on.is_some())
-            .with("roff", values.off.unwrap_or(0.), values.off.is_some())
-            .with("gon", values.on.map_or(0., |r| 1. / r), false)
-            .with("goff", values.off.map_or(0., |r| 1. / r), false);
-        self.setup(&mut model, &mut SensitivityRecord::new())?;
-        Ok((model, SensitivityRecord::new()))
+            )?
+            .with("ron", values.on.unwrap_or(0.), values.on.is_some())?
+            .with("roff", values.off.unwrap_or(0.), values.off.is_some())?
+            .with("gon", values.on.map_or(0., |r| 1. / r), false)?
+            .with("goff", values.off.map_or(0., |r| 1. / r), false)?;
+        self.setup(
+            &mut model,
+            &mut SensitivityRecord::new(self.family(), ParameterScope::Instance),
+        )?;
+        Ok((
+            model,
+            SensitivityRecord::new(self.family(), ParameterScope::Instance),
+        ))
     }
 
     /// `SWmParam`/`CSWmParam`: a resistance also stores its conductance.
@@ -375,7 +381,7 @@ impl DeviceSensitivity for SwitchSensitivity<'_> {
 /// A K coupling's `.sens` description: `MUTpTable`'s `k`, `MUTask`,
 /// `MUTparam`, `MUTtemp` and `MUTacLoad`. The instance record holds `k`,
 /// C's `MUTfactor` (`factor`) and the mirrored inductances and branch rows
-/// of its inductors ([`DeviceSensitivity::coupled_inductors`]).
+/// of its inductors ([`crate::devices::sensitivity::DeviceSensitivity::coupled_inductors`]).
 #[derive(Debug)]
 pub(in crate::devices) struct MutualSensitivity<'a> {
     coupling: &'a MutualInductance,
@@ -387,7 +393,7 @@ impl<'a> MutualSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for MutualSensitivity<'_> {
+impl SensitivityKernel for MutualSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Mutual
     }
@@ -407,14 +413,17 @@ impl DeviceSensitivity for MutualSensitivity<'_> {
     }
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
-        let instance = SensitivityRecord::new()
-            .with("k", self.coupling.coefficient(), true)
-            .with("factor", 0., false)
-            .with("induct1", 0., false)
-            .with("induct2", 0., false)
-            .with("row1", 0., false)
-            .with("row2", 0., false);
-        Ok((SensitivityRecord::new(), instance))
+        let instance = SensitivityRecord::new(self.family(), ParameterScope::Instance)
+            .with("k", self.coupling.coefficient(), true)?
+            .with("factor", 0., false)?
+            .with("induct1", 0., false)?
+            .with("induct2", 0., false)?
+            .with_index("row1", 0)?
+            .with_index("row2", 0)?;
+        Ok((
+            SensitivityRecord::new(self.family(), ParameterScope::Model),
+            instance,
+        ))
     }
 
     /// `MUTask` answers `MUTfactor` for `k`.
@@ -463,16 +472,7 @@ impl DeviceSensitivity for MutualSensitivity<'_> {
     ) -> SpiceResult<SensitivityLoad> {
         let i = current.instance;
         let factor = i.value("factor")?;
-        let row = |keyword: &str| -> SpiceResult<usize> {
-            let value = i.value(keyword)?;
-            crate::primitives::exact_nonnegative_integer::<usize>(value).ok_or_else(|| {
-                SpiceError::circuit(format!(
-                    "{}: unbound inductor branch row",
-                    self.coupling.name()
-                ))
-            })
-        };
-        let (row1, row2) = (row("row1")?, row("row2")?);
+        let (row1, row2) = (i.index("row1")?, i.index("row2")?);
         let stamps = [(row1, row2), (row2, row1)]
             .into_iter()
             .map(|(r, c)| ResetStamp {

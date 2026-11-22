@@ -36,7 +36,7 @@ mod check;
 mod cvtest;
 mod device;
 mod elements;
-mod fields;
+pub(super) mod fields;
 mod geo;
 mod host;
 mod load;

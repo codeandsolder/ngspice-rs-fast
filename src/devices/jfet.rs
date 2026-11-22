@@ -73,8 +73,8 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, RecordPair, SensitivityFamily, SensitivityLoad, SensitivityMode,
-    SensitivityParameter, SensitivityRecord,
+    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
+    SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
     AnalysisMode, Device, DeviceState, IterationPhase, LinearContext, ModelContext, ModelFamily,
@@ -1365,7 +1365,10 @@ impl Device for Jfet {
         instance_parameter(keyword)
     }
     /// `jfet.c`'s `IFparm` tables under C's `sgen` walk (#164).
-    fn sensitivity(&self, context: &ModelContext) -> SpiceResult<Box<dyn DeviceSensitivity + '_>> {
+    fn sensitivity(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
         Ok(Box::new(JfetSensitivity::new(self, context)))
     }
     /// `JFETparam` then `JFETtemp`, with the instance schema domains.
@@ -1610,7 +1613,7 @@ impl<'a> JfetSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for JfetSensitivity<'_> {
+impl SensitivityKernel for JfetSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Jfet
     }
@@ -1629,7 +1632,7 @@ impl DeviceSensitivity for JfetSensitivity<'_> {
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
         let (m, i) = (&self.device.model, &self.device.instance);
-        let mut model = SensitivityRecord::new();
+        let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for keyword in SENSITIVITY_MODEL_FIELDS {
             // `tnom` is celsius in the port and kelvin in C, like the diode.
             let (value, given) = match *keyword {
@@ -1666,9 +1669,9 @@ impl DeviceSensitivity for JfetSensitivity<'_> {
                     true,
                 ),
             };
-            model = model.with(keyword, value, given);
+            model = model.with(keyword, value, given)?;
         }
-        let mut instance = SensitivityRecord::new();
+        let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
         for keyword in SENSITIVITY_INSTANCE_FIELDS {
             let (value, given) = match *keyword {
                 "area" => (i.area, true),
@@ -1682,7 +1685,7 @@ impl DeviceSensitivity for JfetSensitivity<'_> {
                 "ic-vds" => (self.device.initial.values[0].unwrap_or(0.), true),
                 _ => (self.device.initial.values[1].unwrap_or(0.), true),
             };
-            instance = instance.with(keyword, value, given);
+            instance = instance.with(keyword, value, given)?;
         }
         self.setup(&mut model, &mut instance)?;
         self.temperature(&mut model, &mut instance)?;
@@ -1832,7 +1835,7 @@ impl JfetSensitivity<'_> {
 }
 
 /// A JFET's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetJfet {
     /// Built from the reset load's records: the junction conductances.
