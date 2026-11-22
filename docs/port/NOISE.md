@@ -187,7 +187,9 @@ On Acer (512 modeled resistors, 32 models, 256 frequencies), DHAT reported
 155,432,113 versus 3,275,427 allocated bytes and 441,775 versus 41,903
 allocation blocks (including setup). Peak live heap was 1,509,206 versus
 1,225,721 bytes. The measured loop took 180.6 versus 48.6 ms on a loaded host;
-these are single measurements, not a whole-simulator speedup claim.
+these are single measurements, not a whole-simulator speedup claim. Three
+user-space `perf stat` repetitions measured 362.1M versus 191.1M cycles and
+768.3M versus 451.4M instructions (including test setup).
 
 ## Verification
 
