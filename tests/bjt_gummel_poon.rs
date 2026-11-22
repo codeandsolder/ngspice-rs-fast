@@ -3,8 +3,7 @@
 //! C-golden comparisons of the `m7_bjt_*` decks live in `xtask golden verify`.
 use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
 use ngspice_rs::devices::{
-    ACCEPTED_DEPTH, AnalysisMode, Circuit, Forcing, Limit, LoadRequest, ModelContext, StateHistory,
-    TransientTiming,
+    AnalysisMode, Circuit, Forcing, Limit, LoadRequest, ModelContext, StateHistory, TransientTiming,
 };
 use ngspice_rs::maths::integrator::{Coefficients, DEFAULT_XMU, IntegrationMethod, StepHistory};
 use ngspice_rs::maths::{SparseMatrix, Vector};

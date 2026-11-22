@@ -335,14 +335,22 @@ fn small_signal_conductance_follows_swacload() {
     let bias = solution(&c, 2.);
     for (code, conductance) in [(0., 1e-6), (1., 0.1), (2., 0.1), (3., 0.1)] {
         let system = c
-            .small_signal_system_at(&ModelContext::default(), &bias, Some(&[code, 2.]))
+            .small_signal_system_at(
+                &ModelContext::default(),
+                &bias,
+                Some(&c.bind_state(vec![code, 2.]).unwrap()),
+            )
             .unwrap();
         close(system.a.get(a, a) - 1e-3, conductance);
     }
     // An invalid code is an error, not a guess.
     assert!(
-        c.small_signal_system_at(&ModelContext::default(), &bias, Some(&[0.5, 2.]))
-            .is_err()
+        c.small_signal_system_at(
+            &ModelContext::default(),
+            &bias,
+            Some(&c.bind_state(vec![0.5, 2.]).unwrap())
+        )
+        .is_err()
     );
     // Without a state (zero-bias assemblies) the MODEINITJCT state at `bias`.
     let system = c
@@ -352,8 +360,5 @@ fn small_signal_conductance_follows_swacload() {
     // The switch has no immutable linear form: linear-system assembly refuses it.
     let mut c = c;
     assert!(c.linear_system().is_err());
-    assert!(
-        c.small_signal_system_at(&ModelContext::default(), &bias, Some(&[0.]))
-            .is_err()
-    );
+    assert!(c.bind_state(vec![0.]).is_err());
 }

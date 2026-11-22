@@ -128,6 +128,21 @@ impl State1Patches {
     }
 }
 
+/// An immutable state vector tied to one finalized topology.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateSnapshot {
+    pub(super) values: Arc<[Real]>,
+    pub(super) topology: TopologyId,
+}
+
+impl StateSnapshot {
+    /// The values in finalized state-row order.
+    #[must_use]
+    pub fn values(&self) -> &[Real] {
+        &self.values
+    }
+}
+
 /// Accepted device state vectors, most recent first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateHistory {
@@ -632,8 +647,23 @@ pub struct TrialState {
 }
 
 impl TrialState {
-    pub(super) fn matches_topology(&self, topology: TopologyId) -> bool {
-        self.topology.is_some_and(|id| id == topology)
+    /// Retain this load's values without copying its state slots.
+    ///
+    /// # Errors
+    /// The trial is unbound or contains unset or nonfinite values.
+    pub fn snapshot(&self) -> SpiceResult<StateSnapshot> {
+        let topology = self
+            .topology
+            .ok_or_else(|| state_error("unbound trial has no circuit snapshot"))?;
+        if self.values.iter().any(|value| !value.is_finite()) {
+            return Err(state_error(
+                "trial snapshot contains unset or nonfinite values",
+            ));
+        }
+        Ok(StateSnapshot {
+            topology,
+            values: Arc::clone(&self.values),
+        })
     }
 
     /// The same trial carrying the Newton solve's `reltol` and current

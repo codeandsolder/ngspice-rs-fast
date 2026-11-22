@@ -113,3 +113,33 @@ fn replacing_devices_forgets_the_verified_batches() {
     circuit.finalize().unwrap();
     assert_bound_loads_match(&circuit, &x);
 }
+
+#[test]
+fn equal_size_foreign_bound_matrix_is_rejected_before_stamping() {
+    let a = circuit();
+    let b = circuit();
+    let mut foreign = a.new_matrix().unwrap();
+    let history = b.state_history().unwrap();
+    let mut trial = history.trial();
+    let mut rhs = Vector::zeros(b.unknown_count());
+    let error = b
+        .load(
+            &LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &bias(&b),
+                model_context: &ModelContext::default(),
+                integration: None,
+                history: &history,
+                forcing: None,
+            },
+            &mut foreign,
+            &mut rhs,
+            &mut trial,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("different finalized pattern"),
+        "{error}"
+    );
+    assert!(trial.values().iter().all(|v| v.is_nan()));
+}

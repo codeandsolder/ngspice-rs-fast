@@ -57,7 +57,11 @@ fn check(body: &str, small_signal: bool) {
             // MOS6 has no DEVacLoad in the pinned C implementation.
             for (circuit, result) in [(&reused, &a), (&fresh, &b)] {
                 let error = circuit
-                    .small_signal_system_at(&context, &result.values, Some(result.trial.values()))
+                    .small_signal_system_at(
+                        &context,
+                        &result.values,
+                        Some(&result.trial.snapshot().unwrap()),
+                    )
                     .unwrap_err();
                 assert!(
                     error
@@ -68,10 +72,10 @@ fn check(body: &str, small_signal: bool) {
             continue;
         }
         let ac_a = reused
-            .small_signal_system_at(&context, &a.values, Some(a.trial.values()))
+            .small_signal_system_at(&context, &a.values, Some(&a.trial.snapshot().unwrap()))
             .unwrap();
         let ac_b = fresh
-            .small_signal_system_at(&context, &b.values, Some(b.trial.values()))
+            .small_signal_system_at(&context, &b.values, Some(&b.trial.snapshot().unwrap()))
             .unwrap();
         assert_eq!(stamps(&ac_a.a), stamps(&ac_b.a), "{label}: conductance");
         assert_eq!(stamps(&ac_a.e), stamps(&ac_b.e), "{label}: capacitance");

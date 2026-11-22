@@ -251,7 +251,9 @@ fn stale_or_mismatched_overrides_are_errors() {
     let mut other = Circuit::from_netlist(&deck("c1 x 0 1u\nr1 x 0 1k")).unwrap();
     let error = other.linear_system_with_context(&first).unwrap_err();
     assert!(
-        error.to_string().contains("not a two-terminal resistor"),
+        error
+            .to_string()
+            .contains("foreign or stale resistor override"),
         "{error}"
     );
 }
@@ -337,5 +339,32 @@ fn contextual_literal_sweep_preserves_default_model_and_noisy_flag() {
             })
             .unwrap(),
         DeviceNoise::Noiseless
+    );
+}
+
+#[test]
+fn equal_size_foreign_and_reordered_override_targets_are_rejected() {
+    let a = Circuit::from_netlist(&deck("r1 x 0 1k\nr2 x 0 2k")).unwrap();
+    let mut b = Circuit::from_netlist(&deck("r2 x 0 2k\nr1 x 0 1k")).unwrap();
+    let context = ModelContext::default();
+    let target = a.resistor_override("r1", 500.).unwrap();
+    let foreign = context.with_resistor_override(target).unwrap();
+    assert!(b.effective_resistance(&target, &context).is_err());
+    assert!(b.linear_system_with_context(&foreign).is_err());
+    let target = b.resistor_override("r1", 500.).unwrap();
+    let local = context.with_resistor_override(target).unwrap();
+    close(
+        b.linear_system_with_context(&local).unwrap().a.get(0, 0),
+        1. / 500. + 1. / 2e3,
+    );
+    b.swap_devices(0, 1).unwrap();
+    b.finalize().unwrap();
+    assert!(b.linear_system_with_context(&local).is_err());
+    let rebound = context
+        .with_resistor_override(b.resistor_override("r1", 500.).unwrap())
+        .unwrap();
+    close(
+        b.linear_system_with_context(&rebound).unwrap().a.get(0, 0),
+        1. / 500. + 1. / 2e3,
     );
 }

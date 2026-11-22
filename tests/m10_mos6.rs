@@ -484,7 +484,9 @@ fn multiplicity_scales_completed_stamps_not_intrinsic_state() {
             .observation_parameter("m", &ModelContext::default())
             .unwrap()
             .unwrap();
-        let mut histories = circuits.each_ref().map(Circuit::state_history);
+        let mut histories = circuits
+            .each_ref()
+            .map(|circuit| circuit.state_history().unwrap());
         let mut steps = StepHistory::new();
         for (step, dt) in [0., 1e-9, 7e-10, 1.3e-9].into_iter().enumerate() {
             let coefficients = (step != 0).then(|| {

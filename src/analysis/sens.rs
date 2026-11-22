@@ -1037,7 +1037,7 @@ fn ac_state<'a>(
     omega: Real,
     model: crate::devices::ModelContext,
     zeros: &'a Vector,
-    state: &'a [Real],
+    state: &'a crate::devices::StateSnapshot,
 ) -> SpiceResult<AcState<'a>> {
     // CKTunsetup/CKTsetup make a new circuit matrix (elements in setup
     // order) and NIacIter reorders it from scratch.
@@ -1244,7 +1244,7 @@ struct AcState<'a> {
     solution: Vec<Complex>,
     model: crate::devices::ModelContext,
     bias: &'a Vector,
-    state: &'a [Real],
+    state: &'a crate::devices::StateSnapshot,
     circuit: &'a Circuit,
 }
 
@@ -1465,7 +1465,7 @@ struct AcSweep<'a> {
     bias: &'a Vector,
     model: crate::devices::ModelContext,
     zeros: Vector,
-    state: Vec<Real>,
+    state: crate::devices::StateSnapshot,
 }
 
 impl AcSweep<'_> {
@@ -1526,7 +1526,7 @@ fn run_ac(
         bias,
         model,
         zeros: Vector::zeros(circuit.unknown_count()),
-        state: vec![0.; circuit.state_history()?.len()],
+        state: circuit.bind_state(vec![0.; circuit.state_len()])?,
     };
     let mut scratch = AcAssembly::new(circuit.unknown_count());
     let mut system = LinearSystem::new(circuit.unknown_count());

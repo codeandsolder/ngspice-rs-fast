@@ -383,3 +383,48 @@ fn the_registry_builds_all_four_from_cards() {
         "{error}"
     );
 }
+
+#[test]
+fn same_size_controlled_source_reordering_rebinds_the_actual_controllers() {
+    let mut c = circuit("v1 in1 0 1\nr1 in1 0 1k\nv2 in2 0 3\nr2 in2 0 1k\nf1 a 0 v1 2\nf2 b 0 v2 2\nra a 0 1k\nrb b 0 1k").unwrap();
+    let loaded = |c: &Circuit| {
+        let history = c.state_history().unwrap();
+        let mut matrix = c.new_matrix().unwrap();
+        let mut rhs = Vector::zeros(c.unknown_count());
+        c.load(
+            &LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &Vector::zeros(c.unknown_count()),
+                model_context: &ModelContext::default(),
+                integration: None,
+                history: &history,
+                forcing: None,
+            },
+            &mut matrix,
+            &mut rhs,
+            &mut history.trial(),
+        )
+        .unwrap();
+        matrix.solve(&rhs).unwrap()
+    };
+    let before = loaded(&c);
+    close(before.as_slice()[row(&c, "a")], 2.);
+    close(before.as_slice()[row(&c, "b")], 6.);
+    let first = index(&c, "f1");
+    let second = index(&c, "f2");
+    c.swap_devices(first, second).unwrap();
+    assert!(c.control_rows(first).is_err());
+    assert!(c.new_matrix().is_err());
+    c.finalize().unwrap();
+    assert_eq!(
+        c.control_rows(index(&c, "f1")).unwrap(),
+        vec![branch(&c, "v1")]
+    );
+    assert_eq!(
+        c.control_rows(index(&c, "f2")).unwrap(),
+        vec![branch(&c, "v2")]
+    );
+    let after = loaded(&c);
+    close(after.as_slice()[row(&c, "a")], 2.);
+    close(after.as_slice()[row(&c, "b")], 6.);
+}
