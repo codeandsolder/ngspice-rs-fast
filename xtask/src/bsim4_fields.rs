@@ -352,6 +352,20 @@ fn emit_instance_ownership(out: &mut String, fields: &[Field]) -> Result<(), Str
             return Err(format!("{stage}: unknown instance member {unknown}"));
         }
     }
+    // b4temp.c assigns both overlap capacitances unconditionally. A new
+    // overlap needs review of whether preparation actually resets it on
+    // every path; a conditional write is not enough to discard live state.
+    let overlap: BTreeSet<_> = phases[3]
+        .1
+        .iter()
+        .filter(|name| phases[..3].iter().any(|(_, writes)| writes.contains(*name)))
+        .map(String::as_str)
+        .collect();
+    if overlap != BTreeSet::from(["cgdo", "cgso"]) {
+        return Err(format!(
+            "BSIM4 load/preparation overlap changed: {overlap:?}; review reset ownership"
+        ));
+    }
     let persistent: BTreeSet<_> = phases[3]
         .1
         .iter()
