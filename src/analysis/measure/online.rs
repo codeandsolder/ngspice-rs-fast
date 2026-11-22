@@ -3,8 +3,8 @@
 //! and quadrature policies; only the traversal differs.
 
 use super::{
-    CrossingSelector, Extrema, Integral, MeasureEvents, MeasureSpan, Measurement, Window,
-    axis_name, nonfinite, span_width, unsupported,
+    CrossingSelector, Extrema, Integral, MarginScan, MeasureEvents, MeasureSpan, Measurement,
+    Window, axis_name, nonfinite, span_width, unsupported,
 };
 use crate::analysis::ordered_samples::same_coordinate;
 use crate::analysis::results::Plot;
@@ -13,6 +13,9 @@ use crate::netlist::ast::{
     MeasureCard, MeasureEvent, MeasureRequest, MeasureStatistic, MeasureTransition, MeasureWindow,
 };
 use crate::primitives::{AnalysisKind, Complex, Real, SpiceError, SpiceResult};
+
+mod local_query;
+use local_query::LocalHistory;
 
 type Sample = (Real, SpiceResult<Complex>);
 
@@ -31,7 +34,10 @@ pub(in crate::analysis) struct AxisTracker {
 
 impl AxisTracker {
     pub(in crate::analysis) fn bind(plot: &Plot, kind: AnalysisKind) -> SpiceResult<Self> {
-        let name = axis_name(plot, kind)?;
+        Self::bind_named(plot, axis_name(plot, kind)?)
+    }
+
+    pub(in crate::analysis) fn bind_named(plot: &Plot, name: &'static str) -> SpiceResult<Self> {
         let column = plot
             .variable_index(name)
             .ok_or_else(|| SpiceError::Unsupported {
@@ -380,6 +386,13 @@ impl<'a> EventState<'a> {
         *previous = Some((x, value));
     }
 
+    const fn selected(&self) -> Option<Real> {
+        match self {
+            Self::At { at, .. } => Some(*at),
+            Self::Cross { selector, .. } => selector.selected,
+        }
+    }
+
     fn finish(self, axis: &AxisTracker, card: &MeasureCard) -> SpiceResult<Real> {
         let range = axis.range()?;
         match self {
@@ -565,6 +578,12 @@ pub(in crate::analysis) enum BoundMeasure {
         statistic: MeasureStatistic,
         window: MeasureWindow,
     },
+    AtEvent {
+        column: Column,
+        event: Box<EventPlan>,
+        derivative: bool,
+        window: MeasureWindow,
+    },
     When {
         event: EventPlan,
         window: MeasureWindow,
@@ -584,26 +603,38 @@ impl BoundMeasure {
                 at,
                 window,
                 ..
-            }
-            | MeasureRequest::AtEvent {
-                operand,
-                event: MeasureEvent::At { at, .. },
-                derivative: false,
-                window,
             } => Self::Find {
                 column: resolve_request(plot, operand)?,
                 at: *at,
+                window: *window,
+            },
+            MeasureRequest::AtEvent {
+                operand,
+                event,
+                derivative,
+                window,
+            } => Self::AtEvent {
+                column: resolve_request(plot, operand)?,
+                event: Box::new(EventPlan::bind(plot, event, *window, card)?),
+                derivative: *derivative,
                 window: *window,
             },
             MeasureRequest::Statistic {
                 statistic,
                 operand,
                 window,
-            } if !matches!(
-                statistic,
-                MeasureStatistic::PhaseMargin | MeasureStatistic::GainMargin
-            ) =>
-            {
+            } => {
+                if matches!(
+                    statistic,
+                    MeasureStatistic::PhaseMargin | MeasureStatistic::GainMargin
+                ) && (axis_name(plot, card.analysis)? != "frequency"
+                    || !plot.flags().is_complex())
+                {
+                    return Err(unsupported(
+                        card,
+                        "margin measurements require complex AC/SP data".into(),
+                    ));
+                }
                 Self::Statistic {
                     column: resolve_request(plot, operand)?,
                     statistic: *statistic,
@@ -628,6 +659,10 @@ impl BoundMeasure {
             Self::Find { column, .. } | Self::Statistic { column, .. } => {
                 out.extend(column.input_columns());
             }
+            Self::AtEvent { column, event, .. } => {
+                out.extend(column.input_columns());
+                event.inputs(out);
+            }
             Self::When { event, .. } => event.inputs(out),
             Self::Delay { trig, targ, .. } => {
                 trig.inputs(out);
@@ -642,9 +677,21 @@ impl BoundMeasure {
     ) -> SpiceResult<MeasureState<'a>> {
         let state = match self {
             Self::Find { at, .. } => Reduction::Find(PointQuery::new(*at, true)),
+            Self::Statistic { statistic, .. }
+                if matches!(
+                    statistic,
+                    MeasureStatistic::PhaseMargin | MeasureStatistic::GainMargin
+                ) =>
+            {
+                Reduction::Margin(MarginScan::new(*statistic == MeasureStatistic::PhaseMargin))
+            }
             Self::Statistic { statistic, .. } => {
                 Reduction::Statistic(StatisticState::new(*statistic))
             }
+            Self::AtEvent { event, .. } => Reduction::AtEvent(Box::new(EventQueryState {
+                event: EventState::new(event, card)?,
+                history: LocalHistory::new(),
+            })),
             Self::When { event, .. } => Reduction::When(EventState::new(event, card)?),
             Self::Delay { trig, targ, .. } => {
                 Reduction::Delay(EventState::new(trig, card)?, EventState::new(targ, card)?)
@@ -659,9 +706,16 @@ impl BoundMeasure {
     }
 }
 
+struct EventQueryState<'a> {
+    event: EventState<'a>,
+    history: LocalHistory,
+}
+
 enum Reduction<'a> {
+    AtEvent(Box<EventQueryState<'a>>),
     Find(PointQuery),
     Statistic(StatisticState),
+    Margin(MarginScan),
     When(EventState<'a>),
     Delay(EventState<'a>, EventState<'a>),
 }
@@ -682,10 +736,25 @@ impl MeasureState<'_> {
             (Reduction::Find(query), BoundMeasure::Find { column, .. }) => {
                 query.observe(x, || read(column, row, self.card).map(Complex::real));
             }
+            (Reduction::Margin(scan), BoundMeasure::Statistic { column, window, .. }) => {
+                if scan.selected.is_none() {
+                    self.error = column
+                        .value(row)
+                        .and_then(|value| scan.observe(x, value, &raw_window(window), self.card))
+                        .err();
+                }
+            }
             (Reduction::Statistic(state), BoundMeasure::Statistic { column, window, .. }) => {
                 self.error = state
                     .observe(x, || read(column, row, self.card), window)
                     .err();
+            }
+            (Reduction::AtEvent(state), BoundMeasure::AtEvent { column, .. }) => {
+                state.event.observe(x, row, self.card);
+                state.history.observe(x, read(column, row, self.card));
+                if let Some(at) = state.event.selected() {
+                    state.history.select(at);
+                }
             }
             (Reduction::When(event), _) => event.observe(x, row, self.card),
             (Reduction::Delay(trig, targ), _) => {
@@ -716,21 +785,26 @@ impl MeasureState<'_> {
                         "AT= is outside the measurement window (out of interval)".into(),
                     ));
                 }
-                result.value = query
-                    .finish()
-                    .map_err(|error| match error {
-                        QueryFailure::Outside => unsupported(
-                            card,
-                            "AT= is outside the measurement axis (out of interval)".into(),
-                        ),
-                        QueryFailure::Discontinuous => {
-                            unsupported(card, "the operand is discontinuous at AT=".into())
-                        }
-                        QueryFailure::Invalid(error) => error,
-                    })?
-                    .re;
+                result.value = query_value(query, card)?;
                 result.at = Some(*at);
                 result.unit = column.unit().into();
+            }
+            (
+                Reduction::Margin(scan),
+                BoundMeasure::Statistic {
+                    column,
+                    statistic,
+                    window,
+                },
+            ) => {
+                Window::from_range(window, range, axis.name, card)?;
+                if let Some(error) = self.error {
+                    return Err(error);
+                }
+                let (value, at) = scan.finish(card)?;
+                result.value = value;
+                result.at = Some(at);
+                result.unit = super::statistic_unit(*statistic, column.unit(), axis.name);
             }
             (
                 Reduction::Statistic(state),
@@ -746,6 +820,25 @@ impl MeasureState<'_> {
                 result.at = at;
                 result.window = span;
                 result.unit = super::statistic_unit(*statistic, column.unit(), axis.name);
+            }
+            (
+                Reduction::AtEvent(state),
+                BoundMeasure::AtEvent {
+                    column,
+                    derivative,
+                    window,
+                    ..
+                },
+            ) => {
+                Window::from_range(window, range, axis.name, card)?;
+                let at = state.event.finish(axis, card)?;
+                result.value = state.history.finish(at, *derivative, card)?;
+                result.at = Some(at);
+                result.unit = if *derivative {
+                    format!("{}/{}", column.unit(), axis.name)
+                } else {
+                    column.unit().into()
+                };
             }
             (Reduction::When(event), BoundMeasure::When { window, .. }) => {
                 Window::from_range(window, range, axis.name, card)?;
@@ -769,4 +862,17 @@ impl MeasureState<'_> {
         }
         Ok(result)
     }
+}
+
+fn query_value(query: PointQuery, card: &MeasureCard) -> SpiceResult<Real> {
+    query.finish().map(|v| v.re).map_err(|error| match error {
+        QueryFailure::Outside => unsupported(
+            card,
+            "AT= is outside the measurement axis (out of interval)".into(),
+        ),
+        QueryFailure::Discontinuous => {
+            unsupported(card, "the operand is discontinuous at AT=".into())
+        }
+        QueryFailure::Invalid(error) => error,
+    })
 }

@@ -253,18 +253,30 @@ impl PlotObjectivePlan {
             retained_cell_limit,
         } = requests;
         measure::bounded_count(measurements.iter())?;
-        let needs_axis = !measurements.is_empty()
-            || observations
-                .iter()
-                .any(|request| matches!(request.reduction, ObservationReduction::At(_)));
-        let axis = needs_axis
-            .then(|| AxisTracker::bind(header, kind))
-            .transpose()?;
-        // Trace/last observations need no ordered axis: descending DC traces
-        // are valid and keep their coordinates.
-        let trace_axis = measure::axis_name(header, kind)
-            .ok()
-            .and_then(|name| header.variable_index(name));
+        // Direct observations are not restricted to the .measure grammar.
+        // Frequency-bearing noise, distortion and AC sensitivity plots use
+        // their physical scale; integrated/one-point plots have none.
+        let scale = measure::axis_name(header, kind).ok().or_else(|| {
+            (matches!(
+                kind,
+                AnalysisKind::Noise | AnalysisKind::Distortion | AnalysisKind::Sensitivity
+            ) && header.variable_index("frequency").is_some())
+            .then_some("frequency")
+        });
+        let axis = if !measurements.is_empty() {
+            Some(AxisTracker::bind(header, kind)?)
+        } else if observations
+            .iter()
+            .any(|request| matches!(request.reduction, ObservationReduction::At(_)))
+        {
+            Some(AxisTracker::bind_named(
+                header,
+                scale.ok_or_else(|| invalid("point query requires a physical scale"))?,
+            )?)
+        } else {
+            None
+        };
+        let trace_axis = scale.and_then(|name| header.variable_index(name));
         let mut required = Vec::new();
         if let Some(axis) = &axis {
             required.push(axis.column());

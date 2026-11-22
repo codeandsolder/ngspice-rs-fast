@@ -34,9 +34,11 @@ use crate::netlist::ast::{
     MeasureCard, MeasureEvent, MeasureRequest, MeasureStatistic, MeasureTransition, MeasureWindow,
     VectorRequest,
 };
-use crate::primitives::{AnalysisKind, Real, SpiceError, SpiceResult};
+use crate::primitives::{AnalysisKind, Complex, Real, SpiceError, SpiceResult};
 
-use super::ordered_samples::{AxisError, OrderedAxis, SampleError, SampleWindow, column_names};
+use super::ordered_samples::{
+    AxisError, OrderedAxis, SampleError, SampleWindow, column_names, same_coordinate,
+};
 use crate::analysis::results::Plot;
 use crate::analysis::selection::{self, Column};
 
@@ -424,7 +426,6 @@ impl Window {
                     card.name,
                     crate::primitives::format_spice_number(from),
                     crate::primitives::format_spice_number(to),
-                    axis,
                     crate::primitives::format_spice_number(first),
                     crate::primitives::format_spice_number(last)
                 ),
@@ -887,10 +888,6 @@ fn integrate(
 }
 
 /// C `measure_margin`: unwrap phase, interpolate dB/degrees and log frequency.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "retain reference interpolation rounding for the selected crossover and its margin"
-)]
 fn margin(
     axis: &Axis,
     operand: &Operand<'_>,
@@ -904,28 +901,62 @@ fn margin(
             "margin measurements require complex AC/SP data".into(),
         ));
     }
-    let mut previous: Option<(Real, Real, Real)> = None;
-    let mut raw_previous = 0.;
-    let mut offset = 0.;
-    for (i, point) in operand.plot.rows().enumerate() {
-        let value = operand.column.value(point)?;
+    let mut scan = MarginScan::new(phase_margin);
+    for (frequency, point) in axis.values.as_slice().iter().zip(operand.plot.rows()) {
+        scan.observe(*frequency, operand.column.value(point)?, window, card)?;
+        if scan.selected.is_some() {
+            break;
+        }
+    }
+    scan.finish(card)
+}
+
+struct MarginScan {
+    phase_margin: bool,
+    previous: Option<(Real, Real, Real)>,
+    raw_previous: Real,
+    offset: Real,
+    selected: Option<(Real, Real)>,
+}
+
+impl MarginScan {
+    const fn new(phase_margin: bool) -> Self {
+        Self {
+            phase_margin,
+            previous: None,
+            raw_previous: 0.,
+            offset: 0.,
+            selected: None,
+        }
+    }
+
+    #[expect(
+        clippy::float_cmp,
+        reason = "exact interpolation endpoints retain the original coordinate"
+    )]
+    fn observe(
+        &mut self,
+        frequency: Real,
+        value: Complex,
+        window: &Window,
+        card: &MeasureCard,
+    ) -> SpiceResult<()> {
         let db = 20. * value.re.hypot(value.im).log10();
         let raw = value.im.atan2(value.re).to_degrees();
-        if i > 0 {
-            if raw - raw_previous > 180. {
-                offset -= 360.;
-            } else if raw - raw_previous < -180. {
-                offset += 360.;
+        if self.previous.is_some() {
+            if raw - self.raw_previous > 180. {
+                self.offset -= 360.;
+            } else if raw - self.raw_previous < -180. {
+                self.offset += 360.;
             }
         }
-        raw_previous = raw;
-        let phase = raw + offset;
-        let frequency = axis.values.as_slice()[i];
+        self.raw_previous = raw;
+        let phase = raw + self.offset;
         if !db.is_finite() {
             return Err(nonfinite(card, "margin", "zero or nonfinite gain".into()));
         }
-        if let Some((f0, db0, p0)) = previous {
-            let (a, b, target) = if phase_margin {
+        if let Some((f0, db0, p0)) = self.previous {
+            let (a, b, target) = if self.phase_margin {
                 (db0, db, 0.)
             } else {
                 (p0, phase, -180.)
@@ -933,34 +964,40 @@ fn margin(
             if (a >= target && b < target) || (a < target && b >= target) {
                 let fraction = (target - a) / (b - a);
                 let at = if f0 > 0. && frequency > 0. {
-                    (f0.ln() + fraction * (frequency.ln() - f0.ln())).exp()
+                    if fraction == 0. {
+                        f0
+                    } else if fraction == 1. {
+                        frequency
+                    } else {
+                        fraction.mul_add(frequency.ln() - f0.ln(), f0.ln()).exp()
+                    }
                 } else {
-                    f0 + fraction * (frequency - f0)
+                    fraction.mul_add(frequency - f0, f0)
                 };
                 if at >= window.from && at <= window.to {
-                    let value = if phase_margin {
-                        180. + p0 + fraction * (phase - p0)
+                    let value = if self.phase_margin {
+                        fraction.mul_add(phase - p0, 180. + p0)
                     } else {
-                        -(db0 + fraction * (db - db0))
+                        -fraction.mul_add(db - db0, db0)
                     };
-                    return Ok((value, at));
+                    self.selected = Some((value, at));
+                    return Ok(());
                 }
             }
         }
-        previous = Some((frequency, db, phase));
+        self.previous = Some((frequency, db, phase));
+        Ok(())
     }
-    Err(unsupported(
-        card,
-        "no margin crossover in the measurement window".into(),
-    ))
+
+    fn finish(self, card: &MeasureCard) -> SpiceResult<(Real, Real)> {
+        self.selected.ok_or_else(|| {
+            unsupported(card, "no margin crossover in the measurement window".into())
+        })
+    }
 }
 
 /// Nonuniform quadratic derivative, C `measure_deriv_at`; two samples use a
 /// safe secant instead of the C implementation's out-of-range stencil.
-#[expect(
-    clippy::float_cmp,
-    reason = "exact coordinate identity selects discontinuities and zero-width stencil intervals; a tolerance would merge distinct samples"
-)]
 fn derivative_at(
     axis: &Axis,
     operand: &Operand<'_>,
@@ -974,33 +1011,51 @@ fn derivative_at(
         .ok_or_else(|| unsupported(card, "DERIV needs a bracketing interval".into()))?;
     let j = bracket.right();
     if exact {
-        // Check every duplicate at the exact point before choosing a stencil.
         value_at(axis, operand, at, card)?;
     }
-    let secant = || -> SpiceResult<Real> {
-        let width = bracket.x1 - bracket.x0;
+    let triple = if axis.values.len() > 2 {
+        let middle = (j - 1).clamp(1, axis.values.len() - 2);
+        Some(std::array::from_fn(|k| {
+            let i = middle - 1 + k;
+            (i, axis.values.as_slice()[i])
+        }))
+    } else {
+        None
+    };
+    derivative_value(
+        at,
+        [(j - 1, bracket.x0), (j, bracket.x1)],
+        triple,
+        |i| operand.value(i),
+        card,
+    )
+}
+
+fn derivative_value(
+    at: Real,
+    [(i0, x0), (i1, x1)]: [(usize, Real); 2],
+    triple: Option<[(usize, Real); 3]>,
+    sample: impl Fn(usize) -> SpiceResult<Real>,
+    card: &MeasureCard,
+) -> SpiceResult<Real> {
+    let value = if let Some(points) = triple
+        && !same_coordinate(points[0].1, points[1].1)
+        && !same_coordinate(points[1].1, points[2].1)
+    {
+        let mut sum = 0.;
+        for k in 0..3 {
+            let a = points[(k + 1) % 3].1;
+            let b = points[(k + 2) % 3].1;
+            let (i, t) = points[k];
+            sum += sample(i)? * ((at - a) + (at - b)) / ((t - a) * (t - b));
+        }
+        sum
+    } else {
+        let width = x1 - x0;
         if width == 0. {
             return Err(unsupported(card, "DERIV at a repeated axis value".into()));
         }
-        Ok((operand.value(j)? - operand.value(j - 1)?) / width)
-    };
-    let value = if axis.values.len() == 2 {
-        secant()?
-    } else {
-        let middle = (j - 1).clamp(1, axis.values.len() - 2);
-        let t = &axis.values.as_slice()[middle - 1..=middle + 1];
-        if t[0] == t[1] || t[1] == t[2] {
-            secant()?
-        } else {
-            let mut sum = 0.;
-            for k in 0..3 {
-                let a = (k + 1) % 3;
-                let b = (k + 2) % 3;
-                sum += operand.value(middle - 1 + k)? * ((at - t[a]) + (at - t[b]))
-                    / ((t[k] - t[a]) * (t[k] - t[b]));
-            }
-            sum
-        }
+        (sample(i1)? - sample(i0)?) / width
     };
     if !value.is_finite() {
         return Err(nonfinite(card, "DERIV", "nonfinite derivative".into()));
@@ -1264,7 +1319,8 @@ fn statistic_unit(statistic: MeasureStatistic, unit: &str, axis: &str) -> String
 /// the threshold) and a positive bracket width, so there is never a division by
 /// a zero span.
 fn interpolate_axis(x0: Real, y0: Real, x1: Real, y1: Real, y: Real) -> Real {
-    x0 + (x1 - x0) * (y - y0) / (y1 - y0)
+    let x = x0 + (x1 - x0) * (y - y0) / (y1 - y0);
+    if x.is_finite() { x.clamp(x0, x1) } else { x }
 }
 
 #[cfg(test)]

@@ -256,6 +256,17 @@ fn windows_crossings_and_exact_query_groups_match_retained() {
                             window,
                         }
                     }))
+                    .chain([0., 0.5, 1., 1.5, 2., 4., 5.].into_iter().map(|at| {
+                        MeasureRequest::AtEvent {
+                            operand: request("v(out)"),
+                            event: MeasureEvent::At {
+                                at,
+                                location: request_location(),
+                            },
+                            derivative: true,
+                            window,
+                        }
+                    }))
                     .chain(
                         [
                             MeasureTransition::First,
@@ -280,7 +291,26 @@ fn windows_crossings_and_exact_query_groups_match_retained() {
                                 },
                             ]
                             .into_iter()
-                            .map(move |event| MeasureRequest::When { event, window })
+                            .flat_map(move |event| {
+                                [
+                                    MeasureRequest::When {
+                                        event: event.clone(),
+                                        window,
+                                    },
+                                    MeasureRequest::AtEvent {
+                                        event: event.clone(),
+                                        operand: request("v(ref)"),
+                                        derivative: false,
+                                        window,
+                                    },
+                                    MeasureRequest::AtEvent {
+                                        event,
+                                        operand: request("v(ref)"),
+                                        derivative: true,
+                                        window,
+                                    },
+                                ]
+                            })
                         }),
                     );
                 for m in requests {
@@ -329,14 +359,14 @@ fn arbitrary_history_retains_only_raw_dependencies_and_shares_scalar_scope() {
         AnalysisKind::Transient,
         ObjectiveRequests {
             measurements: parsed.measurements.clone(),
-            retained_cell_limit: 9,
+            retained_cell_limit: 6,
             ..ObjectiveRequests::default()
         },
     )
     .unwrap();
-    assert_eq!(bound.retained_columns(), [0, 1, 2]);
+    assert_eq!(bound.retained_columns(), [0, 1]);
     let got = finish(&ScenarioPlan::new(vec![bound]), &full, &scope);
-    assert_eq!(got.retained_cells, 9);
+    assert_eq!(got.retained_cells, 6);
     assert_eq!(
         got.measurements.unwrap(),
         measure::resolve_with_scope(&full, AnalysisKind::Transient, &parsed.measurements, &scope)
@@ -348,7 +378,7 @@ fn arbitrary_history_retains_only_raw_dependencies_and_shares_scalar_scope() {
         AnalysisKind::Transient,
         ObjectiveRequests {
             measurements: parsed.measurements,
-            retained_cell_limit: 8,
+            retained_cell_limit: 5,
             observations: vec![observation(
                 "unaffected",
                 "v(out)",
@@ -361,7 +391,7 @@ fn arbitrary_history_retains_only_raw_dependencies_and_shares_scalar_scope() {
     let got = finish(&ScenarioPlan::new(vec![limited]), &full, &scope);
     assert!(got.measurements.is_err());
     assert!(got.observations[0].value.is_ok());
-    assert_eq!(got.retained_cells, 6);
+    assert_eq!(got.retained_cells, 4);
 }
 
 #[test]
@@ -503,6 +533,68 @@ fn prepared_rc_scenario_reuses_scalar_objectives_across_candidates() {
         assert!((point.value.re - analytical.re).abs() < 1e-12);
         assert!((point.value.im - analytical.im).abs() < 1e-12);
         assert!(got.iter().all(|plot| plot.retained_cells == 0));
+    }
+}
+
+#[test]
+fn streaming_margins_and_frequency_observations_reuse_physical_scale() {
+    let scope = ParamScope::root(&[]).unwrap();
+    let mut builder = Plot::builder("ac1", "AC Analysis", PlotFlags::Complex);
+    builder.push_variable(Variable::new("frequency", "frequency"));
+    builder.push_variable(Variable::new("v(out)", "voltage"));
+    let mut full = builder.build();
+    for (frequency, magnitude, degrees) in [
+        (1., 2., -80_f64),
+        (10., 1., -150.),
+        (100., 0.5, -200.),
+        (1000., 0.25, -220.),
+    ] {
+        let phase = degrees.to_radians();
+        full.push_point(&[
+            Complex::real(frequency),
+            Complex::new(magnitude * phase.cos(), magnitude * phase.sin()),
+        ])
+        .unwrap();
+    }
+    let parsed = parsed(".meas ac pm PHASE_MARGIN v(out)\n.meas ac gm GAIN_MARGIN v(out)");
+    let bound = PlotObjectivePlan::bind(
+        &full,
+        AnalysisKind::Ac,
+        ObjectiveRequests {
+            measurements: parsed.measurements.clone(),
+            ..ObjectiveRequests::default()
+        },
+    )
+    .unwrap();
+    assert!(bound.retained_columns().is_empty());
+    let got = finish(&ScenarioPlan::new(vec![bound]), &full, &scope);
+    assert_eq!(
+        got.measurements.unwrap(),
+        measure::resolve(&full, AnalysisKind::Ac, &parsed.measurements).unwrap()
+    );
+    assert_eq!(got.retained_cells, 0);
+    // Noise and sensitivity are valid direct frequency objectives even
+    // though the deck measurement grammar does not admit them.
+    for kind in [
+        AnalysisKind::Noise,
+        AnalysisKind::Sensitivity,
+        AnalysisKind::Distortion,
+    ] {
+        let bound = PlotObjectivePlan::bind(
+            &full,
+            kind,
+            ObjectiveRequests {
+                observations: vec![observation("at", "v(out)", ObservationReduction::At(10.))],
+                ..ObjectiveRequests::default()
+            },
+        )
+        .unwrap();
+        let got = finish(&ScenarioPlan::new(vec![bound]), &full, &scope);
+        let ObservationValue::Scalar(point) = got.observations[0].value.as_ref().unwrap() else {
+            panic!("expected scalar");
+        };
+        assert_eq!(point.value, full.rows().nth(1).unwrap()[1]);
+        assert_eq!(got.retained_cells, 0);
     }
 }
 
