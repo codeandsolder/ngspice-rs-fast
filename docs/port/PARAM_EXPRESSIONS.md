@@ -112,7 +112,12 @@ declared model name stays a model.
 Recognised syntax commits: missing operands, unmatched `(`/`)`/`{`/`}`, empty
 braces, trailing tokens, wrong arities, bad signs, overflowing literals and
 nesting beyond 64 levels are `SpiceError::Parse` with the byte column of the
-offending text. Valid numparam outside the subset is `SpiceError::NotYetPorted`
+offending text. A separate structural height limit of 256 nodes on any
+root-to-leaf path and a 100,000-node budget per expression protect the owned
+AST and its recursive consumers (clone, drop, comparison, formatting,
+evaluation). Every node is charged during construction; flat binary chains
+are folded incrementally in C order, never reassociated. Wide shallow calls
+remain possible within the node budget. Valid numparam outside the subset is `SpiceError::NotYetPorted`
 (reference `xpressn.c`), never dropped.
 
 ## Explicit exclusions

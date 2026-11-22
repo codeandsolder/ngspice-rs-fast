@@ -773,3 +773,83 @@ fn invalid_nested_expression_on_continuation_retains_real_coordinates() {
     };
     assert_eq!((location.line, location.column), (3, 5));
 }
+
+#[test]
+fn flat_chains_respect_structural_depth_before_boxing() {
+    use ngspice_rs::netlist::expr::MAX_TREE_DEPTH;
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            for op in ["+", "-", "*", "/", "^", "**"] {
+                let accepted = format!("{}1", format!("1{op}").repeat(MAX_TREE_DEPTH - 1));
+                let expr = expression(&accepted).unwrap();
+                assert_eq!(expr, expr.clone());
+                assert!(!sexp(&expr.root).is_empty());
+                let n = parse(&format!(".param a={{{accepted}}}")).unwrap();
+                let scope = ngspice_rs::netlist::eval::ParamScope::for_netlist(&n).unwrap();
+                let expected = match op {
+                    "+" => MAX_TREE_DEPTH as f64,
+                    "-" => 2.0 - MAX_TREE_DEPTH as f64,
+                    _ => 1.0,
+                };
+                assert_eq!(scope.get("a"), Some(expected));
+                let written = ngspice_rs::netlist::write_netlist(&n).unwrap();
+                let reparsed = Parser::new()
+                    .parse_deck(&parse_deck_text(Path::new("param.cir"), &written))
+                    .unwrap();
+                assert!(ngspice_rs::netlist::semantic_diff(&n, &reparsed).is_none());
+                let dumped = ngspice_rs::netlist::dump::dump_ast(
+                    &n,
+                    &ngspice_rs::netlist::dump::PathMapper::new(Path::new(".")),
+                );
+                assert!(!dumped.is_empty());
+                let excessive = format!("{}1", format!("1{op}").repeat(200_000));
+                let error = expression(&excessive).unwrap_err();
+                match error {
+                    SpiceError::Parse { location, message } => {
+                        assert_eq!(
+                            location.column,
+                            10 + (MAX_TREE_DEPTH - 1) * (op.len() + 1) + 1
+                        );
+                        assert!(message.contains("structural depth limit"), "{message}");
+                    }
+                    other => panic!("{other}"),
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn wide_calls_charge_nodes_independently_of_height() {
+    use ngspice_rs::netlist::expr::MAX_TREE_NODES;
+    let valid = format!("f({}1)", "1,".repeat(MAX_TREE_NODES - 2));
+    let parsed = expression(&valid).unwrap();
+    let ExprKind::UserCall { arguments, .. } = &parsed.root.kind else {
+        panic!("expected a call");
+    };
+    assert_eq!(arguments.len(), MAX_TREE_NODES - 1);
+    assert_eq!(parsed, parsed.clone());
+    let invalid = format!("f({}1)", "1,".repeat(MAX_TREE_NODES - 1));
+    let error = expression(&invalid).unwrap_err();
+    assert!(error.to_string().contains("node limit"), "{error}");
+}
+
+#[test]
+fn structural_limit_also_counts_group_and_call_wrappers() {
+    use ngspice_rs::netlist::expr::MAX_TREE_DEPTH;
+    let chain = format!("{}1", "1+".repeat(MAX_TREE_DEPTH - 1));
+    for text in [
+        format!("({chain})"),
+        format!("abs({chain})"),
+        format!("-{chain}"),
+    ] {
+        let error = expression(&text).unwrap_err();
+        assert!(
+            error.to_string().contains("structural depth limit"),
+            "{error}"
+        );
+    }
+}

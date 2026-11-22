@@ -67,42 +67,26 @@
 //! A Fourier result that cannot be computed is an error, never a fabricated
 //! `NaN`/`0`/clamped value:
 //!
-//! * [`SpiceError::Unsupported`], positioned at the card, for a card in a run
+//! * [`crate::primitives::SpiceError::Unsupported`], positioned at the card, for a card in a run
 //!   that is not `.tran`, a plot without a `time` axis or with fewer than two
 //!   points, a descending axis, a run shorter than one period, a window with too
 //!   few samples for the requested harmonics, a grid point on an unrepresented
 //!   discontinuity, and a card whose harmonic count is outside this port's
 //!   bounded resampling budget (a hand-built card can carry one the parser would
 //!   have rejected);
-//! * [`SpiceError::Numerical`] when the plot's own values do not permit the
+//! * [`crate::primitives::SpiceError::Numerical`] when the plot's own values do not permit the
 //!   arithmetic: a non-finite axis value, a non-finite operand value at a grid
 //!   point, a non-finite result, or a zero fundamental amplitude, which leaves
 //!   the THD undefined;
-//! * whatever [`selection::resolve_request`] reports for a vector the plot
+//! * whatever [`crate::analysis::selection::resolve_request`] reports for a vector the plot
 //!   cannot resolve (an unknown node, a branch current the analysis has no
 //!   vector for).
 
-use crate::netlist::ast::{FourierCard, MAX_HARMONICS, VectorRequest};
-use crate::primitives::{AnalysisKind, Real, SpiceError, SpiceResult};
+mod execution;
 
-use super::ordered_samples::{AxisError, OrderedAxis, SampleError, column_names};
 use crate::analysis::results::Plot;
-use crate::analysis::selection::{self, Column};
-
-/// The grid's harmonic-count floor: `4 * 50 = 200` subintervals per period,
-/// matching C's default `fourgridsize`. Higher counts retain four subintervals
-/// per requested harmonic, with the same maximum of 400 subintervals.
-const GRID_FLOOR: u32 = 50;
-
-/// How many ULPs of the quadrature's own sums a fundamental amplitude must
-/// exceed before a total harmonic distortion can be formed from it.
-///
-/// The sums accumulate at most `4 * MAX_HARMONICS + 1 = 401` terms, so a trace
-/// with no fundamental content leaves an amplitude of a few `f64::EPSILON`
-/// times the trace's own magnitude there; a THD formed from that residue would
-/// be pure noise (C prints whatever it computes). This is the arithmetic's
-/// resolution, not a physical tolerance.
-const NOISE_ULPS: Real = 16.0;
+use crate::netlist::ast::FourierCard;
+use crate::primitives::{AnalysisKind, Real, SpiceResult};
 
 /// One tabulated harmonic of a Fourier analysis.
 #[derive(Debug, Clone, PartialEq)]
@@ -161,51 +145,21 @@ pub struct FourierAnalysis {
 ///
 /// # Errors
 ///
-/// * [`SpiceError::Unsupported`], positioned at the card, for a card that names
+/// * [`crate::primitives::SpiceError::Unsupported`], positioned at the card, for a card that names
 ///   another analysis than `kind` (C selects the `tran` plot; a multi-analysis
 ///   deck routes `.four` to its last `.tran` plot through
 ///   [`crate::analysis::batch::resolve_outputs`]), for every condition listed in the module's
 ///   failure policy, and for a harmonic count outside this port's work budget;
-/// * [`SpiceError::Numerical`] for a non-finite axis, operand or result value,
+/// * [`crate::primitives::SpiceError::Numerical`] for a non-finite axis, operand or result value,
 ///   or a zero fundamental amplitude;
-/// * whatever [`selection::resolve_request`] reports for a vector the plot
+/// * whatever [`crate::analysis::selection::resolve_request`] reports for a vector the plot
 ///   cannot resolve.
 pub fn resolve(
     plot: &Plot,
     kind: AnalysisKind,
     cards: &[FourierCard],
 ) -> SpiceResult<Vec<FourierAnalysis>> {
-    if cards.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut results = Vec::new();
-    for card in cards {
-        if card.frontend_command {
-            results.extend(resolve_with_settings(
-                plot,
-                kind,
-                std::slice::from_ref(card),
-                FourierSettings::default(),
-            )?);
-            continue;
-        }
-        if kind != AnalysisKind::Transient {
-            return Err(unsupported(
-                card,
-                format!(
-                    ".four: the card transforms a .tran result (C selects the tran plot); this plot \
-                     is .{}, so the card can never be honoured against it",
-                    kind.as_str()
-                ),
-            ));
-        }
-        check_budget(card)?;
-        let axis = time_axis(plot, card)?;
-        for vector in &card.vectors {
-            results.push(evaluate(plot, &axis, card, vector)?);
-        }
-    }
-    Ok(results)
+    execution::resolve_plans(plot, kind, cards, None, true)
 }
 
 /// Evaluates Fourier fundamental expressions against the deck's parameter scope.
@@ -226,7 +180,7 @@ pub fn resolve_cards(
                 out.fundamental = scope.evaluate(expression, &mut budget)?;
                 out.fundamental_expression = None;
             }
-            check_budget(&out)?;
+            execution::check_budget(&out)?;
             Ok(out)
         })
         .collect()
@@ -297,302 +251,6 @@ pub fn to_text(results: &[FourierAnalysis]) -> String {
     out
 }
 
-/// A positioned failure for a request this plot cannot answer.
-fn unsupported(card: &FourierCard, feature: String) -> SpiceError {
-    SpiceError::Unsupported {
-        feature,
-        location: Some(card.location.clone()),
-    }
-}
-
-/// A value the transform would have to use but cannot.
-fn nonfinite(context: &str, message: String) -> SpiceError {
-    SpiceError::Numerical {
-        context: format!(".four {context}"),
-        message,
-    }
-}
-
-/// The port's bounded harmonic count, enforced where the grid is built as well
-/// as in the grammar, so a hand-built card cannot ask for unbounded work.
-fn check_budget(card: &FourierCard) -> SpiceResult<()> {
-    if card.fundamental_expression.is_some() {
-        return Err(unsupported(card, "unresolved .four fundamental expression; call resolve_cards with the deck parameter scope".into()));
-    }
-    if !(card.fundamental.is_finite() && card.fundamental > 0.0) {
-        return Err(unsupported(
-            card,
-            format!(
-                ".four: the fundamental frequency must be a finite value greater than zero (found \
-                 {})",
-                crate::primitives::format_spice_number(card.fundamental)
-            ),
-        ));
-    }
-    if card.harmonics == 0 || card.harmonics > MAX_HARMONICS {
-        let harmonics = card.harmonics;
-        let max_divisions = 4 * MAX_HARMONICS;
-        return Err(unsupported(
-            card,
-            format!(
-                ".four: HARMONICS={harmonics} is outside this port's bounded resampling budget of 1..={MAX_HARMONICS} \
-                 harmonics ({max_divisions} grid subintervals per vector); C has no such bound \
-                 (docs/port/FOURIER.md)"
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// The ordered physical time axis of a plot: the driver's scale vector.
-///
-/// The plot holds every accepted time point and lands exactly on every source
-/// breakpoint, so consecutive samples never straddle a source discontinuity
-/// (`crates/analysis/src/companion.rs`, "Output"). This module therefore
-/// interpolates only between consecutive samples, and treats two samples that
-/// share an axis value as a jump (see [`sample`]).
-fn time_axis(plot: &Plot, card: &FourierCard) -> SpiceResult<OrderedAxis<'static>> {
-    let values = OrderedAxis::from_plot(plot, "time").map_err(|error| match error {
-            AxisError::MissingColumn => unsupported(card, format!(
-                ".four: the {} plot carries no 'time' axis vector; it carries {}", plot.plotname, column_names(plot))),
-            AxisError::Nonfinite(index) => nonfinite("time", format!("point {index} is not finite")),
-            AxisError::Descending(index) => unsupported(card, format!(
-                ".four: the time axis is not non-decreasing (it descends at point {index}); a Fourier transform needs an ordered axis")),
-        })?;
-    if values.len() < 2 {
-        return Err(unsupported(
-            card,
-            format!(
-                ".four: a Fourier transform needs at least 2 data points (the plot has {}); C reports the same refusal",
-                values.len()
-            ),
-        ));
-    }
-    Ok(values)
-}
-
-/// One transformed vector: the column a `.four` request resolves to, plus the
-/// plot it reads, so a value the transform cannot use is reported as a Fourier
-/// failure rather than as an output-selection one.
-struct Trace<'a> {
-    plot: &'a Plot,
-    column: Column,
-}
-
-impl<'a> Trace<'a> {
-    fn resolve(plot: &'a Plot, request: &VectorRequest) -> SpiceResult<Self> {
-        Ok(Self {
-            plot,
-            column: selection::resolve_request(plot, request)?,
-        })
-    }
-
-    /// The vector's canonical name, e.g. `v(out)`.
-    fn name(&self) -> &str {
-        self.column.name()
-    }
-
-    /// The vector's unit, e.g. `voltage`.
-    fn unit(&self) -> &str {
-        self.column.unit()
-    }
-
-    /// The vector's value at one plot point, as a real.
-    fn value(&self, index: usize) -> SpiceResult<Real> {
-        let Some(point) = self.plot.row(index) else {
-            return Err(nonfinite(
-                self.name(),
-                format!("the plot has no point {index}"),
-            ));
-        };
-        self.column
-            .value(point)
-            .map_err(|error| match error {
-                SpiceError::Numerical { message, .. } => {
-                    nonfinite(&format!("{}: {}", self.name(), self.column.name()), message)
-                }
-                other => other,
-            })
-            .map(|value| value.re)
-    }
-}
-
-/// One `.four` request, transformed over the final complete period of `axis`.
-fn evaluate(
-    plot: &Plot,
-    axis: &OrderedAxis<'_>,
-    card: &FourierCard,
-    request: &VectorRequest,
-) -> SpiceResult<FourierAnalysis> {
-    let trace = Trace::resolve(plot, request)?;
-    let first = axis.as_slice().first().copied().unwrap_or(0.0);
-    let to = axis.as_slice().last().copied().unwrap_or(0.0);
-    let period = 1.0 / card.fundamental;
-    let from = to - period;
-    if from < first {
-        return Err(unsupported(
-            card,
-            format!(
-                ".four {}: the run spans {} s (from {} to {}), shorter than one period ({} s) of \
-                 the {} Hz fundamental; C reports the same refusal",
-                trace.name(),
-                crate::primitives::format_spice_number(to - first),
-                crate::primitives::format_spice_number(first),
-                crate::primitives::format_spice_number(to),
-                crate::primitives::format_spice_number(period),
-                crate::primitives::format_spice_number(card.fundamental)
-            ),
-        ));
-    }
-    let harmonics = card.harmonics as usize;
-    let first_index = axis.lower_bound(from);
-    let samples = axis.len() - first_index;
-    let needed = 2 * harmonics + 1;
-    if samples < needed {
-        return Err(unsupported(
-            card,
-            format!(
-                ".four {}: the final period [{}, {}] covers only {samples} sample(s); {harmonics} harmonics need \
-                 at least {needed} (two per cycle of the highest harmonic, plus the endpoint) to be \
-                 well posed",
-                trace.name(),
-                crate::primitives::format_spice_number(from),
-                crate::primitives::format_spice_number(to)
-            ),
-        ));
-    }
-    let divisions = 4 * card.harmonics.max(GRID_FLOOR);
-    let step = period / Real::from(divisions);
-    let mut values = Vec::with_capacity(divisions as usize + 1);
-    for i in 0..=divisions {
-        // The closing point is the window's upper bound exactly, so the grid
-        // ends on the plot's own last sample instead of on accumulated rounding.
-        let x = if i == divisions {
-            to
-        } else {
-            let offset = Real::from(i) * step;
-            from + offset
-        };
-        values.push(sample(axis, &trace, x, card)?);
-    }
-
-    let (dc, tabulated, thd) = closed_grid_spectrum(&values, divisions, card, &trace)?;
-    Ok(FourierAnalysis {
-        vector: trace.name().to_owned(),
-        unit: trace.unit().to_owned(),
-        fundamental: card.fundamental,
-        dc,
-        harmonics: tabulated,
-        thd,
-        window: FourierWindow { from, to },
-        divisions: divisions as usize,
-        samples,
-    })
-}
-
-/// Non-fused projection on the legacy closed grid, preserving its summation order.
-fn closed_grid_spectrum(
-    values: &[Real],
-    divisions: u32,
-    card: &FourierCard,
-    trace: &Trace<'_>,
-) -> SpiceResult<(Real, Vec<Harmonic>, Real)> {
-    let harmonics = card.harmonics as usize;
-    let mut sine = vec![0.0; harmonics + 1];
-    let mut cosine = vec![0.0; harmonics + 1];
-    let divisor = Real::from(divisions);
-    for (i, y) in (0..=divisions).zip(values) {
-        let weight = if i == 0 || i == divisions { 0.5 } else { 1.0 };
-        let weighted = weight * y;
-        let phase = Real::from(i) / divisor;
-        for (k, (sine, cosine)) in (0..=card.harmonics).zip(sine.iter_mut().zip(&mut cosine)) {
-            let angle = std::f64::consts::TAU * Real::from(k) * phase;
-            let sine_term = weighted * angle.sin();
-            let cosine_term = weighted * angle.cos();
-            *sine += sine_term;
-            *cosine += cosine_term;
-        }
-    }
-    let scale = 2.0 / divisor;
-    let dc = cosine[0] / divisor;
-    // The trace's own magnitude, from the same sums: the noise floor the
-    // fundamental amplitude is compared against below.
-    let magnitude = (0..=divisions).zip(values).fold(0.0, |sum, (i, y)| {
-        let weight = if i == 0 || i == divisions { 0.5 } else { 1.0 };
-        let term = weight * y.abs();
-        sum + term
-    }) / divisor;
-    let mut tabulated = Vec::with_capacity(harmonics);
-    for (k, (sine, cosine)) in (1..=card.harmonics).zip(sine.iter().zip(&cosine).skip(1)) {
-        let amplitude = (scale * sine).hypot(scale * cosine);
-        let phase = (scale * cosine).atan2(scale * sine);
-        if !amplitude.is_finite() || !phase.is_finite() {
-            return Err(nonfinite(
-                trace.name(),
-                format!("harmonic {k} is not finite"),
-            ));
-        }
-        tabulated.push(Harmonic {
-            order: k,
-            frequency: Real::from(k) * card.fundamental,
-            amplitude,
-            phase,
-        });
-    }
-    let fundamental_amplitude = tabulated.first().map_or(0.0, |harmonic| harmonic.amplitude);
-    // Amplitudes were checked finite above. At or below the quadrature's
-    // rounding noise, THD has no denominator. An overflowed magnitude also
-    // refuses the transform instead of producing a spurious denominator.
-    if fundamental_amplitude <= NOISE_ULPS * f64::EPSILON * magnitude {
-        return Err(nonfinite(
-            trace.name(),
-            format!(
-                "the fundamental amplitude ({}) is at or below the quadrature's own rounding \
-                 noise, so the total harmonic distortion has no denominator",
-                crate::primitives::format_spice_number(fundamental_amplitude)
-            ),
-        ));
-    }
-    let thd = tabulated
-        .iter()
-        .skip(1)
-        .map(|harmonic| (harmonic.amplitude / fundamental_amplitude).powi(2))
-        .sum::<Real>()
-        .sqrt();
-    if !dc.is_finite() || !thd.is_finite() {
-        return Err(nonfinite(
-            trace.name(),
-            "the DC component or the total harmonic distortion is not finite".to_owned(),
-        ));
-    }
-    Ok((dc, tabulated, thd))
-}
-
-/// The vector's value at one physical time, with `.measure`'s sample model.
-///
-/// Interpolation is linear between the samples bracketing `x`, never across a
-/// source discontinuity (the drivers keep a sample on every breakpoint). A time
-/// carried by two samples with different values is a jump: its value is
-/// ambiguous, so it is an explicit failure rather than a silent choice between
-/// the left and right limits. A window boundary that falls strictly inside a
-/// bracket is interpolated from the bracketing samples, which may lie just
-/// outside the window.
-fn sample(
-    axis: &OrderedAxis<'_>,
-    trace: &Trace<'_>,
-    x: Real,
-    card: &FourierCard,
-) -> SpiceResult<Real> {
-    axis.linear_sample(x, |i| trace.value(i)).map_err(|error| match error {
-        SampleError::Discontinuous => unsupported(card, format!(
-            ".four {}: the vector is discontinuous at time = {}: the plot has multiple values at that time, so the resampling grid cannot read it there",
-            trace.name(), crate::primitives::format_spice_number(x))),
-        SampleError::OutOfRange => unsupported(card, format!(".four {}: resampling coordinate is outside the time axis", trace.name())),
-        SampleError::Nonfinite => nonfinite(trace.name(), "nonfinite interpolated value".into()),
-        SampleError::Operand(error) => error,
-    })
-}
-
 /// C's `fourier()` front-end variables. `nfreqs` includes the DC row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FourierSettings {
@@ -628,7 +286,7 @@ pub fn resolve_with_settings(
     cards: &[FourierCard],
     settings: FourierSettings,
 ) -> SpiceResult<Vec<FourierAnalysis>> {
-    resolve_settings(plot, kind, cards, settings, true)
+    execution::resolve_plans(plot, kind, cards, Some(settings), true)
 }
 
 /// Evaluate the configured DFT with well-conditioned local Lagrange interpolation.
@@ -644,254 +302,7 @@ pub fn resolve_with_stable_settings(
     cards: &[FourierCard],
     settings: FourierSettings,
 ) -> SpiceResult<Vec<FourierAnalysis>> {
-    resolve_settings(plot, kind, cards, settings, false)
-}
-
-/// Validated sampling and spectrum geometry, shared by all vectors of a card.
-struct ConfiguredPlan {
-    window: FourierWindow,
-    periods: u32,
-    harmonics: u32,
-    grid: Option<Vec<Real>>,
-    degree: usize,
-}
-
-impl ConfiguredPlan {
-    fn new(
-        axis: &OrderedAxis<'_>,
-        card: &FourierCard,
-        settings: FourierSettings,
-        count: u32,
-    ) -> SpiceResult<Self> {
-        let to = *axis
-            .as_slice()
-            .last()
-            .ok_or_else(|| unsupported(card, "empty Fourier axis".into()))?;
-        let from = if settings.polydegree == 0 {
-            axis.as_slice()[0]
-        } else {
-            to - Real::from(settings.nperiods) / card.fundamental
-        };
-        if from < axis.as_slice()[0] {
-            return Err(unsupported(
-                card,
-                "Fourier window is longer than the run".into(),
-            ));
-        }
-        let harmonics = if card.harmonics_location.is_some() {
-            card.harmonics
-        } else {
-            settings.nfreqs.saturating_sub(1)
-        };
-        if harmonics == 0 {
-            return Err(unsupported(
-                card,
-                "nfreqs must include a fundamental for THD".into(),
-            ));
-        }
-        let n = if settings.polydegree == 0 {
-            axis.len()
-        } else {
-            count as usize
-        };
-        if n > 100_000 {
-            return Err(unsupported(card, "Fourier sample budget exceeded".into()));
-        }
-        // The kth harmonic occupies DFT bin k * nperiods, not bin k.
-        // A real signal's highest requested bin must be strictly below Nyquist.
-        if n <= (2 * harmonics * settings.nperiods) as usize {
-            return Err(unsupported(
-                card,
-                "Fourier grid undersamples requested harmonics".into(),
-            ));
-        }
-        let grid = (settings.polydegree != 0).then(|| {
-            let step = (to - from) / Real::from(count);
-            (0..count)
-                .map(|i| {
-                    let offset = Real::from(i) * step;
-                    from + offset
-                })
-                .collect()
-        });
-        Ok(Self {
-            window: FourierWindow { from, to },
-            periods: settings.nperiods,
-            harmonics,
-            grid,
-            degree: settings.polydegree as usize,
-        })
-    }
-
-    fn samples(
-        &self,
-        axis: &OrderedAxis<'_>,
-        card: &FourierCard,
-        trace: &Trace<'_>,
-        compatible: bool,
-    ) -> SpiceResult<Vec<Real>> {
-        let samples = (0..axis.len())
-            .map(|i| trace.value(i))
-            .collect::<SpiceResult<Vec<_>>>()?;
-        let Some(grid) = &self.grid else {
-            return Ok(samples);
-        };
-        if compatible {
-            super::fourier_resample::resample(axis, &samples, grid, self.degree)
-        } else {
-            stable_resample(axis, &samples, grid, self.degree, card, trace.name())
-        }
-    }
-
-    fn transform(
-        &self,
-        card: &FourierCard,
-        trace: &Trace<'_>,
-        values: &[Real],
-        samples: usize,
-    ) -> SpiceResult<FourierAnalysis> {
-        let n = u32::try_from(values.len())
-            .map_err(|_| unsupported(card, "Fourier sample count exceeds u32".into()))?;
-        let divisor = Real::from(n);
-        let periods = Real::from(self.periods);
-        let dc = values.iter().sum::<Real>() / divisor;
-        let mut tabulated = Vec::with_capacity(self.harmonics as usize);
-        for k in 1..=self.harmonics {
-            let mut sine = 0.;
-            let mut cosine = 0.;
-            for (i, y) in (0..n).zip(values) {
-                let phase =
-                    std::f64::consts::TAU * Real::from(k) * periods * Real::from(i) / divisor;
-                // C's projection rounds the product before adding it to the accumulator.
-                let sine_term = y * phase.sin();
-                let cosine_term = y * phase.cos();
-                sine += sine_term;
-                cosine += cosine_term;
-            }
-            tabulated.push(Harmonic {
-                order: k,
-                frequency: Real::from(k) * card.fundamental,
-                amplitude: 2. * sine.hypot(cosine) / divisor,
-                phase: cosine.atan2(sine),
-            });
-        }
-        let fundamental = tabulated[0].amplitude;
-        let magnitude = values.iter().map(|v| v.abs()).sum::<Real>() / divisor;
-        if fundamental <= NOISE_ULPS * f64::EPSILON * magnitude {
-            return Err(nonfinite(
-                trace.name(),
-                "fundamental at rounding noise; undefined THD".into(),
-            ));
-        }
-        let thd = tabulated
-            .iter()
-            .skip(1)
-            .map(|h| (h.amplitude / fundamental).powi(2))
-            .sum::<Real>()
-            .sqrt();
-        if !dc.is_finite()
-            || !thd.is_finite()
-            || tabulated.iter().any(|h| {
-                !h.frequency.is_finite() || !h.amplitude.is_finite() || !h.phase.is_finite()
-            })
-        {
-            return Err(nonfinite(trace.name(), "nonfinite Fourier result".into()));
-        }
-        Ok(FourierAnalysis {
-            vector: trace.name().into(),
-            unit: trace.unit().into(),
-            fundamental: card.fundamental,
-            dc,
-            harmonics: tabulated,
-            thd,
-            window: self.window,
-            divisions: n as usize,
-            samples,
-        })
-    }
-}
-
-fn stable_resample(
-    axis: &OrderedAxis<'_>,
-    samples: &[Real],
-    grid: &[Real],
-    degree: usize,
-    card: &FourierCard,
-    name: &str,
-) -> SpiceResult<Vec<Real>> {
-    if axis.len() <= degree || axis.has_duplicates() {
-        return Err(unsupported(
-            card,
-            "stable polynomial interpolation needs distinct samples".into(),
-        ));
-    }
-    let mut values = Vec::with_capacity(grid.len());
-    for &x in grid {
-        let right = axis.lower_bound(x);
-        let start = right
-            .saturating_sub(degree.div_ceil(2))
-            .min(axis.len() - degree - 1);
-        let mut value = 0.;
-        for k in 0..=degree {
-            let mut weight = 1.;
-            for j in 0..=degree {
-                if j != k {
-                    weight *= (x - axis.as_slice()[start + j])
-                        / (axis.as_slice()[start + k] - axis.as_slice()[start + j]);
-                }
-            }
-            let term = weight * samples[start + k];
-            value += term;
-        }
-        if !value.is_finite() {
-            return Err(nonfinite(
-                name,
-                "nonfinite stable polynomial interpolation".into(),
-            ));
-        }
-        values.push(value);
-    }
-    Ok(values)
-}
-
-fn resolve_settings(
-    plot: &Plot,
-    kind: AnalysisKind,
-    cards: &[FourierCard],
-    settings: FourierSettings,
-    compatible: bool,
-) -> SpiceResult<Vec<FourierAnalysis>> {
-    let Some(first) = cards.first() else {
-        return Ok(Vec::new());
-    };
-    if kind != AnalysisKind::Transient
-        || !(1..=101).contains(&settings.nfreqs)
-        || !(1..=100).contains(&settings.nperiods)
-        || settings.polydegree > 16
-        || !(1..=100_000).contains(&settings.gridsize)
-    {
-        return Err(unsupported(
-            first,
-            "invalid Fourier settings or analysis".into(),
-        ));
-    }
-    let count = settings
-        .gridsize
-        .checked_mul(settings.nperiods)
-        .filter(|n| *n <= 100_000)
-        .ok_or_else(|| unsupported(first, "Fourier grid exceeds 100000 samples".into()))?;
-    let mut results = Vec::new();
-    for card in cards {
-        check_budget(card)?;
-        let axis = time_axis(plot, card)?;
-        let plan = ConfiguredPlan::new(&axis, card, settings, count)?;
-        for request in &card.vectors {
-            let trace = Trace::resolve(plot, request)?;
-            let values = plan.samples(&axis, card, &trace, compatible)?;
-            results.push(plan.transform(card, &trace, &values, axis.len())?);
-        }
-    }
-    Ok(results)
+    execution::resolve_plans(plot, kind, cards, Some(settings), false)
 }
 
 #[cfg(test)]
@@ -1466,5 +877,222 @@ mod tests {
         );
         assert!(text.contains("2         2.000000000000000e+03"), "{text}");
         assert!(printed(&text, "thd").abs() < 1e-14, "{text}");
+    }
+    /// Comparing the metadata separately and the floats by their bits also
+    /// catches signed-zero drift, unlike PartialEq alone.
+    fn assert_identical(actual: &[FourierAnalysis], expected: &[FourierAnalysis]) {
+        assert_eq!(actual, expected);
+        let bits = |result: &FourierAnalysis| {
+            [
+                result.fundamental,
+                result.dc,
+                result.thd,
+                result.window.from,
+                result.window.to,
+            ]
+            .into_iter()
+            .chain(
+                result
+                    .harmonics
+                    .iter()
+                    .flat_map(|h| [h.frequency, h.amplitude, h.phase]),
+            )
+            .map(Real::to_bits)
+            .collect::<Vec<_>>()
+        };
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(bits(actual), bits(expected));
+        }
+    }
+
+    #[test]
+    fn mixed_card_plans_match_independent_vectors_bit_for_bit() {
+        let rows = sweep(0., 2. * PERIOD, 805, |t| {
+            0.3 + sine(1., 1, 0.2)(t) + sine(0.11, 3, -0.7)(t)
+        });
+        let plot = tran(&rows);
+        let cards = [
+            card(vec![out(), current(), out()], 9),
+            FourierCard {
+                frontend_command: true,
+                ..card(vec![current(), out()], 7)
+            },
+            FourierCard {
+                fundamental: 2. * FUNDAMENTAL,
+                ..card(vec![out(), current()], 3)
+            },
+        ];
+        let obtained = resolve(&plot, AnalysisKind::Transient, &cards).unwrap();
+        let mut expected = Vec::new();
+        for card in cards {
+            for vector in &card.vectors {
+                let single = FourierCard {
+                    vectors: vec![vector.clone()],
+                    ..card.clone()
+                };
+                expected.extend(resolve(&plot, AnalysisKind::Transient, &[single]).unwrap());
+            }
+        }
+        assert_identical(&obtained, &expected);
+    }
+
+    #[test]
+    fn configured_projection_shares_every_harmonic_even_across_batch_boundaries() {
+        use super::{FourierSettings, resolve_with_settings, resolve_with_stable_settings};
+        let plot = tran(&sweep(0., PERIOD, 801, sine(1., 1, 0.37)));
+        // At 100k output samples eight vectors cross the 4 MiB batch bound.
+        let vectors: Vec<_> = (0..8)
+            .map(|i| if i % 2 == 0 { out() } else { current() })
+            .collect();
+        let card = card(vectors, 3);
+        type Resolve = fn(
+            &Plot,
+            AnalysisKind,
+            &[FourierCard],
+            FourierSettings,
+        ) -> Result<Vec<FourierAnalysis>, SpiceError>;
+        let cases: [(Resolve, FourierSettings); 3] = [
+            (
+                resolve_with_settings,
+                FourierSettings {
+                    nfreqs: 4,
+                    gridsize: 100_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                resolve_with_stable_settings,
+                FourierSettings {
+                    nfreqs: 4,
+                    gridsize: 100_000,
+                    polydegree: 3,
+                    ..Default::default()
+                },
+            ),
+            (
+                resolve_with_settings,
+                FourierSettings {
+                    nfreqs: 4,
+                    polydegree: 0,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (resolve, settings) in cases {
+            let obtained = resolve(
+                &plot,
+                AnalysisKind::Transient,
+                std::slice::from_ref(&card),
+                settings,
+            )
+            .unwrap();
+            let expected: Vec<_> = [out(), current()]
+                .into_iter()
+                .flat_map(|vector| {
+                    let single = FourierCard {
+                        vectors: vec![vector],
+                        ..card.clone()
+                    };
+                    resolve(&plot, AnalysisKind::Transient, &[single], settings).unwrap()
+                })
+                .collect();
+            let repeated: Vec<_> = (0..8).map(|i| expected[i % 2].clone()).collect();
+            assert_identical(&obtained, &repeated);
+        }
+    }
+
+    #[test]
+    fn unrepresentable_windows_and_harmonic_frequencies_are_refused() {
+        use super::{FourierSettings, resolve_with_settings};
+        let plot = tran(&[(1e9 - 1., 0.), (1e9 - 0.5, 1.), (1e9, 0.)]);
+        let too_short = FourierCard {
+            fundamental: 1e20,
+            ..card(vec![out()], 1)
+        };
+        for error in [
+            resolve(
+                &plot,
+                AnalysisKind::Transient,
+                std::slice::from_ref(&too_short),
+            )
+            .unwrap_err(),
+            resolve_with_settings(
+                &plot,
+                AnalysisKind::Transient,
+                &[too_short],
+                FourierSettings::default(),
+            )
+            .unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("not representable"), "{error}");
+        }
+        let overflow = FourierCard {
+            fundamental: Real::MAX,
+            ..card(vec![out()], 2)
+        };
+        assert!(
+            resolve(&plot, AnalysisKind::Transient, &[overflow])
+                .unwrap_err()
+                .to_string()
+                .contains("harmonic frequency")
+        );
+    }
+
+    #[test]
+    fn an_earlier_projection_failure_precedes_a_later_missing_vector() {
+        let plot = tran(&on_grid(|_| 1.));
+        let mut missing = out();
+        missing.vector = RequestedVector::Voltage {
+            positive: "absent".into(),
+            negative: None,
+        };
+        let error = failed(&plot, &[out(), missing], 9);
+        assert!(error.to_string().contains("rounding noise"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "timing comparison; run explicitly with --ignored --nocapture"]
+    fn shared_fourier_projection_benchmark() {
+        use super::{FourierSettings, resolve_with_stable_settings};
+        use std::time::Instant;
+        let plot = tran(&sweep(0., 2. * PERIOD, 20_000, |t| {
+            0.3 + sine(1., 1, 0.2)(t) + sine(0.11, 3, -0.7)(t)
+        }));
+        let settings = FourierSettings {
+            nfreqs: 33,
+            gridsize: 10_000,
+            polydegree: 1,
+            ..Default::default()
+        };
+        let card = card(
+            (0..32)
+                .map(|i| if i % 2 == 0 { out() } else { current() })
+                .collect(),
+            32,
+        );
+        let start = Instant::now();
+        let separate: Vec<_> = card
+            .vectors
+            .iter()
+            .flat_map(|vector| {
+                let single = FourierCard {
+                    vectors: vec![vector.clone()],
+                    ..card.clone()
+                };
+                resolve_with_stable_settings(&plot, AnalysisKind::Transient, &[single], settings)
+                    .unwrap()
+            })
+            .collect();
+        let scalar = start.elapsed();
+        let start = Instant::now();
+        let grouped =
+            resolve_with_stable_settings(&plot, AnalysisKind::Transient, &[card], settings)
+                .unwrap();
+        let shared = start.elapsed();
+        assert_identical(&grouped, &separate);
+        eprintln!(
+            "32 vectors, 20001 source rows, 10000 grid samples, 32 harmonics: independent={scalar:?}, shared={shared:?}, speedup={:.3}x",
+            scalar.as_secs_f64() / shared.as_secs_f64()
+        );
     }
 }
