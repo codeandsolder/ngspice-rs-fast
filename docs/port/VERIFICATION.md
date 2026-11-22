@@ -2137,3 +2137,19 @@ and relative scales use the normalized value, and Rust's imaginary component
 is still checked. All other samples retain their existing comparison
 policies. This is not a rawfile decoder change: stored rawfiles, especially
 bit-exact captures, retain their actual payload.
+
+### Decimal input equivalence for cancellation-sensitive sensitivity fixtures
+
+Correct decimal conversion (architecture issue #94) independently rounds
+the input to binary64. The historical C frontend can round that same decimal
+to a neighboring binary64 value. For sens_hfet2, sens_mos3 and sens_mos9 this
+difference is amplified by the sensitivity walk. The explicit C-only input
+variants in [conformance/reference-inputs](../../conformance/reference-inputs/README.md)
+use mathematically equivalent decimal spellings that produce the intended
+inputs with the pinned reference executable. The original decks and rawfiles
+remain available unchanged. Capture/check/verify deterministically select
+the corresponding independent captures, and Rust runs the original deck.
+All output columns, shape checks and numerical bounds are unchanged. The
+variant test verifies equivalent numeric token values and unchanged
+non-numeric tokens; missing selected captures are errors, not fallback
+opportunities.
