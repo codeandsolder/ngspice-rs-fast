@@ -743,6 +743,75 @@ mod tests {
     }
 
     #[test]
+    fn transit_time_tensor_matches_closed_form_for_all_optional_factors() {
+        // With qb=1, write forward charge as TF*c + K*c^3/(c+ITF)^2,
+        // K=TF*XTF*exp(VBC*OVTF). Independently differentiate the
+        // rational function in c, then apply the chain rule and the
+        // VBC exponential derivatives. No Dderivs operations here.
+        let m = 2.3;
+        let bias = DistortionBias {
+            vbe: 0.77,
+            vbc: -0.2,
+            vsc: 0.,
+            vbb: 0.,
+        };
+        for model in [
+            "tf=0.4n",
+            "tf=0.4n xtf=3",
+            "tf=0.4n xtf=3 vtf=2",
+            "tf=0.4n xtf=3 itf=20m",
+            "tf=0.4n xtf=3 vtf=2 itf=20m",
+            "tf=0.4n vtf=2 itf=20m",
+            "xtf=3 vtf=2 itf=20m",
+        ] {
+            let t = thermal(&format!("is=1e-15 {model}"), 85., true);
+            let gmin = 1e-12;
+            let junctions = distortion_junctions(&t, bias, m, gmin);
+            let qb = distortion_base_charge(&t, bias, m, &junctions);
+            let d = distortion_forward_diffusion(&t, bias, m, &junctions, &qb);
+            let vtn = t.vt * t.nf;
+            let ev = (bias.vbe / vtn).exp();
+            let is = t.is_be * m;
+            let c = is * (ev - 1.) + gmin * bias.vbe;
+            let dc = is * ev / vtn + gmin;
+            let ddc = is * ev / vtn.powi(2);
+            let dddc = is * ev / vtn.powi(3);
+            let itf = t.itf * m;
+            let denom = c + itf;
+            let f = c.powi(3) / denom.powi(2);
+            let df = c.powi(2) * (c + 3. * itf) / denom.powi(3);
+            let ddf = 6. * c * itf.powi(2) / denom.powi(4);
+            let dddf = 6. * itf.powi(2) * (itf - 3. * c) / denom.powi(5);
+            let k = t.tf * t.xtf * (bias.vbc * t.vtf_factor).exp();
+            let fp = df * dc;
+            let fpp = ddf * dc.powi(2) + df * ddc;
+            let fppp = dddf * dc.powi(3) + 3. * ddf * dc * ddc + df * dddc;
+            let ovtf = t.vtf_factor;
+            for (actual, expected) in [
+                (d.d2_p2, t.tf * ddc + k * fpp),
+                (d.d2_pq, k * ovtf * fp),
+                (d.d2_q2, k * ovtf.powi(2) * f),
+                (d.d3_p3, t.tf * dddc + k * fppp),
+                (d.d3_p2q, k * ovtf * fpp),
+                (d.d3_pq2, k * ovtf.powi(2) * fp),
+                (d.d3_q3, k * ovtf.powi(3) * f),
+            ] {
+                assert!(
+                    (actual - expected).abs() <= expected.abs() * 1e-12 + 1e-30,
+                    "{model}: {actual:e} != {expected:e}"
+                );
+            }
+            let reverse = DistortionBias { vbe: -0.2, ..bias };
+            let junctions = distortion_junctions(&t, reverse, m, gmin);
+            let qb = distortion_base_charge(&t, reverse, m, &junctions);
+            assert_eq!(
+                distortion_forward_diffusion(&t, reverse, m, &junctions, &qb),
+                Dderivs::default()
+            );
+        }
+    }
+
+    #[test]
     fn distortion_base_charge_does_not_inherit_nkf() {
         let ordinary = thermal("is=1e-15 vaf=40 ikf=3m ikr=0.5m", 27., true);
         let nkf = thermal("is=1e-15 vaf=40 ikf=3m ikr=0.5m nkf=0.7", 27., true);
