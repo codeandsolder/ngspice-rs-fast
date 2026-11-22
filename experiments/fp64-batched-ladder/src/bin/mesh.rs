@@ -89,6 +89,58 @@ fn entry(
 }
 
 impl Plan {
+    /// Group typed column/neighbor/update ranges instead of interpreting
+    /// thousands of heterogeneous operations. The original matrix's row
+    /// adjacency is separate from the filled factors used for correction.
+    fn grouped(&self) -> Vec<[u32; 4]> {
+        let mut groups = vec![[0; 4]; 1 + N];
+        let mut cursor = 1;
+        for k in 0..N {
+            let [kind, diag, row, _] = self.tape[cursor];
+            assert_eq!((kind, row), (PIVOT, k as u32));
+            cursor += 1;
+            let mut neighbors = Vec::new();
+            while cursor < self.tape.len() && self.tape[cursor][0] == MULTIPLIER {
+                let [_, handle, row, _] = self.tape[cursor];
+                cursor += 1;
+                let start = groups.len() as u32;
+                while self.tape[cursor][0] == UPDATE {
+                    let [_, dest, source, _] = self.tape[cursor];
+                    groups.push([dest, source, 0, 0]);
+                    cursor += 1;
+                }
+                assert_eq!(self.tape[cursor], [STORE, handle, 0, 0]);
+                cursor += 1;
+                neighbors.push([row, handle, start, groups.len() as u32]);
+            }
+            let start = groups.len() as u32;
+            groups.extend(neighbors);
+            groups[k + 1] = [diag, start, groups.len() as u32, 0];
+        }
+        // Reserve one range per original row; every entry in a row lists
+        // the other column and its original lower-triangle coefficient.
+        let residual = groups.len();
+        groups.resize(residual + N, [0; 4]);
+        for row in 0..N {
+            let start = groups.len() as u32;
+            for (handle, &(i, j)) in self.entries[..self.original].iter().enumerate() {
+                if i == row {
+                    groups.push([j as u32, handle as u32, 0, 0]);
+                } else if j == row {
+                    groups.push([i as u32, handle as u32, 0, 0]);
+                }
+            }
+            groups[residual + row] = [start, groups.len() as u32, 0, 0];
+        }
+        groups[0] = [
+            self.entries.len() as u32,
+            N as u32,
+            self.original as u32,
+            residual as u32,
+        ];
+        groups
+    }
+
     fn new() -> Self {
         let mut entries = Vec::new();
         let mut indices = BTreeMap::new();
@@ -373,6 +425,20 @@ fn solve_tile(
     }
 }
 
+fn grouped_shader(mixed: bool) -> String {
+    let template = include_str!("../mesh_grouped.wgsl");
+    let refinement = if mixed {
+        include_str!("../mesh_refine.wgsl")
+    } else {
+        ""
+    };
+    // Use concrete scalar types and literal conversions in the generated
+    // shader, but keep both factor/solve algorithms identical.
+    template
+        .replace("FACTOR_SCALAR", if mixed { "f32" } else { "f64" })
+        .replace("REFINEMENT_BODY", refinement)
+}
+
 fn main() -> Result<()> {
     let plan = Plan::new();
     println!(
@@ -386,9 +452,15 @@ fn main() -> Result<()> {
         "Complex FP64 RC mesh",
         include_str!("../mesh.wgsl"),
     ))?;
+    let grouped = plan.grouped();
+    let grouped_gpu = pollster::block_on(Gpu::new("Grouped complex FP64", &grouped_shader(false)))?;
+    let mixed_gpu = pollster::block_on(Gpu::new(
+        "Grouped FP32 with FP64 refinement",
+        &grouped_shader(true),
+    ))?;
     println!("persistent CPU workers: {}", rayon::current_num_threads());
     println!(
-        "systems,scalar_ms,simd_ms,parallel_simd_ms,gpu_resident_ms,gpu_amortized_ms,gpu_roundtrip_ms,max_solution_error,max_backward_error"
+        "systems,scalar_ms,simd_ms,parallel_simd_ms,gpu_resident_ms,gpu_amortized_ms,gpu_roundtrip_ms,grouped_resident_ms,grouped_amortized_ms,grouped_roundtrip_ms,mixed_resident_ms,mixed_amortized_ms,mixed_roundtrip_ms,mixed_error,mixed_backward,max_solution_error,max_backward_error"
     );
     for groups in [1_u32, 4, 16, 64] {
         let input = Input::new(&plan, groups as usize);
@@ -434,14 +506,32 @@ fn main() -> Result<()> {
             groups,
         )?;
         let (e, r) = input.check(&plan, &x)?;
+        let (gr, ga, gt) = grouped_gpu.trial(
+            &[&input.matrix, &input.rhs],
+            &[matrix.len(), x.len(), x.len()],
+            Some(&grouped),
+            &mut x,
+            groups,
+        )?;
+        let (ge, gb) = input.check(&plan, &x)?;
+        // Factor and correction storage uses f32; the runner sizes workspace
+        // in f64 units, so allocate exactly half as many units.
+        let (mr, ma, mt) = mixed_gpu.trial(
+            &[&input.matrix, &input.rhs],
+            &[matrix.len() / 2, x.len() / 2, x.len()],
+            Some(&grouped),
+            &mut x,
+            groups,
+        )?;
+        let (me, mb) = input.check(&plan, &x)?;
         println!(
-            "{},{:.4},{:.4},{:.4},{resident:.4},{amortized:.4},{roundtrip:.4},{:.3e},{:.3e}",
+            "{},{:.4},{:.4},{:.4},{resident:.4},{amortized:.4},{roundtrip:.4},{gr:.4},{ga:.4},{gt:.4},{mr:.4},{ma:.4},{mt:.4},{me:.3e},{mb:.3e},{:.3e},{:.3e}",
             groups * TILE as u32,
             times[0],
             times[1],
             times[2],
-            error.max(e),
-            backward.max(r)
+            error.max(e).max(ge).max(me),
+            backward.max(r).max(gb).max(mb)
         );
     }
     Ok(())
