@@ -461,7 +461,7 @@ mod tests {
         )
     }
 
-    fn selected<'a>(outcome: BinOutcome<&'a ModelCard>) -> &'a str {
+    fn selected(outcome: BinOutcome<&ModelCard>) -> &str {
         match outcome {
             BinOutcome::Selected(card) => &card.name,
             other => panic!("expected a bin, got {other:?}"),
