@@ -39,7 +39,7 @@ jobs:
     name: Strict Rust and workflow policy
     uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@073d436b3d759343900bdc5e4ddecfa120792b8c # pinned
     with:
-      rust-toolchain: nightly-2026-11-20
+      rust-toolchain: nightly-2026-11-22
       allow-test-panics: true
 
   verify:
@@ -62,7 +62,7 @@ jobs:
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
-          rust-toolchain: nightly-2026-11-20
+          rust-toolchain: nightly-2026-11-22
 
       - name: Read crate version
         id: version
@@ -123,7 +123,7 @@ jobs:
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
-          rust-toolchain: nightly-2026-11-20
+          rust-toolchain: nightly-2026-11-22
 
       - name: Authenticate with crates.io
         id: auth
