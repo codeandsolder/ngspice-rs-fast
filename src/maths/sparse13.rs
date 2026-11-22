@@ -207,9 +207,10 @@ impl Scalar for Complex {
             self.re * b.re - self.im * b.im,
             self.re * b.im + self.im * b.re,
         );
-        if result.is_finite() && (result.re.is_normal() || result.im.is_normal()) {
-            result
-        } else if self.is_zero() || b.is_zero() {
+        if (result.is_finite() && (result.re.is_normal() || result.im.is_normal()))
+            || self.is_zero()
+            || b.is_zero()
+        {
             result
         } else {
             self * b
