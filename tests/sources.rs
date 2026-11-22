@@ -5,6 +5,7 @@ use ngspice_rs::netlist::{Parser, SourceLimits};
 use ngspice_rs::primitives::SpiceError;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -479,4 +480,127 @@ fn included_and_library_continuations_use_fragment_physical_coordinates() {
     };
     assert_eq!(location.path(), fs::canonicalize(library).unwrap());
     assert_eq!((location.line, location.column), (6, 9));
+}
+
+#[test]
+fn repeated_sources_share_lexical_storage_not_scope_or_occurrence() {
+    let f = Files::new();
+    f.write("main.cir", "title\n.subckt first a\n.model local R RSH=1k\n.include body.inc\n.ends\n.subckt second a\n.model local R RSH=2k\n.include ./body.inc\n.ends\n");
+    f.write("body.inc", "r1 a 0 local\n+ tc1=0.2\nr2 a 0 1k\n");
+    let netlist = f.parse("main.cir").unwrap();
+    let first = &netlist.subcircuits[0];
+    let second = &netlist.subcircuits[1];
+    assert_eq!(first.models[0].parameters[0].value, "1k");
+    assert_eq!(second.models[0].parameters[0].value, "2k");
+    assert_eq!(first.devices.len(), 2);
+    assert_eq!(second.devices.len(), 2);
+    for (left, right) in first.cards[2..4].iter().zip(&second.cards[2..4]) {
+        assert!(Arc::ptr_eq(&left.source, &right.source));
+        assert_ne!(left.include_chain, right.include_chain);
+        assert_eq!(left.include_chain[0].line, 4);
+        assert_eq!(right.include_chain[0].line, 8);
+    }
+    assert!(Arc::ptr_eq(
+        &first.cards[2].include_chain,
+        &first.cards[3].include_chain
+    ));
+    assert!(Arc::ptr_eq(
+        &second.cards[2].include_chain,
+        &second.cards[3].include_chain
+    ));
+    assert_eq!(first.devices[0].parameters.last().unwrap().location.line, 2);
+}
+
+#[test]
+fn repeated_library_visits_share_sections_and_preserve_logical_work() {
+    let f = Files::new();
+    let repeats = 128;
+    let width = 24;
+    let mut root_text = String::from("title\n");
+    let mut library = String::from(".lib used\n");
+    for _ in 0..width {
+        library.push_str("r1 a 0 1k\n");
+    }
+    library.push_str(".endl used\n.lib empty\n.endl empty\n");
+    for _ in 0..repeats {
+        root_text.push_str(".lib parts.lib used\n.lib parts.lib empty\n");
+    }
+    let root = f.write("main.cir", &root_text);
+    f.write("parts.lib", &library);
+    let limits = SourceLimits {
+        files: 1 + 2 * repeats,
+        bytes: root_text.len() + 2 * repeats * library.len(),
+        cards: repeats * (width + 2),
+        ..SourceLimits::default()
+    };
+    let netlist = Parser::new().parse_file_with_limits(&root, limits).unwrap();
+    assert_eq!(netlist.devices.len(), repeats * width);
+    assert_eq!(netlist.includes.len(), 2 * repeats);
+    // 3,072 emitted device cards share 24 lexical allocations.
+    for occurrence in netlist.cards.chunks_exact(width + 2) {
+        for (first, later) in netlist.cards[1..=width].iter().zip(&occurrence[1..=width]) {
+            assert!(Arc::ptr_eq(&first.source, &later.source));
+            assert!(Arc::ptr_eq(
+                &occurrence[1].include_chain,
+                &later.include_chain
+            ));
+        }
+    }
+    let first = netlist.includes[0].selected_section.as_ref().unwrap();
+    for include in netlist.includes.iter().step_by(2) {
+        let section = include.selected_section.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&first.opening, &section.opening));
+        assert!(Arc::ptr_eq(&first.closing, &section.closing));
+    }
+    for (smaller, expected) in [
+        (
+            SourceLimits {
+                files: limits.files - 1,
+                ..limits
+            },
+            "file work limit",
+        ),
+        (
+            SourceLimits {
+                bytes: limits.bytes - 1,
+                ..limits
+            },
+            "byte work limit",
+        ),
+        (
+            SourceLimits {
+                cards: limits.cards - 1,
+                ..limits
+            },
+            "card work limit",
+        ),
+    ] {
+        let error = Parser::new()
+            .parse_file_with_limits(&root, smaller)
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn root_can_select_its_own_section_without_reinterpreting_the_title() {
+    let f = Files::new();
+    f.write(
+        "main.cir",
+        "title\n.lib main.cir body\n.end\n.lib body\nr1 a 0 1k\n.endl body\n",
+    );
+    let netlist = f.parse("main.cir").unwrap();
+    assert_eq!(netlist.title, "title");
+    assert_eq!(netlist.devices.len(), 1);
+    assert_eq!(netlist.devices[0].location.line, 5);
+    assert_eq!(
+        netlist.includes[0]
+            .selected_section
+            .as_ref()
+            .unwrap()
+            .opening
+            .location
+            .line,
+        4
+    );
 }
