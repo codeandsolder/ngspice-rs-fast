@@ -131,16 +131,26 @@ fn twiceintlinfunc(
     width * width.mul_add(weighted, initial_integral)
 }
 
-// A&S coefficients shared by scalar and parallel endpoint evaluation.
-// Each polynomial retains the original nested multiply/add order.
-const I0_SMALL: [Real; 7] = [
-    1.,
-    3.515_622_9,
-    3.089_942_4,
-    1.206_749_2,
-    0.265_973_2,
-    0.360_768e-1,
-    0.45813e-2,
+// Small-argument Taylor coefficients in y=(x/2)^2: I0 has 1/(k!)^2,
+// I1/x has 1/(2 k! (k+1)!). Through degree 14 the omitted absolute
+// terms at x=3.75 are below 9.3e-17 and 2.9e-18 respectively.
+// The A&S large-argument coefficients use y=3.75/x.
+const I0_SMALL: [Real; 15] = [
+    1.0,
+    1.0,
+    0.25,
+    0.027_777_777_777_777_776,
+    0.001_736_111_111_111_111,
+    6.944_444_444_444_444e-5,
+    1.929_012_345_679_012_4e-6,
+    3.936_759_889_140_842e-8,
+    6.151_187_326_782_565e-10,
+    7.594_058_428_126_624e-12,
+    7.594_058_428_126_623e-14,
+    6.276_081_345_559_193e-16,
+    4.358_389_823_304_995e-18,
+    2.578_928_889_529_582_8e-20,
+    1.315_780_045_678_358_6e-22,
 ];
 const I0_LARGE: [Real; 9] = [
     0.398_942_28,
@@ -153,14 +163,22 @@ const I0_LARGE: [Real; 9] = [
     -0.164_763_3e-1,
     0.392_377e-2,
 ];
-const I1_SMALL: [Real; 7] = [
+const I1_SMALL: [Real; 15] = [
     0.5,
-    0.878_905_94,
-    0.514_988_69,
-    0.150_849_34,
-    0.265_873_3e-1,
-    0.301_532e-2,
-    0.32411e-3,
+    0.25,
+    0.041_666_666_666_666_664,
+    0.003_472_222_222_222_222,
+    0.000_173_611_111_111_111_12,
+    5.787_037_037_037_037e-6,
+    1.377_865_961_199_294_4e-7,
+    2.460_474_930_713_026e-9,
+    3.417_326_292_656_981e-11,
+    3.797_029_214_063_311_6e-13,
+    3.451_844_740_057_556e-15,
+    2.615_033_893_982_997e-17,
+    1.676_303_778_194_229e-19,
+    9.210_460_319_748_51e-22,
+    4.385_933_485_594_529e-24,
 ];
 const I1_LARGE: [Real; 9] = [
     0.398_942_28,
@@ -193,7 +211,7 @@ fn polynomial<T: Copy + std::ops::Mul<Output = T> + std::ops::Add<Output = T>>(
 pub fn bess_i0(x: Real) -> Real {
     let ax = x.abs();
     if ax < 3.75 {
-        let y = x / 3.75;
+        let y = 0.5 * x;
         polynomial(y * y, &I0_SMALL, std::convert::identity)
     } else {
         (ax.exp() / ax.sqrt()) * polynomial(3.75 / ax, &I0_LARGE, std::convert::identity)
@@ -205,7 +223,7 @@ pub fn bess_i0(x: Real) -> Real {
 pub fn bess_i1(x: Real) -> Real {
     let ax = x.abs();
     let ans = if ax < 3.75 {
-        let y = ax / 3.75;
+        let y = 0.5 * ax;
         ax * polynomial(y * y, &I1_SMALL, std::convert::identity)
     } else {
         polynomial(3.75 / ax, &I1_LARGE, std::convert::identity) * (ax.exp() / ax.sqrt())
@@ -218,17 +236,17 @@ pub fn bess_i1(x: Real) -> Real {
 pub fn bess_i1_x_over_x(x: Real) -> Real {
     let ax = x.abs();
     if ax < 3.75 {
-        let y = ax / 3.75;
+        let y = 0.5 * ax;
         polynomial(y * y, &I1_SMALL, std::convert::identity)
     } else {
         polynomial(3.75 / ax, &I1_LARGE, std::convert::identity) * (ax.exp() / (ax * ax.sqrt()))
     }
 }
 
-/// I0(x) - 1 in the small-argument polynomial, without adding a unit
+/// I0(x) - 1 in the small-argument Taylor series, without adding a unit
 /// that would round away the correction.
 fn small_i0_delta(x: Real) -> Real {
-    let y = x / 3.75;
+    let y = 0.5 * x;
     let y = y * y;
     y * polynomial(y, &I0_SMALL[1..], std::convert::identity)
 }
@@ -242,7 +260,7 @@ fn weighted_bessel_pair<const DIVIDED: bool>(
     combined_exponent: Real,
 ) -> (Real, Real) {
     if x < 3.75 {
-        let y = x / 3.75;
+        let y = 0.5 * x;
         let y = y * y;
         let factor = decay.exp();
         let i0 = polynomial(y, &I0_SMALL, std::convert::identity);
