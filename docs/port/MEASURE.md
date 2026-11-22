@@ -167,7 +167,7 @@ value). A jump therefore behaves as follows:
 
 | Query | Behaviour |
 | --- | --- |
-| `FIND … AT=<t>` at a jump time `t` whose left and right limits differ | `SpiceError::Unsupported`: the value at a discontinuity is not defined (C would divide by a zero span and report "out of interval") |
+| `FIND … AT=<t>` at a jump time `t` whose left and right limits differ | `SpiceError::Unsupported`: the value at a discontinuity is not defined (C may select a limit or report "out of interval" depending on the sample layout; see the pinned audit below) |
 | `FIND … AT=<t>` at a duplicated time whose two values are equal | the value, as written |
 | a crossing of a threshold inside the jump bracket | the crossing's axis position **is** the jump time, interpolated exactly, with no division |
 | an integral or mean whose boundary is a jump time | the boundary is a sample, so nothing is interpolated across it |
@@ -223,6 +223,34 @@ value). A jump therefore behaves as follows:
   actually carries. Ties keep the last sample that attained the extremum, as
   C's `value <= mValue` / `value >= mValue` do, and the extremum's axis position
   is reported (`at=`).
+
+### Pinned C boundary audit (architecture issue #19)
+
+The shared `ordered_samples::OrderedAxis` retains every coordinate, including
+signed-zero duplicates, and validates the complete finite column before
+checking the ordering. Measurements consume separate stored-sample, clipped
+integral and event-segment views; C-compatible polynomial Fourier fitting uses
+the validated coordinates but retains its own duplicate retreat and degree
+fallback.
+
+The following cases were checked against ngspice commit `059066b5` with a DC
+voltage ramp sampled at 0, 1, 2 and 3, or with an ASCII rawfile imported into C.
+They distinguish established Rust policy from incidental C frontend behavior:
+
+| Case | Pinned C | Rust policy |
+| --- | --- | --- |
+| DC ramp, FROM=0.25 TO=0.75, no stored sample | AVG returned 0 with reported TO=3; INTEG returned 0 with FROM=NaN; MIN/MAX returned the out-of-window sample at 0 | Reject the empty stored-sample window; do not manufacture a result |
+| Ramp, FROM=0.25 TO=1.75 | AVG=1, INTEG=1.5, MIN/MAX=1 at 1 | Same; clip both integral edges, reduce only the stored sample for extrema |
+| WHEN ramp crosses 0.5 or 1.5 in that window | Both reported out of interval | Retain prior Rust traversal: include the left entering segment, not the right leaving segment |
+| Zero width, FROM=TO=1 | AVG failed, MIN=1 | Reject zero-width integrals and means; stored-sample extrema remain valid |
+| Imported times [-1,-0,+0,1,1,2], values [-1,1,10,11,11,12] | FIND AT=0 returned 1; WHEN v(out)=5 RISE=1 returned -5; FIND AT=1 returned 11 | Refuse ambiguous FIND at the jump, return exact coordinate 0 for the jump crossing, preserve coincident equal values at 1 |
+| Same imported plot, AVG FROM=0 TO=2 and MIN FROM=TO=1 | 11 and 11 | Same |
+
+These are intentional, pre-existing Rust semantics, not newly loosened
+tolerances. In particular, exact coordinate identity does not imply that a
+jump's operand has a unique value. Preserve the existing nonfused arithmetic
+and evaluate each operand in traversal order, including errors in samples
+after an already selected event.
 
 ## Arithmetic
 

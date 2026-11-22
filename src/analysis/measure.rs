@@ -36,9 +36,7 @@ use crate::netlist::ast::{
 };
 use crate::primitives::{AnalysisKind, Real, SpiceError, SpiceResult};
 
-use super::ordered_samples::{
-    self, AxisError, SampleError, column_names, interpolate as interpolate_value,
-};
+use super::ordered_samples::{AxisError, OrderedAxis, SampleError, SampleWindow, column_names};
 use crate::analysis::results::Plot;
 use crate::analysis::selection::{self, Column};
 
@@ -281,7 +279,7 @@ struct Axis {
     /// The axis' column name, e.g. `time`.
     name: &'static str,
     /// One physical value per plot point.
-    values: Vec<Real>,
+    values: OrderedAxis<'static>,
 }
 
 impl Axis {
@@ -307,7 +305,7 @@ impl Axis {
                 });
             }
         };
-        let values = ordered_samples::ordered_values(plot, name).map_err(|error| match error {
+        let values = OrderedAxis::from_plot(plot, name).map_err(|error| match error {
             AxisError::MissingColumn => SpiceError::Unsupported {
                 feature: format!("the {} plot carries no '{name}' axis vector; it carries {}", plot.plotname, column_names(plot)),
                 location: None,
@@ -327,11 +325,11 @@ impl Axis {
     }
 
     fn first(&self) -> Real {
-        self.values.first().copied().unwrap_or(0.0)
+        self.values.as_slice().first().copied().unwrap_or(0.0)
     }
 
     fn last(&self) -> Real {
-        self.values.last().copied().unwrap_or(0.0)
+        self.values.as_slice().last().copied().unwrap_or(0.0)
     }
 }
 
@@ -389,22 +387,21 @@ impl Window {
     }
 
     /// The index range of the samples inside the window, inclusive.
-    fn samples(&self, axis: &Axis, card: &MeasureCard) -> SpiceResult<(usize, usize)> {
-        let first = axis.values.partition_point(|value| *value < self.from);
-        let last = axis.values.partition_point(|value| *value <= self.to);
-        if first >= last {
-            return Err(unsupported(
-                card,
-                format!(
-                    ".measure {}: the window [{}, {}] covers no {} sample",
-                    card.name,
-                    crate::primitives::format_spice_number(self.from),
-                    crate::primitives::format_spice_number(self.to),
-                    axis.name
-                ),
-            ));
-        }
-        Ok((first, last - 1))
+    fn samples<'a>(&self, axis: &'a Axis, card: &MeasureCard) -> SpiceResult<SampleWindow<'a>> {
+        axis.values
+            .sample_window(self.from, self.to)
+            .ok_or_else(|| {
+                unsupported(
+                    card,
+                    format!(
+                        ".measure {}: the window [{}, {}] covers no {} sample",
+                        card.name,
+                        crate::primitives::format_spice_number(self.from),
+                        crate::primitives::format_spice_number(self.to),
+                        axis.name
+                    ),
+                )
+            })
     }
 
     /// The window's samples, with both boundaries interpolated exactly.
@@ -419,48 +416,10 @@ impl Window {
         operand: &'a Operand<'_>,
         card: &MeasureCard,
     ) -> SpiceResult<impl Iterator<Item = SpiceResult<(Real, Real)>> + 'a> {
-        let (first, last) = self.samples(axis, card)?;
-        let before = (axis.values[first] > self.from)
-            .then_some(self.from)
-            .into_iter()
-            .map(move |x| clipped_boundary(axis, operand, first - 1, first, x));
-        let interior =
-            axis.values[first..=last]
-                .iter()
-                .enumerate()
-                .map(move |(offset, &axis_value)| {
-                    operand
-                        .value(first + offset)
-                        .map(|value| (axis_value, value))
-                });
-        let after = (axis.values[last] < self.to)
-            .then_some(self.to)
-            .into_iter()
-            .map(move |x| clipped_boundary(axis, operand, last, last + 1, x));
-        Ok(before.chain(interior).chain(after))
+        Ok(self
+            .samples(axis, card)?
+            .clipped_samples(move |index| operand.value(index)))
     }
-}
-
-/// The interpolation order at a clipped boundary is the same as the
-/// materialized-window implementation. Only strictly interior brackets
-/// reach this function.
-fn clipped_boundary(
-    axis: &Axis,
-    operand: &Operand<'_>,
-    left: usize,
-    right: usize,
-    x: Real,
-) -> SpiceResult<(Real, Real)> {
-    Ok((
-        x,
-        interpolate_value(
-            axis.values[left],
-            operand.value(left)?,
-            axis.values[right],
-            operand.value(right)?,
-            x,
-        ),
-    ))
 }
 
 /// One measurement operand: the column a `.measure` vector resolves to, plus the
@@ -711,11 +670,11 @@ fn evaluate_find(
 /// positive width, so it never spans a source discontinuity (the drivers keep a
 /// sample on every breakpoint). An axis value carried by two samples is a jump:
 /// asking for its value is ambiguous, so it is an explicit failure rather than
-/// a silent choice between the left and right limits (C instead divides by a
-/// zero span and reports "out of interval").
+/// a silent choice between the left and right limits (C may choose a limit or
+/// report "out of interval" depending on the sample layout).
 fn value_at(axis: &Axis, operand: &Operand<'_>, x: Real, card: &MeasureCard) -> SpiceResult<Real> {
     check_range(axis, x, card, "AT=")?;
-    ordered_samples::linear_sample(&axis.values, x, |i| operand.value(i)).map_err(|error| match error {
+    axis.values.linear_sample(x, |i| operand.value(i)).map_err(|error| match error {
         SampleError::Discontinuous => unsupported(card, format!(
             ".measure {}: the operand is discontinuous at {} = {}: the plot has multiple values at that {} value, so the value there is not defined",
             card.name, axis.name, crate::primitives::format_spice_number(x), axis.name)),
@@ -762,14 +721,15 @@ fn extrema(
     window: &Window,
     card: &MeasureCard,
 ) -> SpiceResult<Extrema> {
-    let (first, last) = window.samples(axis, card)?;
-    let initial = (operand.value(first)?, axis.values[first]);
+    let samples = window.samples(axis, card)?;
+    let (first, location) = samples.first_sample();
+    let initial = (operand.value(first)?, location);
     let mut extrema = Extrema {
         min: initial,
         max: initial,
     };
-    for (offset, &location) in axis.values[first + 1..=last].iter().enumerate() {
-        let value = operand.value(first + 1 + offset)?;
+    for (index, location) in samples.raw_samples().skip(1) {
+        let value = operand.value(index)?;
         // C's <= / >= comparisons keep the last sample on ties.
         if value <= extrema.min.0 {
             extrema.min = (value, location);
@@ -906,7 +866,7 @@ fn margin(
         }
         raw_previous = raw;
         let phase = raw + offset;
-        let frequency = axis.values[i];
+        let frequency = axis.values.as_slice()[i];
         if !db.is_finite() {
             return Err(nonfinite(card, "margin", "zero or nonfinite gain".into()));
         }
@@ -954,21 +914,17 @@ fn derivative_at(
     card: &MeasureCard,
 ) -> SpiceResult<Real> {
     check_range(axis, at, card, "AT=")?;
-    if axis.values.len() < 2 {
-        return Err(unsupported(
-            card,
-            "DERIV needs a bracketing interval".into(),
-        ));
-    }
-    // Lower-bound lookup is equivalent to the old first-inclusive bracket
-    // scan even at repeated coordinates, but avoids a linear traversal.
-    let j = axis.values.partition_point(|x| *x < at).max(1);
-    if axis.values[j] == at || axis.values[j - 1] == at {
+    let (bracket, exact) = axis
+        .values
+        .derivative_bracket(at)
+        .ok_or_else(|| unsupported(card, "DERIV needs a bracketing interval".into()))?;
+    let j = bracket.right();
+    if exact {
         // Check every duplicate at the exact point before choosing a stencil.
         value_at(axis, operand, at, card)?;
     }
     let secant = || -> SpiceResult<Real> {
-        let width = axis.values[j] - axis.values[j - 1];
+        let width = bracket.x1 - bracket.x0;
         if width == 0. {
             return Err(unsupported(card, "DERIV at a repeated axis value".into()));
         }
@@ -978,7 +934,7 @@ fn derivative_at(
         secant()?
     } else {
         let middle = (j - 1).clamp(1, axis.values.len() - 2);
-        let t = &axis.values[middle - 1..=middle + 1];
+        let t = &axis.values.as_slice()[middle - 1..=middle + 1];
         if t[0] == t[1] || t[1] == t[2] {
             secant()?
         } else {
@@ -1119,10 +1075,6 @@ fn crossing(
     )
 }
 
-#[expect(
-    clippy::float_cmp,
-    reason = "identical axis coordinates denote a discontinuous jump; nearby distinct samples require interpolation"
-)]
 fn crossing_samples(
     axis: &Axis,
     sample: impl Fn(usize) -> SpiceResult<Real>,
@@ -1147,15 +1099,13 @@ fn crossing_samples(
     if ordinal == 0 {
         return Err(unsupported(card, "crossing count must be positive".into()));
     }
-    let (first, last) = window.samples(axis, card)?;
-    let start = first.saturating_sub(1);
+    let mut segments = window.samples(axis, card)?.event_segments().peekable();
     let mut selected = None;
     let mut remaining = ordinal;
-    if start < last {
-        let mut before = sample(start)?;
-        for index in start + 1..=last {
-            let previous = index - 1;
-            let after = sample(index)?;
+    if let Some(first) = segments.peek() {
+        let mut before = sample(first.left)?;
+        for segment in segments {
+            let after = sample(segment.right())?;
             let before_high = before >= value;
             let after_high = after >= value;
             let y0 = before;
@@ -1163,10 +1113,10 @@ fn crossing_samples(
             if before_high == after_high {
                 continue;
             }
-            let x = if axis.values[index] == axis.values[previous] {
-                axis.values[index]
+            let x = if segment.is_jump() {
+                segment.x1
             } else {
-                interpolate_axis(axis.values[previous], y0, axis.values[index], after, value)
+                interpolate_axis(segment.x0, y0, segment.x1, after, value)
             };
             if !x.is_finite() {
                 return Err(nonfinite(
@@ -1747,6 +1697,108 @@ mod tests {
         );
         assert_eq!(measure(&plot, "m", find(0.5)).value, 0.5);
         assert_eq!(measure(&plot, "m", find(1.5)).value, 3.5);
+    }
+
+    #[test]
+    fn clipped_window_policies_remain_distinct() {
+        let plot = tran(&[(0., 0.), (1., 1.), (2., 2.), (3., 3.)]);
+        let window = |statistic| request(statistic, Some(0.25), Some(1.75));
+        assert_eq!(
+            measure(&plot, "min", window(MeasureStatistic::Min)).value,
+            1.
+        );
+        assert_eq!(
+            measure(&plot, "max", window(MeasureStatistic::Max)).value,
+            1.
+        );
+        assert_eq!(
+            measure(&plot, "avg", window(MeasureStatistic::Avg)).value,
+            1.
+        );
+        assert_eq!(
+            measure(&plot, "integ", window(MeasureStatistic::Integ)).value,
+            1.5
+        );
+        // The previously documented no-stored-sample behavior is intentional:
+        // pinned C returns zero and can report NaN interval metadata.
+        for statistic in [
+            MeasureStatistic::Min,
+            MeasureStatistic::Max,
+            MeasureStatistic::Avg,
+            MeasureStatistic::Rms,
+            MeasureStatistic::Integ,
+        ] {
+            let error = failure(&plot, "m", request(statistic, Some(0.25), Some(0.75)));
+            assert!(
+                error.to_string().contains("covers no time sample"),
+                "{error}"
+            );
+        }
+        let event = |threshold| MeasureRequest::When {
+            event: crossing(threshold, MeasureTransition::Rise(1)),
+            window: MeasureWindow {
+                from: Some(0.25),
+                to: Some(1.75),
+            },
+        };
+        // Retain the pre-window sample for the left crossing, but do not
+        // synthesize a crossing in the right bracket beyond the last sample.
+        assert_eq!(measure(&plot, "left", event(0.5)).value, 0.5);
+        assert!(
+            failure(&plot, "right", event(1.5))
+                .to_string()
+                .contains("no RISE=1 crossing")
+        );
+    }
+
+    #[test]
+    fn signed_zero_jump_and_coincident_smooth_samples_preserve_policy() {
+        let plot = tran(&[
+            (-1., -1.),
+            (-0., 1.),
+            (0., 10.),
+            (1., 11.),
+            (1., 11.),
+            (2., 12.),
+        ]);
+        let find = |at| MeasureRequest::Find {
+            operand: out(),
+            at,
+            at_location: loc(),
+            window: MeasureWindow::default(),
+        };
+        assert!(
+            failure(&plot, "jump", find(0.))
+                .to_string()
+                .contains("discontinuous")
+        );
+        assert_eq!(measure(&plot, "smooth", find(1.)).value, 11.);
+        let when = MeasureRequest::When {
+            event: crossing(5., MeasureTransition::Rise(1)),
+            window: MeasureWindow::default(),
+        };
+        assert_eq!(
+            measure(&plot, "jump", when).value.to_bits(),
+            0_f64.to_bits()
+        );
+        assert_eq!(
+            measure(
+                &plot,
+                "avg",
+                request(MeasureStatistic::Avg, Some(0.), Some(2.))
+            )
+            .value,
+            11.
+        );
+        assert_eq!(
+            measure(
+                &plot,
+                "min",
+                request(MeasureStatistic::Min, Some(1.), Some(1.))
+            )
+            .value,
+            11.
+        );
     }
 
     #[test]

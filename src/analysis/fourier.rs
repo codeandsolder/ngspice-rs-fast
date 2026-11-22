@@ -85,7 +85,7 @@
 use crate::netlist::ast::{FourierCard, MAX_HARMONICS, VectorRequest};
 use crate::primitives::{AnalysisKind, Real, SpiceError, SpiceResult};
 
-use super::ordered_samples::{self, AxisError, SampleError, column_names};
+use super::ordered_samples::{AxisError, OrderedAxis, SampleError, column_names};
 use crate::analysis::results::Plot;
 use crate::analysis::selection::{self, Column};
 
@@ -200,7 +200,7 @@ pub fn resolve(
             ));
         }
         check_budget(card)?;
-        let axis = TimeAxis::of(plot, card)?;
+        let axis = time_axis(plot, card)?;
         for vector in &card.vectors {
             results.push(evaluate(plot, &axis, card, vector)?);
         }
@@ -351,14 +351,8 @@ fn check_budget(card: &FourierCard) -> SpiceResult<()> {
 /// (`crates/analysis/src/companion.rs`, "Output"). This module therefore
 /// interpolates only between consecutive samples, and treats two samples that
 /// share an axis value as a jump (see [`sample`]).
-struct TimeAxis {
-    /// One physical time per plot point.
-    values: Vec<Real>,
-}
-
-impl TimeAxis {
-    fn of(plot: &Plot, card: &FourierCard) -> SpiceResult<Self> {
-        let values = ordered_samples::ordered_values(plot, "time").map_err(|error| match error {
+fn time_axis(plot: &Plot, card: &FourierCard) -> SpiceResult<OrderedAxis<'static>> {
+    let values = OrderedAxis::from_plot(plot, "time").map_err(|error| match error {
             AxisError::MissingColumn => unsupported(card, format!(
                 ".four: the {} plot carries no 'time' axis vector; it carries {}", plot.plotname, column_names(plot))),
             AxisError::MissingSample(index) => nonfinite("time", format!("point {index} has no time value")),
@@ -366,17 +360,16 @@ impl TimeAxis {
             AxisError::Descending(index) => unsupported(card, format!(
                 ".four: the time axis is not non-decreasing (it descends at point {index}); a Fourier transform needs an ordered axis")),
         })?;
-        if values.len() < 2 {
-            return Err(unsupported(
-                card,
-                format!(
-                    ".four: a Fourier transform needs at least 2 data points (the plot has {}); C reports the same refusal",
-                    values.len()
-                ),
-            ));
-        }
-        Ok(Self { values })
+    if values.len() < 2 {
+        return Err(unsupported(
+            card,
+            format!(
+                ".four: a Fourier transform needs at least 2 data points (the plot has {}); C reports the same refusal",
+                values.len()
+            ),
+        ));
     }
+    Ok(values)
 }
 
 /// One transformed vector: the column a `.four` request resolves to, plus the
@@ -428,13 +421,13 @@ impl<'a> Trace<'a> {
 /// One `.four` request, transformed over the final complete period of `axis`.
 fn evaluate(
     plot: &Plot,
-    axis: &TimeAxis,
+    axis: &OrderedAxis<'_>,
     card: &FourierCard,
     request: &VectorRequest,
 ) -> SpiceResult<FourierAnalysis> {
     let trace = Trace::resolve(plot, request)?;
-    let first = axis.values.first().copied().unwrap_or(0.0);
-    let to = axis.values.last().copied().unwrap_or(0.0);
+    let first = axis.as_slice().first().copied().unwrap_or(0.0);
+    let to = axis.as_slice().last().copied().unwrap_or(0.0);
     let period = 1.0 / card.fundamental;
     let from = to - period;
     if from < first {
@@ -453,8 +446,8 @@ fn evaluate(
         ));
     }
     let harmonics = card.harmonics as usize;
-    let first_index = axis.values.partition_point(|value| *value < from);
-    let samples = axis.values.len() - first_index;
+    let first_index = axis.lower_bound(from);
+    let samples = axis.len() - first_index;
     let needed = 2 * harmonics + 1;
     if samples < needed {
         return Err(unsupported(
@@ -585,8 +578,13 @@ fn closed_grid_spectrum(
 /// the left and right limits. A window boundary that falls strictly inside a
 /// bracket is interpolated from the bracketing samples, which may lie just
 /// outside the window.
-fn sample(axis: &TimeAxis, trace: &Trace<'_>, x: Real, card: &FourierCard) -> SpiceResult<Real> {
-    ordered_samples::linear_sample(&axis.values, x, |i| trace.value(i)).map_err(|error| match error {
+fn sample(
+    axis: &OrderedAxis<'_>,
+    trace: &Trace<'_>,
+    x: Real,
+    card: &FourierCard,
+) -> SpiceResult<Real> {
+    axis.linear_sample(x, |i| trace.value(i)).map_err(|error| match error {
         SampleError::Discontinuous => unsupported(card, format!(
             ".four {}: the vector is discontinuous at time = {}: the plot has multiple values at that time, so the resampling grid cannot read it there",
             trace.name(), crate::primitives::format_spice_number(x))),
@@ -661,21 +659,21 @@ struct ConfiguredPlan {
 
 impl ConfiguredPlan {
     fn new(
-        axis: &TimeAxis,
+        axis: &OrderedAxis<'_>,
         card: &FourierCard,
         settings: FourierSettings,
         count: u32,
     ) -> SpiceResult<Self> {
         let to = *axis
-            .values
+            .as_slice()
             .last()
             .ok_or_else(|| unsupported(card, "empty Fourier axis".into()))?;
         let from = if settings.polydegree == 0 {
-            axis.values[0]
+            axis.as_slice()[0]
         } else {
             to - Real::from(settings.nperiods) / card.fundamental
         };
-        if from < axis.values[0] {
+        if from < axis.as_slice()[0] {
             return Err(unsupported(
                 card,
                 "Fourier window is longer than the run".into(),
@@ -693,7 +691,7 @@ impl ConfiguredPlan {
             ));
         }
         let n = if settings.polydegree == 0 {
-            axis.values.len()
+            axis.len()
         } else {
             count as usize
         };
@@ -728,19 +726,19 @@ impl ConfiguredPlan {
 
     fn samples(
         &self,
-        axis: &TimeAxis,
+        axis: &OrderedAxis<'_>,
         card: &FourierCard,
         trace: &Trace<'_>,
         compatible: bool,
     ) -> SpiceResult<Vec<Real>> {
-        let samples = (0..axis.values.len())
+        let samples = (0..axis.len())
             .map(|i| trace.value(i))
             .collect::<SpiceResult<Vec<_>>>()?;
         let Some(grid) = &self.grid else {
             return Ok(samples);
         };
         if compatible {
-            super::fourier_resample::resample(&axis.values, &samples, grid, self.degree)
+            super::fourier_resample::resample(axis, &samples, grid, self.degree)
         } else {
             stable_resample(axis, &samples, grid, self.degree, card, trace.name())
         }
@@ -815,14 +813,14 @@ impl ConfiguredPlan {
 }
 
 fn stable_resample(
-    axis: &TimeAxis,
+    axis: &OrderedAxis<'_>,
     samples: &[Real],
     grid: &[Real],
     degree: usize,
     card: &FourierCard,
     name: &str,
 ) -> SpiceResult<Vec<Real>> {
-    if axis.values.len() <= degree || axis.values.windows(2).any(|w| w[0] >= w[1]) {
+    if axis.len() <= degree || axis.has_duplicates() {
         return Err(unsupported(
             card,
             "stable polynomial interpolation needs distinct samples".into(),
@@ -830,17 +828,17 @@ fn stable_resample(
     }
     let mut values = Vec::with_capacity(grid.len());
     for &x in grid {
-        let right = axis.values.partition_point(|t| *t < x);
+        let right = axis.lower_bound(x);
         let start = right
             .saturating_sub(degree.div_ceil(2))
-            .min(axis.values.len() - degree - 1);
+            .min(axis.len() - degree - 1);
         let mut value = 0.;
         for k in 0..=degree {
             let mut weight = 1.;
             for j in 0..=degree {
                 if j != k {
-                    weight *= (x - axis.values[start + j])
-                        / (axis.values[start + k] - axis.values[start + j]);
+                    weight *= (x - axis.as_slice()[start + j])
+                        / (axis.as_slice()[start + k] - axis.as_slice()[start + j]);
                 }
             }
             let term = weight * samples[start + k];
@@ -886,12 +884,12 @@ fn resolve_settings(
     let mut results = Vec::new();
     for card in cards {
         check_budget(card)?;
-        let axis = TimeAxis::of(plot, card)?;
+        let axis = time_axis(plot, card)?;
         let plan = ConfiguredPlan::new(&axis, card, settings, count)?;
         for request in &card.vectors {
             let trace = Trace::resolve(plot, request)?;
             let values = plan.samples(&axis, card, &trace, compatible)?;
-            results.push(plan.transform(card, &trace, &values, axis.values.len())?);
+            results.push(plan.transform(card, &trace, &values, axis.len())?);
         }
     }
     Ok(results)

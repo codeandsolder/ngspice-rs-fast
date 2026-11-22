@@ -1,6 +1,7 @@
 //! C-compatible moving polynomial interpolation (`maths/poly/interpolate.c`).
 //! The absolute power basis and fit acceptance thresholds are intentional:
 //! changing coordinates changes which degrees C falls back from.
+use super::ordered_samples::{OrderedAxis, same_coordinate};
 use crate::maths::polynomial::evaluate;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 fn failure(message: &str) -> SpiceError {
@@ -123,11 +124,6 @@ fn eliminate(matrix: &mut [Real], rhs: &mut [Real], n: usize, row: usize, col: u
     rhs[row] -= factor * rhs[col];
 }
 
-/// Detect coincident physical samples, not approximately equal times.
-fn same_timestamp(left: Real, right: Real) -> bool {
-    left.partial_cmp(&right) == Some(std::cmp::Ordering::Equal)
-}
-
 /// Move the older coincident sample back by C's fractional interval.
 /// Keep the displacement rounded separately, as in `ft_interpolate`.
 const fn retreat_duplicate(time: &mut Real, interval: Real) {
@@ -137,23 +133,19 @@ const fn retreat_duplicate(time: &mut Real, interval: Real) {
 
 /// Resample onto an ascending physical grid with C's degree fallback and edge policy.
 pub(super) fn resample(
-    times: &[Real],
+    axis: &OrderedAxis<'_>,
     values: &[Real],
     grid: &[Real],
     degree: usize,
 ) -> SpiceResult<Vec<Real>> {
+    let times = axis.as_slice();
     if times.len() != values.len()
         || times.len() <= degree
         || degree == 0
         || degree > 16
         || grid.len() < 2
-        || times
-            .iter()
-            .chain(values)
-            .chain(grid)
-            .any(|x| !x.is_finite())
-        || times.windows(2).any(|w| w[0] > w[1])
-        || grid.windows(2).any(|w| w[0] >= w[1])
+        || values.iter().any(|x| !x.is_finite())
+        || OrderedAxis::borrowed(grid).map_or(true, |axis| axis.has_duplicates())
     {
         return Err(failure("invalid interpolation samples or degree"));
     }
@@ -166,7 +158,7 @@ pub(super) fn resample(
     let mut window_values = vec![values[start]];
     let mut end = start;
     while window_times.len() <= degree && end + 1 < times.len() {
-        if same_timestamp(times[end + 1], times[end]) {
+        if same_coordinate(times[end + 1], times[end]) {
             if window_times.len() == 1 {
                 end += 1;
                 window_values[0] = values[end];
@@ -198,7 +190,7 @@ pub(super) fn resample(
         window_values.rotate_left(1);
         window_times[degree] = times[next];
         window_values[degree] = values[next];
-        if same_timestamp(window_times[degree], window_times[degree - 1]) {
+        if same_coordinate(window_times[degree], window_times[degree - 1]) {
             let width = if degree == 1 {
                 window_times[0] - discarded
             } else {
@@ -225,12 +217,12 @@ pub(super) fn resample(
 
 #[cfg(test)]
 mod tests {
-    use super::{resample, same_timestamp};
+    use super::{OrderedAxis, resample, same_coordinate};
 
     #[test]
     fn coincident_times_include_signed_zero_but_not_adjacent_floats() {
-        assert!(same_timestamp(-0., 0.));
-        assert!(!same_timestamp(1., 1_f64.next_up()));
+        assert!(same_coordinate(-0., 0.));
+        assert!(!same_coordinate(1., 1_f64.next_up()));
     }
 
     #[test]
@@ -263,7 +255,8 @@ mod tests {
             0.4945964869320709,
             0.499999999999999,
         ];
-        let result = resample(&time, &values, &[0.0039949, 0.003995], 3).unwrap();
+        let axis = OrderedAxis::borrowed(&time).unwrap();
+        let result = resample(&axis, &values, &[0.0039949, 0.003995], 3).unwrap();
         let expected = [0.46796123867079586_f64, 0.4685892409220287];
         assert_eq!(
             result.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
