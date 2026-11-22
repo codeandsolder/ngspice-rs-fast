@@ -817,7 +817,7 @@ mod tests {
             .ac
             .expect("explicit AC magnitude must be retained");
         assert_eq!(ac.magnitude.map(f64::to_bits), Some(0_f64.to_bits()));
-        assert!(ac.phase.is_none());
+        assert_eq!(ac.phase.map(f64::to_bits), Some(0_f64.to_bits()));
         assert!(input.port.power_function.is_some());
         let mut nodes = NodeTable::new();
         let existing = nodes.intern("v1#res").unwrap();
