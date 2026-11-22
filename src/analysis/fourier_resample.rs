@@ -150,10 +150,13 @@ pub(super) fn resample(
         return Err(failure("invalid interpolation samples or degree"));
     }
     let middle = degree.div_ceil(2);
-    let mut start = 0;
-    while start + degree + 1 < times.len() && times[start + middle] < grid[0] {
-        start += 1;
-    }
+    // The old forward scan stops at the first midpoint at or above the
+    // opening grid point, or the last full window. Use the validated axis
+    // index without changing which window is fitted.
+    let start = axis
+        .lower_bound(grid[0])
+        .saturating_sub(middle)
+        .min(times.len() - degree - 1);
     let mut window_times = vec![times[start]];
     let mut window_values = vec![values[start]];
     let mut end = start;
