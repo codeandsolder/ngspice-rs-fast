@@ -334,7 +334,13 @@ when resolving the requested vector. These bounds do not imply every upstream
 ask or model is implemented.
 
 `m9_observations` compares saved R/D/Q/M currents and parameters against the
-new committed `conformance/observations/m9_device_dc.raw` C fixture. The opt-in
-C test checks that fixture without recapture. Analytic RC transient tests check
+original `conformance/observations/m9_device_dc.raw` C fixture. The opt-in
+`device_observations_match_live_c` test compares Rust with a general
+`NGSPICE_BIN` using the same numerical bounds. The separate
+`device_golden_matches_capture_oracle_bit_exactly` test requires
+`NGSPICE_CAPTURE_BIN` and checks the committed C data bit-for-bit, without
+recapture or numerical tolerance. See the
+[capture provenance and commands](../../conformance/observations/README.md).
+Analytic RC transient tests check
 capacitor/resistor KCL, power and measurement integration; invalid requests
 preserve an existing output file.
