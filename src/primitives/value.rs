@@ -546,50 +546,6 @@ fn wide_product_sum(terms: &[ExactTerm]) -> ScaledNumber {
     }
 }
 
-/// Accurate complex value minus product. Ordinary inputs use a direct
-/// three-term update; cancellation-sensitive components are recovered
-/// from the original operands, rather than a separately rounded product.
-#[inline]
-pub(crate) fn complex_mul_sub(value: Complex, a: Complex, b: Complex) -> Complex {
-    let ac = a.re * b.re;
-    let bd = a.im * b.im;
-    let ad = a.re * b.im;
-    let bc = a.im * b.re;
-    let real = value.re - (ac - bd);
-    let imag = value.im - (ad + bc);
-    let result = Complex::new(real, imag);
-    let scale = (value.re.abs() + value.im.abs()) * 0.0625;
-    let norm = real.abs() + imag.abs();
-    // Complex multiplication is normwise well-conditioned. A small
-    // individual component does not by itself imply a cancellation of
-    // the vector update. Recompute when the entire update nearly cancels,
-    // or when its exponent range threatens to erase it.
-    if norm.is_normal() && norm > scale {
-        return result;
-    }
-    if !value.is_finite()
-        || !a.is_finite()
-        || !b.is_finite()
-        || a == Complex::ZERO
-        || b == Complex::ZERO
-    {
-        return result;
-    }
-    complex_mul_sub_recover(value, a, b)
-}
-
-#[cold]
-fn complex_mul_sub_recover(value: Complex, a: Complex, b: Complex) -> Complex {
-    let restore = |terms: [(Real, Real); 3]| {
-        let exact = exact_product_sum(terms);
-        scale_power(exact.mantissa, exact.exponent)
-    };
-    Complex::new(
-        restore([(value.re, 1.), (-a.re, b.re), (a.im, b.im)]),
-        restore([(value.im, 1.), (-a.re, b.im), (-a.im, b.re)]),
-    )
-}
-
 /// Accurate (value * pivot - upper * lower) / pivot. All four inputs
 /// are original, unnormalized coefficients of the current Schur step.
 #[cold]

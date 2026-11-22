@@ -233,13 +233,15 @@ singular systems).
 ## Fidelity and limits
 
 - The solver preserves the SPARSE policy, not intermediate C rounding.
-  Ordinary Schur updates use the reciprocal-based fast path. Ordering
-  keeps the original pivot locally and fixed-order refactor keeps raw pivots
-  in reusable scratch, allowing cancellation-sensitive updates to evaluate
-  the unnormalized cross-product before dividing. Exact product accumulation
-  distinguishes proportional rows from genuine tiny nonzero determinants.
-  Triangular updates compensate cancellation and recover components at
-  exponent-range boundaries.
+  The factor frame stores both triangular factors with their shared raw
+  diagonal, plus a numerical cache of reciprocal pivots. Ordinary updates
+  use the reciprocal-based fast path; cancellation-sensitive updates recover
+  from the original cross-product before dividing. Packed row and column runs support
+  forward and backward scatter substitution in either orientation. Each
+  update uses the raw RHS numerator before storing the rounded quotient,
+  without a separate numerator buffer. Exact product accumulation distinguishes
+  proportional rows from genuine tiny nonzero determinants. Determinants
+  multiply raw pivots directly, not their rounded inverse reconstructions.
   Determinants are accumulated with binary normalization, with no decimal
   conversion in the pole-zero path. The historical no-FMA C failure on
   `multi_analysis_pz` is no longer reproduced: the notch and multi-analysis
