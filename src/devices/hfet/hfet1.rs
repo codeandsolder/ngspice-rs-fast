@@ -661,10 +661,7 @@ impl Hfet1 {
                 let unorm = (v + rs * iseff) / vteff + (rs * iseff / vteff).ln();
                 (first, vteff * Self::diode(unorm) / rs - iseff)
             } else {
-                (
-                    is1 * ((v / vt1).exp() - 1.),
-                    iseff * ((v / vteff).exp() - 1.),
-                )
+                (is1 * (v / vt1).exp_m1(), iseff * (v / vteff).exp_m1())
             };
             let iaprox = if iaprox1 * iaprox2 == 0. {
                 0.5 * (iaprox1 + iaprox2)
@@ -673,7 +670,7 @@ impl Hfet1 {
             };
             let dvdi0 = rs + vt1 / (iaprox + is1) + vt2 / (iaprox + is2);
             let mut v0 = rs * iaprox;
-            v0 += vt1 * (iaprox / is1 + 1.).ln() + vt2 * (iaprox / is2 + 1.).ln();
+            v0 += vt1 * (iaprox / is1).ln_1p() + vt2 * (iaprox / is2).ln_1p();
             let il = (iaprox + (v - v0) / dvdi0).max(-is1) * 0.99999;
             let gl = 1. / (rs + vt1 / (il + is1) + vt2 / (il + is2));
             (il, gl)
@@ -705,19 +702,19 @@ impl Hfet1 {
         let vl = model.vs / derived.tmu * self.instance.l;
         let rt = model.rsi + model.rdi;
         let vgt0 = vgs - derived.tvto;
-        let s = ((vgt0 - model.vsigmat) / model.vsigma).exp();
-        let sigma = model.sigma0 / (1. + s);
-        let vgt = vgt0 + sigma * vds;
+        let (rolloff, rolloff_slope) = super::rolloff((vgt0 - model.vsigmat) / model.vsigma);
+        let sigma = model.sigma0 * rolloff;
+        let vgt = sigma.mul_add(vds, vgt0);
         let u = 0.5 * vgt / vt - 1.;
         let t = (derived.delta_sqr + u * u).sqrt();
         let vgte = vt * (2. + u + t);
-        let b = (vgt / etavth).exp();
-        let nsn = 2. * derived.n0 * (1. + 0.5 * b).ln();
-        let nsm = if derived.two_exponentials {
+        let (population, population_slope) = super::softplus(vgt / etavth - std::f64::consts::LN_2);
+        let nsn = 2. * derived.n0 * population;
+        let (nsm, weight_n, weight_c) = if derived.two_exponentials {
             let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / (model.eta2 * vt)).exp();
-            nsn * nsc / (nsn + nsc)
+            super::series_density(nsn, nsc)
         } else {
-            nsn
+            (nsn, 1., 0.)
         };
         if nsm < N_MIN {
             let terms = self.gatemod_terms(derived, vgs, vds, 0., 0., 0., gmin, (cgd, cgs, ggs));
@@ -751,25 +748,24 @@ impl Hfet1 {
         let delidgch = vds * (1. + derived.tlambda * vds) / e;
         let cdrain = gch * delidgch;
         let delidvsate = cdrain * d / vsate / (1. + d);
-        let delidvds = gch * (1. + 2. * derived.tlambda * vds) / e
-            - cdrain * (vds / vsate).powf(model.m - 1.) / (vsate * (1. + d));
+        let delidvds = gch / e * (derived.tlambda * vds + (1. + derived.tlambda * vds) / (1. + d));
         let a = 1. + gchi * rt;
         let delgchgchi = 1. / (a * a);
         let delgchins = derived.gchi0;
-        let delnsnsm = ns / nsm * (1. - c / (1. + c));
+        let delnsnsm = ns / nsm / (1. + c);
         let delvgtevgt = 0.5 * (1. + u / t);
-        let mut delnsmvgt = derived.n0 / etavth / (1. / b + 0.5);
-        if derived.two_exponentials {
-            let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / (model.eta2 * vt)).exp();
-            delnsmvgt = nsc * (nsc * delnsmvgt + nsn * nsn / (model.eta2 * vt))
-                / ((nsc + nsn) * (nsc + nsn));
-        }
+        let delnsmvgt = if derived.two_exponentials {
+            weight_n * weight_n * (2. * derived.n0 / etavth * population_slope)
+                + weight_c * nsm / (model.eta2 * vt)
+        } else {
+            2. * derived.n0 / etavth * population_slope
+        };
         let delvsateisat = 1. / gch;
-        let delisatisatm = isat / isatm * (1. - g / (1. + g));
+        let delisatisatm = isat / isatm / (1. + g);
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
         let delvsategch = -vsate / gch;
         let delisatmgchim = vgte * (p - gchim * model.rsi * (1. + 1. / h)) / (p * p);
-        let delvgtvgs = 1. - vds * model.sigma0 / model.vsigma * s / ((1. + s) * (1. + s));
+        let delvgtvgs = 1. - vds * model.sigma0 / model.vsigma * rolloff_slope;
         let p = delgchgchi * delgchins * delnsnsm * delnsmvgt;
         let delvsatevgt = delvsateisat
             * delisatisatm
@@ -817,7 +813,7 @@ impl Hfet1 {
             let b = (1. + a).powf(1. / model.mv1);
             let vdse = vds / b;
             let delvdsevmax = vdse * a / ((1. + a) * vmax);
-            let delvdsevds = (1. - a / (1. + a)) / b;
+            let delvdsevds = 1. / ((1. + a) * b);
             let dvdsevgs = delvdsevmax * model.cm3 * delvsatevgt * delvgtvgs;
             let dvdsevds = delvdsevds + delvdsevmax * model.cm3 * delvsatevgt * sigma;
             let c = vgte * vdse;
@@ -934,7 +930,7 @@ impl Hfet1 {
         let deltdvdse = model.talpha * vdse * (2. - c / (1. + c)) / d;
         let deltdvkneet = (td - temp) * c / ((1. + c) * vkneet);
         let delvdsevmax = vdse * a / ((1. + a) * vmax);
-        let delvdsevds = (1. - a / (1. + a)) / b;
+        let delvdsevds = 1. / ((1. + a) * b);
         let temp2 = delvsatevgt * delvgtvgs;
         let dvdsevgs = delvdsevmax * model.cm1 * temp2;
         let dtdvgs = deltdvdse * dvdsevgs + deltdvkneet * model.ck1 * temp2;
@@ -950,9 +946,9 @@ impl Hfet1 {
             let ggs = -csat / vgs + gmin;
             (ggs * vgs, ggs)
         } else {
-            let evgs = (vgs / vtn).exp();
-            let ggs = csat * evgs / vtn + gmin;
-            (csat * (evgs - 1.) + gmin * vgs, ggs)
+            let (current, conductance) =
+                crate::devices::nonlinear::exponential_junction(vgs, vtn, csat);
+            (gmin.mul_add(vgs, current), conductance + gmin)
         };
         Channel {
             cdrain: 0.,

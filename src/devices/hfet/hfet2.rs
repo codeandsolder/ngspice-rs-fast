@@ -464,19 +464,19 @@ impl Hfet2 {
         let vl = model.vs / derived.tmu * self.instance.l;
         let rt = model.rsi + model.rdi;
         let vgt0 = vgs - derived.tvto;
-        let s = ((vgt0 - model.vsigmat) / model.vsigma).exp();
-        let sigma = model.sigma0 / (1. + s);
-        let vgt = vgt0 + sigma * vds;
+        let (rolloff, rolloff_slope) = super::rolloff((vgt0 - model.vsigmat) / model.vsigma);
+        let sigma = model.sigma0 * rolloff;
+        let vgt = sigma.mul_add(vds, vgt0);
         let u = 0.5 * vgt / vt - 1.;
         let t = (derived.delta_sqr + u * u).sqrt();
         let vgte = vt * (2. + u + t);
-        let b = (vgt / etavth).exp();
-        let nsn = 2. * derived.n0 * (1. + 0.5 * b).ln();
-        let nsm = if derived.two_exponentials {
+        let (population, population_slope) = super::softplus(vgt / etavth - std::f64::consts::LN_2);
+        let nsn = 2. * derived.n0 * population;
+        let (nsm, weight_n, weight_c) = if derived.two_exponentials {
             let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / (model.eta2 * vt)).exp();
-            nsn * nsc / (nsn + nsc)
+            super::series_density(nsn, nsc)
         } else {
-            nsn
+            (nsn, 1., 0.)
         };
         if nsm < N_MIN {
             return Ok(Channel {
@@ -504,25 +504,24 @@ impl Hfet2 {
         let delidgch = vds * (1. + derived.tlambda * vds) / e;
         let cdrain = gch * delidgch;
         let delidvsate = cdrain * d / vsate / (1. + d);
-        let delidvds = gch * (1. + 2. * derived.tlambda * vds) / e
-            - cdrain * (vds / vsate).powf(model.m - 1.) / (vsate * (1. + d));
+        let delidvds = gch / e * (derived.tlambda * vds + (1. + derived.tlambda * vds) / (1. + d));
         let a = 1. + gchi * rt;
         let delgchgchi = 1. / (a * a);
         let delgchins = derived.gchi0;
-        let delnsnsm = ns / nsm * (1. - c / (1. + c));
+        let delnsnsm = ns / nsm / (1. + c);
         let delvgtevgt = 0.5 * (1. + u / t);
-        let mut delnsmvgt = derived.n0 / etavth / (1. / b + 0.5);
-        if derived.two_exponentials {
-            let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / (model.eta2 * vt)).exp();
-            delnsmvgt = nsc * (nsc * delnsmvgt + nsn * nsn / (model.eta2 * vt))
-                / ((nsc + nsn) * (nsc + nsn));
-        }
+        let delnsmvgt = if derived.two_exponentials {
+            weight_n * weight_n * (2. * derived.n0 / etavth * population_slope)
+                + weight_c * nsm / (model.eta2 * vt)
+        } else {
+            2. * derived.n0 / etavth * population_slope
+        };
         let delvsateisat = 1. / gch;
-        let delisatisatm = isat / isatm * (1. - g / (1. + g));
+        let delisatisatm = isat / isatm / (1. + g);
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
         let delvsategch = -vsate / gch;
         let delisatmgchim = vgte * (p - gchim * model.rsi * (1. + 1. / h)) / (p * p);
-        let delvgtvgs = 1. - vds * model.sigma0 / model.vsigma * s / ((1. + s) * (1. + s));
+        let delvgtvgs = 1. - vds * model.sigma0 / model.vsigma * rolloff_slope;
         let p = delgchgchi * delgchins * delnsnsm * delnsmvgt;
         let delvsatevgt = delvsateisat
             * delisatisatm
@@ -624,14 +623,16 @@ impl Hfet2 {
         let vtn = model.n * vt;
         let arg = -vgs * model.del / vt;
         let earg = arg.exp();
-        let expe = (vgs / vtn).exp();
-        let ggs = derived.jslw * expe / vtn + derived.ggrlw * earg * (1. - arg);
-        let mut cg = derived.jslw * (expe - 1.) + derived.ggrlw * vgs * earg;
+        let (current, conductance) =
+            crate::devices::nonlinear::exponential_junction(vgs, vtn, derived.jslw);
+        let ggs = conductance + derived.ggrlw * earg * (1. - arg);
+        let mut cg = current + derived.ggrlw * vgs * earg;
         let arg = -vgd * model.del / vt;
         let earg = arg.exp();
-        let expe = (vgd / vtn).exp();
-        let ggd = derived.jslw * expe / vtn + derived.ggrlw * earg * (1. - arg);
-        let cgd = derived.jslw * (expe - 1.) + derived.ggrlw * vgd * earg;
+        let (current, conductance) =
+            crate::devices::nonlinear::exponential_junction(vgd, vtn, derived.jslw);
+        let ggd = conductance + derived.ggrlw * earg * (1. - arg);
+        let cgd = current + derived.ggrlw * vgd * earg;
         cg += cgd;
         let mut vds = vgs - vgd;
         let inverse = vds < 0.;

@@ -539,9 +539,10 @@ impl Mesa {
     ) -> (Real, Real) {
         let arg = -v * self.model.del / vt;
         let earg = arg.exp();
-        let ev = (v / vte).exp();
-        let conductance = csat * ev / vte + derived.ggrwl * earg * (1. - arg) + gmin;
-        let current = csat * (ev - 1.) + derived.ggrwl * v * earg + gmin * v;
+        let (diode_current, diode_conductance) =
+            crate::devices::nonlinear::exponential_junction(v, vte, csat);
+        let conductance = diode_conductance + derived.ggrwl * earg * (1. - arg) + gmin;
+        let current = gmin.mul_add(v, diode_current + derived.ggrwl * v * earg);
         (current, conductance)
     }
 
@@ -586,9 +587,9 @@ impl Mesa {
         let etavth = derived.teta * vt;
         let rt = derived.trsi + derived.trdi;
         let vgt0 = vgs - von;
-        let s = ((vgt0 - model.vsigmat) / model.vsigma).exp();
-        let sigma = model.sigma0 / (1. + s);
-        let vgt = vgt0 + sigma * vds;
+        let (rolloff, rolloff_slope) = super::rolloff((vgt0 - model.vsigmat) / model.vsigma);
+        let sigma = model.sigma0 * rolloff;
+        let vgt = sigma.mul_add(vds, vgt0);
         let t = vgt / vt - 1.;
         let q = (derived.delta_sqr + t * t).sqrt();
         let vgte = 0.5 * vt * (2. + t + q);
@@ -677,7 +678,7 @@ impl Mesa {
         let delisatisatb = isata * isata / r;
         let delisatbvgt = isatb / etavth;
         let delvsategch = -vsate / gch;
-        let delvgtvgs = 1. - model.sigma0 * vds * s / model.vsigma / (1. + s) / (1. + s);
+        let delvgtvgs = 1. - vds * model.sigma0 / model.vsigma * rolloff_slope;
         let p = delgchgchi * delgchins * delnsvgt;
         let delvsatevgt = delvsateisat
             * (delisatisata * delisatavgte * delvgtevgt + delisatisatb * delisatbvgt)
@@ -709,14 +710,14 @@ impl Mesa {
         let vl = model.vs / derived.tmu * self.instance.l;
         let rt = derived.trsi + derived.trdi;
         let vgt0 = vgs - von;
-        let s = ((vgt0 - model.vsigmat) / model.vsigma).exp();
-        let sigma = model.sigma0 / (1. + s);
-        let vgt = vgt0 + sigma * vds;
+        let (rolloff, rolloff_slope) = super::rolloff((vgt0 - model.vsigmat) / model.vsigma);
+        let sigma = model.sigma0 * rolloff;
+        let vgt = sigma.mul_add(vds, vgt0);
         let u = 0.5 * vgt / vt - 1.;
         let t = (derived.delta_sqr + u * u).sqrt();
         let vgte = vt * (2. + u + t);
-        let b = (vgt / etavth).exp();
-        let nsm = 2. * derived.n0 * (1. + 0.5 * b).ln();
+        let (population, population_slope) = super::softplus(vgt / etavth - std::f64::consts::LN_2);
+        let nsm = 2. * derived.n0 * population;
         if nsm < N_MIN {
             return Ok((0., 0., 0., derived.cf, derived.cf));
         }
@@ -751,20 +752,19 @@ impl Mesa {
         let a = a * a;
         let capgd = derived.cf + third * cgc * (1. - a);
         let delidvsate = cdrain * d / vsate / (1. + d);
-        let delidvds = gch * (1. + 2. * lambda * vds) / e
-            - cdrain * (vds / vsate).powf(model.m - 1.) / (vsate * (1. + d));
+        let delidvds = gch / e * (lambda * vds + (1. + lambda * vds) / (1. + d));
         let a = 1. + gchi * rt;
         let delgchgchi = 1. / (a * a);
         let delgchins = derived.gchi0;
-        let delnsnsm = ns / nsm * (1. - c / (1. + c));
-        let delnsmvgt = derived.n0 / etavth / (1. / b + 0.5);
+        let delnsnsm = ns / nsm / (1. + c);
+        let delnsmvgt = 2. * derived.n0 / etavth * population_slope;
         let delvgtevgt = 0.5 * (1. + u / t);
         let delvsateisat = 1. / gch;
-        let delisatisatm = isat / isatm * (1. - g / (1. + g));
+        let delisatisatm = isat / isatm / (1. + g);
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
         let delvsategch = -vsate / gch;
         let delisatmgchim = vgte * (p - gchim * derived.trsi * (1. + 1. / h)) / (p * p);
-        let delvgtvgs = 1. - vds * model.sigma0 / model.vsigma * s / ((1. + s) * (1. + s));
+        let delvgtvgs = 1. - vds * model.sigma0 / model.vsigma * rolloff_slope;
         let p = delgchgchi * delgchins * delnsnsm * delnsmvgt;
         let delvsatevgt = delvsateisat
             * delisatisatm
@@ -796,9 +796,9 @@ impl Mesa {
         let etavth = eta * vt;
         let rt = derived.trsi + derived.trdi;
         let vgt0 = vgs - von;
-        let s = ((vgt0 - model.vsigmat) / model.vsigma).exp();
-        let sigma = model.sigma0 / (1. + s);
-        let vgt = vgt0 + sigma * vds;
+        let (rolloff, rolloff_slope) = super::rolloff((vgt0 - model.vsigmat) / model.vsigma);
+        let sigma = model.sigma0 * rolloff;
+        let vgt = sigma.mul_add(vds, vgt0);
         let mu = derived.tmu + model.theta * vgt;
         let vl = model.vs / mu * self.instance.l;
         let beta = derived.beta / (derived.vpo + 3. * vl);
@@ -878,7 +878,7 @@ impl Mesa {
         let delisatabeta = 2. * vgte * vgte * (d * e - a * e * derived.trsi * v) / temp;
         let delisatisatb = isata * isata / r;
         let delvsategch = -vsate / gch;
-        let dvgtvgs = 1. - model.sigma0 * vds * s / model.vsigma / ((1. + s) * (1. + s));
+        let dvgtvgs = 1. - vds * model.sigma0 / model.vsigma * rolloff_slope;
         let temp = derived.gchi0 * ns * model.theta;
         let dgchivgt = delgchins * (delnsvgte * delvgtevgt + delnsvgt) + temp;
         let dvgtevds = delvgtevgt * sigma;
