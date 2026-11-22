@@ -590,7 +590,7 @@ mod tests {
             "dm",
             &location,
             m,
-            i,
+            &i,
             InstanceInitial {
                 off: false,
                 values: vec![None],

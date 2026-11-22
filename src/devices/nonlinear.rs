@@ -400,7 +400,7 @@ struct DiodeInstanceParameters {
 impl DiodeInstanceParameters {
     fn kelvin(self, circuit_celsius: Real) -> Real {
         self.temperature
-            .unwrap_or(circuit_celsius + 273.15 + self.dtemp.unwrap_or(0.))
+            .unwrap_or_else(|| circuit_celsius + 273.15 + self.dtemp.unwrap_or(0.))
     }
 }
 
@@ -513,7 +513,7 @@ impl Diode {
             &card.name,
             &instance.location,
             m,
-            i,
+            &i,
             initial,
             context,
         )?;
@@ -543,11 +543,11 @@ impl DiodeInput {
         model: &str,
         location: &SourceLoc,
         m: ScalarValues,
-        i: ScalarValues,
+        i: &ScalarValues,
         initial: crate::devices::initial::InstanceInitial,
         context: &ModelContext,
     ) -> SpiceResult<Self> {
-        let parameters = DiodeParameters::new(&m, &i, location)?;
+        let parameters = DiodeParameters::new(&m, i, location)?;
         let thermal = parameters.thermal(context)?;
         thermal.point(0., context.gmin)?;
         Ok(Self {
@@ -639,7 +639,7 @@ impl UrcDiodeModel {
                 &self.name,
                 location,
                 self.values.clone(),
-                instance,
+                &instance,
                 initial,
                 context,
             )?
