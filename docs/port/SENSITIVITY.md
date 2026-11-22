@@ -39,9 +39,9 @@ compile. The port reproduces `sens_sens()`.
    `Y^-1 ((dI1 - dI0) - (dY1 - dY0) x)` at the output, divided by `delta`.
    DC loads are `DEVload` at the operating point, AC loads `DEVacLoad`.
 
-So a sensitivity is a first-order forward difference (relative error about
-`1e-6`), not an exact derivative.
-
+So a sensitivity is a first-order forward difference, not an exact
+derivative. Its truncation error depends on local curvature and its
+roundoff error on the conditioning of the finite-difference numerator.
 
 ### Numerical conformance resolution
 
@@ -626,13 +626,13 @@ difference in the solved response. The original golden is unchanged;
 `conformance/golden/linux-x86_64-gnu/sens_bjt.raw` is an independently captured
 C variant with build provenance in its README. Capture and drift checks still
 select the native file. Numerical comparisons require both captures, validate
-their complete schemas and point counts, and apply the unchanged 1 ppm +
-1e-9 tolerance to the closest endpoint of the observed per-column interval
-(or zero distance if the Rust value lies inside it). Identical captures reduce
-to the original single-reference test. No column is skipped; no global
-absolute or relative tolerance is increased. This is a measurement of C's
-cross-platform numerical uncertainty, not a claim that a value inside the
-interval is a physically accurate derivative.
+their complete schemas and point counts, and compare against the closest
+endpoint of the observed per-column interval (or zero distance inside it).
+Identical captures reduce to a single-reference test. The base 1 ppm + 1e-9
+target is supplemented by the output-resolution floor described above. No
+column is skipped. This is a measurement of C's cross-platform numerical
+uncertainty, not a claim that every value inside the interval is physically
+accurate.
 
 The improved thermal and ON-bias arithmetic (issue #90) places nine formerly
 platform-specific sensitivity residues inside the two independent C captures.
