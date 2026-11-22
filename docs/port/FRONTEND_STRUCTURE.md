@@ -221,7 +221,7 @@ Accessors: `Netlist::initial_conditions()`/`nodesets()` (entries, possibly
 unevaluated) and `ElaboratedNetlist::initial_conditions()`/`nodesets()`
 (`ResolvedNodeHint { node, value, location }`, finite). The `.tran` `uic` word is
 removed from `AnalysisCard::arguments` and stored in `uic`/`uic_location`
-(`AnalysisRequest::uic`); `Netlist::transient_uic()` finds it.
+(`AnalysisInput::uic`); `Netlist::transient_uic()` finds it.
 
 C (`inppas3.c`): accepts `V(name)` with an optional `=`; `I(..)`, `V(a,b)`, bare
 names and non-numeric values give `.ic syntax error` / a netlist error. C silently
@@ -234,7 +234,7 @@ without a circuit; the analysis layer rejects them with the entry's location (C 
 warns "IC on non-existent node ... ignored"). Bare parameter names are not
 references; use `{expr}`. The analysis half (landed): `RunConfig::from_netlist`
 evaluates the entries against `.param` (`elaborate::literalize_node_hints`) and
-attaches them, in deck order, to every `AnalysisRequest` as
+attaches them, in deck order, to every resolved `AnalysisPlan` as
 `initial_conditions`/`nodesets` (`NodeCondition { node, value, location }`); the
 last duplicate wins as in C. Semantics are in [TRANSIENT.md](TRANSIENT.md). AST dumps print
 `initial-conditions`/`nodesets` sections and the `uic @loc` line only when present, so existing snapshots are unchanged. Tests:
