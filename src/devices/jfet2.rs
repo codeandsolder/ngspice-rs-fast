@@ -73,10 +73,6 @@
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
 )]
 #![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
 )]
@@ -322,7 +318,7 @@ fn qgg(
     let vds = vgs - vgd;
     let d1_xc = 1. - xc;
     let vert = vds.mul_add(vds, alpha).sqrt();
-    let veff = gamma.mul_add(vds, 0.5 * (vgs + vgd + vert));
+    let veff = gamma.mul_add(vds, 0.5_f64.mul_add(vert, Real::midpoint(vgs, vgd)));
     let vnr = d1_xc * (veff - vto);
     let vnrt = vnr.mul_add(vnr, 0.04).sqrt();
     let vnew = 0.5f64.mul_add(vnrt - vnr, veff);
@@ -341,7 +337,7 @@ fn qgg(
         cgso_eff = 0.5 * cgso / qrt * (1. + xc + d1_xc * vnr / vnrt) * par;
     }
     let cpm = vds / vert;
-    let cplus = 0.5 * (1. + cpm);
+    let cplus = Real::midpoint(1., cpm);
     let cminus = cplus - cpm;
     let cgs = cgdo.mul_add(cminus + gamma, cgso_eff * (cplus + gamma));
     let cgd = cgdo.mul_add(cplus - gamma, cgso_eff * (cminus - gamma));

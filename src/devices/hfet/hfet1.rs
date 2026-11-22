@@ -42,20 +42,12 @@
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
 )]
 #![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
 )]
 #![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
-    clippy::imprecise_flops,
-    reason = "the original C floating-point algorithm and libm operation sequence must remain intact"
 )]
 
 use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step, prime_prime};
@@ -655,19 +647,16 @@ impl Hfet1 {
                 let unorm = rs.mul_add(iseff, v) / vteff + (rs * iseff / vteff).ln();
                 (first, vteff * Self::diode(unorm) / rs - iseff)
             } else {
-                (
-                    is1 * ((v / vt1).exp() - 1.),
-                    iseff * ((v / vteff).exp() - 1.),
-                )
+                (is1 * (v / vt1).exp_m1(), iseff * (v / vteff).exp_m1())
             };
             let iaprox = if iaprox1 * iaprox2 == 0. {
-                0.5 * (iaprox1 + iaprox2)
+                Real::midpoint(iaprox1, iaprox2)
             } else {
                 1. / (1. / iaprox1 + 1. / iaprox2)
             };
             let dvdi0 = rs + vt1 / (iaprox + is1) + vt2 / (iaprox + is2);
             let mut v0 = rs * iaprox;
-            v0 += vt2.mul_add((iaprox / is2 + 1.).ln(), vt1 * (iaprox / is1 + 1.).ln());
+            v0 += vt2.mul_add((iaprox / is2).ln_1p(), vt1 * (iaprox / is1).ln_1p());
             let il = (iaprox + (v - v0) / dvdi0).max(-is1) * 0.99999;
             let gl = 1. / (rs + vt1 / (il + is1) + vt2 / (il + is2));
             (il, gl)
@@ -751,7 +740,7 @@ impl Hfet1 {
         let delgchgchi = 1. / (a * a);
         let delgchins = derived.gchi0;
         let delnsnsm = ns / nsm / (1. + c);
-        let delvgtevgt = 0.5 * (1. + u / t);
+        let delvgtevgt = Real::midpoint(1., u / t);
         let delvsateisat = 1. / gch;
         let delisatisatm = isat / isatm / (1. + g);
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
@@ -949,7 +938,7 @@ impl Hfet1 {
         } else {
             let evgs = (vgs / vtn).exp();
             let ggs = csat * evgs / vtn + gmin;
-            (gmin.mul_add(vgs, csat * (evgs - 1.)), ggs)
+            (gmin.mul_add(vgs, csat * (vgs / vtn).exp_m1()), ggs)
         };
         Channel {
             cdrain: 0.,

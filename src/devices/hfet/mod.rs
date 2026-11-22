@@ -766,6 +766,82 @@ mod tests {
     }
 
     #[test]
+    fn carrier_density_derivative_agrees_with_independent_central_difference() {
+        let n0 = 1e15;
+        let thermal = 0.026;
+        let other_thermal = 0.04;
+        let density = |v: Real| {
+            let (first, slope) = soft_density(n0, v, thermal);
+            let second = n0 * (v / other_thermal).exp();
+            series_density(first, slope, second, other_thermal)
+        };
+        for voltage in [-1., -0.4, -0.1, 0., 0.1, 0.4, 1.] {
+            let (_, slope) = density(voltage);
+            let h = thermal * Real::EPSILON.cbrt();
+            let numerical = (density(voltage + h).0 - density(voltage - h).0) / (2. * h);
+            assert!((slope - numerical).abs() <= 2e-8 * slope.abs());
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in representative carrier-density value and derivative workload"]
+    fn carrier_density_numeric_workload() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const COUNT: u32 = 1_000_000;
+        #[expect(
+            clippy::suboptimal_flops,
+            reason = "benchmark retains the historical non-fused arithmetic as the comparison workload"
+        )]
+        fn old(voltage: Real) -> (Real, Real) {
+            let n0 = 1e15;
+            let thermal = 0.026;
+            let other_thermal = 0.04;
+            let b = (voltage / thermal).exp();
+            let nsn = 2. * n0 * (1. + 0.5 * b).ln();
+            let nsc = n0 * (voltage / other_thermal).exp();
+            let slope = n0 / thermal / (1. / b + 0.5);
+            let denominator = nsc + nsn;
+            (
+                nsn * nsc / denominator,
+                nsc * (nsc * slope + nsn * nsn / other_thermal) / denominator.powi(2),
+            )
+        }
+        let new = |voltage: Real| {
+            let (first, slope) = soft_density(1e15, voltage, 0.026);
+            let second = 1e15 * (voltage / 0.04).exp();
+            series_density(first, slope, second, 0.04)
+        };
+        // Identical repeating ordinary bias grid, independent of solver work.
+        // Validate both maps before timing; the analytic extreme cases above
+        // intentionally do not compare with inaccurate legacy values.
+        for i in 0..=1000_u32 {
+            let v = Real::from(i) / 1000. - 0.5;
+            let a = old(v);
+            let b = new(v);
+            for (reference, actual) in [(a.0, b.0), (a.1, b.1)] {
+                assert!((reference - actual).abs() <= 2e-7 * actual.abs());
+            }
+        }
+        let time = |label: &str, evaluate: &dyn Fn(Real) -> (Real, Real)| {
+            let start = Instant::now();
+            for i in 0..COUNT {
+                let v = Real::from(i % 1001) / 1000. - 0.5;
+                black_box(evaluate(black_box(v)));
+            }
+            println!(
+                "{label}: {COUNT} value/derivative pairs in {:?}",
+                start.elapsed()
+            );
+        };
+        for _ in 0..3 {
+            time("legacy density", &old);
+            time("conditioned density", &new);
+        }
+    }
+
+    #[test]
     fn borrowed_reset_stamps_match_owned_assembly_and_validate_before_mutation() {
         use crate::devices::linear::LinearSystem;
         use crate::devices::sensitivity::{ResetStamp, ResetStamps, StampAt, StampPart};

@@ -41,10 +41,6 @@
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
 )]
 #![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
 )]
@@ -500,7 +496,7 @@ impl Hfet2 {
         let delgchgchi = 1. / (a * a);
         let delgchins = derived.gchi0;
         let delnsnsm = ns / nsm / (1. + c);
-        let delvgtevgt = 0.5 * (1. + u / t);
+        let delvgtevgt = Real::midpoint(1., u / t);
         let delvsateisat = 1. / gch;
         let delisatisatm = isat / isatm / (1. + g);
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
@@ -613,12 +609,12 @@ impl Hfet2 {
         let earg = arg.exp();
         let expe = (vgs / vtn).exp();
         let ggs = (derived.ggrlw * earg).mul_add(1. - arg, derived.jslw * expe / vtn);
-        let mut cg = (derived.ggrlw * vgs).mul_add(earg, derived.jslw * (expe - 1.));
+        let mut cg = (derived.ggrlw * vgs).mul_add(earg, derived.jslw * (vgs / vtn).exp_m1());
         let arg = -vgd * model.del / vt;
         let earg = arg.exp();
         let expe = (vgd / vtn).exp();
         let ggd = (derived.ggrlw * earg).mul_add(1. - arg, derived.jslw * expe / vtn);
-        let cgd = (derived.ggrlw * vgd).mul_add(earg, derived.jslw * (expe - 1.));
+        let cgd = (derived.ggrlw * vgd).mul_add(earg, derived.jslw * (vgd / vtn).exp_m1());
         cg += cgd;
         let mut vds = vgs - vgd;
         let inverse = vds < 0.;

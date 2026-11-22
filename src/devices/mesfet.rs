@@ -65,10 +65,6 @@
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
 )]
-#![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
 
 use crate::devices::jfet::{
     self, BOLTZMANN, CHARGE, REFTEMP,
@@ -228,13 +224,13 @@ fn qggnew(
     let gate_difference_squared = gate_difference * gate_difference;
     let vcap_squared = vcap * vcap;
     let veroot = (gate_difference_squared + vcap_squared).sqrt();
-    let veff1 = 0.5 * (vgs + vgd + veroot);
+    let veff1 = 0.5_f64.mul_add(veroot, Real::midpoint(vgs, vgd));
     let veff2 = veff1 - veroot;
     let overdrive = veff1 - vto;
     let overdrive_squared = overdrive * overdrive;
     let delta_squared = DEL * DEL;
     let vnroot = (overdrive_squared + delta_squared).sqrt();
-    let mut vnew1 = 0.5 * (veff1 + vto + vnroot);
+    let mut vnew1 = 0.5_f64.mul_add(vnroot, Real::midpoint(veff1, vto));
     let vnew3 = vnew1;
     let ext = if vnew1 < VMAX {
         0.
@@ -244,9 +240,9 @@ fn qggnew(
     };
     let qroot = (1. - vnew1 / phib).sqrt();
     let qggval = cgs.mul_add(jfet::depletion_voltage(vnew1, qroot) + ext, cgd * veff2);
-    let par1 = 0.5 * (1. + (veff1 - vto) / vnroot);
+    let par1 = Real::midpoint(1., (veff1 - vto) / vnroot);
     let cfact = (vgs - vgd) / veroot;
-    let cplus = 0.5 * (1. + cfact);
+    let cplus = Real::midpoint(1., cfact);
     let cminus = cplus - cfact;
     (
         qggval,

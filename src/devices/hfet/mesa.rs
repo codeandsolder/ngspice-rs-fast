@@ -30,20 +30,12 @@
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
 )]
 #![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
 )]
 #![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
-    clippy::imprecise_flops,
-    reason = "the original C floating-point algorithm and libm operation sequence must remain intact"
 )]
 
 use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step, prime_prime};
@@ -538,7 +530,10 @@ impl Mesa {
         let earg = arg.exp();
         let ev = (v / vte).exp();
         let conductance = (derived.ggrwl * earg).mul_add(1. - arg, csat * ev / vte) + gmin;
-        let current = gmin.mul_add(v, (derived.ggrwl * v).mul_add(earg, csat * (ev - 1.)));
+        let current = gmin.mul_add(
+            v,
+            (derived.ggrwl * v).mul_add(earg, csat * (v / vte).exp_m1()),
+        );
         (current, conductance)
     }
 
@@ -651,7 +646,7 @@ impl Mesa {
         let c = vsate / 2.0f64.mul_add(vsate, -vdse);
         let c = c * c;
         let capgd = (2. / 3. * cgc).mul_add(1. - c, derived.cf);
-        let delvgtevgt = 0.5 * (1. + t / q);
+        let delvgtevgt = Real::midpoint(1., t / q);
         let delidvds0 = gch / h;
         let delidvds1 = if vds == 0. {
             0.
@@ -755,7 +750,7 @@ impl Mesa {
         let delgchgchi = 1. / (a * a);
         let delgchins = derived.gchi0;
         let delnsnsm = ns / nsm / (1. + c);
-        let delvgtevgt = 0.5 * (1. + u / t);
+        let delvgtevgt = Real::midpoint(1., u / t);
         let delvsateisat = 1. / gch;
         let delisatisatm = isat / isatm / (1. + g);
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
@@ -857,7 +852,7 @@ impl Mesa {
         } else {
             0.5 * ns * ns / (derived.vpo * model.nd * model.d * sqrt1 * q * q)
         };
-        let delvgtevgt = 0.5 * (1. + u / t);
+        let delvgtevgt = Real::midpoint(1., u / t);
         let delidvds0 = gch / h;
         let delidvds1 = if vds == 0. {
             0.
@@ -907,7 +902,7 @@ impl Mesa {
                 0.
             } else {
                 cdrain
-                    * ((1. + g).ln() / (m * m) - g * (vds / vsate).ln() / (m * (1. + g)))
+                    * (g.ln_1p() / (m * m) - g * (vds / vsate).ln() / (m * (1. + g)))
                     * model.alpha
                     * delvgtevgt
             };
