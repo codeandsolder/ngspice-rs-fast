@@ -268,7 +268,8 @@ impl SensitivityKernel for DiodeSensitivity<'_> {
     }
 
     fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
-        let (m, i) = &*self.diode.written;
+        let m = &self.diode.written_model;
+        let i = self.diode.parameters.instance;
         let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for keyword in MODEL_FIELDS {
             let value = written(m, port_name(keyword));
@@ -283,10 +284,15 @@ impl SensitivityKernel for DiodeSensitivity<'_> {
         let mut instance = SensitivityRecord::new(self.family(), ParameterScope::Instance);
         for keyword in INSTANCE_FIELDS {
             let value = match *keyword {
-                "ikf" | "ikr" | "ikp" => None,
                 "ic" => self.diode.initial.values.first().copied().flatten(),
-                "temp" => written(i, "temp").map(|t| t + CELSIUS_TO_KELVIN),
-                other => written(i, other),
+                "temp" => i.temperature,
+                "dtemp" => i.dtemp,
+                "area" => i.geometry_given[0].then_some(i.geometry.area),
+                "pj" => i.geometry_given[1].then_some(i.geometry.perimeter),
+                "m" => i.geometry_given[2].then_some(i.geometry.multiplier),
+                "w" => i.width,
+                "l" => i.length,
+                _ => None,
             };
             instance = instance.with(keyword, value.unwrap_or(0.), value.is_some())?;
         }
@@ -453,8 +459,11 @@ impl DiodeSensitivity<'_> {
                 perimeter: i.value("pj")?,
                 multiplier: i.value("m")?,
             },
+            geometry_given: ["area", "pj", "m"].map(|key| i.given(key)),
             temperature: Some(i.value("temp")?),
-            dtemp: 0.,
+            dtemp: None,
+            width: i.given("w").then(|| i.value("w")).transpose()?,
+            length: i.given("l").then(|| i.value("l")).transpose()?,
         };
         let parameters = DiodeParameters::from_defaulted_model(
             |key| m.value(record_key(key)),
@@ -482,7 +491,7 @@ impl DiodeSensitivity<'_> {
             derived: TemperatureCache::new(),
             initial: self.diode.initial.clone(),
             location: self.diode.location.clone(),
-            written: self.diode.written.clone(),
+            written_model: self.diode.written_model.clone(),
             lenient: true,
         })
     }
@@ -595,6 +604,27 @@ mod tests {
                 input.bind(nodes, [anode, NodeId::GROUND])
             })
             .unwrap()
+    }
+
+    #[test]
+    fn swept_instance_preserves_given_flags_without_mutating_original() {
+        let context = ModelContext::new(27., 27.);
+        let original = diode(&[("area", 2.)], &[], &context);
+        let swept = original
+            .with_instance_parameter("area", 3., &context)
+            .unwrap();
+        let swept = swept
+            .with_instance_parameter("dtemp", 0., &context)
+            .unwrap();
+        let (_, before) = original.sensitivity(&context).unwrap().records().unwrap();
+        let (_, after) = swept.sensitivity(&context).unwrap().records().unwrap();
+        assert!(!before.given("area"));
+        assert!(!before.given("dtemp"));
+        assert!(after.given("area"));
+        assert!(after.given("dtemp"));
+        assert_eq!(before.value("area").unwrap().to_bits(), 2_f64.to_bits());
+        assert_eq!(after.value("area").unwrap().to_bits(), 3_f64.to_bits());
+        assert_eq!(after.value("dtemp").unwrap().to_bits(), 0_f64.to_bits());
     }
 
     #[test]

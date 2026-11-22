@@ -324,15 +324,14 @@ pub struct Diode {
     initial: crate::devices::initial::InstanceInitial,
     /// The instance card, for diagnostics of swept replacements.
     location: SourceLoc,
-    /// The validated model and instance setters as written, for `.sens`
-    /// ([`sens`]), shared by swept and perturbed copies.
-    written: std::rc::Rc<(ScalarValues, ScalarValues)>,
+    /// The validated model setters as written, shared by swept and perturbed copies.
+    written_model: ScalarValues,
     /// A `.sens` stand-in: the load keeps C's nonfinite values (a knee
     /// current of zero divides by zero in `dioload.c`) instead of rejecting
     /// them, so the analysis can propagate C's NaN.
     lenient: bool,
 }
-/// DIOsetup's saved quantities. DIOtemp must not reconstruct these from
+/// `DIOsetup`'s saved quantities. `DIOtemp` must not reconstruct these from
 /// perturbed model or instance parameters: the original setup is still live.
 #[derive(Debug, Clone, Copy)]
 struct DiodeSetup {
@@ -390,18 +389,22 @@ impl DiodeGeometry {
 #[derive(Debug, Clone, Copy)]
 struct DiodeInstanceParameters {
     geometry: DiodeGeometry,
+    /// AREA, PJ and M given flags, in that order.
+    geometry_given: [bool; 3],
     temperature: Option<Real>,
-    dtemp: Real,
+    dtemp: Option<Real>,
+    width: Option<Real>,
+    length: Option<Real>,
 }
 
 impl DiodeInstanceParameters {
     fn kelvin(self, circuit_celsius: Real) -> Real {
         self.temperature
-            .unwrap_or(circuit_celsius + 273.15 + self.dtemp)
+            .unwrap_or(circuit_celsius + 273.15 + self.dtemp.unwrap_or(0.))
     }
 }
 
-fn default_eg(tlev: u8) -> Real {
+const fn default_eg(tlev: u8) -> Real {
     if tlev == 2 { 1.16 } else { 1.11 }
 }
 
@@ -415,7 +418,7 @@ struct DiodeModelParameters {
     ns: Real,
     /// NS given: the sidewall current has its own characteristic.
     ns_given: bool,
-    rs: Real,
+    rs: Option<Real>,
     trs1: Real,
     trs2: Real,
     tt: Real,
@@ -459,7 +462,7 @@ struct DiodeModelParameters {
     af: Real,
 }
 /// The nominal model, current instance settings and saved setup state are
-/// separate owners. DIOtemp derives a fresh thermal state from all three.
+/// separate owners. `DIOtemp` derives a fresh thermal state from all three.
 #[derive(Debug, Clone, Copy)]
 struct DiodeParameters {
     model: DiodeModelParameters,
@@ -531,7 +534,7 @@ struct DiodeInput {
     parameters: DiodeParameters,
     derived: TemperatureCache<Thermal>,
     initial: crate::devices::initial::InstanceInitial,
-    written: std::rc::Rc<(ScalarValues, ScalarValues)>,
+    written_model: ScalarValues,
 }
 
 impl DiodeInput {
@@ -554,14 +557,14 @@ impl DiodeInput {
             parameters,
             derived: TemperatureCache::from_value(TemperatureKey::context(context), thermal),
             initial,
-            written: std::rc::Rc::new((m, i)),
+            written_model: m,
         })
     }
 
     /// The caller owns the append-only topology transaction.
     fn bind(self, nodes: &mut NodeAppend<'_>, external: [NodeId; 2]) -> SpiceResult<Diode> {
         let mut terminals = external.to_vec();
-        let positive = if self.parameters.model.rs > 0. {
+        let positive = if self.parameters.model.rs.is_some_and(|rs| rs > 0.) {
             // diosetup.c: CKTmkVolt(ckt, &tmp, DIOname, "internal").
             let name = format!("{}#internal", self.name);
             if nodes.get(&name).is_some() {
@@ -583,7 +586,7 @@ impl DiodeInput {
             derived: self.derived,
             initial: self.initial,
             location: self.location,
-            written: self.written,
+            written_model: self.written_model,
             lenient: false,
         })
     }
@@ -657,17 +660,20 @@ impl DiodeParameters {
         );
         let instance = DiodeInstanceParameters {
             geometry,
+            geometry_given: ["area", "pj", "m"].map(|key| given(i, key).is_some()),
             temperature: given(i, "temp").map(|v| v + 273.15),
-            dtemp: given(i, "dtemp").unwrap_or(0.),
+            dtemp: given(i, "dtemp"),
+            width: None,
+            length: None,
         };
         let knees = ["ikf", "ikr", "ikp"].map(|key| given(m, key).unwrap_or(0.));
         let knee_given = knees.map(|k| k >= EPSMIN);
-        let setup = DiodeSetup::new(value(m, "rs")?, knees, geometry);
+        let setup = DiodeSetup::new(given(m, "rs").unwrap_or(0.), knees, geometry);
         let p = Self::from_defaulted_model(
             |key| match key {
                 "is" => Ok(value(m, key)?.max(EPSMIN)),
                 "nbv" => Ok(given(m, key).unwrap_or(n)),
-                "eg" => Ok(given(m, key).unwrap_or(default_eg(tlev))),
+                "eg" => Ok(given(m, key).unwrap_or_else(|| default_eg(tlev))),
                 _ => value(m, key),
             },
             |key| Ok(given(m, key)),
@@ -707,7 +713,7 @@ impl DiodeParameters {
                 n: read("n")?,
                 ns: read("ns")?,
                 ns_given: given("ns")?.is_some(),
-                rs: read("rs")?,
+                rs: given("rs")?,
                 trs1: read("trs")?,
                 trs2: read("trs2")?,
                 tt: read("tt")?,
@@ -811,7 +817,7 @@ impl DiodeParameters {
         let conductance = self.setup.conductance
             * self.instance.geometry.area
             * self.instance.geometry.multiplier;
-        if self.model.rs != 0. {
+        if self.model.rs.is_some_and(|rs| rs != 0.) {
             let factor = temperature_polynomial(self.model.trs1, self.model.trs2, dt);
             if factor <= 0. || factor.is_nan() {
                 return Err(SpiceError::Numerical {
@@ -828,6 +834,8 @@ impl DiodeParameters {
 
     /// `diotemp.c::DIOtempUpdate` at this run's instance temperature.
     fn thermal(&self, context: &ModelContext) -> SpiceResult<Thermal> {
+        let model = &self.model;
+        let geometry = self.instance.geometry;
         // diotemp.c::DIOtemp: TEMP (dioparam.c adds CONSTCtoK), else the
         // circuit temperature in Kelvin (CKTtemp) plus DTEMP, in C's order.
         let t = self.instance.kelvin(context.temperature);
@@ -844,19 +852,18 @@ impl DiodeParameters {
         let ln_ratio = (t / tn).ln();
         // diosetup.c/diotemp.c scale every instance quantity as
         // `value * AREA * M` (or `* PJ * M`), left to right.
-        let scale = |v: Real| v * self.instance.geometry.area * self.instance.geometry.multiplier;
-        let perimeter =
-            |v: Real| v * self.instance.geometry.perimeter * self.instance.geometry.multiplier;
+        let scale = |v: Real| v * geometry.area * geometry.multiplier;
+        let perimeter = |v: Real| v * geometry.perimeter * geometry.multiplier;
 
-        let factor = temperature_polynomial(self.model.tm1, self.model.tm2, dt);
-        let grading = self.model.grading * factor;
+        let factor = temperature_polynomial(model.tm1, model.tm2, dt);
+        let grading = model.grading * factor;
 
         // Band gap at T and TNOM: the fixed silicon law for TLEV 0/1, the
         // EG/GAP1/GAP2 law for TLEV 2.
-        let (egfet, egfet1) = if self.model.tlev == 2 {
+        let (egfet, egfet1) = if model.tlev == 2 {
             (
-                self.model.eg - self.model.gap1 * t * t / (t + self.model.gap2),
-                self.model.eg - self.model.gap1 * tn * tn / (tn + self.model.gap2),
+                model.eg - model.gap1 * t * t / (t + model.gap2),
+                model.eg - model.gap1 * tn * tn / (tn + model.gap2),
             )
         } else {
             (band_gap(t), band_gap(tn))
@@ -878,70 +885,61 @@ impl DiodeParameters {
         let saturation = |base: Real, n: Real, xti: Real, k: Real| {
             let vte = n * vt;
             let temperature_exponent = xti / n * ln_ratio;
-            let band_gap_exponent = if self.model.tlev == 2 {
+            let band_gap_exponent = if model.tlev == 2 {
                 k * egfet1 / (n * vtnom) - k * egfet / vte
             } else {
-                (t / tn - 1.) * k * self.model.eg / vte
+                (t / tn - 1.) * k * model.eg / vte
             };
             let exponent = band_gap_exponent + temperature_exponent;
             base * exponent.exp()
         };
-        let csat = saturation(scale(self.model.is), self.model.n, self.model.xti, 1.);
-        let csatsw = saturation(
-            perimeter(self.model.jsw.unwrap_or(0.)),
-            self.model.ns,
-            self.model.xti,
-            1.,
-        );
+        let csat = saturation(scale(model.is), model.n, model.xti, 1.);
+        let csatsw = saturation(perimeter(model.jsw.unwrap_or(0.)), model.ns, model.xti, 1.);
         let tunnel = |j: Option<Real>, s: &dyn Fn(Real) -> Real| {
-            j.map(|j| saturation(s(j), self.model.ntun, self.model.xtitun, self.model.keg))
+            j.map(|j| saturation(s(j), model.ntun, model.xtitun, model.keg))
         };
-        let breakdown = match self.model.bv {
+        let breakdown = match model.bv {
             Some(bv) => Some(breakdown_voltage(
                 {
-                    let temperature_shift = self.model.tcv * dt;
-                    if self.model.tlev == 0 {
+                    let temperature_shift = model.tcv * dt;
+                    if model.tlev == 0 {
                         bv - temperature_shift
                     } else {
                         bv * (1. - temperature_shift)
                     }
                 },
                 // Level 1: IBV scales with M only, not AREA.
-                self.instance.geometry.multiplier * self.model.ibv,
+                geometry.multiplier * model.ibv,
                 csat + csatsw,
                 vt,
-                self.model.nbv,
+                model.nbv,
             )?),
             None => None,
         };
         let conductance = self.series_conductance(dt)?;
         let thermal = Thermal {
             vt,
-            n: self.model.n,
-            ns: self.model.ns_given.then_some(self.model.ns),
-            nbv: self.model.nbv,
+            n: model.n,
+            ns: model.ns_given.then_some(model.ns),
+            nbv: model.nbv,
             csat,
-            csatsw: self.model.jsw.map(|_| csatsw),
+            csatsw: model.jsw.map(|_| csatsw),
             breakdown,
-            recombination: self.model.isr.map(|isr| {
-                (
-                    saturation(scale(isr), self.model.nr, self.model.xti, 1.),
-                    self.model.nr,
-                )
-            }),
-            tunnel: tunnel(self.model.jtun, &scale),
-            tunnel_sidewall: tunnel(self.model.jtunsw, &perimeter),
-            ntun: self.model.ntun,
-            ikf: self.model.knee_given[0].then_some(self.setup.knees[0]),
-            ikr: self.model.knee_given[1].then_some(self.setup.knees[1]),
-            ikp: self.model.knee_given[2].then_some(self.setup.knees[2]),
+            recombination: model
+                .isr
+                .map(|isr| (saturation(scale(isr), model.nr, model.xti, 1.), model.nr)),
+            tunnel: tunnel(model.jtun, &scale),
+            tunnel_sidewall: tunnel(model.jtunsw, &perimeter),
+            ntun: model.ntun,
+            ikf: model.knee_given[0].then_some(self.setup.knees[0]),
+            ikr: model.knee_given[1].then_some(self.setup.knees[1]),
+            ikp: model.knee_given[2].then_some(self.setup.knees[2]),
             cjo: bottom.capacitance,
             bottom: bottom.law,
             cjsw: sidewall.capacitance,
             sidewall: sidewall.law,
             // diotemp.c: tt must stay positive.
-            tt: self.model.tt
-                * temperature_polynomial(self.model.ttt1, self.model.ttt2, dt).max(1e-3),
+            tt: model.tt * temperature_polynomial(model.ttt1, model.ttt2, dt).max(1e-3),
             conductance,
         };
         thermal.validate()?;
@@ -1552,7 +1550,7 @@ impl Device for Diode {
             "pj" | "perim" => Some(p.instance.geometry.perimeter),
             "m" => Some(p.instance.geometry.multiplier),
             "temp" => Some(p.instance.kelvin(context.temperature) - 273.15),
-            "dtemp" => Some(p.instance.dtemp),
+            "dtemp" => Some(p.instance.dtemp.unwrap_or(0.)),
             _ => None,
         })
     }
@@ -1622,20 +1620,28 @@ impl Device for Diode {
         };
         match parameter {
             "ic" => {}
-            "w" | "l" => {
-                domain(value >= 0., "nonnegative")?; /* diotemp.c geometry is setup-only once area was resolved. */
+            "w" => {
+                domain(value >= 0., "nonnegative")?;
+                p.instance.width = Some(value);
+            }
+            "l" => {
+                domain(value >= 0., "nonnegative")?;
+                p.instance.length = Some(value);
             }
             "area" => {
                 domain(value > 0., "positive")?;
                 p.instance.geometry.area = value;
+                p.instance.geometry_given[0] = true;
             }
             "pj" => {
                 domain(value >= 0., "nonnegative")?;
                 p.instance.geometry.perimeter = value;
+                p.instance.geometry_given[1] = true;
             }
             "m" => {
                 domain(value > 0., "positive")?;
                 p.instance.geometry.multiplier = value;
+                p.instance.geometry_given[2] = true;
             }
             "temp" => {
                 domain(value + 273.15 > 0., "above absolute zero")?;
@@ -1652,7 +1658,7 @@ impl Device for Diode {
             }
             "dtemp" => {
                 domain(true, "finite")?;
-                p.instance.dtemp = value;
+                p.instance.dtemp = Some(value);
             }
             _ => {
                 return Err(SpiceError::circuit(format!(
@@ -1664,19 +1670,6 @@ impl Device for Diode {
         p.check(&self.location)?;
         let thermal = p.thermal(context)?;
         thermal.point(0., context.gmin)?;
-        let mut written = self.written.clone();
-        if let Some(setter) = INSTANCE
-            .parameters
-            .iter()
-            .find(|field| field.name == parameter)
-        {
-            std::rc::Rc::make_mut(&mut written).1.set(
-                setter.name,
-                value,
-                setter.unit,
-                self.location.clone(),
-            );
-        }
         Ok(Box::new(Self {
             name: self.name.clone(),
             model: self.model.clone(),
@@ -1686,7 +1679,7 @@ impl Device for Diode {
             derived: TemperatureCache::from_value(TemperatureKey::context(context), thermal),
             initial,
             location: self.location.clone(),
-            written,
+            written_model: self.written_model.clone(),
             lenient: false,
         }))
     }
@@ -1743,10 +1736,10 @@ impl Device for Diode {
         limiter.test_held(&context.states, &[(held, held + predicted_change)]);
         // dioload.c from here: the charge companion folds into gd and cd,
         // then cdeq = cd - gd vd and the stamps, in C's order.
-        let gspr = if self.junction[0] != self.terminals[0] {
-            thermal.conductance
-        } else {
+        let gspr = if self.junction[0] == self.terminals[0] {
             0.
+        } else {
+            thermal.conductance
         };
         let (mut gd, mut cd) = (p.junction.conductance, p.junction.current);
         let branch =
