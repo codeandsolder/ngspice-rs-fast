@@ -293,7 +293,7 @@ fn excessive_tokens_are_rejected_at_the_first_unadmitted_physical_coordinate() {
 #[test]
 fn default_policy_accepts_long_pwl_and_wide_flat_decks() {
     let mut text = "pwl\nv1 out 0 pwl(".to_owned();
-    for i in 0..8192 {
+    for i in 0..2048 {
         if i > 0 && i % 32 == 0 {
             text.push_str("\n+");
         }
@@ -304,6 +304,26 @@ fn default_policy_accepts_long_pwl_and_wide_flat_decks() {
         .parse_text(Path::new("pwl.cir"), &text, SourceLimits::default())
         .unwrap();
     assert_eq!(parsed.netlist.devices.len(), 2);
+    // The behavioral expression grammar permits a larger PWL than
+    // ordinary source-vector fields. Preserve both independently.
+    let mut behavioral = "wide behavioral PWL\nv1 in 0 1\nb1 o 0 v=pwl(v(in)".to_owned();
+    for i in 0..8192 {
+        write!(behavioral, ",{i},{i}").unwrap();
+    }
+    behavioral.push_str(")\n.end\n");
+    assert_eq!(
+        Parser::new()
+            .parse_text(
+                Path::new("behavioral.cir"),
+                &behavioral,
+                SourceLimits::default()
+            )
+            .unwrap()
+            .netlist
+            .devices
+            .len(),
+        2
+    );
     let mut text = "flat\n".to_owned();
     for i in 0..100_000 {
         writeln!(text, "r{i} n{i} 0 1k").unwrap();
@@ -315,32 +335,53 @@ fn default_policy_accepts_long_pwl_and_wide_flat_decks() {
     assert_eq!(parsed.netlist.devices.len(), 100_000);
 }
 
-#[test]
-#[ignore = "measure bounded lexical allocation and runtime in a separate process"]
-fn punctuation_budget_benchmark() {
-    let text = format!("title\n{}\n", ",".repeat(1_000_000));
+fn punctuation_benchmark(tokens: usize) {
+    let mut text = String::with_capacity(1_000_007);
+    text.push_str("title\n");
+    text.extend(std::iter::repeat_n(',', 1_000_000));
+    text.push('\n');
     let start = std::time::Instant::now();
     let error = Parser::new()
         .parse_text(
             Path::new("punctuation.cir"),
             &text,
             SourceLimits {
-                tokens: 8192,
+                tokens,
                 ..SourceLimits::default()
             },
         )
         .unwrap_err();
-    assert!(error.to_string().contains("token work"), "{error}");
+    assert_eq!(
+        error.to_string().contains("token work"),
+        tokens < 1_000_000,
+        "{error}"
+    );
     eprintln!(
-        "1,000,000 punctuation tokens; admitted 8192; elapsed={:?}",
+        "punctuation=1000000; token budget={tokens}; elapsed={:?}",
         start.elapsed()
     );
 }
 
 #[test]
+#[ignore = "measure bounded lexical allocation and runtime in a separate process"]
+fn punctuation_budget_benchmark() {
+    punctuation_benchmark(8192);
+}
+
+#[test]
+#[ignore = "measure fully admitted lexical allocation in a separate process"]
+fn punctuation_admitted_benchmark() {
+    punctuation_benchmark(1_000_000);
+}
+
+#[test]
 #[ignore = "measure bounded physical/card metadata allocation in a separate process"]
 fn line_budget_benchmark() {
-    let text = format!("title\n{}", ".op\n".repeat(1_000_000));
+    let mut text = String::with_capacity(4_000_006);
+    text.push_str("title\n");
+    for _ in 0..1_000_000 {
+        text.push_str(".op\n");
+    }
     let start = std::time::Instant::now();
     let error = Parser::new()
         .parse_text(

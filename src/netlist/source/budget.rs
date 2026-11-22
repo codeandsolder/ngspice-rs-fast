@@ -121,7 +121,16 @@ impl SourceBudget {
     }
 
     pub(crate) fn card(&mut self, location: &SourceLoc) -> SpiceResult<()> {
-        spend(&mut self.cards, 1, location, "card work")
+        self.cards = self.cards.checked_sub(1).ok_or_else(|| {
+            SpiceError::parse(
+                location.clone(),
+                format!(
+                    "source card work limit exceeded ({} cards, counting repeated includes)",
+                    self.limits.cards
+                ),
+            )
+        })?;
+        Ok(())
     }
 
     pub(crate) fn tokens(&mut self, count: usize, location: &SourceLoc) -> SpiceResult<()> {

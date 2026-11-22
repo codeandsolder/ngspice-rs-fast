@@ -63,9 +63,9 @@ or file parsing when the original physical input itself must be bounded.
 
 `cargo +nightly test --test source_parse_limits --test sources` covers exact and
 one-past limits, cached replay and lazy library boundaries, terminal lexical
-budget errors and positioned continuations, 8,192-point PWL and 100k-device flat
+budget errors and positioned continuations, 2,048-point independent-source PWL, 8,192-point behavioural PWL and 100k-device flat
 decks. Existing parser, writer, structure and snapshot tests establish semantic
 and provenance parity. The ignored benchmarks in source_parse_limits use one
-million punctuation tokens or one million tiny cards with an 8192-element budget;
+million punctuation tokens or one million tiny cards with an 8192-element budget, plus a fully admitted punctuation baseline;
 run each separately on the test executable with `--exact --ignored --nocapture`
 under time and DHAT to measure actual retained heap and time.
