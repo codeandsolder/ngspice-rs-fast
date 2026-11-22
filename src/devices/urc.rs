@@ -46,9 +46,9 @@
 //! - section `i` uses `r = prop*r1`, `c = prop*c1` and diode `area = prop`,
 //!   with `prop = p^(i-1)` accumulated by repeated multiplication as C does.
 //!
-//! The arithmetic follows C operation by operation (including `pow`/`log`
-//! rather than integer powers), so element values match ngspice bit for bit
-//! on the same platform `libm`.
+//! Section selection follows C; the normalization uses geometric sums
+//! evaluated with `exp_m1` near unity to preserve total element values
+//! even when the ratio differs from one by only a few ULPs.
 //!
 //! # Deliberate divergences
 //!
@@ -68,8 +68,6 @@
 //! `RSPERL` without `ISPERL` is accepted and has no effect, exactly as in C
 //! (it only parameterises the generated diode model).
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"

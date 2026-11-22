@@ -426,21 +426,47 @@ impl TransmissionLine {
                 self.name
             )));
         }
-        // Same operation order as traload.c.
-        let mut f1 = (target - t2) * (target - t3);
-        let mut f2 = (target - t1) * (target - t3);
-        let mut f3 = (target - t1) * (target - t2);
-        f1 /= t1 - t2;
-        f2 /= t2 - t1;
-        f2 /= t2 - t3;
-        f3 /= t2 - t3;
-        f1 /= t1 - t3;
-        f3 /= t1 - t3;
+        // Preserve exact accepted waves, including signed zeros. Form
+        // Lagrange weights from dimensionless ratios: products of tiny
+        // time differences can underflow before their denominators cancel.
+        if target == t1 {
+            return Ok(first.values);
+        }
+        if target == t2 {
+            return Ok(second.values);
+        }
+        if target == t3 {
+            return Ok(third.values);
+        }
+        let weights = [
+            ((target - t2) / (t1 - t2)) * ((target - t3) / (t1 - t3)),
+            ((target - t1) / (t2 - t1)) * ((target - t3) / (t2 - t3)),
+            ((target - t1) / (t3 - t1)) * ((target - t2) / (t3 - t2)),
+        ];
+        let distances = [t1, t2, t3].map(|t| (target - t).abs());
+        let anchor = if distances[0] <= distances[1] && distances[0] <= distances[2] {
+            0
+        } else if distances[1] <= distances[2] {
+            1
+        } else {
+            2
+        };
+        let values = [first.values, second.values, third.values];
         let result = std::array::from_fn(|component| {
-            let first = f1 * first.values[component];
-            let second = f2 * second.values[component];
-            let third = f3 * third.values[component];
-            first + second + third
+            let base = values[anchor][component];
+            let [a, b] = [(anchor + 1) % 3, (anchor + 2) % 3];
+            let da = values[a][component] - base;
+            let db = values[b][component] - base;
+            if da.is_finite() && db.is_finite() {
+                // The three basis functions sum to one. Anchoring at the
+                // nearest knot avoids introducing error on a constant wave.
+                weights[b].mul_add(db, weights[a].mul_add(da, base))
+            } else {
+                weights[2].mul_add(
+                    values[2][component],
+                    weights[1].mul_add(values[1][component], weights[0] * values[0][component]),
+                )
+            }
         });
         if result.iter().any(|v| !v.is_finite()) {
             return Err(SpiceError::Numerical {
@@ -805,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_interpolation_is_bitwise_identical_across_wrap_and_retry() {
+    fn indexed_interpolation_matches_scan_across_wrap_and_retry() {
         let line = line(0.25);
         let mut history = WaveformHistory::new(2);
         for tick in -8_i32..=125 {
@@ -829,13 +855,45 @@ mod tests {
             for trial in trials.into_iter().rev() {
                 let expected = scan_interpolate(&history, trial - line.td);
                 let got = line.delayed(&history, trial).unwrap();
-                assert_eq!(got.map(Real::to_bits), expected.map(Real::to_bits));
+                let target = trial - line.td;
+                let exact = (0..history.len()).find(|&i| history.time(i) == Some(target));
+                if let Some(i) = exact {
+                    let stored = [0, 1].map(|k| history.value(i, k).unwrap());
+                    assert_eq!(got.map(Real::to_bits), stored.map(Real::to_bits));
+                } else {
+                    for (actual, reference) in got.into_iter().zip(expected) {
+                        // The scan uses ordinary-sized times and smooth
+                        // unit-amplitude inputs, including extrapolation.
+                        assert!(
+                            (actual - reference).abs()
+                                <= 512. * Real::EPSILON * reference.abs().max(1.)
+                        );
+                    }
+                }
             }
             assert_eq!(history, old);
         }
         assert!(line.delayed(&WaveformHistory::new(2), 0.).is_err());
         let wrong = WaveformHistory::new(4);
         assert!(line.delayed(&wrong, 0.).is_err());
+    }
+
+    #[test]
+    fn interpolation_handles_tiny_time_intervals_and_exact_constant_waves() {
+        let line = line(0.);
+        let h = 1e-180;
+        let mut history = WaveformHistory::new(2);
+        for (time, value) in [(0., 0.), (h, 1.), (2. * h, 4.)] {
+            history
+                .apply(&WaveformUpdate {
+                    append: Some((time, vec![value, 7.])),
+                    ..WaveformUpdate::default()
+                })
+                .unwrap();
+        }
+        let result = line.delayed(&history, 1.5 * h).unwrap();
+        assert!((result[0] - 2.25).abs() <= 8. * Real::EPSILON);
+        assert_eq!(result[1].to_bits(), 7_f64.to_bits());
     }
 
     #[test]
