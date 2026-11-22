@@ -69,7 +69,7 @@ pub(super) struct Level9(Level3);
 
 impl MosLevel for Level9 {
     type Params = Params;
-    const LEVEL: u8 = 9;
+    const BACKEND: crate::devices::ModelBackend = crate::devices::ModelBackend::Mos9;
     const LABEL: &'static str = "MOS9";
     const DEVICE_TYPE: CDeviceType = CDeviceType::Mos9;
     const NOISE_FAMILY: Option<NoiseFamily> = Some(NoiseFamily::Mos9);

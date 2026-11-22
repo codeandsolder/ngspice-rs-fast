@@ -917,9 +917,11 @@ impl Bjt {
         model: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        if model.levels().selector != 1 || !(3..=4).contains(&i.nodes.len()) {
+        if model.levels().backend != crate::devices::ModelBackend::Bjt
+            || !(3..=4).contains(&i.nodes.len())
+        {
             return Err(SpiceError::Unsupported {
-                feature: "BJT backend requires level 1 and 3/4 terminals".into(),
+                feature: "BJT backend requires a Gummel-Poon model and 3/4 terminals".into(),
                 location: Some(i.location.clone()),
             });
         }

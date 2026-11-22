@@ -79,8 +79,8 @@ pub use passive::PassiveParameters;
 pub mod schema;
 pub mod sensitivity;
 pub use models::{
-    DEFAULT_GMIN, DiodeInstanceParameters, DiodeModelParameters, LevelSelection, ModelContext,
-    ModelFamily, ModelResolver, ResolvedModel,
+    DEFAULT_GMIN, DiodeInstanceParameters, DiodeModelParameters, LevelSelection, ModelBackend,
+    ModelContext, ModelFamily, ModelResolver, ResolvedModel,
 };
 pub mod ltra;
 pub mod registry;

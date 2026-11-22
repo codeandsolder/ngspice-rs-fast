@@ -615,8 +615,8 @@ pub(super) trait MosLevel:
 {
     /// The level's temperature-dependent channel parameters.
     type Params: std::fmt::Debug + Clone + Copy;
-    /// The model `level` selector this implementation serves.
-    const LEVEL: u8;
+    /// Concrete backend this implementation serves.
+    const BACKEND: crate::devices::ModelBackend;
     /// Diagnostic label, e.g. `MOS1`.
     const LABEL: &'static str;
     /// The C device type (`mos1`, `mos3`) for the setup/load order.
@@ -750,9 +750,8 @@ pub(super) trait MosLevel:
         SpiceError::not_yet_ported(
             format!("{} noise of {}", Self::LABEL, device.name),
             format!(
-                "src/spicelib/devices/mos{}/mos{}noi.c",
-                Self::LEVEL,
-                Self::LEVEL
+                "src/spicelib/devices/{label}/{label}noi.c",
+                label = Self::LABEL.to_ascii_lowercase()
             ),
         )
     }
@@ -802,9 +801,8 @@ pub(super) trait MosLevel:
         Err(SpiceError::not_yet_ported(
             format!("{} distortion of {}", Self::LABEL, device.name),
             format!(
-                "src/spicelib/devices/mos{}/mos{}dset.c",
-                Self::LEVEL,
-                Self::LEVEL
+                "src/spicelib/devices/{label}/{label}dset.c",
+                label = Self::LABEL.to_ascii_lowercase()
             ),
         ))
     }
@@ -949,11 +947,10 @@ impl<L: MosLevel> Mosfet<L> {
         resolved: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        if resolved.levels().selector != L::LEVEL || i.nodes.len() != 4 {
+        if resolved.levels().backend != L::BACKEND || i.nodes.len() != 4 {
             return Err(SpiceError::circuit(format!(
-                "{} needs level {} and four terminals",
-                L::LABEL,
-                L::LEVEL
+                "{} needs its model backend and four terminals",
+                L::LABEL
             )));
         }
         let (initial, setters) = crate::devices::initial::split(&i.parameters, &IC_COMPONENTS)?;

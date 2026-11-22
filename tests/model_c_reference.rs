@@ -1,4 +1,6 @@
-//! Opt-in C setup/model queries; no Rust device simulation is implied.
+//! Model selection and opt-in live C setup / selector-alias comparisons.
+use ngspice_conformance::ngspice::{Ngspice, Scratch, capture};
+use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::devices::{ModelContext, ModelResolver};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -137,3 +139,107 @@ fn scratch_nonce() -> u128 {
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Alias decks use the same model and device names and explicit numerical
+/// inputs; only the first level selector changes. Include both polarities.
+const ALIAS_CASES: &[(&str, &str, &[u8])] = &[
+    (
+        "npn",
+        "vc c 0 1.5\nvb b 0 0\nq1 c b 0 mdl\n.model mdl npn(is=1e-15 bf=100 vaf=50 level=LEVEL)\n.dc vb 0.5 0.8 0.05",
+        &[0, 1, 2],
+    ),
+    (
+        "pnp",
+        "vc c 0 -1.5\nvb b 0 0\nq1 c b 0 mdl\n.model mdl pnp(is=1e-15 bf=100 vaf=50 level=LEVEL)\n.dc vb -0.5 -0.8 -0.05",
+        &[0, 1, 2],
+    ),
+    (
+        "nmos",
+        "vd d 0 1.5\nvg g 0 0\nm1 d g 0 0 mdl l=1u w=5u\n.model mdl nmos(vto=0.5 kp=100u lambda=0.02 level=LEVEL)\n.dc vg 0 2 0.25",
+        &[0, 1],
+    ),
+    (
+        "pmos",
+        "vd d 0 -1.5\nvg g 0 0\nm1 d g 0 0 mdl l=1u w=5u\n.model mdl pmos(vto=-0.5 kp=100u lambda=0.02 level=LEVEL)\n.dc vg 0 -2 -0.25",
+        &[0, 1],
+    ),
+];
+
+fn alias_deck(body: &str, level: u8) -> String {
+    format!(
+        "model selector alias\n{}\n.options reltol=1e-8\n.end\n",
+        body.replace("LEVEL", &level.to_string())
+    )
+}
+
+fn simulate_alias(text: &str) -> Plot {
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("alias.cir"), text))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    config
+        .plan_for(&netlist.analyses[0])
+        .unwrap()
+        .run(&mut circuit, &config.context())
+        .unwrap()
+}
+
+#[test]
+fn selector_aliases_use_identical_rust_physics() {
+    for &(name, body, levels) in ALIAS_CASES {
+        let expected = simulate_alias(&alias_deck(body, 1));
+        assert!(expected.point_count() >= 7);
+        for &level in levels {
+            assert_eq!(
+                simulate_alias(&alias_deck(body, level)),
+                expected,
+                "{name} level {level}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN; C's model selector alias dispatch"]
+fn selector_aliases_match_pinned_c_dc_sweeps() {
+    let c = Ngspice::pinned().unwrap();
+    let scratch = Scratch::new("backend-aliases").unwrap();
+    for &(name, body, levels) in ALIAS_CASES {
+        for &level in levels {
+            let text = alias_deck(body, level);
+            let path = scratch.path().join(format!("{name}-{level}.cir"));
+            fs::write(&path, &text).unwrap();
+            let reference = capture(&c, &path, scratch.path(), &[]).unwrap();
+            let plots = RawFile::parse(&reference.rawfile).unwrap();
+            let reference = &plots.plots[0].plot;
+            let rust = simulate_alias(&text);
+            assert_eq!(
+                rust.point_count(),
+                reference.point_count(),
+                "{name} level {level}"
+            );
+            let mut compared = 0;
+            for variable in reference.variables() {
+                let signal = variable.name.as_str();
+                if !(signal.starts_with("v(") || signal.starts_with("i("))
+                    || signal.contains("-sweep")
+                {
+                    continue;
+                }
+                compared += 1;
+                for row in 0..reference.point_count() {
+                    let want = reference.value(signal, row).unwrap();
+                    let got = rust.value(signal, row).unwrap();
+                    for (a, b) in [(got.re, want.re), (got.im, want.im)] {
+                        assert!(
+                            (a - b).abs() <= 1e-6 * b.abs() + 1e-12,
+                            "{name} level {level} {signal}[{row}]: Rust {got:?}, C {want:?}"
+                        );
+                    }
+                }
+            }
+            assert!(compared >= 3, "{name} level {level}");
+        }
+    }
+}
