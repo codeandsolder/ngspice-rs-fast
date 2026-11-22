@@ -7,7 +7,9 @@
 //!
 //! Factorization returns an owned pivoted LU; public storage stays row-major.
 
-use crate::primitives::{Real, SpiceError, SpiceResult};
+use std::{alloc::Layout, ops::Range};
+
+use crate::primitives::{Real, SpiceError, SpiceResult, filled_vec};
 
 use crate::maths::linear::DenseLu;
 
@@ -25,11 +27,82 @@ fn length_error(expected: usize, actual: usize) -> SpiceError {
     }
 }
 
+/// Validated row-major dimensions for dense storage. Every in-range row
+/// offset fits because the entire element count and allocation layout fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DenseShape {
+    rows: usize,
+    cols: usize,
+}
+
+impl DenseShape {
+    pub(super) fn checked<T>(rows: usize, cols: usize, context: &str) -> SpiceResult<Self> {
+        let count = rows
+            .checked_mul(cols)
+            .ok_or_else(|| SpiceError::Numerical {
+                context: context.to_owned(),
+                message: format!("matrix dimensions {rows}x{cols} overflow"),
+            })?;
+        Layout::array::<T>(count).map_err(|_| SpiceError::Numerical {
+            context: context.to_owned(),
+            message: format!("matrix allocation layout {rows}x{cols} overflows"),
+        })?;
+        Ok(Self { rows, cols })
+    }
+
+    pub(super) const fn rows(self) -> usize {
+        self.rows
+    }
+
+    pub(super) const fn len(self) -> usize {
+        self.rows * self.cols
+    }
+
+    pub(super) const fn offset(self, row: usize, col: usize) -> Option<usize> {
+        if row < self.rows && col < self.cols {
+            Some(row * self.cols + col)
+        } else {
+            None
+        }
+    }
+
+    const fn row_range(self, row: usize) -> Option<Range<usize>> {
+        if row < self.rows {
+            Some(row * self.cols..(row + 1) * self.cols)
+        } else {
+            None
+        }
+    }
+
+    const fn transpose(self) -> Self {
+        Self {
+            rows: self.cols,
+            cols: self.rows,
+        }
+    }
+}
+
+/// Allocate once from an exact-size dense iterator (including snapshots).
+/// The iterator is consumed in its existing order.
+pub(super) fn collect_dense<T>(
+    values: impl ExactSizeIterator<Item = T>,
+    context: &str,
+) -> SpiceResult<Vec<T>> {
+    let count = values.len();
+    let mut data = Vec::new();
+    data.try_reserve_exact(count)
+        .map_err(|error| SpiceError::Numerical {
+            context: context.to_owned(),
+            message: format!("cannot allocate {count} entries: {error}"),
+        })?;
+    data.extend(values);
+    Ok(data)
+}
+
 /// A dense, row-major real matrix.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Matrix {
-    rows: usize,
-    cols: usize,
+    shape: DenseShape,
     data: Vec<Real>,
 }
 
@@ -38,29 +111,23 @@ impl Matrix {
     /// # Errors
     /// Dimensions overflow or storage cannot be allocated.
     pub fn zeros(rows: usize, cols: usize) -> SpiceResult<Self> {
-        let len = rows
-            .checked_mul(cols)
-            .ok_or_else(|| SpiceError::Numerical {
-                context: "dense matrix".to_owned(),
-                message: "matrix dimensions overflow".to_owned(),
-            })?;
+        let shape = DenseShape::checked::<Real>(rows, cols, "dense matrix")?;
         Ok(Self {
-            rows,
-            cols,
-            data: crate::primitives::filled_vec(len, 0.0, "dense matrix")?,
+            shape,
+            data: filled_vec(shape.len(), 0.0, "dense matrix")?,
         })
     }
 
     /// Number of rows.
     #[must_use]
     pub const fn rows(&self) -> usize {
-        self.rows
+        self.shape.rows
     }
 
     /// Number of columns.
     #[must_use]
     pub const fn cols(&self) -> usize {
-        self.cols
+        self.shape.cols
     }
 
     /// Total number of elements.
@@ -78,16 +145,13 @@ impl Matrix {
     /// True when the matrix is square.
     #[must_use]
     pub const fn is_square(&self) -> bool {
-        self.rows == self.cols
+        self.shape.rows == self.shape.cols
     }
 
     /// Reads an element, or `None` when out of range.
     #[must_use]
     pub fn get(&self, row: usize, col: usize) -> Option<Real> {
-        if row >= self.rows || col >= self.cols {
-            return None;
-        }
-        self.data.get(row * self.cols + col).copied()
+        self.shape.offset(row, col).map(|offset| self.data[offset])
     }
 
     /// Writes an element.
@@ -96,10 +160,11 @@ impl Matrix {
     ///
     /// [`SpiceError::Numerical`] when the index is out of range.
     pub fn set(&mut self, row: usize, col: usize, value: Real) -> SpiceResult<()> {
-        if row >= self.rows || col >= self.cols {
-            return Err(index_error(self.rows, self.cols, row, col));
-        }
-        self.data[row * self.cols + col] = value;
+        let offset = self
+            .shape
+            .offset(row, col)
+            .ok_or_else(|| index_error(self.shape.rows, self.shape.cols, row, col))?;
+        self.data[offset] = value;
         Ok(())
     }
 
@@ -109,20 +174,18 @@ impl Matrix {
     ///
     /// [`SpiceError::Numerical`] when the index is out of range.
     pub fn add_to(&mut self, row: usize, col: usize, value: Real) -> SpiceResult<()> {
-        if row >= self.rows || col >= self.cols {
-            return Err(index_error(self.rows, self.cols, row, col));
-        }
-        self.data[row * self.cols + col] += value;
+        let offset = self
+            .shape
+            .offset(row, col)
+            .ok_or_else(|| index_error(self.shape.rows, self.shape.cols, row, col))?;
+        self.data[offset] += value;
         Ok(())
     }
 
     /// One row, as a slice.
     #[must_use]
     pub fn row(&self, row: usize) -> Option<&[Real]> {
-        if row >= self.rows {
-            return None;
-        }
-        self.data.get(row * self.cols..(row + 1) * self.cols)
+        self.shape.row_range(row).map(|range| &self.data[range])
     }
 
     /// The elements, row-major.
@@ -150,10 +213,16 @@ impl Matrix {
     /// # Errors
     /// The transposed storage cannot be allocated.
     pub fn transpose(&self) -> SpiceResult<Self> {
-        let mut result = Self::zeros(self.cols, self.rows)?;
-        for row in 0..self.rows {
-            for col in 0..self.cols {
-                result.data[col * self.rows + row] = self.data[row * self.cols + col];
+        let mut result = Self {
+            shape: self.shape.transpose(),
+            data: filled_vec(self.len(), 0.0, "dense matrix transpose")?,
+        };
+        if self.is_empty() {
+            return Ok(result);
+        }
+        for row in 0..self.shape.rows {
+            for col in 0..self.shape.cols {
+                result.data[col * self.shape.rows + row] = self.data[row * self.shape.cols + col];
             }
         }
         Ok(result)
@@ -163,14 +232,18 @@ impl Matrix {
     ///
     /// # Errors
     ///
-    /// [`SpiceError::Numerical`] when the dimensions do not agree.
+    /// [`SpiceError::Numerical`] when the dimensions do not agree or output storage cannot be allocated.
     pub fn mul_vector(&self, vector: &Vector) -> SpiceResult<Vector> {
-        if vector.len() != self.cols {
-            return Err(length_error(self.cols, vector.len()));
+        if vector.len() != self.shape.cols {
+            return Err(length_error(self.shape.cols, vector.len()));
         }
-        let mut result = Vector::zeros(self.rows);
-        if self.cols != 0 {
-            for (row, output) in self.data.chunks_exact(self.cols).zip(result.as_mut_slice()) {
+        let mut result = Vector::from(filled_vec(self.shape.rows, 0.0, "dense matrix product")?);
+        if self.shape.cols != 0 {
+            for (row, output) in self
+                .data
+                .chunks_exact(self.shape.cols)
+                .zip(result.as_mut_slice())
+            {
                 let mut sum = 0.0;
                 for (entry, value) in row.iter().zip(vector.as_slice()) {
                     sum += entry * value;
@@ -208,22 +281,22 @@ impl Matrix {
     ///
     /// [`SpiceError::Numerical`] for an empty or non-square matrix, nonfinite
     /// entries, an asymmetric matrix (entries must agree exactly), or a
-    /// failed decomposition.
+    /// failed decomposition, or unavailable workspace storage.
     pub fn symmetric_eigenvalues(&self) -> SpiceResult<Vec<Real>> {
         let error = |message: String| SpiceError::Numerical {
             context: "dense symmetric eigenvalues".to_owned(),
             message,
         };
-        if self.rows != self.cols || self.rows == 0 {
+        if self.shape.rows != self.shape.cols || self.shape.rows == 0 {
             return Err(error(format!(
                 "needs a nonempty square matrix, got {}x{}",
-                self.rows, self.cols
+                self.shape.rows, self.shape.cols
             )));
         }
         if self.data.iter().any(|value| !value.is_finite()) {
             return Err(error("nonfinite entry".to_owned()));
         }
-        let n = self.rows;
+        let n = self.shape.rows;
         for row in 0..n {
             for col in 0..row {
                 if self.data[row * n + col].partial_cmp(&self.data[col * n + row])
@@ -235,7 +308,7 @@ impl Matrix {
                 }
             }
         }
-        let mut data = self.data.clone();
+        let mut data = collect_dense(self.data.iter().copied(), "dense symmetric eigenvalues")?;
         // Ordinary physical matrices keep their original arithmetic. At
         // extreme scales the sum of squared entries (or its epsilon-squared
         // threshold) can overflow or underflow, falsely reporting convergence.
@@ -247,7 +320,7 @@ impl Matrix {
                 *value /= scale;
             }
         }
-        let mut values = jacobi_eigenvalues(data, n)
+        let mut values = jacobi_eigenvalues(data, n)?
             .ok_or_else(|| error("Jacobi rotations did not converge".to_owned()))?;
         if let Some(scale) = scale {
             for value in &mut values {
@@ -276,7 +349,7 @@ pub(super) fn extreme_norm_scale(max: Real) -> Option<Real> {
 
 /// Cyclic Jacobi eigenvalues of the symmetric row-major `a` (n x n), sorted.
 /// `None` if the off-diagonal mass fails to vanish within the sweep budget.
-fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> Option<Vec<Real>> {
+fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<Vec<Real>>> {
     let off_diagonal_norm = |data: &[Real]| -> Real {
         let mut sum = 0.0;
         for row in 0..order {
@@ -293,11 +366,12 @@ fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> Option<Vec<Real>> {
     let total: Real = data.iter().map(|value| value * value).sum();
     for _sweep in 0..100 {
         if off_diagonal_norm(&data) <= Real::EPSILON * Real::EPSILON * total {
-            let mut values: Vec<Real> = (0..order)
-                .map(|index| data[index * order + index])
-                .collect();
-            values.sort_by(Real::total_cmp);
-            return Some(values);
+            let mut values = collect_dense(
+                (0..order).map(|index| data[index * order + index]),
+                "dense symmetric eigenvalues",
+            )?;
+            values.sort_unstable_by(Real::total_cmp);
+            return Ok(Some(values));
         }
         for first in 0..order {
             for second in first + 1..order {
@@ -332,7 +406,7 @@ fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> Option<Vec<Real>> {
             }
         }
     }
-    None
+    Ok(None)
 }
 
 // Round the products separately, preserving the original rotation arithmetic.
@@ -523,6 +597,19 @@ mod tests {
         let a = Matrix::zeros(3, 0).unwrap();
         assert_eq!(a.mul_vector(&Vector::zeros(0)).unwrap(), Vector::zeros(3));
         assert_eq!(a.transpose().unwrap(), Matrix::zeros(0, 3).unwrap());
+    }
+
+    #[test]
+    fn empty_extreme_shapes_do_not_allocate_or_iterate_over_rows() {
+        let tall = Matrix::zeros(usize::MAX, 0).unwrap();
+        assert_eq!(tall.row(usize::MAX - 1), Some(&[][..]));
+        assert!(tall.row(usize::MAX).is_none());
+        assert!(tall.mul_vector(&Vector::zeros(0)).is_err());
+        let wide = tall.transpose().unwrap();
+        assert_eq!(wide.rows(), 0);
+        assert_eq!(wide.cols(), usize::MAX);
+        assert_eq!(wide.transpose().unwrap(), tall);
+        assert!(wide.get(0, 0).is_none());
     }
 
     #[test]

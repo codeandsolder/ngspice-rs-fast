@@ -8,7 +8,8 @@
 //! `cinv_gj`) is adequate; the MNA solves stay with the SPARSE LU of
 //! [`crate::maths::complex`].
 
-use crate::primitives::{Complex, SpiceError, SpiceResult};
+use super::dense::{DenseShape, collect_dense};
+use crate::primitives::{Complex, SpiceError, SpiceResult, filled_vec};
 
 fn numerical(message: impl Into<String>) -> SpiceError {
     SpiceError::Numerical {
@@ -20,7 +21,7 @@ fn numerical(message: impl Into<String>) -> SpiceError {
 /// A dense, row-major, square complex matrix.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenseComplex {
-    n: usize,
+    shape: DenseShape,
     data: Vec<Complex>,
 }
 
@@ -29,12 +30,10 @@ impl DenseComplex {
     /// # Errors
     /// Dimensions overflow or storage cannot be allocated.
     pub fn zeros(n: usize) -> SpiceResult<Self> {
-        let len = n
-            .checked_mul(n)
-            .ok_or_else(|| numerical("matrix dimensions overflow"))?;
+        let shape = DenseShape::checked::<Complex>(n, n, "dense complex matrix")?;
         Ok(Self {
-            n,
-            data: crate::primitives::filled_vec(len, Complex::ZERO, "dense complex matrix")?,
+            shape,
+            data: filled_vec(shape.len(), Complex::ZERO, "dense complex matrix")?,
         })
     }
 
@@ -63,26 +62,26 @@ impl DenseComplex {
     /// The dimension `n`.
     #[must_use]
     pub const fn dim(&self) -> usize {
-        self.n
+        self.shape.rows()
     }
 
     /// The entry at `(row, col)`, or `None` out of range.
     #[must_use]
     pub fn get(&self, row: usize, col: usize) -> Option<Complex> {
-        (row < self.n && col < self.n).then(|| self.data[row * self.n + col])
+        self.shape.offset(row, col).map(|offset| self.data[offset])
     }
 
     /// Sets the entry at `(row, col)`.
     /// # Errors
     /// An index out of range.
     pub fn set(&mut self, row: usize, col: usize, value: Complex) -> SpiceResult<()> {
-        if row >= self.n || col >= self.n {
-            return Err(numerical(format!(
+        let offset = self.shape.offset(row, col).ok_or_else(|| {
+            numerical(format!(
                 "index ({row}, {col}) is out of range for a {0}x{0} matrix",
-                self.n
-            )));
-        }
-        self.data[row * self.n + col] = value;
+                self.dim()
+            ))
+        })?;
+        self.data[offset] = value;
         Ok(())
     }
 
@@ -93,12 +92,13 @@ impl DenseComplex {
     }
 
     fn same_dimension(&self, other: &Self) -> SpiceResult<()> {
-        if self.n == other.n {
+        if self.shape == other.shape {
             Ok(())
         } else {
             Err(numerical(format!(
                 "dimension mismatch {0}x{0} against {1}x{1}",
-                self.n, other.n
+                self.dim(),
+                other.dim()
             )))
         }
     }
@@ -113,41 +113,37 @@ impl DenseComplex {
 
     /// `self + other` (`csum`).
     /// # Errors
-    /// Mismatched dimensions or a non-finite result.
+    /// Mismatched dimensions, a non-finite result, or unavailable storage.
     pub fn add(&self, other: &Self) -> SpiceResult<Self> {
         self.same_dimension(other)?;
         Self {
-            n: self.n,
-            data: self
-                .data
-                .iter()
-                .zip(&other.data)
-                .map(|(a, b)| *a + *b)
-                .collect(),
+            shape: self.shape,
+            data: collect_dense(
+                self.data.iter().zip(&other.data).map(|(a, b)| *a + *b),
+                "dense complex matrix",
+            )?,
         }
         .checked()
     }
 
     /// `self - other` (`cminus`).
     /// # Errors
-    /// Mismatched dimensions or a non-finite result.
+    /// Mismatched dimensions, a non-finite result, or unavailable storage.
     pub fn sub(&self, other: &Self) -> SpiceResult<Self> {
         self.same_dimension(other)?;
         Self {
-            n: self.n,
-            data: self
-                .data
-                .iter()
-                .zip(&other.data)
-                .map(|(a, b)| *a - *b)
-                .collect(),
+            shape: self.shape,
+            data: collect_dense(
+                self.data.iter().zip(&other.data).map(|(a, b)| *a - *b),
+                "dense complex matrix",
+            )?,
         }
         .checked()
     }
 
     /// `self * other` (`cmultiply`).
     /// # Errors
-    /// Mismatched dimensions or a non-finite result.
+    /// Mismatched dimensions, a non-finite result, or unavailable storage.
     pub fn mul(&self, other: &Self) -> SpiceResult<Self> {
         self.same_dimension(other)?;
         // Skipping a zero multiplier is valid only for finite operands:
@@ -155,8 +151,15 @@ impl DenseComplex {
         if self.data.iter().chain(&other.data).any(|v| !v.is_finite()) {
             return Err(numerical("non-finite entry"));
         }
-        let n = self.n;
-        let mut out = Self::zeros(n)?;
+        let n = self.dim();
+        let mut out = Self {
+            shape: self.shape,
+            data: filled_vec(
+                self.shape.len(),
+                Complex::ZERO,
+                "dense complex matrix product",
+            )?,
+        };
         if n != 0 {
             for (a_row, out_row) in self.data.chunks_exact(n).zip(out.data.chunks_exact_mut(n)) {
                 for (&a, b_row) in a_row.iter().zip(other.data.chunks_exact(n)) {
@@ -180,13 +183,13 @@ impl DenseComplex {
     /// mathematically singular matrix give it huge, rounding-dependent
     /// entries instead.
     /// # Errors
-    /// A non-finite entry or result.
+    /// A non-finite entry or result, or unavailable workspace storage.
     pub fn inverse(&self) -> SpiceResult<Option<Self>> {
-        let n = self.n;
+        let n = self.dim();
         if self.data.iter().any(|value| !value.is_finite()) {
             return Err(numerical("non-finite entry"));
         }
-        let mut a = self.data.clone();
+        let mut a = collect_dense(self.data.iter().copied(), "dense complex inverse workspace")?;
         let max_component = a
             .iter()
             .fold(0.0_f64, |m, v| m.max(v.re.abs()).max(v.im.abs()));
@@ -258,7 +261,12 @@ impl DenseComplex {
                 value.im /= scale;
             }
         }
-        Self { n, data: b }.checked().map(Some)
+        Self {
+            shape: self.shape,
+            data: b,
+        }
+        .checked()
+        .map(Some)
     }
 }
 

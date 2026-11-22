@@ -11,7 +11,7 @@
 //!   space.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::primitives::{SpiceError, SpiceResult};
@@ -36,6 +36,16 @@ impl NodeId {
     #[must_use]
     pub const fn new(index: u32) -> Self {
         Self(index)
+    }
+
+    /// Convert an index without truncating the compact identity.
+    ///
+    /// # Errors
+    /// An index outside the representable node identity range.
+    pub fn from_index(index: usize) -> SpiceResult<Self> {
+        u32::try_from(index)
+            .map(Self)
+            .map_err(|_| SpiceError::circuit("node table exceeds compact identity range"))
     }
 
     /// The raw index, for use as a row/column in the MNA matrix.
@@ -92,7 +102,8 @@ pub struct Node {
 #[derive(Debug, Clone)]
 pub struct NodeTable {
     nodes: Vec<Node>,
-    index: BTreeMap<String, NodeId>,
+    // Only lookup/removal use this index; the Vec determines all node order.
+    index: HashMap<String, NodeId>,
     auto_gnd: bool,
 }
 
@@ -114,7 +125,7 @@ impl NodeTable {
             name: GROUND_NAME.to_owned(),
             kind: NodeKind::Ground,
         };
-        let mut index = BTreeMap::new();
+        let mut index = HashMap::new();
         index.insert(GROUND_NAME.to_owned(), NodeId::GROUND);
         Self {
             nodes: vec![ground],
@@ -136,24 +147,54 @@ impl NodeTable {
         Self::canonical(name, auto_gnd).into_owned()
     }
 
-    fn canonical(name: &str, auto_gnd: bool) -> Cow<'_, str> {
+    fn canonical_borrowed(name: &str, auto_gnd: bool) -> Option<&str> {
         if auto_gnd && name.eq_ignore_ascii_case(GROUND_ALIAS) {
-            Cow::Borrowed(GROUND_NAME)
+            Some(GROUND_NAME)
         } else if name
             .bytes()
             .all(|b| b.is_ascii() && !b.is_ascii_uppercase())
         {
-            Cow::Borrowed(name)
+            Some(name)
         } else {
-            // Unicode lowercase includes contextual mappings (e.g. final
-            // sigma), so do not substitute per-character ASCII folding.
-            let lowered = name.to_lowercase();
-            if auto_gnd && lowered == GROUND_ALIAS {
-                Cow::Borrowed(GROUND_NAME)
-            } else {
-                Cow::Owned(lowered)
-            }
+            None
         }
+    }
+
+    fn canonical(name: &str, auto_gnd: bool) -> Cow<'_, str> {
+        if let Some(name) = Self::canonical_borrowed(name, auto_gnd) {
+            return Cow::Borrowed(name);
+        }
+        // Unicode lowercase includes contextual mappings (e.g. final
+        // sigma), so do not substitute per-character ASCII folding.
+        let lowered = name.to_lowercase();
+        if auto_gnd && lowered == GROUND_ALIAS {
+            Cow::Borrowed(GROUND_NAME)
+        } else {
+            Cow::Owned(lowered)
+        }
+    }
+
+    fn try_copy_name(name: &str) -> SpiceResult<String> {
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(name.len())
+            .map_err(|error| SpiceError::circuit(format!("cannot allocate node name: {error}")))?;
+        owned.push_str(name);
+        Ok(owned)
+    }
+
+    fn canonical_for_intern(name: &str, auto_gnd: bool) -> SpiceResult<Cow<'_, str>> {
+        if let Some(name) = Self::canonical_borrowed(name, auto_gnd) {
+            return Ok(Cow::Borrowed(name));
+        }
+        if name.is_ascii() {
+            let mut owned = Self::try_copy_name(name)?;
+            owned.make_ascii_lowercase();
+            return Ok(Cow::Owned(owned));
+        }
+        // The standard library's contextual Unicode lowercase conversion
+        // has no fallible variant. Preserve its exact spelling semantics.
+        Ok(Self::canonical(name, auto_gnd))
     }
 
     /// Returns the id of `name`, creating the node if needed.
@@ -162,31 +203,34 @@ impl NodeTable {
     /// [`NodeTable::set_kind`] to mark simulator-internal nodes.
     ///
     /// # Errors
-    /// The compact node identity space or node storage is exhausted.
+    /// The compact node identity space or node storage is exhausted. On error,
+    /// existing identities and the name index are unchanged. Context-sensitive
+    /// Unicode normalization uses the standard library's infallible allocation.
     pub fn intern(&mut self, name: &str) -> SpiceResult<NodeId> {
-        let canonical = Self::canonical(name, self.auto_gnd);
+        let canonical = Self::canonical_for_intern(name, self.auto_gnd)?;
         if let Some(id) = self.index.get(canonical.as_ref()) {
             return Ok(*id);
         }
-        let canonical = canonical.into_owned();
-        let id = NodeId::new(
-            u32::try_from(self.nodes.len())
-                .map_err(|_| SpiceError::circuit("node table exceeds compact identity range"))?,
-        );
+        let id = NodeId::from_index(self.nodes.len())?;
+        // Reserve both containers and prepare both names before changing
+        // either the ordered nodes or their lookup index.
         self.nodes
             .try_reserve(1)
             .map_err(|error| SpiceError::circuit(format!("cannot allocate node: {error}")))?;
-        let kind = if canonical == GROUND_NAME {
-            NodeKind::Ground
-        } else {
-            NodeKind::Terminal
+        self.index
+            .try_reserve(1)
+            .map_err(|error| SpiceError::circuit(format!("cannot allocate node index: {error}")))?;
+        let node_name = Self::try_copy_name(canonical.as_ref())?;
+        let key = match canonical {
+            Cow::Borrowed(name) => Self::try_copy_name(name)?,
+            Cow::Owned(name) => name,
         };
         self.nodes.push(Node {
             id,
-            name: canonical.clone(),
-            kind,
+            name: node_name,
+            kind: NodeKind::Terminal,
         });
-        self.index.insert(canonical, id);
+        self.index.insert(key, id);
         Ok(id)
     }
 
@@ -314,6 +358,32 @@ mod tests {
         assert_eq!(ids[0], existing);
         assert_eq!(ids[1], ids[2]);
         assert_eq!(table.len(), 3);
+    }
+
+    #[test]
+    fn compact_identity_boundary_never_truncates() {
+        let max = NodeId::new(u32::MAX).index();
+        assert_eq!(NodeId::from_index(max).unwrap(), NodeId::new(u32::MAX));
+        if let Some(overflow) = max.checked_add(1) {
+            assert!(NodeId::from_index(overflow).is_err());
+        }
+    }
+
+    #[test]
+    fn rollback_removes_index_entries_and_reuses_dense_ids() {
+        let mut table = NodeTable::new();
+        let retained = table.intern("Keep").unwrap();
+        let mark = table.len();
+        let removed = table.intern("Remove").unwrap();
+        table.intern("ΟΣ").unwrap();
+        table.truncate(mark);
+        assert_eq!(table.get("keep"), Some(retained));
+        assert!(table.get("REMOVE").is_none());
+        assert!(table.get("ος").is_none());
+        assert!(table.node(removed).is_none());
+        assert_eq!(table.intern("Replacement").unwrap(), removed);
+        assert_eq!(table.intern("REPLACEMENT").unwrap(), removed);
+        assert_eq!(table.intern("GND").unwrap(), NodeId::GROUND);
     }
 
     #[test]
