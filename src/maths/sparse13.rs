@@ -206,6 +206,8 @@ pub(super) enum Status {
     NonFinite,
     /// A traversal plan cannot be derived from the ordered topology.
     InvalidPlan,
+    /// Coefficients must be reloaded before another factorization.
+    NeedsReload,
     /// A required factor allocation exceeds storage capacity.
     Resource,
 }
@@ -1039,6 +1041,7 @@ enum Diagnostic {
     Singular(usize, usize),
     NonFinite,
     InvalidPlan,
+    NeedsReload,
     Resource,
 }
 
@@ -1051,6 +1054,7 @@ impl Diagnostic {
             Self::Singular(..) => Status::Singular,
             Self::NonFinite => Status::NonFinite,
             Self::InvalidPlan => Status::InvalidPlan,
+            Self::NeedsReload => Status::NeedsReload,
             Self::Resource => Status::Resource,
         }
     }
@@ -1247,7 +1251,7 @@ impl<T: Scalar> Sparse<T> {
     where
         T: std::ops::Add<Output = T>,
     {
-        self.reset_numeric_status();
+        self.note_numeric_write();
         let v = &mut self.values[element.0];
         *v = *v + value;
     }
@@ -1289,10 +1293,10 @@ impl<T: Scalar> Sparse<T> {
         self.reserve_element_storage()?;
         let topology = std::sync::Arc::make_mut(&mut self.topology);
         let e = topology.create_element(row, col, last, self.lifecycle.rows_linked());
-        self.lifecycle.invalidate_structure(!fillin);
         if !fillin {
-            self.diagnostic = Diagnostic::Okay;
+            self.note_numeric_write();
         }
+        self.lifecycle.invalidate_structure(!fillin);
         self.values.push(T::ZERO);
         Ok(e)
     }
@@ -1322,6 +1326,20 @@ impl<T: Scalar> Sparse<T> {
     fn reset_numeric_status(&mut self) {
         self.lifecycle.invalidate_numeric();
         self.diagnostic = Diagnostic::Okay;
+    }
+
+    /// A write into existing LU storage revokes its factor view but does
+    /// not restore the original coefficients. Likewise, stamping into a
+    /// failed partial LU cannot repair it; clear/reload must happen first.
+    fn note_numeric_write(&mut self) {
+        if self.is_factored() {
+            self.lifecycle.invalidate_numeric();
+            self.diagnostic = Diagnostic::NeedsReload;
+        }
+    }
+
+    const fn coefficients_loaded(&self) -> bool {
+        !self.is_factored() && matches!(self.diagnostic, Diagnostic::Okay)
     }
 
     /// Build a fresh frame from unique, already assembled original
@@ -1504,7 +1522,7 @@ impl<T: Scalar> Sparse<T> {
         if gmin == 0.0 {
             return;
         }
-        self.reset_numeric_status();
+        self.note_numeric_write();
         for i in (1..=self.size).rev() {
             let diag = self.topology.diag[i];
             if diag != NONE {
@@ -1533,7 +1551,7 @@ impl<T: Scalar> Sparse<T> {
 
     /// Overwrites one element's value (`*element = value`).
     pub(super) fn set(&mut self, element: SolverElement, value: T) {
-        self.reset_numeric_status();
+        self.note_numeric_write();
         self.values[element.0] = value;
     }
 
@@ -1586,7 +1604,7 @@ impl<T: Scalar> Sparse<T> {
         if col == NONE {
             return Ok(());
         }
-        self.reset_numeric_status();
+        self.note_numeric_write();
         let mut e = self.topology.first_in_col[col];
         while e != NONE {
             self.values[e] = T::ZERO;
@@ -1685,6 +1703,9 @@ impl<T: Scalar> Sparse<T> {
 
     /// `spOrderAndFactor(Matrix, NULL, rel, abs, DiagPivoting = YES)`.
     pub(crate) fn order_and_factor(&mut self, rel_threshold: f64, abs_threshold: f64) -> Status {
+        if !self.coefficients_loaded() {
+            return Status::NeedsReload;
+        }
         let mut scratch = std::mem::take(&mut self.ordering_scratch);
         let status = self.order_with_scratch(rel_threshold, abs_threshold, &mut scratch);
         self.ordering_scratch = scratch;
@@ -1697,7 +1718,6 @@ impl<T: Scalar> Sparse<T> {
         abs_threshold: f64,
         scratch: &mut Markowitz,
     ) -> Status {
-        self.reset_numeric_status();
         if !self.values_are_finite() {
             return self.nonfinite_factor();
         }
@@ -1904,7 +1924,9 @@ impl<T: Scalar> Sparse<T> {
         // C retains a partial order after a singular reordering. If
         // topology changed, no complete numeric traversal is available;
         // retry the threshold path, preserving C's existing pivot prefix.
-        self.reset_numeric_status();
+        if !self.coefficients_loaded() {
+            return Status::NeedsReload;
+        }
         let Lifecycle::Symbolic(plan) = &self.lifecycle else {
             return self.order_and_factor(0.0, 0.0);
         };
@@ -2767,6 +2789,10 @@ mod tests {
         assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
         assert!(matches!(m.lifecycle, Lifecycle::Factored(_)));
         let plan = m.lifecycle.plan().unwrap().clone();
+        let initial = m.solve(&[4., 6.]);
+        assert_eq!(m.factor(), Status::NeedsReload);
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::NeedsReload);
+        assert_eq!(m.solve(&[4., 6.]), initial);
         let handle = m.get_element(1, 1).unwrap();
         assert!(m.factors().is_ok(), "existing-handle lookup is read-only");
         let edits: [fn(&mut Sparse<f64>, SolverElement); 6] = [
@@ -2783,6 +2809,10 @@ mod tests {
             let expected = saved.solve(&rhs);
             edit(&mut m, handle);
             assert!(m.factors().is_err());
+            if !m.coefficients_loaded() {
+                assert_eq!(m.factor(), Status::NeedsReload);
+                assert_eq!(m.order_and_factor(1e-3, 0.), Status::NeedsReload);
+            }
             assert!(matches!(m.lifecycle, Lifecycle::Symbolic(_)));
             assert!(std::sync::Arc::ptr_eq(m.lifecycle.plan().unwrap(), &plan));
             assert_eq!(saved.solve(&rhs), expected);
@@ -2850,11 +2880,13 @@ mod tests {
         let plan = m.lifecycle.plan().unwrap().clone();
         m.reload_originals(&[0., 3.]);
         assert_eq!(m.factor(), Status::ZeroDiag);
+        assert_eq!(m.factor(), Status::NeedsReload);
         assert!(matches!(m.lifecycle, Lifecycle::Symbolic(_)));
         assert!(m.factors().is_err());
         assert_ne!(m.where_singular(), (0, 0));
         m.reload_originals(&[f64::NAN, 3.]);
         assert_eq!(m.factor(), Status::NonFinite);
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::NeedsReload);
         assert!(matches!(m.lifecycle, Lifecycle::ReorderRequired(_)));
         assert!(m.factors().is_err());
         assert_eq!(m.where_singular(), (0, 0));
@@ -3418,7 +3450,7 @@ mod tests {
         // C places the current step's product at size+1. A singleton at
         // step must be returned from that sentinel before scanning other
         // positions. Otherwise the scan proceeds from the highest index.
-        let mut m = build(4, &[(1, 1, 5.), (2, 2, 2.), (3, 3, 3.), (4, 4, 4.)]);
+        let m = build(4, &[(1, 1, 5.), (2, 2, 2.), (3, 3, 3.), (4, 4, 4.)]);
         let mut scratch = Markowitz::default();
         scratch.ensure_size(m.size).unwrap();
         for i in 1..=4 {

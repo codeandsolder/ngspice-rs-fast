@@ -182,6 +182,10 @@ pub(in crate::maths) fn check_status<T: Scalar>(
             context,
             "sparse factor storage capacity exceeded",
         )),
+        Status::NeedsReload => Err(numerical(
+            context,
+            "matrix coefficients must be reloaded before factorization",
+        )),
         Status::InvalidPlan => Err(numerical(
             context,
             "ordered sparse topology lacks a valid traversal plan",

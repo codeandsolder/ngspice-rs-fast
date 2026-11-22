@@ -536,6 +536,10 @@ impl<'a> LoadedPencil<'a> {
                 "pole-zero search",
                 "sparse factor storage capacity exceeded",
             )),
+            Status::NeedsReload => Err(numerical(
+                "pole-zero search",
+                "matrix coefficients must be reloaded before factorization",
+            )),
             Status::InvalidPlan => Err(numerical(
                 "pole-zero search",
                 "ordered sparse topology lacks a valid traversal plan",

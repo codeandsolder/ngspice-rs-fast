@@ -87,7 +87,10 @@ refactor preserves the complete symbolic order for reload/retry.
 Reload, clear, scalar conversion and any coefficient mutation invalidate
 numeric factors; adding an original structural entry requires a new
 ordering. Obtaining an existing element handle alone does not invalidate
-factors. Immutable factor views borrow the topology and numeric values,
+factors. A second factorization of existing LU or a failed partial LU is
+refused until coefficients are cleared or reloaded; editing factor storage
+alone does not reconstruct the original assembly. Immutable factor views
+borrow the topology and numeric values,
 so only a valid factor view can solve, transpose-solve or compute the
 determinant. Singular, zero-diagonal and small-pivot diagnostics carry
 their respective external coordinates; nonfinite/resource failures
