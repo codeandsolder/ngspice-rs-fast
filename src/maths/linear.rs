@@ -32,6 +32,70 @@ use crate::maths::sparse13::{Scalar, Sparse, Status};
 use crate::maths::{FactorStorage, FactorWork, Matrix, Pattern, PatternWork, SparseMatrix, Vector};
 use crate::primitives::{Complex, SpiceError, SpiceResult};
 
+/// Number of independent right-hand sides in a sparse solve tile.
+pub const RHS_BATCH_WIDTH: usize = 4;
+
+/// Reusable, scalar-typed sparse multiple-RHS solve scratch.
+///
+/// Internal storage is tiled by matrix row, with one lane per RHS.
+/// Regardless of the total RHS count, scratch holds only one tile.
+#[derive(Debug)]
+pub struct SolveBatchWorkspace<T> {
+    pub(super) real: Vec<std::simd::f64x4>,
+    pub(super) imag: Vec<std::simd::f64x4>,
+    pub(super) scalar: Vec<T>,
+}
+
+impl<T> Default for SolveBatchWorkspace<T> {
+    fn default() -> Self {
+        Self {
+            real: Vec::new(),
+            imag: Vec::new(),
+            scalar: Vec::new(),
+        }
+    }
+}
+
+/// A batched solve failure, retaining the first affected RHS for callers
+/// that attach independent circuit excitation or parameter identities.
+#[derive(Debug)]
+pub struct BatchSolveFailure {
+    /// Zero-based RHS index, or none for a shape, factor or resource error.
+    pub rhs_index: Option<usize>,
+    /// The underlying numerical/storage diagnostic.
+    pub cause: SpiceError,
+}
+
+impl From<SpiceError> for BatchSolveFailure {
+    fn from(cause: SpiceError) -> Self {
+        Self {
+            rhs_index: None,
+            cause,
+        }
+    }
+}
+
+impl From<BatchSolveFailure> for SpiceError {
+    fn from(error: BatchSolveFailure) -> Self {
+        error.cause
+    }
+}
+
+impl std::fmt::Display for BatchSolveFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(index) = self.rhs_index {
+            write!(f, "RHS {index}: ")?;
+        }
+        self.cause.fmt(f)
+    }
+}
+
+impl std::error::Error for BatchSolveFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
 /// Sparse pivot tolerances used when ordering a circuit matrix.
 ///
 /// SPARSE threshold-pivoting limits for ordering a circuit matrix: C's
@@ -807,6 +871,35 @@ pub fn solve_last_factors(pattern: &Arc<Pattern>, rhs: &Vector) -> SpiceResult<O
     })
 }
 
+/// Solve independent RHS vectors while holding one cache transaction.
+/// Unlike a new factorization this cannot change the cached pivot order.
+pub(crate) fn solve_last_factors_batch_into(
+    pattern: &Arc<Pattern>,
+    rhs: &[f64],
+    workspace: &mut SolveBatchWorkspace<f64>,
+    out: &mut Vec<f64>,
+) -> Result<bool, BatchSolveFailure> {
+    pattern.with_ordering(|state| {
+        let Some(CachedFrame::Real(symbolic)) = &state.frame else {
+            return Ok(false);
+        };
+        if !matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern)))
+            || !symbolic.sparse.is_factored()
+        {
+            return Ok(false);
+        }
+        let result = symbolic.sparse.factors()?.solve_batch_into(rhs, workspace, out, false);
+        // Count delivered RHS solutions, not traversals or SIMD tiles.
+        if result.is_ok() {
+            let count = rhs.len().checked_div(symbolic.n).unwrap_or(0);
+            state.work.rhs_solves = state.work.rhs_solves.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        } else {
+            state.work.rhs_failures = state.work.rhs_failures.saturating_add(1);
+        }
+        result.map(|()| true)
+    })
+}
+
 /// Owned numeric sparse LU factors.
 #[derive(Debug)]
 pub struct SparseLu {
@@ -977,6 +1070,26 @@ impl SparseLu {
         workspace: &mut Vec<f64>,
     ) -> SpiceResult<Vector> {
         solve_real(&self.symbolic.sparse, self.symbolic.n, rhs, workspace, true)
+    }
+
+    /// Solve consecutive RHS-major vectors using one factor traversal per tile.
+    ///
+    /// The output retains RHS order and external matrix ordering. A transpose
+    /// solve uses the same factors. Scratch and output capacities are reusable.
+    ///
+    /// # Errors
+    /// Invalid RHS length, non-finite input or solution, or insufficient storage.
+    pub fn solve_batch_into(
+        &self,
+        rhs: &[f64],
+        workspace: &mut SolveBatchWorkspace<f64>,
+        out: &mut Vec<f64>,
+        transposed: bool,
+    ) -> Result<(), BatchSolveFailure> {
+        self.symbolic
+            .sparse
+            .factors()?
+            .solve_batch_into(rhs, workspace, out, transposed)
     }
 
     /// Binary-scaled determinant: `(mantissa, base-2 exponent)`.

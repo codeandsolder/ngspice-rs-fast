@@ -313,6 +313,64 @@ fn ports_are_ordered_by_number_not_by_deck_order() {
 }
 
 #[test]
+fn five_ports_cross_a_batch_boundary_and_keep_last_excitation_and_noise_order() {
+    use std::fmt::Write as _;
+    let mut body = String::new();
+    // Reverse deck order; the partial final tile must still drive port 5.
+    for port in (1..=5).rev() {
+        writeln!(
+            body,
+            "v{port} n{port} 0 dc 0 portnum {port} z0 {}",
+            40 + 5 * port
+        )
+        .unwrap();
+        writeln!(body, "r{port} n{port} 0 {}", 100 + 20 * port).unwrap();
+    }
+    let plot = sp(&body, ".sp lin 2 1k 2k 1").unwrap();
+    for point in 0..plot.point_count() {
+        for row in 1..=5 {
+            let z0 = 40. + 5. * f64::from(row);
+            let r = 100. + 20. * f64::from(row);
+            let expected = if row == 5 { r / (r + z0) } else { 0. };
+            close_real(&plot, &format!("v(n{row})"), point, expected);
+            for col in 1..=5 {
+                let diagonal = row == col;
+                close_real(
+                    &plot,
+                    &format!("S_{row}_{col}"),
+                    point,
+                    if diagonal { (r - z0) / (r + z0) } else { 0. },
+                );
+                close_real(
+                    &plot,
+                    &format!("Y_{row}_{col}"),
+                    point,
+                    if diagonal { 1. / r } else { 0. },
+                );
+                close_real(
+                    &plot,
+                    &format!("Z_{row}_{col}"),
+                    point,
+                    if diagonal { r } else { 0. },
+                );
+                let noise = value(&plot, &format!("i(Cy_{row}_{col})"), point);
+                if diagonal {
+                    assert!(noise.re > 0. && noise.im.abs() <= 1e-14 * noise.re);
+                } else {
+                    assert_eq!(
+                        [
+                            noise.re.to_bits() & 0x7fff_ffff_ffff_ffff,
+                            noise.im.to_bits() & 0x7fff_ffff_ffff_ffff
+                        ],
+                        [0, 0]
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn the_ac_excitation_of_ordinary_sources_is_off() {
     let plain = "v1 1 0 dc 0 portnum 1\nr1 1 2 50\nr2 2 0 100\nv2 2 0 dc 0 portnum 2";
     let reference = sp(plain, ".sp lin 2 1k 2k").unwrap();

@@ -45,6 +45,14 @@
 )]
 
 use super::linear::numerical;
+use std::simd::{
+    Mask, Select,
+    cmp::{SimdPartialEq, SimdPartialOrd},
+    f64x4,
+    num::SimdFloat,
+};
+
+use crate::maths::linear::{BatchSolveFailure, RHS_BATCH_WIDTH, SolveBatchWorkspace};
 use crate::primitives::{Complex, SpiceResult};
 
 const NONE: usize = usize::MAX;
@@ -82,12 +90,145 @@ fn sparse_indices(size: usize) -> SpiceResult<Vec<usize>> {
     Ok(indices)
 }
 
+type LaneMask = Mask<i64, RHS_BATCH_WIDTH>;
+
+/// One SIMD tile, split by component so scatter updates never repack
+/// interleaved complex numbers. Real solves leave the imaginary plane empty.
+#[derive(Clone, Copy)]
+pub(super) struct LaneParts {
+    re: f64x4,
+    im: f64x4,
+}
+
+impl LaneParts {
+    const ZERO: Self = Self {
+        re: f64x4::splat(0.),
+        im: f64x4::splat(0.),
+    };
+
+    fn from_lanes<T: Scalar>(values: [T; RHS_BATCH_WIDTH]) -> Self {
+        Self {
+            re: f64x4::from_array(values.map(Scalar::real)),
+            im: f64x4::from_array(values.map(Scalar::imaginary)),
+        }
+    }
+
+    fn get<T: Scalar>(self, lane: usize) -> T {
+        T::from_parts(self.re[lane], self.im[lane])
+    }
+
+    fn set<T: Scalar>(&mut self, lane: usize, value: T) {
+        self.re[lane] = value.real();
+        self.im[lane] = value.imaginary();
+    }
+
+    fn select(mask: LaneMask, yes: Self, no: Self) -> Self {
+        Self {
+            re: mask.select(yes.re, no.re),
+            im: mask.select(yes.im, no.im),
+        }
+    }
+}
+
+fn read_tile_row<T: Scalar>(work: &SolveBatchWorkspace<T>, index: usize) -> LaneParts {
+    LaneParts {
+        re: work.real[index],
+        im: if T::HAS_IMAGINARY {
+            work.imag[index]
+        } else {
+            f64x4::splat(0.)
+        },
+    }
+}
+
+fn write_tile_row<T: Scalar>(work: &mut SolveBatchWorkspace<T>, index: usize, value: LaneParts) {
+    work.real[index] = value.re;
+    if T::HAS_IMAGINARY {
+        work.imag[index] = value.im;
+    }
+}
+
+/// Keep the original numerator alongside the normalized multiplier.
+/// Ordinary independent lanes use SIMD; exceptional lanes retain the
+/// scalar cross-product recovery and its exact arithmetic order.
+pub(super) struct BatchUpdate {
+    numerator: LaneParts,
+    multiplier: LaneParts,
+    active: LaneMask,
+    normal: LaneMask,
+}
+
+impl BatchUpdate {
+    fn new<T: Scalar>(numerator: LaneParts, pivot: T, inverse: T) -> Self {
+        let zero = f64x4::splat(0.);
+        let active = numerator.re.simd_ne(zero) | numerator.im.simd_ne(zero);
+        if !active.any() {
+            return Self {
+                numerator,
+                multiplier: numerator,
+                active,
+                normal: LaneMask::splat(false),
+            };
+        }
+        let candidate = T::batch_mul(numerator, inverse);
+        let fast = T::batch_normal(candidate) & LaneMask::splat(!inverse.is_zero());
+        let mut multiplier = LaneParts::select(active, candidate, numerator);
+        let exceptional = active & !fast;
+        if exceptional.any() {
+            for lane in 0..RHS_BATCH_WIDTH {
+                if exceptional.test(lane) {
+                    let value = numerator.get::<T>(lane);
+                    multiplier.set(lane, value.quotient(pivot, inverse));
+                }
+            }
+        }
+        Self {
+            numerator,
+            multiplier,
+            active,
+            normal: T::batch_normal(multiplier),
+        }
+    }
+
+    fn recover<T: Scalar>(
+        &self,
+        old: LaneParts,
+        ordinary: LaneParts,
+        pivot: T,
+        lower: T,
+        fast: LaneMask,
+    ) -> LaneParts {
+        let mut next = LaneParts::select(self.active, ordinary, old);
+        let exceptional = self.active & !fast;
+        if exceptional.any() {
+            for lane in 0..RHS_BATCH_WIDTH {
+                if exceptional.test(lane) {
+                    let value = old.get::<T>(lane).schur(
+                        pivot,
+                        self.numerator.get(lane),
+                        self.multiplier.get(lane),
+                        lower,
+                        self.normal.test(lane),
+                    );
+                    next.set(lane, value);
+                }
+            }
+        }
+        next
+    }
+}
+
 /// Matrix entry type: `f64` for real systems, [`Complex`] for AC.
 pub(super) trait Scalar:
     Copy + PartialEq + std::fmt::Debug + std::ops::Div<Output = Self>
 {
     /// Additive identity.
     const ZERO: Self;
+    const HAS_IMAGINARY: bool;
+    fn imaginary(self) -> f64;
+    fn from_parts(real: f64, imaginary: f64) -> Self;
+    fn batch_mul(parts: LaneParts, value: Self) -> LaneParts;
+    fn batch_normal(parts: LaneParts) -> LaneMask;
     /// C `ELEMENT_MAG`: `|re| + |im|`.
     fn mag(self) -> f64;
     /// Real part, used by `CountTwins`' `ABS(Real) == 1.0` test.
@@ -123,6 +264,9 @@ pub(super) trait Scalar:
     /// Update a Schur entry using the rounded multiplier only when well
     /// conditioned; otherwise recover the unnormalized cross-product.
     fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self, normal: bool) -> Self;
+    /// Update four independently normalized RHS lanes, recovering unsafe
+    /// ordinary results with the same scalar kernel.
+    fn schur_batch(acc: LaneParts, pivot: Self, lower: Self, update: &BatchUpdate) -> LaneParts;
     /// Classify the multiplier once before traversing the lower column.
     fn normal_multiplier(self) -> bool;
     /// Whether the value is exactly zero (`== 0.0` on every part).
@@ -135,6 +279,22 @@ pub(super) trait Scalar:
 
 impl Scalar for f64 {
     const ZERO: Self = 0.0;
+    const HAS_IMAGINARY: bool = false;
+    fn imaginary(self) -> f64 {
+        0.
+    }
+    fn from_parts(real: f64, _imaginary: f64) -> Self {
+        real
+    }
+    fn batch_mul(parts: LaneParts, value: Self) -> LaneParts {
+        LaneParts {
+            re: parts.re * f64x4::splat(value),
+            im: f64x4::splat(0.),
+        }
+    }
+    fn batch_normal(parts: LaneParts) -> LaneMask {
+        parts.re.is_normal()
+    }
     fn mag(self) -> f64 {
         self.abs()
     }
@@ -164,6 +324,23 @@ impl Scalar for f64 {
             result
         }
     }
+    #[inline]
+    fn schur_batch(acc: LaneParts, pivot: Self, lower: Self, update: &BatchUpdate) -> LaneParts {
+        let result = acc.re - update.multiplier.re * f64x4::splat(lower);
+        let fast = result.is_finite()
+            & ((update.normal & result.abs().simd_gt(acc.re.abs() * f64x4::splat(0.0625)))
+                | LaneMask::splat(lower == 0.));
+        update.recover(
+            acc,
+            LaneParts {
+                re: result,
+                im: f64x4::splat(0.),
+            },
+            pivot,
+            lower,
+            fast,
+        )
+    }
     fn normal_multiplier(self) -> bool {
         self.is_normal()
     }
@@ -180,6 +357,24 @@ impl Scalar for f64 {
 
 impl Scalar for Complex {
     const ZERO: Self = Self::ZERO;
+    const HAS_IMAGINARY: bool = true;
+    fn imaginary(self) -> f64 {
+        self.im
+    }
+    fn from_parts(real: f64, imaginary: f64) -> Self {
+        Self::new(real, imaginary)
+    }
+    fn batch_mul(parts: LaneParts, value: Self) -> LaneParts {
+        let re = f64x4::splat(value.re);
+        let im = f64x4::splat(value.im);
+        LaneParts {
+            re: parts.re * re - parts.im * im,
+            im: parts.re * im + parts.im * re,
+        }
+    }
+    fn batch_normal(parts: LaneParts) -> LaneMask {
+        (parts.re.abs() + parts.im.abs()).is_normal()
+    }
     fn mag(self) -> f64 {
         self.re.abs() + self.im.abs()
     }
@@ -252,6 +447,19 @@ impl Scalar for Complex {
         } else {
             result
         }
+    }
+    #[inline]
+    fn schur_batch(acc: LaneParts, pivot: Self, lower: Self, update: &BatchUpdate) -> LaneParts {
+        let product = Self::batch_mul(update.multiplier, lower);
+        let result = LaneParts {
+            re: acc.re - product.re,
+            im: acc.im - product.im,
+        };
+        let norm = result.re.abs() + result.im.abs();
+        let scale = (acc.re.abs() + acc.im.abs()) * f64x4::splat(0.0625);
+        let fast = (update.normal & norm.is_normal() & norm.simd_gt(scale))
+            | (result.re.is_finite() & result.im.is_finite() & LaneMask::splat(lower.is_zero()));
+        update.recover(acc, result, pivot, lower, fast)
     }
     fn normal_multiplier(self) -> bool {
         (self.re.abs() + self.im.abs()).is_normal()
@@ -499,6 +707,47 @@ impl<I: PlanIndex> FactorRuns<I> {
                 x[r] = x[r].schur(pivot, numerator, mult, values[handle], normal);
             }
             x[i] = mult;
+        }
+    }
+
+    fn solve_batch<T: Scalar>(
+        &self,
+        values: &[T],
+        diag: &[usize],
+        inverses: &[T],
+        work: &mut SolveBatchWorkspace<T>,
+        transposed: bool,
+    ) {
+        let size = self.columns.runs.len();
+        let axis = if transposed {
+            &self.rows
+        } else {
+            &self.columns
+        };
+        for i in 1..=size {
+            let pivot = values[diag[i]];
+            let update = BatchUpdate::new(read_tile_row(work, i), pivot, inverses[i]);
+            if update.active.any() {
+                for entry in axis.after_diagonal(i) {
+                    let (handle, r) = entry.indices();
+                    let next =
+                        T::schur_batch(read_tile_row(work, r), pivot, values[handle], &update);
+                    write_tile_row(work, r, next);
+                }
+            }
+        }
+        for i in (1..=size).rev() {
+            let pivot = values[diag[i]];
+            let update = BatchUpdate::new(read_tile_row(work, i), pivot, inverses[i]);
+            if update.active.any() {
+                for entry in axis.before_diagonal(i) {
+                    let (handle, r) = entry.indices();
+                    let next =
+                        T::schur_batch(read_tile_row(work, r), pivot, values[handle], &update);
+                    write_tile_row(work, r, next);
+                }
+                write_tile_row(work, i, update.multiplier);
+            }
         }
     }
 }
@@ -2760,6 +3009,16 @@ impl<T: Scalar> FactorView<'_, T> {
         out: &mut Vec<T>,
         transposed: bool,
     ) -> SpiceResult<()> {
+        self.solve_workspace(rhs, workspace, transposed)?;
+        self.frame.scatter_solution(rhs, workspace, transposed, out)
+    }
+
+    fn solve_workspace(
+        &self,
+        rhs: &[T],
+        workspace: &mut Vec<T>,
+        transposed: bool,
+    ) -> SpiceResult<()> {
         self.frame.gather_rhs(rhs, workspace, transposed)?;
         match self.plan {
             FactorPlan::Compact(runs) => runs.solve(
@@ -2777,7 +3036,104 @@ impl<T: Scalar> FactorView<'_, T> {
                 transposed,
             ),
         }
-        self.frame.scatter_solution(rhs, workspace, transposed, out)
+        Ok(())
+    }
+
+    pub(super) fn solve_batch_into(
+        &self,
+        rhs: &[T],
+        workspace: &mut SolveBatchWorkspace<T>,
+        out: &mut Vec<T>,
+        transposed: bool,
+    ) -> Result<(), BatchSolveFailure> {
+        let frame = self.frame;
+        let n = frame.ext_size;
+        out.clear();
+        if rhs.is_empty() {
+            return Ok(());
+        }
+        if n == 0 || !rhs.len().is_multiple_of(n) {
+            return Err(numerical("SPARSE batch solve", "invalid RHS size").into());
+        }
+        if let Some(index) = rhs.iter().position(|v| !v.is_finite()) {
+            return Err(BatchSolveFailure {
+                rhs_index: Some(index / n),
+                cause: numerical("SPARSE batch solve", "non-finite RHS"),
+            });
+        }
+        let tile_size = n
+            .checked_mul(RHS_BATCH_WIDTH)
+            .ok_or_else(|| numerical("SPARSE batch solve", "RHS tile size overflows"))?;
+        sparse_reserve(out, rhs.len())?;
+        out.extend_from_slice(rhs);
+        let gather = if transposed {
+            &frame.topology.int_to_ext_col
+        } else {
+            &frame.topology.int_to_ext_row
+        };
+        let scatter = if transposed {
+            &frame.topology.ext_to_int_row
+        } else {
+            &frame.topology.ext_to_int_col
+        };
+        for (tile, result) in rhs.chunks(tile_size).zip(out.chunks_mut(tile_size)) {
+            if tile.len() < tile_size {
+                for (rhs, vector) in tile.chunks_exact(n).zip(result.chunks_exact_mut(n)) {
+                    self.solve_workspace(rhs, &mut workspace.scalar, transposed)?;
+                    for (value, &internal) in vector.iter_mut().zip(&scatter[1..]) {
+                        if internal != NONE {
+                            *value = workspace.scalar[internal];
+                        }
+                    }
+                }
+                continue;
+            }
+            workspace.real.clear();
+            sparse_reserve(&mut workspace.real, frame.size + 1)?;
+            workspace.real.resize(frame.size + 1, LaneParts::ZERO.re);
+            if T::HAS_IMAGINARY {
+                workspace.imag.clear();
+                sparse_reserve(&mut workspace.imag, frame.size + 1)?;
+                workspace.imag.resize(frame.size + 1, LaneParts::ZERO.im);
+            }
+            for (internal, &external) in gather[1..=frame.size].iter().enumerate() {
+                let parts = LaneParts::from_lanes(std::array::from_fn(|lane| {
+                    tile[lane * n + external - 1]
+                }));
+                write_tile_row(workspace, internal + 1, parts);
+            }
+            match self.plan {
+                FactorPlan::Compact(runs) => runs.solve_batch(
+                    &frame.values,
+                    &frame.topology.diag,
+                    &frame.inverses,
+                    workspace,
+                    transposed,
+                ),
+                FactorPlan::Wide(runs) => runs.solve_batch(
+                    &frame.values,
+                    &frame.topology.diag,
+                    &frame.inverses,
+                    workspace,
+                    transposed,
+                ),
+            }
+            // Untranslated unknowns keep their original RHS, including signed zeros.
+            for (lane, vector) in result.chunks_exact_mut(n).enumerate() {
+                for (value, &internal) in vector.iter_mut().zip(&scatter[1..]) {
+                    if internal != NONE {
+                        *value = read_tile_row(workspace, internal).get(lane);
+                    }
+                }
+            }
+        }
+        if let Some(index) = out.iter().position(|value| !value.is_finite()) {
+            return Err(BatchSolveFailure {
+                rhs_index: Some(index / n),
+                cause: numerical("SPARSE batch solve", "non-finite solution/singular system"),
+            });
+        }
+        Ok(())
     }
 
     /// Binary-scaled determinant, with `1 <= max(|component|) < 2`.
@@ -3081,6 +3437,234 @@ mod tests {
         assert_eq!(transposed[2], 4.);
         assert_eq!(transposed[1].to_bits(), (-0.0_f64).to_bits());
         assert_eq!(transposed[3], -17.);
+    }
+
+    fn check_batch<T: Scalar>(matrix: &Sparse<T>, rhs: &[T], bits: impl Fn(T) -> [u64; 2]) {
+        let factor = matrix.factors().unwrap();
+        let n = matrix.ext_size;
+        let mut batch = SolveBatchWorkspace::default();
+        let mut out = Vec::new();
+        let mut scalar = Vec::new();
+        let mut expected = Vec::new();
+        let mut storage = None;
+        for transposed in [false, true] {
+            for count in [9, 0, 1, 2, 3, 4, 5, 8, 7, 9] {
+                let rhs = &rhs[..count * n];
+                factor
+                    .solve_batch_into(rhs, &mut batch, &mut out, transposed)
+                    .unwrap();
+                if let Some(storage) = storage {
+                    assert_eq!(batch.real.as_ptr(), storage);
+                } else {
+                    storage = Some(batch.real.as_ptr());
+                }
+                let mut checked = Vec::new();
+                for vector in rhs.chunks_exact(n) {
+                    factor
+                        .solve_into(vector, &mut scalar, &mut expected, transposed)
+                        .unwrap();
+                    checked.extend(expected.iter().copied().map(&bits));
+                }
+                assert_eq!(out.iter().copied().map(&bits).collect::<Vec<_>>(), checked);
+            }
+        }
+        assert!(
+            factor
+                .solve_batch_into(&rhs[..n + 1], &mut batch, &mut out, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn real_rhs_tiles_preserve_permutation_untranslated_signed_zero_and_range() {
+        let mut matrix = build(
+            6,
+            &[
+                (3, 1, 2.),
+                (1, 3, 4.),
+                (3, 3, 1.),
+                (3, 5, 0.25),
+                (5, 3, -0.5),
+                (5, 5, 3.),
+                (6, 6, 1e-200),
+            ],
+        );
+        matrix.mna_preorder();
+        assert!(matches!(
+            matrix.order_and_factor(1e-3, 0.),
+            Status::Okay | Status::SmallPivot
+        ));
+        let values = [
+            0.,
+            -0.,
+            1.,
+            -2.,
+            1e-200,
+            -1e100,
+            1e-100,
+            f64::MIN_POSITIVE,
+            1e100,
+        ];
+        let rhs: Vec<_> = (0_usize..9)
+            .flat_map(|lane| {
+                [
+                    values[lane],
+                    -0.,
+                    values[(lane + 1) % 9],
+                    values[lane],
+                    values[(lane + 2) % 9],
+                    values[(lane + 3) % 9],
+                ]
+            })
+            .collect();
+        check_batch(&matrix, &rhs, |value| [value.to_bits(), 0]);
+        // Invalid lanes cannot be silently ignored just because other RHS
+        // are finite and the tile is not full.
+        let mut invalid = rhs[..18].to_vec();
+        invalid[12] = f64::NAN;
+        assert!(
+            matrix
+                .factors()
+                .unwrap()
+                .solve_batch_into(
+                    &invalid,
+                    &mut SolveBatchWorkspace::default(),
+                    &mut Vec::new(),
+                    false,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn complex_rhs_tiles_match_independent_solve_bits_at_exponent_limits() {
+        let mut matrix = Sparse::<Complex>::new(6).unwrap();
+        for (r, c, value) in [
+            (1, 3, Complex::new(2., -0.25)),
+            (3, 1, Complex::new(4., 0.5)),
+            (3, 3, Complex::new(1., -1.)),
+            (3, 5, Complex::new(0.125, -0.5)),
+            (5, 3, Complex::new(-0.25, 0.5)),
+            (5, 5, Complex::new(2., 3.)),
+            (6, 6, Complex::new(f64::MAX, f64::MAX)),
+        ] {
+            let entry = matrix.get_element(r, c).unwrap();
+            matrix.set(entry, value);
+        }
+        assert!(matches!(
+            matrix.order_and_factor(1e-3, 0.),
+            Status::Okay | Status::SmallPivot
+        ));
+        let values = [
+            0.,
+            -0.,
+            1.,
+            -2.,
+            1e-200,
+            -1e100,
+            1e-100,
+            f64::MIN_POSITIVE,
+            1e100,
+        ];
+        let rhs: Vec<_> = (0_usize..9)
+            .flat_map(|lane| {
+                let value = |offset: usize| {
+                    Complex::new(values[(lane + offset) % 9], values[(lane + offset + 1) % 9])
+                };
+                [
+                    value(0),
+                    Complex::new(-0., 0.),
+                    value(1),
+                    value(2),
+                    value(3),
+                    value(4),
+                ]
+            })
+            .collect();
+        check_batch(&matrix, &rhs, |z| [z.re.to_bits(), z.im.to_bits()]);
+    }
+
+    fn time_rhs_batches<T: Scalar>(matrix: &Sparse<T>, rhs: &[T], scalar: &str) {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let factor = matrix.factors().unwrap();
+        let n = matrix.ext_size;
+        let mut batch = SolveBatchWorkspace::default();
+        let mut work = Vec::new();
+        let mut single = Vec::new();
+        let mut before = Vec::with_capacity(rhs.len());
+        let mut after = Vec::with_capacity(rhs.len());
+        for transposed in [false, true] {
+            for count in [1, 2, 4, 8, 32, 64] {
+                let rhs = &rhs[..n * count];
+                let mut baseline = Vec::new();
+                let mut batched = Vec::new();
+                for _ in 0..5 {
+                    let start = Instant::now();
+                    for _ in 0..16 {
+                        before.clear();
+                        for row in black_box(rhs).chunks_exact(n) {
+                            factor
+                                .solve_into(row, &mut work, &mut single, transposed)
+                                .unwrap();
+                            before.extend_from_slice(&single);
+                        }
+                        black_box(&before);
+                    }
+                    baseline.push(start.elapsed());
+                    let start = Instant::now();
+                    for _ in 0..16 {
+                        factor
+                            .solve_batch_into(black_box(rhs), &mut batch, &mut after, transposed)
+                            .unwrap();
+                        black_box(&after);
+                    }
+                    batched.push(start.elapsed());
+                    assert_eq!(before, after);
+                }
+                baseline.sort_unstable();
+                batched.sort_unstable();
+                println!(
+                    "scalar={scalar} transpose={transposed} rhs={count} independent_ns={} batch_ns={}",
+                    baseline[2].as_nanos(),
+                    batched[2].as_nanos()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in sparse multiple RHS kernel benchmark"]
+    fn sparse_rhs_batch_benchmark() {
+        let n = 512;
+        let mut real = Sparse::<f64>::new(n).unwrap();
+        let mut complex = Sparse::<Complex>::new(n).unwrap();
+        for row in 1..=n {
+            for (col, value) in [
+                (row, 5.),
+                (row.saturating_sub(1), -0.75),
+                (row + 1, -0.5),
+                (row.saturating_sub(16), -0.125),
+                (row + 16, -0.25),
+            ] {
+                if !(1..=n).contains(&col) {
+                    continue;
+                }
+                let h = real.get_element(row, col).unwrap();
+                real.set(h, value);
+                let h = complex.get_element(row, col).unwrap();
+                complex.set(h, Complex::new(value, value * 0.25));
+            }
+        }
+        assert_eq!(real.order_and_factor(1e-3, 0.), Status::Okay);
+        assert_eq!(complex.order_and_factor(1e-3, 0.), Status::Okay);
+        let rhs: Vec<_> = (0..n * 64)
+            .map(|i| f64::from(u32::try_from((i * 13 + 7) % 127).unwrap()) / 64. - 1.)
+            .collect();
+        let imaginary: Vec<_> = rhs.iter().map(|&v| Complex::new(v, 0.25 - v)).collect();
+        time_rhs_batches(&real, &rhs, "real");
+        time_rhs_batches(&complex, &imaginary, "complex");
     }
 
     #[test]

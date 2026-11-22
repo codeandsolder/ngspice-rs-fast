@@ -49,6 +49,9 @@ use crate::devices::sensitivity::{
 };
 use crate::devices::{AnalysisMode, Circuit, Device, IterationPhase, LoadRequest, TrialState};
 use crate::maths::complex::ComplexMatrix;
+use crate::maths::linear::{
+    BatchSolveFailure, RHS_BATCH_WIDTH, SolveBatchWorkspace, solve_last_factors_batch_into,
+};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{
     Complex, NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult, parse_spice_number,
@@ -1147,10 +1150,94 @@ struct DcState<'a> {
     circuit: &'a Circuit,
 }
 
+fn perturbation_error(label: &str, error: SpiceError) -> SpiceError {
+    SpiceError::Numerical {
+        context: format!(".sens {label}: {error}"),
+        message: "the perturbed load could not be evaluated".to_owned(),
+    }
+}
+
+/// Residuals are prepared in the original record-walk order, then solved
+/// together. A solve never mutates parameter records or the pivot order.
+struct SensitivityBatch<T> {
+    rhs: Vec<T>,
+    work: SolveBatchWorkspace<T>,
+    solution: Vec<T>,
+    labels: [String; RHS_BATCH_WIDTH],
+    deltas: [Real; RHS_BATCH_WIDTH],
+    count: usize,
+}
+
+impl<T: Copy> SensitivityBatch<T> {
+    fn new() -> Self {
+        Self {
+            rhs: Vec::new(),
+            work: SolveBatchWorkspace::default(),
+            solution: Vec::new(),
+            labels: std::array::from_fn(|_| String::new()),
+            deltas: [0.; RHS_BATCH_WIDTH],
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, rhs: &[T], label: &str, delta: Real) -> SpiceResult<()> {
+        self.rhs.try_reserve(rhs.len()).map_err(|error| {
+            perturbation_error(
+                label,
+                SpiceError::Numerical {
+                    context: ".sens batch".to_owned(),
+                    message: format!("cannot reserve RHS tile: {error}"),
+                },
+            )
+        })?;
+        self.rhs.extend_from_slice(rhs);
+        self.labels[self.count].clear();
+        self.labels[self.count].push_str(label);
+        self.deltas[self.count] = delta;
+        self.count += 1;
+        Ok(())
+    }
+
+    const fn full(&self) -> bool {
+        self.count == RHS_BATCH_WIDTH
+    }
+
+    fn flush(
+        &mut self,
+        solve: impl FnOnce(
+            &[T],
+            &mut SolveBatchWorkspace<T>,
+            &mut Vec<T>,
+        ) -> Result<(), BatchSolveFailure>,
+        mut emit: impl FnMut(usize, &mut [T], Real),
+    ) -> SpiceResult<()> {
+        let count = std::mem::take(&mut self.count);
+        if count == 0 {
+            return Ok(());
+        }
+        let n = self.rhs.len() / count;
+        let result = solve(&self.rhs, &mut self.work, &mut self.solution);
+        self.rhs.clear();
+        result.map_err(|error| {
+            perturbation_error(&self.labels[error.rhs_index.unwrap_or(0)], error.cause)
+        })?;
+        for lane in 0..count {
+            emit(
+                lane,
+                &mut self.solution[lane * n..(lane + 1) * n],
+                self.deltas[lane],
+            );
+        }
+        Ok(())
+    }
+}
+
 struct DcAssembly {
     matrix: SparseMatrix,
     rhs: Vector,
     tainted: Vec<bool>,
+    tainted_lanes: [Vec<bool>; RHS_BATCH_WIDTH],
+    batch: SensitivityBatch<Real>,
 }
 
 impl DcAssembly {
@@ -1159,6 +1246,8 @@ impl DcAssembly {
             matrix: SparseMatrix::new(n, n),
             rhs: Vector::zeros(n),
             tainted: Vec::new(),
+            tainted_lanes: std::array::from_fn(|_| Vec::new()),
+            batch: SensitivityBatch::new(),
         }
     }
 }
@@ -1179,9 +1268,9 @@ fn mask_nonfinite(rhs: &mut Vector, blocks: &[usize], tainted: &mut Vec<bool>) {
     }
 }
 
-fn restore_nonfinite(solution: &mut Vector, blocks: &[usize], tainted: &[bool]) {
+fn restore_nonfinite(solution: &mut [Real], blocks: &[usize], tainted: &[bool]) {
     if !tainted.is_empty() {
-        for (row, value) in solution.as_mut_slice().iter_mut().enumerate() {
+        for (row, value) in solution.iter_mut().enumerate() {
             if tainted[blocks[row]] {
                 *value = Real::NAN;
             }
@@ -1218,14 +1307,14 @@ impl DcState<'_> {
 
     /// `Y^-1 (delta_I - delta_Y E)` of a base and a perturbed load, with
     /// `delta_I` and `delta_Y` accumulated as `sens_sens()` does.
-    fn delta(
+    fn residual(
         &self,
         mut assembly: BaseAssembly<'_>,
         scratch: &mut DcAssembly,
         index: usize,
         base: &SensitivityLoad,
         perturbed: &SensitivityLoad,
-    ) -> SpiceResult<Vector> {
+    ) -> SpiceResult<()> {
         scratch.matrix.clear();
         scratch.rhs.clear();
         self.load(index, base, &mut scratch.matrix, &mut scratch.rhs)?;
@@ -1249,13 +1338,32 @@ impl DcState<'_> {
         // Nonfinite loads poison the entire connected block, as in C.
         // The mask remains unallocated on the normal path and reuses capacity.
         mask_nonfinite(&mut scratch.rhs, &self.blocks, &mut scratch.tainted);
-        let mut solved = crate::maths::solve_last_factors(&self.pattern, &scratch.rhs)?
-            .ok_or_else(|| SpiceError::Numerical {
-                context: ".sens".to_owned(),
-                message: "the operating point left no factored circuit matrix".to_owned(),
-            })?;
-        restore_nonfinite(&mut solved, &self.blocks, &scratch.tainted);
-        Ok(solved)
+        Ok(())
+    }
+
+    fn flush(
+        &self,
+        scratch: &mut DcAssembly,
+        probe: Probe,
+        point: &mut Vec<Complex>,
+    ) -> SpiceResult<()> {
+        scratch.batch.flush(
+            |rhs, work, solution| {
+                if solve_last_factors_batch_into(&self.pattern, rhs, work, solution)? {
+                    Ok(())
+                } else {
+                    Err(SpiceError::Numerical {
+                        context: ".sens".to_owned(),
+                        message: "the operating point left no factored circuit matrix".to_owned(),
+                    }
+                    .into())
+                }
+            },
+            |lane, solved, delta| {
+                restore_nonfinite(solved, &self.blocks, &scratch.tainted_lanes[lane]);
+                point.push(Complex::real(probe.read(solved, 0.) / delta));
+            },
+        )
     }
 }
 
@@ -1274,16 +1382,16 @@ struct AcAssembly {
     system: LinearSystem,
     rhs: Vec<Complex>,
     perturbed_rhs: Vec<Complex>,
-    solve: Vec<Complex>,
+    batch: SensitivityBatch<Complex>,
 }
 
 impl AcAssembly {
-    const fn new(n: usize) -> Self {
+    fn new(n: usize) -> Self {
         Self {
             system: LinearSystem::new(n),
             rhs: Vec::new(),
             perturbed_rhs: Vec::new(),
-            solve: Vec::new(),
+            batch: SensitivityBatch::new(),
         }
     }
 }
@@ -1320,14 +1428,14 @@ impl AcState<'_> {
         )
     }
 
-    fn delta(
+    fn residual(
         &self,
         mut assembly: BaseAssembly<'_>,
         scratch: &mut AcAssembly,
         index: usize,
         base: &SensitivityLoad,
         perturbed: &SensitivityLoad,
-    ) -> SpiceResult<Vec<Complex>> {
+    ) -> SpiceResult<()> {
         self.assemble(index, base, &mut scratch.system)?;
         scratch.system.ac_rhs_into(&mut scratch.rhs);
         assembly.add(self.stamps(&scratch.system))?;
@@ -1347,8 +1455,28 @@ impl AcState<'_> {
             imaginary.add(value.im);
             *value = Complex::new(real.total(), imaginary.total());
         })?;
-        self.factors
-            .solve_with_workspace(&scratch.rhs, &mut scratch.solve)
+        if scratch.rhs.iter().any(|value| !value.is_finite()) {
+            return Err(SpiceError::Numerical {
+                context: "complex solve".to_owned(),
+                message: "invalid RHS".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn flush(
+        &self,
+        scratch: &mut AcAssembly,
+        probe: Probe,
+        point: &mut Vec<Complex>,
+    ) -> SpiceResult<()> {
+        scratch.batch.flush(
+            |rhs, work, solution| self.factors.solve_batch_into(rhs, work, solution, false),
+            |_, solved, delta| {
+                let value = probe.read(solved, Complex::ZERO);
+                point.push(Complex::new(value.re / delta, value.im / delta));
+            },
+        )
     }
 }
 
@@ -1595,7 +1723,7 @@ fn run_ac(
         };
         let mut point = Vec::with_capacity(plot.variables().len());
         point.push(Complex::real(frequency));
-        walk.sweep(
+        let walked = walk.sweep(
             |slot, member, setup, current| {
                 sweep.load(
                     circuit,
@@ -1606,17 +1734,26 @@ fn run_ac(
                     omega,
                 )
             },
-            |assembly, index, base, perturbed, delta| {
+            |assembly, index, base, perturbed, delta, label| {
                 let Some(at) = &at else {
                     point.push(Complex::new(Real::NAN, Real::NAN));
                     return Ok(());
                 };
-                let dx = at.delta(assembly, &mut scratch, index, base, perturbed)?;
-                let value = probe.read(&dx, Complex::ZERO);
-                point.push(Complex::new(value.re / delta, value.im / delta));
+                at.residual(assembly, &mut scratch, index, base, perturbed)
+                    .map_err(|error| perturbation_error(label, error))?;
+                scratch.batch.push(&scratch.rhs, label, delta)?;
+                if scratch.batch.full() {
+                    at.flush(&mut scratch, probe, &mut point)?;
+                }
                 Ok(())
             },
-        )?;
+        );
+        // A pending earlier solve must report its own failure before a
+        // later parameter load/restoration error can escape the walk.
+        if let Some(at) = &at {
+            at.flush(&mut scratch, probe, &mut point)?;
+        }
+        walked?;
         plot.push_point(&point)?;
     }
     Ok(())
@@ -1677,14 +1814,21 @@ fn run_dc(
     };
     let mut point = Vec::with_capacity(plot.variables().len());
     let mut scratch = DcAssembly::new(n);
-    walk.sweep(
+    let walked = walk.sweep(
         |_, member, setup, current| member.sensitivity.load(setup, current, SensitivityMode::Dc),
-        |assembly, index, base, perturbed, delta| {
-            let dx = at.delta(assembly, &mut scratch, index, base, perturbed)?;
-            point.push(Complex::real(probe.read(dx.as_slice(), 0.) / delta));
+        |assembly, index, base, perturbed, delta, label| {
+            at.residual(assembly, &mut scratch, index, base, perturbed)
+                .map_err(|error| perturbation_error(label, error))?;
+            scratch.tainted_lanes[scratch.batch.count].clone_from(&scratch.tainted);
+            scratch.batch.push(scratch.rhs.as_slice(), label, delta)?;
+            if scratch.batch.full() {
+                at.flush(&mut scratch, probe, &mut point)?;
+            }
             Ok(())
         },
-    )?;
+    );
+    at.flush(&mut scratch, probe, &mut point)?;
+    walked?;
     plot.push_point(&point)?;
     Ok(())
 }
@@ -1740,6 +1884,7 @@ impl ParameterWalk<'_> {
             &SensitivityLoad,
             &SensitivityLoad,
             Real,
+            &str,
         ) -> SpiceResult<()>,
     ) -> SpiceResult<()> {
         // A device that refuses `.sens` outright keeps its own error class; only a
@@ -1793,16 +1938,13 @@ impl ParameterWalk<'_> {
                 },
             )
             .map_err(|error| labelled(error, label, "the perturbed load failed"))?;
-            let measured = (|| {
-                let assembly =
-                    self.delta
-                        .begin(setup_elements(self.circuit, member.index, elements)?)?;
-                measure(assembly, member.index, &base, &perturbed, delta)
-            })();
-            measured.map_err(|error| SpiceError::Numerical {
-                context: format!(".sens {label}: {error}"),
-                message: "the perturbed load could not be evaluated".to_owned(),
-            })?;
+            let elements = setup_elements(self.circuit, member.index, elements)
+                .map_err(|error| perturbation_error(label, error))?;
+            let assembly = self
+                .delta
+                .begin(elements)
+                .map_err(|error| perturbation_error(label, error))?;
+            measure(assembly, member.index, &base, &perturbed, delta, label)?;
             device.set(entry.scope, entry.keyword, value, model, instance)?;
             device.temperature(model, instance)?;
         }
@@ -2006,14 +2148,14 @@ mod tests {
         assert_eq!(rhs.as_slice(), &[1., 0., -0., 3., 4.]);
         assert_eq!(rhs.as_slice()[2].to_bits(), (-0_f64).to_bits());
         let mut solved = Vector::from_slice(&[1., 2., 3., 4., 5.]);
-        restore_nonfinite(&mut solved, &blocks, &tainted);
+        restore_nonfinite(solved.as_mut_slice(), &blocks, &tainted);
         assert!(solved.as_slice()[..3].iter().all(|x| x.is_nan()));
         assert_eq!(solved.as_slice()[3..], [4., 5.]);
         let capacity = tainted.capacity();
         mask_nonfinite(&mut rhs, &blocks, &mut tainted);
         assert!(tainted.is_empty());
         assert_eq!(tainted.capacity(), capacity);
-        restore_nonfinite(&mut rhs, &blocks, &tainted);
+        restore_nonfinite(rhs.as_mut_slice(), &blocks, &tainted);
         assert!(rhs.is_finite());
     }
 
