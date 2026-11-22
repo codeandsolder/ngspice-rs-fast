@@ -382,12 +382,7 @@ impl StepHistory {
 /// `nicomcof.c` solves the Vandermonde system `sum_i ag_i (s_i/h)^j =
 /// -delta_{j1}/h`, `j = 0..=order`, in step-normalized form. The
 /// corrector follows the reference's unpivoted LU elimination and
-/// substitution, preserving operation order rather than evaluating the
-/// algebraically equivalent Lagrange derivative in closed form.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "nicomcof.c unpivoted Gear elimination and substitution round products before subtraction"
-)]
+/// substitution, with fused product/subtraction to reduce rounding error.
 fn gear_corrector(deltas: &[Real; HISTORY_LEN + 1], order: usize) -> [Real; HISTORY_LEN + 1] {
     // nicomcof.c, `case GEAR`, verbatim: the corrector matrix built from
     // (sum of h)/h, LU-decomposed without pivoting (its first column is
@@ -416,19 +411,19 @@ fn gear_corrector(deltas: &[Real; HISTORY_LEN + 1], order: usize) -> [Real; HIST
             row[i] /= pivot[i];
             let multiplier = row[i];
             for (entry, &p) in row[i + 1..=order].iter_mut().zip(&pivot[i + 1..=order]) {
-                *entry -= multiplier * p;
+                *entry = (-multiplier).mul_add(p, *entry);
             }
         }
     }
     for i in 1..=order {
         for j in i + 1..=order {
-            ag[j] -= mat[j][i] * ag[i];
+            ag[j] = (-mat[j][i]).mul_add(ag[i], ag[j]);
         }
     }
     ag[order] /= mat[order][order];
     for i in (0..order).rev() {
         for j in i + 1..=order {
-            ag[i] -= mat[i][j] * ag[j];
+            ag[i] = (-mat[i][j]).mul_add(ag[j], ag[i]);
         }
         ag[i] /= mat[i][i];
     }
@@ -558,6 +553,20 @@ impl Default for TruncationTolerances {
     }
 }
 
+/// Multiply a charge difference and add in one rounding step. Opposite
+/// near-maximum charges can overflow the subtraction even when the weighted
+/// difference is representable. Halving both operands in that exceptional case
+/// is exact; doubling the weight restores the original scale.
+#[inline]
+fn weighted_difference(weight: Real, left: Real, right: Real, addend: Real) -> Real {
+    let difference = left - right;
+    if difference.is_finite() {
+        weight.mul_add(difference, addend)
+    } else {
+        (weight + weight).mul_add(left * 0.5 - right * 0.5, addend)
+    }
+}
+
 impl Coefficients {
     /// The integration rule.
     #[must_use]
@@ -623,10 +632,6 @@ impl Coefficients {
     /// [`SpiceError::Numerical`] for a short history, a missing derivative,
     /// nonfinite inputs/capacitance or nonfinite results.
     #[inline]
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "NIintegrate companion derivative and history source follow the C addition order"
-    )]
     pub fn integrate(
         &self,
         charge: &[Real],
@@ -640,31 +645,42 @@ impl Coefficients {
         if charge.iter().any(|q| !q.is_finite()) || !capacitance.is_finite() {
             return Err(cold_numerical("nonfinite charge history or capacitance"));
         }
-        let derivative = if self.needs_previous_derivative() {
+        let (derivative, current) = if self.needs_previous_derivative() {
             let Some(previous) = previous_derivative else {
                 return Err(cold_numerical(
                     "trapezoidal order 2 needs the previous derivative",
                 ));
             };
             finite(previous, "previous derivative")?;
-            -previous * self.ag[1] + self.ag[0] * (charge[0] - charge[1])
-        } else if self.method == IntegrationMethod::Trapezoidal {
-            // NIintegrate, trapezoidal order 1: ag0 q0 + ag1 q1.
-            self.ag[0] * charge[0] + self.ag[1] * charge[1]
+            let previous = -previous * self.ag[1];
+            (
+                weighted_difference(self.ag[0], charge[0], charge[1], previous),
+                (-self.ag[0]).mul_add(charge[1], previous),
+            )
+        } else if self.order == 1 {
+            // The derivative of constant charge is exactly zero, regardless
+            // of the magnitude of the common charge or rounded coefficient.
+            (
+                weighted_difference(self.ag[0], charge[0], charge[1], 0.),
+                -self.ag[0] * charge[1],
+            )
         } else {
-            // NIintegrate, Gear: zero, then ag[k] q[k] from the highest order
-            // down, ag[0] q0 last.
-            let mut sum = 0.;
+            // Gear weights annihilate constants. Shift charges by the trial
+            // value before the dot product to avoid catastrophic cancellation
+            // of large, nearly equal absolute charges. Form the history source
+            // independently, not by subtracting the rounded present term.
+            let mut derivative = 0.;
+            let mut current = 0.;
             for k in (1..needed).rev() {
-                sum += self.ag[k] * charge[k];
+                derivative = weighted_difference(self.ag[k], charge[k], charge[0], derivative);
+                current = self.ag[k].mul_add(charge[k], current);
             }
-            sum + self.ag[0] * charge[0]
+            (derivative, current)
         };
-        let derivative = finite(derivative, "integrated derivative")?;
         Ok(Companion {
-            derivative,
+            derivative: finite(derivative, "integrated derivative")?,
             conductance: finite(self.ag[0] * capacitance, "companion conductance")?,
-            current: finite(derivative - self.ag[0] * charge[0], "companion current")?,
+            current: finite(current, "companion current")?,
         })
     }
 
@@ -695,10 +711,6 @@ impl Coefficients {
     /// # Errors
     ///
     /// [`SpiceError::Numerical`] for short/nonfinite history or results.
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "NIpred trapezoidal divided differences preserve the reference multiply/add order"
-    )]
     pub fn predict(&self, solutions: &[Real]) -> SpiceResult<Real> {
         let order = usize::from(self.order);
         if self.history < order || solutions.len() < order + 1 {
@@ -716,11 +728,11 @@ impl Coefficients {
             IntegrationMethod::Trapezoidal => {
                 let dd0 = (x[0] - x[1]) / d[1];
                 if order == 1 {
-                    x[0] + d[0] * dd0
+                    d[0].mul_add(dd0, x[0])
                 } else {
                     let b = -d[0] / (2.0 * d[1]);
                     let dd1 = (x[1] - x[2]) / d[2];
-                    x[0] + (b * dd1 + (1.0 - b) * dd0) * d[0]
+                    d[0].mul_add(b.mul_add(dd1, (1.0 - b) * dd0), x[0])
                 }
             }
             IntegrationMethod::Gear { .. } => {
@@ -760,10 +772,6 @@ impl Coefficients {
     ///
     /// [`SpiceError::Numerical`] for short/nonfinite inputs, invalid
     /// tolerances or a nonfinite result.
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "CKTterr uses separately rounded relative and absolute derivative tolerances"
-    )]
     pub fn truncation_timestep(
         &self,
         charge: &[Real],
@@ -789,7 +797,9 @@ impl Coefficients {
         if charge.iter().chain(&derivative).any(|v| !v.is_finite()) {
             return Err(numerical("nonfinite truncation-error history"));
         }
-        let volttol = tol.abstol + tol.reltol * derivative[0].abs().max(derivative[1].abs());
+        let volttol = tol
+            .reltol
+            .mul_add(derivative[0].abs().max(derivative[1].abs()), tol.abstol);
         let chargetol =
             tol.reltol * charge[0].abs().max(charge[1].abs()).max(tol.chgtol) / self.dt();
         let tolerance = finite(volttol.max(chargetol), "truncation tolerance")?;
@@ -832,7 +842,7 @@ mod tests {
         history
     }
 
-    /// Frozen binary64 results of the original unpivoted C-order corrector.
+    /// Prepared spans reproduce the recursive divided differences.
     #[test]
     fn prepared_truncation_spans_preserve_c_order_for_every_supported_order() {
         let mut history = StepHistory::new();
@@ -870,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn gear_corrector_preserves_reference_operation_order() {
+    fn gear_corrector_matches_exact_rational_weights() {
         let deltas = [0.125, 0.25, 0.1875, 0.375, 0.125, 0.3125, 0.0625];
         let expected = [
             [
@@ -910,8 +920,8 @@ mod tests {
                 0x0000_0000_0000_0000,
             ],
             [
-                0x402c_e792_3ce7_923b,
-                0xc034_2d02_d02d_02cf,
+                0x402c_e792_3ce7_923d,
+                0xc034_2d02_d02d_02d0,
                 0x4024_9b26_c9b2_6c9b,
                 0xc015_9659_6596_5966,
                 0x3ff6_5165_1651_6516,
@@ -919,10 +929,10 @@ mod tests {
                 0x0000_0000_0000_0000,
             ],
             [
-                0x402e_5bef_542d_63b8,
-                0xc036_3183_1831_831d,
-                0x402c_5555_5555_5559,
-                0xc022_4424_4244_2444,
+                0x402e_5bef_542d_63b1,
+                0xc036_3183_1831_8318,
+                0x402c_5555_5555_5555,
+                0xc022_4424_4244_2442,
                 0x4011_8918_9189_1892,
                 0xc004_5454_5454_5454,
                 0x3fc1_9ba5_5d3e_8e17,
@@ -930,7 +940,15 @@ mod tests {
         ];
         for (order, expected) in (1..=6).zip(expected) {
             let ag = super::gear_corrector(&deltas, order);
-            assert_eq!(ag.map(f64::to_bits), expected, "order {order}");
+            // Independent exact rational Lagrange derivatives, rounded only
+            // once to binary64. The small Vandermonde solve need not match
+            // either the exact rounding or C's intermediate rounding bitwise.
+            for (actual, reference) in ag.map(f64::to_bits).into_iter().zip(expected) {
+                assert!(
+                    actual.abs_diff(reference) <= 4,
+                    "order {order}: {actual:x} versus {reference:x}"
+                );
+            }
         }
     }
 
@@ -1078,6 +1096,43 @@ mod tests {
             let c = warm.trial(TRAP, order, h, DEFAULT_XMU).unwrap();
             assert!(close(c.predict(&line[1..]).unwrap(), line[0]));
         }
+    }
+
+    #[test]
+    fn charge_derivative_is_invariant_under_a_common_offset() {
+        let warm = history(&[0.125; 6]);
+        for method in [TRAP, GEAR6] {
+            for order in 1..=method.max_order() {
+                let c = warm.trial(method, order, 0.125, DEFAULT_XMU).unwrap();
+                let constant = [1e16; 7];
+                let zero = c.integrate(&constant, Some(0.), 1.).unwrap();
+                assert_eq!(zero.derivative, 0., "{method:?} order {order}");
+                // The unit-spaced charges remain exactly representable after
+                // adding this offset. The affine difference is invariant.
+                let charge = [12., 10., 8., 6., 4., 2., 0.];
+                let shifted = charge.map(|q| q + 1e15);
+                let a = c.integrate(&charge, Some(16.), 1.).unwrap();
+                let b = c.integrate(&shifted, Some(16.), 1.).unwrap();
+                assert_eq!(a.derivative.to_bits(), b.derivative.to_bits());
+                assert!(close(a.derivative, 16.), "{method:?} order {order}");
+            }
+        }
+    }
+
+    #[test]
+    fn representable_derivatives_survive_overflowing_charge_differences() {
+        let warm = history(&[4.; 6]);
+        let charge = [f64::MAX, -f64::MAX];
+        for method in [TRAP, GEAR6] {
+            let c = warm.trial(method, 1, 4., DEFAULT_XMU).unwrap();
+            let result = c.integrate(&charge, None, 1.).unwrap();
+            assert_eq!(result.derivative, f64::MAX * 0.5);
+            assert_eq!(result.current, f64::MAX * 0.25);
+        }
+        let c = warm.trial(TRAP, 2, 4., DEFAULT_XMU).unwrap();
+        let result = c.integrate(&charge, Some(0.), 1.).unwrap();
+        assert_eq!(result.derivative, f64::MAX);
+        assert_eq!(result.current, f64::MAX * 0.5);
     }
 
     #[test]
