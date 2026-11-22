@@ -269,14 +269,43 @@ impl Waveform {
                 ));
             }
         };
-        Ok(WaveformBreakpoints(Inner::Fixed(
-            fixed
+        Ok(WaveformBreakpoints(Inner::Fixed {
+            times: fixed
                 .into_iter()
                 .filter(|t| (t0..=t1).contains(t))
                 .collect::<Vec<_>>()
                 .into_iter(),
-        )))
+            role: if matches!(self, Self::Function(_)) {
+                EventRole::Unscheduled
+            } else {
+                EventRole::Landable
+            },
+        }))
     }
+}
+
+/// Timing provenance distinguishes physical events from C's scheduling
+/// requests. Only landable events are required to appear in both transient
+/// plots. The reference accept routines request neither analytic-function
+/// corners nor a synthetic fractional pulse-count cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventRole {
+    /// Physical corner requested by the C accept routines.
+    Landable,
+    /// Physical transition without a guaranteed C landing.
+    Unscheduled,
+    /// The extra request after a finite pulse train has ended.
+    RequestOnly,
+}
+
+/// A resolved waveform event, retaining the role assigned at generation
+/// rather than recovering it from rounded absolute-time arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaveformEvent {
+    /// Absolute event time.
+    pub time: Real,
+    /// Physical and scheduling meaning.
+    pub role: EventRole,
 }
 
 /// Lazy breakpoint sequence of one [`Waveform`] (see [`Waveform::breakpoints_in`]).
@@ -284,18 +313,32 @@ impl Waveform {
 pub struct WaveformBreakpoints(Inner);
 #[derive(Debug, Clone)]
 enum Inner {
-    Fixed(std::vec::IntoIter<Real>),
+    Fixed {
+        times: std::vec::IntoIter<Real>,
+        role: EventRole,
+    },
     Pulse(crate::devices::pulse::PulseBreakpoints),
     Pwl(crate::devices::functions::PwlBreakpoints),
+}
+impl WaveformBreakpoints {
+    /// Advance the same lazy timeline with physical/scheduling provenance.
+    pub fn next_event(&mut self) -> Option<WaveformEvent> {
+        match &mut self.0 {
+            Inner::Fixed { times, role } => {
+                times.next().map(|time| WaveformEvent { time, role: *role })
+            }
+            Inner::Pulse(it) => it.next_event(),
+            Inner::Pwl(it) => it.next().map(|time| WaveformEvent {
+                time,
+                role: EventRole::Landable,
+            }),
+        }
+    }
 }
 impl Iterator for WaveformBreakpoints {
     type Item = Real;
     fn next(&mut self) -> Option<Real> {
-        match &mut self.0 {
-            Inner::Fixed(it) => it.next(),
-            Inner::Pulse(it) => it.next(),
-            Inner::Pwl(it) => it.next(),
-        }
+        self.next_event().map(|event| event.time)
     }
 }
 

@@ -16,6 +16,7 @@
 //! nonpositive rise/fall, which [`PulseSpec::resolve`] reproduces); and every
 //! boundary has a defined left and right limit instead of a single sampled value.
 
+use super::linear::{EventRole, WaveformEvent};
 use crate::devices::Limit;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
@@ -402,7 +403,7 @@ pub struct PulseBreakpoints {
     /// plateau (a jump to V1 that is not already a corner).
     cut: Option<Real>,
     /// The remaining breakpoints once the count is exhausted.
-    tail: Option<[Option<Real>; 2]>,
+    tail: Option<[Option<WaveformEvent>; 2]>,
 }
 impl PulseBreakpoints {
     fn new(pulse: Pulse, t0: Real, t1: Real) -> SpiceResult<Self> {
@@ -428,7 +429,13 @@ impl PulseBreakpoints {
             let offset = cycle_position(stop, pulse.period).phase;
             (offset > 0. && offset < active).then_some(pulse.delay + stop)
         });
+        // A finite train never needs to visit the inactive cycles beyond
+        // its last scheduling request. Bound representable *visited* cycles,
+        // not the number of periods in an arbitrarily long final-time window.
         let last_cycle = ((t1 - pulse.delay) / pulse.period).floor();
+        let last_cycle = pulse.stop.map_or(last_cycle, |stop| {
+            last_cycle.min((stop / pulse.period).floor() + 1.)
+        });
         if !last_cycle.is_finite() || last_cycle >= MAX_CYCLE {
             return Err(invalid("breakpoint window spans too many periods"));
         }
@@ -455,19 +462,19 @@ impl PulseBreakpoints {
         })
     }
 }
-impl Iterator for PulseBreakpoints {
-    type Item = Real;
-    fn next(&mut self) -> Option<Real> {
+impl PulseBreakpoints {
+    pub(super) fn next_event(&mut self) -> Option<WaveformEvent> {
         while !self.done && self.last.is_none_or(|last| last < self.t1) {
             if let Some(tail) = &mut self.tail {
                 // After `tmax`: the cut (if any), then C's last request.
-                let Some(t) = tail.iter_mut().find_map(Option::take) else {
+                let Some(event) = tail.iter_mut().find_map(Option::take) else {
                     self.done = true;
                     break;
                 };
+                let t = event.time;
                 if t >= self.t0 && t <= self.t1 && self.last.is_none_or(|last| t > last) {
                     self.last = Some(t);
-                    return Some(t);
+                    return Some(event);
                 }
                 continue;
             }
@@ -500,15 +507,34 @@ impl Iterator for PulseBreakpoints {
                 // C's VSRCaccept stops once `time > tmax`, but the request it
                 // made at its last step before that is the first corner after
                 // `tmax`; landing there too keeps the step sequence C's.
-                self.tail = Some([self.cut.take(), Some(t)]);
+                self.tail = Some([
+                    self.cut.take().map(|time| WaveformEvent {
+                        time,
+                        role: EventRole::Unscheduled,
+                    }),
+                    Some(WaveformEvent {
+                        time: t,
+                        role: EventRole::RequestOnly,
+                    }),
+                ]);
             } else if t > self.t1 {
                 self.done = true;
             } else if t >= self.t0 && self.last.is_none_or(|last| t > last) {
                 self.last = Some(t);
-                return Some(t);
+                return Some(WaveformEvent {
+                    time: t,
+                    role: EventRole::Landable,
+                });
             }
         }
         None
+    }
+}
+
+impl Iterator for PulseBreakpoints {
+    type Item = Real;
+    fn next(&mut self) -> Option<Real> {
+        self.next_event().map(|event| event.time)
     }
 }
 
@@ -805,6 +831,30 @@ mod tests {
         assert_eq!(p.stop(), Some(0.5));
         assert_eq!(p.value_at(0.65, R).unwrap(), 0.);
     }
+    #[test]
+    fn finite_train_event_roles_and_long_inactive_window() {
+        let finite = pulse(1., 2., 3., 10.).with_count(1.4).unwrap();
+        let mut iterator = finite.breakpoints_in(0., 1e30).unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = iterator.next_event() {
+            events.push((event.time, event.role));
+        }
+        assert_eq!(
+            events,
+            [
+                (2., EventRole::Landable),
+                (3., EventRole::Landable),
+                (6., EventRole::Landable),
+                (8., EventRole::Landable),
+                (12., EventRole::Landable),
+                (13., EventRole::Landable),
+                (16., EventRole::Unscheduled),
+                (18., EventRole::RequestOnly),
+            ]
+        );
+        assert_eq!(finite.breakpoints_in(1e29, 1e30).unwrap().next(), None);
+    }
+
     #[test]
     fn input_validation_does_not_invent_transient_timing() {
         let spec = PulseSpec {

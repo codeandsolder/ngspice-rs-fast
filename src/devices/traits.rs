@@ -603,6 +603,13 @@ pub trait Device: fmt::Debug {
         Ok(None)
     }
 
+    /// The elaborated transient forcing of an independent source, after
+    /// any circuit-level source composition. This is the same descriptor
+    /// used by immutable source assembly, not a reparse of netlist setters.
+    fn source_waveform(&self) -> Option<&crate::devices::Waveform> {
+        None
+    }
+
     /// The RFSPICE port data, or None for every other device.
     fn rf_port(&self) -> Option<&crate::devices::sources::RfPort> {
         None

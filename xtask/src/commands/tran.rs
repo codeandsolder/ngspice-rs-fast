@@ -7,7 +7,7 @@
 //!   neighbouring samples of that plot. Interpolation is refused (an error, not
 //!   a pass) if a source breakpoint lies strictly between those two samples.
 //! * **Breakpoint**: a discontinuity or slope change of a source (PWL corner,
-//!   PULSE edge, from the deck AST via [`breakpoints`], never guessed from
+//!   PULSE edge, from the elaborated circuit via [`breakpoints`], never guessed from
 //!   data). The left and right limits are compared separately. A plot carries
 //!   two samples at the instant for a true jump (first = left, second = right);
 //!   a single sample is taken as both limits, which is exact for the continuous
@@ -22,15 +22,12 @@
 //! spacing is small against the circuit time constants; that is the caller's
 //! fixture design responsibility and is not hidden by a looser tolerance.
 
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use ngspice_rs::analysis::{Plot, PlotFlags};
-use ngspice_rs::netlist::ast::{
-    DeviceInstance, Netlist, ParameterKind, PositionedValue, PulseWaveform, PwlPoint,
-    SourceWaveform, Subcircuit,
-};
-use ngspice_rs::primitives::{exact_nonnegative_integer, parse_spice_number};
+use ngspice_rs::devices::linear::EventRole;
+use ngspice_rs::devices::{Circuit, TransientTiming};
+use ngspice_rs::primitives::exact_nonnegative_integer;
 
 use super::compare::{self, TranTolerance};
 
@@ -354,57 +351,36 @@ pub(super) fn transient(
     }
 }
 
-fn number(value: &PositionedValue, what: &str, device: &str) -> Result<f64, String> {
-    parse_spice_number(&value.text)
-        .filter(|v| v.is_finite())
-        .ok_or_else(|| format!("{device}: {what} '{}' is not a finite number", value.text))
-}
-
-/// Source breakpoints in `(0, tstop)` from the deck AST, sorted and deduplicated.
-///
-/// Only each source's last waveform setter counts (C applies setters in order).
-///
-/// * PWL (C `VSRCaccept`, `vsrcacct.c`): every knot time shifted by `td=`; with
-///   `r=` the knots after the repeat point recur every `t_last - r`.
-/// * PULSE: `TD + n*PER + {0, TR, TR+PW, TR+PW+TF}`, with C's defaults: `TR`/`TF`
-///   <= 0 or omitted -> `tstep`; `PW` omitted -> `tstop`, except exactly five
-///   values given -> 0; `PER` <= 0 or omitted -> `tstop`. A positive eighth
-///   field `NP` keeps only corners at or before `TD + NP*PER` (C sets none
-///   after it; its one extra request just past that time is not a corner).
-/// * SIN/EXP/SFFM/AM: none (C sets no breakpoints for them); fields are still
-///   checked to be numbers.
-///
-/// Only top-level V/I sources are inspected; a deck whose subcircuit
-/// definitions (at any depth) contain a V/I waveform source is rejected because
-/// waveforms inside them are not enumerated. Subcircuits without such sources
-/// (e.g. an op-amp macromodel) add no breakpoints and are accepted.
-/// Expression-valued or non-numeric waveform fields are errors.
-pub(super) fn breakpoints(
-    netlist: &Netlist,
-    time_step: f64,
-    stop_time: f64,
-) -> Result<Vec<f64>, String> {
-    if !(time_step.is_finite() && time_step > 0.0 && stop_time.is_finite() && stop_time > 0.0) {
-        return Err("tstep and tstop must be finite and positive".into());
-    }
-    if netlist.subcircuits.iter().any(has_waveform_source) {
-        return Err("breakpoints: subcircuit waveforms are not enumerated".into());
-    }
+/// Source breakpoints required to have samples in both transient plots.
+/// Uses the same validated, elaborated forcing as the driver, including
+/// nested parameterized sources and the effective last waveform setter.
+/// The timeline distinguishes physical-only corners and trailing scheduling
+/// requests, neither of which requires a C plot to supply a one-sided limit.
+pub(super) fn breakpoints(circuit: &Circuit, timing: &TransientTiming) -> Result<Vec<f64>, String> {
+    let stop_time = timing.final_time();
     let eps = TIME_EPS_REL * stop_time;
     let mut times = Vec::new();
-    for device in &netlist.devices {
-        if !matches!(device.designator, 'v' | 'i') {
+    let mut generated = 0;
+    for device in circuit.devices() {
+        let Some(waveform) = device.source_waveform() else {
             continue;
-        }
-        let waveform = device.parameters.iter().rev().find_map(|p| match &p.kind {
-            ParameterKind::Waveform(waveform) => Some(waveform),
-            _ => None,
-        });
-        if let Some(waveform) = waveform {
-            collect(device, waveform, time_step, stop_time, &mut times)?;
+        };
+        let waveform = waveform
+            .resolve(timing)
+            .map_err(|error| format!("{}: {error}", device.name()))?;
+        let mut events = waveform
+            .breakpoints_in(0., stop_time)
+            .map_err(|error| format!("{}: {error}", device.name()))?;
+        while let Some(event) = events.next_event() {
+            // Count all generated events before filtering or deduplication.
+            check_event_capacity(generated, 1)?;
+            generated += 1;
+            if event.role == EventRole::Landable && event.time > eps && event.time < stop_time - eps
+            {
+                times.push(event.time);
+            }
         }
     }
-    times.retain(|&t| t > eps && t < stop_time - eps);
     times.sort_by(f64::total_cmp);
     times.dedup_by(|b, a| (*b - *a).abs() <= eps);
     Ok(times)
@@ -437,53 +413,6 @@ pub(super) fn echoes(
     Ok(times)
 }
 
-/// Whether a subcircuit body, or one nested in it, defines a V/I source with a
-/// waveform setter.
-fn has_waveform_source(subcircuit: &Subcircuit) -> bool {
-    subcircuit.devices.iter().any(|device| {
-        matches!(device.designator, 'v' | 'i')
-            && device
-                .parameters
-                .iter()
-                .any(|p| matches!(p.kind, ParameterKind::Waveform(_)))
-    }) || subcircuit.subcircuits.iter().any(has_waveform_source)
-}
-
-/// The last scalar `name=` setter of `device`, if any.
-fn scalar(device: &DeviceInstance, name: &str) -> Result<Option<f64>, String> {
-    device
-        .parameters
-        .iter()
-        .rev()
-        .find(|p| p.name == name)
-        .map(|p| {
-            parse_spice_number(&p.value)
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| format!("{}: {name}= '{}' is not a number", device.name, p.value))
-        })
-        .transpose()
-}
-
-fn collect(
-    device: &DeviceInstance,
-    waveform: &SourceWaveform,
-    time_step: f64,
-    stop_time: f64,
-    out: &mut Vec<f64>,
-) -> Result<(), String> {
-    let name = device.name.as_str();
-    match waveform {
-        SourceWaveform::Pwl(points) => collect_pwl(device, points, stop_time, out)?,
-        SourceWaveform::Pulse(pulse) => collect_pulse(name, pulse, time_step, stop_time, out)?,
-        SourceWaveform::Function(function) => {
-            for (value, field) in function.values.iter().zip(function.function.fields()) {
-                number(value, field, name)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Bound the total event count before extending any waveform's output.
 fn check_event_capacity(existing: usize, additional: usize) -> Result<(), String> {
     let count = existing
@@ -494,121 +423,6 @@ fn check_event_capacity(existing: usize, additional: usize) -> Result<(), String
     } else {
         Err("too many generated breakpoints".into())
     }
-}
-
-fn collect_pwl(
-    device: &DeviceInstance,
-    points: &[PwlPoint],
-    stop_time: f64,
-    out: &mut Vec<f64>,
-) -> Result<(), String> {
-    let name = device.name.as_str();
-    let delay = scalar(device, "td")?.unwrap_or(0.0);
-    check_event_capacity(out.len(), points.len())?;
-    let knots = points
-        .iter()
-        .map(|point| number(&point.time, "PWL time", name))
-        .collect::<Result<Vec<_>, _>>()?;
-    let last = *knots.last().ok_or_else(|| format!("{name}: empty PWL"))?;
-    out.extend(knots.iter().map(|t| delay + t));
-    if let Some(r) = scalar(device, "r")?.filter(|&r| r >= -0.5) {
-        let start = knots
-            .iter()
-            .position(|&t| t.partial_cmp(&r) == Some(Ordering::Equal))
-            .ok_or_else(|| format!("{name}: r={r} matches no PWL time"))?;
-        let period = last - r;
-        if period <= 0.0 || (stop_time - delay - last) / period > f64::from(MAX_POINTS) / 4.0 {
-            return Err(format!(
-                "{name}: repeated PWL would create too many breakpoints"
-            ));
-        }
-        let mut cycle = 1_u32;
-        loop {
-            let previous_offset = f64::from(cycle - 1) * period;
-            let previous_end = delay + last + previous_offset;
-            if previous_end.partial_cmp(&stop_time) != Some(Ordering::Less) {
-                break;
-            }
-            if cycle > MAX_POINTS {
-                return Err(format!(
-                    "{name}: repeated PWL would create too many breakpoints"
-                ));
-            }
-            let offset = f64::from(cycle) * period;
-            check_event_capacity(out.len(), knots.len() - start - 1)?;
-            for &t in &knots[start + 1..] {
-                out.push(delay + t + offset);
-            }
-            cycle += 1;
-        }
-    }
-    Ok(())
-}
-
-fn collect_pulse(
-    name: &str,
-    pulse: &PulseWaveform,
-    time_step: f64,
-    stop_time: f64,
-    out: &mut Vec<f64>,
-) -> Result<(), String> {
-    let optional = [
-        &pulse.delay,
-        &pulse.rise,
-        &pulse.fall,
-        &pulse.width,
-        &pulse.period,
-    ];
-    let given = optional.iter().take_while(|v| v.is_some()).count();
-    let get = |value: &Option<PositionedValue>, what| -> Result<Option<f64>, String> {
-        value.as_ref().map(|v| number(v, what, name)).transpose()
-    };
-    let delay = get(&pulse.delay, "PULSE delay")?.unwrap_or(0.0);
-    let rise = get(&pulse.rise, "PULSE rise")?
-        .filter(|&v| v > 0.0)
-        .unwrap_or(time_step);
-    let fall = get(&pulse.fall, "PULSE fall")?
-        .filter(|&v| v > 0.0)
-        .unwrap_or(time_step);
-    let width = if given == 3 {
-        0.0
-    } else {
-        get(&pulse.width, "PULSE width")?
-            .filter(|&v| v >= 0.0)
-            .unwrap_or(stop_time)
-    };
-    let period = get(&pulse.period, "PULSE period")?
-        .filter(|&v| v > 0.0)
-        .unwrap_or(stop_time);
-    let stop = get(&pulse.count, "PULSE count")?
-        .filter(|&v| v > 0.0)
-        .map(|count| count * period);
-    // Validate level spellings too: an unparseable level is an error.
-    number(&pulse.initial, "PULSE v1", name)?;
-    number(&pulse.pulsed, "PULSE v2", name)?;
-    if (stop_time - delay) / period > f64::from(MAX_POINTS) / 4.0 {
-        return Err(format!("{name}: PULSE would create too many breakpoints"));
-    }
-    let mut cycle = 0_u32;
-    loop {
-        let offset = f64::from(cycle) * period;
-        let start = delay + offset;
-        if start.partial_cmp(&stop_time) != Some(Ordering::Less) {
-            break;
-        }
-        if cycle >= MAX_POINTS {
-            return Err(format!("{name}: PULSE would create too many breakpoints"));
-        }
-        for corner in [0.0, rise, rise + width, rise + width + fall] {
-            let local = offset + corner;
-            if stop.is_none_or(|stop| local <= stop) {
-                check_event_capacity(out.len(), 1)?;
-                out.push(delay + local);
-            }
-        }
-        cycle += 1;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -949,6 +763,18 @@ mod tests {
         }
     }
 
+    use ngspice_rs::netlist::ast::Netlist;
+
+    fn deck_breakpoints(netlist: &Netlist, step: f64, stop: f64) -> Result<Vec<f64>, String> {
+        let config =
+            ngspice_rs::analysis::RunConfig::from_netlist(netlist).map_err(|e| e.to_string())?;
+        let circuit = config.circuit(netlist).map_err(|e| e.to_string())?;
+        super::breakpoints(
+            &circuit,
+            &TransientTiming::new(step, stop).map_err(|e| e.to_string())?,
+        )
+    }
+
     fn deck(body: &str) -> Netlist {
         Parser::new()
             .parse_deck(&parse_deck_text(
@@ -960,47 +786,52 @@ mod tests {
 
     #[test]
     fn pwl_corners_become_breakpoints() {
-        let netlist = deck("v1 in 0 pwl(0 0 1m 0 1.01m 1 1.01m 2 6m 2 9m 0)");
-        let found = breakpoints(&netlist, 1e-5, 8e-3).unwrap();
+        let netlist = deck("v1 in 0 pwl(0 0 1m 0 1.01m 1 6m 2 9m 0)");
+        let found = deck_breakpoints(&netlist, 1e-5, 8e-3).unwrap();
         assert_eq!(found, vec![1e-3, 1.01e-3, 6e-3]);
-        assert!(breakpoints(&netlist, 0.0, 8e-3).is_err());
+        assert!(deck_breakpoints(&netlist, 0.0, 8e-3).is_err());
     }
 
     #[test]
-    fn only_subcircuits_holding_waveform_sources_are_refused() {
+    fn nested_and_parameterized_waveforms_use_expanded_sources() {
         // A source-free macromodel (the M6 gate's op-amp) adds no breakpoints.
         let netlist = deck(
             "v1 in 0 pulse(0 1 1m 1u 1u 1m)\n.subckt amp a b\ne1 b 0 a 0 2\n.ends\nx1 in out amp",
         );
         assert_eq!(
-            breakpoints(&netlist, 1e-5, 4e-3).unwrap(),
+            deck_breakpoints(&netlist, 1e-5, 4e-3).unwrap(),
             vec![1e-3, 1.001e-3, 2.001e-3, 2.002e-3]
         );
-        // A waveform source in a nested definition is not enumerated.
+        // Nested instances resolve their own formal parameters and names.
         let netlist = deck(
-            ".subckt outer a\n.subckt inner b\nv1 b 0 pulse(0 1)\n.ends\nx1 a inner\n.ends\nx1 n outer",
+            ".subckt outer a d=1m\n.subckt inner b td=1m\nv1 b 0 pulse(0 1 {td} 1u 2u 1m)\n.ends\nx1 a inner td={d}\n.ends\nx1 n outer d=0.5m\nx2 m outer d=1m",
         );
-        assert!(
-            breakpoints(&netlist, 1e-5, 4e-3)
-                .unwrap_err()
-                .contains("not enumerated")
-        );
+        let found = deck_breakpoints(&netlist, 1e-5, 4e-3).unwrap();
+        assert_eq!(found.len(), 8);
+        for (actual, expected) in found.iter().zip([
+            0.5e-3, 0.501e-3, 1e-3, 1.001e-3, 1.501e-3, 1.503e-3, 2.001e-3, 2.003e-3,
+        ]) {
+            assert!((actual - expected).abs() < 1e-15);
+        }
     }
 
     #[test]
     fn pulse_edges_follow_c_defaults_and_period() {
         // td=1, tr=1, tf=2, pw=3, per=10 over 0..25.
         let netlist = deck("v1 in 0 pulse(0 5 1 1 2 3 10)");
-        let found = breakpoints(&netlist, 0.1, 25.0).unwrap();
+        let found = deck_breakpoints(&netlist, 0.1, 25.0).unwrap();
         assert_eq!(
             found,
             vec![1.0, 2.0, 5.0, 7.0, 11.0, 12.0, 15.0, 17.0, 21.0, 22.0]
         );
         // Omitted tr/tf -> tstep; omitted pw with five values -> 0; per -> tstop.
         let netlist = deck("i1 in 0 pulse(0 1 0 0 0)");
-        assert_eq!(breakpoints(&netlist, 0.5, 4.0).unwrap(), vec![0.5, 1.0]);
+        assert_eq!(
+            deck_breakpoints(&netlist, 0.5, 4.0).unwrap(),
+            vec![0.5, 1.0]
+        );
         let netlist = deck("i1 in 0 pulse(0 1)");
-        assert_eq!(breakpoints(&netlist, 0.5, 4.0).unwrap(), vec![0.5]);
+        assert_eq!(deck_breakpoints(&netlist, 0.5, 4.0).unwrap(), vec![0.5]);
     }
 
     #[test]
@@ -1008,21 +839,21 @@ mod tests {
         // PULSE count: corners at or before td + np*per only.
         let netlist = deck("v1 in 0 pulse(0 5 1 1 2 3 10 2)");
         assert_eq!(
-            breakpoints(&netlist, 0.1, 40.0).unwrap(),
+            deck_breakpoints(&netlist, 0.1, 40.0).unwrap(),
             vec![1.0, 2.0, 5.0, 7.0, 11.0, 12.0, 15.0, 17.0, 21.0]
         );
         // PWL td=/r=: delayed knots, then the knots after r recur.
         let netlist = deck("v1 in 0 pwl(0 0 1 1 2 0) r=1 td=0.5");
         assert_eq!(
-            breakpoints(&netlist, 0.1, 5.0).unwrap(),
+            deck_breakpoints(&netlist, 0.1, 5.0).unwrap(),
             vec![0.5, 1.5, 2.5, 3.5, 4.5]
         );
         let netlist = deck("v1 in 0 pwl(0 0 1 1 2 0) r=-1 td=0.5");
         assert_eq!(
-            breakpoints(&netlist, 0.1, 5.0).unwrap(),
+            deck_breakpoints(&netlist, 0.1, 5.0).unwrap(),
             vec![0.5, 1.5, 2.5]
         );
-        assert!(breakpoints(&deck("v1 in 0 pwl(0 0 1 1) r=0.5"), 0.1, 5.0).is_err());
+        assert!(deck_breakpoints(&deck("v1 in 0 pwl(0 0 1 1) r=0.5"), 0.1, 5.0).is_err());
         // C sets no breakpoints for SIN/EXP/SFFM/AM; only the last setter counts.
         for card in [
             "v1 in 0 sin(0 1 1 0.5)",
@@ -1032,7 +863,7 @@ mod tests {
             "v1 in 0 pwl(0 0 1 1) sin(0 1)",
         ] {
             assert!(
-                breakpoints(&deck(card), 0.1, 5.0).unwrap().is_empty(),
+                deck_breakpoints(&deck(card), 0.1, 5.0).unwrap().is_empty(),
                 "{card}"
             );
         }
@@ -1041,15 +872,15 @@ mod tests {
     #[test]
     fn non_source_devices_and_out_of_range_corners_are_ignored() {
         let netlist = deck("v1 in 0 dc 1");
-        assert!(breakpoints(&netlist, 1.0, 5.0).unwrap().is_empty());
+        assert!(deck_breakpoints(&netlist, 1.0, 5.0).unwrap().is_empty());
         let netlist = deck("v1 in 0 pwl(0 0 9 1)");
-        assert!(breakpoints(&netlist, 1.0, 5.0).unwrap().is_empty());
+        assert!(deck_breakpoints(&netlist, 1.0, 5.0).unwrap().is_empty());
     }
 
     #[test]
     fn breakpoints_feed_the_comparator_end_to_end() {
-        let netlist = deck("v1 in 0 pwl(0 0 5 0 5 3 10 13)");
-        let bps = breakpoints(&netlist, 0.1, STOP).unwrap();
+        let netlist = deck("v1 in 0 pwl(0 0 5 3 10 13)");
+        let bps = deck_breakpoints(&netlist, 0.1, STOP).unwrap();
         assert_eq!(bps, vec![5.0]);
         run(&jump_plot(0.5), &jump_plot(0.2), &bps).unwrap();
     }

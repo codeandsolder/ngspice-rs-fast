@@ -580,6 +580,9 @@ impl Device for IndependentSource {
         }
         Ok(Some((self.effective_waveform().clone(), self.dc.value())))
     }
+    fn source_waveform(&self) -> Option<&Waveform> {
+        Some(self.effective_waveform())
+    }
     fn rf_port(&self) -> Option<&RfPort> {
         self.port.as_ref()
     }
