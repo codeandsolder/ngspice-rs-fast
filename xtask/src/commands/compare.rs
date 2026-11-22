@@ -431,16 +431,15 @@ fn validate_alternate_captures(
 }
 
 fn validate_resolution(got: &Plot, resolution: Option<&Plot>) -> Result<(), String> {
-    if let Some(resolution) = resolution {
-        if resolution.point_count() != got.point_count()
+    if let Some(resolution) = resolution
+        && (resolution.point_count() != got.point_count()
             || resolution.variables() != got.variables()
             || resolution
                 .cells()
                 .iter()
-                .any(|value| !value.is_finite() || value.re < 0. || value.im != 0.)
-        {
-            return Err("invalid sensitivity resolution diagnostic".to_owned());
-        }
+                .any(|value| !value.is_finite() || value.re < 0. || value.im != 0.))
+    {
+        return Err("invalid sensitivity resolution diagnostic".to_owned());
     }
     Ok(())
 }
@@ -533,8 +532,9 @@ pub(super) fn plots(
                 let resolution_floor = resolution
                     .and_then(|plot| plot.row(point))
                     .map_or(0., |row| row[got_columns[*key]].re);
-                let limit =
-                    tolerance.relative * want.abs() + tolerance.absolute.max(resolution_floor);
+                let limit = tolerance
+                    .relative
+                    .mul_add(want.abs(), tolerance.absolute.max(resolution_floor));
                 if error > limit {
                     mismatches += 1;
                     let report = format!(

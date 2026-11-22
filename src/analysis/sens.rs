@@ -1880,7 +1880,7 @@ mod tests {
         let options = crate::analysis::newton::NewtonOptions {
             abstol: 1e-16,
             vntol: 1e-13,
-            ..Default::default()
+            ..crate::analysis::newton::NewtonOptions::default()
         };
         let resolution = Resolution {
             plot,
