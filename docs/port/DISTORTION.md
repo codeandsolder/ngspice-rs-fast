@@ -215,3 +215,36 @@ backward-residual guards (`ComplexLu::solve`), which can refuse some
 well-posed reactive systems (#128); the fixtures avoid such values.
 
 `.options keepopinfo` retains the preceding `Distortion Operating Point` plot.
+
+## Reused distortion workspace (#125)
+
+Baseline `72bfa4c7b3663eec387be97df77e64b1d8934f45`; candidate from the typed workspace implementation `c2d3fd0` and benchmark `18d3317`, before the equivalent factor-selection expression cleanup. Acer Ryzen 7 4700U, pinned nightly, generic release, managed sccache.
+
+Source RHS vectors are prepared once (case-insensitive source-index binding, C device order and current-input sign retained). The run-local enum selects harmonic or intermodulation storage; three and six solution vectors respectively, with one reusable product RHS, conjugation buffer, solver scratch and scaled output row. Each frequency executes the same three or six factor/solve steps as before, even for zero RHS. No factor cache or new pivot-reuse policy. The second tone remains fixed at the start frequency times the ratio. Pattern-bound assembly keeps signed omega; standalone fallback conjugates both input and output. Every product stamps from a cleared RHS, prior solution slots are overwritten before use, and all plots remain local until the run succeeds.
+
+For n unknowns, reusable complex-cell storage is 8n+2 in harmonic mode (three kernel slots, first forcing, product RHS, conjugation, solve scratch and output row) and 12n+2 in intermodulation mode (six kernels and both forcings). These are capacity targets excluding matrix assembly/factors, device terms, schema/grid and packed retained output. Plot storage is reserved once, checked against rectangular dimensions and allocation limits; no nested scaled-output vectors or per-frequency row allocations.
+
+The benchmark builds the same parsed and reactive diode/RC circuits in baseline and candidate worktrees, uses 4/32/128 branches and 2,002/1,002/402 frequencies, and repeats each case three times with interleaved order under perf stat. Median userspace task-clock includes setup/teardown and all solves, not just buffer handling. DHAT totals and peak live heap include the entire test process; per-point differences include setup and output reservation effects, not just isolated allocator calls.
+
+| Workload | Points | Baseline CPU (ms) | Candidate CPU (ms) | Digest |
+|---|---:|---:|---:|---|
+| harmonic_small | 2002 | 7.21 | 7.03 | `f2f283f24157f620` |
+| harmonic_medium | 1002 | 14.06 | 13.88 | `88570693ef1cd380` |
+| harmonic_large | 402 | 21.60 | 22.39 | `8ee81539c565aca8` |
+| intermod_small | 2002 | 11.70 | 10.70 | `5174825f2ec3773c` |
+| intermod_medium | 1002 | 22.96 | 22.86 | `a32a5ba263b198bf` |
+| intermod_large | 402 | 37.68 | 37.03 | `cf2ae12fc10c5eda` |
+
+| Workload | Baseline allocated bytes / blocks | Candidate allocated bytes / blocks | Bytes saved per point | Blocks saved per point | Peak heap before / after (bytes) |
+|---|---:|---:|---:|---:|---:|
+| harmonic_small | 2,572,628 / 28,262 | 925,301 / 8,236 | 823 | 10.00 | 412,956 / 406,285 |
+| harmonic_medium | 9,555,699 / 26,291 | 3,760,528 / 16,327 | 5,784 | 9.94 | 1,520,724 / 1,499,045 |
+| harmonic_large | 18,567,076 / 56,161 | 8,584,217 / 52,405 | 24,833 | 9.34 | 3,794,749 / 3,346,830 |
+| intermod_small | 4,263,863 / 48,331 | 1,472,320 / 14,287 | 1,394 | 17.00 | 578,728 / 568,065 |
+| intermod_medium | 15,823,146 / 36,477 | 5,846,589 / 19,524 | 9,957 | 16.92 | 2,072,764 / 2,038,949 |
+| intermod_large | 28,992,323 / 60,762 | 11,955,114 / 54,314 | 42,381 | 16.04 | 4,896,325 / 4,219,310 |
+
+All digests match on all runs, including DHAT. Cumulative allocation savings are substantial but the CPU changes are mostly small, as assembly/factorization dominates and the runs are short. The large harmonic sample is slightly slower (3.7%); do not infer a universal speedup. No matrix factorization behavior or tolerance changed.
+
+Reproduce using `cargo +nightly test --locked --release --test distortion_workspace_bench -- --ignored --nocapture`; run the individual exact tests under perf stat and valgrind --tool=dhat (same benchmark file in a detached baseline). Logs `arch-1122-a7c9-next-125-perf.log` and `arch-1122-a7c9-next-125-{baseline,candidate}-*-dhat.log` under the campaign state logs.
+
