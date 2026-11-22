@@ -433,32 +433,48 @@ pub fn erfc(x: Real) -> Real {
         }
         return 1. - 2. / PI.sqrt() * sum;
     }
-    if x > 27. {
+    if !x.is_finite() {
         return 0.;
     }
-    // Lentz: f = x + a1/(x + a2/(x + ...)), a_n = n/2.
-    let tiny = 1e-300;
+    let [_, _, denominator] = erfc_tail(x);
+    (-x * x).exp() / (PI.sqrt() * denominator)
+}
+
+/// For x >= 2, represent
+/// erfc(x) = exp(-x^2)/(sqrt(pi)*(x + u)),
+/// u = (1/2)/(x+v), v = 1/(x+3/2/(x+...)).
+/// Return the two small corrections as well as the full denominator;
+/// RC integrals can use them without subtracting nearly equal terms.
+fn erfc_tail(x: Real) -> [Real; 3] {
+    // Lentz's algorithm for the positive fraction starting at a3.
     let mut f = x;
     let mut c = f;
     let mut d = 0.;
-    for n in 1..=500 {
+    for n in 3..=500 {
         let a = Real::from(n) / 2.;
-        d = x + a * d;
-        if d == 0. {
-            d = tiny;
-        }
+        d = a.mul_add(d, x).recip();
         c = x + a / c;
-        if c == 0. {
-            c = tiny;
-        }
-        d = 1. / d;
         let delta = c * d;
         f *= delta;
-        if (delta - 1.).abs() < 1e-16 {
+        if (delta - 1.).abs() <= Real::EPSILON {
             break;
         }
     }
-    (-x * x).exp() / (PI.sqrt() * f)
+    let v = f.recip();
+    let u = 0.5 / (x + v);
+    [u, v, x + u]
+}
+
+/// Multiply by exp(-z), retaining representable results even if exp(-z)
+/// itself is subnormal or rounds to zero.
+fn attenuated(value: Real, z: Real) -> Real {
+    let decay = (-z).exp();
+    if decay.is_normal() {
+        value * decay
+    } else {
+        let half = (-0.5 * z).exp();
+        (value * half) * half
+    }
 }
 
 /// The coefficients of one convolution step: the factor of the newest
@@ -486,6 +502,57 @@ impl Coefficients {
     }
 }
 
+/// RC endpoint laws, with the root of the lag stored directly for the
+/// rationalized first-kernel divided differences.
+#[derive(Clone, Copy)]
+struct RcKernel {
+    rclsqr: Real,
+    scale: Real,
+}
+
+impl RcKernel {
+    fn new(cbyr: Real, rclsqr: Real) -> Self {
+        Self {
+            rclsqr,
+            scale: 2. * cbyr.sqrt() / PI.sqrt(),
+        }
+    }
+
+    fn at(self, lag: Real, active: [bool; 3]) -> [Real; 3] {
+        let root = lag.sqrt();
+        if lag == 0. || !(active[1] || active[2]) {
+            return [root, 0., 0.];
+        }
+        // Avoid forming 4*lag before division.
+        let z = (self.rclsqr / lag) * 0.25;
+        if z.is_infinite() {
+            return [root, 0., 0.];
+        }
+        let x = z.sqrt();
+        let (h2, h3) = if x < 2. {
+            let complementary = erfc(x);
+            let decay = (-z).exp();
+            let h2 = (2_f64.mul_add(z, 1.)).mul_add(complementary, -2. * x * decay / PI.sqrt());
+            let h3 = (-PI.sqrt() * x).mul_add(complementary, decay);
+            (lag * h2, (self.scale * root) * h3)
+        } else {
+            let [u, v, denominator] = erfc_tail(x);
+            // h2 bracket = ((1+2*x*x)/(x+u) - 2*x)/sqrt(pi)
+            // = v / ((x+v)*(x+u)*sqrt(pi)).
+            // h3 bracket = 1 - x/(x+u) = u/(x+u).
+            let h2_factor = (v / (x + v)) / denominator / PI.sqrt();
+            let h2 = attenuated(lag * h2_factor, z);
+            let h3 = self.scale * attenuated(root * (u / denominator), z);
+            (h2, h3)
+        };
+        [
+            root,
+            if active[1] { h2 } else { 0. },
+            if active[2] { h3 } else { 0. },
+        ]
+    }
+}
+
 /// `LTRArcCoeffsSetup` (the `L = G = 0` line): coefficients at `curtime` over
 /// the accepted times `times[0..=index]`, with C's chopping tolerance
 /// `reltol` (C's `LTRAchopReltol`, always 0 from a deck).
@@ -499,97 +566,51 @@ pub fn rc_coefficients(
 ) -> Coefficients {
     let index = times.len() - 1;
     let mut out = Coefficients::with_len(times.len());
-    let (mut doh1, mut doh2, mut doh3) = (true, true, true);
-
-    let mut delta1 = curtime - times[index];
-    let mut hilimit1 = delta1;
-
-    let mut h1hivalue1 = (4. * cbyr * hilimit1 / PI).sqrt();
-    let mut h1dummy1 = h1hivalue1 / delta1;
-    out.first[0] = h1dummy1;
-    let h1relval = (h1dummy1 * reltol).abs();
-
-    let mut temp = rclsqr / (4. * hilimit1);
-    let mut temp2 = if temp >= 100.0 {
-        0.0
-    } else {
-        erfc(temp.sqrt())
-    };
-    let mut temp3 = (-temp).exp();
-    let temp4 = rclsqr.sqrt();
-    let temp5 = cbyr.sqrt();
-
-    let h2value = |hilimit: Real, temp2: Real, temp3: Real| {
-        if hilimit == 0.0 {
-            0.0
-        } else {
-            (hilimit + rclsqr * 0.5) * temp2 - (hilimit * rclsqr / PI).sqrt() * temp3
-        }
-    };
-    let h3value = |hilimit: Real, temp2: Real, temp3: Real| {
-        if hilimit == 0.0 {
-            0.0
-        } else {
-            temp5 * (2. * (hilimit / PI).sqrt() * temp3 - temp4 * temp2)
-        }
-    };
-
-    let mut h2hivalue1 = h2value(hilimit1, temp2, temp3);
-    let mut h2dummy1 = h2hivalue1 / delta1;
-    out.first[1] = h2dummy1;
-    let h2relval = (h2dummy1 * reltol).abs();
-
-    let mut h3hivalue1 = h3value(hilimit1, temp2, temp3);
-    let mut h3dummy1 = h3hivalue1 / delta1;
-    out.first[2] = h3dummy1;
-    let h3relval = (h3dummy1 * reltol).abs();
+    let kernel = RcKernel::new(cbyr, rclsqr);
+    let mut active = [true; 3];
+    let lag = curtime - times[index];
+    let mut previous = kernel.at(lag, active);
+    let mut slopes = [
+        kernel.scale / previous[0],
+        previous[1] / lag,
+        previous[2] / lag,
+    ];
+    out.first = slopes;
+    let thresholds = slopes.map(|slope| (slope * reltol).abs());
+    let mut earlier_root = 0.;
+    let mut previous_delta = lag;
 
     for i in (1..=index).rev() {
-        delta1 = times[i] - times[i - 1];
-        hilimit1 = curtime - times[i - 1];
-
-        if doh1 {
-            let h1hivalue2 = h1hivalue1;
-            let h1dummy2 = h1dummy1;
-            let h1lovalue1 = h1hivalue2;
-            h1hivalue1 = (4. * cbyr * hilimit1 / PI).sqrt();
-            h1dummy1 = (h1hivalue1 - h1lovalue1) / delta1;
-            out.weights[i][0] = h1dummy1 - h1dummy2;
-            if out.weights[i][0].abs() < h1relval {
-                doh1 = false;
+        if !active.iter().any(|&enabled| enabled) {
+            break;
+        }
+        let delta = times[i] - times[i - 1];
+        let endpoint = kernel.at(curtime - times[i - 1], active);
+        let weight = &mut out.weights[i];
+        if active[0] {
+            // H1(t)=scale*sqrt(t). Rationalize both divided differences:
+            // S_new = scale/(sqrt(hi)+sqrt(lo)),
+            // S_new-S_old = -S_new*(sqrt(hi)-sqrt(earlier))/old_den.
+            // hi-earlier is the sum of the two actual accepted intervals,
+            // even if the absolute lag coordinates round to the same bits.
+            let root = endpoint[0];
+            let old_den = previous[0] + earlier_root;
+            let new_slope = kernel.scale / (root + previous[0]);
+            let root_difference = (delta + previous_delta) / (root + earlier_root);
+            weight[0] = -new_slope * (root_difference / old_den);
+            active[0] = weight[0].abs() >= thresholds[0];
+        }
+        for k in 1..3 {
+            if active[k] {
+                let slope = (endpoint[k] - previous[k]) / delta;
+                weight[k] = slope - slopes[k];
+                slopes[k] = slope;
+                active[k] = weight[k].abs() >= thresholds[k];
             }
         }
-        if doh2 || doh3 {
-            temp = rclsqr / (4. * hilimit1);
-            temp2 = if temp >= 100.0 {
-                0.0
-            } else {
-                erfc(temp.sqrt())
-            };
-            temp3 = (-temp).exp();
-        }
-        if doh2 {
-            let h2hivalue2 = h2hivalue1;
-            let h2dummy2 = h2dummy1;
-            let h2lovalue1 = h2hivalue2;
-            h2hivalue1 = h2value(hilimit1, temp2, temp3);
-            h2dummy1 = (h2hivalue1 - h2lovalue1) / delta1;
-            out.weights[i][1] = h2dummy1 - h2dummy2;
-            if out.weights[i][1].abs() < h2relval {
-                doh2 = false;
-            }
-        }
-        if doh3 {
-            let h3hivalue2 = h3hivalue1;
-            let h3dummy2 = h3dummy1;
-            let h3lovalue1 = h3hivalue2;
-            h3hivalue1 = h3value(hilimit1, temp2, temp3);
-            h3dummy1 = (h3hivalue1 - h3lovalue1) / delta1;
-            out.weights[i][2] = h3dummy1 - h3dummy2;
-            if out.weights[i][2].abs() < h3relval {
-                doh3 = false;
-            }
-        }
+        earlier_root = previous[0];
+        previous_delta = delta;
+        previous = endpoint;
     }
     out.aux_index = index;
     out
@@ -869,6 +890,36 @@ mod tests {
         assert!(c.weights[1..].iter().all(|v| v[0].is_finite()));
         // Second differences of a concave sqrt are negative.
         assert!(c.weights[1..].iter().all(|v| v[0] < 0.));
+    }
+
+    #[test]
+    fn rc_far_history_weights_do_not_disappear_when_absolute_lags_round_equal() {
+        let times = VecDeque::from([0., 0.25, 0.5, 0.75]);
+        let c = rc_coefficients(1., 1., 1e16, &times, 0.);
+        let scale = 2. / PI.sqrt();
+        // Adjacent sqrt divided differences have separation
+        // -scale * (dt_prev + dt_next)/(8 * lag^(3/2)).
+        let expected = -scale * 0.5 / (8. * 1e24);
+        for w in &c.weights[1..3] {
+            assert!((w[0] - expected).abs() <= 8. * Real::EPSILON * expected.abs());
+        }
+    }
+
+    #[test]
+    fn rc_diffusion_tails_remain_positive_and_match_precise_integrals() {
+        let lag = 1.;
+        let cbyr = 1.;
+        for z in [0.01, 1., 4., 25., 100., 400.] {
+            let kernel = RcKernel::new(cbyr, 4. * z);
+            let [_, h2, h3] = kernel.at(lag, [true; 3]);
+            assert!(h2 > 0. && h3 > 0., "z={z} h2={h2:e} h3={h3:e}");
+        }
+        // erfc(27) is a positive subnormal, not zero.
+        assert!(erfc(27.) > 0.);
+        let kernel = RcKernel::new(1., 4000. * 1e100);
+        let [_, h2, h3] = kernel.at(1e100, [true; 3]);
+        assert!(h2 > 0.);
+        assert_eq!(h3, 0.);
     }
 
     #[test]
