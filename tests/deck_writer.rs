@@ -527,7 +527,7 @@ fn unrepresentable_asts_are_explicit_errors() {
     n.cards.push(ngspice_rs::netlist::ast::ScopedCard {
         kind: ScopedCardKind::Ends,
         source: n.cards[0].source.clone(),
-        include_chain: Vec::new(),
+        include_chain: std::sync::Arc::default(),
     });
     refused(&n, "outside a subcircuit");
 
