@@ -6,6 +6,30 @@
 
 use crate::primitives::Real;
 
+/// Hardware fusion is useful when it is part of the compilation target.
+/// The baseline x86-64 target lowers scalar FMA to a costly libm call:
+/// the composed derivative-chain benchmark measured 10.1x slowdown.
+/// These analytic recurrences reduce cancellation separately; on targets
+/// without native fusion, ordinary products and sums are the fast path.
+#[inline]
+#[cfg_attr(
+    not(any(target_feature = "fma", target_arch = "aarch64")),
+    expect(
+        clippy::suboptimal_flops,
+        reason = "portable scalar FMA measured 10.1x slower in the derivative-chain benchmark"
+    )
+)]
+fn accumulate_product(a: Real, b: Real, c: Real) -> Real {
+    #[cfg(any(target_feature = "fma", target_arch = "aarch64"))]
+    {
+        a.mul_add(b, c)
+    }
+    #[cfg(not(any(target_feature = "fma", target_arch = "aarch64")))]
+    {
+        a * b + c
+    }
+}
+
 /// C's `Dderivs`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(in crate::devices) struct Dderivs {
@@ -123,81 +147,102 @@ impl Dderivs {
             d1_p: first * self.d1_p,
             d1_q: first * self.d1_q,
             d1_r: first * self.d1_r,
-            d2_p2: first.mul_add(self.d2_p2, second * self.d1_p * self.d1_p),
-            d2_q2: first.mul_add(self.d2_q2, second * self.d1_q * self.d1_q),
-            d2_r2: first.mul_add(self.d2_r2, second * self.d1_r * self.d1_r),
-            d2_pq: first.mul_add(self.d2_pq, second * self.d1_p * self.d1_q),
-            d2_qr: first.mul_add(self.d2_qr, second * self.d1_q * self.d1_r),
-            d2_pr: first.mul_add(self.d2_pr, second * self.d1_p * self.d1_r),
-            d3_p3: first.mul_add(
+            d2_p2: accumulate_product(first, self.d2_p2, second * self.d1_p * self.d1_p),
+            d2_q2: accumulate_product(first, self.d2_q2, second * self.d1_q * self.d1_q),
+            d2_r2: accumulate_product(first, self.d2_r2, second * self.d1_r * self.d1_r),
+            d2_pq: accumulate_product(first, self.d2_pq, second * self.d1_p * self.d1_q),
+            d2_qr: accumulate_product(first, self.d2_qr, second * self.d1_q * self.d1_r),
+            d2_pr: accumulate_product(first, self.d2_pr, second * self.d1_p * self.d1_r),
+            d3_p3: accumulate_product(
+                first,
                 self.d3_p3,
-                second.mul_add(
+                accumulate_product(
+                    second,
                     3. * self.d2_p2 * self.d1_p,
                     third * self.d1_p * self.d1_p * self.d1_p,
                 ),
             ),
-            d3_q3: first.mul_add(
+            d3_q3: accumulate_product(
+                first,
                 self.d3_q3,
-                second.mul_add(
+                accumulate_product(
+                    second,
                     3. * self.d2_q2 * self.d1_q,
                     third * self.d1_q * self.d1_q * self.d1_q,
                 ),
             ),
-            d3_r3: first.mul_add(
+            d3_r3: accumulate_product(
+                first,
                 self.d3_r3,
-                second.mul_add(
+                accumulate_product(
+                    second,
                     3. * self.d2_r2 * self.d1_r,
                     third * self.d1_r * self.d1_r * self.d1_r,
                 ),
             ),
-            d3_p2r: first.mul_add(
+            d3_p2r: accumulate_product(
+                first,
                 self.d3_p2r,
-                second.mul_add(
-                    self.d2_p2.mul_add(self.d1_r, 2. * self.d2_pr * self.d1_p),
+                accumulate_product(
+                    second,
+                    accumulate_product(self.d2_p2, self.d1_r, 2. * self.d2_pr * self.d1_p),
                     third * self.d1_p * self.d1_p * self.d1_r,
                 ),
             ),
-            d3_p2q: first.mul_add(
+            d3_p2q: accumulate_product(
+                first,
                 self.d3_p2q,
-                second.mul_add(
-                    self.d2_p2.mul_add(self.d1_q, 2. * self.d2_pq * self.d1_p),
+                accumulate_product(
+                    second,
+                    accumulate_product(self.d2_p2, self.d1_q, 2. * self.d2_pq * self.d1_p),
                     third * self.d1_p * self.d1_p * self.d1_q,
                 ),
             ),
-            d3_q2r: first.mul_add(
+            d3_q2r: accumulate_product(
+                first,
                 self.d3_q2r,
-                second.mul_add(
-                    self.d2_q2.mul_add(self.d1_r, 2. * self.d2_qr * self.d1_q),
+                accumulate_product(
+                    second,
+                    accumulate_product(self.d2_q2, self.d1_r, 2. * self.d2_qr * self.d1_q),
                     third * self.d1_q * self.d1_q * self.d1_r,
                 ),
             ),
-            d3_pq2: first.mul_add(
+            d3_pq2: accumulate_product(
+                first,
                 self.d3_pq2,
-                second.mul_add(
-                    (2. * self.d2_pq).mul_add(self.d1_q, self.d2_q2 * self.d1_p),
+                accumulate_product(
+                    second,
+                    accumulate_product((2. * self.d2_pq), self.d1_q, self.d2_q2 * self.d1_p),
                     third * self.d1_p * self.d1_q * self.d1_q,
                 ),
             ),
-            d3_pr2: first.mul_add(
+            d3_pr2: accumulate_product(
+                first,
                 self.d3_pr2,
-                second.mul_add(
-                    (2. * self.d2_pr).mul_add(self.d1_r, self.d2_r2 * self.d1_p),
+                accumulate_product(
+                    second,
+                    accumulate_product((2. * self.d2_pr), self.d1_r, self.d2_r2 * self.d1_p),
                     third * self.d1_p * self.d1_r * self.d1_r,
                 ),
             ),
-            d3_qr2: first.mul_add(
+            d3_qr2: accumulate_product(
+                first,
                 self.d3_qr2,
-                second.mul_add(
-                    (2. * self.d2_qr).mul_add(self.d1_r, self.d2_r2 * self.d1_q),
+                accumulate_product(
+                    second,
+                    accumulate_product((2. * self.d2_qr), self.d1_r, self.d2_r2 * self.d1_q),
                     third * self.d1_q * self.d1_r * self.d1_r,
                 ),
             ),
-            d3_pqr: first.mul_add(
+            d3_pqr: accumulate_product(
+                first,
                 self.d3_pqr,
-                second.mul_add(
-                    self.d2_pq.mul_add(
+                accumulate_product(
+                    second,
+                    accumulate_product(
+                        self.d2_pq,
                         self.d1_r,
-                        self.d2_pr.mul_add(self.d1_q, self.d2_qr * self.d1_p),
+                        accumulate_product(self.d2_pr, self.d1_q, self.d2_qr * self.d1_p),
                     ),
                     third * self.d1_p * self.d1_q * self.d1_r,
                 ),
@@ -224,26 +269,50 @@ impl Dderivs {
         let (a, b) = (self, other);
         let mut result = Self {
             value: a.value * b.value,
-            d1_p: a.d1_p.mul_add(b.value, a.value * b.d1_p),
-            d1_q: a.d1_q.mul_add(b.value, a.value * b.d1_q),
-            d1_r: a.d1_r.mul_add(b.value, a.value * b.d1_r),
-            d2_p2: (2. * a.d1_p).mul_add(b.d1_p, a.d2_p2.mul_add(b.value, a.value * b.d2_p2)),
-            d2_q2: (2. * a.d1_q).mul_add(b.d1_q, a.d2_q2.mul_add(b.value, a.value * b.d2_q2)),
-            d2_r2: (2. * a.d1_r).mul_add(b.d1_r, a.d2_r2.mul_add(b.value, a.value * b.d2_r2)),
-            d2_pq: a.d1_q.mul_add(
+            d1_p: accumulate_product(a.d1_p, b.value, a.value * b.d1_p),
+            d1_q: accumulate_product(a.d1_q, b.value, a.value * b.d1_q),
+            d1_r: accumulate_product(a.d1_r, b.value, a.value * b.d1_r),
+            d2_p2: accumulate_product(
+                (2. * a.d1_p),
                 b.d1_p,
-                a.d1_p
-                    .mul_add(b.d1_q, a.d2_pq.mul_add(b.value, a.value * b.d2_pq)),
+                accumulate_product(a.d2_p2, b.value, a.value * b.d2_p2),
             ),
-            d2_qr: a.d1_r.mul_add(
+            d2_q2: accumulate_product(
+                (2. * a.d1_q),
                 b.d1_q,
-                a.d1_q
-                    .mul_add(b.d1_r, a.d2_qr.mul_add(b.value, a.value * b.d2_qr)),
+                accumulate_product(a.d2_q2, b.value, a.value * b.d2_q2),
             ),
-            d2_pr: a.d1_r.mul_add(
+            d2_r2: accumulate_product(
+                (2. * a.d1_r),
+                b.d1_r,
+                accumulate_product(a.d2_r2, b.value, a.value * b.d2_r2),
+            ),
+            d2_pq: accumulate_product(
+                a.d1_q,
                 b.d1_p,
-                a.d1_p
-                    .mul_add(b.d1_r, a.d2_pr.mul_add(b.value, a.value * b.d2_pr)),
+                accumulate_product(
+                    a.d1_p,
+                    b.d1_q,
+                    accumulate_product(a.d2_pq, b.value, a.value * b.d2_pq),
+                ),
+            ),
+            d2_qr: accumulate_product(
+                a.d1_r,
+                b.d1_q,
+                accumulate_product(
+                    a.d1_q,
+                    b.d1_r,
+                    accumulate_product(a.d2_qr, b.value, a.value * b.d2_qr),
+                ),
+            ),
+            d2_pr: accumulate_product(
+                a.d1_r,
+                b.d1_p,
+                accumulate_product(
+                    a.d1_p,
+                    b.d1_r,
+                    accumulate_product(a.d2_pr, b.value, a.value * b.d2_pr),
+                ),
             ),
             ..Self::default()
         };
@@ -252,93 +321,155 @@ impl Dderivs {
     }
 
     fn mul_third_order(&mut self, a: &Self, b: &Self) {
-        self.d3_p3 = (3. * a.d2_p2).mul_add(
+        self.d3_p3 = accumulate_product(
+            (3. * a.d2_p2),
             b.d1_p,
-            (3. * a.d1_p).mul_add(b.d2_p2, a.d3_p3.mul_add(b.value, a.value * b.d3_p3)),
+            accumulate_product(
+                (3. * a.d1_p),
+                b.d2_p2,
+                accumulate_product(a.d3_p3, b.value, a.value * b.d3_p3),
+            ),
         );
-        self.d3_q3 = (3. * a.d2_q2).mul_add(
+        self.d3_q3 = accumulate_product(
+            (3. * a.d2_q2),
             b.d1_q,
-            (3. * a.d1_q).mul_add(b.d2_q2, a.d3_q3.mul_add(b.value, a.value * b.d3_q3)),
+            accumulate_product(
+                (3. * a.d1_q),
+                b.d2_q2,
+                accumulate_product(a.d3_q3, b.value, a.value * b.d3_q3),
+            ),
         );
-        self.d3_r3 = (3. * a.d2_r2).mul_add(
+        self.d3_r3 = accumulate_product(
+            (3. * a.d2_r2),
             b.d1_r,
-            (3. * a.d1_r).mul_add(b.d2_r2, a.d3_r3.mul_add(b.value, a.value * b.d3_r3)),
+            accumulate_product(
+                (3. * a.d1_r),
+                b.d2_r2,
+                accumulate_product(a.d3_r3, b.value, a.value * b.d3_r3),
+            ),
         );
-        self.d3_p2r = (2. * a.d2_pr).mul_add(
+        self.d3_p2r = accumulate_product(
+            (2. * a.d2_pr),
             b.d1_p,
-            a.d2_p2.mul_add(
+            accumulate_product(
+                a.d2_p2,
                 b.d1_r,
-                a.d1_r.mul_add(
+                accumulate_product(
+                    a.d1_r,
                     b.d2_p2,
-                    (2. * a.d1_p).mul_add(b.d2_pr, a.d3_p2r.mul_add(b.value, a.value * b.d3_p2r)),
+                    accumulate_product(
+                        (2. * a.d1_p),
+                        b.d2_pr,
+                        accumulate_product(a.d3_p2r, b.value, a.value * b.d3_p2r),
+                    ),
                 ),
             ),
         );
-        self.d3_p2q = (2. * a.d2_pq).mul_add(
+        self.d3_p2q = accumulate_product(
+            (2. * a.d2_pq),
             b.d1_p,
-            a.d2_p2.mul_add(
+            accumulate_product(
+                a.d2_p2,
                 b.d1_q,
-                a.d1_q.mul_add(
+                accumulate_product(
+                    a.d1_q,
                     b.d2_p2,
-                    (2. * a.d1_p).mul_add(b.d2_pq, a.d3_p2q.mul_add(b.value, a.value * b.d3_p2q)),
-                ),
-            ),
-        );
-        self.d3_q2r = (2. * a.d2_qr).mul_add(
-            b.d1_q,
-            a.d2_q2.mul_add(
-                b.d1_r,
-                a.d1_r.mul_add(
-                    b.d2_q2,
-                    (2. * a.d1_q).mul_add(b.d2_qr, a.d3_q2r.mul_add(b.value, a.value * b.d3_q2r)),
-                ),
-            ),
-        );
-        self.d3_pq2 = a.d2_q2.mul_add(
-            b.d1_p,
-            (2. * a.d2_pq).mul_add(
-                b.d1_q,
-                (2. * a.d1_q).mul_add(
-                    b.d2_pq,
-                    a.d1_p
-                        .mul_add(b.d2_q2, a.d3_pq2.mul_add(b.value, a.value * b.d3_pq2)),
-                ),
-            ),
-        );
-        self.d3_pr2 = a.d2_r2.mul_add(
-            b.d1_p,
-            (2. * a.d2_pr).mul_add(
-                b.d1_r,
-                (2. * a.d1_r).mul_add(
-                    b.d2_pr,
-                    a.d1_p
-                        .mul_add(b.d2_r2, a.d3_pr2.mul_add(b.value, a.value * b.d3_pr2)),
-                ),
-            ),
-        );
-        self.d3_qr2 = a.d2_r2.mul_add(
-            b.d1_q,
-            (2. * a.d2_qr).mul_add(
-                b.d1_r,
-                (2. * a.d1_r).mul_add(
-                    b.d2_qr,
-                    a.d1_q
-                        .mul_add(b.d2_r2, a.d3_qr2.mul_add(b.value, a.value * b.d3_qr2)),
-                ),
-            ),
-        );
-        self.d3_pqr = a.d2_qr.mul_add(
-            b.d1_p,
-            a.d2_pr.mul_add(
-                b.d1_q,
-                a.d2_pq.mul_add(
-                    b.d1_r,
-                    a.d1_r.mul_add(
+                    accumulate_product(
+                        (2. * a.d1_p),
                         b.d2_pq,
-                        a.d1_q.mul_add(
+                        accumulate_product(a.d3_p2q, b.value, a.value * b.d3_p2q),
+                    ),
+                ),
+            ),
+        );
+        self.d3_q2r = accumulate_product(
+            (2. * a.d2_qr),
+            b.d1_q,
+            accumulate_product(
+                a.d2_q2,
+                b.d1_r,
+                accumulate_product(
+                    a.d1_r,
+                    b.d2_q2,
+                    accumulate_product(
+                        (2. * a.d1_q),
+                        b.d2_qr,
+                        accumulate_product(a.d3_q2r, b.value, a.value * b.d3_q2r),
+                    ),
+                ),
+            ),
+        );
+        self.d3_pq2 = accumulate_product(
+            a.d2_q2,
+            b.d1_p,
+            accumulate_product(
+                (2. * a.d2_pq),
+                b.d1_q,
+                accumulate_product(
+                    (2. * a.d1_q),
+                    b.d2_pq,
+                    accumulate_product(
+                        a.d1_p,
+                        b.d2_q2,
+                        accumulate_product(a.d3_pq2, b.value, a.value * b.d3_pq2),
+                    ),
+                ),
+            ),
+        );
+        self.d3_pr2 = accumulate_product(
+            a.d2_r2,
+            b.d1_p,
+            accumulate_product(
+                (2. * a.d2_pr),
+                b.d1_r,
+                accumulate_product(
+                    (2. * a.d1_r),
+                    b.d2_pr,
+                    accumulate_product(
+                        a.d1_p,
+                        b.d2_r2,
+                        accumulate_product(a.d3_pr2, b.value, a.value * b.d3_pr2),
+                    ),
+                ),
+            ),
+        );
+        self.d3_qr2 = accumulate_product(
+            a.d2_r2,
+            b.d1_q,
+            accumulate_product(
+                (2. * a.d2_qr),
+                b.d1_r,
+                accumulate_product(
+                    (2. * a.d1_r),
+                    b.d2_qr,
+                    accumulate_product(
+                        a.d1_q,
+                        b.d2_r2,
+                        accumulate_product(a.d3_qr2, b.value, a.value * b.d3_qr2),
+                    ),
+                ),
+            ),
+        );
+        self.d3_pqr = accumulate_product(
+            a.d2_qr,
+            b.d1_p,
+            accumulate_product(
+                a.d2_pr,
+                b.d1_q,
+                accumulate_product(
+                    a.d2_pq,
+                    b.d1_r,
+                    accumulate_product(
+                        a.d1_r,
+                        b.d2_pq,
+                        accumulate_product(
+                            a.d1_q,
                             b.d2_pr,
-                            a.d1_p
-                                .mul_add(b.d2_qr, a.d3_pqr.mul_add(b.value, a.value * b.d3_pqr)),
+                            accumulate_product(
+                                a.d1_p,
+                                b.d2_qr,
+                                accumulate_product(a.d3_pqr, b.value, a.value * b.d3_pqr),
+                            ),
                         ),
                     ),
                 ),
@@ -355,113 +486,205 @@ impl Dderivs {
             value: a.value / b.value,
             ..Self::default()
         };
-        n.d1_p = ((-n.value).mul_add(b.d1_p, a.d1_p)) / b.value;
-        n.d1_q = ((-n.value).mul_add(b.d1_q, a.d1_q)) / b.value;
-        n.d1_r = ((-n.value).mul_add(b.d1_r, a.d1_r)) / b.value;
-        n.d2_p2 = ((-2. * n.d1_p).mul_add(b.d1_p, (-n.value).mul_add(b.d2_p2, a.d2_p2))) / b.value;
-        n.d2_q2 = ((-2. * n.d1_q).mul_add(b.d1_q, (-n.value).mul_add(b.d2_q2, a.d2_q2))) / b.value;
-        n.d2_r2 = ((-2. * n.d1_r).mul_add(b.d1_r, (-n.value).mul_add(b.d2_r2, a.d2_r2))) / b.value;
-        n.d2_pq = ((-n.d1_q).mul_add(
+        n.d1_p = (accumulate_product((-n.value), b.d1_p, a.d1_p)) / b.value;
+        n.d1_q = (accumulate_product((-n.value), b.d1_q, a.d1_q)) / b.value;
+        n.d1_r = (accumulate_product((-n.value), b.d1_r, a.d1_r)) / b.value;
+        n.d2_p2 = (accumulate_product(
+            (-2. * n.d1_p),
             b.d1_p,
-            (-n.d1_p).mul_add(b.d1_q, (-n.value).mul_add(b.d2_pq, a.d2_pq)),
+            accumulate_product((-n.value), b.d2_p2, a.d2_p2),
         )) / b.value;
-        n.d2_qr = ((-n.d1_r).mul_add(
+        n.d2_q2 = (accumulate_product(
+            (-2. * n.d1_q),
             b.d1_q,
-            (-n.d1_q).mul_add(b.d1_r, (-n.value).mul_add(b.d2_qr, a.d2_qr)),
+            accumulate_product((-n.value), b.d2_q2, a.d2_q2),
         )) / b.value;
-        n.d2_pr = ((-n.d1_r).mul_add(
+        n.d2_r2 = (accumulate_product(
+            (-2. * n.d1_r),
+            b.d1_r,
+            accumulate_product((-n.value), b.d2_r2, a.d2_r2),
+        )) / b.value;
+        n.d2_pq = (accumulate_product(
+            (-n.d1_q),
             b.d1_p,
-            (-n.d1_p).mul_add(b.d1_r, (-n.value).mul_add(b.d2_pr, a.d2_pr)),
+            accumulate_product(
+                (-n.d1_p),
+                b.d1_q,
+                accumulate_product((-n.value), b.d2_pq, a.d2_pq),
+            ),
+        )) / b.value;
+        n.d2_qr = (accumulate_product(
+            (-n.d1_r),
+            b.d1_q,
+            accumulate_product(
+                (-n.d1_q),
+                b.d1_r,
+                accumulate_product((-n.value), b.d2_qr, a.d2_qr),
+            ),
+        )) / b.value;
+        n.d2_pr = (accumulate_product(
+            (-n.d1_r),
+            b.d1_p,
+            accumulate_product(
+                (-n.d1_p),
+                b.d1_r,
+                accumulate_product((-n.value), b.d2_pr, a.d2_pr),
+            ),
         )) / b.value;
         n.div_third_order(a, b);
         n
     }
 
     fn div_third_order(&mut self, a: &Self, b: &Self) {
-        self.d3_p3 = ((-3. * self.d2_p2).mul_add(
+        self.d3_p3 = (accumulate_product(
+            (-3. * self.d2_p2),
             b.d1_p,
-            (-3. * self.d1_p).mul_add(b.d2_p2, (-self.value).mul_add(b.d3_p3, a.d3_p3)),
+            accumulate_product(
+                (-3. * self.d1_p),
+                b.d2_p2,
+                accumulate_product((-self.value), b.d3_p3, a.d3_p3),
+            ),
         )) / b.value;
-        self.d3_q3 = ((-3. * self.d2_q2).mul_add(
+        self.d3_q3 = (accumulate_product(
+            (-3. * self.d2_q2),
             b.d1_q,
-            (-3. * self.d1_q).mul_add(b.d2_q2, (-self.value).mul_add(b.d3_q3, a.d3_q3)),
+            accumulate_product(
+                (-3. * self.d1_q),
+                b.d2_q2,
+                accumulate_product((-self.value), b.d3_q3, a.d3_q3),
+            ),
         )) / b.value;
-        self.d3_r3 = ((-3. * self.d2_r2).mul_add(
+        self.d3_r3 = (accumulate_product(
+            (-3. * self.d2_r2),
             b.d1_r,
-            (-3. * self.d1_r).mul_add(b.d2_r2, (-self.value).mul_add(b.d3_r3, a.d3_r3)),
+            accumulate_product(
+                (-3. * self.d1_r),
+                b.d2_r2,
+                accumulate_product((-self.value), b.d3_r3, a.d3_r3),
+            ),
         )) / b.value;
-        self.d3_p2r = ((-2. * self.d2_pr).mul_add(
+        self.d3_p2r = (accumulate_product(
+            (-2. * self.d2_pr),
             b.d1_p,
-            (-self.d2_p2).mul_add(
+            accumulate_product(
+                (-self.d2_p2),
                 b.d1_r,
-                (-self.d1_r).mul_add(
+                accumulate_product(
+                    (-self.d1_r),
                     b.d2_p2,
-                    (-2. * self.d1_p).mul_add(b.d2_pr, (-self.value).mul_add(b.d3_p2r, a.d3_p2r)),
+                    accumulate_product(
+                        (-2. * self.d1_p),
+                        b.d2_pr,
+                        accumulate_product((-self.value), b.d3_p2r, a.d3_p2r),
+                    ),
                 ),
             ),
         )) / b.value;
-        self.d3_p2q = ((-2. * self.d2_pq).mul_add(
+        self.d3_p2q = (accumulate_product(
+            (-2. * self.d2_pq),
             b.d1_p,
-            (-self.d2_p2).mul_add(
+            accumulate_product(
+                (-self.d2_p2),
                 b.d1_q,
-                (-self.d1_q).mul_add(
+                accumulate_product(
+                    (-self.d1_q),
                     b.d2_p2,
-                    (-2. * self.d1_p).mul_add(b.d2_pq, (-self.value).mul_add(b.d3_p2q, a.d3_p2q)),
-                ),
-            ),
-        )) / b.value;
-        self.d3_q2r = ((-2. * self.d2_qr).mul_add(
-            b.d1_q,
-            (-self.d2_q2).mul_add(
-                b.d1_r,
-                (-self.d1_r).mul_add(
-                    b.d2_q2,
-                    (-2. * self.d1_q).mul_add(b.d2_qr, (-self.value).mul_add(b.d3_q2r, a.d3_q2r)),
-                ),
-            ),
-        )) / b.value;
-        self.d3_pq2 = ((-self.d2_q2).mul_add(
-            b.d1_p,
-            (-2. * self.d2_pq).mul_add(
-                b.d1_q,
-                (-2. * self.d1_q).mul_add(
-                    b.d2_pq,
-                    (-self.d1_p).mul_add(b.d2_q2, (-self.value).mul_add(b.d3_pq2, a.d3_pq2)),
-                ),
-            ),
-        )) / b.value;
-        self.d3_pr2 = ((-self.d2_r2).mul_add(
-            b.d1_p,
-            (-2. * self.d2_pr).mul_add(
-                b.d1_r,
-                (-2. * self.d1_r).mul_add(
-                    b.d2_pr,
-                    (-self.d1_p).mul_add(b.d2_r2, (-self.value).mul_add(b.d3_pr2, a.d3_pr2)),
-                ),
-            ),
-        )) / b.value;
-        self.d3_qr2 = ((-self.d2_r2).mul_add(
-            b.d1_q,
-            (-2. * self.d2_qr).mul_add(
-                b.d1_r,
-                (-2. * self.d1_r).mul_add(
-                    b.d2_qr,
-                    (-self.d1_q).mul_add(b.d2_r2, (-self.value).mul_add(b.d3_qr2, a.d3_qr2)),
-                ),
-            ),
-        )) / b.value;
-        self.d3_pqr = ((-self.d2_qr).mul_add(
-            b.d1_p,
-            (-self.d2_pr).mul_add(
-                b.d1_q,
-                (-self.d2_pq).mul_add(
-                    b.d1_r,
-                    (-self.d1_r).mul_add(
+                    accumulate_product(
+                        (-2. * self.d1_p),
                         b.d2_pq,
-                        (-self.d1_q).mul_add(
+                        accumulate_product((-self.value), b.d3_p2q, a.d3_p2q),
+                    ),
+                ),
+            ),
+        )) / b.value;
+        self.d3_q2r = (accumulate_product(
+            (-2. * self.d2_qr),
+            b.d1_q,
+            accumulate_product(
+                (-self.d2_q2),
+                b.d1_r,
+                accumulate_product(
+                    (-self.d1_r),
+                    b.d2_q2,
+                    accumulate_product(
+                        (-2. * self.d1_q),
+                        b.d2_qr,
+                        accumulate_product((-self.value), b.d3_q2r, a.d3_q2r),
+                    ),
+                ),
+            ),
+        )) / b.value;
+        self.d3_pq2 = (accumulate_product(
+            (-self.d2_q2),
+            b.d1_p,
+            accumulate_product(
+                (-2. * self.d2_pq),
+                b.d1_q,
+                accumulate_product(
+                    (-2. * self.d1_q),
+                    b.d2_pq,
+                    accumulate_product(
+                        (-self.d1_p),
+                        b.d2_q2,
+                        accumulate_product((-self.value), b.d3_pq2, a.d3_pq2),
+                    ),
+                ),
+            ),
+        )) / b.value;
+        self.d3_pr2 = (accumulate_product(
+            (-self.d2_r2),
+            b.d1_p,
+            accumulate_product(
+                (-2. * self.d2_pr),
+                b.d1_r,
+                accumulate_product(
+                    (-2. * self.d1_r),
+                    b.d2_pr,
+                    accumulate_product(
+                        (-self.d1_p),
+                        b.d2_r2,
+                        accumulate_product((-self.value), b.d3_pr2, a.d3_pr2),
+                    ),
+                ),
+            ),
+        )) / b.value;
+        self.d3_qr2 = (accumulate_product(
+            (-self.d2_r2),
+            b.d1_q,
+            accumulate_product(
+                (-2. * self.d2_qr),
+                b.d1_r,
+                accumulate_product(
+                    (-2. * self.d1_r),
+                    b.d2_qr,
+                    accumulate_product(
+                        (-self.d1_q),
+                        b.d2_r2,
+                        accumulate_product((-self.value), b.d3_qr2, a.d3_qr2),
+                    ),
+                ),
+            ),
+        )) / b.value;
+        self.d3_pqr = (accumulate_product(
+            (-self.d2_qr),
+            b.d1_p,
+            accumulate_product(
+                (-self.d2_pr),
+                b.d1_q,
+                accumulate_product(
+                    (-self.d2_pq),
+                    b.d1_r,
+                    accumulate_product(
+                        (-self.d1_r),
+                        b.d2_pq,
+                        accumulate_product(
+                            (-self.d1_q),
                             b.d2_pr,
-                            (-self.d1_p)
-                                .mul_add(b.d2_qr, (-self.value).mul_add(b.d3_pqr, a.d3_pqr)),
+                            accumulate_product(
+                                (-self.d1_p),
+                                b.d2_qr,
+                                accumulate_product((-self.value), b.d3_pqr, a.d3_pqr),
+                            ),
                         ),
                     ),
                 ),
@@ -483,30 +706,53 @@ impl Dderivs {
         n.d1_p = (self.d1_p) / denominator;
         n.d1_q = (self.d1_q) / denominator;
         n.d1_r = (self.d1_r) / denominator;
-        n.d2_p2 = ((-2. * n.d1_p).mul_add(n.d1_p, self.d2_p2)) / denominator;
-        n.d2_q2 = ((-2. * n.d1_q).mul_add(n.d1_q, self.d2_q2)) / denominator;
-        n.d2_r2 = ((-2. * n.d1_r).mul_add(n.d1_r, self.d2_r2)) / denominator;
-        n.d2_pq = ((-2. * n.d1_p).mul_add(n.d1_q, self.d2_pq)) / denominator;
-        n.d2_qr = ((-2. * n.d1_q).mul_add(n.d1_r, self.d2_qr)) / denominator;
-        n.d2_pr = ((-2. * n.d1_p).mul_add(n.d1_r, self.d2_pr)) / denominator;
-        n.d3_p3 = ((-6. * n.d1_p).mul_add(n.d2_p2, self.d3_p3)) / denominator;
-        n.d3_q3 = ((-6. * n.d1_q).mul_add(n.d2_q2, self.d3_q3)) / denominator;
-        n.d3_r3 = ((-6. * n.d1_r).mul_add(n.d2_r2, self.d3_r3)) / denominator;
-        n.d3_p2r = ((-2. * n.d2_p2).mul_add(n.d1_r, (-4. * n.d1_p).mul_add(n.d2_pr, self.d3_p2r)))
-            / denominator;
-        n.d3_p2q = ((-2. * n.d2_p2).mul_add(n.d1_q, (-4. * n.d1_p).mul_add(n.d2_pq, self.d3_p2q)))
-            / denominator;
-        n.d3_q2r = ((-2. * n.d2_q2).mul_add(n.d1_r, (-4. * n.d1_q).mul_add(n.d2_qr, self.d3_q2r)))
-            / denominator;
-        n.d3_pq2 = ((-4. * n.d2_pq).mul_add(n.d1_q, (-2. * n.d1_p).mul_add(n.d2_q2, self.d3_pq2)))
-            / denominator;
-        n.d3_pr2 = ((-4. * n.d2_pr).mul_add(n.d1_r, (-2. * n.d1_p).mul_add(n.d2_r2, self.d3_pr2)))
-            / denominator;
-        n.d3_qr2 = ((-4. * n.d2_qr).mul_add(n.d1_r, (-2. * n.d1_q).mul_add(n.d2_r2, self.d3_qr2)))
-            / denominator;
-        n.d3_pqr = ((-2. * n.d2_pr).mul_add(
+        n.d2_p2 = (accumulate_product((-2. * n.d1_p), n.d1_p, self.d2_p2)) / denominator;
+        n.d2_q2 = (accumulate_product((-2. * n.d1_q), n.d1_q, self.d2_q2)) / denominator;
+        n.d2_r2 = (accumulate_product((-2. * n.d1_r), n.d1_r, self.d2_r2)) / denominator;
+        n.d2_pq = (accumulate_product((-2. * n.d1_p), n.d1_q, self.d2_pq)) / denominator;
+        n.d2_qr = (accumulate_product((-2. * n.d1_q), n.d1_r, self.d2_qr)) / denominator;
+        n.d2_pr = (accumulate_product((-2. * n.d1_p), n.d1_r, self.d2_pr)) / denominator;
+        n.d3_p3 = (accumulate_product((-6. * n.d1_p), n.d2_p2, self.d3_p3)) / denominator;
+        n.d3_q3 = (accumulate_product((-6. * n.d1_q), n.d2_q2, self.d3_q3)) / denominator;
+        n.d3_r3 = (accumulate_product((-6. * n.d1_r), n.d2_r2, self.d3_r3)) / denominator;
+        n.d3_p2r = (accumulate_product(
+            (-2. * n.d2_p2),
+            n.d1_r,
+            accumulate_product((-4. * n.d1_p), n.d2_pr, self.d3_p2r),
+        )) / denominator;
+        n.d3_p2q = (accumulate_product(
+            (-2. * n.d2_p2),
             n.d1_q,
-            (-2. * n.d2_pq).mul_add(n.d1_r, (-2. * n.d1_p).mul_add(n.d2_qr, self.d3_pqr)),
+            accumulate_product((-4. * n.d1_p), n.d2_pq, self.d3_p2q),
+        )) / denominator;
+        n.d3_q2r = (accumulate_product(
+            (-2. * n.d2_q2),
+            n.d1_r,
+            accumulate_product((-4. * n.d1_q), n.d2_qr, self.d3_q2r),
+        )) / denominator;
+        n.d3_pq2 = (accumulate_product(
+            (-4. * n.d2_pq),
+            n.d1_q,
+            accumulate_product((-2. * n.d1_p), n.d2_q2, self.d3_pq2),
+        )) / denominator;
+        n.d3_pr2 = (accumulate_product(
+            (-4. * n.d2_pr),
+            n.d1_r,
+            accumulate_product((-2. * n.d1_p), n.d2_r2, self.d3_pr2),
+        )) / denominator;
+        n.d3_qr2 = (accumulate_product(
+            (-4. * n.d2_qr),
+            n.d1_r,
+            accumulate_product((-2. * n.d1_q), n.d2_r2, self.d3_qr2),
+        )) / denominator;
+        n.d3_pqr = (accumulate_product(
+            (-2. * n.d2_pr),
+            n.d1_q,
+            accumulate_product(
+                (-2. * n.d2_pq),
+                n.d1_r,
+                accumulate_product((-2. * n.d1_p), n.d2_qr, self.d3_pqr),
+            ),
         )) / denominator;
         n
     }
@@ -519,7 +765,7 @@ impl Dderivs {
             value,
             first,
             2. * value * first,
-            2. * first * 3_f64.mul_add(squared, 1.),
+            2. * first * accumulate_product(3_f64, squared, 1.),
         )
     }
 }

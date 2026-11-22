@@ -504,8 +504,8 @@ impl MosLevel for Level2 {
         let sbiarg = p.bulk_potential.sqrt();
         let mut gammad = gamasd;
         let mut dgdvbs = dgddvb;
-        let mut body = f64::mul_add(barg * barg, barg, -sarg3);
-        let mut gdbdv = 2.0 * gammad * f64::mul_add(sarg1 * sarg1, -dsrgdb, barg * barg * dbrgdb);
+        let (mut body, body_bias) = body_integral(tphi, lvbs, lvds, sarg1, barg);
+        let mut gdbdv = gammad * body_bias;
         let mut dodvbs = f64::mul_add(gammad, dsrgdb, f64::mul_add(dgdvbs, sarg1, -factor));
         let (mut dxndvb, mut dxndvd, mut dodvds) = (0.0, 0.0, 0.0);
         if nfs {
@@ -596,8 +596,9 @@ impl MosLevel for Level2 {
                 bsarg = sphi / (1.0 + 0.5 * (lvbs - vdsat) / tphi);
                 -0.5 * bsarg * bsarg / sphi3
             };
-            bodys = f64::mul_add(bsarg * bsarg, bsarg, -sarg3);
-            gdbdvs = 2.0 * gammad * f64::mul_add(sarg1 * sarg1, -dsrgdb, bsarg * bsarg * dbsrdb);
+            let (integral, bias) = body_integral(tphi, lvbs, vdsat, sarg1, bsarg);
+            bodys = integral;
+            gdbdvs = gammad * bias;
             // C: `if (substrateDoping == 0.0) goto line610; if (xlamda >
             // 0.0) goto line610;` (LAMBDA is finite and nonnegative).
             let derived = p.doped && xlamda <= 0.0;
@@ -783,6 +784,34 @@ impl MosLevel for Level2 {
             cox_squared: cox * cox,
         })
     }
+}
+
+/// Difference of the source and drain body-root cubes and its bias derivative
+/// scaled by 2/3 (the factor used by the MOS2 current equations).
+///
+/// Rationalize the root difference before multiplying by the polynomial.
+/// In particular, a zero drain increment must give exactly zero even when
+/// the common root and its powers are rounded.
+fn body_integral(phi: Real, vbs: Real, vds: Real, source: Real, drain: Real) -> (Real, Real) {
+    let root = phi.sqrt();
+    let (delta, bias) = if vbs <= 0. {
+        let delta = vds / (source + drain);
+        (delta, -delta)
+    } else if vbs > vds {
+        let delta = source * (drain / root) * (0.5 * vds / phi);
+        let quartic = (source + drain) * (source * source + drain * drain);
+        (delta, -(delta / root) * (quartic / phi))
+    } else {
+        let source_delta = source * (0.5 * vbs / phi);
+        let drain_delta = (vds - vbs) / (drain + root);
+        let quartic = (source + root) * source.mul_add(source, phi);
+        (
+            source_delta + drain_delta,
+            -(source_delta / root) * (quartic / phi) - drain_delta,
+        )
+    };
+    let polynomial = drain.mul_add(drain, source.mul_add(drain, source * source));
+    (delta * polynomial, bias)
 }
 
 /// C's `MAX(a, b)`: `a > b ? a : b`.
@@ -1174,6 +1203,33 @@ mod tests {
     /// Below the threshold without NFS (`vbin < vgs <= von`) C runs the
     /// saturation formulas at `vdsat = 0`: no current, but a negative `gm`
     /// from the unclamped `dsdvgs`, which the port keeps.
+    #[test]
+    fn body_integral_retains_tiny_drain_increment_and_exact_zero() {
+        let phi: Real = 0.7;
+        let root = |bias: Real| {
+            if bias <= 0. {
+                (phi - bias).sqrt()
+            } else {
+                phi.sqrt() / (1. + 0.5 * bias / phi)
+            }
+        };
+        for vbs in [-0.3, 0., 0.2] {
+            let source = root(vbs);
+            assert_eq!(body_integral(phi, vbs, 0., source, source), (0., 0.));
+            let (tiny, bias) = body_integral(phi, vbs, 1e-20, source, source);
+            assert!(tiny > 0. && bias < 0.);
+            for vds in [0.01, 0.2, 0.4] {
+                let drain = root(vbs - vds);
+                let (actual, derivative) = body_integral(phi, vbs, vds, source, drain);
+                assert!((actual - (drain.powi(3) - source.powi(3))).abs() < 2e-15);
+                let h = 1e-6;
+                let integral = |v: Real| root(v - vds).powi(3) - root(v).powi(3);
+                let numerical = (integral(vbs + h) - integral(vbs - h)) / (3. * h);
+                assert!((derivative - numerical).abs() < 2e-6);
+            }
+        }
+    }
+
     #[test]
     fn subthreshold_without_nfs_keeps_cs_negative_transconductance() {
         let l = level(0., 0., false, 0.);

@@ -274,6 +274,14 @@ pub(super) fn smoothed_extrema(a: Real, b: Real, width: Real) -> SmoothedExtrema
     } else {
         difference.hypot(width)
     };
+    if span == 0. {
+        // Symmetric limiting derivative at a nonsmoothed tie.
+        return SmoothedExtrema {
+            high: a,
+            low: b,
+            high_weights: [0.5; 2],
+        };
+    }
     let scale = width / span;
     let denominator = 2. * (1. + (difference / span).abs());
     let correction = width * (scale / denominator);
@@ -1572,6 +1580,8 @@ mod tests {
 
     #[test]
     fn smoothed_extrema_retain_the_small_branch_and_its_derivative() {
+        let tie = smoothed_extrema(2., 2., 0.);
+        assert_eq!((tie.high, tie.low, tie.high_weights), (2., 2., [0.5; 2]));
         let forward = smoothed_extrema(1e16, 0., 1.);
         let reverse = smoothed_extrema(0., 1e16, 1.);
         for pair in [&forward, &reverse] {
