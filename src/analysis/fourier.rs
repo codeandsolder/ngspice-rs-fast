@@ -878,4 +878,221 @@ mod tests {
         assert!(text.contains("2         2.000000000000000e+03"), "{text}");
         assert!(printed(&text, "thd").abs() < 1e-14, "{text}");
     }
+    /// Comparing the metadata separately and the floats by their bits also
+    /// catches signed-zero drift, unlike PartialEq alone.
+    fn assert_identical(actual: &[FourierAnalysis], expected: &[FourierAnalysis]) {
+        assert_eq!(actual, expected);
+        let bits = |result: &FourierAnalysis| {
+            [
+                result.fundamental,
+                result.dc,
+                result.thd,
+                result.window.from,
+                result.window.to,
+            ]
+            .into_iter()
+            .chain(
+                result
+                    .harmonics
+                    .iter()
+                    .flat_map(|h| [h.frequency, h.amplitude, h.phase]),
+            )
+            .map(Real::to_bits)
+            .collect::<Vec<_>>()
+        };
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(bits(actual), bits(expected));
+        }
+    }
+
+    #[test]
+    fn mixed_card_plans_match_independent_vectors_bit_for_bit() {
+        let rows = sweep(0., 2. * PERIOD, 805, |t| {
+            0.3 + sine(1., 1, 0.2)(t) + sine(0.11, 3, -0.7)(t)
+        });
+        let plot = tran(&rows);
+        let cards = [
+            card(vec![out(), current(), out()], 9),
+            FourierCard {
+                frontend_command: true,
+                ..card(vec![current(), out()], 7)
+            },
+            FourierCard {
+                fundamental: 2. * FUNDAMENTAL,
+                ..card(vec![out(), current()], 3)
+            },
+        ];
+        let obtained = resolve(&plot, AnalysisKind::Transient, &cards).unwrap();
+        let mut expected = Vec::new();
+        for card in cards {
+            for vector in &card.vectors {
+                let single = FourierCard {
+                    vectors: vec![vector.clone()],
+                    ..card.clone()
+                };
+                expected.extend(resolve(&plot, AnalysisKind::Transient, &[single]).unwrap());
+            }
+        }
+        assert_identical(&obtained, &expected);
+    }
+
+    #[test]
+    fn configured_projection_shares_every_harmonic_even_across_batch_boundaries() {
+        use super::{FourierSettings, resolve_with_settings, resolve_with_stable_settings};
+        let plot = tran(&sweep(0., PERIOD, 801, sine(1., 1, 0.37)));
+        // At 100k output samples eight vectors cross the 4 MiB batch bound.
+        let vectors: Vec<_> = (0..8)
+            .map(|i| if i % 2 == 0 { out() } else { current() })
+            .collect();
+        let card = card(vectors, 3);
+        type Resolve = fn(
+            &Plot,
+            AnalysisKind,
+            &[FourierCard],
+            FourierSettings,
+        ) -> Result<Vec<FourierAnalysis>, SpiceError>;
+        let cases: [(Resolve, FourierSettings); 3] = [
+            (
+                resolve_with_settings,
+                FourierSettings {
+                    nfreqs: 4,
+                    gridsize: 100_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                resolve_with_stable_settings,
+                FourierSettings {
+                    nfreqs: 4,
+                    gridsize: 100_000,
+                    polydegree: 3,
+                    ..Default::default()
+                },
+            ),
+            (
+                resolve_with_settings,
+                FourierSettings {
+                    nfreqs: 4,
+                    polydegree: 0,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (resolve, settings) in cases {
+            let obtained = resolve(
+                &plot,
+                AnalysisKind::Transient,
+                std::slice::from_ref(&card),
+                settings,
+            )
+            .unwrap();
+            let expected: Vec<_> = [out(), current()]
+                .into_iter()
+                .flat_map(|vector| {
+                    let single = FourierCard {
+                        vectors: vec![vector],
+                        ..card.clone()
+                    };
+                    resolve(&plot, AnalysisKind::Transient, &[single], settings).unwrap()
+                })
+                .collect();
+            let repeated: Vec<_> = (0..8).map(|i| expected[i % 2].clone()).collect();
+            assert_identical(&obtained, &repeated);
+        }
+    }
+
+    #[test]
+    fn unrepresentable_windows_and_harmonic_frequencies_are_refused() {
+        use super::{FourierSettings, resolve_with_settings};
+        let plot = tran(&[(1e9 - 1., 0.), (1e9 - 0.5, 1.), (1e9, 0.)]);
+        let too_short = FourierCard {
+            fundamental: 1e20,
+            ..card(vec![out()], 1)
+        };
+        for error in [
+            resolve(
+                &plot,
+                AnalysisKind::Transient,
+                std::slice::from_ref(&too_short),
+            )
+            .unwrap_err(),
+            resolve_with_settings(
+                &plot,
+                AnalysisKind::Transient,
+                &[too_short],
+                FourierSettings::default(),
+            )
+            .unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("not representable"), "{error}");
+        }
+        let overflow = FourierCard {
+            fundamental: Real::MAX,
+            ..card(vec![out()], 2)
+        };
+        assert!(
+            resolve(&plot, AnalysisKind::Transient, &[overflow])
+                .unwrap_err()
+                .to_string()
+                .contains("harmonic frequency")
+        );
+    }
+
+    #[test]
+    fn an_earlier_projection_failure_precedes_a_later_missing_vector() {
+        let plot = tran(&on_grid(|_| 1.));
+        let mut missing = out();
+        missing.vector = RequestedVector::Voltage {
+            positive: "absent".into(),
+            negative: None,
+        };
+        let error = failed(&plot, &[out(), missing], 9);
+        assert!(error.to_string().contains("rounding noise"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "timing comparison; run explicitly with --ignored --nocapture"]
+    fn shared_fourier_projection_benchmark() {
+        use super::{FourierSettings, resolve_with_stable_settings};
+        use std::time::Instant;
+        let plot = tran(&sweep(0., 2. * PERIOD, 20_000, |t| {
+            0.3 + sine(1., 1, 0.2)(t) + sine(0.11, 3, -0.7)(t)
+        }));
+        let settings = FourierSettings {
+            nfreqs: 33,
+            gridsize: 10_000,
+            polydegree: 1,
+            ..Default::default()
+        };
+        let card = card(
+            (0..32)
+                .map(|i| if i % 2 == 0 { out() } else { current() })
+                .collect(),
+            32,
+        );
+        let start = Instant::now();
+        let separate: Vec<_> = card
+            .vectors
+            .iter()
+            .flat_map(|vector| {
+                let single = FourierCard {
+                    vectors: vec![vector.clone()],
+                    ..card.clone()
+                };
+                resolve_with_stable_settings(&plot, AnalysisKind::Transient, &[single], settings)
+                    .unwrap()
+            })
+            .collect();
+        let scalar = start.elapsed();
+        let start = Instant::now();
+        let grouped =
+            resolve_with_stable_settings(&plot, AnalysisKind::Transient, &[card], settings)
+                .unwrap();
+        let shared = start.elapsed();
+        assert_identical(&grouped, &separate);
+        eprintln!(
+            "32 vectors, 20001 source rows, 10000 grid samples, 32 harmonics: independent={scalar:?}, shared={shared:?}, speedup={:.3}x",
+            scalar.as_secs_f64() / shared.as_secs_f64()
+        );
+    }
 }

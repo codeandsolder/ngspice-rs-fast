@@ -181,6 +181,13 @@ pub(super) enum Location {
 }
 
 impl Location {
+    pub(super) fn reads(&self) -> usize {
+        match self {
+            Self::Exact(group) => group.len(),
+            Self::Between(_) => 2,
+        }
+    }
+
     pub(super) fn sample(
         &self,
         x: Real,

@@ -226,7 +226,7 @@ impl ClosedPlan {
     fn finish(
         &self,
         card: &FourierCard,
-        prepared: PreparedTrace<'_>,
+        prepared: &PreparedTrace<'_>,
     ) -> SpiceResult<FourierAnalysis> {
         let trace = &prepared.trace;
         let (dc, harmonics, thd) = closed_grid_spectrum(
@@ -535,16 +535,24 @@ impl ConfiguredPlan {
         axis: &OrderedAxis<'_>,
         trace: &Trace<'_>,
         stable: Option<&StablePlan>,
+        input: &mut Vec<Real>,
     ) -> SpiceResult<Vec<Real>> {
-        let samples = (0..axis.len())
-            .map(|i| trace.value(i))
-            .collect::<SpiceResult<Vec<_>>>()?;
         let Some(grid) = &self.grid else {
-            return Ok(samples);
+            return (0..axis.len()).map(|i| trace.value(i)).collect();
         };
+        input.clear();
+        input.try_reserve_exact(axis.len()).map_err(|error| {
+            nonfinite(
+                trace.name(),
+                format!("cannot allocate Fourier input samples: {error}"),
+            )
+        })?;
+        for i in 0..axis.len() {
+            input.push(trace.value(i)?);
+        }
         stable.map_or_else(
-            || crate::analysis::fourier_resample::resample(axis, &samples, grid, self.degree),
-            |plan| plan.sample(&samples, trace.name()),
+            || crate::analysis::fourier_resample::resample(axis, input, grid, self.degree),
+            |plan| plan.sample(input, trace.name()),
         )
     }
 
@@ -731,7 +739,7 @@ impl Mode {
         }
     }
 
-    fn harmonics(self, card: &FourierCard) -> u32 {
+    const fn harmonics(self, card: &FourierCard) -> u32 {
         match self {
             Self::Closed => card.harmonics,
             Self::Configured { settings, .. } => configured_harmonics(card, settings),
@@ -774,7 +782,7 @@ struct WorkBudget {
 impl WorkBudget {
     const fn new(rows: usize) -> Self {
         Self {
-            work: rows,
+            work: rows.saturating_mul(3),
             retained: rows.saturating_mul(size_of::<Real>()),
             scratch: 0,
             vectors: 0,
@@ -791,41 +799,51 @@ impl WorkBudget {
         compatible: bool,
     ) {
         let projection = count.saturating_mul(harmonics + 1);
-        let (sampling, scratch) = match mode {
-            // Distinct grid coordinates visit each coincident group at most
-            // once, plus at most two bracketing reads per grid coordinate.
+        let (sampling, setup, scratch) = match mode {
+            // For distinct source coordinates, at most two reads per grid
+            // point. A second preflight charges any excess coincident-group
+            // reads after axis validation, before visiting any vector.
             Mode::Closed => (
-                rows.saturating_add(2 * count),
-                count * (size_of::<(Real, Location)>() + size_of::<Real>()),
+                2 * count,
+                count.saturating_mul(rows.checked_ilog2().unwrap_or(0) as usize + 1),
+                count * size_of::<(Real, Location)>(),
             ),
             Mode::Configured { settings, .. } => {
                 let order = settings.polydegree as usize + 1;
                 // C can retry every polynomial degree for each moving fit.
-                // A fit advances at least one grid sample, except for at most
-                // order tail steps; the traversal itself costs rows * order.
+                // Successful forward fits advance at least one grid sample,
+                // except for at most order tail steps. The traversal itself
+                // costs rows * order.
                 let fits = rows.min(count + order);
-                let fit_cost = (1..=order).map(|n| n.pow(3) + n * n).sum::<usize>();
-                let interpolation = if order == 1 {
-                    0
+                let fit_cost = (1..=order).map(|n| 2 * n.pow(3) + 3 * n * n).sum::<usize>();
+                let (interpolation, setup) = if order == 1 {
+                    (0, 0)
                 } else if compatible {
-                    rows.saturating_mul(order)
-                        .saturating_add(fits.saturating_mul(fit_cost))
+                    (
+                        rows.saturating_mul(order)
+                            .saturating_add(fits.saturating_mul(fit_cost)),
+                        count,
+                    )
                 } else {
-                    count.saturating_mul(order * order)
+                    (
+                        count.saturating_mul(order),
+                        count.saturating_mul(order * order),
+                    )
                 };
                 let scratch = rows
                     .saturating_mul(size_of::<Real>())
-                    .saturating_add(count * size_of::<Real>() * 2)
+                    .saturating_add(count * size_of::<Real>())
                     .saturating_add(if compatible || order == 1 {
                         0
                     } else {
                         count * (size_of::<usize>() + order * size_of::<Real>())
                     });
-                (rows.saturating_add(interpolation), scratch)
+                (rows.saturating_add(interpolation), setup, scratch)
             }
         };
         self.work = self
             .work
+            .saturating_add(setup)
             .saturating_add(vectors.saturating_mul(sampling.saturating_add(projection)));
         self.vectors = self.vectors.saturating_add(vectors);
         self.retained = self.retained.saturating_add(
@@ -842,6 +860,24 @@ impl WorkBudget {
         self.scratch = self
             .scratch
             .max(scratch.saturating_add(batched).saturating_add(basis));
+    }
+
+    fn charge_duplicate_reads(
+        &mut self,
+        axis: &OrderedAxis<'_>,
+        card: &FourierCard,
+    ) -> SpiceResult<()> {
+        let plan = ClosedPlan::new(axis, card)?;
+        let reads = plan
+            .locations
+            .iter()
+            .map(|(_, location)| location.reads())
+            .sum::<usize>();
+        let excess = reads.saturating_sub(2 * plan.locations.len());
+        self.work = self
+            .work
+            .saturating_add(excess.saturating_mul(card.vectors.len()));
+        self.check(card)
     }
 
     fn check(&self, card: &FourierCard) -> SpiceResult<()> {
@@ -907,8 +943,17 @@ pub(super) fn resolve_plans(
     let Some(first) = cards.first() else {
         return Ok(Vec::new());
     };
-    let budget = preflight(plot.point_count(), kind, cards, settings, compatible)?;
+    let mut budget = preflight(plot.point_count(), kind, cards, settings, compatible)?;
     let axis = time_axis(plot, first)?;
+    if axis.has_duplicates() {
+        for card in cards {
+            if !card.vectors.is_empty()
+                && matches!(Mode::select(card, kind, settings)?, Mode::Closed)
+            {
+                budget.charge_duplicate_reads(&axis, card)?;
+            }
+        }
+    }
     let mut results = Vec::new();
     results.try_reserve_exact(budget.vectors).map_err(|error| {
         nonfinite(
@@ -918,6 +963,9 @@ pub(super) fn resolve_plans(
     })?;
     for card in cards {
         let mode = Mode::select(card, kind, settings)?;
+        if card.vectors.is_empty() {
+            continue;
+        }
         let execution = CardPlan::new(&axis, card, mode, compatible)?;
         execution.run(
             plot,
@@ -969,11 +1017,14 @@ impl CardPlan {
         card: &FourierCard,
         request: &VectorRequest,
         harmonics: u32,
+        input: &mut Vec<Real>,
     ) -> SpiceResult<PreparedTrace<'a>> {
         let trace = Trace::resolve(plot, request)?;
         let values = match self {
             Self::Closed(plan) => plan.samples(card, &trace)?,
-            Self::Configured { plan, stable } => plan.samples(axis, &trace, stable.as_ref())?,
+            Self::Configured { plan, stable } => {
+                plan.samples(axis, &trace, stable.as_ref(), input)?
+            }
         };
         Ok(PreparedTrace {
             trace,
@@ -986,7 +1037,7 @@ impl CardPlan {
         &self,
         axis: &OrderedAxis<'_>,
         card: &FourierCard,
-        prepared: PreparedTrace<'_>,
+        prepared: &PreparedTrace<'_>,
     ) -> SpiceResult<FourierAnalysis> {
         match self {
             Self::Closed(plan) => plan.finish(card, prepared),
@@ -1014,10 +1065,11 @@ impl CardPlan {
         };
         let batch_size = geometry.batch_size(harmonics);
         let mut batch = Vec::with_capacity(batch_size.min(card.vectors.len()));
+        let mut input = Vec::new();
         for requests in card.vectors.chunks(batch_size) {
             let mut failure = None;
             for request in requests {
-                match self.prepare(plot, axis, card, request, harmonics) {
+                match self.prepare(plot, axis, card, request, harmonics, &mut input) {
                     Ok(prepared) => batch.push(prepared),
                     Err(error) => {
                         failure = Some(error);
@@ -1028,13 +1080,226 @@ impl CardPlan {
             geometry.project(&mut batch, harmonics)?;
             // Finish prior successful samples before returning a later sampling
             // failure: retain the historical vector-wise diagnostic ordering.
-            for prepared in batch.drain(..) {
+            for prepared in &batch {
                 results.push(self.finish(axis, card, prepared)?);
             }
+            batch.clear();
             if let Some(error) = failure {
                 return Err(error);
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FourierSettings;
+    use super::{Mode, ProjectionGrid, WorkBudget, preflight};
+    use crate::netlist::ast::{FourierCard, RequestedVector, VectorRequest};
+    use crate::primitives::{AnalysisKind, Real, SourceLoc};
+    use std::path::PathBuf;
+
+    fn card(vectors: usize, harmonics: u32) -> FourierCard {
+        let loc = SourceLoc::new(PathBuf::from("budget.cir"), 2, 1);
+        let request = VectorRequest {
+            vector: RequestedVector::Voltage {
+                positive: "out".into(),
+                negative: None,
+            },
+            location: loc.clone(),
+        };
+        FourierCard {
+            frontend_command: false,
+            fundamental_expression: None,
+            fundamental: 1e3,
+            fundamental_location: loc.clone(),
+            harmonics,
+            harmonics_location: Some(loc.clone()),
+            vectors: vec![request; vectors],
+            location: loc,
+        }
+    }
+
+    #[test]
+    fn aggregate_budget_preflights_work_and_memory_without_building_a_plot() {
+        let settings = FourierSettings {
+            gridsize: 100_000,
+            polydegree: 1,
+            ..Default::default()
+        };
+        let one = card(1, 100);
+        assert!(
+            preflight(
+                1_000,
+                AnalysisKind::Transient,
+                std::slice::from_ref(&one),
+                Some(settings),
+                true
+            )
+            .is_ok()
+        );
+        assert!(
+            preflight(
+                1_000,
+                AnalysisKind::Transient,
+                &vec![one.clone(); 50],
+                Some(settings),
+                true
+            )
+            .is_err_and(|error| error
+                .to_string()
+                .contains("aggregate work or memory budget"))
+        );
+        assert!(
+            preflight(
+                usize::MAX,
+                AnalysisKind::Transient,
+                &[one],
+                Some(settings),
+                true
+            )
+            .is_err_and(|error| error
+                .to_string()
+                .contains("aggregate work or memory budget"))
+        );
+        // Saturation is a fail-closed arithmetic policy, rather than a wrapped count.
+        let mut budget = WorkBudget::new(1);
+        budget.charge(1, 401, 100, usize::MAX, Mode::Closed, true);
+        assert!(budget.check(&card(1, 1)).is_err());
+    }
+
+    #[test]
+    fn coefficient_rows_preserve_both_original_phase_expressions() {
+        for geometry in [
+            ProjectionGrid::Closed(204),
+            ProjectionGrid::HalfOpen {
+                samples: 1_117,
+                periods: 3,
+            },
+        ] {
+            for k in [0, 1, 3, 100] {
+                for i in [0, 1, 99, 203] {
+                    let expected_angle = match geometry {
+                        ProjectionGrid::Closed(n) => {
+                            let phase = Real::from(i) / Real::from(n);
+                            std::f64::consts::TAU * Real::from(k) * phase
+                        }
+                        ProjectionGrid::HalfOpen { samples, periods } => {
+                            std::f64::consts::TAU
+                                * Real::from(k)
+                                * Real::from(periods)
+                                * Real::from(i)
+                                / Real::from(samples)
+                        }
+                    };
+                    assert_eq!(
+                        geometry.coefficient(k, i).map(Real::to_bits),
+                        [
+                            expected_angle.sin().to_bits(),
+                            expected_angle.cos().to_bits()
+                        ],
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn large_distinct_axis_is_charged_once_and_coincident_reads_are_charged_per_vector() {
+        use super::OrderedAxis;
+        assert!(
+            preflight(
+                1_000_000,
+                AnalysisKind::Transient,
+                &[card(1000, 9)],
+                None,
+                true
+            )
+            .is_ok()
+        );
+        let mut times = vec![0.; 1000];
+        times.extend([0.5e-3, 1e-3]);
+        let axis = OrderedAxis::borrowed(&times).unwrap();
+        let mut budget = WorkBudget::new(times.len());
+        let initial = budget.work;
+        let card = card(10, 1);
+        budget.charge_duplicate_reads(&axis, &card).unwrap();
+        assert!(budget.work > initial + 9000);
+    }
+
+    #[test]
+    fn batched_projection_matches_original_scalar_summation_bit_for_bit() {
+        use super::{PreparedTrace, Trace};
+        use crate::analysis::results::{Plot, PlotFlags, Variable};
+        let mut builder = Plot::builder("test", "Transient Analysis", PlotFlags::Real);
+        builder.push_variable(Variable::new("v(out)", "voltage"));
+        let plot = builder.build();
+        let c = card(1, 8);
+        for geometry in [
+            ProjectionGrid::Closed(204),
+            ProjectionGrid::HalfOpen {
+                samples: 1117,
+                periods: 3,
+            },
+        ] {
+            let mut batch: Vec<_> = (0..3)
+                .map(|trace_index| {
+                    let trace = Trace::resolve(&plot, &c.vectors[0]).unwrap();
+                    let values = (0..geometry.samples())
+                        .map(|i| {
+                            let x = f64::from(u32::try_from(i).unwrap());
+                            match (i + trace_index) % 7 {
+                                0 => -0.,
+                                1 => Real::from_bits(1),
+                                _ => (x * 0.37).sin() * (1. + x * 0.007),
+                            }
+                        })
+                        .collect();
+                    PreparedTrace {
+                        trace,
+                        values,
+                        sums: vec![[0.; 2]; 9],
+                    }
+                })
+                .collect();
+            geometry.project(&mut batch, 8).unwrap();
+            for prepared in batch {
+                let mut wanted = [[0.; 2]; 9];
+                match geometry {
+                    ProjectionGrid::Closed(divisions) => {
+                        for (i, &y) in (0..=divisions).zip(&prepared.values) {
+                            let weight = if i == 0 || i == divisions { 0.5 } else { 1. };
+                            let weighted = weight * y;
+                            let phase = Real::from(i) / Real::from(divisions);
+                            for (k, [sin, cos]) in (0..=8).zip(&mut wanted) {
+                                let angle = std::f64::consts::TAU * Real::from(k) * phase;
+                                let sine_term = weighted * angle.sin();
+                                let cosine_term = weighted * angle.cos();
+                                *sin += sine_term;
+                                *cos += cosine_term;
+                            }
+                        }
+                    }
+                    ProjectionGrid::HalfOpen { samples, periods } => {
+                        for (k, [sin, cos]) in (1..=8).zip(wanted.iter_mut().skip(1)) {
+                            for (i, &y) in (0..samples).zip(&prepared.values) {
+                                let angle = std::f64::consts::TAU
+                                    * Real::from(k)
+                                    * Real::from(periods)
+                                    * Real::from(i)
+                                    / Real::from(samples);
+                                let sine_term = y * angle.sin();
+                                let cosine_term = y * angle.cos();
+                                *sin += sine_term;
+                                *cos += cosine_term;
+                            }
+                        }
+                    }
+                }
+                for (obtained, expected) in prepared.sums.iter().zip(wanted) {
+                    assert_eq!(obtained.map(Real::to_bits), expected.map(Real::to_bits));
+                }
+            }
+        }
     }
 }
