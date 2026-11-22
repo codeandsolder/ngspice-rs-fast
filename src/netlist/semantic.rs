@@ -1,618 +1,516 @@
-//! Location-free semantic comparison of parsed decks.
+//! Borrowed, location-free semantic comparison of parsed decks.
 //!
-//! A re-parsed deck never has the original [`SourceLoc`]s, joined-card text or
-//! token spans, so [`PartialEq`] on [`Netlist`] cannot be used for round-trip
-//! checks. [`semantic_form`] returns a copy of a netlist with every position
-//! and every purely lexical field neutralised; [`semantic_eq`] compares two
-//! netlists through it and [`semantic_diff`] explains the first difference.
+//! Comparison keeps typed values, ordered setters, expression shape, groups
+//! and spelling, scope-local card indexes, include-chain depth and resolved
+//! include paths. It ignores physical locations, source maps, lexical card
+//! formatting, deck paths, include quoting and the raw vector spelling of
+//! waveform/IC setters. Output/control cards retain their spelling because
+//! root output requests live beside the netlist in the parsed deck.
 //!
-//! What is **kept** (it is semantics): titles, device/model/subcircuit/
-//! analysis (including the `.tran` `uic` flag)/directive/`.param`/`.func`/`.option`/`.global`/`.ic`/`.nodeset` content, ordered parameter
-//! assignments with their kinds and value spelling, parsed expression trees and
-//! their original text, the card order with typed indexes, include-chain depth
-//! and resolved include paths.
-//!
-//! What is **neutralised**: every [`SourceLoc`] and span (file, line, column);
-//! [`Netlist::path`]; the joined text/tokens of each [`RawCard`] (formatting
-//! only; the typed AST carries the meaning); [`IncludeDirective::path_spelling`]
-//! (quoting only; the decoded `path` is compared); and the original vector text
-//! of waveform and `ic` setters (their structured values are compared, and the
-//! normalized writer re-spells the vector).
+//! Both equality and diagnostics use one typed traversal. Matching decks
+//! allocate nothing; an unsuccessful comparison records only the path to
+//! the first differing field, never an owned, normalized AST.
 
+use std::fmt;
 use std::path::PathBuf;
 
-use crate::primitives::SourceLoc;
-
 use crate::netlist::ast::{
-    AnalysisCard, ArgumentExpression, DeviceInstance, FuncCard, FuncParameter, FuncSpelling,
+    AnalysisCard, ArgumentExpression, DeviceInstance, FourierCard, FuncCard, FuncParameter,
     FunctionWaveform, GlobalCard, GlobalNode, IncludeDirective, InitialCondition, LibrarySection,
+    MeasureCard, MeasureEvent, MeasureRequest, MeasureStatistic, MeasureTransition, MeasureWindow,
     ModelCard, Netlist, NodeHint, NodeHintCard, NodeHintValue, OptionCard, OptionSetting,
-    ParamAssignment, ParamCard, ParameterAssignment, ParameterKind, PositionedValue, PulseWaveform,
-    PwlPoint, ScopedCard, ScopedCardKind, SourceWaveform, Subcircuit,
+    OutputCards, ParamAssignment, ParamCard, ParameterAssignment, ParameterKind, PositionedValue,
+    PrintCard, PulseWaveform, PwlPoint, RequestedVector, SaveCard, ScopedCard, ScopedCardKind,
+    SourceFunction, SourceWaveform, Subcircuit, VectorRequest,
 };
-use crate::netlist::bexpr::{BExpr, BExprKind, BehaviouralExpression, TableTransfer};
+use crate::netlist::bexpr::{
+    BBinaryOp, BExpr, BExprKind, BUnaryOp, BehaviouralExpression, TableTransfer,
+};
 use crate::netlist::card::{CardKind, RawCard};
-use crate::netlist::expr::{Expr, ExprKind, ParameterExpression, SourceSpan};
+use crate::netlist::expr::{BinaryOp, Expr, ExprKind, Function, ParameterExpression, UnaryOp};
+use crate::netlist::token::{Token, TokenKind};
+use crate::primitives::{AnalysisKind, Real};
 
-fn blank() -> SourceLoc {
-    SourceLoc::new(PathBuf::new(), 0, 0)
+#[derive(Debug)]
+enum Segment {
+    Field(&'static str),
+    Index(usize),
 }
 
-fn span() -> SourceSpan {
-    SourceSpan {
-        start: blank(),
-        end: blank(),
-        logical: 0..0,
-    }
+#[derive(Debug)]
+enum Reason {
+    Value,
+    Variant,
+    Presence,
+    Length { left: usize, right: usize },
 }
 
-fn raw() -> RawCard {
-    RawCard {
-        location: blank(),
-        raw: String::new(),
-        tokens: Vec::new(),
-        kind: CardKind::Unknown,
-        source_map: crate::netlist::source::SourceMap::default(),
-    }
+/// The path is accumulated inside-out only on failure.
+#[derive(Debug)]
+pub(super) struct Difference {
+    path: Vec<Segment>,
+    reason: Reason,
 }
 
-/// Strips spans from an expression tree, keeping shape, spellings and groups.
-#[must_use]
-pub fn expr_form(expr: &Expr) -> Expr {
-    let kind = match &expr.kind {
-        ExprKind::Number { value, spelling } => ExprKind::Number {
-            value: *value,
-            spelling: spelling.clone(),
-        },
-        ExprKind::Identifier(name) => ExprKind::Identifier(name.clone()),
-        ExprKind::Unary { op, operand } => ExprKind::Unary {
-            op: *op,
-            operand: Box::new(expr_form(operand)),
-        },
-        ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
-            op: *op,
-            lhs: Box::new(expr_form(lhs)),
-            rhs: Box::new(expr_form(rhs)),
-        },
-        ExprKind::Call {
-            function,
-            arguments,
-        } => ExprKind::Call {
-            function: *function,
-            arguments: arguments.iter().map(expr_form).collect(),
-        },
-        ExprKind::Group(inner) => ExprKind::Group(Box::new(expr_form(inner))),
-        ExprKind::UserCall { name, arguments } => ExprKind::UserCall {
-            name: name.clone(),
-            arguments: arguments.iter().map(expr_form).collect(),
-        },
-    };
-    Expr { kind, span: span() }
-}
-
-fn expression_form(expression: &ParameterExpression) -> ParameterExpression {
-    ParameterExpression {
-        text: expression.text.clone(),
-        braced: expression.braced,
-        quoted: expression.quoted,
-        span: span(),
-        root: expr_form(&expression.root),
-    }
-}
-
-/// Strips spans from a behavioural-expression tree, keeping shape and spellings.
-#[must_use]
-pub fn bexpr_form(expr: &BExpr) -> BExpr {
-    let boxed = |expr: &BExpr| Box::new(bexpr_form(expr));
-    let kind = match &expr.kind {
-        BExprKind::Number { value, spelling } => BExprKind::Number {
-            value: *value,
-            spelling: spelling.clone(),
-        },
-        BExprKind::Name(name) => BExprKind::Name(name.clone()),
-        BExprKind::Voltage { positive, negative } => BExprKind::Voltage {
-            positive: positive.clone(),
-            negative: negative.clone(),
-        },
-        BExprKind::Current(name) => BExprKind::Current(name.clone()),
-        BExprKind::Unary { op, operand } => BExprKind::Unary {
-            op: *op,
-            operand: boxed(operand),
-        },
-        BExprKind::Binary { op, lhs, rhs } => BExprKind::Binary {
-            op: *op,
-            lhs: boxed(lhs),
-            rhs: boxed(rhs),
-        },
-        BExprKind::Ternary {
-            condition,
-            then,
-            otherwise,
-        } => BExprKind::Ternary {
-            condition: boxed(condition),
-            then: boxed(then),
-            otherwise: boxed(otherwise),
-        },
-        BExprKind::Call { name, arguments } => BExprKind::Call {
-            name: name.clone(),
-            arguments: arguments.iter().map(bexpr_form).collect(),
-        },
-        BExprKind::Group(inner) => BExprKind::Group(boxed(inner)),
-        BExprKind::Value(value) => BExprKind::Value(Box::new(expression_form(value))),
-        BExprKind::Table(table) => BExprKind::Table(Box::new(TableTransfer {
-            input: bexpr_form(&table.input),
-            points: table
-                .points
-                .iter()
-                .map(|(x, y)| (bexpr_form(x), bexpr_form(y)))
-                .collect(),
-            domain: table.domain,
-        })),
-    };
-    BExpr { kind, span: span() }
-}
-
-fn behavioural_form(expression: &BehaviouralExpression) -> BehaviouralExpression {
-    BehaviouralExpression {
-        text: expression.text.clone(),
-        span: span(),
-        verbatim: expression.verbatim,
-        root: bexpr_form(&expression.root),
-    }
-}
-
-fn positioned(value: &PositionedValue) -> PositionedValue {
-    PositionedValue {
-        text: value.text.clone(),
-        location: blank(),
-    }
-}
-
-fn waveform(waveform: &SourceWaveform) -> SourceWaveform {
-    match waveform {
-        SourceWaveform::Pulse(pulse) => {
-            let optional = |value: &Option<PositionedValue>| value.as_ref().map(positioned);
-            SourceWaveform::Pulse(Box::new(PulseWaveform {
-                initial: positioned(&pulse.initial),
-                pulsed: positioned(&pulse.pulsed),
-                delay: optional(&pulse.delay),
-                rise: optional(&pulse.rise),
-                fall: optional(&pulse.fall),
-                width: optional(&pulse.width),
-                period: optional(&pulse.period),
-                count: optional(&pulse.count),
-            }))
+impl Difference {
+    const fn new(reason: Reason) -> Self {
+        Self {
+            path: Vec::new(),
+            reason,
         }
-        SourceWaveform::Function(function) => {
-            SourceWaveform::Function(Box::new(FunctionWaveform {
-                function: function.function,
-                values: function.values.iter().map(positioned).collect(),
-            }))
-        }
-        SourceWaveform::Pwl(points) => SourceWaveform::Pwl(
-            points
-                .iter()
-                .map(|point| PwlPoint {
-                    time: positioned(&point.time),
-                    value: positioned(&point.value),
-                })
-                .collect(),
-        ),
+    }
+
+    fn field(mut self, field: &'static str) -> Self {
+        self.path.push(Segment::Field(field));
+        self
+    }
+
+    fn index(mut self, index: usize) -> Self {
+        self.path.push(Segment::Index(index));
+        self
     }
 }
 
-fn assignment(parameter: &ParameterAssignment) -> ParameterAssignment {
-    let (kind, value) = match &parameter.kind {
-        ParameterKind::Scalar => (ParameterKind::Scalar, parameter.value.clone()),
-        ParameterKind::Textual => (ParameterKind::Textual, parameter.value.clone()),
-        ParameterKind::Flag => (ParameterKind::Flag, parameter.value.clone()),
-        ParameterKind::Instance => (ParameterKind::Instance, parameter.value.clone()),
-        ParameterKind::Behavioural(expression) => (
-            ParameterKind::Behavioural(Box::new(behavioural_form(expression))),
-            parameter.value.clone(),
-        ),
-        ParameterKind::Expression(expression) => (
-            ParameterKind::Expression(Box::new(expression_form(expression))),
-            parameter.value.clone(),
-        ),
-        ParameterKind::InitialConditions(values) => (
-            ParameterKind::InitialConditions(
-                values
-                    .iter()
-                    .map(|component| InitialCondition {
-                        name: component.name.clone(),
-                        value: positioned(&component.value),
-                    })
-                    .collect(),
-            ),
-            String::new(),
-        ),
-        ParameterKind::Waveform(source) => {
-            (ParameterKind::Waveform(waveform(source)), String::new())
-        }
-    };
-    ParameterAssignment {
-        name: parameter.name.clone(),
-        value,
-        kind,
-        location: blank(),
-    }
-}
-
-fn assignments(parameters: &[ParameterAssignment]) -> Vec<ParameterAssignment> {
-    parameters.iter().map(assignment).collect()
-}
-
-fn device(device: &DeviceInstance) -> DeviceInstance {
-    DeviceInstance {
-        name: device.name.clone(),
-        designator: device.designator,
-        nodes: device.nodes.clone(),
-        model: device.model.clone(),
-        parameters: assignments(&device.parameters),
-        location: blank(),
-    }
-}
-
-fn model(model: &ModelCard) -> ModelCard {
-    ModelCard {
-        name: model.name.clone(),
-        base: model.base.clone(),
-        level: model.level,
-        parameters: assignments(&model.parameters),
-        location: blank(),
-    }
-}
-
-fn analysis(card: &AnalysisCard) -> AnalysisCard {
-    AnalysisCard {
-        kind: card.kind,
-        arguments: card.arguments.clone(),
-        expressions: card
-            .expressions
-            .iter()
-            .map(|argument| ArgumentExpression {
-                index: argument.index,
-                expression: expression_form(&argument.expression),
-            })
-            .collect(),
-        uic: card.uic,
-        uic_location: card.uic_location.as_ref().map(|_| blank()),
-        location: blank(),
-    }
-}
-
-fn include(directive: &IncludeDirective) -> IncludeDirective {
-    IncludeDirective {
-        path: directive.path.clone(),
-        path_spelling: String::new(),
-        resolved_path: directive.resolved_path.clone(),
-        section: directive.section.clone(),
-        selected_section: directive
-            .selected_section
-            .as_ref()
-            .map(|section| LibrarySection {
-                name: section.name.clone(),
-                opening: raw(),
-                closing: raw(),
-            }),
-        location: blank(),
-    }
-}
-
-fn param(card: &ParamCard) -> ParamCard {
-    ParamCard {
-        assignments: card
-            .assignments
-            .iter()
-            .map(|assignment| ParamAssignment {
-                name: assignment.name.clone(),
-                name_span: span(),
-                expression: expression_form(&assignment.expression),
-            })
-            .collect(),
-        location: blank(),
-    }
-}
-
-fn function(card: &FuncCard) -> FuncCard {
-    FuncCard {
-        name: card.name.clone(),
-        name_span: span(),
-        parameters: card
-            .parameters
-            .iter()
-            .map(|parameter| FuncParameter {
-                name: parameter.name.clone(),
-                span: span(),
-            })
-            .collect(),
-        body: expression_form(&card.body),
-        // `.param f(x)=...` and `.func f(x) ...` define the same function.
-        spelling: FuncSpelling::Func,
-        location: blank(),
-    }
-}
-
-fn option(card: &OptionCard) -> OptionCard {
-    OptionCard {
-        settings: card
-            .settings
-            .iter()
-            .map(|setting| OptionSetting {
-                name: setting.name.clone(),
-                value: setting.value.as_ref().map(positioned),
-                expression: setting
-                    .expression
-                    .as_ref()
-                    .map(|expression| Box::new(expression_form(expression))),
-                location: blank(),
-            })
-            .collect(),
-        location: blank(),
-    }
-}
-
-fn global(card: &GlobalCard) -> GlobalCard {
-    GlobalCard {
-        nodes: card
-            .nodes
-            .iter()
-            .map(|node| GlobalNode {
-                name: node.name.clone(),
-                location: blank(),
-            })
-            .collect(),
-        location: blank(),
-    }
-}
-
-fn hints(card: &NodeHintCard) -> NodeHintCard {
-    NodeHintCard {
-        entries: card
-            .entries
-            .iter()
-            .map(|entry| NodeHint {
-                node: entry.node.clone(),
-                node_location: blank(),
-                value: match &entry.value {
-                    NodeHintValue::Literal { text, value } => NodeHintValue::Literal {
-                        text: text.clone(),
-                        value: *value,
-                    },
-                    NodeHintValue::Expression(expression) => {
-                        NodeHintValue::Expression(Box::new(expression_form(expression)))
+impl fmt::Display for Difference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, part) in self.path.iter().rev().enumerate() {
+            match part {
+                Segment::Field(field) => {
+                    if i != 0 {
+                        f.write_str(".")?;
                     }
-                },
-                value_location: blank(),
-                location: blank(),
-            })
-            .collect(),
-        location: blank(),
-    }
-}
-
-fn cards(cards: &[ScopedCard]) -> Vec<ScopedCard> {
-    cards
-        .iter()
-        .map(|card| ScopedCard {
-            kind: card.kind,
-            // `.save`/`.print`/`.measure`/`.four` carry only scope-local ordinals in
-            // the netlist and their typed requests live in `OutputCards` /
-            // `ParsedDeck::measurements` / `ParsedDeck::fourier`, so the card's
-            // own spelling is the netlist's only record of what was requested.
-            // Keeping it is what lets `semantic_eq` tell two such cards apart
-            // and lets the writer reproduce them from a semantic form; every
-            // other card is compared through its typed payload.
-            source: match card.kind {
-                ScopedCardKind::Save(_)
-                | ScopedCardKind::Print(_)
-                | ScopedCardKind::Measure(_)
-                | ScopedCardKind::Fourier(_)
-                | ScopedCardKind::Control => RawCard {
-                    raw: card.source.raw.clone(),
-                    ..raw()
-                },
-                _ => raw(),
-            },
-            include_chain: card.include_chain.iter().map(|_| blank()).collect(),
-        })
-        .collect()
-}
-
-fn output_cards(cards: &crate::netlist::ast::OutputCards) -> crate::netlist::ast::OutputCards {
-    let mut out = cards.clone();
-    for save in &mut out.saves {
-        save.location = blank();
-        for request in &mut save.requests {
-            request.location = blank();
-        }
-    }
-    for print in &mut out.prints {
-        print.location = blank();
-        print.analysis_location = blank();
-        for request in &mut print.requests {
-            request.location = blank();
-        }
-    }
-    out
-}
-
-fn measure_event(event: &mut crate::netlist::ast::MeasureEvent) {
-    use crate::netlist::ast::MeasureEvent;
-    match event {
-        MeasureEvent::Delayed { event, .. } => measure_event(event),
-        MeasureEvent::At { location, .. } => *location = blank(),
-        MeasureEvent::Crossing {
-            operand,
-            value_location,
-            ..
-        } => {
-            operand.location = blank();
-            *value_location = blank();
-        }
-        MeasureEvent::VectorCrossing {
-            operand, reference, ..
-        } => {
-            operand.location = blank();
-            reference.location = blank();
-        }
-    }
-}
-
-fn measurement(card: &crate::netlist::ast::MeasureCard) -> crate::netlist::ast::MeasureCard {
-    use crate::netlist::ast::MeasureRequest;
-    let mut out = card.clone();
-    out.location = blank();
-    out.name_location = blank();
-    out.analysis_location = blank();
-    let original = out.clone();
-    match &mut out.request {
-        MeasureRequest::Deferred { card, template, .. } => {
-            card.location = blank();
-            for token in &mut card.tokens {
-                token.location = blank();
+                    f.write_str(field)?;
+                }
+                Segment::Index(index) => write!(f, "[{index}]")?,
             }
-            let mut inner = original;
-            inner.request = *template.clone();
-            **template = measurement(&inner).request;
         }
-        MeasureRequest::Parameter(expression) => **expression = expression_form(expression),
-        MeasureRequest::Find {
-            operand,
-            at_location,
-            ..
-        } => {
-            operand.location = blank();
-            *at_location = blank();
+        if self.path.is_empty() {
+            f.write_str("value")?;
         }
-        MeasureRequest::Statistic { operand, .. } => operand.location = blank(),
-        MeasureRequest::AtEvent { operand, event, .. } => {
-            operand.location = blank();
-            measure_event(event);
+        match self.reason {
+            Reason::Value => f.write_str(": differs"),
+            Reason::Variant => f.write_str(": different variant"),
+            Reason::Presence => f.write_str(": present on only one side"),
+            Reason::Length { left, right } => {
+                write!(f, ": {left} entries on the left, {right} on the right")
+            }
         }
-        MeasureRequest::When { event, .. } => measure_event(event),
-        MeasureRequest::TrigTarg { trig, targ, .. } => {
-            measure_event(trig);
-            measure_event(targ);
-        }
-    }
-    out
-}
-
-fn fourier_card(card: &crate::netlist::ast::FourierCard) -> crate::netlist::ast::FourierCard {
-    let mut out = card.clone();
-    out.location = blank();
-    out.fundamental_location = blank();
-    out.fundamental_expression = out
-        .fundamental_expression
-        .as_deref()
-        .map(expression_form)
-        .map(Box::new);
-    out.harmonics_location = out.harmonics_location.map(|_| blank());
-    for request in &mut out.vectors {
-        request.location = blank();
-    }
-    out
-}
-
-fn subcircuit(sub: &Subcircuit) -> Subcircuit {
-    Subcircuit {
-        name: sub.name.clone(),
-        terminals: sub.terminals.clone(),
-        parameters: assignments(&sub.parameters),
-        devices: sub.devices.iter().map(device).collect(),
-        models: sub.models.iter().map(model).collect(),
-        subcircuits: sub.subcircuits.iter().map(subcircuit).collect(),
-        analyses: sub.analyses.iter().map(analysis).collect(),
-        includes: sub.includes.iter().map(include).collect(),
-        params: sub.params.iter().map(param).collect(),
-        functions: sub.functions.iter().map(function).collect(),
-        options: sub.options.iter().map(option).collect(),
-        globals: sub.globals.iter().map(global).collect(),
-        initial_conditions: sub.initial_conditions.iter().map(hints).collect(),
-        nodesets: sub.nodesets.iter().map(hints).collect(),
-        output: output_cards(&sub.output),
-        measurements: sub.measurements.iter().map(measurement).collect(),
-        fourier: sub.fourier.iter().map(fourier_card).collect(),
-        cards: cards(&sub.cards),
-        end_location: blank(),
-        location: blank(),
     }
 }
 
-/// A copy of `netlist` with positions and lexical-only fields neutralised; see
-/// the module documentation for exactly what is kept and what is dropped.
-#[must_use]
-pub fn semantic_form(netlist: &Netlist) -> Netlist {
-    Netlist {
-        title: netlist.title.clone(),
-        path: PathBuf::new(),
-        devices: netlist.devices.iter().map(device).collect(),
-        models: netlist.models.iter().map(model).collect(),
-        subcircuits: netlist.subcircuits.iter().map(subcircuit).collect(),
-        analyses: netlist.analyses.iter().map(analysis).collect(),
-        includes: netlist.includes.iter().map(include).collect(),
-        params: netlist.params.iter().map(param).collect(),
-        functions: netlist.functions.iter().map(function).collect(),
-        options: netlist.options.iter().map(option).collect(),
-        globals: netlist.globals.iter().map(global).collect(),
-        initial_conditions: netlist.initial_conditions.iter().map(hints).collect(),
-        nodesets: netlist.nodesets.iter().map(hints).collect(),
-        cards: cards(&netlist.cards),
-        location: blank(),
+type Comparison = Result<(), Difference>;
+
+pub(super) trait Semantic {
+    fn compare_semantic(&self, other: &Self) -> Comparison;
+}
+
+/// Exact equality for fields with no lexical/location metadata. In
+/// particular, real values use the same PartialEq semantics as the AST
+/// (signed zero compares equal and NaN does not).
+macro_rules! semantic_leaves {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl Semantic for $ty {
+                fn compare_semantic(&self, other: &Self) -> Comparison {
+                    if PartialEq::eq(self, other) {
+                        Ok(())
+                    } else {
+                        Err(Difference::new(Reason::Value))
+                    }
+                }
+            }
+        )+
+    };
+}
+
+semantic_leaves!(
+    String,
+    bool,
+    char,
+    usize,
+    u32,
+    Real,
+    PathBuf,
+    AnalysisKind,
+    SourceFunction,
+    ScopedCardKind,
+    RequestedVector,
+    MeasureStatistic,
+    MeasureTransition,
+    CardKind,
+    TokenKind,
+    UnaryOp,
+    BinaryOp,
+    Function,
+    BUnaryOp,
+    BBinaryOp,
+);
+
+fn compare_lengths(left: usize, right: usize) -> Comparison {
+    if left == right {
+        Ok(())
+    } else {
+        Err(Difference::new(Reason::Length { left, right }))
     }
 }
 
-/// True when the two netlists are equal after [`semantic_form`].
+impl<T: Semantic> Semantic for Vec<T> {
+    fn compare_semantic(&self, other: &Self) -> Comparison {
+        compare_lengths(self.len(), other.len())?;
+        for (index, (left, right)) in self.iter().zip(other).enumerate() {
+            left.compare_semantic(right)
+                .map_err(|diff| diff.index(index))?;
+        }
+        Ok(())
+    }
+}
+
+impl<T: Semantic> Semantic for Option<T> {
+    fn compare_semantic(&self, other: &Self) -> Comparison {
+        match (self, other) {
+            (Some(left), Some(right)) => left.compare_semantic(right),
+            (None, None) => Ok(()),
+            _ => Err(Difference::new(Reason::Presence)),
+        }
+    }
+}
+
+impl<T: Semantic> Semantic for Box<T> {
+    fn compare_semantic(&self, other: &Self) -> Comparison {
+        (**self).compare_semantic(other)
+    }
+}
+
+impl<T: Semantic, U: Semantic> Semantic for (T, U) {
+    fn compare_semantic(&self, other: &Self) -> Comparison {
+        self.0
+            .compare_semantic(&other.0)
+            .map_err(|diff| diff.index(0))?;
+        self.1
+            .compare_semantic(&other.1)
+            .map_err(|diff| diff.index(1))
+    }
+}
+
+// Exhaustive field patterns make the semantic/lexical classification explicit:
+// adding a field to a compared AST struct requires classifying it here.
+macro_rules! semantic_struct {
+    ($ty:ty { $($field:ident),+ $(,)? } ignore { $($ignored:ident),* $(,)? }) => {
+        impl Semantic for $ty {
+            fn compare_semantic(&self, other: &Self) -> Comparison {
+                let Self { $($field,)+ $($ignored: _,)* } = self;
+                $(
+                    $field.compare_semantic(&other.$field)
+                        .map_err(|diff| diff.field(stringify!($field)))?;
+                )+
+                Ok(())
+            }
+        }
+    };
+}
+
+// Scope order is compared first, including structural terminators and
+// indexes, then the typed payload vectors in stable diagnostic order.
+semantic_struct!(Netlist { title, cards, devices, models, subcircuits, analyses, includes, params, functions, options, globals, initial_conditions, nodesets } ignore { path, location });
+semantic_struct!(Subcircuit { name, terminals, parameters, cards, devices, models, subcircuits, analyses, includes, params, functions, options, globals, initial_conditions, nodesets, output, measurements, fourier } ignore { end_location, location });
+semantic_struct!(DeviceInstance { name, designator, nodes, model, parameters } ignore { location });
+semantic_struct!(ModelCard { name, base, level, parameters } ignore { location });
+semantic_struct!(IncludeDirective { path, resolved_path, section, selected_section } ignore { path_spelling, location });
+semantic_struct!(LibrarySection { name } ignore { opening, closing });
+semantic_struct!(ParamCard { assignments } ignore { location });
+semantic_struct!(ParamAssignment { name, expression } ignore { name_span });
+semantic_struct!(FuncCard { name, parameters, body } ignore { name_span, spelling, location });
+semantic_struct!(FuncParameter { name } ignore { span });
+semantic_struct!(ArgumentExpression { index, expression } ignore {});
+semantic_struct!(OptionCard { settings } ignore { location });
+semantic_struct!(OptionSetting { name, value, expression } ignore { location });
+semantic_struct!(GlobalCard { nodes } ignore { location });
+semantic_struct!(GlobalNode { name } ignore { location });
+semantic_struct!(NodeHintCard { entries } ignore { location });
+semantic_struct!(NodeHint { node, value } ignore { node_location, value_location, location });
+semantic_struct!(PositionedValue { text } ignore { location });
+semantic_struct!(InitialCondition { name, value } ignore {});
+semantic_struct!(PulseWaveform { initial, pulsed, delay, rise, fall, width, period, count } ignore {});
+semantic_struct!(FunctionWaveform { function, values } ignore {});
+semantic_struct!(PwlPoint { time, value } ignore {});
+semantic_struct!(OutputCards { saves, prints } ignore {});
+semantic_struct!(SaveCard { requests } ignore { location });
+semantic_struct!(PrintCard { ascii_plot, analysis, requests } ignore { analysis_location, location });
+semantic_struct!(VectorRequest { vector } ignore { location });
+semantic_struct!(MeasureCard { analysis, name, request } ignore { analysis_location, name_location, location });
+semantic_struct!(MeasureWindow { from, to } ignore {});
+semantic_struct!(ParameterExpression { text, braced, quoted, root } ignore { span });
+semantic_struct!(Expr { kind } ignore { span });
+semantic_struct!(BehaviouralExpression { text, verbatim, root } ignore { span });
+semantic_struct!(BExpr { kind } ignore { span });
+semantic_struct!(TableTransfer { input, points, domain } ignore {});
+semantic_struct!(RawCard { raw, tokens, kind } ignore { location, source_map });
+
+impl Semantic for Token {
+    fn compare_semantic(&self, other: &Self) -> Comparison {
+        // Deferred measurement cards retain their token shape and joined
+        // offsets, but not the physical source map or token location.
+        self.kind
+            .compare_semantic(&other.kind)
+            .map_err(|diff| diff.field("kind"))?;
+        self.text
+            .compare_semantic(&other.text)
+            .map_err(|diff| diff.field("text"))?;
+        self.raw_offset
+            .compare_semantic(&other.raw_offset)
+            .map_err(|diff| diff.field("raw_offset"))
+    }
+}
+
+impl Semantic for AnalysisCard {
+    fn compare_semantic(&self, other: &Self) -> Comparison {
+        let Self {
+            kind,
+            arguments,
+            expressions,
+            uic,
+            uic_location,
+            location: _,
+        } = self;
+        kind.compare_semantic(&other.kind)
+            .map_err(|diff| diff.field("kind"))?;
+        arguments
+            .compare_semantic(&other.arguments)
+            .map_err(|diff| diff.field("arguments"))?;
+        expressions
+            .compare_semantic(&other.expressions)
+            .map_err(|diff| diff.field("expressions"))?;
+        uic.compare_semantic(&other.uic)
+            .map_err(|diff| diff.field("uic"))?;
+        uic_location
+            .is_some()
+            .compare_semantic(&other.uic_location.is_some())
+            .map_err(|diff| diff.field("uic_location"))
+    }
+}
+
+impl Semantic for FourierCard {
+    fn compare_semantic(&self, other: &Self) -> Comparison {
+        let Self {
+            frontend_command,
+            fundamental_expression,
+            fundamental,
+            fundamental_location: _,
+            harmonics,
+            harmonics_location,
+            vectors,
+            location: _,
+        } = self;
+        frontend_command
+            .compare_semantic(&other.frontend_command)
+            .map_err(|diff| diff.field("frontend_command"))?;
+        fundamental_expression
+            .compare_semantic(&other.fundamental_expression)
+            .map_err(|diff| diff.field("fundamental_expression"))?;
+        fundamental
+            .compare_semantic(&other.fundamental)
+            .map_err(|diff| diff.field("fundamental"))?;
+        harmonics
+            .compare_semantic(&other.harmonics)
+            .map_err(|diff| diff.field("harmonics"))?;
+        harmonics_location
+            .is_some()
+            .compare_semantic(&other.harmonics_location.is_some())
+            .map_err(|diff| diff.field("harmonics_location"))?;
+        vectors
+            .compare_semantic(&other.vectors)
+            .map_err(|diff| diff.field("vectors"))
+    }
+}
+
+impl Semantic for ParameterAssignment {
+    fn compare_semantic(&self, other: &Self) -> Comparison {
+        let Self {
+            name,
+            value,
+            kind,
+            location: _,
+        } = self;
+        name.compare_semantic(&other.name)
+            .map_err(|diff| diff.field("name"))?;
+        kind.compare_semantic(&other.kind)
+            .map_err(|diff| diff.field("kind"))?;
+        // Only the structured components carry semantics for vectors.
+        match kind {
+            ParameterKind::Waveform(_) | ParameterKind::InitialConditions(_) => Ok(()),
+            ParameterKind::Scalar
+            | ParameterKind::Textual
+            | ParameterKind::Flag
+            | ParameterKind::Instance
+            | ParameterKind::Expression(_)
+            | ParameterKind::Behavioural(_) => value
+                .compare_semantic(&other.value)
+                .map_err(|diff| diff.field("value")),
+        }
+    }
+}
+
+impl Semantic for ScopedCard {
+    fn compare_semantic(&self, other: &Self) -> Comparison {
+        let Self {
+            kind,
+            source,
+            include_chain,
+        } = self;
+        kind.compare_semantic(&other.kind)
+            .map_err(|diff| diff.field("kind"))?;
+        match kind {
+            ScopedCardKind::Save(_)
+            | ScopedCardKind::Print(_)
+            | ScopedCardKind::Measure(_)
+            | ScopedCardKind::Fourier(_)
+            | ScopedCardKind::Control => {
+                source
+                    .raw
+                    .compare_semantic(&other.source.raw)
+                    .map_err(|diff| diff.field("source.raw"))?;
+            }
+            ScopedCardKind::Device(_)
+            | ScopedCardKind::Model(_)
+            | ScopedCardKind::Subcircuit(_)
+            | ScopedCardKind::Analysis(_)
+            | ScopedCardKind::Include(_)
+            | ScopedCardKind::Options(_)
+            | ScopedCardKind::Global(_)
+            | ScopedCardKind::Param(_)
+            | ScopedCardKind::Func(_)
+            | ScopedCardKind::InitialCondition(_)
+            | ScopedCardKind::Nodeset(_)
+            | ScopedCardKind::End
+            | ScopedCardKind::Ends => {}
+        }
+        compare_lengths(include_chain.len(), other.include_chain.len())
+            .map_err(|diff| diff.field("include_chain"))
+    }
+}
+
+// Exhaustive variant patterns also require callers to classify every new
+// variant and field. Tuple and unit variants use the same mismatch path logic.
+macro_rules! semantic_enum {
+    ($ty:ty {
+        $(
+            $variant:ident
+            $( ( $item:ident : $other_item:ident ) )?
+            $( { $($field:ident : $other_field:ident),+ $(; $($ignored:ident),+)? } )?
+        ),+ $(,)?
+    }) => {
+        impl Semantic for $ty {
+            fn compare_semantic(&self, other: &Self) -> Comparison {
+                match self {
+                    $(
+                        Self::$variant
+                        $(($item))?
+                        $({ $($field,)+ $($($ignored: _,)+)? })?
+                        => {
+                            let Self::$variant
+                                $(($other_item))?
+                                $({ $($field: $other_field,)+ $($($ignored: _,)+)? })?
+                                = other else {
+                                    return Err(Difference::new(Reason::Variant).field(stringify!($variant)));
+                                };
+                            $(
+                                $item.compare_semantic($other_item)
+                                    .map_err(|diff| diff.field(stringify!($item)).field(stringify!($variant)))?;
+                            )?
+                            $(
+                                $(
+                                    $field.compare_semantic($other_field)
+                                        .map_err(|diff| diff.field(stringify!($field)).field(stringify!($variant)))?;
+                                )+
+                            )?
+                            Ok(())
+                        }
+                    ),+
+                }
+            }
+        }
+    };
+}
+
+semantic_enum!(ExprKind {
+    Number { value: rvalue, spelling: rspelling },
+    Identifier(name: rname),
+    Unary { op: rop, operand: roperand },
+    Binary { op: rop, lhs: rlhs, rhs: rrhs },
+    Call { function: rfunction, arguments: rarguments },
+    Group(inner: rinner),
+    UserCall { name: rname, arguments: rarguments },
+});
+
+semantic_enum!(BExprKind {
+    Number { value: rvalue, spelling: rspelling },
+    Name(name: rname),
+    Voltage { positive: rpositive, negative: rnegative },
+    Current(name: rname),
+    Unary { op: rop, operand: roperand },
+    Binary { op: rop, lhs: rlhs, rhs: rrhs },
+    Ternary { condition: rcondition, then: rthen, otherwise: rotherwise },
+    Call { name: rname, arguments: rarguments },
+    Group(inner: rinner),
+    Value(value: rvalue),
+    Table(table: rtable),
+});
+
+semantic_enum!(ParameterKind {
+    Scalar,
+    Textual,
+    Flag,
+    Instance,
+    Expression(expression: rexpression),
+    Behavioural(expression: rexpression),
+    InitialConditions(components: rcomponents),
+    Waveform(waveform: rwaveform),
+});
+
+semantic_enum!(SourceWaveform {
+    Pulse(pulse: rpulse),
+    Function(function: rfunction),
+    Pwl(points: rpoints),
+});
+
+semantic_enum!(NodeHintValue {
+    Literal { text: rtext, value: rvalue },
+    Expression(expression: rexpression),
+});
+
+semantic_enum!(MeasureRequest {
+    Deferred { card: rcard, auto_gnd: rauto_gnd, template: rtemplate },
+    Parameter(expression: rexpression),
+    AtEvent { operand: roperand, event: revent, derivative: rderivative, window: rwindow },
+    When { event: revent, window: rwindow },
+    Find { operand: roperand, at: rat, window: rwindow; at_location },
+    Statistic { statistic: rstatistic, operand: roperand, window: rwindow },
+    TrigTarg { trig: rtrig, targ: rtarg, window: rwindow },
+});
+
+semantic_enum!(MeasureEvent {
+    Delayed { event: revent, td: rtd },
+    At { at: rat; location },
+    VectorCrossing { operand: roperand, reference: rreference, transition: rtransition },
+    Crossing { operand: roperand, value: rvalue, transition: rtransition; value_location },
+});
+
+/// Also used by the writer's expression/tree round-trip checks.
+pub(super) fn equal<T: Semantic>(left: &T, right: &T) -> bool {
+    left.compare_semantic(right).is_ok()
+}
+
+/// True when two decks differ only in location and the documented lexical fields.
 #[must_use]
 pub fn semantic_eq(left: &Netlist, right: &Netlist) -> bool {
-    semantic_form(left) == semantic_form(right)
+    equal(left, right)
 }
 
-fn compare<T: PartialEq + std::fmt::Debug>(what: &str, left: &[T], right: &[T]) -> Option<String> {
-    if left.len() != right.len() {
-        return Some(format!(
-            "{what}: {} entries on the left, {} on the right",
-            left.len(),
-            right.len()
-        ));
-    }
-    left.iter()
-        .zip(right)
-        .position(|(l, r)| l != r)
-        .map(|index| {
-            format!(
-                "{what}[{index}] differs\n  left:  {:?}\n  right: {:?}",
-                left[index], right[index]
-            )
-        })
-}
-
-/// Describes the first semantic difference between two netlists, or `None` when
-/// [`semantic_eq`] holds. The text is for diagnostics, not a stable format.
+/// Describes the first semantic difference, or `None` when the decks are
+/// equal. The path is diagnostic text, not a stable serialization format.
 #[must_use]
 pub fn semantic_diff(left: &Netlist, right: &Netlist) -> Option<String> {
-    let (l, r) = (semantic_form(left), semantic_form(right));
-    if l.title != r.title {
-        return Some(format!("title: {:?} vs {:?}", l.title, r.title));
-    }
-    compare("cards", &l.cards, &r.cards)
-        .or_else(|| compare("devices", &l.devices, &r.devices))
-        .or_else(|| compare("models", &l.models, &r.models))
-        .or_else(|| compare("subcircuits", &l.subcircuits, &r.subcircuits))
-        .or_else(|| compare("analyses", &l.analyses, &r.analyses))
-        .or_else(|| compare("includes", &l.includes, &r.includes))
-        .or_else(|| compare("params", &l.params, &r.params))
-        .or_else(|| compare("functions", &l.functions, &r.functions))
-        .or_else(|| compare("options", &l.options, &r.options))
-        .or_else(|| compare("globals", &l.globals, &r.globals))
-        .or_else(|| {
-            compare(
-                "initial conditions",
-                &l.initial_conditions,
-                &r.initial_conditions,
-            )
-        })
-        .or_else(|| compare("nodesets", &l.nodesets, &r.nodesets))
+    left.compare_semantic(right)
+        .err()
+        .map(|diff| diff.to_string())
 }

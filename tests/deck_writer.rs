@@ -711,3 +711,113 @@ fn generated_device_cards_retain_source_order_and_provenance() {
         }
     }
 }
+
+#[test]
+fn semantic_difference_is_the_first_nested_typed_path() {
+    use ngspice_rs::netlist::ExprKind;
+    let left =
+        parse("t\n.subckt outer a b\n.subckt inner a b\nr1 a b {2*(3+4)}\n.ends\n.ends\n.end\n");
+    let mut right = left.clone();
+    let param = &mut right.subcircuits[0].subcircuits[0].devices[0].parameters[0];
+    let ParameterKind::Expression(expression) = &mut param.kind else {
+        panic!("expected expression");
+    };
+    let ExprKind::Binary { rhs, .. } = &mut expression.root.kind else {
+        panic!("expected binary");
+    };
+    let ExprKind::Group(inner) = &mut rhs.kind else {
+        panic!("expected group");
+    };
+    let ExprKind::Binary { rhs, .. } = &mut inner.kind else {
+        panic!("expected binary in group");
+    };
+    let ExprKind::Number { value, .. } = &mut rhs.kind else {
+        panic!("expected number");
+    };
+    *value = 7.;
+    assert!(!semantic_eq(&left, &right));
+    assert_eq!(
+        semantic_diff(&left, &right).as_deref(),
+        Some(
+            "subcircuits[0].subcircuits[0].devices[0].parameters[0].kind.Expression.expression.root.kind.Binary.rhs.kind.Group.inner.kind.Binary.rhs.kind.Number.value: differs"
+        ),
+    );
+    // The earlier field wins without examining the nested mismatch.
+    right.title = "other title".into();
+    assert_eq!(
+        semantic_diff(&left, &right).as_deref(),
+        Some("title: differs")
+    );
+}
+
+#[test]
+fn scope_order_include_path_and_depth_are_semantic_but_locations_are_not() {
+    let left = parse("t\n.include \"local.inc\"\nr1 a 0 1k\n.end\n");
+    let mut right = left.clone();
+    right.includes[0].path_spelling = "local.inc".into();
+    right.path = PathBuf::from("other.cir");
+    assert!(semantic_eq(&left, &right));
+    right.includes[0].resolved_path = Some(PathBuf::from("/different/local.inc"));
+    assert_eq!(
+        semantic_diff(&left, &right).as_deref(),
+        Some("includes[0].resolved_path: present on only one side")
+    );
+    right.includes[0].resolved_path = None;
+    right.cards[1].include_chain.push(left.location.clone());
+    assert_eq!(
+        semantic_diff(&left, &right).as_deref(),
+        Some("cards[1].include_chain: 0 entries on the left, 1 on the right")
+    );
+    let mut left = left;
+    left.cards[1].include_chain.push(right.location.clone());
+    right.cards[1].include_chain[0] =
+        ngspice_rs::primitives::SourceLoc::new(PathBuf::from("changed.cir"), 31, 19);
+    assert!(semantic_eq(&left, &right));
+    right.cards.swap(0, 1);
+    assert_eq!(
+        semantic_diff(&left, &right).as_deref(),
+        Some("cards[0].kind: differs")
+    );
+}
+
+#[test]
+fn spelling_and_grouping_are_not_algebraic_equivalence() {
+    for (a, b) in [
+        ("r1 a 0 {2+3}", "r1 a 0 {3+2}"),
+        ("r1 a 0 {2*(3)}", "r1 a 0 {2*3}"),
+        ("r1 a 0 {2+3}", "r1 a 0 '2+3'"),
+        ("r1 a 0 1k", "r1 a 0 1000"),
+        (".param x=1 x=2", ".param x=2 x=1"),
+        ("b1 a 0 v=v(b)+1", "b1 a 0 v=1+v(b)"),
+    ] {
+        let left = parse(&format!("t\n{a}\n.end\n"));
+        let right = parse(&format!("t\n{b}\n.end\n"));
+        assert!(!semantic_eq(&left, &right), "{a} vs {b}");
+        assert!(semantic_diff(&left, &right).is_some(), "{a} vs {b}");
+    }
+    let a = parse("t\nv1 a 0 pulse(0 5 1n 2n 3n)\n.end\n");
+    let b = parse("t\nv1 a 0 pulse( 0, 5, 1n, 2n, 3n )\n.end\n");
+    assert!(semantic_eq(&a, &b), "{:?}", semantic_diff(&a, &b));
+}
+
+#[test]
+fn deferred_subcircuit_measurement_ignores_physical_source_maps() {
+    let a = parse("t\n.subckt s a b\nr1 a b 1k\n.meas tran x find v(a)\n+ at={1m}\n.ends\n.end\n");
+    let b = parse(
+        "t\n\n* relocated\n.subckt s a b\nr1 a b 1k\n.meas tran x find v(a) at={1m}\n.ends\n.end\n",
+    );
+    assert_ne!(a, b);
+    assert!(semantic_eq(&a, &b), "{:?}", semantic_diff(&a, &b));
+    let mut changed = b.clone();
+    use ngspice_rs::netlist::ast::MeasureRequest;
+    let MeasureRequest::Deferred { auto_gnd, .. } =
+        &mut changed.subcircuits[0].measurements[0].request
+    else {
+        panic!("expected deferred request");
+    };
+    *auto_gnd = !*auto_gnd;
+    assert_eq!(
+        semantic_diff(&b, &changed).as_deref(),
+        Some("subcircuits[0].measurements[0].request.Deferred.auto_gnd: differs")
+    );
+}

@@ -275,9 +275,14 @@ source reproduction. The full contract is the module documentation of
   that are not single tokens or would be read as comments, scopes opened and
   closed in different files).
 - **Reparse:** SourceLocs, joined card text and spans always differ. Use
-  `semantic_eq`/`semantic_diff`/`semantic_form` (module `semantic`), which
-  neutralise locations, `Netlist::path`, raw card text, `path_spelling` and the
-  original text of waveform/`ic` vectors (their structured values are compared).
+  `semantic_eq`/`semantic_diff` (module `semantic`), which compare borrowed
+  typed fields through one short-circuiting traversal. They ignore physical
+  positions/source maps, `Netlist::path`, include quoting and lexical raw card
+  text (except output/control requests), and the original text of waveform/
+  `ic` vectors (their structured values are compared). Expression grouping,
+  literal spellings and include-chain depth/resolved paths remain significant.
+  Equal decks require no comparison allocations; differences report the first
+  differing field/index path. Writer expression checks use the same traversal.
   Re-parse with the same `Parser` configuration (`auto_gnd`). Tests:
   `tests/deck_writer.rs` (all `conformance/netlists/*.cir`,
   `conformance/parser/*.cir` and the source-resolution fixture round-trip and

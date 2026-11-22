@@ -113,7 +113,7 @@ use crate::netlist::ast::{
     Subcircuit, poly_dimension,
 };
 use crate::netlist::expr::ParameterExpression;
-use crate::netlist::semantic::{bexpr_form, expr_form};
+use crate::netlist::semantic::equal as semantic_equal;
 use crate::netlist::source::{LogicalLine, parse_deck_text, strip_comment};
 use crate::netlist::token::{Token, TokenKind, tokenize};
 use crate::netlist::{Parser, parse_parameter_expression};
@@ -380,13 +380,7 @@ impl Writer {
                 .assignments
                 .iter()
                 .zip(&card.assignments)
-                .all(|(a, b)| {
-                    a.name == b.name
-                        && a.expression.braced == b.expression.braced
-                        && a.expression.quoted == b.expression.quoted
-                        && a.expression.text == b.expression.text
-                        && expr_form(&a.expression.root) == expr_form(&b.expression.root)
-                });
+                .all(|(a, b)| a.name == b.name && semantic_equal(&a.expression, &b.expression));
         if !same {
             return Err(refuse(
                 "`.param` card does not re-parse to the same assignments",
@@ -440,10 +434,7 @@ impl Writer {
                     .iter()
                     .map(|p| p.name.as_str())
                     .eq(formals.iter().copied())
-                && other.body.braced == card.body.braced
-                && other.body.quoted == card.body.quoted
-                && other.body.text == card.body.text
-                && expr_form(&other.body.root) == expr_form(&card.body.root)
+                && semantic_equal(&other.body, &card.body)
         };
         if !same {
             return Err(refuse(
@@ -897,7 +888,7 @@ fn check_expression(expression: &ParameterExpression, location: &SourceLoc) -> S
             Some(location),
         )
     })?;
-    if expr_form(&reparsed.root) != expr_form(&expression.root) {
+    if !semantic_equal(&reparsed.root, &expression.root) {
         return Err(refuse(
             format!(
                 "expression text {:?} does not match its stored syntax tree",
@@ -1270,9 +1261,7 @@ fn behavioural_text(parameter: &ParameterAssignment) -> SpiceResult<String> {
                 Some(location),
             )
         })?;
-    if expression.text.contains(['\n', '\r'])
-        || bexpr_form(&reparsed.root) != bexpr_form(&expression.root)
-    {
+    if expression.text.contains(['\n', '\r']) || !semantic_equal(&reparsed.root, &expression.root) {
         return Err(refuse(
             format!(
                 "behavioural expression text {:?} does not match its stored syntax tree",
