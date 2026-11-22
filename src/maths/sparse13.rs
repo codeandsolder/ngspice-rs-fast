@@ -3191,44 +3191,48 @@ mod tests {
         use crate::primitives::numeric::scale_power;
         let tiny = scale_power(1., -1000);
         let large = scale_power(1., 1000);
-        // Force the same diagonal order as the well-scaled factorization.
-        // U12/D11 is 2^2000, but the Schur entry and solution are finite.
+        // Retain the same diagonal order as the well-scaled factorization.
+        // U12/D11 is 2^2000 or 2^-2000, but the Schur entry and solution
+        // are finite. Check both fresh ordering and numerical refactor.
         let mut m = build(2, &[(1, 1, 2.), (1, 2, 1.), (2, 1, 1.), (2, 2, 2.)]);
         assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
-        m.reload_originals(&[tiny, large, tiny, large * 2.]);
-        assert_eq!(m.factor(), Status::Okay);
-        assert_eq!(m.solve(&[large, large * 2.]), [0., 1.]);
-        assert_eq!(m.solve_transposed(&[tiny, large * 2.]), [0., 1.]);
-        // The same coefficients on the threshold-ordering path.
-        let mut fresh = build(
-            2,
-            &[
-                (1, 1, tiny),
-                (1, 2, large),
-                (2, 1, tiny),
-                (2, 2, large * 2.),
-            ],
-        );
-        assert_eq!(fresh.order_and_factor(1e-3, 0.), Status::Okay);
-        assert_eq!(fresh.solve(&[large, large * 2.]), [0., 1.]);
-
         let c = |x| Complex::new(x, x);
-        let mut m = Sparse::from_originals(
+        let mut complex = Sparse::from_originals(
             2,
             [(1, 1, c(2.)), (1, 2, c(1.)), (2, 1, c(1.)), (2, 2, c(2.))],
         )
         .unwrap();
-        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
-        m.reload_originals(&[c(tiny), c(large), c(tiny), c(large * 2.)]);
-        assert_eq!(m.factor(), Status::Okay);
-        assert_eq!(
-            m.solve(&[c(large), c(large * 2.)]),
-            [Complex::ZERO, Complex::real(1.)]
-        );
-        assert_eq!(
-            m.solve_transposed(&[c(tiny), c(large * 2.)]),
-            [Complex::ZERO, Complex::real(1.)]
-        );
+        assert_eq!(complex.order_and_factor(1e-3, 0.), Status::Okay);
+        for (a, b) in [(tiny, large), (large, tiny), (-tiny, large), (-large, tiny)] {
+            m.reload_originals(&[a, b, a, b * 2.]);
+            assert_eq!(m.factor(), Status::Okay);
+            assert_eq!(m.solve(&[b, b * 2.]), [0., 1.]);
+            assert_eq!(m.solve_transposed(&[a, b * 2.]), [0., 1.]);
+            let mut fresh = build(2, &[(1, 1, a), (1, 2, b), (2, 1, a), (2, 2, b * 2.)]);
+            assert_eq!(fresh.order_and_factor(1e-3, 0.), Status::Okay);
+            assert_eq!(fresh.solve(&[b, b * 2.]), [0., 1.]);
+
+            complex.reload_originals(&[c(a), c(b), c(a), c(b * 2.)]);
+            assert_eq!(complex.factor(), Status::Okay);
+            assert_eq!(
+                complex.solve(&[c(b), c(b * 2.)]),
+                [Complex::ZERO, Complex::real(1.)]
+            );
+            assert_eq!(
+                complex.solve_transposed(&[c(a), c(b * 2.)]),
+                [Complex::ZERO, Complex::real(1.)]
+            );
+            let mut fresh = Sparse::from_originals(
+                2,
+                [(1, 1, c(a)), (1, 2, c(b)), (2, 1, c(a)), (2, 2, c(b * 2.))],
+            )
+            .unwrap();
+            assert_eq!(fresh.order_and_factor(1e-3, 0.), Status::Okay);
+            assert_eq!(
+                fresh.solve(&[c(b), c(b * 2.)]),
+                [Complex::ZERO, Complex::real(1.)]
+            );
+        }
 
         let smallest = c(f64::from_bits(1));
         let mut m = Sparse::from_originals(1, [(1, 1, smallest)]).unwrap();

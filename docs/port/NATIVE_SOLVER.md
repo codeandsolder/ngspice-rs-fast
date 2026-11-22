@@ -301,6 +301,16 @@ singular systems).
   cubics are validated against independently derived polynomial residuals
   and Vieta coefficients. The historical C traces remain optional diagnostics.
   Existing reference tolerances are unchanged.
+  The complete #91 golden audit verifies 219 of 220 fixtures (all eleven
+  pole-zero fixtures). The exception, `sens_jfet2`, remains a sensitivity
+  finite-difference accuracy issue, not a pole-zero or factorization
+  failure. For example, its physical DELTA derivative independently
+  evaluates to approximately 0.00116748671553, whereas the historical
+  C 1-ppm finite difference gives 0.00116747694002 and the #91 finite
+  difference gives 0.00116749333592. Both miss the existing precision
+  bound on the physical derivative; the latter is closer. Keep the
+  historical capture and repair the derivative/reference calculation
+  in [#144](https://github.com/codeandsolder/ngspice-rs-fast/issues/144).
 - libm functions (`exp`, `log`, `pow`) differ between platforms, so
   bit-exact assertions on results that depend on them hold only on the
   oracle's platform (macOS arm64); elsewhere the tests use tolerances.
