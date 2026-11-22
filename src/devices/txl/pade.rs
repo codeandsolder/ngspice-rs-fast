@@ -95,7 +95,7 @@ fn error(message: &str) -> SpiceError {
     }
 }
 fn eval(a: Real, b: Real, c: Real, x: Real) -> Real {
-    a * x * x + b * x + c
+    a.mul_add(x, b).mul_add(x, c)
 }
 
 /// The two 3x4 Gauss-Jordan solves of `Gaussian_Elimination1/2`, including
@@ -136,21 +136,52 @@ fn eliminate(mut a: [[Real; 4]; 3], threshold: Real) -> SpiceResult<[Real; 3]> {
             let f = a[j][i];
             a[j][i] = 0.;
             for k in i + 1..4 {
-                a[j][k] -= f * a[i][k];
+                a[j][k] = (-f).mul_add(a[i][k], a[j][k]);
             }
         }
     }
     Ok([a[2][3], a[1][3], a[0][3]])
 }
-fn solve_series(b: [Real; 5], dc: Real, threshold: Real) -> SpiceResult<([Real; 3], [Real; 3])> {
+fn solve_series(
+    b: [Real; 5],
+    dc: Real,
+    dc_complement: Real,
+    threshold: Real,
+) -> SpiceResult<([Real; 3], [Real; 3])> {
     let [b1, b2, b3, b4, b5] = b;
     let p = eliminate(
-        [[1. - dc, b1, b2, -b3], [b1, b2, b3, -b4], [b2, b3, b4, -b5]],
+        [
+            [dc_complement, b1, b2, -b3],
+            [b1, b2, b3, -b4],
+            [b2, b3, b4, -b5],
+        ],
         threshold,
     )?;
     let [p1, p2, p3] = p;
-    Ok((p, [p1 + b1, b1 * p1 + p2 + b2, p3 * dc]))
+    Ok((p, [p1 + b1, b1.mul_add(p1, p2) + b2, p3 * dc]))
 }
+/// Taylor coefficients of sqrt((1+a z)/(1+b z)). Differentiating the
+/// defining function gives
+/// 2(1+a z)(1+b z)y' = (a-b)y.
+/// Equating powers avoids dividing any derivative by a-b, which becomes
+/// arbitrarily ill-conditioned near a matched lossy line.
+fn admittance_series(a: Real, b: Real) -> [Real; 5] {
+    let delta = a - b;
+    let sum = a + b;
+    let product = a * b;
+    let mut y = [0.; 6];
+    y[0] = 1.;
+    y[1] = 0.5 * delta;
+    for n in 2_u16..=5 {
+        let i = usize::from(n);
+        let previous = Real::from(n - 1);
+        let coefficient = (-2. * previous).mul_add(sum, delta);
+        let second = -2. * Real::from(n - 2) * product;
+        y[i] = coefficient.mul_add(y[i - 1], second * y[i - 2]) / (2. * Real::from(n));
+    }
+    std::array::from_fn(|i| y[i + 1])
+}
+
 /// `find_roots`/`exp_find_roots`: Cardano seed, at most 31 Newton updates,
 /// and stable quadratic deflation. For complex propagation roots the last
 /// two entries hold the real and imaginary part of the conjugate pair.
@@ -244,40 +275,32 @@ impl Pade {
         let mut h2 = [Term::default(); 3];
         let mut h3 = [Term::default(); 6];
         let mut h1c = 0.;
-        // mac(): derivatives of sqrt((1+a z)/(1+b z)), before factorials.
+        // Characteristic-admittance series in the reciprocal-frequency
+        // variable. Preserve C's absolute pivot acceptance policy, but
+        // compute the coefficients without the singular derivative formula.
         let a = g / c;
         let b = r / l;
         let delta = a - b;
-        let t = 3. * b * b - 2. * a * b - a * a;
-        let y1 = 0.5 * delta;
-        let y2 = 0.5 * t * y1 / delta;
-        let y3 = ((3. * b * b + a * a) * y1 * y1 + 0.5 * t * y2) / delta;
-        let y4 = ((3. * b * b - 3. * a * a) * y1 * y1 * y1
-            + (9. * b * b + 3. * a * a) * y1 * y2
-            + 0.5 * t * y3)
-            / delta;
-        let y2_squared = y2 * y2;
-        let y5 = (12. * a * a * y1 * y1 * y1 * y1
-            + y1 * y1 * y2 * (18. * b * b - 18. * a * a)
-            + (9. * b * b + 3. * a * a) * (y2_squared + y1 * y3)
-            + (3. * b * b + a * a) * y1 * y3
-            + 0.5 * t * y4)
-            / delta;
-        let (p, q) = solve_series(
-            [y1, y2 / 2., y3 / 6., y4 / 24., y5 / 120.],
-            (a / b).sqrt(),
-            1e-16,
-        )?;
+        if !a.is_finite() || !b.is_finite() {
+            return Err(error("nonfinite line rates"));
+        }
+        let dc = a.sqrt() / b.sqrt();
+        let dc_complement = if dc > 0.5 && dc < 2. {
+            (-delta / b) / (1. + dc)
+        } else {
+            1. - dc
+        };
+        let (p, q) = solve_series(admittance_series(a, b), dc, dc_complement, 1e-16)?;
         let (x, _) = roots(p, false)?;
         let cs = residues(p, q, x, false);
         for i in 0..3 {
             h1[i] = Term { c: cs[i], x: x[i] };
         }
         // exp_pade(): expansion of exp(-length*sqrt((sL+R)(sC+G))).
-        let y1 = 0.5 * (a + b);
-        let ab = a * b;
-        let y1_squared = y1 * y1;
-        let y2 = ab - y1_squared;
+        let y1 = Real::midpoint(a, b);
+        // a*b - midpoint(a,b)^2 = -((a-b)/2)^2 exactly.
+        let half_delta = 0.5 * delta;
+        let y2 = -half_delta * half_delta;
         let y3 = -3. * y1 * y2;
         let y4 = -3. * y2 * y2 - 4. * y1 * y3;
         let y5 = -5. * y1 * y4 - 10. * y2 * y3;
@@ -303,8 +326,18 @@ impl Pade {
             }
             bb[row] /= Real::from(i);
         }
-        let dc = (a0 - length * (r * g).sqrt()).exp();
-        let (mut p, mut q) = solve_series([bb[1], bb[2], bb[3], bb[4], bb[5]], dc, 1e-28)?;
+        // midpoint(a,b)-sqrt(a*b) = (sqrt(a)-sqrt(b))^2/2.
+        // Rationalize the root difference as well, so cases near a=b
+        // retain their small propagation correction.
+        let root_difference = delta / (a.sqrt() + b.sqrt());
+        let exponent = 0.5 * root_difference * root_difference * tau * length;
+        let dc = exponent.exp();
+        let (mut p, mut q) = solve_series(
+            [bb[1], bb[2], bb[3], bb[4], bb[5]],
+            dc,
+            -exponent.exp_m1(),
+            1e-28,
+        )?;
         for (i, divisor) in [tau, tau * tau, tau * tau * tau].into_iter().enumerate() {
             p[i] /= divisor;
             q[i] /= divisor;
@@ -327,8 +360,9 @@ impl Pade {
                 let w_residue = w.x * w.c;
                 let v_shifted_residue = v.x * v.c;
                 let pair_numerator = v_residue - w_residue - v_shifted_residue;
-                sum += single_pole
-                    + 2. * pair_numerator / (t.x * t.x - 2. * v.x * t.x + v.x * v.x + w.x * w.x);
+                let difference = t.x - v.x;
+                let denominator = difference.mul_add(difference, w.x * w.x);
+                sum += single_pole + 2. * pair_numerator / denominator;
             } else {
                 for u in h2 {
                     sum += u.c / (t.x - u.x);
@@ -336,7 +370,7 @@ impl Pade {
             }
             h3[i] = Term {
                 x: t.x,
-                c: t.c + t.c * sum,
+                c: t.c.mul_add(sum, t.c),
             };
         }
         for i in 0..3 {
@@ -347,7 +381,7 @@ impl Pade {
             }
             h3[i + 3] = Term {
                 x: t.x,
-                c: t.c + t.c * sum,
+                c: t.c.mul_add(sum, t.c),
             };
         }
         if pair {
@@ -391,5 +425,32 @@ impl Pade {
             atten2,
             atten3,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn characteristic_admittance_series_matches_binomial_and_nearly_equal_rates() {
+        assert_eq!(admittance_series(0., 2.), [-1., 1.5, -2.5, 4.375, -7.875]);
+        assert_eq!(admittance_series(2., 2.), [0.; 5]);
+        let a = 2_f64.next_down();
+        let b = 2.;
+        let delta = a - b;
+        let expected = [0.5, -1., 2., -4., 8.].map(|factor| factor * delta);
+        for (actual, expected) in admittance_series(a, b).into_iter().zip(expected) {
+            assert!((actual - expected).abs() <= 8. * Real::EPSILON * expected.abs());
+        }
+    }
+
+    #[test]
+    fn representative_pade_has_finite_nodes_and_attenuation() {
+        let model = Pade::new(12.45, 8.972e-9, 0., 0.468e-12, 16.).unwrap();
+        assert!(model.lossy.is_some());
+        assert!(model.delay_ps > 0.);
+        assert!(model.atten2 > 0. && model.atten2 < 1.);
+        assert_eq!(model.atten3, model.atten2 * model.admit);
     }
 }
