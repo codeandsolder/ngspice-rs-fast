@@ -148,7 +148,10 @@ fn measured_complex_and_real_cache_transitions_preserve_snapshot_work() {
     assert_eq!(first.solve(&b).unwrap(), before);
     let s = first.factor_storage();
     assert_eq!(s.original_entries, 4);
-    assert_eq!(s.numeric_bytes, s.factor_entries * size_of::<Complex>());
+    assert_eq!(
+        s.numeric_bytes,
+        (s.factor_entries + s.translated_order + 1) * size_of::<Complex>()
+    );
     assert_eq!(p.factor_telemetry().storage, Some(second.factor_storage()));
 
     let empty = SparseMatrix::new(2, 2);
@@ -166,7 +169,8 @@ fn measured_complex_and_real_cache_transitions_preserve_snapshot_work() {
     assert_eq!(after.work.complex_to_real, 1);
     assert_eq!(
         after.storage.unwrap().numeric_bytes,
-        retry.factor_storage().factor_entries * size_of::<f64>()
+        (retry.factor_storage().factor_entries + retry.factor_storage().translated_order + 1)
+            * size_of::<f64>()
     );
     assert_eq!(after.work.factor.successful_factors, 5);
     assert_eq!(after.work.rhs_solves, 2);
@@ -229,5 +233,32 @@ fn standalone_complex_retry_counts_only_the_producing_operation() {
                 .iter()
                 .all(|value| (*value - Complex::real(1.)).magnitude() < 1e-13)
         );
+    }
+}
+
+#[test]
+fn complex_raw_factors_cover_both_binary64_exponent_limits() {
+    // A=(1+j)*scale, rhs=A or -j*A. The exact solutions are 1 and -j.
+    // Even the reciprocal of the smallest subnormal complex pivot
+    // is outside range, without making the matrix or solution invalid.
+    for exponent in -1074..=1023 {
+        let scale = if exponent < -1022 {
+            f64::from_bits(1 << u32::try_from(exponent + 1074).unwrap())
+        } else {
+            f64::from_bits(u64::try_from(exponent + 1023).unwrap() << 52)
+        };
+        let mut a = SparseMatrix::new(1, 1);
+        a.add(0, 0, scale).unwrap();
+        let matrix = ComplexMatrix::from_operators(&a, &a, 1.).unwrap();
+        let f = matrix.factorize().unwrap();
+        let rhs = [Complex::new(scale, scale)];
+        assert_eq!(f.solve(&rhs).unwrap(), [Complex::real(1.)]);
+        assert_eq!(f.solve_transposed(&rhs).unwrap(), [Complex::real(1.)]);
+        let rhs = [Complex::new(scale, -scale)];
+        assert_eq!(f.solve(&rhs).unwrap(), [Complex::imaginary(-1.)]);
+        if exponent == -1074 {
+            assert!(f.solve(&[Complex::real(1.)]).is_err());
+            assert_eq!(f.solve(&rhs).unwrap(), [Complex::imaginary(-1.)]);
+        }
     }
 }

@@ -379,10 +379,6 @@ fn residual_tolerance(n: usize) -> f64 {
     128.0 * f64::EPSILON * n as f64
 }
 
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "retain separately rounded residual-bound products to preserve existing acceptance thresholds"
-)]
 fn check_residual<T: ScaleValue>(
     n: usize,
     entries: &[Entry<T>],
@@ -400,7 +396,7 @@ fn check_residual<T: ScaleValue>(
     let mut bounds: Vec<_> = rhs.iter().map(|v| v.magnitude()).collect();
     for &(r, c, v) in entries {
         ax[r] = ax[r] + v * x[c];
-        bounds[r] += v.magnitude() * max_x;
+        bounds[r] = v.magnitude().mul_add(max_x, bounds[r]);
     }
     let tol = residual_tolerance(n);
     let mut residuals = Vec::with_capacity(n);
