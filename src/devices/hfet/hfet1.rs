@@ -1029,9 +1029,15 @@ impl Hfet1 {
                     f64::mul_add(
                         ggdpp0,
                         delvgdpp,
-                        f64::mul_add(gmg0, delvgs, cg0) - gmd0 * delvds
-                            + ggd0 * delvgd
-                            + ggs0 * delvgs,
+                        f64::mul_add(
+                            ggs0,
+                            delvgs,
+                            f64::mul_add(
+                                ggd0,
+                                delvgd,
+                                f64::mul_add(gmd0, -delvds, f64::mul_add(gmg0, delvgs, cg0)),
+                            ),
+                        ),
                     ),
                 );
                 let cdhat = f64::mul_add(
@@ -1440,7 +1446,11 @@ impl Device for Hfet1 {
                 f64::mul_add(
                     gmd,
                     -point.vds,
-                    f64::mul_add(ggd, -point.vgd, point.cgd + cgdpp) - gmg * point.vgs,
+                    f64::mul_add(
+                        gmg,
+                        -point.vgs,
+                        f64::mul_add(ggd, -point.vgd, point.cgd + cgdpp),
+                    ),
                 ),
             );
         let ceqgs = pol
@@ -1462,7 +1472,7 @@ impl Device for Hfet1 {
                 f64::mul_add(
                     gmd,
                     -point.vds,
-                    f64::mul_add(ggd, -point.vgd, point.cgd) - gmg * point.vgs,
+                    f64::mul_add(gmg, -point.vgs, f64::mul_add(ggd, -point.vgd, point.cgd)),
                 ),
                 -cdreq,
             ),

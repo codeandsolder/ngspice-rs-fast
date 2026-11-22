@@ -123,12 +123,13 @@ pub fn golden_path(root: &Path, name: &str) -> PathBuf {
 }
 
 /// Every independently captured C reference used for numerical comparison.
+///
 /// The native platform's file comes first. All listed captures are required;
 /// none is a fallback for a missing or malformed native reference.
 #[must_use]
 pub fn numerical_golden_paths(root: &Path, name: &str) -> Vec<PathBuf> {
     let native = golden_path(root, name);
-    let mut paths = vec![native.clone()];
+    let mut paths = vec![native];
     for linux in [false, true] {
         let candidate = path_for(root, name, linux);
         if !paths.contains(&candidate) {
@@ -139,6 +140,7 @@ pub fn numerical_golden_paths(root: &Path, name: &str) -> Vec<PathBuf> {
 }
 
 /// Closest point in the envelope of independently observed reference values.
+///
 /// Identical captures reduce to the ordinary single-reference comparison.
 /// Nonfinite or absent references must never make a comparison pass.
 ///

@@ -800,7 +800,7 @@ fn body_integral(phi: Real, vbs: Real, vds: Real, source: Real, drain: Real) -> 
         (delta, -delta)
     } else if vbs > vds {
         let delta = source * (drain / root) * (0.5 * vds / phi);
-        let quartic = (source + drain) * (source * source + drain * drain);
+        let quartic = (source + drain) * (drain.mul_add(drain, source * source));
         (delta, -(delta / root) * (quartic / phi))
     } else {
         let source_delta = source * (0.5 * vbs / phi);
@@ -808,7 +808,7 @@ fn body_integral(phi: Real, vbs: Real, vds: Real, source: Real, drain: Real) -> 
         let quartic = (source + root) * source.mul_add(source, phi);
         (
             source_delta + drain_delta,
-            -(source_delta / root) * (quartic / phi) - drain_delta,
+            (-(source_delta / root)).mul_add(quartic / phi, -drain_delta),
         )
     };
     let polynomial = drain.mul_add(drain, source.mul_add(drain, source * source));

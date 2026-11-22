@@ -651,7 +651,7 @@ impl Mesa {
         } else {
             cdrain * (vds / vsate).powf(model.m - 1.) / vsate / (1. + g)
         };
-        let delidvds = delidvds0.mul_add(1. + 2. * lambda * vds, -delidvds1);
+        let delidvds = delidvds0.mul_add((2. * lambda).mul_add(vds, 1.), -delidvds1);
         let delgchgchi = 1. / gchi.mul_add(rt, 1.) / gchi.mul_add(rt, 1.);
         let delgchins = derived.gchi0;
         let r = nsa + nsb;
@@ -858,7 +858,7 @@ impl Mesa {
         } else {
             cdrain * (vds / vsate).powf(m - 1.) / (vsate * (1. + g))
         };
-        let delidvds = delidvds0.mul_add(1. + 2. * lambda * vds, -delidvds1);
+        let delidvds = delidvds0.mul_add((2. * lambda).mul_add(vds, 1.), -delidvds1);
         let delidvsate = cdrain * g / (vsate * (1. + g));
         let delvsateisat = 1. / gch;
         let r = isata + isatb;

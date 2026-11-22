@@ -13,19 +13,25 @@ fn scaled(value: Complex, coefficient: Real) -> Complex {
 }
 
 fn quadratic(t: &Taylor, product: impl Fn(usize, usize) -> Complex) -> Complex {
-    t.second()
-        .into_iter()
-        .fold(Complex::ZERO, |sum, (i, j, c)| {
-            sum + scaled(product(i, j), c)
-        })
+    scaled(product(0, 0), t.xx)
+        + scaled(product(1, 1), t.yy)
+        + scaled(product(2, 2), t.zz)
+        + scaled(product(0, 1), t.xy)
+        + scaled(product(1, 2), t.yz)
+        + scaled(product(0, 2), t.xz)
 }
 
 fn cubic(t: &Taylor, product: impl Fn(usize, usize, usize) -> Complex) -> Complex {
-    t.third()
-        .into_iter()
-        .fold(Complex::ZERO, |sum, (i, j, k, c)| {
-            sum + scaled(product(i, j, k), c)
-        })
+    scaled(product(0, 0, 0), t.xxx)
+        + scaled(product(1, 1, 1), t.yyy)
+        + scaled(product(2, 2, 2), t.zzz)
+        + scaled(product(0, 0, 1), t.xxy)
+        + scaled(product(0, 0, 2), t.xxz)
+        + scaled(product(0, 1, 1), t.xyy)
+        + scaled(product(1, 1, 2), t.yyz)
+        + scaled(product(0, 2, 2), t.xzz)
+        + scaled(product(1, 2, 2), t.yzz)
+        + scaled(product(0, 1, 2), t.xyz)
 }
 
 /// Second harmonic, from the quadratic Taylor terms of the first kernel.

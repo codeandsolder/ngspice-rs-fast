@@ -529,7 +529,7 @@ impl Model {
             f64::mul_add(
                 lfg1,
                 -vgstrap,
-                f64::mul_add(hfg2, -dvgd, hfe1 * dvgs) + 2. * lfg2 * vgdtrap,
+                f64::mul_add(2. * lfg2, vgdtrap, f64::mul_add(hfg2, -dvgd, hfe1 * dvgs)),
             ) + lfg,
             h * gam,
         );

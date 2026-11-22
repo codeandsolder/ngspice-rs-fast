@@ -142,6 +142,24 @@ impl Dderivs {
 
     /// Compose a scalar function using its first three derivatives.
     fn compose(&self, value: Real, first: Real, second: Real, third: Real) -> Self {
+        let pure = |d1: Real, d2: Real, d3: Real| {
+            accumulate_product(
+                first,
+                d3,
+                accumulate_product(second, 3. * d2 * d1, third * d1 * d1 * d1),
+            )
+        };
+        let repeated = |di: Real, dj: Real, dii: Real, dij: Real, diij: Real| {
+            accumulate_product(
+                first,
+                diij,
+                accumulate_product(
+                    second,
+                    accumulate_product(dii, dj, 2. * dij * di),
+                    third * di * di * dj,
+                ),
+            )
+        };
         Self {
             value,
             d1_p: first * self.d1_p,
@@ -153,87 +171,15 @@ impl Dderivs {
             d2_pq: accumulate_product(first, self.d2_pq, second * self.d1_p * self.d1_q),
             d2_qr: accumulate_product(first, self.d2_qr, second * self.d1_q * self.d1_r),
             d2_pr: accumulate_product(first, self.d2_pr, second * self.d1_p * self.d1_r),
-            d3_p3: accumulate_product(
-                first,
-                self.d3_p3,
-                accumulate_product(
-                    second,
-                    3. * self.d2_p2 * self.d1_p,
-                    third * self.d1_p * self.d1_p * self.d1_p,
-                ),
-            ),
-            d3_q3: accumulate_product(
-                first,
-                self.d3_q3,
-                accumulate_product(
-                    second,
-                    3. * self.d2_q2 * self.d1_q,
-                    third * self.d1_q * self.d1_q * self.d1_q,
-                ),
-            ),
-            d3_r3: accumulate_product(
-                first,
-                self.d3_r3,
-                accumulate_product(
-                    second,
-                    3. * self.d2_r2 * self.d1_r,
-                    third * self.d1_r * self.d1_r * self.d1_r,
-                ),
-            ),
-            d3_p2r: accumulate_product(
-                first,
-                self.d3_p2r,
-                accumulate_product(
-                    second,
-                    accumulate_product(self.d2_p2, self.d1_r, 2. * self.d2_pr * self.d1_p),
-                    third * self.d1_p * self.d1_p * self.d1_r,
-                ),
-            ),
-            d3_p2q: accumulate_product(
-                first,
-                self.d3_p2q,
-                accumulate_product(
-                    second,
-                    accumulate_product(self.d2_p2, self.d1_q, 2. * self.d2_pq * self.d1_p),
-                    third * self.d1_p * self.d1_p * self.d1_q,
-                ),
-            ),
-            d3_q2r: accumulate_product(
-                first,
-                self.d3_q2r,
-                accumulate_product(
-                    second,
-                    accumulate_product(self.d2_q2, self.d1_r, 2. * self.d2_qr * self.d1_q),
-                    third * self.d1_q * self.d1_q * self.d1_r,
-                ),
-            ),
-            d3_pq2: accumulate_product(
-                first,
-                self.d3_pq2,
-                accumulate_product(
-                    second,
-                    accumulate_product(2. * self.d2_pq, self.d1_q, self.d2_q2 * self.d1_p),
-                    third * self.d1_p * self.d1_q * self.d1_q,
-                ),
-            ),
-            d3_pr2: accumulate_product(
-                first,
-                self.d3_pr2,
-                accumulate_product(
-                    second,
-                    accumulate_product(2. * self.d2_pr, self.d1_r, self.d2_r2 * self.d1_p),
-                    third * self.d1_p * self.d1_r * self.d1_r,
-                ),
-            ),
-            d3_qr2: accumulate_product(
-                first,
-                self.d3_qr2,
-                accumulate_product(
-                    second,
-                    accumulate_product(2. * self.d2_qr, self.d1_r, self.d2_r2 * self.d1_q),
-                    third * self.d1_q * self.d1_r * self.d1_r,
-                ),
-            ),
+            d3_p3: pure(self.d1_p, self.d2_p2, self.d3_p3),
+            d3_q3: pure(self.d1_q, self.d2_q2, self.d3_q3),
+            d3_r3: pure(self.d1_r, self.d2_r2, self.d3_r3),
+            d3_p2r: repeated(self.d1_p, self.d1_r, self.d2_p2, self.d2_pr, self.d3_p2r),
+            d3_p2q: repeated(self.d1_p, self.d1_q, self.d2_p2, self.d2_pq, self.d3_p2q),
+            d3_q2r: repeated(self.d1_q, self.d1_r, self.d2_q2, self.d2_qr, self.d3_q2r),
+            d3_pq2: repeated(self.d1_q, self.d1_p, self.d2_q2, self.d2_pq, self.d3_pq2),
+            d3_pr2: repeated(self.d1_r, self.d1_p, self.d2_r2, self.d2_pr, self.d3_pr2),
+            d3_qr2: repeated(self.d1_r, self.d1_q, self.d2_r2, self.d2_qr, self.d3_qr2),
             d3_pqr: accumulate_product(
                 first,
                 self.d3_pqr,
@@ -348,6 +294,35 @@ impl Dderivs {
                 accumulate_product(a.d3_r3, b.value, a.value * b.d3_r3),
             ),
         );
+        self.mul_repeated_third_order(a, b);
+        self.d3_pqr = accumulate_product(
+            a.d2_qr,
+            b.d1_p,
+            accumulate_product(
+                a.d2_pr,
+                b.d1_q,
+                accumulate_product(
+                    a.d2_pq,
+                    b.d1_r,
+                    accumulate_product(
+                        a.d1_r,
+                        b.d2_pq,
+                        accumulate_product(
+                            a.d1_q,
+                            b.d2_pr,
+                            accumulate_product(
+                                a.d1_p,
+                                b.d2_qr,
+                                accumulate_product(a.d3_pqr, b.value, a.value * b.d3_pqr),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+    }
+
+    fn mul_repeated_third_order(&mut self, a: &Self, b: &Self) {
         self.d3_p2r = accumulate_product(
             2. * a.d2_pr,
             b.d1_p,
@@ -450,31 +425,6 @@ impl Dderivs {
                 ),
             ),
         );
-        self.d3_pqr = accumulate_product(
-            a.d2_qr,
-            b.d1_p,
-            accumulate_product(
-                a.d2_pr,
-                b.d1_q,
-                accumulate_product(
-                    a.d2_pq,
-                    b.d1_r,
-                    accumulate_product(
-                        a.d1_r,
-                        b.d2_pq,
-                        accumulate_product(
-                            a.d1_q,
-                            b.d2_pr,
-                            accumulate_product(
-                                a.d1_p,
-                                b.d2_qr,
-                                accumulate_product(a.d3_pqr, b.value, a.value * b.d3_pqr),
-                            ),
-                        ),
-                    ),
-                ),
-            ),
-        );
     }
 
     /// Solve the derivative of b*n = a in increasing derivative order.
@@ -563,6 +513,35 @@ impl Dderivs {
                 accumulate_product(-self.value, b.d3_r3, a.d3_r3),
             ),
         )) / b.value;
+        self.div_repeated_third_order(a, b);
+        self.d3_pqr = (accumulate_product(
+            -self.d2_qr,
+            b.d1_p,
+            accumulate_product(
+                -self.d2_pr,
+                b.d1_q,
+                accumulate_product(
+                    -self.d2_pq,
+                    b.d1_r,
+                    accumulate_product(
+                        -self.d1_r,
+                        b.d2_pq,
+                        accumulate_product(
+                            -self.d1_q,
+                            b.d2_pr,
+                            accumulate_product(
+                                -self.d1_p,
+                                b.d2_qr,
+                                accumulate_product(-self.value, b.d3_pqr, a.d3_pqr),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )) / b.value;
+    }
+
+    fn div_repeated_third_order(&mut self, a: &Self, b: &Self) {
         self.d3_p2r = (accumulate_product(
             -2. * self.d2_pr,
             b.d1_p,
@@ -661,31 +640,6 @@ impl Dderivs {
                         -self.d1_q,
                         b.d2_r2,
                         accumulate_product(-self.value, b.d3_qr2, a.d3_qr2),
-                    ),
-                ),
-            ),
-        )) / b.value;
-        self.d3_pqr = (accumulate_product(
-            -self.d2_qr,
-            b.d1_p,
-            accumulate_product(
-                -self.d2_pr,
-                b.d1_q,
-                accumulate_product(
-                    -self.d2_pq,
-                    b.d1_r,
-                    accumulate_product(
-                        -self.d1_r,
-                        b.d2_pq,
-                        accumulate_product(
-                            -self.d1_q,
-                            b.d2_pr,
-                            accumulate_product(
-                                -self.d1_p,
-                                b.d2_qr,
-                                accumulate_product(-self.value, b.d3_pqr, a.d3_pqr),
-                            ),
-                        ),
                     ),
                 ),
             ),
