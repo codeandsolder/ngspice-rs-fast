@@ -98,7 +98,9 @@ pub(super) trait Scalar: Copy + PartialEq + std::fmt::Debug {
     fn mul_sub(self, a: Self, b: Self) -> Self;
     /// Update a Schur entry using the rounded multiplier only when well
     /// conditioned; otherwise recover the unnormalized cross-product.
-    fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self) -> Self;
+    fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self, normal: bool) -> Self;
+    /// Classify the multiplier once before traversing the lower column.
+    fn normal_multiplier(self) -> bool;
     /// Whether the value is exactly zero (`== 0.0` on every part).
     fn is_zero(self) -> bool;
     /// Whether every scalar component is finite.
@@ -139,12 +141,10 @@ impl Scalar for f64 {
         clippy::suboptimal_flops,
         reason = "the rounded multiplier cannot supply a reliable cancellation residual; near cancellation uses the original cross-products instead"
     )]
-    fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self) -> Self {
+    fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self, normal: bool) -> Self {
         let result = self - mult * lower;
         if result.is_finite()
-            && ((mult.is_normal() && result.abs() > self.abs() * 0.0625)
-                || upper == 0.
-                || lower == 0.)
+            && ((normal && result.abs() > self.abs() * 0.0625) || upper == 0. || lower == 0.)
         {
             result
         } else if self.is_finite() && upper.is_finite() && lower.is_finite() {
@@ -152,6 +152,9 @@ impl Scalar for f64 {
         } else {
             result
         }
+    }
+    fn normal_multiplier(self) -> bool {
+        self.is_normal()
     }
     fn is_zero(self) -> bool {
         self == 0.0
@@ -207,10 +210,7 @@ impl Scalar for Complex {
             self.re * b.re - self.im * b.im,
             self.re * b.im + self.im * b.re,
         );
-        if (result.is_finite() && (result.re.is_normal() || result.im.is_normal()))
-            || self.is_zero()
-            || b.is_zero()
-        {
+        if (result.re.abs() + result.im.abs()).is_normal() || self.is_zero() || b.is_zero() {
             result
         } else {
             self * b
@@ -225,7 +225,7 @@ impl Scalar for Complex {
         clippy::suboptimal_flops,
         reason = "the cheap update estimates cancellation; a fused update using the rounded multiplier would not remove its rounding error"
     )]
-    fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self) -> Self {
+    fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self, normal: bool) -> Self {
         // The ordinary Schur update is a three-term dot product.
         // Avoid separately compensating the normalized multiplier's product:
         // its error is dominated by the multiplier itself near cancellation.
@@ -234,11 +234,10 @@ impl Scalar for Complex {
             mult.re * lower.im + mult.im * lower.re,
         );
         let result = self - product;
-        let norm = |v: Self| v.re.abs().max(v.im.abs());
-        if result.is_finite()
-            && ((norm(mult).is_normal() && norm(result) > norm(self) * 0.0625)
-                || upper.is_zero()
-                || lower.is_zero())
+        let norm = result.re.abs() + result.im.abs();
+        let scale = (self.re.abs() + self.im.abs()) * 0.0625;
+        if (normal && norm.is_normal() && norm > scale)
+            || (result.is_finite() && (upper.is_zero() || lower.is_zero()))
         {
             result
         } else if self.is_finite() && upper.is_finite() && lower.is_finite() {
@@ -246,6 +245,9 @@ impl Scalar for Complex {
         } else {
             result
         }
+    }
+    fn normal_multiplier(self) -> bool {
+        (self.re.abs() + self.im.abs()).is_normal()
     }
     fn is_zero(self) -> bool {
         self.re == 0.0 && self.im == 0.0
@@ -411,9 +413,13 @@ impl<I: PlanIndex> FactorRuns<I> {
                 let upper = dest[row];
                 let mult = upper.mul(values[diag[row]]);
                 values[handle] = mult;
+                if upper.is_zero() {
+                    continue;
+                }
+                let normal = mult.normal_multiplier();
                 for entry in self.lower_column(row) {
                     let (handle, r) = entry.indices();
-                    dest[r] = dest[r].schur(pivots[row], upper, mult, values[handle]);
+                    dest[r] = dest[r].schur(pivots[row], upper, mult, values[handle], normal);
                 }
             }
             for entry in self.lower_column(step) {
@@ -2455,6 +2461,7 @@ impl<T: Scalar> Sparse<T> {
                 return;
             }
             self.values[upper] = u;
+            let normal = u.normal_multiplier();
             let upper_col = self.topology.elements[upper].col;
             let mut above = upper;
             let mut sub = self.topology.elements[upper].next_in_col;
@@ -2478,7 +2485,7 @@ impl<T: Scalar> Sparse<T> {
                     sub = element;
                 }
                 let l = self.values[lower];
-                let value = self.values[sub].schur(raw_pivot, raw_upper, u, l);
+                let value = self.values[sub].schur(raw_pivot, raw_upper, u, l, normal);
                 if !value.is_finite() {
                     self.nonfinite_factor();
                     return;

@@ -558,14 +558,13 @@ pub(crate) fn complex_mul_sub(value: Complex, a: Complex, b: Complex) -> Complex
     let real = value.re - (ac - bd);
     let imag = value.im - (ad + bc);
     let result = Complex::new(real, imag);
-    let scale = value.re.abs().max(value.im.abs()) * 0.0625;
+    let scale = (value.re.abs() + value.im.abs()) * 0.0625;
+    let norm = real.abs() + imag.abs();
     // Complex multiplication is normwise well-conditioned. A small
     // individual component does not by itself imply a cancellation of
     // the vector update. Recompute when the entire update nearly cancels,
     // or when its exponent range threatens to erase it.
-    if result.is_finite()
-        && ((real.abs() > scale || imag.abs() > scale) && (real.is_normal() || imag.is_normal()))
-    {
+    if norm.is_normal() && norm > scale {
         return result;
     }
     if !value.is_finite()
