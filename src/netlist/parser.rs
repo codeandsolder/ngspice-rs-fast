@@ -321,7 +321,7 @@ pub(crate) fn resolve_measure_card(
             token.text = crate::netlist::elaborate::format_literal(value);
         }
     }
-    match grammar::parse_card(&prepared, *auto_gnd, &std::collections::BTreeSet::new())? {
+    match grammar::parse_card(&prepared, *auto_gnd, scopes::ModelVisibility::default())? {
         grammar::ParsedCard::Measure(card) => Ok(card),
         _ => Err(crate::primitives::SpiceError::parse(
             card.location.clone(),

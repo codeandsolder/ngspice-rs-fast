@@ -19,6 +19,7 @@
 use ngspice_conformance::fixtures::DeckInputs;
 use ngspice_conformance::ngspice::Scratch;
 use ngspice_conformance::process::{ProcessLimits, run};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -81,10 +82,19 @@ fn is_noise(plot: &Plot) -> bool {
 
 fn compare(name: &str, inputs: &DeckInputs<'_>) {
     let (got, want) = run_both(name, inputs);
+    compare_rawfiles(name, &got, &want, None);
+}
+
+fn compare_rawfiles(
+    name: &str,
+    got: &RawFile,
+    want: &RawFile,
+    integrated_reference: Option<&BTreeMap<String, f64>>,
+) {
     let titles = |raw: &RawFile| -> Vec<String> {
         raw.plots.iter().map(|p| p.plot.plotname.clone()).collect()
     };
-    assert_eq!(titles(&got), titles(&want), "{name}: plot sequence");
+    assert_eq!(titles(got), titles(want), "{name}: plot sequence");
     for (index, (got, want)) in got.plots.iter().zip(&want.plots).enumerate() {
         let (got, want) = (&got.plot, &want.plot);
         assert_eq!(got.flags(), want.flags(), "{name}: plot {index}");
@@ -119,16 +129,140 @@ fn compare(name: &str, inputs: &DeckInputs<'_>) {
                     &variable.name,
                     [b.re, b.im],
                 );
-                let reference = ngspice_rs::primitives::Complex::new(re, im);
+                let reference = if want.plotname == "Integrated Noise"
+                    && let Some(reference) = integrated_reference
+                {
+                    ngspice_rs::primitives::Complex::real(reference[&variable.name])
+                } else {
+                    ngspice_rs::primitives::Complex::new(re, im)
+                };
                 let difference = (*a - reference).magnitude();
                 assert!(
                     difference <= 1e-6 * reference.magnitude() + floor,
-                    "{name}: plot {index} '{}' point {point}: {a} != {b}",
+                    "{name}: plot {index} '{}' point {point}: {a} != {reference}",
                     variable.name
                 );
             }
         }
     }
+}
+
+/// Independently integrate ordinary full-summary oracle samples. This
+/// deliberately uses the elementary antiderivative of a*f^k, rather than
+/// the production log-mean/exponent-scaling implementation. On the bounded
+/// C fixtures all endpoint products and powers are representable.
+fn reference_area(f0: f64, f1: f64, y0: f64, y1: f64, c_floor: bool) -> f64 {
+    const FLOOR: f64 = 1e-38;
+    let (a, b) = if c_floor || y0 <= 0. || y1 <= 0. {
+        (y0.max(FLOOR), y1.max(FLOOR))
+    } else {
+        (y0, y1)
+    };
+    let log_width = (f1 / f0).ln();
+    let k = (b.ln() - a.ln()) / log_width;
+    if a.to_bits() == b.to_bits() || (c_floor && k.abs() < 1e-10) {
+        y1 * (f1 - f0)
+    } else if (k + 1.).abs() < 1e-10 {
+        f1 * b * log_width
+    } else {
+        (f1 * b - f0 * a) / (k + 1.)
+    }
+}
+
+/// Full-summary noise plots expose every individual generator's output
+/// amplitude and the total output/input amplitudes at every frequency.
+/// Reconstruct the current input gain from the latter pair and independently
+/// integrate each generator. The explicit groups describe the expected
+/// device layout (some generators use dots, others underscores); totals
+/// must be sums of individual integrals, never fits of the summed spectrum.
+fn summary_integrals(
+    spectrum: &Plot,
+    integrated: &Plot,
+    groups: &[(&str, &[&str])],
+    c_floor: bool,
+) -> BTreeMap<String, f64> {
+    let values = |name: &str| -> Vec<f64> {
+        spectrum
+            .column(name)
+            .unwrap()
+            .iter()
+            .map(|x| x.re)
+            .collect()
+    };
+    let frequency = values("frequency");
+    let output = values("onoise_spectrum");
+    let input = values("inoise_spectrum");
+    let gain: Vec<_> = input
+        .iter()
+        .zip(&output)
+        .map(|(i, o)| (i / o).powi(2))
+        .collect();
+    let mut reference = BTreeMap::new();
+    let mut total = [0.; 2];
+    let mut insert = |suffix: &str, [out, input]: [f64; 2]| {
+        for (prefix, value) in [("onoise", out), ("inoise", input)] {
+            assert!(
+                reference
+                    .insert(format!("v({prefix}_total{suffix})"), value.sqrt())
+                    .is_none()
+            );
+        }
+    };
+    for &(instance, sources) in groups {
+        let mut instance_total = [0.; 2];
+        for &source in sources {
+            let suffix = format!("{instance}{source}");
+            let density: Vec<_> = values(&format!("onoise{suffix}"))
+                .into_iter()
+                .map(|amplitude| amplitude * amplitude)
+                .collect();
+            let mut area = [0.; 2];
+            for index in 1..frequency.len() {
+                let contribution = reference_area(
+                    frequency[index - 1],
+                    frequency[index],
+                    density[index - 1],
+                    density[index],
+                    c_floor,
+                );
+                area[0] += contribution;
+                area[1] += contribution * gain[index];
+            }
+            insert(&suffix, area);
+            for k in 0..2 {
+                instance_total[k] += area[k];
+                total[k] += area[k];
+            }
+        }
+        insert(instance, instance_total);
+    }
+    insert("", total);
+    assert_eq!(reference.len(), integrated.variable_count());
+    reference
+}
+
+fn compare_full_summary(name: &str, inputs: &DeckInputs<'_>, groups: &[(&str, &[&str])]) {
+    let (got, want) = run_both(name, inputs);
+    let [spectrum, integrated] = &want.plots[..] else {
+        panic!("expected spectrum and integrated plots");
+    };
+    let spectrum = &spectrum.plot;
+    let integrated = &integrated.plot;
+    // First confirm C itself follows the independently calculated floor
+    // convention. Then compare the port with the actual positive-density
+    // integrals of those very same C spectra, at unchanged tolerances.
+    let historical = summary_integrals(spectrum, integrated, groups, true);
+    for variable in integrated.variables() {
+        let expected = integrated.column(&variable.name).unwrap()[0].re;
+        let calculated = historical[&variable.name];
+        assert!(
+            (calculated - expected).abs() <= 1e-6 * expected.abs() + 1e-20,
+            "{name}: floor-aware reference {}: {calculated:e} != {expected:e}",
+            variable.name
+        );
+    }
+    let physical = summary_integrals(spectrum, integrated, groups, false);
+    compare_rawfiles(name, &got, &want, Some(&physical));
 }
 
 fn fixture(name: &str) {
@@ -433,6 +567,19 @@ fn bsim4_correlated_noise_preserves_ordered_generators_and_integration() {
                 ".noise v(d) vg dec 4 1e3 1e10 1",
             )
         });
-        compare(name, &derived);
+        compare_full_summary(
+            name,
+            &derived,
+            &[
+                (
+                    ".m1",
+                    &[
+                        ".rd", ".rs", ".rg", ".rbps", ".rbpd", ".rbpb", ".rbsb", ".rbdb", ".id",
+                        ".1overf", ".igs", ".igd", ".igb", ".corl",
+                    ],
+                ),
+                ("_rl", &["_thermal", "_1overf"]),
+            ],
+        );
     }
 }
