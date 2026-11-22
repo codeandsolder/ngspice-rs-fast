@@ -896,8 +896,8 @@ impl LossyLine {
                 } else {
                     [[0.; 2]; 3]
                 };
-                let [h1, h2, h3] = convolution::history_sums(
-                    history.rows(),
+                let [h1, h2, h3] = reduce_history(
+                    history,
                     &c.weights,
                     initial,
                     if tdover { c.aux_index } else { 0 },
@@ -929,13 +929,8 @@ impl LossyLine {
             }
             LtraCase::Rc => {
                 let c = coefficients;
-                let [h1, h2, h3] = convolution::history_sums(
-                    history.rows(),
-                    &c.weights,
-                    initial,
-                    c.aux_index,
-                    [[0.; 2]; 3],
-                );
+                let [h1, h2, h3] =
+                    reduce_history(history, &c.weights, initial, c.aux_index, [[0.; 2]; 3]);
                 let [mut d1, mut d2] = h1;
                 d1 += iv1 * m.int_h1dash;
                 d2 += iv2 * m.int_h1dash;
@@ -1344,6 +1339,49 @@ impl DelayLine for LossyLine {
     }
 }
 
+// Indexed traversal avoids constructing a split-ring iterator for short
+// histories. The same scalar implementation also serves as the numerical
+// reference for the vector kernel.
+fn scalar_history_sums(
+    history: DelaySamples<'_, 4>,
+    weights: &[[Real; 3]],
+    initial: [Real; 4],
+    coupled_end: usize,
+    mut sums: [[Real; 2]; 3],
+) -> [[Real; 2]; 3] {
+    for (k, components) in [[0, 2], [3, 1], [2, 0]].into_iter().enumerate() {
+        let end = if k == 0 {
+            weights.len() - 1
+        } else {
+            coupled_end
+        };
+        for i in (1..=end).rev() {
+            let weight = weights[i][k];
+            if weight != 0. {
+                let row = history.sample(i);
+                for (sum, component) in sums[k].iter_mut().zip(components) {
+                    *sum += weight * (row[component] - initial[component]);
+                }
+            }
+        }
+    }
+    sums
+}
+
+fn reduce_history(
+    history: DelaySamples<'_, 4>,
+    weights: &[[Real; 3]],
+    initial: [Real; 4],
+    coupled_end: usize,
+    sums: [[Real; 2]; 3],
+) -> [[Real; 2]; 3] {
+    if weights.len() < 32 {
+        scalar_history_sums(history, weights, initial, coupled_end, sums)
+    } else {
+        convolution::history_sums(history.rows(), weights, initial, coupled_end, sums)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1363,34 +1401,6 @@ mod tests {
                 LossyLine::instantiate(&deck.devices[0], nodes, &models, &ModelContext::default())
             })
             .unwrap()
-    }
-
-    // Independent scalar oracle: the old three reverse walks with
-    // a ring lookup for every nonzero term.
-    fn scalar_history_sums(
-        history: DelaySamples<'_, 4>,
-        weights: &[[Real; 3]],
-        initial: [Real; 4],
-        coupled_end: usize,
-        mut sums: [[Real; 2]; 3],
-    ) -> [[Real; 2]; 3] {
-        for (k, components) in [[0, 2], [3, 1], [2, 0]].into_iter().enumerate() {
-            let end = if k == 0 {
-                weights.len() - 1
-            } else {
-                coupled_end
-            };
-            for i in (1..=end).rev() {
-                let weight = weights[i][k];
-                if weight != 0. {
-                    let row = history.sample(i);
-                    for (sum, component) in sums[k].iter_mut().zip(components) {
-                        *sum += weight * (row[component] - initial[component]);
-                    }
-                }
-            }
-        }
-        sums
     }
 
     fn waveform_history(count: i32, wrapped: bool) -> WaveformHistory {
@@ -1429,7 +1439,7 @@ mod tests {
 
     #[test]
     fn batched_history_matches_scalar_order_and_delayed_cutoff() {
-        for count in [1, 2, 7, 8, 9, 17, 257] {
+        for count in [1, 2, 7, 8, 9, 17, 31, 32, 33, 257] {
             for wrapped in [false, true] {
                 let history = waveform_history(count, wrapped);
                 let view = history.samples::<4>().unwrap();
@@ -1450,6 +1460,11 @@ mod tests {
                     let got = convolution::history_sums(view.rows(), &weights, initial, end, seeds);
                     assert_eq!(
                         got.map(|p| p.map(Real::to_bits)),
+                        expected.map(|p| p.map(Real::to_bits))
+                    );
+                    assert_eq!(
+                        reduce_history(view, &weights, initial, end, seeds)
+                            .map(|p| p.map(Real::to_bits)),
                         expected.map(|p| p.map(Real::to_bits))
                     );
                 }
@@ -1498,8 +1513,7 @@ mod tests {
                     let end = coeff.aux_index;
                     let seeds = [[0.; 2], [1e-3, -1e-3], [2e-3, -2e-3]];
                     let old = scalar_history_sums(view, &coeff.weights, initial, end, seeds);
-                    let new =
-                        convolution::history_sums(view.rows(), &coeff.weights, initial, end, seeds);
+                    let new = reduce_history(view, &coeff.weights, initial, end, seeds);
                     assert_eq!(
                         old.map(|p| p.map(Real::to_bits)),
                         new.map(|p| p.map(Real::to_bits))
@@ -1511,8 +1525,8 @@ mod tests {
                             let start = Instant::now();
                             for _ in 0..iterations {
                                 if vector {
-                                    black_box(convolution::history_sums(
-                                        black_box(view).rows(),
+                                    black_box(reduce_history(
+                                        black_box(view),
                                         black_box(&coeff.weights),
                                         initial,
                                         end,

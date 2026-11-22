@@ -436,19 +436,6 @@ pub(super) fn history_sums(
     if coupled_end == 0 {
         return sums;
     }
-    if weights.len() < 8 {
-        for (sample, weight) in pairs {
-            for (kernel, components) in [[0, 2], [3, 1], [2, 0]].into_iter().enumerate() {
-                if weight[kernel] != 0.0 {
-                    for (sum, component) in sums[kernel].iter_mut().zip(components) {
-                        *sum += weight[kernel] * (sample[component] - initial[component]);
-                    }
-                }
-            }
-        }
-        return sums;
-    }
-
     let [h1, h2, h3] = sums;
     let mut voltage = f64x4::from_array([h1[0], h1[1], h3[0], h3[1]]);
     let mut current = f64x2::from_array(h2);
@@ -722,6 +709,48 @@ fn rlc_aux_index(t: Real, curtime: Real, times: &VecDeque<Real>) -> usize {
     }
 }
 
+fn rlc_self_endpoint(lag: Real, beta: Real, exponent: Real, decay: Real) -> Real {
+    if beta == 0. {
+        lag
+    } else if lag == 0. {
+        0.
+    } else {
+        (bess_i1(-exponent) + bess_i0(-exponent)) * lag * decay - lag
+    }
+}
+
+// With no accepted samples beyond the propagation delay, only the local
+// kernel contributes. A short history cannot amortize the batched setup.
+fn short_self_coefficients(
+    beta: Real,
+    curtime: Real,
+    times: &VecDeque<Real>,
+    reltol: Real,
+    out: &mut Coefficients,
+) {
+    let endpoint = |lag| {
+        let exponent = -beta * lag;
+        rlc_self_endpoint(lag, beta, exponent, exponent.exp())
+    };
+    let index = times.len() - 1;
+    let lag = curtime - times[index];
+    let mut previous = endpoint(lag);
+    let mut slope = previous / lag;
+    out.first[0] = slope;
+    let threshold = (slope * reltol).abs();
+    for i in (1..=index).rev() {
+        let current = endpoint(curtime - times[i - 1]);
+        let next_slope = (current - previous) / (times[i] - times[i - 1]);
+        let weight = next_slope - slope;
+        out.weights[i][0] = weight;
+        if weight.abs() <= threshold {
+            break;
+        }
+        previous = current;
+        slope = next_slope;
+    }
+}
+
 /// Independent endpoint fields needed by the RLC divided differences.
 /// The recurrence, delayed auxiliary index and chopping remain scalar.
 #[derive(Clone, Copy)]
@@ -737,14 +766,10 @@ impl RlcKernels {
     fn at(self, lag: Real, active: [bool; 3]) -> [Real; 3] {
         let exponent = -self.beta * lag;
         let decay = exponent.exp();
-        let h1 = if !active[0] {
-            0.
-        } else if self.beta == 0. {
-            lag
-        } else if lag == 0. {
-            0.
+        let h1 = if active[0] {
+            rlc_self_endpoint(lag, self.beta, exponent, decay)
         } else {
-            (bess_i1(-exponent) + bess_i0(-exponent)) * lag * decay - lag
+            0.
         };
         if !(active[1] || active[2]) {
             return [h1, 0., 0.];
@@ -837,6 +862,10 @@ pub fn rlc_coefficients(
     let (mut doh1, mut doh2, mut doh3) = (true, true, true);
 
     let aux = rlc_aux_index(t, curtime, times);
+    if aux == 0 && index < 32 {
+        short_self_coefficients(beta, curtime, times, reltol, &mut out);
+        return out;
+    }
 
     let kernels = RlcKernels {
         delay: t,
