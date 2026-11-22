@@ -488,6 +488,148 @@ fn invalid_observations_and_schema_lifecycle_are_explicit() {
 }
 
 #[test]
+fn direct_queries_on_descending_sweep_preserve_traversal_and_measurement_policy() {
+    let parsed = parsed(
+        "V1 in 0 1\nR1 in out 1k\nR2 out 0 1k\n.dc V1 4 0 -1\n.meas dc lookup FIND v(out) AT=2",
+    );
+    let scope = ParamScope::for_netlist(&parsed.netlist).unwrap();
+    let config = RunConfig::from_netlist(&parsed.netlist).unwrap();
+    let analysis = config.plan_for(&parsed.netlist.analyses[0]).unwrap();
+    let context = config.context();
+    let mut reference = config.circuit(&parsed.netlist).unwrap();
+    let full = analysis.run(&mut reference, &context).unwrap();
+    let bound = PlotObjectivePlan::bind(
+        &full,
+        AnalysisKind::DcSweep,
+        ObjectiveRequests {
+            measurements: parsed.measurements.clone(),
+            observations: vec![
+                observation("exact", "v(out)", ObservationReduction::At(2.)),
+                observation("interior", "v(out)", ObservationReduction::At(2.5)),
+                observation("outside", "v(out)", ObservationReduction::At(5.)),
+                observation("last", "v(out)", ObservationReduction::Last),
+                observation(
+                    "trace",
+                    "v(out)",
+                    ObservationReduction::Trace { max_points: 5 },
+                ),
+            ],
+            ..ObjectiveRequests::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(bound.retained_columns(), []);
+    let plan = ScenarioPlan::new(vec![bound]);
+    let mut candidate = config.circuit(&parsed.netlist).unwrap();
+    let result = plan
+        .run(&[analysis], &mut candidate, &context, &scope)
+        .unwrap()
+        .remove(0);
+    assert_eq!(result.accepted_points, 5);
+    assert_eq!(result.retained_cells, 0);
+    assert_eq!(
+        result.measurements,
+        measure::resolve_with_scope(&full, AnalysisKind::DcSweep, &parsed.measurements, &scope)
+    );
+    assert!(result.measurements.is_err());
+    for (i, coordinate, expected) in [(0, 2., 1.), (1, 2.5, 1.25), (3, 0., 0.)] {
+        let Ok(ObservationValue::Scalar(value)) = &result.observations[i].value else {
+            panic!("expected scalar {i}: {:?}", result.observations[i].value);
+        };
+        assert_eq!(value.coordinate, Some(coordinate));
+        assert!((value.value.re - expected).abs() < 1e-12);
+    }
+    assert_eq!(
+        result.observations[2].value,
+        Err(ObservationFailure::OutOfRange {
+            at: 5.,
+            range: Some((0., 4.)),
+        })
+    );
+    let Ok(ObservationValue::Trace(trace)) = &result.observations[4].value else {
+        panic!("expected trace");
+    };
+    assert_eq!(
+        trace.iter().map(|p| p.coordinate).collect::<Vec<_>>(),
+        [Some(4.), Some(3.), Some(2.), Some(1.), Some(0.),]
+    );
+}
+
+#[test]
+fn directional_queries_use_adjacent_limits_and_reject_direction_changes() {
+    let scope = ParamScope::root(&[]).unwrap();
+    let mut builder = Plot::builder("ac1", "AC Analysis", PlotFlags::Complex);
+    builder.push_variable(Variable::new("frequency", "frequency"));
+    builder.push_variable(Variable::new("v(out)", "voltage"));
+    let header = builder.build();
+    let bound = PlotObjectivePlan::bind(
+        &header,
+        AnalysisKind::Ac,
+        ObjectiveRequests {
+            observations: vec![
+                observation("above", "v(out)", ObservationReduction::At(2.5)),
+                observation("jump", "v(out)", ObservationReduction::At(2.)),
+                observation("below", "v(out)", ObservationReduction::At(1.5)),
+                observation("outside", "v(out)", ObservationReduction::At(4.)),
+            ],
+            ..ObjectiveRequests::default()
+        },
+    )
+    .unwrap();
+    let plan = ScenarioPlan::new(vec![bound]);
+    let rows = [
+        (3., Complex::new(9., 12.)),
+        (2., Complex::new(6., 8.)),
+        (2., Complex::new(2., 4.)),
+        (1., Complex::new(1., 2.)),
+    ];
+    let run = |rows: &[(Real, Complex)]| {
+        let mut plot = header.header();
+        for &(x, y) in rows {
+            plot.push_point(&[Complex::real(x), y]).unwrap();
+        }
+        finish(&plan, &plot, &scope)
+    };
+    let got = run(&rows);
+    for (i, coordinate, value) in [
+        (0, 2.5, Complex::new(7.5, 10.)),
+        (2, 1.5, Complex::new(1.5, 3.)),
+    ] {
+        assert!(matches!(got.observations[i].value,
+            Ok(ObservationValue::Scalar(p)) if p.coordinate == Some(coordinate) && p.value == value));
+    }
+    assert_eq!(
+        got.observations[1].value,
+        Err(ObservationFailure::Discontinuous)
+    );
+    assert_eq!(
+        got.observations[3].value,
+        Err(ObservationFailure::OutOfRange {
+            at: 4.,
+            range: Some((1., 3.)),
+        })
+    );
+    let mut reversed = rows;
+    reversed.reverse();
+    assert_eq!(run(&reversed), got);
+    let mut nonmonotonic = rows.to_vec();
+    nonmonotonic.push((3., Complex::ZERO));
+    let result = run(&nonmonotonic);
+    assert!(result.observations.iter().all(|r| matches!(&r.value,
+        Err(ObservationFailure::Invalid(ngspice_rs::primitives::SpiceError::Unsupported { feature, .. }))
+            if feature.contains("changes direction at point 4")
+    )));
+    // Axis nonfiniteness has priority even after finding a complete bracket
+    // or observing a direction change.
+    nonmonotonic.push((Real::NAN, Complex::ZERO));
+    let result = run(&nonmonotonic);
+    assert!(result.observations.iter().all(|r| matches!(&r.value,
+        Err(ObservationFailure::Invalid(ngspice_rs::primitives::SpiceError::Numerical { message, .. }))
+            if message.contains("point 5")
+    )));
+}
+
+#[test]
 fn prepared_rc_scenario_reuses_scalar_objectives_across_candidates() {
     let parsed = parsed(
         "V1 in 0 dc 1 ac 1\nR1 in out 1k\nC1 out 0 1u\n.op\n.ac lin 3 100 300\n.meas ac gain FIND vm(out) AT=200",

@@ -37,6 +37,8 @@ pub enum ObservationReduction {
     /// Last accepted value; supports single-point operating-point outputs.
     Last,
     /// Linear query at a physical time, frequency or DC scale coordinate.
+    /// The scale must be monotonic in either direction; a direction change
+    /// makes a single coordinate query ambiguous.
     At(Real),
     /// Selected trace with an explicit maximum number of accepted samples.
     /// No decimation, interpolation or duplicate-coordinate merging.
@@ -477,7 +479,7 @@ impl ObservationState {
                 };
                 let range = axis
                     .ok_or_else(|| ObservationFailure::Invalid(invalid("missing objective axis")))?
-                    .range()
+                    .query_range()
                     .map_err(ObservationFailure::Invalid)?;
                 query
                     .finish()
@@ -568,7 +570,12 @@ impl<'a> ActivePlot<'a> {
             .checked_add(1)
             .ok_or_else(|| lifecycle_error("objective point count overflows usize"))?;
         let axis = self.axis.as_mut().and_then(|axis| axis.observe(row));
-        if let Some(x) = axis {
+        if let Some(x) = axis
+            && self
+                .axis
+                .as_ref()
+                .is_some_and(AxisTracker::is_nondecreasing)
+        {
             for measure in self.measurements.iter_mut().flatten() {
                 measure.observe(x, row);
             }

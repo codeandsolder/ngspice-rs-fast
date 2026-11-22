@@ -23,9 +23,13 @@ observation does not turn a different valid observation into a NaN.
 
 - Direct observations: last value, interpolated scalar/complex value at
   a physical coordinate, or an explicitly bounded selected trace.
-  Queries use exact-coordinate group agreement, not an invented value
-  at a jump. Nonfinite data and queries outside the range are explicit
-  errors. Trace/last observations need not have an ordered axis.
+  Queries accept both increasing and decreasing monotonic physical
+  coordinates, using the adjacent samples in traversal order and
+  exact-coordinate group agreement, not an invented value at a jump.
+  Direction changes (e.g. nested DC sweep resets), nonfinite coordinates,
+  and queries outside the interval are explicit errors. Trace/last
+  observations need not have an ordered axis. Deck measurements retain
+  the separate nondecreasing-axis policy of the retained evaluator.
 - Static measurements: extrema (including tie and time policy), AVG,
   INTEG, RMS, FIND, WHEN, TRIG/TARG, derivatives and event-triggered
   value queries, and AC/SP phase/gain margins. Retain bounded per-card
