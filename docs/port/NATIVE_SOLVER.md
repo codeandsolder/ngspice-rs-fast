@@ -112,6 +112,53 @@ The [November 22 comparative workload measurements](performance-baselines/2026-1
 record unchanged residuals and allocation counts for the recovered lifecycle
 candidate versus the accepted scalar baseline.
 
+## Measured factor lifecycle (#105)
+
+`SparseLu::factor_storage` and `ComplexLu::factor_storage` expose the valid
+snapshot's external and translated orders, original-handle creation count,
+stored factor entries and logical numeric-buffer bytes in constant time.
+Original creations include structural zero coefficients. Fill entries are
+slots first created by elimination (total slots minus original creations).
+For pencil-style structural edits, an original created after fill-in increases
+the original count; an existing fill handle reused for another purpose still
+has its original creation provenance. The ratio is not numerical nonzero
+density or allocated capacity, and numeric bytes exclude topology, traversal
+plans, workspace and allocation overhead.
+
+`factor_work` reports only the operation that produced the immutable
+snapshot, including immediate reload-and-order retries. A compact internal
+attempt outcome tracks the actual path and final status. Order calls include
+threshold traversals retaining all old pivots; a search is counted only
+when the active Markowitz search starts. A fixed-plan refactor request
+that falls back to ordering is counted as an order, not a refactor.
+Small-pivot warnings are successful factors; zero, singular, nonfinite,
+resource and invalid attempts are separate failures. Coefficients rejected
+before entering SPARSE or failure constructing a frame are assembly
+rejections, not successful factors. A standalone failed operation returns
+the existing numerical error rather than a factor snapshot.
+
+`Pattern::factor_telemetry` reads cumulative cache work and current valid
+factor storage under the existing cache transaction lock. It includes
+real/complex retypes, successful bit-identical factor matches (even if the
+subsequent RHS is invalid), and success/failure of RHS solves made through
+the real shared cache. An NI zero-pivot result is a failed factor attempt;
+its later caller-directed reorder is counted separately rather than inferred
+to be a retry of identical coefficients. Immediate retries inside a factor
+operation are counted explicitly. Complex LU snapshots and their independent
+normal/transposed solves do not mutate cache telemetry, nor do standalone
+factors constructed from a bound matrix. Their successful solves are measured
+by the calling workload. This preserves snapshot isolation, including
+concurrent solves and solutions of old factors after a later factorization.
+
+No numeric inner-loop counters or new locks were added. The shared counters
+saturate and remain consistent with the cache; cloning or extending a
+pattern creates a fresh record, and discarding a poisoned cache also resets
+work and storage. The latest storage is absent when no valid numeric LU is
+retained. The counters do not include assembly validation outside the cache
+(e.g. construction of a complex operator), detached snapshots, or earlier
+pattern epochs. See [PERFORMANCE.md](PERFORMANCE.md) for benchmark output
+and interpretation.
+
 ## Pole-zero trial lifecycle (#27)
 
 The pole-zero search is split into the reusable affine matrix load and
@@ -261,3 +308,30 @@ NGSPICE_BIN=/absolute/path/to/ngspice cargo test -p ngspice-rs --test c_referenc
 The no-FMA oracle and trace tooling used for bit-level comparison live
 outside the repository; see [VERIFICATION.md](VERIFICATION.md) for the
 committed C-golden workflow.
+
+### Aggregate elaboration resources
+
+The device-generation limits apply to the materialized circuit, not just the
+flattened input cards. `ElaborationLimits` defaults to 250,000 device records,
+1,000,000 distinct non-ground nodes including setup-private nodes, and
+4,000,000 declared scalar device-state slots (32 MiB per complete f64 state
+vector). Call `Circuit::with_elaboration_limits` for incremental construction,
+or `Circuit::from_netlist_with_limits` for a complete deck with explicit
+mutual-inductor and elaboration limits. The complete-deck path also uses the
+device limit for initial subcircuit expansion.
+
+The planner charges existing records and one minimum record per incoming
+card, then binds exact URC and TXL expansion counts and distinct written
+terminals before constructing any ladder. It retains plans only for those
+special cards; ordinary cards remain borrowed. Ordinary private nodes and
+state counts are checked when the factory binds them, and every planned
+expansion is checked against the actual remaining budget and verified against
+its resulting counts. Checked sums, node identity range, state allocation
+layout and fallible staging capacity reject overflow. The final device
+vector reserve takes place inside the node transaction: allocation failure
+or a later card error leaves the previous nodes, devices, origins and
+finalized analysis bindings unchanged. Manual node/device additions and
+replacement obey the same aggregate limits. This bounds materialized records
+and state slots, not arbitrary strings, model caches or dynamic analysis
+history storage. Standard allocator-backed boxed devices and map/string
+construction remain subject to the system allocator.

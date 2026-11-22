@@ -162,3 +162,57 @@ fn transient_conserves_the_temperature_adjusted_depletion_charge() {
         "{delivered} vs {expected}"
     );
 }
+
+#[test]
+fn reused_circuit_rederives_breakdown_at_the_resolved_reltol() {
+    use ngspice_rs::analysis::{AnalysisContext, AnalysisInput};
+    use ngspice_rs::primitives::AnalysisKind;
+
+    let n = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("breakdown-reuse.cir"),
+            "breakdown reuse\nv1 a 0 dc -5.1 ac 1\nd1 a 0 dm\n.model dm d(is=1e-11 bv=5 ibv=2e-9 nbv=1.3)\n.end\n",
+        ))
+        .unwrap();
+    let config = RunConfig::from_netlist(&n).unwrap();
+    // Intentionally keep Newton convergence identical at every physical
+    // context, isolating the model-temperature derivation.
+    let plan = config
+        .plan(AnalysisInput::with_arguments(
+            AnalysisKind::OperatingPoint,
+            ["rtol=1e-12", "vntol=1e-15", "abstol=1e-18"],
+        ))
+        .unwrap();
+    let mut circuit = config.circuit(&n).unwrap();
+    let mut first = None;
+    for (iteration, reltol) in [1e-3, 1e-9, 1e-3, 1e-9].into_iter().enumerate() {
+        let context = AnalysisContext {
+            reltol,
+            ..config.context()
+        };
+        let plot = plan.run(&mut circuit, &context).unwrap();
+        let current = real(&plot, "i(v1)", 0);
+        let vt = K_OVER_Q * 300.15;
+        let xbv = matched_breakdown(5., 2e-9, 1e-11, vt, 1.3, reltol);
+        let expected = 1e-11 * ((5.1 - xbv) / (1.3 * vt)).exp() + 5.1 * GMIN;
+        assert!(
+            (current - expected).abs() <= 1e-8 * expected.abs() + 1e-18,
+            "RELTOL={reltol}: {current} vs {expected}"
+        );
+        if iteration == 0 {
+            first = Some(current);
+        } else if iteration == 1 {
+            assert!((current - first.unwrap()).abs() > 1e-3 * current.abs());
+        } else if iteration == 2 {
+            assert_eq!(current.to_bits(), first.unwrap().to_bits());
+        }
+    }
+
+    for reltol in [0., -1., f64::NAN, f64::INFINITY] {
+        let invalid = AnalysisContext {
+            reltol,
+            ..config.context()
+        };
+        assert!(plan.run(&mut circuit, &invalid).is_err());
+    }
+}

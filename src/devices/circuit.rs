@@ -23,14 +23,20 @@ use crate::maths::{Coefficients, SparseMatrix, Vector};
 use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
 use petgraph::graph::UnGraph;
 
+use crate::devices::elaboration::{
+    ElaborationLimits, ElaborationSize, ExpansionKind, PlannedBatch, reserve, resource_error,
+};
 use crate::devices::linear::Forcing;
 use crate::devices::models::ModelContext;
 use crate::devices::mutual::validation::ValidationBudget;
 use crate::devices::mutual::{CouplingSite, MutualLimits, pair_count};
-use crate::devices::state::{StateHistory, StateSnapshot, TrialState};
+use crate::devices::state::{
+    DeviceState, HistoryPublication, StateHistory, StateSnapshot, TrialState,
+};
 use crate::devices::sweep::{InstanceOverride, ResistorMetadata, ResistorOverride};
 use crate::devices::traits::{
     AcceptContext, AnalysisMode, Device, InductanceValue, MnaUnknowns, MutualTerm, StampContext,
+    StampRhs,
 };
 
 /// A vertex in the circuit's bipartite incidence graph.
@@ -52,8 +58,8 @@ pub enum CircuitVertex {
 /// Connectivity is structural, not proof of a conductive DC path or solvability.
 pub type CircuitGraph = UnGraph<CircuitVertex, usize, usize>;
 
-/// A transient setup index, rebuilt from the current devices. No cache
-/// survives a topology change or a caller's use of device edits.
+/// Name-to-ordinal index built during setup and retained only for the
+/// lifetime of the finalized topology.
 #[derive(Default)]
 struct DeviceNames(BTreeMap<String, usize>);
 
@@ -113,6 +119,7 @@ pub struct Circuit {
     devices: Vec<ElaboratedDevice>,
     bindings: TopologyBindings,
     mutual_limits: MutualLimits,
+    elaboration_limits: ElaborationLimits,
     pub(super) runtime: CircuitRuntime,
 }
 
@@ -122,6 +129,7 @@ pub struct Circuit {
 #[derive(Default)]
 struct TopologyBindings {
     unknowns: MnaUnknowns,
+    names: DeviceNames,
     order: Vec<usize>,
     branch_rows: Vec<std::ops::Range<usize>>,
     control_rows: Vec<Vec<usize>>,
@@ -232,6 +240,141 @@ impl std::ops::Deref for PreparedMutualTerms {
         self.0.as_deref().unwrap_or(&[])
     }
 }
+
+/// Analysis-owned effective device preparation.
+///
+/// The circuit is borrowed immutably for the run, so no topology edit can invalidate a live view.
+/// Only the most recent exact context is retained. Isolated observation
+/// scratch retains capacity, never accepted or previous trial state.
+pub struct PreparedRun<'a> {
+    circuit: &'a Circuit,
+    point: std::cell::RefCell<Option<PreparedPoint>>,
+    pub(super) observation_work:
+        std::cell::RefCell<Option<crate::devices::observe::ObservationWorkspace>>,
+}
+
+pub(super) struct PreparedPoint {
+    context: ModelContext,
+    replacements: Vec<(usize, Box<dyn Device>)>,
+    mutual: std::cell::OnceCell<PreparedMutualTerms>,
+}
+
+fn effective_device<'a>(
+    circuit: &'a Circuit,
+    replacements: &'a [(usize, Box<dyn Device>)],
+    ordinal: usize,
+) -> &'a dyn Device {
+    replacements
+        .binary_search_by_key(&ordinal, |(index, _)| *index)
+        .map_or_else(
+            |_| circuit.devices[ordinal].as_ref(),
+            |index| replacements[index].1.as_ref(),
+        )
+}
+
+impl PreparedPoint {
+    pub(super) fn device<'a>(&'a self, circuit: &'a Circuit, ordinal: usize) -> &'a dyn Device {
+        effective_device(circuit, &self.replacements, ordinal)
+    }
+
+    pub(super) fn mutual(&self, circuit: &Circuit) -> SpiceResult<PreparedMutualTerms> {
+        if let Some(terms) = self.mutual.get() {
+            return Ok(terms.clone());
+        }
+        let terms = circuit.mutual_terms_with_replacements(&self.context, &self.replacements)?;
+        Ok(self.mutual.get_or_init(|| terms).clone())
+    }
+}
+
+impl<'a> PreparedRun<'a> {
+    /// The finalized circuit borrowed by this analysis.
+    #[must_use]
+    pub const fn circuit(&self) -> &'a Circuit {
+        self.circuit
+    }
+
+    pub(super) fn point(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<std::cell::Ref<'_, PreparedPoint>> {
+        if let Ok(point) = std::cell::Ref::filter_map(self.point.borrow(), |current| {
+            current
+                .as_ref()
+                .filter(|point| point.context.same_preparation(context))
+        }) {
+            return Ok(point);
+        }
+        // Validate once on a context transition. Do not discard a valid
+        // preparation on error (including a foreign override).
+        context.validate(&MODEL_CONTEXT_LOCATION)?;
+        let replacements = self.circuit.replacements(context)?;
+        self.point.replace(Some(PreparedPoint {
+            context: *context,
+            replacements,
+            mutual: std::cell::OnceCell::new(),
+        }));
+        std::cell::Ref::filter_map(self.point.borrow(), Option::as_ref)
+            .map_err(|_| SpiceError::circuit("missing prepared model context"))
+    }
+
+    /// Validate the ordered overrides at a physical point without stamping.
+    /// # Errors
+    /// Invalid model context, foreign targets, conflicting setters, or device physics.
+    pub fn validate_context(&self, context: &ModelContext) -> SpiceResult<()> {
+        self.point(context).map(|_| ())
+    }
+
+    /// Load a disposable trial using this run's prepared effective devices.
+    /// # Errors
+    /// As [`Circuit::load`]; a changed context is revalidated before use.
+    pub fn load(
+        &self,
+        request: &LoadRequest<'_>,
+        matrix: &mut SparseMatrix,
+        rhs: &mut Vector,
+        trial: &mut TrialState,
+    ) -> SpiceResult<()> {
+        self.circuit
+            .load_prepared(self, request, matrix, rhs, trial)
+    }
+
+    /// Check convergence using the same effective devices as the load.
+    /// # Errors
+    /// As [`Circuit::convergence_test`].
+    pub fn convergence_test(&self, request: &ConvergenceRequest<'_>) -> SpiceResult<bool> {
+        self.circuit.convergence_prepared(self, request)
+    }
+
+    /// Record persistent MODEINITSMSIG slots using the effective devices.
+    /// # Errors
+    /// As [`Circuit::record_small_signal_state`].
+    pub fn record_small_signal_state(
+        &self,
+        context: &ModelContext,
+        bias: &Vector,
+    ) -> SpiceResult<()> {
+        self.circuit
+            .record_small_signal_state_prepared(self, context, bias)
+    }
+
+    /// Assemble the small-signal system with this run's effective devices.
+    /// # Errors
+    /// As [`Circuit::small_signal_system_at`].
+    pub fn small_signal_system_at(
+        &self,
+        context: &ModelContext,
+        bias: &Vector,
+        state: Option<&StateSnapshot>,
+    ) -> SpiceResult<crate::devices::linear::LinearSystem> {
+        self.circuit
+            .bias_linearized_system(self, context, bias, state, 0, None)
+    }
+}
+
+static MODEL_CONTEXT_LOCATION: std::sync::LazyLock<crate::primitives::SourceLoc> =
+    std::sync::LazyLock::new(|| {
+        crate::primitives::SourceLoc::new(std::path::PathBuf::from("<model-context>"), 1, 1)
+    });
 
 /// A K card resolved without expanding its complete graph.
 struct ResolvedCard {
@@ -539,6 +682,18 @@ impl Circuit {
         Self::default()
     }
 
+    /// Start an analysis-owned preparation scope. It lazily validates the
+    /// first context, then reuses its effective devices until that context
+    /// changes. Separate scopes cannot share disposable trial state.
+    #[must_use]
+    pub const fn prepare_run(&self) -> PreparedRun<'_> {
+        PreparedRun {
+            circuit: self,
+            point: std::cell::RefCell::new(None),
+            observation_work: std::cell::RefCell::new(None),
+        }
+    }
+
     /// Construct an empty circuit with explicit mutual-inductor budgets.
     #[must_use]
     pub fn with_mutual_limits(limits: MutualLimits) -> Self {
@@ -546,6 +701,34 @@ impl Circuit {
             mutual_limits: limits,
             ..Self::default()
         }
+    }
+
+    /// Construct an empty circuit with explicit aggregate elaboration limits.
+    #[must_use]
+    pub fn with_elaboration_limits(limits: ElaborationLimits) -> Self {
+        Self {
+            elaboration_limits: limits,
+            ..Self::default()
+        }
+    }
+
+    fn declared_state_slots(
+        devices: &[ElaboratedDevice],
+        at: Option<&crate::primitives::SourceLoc>,
+    ) -> SpiceResult<usize> {
+        devices.iter().try_fold(0_usize, |total, device| {
+            total
+                .checked_add(device.state_count())
+                .ok_or_else(|| resource_error(at, "aggregate state slots overflow"))
+        })
+    }
+
+    fn elaboration_size(&self) -> SpiceResult<ElaborationSize> {
+        Ok(ElaborationSize::new(
+            self.devices.len(),
+            self.nodes.len() - 1,
+            Self::declared_state_slots(&self.devices, None)?,
+        ))
     }
 
     /// The node table.
@@ -623,6 +806,13 @@ impl Circuit {
                 "replace generated or private-node devices by re-elaboration",
             ));
         }
+        let mut size = self.elaboration_size()?;
+        size.states = size
+            .states
+            .checked_sub(self.devices[index].state_count())
+            .and_then(|n| n.checked_add(device.state_count()))
+            .ok_or_else(|| resource_error(None, "replacement state slots overflow"))?;
+        self.elaboration_limits.check(size, None)?;
         self.invalidate_topology();
         self.devices[index] = ElaboratedDevice {
             device,
@@ -687,7 +877,17 @@ impl Circuit {
     /// Node identity or allocation capacity is exhausted.
     pub fn add_node(&mut self, name: &str) -> SpiceResult<NodeId> {
         let before = self.nodes.len();
-        let node = self.nodes.intern(name)?;
+        let limit = self.elaboration_limits.nodes;
+        let node = self.nodes.transaction(|nodes| {
+            let node = nodes.intern(name)?;
+            if nodes.len() - 1 > limit {
+                return Err(resource_error(
+                    None,
+                    format!("aggregate non-ground nodes exceed {limit}"),
+                ));
+            }
+            Ok(node)
+        })?;
         if self.nodes.len() != before {
             self.invalidate_topology();
         }
@@ -924,12 +1124,8 @@ impl Circuit {
         if self.bindings.mutual.pairs.is_empty() {
             return Ok(PreparedMutualTerms::default());
         }
-        let device_at = |index: usize| -> &dyn Device {
-            replacements
-                .iter()
-                .find(|(i, _)| *i == index)
-                .map_or_else(|| self.devices[index].as_ref(), |(_, d)| d.as_ref())
-        };
+        let device_at =
+            |index: usize| -> &dyn Device { effective_device(self, replacements, index) };
         let mut values = BTreeMap::new();
         for &index in self.bindings.mutual.degrees.keys() {
             let device = device_at(index);
@@ -1175,6 +1371,8 @@ impl Circuit {
 
     fn prepare_topology(&mut self) -> SpiceResult<()> {
         // Validate graph before any predecessor binding or numbering mutation.
+        self.elaboration_limits
+            .check(self.elaboration_size()?, None)?;
         let names = self.validate_topology()?;
         let mut previous = crate::devices::Waveform::Constant(0.);
         let mut previous_dc = 0.;
@@ -1194,6 +1392,7 @@ impl Circuit {
         }
         self.check_port_numbering()?;
         self.allocate_matrix(order)?;
+        self.bindings.names = names;
         self.bindings.identity = Some(TopologyId::allocate()?);
         Ok(())
     }
@@ -1351,6 +1550,14 @@ impl Circuit {
     /// # Errors
     /// Mismatched numbering or a device evaluation failure.
     pub fn convergence_test(&self, request: &ConvergenceRequest<'_>) -> SpiceResult<bool> {
+        self.prepare_run().convergence_test(request)
+    }
+
+    fn convergence_prepared(
+        &self,
+        run: &PreparedRun<'_>,
+        request: &ConvergenceRequest<'_>,
+    ) -> SpiceResult<bool> {
         self.validate_history(request.history)?;
         request.history.check_trial(request.trial)?;
         let n = self.unknown_count();
@@ -1362,6 +1569,7 @@ impl Circuit {
                 "convergence test does not match the circuit numbering",
             ));
         }
+        let point = run.point(request.model_context)?;
         for index in self.load_order() {
             let context = crate::devices::traits::ConvergenceContext {
                 unknowns: &self.bindings.unknowns,
@@ -1376,7 +1584,7 @@ impl Circuit {
                 abstol: request.abstol,
                 vntol: request.vntol,
             };
-            if self.devices[index].convergence_test(&context)? {
+            if point.device(self, index).convergence_test(&context)? {
                 return Ok(true);
             }
         }
@@ -1508,6 +1716,13 @@ impl Circuit {
                 device.name()
             )));
         }
+        let size = self
+            .elaboration_size()?
+            .checked_add(ElaborationSize::new(1, 0, device.state_count()), None)?;
+        self.elaboration_limits.check(size, None)?;
+        self.devices
+            .try_reserve(1)
+            .map_err(|error| resource_error(None, format!("cannot reserve device: {error}")))?;
         let internal = device
             .terminals()
             .iter()
@@ -1640,6 +1855,15 @@ impl Circuit {
         context: &ModelContext,
         bias: &crate::maths::Vector,
     ) -> SpiceResult<()> {
+        self.prepare_run().record_small_signal_state(context, bias)
+    }
+
+    fn record_small_signal_state_prepared(
+        &self,
+        run: &PreparedRun<'_>,
+        context: &ModelContext,
+        bias: &Vector,
+    ) -> SpiceResult<()> {
         self.check_numbering()?;
         if bias.len() != self.unknown_count() {
             return Err(SpiceError::circuit("small-signal state bias dimensions"));
@@ -1654,15 +1878,18 @@ impl Circuit {
                 || vec![0.; self.bindings.state_len],
                 |snapshot| snapshot.values.to_vec(),
             );
-        let operating = crate::devices::distortion::DistortionContext {
-            model_context: context,
-            unknowns: &self.bindings.unknowns,
+        let operating = crate::devices::distortion::DistortionContext::new(
+            context,
+            &self.bindings.unknowns,
             bias,
-        };
-        for (index, device) in self.devices.iter().enumerate() {
+        )?;
+        let point = run.point(context)?;
+        for index in 0..self.devices.len() {
             let rows = self.bindings.state_rows[index].clone();
             if let Some(slots) = state.get_mut(rows) {
-                device.small_signal_state(&operating, slots)?;
+                point
+                    .device(self, index)
+                    .small_signal_state(&operating, slots)?;
             }
         }
         let snapshot = self.bind_state(state)?;
@@ -1743,6 +1970,10 @@ impl Circuit {
             .ok_or_else(|| SpiceError::circuit("circuit topology is stale or not finalized"))
     }
 
+    pub(super) fn observation_device_index(&self, name: &str) -> Option<usize> {
+        self.bindings.names.get(name)
+    }
+
     pub(super) fn check_numbering(&self) -> SpiceResult<()> {
         self.topology_id().map(drop)
     }
@@ -1798,11 +2029,7 @@ impl Circuit {
             .devices
             .get(target.device())
             .ok_or_else(|| SpiceError::circuit("stale resistor override"))?;
-        context.validate(&crate::primitives::SourceLoc::new(
-            std::path::PathBuf::from("<model-context>"),
-            1,
-            1,
-        ))?;
+        context.validate(&MODEL_CONTEXT_LOCATION)?;
         device.resistor_effective(target.supplied(), context)
     }
 
@@ -1867,8 +2094,24 @@ impl Circuit {
         value: Real,
         context: &ModelContext,
     ) -> SpiceResult<InstanceOverride> {
+        let target = self.bind_instance_override(name, keyword, value)?;
+        self.devices[target.device()].with_instance_parameter(
+            target.parameter(),
+            value,
+            context,
+        )?;
+        Ok(target)
+    }
+
+    /// Bind a typed target without constructing a throwaway device. The
+    /// ordered point preparation validates the value at its actual context.
+    pub(crate) fn bind_instance_override(
+        &self,
+        name: &str,
+        keyword: &str,
+        value: Real,
+    ) -> SpiceResult<InstanceOverride> {
         let (index, parameter) = self.instance_parameter(name, keyword)?;
-        self.devices[index].with_instance_parameter(parameter, value, context)?;
         Ok(InstanceOverride::new(
             self.topology_id()?,
             index,
@@ -1889,6 +2132,16 @@ impl Circuit {
         value: Real,
         context: &ModelContext,
     ) -> SpiceResult<InstanceOverride> {
+        let target = self.bind_source_override(name, value)?;
+        self.devices[target.device()].with_instance_parameter("dc", value, context)?;
+        Ok(target)
+    }
+
+    pub(crate) fn bind_source_override(
+        &self,
+        name: &str,
+        value: Real,
+    ) -> SpiceResult<InstanceOverride> {
         let index = self
             .devices
             .iter()
@@ -1896,7 +2149,6 @@ impl Circuit {
             .filter(|&i| matches!(self.devices[i].designator().to_ascii_lowercase(), 'v' | 'i'))
             .filter(|_| value.is_finite())
             .ok_or_else(|| SpiceError::circuit("invalid or unknown DC source override"))?;
-        self.devices[index].with_instance_parameter("dc", value, context)?;
         Ok(InstanceOverride::new(
             self.topology_id()?,
             index,
@@ -1941,7 +2193,15 @@ impl Circuit {
             ));
         }
         let mutual = self.prepared_mutual_terms(request.model_context)?;
-        self.stamp_isolated(index, device, request, matrix, rhs, trial, &mutual)
+        self.stamp_isolated(
+            index,
+            device,
+            request,
+            matrix,
+            StampRhs::dense(rhs),
+            request.history.device_of(trial, index)?,
+            &mutual,
+        )
     }
 
     /// A checked isolated load's shared stamping path. Observations reuse the
@@ -1956,11 +2216,10 @@ impl Circuit {
         device: &dyn Device,
         request: &LoadRequest<'_>,
         matrix: &mut SparseMatrix,
-        rhs: &mut Vector,
-        trial: &mut TrialState,
+        rhs: StampRhs<'_>,
+        states: DeviceState<'_>,
         mutual: &[Vec<MutualTerm>],
     ) -> SpiceResult<()> {
-        let states = request.history.device_of(trial, index)?;
         device.stamp(&mut StampContext {
             matrix,
             rhs,
@@ -1970,6 +2229,7 @@ impl Circuit {
             temperature: request.model_context.temperature,
             nominal_temperature: request.model_context.nominal_temperature,
             gmin: request.model_context.gmin,
+            reltol: request.model_context.reltol,
             frequency: request.model_context.frequency,
             mode: request.mode,
             branches: self.bindings.branch_rows[index].clone(),
@@ -2042,10 +2302,7 @@ impl Circuit {
     /// are untouched; callers stamp the replacement instead of the original for
     /// that ordinal. Several instance overrides of one device are applied in
     /// slot order to the same replacement.
-    pub(crate) fn replacements(
-        &self,
-        context: &ModelContext,
-    ) -> SpiceResult<Vec<(usize, Box<dyn Device>)>> {
+    fn replacements(&self, context: &ModelContext) -> SpiceResult<Vec<(usize, Box<dyn Device>)>> {
         let topology = self.topology_id()?;
         let mut replacements: Vec<(usize, Box<dyn Device>)> = Vec::new();
         for target in context.resistor_overrides.iter().flatten() {
@@ -2071,7 +2328,22 @@ impl Circuit {
             ));
         }
         let resistors = replacements.len();
-        for target in context.instance_overrides.iter().flatten() {
+        for (slot, target) in context
+            .instance_overrides
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, target)| target.as_ref().map(|target| (slot, target)))
+        {
+            if context.instance_overrides[..slot]
+                .iter()
+                .flatten()
+                .any(|previous| {
+                    previous.device() == target.device()
+                        && previous.parameter() == target.parameter()
+                })
+            {
+                return Err(SpiceError::circuit("duplicate instance parameter override"));
+            }
             if target.topology() != topology {
                 return Err(SpiceError::circuit("foreign or stale instance override"));
             }
@@ -2106,7 +2378,13 @@ impl Circuit {
                 )),
             }
         }
-        for (index, replacement) in &replacements {
+        self.validate_replacements(&replacements)?;
+        replacements.sort_unstable_by_key(|(index, _)| *index);
+        Ok(replacements)
+    }
+
+    fn validate_replacements(&self, replacements: &[(usize, Box<dyn Device>)]) -> SpiceResult<()> {
+        for (index, replacement) in replacements {
             let original = &self.devices[*index];
             if original.name() != replacement.name()
                 || original.c_device_type() != replacement.c_device_type()
@@ -2132,7 +2410,7 @@ impl Circuit {
                 )));
             }
         }
-        Ok(replacements)
+        Ok(())
     }
 
     fn check_matrix_pattern(&self, matrix: &SparseMatrix) -> SpiceResult<()> {
@@ -2170,6 +2448,17 @@ impl Circuit {
         rhs: &mut Vector,
         trial: &mut TrialState,
     ) -> SpiceResult<()> {
+        self.prepare_run().load(request, matrix, rhs, trial)
+    }
+
+    fn load_prepared(
+        &self,
+        run: &PreparedRun<'_>,
+        request: &LoadRequest<'_>,
+        matrix: &mut SparseMatrix,
+        rhs: &mut Vector,
+        trial: &mut TrialState,
+    ) -> SpiceResult<()> {
         self.validate_history(request.history)?;
         request.history.check_trial(trial)?;
         self.check_matrix_pattern(matrix)?;
@@ -2186,17 +2475,10 @@ impl Circuit {
                 "load dimensions do not match the circuit numbering",
             ));
         }
-        request
-            .model_context
-            .validate(&crate::primitives::SourceLoc::new(
-                std::path::PathBuf::from("<model-context>"),
-                1,
-                1,
-            ))?;
+        let point = run.point(request.model_context)?;
         matrix.set_pivot_tolerances(request.model_context.pivot);
         matrix.set_unknown_names(Some(self.unknown_names()));
-        let replacements = self.replacements(request.model_context)?;
-        let mutual = self.mutual_terms_with_replacements(request.model_context, &replacements)?;
+        let mutual = point.mutual(self)?;
         let mut voltage_source_value = 0.;
         let unlent = matrix.lend_fixed(self.runtime.fixed_stamps.take(), self.devices.len())?;
         let stamped = self.stamp_devices(
@@ -2204,7 +2486,7 @@ impl Circuit {
             matrix,
             rhs,
             trial,
-            &replacements,
+            &point,
             &mutual,
             &mut voltage_source_value,
         );
@@ -2228,26 +2510,24 @@ impl Circuit {
         matrix: &mut SparseMatrix,
         rhs: &mut Vector,
         trial: &mut TrialState,
-        replacements: &[(usize, Box<dyn Device>)],
+        point: &PreparedPoint,
         mutual: &[Vec<MutualTerm>],
         voltage_source_value: &mut Real,
     ) -> SpiceResult<()> {
         for (position, index) in self.load_order().enumerate() {
-            let device: &dyn Device = match replacements.iter().find(|(i, _)| *i == index) {
-                Some((_, replacement)) => &**replacement,
-                None => &*self.devices[index],
-            };
+            let device = point.device(self, index);
             let states = request.history.device_of(trial, index)?;
             matrix.begin_device(position)?;
             device.stamp(&mut StampContext {
                 matrix: &mut *matrix,
-                rhs: &mut *rhs,
+                rhs: StampRhs::dense(rhs),
                 unknowns: &self.bindings.unknowns,
                 nodes: &self.nodes,
                 solution: request.solution,
                 temperature: request.model_context.temperature,
                 nominal_temperature: request.model_context.nominal_temperature,
                 gmin: request.model_context.gmin,
+                reltol: request.model_context.reltol,
                 frequency: request.model_context.frequency,
                 mode: request.mode,
                 branches: self.bindings.branch_rows[index].clone(),
@@ -2435,12 +2715,7 @@ impl Circuit {
         Ok(())
     }
 
-    fn run_accept_hooks(
-        &self,
-        solution: &Vector,
-        time: Option<Real>,
-        trial: Option<&TrialState>,
-    ) -> SpiceResult<()> {
+    fn validate_accept_point(&self, solution: &Vector, time: Option<Real>) -> SpiceResult<()> {
         self.check_numbering()?;
         if solution.len() != self.unknown_count() || !solution.is_finite() {
             return Err(SpiceError::circuit(
@@ -2450,21 +2725,28 @@ impl Circuit {
         if time.is_some_and(|t| !t.is_finite()) {
             return Err(SpiceError::circuit("accepted time is nonfinite"));
         }
+        Ok(())
+    }
+
+    fn run_accept_hooks(
+        &self,
+        solution: &Vector,
+        time: Option<Real>,
+        trial: Option<&TrialState>,
+    ) -> SpiceResult<()> {
+        // All fallible device-specific checks precede any notifications.
+        // The caller has validated the trial against the finalized state layout.
+        let context = |index: usize| AcceptContext {
+            solution,
+            time,
+            branches: &self.bindings.branch_rows[index],
+            states: trial.map(|trial| &trial.values()[self.bindings.state_rows[index].clone()]),
+        };
         for (index, device) in self.devices.iter().enumerate() {
-            let states = match trial {
-                Some(trial) => Some(
-                    trial
-                        .slice(self.bindings.state_rows[index].clone())
-                        .ok_or_else(|| SpiceError::circuit("trial state is too short"))?,
-                ),
-                None => None,
-            };
-            device.accept(&AcceptContext {
-                solution,
-                time,
-                branches: &self.bindings.branch_rows[index],
-                states,
-            })?;
+            device.validate_accept(&context(index))?;
+        }
+        for (index, device) in self.devices.iter().enumerate() {
+            device.accept(&context(index));
         }
         Ok(())
     }
@@ -2485,9 +2767,11 @@ impl Circuit {
         trial: TrialState,
     ) -> SpiceResult<()> {
         self.validate_history(history)?;
+        self.validate_accept_point(solution, time)?;
         history
             .accept_transaction(
                 trial,
+                HistoryPublication::Rotate,
                 |_, _| Ok(Vec::new()),
                 |trial| self.run_accept_hooks(solution, time, Some(trial)),
             )
@@ -2497,7 +2781,8 @@ impl Circuit {
     /// Accepts a companion-transient point: [`Self::accept_point`] plus the
     /// delay histories of transmission lines ([`crate::devices::delay`]).
     ///
-    /// With `delay.start` (the `t = 0` point) every delay line initializes
+    /// With `delay.start` (the `t = 0` point), the initial state fills the
+    /// integration history and every delay line initializes
     /// its history ([`crate::devices::delay::DelayLine::start`]); otherwise it
     /// records the accepted sample ([`crate::devices::delay::DelayLine::accept`]).
     /// Every update is computed and validated first, then the hooks run, the
@@ -2519,8 +2804,25 @@ impl Circuit {
         delay: &DelayAcceptance,
     ) -> SpiceResult<Vec<Real>> {
         self.validate_history(history)?;
+        self.validate_accept_point(solution, Some(time))?;
+        let publication = if delay.start {
+            if time != 0. {
+                return Err(SpiceError::circuit(
+                    "transient initial point must be at t = 0",
+                ));
+            }
+            HistoryPublication::Initialize
+        } else {
+            if history.accepted(1).is_none() {
+                return Err(SpiceError::circuit(
+                    "transient step requires initial accepted history",
+                ));
+            }
+            HistoryPublication::Rotate
+        };
         history.accept_transaction(
             trial,
+            publication,
             |history, trial| self.delay_updates(solution, time, history, trial, delay),
             |trial| self.run_accept_hooks(solution, Some(time), Some(trial)),
         )
@@ -2641,6 +2943,7 @@ impl Circuit {
     ///
     /// Invalid solution/time or a hook failure.
     pub fn accept_solution(&self, solution: &Vector, time: Option<Real>) -> SpiceResult<()> {
+        self.validate_accept_point(solution, time)?;
         self.run_accept_hooks(solution, time, None)
     }
 
@@ -2659,22 +2962,16 @@ impl Circuit {
         &mut self,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<crate::devices::linear::LinearSystem> {
-        context.validate(&crate::primitives::SourceLoc::new(
-            std::path::PathBuf::from("<model-context>"),
-            1,
-            1,
-        ))?;
+        context.validate(&MODEL_CONTEXT_LOCATION)?;
         self.finalize()?;
-        let replacements = self.replacements(context)?;
-        let mutual = self.mutual_terms_with_replacements(context, &replacements)?;
+        let run = self.prepare_run();
+        let point = run.point(context)?;
+        let mutual = point.mutual(self)?;
         let mut system = crate::devices::linear::LinearSystem::new(self.unknown_count());
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
         for index in self.load_order() {
-            let device: &dyn Device = match replacements.iter().find(|(i, _)| *i == index) {
-                Some((_, replacement)) => &**replacement,
-                None => &*self.devices[index],
-            };
+            let device = point.device(self, index);
             let range = &self.bindings.branch_rows[index];
             device.assemble_linear(&mut crate::devices::linear::LinearContext {
                 model_context: context,
@@ -2718,7 +3015,8 @@ impl Circuit {
         bias: &Vector,
         state: Option<&StateSnapshot>,
     ) -> SpiceResult<crate::devices::linear::LinearSystem> {
-        self.bias_linearized_system(context, bias, state, 0, None)
+        self.prepare_run()
+            .small_signal_system_at(context, bias, state)
     }
 
     /// The pole-zero pencil `A + s E` at a solved bias point: every device's
@@ -2735,7 +3033,7 @@ impl Circuit {
         bias: &Vector,
         state: Option<&StateSnapshot>,
     ) -> SpiceResult<crate::devices::linear::LinearSystem> {
-        self.bias_linearized_system(context, bias, state, 1, None)
+        self.bias_linearized_system(&self.prepare_run(), context, bias, state, 1, None)
     }
 
     /// The pole-zero load as `CKTpzLoad` adds it: every device's
@@ -2755,8 +3053,14 @@ impl Circuit {
         setups: u32,
     ) -> SpiceResult<Vec<crate::maths::pencil::PencilTerm>> {
         let mut ranges = Vec::new();
-        let system =
-            self.bias_linearized_system(context, bias, state, setups.max(1), Some(&mut ranges))?;
+        let system = self.bias_linearized_system(
+            &self.prepare_run(),
+            context,
+            bias,
+            state,
+            setups.max(1),
+            Some(&mut ranges),
+        )?;
         let conductance_stamps = system.a.triplets();
         let capacitance_stamps = system.e.triplets();
         let mut terms = Vec::new();
@@ -2823,6 +3127,7 @@ impl Circuit {
 
     fn bias_linearized_system(
         &self,
+        run: &PreparedRun<'_>,
         context: &ModelContext,
         bias: &Vector,
         state: Option<&StateSnapshot>,
@@ -2830,26 +3135,19 @@ impl Circuit {
         mut ranges: Option<&mut Vec<PoleZeroRange>>,
     ) -> SpiceResult<crate::devices::linear::LinearSystem> {
         let state = self.snapshot_values(state)?;
-        context.validate(&crate::primitives::SourceLoc::new(
-            std::path::PathBuf::from("<model-context>"),
-            1,
-            1,
-        ))?;
+        context.validate(&MODEL_CONTEXT_LOCATION)?;
         if bias.len() != self.unknown_count() || !bias.is_finite() {
             return Err(SpiceError::circuit(
                 "invalid small-signal bias dimensions/values",
             ));
         }
-        let replacements = self.replacements(context)?;
-        let mutual = self.mutual_terms_with_replacements(context, &replacements)?;
+        let point = run.point(context)?;
+        let mutual = point.mutual(self)?;
         let mut system = crate::devices::linear::LinearSystem::new(self.unknown_count());
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
         for index in self.load_order() {
-            let device: &dyn Device = match replacements.iter().find(|(i, _)| *i == index) {
-                Some((_, replacement)) => &**replacement,
-                None => &*self.devices[index],
-            };
+            let device = point.device(self, index);
             let range = &self.bindings.branch_rows[index];
             let mut statements = Vec::new();
             let collecting = ranges.is_some();
@@ -2926,8 +3224,8 @@ impl Circuit {
     /// numbering. Finalize after adding instances.
     ///
     /// # Errors
-    /// [`SpiceError::Circuit`] on a duplicate instance name (against the
-    /// existing devices and within the batch), or whatever
+    /// Aggregate resource limits, unavailable storage, a duplicate instance
+    /// name (against the existing devices and within the batch), or whatever
     /// [`crate::devices::factory::instantiate_with_models`] reports.
     pub fn add_instances(
         &mut self,
@@ -2935,14 +3233,30 @@ impl Circuit {
         models: &crate::devices::models::ModelResolver<'_>,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<()> {
+        let existing = self.elaboration_size()?;
+        let limits = self.elaboration_limits;
+        // All generated plans are parsed and budgeted before any of them
+        // create a ladder. Ordinary factories keep their existing order.
+        let plan =
+            PlannedBatch::prepare(instances, models, context, &self.nodes, existing, limits)?;
         let seen: BTreeSet<String> = self
             .devices
             .iter()
             .map(|device| device.name().to_lowercase())
             .collect();
-        let base = self.devices.len();
+        let devices = &mut self.devices;
         let staged = self.nodes.transaction(|nodes| {
-            Self::elaborate_batch(instances, models, context, nodes, base, seen)
+            let staged =
+                Self::elaborate_batch(plan, models, context, nodes, existing, limits, seen)?;
+            // The node transaction commits only after the final device and
+            // provenance vector can hold the entire staged suffix.
+            devices.try_reserve(staged.len()).map_err(|error| {
+                resource_error(
+                    instances.last().map(|i| &i.location),
+                    format!("cannot reserve final device storage: {error}"),
+                )
+            })?;
+            Ok(staged)
         })?;
         if !staged.is_empty() {
             self.invalidate_topology();
@@ -2951,86 +3265,106 @@ impl Circuit {
         Ok(())
     }
 
-    /// Build each device and its provenance in deck order. All node mutations
-    /// are append-only, as required by the surrounding transaction.
+    /// Build each prepared group and its provenance in deck order. All node
+    /// mutations are append-only, as required by the surrounding transaction.
     fn elaborate_batch(
-        instances: &[crate::netlist::ast::DeviceInstance],
+        plan: PlannedBatch<'_>,
         models: &crate::devices::models::ModelResolver<'_>,
         context: &ModelContext,
         nodes: &mut crate::primitives::NodeAppend<'_>,
-        base: usize,
+        mut usage: ElaborationSize,
+        limits: ElaborationLimits,
         mut seen: BTreeSet<String>,
     ) -> SpiceResult<Vec<ElaboratedDevice>> {
         let mark = nodes.len();
-        let mut staged = Vec::with_capacity(instances.len());
-        // C parses every external node before DEVsetup creates private nodes:
-        // canonicalize future names as well as those already interned.
-        let deck_nodes: BTreeSet<String> = instances
-            .iter()
-            .flat_map(|instance| &instance.nodes)
-            .map(|name| NodeTable::canonical_name(name, nodes.auto_gnd()))
-            .collect();
-        for instance in instances {
+        let base = usage.devices;
+        let mut staged = Vec::new();
+        reserve(
+            &mut staged,
+            plan.devices,
+            plan.instances.first().map(|i| &i.location),
+        )?;
+        let mut expansions = plan.expansions.into_iter().peekable();
+        for (ordinal, instance) in plan.instances.iter().enumerate() {
+            let expansion = expansions.next_if(|prepared| prepared.ordinal == ordinal);
+            let at = Some(&instance.location);
             if !seen.insert(instance.name.to_lowercase()) {
                 return Err(SpiceError::circuit(format!(
                     "duplicate instance name '{}'",
                     instance.name
                 )));
             }
-            let first = nodes.len();
-            if instance.designator == 'y'
-                && let Some(expanded) =
-                    crate::devices::txl::fallback(instance, nodes, models, &deck_nodes)?
-            {
-                for device in expanded {
-                    if !seen.insert(device.name().to_ascii_lowercase()) {
-                        return Err(SpiceError::circuit(format!(
-                            "duplicate TXL generated instance {}",
-                            device.name()
-                        )));
+            let first_node = nodes.len();
+            let first_device = staged.len();
+            let exact = expansion.is_some();
+            let expected = expansion
+                .as_ref()
+                .map_or(Ok(ElaborationSize::new(1, 0, 0)), |prepared| {
+                    prepared.size_at_bind(instance, nodes)
+                })?;
+            limits.check(usage.checked_add(expected, at)?, at)?;
+            match expansion.map(|prepared| prepared.kind) {
+                Some(ExpansionKind::Txl(crate::devices::txl::TxlPlan::Fallback(plan_txl))) => {
+                    let expanded = plan_txl.bind(instance, nodes, &plan.deck_nodes)?;
+                    for device in expanded {
+                        if !seen.insert(device.name().to_ascii_lowercase()) {
+                            return Err(SpiceError::circuit(format!(
+                                "duplicate TXL generated instance {}",
+                                device.name()
+                            )));
+                        }
+                        staged.push(ElaboratedDevice {
+                            device,
+                            origin: DeviceOrigin::default(),
+                        });
                     }
-                    staged.push(ElaboratedDevice {
-                        device,
-                        origin: DeviceOrigin::default(),
-                    });
                 }
-                continue;
+                Some(ExpansionKind::Urc(plan_urc)) => {
+                    let expanded = plan_urc.bind(instance, nodes, context, &plan.deck_nodes)?;
+                    let line = base + staged.len();
+                    Self::stage_urc(
+                        instance,
+                        nodes,
+                        expanded,
+                        first_node,
+                        line,
+                        &mut seen,
+                        &mut staged,
+                    )?;
+                }
+                None => {
+                    let device = crate::devices::factory::instantiate_with_models(
+                        instance, nodes, models, context,
+                    )?;
+                    Self::stage_single(instance, nodes, device, first_node, &mut staged)?;
+                }
+                Some(ExpansionKind::Txl(crate::devices::txl::TxlPlan::Native(native))) => {
+                    let device = native.bind(instance, nodes)?;
+                    Self::stage_single(instance, nodes, device, first_node, &mut staged)?;
+                }
             }
-            if instance.designator == 'u' {
-                let expanded =
-                    crate::devices::urc::expand(instance, nodes, models, context, &deck_nodes)?;
-                let line = base + staged.len();
-                Self::stage_urc(
-                    instance,
-                    nodes,
-                    expanded,
-                    first,
-                    line,
-                    &mut seen,
-                    &mut staged,
-                )?;
-                continue;
+            let actual = ElaborationSize::new(
+                staged.len() - first_device,
+                nodes.len() - first_node,
+                Self::declared_state_slots(&staged[first_device..], at)?,
+            );
+            if exact && actual != expected {
+                return Err(SpiceError::parse(
+                    instance.location.clone(),
+                    format!(
+                        "{}: prepared expansion size {expected:?} differs from materialized {actual:?}",
+                        instance.name
+                    ),
+                ));
             }
-            let device =
-                crate::devices::factory::instantiate_with_models(instance, nodes, models, context)?;
-            let origin = DeviceOrigin {
-                internal_nodes: nodes.nodes()[first..]
-                    .iter()
-                    .filter(|node| node.kind == NodeKind::Internal)
-                    .map(|node| node.id)
-                    .collect(),
-                model: instance.model.as_ref().map(|m| m.to_ascii_lowercase()),
-                generated_by: None,
-            };
-            staged.push(ElaboratedDevice { device, origin });
+            usage = usage.checked_add(actual, at)?;
+            limits.check(usage, at)?;
         }
         // Factories already reject existing names. Check private nodes which
         // were created before a later parsed card could introduce its name.
-        // This includes semiconductor and transmission-line setup, not just
-        // the explicit URC/TXL expansions.
         if let Some(collision) = nodes.nodes()[mark..]
             .iter()
-            .find(|node| node.kind == NodeKind::Internal && deck_nodes.contains(&node.name))
+            .find(|node| node.kind == NodeKind::Internal && plan.deck_nodes.contains(&node.name))
         {
             return Err(SpiceError::circuit(format!(
                 "internal-node name collision: {}",
@@ -3038,6 +3372,34 @@ impl Circuit {
             )));
         }
         Ok(staged)
+    }
+
+    fn stage_single(
+        instance: &crate::netlist::ast::DeviceInstance,
+        nodes: &NodeTable,
+        device: Box<dyn Device>,
+        first: usize,
+        staged: &mut Vec<ElaboratedDevice>,
+    ) -> SpiceResult<()> {
+        let mut internal_nodes = Vec::new();
+        let internal = nodes.nodes()[first..]
+            .iter()
+            .filter(|node| node.kind == NodeKind::Internal);
+        reserve(
+            &mut internal_nodes,
+            internal.clone().count(),
+            Some(&instance.location),
+        )?;
+        internal_nodes.extend(internal.map(|node| node.id));
+        staged.push(ElaboratedDevice {
+            device,
+            origin: DeviceOrigin {
+                internal_nodes,
+                model: instance.model.as_ref().map(|m| m.to_ascii_lowercase()),
+                generated_by: None,
+            },
+        });
+        Ok(())
     }
 
     // Preserve ownership and insertion order of a URC's generated devices.
@@ -3068,13 +3430,15 @@ impl Circuit {
             let origin = if is_line {
                 // URCsetup's own ladder nodes: defer until the URC's setup.
                 DeviceOrigin {
-                    internal_nodes: nodes.nodes()[first..]
-                        .iter()
-                        .filter(|node| {
+                    internal_nodes: {
+                        let internal = nodes.nodes()[first..].iter().filter(|node| {
                             node.kind != NodeKind::Internal && !parsed_terminals.contains(&node.id)
-                        })
-                        .map(|node| node.id)
-                        .collect(),
+                        });
+                        let mut ids = Vec::new();
+                        reserve(&mut ids, internal.clone().count(), Some(&instance.location))?;
+                        ids.extend(internal.map(|node| node.id));
+                        ids
+                    },
                     model: instance.model.as_ref().map(|m| m.to_ascii_lowercase()),
                     generated_by: None,
                 }
@@ -3162,6 +3526,24 @@ impl Circuit {
         context: &ModelContext,
         mutual_limits: MutualLimits,
     ) -> SpiceResult<Self> {
+        Self::from_netlist_with_limits(
+            netlist,
+            context,
+            mutual_limits,
+            ElaborationLimits::default(),
+        )
+    }
+
+    /// Elaborate with both mutual-inductor and aggregate materialized-device
+    /// resource limits. The latter also bounds input subcircuit expansion.
+    /// # Errors
+    /// Invalid deck/context, failed factory or expansion, or exceeded resource limits.
+    pub fn from_netlist_with_limits(
+        netlist: &crate::netlist::ast::Netlist,
+        context: &ModelContext,
+        mutual_limits: MutualLimits,
+        elaboration_limits: ElaborationLimits,
+    ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
         if !netlist.includes.is_empty() {
             return Err(SpiceError::Unsupported {
@@ -3183,10 +3565,17 @@ impl Circuit {
         let expanded = crate::devices::subckt::expand_subcircuits(
             netlist,
             &elaborated.scope,
-            crate::devices::subckt::SubcircuitLimits::default(),
+            crate::devices::subckt::SubcircuitLimits {
+                max_devices: elaboration_limits.devices,
+                ..Default::default()
+            },
         )?;
         let models = crate::devices::models::ModelResolver::new(&expanded.models)?;
-        let mut circuit = Self::with_mutual_limits(mutual_limits);
+        let mut circuit = Self {
+            mutual_limits,
+            elaboration_limits,
+            ..Self::default()
+        };
         // `b4set.c` reads the task's analysis list (`noiseAnalGiven`).
         let mut setup = *context;
         setup.noise_analysis = netlist

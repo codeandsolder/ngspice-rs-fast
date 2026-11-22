@@ -52,6 +52,7 @@ pub mod circuit;
 pub mod controlled;
 pub mod delay;
 pub mod distortion;
+mod elaboration;
 mod factory;
 pub mod functions;
 pub mod hfet;
@@ -79,8 +80,8 @@ pub use passive::PassiveParameters;
 pub mod schema;
 pub mod sensitivity;
 pub use models::{
-    DEFAULT_GMIN, DiodeInstanceParameters, DiodeModelParameters, LevelSelection, ModelBackend,
-    ModelContext, ModelFamily, ModelResolver, ResolvedModel,
+    DEFAULT_GMIN, DEFAULT_RELTOL, DiodeInstanceParameters, DiodeModelParameters, LevelSelection,
+    ModelBackend, ModelContext, ModelFamily, ModelResolver, ResolvedModel,
 };
 pub mod ltra;
 pub mod registry;
@@ -108,8 +109,9 @@ pub mod traits;
 
 pub use behavioural::{Behavioural, BehaviouralOutput, BehaviouralScale};
 pub use circuit::{Circuit, CircuitGraph, CircuitVertex, ElaboratedDevice};
-pub use circuit::{ConvergenceRequest, DelayAcceptance, LoadRequest};
+pub use circuit::{ConvergenceRequest, DelayAcceptance, LoadRequest, PreparedRun};
 pub use controlled::{ControlledKind, ControlledSource};
+pub use elaboration::ElaborationLimits;
 pub use mutual::{MutualInductance, MutualLimits};
 pub use registry::{DeviceEntry, DeviceSupport, Registry};
 pub use rlc::{Capacitor, Inductor, Resistor, ResistorNoise};

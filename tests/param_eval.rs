@@ -377,10 +377,7 @@ fn analysis_expression_positions_and_numeric_rounding_are_explicit() {
         .unwrap();
     assert_eq!(site.value.to_bits(), 3.0_f64.to_bits());
     assert_eq!(site.formatted, "3.000000000000000e+00");
-    assert_eq!(
-        site.read_back.to_bits(),
-        3.000_000_000_000_000_4_f64.to_bits()
-    );
+    assert_eq!(site.read_back.to_bits(), 3.0_f64.to_bits());
     assert_eq!(site.formatted, resolved.netlist.analyses[0].arguments[1]);
 
     let mut duplicate = input.clone();

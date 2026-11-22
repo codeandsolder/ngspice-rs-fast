@@ -194,8 +194,7 @@ fn all_device_charge_pairs_are_disposable_and_integrate_actual_nonlinear_q() {
         )
         .unwrap();
         let mut history = c.state_history().unwrap();
-        history.commit(solved.trial.clone()).unwrap();
-        history.seed_accepted_history().unwrap();
+        history.initialize(solved.trial).unwrap();
         let before = history.clone();
         let mut x = solved.values;
         let row = c.unknowns().node_row(c.nodes().get("a").unwrap()).unwrap();
@@ -542,12 +541,8 @@ fn gmin_stepping_resolves_a_singular_initial_jacobian_without_accepting_trials()
                 .unwrap_or(0.);
             context.nodal(self.nodes, 3. * v * v, false)
         }
-        fn accept(
-            &self,
-            _: &ngspice_rs::devices::AcceptContext<'_>,
-        ) -> ngspice_rs::primitives::SpiceResult<()> {
+        fn accept(&self, _: &ngspice_rs::devices::AcceptContext<'_>) {
             self.accepted.set(self.accepted.get() + 1);
-            Ok(())
         }
     }
     let mut c = circuit("i1 0 a 1");

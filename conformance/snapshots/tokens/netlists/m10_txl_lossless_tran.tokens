@@ -16,8 +16,8 @@ card 1 @netlists/m10_txl_lossless_tran.cir:2:1 lines=2-2 continuations=0
   token 10 2:23 number "1n" value=1e-9
   token 11 2:26 number "0.1n" value=1e-10
   token 12 2:31 number "0.1n" value=1e-10
-  token 13 2:36 number "100n" value=1.0000000000000001e-7
-  token 14 2:41 number "200n" value=2.0000000000000002e-7
+  token 13 2:36 number "100n" value=1e-7
+  token 14 2:41 number "200n" value=2e-7
   token 15 2:45 rparen ")"
 card 2 @netlists/m10_txl_lossless_tran.cir:3:1 lines=3-3 continuations=0
   raw: "y1 1 0 2 0 ym"
@@ -46,7 +46,7 @@ card 4 @netlists/m10_txl_lossless_tran.cir:5:1 lines=5-5 continuations=0
   token 6 5:17 number "0" value=0e0
   token 7 5:19 word "l"
   token 8 5:20 equals "="
-  token 9 5:21 number "250e-9" value=2.5000000000000004e-7
+  token 9 5:21 number "250e-9" value=2.5e-7
   token 10 5:28 word "c"
   token 11 5:29 equals "="
   token 12 5:30 number "100e-12" value=1e-10
@@ -73,8 +73,8 @@ card 6 @netlists/m10_txl_lossless_tran.cir:7:1 lines=7-7 continuations=0
   raw: ".tran 0.05n 12n"
   kind: dot(.tran)
   token 1 7:1 word ".tran"
-  token 2 7:7 number "0.05n" value=4.9999999999999995e-11
-  token 3 7:13 number "12n" value=1.2000000000000002e-8
+  token 2 7:7 number "0.05n" value=5e-11
+  token 3 7:13 number "12n" value=1.2e-8
 card 7 @netlists/m10_txl_lossless_tran.cir:8:1 lines=8-8 continuations=0
   raw: ".end"
   kind: dot(.end)

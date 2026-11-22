@@ -143,6 +143,13 @@ impl StateSnapshot {
     }
 }
 
+/// Publication mode for an accepted trial.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum HistoryPublication {
+    Initialize,
+    Rotate,
+}
+
 /// Accepted device state vectors, most recent first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateHistory {
@@ -288,14 +295,15 @@ impl StateHistory {
     pub(super) fn accept_transaction(
         &mut self,
         trial: TrialState,
+        publication: HistoryPublication,
         prepare: impl FnOnce(&Self, &TrialState) -> SpiceResult<Vec<(usize, DelayUpdate)>>,
         before_commit: impl FnOnce(&TrialState) -> SpiceResult<()>,
     ) -> SpiceResult<Vec<Real>> {
-        self.check(&trial)?;
+        self.check_publication(&trial, publication)?;
         let updates = prepare(self, &trial)?;
         let checked = self.prepare_delays(&updates)?;
         before_commit(&trial)?;
-        self.commit_validated(trial);
+        self.commit_validated(trial, publication);
         if !checked.is_empty() {
             for (device, history) in &mut self.delays {
                 if let Some(update) = checked.get(device) {
@@ -412,30 +420,45 @@ impl StateHistory {
     ///
     /// As [`Self::check`].
     pub fn commit(&mut self, trial: TrialState) -> SpiceResult<()> {
-        self.check(&trial)?;
-        self.commit_validated(trial);
+        self.check_publication(&trial, HistoryPublication::Rotate)?;
+        self.commit_validated(trial, HistoryPublication::Rotate);
         Ok(())
     }
 
-    fn commit_validated(&mut self, trial: TrialState) {
-        trial.patches.apply(&mut self.accepted);
-        self.accepted.insert(0, trial.values);
-        self.accepted.truncate(ACCEPTED_DEPTH);
+    fn check_publication(
+        &self,
+        trial: &TrialState,
+        publication: HistoryPublication,
+    ) -> SpiceResult<()> {
+        self.check(trial)?;
+        if publication == HistoryPublication::Initialize && !self.accepted.is_empty() {
+            return Err(state_error(
+                "initial publication requires empty accepted history",
+            ));
+        }
+        Ok(())
+    }
+
+    fn commit_validated(&mut self, trial: TrialState, publication: HistoryPublication) {
+        match publication {
+            HistoryPublication::Initialize => self.accepted.resize(ACCEPTED_DEPTH, trial.values),
+            HistoryPublication::Rotate => {
+                trial.patches.apply(&mut self.accepted);
+                self.accepted.insert(0, trial.values);
+                self.accepted.truncate(ACCEPTED_DEPTH);
+            }
+        }
         self.revision = Arc::new(());
     }
 
-    /// Replicate the single initial accepted state across integration history.
+    /// Publish the initial accepted point into all integration history slots.
+    /// Each slot shares the same immutable state vector until modified.
     ///
     /// # Errors
-    /// The history does not contain exactly one accepted state.
-    pub fn seed_accepted_history(&mut self) -> SpiceResult<()> {
-        let [first] = self.accepted.as_slice() else {
-            return Err(state_error(
-                "initial history must contain exactly one accepted point",
-            ));
-        };
-        self.accepted = vec![Arc::clone(first); ACCEPTED_DEPTH];
-        self.revision = Arc::new(());
+    /// Invalid or stale trial, or a history that already contains accepted points.
+    pub fn initialize(&mut self, trial: TrialState) -> SpiceResult<()> {
+        self.check_publication(&trial, HistoryPublication::Initialize)?;
+        self.commit_validated(trial, HistoryPublication::Initialize);
         Ok(())
     }
 
@@ -512,6 +535,50 @@ impl StateHistory {
             .cloned()
             .ok_or_else(|| state_error("device ordinal not in finalized state layout"))?;
         self.window(trial, range, self.delays.get(&device))
+    }
+
+    /// Disposable local window with float-mode trial semantics and limiting
+    /// disabled. All source state is read-only; only one device's trial
+    /// slots are allocated. Writes cannot reach the accepted history.
+    pub(super) fn isolated_device<'a>(
+        &'a self,
+        scratch: &'a mut IsolatedState,
+        previous: Option<&'a TrialState>,
+        device: usize,
+    ) -> SpiceResult<DeviceState<'a>> {
+        if let Some(previous) = previous {
+            self.check_trial(previous)?;
+        }
+        let range = self
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.rows.get(device))
+            .cloned()
+            .ok_or_else(|| state_error("device ordinal not in finalized state layout"))?;
+        scratch.values.resize(range.len(), Real::NAN);
+        scratch.values.fill(Real::NAN);
+        scratch.nonconvergent = false;
+        scratch.patches = previous
+            .map(|trial| trial.patches.clone())
+            .unwrap_or_default();
+        let mut mode = LoadMode::newton(IterationPhase::Float);
+        mode.set(LoadFlag::DeviceLimiting, false);
+        let mut accepted = [&[][..]; ACCEPTED_DEPTH];
+        for (slot, vector) in accepted.iter_mut().zip(&self.accepted) {
+            *slot = &vector[range.clone()];
+        }
+        Ok(DeviceState {
+            trial: &mut scratch.values,
+            accepted,
+            depth: self.accepted.len(),
+            mode,
+            previous: previous.map(|trial| &trial.values[range.clone()]),
+            carried: self.carried.as_deref().map(|vector| &vector[range.clone()]),
+            nonconvergent: Some(&mut scratch.nonconvergent),
+            offset: range.start,
+            patches: Some(&mut scratch.patches),
+            delay: self.delays.get(&device),
+        })
     }
 
     fn window<'a>(
@@ -757,6 +824,22 @@ impl TrialState {
     #[must_use]
     pub fn slice(&self, range: Range<usize>) -> Option<&[Real]> {
         self.values.get(range)
+    }
+}
+
+/// Reusable, device-local disposable state storage for isolated asks.
+#[derive(Debug, Default)]
+pub(super) struct IsolatedState {
+    values: Vec<Real>,
+    nonconvergent: bool,
+    patches: State1Patches,
+}
+
+impl IsolatedState {
+    pub(super) fn clear(&mut self) {
+        self.values.clear();
+        self.patches = State1Patches::default();
+        self.nonconvergent = false;
     }
 }
 
@@ -1136,6 +1219,7 @@ mod tests {
         let error = history
             .accept_transaction(
                 trial.clone(),
+                super::HistoryPublication::Rotate,
                 |_, _| Ok(vec![(0, update(1., 3.)), (0, update(2., 4.))]),
                 |_| {
                     hook_ran = true;
@@ -1152,6 +1236,7 @@ mod tests {
             history
                 .accept_transaction(
                     trial.clone(),
+                    super::HistoryPublication::Rotate,
                     |_, _| Ok(updates()),
                     |_| Err(super::state_error("hook refused")),
                 )
@@ -1159,7 +1244,12 @@ mod tests {
         );
         assert_eq!(history, original);
         let breaks = history
-            .accept_transaction(trial, |_, _| Ok(updates()), |_| Ok(()))
+            .accept_transaction(
+                trial,
+                super::HistoryPublication::Rotate,
+                |_, _| Ok(updates()),
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(breaks, vec![4., 3.]);
         assert_eq!(history.accepted(1), Some(&[42.][..]));

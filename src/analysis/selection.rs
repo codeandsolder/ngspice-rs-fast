@@ -486,6 +486,37 @@ impl Column {
         (self.terms, self.component.map(VectorComponent::function))
     }
 
+    /// Raw source columns consumed by this resolved expression, in
+    /// evaluation order. Ground has no dependencies.
+    pub(super) fn input_columns(&self) -> impl Iterator<Item = usize> {
+        self.terms
+            .pairs()
+            .into_iter()
+            .flatten()
+            .map(|(index, _)| index)
+    }
+
+    /// Bind the same expression to a compact raw-column projection. The
+    /// projection's sorted source ordinals are resolved once, not searched
+    /// when evaluating the expression at every accepted sample.
+    pub(super) fn remap_inputs(&mut self, columns: &[usize]) -> SpiceResult<()> {
+        let mapped = |index| {
+            columns
+                .binary_search(&index)
+                .map_err(|_| SpiceError::circuit("projection omits a bound column"))
+        };
+        self.terms = match self.terms {
+            Terms::Ground => Terms::Ground,
+            Terms::Positive(index) => Terms::Positive(mapped(index)?),
+            Terms::Negative(index) => Terms::Negative(mapped(index)?),
+            Terms::Difference { positive, negative } => Terms::Difference {
+                positive: mapped(positive)?,
+                negative: mapped(negative)?,
+            },
+        };
+        Ok(())
+    }
+
     /// The written name of this column, e.g. `v(out)`.
     pub(crate) fn name(&self) -> &str {
         &self.name

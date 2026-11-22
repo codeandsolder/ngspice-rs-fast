@@ -312,12 +312,15 @@ pub(super) fn run(
     plot.reserve_points(plan.grid.len())?;
     let reference = plan.ports[0].z0;
     for &f in plan.grid {
-        let factor = small_signal.at_frequency(circuit, context, f, |system| {
+        let factor = small_signal.at_frequency(context, f, |system| {
             let factor =
                 crate::analysis::ac::ac_matrix(circuit, system, 2. * std::f64::consts::PI * f)?
                     .factorize()?;
-            plan.budget
-                .charge_factor(factor.stored_entries()?, plan.ports.len(), plan.noise)?;
+            plan.budget.charge_factor(
+                factor.factor_storage().factor_entries,
+                plan.ports.len(),
+                plan.noise,
+            )?;
             workspace.solve_ports(&plan.ports, &factor, f)?;
             Ok(factor)
         })?;
@@ -325,9 +328,11 @@ pub(super) fn run(
         workspace.point.push(Complex::real(f));
         workspace.point.extend_from_slice(&workspace.solve.solution);
         if !circuit.observations().is_empty() {
-            workspace
-                .point
-                .extend(circuit.observe_parameters(&context.model_context().with_frequency(f))?);
+            workspace.point.extend(
+                small_signal
+                    .prepared()
+                    .observe_parameters(&context.model_context().with_frequency(f))?,
+            );
         }
         for matrix in [
             &workspace.algebra.s,
@@ -338,8 +343,8 @@ pub(super) fn run(
         }
         workspace.point.push(reference);
         if let Some(noise) = &mut workspace.noise {
-            let generators = crate::devices::noise::circuit_noise(
-                circuit,
+            let generators = crate::devices::noise::prepared_noise(
+                small_signal.prepared(),
                 &context.model_context().with_frequency(f),
                 small_signal.bias(),
                 Some(small_signal.state()),

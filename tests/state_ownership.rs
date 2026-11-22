@@ -52,14 +52,16 @@ impl Device for Accumulator {
         assert!(context.branch(self.branches).is_err());
         Ok(())
     }
-    fn accept(&self, context: &AcceptContext<'_>) -> SpiceResult<()> {
-        if context.time == Some(99.0) {
+    fn validate_accept(&self, context: &AcceptContext<'_>) -> SpiceResult<()> {
+        if self.name == "x2" && context.time == Some(99.0) {
             return Err(SpiceError::circuit("accept refused"));
         }
+        Ok(())
+    }
+    fn accept(&self, context: &AcceptContext<'_>) {
         self.log
             .borrow_mut()
             .push((context.time, context.states.map(<[f64]>::to_vec)));
-        Ok(())
     }
 }
 

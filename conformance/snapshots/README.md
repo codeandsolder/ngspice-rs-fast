@@ -58,3 +58,8 @@ indistinguishable from a separator and is not supported in fixture names.
 3. Review the whole snapshot diff; in the PR, explain why the schema changed.
    Parser behavior changes must show up as intentional snapshot diffs, never as
    silently accepted ones. Do not mix this with rawfile golden recapture.
+
+The decimal conversion update (#94) changes numeric values in the token and AST
+dumps to the nearest binary64 of the exact scaled decimal. The dump schema and
+source positions are unchanged; these are parser snapshots, not recaptured C
+simulation goldens.

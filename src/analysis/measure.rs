@@ -34,9 +34,11 @@ use crate::netlist::ast::{
     MeasureCard, MeasureEvent, MeasureRequest, MeasureStatistic, MeasureTransition, MeasureWindow,
     VectorRequest,
 };
-use crate::primitives::{AnalysisKind, Real, SpiceError, SpiceResult};
+use crate::primitives::{AnalysisKind, Complex, Real, SpiceError, SpiceResult};
 
-use super::ordered_samples::{AxisError, OrderedAxis, SampleError, SampleWindow, column_names};
+use super::ordered_samples::{
+    AxisError, OrderedAxis, SampleError, SampleWindow, column_names, same_coordinate,
+};
 use super::reduction::{CompensatedSum, ScaledSquares};
 use crate::analysis::results::Plot;
 use crate::analysis::selection::{self, Column};
@@ -129,9 +131,22 @@ pub(super) fn resolve_refs_with_scope<'a>(
     cards: impl Iterator<Item = &'a MeasureCard> + Clone,
     scope: &crate::netlist::eval::ParamScope,
 ) -> SpiceResult<Vec<Measurement>> {
-    let mut budget = crate::netlist::eval::EvalBudget::default();
-    let limit = budget.limits().definitions;
-    let mut scan = cards.clone();
+    let count = bounded_count(cards.clone())?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let axis = Axis::of(plot, kind)?;
+    resolve_ordered(kind, cards, scope, |_, card| evaluate(plot, &axis, card))
+}
+
+/// Limit the number of output records before binding or evaluating operands.
+pub(super) fn bounded_count<'a>(
+    cards: impl Iterator<Item = &'a MeasureCard>,
+) -> SpiceResult<usize> {
+    let limit = crate::netlist::eval::EvalBudget::default()
+        .limits()
+        .definitions;
+    let mut scan = cards;
     let count = scan.by_ref().take(limit).count();
     if let Some(card) = scan.next() {
         return Err(unsupported(
@@ -139,10 +154,20 @@ pub(super) fn resolve_refs_with_scope<'a>(
             format!("measurement record limit of {limit} exceeded"),
         ));
     }
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-    let axis = Axis::of(plot, kind)?;
+    Ok(count)
+}
+
+/// Shared two-pass sequential binding environment for retained and streamed
+/// measurements. Vector results are supplied at their original card index.
+/// Deferred numeric setters are resolved only after earlier results exist.
+pub(super) fn resolve_ordered<'a>(
+    kind: AnalysisKind,
+    cards: impl Iterator<Item = &'a MeasureCard> + Clone,
+    scope: &crate::netlist::eval::ParamScope,
+    mut vector: impl FnMut(usize, &MeasureCard) -> SpiceResult<Measurement>,
+) -> SpiceResult<Vec<Measurement>> {
+    let count = bounded_count(cards.clone())?;
+    let mut budget = crate::netlist::eval::EvalBudget::default();
     // Evaluation order is two-pass, but each result occupies its source-order
     // slot immediately. No result sort or chain of lexical scopes is needed.
     let mut results = Vec::new();
@@ -193,7 +218,7 @@ pub(super) fn resolve_refs_with_scope<'a>(
                 events: None,
             }
         } else {
-            evaluate(plot, &axis, card)?
+            vector(index, card)?
         };
         scope.publish(&card.name, result.value, &card.name_location)?;
         results[index] = Some(result);
@@ -276,6 +301,8 @@ const DC_SCALES: [&str; 5] = [
     "v(param-sweep)",
 ];
 
+pub(super) mod online;
+
 /// The ordered physical axis of a plot: the driver's scale vector.
 ///
 /// The companion transient driver keeps every accepted time point and lands
@@ -283,48 +310,73 @@ const DC_SCALES: [&str; 5] = [
 /// source discontinuity (`src/analysis/companion.rs`, "Output"). This module therefore interpolates only between consecutive
 /// samples, and treats two samples that share an axis value as a jump (see
 /// [`value_at`] and [`crossing`]).
-struct Axis {
+pub(super) struct Axis {
     /// The axis' column name, e.g. `time`.
     name: &'static str,
     /// One physical value per plot point.
     values: OrderedAxis<'static>,
 }
 
-impl Axis {
-    fn of(plot: &Plot, kind: AnalysisKind) -> SpiceResult<Self> {
-        let name = match kind {
-            AnalysisKind::Transient => "time",
-            AnalysisKind::Ac | AnalysisKind::SParameter => "frequency",
-            // com_measure2.c tries v-sweep, i-sweep, temp-sweep, res-sweep in
-            // that order. C stops there, so a `.dc @dev[param]` plot has no
-            // measurable scale; the port also accepts its param-sweep.
-            AnalysisKind::DcSweep => DC_SCALES
-                .into_iter()
-                .find(|name| plot.variable_index(name).is_some())
-                .unwrap_or(DC_SCALES[0]),
-            other => {
-                return Err(SpiceError::Unsupported {
-                    feature: format!(
-                        "a .measure result needs a .tran, .dc or .ac plot with an ordered axis; \
+/// Physical measurement scale identity, independent of retained rows.
+pub(super) fn axis_name(plot: &Plot, kind: AnalysisKind) -> SpiceResult<&'static str> {
+    let name = match kind {
+        AnalysisKind::Transient => "time",
+        AnalysisKind::Ac | AnalysisKind::SParameter => "frequency",
+        // com_measure2.c tries v-sweep, i-sweep, temp-sweep, res-sweep in
+        // that order. C stops there, so a `.dc @dev[param]` plot has no
+        // measurable scale; the port also accepts its param-sweep.
+        AnalysisKind::DcSweep => DC_SCALES
+            .into_iter()
+            .find(|name| plot.variable_index(name).is_some())
+            .unwrap_or(DC_SCALES[0]),
+        other => {
+            return Err(SpiceError::Unsupported {
+                feature: format!(
+                    "a .measure result needs a .tran, .dc or .ac plot with an ordered axis; \
                          this run is .{} (docs/port/MEASURE.md)",
-                        other.as_str()
-                    ),
-                    location: None,
-                });
-            }
-        };
+                    other.as_str()
+                ),
+                location: None,
+            });
+        }
+    };
+    Ok(name)
+}
+
+fn missing_axis(plot: &Plot, name: &str) -> SpiceError {
+    SpiceError::Unsupported {
+        feature: format!(
+            "the {} plot carries no '{name}' axis vector; it carries {}",
+            plot.plotname,
+            column_names(plot)
+        ),
+        location: None,
+    }
+}
+
+fn nonfinite_axis(name: &str, index: usize) -> SpiceError {
+    SpiceError::Numerical {
+        context: format!("measure axis {name}"),
+        message: format!("point {index} is not finite"),
+    }
+}
+
+fn descending_axis(name: &str, index: usize) -> SpiceError {
+    SpiceError::Unsupported {
+        feature: format!(
+            "the {name} axis is not non-decreasing (it descends at point {index}); a measurement needs an ordered axis, so a descending or nested .dc sweep is not measurable"
+        ),
+        location: None,
+    }
+}
+
+impl Axis {
+    pub(super) fn of(plot: &Plot, kind: AnalysisKind) -> SpiceResult<Self> {
+        let name = axis_name(plot, kind)?;
         let values = OrderedAxis::from_plot(plot, name).map_err(|error| match error {
-            AxisError::MissingColumn => SpiceError::Unsupported {
-                feature: format!("the {} plot carries no '{name}' axis vector; it carries {}", plot.plotname, column_names(plot)),
-                location: None,
-            },
-            AxisError::Nonfinite(index) => SpiceError::Numerical {
-                context: format!("measure axis {name}"), message: format!("point {index} is not finite"),
-            },
-            AxisError::Descending(index) => SpiceError::Unsupported {
-                feature: format!("the {name} axis is not non-decreasing (it descends at point {index}); a measurement needs an ordered axis, so a descending or nested .dc sweep is not measurable"),
-                location: None,
-            },
+            AxisError::MissingColumn => missing_axis(plot, name),
+            AxisError::Nonfinite(index) => nonfinite_axis(name, index),
+            AxisError::Descending(index) => descending_axis(name, index),
         })?;
         Ok(Self { name, values })
     }
@@ -347,14 +399,29 @@ struct Window {
 
 impl Window {
     fn resolve(window: &MeasureWindow, axis: &Axis, card: &MeasureCard) -> SpiceResult<Self> {
-        if axis.values.is_empty() {
+        let range = axis
+            .values
+            .as_slice()
+            .first()
+            .copied()
+            .zip(axis.values.as_slice().last().copied());
+        Self::from_range(window, range, axis.name, card)
+    }
+
+    fn from_range(
+        window: &MeasureWindow,
+        range: Option<(Real, Real)>,
+        axis: &str,
+        card: &MeasureCard,
+    ) -> SpiceResult<Self> {
+        let Some((first, last)) = range else {
             return Err(unsupported(
                 card,
                 format!(".measure {}: the plot has no points", card.name),
             ));
-        }
-        let from = window.from.unwrap_or_else(|| axis.first());
-        let to = window.to.unwrap_or_else(|| axis.last());
+        };
+        let from = window.from.unwrap_or(first);
+        let to = window.to.unwrap_or(last);
         if !from.is_finite() || !to.is_finite() {
             return Err(unsupported(
                 card,
@@ -365,29 +432,28 @@ impl Window {
             return Err(unsupported(
                 card,
                 format!(
-                    ".measure {}: FROM= is above TO= (a {} window must ascend; C swaps an \
+                    ".measure {}: FROM= is above TO= (a {axis} window must ascend; C swaps an \
                      inverted window for a .dc measurement)",
-                    card.name, axis.name
+                    card.name
                 ),
             ));
         }
-        if to < axis.first() || from > axis.last() {
+        if to < first || from > last {
             return Err(unsupported(
                 card,
                 format!(
-                    ".measure {}: the window [{}, {}] lies outside the {} range [{}, {}]",
+                    ".measure {}: the window [{}, {}] lies outside the {axis} range [{}, {}]",
                     card.name,
                     crate::primitives::format_spice_number(from),
                     crate::primitives::format_spice_number(to),
-                    axis.name,
-                    crate::primitives::format_spice_number(axis.first()),
-                    crate::primitives::format_spice_number(axis.last())
+                    crate::primitives::format_spice_number(first),
+                    crate::primitives::format_spice_number(last)
                 ),
             ));
         }
         Ok(Self {
-            from: from.max(axis.first()),
-            to: to.min(axis.last()),
+            from: from.max(first),
+            to: to.min(last),
         })
     }
 
@@ -471,7 +537,7 @@ impl<'a> Operand<'a> {
     }
 }
 
-fn evaluate(plot: &Plot, axis: &Axis, card: &MeasureCard) -> SpiceResult<Measurement> {
+pub(super) fn evaluate(plot: &Plot, axis: &Axis, card: &MeasureCard) -> SpiceResult<Measurement> {
     match &card.request {
         MeasureRequest::Deferred { .. } | MeasureRequest::Parameter(_) => Err(unsupported(
             card,
@@ -572,27 +638,13 @@ fn evaluate_statistic(
             )?;
             (value, Some(at), None)
         }
-        MeasureStatistic::MinAt | MeasureStatistic::MaxAt => {
-            let extrema = extrema(axis, &operand, &window, card)?;
-            let (_, at) = if statistic == MeasureStatistic::MaxAt {
-                extrema.max
-            } else {
-                extrema.min
-            };
-            (at, None, None)
-        }
-        MeasureStatistic::PeakToPeak => {
-            let extrema = extrema(axis, &operand, &window, card)?;
-            (extrema.max.0 - extrema.min.0, None, None)
-        }
-        MeasureStatistic::Min | MeasureStatistic::Max => {
-            let extrema = extrema(axis, &operand, &window, card)?;
-            let (value, at) = if statistic == MeasureStatistic::Max {
-                extrema.max
-            } else {
-                extrema.min
-            };
-            (value, Some(at), None)
+        MeasureStatistic::MinAt
+        | MeasureStatistic::MaxAt
+        | MeasureStatistic::PeakToPeak
+        | MeasureStatistic::Min
+        | MeasureStatistic::Max => {
+            let (value, at) = extrema(axis, &operand, &window, card)?.result(statistic)?;
+            (value, at, None)
         }
         MeasureStatistic::Avg | MeasureStatistic::Rms | MeasureStatistic::Integ => {
             let span = MeasureSpan {
@@ -604,11 +656,7 @@ fn evaluate_statistic(
             // failure rather than a division by zero.
             let width = span_width(span, card)?;
             let points = window.clipped(axis, &operand, card)?;
-            let value = match statistic {
-                MeasureStatistic::Avg => trapezoid_integral(points, card)? / width,
-                MeasureStatistic::Rms => simpson_rms(points, width)?,
-                _ => simpson_integral(points, card)?,
-            };
+            let value = integrate(points, statistic, width, card)?;
             (value, None, Some(span))
         }
     };
@@ -622,7 +670,7 @@ fn evaluate_statistic(
     Ok(Measurement {
         name: card.name.clone(),
         value,
-        unit: statistic_unit(statistic, &operand, axis),
+        unit: statistic_unit(statistic, operand.unit(), axis.name),
         at,
         window: span,
         events: None,
@@ -713,6 +761,35 @@ struct Extrema {
     max: (Real, Real),
 }
 
+impl Extrema {
+    const fn new(value: Real, location: Real) -> Self {
+        Self {
+            min: (value, location),
+            max: (value, location),
+        }
+    }
+
+    const fn include(&mut self, value: Real, location: Real) {
+        if value <= self.min.0 {
+            self.min = (value, location);
+        }
+        if value >= self.max.0 {
+            self.max = (value, location);
+        }
+    }
+
+    fn result(&self, statistic: MeasureStatistic) -> SpiceResult<(Real, Option<Real>)> {
+        Ok(match statistic {
+            MeasureStatistic::MinAt => (self.min.1, None),
+            MeasureStatistic::MaxAt => (self.max.1, None),
+            MeasureStatistic::PeakToPeak => (self.max.0 - self.min.0, None),
+            MeasureStatistic::Min => (self.min.0, Some(self.min.1)),
+            MeasureStatistic::Max => (self.max.0, Some(self.max.1)),
+            _ => return Err(SpiceError::circuit("invalid extrema statistic")),
+        })
+    }
+}
+
 fn extrema(
     axis: &Axis,
     operand: &Operand<'_>,
@@ -721,180 +798,133 @@ fn extrema(
 ) -> SpiceResult<Extrema> {
     let samples = window.samples(axis, card)?;
     let (first, location) = samples.first_sample();
-    let initial = (operand.value(first)?, location);
-    let mut extrema = Extrema {
-        min: initial,
-        max: initial,
-    };
+    let mut extrema = Extrema::new(operand.value(first)?, location);
     for (index, location) in samples.raw_samples().skip(1) {
-        let value = operand.value(index)?;
-        // C's <= / >= comparisons keep the last sample on ties.
-        if value <= extrema.min.0 {
-            extrema.min = (value, location);
-        }
-        if value >= extrema.max.0 {
-            extrema.max = (value, location);
-        }
+        extrema.include(operand.value(index)?, location);
     }
     Ok(extrema)
 }
 
-/// Trapezoidal AVG. Midpoint avoids overflowing the sum of two finite
-/// samples, and compensation retains small areas across cancellation.
-fn trapezoid_integral(
-    points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
-    card: &MeasureCard,
-) -> SpiceResult<Real> {
-    let mut previous = None;
-    let mut area = CompensatedSum::default();
-    for point in points {
-        let (x1, y1) = point?;
-        if let Some((x0, y0)) = previous {
-            area.add(Real::midpoint(y0, y1) * (x1 - x0));
-        }
-        previous = Some((x1, y1));
-    }
-    let area = area.total();
-    if !area.is_finite() {
-        return Err(nonfinite(
-            card,
-            "INTEG",
-            "the integrated value is not finite".to_owned(),
-        ));
-    }
-    Ok(area)
+/// Shared incremental panel reducer. Simpson uses four lookahead samples,
+/// with one overlapping endpoint, and the positive span from the actual
+/// stored coordinates. AVG uses the same midpoint/compensated trapezoids.
+struct Integral {
+    panel: [(Real, Real); 4],
+    count: usize,
+    area: CompensatedSum,
+    rms: ScaledSquares,
+    rms_maximum: Real,
+    statistic: MeasureStatistic,
 }
 
-/// C `measure_rms_integral`: greedy Simpson 3/8, then 1/3, then trapezoid.
-/// Four samples are sufficient to select a panel; retain an overlapping
-/// endpoint and refill only consumed slots. Only positive widths within
-/// 100 ULPs share a Simpson panel. Duplicate coordinates use trapezoids.
-fn simpson_panels(
-    points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
-    mut consume: impl FnMut(&[(Real, Real)], Real),
-) -> SpiceResult<()> {
-    let mut points = points.fuse();
-    let mut panel = [(0., 0.); 4];
-    let mut count = 0;
-    let equal = |a: Real, b: Real| a > 0. && b > 0. && a.to_bits().abs_diff(b.to_bits()) <= 100;
-    loop {
-        for slot in &mut panel[count..] {
-            let Some(point) = points.next() else {
-                break;
-            };
-            *slot = point?;
-            count += 1;
+impl Integral {
+    const fn new(statistic: MeasureStatistic) -> Self {
+        Self {
+            panel: [(0., 0.); 4],
+            count: 0,
+            area: CompensatedSum::with_initial(0.),
+            rms: ScaledSquares::new(),
+            rms_maximum: 0.,
+            statistic,
         }
-        if count < 2 {
-            break;
+    }
+    fn push(&mut self, point: (Real, Real)) {
+        self.panel[self.count] = point;
+        self.count += 1;
+        if (self.statistic == MeasureStatistic::Avg && self.count == 2) || self.count == 4 {
+            self.consume();
         }
-        let width = |index: usize| panel[index + 1].0 - panel[index].0;
+    }
+    fn consume(&mut self) {
+        let width = |i: usize| self.panel[i + 1].0 - self.panel[i].0;
+        let same = |a: Real, b: Real| a > 0. && b > 0. && a.to_bits().abs_diff(b.to_bits()) <= 100;
         let h = width(0);
-        let consumed = if count == 4 && equal(h, width(1)) && equal(h, width(2)) {
+        let consumed = if self.statistic == MeasureStatistic::Avg {
+            1
+        } else if self.count == 4 && same(h, width(1)) && same(h, width(2)) {
             3
-        } else if count >= 3 && equal(h, width(1)) {
+        } else if self.count >= 3 && same(h, width(1)) {
             2
         } else {
             1
         };
         if h > 0. {
-            consume(&panel[..=consumed], panel[consumed].0 - panel[0].0);
-        }
-        panel.copy_within(consumed..count, 0);
-        count -= consumed;
-    }
-    Ok(())
-}
-
-fn simpson_integral(
-    points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
-    card: &MeasureCard,
-) -> SpiceResult<Real> {
-    let mut area = CompensatedSum::default();
-    simpson_panels(points, |panel, width| {
-        let y = |index: usize| panel[index].1;
-        let mean = match panel.len() {
-            4 => 0.25_f64.mul_add(
-                Real::midpoint(y(0), y(3)),
-                0.75 * Real::midpoint(y(1), y(2)),
-            ),
-            3 => (1. / 3_f64).mul_add(Real::midpoint(y(0), y(2)), (2. / 3.) * y(1)),
-            _ => Real::midpoint(y(0), y(1)),
-        };
-        area.add(mean * width);
-    })?;
-    let area = area.total();
-    if !area.is_finite() {
-        return Err(nonfinite(
-            card,
-            "INTEG",
-            "the integrated value is not finite".into(),
-        ));
-    }
-    Ok(area)
-}
-
-/// A Euclidean norm of the square-root quadrature weights times the samples.
-/// Scale the sum of squares rather than squaring the raw ordinates. Compute
-/// the time ratio after taking square roots to retain very narrow panels.
-/// Panel weights are normalized by the covered span, including when nearly
-/// equal steps differ by a few ULPs.
-fn simpson_rms(
-    points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
-    width: Real,
-) -> SpiceResult<Real> {
-    // A second norm in power-of-two units preserves subnormal weighted
-    // contributions until after the reduction, including constant tiny traces.
-    const SMALL_SCALE: Real = Real::from_bits(1535_u64 << 52); // 2^512
-    let mut normal = ScaledSquares::default();
-    let mut small = ScaledSquares::default();
-    let denominator = width.sqrt();
-    let mut maximum = 0_f64;
-    simpson_panels(points, |panel, span| {
-        let weights: &[Real] = match panel.len() {
-            4 => &[1. / 8., 3. / 8., 3. / 8., 1. / 8.],
-            3 => &[1. / 6., 2. / 3., 1. / 6.],
-            _ => &[0.5, 0.5],
-        };
-        let root_h = span.sqrt();
-        let ratio = root_h / denominator;
-        for (&(_, value), &weight) in panel.iter().zip(weights) {
-            let magnitude = value.abs();
-            maximum = maximum.max(magnitude);
-            let root_weight = weight.sqrt();
-            let weighted = magnitude * (ratio * root_weight);
-            if weighted < Real::MIN_POSITIVE || ratio < Real::MIN_POSITIVE {
-                // Shift before multiplying to avoid rounding either the tiny
-                // time fraction or the tiny weighted value to zero.
-                let shifted = if ratio < Real::MIN_POSITIVE {
-                    (root_h / (denominator / SMALL_SCALE)) * root_weight
-                } else {
-                    (ratio * SMALL_SCALE) * root_weight
+            let span = self.panel[consumed].0 - self.panel[0].0;
+            if self.statistic == MeasureStatistic::Rms {
+                let weights: &[Real] = match consumed {
+                    3 => &[1. / 8., 3. / 8., 3. / 8., 1. / 8.],
+                    2 => &[1. / 6., 2. / 3., 1. / 6.],
+                    _ => &[0.5, 0.5],
                 };
-                let term = magnitude * shifted;
-                if weighted < Real::MIN_POSITIVE {
-                    small.add(term);
-                } else {
-                    normal.add(term / SMALL_SCALE);
-                }
+                let maximum = &mut self.rms_maximum;
+                self.rms.add_weighted(
+                    span,
+                    self.panel
+                        .iter()
+                        .zip(weights)
+                        .map(|(&(_, value), &weight)| {
+                            let magnitude = value.abs();
+                            *maximum = maximum.max(magnitude);
+                            (magnitude, weight)
+                        }),
+                );
             } else {
-                normal.add(weighted);
+                let y = |i: usize| self.panel[i].1;
+                let mean = match consumed {
+                    3 => 0.25_f64.mul_add(
+                        Real::midpoint(y(0), y(3)),
+                        0.75 * Real::midpoint(y(1), y(2)),
+                    ),
+                    2 => (1. / 3_f64).mul_add(Real::midpoint(y(0), y(2)), (2. / 3.) * y(1)),
+                    _ => Real::midpoint(y(0), y(1)),
+                };
+                self.area.add(mean * span);
             }
         }
-    })?;
-    let norm = normal.norm();
-    let tiny = small.norm();
-    // Combine in shifted units when the final result is subnormal or near
-    // the normal/subnormal boundary, so it is rounded only once.
-    let rms = if norm < Real::MIN_POSITIVE * SMALL_SCALE {
-        (norm * SMALL_SCALE).hypot(tiny) / SMALL_SCALE
-    } else {
-        norm
-    };
-    // The positive normalized quadrature cannot exceed the largest sample.
-    // Account for rounding in the square-root weights at this bound, including
-    // a constant MAX trace whose rounded norm would otherwise overflow.
-    Ok(rms.min(maximum))
+        self.panel.copy_within(consumed..self.count, 0);
+        self.count -= consumed;
+    }
+    fn finish(mut self, width: Real, card: &MeasureCard) -> SpiceResult<Real> {
+        while self.count >= 2 {
+            self.consume();
+        }
+        let area = self.area.total();
+        let result = match self.statistic {
+            // Positive normalized quadrature cannot exceed the largest sample.
+            // Rounding of the weights/norm can otherwise overflow a constant MAX trace.
+            MeasureStatistic::Rms => {
+                let norm = self.rms.root_mean(width);
+                if norm > self.rms_maximum {
+                    self.rms_maximum
+                } else {
+                    norm
+                }
+            }
+            MeasureStatistic::Avg => area / width,
+            _ => area,
+        };
+        if !result.is_finite() {
+            return Err(nonfinite(
+                card,
+                self.statistic.name(),
+                "the integrated value is not finite".into(),
+            ));
+        }
+        Ok(result)
+    }
+}
+
+fn integrate(
+    points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
+    statistic: MeasureStatistic,
+    width: Real,
+    card: &MeasureCard,
+) -> SpiceResult<Real> {
+    let mut integral = Integral::new(statistic);
+    for point in points {
+        integral.push(point?);
+    }
+    integral.finish(width, card)
 }
 
 /// C `measure_margin`: unwrap phase, interpolate dB/degrees and log frequency.
@@ -911,28 +941,62 @@ fn margin(
             "margin measurements require complex AC/SP data".into(),
         ));
     }
-    let mut previous: Option<(Real, Real, Real)> = None;
-    let mut raw_previous = 0.;
-    let mut offset = 0.;
-    for (i, point) in operand.plot.rows().enumerate() {
-        let value = operand.column.value(point)?;
+    let mut scan = MarginScan::new(phase_margin);
+    for (frequency, point) in axis.values.as_slice().iter().zip(operand.plot.rows()) {
+        scan.observe(*frequency, operand.column.value(point)?, window, card)?;
+        if scan.selected.is_some() {
+            break;
+        }
+    }
+    scan.finish(card)
+}
+
+struct MarginScan {
+    phase_margin: bool,
+    previous: Option<(Real, Real, Real)>,
+    raw_previous: Real,
+    offset: Real,
+    selected: Option<(Real, Real)>,
+}
+
+impl MarginScan {
+    const fn new(phase_margin: bool) -> Self {
+        Self {
+            phase_margin,
+            previous: None,
+            raw_previous: 0.,
+            offset: 0.,
+            selected: None,
+        }
+    }
+
+    #[expect(
+        clippy::float_cmp,
+        reason = "exact interpolation endpoints retain the original coordinate"
+    )]
+    fn observe(
+        &mut self,
+        frequency: Real,
+        value: Complex,
+        window: &Window,
+        card: &MeasureCard,
+    ) -> SpiceResult<()> {
         let db = 20. * value.re.hypot(value.im).log10();
         let raw = value.im.atan2(value.re).to_degrees();
-        if i > 0 {
-            if raw - raw_previous > 180. {
-                offset -= 360.;
-            } else if raw - raw_previous < -180. {
-                offset += 360.;
+        if self.previous.is_some() {
+            if raw - self.raw_previous > 180. {
+                self.offset -= 360.;
+            } else if raw - self.raw_previous < -180. {
+                self.offset += 360.;
             }
         }
-        raw_previous = raw;
-        let phase = raw + offset;
-        let frequency = axis.values.as_slice()[i];
+        self.raw_previous = raw;
+        let phase = raw + self.offset;
         if !db.is_finite() {
             return Err(nonfinite(card, "margin", "zero or nonfinite gain".into()));
         }
-        if let Some((f0, db0, p0)) = previous {
-            let (a, b, target) = if phase_margin {
+        if let Some((f0, db0, p0)) = self.previous {
+            let (a, b, target) = if self.phase_margin {
                 (db0, db, 0.)
             } else {
                 (p0, phase, -180.)
@@ -942,7 +1006,7 @@ fn margin(
                 let at = if f0 > 0. && frequency > 0. {
                     if fraction == 0. {
                         f0
-                    } else if super::ordered_samples::same_coordinate(fraction, 1.) {
+                    } else if fraction == 1. {
                         frequency
                     } else {
                         fraction.mul_add(frequency.ln() - f0.ln(), f0.ln()).exp()
@@ -951,29 +1015,29 @@ fn margin(
                     fraction.mul_add(frequency - f0, f0)
                 };
                 if at >= window.from && at <= window.to {
-                    let value = if phase_margin {
+                    let value = if self.phase_margin {
                         fraction.mul_add(phase - p0, 180. + p0)
                     } else {
                         -fraction.mul_add(db - db0, db0)
                     };
-                    return Ok((value, at));
+                    self.selected = Some((value, at));
+                    return Ok(());
                 }
             }
         }
-        previous = Some((frequency, db, phase));
+        self.previous = Some((frequency, db, phase));
+        Ok(())
     }
-    Err(unsupported(
-        card,
-        "no margin crossover in the measurement window".into(),
-    ))
+
+    fn finish(self, card: &MeasureCard) -> SpiceResult<(Real, Real)> {
+        self.selected.ok_or_else(|| {
+            unsupported(card, "no margin crossover in the measurement window".into())
+        })
+    }
 }
 
 /// Nonuniform quadratic derivative, C `measure_deriv_at`; two samples use a
 /// safe secant instead of the C implementation's out-of-range stencil.
-#[expect(
-    clippy::float_cmp,
-    reason = "exact coordinate identity selects discontinuities and zero-width stencil intervals; a tolerance would merge distinct samples"
-)]
 fn derivative_at(
     axis: &Axis,
     operand: &Operand<'_>,
@@ -987,35 +1051,51 @@ fn derivative_at(
         .ok_or_else(|| unsupported(card, "DERIV needs a bracketing interval".into()))?;
     let j = bracket.right();
     if exact {
-        // Check every duplicate at the exact point before choosing a stencil.
         value_at(axis, operand, at, card)?;
     }
-    let secant = || -> SpiceResult<Real> {
-        let width = bracket.x1 - bracket.x0;
+    let triple = if axis.values.len() > 2 {
+        let middle = (j - 1).clamp(1, axis.values.len() - 2);
+        Some(std::array::from_fn(|k| {
+            let i = middle - 1 + k;
+            (i, axis.values.as_slice()[i])
+        }))
+    } else {
+        None
+    };
+    derivative_value(
+        at,
+        [(j - 1, bracket.x0), (j, bracket.x1)],
+        triple,
+        |i| operand.value(i),
+        card,
+    )
+}
+
+fn derivative_value(
+    at: Real,
+    [(i0, x0), (i1, x1)]: [(usize, Real); 2],
+    triple: Option<[(usize, Real); 3]>,
+    sample: impl Fn(usize) -> SpiceResult<Real>,
+    card: &MeasureCard,
+) -> SpiceResult<Real> {
+    let value = if let Some(points) = triple
+        && !same_coordinate(points[0].1, points[1].1)
+        && !same_coordinate(points[1].1, points[2].1)
+    {
+        let [(i0, t0), (i1, t1), (i2, t2)] = points;
+        let y0 = sample(i0)?;
+        let y1 = sample(i1)?;
+        let y2 = sample(i2)?;
+        let first = (y1 - y0) / (t1 - t0);
+        let second = (y2 - y1) / (t2 - t1);
+        let curvature = (second - first) / (t2 - t0);
+        curvature.mul_add((at - t0) + (at - t1), first)
+    } else {
+        let width = x1 - x0;
         if width == 0. {
             return Err(unsupported(card, "DERIV at a repeated axis value".into()));
         }
-        Ok((operand.value(j)? - operand.value(j - 1)?) / width)
-    };
-    let value = if axis.values.len() == 2 {
-        secant()?
-    } else {
-        let middle = (j - 1).clamp(1, axis.values.len() - 2);
-        let t = &axis.values.as_slice()[middle - 1..=middle + 1];
-        if t[0] == t[1] || t[1] == t[2] {
-            secant()?
-        } else {
-            // Differentiate Newton's divided-difference polynomial.
-            // Subtract the ordinates first, so a large common DC offset
-            // cannot dominate the cancellation of three weighted values.
-            let y0 = operand.value(middle - 1)?;
-            let y1 = operand.value(middle)?;
-            let y2 = operand.value(middle + 1)?;
-            let first = (y1 - y0) / (t[1] - t[0]);
-            let second = (y2 - y1) / (t[2] - t[1]);
-            let curvature = (second - first) / (t[2] - t[0]);
-            curvature.mul_add((at - t[0]) + (at - t[1]), first)
-        }
+        (sample(i1)? - sample(i0)?) / width
     };
     if !value.is_finite() {
         return Err(nonfinite(card, "DERIV", "nonfinite derivative".into()));
@@ -1144,6 +1224,74 @@ fn crossing(
     )
 }
 
+struct CrossingSelector {
+    transition: MeasureTransition,
+    direction: Option<bool>,
+    remaining: u32,
+    selected: Option<Real>,
+}
+
+impl CrossingSelector {
+    fn new(transition: MeasureTransition, card: &MeasureCard) -> SpiceResult<Self> {
+        let (direction, ordinal) = match transition {
+            MeasureTransition::First | MeasureTransition::Last => (None, 1),
+            MeasureTransition::Cross(n) => (None, n),
+            MeasureTransition::Rise(n) => (Some(true), n),
+            MeasureTransition::Fall(n) => (Some(false), n),
+        };
+        if ordinal == 0 {
+            return Err(unsupported(card, "crossing count must be positive".into()));
+        }
+        Ok(Self {
+            transition,
+            direction,
+            remaining: ordinal,
+            selected: None,
+        })
+    }
+
+    fn include(
+        &mut self,
+        (x0, before): (Real, Real),
+        (x1, after): (Real, Real),
+        value: Real,
+        window: &Window,
+        card: &MeasureCard,
+    ) -> SpiceResult<()> {
+        let before_high = before >= value;
+        let after_high = after >= value;
+        if before_high == after_high {
+            return Ok(());
+        }
+        let x = if super::ordered_samples::same_coordinate(x0, x1) {
+            x1
+        } else {
+            interpolate_axis(x0, before, x1, after, value)
+        };
+        if !x.is_finite() {
+            return Err(nonfinite(
+                card,
+                "WHEN/TRIG/TARG",
+                "nonfinite crossing position".into(),
+            ));
+        }
+        if x >= window.from
+            && x <= window.to
+            && self.direction.is_none_or(|rising| rising == after_high)
+        {
+            if self.transition == MeasureTransition::Last {
+                self.selected = Some(x);
+            } else if self.remaining != 0 {
+                self.remaining -= 1;
+                if self.remaining == 0 {
+                    self.selected = Some(x);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn crossing_samples(
     axis: &Axis,
     sample: impl Fn(usize) -> SpiceResult<Real>,
@@ -1159,59 +1307,25 @@ fn crossing_samples(
             "crossing threshold must be finite".into(),
         ));
     }
-    let (direction, ordinal) = match transition {
-        MeasureTransition::First | MeasureTransition::Last => (None, 1),
-        MeasureTransition::Cross(n) => (None, n),
-        MeasureTransition::Rise(n) => (Some(true), n),
-        MeasureTransition::Fall(n) => (Some(false), n),
-    };
-    if ordinal == 0 {
-        return Err(unsupported(card, "crossing count must be positive".into()));
-    }
+    let mut selector = CrossingSelector::new(transition, card)?;
     let mut segments = window.samples(axis, card)?.event_segments().peekable();
-    let mut selected = None;
-    let mut remaining = ordinal;
     if let Some(first) = segments.peek() {
         let mut before = sample(first.left)?;
         for segment in segments {
             let after = sample(segment.right())?;
-            let before_high = before >= value;
-            let after_high = after >= value;
-            let y0 = before;
+            selector.include(
+                (segment.x0, before),
+                (segment.x1, after),
+                value,
+                window,
+                card,
+            )?;
             before = after;
-            if before_high == after_high {
-                continue;
-            }
-            let x = if segment.is_jump() {
-                segment.x1
-            } else {
-                interpolate_axis(segment.x0, y0, segment.x1, after, value)
-            };
-            if !x.is_finite() {
-                return Err(nonfinite(
-                    card,
-                    "WHEN/TRIG/TARG",
-                    "nonfinite crossing position".into(),
-                ));
-            }
-            if x >= window.from
-                && x <= window.to
-                && direction.is_none_or(|rising| rising == after_high)
-            {
-                if transition == MeasureTransition::Last {
-                    selected = Some(x);
-                } else if remaining != 0 {
-                    remaining -= 1;
-                    if remaining == 0 {
-                        selected = Some(x);
-                    }
-                }
-            }
         }
     }
     // Keep scanning after selecting a crossing: a later invalid sample still
     // invalidates the entire requested scan, just as the old collected list did.
-    selected.ok_or_else(|| {
+    selector.selected.ok_or_else(|| {
         unsupported(
             card,
             format!(
@@ -1228,13 +1342,13 @@ fn crossing_samples(
 }
 
 /// The unit of a statistic's result.
-fn statistic_unit(statistic: MeasureStatistic, operand: &Operand<'_>, axis: &Axis) -> String {
+fn statistic_unit(statistic: MeasureStatistic, unit: &str, axis: &str) -> String {
     match statistic {
         MeasureStatistic::PhaseMargin => "degrees".into(),
         MeasureStatistic::GainMargin => "db".into(),
-        MeasureStatistic::MinAt | MeasureStatistic::MaxAt => axis.name.to_owned(),
-        MeasureStatistic::Integ => format!("{}*{}", operand.unit(), axis.name),
-        _ => operand.unit().to_owned(),
+        MeasureStatistic::MinAt | MeasureStatistic::MaxAt => axis.to_owned(),
+        MeasureStatistic::Integ => format!("{unit}*{axis}"),
+        _ => unit.to_owned(),
     }
 }
 
@@ -1245,7 +1359,21 @@ fn statistic_unit(statistic: MeasureStatistic, operand: &Operand<'_>, axis: &Axi
 /// the threshold) and a positive bracket width, so there is never a division by
 /// a zero span.
 fn interpolate_axis(x0: Real, y0: Real, x1: Real, y1: Real, y: Real) -> Real {
-    x0 + (x1 - x0) * (y - y0) / (y1 - y0)
+    if same_coordinate(y, y0) {
+        return x0;
+    }
+    if same_coordinate(y, y1) {
+        return x1;
+    }
+    let interpolate = super::ordered_samples::interpolate;
+    // Invert the same conditioned interpolation used by point queries.
+    // A falling crossing reverses the ordinate order, not the time order.
+    let x = if y0 < y1 {
+        interpolate(y0, x0, y1, x1, y)
+    } else {
+        interpolate(y1, x1, y0, x0, y)
+    };
+    x.clamp(x0, x1)
 }
 
 #[cfg(test)]
@@ -1381,7 +1509,7 @@ mod tests {
         let card = card("m", request(MeasureStatistic::Avg, None, None));
         let values = [(0.0, Real::MAX), (0.5, Real::MAX)];
         assert_eq!(
-            super::trapezoid_integral(values.into_iter().map(Ok), &card).unwrap(),
+            super::integrate(values.into_iter().map(Ok), MeasureStatistic::Avg, 1., &card).unwrap(),
             Real::MAX / 2.
         );
     }
@@ -1415,10 +1543,18 @@ mod tests {
                 expected += h(i) * (y(i) + y(i + 1)) / 2.;
             }
             let got = if square {
-                let rms = super::simpson_rms(points.into_iter().map(Ok), 8.).unwrap();
+                let rms =
+                    super::integrate(points.into_iter().map(Ok), MeasureStatistic::Rms, 8., &card)
+                        .unwrap();
                 rms * rms * 8.
             } else {
-                super::simpson_integral(points.into_iter().map(Ok), &card).unwrap()
+                super::integrate(
+                    points.into_iter().map(Ok),
+                    MeasureStatistic::Integ,
+                    1.,
+                    &card,
+                )
+                .unwrap()
             };
             assert!((got - expected).abs() <= 8. * Real::EPSILON * expected.abs());
         }
@@ -1436,18 +1572,24 @@ mod tests {
             (3., -1e16),
         ];
         assert_eq!(
-            super::trapezoid_integral(points.into_iter().map(Ok), &card).unwrap(),
+            super::integrate(points.into_iter().map(Ok), MeasureStatistic::Avg, 1., &card).unwrap(),
             1.
         );
         assert_eq!(
-            super::simpson_integral(points.into_iter().map(Ok), &card).unwrap(),
+            super::integrate(
+                points.into_iter().map(Ok),
+                MeasureStatistic::Integ,
+                1.,
+                &card
+            )
+            .unwrap(),
             1.
         );
         let cubic = (0..=3).map(|i| {
             let t = Real::from(i);
             Ok((t, t.powi(3)))
         });
-        let result = super::simpson_integral(cubic, &card).unwrap();
+        let result = super::integrate(cubic, MeasureStatistic::Integ, 1., &card).unwrap();
         assert!((result - 81. / 4.).abs() <= 4. * Real::EPSILON * 81. / 4.);
     }
 
@@ -2009,7 +2151,14 @@ mod tests {
         // The time fraction itself underflows. Its square root and the
         // weighted amplitude remain representable.
         let points = [(0., 1e308), (tiny, 1e308), (tiny, 0.), (1e308, 0.)];
-        let actual = super::simpson_rms(points.into_iter().map(Ok), 1e308).unwrap();
+        let card = card("m", request(MeasureStatistic::Rms, None, None));
+        let actual = super::integrate(
+            points.into_iter().map(Ok),
+            MeasureStatistic::Rms,
+            1e308,
+            &card,
+        )
+        .unwrap();
         let expected = tiny.sqrt() * 1e154;
         assert!((actual - expected).abs() <= 8. * Real::EPSILON * expected);
     }

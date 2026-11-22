@@ -1,7 +1,8 @@
 //! Opt-in live C validation of the companion trap/Gear driver (#26).
 //! `NGSPICE_BIN` must name the external reference binary.
 //!
-//! Rust (ordinary `.tran`, companion backend) and C run the *same* deck text.
+//! Rust (ordinary `.tran`, companion backend) runs the original input; C uses
+//! the selected reference input for committed fixtures.
 //! Their internal timesteps are never compared: both waveforms are evaluated at
 //! common physical times (a regular grid plus every source breakpoint), each by
 //! linear interpolation inside its own plot, which never spans a breakpoint
@@ -12,6 +13,7 @@
 //! `xtask::compare::TRAN`): two correct trap/Gear solutions of one circuit can
 //! legitimately differ by about the accuracy ngspice itself targets. The decks
 //! use `tmax = tau/100` so linear resampling adds far less than that.
+use ngspice_conformance::fixtures::DeckInputs;
 use ngspice_conformance::ngspice::Scratch;
 use ngspice_conformance::process::{ProcessLimits, run};
 use ngspice_rs::analysis::{AnalysisContext, Plot, RawFile, RunConfig};
@@ -72,9 +74,16 @@ fn run_rust(deck: &str) -> Plot {
 }
 
 /// Compares `vectors` on `0, grid, 2 grid, ... , stop` plus `breakpoints`.
-fn compare(tag: &str, deck: &str, grid: f64, stop: f64, breakpoints: &[f64], vectors: &[&str]) {
-    let rust = run_rust(deck);
-    let c = run_c(tag, deck);
+fn compare(
+    tag: &str,
+    inputs: &DeckInputs<'_>,
+    grid: f64,
+    stop: f64,
+    breakpoints: &[f64],
+    vectors: &[&str],
+) {
+    let rust = run_rust(inputs.rust());
+    let c = run_c(tag, inputs.reference());
     let times = rust.column("time").unwrap();
     for b in breakpoints {
         for (label, plot) in [("Rust", &rust), ("C", &c)] {
@@ -115,7 +124,9 @@ fn compare(tag: &str, deck: &str, grid: f64, stop: f64, breakpoints: &[f64], vec
 fn pulse_rc_trap_matches_c() {
     compare(
         "rc-trap",
-        "t\nv1 in 0 pulse(0 1 1m 10u 10u 2m 4m)\nr1 in out 1k\nc1 out 0 0.1u\n.tran 10u 8m 0 1u\n.end\n",
+        &DeckInputs::same(
+            "t\nv1 in 0 pulse(0 1 1m 10u 10u 2m 4m)\nr1 in out 1k\nc1 out 0 0.1u\n.tran 10u 8m 0 1u\n.end\n",
+        ),
         1e-5,
         8e-3,
         &[1e-3, 1.01e-3, 3.01e-3, 3.02e-3, 5e-3],
@@ -128,7 +139,9 @@ fn pulse_rc_trap_matches_c() {
 fn pulse_rc_gear_matches_c() {
     compare(
         "rc-gear",
-        "t\nv1 in 0 pulse(0 1 1m 10u 10u 2m 4m)\nr1 in out 1k\nc1 out 0 0.1u\n.options method=gear\n.tran 10u 8m 0 1u\n.end\n",
+        &DeckInputs::same(
+            "t\nv1 in 0 pulse(0 1 1m 10u 10u 2m 4m)\nr1 in out 1k\nc1 out 0 0.1u\n.options method=gear\n.tran 10u 8m 0 1u\n.end\n",
+        ),
         1e-5,
         8e-3,
         &[1e-3, 1.01e-3, 3.01e-3, 3.02e-3, 5e-3],
@@ -141,7 +154,9 @@ fn pulse_rc_gear_matches_c() {
 fn pwl_rc_trap_matches_c() {
     compare(
         "pwl",
-        "t\nv1 in 0 pwl(0 0 1m 0 1.01m 1 3m 1 3.01m 0.25 8m 0.25)\nr1 in out 1k\nc1 out 0 0.1u\n.tran 10u 8m 0 1u\n.end\n",
+        &DeckInputs::same(
+            "t\nv1 in 0 pwl(0 0 1m 0 1.01m 1 3m 1 3.01m 0.25 8m 0.25)\nr1 in out 1k\nc1 out 0 0.1u\n.tran 10u 8m 0 1u\n.end\n",
+        ),
         1e-5,
         8e-3,
         &[1e-3, 1.01e-3, 3e-3, 3.01e-3],
@@ -155,9 +170,9 @@ fn pulse_series_rlc_matches_c_for_both_methods() {
     for (tag, option) in [("rlc-trap", ""), ("rlc-gear", ".options method=gear\n")] {
         compare(
             tag,
-            &format!(
+            &DeckInputs::same(&format!(
                 "t\nv1 in 0 pulse(0 1 100u 5u 5u 400u 1m)\nr1 in a 10\nl1 a out 1m\nc1 out 0 1u\n{option}.tran 2u 1.5m 0 0.5u\n.end\n"
-            ),
+            )),
             2e-6,
             1.5e-3,
             &[100e-6, 105e-6, 505e-6, 510e-6, 1.1e-3],
@@ -175,9 +190,9 @@ fn pulse_series_rlc_with_high_maxord_matches_c() {
         for order in 3..=6 {
             compare(
                 &format!("rlc-{tag}-maxord{order}"),
-                &format!(
+                &DeckInputs::same(&format!(
                     "t\nv1 in 0 pulse(0 1 100u 5u 5u 400u 1m)\nr1 in a 10\nl1 a out 1m\nc1 out 0 1u\n.options method={method} maxord={order}\n.tran 2u 1.5m 0 0.5u\n.end\n"
-                ),
+                )),
                 2e-6,
                 1.5e-3,
                 &[100e-6, 105e-6, 505e-6, 510e-6, 1.1e-3],
@@ -190,13 +205,10 @@ fn pulse_series_rlc_with_high_maxord_matches_c() {
 #[test]
 #[ignore = "requires NGSPICE_BIN; the maxord=6 conformance deck against live C"]
 fn conformance_rlc_gear_maxord6_matches_c() {
-    let path = ngspice_conformance::fixtures::workspace_root()
-        .unwrap()
-        .join("conformance/netlists/rlc_series_gear_maxord6_tran.cir");
-    let deck = fs::read_to_string(path).unwrap();
+    let inputs = DeckInputs::fixture("rlc_series_gear_maxord6_tran").unwrap();
     compare(
         "rlc_series_gear_maxord6_tran",
-        &deck,
+        &inputs,
         1e-6,
         1e-3,
         &[50e-6, 70e-6, 470e-6, 490e-6],
@@ -207,13 +219,10 @@ fn conformance_rlc_gear_maxord6_matches_c() {
 #[test]
 #[ignore = "requires NGSPICE_BIN; the committed conformance deck against live C"]
 fn conformance_rc_transient_matches_c() {
-    let path = ngspice_conformance::fixtures::workspace_root()
-        .unwrap()
-        .join("conformance/netlists/rc_transient.cir");
-    let deck = fs::read_to_string(path).unwrap();
+    let inputs = DeckInputs::fixture("rc_transient").unwrap();
     compare(
         "rc_transient",
-        &deck,
+        &inputs,
         5e-7,
         5e-6,
         &[1e-9],

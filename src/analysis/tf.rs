@@ -339,7 +339,7 @@ pub(super) fn run(
     // `.ic` applies only to a transient operating point, `.nodeset` here too).
     let n = circuit.unknown_count();
     crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?.solve(
-        circuit,
+        &circuit.prepare_run(),
         &context.model_context(),
         settings,
     )?;

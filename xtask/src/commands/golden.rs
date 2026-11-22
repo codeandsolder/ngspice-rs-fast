@@ -162,7 +162,8 @@ fn capture(root: &Path, options: &Options) -> Result<(), String> {
         if options.verbose {
             println!("capturing {}", netlist.display());
         }
-        let captured = capture_fixture(&binary, netlist, &scratch)?;
+        let reference = fixtures::reference_netlist_path(root, netlist)?;
+        let captured = capture_fixture(&binary, &reference, &scratch)?;
         let target = golden_path(root, netlist)?;
         let name = fixtures::fixture_id(netlist)?;
 
@@ -220,7 +221,8 @@ fn check(root: &Path, options: &Options) -> Result<(), String> {
     let mut drifted = Vec::new();
 
     for netlist in &netlists {
-        let captured = capture_fixture(&binary, netlist, &scratch)?;
+        let reference = fixtures::reference_netlist_path(root, netlist)?;
+        let captured = capture_fixture(&binary, &reference, &scratch)?;
         let target = golden_path(root, netlist)?;
         let name = fixtures::fixture_id(netlist)?;
 

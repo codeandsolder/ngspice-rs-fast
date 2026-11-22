@@ -1,6 +1,7 @@
 //! Compensated reductions for cancellation-sensitive analysis quantities.
 
 use crate::primitives::Real;
+use crate::primitives::numeric::binary_exponent;
 
 /// Neumaier accumulation: retain the rounding error of each addition even
 /// when the new term exceeds the running total in magnitude.
@@ -65,39 +66,125 @@ impl CompensatedSum {
     }
 }
 
-/// One-pass norm with a running magnitude scale, so neither large nor tiny
-/// terms need to be squared in the original units.
-#[derive(Default)]
+/// Weighted square-sum in binary exponent units. Neither a squared
+/// ordinate nor its product with a physical span has to fit in binary64.
+/// Normalize only at the end, when the actual covered window is known.
 pub(super) struct ScaledSquares {
-    scale: Real,
+    exponent: Option<i32>,
     squares: CompensatedSum,
 }
 
+fn power_of_two(exponent: i32) -> Real {
+    match exponent {
+        ..=-1075 => 0.,
+        -1074..=-1023 => Real::from_bits(1_u64 << (exponent + 1074).cast_unsigned()),
+        -1022..=1023 => Real::from_bits(u64::from((exponent + 1023).cast_unsigned()) << 52),
+        1024.. => Real::INFINITY,
+    }
+}
+
+fn split(value: Real) -> Option<(Real, i32)> {
+    let exponent = binary_exponent(value)?;
+    Some((value / power_of_two(exponent), exponent))
+}
+
 impl ScaledSquares {
-    pub(super) fn add(&mut self, magnitude: Real) {
-        if magnitude == 0. {
-            return;
-        }
-        if magnitude > self.scale {
-            let ratio = self.scale / magnitude;
-            let previous = self.squares.total() * ratio * ratio;
-            self.scale = magnitude;
-            self.squares = CompensatedSum::with_initial(previous);
-            self.squares.add(1.);
-        } else {
-            let ratio = magnitude / self.scale;
-            self.squares.add(ratio * ratio);
+    pub(super) const fn new() -> Self {
+        Self {
+            exponent: None,
+            squares: CompensatedSum::with_initial(0.),
         }
     }
 
-    pub(super) fn norm(&self) -> Real {
-        self.scale * self.squares.total().sqrt()
+    /// Add a group of squared ordinates with a common positive scale and
+    /// individual nonnegative weights. Inputs are finite; split the three
+    /// factors before multiplying, including subnormal scales.
+    pub(super) fn add_weighted(
+        &mut self,
+        scale: Real,
+        samples: impl Iterator<Item = (Real, Real)>,
+    ) {
+        let Some((sm, se)) = split(scale) else {
+            return;
+        };
+        for (value, weight) in samples {
+            let (Some((m, me)), Some((w, we))) = (split(value.abs()), split(weight)) else {
+                continue;
+            };
+            let term = m * m * sm * w;
+            let exponent = 2 * me + se + we;
+            let scale = match self.exponent {
+                Some(old) if exponent > old => {
+                    // The old accumulator may have collected many terms.
+                    // Split its total as well before rescaling.
+                    let total = self.squares.total();
+                    let rescaled =
+                        split(total).map_or(0., |(m, e)| m * power_of_two(e + old - exponent));
+                    self.squares = CompensatedSum::with_initial(rescaled);
+                    self.exponent = Some(exponent);
+                    exponent
+                }
+                Some(old) => old,
+                None => {
+                    self.exponent = Some(exponent);
+                    exponent
+                }
+            };
+            self.squares.add(term * power_of_two(exponent - scale));
+        }
+    }
+
+    /// Square root of the normalized positive sum. Split the remaining
+    /// exponent by two before taking the root, so a small weighted term
+    /// is not rounded to zero before normalization.
+    pub(super) fn root_mean(self, divisor: Real) -> Real {
+        let Some(exponent) = self.exponent else {
+            return 0.;
+        };
+        let Some((d, de)) = split(divisor) else {
+            return Real::NAN;
+        };
+        let exponent = exponent - de;
+        let odd = if exponent.rem_euclid(2) == 0 { 1. } else { 2. };
+        let root = (self.squares.total() / d * odd).sqrt();
+        let Some((m, e)) = split(root) else {
+            return root;
+        };
+        let exponent = exponent.div_euclid(2) + e;
+        if exponent < -1022 {
+            (m * power_of_two(exponent + 1022)) * Real::MIN_POSITIVE
+        } else {
+            m * power_of_two(exponent)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::CompensatedSum;
+
+    #[test]
+    fn scaled_weighted_constant_panels_cover_every_binary64_exponent() {
+        use super::{ScaledSquares, power_of_two};
+        for ye in -1074..=1023 {
+            let value = power_of_two(ye);
+            for se in [-1074, -536, 0, 536, 1023] {
+                let span = power_of_two(se);
+                let mut norm = ScaledSquares::new();
+                norm.add_weighted(
+                    span,
+                    [0.125, 0.375, 0.375, 0.125]
+                        .into_iter()
+                        .map(|weight| (value, weight)),
+                );
+                assert_eq!(norm.root_mean(span).to_bits(), value.to_bits());
+            }
+        }
+        let mut norm = ScaledSquares::new();
+        norm.add_weighted(1e-100, [(1e-300, 1.)].into_iter());
+        norm.add_weighted(1e100, [(1e300, 1.)].into_iter());
+        assert!((norm.root_mean(1e100) - 1e300).abs() <= 4. * f64::EPSILON * 1e300);
+    }
 
     #[test]
     fn retains_small_terms_on_both_sides_of_large_cancellation() {
