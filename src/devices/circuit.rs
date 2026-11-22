@@ -233,6 +233,114 @@ impl std::ops::Deref for PreparedMutualTerms {
     }
 }
 
+/// Analysis-owned effective device preparation. The circuit is borrowed
+/// immutably for the run, so no topology edit can invalidate a live view.
+/// Only the most recent exact context is retained; neither trial history nor
+/// solver workspaces are owned by this object.
+pub struct PreparedRun<'a> {
+    circuit: &'a Circuit,
+    point: std::cell::RefCell<Option<PreparedPoint>>,
+}
+
+pub(super) struct PreparedPoint {
+    context: ModelContext,
+    replacements: Vec<(usize, Box<dyn Device>)>,
+    mutual: std::cell::OnceCell<PreparedMutualTerms>,
+}
+
+impl PreparedPoint {
+    pub(super) fn device<'a>(&'a self, circuit: &'a Circuit, ordinal: usize) -> &'a dyn Device {
+        match self
+            .replacements
+            .binary_search_by_key(&ordinal, |(index, _)| *index)
+        {
+            Ok(index) => self.replacements[index].1.as_ref(),
+            Err(_) => circuit.devices[ordinal].as_ref(),
+        }
+    }
+
+    pub(super) fn mutual(&self, circuit: &Circuit) -> SpiceResult<PreparedMutualTerms> {
+        if let Some(terms) = self.mutual.get() {
+            return Ok(terms.clone());
+        }
+        let terms = circuit.mutual_terms_with_replacements(&self.context, &self.replacements)?;
+        Ok(self.mutual.get_or_init(|| terms).clone())
+    }
+}
+
+impl<'a> PreparedRun<'a> {
+    /// The finalized circuit borrowed by this analysis.
+    #[must_use]
+    pub const fn circuit(&self) -> &'a Circuit {
+        self.circuit
+    }
+
+    pub(super) fn point(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<std::cell::Ref<'_, PreparedPoint>> {
+        let current = self.point.borrow();
+        if !current
+            .as_ref()
+            .is_some_and(|point| point.context.same_preparation(context))
+        {
+            drop(current);
+            // Validate once on a context transition. Do not discard a valid
+            // preparation on error (including a foreign override).
+            context.validate(&MODEL_CONTEXT_LOCATION)?;
+            let replacements = self.circuit.replacements(context)?;
+            self.point.replace(Some(PreparedPoint {
+                context: *context,
+                replacements,
+                mutual: std::cell::OnceCell::new(),
+            }));
+        } else {
+            drop(current);
+        }
+        std::cell::Ref::filter_map(self.point.borrow(), Option::as_ref)
+            .map_err(|_| SpiceError::circuit("missing prepared model context"))
+    }
+
+    /// Load a disposable trial using this run's prepared effective devices.
+    /// # Errors
+    /// As [`Circuit::load`]; a changed context is revalidated before use.
+    pub fn load(
+        &self,
+        request: &LoadRequest<'_>,
+        matrix: &mut SparseMatrix,
+        rhs: &mut Vector,
+        trial: &mut TrialState,
+    ) -> SpiceResult<()> {
+        self.circuit
+            .load_prepared(self, request, matrix, rhs, trial)
+    }
+
+    /// Check convergence using the same effective devices as the load.
+    /// # Errors
+    /// As [`Circuit::convergence_test`].
+    pub fn convergence_test(&self, request: &ConvergenceRequest<'_>) -> SpiceResult<bool> {
+        self.circuit.convergence_prepared(self, request)
+    }
+
+    /// Assemble the small-signal system with this run's effective devices.
+    /// # Errors
+    /// As [`Circuit::small_signal_system_at`].
+    pub fn small_signal_system_at(
+        &self,
+        context: &ModelContext,
+        bias: &Vector,
+        state: Option<&StateSnapshot>,
+    ) -> SpiceResult<crate::devices::linear::LinearSystem> {
+        self.circuit
+            .bias_linearized_system(self, context, bias, state, 0, None)
+    }
+}
+
+static MODEL_CONTEXT_LOCATION: std::sync::LazyLock<crate::primitives::SourceLoc> =
+    std::sync::LazyLock::new(|| {
+        crate::primitives::SourceLoc::new(std::path::PathBuf::from("<model-context>"), 1, 1)
+    });
+
 /// A K card resolved without expanding its complete graph.
 struct ResolvedCard {
     coupling: usize,
@@ -537,6 +645,17 @@ impl Circuit {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Start an analysis-owned preparation scope. It lazily validates the
+    /// first context, then reuses its effective devices until that context
+    /// changes. Separate scopes cannot share disposable trial state.
+    #[must_use]
+    pub const fn prepare_run(&self) -> PreparedRun<'_> {
+        PreparedRun {
+            circuit: self,
+            point: std::cell::RefCell::new(None),
+        }
     }
 
     /// Construct an empty circuit with explicit mutual-inductor budgets.
@@ -925,10 +1044,10 @@ impl Circuit {
             return Ok(PreparedMutualTerms::default());
         }
         let device_at = |index: usize| -> &dyn Device {
-            replacements
-                .iter()
-                .find(|(i, _)| *i == index)
-                .map_or_else(|| self.devices[index].as_ref(), |(_, d)| d.as_ref())
+            match replacements.binary_search_by_key(&index, |(ordinal, _)| *ordinal) {
+                Ok(found) => replacements[found].1.as_ref(),
+                Err(_) => self.devices[index].as_ref(),
+            }
         };
         let mut values = BTreeMap::new();
         for &index in self.bindings.mutual.degrees.keys() {
@@ -1351,6 +1470,14 @@ impl Circuit {
     /// # Errors
     /// Mismatched numbering or a device evaluation failure.
     pub fn convergence_test(&self, request: &ConvergenceRequest<'_>) -> SpiceResult<bool> {
+        self.prepare_run().convergence_test(request)
+    }
+
+    fn convergence_prepared(
+        &self,
+        run: &PreparedRun<'_>,
+        request: &ConvergenceRequest<'_>,
+    ) -> SpiceResult<bool> {
         self.validate_history(request.history)?;
         request.history.check_trial(request.trial)?;
         let n = self.unknown_count();
@@ -1362,6 +1489,7 @@ impl Circuit {
                 "convergence test does not match the circuit numbering",
             ));
         }
+        let point = run.point(request.model_context)?;
         for index in self.load_order() {
             let context = crate::devices::traits::ConvergenceContext {
                 unknowns: &self.bindings.unknowns,
@@ -1376,7 +1504,7 @@ impl Circuit {
                 abstol: request.abstol,
                 vntol: request.vntol,
             };
-            if self.devices[index].convergence_test(&context)? {
+            if point.device(self, index).convergence_test(&context)? {
                 return Ok(true);
             }
         }
@@ -1798,11 +1926,7 @@ impl Circuit {
             .devices
             .get(target.device())
             .ok_or_else(|| SpiceError::circuit("stale resistor override"))?;
-        context.validate(&crate::primitives::SourceLoc::new(
-            std::path::PathBuf::from("<model-context>"),
-            1,
-            1,
-        ))?;
+        context.validate(&MODEL_CONTEXT_LOCATION)?;
         device.resistor_effective(target.supplied(), context)
     }
 
@@ -2042,10 +2166,7 @@ impl Circuit {
     /// are untouched; callers stamp the replacement instead of the original for
     /// that ordinal. Several instance overrides of one device are applied in
     /// slot order to the same replacement.
-    pub(crate) fn replacements(
-        &self,
-        context: &ModelContext,
-    ) -> SpiceResult<Vec<(usize, Box<dyn Device>)>> {
+    fn replacements(&self, context: &ModelContext) -> SpiceResult<Vec<(usize, Box<dyn Device>)>> {
         let topology = self.topology_id()?;
         let mut replacements: Vec<(usize, Box<dyn Device>)> = Vec::new();
         for target in context.resistor_overrides.iter().flatten() {
@@ -2071,7 +2192,22 @@ impl Circuit {
             ));
         }
         let resistors = replacements.len();
-        for target in context.instance_overrides.iter().flatten() {
+        for (slot, target) in context
+            .instance_overrides
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, target)| target.as_ref().map(|target| (slot, target)))
+        {
+            if context.instance_overrides[..slot]
+                .iter()
+                .flatten()
+                .any(|previous| {
+                    previous.device() == target.device()
+                        && previous.parameter() == target.parameter()
+                })
+            {
+                return Err(SpiceError::circuit("duplicate instance parameter override"));
+            }
             if target.topology() != topology {
                 return Err(SpiceError::circuit("foreign or stale instance override"));
             }
@@ -2132,6 +2268,7 @@ impl Circuit {
                 )));
             }
         }
+        replacements.sort_unstable_by_key(|(index, _)| *index);
         Ok(replacements)
     }
 
@@ -2170,6 +2307,17 @@ impl Circuit {
         rhs: &mut Vector,
         trial: &mut TrialState,
     ) -> SpiceResult<()> {
+        self.prepare_run().load(request, matrix, rhs, trial)
+    }
+
+    fn load_prepared(
+        &self,
+        run: &PreparedRun<'_>,
+        request: &LoadRequest<'_>,
+        matrix: &mut SparseMatrix,
+        rhs: &mut Vector,
+        trial: &mut TrialState,
+    ) -> SpiceResult<()> {
         self.validate_history(request.history)?;
         request.history.check_trial(trial)?;
         self.check_matrix_pattern(matrix)?;
@@ -2186,17 +2334,10 @@ impl Circuit {
                 "load dimensions do not match the circuit numbering",
             ));
         }
-        request
-            .model_context
-            .validate(&crate::primitives::SourceLoc::new(
-                std::path::PathBuf::from("<model-context>"),
-                1,
-                1,
-            ))?;
+        let point = run.point(request.model_context)?;
         matrix.set_pivot_tolerances(request.model_context.pivot);
         matrix.set_unknown_names(Some(self.unknown_names()));
-        let replacements = self.replacements(request.model_context)?;
-        let mutual = self.mutual_terms_with_replacements(request.model_context, &replacements)?;
+        let mutual = point.mutual(self)?;
         let mut voltage_source_value = 0.;
         let unlent = matrix.lend_fixed(self.runtime.fixed_stamps.take(), self.devices.len())?;
         let stamped = self.stamp_devices(
@@ -2204,7 +2345,7 @@ impl Circuit {
             matrix,
             rhs,
             trial,
-            &replacements,
+            &point,
             &mutual,
             &mut voltage_source_value,
         );
@@ -2228,15 +2369,12 @@ impl Circuit {
         matrix: &mut SparseMatrix,
         rhs: &mut Vector,
         trial: &mut TrialState,
-        replacements: &[(usize, Box<dyn Device>)],
+        point: &PreparedPoint,
         mutual: &[Vec<MutualTerm>],
         voltage_source_value: &mut Real,
     ) -> SpiceResult<()> {
         for (position, index) in self.load_order().enumerate() {
-            let device: &dyn Device = match replacements.iter().find(|(i, _)| *i == index) {
-                Some((_, replacement)) => &**replacement,
-                None => &*self.devices[index],
-            };
+            let device = point.device(self, index);
             let states = request.history.device_of(trial, index)?;
             matrix.begin_device(position)?;
             device.stamp(&mut StampContext {
@@ -2659,22 +2797,16 @@ impl Circuit {
         &mut self,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<crate::devices::linear::LinearSystem> {
-        context.validate(&crate::primitives::SourceLoc::new(
-            std::path::PathBuf::from("<model-context>"),
-            1,
-            1,
-        ))?;
+        context.validate(&MODEL_CONTEXT_LOCATION)?;
         self.finalize()?;
-        let replacements = self.replacements(context)?;
-        let mutual = self.mutual_terms_with_replacements(context, &replacements)?;
+        let run = self.prepare_run();
+        let point = run.point(context)?;
+        let mutual = point.mutual(self)?;
         let mut system = crate::devices::linear::LinearSystem::new(self.unknown_count());
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
         for index in self.load_order() {
-            let device: &dyn Device = match replacements.iter().find(|(i, _)| *i == index) {
-                Some((_, replacement)) => &**replacement,
-                None => &*self.devices[index],
-            };
+            let device = point.device(self, index);
             let range = &self.bindings.branch_rows[index];
             device.assemble_linear(&mut crate::devices::linear::LinearContext {
                 model_context: context,
@@ -2718,7 +2850,8 @@ impl Circuit {
         bias: &Vector,
         state: Option<&StateSnapshot>,
     ) -> SpiceResult<crate::devices::linear::LinearSystem> {
-        self.bias_linearized_system(context, bias, state, 0, None)
+        self.prepare_run()
+            .small_signal_system_at(context, bias, state)
     }
 
     /// The pole-zero pencil `A + s E` at a solved bias point: every device's
@@ -2735,7 +2868,7 @@ impl Circuit {
         bias: &Vector,
         state: Option<&StateSnapshot>,
     ) -> SpiceResult<crate::devices::linear::LinearSystem> {
-        self.bias_linearized_system(context, bias, state, 1, None)
+        self.bias_linearized_system(&self.prepare_run(), context, bias, state, 1, None)
     }
 
     /// The pole-zero load as `CKTpzLoad` adds it: every device's
@@ -2755,8 +2888,14 @@ impl Circuit {
         setups: u32,
     ) -> SpiceResult<Vec<crate::maths::pencil::PencilTerm>> {
         let mut ranges = Vec::new();
-        let system =
-            self.bias_linearized_system(context, bias, state, setups.max(1), Some(&mut ranges))?;
+        let system = self.bias_linearized_system(
+            &self.prepare_run(),
+            context,
+            bias,
+            state,
+            setups.max(1),
+            Some(&mut ranges),
+        )?;
         let conductance_stamps = system.a.triplets();
         let capacitance_stamps = system.e.triplets();
         let mut terms = Vec::new();
@@ -2823,6 +2962,7 @@ impl Circuit {
 
     fn bias_linearized_system(
         &self,
+        run: &PreparedRun<'_>,
         context: &ModelContext,
         bias: &Vector,
         state: Option<&StateSnapshot>,
@@ -2830,26 +2970,19 @@ impl Circuit {
         mut ranges: Option<&mut Vec<PoleZeroRange>>,
     ) -> SpiceResult<crate::devices::linear::LinearSystem> {
         let state = self.snapshot_values(state)?;
-        context.validate(&crate::primitives::SourceLoc::new(
-            std::path::PathBuf::from("<model-context>"),
-            1,
-            1,
-        ))?;
+        context.validate(&MODEL_CONTEXT_LOCATION)?;
         if bias.len() != self.unknown_count() || !bias.is_finite() {
             return Err(SpiceError::circuit(
                 "invalid small-signal bias dimensions/values",
             ));
         }
-        let replacements = self.replacements(context)?;
-        let mutual = self.mutual_terms_with_replacements(context, &replacements)?;
+        let point = run.point(context)?;
+        let mutual = point.mutual(self)?;
         let mut system = crate::devices::linear::LinearSystem::new(self.unknown_count());
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
         for index in self.load_order() {
-            let device: &dyn Device = match replacements.iter().find(|(i, _)| *i == index) {
-                Some((_, replacement)) => &**replacement,
-                None => &*self.devices[index],
-            };
+            let device = point.device(self, index);
             let range = &self.bindings.branch_rows[index];
             let mut statements = Vec::new();
             let collecting = ranges.is_some();

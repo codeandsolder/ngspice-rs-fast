@@ -300,7 +300,12 @@ impl SmallSignal {
             let model = context.model_context().with_frequency(f);
             self.previous = self
                 .start
-                .solve_from(circuit, &model, &self.settings, &self.previous)?
+                .solve_from(
+                    &circuit.prepare_run(),
+                    &model,
+                    &self.settings,
+                    &self.previous,
+                )?
                 .values;
             // C repeats MODEINITSMSIG after every frequency-dependent CKTop.
             // Preserve its carried device slots for the next bias and analysis.

@@ -494,13 +494,11 @@ pub fn circuit_noise(
     let state = circuit.snapshot_values(state)?;
     // (family, model creation rank, instance rank, entry)
     let mut models = std::collections::BTreeMap::new();
-    let replacements = circuit.replacements(context)?;
+    let run = circuit.prepare_run();
+    let point = run.point(context)?;
     let mut entries: Vec<(NoiseFamily, usize, usize, InstanceNoise)> = Vec::new();
-    for (index, original) in circuit.devices().iter().enumerate() {
-        let device = replacements.iter().find(|(i, _)| *i == index).map_or_else(
-            || original.as_ref(),
-            |(_, replacement)| replacement.as_ref(),
-        );
+    for index in 0..circuit.device_count() {
+        let device = point.device(circuit, index);
         let rows = circuit
             .state_rows(index)
             .ok_or_else(|| SpiceError::circuit("circuit numbering is stale; finalize first"))?;

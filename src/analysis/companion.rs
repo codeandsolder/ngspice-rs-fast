@@ -393,6 +393,7 @@ impl StepControl {
 
 struct Driver<'a> {
     circuit: &'a Circuit,
+    prepared: crate::devices::PreparedRun<'a>,
     system: &'a LinearSystem,
     settings: TransientPlan,
     timing: TransientTiming,
@@ -519,6 +520,7 @@ pub fn companion_transient_into(
         .collect::<SpiceResult<_>>()?;
     let driver = Driver {
         circuit,
+        prepared: circuit.prepare_run(),
         system: &system,
         settings,
         timing,
@@ -589,7 +591,7 @@ impl Driver<'_> {
             if cursor.time == 0. {
                 // C (dctran.c) writes no t = 0 row under uic.
                 if start <= 0. && !self.uic {
-                    let observed = self.circuit.observe_real(
+                    let observed = self.prepared.observe_real(
                         &LoadRequest {
                             mode: AnalysisMode::OperatingPoint,
                             solution: &x,
@@ -660,7 +662,7 @@ impl Driver<'_> {
                         self.trial_step_policy(cursor, &coefficients, &state, &x_new)?;
                     if accept {
                         let observed = if cursor.time >= self.settings.start {
-                            self.circuit.observe_real(
+                            self.prepared.observe_real(
                                 &LoadRequest {
                                     mode: AnalysisMode::Transient {
                                         time: cursor.time,
@@ -845,8 +847,8 @@ impl Driver<'_> {
                         .collect(),
                     nodesets: initial::forced_nodesets(&self.hints.nodesets),
                 };
-                let solution = crate::analysis::bias::solve_dc_forced(
-                    self.circuit,
+                let solution = crate::analysis::bias::solve_dc_forced_prepared(
+                    &self.prepared,
                     &self.model_context,
                     &self.bias,
                     &[],
@@ -905,7 +907,7 @@ impl Driver<'_> {
     ) -> SpiceResult<TrialState> {
         let n = self.circuit.unknown_count();
         let mut trial = self.history.trial().with_initial_conditions(uic);
-        self.circuit.load(
+        self.prepared.load(
             &LoadRequest {
                 mode: AnalysisMode::OperatingPoint,
                 solution: x,
@@ -955,7 +957,7 @@ impl Driver<'_> {
             crate::analysis::newton::PhasePolicy::Predicted
         };
         let solved = CircuitNewton {
-            circuit: self.circuit,
+            prepared: &self.prepared,
             context: &self.model_context,
             history: &self.history,
             branch_rows: &self.branch_row,

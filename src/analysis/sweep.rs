@@ -750,7 +750,7 @@ fn warm_start_settings(
 
 /// Policy and circuit inputs shared by all points in a DC sweep.
 struct SweepSolver<'a> {
-    circuit: &'a Circuit,
+    prepared: crate::devices::PreparedRun<'a>,
     settings: &'a crate::analysis::bias::DcSettings,
     warm_settings: Option<&'a crate::analysis::bias::DcSettings>,
     nodes: &'a crate::analysis::bias::NodeForcing,
@@ -770,7 +770,7 @@ impl SweepSolver<'_> {
         // After the first point, C tries a bounded warm Newton solve before CKTop.
         if let Some(direct) = self.warm_settings.filter(|_| !first) {
             match solve_dc_from(
-                self.circuit,
+                &self.prepared,
                 &point.model,
                 direct,
                 overrides,
@@ -796,7 +796,7 @@ impl SweepSolver<'_> {
             PhasePolicy::Predicted
         };
         Ok(solve_dc_from(
-            self.circuit,
+            &self.prepared,
             &point.model,
             self.settings,
             overrides,
@@ -831,7 +831,7 @@ pub(super) fn run(
     let settings = request.dc_settings();
     let warm_settings = warm_start_settings(point_iterations, settings);
     let solver = SweepSolver {
-        circuit,
+        prepared: circuit.prepare_run(),
         settings,
         warm_settings: warm_settings.as_ref(),
         nodes: &nodes,
@@ -882,7 +882,7 @@ pub(super) fn run(
             // Only a solved point is accepted; a failure above returns before
             // any accept hook runs for it. A nonlinear point's state becomes the
             // accepted history of the next one.
-            let observed = circuit.observe_real(
+            let observed = solver.prepared.observe_real(
                 &crate::devices::LoadRequest {
                     mode: crate::devices::AnalysisMode::DcSweep,
                     solution: &x,

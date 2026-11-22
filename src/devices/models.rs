@@ -860,6 +860,51 @@ impl ModelContext {
         Ok(self)
     }
 
+    /// Exact identity of every immutable load setting. Ordinary floating
+    /// equality does not distinguish signed zero, including swept values.
+    pub(super) fn same_preparation(&self, other: &Self) -> bool {
+        if self.spice3_noise != other.spice3_noise || self.noise_analysis != other.noise_analysis {
+            return false;
+        }
+        let bits = |context: &Self| {
+            [
+                context.temperature,
+                context.nominal_temperature,
+                context.gmin,
+                context.frequency,
+                context.pivot.absolute,
+                context.pivot.relative,
+                context.source_factor,
+            ]
+            .map(Real::to_bits)
+        };
+        bits(self) == bits(other)
+            && self.resistor_overrides.map(|slot| {
+                slot.map(|value| (value.topology(), value.device(), value.supplied().to_bits()))
+            }) == other.resistor_overrides.map(|slot| {
+                slot.map(|value| (value.topology(), value.device(), value.supplied().to_bits()))
+            })
+            && self.instance_overrides.map(|slot| {
+                slot.map(|value| {
+                    (
+                        value.topology(),
+                        value.device(),
+                        value.parameter(),
+                        value.value().to_bits(),
+                    )
+                })
+            }) == other.instance_overrides.map(|slot| {
+                slot.map(|value| {
+                    (
+                        value.topology(),
+                        value.device(),
+                        value.parameter(),
+                        value.value().to_bits(),
+                    )
+                })
+            })
+    }
+
     pub(crate) fn validate(&self, location: &SourceLoc) -> SpiceResult<()> {
         temperature_kelvin(self.temperature, location)?;
         temperature_kelvin(self.nominal_temperature, location)?;
