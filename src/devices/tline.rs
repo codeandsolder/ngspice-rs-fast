@@ -749,7 +749,7 @@ impl DelayLine for TransmissionLine {
         });
         Ok(self
             .slope_changed(slopes)
-            .then(|| latest.time + self.td - context.time))
+            .then_some(latest.time + self.td - context.time))
     }
 }
 
