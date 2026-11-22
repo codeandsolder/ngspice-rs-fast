@@ -1928,7 +1928,11 @@ impl Device for Diode {
     /// current included, as C's `DIOcurrent`) and the flicker law
     /// `KF abs(cd/m)^AF m / f`. The `_rsw`/`_idsw`/`_1overfsw` generators of
     /// a separate sidewall (RSW, not ported) are zero, as C's are without RSW.
-    fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
+    fn noise(
+        &self,
+        context: &NoiseContext<'_>,
+        sources: &mut Vec<NoiseSource>,
+    ) -> SpiceResult<DeviceNoise<'_>> {
         let p = &self.parameters;
         let thermal = self.thermal(context.model_context)?;
         let vd = context.voltage(self.junction[0]) - context.voltage(self.junction[1]);
@@ -1943,46 +1947,46 @@ impl Device for Diode {
         let flicker = p.model.kf * (p.model.af * (cd / m).abs().max(1e-38).ln()).exp();
         let [anode, cathode] = self.junction;
         let external = self.terminals[0];
+        sources.extend([
+            NoiseSource::new(
+                "_rs",
+                [anode, external],
+                NoiseKind::Thermal {
+                    conductance: thermal.conductance,
+                    temperature,
+                },
+            ),
+            NoiseSource::new("_id", self.junction, NoiseKind::Shot { current: cd }),
+            NoiseSource::new(
+                "_1overf",
+                self.junction,
+                NoiseKind::Flicker {
+                    numerator: flicker,
+                    law: FlickerLaw::PerHertzTimes { multiplier: m },
+                },
+            ),
+            NoiseSource::new(
+                "_rsw",
+                [anode, external],
+                NoiseKind::Thermal {
+                    conductance: 0.,
+                    temperature,
+                },
+            ),
+            NoiseSource::new("_idsw", [anode, cathode], NoiseKind::Shot { current: 0. }),
+            NoiseSource::new(
+                "_1overfsw",
+                [anode, cathode],
+                NoiseKind::Flicker {
+                    numerator: 0.,
+                    law: FlickerLaw::PerHertzTimes { multiplier: m },
+                },
+            ),
+        ]);
         Ok(DeviceNoise::Sources {
             family: NoiseFamily::Diode,
-            model: Some(self.model.clone()),
+            model: Some(&self.model),
             total: true,
-            sources: vec![
-                NoiseSource::new(
-                    "_rs",
-                    [anode, external],
-                    NoiseKind::Thermal {
-                        conductance: thermal.conductance,
-                        temperature,
-                    },
-                ),
-                NoiseSource::new("_id", self.junction, NoiseKind::Shot { current: cd }),
-                NoiseSource::new(
-                    "_1overf",
-                    self.junction,
-                    NoiseKind::Flicker {
-                        numerator: flicker,
-                        law: FlickerLaw::PerHertzTimes { multiplier: m },
-                    },
-                ),
-                NoiseSource::new(
-                    "_rsw",
-                    [anode, external],
-                    NoiseKind::Thermal {
-                        conductance: 0.,
-                        temperature,
-                    },
-                ),
-                NoiseSource::new("_idsw", [anode, cathode], NoiseKind::Shot { current: 0. }),
-                NoiseSource::new(
-                    "_1overfsw",
-                    [anode, cathode],
-                    NoiseKind::Flicker {
-                        numerator: 0.,
-                        law: FlickerLaw::PerHertzTimes { multiplier: m },
-                    },
-                ),
-            ],
         })
     }
 }

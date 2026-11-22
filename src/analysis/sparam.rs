@@ -37,7 +37,7 @@ use crate::analysis::results::Variable;
 use crate::analysis::{AnalysisPlan, Plot};
 use crate::devices::Circuit;
 use crate::devices::linear::SourceKind;
-use crate::devices::noise::InstanceNoise;
+use crate::devices::noise::NoisePlan;
 use crate::maths::complex::ComplexLu;
 use crate::maths::dense_complex::DenseComplex;
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult, filled_vec, parse_spice_number};
@@ -311,6 +311,7 @@ pub(super) fn run(
     let mut plot = parameter_plot(circuit, plan.ports.len(), donoise, plan.budget.width)?;
     plot.reserve_points(plan.grid.len())?;
     let reference = plan.ports[0].z0;
+    let mut noise_plan: Option<NoisePlan<'_>> = None;
     for &f in plan.grid {
         let factor = small_signal.at_frequency(context, f, |system| {
             let factor =
@@ -343,22 +344,32 @@ pub(super) fn run(
         }
         workspace.point.push(reference);
         if let Some(noise) = &mut workspace.noise {
-            let generators = crate::devices::noise::prepared_noise(
-                small_signal.prepared(),
-                &context.model_context().with_frequency(f),
-                small_signal.bias(),
-                Some(small_signal.state()),
-            )?;
-            let sources = generators.iter().try_fold(0_usize, |total, instance| {
-                sum(&[total, instance.sources.len()])
-            })?;
-            plan.budget.charge_noise(plan.ports.len(), sources)?;
+            let model = context.model_context().with_frequency(f);
+            let generators = match &mut noise_plan {
+                Some(generators) => {
+                    generators.refresh(
+                        small_signal.prepared(),
+                        &model,
+                        small_signal.bias(),
+                        Some(small_signal.state()),
+                    )?;
+                    generators
+                }
+                None => noise_plan.insert(NoisePlan::bind(
+                    small_signal.prepared(),
+                    &model,
+                    small_signal.bias(),
+                    Some(small_signal.state()),
+                )?),
+            };
+            plan.budget
+                .charge_noise(plan.ports.len(), generators.source_count())?;
             noise.evaluate(
                 circuit,
                 &plan.ports,
                 &factor,
                 &workspace.algebra.y,
-                &generators,
+                generators,
                 &mut workspace.solve,
             )?;
             noise.append_results(
@@ -697,7 +708,7 @@ impl NoiseWorkspace {
         ports: &[BoundPort],
         factor: &ComplexLu,
         y: &DenseComplex,
-        generators: &[InstanceNoise],
+        generators: &NoisePlan<'_>,
         solve: &mut SolveBuffers,
     ) -> SpiceResult<()> {
         let count = ports.len();
@@ -715,17 +726,14 @@ impl NoiseWorkspace {
             adjoint.copy_from_slice(&solve.solution);
         }
         self.cy.clear();
-        for instance in generators {
-            for source in &instance.sources {
-                let Some(amplitude) = source.kind.rf_amplitude()? else {
+        for (_, sources) in generators.instances() {
+            for source in sources {
+                let Some(amplitude) = source.rf_amplitude()? else {
                     continue;
                 };
-                // Bind the two node rows once per generator, not per port.
-                let rows = source.nodes.map(|node| circuit.unknowns().node_row(node));
                 for (voltage, adjoint) in self.voltage.iter_mut().zip(self.adjoints.chunks_exact(n))
                 {
-                    let at = |row: Option<usize>| row.map_or(Complex::ZERO, |r| adjoint[r]);
-                    *voltage = (at(rows[0]) - at(rows[1])) * Complex::real(amplitude);
+                    *voltage = source.transfer(adjoint) * Complex::real(amplitude);
                 }
                 for (i, current) in self.current.iter_mut().enumerate() {
                     *current = self.voltage[i] * ports[i].inverse_z0;

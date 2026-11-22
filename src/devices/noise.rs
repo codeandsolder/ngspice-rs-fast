@@ -20,22 +20,27 @@
 //! The port splits C's single `DEVnoise` callback in two:
 //!
 //! * a device describes its generators **at the bias point** through
-//!   [`crate::devices::Device::noise`], returning a [`DeviceNoise`]: no
-//!   frequency, adjoint vector or integration state is visible to it. A device
+//!   [`crate::devices::Device::noise`], returning a [`DeviceNoise`] description and appending generators to caller-owned
+//!   storage. The model context includes frequency; adjoint vectors and
+//!   integration state remain analysis-owned. A device
 //!   that is noiseless in C (`DEVnoise = NULL`: C, L, V, I, E/F/G/H, K, B)
 //!   returns [`DeviceNoise::Noiseless`]; the trait default is an explicit error,
 //!   so a device whose noise is not ported can never be silently omitted;
 //! * the analysis owns gains, densities, the `Nintegrate` integration history
 //!   and the output naming (`onoise_<inst><suffix>`), and orders the instances
-//!   as C's `CKTnoise` visits them ([`circuit_noise`]).
+//!   as C's `CKTnoise` visits them ([`NoisePlan`]).
 //!
 //! The same pattern (a pure bias-point description returned by a default
 //! erroring trait method, evaluated by the analysis) is meant for later
 //! small-signal analyses with per-device hooks.
 
-use crate::devices::{Circuit, MnaUnknowns, ModelContext, SourceKind};
+use crate::devices::{MnaUnknowns, ModelContext, SourceKind};
 use crate::maths::Vector;
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
+
+mod layout;
+pub(crate) use layout::BoundTransfer;
+pub use layout::{BoundNoiseSource, NoiseInstance, NoisePlan};
 
 /// ngspice `CONSTboltz` (J/K).
 pub const BOLTZMANN: Real = 1.380_648_52e-23;
@@ -278,7 +283,7 @@ impl NoiseKind {
 /// One noise generator: a current source between `nodes` (C's `node1`,
 /// `node2` of `NevalSrc`), named by `suffix` after the instance name
 /// (`onoise_<instance><suffix>`, e.g. `_thermal`, `_rb`, `_1overf`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NoiseSource {
     /// C's generator name suffix, including the leading underscore.
     pub suffix: &'static str,
@@ -343,47 +348,39 @@ impl NoiseSource {
             kind,
         }
     }
+}
 
-    /// The output-referred density given the adjoint transfer value
-    /// `difference(nodes)` (C's `CKTrhs[n1] - CKTrhs[n2]` plus `j` times the
-    /// `CKTirhs` difference) of a node pair, in `nevalsrc.c`'s order.
-    ///
-    /// # Errors
-    ///
-    /// Invalid generator parameters or frequency, or nonfinite density.
-    pub fn output_density(
+impl NoiseKind {
+    // The caller supplies the already bound primary and coherent transfers.
+    fn output_density(
         &self,
-        difference: impl Fn([NodeId; 2]) -> Complex,
+        primary: Complex,
+        secondary: Option<Complex>,
         frequency: Real,
     ) -> SpiceResult<Real> {
-        if let NoiseKind::CorrelatedThermal {
+        if let Self::CorrelatedThermal {
             conductance,
-            second,
             second_conductance,
             phase,
             temperature,
-        } = self.kind
+            ..
+        } = *self
         {
-            if !valid_frequency(frequency) || !self.kind.validate() {
+            if !valid_frequency(frequency) || !self.validate() {
                 return Err(noise_error("invalid coherent generator or frequency"));
             }
-            let gain = correlated_gain(
-                difference(self.nodes),
-                difference(second),
-                conductance,
-                second_conductance,
-                phase,
-            );
+            let second = secondary.ok_or_else(|| noise_error("missing coherent transfer"))?;
+            let gain = correlated_gain(primary, second, conductance, second_conductance, phase);
             return finite_density(4.0 * BOLTZMANN * temperature * gain);
         }
-        self.kind
-            .scalar_output_density(squared_gain(difference(self.nodes)), frequency)
+        self.scalar_output_density(squared_gain(primary), frequency)
     }
 }
 
-/// What a device contributes to `.noise`.
+/// Borrowed identity of a device's contribution to `.noise`.
+/// The device appends its ordered generators to the caller's scratch buffer.
 #[derive(Debug, Clone, PartialEq)]
-pub enum DeviceNoise {
+pub enum DeviceNoise<'a> {
     /// No generators and no output columns: C's `DEVnoise = NULL` devices, and
     /// a resistor with `noisy=0` (`resnoise.c` skips it entirely).
     Noiseless,
@@ -395,14 +392,12 @@ pub enum DeviceNoise {
         /// The instance's model name, `None` for C's default model of the
         /// type (a literal resistor). C visits the models of one type in
         /// reverse order of their creation and the instances of one model in
-        /// reverse order of theirs ([`circuit_noise`]).
-        model: Option<String>,
+        /// reverse order of theirs ([`NoisePlan`]).
+        model: Option<&'a str>,
         /// Whether C reports an instance total (empty suffix) after the
         /// generators: every multi-generator device does; the single-generator
         /// S/W switches name their generator with the empty suffix instead.
         total: bool,
-        /// The generators, at least one.
-        sources: Vec<NoiseSource>,
     },
 }
 
@@ -449,123 +444,6 @@ pub struct InputSource {
     pub kind: SourceKind,
     /// Whether the card gave an `ac` value (even `ac 0`).
     pub ac_given: bool,
-}
-
-/// One noisy instance, with its generators, in C's visiting order.
-#[derive(Debug, Clone, PartialEq)]
-pub struct InstanceNoise {
-    /// The device ordinal in [`Circuit::devices`].
-    pub device: usize,
-    /// The instance name, as written in output names.
-    pub name: String,
-    /// Reference device family, including its output naming convention.
-    pub family: NoiseFamily,
-    /// The generators (without the instance total).
-    pub sources: Vec<NoiseSource>,
-    /// Whether the instance total follows the generators.
-    pub total: bool,
-}
-
-/// Enumerate noisy devices in the same order as ngspice.
-///
-/// Every noisy instance of `circuit` at the operating point `bias`, in the
-/// order C's `CKTnoise` visits them: by device type in `DEVices[]` order
-/// ([`NoiseFamily`]), then by model in reverse order of model creation (C
-/// creates a model when the first instance referring to it is parsed and
-/// prepends it to the type's list), then by instance in reverse deck order
-/// (instances are prepended to their model's list as well).
-///
-/// `state` is the full small-signal state vector (see [`NoiseContext::states`]).
-///
-/// # Errors
-///
-/// Stale numbering, a bias or state of the wrong size, a device whose noise
-/// is not ported (the [`crate::devices::Device::noise`] default), invalid
-/// device physics at the bias, or a nonfinite generator.
-pub fn circuit_noise(
-    circuit: &Circuit,
-    context: &ModelContext,
-    bias: &Vector,
-    state: Option<&crate::devices::StateSnapshot>,
-) -> SpiceResult<Vec<InstanceNoise>> {
-    prepared_noise(&circuit.prepare_run(), context, bias, state)
-}
-
-pub(crate) fn prepared_noise(
-    run: &crate::devices::PreparedRun<'_>,
-    context: &ModelContext,
-    bias: &Vector,
-    state: Option<&crate::devices::StateSnapshot>,
-) -> SpiceResult<Vec<InstanceNoise>> {
-    let circuit = run.circuit();
-    if bias.len() != circuit.unknown_count() || !bias.is_finite() {
-        return Err(SpiceError::circuit("invalid noise bias dimensions/values"));
-    }
-    let state = circuit.snapshot_values(state)?;
-    // (family, model creation rank, instance rank, entry)
-    let mut models = std::collections::BTreeMap::new();
-    let point = run.point(context)?;
-    let mut entries: Vec<(NoiseFamily, usize, usize, InstanceNoise)> = Vec::new();
-    for index in 0..circuit.device_count() {
-        let device = point.device(circuit, index);
-        let rows = circuit
-            .state_rows(index)
-            .ok_or_else(|| SpiceError::circuit("circuit numbering is stale; finalize first"))?;
-        let controls = circuit.controls(index)?;
-        let device_state = match state {
-            Some(state) => Some(
-                state
-                    .get(rows)
-                    .ok_or_else(|| SpiceError::circuit("noise bias state is too short"))?,
-            ),
-            None => None,
-        };
-        let noise = device.noise(&NoiseContext {
-            model_context: context,
-            unknowns: circuit.unknowns(),
-            bias,
-            states: device_state,
-            controls,
-        })?;
-        let DeviceNoise::Sources {
-            family,
-            model,
-            total,
-            sources,
-        } = noise
-        else {
-            continue;
-        };
-        if sources.is_empty() {
-            return Err(SpiceError::circuit(format!(
-                "{}: a noisy device must describe at least one generator",
-                device.name()
-            )));
-        }
-        if let Some(bad) = sources.iter().find(|source| !source.kind.validate()) {
-            return Err(SpiceError::Numerical {
-                context: format!("noise of {}", device.name()),
-                message: format!("nonfinite or out-of-domain generator {}", bad.suffix),
-            });
-        }
-        let next_rank = models.len();
-        let rank = *models.entry((family, model)).or_insert(next_rank);
-        entries.push((
-            family,
-            rank,
-            index,
-            InstanceNoise {
-                device: index,
-                name: device.name().to_owned(),
-                family,
-                sources,
-                total,
-            },
-        ));
-    }
-    // Later-created models and later instances come first within a type.
-    entries.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(b.2.cmp(&a.2)));
-    Ok(entries.into_iter().map(|entry| entry.3).collect())
 }
 
 #[cfg(test)]
@@ -691,22 +569,33 @@ mod tests {
             }
         };
         assert_eq!(
-            source.output_density(cancellation, 100.).unwrap().to_bits(),
+            source
+                .kind
+                .output_density(cancellation(first), Some(cancellation(second)), 100.)
+                .unwrap()
+                .to_bits(),
             0_f64.to_bits()
         );
         assert_eq!(
             source
-                .output_density(|_| Complex::new(2., -3.), 100.)
+                .kind
+                .output_density(Complex::new(2., -3.), Some(Complex::new(2., -3.)), 100.)
                 .unwrap()
                 .to_bits(),
             (4. * BOLTZMANN * 300. * 208.).to_bits()
         );
         assert!(
             source
-                .output_density(|_| Complex::real(f64::MAX), 100.)
+                .kind
+                .output_density(Complex::real(f64::MAX), Some(Complex::real(f64::MAX)), 100.)
                 .is_err()
         );
-        assert!(source.output_density(cancellation, 0.).is_err());
+        assert!(
+            source
+                .kind
+                .output_density(cancellation(first), Some(cancellation(second)), 0.)
+                .is_err()
+        );
 
         let invalid = NoiseSource::new(
             ".corl",
@@ -720,7 +609,9 @@ mod tests {
             },
         );
         assert!(matches!(
-            invalid.output_density(cancellation, 100.),
+            invalid
+                .kind
+                .output_density(cancellation(first), Some(cancellation(second)), 100.),
             Err(SpiceError::Numerical { .. })
         ));
     }

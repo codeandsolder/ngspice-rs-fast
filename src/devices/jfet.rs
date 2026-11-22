@@ -1043,7 +1043,8 @@ impl Device for Jfet {
     fn noise(
         &self,
         _context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> SpiceResult<crate::devices::noise::DeviceNoise> {
+        _sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         Err(SpiceError::not_yet_ported(
             format!("noise analysis of JFET {}", self.name),
             "src/spicelib/devices/jfet/jfetnoi.c",

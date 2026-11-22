@@ -1391,7 +1391,8 @@ impl Device for Bsim4 {
     fn noise(
         &self,
         context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> SpiceResult<crate::devices::noise::DeviceNoise> {
+        sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         use crate::devices::noise::{DeviceNoise, NoiseFamily, NoiseKind, NoiseSource};
         let model_context = *context.model_context;
         let prepared = self.ensure(model_context.temperature, model_context.nominal_temperature)?;
@@ -1419,50 +1420,50 @@ impl Device for Bsim4 {
         );
         let id = |local: i32| self.node_id(local).unwrap_or(NodeId::GROUND);
         let [dp, sp] = [id(h.dNodePrime), id(h.sNodePrime)];
-        let sources = generators
-            .into_iter()
-            .zip(noise::NAMES)
-            .map(|(generator, suffix)| {
-                let (nodes, kind) = match generator {
-                    noise::Source::Thermal(a, b, conductance) => (
-                        [id(a), id(b)],
-                        NoiseKind::Thermal {
-                            conductance,
-                            temperature,
-                        },
-                    ),
-                    noise::Source::Shot(a, b, current) => {
-                        ([id(a), id(b)], NoiseKind::Shot { current })
-                    }
-                    noise::Source::Gain(a, b, factor) => {
-                        ([id(a), id(b)], NoiseKind::Gain { factor })
-                    }
-                    noise::Source::Zero => ([dp, sp], NoiseKind::Gain { factor: 0. }),
-                    noise::Source::Correlated {
-                        first,
-                        g1,
-                        second,
-                        g2,
-                        phase,
-                    } => (
-                        [id(first.0), id(first.1)],
-                        NoiseKind::CorrelatedThermal {
-                            conductance: g1,
-                            second: [id(second.0), id(second.1)],
-                            second_conductance: g2,
+        sources.extend(
+            generators
+                .into_iter()
+                .zip(noise::NAMES)
+                .map(|(generator, suffix)| {
+                    let (nodes, kind) = match generator {
+                        noise::Source::Thermal(a, b, conductance) => (
+                            [id(a), id(b)],
+                            NoiseKind::Thermal {
+                                conductance,
+                                temperature,
+                            },
+                        ),
+                        noise::Source::Shot(a, b, current) => {
+                            ([id(a), id(b)], NoiseKind::Shot { current })
+                        }
+                        noise::Source::Gain(a, b, factor) => {
+                            ([id(a), id(b)], NoiseKind::Gain { factor })
+                        }
+                        noise::Source::Zero => ([dp, sp], NoiseKind::Gain { factor: 0. }),
+                        noise::Source::Correlated {
+                            first,
+                            g1,
+                            second,
+                            g2,
                             phase,
-                            temperature,
-                        },
-                    ),
-                };
-                NoiseSource::new(suffix, nodes, kind)
-            })
-            .collect();
+                        } => (
+                            [id(first.0), id(first.1)],
+                            NoiseKind::CorrelatedThermal {
+                                conductance: g1,
+                                second: [id(second.0), id(second.1)],
+                                second_conductance: g2,
+                                phase,
+                                temperature,
+                            },
+                        ),
+                    };
+                    NoiseSource::new(suffix, nodes, kind)
+                }),
+        );
         Ok(DeviceNoise::Sources {
             family: NoiseFamily::Bsim4,
-            model: Some(self.model_name.clone()),
+            model: Some(&self.model_name),
             total: true,
-            sources,
         })
     }
 }

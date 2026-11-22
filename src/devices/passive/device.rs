@@ -1,7 +1,7 @@
 //! Contextual input wrapper delegates effective values to existing R/C/L stamps.
 use super::{PassiveKind, PassiveParameters};
 use crate::devices::models::{ModelContext, ResolvedModel};
-use crate::devices::noise::{DeviceNoise, NoiseContext};
+use crate::devices::noise::{DeviceNoise, NoiseContext, NoiseSource};
 use crate::devices::rlc::{
     QUANTITY, REACTIVE_STATE_COUNT, ReactiveLoad, assemble_capacitor_ac, assemble_conductance,
     assemble_inductor_ac, resistor_noise, stamp_conductance,
@@ -226,7 +226,11 @@ impl Device for ModelPassive {
     /// `resnoise.c` for a resistor (including geometry, multiplier and temp);
     /// C and L have no noise generators. Validate the effective value in
     /// every family, as for stamps and linear assembly.
-    fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
+    fn noise(
+        &self,
+        context: &NoiseContext<'_>,
+        sources: &mut Vec<NoiseSource>,
+    ) -> SpiceResult<DeviceNoise<'_>> {
         self.parameters.effective_value(context.model_context)?;
         Ok(if self.parameters.kind == PassiveKind::Resistor {
             let conductance = self
@@ -236,12 +240,17 @@ impl Device for ModelPassive {
                 .parameters
                 .temperature_point(context.model_context)?
                 .effective();
-            let evaluate = |noise: &ResistorNoise| {
+            let model = self.model.as_deref().or_else(|| {
+                self.literal_noise
+                    .as_deref()
+                    .and_then(|noise| noise.model.as_deref())
+            });
+            let mut evaluate = |noise: &ResistorNoise| {
                 resistor_noise(
                     self.terminals,
                     conductance,
                     noise,
-                    self.model.as_deref().or(noise.model.as_deref()),
+                    model,
                     context,
                     if self.literal_noise.is_some()
                         && self.parameters.temperature.is_none()
@@ -251,12 +260,13 @@ impl Device for ModelPassive {
                     } else {
                         Some(temperature)
                     },
+                    sources,
                 )
             };
-            self.literal_noise.as_deref().map_or_else(
-                || evaluate(&self.parameters.resistor_noise_parameters()),
-                evaluate,
-            )
+            match self.literal_noise.as_deref() {
+                Some(noise) => evaluate(noise),
+                None => evaluate(&self.parameters.resistor_noise_parameters()),
+            }
         } else {
             DeviceNoise::Noiseless
         })

@@ -796,7 +796,11 @@ impl Device for Mesfet {
     /// temperature), channel thermal noise `4 k T (2/3) |gm|` and flicker
     /// noise `KF |cd|^AF / f` between d' and s', every source scaled by `m`.
     /// `cd` is C's `MEScd`: the channel minus the gate-drain diode current.
-    fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
+    fn noise(
+        &self,
+        context: &NoiseContext<'_>,
+        sources: &mut Vec<NoiseSource>,
+    ) -> SpiceResult<DeviceNoise<'_>> {
         let op = self.operating()?;
         let [vgs, vgd] = self.bias(context.unknowns, context.bias);
         let point = self.point(&op, vgs, vgd, context.model_context.gmin)?;
@@ -811,27 +815,27 @@ impl Device for Mesfet {
             conductance,
             temperature,
         };
+        sources.extend([
+            NoiseSource::new("_rd", [d, self.terminals[0]], thermal(gdpr * m)),
+            NoiseSource::new("_rs", [s, self.terminals[2]], thermal(gspr * m)),
+            NoiseSource::new(
+                "_id",
+                [d, s],
+                thermal(2.0 / 3.0 * m * point.channel.gm.abs()),
+            ),
+            NoiseSource::new(
+                "_1overf",
+                [d, s],
+                NoiseKind::Flicker {
+                    numerator: flicker,
+                    law: FlickerLaw::PerHertz,
+                },
+            ),
+        ]);
         Ok(DeviceNoise::Sources {
             family: NoiseFamily::Mes,
-            model: Some(self.model_name.clone()),
+            model: Some(&self.model_name),
             total: true,
-            sources: vec![
-                NoiseSource::new("_rd", [d, self.terminals[0]], thermal(gdpr * m)),
-                NoiseSource::new("_rs", [s, self.terminals[2]], thermal(gspr * m)),
-                NoiseSource::new(
-                    "_id",
-                    [d, s],
-                    thermal(2.0 / 3.0 * m * point.channel.gm.abs()),
-                ),
-                NoiseSource::new(
-                    "_1overf",
-                    [d, s],
-                    NoiseKind::Flicker {
-                        numerator: flicker,
-                        law: FlickerLaw::PerHertz,
-                    },
-                ),
-            ],
         })
     }
     fn distortion(

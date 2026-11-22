@@ -1703,7 +1703,11 @@ impl Device for Bjt {
     /// between the internal base and emitter. The quasi-saturation `_rci`
     /// generator is zero: RCO is not ported, so C's `collCX` node is the
     /// internal collector.
-    fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
+    fn noise(
+        &self,
+        context: &NoiseContext<'_>,
+        sources: &mut Vec<NoiseSource>,
+    ) -> SpiceResult<DeviceNoise<'_>> {
         let thermal = self.thermal(context.model_context)?;
         let v = self.bias(|node| context.voltage(node));
         let p = c_point(&thermal, v, context.model_context.gmin)?;
@@ -1719,26 +1723,26 @@ impl Device for Bjt {
             conductance,
             temperature,
         };
+        sources.extend([
+            NoiseSource::new("_rc", [n.cp, n.c], thermal_noise(thermal.gc * m)),
+            NoiseSource::new("_rci", [n.cp, n.cp], thermal_noise(0.)),
+            NoiseSource::new("_rb", [n.bp, n.b], thermal_noise(p.transport.gx * m)),
+            NoiseSource::new("_re", [n.ep, n.e], thermal_noise(thermal.ge * m)),
+            NoiseSource::new("_ic", [n.cp, n.ep], NoiseKind::Shot { current: cc * m }),
+            NoiseSource::new("_ib", [n.bp, n.ep], NoiseKind::Shot { current: cb * m }),
+            NoiseSource::new(
+                "_1overf",
+                [n.bp, n.ep],
+                NoiseKind::Flicker {
+                    numerator: flicker,
+                    law: FlickerLaw::PerHertz,
+                },
+            ),
+        ]);
         Ok(DeviceNoise::Sources {
             family: NoiseFamily::Bjt,
-            model: Some(self.model_name.clone()),
+            model: Some(&self.model_name),
             total: true,
-            sources: vec![
-                NoiseSource::new("_rc", [n.cp, n.c], thermal_noise(thermal.gc * m)),
-                NoiseSource::new("_rci", [n.cp, n.cp], thermal_noise(0.)),
-                NoiseSource::new("_rb", [n.bp, n.b], thermal_noise(p.transport.gx * m)),
-                NoiseSource::new("_re", [n.ep, n.e], thermal_noise(thermal.ge * m)),
-                NoiseSource::new("_ic", [n.cp, n.ep], NoiseKind::Shot { current: cc * m }),
-                NoiseSource::new("_ib", [n.bp, n.ep], NoiseKind::Shot { current: cb * m }),
-                NoiseSource::new(
-                    "_1overf",
-                    [n.bp, n.ep],
-                    NoiseKind::Flicker {
-                        numerator: flicker,
-                        law: FlickerLaw::PerHertz,
-                    },
-                ),
-            ],
         })
     }
 }
