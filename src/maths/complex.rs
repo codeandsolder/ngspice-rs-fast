@@ -41,7 +41,9 @@ pub struct DynamicGroup {
 /// `omega` times each of `e`'s contributions in stamp order, except that
 /// the contributions of one of `groups` are scaled one by one, summed and
 /// multiplied by the group's scale into a single value first
-/// ([`DynamicGroup`]).
+/// ([`DynamicGroup`]). The ordinary reference stamping path retains the
+/// individual product rounding and contribution order; it is not a fused
+/// dot product.
 pub(crate) fn dynamic_terms(
     e: &SparseMatrix,
     groups: &[DynamicGroup],

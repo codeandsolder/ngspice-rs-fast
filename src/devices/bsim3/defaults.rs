@@ -102,13 +102,11 @@ impl ModelDefaults {
                 "BSIM3 integer model field {name} is fractional: {value}"
             )));
         }
-        crate::primitives::c_integer(value)
-            .and_then(|n| i32::try_from(n).ok())
-            .ok_or_else(|| {
-                SpiceError::circuit(format!(
-                    "BSIM3 integer model field {name} is outside the C i32 range: {value}"
-                ))
-            })
+        crate::primitives::exact_signed_integer(value).ok_or_else(|| {
+            SpiceError::circuit(format!(
+                "BSIM3 integer model field {name} is outside the C i32 range: {value}"
+            ))
+        })
     }
 
     /// C's given-bit state, not whether the final number differs from a
