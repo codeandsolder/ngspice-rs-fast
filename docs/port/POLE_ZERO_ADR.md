@@ -188,3 +188,37 @@ cubic residuals and Vieta coefficients. The notch case uses the same
 independent completeness criterion. See
 [VERIFICATION.md](VERIFICATION.md#m8-pole-zero-analysis-103) for the measured
 errors.
+
+### Independently certified HFET2 pole (#91)
+
+The committed `m10_hfet2_pz.raw` and pinned C binary contain only the
+slow pole and two zeros. C prints its iteration-limit warning (209 trials).
+The Rust search additionally finds a drain pole near -1e10 rad/s. To
+distinguish a genuine root from a numerical artifact, expand the determinant
+of the eight-row affine pencil by permutations, with each dumped stamp
+interpreted as an exact binary64 rational. The optional diagnostic
+`analysis::pz::tests::report_hfet2_pole_pencil` emits the original stamps
+as hexadecimal binary64 bits for independent reproduction. Only 11
+permutations contribute. Normalizing the polynomial by its linear
+coefficient yields the ascending coefficients
+
+```text
+ 1.9155254053259393e-4
+ 1
+ 9.9999999859988947e-11
+ 3.9307772294313934e-35
+ 1.4562552973164515e-70
+```
+
+The drain root is -10000000014.000953054..., with normalized determinant
+residual 2.22e-16 at the returned binary64 value. Two further roots lie
+near -2.54402613e24 and -2.69923635e35, outside the existing search range;
+the bounded Muller search does not claim a complete generalized
+eigenspectrum. The very slow root is sensitive to cancellation during
+binary64 stamp assembly (the exact affine-stamp polynomial gives
+-0.0001915525405..., while the rounded search reproduces C's
+-0.0001915532914...). The C rawfile is unchanged. The golden gate requires
+its original root set augmented by the independently certified drain
+pole, and the production-path regression checks that pole separately to
+1e-12 relative accuracy and verifies its polynomial residual. Neither
+missing the extra pole nor returning an arbitrary extra pole is accepted.

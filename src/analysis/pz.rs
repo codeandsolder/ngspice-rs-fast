@@ -392,6 +392,43 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "optional independent polynomial-coefficient diagnostic"]
+    fn report_hfet2_pole_pencil() {
+        use crate::analysis::RunConfig;
+        use crate::netlist::Parser;
+        use crate::netlist::source::parse_deck_text;
+        use std::path::Path;
+        let deck = include_str!("../../conformance/netlists/m10_hfet2_pz.cir");
+        let netlist = Parser::new()
+            .parse_deck(&parse_deck_text(Path::new("hfet2.cir"), deck))
+            .unwrap();
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+        let context = config.context();
+        let mut circuit = config.circuit(&netlist).unwrap();
+        circuit.finalize().unwrap();
+        let signal = crate::analysis::ac::SmallSignal::prepare(
+            &mut circuit,
+            &plan,
+            &context,
+            plan.dc_settings().clone(),
+        )
+        .unwrap();
+        let load = prepared_load(&circuit, &signal, &context, 1, [None, None], None).unwrap();
+        println!("order {}", load.order);
+        for term in &load.terms {
+            println!(
+                "term {} {} {:016x} {:016x}",
+                term.row,
+                term.col,
+                term.conductance.unwrap_or(0.).to_bits(),
+                term.capacitance.unwrap_or(0.).to_bits()
+            );
+        }
+        println!("roots {:?}", roots(&load, "poles").unwrap());
+    }
+
+    #[test]
     fn cards_take_both_flags_in_either_order() {
         let parsed = parse(&request(&["in", "0", "out", "0", "vol", "pz"])).unwrap();
         assert_eq!(parsed.input, Input::Voltage);

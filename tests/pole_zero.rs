@@ -42,6 +42,43 @@ fn assert_close(got: Complex, re: Real, im: Real, relative: Real) {
     );
 }
 
+#[test]
+fn hfet2_recovers_the_independently_verified_drain_pole() {
+    let deck = include_str!("../conformance/netlists/m10_hfet2_pz.cir");
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("hfet2.cir"), deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let plot = request.run(&mut circuit, &config.context()).unwrap();
+    let poles = roots(&plot, "pole");
+    assert_eq!(poles.len(), 2);
+    assert_close(poles[0], -10_000_000_014.000_954, 0., 1e-12);
+    assert_close(poles[1], -1.915_532_913_552_036e-4, 0., 1e-9);
+
+    // Exact-rational determinant expansion of the original affine stamps,
+    // normalized by its linear coefficient (POLE_ZERO_ADR.md). The two
+    // remaining polynomial roots lie past the search's frequency range.
+    let coefficients = [
+        1.915_525_405_325_939_3e-4,
+        1.,
+        9.999_999_985_998_895e-11,
+        3.930_777_229_431_393_4e-35,
+        1.456_255_297_316_451_5e-70,
+    ];
+    let s = poles[0].re;
+    let residual = coefficients
+        .iter()
+        .rev()
+        .fold(0.0_f64, |acc, &v| acc.mul_add(s, v));
+    let scale = coefficients
+        .iter()
+        .rev()
+        .fold(0.0_f64, |acc, &v| acc.mul_add(s.abs(), v.abs()));
+    assert!(residual.abs() / scale < 1e-12);
+}
+
 fn error(cards: &str, analysis: &str) -> String {
     run(cards, analysis)
         .expect_err("the analysis is refused")
