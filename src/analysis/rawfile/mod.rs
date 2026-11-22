@@ -54,6 +54,11 @@
     reason = "the ASCII ngspice rawfile documentation demonstrates literal tab separator bytes"
 )]
 
+mod transaction;
+
+use transaction::OwnedTemporary;
+pub use transaction::RawFileTransaction;
+
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
@@ -64,10 +69,6 @@ use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 use crate::analysis::results::{Plot, PlotFlags, Variable};
 
 mod binary;
-mod transaction;
-
-use transaction::OwnedTemporary;
-pub use transaction::RawFileTransaction;
 
 pub use binary::BinaryByteOrder;
 
