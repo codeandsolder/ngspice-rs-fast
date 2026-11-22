@@ -636,11 +636,13 @@ impl SourceFunction {
 /// knot. With `r = t_k` the segment `[t_k, t_last]` repeats forever with period
 /// `t_last - t_k`; where `v_k != v_last` each repetition boundary is a jump.
 ///
-/// Values follow `vsrcload.c` verbatim, including at a repetition boundary,
+/// Repetition selection follows `vsrcload.c`, including at a repetition boundary,
 /// which C evaluates once: depending on which side of `t_last` the landing
 /// time (`CKTtime += CKTdelta` toward the breakpoint `VSRCaccept` requested)
 /// folds, it loads `v_last` or `v_k`. The transient driver reproduces those
 /// landing times bit for bit, so the requested [`Limit`] is ignored.
+/// Between knots interpolation uses the nearer endpoint and FMA, and
+/// exact local knots return their stored values without arithmetic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PwlSource {
     knots: Arc<[(Real, Real)]>,
@@ -763,20 +765,36 @@ impl PwlSource {
         }
     }
 
-    /// Linear interpolation at an in-range local time (C's segment search).
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "C PWL interpolation rounds the scaled segment difference before adding its starting value"
-    )]
+    /// Linear interpolation at an in-range local time. Exact knots return
+    /// their original ordinate bits; between knots use the nearer anchor
+    /// to avoid cancellation at an endpoint.
     fn interpolate(&self, time: Real) -> Real {
-        // Strictly increasing finite knots are guaranteed by the constructor.
-        // Search right endpoints, choosing the preceding segment at an exact
-        // knot just as C's first t1 >= time does (including its rounding).
         let left = self.knots[1..].partition_point(|(t, _)| *t < time);
         let (t0, v0) = self.knots[left];
         self.knots.get(left + 1).map_or(v0, |&(t1, v1)| {
-            let fraction = (time - t0) / (t1 - t0);
-            v0 + fraction * (v1 - v0)
+            if time <= t0 {
+                return v0;
+            }
+            if time >= t1 {
+                return v1;
+            }
+            let (near_time, near, far_time, far) = if time <= Real::midpoint(t0, t1) {
+                (t0, v0, t1, v1)
+            } else {
+                (t1, v1, t0, v0)
+            };
+            let fraction = (time - near_time) / (far_time - near_time);
+            let difference = far - near;
+            if difference.is_finite() {
+                fraction.mul_add(difference, near)
+            } else {
+                // The exact difference can overflow for opposite-sign
+                // endpoints. The nearer-anchor fraction is <= 1/2, so
+                // halve the difference before multiplying by twice it.
+                let half_near = 0.5 * near;
+                let half_far = 0.5 * far;
+                (2. * fraction).mul_add(half_far - half_near, near)
+            }
         })
     }
 
@@ -875,7 +893,7 @@ impl PwlSource {
     /// Repetition offset; no arithmetic is applied to the original plain knots.
     #[expect(
         clippy::suboptimal_flops,
-        reason = "C PWL event times use separate rounded additions and multiplication"
+        reason = "event times and C landing-side selection share this rounded cycle schedule; fusing a repeat boundary can select the opposite side of a discontinuity"
     )]
     fn event_time(&self, knot: Real, cycle: Real) -> Real {
         match self.timing {
@@ -1286,7 +1304,7 @@ mod tests {
     }
 
     #[test]
-    fn pwl_binary_lookup_preserves_linear_search_bits() {
+    fn pwl_binary_lookup_preserves_exact_knots_and_matches_linear_search() {
         let knots: Vec<_> = (0..257)
             .map(|i| {
                 let t = Real::from(i);
@@ -1294,24 +1312,38 @@ mod tests {
             })
             .collect();
         let p = PwlSource::new(knots.clone(), 0., None).unwrap();
+        for &(time, value) in &knots {
+            assert_eq!(p.interpolate(time).to_bits(), value.to_bits(), "t={time}");
+        }
         for pair in knots.windows(2) {
             let (t0, t1) = (pair[0].0, pair[1].0);
-            for t in [t0, t0.midpoint(t1), t1, t1.next_down(), t1.next_up()] {
-                let expected = knots
-                    .windows(2)
-                    .find_map(|w| {
-                        let ((a, x), (b, y)) = (w[0], w[1]);
-                        (b >= t).then(|| {
-                            let fraction = (t - a) / (b - a);
-                            x + fraction * (y - x)
-                        })
-                    })
-                    .unwrap_or(knots.last().unwrap().1);
-                assert_eq!(p.interpolate(t).to_bits(), expected.to_bits(), "t={t}");
+            for t in [t0.midpoint(t1), t1.next_down(), t1.next_up()] {
+                if let Some(w) = knots.windows(2).find(|w| w[1].0 >= t) {
+                    let ((a, x), (b, y)) = (w[0], w[1]);
+                    let expected = ((b - t) * x + (t - a) * y) / (b - a);
+                    let bound = 8. * Real::EPSILON * x.abs().max(y.abs());
+                    assert!((p.interpolate(t) - expected).abs() <= bound, "t={t}");
+                } else {
+                    assert_eq!(p.interpolate(t), knots.last().unwrap().1);
+                }
             }
         }
         let single = PwlSource::new(vec![(0., -0.)], 0., None).unwrap();
         assert_eq!(single.interpolate(1.).to_bits(), (-0.0_f64).to_bits());
+    }
+
+    #[test]
+    fn pwl_preserves_near_endpoint_voltage_and_overflowing_differences() {
+        let p = PwlSource::plain(vec![(0., 1e16), (1., 1.), (2., -0.)]).unwrap();
+        assert_eq!(p.value_at(1., R).unwrap(), 1.);
+        assert_eq!(p.value_at(2., R).unwrap().to_bits(), (-0_f64).to_bits());
+        let t = 1_f64.next_down();
+        let expected = (1. - t).mul_add(1e16, t);
+        assert!((p.value_at(t, R).unwrap() - expected).abs() <= 2. * Real::EPSILON * expected);
+        let p = PwlSource::plain(vec![(0., -Real::MAX), (2., Real::MAX)]).unwrap();
+        assert_eq!(p.value_at(1., R).unwrap(), 0.);
+        assert_eq!(p.value_at(0.5, R).unwrap(), -Real::MAX / 2.);
+        assert_eq!(p.value_at(1.5, R).unwrap(), Real::MAX / 2.);
     }
 
     #[test]
