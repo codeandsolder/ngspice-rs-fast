@@ -6,6 +6,13 @@
 
 use crate::primitives::Real;
 
+// ngspice const.h at the pinned C revision. Derive epsilon from the
+// same constants and product order rather than using the older MOS constant.
+const MU_ZERO: Real = 4. * std::f64::consts::PI * 1e-7;
+const SPEED_OF_LIGHT: Real = 299_792_458.;
+const EPS_ZERO: Real = 1. / (MU_ZERO * SPEED_OF_LIGHT * SPEED_OF_LIGHT);
+const EPS_SIO2: Real = 3.9 * EPS_ZERO;
+
 /// Resolve temperature and offset, both in kelvin. An explicit temperature
 /// disables the offset even if it was written.
 #[derive(Debug, Clone, Copy)]
@@ -125,8 +132,6 @@ pub(in crate::devices) struct CapacitorGeometry {
 
 impl CapacitorSetup {
     pub(in crate::devices) fn prepare(self) -> CapacitorGeometry {
-        const EPS_ZERO: Real = 8.854_214_871e-12;
-        const EPS_SIO2: Real = 3.9 * EPS_ZERO;
         CapacitorGeometry {
             cj: self.cj.unwrap_or_else(|| {
                 self.thickness
@@ -174,7 +179,6 @@ pub(in crate::devices) struct CoilGeometry {
 
 impl CoilSetup {
     pub(in crate::devices) fn prepare(self) -> CoilGeometry {
-        const MU_ZERO: Real = 4. * std::f64::consts::PI * 1e-7;
         let cross_section = self.diameter.map_or_else(
             || self.cross_section.unwrap_or(0.),
             |dia| std::f64::consts::PI * dia * dia / 4.,
