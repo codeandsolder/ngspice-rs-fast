@@ -35,7 +35,8 @@ use std::sync::Arc;
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 use crate::netlist::ast::{
-    DeviceInstance, Netlist, ParameterAssignment, ParameterKind, Subcircuit, poly_dimension,
+    DeviceInstance, Netlist, ParameterAssignment, ParameterKind, ScopeView, ScopedCard,
+    ScopedCardKind, Subcircuit, poly_dimension,
 };
 use crate::netlist::bexpr::{
     BBinaryOp, BExpr, BExprKind, BUnaryOp, BehaviouralExpression, SPECIAL_NAMES,
@@ -68,7 +69,7 @@ const MAX_RESOLVED_NODES: usize = 100_000;
 pub fn lower_nonlinear_sources(netlist: &Netlist) -> SpiceResult<Netlist> {
     let mut out = netlist.clone();
     measure_currents(&mut out)?;
-    out.devices = lower_devices(std::mem::take(&mut out.devices))?;
+    lower_devices(&mut out.devices, &mut out.cards)?;
     for subcircuit in &mut out.subcircuits {
         lower_subcircuit(subcircuit)?;
     }
@@ -79,64 +80,52 @@ pub fn lower_nonlinear_sources(netlist: &Netlist) -> SpiceResult<Netlist> {
 /// and the index in that scope's device list.
 type Position = (Vec<usize>, usize);
 
-fn scope_devices<'a>(netlist: &'a mut Netlist, path: &[usize]) -> &'a mut Vec<DeviceInstance> {
+fn scope_parts<'a>(
+    netlist: &'a mut Netlist,
+    path: &[usize],
+) -> (&'a mut Vec<DeviceInstance>, &'a mut Vec<ScopedCard>) {
     let Some((first, rest)) = path.split_first() else {
-        return &mut netlist.devices;
+        return (&mut netlist.devices, &mut netlist.cards);
     };
     let mut subcircuit = &mut netlist.subcircuits[*first];
     for index in rest {
         subcircuit = &mut subcircuit.subcircuits[*index];
     }
-    &mut subcircuit.devices
+    (&mut subcircuit.devices, &mut subcircuit.cards)
 }
 
 /// Device positions in deck order: the root's and every body's cards as they
 /// were written (falling back to vector order without card lists).
-fn deck_order(netlist: &Netlist) -> Vec<Position> {
-    fn walk(
-        cards: &[crate::netlist::ast::ScopedCard],
-        devices: usize,
-        subcircuits: &[Subcircuit],
-        path: &[usize],
-        out: &mut Vec<Position>,
-    ) {
-        let start = out.len();
-        for card in cards {
+fn deck_order(netlist: &Netlist) -> SpiceResult<Vec<Position>> {
+    fn walk(scope: ScopeView<'_>, path: &[usize], out: &mut Vec<Position>) -> SpiceResult<()> {
+        if scope.cards.is_empty() {
+            out.extend((0..scope.devices.len()).map(|index| (path.to_vec(), index)));
+            for (index, body) in scope.subcircuits.iter().enumerate() {
+                let mut nested = path.to_vec();
+                nested.push(index);
+                walk(ScopeView::from(body), &nested, out)?;
+            }
+            return Ok(());
+        }
+        scope
+            .validate_order()
+            .map_err(|error| SpiceError::circuit(error.to_string()))?;
+        for card in scope.cards {
             match card.kind {
-                crate::netlist::ast::ScopedCardKind::Device(index) if index < devices => {
-                    out.push((path.to_vec(), index));
-                }
-                crate::netlist::ast::ScopedCardKind::Subcircuit(index) => {
-                    if let Some(body) = subcircuits.get(index) {
-                        let mut nested = path.to_vec();
-                        nested.push(index);
-                        walk(
-                            &body.cards,
-                            body.devices.len(),
-                            &body.subcircuits,
-                            &nested,
-                            out,
-                        );
-                    }
+                ScopedCardKind::Device(index) => out.push((path.to_vec(), index)),
+                ScopedCardKind::Subcircuit(index) => {
+                    let mut nested = path.to_vec();
+                    nested.push(index);
+                    walk(ScopeView::from(&scope.subcircuits[index]), &nested, out)?;
                 }
                 _ => {}
             }
         }
-        let listed = out[start..].iter().filter(|(p, _)| p == path).count();
-        if listed != devices {
-            out.retain(|(p, _)| p != path);
-            out.extend((0..devices).map(|index| (path.to_vec(), index)));
-        }
+        Ok(())
     }
     let mut out = Vec::new();
-    walk(
-        &netlist.cards,
-        netlist.devices.len(),
-        &netlist.subcircuits,
-        &[],
-        &mut out,
-    );
-    out
+    walk(ScopeView::from(netlist), &[], &mut out)?;
+    Ok(out)
 }
 
 /// Characters `is_arith_char()` accepts before `i(` (plus `{` and `=`).
@@ -199,8 +188,8 @@ fn measure_currents(netlist: &mut Netlist) -> SpiceResult<()> {
     // Phase 1: every rewritable reference, grouped by device, in deck order.
     let mut references = Vec::new();
     let mut scopes = HashMap::<Vec<usize>, ScopeMeasurements>::new();
-    for position in deck_order(netlist) {
-        let device = &scope_devices(netlist, &position.0)[position.1];
+    for position in deck_order(netlist)? {
+        let device = &scope_parts(netlist, &position.0).0[position.1];
         let mut occurrence = 0;
         let mut group = Vec::new();
         for parameter in &device.parameters {
@@ -237,7 +226,7 @@ fn measure_currents(netlist: &mut Netlist) -> SpiceResult<()> {
     // Index each relevant scope once, before any names or nodes are changed.
     // This replaces one full device scan for every reference.
     for (path, scope) in &mut scopes {
-        for (index, device) in scope_devices(netlist, path).iter().enumerate() {
+        for (index, device) in scope_parts(netlist, path).0.iter().enumerate() {
             if let Some(targets) = scope.targets.get_mut(&device.name) {
                 if is_simple_linear(device) {
                     targets.simple = true;
@@ -256,14 +245,18 @@ fn measure_currents(netlist: &mut Netlist) -> SpiceResult<()> {
         if scope.insertions.is_empty() {
             continue;
         }
-        let devices = scope_devices(netlist, &path);
+        let (devices, cards) = scope_parts(netlist, &path);
         let mut rewritten = Vec::with_capacity(devices.len() + scope.insertions.len());
+        let mut mapping = Vec::with_capacity(devices.len());
         for (index, device) in std::mem::take(devices).into_iter().enumerate() {
+            let start = rewritten.len();
             rewritten.push(device);
             if let Some(source) = scope.insertions.remove(&index) {
                 rewritten.push(source);
             }
+            mapping.push(start..rewritten.len());
         }
+        remap_device_cards(cards, &mapping)?;
         *devices = rewritten;
     }
     Ok(())
@@ -279,7 +272,7 @@ fn rewrite_measured_references(
     // was inserted. Rewrite each expression once, not once per reference.
     let mut serial = 0usize;
     for ((path, device_index), group) in references {
-        let devices = scope_devices(netlist, &path);
+        let (devices, _) = scope_parts(netlist, &path);
         let scope = scopes
             .get_mut(&path)
             .ok_or_else(|| SpiceError::circuit("missing indexed current-reference scope"))?;
@@ -362,19 +355,57 @@ fn rename_occurrences(device: &mut DeviceInstance, renames: &[(usize, String)]) 
 }
 
 fn lower_subcircuit(subcircuit: &mut Subcircuit) -> SpiceResult<()> {
-    subcircuit.devices = lower_devices(std::mem::take(&mut subcircuit.devices))?;
+    lower_devices(&mut subcircuit.devices, &mut subcircuit.cards)?;
     for nested in &mut subcircuit.subcircuits {
         lower_subcircuit(nested)?;
     }
     Ok(())
 }
 
-fn lower_devices(devices: Vec<DeviceInstance>) -> SpiceResult<Vec<DeviceInstance>> {
-    let mut out = Vec::with_capacity(devices.len());
-    for device in devices {
-        lower_device(device, &mut out)?;
+/// Rewrite only device ordinals, preserving the original card and include
+/// chain on every generated device. Location alone is not a card identity:
+/// the same physical line can be expanded by multiple include directives.
+fn remap_device_cards(
+    cards: &mut Vec<ScopedCard>,
+    mapping: &[std::ops::Range<usize>],
+) -> SpiceResult<()> {
+    let mut rewritten = Vec::with_capacity(cards.len());
+    for card in std::mem::take(cards) {
+        if let ScopedCardKind::Device(index) = card.kind {
+            let range = mapping.get(index).ok_or_else(|| {
+                SpiceError::parse(
+                    card.source.location.clone(),
+                    "invalid device card index during lowering",
+                )
+            })?;
+            for index in range.clone() {
+                rewritten.push(ScopedCard {
+                    kind: ScopedCardKind::Device(index),
+                    ..card.clone()
+                });
+            }
+        } else {
+            rewritten.push(card);
+        }
     }
-    Ok(out)
+    *cards = rewritten;
+    Ok(())
+}
+
+fn lower_devices(
+    devices: &mut Vec<DeviceInstance>,
+    cards: &mut Vec<ScopedCard>,
+) -> SpiceResult<()> {
+    let mut out = Vec::with_capacity(devices.len());
+    let mut mapping = Vec::with_capacity(devices.len());
+    for device in std::mem::take(devices) {
+        let start = out.len();
+        lower_device(device, &mut out)?;
+        mapping.push(start..out.len());
+    }
+    remap_device_cards(cards, &mapping)?;
+    *devices = out;
+    Ok(())
 }
 
 fn has(device: &DeviceInstance, name: &str) -> bool {

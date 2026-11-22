@@ -1189,6 +1189,253 @@ pub struct Netlist {
     pub location: SourceLoc,
 }
 
+/// Borrowed lexical scope shared by frontend passes. Semantic entries retain
+/// their typed vector identity and their source card's include provenance.
+#[derive(Clone, Copy)]
+pub(crate) struct ScopeView<'a> {
+    pub(crate) devices: &'a [DeviceInstance],
+    pub(crate) models: &'a [ModelCard],
+    pub(crate) subcircuits: &'a [Subcircuit],
+    pub(crate) analyses: &'a [AnalysisCard],
+    pub(crate) includes: &'a [IncludeDirective],
+    pub(crate) params: &'a [ParamCard],
+    pub(crate) options: &'a [OptionCard],
+    pub(crate) globals: &'a [GlobalCard],
+    pub(crate) initial_conditions: &'a [NodeHintCard],
+    pub(crate) nodesets: &'a [NodeHintCard],
+    pub(crate) functions: &'a [FuncCard],
+    pub(crate) cards: &'a [ScopedCard],
+}
+
+impl<'a> From<&'a Netlist> for ScopeView<'a> {
+    fn from(scope: &'a Netlist) -> Self {
+        Self {
+            devices: &scope.devices,
+            models: &scope.models,
+            subcircuits: &scope.subcircuits,
+            analyses: &scope.analyses,
+            includes: &scope.includes,
+            params: &scope.params,
+            options: &scope.options,
+            globals: &scope.globals,
+            initial_conditions: &scope.initial_conditions,
+            nodesets: &scope.nodesets,
+            functions: &scope.functions,
+            cards: &scope.cards,
+        }
+    }
+}
+
+impl<'a> From<&'a Subcircuit> for ScopeView<'a> {
+    fn from(scope: &'a Subcircuit) -> Self {
+        Self {
+            devices: &scope.devices,
+            models: &scope.models,
+            subcircuits: &scope.subcircuits,
+            analyses: &scope.analyses,
+            includes: &scope.includes,
+            params: &scope.params,
+            options: &scope.options,
+            globals: &scope.globals,
+            initial_conditions: &scope.initial_conditions,
+            nodesets: &scope.nodesets,
+            functions: &scope.functions,
+            cards: &scope.cards,
+        }
+    }
+}
+
+/// Resolved semantic entry with no unchecked index at consumer boundaries.
+pub(crate) enum ScopeEntry<'a> {
+    Device(&'a DeviceInstance),
+    Model(&'a ModelCard),
+    Subcircuit(&'a Subcircuit),
+    Analysis(&'a AnalysisCard),
+    Include(&'a IncludeDirective),
+    Param(&'a ParamCard),
+    Options(&'a OptionCard),
+    Global(&'a GlobalCard),
+    InitialCondition(&'a NodeHintCard),
+    Nodeset(&'a NodeHintCard),
+    Func(&'a FuncCard),
+    Output,
+    Measure,
+    Fourier,
+    Ends,
+    End,
+}
+
+#[derive(Debug)]
+pub(crate) enum ScopeOrderError {
+    Index {
+        index: usize,
+        collection: &'static str,
+    },
+    Coverage,
+}
+
+impl std::fmt::Display for ScopeOrderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Index { index, collection } => {
+                write!(f, "card index {index} is out of range for {collection}")
+            }
+            Self::Coverage => f.write_str(
+                "the ordered cards do not reference every typed entry exactly once in vector order",
+            ),
+        }
+    }
+}
+
+impl<'a> ScopeView<'a> {
+    pub(crate) fn entry(self, kind: ScopedCardKind) -> Result<ScopeEntry<'a>, ScopeOrderError> {
+        match kind {
+            ScopedCardKind::Device(index) => {
+                self.devices
+                    .get(index)
+                    .map(ScopeEntry::Device)
+                    .ok_or(ScopeOrderError::Index {
+                        index,
+                        collection: "devices",
+                    })
+            }
+            ScopedCardKind::Model(index) => {
+                self.models
+                    .get(index)
+                    .map(ScopeEntry::Model)
+                    .ok_or(ScopeOrderError::Index {
+                        index,
+                        collection: "models",
+                    })
+            }
+            ScopedCardKind::Subcircuit(index) => self
+                .subcircuits
+                .get(index)
+                .map(ScopeEntry::Subcircuit)
+                .ok_or(ScopeOrderError::Index {
+                    index,
+                    collection: "subcircuits",
+                }),
+            ScopedCardKind::Analysis(index) => self
+                .analyses
+                .get(index)
+                .map(ScopeEntry::Analysis)
+                .ok_or(ScopeOrderError::Index {
+                    index,
+                    collection: "analyses",
+                }),
+            ScopedCardKind::Include(index) => self
+                .includes
+                .get(index)
+                .map(ScopeEntry::Include)
+                .ok_or(ScopeOrderError::Index {
+                    index,
+                    collection: "includes",
+                }),
+            ScopedCardKind::Param(index) => {
+                self.params
+                    .get(index)
+                    .map(ScopeEntry::Param)
+                    .ok_or(ScopeOrderError::Index {
+                        index,
+                        collection: "params",
+                    })
+            }
+            ScopedCardKind::Options(index) => self
+                .options
+                .get(index)
+                .map(ScopeEntry::Options)
+                .ok_or(ScopeOrderError::Index {
+                    index,
+                    collection: "options",
+                }),
+            ScopedCardKind::Global(index) => {
+                self.globals
+                    .get(index)
+                    .map(ScopeEntry::Global)
+                    .ok_or(ScopeOrderError::Index {
+                        index,
+                        collection: "globals",
+                    })
+            }
+            ScopedCardKind::InitialCondition(index) => self
+                .initial_conditions
+                .get(index)
+                .map(ScopeEntry::InitialCondition)
+                .ok_or(ScopeOrderError::Index {
+                    index,
+                    collection: "initial_conditions",
+                }),
+            ScopedCardKind::Nodeset(index) => self
+                .nodesets
+                .get(index)
+                .map(ScopeEntry::Nodeset)
+                .ok_or(ScopeOrderError::Index {
+                    index,
+                    collection: "nodesets",
+                }),
+            ScopedCardKind::Func(index) => {
+                self.functions
+                    .get(index)
+                    .map(ScopeEntry::Func)
+                    .ok_or(ScopeOrderError::Index {
+                        index,
+                        collection: "functions",
+                    })
+            }
+            ScopedCardKind::Output => Ok(ScopeEntry::Output),
+            ScopedCardKind::Measure => Ok(ScopeEntry::Measure),
+            ScopedCardKind::Fourier => Ok(ScopeEntry::Fourier),
+            ScopedCardKind::Ends => Ok(ScopeEntry::Ends),
+            ScopedCardKind::End => Ok(ScopeEntry::End),
+        }
+    }
+
+    /// Indexed vectors are in card order. Reject missing or duplicate refs
+    /// even when their total count happens to equal the vector lengths.
+    pub(crate) fn validate_order(self) -> Result<(), ScopeOrderError> {
+        let lengths = [
+            self.devices.len(),
+            self.models.len(),
+            self.subcircuits.len(),
+            self.analyses.len(),
+            self.includes.len(),
+            self.params.len(),
+            self.options.len(),
+            self.globals.len(),
+            self.initial_conditions.len(),
+            self.nodesets.len(),
+            self.functions.len(),
+        ];
+        let mut next = [0; 11];
+        for card in self.cards {
+            let (collection, index) = match card.kind {
+                ScopedCardKind::Device(index) => (0, index),
+                ScopedCardKind::Model(index) => (1, index),
+                ScopedCardKind::Subcircuit(index) => (2, index),
+                ScopedCardKind::Analysis(index) => (3, index),
+                ScopedCardKind::Include(index) => (4, index),
+                ScopedCardKind::Param(index) => (5, index),
+                ScopedCardKind::Options(index) => (6, index),
+                ScopedCardKind::Global(index) => (7, index),
+                ScopedCardKind::InitialCondition(index) => (8, index),
+                ScopedCardKind::Nodeset(index) => (9, index),
+                ScopedCardKind::Func(index) => (10, index),
+                _ => continue,
+            };
+            self.entry(card.kind)?;
+            if index != next[collection] {
+                return Err(ScopeOrderError::Coverage);
+            }
+            next[collection] += 1;
+        }
+        if next != lengths {
+            return Err(ScopeOrderError::Coverage);
+        }
+        Ok(())
+    }
+}
+
 impl Netlist {
     /// The analyses requested, in deck order.
     pub fn analysis_kinds(&self) -> impl Iterator<Item = AnalysisKind> + '_ {

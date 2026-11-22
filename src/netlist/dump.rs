@@ -55,9 +55,8 @@ use std::path::Path;
 use crate::primitives::{SourceLoc, SpiceError, SpiceResult};
 
 use crate::netlist::ast::{
-    AnalysisCard, DeviceInstance, FuncCard, FuncSpelling, GlobalCard, IncludeDirective, ModelCard,
-    Netlist, NodeHintCard, NodeHintValue, OptionCard, ParamCard, ParameterAssignment,
-    ParameterKind, PositionedValue, ScopedCard, ScopedCardKind, SourceWaveform, Subcircuit,
+    DeviceInstance, FuncSpelling, Netlist, NodeHintValue, ParameterAssignment, ParameterKind,
+    PositionedValue, ScopeView, ScopedCard, ScopedCardKind, SourceWaveform,
 };
 use crate::netlist::bexpr::{BExpr, BExprKind, BUnaryOp};
 use crate::netlist::card::{CardKind, RawCard};
@@ -438,21 +437,6 @@ pub fn dump_ast_error(path: &Path, error: &SpiceError, paths: &PathMapper) -> St
     out.text
 }
 
-struct Scope<'a> {
-    devices: &'a [DeviceInstance],
-    models: &'a [ModelCard],
-    subcircuits: &'a [Subcircuit],
-    analyses: &'a [AnalysisCard],
-    includes: &'a [IncludeDirective],
-    params: &'a [ParamCard],
-    functions: &'a [FuncCard],
-    options: &'a [OptionCard],
-    globals: &'a [GlobalCard],
-    initial_conditions: &'a [NodeHintCard],
-    nodesets: &'a [NodeHintCard],
-    cards: &'a [ScopedCard],
-}
-
 /// Dumps a parsed netlist.
 #[must_use]
 pub fn dump_ast(netlist: &Netlist, paths: &PathMapper) -> String {
@@ -468,20 +452,7 @@ pub fn dump_ast(netlist: &Netlist, paths: &PathMapper) -> String {
         ),
     );
     out.line(0, "scope root");
-    let scope = Scope {
-        devices: &netlist.devices,
-        models: &netlist.models,
-        subcircuits: &netlist.subcircuits,
-        analyses: &netlist.analyses,
-        includes: &netlist.includes,
-        params: &netlist.params,
-        functions: &netlist.functions,
-        options: &netlist.options,
-        globals: &netlist.globals,
-        initial_conditions: &netlist.initial_conditions,
-        nodesets: &netlist.nodesets,
-        cards: &netlist.cards,
-    };
+    let scope = ScopeView::from(netlist);
     write_scope(&ctx, &mut out, 1, &scope);
     out.text
 }
@@ -490,7 +461,7 @@ fn section(out: &mut Out, indent: usize, name: &str, count: usize) {
     out.line(indent, format!("{name} ({count}):"));
 }
 
-fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
+fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &ScopeView<'_>) {
     write_scope_devices(ctx, out, indent, scope);
     write_scope_subcircuits(ctx, out, indent, scope);
     write_scope_analyses(ctx, out, indent, scope);
@@ -499,7 +470,7 @@ fn write_scope(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
     write_scope_hints(ctx, out, indent, scope);
 }
 
-fn write_scope_devices(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
+fn write_scope_devices(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &ScopeView<'_>) {
     section(out, indent, "cards", scope.cards.len());
     for (n, card) in scope.cards.iter().enumerate() {
         write_card(ctx, out, indent + 1, n, card);
@@ -524,7 +495,7 @@ fn write_scope_devices(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scop
     }
 }
 
-fn write_scope_subcircuits(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
+fn write_scope_subcircuits(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &ScopeView<'_>) {
     section(out, indent, "subcircuits", scope.subcircuits.len());
     for (n, sub) in scope.subcircuits.iter().enumerate() {
         out.line(
@@ -540,25 +511,12 @@ fn write_scope_subcircuits(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &
         out.line(indent + 2, format!("terminals: {}", terminals.join(" ")));
         write_parameters(ctx, out, indent + 2, &sub.parameters);
         out.line(indent + 2, "scope body");
-        let inner = Scope {
-            devices: &sub.devices,
-            models: &sub.models,
-            subcircuits: &sub.subcircuits,
-            analyses: &sub.analyses,
-            includes: &sub.includes,
-            params: &sub.params,
-            functions: &sub.functions,
-            options: &sub.options,
-            globals: &sub.globals,
-            initial_conditions: &sub.initial_conditions,
-            nodesets: &sub.nodesets,
-            cards: &sub.cards,
-        };
+        let inner = ScopeView::from(sub);
         write_scope(ctx, out, indent + 3, &inner);
     }
 }
 
-fn write_scope_analyses(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
+fn write_scope_analyses(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &ScopeView<'_>) {
     section(out, indent, "analyses", scope.analyses.len());
     for (n, analysis) in scope.analyses.iter().enumerate() {
         out.line(
@@ -617,7 +575,7 @@ fn write_scope_analyses(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Sco
     }
 }
 
-fn write_scope_parameters(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
+fn write_scope_parameters(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &ScopeView<'_>) {
     section(out, indent, "params", scope.params.len());
     for (n, card) in scope.params.iter().enumerate() {
         out.line(
@@ -668,7 +626,7 @@ fn write_scope_parameters(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &S
     }
 }
 
-fn write_scope_options(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
+fn write_scope_options(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &ScopeView<'_>) {
     section(out, indent, "options", scope.options.len());
     for (n, card) in scope.options.iter().enumerate() {
         out.line(
@@ -712,7 +670,7 @@ fn write_scope_options(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scop
     }
 }
 
-fn write_scope_hints(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scope<'_>) {
+fn write_scope_hints(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &ScopeView<'_>) {
     for (name, label, cards) in [
         ("initial-conditions", "ic-card", scope.initial_conditions),
         ("nodesets", "nodeset-card", scope.nodesets),
