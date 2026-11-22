@@ -12,7 +12,7 @@
 //! - Strings are double quoted with `\\`, `\"`, `\n`, `\r`, `\t` and
 //!   `\u{hex}` escapes for other control characters. Everything else is verbatim.
 //! - A location is `path:line:column` (1-based line, 1-based **byte** column
-//!   relative to the joined logical card). Paths are rendered by [`PathMapper`]:
+//!   within the physical source line). Paths are rendered by [`PathMapper`]:
 //!   relative to the fixture root with `/` separators, never absolute.
 //! - Reals are printed with Rust's shortest round-trip exponent form (`{:e}`).
 //! - Nesting is shown with two-space indentation.

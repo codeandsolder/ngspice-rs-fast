@@ -26,7 +26,10 @@ pub(super) fn positioned(token: &Token) -> PositionedValue {
 }
 
 pub(super) fn numeric<'a>(input: &mut Input<'a>, maximum: usize) -> Result<NumericVector<'a>> {
-    let start = super::grammar::location(input).column as usize - 1;
+    let start = input
+        .input
+        .first()
+        .map_or(input.state.card.raw.len(), |token| token.raw_offset);
     let parenthesized = opt(punctuation(TokenKind::LParen))
         .parse_next(input)?
         .is_some();
@@ -64,8 +67,8 @@ pub(super) fn numeric<'a>(input: &mut Input<'a>, maximum: usize) -> Result<Numer
     } else {
         values[values.len() - 1]
     };
-    let end = last.location.column as usize - 1 + last.text.len();
-    // Token columns are byte offsets in this exact joined raw card.
+    let end = last.raw_offset + last.text.len();
+    // Use joined offsets, not physical diagnostic coordinates.
     let text = input
         .state
         .card

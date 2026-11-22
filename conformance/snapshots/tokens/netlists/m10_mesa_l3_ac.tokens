@@ -68,15 +68,15 @@ card 5 @netlists/m10_mesa_l3_ac.cir:6:1 lines=6-7 continuations=1
   token 22 6:58 word "sigma0"
   token 23 6:64 equals "="
   token 24 6:65 number "0.02" value=2e-2
-  token 25 6:70 word "vsigmat"
-  token 26 6:77 equals "="
-  token 27 6:78 number "1.37" value=1.37e0
-  token 28 6:83 word "delta"
-  token 29 6:88 equals "="
-  token 30 6:89 number "5" value=5e0
-  token 31 6:91 word "beta"
-  token 32 6:95 equals "="
-  token 33 6:96 number "0.0085" value=8.5e-3
+  token 25 7:3 word "vsigmat"
+  token 26 7:10 equals "="
+  token 27 7:11 number "1.37" value=1.37e0
+  token 28 7:16 word "delta"
+  token 29 7:21 equals "="
+  token 30 7:22 number "5" value=5e0
+  token 31 7:24 word "beta"
+  token 32 7:28 equals "="
+  token 33 7:29 number "0.0085" value=8.5e-3
 card 6 @netlists/m10_mesa_l3_ac.cir:8:1 lines=8-8 continuations=0
   raw: ".save all"
   kind: dot(.save)

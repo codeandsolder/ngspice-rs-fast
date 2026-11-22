@@ -32,22 +32,43 @@
 
 use crate::primitives::{Real, SourceLoc};
 
-/// A half-open byte range on one logical card: `start` is the first byte,
-/// `end` the column just past the last byte. Columns follow the tokenizer's
-/// contract (1-based, relative to the joined logical card).
+/// A half-open byte range with physical source coordinates and a separate
+/// logical byte range in the parser's input. Physical endpoints can be on
+/// different lines; logical offsets are used to slice the retained spelling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSpan {
     /// First byte of the spanned text.
     pub start: SourceLoc,
-    /// Column one past the last byte (same file and line as `start`).
+    /// Physical location just past the last byte.
     pub end: SourceLoc,
+    /// Half-open byte range in the parser's shared logical input.
+    pub logical: std::ops::Range<usize>,
 }
 
 impl SourceSpan {
+    pub(crate) fn from_positions(
+        start: crate::netlist::source::SourcePosition<'_>,
+        end: crate::netlist::source::SourcePosition<'_>,
+    ) -> Self {
+        Self {
+            start: start.location(),
+            end: end.location(),
+            logical: start.logical_offset()..end.logical_offset(),
+        }
+    }
+
+    /// The byte range relative to the containing span, for slicing its text.
+    #[must_use]
+    pub fn relative_to(&self, container: &Self) -> Option<std::ops::Range<usize>> {
+        let start = self.logical.start.checked_sub(container.logical.start)?;
+        let end = self.logical.end.checked_sub(container.logical.start)?;
+        (end <= container.len()).then_some(start..end)
+    }
+
     /// Span length in bytes.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.end.column.saturating_sub(self.start.column) as usize
+        self.logical.end - self.logical.start
     }
 
     /// True when the span covers no bytes.
@@ -72,8 +93,7 @@ pub struct ParameterExpression {
     /// the same as the braced one; the flag only preserves the spelling for
     /// the writer and dumps. Implies [`braced`](Self::braced).
     pub quoted: bool,
-    /// Span of [`text`](Self::text). For a braced expression the braces sit one
-    /// column before `span.start` and at `span.end`.
+    /// Span of [`text`](Self::text), excluding enclosing delimiters.
     pub span: SourceSpan,
     /// The syntax tree. `root.span` excludes surrounding whitespace.
     pub root: Expr,

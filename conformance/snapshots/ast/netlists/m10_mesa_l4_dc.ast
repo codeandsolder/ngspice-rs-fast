@@ -39,8 +39,8 @@ scope root
         [4] name="rsi" kind=scalar value="30" @netlists/m10_mesa_l4_dc.cir:5:42
         [5] name="mu" kind=scalar value="0.35" @netlists/m10_mesa_l4_dc.cir:5:49
         [6] name="nmax" kind=scalar value="3e16" @netlists/m10_mesa_l4_dc.cir:5:57
-        [7] name="cas" kind=scalar value="1" @netlists/m10_mesa_l4_dc.cir:5:67
-        [8] name="cbs" kind=scalar value="1" @netlists/m10_mesa_l4_dc.cir:5:73
+        [7] name="cas" kind=scalar value="1" @netlists/m10_mesa_l4_dc.cir:6:3
+        [8] name="cbs" kind=scalar value="1" @netlists/m10_mesa_l4_dc.cir:6:9
   subcircuits (0):
   analyses (1):
     analysis [0] kind=dc @netlists/m10_mesa_l4_dc.cir:9:1

@@ -58,7 +58,7 @@ scope root
         [4] name="rsi" kind=scalar value="20" @netlists/sens_mesa3.cir:21:46
         [5] name="rtc1" kind=scalar value="1e-3" @netlists/sens_mesa3.cir:21:53
         [6] name="rtc2" kind=scalar value="1e-5" @netlists/sens_mesa3.cir:21:63
-        [7] name="phib" kind=scalar value="3.1232e18" @netlists/sens_mesa3.cir:21:73
+        [7] name="phib" kind=scalar value="3.1232e18" @netlists/sens_mesa3.cir:22:3
     model [1] name="mesmod2" base="nmf" level=3e0 @netlists/sens_mesa3.cir:23:1
       parameters (8):
         [0] name="level" kind=scalar value="3" @netlists/sens_mesa3.cir:23:20
@@ -68,7 +68,7 @@ scope root
         [4] name="rsi" kind=scalar value="20" @netlists/sens_mesa3.cir:23:47
         [5] name="rtc1" kind=scalar value="1e-3" @netlists/sens_mesa3.cir:23:54
         [6] name="rtc2" kind=scalar value="1e-5" @netlists/sens_mesa3.cir:23:64
-        [7] name="phib" kind=scalar value="3.1232e18" @netlists/sens_mesa3.cir:23:74
+        [7] name="phib" kind=scalar value="3.1232e18" @netlists/sens_mesa3.cir:24:3
   subcircuits (0):
   analyses (1):
     analysis [0] kind=sens @netlists/sens_mesa3.cir:25:1

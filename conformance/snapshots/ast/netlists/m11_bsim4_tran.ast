@@ -93,33 +93,33 @@ scope root
         [3] name="rbodymod" kind=scalar value="1" @netlists/m11_bsim4_tran.cir:13:51
         [4] name="igcmod" kind=scalar value="1" @netlists/m11_bsim4_tran.cir:13:62
         [5] name="igbmod" kind=scalar value="1" @netlists/m11_bsim4_tran.cir:13:71
-        [6] name="xrcrg1" kind=scalar value="12" @netlists/m11_bsim4_tran.cir:13:80
-        [7] name="xrcrg2" kind=scalar value="5" @netlists/m11_bsim4_tran.cir:13:90
-        [8] name="rshg" kind=scalar value="0.4" @netlists/m11_bsim4_tran.cir:13:99
-        [9] name="rbpb" kind=scalar value="5" @netlists/m11_bsim4_tran.cir:13:108
-        [10] name="rbpd" kind=scalar value="15" @netlists/m11_bsim4_tran.cir:13:115
-        [11] name="rbps" kind=scalar value="15" @netlists/m11_bsim4_tran.cir:13:123
-        [12] name="rbdb" kind=scalar value="15" @netlists/m11_bsim4_tran.cir:13:131
-        [13] name="rbsb" kind=scalar value="15" @netlists/m11_bsim4_tran.cir:13:139
-        [14] name="cgso" kind=scalar value="1.5e-10" @netlists/m11_bsim4_tran.cir:13:147
-        [15] name="cgdo" kind=scalar value="1.5e-10" @netlists/m11_bsim4_tran.cir:13:160
-        [16] name="cgbo" kind=scalar value="1e-11" @netlists/m11_bsim4_tran.cir:13:173
-        [17] name="jss" kind=scalar value="1e-4" @netlists/m11_bsim4_tran.cir:13:184
-        [18] name="cjs" kind=scalar value="1e-3" @netlists/m11_bsim4_tran.cir:13:193
-        [19] name="cjsws" kind=scalar value="2e-10" @netlists/m11_bsim4_tran.cir:13:202
-        [20] name="trnqsmod" kind=scalar value="1" @netlists/m11_bsim4_tran.cir:13:214
+        [6] name="xrcrg1" kind=scalar value="12" @netlists/m11_bsim4_tran.cir:14:3
+        [7] name="xrcrg2" kind=scalar value="5" @netlists/m11_bsim4_tran.cir:14:13
+        [8] name="rshg" kind=scalar value="0.4" @netlists/m11_bsim4_tran.cir:14:22
+        [9] name="rbpb" kind=scalar value="5" @netlists/m11_bsim4_tran.cir:14:31
+        [10] name="rbpd" kind=scalar value="15" @netlists/m11_bsim4_tran.cir:14:38
+        [11] name="rbps" kind=scalar value="15" @netlists/m11_bsim4_tran.cir:14:46
+        [12] name="rbdb" kind=scalar value="15" @netlists/m11_bsim4_tran.cir:14:54
+        [13] name="rbsb" kind=scalar value="15" @netlists/m11_bsim4_tran.cir:14:62
+        [14] name="cgso" kind=scalar value="1.5e-10" @netlists/m11_bsim4_tran.cir:15:3
+        [15] name="cgdo" kind=scalar value="1.5e-10" @netlists/m11_bsim4_tran.cir:15:16
+        [16] name="cgbo" kind=scalar value="1e-11" @netlists/m11_bsim4_tran.cir:15:29
+        [17] name="jss" kind=scalar value="1e-4" @netlists/m11_bsim4_tran.cir:15:40
+        [18] name="cjs" kind=scalar value="1e-3" @netlists/m11_bsim4_tran.cir:15:49
+        [19] name="cjsws" kind=scalar value="2e-10" @netlists/m11_bsim4_tran.cir:15:58
+        [20] name="trnqsmod" kind=scalar value="1" @netlists/m11_bsim4_tran.cir:16:3
     model [1] name="pch" base="pmos" level=5.4e1 @netlists/m11_bsim4_tran.cir:17:1
       parameters (10):
         [0] name="level" kind=scalar value="54" @netlists/m11_bsim4_tran.cir:17:17
         [1] name="version" kind=textual value="4.8.3" @netlists/m11_bsim4_tran.cir:17:26
         [2] name="rdsmod" kind=scalar value="1" @netlists/m11_bsim4_tran.cir:17:40
         [3] name="rdsw" kind=scalar value="200" @netlists/m11_bsim4_tran.cir:17:49
-        [4] name="cgso" kind=scalar value="1.5e-10" @netlists/m11_bsim4_tran.cir:17:58
-        [5] name="cgdo" kind=scalar value="1.5e-10" @netlists/m11_bsim4_tran.cir:17:71
-        [6] name="cgbo" kind=scalar value="1e-11" @netlists/m11_bsim4_tran.cir:17:84
-        [7] name="jss" kind=scalar value="1e-4" @netlists/m11_bsim4_tran.cir:17:95
-        [8] name="cjs" kind=scalar value="1e-3" @netlists/m11_bsim4_tran.cir:17:104
-        [9] name="cjsws" kind=scalar value="2e-10" @netlists/m11_bsim4_tran.cir:17:113
+        [4] name="cgso" kind=scalar value="1.5e-10" @netlists/m11_bsim4_tran.cir:18:3
+        [5] name="cgdo" kind=scalar value="1.5e-10" @netlists/m11_bsim4_tran.cir:18:16
+        [6] name="cgbo" kind=scalar value="1e-11" @netlists/m11_bsim4_tran.cir:18:29
+        [7] name="jss" kind=scalar value="1e-4" @netlists/m11_bsim4_tran.cir:18:40
+        [8] name="cjs" kind=scalar value="1e-3" @netlists/m11_bsim4_tran.cir:18:49
+        [9] name="cjsws" kind=scalar value="2e-10" @netlists/m11_bsim4_tran.cir:18:58
   subcircuits (0):
   analyses (1):
     analysis [0] kind=tran @netlists/m11_bsim4_tran.cir:19:1

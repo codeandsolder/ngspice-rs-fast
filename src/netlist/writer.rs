@@ -914,13 +914,7 @@ fn check_closed(sub: &Subcircuit, chain: &[SourceLoc]) -> SpiceResult<()> {
 }
 
 fn lex(text: &str, location: &SourceLoc) -> SpiceResult<Vec<Token>> {
-    tokenize(&LogicalLine {
-        location: location.clone(),
-        end_line: location.line,
-        continuations: 0,
-        text: text.to_owned(),
-    })
-    .map_err(|error| {
+    tokenize(&LogicalLine::single(location.clone(), text.to_owned())).map_err(|error| {
         refuse(
             format!("text {text:?} does not tokenize: {error}"),
             Some(location),

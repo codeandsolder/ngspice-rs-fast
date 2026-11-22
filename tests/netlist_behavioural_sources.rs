@@ -513,3 +513,15 @@ fn current_references_insert_measurement_sources_like_inp_meas_current() {
         "(i(e1) + i(vx))"
     );
 }
+
+#[test]
+fn behavioural_expression_and_setters_use_separate_physical_and_logical_offsets() {
+    let device = device("  B1 out 0 v=2*\n* comment\n  + v(in) m=3");
+    let expr = expression(&device, "v");
+    assert_eq!(expr.text, "2* v(in)");
+    assert_eq!((expr.span.start.line, expr.span.start.column), (2, 14));
+    assert_eq!((expr.span.end.line, expr.span.end.column), (4, 10));
+    assert_eq!(expr.span.len(), expr.text.len());
+    let setter = &device.parameters[1].location;
+    assert_eq!((setter.line, setter.column), (4, 11));
+}

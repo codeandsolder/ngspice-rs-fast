@@ -122,49 +122,49 @@ card 6 @netlists/m10_mos3_tran.cir:11:1 lines=11-13 continuations=2
   token 26 11:76 word "vmax"
   token 27 11:80 equals "="
   token 28 11:81 number "1.5e5" value=1.5e5
-  token 29 11:87 word "nfs"
-  token 30 11:90 equals "="
-  token 31 11:91 number "5e11" value=5e11
-  token 32 11:96 word "eta"
-  token 33 11:99 equals "="
-  token 34 11:100 number "0.1" value=1e-1
-  token 35 11:104 word "theta"
-  token 36 11:109 equals "="
-  token 37 11:110 number "0.15" value=1.5e-1
-  token 38 11:115 word "kappa"
-  token 39 11:120 equals "="
-  token 40 11:121 number "0.3" value=3.0000000000000004e-1
-  token 41 11:125 word "delta"
-  token 42 11:130 equals "="
-  token 43 11:131 number "0.5" value=5e-1
-  token 44 11:135 word "cgso"
-  token 45 11:139 equals "="
-  token 46 11:140 number "0.3n" value=3e-10
-  token 47 11:145 word "cgdo"
-  token 48 11:149 equals "="
-  token 49 11:150 number "0.3n" value=3e-10
-  token 50 11:155 word "cgbo"
-  token 51 11:159 equals "="
-  token 52 11:160 number "0.1n" value=1e-10
-  token 53 11:165 word "cj"
-  token 54 11:167 equals "="
-  token 55 11:168 number "0.9m" value=9.000000000000001e-4
-  token 56 11:173 word "mj"
-  token 57 11:175 equals "="
-  token 58 11:176 number "0.5" value=5e-1
-  token 59 11:180 word "cjsw"
-  token 60 11:184 equals "="
-  token 61 11:185 number "0.25n" value=2.4999999999999996e-10
-  token 62 11:191 word "pb"
-  token 63 11:193 equals "="
-  token 64 11:194 number "0.9" value=9e-1
-  token 65 11:198 word "rsh"
-  token 66 11:201 equals "="
-  token 67 11:202 number "20" value=2e1
-  token 68 11:205 word "js"
-  token 69 11:207 equals "="
-  token 70 11:208 number "1e-4" value=1e-4
-  token 71 11:212 rparen ")"
+  token 29 12:3 word "nfs"
+  token 30 12:6 equals "="
+  token 31 12:7 number "5e11" value=5e11
+  token 32 12:12 word "eta"
+  token 33 12:15 equals "="
+  token 34 12:16 number "0.1" value=1e-1
+  token 35 12:20 word "theta"
+  token 36 12:25 equals "="
+  token 37 12:26 number "0.15" value=1.5e-1
+  token 38 12:31 word "kappa"
+  token 39 12:36 equals "="
+  token 40 12:37 number "0.3" value=3.0000000000000004e-1
+  token 41 12:41 word "delta"
+  token 42 12:46 equals "="
+  token 43 12:47 number "0.5" value=5e-1
+  token 44 12:51 word "cgso"
+  token 45 12:55 equals "="
+  token 46 12:56 number "0.3n" value=3e-10
+  token 47 12:61 word "cgdo"
+  token 48 12:65 equals "="
+  token 49 12:66 number "0.3n" value=3e-10
+  token 50 12:71 word "cgbo"
+  token 51 12:75 equals "="
+  token 52 12:76 number "0.1n" value=1e-10
+  token 53 13:3 word "cj"
+  token 54 13:5 equals "="
+  token 55 13:6 number "0.9m" value=9.000000000000001e-4
+  token 56 13:11 word "mj"
+  token 57 13:13 equals "="
+  token 58 13:14 number "0.5" value=5e-1
+  token 59 13:18 word "cjsw"
+  token 60 13:22 equals "="
+  token 61 13:23 number "0.25n" value=2.4999999999999996e-10
+  token 62 13:29 word "pb"
+  token 63 13:31 equals "="
+  token 64 13:32 number "0.9" value=9e-1
+  token 65 13:36 word "rsh"
+  token 66 13:39 equals "="
+  token 67 13:40 number "20" value=2e1
+  token 68 13:43 word "js"
+  token 69 13:45 equals "="
+  token 70 13:46 number "1e-4" value=1e-4
+  token 71 13:50 rparen ")"
 card 7 @netlists/m10_mos3_tran.cir:14:1 lines=14-16 continuations=2
   raw: ".model pch pmos(level=3 vto=-0.75 tox=9n nsub=2.5e16 xj=0.15u ld=0.04u uo=180 vmax=1.2e5 nfs=5e11 eta=0.1 theta=0.18 kappa=0.4 cgso=0.3n cgdo=0.3n cgbo=0.1n cj=1m cjsw=0.3n pb=0.9 rd=30 rs=30)"
   kind: dot(.model)
@@ -196,43 +196,43 @@ card 7 @netlists/m10_mos3_tran.cir:14:1 lines=14-16 continuations=2
   token 26 14:79 word "vmax"
   token 27 14:83 equals "="
   token 28 14:84 number "1.2e5" value=1.2e5
-  token 29 14:90 word "nfs"
-  token 30 14:93 equals "="
-  token 31 14:94 number "5e11" value=5e11
-  token 32 14:99 word "eta"
-  token 33 14:102 equals "="
-  token 34 14:103 number "0.1" value=1e-1
-  token 35 14:107 word "theta"
-  token 36 14:112 equals "="
-  token 37 14:113 number "0.18" value=1.8e-1
-  token 38 14:118 word "kappa"
-  token 39 14:123 equals "="
-  token 40 14:124 number "0.4" value=4e-1
-  token 41 14:128 word "cgso"
-  token 42 14:132 equals "="
-  token 43 14:133 number "0.3n" value=3e-10
-  token 44 14:138 word "cgdo"
-  token 45 14:142 equals "="
-  token 46 14:143 number "0.3n" value=3e-10
-  token 47 14:148 word "cgbo"
-  token 48 14:152 equals "="
-  token 49 14:153 number "0.1n" value=1e-10
-  token 50 14:158 word "cj"
-  token 51 14:160 equals "="
-  token 52 14:161 number "1m" value=1e-3
-  token 53 14:164 word "cjsw"
-  token 54 14:168 equals "="
-  token 55 14:169 number "0.3n" value=3e-10
-  token 56 14:174 word "pb"
-  token 57 14:176 equals "="
-  token 58 14:177 number "0.9" value=9e-1
-  token 59 14:181 word "rd"
-  token 60 14:183 equals "="
-  token 61 14:184 number "30" value=3e1
-  token 62 14:187 word "rs"
-  token 63 14:189 equals "="
-  token 64 14:190 number "30" value=3e1
-  token 65 14:192 rparen ")"
+  token 29 15:3 word "nfs"
+  token 30 15:6 equals "="
+  token 31 15:7 number "5e11" value=5e11
+  token 32 15:12 word "eta"
+  token 33 15:15 equals "="
+  token 34 15:16 number "0.1" value=1e-1
+  token 35 15:20 word "theta"
+  token 36 15:25 equals "="
+  token 37 15:26 number "0.18" value=1.8e-1
+  token 38 15:31 word "kappa"
+  token 39 15:36 equals "="
+  token 40 15:37 number "0.4" value=4e-1
+  token 41 15:41 word "cgso"
+  token 42 15:45 equals "="
+  token 43 15:46 number "0.3n" value=3e-10
+  token 44 15:51 word "cgdo"
+  token 45 15:55 equals "="
+  token 46 15:56 number "0.3n" value=3e-10
+  token 47 15:61 word "cgbo"
+  token 48 15:65 equals "="
+  token 49 15:66 number "0.1n" value=1e-10
+  token 50 16:3 word "cj"
+  token 51 16:5 equals "="
+  token 52 16:6 number "1m" value=1e-3
+  token 53 16:9 word "cjsw"
+  token 54 16:13 equals "="
+  token 55 16:14 number "0.3n" value=3e-10
+  token 56 16:19 word "pb"
+  token 57 16:21 equals "="
+  token 58 16:22 number "0.9" value=9e-1
+  token 59 16:26 word "rd"
+  token 60 16:28 equals "="
+  token 61 16:29 number "30" value=3e1
+  token 62 16:32 word "rs"
+  token 63 16:34 equals "="
+  token 64 16:35 number "30" value=3e1
+  token 65 16:37 rparen ")"
 card 8 @netlists/m10_mos3_tran.cir:17:1 lines=17-17 continuations=0
   raw: ".options method=gear reltol=1e-5"
   kind: dot(.options)

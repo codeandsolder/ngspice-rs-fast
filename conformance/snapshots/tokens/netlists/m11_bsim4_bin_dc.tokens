@@ -96,48 +96,48 @@ card 6 @netlists/m11_bsim4_bin_dc.cir:11:1 lines=11-13 continuations=2
   token 31 11:113 word "igbmod"
   token 32 11:119 equals "="
   token 33 11:120 number "1" value=1e0
-  token 34 11:122 word "xrcrg1"
-  token 35 11:128 equals "="
-  token 36 11:129 number "12" value=1.2e1
-  token 37 11:132 word "xrcrg2"
-  token 38 11:138 equals "="
-  token 39 11:139 number "5" value=5e0
-  token 40 11:141 word "rshg"
-  token 41 11:145 equals "="
-  token 42 11:146 number "0.4" value=4e-1
-  token 43 11:150 word "rbpb"
-  token 44 11:154 equals "="
-  token 45 11:155 number "5" value=5e0
-  token 46 11:157 word "rbpd"
-  token 47 11:161 equals "="
-  token 48 11:162 number "15" value=1.5e1
-  token 49 11:165 word "rbps"
-  token 50 11:169 equals "="
-  token 51 11:170 number "15" value=1.5e1
-  token 52 11:173 word "rbdb"
-  token 53 11:177 equals "="
-  token 54 11:178 number "15" value=1.5e1
-  token 55 11:181 word "rbsb"
-  token 56 11:185 equals "="
-  token 57 11:186 number "15" value=1.5e1
-  token 58 11:189 word "cgso"
-  token 59 11:193 equals "="
-  token 60 11:194 number "1.5e-10" value=1.5e-10
-  token 61 11:202 word "cgdo"
-  token 62 11:206 equals "="
-  token 63 11:207 number "1.5e-10" value=1.5e-10
-  token 64 11:215 word "cgbo"
-  token 65 11:219 equals "="
-  token 66 11:220 number "1e-11" value=1e-11
-  token 67 11:226 word "jss"
-  token 68 11:229 equals "="
-  token 69 11:230 number "1e-4" value=1e-4
-  token 70 11:235 word "cjs"
-  token 71 11:238 equals "="
-  token 72 11:239 number "1e-3" value=1e-3
-  token 73 11:244 word "cjsws"
-  token 74 11:249 equals "="
-  token 75 11:250 number "2e-10" value=2e-10
+  token 34 12:3 word "xrcrg1"
+  token 35 12:9 equals "="
+  token 36 12:10 number "12" value=1.2e1
+  token 37 12:13 word "xrcrg2"
+  token 38 12:19 equals "="
+  token 39 12:20 number "5" value=5e0
+  token 40 12:22 word "rshg"
+  token 41 12:26 equals "="
+  token 42 12:27 number "0.4" value=4e-1
+  token 43 12:31 word "rbpb"
+  token 44 12:35 equals "="
+  token 45 12:36 number "5" value=5e0
+  token 46 12:38 word "rbpd"
+  token 47 12:42 equals "="
+  token 48 12:43 number "15" value=1.5e1
+  token 49 12:46 word "rbps"
+  token 50 12:50 equals "="
+  token 51 12:51 number "15" value=1.5e1
+  token 52 12:54 word "rbdb"
+  token 53 12:58 equals "="
+  token 54 12:59 number "15" value=1.5e1
+  token 55 12:62 word "rbsb"
+  token 56 12:66 equals "="
+  token 57 12:67 number "15" value=1.5e1
+  token 58 13:3 word "cgso"
+  token 59 13:7 equals "="
+  token 60 13:8 number "1.5e-10" value=1.5e-10
+  token 61 13:16 word "cgdo"
+  token 62 13:20 equals "="
+  token 63 13:21 number "1.5e-10" value=1.5e-10
+  token 64 13:29 word "cgbo"
+  token 65 13:33 equals "="
+  token 66 13:34 number "1e-11" value=1e-11
+  token 67 13:40 word "jss"
+  token 68 13:43 equals "="
+  token 69 13:44 number "1e-4" value=1e-4
+  token 70 13:49 word "cjs"
+  token 71 13:52 equals "="
+  token 72 13:53 number "1e-3" value=1e-3
+  token 73 13:58 word "cjsws"
+  token 74 13:63 equals "="
+  token 75 13:64 number "2e-10" value=2e-10
 card 7 @netlists/m11_bsim4_bin_dc.cir:14:1 lines=14-17 continuations=3
   raw: ".model nch.2 nmos lmin=2e-7 lmax=1e-5 wmin=1e-7 wmax=1e-4 level=54 version=4.8.3 rgatemod=1 rbodymod=1 igcmod=1 igbmod=1 xrcrg1=12 xrcrg2=5 rshg=0.4 rbpb=5 rbpd=15 rbps=15 rbdb=15 rbsb=15 cgso=1.5e-10 cgdo=1.5e-10 cgbo=1e-11 jss=1e-4 cjs=1e-3 cjsws=2e-10 vth0=0.42 lvth0=1e-9 wvth0=2e-9 pvth0=1e-16"
   kind: dot(.model)
@@ -174,60 +174,60 @@ card 7 @netlists/m11_bsim4_bin_dc.cir:14:1 lines=14-17 continuations=3
   token 31 14:113 word "igbmod"
   token 32 14:119 equals "="
   token 33 14:120 number "1" value=1e0
-  token 34 14:122 word "xrcrg1"
-  token 35 14:128 equals "="
-  token 36 14:129 number "12" value=1.2e1
-  token 37 14:132 word "xrcrg2"
-  token 38 14:138 equals "="
-  token 39 14:139 number "5" value=5e0
-  token 40 14:141 word "rshg"
-  token 41 14:145 equals "="
-  token 42 14:146 number "0.4" value=4e-1
-  token 43 14:150 word "rbpb"
-  token 44 14:154 equals "="
-  token 45 14:155 number "5" value=5e0
-  token 46 14:157 word "rbpd"
-  token 47 14:161 equals "="
-  token 48 14:162 number "15" value=1.5e1
-  token 49 14:165 word "rbps"
-  token 50 14:169 equals "="
-  token 51 14:170 number "15" value=1.5e1
-  token 52 14:173 word "rbdb"
-  token 53 14:177 equals "="
-  token 54 14:178 number "15" value=1.5e1
-  token 55 14:181 word "rbsb"
-  token 56 14:185 equals "="
-  token 57 14:186 number "15" value=1.5e1
-  token 58 14:189 word "cgso"
-  token 59 14:193 equals "="
-  token 60 14:194 number "1.5e-10" value=1.5e-10
-  token 61 14:202 word "cgdo"
-  token 62 14:206 equals "="
-  token 63 14:207 number "1.5e-10" value=1.5e-10
-  token 64 14:215 word "cgbo"
-  token 65 14:219 equals "="
-  token 66 14:220 number "1e-11" value=1e-11
-  token 67 14:226 word "jss"
-  token 68 14:229 equals "="
-  token 69 14:230 number "1e-4" value=1e-4
-  token 70 14:235 word "cjs"
-  token 71 14:238 equals "="
-  token 72 14:239 number "1e-3" value=1e-3
-  token 73 14:244 word "cjsws"
-  token 74 14:249 equals "="
-  token 75 14:250 number "2e-10" value=2e-10
-  token 76 14:256 word "vth0"
-  token 77 14:260 equals "="
-  token 78 14:261 number "0.42" value=4.2e-1
-  token 79 14:266 word "lvth0"
-  token 80 14:271 equals "="
-  token 81 14:272 number "1e-9" value=1e-9
-  token 82 14:277 word "wvth0"
-  token 83 14:282 equals "="
-  token 84 14:283 number "2e-9" value=2e-9
-  token 85 14:288 word "pvth0"
-  token 86 14:293 equals "="
-  token 87 14:294 number "1e-16" value=1e-16
+  token 34 15:3 word "xrcrg1"
+  token 35 15:9 equals "="
+  token 36 15:10 number "12" value=1.2e1
+  token 37 15:13 word "xrcrg2"
+  token 38 15:19 equals "="
+  token 39 15:20 number "5" value=5e0
+  token 40 15:22 word "rshg"
+  token 41 15:26 equals "="
+  token 42 15:27 number "0.4" value=4e-1
+  token 43 15:31 word "rbpb"
+  token 44 15:35 equals "="
+  token 45 15:36 number "5" value=5e0
+  token 46 15:38 word "rbpd"
+  token 47 15:42 equals "="
+  token 48 15:43 number "15" value=1.5e1
+  token 49 15:46 word "rbps"
+  token 50 15:50 equals "="
+  token 51 15:51 number "15" value=1.5e1
+  token 52 15:54 word "rbdb"
+  token 53 15:58 equals "="
+  token 54 15:59 number "15" value=1.5e1
+  token 55 15:62 word "rbsb"
+  token 56 15:66 equals "="
+  token 57 15:67 number "15" value=1.5e1
+  token 58 16:3 word "cgso"
+  token 59 16:7 equals "="
+  token 60 16:8 number "1.5e-10" value=1.5e-10
+  token 61 16:16 word "cgdo"
+  token 62 16:20 equals "="
+  token 63 16:21 number "1.5e-10" value=1.5e-10
+  token 64 16:29 word "cgbo"
+  token 65 16:33 equals "="
+  token 66 16:34 number "1e-11" value=1e-11
+  token 67 16:40 word "jss"
+  token 68 16:43 equals "="
+  token 69 16:44 number "1e-4" value=1e-4
+  token 70 16:49 word "cjs"
+  token 71 16:52 equals "="
+  token 72 16:53 number "1e-3" value=1e-3
+  token 73 16:58 word "cjsws"
+  token 74 16:63 equals "="
+  token 75 16:64 number "2e-10" value=2e-10
+  token 76 17:3 word "vth0"
+  token 77 17:7 equals "="
+  token 78 17:8 number "0.42" value=4.2e-1
+  token 79 17:13 word "lvth0"
+  token 80 17:18 equals "="
+  token 81 17:19 number "1e-9" value=1e-9
+  token 82 17:24 word "wvth0"
+  token 83 17:29 equals "="
+  token 84 17:30 number "2e-9" value=2e-9
+  token 85 17:35 word "pvth0"
+  token 86 17:40 equals "="
+  token 87 17:41 number "1e-16" value=1e-16
 card 8 @netlists/m11_bsim4_bin_dc.cir:18:1 lines=18-18 continuations=0
   raw: ".dc vg 0 1.2 0.1"
   kind: dot(.dc)

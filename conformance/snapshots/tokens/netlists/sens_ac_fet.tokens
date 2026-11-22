@@ -73,22 +73,22 @@ card 5 @netlists/sens_ac_fet.cir:9:1 lines=9-10 continuations=1
   token 26 9:70 word "pb"
   token 27 9:72 equals "="
   token 28 9:73 number "0.8" value=8e-1
-  token 29 9:77 word "is"
-  token 30 9:79 equals "="
-  token 31 9:80 number "1e-14" value=1e-14
-  token 32 9:86 word "n"
-  token 33 9:87 equals "="
-  token 34 9:88 number "1.2" value=1.2000000000000002e0
-  token 35 9:92 word "fc"
-  token 36 9:94 equals "="
-  token 37 9:95 number "0.4" value=4e-1
-  token 38 9:99 word "b"
-  token 39 9:100 equals "="
-  token 40 9:101 number "0.9" value=9e-1
-  token 41 9:105 word "tnom"
-  token 42 9:109 equals "="
-  token 43 9:110 number "30" value=3e1
-  token 44 9:112 rparen ")"
+  token 29 10:3 word "is"
+  token 30 10:5 equals "="
+  token 31 10:6 number "1e-14" value=1e-14
+  token 32 10:12 word "n"
+  token 33 10:13 equals "="
+  token 34 10:14 number "1.2" value=1.2000000000000002e0
+  token 35 10:18 word "fc"
+  token 36 10:20 equals "="
+  token 37 10:21 number "0.4" value=4e-1
+  token 38 10:25 word "b"
+  token 39 10:26 equals "="
+  token 40 10:27 number "0.9" value=9e-1
+  token 41 10:31 word "tnom"
+  token 42 10:35 equals "="
+  token 43 10:36 number "30" value=3e1
+  token 44 10:38 rparen ")"
 card 6 @netlists/sens_ac_fet.cir:11:1 lines=11-11 continuations=0
   raw: "rz 1 4 1k"
   kind: device(r)
@@ -135,22 +135,22 @@ card 8 @netlists/sens_ac_fet.cir:13:1 lines=13-14 continuations=1
   token 23 13:65 word "rs"
   token 24 13:67 equals "="
   token 25 13:68 number "4" value=4e0
-  token 26 13:70 word "cgs"
-  token 27 13:73 equals "="
-  token 28 13:74 number "2p" value=2e-12
-  token 29 13:77 word "cgd"
-  token 30 13:80 equals "="
-  token 31 13:81 number "0.5p" value=5e-13
-  token 32 13:86 word "pb"
-  token 33 13:88 equals "="
-  token 34 13:89 number "0.8" value=8e-1
-  token 35 13:93 word "is"
-  token 36 13:95 equals "="
-  token 37 13:96 number "1e-14" value=1e-14
-  token 38 13:102 word "fc"
-  token 39 13:104 equals "="
-  token 40 13:105 number "0.4" value=4e-1
-  token 41 13:108 rparen ")"
+  token 26 14:3 word "cgs"
+  token 27 14:6 equals "="
+  token 28 14:7 number "2p" value=2e-12
+  token 29 14:10 word "cgd"
+  token 30 14:13 equals "="
+  token 31 14:14 number "0.5p" value=5e-13
+  token 32 14:19 word "pb"
+  token 33 14:21 equals "="
+  token 34 14:22 number "0.8" value=8e-1
+  token 35 14:26 word "is"
+  token 36 14:28 equals "="
+  token 37 14:29 number "1e-14" value=1e-14
+  token 38 14:35 word "fc"
+  token 39 14:37 equals "="
+  token 40 14:38 number "0.4" value=4e-1
+  token 41 14:41 rparen ")"
 card 9 @netlists/sens_ac_fet.cir:15:1 lines=15-15 continuations=0
   raw: "rh 1 5 1k"
   kind: device(r)

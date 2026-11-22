@@ -40,7 +40,7 @@ fn s(name: &str, value: &str, kind: &'static str) -> (String, String, &'static s
     (name.to_owned(), value.to_owned(), kind)
 }
 
-fn parse_error(body: &str) -> (u32, String) {
+fn parse_error(body: &str) -> (usize, String) {
     match try_parse(body) {
         Err(SpiceError::Parse { location, message }) => (location.column, message),
         other => panic!("expected a parse error for {body:?}, got {other:?}"),

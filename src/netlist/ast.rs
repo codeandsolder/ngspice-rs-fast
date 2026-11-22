@@ -110,7 +110,7 @@ pub enum ParameterKind {
 pub struct PositionedValue {
     /// Original numeric spelling, including scale/unit suffixes.
     pub text: String,
-    /// Position in the joined logical card (the tokenizer's location contract).
+    /// Physical source location, with a 1-based UTF-8 byte column.
     pub location: SourceLoc,
 }
 

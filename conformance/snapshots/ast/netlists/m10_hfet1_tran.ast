@@ -58,9 +58,9 @@ scope root
         [4] name="m" kind=scalar value="2.57" @netlists/m10_hfet1_tran.cir:7:45
         [5] name="vt0" kind=scalar value="0.3" @netlists/m10_hfet1_tran.cir:7:52
         [6] name="cds" kind=scalar value="5e-14" @netlists/m10_hfet1_tran.cir:7:60
-        [7] name="js1s" kind=scalar value="0" @netlists/m10_hfet1_tran.cir:7:70
-        [8] name="js1d" kind=scalar value="0" @netlists/m10_hfet1_tran.cir:7:77
-        [9] name="ggr" kind=scalar value="0" @netlists/m10_hfet1_tran.cir:7:84
+        [7] name="js1s" kind=scalar value="0" @netlists/m10_hfet1_tran.cir:8:3
+        [8] name="js1d" kind=scalar value="0" @netlists/m10_hfet1_tran.cir:8:10
+        [9] name="ggr" kind=scalar value="0" @netlists/m10_hfet1_tran.cir:8:17
   subcircuits (0):
   analyses (1):
     analysis [0] kind=tran @netlists/m10_hfet1_tran.cir:10:1

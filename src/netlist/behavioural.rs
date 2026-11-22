@@ -207,11 +207,14 @@ fn measure_currents(netlist: &mut Netlist) -> SpiceResult<()> {
             let ParameterKind::Behavioural(expression) = &parameter.kind else {
                 continue;
             };
-            let origin = expression.span.start.column;
             expression.root.visit(&mut |node| {
                 if let BExprKind::Current(name) = &node.kind {
-                    let offset = node.span.start.column.saturating_sub(origin) as usize;
-                    if !name.starts_with('v') && measured_reference(&expression.text, offset) {
+                    if !name.starts_with('v')
+                        && node
+                            .span
+                            .relative_to(&expression.span)
+                            .is_some_and(|range| measured_reference(&expression.text, range.start))
+                    {
                         group.push(MeasurementReference {
                             occurrence,
                             name: name.clone(),
@@ -508,6 +511,7 @@ fn point(parameter: &ParameterAssignment) -> SpiceResult<BExpr> {
     let span = SourceSpan {
         start: parameter.location.clone(),
         end: parameter.location.clone(),
+        logical: 0..0,
     };
     let kind = match &parameter.kind {
         ParameterKind::Scalar => BExprKind::Number {
@@ -538,6 +542,7 @@ fn generated(root: BExpr, text: String, location: &SourceLoc) -> ParameterKind {
         span: SourceSpan {
             start: location.clone(),
             end: location.clone(),
+            logical: 0..0,
         },
         verbatim: true,
         root,
@@ -550,6 +555,7 @@ fn quantity(kind: BExprKind, location: &SourceLoc) -> BExpr {
         span: SourceSpan {
             start: location.clone(),
             end: location.clone(),
+            logical: 0..0,
         },
     }
 }

@@ -26,8 +26,8 @@ snapshotted as an `error` block, never as a partial AST.
 
 Documented in the module docs of `src/netlist/dump.rs`. The first
 line is a version header (`# ngspice-rs token-dump v1`, `# ngspice-rs ast-dump v1`).
-Token spelling, kind, order and `line:column` (byte columns, relative to the
-joined logical card) are preserved; AST scopes list ordered cards with
+Token spelling, kind, order and `line:column` (UTF-8 byte columns within the
+physical source line) are preserved; AST scopes list ordered cards with
 scope-local indexes, then typed vectors with ordered parameter assignments,
 expression trees with spans, include chains, options, globals and params.
 

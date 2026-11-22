@@ -234,19 +234,19 @@ fn continuations_flags_and_components_keep_byte_positions() {
     let netlist = parse("Q1 α b e qm 2 OFF\n+ ic=(.6, 2) icvce=3\n.model qm npn\n").unwrap();
     let p = &netlist.devices[0].parameters;
     assert_eq!(p[0].location.column, 16);
-    assert_eq!(p[1].location.column, 20);
-    assert_eq!(p[1].location.line, 2);
+    assert_eq!(p[1].location.column, 3);
+    assert_eq!(p[1].location.line, 3);
     let ParameterKind::InitialConditions(values) = &p[1].kind else {
         panic!("IC")
     };
-    assert_eq!(values[0].value.location.column, 24);
-    assert_eq!(values[1].value.location.column, 28);
-    assert_eq!(values[1].value.location.line, 2);
+    assert_eq!(values[0].value.location.column, 7);
+    assert_eq!(values[1].value.location.column, 11);
+    assert_eq!(values[1].value.location.line, 3);
     assert_eq!(p.last().unwrap().location.column, 14);
     let text = "Q1 α b e qm ic=(.6, 1e999)\n.model qm npn";
     let error = parse(text).unwrap_err();
     assert!(
-        matches!(error,SpiceError::Parse{location,..} if location.column as usize==text.find("1e999").unwrap()+1)
+        matches!(error,SpiceError::Parse{location,..} if location.column==text.find("1e999").unwrap()+1)
     );
 }
 

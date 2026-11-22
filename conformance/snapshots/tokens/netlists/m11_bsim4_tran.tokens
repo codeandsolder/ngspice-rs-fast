@@ -170,51 +170,51 @@ card 9 @netlists/m11_bsim4_tran.cir:13:1 lines=13-16 continuations=3
   token 19 13:71 word "igbmod"
   token 20 13:77 equals "="
   token 21 13:78 number "1" value=1e0
-  token 22 13:80 word "xrcrg1"
-  token 23 13:86 equals "="
-  token 24 13:87 number "12" value=1.2e1
-  token 25 13:90 word "xrcrg2"
-  token 26 13:96 equals "="
-  token 27 13:97 number "5" value=5e0
-  token 28 13:99 word "rshg"
-  token 29 13:103 equals "="
-  token 30 13:104 number "0.4" value=4e-1
-  token 31 13:108 word "rbpb"
-  token 32 13:112 equals "="
-  token 33 13:113 number "5" value=5e0
-  token 34 13:115 word "rbpd"
-  token 35 13:119 equals "="
-  token 36 13:120 number "15" value=1.5e1
-  token 37 13:123 word "rbps"
-  token 38 13:127 equals "="
-  token 39 13:128 number "15" value=1.5e1
-  token 40 13:131 word "rbdb"
-  token 41 13:135 equals "="
-  token 42 13:136 number "15" value=1.5e1
-  token 43 13:139 word "rbsb"
-  token 44 13:143 equals "="
-  token 45 13:144 number "15" value=1.5e1
-  token 46 13:147 word "cgso"
-  token 47 13:151 equals "="
-  token 48 13:152 number "1.5e-10" value=1.5e-10
-  token 49 13:160 word "cgdo"
-  token 50 13:164 equals "="
-  token 51 13:165 number "1.5e-10" value=1.5e-10
-  token 52 13:173 word "cgbo"
-  token 53 13:177 equals "="
-  token 54 13:178 number "1e-11" value=1e-11
-  token 55 13:184 word "jss"
-  token 56 13:187 equals "="
-  token 57 13:188 number "1e-4" value=1e-4
-  token 58 13:193 word "cjs"
-  token 59 13:196 equals "="
-  token 60 13:197 number "1e-3" value=1e-3
-  token 61 13:202 word "cjsws"
-  token 62 13:207 equals "="
-  token 63 13:208 number "2e-10" value=2e-10
-  token 64 13:214 word "trnqsmod"
-  token 65 13:222 equals "="
-  token 66 13:223 number "1" value=1e0
+  token 22 14:3 word "xrcrg1"
+  token 23 14:9 equals "="
+  token 24 14:10 number "12" value=1.2e1
+  token 25 14:13 word "xrcrg2"
+  token 26 14:19 equals "="
+  token 27 14:20 number "5" value=5e0
+  token 28 14:22 word "rshg"
+  token 29 14:26 equals "="
+  token 30 14:27 number "0.4" value=4e-1
+  token 31 14:31 word "rbpb"
+  token 32 14:35 equals "="
+  token 33 14:36 number "5" value=5e0
+  token 34 14:38 word "rbpd"
+  token 35 14:42 equals "="
+  token 36 14:43 number "15" value=1.5e1
+  token 37 14:46 word "rbps"
+  token 38 14:50 equals "="
+  token 39 14:51 number "15" value=1.5e1
+  token 40 14:54 word "rbdb"
+  token 41 14:58 equals "="
+  token 42 14:59 number "15" value=1.5e1
+  token 43 14:62 word "rbsb"
+  token 44 14:66 equals "="
+  token 45 14:67 number "15" value=1.5e1
+  token 46 15:3 word "cgso"
+  token 47 15:7 equals "="
+  token 48 15:8 number "1.5e-10" value=1.5e-10
+  token 49 15:16 word "cgdo"
+  token 50 15:20 equals "="
+  token 51 15:21 number "1.5e-10" value=1.5e-10
+  token 52 15:29 word "cgbo"
+  token 53 15:33 equals "="
+  token 54 15:34 number "1e-11" value=1e-11
+  token 55 15:40 word "jss"
+  token 56 15:43 equals "="
+  token 57 15:44 number "1e-4" value=1e-4
+  token 58 15:49 word "cjs"
+  token 59 15:52 equals "="
+  token 60 15:53 number "1e-3" value=1e-3
+  token 61 15:58 word "cjsws"
+  token 62 15:63 equals "="
+  token 63 15:64 number "2e-10" value=2e-10
+  token 64 16:3 word "trnqsmod"
+  token 65 16:11 equals "="
+  token 66 16:12 number "1" value=1e0
 card 10 @netlists/m11_bsim4_tran.cir:17:1 lines=17-18 continuations=1
   raw: ".model pch pmos level=54 version=4.8.3 rdsmod=1 rdsw=200 cgso=1.5e-10 cgdo=1.5e-10 cgbo=1e-11 jss=1e-4 cjs=1e-3 cjsws=2e-10"
   kind: dot(.model)
@@ -233,24 +233,24 @@ card 10 @netlists/m11_bsim4_tran.cir:17:1 lines=17-18 continuations=1
   token 13 17:49 word "rdsw"
   token 14 17:53 equals "="
   token 15 17:54 number "200" value=2e2
-  token 16 17:58 word "cgso"
-  token 17 17:62 equals "="
-  token 18 17:63 number "1.5e-10" value=1.5e-10
-  token 19 17:71 word "cgdo"
-  token 20 17:75 equals "="
-  token 21 17:76 number "1.5e-10" value=1.5e-10
-  token 22 17:84 word "cgbo"
-  token 23 17:88 equals "="
-  token 24 17:89 number "1e-11" value=1e-11
-  token 25 17:95 word "jss"
-  token 26 17:98 equals "="
-  token 27 17:99 number "1e-4" value=1e-4
-  token 28 17:104 word "cjs"
-  token 29 17:107 equals "="
-  token 30 17:108 number "1e-3" value=1e-3
-  token 31 17:113 word "cjsws"
-  token 32 17:118 equals "="
-  token 33 17:119 number "2e-10" value=2e-10
+  token 16 18:3 word "cgso"
+  token 17 18:7 equals "="
+  token 18 18:8 number "1.5e-10" value=1.5e-10
+  token 19 18:16 word "cgdo"
+  token 20 18:20 equals "="
+  token 21 18:21 number "1.5e-10" value=1.5e-10
+  token 22 18:29 word "cgbo"
+  token 23 18:33 equals "="
+  token 24 18:34 number "1e-11" value=1e-11
+  token 25 18:40 word "jss"
+  token 26 18:43 equals "="
+  token 27 18:44 number "1e-4" value=1e-4
+  token 28 18:49 word "cjs"
+  token 29 18:52 equals "="
+  token 30 18:53 number "1e-3" value=1e-3
+  token 31 18:58 word "cjsws"
+  token 32 18:63 equals "="
+  token 33 18:64 number "2e-10" value=2e-10
 card 11 @netlists/m11_bsim4_tran.cir:19:1 lines=19-19 continuations=0
   raw: ".tran 10p 1.5n"
   kind: dot(.tran)
