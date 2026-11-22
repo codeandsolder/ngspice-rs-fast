@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use crate::primitives::{SourceLoc, SpiceError, SpiceResult};
 
-pub(crate) mod budget;
+pub(super) mod budget;
 use budget::{SourceBudget, SourceLimits, copy_text};
 
 /// One physical line of a deck, with its 1-based line number.

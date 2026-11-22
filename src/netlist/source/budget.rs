@@ -46,7 +46,7 @@ impl Default for SourceLimits {
 /// Counters spend before storage creation. A hard admission/lexical error
 /// terminates traversal; ordinary syntax errors can still be replayed in
 /// order. Actual allocation failures use the same terminal path.
-pub(crate) struct SourceBudget {
+pub(in crate::netlist) struct SourceBudget {
     pub(crate) limits: SourceLimits,
     files: usize,
     bytes: usize,
@@ -171,7 +171,7 @@ impl SourceBudget {
     }
 }
 
-pub(crate) fn copy_text(
+pub(in crate::netlist) fn copy_text(
     text: &str,
     budget: &mut SourceBudget,
     location: &SourceLoc,

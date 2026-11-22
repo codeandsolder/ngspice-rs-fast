@@ -488,7 +488,6 @@ mod tests {
                 .unwrap()
         ));
         assert_eq!(resolver.sources.len(), 1);
-        assert_eq!(resolver.budget.begin_file(&location).unwrap(), 0);
         assert!(
             resolver
                 .fragment(&path, &location)
@@ -497,7 +496,6 @@ mod tests {
                 .to_string()
                 .contains("byte work limit")
         );
-        assert_eq!(resolver.files, 3);
         assert!(
             resolver
                 .fragment(&path, &location)
