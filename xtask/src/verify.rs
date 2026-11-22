@@ -8,7 +8,10 @@ use ngspice_rs::analysis::{AnalysisRequest, RawFile, RunConfig, runner};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::primitives::{AnalysisKind, parse_spice_number};
 
-use crate::{compare, golden, tran, workspace_root};
+#[cfg(test)]
+use crate::workspace_root;
+use crate::{compare, tran};
+use ngspice_conformance::fixtures;
 
 /// How a fixture's Rust result is compared with its C golden.
 enum Gate {
@@ -1850,13 +1853,13 @@ const EXCLUDED: &[(&str, &str)] = &[(
      but not the FMA-built golden (3 poles)",
 )];
 
-pub(crate) fn main(arguments: &[String]) -> Result<(), String> {
+pub(super) fn main(root: &Path, arguments: &[String]) -> Result<(), String> {
     let only = match arguments {
         [] => None,
         [flag, name] if flag == "--netlist" && !name.starts_with('-') => Some(name.as_str()),
         _ => return Err("usage: cargo xtask golden verify [--netlist <NAME>]".into()),
     };
-    run(&workspace_root(), only)
+    run(root, only)
 }
 
 fn run(root: &Path, only: Option<&str>) -> Result<(), String> {
@@ -1885,7 +1888,7 @@ fn run_with_registries(
     batch: &[Batch],
     excluded: &[(&str, &str)],
 ) -> Result<(), String> {
-    let paths = golden::netlist_paths_at(root, only)?;
+    let paths = fixtures::netlist_paths_at(root, only)?;
     let mut verified = 0;
     let mut unsupported = 0;
     let mut failures = Vec::new();
@@ -2175,7 +2178,7 @@ fn project(mut got: ngspice_rs::analysis::Plot, internal: &[String]) -> ngspice_
 
 /// The committed C golden of `name`.
 fn load_golden(root: &Path, name: &str) -> Result<RawFile, String> {
-    let target = crate::reference::golden_path(root, name);
+    let target = fixtures::golden_path(root, name);
     let text =
         fs::read_to_string(&target).map_err(|e| format!("reading {}: {e}", target.display()))?;
     RawFile::parse(&text).map_err(|e| format!("{}: {e}", target.display()))
@@ -2269,18 +2272,14 @@ mod tests {
                 std::process::id(),
                 ID.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::create_dir_all(root.join(golden::NETLIST_DIR)).unwrap();
-            fs::create_dir_all(root.join(golden::GOLDEN_DIR)).unwrap();
+            fs::create_dir_all(root.join(fixtures::NETLIST_DIR)).unwrap();
+            fs::create_dir_all(root.join(fixtures::GOLDEN_DIR)).unwrap();
             for name in names {
                 let deck = format!("conformance/netlists/{name}.cir");
                 fs::copy(workspace_root().join(&deck), root.join(&deck)).unwrap();
-                let target = crate::reference::golden_path(&root, name);
+                let target = fixtures::golden_path(&root, name);
                 fs::create_dir_all(target.parent().unwrap()).unwrap();
-                fs::copy(
-                    crate::reference::golden_path(&workspace_root(), name),
-                    target,
-                )
-                .unwrap();
+                fs::copy(fixtures::golden_path(&workspace_root(), name), target).unwrap();
             }
             Self(root)
         }
@@ -2293,11 +2292,11 @@ mod tests {
 
     #[test]
     fn production_fixtures_pass_without_modifying_inputs() {
-        let paths: Vec<_> = golden::netlist_paths_at(&workspace_root(), None)
+        let paths: Vec<_> = fixtures::netlist_paths_at(&workspace_root(), None)
             .unwrap()
             .into_iter()
             .flat_map(|p| {
-                let raw = crate::reference::golden_path(
+                let raw = fixtures::golden_path(
                     &workspace_root(),
                     p.file_stem().unwrap().to_str().unwrap(),
                 );
@@ -2326,7 +2325,7 @@ mod tests {
             generic,
         )
         .unwrap();
-        let selected = crate::reference::golden_path(&temp.0, "sens_bjt");
+        let selected = fixtures::golden_path(&temp.0, "sens_bjt");
         let original = fs::read_to_string(&selected).unwrap();
         run(&temp.0, Some("sens_bjt")).unwrap();
         fs::remove_file(&selected).unwrap();
@@ -2405,7 +2404,13 @@ mod tests {
             vec!["--netlist", "--verbose"],
             vec!["--netlist", "rc_divider", "extra"],
         ] {
-            assert!(main(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err());
+            assert!(
+                main(
+                    &workspace_root(),
+                    &args.into_iter().map(String::from).collect::<Vec<_>>()
+                )
+                .is_err()
+            );
         }
     }
 

@@ -10,18 +10,10 @@ use std::path::{Path, PathBuf};
 
 use ngspice_rs::analysis::RawFile;
 
-use crate::ngspice::{self, Ngspice};
-use crate::workspace_root;
-
-/// Where the fixture decks live, relative to the workspace root.
-pub(crate) const NETLIST_DIR: &str = "conformance/netlists";
-
-/// Where the captured rawfiles live, relative to the workspace root.
-#[cfg(test)]
-pub(crate) const GOLDEN_DIR: &str = "conformance/golden";
-
-/// Where instrumented decks and rawfiles are staged, relative to the workspace root.
-pub(crate) const SCRATCH_DIR: &str = "target/xtask/golden";
+use ngspice_conformance::{
+    fixtures,
+    ngspice::{self, Captured, Ngspice},
+};
 
 const USAGE: &str = "\
 usage: cargo xtask golden <capture|check|list|verify> [OPTIONS]
@@ -71,65 +63,62 @@ impl Options {
 }
 
 /// Entry point for `cargo xtask golden …`.
-pub(crate) fn main(arguments: &[String]) -> Result<(), String> {
+pub(super) fn main(root: &Path, arguments: &[String]) -> Result<(), String> {
     match arguments.first().map(String::as_str) {
-        Some("capture") => capture(&Options::parse(&arguments[1..])?),
-        Some("check") => check(&Options::parse(&arguments[1..])?),
-        Some("list") => list(),
-        Some("verify") => crate::verify::main(&arguments[1..]),
+        Some("capture") => capture(root, &Options::parse(&arguments[1..])?),
+        Some("check") => check(root, &Options::parse(&arguments[1..])?),
+        Some("list") => list(root),
+        Some("verify") => crate::verify::main(root, &arguments[1..]),
         _ => Err(format!("usage: unknown 'golden' subcommand\n\n{USAGE}")),
     }
 }
 
-fn scratch_directory() -> PathBuf {
-    workspace_root().join(SCRATCH_DIR)
+fn scratch_directory(root: &Path) -> PathBuf {
+    let target =
+        std::env::var_os("CARGO_TARGET_DIR").or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"));
+    fixtures::scratch_directory(root, target.as_deref().map(Path::new))
 }
 
-fn netlist_paths(only: Option<&str>) -> Result<Vec<PathBuf>, String> {
-    netlist_paths_at(&workspace_root(), only)
+fn golden_path(root: &Path, netlist: &Path) -> Result<PathBuf, String> {
+    Ok(fixtures::golden_path(root, fixtures::fixture_id(netlist)?))
 }
 
-pub(crate) fn netlist_paths_at(root: &Path, only: Option<&str>) -> Result<Vec<PathBuf>, String> {
-    let directory = root.join(NETLIST_DIR);
-    let mut paths: Vec<PathBuf> = fs::read_dir(&directory)
-        .map_err(|error| format!("reading {}: {error}", directory.display()))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "cir"))
-        .collect();
-    paths.sort();
-
-    if let Some(name) = only {
-        let wanted = name.trim_end_matches(".cir");
-        paths.retain(|path| {
-            path.file_stem()
-                .is_some_and(|stem| stem.eq_ignore_ascii_case(wanted))
-        });
-        if paths.is_empty() {
-            return Err(format!(
-                "no fixture named '{name}' in {}",
-                directory.display()
-            ));
-        }
-    }
-    if paths.is_empty() {
-        return Err(format!("no .cir fixtures in {}", directory.display()));
-    }
-    Ok(paths)
-}
-
-fn golden_path(netlist: &Path) -> Result<PathBuf, String> {
-    let name = netlist
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| format!("fixture {} has no file name", netlist.display()))?;
-    Ok(crate::reference::golden_path(&workspace_root(), name))
-}
-
-fn locate(options: &Options) -> Result<Ngspice, String> {
-    let binary = ngspice::locate(options.ngspice.as_deref(), &workspace_root())?;
+fn locate(root: &Path, options: &Options) -> Result<Ngspice, String> {
+    let binary = ngspice::locate(options.ngspice.as_deref(), root)?;
     println!("ngspice:  {} ({})", binary.path.display(), binary.version);
     Ok(binary)
+}
+
+// Scheduling and rawfile decoding use the simulator. The reference runner itself
+// has no dependency on the implementation under test.
+fn capture_fixture(binary: &Ngspice, netlist: &Path, scratch: &Path) -> Result<Captured, String> {
+    let parsed = ngspice_rs::netlist::Parser::new()
+        .parse_file(netlist)
+        .map_err(|error| format!("parsing {}: {error}", netlist.display()))?;
+    let config = ngspice_rs::analysis::RunConfig::from_netlist(&parsed)
+        .map_err(|error| error.to_string())?;
+    let plots: Vec<_> = ngspice_rs::analysis::batch::schedule_evaluated(&parsed.analyses, &config)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .flat_map(|entry| entry.plot_names().map(str::to_owned).collect::<Vec<_>>())
+        .collect();
+    let captured = ngspice::capture(binary, netlist, scratch, &plots)?;
+    let actual = RawFile::parse(&captured.rawfile).map_err(|error| {
+        format!(
+            "{}: the captured rawfile does not parse: {error}",
+            netlist.display()
+        )
+    })?;
+    if plots.len() > 1 && actual.len() != plots.len() {
+        return Err(format!(
+            "{}: expected {} plots ({}), ngspice wrote {}",
+            netlist.display(),
+            plots.len(),
+            plots.join(" "),
+            actual.len()
+        ));
+    }
+    Ok(captured)
 }
 
 fn describe(rawfile: &str) -> Result<String, String> {
@@ -152,13 +141,13 @@ fn describe(rawfile: &str) -> Result<String, String> {
     Ok(parts.join("; "))
 }
 
-fn capture(options: &Options) -> Result<(), String> {
-    let binary = locate(options)?;
-    let scratch = scratch_directory();
+fn capture(root: &Path, options: &Options) -> Result<(), String> {
+    let binary = locate(root, options)?;
+    let scratch = scratch_directory(root);
     fs::create_dir_all(&scratch)
         .map_err(|error| format!("creating {}: {error}", scratch.display()))?;
 
-    let netlists = netlist_paths(options.netlist.as_deref())?;
+    let netlists = fixtures::netlist_paths_at(root, options.netlist.as_deref())?;
     let mut created = 0usize;
     let mut changed = 0usize;
     let mut unchanged = 0usize;
@@ -167,8 +156,8 @@ fn capture(options: &Options) -> Result<(), String> {
         if options.verbose {
             println!("capturing {}", netlist.display());
         }
-        let captured = ngspice::capture(&binary, netlist, &scratch)?;
-        let target = golden_path(netlist)?;
+        let captured = capture_fixture(&binary, netlist, &scratch)?;
+        let target = golden_path(root, netlist)?;
         let name = netlist
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -186,11 +175,12 @@ fn capture(options: &Options) -> Result<(), String> {
                 println!("  changed    {name}  ({report})");
                 write_golden(&target, &captured.rawfile)?;
             }
-            Err(_) => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 created += 1;
                 println!("  new        {name}");
                 write_golden(&target, &captured.rawfile)?;
             }
+            Err(error) => return Err(format!("reading {}: {error}", target.display())),
         }
         if options.verbose {
             println!("             deck: {}", captured.deck_path.display());
@@ -217,18 +207,18 @@ fn write_golden(target: &Path, rawfile: &str) -> Result<(), String> {
     fs::write(target, rawfile).map_err(|error| format!("writing {}: {error}", target.display()))
 }
 
-fn check(options: &Options) -> Result<(), String> {
-    let binary = locate(options)?;
-    let scratch = scratch_directory();
+fn check(root: &Path, options: &Options) -> Result<(), String> {
+    let binary = locate(root, options)?;
+    let scratch = scratch_directory(root);
     fs::create_dir_all(&scratch)
         .map_err(|error| format!("creating {}: {error}", scratch.display()))?;
 
-    let netlists = netlist_paths(options.netlist.as_deref())?;
+    let netlists = fixtures::netlist_paths_at(root, options.netlist.as_deref())?;
     let mut drifted = Vec::new();
 
     for netlist in &netlists {
-        let captured = ngspice::capture(&binary, netlist, &scratch)?;
-        let target = golden_path(netlist)?;
+        let captured = capture_fixture(&binary, netlist, &scratch)?;
+        let target = golden_path(root, netlist)?;
         let name = netlist
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -268,15 +258,15 @@ fn check(options: &Options) -> Result<(), String> {
     }
 }
 
-fn list() -> Result<(), String> {
-    let netlists = netlist_paths(None)?;
+fn list(root: &Path) -> Result<(), String> {
+    let netlists = fixtures::netlist_paths_at(root, None)?;
     println!("{:<22} {:<12} details", "fixture", "golden");
     for netlist in &netlists {
         let name = netlist
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or("<unnamed>");
-        let target = golden_path(netlist)?;
+        let target = golden_path(root, netlist)?;
         match fs::read_to_string(&target) {
             Ok(rawfile) => println!("{name:<22} {:<12} {}", "present", describe(&rawfile)?),
             Err(_) => println!("{name:<22} {:<12} -", "missing"),
@@ -287,7 +277,9 @@ fn list() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Options, golden_path, netlist_paths};
+    use super::{Options, golden_path};
+    use crate::workspace_root;
+    use ngspice_conformance::fixtures::netlist_paths_at;
     use std::path::PathBuf;
 
     #[test]
@@ -314,25 +306,29 @@ mod tests {
 
     #[test]
     fn fixtures_are_discovered_and_filtered() {
-        let paths = netlist_paths(None).expect("fixtures exist");
+        let paths = netlist_paths_at(&workspace_root(), None).expect("fixtures exist");
         assert!(!paths.is_empty());
         let first = paths[0]
             .file_stem()
             .and_then(|stem| stem.to_str())
             .expect("named")
             .to_owned();
-        let filtered = netlist_paths(Some(&first)).expect("filter works");
+        let filtered = netlist_paths_at(&workspace_root(), Some(&first)).expect("filter works");
         assert_eq!(filtered.len(), 1);
         // The `.cir` suffix is optional.
-        let filtered = netlist_paths(Some(&format!("{first}.cir"))).expect("filter works");
+        let filtered = netlist_paths_at(&workspace_root(), Some(&format!("{first}.cir")))
+            .expect("filter works");
         assert_eq!(filtered.len(), 1);
-        assert!(netlist_paths(Some("definitely-not-a-fixture")).is_err());
+        assert!(netlist_paths_at(&workspace_root(), Some("definitely-not-a-fixture")).is_err());
     }
 
     #[test]
     fn goldens_are_named_after_their_fixture() {
-        let path =
-            golden_path(&PathBuf::from("conformance/netlists/rc_divider.cir")).expect("named");
+        let path = golden_path(
+            &workspace_root(),
+            &PathBuf::from("conformance/netlists/rc_divider.cir"),
+        )
+        .expect("named");
         assert!(path.ends_with("conformance/golden/rc_divider.raw"));
     }
 }

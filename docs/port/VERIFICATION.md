@@ -422,7 +422,7 @@ comparison, while C and Rust agree on the same platform.
 The original fixture and macOS golden remain unchanged. A new independent C
 capture lives in `conformance/golden/linux-x86_64-gnu/sens_bjt.raw`, with exact
 source/compiler/libc/configuration provenance in that directory's README.
-`conformance/reference.rs` is shared only by tests and xtask, not the simulator;
+`conformance/support/src/fixtures.rs` is shared only by tests and xtask, not the simulator;
 its explicit target/fixture selection is used by capture/check/list/verify
 and the BJT test. It never silently substitutes another file when the selected
 capture is missing. All 291 columns keep the existing bound; no comparison
@@ -1222,7 +1222,8 @@ write <fixture>.raw
 ```
 
 immediately before the first `.end` card, runs `ngspice -b` on it with a scratch
-directory (`target/xtask/golden/<fixture>/`) as the working directory, and reads
+directory (`target/xtask/golden/<fixture>/` by default, under `CARGO_TARGET_DIR`
+or `CARGO_BUILD_TARGET_DIR` when set) as the working directory, and reads
 the ASCII rawfile that `write` produced. A deck with several analysis cards
 writes every plot by name instead and ends the block with `quit` (see
 "Multi-analysis batch decks (#96)"). A fixture that already contains a
@@ -1231,6 +1232,16 @@ writes every plot by name instead and ends the block with `quit` (see
 The scratch directory is also why `write` takes a bare file name: the path never
 needs quoting, and `.include`-style relative paths would resolve the same way
 every time (they are out of scope for fixtures anyway).
+
+Fixture discovery, platform-specific golden selection, scratch paths, external
+C invocation and textual capture comparison are provided by the unpublished
+`ngspice-conformance` workspace library in `conformance/support`. It has
+no dependency on the simulator. `xtask` supplies the analysis schedule and
+validates the decoded plots; integration tests may use the same reference
+selector without including another crate's source. The verifier compares
+against the selected platform reference only, never falling back to a different
+platform. Stale rawfiles and obsolete `.spiceinit` must be removed successfully
+(or already be absent) before a capture starts.
 
 ## Storage and comparison
 

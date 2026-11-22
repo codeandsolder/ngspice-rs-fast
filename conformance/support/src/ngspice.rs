@@ -1,7 +1,7 @@
 //! Locating and driving the C `ngspice` binary.
 //!
 //! The port never links against the C library; comparison data is produced by
-//! running the reference binary out of process. This module owns the two
+//! running the reference binary out of process. This module owns the
 //! details that make that work:
 //!
 //! 1. **ASCII output.** ngspice writes binary rawfiles unless the command
@@ -18,9 +18,8 @@
 //!    order (a `.noise` card writes two plots, `noise1.all noise2.all`; a
 //!    single `.noise` card is therefore instrumented this way too, and C's
 //!    `write` then lists each plot's vectors in its own sorted order, which
-//!    the name-based comparators ignore), with the names and order computed by
-//!    [`ngspice_rs::analysis::batch::schedule`]; a wrong name or order makes ngspice
-//!    fail or the plot-count check below reject the capture. The block ends with
+//!    the name-based comparators ignore). The simulator-aware caller supplies
+//!    the schedule and checks the captured plot count. The block ends with
 //!    `quit`: without it, batch mode re-runs every analysis after `.endc` for a
 //!    deck with `.op` (`ft_savedotargs()` registers an op-only save list, so the
 //!    other analyses then fail with "no data saved").
@@ -37,11 +36,11 @@ use std::process::Command;
 
 /// The C binary, and what it says it is.
 #[derive(Debug, Clone)]
-pub(crate) struct Ngspice {
-    /// Path to the binary. May be a bare name to be resolved through `PATH`.
-    pub(crate) path: PathBuf,
+pub struct Ngspice {
+    /// Absolute path to the resolved binary.
+    pub path: PathBuf,
     /// The version string scraped from `--version`, e.g. `ngspice-47+`.
-    pub(crate) version: String,
+    pub version: String,
 }
 
 /// Finds the C binary.
@@ -52,7 +51,7 @@ pub(crate) struct Ngspice {
 /// # Errors
 ///
 /// A message listing everywhere it looked.
-pub(crate) fn locate(explicit: Option<&Path>, workspace: &Path) -> Result<Ngspice, String> {
+pub fn locate(explicit: Option<&Path>, workspace: &Path) -> Result<Ngspice, String> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(path) = explicit {
         candidates.push(path.to_path_buf());
@@ -70,25 +69,20 @@ pub(crate) fn locate(explicit: Option<&Path>, workspace: &Path) -> Result<Ngspic
         // relative to the workspace root, not to the caller's directory, and is
         // made absolute so that it still resolves when ngspice runs in a scratch
         // directory.
-        let is_bare_name = candidate.components().count() == 1;
-        let resolved = if is_bare_name || candidate.is_absolute() {
-            candidate
-        } else {
-            workspace.join(candidate)
-        };
-        let resolved = fs::canonicalize(&resolved).unwrap_or(resolved);
-        if !is_bare_name && !resolved.is_file() {
-            tried.push(format!("{} (not a file)", resolved.display()));
-            continue;
-        }
-        match version_of(&resolved) {
-            Ok(version) => {
-                return Ok(Ngspice {
-                    path: resolved,
-                    version,
-                });
+        for path in candidate_paths(&candidate, workspace) {
+            let Some(resolved) = executable_path(&path) else {
+                tried.push(format!("{} (not a file)", path.display()));
+                continue;
+            };
+            match version_of(&resolved) {
+                Ok(version) => {
+                    return Ok(Ngspice {
+                        path: resolved,
+                        version,
+                    });
+                }
+                Err(error) => tried.push(format!("{} ({error})", resolved.display())),
             }
-            Err(error) => tried.push(format!("{} ({error})", resolved.display())),
         }
     }
 
@@ -99,11 +93,39 @@ pub(crate) fn locate(explicit: Option<&Path>, workspace: &Path) -> Result<Ngspic
     ))
 }
 
+fn candidate_paths(candidate: &Path, workspace: &Path) -> Vec<PathBuf> {
+    if candidate.components().count() == 1 {
+        std::env::var_os("PATH").map_or_else(Vec::new, |path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(candidate))
+                .collect()
+        })
+    } else {
+        vec![workspace.join(candidate)]
+    }
+}
+
+fn executable_path(path: &Path) -> Option<PathBuf> {
+    let path = if cfg!(windows) && path.extension().is_none() && !path.is_file() {
+        path.with_extension("exe")
+    } else {
+        path.to_path_buf()
+    };
+    if path.is_file() {
+        fs::canonicalize(&path).ok()
+    } else {
+        None
+    }
+}
+
 fn version_of(binary: &Path) -> Result<String, String> {
     let output = Command::new(binary)
         .arg("--version")
         .output()
         .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!("--version exited with {}", output.status));
+    }
     let text = String::from_utf8_lossy(&output.stdout).into_owned()
         + &String::from_utf8_lossy(&output.stderr);
     text.split_whitespace()
@@ -114,13 +136,13 @@ fn version_of(binary: &Path) -> Result<String, String> {
 
 /// The result of capturing one fixture.
 #[derive(Debug, Clone)]
-pub(crate) struct Captured {
+pub struct Captured {
     /// The rawfile text, exactly as ngspice wrote it.
-    pub(crate) rawfile: String,
+    pub rawfile: String,
     /// Where the instrumented deck was written, for debugging.
-    pub(crate) deck_path: PathBuf,
+    pub deck_path: PathBuf,
     /// ngspice's stdout and stderr combined, for diagnostics.
-    pub(crate) log: String,
+    pub log: String,
 }
 
 /// Builds the instrumented deck: the fixture plus a `.control` block that writes
@@ -130,7 +152,7 @@ pub(crate) struct Captured {
 ///
 /// A message when the fixture already contains a `.control` section, because
 /// golden fixtures must be pure decks.
-pub(crate) fn instrument(netlist: &str, plot_file: &str) -> Result<String, String> {
+fn instrument(netlist: &str, plot_file: &str) -> Result<String, String> {
     instrument_with(
         netlist,
         &format!(".control\nset filetype=ascii\nrun\nwrite {plot_file}\n.endc\n"),
@@ -143,11 +165,7 @@ pub(crate) fn instrument(netlist: &str, plot_file: &str) -> Result<String, Strin
 /// # Errors
 ///
 /// As [`instrument`].
-pub(crate) fn instrument_plots(
-    netlist: &str,
-    plot_file: &str,
-    plots: &[String],
-) -> Result<String, String> {
+fn instrument_plots(netlist: &str, plot_file: &str, plots: &[String]) -> Result<String, String> {
     let vectors: Vec<String> = plots.iter().map(|name| format!("{name}.all")).collect();
     instrument_with(
         netlist,
@@ -188,31 +206,31 @@ fn instrument_with(netlist: &str, control: &str) -> Result<String, String> {
 ///
 /// # Errors
 ///
+/// The caller supplies plot names in batch order for multi-plot decks.
+///
 /// Any failure to prepare the scratch directory, run the binary, or find a
 /// non-empty rawfile afterwards. The message includes ngspice's output.
-pub(crate) fn capture(
+pub fn capture(
     ngspice: &Ngspice,
     netlist: &Path,
     scratch: &Path,
+    plots: &[String],
 ) -> Result<Captured, String> {
-    let name = netlist
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| format!("fixture {} has no file name", netlist.display()))?;
-    let directory = scratch.join(name);
+    let name = crate::fixtures::fixture_id(netlist)?;
+    let directory = std::path::absolute(scratch.join(name))
+        .map_err(|error| format!("resolving scratch directory: {error}"))?;
     fs::create_dir_all(&directory)
         .map_err(|error| format!("creating {}: {error}", directory.display()))?;
 
     let plot_file = format!("{name}.raw");
     let raw_path = directory.join(&plot_file);
-    let _ = fs::remove_file(&raw_path);
+    remove_stale(&raw_path)?;
 
     let text = fs::read_to_string(netlist)
         .map_err(|error| format!("reading {}: {error}", netlist.display()))?;
     write_codemodel_init(ngspice, &text, &directory)?;
-    let plots = batch_plot_names(netlist)?;
     let deck = if plots.len() > 1 {
-        instrument_plots(&text, &plot_file, &plots)?
+        instrument_plots(&text, &plot_file, plots)?
     } else {
         instrument(&text, &plot_file)?
     };
@@ -256,19 +274,6 @@ pub(crate) fn capture(
         ));
     }
 
-    if plots.len() > 1 {
-        let parsed = ngspice_rs::analysis::RawFile::parse(&rawfile)
-            .map_err(|error| format!("{name}: the captured rawfile does not parse: {error}"))?;
-        if parsed.len() != plots.len() {
-            return Err(format!(
-                "{name}: expected {} plots ({}), ngspice wrote {}",
-                plots.len(),
-                plots.join(" "),
-                parsed.len()
-            ));
-        }
-    }
-
     Ok(Captured {
         rawfile,
         deck_path,
@@ -277,11 +282,11 @@ pub(crate) fn capture(
 }
 
 /// The marker comment through which a fixture asks for XSPICE code models.
-pub(crate) const CODEMODEL_MARKER: &str = "* xtask-codemodels:";
+const CODEMODEL_MARKER: &str = "* xtask-codemodels:";
 
 /// The XSPICE code models a fixture names on a `* xtask-codemodels: a b`
 /// comment line (E/G `TABLE` needs `analog`, `POLY` needs `spice2poly`).
-pub(crate) fn requested_codemodels(netlist: &str) -> Vec<String> {
+fn requested_codemodels(netlist: &str) -> Vec<String> {
     netlist
         .lines()
         .filter_map(|line| {
@@ -333,11 +338,7 @@ fn write_codemodel_init(ngspice: &Ngspice, netlist: &str, directory: &Path) -> R
     let init = directory.join(".spiceinit");
     let models = requested_codemodels(netlist);
     if models.is_empty() {
-        return match fs::remove_file(&init) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("removing stale {}: {error}", init.display())),
-        };
+        return remove_stale(&init);
     }
     let mut text = String::new();
     for name in &models {
@@ -348,21 +349,12 @@ fn write_codemodel_init(ngspice: &Ngspice, netlist: &str, directory: &Path) -> R
     fs::write(&init, text).map_err(|error| format!("writing {}: {error}", init.display()))
 }
 
-/// The C plot names of the fixture's analyses in batch order (one entry per
-/// plot: a `.noise` card names its spectrum and its integrated-noise plot).
-fn batch_plot_names(netlist: &Path) -> Result<Vec<String>, String> {
-    let parsed = ngspice_rs::netlist::Parser::new()
-        .parse_file(netlist)
-        .map_err(|error| format!("parsing {}: {error}", netlist.display()))?;
-    let config = ngspice_rs::analysis::RunConfig::from_netlist(&parsed)
-        .map_err(|error| error.to_string())?;
-    Ok(
-        ngspice_rs::analysis::batch::schedule_evaluated(&parsed.analyses, &config)
-            .map_err(|error| error.to_string())?
-            .iter()
-            .flat_map(|entry| entry.plot_names().map(str::to_owned).collect::<Vec<_>>())
-            .collect(),
-    )
+fn remove_stale(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("removing stale {}: {error}", path.display())),
+    }
 }
 
 fn tail(text: &str, lines: usize) -> String {
@@ -379,7 +371,7 @@ fn tail(text: &str, lines: usize) -> String {
 /// trailing whitespace, but `Title:` preserves it: it is deck data and must
 /// agree with the title checked by `tests/golden_rawfiles.rs`.
 #[must_use]
-pub(crate) fn rawfiles_match(left: &str, right: &str) -> bool {
+pub fn rawfiles_match(left: &str, right: &str) -> bool {
     comparable(left) == comparable(right)
 }
 
@@ -398,7 +390,7 @@ fn comparable(text: &str) -> Vec<&str> {
 
 /// The first differing line, for a drift report.
 #[must_use]
-pub(crate) fn first_difference(left: &str, right: &str) -> Option<String> {
+pub fn first_difference(left: &str, right: &str) -> Option<String> {
     let left = comparable(left);
     let right = comparable(right);
     for index in 0..left.len().max(right.len()) {
@@ -426,6 +418,44 @@ mod tests {
         let deck = "t\n* xtask-codemodels: spice2poly Analog\n* other\nr1 a 0 1\n.end\n";
         assert_eq!(requested_codemodels(deck), ["spice2poly", "analog"]);
         assert!(requested_codemodels("t\nr1 a 0 1\n").is_empty());
+    }
+
+    #[test]
+    fn stale_init_is_removed_or_reported() {
+        let directory = crate::test_support::Temp::new();
+        let binary = super::Ngspice {
+            path: directory.0.join("missing-ngspice"),
+            version: "test".to_owned(),
+        };
+        let init = directory.0.join(".spiceinit");
+        std::fs::write(&init, "codemodel obsolete.cm").unwrap();
+        super::write_codemodel_init(&binary, DECK, &directory.0).unwrap();
+        assert!(!init.exists());
+        super::write_codemodel_init(&binary, DECK, &directory.0).unwrap();
+        std::fs::create_dir(&init).unwrap();
+        let error = super::write_codemodel_init(&binary, DECK, &directory.0).unwrap_err();
+        assert!(
+            error.contains("removing stale") && error.contains(".spiceinit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn stale_rawfile_failure_precedes_process_launch() {
+        let directory = crate::test_support::Temp::new();
+        let binary = super::Ngspice {
+            path: directory.0.join("missing-ngspice"),
+            version: "test".to_owned(),
+        };
+        let deck = directory.0.join("fixture.cir");
+        std::fs::write(&deck, DECK).unwrap();
+        let scratch = directory.0.join("scratch");
+        std::fs::create_dir_all(scratch.join("fixture/fixture.raw")).unwrap();
+        let error = super::capture(&binary, &deck, &scratch, &[]).unwrap_err();
+        assert!(
+            error.contains("removing stale") && error.contains("fixture.raw"),
+            "{error}"
+        );
     }
 
     const DECK: &str = "RC divider\nv1 in 0 dc 5\n.op\n.end\n";

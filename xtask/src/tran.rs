@@ -50,21 +50,21 @@ const MAX_POINTS: u32 = 2_000_000;
 /// time, and **both** plots must begin exactly there: the instant is compared as
 /// an ordinary sample, and nothing before it is interpolated or extrapolated.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Grid {
-    pub(crate) start: f64,
-    pub(crate) stop: f64,
-    pub(crate) step: f64,
+pub(super) struct Grid {
+    pub(super) start: f64,
+    pub(super) stop: f64,
+    pub(super) step: f64,
 }
 
 /// What a successful comparison covered.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Summary {
+pub(super) struct Summary {
     /// Interior (smooth) or end-point instants compared.
-    pub(crate) instants: usize,
+    pub(super) instants: usize,
     /// One-sided breakpoint limits compared (two per breakpoint).
-    pub(crate) limits: usize,
+    pub(super) limits: usize,
     /// Largest `|error| / bound` seen over every compared value (<= 1).
-    pub(crate) worst_ratio: f64,
+    pub(super) worst_ratio: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -281,7 +281,7 @@ fn comparison_instants(
 /// `voltage` or `current` unit and satisfy
 /// `|got - want| <= relative*|want| + absolute(kind)` at every instant and at
 /// both limits of every breakpoint. Both plots must end at `grid.stop`.
-pub(crate) fn transient(
+pub(super) fn transient(
     got: &Plot,
     want: &Plot,
     tolerance: TranTolerance,
@@ -379,7 +379,7 @@ fn number(value: &PositionedValue, what: &str, device: &str) -> Result<f64, Stri
 /// waveforms inside them are not enumerated. Subcircuits without such sources
 /// (e.g. an op-amp macromodel) add no breakpoints and are accepted.
 /// Expression-valued or non-numeric waveform fields are errors.
-pub(crate) fn breakpoints(
+pub(super) fn breakpoints(
     netlist: &Netlist,
     time_step: f64,
     stop_time: f64,
@@ -413,7 +413,7 @@ pub(crate) fn breakpoints(
 /// `breakpoints` plus `b + offset` for every breakpoint `b` and offset (the
 /// echoes of a transmission-line deck, see `verify::Gate::Echoes`), inside
 /// `(0, stop_time)`, sorted and deduplicated like [`breakpoints`].
-pub(crate) fn echoes(
+pub(super) fn echoes(
     breakpoints: &[f64],
     offsets: &[f64],
     stop_time: f64,

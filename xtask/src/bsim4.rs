@@ -18,7 +18,7 @@ const SPEC: Spec = Spec {
     literal_expected: 777,
 };
 
-pub(crate) fn main(args: &[String]) -> Result<(), String> {
+pub(super) fn main(root: &std::path::Path, args: &[String]) -> Result<(), String> {
     let parsed = ifparm::args(args, USAGE)?;
     let source = parsed.source;
     let files = [
@@ -57,7 +57,7 @@ pub(crate) fn main(args: &[String]) -> Result<(), String> {
         ("src/devices/bsim4/defaults_data.rs", defaults),
         ("src/devices/bsim4/fields.rs", fields),
     ] {
-        ifparm::emit(path, &text, parsed.check)?;
+        ifparm::emit(root, path, &text, parsed.check)?;
     }
     if parsed.check {
         println!("BSIM4 schema/default facts match {revision}");
