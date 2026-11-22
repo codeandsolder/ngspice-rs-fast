@@ -46,9 +46,9 @@
 //! - section `i` uses `r = prop*r1`, `c = prop*c1` and diode `area = prop`,
 //!   with `prop = p^(i-1)` accumulated by repeated multiplication as C does.
 //!
-//! Section selection follows C; the normalization uses geometric sums
-//! evaluated with `exp_m1` near unity to preserve total element values
-//! even when the ratio differs from one by only a few ULPs.
+//! Section selection follows C; the normalization sums the actual section
+//! weights with compensated addition, preserving total element values even
+//! when the ratio is extremely close to one.
 //!
 //! # Deliberate divergences
 //!
@@ -257,20 +257,45 @@ impl UrcSections {
             reason = "the number of URC sections is bounded by MAX_LUMPS and represented in the C real-valued formula"
         )]
         let n = lumps as Real;
-        // Normalize by the geometric sums, without subtracting nearly
-        // equal powers when K approaches one. Keep the exact K=1 input
-        // rejection above; both adjacent representable ratios are valid.
-        let delta = p - 1.;
-        let log_p = if delta.abs() <= 0.5 {
-            delta.ln_1p()
-        } else {
-            p.ln()
+        // Normalize the actual sequence of rounded section weights, not
+        // p^n-1 (cancellation near unity) or expm1(n*ln(p)) (amplifies
+        // logarithm rounding for large n). Setup already visits every
+        // section to validate it, and this bounded pass uses constant space.
+        let mut prop = 1.;
+        let mut sum = 0.;
+        let mut correction = 0.;
+        for _ in 1..lumps {
+            let adjusted = prop - correction;
+            let next = sum + adjusted;
+            correction = (next - sum) - adjusted;
+            sum = next;
+            prop *= p;
+        }
+        let before_last = sum;
+        let all = sum + (prop - correction);
+        if !all.is_finite() {
+            return Err(invalid("nonfinite geometric normalization".into()));
+        }
+        // R has two of every section, C/I have two except the middle.
+        let rden = 2. * all;
+        let cden = all + before_last;
+        let divide_r = |total: Real| {
+            if rden.is_finite() {
+                total / rden
+            } else {
+                0.5 * (total / all)
+            }
         };
-        let r_weight = delta / (2. * (n * log_p).exp_m1());
-        let c_weight = delta / (p + 1.).mul_add(((n - 1.) * log_p).exp_m1(), delta);
-        let r1 = r0 * r_weight;
-        let c1 = c0 * c_weight;
-        let diode = i0.map(|i0| (i0 * c_weight, length * n * rsperl));
+        let divide_c = |total: Real| {
+            if cden.is_finite() {
+                total / cden
+            } else {
+                0.5 * (total / all.midpoint(before_last))
+            }
+        };
+        let r1 = divide_r(r0);
+        let c1 = divide_c(c0);
+        let diode = i0.map(|i0| (divide_c(i0), length * n * rsperl));
         let sections = Self {
             length,
             lumps,
