@@ -664,12 +664,10 @@ impl Jfet2 {
         // `inpgmod.c::create_model`: see `Jfet::instantiate`.
         let (scalars, model_defaults) = crate::devices::schema::split_model_setters(
             scalars,
-            &ScalarSchema { parameters: MODEL },
-            &ScalarSchema {
-                parameters: crate::devices::jfet::INSTANCE,
-            },
+            &MODEL_SCHEMA,
+            &crate::devices::jfet::INSTANCE_SCHEMA,
         );
-        let m = ScalarSchema { parameters: MODEL }.validate(scalars, &resolved.card().location)?;
+        let m = MODEL_SCHEMA.validate(scalars, &resolved.card().location)?;
         let r = |name: &str| required(&m, name);
         // JFET2_MOD_VTO (`vt0`, alias `vto`) and JFET2_MOD_PB (`vbi`, alias
         // `pb`): setters apply in card order, so the later spelling wins.
@@ -1714,6 +1712,8 @@ impl Device for ResetJfet2 {
         )
     }
 }
+
+static MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(MODEL);
 
 #[cfg(test)]
 mod tests {

@@ -28,12 +28,13 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
 use super::{Inputs, ModelParameters, Value, charges, dc};
-use crate::devices::models::{ModelContext, ResolvedModel};
+use crate::devices::models::{ModelContext, PreparationKey, ResolvedModel};
 use crate::devices::nonlinear::{JunctionPoint, junction_companion};
 use crate::devices::state::{DeviceState, IterationPhase};
 use crate::devices::traits::{Device, StampContext};
@@ -116,7 +117,7 @@ enum Start {
 struct Cached {
     temperature: Real,
     nominal: Real,
-    defaults: Rc<ModelDefaults>,
+    defaults: Arc<ModelDefaults>,
     temperature_model: TemperatureModel,
     setup: InstanceSetup,
 }
@@ -178,7 +179,11 @@ impl Bsim3 {
         }
         let params = super::model_parameters(model)?;
         let inputs = params.instance_parameters(instance, 1.)?;
-        let defaults = Rc::new(params.model_defaults(context)?);
+        context.validate(&params.location)?;
+        let defaults = model.prepare(
+            PreparationKey::Nominal(context.nominal_temperature.to_bits()),
+            || params.model_defaults(context),
+        )?;
         let temperature_model = defaults.at_temperature(context.temperature, &instance.location)?;
         let setup = InstanceSetup::new(&defaults, &temperature_model, &inputs, &instance.location)?;
         let off = inputs
@@ -255,9 +260,9 @@ impl Bsim3 {
             // Keep context validation at the model location even on reuse.
             let defaults = if cache.nominal == nominal {
                 context.validate(&self.params.location)?;
-                Rc::clone(&cache.defaults)
+                Arc::clone(&cache.defaults)
             } else {
-                Rc::new(self.params.model_defaults(&context)?)
+                Arc::new(self.params.model_defaults(&context)?)
             };
             let temperature_model = defaults.at_temperature(temperature, &self.location)?;
             let setup =
@@ -1333,12 +1338,12 @@ mod tests {
         assert!(Rc::ptr_eq(&initial, &device.ensure(27., 27.).unwrap()));
         let hot = device.ensure(127., 27.).unwrap();
         assert!(!Rc::ptr_eq(&initial, &hot));
-        assert!(Rc::ptr_eq(&initial.defaults, &hot.defaults));
+        assert!(Arc::ptr_eq(&initial.defaults, &hot.defaults));
         assert_ne!(initial.setup.u0temp.to_bits(), hot.setup.u0temp.to_bits());
         assert!(device.ensure(-273.15, 27.).is_err());
         assert!(Rc::ptr_eq(&hot, &device.ensure(127., 27.).unwrap()));
         let new_nominal = device.ensure(127., 42.).unwrap();
-        assert!(!Rc::ptr_eq(&hot.defaults, &new_nominal.defaults));
+        assert!(!Arc::ptr_eq(&hot.defaults, &new_nominal.defaults));
         let fresh = crate::primitives::NodeTable::new()
             .transaction(|nodes| {
                 Bsim3::build(inst, nodes, &resolved, &ModelContext::new(127., 42.))
@@ -1348,5 +1353,14 @@ mod tests {
         assert_eq!(new_nominal.defaults, fresh.defaults);
         assert_eq!(new_nominal.setup, fresh.setup);
         assert_eq!(new_nominal.temperature_model, fresh.temperature_model);
+        // Build independent instances at A/B/A. Only the immutable model
+        // defaults are shared; each instance retains its own setup state.
+        let again = crate::primitives::NodeTable::new()
+            .transaction(|nodes| Bsim3::build(inst, nodes, &resolved, &ModelContext::new(27., 27.)))
+            .unwrap();
+        let again = again.ensure(27., 27.).unwrap();
+        assert!(Arc::ptr_eq(&initial.defaults, &again.defaults));
+        assert!(!Rc::ptr_eq(&initial, &again));
+        assert_eq!(initial.setup, again.setup);
     }
 }

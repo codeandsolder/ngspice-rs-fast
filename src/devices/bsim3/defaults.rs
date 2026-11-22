@@ -1,10 +1,9 @@
 //! Model-only default processing from `b3set.c::BSIM3setup`, before instance
 //! geometry, state/node allocation, temperature scaling or effective-size
 //! `b3check.c` diagnostics. Keep this phase distinct from raw explicit inputs.
-use std::collections::HashMap;
-use std::sync::OnceLock;
-
-use super::{ModelParameters, Parameter, Value, defaults_data, descriptor, parameters};
+#[cfg(test)]
+use super::parameters;
+use super::{DEVICE, ModelParameters, Value, defaults_data};
 use crate::devices::ModelContext;
 use crate::devices::schema::temperature_kelvin;
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
@@ -13,27 +12,6 @@ const EPS_OXIDE: Real = 3.453_133e-11;
 // b3set.c uses this rounded constant, not the platform's full-precision pi.
 // Preserve the exact binary64 value of b3set.c's deliberately rounded PI.
 const SETUP_PI: Real = Real::from_bits(0x4009_21fb_5452_4550);
-
-/// The generated descriptor remains authoritative; index its canonical
-/// spelling and aliases once instead of scanning hundreds of rows at every
-/// model-field access in setup and the numerical load. Mixed-case external
-/// input retains the shared descriptor's ASCII-insensitive semantics.
-fn model_descriptor(name: &str) -> Option<&'static Parameter> {
-    static INDEX: OnceLock<HashMap<&'static str, &'static Parameter>> = OnceLock::new();
-    let index = INDEX.get_or_init(|| {
-        let mut index = HashMap::with_capacity(parameters::MODEL.len());
-        for parameter in parameters::MODEL {
-            index.entry(parameter.name).or_insert(parameter);
-        }
-        index
-    });
-    index.get(name).copied().or_else(|| {
-        name.bytes()
-            .any(|b| b.is_ascii_uppercase())
-            .then(|| descriptor(parameters::MODEL, name))
-            .flatten()
-    })
-}
 
 /// One actual C model value and its given bit. Numeric zero initialization
 /// is the `GENmodel` allocation rule, not a fallback for a missing parameter.
@@ -141,7 +119,7 @@ impl ModelDefaults {
     /// Flags and VERSION are exposed separately; aliases use the same C ID.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Real> {
-        let parameter = model_descriptor(name)?;
+        let parameter = DEVICE.model.get(name)?;
         self.values.get(parameter.canonical)
     }
 
@@ -149,7 +127,7 @@ impl ModelDefaults {
     /// default. Aliases (and the two type flags) share their actual C bit.
     #[must_use]
     pub fn is_given(&self, name: &str) -> bool {
-        model_descriptor(name).is_some_and(|parameter| {
+        DEVICE.model.get(name).is_some_and(|parameter| {
             parameter.c_given.is_some()
                 && match parameter.canonical {
                     "nmos" | "pmos" => true, // INPmakeMod always applies the type flag.
@@ -305,14 +283,16 @@ mod tests {
                 parameter.name.to_ascii_uppercase(),
             ] {
                 assert_eq!(
-                    model_descriptor(&name),
-                    descriptor(parameters::MODEL, &name),
+                    DEVICE.model.get(&name),
+                    parameters::MODEL
+                        .iter()
+                        .find(|p| p.name.eq_ignore_ascii_case(&name)),
                     "{name}"
                 );
             }
         }
-        assert_eq!(model_descriptor("missing"), None);
-        assert_eq!(model_descriptor("MISSING"), None);
+        assert_eq!(DEVICE.model.get("missing"), None);
+        assert_eq!(DEVICE.model.get("MISSING"), None);
     }
 
     #[test]

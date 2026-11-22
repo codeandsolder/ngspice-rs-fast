@@ -3247,7 +3247,7 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         let mut checked = 0;
         for &(keyword, expected) in super::super::defaults_data::LITERALS {
-            let p = super::super::descriptor(parameters::MODEL, keyword).unwrap();
+            let p = super::super::DEVICE.model.get(keyword).unwrap();
             let field = p.c_field.unwrap();
             let actual = if let Some(v) = m.real_mut(field) {
                 *v
