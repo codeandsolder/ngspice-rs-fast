@@ -16,7 +16,7 @@
 //! nonpositive rise/fall, which [`PulseSpec::resolve`] reproduces); and every
 //! boundary has a defined left and right limit instead of a single sampled value.
 
-use crate::devices::Limit;
+use crate::devices::{Limit, WaveformEvent, WaveformEventKind};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// The largest cycle index whose start time is still resolvable in `f64`.
@@ -402,7 +402,7 @@ pub struct PulseBreakpoints {
     /// plateau (a jump to V1 that is not already a corner).
     cut: Option<Real>,
     /// The remaining breakpoints once the count is exhausted.
-    tail: Option<[Option<Real>; 2]>,
+    tail: Option<[Option<WaveformEvent>; 2]>,
 }
 impl PulseBreakpoints {
     fn new(pulse: Pulse, t0: Real, t1: Real) -> SpiceResult<Self> {
@@ -428,7 +428,18 @@ impl PulseBreakpoints {
             let offset = cycle_position(stop, pulse.period).phase;
             (offset > 0. && offset < active).then_some(pulse.delay + stop)
         });
-        let last_cycle = ((t1 - pulse.delay) / pulse.period).floor();
+        // A finite train needs only the cycle containing its last request,
+        // not every hypothetical cycle up to the window end. No cycles
+        // at all are needed for a window entirely before the delay.
+        let before_delay = t1 < pulse.delay;
+        let last_cycle = if before_delay {
+            0.
+        } else {
+            let last = ((t1 - pulse.delay) / pulse.period).floor();
+            pulse
+                .stop
+                .map_or(last, |stop| last.min((stop / pulse.period).floor() + 1.))
+        };
         if !last_cycle.is_finite() || last_cycle >= MAX_CYCLE {
             return Err(invalid("breakpoint window spans too many periods"));
         }
@@ -449,25 +460,27 @@ impl PulseBreakpoints {
             cycle,
             index: 0,
             last: None,
-            done: false,
+            done: before_delay,
             cut,
             tail: None,
         })
     }
 }
-impl Iterator for PulseBreakpoints {
-    type Item = Real;
-    fn next(&mut self) -> Option<Real> {
+impl PulseBreakpoints {
+    pub(super) fn next_event(&mut self) -> Option<WaveformEvent> {
         while !self.done && self.last.is_none_or(|last| last < self.t1) {
             if let Some(tail) = &mut self.tail {
                 // After `tmax`: the cut (if any), then C's last request.
-                let Some(t) = tail.iter_mut().find_map(Option::take) else {
+                let Some(event) = tail.iter_mut().find_map(Option::take) else {
                     self.done = true;
                     break;
                 };
-                if t >= self.t0 && t <= self.t1 && self.last.is_none_or(|last| t > last) {
-                    self.last = Some(t);
-                    return Some(t);
+                if event.time >= self.t0
+                    && event.time <= self.t1
+                    && self.last.is_none_or(|last| event.time > last)
+                {
+                    self.last = Some(event.time);
+                    return Some(event);
                 }
                 continue;
             }
@@ -493,6 +506,11 @@ impl Iterator for PulseBreakpoints {
             let cycle_start = self.pulse.period * self.cycle;
             let local = cycle_start + self.offsets[self.index];
             let t = self.pulse.delay + local;
+            let kind = if self.index == 0 {
+                WaveformEventKind::PulsePeriodStart
+            } else {
+                WaveformEventKind::PulseEdge
+            };
             self.index += 1;
             if !t.is_finite() {
                 self.done = true;
@@ -500,15 +518,31 @@ impl Iterator for PulseBreakpoints {
                 // C's VSRCaccept stops once `time > tmax`, but the request it
                 // made at its last step before that is the first corner after
                 // `tmax`; landing there too keeps the step sequence C's.
-                self.tail = Some([self.cut.take(), Some(t)]);
+                self.tail = Some([
+                    self.cut.take().map(|time| WaveformEvent {
+                        time,
+                        kind: WaveformEventKind::PulseCountCut,
+                    }),
+                    Some(WaveformEvent {
+                        time: t,
+                        kind: WaveformEventKind::PulseTrailingRequest,
+                    }),
+                ]);
             } else if t > self.t1 {
                 self.done = true;
             } else if t >= self.t0 && self.last.is_none_or(|last| t > last) {
                 self.last = Some(t);
-                return Some(t);
+                return Some(WaveformEvent { time: t, kind });
             }
         }
         None
+    }
+}
+
+impl Iterator for PulseBreakpoints {
+    type Item = Real;
+    fn next(&mut self) -> Option<Real> {
+        self.next_event().map(|event| event.time)
     }
 }
 
