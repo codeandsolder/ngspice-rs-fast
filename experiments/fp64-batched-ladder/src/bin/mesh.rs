@@ -303,6 +303,52 @@ fn execute<T: Packed>(tape: &[[u32; 4]], matrix: &mut [f64], rhs: &mut [f64], la
     }
 }
 
+// Match the GPU's grouped factorization and reusable triangular solves.
+// The original interpreter remains as a separately benchmarked baseline.
+fn factor_grouped<T: Packed>(plan: &[[u32; 4]], matrix: &mut [f64], lane: usize) {
+    for k in 0..N {
+        let [diag, first, end, _] = plan[1 + k];
+        let inverse = T::load(matrix, diag as usize, lane).inverse();
+        inverse.store(matrix, diag as usize, lane);
+        for &[_, handle, start, stop] in &plan[first as usize..end as usize] {
+            let l = T::load(matrix, handle as usize, lane).mul(inverse);
+            for &[dest, source, _, _] in &plan[start as usize..stop as usize] {
+                T::load(matrix, dest as usize, lane)
+                    .sub(l.mul(T::load(matrix, source as usize, lane)))
+                    .store(matrix, dest as usize, lane);
+            }
+            l.store(matrix, handle as usize, lane);
+        }
+    }
+}
+
+fn solve_grouped<T: Packed>(plan: &[[u32; 4]], matrix: &[f64], rhs: &mut [f64], lane: usize) {
+    for k in 0..N {
+        let [diag, first, end, _] = plan[1 + k];
+        let y = T::load(rhs, k, lane);
+        for &[row, handle, _, _] in &plan[first as usize..end as usize] {
+            T::load(rhs, row as usize, lane)
+                .sub(T::load(matrix, handle as usize, lane).mul(y))
+                .store(rhs, row as usize, lane);
+        }
+        T::load(matrix, diag as usize, lane)
+            .mul(y)
+            .store(rhs, k, lane);
+    }
+    for k in (0..N).rev() {
+        let [_, first, end, _] = plan[1 + k];
+        let mut value = T::load(rhs, k, lane);
+        for &[row, handle, _, _] in &plan[first as usize..end as usize] {
+            value = value.sub(T::load(matrix, handle as usize, lane).mul(T::load(
+                rhs,
+                row as usize,
+                lane,
+            )));
+        }
+        value.store(rhs, k, lane);
+    }
+}
+
 struct Input {
     matrix: Vec<f64>,
     rhs: Vec<f64>,
@@ -393,6 +439,12 @@ impl Input {
                     }
                 }
                 for i in 0..N {
+                    ensure!(
+                        residual[i].re.is_finite()
+                            && residual[i].im.is_finite()
+                            && norm[i].is_finite(),
+                        "nonfinite residual"
+                    );
                     backward =
                         backward.max(residual[i].magnitude() / norm[i].max(f64::MIN_POSITIVE));
                 }
@@ -460,7 +512,7 @@ fn main() -> Result<()> {
     ))?;
     println!("persistent CPU workers: {}", rayon::current_num_threads());
     println!(
-        "systems,scalar_ms,simd_ms,parallel_simd_ms,gpu_resident_ms,gpu_amortized_ms,gpu_roundtrip_ms,grouped_resident_ms,grouped_amortized_ms,grouped_roundtrip_ms,mixed_resident_ms,mixed_amortized_ms,mixed_roundtrip_ms,mixed_error,mixed_backward,max_solution_error,max_backward_error"
+        "systems,scalar_ms,simd_ms,parallel_simd_ms,grouped_simd_ms,grouped_parallel_simd_ms,gpu_resident_ms,gpu_amortized_ms,gpu_roundtrip_ms,grouped_resident_ms,grouped_amortized_ms,grouped_roundtrip_ms,mixed_resident_ms,mixed_amortized_ms,mixed_roundtrip_ms,mixed_error,mixed_backward,max_solution_error,max_backward_error"
     );
     for groups in [1_u32, 4, 16, 64] {
         let input = Input::new(&plan, groups as usize);
@@ -470,9 +522,35 @@ fn main() -> Result<()> {
         let mut error = 0.0_f64;
         let mut backward = 0.0_f64;
         let mut times = Vec::new();
-        for mode in 0..3 {
+        for mode in 0..5 {
             times.push(median_ms(|| {
-                if mode == 2 {
+                if mode >= 3 {
+                    let solve = |m: &[f64], b: &[f64], work: &mut [f64], x: &mut [f64]| {
+                        work.copy_from_slice(m);
+                        x.copy_from_slice(b);
+                        factor_grouped::<SimdBlock>(&grouped, work, 0);
+                        solve_grouped::<SimdBlock>(&grouped, work, x, 0);
+                    };
+                    if mode == 4 {
+                        input
+                            .matrix
+                            .par_chunks_exact(stride)
+                            .zip(input.rhs.par_chunks_exact(N * BLOCK))
+                            .zip(matrix.par_chunks_exact_mut(stride))
+                            .zip(x.par_chunks_exact_mut(N * BLOCK))
+                            .for_each(|(((m, b), work), x)| solve(m, b, work, x));
+                    } else {
+                        for (((m, b), work), x) in input
+                            .matrix
+                            .chunks_exact(stride)
+                            .zip(input.rhs.chunks_exact(N * BLOCK))
+                            .zip(matrix.chunks_exact_mut(stride))
+                            .zip(x.chunks_exact_mut(N * BLOCK))
+                        {
+                            solve(m, b, work, x);
+                        }
+                    }
+                } else if mode == 2 {
                     input
                         .matrix
                         .par_chunks_exact(stride)
@@ -525,14 +603,45 @@ fn main() -> Result<()> {
         )?;
         let (me, mb) = input.check(&plan, &x)?;
         println!(
-            "{},{:.4},{:.4},{:.4},{resident:.4},{amortized:.4},{roundtrip:.4},{gr:.4},{ga:.4},{gt:.4},{mr:.4},{ma:.4},{mt:.4},{me:.3e},{mb:.3e},{:.3e},{:.3e}",
+            "{},{:.4},{:.4},{:.4},{:.4},{:.4},{resident:.4},{amortized:.4},{roundtrip:.4},{gr:.4},{ga:.4},{gt:.4},{mr:.4},{ma:.4},{mt:.4},{me:.3e},{mb:.3e},{:.3e},{:.3e}",
             groups * TILE as u32,
             times[0],
             times[1],
             times[2],
+            times[3],
+            times[4],
             error.max(e).max(ge).max(me),
             backward.max(r).max(gb).max(mb)
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grouped_plan_factors_can_solve_repeated_rhs() -> Result<()> {
+        let plan = Plan::new();
+        let grouped = plan.grouped();
+        let input = Input::new(&plan, 1);
+        let mut factors = input.matrix.clone();
+        factor_grouped::<SimdBlock>(&grouped, &mut factors, 0);
+        let mut output = input.rhs.clone();
+        solve_grouped::<SimdBlock>(&grouped, &factors, &mut output, 0);
+        input.check(&plan, &output)?;
+        let mut second = input.rhs.clone();
+        solve_grouped::<SimdBlock>(&grouped, &factors, &mut second, 0);
+        assert_eq!(output, second);
+        // Also test the same typed plan in scalar mode for every lane.
+        let mut scalar_factors = input.matrix.clone();
+        let mut scalar_result = input.rhs.clone();
+        for lane in 0..TILE {
+            factor_grouped::<C<f64>>(&grouped, &mut scalar_factors, lane);
+            solve_grouped::<C<f64>>(&grouped, &scalar_factors, &mut scalar_result, lane);
+        }
+        input.check(&plan, &scalar_result)?;
+        Ok(())
+    }
 }
