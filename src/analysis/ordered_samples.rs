@@ -312,12 +312,46 @@ pub(super) enum SampleError {
 }
 
 fn interpolate(x0: Real, y0: Real, x1: Real, y1: Real, x: Real) -> Real {
-    y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    // Compute the fraction from the nearer endpoint; subtracting a
+    // rounded fraction from one can lose the whole short interval.
+    let (near_x, near_y, far_x, far_y) = if x <= Real::midpoint(x0, x1) {
+        (x0, y0, x1, y1)
+    } else {
+        (x1, y1, x0, y0)
+    };
+    let width = far_x - near_x;
+    let fraction = if width.is_finite() {
+        (x - near_x) / width
+    } else {
+        // A span crossing zero may overflow even though the ratio is finite.
+        let near = 0.5 * near_x;
+        let scaled_x = 0.5 * x;
+        let far = 0.5 * far_x;
+        (scaled_x - near) / (far - near)
+    };
+    let difference = far_y - near_y;
+    if difference.is_finite() {
+        fraction.mul_add(difference, near_y)
+    } else {
+        // Opposite-sign finite endpoints can have an unrepresentable
+        // difference even when every interpolated ordinate is finite.
+        fraction.mul_add(far_y, (1. - fraction) * near_y)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AxisError, OrderedAxis, SampleError};
+
+    #[test]
+    fn interpolation_handles_overflowing_spans_and_anchor_differences() {
+        use super::interpolate;
+        assert_eq!(interpolate(-f64::MAX, -1., f64::MAX, 1., 0.), 0.);
+        assert_eq!(interpolate(0., -f64::MAX, 2., f64::MAX, 1.), 0.);
+        let x = 1_f64.next_down();
+        let expected = 1. - x;
+        assert_eq!(interpolate(0., 1., 1., 0., x), expected);
+    }
 
     #[test]
     fn duplicate_coordinates_use_exact_equality_including_signed_zero() {

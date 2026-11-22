@@ -38,6 +38,7 @@
 //! The device side, including C's side effects of the in-place perturbation,
 //! lives in [`crate::devices::sensitivity`]; see `docs/port/SENSITIVITY.md`.
 
+use super::reduction::CompensatedSum;
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{PlotFlags, Variable};
 use crate::analysis::{AnalysisContext, AnalysisPlan, Plot};
@@ -231,7 +232,7 @@ pub(super) fn parse(arguments: &[String]) -> SpiceResult<SensCard> {
 /// divides `ln(fstop/fstart)` by `M_LOG2E` instead of multiplying.
 #[expect(
     clippy::suboptimal_flops,
-    reason = "preserve C count_steps and inc_freq rounding, including pow and truncation"
+    reason = "count_steps truncates a discrete sweep length; changing frequency grid membership requires a separate policy change"
 )]
 fn frequencies(sweep: &Sweep) -> SpiceResult<Vec<Real>> {
     let steps = Real::from(sweep.steps.max(1));
@@ -971,15 +972,18 @@ impl PerturbedAssembly<'_> {
             });
         }
         for row in 0..x.len() {
-            let mut sum = Complex::ZERO;
-            // This is the ordinary C complex product and sum, not a fused
-            // dot product; each contribution is reduced before multiplication.
+            let mut real = CompensatedSum::default();
+            let mut imaginary = CompensatedSum::default();
+            // Preserve the sparse visitation and perturbation semantics,
+            // but compensate each component of the cancellation-prone dot.
             if self.matrix.rows[row].first.is_some() {
                 for entry in self.matrix.fold_row(row, self.base_count) {
-                    sum = sum + entry.value * x[entry.col.0];
+                    let product = entry.value * x[entry.col.0];
+                    real.add(product.re);
+                    imaginary.add(product.im);
                 }
             }
-            visit(row, sum);
+            visit(row, Complex::new(real.total(), imaginary.total()));
         }
         Ok(())
     }

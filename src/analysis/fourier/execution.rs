@@ -4,6 +4,7 @@ use super::{FourierAnalysis, FourierSettings, FourierWindow, Harmonic};
 use crate::analysis::ordered_samples::{
     AxisError, Location, OrderedAxis, SampleError, column_names,
 };
+use crate::analysis::reduction::CompensatedSum;
 use crate::analysis::results::Plot;
 use crate::analysis::selection::{self, Column};
 use crate::netlist::ast::{FourierCard, MAX_HARMONICS, VectorRequest};
@@ -269,8 +270,8 @@ fn check_grid_point(card: &FourierCard, previous: Option<Real>, x: Real) -> Spic
     Ok(())
 }
 
-/// Preserve the distinct phase expressions: rearranging multiplication or
-/// replacing the separate sin/cos calls changes reference rounding.
+/// Each grid uses its own integer bin index; reduce it modulo the grid
+/// length before converting to radians to avoid large-angle phase error.
 #[derive(Clone, Copy)]
 enum ProjectionGrid {
     Closed(u32),
@@ -286,17 +287,16 @@ impl ProjectionGrid {
     }
 
     fn coefficient(self, k: u32, i: u32) -> [Real; 2] {
-        let angle = match self {
-            Self::Closed(divisions) => {
-                let phase = Real::from(i) / Real::from(divisions);
-                std::f64::consts::TAU * Real::from(k) * phase
-            }
-            Self::HalfOpen { samples, periods } => {
-                std::f64::consts::TAU * Real::from(k) * Real::from(periods) * Real::from(i)
-                    / Real::from(samples)
-            }
+        let (length, periods) = match self {
+            Self::Closed(divisions) => (divisions, 1),
+            Self::HalfOpen { samples, periods } => (samples, periods),
         };
-        [angle.sin(), angle.cos()]
+        // Bounds: <=100 harmonics, <=100 periods and <=100000 grid points.
+        let residue = (k * periods * i) % length;
+        let phase = Real::from(residue) / Real::from(length);
+        let angle = std::f64::consts::TAU * phase;
+        let (sin, cos) = angle.sin_cos();
+        [sin, cos]
     }
 }
 
@@ -330,8 +330,8 @@ impl ProjectionGrid {
                 *pair = self.coefficient(k, i);
             }
             for prepared in batch.iter_mut() {
-                let mut sine = 0.;
-                let mut cosine = 0.;
+                let mut sine = CompensatedSum::default();
+                let mut cosine = CompensatedSum::default();
                 for (i, (y, [sin, cos])) in prepared.values.iter().zip(&basis).enumerate() {
                     let weighted = match self {
                         Self::Closed(divisions) => {
@@ -346,10 +346,10 @@ impl ProjectionGrid {
                     };
                     let sine_term = weighted * sin;
                     let cosine_term = weighted * cos;
-                    sine += sine_term;
-                    cosine += cosine_term;
+                    sine.add(sine_term);
+                    cosine.add(cosine_term);
                 }
-                prepared.sums[k as usize] = [sine, cosine];
+                prepared.sums[k as usize] = [sine.total(), cosine.total()];
             }
         }
         Ok(())
@@ -566,13 +566,17 @@ impl ConfiguredPlan {
         let n = u32::try_from(values.len())
             .map_err(|_| unsupported(card, "Fourier sample count exceeds u32".into()))?;
         let divisor = Real::from(n);
-        let dc = values.iter().sum::<Real>() / divisor;
+        let mut dc = CompensatedSum::default();
+        for &value in values {
+            dc.add(value / divisor);
+        }
+        let dc = dc.total();
         let mut tabulated = Vec::with_capacity(self.harmonics as usize);
         for (k, &[sine, cosine]) in (1..=self.harmonics).zip(sums.iter().skip(1)) {
             tabulated.push(Harmonic {
                 order: k,
                 frequency: Real::from(k) * card.fundamental,
-                amplitude: 2. * sine.hypot(cosine) / divisor,
+                amplitude: ((2. / divisor) * sine).hypot((2. / divisor) * cosine),
                 phase: cosine.atan2(sine),
             });
         }
@@ -613,7 +617,7 @@ impl ConfiguredPlan {
 }
 
 /// Stable local polynomial geometry. Coefficients depend only on times,
-/// not the vector; keep the exact old multiplication and evaluation order.
+/// not the vector. Accumulate weighted values with compensation.
 struct StablePlan {
     starts: Vec<usize>,
     weights: Vec<Real>,
@@ -665,11 +669,28 @@ impl StablePlan {
             .iter()
             .zip(self.weights.chunks_exact(self.order))
         {
-            let mut value = 0.;
-            for (&weight, &sample) in row.iter().zip(&samples[start..start + self.order]) {
-                let term = weight * sample;
-                value += term;
+            // Apply the interpolation weights to differences from the
+            // nearest central node: a constant trace is represented exactly,
+            // even when the weights' rounded sum differs from one.
+            if let Some(index) = row
+                .iter()
+                .position(|&weight| crate::analysis::ordered_samples::same_coordinate(weight, 1.))
+                && row
+                    .iter()
+                    .enumerate()
+                    .all(|(j, &weight)| j == index || weight == 0.)
+            {
+                values.push(samples[start + index]);
+                continue;
             }
+            let anchor = samples[start + self.order / 2];
+            let mut value = CompensatedSum::default();
+            value.add(anchor);
+            for (&weight, &sample) in row.iter().zip(&samples[start..start + self.order]) {
+                let difference = sample - anchor;
+                value.add(weight * difference);
+            }
+            let value = value.total();
             if !value.is_finite() {
                 return Err(nonfinite(
                     name,
@@ -1169,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn coefficient_rows_preserve_both_original_phase_expressions() {
+    fn reduced_coefficient_rows_agree_with_unreduced_phase_within_roundoff() {
         for geometry in [
             ProjectionGrid::Closed(204),
             ProjectionGrid::HalfOpen {
@@ -1192,13 +1213,10 @@ mod tests {
                                 / Real::from(samples)
                         }
                     };
-                    assert_eq!(
-                        geometry.coefficient(k, i).map(Real::to_bits),
-                        [
-                            expected_angle.sin().to_bits(),
-                            expected_angle.cos().to_bits()
-                        ],
-                    );
+                    let actual = geometry.coefficient(k, i);
+                    let bound = 8. * Real::EPSILON * expected_angle.abs().max(1.);
+                    assert!((actual[0] - expected_angle.sin()).abs() <= bound);
+                    assert!((actual[1] - expected_angle.cos()).abs() <= bound);
                 }
             }
         }
@@ -1227,7 +1245,20 @@ mod tests {
     }
 
     #[test]
-    fn batched_projection_matches_original_scalar_summation_bit_for_bit() {
+    fn high_bin_phase_reduction_is_periodic_and_preserves_endpoints() {
+        let grid = ProjectionGrid::HalfOpen {
+            samples: 100_000,
+            periods: 100,
+        };
+        assert_eq!(grid.coefficient(100, 0), [0., 1.]);
+        assert_eq!(grid.coefficient(100, 99_990), [0., 1.]);
+        assert_eq!(grid.coefficient(100, 99_991), grid.coefficient(100, 1));
+        let closed = ProjectionGrid::Closed(400);
+        assert_eq!(closed.coefficient(100, 400), [0., 1.]);
+    }
+
+    #[test]
+    fn batched_projection_agrees_with_independent_scalar_quadrature() {
         use super::{PreparedTrace, Trace};
         use crate::analysis::results::{Plot, PlotFlags, Variable};
         let mut builder = Plot::builder("test", "Transient Analysis", PlotFlags::Real);
@@ -1295,8 +1326,16 @@ mod tests {
                         }
                     }
                 }
+                let magnitude = prepared.values.iter().map(|v| v.abs()).sum::<Real>();
+                // Naive summation has O(n*epsilon) relative-to-L1 error.
+                // The unreduced phase also has O(k*periods*TAU*epsilon) error.
+                let bound = (geometry.samples() as Real + 8. * 3. * std::f64::consts::TAU)
+                    * Real::EPSILON
+                    * magnitude;
                 for (obtained, expected) in prepared.sums.iter().zip(wanted) {
-                    assert_eq!(obtained.map(Real::to_bits), expected.map(Real::to_bits));
+                    for (&actual, reference) in obtained.iter().zip(expected) {
+                        assert!((actual - reference).abs() <= bound);
+                    }
                 }
             }
         }

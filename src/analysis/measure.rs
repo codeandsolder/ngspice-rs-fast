@@ -37,6 +37,7 @@ use crate::netlist::ast::{
 use crate::primitives::{AnalysisKind, Real, SpiceError, SpiceResult};
 
 use super::ordered_samples::{AxisError, OrderedAxis, SampleError, SampleWindow, column_names};
+use super::reduction::CompensatedSum;
 use crate::analysis::results::Plot;
 use crate::analysis::selection::{self, Column};
 
@@ -745,29 +746,22 @@ fn extrema(
     Ok(extrema)
 }
 
-/// C `measure_minMaxAvg` uses the trapezoidal integral for AVG. Only the
-/// preceding sample is needed; keep exactly the original grouping.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "retain separately rounded C trapezoid sum"
-)]
-#[expect(
-    clippy::manual_midpoint,
-    reason = "C AVG explicitly sums the samples before scaling; midpoint changes overflow and rounding semantics"
-)]
+/// Trapezoidal AVG. Midpoint avoids overflowing the sum of two finite
+/// samples, and compensation retains small areas across cancellation.
 fn trapezoid_integral(
     points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
     card: &MeasureCard,
 ) -> SpiceResult<Real> {
     let mut previous = None;
-    let mut area = 0.;
+    let mut area = CompensatedSum::default();
     for point in points {
         let (x1, y1) = point?;
         if let Some((x0, y0)) = previous {
-            area += 0.5 * (y0 + y1) * (x1 - x0);
+            area.add(Real::midpoint(y0, y1) * (x1 - x0));
         }
         previous = Some((x1, y1));
     }
+    let area = area.total();
     if !area.is_finite() {
         return Err(nonfinite(
             card,
@@ -782,10 +776,6 @@ fn trapezoid_integral(
 /// Four samples are sufficient to select a panel; retain an overlapping
 /// endpoint and refill only consumed slots. Only positive widths within
 /// 100 ULPs share a Simpson panel. Duplicate coordinates use trapezoids.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "preserve C Simpson panel weighting and independently rounded accumulation"
-)]
 fn simpson_integral(
     points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
     square: bool,
@@ -794,7 +784,7 @@ fn simpson_integral(
     let mut points = points.fuse();
     let mut panel = [(0., 0.); 4];
     let mut count = 0;
-    let mut area = 0.;
+    let mut area = CompensatedSum::default();
     let equal = |a: Real, b: Real| a > 0. && b > 0. && a.to_bits().abs_diff(b.to_bits()) <= 100;
     loop {
         for slot in &mut panel[count..] {
@@ -814,18 +804,28 @@ fn simpson_integral(
         let width = |index: usize| panel[index + 1].0 - panel[index].0;
         let h = width(0);
         let consumed = if count == 4 && equal(h, width(1)) && equal(h, width(2)) {
-            area += 3. * h * (y(0) + 3. * (y(1) + y(2)) + y(3)) / 8.;
+            // The weights sum to one: apply them before combining samples
+            // rather than overflowing an unscaled weighted ordinate.
+            let mean = 0.25_f64.mul_add(
+                Real::midpoint(y(0), y(3)),
+                0.75 * Real::midpoint(y(1), y(2)),
+            );
+            area.add(mean * (3. * h));
             3
         } else if count >= 3 && equal(h, width(1)) {
-            area += h * (y(0) + 4. * y(1) + y(2)) / 3.;
+            let mean = (1. / 3_f64).mul_add(Real::midpoint(y(0), y(2)), (2. / 3.) * y(1));
+            area.add(mean * (2. * h));
             2
         } else {
-            area += h * (y(0) + y(1)) / 2.;
+            if h > 0. {
+                area.add(Real::midpoint(y(0), y(1)) * h);
+            }
             1
         };
         panel.copy_within(consumed..count, 0);
         count -= consumed;
     }
+    let area = area.total();
     if !area.is_finite() {
         return Err(nonfinite(
             card,
@@ -837,10 +837,6 @@ fn simpson_integral(
 }
 
 /// C `measure_margin`: unwrap phase, interpolate dB/degrees and log frequency.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "retain reference interpolation rounding for the selected crossover and its margin"
-)]
 fn margin(
     axis: &Axis,
     operand: &Operand<'_>,
@@ -883,15 +879,21 @@ fn margin(
             if (a >= target && b < target) || (a < target && b >= target) {
                 let fraction = (target - a) / (b - a);
                 let at = if f0 > 0. && frequency > 0. {
-                    (f0.ln() + fraction * (frequency.ln() - f0.ln())).exp()
+                    if fraction == 0. {
+                        f0
+                    } else if super::ordered_samples::same_coordinate(fraction, 1.) {
+                        frequency
+                    } else {
+                        fraction.mul_add(frequency.ln() - f0.ln(), f0.ln()).exp()
+                    }
                 } else {
-                    f0 + fraction * (frequency - f0)
+                    fraction.mul_add(frequency - f0, f0)
                 };
                 if at >= window.from && at <= window.to {
                     let value = if phase_margin {
-                        180. + p0 + fraction * (phase - p0)
+                        fraction.mul_add(phase - p0, 180. + p0)
                     } else {
-                        -(db0 + fraction * (db - db0))
+                        -fraction.mul_add(db - db0, db0)
                     };
                     return Ok((value, at));
                 }
@@ -942,14 +944,16 @@ fn derivative_at(
         if t[0] == t[1] || t[1] == t[2] {
             secant()?
         } else {
-            let mut sum = 0.;
-            for k in 0..3 {
-                let a = (k + 1) % 3;
-                let b = (k + 2) % 3;
-                sum += operand.value(middle - 1 + k)? * ((at - t[a]) + (at - t[b]))
-                    / ((t[k] - t[a]) * (t[k] - t[b]));
-            }
-            sum
+            // Differentiate Newton's divided-difference polynomial.
+            // Subtract the ordinates first, so a large common DC offset
+            // cannot dominate the cancellation of three weighted values.
+            let y0 = operand.value(middle - 1)?;
+            let y1 = operand.value(middle)?;
+            let y2 = operand.value(middle + 1)?;
+            let first = (y1 - y0) / (t[1] - t[0]);
+            let second = (y2 - y1) / (t[2] - t[1]);
+            let curvature = (second - first) / (t[2] - t[0]);
+            curvature.mul_add((at - t[0]) + (at - t[1]), first)
         }
     };
     if !value.is_finite() {
@@ -1312,16 +1316,17 @@ mod tests {
     }
 
     #[test]
-    fn trapezoid_keeps_reference_sum_before_scaling() {
+    fn trapezoid_avoids_intermediate_sample_overflow() {
         let card = card("m", request(MeasureStatistic::Avg, None, None));
         let values = [(0.0, Real::MAX), (0.5, Real::MAX)];
-        // C's intermediate sample sum overflows, even though an alternative
-        // midpoint implementation could keep the final integral finite.
-        assert!(super::trapezoid_integral(values.into_iter().map(Ok), &card).is_err());
+        assert_eq!(
+            super::trapezoid_integral(values.into_iter().map(Ok), &card).unwrap(),
+            Real::MAX / 2.
+        );
     }
 
     #[test]
-    fn streaming_simpson_panels_keep_greedy_selection_and_rounding() {
+    fn streaming_simpson_panels_keep_greedy_selection() {
         let points: [(Real, Real); 9] = [
             (0., 0.1),
             (1., -0.2),
@@ -1349,8 +1354,55 @@ mod tests {
                 expected += h(i) * (y(i) + y(i + 1)) / 2.;
             }
             let got = super::simpson_integral(points.into_iter().map(Ok), square, &card).unwrap();
-            assert_eq!(got.to_bits(), expected.to_bits());
+            assert!((got - expected).abs() <= 8. * Real::EPSILON * expected.abs());
         }
+    }
+
+    #[test]
+    fn quadrature_retains_cancelled_small_panel_areas_and_integrates_cubics() {
+        let card = card("m", request(MeasureStatistic::Integ, None, None));
+        let points = [
+            (0., 1e16),
+            (1., 1e16),
+            (1., 1.),
+            (2., 1.),
+            (2., -1e16),
+            (3., -1e16),
+        ];
+        assert_eq!(
+            super::trapezoid_integral(points.into_iter().map(Ok), &card).unwrap(),
+            1.
+        );
+        assert_eq!(
+            super::simpson_integral(points.into_iter().map(Ok), false, &card).unwrap(),
+            1.
+        );
+        let cubic = (0..=3).map(|i| {
+            let t = Real::from(i);
+            Ok((t, t.powi(3)))
+        });
+        let result = super::simpson_integral(cubic, false, &card).unwrap();
+        assert!((result - 81. / 4.).abs() <= 4. * Real::EPSILON * 81. / 4.);
+    }
+
+    #[test]
+    fn quadratic_derivative_ignores_large_common_ordinate_offset() {
+        let offset = 2_f64.powi(50);
+        let plot = tran(&[(0., offset), (1., offset + 1.), (3., offset + 9.)]);
+        let result = measure(
+            &plot,
+            "slope",
+            MeasureRequest::AtEvent {
+                operand: out(),
+                event: MeasureEvent::At {
+                    at: 2.,
+                    location: loc(),
+                },
+                derivative: true,
+                window: MeasureWindow::default(),
+            },
+        );
+        assert_eq!(result.value, 4.);
     }
 
     #[test]
