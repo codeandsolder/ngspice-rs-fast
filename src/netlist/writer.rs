@@ -110,7 +110,10 @@ use crate::netlist::ast::{
     AnalysisCard, DeviceInstance, FuncCard, FuncSpelling, GlobalCard, IncludeDirective, ModelCard,
     Netlist, NodeHintCard, NodeHintValue, OptionCard, ParamCard, ParameterAssignment,
     ParameterKind, PositionedValue, ScopeEntry, ScopeView, ScopedCardKind, SourceWaveform,
-    Subcircuit, poly_dimension,
+    Subcircuit,
+};
+use crate::netlist::behavioural::forms::{
+    B_SETTERS, NonlinearForm, PolyControls, PolyForm, TableForm, TableInput,
 };
 use crate::netlist::expr::ParameterExpression;
 use crate::netlist::semantic::equal as semantic_equal;
@@ -674,14 +677,9 @@ impl Writer {
                 Some(location),
             ));
         }
-        if designator == 'b'
-            || (matches!(designator, 'e'..='h')
-                && device
-                    .parameters
-                    .iter()
-                    .any(|p| matches!(p.name.as_str(), "value" | "table" | "poly")))
-        {
-            let line = behavioural_card(device)?;
+        let nonlinear = NonlinearForm::validate(device)?;
+        if designator == 'b' || nonlinear.is_some() {
+            let line = behavioural_card(device, nonlinear)?;
             return self.line(depth, &line, location);
         }
         let mut parts = vec![node(&device.name, location)?];
@@ -1278,7 +1276,10 @@ fn behavioural_text(parameter: &ParameterAssignment) -> SpiceResult<String> {
 /// `e1 n+ n- table {<text>} = (x, y) ... [m=..]`,
 /// `e1 n+ n- nc+ nc- table=(x0, y0, ...)` and
 /// `e1 n+ n- poly(n) <controls> <coefficients> [m=..]`.
-fn behavioural_card(device: &DeviceInstance) -> SpiceResult<String> {
+fn behavioural_card(
+    device: &DeviceInstance,
+    nonlinear: Option<NonlinearForm<'_>>,
+) -> SpiceResult<String> {
     let location = &device.location;
     let designator = device.designator;
     if device.model.is_some() {
@@ -1293,48 +1294,29 @@ fn behavioural_card(device: &DeviceInstance) -> SpiceResult<String> {
     };
     parts.push(node(positive, location)?);
     parts.push(node(negative, location)?);
-    let b_setters = [
-        "m",
-        "tc1",
-        "tc2",
-        "temp",
-        "dtemp",
-        "reciproctc",
-        "reciprocm",
-    ];
-    let parameters = device.parameters.as_slice();
-    let first = parameters.first().ok_or_else(|| {
-        refuse(
-            format!("'{designator}' instance without a behavioural form"),
-            Some(location),
-        )
-    })?;
-    match (designator, first.name.as_str()) {
-        ('b', "v" | "i") | ('e' | 'g', "value") if controls.is_empty() => {
-            parts.push(format!("{}={}", first.name, behavioural_text(first)?));
-            let allowed: &[&str] = if designator == 'g' {
-                &["m"]
-            } else {
-                &b_setters
-            };
-            for parameter in &parameters[1..] {
-                parts.push(behavioural_setter(parameter, designator, allowed)?);
+    match nonlinear {
+        Some(NonlinearForm::Value(form)) => {
+            parts.push(format!("value={}", behavioural_text(form.input)?));
+            for parameter in form.setters {
+                parts.push(named_value(parameter, false)?);
             }
         }
-        ('e' | 'g', "table") => {
-            behavioural_table(device, first, controls, &parameters[1..], &mut parts)?;
-        }
-        (_, "poly") => {
-            behavioural_poly(device, first, controls, &parameters[1..], &mut parts)?;
-        }
-        _ => {
-            return Err(refuse(
-                format!(
-                    "'{designator}' instance whose first parameter {:?} is not a behavioural form",
-                    first.name
-                ),
-                Some(location),
-            ));
+        Some(NonlinearForm::Table(form)) => behavioural_table(device, form, &mut parts)?,
+        Some(NonlinearForm::Poly(form)) => behavioural_poly(device, form, &mut parts)?,
+        None => {
+            let Some((first, setters)) = device.parameters.split_first() else {
+                return Err(refuse("B source without behavioural form", Some(location)));
+            };
+            if designator != 'b'
+                || !matches!(first.name.as_str(), "v" | "i")
+                || !controls.is_empty()
+            {
+                return Err(refuse("invalid B source form", Some(location)));
+            }
+            parts.push(format!("{}={}", first.name, behavioural_text(first)?));
+            for parameter in setters {
+                parts.push(behavioural_setter(parameter, designator, B_SETTERS)?);
+            }
         }
     }
     Ok(parts.join(" "))
@@ -1357,125 +1339,59 @@ fn behavioural_setter(
 
 fn behavioural_table(
     device: &DeviceInstance,
-    first: &ParameterAssignment,
-    controls: &[String],
-    remaining: &[ParameterAssignment],
+    form: TableForm<'_>,
     parts: &mut Vec<String>,
 ) -> SpiceResult<()> {
-    let designator = device.designator;
-    let location = &device.location;
-    let four_node = match (&first.kind, controls) {
-        (ParameterKind::Behavioural(_), []) => false,
-        (ParameterKind::Flag, [nc_positive, nc_negative]) if designator == 'e' => {
-            parts.push(node(nc_positive, location)?);
-            parts.push(node(nc_negative, location)?);
-            true
+    match form.input {
+        TableInput::Voltage([positive, negative]) => {
+            parts.push(node(positive, &device.location)?);
+            parts.push(node(negative, &device.location)?);
+            let mut values = Vec::with_capacity(form.points.len() * 2);
+            for (x, y) in form.points {
+                values.push(value_text(x.parameter, false)?);
+                values.push(value_text(y.parameter, false)?);
+            }
+            parts.push(format!("table=({})", values.join(", ")));
         }
-        _ => {
-            return Err(refuse(
-                format!("'{designator}' TABLE with {} nodes", device.nodes.len()),
-                Some(location),
-            ));
-        }
-    };
-    let mut rest = remaining;
-    let mut values = Vec::new();
-    while let [x, y, tail @ ..] = rest {
-        if x.name != "x" || y.name != "y" {
-            break;
-        }
-        values.push((value_text(x, false)?, value_text(y, false)?));
-        rest = tail;
-    }
-    if values.is_empty() {
-        return Err(refuse("TABLE without points", Some(location)));
-    }
-    if four_node {
-        let flat: Vec<String> = values
-            .iter()
-            .flat_map(|(x, y)| [x.clone(), y.clone()])
-            .collect();
-        parts.push(format!("table=({})", flat.join(", ")));
-    } else {
-        parts.push(format!("table {{{}}} =", behavioural_text(first)?));
-        for (x, y) in &values {
-            parts.push(format!("({x}, {y})"));
+        TableInput::Expression(parameter, _) => {
+            parts.push(format!("table {{{}}} =", behavioural_text(parameter)?));
+            for (x, y) in form.points {
+                let x = value_text(x.parameter, false)?;
+                let y = value_text(y.parameter, false)?;
+                parts.push(format!("({x}, {y})"));
+            }
         }
     }
-    let allowed: &[&str] = if designator == 'g' { &["m"] } else { &[] };
-    for parameter in rest {
-        parts.push(behavioural_setter(parameter, designator, allowed)?);
+    for parameter in form.setters {
+        parts.push(named_value(parameter, false)?);
     }
     Ok(())
 }
 
 fn behavioural_poly(
     device: &DeviceInstance,
-    first: &ParameterAssignment,
-    controls: &[String],
-    remaining: &[ParameterAssignment],
+    form: PolyForm<'_>,
     parts: &mut Vec<String>,
 ) -> SpiceResult<()> {
-    let designator = device.designator;
-    let location = &device.location;
-    let spelling = value_text(first, false)?;
-    let dimension = poly_dimension(&spelling)
-        .ok_or_else(|| refuse("POLY dimension is not an integer in 1..=64", Some(location)))?;
+    let spelling = value_text(form.spelling, false)?;
     parts.push(format!("poly({spelling})"));
-    let mut rest = remaining;
-    if matches!(designator, 'e' | 'g') {
-        if controls.len() != 2 * dimension {
-            return Err(refuse(
-                format!(
-                    "POLY({dimension}) with {} controlling nodes",
-                    controls.len()
-                ),
-                Some(location),
-            ));
-        }
-        for control in controls {
-            parts.push(node(control, location)?);
-        }
-    } else {
-        for _ in 0..dimension {
-            match rest.split_first() {
-                Some((control, tail))
-                    if control.name == "control" && control.kind == ParameterKind::Instance =>
-                {
-                    parts.push(node(&control.value, &control.location)?);
-                    rest = tail;
-                }
-                _ => {
-                    return Err(refuse(
-                        format!("POLY({dimension}) without its controlling sources"),
-                        Some(location),
-                    ));
-                }
+    match form.controls {
+        PolyControls::Voltage(pairs) => {
+            for control in pairs.iter().flatten() {
+                parts.push(node(control, &device.location)?);
             }
         }
-        if !controls.is_empty() {
-            return Err(refuse("F/H POLY with controlling nodes", Some(location)));
+        PolyControls::Current(sources) => {
+            for control in sources {
+                parts.push(node(&control.value, &control.location)?);
+            }
         }
     }
-    let mut coefficients = 0;
-    while let Some((coefficient, tail)) = rest.split_first() {
-        if coefficient.name != "coef" {
-            break;
-        }
-        parts.push(value_text(coefficient, false)?);
-        coefficients += 1;
-        rest = tail;
+    for coefficient in form.coefficients {
+        parts.push(value_text(coefficient.parameter, false)?);
     }
-    if coefficients == 0 {
-        return Err(refuse("POLY without coefficients", Some(location)));
-    }
-    let allowed: &[&str] = if matches!(designator, 'g' | 'f') {
-        &["m"]
-    } else {
-        &[]
-    };
-    for parameter in rest {
-        parts.push(behavioural_setter(parameter, designator, allowed)?);
+    for parameter in form.setters {
+        parts.push(named_value(parameter, false)?);
     }
     Ok(())
 }
