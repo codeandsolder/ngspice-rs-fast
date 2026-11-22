@@ -78,10 +78,6 @@
     clippy::float_cmp,
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
 )]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
 
 use std::collections::BTreeSet;
 
@@ -263,10 +259,20 @@ impl UrcSections {
             reason = "the number of URC sections is bounded by MAX_LUMPS and represented in the C real-valued formula"
         )]
         let n = lumps as Real;
-        let r1 = (r0 * (p - 1.)) / ((2. * p.powf(n)) - 2.);
-        let denominator = (p.powf(n - 1.)) * (p + 1.) - 2.;
-        let c1 = (c0 * (p - 1.)) / denominator;
-        let diode = i0.map(|i0| ((i0 * (p - 1.)) / denominator, length * n * rsperl));
+        // Normalize by the geometric sums, without subtracting nearly
+        // equal powers when K approaches one. Keep the exact K=1 input
+        // rejection above; both adjacent representable ratios are valid.
+        let delta = p - 1.;
+        let log_p = if delta.abs() <= 0.5 {
+            delta.ln_1p()
+        } else {
+            p.ln()
+        };
+        let r_weight = delta / (2. * (n * log_p).exp_m1());
+        let c_weight = delta / (p + 1.).mul_add(((n - 1.) * log_p).exp_m1(), delta);
+        let r1 = r0 * r_weight;
+        let c1 = c0 * c_weight;
+        let diode = i0.map(|i0| (i0 * c_weight, length * n * rsperl));
         let sections = Self {
             length,
             lumps,
@@ -714,8 +720,8 @@ mod tests {
         // r1 = r0 (p-1) / (2 p^3 - 2), c1 = c0 (p-1) / (p^2 (p+1) - 2).
         let r0 = 50e-6 * 1000.;
         let c0 = 50e-6 * 1e-12;
-        assert_eq!(s.resistance, (r0 * 0.5) / ((2. * 1.5f64.powf(3.)) - 2.));
-        assert_eq!(s.capacitance, (c0 * 0.5) / (1.5f64.powf(2.) * 2.5 - 2.));
+        assert!((s.resistance - r0 / 9.5).abs() <= 4. * Real::EPSILON * r0);
+        assert!((s.capacitance - c0 / 7.25).abs() <= 4. * Real::EPSILON * c0);
         assert!(s.diode.is_none());
     }
 
@@ -739,6 +745,27 @@ mod tests {
             let (i1, rd) = s.diode.unwrap();
             assert!((i1 / s.capacitance - 1e-15 / 1e-12).abs() < 1e-12);
             assert_eq!(rd, 1e-3 * lumps as Real * 10.);
+        }
+    }
+
+    #[test]
+    fn nearly_uniform_ladders_conserve_total_elements() {
+        for p in [1_f64.next_down(), 1_f64.next_up(), 1. - 1e-10, 1. + 1e-10] {
+            for lumps in [1_i64, 3, 101] {
+                let s = UrcSections::new(1., Some(lumps), p, 1e9, 1000., 1e-12, Some(1e-15), 0.)
+                    .unwrap();
+                let mut prop = 1.;
+                let mut r = 0.;
+                let mut c = 0.;
+                for i in 0..s.lumps {
+                    r += 2. * prop * s.resistance;
+                    c += prop * s.capacitance * if i + 1 == s.lumps { 1. } else { 2. };
+                    prop *= p;
+                }
+                assert!((r / 1000. - 1.).abs() < 2e-13, "{p} {lumps}: {r}");
+                assert!((c / 1e-12 - 1.).abs() < 2e-13, "{p} {lumps}: {c}");
+                assert!((s.diode.unwrap().0 / s.capacitance - 1e-3).abs() < 1e-17);
+            }
         }
     }
 
