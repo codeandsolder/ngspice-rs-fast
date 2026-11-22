@@ -3937,6 +3937,58 @@ o7 m 0 n 0 rg
         initialize(&mut history, 2.);
         assert_ne!(a, compare(&history, 2.25, &model));
         assert_eq!(a, compare(&original, 2.25, &model));
+
+        // A successful acceptance rotates the revision and extends the
+        // waveform; the next proposal must evaluate the extended history.
+        let mut advanced = original.clone();
+        let updates = circuit
+            .devices()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, _)| {
+                (
+                    ordinal,
+                    DelayUpdate::Waveform(WaveformUpdate {
+                        append: Some((2.125, vec![3.5, 1.5, -4.5, -2.5])),
+                        ..WaveformUpdate::default()
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let trial = advanced.trial();
+        advanced
+            .accept_transaction(
+                trial,
+                HistoryPublication::Rotate,
+                |_, _| Ok(updates),
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_ne!(a, compare(&advanced, 2.25, &model));
+
+        // Merely opening an attempt performs no device work. Empty histories
+        // still fail when stamping, just as with a direct one-off load.
+        let empty = circuit.state_history().unwrap();
+        let before = run.ltra_work();
+        let mut proposal = run
+            .transient_attempt(&empty, &model, 2.25, &coefficients, forcing)
+            .unwrap();
+        let x = Vector::zeros(n);
+        let mut matrix = SparseMatrix::new(n, n);
+        let mut rhs = Vector::zeros(n);
+        let mut trial = empty.trial();
+        let expected = run
+            .load(&proposal.request(&x), &mut matrix, &mut rhs, &mut trial)
+            .unwrap_err();
+        let actual = proposal
+            .load(&x, &mut matrix, &mut rhs, &mut trial)
+            .unwrap_err();
+        assert_eq!(actual.to_string(), expected.to_string());
+        drop(proposal);
+        let after = run.ltra_work();
+        assert_eq!(after.coefficient_preparations, before.coefficient_preparations);
+        assert_eq!(after.convolution_evaluations, before.convolution_evaluations);
+        assert_eq!(a, compare(&original, 2.25, &model));
     }
 
     #[test]

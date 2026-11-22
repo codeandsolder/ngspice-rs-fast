@@ -59,7 +59,9 @@
 //!   convolution of the history (minus the operating-point initial
 //!   conditions) and the delayed waves at `t - TD` (quadratic, linear or
 //!   mixed interpolation, `LTRAquadInterp`/`LTRAlinInterp`) into the
-//!   right-hand side.
+//!   right-hand side. Within a transient proposal, both Newton and observation
+//!   loads reuse these immutable history-dependent inputs. Rejected proposals
+//!   discard them before retry; acceptance drops them before mutating history.
 //! * **Breakpoints.** On acceptance the line requests a breakpoint at the
 //!   previous accepted time plus `TD` when either attenuated wave
 //!   `(v + Z0 i) exp(-beta TD)` changes slope by at least `rel max(|d1|,
@@ -468,7 +470,7 @@ enum CoefficientKernel {
 }
 
 impl CoefficientKernel {
-    fn for_model(model: &LtraModel) -> Option<Self> {
+    const fn for_model(model: &LtraModel) -> Option<Self> {
         match model.case {
             LtraCase::Rc => Some(Self::Rc {
                 cbyr: model.cbyr.to_bits(),
@@ -548,7 +550,7 @@ impl LtraWorkspace {
         }
     }
 
-    pub(super) fn begin(&mut self) {
+    pub(super) const fn begin(&mut self) {
         self.work.attempts += 1;
     }
 
