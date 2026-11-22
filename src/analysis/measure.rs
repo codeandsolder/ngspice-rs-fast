@@ -128,14 +128,28 @@ pub(super) fn resolve_refs_with_scope<'a>(
     cards: impl Iterator<Item = &'a MeasureCard> + Clone,
     scope: &crate::netlist::eval::ParamScope,
 ) -> SpiceResult<Vec<Measurement>> {
-    let count = cards.clone().count();
+    let mut budget = crate::netlist::eval::EvalBudget::default();
+    let limit = budget.limits().definitions;
+    let mut scan = cards.clone();
+    let count = scan.by_ref().take(limit).count();
+    if let Some(card) = scan.next() {
+        return Err(unsupported(
+            card,
+            format!("measurement record limit of {limit} exceeded"),
+        ));
+    }
     if count == 0 {
         return Ok(Vec::new());
     }
     let axis = Axis::of(plot, kind)?;
-    let mut results = Vec::with_capacity(count);
-    let mut scope = std::sync::Arc::new(scope.clone());
-    let mut budget = crate::netlist::eval::EvalBudget::default();
+    // Evaluation order is two-pass, but each result occupies its source-order
+    // slot immediately. No result sort or chain of lexical scopes is needed.
+    let mut results = Vec::new();
+    results
+        .try_reserve_exact(count)
+        .map_err(|error| SpiceError::circuit(format!("allocating measurement records: {error}")))?;
+    results.resize_with(count, || None);
+    let mut scope = crate::netlist::eval::SequentialBindings::new(scope, count);
     for (index, card) in cards
         .clone()
         .enumerate()
@@ -180,20 +194,13 @@ pub(super) fn resolve_refs_with_scope<'a>(
         } else {
             evaluate(plot, &axis, card)?
         };
-        scope = std::sync::Arc::new(crate::netlist::eval::ParamScope::resolve(
-            Some(scope),
-            &[crate::netlist::eval::ParamBinding {
-                name: card.name.to_ascii_lowercase(),
-                value: result.value,
-                location: card.name_location.clone(),
-            }],
-            &[],
-            &mut budget,
-        )?);
-        results.push((index, result));
+        scope.publish(&card.name, result.value, &card.name_location)?;
+        results[index] = Some(result);
     }
-    results.sort_by_key(|(index, _)| *index);
-    Ok(results.into_iter().map(|(_, result)| result).collect())
+    results
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| SpiceError::circuit("measurement result missing after evaluation"))
 }
 
 /// Renders results as the bounded text block the CLI appends to its report.
@@ -1970,6 +1977,37 @@ mod tests {
             to_text(&[]),
             "measure: 0 result(s), evaluated on the full plot before any .save/.print selection\n"
         );
+    }
+
+    #[test]
+    fn measurement_record_limit_counts_duplicates_before_evaluating() {
+        let scope = crate::netlist::eval::ParamScope::root(&[]).unwrap();
+        let limit = crate::netlist::eval::EvalLimits::default().definitions;
+        let plot = tran(&[(0., 1.)]);
+        let repeated = card("same", request(MeasureStatistic::Max, None, None));
+        let error = super::resolve_refs_with_scope(
+            &plot,
+            AnalysisKind::Transient,
+            std::iter::repeat_n(&repeated, limit + 1),
+            &scope,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, crate::primitives::SpiceError::Unsupported {
+            location: Some(location), ..
+        } if location == &repeated.location)
+        );
+        assert!(error.to_string().contains("measurement record limit"));
+        let results = super::resolve_refs_with_scope(
+            &plot,
+            AnalysisKind::Transient,
+            std::iter::repeat_n(&repeated, limit),
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(results.len(), limit);
+        assert!(results.iter().all(|result| result.value == 1.));
+        assert!(scope.get("same").is_none());
     }
 
     #[test]
