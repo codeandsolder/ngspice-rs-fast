@@ -121,78 +121,76 @@ fn check_required(
     p: &mut SizeParam,
     messages: &mut Vec<String>,
 ) -> bool {
-    let mut Fatal_Flag = if m.toxe <= 0.0 {
+    let mut fatal = m.toxe <= 0.0;
+    if fatal {
         messages.push(format!("Fatal: Toxe = {} is not positive.", c_g(m.toxe)));
-        1
-    } else {
-        0
-    };
+    }
     if h.toxp <= 0.0 {
         messages.push(format!("Fatal: Toxp = {} is not positive.", c_g(h.toxp)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.eot <= 0.0 {
         messages.push(format!("Fatal: EOT = {} is not positive.", c_g(m.eot)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.tempeot <= 0.0 {
         messages.push(format!(
             "Fatal: TEMPEOT = {} is not positive.",
             c_g(m.tempeot)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.epsrgate < 0.0 {
         messages.push(format!(
             "Fatal: Epsrgate = {} is not positive.",
             c_g(m.epsrgate)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.epsrsub < 0.0 {
         messages.push(format!(
             "Fatal: Epsrsub = {} is not positive.",
             c_g(m.epsrsub)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.easub < 0.0 {
         messages.push(format!("Fatal: Easub = {} is not positive.", c_g(m.easub)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.ni0sub <= 0.0 {
         messages.push(format!("Fatal: Easub = {} is not positive.", c_g(m.ni0sub)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.toxm <= 0.0 {
         messages.push(format!("Fatal: Toxm = {} is not positive.", c_g(m.toxm)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.toxref <= 0.0 {
         messages.push(format!(
             "Fatal: Toxref = {} is not positive.",
             c_g(m.toxref)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.lpe0 < -p.leff {
         messages.push(format!("Fatal: Lpe0 = {} is less than -Leff.", c_g(p.lpe0)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.lintnoi > p.leff / 2.0 {
         messages.push(format!(
             "Fatal: Lintnoi = {} is too large - Leff for noise is negative.",
             c_g(m.lintnoi)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.lpeb < -p.leff {
         messages.push(format!("Fatal: Lpeb = {} is less than -Leff.", c_g(p.lpeb)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.ndep <= 0.0 {
         messages.push(format!("Fatal: Ndep = {} is not positive.", c_g(p.ndep)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.phi <= 0.0 {
         messages.push(format!(
@@ -204,104 +202,104 @@ fn check_required(
             c_g(p.phin),
             c_g(p.ndep)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.nsub <= 0.0 {
         messages.push(format!("Fatal: Nsub = {} is not positive.", c_g(p.nsub)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.ngate < 0.0 {
         messages.push(format!(
             "Fatal: Ngate = {} Ngate is not positive.",
             c_g(p.ngate)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.ngate > 1.0e25 {
         messages.push(format!("Fatal: Ngate = {} Ngate is too high", c_g(p.ngate)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.xj <= 0.0 {
         messages.push(format!("Fatal: Xj = {} is not positive.", c_g(p.xj)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.dvt1 < 0.0 {
         messages.push(format!("Fatal: Dvt1 = {} is negative.", c_g(p.dvt1)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.dvt1w < 0.0 {
         messages.push(format!("Fatal: Dvt1w = {} is negative.", c_g(p.dvt1w)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.w0 == -p.weff {
         messages.push("Fatal: (W0 + Weff) = 0 causing divided-by-zero.".to_string());
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.dsub < 0.0 {
         messages.push(format!("Fatal: Dsub = {} is negative.", c_g(p.dsub)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.b1 == -p.weff {
         messages.push("Fatal: (B1 + Weff) = 0 causing divided-by-zero.".to_string());
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if h.u0temp <= 0.0 {
         messages.push(format!(
             "Fatal: u0 at current temperature = {} is not positive.",
             c_g(h.u0temp)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.delta < 0.0 {
         messages.push(format!(
             "Fatal: Delta = {} is less than zero.",
             c_g(p.delta)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if h.vsattemp <= 0.0 {
         messages.push(format!(
             "Fatal: Vsat at current temperature = {} is not positive.",
             c_g(h.vsattemp)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.pclm <= 0.0 {
         messages.push(format!("Fatal: Pclm = {} is not positive.", c_g(p.pclm)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.drout < 0.0 {
         messages.push(format!("Fatal: Drout = {} is negative.", c_g(p.drout)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if h.m <= 0.0 {
         messages.push(format!("Fatal: multiplier = {} is not positive.", c_g(h.m)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if h.nf < 1.0 {
         messages.push(format!(
             "Fatal: Number of finger = {} is smaller than one.",
             c_g(h.nf)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if (h.sa > 0.0) && (h.sb > 0.0) && ((h.nf == 1.0) || ((h.nf > 1.0) && (h.sd > 0.0))) {
         if m.saref <= 0.0 {
             messages.push(format!("Fatal: SAref = {} is not positive.", c_g(m.saref)));
-            Fatal_Flag = 1;
+            fatal = true;
         }
         if m.sbref <= 0.0 {
             messages.push(format!("Fatal: SBref = {} is not positive.", c_g(m.sbref)));
-            Fatal_Flag = 1;
+            fatal = true;
         }
     }
     if (h.l + m.xl) <= m.xgl {
         messages.push("Fatal: The parameter xgl must be smaller than Ldrawn+XL.".to_string());
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if h.ngcon < 1.0 {
         messages.push("Fatal: The parameter ngcon cannot be smaller than one.".to_string());
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if (h.ngcon != 1.0) && (h.ngcon != 2.0) {
         h.ngcon = 1.0;
@@ -312,15 +310,15 @@ fn check_required(
     }
     if p.fprout < 0.0 {
         messages.push(format!("Fatal: fprout = {} is negative.", c_g(p.fprout)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.pdits < 0.0 {
         messages.push(format!("Fatal: pdits = {} is negative.", c_g(p.pdits)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.pditsl < 0.0 {
         messages.push(format!("Fatal: pditsl = {} is negative.", c_g(m.pditsl)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.igbMod != 0 {
         if p.nigbinv <= 0.0 {
@@ -328,36 +326,36 @@ fn check_required(
                 "Fatal: nigbinv = {} is non-positive.",
                 c_g(p.nigbinv)
             ));
-            Fatal_Flag = 1;
+            fatal = true;
         }
         if p.nigbacc <= 0.0 {
             messages.push(format!(
                 "Fatal: nigbacc = {} is non-positive.",
                 c_g(p.nigbacc)
             ));
-            Fatal_Flag = 1;
+            fatal = true;
         }
     }
     if m.igcMod != 0 {
         if p.nigc <= 0.0 {
             messages.push(format!("Fatal: nigc = {} is non-positive.", c_g(p.nigc)));
-            Fatal_Flag = 1;
+            fatal = true;
         }
         if p.poxedge <= 0.0 {
             messages.push(format!(
                 "Fatal: poxedge = {} is non-positive.",
                 c_g(p.poxedge)
             ));
-            Fatal_Flag = 1;
+            fatal = true;
         }
         if p.pigcd <= 0.0 {
             messages.push(format!("Fatal: pigcd = {} is non-positive.", c_g(p.pigcd)));
-            Fatal_Flag = 1;
+            fatal = true;
         }
     }
     if p.clc < 0.0 {
         messages.push(format!("Fatal: Clc = {} is negative.", c_g(p.clc)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.ckappas < 0.02 {
         messages.push(format!(
@@ -375,29 +373,29 @@ fn check_required(
     }
     if m.vtss < 0.0 {
         messages.push(format!("Fatal: Vtss = {} is negative.", c_g(m.vtss)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.vtsd < 0.0 {
         messages.push(format!("Fatal: Vtsd = {} is negative.", c_g(m.vtsd)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.vtssws < 0.0 {
         messages.push(format!("Fatal: Vtssws = {} is negative.", c_g(m.vtssws)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.vtsswd < 0.0 {
         messages.push(format!("Fatal: Vtsswd = {} is negative.", c_g(m.vtsswd)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.vtsswgs < 0.0 {
         messages.push(format!("Fatal: Vtsswgs = {} is negative.", c_g(m.vtsswgs)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.vtsswgd < 0.0 {
         messages.push(format!("Fatal: Vtsswgd = {} is negative.", c_g(m.vtsswgd)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
-    Fatal_Flag != 0
+    fatal
 }
 
 /// Optional recommended-range checks and resets, gated by C's `paramChk`.
@@ -424,7 +422,7 @@ fn check_recommended(
     temperature: f64,
     messages: &mut Vec<String>,
 ) -> bool {
-    let mut Fatal_Flag: i32 = 0;
+    let mut fatal = false;
     if p.leff <= 1.0e-9 {
         messages.push(format!(
             "Warning: Leff = {} <= 1.0e-9. Recommended Leff >= 1e-8 ",
@@ -638,53 +636,53 @@ fn check_recommended(
     }
     if m.rbps0 <= 0.0 {
         messages.push(format!("Fatal: RBPS0 = {} is not positive.", c_g(m.rbps0)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.rbpd0 <= 0.0 {
         messages.push(format!("Fatal: RBPD0 = {} is not positive.", c_g(m.rbpd0)));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.rbpbx0 <= 0.0 {
         messages.push(format!(
             "Fatal: RBPBX0 = {} is not positive.",
             c_g(m.rbpbx0)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.rbpby0 <= 0.0 {
         messages.push(format!(
             "Fatal: RBPBY0 = {} is not positive.",
             c_g(m.rbpby0)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.rbdbx0 <= 0.0 {
         messages.push(format!(
             "Fatal: RBDBX0 = {} is not positive.",
             c_g(m.rbdbx0)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.rbdby0 <= 0.0 {
         messages.push(format!(
             "Fatal: RBDBY0 = {} is not positive.",
             c_g(m.rbdby0)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.rbsbx0 <= 0.0 {
         messages.push(format!(
             "Fatal: RBSBX0 = {} is not positive.",
             c_g(m.rbsbx0)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if m.rbsby0 <= 0.0 {
         messages.push(format!(
             "Fatal: RBSBY0 = {} is not positive.",
             c_g(m.rbsby0)
         ));
-        Fatal_Flag = 1;
+        fatal = true;
     }
     if p.noff < 0.1 {
         messages.push(format!("Warning: Noff = {} is too small.", c_g(p.noff)));
@@ -949,7 +947,7 @@ fn check_recommended(
             m.scref = 1e-6;
         }
     }
-    Fatal_Flag != 0
+    fatal
 }
 
 #[cfg(test)]
@@ -1044,5 +1042,7 @@ mod tests {
         ));
         assert_eq!(messages[0], "\nChecking parameters for BSIM 4.8 model nn");
         assert_eq!(messages[1], "Fatal: Toxe = 0 is not positive.");
+        assert_eq!(messages[2], "Fatal: Toxp = 0 is not positive.");
+        assert_eq!(messages[3], "Fatal: EOT = 0 is not positive.");
     }
 }
