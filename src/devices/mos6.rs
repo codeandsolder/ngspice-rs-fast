@@ -280,7 +280,7 @@ impl Level6 {
 
 impl MosLevel for Level6 {
     type Params = Params;
-    const LEVEL: u8 = 6;
+    const BACKEND: crate::devices::ModelBackend = crate::devices::ModelBackend::Mos6;
     const LABEL: &'static str = "MOS6";
     const DEVICE_TYPE: CDeviceType = CDeviceType::Mos6;
     const MULTIPLICITY: Multiplicity = BulkLaw::Mos6.multiplicity();

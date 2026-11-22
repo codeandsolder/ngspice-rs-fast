@@ -309,11 +309,11 @@ impl<L: SensitivityLevel> SensitivityKernel for MosSensitivity<'_, L> {
 
     /// `capbd`/`capbs` (`mosXacld.c`).
     fn stale_ac_fields(&self) -> Option<&'static str> {
-        Some(match L::LEVEL {
-            1 => "src/spicelib/devices/mos1/mos1acld.c",
-            2 => "src/spicelib/devices/mos2/mos2acld.c",
-            3 => "src/spicelib/devices/mos3/mos3acld.c",
-            9 => "src/spicelib/devices/mos9/mos9acld.c",
+        Some(match L::BACKEND {
+            crate::devices::ModelBackend::Mos1 => "src/spicelib/devices/mos1/mos1acld.c",
+            crate::devices::ModelBackend::Mos2 => "src/spicelib/devices/mos2/mos2acld.c",
+            crate::devices::ModelBackend::Mos3 => "src/spicelib/devices/mos3/mos3acld.c",
+            crate::devices::ModelBackend::Mos9 => "src/spicelib/devices/mos9/mos9acld.c",
             _ => "src/spicelib/devices/mos6/mos6init.c",
         })
     }

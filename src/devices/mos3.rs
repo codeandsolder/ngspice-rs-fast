@@ -348,7 +348,7 @@ impl Level3 {
 
 impl MosLevel for Level3 {
     type Params = Params;
-    const LEVEL: u8 = 3;
+    const BACKEND: crate::devices::ModelBackend = crate::devices::ModelBackend::Mos3;
     const LABEL: &'static str = "MOS3";
     const DEVICE_TYPE: CDeviceType = CDeviceType::Mos3;
     const NOISE_FAMILY: Option<NoiseFamily> = Some(NoiseFamily::Mos3);

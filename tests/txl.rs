@@ -577,7 +577,7 @@ fn the_registry_reports_a_bounded_y() {
     assert!(entry.c_reference.contains("inp2y.c"), "{entry:?}");
     assert!(matches!(
         entry.support,
-        ngspice_rs::devices::registry::DeviceSupport::Bounded { .. }
+        ngspice_rs::devices::registry::DeviceSupport::Bounded
     ));
     assert!(!entry.description.is_empty());
 }

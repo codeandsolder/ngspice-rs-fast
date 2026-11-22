@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::analysis::{AnalysisSupport, DRIVERS};
-use crate::devices::{DeviceSupport, Registry};
+use crate::devices::Registry;
 use crate::netlist::{Deck, RawCard, classify_deck, load};
 use crate::primitives::{AnalysisKind as Kind, SpiceError, SpiceResult};
 
@@ -508,8 +508,27 @@ pub fn devices_text(registry: &Registry) -> String {
             entry.support.label(),
             entry.c_reference
         );
-        if let DeviceSupport::Bounded { scope } = entry.support {
-            let _ = writeln!(out, "     {:<width$}  {:<7}  built: {scope}", "", "");
+        if entry.support.is_implemented() {
+            for spec in crate::devices::ModelBackend::catalog(entry.designator) {
+                let levels = spec
+                    .selectors
+                    .iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let _ = writeln!(
+                    out,
+                    "     {:<width$}  {:<7}  {} (model level {levels})",
+                    "", "", spec.name
+                );
+            }
+            if entry.designator == 'x' {
+                let _ = writeln!(
+                    out,
+                    "     {:<width$}  {:<7}  expanded subcircuit instances",
+                    "", ""
+                );
+            }
         }
     }
     out
@@ -757,7 +776,14 @@ r2 out 0 1k
             assert_eq!(status(letter), "pending", "{letter}");
         }
         assert!(
-            text.contains("built: MOS1, MOS2, MOS3, MOS6 and MOS9 (levels 1, 2, 3, 6 and 9)"),
+            [
+                "MOS1 (model level 0/1)",
+                "BSIM3v3.3 (model level 8/49)",
+                "BSIM4.8 (model level 14/54)",
+                "Gummel-Poon (model level 0/1/2)"
+            ]
+            .into_iter()
+            .all(|backend| text.contains(backend)),
             "{text}"
         );
         assert!(text.contains("inp2r.c"), "{text}");
