@@ -84,7 +84,11 @@ fn golden_path(root: &Path, netlist: &Path) -> Result<PathBuf, String> {
 }
 
 fn locate(root: &Path, options: &Options) -> Result<Ngspice, String> {
-    let binary = ngspice::locate(options.ngspice.as_deref(), root)?;
+    let binary = ngspice::locate(
+        options.ngspice.as_deref(),
+        root,
+        ngspice::OracleLimits::default(),
+    )?;
     println!("ngspice:  {} ({})", binary.path.display(), binary.version);
     Ok(binary)
 }

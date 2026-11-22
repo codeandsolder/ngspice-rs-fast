@@ -1,4 +1,6 @@
 //! Opt-in live C validation. `NGSPICE_BIN` must name the external reference binary.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, RawFile};
 use ngspice_rs::devices::{Circuit, IndependentSource, Waveform};
 use ngspice_rs::netlist::Parser;
@@ -6,7 +8,6 @@ use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::{AnalysisKind, Complex};
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 /// Runs `body` in C with `v1` replaced by `c_source`, and in Rust with the
 /// equivalent `rust_waveform`, then compares `vectors` on Rust's requested
@@ -20,16 +21,9 @@ fn compare_with_c(
     tol: f64,
 ) {
     let binary = std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN");
-    let dir =
-        std::env::temp_dir().join(format!("spice-dae-reference-{}-{tag}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    struct Cleanup(std::path::PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-    let _cleanup = Cleanup(dir.clone());
+    let scratch =
+        Scratch::new("c-linear-reference").unwrap_or_else(|error| panic!("{tag}: {error}"));
+    let dir = scratch.path();
     let netlist = Parser::new()
         .parse_deck(&parse_deck_text(
             Path::new("dae.cir"),
@@ -56,11 +50,7 @@ fn compare_with_c(
         ),
     )
     .unwrap();
-    let result = Command::new(binary)
-        .args(["-b", "dae.cir"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
+    let result = run(binary, dir, &["-b", "dae.cir"], ProcessLimits::ORACLE).unwrap();
     assert!(
         result.status.success(),
         "{}\n{}",

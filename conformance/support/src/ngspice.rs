@@ -29,11 +29,11 @@
 //!    `* xtask-codemodels: <name>...` comment; the scratch directory then gets
 //!    a `.spiceinit` with just those `codemodel` commands.
 
+use crate::process::{self, ProcessLimits, ProcessOutput};
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Write as _};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Normalize the reference frequency axis of an incremental batch rawfile.
@@ -58,6 +58,26 @@ pub struct Ngspice {
     pub path: PathBuf,
     /// The version string scraped from `--version`, e.g. `ngspice-47+`.
     pub version: String,
+    /// Limits used for every simulation invocation.
+    pub limits: ProcessLimits,
+}
+
+/// Explicit version-probe and simulation budgets.
+#[derive(Debug, Clone, Copy)]
+pub struct OracleLimits {
+    /// Budget for discovering each candidate executable's version.
+    pub version: ProcessLimits,
+    /// Budget for a live simulation.
+    pub simulation: ProcessLimits,
+}
+
+impl Default for OracleLimits {
+    fn default() -> Self {
+        Self {
+            version: ProcessLimits::VERSION,
+            simulation: ProcessLimits::ORACLE,
+        }
+    }
 }
 
 /// Finds the C binary.
@@ -70,7 +90,11 @@ pub struct Ngspice {
 /// A message listing everywhere it looked. An explicitly selected executable
 /// (including the environment override) must be usable; it never silently
 /// falls back to a different oracle.
-pub fn locate(explicit: Option<&Path>, workspace: &Path) -> Result<Ngspice, String> {
+pub fn locate(
+    explicit: Option<&Path>,
+    workspace: &Path,
+    limits: OracleLimits,
+) -> Result<Ngspice, String> {
     let selected = explicit
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("NGSPICE_BIN").map(PathBuf::from));
@@ -90,11 +114,12 @@ pub fn locate(explicit: Option<&Path>, workspace: &Path) -> Result<Ngspice, Stri
                 tried.push(format!("{} (not a file)", path.display()));
                 continue;
             };
-            match version_of(&resolved) {
+            match version_of(&resolved, limits.version) {
                 Ok(version) => {
                     return Ok(Ngspice {
                         path: resolved,
                         version,
+                        limits: limits.simulation,
                     });
                 }
                 Err(error) => tried.push(format!("{} ({error})", resolved.display())),
@@ -134,20 +159,15 @@ fn executable_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
-fn version_of(binary: &Path) -> Result<String, String> {
-    let output = Command::new(binary)
-        .arg("--version")
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err(format!("--version exited with {}", output.status));
-    }
-    let text = String::from_utf8_lossy(&output.stdout).into_owned()
-        + &String::from_utf8_lossy(&output.stderr);
+fn version_of(binary: &Path, limits: ProcessLimits) -> Result<String, String> {
+    let output =
+        process::run(binary, ".", &["--version"], limits).map_err(|error| error.to_string())?;
+    output.require_success("--version")?;
+    let text = output.transcript();
     text.split_whitespace()
         .find(|word| word.starts_with("ngspice-"))
         .map(|word| word.trim_end_matches(':').to_owned())
-        .ok_or_else(|| "no 'ngspice-<version>' token in --version output".to_owned())
+        .ok_or_else(|| format!("no 'ngspice-<version>' token in --version output\n{text}"))
 }
 
 /// Isolated scratch directory, removed on normal return and unwinding.
@@ -229,7 +249,7 @@ impl Ngspice {
         if !path.is_absolute() {
             return Err(format!("NGSPICE_BIN must be absolute: {}", path.display()));
         }
-        locate(Some(&path), Path::new("."))
+        locate(Some(&path), Path::new("."), OracleLimits::default())
     }
 
     /// Run C in the specified isolated directory, retaining both captured
@@ -242,56 +262,7 @@ impl Ngspice {
         directory: &Path,
         args: &[impl AsRef<OsStr> + Debug],
     ) -> Result<ProcessOutput, String> {
-        let output = Command::new(&self.path)
-            .args(args)
-            .current_dir(directory)
-            .output()
-            .map_err(|error| {
-                format!(
-                    "running {} {args:?} in {}: {error}",
-                    self.path.display(),
-                    directory.display()
-                )
-            })?;
-        Ok(ProcessOutput {
-            status: output.status,
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
-    }
-}
-
-/// Child status and the two separately captured log streams.
-#[derive(Debug, Clone)]
-pub struct ProcessOutput {
-    /// Exit status; successful exit does not guarantee all measurements passed.
-    pub status: ExitStatus,
-    /// Console output.
-    pub stdout: String,
-    /// Diagnostics.
-    pub stderr: String,
-}
-
-impl ProcessOutput {
-    /// Return both streams with explicit separators for diagnostics.
-    #[must_use]
-    pub fn transcript(&self) -> String {
-        format!(
-            "--- stdout ---\n{}\n--- stderr ---\n{}",
-            self.stdout, self.stderr
-        )
-    }
-
-    /// Check the child's exit status, preserving the full captured diagnostics.
-    ///
-    /// # Errors
-    /// The child exited unsuccessfully.
-    pub fn require_success(&self, label: &str) -> Result<(), String> {
-        if self.status.success() {
-            Ok(())
-        } else {
-            Err(format!("{label}: {}\n{}", self.status, self.transcript()))
-        }
+        process::run(&self.path, directory, args, self.limits).map_err(|error| error.to_string())
     }
 }
 
@@ -400,7 +371,7 @@ pub fn capture(
         .map_err(|error| format!("writing {}: {error}", deck_path.display()))?;
 
     let output = ngspice.run(&directory, &[OsStr::new("-b"), deck_path.as_os_str()])?;
-    let log = format!("{}{}", output.stdout, output.stderr);
+    let log = output.transcript();
     if !output.status.success() {
         return Err(format!(
             "{} failed on {name} with {}\n--- ngspice output ---\n{}",
@@ -419,12 +390,18 @@ pub fn capture(
         )
     })?;
     if rawfile.trim().is_empty() {
-        return Err(format!("{name}: ngspice wrote an empty rawfile"));
+        return Err(format!(
+            "{name}: ngspice wrote an empty rawfile at {}\n{}",
+            raw_path.display(),
+            tail(&log, 30)
+        ));
     }
     if !rawfile.contains("Values:") {
         return Err(format!(
             "{name}: the rawfile is not in ASCII form; the instrumented deck should have \
-             issued 'set filetype=ascii'"
+             issued 'set filetype=ascii'\n{}\n{}",
+            raw_path.display(),
+            tail(&log, 30)
         ));
     }
 
@@ -618,6 +595,7 @@ mod tests {
         let binary = super::Ngspice {
             path: "/bin/sh".into(),
             version: "test".into(),
+            limits: super::ProcessLimits::ORACLE,
         };
         let output = binary
             .run(
@@ -626,13 +604,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output.status.code(), Some(7));
-        assert_eq!(output.stdout, "hello");
-        assert_eq!(output.stderr, "warning");
+        assert_eq!(output.stdout, b"hello");
+        assert_eq!(output.stderr, b"warning");
         let error = output.require_success("child").unwrap_err();
         assert!(error.contains("hello") && error.contains("warning") && error.contains("child"));
         let missing = super::Ngspice {
             path: directory.path().join("missing-executable"),
             version: "test".into(),
+            limits: super::ProcessLimits::ORACLE,
         };
         assert!(
             missing
@@ -674,7 +653,12 @@ mod tests {
     fn missing_explicit_binary_never_falls_back() {
         let directory = super::Scratch::new("conformance-test").unwrap();
         let binary = directory.path().join("missing-ngspice");
-        let error = super::locate(Some(&binary), directory.path()).unwrap_err();
+        let error = super::locate(
+            Some(&binary),
+            directory.path(),
+            super::OracleLimits::default(),
+        )
+        .unwrap_err();
         assert!(error.contains(&binary.display().to_string()), "{error}");
     }
 
@@ -684,6 +668,7 @@ mod tests {
         let binary = super::Ngspice {
             path: directory.path().join("missing-ngspice"),
             version: "test".to_owned(),
+            limits: super::ProcessLimits::ORACLE,
         };
         let init = directory.path().join(".spiceinit");
         std::fs::write(&init, "codemodel obsolete.cm").unwrap();
@@ -704,6 +689,7 @@ mod tests {
         let binary = super::Ngspice {
             path: directory.path().join("missing-ngspice"),
             version: "test".to_owned(),
+            limits: super::ProcessLimits::ORACLE,
         };
         let deck = directory.path().join("fixture.cir");
         std::fs::write(&deck, DECK).unwrap();
@@ -712,6 +698,86 @@ mod tests {
         let error = super::capture(&binary, &deck, &scratch, &[]).unwrap_err();
         assert!(
             error.contains("removing stale") && error.contains("fixture.raw"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn executable_fixture(directory: &std::path::Path, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = directory.join("fake-ngspice");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_has_its_own_budget_and_diagnostics() {
+        use std::time::Duration;
+        let scratch = super::Scratch::new("version-fixture").unwrap();
+        let path = executable_fixture(scratch.path(), "printf 'ngspice-test:\\n'");
+        let limits = super::OracleLimits {
+            version: super::ProcessLimits {
+                timeout: Duration::from_secs(2),
+                output_bytes: 1024,
+            },
+            simulation: super::ProcessLimits::ORACLE,
+        };
+        let binary = super::locate(Some(&path), scratch.path(), limits).unwrap();
+        assert_eq!(binary.version, "ngspice-test");
+        let path = executable_fixture(
+            scratch.path(),
+            "printf 'probe started\\n' >&2; exec sleep 30",
+        );
+        let error = super::locate(Some(&path), scratch.path(), limits).unwrap_err();
+        assert!(
+            error.contains("Timeout") && error.contains("probe started"),
+            "{error}"
+        );
+        let path = executable_fixture(scratch.path(), "printf 'not the oracle\\n'");
+        let error = super::locate(Some(&path), scratch.path(), limits).unwrap_err();
+        assert!(
+            error.contains("no 'ngspice-<version>' token") && error.contains("not the oracle"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_does_not_accept_failed_partial_rawfile() {
+        use std::time::Duration;
+        let scratch = super::Scratch::new("partial-rawfile").unwrap();
+        let deck = scratch.path().join("fixture.cir");
+        std::fs::write(&deck, DECK).unwrap();
+        let output = scratch.path().join("capture");
+        let mut binary = super::Ngspice {
+            path: executable_fixture(
+                scratch.path(),
+                "printf 'Values:\\n' > fixture.raw; printf 'interrupted\\n' >&2; exec sleep 30",
+            ),
+            version: "test".into(),
+            limits: super::ProcessLimits {
+                timeout: Duration::from_secs(2),
+                ..super::ProcessLimits::ORACLE
+            },
+        };
+        let error = super::capture(&binary, &deck, &output, &[]).unwrap_err();
+        assert!(
+            error.contains("Timeout") && error.contains("interrupted"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(output.join("fixture/fixture.raw")).unwrap(),
+            b"Values:\n"
+        );
+        binary.path = executable_fixture(
+            scratch.path(),
+            "printf 'bad rawfile\\n' > fixture.raw; printf 'invalid format\\n' >&2",
+        );
+        let error = super::capture(&binary, &deck, &output, &[]).unwrap_err();
+        assert!(
+            error.contains("not in ASCII form") && error.contains("invalid format"),
             "{error}"
         );
     }

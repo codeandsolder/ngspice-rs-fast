@@ -22,10 +22,11 @@
 //! Nothing here reads or rewrites a committed golden, and the deck uses PULSE
 //! (the periodic source this front end supports) rather than a `sin(...)` source.
 
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::f64::consts::PI;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use ngspice_rs::analysis::{RunConfig, fourier};
 use ngspice_rs::netlist::Parser;
@@ -42,15 +43,6 @@ const DECK: &str = "v1 in 0 pulse(0 1 0 1n 1n 0.5m 1m)\n\
 /// Builds the shared deck text: a title, [`DECK`], the `.four` card, `.end`.
 fn deck_text(vector: &str) -> String {
     format!("Fourier oracle\n{DECK}.four 1k {vector}\n.end\n")
-}
-
-/// Removes the temporary directory even when the test fails.
-struct Cleanup(PathBuf);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
 }
 
 /// The port's own Fourier analysis of `vector`, over its own transient plot.
@@ -84,16 +76,10 @@ struct CRow {
 fn c_analysis(tag: &str, vector: &str) -> (Real, Real, Vec<CRow>) {
     let binary = std::env::var_os("NGSPICE_BIN").expect("set absolute NGSPICE_BIN");
     assert!(Path::new(&binary).is_absolute());
-    let dir = std::env::temp_dir().join(format!("spice-four-oracle-{}-{tag}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir(&dir).expect("scratch directory");
-    let _cleanup = Cleanup(dir.clone());
+    let scratch = Scratch::new("c-four-reference").unwrap();
+    let dir = scratch.path();
     fs::write(dir.join("four.cir"), deck_text(vector)).expect("write the deck");
-    let run = Command::new(&binary)
-        .args(["-b", "four.cir"])
-        .current_dir(&dir)
-        .output()
-        .expect("run ngspice");
+    let run = run(&binary, dir, &["-b", "four.cir"], ProcessLimits::ORACLE).expect("run ngspice");
     let output = format!(
         "{}{}",
         String::from_utf8_lossy(&run.stdout),

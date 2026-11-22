@@ -14,19 +14,12 @@
 //! NGSPICE_BIN=/abs/path/to/ngspice cargo test -p ngspice-rs --test c_sens_reference -- --ignored
 //! ```
 
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use ngspice_rs::analysis::{RawFile, RawFormat};
-
-struct Cleanup(PathBuf);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 const LINEAR: (f64, f64) = (1e-8, 1e-12);
 const NONLINEAR: (f64, f64) = (1e-6, 1e-9);
@@ -91,19 +84,18 @@ fn mos_ac_sensitivity_after_transient_matches_c() {
 fn compare_with_c(name: &str, deck_text: &str, (relative, absolute): (f64, f64)) {
     let binary = std::env::var_os("NGSPICE_BIN").expect("set absolute NGSPICE_BIN");
     assert!(Path::new(&binary).is_absolute());
-    let directory =
-        std::env::temp_dir().join(format!("spice-rs-c-sens-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&directory);
-    fs::create_dir_all(&directory).unwrap();
-    let _cleanup = Cleanup(directory.clone());
+    let scratch = Scratch::new("c-sens-reference").unwrap();
+    let directory = scratch.path();
     let deck = directory.join("deck.cir");
     fs::write(&deck, deck_text).unwrap();
 
-    let c = Command::new(&binary)
-        .args(["-b", "-r", "c.raw", "deck.cir"])
-        .current_dir(&directory)
-        .output()
-        .expect("the C ngspice runs");
+    let c = run(
+        &binary,
+        directory,
+        &["-b", "-r", "c.raw", "deck.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .expect("the C ngspice runs");
     let log = format!(
         "{}\n{}",
         String::from_utf8_lossy(&c.stdout),
@@ -114,14 +106,17 @@ fn compare_with_c(name: &str, deck_text: &str, (relative, absolute): (f64, f64))
         !log.contains("aborted") && !log.contains("Error"),
         "{name}: ngspice reported a problem:\n{log}"
     );
-    let rust = Command::new(
+    let rust = run(
         std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+        directory,
+        &[
+            std::ffi::OsStr::new("simulate"),
+            std::ffi::OsStr::new("--output"),
+            directory.join("rust.raw").as_os_str(),
+            deck.as_os_str(),
+        ],
+        ProcessLimits::ORACLE,
     )
-    .arg("simulate")
-    .arg("--output")
-    .arg(directory.join("rust.raw"))
-    .arg(&deck)
-    .output()
     .expect("spice-rs runs");
     assert!(
         rust.status.success(),

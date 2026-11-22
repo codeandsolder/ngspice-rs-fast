@@ -1,3 +1,34 @@
+## Bounded reference-process execution (#80)
+
+All live C reference invocations use the development-only
+`ngspice_conformance::process` runner (including version discovery and
+direct binary rawfile comparisons). It executes an absolute executable,
+without shell interpretation, with stdin disconnected and concurrent
+stdout/stderr capture. The default simulation budget is 180 seconds and
+8 MiB of combined output; version discovery uses 10 seconds and 128 KiB
+per candidate. `OracleLimits` and `ProcessLimits` allow explicit budgets
+without global environment configuration.
+
+Output is retained as bytes, with both streams separate; text diagnostics
+use lossy UTF-8 only when displaying them. A deadline applies to capture
+and to child exit after pipe EOF; continuous output cannot sidestep it.
+The combined capture budget is enforced before appending data. Timeout,
+output-budget exhaustion, launch, capture and wait failures are distinct;
+a completed nonzero exit is separate from an invalid/absent rawfile after
+successful exit. On failure the direct child is terminated and reaped;
+kernel-level cleanup failure is reported rather than causing an unbounded
+wait. No process-group or descendant-termination assumption is made.
+
+The shared scratch owner creates a fresh directory and removes it on
+return or unwind. The existing `NGSPICE_KEEP_SCRATCH=1` diagnostic option
+explicitly preserves the deck, any partial/raw output and control files.
+The runner preserves both stream prefixes in its error, and capture never
+treats a partial file after a timeout as success. No numerical oracle,
+golden, comparison tolerance or reference executable was changed.
+The `subprocess` dependency is restricted to the conformance support
+crate; it provides cancellable portable pipe reads without local unsafe
+code or blocking reader-thread joins.
+
 # M10 0.5h: card budget, long diode chains, 402-FET transient
 
 - `diode100_op`: one new C golden, captured once with `cargo xtask golden

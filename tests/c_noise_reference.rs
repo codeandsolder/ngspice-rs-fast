@@ -16,9 +16,10 @@
 //!   cargo test -p ngspice-rs --test c_noise_reference -- --ignored
 //! ```
 
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use ngspice_rs::analysis::{Plot, RawFile};
 
@@ -26,49 +27,43 @@ fn workspace() -> PathBuf {
     ngspice_conformance::fixtures::workspace_root().unwrap()
 }
 
-struct Cleanup(PathBuf);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 /// Runs `deck_text` through C batch mode and `spice-rs simulate`; returns
 /// (Rust, C) rawfiles.
 fn run_both(name: &str, deck_text: &str) -> (RawFile, RawFile) {
     let binary = std::env::var_os("NGSPICE_BIN").expect("set absolute NGSPICE_BIN");
     assert!(Path::new(&binary).is_absolute());
-    let directory =
-        std::env::temp_dir().join(format!("spice-rs-c-noise-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&directory);
-    fs::create_dir_all(&directory).unwrap();
-    let _cleanup = Cleanup(directory.clone());
+    let scratch = Scratch::new("c-noise-reference").unwrap();
+    let directory = scratch.path();
     let deck = directory.join("deck.cir");
     fs::write(&deck, deck_text).unwrap();
     if deck_text.contains("set ngbehavior=s3") {
         // newcompat is set before device setup in C, via its initialization file.
         fs::write(directory.join(".spiceinit"), "set ngbehavior=s3\n").unwrap();
     }
-    let c = Command::new(&binary)
-        .args(["-b", "-r", "c.raw", "deck.cir"])
-        .current_dir(&directory)
-        .output()
-        .expect("the C ngspice runs");
+    let c = run(
+        &binary,
+        directory,
+        &["-b", "-r", "c.raw", "deck.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .expect("the C ngspice runs");
     assert!(
         c.status.success(),
         "{name}: ngspice failed:\n{}\n{}",
         String::from_utf8_lossy(&c.stdout),
         String::from_utf8_lossy(&c.stderr)
     );
-    let rust = Command::new(
+    let rust = run(
         std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+        directory,
+        &[
+            std::ffi::OsStr::new("simulate"),
+            std::ffi::OsStr::new("--output"),
+            directory.join("rust.raw").as_os_str(),
+            deck.as_os_str(),
+        ],
+        ProcessLimits::ORACLE,
     )
-    .arg("simulate")
-    .arg("--output")
-    .arg(directory.join("rust.raw"))
-    .arg(&deck)
-    .output()
     .expect("spice-rs runs");
     assert!(
         rust.status.success(),

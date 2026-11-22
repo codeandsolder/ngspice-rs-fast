@@ -22,9 +22,10 @@
 //!
 //! Ordinary `cargo test` never needs C: everything here is `#[ignore]`d.
 
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use ngspice_rs::analysis::{AnalysisContext, Plot, RawFile, RunConfig, fourier};
 use ngspice_rs::devices::{Circuit, Limit, SourceKind, TransientTiming};
@@ -63,14 +64,6 @@ fn loads() -> String {
     (1..=22).map(|k| format!("r{k} n{k} 0 1k\n")).collect()
 }
 
-/// Removes the temporary directory even when the test fails.
-struct Cleanup(PathBuf);
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 /// Runs `cards` (title and `.end` added) under `analysis` in C, returning the
 /// plot written by `write`, and the full output text.
 fn run_c(tag: &str, cards: &str, analysis: &str, extra: &str) -> (Option<Plot>, String) {
@@ -79,10 +72,9 @@ fn run_c(tag: &str, cards: &str, analysis: &str, extra: &str) -> (Option<Plot>, 
         Path::new(&binary).is_absolute(),
         "NGSPICE_BIN must be absolute"
     );
-    let dir = std::env::temp_dir().join(format!("spice-sources-{}-{tag}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir(&dir).unwrap();
-    let _cleanup = Cleanup(dir.clone());
+    let scratch =
+        Scratch::new("c-source-functions").unwrap_or_else(|error| panic!("{tag}: {error}"));
+    let dir = scratch.path();
     // An analysis command runs from a `.control` block and writes a rawfile;
     // without one the deck's own cards (e.g. `.tran` + `.four`) run in batch.
     let deck = if analysis.is_empty() {
@@ -93,11 +85,7 @@ fn run_c(tag: &str, cards: &str, analysis: &str, extra: &str) -> (Option<Plot>, 
         )
     };
     fs::write(dir.join("c.cir"), deck).unwrap();
-    let output = Command::new(&binary)
-        .args(["-b", "c.cir"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
+    let output = run(&binary, dir, &["-b", "c.cir"], ProcessLimits::ORACLE).unwrap();
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -452,7 +440,7 @@ fn polar_ac_coefficients_and_phase_overrides_match_c() {
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN"]
 fn pwl_and_pulse_match_c_binary_samples_bit_for_bit() {
-    use ngspice_conformance::ngspice::{Ngspice, Scratch};
+    use ngspice_conformance::ngspice::Ngspice;
 
     let deck = "Exact source samples\n\
 vplain a 0 pwl(0 1.25 0.3m 2.75 0.6m 1.5)\n\

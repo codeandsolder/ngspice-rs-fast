@@ -15,22 +15,16 @@
 //!
 //! Ordinary `cargo test` never needs C: everything here is `#[ignore]`d.
 
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::devices::Circuit;
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::Real;
-
-struct Cleanup(PathBuf);
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Runs `cards` at an operating point in C, also saving the `asks`.
 fn run_c(tag: &str, cards: &str, asks: &[&str]) -> Plot {
@@ -39,21 +33,15 @@ fn run_c(tag: &str, cards: &str, asks: &[&str]) -> Plot {
         Path::new(&binary).is_absolute(),
         "NGSPICE_BIN must be absolute"
     );
-    let dir = std::env::temp_dir().join(format!("spice-urc-{}-{tag}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir(&dir).unwrap();
-    let _cleanup = Cleanup(dir.clone());
+    let scratch = Scratch::new("c-urc-reference").unwrap_or_else(|error| panic!("{tag}: {error}"));
+    let dir = scratch.path();
     let deck = format!(
         "c\n{cards}.control\nset filetype=ascii\nsave all {}\nop\nwrite result.raw\nquit\n\
          .endc\n.end\n",
         asks.join(" ")
     );
     fs::write(dir.join("c.cir"), deck).unwrap();
-    let output = Command::new(&binary)
-        .args(["-b", "c.cir"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
+    let output = run(&binary, dir, &["-b", "c.cir"], ProcessLimits::ORACLE).unwrap();
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),

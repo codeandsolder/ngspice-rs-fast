@@ -63,8 +63,11 @@ fn compare(tag: &str, kind: AnalysisKind, deck: &str) {
     output
         .require_success(tag)
         .unwrap_or_else(|error| panic!("{error}"));
-    let theirs = measurement::parse(&output.stdout, &output.stderr)
-        .unwrap_or_else(|error| panic!("{tag}: {error}\n{}", output.transcript()));
+    let theirs = measurement::parse(
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+    .unwrap_or_else(|error| panic!("{tag}: {error}\n{}", output.transcript()));
     let analysis = Analysis::keyword(kind.as_str()).expect("supported measurement analysis");
     let actual = [ActualSection {
         analysis,
@@ -85,8 +88,11 @@ fn real_reports_keep_failed_cards_and_repeated_runs_separate() {
         fs::write(scratch.path().join("probe.cir"), text).unwrap();
         let output = binary.run(scratch.path(), &["-b", "probe.cir"]).unwrap();
         output.require_success("measurement probe").unwrap();
-        measurement::parse(&output.stdout, &output.stderr)
-            .unwrap_or_else(|error| panic!("{error}\n{}", output.transcript()))
+        measurement::parse(
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+        .unwrap_or_else(|error| panic!("{error}\n{}", output.transcript()))
     };
     let repeated = run(
         "Repeated measurements\nv1 in 0 0\nr1 in 0 1k\n.dc v1 0 1 .1\n.meas dc stack max v(in)\n.control\nrun\nrun\nquit\n.endc\n.end\n",

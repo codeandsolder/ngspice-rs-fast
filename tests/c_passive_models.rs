@@ -1,4 +1,6 @@
 //! Opt-in C effective-value queries plus production DC/AC conformance.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RawFile};
 use ngspice_rs::devices::{Circuit, ModelResolver};
 use ngspice_rs::netlist::Parser;
@@ -7,44 +9,27 @@ use ngspice_rs::primitives::AnalysisKind;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const PROBE: &str = include_str!("../conformance/parser/passive_elaboration.cir");
-struct Scratch(PathBuf);
-impl Scratch {
-    fn new() -> Self {
-        let nonce = scratch_nonce();
-        let scratch = Self(std::env::temp_dir().join(format!(
-            "spice-passive-oracle-{}-{nonce}",
-            std::process::id()
-        )));
-        fs::create_dir_all(&scratch.0).unwrap();
-        scratch
-    }
-    fn run(&self, text: &str) -> String {
-        fs::write(self.0.join("probe.cir"), text).unwrap();
-        let binary = PathBuf::from(std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN"));
-        assert!(binary.is_absolute(), "NGSPICE_BIN must be absolute");
-        let result = Command::new(binary)
-            .args(["-b", "probe.cir"])
-            .current_dir(&self.0)
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8(result.stdout).unwrap();
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        assert!(result.status.success(), "{stdout}\n{stderr}");
-        assert!(
-            !stderr.to_lowercase().contains("error"),
-            "{stdout}\n{stderr}"
-        );
-        stdout
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
+fn run_probe(scratch: &Scratch, text: &str) -> String {
+    fs::write(scratch.path().join("probe.cir"), text).unwrap();
+    let binary = PathBuf::from(std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN"));
+    assert!(binary.is_absolute(), "NGSPICE_BIN must be absolute");
+    let result = run(
+        binary,
+        scratch.path(),
+        &["-b", "probe.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .unwrap();
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        !stderr.to_lowercase().contains("error"),
+        "{stdout}\n{stderr}"
+    );
+    stdout
 }
 fn close(got: f64, want: f64, relative: f64, absolute: f64) {
     assert!(
@@ -116,8 +101,8 @@ fn passive_effective_geometry_temperature_and_precedence_match_c() {
             ".options temp={} tnom={}\n.control\nset numdgt=17\nop\n{lets}print {queries}\nquit\n.endc\n.end\n",
             context.temperature, context.nominal_temperature
         );
-        let scratch = Scratch::new();
-        let output = scratch.run(&PROBE.replace(".end\n", &script));
+        let scratch = Scratch::new("c-passive-models").unwrap();
+        let output = run_probe(&scratch, &PROBE.replace(".end\n", &script));
         let mut actual = BTreeMap::new();
         for line in output.lines() {
             if let Some((name, value)) = line.split_once(" = ")
@@ -169,33 +154,15 @@ fn passive_model_production_dc_ac_matches_c() {
                 "responses\n{body}\n.options temp={} tnom={}\n.control\nset filetype=ascii\nset numdgt=17\n{command}\nwrite response.raw\nquit\n.endc\n.end\n",
                 context.temperature, context.nominal_temperature
             );
-            let scratch = Scratch::new();
-            scratch.run(&text);
-            let raw = fs::read_to_string(scratch.0.join("response.raw")).unwrap();
+            let scratch = Scratch::new("c-passive-models").unwrap();
+            run_probe(&scratch, &text);
+            let raw = fs::read_to_string(scratch.path().join("response.raw")).unwrap();
             let raw = RawFile::parse(&raw).unwrap();
             assert_eq!(raw.plots.len(), 1);
             compare(&got, &raw.plots[0].plot, kind == AnalysisKind::Ac);
         }
     }
 }
-
-/// A process-local counter appended to scratch directory names.
-///
-/// `SystemTime::now()` is coarsened on some platforms (1 ms on macOS), so the
-/// process id and the clock alone do not distinguish two tests of one binary
-/// that start in the same tick - and tests run in parallel, so two of them
-/// collided and `create_dir(...).unwrap()` panicked.
-static SCRATCH_NONCE: AtomicU64 = AtomicU64::new(0);
-
-fn scratch_nonce() -> u128 {
-    let clock = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the clock is after the epoch")
-        .as_nanos();
-    clock + u128::from(SCRATCH_NONCE.fetch_add(1, Ordering::Relaxed))
-}
-
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[test]
 #[ignore = "requires NGSPICE_BIN; compares exponential TC, DTEMP, AC resistance, dielectric and coil geometry with C"]
@@ -234,10 +201,11 @@ fn expanded_model_passive_inputs_match_c() {
                 "responses\n{body}\n.options temp={} tnom={}\n.control\nset filetype=ascii\nset numdgt=17\n{command}\nwrite response.raw\nquit\n.endc\n.end\n",
                 context.temperature, context.nominal_temperature
             );
-            let scratch = Scratch::new();
-            scratch.run(&text);
-            let raw = RawFile::parse(&fs::read_to_string(scratch.0.join("response.raw")).unwrap())
-                .unwrap();
+            let scratch = Scratch::new("c-passive-models").unwrap();
+            run_probe(&scratch, &text);
+            let raw =
+                RawFile::parse(&fs::read_to_string(scratch.path().join("response.raw")).unwrap())
+                    .unwrap();
             assert_eq!(raw.plots.len(), 1);
             compare(&got, &raw.plots[0].plot, kind == AnalysisKind::Ac);
         }

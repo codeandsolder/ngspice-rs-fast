@@ -1,5 +1,6 @@
 //! Model selection and opt-in live C setup / selector-alias comparisons.
 use ngspice_conformance::ngspice::{Ngspice, Scratch, capture};
+use ngspice_conformance::process::{ProcessLimits, run};
 use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::devices::{ModelContext, ModelResolver};
 use ngspice_rs::netlist::Parser;
@@ -7,8 +8,6 @@ use ngspice_rs::netlist::source::parse_deck_text;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const PROBE: &str = include_str!("../conformance/parser/model_schemas.cir");
 
@@ -78,25 +77,17 @@ fn model_resolver_and_diode_defaults_match_c_setup() {
         ".end\n",
         &format!(".control\nset numdgt=17\nop\nprint {queries}\nquit\n.endc\n.end\n"),
     );
-    struct Scratch(PathBuf);
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-    let nonce = scratch_nonce();
-    let scratch = Scratch(
-        std::env::temp_dir().join(format!("spice-model-schema-{}-{nonce}", std::process::id())),
-    );
-    fs::create_dir_all(&scratch.0).unwrap();
-    fs::write(scratch.0.join("probe.cir"), text).unwrap();
+    let scratch = Scratch::new("model-c-reference").unwrap();
+    fs::write(scratch.path().join("probe.cir"), text).unwrap();
     let binary = PathBuf::from(std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN"));
     assert!(binary.is_absolute(), "NGSPICE_BIN must be an absolute path");
-    let output = Command::new(binary)
-        .args(["-b", "probe.cir"])
-        .current_dir(&scratch.0)
-        .output()
-        .unwrap();
+    let output = run(
+        binary,
+        scratch.path(),
+        &["-b", "probe.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
@@ -121,24 +112,6 @@ fn model_resolver_and_diode_defaults_match_c_setup() {
         );
     }
 }
-
-/// A process-local counter appended to scratch directory names.
-///
-/// `SystemTime::now()` is coarsened on some platforms (1 ms on macOS), so the
-/// process id and the clock alone do not distinguish two tests of one binary
-/// that start in the same tick - and tests run in parallel, so two of them
-/// collided and `create_dir(...).unwrap()` panicked.
-static SCRATCH_NONCE: AtomicU64 = AtomicU64::new(0);
-
-fn scratch_nonce() -> u128 {
-    let clock = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the clock is after the epoch")
-        .as_nanos();
-    clock + u128::from(SCRATCH_NONCE.fetch_add(1, Ordering::Relaxed))
-}
-
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Alias decks use the same model and device names and explicit numerical
 /// inputs; only the first level selector changes. Include both polarities.
