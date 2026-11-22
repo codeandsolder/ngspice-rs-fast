@@ -559,14 +559,17 @@ mod binding {
 #[test]
 fn reactive_intermodulation_reuses_independent_kernels_on_both_sides_of_f2() {
     let stage = DiodeStage::STAGE;
-    let (g, c2, c3) = stage.coefficients();
+    let (conductance, c2, c3) = stage.coefficients();
     let capacitance = 1e-7;
-    let a = 2e-6;
-    let b = 1e-6;
-    // Choose a fixed f2 interior to the f1 grid, including a zero
+    let amplitude1 = 2e-6;
+    let amplitude2 = 1e-6;
+    // Choose amplitude1 fixed f2 interior to the f1 grid, including amplitude1 zero
     // difference frequency, and repeat the same request on the same circuit.
     let deck = stage
-        .deck(&format!("distof1 {a} distof2 {b}"), ".disto lin 2 1k 4k 2")
+        .deck(
+            &format!("distof1 {amplitude1} distof2 {amplitude2}"),
+            ".disto lin 2 1k 4k 2",
+        )
         .replace(".option", "c1 a 0 100n\n.option");
     let netlist = Parser::new()
         .parse_deck(&parse_deck_text(Path::new("reactive.cir"), &deck))
@@ -576,9 +579,9 @@ fn reactive_intermodulation_reuses_independent_kernels_on_both_sides_of_f2() {
     let mut circuit = config.circuit(&netlist).unwrap();
     let first = request.run_plots(&mut circuit, &config.context()).unwrap();
     let second = request.run_plots(&mut circuit, &config.context()).unwrap();
-    let admittance = |f: f64| Complex::new(g, std::f64::consts::TAU * f * capacitance);
+    let admittance = |f: f64| Complex::new(conductance, std::f64::consts::TAU * f * capacitance);
     let f2 = 2000.;
-    let y = Complex::real(-0.5 * b) / admittance(f2);
+    let input2 = Complex::real(-0.5 * amplitude2) / admittance(f2);
     let close_complex = |got: Complex, want: Complex| {
         assert!(
             (got - want).magnitude() <= 1e-8 * want.magnitude(),
@@ -586,15 +589,15 @@ fn reactive_intermodulation_reuses_independent_kernels_on_both_sides_of_f2() {
         );
     };
     for (index, f1) in [1000., 2000., 3000., 4000.].into_iter().enumerate() {
-        let x = Complex::real(-0.5 * a) / admittance(f1);
-        let h2 = Complex::real(-c2) * x * x / admittance(2. * f1);
-        let sum = Complex::real(-c2) * x * y / admittance(f1 + f2);
-        let difference = Complex::real(-c2) * x * y.conj() / admittance(f1 - f2);
+        let input1 = Complex::real(-0.5 * amplitude1) / admittance(f1);
+        let h2 = Complex::real(-c2) * input1 * input1 / admittance(2. * f1);
+        let sum = Complex::real(-c2) * input1 * input2 / admittance(f1 + f2);
+        let difference = Complex::real(-c2) * input1 * input2.conj() / admittance(f1 - f2);
         let third = -(Complex::real(c2)
-            * (Complex::real(4.) * x * difference + Complex::real(2.) * y.conj() * h2)
-            + Complex::real(3. * c3) * x * x * y.conj())
+            * (Complex::real(4.) * input1 * difference + Complex::real(2.) * input2.conj() * h2)
+            + Complex::real(3. * c3) * input1 * input1 * input2.conj())
             / Complex::real(3.)
-            / admittance(2. * f1 - f2);
+            / admittance(2_f64.mul_add(f1, -f2));
         for (plot, want) in first.iter().zip([
             Complex::real(4.) * sum,
             Complex::real(4.) * difference,
@@ -604,13 +607,13 @@ fn reactive_intermodulation_reuses_independent_kernels_on_both_sides_of_f2() {
             close_complex(column(plot, "v(a)")[index], want);
         }
     }
-    for (a, b) in first.iter().zip(second.iter()) {
-        assert_eq!(a.point_count(), b.point_count());
-        for (a, b) in a.rows().zip(b.rows()) {
-            for (a, b) in a.iter().zip(b.iter()) {
+    for (left, right) in first.iter().zip(second.iter()) {
+        assert_eq!(left.point_count(), right.point_count());
+        for (left, right) in left.rows().zip(right.rows()) {
+            for (left, right) in left.iter().zip(right.iter()) {
                 assert_eq!(
-                    (a.re.to_bits(), a.im.to_bits()),
-                    (b.re.to_bits(), b.im.to_bits())
+                    (left.re.to_bits(), left.im.to_bits()),
+                    (right.re.to_bits(), right.im.to_bits())
                 );
             }
         }

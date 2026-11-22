@@ -163,29 +163,25 @@ fn solve_at(
     if rhs.len() != system.a.rows() || conjugate.len() != rhs.len() {
         return Err(SpiceError::circuit("invalid distortion RHS"));
     }
-    let factor;
-    let flip;
-    if let Some(pattern) = circuit.matrix_pattern()
+    let (factor, flip) = if let Some(pattern) = circuit.matrix_pattern()
         && let Some(matrix) = ComplexMatrix::from_operators_grouped_on(
             &pattern,
             &system.a,
             &system.e,
             &system.e_groups,
             omega,
-        )?
-    {
-        factor = matrix.factorize()?;
-        flip = false;
+        )? {
+        (matrix.factorize()?, false)
     } else {
-        factor = ComplexMatrix::from_operators_grouped(
+        let factor = ComplexMatrix::from_operators_grouped(
             &system.a,
             &system.e,
             &system.e_groups,
             omega.abs(),
         )?
         .factorize()?;
-        flip = omega < 0.;
-    }
+        (factor, omega < 0.)
+    };
     if rhs.iter().all(|value| *value == Complex::ZERO) {
         out.resize(rhs.len(), Complex::ZERO);
         out.fill(Complex::ZERO);
