@@ -5,6 +5,20 @@ Current capabilities and numerical limits are recorded in
 [TODO.md](../../TODO.md) tracks remaining work. Rust edition 2024 / pinned nightly (`rust-toolchain.toml`)
 applies to the locked workspace, not the historical dependency-free scaffold.
 
+## Numerical equivalence
+
+C/ngspice is the behavioral reference, not a mandated floating-point
+evaluation order. Prefer accurate, efficient arithmetic, including FMA and
+portable SIMD. Preserve topology, physical units, model equations, output
+semantics, convergence and error boundaries. Compare physical values with
+analytically justified tolerances; do not require bitwise C equality solely
+for matching historical rounding. Exact comparisons remain appropriate for
+stored input values, discrete phase/branch decisions, and internal invariants
+that genuinely require exactness. Qualitative solver differences (missing
+roots, false convergence, unstable timesteps) require investigation, not
+looser tolerances. Any remaining `suboptimal_flops` expectation must explain
+the specific correctness or measured performance reason.
+
 ## Layering
 
 `ngspice-rs` is a single crate. The port was originally developed as six crates
