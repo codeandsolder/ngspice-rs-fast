@@ -267,7 +267,7 @@ fn swept_sources_keep_terminal_sign_multiplier_and_bound_units() {
     let dir = scratch.path();
     let deck = dir.join("deck.cir");
     let raw = dir.join("out.raw");
-    fs::write(&deck, "Swept current\ni1 0 a dc 1m m=2\nr1 a 0 1k\n.dc i1 -1m 1m 1m\n.save v(a) @i1[dc] @i1[i] i(i1) @i1[p] @r1[resistance] @r1[p]\n.end\n").unwrap();
+    fs::write(&deck, "Swept current\ni1 0 a dc 1m\nr1 a 0 1k\n.dc i1 -1m 1m 1m @i1[m] 2 2 1\n.save v(a) @i1[dc] @i1[i] i(i1) @i1[p] @r1[resistance] @r1[p]\n.end\n").unwrap();
     simulate::run(&deck, &raw, true).unwrap();
     let file = RawFile::load(&raw).unwrap();
     let plot = &file.plots[0].plot;

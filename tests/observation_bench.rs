@@ -1,4 +1,3 @@
-
 //! Reproducible allocation and CPU workloads for many saved device quantities.
 //!
 //! Run the two ignored workloads independently (also suitable for DHAT).

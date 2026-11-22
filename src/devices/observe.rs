@@ -166,7 +166,8 @@ impl TerminalLayout {
                 .by_row
                 .binary_search_by_key(&triplet.row, |&(row, _)| row)
             {
-                currents[self.by_row[index].1] += triplet.value * solution.as_slice()[triplet.col];
+                let contribution = triplet.value * solution.as_slice()[triplet.col];
+                currents[self.by_row[index].1] += contribution;
             }
         }
         let mut ground = 0.;
@@ -233,7 +234,7 @@ struct PointLoads<'a, 'b> {
 impl PointLoads<'_, '_> {
     fn current(&mut self, load: usize, slot: usize, name: &str) -> SpiceResult<Real> {
         let layout = &self.circuit.runtime.observations.loads[load];
-        let work = &mut self.workspace;
+        let work = &mut *self.workspace;
         let loaded = &mut work.loaded[load];
         if !loaded.ready {
             if self.mutual.is_none() {
