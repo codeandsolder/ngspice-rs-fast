@@ -242,6 +242,7 @@ impl Circuit {
     /// # Errors
     /// Unknown devices, malformed queries, or duplicate queries beyond the budget.
     pub fn set_observations(&mut self, names: &[String]) -> SpiceResult<()> {
+        self.check_numbering()?;
         let mut plan = ObservationPlan::default();
         let mut seen = BTreeSet::new();
         for name in names {
@@ -263,14 +264,14 @@ impl Circuit {
                 return Err(gap("more than 1024 requested quantities"));
             }
         }
-        self.observations = plan;
+        self.runtime.observations = plan;
         Ok(())
     }
 
     /// Extra columns requested through [`Self::set_observations`].
     #[must_use]
     pub fn observations(&self) -> &[String] {
-        &self.observations.names
+        &self.runtime.observations.names
     }
 
     /// Observe a converged real point using immutable copies of its device loads.
@@ -286,7 +287,11 @@ impl Circuit {
         time: Option<(Real, crate::devices::Forcing)>,
         previous: Option<&crate::devices::TrialState>,
     ) -> SpiceResult<Vec<Complex>> {
-        if self.observations.names.is_empty() {
+        self.validate_history(request.history)?;
+        if let Some(trial) = previous {
+            request.history.check_trial(trial)?;
+        }
+        if self.runtime.observations.names.is_empty() {
             return Ok(Vec::new());
         }
         let replacements = self.replacements(request.model_context)?;
@@ -301,7 +306,8 @@ impl Circuit {
             scratch: None,
             currents: BTreeMap::new(),
         };
-        self.observations
+        self.runtime
+            .observations
             .iter()
             .map(|(name, hint)| {
                 let (instance, key) = query(name)?;
@@ -382,7 +388,8 @@ impl Circuit {
     /// A current/power or unsupported scalar query, or nonfinite parameter.
     pub fn observe_parameters(&self, context: &ModelContext) -> SpiceResult<Vec<Complex>> {
         let replacements = self.replacements(context)?;
-        self.observations
+        self.runtime
+            .observations
             .iter()
             .map(|(name, hint)| {
                 let (instance, key) = query(name)?;
@@ -466,7 +473,7 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(circuit.observations().len(), 5);
-        let history = circuit.state_history();
+        let history = circuit.state_history().unwrap();
         let model = ModelContext::default();
         let solution = Vector::from_slice(&[3., 1.]);
         let request = LoadRequest {
@@ -494,7 +501,7 @@ mod tests {
         let a = circuit.add_node("a").unwrap();
         let b = circuit.add_node("b").unwrap();
         let g = NodeId::GROUND;
-        circuit.rebuild_unknowns();
+        circuit.finalize().unwrap();
         let mut matrix = SparseMatrix::new(2, 2);
         for (row, col, value) in [
             (0, 1, 1e16),

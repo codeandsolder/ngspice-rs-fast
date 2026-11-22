@@ -447,7 +447,11 @@ fn transient_load_snapshots_require_a_matching_device_layout() {
     inherited.inherit_from(&original);
     inherited.finalize().unwrap();
     assert_eq!(inherited.final_transient_state(), Some(snapshot.clone()));
-    inherited.devices_mut().reverse();
+    for index in 0..inherited.device_count() / 2 {
+        inherited
+            .swap_devices(index, inherited.device_count() - 1 - index)
+            .unwrap();
+    }
     inherited.finalize().unwrap();
     assert!(inherited.final_transient_state().is_none());
     inherited.inherit_from(&original);

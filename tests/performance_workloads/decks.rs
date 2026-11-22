@@ -154,7 +154,18 @@ fn run(name: &str, text: &str, verify: impl Fn(&Plot)) {
 }
 
 fn load_kernel(name: &str, text: &str, repeats: u32) {
-    let (_, config, plan, circuit) = setup(name, text);
+    let (_, config, plan, mut circuit) = setup(name, text);
+    const FINALIZE_REPEATS: u32 = 10_000;
+    let start = Instant::now();
+    for _ in 0..FINALIZE_REPEATS {
+        black_box(&mut circuit).finalize().unwrap();
+    }
+    report(
+        name,
+        "finalize_unchanged",
+        FINALIZE_REPEATS,
+        start.elapsed(),
+    );
     let model = config.context().model_context();
     let start = Instant::now();
     let dc = solve_dc_with(&circuit, &model, plan.dc_settings(), &[], None, None).unwrap();
@@ -165,7 +176,7 @@ fn load_kernel(name: &str, text: &str, repeats: u32) {
         dc.report.stages.len()
     );
     let x = dc.solution.values;
-    let history = circuit.state_history();
+    let history = circuit.state_history().unwrap();
     let request = LoadRequest {
         mode: AnalysisMode::OperatingPoint,
         solution: &x,

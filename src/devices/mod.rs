@@ -107,13 +107,15 @@ pub mod state;
 pub mod traits;
 
 pub use behavioural::{Behavioural, BehaviouralOutput, BehaviouralScale};
-pub use circuit::{Circuit, CircuitGraph, CircuitVertex};
+pub use circuit::{Circuit, CircuitGraph, CircuitVertex, ElaboratedDevice};
 pub use circuit::{ConvergenceRequest, DelayAcceptance, LoadRequest};
 pub use controlled::{ControlledKind, ControlledSource};
 pub use mutual::{MutualInductance, MutualLimits};
 pub use registry::{DeviceEntry, DeviceSupport, Registry};
 pub use rlc::{Capacitor, Inductor, Resistor, ResistorNoise};
-pub use state::{ACCEPTED_DEPTH, DeviceState, IterationPhase, StateHistory, TrialState};
+pub use state::{
+    ACCEPTED_DEPTH, DeviceState, IterationPhase, StateHistory, StateSnapshot, TrialState,
+};
 pub use sweep::{
     InstanceOverride, MAX_INSTANCE_OVERRIDES, MAX_RESISTOR_OVERRIDES, ResistorMetadata,
     ResistorOrigin, ResistorOverride,

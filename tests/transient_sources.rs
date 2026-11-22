@@ -34,7 +34,7 @@ fn circuit(voltage: bool, waveform: Waveform) -> Circuit {
 /// RHS of a transient load at `time` (no integration state is involved).
 fn rhs(circuit: &Circuit, mode: AnalysisMode, forcing: Option<Forcing>) -> SpiceResult<Vec<f64>> {
     let n = circuit.unknown_count();
-    let history = circuit.state_history();
+    let history = circuit.state_history().unwrap();
     let mut matrix = SparseMatrix::new(n, n);
     let mut rhs = Vector::zeros(n);
     circuit.load(

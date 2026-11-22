@@ -102,7 +102,7 @@ pub(super) fn op(
         .values;
     let mut plot = plot(circuit, "op1", "Operating Point", None, false)?;
     circuit.accept_solution(&x, None)?;
-    let history = circuit.state_history();
+    let history = circuit.state_history()?;
     let values = circuit.observe_real(
         &crate::devices::LoadRequest {
             mode: crate::devices::AnalysisMode::OperatingPoint,

@@ -69,6 +69,7 @@ struct PatternIndex {
 #[derive(Debug)]
 pub struct Pattern {
     index: PatternIndex,
+    namespace: Arc<()>,
     ordering: std::sync::Mutex<OrderingState>,
     /// The `(row, col, id)` sequence of the last load, replayed by bound
     /// matrices to skip lookups (ngspice's per-device element pointers).
@@ -151,7 +152,9 @@ const FIXED_MAX: usize = u32::BITS as usize;
 impl Clone for Pattern {
     /// A copy without the cached pivot order.
     fn clone(&self) -> Self {
-        Self::with_index(self.index.clone())
+        let mut copy = Self::with_index(self.index.clone());
+        copy.namespace = Arc::clone(&self.namespace);
+        copy
     }
 }
 
@@ -229,6 +232,7 @@ impl Pattern {
     fn with_index(index: PatternIndex) -> Self {
         Self {
             index,
+            namespace: Arc::new(()),
             ordering: std::sync::Mutex::new(OrderingState::default()),
             trace: std::sync::Mutex::new(Arc::new(Trace::default())),
             complex_workspace: std::sync::Mutex::new(Vec::new()),
@@ -290,7 +294,13 @@ impl Pattern {
                 push_compact(&mut positions, position)?;
             }
         }
-        Self::index(self.index.n, positions)
+        let mut extended = Self::index(self.index.n, positions)?;
+        extended.namespace = Arc::clone(&self.namespace);
+        Ok(extended)
+    }
+
+    pub(crate) fn same_namespace(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.namespace, &other.namespace)
     }
 
     /// Matrix positions in stable creation order.

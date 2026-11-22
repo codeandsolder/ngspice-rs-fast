@@ -32,21 +32,25 @@ fn netlist(body: &str) -> ngspice_rs::netlist::ast::Netlist {
 /// Replaces `v1` (device 0) by an ideal step from 0 to 1 V at `time`.
 fn step_at(c: &mut Circuit, time: f64) {
     let t = c.devices()[0].terminals().to_vec();
-    c.devices_mut()[0] = Box::new(
-        IndependentSource::new(
-            "v1",
-            [t[0], t[1]],
-            true,
-            0.,
-            ngspice_rs::primitives::Complex::real(1.),
-            Waveform::Step {
-                before: 0.,
-                after: 1.,
-                time,
-            },
-        )
-        .unwrap(),
-    );
+    c.replace_device(
+        0,
+        Box::new(
+            IndependentSource::new(
+                "v1",
+                [t[0], t[1]],
+                true,
+                0.,
+                ngspice_rs::primitives::Complex::real(1.),
+                Waveform::Step {
+                    before: 0.,
+                    after: 1.,
+                    time,
+                },
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
 }
 fn request(args: &[&str]) -> AnalysisInput {
     AnalysisInput::with_arguments(AnalysisKind::Transient, args.iter().copied())

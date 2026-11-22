@@ -231,7 +231,7 @@ fn the_dc_jacobian_matches_finite_differences_over_a_bias_grid() {
     for body in bodies {
         let c = circuit(&body).unwrap();
         let context = ModelContext::default();
-        let history = c.state_history();
+        let history = c.state_history().unwrap();
         let solved = ngspice_rs::analysis::bias::solve_dc(
             &c,
             &context,

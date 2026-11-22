@@ -162,7 +162,7 @@ fn dc_jacobian_matches_finite_differences_where_c_is_exact() {
     for (body, relative) in [(SHARED[0], 1e-6), (SHARED[2], 1e-6), (kappa_zero, 0.1)] {
         let c = circuit(body);
         let context = ModelContext::default();
-        let history = c.state_history();
+        let history = c.state_history().unwrap();
         let solved = bias(&c);
         let system = c.small_signal_system(&context, &solved.values).unwrap();
         let n = c.unknown_count();

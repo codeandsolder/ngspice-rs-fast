@@ -83,7 +83,7 @@ fn capacitor(floating: bool, c: f64) -> Circuit {
 fn dc_loads_keep_the_capacitor_open_and_record_charge() {
     let circuit = capacitor(true, 2e-6);
     assert_eq!(circuit.state_len(), 2);
-    let history = circuit.state_history();
+    let history = circuit.state_history().unwrap();
     let loaded = load(&circuit, &history, &[3.0, 1.0], None).unwrap();
     assert!(loaded.matrix.is_empty());
     assert_eq!(loaded.rhs.as_slice(), &[0.0, 0.0]);
@@ -96,7 +96,7 @@ fn capacitor_companions_match_the_derived_equations() {
     for floating in [false, true] {
         let circuit = capacitor(floating, c);
         let x = |a: f64, b: f64| if floating { vec![a, b] } else { vec![a - b] };
-        let mut history = circuit.state_history();
+        let mut history = circuit.state_history().unwrap();
         let mut steps = StepHistory::new();
         // Accepted DC point at v = 1, then a backward-Euler step to v = 1.5.
         let dc = load(&circuit, &history, &x(1.0, 0.0), None).unwrap();
@@ -163,7 +163,7 @@ fn inductor_branch_companions_have_the_documented_signs() {
     assert_eq!(circuit.branch_rows(0), Some(1..2));
     assert_eq!(circuit.state_rows(0), Some(0..2));
     assert_eq!(circuit.state_rows(1), Some(2..2));
-    let mut history = circuit.state_history();
+    let mut history = circuit.state_history().unwrap();
     let mut steps = StepHistory::new();
     // DC: a short, flux = L i.
     let dc = load(&circuit, &history, &[0.0, 0.2], None).unwrap();
@@ -203,7 +203,7 @@ fn inductor_branch_companions_have_the_documented_signs() {
 fn repeated_rejected_and_rolled_back_trials_leave_history_intact() {
     let c = 1e-6;
     let circuit = capacitor(false, c);
-    let mut history = circuit.state_history();
+    let mut history = circuit.state_history().unwrap();
     let mut steps = StepHistory::new();
     let dc = load(&circuit, &history, &[1.0], None).unwrap();
     accept(&circuit, &mut history, &[1.0], dc);
@@ -252,7 +252,7 @@ fn repeated_rejected_and_rolled_back_trials_leave_history_intact() {
 #[test]
 fn unsupported_and_incomplete_companion_loads_fail_explicitly() {
     let circuit = capacitor(false, 1e-6);
-    let mut history = circuit.state_history();
+    let mut history = circuit.state_history().unwrap();
     let steps = StepHistory::new();
     // No coefficients in a transient load.
     let n = circuit.unknown_count();
@@ -311,7 +311,7 @@ fn companion_rc_and_rl_decays_converge_at_second_order() {
         method: IntegrationMethod,
         steps: usize,
     ) -> Vec<f64> {
-        let mut history = circuit.state_history();
+        let mut history = circuit.state_history().unwrap();
         let mut step_history = StepHistory::new();
         let dc = load(circuit, &history, initial, None).unwrap();
         accept(circuit, &mut history, initial, dc);
