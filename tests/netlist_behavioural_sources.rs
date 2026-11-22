@@ -605,9 +605,9 @@ fn generated_instance_names_do_not_silently_overwrite_existing_devices() {
         lowered.devices.iter().filter(|d| d.name == "v_r1").count(),
         2
     );
-    let err = ngspice_rs::devices::Circuit::from_netlist(&input)
-        .err()
-        .expect("generated device name collision");
+    let Err(err) = ngspice_rs::devices::Circuit::from_netlist(&input) else {
+        panic!("generated device name collision");
+    };
     assert!(err.to_string().contains("duplicate instance name"), "{err}");
 }
 
