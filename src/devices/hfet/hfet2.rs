@@ -470,13 +470,13 @@ impl Hfet2 {
         let u = 0.5 * vgt / vt - 1.;
         let t = (derived.delta_sqr + u * u).sqrt();
         let vgte = vt * (2. + u + t);
-        let b = (vgt / etavth).exp();
-        let nsn = 2. * derived.n0 * (1. + 0.5 * b).ln();
-        let nsm = if derived.two_exponentials {
-            let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / (model.eta2 * vt)).exp();
-            nsn * nsc / (nsn + nsc)
+        let (nsn, slope) = super::soft_density(derived.n0, vgt, etavth);
+        let (nsm, delnsmvgt) = if derived.two_exponentials {
+            let thermal = model.eta2 * vt;
+            let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / thermal).exp();
+            super::series_density(nsn, slope, nsc, thermal)
         } else {
-            nsn
+            (nsn, slope)
         };
         if nsm < N_MIN {
             return Ok(Channel {
@@ -509,16 +509,10 @@ impl Hfet2 {
         let a = 1. + gchi * rt;
         let delgchgchi = 1. / (a * a);
         let delgchins = derived.gchi0;
-        let delnsnsm = ns / nsm * (1. - c / (1. + c));
+        let delnsnsm = ns / nsm / (1. + c);
         let delvgtevgt = 0.5 * (1. + u / t);
-        let mut delnsmvgt = derived.n0 / etavth / (1. / b + 0.5);
-        if derived.two_exponentials {
-            let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / (model.eta2 * vt)).exp();
-            delnsmvgt = nsc * (nsc * delnsmvgt + nsn * nsn / (model.eta2 * vt))
-                / ((nsc + nsn) * (nsc + nsn));
-        }
         let delvsateisat = 1. / gch;
-        let delisatisatm = isat / isatm * (1. - g / (1. + g));
+        let delisatisatm = isat / isatm / (1. + g);
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
         let delvsategch = -vsate / gch;
         let delisatmgchim = vgte * (p - gchim * model.rsi * (1. + 1. / h)) / (p * p);

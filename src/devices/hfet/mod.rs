@@ -53,6 +53,44 @@ use crate::devices::{LinearContext, ModelFamily, ResolvedModel};
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
+/// Carrier density and its voltage derivative for the common HFET/MESA
+/// soft threshold. Evaluate log(1 + exp(x)/2) without losing weak-inversion
+/// charge when exp(x)/2 is smaller than one ULP of 1.
+fn soft_density(n0: Real, voltage: Real, thermal: Real) -> (Real, Real) {
+    let x = voltage / thermal;
+    let (logarithm, fraction) = if x <= 1. {
+        let b = 0.5 * x.exp();
+        (b.ln_1p(), b / (1. + b))
+    } else {
+        let reciprocal = 2. * (-x).exp();
+        (
+            (x - std::f64::consts::LN_2) + reciprocal.ln_1p(),
+            1. / (1. + reciprocal),
+        )
+    };
+    let density = 2. * n0 * logarithm;
+    let slope = 2. * n0 / thermal * fraction;
+    (density, slope)
+}
+
+/// Combine the two carrier populations in series, with derivative of
+/// the second population equal to its density divided by thermal voltage.
+/// Ratios avoid forming the product or squared sum of two large densities.
+fn series_density(first: Real, slope: Real, second: Real, thermal: Real) -> (Real, Real) {
+    let (density, first_fraction, second_fraction) = if first.abs() <= second.abs() {
+        let ratio = first / second;
+        let fraction = 1. / (1. + ratio);
+        (first * fraction, ratio * fraction, fraction)
+    } else {
+        let ratio = second / first;
+        let fraction = 1. / (1. + ratio);
+        (second * fraction, fraction, ratio * fraction)
+    };
+    let derivative =
+        (second_fraction * second_fraction).mul_add(slope, density / thermal * first_fraction);
+    (density, derivative)
+}
+
 /// Staged node setup common to the three MESA/HFET levels.
 /// The caller commits the transaction only after temperature derivation succeeds.
 struct NodeSetup<'a, 'table> {
@@ -702,6 +740,30 @@ static MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(MODEL);
 mod tests {
     use super::*;
     use crate::primitives::NodeTable;
+
+    #[test]
+    fn soft_density_preserves_weak_inversion_and_avoids_exponential_overflow() {
+        let (density, slope) = super::soft_density(2., -50., 1.);
+        let asymptote = 2. * (-50_f64).exp();
+        assert!((density / asymptote - 1.).abs() < 4. * f64::EPSILON);
+        assert!((slope / asymptote - 1.).abs() < 4. * f64::EPSILON);
+        let (density, slope) = super::soft_density(2., 1000., 1.);
+        assert_eq!(density, 4. * (1000. - std::f64::consts::LN_2));
+        assert_eq!(slope, 4.);
+    }
+
+    #[test]
+    fn series_density_avoids_overflow_and_matches_the_analytic_derivative() {
+        let (density, slope) = super::series_density(1e200, 2e200, 1e200, 0.5);
+        assert_eq!(density, 5e199);
+        assert_eq!(slope, 1e200);
+        let (density, slope) = super::series_density(1e-200, 2e-200, 1e-200, 0.5);
+        assert_eq!(density, 5e-201);
+        assert_eq!(slope, 1e-200);
+        let (density, slope) = super::series_density(1., 2., f64::INFINITY, 0.5);
+        assert_eq!(density, 1.);
+        assert_eq!(slope, 2.);
+    }
 
     #[test]
     fn borrowed_reset_stamps_match_owned_assembly_and_validate_before_mutation() {

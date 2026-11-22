@@ -715,8 +715,7 @@ impl Mesa {
         let u = 0.5 * vgt / vt - 1.;
         let t = (derived.delta_sqr + u * u).sqrt();
         let vgte = vt * (2. + u + t);
-        let b = (vgt / etavth).exp();
-        let nsm = 2. * derived.n0 * (1. + 0.5 * b).ln();
+        let (nsm, delnsmvgt) = super::soft_density(derived.n0, vgt, etavth);
         if nsm < N_MIN {
             return Ok((0., 0., 0., derived.cf, derived.cf));
         }
@@ -756,11 +755,10 @@ impl Mesa {
         let a = 1. + gchi * rt;
         let delgchgchi = 1. / (a * a);
         let delgchins = derived.gchi0;
-        let delnsnsm = ns / nsm * (1. - c / (1. + c));
-        let delnsmvgt = derived.n0 / etavth / (1. / b + 0.5);
+        let delnsnsm = ns / nsm / (1. + c);
         let delvgtevgt = 0.5 * (1. + u / t);
         let delvsateisat = 1. / gch;
-        let delisatisatm = isat / isatm * (1. - g / (1. + g));
+        let delisatisatm = isat / isatm / (1. + g);
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
         let delvsategch = -vsate / gch;
         let delisatmgchim = vgte * (p - gchim * derived.trsi * (1. + 1. / h)) / (p * p);
