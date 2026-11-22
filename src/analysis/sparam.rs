@@ -790,3 +790,158 @@ impl NoiseWorkspace {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UNLIMITED: RfLimits = RfLimits {
+        work_units: usize::MAX,
+        numeric_bytes: usize::MAX,
+        variables: usize::MAX,
+    };
+
+    #[test]
+    fn budget_preflight_checks_overflow_and_aggregate_work_before_allocation() {
+        let check =
+            |p, n, o, f, noise, limits| RfBudget::preflight(p, n, o, f, noise, false, limits);
+        for (p, n, o, f) in [
+            (usize::MAX, 2, 0, 1),
+            (2, usize::MAX, 0, 1),
+            (2, 2, usize::MAX, 1),
+            (2, 2, 0, usize::MAX),
+        ] {
+            assert!(check(p, n, o, f, true, UNLIMITED).is_err());
+        }
+        assert!(check(0, 1, 0, 1, false, UNLIMITED).is_err());
+        assert!(check(32, 96, 0, 100_000, true, RfLimits::default()).is_err());
+        assert!(check(8, 24, 0, 64, true, RfLimits::default()).is_ok());
+        assert!(check(32, 96, 0, 64, true, RfLimits::default()).is_ok());
+        let without_noise = check(2, 6, 0, 3, false, UNLIMITED).unwrap();
+        let with_noise = check(2, 6, 0, 3, true, UNLIMITED).unwrap();
+        assert_eq!(without_noise.width, 20);
+        assert_eq!(with_noise.width, 28);
+        assert!(with_noise.remaining < without_noise.remaining);
+        let work = usize::MAX - with_noise.remaining;
+        let limits = RfLimits {
+            work_units: work,
+            ..UNLIMITED
+        };
+        let mut exact = check(2, 6, 0, 3, true, limits).unwrap();
+        assert!(exact.charge(0).is_ok());
+        assert!(exact.charge(1).is_err());
+        assert!(
+            check(
+                2,
+                6,
+                0,
+                3,
+                true,
+                RfLimits {
+                    work_units: work - 1,
+                    ..UNLIMITED
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            check(
+                2,
+                6,
+                0,
+                3,
+                true,
+                RfLimits {
+                    variables: 27,
+                    ..UNLIMITED
+                }
+            )
+            .is_err()
+        );
+
+        // Exact numeric bytes including retained bias, extra observations,
+        // ports, row, thirteen algebra matrices and covariance, RHS/work/
+        // result, two adjacent adjoints and noise scratch.
+        let cells = 3 * 29 + 7 + 29 + 14 * 4 + 2 * 6 + 3 * 6 + 1 + 1 + 8 * 2;
+        let bytes = cells * std::mem::size_of::<Complex>();
+        assert!(
+            RfBudget::preflight(
+                2,
+                6,
+                1,
+                3,
+                true,
+                true,
+                RfLimits {
+                    numeric_bytes: bytes - 1,
+                    ..UNLIMITED
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            RfBudget::preflight(
+                2,
+                6,
+                1,
+                3,
+                true,
+                true,
+                RfLimits {
+                    numeric_bytes: bytes,
+                    ..UNLIMITED
+                }
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn work_budget_charges_actual_factor_entries_and_noise_sources_transactionally() {
+        let mut budget = RfBudget {
+            remaining: 144,
+            width: 0,
+        };
+        budget.charge_factor(10, 2, true).unwrap(); // 80
+        assert_eq!(budget.remaining, 64);
+        budget.charge_noise(2, 5).unwrap(); // 60
+        assert_eq!(budget.remaining, 4);
+        assert!(budget.charge_noise(2, 1).is_err());
+        assert_eq!(budget.remaining, 4);
+        assert!(budget.charge_factor(usize::MAX, 2, true).is_err());
+        assert!(budget.charge_noise(usize::MAX, 1).is_err());
+        assert_eq!(budget.remaining, 4);
+    }
+
+    #[test]
+    fn conversions_clear_previous_results_when_a_later_frequency_is_singular() {
+        let ports = [BoundPort {
+            number: 1,
+            z0: Complex::real(50.),
+            ki: Complex::real(0.5 / 50_f64.sqrt()),
+            inverse_z0: Complex::real(1. / 50.),
+            positive: Some(0),
+            negative: None,
+            branch: 1,
+        }];
+        let mut algebra = PortAlgebra::new(&ports).unwrap();
+        algebra.incident.set(0, 0, Complex::real(1.)).unwrap();
+        algebra.scattered.set(0, 0, Complex::real(0.25)).unwrap();
+        algebra.calculate(1.).unwrap();
+        assert_ne!(algebra.z.data(), &[Complex::ZERO]);
+        assert_ne!(algebra.y.data(), &[Complex::ZERO]);
+        algebra.scattered.set(0, 0, Complex::real(1.)).unwrap();
+        algebra.calculate(2.).unwrap();
+        assert_eq!(algebra.z.data(), &[Complex::ZERO]);
+        algebra.scattered.set(0, 0, Complex::real(-1.)).unwrap();
+        algebra.calculate(3.).unwrap();
+        assert_eq!(algebra.y.data(), &[Complex::ZERO]);
+        algebra.incident.clear();
+        assert!(algebra.calculate(4.).is_err());
+        algebra.incident.set(0, 0, Complex::real(1.)).unwrap();
+        algebra.scattered.set(0, 0, Complex::real(0.25)).unwrap();
+        algebra.calculate(5.).unwrap();
+        assert_ne!(algebra.z.data(), &[Complex::ZERO]);
+        assert_ne!(algebra.y.data(), &[Complex::ZERO]);
+    }
+}

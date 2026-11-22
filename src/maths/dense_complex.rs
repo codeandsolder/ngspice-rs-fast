@@ -521,4 +521,100 @@ mod tests {
         assert_eq!(sum.dim(), 2);
         assert_eq!(sum.data().len(), 4);
     }
+    #[test]
+    fn diagonal_kernels_preserve_generic_product_bits_and_errors() {
+        let values = [
+            (0., -0.),
+            (-0., 0.),
+            (-0., -0.),
+            (f64::from_bits(1), -f64::from_bits(2)),
+            (-2., 3.),
+            (1e150, -1e-150),
+            (1e-150, 1e150),
+            (-1., -1.),
+            (4., 0.),
+        ];
+        let a = matrix(3, &values);
+        let bits = |m: &DenseComplex| {
+            m.data()
+                .iter()
+                .map(|v| [v.re.to_bits(), v.im.to_bits()])
+                .collect::<Vec<_>>()
+        };
+        let mut out = DenseComplex::zeros(3).unwrap();
+        for diagonal in [
+            [
+                Complex::new(-0., -0.),
+                Complex::real(1.),
+                Complex::new(-2., 3.),
+            ],
+            [
+                Complex::real(f64::from_bits(1)),
+                Complex::new(1e150, -1e150),
+                Complex::real(-0.5),
+            ],
+            [
+                Complex::real(1e-150),
+                Complex::real(1e-150),
+                Complex::real(1e-150),
+            ],
+        ] {
+            let d = DenseComplex::diagonal(&diagonal).unwrap();
+            a.right_diagonal_into(&diagonal, &mut out).unwrap();
+            assert_eq!(bits(&out), bits(&a.mul(&d).unwrap()));
+            a.left_diagonal_into(&diagonal, &mut out).unwrap();
+            assert_eq!(bits(&out), bits(&d.mul(&a).unwrap()));
+        }
+        for invalid in [f64::INFINITY, f64::NAN] {
+            let diag = [Complex::real(invalid); 3];
+            assert!(a.right_diagonal_into(&diag, &mut out).is_err());
+            assert!(a.left_diagonal_into(&diag, &mut out).is_err());
+        }
+        assert!(
+            a.right_diagonal_into(&[Complex::ZERO; 2], &mut out)
+                .is_err()
+        );
+        let huge = DenseComplex::diagonal(&[Complex::real(f64::MAX); 3]).unwrap();
+        assert!(
+            huge.right_diagonal_into(&[Complex::real(2.); 3], &mut out)
+                .is_err()
+        );
+        assert!(
+            huge.left_diagonal_into(&[Complex::real(2.); 3], &mut out)
+                .is_err()
+        );
+        let mut empty = DenseComplex::zeros(0).unwrap();
+        DenseComplex::zeros(0)
+            .unwrap()
+            .left_diagonal_into(&[], &mut empty)
+            .unwrap();
+        DenseComplex::zeros(0)
+            .unwrap()
+            .right_diagonal_into(&[], &mut empty)
+            .unwrap();
+    }
+
+    #[test]
+    fn reusable_inverse_and_product_overwrite_stale_scratch() {
+        let a = matrix(2, &[(2., 1.), (3., 4.), (5., -1.), (1., 2.)]);
+        let mut scratch = DenseComplex::diagonal(&[Complex::real(f64::NAN); 2]).unwrap();
+        let mut out = scratch.clone();
+        let expected = a.inverse().unwrap().unwrap();
+        assert!(a.inverse_into(&mut out, &mut scratch).unwrap());
+        assert_eq!(out, expected);
+        assert!(
+            !DenseComplex::zeros(2)
+                .unwrap()
+                .inverse_into(&mut out, &mut scratch)
+                .unwrap()
+        );
+        assert!(a.inverse_into(&mut out, &mut scratch).unwrap());
+        assert_eq!(out, expected);
+        a.mul_into(&expected, &mut scratch).unwrap();
+        assert_eq!(scratch, a.mul(&expected).unwrap());
+        assert!(
+            a.inverse_into(&mut DenseComplex::zeros(1).unwrap(), &mut scratch)
+                .is_err()
+        );
+    }
 }

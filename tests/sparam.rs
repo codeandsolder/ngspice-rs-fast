@@ -633,3 +633,79 @@ fn rf_sweep_benchmark_08() {
 fn rf_sweep_benchmark_32() {
     benchmark_rf_sweep(32);
 }
+
+#[test]
+fn rf_resource_limits_are_configurable_and_aggregate() {
+    use ngspice_rs::analysis::RfLimits;
+    let deck = "RF limits\nv1 in 0 portnum 1 z0 50\nr1 in 0 100\nv2 out 0 portnum 2 z0 75\nr2 in out 25\nr3 out 0 100\n.sp lin 4 1k 4k 1\n.end\n";
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("rf-limits.cir"), deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+    for (limits, expected) in [
+        (
+            RfLimits {
+                variables: 1,
+                ..Default::default()
+            },
+            "variables",
+        ),
+        (
+            RfLimits {
+                numeric_bytes: 1,
+                ..Default::default()
+            },
+            "numeric bytes",
+        ),
+        (
+            RfLimits {
+                work_units: 1,
+                ..Default::default()
+            },
+            "work units",
+        ),
+    ] {
+        let mut context = config.context();
+        context.rf_limits = limits;
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let error = plan.run(&mut circuit, &context).unwrap_err().to_string();
+        assert!(
+            error.contains(".sp RF resource limit") && error.contains(expected),
+            "{error}"
+        );
+    }
+    let mut text = String::new();
+    use std::fmt::Write as _;
+    for i in 1..=32 {
+        writeln!(text, "v{i} n{i} 0 portnum {i}\nr{i} n{i} 0 100").unwrap();
+    }
+    let error = sp(&text, ".sp lin 10000 1 10000 1")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("numeric bytes"), "{error}");
+    // Angular-frequency overflow would otherwise reach model assembly or
+    // an unrelated nonfinite matrix operation.
+    let error = sp("v1 1 0 portnum 1\nr1 1 0 100", ".sp lin 1 1e308 1e308")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("angular frequency"), "{error}");
+}
+
+#[test]
+fn reusable_rf_sweep_matches_independent_frequencies_with_noise() {
+    let body = "v3 c 0 portnum 3 z0 25\nv2 b 0 portnum 2 z0 75\nv1 a 0 portnum 1 z0 50\nr1 a b 30\nr2 b c 40\nr3 c 0 100\nr4 a 0 80\nc1 b 0 1n";
+    let sweep = sp(body, ".sp lin 3 1000 3000 1").unwrap();
+    for (index, f) in [1000, 2000, 3000].into_iter().enumerate() {
+        let independent = sp(body, &format!(".sp lin 1 {f} {f} 1")).unwrap();
+        assert_eq!(independent.variables(), sweep.variables());
+        for (a, b) in sweep
+            .row(index)
+            .unwrap()
+            .iter()
+            .zip(independent.row(0).unwrap())
+        {
+            close(*a, *b);
+        }
+    }
+}
