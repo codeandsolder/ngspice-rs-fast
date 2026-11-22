@@ -188,8 +188,8 @@ fn duplicate_sites_and_parallel_sessions() {
             let candidate = lane.prepare(&[value, 1000.]).unwrap();
             candidate.config.params().unwrap().get("r").unwrap()
         };
-        let a = scope.spawn(|| run(2000.));
-        let b = scope.spawn(|| run(3000.));
+        let a = scope.spawn(move || run(2000.));
+        let b = scope.spawn(move || run(3000.));
         assert_eq!(a.join().unwrap(), 2000.);
         assert_eq!(b.join().unwrap(), 3000.);
     });
