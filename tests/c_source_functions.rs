@@ -369,20 +369,26 @@ fn unmarked_decks_diverge_from_c_only_within_documented_bounds() {
 
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN; runs a temporary C deck out of process"]
-fn polar_ac_coefficients_and_phase_overrides_match_c() {
+fn polar_ac_coefficients_and_phase_overrides_match_equivalent_c_phase() {
     use ngspice_rs::devices::ModelContext;
 
     let base = "v1 a 0 ac 2 0\ni1 b 0 ac 3 0\nr1 a 0 1\nr2 b 0 1\n";
     let mut circuit = Circuit::from_netlist(&rust_netlist(&format!("t\n{base}.end\n"))).unwrap();
     let context = ModelContext::default();
-    // The huge phase distinguishes C's multiplication/division order
-    // from multiplying by the pre-rounded degrees-to-radians factor.
-    for (index, phase) in [123_456_789_012_345., -720.25, -0.].into_iter().enumerate() {
+    // Independently reduce the exact integral huge phase by integer division.
+    // C's unreduced radians lose phase precision; the small equivalent deck
+    // provides the correct periodic reference, not its large-angle rounding.
+    for (index, (phase, reduced)) in [(123_456_789_012_345., 105.), (-720.25, -0.25), (-0., -0.)]
+        .into_iter()
+        .enumerate()
+    {
         let static_cards =
             format!("v1 a 0 ac 2 {phase}\ni1 b 0 ac 3 {phase}\nr1 a 0 1\nr2 b 0 1\n");
+        let reference_cards =
+            format!("v1 a 0 ac 2 {reduced}\ni1 b 0 ac 3 {reduced}\nr1 a 0 1\nr2 b 0 1\n");
         let (c_initial, text) = run_c(
             &format!("ac-initial-{index}"),
-            &static_cards,
+            &reference_cards,
             "ac lin 1 1k 1k",
             "",
         );
@@ -390,7 +396,9 @@ fn polar_ac_coefficients_and_phase_overrides_match_c() {
         let (c_altered, text) = run_c(
             &format!("ac-altered-{index}"),
             base,
-            &format!("alter @v1[acphase] = {phase}\nalter @i1[acphase] = {phase}\nac lin 1 1k 1k"),
+            &format!(
+                "alter @v1[acphase] = {reduced}\nalter @i1[acphase] = {reduced}\nac lin 1 1k 1k"
+            ),
             "",
         );
         let c_altered = c_altered.unwrap_or_else(|| panic!("missing altered AC plot: {text}"));

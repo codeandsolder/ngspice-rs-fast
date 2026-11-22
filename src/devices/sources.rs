@@ -871,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_ac_and_explicit_zero_are_distinct_and_overflow_is_rejected() {
+    fn omitted_ac_and_explicit_zero_are_distinct_and_phase_is_periodic() {
         let context = crate::devices::ModelContext::default();
         let absent = polar_source(true, None, None, None);
         assert!(!absent.ac_given());
@@ -896,23 +896,26 @@ mod tests {
             ac_bits(coefficients(swept).ac),
             [1.0_f64.to_bits(), (-0.0_f64).to_bits()]
         );
-        assert!(
-            absent
-                .with_instance_parameter("acphase", Real::MAX, &context)
-                .is_err()
-        );
-        assert!(
-            AcInput {
-                magnitude: Some(0.),
-                phase: Some(Real::MAX)
-            }
-            .resolve()
-            .is_err()
-        );
-        // The exact binary64 intermediate distinguishes C from to_radians().
+        let huge = absent
+            .with_instance_parameter("acphase", Real::MAX, &context)
+            .unwrap();
+        let reduced = absent
+            .with_instance_parameter("acphase", 128., &context)
+            .unwrap();
         assert_eq!(
-            crate::devices::functions::phase_radians(123_456_789_012_345.).to_bits(),
-            2_154_727_452_205.378_4_f64.to_bits()
+            ac_bits(coefficients(huge).ac),
+            ac_bits(coefficients(reduced).ac)
+        );
+        let zero = AcInput {
+            magnitude: Some(0.),
+            phase: Some(Real::MAX),
+        }
+        .resolve()
+        .unwrap();
+        assert_eq!(zero.magnitude(), 0.);
+        assert_eq!(
+            crate::devices::functions::phase_radians(123_456_789_012_345.),
+            crate::devices::functions::phase_radians(105.)
         );
     }
 

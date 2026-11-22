@@ -26,7 +26,9 @@
 //! | AM | FM | `5 / CKTfinalTime` (omitted only) |
 //! | AM | FC | `500 / CKTfinalTime` (omitted only) |
 //!
-//! Phases are in degrees. Before its delay a SIN holds `VO + VA sin(PHASE)`, an
+//! Phases are in degrees, reduced modulo 360 before conversion. The
+//! frequency-time product is reduced using its FMA residual, independently
+//! of C's large-radian rounding. Before its delay a SIN holds `VO + VA sin(PHASE)`, an
 //! EXP holds V1, and SFFM/AM hold **zero** (not VO): C returns 0 for
 //! `time <= TD`, so SFFM/AM generally jump at their delay. OP/DC analyses
 //! without an explicit DC value use the C time-zero value
@@ -45,7 +47,7 @@
 //! where they are unset); SFFM's MDI limiting is silent (C prints a one-time
 //! warning); and every value is checked to be finite.
 
-use std::f64::consts::PI;
+use std::f64::consts::TAU;
 use std::sync::Arc;
 
 use crate::devices::{Limit, TransientTiming};
@@ -396,45 +398,57 @@ pub struct Am {
     carrier_phase: Real,
 }
 
-/// The phase conversion in VSRC/ISRC temperature and load routines rounds the product
-/// before dividing by 180, rather than multiplying by a precomputed ratio.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "retain C phase conversion multiplication and division order"
-)]
+/// Convert a periodic degree input only after reducing its exact binary64
+/// value modulo 360. This avoids overflow and preserves fractional turns
+/// even for phases much larger than the representable radian precision.
 pub(super) const fn phase_radians(degrees: Real) -> Real {
-    degrees * PI / 180.
+    let reduced = degrees % 360.;
+    let principal = if reduced > 180. {
+        reduced - 360.
+    } else if reduced < -180. {
+        reduced + 360.
+    } else {
+        reduced
+    };
+    principal.to_radians()
 }
 
-/// SIN before its delay and in DC share the same reference formula.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "C SIN offset addition follows a separately rounded amplitude product"
-)]
+/// SIN before its delay and in DC share the same held value.
 fn held_sine(offset: Real, amplitude: Real, radians: Real) -> Real {
-    offset + amplitude * radians.sin()
+    amplitude.mul_add(radians.sin(), offset)
 }
 
-/// SFFM and AM both use the C left-associated carrier/modulator angle.
-const fn modulation_angle(frequency: Real, time: Real, radians: Real) -> Real {
-    2. * PI * frequency * time + radians
+/// Fractional turns of the exact binary64 frequency-time product. The FMA
+/// residual retains low product bits, which would otherwise already be
+/// lost before converting even to a reduced radian angle.
+fn modulation_angle(frequency: Real, time: Real, radians: Real) -> Real {
+    if time == 0. {
+        return radians;
+    }
+    if !time.is_finite() {
+        return Real::NAN;
+    }
+    let cycles = frequency * time;
+    let fractional = if cycles.is_finite() {
+        let residual = frequency.mul_add(time, -cycles);
+        cycles.fract() + residual.fract()
+    } else {
+        // A product of two finite binary64 values large enough to overflow
+        // has no fractional bits: the exact significand has at most 106 bits.
+        0.
+    };
+    TAU.mul_add(fractional, radians)
 }
 
 impl Sine {
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "C SIN time-frequency product, phase addition and damping have a fixed rounding order"
-    )]
     fn value_at(self, t: Real) -> Real {
         let time = t - self.delay;
         let phase = phase_radians(self.phase);
         if time <= 0. {
             held_sine(self.offset, self.amplitude, phase)
         } else {
-            self.offset
-                + self.amplitude
-                    * (self.frequency * time * 2. * PI + phase).sin()
-                    * (-time * self.damping).exp()
+            let angle = modulation_angle(self.frequency, time, phase);
+            (self.amplitude * angle.sin()).mul_add((-time * self.damping).exp(), self.offset)
         }
     }
 }
@@ -462,10 +476,6 @@ impl Exponential {
 }
 
 impl Sffm {
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "C SFFM separately rounds the modulation index product and the offset sum"
-    )]
     fn value_at(self, t: Real, limit: Limit) -> Real {
         let time = t - self.delay;
         if time < 0. || (time == 0. && limit == Limit::Left) {
@@ -473,16 +483,12 @@ impl Sffm {
         }
         let carrier_angle = modulation_angle(self.carrier, time, phase_radians(self.carrier_phase));
         let signal_angle = modulation_angle(self.signal, time, phase_radians(self.signal_phase));
-        let angle = carrier_angle + self.index * signal_angle.sin();
-        self.offset + self.amplitude * angle.sin()
+        let angle = self.index.mul_add(signal_angle.sin(), carrier_angle);
+        self.amplitude.mul_add(angle.sin(), self.offset)
     }
 }
 
 impl Am {
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "C AM rounds the modulation product and carrier amplitude before the final offset sum"
-    )]
     fn value_at(self, t: Real, limit: Limit) -> Real {
         let time = t - self.delay;
         if time < 0. || (time == 0. && limit == Limit::Left) {
@@ -498,9 +504,9 @@ impl Am {
             time,
             phase_radians(self.modulation_phase),
         );
-        self.offset
-            + (self.carrier_amplitude + self.modulation_amplitude * signal_angle.sin())
-                * carrier_angle.sin()
+        self.modulation_amplitude
+            .mul_add(signal_angle.sin(), self.carrier_amplitude)
+            .mul_add(carrier_angle.sin(), self.offset)
     }
 }
 
@@ -952,6 +958,7 @@ impl Iterator for PwlBreakpoints {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f64::consts::PI;
     const L: Limit = Limit::Left;
     const R: Limit = Limit::Right;
 
@@ -971,6 +978,31 @@ mod tests {
             damping: fields[2],
             phase: fields[3],
         })
+    }
+
+    #[test]
+    fn periodic_phase_conversion_retains_large_exact_degree_inputs() {
+        assert_eq!(phase_radians(-0.).to_bits(), (-0_f64).to_bits());
+        assert_eq!(phase_radians(123_456_789_012_345.), phase_radians(105.));
+        assert_eq!(phase_radians(Real::MAX), phase_radians(128.));
+        assert_eq!(phase_radians(-720.25), phase_radians(-0.25));
+        assert_eq!(phase_radians(359.), phase_radians(-1.));
+    }
+
+    #[test]
+    fn periodic_time_product_retains_fractional_turns_beyond_binary64_precision() {
+        let frequency = 2_f64.powi(40) + 0.25;
+        let time = 2_f64.powi(30) + 0.5;
+        // Exact product's only fractional contribution is 0.25 * 0.5.
+        assert_eq!(modulation_angle(frequency, time, 0.), TAU * 0.125);
+        assert_eq!(modulation_angle(-frequency, time, 0.), -TAU * 0.125);
+        // The overflowed product is an exact integer, not an unknown phase.
+        assert_eq!(modulation_angle(Real::MAX, 2., phase_radians(90.)), PI / 2.);
+        let s = sine([Some(frequency), None, None, Some(105.)])
+            .resolve(&timing())
+            .unwrap();
+        let expected = 0.5 + 2. * (phase_radians(105.) + TAU * 0.125).sin();
+        assert!(close(s.value_at(time, R).unwrap(), expected));
     }
 
     #[test]
