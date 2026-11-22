@@ -133,37 +133,73 @@ fn twiceintlinfunc(
     dummy * 0.5
 }
 
+// A&S coefficients shared by scalar and parallel endpoint evaluation.
+// Each polynomial retains the original nested multiply/add order.
+const I0_SMALL: [Real; 7] = [
+    1.,
+    3.515_622_9,
+    3.089_942_4,
+    1.206_749_2,
+    0.265_973_2,
+    0.360_768e-1,
+    0.45813e-2,
+];
+const I0_LARGE: [Real; 9] = [
+    0.398_942_28,
+    0.132_859_2e-1,
+    0.225_319e-2,
+    -0.157_565e-2,
+    0.916_281e-2,
+    -0.205_770_6e-1,
+    0.263_553_7e-1,
+    -0.164_763_3e-1,
+    0.392_377e-2,
+];
+const I1_SMALL: [Real; 7] = [
+    0.5,
+    0.878_905_94,
+    0.514_988_69,
+    0.150_849_34,
+    0.265_873_3e-1,
+    0.301_532e-2,
+    0.32411e-3,
+];
+const I1_LARGE: [Real; 9] = [
+    0.398_942_28,
+    -0.398_802_4e-1,
+    -0.362_018e-2,
+    0.163_801e-2,
+    -0.103_155_5e-1,
+    0.228_296_7e-1,
+    -0.289_531_2e-1,
+    0.178_765_4e-1,
+    -0.420_059e-2,
+];
+
+#[inline]
+fn polynomial<T: Copy + std::ops::Mul<Output = T> + std::ops::Add<Output = T>>(
+    y: T,
+    coefficients: &[Real],
+    constant: impl Fn(Real) -> T,
+) -> T {
+    let Some((&last, rest)) = coefficients.split_last() else {
+        return constant(0.);
+    };
+    rest.iter()
+        .rev()
+        .fold(constant(last), |value, &c| constant(c) + y * value)
+}
+
 /// `bessI0` (Abramowitz and Stegun 9.8.1, 9.8.2).
 #[must_use]
 pub fn bess_i0(x: Real) -> Real {
     let ax = x.abs();
     if ax < 3.75 {
-        let mut y = x / 3.75;
-        y *= y;
-        1.0 + y
-            * (3.515_622_9
-                + y * (3.089_942_4
-                    + y * (1.206_749_2 + y * (0.265_973_2 + y * (0.360_768e-1 + y * 0.45813e-2)))))
+        let y = x / 3.75;
+        polynomial(y * y, &I0_SMALL, std::convert::identity)
     } else {
-        let y = 3.75 / ax;
-        (ax.exp() / ax.sqrt())
-            * (0.398_942_28
-                + y * (0.132_859_2e-1
-                    + y * (0.225_319e-2
-                        + y * (-0.157_565e-2
-                            + y * (0.916_281e-2
-                                + y * (-0.205_770_6e-1
-                                    + y * (0.263_553_7e-1
-                                        + y * (-0.164_763_3e-1 + y * 0.392_377e-2))))))))
+        (ax.exp() / ax.sqrt()) * polynomial(3.75 / ax, &I0_LARGE, std::convert::identity)
     }
-}
-
-/// The large-argument series shared by `bessI1` and `bessI1xOverX`.
-fn bess_i1_tail(y: Real) -> Real {
-    let ans = 0.228_296_7e-1 + y * (-0.289_531_2e-1 + y * (0.178_765_4e-1 - y * 0.420_059e-2));
-    0.398_942_28
-        + y * (-0.398_802_4e-1
-            + y * (-0.362_018e-2 + y * (0.163_801e-2 + y * (-0.103_155_5e-1 + y * ans))))
 }
 
 /// `bessI1` (Abramowitz and Stegun 9.8.3, 9.8.4).
@@ -171,16 +207,10 @@ fn bess_i1_tail(y: Real) -> Real {
 pub fn bess_i1(x: Real) -> Real {
     let ax = x.abs();
     let ans = if ax < 3.75 {
-        let mut y = x / 3.75;
-        y *= y;
-        ax * (0.5
-            + y * (0.878_905_94
-                + y * (0.514_988_69
-                    + y * (0.150_849_34
-                        + y * (0.265_873_3e-1 + y * (0.301_532e-2 + y * 0.32411e-3))))))
+        let y = ax / 3.75;
+        ax * polynomial(y * y, &I1_SMALL, std::convert::identity)
     } else {
-        let y = 3.75 / ax;
-        bess_i1_tail(y) * (ax.exp() / ax.sqrt())
+        polynomial(3.75 / ax, &I1_LARGE, std::convert::identity) * (ax.exp() / ax.sqrt())
     };
     if x < 0.0 { -ans } else { ans }
 }
@@ -190,17 +220,57 @@ pub fn bess_i1(x: Real) -> Real {
 pub fn bess_i1_x_over_x(x: Real) -> Real {
     let ax = x.abs();
     if ax < 3.75 {
-        let mut y = x / 3.75;
-        y *= y;
-        0.5 + y
-            * (0.878_905_94
-                + y * (0.514_988_69
-                    + y * (0.150_849_34
-                        + y * (0.265_873_3e-1 + y * (0.301_532e-2 + y * 0.32411e-3)))))
+        let y = ax / 3.75;
+        polynomial(y * y, &I1_SMALL, std::convert::identity)
     } else {
-        let y = 3.75 / ax;
-        bess_i1_tail(y) * (ax.exp() / (ax * ax.sqrt()))
+        polynomial(3.75 / ax, &I1_LARGE, std::convert::identity) * (ax.exp() / (ax * ax.sqrt()))
     }
+}
+
+/// Batch I0 and either I1 or I1/|x|. Large-argument I0/I1 share
+/// the exponential and square root without changing division order.
+/// When adjacent knots straddle the polynomial boundary, fall back
+/// to the scalar laws rather than evaluating both polynomials.
+fn bessel_pair_batch<const DIVIDED: bool>(
+    x: std::simd::f64x4,
+) -> (std::simd::f64x4, std::simd::f64x4) {
+    use std::simd::{Select, StdFloat, cmp::SimdPartialOrd, f64x4, num::SimdFloat};
+    let ax = x.abs();
+    let boundary = f64x4::splat(3.75);
+    let small = ax.simd_lt(boundary);
+    let (i0, i1) = if small.all() {
+        let y = ax / boundary;
+        let y = y * y;
+        let i0 = polynomial(y, &I0_SMALL, f64x4::splat);
+        let i1 = polynomial(y, &I1_SMALL, f64x4::splat);
+        (i0, if DIVIDED { i1 } else { ax * i1 })
+    } else if !small.any() {
+        let y = boundary / ax;
+        let exp = f64x4::from_array(ax.to_array().map(Real::exp));
+        let root = ax.sqrt();
+        let i0 = (exp / root) * polynomial(y, &I0_LARGE, f64x4::splat);
+        let scale = if DIVIDED {
+            exp / (ax * root)
+        } else {
+            exp / root
+        };
+        let i1 = polynomial(y, &I1_LARGE, f64x4::splat) * scale;
+        (i0, i1)
+    } else {
+        let values = x.to_array();
+        return (
+            f64x4::from_array(values.map(bess_i0)),
+            f64x4::from_array(values.map(if DIVIDED { bess_i1_x_over_x } else { bess_i1 })),
+        );
+    };
+    (
+        i0,
+        if DIVIDED {
+            i1
+        } else {
+            x.simd_lt(f64x4::splat(0.)).select(-i1, i1)
+        },
+    )
 }
 
 /// `LTRArlcH2Func`: `h2(t)` of the RLC line, zero before `T`.
@@ -334,6 +404,62 @@ pub fn erfc(x: Real) -> Real {
     (-x * x).exp() / (PI.sqrt() * f)
 }
 
+/// Sum h1', h2 and h3' over the accepted waveform in one reverse pass.
+/// The two port contributions to each kernel are independent: use SIMD
+/// across those contributions, not across chronological terms. Every
+/// accumulator therefore retains the original addition order.
+pub(super) fn history_sums(
+    rows: impl DoubleEndedIterator<Item = [Real; 4]>,
+    weights: &[[Real; 3]],
+    initial: [Real; 4],
+    coupled_end: usize,
+    mut sums: [[Real; 2]; 3],
+) -> [[Real; 2]; 3] {
+    use std::simd::{Select, cmp::SimdPartialEq, f64x2, f64x4};
+    // Entry zero represents the initial conditions. Split the newest,
+    // uncoupled part of an RLC history before processing h2/h3. Before
+    // the propagation delay, only the two h1' port lanes need updating.
+    let count = weights.len().saturating_sub(1);
+    let mut pairs = rows.rev().zip(weights.iter().rev()).take(count);
+    let uncoupled = count.saturating_sub(coupled_end);
+    if uncoupled != 0 {
+        let mut voltage = f64x2::from_array(sums[0]);
+        let initial_voltage = f64x2::from_array([initial[0], initial[2]]);
+        for ([v1, _, v2, _], weight) in pairs.by_ref().take(uncoupled) {
+            if weight[0] != 0.0 {
+                voltage +=
+                    f64x2::splat(weight[0]) * (f64x2::from_array([v1, v2]) - initial_voltage);
+            }
+        }
+        sums[0] = voltage.to_array();
+    }
+    if coupled_end == 0 {
+        return sums;
+    }
+    let [h1, h2, h3] = sums;
+    let mut voltage = f64x4::from_array([h1[0], h1[1], h3[0], h3[1]]);
+    let mut current = f64x2::from_array(h2);
+    let [iv1, ii1, iv2, ii2] = initial;
+    let initial_voltage = f64x4::from_array([iv1, iv2, iv2, iv1]);
+    let initial_current = f64x2::from_array([ii2, ii1]);
+    for ([v1, i1, v2, i2], &[h1, h2, h3]) in pairs {
+        if h1 != 0.0 || h3 != 0.0 {
+            let coefficient = f64x4::from_array([h1, h1, h3, h3]);
+            let delta = f64x4::from_array([v1, v2, v2, v1]) - initial_voltage;
+            // A zero coefficient is skipped, even if delta overflows.
+            // Selection also preserves the accumulator's signed zero.
+            voltage = coefficient
+                .simd_ne(f64x4::splat(0.0))
+                .select(voltage + coefficient * delta, voltage);
+        }
+        if h2 != 0.0 {
+            current += f64x2::splat(h2) * (f64x2::from_array([i2, i1]) - initial_current);
+        }
+    }
+    let [h1a, h1b, h3a, h3b] = voltage.to_array();
+    [[h1a, h1b], current.to_array(), [h3a, h3b]]
+}
+
 /// The coefficients of one convolution step: the factor of the newest
 /// (unknown) sample and the factors of the accepted samples `1..=index`
 /// (entry 0 unused, as in C's lists).
@@ -359,6 +485,143 @@ impl Coefficients {
     }
 }
 
+/// RC endpoint integral laws. The lag is measured backwards from the
+/// proposed time; adjacent endpoints are shared by the divided differences.
+#[derive(Clone, Copy)]
+struct RcKernel {
+    cbyr: Real,
+    rclsqr: Real,
+    root_rclsqr: Real,
+    root_cbyr: Real,
+}
+
+impl RcKernel {
+    fn at(self, lag: Real, active: [bool; 3]) -> [Real; 3] {
+        let h1 = if active[0] {
+            (4. * self.cbyr * lag / PI).sqrt()
+        } else {
+            0.
+        };
+        if !(active[1] || active[2]) || lag == 0. {
+            return [h1, 0., 0.];
+        }
+        let temp = self.rclsqr / (4. * lag);
+        let complement = if temp >= 100. { 0. } else { erfc(temp.sqrt()) };
+        let decay = (-temp).exp();
+        let h2 = if active[1] {
+            (lag + self.rclsqr * 0.5) * complement - (lag * self.rclsqr / PI).sqrt() * decay
+        } else {
+            0.
+        };
+        let h3 = if active[2] {
+            self.root_cbyr * (2. * (lag / PI).sqrt() * decay - self.root_rclsqr * complement)
+        } else {
+            0.
+        };
+        [h1, h2, h3]
+    }
+
+    fn batch(self, lag: [Real; 4]) -> [[Real; 3]; 4] {
+        use std::simd::{Select, StdFloat, cmp::SimdPartialEq, f64x4};
+        let lag = f64x4::from_array(lag);
+        let zero = f64x4::splat(0.);
+        let temp = f64x4::splat(self.rclsqr) / (f64x4::splat(4.) * lag);
+        let complement = rc_erfc_batch(temp);
+        let decay = f64x4::from_array((-temp).to_array().map(Real::exp));
+        let h1 = (f64x4::splat(4. * self.cbyr) * lag / f64x4::splat(PI)).sqrt();
+        let nonzero = lag.simd_ne(zero);
+        let h2 = nonzero.select(
+            (lag + f64x4::splat(self.rclsqr * 0.5)) * complement
+                - (lag * f64x4::splat(self.rclsqr) / f64x4::splat(PI)).sqrt() * decay,
+            zero,
+        );
+        let h3 = nonzero.select(
+            f64x4::splat(self.root_cbyr)
+                * (f64x4::splat(2.) * (lag / f64x4::splat(PI)).sqrt() * decay
+                    - f64x4::splat(self.root_rclsqr) * complement),
+            zero,
+        );
+        let [h1, h2, h3] = [h1.to_array(), h2.to_array(), h3.to_array()];
+        std::array::from_fn(|i| [h1[i], h2[i], h3[i]])
+    }
+}
+
+/// Independent nonnegative RC erfc arguments in a batch. Each lane follows
+/// the scalar recurrence and stops at its own convergence test. On a
+/// mixed-regime or invalid batch, use the scalar reference instead.
+fn rc_erfc_batch(temp: std::simd::f64x4) -> std::simd::f64x4 {
+    use std::simd::{
+        Select, StdFloat,
+        cmp::{SimdPartialEq, SimdPartialOrd},
+        f64x4,
+        num::SimdFloat,
+    };
+    let zero = f64x4::splat(0.);
+    let one = f64x4::splat(1.);
+    let two = f64x4::splat(2.);
+    let cutoff = temp.simd_ge(f64x4::splat(100.));
+    let valid = temp.simd_ge(zero);
+    if !valid.all() {
+        return f64x4::from_array(
+            temp.to_array()
+                .map(|x| if x >= 100. { 0. } else { erfc(x.sqrt()) }),
+        );
+    }
+    if cutoff.all() {
+        return zero;
+    }
+    let x = temp.sqrt();
+    let series = x.simd_lt(two) & !cutoff;
+    let continued = !series & !cutoff;
+    let result = if series.any() && continued.any() {
+        return f64x4::from_array(
+            temp.to_array()
+                .map(|x| if x >= 100. { 0. } else { erfc(x.sqrt()) }),
+        );
+    } else if series.any() {
+        let x = cutoff.select(zero, x);
+        let x2 = x * x;
+        let mut term = x;
+        let mut sum = x;
+        let mut active = series;
+        for n in 1..=201 {
+            let n = Real::from(n);
+            term *= -x2 / f64x4::splat(n);
+            let add = term / f64x4::splat(2. * n + 1.);
+            sum = active.select(sum + add, sum);
+            active &= add.abs().simd_gt(f64x4::splat(1e-17) * sum.abs());
+            if !active.any() {
+                break;
+            }
+        }
+        one - f64x4::splat(2. / PI.sqrt()) * sum
+    } else {
+        let x = cutoff.select(two, x);
+        let tiny = f64x4::splat(1e-300);
+        let mut f = x;
+        let mut c = f;
+        let mut d = zero;
+        let mut active = continued;
+        for n in 1..=500 {
+            let a = f64x4::splat(Real::from(n) / 2.);
+            d = x + a * d;
+            d = d.simd_eq(zero).select(tiny, d);
+            c = x + a / c;
+            c = c.simd_eq(zero).select(tiny, c);
+            d = one / d;
+            let delta = c * d;
+            f = active.select(f * delta, f);
+            active &= (delta - one).abs().simd_ge(f64x4::splat(1e-16));
+            if !active.any() {
+                break;
+            }
+        }
+        let numerator = f64x4::from_array((-x * x).to_array().map(Real::exp));
+        numerator / (f64x4::splat(PI.sqrt()) * f)
+    };
+    cutoff.select(zero, result)
+}
+
 /// `LTRArcCoeffsSetup` (the `L = G = 0` line): coefficients at `curtime` over
 /// the accepted times `times[0..=index]`, with C's chopping tolerance
 /// `reltol` (C's `LTRAchopReltol`, always 0 from a deck).
@@ -372,95 +635,51 @@ pub fn rc_coefficients(
 ) -> Coefficients {
     let index = times.len() - 1;
     let mut out = Coefficients::with_len(times.len());
-    let (mut doh1, mut doh2, mut doh3) = (true, true, true);
-
-    let mut delta1 = curtime - times[index];
-    let mut hilimit1 = delta1;
-
-    let mut h1hivalue1 = (4. * cbyr * hilimit1 / PI).sqrt();
-    let mut h1dummy1 = h1hivalue1 / delta1;
-    out.first[0] = h1dummy1;
-    let h1relval = (h1dummy1 * reltol).abs();
-
-    let mut temp = rclsqr / (4. * hilimit1);
-    let mut temp2 = if temp >= 100.0 {
-        0.0
-    } else {
-        erfc(temp.sqrt())
+    let kernel = RcKernel {
+        cbyr,
+        rclsqr,
+        root_rclsqr: rclsqr.sqrt(),
+        root_cbyr: cbyr.sqrt(),
     };
-    let mut temp3 = (-temp).exp();
-    let temp4 = rclsqr.sqrt();
-    let temp5 = cbyr.sqrt();
+    let mut active = [true; 3];
+    let lag = curtime - times[index];
+    let mut previous = kernel.at(lag, active);
+    let mut slopes = previous.map(|value| value / lag);
+    out.first = slopes;
+    let thresholds = slopes.map(|slope| (slope * reltol).abs());
 
-    let h2value = |hilimit: Real, temp2: Real, temp3: Real| {
-        if hilimit == 0.0 {
-            0.0
+    // RC uses a strict '<' chopping test. With zero tolerance no kernel
+    // can stop early, so these independent endpoints can be batched.
+    // Keep the scalar path for nonzero chopping and an incomplete batch.
+    'chunks: for (chunk_index, chunk) in out.weights[1..].rchunks_mut(4).enumerate() {
+        let newest = index - chunk_index * 4;
+        let batch = if reltol == 0. && chunk.len() == 4 {
+            Some(kernel.batch(std::array::from_fn(|lane| {
+                curtime - times[newest - lane - 1]
+            })))
         } else {
-            (hilimit + rclsqr * 0.5) * temp2 - (hilimit * rclsqr / PI).sqrt() * temp3
-        }
-    };
-    let h3value = |hilimit: Real, temp2: Real, temp3: Real| {
-        if hilimit == 0.0 {
-            0.0
-        } else {
-            temp5 * (2. * (hilimit / PI).sqrt() * temp3 - temp4 * temp2)
-        }
-    };
-
-    let mut h2hivalue1 = h2value(hilimit1, temp2, temp3);
-    let mut h2dummy1 = h2hivalue1 / delta1;
-    out.first[1] = h2dummy1;
-    let h2relval = (h2dummy1 * reltol).abs();
-
-    let mut h3hivalue1 = h3value(hilimit1, temp2, temp3);
-    let mut h3dummy1 = h3hivalue1 / delta1;
-    out.first[2] = h3dummy1;
-    let h3relval = (h3dummy1 * reltol).abs();
-
-    for i in (1..=index).rev() {
-        delta1 = times[i] - times[i - 1];
-        hilimit1 = curtime - times[i - 1];
-
-        if doh1 {
-            let h1hivalue2 = h1hivalue1;
-            let h1dummy2 = h1dummy1;
-            let h1lovalue1 = h1hivalue2;
-            h1hivalue1 = (4. * cbyr * hilimit1 / PI).sqrt();
-            h1dummy1 = (h1hivalue1 - h1lovalue1) / delta1;
-            out.weights[i][0] = h1dummy1 - h1dummy2;
-            if out.weights[i][0].abs() < h1relval {
-                doh1 = false;
+            None
+        };
+        for (lane, weight) in chunk.iter_mut().rev().enumerate() {
+            if !active.iter().any(|&enabled| enabled) {
+                break 'chunks;
             }
-        }
-        if doh2 || doh3 {
-            temp = rclsqr / (4. * hilimit1);
-            temp2 = if temp >= 100.0 {
-                0.0
-            } else {
-                erfc(temp.sqrt())
-            };
-            temp3 = (-temp).exp();
-        }
-        if doh2 {
-            let h2hivalue2 = h2hivalue1;
-            let h2dummy2 = h2dummy1;
-            let h2lovalue1 = h2hivalue2;
-            h2hivalue1 = h2value(hilimit1, temp2, temp3);
-            h2dummy1 = (h2hivalue1 - h2lovalue1) / delta1;
-            out.weights[i][1] = h2dummy1 - h2dummy2;
-            if out.weights[i][1].abs() < h2relval {
-                doh2 = false;
-            }
-        }
-        if doh3 {
-            let h3hivalue2 = h3hivalue1;
-            let h3dummy2 = h3dummy1;
-            let h3lovalue1 = h3hivalue2;
-            h3hivalue1 = h3value(hilimit1, temp2, temp3);
-            h3dummy1 = (h3hivalue1 - h3lovalue1) / delta1;
-            out.weights[i][2] = h3dummy1 - h3dummy2;
-            if out.weights[i][2].abs() < h3relval {
-                doh3 = false;
+            let i = newest - lane;
+            let endpoint = batch.as_ref().map_or_else(
+                || kernel.at(curtime - times[i - 1], active),
+                |values| values[lane],
+            );
+            let delta = times[i] - times[i - 1];
+            for k in 0..3 {
+                if active[k] {
+                    let slope = (endpoint[k] - previous[k]) / delta;
+                    weight[k] = slope - slopes[k];
+                    previous[k] = endpoint[k];
+                    slopes[k] = slope;
+                    if weight[k].abs() < thresholds[k] {
+                        active[k] = false;
+                    }
+                }
             }
         }
     }
@@ -490,6 +709,134 @@ fn rlc_aux_index(t: Real, curtime: Real, times: &VecDeque<Real>) -> usize {
     }
 }
 
+fn rlc_self_endpoint(lag: Real, beta: Real, exponent: Real, decay: Real) -> Real {
+    if beta == 0. {
+        lag
+    } else if lag == 0. {
+        0.
+    } else {
+        (bess_i1(-exponent) + bess_i0(-exponent)) * lag * decay - lag
+    }
+}
+
+// With no accepted samples beyond the propagation delay, only the local
+// kernel contributes. A short history cannot amortize the batched setup.
+fn short_self_coefficients(
+    beta: Real,
+    curtime: Real,
+    times: &VecDeque<Real>,
+    reltol: Real,
+    out: &mut Coefficients,
+) {
+    let endpoint = |lag| {
+        let exponent = -beta * lag;
+        rlc_self_endpoint(lag, beta, exponent, exponent.exp())
+    };
+    let index = times.len() - 1;
+    let lag = curtime - times[index];
+    let mut previous = endpoint(lag);
+    let mut slope = previous / lag;
+    out.first[0] = slope;
+    let threshold = (slope * reltol).abs();
+    for i in (1..=index).rev() {
+        let current = endpoint(curtime - times[i - 1]);
+        let next_slope = (current - previous) / (times[i] - times[i - 1]);
+        let weight = next_slope - slope;
+        out.weights[i][0] = weight;
+        if weight.abs() <= threshold {
+            break;
+        }
+        previous = current;
+        slope = next_slope;
+    }
+}
+
+/// Independent endpoint fields needed by the RLC divided differences.
+/// The recurrence, delayed auxiliary index and chopping remain scalar.
+#[derive(Clone, Copy)]
+struct RlcKernels {
+    delay: Real,
+    alpha: Real,
+    beta: Real,
+    alpha_squared_delay: Real,
+    delay_decay: Real,
+}
+
+impl RlcKernels {
+    fn at(self, lag: Real, active: [bool; 3]) -> [Real; 3] {
+        let exponent = -self.beta * lag;
+        let decay = exponent.exp();
+        let h1 = if active[0] {
+            rlc_self_endpoint(lag, self.beta, exponent, decay)
+        } else {
+            0.
+        };
+        if !(active[1] || active[2]) {
+            return [h1, 0., 0.];
+        }
+        let argument = if lag > self.delay {
+            self.alpha * (lag * lag - self.delay * self.delay).sqrt()
+        } else {
+            0.
+        };
+        let h2 = if !active[1] || self.alpha == 0. || lag < self.delay {
+            0.
+        } else {
+            self.alpha_squared_delay * decay * bess_i1_x_over_x(argument)
+        };
+        let h3 = if !active[2] || lag <= self.delay || self.beta == 0. {
+            0.
+        } else {
+            decay * bess_i0(argument) - self.delay_decay
+        };
+        [h1, h2, h3]
+    }
+
+    fn batch(self, lags: [Real; 4], active: [bool; 3]) -> [[Real; 3]; 4] {
+        use std::simd::{
+            Select, StdFloat,
+            cmp::{SimdPartialEq, SimdPartialOrd},
+            f64x4,
+        };
+        let lag = f64x4::from_array(lags);
+        let zero = f64x4::splat(0.);
+        let exponent = f64x4::splat(-self.beta) * lag;
+        let decay = f64x4::from_array(exponent.to_array().map(Real::exp));
+        let h1 = if !active[0] {
+            zero
+        } else if self.beta == 0. {
+            lag
+        } else {
+            let (i0, i1) = bessel_pair_batch::<false>(-exponent);
+            lag.simd_eq(zero)
+                .select(zero, (i1 + i0) * lag * decay - lag)
+        };
+        let mut h2 = zero;
+        let mut h3 = zero;
+        if active[1] || active[2] {
+            let transit = f64x4::splat(self.delay);
+            let beyond = lag.simd_gt(transit);
+            let argument = beyond.select(
+                f64x4::splat(self.alpha) * (lag * lag - transit * transit).sqrt(),
+                zero,
+            );
+            let (i0, divided_i1) = bessel_pair_batch::<true>(argument);
+            if active[1] && self.alpha != 0. {
+                h2 = (!lag.simd_lt(transit)).select(
+                    f64x4::splat(self.alpha_squared_delay) * decay * divided_i1,
+                    zero,
+                );
+            }
+            if active[2] && self.beta != 0. {
+                h3 = (!lag.simd_le(transit))
+                    .select(decay * i0 - f64x4::splat(self.delay_decay), zero);
+            }
+        }
+        let [h1, h2, h3] = [h1.to_array(), h2.to_array(), h3.to_array()];
+        std::array::from_fn(|i| [h1[i], h2[i], h3[i]])
+    }
+}
+
 /// `LTRArlcCoeffsSetup` (the `G = 0` RLC line): coefficients at `curtime`
 /// over the accepted times `times[0..=index]`, with delay `t`, `alpha`,
 /// `beta` and C's chopping tolerance `reltol` (always 0 from a deck).
@@ -515,152 +862,114 @@ pub fn rlc_coefficients(
     let (mut doh1, mut doh2, mut doh3) = (true, true, true);
 
     let aux = rlc_aux_index(t, curtime, times);
-
-    let mut h2lovalue1 = 0.0;
-    let mut h2hivalue1 = 0.0;
-    let mut h2dummy1 = 0.0;
-    let mut h3hivalue1 = 0.0;
-    let mut h3dummy1 = 0.0;
-    let mut alphasq_t = 0.0;
-    let mut exp_beta_t = 0.0;
-    let mut h2relval = 0.0;
-    let mut h3relval = 0.0;
-    let mut besselarg;
-
-    if aux != 0 {
-        let lolimit1 = t;
-        let hilimit1 = curtime - times[aux];
-        let delta1 = hilimit1 - lolimit1;
-
-        h2lovalue1 = rlc_h2(t, t, alpha, beta);
-        besselarg = if hilimit1 > t {
-            alpha * (hilimit1 * hilimit1 - t * t).sqrt()
-        } else {
-            0.0
-        };
-        let expterm = (-beta * hilimit1).exp();
-        let bessi1overxterm = bess_i1_x_over_x(besselarg);
-        alphasq_t = alpha * alpha * t;
-        h2hivalue1 = if alpha == 0.0 || hilimit1 < t {
-            0.0
-        } else {
-            alphasq_t * expterm * bessi1overxterm
-        };
-        h2dummy1 = twiceintlinfunc(
-            lolimit1, hilimit1, lolimit1, h2lovalue1, h2hivalue1, lolimit1, hilimit1,
-        ) / delta1;
-        out.first[1] = h2dummy1;
-        h2relval = (reltol * h2dummy1).abs();
-
-        let h3lovalue1 = 0.0; // E3dash is consistent with this (C).
-        let bessi0term = bess_i0(besselarg);
-        exp_beta_t = (-beta * t).exp();
-        h3hivalue1 = if hilimit1 <= t || beta == 0.0 {
-            0.0
-        } else {
-            expterm * bessi0term - exp_beta_t
-        };
-        h3dummy1 = intlinfunc(
-            lolimit1, hilimit1, h3lovalue1, h3hivalue1, lolimit1, hilimit1,
-        ) / delta1;
-        out.first[2] = h3dummy1;
-        h3relval = (h3dummy1 * reltol).abs();
+    if aux == 0 && index < 32 {
+        short_self_coefficients(beta, curtime, times, reltol, &mut out);
+        return out;
     }
 
-    let h1value = |hilimit: Real, exparg: Real, expterm: Real| {
-        if beta == 0.0 {
-            hilimit
-        } else if hilimit == 0.0 {
-            0.0
-        } else {
-            (bess_i1(-exparg) + bess_i0(-exparg)) * hilimit * expterm - hilimit
-        }
+    let kernels = RlcKernels {
+        delay: t,
+        alpha,
+        beta,
+        alpha_squared_delay: alpha * alpha * t,
+        delay_decay: (-beta * t).exp(),
     };
+    let [
+        mut h2lovalue1,
+        mut h2hivalue1,
+        mut h2dummy1,
+        mut h3hivalue1,
+        mut h3dummy1,
+    ] = if aux != 0 {
+        let hilimit = curtime - times[aux];
+        let delta = hilimit - t;
+        let h2low = rlc_h2(t, t, alpha, beta);
+        let [_, h2high, h3high] = kernels.at(hilimit, [false, true, true]);
+        let h2first = twiceintlinfunc(t, hilimit, t, h2low, h2high, t, hilimit) / delta;
+        // E3dash is zero at TD (C).
+        let h3first = intlinfunc(t, hilimit, 0., h3high, t, hilimit) / delta;
+        [h2low, h2high, h2first, h3high, h3first]
+    } else {
+        [0.; 5]
+    };
+    out.first[1] = h2dummy1;
+    out.first[2] = h3dummy1;
+    let h2relval = (reltol * h2dummy1).abs();
+    let h3relval = (h3dummy1 * reltol).abs();
 
     let mut lolimit1 = 0.0;
     let mut hilimit1 = curtime - times[index];
     let mut delta1 = hilimit1 - lolimit1;
-    let mut exparg = -beta * hilimit1;
-    let mut expterm = exparg.exp();
-
-    let mut h1lovalue1;
-    let mut h1hivalue1 = h1value(hilimit1, exparg, expterm);
+    let mut h1hivalue1 = kernels.at(hilimit1, [true, false, false])[0];
     let mut h1dummy1 = h1hivalue1 / delta1;
     out.first[0] = h1dummy1;
     let h1relval = (h1dummy1 * reltol).abs();
 
-    let mut lolimit2;
-    let mut hilimit2 = 0.0;
-    lolimit2 = 0.0;
-
-    for i in (1..=index).rev() {
-        if doh1 || doh2 || doh3 {
-            lolimit2 = lolimit1;
-            hilimit2 = hilimit1;
+    'chunks: for (chunk_index, chunk) in out.weights[1..].rchunks_mut(4).enumerate() {
+        let newest = index - chunk_index * 4;
+        let batch = if reltol == 0. && chunk.len() == 4 {
+            let coupled = newest - (chunk.len() - 1) <= aux;
+            Some(kernels.batch(
+                std::array::from_fn(|lane| curtime - times[newest - lane - 1]),
+                [doh1, doh2 && coupled, doh3 && coupled],
+            ))
+        } else {
+            None
+        };
+        for (lane, weight) in chunk.iter_mut().rev().enumerate() {
+            if !(doh1 || doh2 || doh3) {
+                break 'chunks;
+            }
+            let i = newest - lane;
+            let lolimit2 = lolimit1;
+            let hilimit2 = hilimit1;
             lolimit1 = hilimit2;
             hilimit1 = curtime - times[i - 1];
             delta1 = times[i] - times[i - 1];
-            exparg = -beta * hilimit1;
-            expterm = exparg.exp();
-        }
-        if doh1 {
-            let h1hivalue2 = h1hivalue1;
-            let h1dummy2 = h1dummy1;
-            h1lovalue1 = h1hivalue2;
-            h1hivalue1 = h1value(hilimit1, exparg, expterm);
-            h1dummy1 = (h1hivalue1 - h1lovalue1) / delta1;
-            out.weights[i][0] = h1dummy1 - h1dummy2;
-            if out.weights[i][0].abs() <= h1relval {
-                doh1 = false;
-            }
-        }
-        if i <= aux {
-            besselarg = 0.0;
-            if doh2 || doh3 {
-                besselarg = if hilimit1 > t {
-                    alpha * (hilimit1 * hilimit1 - t * t).sqrt()
-                } else {
-                    0.0
-                };
-            }
-            if doh2 {
-                let h2lovalue2 = h2lovalue1;
-                let h2hivalue2 = h2hivalue1;
-                let h2dummy2 = h2dummy1;
-                h2lovalue1 = h2hivalue2;
-                let bessi1overxterm = bess_i1_x_over_x(besselarg);
-                h2hivalue1 = if alpha == 0.0 || hilimit1 < t {
-                    0.0
-                } else {
-                    alphasq_t * expterm * bessi1overxterm
-                };
-                h2dummy1 = twiceintlinfunc(
-                    lolimit1, hilimit1, lolimit1, h2lovalue1, h2hivalue1, lolimit1, hilimit1,
-                ) / delta1;
-                out.weights[i][1] = h2dummy1 - h2dummy2
-                    + intlinfunc(
-                        lolimit2, hilimit2, h2lovalue2, h2hivalue2, lolimit2, hilimit2,
-                    );
-                if out.weights[i][1].abs() <= h2relval {
-                    doh2 = false;
+
+            let endpoint = batch.as_ref().map_or_else(
+                || kernels.at(hilimit1, [doh1, doh2 && i <= aux, doh3 && i <= aux]),
+                |values| values[lane],
+            );
+            if doh1 {
+                let h1lovalue1 = h1hivalue1;
+                let h1dummy2 = h1dummy1;
+                h1hivalue1 = endpoint[0];
+                h1dummy1 = (h1hivalue1 - h1lovalue1) / delta1;
+                weight[0] = h1dummy1 - h1dummy2;
+                if weight[0].abs() <= h1relval {
+                    doh1 = false;
                 }
             }
-            if doh3 {
-                let h3hivalue2 = h3hivalue1;
-                let h3dummy2 = h3dummy1;
-                let h3lovalue1 = h3hivalue2;
-                let bessi0term = bess_i0(besselarg);
-                h3hivalue1 = if hilimit1 <= t || beta == 0.0 {
-                    0.0
-                } else {
-                    expterm * bessi0term - exp_beta_t
-                };
-                h3dummy1 = intlinfunc(
-                    lolimit1, hilimit1, h3lovalue1, h3hivalue1, lolimit1, hilimit1,
-                ) / delta1;
-                out.weights[i][2] = h3dummy1 - h3dummy2;
-                if out.weights[i][2].abs() <= h3relval {
-                    doh3 = false;
+            if i <= aux {
+                if doh2 {
+                    let h2lovalue2 = h2lovalue1;
+                    let h2hivalue2 = h2hivalue1;
+                    let h2dummy2 = h2dummy1;
+                    h2lovalue1 = h2hivalue2;
+                    h2hivalue1 = endpoint[1];
+                    h2dummy1 = twiceintlinfunc(
+                        lolimit1, hilimit1, lolimit1, h2lovalue1, h2hivalue1, lolimit1, hilimit1,
+                    ) / delta1;
+                    weight[1] = h2dummy1 - h2dummy2
+                        + intlinfunc(
+                            lolimit2, hilimit2, h2lovalue2, h2hivalue2, lolimit2, hilimit2,
+                        );
+                    if weight[1].abs() <= h2relval {
+                        doh2 = false;
+                    }
+                }
+                if doh3 {
+                    let h3lovalue1 = h3hivalue1;
+                    let h3dummy2 = h3dummy1;
+                    h3hivalue1 = endpoint[2];
+                    h3dummy1 = intlinfunc(
+                        lolimit1, hilimit1, h3lovalue1, h3hivalue1, lolimit1, hilimit1,
+                    ) / delta1;
+                    weight[2] = h3dummy1 - h3dummy2;
+                    if weight[2].abs() <= h3relval {
+                        doh3 = false;
+                    }
                 }
             }
         }
@@ -672,6 +981,107 @@ pub fn rlc_coefficients(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_same(got: Real, expected: Real) {
+        if expected.is_nan() {
+            assert!(got.is_nan(), "{got}");
+        } else {
+            assert_eq!(got.to_bits(), expected.to_bits(), "{got:e} vs {expected:e}");
+        }
+    }
+
+    #[test]
+    fn vector_endpoints_match_the_scalar_laws_at_boundaries() {
+        use std::simd::f64x4;
+        // Distinct stopping iterations, series/continued fraction split,
+        // the RC cutoff, nonphysical inputs and nonfinite propagation.
+        for batch in [
+            [0., 0.01, 0.5, 3.999_999_999],
+            [4., 4.1, 16., 99.999_999],
+            [0.25, 4., 100., Real::INFINITY],
+            [-1., Real::NAN, 0., 1.],
+            [99.9, 100., 100.1, Real::INFINITY],
+        ] {
+            let got = rc_erfc_batch(f64x4::from_array(batch)).to_array();
+            for (value, temp) in got.into_iter().zip(batch) {
+                assert_same(value, if temp >= 100. { 0. } else { erfc(temp.sqrt()) });
+            }
+        }
+        for batch in [
+            [-0., 0.125, -1.5, 3.75f64.next_down()],
+            [-3.75, 3.75, 12., 30.],
+            [0., 3.75, -0.5, -4.],
+            [670., 709., 720., Real::INFINITY],
+        ] {
+            let x = f64x4::from_array(batch);
+            let (i0, i1) = bessel_pair_batch::<false>(x);
+            let (i0_divided, divided) = bessel_pair_batch::<true>(x);
+            for (i, value) in batch.into_iter().enumerate() {
+                assert_same(i0[i], bess_i0(value));
+                assert_same(i0_divided[i], bess_i0(value));
+                assert_same(i1[i], bess_i1(value));
+                assert_same(divided[i], bess_i1_x_over_x(value));
+            }
+        }
+        let rc = RcKernel {
+            cbyr: 1e-12,
+            rclsqr: 4e-8,
+            root_rclsqr: 4e-8f64.sqrt(),
+            root_cbyr: 1e-12f64.sqrt(),
+        };
+        for lags in [
+            [0., 1e-12, 1e-10, 1e-8],
+            [1e-9, 2e-9, 3e-9, 4e-9],
+            [1e-7, 1e-6, 1e-5, 1e-4],
+        ] {
+            for (vector, lag) in rc.batch(lags).into_iter().zip(lags) {
+                for (got, expected) in vector.into_iter().zip(rc.at(lag, [true; 3])) {
+                    assert_same(got, expected);
+                }
+            }
+        }
+        for (delay, alpha, beta) in [
+            (5e-9, 2e7, 2e7),
+            (5e-9, 0., 2e7),
+            (5e-9, 2e7, 0.),
+            (0., 2e7, 2e7),
+        ] {
+            let kernels = RlcKernels {
+                delay,
+                alpha,
+                beta,
+                alpha_squared_delay: alpha * alpha * delay,
+                delay_decay: (-beta * delay).exp(),
+            };
+            for lags in [
+                [0., delay.next_down(), delay, delay.next_up()],
+                [1e-8, 2e-8, 3e-8, 4e-8],
+                [2e-7, 4e-7, 8e-7, 1e-6],
+            ] {
+                for (vector, lag) in kernels.batch(lags, [true; 3]).into_iter().zip(lags) {
+                    let exponent = -beta * lag;
+                    let decay = exponent.exp();
+                    let h1 = if beta == 0. {
+                        lag
+                    } else if lag == 0. {
+                        0.
+                    } else {
+                        (bess_i1(-exponent) + bess_i0(-exponent)) * lag * decay - lag
+                    };
+                    let h2 = rlc_h2(lag, delay, alpha, beta);
+                    let h3 = if lag <= delay || beta == 0. {
+                        0.
+                    } else {
+                        decay * bess_i0(alpha * (lag * lag - delay * delay).sqrt())
+                            - (-beta * delay).exp()
+                    };
+                    for (got, expected) in vector.into_iter().zip([h1, h2, h3]) {
+                        assert_same(got, expected);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn erfc_matches_reference_values() {
