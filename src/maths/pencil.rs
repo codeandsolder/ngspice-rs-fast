@@ -14,10 +14,10 @@
 //!
 //! C's file-scope state (`CKTpzTrapped`, `NIpzK`, the guess bounds, move
 //! history) lives in `Search`; `Last_Move` starts at zero for each search
-//! instead of carrying over from a previous one. C's warnings (iteration limit,
-//! numerical aberrations) go to standard error and the roots found so far are
-//! returned, as in C; a determinant that vanishes at every trial is C's
-//! `E_SHORT`.
+//! instead of carrying over from a previous one. C's iteration-limit warning
+//! goes to standard error and the roots found so far are returned, as in C.
+//! The reference's aberration flag has no producer and its flatness counter is
+//! debug-only. A determinant that vanishes at every trial is C's `E_SHORT`.
 
 // C-compatible numerical expressions are kept in their reference order:
 // Clippy's fused multiply-add suggestions change IEEE-754 rounding.
@@ -197,32 +197,6 @@ impl PencilLoad {
 }
 
 const NITER_LIM: usize = 200;
-
-const SHIFT_LEFT: u8 = 2;
-const SHIFT_RIGHT: u8 = 3;
-const SKIP_LEFT: u8 = 4;
-const SKIP_RIGHT: u8 = 5;
-const INIT: u8 = 6;
-const GUESS: u8 = 7;
-const SPLIT_LEFT: u8 = 8;
-const SPLIT_RIGHT: u8 = 9;
-const MULLER: u8 = 10;
-const SYM: u8 = 11;
-const SYM2: u8 = 12;
-const COMPLEX_INIT: u8 = 13;
-const COMPLEX_GUESS: u8 = 14;
-
-const NEAR_LEFT: u8 = 4;
-const MID_LEFT: u8 = 5;
-const FAR_LEFT: u8 = 6;
-const NEAR_RIGHT: u8 = 7;
-const FAR_RIGHT: u8 = 8;
-const MID_RIGHT: u8 = 9;
-
-const ISAROOT: u8 = 2;
-const ISAREPEAT: u8 = 4;
-const ISANABERRATION: u8 = 8;
-const ISAMINIMA: u8 = 16;
 
 /// `SPcomplex` arithmetic with the exact C macro formulas (`complex.h`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -447,19 +421,488 @@ fn base2_determinant(mantissa: Complex, p: i32) -> SpiceResult<(Cx, i64)> {
     Ok((Cx::new(re * shift, im * shift), exponent))
 }
 
-#[derive(Debug, Clone)]
+/// Stable identity of a linked trial. IDs are allocated by the arena and
+/// never reused, including after a trial is pruned during deflation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrialId(usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrialKind {
+    Sample,
+    Minimum,
+    Root(std::num::NonZeroU32),
+}
+
+#[derive(Debug, Clone, Copy)]
 struct Trial {
     s: Cx,
     f_def: Cx,
     mag_def: i64,
-    multiplicity: u32,
-    flags: u8,
+    kind: TrialKind,
     count: u32,
-    next: Option<usize>,
-    prev: Option<usize>,
+    next: Option<TrialId>,
+    prev: Option<TrialId>,
 }
 
-type Set = [Option<usize>; 3];
+impl Trial {
+    const fn new(s: Cx, f_def: Cx, mag_def: i64, kind: TrialKind) -> Self {
+        Self {
+            s,
+            f_def,
+            mag_def,
+            kind,
+            count: 0,
+            next: None,
+            prev: None,
+        }
+    }
+
+    const fn multiplicity(&self) -> u32 {
+        match self.kind {
+            TrialKind::Root(multiplicity) => multiplicity.get(),
+            TrialKind::Sample | TrialKind::Minimum => 0,
+        }
+    }
+
+    const fn is_root(&self) -> bool {
+        matches!(self.kind, TrialKind::Root(_))
+    }
+}
+
+fn invalid_trial() -> crate::primitives::SpiceError {
+    numerical("pole-zero search", "invalid or removed trial identity")
+}
+
+/// Owns linked trials and their sorted traversal. A proposed frequency
+/// stays outside the arena until it is evaluated and linked; collisions
+/// may return an existing ID without allocating an abandoned candidate.
+#[derive(Default)]
+struct TrialArena {
+    entries: Vec<Option<Trial>>,
+    head: Option<TrialId>,
+    anchor: Option<TrialId>,
+}
+
+impl TrialArena {
+    fn get(&self, id: TrialId) -> SpiceResult<&Trial> {
+        self.entries
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .ok_or_else(invalid_trial)
+    }
+
+    fn get_mut(&mut self, id: TrialId) -> SpiceResult<&mut Trial> {
+        self.entries
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .ok_or_else(invalid_trial)
+    }
+
+    fn insert_after(&mut self, prev: Option<TrialId>, mut trial: Trial) -> SpiceResult<TrialId> {
+        let next = match prev {
+            Some(id) => self.get(id)?.next,
+            None => self.head,
+        };
+        // Validate both links before changing the list.
+        if let Some(id) = next {
+            self.get(id)?;
+        }
+        let id = TrialId(self.entries.len());
+        trial.prev = prev;
+        trial.next = next;
+        self.entries.push(Some(trial));
+        if let Some(prev) = prev {
+            self.get_mut(prev)?.next = Some(id);
+        } else {
+            self.head = Some(id);
+        }
+        if let Some(next) = next {
+            self.get_mut(next)?.prev = Some(id);
+        } else if prev.is_none() {
+            self.anchor = Some(id);
+        }
+        Ok(id)
+    }
+
+    fn remove(&mut self, id: TrialId) -> SpiceResult<()> {
+        let Trial { prev, next, .. } = *self.get(id)?;
+        if let Some(prev) = prev {
+            self.get_mut(prev)?.next = next;
+        } else {
+            self.head = next;
+        }
+        if let Some(next) = next {
+            self.get_mut(next)?.prev = prev;
+        }
+        if self.anchor == Some(id) {
+            self.anchor = next.or(prev);
+        }
+        self.entries[id.0] = None;
+        Ok(())
+    }
+
+    fn triple(&self, ids: Triple) -> SpiceResult<[&Trial; 3]> {
+        Ok([
+            self.get(ids.left)?,
+            self.get(ids.middle)?,
+            self.get(ids.right)?,
+        ])
+    }
+
+    fn frequency(&self, id: TrialId) -> SpiceResult<Cx> {
+        Ok(self.get(id)?.s)
+    }
+
+    fn seek(&self, start: Option<TrialId>, direction: Seek) -> SpiceResult<Option<TrialId>> {
+        let mut current = start;
+        if direction != Seek::Anchor {
+            current = self.neighbor(current, direction)?;
+        }
+        while let Some(id) = current {
+            if self.get(id)?.kind == TrialKind::Sample {
+                return Ok(Some(id));
+            }
+            current = self.neighbor(current, direction)?;
+        }
+        Ok(None)
+    }
+
+    fn neighbor(&self, id: Option<TrialId>, direction: Seek) -> SpiceResult<Option<TrialId>> {
+        id.map_or(Ok(None), |id| {
+            let t = self.get(id)?;
+            Ok(match direction {
+                Seek::Left => t.prev,
+                Seek::Right | Seek::Anchor => t.next,
+            })
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seek {
+    Left,
+    Anchor,
+    Right,
+}
+
+impl From<Side> for Seek {
+    fn from(side: Side) -> Self {
+        match side {
+            Side::Left => Self::Left,
+            Side::Right => Self::Right,
+        }
+    }
+}
+
+impl Seek {
+    const fn guess(self) -> Real {
+        match self {
+            Self::Left => -1.0,
+            Self::Anchor => 0.0,
+            Self::Right => 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Move {
+    None,
+    Near(Side),
+    Mid(Side),
+    Far(Side),
+}
+
+impl Move {
+    fn split_side(self) -> SpiceResult<Side> {
+        match self {
+            Self::Mid(Side::Left) | Self::Near(Side::Right) => Ok(Side::Left),
+            Self::Mid(Side::Right) | Self::Near(Side::Left) => Ok(Side::Right),
+            Self::None | Self::Far(_) => Err(numerical(
+                "pole-zero search",
+                "trapped search has no usable last move (C calls controlled_exit)",
+            )),
+        }
+    }
+}
+
+/// The three numerical regions C denotes by CKTpzTrapped = 1, 2, 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Region {
+    LeftCrossing,
+    RightCrossing,
+    Minimum,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trap {
+    Free,
+    Bracket(Region),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Triple {
+    left: TrialId,
+    middle: TrialId,
+    right: TrialId,
+}
+
+/// A temporary representation of C's three slots, used only to make list
+/// transitions. The persistent neighborhood below is classified before a
+/// strategy can consume it. In particular a complete bracket cannot lack a
+/// required point, and a complex seed is distinct from a Muller triple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Window {
+    left: Option<TrialId>,
+    middle: Option<TrialId>,
+    right: Option<TrialId>,
+}
+
+impl From<Triple> for Window {
+    fn from(t: Triple) -> Self {
+        Self {
+            left: Some(t.left),
+            middle: Some(t.middle),
+            right: Some(t.right),
+        }
+    }
+}
+
+impl Window {
+    const fn centered(middle: TrialId) -> Self {
+        Self {
+            left: None,
+            middle: Some(middle),
+            right: None,
+        }
+    }
+
+    const fn triple(self) -> Option<Triple> {
+        match (self.left, self.middle, self.right) {
+            (Some(left), Some(middle), Some(right)) => Some(Triple {
+                left,
+                middle,
+                right,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Incomplete states are partitioned by C's fill priority (middle, right,
+/// left). The slots outside the missing point retain their original meaning,
+/// even after falling off either end of the trial list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Incomplete {
+    Middle {
+        left: Option<TrialId>,
+        right: Option<TrialId>,
+    },
+    Right {
+        left: Option<TrialId>,
+        middle: TrialId,
+    },
+    Left {
+        middle: TrialId,
+        right: TrialId,
+    },
+}
+
+impl From<Incomplete> for Window {
+    fn from(value: Incomplete) -> Self {
+        match value {
+            Incomplete::Middle { left, right } => Self {
+                left,
+                middle: None,
+                right,
+            },
+            Incomplete::Right { left, middle } => Self {
+                left,
+                middle: Some(middle),
+                right: None,
+            },
+            Incomplete::Left { middle, right } => Self {
+                left: None,
+                middle: Some(middle),
+                right: Some(right),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RealBracket(Triple);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComplexSeed {
+    First {
+        latest: TrialId,
+        previous: Option<TrialId>,
+    },
+    Gap {
+        latest: TrialId,
+        oldest: TrialId,
+    },
+}
+
+impl From<ComplexSeed> for Window {
+    fn from(seed: ComplexSeed) -> Self {
+        match seed {
+            ComplexSeed::First { latest, previous } => Self {
+                left: Some(latest),
+                middle: previous,
+                right: None,
+            },
+            ComplexSeed::Gap { latest, oldest } => Self {
+                left: Some(latest),
+                middle: None,
+                right: Some(oldest),
+            },
+        }
+    }
+}
+
+impl ComplexSeed {
+    const fn guess(self) -> (TrialId, Real) {
+        match self {
+            Self::First { latest, .. } => (latest, 1.0e8),
+            Self::Gap { latest, .. } => (latest, 1.0e12),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Neighborhood {
+    Incomplete(Incomplete),
+    Real(RealBracket),
+    ComplexSeed(ComplexSeed),
+    ComplexTriple(Triple),
+    Minimum {
+        middle: TrialId,
+        left: Option<TrialId>,
+        right: Option<TrialId>,
+    },
+}
+
+impl Neighborhood {
+    fn classify(window: Window, arena: &TrialArena) -> SpiceResult<Self> {
+        // Test the center minimum before the complex left point, exactly
+        // as CKTpzStrat does. Do not reorder points or use the imaginary
+        // parts of the other slots to change C's choice of kernel.
+        let Window {
+            left,
+            middle,
+            right,
+        } = window;
+        let center_is_minimum = middle
+            .map(|id| arena.get(id))
+            .transpose()?
+            .is_some_and(|t| t.kind == TrialKind::Minimum);
+        let left_is_complex = left
+            .map(|id| arena.get(id))
+            .transpose()?
+            .is_some_and(|t| t.s.im != 0.0);
+        if let Some(id) = right {
+            arena.get(id)?;
+        }
+        if center_is_minimum {
+            let middle = middle.ok_or_else(invalid_trial)?;
+            return Ok(Self::Minimum {
+                middle,
+                left,
+                right,
+            });
+        }
+        if left_is_complex {
+            let latest = left.ok_or_else(invalid_trial)?;
+            return Ok(match (middle, right) {
+                (Some(middle), Some(right)) => Self::ComplexTriple(Triple {
+                    left: latest,
+                    middle,
+                    right,
+                }),
+                (previous, None) => Self::ComplexSeed(ComplexSeed::First { latest, previous }),
+                (None, Some(oldest)) => Self::ComplexSeed(ComplexSeed::Gap { latest, oldest }),
+            });
+        }
+        Ok(match (left, middle, right) {
+            (Some(left), Some(middle), Some(right)) => Self::Real(RealBracket(Triple {
+                left,
+                middle,
+                right,
+            })),
+            (left, None, right) => Self::Incomplete(Incomplete::Middle { left, right }),
+            (left, Some(middle), None) => Self::Incomplete(Incomplete::Right { left, middle }),
+            (None, Some(middle), Some(right)) => {
+                Self::Incomplete(Incomplete::Left { middle, right })
+            }
+        })
+    }
+
+    fn window(self) -> Window {
+        match self {
+            Self::Incomplete(incomplete) => incomplete.into(),
+            Self::Real(RealBracket(triple)) | Self::ComplexTriple(triple) => triple.into(),
+            Self::ComplexSeed(seed) => seed.into(),
+            Self::Minimum {
+                middle,
+                left,
+                right,
+            } => Window {
+                left,
+                middle: Some(middle),
+                right,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Navigation {
+    Fill(Incomplete),
+    Skip { bracket: RealBracket, side: Side },
+    Shift { bracket: RealBracket, side: Side },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evaluation {
+    Guess(Option<TrialId>),
+    Quadratic {
+        bracket: RealBracket,
+        region: Region,
+    },
+    Split {
+        edge: TrialId,
+        middle: TrialId,
+    },
+    ComplexInit(TrialId),
+    ComplexGuess(ComplexSeed),
+    Muller(Triple),
+}
+
+impl Evaluation {
+    const fn split(RealBracket(t): RealBracket, side: Side) -> Self {
+        let edge = match side {
+            Side::Left => t.left,
+            Side::Right => t.right,
+        };
+        Self::Split {
+            edge,
+            middle: t.middle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Strategy {
+    Navigate(Navigation),
+    Evaluate(Evaluation),
+}
 
 /// One compiled pencil load, retaining element handles and the SPARSE
 /// pivot frame between trials. The root-search state does not own matrix
@@ -556,26 +999,44 @@ impl<'a> LoadedPencil<'a> {
     }
 }
 
-/// One `CKTpzFindZeros` run with its file-scope state.
+/// Curvature hint produced by NIpzSym2 and consumed by complex initialization.
+#[derive(Default)]
+struct Curvature {
+    value: Real,
+    exponent: i64,
+}
+
+impl Curvature {
+    const fn usable(&self) -> bool {
+        self.value != 0.0 && self.exponent > -10
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TraceEvent {
+    Proposal(Cx),
+    Load(Cx),
+    Determinant(Cx, i64),
+}
+
+/// One CKTpzFindZeros run with its independent scheduler and trial arena.
 struct Search<'a> {
     pencil: LoadedPencil<'a>,
-    trials: Vec<Trial>,
-    head: Option<usize>,
-    zero_trial: Option<usize>,
+    arena: TrialArena,
     nzeros: usize,
-    nflat: usize,
     max_zeros: usize,
     seq_num: usize,
     guess_param: Real,
     high_guess: Real,
     low_guess: Real,
-    last_move: u8,
+    last_move: Move,
     consec_moves: u32,
     niter: usize,
-    aberr_num: usize,
-    trapped: u8,
-    pz_k: Real,
-    pz_k_mag: i64,
+    trapped: Trap,
+    curvature: Curvature,
+    #[cfg(test)]
+    trace: Vec<TraceEvent>,
 }
 
 /// Roots of `det(A + s E)` found by ngspice's pole-zero search
@@ -597,90 +1058,81 @@ pub fn pencil_roots(a: &Matrix, e: &Matrix) -> SpiceResult<PencilRoots> {
 /// `E_PANIC`).
 pub fn pencil_load_roots(load: &PencilLoad) -> SpiceResult<PencilRoots> {
     load.validate()?;
-    let n = load.order;
-    let mut search = Search {
-        pencil: LoadedPencil::new(load)?,
-        trials: Vec::new(),
-        head: None,
-        zero_trial: None,
-        nzeros: 0,
-        nflat: 0,
-        max_zeros: n,
-        seq_num: 1,
-        guess_param: 0.0,
-        high_guess: -1.0,
-        low_guess: 1.0,
-        last_move: 0,
-        consec_moves: 0,
-        niter: 0,
-        aberr_num: 0,
-        trapped: 0,
-        pz_k: 0.0,
-        pz_k_mag: 0,
-    };
-    search.find_zeros().map(|roots| PencilRoots { roots })
+    Search::new(load)?
+        .find_zeros()
+        .map(|roots| PencilRoots { roots })
+}
+
+impl<'a> Search<'a> {
+    fn new(load: &'a PencilLoad) -> SpiceResult<Self> {
+        Ok(Self {
+            pencil: LoadedPencil::new(load)?,
+            arena: TrialArena::default(),
+            nzeros: 0,
+            max_zeros: load.order,
+            seq_num: 1,
+            guess_param: 0.0,
+            high_guess: -1.0,
+            low_guess: 1.0,
+            last_move: Move::None,
+            consec_moves: 0,
+            niter: 0,
+            trapped: Trap::Free,
+            curvature: Curvature::default(),
+            #[cfg(test)]
+            trace: Vec::new(),
+        })
+    }
 }
 
 impl Search<'_> {
-    fn neighborhood_trial(&self, index: Option<usize>) -> SpiceResult<&Trial> {
-        index
-            .and_then(|index| self.trials.get(index))
-            .ok_or_else(|| {
-                numerical(
-                    "pole-zero search",
-                    "missing neighborhood trial for search strategy",
-                )
-            })
-    }
-
-    fn s(&self, index: Option<usize>) -> SpiceResult<Cx> {
-        self.neighborhood_trial(index).map(|trial| trial.s)
-    }
-
-    /// `CKTpzFindZeros`.
+    /// CKTpzFindZeros: navigate existing trials before proposing a new one.
     fn find_zeros(&mut self) -> SpiceResult<Vec<Complex>> {
-        let mut set: Set = [None; 3];
-        self.reset(&mut set);
+        let mut neighborhood = self.reset()?;
         loop {
-            let mut strat;
-            loop {
-                strat = self.strat(&set)?;
-                if !(strat < GUESS && self.trapped == 0) {
-                    break;
+            let evaluation = loop {
+                match self.strategy(neighborhood)? {
+                    Strategy::Evaluate(evaluation) => break evaluation,
+                    Strategy::Navigate(navigation) => {
+                        if self.trapped != Trap::Free {
+                            return Err(numerical(
+                                "pole-zero search",
+                                "trapped search attempted navigation",
+                            ));
+                        }
+                        neighborhood = self.step(navigation)?;
+                        let window = neighborhood.window();
+                        if window.triple().is_none() {
+                            break Evaluation::Guess(window.middle);
+                        }
+                    }
                 }
-                if !self.step(strat, &mut set) {
-                    strat = GUESS;
-                    break;
-                }
-            }
+            };
             self.niter += 1;
-            let candidate = self.eval(strat, &set)?;
-            let new = self.run_trial(candidate, &set)?;
-            let flags = self.trials[new].flags;
-            if flags & ISAROOT != 0 {
-                if self.verify(new)? {
+            let candidate = self.eval(evaluation)?;
+            #[cfg(test)]
+            self.trace.push(TraceEvent::Proposal(candidate));
+            let new = self.run_trial(candidate, neighborhood.window().middle)?;
+            neighborhood = match self.arena.get(new)?.kind {
+                TrialKind::Root(_) => {
+                    self.verify(new)?;
                     self.niter = 0;
-                    self.reset(&mut set);
-                } else {
-                    self.update_set(&mut set, new)?;
+                    self.reset()?
                 }
-            } else if flags & ISANABERRATION != 0 {
-                self.reset(&mut set);
-                self.aberr_num += 1;
-            } else if flags & ISAMINIMA != 0 {
-                set = [None, Some(new), None];
-            } else {
-                self.update_set(&mut set, new)?;
-            }
+                TrialKind::Minimum => Neighborhood::classify(Window::centered(new), &self.arena)?,
+                TrialKind::Sample => self.update_neighborhood(neighborhood, new)?,
+            };
             let spread = self.high_guess - self.low_guess;
-            let open = set[0].is_none()
-                || set[2].is_none()
-                || self.trapped != 0
-                || self.s(set[2])?.re - self.s(set[0])?.re < 1e22;
+            let window = neighborhood.window();
+            let open = match (window.left, window.right) {
+                (Some(left), Some(right)) if self.trapped == Trap::Free => {
+                    self.arena.frequency(right)?.re - self.arena.frequency(left)?.re < 1e22
+                }
+                _ => true,
+            };
             if !(spread < 1e40
                 && self.nzeros < self.max_zeros
                 && self.niter < NITER_LIM
-                && self.aberr_num < 3
                 && spread < 1e35
                 && open)
             {
@@ -694,51 +1146,34 @@ impl Search<'_> {
                  \"The input signal is shorted on the way to the output\")",
             ));
         }
-        if self.aberr_num > 2 {
-            eprintln!(
-                "warning: Pole-zero converging to numerical aberrations; giving up after {} trials",
-                self.seq_num
-            );
-        }
         if self.niter >= NITER_LIM {
             eprintln!(
                 "warning: Pole-zero iteration limit reached; giving up after {} trials",
                 self.seq_num
             );
         }
-        // clear_trials(0) and PZpost.
+        // clear_trials(0) and PZpost: roots are already linked in C order.
         let mut roots = Vec::new();
-        let mut t = self.head;
-        while let Some(i) = t {
-            let trial = &self.trials[i];
-            if trial.flags & ISAROOT != 0 {
-                for _ in 0..trial.multiplicity {
-                    roots.push(Complex::new(trial.s.re, trial.s.im));
-                    if trial.s.im != 0.0 {
-                        roots.push(Complex::new(trial.s.re, -trial.s.im));
-                    }
+        let mut current = self.arena.head;
+        while let Some(id) = current {
+            let trial = self.arena.get(id)?;
+            for _ in 0..trial.multiplicity() {
+                roots.push(Complex::new(trial.s.re, trial.s.im));
+                if trial.s.im != 0.0 {
+                    roots.push(Complex::new(trial.s.re, -trial.s.im));
                 }
             }
-            t = trial.next;
+            current = trial.next;
         }
         Ok(roots)
     }
 
-    /// `PZeval`: the next trial point for a strategy (not yet in the list).
-    fn eval(&mut self, strat: u8, set: &Set) -> SpiceResult<usize> {
-        let mut trial = Trial {
-            s: Cx::ZERO,
-            f_def: Cx::ZERO,
-            mag_def: 0,
-            multiplicity: 0,
-            flags: 0,
-            count: 0,
-            next: None,
-            prev: None,
-        };
+    /// PZeval. Only candidate frequencies, not detached arena entries, exist
+    /// before the determinant evaluation and collision handling.
+    fn eval(&mut self, evaluation: Evaluation) -> SpiceResult<Cx> {
         self.seq_num += 1;
-        match strat {
-            GUESS => {
+        let s = match evaluation {
+            Evaluation::Guess(center) => {
                 if self.high_guess < self.low_guess {
                     self.guess_param = 0.0;
                 } else if self.guess_param > 0.0 {
@@ -760,213 +1195,201 @@ impl Search<'_> {
                 if self.low_guess > self.guess_param {
                     self.low_guess = self.guess_param;
                 }
-                trial.s.re = self.guess_param;
-                trial.s.im = set[1].map_or(0.0, |i| self.trials[i].s.im);
+                let imag = center
+                    .map(|id| self.arena.frequency(id))
+                    .transpose()?
+                    .map_or(0.0, |s| s.im);
+                Cx::new(self.guess_param, imag)
             }
-            SYM | SYM2 => {
-                trial.s = Cx::new(self.sym2(set)?, 0.0);
-                let (s0, s1) = (self.s(set[0])?, self.s(set[1])?);
-                match self.trapped {
-                    1 => {
-                        if trial.s.re < s0.re || trial.s.re > s1.re {
-                            trial.s.re = (s0.re + s1.re) / 2.0;
+            Evaluation::Quadratic {
+                bracket: RealBracket(triple),
+                region,
+            } => {
+                let [t0, t1, t2] = self.arena.triple(triple)?;
+                let mut trial = Cx::new(sym2(t0, t1, t2, region, &mut self.curvature)?, 0.0);
+                let (s0, s1, s2) = (t0.s, t1.s, t2.s);
+                match region {
+                    Region::LeftCrossing => {
+                        if trial.re < s0.re || trial.re > s1.re {
+                            trial.re = (s0.re + s1.re) / 2.0;
                         }
                     }
-                    2 => {
-                        let s2 = self.s(set[2])?;
-                        if trial.s.re < s1.re || trial.s.re > s2.re {
-                            trial.s.re = (s1.re + s2.re) / 2.0;
+                    Region::RightCrossing => {
+                        if trial.re < s1.re || trial.re > s2.re {
+                            trial.re = (s1.re + s2.re) / 2.0;
                         }
                     }
-                    3 => {
-                        let s2 = self.s(set[2])?;
-                        if trial.s.re <= s0.re
-                            || (trial.s.re == s1.re && trial.s.im == s1.im)
-                            || trial.s.re >= s2.re
+                    Region::Minimum => {
+                        if trial.re <= s0.re
+                            || (trial.re == s1.re && trial.im == s1.im)
+                            || trial.re >= s2.re
                         {
-                            trial.s.re = (s0.re + s2.re) / 2.0;
-                            if trial.s.re == s1.re {
-                                trial.s.re =
-                                    if self.last_move == MID_LEFT || self.last_move == NEAR_RIGHT {
-                                        (s0.re + s1.re) / 2.0
-                                    } else {
-                                        (s1.re + s2.re) / 2.0
-                                    };
+                            trial.re = (s0.re + s2.re) / 2.0;
+                            if trial.re == s1.re {
+                                trial.re = if matches!(
+                                    self.last_move,
+                                    Move::Mid(Side::Left) | Move::Near(Side::Right)
+                                ) {
+                                    (s0.re + s1.re) / 2.0
+                                } else {
+                                    (s1.re + s2.re) / 2.0
+                                };
                             }
                         }
                     }
-                    _ => {}
                 }
+                trial
             }
-            COMPLEX_INIT => {
-                trial.s.re = self.s(set[1])?.re;
-                if self.pz_k != 0.0 && self.pz_k_mag > -10 {
-                    trial.s.im = materialize_power(self.pz_k, self.pz_k_mag);
+            Evaluation::ComplexInit(minimum) => {
+                let re = self.arena.frequency(minimum)?.re;
+                let im = if self.curvature.usable() {
+                    materialize_power(self.curvature.value, self.curvature.exponent)
                 } else {
-                    trial.s.im = 10000.0;
-                }
-                self.pz_k = 0.0;
-                self.pz_k_mag = 0;
+                    10000.0
+                };
+                self.curvature = Curvature::default();
+                Cx::new(re, im)
             }
-            COMPLEX_GUESS => {
-                trial.s.re = self.s(set[0])?.re;
-                trial.s.im = if set[2].is_none() { 1.0e8 } else { 1.0e12 };
+            Evaluation::ComplexGuess(seed) => {
+                let (id, im) = seed.guess();
+                Cx::new(self.arena.frequency(id)?.re, im)
             }
-            MULLER => trial.s = self.muller(set)?,
-            SPLIT_LEFT => {
-                trial.s.re = (self.s(set[0])?.re + 2.0 * self.s(set[1])?.re) / 3.0;
-            }
-            SPLIT_RIGHT => {
-                trial.s.re = (self.s(set[2])?.re + 2.0 * self.s(set[1])?.re) / 3.0;
-            }
-            _ => return Err(numerical("pole-zero search", "Step type unknown")),
-        }
-        if !trial.s.re.is_finite() || !trial.s.im.is_finite() {
+            Evaluation::Muller(triple) => muller(self.arena.triple(triple)?)?,
+            Evaluation::Split { edge, middle } => Cx::new(
+                (self.arena.frequency(edge)?.re + 2.0 * self.arena.frequency(middle)?.re) / 3.0,
+                0.0,
+            ),
+        };
+        if !s.re.is_finite() || !s.im.is_finite() {
             return Err(numerical("pole-zero search", "non-finite trial frequency"));
         }
-        self.trials.push(trial);
-        Ok(self.trials.len() - 1)
+        Ok(s)
     }
 
-    /// `CKTpzStrat`.
-    #[expect(
-        clippy::needless_late_init,
-        reason = "initialization position follows the original C control-flow structure"
-    )] // keeps C's branch structure
-    fn strat(&mut self, set: &Set) -> SpiceResult<u8> {
-        let mut new_trap = 0;
-        let suggestion;
-        let minima = set[1].is_some_and(|i| self.trials[i].flags & ISAMINIMA != 0);
-        if minima {
-            suggestion = COMPLEX_INIT;
-        } else if set[0].is_some_and(|i| self.trials[i].s.im != 0.0) {
-            suggestion = if set[1].is_none() || set[2].is_none() {
-                COMPLEX_GUESS
-            } else {
-                MULLER
-            };
-        } else if set.iter().any(Option::is_none) {
-            suggestion = INIT;
-        } else {
-            let t0 = self.neighborhood_trial(set[0])?;
-            let t1 = self.neighborhood_trial(set[1])?;
-            let t2 = self.neighborhood_trial(set[2])?;
-            let mut chosen;
-            if sgn(t0.f_def.re) != sgn(t1.f_def.re) {
-                new_trap = 1;
-                chosen = SYM2;
-            } else if sgn(t1.f_def.re) != sgn(t2.f_def.re) {
-                new_trap = 2;
-                chosen = SYM2;
-            } else {
-                let (a, a_mag) = zaddeq(t1.f_def.re, t1.mag_def, -t0.f_def.re, t0.mag_def)?;
-                let (b, b_mag) = zaddeq(t2.f_def.re, t2.mag_def, -t1.f_def.re, t1.mag_def)?;
-                if self.trapped == 0 {
-                    let k1 = t1.s.re - t0.s.re;
-                    let k2 = t2.s.re - t1.s.re;
-                    chosen = if a_mag + 10 < t0.mag_def
-                        && a_mag + 10 < t1.mag_def
-                        && b_mag + 10 < t1.mag_def
-                        && b_mag + 10 < t2.mag_def
-                    {
-                        if k1 > k2 { SKIP_RIGHT } else { SKIP_LEFT }
-                    } else if sgn(a) != -sgn(b) {
-                        if a == 0.0 {
-                            SKIP_LEFT
-                        } else if b == 0.0 {
-                            SKIP_RIGHT
-                        } else if sgn(a) == sgn(t1.f_def.re) {
-                            SHIFT_LEFT
+    /// CKTpzStrat. Each evaluation or navigation carries all of its inputs.
+    fn strategy(&mut self, neighborhood: Neighborhood) -> SpiceResult<Strategy> {
+        let mut trap = Trap::Free;
+        let suggestion = match neighborhood {
+            Neighborhood::Minimum { middle, .. } => {
+                Strategy::Evaluate(Evaluation::ComplexInit(middle))
+            }
+            Neighborhood::ComplexSeed(seed) => Strategy::Evaluate(Evaluation::ComplexGuess(seed)),
+            Neighborhood::ComplexTriple(triple) => Strategy::Evaluate(Evaluation::Muller(triple)),
+            Neighborhood::Incomplete(incomplete) => {
+                Strategy::Navigate(Navigation::Fill(incomplete))
+            }
+            Neighborhood::Real(bracket) => {
+                let [t0, t1, t2] = self.arena.triple(bracket.0)?;
+                let quadratic =
+                    |region| Strategy::Evaluate(Evaluation::Quadratic { bracket, region });
+                let skip = |side| Strategy::Navigate(Navigation::Skip { bracket, side });
+                let shift = |side| Strategy::Navigate(Navigation::Shift { bracket, side });
+                let split = |side| Strategy::Evaluate(Evaluation::split(bracket, side));
+                let mut chosen;
+                if sgn(t0.f_def.re) != sgn(t1.f_def.re) {
+                    trap = Trap::Bracket(Region::LeftCrossing);
+                    chosen = quadratic(Region::LeftCrossing);
+                } else if sgn(t1.f_def.re) != sgn(t2.f_def.re) {
+                    trap = Trap::Bracket(Region::RightCrossing);
+                    chosen = quadratic(Region::RightCrossing);
+                } else {
+                    let (a, a_mag) = zaddeq(t1.f_def.re, t1.mag_def, -t0.f_def.re, t0.mag_def)?;
+                    let (b, b_mag) = zaddeq(t2.f_def.re, t2.mag_def, -t1.f_def.re, t1.mag_def)?;
+                    if self.trapped == Trap::Free {
+                        let k1 = t1.s.re - t0.s.re;
+                        let k2 = t2.s.re - t1.s.re;
+                        chosen = if a_mag + 10 < t0.mag_def
+                            && a_mag + 10 < t1.mag_def
+                            && b_mag + 10 < t1.mag_def
+                            && b_mag + 10 < t2.mag_def
+                        {
+                            if k1 > k2 {
+                                skip(Side::Right)
+                            } else {
+                                skip(Side::Left)
+                            }
+                        } else if sgn(a) != -sgn(b) {
+                            if a == 0.0 {
+                                skip(Side::Left)
+                            } else if b == 0.0 {
+                                skip(Side::Right)
+                            } else if sgn(a) == sgn(t1.f_def.re) {
+                                shift(Side::Left)
+                            } else {
+                                shift(Side::Right)
+                            }
+                        } else if sgn(a) == -sgn(t1.f_def.re) {
+                            trap = Trap::Bracket(Region::Minimum);
+                            quadratic(Region::Minimum)
+                        } else if k1 > k2 {
+                            skip(Side::Right)
                         } else {
-                            SHIFT_RIGHT
-                        }
-                    } else if sgn(a) == -sgn(t1.f_def.re) {
-                        new_trap = 3;
-                        SYM
-                    } else if k1 > k2 {
-                        SKIP_RIGHT
+                            skip(Side::Left)
+                        };
                     } else {
-                        SKIP_LEFT
-                    };
-                } else {
-                    new_trap = 3;
-                    chosen = if sgn(a) != sgn(b) {
-                        SYM
-                    } else if a_mag > b_mag || (a_mag == b_mag && a.abs() > b.abs()) {
-                        SPLIT_LEFT
-                    } else {
-                        SPLIT_RIGHT
-                    };
+                        trap = Trap::Bracket(Region::Minimum);
+                        chosen = if sgn(a) != sgn(b) {
+                            quadratic(Region::Minimum)
+                        } else if a_mag > b_mag || (a_mag == b_mag && a.abs() > b.abs()) {
+                            split(Side::Left)
+                        } else {
+                            split(Side::Right)
+                        };
+                    }
                 }
+                if self.consec_moves >= 3 && self.trapped == trap {
+                    chosen = split(self.last_move.split_side()?);
+                    self.consec_moves = 0;
+                }
+                chosen
             }
-            if self.consec_moves >= 3 && self.trapped == new_trap {
-                new_trap = self.trapped;
-                chosen = if self.last_move == MID_LEFT || self.last_move == NEAR_RIGHT {
-                    SPLIT_LEFT
-                } else if self.last_move == MID_RIGHT || self.last_move == NEAR_LEFT {
-                    SPLIT_RIGHT
-                } else {
-                    return Err(numerical(
-                        "pole-zero search",
-                        "trapped search has no usable last move (C calls controlled_exit)",
-                    ));
-                };
-                self.consec_moves = 0;
-            }
-            suggestion = chosen;
-        }
-        self.trapped = new_trap;
+        };
+        self.trapped = trap;
         Ok(suggestion)
     }
 
-    /// `CKTpzRunTrial`: evaluates (or merges) a trial and links it into the
-    /// sorted list. Returns the trial now standing for it.
-    fn run_trial(&mut self, candidate: usize, set: &Set) -> SpiceResult<usize> {
-        let mut new = candidate;
-        if self.trials[new].s.im < 0.0 {
-            self.trials[new].s.im *= -1.0;
+    /// CKTpzRunTrial: evaluate a proposed frequency, or merge a collision
+    /// with an existing linked trial. Deflation is accumulated in list order.
+    fn run_trial(&mut self, mut s: Cx, middle: Option<TrialId>) -> SpiceResult<TrialId> {
+        if s.im < 0.0 {
+            s.im *= -1.0;
         }
-        let mut pretest = false;
         let mut shifted = false;
-        let mut repeat = false;
         let mut def_frac;
         let mut def_mag;
         let mut prev;
-        let mut matched;
-        let mut hit = None;
+        let mut hit;
         loop {
             def_mag = 0;
             def_frac = Cx::new(1.0, 0.0);
             let was_shifted = shifted;
             shifted = false;
             prev = None;
-            matched = None;
-            let mut p = self.head;
-            while let Some(pi) = p {
-                let diff = self.trials[pi].s.sub(self.trials[new].s);
+            hit = None;
+            let mut p = self.arena.head;
+            while let Some(id) = p {
+                let trial = *self.arena.get(id)?;
+                let diff = trial.s.sub(s);
                 if diff.re < 0.0 || (diff.re == 0.0 && diff.im < 0.0) {
-                    prev = Some(pi);
+                    prev = Some(id);
                 }
-                let root = self.trials[pi].flags & ISAROOT != 0;
+                let root = trial.is_root();
                 let (abstol, reltol) = if root { (1e-5, 1e-6) } else { (1e-20, 1e-12) };
-                if diff.im == 0.0
-                    && diff.re.abs() / (self.trials[pi].s.re.abs() + abstol / reltol) < reltol
-                {
+                if diff.im == 0.0 && diff.re.abs() / (trial.s.re.abs() + abstol / reltol) < reltol {
                     if was_shifted
-                        || self.trials[pi].count >= 3
-                        || !self.alter(new, set[1], abstol, reltol)
+                        || trial.count >= 3
+                        || !self.alter(&mut s, middle, abstol, reltol)?
                     {
-                        self.trials[pi].count = 0;
-                        pretest = true;
-                        hit = Some(pi);
+                        self.arena.get_mut(id)?.count = 0;
+                        hit = Some(id);
                         break;
                     }
-                    self.trials[pi].count += 1;
+                    self.arena.get_mut(id)?.count += 1;
                     shifted = true;
                     break;
                 }
-                if self.trapped == 0 {
-                    self.trials[pi].count = 0;
+                if self.trapped == Trap::Free {
+                    self.arena.get_mut(id)?.count = 0;
                 }
                 if root {
                     let mut diff = diff;
@@ -977,112 +1400,84 @@ impl Search<'_> {
                         diff_mag *= 2;
                     }
                     c_norm(&mut diff, &mut diff_mag)?;
-                    for _ in 0..self.trials[pi].multiplicity {
+                    for _ in 0..trial.multiplicity() {
                         def_frac = def_frac.mul(diff);
                         def_mag += diff_mag;
                         c_norm(&mut def_frac, &mut def_mag)?;
                     }
-                } else if matched.is_none() {
-                    matched = Some(pi);
                 }
-                p = self.trials[pi].next;
+                p = trial.next;
             }
             if !shifted {
                 break;
             }
         }
-        let mut singular = false;
-        if pretest {
-            let p = hit.unwrap_or(new);
-            if self.trials[p].flags & ISAROOT == 0
-                && self.trapped == 3
-                && self.pz_k != 0.0
-                && self.pz_k_mag > -10
-            {
-                self.trials[p].flags |= ISAMINIMA;
-                new = p;
-                repeat = true;
-            } else if self.trials[p].flags & ISAROOT != 0 {
-                new = p;
-                self.trials[p].flags |= ISAREPEAT;
-                self.trials[p].multiplicity += 1;
-                repeat = true;
-            } else {
-                singular = true;
-            }
-        }
-        if !repeat {
-            let mut f_raw = Cx::ZERO;
-            let mut mag_raw = 0;
-            if !pretest {
-                match self.pencil.determinant_at(self.trials[new].s)? {
-                    Some((f, mag)) => {
-                        f_raw = f;
-                        mag_raw = mag;
-                    }
-                    None => singular = true,
+
+        let determinant = if let Some(hit) = hit {
+            let trial = self.arena.get_mut(hit)?;
+            match trial.kind {
+                TrialKind::Root(multiplicity) => {
+                    trial.kind = TrialKind::Root(multiplicity.checked_add(1).ok_or_else(|| {
+                        numerical("pole-zero search", "root multiplicity overflow")
+                    })?);
+                    return Ok(hit);
                 }
+                TrialKind::Sample | TrialKind::Minimum
+                    if self.trapped == Trap::Bracket(Region::Minimum)
+                        && self.curvature.usable() =>
+                {
+                    trial.kind = TrialKind::Minimum;
+                    return Ok(hit);
+                }
+                TrialKind::Sample | TrialKind::Minimum => None,
             }
-            let trial = &mut self.trials[new];
-            if singular || f_raw.is_zero() {
-                trial.f_def = Cx::ZERO;
-                trial.mag_def = 0;
-                trial.flags = ISAROOT;
-            } else {
+        } else {
+            #[cfg(test)]
+            self.trace.push(TraceEvent::Load(s));
+            let determinant = self.pencil.determinant_at(s)?;
+            #[cfg(test)]
+            if let Some((value, exponent)) = determinant {
+                self.trace.push(TraceEvent::Determinant(value, exponent));
+            }
+            determinant
+        };
+
+        let trial = match determinant {
+            Some((f_raw, mag_raw)) if !f_raw.is_zero() => {
                 // PZnumswaps is always 1 after SMPcReorder.
-                trial.f_def = f_raw.div(def_frac);
-                trial.mag_def = mag_raw - def_mag;
-                c_norm(&mut trial.f_def, &mut trial.mag_def)?;
+                let mut f_def = f_raw.div(def_frac);
+                let mut mag_def = mag_raw - def_mag;
+                c_norm(&mut f_def, &mut mag_def)?;
+                Trial::new(s, f_def, mag_def, TrialKind::Sample)
             }
-            if let Some(prev) = prev {
-                let after = self.trials[prev].next;
-                self.trials[new].next = after;
-                if let Some(after) = after {
-                    self.trials[after].prev = Some(new);
-                }
-                self.trials[prev].next = Some(new);
-            } else {
-                match self.head {
-                    Some(head) => self.trials[head].prev = Some(new),
-                    None => self.zero_trial = Some(new),
-                }
-                self.trials[new].next = self.head;
-                self.head = Some(new);
-            }
-            self.trials[new].prev = prev;
-            if self.trials[new].flags & ISAROOT == 0 {
-                match matched {
-                    Some(m) => self.check_flat(m, new),
-                    None => self.nflat = 1,
-                }
-            }
-        }
-        Ok(new)
+            _ => Trial::new(s, Cx::ZERO, 0, TrialKind::Root(std::num::NonZeroU32::MIN)),
+        };
+        self.arena.insert_after(prev, trial)
     }
 
-    /// `CKTpzVerify`: count the root, deflate every stored non-root trial
-    /// by it and drop trials too close to it (always "verified").
-    fn verify(&mut self, new: usize) -> SpiceResult<bool> {
+    /// CKTpzVerify always returns success in C. Count each occurrence of
+    /// the root, deflate surviving trials and unlink those too close to it.
+    fn verify(&mut self, new: TrialId) -> SpiceResult<()> {
+        let root = self.arena.get(new)?;
+        if !root.is_root() {
+            return Err(numerical(
+                "pole-zero search",
+                "cannot verify a non-root trial",
+            ));
+        }
         self.nzeros += 1;
-        let s = self.trials[new].s;
+        let s = root.s;
         if s.im != 0.0 {
             self.nzeros += 1;
         }
-        self.nflat = 0;
-        if self.trials[new].multiplicity == 0 {
-            self.trials[new].flags |= ISAROOT;
-            self.trials[new].multiplicity = 1;
-        }
-        let mut prev: Option<usize> = None;
-        let mut t = self.head;
-        while let Some(ti) = t {
-            let next = self.trials[ti].next;
-            if self.trials[ti].flags & ISAROOT != 0 {
-                prev = Some(ti);
-                t = next;
+        let mut current = self.arena.head;
+        while let Some(id) = current {
+            let trial = *self.arena.get(id)?;
+            current = trial.next;
+            if trial.is_root() {
                 continue;
             }
-            let mut diff = s.sub(self.trials[ti].s);
+            let mut diff = s.sub(trial.s);
             if s.im != 0.0 {
                 diff = diff.mag2();
             }
@@ -1091,190 +1486,209 @@ impl Search<'_> {
                 let mut diff_mag = 0;
                 c_norm(&mut diff, &mut diff_mag)?;
                 diff_mag *= -1;
-                let trial = &mut self.trials[ti];
+                let trial = self.arena.get_mut(id)?;
                 trial.f_def = trial.f_def.div(diff);
                 c_norm(&mut trial.f_def, &mut diff_mag)?;
                 trial.mag_def += diff_mag;
             }
-            if self.trials[ti].s.im != 0.0 || tdiff.abs() / (s.re.abs() + 200.0) < 0.005 {
-                if let Some(p) = prev {
-                    self.trials[p].next = next;
-                }
-                if let Some(n) = next {
-                    self.trials[n].prev = prev;
-                }
-                if self.zero_trial == Some(ti) {
-                    self.zero_trial = next.or(self.trials[ti].prev);
-                }
-                if self.head == Some(ti) {
-                    self.head = next;
-                }
+            if trial.s.im != 0.0 || tdiff.abs() / (s.re.abs() + 200.0) < 0.005 {
+                self.arena.remove(id)?;
             } else {
-                match prev {
-                    Some(p) => self.check_flat(p, ti),
-                    None => self.nflat = 1,
-                }
-                self.trials[ti].flags &= !ISAMINIMA;
-                prev = Some(ti);
-            }
-            t = next;
-        }
-        Ok(true)
-    }
-
-    /// `pzseek`: the nearest non-root, non-minimum trial in a direction.
-    fn seek(&mut self, t: Option<usize>, dir: i32) -> Option<usize> {
-        self.guess_param = Real::from(dir);
-        let mut t = t?;
-        let skip = |trial: &Trial| trial.flags & (ISAROOT | ISAMINIMA) != 0;
-        if dir == 0 && !skip(&self.trials[t]) {
-            return Some(t);
-        }
-        loop {
-            let next = if dir >= 0 {
-                self.trials[t].next
-            } else {
-                self.trials[t].prev
-            };
-            t = next?;
-            if !skip(&self.trials[t]) {
-                return Some(t);
+                self.arena.get_mut(id)?.kind = TrialKind::Sample;
             }
         }
+        Ok(())
     }
 
-    /// `CKTpzUpdateSet`.
-    fn update_set(&mut self, set: &mut Set, new: usize) -> SpiceResult<()> {
-        let mut this_move = 0;
-        let trial = self.trials[new].clone();
+    /// pzseek also sets the sign of the next extrapolation guess, including
+    /// when it encounters an empty list.
+    fn seek(&mut self, start: Option<TrialId>, direction: Seek) -> SpiceResult<Option<TrialId>> {
+        self.guess_param = direction.guess();
+        self.arena.seek(start, direction)
+    }
+
+    /// CKTpzUpdateSet. Preserve the C slot updates and strict determinant
+    /// tie-break; classify the result before it can schedule another kernel.
+    fn update_neighborhood(
+        &mut self,
+        neighborhood: Neighborhood,
+        new: TrialId,
+    ) -> SpiceResult<Neighborhood> {
+        let Window {
+            left,
+            middle,
+            right,
+        } = neighborhood.window();
+        let trial = *self.arena.get(new)?;
         let n = trial.s;
+        let mut movement = Move::None;
+        let mut window = Window {
+            left,
+            middle,
+            right,
+        };
         if n.im != 0.0 {
-            set[2] = set[1];
-            set[1] = set[0];
-            set[0] = Some(new);
-        } else if set[1].is_none() {
-            set[1] = Some(new);
-        } else if set[2].is_none() && n.re > self.s(set[1])?.re {
-            set[2] = Some(new);
-        } else if set[0].is_none() {
-            set[0] = Some(new);
-        } else if trial.flags & ISAMINIMA != 0 {
-            set[1] = Some(new);
-        } else if n.re < self.s(set[0])?.re {
-            set[2] = set[1];
-            set[1] = set[0];
-            set[0] = Some(new);
-            this_move = FAR_LEFT;
-        } else {
-            let middle = self.neighborhood_trial(set[1])?;
-            let better = self.trapped == 0
-                || trial.mag_def < middle.mag_def
-                || (trial.mag_def == middle.mag_def
-                    && trial.f_def.re.abs() < middle.f_def.re.abs());
-            if n.re < middle.s.re {
-                if better {
-                    set[2] = set[1];
-                    set[1] = Some(new);
-                    this_move = MID_LEFT;
+            window = Window {
+                left: Some(new),
+                middle: left,
+                right: middle,
+            };
+        } else if let Some(mid) = middle {
+            let center = self.arena.get(mid)?;
+            if right.is_none() && n.re > center.s.re {
+                window.right = Some(new);
+            } else if let Some(left) = left {
+                if trial.kind == TrialKind::Minimum {
+                    window.middle = Some(new);
+                } else if n.re < self.arena.frequency(left)?.re {
+                    window = Window {
+                        left: Some(new),
+                        middle: Some(left),
+                        right: middle,
+                    };
+                    movement = Move::Far(Side::Left);
                 } else {
-                    set[0] = Some(new);
-                    this_move = NEAR_LEFT;
-                }
-            } else if set[2].is_some() && n.re < self.s(set[2])?.re {
-                if better {
-                    set[0] = set[1];
-                    set[1] = Some(new);
-                    this_move = MID_RIGHT;
-                } else {
-                    set[2] = Some(new);
-                    this_move = NEAR_RIGHT;
+                    let better = self.trapped == Trap::Free
+                        || trial.mag_def < center.mag_def
+                        || (trial.mag_def == center.mag_def
+                            && trial.f_def.re.abs() < center.f_def.re.abs());
+                    if n.re < center.s.re {
+                        if better {
+                            window.right = middle;
+                            window.middle = Some(new);
+                            movement = Move::Mid(Side::Left);
+                        } else {
+                            window.left = Some(new);
+                            movement = Move::Near(Side::Left);
+                        }
+                    } else if right
+                        .map(|id| self.arena.frequency(id))
+                        .transpose()?
+                        .is_some_and(|r| n.re < r.re)
+                    {
+                        if better {
+                            window.left = middle;
+                            window.middle = Some(new);
+                            movement = Move::Mid(Side::Right);
+                        } else {
+                            window.right = Some(new);
+                            movement = Move::Near(Side::Right);
+                        }
+                    } else {
+                        window = Window {
+                            left: middle,
+                            middle: right,
+                            right: Some(new),
+                        };
+                        movement = Move::Far(Side::Right);
+                    }
                 }
             } else {
-                set[0] = set[1];
-                set[1] = set[2];
-                set[2] = Some(new);
-                this_move = FAR_RIGHT;
+                window.left = Some(new);
             }
+        } else {
+            window.middle = Some(new);
         }
-        if self.trapped != 0 && this_move == self.last_move {
+        if self.trapped != Trap::Free && movement == self.last_move {
             self.consec_moves += 1;
         } else {
             self.consec_moves = 0;
         }
-        self.last_move = this_move;
-        Ok(())
+        self.last_move = movement;
+        Neighborhood::classify(window, &self.arena)
     }
 
-    /// `check_flat`.
-    fn check_flat(&mut self, a: usize, b: usize) {
-        let (a, b) = (&self.trials[a], &self.trials[b]);
-        let diff_mag = a.mag_def - b.mag_def;
-        if diff_mag.abs() <= 1 {
-            let mult = match diff_mag {
-                1 => 2.0,
-                -1 => 0.5,
-                _ => 1.0,
-            };
-            let diff = a.f_def.scale(mult).sub(b.f_def).mag2();
-            if diff.re < 1.0e-20 {
-                self.nflat += 1;
-            }
-        }
-    }
-
-    /// `CKTpzStep`.
-    fn step(&mut self, strat: u8, set: &mut Set) -> bool {
-        match strat {
-            INIT => {
-                if set[1].is_none() {
-                    set[1] = self.seek(self.zero_trial, 0);
-                } else if set[2].is_none() {
-                    set[2] = self.seek(set[1], 1);
-                } else if set[0].is_none() {
-                    set[0] = self.seek(set[1], -1);
+    /// CKTpzStep. A navigation cannot ask for an absent bracket endpoint;
+    /// only initialization may fill a missing point.
+    fn step(&mut self, navigation: Navigation) -> SpiceResult<Neighborhood> {
+        let window = match navigation {
+            Navigation::Fill(incomplete) => match incomplete {
+                Incomplete::Middle { left, right } => Window {
+                    left,
+                    middle: self.seek(self.arena.anchor, Seek::Anchor)?,
+                    right,
+                },
+                Incomplete::Right { left, middle } => Window {
+                    left,
+                    middle: Some(middle),
+                    right: self.seek(Some(middle), Seek::Right)?,
+                },
+                Incomplete::Left { middle, right } => Window {
+                    left: self.seek(Some(middle), Seek::Left)?,
+                    middle: Some(middle),
+                    right: Some(right),
+                },
+            },
+            Navigation::Skip {
+                bracket: RealBracket(t),
+                side,
+            } => {
+                let mut window = Window::from(t);
+                match side {
+                    Side::Left => window.left = self.seek(Some(t.left), side.into())?,
+                    Side::Right => window.right = self.seek(Some(t.right), side.into())?,
                 }
+                window
             }
-            SKIP_LEFT => set[0] = self.seek(set[0], -1),
-            SKIP_RIGHT => set[2] = self.seek(set[2], 1),
-            SHIFT_LEFT => {
-                set[2] = set[1];
-                set[1] = set[0];
-                set[0] = self.seek(set[0], -1);
-            }
-            SHIFT_RIGHT => {
-                set[0] = set[1];
-                set[1] = set[2];
-                set[2] = self.seek(set[2], 1);
-            }
-            _ => {}
-        }
-        set.iter().all(Option::is_some)
-    }
-
-    /// `CKTpzReset`.
-    fn reset(&mut self, set: &mut Set) {
-        self.trapped = 0;
-        self.consec_moves = 0;
-        set[1] = self.seek(self.zero_trial, 0);
-        if set[1].is_some() {
-            set[0] = self.seek(set[1], -1);
-            set[2] = self.seek(set[1], 1);
-        } else {
-            set[0] = None;
-            set[2] = None;
-        }
-    }
-
-    /// `alter`: move a trial that collides with an existing one.
-    fn alter(&mut self, new: usize, nearto: Option<usize>, abstol: Real, reltol: Real) -> bool {
-        let Some(near) = nearto else {
-            return false;
+            Navigation::Shift {
+                bracket: RealBracket(t),
+                side,
+            } => match side {
+                Side::Left => Window {
+                    left: self.seek(Some(t.left), side.into())?,
+                    middle: Some(t.left),
+                    right: Some(t.middle),
+                },
+                Side::Right => Window {
+                    left: Some(t.middle),
+                    middle: Some(t.right),
+                    right: self.seek(Some(t.right), side.into())?,
+                },
+            },
         };
-        let t = self.trials[near].clone();
-        let neighbor = |i: Option<usize>| i.map(|i| self.trials[i].s.re);
-        let (left, right) = (neighbor(t.prev), neighbor(t.next));
-        let root = t.flags & ISAROOT != 0;
-        let p1 = if self.trapped == 2 {
+        Neighborhood::classify(window, &self.arena)
+    }
+
+    /// CKTpzReset.
+    fn reset(&mut self) -> SpiceResult<Neighborhood> {
+        self.trapped = Trap::Free;
+        self.consec_moves = 0;
+        let middle = self.seek(self.arena.anchor, Seek::Anchor)?;
+        let window = if middle.is_some() {
+            let left = self.seek(middle, Seek::Left)?;
+            let right = self.seek(middle, Seek::Right)?;
+            Window {
+                left,
+                middle,
+                right,
+            }
+        } else {
+            Window::default()
+        };
+        Neighborhood::classify(window, &self.arena)
+    }
+
+    /// alter: move a candidate that collides with a linked trial.
+    fn alter(
+        &self,
+        candidate: &mut Cx,
+        nearto: Option<TrialId>,
+        abstol: Real,
+        reltol: Real,
+    ) -> SpiceResult<bool> {
+        let Some(near) = nearto else {
+            return Ok(false);
+        };
+        let t = self.arena.get(near)?;
+        let neighbor = |id: Option<TrialId>| -> SpiceResult<Option<Real>> {
+            Ok(id
+                .map(|id| self.arena.frequency(id))
+                .transpose()?
+                .map(|s| s.re))
+        };
+        let (left, right) = (neighbor(t.prev)?, neighbor(t.next)?);
+        let root = t.is_root();
+        let p1 = if self.trapped == Trap::Bracket(Region::RightCrossing) {
             t.s.re
         } else {
             let mut p1 = t.s.re;
@@ -1287,7 +1701,7 @@ impl Search<'_> {
             }
             p1 / 2.0
         };
-        let p2 = if self.trapped == 1 {
+        let p2 = if self.trapped == Trap::Bracket(Region::LeftCrossing) {
             t.s.re
         } else {
             let mut p2 = t.s.re;
@@ -1304,200 +1718,215 @@ impl Search<'_> {
         if left.is_some_and(|l| (p1 - l).abs() / l.abs() + abstol / reltol < reltol)
             || right.is_some_and(|r| (p2 - r).abs() / r.abs() + abstol / reltol < reltol)
         {
-            return false;
+            return Ok(false);
         }
-        self.trials[new].s.re = if self.trapped != 2 && t.s.re - p1 > p2 - t.s.re {
-            p1
-        } else {
-            p2
-        };
-        true
+        candidate.re =
+            if self.trapped != Trap::Bracket(Region::RightCrossing) && t.s.re - p1 > p2 - t.s.re {
+                p1
+            } else {
+                p2
+            };
+        Ok(true)
+    }
+}
+
+/// `NIpzSym2`: deflated quadratic fit through three real trials.
+fn sym2(
+    t0: &Trial,
+    t1: &Trial,
+    t2: &Trial,
+    region: Region,
+    curvature: &mut Curvature,
+) -> SpiceResult<Real> {
+    let mut dx0 = t1.s.re - t0.s.re;
+    let mut dx1 = t2.s.re - t1.s.re;
+    let x0 = (t0.s.re + t1.s.re) / 2.0;
+    let mut d2x = (t2.s.re - t0.s.re) / 2.0;
+
+    let (mut a, mut a_mag) = zaddeq(t1.f_def.re, t1.mag_def, -t0.f_def.re, t0.mag_def)?;
+    let mut tmag = 0;
+    r_norm(&mut dx0, &mut tmag)?;
+    a /= dx0;
+    a_mag -= tmag;
+    r_norm(&mut a, &mut a_mag)?;
+
+    let (mut b, mut b_mag) = zaddeq(t2.f_def.re, t2.mag_def, -t1.f_def.re, t1.mag_def)?;
+    tmag = 0;
+    r_norm(&mut dx1, &mut tmag)?;
+    b /= dx1;
+    b_mag -= tmag;
+    r_norm(&mut b, &mut b_mag)?;
+
+    let (mut c, mut c_mag) = zaddeq(b, b_mag, -a, a_mag)?;
+    tmag = 0;
+    r_norm(&mut d2x, &mut tmag)?;
+    c /= d2x;
+    c_mag -= tmag;
+    r_norm(&mut c, &mut c_mag)?;
+
+    if c == 0.0 || ((a == 0.0 || c_mag < a_mag - 40) && (b == 0.0 || c_mag < b_mag - 40)) {
+        if a == 0.0 {
+            a = b;
+            a_mag = b_mag;
+        }
+        if a == 0.0 {
+            return Ok(t1.s.re);
+        }
+        let s = materialize_power(-t1.f_def.re / a, t1.mag_def - a_mag);
+        return Ok(s + t1.s.re);
     }
 
-    /// `NIpzSym2`: deflated quadratic fit through three real trials.
-    fn sym2(&mut self, set: &Set) -> SpiceResult<Real> {
-        let t0 = self.neighborhood_trial(set[0])?.clone();
-        let t1 = self.neighborhood_trial(set[1])?.clone();
-        let t2 = self.neighborhood_trial(set[2])?.clone();
-        let mut dx0 = t1.s.re - t0.s.re;
-        let mut dx1 = t2.s.re - t1.s.re;
-        let x0 = (t0.s.re + t1.s.re) / 2.0;
-        let mut d2x = (t2.s.re - t0.s.re) / 2.0;
+    a /= c;
+    r_norm(&mut a, &mut a_mag)?;
+    a_mag -= c_mag;
+    let mut diff = t1.s.re - x0;
+    tmag = 0;
+    r_norm(&mut diff, &mut tmag)?;
+    (a, a_mag) = zaddeq(a, a_mag, diff, tmag)?;
 
-        let (mut a, mut a_mag) = zaddeq(t1.f_def.re, t1.mag_def, -t0.f_def.re, t0.mag_def)?;
-        let mut tmag = 0;
-        r_norm(&mut dx0, &mut tmag)?;
-        a /= dx0;
-        a_mag -= tmag;
-        r_norm(&mut a, &mut a_mag)?;
+    b = 2.0 * t1.f_def.re / c;
+    b_mag = t1.mag_def - c_mag;
+    r_norm(&mut b, &mut b_mag)?;
 
-        let (mut b, mut b_mag) = zaddeq(t2.f_def.re, t2.mag_def, -t1.f_def.re, t1.mag_def)?;
-        tmag = 0;
-        r_norm(&mut dx1, &mut tmag)?;
-        b /= dx1;
-        b_mag -= tmag;
-        r_norm(&mut b, &mut b_mag)?;
-
-        let (mut c, mut c_mag) = zaddeq(b, b_mag, -a, a_mag)?;
-        tmag = 0;
-        r_norm(&mut d2x, &mut tmag)?;
-        c /= d2x;
-        c_mag -= tmag;
-        r_norm(&mut c, &mut c_mag)?;
-
-        if c == 0.0 || ((a == 0.0 || c_mag < a_mag - 40) && (b == 0.0 || c_mag < b_mag - 40)) {
-            if a == 0.0 {
-                a = b;
-                a_mag = b_mag;
-            }
-            if a == 0.0 {
-                return Ok(t1.s.re);
-            }
-            let s = materialize_power(-t1.f_def.re / a, t1.mag_def - a_mag);
-            return Ok(s + t1.s.re);
+    let (mut disc, mut disc_mag) = zaddeq(a * a, 2 * a_mag, -b, b_mag)?;
+    let complex = disc < 0.0;
+    if complex {
+        disc *= -1.0;
+    }
+    if disc_mag % 2 == 0 {
+        disc = disc.sqrt();
+    } else {
+        disc = (2.0 * disc).sqrt();
+        disc_mag -= 1;
+    }
+    disc_mag /= 2;
+    if complex {
+        if curvature.value == 0.0 {
+            curvature.value = disc;
+            curvature.exponent = disc_mag;
         }
-
-        a /= c;
-        r_norm(&mut a, &mut a_mag)?;
-        a_mag -= c_mag;
-        let mut diff = t1.s.re - x0;
-        tmag = 0;
-        r_norm(&mut diff, &mut tmag)?;
-        (a, a_mag) = zaddeq(a, a_mag, diff, tmag)?;
-
-        b = 2.0 * t1.f_def.re / c;
-        b_mag = t1.mag_def - c_mag;
-        r_norm(&mut b, &mut b_mag)?;
-
-        let (mut disc, mut disc_mag) = zaddeq(a * a, 2 * a_mag, -b, b_mag)?;
-        let complex = disc < 0.0;
-        if complex {
-            disc *= -1.0;
-        }
-        if disc_mag % 2 == 0 {
-            disc = disc.sqrt();
-        } else {
-            disc = (2.0 * disc).sqrt();
-            disc_mag -= 1;
-        }
-        disc_mag /= 2;
-        if complex {
-            if self.pz_k == 0.0 {
-                self.pz_k = disc;
-                self.pz_k_mag = disc_mag;
-            }
-            disc = 0.0;
-            disc_mag = 0;
-        }
-        (c, c_mag) = if a * disc >= 0.0 {
-            zaddeq(a, a_mag, disc, disc_mag)?
-        } else {
-            zaddeq(a, a_mag, -disc, disc_mag)?
-        };
-        if c == 0.0 {
-            b = 0.0;
-            b_mag = 0;
-        } else {
-            b /= c;
-            b_mag -= c_mag;
-        }
-        (b, b_mag) = zaddeq(t1.s.re, 0, -b, b_mag)?;
-        (c, c_mag) = zaddeq(t1.s.re, 0, -c, c_mag)?;
-        b = materialize_power(b, b_mag);
-        c = materialize_power(c, c_mag);
-        let outside = |x: Real| x < t0.s.re || x > t2.s.re;
-        Ok(if outside(b) {
-            if outside(c) {
-                match self.trapped {
-                    1 => (t0.s.re + t1.s.re) / 2.0,
-                    2 => (t1.s.re + t2.s.re) / 2.0,
-                    3 => {
-                        if (t1.s.re - c).abs() < (t1.s.re - b).abs() {
-                            (t1.s.re + c) / 2.0
-                        } else {
-                            (t1.s.re + b) / 2.0
-                        }
-                    }
-                    _ => {
-                        return Err(numerical("pole-zero search", "Lost numerical stability"));
+        disc = 0.0;
+        disc_mag = 0;
+    }
+    (c, c_mag) = if a * disc >= 0.0 {
+        zaddeq(a, a_mag, disc, disc_mag)?
+    } else {
+        zaddeq(a, a_mag, -disc, disc_mag)?
+    };
+    if c == 0.0 {
+        b = 0.0;
+        b_mag = 0;
+    } else {
+        b /= c;
+        b_mag -= c_mag;
+    }
+    (b, b_mag) = zaddeq(t1.s.re, 0, -b, b_mag)?;
+    (c, c_mag) = zaddeq(t1.s.re, 0, -c, c_mag)?;
+    b = materialize_power(b, b_mag);
+    c = materialize_power(c, c_mag);
+    let outside = |x: Real| x < t0.s.re || x > t2.s.re;
+    Ok(if outside(b) {
+        if outside(c) {
+            match region {
+                Region::LeftCrossing => (t0.s.re + t1.s.re) / 2.0,
+                Region::RightCrossing => (t1.s.re + t2.s.re) / 2.0,
+                Region::Minimum => {
+                    if (t1.s.re - c).abs() < (t1.s.re - b).abs() {
+                        (t1.s.re + c) / 2.0
+                    } else {
+                        (t1.s.re + b) / 2.0
                     }
                 }
-            } else {
-                c
             }
-        } else if outside(c) || a > 0.0 {
-            b
         } else {
             c
-        })
-    }
+        }
+    } else if outside(c) || a > 0.0 {
+        b
+    } else {
+        c
+    })
+}
 
-    /// `NIpzMuller`.
-    fn muller(&self, set: &Set) -> SpiceResult<Cx> {
-        let t = [
-            self.neighborhood_trial(set[0])?,
-            self.neighborhood_trial(set[1])?,
-            self.neighborhood_trial(set[2])?,
-        ];
-        let mut min = -999_999;
-        let mut count = 0;
-        let mut total = 0;
-        for trial in t {
-            if !trial.f_def.is_zero() {
-                if min < trial.mag_def - 50 {
-                    min = trial.mag_def - 50;
-                }
-                total += trial.mag_def;
-                count += 1;
+/// `NIpzMuller`.
+fn muller(t: [&Trial; 3]) -> SpiceResult<Cx> {
+    let mut min = -999_999;
+    let mut count = 0;
+    let mut total = 0;
+    for trial in t {
+        if !trial.f_def.is_zero() {
+            if min < trial.mag_def - 50 {
+                min = trial.mag_def - 50;
             }
+            total += trial.mag_def;
+            count += 1;
         }
-        let mut magx = if count != 0 { total / count } else { total };
-        if magx < min {
-            magx = min;
-        }
-        let mut scale = [1.0; 3];
-        for (i, trial) in t.iter().enumerate() {
-            let mag = trial.mag_def - magx;
-            scale[i] = if mag < -90 {
-                0.0
-            } else {
-                materialize_power(1.0, mag)
-            };
-        }
-        let f: [Cx; 3] = std::array::from_fn(|i| t[i].f_def.scale(scale[i]));
-        let h0 = t[0].s.sub(t[1].s);
-        let h1 = t[1].s.sub(t[2].s);
-        let lambda = h0.div(h1);
-        let mut delta = lambda;
-        delta.re += 1.0;
-
-        let mut a = f[2].mul(lambda);
-        let mut c = f[1].mul(delta);
-        a = a.sub(c);
-        a = a.add(f[0]);
-        a = a.mul(lambda);
-
-        let mut b = lambda.mul(lambda);
-        b = b.mul(f[2]);
-        c = delta.mul(delta);
-        c = c.mul(f[1]);
-        b = b.sub(c);
-        c = lambda.add(delta);
-        c = c.mul(f[0]);
-        b = b.add(c);
-
-        c = delta.mul(f[0]);
-
-        normalize_muller(&mut a, &mut b, &mut c)?;
-        let mut d = b.mul(b);
-        let e = a.scale(4.0).mul(c);
-        d = d.sub(e);
-        d = d.sqrt();
-        let q = b.re * d.re + b.im * d.im;
-        b = if q > 0.0 { b.add(d) } else { b.sub(d) };
-        c = c.div(b.scale(-0.5));
-        Ok(h0.mul(c).add(t[0].s))
     }
+    let mut magx = if count != 0 { total / count } else { total };
+    if magx < min {
+        magx = min;
+    }
+    let mut scale = [1.0; 3];
+    for (i, trial) in t.iter().enumerate() {
+        let mag = trial.mag_def - magx;
+        scale[i] = if mag < -90 {
+            0.0
+        } else {
+            materialize_power(1.0, mag)
+        };
+    }
+    let f: [Cx; 3] = std::array::from_fn(|i| t[i].f_def.scale(scale[i]));
+    let h0 = t[0].s.sub(t[1].s);
+    let h1 = t[1].s.sub(t[2].s);
+    let lambda = h0.div(h1);
+    let mut delta = lambda;
+    delta.re += 1.0;
+
+    let mut a = f[2].mul(lambda);
+    let mut c = f[1].mul(delta);
+    a = a.sub(c);
+    a = a.add(f[0]);
+    a = a.mul(lambda);
+
+    let mut b = lambda.mul(lambda);
+    b = b.mul(f[2]);
+    c = delta.mul(delta);
+    c = c.mul(f[1]);
+    b = b.sub(c);
+    c = lambda.add(delta);
+    c = c.mul(f[0]);
+    b = b.add(c);
+
+    c = delta.mul(f[0]);
+
+    normalize_muller(&mut a, &mut b, &mut c)?;
+    let mut d = b.mul(b);
+    let e = a.scale(4.0).mul(c);
+    d = d.sub(e);
+    d = d.sqrt();
+    let q = b.re * d.re + b.im * d.im;
+    b = if q > 0.0 { b.add(d) } else { b.sub(d) };
+    c = c.div(b.scale(-0.5));
+    Ok(h0.mul(c).add(t[0].s))
+}
+
+#[cfg(test)]
+pub(crate) fn check_c_trace(load: &PencilLoad, name: &str, trace: &str) {
+    let mut search = Search::new(load).unwrap();
+    let result = search.find_zeros();
+    eprintln!(
+        "TRACECASE {name} iterations={} result={result:?} expected_events={}",
+        search.niter,
+        trace.lines().count()
+    );
+    for event in search.trace {
+        match event {
+            TraceEvent::Proposal(s) => eprintln!("TRIAL {:.17e} {:.17e}", s.re, s.im),
+            TraceEvent::Load(s) => eprintln!("LOAD {:.17e} {:.17e}", s.re, s.im),
+            TraceEvent::Determinant(s, exp) => eprintln!("DET {:.17e} {:.17e} {exp}", s.re, s.im),
+        }
+    }
+    eprintln!("TRACEEND {name}");
 }
 
 #[cfg(test)]
