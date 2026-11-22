@@ -1055,14 +1055,22 @@ impl Bjt {
         }
     }
 
-    fn bias(&self, voltage: impl Fn(NodeId) -> Real) -> Bias {
+    fn bias_nodes(&self) -> [NodeId; 6] {
         let n = self.nodes;
+        [n.bp, n.ep, n.cp, n.b, n.s, n.sc]
+    }
+
+    fn bias_values(&self, [bp, ep, cp, b, s, sc]: [Real; 6]) -> Bias {
         Bias {
-            vbe: self.pol * (voltage(n.bp) - voltage(n.ep)),
-            vbc: self.pol * (voltage(n.bp) - voltage(n.cp)),
-            vbx: self.pol * (voltage(n.b) - voltage(n.cp)),
-            vsub: self.pol * self.subs * (voltage(n.s) - voltage(n.sc)),
+            vbe: self.pol * (bp - ep),
+            vbc: self.pol * (bp - cp),
+            vbx: self.pol * (b - cp),
+            vsub: self.pol * self.subs * (s - sc),
         }
+    }
+
+    fn bias(&self, voltage: impl Fn(NodeId) -> Real) -> Bias {
+        self.bias_values(self.bias_nodes().map(voltage))
     }
 
     /// `bjtload.c`'s branch voltages `(vbe, vbc, vbx, vsub)` for this load,
@@ -1650,7 +1658,16 @@ impl Device for Bjt {
         slots: &mut [Real],
     ) -> SpiceResult<()> {
         let t = self.thermal(context.model_context)?;
-        let v = self.bias(|node| context.voltage(node));
+        let [bp, ep, cp, b, s, sc] = self.bias_nodes();
+        let voltage = |node| context.voltage(node);
+        let v = self.bias_values([
+            voltage(bp)?,
+            voltage(ep)?,
+            voltage(cp)?,
+            voltage(b)?,
+            voltage(s)?,
+            voltage(sc)?,
+        ]);
         let p = c_point(&t, v, context.model_context.gmin)?;
         for (slot, value) in [
             (slot::QSUB + 1, p.charges.capsub),
@@ -2682,11 +2699,8 @@ q1 c b e s qm area=1.3 m=2 temp=85
             let row = circuit.unknowns().node_row(node).unwrap();
             solution.set(row, voltage).unwrap();
         }
-        let distortion = DistortionContext {
-            model_context: &model_context,
-            unknowns: circuit.unknowns(),
-            bias: &solution,
-        };
+        let distortion =
+            DistortionContext::new(&model_context, circuit.unknowns(), &solution).unwrap();
         let biases = [
             Bias {
                 vbe: 0.74,

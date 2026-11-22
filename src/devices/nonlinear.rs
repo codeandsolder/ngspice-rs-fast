@@ -1838,7 +1838,7 @@ impl Device for Diode {
         };
         let p = &self.parameters;
         let t = self.thermal(context.model_context)?;
-        let vd = context.voltage(self.junction[0]) - context.voltage(self.junction[1]);
+        let vd = context.voltage(self.junction[0])? - context.voltage(self.junction[1])?;
         let csat = t.csat + t.csatsw.unwrap_or(0.);
         let vt = t.vt;
         let vte = t.n * vt;

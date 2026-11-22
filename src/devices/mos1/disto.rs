@@ -66,9 +66,9 @@ impl Mos1 {
         let [dp, g, sp, b] = self.inner;
         let v = |node| context.voltage(node);
         let vt = op.vt;
-        let vbs = pol * (v(b) - v(sp));
-        let vgs = pol * (v(g) - v(sp));
-        let vds = pol * (v(dp) - v(sp));
+        let vbs = pol * (v(b)? - v(sp)?);
+        let vgs = pol * (v(g)? - v(sp)?);
+        let vds = pol * (v(dp)? - v(sp)?);
         let vbd = vbs - vds;
         let vgd = vgs - vds;
 

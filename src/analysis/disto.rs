@@ -4,7 +4,7 @@
 //! frequency loop, the solves and the plots), `cktdisto.c` (`CKTdisto`: the
 //! source inputs and the device dispatch), `dkerproc.c` (`DkerProc`: the
 //! output scaling), `dloadfns.c` (the kernel polynomials, see
-//! [`crate::devices::distortion::add_products`]), `dsetparm.c`/`inp2dot.c`
+//! [`crate::devices::distortion::CircuitDistortion::add_products`]), `dsetparm.c`/`inp2dot.c`
 //! (the card) and the device routines summarised in
 //! [`crate::devices::distortion`].
 //!
@@ -41,9 +41,7 @@ use crate::analysis::frequency::{Advance, FrequencyGrid};
 use crate::analysis::linear::{number, plot, unsupported};
 use crate::analysis::results::Plot;
 use crate::analysis::{AnalysisContext, AnalysisPlan};
-use crate::devices::distortion::{
-    CircuitDistortion, DistortionInput, Kernels, Product, add_products, circuit_distortion,
-};
+use crate::devices::distortion::{CircuitDistortion, DistortionInput, Product, circuit_distortion};
 use crate::devices::{Circuit, LinearSystem, SourceKind};
 use crate::maths::complex::ComplexMatrix;
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult, parse_spice_number};
@@ -223,11 +221,11 @@ fn solve_at(
 /// inputs (`cktdisto.c` `D_RHSF1`/`D_RHSF2`).
 fn input_rhs(
     system: &LinearSystem,
-    distortion: &CircuitDistortion,
+    distortion: &CircuitDistortion<'_>,
     second: bool,
 ) -> SpiceResult<Vec<Complex>> {
     let mut rhs = vec![Complex::ZERO; system.a.rows()];
-    for (name, f1, f2) in &distortion.inputs {
+    for (name, f1, f2) in distortion.inputs() {
         let Some(input): Option<DistortionInput> = (if second { *f2 } else { *f1 }) else {
             continue;
         };
@@ -265,44 +263,33 @@ fn scaled(values: &[Complex], k: Real) -> Vec<Complex> {
 }
 
 fn harmonic_outputs(
-    products: &impl Fn(Product, Kernels<'_>, Real) -> SpiceResult<Vec<Complex>>,
-    base: Kernels<'_>,
+    products: &impl Fn(Product<'_>, Real) -> SpiceResult<Vec<Complex>>,
+    h1: &[Complex],
     h2: &[Complex],
     omega1: Real,
 ) -> SpiceResult<Vec<Vec<Complex>>> {
-    let h3 = products(
-        Product::ThreeF1,
-        Kernels {
-            h2: Some(h2),
-            ..base
-        },
-        3. * omega1,
-    )?;
+    let h3 = products(Product::ThreeF1 { h1, h2 }, 3. * omega1)?;
     Ok(vec![scaled(h2, 2.), scaled(&h3, 2.)])
 }
 
 fn intermodulation_outputs(
-    products: &impl Fn(Product, Kernels<'_>, Real) -> SpiceResult<Vec<Complex>>,
-    base: Kernels<'_>,
+    products: &impl Fn(Product<'_>, Real) -> SpiceResult<Vec<Complex>>,
+    h1: &[Complex],
     h2: &[Complex],
     h1_f2: &[Complex],
     omega1: Real,
     omega2: Real,
 ) -> SpiceResult<Vec<Vec<Complex>>> {
-    let with_f2 = Kernels {
-        h1_f2: Some(h1_f2),
-        ..base
-    };
-    let sum = products(Product::F1PlusF2, with_f2, omega1 + omega2)?;
-    let difference = products(Product::F1MinusF2, with_f2, omega1 - omega2)?;
+    let sum = products(Product::F1PlusF2 { h1, h1_f2 }, omega1 + omega2)?;
+    let difference = products(Product::F1MinusF2 { h1, h1_f2 }, omega1 - omega2)?;
     // C computes the doubled frequency before subtracting f2.
     let twice_omega1 = 2. * omega1;
     let third = products(
-        Product::TwoF1MinusF2,
-        Kernels {
-            h2: Some(h2),
-            h2_minus: Some(&difference),
-            ..with_f2
+        Product::TwoF1MinusF2 {
+            h1,
+            h1_f2,
+            h2,
+            h2_minus: &difference,
         },
         twice_omega1 - omega2,
     )?;
@@ -357,11 +344,10 @@ pub(super) fn run(
     let model = context.model_context();
     let distortion = circuit_distortion(circuit, &model, small.bias())?;
     let system = small.system();
-    let unknowns = circuit.unknowns();
     let rhs_f1 = input_rhs(system, &distortion, false)?;
     let intermodulation = card.f2_over_f1.is_some();
     let rhs_f2 = if intermodulation {
-        if !distortion.inputs.iter().any(|(_, _, f2)| f2.is_some()) {
+        if !distortion.inputs().iter().any(|(_, _, f2)| f2.is_some()) {
             // distoan.c E_NOF2SRC.
             return Err(unsupported(
                 ".disto with f2overf1 needs a source with a distof2 input (distoan.c: No \
@@ -376,33 +362,20 @@ pub(super) fn run(
     let omega2 = two_pi * card.start * card.f2_over_f1.unwrap_or(0.);
     let mut plots = output_plots(circuit, intermodulation)?;
     let n = circuit.unknown_count();
-    let products = |product: Product, kernels: Kernels<'_>, omega: Real| {
+    let products = |product: Product<'_>, omega: Real| {
         let mut rhs = vec![Complex::ZERO; n];
-        add_products(
-            &distortion.terms,
-            product,
-            kernels,
-            omega,
-            unknowns,
-            &mut rhs,
-        )?;
+        distortion.add_products(product, omega, &mut rhs)?;
         solve_at(circuit, system, omega, &rhs)
     };
     for &freq in grid {
         let omega1 = two_pi * freq;
         let h1 = solve_at(circuit, system, omega1, &rhs_f1)?;
-        let base = Kernels {
-            h1: &h1,
-            h1_f2: None,
-            h2: None,
-            h2_minus: None,
-        };
-        let h2 = products(Product::TwoF1, base, 2. * omega1)?;
+        let h2 = products(Product::TwoF1 { h1: &h1 }, 2. * omega1)?;
         let outputs = match &rhs_f2 {
-            None => harmonic_outputs(&products, base, &h2, omega1)?,
+            None => harmonic_outputs(&products, &h1, &h2, omega1)?,
             Some(rhs_f2) => {
                 let h1_f2 = solve_at(circuit, system, omega2, rhs_f2)?;
-                intermodulation_outputs(&products, base, &h2, &h1_f2, omega1, omega2)?
+                intermodulation_outputs(&products, &h1, &h2, &h1_f2, omega1, omega2)?
             }
         };
         for (plot, values) in plots.iter_mut().zip(outputs) {

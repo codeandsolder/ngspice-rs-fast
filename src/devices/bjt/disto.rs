@@ -578,10 +578,10 @@ impl Bjt {
         let n = self.nodes;
         let v = |node| context.voltage(node);
         let bias = DistortionBias {
-            vbe: pol * (v(n.bp) - v(n.ep)),
-            vbc: pol * (v(n.b) - v(n.cp)),
-            vsc: pol * (v(n.s) - v(n.cp)),
-            vbb: pol * (v(n.b) - v(n.bp)),
+            vbe: pol * (v(n.bp)? - v(n.ep)?),
+            vbc: pol * (v(n.b)? - v(n.cp)?),
+            vsc: pol * (v(n.s)? - v(n.cp)?),
+            vbb: pol * (v(n.b)? - v(n.bp)?),
         };
         let junctions = distortion_junctions(&t, bias, m, gmin);
         let d_qb = distortion_base_charge(&t, bias, m, &junctions);
