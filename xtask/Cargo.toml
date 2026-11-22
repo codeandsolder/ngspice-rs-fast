@@ -13,3 +13,4 @@ workspace = true
 
 [dependencies]
 ngspice-rs = { path = ".." }
+syn = { version = "3", features = ["full", "visit"] }

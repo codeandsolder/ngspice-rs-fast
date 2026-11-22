@@ -60,22 +60,6 @@ fn strncmp(a: &str, b: &str, n: usize) -> bool {
 ///   instance is the first one in that order; its model resets persist
 ///   into every later instance and pass, its size-dependent resets only
 ///   into instances sharing its (l, w, nf) parameter set in that pass.
-#[expect(
-    clippy::too_many_lines,
-    reason = "keeps the reference numerical routine in the original statement and rounding order"
-)]
-#[expect(
-    clippy::collapsible_if,
-    reason = "preserves the reference conditional order and side-effect boundaries"
-)]
-#[expect(
-    clippy::collapsible_else_if,
-    reason = "keeps the reference branches identifiable by their original conditions"
-)]
-#[expect(
-    clippy::float_cmp,
-    reason = "C checks exact singular denominators and discrete real-valued NF, NGCON and WPEMOD selectors; epsilon comparisons would change model resets and diagnostics"
-)]
 pub(super) fn check_model(
     m: &mut Model,
     h: &mut Instance,
@@ -84,11 +68,22 @@ pub(super) fn check_model(
     model_name: &str,
     messages: &mut Vec<String>,
 ) -> bool {
-    let mut Fatal_Flag: i32 = 0;
     let start = messages.len();
     messages.push(format!(
         "\nChecking parameters for BSIM 4.8 model {model_name}"
     ));
+    version_and_mode_warnings(m, h, messages);
+    let required_fatal = check_required(m, h, p, messages);
+    // Even a fatal required check does not suppress later diagnostics or resets.
+    let recommended_fatal = m.paramChk == 1 && check_recommended(m, h, p, temperature, messages);
+    if messages.len() == start + 1 {
+        messages.truncate(start);
+    }
+    required_fatal || recommended_fatal
+}
+
+/// Compatibility diagnostics preceding parameter validation.
+fn version_and_mode_warnings(m: &Model, h: &Instance, messages: &mut Vec<String>) {
     if (strcmp(&m.version, "4.8.0"))
         && (strncmp(&m.version, "4.80", 4))
         && (strncmp(&m.version, "4.8", 3))
@@ -104,14 +99,29 @@ pub(super) fn check_model(
         messages
             .push("You specified a wrong version number. Working now with BSIM4.8.3.".to_string());
     }
-    if (h.rgateMod == 2) || (h.rgateMod == 3) {
-        if (h.trnqsMod == 1) || (h.acnqsMod == 1) {
-            messages.push(
-                "Warning: You've selected both Rg and charge deficit NQS; select one only."
-                    .to_string(),
-            );
-        }
+    if ((h.rgateMod == 2) || (h.rgateMod == 3)) && ((h.trnqsMod == 1) || (h.acnqsMod == 1)) {
+        messages.push(
+            "Warning: You've selected both Rg and charge deficit NQS; select one only.".to_string(),
+        );
     }
+}
+
+/// Always-on validity checks and mandatory parameter corrections.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)]
+#[expect(
+    clippy::float_cmp,
+    reason = "C checks exact singular denominators and discrete real-valued NF, NGCON and WPEMOD selectors; epsilon comparisons would change model resets and diagnostics"
+)]
+fn check_required(
+    m: &Model,
+    h: &mut Instance,
+    p: &mut SizeParam,
+    messages: &mut Vec<String>,
+) -> bool {
+    let mut Fatal_Flag: i32 = 0;
     if m.toxe <= 0.0 {
         messages.push(format!("Fatal: Toxe = {} is not positive.", c_g(m.toxe)));
         Fatal_Flag = 1;
@@ -386,534 +396,557 @@ pub(super) fn check_model(
         messages.push(format!("Fatal: Vtsswgd = {} is negative.", c_g(m.vtsswgd)));
         Fatal_Flag = 1;
     }
-    if m.paramChk == 1 {
-        if p.leff <= 1.0e-9 {
+    Fatal_Flag != 0
+}
+
+/// Optional recommended-range checks and resets, gated by C's `paramChk`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the reference numerical routine in the original statement and rounding order"
+)]
+#[expect(
+    clippy::collapsible_if,
+    reason = "preserves the reference conditional order and side-effect boundaries"
+)]
+#[expect(
+    clippy::collapsible_else_if,
+    reason = "keeps the reference branches identifiable by their original conditions"
+)]
+#[expect(
+    clippy::float_cmp,
+    reason = "C checks exact singular denominators and discrete real-valued NF, NGCON and WPEMOD selectors; epsilon comparisons would change model resets and diagnostics"
+)]
+fn check_recommended(
+    m: &mut Model,
+    h: &Instance,
+    p: &mut SizeParam,
+    temperature: f64,
+    messages: &mut Vec<String>,
+) -> bool {
+    let mut Fatal_Flag: i32 = 0;
+    if p.leff <= 1.0e-9 {
+        messages.push(format!(
+            "Warning: Leff = {} <= 1.0e-9. Recommended Leff >= 1e-8 ",
+            c_g(p.leff)
+        ));
+    }
+    if p.leffCV <= 1.0e-9 {
+        messages.push(format!(
+            "Warning: Leff for CV = {} <= 1.0e-9. Recommended LeffCV >=1e-8 ",
+            c_g(p.leffCV)
+        ));
+    }
+    if p.weff <= 1.0e-9 {
+        messages.push(format!(
+            "Warning: Weff = {} <= 1.0e-9. Recommended Weff >=1e-7 ",
+            c_g(p.weff)
+        ));
+    }
+    if p.weffCV <= 1.0e-9 {
+        messages.push(format!(
+            "Warning: Weff for CV = {} <= 1.0e-9. Recommended WeffCV >= 1e-7 ",
+            c_g(p.weffCV)
+        ));
+    }
+    if m.toxe < 1.0e-10 {
+        messages.push(format!(
+            "Warning: Toxe = {} is less than 1A. Recommended Toxe >= 5A",
+            c_g(m.toxe)
+        ));
+    }
+    if h.toxp < 1.0e-10 {
+        messages.push(format!(
+            "Warning: Toxp = {} is less than 1A. Recommended Toxp >= 5A",
+            c_g(h.toxp)
+        ));
+    }
+    if m.toxm < 1.0e-10 {
+        messages.push(format!(
+            "Warning: Toxm = {} is less than 1A. Recommended Toxm >= 5A",
+            c_g(m.toxm)
+        ));
+    }
+    if p.ndep <= 1.0e12 {
+        messages.push(format!("Warning: Ndep = {} may be too small.", c_g(p.ndep)));
+    } else if p.ndep >= 1.0e21 {
+        messages.push(format!("Warning: Ndep = {} may be too large.", c_g(p.ndep)));
+    }
+    if p.nsub <= 1.0e14 {
+        messages.push(format!("Warning: Nsub = {} may be too small.", c_g(p.nsub)));
+    } else if p.nsub >= 1.0e21 {
+        messages.push(format!("Warning: Nsub = {} may be too large.", c_g(p.nsub)));
+    }
+    if (p.ngate > 0.0) && (p.ngate <= 1.0e18) {
+        messages.push(format!(
+            "Warning: Ngate = {} is less than 1.E18cm^-3.",
+            c_g(p.ngate)
+        ));
+    }
+    if p.dvt0 < 0.0 {
+        messages.push(format!("Warning: Dvt0 = {} is negative.", c_g(p.dvt0)));
+    }
+    if fabs(1.0e-8 / (p.w0 + p.weff)) > 10.0 {
+        messages.push("Warning: (W0 + Weff) may be too small.".to_string());
+    }
+    if p.nfactor < 0.0 {
+        messages.push(format!(
+            "Warning: Nfactor = {} is negative.",
+            c_g(p.nfactor)
+        ));
+    }
+    if p.cdsc < 0.0 {
+        messages.push(format!("Warning: Cdsc = {} is negative.", c_g(p.cdsc)));
+    }
+    if p.cdscd < 0.0 {
+        messages.push(format!("Warning: Cdscd = {} is negative.", c_g(p.cdscd)));
+    }
+    if h.eta0 < 0.0 {
+        messages.push(format!("Warning: Eta0 = {} is negative.", c_g(h.eta0)));
+    }
+    if m.gidlclamp >= 0.0 {
+        messages.push(format!(
+            "Warning: gidlclamp = {} is zero or positive.",
+            c_g(m.gidlclamp)
+        ));
+    }
+    if fabs(1.0e-8 / (p.b1 + p.weff)) > 10.0 {
+        messages.push("Warning: (B1 + Weff) may be too small.".to_string());
+    }
+    if p.a2 < 0.01 {
+        messages.push(format!(
+            "Warning: A2 = {} is too small. Set to 0.01.",
+            c_g(p.a2)
+        ));
+        p.a2 = 0.01;
+    } else if p.a2 > 1.0 {
+        messages.push(format!(
+            "Warning: A2 = {} is larger than 1. A2 is set to 1 and A1 is set to 0.",
+            c_g(p.a2)
+        ));
+        p.a2 = 1.0;
+        p.a1 = 0.0;
+    }
+    if p.prwg < 0.0 {
+        messages.push(format!(
+            "Warning: Prwg = {} is negative. Set to zero.",
+            c_g(p.prwg)
+        ));
+        p.prwg = 0.0;
+    }
+    if p.rdsw < 0.0 {
+        messages.push(format!(
+            "Warning: Rdsw = {} is negative. Set to zero.",
+            c_g(p.rdsw)
+        ));
+        p.rdsw = 0.0;
+        p.rds0 = 0.0;
+    }
+    if p.rds0 < 0.0 {
+        messages.push(format!(
+            "Warning: Rds at current temperature = {} is negative. Set to zero.",
+            c_g(p.rds0)
+        ));
+        p.rds0 = 0.0;
+    }
+    if p.rdswmin < 0.0 {
+        messages.push(format!(
+            "Warning: Rdswmin at current temperature = {} is negative. Set to zero.",
+            c_g(p.rdswmin)
+        ));
+        p.rdswmin = 0.0;
+    }
+    if p.pscbe2 <= 0.0 {
+        messages.push(format!(
+            "Warning: Pscbe2 = {} is not positive.",
+            c_g(p.pscbe2)
+        ));
+    }
+    if p.vsattemp < 1.0e3 {
+        messages.push(format!(
+            "Warning: Vsat at current temperature = {} may be too small.",
+            c_g(p.vsattemp)
+        ));
+    }
+    if (m.lambdaGiven) && (p.lambda > 0.0) {
+        if p.lambda > 1.0e-9 {
             messages.push(format!(
-                "Warning: Leff = {} <= 1.0e-9. Recommended Leff >= 1e-8 ",
-                c_g(p.leff)
+                "Warning: Lambda = {} may be too large.",
+                c_g(p.lambda)
             ));
         }
-        if p.leffCV <= 1.0e-9 {
+    }
+    if (m.vtlGiven) && (p.vtl > 0.0) {
+        if p.vtl < 6.0e4 {
             messages.push(format!(
-                "Warning: Leff for CV = {} <= 1.0e-9. Recommended LeffCV >=1e-8 ",
-                c_g(p.leffCV)
+                "Warning: Thermal velocity vtl = {} may be too small.",
+                c_g(p.vtl)
             ));
         }
-        if p.weff <= 1.0e-9 {
+        if p.xn < 3.0 {
             messages.push(format!(
-                "Warning: Weff = {} <= 1.0e-9. Recommended Weff >=1e-7 ",
-                c_g(p.weff)
+                "Warning: back scattering coeff xn = {} is too small. Reset to 3.0 ",
+                c_g(p.xn)
+            ));
+            p.xn = 3.0;
+        }
+        if m.lc < 0.0 {
+            messages.push(format!(
+                "Warning: back scattering coeff lc = {} is too small. Reset to 0.0",
+                c_g(m.lc)
+            ));
+            p.lc = 0.0;
+        }
+    }
+    if p.pdibl1 < 0.0 {
+        messages.push(format!("Warning: Pdibl1 = {} is negative.", c_g(p.pdibl1)));
+    }
+    if p.pdibl2 < 0.0 {
+        messages.push(format!("Warning: Pdibl2 = {} is negative.", c_g(p.pdibl2)));
+    }
+    if (h.sa > 0.0) && (h.sb > 0.0) && ((h.nf == 1.0) || ((h.nf > 1.0) && (h.sd > 0.0))) {
+        if m.lodk2 <= 0.0 {
+            messages.push(format!(
+                "Warning: LODK2 = {} is not positive.",
+                c_g(m.lodk2)
             ));
         }
-        if p.weffCV <= 1.0e-9 {
+        if m.lodeta0 <= 0.0 {
             messages.push(format!(
-                "Warning: Weff for CV = {} <= 1.0e-9. Recommended WeffCV >= 1e-7 ",
-                c_g(p.weffCV)
+                "Warning: LODETA0 = {} is not positive.",
+                c_g(m.lodeta0)
             ));
         }
-        if m.toxe < 1.0e-10 {
-            messages.push(format!(
-                "Warning: Toxe = {} is less than 1A. Recommended Toxe >= 5A",
-                c_g(m.toxe)
-            ));
+    }
+    if h.rgateMod == 1 {
+        if m.rshg <= 0.0 {
+            messages.push("Warning: rshg should be positive for rgateMod = 1.".to_string());
         }
-        if h.toxp < 1.0e-10 {
-            messages.push(format!(
-                "Warning: Toxp = {} is less than 1A. Recommended Toxp >= 5A",
-                c_g(h.toxp)
-            ));
+    } else if h.rgateMod == 2 {
+        if m.rshg <= 0.0 {
+            messages.push("Warning: rshg <= 0.0 for rgateMod = 2.".to_string());
+        } else if p.xrcrg1 <= 0.0 {
+            messages.push("Warning: xrcrg1 <= 0.0 for rgateMod = 2.".to_string());
         }
-        if m.toxm < 1.0e-10 {
-            messages.push(format!(
-                "Warning: Toxm = {} is less than 1A. Recommended Toxm >= 5A",
-                c_g(m.toxm)
-            ));
+    }
+    if h.rgateMod == 3 {
+        if m.rshg <= 0.0 {
+            messages.push("Warning: rshg should be positive for rgateMod = 3.".to_string());
+        } else if p.xrcrg1 <= 0.0 {
+            messages.push("Warning: xrcrg1 should be positive for rgateMod = 3.".to_string());
         }
-        if p.ndep <= 1.0e12 {
-            messages.push(format!("Warning: Ndep = {} may be too small.", c_g(p.ndep)));
-        } else if p.ndep >= 1.0e21 {
-            messages.push(format!("Warning: Ndep = {} may be too large.", c_g(p.ndep)));
+    }
+    if m.rbps0 <= 0.0 {
+        messages.push(format!("Fatal: RBPS0 = {} is not positive.", c_g(m.rbps0)));
+        Fatal_Flag = 1;
+    }
+    if m.rbpd0 <= 0.0 {
+        messages.push(format!("Fatal: RBPD0 = {} is not positive.", c_g(m.rbpd0)));
+        Fatal_Flag = 1;
+    }
+    if m.rbpbx0 <= 0.0 {
+        messages.push(format!(
+            "Fatal: RBPBX0 = {} is not positive.",
+            c_g(m.rbpbx0)
+        ));
+        Fatal_Flag = 1;
+    }
+    if m.rbpby0 <= 0.0 {
+        messages.push(format!(
+            "Fatal: RBPBY0 = {} is not positive.",
+            c_g(m.rbpby0)
+        ));
+        Fatal_Flag = 1;
+    }
+    if m.rbdbx0 <= 0.0 {
+        messages.push(format!(
+            "Fatal: RBDBX0 = {} is not positive.",
+            c_g(m.rbdbx0)
+        ));
+        Fatal_Flag = 1;
+    }
+    if m.rbdby0 <= 0.0 {
+        messages.push(format!(
+            "Fatal: RBDBY0 = {} is not positive.",
+            c_g(m.rbdby0)
+        ));
+        Fatal_Flag = 1;
+    }
+    if m.rbsbx0 <= 0.0 {
+        messages.push(format!(
+            "Fatal: RBSBX0 = {} is not positive.",
+            c_g(m.rbsbx0)
+        ));
+        Fatal_Flag = 1;
+    }
+    if m.rbsby0 <= 0.0 {
+        messages.push(format!(
+            "Fatal: RBSBY0 = {} is not positive.",
+            c_g(m.rbsby0)
+        ));
+        Fatal_Flag = 1;
+    }
+    if p.noff < 0.1 {
+        messages.push(format!("Warning: Noff = {} is too small.", c_g(p.noff)));
+    }
+    if p.voffcv < -0.5 {
+        messages.push(format!("Warning: Voffcv = {} is too small.", c_g(p.voffcv)));
+    }
+    if p.moin < 5.0 {
+        messages.push(format!("Warning: Moin = {} is too small.", c_g(p.moin)));
+    }
+    if p.moin > 25.0 {
+        messages.push(format!("Warning: Moin = {} is too large.", c_g(p.moin)));
+    }
+    if m.capMod == 2 {
+        if p.acde < 0.1 {
+            messages.push(format!("Warning: Acde = {} is too small.", c_g(p.acde)));
         }
-        if p.nsub <= 1.0e14 {
-            messages.push(format!("Warning: Nsub = {} may be too small.", c_g(p.nsub)));
-        } else if p.nsub >= 1.0e21 {
-            messages.push(format!("Warning: Nsub = {} may be too large.", c_g(p.nsub)));
+        if p.acde > 1.6 {
+            messages.push(format!("Warning: Acde = {} is too large.", c_g(p.acde)));
         }
-        if (p.ngate > 0.0) && (p.ngate <= 1.0e18) {
-            messages.push(format!(
-                "Warning: Ngate = {} is less than 1.E18cm^-3.",
-                c_g(p.ngate)
-            ));
-        }
-        if p.dvt0 < 0.0 {
-            messages.push(format!("Warning: Dvt0 = {} is negative.", c_g(p.dvt0)));
-        }
-        if fabs(1.0e-8 / (p.w0 + p.weff)) > 10.0 {
-            messages.push("Warning: (W0 + Weff) may be too small.".to_string());
-        }
-        if p.nfactor < 0.0 {
-            messages.push(format!(
-                "Warning: Nfactor = {} is negative.",
-                c_g(p.nfactor)
-            ));
-        }
-        if p.cdsc < 0.0 {
-            messages.push(format!("Warning: Cdsc = {} is negative.", c_g(p.cdsc)));
-        }
-        if p.cdscd < 0.0 {
-            messages.push(format!("Warning: Cdscd = {} is negative.", c_g(p.cdscd)));
-        }
-        if h.eta0 < 0.0 {
-            messages.push(format!("Warning: Eta0 = {} is negative.", c_g(h.eta0)));
-        }
-        if m.gidlclamp >= 0.0 {
-            messages.push(format!(
-                "Warning: gidlclamp = {} is zero or positive.",
-                c_g(m.gidlclamp)
-            ));
-        }
-        if fabs(1.0e-8 / (p.b1 + p.weff)) > 10.0 {
-            messages.push("Warning: (B1 + Weff) may be too small.".to_string());
-        }
-        if p.a2 < 0.01 {
-            messages.push(format!(
-                "Warning: A2 = {} is too small. Set to 0.01.",
-                c_g(p.a2)
-            ));
-            p.a2 = 0.01;
-        } else if p.a2 > 1.0 {
-            messages.push(format!(
-                "Warning: A2 = {} is larger than 1. A2 is set to 1 and A1 is set to 0.",
-                c_g(p.a2)
-            ));
-            p.a2 = 1.0;
-            p.a1 = 0.0;
-        }
-        if p.prwg < 0.0 {
-            messages.push(format!(
-                "Warning: Prwg = {} is negative. Set to zero.",
-                c_g(p.prwg)
-            ));
-            p.prwg = 0.0;
-        }
-        if p.rdsw < 0.0 {
-            messages.push(format!(
-                "Warning: Rdsw = {} is negative. Set to zero.",
-                c_g(p.rdsw)
-            ));
-            p.rdsw = 0.0;
-            p.rds0 = 0.0;
-        }
-        if p.rds0 < 0.0 {
-            messages.push(format!(
-                "Warning: Rds at current temperature = {} is negative. Set to zero.",
-                c_g(p.rds0)
-            ));
-            p.rds0 = 0.0;
-        }
-        if p.rdswmin < 0.0 {
-            messages.push(format!(
-                "Warning: Rdswmin at current temperature = {} is negative. Set to zero.",
-                c_g(p.rdswmin)
-            ));
-            p.rdswmin = 0.0;
-        }
-        if p.pscbe2 <= 0.0 {
-            messages.push(format!(
-                "Warning: Pscbe2 = {} is not positive.",
-                c_g(p.pscbe2)
-            ));
-        }
-        if p.vsattemp < 1.0e3 {
-            messages.push(format!(
-                "Warning: Vsat at current temperature = {} may be too small.",
-                c_g(p.vsattemp)
-            ));
-        }
-        if (m.lambdaGiven) && (p.lambda > 0.0) {
-            if p.lambda > 1.0e-9 {
+    }
+    if m.cgdo < 0.0 {
+        messages.push(format!(
+            "Warning: cgdo = {} is negative. Set to zero.",
+            c_g(m.cgdo)
+        ));
+        m.cgdo = 0.0;
+    }
+    if m.cgso < 0.0 {
+        messages.push(format!(
+            "Warning: cgso = {} is negative. Set to zero.",
+            c_g(m.cgso)
+        ));
+        m.cgso = 0.0;
+    }
+    if m.cgbo < 0.0 {
+        messages.push(format!(
+            "Warning: cgbo = {} is negative. Set to zero.",
+            c_g(m.cgbo)
+        ));
+        m.cgbo = 0.0;
+    }
+    if m.tnoiMod == 1 {
+        messages.push(format!(
+            "Warning: TNOIMOD={} is not supported and may be removed from future version.",
+            m.tnoiMod
+        ));
+    }
+    if m.idovvdsc <= 0.0 {
+        messages.push(format!(
+            "Warning: idovvdsc = {} is zero or negative.",
+            c_g(m.idovvdsc)
+        ));
+    }
+    if (strcmp(&m.version, "4.8.1"))
+        && (strncmp(&m.version, "4.81", 4))
+        && (strncmp(&m.version, "4.8", 3))
+        && (strcmp(&m.version, "4.8.2"))
+        && (strncmp(&m.version, "4.82", 4))
+        && (strcmp(&m.version, "4.8.3"))
+        && (strncmp(&m.version, "4.83", 4))
+    {
+        if m.tnoiMod == 1 || m.tnoiMod == 2 {
+            if m.tnoia < 0.0 {
                 messages.push(format!(
-                    "Warning: Lambda = {} may be too large.",
-                    c_g(p.lambda)
+                    "Warning: tnoia = {} is negative. Set to zero.",
+                    c_g(m.tnoia)
                 ));
+                m.tnoia = 0.0;
             }
-        }
-        if (m.vtlGiven) && (p.vtl > 0.0) {
-            if p.vtl < 6.0e4 {
+            if m.tnoib < 0.0 {
                 messages.push(format!(
-                    "Warning: Thermal velocity vtl = {} may be too small.",
-                    c_g(p.vtl)
+                    "Warning: tnoib = {} is negative. Set to zero.",
+                    c_g(m.tnoib)
                 ));
+                m.tnoib = 0.0;
             }
-            if p.xn < 3.0 {
+            if m.rnoia < 0.0 {
                 messages.push(format!(
-                    "Warning: back scattering coeff xn = {} is too small. Reset to 3.0 ",
-                    c_g(p.xn)
+                    "Warning: rnoia = {} is negative. Set to zero.",
+                    c_g(m.rnoia)
                 ));
-                p.xn = 3.0;
+                m.rnoia = 0.0;
             }
-            if m.lc < 0.0 {
+            if m.rnoib < 0.0 {
                 messages.push(format!(
-                    "Warning: back scattering coeff lc = {} is too small. Reset to 0.0",
-                    c_g(m.lc)
+                    "Warning: rnoib = {} is negative. Set to zero.",
+                    c_g(m.rnoib)
                 ));
-                p.lc = 0.0;
+                m.rnoib = 0.0;
             }
         }
-        if p.pdibl1 < 0.0 {
-            messages.push(format!("Warning: Pdibl1 = {} is negative.", c_g(p.pdibl1)));
-        }
-        if p.pdibl2 < 0.0 {
-            messages.push(format!("Warning: Pdibl2 = {} is negative.", c_g(p.pdibl2)));
-        }
-        if (h.sa > 0.0) && (h.sb > 0.0) && ((h.nf == 1.0) || ((h.nf > 1.0) && (h.sd > 0.0))) {
-            if m.lodk2 <= 0.0 {
+        if m.tnoiMod == 2 {
+            if m.tnoic < 0.0 {
                 messages.push(format!(
-                    "Warning: LODK2 = {} is not positive.",
-                    c_g(m.lodk2)
+                    "Warning: tnoic = {} is negative. Set to zero.",
+                    c_g(m.tnoic)
                 ));
+                m.tnoic = 0.0;
             }
-            if m.lodeta0 <= 0.0 {
+            if m.rnoic < 0.0 {
                 messages.push(format!(
-                    "Warning: LODETA0 = {} is not positive.",
-                    c_g(m.lodeta0)
+                    "Warning: rnoic = {} is negative. Set to zero.",
+                    c_g(m.rnoic)
                 ));
+                m.rnoic = 0.0;
             }
         }
-        if h.rgateMod == 1 {
-            if m.rshg <= 0.0 {
-                messages.push("Warning: rshg should be positive for rgateMod = 1.".to_string());
-            }
-        } else if h.rgateMod == 2 {
-            if m.rshg <= 0.0 {
-                messages.push("Warning: rshg <= 0.0 for rgateMod = 2.".to_string());
-            } else if p.xrcrg1 <= 0.0 {
-                messages.push("Warning: xrcrg1 <= 0.0 for rgateMod = 2.".to_string());
-            }
-        }
-        if h.rgateMod == 3 {
-            if m.rshg <= 0.0 {
-                messages.push("Warning: rshg should be positive for rgateMod = 3.".to_string());
-            } else if p.xrcrg1 <= 0.0 {
-                messages.push("Warning: xrcrg1 should be positive for rgateMod = 3.".to_string());
-            }
-        }
-        if m.rbps0 <= 0.0 {
-            messages.push(format!("Fatal: RBPS0 = {} is not positive.", c_g(m.rbps0)));
-            Fatal_Flag = 1;
-        }
-        if m.rbpd0 <= 0.0 {
-            messages.push(format!("Fatal: RBPD0 = {} is not positive.", c_g(m.rbpd0)));
-            Fatal_Flag = 1;
-        }
-        if m.rbpbx0 <= 0.0 {
-            messages.push(format!(
-                "Fatal: RBPBX0 = {} is not positive.",
-                c_g(m.rbpbx0)
-            ));
-            Fatal_Flag = 1;
-        }
-        if m.rbpby0 <= 0.0 {
-            messages.push(format!(
-                "Fatal: RBPBY0 = {} is not positive.",
-                c_g(m.rbpby0)
-            ));
-            Fatal_Flag = 1;
-        }
-        if m.rbdbx0 <= 0.0 {
-            messages.push(format!(
-                "Fatal: RBDBX0 = {} is not positive.",
-                c_g(m.rbdbx0)
-            ));
-            Fatal_Flag = 1;
-        }
-        if m.rbdby0 <= 0.0 {
-            messages.push(format!(
-                "Fatal: RBDBY0 = {} is not positive.",
-                c_g(m.rbdby0)
-            ));
-            Fatal_Flag = 1;
-        }
-        if m.rbsbx0 <= 0.0 {
-            messages.push(format!(
-                "Fatal: RBSBX0 = {} is not positive.",
-                c_g(m.rbsbx0)
-            ));
-            Fatal_Flag = 1;
-        }
-        if m.rbsby0 <= 0.0 {
-            messages.push(format!(
-                "Fatal: RBSBY0 = {} is not positive.",
-                c_g(m.rbsby0)
-            ));
-            Fatal_Flag = 1;
-        }
-        if p.noff < 0.1 {
-            messages.push(format!("Warning: Noff = {} is too small.", c_g(p.noff)));
-        }
-        if p.voffcv < -0.5 {
-            messages.push(format!("Warning: Voffcv = {} is too small.", c_g(p.voffcv)));
-        }
-        if p.moin < 5.0 {
-            messages.push(format!("Warning: Moin = {} is too small.", c_g(p.moin)));
-        }
-        if p.moin > 25.0 {
-            messages.push(format!("Warning: Moin = {} is too large.", c_g(p.moin)));
-        }
-        if m.capMod == 2 {
-            if p.acde < 0.1 {
-                messages.push(format!("Warning: Acde = {} is too small.", c_g(p.acde)));
-            }
-            if p.acde > 1.6 {
-                messages.push(format!("Warning: Acde = {} is too large.", c_g(p.acde)));
-            }
-        }
-        if m.cgdo < 0.0 {
-            messages.push(format!(
-                "Warning: cgdo = {} is negative. Set to zero.",
-                c_g(m.cgdo)
-            ));
-            m.cgdo = 0.0;
-        }
-        if m.cgso < 0.0 {
-            messages.push(format!(
-                "Warning: cgso = {} is negative. Set to zero.",
-                c_g(m.cgso)
-            ));
-            m.cgso = 0.0;
-        }
-        if m.cgbo < 0.0 {
-            messages.push(format!(
-                "Warning: cgbo = {} is negative. Set to zero.",
-                c_g(m.cgbo)
-            ));
-            m.cgbo = 0.0;
-        }
+    } else {
         if m.tnoiMod == 1 {
-            messages.push(format!(
-                "Warning: TNOIMOD={} is not supported and may be removed from future version.",
-                m.tnoiMod
-            ));
-        }
-        if m.idovvdsc <= 0.0 {
-            messages.push(format!(
-                "Warning: idovvdsc = {} is zero or negative.",
-                c_g(m.idovvdsc)
-            ));
-        }
-        if (strcmp(&m.version, "4.8.1"))
-            && (strncmp(&m.version, "4.81", 4))
-            && (strncmp(&m.version, "4.8", 3))
-            && (strcmp(&m.version, "4.8.2"))
-            && (strncmp(&m.version, "4.82", 4))
-            && (strcmp(&m.version, "4.8.3"))
-            && (strncmp(&m.version, "4.83", 4))
-        {
-            if m.tnoiMod == 1 || m.tnoiMod == 2 {
-                if m.tnoia < 0.0 {
-                    messages.push(format!(
-                        "Warning: tnoia = {} is negative. Set to zero.",
-                        c_g(m.tnoia)
-                    ));
-                    m.tnoia = 0.0;
-                }
-                if m.tnoib < 0.0 {
-                    messages.push(format!(
-                        "Warning: tnoib = {} is negative. Set to zero.",
-                        c_g(m.tnoib)
-                    ));
-                    m.tnoib = 0.0;
-                }
-                if m.rnoia < 0.0 {
-                    messages.push(format!(
-                        "Warning: rnoia = {} is negative. Set to zero.",
-                        c_g(m.rnoia)
-                    ));
-                    m.rnoia = 0.0;
-                }
-                if m.rnoib < 0.0 {
-                    messages.push(format!(
-                        "Warning: rnoib = {} is negative. Set to zero.",
-                        c_g(m.rnoib)
-                    ));
-                    m.rnoib = 0.0;
-                }
-            }
-            if m.tnoiMod == 2 {
-                if m.tnoic < 0.0 {
-                    messages.push(format!(
-                        "Warning: tnoic = {} is negative. Set to zero.",
-                        c_g(m.tnoic)
-                    ));
-                    m.tnoic = 0.0;
-                }
-                if m.rnoic < 0.0 {
-                    messages.push(format!(
-                        "Warning: rnoic = {} is negative. Set to zero.",
-                        c_g(m.rnoic)
-                    ));
-                    m.rnoic = 0.0;
-                }
-            }
-        } else {
-            if m.tnoiMod == 1 {
-                if m.tnoia < 0.0 {
-                    messages.push(format!(
-                        "Warning: tnoia = {} is negative. Set to zero.",
-                        c_g(m.tnoia)
-                    ));
-                    m.tnoia = 0.0;
-                }
-                if m.tnoib < 0.0 {
-                    messages.push(format!(
-                        "Warning: tnoib = {} is negative. Set to zero.",
-                        c_g(m.tnoib)
-                    ));
-                    m.tnoib = 0.0;
-                }
-                if m.rnoia < 0.0 {
-                    messages.push(format!(
-                        "Warning: rnoia = {} is negative. Set to zero.",
-                        c_g(m.rnoia)
-                    ));
-                    m.rnoia = 0.0;
-                }
-                if m.rnoib < 0.0 {
-                    messages.push(format!(
-                        "Warning: rnoib = {} is negative. Set to zero.",
-                        c_g(m.rnoib)
-                    ));
-                    m.rnoib = 0.0;
-                }
-            }
-        }
-        if m.SjctEmissionCoeff < 0.1 {
-            messages.push(format!(
-                "Warning: Njs = {} is less than 0.1. Setting Njs to 0.1.",
-                c_g(m.SjctEmissionCoeff)
-            ));
-            m.SjctEmissionCoeff = 0.1;
-        } else if m.SjctEmissionCoeff < 0.7 {
-            messages.push(format!(
-                "Warning: Njs = {} is less than 0.7.",
-                c_g(m.SjctEmissionCoeff)
-            ));
-        }
-        if m.DjctEmissionCoeff < 0.1 {
-            messages.push(format!(
-                "Warning: Njd = {} is less than 0.1. Setting Njd to 0.1.",
-                c_g(m.DjctEmissionCoeff)
-            ));
-            m.DjctEmissionCoeff = 0.1;
-        } else if m.DjctEmissionCoeff < 0.7 {
-            messages.push(format!(
-                "Warning: Njd = {} is less than 0.7.",
-                c_g(m.DjctEmissionCoeff)
-            ));
-        }
-        if m.njtsstemp < 0.0 {
-            messages.push(format!(
-                "Warning: Njts = {} is negative at temperature = {}.",
-                c_g(m.njtsstemp),
-                c_g(temperature)
-            ));
-        }
-        if m.njtsswstemp < 0.0 {
-            messages.push(format!(
-                "Warning: Njtssw = {} is negative at temperature = {}.",
-                c_g(m.njtsswstemp),
-                c_g(temperature)
-            ));
-        }
-        if m.njtsswgstemp < 0.0 {
-            messages.push(format!(
-                "Warning: Njtsswg = {} is negative at temperature = {}.",
-                c_g(m.njtsswgstemp),
-                c_g(temperature)
-            ));
-        }
-        if m.njtsdGiven && m.njtsdtemp < 0.0 {
-            messages.push(format!(
-                "Warning: Njtsd = {} is negative at temperature = {}.",
-                c_g(m.njtsdtemp),
-                c_g(temperature)
-            ));
-        }
-        if m.njtsswdGiven && m.njtsswdtemp < 0.0 {
-            messages.push(format!(
-                "Warning: Njtsswd = {} is negative at temperature = {}.",
-                c_g(m.njtsswdtemp),
-                c_g(temperature)
-            ));
-        }
-        if m.njtsswgdGiven && m.njtsswgdtemp < 0.0 {
-            messages.push(format!(
-                "Warning: Njtsswgd = {} is negative at temperature = {}.",
-                c_g(m.njtsswgdtemp),
-                c_g(temperature)
-            ));
-        }
-        if m.ntnoi < 0.0 {
-            messages.push(format!(
-                "Warning: ntnoi = {} is negative. Set to zero.",
-                c_g(m.ntnoi)
-            ));
-            m.ntnoi = 0.0;
-        }
-        if m.SbulkJctBotGradingCoeff >= 0.99 {
-            messages.push(format!(
-                "Warning: MJS = {} is too big. Set to 0.99.",
-                c_g(m.SbulkJctBotGradingCoeff)
-            ));
-            m.SbulkJctBotGradingCoeff = 0.99;
-        }
-        if m.SbulkJctSideGradingCoeff >= 0.99 {
-            messages.push(format!(
-                "Warning: MJSWS = {} is too big. Set to 0.99.",
-                c_g(m.SbulkJctSideGradingCoeff)
-            ));
-            m.SbulkJctSideGradingCoeff = 0.99;
-        }
-        if m.SbulkJctGateSideGradingCoeff >= 0.99 {
-            messages.push(format!(
-                "Warning: MJSWGS = {} is too big. Set to 0.99.",
-                c_g(m.SbulkJctGateSideGradingCoeff)
-            ));
-            m.SbulkJctGateSideGradingCoeff = 0.99;
-        }
-        if m.DbulkJctBotGradingCoeff >= 0.99 {
-            messages.push(format!(
-                "Warning: MJD = {} is too big. Set to 0.99.",
-                c_g(m.DbulkJctBotGradingCoeff)
-            ));
-            m.DbulkJctBotGradingCoeff = 0.99;
-        }
-        if m.DbulkJctSideGradingCoeff >= 0.99 {
-            messages.push(format!(
-                "Warning: MJSWD = {} is too big. Set to 0.99.",
-                c_g(m.DbulkJctSideGradingCoeff)
-            ));
-            m.DbulkJctSideGradingCoeff = 0.99;
-        }
-        if m.DbulkJctGateSideGradingCoeff >= 0.99 {
-            messages.push(format!(
-                "Warning: MJSWGD = {} is too big. Set to 0.99.",
-                c_g(m.DbulkJctGateSideGradingCoeff)
-            ));
-            m.DbulkJctGateSideGradingCoeff = 0.99;
-        }
-        if m.wpemod == 1.0 {
-            if m.scref <= 0.0 {
+            if m.tnoia < 0.0 {
                 messages.push(format!(
-                    "Warning: SCREF = {} is not positive. Set to 1e-6.",
-                    c_g(m.scref)
+                    "Warning: tnoia = {} is negative. Set to zero.",
+                    c_g(m.tnoia)
                 ));
-                m.scref = 1e-6;
+                m.tnoia = 0.0;
+            }
+            if m.tnoib < 0.0 {
+                messages.push(format!(
+                    "Warning: tnoib = {} is negative. Set to zero.",
+                    c_g(m.tnoib)
+                ));
+                m.tnoib = 0.0;
+            }
+            if m.rnoia < 0.0 {
+                messages.push(format!(
+                    "Warning: rnoia = {} is negative. Set to zero.",
+                    c_g(m.rnoia)
+                ));
+                m.rnoia = 0.0;
+            }
+            if m.rnoib < 0.0 {
+                messages.push(format!(
+                    "Warning: rnoib = {} is negative. Set to zero.",
+                    c_g(m.rnoib)
+                ));
+                m.rnoib = 0.0;
             }
         }
     }
-    if messages.len() == start + 1 {
-        messages.truncate(start);
+    if m.SjctEmissionCoeff < 0.1 {
+        messages.push(format!(
+            "Warning: Njs = {} is less than 0.1. Setting Njs to 0.1.",
+            c_g(m.SjctEmissionCoeff)
+        ));
+        m.SjctEmissionCoeff = 0.1;
+    } else if m.SjctEmissionCoeff < 0.7 {
+        messages.push(format!(
+            "Warning: Njs = {} is less than 0.7.",
+            c_g(m.SjctEmissionCoeff)
+        ));
+    }
+    if m.DjctEmissionCoeff < 0.1 {
+        messages.push(format!(
+            "Warning: Njd = {} is less than 0.1. Setting Njd to 0.1.",
+            c_g(m.DjctEmissionCoeff)
+        ));
+        m.DjctEmissionCoeff = 0.1;
+    } else if m.DjctEmissionCoeff < 0.7 {
+        messages.push(format!(
+            "Warning: Njd = {} is less than 0.7.",
+            c_g(m.DjctEmissionCoeff)
+        ));
+    }
+    if m.njtsstemp < 0.0 {
+        messages.push(format!(
+            "Warning: Njts = {} is negative at temperature = {}.",
+            c_g(m.njtsstemp),
+            c_g(temperature)
+        ));
+    }
+    if m.njtsswstemp < 0.0 {
+        messages.push(format!(
+            "Warning: Njtssw = {} is negative at temperature = {}.",
+            c_g(m.njtsswstemp),
+            c_g(temperature)
+        ));
+    }
+    if m.njtsswgstemp < 0.0 {
+        messages.push(format!(
+            "Warning: Njtsswg = {} is negative at temperature = {}.",
+            c_g(m.njtsswgstemp),
+            c_g(temperature)
+        ));
+    }
+    if m.njtsdGiven && m.njtsdtemp < 0.0 {
+        messages.push(format!(
+            "Warning: Njtsd = {} is negative at temperature = {}.",
+            c_g(m.njtsdtemp),
+            c_g(temperature)
+        ));
+    }
+    if m.njtsswdGiven && m.njtsswdtemp < 0.0 {
+        messages.push(format!(
+            "Warning: Njtsswd = {} is negative at temperature = {}.",
+            c_g(m.njtsswdtemp),
+            c_g(temperature)
+        ));
+    }
+    if m.njtsswgdGiven && m.njtsswgdtemp < 0.0 {
+        messages.push(format!(
+            "Warning: Njtsswgd = {} is negative at temperature = {}.",
+            c_g(m.njtsswgdtemp),
+            c_g(temperature)
+        ));
+    }
+    if m.ntnoi < 0.0 {
+        messages.push(format!(
+            "Warning: ntnoi = {} is negative. Set to zero.",
+            c_g(m.ntnoi)
+        ));
+        m.ntnoi = 0.0;
+    }
+    if m.SbulkJctBotGradingCoeff >= 0.99 {
+        messages.push(format!(
+            "Warning: MJS = {} is too big. Set to 0.99.",
+            c_g(m.SbulkJctBotGradingCoeff)
+        ));
+        m.SbulkJctBotGradingCoeff = 0.99;
+    }
+    if m.SbulkJctSideGradingCoeff >= 0.99 {
+        messages.push(format!(
+            "Warning: MJSWS = {} is too big. Set to 0.99.",
+            c_g(m.SbulkJctSideGradingCoeff)
+        ));
+        m.SbulkJctSideGradingCoeff = 0.99;
+    }
+    if m.SbulkJctGateSideGradingCoeff >= 0.99 {
+        messages.push(format!(
+            "Warning: MJSWGS = {} is too big. Set to 0.99.",
+            c_g(m.SbulkJctGateSideGradingCoeff)
+        ));
+        m.SbulkJctGateSideGradingCoeff = 0.99;
+    }
+    if m.DbulkJctBotGradingCoeff >= 0.99 {
+        messages.push(format!(
+            "Warning: MJD = {} is too big. Set to 0.99.",
+            c_g(m.DbulkJctBotGradingCoeff)
+        ));
+        m.DbulkJctBotGradingCoeff = 0.99;
+    }
+    if m.DbulkJctSideGradingCoeff >= 0.99 {
+        messages.push(format!(
+            "Warning: MJSWD = {} is too big. Set to 0.99.",
+            c_g(m.DbulkJctSideGradingCoeff)
+        ));
+        m.DbulkJctSideGradingCoeff = 0.99;
+    }
+    if m.DbulkJctGateSideGradingCoeff >= 0.99 {
+        messages.push(format!(
+            "Warning: MJSWGD = {} is too big. Set to 0.99.",
+            c_g(m.DbulkJctGateSideGradingCoeff)
+        ));
+        m.DbulkJctGateSideGradingCoeff = 0.99;
+    }
+    if m.wpemod == 1.0 {
+        if m.scref <= 0.0 {
+            messages.push(format!(
+                "Warning: SCREF = {} is not positive. Set to 1e-6.",
+                c_g(m.scref)
+            ));
+            m.scref = 1e-6;
+        }
     }
     Fatal_Flag != 0
 }
@@ -963,6 +996,33 @@ mod tests {
                 .any(|s| s.contains("Ngcon must be equal to one or two"))
         );
         assert_eq!(instance.ngcon.to_bits(), 1.0_f64.to_bits());
+    }
+
+    #[test]
+    fn fatal_required_checks_do_not_skip_optional_resets() {
+        let mut m = Model {
+            version: "4.8.3".into(),
+            paramChk: 1,
+            cgdo: -1.,
+            ..Model::default()
+        };
+        let (mut h, mut p) = (Instance::default(), SizeParam::default());
+        let mut messages = Vec::new();
+        assert!(check_model(
+            &mut m,
+            &mut h,
+            &mut p,
+            300.15,
+            "nn",
+            &mut messages
+        ));
+        let fatal = messages
+            .iter()
+            .position(|s| s.starts_with("Fatal:"))
+            .unwrap();
+        let reset = messages.iter().position(|s| s.contains("cgdo =")).unwrap();
+        assert!(fatal < reset);
+        assert_eq!(m.cgdo.to_bits(), 0.0_f64.to_bits());
     }
 
     #[test]
