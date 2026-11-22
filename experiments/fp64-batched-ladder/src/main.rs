@@ -2,16 +2,15 @@
 #![feature(portable_simd)]
 #![forbid(unsafe_code)]
 
-use std::{borrow::Cow, hint::black_box, simd::Simd, sync::mpsc, time::Instant};
+use std::{hint::black_box, simd::Simd};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
+use fp64_batched_ladder::{Gpu, median_ms};
 use rayon::prelude::*;
-use wgpu::util::{BufferInitDescriptor, DeviceExt};
 
 const N: usize = 64;
 const TILE: usize = 64;
 const CELLS: usize = N * TILE;
-const REPEATS: usize = 7;
 
 struct Input {
     diagonal: Vec<f64>,
@@ -154,169 +153,12 @@ fn parallel_simd(d: &[f64], b: &[f64], p: &mut [f64], x: &mut [f64]) {
         .for_each(|(((d, b), p), x)| row_simd(d, b, p, x));
 }
 
-fn median_ms(mut f: impl FnMut() -> Result<()>) -> Result<f64> {
-    f()?;
-    let mut times = [0.; REPEATS];
-    for t in &mut times {
-        let start = Instant::now();
-        f()?;
-        *t = start.elapsed().as_secs_f64() * 1000.;
-    }
-    times.sort_by(f64::total_cmp);
-    Ok(times[REPEATS / 2])
-}
-
-struct Gpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    pipeline: wgpu::ComputePipeline,
-}
-
-impl Gpu {
-    async fn new() -> Result<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await?;
-        let info = adapter.get_info();
-        println!(
-            "adapter: {} ({:?}, {})",
-            info.name, info.backend, info.driver
-        );
-        ensure!(
-            adapter.features().contains(wgpu::Features::SHADER_F64),
-            "adapter lacks FP64"
-        );
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::SHADER_F64,
-                ..Default::default()
-            })
-            .await?;
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("FP64 ladder solver"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("ladder.wgsl"))),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("FP64 ladder solver"),
-            layout: None,
-            module: &module,
-            entry_point: Some("solve"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        Ok(Self {
-            device,
-            queue,
-            pipeline,
-        })
-    }
-
-    fn trial(&self, input: &Input, tiles: u32) -> Result<(f64, f64, f64)> {
-        let size = (input.diagonal.len() * size_of::<f64>()) as u64;
-        ensure!(size <= u64::from(self.device.limits().max_storage_buffer_binding_size));
-        let init = |name, data: &[f64]| {
-            self.device.create_buffer_init(&BufferInitDescriptor {
-                label: Some(name),
-                contents: bytemuck::cast_slice(data),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            })
-        };
-        let allocate = |name, usage| {
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(name),
-                size,
-                usage,
-                mapped_at_creation: false,
-            })
-        };
-        let diagonal = init("diagonal", &input.diagonal);
-        let rhs = init("RHS", &input.rhs);
-        let p = allocate("reciprocal", wgpu::BufferUsages::STORAGE);
-        let x = allocate(
-            "solution",
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        );
-        let staging = allocate(
-            "readback",
-            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        );
-        let bindings = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ladder buffers"),
-            layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: diagonal.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: rhs.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: p.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: x.as_entire_binding(),
-                },
-            ],
-        });
-        let dispatch = |readback: bool| -> Result<()> {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &bindings, &[]);
-                pass.dispatch_workgroups(tiles, 1, 1);
-            }
-            if readback {
-                encoder.copy_buffer_to_buffer(&x, 0, &staging, 0, size);
-            }
-            self.queue.submit([encoder.finish()]);
-            self.device.poll(wgpu::PollType::wait_indefinitely())?;
-            Ok(())
-        };
-        let resident = median_ms(|| dispatch(false))?;
-        let mut host_result = vec![0.; input.expected.len()];
-        let transfer = median_ms(|| {
-            self.queue
-                .write_buffer(&diagonal, 0, bytemuck::cast_slice(&input.diagonal));
-            self.queue
-                .write_buffer(&rhs, 0, bytemuck::cast_slice(&input.rhs));
-            dispatch(true)?;
-            let slice = staging.slice(..);
-            let (tx, rx) = mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |result| {
-                let _ = tx.send(result);
-            });
-            self.device.poll(wgpu::PollType::wait_indefinitely())?;
-            rx.recv().context("readback callback dropped")??;
-            {
-                let mapped = slice.get_mapped_range()?;
-                host_result.copy_from_slice(bytemuck::cast_slice(&mapped));
-                black_box(&host_result);
-            }
-            staging.unmap();
-            Ok(())
-        })?;
-        let measured_error = input.check(&host_result)?;
-        Ok((resident, transfer, measured_error))
-    }
-}
-
 fn main() -> Result<()> {
-    let gpu = pollster::block_on(Gpu::new())?;
+    let gpu = pollster::block_on(Gpu::new("FP64 ladder solver", include_str!("ladder.wgsl")))?;
     println!("persistent CPU workers: {}", rayon::current_num_threads());
-    println!("nodes={N}, tile={TILE}, repeats={REPEATS}");
+    println!("nodes={N}, tile={TILE}, repeats=7");
     println!(
-        "systems,scalar_ms,row_simd_ms,parallel_row_simd_ms,gpu_resident_ms,gpu_roundtrip_ms,max_error"
+        "systems,scalar_ms,row_simd_ms,parallel_row_simd_ms,gpu_resident_ms,gpu_amortized_ms,gpu_roundtrip_ms,max_error"
     );
     for tiles in [1_u32, 4, 16, 64, 256, 1024] {
         let input = Input::new(tiles as usize);
@@ -340,9 +182,16 @@ fn main() -> Result<()> {
             })?);
             error = error.max(input.check(&x)?);
         }
-        let (resident, transfer, gpu_error) = gpu.trial(&input, tiles)?;
+        let (resident, throughput, transfer) = gpu.trial(
+            &[&input.diagonal, &input.rhs],
+            &[p.len(), x.len()],
+            None,
+            &mut x,
+            tiles,
+        )?;
+        let gpu_error = input.check(&x)?;
         println!(
-            "{},{:.4},{:.4},{:.4},{resident:.4},{transfer:.4},{:.3e}",
+            "{},{:.4},{:.4},{:.4},{resident:.4},{throughput:.4},{transfer:.4},{:.3e}",
             tiles * TILE as u32,
             timings[0],
             timings[1],
