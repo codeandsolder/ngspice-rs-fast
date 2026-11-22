@@ -416,7 +416,7 @@ mod tests {
     fn fixtures_request_code_models_by_a_marker_comment() {
         let deck = "t\n* xtask-codemodels: spice2poly Analog\n* other\nr1 a 0 1\n.end\n";
         assert_eq!(requested_codemodels(deck), ["spice2poly", "analog"]);
-        assert!(requested_codemodels("t\nr1 a 0 1\n").is_empty());
+        assert_eq!(requested_codemodels("t\nr1 a 0 1\n"), Vec::<String>::new());
     }
 
     #[test]
