@@ -732,6 +732,37 @@ mod tests {
     }
 
     #[test]
+    fn full_retained_selection_moves_the_original_rows_after_printing() {
+        use crate::analysis::{Plot, PlotFlags, Variable};
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use crate::primitives::Complex;
+        use std::path::Path;
+        let parsed = Parser::new()
+            .parse_deck_with_output(&parse_deck_text(
+                Path::new("retained.cir"),
+                "retained\nv1 in 0 1\nr1 in 0 1k\n.op\n.print op all\n.end\n",
+            ))
+            .unwrap();
+        let config = crate::analysis::RunConfig::from_netlist(&parsed.netlist).unwrap();
+        let schedule = schedule(&config.plans_for(&parsed.netlist.analyses).unwrap());
+        let plans = super::plan_outputs(&schedule[0], &parsed.output, &[], &[]).unwrap();
+        assert!(plans[0].requires_retention());
+        let mut plot = Plot::new(
+            "op1",
+            "Operating Point",
+            PlotFlags::Real,
+            vec![Variable::new("v(in)", "voltage")],
+        );
+        let data = vec![Complex::real(1.)];
+        let row = data.as_ptr();
+        plot.push_point(data).unwrap();
+        let scope = crate::netlist::eval::ParamScope::root(&[]).unwrap();
+        let outputs = super::resolve_outputs(plot, &plans[0], &scope, None).unwrap();
+        assert!(outputs.printed.unwrap().contains("v(in)"));
+        assert_eq!(outputs.written.points()[0].as_ptr(), row);
+    }
+
+    #[test]
     fn singleton_noise_rejects_integrated_consumers_before_rows() {
         use crate::netlist::{Parser, source::parse_deck_text};
         use std::path::Path;

@@ -608,6 +608,34 @@ mod tests {
     }
 
     #[test]
+    fn collection_transfers_allocations_and_enforces_plot_lifecycle() {
+        use super::{PlotCollector, PointSink};
+        let mut collector = PlotCollector::default();
+        let retained = plot();
+        let row = retained.points()[0].as_ptr();
+        collector.complete(retained).unwrap();
+        let header = plot().header();
+        let next = vec![Complex::real(1.), Complex::real(2.)];
+        let next_row = next.as_ptr();
+        collector.begin(&header).unwrap();
+        collector.point(next).unwrap();
+        collector.end().unwrap();
+        let plots = collector.finish(2).unwrap();
+        assert_eq!(plots[0].points()[0].as_ptr(), row);
+        assert_eq!(plots[1].points()[0].as_ptr(), next_row);
+
+        let mut collector = PlotCollector::default();
+        assert!(collector.end().is_err());
+        assert!(collector.point(vec![]).is_err());
+        collector.begin(&header).unwrap();
+        assert!(collector.begin(&header).is_err());
+        assert!(collector.complete(plot()).is_err());
+        assert!(collector.point(vec![Complex::ZERO]).is_err());
+        assert!(collector.finish(1).is_err());
+        assert!(PlotCollector::default().finish(1).is_err());
+    }
+
+    #[test]
     fn flags_are_read_from_the_rawfile_spelling() {
         assert_eq!(PlotFlags::parse("real"), PlotFlags::Real);
         assert_eq!(PlotFlags::parse("complex"), PlotFlags::Complex);
