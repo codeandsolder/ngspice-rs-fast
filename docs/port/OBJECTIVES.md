@@ -126,3 +126,27 @@ still require all their accepted samples to agree.
 Probe source `query_batch.rs`, link script, timing script and raw
 logs are in the campaign evidence folder
 `logs/worker-arch-1122-b6d9-issue114/probe/`.
+
+### Final-value expression deferral
+
+Same Acer native optimized-dev setup, 50,001 accepted rows per
+candidate, 65 raw producer columns, five alternating CPU-time trials
+after warmup. Compare `af1bc01` (per-row Last evaluation) to
+`a76a8f5` (single evaluation from the final compact dependency row).
+Requests mix untransformed complex values, magnitude, phase and dB.
+The first row is zero, so a dB request's intermediate failure is
+irrelevant to the final value. Results and error policy are unchanged.
+
+| Last requests | Raw operand columns | Candidates | Before (ms) | After (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 1 | 20 | 43.328 | 36.517 |
+| 4 | 1 | 20 | 164.385 | 34.429 |
+| 16 | 4 | 10 | 297.032 | 20.329 |
+| 64 | 64 | 4 | 455.081 | 45.129 |
+| 256 | 1 | 3 | 1,245.299 | 7.102 |
+| 1,024 | 8 | 1 | 1,313.571 | 3.773 |
+
+All checksum strings match across both variants, each case and trial.
+This is output processing only; it excludes the numerical solver.
+Source, link script, timing script and raw measurements:
+`logs/worker-arch-1122-b6d9-issue114/last-probe/`.
