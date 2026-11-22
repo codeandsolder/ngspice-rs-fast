@@ -2186,3 +2186,23 @@ All output columns, shape checks and numerical bounds are unchanged. The
 variant test verifies equivalent numeric token values and unchanged
 non-numeric tokens; missing selected captures are errors, not fallback
 opportunities.
+
+The live C comparison suites use the same selection through
+`ngspice_conformance::fixtures::DeckInputs::fixture` (#121).
+The explicit fixture ID resolves the original deck from the normal fixture
+directory and the C input through `reference_netlist_path`; both texts are
+read before invoking either simulator. There is no probing for alternate
+files and no fallback when an explicitly selected file is absent. For
+ordinary fixtures, both sides share the original text. Fixture-derived
+test decks transform each selected text independently. Ad-hoc or generated
+decks opt into identical input with `DeckInputs::same` and never consult the
+fixture registry based on a test label.
+
+The sensitivity, batch, companion transient, distortion, noise and
+S-parameter live suites follow this rule. MOS sensitivity checks against
+stored numerical goldens use `golden_path` as well. The M4/M7/M10
+parse/write/parse tests are not live fixture comparisons; historical rawfile
+schema and byte-format tests retain their historical captures. The live
+HFET2, MOS3 and MOS9 comparisons exercise the registered C-only variants
+with unchanged numerical bounds. Process isolation, scratch cleanup and
+oracle resource limits are unchanged.
