@@ -27,7 +27,7 @@ pub const MAX_GMIN_FACTOR: Real = 1e6;
 /// Largest scheduled artificial nodal gmin (S).
 pub const MAX_GMIN: Real = 1.;
 /// Default number of equal source increments.
-pub const DEFAULT_SOURCE_STEPS: u32 = 20;
+pub const DEFAULT_SOURCE_STEPS: u16 = 20;
 /// Default temporary nodal gmin (S) held during source stepping.
 pub const DEFAULT_SOURCE_GMIN: Real = 1e-8;
 /// Maximum gmin steps, or explicit ladder entries. The ngspice
@@ -38,7 +38,7 @@ pub const MAX_SOURCE_STEPS: usize = 1_000;
 /// Largest explicit total Newton-iteration budget.
 pub const MAX_TOTAL_ITERATIONS: usize = 10_000_000;
 
-fn uniform_scales(steps: u32) -> impl Iterator<Item = Real> {
+fn uniform_scales(steps: u16) -> impl Iterator<Item = Real> {
     (0..=steps).map(move |step| Real::from(step) / Real::from(steps))
 }
 
@@ -49,55 +49,109 @@ fn invalid(message: impl Into<String>) -> SpiceError {
     }
 }
 
-/// Source stepping: sources scaled through `scales`, held at a temporary gmin.
-///
-/// The scales only *approach* the solution; they never replace it. A strategy
-/// always ends with an extra full-source, zero-gmin solve.
+/// A checked count with domain-specific inclusive bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedCount<const MIN: usize, const MAX: usize>(usize);
+
+impl<const MIN: usize, const MAX: usize> BoundedCount<MIN, MAX> {
+    /// Constructs a count within its inclusive bounds.
+    ///
+    /// # Errors
+    /// The count is outside the bounds.
+    pub fn new(value: usize) -> SpiceResult<Self> {
+        if (MIN..=MAX).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(invalid(format!(
+                "count must be in {MIN}..={MAX}, not {value}"
+            )))
+        }
+    }
+
+    /// The validated count.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// A fixed ngspice schedule has at least two increments.
+pub type FixedSteps<const MAX: usize> = BoundedCount<2, MAX>;
+/// Bounded Newton iteration limit (written adaptation base or stage limit).
+pub type IterationLimit = BoundedCount<1, { newton::MAX_ITERATIONS }>;
+/// Bounded total work limit for a DC solve.
+pub type IterationBudget = BoundedCount<1, MAX_TOTAL_ITERATIONS>;
+
+/// ngspice's count encoding, translated once at the request boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stepping<const MAX: usize> {
+    /// No attempt.
+    Disabled,
+    /// C's adaptive strategy.
+    Adaptive,
+    /// C's fixed strategy with a bounded count.
+    Fixed(FixedSteps<MAX>),
+}
+
+impl<const MAX: usize> Stepping<MAX> {
+    /// Decode C's 0 (disabled), 1 (adaptive), or fixed count.
+    ///
+    /// # Errors
+    /// The count exceeds the supported domain.
+    pub fn from_count(count: usize) -> SpiceResult<Self> {
+        match count {
+            0 => Ok(Self::Disabled),
+            1 => Ok(Self::Adaptive),
+            _ => FixedSteps::new(count).map(Self::Fixed),
+        }
+    }
+}
+
+/// A validated, decreasing custom nodal-gmin ladder. Empty disables it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GminSchedule(Vec<Real>);
+
+impl GminSchedule {
+    /// Validate a custom ladder.
+    ///
+    /// # Errors
+    /// Nonfinite, nonpositive, oversized or nondecreasing stages.
+    pub fn new(values: Vec<Real>) -> SpiceResult<Self> {
+        validate_gmin_schedule(&values, MAX_GMIN_STAGES)?;
+        Ok(Self(values))
+    }
+
+    /// The temporary nodal-gmin values, in execution order.
+    #[must_use]
+    pub const fn as_slice(&self) -> &[Real] {
+        self.0.as_slice()
+    }
+}
+
+/// Source stepping: strictly increasing scales followed by a separate
+/// full-source, zero-gmin solve. Temporary gmin and scales are immutable.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceStepping {
-    /// Strictly increasing source multipliers within `[0, 1]`. Every
-    /// independent source (including overrides and transient forcing) is
-    /// multiplied by the scale; the stored source values never change.
-    pub scales: Vec<Real>,
-    /// Temporary uniform nodal gmin (S) in `[0, MAX_GMIN]` for these stages.
-    pub gmin: Real,
+    scales: Vec<Real>,
+    gmin: Real,
 }
 
 impl SourceStepping {
-    /// `steps` equal increments: scales `0, 1/steps, ..., 1`.
+    /// Validate a custom source ladder.
     ///
     /// # Errors
-    /// `steps` outside `1..=MAX_SOURCE_STEPS` or an invalid `gmin`.
-    pub fn uniform(steps: usize, gmin: Real) -> SpiceResult<Self> {
-        if !(1..=MAX_SOURCE_STEPS).contains(&steps) {
-            return Err(invalid(format!(
-                "source steps must be in 1..={MAX_SOURCE_STEPS}, not {steps}"
-            )));
-        }
-        let steps = u32::try_from(steps).map_err(|_| invalid("source step count exceeds u32"))?;
-        let stepping = Self {
-            scales: uniform_scales(steps).collect(),
-            gmin,
-        };
-        stepping.validate()?;
-        Ok(stepping)
-    }
-
-    /// Check finite, increasing, bounded scales and a finite bounded gmin.
-    ///
-    /// # Errors
-    /// Empty/oversized, nonfinite, out-of-range or non-increasing scales, or an
-    /// invalid temporary gmin.
-    pub fn validate(&self) -> SpiceResult<()> {
-        if self.scales.is_empty() || self.scales.len() > MAX_SOURCE_STEPS + 1 {
+    /// Empty/oversized, nonfinite, out-of-range or non-increasing scales, or
+    /// an invalid temporary gmin.
+    pub fn new(scales: Vec<Real>, gmin: Real) -> SpiceResult<Self> {
+        if scales.is_empty() || scales.len() > MAX_SOURCE_STEPS + 1 {
             return Err(invalid(format!(
                 "source schedule needs 1..={} scales, not {}",
                 MAX_SOURCE_STEPS + 1,
-                self.scales.len()
+                scales.len()
             )));
         }
         let mut previous = Real::NEG_INFINITY;
-        for scale in &self.scales {
+        for scale in &scales {
             if !scale.is_finite() || !(0. ..=1.).contains(scale) {
                 return Err(invalid(format!(
                     "source scale {scale} must be finite and in [0, 1]"
@@ -110,13 +164,34 @@ impl SourceStepping {
             }
             previous = *scale;
         }
-        if !self.gmin.is_finite() || !(0. ..=MAX_GMIN).contains(&self.gmin) {
+        if !gmin.is_finite() || !(0. ..=MAX_GMIN).contains(&gmin) {
             return Err(invalid(format!(
-                "source-stepping gmin {} must be finite and in [0, {MAX_GMIN}] S",
-                self.gmin
+                "source-stepping gmin {gmin} must be finite and in [0, {MAX_GMIN}] S"
             )));
         }
-        Ok(())
+        Ok(Self { scales, gmin })
+    }
+
+    /// Equal increments including both endpoints.
+    ///
+    /// # Errors
+    /// Invalid step count or temporary gmin.
+    pub fn uniform(steps: usize, gmin: Real) -> SpiceResult<Self> {
+        let steps = BoundedCount::<1, MAX_SOURCE_STEPS>::new(steps)?.get();
+        let steps = u16::try_from(steps).map_err(|_| invalid("source step count exceeds u16"))?;
+        Self::new(uniform_scales(steps).collect(), gmin)
+    }
+
+    /// The validated source scales.
+    #[must_use]
+    pub const fn scales(&self) -> &[Real] {
+        self.scales.as_slice()
+    }
+
+    /// The temporary nodal gmin.
+    #[must_use]
+    pub const fn gmin(&self) -> Real {
+        self.gmin
     }
 }
 
@@ -143,117 +218,112 @@ const GILLESPIE_MIN_PROGRESS: Real = 1e-8;
 /// `gillespie_src`'s zero-source gmin ladder spans ten decades above `gmin`.
 const GILLESPIE_GMIN_DECADES: usize = 10;
 
-/// ngspice's `CKTop` continuation (`cktop.c`), parameterised like C.
-///
-/// After direct Newton fails (unless [`ContinuationPolicy::skip_direct`]):
-///
-/// * gmin stepping by [`Self::gmin_steps`]: `1` runs `dynamic_gmin` (an
-///   adaptive artificial diagonal gmin from `1e-2 / gminfactor` S down to the
-///   junction `gmin`, then a zero-gmin solve) and, if that fails, `new_gmin`
-///   (the same adaptive walk applied to the *junction* gmin of every device);
-///   `n > 1` runs `spice3_gmin`, `n + 1` stages of artificial gmin from
-///   `gmin * gminfactor^n` down to `gmin`, then a zero-gmin solve; `0`
-///   disables it.
-/// * source stepping by [`Self::source_steps`]: `1` runs `gillespie_src`
-///   (adaptive source factor from 0, with a ten-decade gmin ladder if the
-///   zero-source solve fails); `n > 1` runs `spice3_src`, `n + 1` equal
-///   source scales with no artificial gmin; `0` disables it.
+/// ngspice's `CKTop` strategies: adaptive gmin tries both nodal and junction
+/// gmin, adaptive source stepping uses Gillespie; fixed counts use Spice3.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NgspiceStepping {
-    /// C `CKTnumGminSteps` (deck `gminsteps`, default 1).
-    pub gmin_steps: usize,
-    /// C `CKTnumSrcSteps` (deck `srcsteps`/`itl6`, default 1).
-    pub source_steps: usize,
-    /// C `CKTgminFactor` (deck `gminfactor`, default 10).
-    pub gmin_factor: Real,
-    /// C `CKTdcTrcvMaxIter` as written (deck `itl2`, default
-    /// [`NGSPICE_ADAPT_ITERATIONS`]), which steers the adaptive steps. The
-    /// stages' Newton *limit* is [`ContinuationPolicy::stage_max_iterations`].
-    pub adapt_iterations: usize,
+    /// C `CKTnumGminSteps`, decoded at construction.
+    pub gmin: Stepping<MAX_GMIN_STAGES>,
+    /// C `CKTnumSrcSteps`, decoded at construction.
+    pub source: Stepping<MAX_SOURCE_STEPS>,
+    gmin_factor: Real,
+    adapt_iterations: IterationLimit,
 }
 
 impl Default for NgspiceStepping {
     fn default() -> Self {
         Self {
-            gmin_steps: 1,
-            source_steps: 1,
+            gmin: Stepping::Adaptive,
+            source: Stepping::Adaptive,
             gmin_factor: DEFAULT_GMIN_FACTOR,
-            adapt_iterations: NGSPICE_ADAPT_ITERATIONS,
+            adapt_iterations: BoundedCount(NGSPICE_ADAPT_ITERATIONS),
         }
     }
 }
 
 impl NgspiceStepping {
-    /// Check the counts, factor and adaptation base.
+    /// Decode C's step counts and validate the factor and adaptation base.
     ///
     /// # Errors
-    /// Counts above [`MAX_GMIN_STAGES`]/[`MAX_SOURCE_STEPS`], an invalid
-    /// factor or an adaptation base outside `1..=MAX_ITERATIONS`.
-    pub fn validate(&self) -> SpiceResult<()> {
-        check_factor(self.gmin_factor)?;
-        if self.gmin_steps > MAX_GMIN_STAGES {
-            return Err(invalid(format!(
-                "gmin steps must be in 0..={MAX_GMIN_STAGES}, not {}",
-                self.gmin_steps
-            )));
-        }
-        if self.source_steps > MAX_SOURCE_STEPS {
-            return Err(invalid(format!(
-                "source steps must be in 0..={MAX_SOURCE_STEPS}, not {}",
-                self.source_steps
-            )));
-        }
-        if !(1..=newton::MAX_ITERATIONS).contains(&self.adapt_iterations) {
-            return Err(invalid(format!(
-                "adaptation iteration base must be in 1..={}, not {}",
-                newton::MAX_ITERATIONS,
-                self.adapt_iterations
-            )));
-        }
-        Ok(())
+    /// Out-of-range counts, an invalid factor or invalid adaptation base.
+    pub fn new(
+        gmin_steps: usize,
+        source_steps: usize,
+        gmin_factor: Real,
+        adapt_iterations: usize,
+    ) -> SpiceResult<Self> {
+        check_factor(gmin_factor)?;
+        Ok(Self {
+            gmin: Stepping::from_count(gmin_steps)?,
+            source: Stepping::from_count(source_steps)?,
+            gmin_factor,
+            adapt_iterations: IterationLimit::new(adapt_iterations)?,
+        })
     }
 
-    /// `spice3_gmin`'s artificial gmin ladder for junction gmin `gmin`:
-    /// `gmin * factor^steps` down to `gmin`, `steps + 1` values.
+    /// C's written adaptation base, independent of the effective stage limit.
+    #[must_use]
+    pub const fn adapt_iterations(&self) -> usize {
+        self.adapt_iterations.get()
+    }
+
+    /// Ratio used for artificial or junction gmin stepping.
+    #[must_use]
+    pub const fn gmin_factor(&self) -> Real {
+        self.gmin_factor
+    }
+
+    /// Resolve the fixed gmin ladder for the configured junction gmin.
+    /// Adaptive and disabled strategies have no fixed ladder.
     ///
     /// # Errors
-    /// Invalid stepping parameters, or a ladder that is not finite,
-    /// positive, at most [`MAX_GMIN`] and strictly decreasing.
-    pub fn spice3_ladder(&self, gmin: Real) -> SpiceResult<Vec<Real>> {
-        // Validate before loops and capacity arithmetic: callers can construct
-        // NgspiceStepping directly, outside ContinuationPolicy's validation.
-        self.validate()?;
+    /// A fixed ladder is not finite, positive, bounded and decreasing.
+    pub fn fixed_gmin_ladder(&self, gmin: Real) -> SpiceResult<Option<Vec<Real>>> {
+        match self.gmin {
+            Stepping::Fixed(steps) => self.spice3_ladder(gmin, steps).map(Some),
+            Stepping::Disabled | Stepping::Adaptive => Ok(None),
+        }
+    }
+
+    fn spice3_ladder(
+        &self,
+        gmin: Real,
+        steps: FixedSteps<MAX_GMIN_STAGES>,
+    ) -> SpiceResult<Vec<Real>> {
+        let steps = steps.get();
         let mut value = gmin;
-        for _ in 0..self.gmin_steps {
+        for _ in 0..steps {
             value *= self.gmin_factor;
         }
-        let mut ladder = Vec::with_capacity(self.gmin_steps + 1);
-        for _ in 0..=self.gmin_steps {
+        let mut ladder = Vec::with_capacity(steps + 1);
+        for _ in 0..=steps {
             ladder.push(value);
             value /= self.gmin_factor;
         }
         validate_gmin_schedule(&ladder, MAX_GMIN_STAGES + 1).map_err(|_| {
             invalid(format!(
-                "gminsteps={} with gminfactor={} and gmin={gmin:e} S gives the ladder \
+                "gminsteps={steps} with gminfactor={} and gmin={gmin:e} S gives the ladder \
                  {:e}..{gmin:e} S; each value must be finite, positive, at most \
                  {MAX_GMIN} S and decreasing",
-                self.gmin_steps, self.gmin_factor, ladder[0]
+                self.gmin_factor, ladder[0]
             ))
         })?;
         Ok(ladder)
     }
 }
 
-/// Which family of continuation strategies a [`ContinuationPolicy`] runs.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Disjoint strategies: custom ladder data cannot coexist with `CKTop` data.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ContinuationSchedule {
-    /// ngspice's adaptive `CKTop` strategies ([`NgspiceStepping`]); the
-    /// default.
+    /// ngspice's `CKTop` strategies.
     Ngspice(NgspiceStepping),
-    /// The port's original fixed, deterministic ladders
-    /// ([`ContinuationPolicy::gmin_schedule`],
-    /// [`ContinuationPolicy::source_stepping`]).
-    Ladder,
+    /// The port's fixed, deterministic ladders.
+    Ladder {
+        /// Validated nodal gmin ladder (empty disables the attempt).
+        gmin: GminSchedule,
+        /// Validated source ladder (None disables the attempt).
+        source: Option<SourceStepping>,
+    },
 }
 
 /// Bounded DC continuation used after direct Newton fails.
@@ -265,20 +335,13 @@ pub enum ContinuationSchedule {
 /// touch device history, accept hooks or stored source values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContinuationPolicy {
-    /// Strategy family. [`ContinuationSchedule::Ladder`] uses the two ladder
-    /// fields below; [`ContinuationSchedule::Ngspice`] requires them empty.
+    /// Strategy family and its validated data.
     pub schedule: ContinuationSchedule,
-    /// Ladder only: strictly decreasing artificial nodal gmin values (S)
-    /// solved at full source before the final zero-gmin solve. Empty disables
-    /// gmin stepping.
-    pub gmin_schedule: Vec<Real>,
-    /// Ladder only: source schedule, or `None` to disable source stepping.
-    pub source_stepping: Option<SourceStepping>,
     /// Total Newton iterations over *all* stages of one solve. `None` selects
     /// `NewtonOptions::max_iterations` for the direct solve plus the stage
     /// limit for every continuation stage, i.e. no tighter than the per-stage
     /// limits already imply; `Some(n)` caps the work at `n`.
-    pub max_total_iterations: Option<usize>,
+    pub max_total_iterations: Option<IterationBudget>,
     /// Newton iteration limit of every gmin/source-stepping stage, including
     /// source stepping's final full-source solve (C: `NIiter(ckt,
     /// CKTdcTrcvMaxIter)`, deck `itl2`). Gmin stepping's closing zero-gmin
@@ -286,7 +349,7 @@ pub struct ContinuationPolicy {
     /// `NewtonOptions::max_iterations` (C: `dynamic_gmin`, `spice3_gmin` and
     /// `new_gmin` end with `NIiter(ckt, iterlim)`, i.e. `CKTdcMaxIter`, deck
     /// `itl1`). `None` keeps `NewtonOptions::max_iterations` for the stages too.
-    pub stage_max_iterations: Option<usize>,
+    pub stage_max_iterations: Option<IterationLimit>,
     /// Skip the direct Newton attempt and start with continuation (C
     /// `CKTnoOpIter`, deck `.options noopiter`).
     pub skip_direct: bool,
@@ -315,11 +378,13 @@ impl ContinuationPolicy {
     #[must_use]
     pub fn ladder() -> Self {
         Self {
-            gmin_schedule: DEFAULT_GMIN_SCHEDULE.to_vec(),
-            source_stepping: Some(SourceStepping {
-                scales: uniform_scales(DEFAULT_SOURCE_STEPS).collect(),
-                gmin: DEFAULT_SOURCE_GMIN,
-            }),
+            schedule: ContinuationSchedule::Ladder {
+                gmin: GminSchedule(DEFAULT_GMIN_SCHEDULE.to_vec()),
+                source: Some(SourceStepping {
+                    scales: uniform_scales(DEFAULT_SOURCE_STEPS).collect(),
+                    gmin: DEFAULT_SOURCE_GMIN,
+                }),
+            },
             ..Self::disabled()
         }
     }
@@ -328,9 +393,10 @@ impl ContinuationPolicy {
     #[must_use]
     pub const fn disabled() -> Self {
         Self {
-            schedule: ContinuationSchedule::Ladder,
-            gmin_schedule: Vec::new(),
-            source_stepping: None,
+            schedule: ContinuationSchedule::Ladder {
+                gmin: GminSchedule(Vec::new()),
+                source: None,
+            },
             max_total_iterations: None,
             stage_max_iterations: None,
             skip_direct: false,
@@ -349,15 +415,13 @@ impl ContinuationPolicy {
         gmin_factor: Option<Real>,
         adapt_iterations: Option<usize>,
     ) -> SpiceResult<Self> {
-        let defaults = NgspiceStepping::default();
-        let policy = Self::ngspice(NgspiceStepping {
-            gmin_steps: gmin_steps.unwrap_or(defaults.gmin_steps),
-            source_steps: source_steps.unwrap_or(defaults.source_steps),
-            gmin_factor: gmin_factor.unwrap_or(defaults.gmin_factor),
-            adapt_iterations: adapt_iterations.unwrap_or(defaults.adapt_iterations),
-        });
-        policy.validate()?;
-        Ok(policy)
+        NgspiceStepping::new(
+            gmin_steps.unwrap_or(1),
+            source_steps.unwrap_or(1),
+            gmin_factor.unwrap_or(DEFAULT_GMIN_FACTOR),
+            adapt_iterations.unwrap_or(NGSPICE_ADAPT_ITERATIONS),
+        )
+        .map(Self::ngspice)
     }
 
     /// Geometric gmin schedule `start / factor^k`, `k = 0..steps`. `steps == 0`
@@ -365,7 +429,7 @@ impl ContinuationPolicy {
     ///
     /// # Errors
     /// Too many steps, an invalid `start`/`factor`, or a value that underflows.
-    pub fn geometric_gmin(start: Real, factor: Real, steps: usize) -> SpiceResult<Vec<Real>> {
+    pub fn geometric_gmin(start: Real, factor: Real, steps: usize) -> SpiceResult<GminSchedule> {
         check_factor(factor)?;
         if !(start.is_finite() && 0. < start && start <= MAX_GMIN) {
             return Err(invalid(format!(
@@ -382,13 +446,11 @@ impl ContinuationPolicy {
             && factor == DEFAULT_GMIN_FACTOR
             && steps <= DEFAULT_GMIN_SCHEDULE.len();
         if ladder {
-            return Ok(DEFAULT_GMIN_SCHEDULE[..steps].to_vec());
+            return Ok(GminSchedule(DEFAULT_GMIN_SCHEDULE[..steps].to_vec()));
         }
-        let schedule: Vec<Real> = (0..steps)
-            .map(|k| start / factor.powi(i32::try_from(k).unwrap_or(i32::MAX)))
-            .collect();
-        validate_gmin_schedule(&schedule, MAX_GMIN_STAGES)?;
-        Ok(schedule)
+        let steps = i32::try_from(steps).map_err(|_| invalid("gmin step count exceeds i32"))?;
+        let schedule: Vec<Real> = (0..steps).map(|k| start / factor.powi(k)).collect();
+        GminSchedule::new(schedule)
     }
 
     /// The ladder schedule from `srcsteps`/`gminsteps`/`gminfactor`-style
@@ -403,58 +465,19 @@ impl ContinuationPolicy {
         gmin_steps: Option<usize>,
         gmin_factor: Option<Real>,
     ) -> SpiceResult<Self> {
-        let mut policy = Self::ladder();
-        if let Some(steps) = source_steps {
-            policy.source_stepping = (steps > 0)
-                .then(|| SourceStepping::uniform(steps, DEFAULT_SOURCE_GMIN))
-                .transpose()?;
-        }
-        if gmin_steps.is_some() || gmin_factor.is_some() {
-            policy.gmin_schedule = Self::geometric_gmin(
-                GMIN_START,
-                gmin_factor.unwrap_or(DEFAULT_GMIN_FACTOR),
-                gmin_steps.unwrap_or(DEFAULT_GMIN_SCHEDULE.len()),
-            )?;
-        }
-        policy.validate()?;
-        Ok(policy)
-    }
-
-    /// Validate every schedule and budget before the first load.
-    ///
-    /// # Errors
-    /// Nonfinite/non-positive/non-decreasing gmin values, invalid source
-    /// scales, or an out-of-range total iteration budget.
-    pub fn validate(&self) -> SpiceResult<()> {
-        if let ContinuationSchedule::Ngspice(stepping) = &self.schedule {
-            stepping.validate()?;
-            if !self.gmin_schedule.is_empty() || self.source_stepping.is_some() {
-                return Err(invalid(
-                    "gmin_schedule/source_stepping are ladder settings; the ngspice schedule \
-                     takes its steps from NgspiceStepping",
-                ));
-            }
-        }
-        validate_gmin_schedule(&self.gmin_schedule, MAX_GMIN_STAGES)?;
-        if let Some(source) = &self.source_stepping {
-            source.validate()?;
-        }
-        if let Some(total) = self.max_total_iterations
-            && !(1..=MAX_TOTAL_ITERATIONS).contains(&total)
-        {
-            return Err(invalid(format!(
-                "total iteration budget must be in 1..={MAX_TOTAL_ITERATIONS}, not {total}"
-            )));
-        }
-        if let Some(limit) = self.stage_max_iterations
-            && !(1..=newton::MAX_ITERATIONS).contains(&limit)
-        {
-            return Err(invalid(format!(
-                "continuation stage iteration limit must be in 1..={}, not {limit}",
-                newton::MAX_ITERATIONS
-            )));
-        }
-        Ok(())
+        let gmin = Self::geometric_gmin(
+            GMIN_START,
+            gmin_factor.unwrap_or(DEFAULT_GMIN_FACTOR),
+            gmin_steps.unwrap_or(DEFAULT_GMIN_SCHEDULE.len()),
+        )?;
+        let steps = source_steps.unwrap_or_else(|| usize::from(DEFAULT_SOURCE_STEPS));
+        let source = (steps > 0)
+            .then(|| SourceStepping::uniform(steps, DEFAULT_SOURCE_GMIN))
+            .transpose()?;
+        Ok(Self {
+            schedule: ContinuationSchedule::Ladder { gmin, source },
+            ..Self::disabled()
+        })
     }
 }
 
@@ -502,13 +525,12 @@ pub struct DcSettings {
 }
 
 impl DcSettings {
-    /// Validate both halves.
+    /// Validate Newton tolerances; the continuation schedule is constructed valid.
     ///
     /// # Errors
-    /// Invalid Newton options or continuation policy.
+    /// Invalid Newton options.
     pub fn validate(&self) -> SpiceResult<()> {
-        self.newton.validate()?;
-        self.continuation.validate()
+        self.newton.validate()
     }
 
     /// Resolve named request arguments over the defaults: `rtol`, `vntol`,
@@ -593,7 +615,7 @@ impl DcSettings {
         } else {
             ContinuationPolicy::from_ngspice_steps(source, gmin_steps, gmin_factor, adapt)?
         };
-        continuation.stage_max_iterations = stage_limit;
+        continuation.stage_max_iterations = stage_limit.map(IterationLimit::new).transpose()?;
         continuation.skip_direct = skip_direct;
         Ok(Self {
             newton: NewtonOptions::from_request(
@@ -1158,136 +1180,176 @@ struct Engine<'a> {
     remaining: usize,
 }
 
-/// One planned strategy.
-enum Plan<'p> {
-    /// Configured off.
-    Disabled,
-    /// Fixed stages from `start`, then the closing original solve.
-    Walk {
-        start: &'p Vector,
-        stages: Vec<Point>,
-    },
-    /// `dynamic_gmin` (artificial gmin) or `new_gmin` (`junction`).
-    Dynamic {
-        stepping: NgspiceStepping,
-        junction: bool,
-    },
-    /// `gillespie_src`.
-    Gillespie(NgspiceStepping),
-    /// `spice3_src` with this many equal increments.
-    Uniform(usize),
+#[derive(Clone, Copy)]
+enum GminKind {
+    Nodal,
+    Junction,
 }
 
-/// Only the direct attempt and closing gmin solves use ITL1. All other
-/// continuation stages, including closing source steps, use ITL2.
-const fn uses_direct_limit(strategy: DcStrategy, closing: bool) -> bool {
-    matches!(strategy, DcStrategy::Direct)
-        || (closing
-            && matches!(
-                strategy,
-                DcStrategy::GminStepping | DcStrategy::JunctionGminStepping
-            ))
+impl GminKind {
+    const fn strategy(self) -> DcStrategy {
+        match self {
+            Self::Nodal => DcStrategy::GminStepping,
+            Self::Junction => DcStrategy::JunctionGminStepping,
+        }
+    }
+
+    const fn point(self, gmin: Real) -> Point {
+        match self {
+            Self::Nodal => Point::nodal(1., gmin),
+            Self::Junction => Point {
+                scale: 1.,
+                gmin: 0.,
+                junction: Some(gmin),
+            },
+        }
+    }
+}
+
+/// A solve identifies both its equation modifications and its iteration policy.
+/// The original-equation closing stages cannot accidentally retain a gmin.
+#[derive(Clone, Copy)]
+enum Stage {
+    Direct,
+    Gmin(GminKind, Real),
+    CloseGmin(GminKind),
+    Source { scale: Real, gmin: Real },
+    CloseSource,
+}
+
+impl Stage {
+    const fn strategy(self) -> DcStrategy {
+        match self {
+            Self::Direct => DcStrategy::Direct,
+            Self::Gmin(kind, _) | Self::CloseGmin(kind) => kind.strategy(),
+            Self::Source { .. } | Self::CloseSource => DcStrategy::SourceStepping,
+        }
+    }
+
+    const fn point(self) -> Point {
+        match self {
+            Self::Direct | Self::CloseGmin(_) | Self::CloseSource => Point::ORIGINAL,
+            Self::Gmin(kind, gmin) => kind.point(gmin),
+            Self::Source { scale, gmin } => Point::nodal(scale, gmin),
+        }
+    }
+
+    const fn uses_direct_limit(self) -> bool {
+        matches!(self, Self::Direct | Self::CloseGmin(_))
+    }
+}
+
+/// Each executable strategy owns its seed, stage data and closing semantics.
+/// Only the disabled entries carry a reporting-only strategy tag.
+enum Plan<'p> {
+    Disabled(DcStrategy),
+    Direct(&'p Vector),
+    FixedGmin {
+        start: &'p Vector,
+        ladder: Vec<Real>,
+    },
+    FixedSource {
+        start: &'p Vector,
+        scales: Vec<Real>,
+        gmin: Real,
+    },
+    Dynamic {
+        kind: GminKind,
+        factor: Real,
+        adapt: IterationLimit,
+    },
+    Gillespie(IterationLimit),
 }
 
 impl Plan<'_> {
-    /// Upper bound on the number of solves at ITL1 and ITL2 respectively.
-    const fn solve_counts(&self, strategy: DcStrategy) -> (usize, usize) {
+    const fn strategy(&self) -> DcStrategy {
         match self {
-            Self::Disabled => (0, 0),
-            Self::Walk { stages, .. } => {
-                if uses_direct_limit(strategy, true) {
-                    (1, stages.len())
-                } else {
-                    (0, stages.len().saturating_add(1))
-                }
-            }
+            Self::Disabled(strategy) => *strategy,
+            Self::Direct(_) => DcStrategy::Direct,
+            Self::FixedGmin { .. } => DcStrategy::GminStepping,
+            Self::Dynamic { kind, .. } => kind.strategy(),
+            Self::FixedSource { .. } | Self::Gillespie(_) => DcStrategy::SourceStepping,
+        }
+    }
+
+    /// Upper bound on the number of solves at ITL1 and ITL2 respectively.
+    const fn solve_counts(&self) -> (usize, usize) {
+        match self {
+            Self::Disabled(_) => (0, 0),
+            Self::Direct(_) => (1, 0),
+            Self::FixedGmin { ladder, .. } => (1, ladder.len()),
+            Self::FixedSource { scales, .. } => (0, scales.len() + 1),
             Self::Dynamic { .. } => (1, MAX_ADAPTIVE_STAGES),
             Self::Gillespie(_) => (0, 1 + GILLESPIE_GMIN_DECADES + 1 + MAX_ADAPTIVE_STAGES),
-            Self::Uniform(steps) => (0, steps.saturating_add(1)),
         }
     }
 }
 
 impl ContinuationPolicy {
-    /// Resolve the validated schedule to the actual ordered attempts.
+    /// Resolve the validated schedule into ordered attempts.
     fn plan<'a>(
         &self,
         seed: &'a Vector,
         zero: &'a Vector,
         gmin: Real,
-    ) -> SpiceResult<Vec<(DcStrategy, Plan<'a>)>> {
-        // Source stepping restarts from the all-sources-off state, not the seed.
-        let mut plan: Vec<(DcStrategy, Plan<'_>)> = vec![(
-            DcStrategy::Direct,
-            if self.skip_direct {
-                Plan::Disabled
-            } else {
-                Plan::Walk {
-                    start: seed,
-                    stages: Vec::new(),
-                }
-            },
-        )];
-        match self.schedule {
-            ContinuationSchedule::Ladder => {
-                let ladder = &self.gmin_schedule;
-                plan.push((
-                    DcStrategy::GminStepping,
-                    if ladder.is_empty() {
-                        Plan::Disabled
-                    } else {
-                        Plan::Walk {
-                            start: seed,
-                            stages: ladder.iter().map(|g| Point::nodal(1., *g)).collect(),
-                        }
+    ) -> SpiceResult<Vec<Plan<'a>>> {
+        let mut plan = vec![if self.skip_direct {
+            Plan::Disabled(DcStrategy::Direct)
+        } else {
+            Plan::Direct(seed)
+        }];
+        match &self.schedule {
+            ContinuationSchedule::Ladder { gmin, source } => {
+                plan.push(if gmin.as_slice().is_empty() {
+                    Plan::Disabled(DcStrategy::GminStepping)
+                } else {
+                    Plan::FixedGmin {
+                        start: seed,
+                        ladder: gmin.as_slice().to_vec(),
+                    }
+                });
+                plan.push(source.as_ref().map_or(
+                    Plan::Disabled(DcStrategy::SourceStepping),
+                    |source| Plan::FixedSource {
+                        start: zero,
+                        scales: source.scales.clone(),
+                        gmin: source.gmin,
                     },
-                ));
-                plan.push((
-                    DcStrategy::SourceStepping,
-                    self.source_stepping
-                        .as_ref()
-                        .map_or(Plan::Disabled, |source| Plan::Walk {
-                            start: zero,
-                            stages: source
-                                .scales
-                                .iter()
-                                .map(|k| Point::nodal(*k, source.gmin))
-                                .collect(),
-                        }),
                 ));
             }
             ContinuationSchedule::Ngspice(stepping) => {
-                match stepping.gmin_steps {
-                    0 => plan.push((DcStrategy::GminStepping, Plan::Disabled)),
-                    1 => {
-                        for junction in [false, true] {
-                            let strategy = if junction {
-                                DcStrategy::JunctionGminStepping
-                            } else {
-                                DcStrategy::GminStepping
-                            };
-                            plan.push((strategy, Plan::Dynamic { stepping, junction }));
+                match stepping.gmin {
+                    Stepping::Disabled => plan.push(Plan::Disabled(DcStrategy::GminStepping)),
+                    Stepping::Adaptive => {
+                        for kind in [GminKind::Nodal, GminKind::Junction] {
+                            plan.push(Plan::Dynamic {
+                                kind,
+                                factor: stepping.gmin_factor,
+                                adapt: stepping.adapt_iterations,
+                            });
                         }
                     }
-                    _ => {
-                        let ladder = stepping.spice3_ladder(gmin)?;
-                        plan.push((
-                            DcStrategy::GminStepping,
-                            Plan::Walk {
-                                start: seed,
-                                stages: ladder.iter().map(|g| Point::nodal(1., *g)).collect(),
-                            },
-                        ));
-                    }
+                    Stepping::Fixed(steps) => plan.push(Plan::FixedGmin {
+                        start: seed,
+                        ladder: stepping.spice3_ladder(gmin, steps)?,
+                    }),
                 }
-                plan.push((
-                    DcStrategy::SourceStepping,
-                    match stepping.source_steps {
-                        0 => Plan::Disabled,
-                        1 => Plan::Gillespie(stepping),
-                        steps => Plan::Uniform(steps),
-                    },
-                ));
+                plan.push(match stepping.source {
+                    Stepping::Disabled => Plan::Disabled(DcStrategy::SourceStepping),
+                    Stepping::Adaptive => Plan::Gillespie(stepping.adapt_iterations),
+                    Stepping::Fixed(steps) => {
+                        let count = steps.get();
+                        let steps = u16::try_from(count)
+                            .map_err(|_| invalid("source step count exceeds u16"))?;
+                        // The last Spice3 scale is the explicit original solve,
+                        // unlike the custom ladder which has an extra solve.
+                        Plan::FixedSource {
+                            start: zero,
+                            scales: uniform_scales(steps).take(count).collect(),
+                            gmin: 0.,
+                        }
+                    }
+                });
             }
         }
         Ok(plan)
@@ -1295,10 +1357,9 @@ impl ContinuationPolicy {
 }
 
 /// `NIiter` may take its configured limit plus the failing extra pass.
-/// The implicit budget covers every enabled strategy's worst-case work.
-fn iteration_budget(plan: &[(DcStrategy, Plan<'_>)], direct: usize, stage: usize) -> usize {
-    plan.iter().fold(0_usize, |total, (strategy, planned)| {
-        let (direct_count, stage_count) = planned.solve_counts(*strategy);
+fn iteration_budget(plan: &[Plan<'_>], direct: usize, stage: usize) -> usize {
+    plan.iter().fold(0_usize, |total, planned| {
+        let (direct_count, stage_count) = planned.solve_counts();
         total
             .saturating_add(direct_count.saturating_mul(direct.saturating_add(1)))
             .saturating_add(stage_count.saturating_mul(stage.saturating_add(1)))
@@ -1306,23 +1367,21 @@ fn iteration_budget(plan: &[(DcStrategy, Plan<'_>)], direct: usize, stage: usize
 }
 
 impl Engine<'_> {
-    /// One disposable Newton solve at `point`; charges the budget.
-    /// `continued` is the preceding stage's converged trial, if any; `closing`
-    /// marks a gmin strategy's final solve of the original equations.
+    /// One disposable Newton solve of the typed stage; charges the budget.
+    /// `continued` is the preceding stage's converged trial, if any.
     fn stage(
         &mut self,
         report: &mut DcReport,
-        strategy: DcStrategy,
+        stage: Stage,
         guess: &Vector,
         continued: Option<TrialState>,
-        point: Point,
-        closing: bool,
     ) -> Result<NewtonSolution<TrialState>, Halt> {
         let Point {
             scale,
             gmin,
             junction,
-        } = point;
+        } = stage.point();
+        let strategy = stage.strategy();
         let describe = || {
             junction.map_or_else(
                 || format!("scale {scale}, gmin {gmin:e} S"),
@@ -1343,7 +1402,7 @@ impl Engine<'_> {
         // `iterlim` (itl1) and every other continuation solve by itl2
         // (`cktop.c`: `spice3_gmin`/`dynamic_gmin`/`new_gmin` end with
         // `NIiter(ckt, iterlim)`; `gillespie_src`/`spice3_src` ignore it).
-        let limit = if uses_direct_limit(strategy, closing) {
+        let limit = if stage.uses_direct_limit() {
             self.newton.max_iterations
         } else {
             self.stage_limit
@@ -1425,22 +1484,22 @@ impl Engine<'_> {
         }
     }
 
-    /// Walk `stages` from `start`, then the final full-source zero-gmin solve.
+    /// Walk fixed stages and an explicit original-equation closing stage.
     fn walk(
         &mut self,
         report: &mut DcReport,
-        strategy: DcStrategy,
         start: &Vector,
-        stages: &[Point],
+        stages: impl Iterator<Item = Stage>,
+        closing: Stage,
     ) -> Result<NewtonSolution<TrialState>, Halt> {
         let mut guess = start.clone();
         let mut continued = None;
-        for &point in stages {
-            let solved = self.stage(report, strategy, &guess, continued, point, false)?;
+        for stage in stages {
+            let solved = self.stage(report, stage, &guess, continued)?;
             guess = solved.values;
             continued = Some(solved.trial);
         }
-        self.stage(report, strategy, &guess, continued, Point::ORIGINAL, true)
+        self.stage(report, closing, &guess, continued)
     }
 
     /// A stage continuing `from` (a converged stage), or restarting from the
@@ -1449,23 +1508,14 @@ impl Engine<'_> {
     fn step(
         &mut self,
         report: &mut DcReport,
-        strategy: DcStrategy,
         from: Option<&NewtonSolution<TrialState>>,
-        point: Point,
-        closing: bool,
+        stage: Stage,
     ) -> Result<NewtonSolution<TrialState>, Halt> {
         if let Some(from) = from {
-            self.stage(
-                report,
-                strategy,
-                &from.values,
-                Some(from.trial.clone()),
-                point,
-                closing,
-            )
+            self.stage(report, stage, &from.values, Some(from.trial.clone()))
         } else {
             let zero = Vector::zeros(self.circuit.unknown_count());
-            self.stage(report, strategy, &zero, None, point, closing)
+            self.stage(report, stage, &zero, None)
         }
     }
 
@@ -1476,14 +1526,11 @@ impl Engine<'_> {
     fn dynamic_gmin(
         &mut self,
         report: &mut DcReport,
-        stepping: NgspiceStepping,
-        junction: bool,
+        kind: GminKind,
+        initial_factor: Real,
+        adapt: IterationLimit,
     ) -> Result<NewtonSolution<TrialState>, Halt> {
-        let strategy = if junction {
-            DcStrategy::JunctionGminStepping
-        } else {
-            DcStrategy::GminStepping
-        };
+        let junction = matches!(kind, GminKind::Junction);
         // gtarget = MAX(CKTgmin, CKTgshunt); gshunt is not ported (0).
         let target = self.context.gmin;
         let slow_floor = if junction {
@@ -1491,34 +1538,22 @@ impl Engine<'_> {
         } else {
             DYNAMIC_FACTOR_FLOOR
         };
-        let (quick, slow) = (
-            stepping.adapt_iterations / 4,
-            3 * stepping.adapt_iterations / 4,
-        );
-        let mut factor = stepping.gmin_factor;
+        let (quick, slow) = (adapt.get() / 4, 3 * adapt.get() / 4);
+        let mut factor = initial_factor;
         let mut previous = DYNAMIC_GMIN_START;
         let mut gmin = previous / factor;
         let mut saved: Option<NewtonSolution<TrialState>> = None;
         for _ in 0..MAX_ADAPTIVE_STAGES {
-            let point = if junction {
-                Point {
-                    scale: 1.,
-                    gmin: 0.,
-                    junction: Some(gmin),
-                }
-            } else {
-                Point::nodal(1., gmin)
-            };
-            match self.step(report, strategy, saved.as_ref(), point, false) {
+            match self.step(report, saved.as_ref(), Stage::Gmin(kind, gmin)) {
                 Ok(solved) => {
                     let iterations = solved.iterations;
                     saved = Some(solved);
                     if gmin <= target {
                         let last = saved.as_ref();
-                        return self.step(report, strategy, last, Point::ORIGINAL, true);
+                        return self.step(report, last, Stage::CloseGmin(kind));
                     }
                     if iterations <= quick {
-                        factor = (factor * factor.sqrt()).min(stepping.gmin_factor);
+                        factor = (factor * factor.sqrt()).min(initial_factor);
                     }
                     if iterations > slow {
                         factor = factor.sqrt().max(slow_floor);
@@ -1553,10 +1588,16 @@ impl Engine<'_> {
     fn gillespie(
         &mut self,
         report: &mut DcReport,
-        stepping: NgspiceStepping,
+        adapt: IterationLimit,
     ) -> Result<NewtonSolution<TrialState>, Halt> {
-        let strategy = DcStrategy::SourceStepping;
-        let mut saved = match self.step(report, strategy, None, Point::nodal(0., 0.), false) {
+        let mut saved = match self.step(
+            report,
+            None,
+            Stage::Source {
+                scale: 0.,
+                gmin: 0.,
+            },
+        ) {
             Ok(solved) => solved,
             Err(Halt::Retry(_)) => {
                 // diagGmin = (gshunt <= 0 ? gmin : gshunt) * 10^10, then / 10.
@@ -1568,10 +1609,8 @@ impl Engine<'_> {
                 for _ in 0..=GILLESPIE_GMIN_DECADES {
                     last = Some(self.step(
                         report,
-                        strategy,
                         last.as_ref(),
-                        Point::nodal(0., gmin),
-                        false,
+                        Stage::Source { scale: 0., gmin },
                     )?);
                     gmin /= 10.;
                 }
@@ -1579,20 +1618,19 @@ impl Engine<'_> {
             }
             Err(halt) => return Err(halt),
         };
-        let (quick, slow) = (
-            stepping.adapt_iterations / 4,
-            3 * stepping.adapt_iterations / 4,
-        );
+        let (quick, slow) = (adapt.get() / 4, 3 * adapt.get() / 4);
         let mut converged: Real = 0.;
         let mut raise = GILLESPIE_FIRST_RAISE;
         let mut scale = converged + raise;
         for _ in 0..MAX_ADAPTIVE_STAGES {
             match self.step(
                 report,
-                strategy,
                 Some(&saved),
-                Point::nodal(scale, 0.),
-                false,
+                if scale.to_bits() == 1.0_f64.to_bits() {
+                    Stage::CloseSource
+                } else {
+                    Stage::Source { scale, gmin: 0. }
+                },
             ) {
                 Ok(solved) => {
                     let iterations = solved.iterations;
@@ -1633,45 +1671,49 @@ impl Engine<'_> {
         )))
     }
 
-    /// `spice3_src`: `steps + 1` equal source scales `i / steps` without
-    /// artificial gmin; the last stage solves the original equations.
-    fn uniform_sources(
-        &mut self,
-        report: &mut DcReport,
-        steps: usize,
-    ) -> Result<NewtonSolution<TrialState>, Halt> {
-        let steps = u32::try_from(steps)
-            .map_err(|_| Halt::Retry("source step count exceeds u32".into()))?;
-        let mut last: Option<NewtonSolution<TrialState>> = None;
-        for scale in uniform_scales(steps) {
-            last = Some(self.step(
-                report,
-                DcStrategy::SourceStepping,
-                last.as_ref(),
-                Point::nodal(scale, 0.),
-                false,
-            )?);
-        }
-        last.ok_or_else(|| Halt::Retry("empty source schedule".into()))
-    }
-
     /// Run one planned strategy and record its entry in the attempt list.
     fn attempt(
         &mut self,
         report: &mut DcReport,
-        strategy: DcStrategy,
         plan: &Plan<'_>,
     ) -> Result<NewtonSolution<TrialState>, Halt> {
+        let strategy = plan.strategy();
         let result = match plan {
-            Plan::Disabled => Err(Halt::Retry(String::new())),
-            Plan::Walk { start, stages } => self.walk(report, strategy, start, stages),
-            Plan::Dynamic { stepping, junction } => self.dynamic_gmin(report, *stepping, *junction),
-            Plan::Gillespie(stepping) => self.gillespie(report, *stepping),
-            Plan::Uniform(steps) => self.uniform_sources(report, *steps),
+            Plan::Disabled(_) => Err(Halt::Retry(String::new())),
+            Plan::Direct(seed) => self.stage(report, Stage::Direct, seed, None),
+            Plan::FixedGmin { start, ladder } => self.walk(
+                report,
+                start,
+                ladder
+                    .iter()
+                    .map(|gmin| Stage::Gmin(GminKind::Nodal, *gmin)),
+                Stage::CloseGmin(GminKind::Nodal),
+            ),
+            Plan::FixedSource {
+                start,
+                scales,
+                gmin,
+            } => self.walk(
+                report,
+                start,
+                scales.iter().map(|scale| Stage::Source {
+                    scale: *scale,
+                    gmin: *gmin,
+                }),
+                Stage::CloseSource,
+            ),
+            Plan::Dynamic {
+                kind,
+                factor,
+                adapt,
+            } => self.dynamic_gmin(report, *kind, *factor, *adapt),
+            Plan::Gillespie(adapt) => self.gillespie(report, *adapt),
         };
         let (outcome, detail) = match &result {
             Ok(_) => (AttemptOutcome::Converged, String::new()),
-            Err(_) if matches!(plan, Plan::Disabled) => (AttemptOutcome::Disabled, String::new()),
+            Err(_) if matches!(plan, Plan::Disabled(_)) => {
+                (AttemptOutcome::Disabled, String::new())
+            }
             Err(Halt::Retry(detail) | Halt::Budget(detail)) => {
                 (AttemptOutcome::Failed, detail.clone())
             }
@@ -1742,11 +1784,12 @@ fn run(
     let seed = initial.unwrap_or(&zero);
     let stage_limit = policy
         .stage_max_iterations
-        .unwrap_or(options.max_iterations);
+        .map_or(options.max_iterations, IterationLimit::get);
     let plan = policy.plan(seed, &zero, context.gmin)?;
-    let budget = policy
-        .max_total_iterations
-        .unwrap_or_else(|| iteration_budget(&plan, options.max_iterations, stage_limit));
+    let budget = policy.max_total_iterations.map_or_else(
+        || iteration_budget(&plan, options.max_iterations, stage_limit),
+        IterationBudget::get,
+    );
     report.budget = budget;
     let mut engine = Engine {
         circuit,
@@ -1761,10 +1804,10 @@ fn run(
         stage_limit,
         remaining: budget,
     };
-    for (strategy, planned) in &plan {
-        match engine.attempt(report, *strategy, planned) {
+    for planned in &plan {
+        match engine.attempt(report, planned) {
             Ok(solved) => {
-                report.outcome = DcOutcome::Converged(*strategy);
+                report.outcome = DcOutcome::Converged(planned.strategy());
                 return Ok(solved);
             }
             Err(Halt::Retry(_)) => {}

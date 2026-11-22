@@ -572,12 +572,10 @@ impl RunConfig {
         // The last-set counts and factor must form one valid schedule together
         // (with the deck's junction gmin, which seeds C's `spice3_gmin` ladder).
         if let Err(error) = config.dc.policy().and_then(|policy| match policy.schedule {
-            crate::analysis::bias::ContinuationSchedule::Ngspice(stepping)
-                if stepping.gmin_steps > 1 =>
-            {
-                stepping.spice3_ladder(config.context.gmin).map(|_| ())
+            crate::analysis::bias::ContinuationSchedule::Ngspice(stepping) => {
+                stepping.fixed_gmin_ladder(config.context.gmin).map(|_| ())
             }
-            _ => Ok(()),
+            crate::analysis::bias::ContinuationSchedule::Ladder { .. } => Ok(()),
         }) {
             let location = config
                 .applied
