@@ -98,3 +98,29 @@ matched-checksum weighted-square kernel probe on Acer (20 repetitions
 of 100,000 four-point panels) measured median CPU time of 84.87 ms
 versus 91.07 ms for the intermediate square-root-product formulation.
 These kernel timings are not the end-to-end output benchmark above.
+
+Final reconciliation benchmark (commit `494a069`, before this
+documentation-only update), same release executable and workload,
+three alternating retained/streamed trials:
+
+| Metric | Retained | Streamed |
+|---|---:|---:|
+| Median userspace task-clock | 714.41 ms | 204.94 ms |
+| Median peak RSS | 55,752 KiB | 4,704 KiB |
+| DHAT cumulative allocated bytes | 2,747,364,185 | 277,800 |
+| DHAT peak live heap bytes | 68,722,112 | 43,653 |
+| DHAT cumulative allocated blocks | 2,177 | 1,337 |
+
+All six runs and both DHAT runs produced checksum 61.5470053841868.
+The retained baseline uses the same conditioned arithmetic as the
+streamed reducer. Output-only CPU speedup is 3.49x. The updated
+checksum differs from the historical pre-reconciliation result only
+in its last printed digits.
+
+Run with the pinned nightly in release mode and interleave
+`full_plot_batch` and `objective_only_batch` under
+`perf stat -e task-clock,cycles,instructions` and
+`/usr/bin/time -f '%M'`. Separate DHAT profiles reproduce the heap
+measurements. Raw logs: `arch-1122-a7c9-114-final-bench-perf.log`
+and `arch-1122-a7c9-114-final-{full_plot_batch,objective_only_batch}-dhat.log`
+in campaign logs.
