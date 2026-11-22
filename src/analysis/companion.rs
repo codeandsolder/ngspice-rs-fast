@@ -375,10 +375,6 @@ impl AcceptedCursor {
         }
     }
 
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "match C breakpoint projection rounding without FMA"
-    )]
     fn prepare(
         self,
         settings: &TransientPlan,
@@ -418,7 +414,7 @@ impl AcceptedCursor {
             clock.save_delta = clock.next.delta;
             clock.next.delta = breaks.first() - clock.time;
         } else if !almost_equal_ulps(clock.time + clock.next.delta, settings.stop, 100)
-            && clock.time + 1.9 * clock.next.delta > breaks.first()
+            && clock.next.delta.mul_add(1.9, clock.time) > breaks.first()
         {
             clock.save_delta = clock.next.delta;
             clock.next.delta = (breaks.first() - clock.time) / 2.0;
@@ -524,6 +520,7 @@ enum Acceptance<'a> {
 
 struct Driver<'a> {
     circuit: &'a Circuit,
+    prepared: crate::devices::PreparedRun<'a>,
     system: &'a LinearSystem,
     settings: TransientPlan,
     timing: TransientTiming,
@@ -650,6 +647,7 @@ pub fn companion_transient_into(
         .collect::<SpiceResult<_>>()?;
     let driver = Driver {
         circuit,
+        prepared: circuit.prepare_run(),
         system: &system,
         settings,
         timing,
@@ -714,7 +712,7 @@ impl Driver<'_> {
             if accepted.cursor.clock.time == 0. {
                 // C (dctran.c) writes no t = 0 row under uic.
                 if start <= 0. && !self.uic {
-                    let observed = self.circuit.observe_real(
+                    let observed = self.prepared.observe_real(
                         &LoadRequest {
                             mode: AnalysisMode::OperatingPoint,
                             solution: &accepted.solution,
@@ -826,7 +824,7 @@ impl Driver<'_> {
             limit: attempt.boundary.limit(),
             timing: self.timing,
         };
-        self.circuit.observe_real(
+        self.prepared.observe_real(
             &LoadRequest {
                 mode: AnalysisMode::Transient {
                     time,
@@ -959,8 +957,8 @@ impl Driver<'_> {
                         .collect(),
                     nodesets: initial::forced_nodesets(&self.hints.nodesets),
                 };
-                let solution = crate::analysis::bias::solve_dc_forced(
-                    self.circuit,
+                let solution = crate::analysis::bias::solve_dc_forced_prepared(
+                    &self.prepared,
                     &self.model_context,
                     &self.bias,
                     &[],
@@ -1021,7 +1019,7 @@ impl Driver<'_> {
     ) -> SpiceResult<TrialState> {
         let n = self.circuit.unknown_count();
         let mut trial = self.history.trial().with_initial_conditions(uic);
-        self.circuit.load(
+        self.prepared.load(
             &LoadRequest {
                 mode: AnalysisMode::OperatingPoint,
                 solution: x,
@@ -1064,7 +1062,7 @@ impl Driver<'_> {
             crate::analysis::newton::PhasePolicy::Predicted
         };
         let solved = CircuitNewton {
-            circuit: self.circuit,
+            prepared: &self.prepared,
             context: &self.model_context,
             history: &self.history,
             branch_rows: &self.branch_row,

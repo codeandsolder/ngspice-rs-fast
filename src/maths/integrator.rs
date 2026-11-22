@@ -330,7 +330,7 @@ impl StepHistory {
         }
         // nicomcof.c
         let ag = match (method, order) {
-            (IntegrationMethod::Trapezoidal, 1) => {
+            (_, 1) => {
                 let mut ag = [0.0; HISTORY_LEN + 1];
                 ag[..2].copy_from_slice(&[1.0 / dt, -1.0 / dt]);
                 ag
@@ -340,12 +340,24 @@ impl StepHistory {
                 ag[..2].copy_from_slice(&[1.0 / dt / (1.0 - xmu), xmu / (1.0 - xmu)]);
                 ag
             }
-            // nicomcof.c: Gear order 1 falls through to the general case.
-            (IntegrationMethod::Gear { .. }, _) => gear_corrector(&deltas, usize::from(order)),
+            (IntegrationMethod::Gear { .. }, _) => {
+                gear_weights(&deltas, usize::from(order)).map(ScaledReal::finish)
+            }
         };
         for value in ag {
             finite(value, "integration coefficient")?;
         }
+        let history_anchor = if order <= 2 {
+            1
+        } else {
+            (1..=usize::from(order))
+                .max_by(|&a, &b| ag[a].abs().total_cmp(&ag[b].abs()))
+                .unwrap_or(1)
+        };
+        let scaled_weights = matches!(method, IntegrationMethod::Gear { .. })
+            && ag[..=usize::from(order)]
+                .iter()
+                .any(|weight| !weight.is_normal());
         Ok(Coefficients {
             method,
             order,
@@ -353,6 +365,8 @@ impl StepHistory {
             history: self.len,
             filled: self.fill.is_some(),
             ag,
+            history_anchor,
+            scaled_weights,
             truncation: TruncationSpans::new(&deltas, usize::from(order)),
         })
     }
@@ -376,61 +390,78 @@ impl StepHistory {
     }
 }
 
-/// The variable-step Gear (BDF) corrector of `order` on the points
-/// `t_{n+1} - s_i`, `s_0 = 0`, `s_i = deltas[0] + ... + deltas[i - 1]`.
-///
-/// `nicomcof.c` solves the Vandermonde system `sum_i ag_i (s_i/h)^j =
-/// -delta_{j1}/h`, `j = 0..=order`, in step-normalized form. The
-/// corrector follows the reference's unpivoted LU elimination and
-/// substitution, preserving operation order rather than evaluating the
-/// algebraically equivalent Lagrange derivative in closed form.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "nicomcof.c unpivoted Gear elimination and substitution round products before subtraction"
-)]
-fn gear_corrector(deltas: &[Real; HISTORY_LEN + 1], order: usize) -> [Real; HISTORY_LEN + 1] {
-    // nicomcof.c, `case GEAR`, verbatim: the corrector matrix built from
-    // (sum of h)/h, LU-decomposed without pivoting (its first column is
-    // 1 0 0 ...), then forward and backward substitution on CKTag.
-    let delta = deltas[0];
-    let mut mat = [[0.0; HISTORY_LEN + 1]; HISTORY_LEN + 1];
-    let mut ag = [0.0; HISTORY_LEN + 1];
-    ag[1] = -1. / delta;
-    for entry in mat[0].iter_mut().take(order + 1) {
-        *entry = 1.;
+/// An exact binary64 power of two, including subnormals. The caller supplies
+/// an exponent within the representable range.
+fn span_power(exponent: i32) -> Real {
+    if exponent >= -1022 {
+        Real::from_bits(u64::from((exponent + 1023).cast_unsigned()) << 52)
+    } else {
+        Real::from_bits(1_u64 << (exponent + 1074).cast_unsigned())
     }
-    let mut arg = 0.;
-    for i in 1..=order {
-        arg += deltas[i - 1];
-        let normalized = arg / delta;
-        let mut arg1 = 1.;
-        for row in mat.iter_mut().take(order + 1).skip(1) {
-            arg1 *= normalized;
-            row[i] = arg1;
+}
+
+/// Round a normalized signed significand with its binary exponent.
+fn compose_scaled(value: Real, exponent: i32) -> Real {
+    if value == 0. {
+        return value;
+    }
+    match exponent {
+        ..=-1076 => 0_f64.copysign(value),
+        -1075 => (value * 0.5) * span_power(-1074),
+        e @ -1074..=1023 => value * span_power(e),
+        _ => Real::INFINITY.copysign(value),
+    }
+}
+
+/// Sum each positive interval once, never by subtracting cumulative times.
+fn scaled_spans(steps: &[Real]) -> [[ScaledReal; HISTORY_LEN + 2]; HISTORY_LEN + 2] {
+    let mut spans = [[ScaledReal::ZERO; HISTORY_LEN + 2]; HISTORY_LEN + 2];
+    let mut terms = [ScaledReal::ZERO; HISTORY_LEN + 1];
+    for (slot, &step) in terms.iter_mut().zip(steps) {
+        *slot = ScaledReal::new(step, 0);
+    }
+    for (start, row) in spans.iter_mut().enumerate().take(steps.len()) {
+        let mut sum = ScaledReal::ZERO;
+        for (end, &step) in terms[..steps.len()].iter().enumerate().skip(start) {
+            sum = sum.add(step);
+            row[end + 1] = sum;
         }
     }
+    spans
+}
+
+/// The variable-step Gear (BDF) corrector on points at distances
+/// `s_i = deltas[0] + ... + deltas[i-1]` from the trial point.
+///
+/// Differentiate the Lagrange basis at the trial point directly:
+/// `ag_0 = sum_i 1/s_i`, `ag_i = -(1/s_i) product_{j!=i} s_j/(s_j-s_i)`.
+/// Unlike the unpivoted Vandermonde solve in nicomcof.c, this does not raise
+/// long/short step ratios to high powers or subtract nearly equal nodes.
+/// Form differences from their original positive intervals and retain the
+/// binary exponent separately until the final coefficient.
+fn gear_weights(deltas: &[Real; HISTORY_LEN + 1], order: usize) -> [ScaledReal; HISTORY_LEN + 1] {
+    let mut ag = [ScaledReal::ZERO; HISTORY_LEN + 1];
+    let spans = scaled_spans(&deltas[..order]);
+    for span in &spans[0][1..=order] {
+        ag[0] = ag[0].add(ScaledReal::new(1. / span.value, -span.power));
+    }
     for i in 1..=order {
-        let (head, tail) = mat[..=order].split_at_mut(i + 1);
-        let pivot = &head[i];
-        for row in tail {
-            row[i] /= pivot[i];
-            let multiplier = row[i];
-            for (entry, &p) in row[i + 1..=order].iter_mut().zip(&pivot[i + 1..=order]) {
-                *entry -= multiplier * p;
+        let span = spans[0][i];
+        let mut value = -1. / span.value;
+        let mut exponent = -span.power;
+        for (j, &numerator) in spans[0].iter().enumerate().take(order + 1).skip(1) {
+            if j != i {
+                let interval = spans[i.min(j)][i.max(j)];
+                let denominator = if j < i {
+                    -interval.value
+                } else {
+                    interval.value
+                };
+                value *= numerator.value / denominator;
+                exponent += numerator.power - interval.power;
             }
         }
-    }
-    for i in 1..=order {
-        for j in i + 1..=order {
-            ag[j] -= mat[j][i] * ag[i];
-        }
-    }
-    ag[order] /= mat[order][order];
-    for i in (0..order).rev() {
-        for j in i + 1..=order {
-            ag[i] -= mat[i][j] * ag[j];
-        }
-        ag[i] /= mat[i][i];
+        ag[i] = ScaledReal::new(value, exponent);
     }
     ag
 }
@@ -516,6 +547,8 @@ pub struct Coefficients {
     /// Older steps are placeholders (see [`StepHistory::with_fill`]).
     filled: bool,
     ag: [Real; HISTORY_LEN + 1],
+    history_anchor: usize,
+    scaled_weights: bool,
     truncation: TruncationSpans,
 }
 
@@ -555,6 +588,94 @@ impl Default for TruncationTolerances {
             chgtol: 1e-14,
             trtol: 7.0,
         }
+    }
+}
+
+/// Multiply a charge difference and add in one rounding step. Opposite
+/// near-maximum charges can overflow the subtraction even when the weighted
+/// difference is representable. Halving both operands in that exceptional case
+/// is exact; doubling the weight restores the original scale.
+#[inline]
+fn weighted_difference(weight: Real, left: Real, right: Real, addend: Real) -> Real {
+    let difference = left - right;
+    if difference.is_finite() {
+        weight.mul_add(difference, addend)
+    } else {
+        (weight + weight).mul_add(right.mul_add(-0.5, left * 0.5), addend)
+    }
+}
+
+/// Normalized finite significand with an extended binary exponent. Gear
+/// coefficients and intermediate polynomial estimates can be outside the
+/// binary64 exponent range even when their final weighted result is finite.
+#[derive(Clone, Copy)]
+struct ScaledReal {
+    value: Real,
+    power: i32,
+}
+
+impl ScaledReal {
+    const ZERO: Self = Self {
+        value: 0.,
+        power: 0,
+    };
+
+    fn new(value: Real, power: i32) -> Self {
+        let Some(local) = crate::primitives::numeric::binary_exponent(value) else {
+            return Self { value, power: 0 };
+        };
+        // Multiplication by an exactly representable reciprocal power of
+        // two is exact for normalization and cheaper than division. Only
+        // the smallest subnormals need the direct division.
+        let normalized = if local >= -1023 {
+            value * span_power(-local)
+        } else {
+            value / span_power(local)
+        };
+        Self {
+            value: normalized,
+            power: power + local,
+        }
+    }
+
+    fn add(self, other: Self) -> Self {
+        if self.value == 0. {
+            return other;
+        }
+        if other.value == 0. {
+            return self;
+        }
+        if self.power >= other.power {
+            let right = compose_scaled(other.value, other.power - self.power);
+            Self::new(self.value + right, self.power)
+        } else {
+            let left = compose_scaled(self.value, self.power - other.power);
+            Self::new(left + other.value, other.power)
+        }
+    }
+
+    fn subtract(self, other: Self) -> Self {
+        self.add(Self {
+            value: -other.value,
+            power: other.power,
+        })
+    }
+
+    fn multiply(self, other: Self) -> Self {
+        Self::new(self.value * other.value, self.power + other.power)
+    }
+
+    fn extrapolate(self, right: Self, distance: Self, interval: Self) -> Self {
+        let difference = self.subtract(right);
+        let increment = Self::new(
+            difference.value * (distance.value / interval.value),
+            difference.power + distance.power - interval.power,
+        );
+        self.add(increment)
+    }
+
+    fn finish(self) -> Real {
+        compose_scaled(self.value, self.power)
     }
 }
 
@@ -623,10 +744,6 @@ impl Coefficients {
     /// [`SpiceError::Numerical`] for a short history, a missing derivative,
     /// nonfinite inputs/capacitance or nonfinite results.
     #[inline]
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "NIintegrate companion derivative and history source follow the C addition order"
-    )]
     pub fn integrate(
         &self,
         charge: &[Real],
@@ -640,31 +757,89 @@ impl Coefficients {
         if charge.iter().any(|q| !q.is_finite()) || !capacitance.is_finite() {
             return Err(cold_numerical("nonfinite charge history or capacitance"));
         }
-        let derivative = if self.needs_previous_derivative() {
+        let anchor = self.history_anchor;
+        let (derivative, current) = if self.needs_previous_derivative() {
             let Some(previous) = previous_derivative else {
                 return Err(cold_numerical(
                     "trapezoidal order 2 needs the previous derivative",
                 ));
             };
             finite(previous, "previous derivative")?;
-            -previous * self.ag[1] + self.ag[0] * (charge[0] - charge[1])
-        } else if self.method == IntegrationMethod::Trapezoidal {
-            // NIintegrate, trapezoidal order 1: ag0 q0 + ag1 q1.
-            self.ag[0] * charge[0] + self.ag[1] * charge[1]
+            let previous = -previous * self.ag[1];
+            (
+                weighted_difference(self.ag[0], charge[0], charge[1], previous),
+                (-self.ag[0]).mul_add(charge[1], previous),
+            )
+        } else if self.order == 1 {
+            // The derivative of constant charge is exactly zero, regardless
+            // of the magnitude of the common charge or rounded coefficient.
+            (
+                weighted_difference(self.ag[0], charge[0], charge[1], 0.),
+                -self.ag[0] * charge[1],
+            )
         } else {
-            // NIintegrate, Gear: zero, then ag[k] q[k] from the highest order
-            // down, ag[0] q0 last.
-            let mut sum = 0.;
-            for k in (1..needed).rev() {
-                sum += self.ag[k] * charge[k];
+            // Omit the strongest historical coefficient, using conservation
+            // of constant charge and the independent present coefficient.
+            // At order two the strongest is always the latest accepted
+            // charge. Higher orders may contain a tighter historical pair.
+            let mut correction = 0.;
+            for k in (1..needed).rev().filter(|&k| k != anchor) {
+                correction = weighted_difference(self.ag[k], charge[k], charge[anchor], correction);
             }
-            sum + self.ag[0] * charge[0]
+            (
+                weighted_difference(self.ag[0], charge[0], charge[anchor], correction),
+                (-self.ag[0]).mul_add(charge[anchor], correction),
+            )
         };
-        let derivative = finite(derivative, "integrated derivative")?;
+        let conductance = self.ag[0] * capacitance;
+        // Normally all weights and results are binary64 values. A rounded
+        // zero/subnormal weight can still have a representable product with
+        // a large charge, and an intermediate history sum can overflow before
+        // a later term cancels it. Retain exponents for these exceptional loads.
+        if matches!(self.method, IntegrationMethod::Gear { .. })
+            && (!derivative.is_finite()
+                || !conductance.is_finite()
+                || !current.is_finite()
+                || self.scaled_weights)
+        {
+            return self.integrate_scaled_gear(charge, capacitance, anchor);
+        }
         Ok(Companion {
-            derivative,
-            conductance: finite(self.ag[0] * capacitance, "companion conductance")?,
-            current: finite(derivative - self.ag[0] * charge[0], "companion current")?,
+            derivative: finite(derivative, "integrated derivative")?,
+            conductance: finite(conductance, "companion conductance")?,
+            current: finite(current, "companion current")?,
+        })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn integrate_scaled_gear(
+        &self,
+        charge: &[Real],
+        capacitance: Real,
+        anchor: usize,
+    ) -> SpiceResult<Companion> {
+        let weights = gear_weights(&self.deltas, usize::from(self.order));
+        let reference = ScaledReal::new(charge[anchor], 0);
+        let mut correction = ScaledReal::ZERO;
+        for (k, &sample) in charge.iter().enumerate().skip(1).rev() {
+            if k != anchor {
+                correction = correction
+                    .add(weights[k].multiply(ScaledReal::new(sample, 0).subtract(reference)));
+            }
+        }
+        let derivative = weights[0]
+            .multiply(ScaledReal::new(charge[0], 0).subtract(reference))
+            .add(correction)
+            .finish();
+        let current = correction.subtract(weights[0].multiply(reference)).finish();
+        let conductance = weights[0]
+            .multiply(ScaledReal::new(capacitance, 0))
+            .finish();
+        Ok(Companion {
+            derivative: finite(derivative, "integrated derivative")?,
+            conductance: finite(conductance, "companion conductance")?,
+            current: finite(current, "companion current")?,
         })
     }
 
@@ -695,10 +870,6 @@ impl Coefficients {
     /// # Errors
     ///
     /// [`SpiceError::Numerical`] for short/nonfinite history or results.
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "NIpred trapezoidal divided differences preserve the reference multiply/add order"
-    )]
     pub fn predict(&self, solutions: &[Real]) -> SpiceResult<Real> {
         let order = usize::from(self.order);
         if self.history < order || solutions.len() < order + 1 {
@@ -716,31 +887,31 @@ impl Coefficients {
             IntegrationMethod::Trapezoidal => {
                 let dd0 = (x[0] - x[1]) / d[1];
                 if order == 1 {
-                    x[0] + d[0] * dd0
+                    d[0].mul_add(dd0, x[0])
                 } else {
                     let b = -d[0] / (2.0 * d[1]);
                     let dd1 = (x[1] - x[2]) / d[2];
-                    x[0] + (b * dd1 + (1.0 - b) * dd0) * d[0]
+                    d[0].mul_add(b.mul_add(dd1, (1.0 - b) * dd0), x[0])
                 }
             }
             IntegrationMethod::Gear { .. } => {
-                // Lagrange extrapolation to the trial time from nodes at
-                // distance t_{n+1} - t_{n-i}.
-                let mut nodes = [0.0; HISTORY_LEN + 1];
-                let mut sum = 0.0;
-                for (i, node) in nodes.iter_mut().take(order + 1).enumerate() {
-                    sum += d[i];
-                    *node = sum;
+                // Neville extrapolation combines adjacent polynomials in
+                // difference form. It preserves constants exactly, without
+                // forming large cancelling Lagrange weights or subtracting
+                // nearly equal cumulative timestamps.
+                let mut values = [ScaledReal::ZERO; HISTORY_LEN + 1];
+                for (value, &solution) in values.iter_mut().zip(x) {
+                    *value = ScaledReal::new(solution, 0);
                 }
-                (0..=order)
-                    .map(|i| {
-                        let weight: Real = (0..=order)
-                            .filter(|&j| j != i)
-                            .map(|j| nodes[j] / (nodes[j] - nodes[i]))
-                            .product();
-                        weight * x[i]
-                    })
-                    .sum()
+                let spans = scaled_spans(&d[..=order]);
+                for width in 1..=order {
+                    for i in 0..=order - width {
+                        let distance = spans[0][i + 1];
+                        let interval = spans[i + 1][i + width + 1];
+                        values[i] = values[i].extrapolate(values[i + 1], distance, interval);
+                    }
+                }
+                values[0].finish()
             }
         };
         finite(predicted, "prediction")
@@ -760,10 +931,6 @@ impl Coefficients {
     ///
     /// [`SpiceError::Numerical`] for short/nonfinite inputs, invalid
     /// tolerances or a nonfinite result.
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "CKTterr uses separately rounded relative and absolute derivative tolerances"
-    )]
     pub fn truncation_timestep(
         &self,
         charge: &[Real],
@@ -789,7 +956,9 @@ impl Coefficients {
         if charge.iter().chain(&derivative).any(|v| !v.is_finite()) {
             return Err(numerical("nonfinite truncation-error history"));
         }
-        let volttol = tol.abstol + tol.reltol * derivative[0].abs().max(derivative[1].abs());
+        let volttol = tol
+            .reltol
+            .mul_add(derivative[0].abs().max(derivative[1].abs()), tol.abstol);
         let chargetol =
             tol.reltol * charge[0].abs().max(charge[1].abs()).max(tol.chgtol) / self.dt();
         let tolerance = finite(volttol.max(chargetol), "truncation tolerance")?;
@@ -832,7 +1001,7 @@ mod tests {
         history
     }
 
-    /// Frozen binary64 results of the original unpivoted C-order corrector.
+    /// Prepared spans reproduce the recursive divided differences.
     #[test]
     fn prepared_truncation_spans_preserve_c_order_for_every_supported_order() {
         let mut history = StepHistory::new();
@@ -870,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn gear_corrector_preserves_reference_operation_order() {
+    fn gear_corrector_matches_exact_rational_weights() {
         let deltas = [0.125, 0.25, 0.1875, 0.375, 0.125, 0.3125, 0.0625];
         let expected = [
             [
@@ -910,8 +1079,8 @@ mod tests {
                 0x0000_0000_0000_0000,
             ],
             [
-                0x402c_e792_3ce7_923b,
-                0xc034_2d02_d02d_02cf,
+                0x402c_e792_3ce7_923d,
+                0xc034_2d02_d02d_02d0,
                 0x4024_9b26_c9b2_6c9b,
                 0xc015_9659_6596_5966,
                 0x3ff6_5165_1651_6516,
@@ -919,18 +1088,47 @@ mod tests {
                 0x0000_0000_0000_0000,
             ],
             [
-                0x402e_5bef_542d_63b8,
-                0xc036_3183_1831_831d,
-                0x402c_5555_5555_5559,
-                0xc022_4424_4244_2444,
+                0x402e_5bef_542d_63b1,
+                0xc036_3183_1831_8318,
+                0x402c_5555_5555_5555,
+                0xc022_4424_4244_2442,
                 0x4011_8918_9189_1892,
                 0xc004_5454_5454_5454,
                 0x3fc1_9ba5_5d3e_8e17,
             ],
         ];
         for (order, expected) in (1..=6).zip(expected) {
-            let ag = super::gear_corrector(&deltas, order);
-            assert_eq!(ag.map(f64::to_bits), expected, "order {order}");
+            let ag = super::gear_weights(&deltas, order).map(super::ScaledReal::finish);
+            // Independent exact rational Lagrange derivatives, rounded only
+            // once to binary64. The direct span formula need not match
+            // the exact rounding bitwise.
+            for (actual, reference) in ag.map(f64::to_bits).into_iter().zip(expected) {
+                assert!(
+                    actual.abs_diff(reference) <= 4,
+                    "order {order}: {actual:x} versus {reference:x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gear_weights_remain_accurate_for_uneven_and_extreme_steps() {
+        // Independent exact rational reference for the two-point historical
+        // interval: order 2 on s1=h and s2=h+k.
+        for k in [1e-15, 1e-12, 1e-6, 1e6, 1e12, 1e15] {
+            let d = [1., k, 1., 1., 1., 1., 1.];
+            let a = super::gear_weights(&d, 2).map(super::ScaledReal::finish);
+            assert!((a[0] / (1. + 1. / (1. + k)) - 1.).abs() <= 4e-16);
+            assert!((a[1] / (-(1. + k) / k) - 1.).abs() <= 4e-16);
+            assert!((a[2] / (1. / (k * (1. + k))) - 1.).abs() <= 4e-16);
+        }
+        let ordinary = super::gear_weights(&[1.; 7], 6).map(super::ScaledReal::finish);
+        for scale in [1e-300, 1e300, 1e308] {
+            let huge = super::gear_weights(&[scale; 7], 6).map(super::ScaledReal::finish);
+            for (actual, expected) in huge.iter().zip(ordinary) {
+                assert!(actual.is_finite());
+                assert!((actual * scale - expected).abs() <= 2e-13 * (1. + expected.abs()));
+            }
         }
     }
 
@@ -1078,6 +1276,103 @@ mod tests {
             let c = warm.trial(TRAP, order, h, DEFAULT_XMU).unwrap();
             assert!(close(c.predict(&line[1..]).unwrap(), line[0]));
         }
+    }
+
+    #[test]
+    fn charge_derivative_is_invariant_under_a_common_offset() {
+        let warm = history(&[0.125; 6]);
+        for method in [TRAP, GEAR6] {
+            for order in 1..=method.max_order() {
+                let c = warm.trial(method, order, 0.125, DEFAULT_XMU).unwrap();
+                let constant = [1e16; 7];
+                let zero = c.integrate(&constant, Some(0.), 1.).unwrap();
+                assert_eq!(zero.derivative, 0., "{method:?} order {order}");
+                // The unit-spaced charges remain exactly representable after
+                // adding this offset. The affine difference is invariant.
+                let charge = [12., 10., 8., 6., 4., 2., 0.];
+                let shifted = charge.map(|q| q + 1e15);
+                let a = c.integrate(&charge, Some(16.), 1.).unwrap();
+                let b = c.integrate(&shifted, Some(16.), 1.).unwrap();
+                assert_eq!(a.derivative.to_bits(), b.derivative.to_bits());
+                assert!(close(a.derivative, 16.), "{method:?} order {order}");
+            }
+        }
+    }
+
+    #[test]
+    fn representable_derivatives_survive_overflowing_charge_differences() {
+        let warm = history(&[4.; 6]);
+        let charge = [f64::MAX, -f64::MAX];
+        for method in [TRAP, GEAR6] {
+            let c = warm.trial(method, 1, 4., DEFAULT_XMU).unwrap();
+            let result = c.integrate(&charge, None, 1.).unwrap();
+            assert_eq!(result.derivative, f64::MAX * 0.5);
+            assert_eq!(result.current, f64::MAX * 0.25);
+        }
+        let c = warm.trial(TRAP, 2, 4., DEFAULT_XMU).unwrap();
+        let result = c.integrate(&charge, Some(0.), 1.).unwrap();
+        assert_eq!(result.derivative, f64::MAX);
+        assert_eq!(result.current, f64::MAX * 0.5);
+    }
+
+    #[test]
+    fn gear_history_uses_the_well_conditioned_present_coefficient() {
+        // q(t) = max(t, 0) is affine across the trial interval and constant
+        // over the two historical nodes. The exact interpolant derivative is
+        // ag0 * (q0 - q1), not the difference of two huge history weights.
+        let warm = history(&[1e-15]);
+        let c = warm.trial(GEAR2, 2, 1., DEFAULT_XMU).unwrap();
+        let a = c.integrate(&[1., 0., 0.], None, 1.).unwrap();
+        assert_eq!(a.derivative.to_bits(), c.ag()[0].to_bits());
+        let b = c.integrate(&[2., 1., 1.], None, 1.).unwrap();
+        assert_eq!(b.derivative.to_bits(), a.derivative.to_bits());
+        assert_eq!(b.current.to_bits(), (-c.ag()[0]).to_bits());
+    }
+
+    #[test]
+    fn scaled_gear_recovers_weight_underflow_and_history_overflow() {
+        let warm = history(&[1e200]);
+        let c = warm.trial(GEAR2, 2, 1e-100, DEFAULT_XMU).unwrap();
+        assert_eq!(c.ag()[2], 0.);
+        let result = c.integrate(&[0., 0., 1e300], None, 1.).unwrap();
+        assert!((result.derivative / 1e-200 - 1.).abs() <= 4. * f64::EPSILON);
+        assert_eq!(result.current.to_bits(), result.derivative.to_bits());
+
+        let warm = history(&[0.25; 6]);
+        let c = warm.trial(GEAR6, 3, 0.25, DEFAULT_XMU).unwrap();
+        let result = c
+            .integrate(&[0., 0., f64::MAX * 0.1, f64::MAX], None, 1.)
+            .unwrap();
+        let expected = f64::MAX * (0.6 - 4. / 3.);
+        assert!((result.derivative / expected - 1.).abs() <= 4. * f64::EPSILON);
+        assert_eq!(result.current.to_bits(), result.derivative.to_bits());
+    }
+
+    #[test]
+    fn gear_predictor_preserves_constants_and_extreme_linear_extrapolation() {
+        for (trial, old) in [(1e12, 1e-6), (1e308, 1e-308), (1e-300, 1e300)] {
+            let warm = history(&[old]);
+            let c = warm.trial(GEAR6, 1, trial, DEFAULT_XMU).unwrap();
+            assert_eq!(c.predict(&[1e200; 2]).unwrap(), 1e200);
+            let estimate = c.predict(&[0., -old]).unwrap();
+            assert!((estimate / trial - 1.).abs() <= 4. * f64::EPSILON);
+        }
+        let warm = history(&[1e-15; 6]);
+        for order in 1..=6 {
+            let c = warm.trial(GEAR6, order, 1., DEFAULT_XMU).unwrap();
+            assert_eq!(c.predict(&[1e200; 7]).unwrap(), 1e200);
+        }
+    }
+
+    #[test]
+    fn gear_predictor_keeps_out_of_range_intermediate_polynomials() {
+        // The far historical pair is almost coincident and its first-order
+        // extrapolation is -1e400 (outside binary64). The second-order
+        // interpolant at the nearby trial point is nonetheless about 1e200.
+        let warm = history(&[1e-200, 1e200]);
+        let c = warm.trial(GEAR2, 2, 1., DEFAULT_XMU).unwrap();
+        let prediction = c.predict(&[0., 0., 1.]).unwrap();
+        assert!((prediction / 1e200 - 1.).abs() <= 4. * f64::EPSILON);
     }
 
     #[test]

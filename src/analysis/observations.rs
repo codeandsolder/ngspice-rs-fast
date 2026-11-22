@@ -1,4 +1,6 @@
 //! Discover requested device quantities without widening ordinary plots.
+use std::collections::BTreeSet;
+
 use crate::netlist::ast::{
     FourierCard, MeasureCard, MeasureEvent, MeasureRequest, OutputCards, RequestedVector,
     VectorRequest,
@@ -13,19 +15,17 @@ pub fn requests(
     measures: &[MeasureCard],
     fourier: &[FourierCard],
 ) -> Vec<String> {
-    fn vector(v: &VectorRequest, out: &mut Vec<String>) {
+    fn vector(v: &VectorRequest, out: &mut impl FnMut(String)) {
         let name = match &v.vector {
             RequestedVector::Current { .. } => Some(v.vector.name()),
             RequestedVector::Named { name, .. } if name.starts_with('@') => Some(name.clone()),
             _ => None,
         };
-        if let Some(name) = name
-            && !out.contains(&name)
-        {
-            out.push(name);
+        if let Some(name) = name {
+            out(name);
         }
     }
-    fn event(e: &MeasureEvent, out: &mut Vec<String>) {
+    fn event(e: &MeasureEvent, out: &mut impl FnMut(String)) {
         match e {
             MeasureEvent::Crossing { operand, .. } => vector(operand, out),
             MeasureEvent::VectorCrossing {
@@ -38,7 +38,7 @@ pub fn requests(
             MeasureEvent::At { .. } => {}
         }
     }
-    fn measure(m: &MeasureRequest, out: &mut Vec<String>) {
+    fn measure(m: &MeasureRequest, out: &mut impl FnMut(String)) {
         match m {
             MeasureRequest::Deferred { template, .. } => measure(template, out),
             MeasureRequest::Parameter(_) => {}
@@ -58,7 +58,13 @@ pub fn requests(
             }
         }
     }
-    let mut out = Vec::new();
+    let mut names = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut out = |name: String| {
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    };
     for card in &output.saves {
         for v in &card.requests {
             vector(v, &mut out);
@@ -83,5 +89,5 @@ pub fn requests(
             }
         }
     }
-    out
+    names
 }

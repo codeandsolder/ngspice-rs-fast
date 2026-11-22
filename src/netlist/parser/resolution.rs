@@ -2,7 +2,7 @@
 //! library section processing. Deliberately no sourcepath/env/home expansion.
 
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::ops::Range;
@@ -15,7 +15,7 @@ use petgraph::algo::has_path_connecting;
 use petgraph::graph::{DiGraph, NodeIndex};
 
 use super::grammar::{self, ParsedCard};
-use super::scopes::InputCard;
+use super::scopes::{InputCard, ModelVisibility};
 use crate::netlist::ast::LibrarySection;
 use crate::netlist::card::{DotCommand, RawCard};
 use crate::netlist::source::{Deck, parse_deck_text, parse_fragment_text};
@@ -276,7 +276,7 @@ impl Resolver {
         parent: NodeIndex,
         chain: &[SourceLoc],
     ) -> SpiceResult<Option<Expansion>> {
-        let parsed = grammar::parse_card(&entry.source, true, &BTreeSet::new())?;
+        let parsed = grammar::parse_card(&entry.source, true, ModelVisibility::default())?;
         let ParsedCard::Include(directive) = parsed else {
             return Ok(None);
         };
@@ -415,7 +415,7 @@ fn index_sections(fragment: &Fragment) -> SpiceResult<SectionIndex> {
         let keyword = line.text.split_whitespace().next().unwrap_or_default();
         if keyword.eq_ignore_ascii_case(".lib") || keyword.eq_ignore_ascii_case(".endl") {
             let card = fragment.card(index)?;
-            match grammar::parse_card(&card, true, &BTreeSet::new())? {
+            match grammar::parse_card(&card, true, ModelVisibility::default())? {
                 ParsedCard::LibStart(name) => {
                     if current.is_some() {
                         return Err(SpiceError::parse(

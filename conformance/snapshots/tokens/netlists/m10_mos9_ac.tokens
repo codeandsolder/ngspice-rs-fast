@@ -15,7 +15,7 @@ card 2 @netlists/m10_mos9_ac.cir:3:1 lines=3-3 continuations=0
   token 2 3:5 word "gate"
   token 3 3:10 number "0" value=0e0
   token 4 3:12 word "dc"
-  token 5 3:15 number "1.15" value=1.1500000000000001e0
+  token 5 3:15 number "1.15" value=1.15e0
   token 6 3:20 word "ac"
   token 7 3:23 number "1" value=1e0
 card 3 @netlists/m10_mos9_ac.cir:4:1 lines=4-4 continuations=0
@@ -78,10 +78,10 @@ card 5 @netlists/m10_mos9_ac.cir:6:1 lines=6-6 continuations=0
   token 18 6:47 number "48p" value=4.8e-11
   token 19 6:51 word "pd"
   token 20 6:53 equals "="
-  token 21 6:54 number "38u" value=3.7999999999999995e-5
+  token 21 6:54 number "38u" value=3.8e-5
   token 22 6:58 word "ps"
   token 23 6:60 equals "="
-  token 24 6:61 number "38u" value=3.7999999999999995e-5
+  token 24 6:61 number "38u" value=3.8e-5
   token 25 6:65 word "dtemp"
   token 26 6:70 equals "="
   token 27 6:71 number "-10" value=-1e1
@@ -214,7 +214,7 @@ card 8 @netlists/m10_mos9_ac.cir:11:1 lines=11-12 continuations=1
   token 46 12:56 number "0.2n" value=2e-10
   token 47 12:61 word "cj"
   token 48 12:63 equals "="
-  token 49 12:64 number "0.6m" value=6.000000000000001e-4
+  token 49 12:64 number "0.6m" value=6e-4
   token 50 12:69 word "cjsw"
   token 51 12:73 equals "="
   token 52 12:74 number "0.45n" value=4.5e-10

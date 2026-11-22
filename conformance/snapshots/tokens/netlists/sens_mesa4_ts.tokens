@@ -58,7 +58,7 @@ card 6 @netlists/sens_mesa4_ts.cir:16:1 lines=16-16 continuations=0
   token 8 16:20 number "1u" value=1e-6
   token 9 16:23 word "w"
   token 10 16:24 equals "="
-  token 11 16:25 number "20u" value=1.9999999999999998e-5
+  token 11 16:25 number "20u" value=2e-5
   token 12 16:29 word "ts"
   token 13 16:31 equals "="
   token 14 16:32 number "40" value=4e1
@@ -86,7 +86,7 @@ card 7 @netlists/sens_mesa4_ts.cir:17:1 lines=17-18 continuations=1
   token 19 17:51 number "20" value=2e1
   token 20 17:54 word "mu"
   token 21 17:56 equals "="
-  token 22 17:57 number "0.3" value=3.0000000000000004e-1
+  token 22 17:57 number "0.3" value=3e-1
   token 23 17:61 word "gamma"
   token 24 17:66 equals "="
   token 25 17:67 number "2.5" value=2.5e0
@@ -101,7 +101,7 @@ card 7 @netlists/sens_mesa4_ts.cir:17:1 lines=17-18 continuations=1
   token 34 18:15 number "1.1" value=1.1e0
   token 35 18:19 word "epsi"
   token 36 18:23 equals "="
-  token 37 18:24 number "1.142189e-10" value=1.1421889999999999e-10
+  token 37 18:24 number "1.142189e-10" value=1.142189e-10
   token 38 18:37 word "phib"
   token 39 18:41 equals "="
   token 40 18:42 number "3.1232e18" value=3.1232e18

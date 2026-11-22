@@ -26,7 +26,7 @@ card 3 @netlists/sens_ac_hetero.cir:12:1 lines=12-12 continuations=0
   token 2 12:4 number "9" value=9e0
   token 3 12:6 number "0" value=0e0
   token 4 12:8 word "dc"
-  token 5 12:11 number "0.3" value=3.0000000000000004e-1
+  token 5 12:11 number "0.3" value=3e-1
   token 6 12:15 word "ac"
   token 7 12:18 number "1" value=1e0
 card 4 @netlists/sens_ac_hetero.cir:13:1 lines=13-13 continuations=0
@@ -88,7 +88,7 @@ card 6 @netlists/sens_ac_hetero.cir:15:1 lines=15-17 continuations=2
   token 36 16:28 number "1e-14" value=1e-14
   token 37 16:34 word "n"
   token 38 16:35 equals "="
-  token 39 16:36 number "1.2" value=1.2000000000000002e0
+  token 39 16:36 number "1.2" value=1.2e0
   token 40 16:40 word "fc"
   token 41 16:42 equals "="
   token 42 16:43 number "0.4" value=4e-1
@@ -97,7 +97,7 @@ card 6 @netlists/sens_ac_hetero.cir:15:1 lines=15-17 continuations=2
   token 45 16:51 number "1e-9" value=1e-9
   token 46 16:56 word "vbd"
   token 47 16:59 equals "="
-  token 48 16:60 number "1.2" value=1.2000000000000002e0
+  token 48 16:60 number "1.2" value=1.2e0
   token 49 17:3 word "taud"
   token 50 17:7 equals "="
   token 51 17:8 number "1e-9" value=1e-9
@@ -126,7 +126,7 @@ card 7 @netlists/sens_ac_hetero.cir:18:1 lines=18-18 continuations=0
   token 8 18:16 number "1u" value=1e-6
   token 9 18:19 word "w"
   token 10 18:20 equals "="
-  token 11 18:21 number "20u" value=1.9999999999999998e-5
+  token 11 18:21 number "20u" value=2e-5
 card 8 @netlists/sens_ac_hetero.cir:19:1 lines=19-19 continuations=0
   raw: ".model me2 nmf(level=2 rd=31 rs=31 rg=10 phib=3.1232e18)"
   kind: dot(.model)
@@ -163,7 +163,7 @@ card 9 @netlists/sens_ac_hetero.cir:20:1 lines=20-20 continuations=0
   token 8 20:16 number "1u" value=1e-6
   token 9 20:19 word "w"
   token 10 20:20 equals "="
-  token 11 20:21 number "20u" value=1.9999999999999998e-5
+  token 11 20:21 number "20u" value=2e-5
 card 10 @netlists/sens_ac_hetero.cir:21:1 lines=21-22 continuations=1
   raw: ".model me3 nmf(level=3 rd=31 rs=31 rdi=20 rsi=20 rtc1=1e-3 rtc2=1e-5 phib=3.1232e18)"
   kind: dot(.model)
@@ -209,7 +209,7 @@ card 11 @netlists/sens_ac_hetero.cir:23:1 lines=23-23 continuations=0
   token 8 23:16 number "1u" value=1e-6
   token 9 23:19 word "w"
   token 10 23:20 equals "="
-  token 11 23:21 number "20u" value=1.9999999999999998e-5
+  token 11 23:21 number "20u" value=2e-5
 card 12 @netlists/sens_ac_hetero.cir:24:1 lines=24-25 continuations=1
   raw: ".model me4 nmf(level=4 rd=31 rs=31 rdi=20 rsi=20 mu=0.3 gamma=2.5 nmax=4e16 cas=0.9 cbs=1.1 epsi=1.142189e-10 phib=3.1232e18)"
   kind: dot(.model)
@@ -234,7 +234,7 @@ card 12 @netlists/sens_ac_hetero.cir:24:1 lines=24-25 continuations=1
   token 19 24:47 number "20" value=2e1
   token 20 24:50 word "mu"
   token 21 24:52 equals "="
-  token 22 24:53 number "0.3" value=3.0000000000000004e-1
+  token 22 24:53 number "0.3" value=3e-1
   token 23 24:57 word "gamma"
   token 24 24:62 equals "="
   token 25 24:63 number "2.5" value=2.5e0
@@ -249,7 +249,7 @@ card 12 @netlists/sens_ac_hetero.cir:24:1 lines=24-25 continuations=1
   token 34 25:25 number "1.1" value=1.1e0
   token 35 25:29 word "epsi"
   token 36 25:33 equals "="
-  token 37 25:34 number "1.142189e-10" value=1.1421889999999999e-10
+  token 37 25:34 number "1.142189e-10" value=1.142189e-10
   token 38 25:47 word "phib"
   token 39 25:51 equals "="
   token 40 25:52 number "3.1232e18" value=3.1232e18
@@ -267,7 +267,7 @@ card 13 @netlists/sens_ac_hetero.cir:26:1 lines=26-26 continuations=0
   token 8 26:15 number "1u" value=1e-6
   token 9 26:18 word "w"
   token 10 26:19 equals "="
-  token 11 26:20 number "20u" value=1.9999999999999998e-5
+  token 11 26:20 number "20u" value=2e-5
 card 14 @netlists/sens_ac_hetero.cir:27:1 lines=27-28 continuations=1
   raw: ".model hf nhfet level=5 rd=31 rs=31 rg=10 ri=1e3 rf=2e3 rdi=50 rsi=50 vt0=-0.5 cds=1p kappa=0.2 delf=1e5 fgds=1e5"
   kind: dot(.model)

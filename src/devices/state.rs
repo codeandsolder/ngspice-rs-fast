@@ -537,6 +537,50 @@ impl StateHistory {
         self.window(trial, range, self.delays.get(&device))
     }
 
+    /// Disposable local window with float-mode trial semantics and limiting
+    /// disabled. All source state is read-only; only one device's trial
+    /// slots are allocated. Writes cannot reach the accepted history.
+    pub(super) fn isolated_device<'a>(
+        &'a self,
+        scratch: &'a mut IsolatedState,
+        previous: Option<&'a TrialState>,
+        device: usize,
+    ) -> SpiceResult<DeviceState<'a>> {
+        if let Some(previous) = previous {
+            self.check_trial(previous)?;
+        }
+        let range = self
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.rows.get(device))
+            .cloned()
+            .ok_or_else(|| state_error("device ordinal not in finalized state layout"))?;
+        scratch.values.resize(range.len(), Real::NAN);
+        scratch.values.fill(Real::NAN);
+        scratch.nonconvergent = false;
+        scratch.patches = previous
+            .map(|trial| trial.patches.clone())
+            .unwrap_or_default();
+        let mut mode = LoadMode::newton(IterationPhase::Float);
+        mode.set(LoadFlag::DeviceLimiting, false);
+        let mut accepted = [&[][..]; ACCEPTED_DEPTH];
+        for (slot, vector) in accepted.iter_mut().zip(&self.accepted) {
+            *slot = &vector[range.clone()];
+        }
+        Ok(DeviceState {
+            trial: &mut scratch.values,
+            accepted,
+            depth: self.accepted.len(),
+            mode,
+            previous: previous.map(|trial| &trial.values[range.clone()]),
+            carried: self.carried.as_deref().map(|vector| &vector[range.clone()]),
+            nonconvergent: Some(&mut scratch.nonconvergent),
+            offset: range.start,
+            patches: Some(&mut scratch.patches),
+            delay: self.delays.get(&device),
+        })
+    }
+
     fn window<'a>(
         &'a self,
         trial: &'a mut TrialState,
@@ -780,6 +824,22 @@ impl TrialState {
     #[must_use]
     pub fn slice(&self, range: Range<usize>) -> Option<&[Real]> {
         self.values.get(range)
+    }
+}
+
+/// Reusable, device-local disposable state storage for isolated asks.
+#[derive(Debug, Default)]
+pub(super) struct IsolatedState {
+    values: Vec<Real>,
+    nonconvergent: bool,
+    patches: State1Patches,
+}
+
+impl IsolatedState {
+    pub(super) fn clear(&mut self) {
+        self.values.clear();
+        self.patches = State1Patches::default();
+        self.nonconvergent = false;
     }
 }
 

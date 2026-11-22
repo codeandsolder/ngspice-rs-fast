@@ -16,7 +16,6 @@
 //! | `K` | 1e3 | |
 //! | `MIL` | 25.4e-6 | thousandths of an inch |
 //! | `M` | 1e-3 | **milli**, not mega |
-//! | `L` | 1e-3 | accepted by `INPevaluate()` |
 //! | `U` | 1e-6 | |
 //! | `N` | 1e-9 | |
 //! | `P` | 1e-12 | |
@@ -27,7 +26,7 @@
 //! `1kohm` is `1000`. Anything else after the literal — `1k2` — is rejected by
 //! [`parse_spice_number`]; see the RKM note on that function.
 
-use super::numeric::{scale_power, split_power};
+use super::numeric::{DecimalMultiplier, rounded_decimal, scale_power, split_power};
 use std::fmt;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
@@ -159,14 +158,23 @@ impl Sub for Complex {
 impl Mul for Complex {
     type Output = Self;
 
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "ordinary SPICE complex multiplication preserves separate product rounding"
-    )]
+    #[inline]
     fn mul(self, rhs: Self) -> Self {
+        let ac = self.re * rhs.re;
+        let bd = -self.im * rhs.im;
+        let ad = self.re * rhs.im;
+        let bc = self.im * rhs.re;
+        let real = ac + bd;
+        let imag = ad + bc;
+        // An axial operand has only one potentially nonzero product in
+        // each component: no two-product cancellation or range recovery
+        // is possible. Preserve the IEEE zero/nonfinite signs of the sum.
+        if self.re == 0. || self.im == 0. || rhs.re == 0. || rhs.im == 0. {
+            return Self::new(real, imag);
+        }
         Self::new(
-            self.re * rhs.re - self.im * rhs.im,
-            self.re * rhs.im + self.im * rhs.re,
+            refine_product(self.re, rhs.re, -self.im, rhs.im, ac, bd, real),
+            refine_product(self.re, rhs.im, self.im, rhs.re, ad, bc, imag),
         )
     }
 }
@@ -174,25 +182,30 @@ impl Mul for Complex {
 impl Div for Complex {
     type Output = Self;
 
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "the normal complex-division path uses the reference C squared denominator"
-    )]
+    #[inline]
     fn div(self, rhs: Self) -> Self {
-        let denominator = rhs.re * rhs.re + rhs.im * rhs.im;
+        let cc = rhs.re * rhs.re;
+        let dd = rhs.im * rhs.im;
+        let denominator = cc + dd;
         let ac = self.re * rhs.re;
         let bd = self.im * rhs.im;
         let bc = self.im * rhs.re;
-        let ad = self.re * rhs.im;
-        let result = Self::new((ac + bd) / denominator, (bc - ad) / denominator);
-        // Keep the C operation order on the ordinary path. Only use the
-        // scaled path when a product or sum loses its representable range.
+        let ad = -self.re * rhs.im;
+        let real = compensated_sum(self.re, rhs.re, self.im, rhs.im, ac, bd);
+        let imag = compensated_sum(self.im, rhs.re, -self.re, rhs.im, bc, ad);
+        let result = Self::new(real / denominator, imag / denominator);
+        // Keep numerator and denominator in exponent-scaled form whenever
+        // materializing either could erase a representable quotient component.
         if (!denominator.is_normal()
             || !result.is_finite()
-            || lost_product(ac, self.re, rhs.re)
-            || lost_product(bd, self.im, rhs.im)
-            || lost_product(bc, self.im, rhs.re)
-            || lost_product(ad, self.re, rhs.im))
+            || (!real.is_normal()
+                && (lost_product(ac, self.re, rhs.re)
+                    || lost_product(bd, self.im, rhs.im)
+                    || quotient_numerator_lost_range(real, ac, bd)))
+            || (!imag.is_normal()
+                && (lost_product(bc, self.im, rhs.re)
+                    || lost_product(ad, self.re, rhs.im)
+                    || quotient_numerator_lost_range(imag, bc, ad))))
             && self.is_finite()
             && rhs.is_finite()
             && rhs != Self::ZERO
@@ -203,8 +216,67 @@ impl Div for Complex {
     }
 }
 
+/// Recover the rounding residual in a cancellation-prone sum of two
+/// products. The IEEE sum is sufficient for well-conditioned sums; avoid
+/// software FMA calls on generic targets for these common cases.
+#[inline]
+fn compensated_sum(a: Real, b: Real, c: Real, d: Real, first: Real, second: Real) -> Real {
+    let sum = first + second;
+    if sum.abs() <= 0.5 * first.abs().max(second.abs()) && first.is_normal() && second.is_normal() {
+        a.mul_add(b, second) + c.mul_add(d, -second)
+    } else {
+        sum
+    }
+}
+
+#[inline]
+fn refine_product(
+    a: Real,
+    b: Real,
+    c: Real,
+    d: Real,
+    first: Real,
+    second: Real,
+    sum: Real,
+) -> Real {
+    if sum.is_normal() && sum.abs() > 0.5 * first.abs().max(second.abs()) {
+        return sum;
+    }
+    refine_product_sum(a, b, c, d, first, second, sum)
+}
+
+#[cold]
+fn refine_product_sum(
+    a: Real,
+    b: Real,
+    c: Real,
+    d: Real,
+    first: Real,
+    second: Real,
+    sum: Real,
+) -> Real {
+    if (!sum.is_finite() || lost_product(first, a, b) || lost_product(second, c, d))
+        && [a, b, c, d].into_iter().all(Real::is_finite)
+    {
+        let scaled = ScaledProduct::product(a, b).add(ScaledProduct::product(c, d));
+        scale_power(scaled.mantissa, scaled.exponent)
+    } else {
+        compensated_sum(a, b, c, d, first, second)
+    }
+}
+
+#[inline]
 fn lost_product(product: Real, a: Real, b: Real) -> bool {
     !product.is_normal() && a != 0.0 && b != 0.0
+}
+
+/// A cancellation residual below the normal range must not be rounded
+/// before division by a potentially tiny denominator.
+fn quotient_numerator_lost_range(sum: Real, first: Real, second: Real) -> bool {
+    !sum.is_normal()
+        && first != 0.0
+        && second != 0.0
+        && first.abs().max(second.abs()) < Real::from_bits(54_u64 << 52)
 }
 
 /// A number represented outside the native binary64 exponent range.
@@ -299,6 +371,239 @@ fn scaled_complex_div(a: Complex, b: Complex) -> Complex {
     )
 }
 
+/// Exact signed binary64 product as an integer significand and exponent.
+/// The input pair is finite; its product needs at most 106 bits.
+#[derive(Clone, Copy)]
+struct ExactTerm {
+    significand: i128,
+    exponent: i32,
+}
+
+impl ExactTerm {
+    fn new(a: Real, b: Real) -> Self {
+        let unpack = |v: Real| {
+            let bits = v.to_bits();
+            let biased = i32::try_from((bits >> 52) & 0x7ff).unwrap_or_default();
+            let fraction = bits & 0x000f_ffff_ffff_ffff;
+            let significand = if biased == 0 {
+                fraction
+            } else {
+                fraction | (1 << 52)
+            };
+            (significand, biased.max(1) - 1075)
+        };
+        let (a_int, a_exp) = unpack(a);
+        let (b_int, b_exp) = unpack(b);
+        let abs = i128::from(a_int) * i128::from(b_int);
+        Self {
+            significand: if a.is_sign_negative() == b.is_sign_negative() {
+                abs
+            } else {
+                -abs
+            },
+            exponent: a_exp + b_exp,
+        }
+    }
+}
+
+/// Exact sum of up to four products, before normalization and rounding.
+/// With exponents within 19 bits, four 106-bit significands fit in a
+/// signed i128. Use the full finite-binary64 superaccumulator only when
+/// the products span a wider range.
+#[cold]
+fn exact_product_sum<const N: usize>(pairs: [(Real, Real); N]) -> ScaledNumber {
+    let terms = pairs.map(|(a, b)| ExactTerm::new(a, b));
+    let mut min = i32::MAX;
+    let mut max = i32::MIN;
+    for term in terms.iter().filter(|term| term.significand != 0) {
+        min = min.min(term.exponent);
+        max = max.max(term.exponent);
+    }
+    if min > max {
+        return ScaledNumber {
+            mantissa: 0.,
+            exponent: 0,
+        };
+    }
+    if max - min <= 19 {
+        let sum = terms
+            .iter()
+            .filter(|term| term.significand != 0)
+            .map(|term| term.significand << (term.exponent - min))
+            .sum::<i128>();
+        return scaled_integer(sum, min);
+    }
+    wide_product_sum(&terms)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "round the exact integer sum once to binary64"
+)]
+fn scaled_integer(sum: i128, exponent: i32) -> ScaledNumber {
+    if sum == 0 {
+        return ScaledNumber {
+            mantissa: 0.,
+            exponent: 0,
+        };
+    }
+    let (mantissa, shift) = split_power(sum as Real);
+    ScaledNumber {
+        mantissa,
+        exponent: exponent + shift,
+    }
+}
+
+/// 66 limbs cover the full finite binary64 product range, including
+/// four maximal products. Positive and negative sums stay separate
+/// until subtraction, so even cancellation across a huge exponent
+/// spread cannot erase a nonzero determinant.
+#[cold]
+fn wide_product_sum(terms: &[ExactTerm]) -> ScaledNumber {
+    const LIMBS: usize = 66;
+    const MIN_EXP: i32 = -2148;
+    let mut positive = [0_u64; LIMBS];
+    let mut negative = [0_u64; LIMBS];
+    for term in terms.iter().filter(|term| term.significand != 0) {
+        let product = term.significand.unsigned_abs();
+        let shift = usize::try_from(term.exponent - MIN_EXP).unwrap_or_default();
+        let index = shift / 64;
+        let offset = shift % 64;
+        let bytes = product.to_le_bytes();
+        let lo = u64::from_le_bytes(*bytes.first_chunk::<8>().unwrap_or(&[0; 8]));
+        let hi = u64::from_le_bytes(*bytes.last_chunk::<8>().unwrap_or(&[0; 8]));
+        let parts = if offset == 0 {
+            [lo, hi, 0]
+        } else {
+            [
+                lo << offset,
+                (hi << offset) | (lo >> (64 - offset)),
+                hi >> (64 - offset),
+            ]
+        };
+        let out = if term.significand > 0 {
+            &mut positive
+        } else {
+            &mut negative
+        };
+        let mut carry = false;
+        for (i, slot) in out[index..].iter_mut().enumerate() {
+            let (value, overflow) = slot.overflowing_add(parts.get(i).copied().unwrap_or_default());
+            let (value, next) = value.overflowing_add(u64::from(carry));
+            *slot = value;
+            carry = overflow || next;
+            if i >= 2 && !carry {
+                break;
+            }
+        }
+    }
+    let negative_sign = positive.iter().rev().cmp(negative.iter().rev()).is_lt();
+    let (mut magnitude, subtrahend) = if negative_sign {
+        (negative, positive)
+    } else {
+        (positive, negative)
+    };
+    let mut borrow = false;
+    for (value, other) in magnitude.iter_mut().zip(subtrahend) {
+        let (diff, underflow) = value.overflowing_sub(other);
+        let (diff, next) = diff.overflowing_sub(u64::from(borrow));
+        *value = diff;
+        borrow = underflow || next;
+    }
+    let Some(index) = magnitude.iter().rposition(|&word| word != 0) else {
+        return ScaledNumber {
+            mantissa: 0.,
+            exponent: 0,
+        };
+    };
+    let high_bit = index * 64 + usize::try_from(magnitude[index].ilog2()).unwrap_or_default();
+    let exponent = i32::try_from(high_bit).unwrap_or_default() + MIN_EXP;
+    let shift = high_bit.saturating_sub(52);
+    let limb = shift / 64;
+    let offset = shift % 64;
+    let mut significand = magnitude[limb] >> offset;
+    if offset != 0 {
+        significand |= magnitude.get(limb + 1).copied().unwrap_or_default() << (64 - offset);
+    }
+    if high_bit < 52 {
+        significand <<= 52 - high_bit;
+    } else if shift != 0 {
+        let halfway = shift - 1;
+        let halfway_limb = halfway / 64;
+        let halfway_mask = 1_u64 << (halfway % 64);
+        let halfway_set = magnitude[halfway_limb] & halfway_mask != 0;
+        let sticky = magnitude[halfway_limb] & (halfway_mask - 1) != 0
+            || magnitude[..halfway_limb].iter().any(|&word| word != 0);
+        significand += u64::from(halfway_set && (sticky || significand & 1 != 0));
+    }
+    // The implicit bit at 52 supplies the low exponent bit; adding
+    // rather than masking also handles rounding the significand to 2.
+    let mantissa = Real::from_bits((1022_u64 << 52) + significand);
+    ScaledNumber {
+        mantissa: if negative_sign { -mantissa } else { mantissa },
+        exponent,
+    }
+}
+
+/// Accurate (value * pivot - upper * lower) / pivot. All four inputs
+/// are original, unnormalized coefficients of the current Schur step.
+#[cold]
+pub(crate) fn real_schur(value: Real, pivot: Real, upper: Real, lower: Real) -> Real {
+    let product = upper * lower;
+    let other = value * pivot;
+    // Normal products with enough exponent headroom have an exact FMA
+    // rounding residual. A two-product difference needs no wide accumulator.
+    if product.is_normal()
+        && other.is_normal()
+        && product.abs().min(other.abs()) >= Real::from_bits(55_u64 << 52)
+        && product.abs().max(other.abs()) < Real::MAX * 0.5
+    {
+        return (value.mul_add(pivot, -product) - upper.mul_add(lower, -product)) / pivot;
+    }
+    let numerator = exact_product_sum([(value, pivot), (-upper, lower)]);
+    let (mantissa, exponent) = split_power(pivot);
+    numerator.divide(ScaledNumber { mantissa, exponent })
+}
+
+/// Same Schur update for complex entries. Accumulate the cross products
+/// before rounding, then divide in scaled form, preserving independently
+/// scaled real and imaginary numerator components.
+#[cold]
+pub(crate) fn complex_schur(
+    value: Complex,
+    pivot: Complex,
+    upper: Complex,
+    lower: Complex,
+) -> Complex {
+    let real = exact_product_sum([
+        (value.re, pivot.re),
+        (-value.im, pivot.im),
+        (-upper.re, lower.re),
+        (upper.im, lower.im),
+    ]);
+    let imag = exact_product_sum([
+        (value.re, pivot.im),
+        (value.im, pivot.re),
+        (-upper.re, lower.im),
+        (-upper.im, lower.re),
+    ]);
+    let times = |x: ScaledNumber, v: Real| {
+        let mut product = ScaledProduct::product(x.mantissa, v);
+        product.value.exponent += x.exponent;
+        product
+    };
+    let p = ScaledProduct::product;
+    let denominator = p(pivot.re, pivot.re).add(p(pivot.im, pivot.im));
+    Complex::new(
+        times(real, pivot.re)
+            .add(times(imag, pivot.im))
+            .divide(denominator),
+        times(imag, pivot.re)
+            .add(times(real, -pivot.im))
+            .divide(denominator),
+    )
+}
+
 impl Neg for Complex {
     type Output = Self;
 
@@ -332,211 +637,145 @@ pub struct ParsedNumber {
     pub consumed: usize,
 }
 
-/// `INPevaluate`'s decimal exponent adjustment and byte width of a scale
-/// suffix, plus whether it is `MIL` (which also scales the mantissa by 25.4).
-///
-/// `letter` is the first letter after the numeric part, `rest` the text that
-/// follows it. `MEG` and `MIL` are three bytes wide, everything else one.
-/// Other letters (units such as `V`, `F`, `ohm`) do not scale.
-fn scale_suffix(letter: char, rest: &str) -> (i32, usize, bool) {
-    fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
-        text.len() >= prefix.len()
-            && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+/// Literal dialects share decimal syntax and exact scaling, but not the
+/// exponent markers, MIL suffix or consumed-letter convention.
+#[derive(Clone, Copy)]
+enum LiteralDialect {
+    Spice,
+    Numparam,
+}
+
+impl LiteralDialect {
+    const fn exponent_marker(self, byte: u8) -> bool {
+        match self {
+            Self::Spice => matches!(byte, b'e' | b'E' | b'd' | b'D'),
+            Self::Numparam => matches!(byte, b'e' | b'E'),
+        }
     }
 
-    match letter.to_ascii_lowercase() {
-        't' => (12, 1, false),
-        'g' => (9, 1, false),
-        'k' => (3, 1, false),
-        'u' => (-6, 1, false),
-        'n' => (-9, 1, false),
-        'p' => (-12, 1, false),
-        'f' => (-15, 1, false),
-        'a' => (-18, 1, false),
-        'm' => {
-            if starts_with_ignore_case(rest, "eg") {
-                (6, 3, false)
-            } else if starts_with_ignore_case(rest, "il") {
-                (-6, 3, true)
-            } else {
-                (-3, 1, false)
+    fn suffix(self, rest: &[u8]) -> (i32, usize, DecimalMultiplier) {
+        use DecimalMultiplier::{Mil, One};
+        let three = rest.get(..3);
+        match rest.first().map(u8::to_ascii_lowercase) {
+            Some(b't') => (12, 1, One),
+            Some(b'g') => (9, 1, One),
+            Some(b'k') => (3, 1, One),
+            Some(b'u') => (-6, 1, One),
+            Some(b'n') => (-9, 1, One),
+            Some(b'p') => (-12, 1, One),
+            Some(b'f') => (-15, 1, One),
+            Some(b'a') => (-18, 1, One),
+            Some(b'm') if three.is_some_and(|s| s.eq_ignore_ascii_case(b"meg")) => (6, 3, One),
+            // 25.4e-6 = 254e-7 exactly, not a binary64 multiplication.
+            Some(b'm')
+                if matches!(self, Self::Spice)
+                    && three.is_some_and(|s| s.eq_ignore_ascii_case(b"mil")) =>
+            {
+                (-7, 3, Mil)
             }
+            Some(b'm') => (-3, 1, One),
+            _ => (0, 0, One),
         }
-        _ => (0, 0, false),
     }
 }
 
-/// Consume consecutive decimal digits with the reference mantissa accumulator.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "INPevaluate rounds multiplication by ten before adding the digit"
-)]
-fn scan_mantissa_digits(bytes: &[u8], index: &mut usize, mantissa: &mut Real) -> usize {
+/// Scan decimal digits and simultaneously compute a candidate short coefficient.
+/// Wrapping is harmless for longer literals: the result is used only when
+/// there were at most 16 digits (then the exact integer fits in u64).
+fn scan_digits(bytes: &[u8], index: &mut usize, coefficient: &mut u64) -> usize {
     let start = *index;
-    while bytes.get(*index).is_some_and(u8::is_ascii_digit) {
-        *mantissa = 10.0 * *mantissa + Real::from(bytes[*index] - b'0');
+    while let Some(&digit) = bytes.get(*index).filter(|digit| digit.is_ascii_digit()) {
+        *coefficient = coefficient
+            .wrapping_mul(10)
+            .wrapping_add(u64::from(digit - b'0'));
         *index += 1;
     }
     *index - start
 }
 
-/// Parses a literal from the start of `input`, reporting bytes consumed.
-///
-/// Does not skip leading whitespace: the literal must begin at byte 0. Returns
-/// `None` when no numeric part is present. The numeric part is
-/// `[+-]?(digits[.digits?]|.digits)([eEdD][+-]?digits)?`, optionally followed
-/// by a scale suffix.
-///
-/// The value is computed exactly as `INPevaluate()` (`inpeval.c`) does, not
-/// as the nearest double to the decimal literal: the digits accumulate into a
-/// double mantissa (`mantis = 10 * mantis + digit`, fraction digits counted
-/// as negative powers), `MIL` multiplies the mantissa by 25.4, and the result
-/// is `sign * mantis * pow(10, expo)`. So `1.2` is `12 * 0.1`,
-/// `1.2000000000000002`, as in ngspice.
-///
-/// # Divergence from `INPevaluate()`
-///
-/// `INPevaluate()` applies the suffix multiplier but leaves `MEG`/`MIL`
-/// unconsumed in its output pointer, because its callers do the skipping.
-/// This function consumes the whole recognised suffix, so `consumed` is the
-/// full width. An exponent marker without digits (`1e`) is left for the
-/// caller; C would consume it with exponent zero, which gives the same value
-/// unless a scale letter follows it.
-#[must_use]
-pub fn parse_spice_number_prefix(input: &str) -> Option<ParsedNumber> {
+fn decimal_prefix(input: &str, dialect: LiteralDialect) -> Option<ParsedNumber> {
     let bytes = input.as_bytes();
-    let mut i = 0;
-    let mut sign = 1.0;
-    match bytes.first() {
-        Some(b'+') => i += 1,
-        Some(b'-') => {
-            i += 1;
-            sign = -1.0;
-        }
-        _ => {}
-    }
-
-    let mut mantis: Real = 0.0;
-    let integer_digits = scan_mantissa_digits(bytes, &mut i, &mut mantis);
+    let negative = bytes.first() == Some(&b'-');
+    let start = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let mut i = start;
+    let mut coefficient = 0;
+    let integer_digits = scan_digits(bytes, &mut i, &mut coefficient);
     let fractional_digits = if bytes.get(i) == Some(&b'.') {
         i += 1;
-        scan_mantissa_digits(bytes, &mut i, &mut mantis)
+        scan_digits(bytes, &mut i, &mut coefficient)
     } else {
         0
     };
     if integer_digits == 0 && fractional_digits == 0 {
         return None;
     }
-    // Match the old saturating decrement once per fractional digit.
-    let expo1 = i32::try_from(fractional_digits).map_or(i32::MIN, |count| -count);
-
-    let mut expo2: i32 = 0;
+    let mantissa = &input[start..i];
+    let mut exponent = 0_i128;
     if bytes
         .get(i)
-        .is_some_and(|byte| matches!(byte.to_ascii_lowercase(), b'e' | b'd'))
-    {
-        let mut exponent_end = i + 1;
-        let mut negative = false;
-        match bytes.get(exponent_end) {
-            Some(b'+') => exponent_end += 1,
-            Some(b'-') => {
-                exponent_end += 1;
-                negative = true;
-            }
-            _ => {}
-        }
-        let exponent_digits_start = exponent_end;
-        let mut exponent: i32 = 0;
-        while exponent_end < bytes.len() && bytes[exponent_end].is_ascii_digit() {
-            exponent = exponent
-                .saturating_mul(10)
-                .saturating_add(i32::from(bytes[exponent_end] - b'0'));
-            exponent_end += 1;
-        }
-        // `1e` with nothing after it is a mantissa of `1` followed by junk, not
-        // an exponent; leave it for the caller.
-        if exponent_end > exponent_digits_start {
-            i = exponent_end;
-            expo2 = if negative { -exponent } else { exponent };
-        }
-    }
-
-    let (scale, suffix_width, mil) = input[i..].chars().next().map_or((0, 0, false), |letter| {
-        scale_suffix(letter, &input[i + letter.len_utf8()..])
-    });
-    if mil {
-        mantis *= 25.4;
-    }
-    let expo = expo1.saturating_add(scale).saturating_add(expo2);
-
-    Some(ParsedNumber {
-        value: sign * mantis * Real::from(expo).powf_c(),
-        consumed: i + suffix_width,
-    })
-}
-
-/// Parse numeric literals and unit suffixes accepted by numparam.
-///
-/// Parses a number inside a `.param`/`{...}` expression as numparam's
-/// `fetchnumber()` (`xpressn.c`) does: `sscanf("%lG")` (the correctly rounded
-/// decimal value, `e`/`E` exponents only) times `parseunit()`'s multiplier
-/// for the next letter (`T G K MEG M U N P F A`; `MIL` is milli there).
-/// `consumed` covers the numeric part only; the caller swallows the unit
-/// letters, as `fetchnumber()` does.
-#[must_use]
-pub fn parse_numparam_number_prefix(input: &str) -> Option<ParsedNumber> {
-    let bytes = input.as_bytes();
-    let mut i = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
-    let mut digits = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-        digits += 1;
-    }
-    if bytes.get(i) == Some(&b'.') {
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-            digits += 1;
-        }
-    }
-    if digits == 0 {
-        return None;
-    }
-    if bytes
-        .get(i)
-        .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'e'))
+        .is_some_and(|&byte| dialect.exponent_marker(byte))
     {
         let mut end = i + 1;
+        let negative_exponent = bytes.get(end) == Some(&b'-');
         if matches!(bytes.get(end), Some(b'+' | b'-')) {
             end += 1;
         }
-        let start = end;
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
+        let exponent_start = end;
+        while let Some(&digit) = bytes.get(end).filter(|digit| digit.is_ascii_digit()) {
+            exponent = exponent
+                .saturating_mul(10)
+                .saturating_add(i128::from(digit - b'0'));
             end += 1;
         }
-        if end > start {
+        // Incomplete exponent markers remain for the caller, as before.
+        if end > exponent_start {
             i = end;
+            if negative_exponent {
+                exponent = -exponent;
+            }
         }
     }
-    let value: Real = input[..i].parse().ok()?;
-    let rest = &input[i..];
-    let unit = match rest.bytes().next().map(|b| b.to_ascii_uppercase()) {
-        Some(b'T') => 1e12,
-        Some(b'G') => 1e9,
-        Some(b'K') => 1e3,
-        Some(b'M') if rest.len() >= 3 && rest[..3].eq_ignore_ascii_case("meg") => 1e6,
-        Some(b'M') => 1e-3,
-        Some(b'U') => 1e-6,
-        Some(b'N') => 1e-9,
-        Some(b'P') => 1e-12,
-        Some(b'F') => 1e-15,
-        Some(b'A') => 1e-18,
-        _ => 1.0,
-    };
+    let (scale, suffix_width, multiplier) = dialect.suffix(&bytes[i..]);
+    // A saturated exponent cannot be cancelled by the length of an actual
+    // input slice, so saturating adjustment is exact for every finite result.
+    let exponent = exponent
+        .saturating_sub(i128::try_from(fractional_digits).ok()?)
+        .saturating_add(i128::from(scale));
+    let short_coefficient = (integer_digits + fractional_digits <= 16).then_some(coefficient);
+    let value = rounded_decimal(mantissa, short_coefficient, negative, exponent, multiplier)?;
     Some(ParsedNumber {
-        value: value * unit,
-        consumed: i,
+        value,
+        consumed: i + if matches!(dialect, LiteralDialect::Spice) {
+            suffix_width
+        } else {
+            0
+        },
     })
+}
+
+/// Parse a SPICE literal prefix with its scale suffix, without leading space.
+///
+/// Decimal digits, optional sign, point and e/E/d/D exponent are recognized
+/// before the optional scale. The exact scaled decimal is rounded once to
+/// nearest binary64. Overflow produces infinity, underflow gradual or signed
+/// zero; semantic parsers retain their existing finite-value checks.
+///
+/// The full MEG/MIL suffix is consumed, unlike C's internal rest pointer.
+/// A marker without exponent digits is left for the caller.
+#[must_use]
+pub fn parse_spice_number_prefix(input: &str) -> Option<ParsedNumber> {
+    decimal_prefix(input, LiteralDialect::Spice)
+}
+
+/// Parse a numparam literal prefix.
+///
+/// Numparam recognizes only e/E exponents,
+/// and MIL means milli, not thousandths of an inch. The scale is applied
+/// before correct rounding, but consumed counts just the numeric part;
+/// the expression parser swallows trailing unit letters separately.
+#[must_use]
+pub fn parse_numparam_number_prefix(input: &str) -> Option<ParsedNumber> {
+    decimal_prefix(input, LiteralDialect::Numparam)
 }
 
 /// A complete numparam number ([`parse_numparam_number_prefix`]) followed by
@@ -549,17 +788,6 @@ pub fn parse_numparam_number(input: &str) -> Option<Real> {
         .chars()
         .all(|c| c.is_ascii_alphabetic())
         .then_some(parsed.value)
-}
-
-/// `pow(10.0, expo)` through the platform `pow`, as C calls it.
-trait PowTen {
-    fn powf_c(self) -> Real;
-}
-
-impl PowTen for Real {
-    fn powf_c(self) -> Real {
-        Self::powf(10.0, self)
-    }
 }
 
 /// Parses a complete SPICE numeric literal, scale factor included.
@@ -609,8 +837,9 @@ pub fn format_spice_number(value: Real) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Complex, almost_equal_ulps, approx_eq, format_spice_number, parse_numparam_number_prefix,
-        parse_spice_number, parse_spice_number_prefix,
+        Complex, Real, almost_equal_ulps, approx_eq, complex_schur, exact_product_sum,
+        format_spice_number, parse_numparam_number_prefix, parse_spice_number,
+        parse_spice_number_prefix, real_schur, scale_power,
     };
 
     #[test]
@@ -629,17 +858,15 @@ mod tests {
     }
 
     #[test]
-    fn complex_division_preserves_normal_rounding_and_extreme_components() {
+    fn complex_division_handles_normal_and_extreme_components() {
         let a = Complex::new(1.23456789, -9.87654321);
         let b = Complex::new(-0.371, 2.415);
-        let d = b.re * b.re + b.im * b.im;
-        let expected = Complex::new(
-            (a.re * b.re + a.im * b.im) / d,
-            (a.im * b.re - a.re * b.im) / d,
-        );
+        // Correct rounding of the exact rational quotient of the binary64
+        // input values (not the original cancellation-prone calculation).
+        let expected = Complex::new(-4.072_097_521_006_333_5, 0.114_360_368_651_490_67);
         let actual = a / b;
-        assert_eq!(actual.re.to_bits(), expected.re.to_bits());
-        assert_eq!(actual.im.to_bits(), expected.im.to_bits());
+        assert!(almost_equal_ulps(actual.re, expected.re, 2));
+        assert!(almost_equal_ulps(actual.im, expected.im, 2));
         for scale in [1e-300, 1e-200, 1e200, 1e300, f64::MAX] {
             let z = Complex::new(scale, scale);
             assert_eq!(z / z, Complex::real(1.));
@@ -664,16 +891,84 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_complex_arithmetic_does_not_recover_product_roundoff() {
+    fn ordinary_complex_arithmetic_recovers_product_roundoff() {
         let epsilon = f64::EPSILON;
         let a = Complex::new(1. + epsilon, 1.);
         let b = Complex::new(1. - epsilon, 1.);
-        // Fusing the two products would expose -epsilon^2, but the C path
-        // rounds two ordinary products independently before subtraction.
-        assert_eq!((a * b).re.to_bits(), 0_f64.to_bits());
+        let expected = -(epsilon * epsilon);
+        assert_eq!((a * b).re, expected);
         let q = Complex::new(a.re, -a.im) / b;
-        assert_eq!(q.re.to_bits(), 0_f64.to_bits());
-        assert!((1. + epsilon).mul_add(1. - epsilon, -1.) < 0.);
+        assert_eq!(q.re, expected / ((1. - epsilon).powi(2) + 1.));
+        assert_eq!((b * a).re, expected);
+    }
+
+    #[test]
+    fn exact_products_preserve_cancellation_across_the_full_exponent_range() {
+        let tiny = Real::from_bits(1);
+        let huge = Real::MAX;
+        let exact = exact_product_sum([(huge, huge), (-huge, huge), (tiny, tiny)]);
+        assert_eq!(exact.mantissa, 1.);
+        assert_eq!(exact.exponent, -2148);
+        let exact = exact_product_sum([(huge, huge), (-huge, huge), (-tiny, tiny)]);
+        assert_eq!(exact.mantissa, -1.);
+        assert_eq!(exact.exponent, -2148);
+        let power = scale_power(1., 1023);
+        let exact = exact_product_sum([(power, power); 4]);
+        assert_eq!(exact.mantissa, 1.);
+        assert_eq!(exact.exponent, 2048);
+        // The wide sum rounds halfway to even, but a sticky bit at the
+        // opposite end of the accumulator changes the rounded result.
+        let half = Real::EPSILON / 2.;
+        for (extra, expected) in [(0., 1.), (tiny, 1.0_f64.next_up())] {
+            let exact = exact_product_sum([(1., 1.), (half, 1.), (extra, 1.)]);
+            assert_eq!(scale_power(exact.mantissa, exact.exponent), expected);
+        }
+    }
+
+    #[test]
+    fn unnormalized_schur_recovers_tiny_nonzero_determinants() {
+        for (pivot_exp, lower_exp) in [(700, 700), (-500, -700), (500, -500)] {
+            let pivot = scale_power(1., pivot_exp);
+            let lower = scale_power(1., lower_exp);
+            let value = lower.next_up();
+            assert_eq!(real_schur(lower, pivot, pivot, lower), 0.);
+            assert_eq!(real_schur(value, pivot, pivot, lower), value - lower);
+        }
+        let pivot = Complex::new(scale_power(1., 500), scale_power(1., -500));
+        let lower = Complex::new(scale_power(1., 600), scale_power(1., -600));
+        let value = Complex::new(lower.re, lower.im.next_up());
+        assert_eq!(complex_schur(lower, pivot, pivot, lower), Complex::ZERO);
+        let result = complex_schur(value, pivot, pivot, lower);
+        let expected = value.im - lower.im;
+        assert!((result.im / expected - 1.).abs() < 1e-14);
+        assert!(result.re.abs() <= expected.abs() * 1e-14);
+    }
+
+    #[test]
+    fn quotient_retains_cancellation_before_subnormal_rounding() {
+        let e = f64::EPSILON;
+        let scale = 2_f64.powi(-500);
+        let a = Complex::new((1. + e) * scale, -scale);
+        let b = Complex::new((1. - e) * scale, scale);
+        let q = a / b;
+        let expected = -(e * e) / ((1. - e).powi(2) + 1.);
+        assert!((q.re / expected - 1.).abs() < 1e-14);
+        assert!((q.im + 1.).abs() < 1e-14);
+    }
+
+    #[test]
+    fn complex_product_recovers_finite_components_across_exponent_limits() {
+        let large = Complex::new(f64::MAX, f64::MAX);
+        let z = large * Complex::new(2., 2.);
+        assert_eq!(z.re, 0.);
+        assert!(z.im.is_infinite() && z.im.is_sign_positive());
+        let tiny = f64::from_bits(1);
+        let z = Complex::new(tiny, tiny) * Complex::new(0.5, -0.5);
+        assert_eq!(z.re, tiny);
+        assert_eq!(z.im, 0.);
+        let z = Complex::new(1e300, 1e-300) * Complex::real(1e-10);
+        assert!((z.re / 1e290 - 1.).abs() < 1e-14);
+        assert!((z.im / 1e-310 - 1.).abs() < 1e-13);
     }
 
     #[test]
@@ -704,9 +999,8 @@ mod tests {
         assert_eq!(parse_spice_number("1meg"), Some(1e6));
         assert_eq!(parse_spice_number("1MEG"), Some(1e6));
         assert_eq!(parse_spice_number("1MeG"), Some(1e6));
-        // `mantis *= 25.4`, then `pow(10, -6)`.
-        assert_eq!(parse_spice_number("1mil"), Some(25.4 * 1e-6));
-        assert_eq!(parse_spice_number("1MIL"), Some(25.4 * 1e-6));
+        assert_eq!(parse_spice_number("1mil"), Some(25.4e-6));
+        assert_eq!(parse_spice_number("1MIL"), Some(25.4e-6));
         assert_eq!(parse_spice_number("1u"), Some(1e-6));
         assert_eq!(parse_spice_number("1n"), Some(1e-9));
         assert_eq!(parse_spice_number("1p"), Some(1e-12));
@@ -719,22 +1013,150 @@ mod tests {
     }
 
     #[test]
-    fn values_are_computed_as_inpevaluate_does() {
-        // Digits accumulate into a double mantissa scaled by pow(10, expo),
-        // so these differ from the nearest double; ngspice gives the same.
-        assert_eq!(parse_spice_number("1.2"), Some(1.200_000_000_000_000_2));
-        assert_eq!(parse_spice_number("1.2"), Some(12.0 * 10f64.powf(-1.0)));
-        // numparam writes `{3}` back as "% 23.15e" text before INPevaluate.
+    fn literals_round_once_after_exact_scaling() {
+        assert_eq!(parse_spice_number("1.2"), Some(1.2));
+        assert_eq!(parse_spice_number("3.000000000000000e+00"), Some(3.));
+        assert_eq!(parse_spice_number("1d3"), Some(1e3));
+        assert_eq!(parse_spice_number("-2.5D-3"), Some(-2.5e-3));
+        assert_eq!(parse_spice_number("1e312f"), Some(1e297));
+        assert_eq!(parse_spice_number("1e-330meg"), Some(0.));
+        assert_eq!(parse_spice_number("1e-330t"), Some(1e-318));
+        assert_eq!(parse_spice_number("1e309mil"), Some(2.54e304));
+        assert_eq!(parse_spice_number("1e-323mil"), Some(0.));
+        assert_eq!(parse_spice_number("0e99999999999999999999999"), Some(0.));
         assert_eq!(
-            parse_spice_number("3.000000000000000e+00"),
-            Some(3e15 * 10f64.powf(-15.0))
+            parse_spice_number("-1e-99999999999999999999999")
+                .unwrap()
+                .to_bits(),
+            (-0_f64).to_bits()
         );
-        // `d`/`D` is an exponent marker, as `e`.
-        assert_eq!(parse_spice_number("1d3"), Some(1000.0));
         assert_eq!(
-            parse_spice_number("-2.5D-3"),
-            Some(-25.0 * 10f64.powf(-4.0))
+            parse_spice_number("-0e99999999999999999999999")
+                .unwrap()
+                .to_bits(),
+            (-0_f64).to_bits()
         );
+        assert_eq!(
+            parse_spice_number("1e99999999999999999999999"),
+            Some(f64::INFINITY)
+        );
+    }
+
+    #[test]
+    fn decimal_edges_match_independent_exact_rounding() {
+        // Expected bits from exact decimal products converted with CPython
+        // Decimal -> binary64, including boundaries on both sides of a tie.
+        for (text, expected) in [
+            ("9007199254740993", 0x4340_0000_0000_0000),
+            ("9007199254740995", 0x4340_0000_0000_0002),
+            ("9007199254740993e-3k", 0x4340_0000_0000_0000),
+            ("1.7976931348623157e311m", f64::MAX.to_bits()),
+            ("1.7976931348623159e308", f64::INFINITY.to_bits()),
+            ("2.2250738585072011e-308", 0x000f_ffff_ffff_ffff),
+            ("2.2250738585072014e-308", f64::MIN_POSITIVE.to_bits()),
+            ("2.4703282292062327e-306a", 0),
+            ("2.4703282292062328e-306a", 1),
+            ("1.234567890123456789mil", 0x3f00_70cd_83b2_078b),
+            ("9999999999999999mil", 0x424d_91ca_35ff_ffff),
+            ("1.234567890123456789e12a", 0x3eb4_b66d_c01e_c6fb),
+            ("-0.0", (-0_f64).to_bits()),
+        ] {
+            assert_eq!(
+                parse_spice_number(text).unwrap().to_bits(),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_sticky_tail_distinguishes_exact_halfway_cases() {
+        // Exact midpoint between 1 and the next binary64, and perturbations
+        // smaller than the retained 768 significant digits.
+        let midpoint = "1.00000000000000011102230246251565404236316680908203125";
+        let zeros = "0".repeat(1000);
+        let tie = format!("{midpoint}{zeros}");
+        let above = format!("{tie}1");
+        let below = format!("{}4{}", &midpoint[..midpoint.len() - 1], "9".repeat(1000));
+        for (text, bits) in [
+            (tie, 1_f64.to_bits()),
+            (above, 1_f64.to_bits() + 1),
+            (below, 1_f64.to_bits()),
+        ] {
+            assert_eq!(parse_spice_number(&text).unwrap().to_bits(), bits);
+            assert_eq!(
+                parse_numparam_number_prefix(&text).unwrap().value.to_bits(),
+                bits
+            );
+        }
+
+        // MIL is the non-power-of-ten case. Construct a decimal from an
+        // independent exact rational: midpoint / (254e-7). The odd factor 127
+        // gives a repeating decimal, so truncation and incrementing the last
+        // digit straddle the exact midpoint. Carries from the discarded
+        // decimal tail must be taken into account *before* truncation.
+        let denominator = (1_u128 << 53) * 254;
+        let numerator = ((1_u128 << 53) + 1) * 10_000_000;
+        let mut lower = format!("{}.", numerator / denominator);
+        let mut remainder = numerator % denominator;
+        while lower.len() < 1000 || lower.ends_with('9') {
+            remainder *= 10;
+            lower.push(char::from(
+                b'0' + u8::try_from(remainder / denominator).unwrap(),
+            ));
+            remainder %= denominator;
+        }
+        assert_ne!(remainder, 0);
+        let mut upper = lower.clone();
+        let last = upper.pop().unwrap();
+        upper.push(char::from_u32(u32::from(last) + 1).unwrap());
+        assert_eq!(
+            parse_spice_number(&format!("{lower}mil"))
+                .unwrap()
+                .to_bits(),
+            1_f64.to_bits()
+        );
+        assert_eq!(
+            parse_spice_number(&format!("{upper}mil"))
+                .unwrap()
+                .to_bits(),
+            1_f64.to_bits() + 1
+        );
+    }
+
+    #[test]
+    fn huge_decimal_coefficients_cancel_exponents_without_intermediate_overflow() {
+        let count = 100_000;
+        let zeros = "0".repeat(count);
+        let integer = format!("1{zeros}e-{count}");
+        let fraction = format!("0.{zeros}12345e{}k", count + 1);
+        assert_eq!(parse_spice_number(&integer), Some(1.));
+        assert_eq!(parse_spice_number(&format!("{integer}mil")), Some(25.4e-6));
+        assert_eq!(parse_spice_number(&fraction), Some(1234.5));
+        assert_eq!(parse_numparam_number_prefix(&integer).unwrap().value, 1.);
+    }
+
+    #[test]
+    fn decimal_prefix_boundaries_are_dialect_specific_and_utf8_safe() {
+        for (text, spice, numparam, spice_width, numparam_width) in [
+            ("1d2k", 100_000., 1., 4, 1),
+            ("1e+", 1., 1., 1, 1),
+            ("1MeGoHm", 1e6, 1e6, 4, 1),
+            ("1mIl", 25.4e-6, 1e-3, 4, 1),
+            ("1m²", 1e-3, 1e-3, 2, 1),
+            ("1m€", 1e-3, 1e-3, 2, 1),
+            ("1Ω", 1., 1., 1, 1),
+            ("1l", 1., 1., 1, 1),
+            ("1e-330T", 1e-318, 1e-318, 7, 6),
+        ] {
+            let a = parse_spice_number_prefix(text).unwrap();
+            let b = parse_numparam_number_prefix(text).unwrap();
+            assert_eq!((a.value, a.consumed), (spice, spice_width), "{text}");
+            assert_eq!((b.value, b.consumed), (numparam, numparam_width), "{text}");
+        }
+        for text in ["1m²", "1m€", "1Ω", "1e+", "4k7", "2N2222"] {
+            assert_eq!(parse_spice_number(text), None, "{text}");
+        }
     }
 
     #[test]
@@ -764,10 +1186,10 @@ mod tests {
     }
 
     #[test]
-    fn numparam_numbers_are_strtod_times_the_unit() {
+    fn numparam_retains_its_own_suffix_and_exponent_grammar() {
         let value = |text| parse_numparam_number_prefix(text).map(|p| p.value);
         assert_eq!(value("1.2"), Some(1.2));
-        assert_eq!(value("1.2k"), Some(1.2 * 1e3));
+        assert_eq!(value("1.2k"), Some(1.2e3));
         assert_eq!(value("2meg"), Some(2e6));
         // parseunit() has no MIL: `1mil` is milli.
         assert_eq!(value("1mil"), Some(1e-3));
@@ -782,7 +1204,7 @@ mod tests {
     fn trailing_unit_names_are_ignored() {
         assert_eq!(parse_spice_number("5V"), Some(5.0));
         assert_eq!(parse_spice_number("1kohm"), Some(1000.0));
-        assert_eq!(parse_spice_number("1000F"), Some(1e-15 * 1000.0));
+        assert_eq!(parse_spice_number("1000F"), Some(1e-12));
     }
 
     #[test]
@@ -810,10 +1232,7 @@ mod tests {
 
         let parsed = parse_spice_number_prefix("2.5uF").unwrap();
         assert_eq!(parsed.consumed, 4);
-        // `INPevaluate()` computes `mantissa * pow(10, expo)`; it does not parse
-        // the scaled literal directly, so the result is this product and not
-        // necessarily the nearest double to `2.5e-6`.
-        assert_eq!(parsed.value, 2.5 * 1e-6);
+        assert_eq!(parsed.value, 2.5e-6);
 
         let parsed = parse_spice_number_prefix("1e3").unwrap();
         assert_eq!(parsed.consumed, 3);

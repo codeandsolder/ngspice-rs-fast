@@ -109,3 +109,29 @@ fn structural_and_exact_singularity_even_with_zero_rhs() {
         assert!(d.solve(&Vector::zeros(2)).is_err());
     }
 }
+
+#[test]
+fn sparse_raw_factors_cover_both_binary64_exponent_limits() {
+    // Dyadic integer-scaled diagonal: both input and solution are exact.
+    // Every nonzero binary64 exponent, including the smallest subnormal.
+    for exponent in -1074..=1023 {
+        let pivot = if exponent < -1022 {
+            f64::from_bits(1 << u32::try_from(exponent + 1074).unwrap())
+        } else {
+            f64::from_bits(u64::try_from(exponent + 1023).unwrap() << 52)
+        };
+        let (s, _) = matrices(&[&[pivot]]);
+        let f = s.factorize().unwrap();
+        let rhs = Vector::from_slice(&[pivot]);
+        assert_eq!(f.solve(&rhs).unwrap().as_slice(), &[1.]);
+        assert_eq!(f.solve_transposed(&rhs).unwrap().as_slice(), &[1.]);
+        let negative = Vector::from_slice(&[-pivot]);
+        assert_eq!(f.solve(&negative).unwrap().as_slice(), &[-1.]);
+        if exponent == -1074 {
+            // An unrepresentable answer is a solve error, not a bad
+            // factor. A subsequent representable solve still succeeds.
+            assert!(f.solve(&Vector::from_slice(&[1.])).is_err());
+            assert_eq!(f.solve(&rhs).unwrap().as_slice(), &[1.]);
+        }
+    }
+}

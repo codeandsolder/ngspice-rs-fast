@@ -85,13 +85,14 @@
 
 use std::collections::BTreeSet;
 
+use super::elaboration::{ElaborationSize, reserve, resource_error};
 use crate::devices::linear::LinearContext;
-use crate::devices::models::{ModelContext, ModelFamily, ModelResolver};
+use crate::devices::models::{ModelContext, ModelFamily, ModelResolver, PreparationKey};
 use crate::devices::rlc::{Capacitor, Resistor};
 use crate::devices::schema::{ScalarDomain, ScalarParameter, ScalarSchema, ScalarUnit};
 use crate::devices::traits::{Device, StampContext};
 use crate::maths::Vector;
-use crate::netlist::ast::{DeviceInstance, ParameterKind};
+use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment, ParameterKind};
 use crate::primitives::{NodeAppend, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// The most sections one instance may expand into. C has no limit; the bound
@@ -316,110 +317,166 @@ impl UrcSections {
     }
 }
 
-/// Expands one `U` instance into its R/C (or R/D) ladder, in C's creation
-/// order. Internal nodes are interned in `nodes` only on success.
-/// `deck_nodes` are the node names the deck's own cards use: a generated
-/// name among them is a collision even when its card comes later.
-///
-/// # Errors
-/// A missing or wrong-family model, unsupported or invalid setters, the
-/// degenerate inputs of [`UrcSections::new`], internal name collisions, or a
-/// generated element's own validation.
-pub(crate) fn expand(
-    instance: &DeviceInstance,
-    nodes: &mut NodeAppend<'_>,
-    models: &ModelResolver<'_>,
-    context: &ModelContext,
-    deck_nodes: &BTreeSet<String>,
-) -> SpiceResult<Vec<Box<dyn Device>>> {
-    context.validate(&instance.location)?;
-    if instance.nodes.len() != 3 {
-        return Err(SpiceError::circuit(format!(
-            "URC {} needs three terminals",
-            instance.name
-        )));
-    }
-    let Some(model) = models.resolve(instance)? else {
-        return Err(SpiceError::parse(
-            instance.location.clone(),
-            format!("URC {} requires a model", instance.name),
-        ));
-    };
-    if model.family() != ModelFamily::Urc {
-        return Err(SpiceError::parse(
-            instance.location.clone(),
-            format!("URC {} needs a urc model", instance.name),
-        ));
-    }
-    let card = model.card();
-    let mut setters = Vec::with_capacity(card.parameters.len());
-    for parameter in &card.parameters {
-        if parameter.kind == ParameterKind::Flag && parameter.name == "urc" {
-            continue; // URC_MOD_URC: a no-op type flag (urcmpar.c).
+/// Immutable declaration data with model defaults in C's application order.
+struct ModelInputs {
+    values: crate::devices::schema::ScalarValues,
+    defaults: Vec<ParameterAssignment>,
+}
+
+impl ModelInputs {
+    fn read(card: &ModelCard) -> SpiceResult<Self> {
+        let mut setters = Vec::with_capacity(card.parameters.len());
+        for parameter in &card.parameters {
+            if parameter.kind == ParameterKind::Flag && parameter.name == "urc" {
+                continue; // URC_MOD_URC: a no-op type flag (urcmpar.c).
+            }
+            if parameter.name.eq_ignore_ascii_case("level") {
+                return Err(SpiceError::Unsupported {
+                    feature: "level on a urc model (URCmPTable has no level; C ignores it)".into(),
+                    location: Some(parameter.location.clone()),
+                });
+            }
+            setters.push(parameter);
         }
-        if parameter.name.eq_ignore_ascii_case("level") {
-            return Err(SpiceError::Unsupported {
-                feature: "level on a urc model (URCmPTable has no level; C ignores it)".into(),
-                location: Some(parameter.location.clone()),
-            });
-        }
-        setters.push(parameter);
-    }
-    // `inpgmod.c::create_model`: `l`/`n` on the `.model` card are instance
-    // defaults there, applied before the instance card's own setters.
-    let (setters, model_defaults) =
-        crate::devices::schema::split_model_setters(setters, &MODEL, &INSTANCE);
-    let m = MODEL.validate(setters, &card.location)?;
-    let i = crate::devices::schema::with_defaults(
-        &INSTANCE,
-        &model_defaults,
-        instance.parameters.iter(),
-        &instance.location,
-    )?;
-    let value = |name: &str| m.get(name).map(|v| v.value);
-    let Some(length) = i.get("l").map(|v| v.value) else {
-        return Err(SpiceError::Unsupported {
-            feature: format!(
-                "URC {} without l= (C uses length 0: zero-valued elements)",
-                instance.name
-            ),
-            location: Some(instance.location.clone()),
-        });
-    };
-    let lumps = match i.get("n") {
-        None => None,
-        Some(n) => Some(integer(n.value, n.location.as_ref(), &instance.location)?),
-    };
-    let required = |name: &str| {
-        value(name).ok_or_else(|| {
-            SpiceError::parse(card.location.clone(), format!("missing default for {name}"))
+        // `inpgmod.c::create_model`: `l`/`n` on the `.model` card are instance
+        // defaults there, applied before the instance card's own setters.
+        let (setters, model_defaults) =
+            crate::devices::schema::split_model_setters(setters, &MODEL, &INSTANCE);
+        let m = MODEL.validate(setters, &card.location)?;
+        Ok(Self {
+            values: m,
+            defaults: model_defaults.into_iter().cloned().collect(),
         })
-    };
-    let sections = UrcSections::new(
-        length,
-        lumps,
-        required("k")?,
-        required("fmax")?,
-        required("rperl")?,
-        required("cperl")?,
-        value("isperl"),
-        required("rsperl")?,
-    )
-    .map_err(|error| match error {
-        SpiceError::Circuit { message } => SpiceError::parse(
-            instance.location.clone(),
-            format!("{}: {message}", instance.name),
-        ),
-        other => other,
-    })?;
-    build(
-        instance,
-        &sections,
-        &card.location,
-        nodes,
-        context,
-        deck_nodes,
-    )
+    }
+}
+
+/// Validated section arithmetic and provenance, without allocating ladder
+/// nodes, devices or state. Every device in this plan has an exact size.
+pub(super) struct UrcPlan {
+    sections: UrcSections,
+    model_location: SourceLoc,
+}
+
+impl UrcPlan {
+    pub(super) fn prepare(
+        instance: &DeviceInstance,
+        models: &ModelResolver<'_>,
+        context: &ModelContext,
+    ) -> SpiceResult<Self> {
+        context.validate(&instance.location)?;
+        if instance.nodes.len() != 3 {
+            return Err(SpiceError::circuit(format!(
+                "URC {} needs three terminals",
+                instance.name
+            )));
+        }
+        let Some(model) = models.resolve(instance)? else {
+            return Err(SpiceError::parse(
+                instance.location.clone(),
+                format!("URC {} requires a model", instance.name),
+            ));
+        };
+        if model.family() != ModelFamily::Urc {
+            return Err(SpiceError::parse(
+                instance.location.clone(),
+                format!("URC {} needs a urc model", instance.name),
+            ));
+        }
+        let card = model.card();
+        let inputs = model.prepare(PreparationKey::Inputs, || ModelInputs::read(card))?;
+        let m = &inputs.values;
+        let i = INSTANCE.validate(
+            inputs.defaults.iter().chain(&instance.parameters),
+            &instance.location,
+        )?;
+        let value = |name: &str| m.get(name).map(|v| v.value);
+        let Some(length) = i.get("l").map(|v| v.value) else {
+            return Err(SpiceError::Unsupported {
+                feature: format!(
+                    "URC {} without l= (C uses length 0: zero-valued elements)",
+                    instance.name
+                ),
+                location: Some(instance.location.clone()),
+            });
+        };
+        let lumps = match i.get("n") {
+            None => None,
+            Some(n) => Some(integer(n.value, n.location.as_ref(), &instance.location)?),
+        };
+        let required = |name: &str| {
+            value(name).ok_or_else(|| {
+                SpiceError::parse(card.location.clone(), format!("missing default for {name}"))
+            })
+        };
+        let sections = UrcSections::new(
+            length,
+            lumps,
+            required("k")?,
+            required("fmax")?,
+            required("rperl")?,
+            required("cperl")?,
+            value("isperl"),
+            required("rsperl")?,
+        )
+        .map_err(|error| match error {
+            SpiceError::Circuit { message } => SpiceError::parse(
+                instance.location.clone(),
+                format!("{}: {message}", instance.name),
+            ),
+            other => other,
+        })?;
+        Ok(Self {
+            sections,
+            model_location: card.location.clone(),
+        })
+    }
+
+    pub(super) fn size(&self, location: &SourceLoc) -> SpiceResult<ElaborationSize> {
+        let multiply = |a: usize, b: usize| {
+            a.checked_mul(b)
+                .ok_or_else(|| resource_error(Some(location), "URC expansion size overflows"))
+        };
+        let lumps = self.sections.lumps;
+        // The final section shares its high/low node and has one shunt.
+        // Marker + 2L resistors + (2L - 1) shunts = 4L records.
+        let shunts = multiply(2, lumps)?
+            .checked_sub(1)
+            .ok_or_else(|| resource_error(Some(location), "URC has no sections"))?;
+        let (primes, states) = match self.sections.diode {
+            Some((_, rd)) => (
+                if rd > 0. { shunts } else { 0 },
+                super::nonlinear::DIODE_STATE_COUNT,
+            ),
+            None => (0, super::rlc::REACTIVE_STATE_COUNT),
+        };
+        let nodes = shunts
+            .checked_add(primes)
+            .ok_or_else(|| resource_error(Some(location), "URC node count overflows"))?;
+        Ok(ElaborationSize::new(
+            multiply(4, lumps)?,
+            nodes,
+            multiply(shunts, states)?,
+        ))
+    }
+
+    pub(super) fn bind(
+        self,
+        instance: &DeviceInstance,
+        nodes: &mut NodeAppend<'_>,
+        context: &ModelContext,
+        deck_nodes: &BTreeSet<String>,
+    ) -> SpiceResult<Vec<Box<dyn Device>>> {
+        let size = self.size(&instance.location)?;
+        build(
+            instance,
+            &self.sections,
+            &self.model_location,
+            nodes,
+            context,
+            deck_nodes,
+            size.devices,
+        )
+    }
 }
 
 /// `INPgetValue(IF_INTEGER)`: `(int) floor(0.5 + value)`, range checked.
@@ -437,6 +494,7 @@ fn build(
     nodes: &mut NodeAppend<'_>,
     context: &ModelContext,
     deck_nodes: &BTreeSet<String>,
+    device_count: usize,
 ) -> SpiceResult<Vec<Box<dyn Device>>> {
     let name = &instance.name;
     // The diode ladder's generated model (`<name>#diodemod`: cjo, rs, is set
@@ -469,7 +527,8 @@ fn build(
             }
             staged.intern(&node)
         };
-        let mut devices: Vec<Box<dyn Device>> = Vec::with_capacity(4 * sections.lumps + 1);
+        let mut devices: Vec<Box<dyn Device>> = Vec::new();
+        reserve(&mut devices, device_count, Some(&instance.location))?;
         // C keeps the URC instance itself (created by INP2U, before setup) next
         // to the elements URCsetup generates.
         devices.push(Box::new(UrcLine {
@@ -737,10 +796,9 @@ mod tests {
         let before = nodes.nodes().to_vec();
         let error = nodes
             .transaction(|nodes| {
-                expand(
+                UrcPlan::prepare(&netlist.devices[0], &models, &ModelContext::default())?.bind(
                     &netlist.devices[0],
                     nodes,
-                    &models,
                     &ModelContext::default(),
                     &BTreeSet::new(),
                 )

@@ -7,8 +7,6 @@
 //! `2`/`3`/`6` combine the strong-inversion and weak-inversion flicker
 //! densities. Values outside 1..6 leave C's `noizDens` uninitialized, so they
 //! are refused here instead of being given a substitute law.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -20,10 +18,6 @@
 #![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use super::charges::ChargeEvaluation;
@@ -110,7 +104,7 @@ impl NoiseModel<'_> {
             _ => {
                 // `m * ueff * |qinv| / (leff^2 + ueff * |qinv| * rds)`.
                 let qinv = charge.qinv.abs();
-                multiplier * ueff * qinv / (leff * leff + ueff * qinv * dc.rds)
+                multiplier * ueff * qinv / (ueff * qinv).mul_add(dc.rds, leff * leff)
             }
         };
 
@@ -128,7 +122,7 @@ impl NoiseModel<'_> {
                 // keeps the same law and the numerator below is the
                 // frequency-free part.
                 let lintnoi = m.values.lintnoi.value;
-                let leff_noi = leff - 2.0 * lintnoi;
+                let leff_noi = 2.0f64.mul_add(-lintnoi, leff);
                 let leff_noi_sq = leff_noi * leff_noi;
                 let vgsteff = dc.vgsteff;
                 let vdseff = dc.vdseff;
@@ -144,7 +138,15 @@ impl NoiseModel<'_> {
                     (litl * t0.max(N_MINLOG).ln()).max(0.0)
                 };
                 let n0 = cox * vgsteff / CHARGE;
-                let nl = cox * vgsteff * (1.0 - dc.abulk_over_vgst2vtm * vdseff) / CHARGE;
+                let channel_drop = dc.abulk_over_vgst2vtm * vdseff;
+                let nl = cox * vgsteff * (1.0 - channel_drop) / CHARGE;
+                let density_drop = n0 * channel_drop;
+                let density_ratio = (n0 + 2.0e14) / (nl + 2.0e14);
+                let log_ratio = if density_ratio > 0.5 && density_ratio < 2.0 {
+                    (density_drop / (nl + 2.0e14)).ln_1p()
+                } else {
+                    density_ratio.max(N_MINLOG).ln()
+                };
                 let noia = m.values.noia.value;
                 let noib = m.values.noib.value;
                 let noic = m.values.noic.value;
@@ -155,13 +157,12 @@ impl NoiseModel<'_> {
                     * thermal
                     * cd
                     * ueff
-                    * (noia * (((n0 + 2.0e14) / (nl + 2.0e14)).max(N_MINLOG)).ln()
-                        + noib * (n0 - nl)
-                        + noic * 0.5 * (n0 * n0 - nl * nl))
+                    * (noic * 0.5 * density_drop)
+                        .mul_add(n0 + nl, noib.mul_add(density_drop, noia * log_ratio))
                     / (1.0e8 * abulk * cox * leff_noi_sq);
                 let b = thermal * cd * cd / (1.0e8 * leff_noi_sq * weff)
                     * del_clm
-                    * (noia + noib * nl + noic * nl * nl)
+                    * (noic * nl).mul_add(nl, noib.mul_add(nl, noia))
                     / ((nl + 2.0e14) * (nl + 2.0e14));
                 let c = noia * thermal * cd * cd / (weff * leff * 4.0e36);
                 let sum = a + b + c;

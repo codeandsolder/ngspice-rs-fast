@@ -18,11 +18,11 @@ card 2 @netlists/m4_mos1_tran.cir:3:1 lines=3-3 continuations=0
   token 5 3:17 lparen "("
   token 6 3:18 number "1.5" value=1.5e0
   token 7 3:22 number "2.5" value=2.5e0
-  token 8 3:26 number "100n" value=1.0000000000000001e-7
-  token 9 3:31 number "100n" value=1.0000000000000001e-7
-  token 10 3:36 number "100n" value=1.0000000000000001e-7
-  token 11 3:41 number "300n" value=3.0000000000000004e-7
-  token 12 3:46 number "800n" value=8.000000000000001e-7
+  token 8 3:26 number "100n" value=1e-7
+  token 9 3:31 number "100n" value=1e-7
+  token 10 3:36 number "100n" value=1e-7
+  token 11 3:41 number "300n" value=3e-7
+  token 12 3:46 number "800n" value=8e-7
   token 13 3:50 rparen ")"
 card 3 @netlists/m4_mos1_tran.cir:4:1 lines=4-4 continuations=0
   raw: "rd vdd drain 10k"
@@ -42,7 +42,7 @@ card 4 @netlists/m4_mos1_tran.cir:5:1 lines=5-5 continuations=0
   token 6 5:19 word "mm"
   token 7 5:22 word "w"
   token 8 5:23 equals "="
-  token 9 5:24 number "10u" value=9.999999999999999e-6
+  token 9 5:24 number "10u" value=1e-5
   token 10 5:28 word "l"
   token 11 5:29 equals "="
   token 12 5:30 number "1u" value=1e-6

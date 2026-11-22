@@ -27,7 +27,7 @@ card 3 @netlists/noise_rc.cir:7:1 lines=7-7 continuations=0
   token 4 7:10 word "rflick"
   token 5 7:17 word "l"
   token 6 7:18 equals "="
-  token 7 7:19 number "20u" value=1.9999999999999998e-5
+  token 7 7:19 number "20u" value=2e-5
   token 8 7:23 word "w"
   token 9 7:24 equals "="
   token 10 7:25 number "2u" value=2e-6
@@ -83,7 +83,7 @@ card 8 @netlists/noise_rc.cir:12:1 lines=12-12 continuations=0
   token 13 12:34 number "1.5" value=1.5e0
   token 14 12:38 word "ef"
   token 15 12:40 equals "="
-  token 16 12:41 number "1.2" value=1.2000000000000002e0
+  token 16 12:41 number "1.2" value=1.2e0
   token 17 12:45 word "lf"
   token 18 12:47 equals "="
   token 19 12:48 number "1.1" value=1.1e0

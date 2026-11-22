@@ -14,7 +14,7 @@
 //! | `temp`, `tnom` | [`AnalysisContext`] circuit/nominal temperature (Celsius, finite, above absolute zero) |
 //! | `gmin` | [`AnalysisContext::gmin`]: junction minimum conductance of every diode/BJT/MOS1 junction in all analyses (C `CKTgmin`, default 1e-12 S; finite, `>= 0`) |
 //! | `pivtol`, `pivrel` | [`AnalysisContext::pivot`]: SPARSE threshold-pivoting limits used whenever a circuit matrix is (re)ordered in any analysis (C `CKTpivotAbsTol`/`CKTpivotRelTol`, `SMPreorder`/`SMPcReorder`; defaults 1e-13 and 1e-3). `pivtol` must be finite and `>= 0`, `pivrel` in `(0, 1]`; C's `spOrderAndFactor` would silently use its default for other values |
-//! | `reltol` | transient relative tolerance (`rtol`): companion truncation/convergence; also the DC/AC Newton `rtol` |
+//! | `reltol` | circuit relative tolerance, including diode temperature matching; default for Newton and transient truncation/convergence |
 //! | `vntol` | voltage absolute tolerance (companion Newton test; DC/AC Newton) |
 //! | `abstol` | branch-current absolute tolerance (companion truncation/Newton test; DC/AC Newton) |
 //! | `chgtol`, `trtol` | companion local-truncation-error charge floor and overestimation factor |
@@ -216,8 +216,6 @@ pub struct RunOverrides {
 /// BDF defaults are unchanged unless a deck sets them.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TransientSettings {
-    /// `reltol` → BDF relative tolerance.
-    pub rtol: Option<Real>,
     /// `vntol` → voltage absolute tolerance.
     pub vntol: Option<Real>,
     /// `abstol` → branch-current absolute tolerance.
@@ -954,7 +952,7 @@ impl RunConfig {
                     ));
                 }
                 match name {
-                    "reltol" => self.transient.rtol = Some(number),
+                    "reltol" => self.context.reltol = number,
                     "vntol" => self.transient.vntol = Some(number),
                     "abstol" => self.transient.abstol = Some(number),
                     "chgtol" => self.transient.chgtol = Some(number),
@@ -965,8 +963,8 @@ impl RunConfig {
         Ok(())
     }
 
-    /// Temperatures and junction `gmin` shared by all analyses; defaults are
-    /// 27 C / 27 C / 1e-12 S.
+    /// Resolved circuit temperatures, junction gmin, RELTOL and other
+    /// physical settings shared by all analyses.
     #[must_use]
     pub const fn context(&self) -> AnalysisContext {
         self.context

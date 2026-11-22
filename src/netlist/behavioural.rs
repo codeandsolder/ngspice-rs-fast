@@ -335,8 +335,8 @@ impl PolyPowers {
 }
 
 /// A parameter value as the B-source parser sees it: numparam splices the
-/// `"% 23.15e"` text into the expression and `PTlex` reads it back with
-/// `INPevaluate`, so `3` arrives as `3.0000000000000004`.
+/// `"% 23.15e"` text into the expression, then the lexer reads the
+/// decimal literal back with correct rounding.
 fn spliced(value: Real) -> BExprKind {
     let spelling = format_literal(value);
     BExprKind::Number {

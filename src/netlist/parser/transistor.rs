@@ -48,25 +48,11 @@ pub(super) fn transistor_card<'a>(input: &mut Input<'a>) -> Result<ParsedCard> {
 }
 
 fn is_declared_model(input: &Input<'_>, token: &Token) -> bool {
-    let name = token.text.to_ascii_lowercase();
     token.is_name_like()
-        && (input.state.declared_models.contains(&name)
-            || (input.state.card.designator() == Some('m') && is_binned_reference(input, &name)))
-}
-
-/// `misc/string.c::model_name_match` against the declared names: a MOS
-/// reference to `<name>` with a declared `<name>.<digits>` binning candidate.
-fn is_binned_reference(input: &Input<'_>, name: &str) -> bool {
-    let prefix = format!("{name}.");
-    input
-        .state
-        .declared_models
-        .range(prefix.clone()..)
-        .take_while(|model| model.starts_with(&prefix))
-        .any(|model| {
-            let suffix = &model[prefix.len()..];
-            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-        })
+        && input
+            .state
+            .declared_models
+            .contains(&token.text, input.state.card.designator() == Some('m'))
 }
 
 fn declared_model<'a>(input: &mut Input<'a>) -> Result<&'a Token> {

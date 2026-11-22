@@ -1352,8 +1352,11 @@ pub(super) fn run(
         EarlierAcState::default()
     };
     // The operating point, exactly as `.op` solves it (`CKTop`).
-    let solved = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?
-        .solve(circuit, &model, settings)?;
+    let solved = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?.solve(
+        &circuit.prepare_run(),
+        &model,
+        settings,
+    )?;
 
     let mut plot = workspace.plot(ac);
     if let Some(grid) = grid {

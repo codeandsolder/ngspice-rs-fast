@@ -30,6 +30,8 @@ pub use linear::{
 pub mod pencil;
 pub mod sparse;
 pub(crate) mod sparse13;
+mod telemetry;
+pub use telemetry::{FactorStorage, FactorWork, PatternTelemetry, PatternWork};
 
 pub use dense::{Matrix, Vector};
 pub use equilibration::{

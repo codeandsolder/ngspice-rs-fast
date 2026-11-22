@@ -45,7 +45,7 @@ card 6 @netlists/m10_jfet_ac.cir:7:1 lines=7-7 continuations=0
   token 1 7:1 word "cs"
   token 2 7:4 word "s"
   token 3 7:6 number "0" value=0e0
-  token 4 7:8 number "10u" value=9.999999999999999e-6
+  token 4 7:8 number "10u" value=1e-5
 card 7 @netlists/m10_jfet_ac.cir:8:1 lines=8-8 continuations=0
   raw: "j1 d g s jn 1.5 m=2"
   kind: device(j)
@@ -70,7 +70,7 @@ card 8 @netlists/m10_jfet_ac.cir:9:1 lines=9-9 continuations=0
   token 7 9:19 number "-2.2" value=-2.2e0
   token 8 9:24 word "beta"
   token 9 9:28 equals "="
-  token 10 9:29 number "0.9m" value=9.000000000000001e-4
+  token 10 9:29 number "0.9m" value=9e-4
   token 11 9:34 word "lambda"
   token 12 9:40 equals "="
   token 13 9:41 number "0.015" value=1.5e-2
@@ -88,7 +88,7 @@ card 8 @netlists/m10_jfet_ac.cir:9:1 lines=9-9 continuations=0
   token 25 9:70 number "1.5p" value=1.5e-12
   token 26 9:75 word "pb"
   token 27 9:77 equals "="
-  token 28 9:78 number "0.7" value=7.000000000000001e-1
+  token 28 9:78 number "0.7" value=7e-1
   token 29 9:82 word "fc"
   token 30 9:84 equals "="
   token 31 9:85 number "0.4" value=4e-1
