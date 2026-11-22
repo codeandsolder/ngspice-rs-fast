@@ -39,6 +39,7 @@ use crate::primitives::{AnalysisKind, Complex, Real, SpiceError, SpiceResult};
 use super::ordered_samples::{
     AxisError, OrderedAxis, SampleError, SampleWindow, column_names, same_coordinate,
 };
+use super::reduction::{CompensatedSum, ScaledSquares};
 use crate::analysis::results::Plot;
 use crate::analysis::selection::{self, Column};
 
@@ -636,14 +637,7 @@ fn evaluate_statistic(
             // failure rather than a division by zero.
             let width = span_width(span, card)?;
             let points = window.clipped(axis, &operand, card)?;
-            let squared = statistic == MeasureStatistic::Rms;
-            let area = integrate(points, statistic, card)?;
-            let mean = if statistic == MeasureStatistic::Integ {
-                area
-            } else {
-                area / width
-            };
-            let value = if squared { mean.sqrt() } else { mean };
+            let value = integrate(points, statistic, width, card)?;
             (value, None, Some(span))
         }
     };
@@ -792,12 +786,15 @@ fn extrema(
     Ok(extrema)
 }
 
-/// Shared incremental area reducer. AVG requires one interval; the greedy
-/// Simpson policies require at most four points and one overlapping endpoint.
+/// Shared incremental panel reducer. Simpson uses four lookahead samples,
+/// with one overlapping endpoint, and the positive span from the actual
+/// stored coordinates. AVG uses the same midpoint/compensated trapezoids.
 struct Integral {
     panel: [(Real, Real); 4],
     count: usize,
-    area: Real,
+    area: CompensatedSum,
+    rms: ScaledSquares,
+    rms_maximum: Real,
     statistic: MeasureStatistic,
 }
 
@@ -806,11 +803,12 @@ impl Integral {
         Self {
             panel: [(0., 0.); 4],
             count: 0,
-            area: 0.,
+            area: CompensatedSum::with_initial(0.),
+            rms: ScaledSquares::new(),
+            rms_maximum: 0.,
             statistic,
         }
     }
-
     fn push(&mut self, point: (Real, Real)) {
         self.panel[self.count] = point;
         self.count += 1;
@@ -818,73 +816,90 @@ impl Integral {
             self.consume();
         }
     }
-
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "preserve C Simpson weighting and independently rounded accumulation"
-    )]
-    #[expect(
-        clippy::manual_midpoint,
-        reason = "C explicitly sums sample values before scaling"
-    )]
     fn consume(&mut self) {
-        let y = |index: usize| {
-            let value = self.panel[index].1;
-            if self.statistic == MeasureStatistic::Rms {
-                value * value
-            } else {
-                value
-            }
-        };
-        let width = |index: usize| self.panel[index + 1].0 - self.panel[index].0;
-        let equal = |a: Real, b: Real| a > 0. && b > 0. && a.to_bits().abs_diff(b.to_bits()) <= 100;
+        let width = |i: usize| self.panel[i + 1].0 - self.panel[i].0;
+        let same = |a: Real, b: Real| a > 0. && b > 0. && a.to_bits().abs_diff(b.to_bits()) <= 100;
         let h = width(0);
         let consumed = if self.statistic == MeasureStatistic::Avg {
-            self.area += 0.5 * (y(0) + y(1)) * h;
             1
-        } else if self.count == 4 && equal(h, width(1)) && equal(h, width(2)) {
-            self.area += 3. * h * (y(0) + 3. * (y(1) + y(2)) + y(3)) / 8.;
+        } else if self.count == 4 && same(h, width(1)) && same(h, width(2)) {
             3
-        } else if self.count >= 3 && equal(h, width(1)) {
-            self.area += h * (y(0) + 4. * y(1) + y(2)) / 3.;
+        } else if self.count >= 3 && same(h, width(1)) {
             2
         } else {
-            self.area += h * (y(0) + y(1)) / 2.;
             1
         };
+        if h > 0. {
+            let span = self.panel[consumed].0 - self.panel[0].0;
+            if self.statistic == MeasureStatistic::Rms {
+                let weights: &[Real] = match consumed {
+                    3 => &[1. / 8., 3. / 8., 3. / 8., 1. / 8.],
+                    2 => &[1. / 6., 2. / 3., 1. / 6.],
+                    _ => &[0.5, 0.5],
+                };
+                let root_span = span.sqrt();
+                for (&(_, value), &weight) in self.panel.iter().zip(weights) {
+                    let magnitude = value.abs();
+                    self.rms_maximum = self.rms_maximum.max(magnitude);
+                    self.rms.add_product(magnitude, root_span * weight.sqrt());
+                }
+            } else {
+                let y = |i: usize| self.panel[i].1;
+                let mean = match consumed {
+                    3 => 0.25_f64.mul_add(
+                        Real::midpoint(y(0), y(3)),
+                        0.75 * Real::midpoint(y(1), y(2)),
+                    ),
+                    2 => (1. / 3_f64).mul_add(Real::midpoint(y(0), y(2)), (2. / 3.) * y(1)),
+                    _ => Real::midpoint(y(0), y(1)),
+                };
+                self.area.add(mean * span);
+            }
+        }
         self.panel.copy_within(consumed..self.count, 0);
         self.count -= consumed;
     }
-
-    fn area(mut self, card: &MeasureCard) -> SpiceResult<Real> {
+    fn finish(mut self, width: Real, card: &MeasureCard) -> SpiceResult<Real> {
         while self.count >= 2 {
             self.consume();
         }
-        if !self.area.is_finite() {
+        let area = self.area.total();
+        let result = match self.statistic {
+            // Positive normalized quadrature cannot exceed the largest sample.
+            // Rounding of the weights/norm can otherwise overflow a constant MAX trace.
+            MeasureStatistic::Rms => {
+                let norm = self.rms.norm_over(width.sqrt());
+                if norm > self.rms_maximum {
+                    self.rms_maximum
+                } else {
+                    norm
+                }
+            }
+            MeasureStatistic::Avg => area / width,
+            _ => area,
+        };
+        if !result.is_finite() {
             return Err(nonfinite(
                 card,
-                if self.statistic == MeasureStatistic::Avg {
-                    "INTEG"
-                } else {
-                    "INTEG/RMS"
-                },
+                self.statistic.name(),
                 "the integrated value is not finite".into(),
             ));
         }
-        Ok(self.area)
+        Ok(result)
     }
 }
 
 fn integrate(
     points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
     statistic: MeasureStatistic,
+    width: Real,
     card: &MeasureCard,
 ) -> SpiceResult<Real> {
     let mut integral = Integral::new(statistic);
     for point in points {
         integral.push(point?);
     }
-    integral.area(card)
+    integral.finish(width, card)
 }
 
 /// C `measure_margin`: unwrap phase, interpolate dB/degrees and log frequency.
@@ -1042,14 +1057,14 @@ fn derivative_value(
         && !same_coordinate(points[0].1, points[1].1)
         && !same_coordinate(points[1].1, points[2].1)
     {
-        let mut sum = 0.;
-        for k in 0..3 {
-            let a = points[(k + 1) % 3].1;
-            let b = points[(k + 2) % 3].1;
-            let (i, t) = points[k];
-            sum += sample(i)? * ((at - a) + (at - b)) / ((t - a) * (t - b));
-        }
-        sum
+        let [(i0, t0), (i1, t1), (i2, t2)] = points;
+        let y0 = sample(i0)?;
+        let y1 = sample(i1)?;
+        let y2 = sample(i2)?;
+        let first = (y1 - y0) / (t1 - t0);
+        let second = (y2 - y1) / (t2 - t1);
+        let curvature = (second - first) / (t2 - t0);
+        curvature.mul_add((at - t0) + (at - t1), first)
     } else {
         let width = x1 - x0;
         if width == 0. {
@@ -1319,8 +1334,21 @@ fn statistic_unit(statistic: MeasureStatistic, unit: &str, axis: &str) -> String
 /// the threshold) and a positive bracket width, so there is never a division by
 /// a zero span.
 fn interpolate_axis(x0: Real, y0: Real, x1: Real, y1: Real, y: Real) -> Real {
-    let x = x0 + (x1 - x0) * (y - y0) / (y1 - y0);
-    if x.is_finite() { x.clamp(x0, x1) } else { x }
+    if same_coordinate(y, y0) {
+        return x0;
+    }
+    if same_coordinate(y, y1) {
+        return x1;
+    }
+    let interpolate = super::ordered_samples::interpolate;
+    // Invert the same conditioned interpolation used by point queries.
+    // A falling crossing reverses the ordinate order, not the time order.
+    let x = if y0 < y1 {
+        interpolate(y0, x0, y1, x1, y)
+    } else {
+        interpolate(y1, x1, y0, x0, y)
+    };
+    x.clamp(x0, x1)
 }
 
 #[cfg(test)]
@@ -1452,18 +1480,17 @@ mod tests {
     }
 
     #[test]
-    fn trapezoid_keeps_reference_sum_before_scaling() {
+    fn trapezoid_avoids_intermediate_sample_overflow() {
         let card = card("m", request(MeasureStatistic::Avg, None, None));
         let values = [(0.0, Real::MAX), (0.5, Real::MAX)];
-        // C's intermediate sample sum overflows, even though an alternative
-        // midpoint implementation could keep the final integral finite.
-        assert!(
-            super::integrate(values.into_iter().map(Ok), MeasureStatistic::Avg, &card).is_err()
+        assert_eq!(
+            super::integrate(values.into_iter().map(Ok), MeasureStatistic::Avg, 1., &card).unwrap(),
+            Real::MAX / 2.
         );
     }
 
     #[test]
-    fn streaming_simpson_panels_keep_greedy_selection_and_rounding() {
+    fn streaming_simpson_panels_keep_greedy_selection() {
         let points: [(Real, Real); 9] = [
             (0., 0.1),
             (1., -0.2),
@@ -1490,18 +1517,75 @@ mod tests {
             for i in 5..8 {
                 expected += h(i) * (y(i) + y(i + 1)) / 2.;
             }
-            let got = super::integrate(
-                points.into_iter().map(Ok),
-                if square {
-                    MeasureStatistic::Rms
-                } else {
-                    MeasureStatistic::Integ
-                },
-                &card,
-            )
-            .unwrap();
-            assert_eq!(got.to_bits(), expected.to_bits());
+            let got = if square {
+                let rms =
+                    super::integrate(points.into_iter().map(Ok), MeasureStatistic::Rms, 8., &card)
+                        .unwrap();
+                rms * rms * 8.
+            } else {
+                super::integrate(
+                    points.into_iter().map(Ok),
+                    MeasureStatistic::Integ,
+                    1.,
+                    &card,
+                )
+                .unwrap()
+            };
+            assert!((got - expected).abs() <= 8. * Real::EPSILON * expected.abs());
         }
+    }
+
+    #[test]
+    fn quadrature_retains_cancelled_small_panel_areas_and_integrates_cubics() {
+        let card = card("m", request(MeasureStatistic::Integ, None, None));
+        let points = [
+            (0., 1e16),
+            (1., 1e16),
+            (1., 1.),
+            (2., 1.),
+            (2., -1e16),
+            (3., -1e16),
+        ];
+        assert_eq!(
+            super::integrate(points.into_iter().map(Ok), MeasureStatistic::Avg, 1., &card).unwrap(),
+            1.
+        );
+        assert_eq!(
+            super::integrate(
+                points.into_iter().map(Ok),
+                MeasureStatistic::Integ,
+                1.,
+                &card
+            )
+            .unwrap(),
+            1.
+        );
+        let cubic = (0..=3).map(|i| {
+            let t = Real::from(i);
+            Ok((t, t.powi(3)))
+        });
+        let result = super::integrate(cubic, MeasureStatistic::Integ, 1., &card).unwrap();
+        assert!((result - 81. / 4.).abs() <= 4. * Real::EPSILON * 81. / 4.);
+    }
+
+    #[test]
+    fn quadratic_derivative_ignores_large_common_ordinate_offset() {
+        let offset = 2_f64.powi(50);
+        let plot = tran(&[(0., offset), (1., offset + 1.), (3., offset + 9.)]);
+        let result = measure(
+            &plot,
+            "slope",
+            MeasureRequest::AtEvent {
+                operand: out(),
+                event: MeasureEvent::At {
+                    at: 2.,
+                    location: loc(),
+                },
+                derivative: true,
+                window: MeasureWindow::default(),
+            },
+        );
+        assert_eq!(result.value, 4.);
     }
 
     #[test]
@@ -2024,12 +2108,34 @@ mod tests {
         );
         assert!(error.to_string().contains("measure m: v(out)"), "{error}");
         assert!(error.to_string().contains("not finite"), "{error}");
+    }
 
-        // An operand that is finite everywhere still cannot be integrated when
-        // squaring overflows.
-        let huge = tran(&[(0.0, 0.0), (1.0, 1e200)]);
-        let error = failure(&huge, "m", request(MeasureStatistic::Rms, None, None));
-        assert!(error.to_string().contains("not finite"), "{error}");
+    #[test]
+    fn rms_retains_representable_extreme_magnitudes() {
+        let tiny = Real::from_bits(1);
+        for scale in [1e200, 1e-200, Real::MAX, tiny] {
+            let plot = tran(&[(0., 0.), (1., scale)]);
+            let actual = measure(&plot, "m", request(MeasureStatistic::Rms, None, None)).value;
+            let expected = scale * 0.5_f64.sqrt();
+            assert!((actual - expected).abs() <= 4. * Real::EPSILON * expected);
+            // Multiple weighted subnormals must not round independently to zero.
+            let plot = tran(&[(0., scale), (1., scale), (2., scale), (3., scale)]);
+            let actual = measure(&plot, "m", request(MeasureStatistic::Rms, None, None)).value;
+            assert!((actual - scale).abs() <= 4. * Real::EPSILON * scale);
+        }
+        // The time fraction itself underflows. Its square root and the
+        // weighted amplitude remain representable.
+        let points = [(0., 1e308), (tiny, 1e308), (tiny, 0.), (1e308, 0.)];
+        let card = card("m", request(MeasureStatistic::Rms, None, None));
+        let actual = super::integrate(
+            points.into_iter().map(Ok),
+            MeasureStatistic::Rms,
+            1e308,
+            &card,
+        )
+        .unwrap();
+        let expected = tiny.sqrt() * 1e154;
+        assert!((actual - expected).abs() <= 8. * Real::EPSILON * expected);
     }
 
     #[test]

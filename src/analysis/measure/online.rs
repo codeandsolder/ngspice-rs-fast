@@ -545,17 +545,10 @@ impl StatisticState {
             return Err(no_samples(card));
         }
         if let Some(integral) = self.integral {
-            let area = integral.area(card)?;
-            let mean = if statistic == MeasureStatistic::Integ {
-                area
-            } else {
-                area / width.ok_or_else(|| SpiceError::circuit("missing integration width"))?
-            };
-            let value = if statistic == MeasureStatistic::Rms {
-                mean.sqrt()
-            } else {
-                mean
-            };
+            let value = integral.finish(
+                width.ok_or_else(|| SpiceError::circuit("missing integration width"))?,
+                card,
+            )?;
             Ok((value, None, Some(span)))
         } else if let Some(extrema) = self.extrema {
             let (value, at) = extrema.result(statistic)?;
