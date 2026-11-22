@@ -1,18 +1,8 @@
 //! `b4cvtest.c` (`BSIM4convTest`): the device convergence test, followed
 //! statement by statement over C's struct members.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
-#![expect(
-    non_snake_case,
-    reason = "preserves upstream C identifiers for equation-by-equation comparison"
 )]
 use super::fields::{Instance, Model};
 use super::host::{mode, state};
@@ -22,12 +12,35 @@ fn max(a: f64, b: f64) -> f64 {
     if a > b { a } else { b }
 }
 
+/// Calculate the linearized current change independently of the previous
+/// current. Forming the predicted total and subtracting it again loses a
+/// small correction when the two totals round to the same value.
+fn prediction<const N: usize>(
+    previous: f64,
+    terms: [(f64, f64); N],
+    reltol: f64,
+    abstol: f64,
+) -> (f64, f64) {
+    let delta = terms
+        .into_iter()
+        .fold(0., |sum, (slope, voltage)| slope.mul_add(voltage, sum));
+    let predicted = previous + delta;
+    let error = if previous.is_finite() && predicted.is_finite() {
+        delta.abs()
+    } else {
+        // Preserve the reference comparison's NaN/Inf behavior.
+        (predicted - previous).abs()
+    };
+    let tolerance = reltol.mul_add(max(predicted.abs(), previous.abs()), abstol);
+    (error, tolerance)
+}
+
 /// `BSIM4convTest` for one instance: `true` when C would increment
 /// `CKTnoncon`. `rhs_old` is the new iterate C reads as `CKTrhsOld`,
 /// `state0` the last load's state vector, `mode` C's `CKTmode`.
 #[expect(
     clippy::too_many_lines,
-    reason = "keeps the reference numerical routine in the original statement and rounding order"
+    reason = "keep the forward/reverse terminal-current prediction families together"
 )] // One C function, kept in C's shape.
 pub(super) fn conv_test(
     m: &Model,
@@ -70,93 +83,186 @@ pub(super) fn conv_test(
     let delvbd_jct = if h.rbodyMod == 0 { delvbd } else { delvdbd };
     let delvbs_jct = if h.rbodyMod == 0 { delvbs } else { delvsbs };
 
-    let (Idtot, cdhat, Igstot, cgshat, Igdtot, cgdhat, Igbtot, cgbhat);
-    if h.mode >= 0 {
-        Idtot = h.cd + h.csub - h.cbd + h.Igidl;
-        cdhat = Idtot - h.gbd * delvbd_jct
-            + (h.gmbs + h.gbbs + h.ggidlb) * delvbs
-            + (h.gm + h.gbgs + h.ggidlg) * delvgs
-            + (h.gds + h.gbds + h.ggidld) * delvds;
-        Igstot = h.Igs + h.Igcs;
-        cgshat = Igstot + (h.gIgsg + h.gIgcsg) * delvgs + h.gIgcsd * delvds + h.gIgcsb * delvbs;
-        Igdtot = h.Igd + h.Igcd;
-        cgdhat =
-            Igdtot + h.gIgdg * delvgd + h.gIgcdg * delvgs + h.gIgcdd * delvds + h.gIgcdb * delvbs;
-        Igbtot = h.Igb;
-        cgbhat = h.Igb + h.gIgbg * delvgs + h.gIgbd * delvds + h.gIgbb * delvbs;
+    // The fixed-off instance does not participate in convergence testing.
+    if h.off != 0 && (mode & mode::MODEINITFIX) != 0 {
+        return false;
+    }
+
+    let compare = |(error, tolerance): (f64, f64)| error >= tolerance;
+    let (drain, gate_source, gate_drain, gate_bulk) = if h.mode >= 0 {
+        (
+            prediction(
+                h.cd + h.csub - h.cbd + h.Igidl,
+                [
+                    (h.gbd, -delvbd_jct),
+                    (h.gmbs + h.gbbs + h.ggidlb, delvbs),
+                    (h.gm + h.gbgs + h.ggidlg, delvgs),
+                    (h.gds + h.gbds + h.ggidld, delvds),
+                ],
+                reltol,
+                abstol,
+            ),
+            prediction(
+                h.Igs + h.Igcs,
+                [
+                    (h.gIgsg + h.gIgcsg, delvgs),
+                    (h.gIgcsd, delvds),
+                    (h.gIgcsb, delvbs),
+                ],
+                reltol,
+                abstol,
+            ),
+            prediction(
+                h.Igd + h.Igcd,
+                [
+                    (h.gIgdg, delvgd),
+                    (h.gIgcdg, delvgs),
+                    (h.gIgcdd, delvds),
+                    (h.gIgcdb, delvbs),
+                ],
+                reltol,
+                abstol,
+            ),
+            prediction(
+                h.Igb,
+                [(h.gIgbg, delvgs), (h.gIgbd, delvds), (h.gIgbb, delvbs)],
+                reltol,
+                abstol,
+            ),
+        )
     } else {
-        // C's own "bugfix" spelling of the reverse-mode drain current.
-        Idtot = h.cd + h.cbd - h.Igidl;
-        cdhat = Idtot + h.gbd * delvbd_jct + h.gmbs * delvbd + h.gm * delvgd
-            - (h.gds + h.ggidls) * delvds
-            - h.ggidlg * delvgs
-            - h.ggidlb * delvbs;
-        Igstot = h.Igs + h.Igcd;
-        cgshat =
-            Igstot + h.gIgsg * delvgs + h.gIgcdg * delvgd - h.gIgcdd * delvds + h.gIgcdb * delvbd;
-        Igdtot = h.Igd + h.Igcs;
-        cgdhat = Igdtot + (h.gIgdg + h.gIgcsg) * delvgd - h.gIgcsd * delvds + h.gIgcsb * delvbd;
-        Igbtot = h.Igb;
-        cgbhat = h.Igb + h.gIgbg * delvgd - h.gIgbd * delvds + h.gIgbb * delvbd;
+        (
+            // C's bugfix spelling of the reverse-mode drain current.
+            prediction(
+                h.cd + h.cbd - h.Igidl,
+                [
+                    (h.gbd, delvbd_jct),
+                    (h.gmbs, delvbd),
+                    (h.gm, delvgd),
+                    (h.gds + h.ggidls, -delvds),
+                    (h.ggidlg, -delvgs),
+                    (h.ggidlb, -delvbs),
+                ],
+                reltol,
+                abstol,
+            ),
+            prediction(
+                h.Igs + h.Igcd,
+                [
+                    (h.gIgsg, delvgs),
+                    (h.gIgcdg, delvgd),
+                    (h.gIgcdd, -delvds),
+                    (h.gIgcdb, delvbd),
+                ],
+                reltol,
+                abstol,
+            ),
+            prediction(
+                h.Igd + h.Igcs,
+                [
+                    (h.gIgdg + h.gIgcsg, delvgd),
+                    (h.gIgcsd, -delvds),
+                    (h.gIgcsb, delvbd),
+                ],
+                reltol,
+                abstol,
+            ),
+            prediction(
+                h.Igb,
+                [(h.gIgbg, delvgd), (h.gIgbd, -delvds), (h.gIgbb, delvbd)],
+                reltol,
+                abstol,
+            ),
+        )
+    };
+    let source_series = prediction(
+        h.gstot * state0(state::VSES),
+        [
+            (h.gstot, delvses),
+            (h.gstotd, delvds),
+            (h.gstotg, delvgs),
+            (h.gstotb, delvbs),
+        ],
+        reltol,
+        abstol,
+    );
+    let drain_series = prediction(
+        h.gdtot * vdedo,
+        [
+            (h.gdtot, delvded),
+            (h.gdtotd, delvds),
+            (h.gdtotg, delvgs),
+            (h.gdtotb, delvbs),
+        ],
+        reltol,
+        abstol,
+    );
+    if [
+        drain,
+        source_series,
+        drain_series,
+        gate_source,
+        gate_drain,
+        gate_bulk,
+    ]
+    .into_iter()
+    .any(compare)
+    {
+        return true;
     }
 
-    let Isestot = h.gstot * (state0(state::VSES));
-    let cseshat =
-        Isestot + h.gstot * delvses + h.gstotd * delvds + h.gstotg * delvgs + h.gstotb * delvbs;
-    let Idedtot = h.gdtot * vdedo;
-    let cdedhat =
-        Idedtot + h.gdtot * delvded + h.gdtotd * delvds + h.gdtotg * delvgs + h.gdtotb * delvbs;
-
-    // Check convergence
-    if (h.off == 0) || ((mode & mode::MODEINITFIX) == 0) {
-        let tol0 = reltol * max(cdhat.abs(), Idtot.abs()) + abstol;
-        let tol1 = reltol * max(cseshat.abs(), Isestot.abs()) + abstol;
-        let tol2 = reltol * max(cdedhat.abs(), Idedtot.abs()) + abstol;
-        let tol3 = reltol * max(cgshat.abs(), Igstot.abs()) + abstol;
-        let tol4 = reltol * max(cgdhat.abs(), Igdtot.abs()) + abstol;
-        let tol5 = reltol * max(cgbhat.abs(), Igbtot.abs()) + abstol;
-        if ((cdhat - Idtot).abs() >= tol0)
-            || ((cseshat - Isestot).abs() >= tol1)
-            || ((cdedhat - Idedtot).abs() >= tol2)
-        {
-            return true;
-        }
-        if ((cgshat - Igstot).abs() >= tol3)
-            || ((cgdhat - Igdtot).abs() >= tol4)
-            || ((cgbhat - Igbtot).abs() >= tol5)
-        {
-            return true;
-        }
-        let Ibtot = h.cbs + h.cbd - h.Igidl - h.Igisl - h.csub;
-        let cbhat = if h.mode >= 0 {
-            Ibtot + h.gbd * delvbd_jct + h.gbs * delvbs_jct
-                - (h.gbbs + h.ggidlb) * delvbs
-                - (h.gbgs + h.ggidlg) * delvgs
-                - (h.gbds + h.ggidld) * delvds
-                - h.ggislg * delvgd
-                - h.ggislb * delvbd
-                + h.ggisls * delvds
-        } else {
-            Ibtot + h.gbs * delvbs_jct + h.gbd * delvbd_jct
-                - (h.gbbs + h.ggislb) * delvbd
-                - (h.gbgs + h.ggislg) * delvgd
-                + (h.gbds + h.ggisld - h.ggidls) * delvds
-                - h.ggidlg * delvgs
-                - h.ggidlb * delvbs
-        };
-        let tol6 = reltol * max(cbhat.abs(), Ibtot.abs()) + abstol;
-        if (cbhat - Ibtot).abs() > tol6 {
-            return true;
-        }
-    }
-    false
+    let bulk_current = h.cbs + h.cbd - h.Igidl - h.Igisl - h.csub;
+    let (error, tolerance) = if h.mode >= 0 {
+        prediction(
+            bulk_current,
+            [
+                (h.gbd, delvbd_jct),
+                (h.gbs, delvbs_jct),
+                (h.gbbs + h.ggidlb, -delvbs),
+                (h.gbgs + h.ggidlg, -delvgs),
+                (h.gbds + h.ggidld, -delvds),
+                (h.ggislg, -delvgd),
+                (h.ggislb, -delvbd),
+                (h.ggisls, delvds),
+            ],
+            reltol,
+            abstol,
+        )
+    } else {
+        prediction(
+            bulk_current,
+            [
+                (h.gbs, delvbs_jct),
+                (h.gbd, delvbd_jct),
+                (h.gbbs + h.ggislb, -delvbd),
+                (h.gbgs + h.ggislg, -delvgd),
+                (h.gbds + h.ggisld - h.ggidls, delvds),
+                (h.ggidlg, -delvgs),
+                (h.ggidlb, -delvbs),
+            ],
+            reltol,
+            abstol,
+        )
+    };
+    // C uses a strict comparison for bulk, inclusive for other currents.
+    error > tolerance
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::acld::tests::shaped;
     use super::super::host::{mode, node, state};
-    use super::{Model, conv_test};
+    use super::{Model, conv_test, prediction};
+
+    #[test]
+    fn small_current_corrections_are_not_rounded_out_of_the_residual() {
+        let (error, tolerance) = prediction(1e20, [(1., 1.)], 0., 0.5);
+        assert_eq!((error, tolerance), (1., 0.5));
+        assert_eq!(1e20 + 1., 1e20);
+        assert!(error > tolerance);
+        let (error, _) = prediction(f64::INFINITY, [(1., 1.)], 1e-3, 1e-12);
+        assert!(error.is_nan());
+    }
 
     fn run(h: &super::Instance, rhs: &[f64; node::COUNT], s0: &[f64; state::COUNT]) -> bool {
         let m = Model {

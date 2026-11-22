@@ -7,11 +7,6 @@
     clippy::similar_names,
     reason = "C equation names preserve the reference distinctions"
 )]
-#![expect(clippy::manual_midpoint, reason = "retain C midpoint rounding order")]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "preserve non-fused C floating-point arithmetic"
-)]
 #![expect(
     unused_assignments,
     reason = "reference intermediate assignments remain in their equation sequence"
@@ -39,7 +34,7 @@
 use super::bias::LoadBias;
 use super::{
     BSIM4polyDepletion, Charge_q, DEXP, EPS0, EPSSI, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP,
-    MIN_EXP, MM, Model, SizeParam, exp, log, sqrt,
+    MIN_EXP, MM, Model, SizeParam, difference_of_products, exp, log, smooth_vds, sqrt,
 };
 
 /// Body potential, threshold, effective gate bias and their independent derivatives.
@@ -211,10 +206,10 @@ pub(super) fn electrostatics(
         epssub = EPSSI;
     }
     T0 = Vbs - here.vbsc - 0.001;
-    T1 = sqrt(T0 * T0 - 0.004 * here.vbsc);
+    T1 = sqrt(0.004f64.mul_add(-here.vbsc, T0 * T0));
     if T0 >= 0.0 {
-        Vbseff = here.vbsc + 0.5 * (T0 + T1);
-        dVbseff_dVb = 0.5 * (1.0 + T0 / T1);
+        Vbseff = here.vbsc + T0.midpoint(T1);
+        dVbseff_dVb = f64::midpoint(1.0, T0 / T1);
     } else {
         T2 = -0.002 / (T1 - T0);
         Vbseff = here.vbsc * (1.0 + T2);
@@ -222,9 +217,9 @@ pub(super) fn electrostatics(
     }
     T9 = 0.95 * pParam.phi;
     T0 = T9 - Vbseff - 0.001;
-    T1 = sqrt(T0 * T0 + 0.004 * T9);
-    Vbseff = T9 - 0.5 * (T0 + T1);
-    dVbseff_dVb *= 0.5 * (1.0 + T0 / T1);
+    T1 = sqrt(0.004f64.mul_add(T9, T0 * T0));
+    Vbseff = T9 - T0.midpoint(T1);
+    dVbseff_dVb *= f64::midpoint(1.0, T0 / T1);
     Phis = pParam.phi - Vbseff;
     dPhis_dVb = -1.0;
     sqrtPhis = sqrt(Phis);
@@ -241,32 +236,32 @@ pub(super) fn electrostatics(
         T1 = 1.0 + T0;
         T2 = pParam.dvt2;
     } else {
-        T4 = 1.0 / (3.0 + 8.0 * T0);
-        T1 = (1.0 + 3.0 * T0) * T4;
+        T4 = 1.0 / 8.0f64.mul_add(T0, 3.0);
+        T1 = 3.0f64.mul_add(T0, 1.0) * T4;
         T2 = pParam.dvt2 * T4 * T4;
     }
     lt1 = model.factor1 * T3 * T1;
-    dlt1_dVb = model.factor1 * (0.5 / T3 * T1 * dXdep_dVb + T3 * T2);
+    dlt1_dVb = model.factor1 * T3.mul_add(T2, 0.5 / T3 * T1 * dXdep_dVb);
     T0 = pParam.dvt2w * Vbseff;
     if T0 >= -0.5 {
         T1 = 1.0 + T0;
         T2 = pParam.dvt2w;
     } else {
-        T4 = 1.0 / (3.0 + 8.0 * T0);
-        T1 = (1.0 + 3.0 * T0) * T4;
+        T4 = 1.0 / 8.0f64.mul_add(T0, 3.0);
+        T1 = 3.0f64.mul_add(T0, 1.0) * T4;
         T2 = pParam.dvt2w * T4 * T4;
     }
     ltw = model.factor1 * T3 * T1;
-    dltw_dVb = model.factor1 * (0.5 / T3 * T1 * dXdep_dVb + T3 * T2);
+    dltw_dVb = model.factor1 * T3.mul_add(T2, 0.5 / T3 * T1 * dXdep_dVb);
     T0 = pParam.dvt1 * Leff / lt1;
     if T0 < EXP_THRESHOLD {
         T1 = exp(T0);
         T2 = T1 - 1.0;
         T3 = T2 * T2;
-        T4 = T3 + 2.0 * T1 * MIN_EXP;
+        T4 = (2.0 * T1).mul_add(MIN_EXP, T3);
         Theta0 = T1 / T4;
         dT1_dVb = -T0 * T1 * dlt1_dVb / lt1;
-        dTheta0_dVb = dT1_dVb * (T4 - 2.0 * T1 * (T2 + MIN_EXP)) / T4 / T4;
+        dTheta0_dVb = dT1_dVb * (2.0 * T1).mul_add(-(T2 + MIN_EXP), T4) / T4 / T4;
     } else {
         Theta0 = 1.0 / (MAX_EXP - 2.0);
         dTheta0_dVb = 0.0;
@@ -279,10 +274,10 @@ pub(super) fn electrostatics(
         T1 = exp(T0);
         T2 = T1 - 1.0;
         T3 = T2 * T2;
-        T4 = T3 + 2.0 * T1 * MIN_EXP;
+        T4 = (2.0 * T1).mul_add(MIN_EXP, T3);
         T5 = T1 / T4;
         dT1_dVb = -T0 * T1 * dltw_dVb / ltw;
-        dT5_dVb = dT1_dVb * (T4 - 2.0 * T1 * (T2 + MIN_EXP)) / T4 / T4;
+        dT5_dVb = dT1_dVb * (2.0 * T1).mul_add(-(T2 + MIN_EXP), T4) / T4 / T4;
     } else {
         T5 = 1.0 / (MAX_EXP - 2.0);
         dT5_dVb = 0.0;
@@ -292,12 +287,14 @@ pub(super) fn electrostatics(
     dT2_dVb = pParam.dvt0w * dT5_dVb * V0;
     TempRatio = ckt.temp() / model.tnom - 1.0;
     T0 = sqrt(1.0 + pParam.lpe0 / Leff);
-    T1 = pParam.k1ox * (T0 - 1.0) * pParam.sqrtPhi
-        + (pParam.kt1 + pParam.kt1l / Leff + pParam.kt2 * Vbseff) * TempRatio;
+    T1 = pParam
+        .kt2
+        .mul_add(Vbseff, pParam.kt1 + pParam.kt1l / Leff)
+        .mul_add(TempRatio, pParam.k1ox * (T0 - 1.0) * pParam.sqrtPhi);
     Vth_NarrowW = toxe * pParam.phi / (pParam.weff + pParam.w0);
-    T3 = here.eta0 + pParam.etab * Vbseff;
+    T3 = pParam.etab.mul_add(Vbseff, here.eta0);
     if T3 < 1.0e-4 {
-        T9 = 1.0 / (3.0 - 2.0e4 * T3);
+        T9 = 1.0 / 2.0e4f64.mul_add(-T3, 3.0);
         T3 = (2.0e-4 - T3) * T9;
         T4 = T9 * T9;
     } else {
@@ -306,34 +303,50 @@ pub(super) fn electrostatics(
     dDIBL_Sft_dVd = T3 * pParam.theta0vb0;
     DIBL_Sft = dDIBL_Sft_dVd * Vds;
     Lpe_Vb = sqrt(1.0 + pParam.lpeb / Leff);
-    Vth = f64::from(model.r#type) * here.vth0
-        + (pParam.k1ox * sqrtPhis - pParam.k1 * pParam.sqrtPhi) * Lpe_Vb
-        - here.k2ox * Vbseff
-        - Delt_vth
-        - T2
-        + (pParam.k3 + pParam.k3b * Vbseff) * Vth_NarrowW
-        + T1
+    Vth = pParam.k3b.mul_add(Vbseff, pParam.k3).mul_add(
+        Vth_NarrowW,
+        here.k2ox.mul_add(
+            -Vbseff,
+            pParam
+                .k1
+                .mul_add(-pParam.sqrtPhi, pParam.k1ox * sqrtPhis)
+                .mul_add(Lpe_Vb, f64::from(model.r#type) * here.vth0),
+        ) - Delt_vth
+            - T2,
+    ) + T1
         - DIBL_Sft;
-    dVth_dVb = Lpe_Vb * pParam.k1ox * dsqrtPhis_dVb - here.k2ox - dDelt_vth_dVb - dT2_dVb
-        + pParam.k3b * Vth_NarrowW
-        - pParam.etab * Vds * pParam.theta0vb0 * T4
-        + pParam.kt2 * TempRatio;
+    dVth_dVb = pParam.kt2.mul_add(
+        TempRatio,
+        (pParam.etab * Vds * pParam.theta0vb0).mul_add(
+            -T4,
+            pParam.k3b.mul_add(
+                Vth_NarrowW,
+                (Lpe_Vb * pParam.k1ox).mul_add(dsqrtPhis_dVb, -here.k2ox) - dDelt_vth_dVb - dT2_dVb,
+            ),
+        ),
+    );
     dVth_dVd = -dDIBL_Sft_dVd;
     tmp1 = epssub / Xdep;
     here.nstar = model.vtm / Charge_q * (model.coxe + tmp1 + pParam.cit);
     tmp2 = pParam.nfactor * tmp1;
-    tmp3 = pParam.cdsc + pParam.cdscb * Vbseff + pParam.cdscd * Vds;
-    tmp4 = (tmp2 + tmp3 * Theta0 + pParam.cit) / model.coxe;
+    tmp3 = pParam
+        .cdscd
+        .mul_add(Vds, pParam.cdscb.mul_add(Vbseff, pParam.cdsc));
+    tmp4 = (tmp3.mul_add(Theta0, tmp2) + pParam.cit) / model.coxe;
     if tmp4 >= -0.5 {
         n = 1.0 + tmp4;
-        dn_dVb =
-            (-tmp2 / Xdep * dXdep_dVb + tmp3 * dTheta0_dVb + pParam.cdscb * Theta0) / model.coxe;
+        dn_dVb = pParam
+            .cdscb
+            .mul_add(Theta0, tmp3.mul_add(dTheta0_dVb, -tmp2 / Xdep * dXdep_dVb))
+            / model.coxe;
         dn_dVd = pParam.cdscd * Theta0 / model.coxe;
     } else {
-        T0 = 1.0 / (3.0 + 8.0 * tmp4);
-        n = (1.0 + 3.0 * tmp4) * T0;
+        T0 = 1.0 / 8.0f64.mul_add(tmp4, 3.0);
+        n = 3.0f64.mul_add(tmp4, 1.0) * T0;
         T0 *= T0;
-        dn_dVb = (-tmp2 / Xdep * dXdep_dVb + tmp3 * dTheta0_dVb + pParam.cdscb * Theta0)
+        dn_dVb = pParam
+            .cdscb
+            .mul_add(Theta0, tmp3.mul_add(dTheta0_dVb, -tmp2 / Xdep * dXdep_dVb))
             / model.coxe
             * T0;
         dn_dVd = pParam.cdscd * Theta0 / model.coxe * T0;
@@ -347,7 +360,7 @@ pub(super) fn electrostatics(
             T2 = exp(T0);
             dT2_dVd = -pParam.dvtp1 * T2;
         }
-        T3 = Leff + pParam.dvtp0 * (1.0 + T2);
+        T3 = pParam.dvtp0.mul_add(1.0 + T2, Leff);
         dT3_dVd = pParam.dvtp0 * dT2_dVd;
         if model.tempMod < 2 {
             T4 = Vtm * log(Leff / T3);
@@ -356,9 +369,9 @@ pub(super) fn electrostatics(
             T4 = model.vtm0 * log(Leff / T3);
             dT4_dVd = -model.vtm0 * dT3_dVd / T3;
         }
-        dDITS_Sft_dVd = dn_dVd * T4 + n * dT4_dVd;
+        dDITS_Sft_dVd = n.mul_add(dT4_dVd, dn_dVd * T4);
         dDITS_Sft_dVb = T4 * dn_dVb;
-        Vth -= n * T4;
+        Vth = n.mul_add(-T4, Vth);
         dVth_dVd -= dDITS_Sft_dVd;
         dVth_dVb -= dDITS_Sft_dVb;
     }
@@ -413,21 +426,21 @@ pub(super) fn electrostatics(
         T3 = Vtm * log(1.0 + ExpVgst);
         T10 = n * T3;
         dT10_dVg = pParam.mstar * ExpVgst / (1.0 + ExpVgst);
-        dT10_dVb = T3 * dn_dVb - dT10_dVg * (dVth_dVb + Vgst * dn_dVb / n);
-        dT10_dVd = T3 * dn_dVd - dT10_dVg * (dVth_dVd + Vgst * dn_dVd / n);
+        dT10_dVb = dT10_dVg.mul_add(-(dVth_dVb + Vgst * dn_dVb / n), T3 * dn_dVb);
+        dT10_dVd = dT10_dVg.mul_add(-(dVth_dVd + Vgst * dn_dVd / n), T3 * dn_dVd);
         dT10_dVg *= dVgs_eff_dVg;
     }
-    T1 = pParam.voffcbn - (1.0 - pParam.mstar) * Vgst;
+    T1 = (1.0 - pParam.mstar).mul_add(-Vgst, pParam.voffcbn);
     T2 = T1 / T0;
     if T2 < -EXP_THRESHOLD {
         T3 = model.coxe * MIN_EXP / pParam.cdep0;
-        T9 = pParam.mstar + T3 * n;
+        T9 = T3.mul_add(n, pParam.mstar);
         dT9_dVg = 0.0;
         dT9_dVd = dn_dVd * T3;
         dT9_dVb = dn_dVb * T3;
     } else if T2 > EXP_THRESHOLD {
         T3 = model.coxe * MAX_EXP / pParam.cdep0;
-        T9 = pParam.mstar + T3 * n;
+        T9 = T3.mul_add(n, pParam.mstar);
         dT9_dVg = 0.0;
         dT9_dVd = dn_dVd * T3;
         dT9_dVb = dn_dVb * T3;
@@ -436,18 +449,18 @@ pub(super) fn electrostatics(
         T3 = model.coxe / pParam.cdep0;
         T4 = T3 * ExpVgst;
         T5 = T1 * T4 / T0;
-        T9 = pParam.mstar + n * T4;
+        T9 = n.mul_add(T4, pParam.mstar);
         dT9_dVg = T3 * (pParam.mstar - 1.0) * ExpVgst / Vtm;
-        dT9_dVb = T4 * dn_dVb - dT9_dVg * dVth_dVb - T5 * dn_dVb;
-        dT9_dVd = T4 * dn_dVd - dT9_dVg * dVth_dVd - T5 * dn_dVd;
+        dT9_dVb = T5.mul_add(-dn_dVb, dT9_dVg.mul_add(-dVth_dVb, T4 * dn_dVb));
+        dT9_dVd = T5.mul_add(-dn_dVd, dT9_dVg.mul_add(-dVth_dVd, T4 * dn_dVd));
         dT9_dVg *= dVgs_eff_dVg;
     }
     Vgsteff = T10 / T9;
     here.Vgsteff = Vgsteff;
     T11 = T9 * T9;
-    dVgsteff_dVg = (T9 * dT10_dVg - T10 * dT9_dVg) / T11;
-    dVgsteff_dVd = (T9 * dT10_dVd - T10 * dT9_dVd) / T11;
-    dVgsteff_dVb = (T9 * dT10_dVb - T10 * dT9_dVb) / T11;
+    dVgsteff_dVg = T10.mul_add(-dT9_dVg, T9 * dT10_dVg) / T11;
+    dVgsteff_dVd = T10.mul_add(-dT9_dVd, T9 * dT10_dVd) / T11;
+    dVgsteff_dVb = T10.mul_add(-dT9_dVb, T9 * dT10_dVb) / T11;
     Electrostatics {
         Leff,
         Lpe_Vb,
@@ -717,11 +730,11 @@ pub(super) fn transport(
     let mut dFsevl_dVd: f64;
     let mut dFsevl_dVb: f64;
     T9 = sqrtPhis - pParam.sqrtPhi;
-    Weff = pParam.weff - 2.0 * (pParam.dwg * Vgsteff + pParam.dwb * T9);
+    Weff = 2.0f64.mul_add(-pParam.dwb.mul_add(T9, pParam.dwg * Vgsteff), pParam.weff);
     dWeff_dVg = -2.0 * pParam.dwg;
     dWeff_dVb = -2.0 * pParam.dwb * dsqrtPhis_dVb;
     if Weff < 2.0e-8 {
-        T0 = 1.0 / (6.0e-8 - 2.0 * Weff);
+        T0 = 1.0 / 2.0f64.mul_add(-Weff, 6.0e-8);
         Weff = 2.0e-8 * (4.0e-8 - Weff) * T0;
         let correction = T0 * 4.0e-16;
         T0 *= correction;
@@ -733,17 +746,17 @@ pub(super) fn transport(
         dRds_dVg = dRds_dVb;
         Rds = dRds_dVg;
     } else {
-        T0 = 1.0 + pParam.prwg * Vgsteff;
+        T0 = pParam.prwg.mul_add(Vgsteff, 1.0);
         dT0_dVg = -pParam.prwg / T0 / T0;
         T1 = pParam.prwb * T9;
         dT1_dVb = pParam.prwb * dsqrtPhis_dVb;
         T2 = 1.0 / T0 + T1;
-        T3 = T2 + sqrt(T2 * T2 + 0.01);
+        T3 = T2 + sqrt(T2.mul_add(T2, 0.01));
         dT3_dVg = 1.0 + T2 / (T3 - T2);
         dT3_dVb = dT3_dVg * dT1_dVb;
         dT3_dVg *= dT0_dVg;
         T4 = pParam.rds0 * 0.5;
-        Rds = pParam.rdswmin + T3 * T4;
+        Rds = T3.mul_add(T4, pParam.rdswmin);
         dRds_dVg = T4 * dT3_dVg;
         dRds_dVb = T4 * dT3_dVb;
         if Rds > 0.0 {
@@ -753,10 +766,10 @@ pub(super) fn transport(
         }
     }
     T9 = 0.5 * pParam.k1ox * Lpe_Vb / sqrtPhis;
-    T1 = T9 + here.k2ox - pParam.k3b * Vth_NarrowW;
+    T1 = pParam.k3b.mul_add(-Vth_NarrowW, T9 + here.k2ox);
     dT1_dVb = -T9 / sqrtPhis * dsqrtPhis_dVb;
     T9 = sqrt(pParam.xj * Xdep);
-    tmp1 = Leff + 2.0 * T9;
+    tmp1 = 2.0f64.mul_add(T9, Leff);
     T5 = Leff / tmp1;
     tmp2 = pParam.a0 * T5;
     tmp3 = pParam.weff + pParam.b1;
@@ -765,19 +778,19 @@ pub(super) fn transport(
     dT2_dVb = -T9 / tmp1 / Xdep * dXdep_dVb;
     T6 = T5 * T5;
     T7 = T5 * T6;
-    Abulk0 = 1.0 + T1 * T2;
-    dAbulk0_dVb = T1 * tmp2 * dT2_dVb + T2 * dT1_dVb;
+    Abulk0 = T1.mul_add(T2, 1.0);
+    dAbulk0_dVb = T2.mul_add(dT1_dVb, T1 * tmp2 * dT2_dVb);
     T8 = pParam.ags * pParam.a0 * T7;
     dAbulk_dVg = -T1 * T8;
-    Abulk = Abulk0 + dAbulk_dVg * Vgsteff;
-    dAbulk_dVb = dAbulk0_dVb - T8 * Vgsteff * (dT1_dVb + 3.0 * T1 * dT2_dVb);
+    Abulk = dAbulk_dVg.mul_add(Vgsteff, Abulk0);
+    dAbulk_dVb = (T8 * Vgsteff).mul_add(-(3.0 * T1).mul_add(dT2_dVb, dT1_dVb), dAbulk0_dVb);
     if Abulk0 < 0.1 {
-        T9 = 1.0 / (3.0 - 20.0 * Abulk0);
+        T9 = 1.0 / 20.0f64.mul_add(-Abulk0, 3.0);
         Abulk0 = (0.2 - Abulk0) * T9;
         dAbulk0_dVb *= T9 * T9;
     }
     if Abulk < 0.1 {
-        T9 = 1.0 / (3.0 - 20.0 * Abulk);
+        T9 = 1.0 / 20.0f64.mul_add(-Abulk, 3.0);
         Abulk = (0.2 - Abulk) * T9;
         T10 = T9 * T9;
         dAbulk_dVb *= T10;
@@ -790,13 +803,13 @@ pub(super) fn transport(
         dT0_dVb = -pParam.keta * T0 * T0;
     } else {
         T1 = 1.0 / (0.8 + T2);
-        T0 = (17.0 + 20.0 * T2) * T1;
+        T0 = 20.0f64.mul_add(T2, 17.0) * T1;
         dT0_dVb = -pParam.keta * T1 * T1;
     }
     dAbulk_dVg *= T0;
-    dAbulk_dVb = dAbulk_dVb * T0 + Abulk * dT0_dVb;
+    dAbulk_dVb = Abulk.mul_add(dT0_dVb, dAbulk_dVb * T0);
     dAbulk0_Q_dVb = dAbulk0_dVb;
-    dAbulk0_dVb = dAbulk0_dVb * T0 + Abulk0 * dT0_dVb;
+    dAbulk0_dVb = Abulk0.mul_add(dT0_dVb, dAbulk0_dVb * T0);
     Abulk *= T0;
     Abulk0_Q = Abulk0;
     Abulk0 *= T0;
@@ -810,97 +823,99 @@ pub(super) fn transport(
             dT0_dVb = -pParam.ketac * T0 * T0;
         } else {
             T1 = 1.0 / (0.8 + T2);
-            T0 = (17.0 + 20.0 * T2) * T1;
+            T0 = 20.0f64.mul_add(T2, 17.0) * T1;
             dT0_dVb = -pParam.ketac * T1 * T1;
         }
-        dAbulk0_Q_dVb = dAbulk0_Q_dVb * T0 + Abulk0_Q * dT0_dVb;
+        dAbulk0_Q_dVb = Abulk0_Q.mul_add(dT0_dVb, dAbulk0_Q_dVb * T0);
         Abulk0_Q *= T0;
     }
     if (model.mtrlMod != 0) && model.mtrlCompatMod == 0 {
-        T14 = 2.0 * f64::from(model.r#type) * (model.phig - model.easub - 0.5 * model.Eg0 + 0.45);
+        T14 = 2.0
+            * f64::from(model.r#type)
+            * (0.5f64.mul_add(-model.Eg0, model.phig - model.easub) + 0.45);
     } else {
         T14 = 0.0;
     }
     if model.mobMod == 0 {
         T0 = Vgsteff + Vth + Vth - T14;
-        T2 = pParam.ua + pParam.uc * Vbseff;
+        T2 = pParam.uc.mul_add(Vbseff, pParam.ua);
         T3 = T0 / toxe;
-        T12 = sqrt(Vth * Vth + 0.0001);
-        T9 = 1.0 / (Vgsteff + 2.0 * T12);
+        T12 = sqrt(f64::mul_add(Vth, Vth, 0.0001));
+        T9 = 1.0 / 2.0f64.mul_add(T12, Vgsteff);
         T10 = T9 * toxe;
         T8 = pParam.ud * T10 * T10 * Vth;
         T6 = T8 * Vth;
-        T5 = T3 * (T2 + pParam.ub * T3) + T6;
+        T5 = T3.mul_add(pParam.ub.mul_add(T3, T2), T6);
         T7 = -2.0 * T6 * T9;
         T11 = T7 * Vth / T12;
-        dDenomi_dVg = (T2 + 2.0 * pParam.ub * T3) / toxe;
+        dDenomi_dVg = (2.0 * pParam.ub).mul_add(T3, T2) / toxe;
         T13 = 2.0 * (dDenomi_dVg + T11 + T8);
         dDenomi_dVd = T13 * dVth_dVd;
-        dDenomi_dVb = T13 * dVth_dVb + pParam.uc * T3;
+        dDenomi_dVb = pParam.uc.mul_add(T3, T13 * dVth_dVb);
         dDenomi_dVg += T7;
     } else if model.mobMod == 1 {
         T0 = Vgsteff + Vth + Vth - T14;
-        T2 = 1.0 + pParam.uc * Vbseff;
+        T2 = pParam.uc.mul_add(Vbseff, 1.0);
         T3 = T0 / toxe;
-        T4 = T3 * (pParam.ua + pParam.ub * T3);
-        T12 = sqrt(Vth * Vth + 0.0001);
-        T9 = 1.0 / (Vgsteff + 2.0 * T12);
+        T4 = T3 * pParam.ub.mul_add(T3, pParam.ua);
+        T12 = sqrt(f64::mul_add(Vth, Vth, 0.0001));
+        T9 = 1.0 / 2.0f64.mul_add(T12, Vgsteff);
         T10 = T9 * toxe;
         T8 = pParam.ud * T10 * T10 * Vth;
         T6 = T8 * Vth;
-        T5 = T4 * T2 + T6;
+        T5 = T4.mul_add(T2, T6);
         T7 = -2.0 * T6 * T9;
         T11 = T7 * Vth / T12;
-        dDenomi_dVg = (pParam.ua + 2.0 * pParam.ub * T3) * T2 / toxe;
+        dDenomi_dVg = (2.0 * pParam.ub).mul_add(T3, pParam.ua) * T2 / toxe;
         T13 = 2.0 * (dDenomi_dVg + T11 + T8);
         dDenomi_dVd = T13 * dVth_dVd;
-        dDenomi_dVb = T13 * dVth_dVb + pParam.uc * T4;
+        dDenomi_dVb = pParam.uc.mul_add(T4, T13 * dVth_dVb);
         dDenomi_dVg += T7;
     } else if model.mobMod == 2 {
         T0 = (Vgsteff + here.vtfbphi1) / toxe;
         T1 = exp(pParam.eu * log(T0));
         dT1_dVg = T1 * pParam.eu / T0 / toxe;
-        T2 = pParam.ua + pParam.uc * Vbseff;
-        T12 = sqrt(Vth * Vth + 0.0001);
-        T9 = 1.0 / (Vgsteff + 2.0 * T12);
+        T2 = pParam.uc.mul_add(Vbseff, pParam.ua);
+        T12 = sqrt(f64::mul_add(Vth, Vth, 0.0001));
+        T9 = 1.0 / 2.0f64.mul_add(T12, Vgsteff);
         T10 = T9 * toxe;
         T8 = pParam.ud * T10 * T10 * Vth;
         T6 = T8 * Vth;
-        T5 = T1 * T2 + T6;
+        T5 = T1.mul_add(T2, T6);
         T7 = -2.0 * T6 * T9;
         T11 = T7 * Vth / T12;
-        dDenomi_dVg = T2 * dT1_dVg + T7;
+        dDenomi_dVg = T2.mul_add(dT1_dVg, T7);
         T13 = 2.0 * (T11 + T8);
         dDenomi_dVd = T13 * dVth_dVd;
-        dDenomi_dVb = T13 * dVth_dVb + T1 * pParam.uc;
+        dDenomi_dVb = T1.mul_add(pParam.uc, T13 * dVth_dVb);
     } else if model.mobMod == 4 {
         T0 = Vgsteff + here.vtfbphi1 - T14;
-        T2 = pParam.ua + pParam.uc * Vbseff;
+        T2 = pParam.uc.mul_add(Vbseff, pParam.ua);
         T3 = T0 / toxe;
-        T12 = sqrt(here.vtfbphi1 * here.vtfbphi1 + 0.0001);
-        T9 = 1.0 / (Vgsteff + 2.0 * T12);
+        T12 = sqrt(here.vtfbphi1.mul_add(here.vtfbphi1, 0.0001));
+        T9 = 1.0 / 2.0f64.mul_add(T12, Vgsteff);
         T10 = T9 * toxe;
         T8 = pParam.ud * T10 * T10 * here.vtfbphi1;
         T6 = T8 * here.vtfbphi1;
-        T5 = T3 * (T2 + pParam.ub * T3) + T6;
+        T5 = T3.mul_add(pParam.ub.mul_add(T3, T2), T6);
         T7 = -2.0 * T6 * T9;
-        dDenomi_dVg = (T2 + 2.0 * pParam.ub * T3) / toxe;
+        dDenomi_dVg = (2.0 * pParam.ub).mul_add(T3, T2) / toxe;
         dDenomi_dVd = 0.0;
         dDenomi_dVb = pParam.uc * T3;
         dDenomi_dVg += T7;
     } else if model.mobMod == 5 {
         T0 = Vgsteff + here.vtfbphi1 - T14;
-        T2 = 1.0 + pParam.uc * Vbseff;
+        T2 = pParam.uc.mul_add(Vbseff, 1.0);
         T3 = T0 / toxe;
-        T4 = T3 * (pParam.ua + pParam.ub * T3);
-        T12 = sqrt(here.vtfbphi1 * here.vtfbphi1 + 0.0001);
-        T9 = 1.0 / (Vgsteff + 2.0 * T12);
+        T4 = T3 * pParam.ub.mul_add(T3, pParam.ua);
+        T12 = sqrt(here.vtfbphi1.mul_add(here.vtfbphi1, 0.0001));
+        T9 = 1.0 / 2.0f64.mul_add(T12, Vgsteff);
         T10 = T9 * toxe;
         T8 = pParam.ud * T10 * T10 * here.vtfbphi1;
         T6 = T8 * here.vtfbphi1;
-        T5 = T4 * T2 + T6;
+        T5 = T4.mul_add(T2, T6);
         T7 = -2.0 * T6 * T9;
-        dDenomi_dVg = (pParam.ua + 2.0 * pParam.ub * T3) * T2 / toxe;
+        dDenomi_dVg = (2.0 * pParam.ub).mul_add(T3, pParam.ua) * T2 / toxe;
         dDenomi_dVd = 0.0;
         dDenomi_dVb = pParam.uc * T4;
         dDenomi_dVg += T7;
@@ -908,35 +923,35 @@ pub(super) fn transport(
         T0 = (Vgsteff + here.vtfbphi1) / toxe;
         T1 = exp(pParam.eu * log(T0));
         dT1_dVg = T1 * pParam.eu / T0 / toxe;
-        T2 = pParam.ua + pParam.uc * Vbseff;
-        T12 = sqrt(here.vtfbphi1 * here.vtfbphi1 + 0.0001);
-        T9 = 1.0 / (Vgsteff + 2.0 * T12);
+        T2 = pParam.uc.mul_add(Vbseff, pParam.ua);
+        T12 = sqrt(here.vtfbphi1.mul_add(here.vtfbphi1, 0.0001));
+        T9 = 1.0 / 2.0f64.mul_add(T12, Vgsteff);
         T10 = T9 * toxe;
         T8 = pParam.ud * T10 * T10 * here.vtfbphi1;
         T6 = T8 * here.vtfbphi1;
-        T5 = T1 * T2 + T6;
+        T5 = T1.mul_add(T2, T6);
         T7 = -2.0 * T6 * T9;
-        dDenomi_dVg = T2 * dT1_dVg + T7;
+        dDenomi_dVg = T2.mul_add(dT1_dVg, T7);
         dDenomi_dVd = 0.0;
         dDenomi_dVb = T1 * pParam.uc;
     } else {
         T0 = (Vgsteff + here.vtfbphi1) * 1.0e-8 / toxe / 6.0;
         T1 = exp(pParam.eu * log(T0));
         dT1_dVg = T1 * pParam.eu * 1.0e-8 / T0 / toxe / 6.0;
-        T2 = pParam.ua + pParam.uc * Vbseff;
+        T2 = pParam.uc.mul_add(Vbseff, pParam.ua);
         VgsteffVth = pParam.VgsteffVth;
         T10 = exp(pParam.ucs * log(0.5 + 0.5 * Vgsteff / VgsteffVth));
         T11 = pParam.ud / T10;
         dT11_dVg = -0.5 * pParam.ucs * T11 / (0.5 + 0.5 * Vgsteff / VgsteffVth) / VgsteffVth;
-        dDenomi_dVg = T2 * dT1_dVg + dT11_dVg;
+        dDenomi_dVg = T2.mul_add(dT1_dVg, dT11_dVg);
         dDenomi_dVd = 0.0;
         dDenomi_dVb = T1 * pParam.uc;
-        T5 = T1 * T2 + T11;
+        T5 = T1.mul_add(T2, T11);
     }
     if T5 >= -0.8 {
         Denomi = 1.0 + T5;
     } else {
-        T9 = 1.0 / (7.0 + 10.0 * T5);
+        T9 = 1.0 / 10.0f64.mul_add(T5, 7.0);
         Denomi = (0.6 + T5) * T9;
         T9 *= T9;
         dDenomi_dVg *= T9;
@@ -964,17 +979,17 @@ pub(super) fn transport(
         dLambda_dVg = 0.0;
     } else if a1 > 0.0 {
         T0 = 1.0 - pParam.a2;
-        T1 = T0 - pParam.a1 * Vgsteff - 0.0001;
-        T2 = sqrt(T1 * T1 + 0.0004 * T0);
-        Lambda = pParam.a2 + T0 - 0.5 * (T1 + T2);
+        T1 = pParam.a1.mul_add(-Vgsteff, T0) - 0.0001;
+        T2 = sqrt(0.0004f64.mul_add(T0, T1 * T1));
+        Lambda = pParam.a2 + T0 - T1.midpoint(T2);
         dLambda_dVg = 0.5 * pParam.a1 * (1.0 + T1 / T2);
     } else {
-        T1 = pParam.a2 + pParam.a1 * Vgsteff - 0.0001;
-        T2 = sqrt(T1 * T1 + 0.0004 * pParam.a2);
-        Lambda = 0.5 * (T1 + T2);
+        T1 = pParam.a1.mul_add(Vgsteff, pParam.a2) - 0.0001;
+        T2 = sqrt(0.0004f64.mul_add(pParam.a2, T1 * T1));
+        Lambda = f64::midpoint(T1, T2);
         dLambda_dVg = 0.5 * pParam.a1 * (1.0 + T1 / T2);
     }
-    Vgst2Vtm = Vgsteff + 2.0 * Vtm;
+    Vgst2Vtm = 2.0f64.mul_add(Vtm, Vgsteff);
     if Rds > 0.0 {
         tmp2 = dRds_dVg / Rds + dWeff_dVg / Weff;
         tmp3 = dRds_dVb / Rds + dWeff_dVb / Weff;
@@ -983,18 +998,18 @@ pub(super) fn transport(
         tmp3 = dWeff_dVb / Weff;
     }
     if (Rds == 0.0) && (Lambda == 1.0) {
-        T0 = 1.0 / (Abulk * EsatL + Vgst2Vtm);
+        T0 = 1.0 / Abulk.mul_add(EsatL, Vgst2Vtm);
         tmp1 = 0.0;
         T1 = T0 * T0;
         T2 = Vgst2Vtm * T0;
         T3 = EsatL * Vgst2Vtm;
         Vdsat = T3 * T0;
-        dT0_dVg = -(Abulk * dEsatL_dVg + EsatL * dAbulk_dVg + 1.0) * T1;
+        dT0_dVg = -(EsatL.mul_add(dAbulk_dVg, Abulk * dEsatL_dVg) + 1.0) * T1;
         dT0_dVd = -(Abulk * dEsatL_dVd) * T1;
-        dT0_dVb = -(Abulk * dEsatL_dVb + dAbulk_dVb * EsatL) * T1;
-        dVdsat_dVg = T3 * dT0_dVg + T2 * dEsatL_dVg + EsatL * T0;
-        dVdsat_dVd = T3 * dT0_dVd + T2 * dEsatL_dVd;
-        dVdsat_dVb = T3 * dT0_dVb + T2 * dEsatL_dVb;
+        dT0_dVb = -dAbulk_dVb.mul_add(EsatL, Abulk * dEsatL_dVb) * T1;
+        dVdsat_dVg = EsatL.mul_add(T0, T2.mul_add(dEsatL_dVg, T3 * dT0_dVg));
+        dVdsat_dVd = T2.mul_add(dEsatL_dVd, T3 * dT0_dVd);
+        dVdsat_dVb = T2.mul_add(dEsatL_dVb, T3 * dT0_dVb);
     } else {
         tmp1 = dLambda_dVg / (Lambda * Lambda);
         T9 = Abulk * WVCoxRds;
@@ -1002,58 +1017,57 @@ pub(super) fn transport(
         T7 = Vgst2Vtm * T9;
         T6 = Vgst2Vtm * WVCoxRds;
         T0 = 2.0 * Abulk * (T9 - 1.0 + 1.0 / Lambda);
-        dT0_dVg = 2.0 * (T8 * tmp2 - Abulk * tmp1 + (2.0 * T9 + 1.0 / Lambda - 1.0) * dAbulk_dVg);
-        dT0_dVb =
-            2.0 * (T8 * (2.0 / Abulk * dAbulk_dVb + tmp3) + (1.0 / Lambda - 1.0) * dAbulk_dVb);
+        dT0_dVg = 2.0
+            * (2.0f64.mul_add(T9, 1.0 / Lambda) - 1.0)
+                .mul_add(dAbulk_dVg, Abulk.mul_add(-tmp1, T8 * tmp2));
+        dT0_dVb = 2.0
+            * (1.0 / Lambda - 1.0)
+                .mul_add(dAbulk_dVb, T8 * (2.0 / Abulk).mul_add(dAbulk_dVb, tmp3));
         dT0_dVd = 0.0;
-        T1 = Vgst2Vtm * (2.0 / Lambda - 1.0) + Abulk * EsatL + 3.0 * T7;
-        dT1_dVg = (2.0 / Lambda - 1.0) - 2.0 * Vgst2Vtm * tmp1
-            + Abulk * dEsatL_dVg
-            + EsatL * dAbulk_dVg
-            + 3.0 * (T9 + T7 * tmp2 + T6 * dAbulk_dVg);
-        dT1_dVb = Abulk * dEsatL_dVb + EsatL * dAbulk_dVb + 3.0 * (T6 * dAbulk_dVb + T7 * tmp3);
+        T1 = 3.0f64.mul_add(T7, Abulk.mul_add(EsatL, Vgst2Vtm * (2.0 / Lambda - 1.0)));
+        dT1_dVg = 3.0f64.mul_add(
+            T6.mul_add(dAbulk_dVg, T7.mul_add(tmp2, T9)),
+            EsatL.mul_add(
+                dAbulk_dVg,
+                Abulk.mul_add(
+                    dEsatL_dVg,
+                    (2.0 * Vgst2Vtm).mul_add(-tmp1, 2.0 / Lambda - 1.0),
+                ),
+            ),
+        );
+        dT1_dVb = 3.0f64.mul_add(
+            T7.mul_add(tmp3, T6 * dAbulk_dVb),
+            EsatL.mul_add(dAbulk_dVb, Abulk * dEsatL_dVb),
+        );
         dT1_dVd = Abulk * dEsatL_dVd;
-        T2 = Vgst2Vtm * (EsatL + 2.0 * T6);
-        dT2_dVg = EsatL + Vgst2Vtm * dEsatL_dVg + T6 * (4.0 + 2.0 * Vgst2Vtm * tmp2);
-        dT2_dVb = Vgst2Vtm * (dEsatL_dVb + 2.0 * T6 * tmp3);
+        T2 = Vgst2Vtm * 2.0f64.mul_add(T6, EsatL);
+        dT2_dVg = T6.mul_add(
+            (2.0 * Vgst2Vtm).mul_add(tmp2, 4.0),
+            Vgst2Vtm.mul_add(dEsatL_dVg, EsatL),
+        );
+        dT2_dVb = Vgst2Vtm * (2.0 * T6).mul_add(tmp3, dEsatL_dVb);
         dT2_dVd = Vgst2Vtm * dEsatL_dVd;
-        T3 = sqrt(T1 * T1 - 2.0 * T0 * T2);
-        Vdsat = (T1 - T3) / T0;
-        dT3_dVg = (T1 * dT1_dVg - 2.0 * (T0 * dT2_dVg + T2 * dT0_dVg)) / T3;
-        dT3_dVd = (T1 * dT1_dVd - 2.0 * (T0 * dT2_dVd + T2 * dT0_dVd)) / T3;
-        dT3_dVb = (T1 * dT1_dVb - 2.0 * (T0 * dT2_dVb + T2 * dT0_dVb)) / T3;
-        dVdsat_dVg =
-            (dT1_dVg - (T1 * dT1_dVg - dT0_dVg * T2 - T0 * dT2_dVg) / T3 - Vdsat * dT0_dVg) / T0;
-        dVdsat_dVb =
-            (dT1_dVb - (T1 * dT1_dVb - dT0_dVb * T2 - T0 * dT2_dVb) / T3 - Vdsat * dT0_dVb) / T0;
-        dVdsat_dVd = (dT1_dVd - (T1 * dT1_dVd - T0 * dT2_dVd) / T3) / T0;
+        T3 = sqrt(difference_of_products(T1, T1, 2.0 * T0, T2));
+        Vdsat = if T1 >= 0.0 && T1.midpoint(T3) != 0.0 {
+            T2 / T1.midpoint(T3)
+        } else {
+            (T1 - T3) / T0
+        };
+        // Implicit differentiation avoids subtracting nearly equal
+        // derivatives of the roots and dividing by a small T0.
+        let derivative = |da: f64, db: f64, dc: f64| {
+            (0.5 * Vdsat * Vdsat).mul_add(da, Vdsat.mul_add(-db, dc)) / T3
+        };
+        dVdsat_dVg = derivative(dT0_dVg, dT1_dVg, dT2_dVg);
+        dVdsat_dVd = derivative(dT0_dVd, dT1_dVd, dT2_dVd);
+        dVdsat_dVb = derivative(dT0_dVb, dT1_dVb, dT2_dVb);
     }
     here.vdsat = Vdsat;
-    T1 = Vdsat - Vds - pParam.delta;
-    dT1_dVg = dVdsat_dVg;
-    dT1_dVd = dVdsat_dVd - 1.0;
-    dT1_dVb = dVdsat_dVb;
-    T2 = sqrt(T1 * T1 + 4.0 * pParam.delta * Vdsat);
-    T0 = T1 / T2;
-    T9 = 2.0 * pParam.delta;
-    T3 = T9 / T2;
-    dT2_dVg = T0 * dT1_dVg + T3 * dVdsat_dVg;
-    dT2_dVd = T0 * dT1_dVd + T3 * dVdsat_dVd;
-    dT2_dVb = T0 * dT1_dVb + T3 * dVdsat_dVb;
-    if T1 >= 0.0 {
-        Vdseff = Vdsat - 0.5 * (T1 + T2);
-        dVdseff_dVg = dVdsat_dVg - 0.5 * (dT1_dVg + dT2_dVg);
-        dVdseff_dVd = dVdsat_dVd - 0.5 * (dT1_dVd + dT2_dVd);
-        dVdseff_dVb = dVdsat_dVb - 0.5 * (dT1_dVb + dT2_dVb);
-    } else {
-        T4 = T9 / (T2 - T1);
-        T5 = 1.0 - T4;
-        T6 = Vdsat * T4 / (T2 - T1);
-        Vdseff = Vdsat * T5;
-        dVdseff_dVg = dVdsat_dVg * T5 + T6 * (dT2_dVg - dT1_dVg);
-        dVdseff_dVd = dVdsat_dVd * T5 + T6 * (dT2_dVd - dT1_dVd);
-        dVdseff_dVb = dVdsat_dVb * T5 + T6 * (dT2_dVb - dT1_dVb);
-    }
+    let (effective, d_saturation, d_drain) = smooth_vds(Vdsat, Vds, pParam.delta);
+    Vdseff = effective;
+    dVdseff_dVg = d_saturation * dVdsat_dVg;
+    dVdseff_dVd = d_saturation.mul_add(dVdsat_dVd, d_drain);
+    dVdseff_dVb = d_saturation * dVdsat_dVb;
     if Vds == 0.0 {
         Vdseff = 0.0;
         dVdseff_dVg = 0.0;
@@ -1076,31 +1090,31 @@ pub(super) fn transport(
         dT5_dVg = dEsatL_dVg * T4;
         dT5_dVd = dEsatL_dVd * T4;
         dT5_dVb = dEsatL_dVb * T4;
-        T6 = 1.0 + diffVds * T5;
-        dT6_dVg = dT5_dVg * diffVds - dVdseff_dVg * T5;
-        dT6_dVd = dT5_dVd * diffVds + (1.0 - dVdseff_dVd) * T5;
-        dT6_dVb = dT5_dVb * diffVds - dVdseff_dVb * T5;
-        T7 = 2.0 / (T6 * T6 + 1.0);
+        T6 = diffVds.mul_add(T5, 1.0);
+        dT6_dVg = dVdseff_dVg.mul_add(-T5, dT5_dVg * diffVds);
+        dT6_dVd = (1.0 - dVdseff_dVd).mul_add(T5, dT5_dVd * diffVds);
+        dT6_dVb = dVdseff_dVb.mul_add(-T5, dT5_dVb * diffVds);
+        T7 = 2.0 / T6.mul_add(T6, 1.0);
         T8 = 1.0 - T7;
         T9 = T6 * T7 * T7;
         dT8_dVg = T9 * dT6_dVg;
         dT8_dVd = T9 * dT6_dVd;
         dT8_dVb = T9 * dT6_dVb;
-        T10 = 1.0 + T2 * T8;
-        dT10_dVg = dT2_dVg * T8 + T2 * dT8_dVg;
-        dT10_dVd = dT2_dVd * T8 + T2 * dT8_dVd;
-        dT10_dVb = dT2_dVb * T8 + T2 * dT8_dVb;
+        T10 = T2.mul_add(T8, 1.0);
+        dT10_dVg = T2.mul_add(dT8_dVg, dT2_dVg * T8);
+        dT10_dVd = T2.mul_add(dT8_dVd, dT2_dVd * T8);
+        dT10_dVb = T2.mul_add(dT8_dVb, dT2_dVb * T8);
         if T10 == 1.0 {
             dT10_dVb = 0.0;
             dT10_dVd = dT10_dVb;
             dT10_dVg = dT10_dVd;
         }
         dEsatL_dVg *= T10;
-        dEsatL_dVg += EsatL * dT10_dVg;
+        dEsatL_dVg = EsatL.mul_add(dT10_dVg, dEsatL_dVg);
         dEsatL_dVd *= T10;
-        dEsatL_dVd += EsatL * dT10_dVd;
+        dEsatL_dVd = EsatL.mul_add(dT10_dVd, dEsatL_dVd);
         dEsatL_dVb *= T10;
-        dEsatL_dVb += EsatL * dT10_dVb;
+        dEsatL_dVb = EsatL.mul_add(dT10_dVb, dEsatL_dVb);
         EsatL *= T10;
         Esat = EsatL / Leff;
         here.EsatL = EsatL;
@@ -1108,20 +1122,27 @@ pub(super) fn transport(
     tmp4 = 1.0 - 0.5 * Abulk * Vdsat / Vgst2Vtm;
     T9 = WVCoxRds * Vgsteff;
     T8 = T9 / Vgst2Vtm;
-    T0 = EsatL + Vdsat + 2.0 * T9 * tmp4;
+    T0 = (2.0 * T9).mul_add(tmp4, EsatL + Vdsat);
     T7 = 2.0 * WVCoxRds * tmp4;
-    dT0_dVg = dEsatL_dVg + dVdsat_dVg + T7 * (1.0 + tmp2 * Vgsteff)
-        - T8 * (Abulk * dVdsat_dVg - Abulk * Vdsat / Vgst2Vtm + Vdsat * dAbulk_dVg);
-    dT0_dVb = dEsatL_dVb + dVdsat_dVb + T7 * tmp3 * Vgsteff
-        - T8 * (dAbulk_dVb * Vdsat + Abulk * dVdsat_dVb);
-    dT0_dVd = dEsatL_dVd + dVdsat_dVd - T8 * Abulk * dVdsat_dVd;
+    dT0_dVg = T8.mul_add(
+        -Vdsat.mul_add(
+            dAbulk_dVg,
+            Abulk.mul_add(dVdsat_dVg, -(Abulk * Vdsat / Vgst2Vtm)),
+        ),
+        T7.mul_add(tmp2.mul_add(Vgsteff, 1.0), dEsatL_dVg + dVdsat_dVg),
+    );
+    dT0_dVb = T8.mul_add(
+        -Abulk.mul_add(dVdsat_dVb, dAbulk_dVb * Vdsat),
+        (T7 * tmp3).mul_add(Vgsteff, dEsatL_dVb + dVdsat_dVb),
+    );
+    dT0_dVd = (T8 * Abulk).mul_add(-dVdsat_dVd, dEsatL_dVd + dVdsat_dVd);
     T9 = WVCoxRds * Abulk;
     T1 = 2.0 / Lambda - 1.0 + T9;
-    dT1_dVg = -2.0 * tmp1 + WVCoxRds * (Abulk * tmp2 + dAbulk_dVg);
-    dT1_dVb = dAbulk_dVb * WVCoxRds + T9 * tmp3;
+    dT1_dVg = WVCoxRds.mul_add(Abulk.mul_add(tmp2, dAbulk_dVg), -2.0 * tmp1);
+    dT1_dVb = T9.mul_add(tmp3, dAbulk_dVb * WVCoxRds);
     Vasat = T0 / T1;
-    dVasat_dVg = (dT0_dVg - Vasat * dT1_dVg) / T1;
-    dVasat_dVb = (dT0_dVb - Vasat * dT1_dVb) / T1;
+    dVasat_dVg = Vasat.mul_add(-dT1_dVg, dT0_dVg) / T1;
+    dVasat_dVb = Vasat.mul_add(-dT1_dVb, dT0_dVb) / T1;
     dVasat_dVd = dT0_dVd / T1;
     tmp1 = here.vtfbphi2;
     tmp2 = 2.0e8 * here.toxp;
@@ -1132,41 +1153,47 @@ pub(super) fn transport(
     T2 = model.bdos * 0.7 * tmp3 / T0;
     Tcen = model.ados * 1.9e-9 / T1;
     dTcen_dVg = -Tcen * T2 * dT0_dVg / T1;
-    Coxeff = epssub * here.coxp / (epssub + here.coxp * Tcen);
+    Coxeff = epssub * here.coxp / here.coxp.mul_add(Tcen, epssub);
     here.Coxeff = Coxeff;
     dCoxeff_dVg = -Coxeff * Coxeff * dTcen_dVg / epssub;
     CoxeffWovL = Coxeff * Weff / Leff;
     beta = ueff * CoxeffWovL;
     T3 = ueff / Leff;
-    dbeta_dVg = CoxeffWovL * dueff_dVg + T3 * (Weff * dCoxeff_dVg + Coxeff * dWeff_dVg);
+    dbeta_dVg = T3.mul_add(
+        Coxeff.mul_add(dWeff_dVg, Weff * dCoxeff_dVg),
+        CoxeffWovL * dueff_dVg,
+    );
     dbeta_dVd = CoxeffWovL * dueff_dVd;
-    dbeta_dVb = CoxeffWovL * dueff_dVb + T3 * Coxeff * dWeff_dVb;
+    dbeta_dVb = (T3 * Coxeff).mul_add(dWeff_dVb, CoxeffWovL * dueff_dVb);
     here.AbovVgst2Vtm = Abulk / Vgst2Vtm;
-    T0 = 1.0 - 0.5 * Vdseff * here.AbovVgst2Vtm;
+    T0 = (0.5 * Vdseff).mul_add(-here.AbovVgst2Vtm, 1.0);
     dT0_dVg =
-        -0.5 * (Abulk * dVdseff_dVg - Abulk * Vdseff / Vgst2Vtm + Vdseff * dAbulk_dVg) / Vgst2Vtm;
+        -0.5 * Vdseff.mul_add(
+            dAbulk_dVg,
+            Abulk.mul_add(dVdseff_dVg, -(Abulk * Vdseff / Vgst2Vtm)),
+        ) / Vgst2Vtm;
     dT0_dVd = -0.5 * Abulk * dVdseff_dVd / Vgst2Vtm;
-    dT0_dVb = -0.5 * (Abulk * dVdseff_dVb + dAbulk_dVb * Vdseff) / Vgst2Vtm;
+    dT0_dVb = -0.5 * dAbulk_dVb.mul_add(Vdseff, Abulk * dVdseff_dVb) / Vgst2Vtm;
     fgche1 = Vgsteff * T0;
-    dfgche1_dVg = Vgsteff * dT0_dVg + T0;
+    dfgche1_dVg = f64::mul_add(Vgsteff, dT0_dVg, T0);
     dfgche1_dVd = Vgsteff * dT0_dVd;
     dfgche1_dVb = Vgsteff * dT0_dVb;
     T9 = Vdseff / EsatL;
     fgche2 = 1.0 + T9;
-    dfgche2_dVg = (dVdseff_dVg - T9 * dEsatL_dVg) / EsatL;
-    dfgche2_dVd = (dVdseff_dVd - T9 * dEsatL_dVd) / EsatL;
-    dfgche2_dVb = (dVdseff_dVb - T9 * dEsatL_dVb) / EsatL;
+    dfgche2_dVg = T9.mul_add(-dEsatL_dVg, dVdseff_dVg) / EsatL;
+    dfgche2_dVd = T9.mul_add(-dEsatL_dVd, dVdseff_dVd) / EsatL;
+    dfgche2_dVb = T9.mul_add(-dEsatL_dVb, dVdseff_dVb) / EsatL;
     gche = beta * fgche1 / fgche2;
-    dgche_dVg = (beta * dfgche1_dVg + fgche1 * dbeta_dVg - gche * dfgche2_dVg) / fgche2;
-    dgche_dVd = (beta * dfgche1_dVd + fgche1 * dbeta_dVd - gche * dfgche2_dVd) / fgche2;
-    dgche_dVb = (beta * dfgche1_dVb + fgche1 * dbeta_dVb - gche * dfgche2_dVb) / fgche2;
-    T0 = 1.0 + gche * Rds;
+    dgche_dVg = gche.mul_add(-dfgche2_dVg, fgche1.mul_add(dbeta_dVg, beta * dfgche1_dVg)) / fgche2;
+    dgche_dVd = gche.mul_add(-dfgche2_dVd, fgche1.mul_add(dbeta_dVd, beta * dfgche1_dVd)) / fgche2;
+    dgche_dVb = gche.mul_add(-dfgche2_dVb, fgche1.mul_add(dbeta_dVb, beta * dfgche1_dVb)) / fgche2;
+    T0 = gche.mul_add(Rds, 1.0);
     Idl = gche / T0;
-    T1 = (1.0 - Idl * Rds) / T0;
+    T1 = Idl.mul_add(-Rds, 1.0) / T0;
     T2 = Idl * Idl;
-    dIdl_dVg = T1 * dgche_dVg - T2 * dRds_dVg;
+    dIdl_dVg = T2.mul_add(-dRds_dVg, T1 * dgche_dVg);
     dIdl_dVd = T1 * dgche_dVd;
-    dIdl_dVb = T1 * dgche_dVb - T2 * dRds_dVb;
+    dIdl_dVb = T2.mul_add(-dRds_dVb, T1 * dgche_dVb);
     if pParam.fprout <= 0.0 {
         FP = 1.0;
         dFP_dVg = 0.0;
@@ -1183,7 +1210,7 @@ pub(super) fn transport(
         dPvagTerm_dVb = -T9 * dEsatL_dVb / EsatL;
         dPvagTerm_dVd = -T9 * dEsatL_dVd / EsatL;
     } else {
-        T4 = 1.0 / (17.0 + 20.0 * T9);
+        T4 = 1.0 / 20.0f64.mul_add(T9, 17.0);
         PvagTerm = (0.8 + T9) * T4;
         T4 *= T4;
         dPvagTerm_dVg = T8 * (1.0 - Vgsteff * dEsatL_dVg / EsatL) * T4;
@@ -1192,10 +1219,10 @@ pub(super) fn transport(
         dPvagTerm_dVd = -T9 * dEsatL_dVd;
     }
     if (pParam.pclm > MIN_EXP) && (diffVds > 1.0e-10) {
-        T0 = 1.0 + Rds * Idl;
-        dT0_dVg = dRds_dVg * Idl + Rds * dIdl_dVg;
+        T0 = Rds.mul_add(Idl, 1.0);
+        dT0_dVg = Rds.mul_add(dIdl_dVg, dRds_dVg * Idl);
         dT0_dVd = Rds * dIdl_dVd;
-        dT0_dVb = dRds_dVb * Idl + Rds * dIdl_dVb;
+        dT0_dVb = Rds.mul_add(dIdl_dVb, dRds_dVb * Idl);
         T2 = Vdsat / Esat;
         T1 = Leff + T2;
         dT1_dVg = (dVdsat_dVg - T2 * dEsatL_dVg / Leff) / Esat;
@@ -1206,9 +1233,9 @@ pub(super) fn transport(
         dCclm_dVb = Cclm * (dPvagTerm_dVb / PvagTerm + dT0_dVb / T0 + dT1_dVb / T1);
         dCclm_dVd = Cclm * (dPvagTerm_dVd / PvagTerm + dT0_dVd / T0 + dT1_dVd / T1);
         VACLM = Cclm * diffVds;
-        dVACLM_dVg = dCclm_dVg * diffVds - dVdseff_dVg * Cclm;
-        dVACLM_dVb = dCclm_dVb * diffVds - dVdseff_dVb * Cclm;
-        dVACLM_dVd = dCclm_dVd * diffVds + (1.0 - dVdseff_dVd) * Cclm;
+        dVACLM_dVg = dVdseff_dVg.mul_add(-Cclm, dCclm_dVg * diffVds);
+        dVACLM_dVb = dVdseff_dVb.mul_add(-Cclm, dCclm_dVb * diffVds);
+        dVACLM_dVd = (1.0 - dVdseff_dVd).mul_add(Cclm, dCclm_dVd * diffVds);
     } else {
         Cclm = MAX_EXP;
         VACLM = Cclm;
@@ -1222,12 +1249,13 @@ pub(super) fn transport(
     if pParam.thetaRout > MIN_EXP {
         T8 = Abulk * Vdsat;
         T0 = Vgst2Vtm * T8;
-        dT0_dVg = Vgst2Vtm * Abulk * dVdsat_dVg + T8 + Vgst2Vtm * Vdsat * dAbulk_dVg;
-        dT0_dVb = Vgst2Vtm * (dAbulk_dVb * Vdsat + Abulk * dVdsat_dVb);
+        dT0_dVg =
+            (Vgst2Vtm * Vdsat).mul_add(dAbulk_dVg, (Vgst2Vtm * Abulk).mul_add(dVdsat_dVg, T8));
+        dT0_dVb = Vgst2Vtm * Abulk.mul_add(dVdsat_dVb, dAbulk_dVb * Vdsat);
         dT0_dVd = Vgst2Vtm * Abulk * dVdsat_dVd;
         T1 = Vgst2Vtm + T8;
-        dT1_dVg = 1.0 + Abulk * dVdsat_dVg + Vdsat * dAbulk_dVg;
-        dT1_dVb = Abulk * dVdsat_dVb + dAbulk_dVb * Vdsat;
+        dT1_dVg = Vdsat.mul_add(dAbulk_dVg, Abulk.mul_add(dVdsat_dVg, 1.0));
+        dT1_dVb = dAbulk_dVb.mul_add(Vdsat, Abulk * dVdsat_dVb);
         dT1_dVd = Abulk * dVdsat_dVd;
         T9 = T1 * T1;
         T2 = pParam.thetaRout;
@@ -1240,19 +1268,19 @@ pub(super) fn transport(
             T3 = 1.0 / (1.0 + T7);
             VADIBL *= T3;
             dVADIBL_dVg *= T3;
-            dVADIBL_dVb = (dVADIBL_dVb - VADIBL * pParam.pdiblb) * T3;
+            dVADIBL_dVb = VADIBL.mul_add(-pParam.pdiblb, dVADIBL_dVb) * T3;
             dVADIBL_dVd *= T3;
         } else {
             T4 = 1.0 / (0.8 + T7);
-            T3 = (17.0 + 20.0 * T7) * T4;
+            T3 = 20.0f64.mul_add(T7, 17.0) * T4;
             dVADIBL_dVg *= T3;
-            dVADIBL_dVb = dVADIBL_dVb * T3 - VADIBL * pParam.pdiblb * T4 * T4;
+            dVADIBL_dVb = (VADIBL * pParam.pdiblb * T4).mul_add(-T4, dVADIBL_dVb * T3);
             dVADIBL_dVd *= T3;
             VADIBL *= T3;
         }
-        dVADIBL_dVg = dVADIBL_dVg * PvagTerm + VADIBL * dPvagTerm_dVg;
-        dVADIBL_dVb = dVADIBL_dVb * PvagTerm + VADIBL * dPvagTerm_dVb;
-        dVADIBL_dVd = dVADIBL_dVd * PvagTerm + VADIBL * dPvagTerm_dVd;
+        dVADIBL_dVg = VADIBL.mul_add(dPvagTerm_dVg, dVADIBL_dVg * PvagTerm);
+        dVADIBL_dVb = VADIBL.mul_add(dPvagTerm_dVb, dVADIBL_dVb * PvagTerm);
+        dVADIBL_dVd = VADIBL.mul_add(dPvagTerm_dVd, dVADIBL_dVd * PvagTerm);
         VADIBL *= PvagTerm;
     } else {
         VADIBL = MAX_EXP;
@@ -1273,8 +1301,8 @@ pub(super) fn transport(
         dT1_dVd = T1 * pParam.pditsd;
     }
     if pParam.pdits > MIN_EXP {
-        T2 = 1.0 + model.pditsl * Leff;
-        VADITS = (1.0 + T2 * T1) / pParam.pdits;
+        T2 = model.pditsl.mul_add(Leff, 1.0);
+        VADITS = T2.mul_add(T1, 1.0) / pParam.pdits;
         dVADITS_dVg = VADITS * dFP_dVg;
         dVADITS_dVd = FP * T2 * dT1_dVd / pParam.pdits;
         VADITS *= FP;
@@ -1306,14 +1334,29 @@ pub(super) fn transport(
     T9 = diffVds / VADIBL;
     T0 = 1.0 + T9;
     Idsa = Idl * T0;
-    dIdsa_dVg = T0 * dIdl_dVg - Idl * (dVdseff_dVg + T9 * dVADIBL_dVg) / VADIBL;
-    dIdsa_dVd = T0 * dIdl_dVd + Idl * (1.0 - dVdseff_dVd - T9 * dVADIBL_dVd) / VADIBL;
-    dIdsa_dVb = T0 * dIdl_dVb - Idl * (dVdseff_dVb + T9 * dVADIBL_dVb) / VADIBL;
+    dIdsa_dVg = T0.mul_add(
+        dIdl_dVg,
+        -(Idl * T9.mul_add(dVADIBL_dVg, dVdseff_dVg) / VADIBL),
+    );
+    dIdsa_dVd = T0.mul_add(
+        dIdl_dVd,
+        Idl * T9.mul_add(-dVADIBL_dVd, 1.0 - dVdseff_dVd) / VADIBL,
+    );
+    dIdsa_dVb = T0.mul_add(
+        dIdl_dVb,
+        -(Idl * T9.mul_add(dVADIBL_dVb, dVdseff_dVb) / VADIBL),
+    );
     T9 = diffVds / VADITS;
     T0 = 1.0 + T9;
-    dIdsa_dVg = T0 * dIdsa_dVg - Idsa * (dVdseff_dVg + T9 * dVADITS_dVg) / VADITS;
-    dIdsa_dVd = T0 * dIdsa_dVd + Idsa * (1.0 - dVdseff_dVd - T9 * dVADITS_dVd) / VADITS;
-    dIdsa_dVb = T0 * dIdsa_dVb - Idsa * dVdseff_dVb / VADITS;
+    dIdsa_dVg = T0.mul_add(
+        dIdsa_dVg,
+        -(Idsa * T9.mul_add(dVADITS_dVg, dVdseff_dVg) / VADITS),
+    );
+    dIdsa_dVd = T0.mul_add(
+        dIdsa_dVd,
+        Idsa * T9.mul_add(-dVADITS_dVd, 1.0 - dVdseff_dVd) / VADITS,
+    );
+    dIdsa_dVb = T0.mul_add(dIdsa_dVb, -(Idsa * dVdseff_dVb / VADITS));
     Idsa *= T0;
     T0 = log(Va / Vasat);
     dT0_dVg = dVa_dVg / Va - dVasat_dVg / Vasat;
@@ -1321,14 +1364,14 @@ pub(super) fn transport(
     dT0_dVd = dVa_dVd / Va - dVasat_dVd / Vasat;
     T1 = T0 / Cclm;
     T9 = 1.0 + T1;
-    dT9_dVg = (dT0_dVg - T1 * dCclm_dVg) / Cclm;
-    dT9_dVb = (dT0_dVb - T1 * dCclm_dVb) / Cclm;
-    dT9_dVd = (dT0_dVd - T1 * dCclm_dVd) / Cclm;
-    dIdsa_dVg = dIdsa_dVg * T9 + Idsa * dT9_dVg;
-    dIdsa_dVb = dIdsa_dVb * T9 + Idsa * dT9_dVb;
-    dIdsa_dVd = dIdsa_dVd * T9 + Idsa * dT9_dVd;
+    dT9_dVg = T1.mul_add(-dCclm_dVg, dT0_dVg) / Cclm;
+    dT9_dVb = T1.mul_add(-dCclm_dVb, dT0_dVb) / Cclm;
+    dT9_dVd = T1.mul_add(-dCclm_dVd, dT0_dVd) / Cclm;
+    dIdsa_dVg = Idsa.mul_add(dT9_dVg, dIdsa_dVg * T9);
+    dIdsa_dVb = Idsa.mul_add(dT9_dVb, dIdsa_dVb * T9);
+    dIdsa_dVd = Idsa.mul_add(dT9_dVd, dIdsa_dVd * T9);
     Idsa *= T9;
-    tmp = pParam.alpha0 + pParam.alpha1 * Leff;
+    tmp = pParam.alpha1.mul_add(Leff, pParam.alpha0);
     if (tmp <= 0.0) || (pParam.beta0 <= 0.0) {
         Gbg = 0.0;
         Gbb = Gbg;
@@ -1352,11 +1395,11 @@ pub(super) fn transport(
         }
         T4 = Idsa * Vdseff;
         Isub = T1 * T4;
-        Gbg = T1 * (dIdsa_dVg * Vdseff + Idsa * dVdseff_dVg) + T4 * dT1_dVg;
-        Gbd = T1 * (dIdsa_dVd * Vdseff + Idsa * dVdseff_dVd) + T4 * dT1_dVd;
-        Gbb = T1 * (dIdsa_dVb * Vdseff + Idsa * dVdseff_dVb) + T4 * dT1_dVb;
-        Gbd += Gbg * dVgsteff_dVd;
-        Gbb += Gbg * dVgsteff_dVb;
+        Gbg = T4.mul_add(dT1_dVg, T1 * Idsa.mul_add(dVdseff_dVg, dIdsa_dVg * Vdseff));
+        Gbd = T4.mul_add(dT1_dVd, T1 * Idsa.mul_add(dVdseff_dVd, dIdsa_dVd * Vdseff));
+        Gbb = T4.mul_add(dT1_dVb, T1 * Idsa.mul_add(dVdseff_dVb, dIdsa_dVb * Vdseff));
+        Gbd = Gbg.mul_add(dVgsteff_dVd, Gbd);
+        Gbb = Gbg.mul_add(dVgsteff_dVb, Gbb);
         Gbg *= dVgsteff_dVg;
         Gbb *= dVbseff_dVb;
     }
@@ -1367,24 +1410,33 @@ pub(super) fn transport(
     T9 = diffVds / VASCBE;
     T0 = 1.0 + T9;
     Ids = Idsa * T0;
-    Gm = T0 * dIdsa_dVg - Idsa * (dVdseff_dVg + T9 * dVASCBE_dVg) / VASCBE;
-    Gds = T0 * dIdsa_dVd + Idsa * (1.0 - dVdseff_dVd - T9 * dVASCBE_dVd) / VASCBE;
-    Gmb = T0 * dIdsa_dVb - Idsa * (dVdseff_dVb + T9 * dVASCBE_dVb) / VASCBE;
-    tmp1 = Gds + Gm * dVgsteff_dVd;
-    tmp2 = Gmb + Gm * dVgsteff_dVb;
+    Gm = T0.mul_add(
+        dIdsa_dVg,
+        -(Idsa * T9.mul_add(dVASCBE_dVg, dVdseff_dVg) / VASCBE),
+    );
+    Gds = T0.mul_add(
+        dIdsa_dVd,
+        Idsa * T9.mul_add(-dVASCBE_dVd, 1.0 - dVdseff_dVd) / VASCBE,
+    );
+    Gmb = T0.mul_add(
+        dIdsa_dVb,
+        -(Idsa * T9.mul_add(dVASCBE_dVb, dVdseff_dVb) / VASCBE),
+    );
+    tmp1 = Gm.mul_add(dVgsteff_dVd, Gds);
+    tmp2 = Gm.mul_add(dVgsteff_dVb, Gmb);
     tmp3 = Gm;
-    Gm = (Ids * dVdseff_dVg + Vdseff * tmp3) * dVgsteff_dVg;
-    Gds = Ids * (dVdseff_dVd + dVdseff_dVg * dVgsteff_dVd) + Vdseff * tmp1;
-    Gmb = (Ids * (dVdseff_dVb + dVdseff_dVg * dVgsteff_dVb) + Vdseff * tmp2) * dVbseff_dVb;
+    Gm = Vdseff.mul_add(tmp3, Ids * dVdseff_dVg) * dVgsteff_dVg;
+    Gds = Vdseff.mul_add(tmp1, Ids * dVdseff_dVg.mul_add(dVgsteff_dVd, dVdseff_dVd));
+    Gmb = Vdseff.mul_add(tmp2, Ids * dVdseff_dVg.mul_add(dVgsteff_dVb, dVdseff_dVb)) * dVbseff_dVb;
     cdrain = Ids * Vdseff;
     if (model.vtlGiven) && (model.vtl > 0.0) {
         T12 = 1.0 / Leff / CoxeffWovL;
         T11 = T12 / Vgsteff;
         T10 = -T11 / Vgsteff;
         vs = cdrain * T11;
-        dvs_dVg = Gm * T11 + cdrain * T10 * dVgsteff_dVg;
-        dvs_dVd = Gds * T11 + cdrain * T10 * dVgsteff_dVd;
-        dvs_dVb = Gmb * T11 + cdrain * T10 * dVgsteff_dVb;
+        dvs_dVg = (cdrain * T10).mul_add(dVgsteff_dVg, Gm * T11);
+        dvs_dVd = (cdrain * T10).mul_add(dVgsteff_dVd, Gds * T11);
+        dvs_dVb = (cdrain * T10).mul_add(dVgsteff_dVb, Gmb * T11);
         T0 = f64::from(2 * MM);
         T1 = vs / (pParam.vtl * pParam.tfactor);
         if T1 > 0.0 {
@@ -1405,11 +1457,11 @@ pub(super) fn transport(
             dFsevl_dVb = 0.0;
         }
         Gm *= Fsevl;
-        Gm += cdrain * dFsevl_dVg;
+        Gm = cdrain.mul_add(dFsevl_dVg, Gm);
         Gmb *= Fsevl;
-        Gmb += cdrain * dFsevl_dVb;
+        Gmb = cdrain.mul_add(dFsevl_dVb, Gmb);
         Gds *= Fsevl;
-        Gds += cdrain * dFsevl_dVd;
+        Gds = cdrain.mul_add(dFsevl_dVd, Gds);
         cdrain *= Fsevl;
     }
     here.gds = Gds;
@@ -1422,8 +1474,8 @@ pub(super) fn transport(
     if (here.rgateMod > 1) || (here.trnqsMod != 0) || (here.acnqsMod != 0) {
         T9 = pParam.xrcrg2 * model.vtm;
         T0 = T9 * beta;
-        dT0_dVd = (dbeta_dVd + dbeta_dVg * dVgsteff_dVd) * T9;
-        dT0_dVb = (dbeta_dVb + dbeta_dVg * dVgsteff_dVb) * T9;
+        dT0_dVd = dbeta_dVg.mul_add(dVgsteff_dVd, dbeta_dVd) * T9;
+        dT0_dVb = dbeta_dVg.mul_add(dVgsteff_dVb, dbeta_dVb) * T9;
         dT0_dVg = dbeta_dVg * T9;
         here.gcrg = pParam.xrcrg1 * (T0 + Ids);
         here.gcrgd = pParam.xrcrg1 * (dT0_dVd + tmp1);
@@ -1448,23 +1500,23 @@ pub(super) fn transport(
     }
     if model.rdsMod != 0 {
         T0 = vgs - pParam.vfbsd;
-        T1 = sqrt(T0 * T0 + 1.0e-4);
-        vgs_eff = 0.5 * (T0 + T1);
+        T1 = sqrt(T0.mul_add(T0, 1.0e-4));
+        vgs_eff = f64::midpoint(T0, T1);
         dvgs_eff_dvg = vgs_eff / T1;
-        T0 = 1.0 + pParam.prwg * vgs_eff;
+        T0 = pParam.prwg.mul_add(vgs_eff, 1.0);
         dT0_dvg = -pParam.prwg / T0 / T0 * dvgs_eff_dvg;
         T1 = -pParam.prwb * vbs;
         dT1_dvb = -pParam.prwb;
         T2 = 1.0 / T0 + T1;
-        T3 = T2 + sqrt(T2 * T2 + 0.01);
+        T3 = T2 + sqrt(T2.mul_add(T2, 0.01));
         dT3_dvg = T3 / (T3 - T2);
         dT3_dvb = dT3_dvg * dT1_dvb;
         dT3_dvg *= dT0_dvg;
         T4 = pParam.rs0 * 0.5;
-        Rs = pParam.rswmin + T3 * T4;
+        Rs = T3.mul_add(T4, pParam.rswmin);
         dRs_dvg = T4 * dT3_dvg;
         dRs_dvb = T4 * dT3_dvb;
-        T0 = 1.0 + here.sourceConductance * Rs;
+        T0 = here.sourceConductance.mul_add(Rs, 1.0);
         here.gstot = here.sourceConductance / T0;
         T0 = -here.gstot * here.gstot;
         dgstot_dvd = 0.0;
@@ -1472,23 +1524,23 @@ pub(super) fn transport(
         dgstot_dvb = T0 * dRs_dvb;
         dgstot_dvs = -(dgstot_dvg + dgstot_dvb + dgstot_dvd);
         T0 = vgd - pParam.vfbsd;
-        T1 = sqrt(T0 * T0 + 1.0e-4);
-        vgd_eff = 0.5 * (T0 + T1);
+        T1 = sqrt(T0.mul_add(T0, 1.0e-4));
+        vgd_eff = f64::midpoint(T0, T1);
         dvgd_eff_dvg = vgd_eff / T1;
-        T0 = 1.0 + pParam.prwg * vgd_eff;
+        T0 = pParam.prwg.mul_add(vgd_eff, 1.0);
         dT0_dvg = -pParam.prwg / T0 / T0 * dvgd_eff_dvg;
         T1 = -pParam.prwb * vbd;
         dT1_dvb = -pParam.prwb;
         T2 = 1.0 / T0 + T1;
-        T3 = T2 + sqrt(T2 * T2 + 0.01);
+        T3 = T2 + sqrt(T2.mul_add(T2, 0.01));
         dT3_dvg = T3 / (T3 - T2);
         dT3_dvb = dT3_dvg * dT1_dvb;
         dT3_dvg *= dT0_dvg;
         T4 = pParam.rd0 * 0.5;
-        Rd = pParam.rdwmin + T3 * T4;
+        Rd = T3.mul_add(T4, pParam.rdwmin);
         dRd_dvg = T4 * dT3_dvg;
         dRd_dvb = T4 * dT3_dvb;
-        T0 = 1.0 + here.drainConductance * Rd;
+        T0 = here.drainConductance.mul_add(Rd, 1.0);
         here.gdtot = here.drainConductance / T0;
         T0 = -here.gdtot * here.gdtot;
         dgdtot_dvs = 0.0;

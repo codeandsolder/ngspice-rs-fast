@@ -2,11 +2,11 @@
 //!
 //! Every expected value is C's: printed by the `-ffp-contract=off` build of
 //! the reference ngspice (`docs/port/VERIFICATION.md`) from the same deck
-//! with `.options sparse`. On macOS arm64, where that oracle was built, the
-//! port reproduces them bit for bit. Elsewhere `exp`/`log`/`pow` round
-//! differently in the last place, and `.sens` divides differences of loads
-//! by perturbations of about 1e-6 relative, which amplifies that rounding
-//! about a millionfold, so the comparison there is 1e-4 relative.
+//! with `.options sparse`. Fused and rationalized compact-model arithmetic
+//! and platform math functions may differ in the last place. Since `.sens`
+//! divides load differences by perturbations of about 1e-6 relative, it
+//! amplifies small numerical differences about a millionfold. The existing
+//! portable 1e-4 relative bound applies on all platforms.
 //! C's NaN columns (a perturbation that makes `b4temp.c` reject the
 //! geometry, and the AC frequencies after TNOM's per-frequency drift
 //! overflows) are NaN here too. See `docs/port/SENSITIVITY.md`.
@@ -16,9 +16,6 @@ use ngspice_rs::analysis::{Plot, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::SpiceResult;
-
-/// Exact on the oracle's platform.
-const EXACT: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
 
 /// The PTM-like card: gate resistance, body network, gate tunnelling.
 const CARD: &str =
@@ -50,12 +47,6 @@ fn run(text: &str) -> SpiceResult<Plot> {
 fn same(actual: f64, expected: f64, label: &str) {
     if expected.is_nan() {
         assert!(actual.is_nan(), "{label}: Rust {actual:e}, C NaN");
-    } else if EXACT {
-        assert_eq!(
-            actual.to_bits() & !(1 << 63),
-            expected.to_bits() & !(1 << 63),
-            "{label}: Rust {actual:e}, C {expected:e}"
-        );
     } else {
         assert!(
             (actual - expected).abs() <= 1e-4 * expected.abs() + 1e-30,

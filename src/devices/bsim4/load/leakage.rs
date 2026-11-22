@@ -7,11 +7,6 @@
     clippy::similar_names,
     reason = "C equation names preserve the reference distinctions"
 )]
-#![expect(clippy::manual_midpoint, reason = "retain C midpoint rounding order")]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "preserve non-fused C floating-point arithmetic"
-)]
 #![expect(
     unused_assignments,
     reason = "reference intermediate assignments remain in their equation sequence"
@@ -39,7 +34,7 @@
 )]
 use super::{
     DELTA_3, DELTA_4, EXP_THRESHOLD, EXPL_THRESHOLD, Instance, MAX_EXP, MAX_EXPL, MIN_EXP,
-    MIN_EXPL, Model, SizeParam, exp, log, sqrt,
+    MIN_EXPL, Model, SizeParam, exp, log, smooth_vds, sqrt,
 };
 use super::{
     bias::LoadBias,
@@ -238,7 +233,7 @@ pub(super) fn evaluate(
             T6 = pParam.cgidl + T5;
             T7 = T5 / T6;
             T8 = 3.0 * pParam.cgidl * T4 / T6 / T6;
-            Ggidld = Ggidld * T7 + Igidl * T8;
+            Ggidld = Igidl.mul_add(T8, Ggidld * T7);
             Ggidlg = Ggidlg * T7;
             Ggidlb = -Igidl * T8;
             Igidl *= T7;
@@ -282,7 +277,7 @@ pub(super) fn evaluate(
             T6 = pParam.cgisl + T5;
             T7 = T5 / T6;
             T8 = 3.0 * pParam.cgisl * T4 / T6 / T6;
-            Ggisls = Ggisls * T7 + Igisl * T8;
+            Ggisls = Igisl.mul_add(T8, Ggisls * T7);
             Ggislg = Ggislg * T7;
             Ggislb = -Igisl * T8;
             Igisl *= T7;
@@ -293,9 +288,9 @@ pub(super) fn evaluate(
         here.ggislb = Ggislb;
     } else {
         if model.mtrlMod == 0 {
-            T1 = (-vds - pParam.rgisl * vgd_eff - pParam.egisl) / T0;
+            T1 = (pParam.rgisl.mul_add(-vgd_eff, -vds) - pParam.egisl) / T0;
         } else {
-            T1 = (-vds - pParam.rgisl * vgd_eff - pParam.egisl + pParam.vfbsd) / T0;
+            T1 = (pParam.rgisl.mul_add(-vgd_eff, -vds) - pParam.egisl + pParam.vfbsd) / T0;
         }
         if (pParam.agisl <= 0.0) || (pParam.bgisl <= 0.0) || (T1 <= 0.0) || (pParam.cgisl < 0.0) {
             Ggislb = 0.0;
@@ -340,9 +335,9 @@ pub(super) fn evaluate(
         here.ggislg = Ggislg;
         here.ggislb = Ggislb;
         if model.mtrlMod == 0 {
-            T1 = (vds - pParam.rgidl * vgs_eff - pParam.egidl) / T0;
+            T1 = (pParam.rgidl.mul_add(-vgs_eff, vds) - pParam.egidl) / T0;
         } else {
-            T1 = (vds - pParam.rgidl * vgs_eff - pParam.egidl + pParam.vfbsd) / T0;
+            T1 = (pParam.rgidl.mul_add(-vgs_eff, vds) - pParam.egidl + pParam.vfbsd) / T0;
         }
         if (pParam.agidl <= 0.0) || (pParam.bgidl <= 0.0) || (T1 <= 0.0) || (pParam.cgidl < 0.0) {
             Ggidlb = 0.0;
@@ -391,12 +386,12 @@ pub(super) fn evaluate(
         Vfb = here.vfbzb;
         V3 = Vfb - Vgs_eff + Vbseff - DELTA_3;
         if Vfb <= 0.0 {
-            T0 = sqrt(V3 * V3 - 4.0 * DELTA_3 * Vfb);
+            T0 = sqrt((4.0 * DELTA_3).mul_add(-Vfb, V3 * V3));
         } else {
-            T0 = sqrt(V3 * V3 + 4.0 * DELTA_3 * Vfb);
+            T0 = sqrt((4.0 * DELTA_3).mul_add(Vfb, V3 * V3));
         }
-        T1 = 0.5 * (1.0 + V3 / T0);
-        Vfbeff = Vfb - 0.5 * (V3 + T0);
+        T1 = f64::midpoint(1.0, V3 / T0);
+        Vfbeff = Vfb - V3.midpoint(T0);
         dVfbeff_dVg = T1 * dVgs_eff_dVg;
         dVfbeff_dVb = -T1;
         Voxacc = Vfb - Vfbeff;
@@ -420,7 +415,7 @@ pub(super) fn evaluate(
             dVoxdepinv_dVd = dVgsteff_dVd;
             dVoxdepinv_dVb = dVfbeff_dVb + 1.0 + dVgsteff_dVb;
         } else {
-            T1 = sqrt(T0 * T0 + T3);
+            T1 = sqrt(T0.mul_add(T0, T3));
             T2 = T0 / T1;
             Voxdepinv = pParam.k1ox * (T1 - T0);
             dVoxdepinv_dVg = T2 * (dVgs_eff_dVg - dVfbeff_dVg - dVgsteff_dVg);
@@ -440,9 +435,9 @@ pub(super) fn evaluate(
     if model.igcMod != 0 {
         T0 = tmp * pParam.nigc;
         if model.igcMod == 1 {
-            VxNVt = (Vgs_eff - f64::from(model.r#type) * here.vth0) / T0;
+            VxNVt = f64::mul_add(f64::from(model.r#type), -here.vth0, Vgs_eff) / T0;
             if VxNVt > EXP_THRESHOLD {
-                Vaux = Vgs_eff - f64::from(model.r#type) * here.vth0;
+                Vaux = f64::mul_add(f64::from(model.r#type), -here.vth0, Vgs_eff);
                 dVaux_dVg = dVgs_eff_dVg;
                 dVaux_dVd = 0.0;
                 dVaux_dVb = 0.0;
@@ -475,14 +470,14 @@ pub(super) fn evaluate(
             dVaux_dVg *= dVgs_eff_dVg;
         }
         T2 = Vgs * Vaux;
-        dT2_dVg = Vaux + Vgs * dVaux_dVg;
+        dT2_dVg = f64::mul_add(Vgs, dVaux_dVg, Vaux);
         dT2_dVd = Vgs * dVaux_dVd;
         dT2_dVb = Vgs * dVaux_dVb;
         T11 = pParam.Aechvb;
         T12 = pParam.Bechvb;
-        T3 = pParam.aigc * pParam.cigc - pParam.bigc;
+        T3 = pParam.aigc.mul_add(pParam.cigc, -pParam.bigc);
         T4 = pParam.bigc * pParam.cigc;
-        T5 = T12 * (pParam.aigc + T3 * Voxdepinv - T4 * Voxdepinv * Voxdepinv);
+        T5 = T12 * (T4 * Voxdepinv).mul_add(-Voxdepinv, T3.mul_add(Voxdepinv, pParam.aigc));
         if T5 > EXP_THRESHOLD {
             T6 = MAX_EXP;
             dT6_dVb = 0.0;
@@ -495,15 +490,15 @@ pub(super) fn evaluate(
             dT6_dVg = dT6_dVd;
         } else {
             T6 = exp(T5);
-            dT6_dVg = T6 * T12 * (T3 - 2.0 * T4 * Voxdepinv);
+            dT6_dVg = T6 * T12 * (2.0 * T4).mul_add(-Voxdepinv, T3);
             dT6_dVd = dT6_dVg * dVoxdepinv_dVd;
             dT6_dVb = dT6_dVg * dVoxdepinv_dVb;
             dT6_dVg *= dVoxdepinv_dVg;
         }
         Igc = T11 * T2 * T6;
-        dIgc_dVg = T11 * (T2 * dT6_dVg + T6 * dT2_dVg);
-        dIgc_dVd = T11 * (T2 * dT6_dVd + T6 * dT2_dVd);
-        dIgc_dVb = T11 * (T2 * dT6_dVb + T6 * dT2_dVb);
+        dIgc_dVg = T11 * T6.mul_add(dT2_dVg, T2 * dT6_dVg);
+        dIgc_dVd = T11 * T6.mul_add(dT2_dVd, T2 * dT6_dVd);
+        dIgc_dVb = T11 * T6.mul_add(dT2_dVb, T2 * dT6_dVb);
         if model.pigcdGiven {
             Pigcd = pParam.pigcd;
             dPigcd_dVb = 0.0;
@@ -515,16 +510,22 @@ pub(super) fn evaluate(
             T13 = T11 / T12 / T12;
             T14 = -T13 / T12;
             Pigcd = T13 * (1.0 - 0.5 * Vdseff / T12);
-            dPigcd_dVg = T14 * (2.0 + 0.5 * (dVdseff_dVg - 3.0 * Vdseff / T12));
+            dPigcd_dVg = T14 * 0.5f64.mul_add(dVdseff_dVg - 3.0 * Vdseff / T12, 2.0);
             dPigcd_dVd = 0.5 * T14 * dVdseff_dVd;
             dPigcd_dVb = 0.5 * T14 * dVdseff_dVb;
         }
         T7 = -Pigcd * Vdseff;
-        dT7_dVg = -Vdseff * dPigcd_dVg - Pigcd * dVdseff_dVg;
-        dT7_dVd = -Vdseff * dPigcd_dVd - Pigcd * dVdseff_dVd + dT7_dVg * dVgsteff_dVd;
-        dT7_dVb = -Vdseff * dPigcd_dVb - Pigcd * dVdseff_dVb + dT7_dVg * dVgsteff_dVb;
+        dT7_dVg = Pigcd.mul_add(-dVdseff_dVg, -Vdseff * dPigcd_dVg);
+        dT7_dVd = dT7_dVg.mul_add(
+            dVgsteff_dVd,
+            Pigcd.mul_add(-dVdseff_dVd, -Vdseff * dPigcd_dVd),
+        );
+        dT7_dVb = dT7_dVg.mul_add(
+            dVgsteff_dVb,
+            Pigcd.mul_add(-dVdseff_dVb, -Vdseff * dPigcd_dVb),
+        );
         dT7_dVg *= dVgsteff_dVg;
-        T8 = T7 * T7 + 2.0e-4;
+        T8 = T7.mul_add(T7, 2.0e-4);
         dT8_dVg = 2.0 * T7;
         dT8_dVd = dT8_dVg * dT7_dVd;
         dT8_dVb = dT8_dVg * dT7_dVb;
@@ -548,22 +549,22 @@ pub(super) fn evaluate(
         T0 = T8 * T8;
         T1 = T9 - 1.0 + 1.0e-4;
         T10 = (T1 - T7) / T8;
-        dT10_dVg = (dT9_dVg - dT7_dVg - T10 * dT8_dVg) / T8;
-        dT10_dVd = (dT9_dVd - dT7_dVd - T10 * dT8_dVd) / T8;
-        dT10_dVb = (dT9_dVb - dT7_dVb - T10 * dT8_dVb) / T8;
+        dT10_dVg = T10.mul_add(-dT8_dVg, dT9_dVg - dT7_dVg) / T8;
+        dT10_dVd = T10.mul_add(-dT8_dVd, dT9_dVd - dT7_dVd) / T8;
+        dT10_dVb = T10.mul_add(-dT8_dVb, dT9_dVb - dT7_dVb) / T8;
         Igcs = Igc * T10;
-        dIgcs_dVg = dIgc_dVg * T10 + Igc * dT10_dVg;
-        dIgcs_dVd = dIgc_dVd * T10 + Igc * dT10_dVd;
-        dIgcs_dVb = dIgc_dVb * T10 + Igc * dT10_dVb;
+        dIgcs_dVg = Igc.mul_add(dT10_dVg, dIgc_dVg * T10);
+        dIgcs_dVd = Igc.mul_add(dT10_dVd, dIgc_dVd * T10);
+        dIgcs_dVb = Igc.mul_add(dT10_dVb, dIgc_dVb * T10);
         T1 = T9 - 1.0 - 1.0e-4;
-        T10 = (T7 * T9 - T1) / T8;
-        dT10_dVg = (dT7_dVg * T9 + (T7 - 1.0) * dT9_dVg - T10 * dT8_dVg) / T8;
-        dT10_dVd = (dT7_dVd * T9 + (T7 - 1.0) * dT9_dVd - T10 * dT8_dVd) / T8;
-        dT10_dVb = (dT7_dVb * T9 + (T7 - 1.0) * dT9_dVb - T10 * dT8_dVb) / T8;
+        T10 = T7.mul_add(T9, -T1) / T8;
+        dT10_dVg = T10.mul_add(-dT8_dVg, (T7 - 1.0).mul_add(dT9_dVg, dT7_dVg * T9)) / T8;
+        dT10_dVd = T10.mul_add(-dT8_dVd, (T7 - 1.0).mul_add(dT9_dVd, dT7_dVd * T9)) / T8;
+        dT10_dVb = T10.mul_add(-dT8_dVb, (T7 - 1.0).mul_add(dT9_dVb, dT7_dVb * T9)) / T8;
         Igcd = Igc * T10;
-        dIgcd_dVg = dIgc_dVg * T10 + Igc * dT10_dVg;
-        dIgcd_dVd = dIgc_dVd * T10 + Igc * dT10_dVd;
-        dIgcd_dVb = dIgc_dVb * T10 + Igc * dT10_dVb;
+        dIgcd_dVg = Igc.mul_add(dT10_dVg, dIgc_dVg * T10);
+        dIgcd_dVd = Igc.mul_add(dT10_dVd, dIgc_dVd * T10);
+        dIgcd_dVb = Igc.mul_add(dT10_dVb, dIgc_dVb * T10);
         here.Igcs = Igcs;
         here.gIgcsg = dIgcs_dVg;
         here.gIgcsd = dIgcs_dVd;
@@ -573,15 +574,15 @@ pub(super) fn evaluate(
         here.gIgcdd = dIgcd_dVd;
         here.gIgcdb = dIgcd_dVb * dVbseff_dVb;
         T0 = vgs - (pParam.vfbsd + pParam.vfbsdoff);
-        vgs_eff = sqrt(T0 * T0 + 1.0e-4);
+        vgs_eff = sqrt(T0.mul_add(T0, 1.0e-4));
         dvgs_eff_dvg = T0 / vgs_eff;
         T2 = vgs * vgs_eff;
-        dT2_dVg = vgs * dvgs_eff_dvg + vgs_eff;
+        dT2_dVg = f64::mul_add(vgs, dvgs_eff_dvg, vgs_eff);
         T11 = pParam.AechvbEdgeS;
         T12 = pParam.BechvbEdge;
-        T3 = pParam.aigs * pParam.cigs - pParam.bigs;
+        T3 = pParam.aigs.mul_add(pParam.cigs, -pParam.bigs);
         T4 = pParam.bigs * pParam.cigs;
-        T5 = T12 * (pParam.aigs + T3 * vgs_eff - T4 * vgs_eff * vgs_eff);
+        T5 = T12 * (T4 * vgs_eff).mul_add(-vgs_eff, T3.mul_add(vgs_eff, pParam.aigs));
         if T5 > EXP_THRESHOLD {
             T6 = MAX_EXP;
             dT6_dVg = 0.0;
@@ -590,20 +591,20 @@ pub(super) fn evaluate(
             dT6_dVg = 0.0;
         } else {
             T6 = exp(T5);
-            dT6_dVg = T6 * T12 * (T3 - 2.0 * T4 * vgs_eff) * dvgs_eff_dvg;
+            dT6_dVg = T6 * T12 * (2.0 * T4).mul_add(-vgs_eff, T3) * dvgs_eff_dvg;
         }
         Igs = T11 * T2 * T6;
-        dIgs_dVg = T11 * (T2 * dT6_dVg + T6 * dT2_dVg);
+        dIgs_dVg = T11 * T6.mul_add(dT2_dVg, T2 * dT6_dVg);
         dIgs_dVs = -dIgs_dVg;
         T0 = vgd - (pParam.vfbsd + pParam.vfbsdoff);
-        vgd_eff = sqrt(T0 * T0 + 1.0e-4);
+        vgd_eff = sqrt(T0.mul_add(T0, 1.0e-4));
         dvgd_eff_dvg = T0 / vgd_eff;
         T2 = vgd * vgd_eff;
-        dT2_dVg = vgd * dvgd_eff_dvg + vgd_eff;
+        dT2_dVg = f64::mul_add(vgd, dvgd_eff_dvg, vgd_eff);
         T11 = pParam.AechvbEdgeD;
-        T3 = pParam.aigd * pParam.cigd - pParam.bigd;
+        T3 = pParam.aigd.mul_add(pParam.cigd, -pParam.bigd);
         T4 = pParam.bigd * pParam.cigd;
-        T5 = T12 * (pParam.aigd + T3 * vgd_eff - T4 * vgd_eff * vgd_eff);
+        T5 = T12 * (T4 * vgd_eff).mul_add(-vgd_eff, T3.mul_add(vgd_eff, pParam.aigd));
         if T5 > EXP_THRESHOLD {
             T6 = MAX_EXP;
             dT6_dVg = 0.0;
@@ -612,10 +613,10 @@ pub(super) fn evaluate(
             dT6_dVg = 0.0;
         } else {
             T6 = exp(T5);
-            dT6_dVg = T6 * T12 * (T3 - 2.0 * T4 * vgd_eff) * dvgd_eff_dvg;
+            dT6_dVg = T6 * T12 * (2.0 * T4).mul_add(-vgd_eff, T3) * dvgd_eff_dvg;
         }
         Igd = T11 * T2 * T6;
-        dIgd_dVg = T11 * (T2 * dT6_dVg + T6 * dT2_dVg);
+        dIgd_dVg = T11 * T6.mul_add(dT2_dVg, T2 * dT6_dVg);
         dIgd_dVd = -dIgd_dVg;
         here.Igs = Igs;
         here.gIgsg = dIgs_dVg;
@@ -658,13 +659,13 @@ pub(super) fn evaluate(
             dVaux_dVg = -dVaux_dVb * dVgs_eff_dVg;
         }
         T2 = (Vgs - Vbs) * Vaux;
-        dT2_dVg = Vaux + (Vgs - Vbs) * dVaux_dVg;
-        dT2_dVb = -Vaux + (Vgs - Vbs) * dVaux_dVb;
+        dT2_dVg = f64::mul_add(Vgs - Vbs, dVaux_dVg, Vaux);
+        dT2_dVb = f64::mul_add(Vgs - Vbs, dVaux_dVb, -Vaux);
         T11 = 4.97232e-7 * pParam.weff * pParam.leff * pParam.ToxRatio;
         T12 = -7.45669e11 * toxe;
-        T3 = pParam.aigbacc * pParam.cigbacc - pParam.bigbacc;
+        T3 = pParam.aigbacc.mul_add(pParam.cigbacc, -pParam.bigbacc);
         T4 = pParam.bigbacc * pParam.cigbacc;
-        T5 = T12 * (pParam.aigbacc + T3 * Voxacc - T4 * Voxacc * Voxacc);
+        T5 = T12 * (T4 * Voxacc).mul_add(-Voxacc, T3.mul_add(Voxacc, pParam.aigbacc));
         if T5 > EXP_THRESHOLD {
             T6 = MAX_EXP;
             dT6_dVb = 0.0;
@@ -675,13 +676,13 @@ pub(super) fn evaluate(
             dT6_dVg = dT6_dVb;
         } else {
             T6 = exp(T5);
-            dT6_dVg = T6 * T12 * (T3 - 2.0 * T4 * Voxacc);
+            dT6_dVg = T6 * T12 * (2.0 * T4).mul_add(-Voxacc, T3);
             dT6_dVb = dT6_dVg * dVoxacc_dVb;
             dT6_dVg *= dVoxacc_dVg;
         }
         Igbacc = T11 * T2 * T6;
-        dIgbacc_dVg = T11 * (T2 * dT6_dVg + T6 * dT2_dVg);
-        dIgbacc_dVb = T11 * (T2 * dT6_dVb + T6 * dT2_dVb);
+        dIgbacc_dVg = T11 * T6.mul_add(dT2_dVg, T2 * dT6_dVg);
+        dIgbacc_dVb = T11 * T6.mul_add(dT2_dVb, T2 * dT6_dVb);
         T0 = tmp * pParam.nigbinv;
         T1 = Voxdepinv - pParam.eigbinv;
         VxNVt = T1 / T0;
@@ -704,14 +705,14 @@ pub(super) fn evaluate(
             dVaux_dVg *= dVoxdepinv_dVg;
         }
         T2 = (Vgs - Vbs) * Vaux;
-        dT2_dVg = Vaux + (Vgs - Vbs) * dVaux_dVg;
+        dT2_dVg = f64::mul_add(Vgs - Vbs, dVaux_dVg, Vaux);
         dT2_dVd = (Vgs - Vbs) * dVaux_dVd;
-        dT2_dVb = -Vaux + (Vgs - Vbs) * dVaux_dVb;
+        dT2_dVb = f64::mul_add(Vgs - Vbs, dVaux_dVb, -Vaux);
         T11 *= 0.75610;
         T12 *= 1.31724;
-        T3 = pParam.aigbinv * pParam.cigbinv - pParam.bigbinv;
+        T3 = pParam.aigbinv.mul_add(pParam.cigbinv, -pParam.bigbinv);
         T4 = pParam.bigbinv * pParam.cigbinv;
-        T5 = T12 * (pParam.aigbinv + T3 * Voxdepinv - T4 * Voxdepinv * Voxdepinv);
+        T5 = T12 * (T4 * Voxdepinv).mul_add(-Voxdepinv, T3.mul_add(Voxdepinv, pParam.aigbinv));
         if T5 > EXP_THRESHOLD {
             T6 = MAX_EXP;
             dT6_dVb = 0.0;
@@ -724,15 +725,15 @@ pub(super) fn evaluate(
             dT6_dVg = dT6_dVd;
         } else {
             T6 = exp(T5);
-            dT6_dVg = T6 * T12 * (T3 - 2.0 * T4 * Voxdepinv);
+            dT6_dVg = T6 * T12 * (2.0 * T4).mul_add(-Voxdepinv, T3);
             dT6_dVd = dT6_dVg * dVoxdepinv_dVd;
             dT6_dVb = dT6_dVg * dVoxdepinv_dVb;
             dT6_dVg *= dVoxdepinv_dVg;
         }
         Igbinv = T11 * T2 * T6;
-        dIgbinv_dVg = T11 * (T2 * dT6_dVg + T6 * dT2_dVg);
-        dIgbinv_dVd = T11 * (T2 * dT6_dVd + T6 * dT2_dVd);
-        dIgbinv_dVb = T11 * (T2 * dT6_dVb + T6 * dT2_dVb);
+        dIgbinv_dVg = T11 * T6.mul_add(dT2_dVg, T2 * dT6_dVg);
+        dIgbinv_dVd = T11 * T6.mul_add(dT2_dVd, T2 * dT6_dVd);
+        dIgbinv_dVb = T11 * T6.mul_add(dT2_dVb, T2 * dT6_dVb);
         here.Igb = Igbinv + Igbacc;
         here.gIgbg = dIgbinv_dVg + dIgbacc_dVg;
         here.gIgbd = dIgbinv_dVd;
@@ -790,28 +791,18 @@ pub(super) fn evaluate(
     if model.tnoiMod == 0 {
         Abulk = Abulk0_Q * pParam.abulkCVfactor;
         Vdsat = Vgsteff / Abulk;
-        T0 = Vdsat - Vds - DELTA_4;
-        T1 = sqrt(T0 * T0 + 4.0 * DELTA_4 * Vdsat);
-        if T0 >= 0.0 {
-            Vdseff = Vdsat - 0.5 * (T0 + T1);
-        } else {
-            let twice_delta = DELTA_4 + DELTA_4;
-            T3 = twice_delta / (T1 - T0);
-            T4 = 1.0 - T3;
-            T5 = Vdsat * T3 / (T1 - T0);
-            Vdseff = Vdsat * T4;
-        }
-        if Vds == 0.0 {
-            Vdseff = 0.0;
-        }
+        Vdseff = smooth_vds(Vdsat, Vds, DELTA_4).0;
         T0 = Abulk * Vdseff;
-        T1 = 12.0 * (Vgsteff - 0.5 * T0 + 1.0e-20);
+        T1 = 12.0 * (0.5f64.mul_add(-T0, Vgsteff) + 1.0e-20);
         T2 = Vdseff / T1;
         T3 = T0 * T2;
-        here.qinv =
-            Coxeff * pParam.weffCV * here.nf * pParam.leffCV * (Vgsteff - 0.5 * T0 + Abulk * T3);
+        here.qinv = Coxeff
+            * pParam.weffCV
+            * here.nf
+            * pParam.leffCV
+            * Abulk.mul_add(T3, 0.5f64.mul_add(-T0, Vgsteff));
     } else if model.tnoiMod == 2 {
-        here.noiGd0 = here.nf * beta * Vgsteff / (1.0 + gche * Rds);
+        here.noiGd0 = here.nf * beta * Vgsteff / f64::mul_add(gche, Rds, 1.0);
     }
     cdrain
 }

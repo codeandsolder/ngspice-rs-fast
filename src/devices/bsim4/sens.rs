@@ -36,12 +36,6 @@
 //!   writes, hold what an earlier analysis's `MODEINITSMSIG` load left (zero
 //!   when none ran). Each parameter's AC load reads those, the reset's
 //!   `CKTstate0`, and the setup/temperature members of the present records.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
 #![expect(
     non_snake_case,
     reason = "preserves upstream C identifiers for equation-by-equation comparison"
@@ -549,23 +543,23 @@ fn rejected_size(m: &Model, h: &Instance) -> SizeParam {
     let tmp2 = m.Wlc / T2 + m.Wwc / T3 + m.Wwlc / (T2 * T3);
     p.dwc = m.dwc + tmp2;
     p.dwj = m.dwj + tmp2;
-    p.leff = Lnew - 2.0 * p.dl;
+    p.leff = 2.0f64.mul_add(-p.dl, Lnew);
     if p.leff <= 0.0 {
         return p;
     }
-    p.weff = Wnew - 2.0 * p.dw;
+    p.weff = 2.0f64.mul_add(-p.dw, Wnew);
     if p.weff <= 0.0 {
         return p;
     }
-    p.leffCV = Lnew - 2.0 * p.dlc;
+    p.leffCV = 2.0f64.mul_add(-p.dlc, Lnew);
     if p.leffCV <= 0.0 {
         return p;
     }
-    p.weffCV = Wnew - 2.0 * p.dwc;
+    p.weffCV = 2.0f64.mul_add(-p.dwc, Wnew);
     if p.weffCV <= 0.0 {
         return p;
     }
-    p.weffCJ = Wnew - 2.0 * p.dwj;
+    p.weffCJ = 2.0f64.mul_add(-p.dwj, Wnew);
     p
 }
 

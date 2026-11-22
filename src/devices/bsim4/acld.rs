@@ -1,7 +1,5 @@
 //! `b4acld.c` (`BSIM4acLoad`): the small-signal AC load, followed statement
 //! by statement over C's struct members.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -9,10 +7,6 @@
 #![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 #![expect(
     non_snake_case,
@@ -199,7 +193,7 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         }
         if h.rgateMod > 1 {
             gcrgd = h.gcrgd * T0;
-            gcrgg = h.gcrgg * T0 - h.gcrg;
+            gcrgg = h.gcrgg.mul_add(T0, -h.gcrg);
             gcrgs = h.gcrgs * T0;
             gcrgb = h.gcrgb * T0;
             gcrg = h.gcrg;
@@ -251,7 +245,7 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
             xcdbdb = 0.0;
         } else {
             xcdbbr = Cdbr * omega;
-            xcsbbr = -(xcsgbr + xcsdbr + xcssbr + xcsgmb) + h.capbs * omega;
+            xcsbbr = h.capbs.mul_add(omega, -(xcsgbr + xcsdbr + xcssbr + xcsgmb));
 
             xcbdb = h.cbdb * omega;
             xcbsb = h.cbsb * omega;
@@ -337,7 +331,7 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         if h.rgateMod > 1 {
             // C swaps the drain and source derivatives in reverse mode.
             gcrgd = h.gcrgs * T0;
-            gcrgg = h.gcrgg * T0 - h.gcrg;
+            gcrgg = h.gcrgg.mul_add(T0, -h.gcrg);
             gcrgs = h.gcrgd * T0;
             gcrgb = h.gcrgb * T0;
             gcrg = h.gcrg;
@@ -388,7 +382,7 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
             xcbsb = (h.cbdb - h.capbs) * omega;
             xcdbdb = 0.0;
         } else {
-            xcdbbr = -(xcdgbr + xcddbr + xcdsbr + xcdgmb) + h.capbd * omega;
+            xcdbbr = h.capbd.mul_add(omega, -(xcdgbr + xcddbr + xcdsbr + xcdgmb));
             xcsbbr = Cdbr * omega;
 
             xcbdb = h.cbsb * omega;
@@ -467,13 +461,13 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         ckt.real(ge, gp, -(mult_i * geltd));
 
         ckt.imag(gp, gp, mult_q * xcggbr);
-        ckt.real(gp, gp, mult_i * (geltd + gIgtotg) + mult_q * xcggbi);
+        ckt.real(gp, gp, mult_q.mul_add(xcggbi, mult_i * (geltd + gIgtotg)));
         ckt.imag(gp, dp, mult_q * xcgdbr);
-        ckt.real(gp, dp, mult_q * xcgdbi + mult_i * gIgtotd);
+        ckt.real(gp, dp, mult_i.mul_add(gIgtotd, mult_q * xcgdbi));
         ckt.imag(gp, sp, mult_q * xcgsbr);
-        ckt.real(gp, sp, mult_q * xcgsbi + mult_i * gIgtots);
+        ckt.real(gp, sp, mult_i.mul_add(gIgtots, mult_q * xcgsbi));
         ckt.imag(gp, bp, mult_q * xcgbbr);
-        ckt.real(gp, bp, mult_q * xcgbbi + mult_i * gIgtotb);
+        ckt.real(gp, bp, mult_i.mul_add(gIgtotb, mult_q * xcgbbi));
     } else if h.rgateMod == 2 {
         // WDLiu: gcrg already subtracted from all gcrgg below
         ckt.real(ge, ge, mult_i * gcrg);
@@ -484,13 +478,13 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
 
         ckt.real(gp, ge, -(mult_i * gcrg));
         ckt.imag(gp, gp, mult_q * xcggbr);
-        ckt.real(gp, gp, -(mult_i * (gcrgg - gIgtotg) - mult_q * xcggbi));
+        ckt.real(gp, gp, -mult_q.mul_add(-xcggbi, mult_i * (gcrgg - gIgtotg)));
         ckt.imag(gp, dp, mult_q * xcgdbr);
-        ckt.real(gp, dp, -(mult_i * (gcrgd - gIgtotd) - mult_q * xcgdbi));
+        ckt.real(gp, dp, -mult_q.mul_add(-xcgdbi, mult_i * (gcrgd - gIgtotd)));
         ckt.imag(gp, sp, mult_q * xcgsbr);
-        ckt.real(gp, sp, -(mult_i * (gcrgs - gIgtots) - mult_q * xcgsbi));
+        ckt.real(gp, sp, -mult_q.mul_add(-xcgsbi, mult_i * (gcrgs - gIgtots)));
         ckt.imag(gp, bp, mult_q * xcgbbr);
-        ckt.real(gp, bp, -(mult_i * (gcrgb - gIgtotb) - mult_q * xcgbbi));
+        ckt.real(gp, bp, -mult_q.mul_add(-xcgbbi, mult_i * (gcrgb - gIgtotb)));
     } else if h.rgateMod == 3 {
         ckt.real(ge, ge, mult_i * geltd);
         ckt.real(ge, gm, -(mult_i * geltd));
@@ -511,23 +505,23 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         ckt.imag(sp, gm, mult_q * xcsgmb);
         ckt.imag(bp, gm, mult_q * xcbgmb);
 
-        ckt.real(gp, gp, -(mult_i * (gcrgg - gIgtotg) - mult_q * xcggbi));
+        ckt.real(gp, gp, -mult_q.mul_add(-xcggbi, mult_i * (gcrgg - gIgtotg)));
         ckt.imag(gp, gp, mult_q * xcggbr);
-        ckt.real(gp, dp, -(mult_i * (gcrgd - gIgtotd) - mult_q * xcgdbi));
+        ckt.real(gp, dp, -mult_q.mul_add(-xcgdbi, mult_i * (gcrgd - gIgtotd)));
         ckt.imag(gp, dp, mult_q * xcgdbr);
-        ckt.real(gp, sp, -(mult_i * (gcrgs - gIgtots) - mult_q * xcgsbi));
+        ckt.real(gp, sp, -mult_q.mul_add(-xcgsbi, mult_i * (gcrgs - gIgtots)));
         ckt.imag(gp, sp, mult_q * xcgsbr);
-        ckt.real(gp, bp, -(mult_i * (gcrgb - gIgtotb) - mult_q * xcgbbi));
+        ckt.real(gp, bp, -mult_q.mul_add(-xcgbbi, mult_i * (gcrgb - gIgtotb)));
         ckt.imag(gp, bp, mult_q * xcgbbr);
     } else {
         ckt.imag(gp, gp, mult_q * xcggbr);
-        ckt.real(gp, gp, mult_q * xcggbi + mult_i * gIgtotg);
+        ckt.real(gp, gp, mult_i.mul_add(gIgtotg, mult_q * xcggbi));
         ckt.imag(gp, dp, mult_q * xcgdbr);
-        ckt.real(gp, dp, mult_q * xcgdbi + mult_i * gIgtotd);
+        ckt.real(gp, dp, mult_i.mul_add(gIgtotd, mult_q * xcgdbi));
         ckt.imag(gp, sp, mult_q * xcgsbr);
-        ckt.real(gp, sp, mult_q * xcgsbi + mult_i * gIgtots);
+        ckt.real(gp, sp, mult_i.mul_add(gIgtots, mult_q * xcgsbi));
         ckt.imag(gp, bp, mult_q * xcgbbr);
-        ckt.real(gp, bp, mult_q * xcgbbi + mult_i * gIgtotb);
+        ckt.real(gp, bp, mult_i.mul_add(gIgtotb, mult_q * xcgbbi));
     }
 
     if m.rdsMod != 0 {
@@ -539,59 +533,71 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         ckt.real(s, bp, mult_i * gstotb);
     }
 
-    ckt.imag(dp, dp, mult_q * xcddbr + mult_i * (gdsi + RevSumi));
+    ckt.imag(dp, dp, mult_i.mul_add(gdsi + RevSumi, mult_q * xcddbr));
     ckt.real(
         dp,
         dp,
-        mult_i * (gdpr + gdsr + h.gbd - gdtotd + RevSumr + gbdpdp - gIdtotd) + mult_q * xcddbi,
+        mult_q.mul_add(
+            xcddbi,
+            mult_i * (gdpr + gdsr + h.gbd - gdtotd + RevSumr + gbdpdp - gIdtotd),
+        ),
     );
     ckt.real(dp, d, -(mult_i * (gdpr + gdtot)));
-    ckt.imag(dp, gp, mult_q * xcdgbr + mult_i * Gmi);
+    ckt.imag(dp, gp, mult_i.mul_add(Gmi, mult_q * xcdgbr));
     ckt.real(
         dp,
         gp,
-        mult_i * (Gmr - gdtotg + gbdpg - gIdtotg) + mult_q * xcdgbi,
+        mult_q.mul_add(xcdgbi, mult_i * (Gmr - gdtotg + gbdpg - gIdtotg)),
     );
-    ckt.imag(dp, sp, mult_q * xcdsbr - mult_i * (gdsi + FwdSumi));
+    ckt.imag(dp, sp, mult_i.mul_add(-(gdsi + FwdSumi), mult_q * xcdsbr));
     ckt.real(
         dp,
         sp,
-        -(mult_i * (gdsr + FwdSumr + gdtots - gbdpsp + gIdtots) - mult_q * xcdsbi),
+        -mult_q.mul_add(
+            -xcdsbi,
+            mult_i * (gdsr + FwdSumr + gdtots - gbdpsp + gIdtots),
+        ),
     );
-    ckt.imag(dp, bp, mult_q * xcdbbr + mult_i * Gmbsi);
+    ckt.imag(dp, bp, mult_i.mul_add(Gmbsi, mult_q * xcdbbr));
     ckt.real(
         dp,
         bp,
-        -(mult_i * (gjbd + gdtotb - Gmbsr - gbdpb + gIdtotb) - mult_q * xcdbbi),
+        -mult_q.mul_add(-xcdbbi, mult_i * (gjbd + gdtotb - Gmbsr - gbdpb + gIdtotb)),
     );
 
     ckt.real(d, dp, -(mult_i * (gdpr - gdtotd)));
     ckt.real(d, d, mult_i * (gdpr + gdtot));
 
-    ckt.imag(sp, dp, mult_q * xcsdbr - mult_i * (gdsi + RevSumi));
+    ckt.imag(sp, dp, mult_i.mul_add(-(gdsi + RevSumi), mult_q * xcsdbr));
     ckt.real(
         sp,
         dp,
-        -(mult_i * (gdsr + gstotd + RevSumr - gbspdp + gIstotd) - mult_q * xcsdbi),
+        -mult_q.mul_add(
+            -xcsdbi,
+            mult_i * (gdsr + gstotd + RevSumr - gbspdp + gIstotd),
+        ),
     );
-    ckt.imag(sp, gp, mult_q * xcsgbr - mult_i * Gmi);
+    ckt.imag(sp, gp, mult_i.mul_add(-Gmi, mult_q * xcsgbr));
     ckt.real(
         sp,
         gp,
-        -(mult_i * (Gmr + gstotg - gbspg + gIstotg) - mult_q * xcsgbi),
+        -mult_q.mul_add(-xcsgbi, mult_i * (Gmr + gstotg - gbspg + gIstotg)),
     );
-    ckt.imag(sp, sp, mult_q * xcssbr + mult_i * (gdsi + FwdSumi));
+    ckt.imag(sp, sp, mult_i.mul_add(gdsi + FwdSumi, mult_q * xcssbr));
     ckt.real(
         sp,
         sp,
-        mult_i * (gspr + gdsr + h.gbs - gstots + FwdSumr + gbspsp - gIstots) + mult_q * xcssbi,
+        mult_q.mul_add(
+            xcssbi,
+            mult_i * (gspr + gdsr + h.gbs - gstots + FwdSumr + gbspsp - gIstots),
+        ),
     );
     ckt.real(sp, s, -(mult_i * (gspr + gstot)));
-    ckt.imag(sp, bp, mult_q * xcsbbr - mult_i * Gmbsi);
+    ckt.imag(sp, bp, mult_i.mul_add(-Gmbsi, mult_q * xcsbbr));
     ckt.real(
         sp,
         bp,
-        -(mult_i * (gjbs + gstotb + Gmbsr - gbspb + gIstotb) - mult_q * xcsbbi),
+        -mult_q.mul_add(-xcsbbi, mult_i * (gjbs + gstotb + Gmbsr - gbspb + gIstotb)),
     );
 
     ckt.real(s, sp, -(mult_i * (gspr - gstots)));

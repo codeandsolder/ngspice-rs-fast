@@ -21,6 +21,12 @@
 use super::{CONST_VT0, Instance, LoadCkt, Model, mode, state};
 use crate::devices::limiting::{fetlim, limvds, pnjlim};
 
+/// Extrapolate the difference between accepted states. A constant history
+/// remains the same value even for a very large step-size ratio.
+fn predict(ratio: f64, recent: f64, older: f64) -> f64 {
+    ratio.mul_add(recent - older, recent)
+}
+
 /// The selected and limited terminal voltages (polarity normalized), plus
 /// the reference charge-computation and convergence decisions.
 pub(super) struct LoadBias {
@@ -141,7 +147,7 @@ pub(super) fn select(model: &Model, here: &Instance, ckt: &mut dyn LoadCkt) -> L
             vds = 0.1;
             vdes = 0.11;
             vses = -0.01;
-            vgms = f64::from(model.r#type) * here.vth0 + 0.1;
+            vgms = f64::mul_add(f64::from(model.r#type), here.vth0, 0.1);
             vges = vgms;
             vgs = vges;
             vsbs = 0.0;
@@ -163,30 +169,30 @@ pub(super) fn select(model: &Model, here: &Instance, ckt: &mut dyn LoadCkt) -> L
         if (ckt.mode() & mode::MODEINITPRED) != 0 {
             xfact = ckt.delta() / ckt.delta_old(1);
             ckt.set_state0(state::VDS, ckt.state1(state::VDS));
-            vds = (1.0 + xfact) * (ckt.state1(state::VDS)) - (xfact * (ckt.state2(state::VDS)));
+            vds = predict(xfact, ckt.state1(state::VDS), ckt.state2(state::VDS));
             ckt.set_state0(state::VGS, ckt.state1(state::VGS));
-            vgs = (1.0 + xfact) * (ckt.state1(state::VGS)) - (xfact * (ckt.state2(state::VGS)));
+            vgs = predict(xfact, ckt.state1(state::VGS), ckt.state2(state::VGS));
             ckt.set_state0(state::VGES, ckt.state1(state::VGES));
-            vges = (1.0 + xfact) * (ckt.state1(state::VGES)) - (xfact * (ckt.state2(state::VGES)));
+            vges = predict(xfact, ckt.state1(state::VGES), ckt.state2(state::VGES));
             ckt.set_state0(state::VGMS, ckt.state1(state::VGMS));
-            vgms = (1.0 + xfact) * (ckt.state1(state::VGMS)) - (xfact * (ckt.state2(state::VGMS)));
+            vgms = predict(xfact, ckt.state1(state::VGMS), ckt.state2(state::VGMS));
             ckt.set_state0(state::VBS, ckt.state1(state::VBS));
-            vbs = (1.0 + xfact) * (ckt.state1(state::VBS)) - (xfact * (ckt.state2(state::VBS)));
+            vbs = predict(xfact, ckt.state1(state::VBS), ckt.state2(state::VBS));
             ckt.set_state0(state::VBD, ckt.state0(state::VBS) - ckt.state0(state::VDS));
             ckt.set_state0(state::VDBS, ckt.state1(state::VDBS));
-            vdbs = (1.0 + xfact) * (ckt.state1(state::VDBS)) - (xfact * (ckt.state2(state::VDBS)));
+            vdbs = predict(xfact, ckt.state1(state::VDBS), ckt.state2(state::VDBS));
             ckt.set_state0(
                 state::VDBD,
                 ckt.state0(state::VDBS) - ckt.state0(state::VDS),
             );
             ckt.set_state0(state::VSBS, ckt.state1(state::VSBS));
-            vsbs = (1.0 + xfact) * (ckt.state1(state::VSBS)) - (xfact * (ckt.state2(state::VSBS)));
+            vsbs = predict(xfact, ckt.state1(state::VSBS), ckt.state2(state::VSBS));
             ckt.set_state0(state::VSES, ckt.state1(state::VSES));
-            vses = (1.0 + xfact) * (ckt.state1(state::VSES)) - (xfact * (ckt.state2(state::VSES)));
+            vses = predict(xfact, ckt.state1(state::VSES), ckt.state2(state::VSES));
             ckt.set_state0(state::VDES, ckt.state1(state::VDES));
-            vdes = (1.0 + xfact) * (ckt.state1(state::VDES)) - (xfact * (ckt.state2(state::VDES)));
+            vdes = predict(xfact, ckt.state1(state::VDES), ckt.state2(state::VDES));
             ckt.set_state0(state::QDEF, ckt.state1(state::QDEF));
-            qdef = (1.0 + xfact) * (ckt.state1(state::QDEF)) - (xfact * (ckt.state2(state::QDEF)));
+            qdef = predict(xfact, ckt.state1(state::QDEF), ckt.state2(state::QDEF));
         } else {
             vds = f64::from(model.r#type)
                 * (ckt.rhs_old(here.dNodePrime) - ckt.rhs_old(here.sNodePrime));
@@ -376,4 +382,15 @@ pub(super) fn commit(here: &Instance, ckt: &mut dyn LoadCkt, bias: &LoadBias) {
     ckt.set_state0(state::VSES, vses);
     ckt.set_state0(state::VDES, vdes);
     ckt.set_state0(state::QDEF, qdef);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::predict;
+
+    #[test]
+    fn constant_history_remains_constant_at_large_step_ratios() {
+        assert_eq!(predict(1e20, 0.123, 0.123), 0.123);
+        assert_eq!(predict(2., 3., 2.), 5.);
+    }
 }

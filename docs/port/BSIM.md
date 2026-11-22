@@ -276,8 +276,8 @@ the other BSIM families are unchanged.
 | B3-4 small signal / noise | done for `.dc`, `.ac`, `.pz`, `.tf`, `.noise` and `.disto` (linear, as C); `.sens` refused |
 | B3-5 goldens and binning coverage | done: `m11_bsim3_{op,dc,ac,tran}` and `m11_bsim4_{op,dc,ac,pz,noise,tran,bin_dc}` under `xtask golden verify` (binning end to end in `m11_bsim4_bin_dc`) |
 | B4-0 tables/schema | done |
-| B4-1..B4-4 BSIM4 setup, temperature, checks, load, small signal, noise, pole-zero | done, bit-exact against the FMA-free C oracle ([BSIM4](#bsim4)) |
-| B4 `.sens` | done (DC and AC), bit-exact on every deck C completes; see [SENSITIVITY.md](SENSITIVITY.md) |
+| B4-1..B4-4 BSIM4 setup, temperature, checks, load, small signal, noise, pole-zero | done, numerically verified against the FMA-free C oracle ([BSIM4](#bsim4)) |
+| B4 `.sens` | done (DC and AC), verified against the C oracle; see [SENSITIVITY.md](SENSITIVITY.md) |
 
 ### Next: what remains
 
@@ -402,8 +402,9 @@ Tracked in #189 (cross-instance and cross-analysis C state), #186
   and `tests/bsim4_device.rs` (9 decks: OP with gate and body resistance,
   PMOS `rdsMod` sweep, AC, noise with `tnoiMod` 0/2 and `fnoiMod` 0/1,
   `.pz` with the setup re-run, an NQS CMOS inverter transient, a width
-  sweep and a check-once temperature sweep), bit-exact on macOS arm64 and to
-  1e-9 elsewhere.
+  sweep and a check-once temperature sweep), using the existing portable
+  numerical bounds on every architecture (1e-9 relative for non-transient
+  samples; transient interpolation on the C grid).
 - Opt-in: `c_bsim4_schema_reference`, `c_bsim4_setup_reference` (every
   numeric model member after `b4set.c`, 4,430 values over five cards),
   `c_bsim4_temp_reference` (6,314 model/instance values after `b4temp.c`,
@@ -415,6 +416,54 @@ Tracked in #189 (cross-instance and cross-analysis C state), #186
   `fidelity-tools/scripts/ulpcmp.py` against the FMA-free oracle: all
   bit-exact, except decks C itself aborts (fatal checks), which fail with
   C's messages. The conformance scoreboard is unchanged.
+
+### Numerical arithmetic audit (#89)
+
+The earlier bit-exact results above describe the original FMA-free translation.
+The current compact-model kernels intentionally improve their floating-point
+arithmetic; the existing portable reference tolerances and C golden values
+remain in force on all targets. Host event order and instance write ownership
+remain unchanged.
+
+- Fuse affine stamping and derivatives; evaluate convergence residuals before
+  adding a potentially much larger prior current. Factor nearly equal density
+  terms in flicker noise and share geometry diffusion equations.
+- Share a four-term binning polynomial across 160 size-dependent parameters.
+  Solve the diode threshold in `exp(V/Nvtm)-1`, and use a stable width average
+  for the well-proximity effect.
+- Rationalize the smoothed drain-voltage root and both derivative gaps in the
+  channel, charge and noise paths. Compute the transport discriminant as an
+  accurate difference of products and differentiate the saturation equation
+  implicitly. Preserve small junction currents using `expm1` with the
+  reference clamp boundaries; extrapolate accepted-state differences rather
+  than subtracting scaled nearly identical history values.
+- Retain a narrowly scoped arithmetic expectation for junction equivalent
+  current: the current includes an already-rounded linear conductance term.
+  Subtracting the identically rounded product gives an exact zero for pure
+  linear conduction; FMA against that stored current would introduce a
+  spurious source. A unit regression demonstrates the difference.
+- Independent bias-grid checks cover charge and capacitance conservation and
+  channel derivatives for capMod 0–2. Additional tests cover cancellation,
+  tiny currents, smoothing derivatives and constant predictor histories.
+  The ignored real-device benchmark reports wall time and, on Linux, per-thread
+  CPU ticks for portable and native builds, to exclude scheduler preemption.
+
+Initial measurement (Ryzen 7 4700U, 2026-11-22, five batches of 200,000
+loads per mode, median thread CPU time in microseconds per load):
+
+| capMod | Original generic | Audited generic | Original native | Audited native |
+|---|---:|---:|---:|---:|
+| 0 | 1.30 | 2.15 | 1.40 | 1.40 |
+| 1 | 1.25 | 2.30 | 1.50 | 1.40 |
+| 2 | 1.40 | 2.15 | 1.70 | 1.55 |
+
+The native builds show no clear throughput loss; the generic build pays for
+out-of-line fused operations. These are busy-host measurements and CPU clock
+variation remains. A runtime FMA specialization experiment investigates
+recovering that generic-target overhead without changing the arithmetic.
+The numerical audit passes 75 focused tests (including live C comparisons)
+and the full golden verification: 219 verified, one existing unsupported
+fixture, zero failures.
 
 ### Notes for the next slice (`capMod` 0/1/2)
 
