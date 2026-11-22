@@ -25,7 +25,6 @@
 use std::collections::BTreeMap;
 
 use ngspice_rs::analysis::{Plot, PlotFlags};
-use ngspice_rs::devices::linear::EventRole;
 use ngspice_rs::devices::{Circuit, TransientTiming};
 use ngspice_rs::primitives::exact_nonnegative_integer;
 
@@ -365,22 +364,17 @@ pub(super) fn breakpoints(circuit: &Circuit, timing: &TransientTiming) -> Result
     let eps = TIME_EPS_REL * stop_time;
     let mut times = Vec::new();
     let mut generated = 0;
-    for device in circuit.devices() {
-        let Some(waveform) = device.source_waveform() else {
-            continue;
-        };
-        let waveform = waveform
-            .resolve(timing)
-            .map_err(|error| format!("{}: {error}", device.name()))?;
-        let mut events = waveform
+    for source in circuit.source_timelines(*timing) {
+        let source = source.map_err(|error| error.to_string())?;
+        let mut events = source
+            .waveform
             .breakpoints_in(0., stop_time)
-            .map_err(|error| format!("{}: {error}", device.name()))?;
+            .map_err(|error| format!("{}: {error}", source.name))?;
         while let Some(event) = events.next_event() {
             // Count all generated events before filtering or deduplication.
             check_event_capacity(generated, 1)?;
             generated += 1;
-            if event.role == EventRole::Landable && event.time > eps && event.time < stop_time - eps
-            {
+            if event.kind.requires_landing() && event.time > eps && event.time < stop_time - eps {
                 times.push(event.time);
             }
         }
@@ -823,7 +817,7 @@ mod tests {
         );
         // Nested instances resolve their own formal parameters and names.
         let netlist = deck(
-            ".subckt outer a d=1m\n.subckt inner b td=1m\nv1 b 0 pulse(0 1 {td} 1u 2u 1m)\n.ends\nx1 a inner td={d}\n.ends\nx1 n outer d=0.5m\nx2 m outer d=1m",
+            ".subckt inner b td=1m\nv1 b 0 pulse(0 1 {td} 1u 2u 1m)\n.ends\n.subckt outer a d=1m\nx1 a inner td={d}\n.ends\nx1 n outer d=0.5m\nx2 m outer d=1m",
         );
         let found = deck_breakpoints(&netlist, 1e-5, 4e-3).unwrap();
         assert_eq!(found.len(), 8);

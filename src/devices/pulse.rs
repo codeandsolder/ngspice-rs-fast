@@ -16,8 +16,7 @@
 //! nonpositive rise/fall, which [`PulseSpec::resolve`] reproduces); and every
 //! boundary has a defined left and right limit instead of a single sampled value.
 
-use super::linear::{EventRole, WaveformEvent};
-use crate::devices::Limit;
+use crate::devices::{Limit, WaveformEvent, WaveformEventKind};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// The largest cycle index whose start time is still resolvable in `f64`.
@@ -429,13 +428,18 @@ impl PulseBreakpoints {
             let offset = cycle_position(stop, pulse.period).phase;
             (offset > 0. && offset < active).then_some(pulse.delay + stop)
         });
-        // A finite train never needs to visit the inactive cycles beyond
-        // its last scheduling request. Bound representable *visited* cycles,
-        // not the number of periods in an arbitrarily long final-time window.
-        let last_cycle = ((t1 - pulse.delay) / pulse.period).floor();
-        let last_cycle = pulse.stop.map_or(last_cycle, |stop| {
-            last_cycle.min((stop / pulse.period).floor() + 1.)
-        });
+        // A finite train needs only the cycle containing its last request,
+        // not every hypothetical cycle up to the window end. No cycles
+        // at all are needed for a window entirely before the delay.
+        let before_delay = t1 < pulse.delay;
+        let last_cycle = if before_delay {
+            0.
+        } else {
+            let last = ((t1 - pulse.delay) / pulse.period).floor();
+            pulse
+                .stop
+                .map_or(last, |stop| last.min((stop / pulse.period).floor() + 1.))
+        };
         if !last_cycle.is_finite() || last_cycle >= MAX_CYCLE {
             return Err(invalid("breakpoint window spans too many periods"));
         }
@@ -456,7 +460,7 @@ impl PulseBreakpoints {
             cycle,
             index: 0,
             last: None,
-            done: false,
+            done: before_delay,
             cut,
             tail: None,
         })
@@ -471,9 +475,11 @@ impl PulseBreakpoints {
                     self.done = true;
                     break;
                 };
-                let t = event.time;
-                if t >= self.t0 && t <= self.t1 && self.last.is_none_or(|last| t > last) {
-                    self.last = Some(t);
+                if event.time >= self.t0
+                    && event.time <= self.t1
+                    && self.last.is_none_or(|last| event.time > last)
+                {
+                    self.last = Some(event.time);
                     return Some(event);
                 }
                 continue;
@@ -500,6 +506,11 @@ impl PulseBreakpoints {
             let cycle_start = self.pulse.period * self.cycle;
             let local = cycle_start + self.offsets[self.index];
             let t = self.pulse.delay + local;
+            let kind = if self.index == 0 {
+                WaveformEventKind::PulsePeriodStart
+            } else {
+                WaveformEventKind::PulseEdge
+            };
             self.index += 1;
             if !t.is_finite() {
                 self.done = true;
@@ -510,21 +521,18 @@ impl PulseBreakpoints {
                 self.tail = Some([
                     self.cut.take().map(|time| WaveformEvent {
                         time,
-                        role: EventRole::Unscheduled,
+                        kind: WaveformEventKind::PulseCountCut,
                     }),
                     Some(WaveformEvent {
                         time: t,
-                        role: EventRole::RequestOnly,
+                        kind: WaveformEventKind::PulseTrailingRequest,
                     }),
                 ]);
             } else if t > self.t1 {
                 self.done = true;
             } else if t >= self.t0 && self.last.is_none_or(|last| t > last) {
                 self.last = Some(t);
-                return Some(WaveformEvent {
-                    time: t,
-                    role: EventRole::Landable,
-                });
+                return Some(WaveformEvent { time: t, kind });
             }
         }
         None
@@ -832,24 +840,25 @@ mod tests {
         assert_eq!(p.value_at(0.65, R).unwrap(), 0.);
     }
     #[test]
-    fn finite_train_event_roles_and_long_inactive_window() {
+    fn finite_train_event_kinds_and_long_inactive_window() {
         let finite = pulse(1., 2., 3., 10.).with_count(1.4).unwrap();
         let mut iterator = finite.breakpoints_in(0., 1e30).unwrap();
         let mut events = Vec::new();
         while let Some(event) = iterator.next_event() {
-            events.push((event.time, event.role));
+            events.push((event.time, event.kind));
         }
+        use WaveformEventKind::{PulseCountCut, PulseEdge, PulsePeriodStart, PulseTrailingRequest};
         assert_eq!(
             events,
             [
-                (2., EventRole::Landable),
-                (3., EventRole::Landable),
-                (6., EventRole::Landable),
-                (8., EventRole::Landable),
-                (12., EventRole::Landable),
-                (13., EventRole::Landable),
-                (16., EventRole::Unscheduled),
-                (18., EventRole::RequestOnly),
+                (2., PulsePeriodStart),
+                (3., PulseEdge),
+                (6., PulseEdge),
+                (8., PulseEdge),
+                (12., PulsePeriodStart),
+                (13., PulseEdge),
+                (16., PulseCountCut),
+                (18., PulseTrailingRequest),
             ]
         );
         assert_eq!(finite.breakpoints_in(1e29, 1e30).unwrap().next(), None);

@@ -374,6 +374,14 @@ impl IndependentSource {
         Ok(self)
     }
 
+    const fn source_kind(&self) -> crate::devices::SourceKind {
+        if self.voltage {
+            crate::devices::SourceKind::Voltage
+        } else {
+            crate::devices::SourceKind::Current
+        }
+    }
+
     fn effective_waveform(&self) -> &Waveform {
         self.accumulated_waveform
             .as_deref()
@@ -527,13 +535,13 @@ impl Device for IndependentSource {
         })
     }
 
+    fn independent_waveform(&self) -> Option<(crate::devices::SourceKind, &Waveform)> {
+        Some((self.source_kind(), self.effective_waveform()))
+    }
+
     fn input_source(&self) -> Option<crate::devices::noise::InputSource> {
         Some(crate::devices::noise::InputSource {
-            kind: if self.voltage {
-                crate::devices::linear::SourceKind::Voltage
-            } else {
-                crate::devices::linear::SourceKind::Current
-            },
+            kind: self.source_kind(),
             ac_given: self.ac_given(),
         })
     }
@@ -579,9 +587,6 @@ impl Device for IndependentSource {
             }
         }
         Ok(Some((self.effective_waveform().clone(), self.dc.value())))
-    }
-    fn source_waveform(&self) -> Option<&Waveform> {
-        Some(self.effective_waveform())
     }
     fn rf_port(&self) -> Option<&RfPort> {
         self.port.as_ref()
@@ -680,11 +685,7 @@ impl Device for IndependentSource {
         };
         context.system.sources.push(LinearSource {
             name: self.name.clone(),
-            kind: if self.voltage {
-                crate::devices::linear::SourceKind::Voltage
-            } else {
-                crate::devices::linear::SourceKind::Current
-            },
+            kind: self.source_kind(),
             rows,
             dc: self.dc.value(),
             ac: self.ac.phasor,
