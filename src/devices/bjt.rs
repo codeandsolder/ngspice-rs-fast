@@ -811,10 +811,10 @@ impl Thermal {
             self.vjs,
             self.be.f1,
             self.be.f2,
-            self.be.f3,
+            self.be.edge,
             self.bc.f1,
             self.bc.f2,
-            self.bc.f3,
+            self.bc.edge,
         ];
         if values.iter().any(|v| !v.is_finite())
             || [

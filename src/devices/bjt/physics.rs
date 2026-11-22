@@ -11,7 +11,10 @@
 )]
 
 use super::{Bias, Thermal};
-use crate::devices::nonlinear::{cubic_reverse_junction, exponential_junction, reverse_depletion};
+use crate::devices::nonlinear::{
+    cubic_reverse_junction, exponential_junction, exponential_junction_at_argument,
+    reverse_depletion,
+};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// ngspice `MAX_EXP_ARG`, the substrate exponential clamp of `bjtload.c`.
@@ -136,17 +139,9 @@ fn substrate_junction(t: &Thermal, vsub: Real, gmin: Real) -> Junction {
             let (current, conductance) = cubic_reverse_junction(vsub, vts, iss);
             (conductance + gmin, gmin.mul_add(vsub, current))
         } else {
-            let argument = (vsub / vts).min(MAX_EXP_ARG);
-            let exponential = argument.exp();
-            let incremental = if argument.abs() < 0.5 {
-                argument.exp_m1()
-            } else {
-                exponential - 1.
-            };
-            (
-                iss * exponential / vts + gmin,
-                gmin.mul_add(vsub, iss * incremental),
-            )
+            let (current, conductance) =
+                exponential_junction_at_argument((vsub / vts).min(MAX_EXP_ARG), vts, iss);
+            (conductance + gmin, gmin.mul_add(vsub, current))
         }
     });
     Junction {

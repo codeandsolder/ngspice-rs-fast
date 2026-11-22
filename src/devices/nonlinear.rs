@@ -1415,7 +1415,12 @@ pub(super) fn cubic_reverse_junction(v: Real, vt: Real, is: Real) -> (Real, Real
 
 /// Current and conductance without gmin or an exponential clamp.
 pub(super) fn exponential_junction(v: Real, vt: Real, is: Real) -> (Real, Real) {
-    let argument = v / vt;
+    exponential_junction_at_argument(v / vt, vt, is)
+}
+
+/// Evaluate an exponential junction after the caller has applied its
+/// model-specific reverse-region policy and optional exponent clamp.
+pub(super) fn exponential_junction_at_argument(argument: Real, vt: Real, is: Real) -> (Real, Real) {
     let exp = argument.exp();
     if exp.is_finite() {
         // Around equilibrium the current is O(v); subtracting one from
@@ -1503,20 +1508,20 @@ pub(super) struct DepletionLaw {
     pub(super) threshold: Real,
     pub(super) f1: Real,
     pub(super) f2: Real,
-    pub(super) f3: Real,
+    /// The normalized capacitance at the start of the forward continuation.
+    pub(super) edge: Real,
 }
 
 impl DepletionLaw {
     pub(super) fn new(potential: Real, grading: Real, fc: Real) -> Self {
         let xfc = (-fc).ln_1p();
-        let forward_factor = 1. + grading;
         Self {
             potential,
             grading,
             threshold: fc * potential,
             f1: potential * depletion_integral(xfc, grading),
             f2: ((1. + grading) * xfc).exp(),
-            f3: (-fc).mul_add(forward_factor, 1.),
+            edge: 1. - fc,
         }
     }
 
@@ -1546,7 +1551,7 @@ impl DepletionLaw {
             let czf2 = cz / self.f2;
             let delta = v - threshold;
             let slope = grading / potential;
-            let edge = self.f3 + grading * threshold / potential;
+            let edge = self.edge;
             let relative_capacitance = slope.mul_add(delta, edge);
             let (charge, capacitance) = add_diffusion(cz * self.f1, czf2 * relative_capacitance);
             // Integrate the linear capacitance from the forward threshold
