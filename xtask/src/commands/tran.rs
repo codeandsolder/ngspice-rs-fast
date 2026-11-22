@@ -78,7 +78,8 @@ enum SamplePlan<'a> {
     Linear {
         lower: &'a [Complex],
         upper: &'a [Complex],
-        fraction: f64,
+        lower_weight: f64,
+        upper_weight: f64,
     },
 }
 
@@ -89,11 +90,12 @@ impl SamplePlan<'_> {
             Self::Linear {
                 lower,
                 upper,
-                fraction,
+                lower_weight,
+                upper_weight,
             } => {
                 // Preserve the original arithmetic order and rounding.
-                let left = (1.0 - fraction) * lower[column].re;
-                let right = fraction * upper[column].re;
+                let left = lower_weight * lower[column].re;
+                let right = upper_weight * upper[column].re;
                 left + right
             }
         }
@@ -240,7 +242,7 @@ impl<'a> Series<'a> {
         }
         // Keep the original interior bracket-selection rule, including its
         // behavior for the tiny reversals allowed by check_times. Only the
-        // event lookup above requires a complete scan of matching rows.
+        // event lookup above required a complete scan of matching rows.
         let upper = self.times.partition_point(|&x| x < t - self.eps);
         if upper == self.times.len() {
             return Err(format!("{}: time {t:e} is beyond the samples", self.label));
@@ -263,7 +265,8 @@ impl<'a> Series<'a> {
         Ok(SamplePlan::Linear {
             lower: row(upper - 1),
             upper: row(upper),
-            fraction,
+            lower_weight: 1.0 - fraction,
+            upper_weight: fraction,
         })
     }
 }
@@ -669,7 +672,7 @@ mod tests {
             let t = f64::from(index) * grid.step;
             if t > grid.start + eps
                 && t < grid.stop - eps
-                && !breakpoints.iter().any(|&b| (b - t).abs() <= eps)
+                && nearby_breakpoint(breakpoints, t, eps).is_none()
             {
                 check_event_capacity(instants.len(), 1)?;
                 instants.push((t, Side::Interior));
@@ -694,7 +697,7 @@ mod tests {
     #[test]
     fn indexed_event_rows_match_full_scans_at_rounding_boundaries() {
         let eps = 0.125;
-        let events = [0.5, 1.0, 1.1875, 2.0, 4.0];
+        let events: [f64; 5] = [0.5, 1.0, 1.1875, 2.0, 4.0];
         let mut times = vec![-0.0, 0.0, 3.0];
         for event in events {
             for boundary in [event - eps, event, event + eps] {
