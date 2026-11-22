@@ -70,12 +70,12 @@ use crate::devices::limiting::{self, Limiter, Linearization};
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
-use crate::devices::nonlinear::DepletionLaw;
 use crate::devices::nonlinear::charge::ChargeBranch;
 use crate::devices::nonlinear::thermal::{
     BOLTZMANN, CELSIUS_TO_KELVIN, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureCache,
     TemperatureKey, band_gap, potential_shift,
 };
+use crate::devices::nonlinear::{DepletionLaw, unaliased_conductance};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -1486,6 +1486,9 @@ impl Device for Bjt {
         } = self.nodes;
         // Without quasi-saturation `collCX` is the collector prime.
         let cx = cp;
+        let gcpr = unaliased_conductance(c, cx, gcpr);
+        let gx = unaliased_conductance(b, bp, gx);
+        let gepr = unaliased_conductance(e, ep, gepr);
         context.stamp_rhs(b, m * (-ceqbx))?;
         context.stamp_rhs(cp, m * (ceqbx + ceqbc))?;
         context.stamp_rhs(sc, m * ceqsub)?;
@@ -1582,6 +1585,9 @@ impl Device for Bjt {
             sc,
         } = self.nodes;
         let cx = cp;
+        let gcpr = unaliased_conductance(c, cx, gcpr);
+        let gx = unaliased_conductance(b, bp, gx);
+        let gepr = unaliased_conductance(e, ep, gepr);
         let mut add = |row: NodeId, col: NodeId, value: Real| -> SpiceResult<()> {
             if let (Some(r), Some(k)) = (unknowns.node_row(row), unknowns.node_row(col)) {
                 context.system.a.add(r, k, value)?;
@@ -2430,6 +2436,9 @@ impl Device for ResetBjt {
             sc,
         } = self.current.nodes;
         let cx = cp;
+        let gcpr = unaliased_conductance(c, cx, gcpr);
+        let gx = unaliased_conductance(b, bp, gx);
+        let gepr = unaliased_conductance(e, ep, gepr);
         let real = [
             (c, c, m * (gcpr)),
             (b, b, m * (gx)),

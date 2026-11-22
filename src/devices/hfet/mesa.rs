@@ -43,6 +43,7 @@ use super::{NodeSetup, TemperatureCache, given_celsius, physical_temperature, st
 use crate::devices::hfet::{Instance, Model};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{self, BOLTZMANN, CHARGE};
+use crate::devices::nonlinear::unaliased_conductance;
 use crate::devices::sensitivity::{
     AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter, SensitivityRecord,
@@ -197,6 +198,19 @@ struct Nodes {
     /// The prime-prime nodes (H1b; the prime node while `rdi`/`rsi` are zero).
     spp: NodeId,
     dpp: NodeId,
+}
+
+impl Nodes {
+    /// Series conductances restricted to distinct electrical nodes.
+    fn series(self, derived: &Derived) -> [Real; 5] {
+        [
+            unaliased_conductance(self.d, self.dp, derived.gdpr),
+            unaliased_conductance(self.s, self.sp, derived.gspr),
+            unaliased_conductance(self.g, self.gp, derived.ggate),
+            unaliased_conductance(self.sp, self.spp, derived.tgi),
+            unaliased_conductance(self.dp, self.dpp, derived.tgf),
+        ]
+    }
 }
 
 /// MESA level 2.
@@ -1419,9 +1433,8 @@ impl Device for Mesa {
         context.stamp_rhs(self.nodes.spp, f64::mul_add(ggspp, -vgspp, cgspp))?;
         let (gds, gm) = (point.gds, point.gm);
         let (ggs, ggd) = (point.ggs, point.ggd);
-        let (gdpr, gspr, ggate) = (derived.gdpr, derived.gspr, derived.ggate);
-        let (tgi, tgf) = (derived.tgi, derived.tgf);
         let n = self.nodes;
+        let [gdpr, gspr, ggate, tgi, tgf] = n.series(&derived);
         for (row, col, value) in [
             (n.d, n.d, m * gdpr),
             (n.s, n.s, m * gspr),
@@ -1519,8 +1532,7 @@ impl Device for Mesa {
             context.model_context.frequency,
         )?;
         let n = self.nodes;
-        let (gdpr, gspr, ggate) = (derived.gdpr, derived.gspr, derived.ggate);
-        let (tgi, tgf) = (derived.tgi, derived.tgf);
+        let [gdpr, gspr, ggate, tgi, tgf] = n.series(&derived);
         for (a, b, value) in [
             (n.d, n.d, m * gdpr),
             (n.s, n.s, m * gspr),
@@ -2075,9 +2087,9 @@ impl Device for ResetMesa {
         let (ggs, ggd, ggspp, ggdpp) = (point.ggs, point.ggd, 0., 0.);
         let current = &self.current;
         let c = current.derived(temperature, nominal)?;
-        let (gdpr, gspr, ggate, tgi, tgf) = (c.gdpr, c.gspr, c.ggate, c.tgi, c.tgf);
         let m = current.instance.m;
         let n = current.nodes;
+        let [gdpr, gspr, ggate, tgi, tgf] = n.series(&c);
         let stamps = [
             (n.d, n.d, m * gdpr),
             (n.s, n.s, m * gspr),
