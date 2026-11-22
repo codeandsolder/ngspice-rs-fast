@@ -27,9 +27,9 @@ pub(super) const MAX_CYCLE: Real = 4_503_599_627_370_496.0; // 2^52
 /// reject unresolvable cycle numbers; neither policy belongs in this kernel.
 #[derive(Clone, Copy)]
 pub(super) struct CyclePosition {
-    pub index: Real,
-    pub base: Real,
-    pub phase: Real,
+    index: Real,
+    pub(super) base: Real,
+    pub(super) phase: Real,
 }
 
 pub(super) fn cycle_position(elapsed: Real, period: Real) -> CyclePosition {
@@ -40,9 +40,32 @@ pub(super) fn cycle_position(elapsed: Real, period: Real) -> CyclePosition {
 }
 
 impl CyclePosition {
-    pub fn resolvable(self) -> bool {
+    pub(super) const fn resolvable(self) -> bool {
         self.index.is_finite() && self.index < MAX_CYCLE && self.base.is_finite()
     }
+}
+
+/// Skip a monotone prefix of cycles with no visible corners. A large delay
+/// can round many consecutive cycles to the same absolute time. Search the
+/// exactly representable cycle indices instead of stepping through them.
+pub(super) fn seek_cycle(first: Real, mut omit: impl FnMut(Real) -> bool) -> Option<Real> {
+    if first >= MAX_CYCLE {
+        return None;
+    }
+    if !omit(first) {
+        return Some(first);
+    }
+    let mut low = first + 1.;
+    let mut high = MAX_CYCLE;
+    while low < high {
+        let middle = low.midpoint(high).floor();
+        if omit(middle) {
+            low = middle + 1.;
+        } else {
+            high = middle;
+        }
+    }
+    (low < MAX_CYCLE).then_some(low)
 }
 
 fn invalid(message: impl Into<String>) -> SpiceError {
@@ -431,7 +454,7 @@ impl PulseBreakpoints {
 impl Iterator for PulseBreakpoints {
     type Item = Real;
     fn next(&mut self) -> Option<Real> {
-        while !self.done {
+        while !self.done && self.last.is_none_or(|last| last < self.t1) {
             if let Some(tail) = &mut self.tail {
                 // After `tmax`: the cut (if any), then C's last request.
                 let Some(t) = tail.iter_mut().find_map(Option::take) else {
@@ -446,7 +469,21 @@ impl Iterator for PulseBreakpoints {
             }
             if self.index >= self.count {
                 self.index = 0;
-                self.cycle += 1.;
+                let Some(cycle) = seek_cycle(self.cycle + 1., |cycle| {
+                    let local_last = self.pulse.period * cycle + self.offsets[self.count - 1];
+                    // Do not skip the cycle containing the first request
+                    // after a finite train's stop, even if its corners
+                    // round to already emitted times.
+                    if self.pulse.stop.is_some_and(|stop| local_last > stop) {
+                        return false;
+                    }
+                    let end = self.pulse.delay + local_last;
+                    end < self.t0 || self.last.is_some_and(|last| end <= last)
+                }) else {
+                    self.done = true;
+                    break;
+                };
+                self.cycle = cycle;
             }
             let cycle_start = self.pulse.period * self.cycle;
             let local = cycle_start + self.offsets[self.index];
@@ -790,5 +827,52 @@ mod tests {
             ..spec
         };
         assert!(overflow.validate().is_err());
+    }
+    #[test]
+    fn collapsed_cycles_advance_to_next_representable_event_without_scanning() {
+        let delay = 1e16_f64;
+        let end = delay.next_up();
+        let pulse = Pulse::new(0., 1., delay, 1e-13, 1e-13, 1e-13, 1e-12).unwrap();
+        // Two trillion periods fit in one ulp of the absolute time.
+        assert_eq!(
+            pulse
+                .breakpoints_in(delay, end)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [delay, end]
+        );
+        assert_eq!(
+            pulse
+                .breakpoints_in(delay, delay)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [delay]
+        );
+        let finite = pulse.with_count(0.25).unwrap();
+        assert_eq!(
+            finite
+                .breakpoints_in(delay, end)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [delay]
+        );
+        // A finite train whose stop is on the rounding threshold still
+        // publishes the *first* corner after the stop, even after skipping.
+        let long = pulse.with_count(1e12).unwrap();
+        assert_eq!(
+            long.breakpoints_in(delay, end).unwrap().collect::<Vec<_>>(),
+            [delay, end]
+        );
+    }
+
+    #[test]
+    fn cycle_seek_is_exact_and_bounded() {
+        for start in [1., MAX_CYCLE - 1.] {
+            assert_eq!(seek_cycle(start, |_| false), Some(start));
+            assert_eq!(seek_cycle(start, |_| true), None);
+        }
+        let threshold = MAX_CYCLE - 3.;
+        assert_eq!(seek_cycle(1., |cycle| cycle < threshold), Some(threshold));
+        assert_eq!(seek_cycle(MAX_CYCLE, |_| false), None);
     }
 }

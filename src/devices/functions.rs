@@ -51,7 +51,7 @@ use std::sync::Arc;
 use crate::devices::{Limit, TransientTiming};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
-use super::pulse::{MAX_CYCLE, cycle_position};
+use super::pulse::{MAX_CYCLE, cycle_position, seek_cycle};
 
 fn invalid(kind: &str, message: impl Into<String>) -> SpiceError {
     SpiceError::circuit(format!("invalid {kind} waveform: {}", message.into()))
@@ -902,17 +902,25 @@ impl Iterator for PwlBreakpoints {
     type Item = Real;
     fn next(&mut self) -> Option<Real> {
         let knots = &self.source.knots;
-        while !self.done {
+        while !self.done && self.last.is_none_or(|last| last < self.t1) {
             if self.index >= knots.len() {
                 let Some(repeat) = self.source.repeat() else {
                     self.done = true;
                     break;
                 };
-                self.cycle = if self.cycle == 0. {
+                let first = if self.cycle == 0. {
                     self.first_cycle
                 } else {
                     self.cycle + 1.
                 };
+                let Some(cycle) = seek_cycle(first, |cycle| {
+                    let end = self.source.event_time(knots[knots.len() - 1].0, cycle);
+                    end < self.t0 || self.last.is_some_and(|last| end <= last)
+                }) else {
+                    self.done = true;
+                    break;
+                };
+                self.cycle = cycle;
                 // Knots after the restart point; the restart itself coincides
                 // with the previous repetition's last knot.
                 self.index = repeat + 1;
@@ -1433,5 +1441,32 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn repeated_knots_skip_collapsed_cycles_at_large_delays() {
+        let delay = 1e16_f64;
+        let next = delay.next_up();
+        let source = PwlSource::new(vec![(0., 0.), (1e-12, 1.)], delay, Some(0.)).unwrap();
+        assert_eq!(
+            source
+                .breakpoints_in(delay, next)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [delay, next]
+        );
+        assert_eq!(
+            source
+                .breakpoints_in(delay, delay)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [delay]
+        );
+        assert_eq!(
+            source
+                .breakpoints_in(next, next)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [next]
+        );
     }
 }
