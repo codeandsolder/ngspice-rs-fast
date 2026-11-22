@@ -178,7 +178,7 @@ Golden fixtures (captured once each with `cargo xtask golden capture
 `pz_bridge_diff`, `pz_transformer`, `pz_cv_loop`, `pz_diode`, `pz_mos1` and the
 batch `multi_analysis_pz` (`.ac`, `.op`, two `.pz`). Since the Muller port,
 `multi_analysis_pz` is excluded from `golden verify` (`EXCLUDED` in
-`xtask/src/verify.rs`): the port matches a `-ffp-contract=off` C build bit
+`xtask/src/commands/verify.rs`): the port matches a `-ffp-contract=off` C build bit
 for bit, which hits the 201-trial limit on the poles and writes an empty `pz2`
 plot, while the committed golden came from the FMA-built reference, whose
 search converges to three poles. See

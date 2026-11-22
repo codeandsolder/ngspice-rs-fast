@@ -32,7 +32,7 @@ use ngspice_rs::netlist::ast::{
 };
 use ngspice_rs::primitives::{exact_nonnegative_integer, parse_spice_number};
 
-use crate::compare::{self, TranTolerance};
+use super::compare::{self, TranTolerance};
 
 /// Time coincidence is judged within `TIME_EPS_REL * stop`: far below any
 /// physical timestep, far above the 17-digit rawfile rounding of `t` and of

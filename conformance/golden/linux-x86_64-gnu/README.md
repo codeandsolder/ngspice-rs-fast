@@ -38,7 +38,7 @@ Rust reproduces Linux C; comparing it to the macOS capture caused PR #183's
 CI failures. This is not evidence that the huge ISE number is a portable,
 well-conditioned physical derivative.
 
-`conformance/reference.rs` explicitly selects this file for
+`conformance/support/src/fixtures.rs` explicitly selects this file for
 `x86_64-unknown-linux-gnu`. Capture, drift checks, numerical verification and
 the BJT production test share that selection. The same 291 columns are
 checked at the original `1e-6` relative plus `1e-9` absolute bound. A missing

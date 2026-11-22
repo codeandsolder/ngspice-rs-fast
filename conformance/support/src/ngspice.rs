@@ -50,18 +50,17 @@ pub struct Ngspice {
 ///
 /// # Errors
 ///
-/// A message listing everywhere it looked.
+/// A message listing everywhere it looked. An explicitly selected executable
+/// (including the environment override) must be usable; it never silently
+/// falls back to a different oracle.
 pub fn locate(explicit: Option<&Path>, workspace: &Path) -> Result<Ngspice, String> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(path) = explicit {
-        candidates.push(path.to_path_buf());
-    }
-    if let Some(from_env) = std::env::var_os("NGSPICE_BIN") {
-        candidates.push(PathBuf::from(from_env));
-    }
-    candidates.push(workspace.join("build/src/ngspice"));
-    candidates.push(PathBuf::from("build/src/ngspice"));
-    candidates.push(PathBuf::from("ngspice"));
+    let candidates = if let Some(path) = explicit {
+        vec![path.to_path_buf()]
+    } else if let Some(from_env) = std::env::var_os("NGSPICE_BIN") {
+        vec![PathBuf::from(from_env)]
+    } else {
+        vec![PathBuf::from("build/src/ngspice"), PathBuf::from("ngspice")]
+    };
 
     let mut tried = Vec::new();
     for candidate in candidates {
@@ -421,8 +420,16 @@ mod tests {
     }
 
     #[test]
+    fn missing_explicit_binary_never_falls_back() {
+        let directory = crate::Temp::new();
+        let binary = directory.0.join("missing-ngspice");
+        let error = super::locate(Some(&binary), &directory.0).unwrap_err();
+        assert!(error.contains(&binary.display().to_string()), "{error}");
+    }
+
+    #[test]
     fn stale_init_is_removed_or_reported() {
-        let directory = crate::test_support::Temp::new();
+        let directory = crate::Temp::new();
         let binary = super::Ngspice {
             path: directory.0.join("missing-ngspice"),
             version: "test".to_owned(),
@@ -442,7 +449,7 @@ mod tests {
 
     #[test]
     fn stale_rawfile_failure_precedes_process_launch() {
-        let directory = crate::test_support::Temp::new();
+        let directory = crate::Temp::new();
         let binary = super::Ngspice {
             path: directory.0.join("missing-ngspice"),
             version: "test".to_owned(),

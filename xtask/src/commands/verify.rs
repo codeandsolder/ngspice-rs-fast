@@ -9,8 +9,8 @@ use ngspice_rs::netlist::Parser;
 use ngspice_rs::primitives::{AnalysisKind, parse_spice_number};
 
 #[cfg(test)]
-use crate::workspace_root;
-use crate::{compare, tran};
+use super::workspace_root;
+use super::{compare, tran};
 use ngspice_conformance::fixtures;
 
 /// How a fixture's Rust result is compared with its C golden.
@@ -1898,10 +1898,10 @@ fn run_with_registries(
             .map(|fixture| fixture.name)
             .chain(batch.iter().map(|fixture| fixture.name))
         {
-            if !paths
-                .iter()
-                .any(|path| path.file_stem().is_some_and(|stem| stem == name))
-            {
+            if !paths.iter().any(|path| {
+                path.file_stem()
+                    .is_some_and(|stem| stem.eq_ignore_ascii_case(name))
+            }) {
                 failures.push(format!("missing supported fixture '{name}'"));
             }
         }
@@ -1911,7 +1911,10 @@ fn run_with_registries(
             .file_stem()
             .and_then(|s| s.to_str())
             .ok_or("invalid fixture name")?;
-        if let Some(fixture) = supported.iter().find(|fixture| fixture.name == name) {
+        if let Some(fixture) = supported
+            .iter()
+            .find(|fixture| fixture.name.eq_ignore_ascii_case(name))
+        {
             match fixture_result(root, &path, fixture) {
                 Ok(details) => {
                     verified += 1;
@@ -1925,7 +1928,10 @@ fn run_with_registries(
                     failures.push(format!("{name}: {error}"));
                 }
             }
-        } else if let Some(fixture) = batch.iter().find(|fixture| fixture.name == name) {
+        } else if let Some(fixture) = batch
+            .iter()
+            .find(|fixture| fixture.name.eq_ignore_ascii_case(name))
+        {
             match batch_result(root, &path, fixture) {
                 Ok(details) => {
                     verified += 1;
@@ -1939,7 +1945,10 @@ fn run_with_registries(
                     failures.push(format!("{name}: {error}"));
                 }
             }
-        } else if let Some((_, reason)) = excluded.iter().find(|(fixture, _)| *fixture == name) {
+        } else if let Some((_, reason)) = excluded
+            .iter()
+            .find(|(fixture, _)| fixture.eq_ignore_ascii_case(name))
+        {
             unsupported += 1;
             println!("  unsupported {name}: {reason}");
             if only.is_some() {
@@ -2311,6 +2320,47 @@ mod tests {
         run(&workspace_root(), Some(BATCH[0].name)).unwrap();
         for (path, bytes) in paths.iter().zip(before) {
             assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the independent C oracle in NGSPICE_BIN"]
+    fn capture_check_verify_use_the_same_selected_reference() {
+        use super::super::golden;
+        let temp = Temp::with(&["rc_divider", "multi_analysis_rc", "sens_bjt"]);
+        let root = &temp.0;
+        let binary = std::env::var("NGSPICE_BIN").unwrap();
+        assert!(Path::new(&binary).is_absolute());
+        // Exercise case-insensitive deck IDs without perturbing the real fixtures.
+        let netlists = root.join(fixtures::NETLIST_DIR);
+        fs::rename(netlists.join("sens_bjt.cir"), netlists.join("SENS_BJT.CIR")).unwrap();
+        for name in ["rc_divider", "multi_analysis_rc", "sens_bjt"] {
+            let selected = fixtures::golden_path(root, name);
+            let alternative = if selected == root.join("conformance/golden/sens_bjt.raw") {
+                root.join("conformance/golden/linux-x86_64-gnu/sens_bjt.raw")
+            } else {
+                root.join("conformance/golden/sens_bjt.raw")
+            };
+            if name == "sens_bjt" {
+                fs::create_dir_all(alternative.parent().unwrap()).unwrap();
+                fs::write(&alternative, "not the selected reference").unwrap();
+            }
+            fs::remove_file(&selected).unwrap();
+            let c_command = |command: &str| {
+                [command, "--netlist", name, "--ngspice", &binary].map(str::to_owned)
+            };
+            assert!(golden::main(root, &c_command("check")).is_err());
+            golden::main(root, &c_command("capture")).unwrap();
+            let bytes = fs::read(&selected).unwrap();
+            golden::main(root, &c_command("check")).unwrap();
+            run(root, Some(name)).unwrap();
+            assert_eq!(fs::read(&selected).unwrap(), bytes);
+            if name == "sens_bjt" {
+                assert_eq!(
+                    fs::read_to_string(alternative).unwrap(),
+                    "not the selected reference"
+                );
+            }
         }
     }
 

@@ -97,6 +97,7 @@ fn path_for(root: &Path, name: &str, linux_x86_64_gnu: bool) -> PathBuf {
     // bjtsetup.c scales ISE=1e-3 by IS=1e-16, so cktsens.c's ISE
     // perturbation is 1e-25. Platform libm rounding is amplified by that
     // divisor: Linux C and Rust agree, but neither matches macOS C's residue.
+    let name = name.to_ascii_lowercase();
     if name == "sens_bjt" && linux_x86_64_gnu {
         directory.push("linux-x86_64-gnu");
     }
@@ -110,7 +111,7 @@ mod tests {
 
     #[test]
     fn discovery_handles_case_and_rejects_colliding_ids() {
-        let root = crate::test_support::Temp::new();
+        let root = crate::Temp::new();
         let directory = root.0.join(super::NETLIST_DIR);
         std::fs::create_dir_all(&directory).unwrap();
         let a = directory.join("a.CIR");
@@ -157,6 +158,10 @@ mod tests {
         assert_eq!(
             path_for(root, "sens_bjt", true),
             root.join("conformance/golden/linux-x86_64-gnu/sens_bjt.raw")
+        );
+        assert_eq!(
+            path_for(root, "SENS_BJT", true),
+            path_for(root, "sens_bjt", true)
         );
         assert_eq!(
             path_for(root, "sens_bjt", false),

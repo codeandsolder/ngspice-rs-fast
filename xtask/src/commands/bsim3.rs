@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::ifparm::{self, Spec};
+use super::ifparm::{self, Spec};
 
 const USAGE: &str = "usage: cargo xtask bsim3-schema --source <ngspice-checkout> [--check]";
 

@@ -110,7 +110,7 @@ instance-first (`TXLlengthgiven`, else the model's `length`).
 C's rawfile names **both** branch currents `i(y1)` (`raw_write` strips
 `CKTmkCur`'s suffix), and the port's plot does the same. The comparison
 identifies a repeated name by occurrence, so the two are still checked
-position by position (`xtask/src/compare.rs`).
+position by position (`xtask/src/commands/compare.rs`).
 
 ## The transient (`txlload.c`, `txlacct.c`)
 

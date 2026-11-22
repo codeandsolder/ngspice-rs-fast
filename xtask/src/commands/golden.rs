@@ -68,7 +68,7 @@ pub(super) fn main(root: &Path, arguments: &[String]) -> Result<(), String> {
         Some("capture") => capture(root, &Options::parse(&arguments[1..])?),
         Some("check") => check(root, &Options::parse(&arguments[1..])?),
         Some("list") => list(root),
-        Some("verify") => crate::verify::main(root, &arguments[1..]),
+        Some("verify") => super::verify::main(root, &arguments[1..]),
         _ => Err(format!("usage: unknown 'golden' subcommand\n\n{USAGE}")),
     }
 }
@@ -158,10 +158,7 @@ fn capture(root: &Path, options: &Options) -> Result<(), String> {
         }
         let captured = capture_fixture(&binary, netlist, &scratch)?;
         let target = golden_path(root, netlist)?;
-        let name = netlist
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("<unnamed>");
+        let name = fixtures::fixture_id(netlist)?;
 
         match fs::read_to_string(&target) {
             Ok(existing) if ngspice::rawfiles_match(&existing, &captured.rawfile) => {
@@ -219,10 +216,7 @@ fn check(root: &Path, options: &Options) -> Result<(), String> {
     for netlist in &netlists {
         let captured = capture_fixture(&binary, netlist, &scratch)?;
         let target = golden_path(root, netlist)?;
-        let name = netlist
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("<unnamed>");
+        let name = fixtures::fixture_id(netlist)?;
 
         match fs::read_to_string(&target) {
             Ok(existing) if ngspice::rawfiles_match(&existing, &captured.rawfile) => {
@@ -262,10 +256,7 @@ fn list(root: &Path) -> Result<(), String> {
     let netlists = fixtures::netlist_paths_at(root, None)?;
     println!("{:<22} {:<12} details", "fixture", "golden");
     for netlist in &netlists {
-        let name = netlist
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("<unnamed>");
+        let name = fixtures::fixture_id(netlist)?;
         let target = golden_path(root, netlist)?;
         match fs::read_to_string(&target) {
             Ok(rawfile) => println!("{name:<22} {:<12} {}", "present", describe(&rawfile)?),
@@ -277,8 +268,8 @@ fn list(root: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::workspace_root;
     use super::{Options, golden_path};
-    use crate::workspace_root;
     use ngspice_conformance::fixtures::netlist_paths_at;
     use std::path::PathBuf;
 

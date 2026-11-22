@@ -398,7 +398,7 @@ point when `tstart = 0`). The `.tran` step is not an output grid and no samples
 are interpolated, so no sample can span a source breakpoint, and every
 breakpoint inside the run has a sample. C writes no second sample at a jump and
 neither does this driver: the sample at a jump is the left limit and the next
-sample is the first right-limit step. `xtask/src/tran.rs` consumes such plots
+sample is the first right-limit step. `xtask/src/commands/tran.rs` consumes such plots
 (a single sample at a breakpoint serves both limits, exact for the continuous
 capacitor voltage/inductor current). Consumers that need a regular grid resample
 inside an interval between two samples (never across a breakpoint), as the

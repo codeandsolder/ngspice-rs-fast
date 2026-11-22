@@ -1,6 +1,6 @@
 //! Extract BSIM4 interface facts, not C implementation code. The committed
 //! tables are offline input-schema artifacts; Cargo never needs the C tree.
-use crate::ifparm::{self, Spec};
+use super::ifparm::{self, Spec};
 
 const USAGE: &str = "usage: cargo xtask bsim4-schema --source <ngspice-checkout> [--check]";
 
@@ -49,8 +49,8 @@ pub(super) fn main(root: &std::path::Path, args: &[String]) -> Result<(), String
         &read("b4set.c")?,
         &revision,
     )?;
-    let fields = crate::bsim4_fields::fields(&read("bsim4def.h")?, &revision)?;
-    let asks = crate::bsim4_fields::asks(&read("b4mask.c")?, &read("b4ask.c")?, &revision)?;
+    let fields = super::bsim4_fields::fields(&read("bsim4def.h")?, &revision)?;
+    let asks = super::bsim4_fields::asks(&read("b4mask.c")?, &read("b4ask.c")?, &revision)?;
     for (path, text) in [
         ("src/devices/bsim4/asks.rs", asks),
         ("src/devices/bsim4/parameters.rs", text),
