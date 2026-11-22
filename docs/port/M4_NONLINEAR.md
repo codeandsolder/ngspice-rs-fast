@@ -776,3 +776,25 @@ C drift checks (no fixture recapture):
 ```sh
 NGSPICE_BIN="$PWD/../../ngspice_test/build/src/ngspice" cargo xtask golden check
 ```
+
+### Resolved breakdown matching regression (#63)
+
+The independent recurrence test uses BV=5 V, IBV=2 nA, total saturation
+current=10 pA, Vt=25.864 mV, NBV=1.3. With RELTOL=1e-3 the
+matched voltage is 4.919937198335192 V after three iterations; with
+RELTOL=1e-9 it is 4.920082394248898 V after nine. This is deliberately
+close to the breakdown-current floor, so the former hardcoded tolerance
+is not numerically harmless.
+
+Pinned C (059066b5) at 27 C, Vd=-5.1 V, the same IS/BV/IBV/NBV,
+CJO=20 pF, and VNTOL=1e-15, ABSTOL=1e-18 reports source current
+2.12369315903490703e-9 A at RELTOL=1e-3 and 2.11458459967022560e-9 A at
+RELTOL=1e-9 (about 0.43% difference). The new opt-in
+`model_c_reference::diode_breakdown_uses_resolved_circuit_reltol`
+compares all source-current components across voltage DC, AC, temperature,
+and instance-area sweeps at both tolerances; 8 deck/analysis combinations.
+The opt-in sensitivity regression checks DC and AC replay at both
+tolerances (4 combinations). Both passed on the pinned reference.
+Independent Rust circuit reuse fixes its local Newton tolerances while
+alternating the physical circuit tolerance, checks the matching equation,
+rejects invalid RELTOL, and checks exact restoration of the original result.

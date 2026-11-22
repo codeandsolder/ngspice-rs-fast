@@ -14,7 +14,7 @@
 //! | `temp`, `tnom` | [`AnalysisContext`] circuit/nominal temperature (Celsius, finite, above absolute zero) |
 //! | `gmin` | [`AnalysisContext::gmin`]: junction minimum conductance of every diode/BJT/MOS1 junction in all analyses (C `CKTgmin`, default 1e-12 S; finite, `>= 0`) |
 //! | `pivtol`, `pivrel` | [`AnalysisContext::pivot`]: SPARSE threshold-pivoting limits used whenever a circuit matrix is (re)ordered in any analysis (C `CKTpivotAbsTol`/`CKTpivotRelTol`, `SMPreorder`/`SMPcReorder`; defaults 1e-13 and 1e-3). `pivtol` must be finite and `>= 0`, `pivrel` in `(0, 1]`; C's `spOrderAndFactor` would silently use its default for other values |
-//! | `reltol` | transient relative tolerance (`rtol`): companion truncation/convergence; also the DC/AC Newton `rtol` |
+//! | `reltol` | circuit relative tolerance, including diode temperature matching; default for Newton and transient truncation/convergence |
 //! | `vntol` | voltage absolute tolerance (companion Newton test; DC/AC Newton) |
 //! | `abstol` | branch-current absolute tolerance (companion truncation/Newton test; DC/AC Newton) |
 //! | `chgtol`, `trtol` | companion local-truncation-error charge floor and overestimation factor |
