@@ -940,3 +940,130 @@ fn rootless_pole_zero_rows_round_trip_without_consuming_next_header() {
     invalid.plotname = "other".into();
     assert!(RawFile::single(invalid).to_ascii().is_err());
 }
+
+#[test]
+fn empty_pz_streaming_preserves_following_plot_and_exact_row_budget() {
+    for empty_rows in [0, 1] {
+        let header = format!(
+            "Plotname: Pole-Zero Analysis\nFlags: real\nNo. Variables: 0\nNo. Points: {empty_rows}\nVariables:\n"
+        );
+        let marker = if empty_rows == 1 { "0\t" } else { "" };
+        for (mut bytes, following, encoding) in [
+            (
+                format!("{header}Values:\n{marker}").into_bytes(),
+                ASCII_RAWFILE.as_bytes().to_vec(),
+                RawFormat::Ascii,
+            ),
+            (
+                binary_rawfile(&header, &[]),
+                binary_rawfile(OP_HEADER, &OP_VALUES),
+                RawFormat::Binary,
+            ),
+        ] {
+            let expected = RawFile::parse_bytes(&following).unwrap();
+            let ordinary = expected.single_plot().unwrap();
+            bytes.extend_from_slice(&following);
+            let mut policy = RawReadPolicy::DEFAULT;
+            policy.collect.rows = empty_rows + ordinary.point_count();
+            policy.collect.cells = ordinary.cells().len();
+            policy.collect.variables = ordinary.variable_count();
+            assert_eq!(RawFormat::detect(&bytes).unwrap(), encoding);
+            // Exercise both explicit decoding and finish() draining the
+            // empty row. A one-byte reader splits the ASCII index token.
+            for drain_first in [false, true] {
+                let input = BufReader::with_capacity(1, bytes.as_slice());
+                let mut reader = RawFileReader::new(input).with_policy(policy);
+                let mut empty = reader.next_plot().unwrap().unwrap();
+                assert_eq!(empty.point_count(), empty_rows);
+                if drain_first {
+                    for _ in 0..empty_rows {
+                        assert_eq!(empty.next_row().unwrap().unwrap(), &[]);
+                    }
+                    assert!(empty.next_row().unwrap().is_none());
+                }
+                assert_eq!(empty.finish().unwrap().plot.point_count(), 0);
+                let mut next = reader.next_plot().unwrap().unwrap();
+                assert_eq!(next.point_count(), ordinary.point_count());
+                for row in ordinary.rows() {
+                    assert_eq!(next.next_row().unwrap().unwrap(), row);
+                }
+                next.finish().unwrap();
+                assert!(reader.next_plot().unwrap().is_none());
+            }
+            let collected = RawFileReader::new(bytes.as_slice())
+                .with_policy(policy)
+                .read()
+                .unwrap();
+            assert_eq!(collected.len(), 2);
+            assert_eq!(collected.plots[0].plot.point_count(), empty_rows);
+            assert!(collected.plots[0].plot.cells().is_empty());
+            assert_eq!(collected.plots[1], expected.plots[0]);
+            policy.collect.rows -= 1;
+            assert!(
+                RawFileReader::new(bytes.as_slice())
+                    .with_policy(policy)
+                    .read()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("collected rows")
+            );
+        }
+    }
+}
+
+#[test]
+fn malformed_zero_width_shapes_fail_before_streaming_or_allocation() {
+    for (plotname, flags, points) in [
+        ("Pole-Zero Analysis", "real", 2),
+        ("Pole-Zero Analysis", "real", usize::MAX),
+        ("Pole-Zero Analysis", "complex", 1),
+        ("Operating Point", "real", 1),
+    ] {
+        let header = format!(
+            "Plotname: {plotname}\nFlags: {flags}\nNo. Variables: 0\nNo. Points: {points}\nVariables:\n"
+        );
+        for (mut bytes, next) in [
+            (
+                format!("{header}Values:\n").into_bytes(),
+                ASCII_RAWFILE.as_bytes().to_vec(),
+            ),
+            (
+                binary_rawfile(&header, &[]),
+                binary_rawfile(OP_HEADER, &OP_VALUES),
+            ),
+        ] {
+            bytes.extend_from_slice(&next);
+            assert!(
+                RawFormat::detect(&bytes)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("zero variables")
+            );
+            let mut reader = RawFileReader::new(bytes.as_slice());
+            let Err(error) = reader.next_plot() else {
+                panic!("accepted invalid zero-width shape");
+            };
+            assert!(error.to_string().contains("zero variables"), "{error}");
+            assert!(reader.next_plot().is_err());
+        }
+    }
+}
+
+#[test]
+fn rootless_ascii_index_work_is_bounded_even_when_finishing() {
+    let header = "Plotname: Pole-Zero Analysis\nFlags: real\nNo. Variables: 0\nNo. Points: 1\nVariables:\nValues:\n";
+    let policy = RawReadPolicy {
+        line_bytes: 64,
+        ..RawReadPolicy::DEFAULT
+    };
+    let text = format!("{header}{}0\t{ASCII_RAWFILE}", " ".repeat(65));
+    let mut reader = RawFileReader::new(text.as_bytes()).with_policy(policy);
+    let row = reader.next_plot().unwrap().unwrap();
+    assert!(
+        row.finish()
+            .unwrap_err()
+            .to_string()
+            .contains("empty pole-zero point index")
+    );
+    assert!(reader.next_plot().is_err());
+}

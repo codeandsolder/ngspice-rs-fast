@@ -23,7 +23,9 @@ fn pairs(parameters: &[ParameterAssignment]) -> Vec<(&str, &str)> {
 
 #[test]
 fn diode_dc_fixture_builds_devices_model_and_sweep() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/netlists/diode_dc.cir");
+    let path = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance/netlists/diode_dc.cir");
     let netlist = Parser::new().parse_file(&path).unwrap();
     assert_eq!(netlist.path, path);
     assert_eq!(netlist.title, "Diode DC sweep");

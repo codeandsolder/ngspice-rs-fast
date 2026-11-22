@@ -22,9 +22,7 @@ use std::process::Command;
 use ngspice_rs::analysis::{Plot, RawFile};
 
 fn workspace() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .canonicalize()
-        .expect("the workspace root exists")
+    ngspice_conformance::fixtures::workspace_root().unwrap()
 }
 
 struct Cleanup(PathBuf);
@@ -58,13 +56,15 @@ fn run_both(name: &str, deck_text: &str) -> (RawFile, RawFile) {
         String::from_utf8_lossy(&c.stdout),
         String::from_utf8_lossy(&c.stderr)
     );
-    let rust = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("simulate")
-        .arg("--output")
-        .arg(directory.join("rust.raw"))
-        .arg(&deck)
-        .output()
-        .expect("spice-rs runs");
+    let rust = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("simulate")
+    .arg("--output")
+    .arg(directory.join("rust.raw"))
+    .arg(&deck)
+    .output()
+    .expect("spice-rs runs");
     assert!(
         rust.status.success(),
         "{name}: {}",
@@ -97,7 +97,7 @@ fn compare(name: &str, deck_text: &str) {
         } else {
             1e-12
         };
-        for variable in want.variables() {
+        for (column, variable) in want.variables().iter().enumerate() {
             let want_column = want.column(&variable.name).unwrap();
             let got_column = got
                 .column(&variable.name)
@@ -109,13 +109,15 @@ fn compare(name: &str, deck_text: &str) {
                 variable.name
             );
             for (point, (a, b)) in got_column.iter().zip(&want_column).enumerate() {
-                let difference = if variable.name == "frequency" {
-                    (a.re - b.re).abs()
-                } else {
-                    (*a - *b).magnitude()
-                };
+                let [re, im] = ngspice_conformance::ngspice::batch_reference_sample(
+                    column,
+                    &variable.name,
+                    [b.re, b.im],
+                );
+                let reference = ngspice_rs::primitives::Complex::new(re, im);
+                let difference = (*a - reference).magnitude();
                 assert!(
-                    difference <= 1e-6 * b.magnitude() + floor,
+                    difference <= 1e-6 * reference.magnitude() + floor,
                     "{name}: plot {index} '{}' point {point}: {a} != {b}",
                     variable.name
                 );

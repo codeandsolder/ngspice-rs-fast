@@ -20,7 +20,7 @@ fn value(plot: &Plot, name: &str) -> f64 {
     .re
 }
 fn fixture(level: u8, per_device: usize) {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = ngspice_conformance::fixtures::workspace_root().unwrap();
     let deck =
         std::fs::read_to_string(root.join(format!("conformance/netlists/sens_mos{level}.cir")))
             .unwrap();

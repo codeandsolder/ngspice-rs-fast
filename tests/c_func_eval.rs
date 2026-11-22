@@ -23,7 +23,7 @@ impl Drop for Scratch {
 /// Runs C on `cards` plus a source whose DC value is `value` (written as is,
 /// so `{...}` or `'...'`); `Err` when C fails or never prints the node.
 fn c_value(label: &str, cards: &str, value: &str) -> Result<f64, String> {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join(".");
+    let workspace = ngspice_conformance::fixtures::workspace_root().unwrap();
     let binary = PathBuf::from(std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN"));
     let binary = if binary.is_absolute() {
         binary

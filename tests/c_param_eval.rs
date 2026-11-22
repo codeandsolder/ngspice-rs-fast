@@ -21,7 +21,7 @@ impl Drop for Scratch {
 
 /// Runs C on `params` plus a source reading `{probe}`; `Err` when C fails.
 fn c_value(label: &str, params: &str, probe: &str) -> Result<f64, String> {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join(".");
+    let workspace = ngspice_conformance::fixtures::workspace_root().unwrap();
     let binary = PathBuf::from(std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN"));
     let binary = if binary.is_absolute() {
         binary

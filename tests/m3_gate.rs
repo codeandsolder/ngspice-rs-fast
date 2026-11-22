@@ -33,7 +33,9 @@ use ngspice_rs::netlist::Parser;
 use ngspice_rs::primitives::parse_spice_number;
 
 fn conformance() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance")
+    ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance")
 }
 
 /// A fixture deck and its production request.

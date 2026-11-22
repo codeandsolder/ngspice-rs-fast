@@ -384,7 +384,8 @@ fn m7_fixtures_parse_write_parse_with_a_fixed_point() {
     ] {
         let n = Parser::new()
             .parse_file(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
+                ngspice_conformance::fixtures::workspace_root()
+                    .unwrap()
                     .join(format!("conformance/netlists/{name}.cir")),
             )
             .unwrap();
@@ -534,7 +535,7 @@ fn sensitivity_matches_the_reference_on_the_fixture_card() {
          .model qp pnp level=1 tnom=50 tbr1=0.02 tbr2=2e-5\n.sens i(vids)",
     );
     let raw = ngspice_rs::analysis::RawFile::load(fixtures::golden_path(
-        Path::new(env!("CARGO_MANIFEST_DIR")),
+        &ngspice_conformance::fixtures::workspace_root().unwrap(),
         "sens_bjt",
     ))
     .unwrap();

@@ -369,7 +369,9 @@ fn parsed_source_functions_match_live_c_coefficients() {
 #[test]
 #[ignore = "requires NGSPICE_BIN; run cargo test -p ngspice-rs --test c_reference -- --ignored"]
 fn parsed_source_structure_matches_live_c_setup() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/parser/sources/main.cir");
+    let path = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance/parser/sources/main.cir");
     let n = Parser::new().parse_file(path).unwrap();
     assert_eq!(n.subcircuits[0].name, "div");
     assert_eq!(n.device("x1").unwrap().model.as_deref(), Some("div"));
@@ -421,7 +423,7 @@ fn reference_output_sources(
     text: &str,
     sources: &[(&str, &str)],
 ) -> std::process::Output {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join(".");
+    let workspace = ngspice_conformance::fixtures::workspace_root().unwrap();
     let binary = PathBuf::from(std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN"));
     let binary = if binary.is_absolute() {
         binary

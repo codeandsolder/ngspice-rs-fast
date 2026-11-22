@@ -10,12 +10,14 @@ fn simulate(tag: &str, deck: &str) -> (RawFile, String) {
     let dir = std::env::temp_dir().join(format!("m8-output-{}-{tag}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("deck.cir"), deck).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .args(["simulate", "--output"])
-        .arg(dir.join("result.raw"))
-        .arg(dir.join("deck.cir"))
-        .output()
-        .unwrap();
+    let output = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .args(["simulate", "--output"])
+    .arg(dir.join("result.raw"))
+    .arg(dir.join("deck.cir"))
+    .output()
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",
