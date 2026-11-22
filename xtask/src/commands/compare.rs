@@ -177,13 +177,17 @@ pub(super) const POLE_ZERO: RootTolerance = RootTolerance {
 
 /// The roots of one kind (`pole` or `zero`) of a pole-zero plot, in column
 /// order.
-fn root_set(plot: &Plot, kind: &str) -> Vec<(String, ngspice_rs::primitives::Complex)> {
+fn root_set(
+    plot: &Plot,
+    row: &[ngspice_rs::primitives::Complex],
+    kind: &str,
+) -> Vec<(String, ngspice_rs::primitives::Complex)> {
     let prefix = format!("v({kind}(");
     plot.variables()
         .iter()
-        .enumerate()
-        .filter(|(_, variable)| variable.name.to_ascii_lowercase().starts_with(&prefix))
-        .map(|(index, variable)| (variable.name.clone(), plot.row(0).unwrap()[index]))
+        .zip(row)
+        .filter(|(variable, _)| variable.name.to_ascii_lowercase().starts_with(&prefix))
+        .map(|(variable, value)| (variable.name.clone(), *value))
         .collect()
 }
 
@@ -252,13 +256,15 @@ pub(super) fn roots(got: &Plot, want: &Plot, tolerance: RootTolerance) -> Result
     }
     let mut worst_ratio: f64 = 0.0;
     let mut counts = Vec::new();
-    let scale = want
+    let got_row = got
         .row(0)
-        .unwrap()
-        .iter()
-        .fold(0.0_f64, |m, z| m.max(z.magnitude()));
+        .ok_or_else(|| "Rust pole-zero plot has no row".to_owned())?;
+    let want_row = want
+        .row(0)
+        .ok_or_else(|| "C pole-zero plot has no row".to_owned())?;
+    let scale = want_row.iter().fold(0.0_f64, |m, z| m.max(z.magnitude()));
     for kind in ["pole", "zero"] {
-        let (rust, c) = (root_set(got, kind), root_set(want, kind));
+        let (rust, c) = (root_set(got, got_row, kind), root_set(want, want_row, kind));
         if rust.len() != c.len() {
             return Err(format!(
                 "{kind} count mismatch: Rust {}, C {}",

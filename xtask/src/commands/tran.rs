@@ -164,7 +164,16 @@ impl<'a> Series<'a> {
 
     /// Value of column `column` at `t` on `side`.
     fn value(&self, column: usize, t: f64, side: Side) -> Result<f64, String> {
-        let at = |index: usize| self.plot.row(index).unwrap()[column].re;
+        let values = self
+            .plot
+            .column_at(column)
+            .ok_or_else(|| format!("{}: missing column {column}", self.label))?;
+        let at = |index| {
+            values
+                .get(index)
+                .map(|value| value.re)
+                .ok_or_else(|| format!("{}: no sample {index} for column {column}", self.label))
+        };
         if let Some(b) = self.breakpoint_near(t) {
             let near: Vec<usize> = (0..self.times.len())
                 .filter(|&i| (self.times[i] - b).abs() <= self.eps)
@@ -176,8 +185,8 @@ impl<'a> Series<'a> {
                 ));
             };
             return match side {
-                Side::Left => Ok(at(first)),
-                Side::Right => Ok(at(last)),
+                Side::Left => at(first),
+                Side::Right => at(last),
                 Side::Interior => Err(format!(
                     "{}: interior evaluation requested at breakpoint {b:e}",
                     self.label
@@ -189,7 +198,7 @@ impl<'a> Series<'a> {
             return Err(format!("{}: time {t:e} is beyond the samples", self.label));
         }
         if (self.times[upper] - t).abs() <= self.eps {
-            return Ok(at(upper));
+            return at(upper);
         }
         if upper == 0 {
             return Err(format!("{}: time {t:e} precedes the samples", self.label));
@@ -203,8 +212,8 @@ impl<'a> Series<'a> {
             ));
         }
         let fraction = (t - t0) / (t1 - t0);
-        let left = (1.0 - fraction) * at(upper - 1);
-        let right = fraction * at(upper);
+        let left = (1.0 - fraction) * at(upper - 1)?;
+        let right = fraction * at(upper)?;
         Ok(left + right)
     }
 }
@@ -303,8 +312,11 @@ pub(super) fn transient(
             "current" => tolerance.current_absolute,
             other => return Err(format!("signal '{name}' has unsupported unit '{other}'")),
         };
-        let peak = (0..want.point_count())
-            .map(|row| want.row(row).unwrap()[column].re.abs())
+        let peak = want
+            .column_at(column)
+            .ok_or_else(|| format!("C: missing column {column} for '{name}'"))?
+            .iter()
+            .map(|value| value.re.abs())
             .fold(0.0, f64::max);
         let peak_allowance = tolerance.peak_relative * peak;
         let absolute = absolute + peak_allowance;
