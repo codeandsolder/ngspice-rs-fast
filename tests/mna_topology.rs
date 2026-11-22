@@ -129,3 +129,54 @@ fn rectangular_matrices_have_no_shared_row_column_unknown_set() {
     assert!(error.to_string().contains("square"));
     assert_eq!(matrix, original);
 }
+
+#[test]
+fn manual_edits_enforce_elaboration_limits_without_revoking_existing_topology() {
+    use ngspice_rs::devices::{Capacitor, Circuit, ElaborationLimits, Resistor};
+    use ngspice_rs::primitives::NodeId;
+    let mut circuit = Circuit::with_elaboration_limits(ElaborationLimits {
+        devices: 1,
+        nodes: 1,
+        state_slots: 0,
+    });
+    let node = circuit.add_node("out").unwrap();
+    let terminals = [node, NodeId::GROUND];
+    circuit
+        .add_device(Box::new(Resistor::new("r1", terminals, 100.).unwrap()))
+        .unwrap();
+    circuit.finalize().unwrap();
+    let pattern = circuit.matrix_pattern().unwrap();
+    let before_nodes = circuit.nodes().nodes().to_vec();
+    assert_eq!(circuit.add_node("OUT").unwrap(), node);
+    assert!(
+        circuit
+            .add_node("extra")
+            .unwrap_err()
+            .to_string()
+            .contains("nodes")
+    );
+    assert!(
+        circuit
+            .add_device(Box::new(Resistor::new("r2", terminals, 100.).unwrap()))
+            .unwrap_err()
+            .to_string()
+            .contains("devices")
+    );
+    assert!(
+        circuit
+            .replace_device(
+                0,
+                Box::new(Capacitor::new("c1", terminals, 1e-9, None).unwrap())
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("state slots")
+    );
+    assert_eq!(circuit.nodes().nodes(), before_nodes);
+    assert_eq!(circuit.device_count(), 1);
+    assert!(circuit.device("r1").is_some());
+    assert!(std::sync::Arc::ptr_eq(
+        &pattern,
+        &circuit.matrix_pattern().unwrap()
+    ));
+}

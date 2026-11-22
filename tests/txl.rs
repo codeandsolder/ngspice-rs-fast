@@ -581,3 +581,78 @@ fn the_registry_reports_a_bounded_y() {
     ));
     assert!(!entry.description.is_empty());
 }
+
+#[test]
+fn txl_fallback_and_native_plans_have_exact_distinct_resource_costs() {
+    use ngspice_rs::devices::{ElaborationLimits, ModelResolver};
+    for (body, limits, fallback) in [
+        (
+            LADDER,
+            ElaborationLimits {
+                devices: 9,
+                nodes: 4,
+                state_slots: 8,
+            },
+            true,
+        ),
+        (
+            PADE,
+            ElaborationLimits {
+                devices: 3,
+                nodes: 2,
+                state_slots: 0,
+            },
+            false,
+        ),
+    ] {
+        let parsed = deck(body).unwrap();
+        let models = ModelResolver::new(&parsed.models).unwrap();
+        let mut c = Circuit::with_elaboration_limits(limits);
+        c.add_instances(&parsed.devices, &models, &Default::default())
+            .unwrap();
+        c.finalize().unwrap();
+        assert_eq!(c.device_count(), limits.devices);
+        assert_eq!(c.nodes().len() - 1, limits.nodes);
+        assert_eq!(c.state_len(), limits.state_slots);
+        assert_eq!(c.device("y1").is_none(), fallback);
+        let reference = circuit(body).unwrap();
+        assert_eq!(c.unknown_names(), reference.unknown_names());
+        let too_small = [
+            ElaborationLimits {
+                devices: limits.devices - 1,
+                ..limits
+            },
+            ElaborationLimits {
+                nodes: limits.nodes - 1,
+                ..limits
+            },
+        ];
+        for limit in too_small {
+            let mut c = Circuit::with_elaboration_limits(limit);
+            let error = c
+                .add_instances(&parsed.devices, &models, &Default::default())
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("elaboration resource limit"),
+                "{error}"
+            );
+            assert_eq!(c.device_count(), 0);
+            assert_eq!(c.nodes().len(), 1);
+        }
+        if fallback {
+            let mut c = Circuit::with_elaboration_limits(ElaborationLimits {
+                state_slots: 7,
+                ..limits
+            });
+            let error = c
+                .add_instances(&parsed.devices, &models, &Default::default())
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("8 state slots exceed 7"),
+                "{error}"
+            );
+            assert_eq!(c.device_count(), 0);
+            assert_eq!(c.nodes().len(), 1);
+        }
+    }
+}

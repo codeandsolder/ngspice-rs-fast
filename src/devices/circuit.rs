@@ -726,7 +726,7 @@ impl Circuit {
     /// Node identity or allocation capacity is exhausted.
     pub fn add_node(&mut self, name: &str) -> SpiceResult<NodeId> {
         let before = self.nodes.len();
-        let limit = self.elaboration_limits.max_nodes;
+        let limit = self.elaboration_limits.nodes;
         let node = self.nodes.transaction(|nodes| {
             let node = nodes.intern(name)?;
             if nodes.len() - 1 > limit {
@@ -3321,7 +3321,7 @@ impl Circuit {
             netlist,
             &elaborated.scope,
             crate::devices::subckt::SubcircuitLimits {
-                max_devices: elaboration_limits.max_devices,
+                max_devices: elaboration_limits.devices,
                 ..Default::default()
             },
         )?;

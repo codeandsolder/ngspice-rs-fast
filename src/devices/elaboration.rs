@@ -13,19 +13,19 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElaborationLimits {
     /// Maximum device records, including URC markers and generated devices.
-    pub max_devices: usize,
+    pub devices: usize,
     /// Maximum distinct non-ground nodes, including setup-private nodes.
-    pub max_nodes: usize,
+    pub nodes: usize,
     /// Maximum declared device state slots (one scalar per slot).
-    pub max_state_slots: usize,
+    pub state_slots: usize,
 }
 
 impl Default for ElaborationLimits {
     fn default() -> Self {
         Self {
-            max_devices: super::subckt::SubcircuitLimits::default().max_devices,
-            max_nodes: 1_000_000,
-            max_state_slots: 4_000_000,
+            devices: super::subckt::SubcircuitLimits::default().max_devices,
+            nodes: 1_000_000,
+            state_slots: 4_000_000,
         }
     }
 }
@@ -81,9 +81,9 @@ impl ElaborationLimits {
         location: Option<&SourceLoc>,
     ) -> SpiceResult<()> {
         for (name, current, limit) in [
-            ("devices", size.devices, self.max_devices),
-            ("non-ground nodes", size.nodes, self.max_nodes),
-            ("state slots", size.states, self.max_state_slots),
+            ("devices", size.devices, self.devices),
+            ("non-ground nodes", size.nodes, self.nodes),
+            ("state slots", size.states, self.state_slots),
         ] {
             if current > limit {
                 return Err(resource_error(
@@ -135,7 +135,7 @@ impl<'a> PlannedInstance<'a> {
         models: &ModelResolver<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Self> {
-        let kind = match instance.designator {
+        let kind = match instance.designator.to_ascii_lowercase() {
             'u' => PlannedKind::Urc(UrcPlan::prepare(instance, models, context)?),
             'y' => PlannedKind::Txl(TxlPlan::prepare(instance, models, context)?),
             _ => PlannedKind::Ordinary,
@@ -231,5 +231,52 @@ impl<'a> PlannedBatch<'a> {
             devices: known.devices - existing.devices,
             deck_nodes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_dimensions_and_reserve_fail_without_wrapping() {
+        let unrestricted = ElaborationLimits {
+            devices: usize::MAX,
+            nodes: usize::MAX,
+            state_slots: usize::MAX,
+        };
+        for size in [
+            ElaborationSize::new(usize::MAX, 0, 0),
+            ElaborationSize::new(0, usize::MAX, 0),
+            ElaborationSize::new(0, 0, usize::MAX),
+        ] {
+            assert!(
+                size.checked_add(ElaborationSize::new(1, 1, 1), None)
+                    .is_err()
+            );
+        }
+        assert!(
+            unrestricted
+                .check(ElaborationSize::new(0, 0, usize::MAX), None)
+                .is_err()
+        );
+        if usize::BITS > u32::BITS {
+            assert!(
+                unrestricted
+                    .check(ElaborationSize::new(0, usize::MAX, 0), None)
+                    .is_err()
+            );
+        }
+        let mut nodes = NodeTable::new();
+        let retained = nodes.intern("keep").unwrap();
+        let before = nodes.nodes().to_vec();
+        let mut final_records = vec![retained];
+        let result = nodes.transaction(|nodes| {
+            nodes.intern("temporary")?;
+            reserve(&mut final_records, usize::MAX, None)
+        });
+        assert!(result.unwrap_err().to_string().contains("reserve"));
+        assert_eq!(nodes.nodes(), before);
+        assert_eq!(final_records, [retained]);
     }
 }
