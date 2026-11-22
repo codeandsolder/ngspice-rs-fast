@@ -71,6 +71,7 @@ pub use rawfile::{
     BinaryByteOrder, RawFile, RawFileReader, RawFileWriter, RawFormat, RawPlot, RawPlotRows,
     StreamedPlot,
 };
+pub use rawfile::{FinishedPlot, RawFileTransaction};
 pub use results::{Plot, PlotBuilder, PlotFlags, PlotSchema, PointSink, Variable};
 pub use selection::{Selection, print_requests, write_requests};
 

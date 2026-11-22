@@ -54,8 +54,13 @@
     reason = "the ASCII ngspice rawfile documentation demonstrates literal tab separator bytes"
 )]
 
+mod transaction;
+
+use transaction::OwnedTemporary;
+pub use transaction::RawFileTransaction;
+
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -341,12 +346,21 @@ impl RawFileWriter {
     ) -> SpiceResult<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::create(&path).map_err(|error| SpiceError::io(&path, &error))?;
-        Ok(Self {
+        Ok(Self::from_file(file, path, format, byte_order))
+    }
+
+    fn from_file(
+        file: File,
+        path: PathBuf,
+        format: RawFormat,
+        byte_order: BinaryByteOrder,
+    ) -> Self {
+        Self {
             out: BufWriter::new(file),
             path,
             format,
             byte_order,
-        })
+        }
     }
 
     /// The encoding this writer uses.
@@ -385,22 +399,26 @@ impl RawFileWriter {
         spool: impl AsRef<Path>,
     ) -> SpiceResult<StreamedPlot> {
         let path = spool.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| SpiceError::io(&path, &error))?;
-        let mut header = header;
+        let (file, temporary) =
+            OwnedTemporary::open(path.clone()).map_err(|error| SpiceError::io(&path, &error))?;
+        Ok(self.begin_owned_plot(header, file, temporary))
+    }
+
+    fn begin_owned_plot(
+        &self,
+        mut header: RawPlot,
+        file: File,
+        temporary: OwnedTemporary,
+    ) -> StreamedPlot {
         header.plot.clear_points();
-        Ok(StreamedPlot {
+        StreamedPlot {
             header,
             format: self.format,
             byte_order: self.byte_order,
             point_count: 0,
-            spool: Some(BufWriter::new(file)),
-            path,
-        })
+            spool: BufWriter::new(file),
+            temporary,
+        }
     }
 
     /// Writes a streamed plot: its header with the final point count, then the
@@ -411,7 +429,7 @@ impl RawFileWriter {
     /// [`SpiceError::Io`] when the spool cannot be read back or the rawfile
     /// cannot be written; [`SpiceError::Unsupported`] when the spool encoding
     /// differs from this writer's encoding.
-    pub fn finish_plot(&mut self, mut plot: StreamedPlot) -> SpiceResult<()> {
+    pub fn finish_plot(&mut self, plot: StreamedPlot) -> SpiceResult<FinishedPlot> {
         if plot.format != self.format
             || (self.format.is_binary() && plot.byte_order != self.byte_order)
         {
@@ -419,18 +437,25 @@ impl RawFileWriter {
                 "streamed plot encoding differs from rawfile writer",
             ));
         }
-        let spool_error = |error: io::Error| SpiceError::io(&plot.path, &error);
-        let Some(spool) = plot.spool.take() else {
-            return Ok(());
-        };
+        let StreamedPlot {
+            header,
+            point_count,
+            spool,
+            temporary,
+            ..
+        } = plot;
+        let spool_error = |error: io::Error| SpiceError::io(temporary.path(), &error);
         let mut file = spool
             .into_inner()
             .map_err(|error| spool_error(error.into_error()))?;
         file.seek(SeekFrom::Start(0)).map_err(spool_error)?;
-        render_header(&mut self.out, &plot.header, plot.point_count, self.format)
+        render_header(&mut self.out, &header, point_count, self.format)
             .map_err(|error| self.io_error(&error))?;
         io::copy(&mut file, &mut self.out).map_err(|error| self.io_error(&error))?;
-        Ok(())
+        Ok(FinishedPlot {
+            header,
+            point_count,
+        })
     }
 
     /// Flushes everything written so far and closes the file.
@@ -460,9 +485,9 @@ pub struct StreamedPlot {
     format: RawFormat,
     byte_order: BinaryByteOrder,
     point_count: usize,
-    /// `None` once finished.
-    spool: Option<BufWriter<File>>,
-    path: PathBuf,
+    // Field order closes the spool before the owned path is removed.
+    spool: BufWriter<File>,
+    temporary: OwnedTemporary,
 }
 
 impl StreamedPlot {
@@ -490,33 +515,29 @@ impl StreamedPlot {
             .point_count
             .checked_add(1)
             .ok_or_else(|| unsupported("rawfile point count overflows a usize"))?;
-        let Some(spool) = self.spool.as_mut() else {
-            return Err(unsupported("point pushed to a finished rawfile plot"));
-        };
         write_point(
-            spool,
+            &mut self.spool,
             &self.header.plot,
             self.format,
             self.point_count,
             values,
             self.byte_order,
         )
-        .map_err(|error| SpiceError::io(&self.path, &error))?;
+        .map_err(|error| SpiceError::io(self.temporary.path(), &error))?;
         self.point_count = next_count;
         Ok(())
     }
 }
 
-impl Drop for StreamedPlot {
-    fn drop(&mut self) {
-        // Close before removing; a failed removal leaves only a stray spool
-        // file beside the rawfile, never a partial rawfile.
-        self.spool = None;
-        let _ = fs::remove_file(&self.path);
-    }
+/// Metadata of a completed streamed plot; rows were written without retention.
+#[derive(Debug)]
+pub struct FinishedPlot {
+    /// Plot headers and column schema.
+    pub header: RawPlot,
+    /// Number of stored points.
+    pub point_count: usize,
 }
 
-/// Checks that every point of `plot` has one value per variable.
 fn validate_plot(plot: &Plot) -> SpiceResult<()> {
     plot.points()
         .iter()

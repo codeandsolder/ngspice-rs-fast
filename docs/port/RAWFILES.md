@@ -156,6 +156,32 @@ that file was already in this canonical form: per-variable options are dropped
 a batch-written file parses correctly but re-renders canonically rather than
 byte for byte.
 
+### Atomic rawfile output transactions
+
+`RawFileTransaction::create(destination, format, byte_order)` exclusively
+creates its output beside the destination and owns that opened file. A bounded
+128-attempt name generator retries collisions without opening, truncating or
+unlinking existing paths (including symlinks). Names are independent of the
+destination basename, which can itself be long. The destination is excluded
+from candidate names.
+
+Use `write_plot` for retained plots, or `begin_plot`, `push_point` and
+`finish_plot` for streamed plots; the transaction owns the active spool and
+its unique path. Each operation failure poisons the transaction. Only a
+complete, flushed transaction can `publish`, replacing the final file by a
+same-directory rename. Dropping an unfinished transaction closes and removes
+its owned temporary files. Unix cleanup/publication also verifies the opened
+file's device and inode before operating on its name. As with other
+rename-based transactions, this assumes the destination directory is trusted;
+it is not a defense against a process freely rearranging directory entries
+during the rename itself. Publication is atomic, not a power-loss durability
+guarantee.
+
+The lower-level `RawFileWriter::create` retains deliberate create/truncate
+semantics for explicit paths; its explicit spool paths still require
+exclusive creation. The CLI uses the transaction for both retained and
+streamed analysis output.
+
 ## Incremental decoding and validation
 
 For both formats, a single header parser validates the declared shape. Binary
