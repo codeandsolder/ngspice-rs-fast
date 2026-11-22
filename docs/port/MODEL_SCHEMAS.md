@@ -109,7 +109,9 @@ validated `ModelBackend` catalog is authoritative for factory dispatch and
 the CLI device capability list. The pinned C `INPdomodel` maps BJT levels
 0/1/2 to Gummel–Poon and MOS levels 0/1 to MOS1; these aliases now instantiate
 the exact same Rust physics without changing the first-selector provenance.
-MESA retains its actual level for its distinct equations. C would ignore some
+JFET and MESFET retain the rounded first selector including zero. MESA retains its
+actual level for its distinct equations. BSIM version selection occurs once during
+model resolution, not again during input schema preparation. C would ignore some
 passive level values that Rust conservatively rejects. Unsupported levels
 return located errors with C references, and an available backend can still
 reject an unsupported physical parameter or analysis.

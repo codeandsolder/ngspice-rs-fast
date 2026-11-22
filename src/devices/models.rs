@@ -291,8 +291,8 @@ impl ModelBackend {
 pub struct LevelSelection {
     /// First raw scalar level, or `None` if omitted. No AST mutation occurs.
     pub first_raw: Option<Real>,
-    /// Backend selector: first-level rounding for BJT/MOS/`r`; fixed 1 for
-    /// diode, capacitor, inductor and `res`.
+    /// First rounded level for selector-based families (including aliases);
+    /// fixed 1 for families whose C backend does not scan the level.
     pub selector: u8,
     /// Concrete implementation for the validated selector.
     pub backend: ModelBackend,
@@ -981,15 +981,9 @@ fn rounded_level(raw: Real, location: &SourceLoc) -> SpiceResult<u8> {
 /// level.
 const fn mos_level_reference(selector: u8) -> &'static str {
     match selector {
-        0 => "src/spicelib/parser/inpdomod.c (level 0 selects src/spicelib/devices/mos1/)",
-        2 => "src/spicelib/devices/mos2/",
         4 => "src/spicelib/devices/bsim1/",
         5 => "src/spicelib/devices/bsim2/",
-        6 => "src/spicelib/devices/mos6/",
-        8 | 49 => "src/spicelib/devices/bsim3/ (bsim3v0/, bsim3v1/, bsim3v32/ by VERSION)",
-        9 => "src/spicelib/devices/mos9/",
         10 | 58 => "src/spicelib/devices/bsimsoi/",
-        14 | 54 => "src/spicelib/devices/bsim4/ (bsim4v5/, bsim4v6/, bsim4v7/ by VERSION)",
         55 => "src/spicelib/devices/bsim3soi_fd/",
         56 => "src/spicelib/devices/bsim3soi_dd/",
         57 => "src/spicelib/devices/bsim3soi_pd/",
@@ -1020,25 +1014,9 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
     }
     let first_integer = first.map_or(1, |(_, integer, _)| integer);
     let location = first.map_or(&card.location, |(_, _, location)| location);
-    let selector = match family {
-        ModelFamily::Npn | ModelFamily::Pnp | ModelFamily::Nmos | ModelFamily::Pmos => {
-            first_integer
-        }
-        ModelFamily::Resistor if card.base.eq_ignore_ascii_case("r") => first_integer,
-        // inpdomod.c: NJF/PJF level 0 or 1 is JFET, 2 is JFET2;
-        // NMF/PMF level 0 or 1 is MES, 2-4 MESA, 5 HFET1, 6 HFET2.
-        ModelFamily::Njf | ModelFamily::Pjf | ModelFamily::Nmf | ModelFamily::Pmf => {
-            first_integer.max(1)
-        }
-        _ => 1,
-    };
-    let applied = (family == ModelFamily::Diode).then_some(last.unwrap_or(1));
-    // Some C device families use a fixed backend and separately apply, or
-    // reject, explicit level data. Do not confuse those rules with aliases
-    // that select a different model implementation.
-    let valid_setter = match family {
-        ModelFamily::Diode => applied == Some(1),
-        ModelFamily::Resistor if card.base.eq_ignore_ascii_case("r") => true,
+    // Preserve the first rounded selector, including aliases. Fixed-backend
+    // families have separate level setter policy.
+    let (selector, valid_setter, applied) = match family {
         ModelFamily::Npn
         | ModelFamily::Pnp
         | ModelFamily::Nmos
@@ -1046,8 +1024,13 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
         | ModelFamily::Njf
         | ModelFamily::Pjf
         | ModelFamily::Nmf
-        | ModelFamily::Pmf => true,
-        _ => first_integer == 1,
+        | ModelFamily::Pmf => (first_integer, true, None),
+        ModelFamily::Resistor if card.base.eq_ignore_ascii_case("r") => (first_integer, true, None),
+        ModelFamily::Diode => {
+            let applied = last.unwrap_or(1);
+            (1, applied == 1, Some(applied))
+        }
+        _ => (1, first_integer == 1, None),
     };
     let Some(backend) = ModelBackend::select(family, selector).filter(|_| valid_setter) else {
         if matches!(family, ModelFamily::Njf | ModelFamily::Pjf) {

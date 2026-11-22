@@ -376,9 +376,9 @@ impl Mesfet {
         resolved: &ResolvedModel<'_>,
         _context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        if resolved.levels().selector != 1 || i.nodes.len() != 3 {
+        if resolved.levels().backend != crate::devices::ModelBackend::Mesfet || i.nodes.len() != 3 {
             return Err(SpiceError::circuit(format!(
-                "{}: MESFET needs level 1 and three terminals",
+                "{}: MESFET needs level 0/1 and three terminals",
                 i.name
             )));
         }

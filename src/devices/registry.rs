@@ -56,7 +56,7 @@ pub enum DeviceSupport {
     /// The entry's factory builds the device from its card.
     Ported,
     /// Built only while elaborating a deck (it needs a `.model` card or a
-    /// `.subckt` definition), for the subset of C's models named by `scope`.
+    /// `.subckt` definition), for the model backends in the built-in catalog.
     Bounded,
     /// Not built: instances fail with `NotYetPorted` and the C reference.
     Pending,

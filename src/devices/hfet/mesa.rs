@@ -243,7 +243,7 @@ impl Mesa {
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
         let level = resolved.levels().selector;
-        if !matches!(level, 2..=4) {
+        if resolved.levels().backend != crate::devices::ModelBackend::Mesa {
             return Err(SpiceError::circuit(format!(
                 "{}: MESA needs level 2, 3 or 4",
                 i.name

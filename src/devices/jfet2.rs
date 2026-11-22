@@ -654,7 +654,7 @@ impl Jfet2 {
         resolved: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        if resolved.levels().selector != 2 || i.nodes.len() != 3 {
+        if resolved.levels().backend != crate::devices::ModelBackend::Jfet2 || i.nodes.len() != 3 {
             return Err(SpiceError::circuit(format!(
                 "{}: JFET2 needs level 2 and three terminals",
                 i.name
