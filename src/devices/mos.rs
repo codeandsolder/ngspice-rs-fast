@@ -368,19 +368,6 @@ pub(super) struct Junction {
     pub(super) reverse: ReverseLaw,
 }
 
-/// The MOS grading-1/2 shortcut, rationalized at small voltages.
-/// Other grading exponents use the same integrated depletion law as BJT.
-fn mos_depletion(v: Real, cz: Real, potential: Real, grading: Real) -> (Real, Real) {
-    if cz == 0. {
-        (0., 0.)
-    } else if grading == 0.5 {
-        let root = (1. - v / potential).sqrt();
-        (cz * (v / 1_f64.midpoint(root)), cz / root)
-    } else {
-        reverse_depletion(v, cz, potential, grading)
-    }
-}
-
 impl Junction {
     /// `mos1temp.c`/`mos3temp.c`: the junction of one side from its
     /// zero-bias bottom and sidewall capacitances, with the linear
@@ -401,8 +388,8 @@ impl Junction {
         reverse: ReverseLaw,
     ) -> Self {
         let depletion = fc * potential;
-        let (qb, cb) = mos_depletion(depletion, bottom, potential, mj);
-        let (qs, cs) = mos_depletion(depletion, sidewall, potential, mjsw);
+        let (qb, cb) = reverse_depletion(depletion, bottom, potential, mj);
+        let (qs, cs) = reverse_depletion(depletion, sidewall, potential, mjsw);
         let edge_charge = qb + qs;
         let edge_capacitance = cb + cs;
         let forward_slope = cb.mul_add(mj, cs * mjsw) / (potential * (1. - fc));
@@ -430,8 +417,8 @@ impl Junction {
             return (0., 0.);
         }
         if v < self.depletion {
-            let (qb, cb) = mos_depletion(v, self.bottom, self.potential, self.mj);
-            let (qs, cs) = mos_depletion(v, self.sidewall, self.potential, self.mjsw);
+            let (qb, cb) = reverse_depletion(v, self.bottom, self.potential, self.mj);
+            let (qs, cs) = reverse_depletion(v, self.sidewall, self.potential, self.mjsw);
             (qb + qs, cb + cs)
         } else {
             let delta = v - self.depletion;

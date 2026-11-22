@@ -64,7 +64,7 @@ use self::linear::{GateLinearization, GatePencil, ac_conductances};
 use crate::devices::limiting;
 use crate::devices::nonlinear::charge::ChargeBranch;
 use crate::devices::nonlinear::thermal::{SiliconTemperature, TemperatureCache, TemperatureKey};
-use crate::devices::nonlinear::{cubic_reverse_junction, exponential_junction};
+use crate::devices::nonlinear::{DepletionLaw, cubic_reverse_junction, exponential_junction};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -225,16 +225,11 @@ struct Operating {
     /// `JFETdrainConduct * area`, `JFETsourceConduct * area` (`gdpr`, `gspr`).
     gdpr: Real,
     gspr: Real,
-    /// C `JFETtGatePot`.
-    pb: Real,
     /// `JFETtCGS * area`, `JFETtCGD * area`.
     czgs: Real,
     czgd: Real,
-    /// C `JFETcorDepCap`, `JFETf1`, model `JFETf2`, `JFETf3` and `JFETbFac`.
-    cor_dep_cap: Real,
-    f1: Real,
-    f2: Real,
-    f3: Real,
+    /// Shared depletion continuation at grading 1/2.
+    gate_law: DepletionLaw,
     bfac: Real,
 }
 
@@ -264,7 +259,7 @@ fn gate_diode(v: Real, vt_temp: Real, csat: Real, gmin: Real) -> (Real, Real) {
     } else {
         exponential_junction(v, vt_temp, csat)
     };
-    (current + gmin * v, conductance + gmin)
+    (gmin.mul_add(v, current), conductance + gmin)
 }
 
 impl Model {
@@ -277,82 +272,48 @@ impl Model {
             gm: 0.,
             gds: 0.,
         };
-        if vds >= 0. {
-            let vgst = vgs - op.vto;
-            if vgst <= 0. {
-                return off;
-            }
-            let betap = beta * (1. + lambda * vds);
-            if vgst >= vds {
-                // Normal mode, linear region.
-                let apart = 2. * b + 3. * op.bfac * (vgst - vds);
-                let cpart = vds * (vds * (op.bfac * vds - b) + vgst * apart);
-                Channel {
-                    current: betap * cpart,
-                    gm: betap * vds * (apart + 3. * op.bfac * vgst),
-                    gds: betap * (vgst - vds) * apart + beta * lambda * cpart,
-                }
-            } else {
-                // Normal mode, saturation region.
-                let bfac = vgst * op.bfac;
-                let vgst_squared = vgst * vgst;
-                let cpart = vgst_squared * (b + bfac);
-                Channel {
-                    current: betap * cpart,
-                    gm: betap * vgst * (2. * b + 3. * bfac),
-                    gds: lambda * beta * cpart,
-                }
-            }
+        let (gate, direction) = if vds >= 0. { (vgs, 1.) } else { (vgd, -1.) };
+        let overdrive = gate - op.vto;
+        if overdrive <= 0. {
+            return off;
+        }
+        let drain = vds.abs();
+        let betap = beta * lambda.mul_add(drain, 1.);
+        let shape = 3. * op.bfac;
+        let (current, gm, gds) = if overdrive >= drain {
+            // Both directions have the same intrinsic current. Exchange
+            // terminals once, then transform the Jacobian, rather than
+            // maintaining separately rounded normal/inverse polynomials.
+            let remaining = overdrive - drain;
+            let apart = shape.mul_add(remaining, 2. * b);
+            let cpart = drain * drain.mul_add(op.bfac.mul_add(drain, -b), overdrive * apart);
+            (
+                betap * cpart,
+                betap * drain * shape.mul_add(overdrive, apart),
+                (betap * remaining).mul_add(apart, beta * lambda * cpart),
+            )
         } else {
-            let vgdt = vgd - op.vto;
-            if vgdt <= 0. {
-                return off;
-            }
-            let betap = beta * (1. - lambda * vds);
-            if vgdt + vds >= 0. {
-                // Inverse mode, linear region.
-                let apart = 2. * b + 3. * op.bfac * (vgdt + vds);
-                let cpart = vds * (-vds * (-op.bfac * vds - b) + vgdt * apart);
-                let gm = betap * vds * (apart + 3. * op.bfac * vgdt);
-                Channel {
-                    current: betap * cpart,
-                    gm,
-                    gds: betap * (vgdt + vds) * apart - beta * lambda * cpart - gm,
-                }
-            } else {
-                // Inverse mode, saturation region.
-                let bfac = vgdt * op.bfac;
-                let gm = -betap * vgdt * (2. * b + 3. * bfac);
-                let vgdt_squared = vgdt * vgdt;
-                let cpart = vgdt_squared * (b + bfac);
-                Channel {
-                    current: -betap * cpart,
-                    gm,
-                    gds: lambda * beta * cpart - gm,
-                }
-            }
+            let bfac = overdrive * op.bfac;
+            let cpart = overdrive * overdrive * (b + bfac);
+            (
+                betap * cpart,
+                betap * overdrive * 3_f64.mul_add(bfac, 2. * b),
+                lambda * beta * cpart,
+            )
+        };
+        Channel {
+            current: direction * current,
+            gm: direction * gm,
+            gds: if direction < 0. { gds + gm } else { gds },
         }
     }
 }
-
 impl Operating {
     /// Gate depletion charge and capacitance at a normalized junction
     /// voltage for zero-bias capacitance `cz` (`jfetload.c`, grading 1/2 with
     /// linear continuation above `FC * PB`).
     fn charge(&self, v: Real, cz: Real) -> (Real, Real) {
-        let twop = 2. * self.pb;
-        if v < self.cor_dep_cap {
-            let sarg = (1. - v / self.pb).sqrt();
-            (twop * cz * (1. - sarg), cz / sarg)
-        } else {
-            let czf2 = cz / self.f2;
-            let fcpb2 = self.cor_dep_cap * self.cor_dep_cap;
-            (
-                cz * self.f1
-                    + czf2 * (self.f3 * (v - self.cor_dep_cap) + (v * v - fcpb2) / (twop + twop)),
-                czf2 * (self.f3 + v / twop),
-            )
-        }
+        self.gate_law.charge(v, cz, None)
     }
 }
 
@@ -453,17 +414,14 @@ impl Jfet {
         let (model, instance) = (&self.model, &self.instance);
         let (tnom, temp) = temperatures(&self.name, model.tnom, instance, context)?;
         let junction = gate_junction(model.pb, tnom, temp);
-        let xfc = (1. - model.fc).ln();
-        let f2 = ((1. + 0.5) * xfc).exp();
-        let f3 = 1. - model.fc * (1. + 0.5);
         let bfac = (1. - model.b) / (model.pb - model.vto);
 
         let vt = temp * K_OVER_Q;
         let vtn = vt * model.n;
-        let ratio1 = temp / tnom - 1.;
+        let ratio1 = (temp - tnom) / tnom;
         let saturation = model.xti.map_or_else(
             || model.is * (ratio1 * model.eg / vtn).exp(),
-            |xti| model.is * (ratio1 * model.eg / vtn).exp() * (ratio1 + 1.).powf(xti),
+            |xti| model.is * (xti.mul_add(ratio1.ln_1p(), ratio1 * model.eg / vtn)).exp(),
         );
         let GateJunction {
             pb,
@@ -476,8 +434,8 @@ impl Jfet {
         tcgd *= cjfact1;
         let vto = model
             .vtotc
-            .map_or(model.vto - model.tcv * (temp - tnom), |vtotc| {
-                model.vto + vtotc * (temp - tnom)
+            .map_or((-model.tcv).mul_add(temp - tnom, model.vto), |vtotc| {
+                vtotc.mul_add(temp - tnom, model.vto)
             });
         let beta = model.betatce.map_or_else(
             || model.beta * (temp / tnom).powf(model.bex),
@@ -494,13 +452,9 @@ impl Jfet {
             csat: saturation * area,
             gdpr,
             gspr,
-            pb,
             czgs: tcgs * area,
             czgd: tcgd * area,
-            cor_dep_cap: model.fc * pb,
-            f1: pb * (1. - ((1. - 0.5) * xfc).exp()) / (1. - 0.5),
-            f2,
-            f3,
+            gate_law: DepletionLaw::new(pb, 0.5, model.fc),
             bfac,
         };
         let finite = [
@@ -511,10 +465,10 @@ impl Jfet {
             operating.csat,
             operating.czgs,
             operating.czgd,
-            operating.cor_dep_cap,
-            operating.f1,
-            operating.f2,
-            operating.f3,
+            operating.gate_law.threshold,
+            operating.gate_law.f1,
+            operating.gate_law.f2,
+            operating.gate_law.edge,
             operating.bfac,
         ]
         .iter()
@@ -1589,15 +1543,26 @@ mod tests {
     }
 
     #[test]
+    fn gate_depletion_preserves_sub_ulp_voltage_increments() {
+        let (_, op) = operating(1.);
+        for voltage in [-1e-30, 1e-30] {
+            let (charge, cap) = op.charge(voltage, 2e-12);
+            let expected = voltage * 2e-12;
+            assert!((charge - expected).abs() <= 4. * Real::EPSILON * expected.abs());
+            assert_eq!(cap.to_bits(), (2e-12_f64).to_bits());
+        }
+    }
+
+    #[test]
     fn gate_charge_is_continuous_and_its_derivative_is_the_capacitance() {
         let (_, op) = operating(1.);
-        for v in [-5., -1., 0., 0.3, op.cor_dep_cap, 0.6, 1.] {
+        for v in [-5., -1., 0., 0.3, op.gate_law.threshold, 0.6, 1.] {
             let h = 1e-7;
             let (_, c) = op.charge(v, 2e-12);
             let numerical = (op.charge(v + h, 2e-12).0 - op.charge(v - h, 2e-12).0) / (2. * h);
             assert!((numerical - c).abs() <= 1e-6 * c, "{v}: {numerical} {c}");
         }
-        let edge = op.cor_dep_cap;
+        let edge = op.gate_law.threshold;
         let (below, above) = (op.charge(edge - 1e-12, 2e-12), op.charge(edge, 2e-12));
         assert!((below.0 - above.0).abs() <= 1e-9 * above.0.abs());
         assert!((below.1 - above.1).abs() <= 1e-9 * above.1);

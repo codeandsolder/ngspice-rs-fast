@@ -1491,7 +1491,18 @@ fn depletion_integral(logarithm: Real, grading: Real) -> Real {
 
 /// Reverse depletion charge and capacitance for the logarithmic grading law
 /// in `dioload.c` and `bjtload.c` (not the MOS or JFET square-root shortcuts).
+#[expect(
+    clippy::float_cmp,
+    reason = "specific grading exponent selects the equivalent exact square-root law"
+)]
 pub(super) fn reverse_depletion(v: Real, cz: Real, pot: Real, m: Real) -> (Real, Real) {
+    if cz == 0. {
+        return (cz * v, cz);
+    }
+    if m == 0.5 {
+        let root = (1. - v / pot).sqrt();
+        return (cz * (v / 1_f64.midpoint(root)), cz / root);
+    }
     let logarithm = (-v / pot).ln_1p();
     (
         pot * cz * depletion_integral(logarithm, m),
