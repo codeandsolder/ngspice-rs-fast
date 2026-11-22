@@ -255,7 +255,7 @@ fn decimal_sweep_steps_visit_cs_accumulated_values() {
 /// the instance flag (here OFF, open inside the band), not carried over from
 /// the last point of the previous inner sweep (closed at `vc = 3`).
 fn scale(plot: &Plot) -> Vec<Real> {
-    column(plot, &plot.variables[0].name)
+    column(plot, &plot.variables()[0].name)
 }
 
 const NESTED: &str = "vc c 0 0\nvdd vdd 0 1\nr1 vdd a 1k\ns1 a 0 c 0 swh\n\

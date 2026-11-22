@@ -76,9 +76,13 @@ fn typed_resistor_temperature_and_nested_source_sweeps_match_c() {
         );
         // The port names the scale as C's dctrcurv.c does; a nested sweep's
         // outer axis has no column in either plot.
-        let scale = want.variables[0].name.as_str();
-        assert_eq!(got.variables[0].name, scale, "{tag}: scale name");
-        assert_eq!(got.variables.len(), want.variables.len(), "{tag}: columns");
+        let scale = want.variables()[0].name.as_str();
+        assert_eq!(got.variables()[0].name, scale, "{tag}: scale name");
+        assert_eq!(
+            got.variables().len(),
+            want.variables().len(),
+            "{tag}: columns"
+        );
         for (ours, reference) in [
             (scale, scale),
             ("v(in)", "v(in)"),

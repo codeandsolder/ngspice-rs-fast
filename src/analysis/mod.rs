@@ -70,7 +70,7 @@ pub use rawfile::{
     BinaryByteOrder, RawFile, RawFileReader, RawFileWriter, RawFormat, RawPlot, RawPlotRows,
     StreamedPlot,
 };
-pub use results::{Plot, PlotFlags, PointSink, Variable};
+pub use results::{Plot, PlotBuilder, PlotFlags, PlotSchema, PointSink, Variable};
 pub use selection::{Selection, print_requests, write_requests};
 
 /// The C reference for the analysis drivers.

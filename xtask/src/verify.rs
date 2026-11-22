@@ -2142,7 +2142,7 @@ fn run_card_plots(
     let plots = plots
         .into_iter()
         .map(|plot| project(plot, &internal))
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((request, plots, circuit))
 }
 
@@ -2161,16 +2161,28 @@ const C_UNSAVED_SUFFIXES: [&str; 7] = [
 /// Projects one Rust plot onto C's default save set (see
 /// [`run_card_plots`]). Vector names already follow C, including the DC
 /// sweep scales (`dctrcurv.c`).
-fn project(mut got: ngspice_rs::analysis::Plot, internal: &[String]) -> ngspice_rs::analysis::Plot {
-    for column in (0..got.variables.len()).rev() {
-        if internal.contains(&got.variables[column].name) {
-            got.variables.remove(column);
-            for row in &mut got.points {
+fn project(
+    mut got: ngspice_rs::analysis::Plot,
+    internal: &[String],
+) -> Result<ngspice_rs::analysis::Plot, String> {
+    let mut variables = got.variables().to_vec();
+    let mut points = got.take_points();
+    for column in (0..variables.len()).rev() {
+        if internal.contains(&variables[column].name) {
+            variables.remove(column);
+            for row in &mut points {
                 row.remove(column);
             }
         }
     }
-    got
+    ngspice_rs::analysis::Plot::new(
+        got.name.clone(),
+        got.plotname.clone(),
+        got.flags(),
+        variables,
+    )
+    .with_points(points)
+    .map_err(|err| err.to_string())
 }
 
 /// The committed C golden of `name`.
@@ -2337,7 +2349,7 @@ mod tests {
         let mut raw = RawFile::parse(&original).unwrap();
         let plot = &mut raw.plots[0].plot;
         let index = plot.variable_index("v(q1:ise)").unwrap();
-        plot.points[0][index] = ngspice_rs::primitives::Complex::ZERO;
+        plot.point_mut(0).unwrap()[index] = ngspice_rs::primitives::Complex::ZERO;
         fs::write(selected, raw.to_ascii().unwrap()).unwrap();
         let error = run(&temp.0, Some("sens_bjt")).unwrap_err();
         assert!(error.contains("v(q1:ise)"), "{error}");

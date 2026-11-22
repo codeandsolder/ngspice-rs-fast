@@ -174,10 +174,14 @@ fn a_linear_circuit_has_no_distortion_and_c_names() {
         "rc\nv1 in 0 dc 1 ac 1 distof1 0.1\nr1 in out 1k\nc1 out 0 1u\n\
          .disto lin 2 1k 4k\n.end\n",
     );
-    let names: Vec<&str> = plots[0].variables.iter().map(|v| v.name.as_str()).collect();
+    let names: Vec<&str> = plots[0]
+        .variables()
+        .iter()
+        .map(|v| v.name.as_str())
+        .collect();
     assert_eq!(names, ["frequency", "v(in)", "v(out)", "i(v1)"]);
-    assert_eq!(plots[0].variables[1].unit, "voltage");
-    assert!(plots[0].flags.is_complex());
+    assert_eq!(plots[0].variables()[1].unit, "voltage");
+    assert!(plots[0].flags().is_complex());
     // distoan.c steps a linear sweep by (stop - start) / (pts + 1).
     let freqs: Vec<f64> = column(&plots[0], "frequency")
         .iter()

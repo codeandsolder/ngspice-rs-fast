@@ -259,7 +259,7 @@ pub trait Analysis: fmt::Debug {
         sink: &mut dyn PointSink,
     ) -> SpiceResult<Plot> {
         let mut plot = self.run(circuit, request, context)?;
-        let points = std::mem::take(&mut plot.points);
+        let points = plot.take_points();
         sink.begin(&plot)?;
         for point in &points {
             sink.point(point)?;

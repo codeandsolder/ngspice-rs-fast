@@ -56,7 +56,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::analysis::batch;
 use crate::analysis::fourier::{self, FourierAnalysis};
 use crate::analysis::measure::{self, Measurement};
-use crate::analysis::selection::Selection;
+use crate::analysis::selection::RowProjection;
 use crate::analysis::{
     BinaryByteOrder, Plot, PointSink, RawFileWriter, RawFormat, RawPlot, RunConfig, StreamedPlot,
     runner,
@@ -122,7 +122,7 @@ impl PlotReport {
             name: name.to_owned(),
             analysis,
             plotname: plot.plotname.clone(),
-            variables: plot.variables.iter().map(|v| v.name.clone()).collect(),
+            variables: plot.variables().iter().map(|v| v.name.clone()).collect(),
             points,
             printed: None,
             measured: None,
@@ -279,7 +279,7 @@ pub fn run_with_format(
             writer: &mut rawfile.writer,
             spool: &rawfile.spool,
         }
-        .write(entry, &produced, names, &mut plots)?;
+        .write(entry, produced, names, &mut plots)?;
         circuit.note_completed(entry.kind);
         previous_circuit = Some(circuit);
     }
@@ -341,38 +341,24 @@ impl BatchOutput<'_> {
     fn write(
         &mut self,
         entry: &batch::ScheduledAnalysis,
-        produced: &[Plot],
+        produced: Vec<Plot>,
         names: Vec<&str>,
         plots: &mut Vec<PlotReport>,
     ) -> SpiceResult<()> {
-        for (plot, name) in produced.iter().zip(names) {
+        for (plot, name) in produced.into_iter().zip(names) {
             // The selection, the measurements and the Fourier cards are
             // resolved against the **full** plot and before anything is
             // written or printed: an unresolvable request leaves stdout empty
             // and an existing destination untouched.
-            let mut outputs = batch::resolve_outputs_with_scope(
+            let outputs = batch::resolve_outputs_with_scope(
                 plot,
                 entry,
                 &self.parsed.output,
                 &self.parsed.measurements,
-                if self.config.fourier_settings().is_some() {
-                    &[]
-                } else {
-                    &self.parsed.fourier
-                },
+                &self.parsed.fourier,
                 self.scope,
+                self.config.fourier_settings(),
             )?;
-            if entry.last_of_kind
-                && entry.kind == AnalysisKind::Transient
-                && let Some(settings) = self.config.fourier_settings()
-            {
-                outputs.fourier = fourier::resolve_with_settings(
-                    plot,
-                    entry.kind,
-                    &self.parsed.fourier,
-                    settings,
-                )?;
-            }
             let raw_plot = raw_plot_for(&self.parsed.netlist.title, outputs.written, self.date);
             let mut report = PlotReport::written(
                 name,
@@ -477,7 +463,7 @@ struct RawfileSink<'a> {
     title: &'a str,
     date: &'a str,
     /// The written selection and the plot, once the driver has begun it.
-    plot: Option<(Selection, StreamedPlot)>,
+    plot: Option<(RowProjection, StreamedPlot)>,
 }
 
 impl PointSink for RawfileSink<'_> {
@@ -489,9 +475,9 @@ impl PointSink for RawfileSink<'_> {
             });
         }
         let selection = batch::written_selection(header, self.entry, self.output)?;
-        let raw_plot = raw_plot_for(self.title, selection.header(header), self.date);
+        let raw_plot = raw_plot_for(self.title, selection.header(header)?, self.date);
         let streamed = self.writer.begin_plot(raw_plot, self.spool)?;
-        self.plot = Some((selection, streamed));
+        self.plot = Some((selection.bind(header)?, streamed));
         Ok(())
     }
 
@@ -502,11 +488,7 @@ impl PointSink for RawfileSink<'_> {
                 message: "the driver produced a point before its plot header".to_owned(),
             });
         };
-        if selection.is_full() {
-            streamed.push_point(values)
-        } else {
-            streamed.push_point(&selection.apply_point(values)?)
-        }
+        streamed.push_point(selection.project(values)?)
     }
 }
 

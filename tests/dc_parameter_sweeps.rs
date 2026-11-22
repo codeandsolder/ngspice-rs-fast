@@ -72,8 +72,8 @@ fn diode_area_follows_the_junction_law() {
     let plot = run(&mut c, "@d1[area] 1 8 0.5 rtol=1e-12 vntol=1e-15").unwrap();
     // dctrcurv.c names an instance-parameter scale param-sweep, which
     // guess_type (outitf.c) leaves a voltage.
-    assert_eq!(plot.variables[0].name, "v(param-sweep)");
-    assert_eq!(plot.variables[0].unit, "voltage");
+    assert_eq!(plot.variables()[0].name, "v(param-sweep)");
+    assert_eq!(plot.variables()[0].unit, "voltage");
     let (current, is): (f64, f64) = (1e-3, 1e-14);
     let v = column(&plot, "v(a)");
     let nvt = v[0] / (current / is + 1.).ln();
@@ -156,7 +156,7 @@ fn controlled_gain_sources_and_resistance_routes() {
     // F senses i(v1) = -2 mA; nested with E so both replacements coexist.
     let f = run(&mut c, "@f1[gain] 1 2 1 @e1[gain] 1 2 1").unwrap();
     // C writes no outer-axis column: the outer E gain shows in v(eo) = 2*gain.
-    let names: Vec<_> = f.variables.iter().map(|v| v.name.as_str()).collect();
+    let names: Vec<_> = f.variables().iter().map(|v| v.name.as_str()).collect();
     assert!(names.iter().all(|n| !n.starts_with("sweep")), "{names:?}");
     assert_eq!(column(&f, "v(eo)"), [2., 2., 4., 4.]);
     for (gain, v) in column(&f, "v(param-sweep)").iter().zip(column(&f, "v(fo)")) {
@@ -182,9 +182,9 @@ fn controlled_gain_sources_and_resistance_routes() {
         // The scales hold the same grid under C's per-kind names.
         assert_eq!(
             column(&a, "v(param-sweep)"),
-            column(&b, &b.variables[0].name)
+            column(&b, &b.variables()[0].name)
         );
-        assert_eq!(a.variables[0].unit, "voltage");
+        assert_eq!(a.variables()[0].unit, "voltage");
     }
 }
 

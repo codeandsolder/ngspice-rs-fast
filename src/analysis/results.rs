@@ -6,6 +6,8 @@
 //! variables and points, which is what a rawfile contains, and leaves plotting
 //! to whoever consumes the result.
 
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
+
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 
 /// Receives an analysis's points as they are produced, in place of a [`Plot`]
@@ -112,34 +114,244 @@ impl Variable {
     }
 }
 
+/// Immutable ordered column identities and lookup indexes for a plot.
+/// Duplicate names (such as the branch currents of a two-port device) are
+/// allowed; lookup always selects the first occurrence.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PlotSchema {
+    flags: PlotFlags,
+    variables: Vec<Variable>,
+    names: HashMap<String, usize>,
+    voltages: HashMap<String, usize>,
+    currents: HashMap<String, usize>,
+}
+
+fn folded(name: &str) -> Cow<'_, str> {
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+impl PlotSchema {
+    fn new(flags: PlotFlags, variables: Vec<Variable>) -> Self {
+        let mut names = HashMap::with_capacity(variables.len());
+        let mut voltages = HashMap::new();
+        let mut currents = HashMap::new();
+        for (index, variable) in variables.iter().enumerate() {
+            let name = folded(&variable.name);
+            if let Some(node) = name.strip_prefix("v(").and_then(|s| s.strip_suffix(')')) {
+                voltages.entry(node.to_owned()).or_insert(index);
+            }
+            if let Some(device) = name.strip_prefix("i(").and_then(|s| s.strip_suffix(')')) {
+                currents.entry(device.to_owned()).or_insert(index);
+            }
+            names.entry(name.into_owned()).or_insert(index);
+        }
+        Self {
+            flags,
+            variables,
+            names,
+            voltages,
+            currents,
+        }
+    }
+
+    /// Exact ASCII case-insensitive vector identity.
+    #[must_use]
+    pub fn index(&self, name: &str) -> Option<usize> {
+        self.names.get(folded(name).as_ref()).copied()
+    }
+
+    /// Explicit voltage identity, without constructing a wrapper string.
+    #[must_use]
+    pub fn voltage(&self, node: &str) -> Option<usize> {
+        self.voltages.get(folded(node).as_ref()).copied()
+    }
+
+    /// Explicit branch current identity.
+    #[must_use]
+    pub fn current(&self, device: &str) -> Option<usize> {
+        self.currents.get(folded(device).as_ref()).copied()
+    }
+
+    /// Named requests prefer exact vector names, then voltage, current and
+    /// finally the C branch-name alias.
+    #[must_use]
+    pub fn named(&self, vector: &str) -> Option<usize> {
+        let name = folded(vector);
+        self.names
+            .get(name.as_ref())
+            .or_else(|| self.voltages.get(name.as_ref()))
+            .or_else(|| self.currents.get(name.as_ref()))
+            .or_else(|| {
+                let device = name.strip_suffix("#branch")?;
+                (!device.is_empty())
+                    .then(|| self.currents.get(device))
+                    .flatten()
+            })
+            .copied()
+    }
+
+    /// Ordered columns of this schema.
+    #[must_use]
+    pub fn variables(&self) -> &[Variable] {
+        &self.variables
+    }
+
+    /// Real or complex plot representation.
+    #[must_use]
+    pub const fn flags(&self) -> PlotFlags {
+        self.flags
+    }
+}
+
+/// Builder for a plot schema before any rows exist.
+pub struct PlotBuilder {
+    name: String,
+    plotname: String,
+    flags: PlotFlags,
+    variables: Vec<Variable>,
+}
+
+impl PlotBuilder {
+    /// Append a variable before sealing the schema.
+    pub fn push_variable(&mut self, variable: Variable) {
+        self.variables.push(variable);
+    }
+
+    /// Seal the schema and start collecting rows.
+    #[must_use]
+    pub fn build(self) -> Plot {
+        Plot::new(self.name, self.plotname, self.flags, self.variables)
+    }
+}
+
 /// The result of one analysis run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plot {
-    /// The plot's name. A rawfile does not record ngspice's internal plot name
-    /// (`tran1`, `ac2`, …), so this is set from the plot name when one is loaded.
+    /// Internal plot name (not part of the column schema).
     pub name: String,
-    /// The `Plotname:` header, e.g. `Operating Point`, `Transient Analysis`.
+    /// Rawfile plot name.
     pub plotname: String,
-    /// Whether the data is real or complex.
-    pub flags: PlotFlags,
-    /// The columns.
-    pub variables: Vec<Variable>,
-    /// The rows: one entry per point, each holding `variables.len()` values.
-    pub points: Vec<Vec<Complex>>,
+    schema: Arc<PlotSchema>,
+    /// Each row has exactly the width of the immutable schema.
+    points: Vec<Vec<Complex>>,
 }
 
 impl Plot {
-    /// An empty plot.
+    /// Construct a plot with a complete column schema and no points.
     #[must_use]
-    pub fn new(name: impl Into<String>, plotname: impl Into<String>, flags: PlotFlags) -> Self {
-        let plotname = plotname.into();
+    pub fn new(
+        name: impl Into<String>,
+        plotname: impl Into<String>,
+        flags: PlotFlags,
+        variables: Vec<Variable>,
+    ) -> Self {
         Self {
             name: name.into(),
-            plotname,
-            flags,
-            variables: Vec::new(),
+            plotname: plotname.into(),
+            schema: Arc::new(PlotSchema::new(flags, variables)),
             points: Vec::new(),
         }
+    }
+
+    /// Begin constructing a schema when the columns are generated incrementally.
+    #[must_use]
+    pub fn builder(
+        name: impl Into<String>,
+        plotname: impl Into<String>,
+        flags: PlotFlags,
+    ) -> PlotBuilder {
+        PlotBuilder {
+            name: name.into(),
+            plotname: plotname.into(),
+            flags,
+            variables: Vec::new(),
+        }
+    }
+
+    /// The immutable schema, shared by clones and bound projections.
+    #[must_use]
+    pub fn schema(&self) -> &Arc<PlotSchema> {
+        &self.schema
+    }
+
+    /// Ordered columns.
+    #[must_use]
+    pub fn variables(&self) -> &[Variable] {
+        self.schema.variables()
+    }
+
+    /// Real or complex plot representation.
+    #[must_use]
+    pub fn flags(&self) -> PlotFlags {
+        self.schema.flags()
+    }
+
+    /// Stored rows.
+    #[must_use]
+    pub fn points(&self) -> &[Vec<Complex>] {
+        &self.points
+    }
+
+    /// Borrow a row mutably without allowing changes to its width.
+    pub fn point_mut(&mut self, index: usize) -> Option<&mut [Complex]> {
+        self.points.get_mut(index).map(Vec::as_mut_slice)
+    }
+
+    /// Mutable fixed-width rows.
+    pub fn rows_mut(&mut self) -> impl Iterator<Item = &mut [Complex]> {
+        self.points.iter_mut().map(Vec::as_mut_slice)
+    }
+
+    /// Reserve row capacity.
+    pub fn reserve_points(&mut self, additional: usize) {
+        self.points.reserve_exact(additional);
+    }
+
+    /// Remove rows after the given length.
+    pub fn truncate_points(&mut self, len: usize) {
+        self.points.truncate(len);
+    }
+
+    /// Remove all rows, preserving the schema.
+    pub fn clear_points(&mut self) {
+        self.points.clear();
+    }
+
+    /// Remove and return a row by index.
+    pub fn remove_point(&mut self, index: usize) -> Option<Vec<Complex>> {
+        (index < self.points.len()).then(|| self.points.remove(index))
+    }
+
+    /// Take the stored rows, leaving the immutable header.
+    pub fn take_points(&mut self) -> Vec<Vec<Complex>> {
+        std::mem::take(&mut self.points)
+    }
+
+    /// A point-free header sharing the same schema.
+    #[must_use]
+    pub fn header(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            plotname: self.plotname.clone(),
+            schema: Arc::clone(&self.schema),
+            points: Vec::new(),
+        }
+    }
+
+    /// Seal a complete array of rows, checking every row against the schema.
+    ///
+    /// # Errors
+    /// Any row has the wrong number of values.
+    pub fn with_points(mut self, points: Vec<Vec<Complex>>) -> SpiceResult<Self> {
+        for row in &points {
+            self.check_point(row)?;
+        }
+        self.points = points;
+        Ok(self)
     }
 
     /// Number of points.
@@ -150,19 +362,14 @@ impl Plot {
 
     /// Number of columns.
     #[must_use]
-    pub const fn variable_count(&self) -> usize {
-        self.variables.len()
+    pub fn variable_count(&self) -> usize {
+        self.variables().len()
     }
 
     /// True when the plot has no columns or no points.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.variables.is_empty() || self.points.is_empty()
-    }
-
-    /// Adds a column.
-    pub fn push_variable(&mut self, variable: Variable) {
-        self.variables.push(variable);
+    pub fn is_empty(&self) -> bool {
+        self.variables().is_empty() || self.points.is_empty()
     }
 
     /// Appends a point.
@@ -183,13 +390,13 @@ impl Plot {
     ///
     /// As [`Plot::push_point`].
     pub fn check_point(&self, values: &[Complex]) -> SpiceResult<()> {
-        if values.len() != self.variables.len() {
+        if values.len() != self.variables().len() {
             return Err(SpiceError::Numerical {
                 context: format!("plot {}", self.name),
                 message: format!(
                     "point has {} value(s) but the plot has {} variable(s)",
                     values.len(),
-                    self.variables.len()
+                    self.variables().len()
                 ),
             });
         }
@@ -199,9 +406,7 @@ impl Plot {
     /// The index of a variable, matched case-insensitively.
     #[must_use]
     pub fn variable_index(&self, name: &str) -> Option<usize> {
-        self.variables
-            .iter()
-            .position(|variable| variable.name.eq_ignore_ascii_case(name))
+        self.schema.index(name)
     }
 
     /// One value, addressed by variable name and point index.
@@ -246,9 +451,15 @@ mod tests {
     use crate::primitives::Complex;
 
     fn plot() -> Plot {
-        let mut plot = Plot::new("op1", "Operating Point", PlotFlags::Real);
-        plot.push_variable(Variable::new("v(out)", "voltage"));
-        plot.push_variable(Variable::new("i(v1)", "current"));
+        let mut plot = Plot::new(
+            "op1",
+            "Operating Point",
+            PlotFlags::Real,
+            vec![
+                Variable::new("v(out)", "voltage"),
+                Variable::new("i(v1)", "current"),
+            ],
+        );
         plot.push_point(vec![Complex::real(2.5), Complex::real(-2.5e-3)])
             .unwrap();
         plot
@@ -275,6 +486,50 @@ mod tests {
             .push_point(vec![Complex::real(1.0)])
             .expect_err("arity mismatch");
         assert!(error.to_string().contains("1 value(s)"));
+    }
+
+    #[test]
+    fn ordered_column_index_preserves_first_occurrence_and_alias_precedence() {
+        let plot = Plot::new(
+            "op1",
+            "Operating Point",
+            PlotFlags::Real,
+            vec![
+                Variable::new("V(OUT)", "voltage"),
+                Variable::new("v(out)", "voltage"),
+                Variable::new("out", "device"),
+                Variable::new("i(out)", "current"),
+                Variable::new("v(aux)", "voltage"),
+                Variable::new("i(aux)", "current"),
+                Variable::new("i(v1)", "current"),
+                Variable::new("v1#branch", "device"),
+                Variable::new("i(v2)", "current"),
+            ],
+        );
+        let schema = plot.schema();
+        assert_eq!(schema.index("v(OUT)"), Some(0));
+        assert_eq!(schema.voltage("OUT"), Some(0));
+        assert_eq!(schema.named("OUT"), Some(2));
+        assert_eq!(schema.current("OUT"), Some(3));
+        assert_eq!(schema.named("AUX"), Some(4));
+        assert_eq!(schema.named("V1#branch"), Some(7));
+        assert_eq!(schema.named("v2#branch"), Some(8));
+        assert_eq!(schema.named("missing"), None);
+    }
+
+    #[test]
+    fn complete_rows_are_checked_before_storage() {
+        let plot = plot();
+        let header = plot.header();
+        assert!(std::sync::Arc::ptr_eq(plot.schema(), header.schema()));
+        assert_eq!(header.point_count(), 0);
+        assert!(
+            header
+                .clone()
+                .with_points(vec![vec![Complex::ZERO; 2], vec![Complex::ZERO; 3]])
+                .is_err()
+        );
+        assert!(header.with_points(vec![vec![Complex::ZERO]]).is_err());
     }
 
     #[test]

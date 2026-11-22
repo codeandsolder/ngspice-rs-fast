@@ -128,7 +128,7 @@ pub(super) fn run(
                     matrix,
                 ))
             })?;
-        let mut point = Vec::with_capacity(plot.variables.len());
+        let mut point = Vec::with_capacity(plot.variables().len());
         point.push(Complex::real(f));
         point.extend(last);
         for matrix in &matrices {
@@ -159,25 +159,26 @@ pub(super) fn run(
 
 /// Schema in the same order as the per-frequency point assembly.
 fn parameter_plot(circuit: &Circuit, port_count: usize, donoise: bool) -> SpiceResult<Plot> {
-    let mut plot = plot(
+    let plot = plot(
         circuit,
         "sp1",
         "SP Analysis",
         Some(("frequency", "frequency")),
         true,
     )?;
+    let mut variables = plot.variables().to_vec();
     for (prefix, unit) in [("S", "s-param"), ("Y", "admittance"), ("Z", "impedance")] {
         for i in 1..=port_count {
             for j in 1..=port_count {
-                plot.push_variable(Variable::complex(format!("{prefix}_{i}_{j}"), unit));
+                variables.push(Variable::complex(format!("{prefix}_{i}_{j}"), unit));
             }
         }
     }
-    plot.push_variable(Variable::complex("v(Rbase)", "voltage"));
+    variables.push(Variable::complex("v(Rbase)", "voltage"));
     if donoise {
         for i in 1..=port_count {
             for j in 1..=port_count {
-                plot.push_variable(Variable::complex(format!("i(Cy_{i}_{j})"), "current"));
+                variables.push(Variable::complex(format!("i(Cy_{i}_{j})"), "current"));
             }
         }
         if port_count == 2 {
@@ -187,11 +188,16 @@ fn parameter_plot(circuit: &Circuit, port_count: usize, donoise: bool) -> SpiceR
                 ("NFmin", "decibel"),
                 ("Rn", "impedance"),
             ] {
-                plot.push_variable(Variable::complex(name, unit));
+                variables.push(Variable::complex(name, unit));
             }
         }
     }
-    Ok(plot)
+    Ok(Plot::new(
+        plot.name.clone(),
+        plot.plotname.clone(),
+        plot.flags(),
+        variables,
+    ))
 }
 
 /// The circuit's RF ports in port-number order, bound to their rows.

@@ -251,7 +251,7 @@ impl SmallSignal {
             _ => "AC Operating Point",
         };
         let mut plot = plot(circuit, "op1", title, None, false)?;
-        let mut point = Vec::with_capacity(plot.variables.len());
+        let mut point = Vec::with_capacity(plot.variables().len());
         point.extend(self.bias().as_slice().iter().copied().map(Complex::real));
         // Spectral observations support scalar instance parameters. Include
         // them in the bias row as well; its header already names them.

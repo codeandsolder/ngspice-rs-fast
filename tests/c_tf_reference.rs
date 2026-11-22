@@ -80,14 +80,14 @@ fn compare_with_c(name: &str, deck_text: &str, relative: f64) {
     for (index, (got, want)) in got.plots.iter().zip(&want.plots).enumerate() {
         let (got, want) = (&got.plot, &want.plot);
         assert_eq!(got.plotname, want.plotname, "{name}: plot {index}");
-        assert_eq!(got.flags, want.flags, "{name}: plot {index}");
+        assert_eq!(got.flags(), want.flags(), "{name}: plot {index}");
         // C's default save set omits simulator-created internal nodes (series
         // resistances), which the port's `.op`/`.ac` plots carry as
         // `v(dev#node)`; the `.tf` plot has no such rows and is compared whole.
         let transfer = want.plotname == "Transfer Function";
         let names = |plot: &ngspice_rs::analysis::Plot| -> Vec<(String, String)> {
             let mut names: Vec<_> = plot
-                .variables
+                .variables()
                 .iter()
                 .filter(|variable| transfer || !variable.name.contains('#'))
                 .map(|variable| (variable.name.clone(), variable.unit.clone()))
@@ -101,7 +101,7 @@ fn compare_with_c(name: &str, deck_text: &str, relative: f64) {
             want.point_count(),
             "{name}: plot {index}"
         );
-        for variable in &want.variables {
+        for variable in want.variables() {
             let want_column = want.column(&variable.name).unwrap();
             let got_column = got.column(&variable.name).unwrap();
             for (point, (a, b)) in got_column.iter().zip(&want_column).enumerate() {

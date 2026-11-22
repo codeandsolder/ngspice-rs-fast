@@ -16,12 +16,12 @@ fn scratch(tag: &str) -> PathBuf {
 fn column(plot: &ngspice_rs::analysis::Plot, name: &str) -> Vec<Complex> {
     let i = plot
         .variable_index(name)
-        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables));
-    plot.points.iter().map(|p| p[i]).collect()
+        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
+    plot.points().iter().map(|p| p[i]).collect()
 }
 fn compare(ours: &ngspice_rs::analysis::Plot, c: &ngspice_rs::analysis::Plot) {
-    assert_eq!(ours.points.len(), c.points.len());
-    for v in &ours.variables {
+    assert_eq!(ours.points().len(), c.points().len());
+    for v in ours.variables() {
         let name = v.name.as_str();
         let c_name = if name.starts_with("i(") {
             format!("{}#branch", &name[2..name.len() - 1])
@@ -33,9 +33,9 @@ fn compare(ours: &ngspice_rs::analysis::Plot, c: &ngspice_rs::analysis::Plot) {
             .or_else(|| c.variable_index(name))
             .or_else(|| c.variable_index(&format!("i({name})")))
             .or_else(|| c.variable_index(&format!("v({name})")))
-            .unwrap_or_else(|| panic!("missing {name}: {:?}", c.variables));
+            .unwrap_or_else(|| panic!("missing {name}: {:?}", c.variables()));
         let i = ours.variable_index(&v.name).unwrap();
-        for (a, b) in ours.points.iter().zip(&c.points) {
+        for (a, b) in ours.points().iter().zip(c.points()) {
             assert!(
                 (a[i].re - b[other].re).abs() <= 1e-7 * b[other].re.abs() + 2e-11,
                 "{}: {:?} {:?}",
@@ -71,7 +71,7 @@ fn companion_currents_use_integrated_charge_and_satisfy_kcl() {
     let input = column(p, "v(in)");
     let output = column(p, "v(out)");
     let power = column(p, "@r1[p]");
-    for k in 0..p.points.len() {
+    for k in 0..p.points().len() {
         assert!((resistor[k].re - capacitor[k].re).abs() < 2e-12);
         let drop = input[k].re - output[k].re;
         assert!((resistor[k].re - drop / 1000.).abs() < 1e-14);

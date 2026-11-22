@@ -475,8 +475,8 @@ fn sensitivity(body: &str) -> Plot {
 fn column(plot: &Plot, name: &str) -> f64 {
     let index = plot
         .variable_index(name)
-        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables));
-    plot.points[0][index].re
+        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
+    plot.points()[0][index].re
 }
 
 /// `.sens` over `bjt.c`'s tables (#164): 103 model setters and six instance
@@ -491,7 +491,7 @@ fn sensitivity_covers_the_bjt_tables() {
          rb 4 3 1k\n.model qn npn level=1\n.sens i(vids)",
     );
     let names: Vec<&str> = plot
-        .variables
+        .variables()
         .iter()
         .map(|variable| variable.name.as_str())
         .filter(|name| name.starts_with("v(q1"))
@@ -552,7 +552,7 @@ fn sensitivity_matches_the_reference_on_the_fixture_card() {
     let expected = &raw.plots[0].plot;
     assert_eq!(plot.variable_count(), expected.variable_count());
     assert_eq!(plot.point_count(), expected.point_count());
-    for variable in &expected.variables {
+    for variable in expected.variables() {
         close(
             column(&plot, &variable.name),
             column(expected, &variable.name),
