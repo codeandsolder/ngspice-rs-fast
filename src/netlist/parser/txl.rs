@@ -2,7 +2,7 @@
 //! The Padé device binds only the first and third terminals; the fallback
 //! capacitors use the second terminal. CPL is explicitly outside this port.
 use super::grammar::{Input, ParsedCard, Result};
-use super::syntax::{canonical_node, equals, malformed, name, named, value};
+use super::syntax::{canonical_node, equals, malformed, name, named, named_device, value};
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
 use crate::netlist::token::Token;
 use winnow::Parser as _;
@@ -10,15 +10,7 @@ use winnow::combinator::{cut_err, opt, repeat};
 use winnow::token::any;
 
 pub(super) fn txl_card(input: &mut Input<'_>) -> Result<ParsedCard> {
-    let instance = any
-        .verify(|t: &Token| {
-            t.is_name_like()
-                && t.text
-                    .as_bytes()
-                    .first()
-                    .is_some_and(|c| c.eq_ignore_ascii_case(&b'y'))
-        })
-        .parse_next(input)?;
+    let (instance, _) = named_device("y").parse_next(input)?;
     cut_err(move |input: &mut Input<'_>| {
         let mut nodes = Vec::new();
         for what in [

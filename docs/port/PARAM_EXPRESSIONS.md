@@ -195,7 +195,7 @@ Remaining limits: no comparison/ternary operators or random functions.
 `BinaryOp`, `Function`, `SourceSpan`, `MAX_NESTING`. Cards:
 `Netlist::params`/`Subcircuit::params: Vec<ParamCard>`, each with
 `assignments: Vec<ParamAssignment { name, name_span, expression }>`.
-`Parser::parse_expression(text, &SourceLoc)` parses a standalone expression.
+`netlist::parse_parameter_expression(text, &SourceLoc)` parses a standalone expression.
 
 ## `.func` and quoted values (#107)
 

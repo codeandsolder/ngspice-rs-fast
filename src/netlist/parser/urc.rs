@@ -27,19 +27,10 @@ use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
 use crate::netlist::token::{Token, TokenKind};
 
 use super::grammar::{Failure, Input, ParsedCard, Result, location};
-use super::syntax::{canonical_node, equals, malformed, name, named, value};
+use super::syntax::{canonical_node, equals, malformed, name, named, named_device, value};
 
 pub(super) fn urc_card(input: &mut Input<'_>) -> Result<ParsedCard> {
-    let instance = any
-        .verify(|token: &Token| {
-            token.is_name_like()
-                && token
-                    .text
-                    .as_bytes()
-                    .first()
-                    .is_some_and(|c| c.eq_ignore_ascii_case(&b'u'))
-        })
-        .parse_next(input)?;
+    let (instance, _) = named_device("u").parse_next(input)?;
     cut_err(move |input: &mut Input<'_>| body(input, instance)).parse_next(input)
 }
 
