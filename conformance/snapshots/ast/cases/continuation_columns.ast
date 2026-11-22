@@ -1,6 +1,6 @@
 # ngspice-rs ast-dump v1
 file: cases/continuation_columns.cir
-title: "Continuation lines and comments: columns are relative to the joined card" @cases/continuation_columns.cir:1:1
+title: "Continuation lines and comments: columns are relative to physical source lines" @cases/continuation_columns.cir:1:1
 scope root
   cards (5):
     [0] device[0] @cases/continuation_columns.cir:3:1 "v1 in 0 dc 5"

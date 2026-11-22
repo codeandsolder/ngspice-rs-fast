@@ -43,15 +43,15 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy, rustfmt
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
 
       - name: Read crate version
         id: version
@@ -92,7 +92,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
 
   publish:
     name: Publish to crates.io
@@ -108,13 +108,13 @@ jobs:
       id-token: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
 
       - name: Authenticate with crates.io
         id: auth
@@ -127,4 +127,4 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main

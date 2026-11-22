@@ -92,9 +92,9 @@ argument text and keyword location. No evaluation occurs during tokenization.
 
 ## Provenance and validation boundaries
 
-Positions follow the existing tokenizer: paths and physical start lines are
-preserved; columns are **byte offsets in the joined logical card**, including
-continuations. This work does not change physical-line mapping or tokenization.
+Positions follow the tokenizer’s physical source map: paths, physical line
+numbers, and one-based UTF-8 byte columns are preserved, including
+continuations. Logical folding does not change reported source positions.
 Balanced outer parentheses and strict commas are intentional bounded stricter
 behavior than C's permissive delimiter gobbling. Scalar AST spellings/order are
 unchanged; `ParameterAssignment` now has an explicit `kind` field. Scalar
