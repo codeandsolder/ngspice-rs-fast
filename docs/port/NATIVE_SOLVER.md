@@ -281,9 +281,15 @@ singular systems).
 
 - The solver preserves the SPARSE policy, not intermediate C rounding.
   The factor frame stores both triangular factors with their shared raw
-  diagonal, plus a numerical cache of reciprocal pivots. Ordinary updates
-  use the reciprocal-based fast path; cancellation-sensitive updates recover
-  from the original cross-product before dividing. Packed row and column runs support
+  diagonal, plus a numerical cache of normal reciprocal pivots. Ordinary
+  updates use the reciprocal-based fast path; cancellation-sensitive
+  updates recover from the original cross-product before dividing.
+  When the reciprocal or normalized multiplier is outside binary64
+  range (including subnormal precision), use the raw pivot and
+  conditioned cross-product instead. A nonrepresentable multiplier
+  alone does not invalidate the factors. A nonrepresentable stored
+  Schur coefficient does; an overflowing final solution is an RHS
+  error and retains the valid factors. Packed row and column runs support
   forward and backward scatter substitution in either orientation. Each
   update uses the raw RHS numerator before storing the rounded quotient,
   without a separate numerator buffer. Exact product accumulation distinguishes

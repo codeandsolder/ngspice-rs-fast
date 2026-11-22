@@ -83,7 +83,9 @@ fn sparse_indices(size: usize) -> SpiceResult<Vec<usize>> {
 }
 
 /// Matrix entry type: `f64` for real systems, [`Complex`] for AC.
-pub(super) trait Scalar: Copy + PartialEq + std::fmt::Debug {
+pub(super) trait Scalar:
+    Copy + PartialEq + std::fmt::Debug + std::ops::Div<Output = Self>
+{
     /// Additive identity.
     const ZERO: Self;
     /// C `ELEMENT_MAG`: `|re| + |im|`.
@@ -94,6 +96,30 @@ pub(super) trait Scalar: Copy + PartialEq + std::fmt::Debug {
     fn recip(self) -> Self;
     /// C `x * y` or `CMPLX_MULT`.
     fn mul(self, other: Self) -> Self;
+    /// Cache only a normal reciprocal. A finite raw pivot can have an
+    /// unrepresentable reciprocal, or one with a subnormal significand.
+    fn cached_recip(self) -> Self {
+        let inverse = self.recip();
+        if inverse.normal_multiplier() {
+            inverse
+        } else {
+            Self::ZERO
+        }
+    }
+    /// Normalize a raw triangular entry without requiring its reciprocal
+    /// to be representable. Use the actual division at exponent limits.
+    #[inline]
+    fn quotient(self, pivot: Self, inverse: Self) -> Self {
+        if inverse.is_zero() {
+            return self / pivot;
+        }
+        let result = self.mul(inverse);
+        if result.normal_multiplier() || self.is_zero() {
+            result
+        } else {
+            self / pivot
+        }
+    }
     /// Update a Schur entry using the rounded multiplier only when well
     /// conditioned; otherwise recover the unnormalized cross-product.
     fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self, normal: bool) -> Self;
@@ -394,16 +420,13 @@ impl<I: PlanIndex> FactorRuns<I> {
             for entry in self.columns.before_diagonal(step) {
                 let (handle, row) = entry.indices();
                 let upper = dest[row];
-                let mult = upper.mul(inverses[row]);
-                if !mult.is_finite() {
-                    return Err(RefactorIssue::NonFinite);
-                }
                 values[handle] = upper;
                 if upper.is_zero() {
                     continue;
                 }
-                let normal = mult.normal_multiplier();
                 let pivot = values[diag[row]];
+                let mult = upper.quotient(pivot, inverses[row]);
+                let normal = mult.normal_multiplier();
                 for entry in self.columns.after_diagonal(row) {
                     let (handle, r) = entry.indices();
                     dest[r] = dest[r].schur(pivot, upper, mult, values[handle], normal);
@@ -416,12 +439,11 @@ impl<I: PlanIndex> FactorRuns<I> {
             if dest[step].is_zero() {
                 return Err(RefactorIssue::ZeroPivot(step));
             }
-            let inverse = dest[step].recip();
-            if !inverse.is_finite() || inverse.is_zero() {
+            if !dest[step].is_finite() {
                 return Err(RefactorIssue::NonFinite);
             }
             values[diag[step]] = dest[step];
-            inverses[step] = inverse;
+            inverses[step] = dest[step].cached_recip();
         }
         Ok(())
     }
@@ -444,14 +466,14 @@ impl<I: PlanIndex> FactorRuns<I> {
             if numerator.is_zero() {
                 continue;
             }
-            let mult = numerator.mul(inverses[i]);
+            let pivot = values[diag[i]];
+            let mult = numerator.quotient(pivot, inverses[i]);
             let normal = mult.normal_multiplier();
             let entries = if transposed {
                 self.rows.after_diagonal(i)
             } else {
                 self.columns.after_diagonal(i)
             };
-            let pivot = values[diag[i]];
             for entry in entries {
                 let (handle, r) = entry.indices();
                 x[r] = x[r].schur(pivot, numerator, mult, values[handle], normal);
@@ -464,14 +486,14 @@ impl<I: PlanIndex> FactorRuns<I> {
             if numerator.is_zero() {
                 continue;
             }
-            let mult = numerator.mul(inverses[i]);
+            let pivot = values[diag[i]];
+            let mult = numerator.quotient(pivot, inverses[i]);
             let normal = mult.normal_multiplier();
             let entries = if transposed {
                 self.rows.before_diagonal(i)
             } else {
                 self.columns.before_diagonal(i)
             };
-            let pivot = values[diag[i]];
             for entry in entries {
                 let (handle, r) = entry.indices();
                 x[r] = x[r].schur(pivot, numerator, mult, values[handle], normal);
@@ -2073,11 +2095,10 @@ impl<T: Scalar> Sparse<T> {
             return self.refactor_zero_pivot(1);
         }
         let first_pivot = self.values[first];
-        let inverse = first_pivot.recip();
-        if !inverse.is_finite() || inverse.is_zero() {
+        if !first_pivot.is_finite() {
             return self.nonfinite_factor();
         }
-        self.inverses[1] = inverse;
+        self.inverses[1] = first_pivot.cached_recip();
         // Each column is scattered before use. Successful ordering
         // inserted every structural elimination target as a fill-in, so
         // the lower-column updates cannot read an unscattered row.
@@ -2509,20 +2530,16 @@ impl<T: Scalar> Sparse<T> {
             return;
         }
         let raw_pivot = self.values[pivot];
-        let inverse = raw_pivot.recip();
-        if !inverse.is_finite() || inverse.is_zero() {
+        if !raw_pivot.is_finite() {
             self.nonfinite_factor();
             return;
         }
+        let inverse = raw_pivot.cached_recip();
         self.inverses[self.topology.elements[pivot].row] = inverse;
         let mut upper = self.topology.elements[pivot].next_in_row;
         while upper != NONE {
             let raw_upper = self.values[upper];
-            let u = raw_upper.mul(inverse);
-            if !u.is_finite() {
-                self.nonfinite_factor();
-                return;
-            }
+            let u = raw_upper.quotient(raw_pivot, inverse);
             let normal = u.normal_multiplier();
             let upper_col = self.topology.elements[upper].col;
             let mut above = upper;
@@ -3145,13 +3162,15 @@ mod tests {
             let shift = i32::try_from(exponent - i64::from(ae + be)).unwrap();
             assert!((mantissa * 2_f64.powi(shift) / (am * bm) - 1.).abs() < 1e-14);
         }
-        let mut m = build(1, &[(1, 1, f64::from_bits(1))]);
-        assert_eq!(m.order_and_factor(1e-3, 0.), Status::NonFinite);
-        assert!(!m.is_factored());
-        assert!(
-            m.factors().is_err(),
-            "inverse pivot overflow must be explicit"
-        );
+        let tiny = f64::from_bits(1);
+        let mut m = build(1, &[(1, 1, tiny)]);
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        assert_eq!(m.factors().unwrap().determinant().unwrap(), (1., -1074));
+        assert_eq!(m.solve(&[tiny]), [1.]);
+        assert_eq!(m.solve_transposed(&[tiny]), [1.]);
+        m.reload_originals(&[tiny * 2.]);
+        assert_eq!(m.factor(), Status::Okay);
+        assert_eq!(m.solve(&[tiny]), [0.5]);
 
         let mut m = Sparse::<Complex>::new(2).unwrap();
         for i in 1..=2 {
@@ -3165,6 +3184,57 @@ mod tests {
         let imag = mantissa.im * 2_f64.powi(shift);
         assert!((imag / (m * m) - 2.).abs() < 1e-14);
         assert!(mantissa.re.abs() < 1e-14);
+    }
+
+    #[test]
+    fn raw_factors_do_not_require_representable_normalized_entries() {
+        use crate::primitives::numeric::scale_power;
+        let tiny = scale_power(1., -1000);
+        let large = scale_power(1., 1000);
+        // Force the same diagonal order as the well-scaled factorization.
+        // U12/D11 is 2^2000, but the Schur entry and solution are finite.
+        let mut m = build(2, &[(1, 1, 2.), (1, 2, 1.), (2, 1, 1.), (2, 2, 2.)]);
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        m.reload_originals(&[tiny, large, tiny, large * 2.]);
+        assert_eq!(m.factor(), Status::Okay);
+        assert_eq!(m.solve(&[large, large * 2.]), [0., 1.]);
+        assert_eq!(m.solve_transposed(&[tiny, large * 2.]), [0., 1.]);
+        // The same coefficients on the threshold-ordering path.
+        let mut fresh = build(
+            2,
+            &[
+                (1, 1, tiny),
+                (1, 2, large),
+                (2, 1, tiny),
+                (2, 2, large * 2.),
+            ],
+        );
+        assert_eq!(fresh.order_and_factor(1e-3, 0.), Status::Okay);
+        assert_eq!(fresh.solve(&[large, large * 2.]), [0., 1.]);
+
+        let c = |x| Complex::new(x, x);
+        let mut m = Sparse::from_originals(
+            2,
+            [(1, 1, c(2.)), (1, 2, c(1.)), (2, 1, c(1.)), (2, 2, c(2.))],
+        )
+        .unwrap();
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        m.reload_originals(&[c(tiny), c(large), c(tiny), c(large * 2.)]);
+        assert_eq!(m.factor(), Status::Okay);
+        assert_eq!(
+            m.solve(&[c(large), c(large * 2.)]),
+            [Complex::ZERO, Complex::real(1.)]
+        );
+        assert_eq!(
+            m.solve_transposed(&[c(tiny), c(large * 2.)]),
+            [Complex::ZERO, Complex::real(1.)]
+        );
+
+        let smallest = c(f64::from_bits(1));
+        let mut m = Sparse::from_originals(1, [(1, 1, smallest)]).unwrap();
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        assert_eq!(m.solve(&[smallest]), [Complex::real(1.)]);
+        assert_eq!(m.solve_transposed(&[smallest]), [Complex::real(1.)]);
     }
 
     #[test]

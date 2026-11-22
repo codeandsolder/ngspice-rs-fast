@@ -235,3 +235,30 @@ fn standalone_complex_retry_counts_only_the_producing_operation() {
         );
     }
 }
+
+#[test]
+fn complex_raw_factors_cover_both_binary64_exponent_limits() {
+    // A=(1+j)*scale, rhs=A or -j*A. The exact solutions are 1 and -j.
+    // Even the reciprocal of the smallest subnormal complex pivot
+    // is outside range, without making the matrix or solution invalid.
+    for exponent in -1074..=1023 {
+        let scale = if exponent < -1022 {
+            f64::from_bits(1 << u32::try_from(exponent + 1074).unwrap())
+        } else {
+            f64::from_bits(u64::try_from(exponent + 1023).unwrap() << 52)
+        };
+        let mut a = SparseMatrix::new(1, 1);
+        a.add(0, 0, scale).unwrap();
+        let matrix = ComplexMatrix::from_operators(&a, &a, 1.).unwrap();
+        let f = matrix.factorize().unwrap();
+        let rhs = [Complex::new(scale, scale)];
+        assert_eq!(f.solve(&rhs).unwrap(), [Complex::real(1.)]);
+        assert_eq!(f.solve_transposed(&rhs).unwrap(), [Complex::real(1.)]);
+        let rhs = [Complex::new(scale, -scale)];
+        assert_eq!(f.solve(&rhs).unwrap(), [Complex::imaginary(-1.)]);
+        if exponent == -1074 {
+            assert!(f.solve(&[Complex::real(1.)]).is_err());
+            assert_eq!(f.solve(&rhs).unwrap(), [Complex::imaginary(-1.)]);
+        }
+    }
+}

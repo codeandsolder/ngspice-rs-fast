@@ -246,12 +246,28 @@ fn zero_pivot_search_and_failed_factors_are_measured_not_counted_as_success() {
     assert_eq!(rejected.work.factor.successful_factors, 2);
     assert!(rejected.storage.is_none());
 
-    let tiny = two_by_two(&p, [f64::from_bits(1), 0., 0., 1.]);
-    assert!(solve_ni(&tiny, &rhs, &mut old, true, 0.).is_err());
+    // A nonrepresentable Schur entry is a genuine factor failure.
+    // A tiny raw pivot alone is not: it may only make a particular
+    // RHS solution unrepresentable.
+    let overflow = two_by_two(&p, [f64::MAX, f64::MAX, f64::MAX, -f64::MAX]);
+    assert!(solve_ni(&overflow, &rhs, &mut old, true, 0.).is_err());
     let nonfinite = p.factor_telemetry();
     assert_eq!(nonfinite.work.factor.nonfinite_failures, 1);
     assert_eq!(nonfinite.work.factor.successful_factors, 2);
     assert!(nonfinite.storage.is_none());
+
+    let tiny = two_by_two(&p, [f64::from_bits(1), 0., 0., 1.]);
+    assert!(solve_ni(&tiny, &rhs, &mut old, true, 0.).is_err());
+    let valid_factors = p.factor_telemetry();
+    assert_eq!(valid_factors.work.factor.nonfinite_failures, 1);
+    assert_eq!(valid_factors.work.factor.successful_factors, 3);
+    assert_eq!(valid_factors.work.rhs_failures, 1);
+    assert!(valid_factors.storage.is_some());
+    let representable = Vector::from_slice(&[f64::from_bits(1), 1.]);
+    let NiStep::Solved(x) = solve_ni(&tiny, &representable, &mut old, false, 0.).unwrap() else {
+        panic!("valid small-pivot factors failed to solve a representable RHS");
+    };
+    assert_eq!(x.as_slice(), &[1., 1.]);
 }
 
 #[test]
