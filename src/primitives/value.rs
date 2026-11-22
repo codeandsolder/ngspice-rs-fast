@@ -373,10 +373,15 @@ impl LiteralDialect {
     }
 }
 
-/// Consume consecutive decimal digits, without attempting conversion.
-fn scan_digits(bytes: &[u8], index: &mut usize) -> usize {
+/// Scan decimal digits and simultaneously compute a candidate short coefficient.
+/// Wrapping is harmless for longer literals: the result is used only when
+/// there were at most 16 digits (then the exact integer fits in u64).
+fn scan_digits(bytes: &[u8], index: &mut usize, coefficient: &mut u64) -> usize {
     let start = *index;
-    while bytes.get(*index).is_some_and(u8::is_ascii_digit) {
+    while let Some(&digit) = bytes.get(*index).filter(|digit| digit.is_ascii_digit()) {
+        *coefficient = coefficient
+            .wrapping_mul(10)
+            .wrapping_add(u64::from(digit - b'0'));
         *index += 1;
     }
     *index - start
@@ -387,10 +392,11 @@ fn decimal_prefix(input: &str, dialect: LiteralDialect) -> Option<ParsedNumber> 
     let negative = bytes.first() == Some(&b'-');
     let start = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
     let mut i = start;
-    let integer_digits = scan_digits(bytes, &mut i);
+    let mut coefficient = 0;
+    let integer_digits = scan_digits(bytes, &mut i, &mut coefficient);
     let fractional_digits = if bytes.get(i) == Some(&b'.') {
         i += 1;
-        scan_digits(bytes, &mut i)
+        scan_digits(bytes, &mut i, &mut coefficient)
     } else {
         0
     };
@@ -429,7 +435,8 @@ fn decimal_prefix(input: &str, dialect: LiteralDialect) -> Option<ParsedNumber> 
     let exponent = exponent
         .saturating_sub(i128::try_from(fractional_digits).ok()?)
         .saturating_add(i128::from(scale));
-    let value = rounded_decimal(mantissa, negative, exponent, multiplier)?;
+    let short_coefficient = (integer_digits + fractional_digits <= 16).then_some(coefficient);
+    let value = rounded_decimal(mantissa, short_coefficient, negative, exponent, multiplier)?;
     Some(ParsedNumber {
         value,
         consumed: i + if matches!(dialect, LiteralDialect::Spice) {
@@ -658,6 +665,123 @@ mod tests {
             parse_spice_number("1e99999999999999999999999"),
             Some(f64::INFINITY)
         );
+    }
+
+    #[test]
+    fn decimal_edges_match_independent_exact_rounding() {
+        // Expected bits from exact decimal products converted with CPython
+        // Decimal -> binary64, including boundaries on both sides of a tie.
+        for (text, expected) in [
+            ("9007199254740993", 0x4340_0000_0000_0000),
+            ("9007199254740995", 0x4340_0000_0000_0002),
+            ("9007199254740993e-3k", 0x4340_0000_0000_0000),
+            ("1.7976931348623157e311m", f64::MAX.to_bits()),
+            ("1.7976931348623159e308", f64::INFINITY.to_bits()),
+            ("2.2250738585072011e-308", 0x000f_ffff_ffff_ffff),
+            ("2.2250738585072014e-308", f64::MIN_POSITIVE.to_bits()),
+            ("2.4703282292062327e-306a", 0),
+            ("2.4703282292062328e-306a", 1),
+            ("1.234567890123456789mil", 0x3f00_70cd_83b2_078b),
+            ("9999999999999999mil", 0x424d_91ca_35ff_ffff),
+            ("1.234567890123456789e12a", 0x3eb4_b66d_c01e_c6fb),
+            ("-0.0", (-0_f64).to_bits()),
+        ] {
+            assert_eq!(
+                parse_spice_number(text).unwrap().to_bits(),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_sticky_tail_distinguishes_exact_halfway_cases() {
+        // Exact midpoint between 1 and the next binary64, and perturbations
+        // smaller than the retained 768 significant digits.
+        let midpoint = "1.00000000000000011102230246251565404236316680908203125";
+        let zeros = "0".repeat(1000);
+        let tie = format!("{midpoint}{zeros}");
+        let above = format!("{tie}1");
+        let below = format!("{}4{}", &midpoint[..midpoint.len() - 1], "9".repeat(1000));
+        for (text, bits) in [
+            (tie, 1_f64.to_bits()),
+            (above, 1_f64.to_bits() + 1),
+            (below, 1_f64.to_bits()),
+        ] {
+            assert_eq!(parse_spice_number(&text).unwrap().to_bits(), bits);
+            assert_eq!(
+                parse_numparam_number_prefix(&text).unwrap().value.to_bits(),
+                bits
+            );
+        }
+
+        // MIL is the non-power-of-ten case. Construct a decimal from an
+        // independent exact rational: midpoint / (254e-7). The odd factor 127
+        // gives a repeating decimal, so truncation and incrementing the last
+        // digit straddle the exact midpoint. Carries from the discarded
+        // decimal tail must be taken into account *before* truncation.
+        let denominator = (1_u128 << 53) * 254;
+        let numerator = ((1_u128 << 53) + 1) * 10_000_000;
+        let mut lower = format!("{}.", numerator / denominator);
+        let mut remainder = numerator % denominator;
+        while lower.len() < 1000 || lower.ends_with('9') {
+            remainder *= 10;
+            lower.push(char::from(
+                b'0' + u8::try_from(remainder / denominator).unwrap(),
+            ));
+            remainder %= denominator;
+        }
+        assert_ne!(remainder, 0);
+        let mut upper = lower.clone();
+        let last = upper.pop().unwrap();
+        upper.push(char::from_u32(u32::from(last) + 1).unwrap());
+        assert_eq!(
+            parse_spice_number(&format!("{lower}mil"))
+                .unwrap()
+                .to_bits(),
+            1_f64.to_bits()
+        );
+        assert_eq!(
+            parse_spice_number(&format!("{upper}mil"))
+                .unwrap()
+                .to_bits(),
+            1_f64.to_bits() + 1
+        );
+    }
+
+    #[test]
+    fn huge_decimal_coefficients_cancel_exponents_without_intermediate_overflow() {
+        let count = 100_000;
+        let zeros = "0".repeat(count);
+        let integer = format!("1{zeros}e-{count}");
+        let fraction = format!("0.{zeros}12345e{}k", count + 1);
+        assert_eq!(parse_spice_number(&integer), Some(1.));
+        assert_eq!(parse_spice_number(&format!("{integer}mil")), Some(25.4e-6));
+        assert_eq!(parse_spice_number(&fraction), Some(1234.5));
+        assert_eq!(parse_numparam_number_prefix(&integer).unwrap().value, 1.);
+    }
+
+    #[test]
+    fn decimal_prefix_boundaries_are_dialect_specific_and_utf8_safe() {
+        for (text, spice, numparam, spice_width, numparam_width) in [
+            ("1d2k", 100_000., 1., 4, 1),
+            ("1e+", 1., 1., 1, 1),
+            ("1MeGoHm", 1e6, 1e6, 4, 1),
+            ("1mIl", 25.4e-6, 1e-3, 4, 1),
+            ("1m²", 1e-3, 1e-3, 2, 1),
+            ("1m€", 1e-3, 1e-3, 2, 1),
+            ("1Ω", 1., 1., 1, 1),
+            ("1l", 1., 1., 1, 1),
+            ("1e-330T", 1e-318, 1e-318, 7, 6),
+        ] {
+            let a = parse_spice_number_prefix(text).unwrap();
+            let b = parse_numparam_number_prefix(text).unwrap();
+            assert_eq!((a.value, a.consumed), (spice, spice_width), "{text}");
+            assert_eq!((b.value, b.consumed), (numparam, numparam_width), "{text}");
+        }
+        for text in ["1m²", "1m€", "1Ω", "1e+", "4k7", "2N2222"] {
+            assert_eq!(parse_spice_number(text), None, "{text}");
+        }
     }
 
     #[test]

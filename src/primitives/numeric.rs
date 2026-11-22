@@ -78,6 +78,55 @@ pub(crate) fn bounded_rounded_exponent(value: Real, bounds: RangeInclusive<i32>)
     )
 }
 
+/// Powers of ten whose integer value is exactly representable in binary64:
+/// 5^22 fits in 53 bits, while 5^23 does not. If the scaled coefficient is
+/// also exact, one IEEE multiplication or division already rounds the
+/// mathematical decimal correctly. No approximate reciprocal is used.
+const EXACT_DECIMAL_POWERS: [Real; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+];
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the integer coefficient is checked to be at most 2^53 before conversion"
+)]
+fn short_decimal(coefficient: u64, exponent: i128, multiplier: DecimalMultiplier) -> Option<Real> {
+    use std::io::Write as _;
+
+    let coefficient = coefficient.checked_mul(u64::from(multiplier.factor()))?;
+    if coefficient == 0 {
+        return Some(0.);
+    }
+    if coefficient <= 1_u64 << 53
+        && let Some(power) = usize::try_from(exponent.unsigned_abs())
+            .ok()
+            .and_then(|index| EXACT_DECIMAL_POWERS.get(index))
+    {
+        let coefficient = coefficient as Real;
+        return Some(if exponent < 0 {
+            coefficient / power
+        } else {
+            coefficient * power
+        });
+    }
+    // Even a u64 cannot rescue a decimal exponent outside this range.
+    if exponent > 400 {
+        return Some(Real::INFINITY);
+    }
+    if exponent < -400 {
+        return Some(0.);
+    }
+    // A short exact integer product needs at most twenty digits, so avoid
+    // the general long-coefficient buffer even outside the arithmetic fast path.
+    let mut text = [0; 32];
+    let available = text.len();
+    let mut remaining = text.as_mut_slice();
+    write!(remaining, "{coefficient}e{exponent}").ok()?;
+    let used = available - remaining.len();
+    std::str::from_utf8(&text[..used]).ok()?.parse().ok()
+}
+
 /// Convert a validated decimal mantissa times an exact integer and power
 /// of ten to nearest binary64 (ties to even). The sign is independent of the
 /// magnitude so zero and gradual underflow retain negative zero.
@@ -92,11 +141,18 @@ pub(crate) fn bounded_rounded_exponent(value: Real, bounds: RangeInclusive<i32>)
 /// requiring a proportional allocation or overwhelming the library parser.
 pub(super) fn rounded_decimal(
     mantissa: &str,
+    short_coefficient: Option<u64>,
     negative: bool,
     exponent: i128,
     multiplier: DecimalMultiplier,
 ) -> Option<Real> {
     use std::io::Write as _;
+
+    if let Some(magnitude) =
+        short_coefficient.and_then(|coefficient| short_decimal(coefficient, exponent, multiplier))
+    {
+        return Some(if negative { -magnitude } else { magnitude });
+    }
 
     const BOUNDARY_DIGITS: usize = 768;
     // MIL multiplies by 254, requiring up to three extra leading positions.

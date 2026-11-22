@@ -297,8 +297,8 @@ fn parsed_ic_and_nodeset_cards_travel_with_every_request() {
             .iter()
             .map(|c| (c.node.as_str(), c.value))
             .collect();
-        // numparam's "1.500000000000000e+00" read by INPevaluate.
-        assert_eq!(ic, [("a", 1.), ("a", 1.5000000000000002)]);
+        // Correctly rounded read-back of the numparam-formatted value.
+        assert_eq!(ic, [("a", 1.), ("a", 1.5)]);
         assert_eq!(request.nodesets().len(), 1);
         assert_eq!(request.nodesets()[0].value, 2.);
         assert_eq!(request.nodesets()[0].location.line, 5);

@@ -191,18 +191,18 @@ fn endpoint_rounding_reaches_the_run() {
     let mut c = circuit("v1 a 0 0\nr1 a 0 1k");
     let p = run(&mut c, &["v1", "0", "0.3", "0.1"]).unwrap();
     assert_eq!(p.point_count(), 4);
-    // ngspice's last value: 0.1 + 0.1 + 0.1, also INPevaluate("0.3").
+    // Accumulated sweep endpoint: three binary64 additions, not a literal.
     assert_eq!(
         *column(&p, "v(v-sweep)").last().unwrap(),
         0.30000000000000004
     );
     assert_column(&p, "i(v1)", &[0., -1e-4, -2e-4, -3e-4], 1e-12, 1e-18);
-    // dctrcurv.c accumulates `value += step`: the reverse sweep ends at
-    // 0.3 - 3 * 0.1 in floating point, as ngspice's output does.
+    // Reverse sweep starts at the correctly rounded 0.3. Sequential
+    // subtraction still accumulates in binary64, not exact decimal.
     let p = run(&mut c, &["v1", "0.3", "0", "-0.1"]).unwrap();
     assert_eq!(
         column(&p, "v(v-sweep)").last(),
-        Some(&2.7755575615628914e-17)
+        Some(&(-2.7755575615628914e-17))
     );
     assert_eq!(p.point_count(), 4);
     assert_eq!(p.variables()[0].name, "v(v-sweep)");
