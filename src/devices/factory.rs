@@ -357,6 +357,7 @@ impl SourceSetter {
     }
 }
 
+#[derive(Clone, Copy)]
 enum PortSetter {
     Number,
     Impedance,
