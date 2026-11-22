@@ -61,6 +61,8 @@ jobs:
 
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
+        with:
+          rust-toolchain: nightly-2026-11-20
 
       - name: Read crate version
         id: version
@@ -120,6 +122,8 @@ jobs:
 
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
+        with:
+          rust-toolchain: nightly-2026-11-20
 
       - name: Authenticate with crates.io
         id: auth

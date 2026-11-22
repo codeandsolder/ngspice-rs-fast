@@ -59,9 +59,10 @@ records the design of the earlier milestones.
 
 ## Installation
 
-`ngspice-rs` is published on [crates.io](https://crates.io/crates/ngspice-rs) and
-This fork uses the pinned Rust nightly in `rust-toolchain.toml` (edition 2024), enabling portable SIMD development without stable-compiler constraints. No C toolchain or ngspice binary is
-required.
+`ngspice-rs` is published on [crates.io](https://crates.io/crates/ngspice-rs).
+This fork uses the pinned Rust nightly in `rust-toolchain.toml` (edition 2024),
+allowing portable SIMD without stable-compiler constraints. No C toolchain or
+ngspice binary is required.
 
 The `spice-rs` command-line tool can be installed as a prebuilt binary with
 [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), or compiled

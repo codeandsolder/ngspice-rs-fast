@@ -133,8 +133,8 @@ remains dependency-free and SPICE node IDs/ground aliasing remain unchanged.
 
 The semantic parser is implemented with winnow 1.0.4 (MIT), replacing M1a's
 manual token cursor. Only `netlist` directly depends on it; default
-features are disabled and only `std`/`parser` enabled. Its declared MSRV is 1.65,
-the dependency's historical minimum supported compiler. The workspace now uses pinned nightly; stable/MSRV CI is retired. `Cargo.lock` pins the resolved graph;
+features are disabled and only `std`/`parser` enabled. The workspace uses pinned
+nightly; stable/MSRV CI is retired. `Cargo.lock` pins the resolved graph;
 offline builds require the registry dependencies to have been cached first.
 
 - `parser/grammar.rs`: `Stateful<TokenSlice<Token>, Context>` over borrowed
