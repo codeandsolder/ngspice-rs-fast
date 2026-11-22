@@ -69,3 +69,28 @@ and provenance parity. The ignored benchmarks in source_parse_limits use one
 million punctuation tokens or one million tiny cards with an 8192-element budget, plus a fully admitted punctuation baseline;
 run each separately on the test executable with `--exact --ignored --nocapture`
 under time and DHAT to measure actual retained heap and time.
+
+Acer, pinned nightly, optimized test profile, 2026-11-22. The same
+1,000,000-character punctuation source was rejected either at the configured
+lexical budget or after complete tokenization by the semantic grammar.
+Three alternating native runs, plus DHAT in separate processes:
+
+| Metric | 1M admitted tokens | 8,192 admitted tokens |
+|---|---:|---:|
+| Median process wall time | 1.09 s | 0.03 s |
+| Median peak RSS | 131,796 KiB | 5,808 KiB |
+| DHAT allocated bytes | 207,361,806 | 3,615,028 |
+| DHAT allocated blocks | 1,000,291 | 8,437 |
+| DHAT peak live bytes | 105,669,428 | 2,800,622 |
+
+The 1,000,000-card input with a folded-card limit of 8,192 had median
+peak RSS 7,684 KiB and DHAT peak live bytes 4,554,207 (including its 4 MB
+caller-owned text), 8,433 blocks allocated. The combined valid workload
+(2,048-point independent PWL, 8,192-point behavioural PWL and 100,000
+resistors) finished in 0.64 s with peak RSS 171,552 KiB.
+
+These are process measurements including the test harness/input. The bounded
+and fully admitted punctuation cases use identical code and source with
+different policies; the table measures the effect of limiting lexical work,
+not a general parser speedup over the previous revision. Wall time is noisy
+on the shared host.
