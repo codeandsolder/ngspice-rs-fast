@@ -305,15 +305,20 @@ mod tests {
         use std::path::Path;
 
         let fixture = include_str!("../../conformance/pencil_search_traces.txt");
-        for case in fixture.split("\ncase ").skip(1) {
+        let mut cases = fixture.split("\ncase ").skip(1);
+        for expected in ["repeat", "near", "complex", "singular", "notch"] {
+            let case = cases.next().unwrap();
             let (name, rest) = case.split_once('\n').unwrap();
+            assert_eq!(name, expected);
             let (deck, trace) = rest.split_once("\ntrace\n").unwrap();
             let netlist = Parser::new()
                 .parse_deck(&parse_deck_text(Path::new("trace.cir"), deck))
                 .unwrap();
             let config = RunConfig::from_netlist(&netlist).unwrap();
             let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+            assert_eq!(netlist.analyses.len(), 1);
             let card = parse(&netlist.analyses[0].arguments).unwrap();
+            assert_ne!(card.poles, card.zeros);
             let context = config.context();
             let mut circuit = config.circuit(&netlist).unwrap();
             circuit.finalize().unwrap();
@@ -341,6 +346,7 @@ mod tests {
             let load = prepared_load(&circuit, &signal, &context, 1, input, output).unwrap();
             crate::maths::pencil::check_c_trace(&load, name, trace);
         }
+        assert!(cases.next().is_none());
     }
 
     #[test]
