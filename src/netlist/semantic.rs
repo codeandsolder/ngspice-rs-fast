@@ -395,7 +395,7 @@ fn cards(cards: &[ScopedCard]) -> Vec<ScopedCard> {
         .iter()
         .map(|card| ScopedCard {
             kind: card.kind,
-            // `.save`/`.print`/`.measure`/`.four` carry no scope-local index in
+            // `.save`/`.print`/`.measure`/`.four` carry only scope-local ordinals in
             // the netlist and their typed requests live in `OutputCards` /
             // `ParsedDeck::measurements` / `ParsedDeck::fourier`, so the card's
             // own spelling is the netlist's only record of what was requested.
@@ -403,12 +403,14 @@ fn cards(cards: &[ScopedCard]) -> Vec<ScopedCard> {
             // and lets the writer reproduce them from a semantic form; every
             // other card is compared through its typed payload.
             source: match card.kind {
-                ScopedCardKind::Output | ScopedCardKind::Measure | ScopedCardKind::Fourier => {
-                    RawCard {
-                        raw: card.source.raw.clone(),
-                        ..raw()
-                    }
-                }
+                ScopedCardKind::Save(_)
+                | ScopedCardKind::Print(_)
+                | ScopedCardKind::Measure(_)
+                | ScopedCardKind::Fourier(_)
+                | ScopedCardKind::Control => RawCard {
+                    raw: card.source.raw.clone(),
+                    ..raw()
+                },
                 _ => raw(),
             },
             include_chain: card.include_chain.iter().map(|_| blank()).collect(),

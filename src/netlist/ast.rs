@@ -1090,7 +1090,7 @@ pub struct FourierCard {
 /// for future serializers/snapshots; neither is implemented by this storage.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScopedCard {
-    /// Semantic kind and scope-local index, where applicable.
+    /// Semantic kind and scope-local index, including frontend side channels.
     pub kind: ScopedCardKind,
     /// Positioned source spelling/tokens of this card.
     pub source: crate::netlist::card::RawCard,
@@ -1125,21 +1125,16 @@ pub enum ScopedCardKind {
     InitialCondition(usize),
     /// Index into this scope's nodeset cards.
     Nodeset(usize),
-    /// A `.save` or root `.print`/`.plot` card. Body requests live in `Subcircuit::output`; root requests live in
-    /// the [`OutputCards`] the parser returns beside the [`Netlist`]
-    /// ([`crate::netlist::Parser::parse_file_with_output`]), so this card carries no
-    /// scope-local index.
-    Output,
-    /// A `.measure`/`.meas` card. Body requests live in `Subcircuit::measurements`; root requests live in
-    /// the [`MeasureCard`] list returned beside the [`Netlist`]
-    /// ([`ParsedDeck::measurements`](crate::netlist::ParsedDeck::measurements)), so this
-    /// card carries no scope-local index.
-    Measure,
-    /// A `.four` card. Body requests live in `Subcircuit::fourier`; root requests live in the
-    /// [`FourierCard`] list returned beside the [`Netlist`]
-    /// ([`ParsedDeck::fourier`](crate::netlist::ParsedDeck::fourier)), so this card
-    /// carries no scope-local index.
-    Fourier,
+    /// Index into the owning scope's output save cards.
+    Save(usize),
+    /// Index into the owning scope's output print/plot cards.
+    Print(usize),
+    /// Index into the owning scope's measurement cards.
+    Measure(usize),
+    /// Index into the owning scope's Fourier cards.
+    Fourier(usize),
+    /// Structural/control command with no separate semantic payload.
+    Control,
     /// End of a subcircuit body.
     Ends,
     /// End of a deck.
@@ -1258,9 +1253,11 @@ pub(crate) enum ScopeEntry<'a> {
     InitialCondition(&'a NodeHintCard),
     Nodeset(&'a NodeHintCard),
     Func(&'a FuncCard),
-    Output,
-    Measure,
-    Fourier,
+    Save(usize),
+    Print(usize),
+    Measure(usize),
+    Fourier(usize),
+    Control,
     Ends,
     End,
 }
@@ -1383,9 +1380,11 @@ impl<'a> ScopeView<'a> {
                         collection: "functions",
                     })
             }
-            ScopedCardKind::Output => Ok(ScopeEntry::Output),
-            ScopedCardKind::Measure => Ok(ScopeEntry::Measure),
-            ScopedCardKind::Fourier => Ok(ScopeEntry::Fourier),
+            ScopedCardKind::Save(index) => Ok(ScopeEntry::Save(index)),
+            ScopedCardKind::Print(index) => Ok(ScopeEntry::Print(index)),
+            ScopedCardKind::Measure(index) => Ok(ScopeEntry::Measure(index)),
+            ScopedCardKind::Fourier(index) => Ok(ScopeEntry::Fourier(index)),
+            ScopedCardKind::Control => Ok(ScopeEntry::Control),
             ScopedCardKind::Ends => Ok(ScopeEntry::Ends),
             ScopedCardKind::End => Ok(ScopeEntry::End),
         }
@@ -1407,7 +1406,7 @@ impl<'a> ScopeView<'a> {
             self.nodesets.len(),
             self.functions.len(),
         ];
-        let mut next = [0; 11];
+        let mut next = [0; 15];
         for card in self.cards {
             let (collection, index) = match card.kind {
                 ScopedCardKind::Device(index) => (0, index),
@@ -1421,6 +1420,10 @@ impl<'a> ScopeView<'a> {
                 ScopedCardKind::InitialCondition(index) => (8, index),
                 ScopedCardKind::Nodeset(index) => (9, index),
                 ScopedCardKind::Func(index) => (10, index),
+                ScopedCardKind::Save(index) => (11, index),
+                ScopedCardKind::Print(index) => (12, index),
+                ScopedCardKind::Measure(index) => (13, index),
+                ScopedCardKind::Fourier(index) => (14, index),
                 _ => continue,
             };
             self.entry(card.kind)?;
@@ -1429,7 +1432,7 @@ impl<'a> ScopeView<'a> {
             }
             next[collection] += 1;
         }
-        if next != lengths {
+        if next[..11] != lengths {
             return Err(ScopeOrderError::Coverage);
         }
         Ok(())

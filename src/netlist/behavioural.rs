@@ -378,10 +378,16 @@ fn remap_device_cards(
                     "invalid device card index during lowering",
                 )
             })?;
-            for index in range.clone() {
+            if let Some(last) = range.clone().next_back() {
+                for index in range.start..last {
+                    rewritten.push(ScopedCard {
+                        kind: ScopedCardKind::Device(index),
+                        ..card.clone()
+                    });
+                }
                 rewritten.push(ScopedCard {
-                    kind: ScopedCardKind::Device(index),
-                    ..card.clone()
+                    kind: ScopedCardKind::Device(last),
+                    ..card
                 });
             }
         } else {

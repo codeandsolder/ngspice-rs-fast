@@ -52,7 +52,7 @@ struct Scope {
 }
 
 impl Scope {
-    /// Output requests travel beside the netlist, without a scope-local index.
+    /// Output requests travel beside the netlist, with scope-local ordinals.
     /// Body-local save/measure/Fourier requests remain attached for expansion;
     /// print requests in bodies remain explicitly unsupported.
     fn record_output(
@@ -62,7 +62,10 @@ impl Scope {
         opening: Option<(&str, &SourceLoc)>,
     ) -> SpiceResult<ScopedCardKind> {
         match output {
-            OutputCard::Save(save) => self.output.saves.push(save),
+            OutputCard::Save(save) => Ok(ScopedCardKind::Save(push_index(
+                &mut self.output.saves,
+                save,
+            ))),
             OutputCard::Print(print) => {
                 reject_in_body(
                     card,
@@ -70,10 +73,12 @@ impl Scope {
                     ".print",
                     "src/frontend/dotcards.c (ft_savedotargs/com_save2)",
                 )?;
-                self.output.prints.push(print);
+                Ok(ScopedCardKind::Print(push_index(
+                    &mut self.output.prints,
+                    print,
+                )))
             }
         }
-        Ok(ScopedCardKind::Output)
     }
 
     fn into_definition(self, mut definition: Subcircuit) -> SpiceResult<Subcircuit> {
@@ -306,7 +311,7 @@ fn scope(
         *cursor += 1;
         let card = &entry.source;
         let Some(parsed) = control.parse(card, opening.is_some(), auto_gnd, &declared)? else {
-            result.cards.push(ordered(entry, ScopedCardKind::Output));
+            result.cards.push(ordered(entry, ScopedCardKind::Control));
             continue;
         };
         let kind = match parsed {
@@ -325,12 +330,10 @@ fn scope(
             ParsedCard::Func(f) => ScopedCardKind::Func(push_index(&mut result.functions, f)),
             ParsedCard::Output(output) => result.record_output(output, card, opening)?,
             ParsedCard::Measure(measure) => {
-                result.measurements.push(measure);
-                ScopedCardKind::Measure
+                ScopedCardKind::Measure(push_index(&mut result.measurements, measure))
             }
             ParsedCard::Fourier(fourier) => {
-                result.fourier.push(fourier);
-                ScopedCardKind::Fourier
+                ScopedCardKind::Fourier(push_index(&mut result.fourier, fourier))
             }
             ParsedCard::Include(mut i) => {
                 i.resolved_path.clone_from(&entry.resolved_path);

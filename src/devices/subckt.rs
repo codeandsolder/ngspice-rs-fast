@@ -148,16 +148,19 @@ pub fn expand_with_output(
     check_acyclic(&definitions, &netlist.devices)?;
     let active = netlist.active_subcircuit_indices();
     let mut hoisted_fourier = Vec::new();
-    let mut root_fourier = fourier.iter().peekable();
+    let root_view = ScopeView::from(netlist);
     for card in &netlist.cards {
-        match card.kind {
-            ScopedCardKind::Fourier => hoisted_fourier.extend(
-                root_fourier
-                    .next_if(|fourier| fourier.location == card.source.location)
-                    .cloned(),
-            ),
-            ScopedCardKind::Subcircuit(index) if active.contains(&index) => {
-                hoisted_fourier.extend(netlist.subcircuits[index].fourier.iter().cloned());
+        let entry = root_view
+            .entry(card.kind)
+            .map_err(|error| SpiceError::parse(card.source.location.clone(), error.to_string()))?;
+        match (card.kind, entry) {
+            (_, ScopeEntry::Fourier(index)) => {
+                hoisted_fourier.extend(side_card(fourier, index, &card.source.location)?.cloned())
+            }
+            (ScopedCardKind::Subcircuit(index), ScopeEntry::Subcircuit(definition))
+                if active.contains(&index) =>
+            {
+                hoisted_fourier.extend(definition.fourier.iter().cloned());
             }
             _ => {}
         }
@@ -263,9 +266,23 @@ enum FrontendAction<'a> {
     NoOutput,
 }
 
+fn side_card<'a, T>(
+    cards: &'a [T],
+    index: usize,
+    location: &SourceLoc,
+) -> SpiceResult<Option<&'a T>> {
+    if cards.is_empty() {
+        return Ok(None);
+    }
+    cards
+        .get(index)
+        .map(Some)
+        .ok_or_else(|| SpiceError::parse(location.clone(), "invalid frontend side-card index"))
+}
+
 /// Compile immutable lexical order once. Indexed entries are validated at
 /// the boundary; output side channels follow their original occurrence order
-/// rather than collecting all cards with a matching physical location.
+/// rather than matching physical source locations.
 fn expansion_plan<'a>(
     scope: ScopeView<'a>,
     output: &'a OutputCards,
@@ -281,9 +298,6 @@ fn expansion_plan<'a>(
         .validate_order()
         .map_err(|error| SpiceError::circuit(error.to_string()))?;
     let mut sequence = Vec::new();
-    let mut saves = output.saves.iter().peekable();
-    let mut prints = output.prints.iter().peekable();
-    let mut measures = measurements.iter().peekable();
     for card in scope.cards {
         let location = &card.source.location;
         let entry = scope
@@ -297,19 +311,13 @@ fn expansion_plan<'a>(
             (_, ScopeEntry::Options(option)) => FrontendAction::Options(option),
             (ScopedCardKind::InitialCondition(index), _) => FrontendAction::InitialCondition(index),
             (ScopedCardKind::Nodeset(index), _) => FrontendAction::Nodeset(index),
-            (_, ScopeEntry::Output) => {
-                if let Some(save) = saves.next_if(|entry| &entry.location == location) {
-                    FrontendAction::Save(save)
-                } else if let Some(print) = prints.next_if(|entry| &entry.location == location) {
-                    FrontendAction::Print(print)
-                } else {
-                    // Control syntax and callers that intentionally omit side-channel output.
-                    FrontendAction::NoOutput
-                }
-            }
-            (_, ScopeEntry::Measure) => measures
-                .next_if(|entry| &entry.location == location)
+            (_, ScopeEntry::Save(index)) => side_card(&output.saves, index, location)?
+                .map_or(FrontendAction::NoOutput, FrontendAction::Save),
+            (_, ScopeEntry::Print(index)) => side_card(&output.prints, index, location)?
+                .map_or(FrontendAction::NoOutput, FrontendAction::Print),
+            (_, ScopeEntry::Measure(index)) => side_card(measurements, index, location)?
                 .map_or(FrontendAction::NoOutput, FrontendAction::Measure),
+            (_, ScopeEntry::Control) => FrontendAction::NoOutput,
             _ => continue,
         };
         sequence.push(ExpansionItem::Frontend { location, action });

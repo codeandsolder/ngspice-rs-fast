@@ -249,7 +249,11 @@ impl Writer {
                 // (`ParsedDeck::fourier`) are returned beside the netlist, so
                 // their typed index lives outside the netlist and the card is
                 // reproduced from its own spelling.
-                ScopeEntry::Output | ScopeEntry::Measure | ScopeEntry::Fourier => {
+                ScopeEntry::Save(_)
+                | ScopeEntry::Print(_)
+                | ScopeEntry::Measure(_)
+                | ScopeEntry::Fourier(_)
+                | ScopeEntry::Control => {
                     if !skip {
                         self.line(depth, card.source.raw.trim(), location)?;
                     }
