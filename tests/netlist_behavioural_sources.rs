@@ -757,3 +757,36 @@ fn wide_valid_pwl_constructs_resolves_and_compiles_on_bounded_stack() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn symbolic_depth_boundary_and_nested_syntax_compile_on_bounded_stack() {
+    use ngspice_rs::netlist::expr::{MAX_NESTING, MAX_TREE_DEPTH};
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let symbolic = format!("{}v(in)", "v(in)+".repeat(MAX_TREE_DEPTH - 1));
+            let nested = [
+                symbolic,
+                format!("{}1{}", "(".repeat(MAX_NESTING), ")".repeat(MAX_NESTING)),
+                format!("{}1", "1?1:".repeat(MAX_NESTING)),
+            ];
+            for text in nested {
+                let n = parse(&format!("v1 in 0 1\nb1 o 0 v={text}"));
+                assert!(ngspice_rs::devices::Circuit::from_netlist(&n).is_ok());
+            }
+            for text in [
+                format!(
+                    "{}1{}",
+                    "(".repeat(MAX_NESTING + 1),
+                    ")".repeat(MAX_NESTING + 1)
+                ),
+                format!("{}1", "1?1:".repeat(MAX_NESTING + 1)),
+            ] {
+                let error = try_parse(&format!("b1 o 0 v={text}")).unwrap_err();
+                assert!(error.to_string().contains("nesting limit"), "{error}");
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
