@@ -205,3 +205,25 @@ fn bsim4_mode_and_analysis_matrix_matches_c() {
         compare(&c[0], &rust_plots(&deck)[0], &label);
     }
 }
+
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN; nested BSIM4 preparation sweeps"]
+fn nested_temperature_and_width_sweeps_match_c() {
+    let binary = PathBuf::from(std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN"));
+    assert!(binary.is_absolute());
+    // Both inner axes return to their starting value when the outer one
+    // advances. Cached snapshots must restore preparation-owned fields,
+    // while load-only fields continue from the preceding operating point.
+    for (label, card) in [
+        ("temp-inner", ".dc temp 27 47 20 @m1[w] 0.3u 0.6u 0.3u"),
+        ("width-inner", ".dc @m1[w] 0.3u 0.6u 0.3u temp 27 47 20"),
+    ] {
+        let deck = amplifier("", card);
+        let c = c_plots(&binary, &deck, label);
+        let rust = rust_plots(&deck);
+        assert_eq!(c.len(), rust.len(), "{label}: plot count");
+        for (c, rust) in c.iter().zip(&rust) {
+            compare(c, rust, label);
+        }
+    }
+}
