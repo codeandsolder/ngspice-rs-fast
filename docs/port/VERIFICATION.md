@@ -1740,7 +1740,9 @@ that mention BDF, `TRAN_RESTART` and variants are that historical record.)
 * Breakpoints come from the already elaborated circuit (`tran::breakpoints`,
   #33), not a second interpretation of the AST. The same validated `Waveform`
   and `TransientTiming` resolve source setters, subcircuit instances and
-  analysis defaults for simulation and comparison. Lazy events retain source
+  analysis defaults for simulation and comparison. Nested instance calls use
+  the existing elaborator (lexically nested definitions remain unsupported).
+  Lazy events retain source
   identity, exact times, and kind (PULSE edge/period/count cut, PWL knot/repeat
   boundary, step jump, smooth-function corner or trailing accept request).
   Comparison requires samples at physical PULSE/PWL/step events; smooth

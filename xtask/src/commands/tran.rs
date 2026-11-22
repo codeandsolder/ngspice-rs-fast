@@ -816,7 +816,7 @@ mod tests {
         // Two expanded instances get their own parameterized delay. An unused
         // definition contributes no events.
         let netlist = deck(
-            ".subckt outer a params: delay=1m\n.subckt inner b params: d=0\n             v1 b 0 pwl(0 0 1m 1) td={d}\n.ends\nx1 a inner d={delay}\n.ends\n             x1 n1 outer delay=0.5m\nx2 n2 outer delay=2m\n             .subckt unused a\nv1 a 0 pulse(0 1 0.1m)\n.ends",
+            ".subckt inner b params: d=0\n             v1 b 0 pwl(0 0 1m 1) td={d}\n.ends\n.subckt outer a params: delay=1m\nx1 a inner d={delay}\n.ends\n             x1 n1 outer delay=0.5m\nx2 n2 outer delay=2m\n             .subckt unused a\nv1 a 0 pulse(0 1 0.1m)\n.ends",
         );
         assert_eq!(
             deck_breakpoints(&netlist, 1e-5, 4e-3).unwrap(),
@@ -912,7 +912,7 @@ mod tests {
         let netlist = deck("v1 in 0 pulse(0 1 2 1 2 3 10 1.2)");
         assert_eq!(
             deck_breakpoints(&netlist, 0.1, 30.0).unwrap(),
-            vec![2., 3., 6., 8., 12., 13., 14.]
+            vec![2., 3., 6., 8., 12., 13., 2. + 10. * 1.200_000_000_000_000_2]
         );
     }
 

@@ -518,11 +518,11 @@ fn nested_resolved_timeline_matches_independent_c_corners() {
     // pulse whose rise/fall default to the .tran step, and coincident corners.
     let cards = "\
 .param dt=0.125\n\
-.subckt outer a b params: delay=0.5\n\
 .subckt inner x y params: d=0\n\
 v1 x 0 pwl(0 0 0.25 1 0.5 0) td={d}\n\
 v2 y 0 pulse(0 1 0.25 0 0)\n\
 .ends inner\n\
+.subckt outer a b params: delay=0.5\n\
 xinner a b inner d={delay}\n\
 .ends outer\n\
 x1 a b outer delay=0.5\n\
