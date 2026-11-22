@@ -12,15 +12,15 @@
 //!   coupling to `M + delta` and "restores" it to `M`.
 //!
 //! In an AC sweep these devices load what `cktsens.c`'s per-frequency reset
-//! left ([`DeviceSensitivity::reset_ac_load`]): a B source's `ASRCacValues`
+//! left ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]): a B source's `ASRCacValues`
 //! are reallocated (zeroed) by every `ASRCsetup` and written only by a
 //! small-signal load, so only a voltage source's branch incidences remain; a
 //! switch keeps the state its `MODEINITFLOAT` load chose for a zero control.
 
 use super::{
-    AcReset, CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, RecordPair, ResetStamp,
-    ResetStamps, SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
-    SensitivityRecord, StampAt, StampPart,
+    AcReset, CELSIUS_TO_KELVIN, ParameterScope, RecordPair, ResetStamp, ResetStamps,
+    SensitivityFamily, SensitivityKernel, SensitivityLoad, SensitivityMode,
+    SensitivityParameter as P, SensitivityRecord, StampAt, StampPart,
 };
 use crate::devices::{
     Behavioural, BehaviouralOutput, BehaviouralScale, Device, MutualInductance, Switch, SwitchKind,
@@ -69,7 +69,7 @@ impl<'a> BehaviouralSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for BehaviouralSensitivity<'_> {
+impl SensitivityKernel for BehaviouralSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Asrc
     }
@@ -234,7 +234,7 @@ impl<'a> SwitchSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for SwitchSensitivity<'_> {
+impl SensitivityKernel for SwitchSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         match self.switch.kind() {
             SwitchKind::Voltage => SensitivityFamily::VoltageSwitch,
@@ -381,7 +381,7 @@ impl DeviceSensitivity for SwitchSensitivity<'_> {
 /// A K coupling's `.sens` description: `MUTpTable`'s `k`, `MUTask`,
 /// `MUTparam`, `MUTtemp` and `MUTacLoad`. The instance record holds `k`,
 /// C's `MUTfactor` (`factor`) and the mirrored inductances and branch rows
-/// of its inductors ([`DeviceSensitivity::coupled_inductors`]).
+/// of its inductors ([`crate::devices::sensitivity::DeviceSensitivity::coupled_inductors`]).
 #[derive(Debug)]
 pub(in crate::devices) struct MutualSensitivity<'a> {
     coupling: &'a MutualInductance,
@@ -393,7 +393,7 @@ impl<'a> MutualSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for MutualSensitivity<'_> {
+impl SensitivityKernel for MutualSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Mutual
     }

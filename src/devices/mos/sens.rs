@@ -20,8 +20,8 @@ use super::{CELSIUS_TO_KELVIN, Common, MosLevel, Mosfet};
 use crate::devices::ModelContext;
 use crate::devices::nonlinear::thermal::TemperatureCache;
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, ParameterScope, RecordPair, ResetStamp, ResetStamps,
-    SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
+    AcReset, ParameterScope, RecordPair, ResetStamp, ResetStamps, SensitivityFamily,
+    SensitivityKernel, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
     SensitivityRecord as Record, StampAt, StampPart,
 };
 use crate::devices::{Device, LinearContext, StampContext};
@@ -205,7 +205,7 @@ pub(in crate::devices) struct MosSensitivity<'a, L: SensitivityLevel> {
     pub(crate) context: ModelContext,
 }
 
-impl<L: SensitivityLevel> DeviceSensitivity for MosSensitivity<'_, L> {
+impl<L: SensitivityLevel> SensitivityKernel for MosSensitivity<'_, L> {
     fn family(&self) -> SensitivityFamily {
         L::FAMILY
     }
@@ -423,7 +423,7 @@ impl<L: SensitivityLevel> MosSensitivity<'_, L> {
 }
 
 /// A classic MOSFET's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetMosfet<L: MosLevel> {
     /// Built from the reset load's records: the conductances and the mode.

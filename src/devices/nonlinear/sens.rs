@@ -17,9 +17,9 @@
 use super::thermal::TemperatureCache;
 use super::{Diode, DiodeParameters, EPSMIN};
 use crate::devices::sensitivity::{
-    AcReset, CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, RecordPair, ResetStamp,
-    ResetStamps, SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
-    SensitivityRecord, StampAt, StampPart, written,
+    AcReset, CELSIUS_TO_KELVIN, ParameterScope, RecordPair, ResetStamp, ResetStamps,
+    SensitivityFamily, SensitivityKernel, SensitivityLoad, SensitivityMode,
+    SensitivityParameter as P, SensitivityRecord, StampAt, StampPart, written,
 };
 use crate::devices::{Device, LinearContext, StampContext};
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
@@ -237,7 +237,7 @@ fn setup_diode_instance(
     instance.store("ikp", model.value("ikp")? * pj * m)
 }
 
-impl DeviceSensitivity for DiodeSensitivity<'_> {
+impl SensitivityKernel for DiodeSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Diode
     }
@@ -566,7 +566,7 @@ impl DiodeSensitivity<'_> {
 }
 
 /// A diode's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetDiode {
     /// Built from the records of the reset load, which sets the junction

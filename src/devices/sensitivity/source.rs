@@ -3,7 +3,7 @@
 //! loads (`vsrcload.c`, `vsrcacld.c`, `isrcload.c`, `isrcacld.c`).
 
 use super::{
-    DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter as P, SensitivityRecord,
 };
 use crate::devices::IndependentSource;
@@ -65,7 +65,7 @@ impl<'a> SourceSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for SourceSensitivity<'_> {
+impl SensitivityKernel for SourceSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         if self.voltage {
             SensitivityFamily::VoltageSource

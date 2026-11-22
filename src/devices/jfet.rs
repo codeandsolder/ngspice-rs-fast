@@ -73,7 +73,7 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
@@ -1365,7 +1365,10 @@ impl Device for Jfet {
         instance_parameter(keyword)
     }
     /// `jfet.c`'s `IFparm` tables under C's `sgen` walk (#164).
-    fn sensitivity(&self, context: &ModelContext) -> SpiceResult<Box<dyn DeviceSensitivity + '_>> {
+    fn sensitivity(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
         Ok(Box::new(JfetSensitivity::new(self, context)))
     }
     /// `JFETparam` then `JFETtemp`, with the instance schema domains.
@@ -1610,7 +1613,7 @@ impl<'a> JfetSensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for JfetSensitivity<'_> {
+impl SensitivityKernel for JfetSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Jfet
     }
@@ -1832,7 +1835,7 @@ impl JfetSensitivity<'_> {
 }
 
 /// A JFET's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetJfet {
     /// Built from the reset load's records: the junction conductances.

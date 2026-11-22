@@ -6,8 +6,8 @@
 //! every DC sensitivity of theirs is exactly zero.
 
 use super::{
-    CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, PassiveInputs, RecordPair,
-    SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
+    CELSIUS_TO_KELVIN, ParameterScope, PassiveInputs, RecordPair, SensitivityFamily,
+    SensitivityKernel, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
     SensitivityRecord,
 };
 use crate::devices::{Device, LinearContext, StampContext};
@@ -194,7 +194,7 @@ const fn reactive_temperature_factor(tc1: Real, tc2: Real, difference: Real) -> 
     1.0 + tc1 * difference + tc2 * difference * difference
 }
 
-impl DeviceSensitivity for ReactiveSensitivity<'_> {
+impl SensitivityKernel for ReactiveSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         match self.kind {
             ReactiveKind::Capacitor => SensitivityFamily::Capacitor,

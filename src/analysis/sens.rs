@@ -644,8 +644,6 @@ fn members<'a>(
         let sensitivity = device.sensitivity(context)?;
         let (mut model_record, mut instance_record) = sensitivity.records()?;
         let family = sensitivity.family();
-        model_record.validate(family, ParameterScope::Model)?;
-        instance_record.validate(family, ParameterScope::Instance)?;
         match layouts.entry(family) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert((model_record.clone(), instance_record.clone()));

@@ -78,7 +78,7 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
+    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
@@ -1641,7 +1641,10 @@ impl Device for Hfet1 {
         Ok(())
     }
 
-    fn sensitivity(&self, context: &ModelContext) -> SpiceResult<Box<dyn DeviceSensitivity + '_>> {
+    fn sensitivity(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
         Ok(Box::new(Hfet1Sensitivity::new(self, context)))
     }
 
@@ -1864,7 +1867,7 @@ impl<'a> Hfet1Sensitivity<'a> {
     }
 }
 
-impl DeviceSensitivity for Hfet1Sensitivity<'_> {
+impl SensitivityKernel for Hfet1Sensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Hfet1
     }
@@ -2161,7 +2164,7 @@ impl Hfet1Sensitivity<'_> {
 }
 
 /// An HFET1's AC load in `cktsens.c`'s sweep
-/// ([`DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
 #[derive(Debug)]
 struct ResetHfet1 {
     /// Built from the reset load's records: the gate and channel

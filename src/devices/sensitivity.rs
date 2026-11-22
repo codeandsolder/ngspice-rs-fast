@@ -301,7 +301,15 @@ impl SensitivityRecord {
         family: SensitivityFamily,
         scope: ParameterScope,
     ) -> SpiceResult<()> {
-        if self.family != family || self.scope != scope {
+        let representation_matches = match (&self.data, family, scope) {
+            (RecordData::Bsim4Model(_), SensitivityFamily::Bsim4, ParameterScope::Model)
+            | (RecordData::Bsim4Instance(_), SensitivityFamily::Bsim4, ParameterScope::Instance) => {
+                true
+            }
+            (RecordData::Scalars(_), family, _) => family != SensitivityFamily::Bsim4,
+            _ => false,
+        };
+        if self.family != family || self.scope != scope || !representation_matches {
             return Err(SpiceError::circuit(format!(
                 "sensitivity record identity mismatch: expected {family:?}/{scope:?}, got {:?}/{:?}",
                 self.family, self.scope,
@@ -474,6 +482,21 @@ pub struct RecordPair<'a> {
     pub instance: &'a SensitivityRecord,
 }
 
+fn validate_pair(
+    family: SensitivityFamily,
+    model: &SensitivityRecord,
+    instance: &SensitivityRecord,
+) -> SpiceResult<()> {
+    model.validate(family, ParameterScope::Model)?;
+    instance.validate(family, ParameterScope::Instance)
+}
+
+impl RecordPair<'_> {
+    fn validate(self, family: SensitivityFamily) -> SpiceResult<()> {
+        validate_pair(family, self.model, self.instance)
+    }
+}
+
 /// Which load a sensitivity analysis performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SensitivityMode {
@@ -496,7 +519,7 @@ pub enum SensitivityLoad {
 
 /// One device as `.sens` sees it: C's parameter tables, its records, and its
 /// setter, setup, temperature and load routines replayed on those records.
-pub trait DeviceSensitivity: fmt::Debug {
+pub trait DeviceSensitivity: fmt::Debug + sealed::Sealed {
     /// The C device type.
     fn family(&self) -> SensitivityFamily;
 
@@ -528,12 +551,7 @@ pub trait DeviceSensitivity: fmt::Debug {
         scope: ParameterScope,
         keyword: &str,
         records: RecordPair<'_>,
-    ) -> SpiceResult<Real> {
-        match scope {
-            ParameterScope::Model => records.model.value(keyword),
-            ParameterScope::Instance => records.instance.value(keyword),
-        }
-    }
+    ) -> SpiceResult<Real>;
 
     /// `DEVparam`/`DEVmodParam`. The default stores the value and marks the
     /// field given.
@@ -547,12 +565,7 @@ pub trait DeviceSensitivity: fmt::Debug {
         value: Real,
         model: &mut SensitivityRecord,
         instance: &mut SensitivityRecord,
-    ) -> SpiceResult<()> {
-        match scope {
-            ParameterScope::Model => model.set(keyword, value),
-            ParameterScope::Instance => instance.set(keyword, value),
-        }
-    }
+    ) -> SpiceResult<()>;
 
     /// The record side effects of `DEVsetup` (defaults for fields not given,
     /// flags it clears). Runs once per parameter, before the perturbation.
@@ -563,9 +576,7 @@ pub trait DeviceSensitivity: fmt::Debug {
         &self,
         _model: &mut SensitivityRecord,
         _instance: &mut SensitivityRecord,
-    ) -> SpiceResult<()> {
-        Ok(())
-    }
+    ) -> SpiceResult<()>;
 
     /// `DEVunsetup`, which `cktsens.c`'s `CKTunsetup` runs on every device
     /// before each AC frequency's `CKTsetup`. The default does nothing.
@@ -576,17 +587,16 @@ pub trait DeviceSensitivity: fmt::Debug {
         &self,
         _model: &mut SensitivityRecord,
         _instance: &mut SensitivityRecord,
-    ) -> SpiceResult<()> {
-        Ok(())
-    }
+    ) -> SpiceResult<()>;
 
     /// The `(row, column)` node pairs `DEVsetup` allocates on `delta_Y` for
     /// the records `setup` left, in `TSTALLOC` order, when they differ from
     /// the circuit's own setup elements (`b4set.c` re-aliases internal nodes
     /// when it runs again). `None` (the default) uses the circuit's.
-    fn setup_elements(&self, _setup: RecordPair<'_>) -> SpiceResult<Option<Vec<(NodeId, NodeId)>>> {
-        Ok(None)
-    }
+    ///
+    /// # Errors
+    /// A record does not belong to the device family or scope.
+    fn setup_elements(&self, _setup: RecordPair<'_>) -> SpiceResult<Option<Vec<(NodeId, NodeId)>>>;
 
     /// `DEVtemperature`: recomputes the derived fields from the parameters.
     ///
@@ -596,9 +606,7 @@ pub trait DeviceSensitivity: fmt::Debug {
         &self,
         _model: &mut SensitivityRecord,
         _instance: &mut SensitivityRecord,
-    ) -> SpiceResult<()> {
-        Ok(())
-    }
+    ) -> SpiceResult<()>;
 
     /// What the device loads with the records `current`; `setup` holds the
     /// records as `DEVsetup` last saw them, for quantities only setup derives.
@@ -632,10 +640,7 @@ pub trait DeviceSensitivity: fmt::Debug {
         setup: RecordPair<'_>,
         reset: AcReset<'_>,
         current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
-        let _ = reset;
-        self.load(setup, current, SensitivityMode::Ac)
-    }
+    ) -> SpiceResult<SensitivityLoad>;
 
     /// The C file of this device's AC load when that load reads instance
     /// fields only a small-signal (`MODEINITSMSIG`) or transient load writes
@@ -643,9 +648,7 @@ pub trait DeviceSensitivity: fmt::Debug {
     /// they hold whatever an earlier analysis of the deck left
     /// ([`AcReset::small_signal`]), or C's zero initialisation when none did;
     /// after a `.tran` they come from [`AcReset::transient`].
-    fn stale_ac_fields(&self) -> Option<&'static str> {
-        None
-    }
+    fn stale_ac_fields(&self) -> Option<&'static str>;
 
     /// For a K coupling, the names of its two inductors: the analysis
     /// mirrors their `INDinduct` and branch rows into this device's instance
@@ -653,6 +656,216 @@ pub trait DeviceSensitivity: fmt::Debug {
     /// `MUTacLoad` read through C's instance pointers.
     fn coupled_inductors(&self) -> Option<[&str; 2]> {
         None
+    }
+}
+
+/// Internal family-specific replay hooks. The sealed public interface validates records.
+pub(in crate::devices) trait SensitivityKernel: fmt::Debug {
+    fn family(&self) -> SensitivityFamily;
+
+    fn model(&self) -> Option<&str>;
+
+    fn model_parameters(&self) -> &'static [SensitivityParameter];
+
+    fn instance_parameters(&self) -> &'static [SensitivityParameter];
+
+    fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)>;
+
+    fn ask(
+        &self,
+        scope: ParameterScope,
+        keyword: &str,
+        records: RecordPair<'_>,
+    ) -> SpiceResult<Real> {
+        match scope {
+            ParameterScope::Model => records.model.value(keyword),
+            ParameterScope::Instance => records.instance.value(keyword),
+        }
+    }
+
+    fn set(
+        &self,
+        scope: ParameterScope,
+        keyword: &str,
+        value: Real,
+        model: &mut SensitivityRecord,
+        instance: &mut SensitivityRecord,
+    ) -> SpiceResult<()> {
+        match scope {
+            ParameterScope::Model => model.set(keyword, value),
+            ParameterScope::Instance => instance.set(keyword, value),
+        }
+    }
+
+    fn setup(
+        &self,
+        _model: &mut SensitivityRecord,
+        _instance: &mut SensitivityRecord,
+    ) -> SpiceResult<()> {
+        Ok(())
+    }
+
+    fn unsetup(
+        &self,
+        _model: &mut SensitivityRecord,
+        _instance: &mut SensitivityRecord,
+    ) -> SpiceResult<()> {
+        Ok(())
+    }
+
+    fn setup_elements(&self, _setup: RecordPair<'_>) -> SpiceResult<Option<Vec<(NodeId, NodeId)>>> {
+        Ok(None)
+    }
+
+    fn temperature(
+        &self,
+        _model: &mut SensitivityRecord,
+        _instance: &mut SensitivityRecord,
+    ) -> SpiceResult<()> {
+        Ok(())
+    }
+
+    fn load(
+        &self,
+        setup: RecordPair<'_>,
+        current: RecordPair<'_>,
+        mode: SensitivityMode,
+    ) -> SpiceResult<SensitivityLoad>;
+
+    fn reset_ac_load(
+        &self,
+        setup: RecordPair<'_>,
+        reset: AcReset<'_>,
+        current: RecordPair<'_>,
+    ) -> SpiceResult<SensitivityLoad> {
+        let _ = reset;
+        self.load(setup, current, SensitivityMode::Ac)
+    }
+
+    fn stale_ac_fields(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn coupled_inductors(&self) -> Option<[&str; 2]> {
+        None
+    }
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl<T: super::SensitivityKernel + ?Sized> Sealed for T {}
+}
+
+// Family kernels cannot bypass these checks. Model and instance identities
+// are checked before any state changes, including paths that ignore a record.
+impl<T: SensitivityKernel + ?Sized> DeviceSensitivity for T {
+    fn family(&self) -> SensitivityFamily {
+        SensitivityKernel::family(self)
+    }
+
+    fn model(&self) -> Option<&str> {
+        SensitivityKernel::model(self)
+    }
+
+    fn model_parameters(&self) -> &'static [SensitivityParameter] {
+        SensitivityKernel::model_parameters(self)
+    }
+
+    fn instance_parameters(&self) -> &'static [SensitivityParameter] {
+        SensitivityKernel::instance_parameters(self)
+    }
+
+    fn records(&self) -> SpiceResult<(SensitivityRecord, SensitivityRecord)> {
+        let (model, instance) = SensitivityKernel::records(self)?;
+        validate_pair(SensitivityKernel::family(self), &model, &instance)?;
+        Ok((model, instance))
+    }
+
+    fn ask(
+        &self,
+        scope: ParameterScope,
+        keyword: &str,
+        records: RecordPair<'_>,
+    ) -> SpiceResult<Real> {
+        records.validate(SensitivityKernel::family(self))?;
+        SensitivityKernel::ask(self, scope, keyword, records)
+    }
+
+    fn set(
+        &self,
+        scope: ParameterScope,
+        keyword: &str,
+        value: Real,
+        model: &mut SensitivityRecord,
+        instance: &mut SensitivityRecord,
+    ) -> SpiceResult<()> {
+        validate_pair(SensitivityKernel::family(self), model, instance)?;
+        SensitivityKernel::set(self, scope, keyword, value, model, instance)
+    }
+
+    fn setup(
+        &self,
+        model: &mut SensitivityRecord,
+        instance: &mut SensitivityRecord,
+    ) -> SpiceResult<()> {
+        validate_pair(SensitivityKernel::family(self), model, instance)?;
+        SensitivityKernel::setup(self, model, instance)
+    }
+
+    fn unsetup(
+        &self,
+        model: &mut SensitivityRecord,
+        instance: &mut SensitivityRecord,
+    ) -> SpiceResult<()> {
+        validate_pair(SensitivityKernel::family(self), model, instance)?;
+        SensitivityKernel::unsetup(self, model, instance)
+    }
+
+    fn temperature(
+        &self,
+        model: &mut SensitivityRecord,
+        instance: &mut SensitivityRecord,
+    ) -> SpiceResult<()> {
+        validate_pair(SensitivityKernel::family(self), model, instance)?;
+        SensitivityKernel::temperature(self, model, instance)
+    }
+
+    fn setup_elements(&self, setup: RecordPair<'_>) -> SpiceResult<Option<Vec<(NodeId, NodeId)>>> {
+        setup.validate(SensitivityKernel::family(self))?;
+        SensitivityKernel::setup_elements(self, setup)
+    }
+
+    fn load(
+        &self,
+        setup: RecordPair<'_>,
+        current: RecordPair<'_>,
+        mode: SensitivityMode,
+    ) -> SpiceResult<SensitivityLoad> {
+        let family = SensitivityKernel::family(self);
+        setup.validate(family)?;
+        current.validate(family)?;
+        SensitivityKernel::load(self, setup, current, mode)
+    }
+
+    fn reset_ac_load(
+        &self,
+        setup: RecordPair<'_>,
+        reset: AcReset<'_>,
+        current: RecordPair<'_>,
+    ) -> SpiceResult<SensitivityLoad> {
+        let family = SensitivityKernel::family(self);
+        setup.validate(family)?;
+        reset.state.validate(family)?;
+        current.validate(family)?;
+        SensitivityKernel::reset_ac_load(self, setup, reset, current)
+    }
+
+    fn stale_ac_fields(&self) -> Option<&'static str> {
+        SensitivityKernel::stale_ac_fields(self)
+    }
+
+    fn coupled_inductors(&self) -> Option<[&str; 2]> {
+        SensitivityKernel::coupled_inductors(self)
     }
 }
 
@@ -953,7 +1166,11 @@ pub(crate) fn written(values: &crate::devices::schema::ScalarValues, name: &str)
 
 #[cfg(test)]
 mod tests {
-    use super::{ParameterScope, SensitivityFamily, SensitivityRecord};
+    use super::{
+        Bsim4InstanceSnapshot, ParameterScope, RecordData, SensitivityFamily, SensitivityRecord,
+    };
+    use crate::devices::bsim4::fields::{Instance, Model, SizeParam};
+    use std::sync::Arc;
 
     #[test]
     fn records_track_values_and_given_flags() {
@@ -973,5 +1190,115 @@ mod tests {
         assert!(!record.given("m"));
         assert!(record.value("nope").is_err());
         assert!(!record.given("nope"));
+    }
+
+    #[test]
+    fn scalar_layout_checks_identity_order_length_and_types() {
+        let record = || SensitivityRecord::new(SensitivityFamily::Mutual, ParameterScope::Instance);
+        let canonical = record()
+            .with("factor", -0., true)
+            .unwrap()
+            .with_index("row1", usize::MAX)
+            .unwrap();
+        assert!(
+            record()
+                .with("factor", 1., false)
+                .unwrap()
+                .with("factor", 2., true)
+                .is_err()
+        );
+        assert!(record().share_layout(&canonical).is_err());
+        let mut reversed = record()
+            .with_index("row1", 0)
+            .unwrap()
+            .with("factor", 0., false)
+            .unwrap();
+        assert!(reversed.share_layout(&canonical).is_err());
+        let mut wrong_type = record()
+            .with("factor", 1., true)
+            .unwrap()
+            .with("row1", 0., false)
+            .unwrap();
+        assert!(wrong_type.share_layout(&canonical).is_err());
+        let mut wrong_family =
+            SensitivityRecord::new(SensitivityFamily::Inductor, ParameterScope::Instance);
+        assert!(wrong_family.share_layout(&canonical).is_err());
+        let mut wrong_role =
+            SensitivityRecord::new(SensitivityFamily::Mutual, ParameterScope::Model);
+        assert!(wrong_role.share_layout(&canonical).is_err());
+        let mut correct = record()
+            .with("factor", 2., false)
+            .unwrap()
+            .with_index("row1", 5)
+            .unwrap();
+        correct.share_layout(&canonical).unwrap();
+        let (RecordData::Scalars(first), RecordData::Scalars(second)) =
+            (&canonical.data, &correct.data)
+        else {
+            unreachable!();
+        };
+        assert!(Arc::ptr_eq(&first.layout, &second.layout));
+        assert_eq!(correct.index("row1").unwrap(), 5);
+        assert!(correct.set("row1", 4.).is_err());
+        assert!(correct.set_given("row1", true).is_err());
+        assert!(correct.store_index("factor", 4).is_err());
+        assert_eq!(correct.index("row1").unwrap(), 5);
+        assert_eq!(correct.value("factor").unwrap().to_bits(), 2_f64.to_bits());
+        let snapshot = canonical.clone();
+        assert_eq!(snapshot.index("row1").unwrap(), usize::MAX);
+        assert_eq!(
+            snapshot.value("factor").unwrap().to_bits(),
+            (-0_f64).to_bits()
+        );
+        assert!(snapshot.given("factor"));
+    }
+
+    #[test]
+    fn native_bsim4_snapshots_preserve_bits_and_roles() {
+        let payload = f64::from_bits(0x7ff8_0000_0000_1234);
+        let model = SensitivityRecord::from_bsim4_model(Model {
+            vth0: -0.,
+            toxref: payload,
+            r#type: i32::MIN,
+            vth0Given: true,
+            version: "test-version".to_owned(),
+            ..Model::default()
+        });
+        let instance = SensitivityRecord::from_bsim4_instance(Bsim4InstanceSnapshot {
+            instance: Instance {
+                dNodePrime: i32::MAX,
+                l: payload,
+                lGiven: true,
+                ..Instance::default()
+            },
+            size: SizeParam {
+                Length: -0.,
+                ..SizeParam::default()
+            },
+            unset: true,
+            created: 0x80,
+        });
+        let cloned = model.clone();
+        let m = cloned.bsim4_model().unwrap();
+        assert_eq!(m.vth0.to_bits(), (-0_f64).to_bits());
+        assert_eq!(m.toxref.to_bits(), payload.to_bits());
+        assert_eq!(m.r#type, i32::MIN);
+        assert!(m.vth0Given);
+        assert_eq!(m.version, "test-version");
+        let cloned = instance.clone();
+        let h = cloned.bsim4_instance().unwrap();
+        assert_eq!(h.instance.dNodePrime, i32::MAX);
+        assert_eq!(h.instance.l.to_bits(), payload.to_bits());
+        assert!(h.instance.lGiven && h.unset);
+        assert_eq!(h.size.Length.to_bits(), (-0_f64).to_bits());
+        assert_eq!(h.created, 0x80);
+        assert!(cloned.bsim4_model().is_err());
+        assert!(model.bsim4_instance().is_err());
+        assert!(model.value("BSIM4vth0").is_err());
+        let fake = SensitivityRecord::new(SensitivityFamily::Bsim4, ParameterScope::Model);
+        assert!(
+            fake.validate(SensitivityFamily::Bsim4, ParameterScope::Model)
+                .is_err()
+        );
     }
 }

@@ -56,8 +56,8 @@ use super::host::node;
 use super::{Access, InputType, asks, elements, parameters, set, temp};
 use crate::devices::schema::temperature_kelvin;
 use crate::devices::sensitivity::{
-    AcReset, Bsim4InstanceSnapshot, DeviceSensitivity, ParameterScope, RecordPair,
-    SensitivityFamily, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
+    AcReset, Bsim4InstanceSnapshot, ParameterScope, RecordPair, SensitivityFamily,
+    SensitivityKernel, SensitivityLoad, SensitivityMode, SensitivityParameter as P,
     SensitivityRecord as Record,
 };
 use crate::devices::{Device, LinearContext, ModelContext, StampContext};
@@ -210,7 +210,7 @@ fn accessor(scope: ParameterScope, keyword: &str) -> SpiceResult<Accessor> {
     })
 }
 
-impl DeviceSensitivity for Bsim4Sensitivity<'_> {
+impl SensitivityKernel for Bsim4Sensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Bsim4
     }

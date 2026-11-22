@@ -538,3 +538,80 @@ fn unsupported_cases_fail_explicitly() {
         "{error}"
     );
 }
+
+#[test]
+fn replay_rejects_foreign_and_swapped_records_without_mutating() {
+    use ngspice_rs::devices::sensitivity::{ParameterScope, RecordPair, SensitivityMode};
+    use ngspice_rs::devices::{Circuit, ModelContext};
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("record-identity.cir"),
+            "identity\nr1 a 0 1k\nc1 a 0 1u\nv1 a 0 1\n.end\n",
+        ))
+        .unwrap();
+    let circuit = Circuit::from_netlist(&netlist).unwrap();
+    let context = ModelContext::default();
+    let describe = |name| {
+        circuit
+            .devices()
+            .iter()
+            .find(|device| device.name() == name)
+            .unwrap()
+            .sensitivity(&context)
+            .unwrap()
+    };
+    let resistor = describe("r1");
+    let capacitor = describe("c1");
+    let (mut rm, mut ri) = resistor.records().unwrap();
+    let (mut cm, mut ci) = capacitor.records().unwrap();
+    let before = ri.value("resistance").unwrap().to_bits();
+    assert!(
+        resistor
+            .set(
+                ParameterScope::Instance,
+                "resistance",
+                2e3,
+                &mut cm,
+                &mut ri
+            )
+            .is_err()
+    );
+    assert!(
+        resistor
+            .set(
+                ParameterScope::Instance,
+                "resistance",
+                2e3,
+                &mut ri,
+                &mut rm
+            )
+            .is_err()
+    );
+    assert!(resistor.setup(&mut rm, &mut ci).is_err());
+    assert!(resistor.temperature(&mut cm, &mut ri).is_err());
+    assert_eq!(ri.value("resistance").unwrap().to_bits(), before);
+    let correct = RecordPair {
+        model: &rm,
+        instance: &ri,
+    };
+    let foreign = RecordPair {
+        model: &cm,
+        instance: &ci,
+    };
+    let swapped = RecordPair {
+        model: &ri,
+        instance: &rm,
+    };
+    assert!(
+        resistor
+            .ask(ParameterScope::Instance, "resistance", foreign)
+            .is_err()
+    );
+    assert!(
+        resistor
+            .load(correct, swapped, SensitivityMode::Dc)
+            .is_err()
+    );
+    assert!(resistor.setup_elements(foreign).is_err());
+    assert!(resistor.load(correct, correct, SensitivityMode::Dc).is_ok());
+}

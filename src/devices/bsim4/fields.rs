@@ -5063,7 +5063,6 @@ impl SizeParam {
             _ => return None,
         })
     }
-
 }
 
 /// `struct sBSIM4instance`'s scalar members (370 of them), in declaration order.

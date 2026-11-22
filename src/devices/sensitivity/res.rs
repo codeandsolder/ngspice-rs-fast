@@ -3,8 +3,8 @@
 //! `resload.c` (`RESload`, `RESacload`).
 
 use super::{
-    CELSIUS_TO_KELVIN, DeviceSensitivity, ParameterScope, PassiveInputs, RecordPair,
-    SensitivityConductance, SensitivityFamily, SensitivityLoad, SensitivityMode,
+    CELSIUS_TO_KELVIN, ParameterScope, PassiveInputs, RecordPair, SensitivityConductance,
+    SensitivityFamily, SensitivityKernel, SensitivityLoad, SensitivityMode,
     SensitivityParameter as P, SensitivityRecord,
 };
 use crate::primitives::{NodeId, Real, SpiceResult};
@@ -94,7 +94,7 @@ const fn resistance_temperature_factor(tc1: Real, tc2: Real, difference: Real) -
     ((tc2 * difference) + tc1) * difference + 1.0
 }
 
-impl DeviceSensitivity for ResistorSensitivity<'_> {
+impl SensitivityKernel for ResistorSensitivity<'_> {
     fn family(&self) -> SensitivityFamily {
         SensitivityFamily::Resistor
     }
