@@ -118,7 +118,7 @@ pub(super) fn op(
     )?;
     let mut point: Vec<_> = x.as_slice().iter().map(|v| Complex::real(*v)).collect();
     point.extend(values);
-    plot.push_point(point)?;
+    plot.push_point(&point)?;
     // dcop.c performs MODEINITSMSIG after CKTop. Publish its persistent
     // device fields for the next analysis, just as the AC preparation does.
     circuit.record_small_signal_state(&model, &x)?;

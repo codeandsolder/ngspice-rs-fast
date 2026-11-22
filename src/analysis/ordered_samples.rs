@@ -41,8 +41,7 @@ impl OrderedAxis<'static> {
     pub(super) fn from_plot(plot: &Plot, name: &str) -> Result<Self, AxisError> {
         let column = plot.variable_index(name).ok_or(AxisError::MissingColumn)?;
         let values = plot
-            .points()
-            .iter()
+            .rows()
             .enumerate()
             .map(|(index, point)| {
                 let value = point.get(column).ok_or(AxisError::MissingSample(index))?;

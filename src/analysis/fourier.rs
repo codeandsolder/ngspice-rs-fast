@@ -400,7 +400,7 @@ impl<'a> Trace<'a> {
 
     /// The vector's value at one plot point, as a real.
     fn value(&self, index: usize) -> SpiceResult<Real> {
-        let Some(point) = self.plot.points().get(index) else {
+        let Some(point) = self.plot.row(index) else {
             return Err(nonfinite(
                 self.name(),
                 format!("the plot has no point {index}"),
@@ -921,7 +921,7 @@ mod tests {
         plot.push_variable(Variable::new("i(v1)", "current"));
         let mut plot = plot.build();
         for (time, value) in rows {
-            plot.push_point(vec![
+            plot.push_point(&[
                 Complex::real(*time),
                 Complex::real(*value),
                 Complex::real(-*value),
@@ -1181,7 +1181,7 @@ mod tests {
         let result = one(&plot);
         assert_eq!(result.window.to, 5.0 * PERIOD);
         assert_eq!(result.window.from, 4.0 * PERIOD);
-        assert!(result.samples < plot.points().len(), "{result:?}");
+        assert!(result.samples < plot.point_count(), "{result:?}");
         assert!(result.samples > 2 * 9, "{result:?}");
     }
 
@@ -1280,8 +1280,8 @@ mod tests {
         let mut plot = Plot::builder("tran1", "Transient Analysis", PlotFlags::Real);
         plot.push_variable(Variable::new("v(out)", "voltage"));
         let mut plot = plot.build();
-        plot.push_point(vec![Complex::real(1.0)]).unwrap();
-        plot.push_point(vec![Complex::real(2.0)]).unwrap();
+        plot.push_point(&[Complex::real(1.0)]).unwrap();
+        plot.push_point(&[Complex::real(2.0)]).unwrap();
         let error = failed(&plot, &[out()], 9);
         assert!(error.to_string().contains("no 'time' axis"), "{error}");
 

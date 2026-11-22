@@ -49,8 +49,8 @@ fn values(plot: &Plot) -> [f64; 3] {
             .iter()
             .all(|v| v.unit == "voltage" && v.is_real)
     );
-    assert!(plot.points()[0].iter().all(|v| v.im == 0.));
-    [0, 1, 2].map(|column| plot.points()[0][column].re)
+    assert!(plot.row(0).unwrap().iter().all(|v| v.im == 0.));
+    [0, 1, 2].map(|column| plot.row(0).unwrap()[column].re)
 }
 
 fn names(plot: &Plot) -> Vec<&str> {

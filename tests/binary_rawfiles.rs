@@ -471,8 +471,7 @@ fn detection_reads_only_the_header_and_never_decodes_the_payload() {
     assert!(
         rawfile.plots[0]
             .plot
-            .points()
-            .iter()
+            .rows()
             .flatten()
             .all(|value| value.re.is_nan())
     );
@@ -607,10 +606,10 @@ fn lending_rows_match_collected_data_with_small_input_buffers() {
         let mut decoder = RawFileReader::new(input).with_byte_order(order);
         for expected_plot in &expected.plots {
             let mut rows = decoder.next_plot().unwrap().unwrap();
-            assert!(rows.header().plot.points().is_empty());
-            assert_eq!(rows.point_count(), expected_plot.plot.points().len());
+            assert!(rows.header().plot.point_count() == 0);
+            assert_eq!(rows.point_count(), expected_plot.plot.point_count());
             let mut address = None;
-            for expected_row in expected_plot.plot.points() {
+            for expected_row in expected_plot.plot.rows() {
                 let row = rows.next_row().unwrap().unwrap();
                 assert_eq!(row, expected_row);
                 if let Some(previous) = address {

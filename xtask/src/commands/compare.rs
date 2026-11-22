@@ -183,7 +183,7 @@ fn root_set(plot: &Plot, kind: &str) -> Vec<(String, ngspice_rs::primitives::Com
         .iter()
         .enumerate()
         .filter(|(_, variable)| variable.name.to_ascii_lowercase().starts_with(&prefix))
-        .map(|(index, variable)| (variable.name.clone(), plot.points()[0][index]))
+        .map(|(index, variable)| (variable.name.clone(), plot.row(0).unwrap()[index]))
         .collect()
 }
 
@@ -252,7 +252,9 @@ pub(super) fn roots(got: &Plot, want: &Plot, tolerance: RootTolerance) -> Result
     }
     let mut worst_ratio: f64 = 0.0;
     let mut counts = Vec::new();
-    let scale = want.points()[0]
+    let scale = want
+        .row(0)
+        .unwrap()
         .iter()
         .fold(0.0_f64, |m, z| m.max(z.magnitude()));
     for kind in ["pole", "zero"] {
@@ -327,7 +329,7 @@ pub(super) fn validate(plot: &Plot, label: &str) -> Result<BTreeMap<String, usiz
             return Err(format!("{label}: ambiguous variable occurrence '{key}'"));
         }
     }
-    for (index, point) in plot.points().iter().enumerate() {
+    for (index, point) in plot.rows().enumerate() {
         if point.len() != plot.variable_count() {
             return Err(format!("{label}: point {index} has invalid row shape"));
         }
@@ -421,7 +423,7 @@ pub(super) fn plots(
                 .get(axis)
                 .ok_or_else(|| format!("{label}: missing axis '{axis}'"))?;
             let mut previous = None;
-            for (index, row) in plot.points().iter().enumerate() {
+            for (index, row) in plot.rows().enumerate() {
                 let value = row[column];
                 if value.im != 0.0 || value.re <= 0.0 || previous.is_some_and(|p| p >= value.re) {
                     return Err(format!(
@@ -441,7 +443,7 @@ pub(super) fn plots(
     // device with two branch currents is compared position by position.
     let mut order: Vec<(&String, &usize)> = want_columns.iter().collect();
     order.sort_by_key(|(_, index)| **index);
-    for (point, (actual, expected)) in got.points().iter().zip(want.points()).enumerate() {
+    for (point, (actual, expected)) in got.rows().zip(want.rows()).enumerate() {
         for (key, column) in &order {
             let variable = &want.variables()[**column];
             let got = actual[got_columns[*key]];
@@ -491,7 +493,7 @@ mod tests {
                 Variable::complex("v(out)", "voltage"),
             ],
         )
-        .with_points(vec![
+        .with_rows(vec![
             vec![Complex::real(100.0), Complex::new(0.5, -0.25)],
             vec![Complex::real(1000.0), Complex::ZERO],
         ])
@@ -504,10 +506,10 @@ mod tests {
     ) -> Plot {
         let mut flags = plot.flags();
         let mut variables = plot.variables().to_vec();
-        let mut points = plot.points().to_vec();
+        let mut points = plot.rows().map(<[_]>::to_vec).collect::<Vec<_>>();
         change(&mut flags, &mut variables, &mut points);
         Plot::new(plot.name.clone(), plot.plotname.clone(), flags, variables)
-            .with_points(points)
+            .with_rows(points)
             .unwrap()
     }
 
@@ -602,11 +604,7 @@ mod tests {
     fn shape_empty_and_nonfinite_data_fail_on_either_side() {
         let want = plot();
         let mut cases = Vec::new();
-        assert!(
-            want.header()
-                .with_points(vec![vec![Complex::ZERO]])
-                .is_err()
-        );
+        assert!(want.header().with_rows(vec![vec![Complex::ZERO]]).is_err());
         let mut bad = want.clone();
         bad.truncate_points(1);
         cases.push(bad);
@@ -688,7 +686,7 @@ mod tests {
             ));
         }
         plot.build()
-            .with_points(vec![poles.iter().chain(zeros).copied().collect()])
+            .with_rows(vec![poles.iter().chain(zeros).copied().collect::<Vec<_>>()])
             .unwrap()
     }
 
@@ -775,7 +773,7 @@ mod tests {
                 .unwrap_err()
                 .contains("nonfinite")
         );
-        assert!(bad.header().with_points(vec![vec![]]).is_err());
+        assert!(bad.header().with_rows(vec![vec![]]).is_err());
 
         let repeated = Complex::new(-1e6, 1e6);
         let nearby = Complex::new(-1_000_000.25, 999_999.75);
@@ -840,7 +838,7 @@ mod tests {
             assert!(compare(&got, &want).unwrap_err().contains("axis"));
         }
         let mut got = want.clone();
-        got.point_mut(1).unwrap()[0] = got.points()[0][0];
+        got.point_mut(1).unwrap()[0] = got.row(0).unwrap()[0];
         assert!(compare(&got, &want).unwrap_err().contains("axis"));
         got = want.clone();
         got.point_mut(1).unwrap()[0].re += 1.0;

@@ -353,7 +353,7 @@ impl PointSink for BatchOutput<'_> {
         Ok(())
     }
 
-    fn point(&mut self, values: Vec<Complex>) -> SpiceResult<()> {
+    fn point(&mut self, values: &[Complex]) -> SpiceResult<()> {
         match self
             .active
             .as_mut()
@@ -361,7 +361,7 @@ impl PointSink for BatchOutput<'_> {
         {
             ActiveOutput::Retained(plot) => plot.push_point(values),
             ActiveOutput::Streamed(projection) => {
-                self.writer.push_point(projection.project(&values)?)
+                self.writer.push_point(projection.project(values)?)
             }
         }
     }

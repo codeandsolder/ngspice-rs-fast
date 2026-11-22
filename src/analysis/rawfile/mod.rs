@@ -519,6 +519,17 @@ impl StreamedPlot {
             .point_count
             .checked_add(1)
             .ok_or_else(|| unsupported("rawfile point count overflows a usize"))?;
+        if self.header.plot.variable_count() == 0
+            && !super::results::valid_empty_shape(
+                &self.header.plot.plotname,
+                self.header.plot.flags(),
+                next_count,
+            )
+        {
+            return Err(unsupported(
+                "zero variables with nonzero points outside a rootless pole-zero result",
+            ));
+        }
         write_point(
             &mut self.spool,
             &self.header.plot,
@@ -543,9 +554,7 @@ pub struct FinishedPlot {
 }
 
 fn validate_plot(plot: &Plot) -> SpiceResult<()> {
-    plot.points()
-        .iter()
-        .try_for_each(|point| plot.check_point(point))
+    plot.validate_shape()
 }
 
 /// The line that ends the header in `format`.
@@ -564,8 +573,8 @@ fn write_plot(
     byte_order: BinaryByteOrder,
 ) -> io::Result<()> {
     let plot = &raw_plot.plot;
-    render_header(out, raw_plot, plot.points().len(), format)?;
-    for (index, point) in plot.points().iter().enumerate() {
+    render_header(out, raw_plot, plot.point_count(), format)?;
+    for (index, point) in plot.rows().enumerate() {
         write_point(out, plot, format, index, point, byte_order)?;
     }
     Ok(())
@@ -916,7 +925,7 @@ fn parse_header(cursor: &mut Cursor<impl BufRead>) -> SpiceResult<Option<(Header
     if variable_count > cursor.policy.variables {
         return Err(limit("variables per plot"));
     }
-    if variable_count == 0 && point_count != 0 {
+    if variable_count == 0 && !super::results::valid_empty_shape(&plotname, flags, point_count) {
         return Err(unsupported(
             "rawfile declares zero variables with nonzero points",
         ));
@@ -1142,22 +1151,17 @@ impl<R: BufRead> RawFileReader<R> {
                 rows.header.plot.variables().len(),
                 "collected variables",
             )?;
-            let mut points = Vec::new();
+            let mut cells = Vec::new();
+            let mut point_count = 0;
             while let Some(row) = rows.next_row()? {
                 spend(&mut budget.rows, 1, "collected rows")?;
                 spend(&mut budget.cells, row.len(), "collected cells")?;
-                let mut copy = Vec::new();
-                copy.try_reserve_exact(row.len()).map_err(|error| {
-                    unsupported(format!(
-                        "rawfile allocation failed for collected row: {error}"
-                    ))
-                })?;
-                copy.extend_from_slice(row);
-                reserve(&mut points, 1, "collected row list")?;
-                points.push(copy);
+                reserve(&mut cells, row.len(), "collected cells")?;
+                cells.extend_from_slice(row);
+                point_count += 1;
             }
             let mut raw_plot = rows.finish()?;
-            raw_plot.plot = raw_plot.plot.with_points(points)?;
+            raw_plot.plot = raw_plot.plot.with_cells(point_count, cells)?;
             reserve(&mut plots, 1, "collected plots")?;
             plots.push(raw_plot);
         }
@@ -1221,6 +1225,17 @@ impl<R: BufRead> RawPlotRows<'_, R> {
 
     fn decode_ascii_row(&mut self) -> SpiceResult<()> {
         let columns = self.header.plot.variables().len();
+        if columns == 0 {
+            // The C batch writer emits an index followed by a newline even
+            // when its single rootless pole-zero row has no values.
+            let Some(line) = self.reader.cursor.next(true)? else {
+                return Err(unsupported("truncated empty pole-zero row"));
+            };
+            if line.trim() != "0" {
+                return Err(unsupported("invalid empty pole-zero point index"));
+            }
+            return Ok(());
+        }
         for (column, is_real) in self.realness.iter_mut().enumerate() {
             let Some(line) = self.reader.cursor.next(true)? else {
                 return Err(unsupported(format!(
@@ -1480,7 +1495,7 @@ Values:
         assert_eq!(raw_plot.plot.variables().len(), 3);
         assert_eq!(raw_plot.plot.variables()[1].name, "v(out)");
         assert_eq!(raw_plot.plot.variables()[1].unit, "voltage");
-        assert_eq!(raw_plot.plot.points().len(), 1);
+        assert_eq!(raw_plot.plot.point_count(), 1);
         assert_eq!(raw_plot.plot.value("v(out)", 0), Some(Complex::real(2.5)));
         assert_eq!(raw_plot.plot.value("v(in)", 0), Some(Complex::real(5.0)));
         assert_eq!(
@@ -1494,7 +1509,7 @@ Values:
         let rawfile = RawFile::parse(AC_RAWFILE).expect("parses");
         let plot = &rawfile.single_plot().expect("one plot");
         assert_eq!(plot.flags(), PlotFlags::Complex);
-        assert_eq!(plot.points().len(), 2);
+        assert_eq!(plot.point_count(), 2);
         assert_eq!(plot.value("frequency", 1), Some(Complex::new(1e3, 0.0)));
         assert_eq!(plot.value("v(out)", 1), Some(Complex::new(0.9, -0.1)));
         assert_eq!(plot.value("i(v1)", 0), Some(Complex::new(-1e-3, 1e-5)));
@@ -1694,7 +1709,7 @@ Values:
     #[test]
     fn validate_catches_ragged_plots() {
         let mut rawfile = RawFile::parse(OP_RAWFILE).expect("parses");
-        assert!(rawfile.plots[0].plot.push_point(Vec::new()).is_err());
+        assert!(rawfile.plots[0].plot.push_point(&[]).is_err());
         assert!(rawfile.validate().is_ok());
     }
 }

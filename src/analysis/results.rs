@@ -12,7 +12,7 @@ use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 
 /// Ordered output lifecycle for every plot produced by an analysis.
 ///
-/// A successful plot is announced, receives owned rows in order, then ends.
+/// A successful plot is announced, receives borrowed rows in order, then ends.
 /// Errors abort the analysis; no successful end event follows a failed row.
 /// Drivers that intrinsically collect a plot transfer it by value instead.
 pub trait PointSink {
@@ -22,11 +22,11 @@ pub trait PointSink {
     /// Whatever the consumer reports; the analysis stops with that error.
     fn begin(&mut self, header: &Plot) -> SpiceResult<()>;
 
-    /// One owned row, with one value per variable of the active header.
+    /// One borrowed row, with one value per variable of the active header.
     ///
     /// # Errors
     /// Whatever the consumer reports; the analysis stops with that error.
-    fn point(&mut self, values: Vec<Complex>) -> SpiceResult<()>;
+    fn point(&mut self, values: &[Complex]) -> SpiceResult<()>;
 
     /// Complete the active plot, including when it has no rows.
     ///
@@ -35,14 +35,13 @@ pub trait PointSink {
     fn end(&mut self) -> SpiceResult<()>;
 
     /// Transfer an already materialized plot. Consumers that retain it can
-    /// take its row allocations directly rather than copying or replaying.
+    /// take its packed cell allocation directly rather than copying or replaying.
     ///
     /// # Errors
     /// As the begin/point/end lifecycle.
-    fn complete(&mut self, mut plot: Plot) -> SpiceResult<()> {
-        let points = plot.take_points();
-        self.begin(&plot)?;
-        for point in points {
+    fn complete(&mut self, plot: Plot) -> SpiceResult<()> {
+        self.begin(&plot.header())?;
+        for point in plot.rows() {
             self.point(point)?;
         }
         self.end()
@@ -85,7 +84,7 @@ impl PointSink for PlotCollector {
         Ok(())
     }
 
-    fn point(&mut self, values: Vec<Complex>) -> SpiceResult<()> {
+    fn point(&mut self, values: &[Complex]) -> SpiceResult<()> {
         self.active
             .as_mut()
             .ok_or_else(|| lifecycle_error("point without an active plot"))?
@@ -311,8 +310,9 @@ pub struct Plot {
     /// Rawfile plot name.
     pub plotname: String,
     schema: Arc<PlotSchema>,
-    /// Each row has exactly the width of the immutable schema.
-    points: Vec<Vec<Complex>>,
+    /// Row-major rectangular storage. Each row has the immutable schema width.
+    cells: Vec<Complex>,
+    point_count: usize,
 }
 
 impl Plot {
@@ -328,7 +328,8 @@ impl Plot {
             name: name.into(),
             plotname: plotname.into(),
             schema: Arc::new(PlotSchema::new(flags, variables)),
-            points: Vec::new(),
+            cells: Vec::new(),
+            point_count: 0,
         }
     }
 
@@ -365,45 +366,90 @@ impl Plot {
         self.schema.flags()
     }
 
-    /// Stored rows.
+    /// All cells in row-major order, without row descriptors or allocations.
     #[must_use]
-    pub fn points(&self) -> &[Vec<Complex>] {
-        &self.points
+    pub fn cells(&self) -> &[Complex] {
+        &self.cells
+    }
+
+    /// Borrow a row by index.
+    #[must_use]
+    pub fn row(&self, index: usize) -> Option<&[Complex]> {
+        if index >= self.point_count {
+            return None;
+        }
+        let width = self.variable_count();
+        let start = index * width;
+        Some(&self.cells[start..start + width])
+    }
+
+    /// Borrow every row in order, including the empty pole-zero result row.
+    pub fn rows(&self) -> impl ExactSizeIterator<Item = &[Complex]> + DoubleEndedIterator + Clone {
+        let width = self.variable_count();
+        (0..self.point_count).map(move |index| {
+            let start = index * width;
+            &self.cells[start..start + width]
+        })
     }
 
     /// Borrow a row mutably without allowing changes to its width.
     pub fn point_mut(&mut self, index: usize) -> Option<&mut [Complex]> {
-        self.points.get_mut(index).map(Vec::as_mut_slice)
+        if index >= self.point_count {
+            return None;
+        }
+        let width = self.variable_count();
+        let start = index * width;
+        Some(&mut self.cells[start..start + width])
     }
 
-    /// Mutable fixed-width rows.
-    pub fn rows_mut(&mut self) -> impl Iterator<Item = &mut [Complex]> {
-        self.points.iter_mut().map(Vec::as_mut_slice)
+    /// Mutable fixed-width rows. A valid rootless pole-zero row has no cells.
+    pub fn rows_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut [Complex]> {
+        let width = self.variable_count();
+        let empty = if width == 0 { self.point_count } else { 0 };
+        std::iter::once(&mut [][..])
+            .take(empty)
+            .chain(self.cells.chunks_exact_mut(width.max(1)))
     }
 
-    /// Reserve row capacity.
-    pub fn reserve_points(&mut self, additional: usize) {
-        self.points.reserve_exact(additional);
+    /// Reserve space for additional rows, without modifying the row count.
+    ///
+    /// # Errors
+    /// Invalid or overflowing shape, or allocation failure.
+    pub fn reserve_points(&mut self, additional: usize) -> SpiceResult<()> {
+        let count = self
+            .point_count
+            .checked_add(additional)
+            .ok_or_else(|| self.storage_error("point count overflows usize"))?;
+        self.cell_count(count)?;
+        let cells = additional * self.variable_count();
+        self.cells
+            .try_reserve_exact(cells)
+            .map_err(|error| self.storage_error(error))
     }
 
     /// Remove rows after the given length.
     pub fn truncate_points(&mut self, len: usize) {
-        self.points.truncate(len);
+        self.point_count = self.point_count.min(len);
+        self.cells
+            .truncate(self.point_count * self.variable_count());
     }
 
-    /// Remove all rows, preserving the schema.
+    /// Remove all rows, preserving the schema and reusable cell capacity.
     pub fn clear_points(&mut self) {
-        self.points.clear();
+        self.truncate_points(0);
     }
 
-    /// Remove and return a row by index.
-    pub fn remove_point(&mut self, index: usize) -> Option<Vec<Complex>> {
-        (index < self.points.len()).then(|| self.points.remove(index))
-    }
-
-    /// Take the stored rows, leaving the immutable header.
-    pub fn take_points(&mut self) -> Vec<Vec<Complex>> {
-        std::mem::take(&mut self.points)
+    /// Remove a row by index, preserving the order of all other rows.
+    /// Returns false if the index is out of bounds.
+    pub fn remove_point(&mut self, index: usize) -> bool {
+        if index >= self.point_count {
+            return false;
+        }
+        let width = self.variable_count();
+        let start = index * width;
+        drop(self.cells.drain(start..start + width));
+        self.point_count -= 1;
+        true
     }
 
     /// A point-free header sharing the same schema.
@@ -413,26 +459,77 @@ impl Plot {
             name: self.name.clone(),
             plotname: self.plotname.clone(),
             schema: Arc::clone(&self.schema),
-            points: Vec::new(),
+            cells: Vec::new(),
+            point_count: 0,
         }
     }
 
-    /// Seal a complete array of rows, checking every row against the schema.
+    /// Attach a rectangular owned cell buffer without copying it.
     ///
     /// # Errors
-    /// Any row has the wrong number of values.
-    pub fn with_points(mut self, points: Vec<Vec<Complex>>) -> SpiceResult<Self> {
-        for row in &points {
-            self.check_point(row)?;
+    /// Invalid shape, overflow or inconsistent cell count.
+    pub fn with_cells(mut self, point_count: usize, cells: Vec<Complex>) -> SpiceResult<Self> {
+        let expected = self.cell_count(point_count)?;
+        if cells.len() != expected {
+            return Err(self.storage_error(format_args!(
+                "expected {expected} cells, got {}",
+                cells.len()
+            )));
         }
-        self.points = points;
+        self.cells = cells;
+        self.point_count = point_count;
         Ok(self)
     }
 
-    /// Number of points.
+    /// Populate a new table from rows of any slice-like representation.
+    ///
+    /// # Errors
+    /// Ragged rows, invalid shape, overflow or allocation failure.
+    pub fn with_rows(
+        mut self,
+        rows: impl IntoIterator<Item = impl AsRef<[Complex]>>,
+    ) -> SpiceResult<Self> {
+        self.clear_points();
+        for row in rows {
+            self.push_point(row.as_ref())?;
+        }
+        Ok(self)
+    }
+
+    /// Number of points, including the single empty row of a rootless PZ plot.
     #[must_use]
     pub const fn point_count(&self) -> usize {
-        self.points.len()
+        self.point_count
+    }
+
+    fn storage_error(&self, message: impl std::fmt::Display) -> SpiceError {
+        SpiceError::Numerical {
+            context: format!("plot {}", self.name),
+            message: message.to_string(),
+        }
+    }
+
+    fn cell_count(&self, points: usize) -> SpiceResult<usize> {
+        let width = self.variable_count();
+        if width == 0 && !valid_empty_shape(&self.plotname, self.flags(), points) {
+            return Err(self.storage_error(
+                "zero variables with nonzero points outside a rootless pole-zero result",
+            ));
+        }
+        points
+            .checked_mul(width)
+            .ok_or_else(|| self.storage_error("point count times column count overflows usize"))
+    }
+
+    /// Validate rectangular storage before serialization, including the
+    /// zero-column rule (plot names can be edited by callers).
+    pub(super) fn validate_shape(&self) -> SpiceResult<()> {
+        let expected = self.cell_count(self.point_count)?;
+        if expected == self.cells.len() {
+            Ok(())
+        } else {
+            Err(self.storage_error("inconsistent rectangular cell count"))
+        }
     }
 
     /// Number of columns.
@@ -444,37 +541,41 @@ impl Plot {
     /// True when the plot has no columns or no points.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.variables().is_empty() || self.points.is_empty()
+        self.variables().is_empty() || self.point_count == 0
     }
 
-    /// Appends a point.
+    /// Append a borrowed row, copying its cells once into the packed table.
     ///
     /// # Errors
-    ///
-    /// [`SpiceError::Numerical`] when the point does not have one value per
-    /// variable.
-    pub fn push_point(&mut self, values: Vec<Complex>) -> SpiceResult<()> {
-        self.check_point(&values)?;
-        self.points.push(values);
+    /// Ragged row, invalid shape, overflow or allocation failure.
+    pub fn push_point(&mut self, values: &[Complex]) -> SpiceResult<()> {
+        self.check_point(values)?;
+        let next = self
+            .point_count
+            .checked_add(1)
+            .ok_or_else(|| self.storage_error("point count overflows usize"))?;
+        self.cell_count(next)?;
+        self.cells
+            .try_reserve(values.len())
+            .map_err(|error| self.storage_error(error))?;
+        self.cells.extend_from_slice(values);
+        self.point_count = next;
         Ok(())
     }
 
-    /// Checks that `values` could be appended: one value per variable.
+    /// Check that one row matches the immutable schema.
     ///
     /// # Errors
-    ///
-    /// As [`Plot::push_point`].
+    /// Row width mismatch or invalid zero-column row.
     pub fn check_point(&self, values: &[Complex]) -> SpiceResult<()> {
-        if values.len() != self.variables().len() {
-            return Err(SpiceError::Numerical {
-                context: format!("plot {}", self.name),
-                message: format!(
-                    "point has {} value(s) but the plot has {} variable(s)",
-                    values.len(),
-                    self.variables().len()
-                ),
-            });
+        if values.len() != self.variable_count() {
+            return Err(self.storage_error(format_args!(
+                "point has {} value(s) but the plot has {} variable(s)",
+                values.len(),
+                self.variable_count()
+            )));
         }
+        self.cell_count(1)?;
         Ok(())
     }
 
@@ -488,35 +589,153 @@ impl Plot {
     #[must_use]
     pub fn value(&self, variable: &str, point: usize) -> Option<Complex> {
         let column = self.variable_index(variable)?;
-        self.points.get(point)?.get(column).copied()
+        self.row(point)?.get(column).copied()
     }
 
-    /// Every value of one variable.
+    /// Borrow a strided view of a named column without allocating.
     #[must_use]
-    pub fn column(&self, variable: &str) -> Option<Vec<Complex>> {
-        let column = self.variable_index(variable)?;
-        self.points
-            .iter()
-            .map(|point| point.get(column).copied())
-            .collect()
+    pub fn column(&self, variable: &str) -> Option<ColumnView<'_>> {
+        self.column_at(self.variable_index(variable)?)
+    }
+
+    /// Borrow a strided view by column index.
+    #[must_use]
+    pub fn column_at(&self, column: usize) -> Option<ColumnView<'_>> {
+        let width = self.variable_count();
+        (column < width).then_some(ColumnView {
+            cells: &self.cells,
+            width,
+            column,
+        })
     }
 
     /// Largest absolute value anywhere in the plot.
     #[must_use]
     pub fn max_abs(&self) -> Real {
-        self.points
+        self.cells
             .iter()
-            .flat_map(|point| point.iter())
             .fold(0.0, |acc, value| acc.max(value.magnitude()))
     }
 
     /// True when every value is finite.
     #[must_use]
     pub fn is_finite(&self) -> bool {
-        self.points
+        self.cells.iter().all(|value| value.is_finite())
+    }
+}
+
+/// C's rootless .pz result is a real plot containing one empty row. Other
+/// zero-column plots must be empty; no unbounded zero-cell stream is valid.
+pub(super) fn valid_empty_shape(plotname: &str, flags: PlotFlags, points: usize) -> bool {
+    points == 0 || (points == 1 && flags == PlotFlags::Real && plotname == "Pole-Zero Analysis")
+}
+
+/// A borrowed, strided column of the packed row-major plot table.
+///
+/// The view owns no cells. Indexing is in point order, not memory order.
+#[derive(Clone, Copy)]
+pub struct ColumnView<'a> {
+    cells: &'a [Complex],
+    width: usize,
+    column: usize,
+}
+
+impl<'a> ColumnView<'a> {
+    /// Number of values (rows).
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.cells.len() / self.width
+    }
+
+    /// Whether the column contains no values.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    /// Borrow the value at a given row.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&'a Complex> {
+        if index >= self.len() {
+            return None;
+        }
+        self.cells.get(index * self.width + self.column)
+    }
+
+    /// Iterate over borrowed cells without copying the column.
+    pub fn iter(&self) -> std::iter::StepBy<std::slice::Iter<'a, Complex>> {
+        self.cells
+            .get(self.column..)
+            .unwrap_or_default()
             .iter()
-            .flat_map(|point| point.iter())
-            .all(|value| value.is_finite())
+            .step_by(self.width)
+    }
+
+    /// First value, if present.
+    #[must_use]
+    pub fn first(&self) -> Option<&'a Complex> {
+        self.get(0)
+    }
+
+    /// Last value, if present.
+    #[must_use]
+    pub fn last(&self) -> Option<&'a Complex> {
+        self.len().checked_sub(1).and_then(|index| self.get(index))
+    }
+
+    /// Binary search on a partitioned column without extracting a copy.
+    pub fn partition_point(&self, mut predicate: impl FnMut(&Complex) -> bool) -> usize {
+        let mut low = 0;
+        let mut high = self.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if predicate(&self[middle]) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low
+    }
+}
+
+impl std::ops::Index<usize> for ColumnView<'_> {
+    type Output = Complex;
+    fn index(&self, index: usize) -> &Self::Output {
+        // A valid column has positive width. Match slice indexing semantics.
+        &self
+            .cells
+            .chunks_exact(self.width)
+            .nth(index)
+            .unwrap_or(&[])[self.column]
+    }
+}
+
+impl<'a> IntoIterator for ColumnView<'a> {
+    type Item = Complex;
+    type IntoIter = std::iter::Copied<std::iter::StepBy<std::slice::Iter<'a, Complex>>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter().copied()
+    }
+}
+
+impl<'a> IntoIterator for &ColumnView<'a> {
+    type Item = &'a Complex;
+    type IntoIter = std::iter::StepBy<std::slice::Iter<'a, Complex>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl PartialEq for ColumnView<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl std::fmt::Debug for ColumnView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self).finish()
     }
 }
 
@@ -535,7 +754,7 @@ mod tests {
                 Variable::new("i(v1)", "current"),
             ],
         );
-        plot.push_point(vec![Complex::real(2.5), Complex::real(-2.5e-3)])
+        plot.push_point(&[Complex::real(2.5), Complex::real(-2.5e-3)])
             .unwrap();
         plot
     }
@@ -546,7 +765,13 @@ mod tests {
         assert_eq!(plot.value("V(OUT)", 0), Some(Complex::real(2.5)));
         assert_eq!(plot.value("v(out)", 1), None);
         assert_eq!(plot.variable_index("i(v1)"), Some(1));
-        assert_eq!(plot.column("i(v1)"), Some(vec![Complex::real(-2.5e-3)]));
+        assert!(
+            plot.column("i(v1)")
+                .unwrap()
+                .iter()
+                .copied()
+                .eq([Complex::real(-2.5e-3)])
+        );
         assert_eq!(plot.point_count(), 1);
         assert_eq!(plot.variable_count(), 2);
         assert!(!plot.is_empty());
@@ -558,7 +783,7 @@ mod tests {
     fn points_must_match_the_columns() {
         let mut plot = plot();
         let error = plot
-            .push_point(vec![Complex::real(1.0)])
+            .push_point(&[Complex::real(1.0)])
             .expect_err("arity mismatch");
         assert!(error.to_string().contains("1 value(s)"));
     }
@@ -601,10 +826,10 @@ mod tests {
         assert!(
             header
                 .clone()
-                .with_points(vec![vec![Complex::ZERO; 2], vec![Complex::ZERO; 3]])
+                .with_rows(vec![vec![Complex::ZERO; 2], vec![Complex::ZERO; 3]])
                 .is_err()
         );
-        assert!(header.with_points(vec![vec![Complex::ZERO]]).is_err());
+        assert!(header.with_rows(vec![vec![Complex::ZERO]]).is_err());
     }
 
     #[test]
@@ -612,25 +837,25 @@ mod tests {
         use super::{PlotCollector, PointSink};
         let mut collector = PlotCollector::default();
         let retained = plot();
-        let row = retained.points()[0].as_ptr();
+        let row = retained.row(0).unwrap().as_ptr();
         collector.complete(retained).unwrap();
         let header = plot().header();
         let next = vec![Complex::real(1.), Complex::real(2.)];
-        let next_row = next.as_ptr();
+
         collector.begin(&header).unwrap();
-        collector.point(next).unwrap();
+        collector.point(&next).unwrap();
         collector.end().unwrap();
         let plots = collector.finish(2).unwrap();
-        assert_eq!(plots[0].points()[0].as_ptr(), row);
-        assert_eq!(plots[1].points()[0].as_ptr(), next_row);
+        assert_eq!(plots[0].row(0).unwrap().as_ptr(), row);
+        assert_eq!(plots[1].cells(), next);
 
         let mut collector = PlotCollector::default();
         assert!(collector.end().is_err());
-        assert!(collector.point(vec![]).is_err());
+        assert!(collector.point(&[]).is_err());
         collector.begin(&header).unwrap();
         assert!(collector.begin(&header).is_err());
         assert!(collector.complete(plot()).is_err());
-        assert!(collector.point(vec![Complex::ZERO]).is_err());
+        assert!(collector.point(&[Complex::ZERO]).is_err());
         assert!(collector.finish(1).is_err());
         assert!(PlotCollector::default().finish(1).is_err());
     }

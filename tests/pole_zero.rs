@@ -30,7 +30,7 @@ fn roots(plot: &Plot, kind: &str) -> Vec<Complex> {
         .iter()
         .enumerate()
         .filter(|(_, v)| v.name.starts_with(&format!("v({kind}(")))
-        .map(|(i, _)| plot.points()[0][i])
+        .map(|(i, _)| plot.row(0).unwrap()[i])
         .collect()
 }
 
@@ -62,8 +62,8 @@ fn an_rc_lowpass_has_one_real_pole_and_no_finite_zero() {
         (pole.name.as_str(), pole.unit.as_str(), pole.is_real),
         ("v(pole(1))", "voltage", false)
     );
-    assert_eq!(plot.points()[0][0].im, 0.0);
-    assert_close(plot.points()[0][0], -1e3, 0.0, 1e-12);
+    assert_eq!(plot.row(0).unwrap()[0].im, 0.0);
+    assert_close(plot.row(0).unwrap()[0], -1e3, 0.0, 1e-12);
 }
 
 #[test]

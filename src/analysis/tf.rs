@@ -417,7 +417,7 @@ pub(super) fn run(
         plot.push_variable(Variable::new(name, "voltage"));
     }
     let mut plot = plot.build();
-    plot.push_point(values.into_iter().map(Complex::real).collect())?;
+    plot.push_point(&values.map(Complex::real))?;
     Ok(plot)
 }
 

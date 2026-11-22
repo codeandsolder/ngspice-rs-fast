@@ -102,7 +102,7 @@ impl<'a> Series<'a> {
         if plot.variables()[time].unit != "time" {
             return Err(format!("{label}: axis 'time' must have unit 'time'"));
         }
-        let times: Vec<f64> = plot.points().iter().map(|row| row[time].re).collect();
+        let times: Vec<f64> = plot.rows().map(|row| row[time].re).collect();
         if (times[0] - grid.start).abs() > eps {
             return Err(format!(
                 "{label}: transient starts at {:e}, not {:e}",
@@ -171,7 +171,7 @@ impl<'a> Series<'a> {
 
     /// Value of column `column` at `t` on `side`.
     fn value(&self, column: usize, t: f64, side: Side) -> Result<f64, String> {
-        let at = |index: usize| self.plot.points()[index][column].re;
+        let at = |index: usize| self.plot.row(index).unwrap()[column].re;
         if let Some(b) = self.breakpoint_near(t) {
             let near: Vec<usize> = (0..self.times.len())
                 .filter(|&i| (self.times[i] - b).abs() <= self.eps)
@@ -304,7 +304,7 @@ pub(super) fn transient(
             other => return Err(format!("signal '{name}' has unsupported unit '{other}'")),
         };
         let peak = (0..want.point_count())
-            .map(|row| want.points()[row][column].re.abs())
+            .map(|row| want.row(row).unwrap()[column].re.abs())
             .fold(0.0, f64::max);
         let peak_allowance = tolerance.peak_relative * peak;
         let absolute = absolute + peak_allowance;
@@ -632,10 +632,9 @@ mod tests {
                 Variable::new("v(out)", "voltage"),
             ],
         )
-        .with_points(
+        .with_rows(
             rows.iter()
-                .map(|&(t, v)| vec![Complex::real(t), Complex::real(v)])
-                .collect(),
+                .map(|&(t, v)| [Complex::real(t), Complex::real(v)]),
         )
         .unwrap()
     }
@@ -644,7 +643,7 @@ mod tests {
         let mut variables = plot.variables().to_vec();
         change(&mut flags, &mut variables);
         Plot::new(plot.name.clone(), plot.plotname.clone(), flags, variables)
-            .with_points(plot.points().to_vec())
+            .with_rows(plot.rows())
             .unwrap()
     }
     /// Samples of `f` at the given times.
@@ -782,20 +781,12 @@ mod tests {
         // Interpolating across the jump would pass 4.5..5.5 values wrongly; the
         // plots above only agree because each side is handled on its own.
         let mut bad_right = jump_plot(0.5);
-        let last_at_five = bad_right
-            .points()
-            .iter()
-            .rposition(|row| row[0].re == 5.0)
-            .unwrap();
+        let last_at_five = bad_right.rows().rposition(|row| row[0].re == 5.0).unwrap();
         bad_right.point_mut(last_at_five).unwrap()[1] = Complex::real(8.5);
         let error = run(&bad_right, &want, &[5.0]).unwrap_err();
         assert!(error.contains("(Right)"), "{error}");
         let mut bad_left = jump_plot(0.5);
-        let first_at_five = bad_left
-            .points()
-            .iter()
-            .position(|row| row[0].re == 5.0)
-            .unwrap();
+        let first_at_five = bad_left.rows().position(|row| row[0].re == 5.0).unwrap();
         bad_left.point_mut(first_at_five).unwrap()[1] = Complex::real(0.5);
         let error = run(&bad_left, &want, &[5.0]).unwrap_err();
         assert!(error.contains("(Left)"), "{error}");
@@ -807,12 +798,8 @@ mod tests {
         // sample at 5 is both limits, so the C jump (0 vs 8) must be caught.
         let want = jump_plot(0.5);
         let mut smeared = jump_plot(0.5);
-        let first = smeared
-            .points()
-            .iter()
-            .position(|r| r[0].re == 5.0)
-            .unwrap();
-        smeared.remove_point(first).unwrap();
+        let first = smeared.rows().position(|r| r[0].re == 5.0).unwrap();
+        assert!(smeared.remove_point(first));
         let error = run(&smeared, &want, &[5.0]).unwrap_err();
         assert!(error.contains("(Left)"), "{error}");
         // And with no declared event the repeated instant is invalid input.

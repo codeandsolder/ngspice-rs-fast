@@ -1675,7 +1675,7 @@ fn the_m6_gate_deck_runs_every_analysis_end_to_end() {
         close("dc sense", isense[point].re, lim[point].re / 10., 1e-9);
     }
     // The operating point is at rest: every source is 0 V at DC.
-    for value in &written.plots[2].plot.points()[0] {
+    for value in written.plots[2].plot.row(0).unwrap() {
         assert!(value.magnitude() < 1e-9, "{value}");
     }
     // Transient: the 0.1 V, 1 kHz drive reaches about 2 V at v(out), where
