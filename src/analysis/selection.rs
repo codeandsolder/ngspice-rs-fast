@@ -486,6 +486,16 @@ impl Column {
         (self.terms, self.component.map(VectorComponent::function))
     }
 
+    /// Raw source columns consumed by this resolved expression, in
+    /// evaluation order. Ground has no dependencies.
+    pub(super) fn input_columns(&self) -> impl Iterator<Item = usize> {
+        self.terms
+            .pairs()
+            .into_iter()
+            .flatten()
+            .map(|(index, _)| index)
+    }
+
     /// The written name of this column, e.g. `v(out)`.
     pub(crate) fn name(&self) -> &str {
         &self.name
