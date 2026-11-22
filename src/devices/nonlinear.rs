@@ -839,6 +839,11 @@ impl DiodeParameters {
 
     /// `diotemp.c::DIOtempUpdate` at this run's instance temperature.
     fn thermal(&self, context: &ModelContext) -> SpiceResult<Thermal> {
+        // Low-level device callers can prepare without a circuit load.
+        // Reject an invalid matching tolerance before publishing a derivation.
+        if !(context.reltol.is_finite() && context.reltol > 0.) {
+            return Err(SpiceError::circuit("invalid diode circuit RELTOL"));
+        }
         let model = &self.model;
         let geometry = self.instance.geometry;
         // diotemp.c::DIOtemp: TEMP (dioparam.c adds CONSTCtoK), else the

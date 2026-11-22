@@ -637,6 +637,16 @@ mod tests {
             next.to_bits()
         );
 
+        for reltol in [0., -1., f64::NAN, f64::INFINITY] {
+            assert!(original.thermal(&tight.with_reltol(reltol)).is_err());
+            // Failure must not replace the last successful derivation.
+            let cached = original
+                .derived
+                .get(super::super::DiodeThermalKey::context(&tight))
+                .unwrap();
+            assert_eq!(cached.breakdown.unwrap().to_bits(), next.to_bits());
+        }
+
         // The sensitivity stand-in owns a fresh cache; loading at the same
         // temperatures but changing RELTOL must not recover the old knee.
         let kernel = DiodeSensitivity::new(&original, &tight);
