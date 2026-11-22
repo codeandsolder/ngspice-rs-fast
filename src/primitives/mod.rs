@@ -18,7 +18,7 @@
 
 pub mod error;
 pub mod node;
-pub(crate) mod numeric;
+pub mod numeric;
 pub mod value;
 
 pub use error::{SourceLoc, SpiceError, SpiceResult};

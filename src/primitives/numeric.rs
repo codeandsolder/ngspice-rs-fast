@@ -67,7 +67,7 @@ pub fn truncating_signed_integer<T: TryFrom<i128>>(value: Real) -> Option<T> {
 /// Quantize a finite exponent, ties away from zero, saturating at the given
 /// integer limits. Invalid exponents or reversed bounds are rejected.
 #[must_use]
-pub fn bounded_rounded_exponent(value: Real, bounds: RangeInclusive<i32>) -> Option<i32> {
+pub(crate) fn bounded_rounded_exponent(value: Real, bounds: RangeInclusive<i32>) -> Option<i32> {
     if !value.is_finite() || bounds.is_empty() {
         return None;
     }
@@ -86,7 +86,7 @@ fn biased_exponent(bits: u64) -> i32 {
 
 /// Exact unbiased exponent of a finite, nonzero binary64 magnitude,
 /// including subnormals. Returns None for zero, infinity and NaN.
-pub fn binary_exponent(value: Real) -> Option<i32> {
+pub(crate) fn binary_exponent(value: Real) -> Option<i32> {
     if !value.is_finite() || value == 0.0 {
         return None;
     }
