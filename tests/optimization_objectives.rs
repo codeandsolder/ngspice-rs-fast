@@ -121,7 +121,7 @@ fn static_measurements_are_identical_without_retaining_rows() {
     )
     .unwrap();
     assert_eq!(bound.required_columns(), [0, 1, 2]);
-    assert!(bound.retained_columns().is_empty());
+    assert_eq!(bound.retained_columns(), []);
     let plan = ScenarioPlan::new(vec![bound]);
     let expected =
         measure::resolve_with_scope(&full, AnalysisKind::Transient, &parsed.measurements, &scope)
@@ -187,6 +187,95 @@ fn same_result(
     }
 }
 
+fn window_requests(window: MeasureWindow) -> impl Iterator<Item = MeasureRequest> {
+    let statistics = [
+        MeasureStatistic::Min,
+        MeasureStatistic::Max,
+        MeasureStatistic::MinAt,
+        MeasureStatistic::MaxAt,
+        MeasureStatistic::PeakToPeak,
+        MeasureStatistic::Avg,
+        MeasureStatistic::Integ,
+        MeasureStatistic::Rms,
+    ];
+    statistics
+        .into_iter()
+        .map(move |statistic| MeasureRequest::Statistic {
+            statistic,
+            operand: request("v(out)"),
+            window,
+        })
+        .chain(
+            [0., 0.5, 1., 1.5, 2., 4., 5.]
+                .into_iter()
+                .map(move |at| MeasureRequest::Find {
+                    operand: request("v(out)"),
+                    at,
+                    at_location: request_location(),
+                    window,
+                }),
+        )
+        .chain(
+            [0., 0.5, 1., 1.5, 2., 4., 5.]
+                .into_iter()
+                .map(move |at| MeasureRequest::AtEvent {
+                    operand: request("v(out)"),
+                    event: MeasureEvent::At {
+                        at,
+                        location: request_location(),
+                    },
+                    derivative: true,
+                    window,
+                }),
+        )
+        .chain(
+            [
+                MeasureTransition::First,
+                MeasureTransition::Rise(2),
+                MeasureTransition::Fall(1),
+                MeasureTransition::Cross(2),
+                MeasureTransition::Last,
+            ]
+            .into_iter()
+            .flat_map(move |transition| {
+                [
+                    MeasureEvent::Crossing {
+                        operand: request("v(out)"),
+                        value: 0.,
+                        value_location: request_location(),
+                        transition,
+                    },
+                    MeasureEvent::VectorCrossing {
+                        operand: request("v(out)"),
+                        reference: request("v(ref)"),
+                        transition,
+                    },
+                ]
+                .into_iter()
+                .flat_map(move |event| {
+                    [
+                        MeasureRequest::When {
+                            event: event.clone(),
+                            window,
+                        },
+                        MeasureRequest::AtEvent {
+                            event: event.clone(),
+                            operand: request("v(ref)"),
+                            derivative: false,
+                            window,
+                        },
+                        MeasureRequest::AtEvent {
+                            event,
+                            operand: request("v(ref)"),
+                            derivative: true,
+                            window,
+                        },
+                    ]
+                })
+            }),
+        )
+}
+
 #[test]
 fn windows_crossings_and_exact_query_groups_match_retained() {
     let scope = ParamScope::root(&[]).unwrap();
@@ -208,16 +297,6 @@ fn windows_crossings_and_exact_query_groups_match_retained() {
         ],
         vec![(1., 0., 1.)],
         vec![],
-    ];
-    let statistics = [
-        MeasureStatistic::Min,
-        MeasureStatistic::Max,
-        MeasureStatistic::MinAt,
-        MeasureStatistic::MaxAt,
-        MeasureStatistic::PeakToPeak,
-        MeasureStatistic::Avg,
-        MeasureStatistic::Integ,
-        MeasureStatistic::Rms,
     ];
     let mut count = 0;
     for rows in &samples {
@@ -241,78 +320,7 @@ fn windows_crossings_and_exact_query_groups_match_retained() {
                 Some(6.),
             ] {
                 let window = MeasureWindow { from, to };
-                let requests = statistics
-                    .into_iter()
-                    .map(|statistic| MeasureRequest::Statistic {
-                        statistic,
-                        operand: request("v(out)"),
-                        window,
-                    })
-                    .chain([0., 0.5, 1., 1.5, 2., 4., 5.].into_iter().map(|at| {
-                        MeasureRequest::Find {
-                            operand: request("v(out)"),
-                            at,
-                            at_location: request_location(),
-                            window,
-                        }
-                    }))
-                    .chain([0., 0.5, 1., 1.5, 2., 4., 5.].into_iter().map(|at| {
-                        MeasureRequest::AtEvent {
-                            operand: request("v(out)"),
-                            event: MeasureEvent::At {
-                                at,
-                                location: request_location(),
-                            },
-                            derivative: true,
-                            window,
-                        }
-                    }))
-                    .chain(
-                        [
-                            MeasureTransition::First,
-                            MeasureTransition::Rise(2),
-                            MeasureTransition::Fall(1),
-                            MeasureTransition::Cross(2),
-                            MeasureTransition::Last,
-                        ]
-                        .into_iter()
-                        .flat_map(|transition| {
-                            [
-                                MeasureEvent::Crossing {
-                                    operand: request("v(out)"),
-                                    value: 0.,
-                                    value_location: request_location(),
-                                    transition,
-                                },
-                                MeasureEvent::VectorCrossing {
-                                    operand: request("v(out)"),
-                                    reference: request("v(ref)"),
-                                    transition,
-                                },
-                            ]
-                            .into_iter()
-                            .flat_map(move |event| {
-                                [
-                                    MeasureRequest::When {
-                                        event: event.clone(),
-                                        window,
-                                    },
-                                    MeasureRequest::AtEvent {
-                                        event: event.clone(),
-                                        operand: request("v(ref)"),
-                                        derivative: false,
-                                        window,
-                                    },
-                                    MeasureRequest::AtEvent {
-                                        event,
-                                        operand: request("v(ref)"),
-                                        derivative: true,
-                                        window,
-                                    },
-                                ]
-                            })
-                        }),
-                    );
+                let requests = window_requests(window);
                 for m in requests {
                     let card = card(m);
                     let bound = PlotObjectivePlan::bind(
@@ -324,7 +332,7 @@ fn windows_crossings_and_exact_query_groups_match_retained() {
                         },
                     )
                     .unwrap();
-                    assert!(bound.retained_columns().is_empty());
+                    assert_eq!(bound.retained_columns(), []);
                     let got = finish(&ScenarioPlan::new(vec![bound]), &full, &scope);
                     let expected = measure::resolve(
                         &full,
@@ -529,7 +537,8 @@ fn prepared_rc_scenario_reuses_scalar_objectives_across_candidates() {
             panic!("expected scalar");
         };
         let w = std::f64::consts::TAU * 200. * 1e-3;
-        let analytical = Complex::new(1. / (1. + w * w), -w / (1. + w * w));
+        let denominator = w.mul_add(w, 1.);
+        let analytical = Complex::new(1. / denominator, -w / denominator);
         assert!((point.value.re - analytical.re).abs() < 1e-12);
         assert!((point.value.im - analytical.im).abs() < 1e-12);
         assert!(got.iter().all(|plot| plot.retained_cells == 0));
@@ -566,7 +575,7 @@ fn streaming_margins_and_frequency_observations_reuse_physical_scale() {
         },
     )
     .unwrap();
-    assert!(bound.retained_columns().is_empty());
+    assert_eq!(bound.retained_columns(), []);
     let got = finish(&ScenarioPlan::new(vec![bound]), &full, &scope);
     assert_eq!(
         got.measurements.unwrap(),
@@ -658,7 +667,12 @@ fn bench(retained: bool) {
         "retained={retained}; {repeats} candidates x {count} points x 65 columns; elapsed={:?}; peak cells={peak}; checksum={checksum}",
         start.elapsed()
     );
-    assert!((checksum - f64::from(repeats) * (2.5 + 1_f64 / 3_f64.sqrt())).abs() < 1e-8);
+    assert!(
+        f64::from(repeats)
+            .mul_add(-(2.5 + 1_f64 / 3_f64.sqrt()), checksum)
+            .abs()
+            < 1e-8
+    );
 }
 
 #[test]
