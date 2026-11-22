@@ -3986,8 +3986,14 @@ o7 m 0 n 0 rg
         assert_eq!(actual.to_string(), expected.to_string());
         drop(proposal);
         let after = run.ltra_work();
-        assert_eq!(after.coefficient_preparations, before.coefficient_preparations);
-        assert_eq!(after.convolution_evaluations, before.convolution_evaluations);
+        assert_eq!(
+            after.coefficient_preparations,
+            before.coefficient_preparations
+        );
+        assert_eq!(
+            after.convolution_evaluations,
+            before.convolution_evaluations
+        );
         assert_eq!(a, compare(&original, 2.25, &model));
     }
 

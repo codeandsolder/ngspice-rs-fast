@@ -206,6 +206,17 @@ frequency like the lossless line (`A += Re`, `E += Im / omega`).
   bit-for-bit. RHS histories remain independent. Direct one-off loads retain
   the same scalar evaluator; DC and RG do not allocate convolution weights.
   No timestep, interpolation, accumulation-order or breakpoint policy changes.
+
+  **Measured preparation work (#107):** the release `ltra_history` workload
+  on Acer produces the same 1,759 accepted steps, zero rejects and 74
+  breakpoints. The original evaluated coefficients and convolution 3,518
+  times per run (24,626 calls observed over seven runs); the prepared
+  transient reports 3,518 Newton/line loads but only 1,759 coefficient
+  preparations and convolution evaluations. DHAT across the same seven
+  retained/streamed/statistics runs reports 549,330,884 → 29,922,262 total
+  allocated bytes, 190,648 → 166,107 blocks and 623,870 → 623,838 peak live
+  bytes. The instrumented statistics run took 256.2 → 150.0 ms; wall clocks
+  are noisy under simultaneous builds, unlike the measured work counts.
 * **Breakpoints** (`ltraacct.c`): after recording a point, if either
   attenuated wave `(v + Z0 i) exp(-beta TD)` changes slope by at least
   `rel max(|d1|, |d2|) + abs` and is not steady (C's `CHECK`: range of the
