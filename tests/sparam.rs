@@ -329,8 +329,8 @@ fn five_ports_cross_a_batch_boundary_and_keep_last_excitation_and_noise_order() 
     let plot = sp(&body, ".sp lin 2 1k 2k 1").unwrap();
     for point in 0..plot.point_count() {
         for row in 1..=5 {
-            let z0 = 40. + 5. * f64::from(row);
-            let r = 100. + 20. * f64::from(row);
+            let z0 = f64::from(40 + 5 * row);
+            let r = f64::from(100 + 20 * row);
             let expected = if row == 5 { r / (r + z0) } else { 0. };
             close_real(&plot, &format!("v(n{row})"), point, expected);
             for col in 1..=5 {

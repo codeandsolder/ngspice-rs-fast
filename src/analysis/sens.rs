@@ -1150,7 +1150,7 @@ struct DcState<'a> {
     circuit: &'a Circuit,
 }
 
-fn perturbation_error(label: &str, error: SpiceError) -> SpiceError {
+fn perturbation_error(label: &str, error: &SpiceError) -> SpiceError {
     SpiceError::Numerical {
         context: format!(".sens {label}: {error}"),
         message: "the perturbed load could not be evaluated".to_owned(),
@@ -1184,7 +1184,7 @@ impl<T: Copy> SensitivityBatch<T> {
         self.rhs.try_reserve(rhs.len()).map_err(|error| {
             perturbation_error(
                 label,
-                SpiceError::Numerical {
+                &SpiceError::Numerical {
                     context: ".sens batch".to_owned(),
                     message: format!("cannot reserve RHS tile: {error}"),
                 },
@@ -1219,7 +1219,7 @@ impl<T: Copy> SensitivityBatch<T> {
         let result = solve(&self.rhs, &mut self.work, &mut self.solution);
         self.rhs.clear();
         result.map_err(|error| {
-            perturbation_error(&self.labels[error.rhs_index.unwrap_or(0)], error.cause)
+            perturbation_error(&self.labels[error.rhs_index.unwrap_or(0)], &error.cause)
         })?;
         for lane in 0..count {
             emit(
@@ -1740,7 +1740,7 @@ fn run_ac(
                     return Ok(());
                 };
                 at.residual(assembly, &mut scratch, index, base, perturbed)
-                    .map_err(|error| perturbation_error(label, error))?;
+                    .map_err(|error| perturbation_error(label, &error))?;
                 scratch.batch.push(&scratch.rhs, label, delta)?;
                 if scratch.batch.full() {
                     at.flush(&mut scratch, probe, &mut point)?;
@@ -1818,7 +1818,7 @@ fn run_dc(
         |_, member, setup, current| member.sensitivity.load(setup, current, SensitivityMode::Dc),
         |assembly, index, base, perturbed, delta, label| {
             at.residual(assembly, &mut scratch, index, base, perturbed)
-                .map_err(|error| perturbation_error(label, error))?;
+                .map_err(|error| perturbation_error(label, &error))?;
             scratch.tainted_lanes[scratch.batch.count].clone_from(&scratch.tainted);
             scratch.batch.push(scratch.rhs.as_slice(), label, delta)?;
             if scratch.batch.full() {
@@ -1939,11 +1939,11 @@ impl ParameterWalk<'_> {
             )
             .map_err(|error| labelled(error, label, "the perturbed load failed"))?;
             let elements = setup_elements(self.circuit, member.index, elements)
-                .map_err(|error| perturbation_error(label, error))?;
+                .map_err(|error| perturbation_error(label, &error))?;
             let assembly = self
                 .delta
                 .begin(elements)
-                .map_err(|error| perturbation_error(label, error))?;
+                .map_err(|error| perturbation_error(label, &error))?;
             measure(assembly, member.index, &base, &perturbed, delta, label)?;
             device.set(entry.scope, entry.keyword, value, model, instance)?;
             device.temperature(model, instance)?;

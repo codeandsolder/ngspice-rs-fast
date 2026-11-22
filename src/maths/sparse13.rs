@@ -3522,18 +3522,40 @@ mod tests {
         // are finite and the tile is not full.
         let mut invalid = rhs[..18].to_vec();
         invalid[12] = f64::NAN;
-        assert!(
-            matrix
-                .factors()
-                .unwrap()
-                .solve_batch_into(
-                    &invalid,
-                    &mut SolveBatchWorkspace::default(),
-                    &mut Vec::new(),
-                    false,
-                )
-                .is_err()
-        );
+        let failure = matrix
+            .factors()
+            .unwrap()
+            .solve_batch_into(
+                &invalid,
+                &mut SolveBatchWorkspace::default(),
+                &mut Vec::new(),
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(failure.rhs_index, Some(2));
+    }
+
+    #[test]
+    fn batch_reports_overflowing_lane_and_recovers_workspace() {
+        let mut matrix = build(1, &[(1, 1, f64::MIN_POSITIVE)]);
+        assert!(matches!(
+            matrix.order_and_factor(1e-3, 0.),
+            Status::Okay | Status::SmallPivot
+        ));
+        let factor = matrix.factors().unwrap();
+        let mut work = SolveBatchWorkspace::default();
+        let mut output = Vec::new();
+        for transposed in [false, true] {
+            let failure = factor
+                .solve_batch_into(&[0., 1e300, 1., -0.], &mut work, &mut output, transposed)
+                .unwrap_err();
+            assert_eq!(failure.rhs_index, Some(1));
+            factor
+                .solve_batch_into(&[0., 1., 0.5, -0.], &mut work, &mut output, transposed)
+                .unwrap();
+            assert_eq!(output[1], 1. / f64::MIN_POSITIVE);
+            assert_eq!(output[3].to_bits(), (-0.0_f64).to_bits());
+        }
     }
 
     #[test]
@@ -4481,6 +4503,11 @@ mod tests {
             assert_eq!(solve(&[1., 5.]), [1. / 3., 0.]);
             let perturbed = 5.0_f64.next_up();
             assert_eq!(solve(&[1., perturbed]), [1. / 3., (perturbed - 5.) / 2.]);
+            let rhs = [
+                1., 5., 1., perturbed, -1., -5., 0., -0., 2., 10., -2., -10., 1., 4., -1., -4., 2.,
+                9.,
+            ];
+            check_batch(&m, &rhs, |value| [value.to_bits(), 0]);
         }
         for (row, col) in [(1, 2), (2, 1)] {
             let mut m = build(2, &[(1, 1, 2.), (2, 2, 3.), (row, col, 15.)]);

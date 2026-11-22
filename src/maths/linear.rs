@@ -38,7 +38,7 @@ pub const RHS_BATCH_WIDTH: usize = 4;
 /// Reusable, scalar-typed sparse multiple-RHS solve scratch.
 ///
 /// Internal storage is tiled by matrix row, with one lane per RHS.
-/// Regardless of the total RHS count, scratch holds only one tile.
+/// Regardless of the total RHS count, scratch holds only one tile and one scalar tail.
 #[derive(Debug)]
 pub struct SolveBatchWorkspace<T> {
     pub(super) real: Vec<std::simd::f64x4>,
