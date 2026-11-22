@@ -2,12 +2,14 @@
 use std::process::{Command, Output};
 
 fn verify(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_xtask"))
-        .args(["golden", "verify"])
-        .args(args)
-        .env("NGSPICE_BIN", "/definitely/unavailable/ngspice")
-        .output()
-        .expect("run xtask")
+    Command::new(
+        std::env::var_os("CARGO_BIN_EXE_xtask").expect("Cargo supplies the test executable"),
+    )
+    .args(["golden", "verify"])
+    .args(args)
+    .env("NGSPICE_BIN", "/definitely/unavailable/ngspice")
+    .output()
+    .expect("run xtask")
 }
 
 #[test]
@@ -51,4 +53,28 @@ fn explicit_bad_requests_and_usage_errors_exit_nonzero() {
     let output = verify(&["--netlist", "unknown"]);
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("no fixture named 'unknown'"), "{stderr}");
+}
+
+#[test]
+fn workspace_is_selected_from_runtime_directory() {
+    let root = ngspice_conformance::fixtures::workspace_root().unwrap();
+    let binary = std::env::var_os("CARGO_BIN_EXE_xtask").unwrap();
+    let output = Command::new(&binary)
+        .current_dir(root.join("conformance/netlists"))
+        .args(["golden", "verify", "--netlist", "rc_divider"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let outside = std::env::temp_dir();
+    if ngspice_conformance::fixtures::workspace_root_from(&outside).is_none() {
+        let output = Command::new(binary)
+            .current_dir(outside)
+            .args(["golden", "verify", "--netlist", "rc_divider"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no ngspice conformance workspace")
+        );
+    }
 }

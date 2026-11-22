@@ -40,9 +40,7 @@ impl Drop for Cleanup {
 }
 
 fn workspace() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .canonicalize()
-        .expect("the workspace root exists")
+    ngspice_conformance::fixtures::workspace_root().unwrap()
 }
 
 /// Runs C batch mode and `spice-rs simulate` on `deck_text`.
@@ -74,13 +72,15 @@ fn run_both_decks(name: &str, deck_text: &str, rust_deck: &str) -> (RawFile, Raw
         String::from_utf8_lossy(&c.stderr)
     );
     fs::write(directory.join("rust.cir"), rust_deck).unwrap();
-    let rust = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("simulate")
-        .arg("--output")
-        .arg(directory.join("rust.raw"))
-        .arg(directory.join("rust.cir"))
-        .output()
-        .expect("spice-rs runs");
+    let rust = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("simulate")
+    .arg("--output")
+    .arg(directory.join("rust.raw"))
+    .arg(directory.join("rust.cir"))
+    .output()
+    .expect("spice-rs runs");
     assert!(
         rust.status.success(),
         "{name}: {}",

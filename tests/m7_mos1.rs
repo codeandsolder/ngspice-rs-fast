@@ -503,7 +503,8 @@ fn new_m7_fixtures_parse_write_parse_with_a_fixed_point() {
     ] {
         let n = Parser::new()
             .parse_file(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
+                ngspice_conformance::fixtures::workspace_root()
+                    .unwrap()
                     .join(format!("conformance/netlists/{name}.cir")),
             )
             .unwrap();

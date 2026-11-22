@@ -20,7 +20,8 @@ fn run_op(n: &Netlist) -> Result<(RunConfig, String), SpiceError> {
 }
 
 fn fixture() -> Netlist {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
         .join("conformance/parser/combined_params_options.cir");
     Parser::new().parse_file(path).unwrap()
 }

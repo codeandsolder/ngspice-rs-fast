@@ -23,9 +23,7 @@ use std::process::Command;
 use ngspice_rs::analysis::{Plot, RawFile};
 
 fn workspace() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .canonicalize()
-        .expect("the workspace root exists")
+    ngspice_conformance::fixtures::workspace_root().unwrap()
 }
 
 struct Cleanup(PathBuf);
@@ -63,13 +61,15 @@ fn run_both(name: &str, deck_text: &str) -> (RawFile, RawFile) {
         String::from_utf8_lossy(&c.stdout),
         String::from_utf8_lossy(&c.stderr)
     );
-    let rust = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("simulate")
-        .arg("--output")
-        .arg(directory.join("rust.raw"))
-        .arg(&deck)
-        .output()
-        .expect("spice-rs runs");
+    let rust = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("simulate")
+    .arg("--output")
+    .arg(directory.join("rust.raw"))
+    .arg(&deck)
+    .output()
+    .expect("spice-rs runs");
     assert!(
         rust.status.success(),
         "{name}: {}",

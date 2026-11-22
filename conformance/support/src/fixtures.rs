@@ -14,6 +14,35 @@ pub const NETLIST_DIR: &str = "conformance/netlists";
 /// Reference directory, relative to the workspace.
 pub const GOLDEN_DIR: &str = "conformance/golden";
 
+/// Find the conformance workspace above a runtime directory.
+#[must_use]
+pub fn workspace_root_from(directory: &Path) -> Option<PathBuf> {
+    directory
+        .ancestors()
+        .find(|root| {
+            root.join("Cargo.toml").is_file()
+                && root.join(NETLIST_DIR).is_dir()
+                && root.join(GOLDEN_DIR).is_dir()
+                && root.join("xtask/Cargo.toml").is_file()
+        })
+        .map(Path::to_path_buf)
+}
+
+/// Find the conformance workspace from the current working directory.
+///
+/// # Errors
+/// The current directory is unavailable or is outside the workspace.
+pub fn workspace_root() -> Result<PathBuf, String> {
+    let directory =
+        std::env::current_dir().map_err(|error| format!("current directory: {error}"))?;
+    workspace_root_from(&directory).ok_or_else(|| {
+        format!(
+            "no ngspice conformance workspace above {}",
+            directory.display()
+        )
+    })
+}
+
 /// Resolve the capture scratch root beneath the configured Cargo target directory.
 ///
 /// Relative target directories are interpreted relative to the workspace.

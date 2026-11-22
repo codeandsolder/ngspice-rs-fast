@@ -18,10 +18,7 @@ use ngspice_rs::analysis::results::PlotFlags;
 use ngspice_rs::primitives::{Complex, Real, approx_eq, format_spice_number};
 
 fn workspace() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".")
-        .canonicalize()
-        .expect("the workspace root exists")
+    ngspice_conformance::fixtures::workspace_root().unwrap()
 }
 
 fn fixture_names() -> Vec<String> {

@@ -379,7 +379,9 @@ fn file_round_trip(path: &Path) -> (String, Netlist, Netlist) {
 
 #[test]
 fn every_conformance_fixture_round_trips() {
-    let conformance = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance");
+    let conformance = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance");
     let temp = TempDir::new("fixtures");
     copy_dir(&conformance, &temp.0);
     let mut count = 0;

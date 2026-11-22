@@ -282,17 +282,20 @@ fn simulate_writes_c_layout_and_composes_with_other_analyses() {
     let dir = std::env::temp_dir().join(format!("spice-rs-pz-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
-    let deck =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/netlists/multi_analysis_pz.cir");
+    let deck = ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
+        .join("conformance/netlists/multi_analysis_pz.cir");
     let simulate = |format: &str, output: &Path| {
-        let run = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-            .arg("simulate")
-            .args(["--format", format])
-            .arg("--output")
-            .arg(output)
-            .arg(&deck)
-            .output()
-            .unwrap();
+        let run = Command::new(
+            std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+        )
+        .arg("simulate")
+        .args(["--format", format])
+        .arg("--output")
+        .arg(output)
+        .arg(&deck)
+        .output()
+        .unwrap();
         assert!(
             run.status.success(),
             "{}",
@@ -354,13 +357,15 @@ fn a_save_card_naming_a_node_vector_fails_the_run() {
         format!("save\n{RC}.save v(out)\n.pz in 0 out 0 vol pz\n.end\n"),
     )
     .unwrap();
-    let run = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("simulate")
-        .arg("--output")
-        .arg(dir.join("out.raw"))
-        .arg(&deck)
-        .output()
-        .unwrap();
+    let run = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("simulate")
+    .arg("--output")
+    .arg(dir.join("out.raw"))
+    .arg(&deck)
+    .output()
+    .unwrap();
     assert_eq!(run.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&run.stderr).contains("v(out)"));
     assert!(!dir.join("out.raw").exists());

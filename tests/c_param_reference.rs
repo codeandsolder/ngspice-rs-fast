@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -67,7 +67,7 @@ fn evaluate(expr: &Expr, names: &BTreeMap<&str, f64>) -> f64 {
 }
 
 fn c_value(label: &str, expression: &str) -> f64 {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join(".");
+    let workspace = ngspice_conformance::fixtures::workspace_root().unwrap();
     let binary = PathBuf::from(std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN"));
     let binary = if binary.is_absolute() {
         binary

@@ -329,43 +329,19 @@ fn emit_instance_ownership(out: &mut String, fields: &[Field]) -> Result<(), Str
     let phases = [
         (
             "SETUP_WRITES",
-            instance_writes(
-                include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../src/devices/bsim4/set.rs"
-                )),
-                "h",
-            )?,
+            instance_writes(include_str!("../../../src/devices/bsim4/set.rs"), "h")?,
         ),
         (
             "TEMPERATURE_WRITES",
-            instance_writes(
-                include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../src/devices/bsim4/temp.rs"
-                )),
-                "h",
-            )?,
+            instance_writes(include_str!("../../../src/devices/bsim4/temp.rs"), "h")?,
         ),
         (
             "CHECK_WRITES",
-            instance_writes(
-                include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../src/devices/bsim4/check.rs"
-                )),
-                "h",
-            )?,
+            instance_writes(include_str!("../../../src/devices/bsim4/check.rs"), "h")?,
         ),
         (
             "LOAD_WRITES",
-            instance_writes(
-                include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../src/devices/bsim4/load.rs"
-                )),
-                "here",
-            )?,
+            instance_writes(include_str!("../../../src/devices/bsim4/load.rs"), "here")?,
         ),
     ];
     let known: BTreeSet<_> = fields

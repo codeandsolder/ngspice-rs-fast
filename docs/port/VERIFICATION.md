@@ -2071,3 +2071,14 @@ are not established by the bounded linear implementation; subcircuit elaboration
 and parameter scoping are covered by the #18 gate ([SUBCIRCUITS.md](SUBCIRCUITS.md)).
 Track those remaining
 gates in the central [TODO.md](../../TODO.md); do not claim full SPICE parity.
+
+### Runtime paths
+
+Conformance tests and xtask discover the checkout at runtime from the
+current directory (Cargo runs tests from their package directories).
+Run xtask from inside the intended checkout, including when invoking a
+previously built executable directly. Process-level tests use Cargo's
+runtime `CARGO_BIN_EXE_*` environment to select the exact built executable,
+never a binary found through PATH. Source inputs to the BSIM4 generator
+use source-relative `include_str!` paths. No checkout or executable paths
+are embedded through compile-time Cargo environment macros.

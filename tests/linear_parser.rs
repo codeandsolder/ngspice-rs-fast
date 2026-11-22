@@ -16,7 +16,8 @@ fn parse(body: &str) -> Result<Netlist, SpiceError> {
 }
 
 fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    ngspice_conformance::fixtures::workspace_root()
+        .unwrap()
         .join("conformance/netlists")
         .join(format!("{name}.cir"))
 }

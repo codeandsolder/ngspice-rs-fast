@@ -16,10 +16,7 @@ use ngspice_rs::analysis::{PlotFlags, RawFile};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn workspace() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".")
-        .canonicalize()
-        .expect("the workspace root exists")
+    ngspice_conformance::fixtures::workspace_root().unwrap()
 }
 
 fn fixture(name: &str) -> PathBuf {
@@ -70,22 +67,26 @@ fn stderr(run: &Output) -> String {
 
 /// Runs `spice-rs simulate --output <output> <deck>`.
 fn simulate(output: &Path, deck: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .arg("simulate")
-        .args(["--format", "ascii"])
-        .arg("--output")
-        .arg(output)
-        .arg(deck)
-        .output()
-        .expect("run spice-rs")
+    Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .arg("simulate")
+    .args(["--format", "ascii"])
+    .arg("--output")
+    .arg(output)
+    .arg(deck)
+    .output()
+    .expect("run spice-rs")
 }
 
 /// Runs `spice-rs` with raw arguments.
 fn cli(arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .args(arguments)
-        .output()
-        .expect("run spice-rs")
+    Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .args(arguments)
+    .output()
+    .expect("run spice-rs")
 }
 
 /// Compares a written rawfile with its committed C golden, variable by name.
@@ -1734,12 +1735,14 @@ fn binary_cli_output_and_encoding_precedence() {
         "binary test\nV1 in 0 1 ac 1\nR1 in 0 1k\n.op\n.ac lin 2 1 2\n.control\nset filetype=ascii\n.endc\n.end\n",
     );
     let raw = dir.join("out.raw");
-    let run = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .args(["simulate", "--format", "binary", "--output"])
-        .arg(&raw)
-        .arg(&deck)
-        .output()
-        .unwrap();
+    let run = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .args(["simulate", "--format", "binary", "--output"])
+    .arg(&raw)
+    .arg(&deck)
+    .output()
+    .unwrap();
     assert!(run.status.success(), "{}", stderr(&run));
     assert_eq!(
         RawFormat::detect(&fs::read(&raw).unwrap()).unwrap(),
@@ -1747,13 +1750,15 @@ fn binary_cli_output_and_encoding_precedence() {
     );
     assert_eq!(RawFile::load(&raw).unwrap().plots.len(), 2);
     assert!(stdout(&run).contains("ngspice binary rawfile with 2 plots"));
-    let run = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .args(["simulate", "--output"])
-        .arg(&raw)
-        .arg(&deck)
-        .env("SPICE_ASCIIRAWFILE", "0")
-        .output()
-        .unwrap();
+    let run = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .args(["simulate", "--output"])
+    .arg(&raw)
+    .arg(&deck)
+    .env("SPICE_ASCIIRAWFILE", "0")
+    .output()
+    .unwrap();
     assert!(run.status.success(), "{}", stderr(&run));
     assert_eq!(
         RawFormat::detect(&fs::read(&raw).unwrap()).unwrap(),
@@ -1761,13 +1766,15 @@ fn binary_cli_output_and_encoding_precedence() {
     );
     fs::write(&deck, "binary test\nV1 in 0 1\nR1 in 0 1k\n.op\n.end\n").unwrap();
     for (environment, expected) in [("0", RawFormat::Binary), ("1", RawFormat::Ascii)] {
-        let run = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-            .args(["simulate", "--output"])
-            .arg(&raw)
-            .arg(&deck)
-            .env("SPICE_ASCIIRAWFILE", environment)
-            .output()
-            .unwrap();
+        let run = Command::new(
+            std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+        )
+        .args(["simulate", "--output"])
+        .arg(&raw)
+        .arg(&deck)
+        .env("SPICE_ASCIIRAWFILE", environment)
+        .output()
+        .unwrap();
         assert!(run.status.success(), "{}", stderr(&run));
         assert_eq!(
             RawFormat::detect(&fs::read(&raw).unwrap()).unwrap(),
@@ -1849,12 +1856,14 @@ fn c_reads_the_cli_binary_rawfile() {
         "binary C test\nV1 in 0 1 ac 1\nR1 in 0 1k\n.op\n.ac lin 2 1 2\n.end\n",
     );
     let raw = dir.join("out.raw");
-    let run = Command::new(env!("CARGO_BIN_EXE_spice-rs"))
-        .args(["simulate", "--format", "binary", "--output"])
-        .arg(&raw)
-        .arg(&deck)
-        .output()
-        .unwrap();
+    let run = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+    )
+    .args(["simulate", "--format", "binary", "--output"])
+    .arg(&raw)
+    .arg(&deck)
+    .output()
+    .unwrap();
     assert!(run.status.success(), "{}", stderr(&run));
     let control = dir.join("read.cir");
     fs::write(&control, format!("Read Rust binary\n.control\nload {}\nsetplot op1\nprint v(in)\nsetplot ac1\nprint v(in)\nquit\n.endc\n.end\n", raw.display())).unwrap();
