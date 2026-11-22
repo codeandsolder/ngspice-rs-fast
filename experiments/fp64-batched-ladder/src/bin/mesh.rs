@@ -8,6 +8,7 @@ use fp64_batched_ladder::{Gpu, median_ms};
 use rayon::prelude::*;
 use std::{
     collections::BTreeMap,
+    fmt::Write as _,
     hint::black_box,
     ops::{Add, Div, Mul, Neg, Sub},
     simd::Simd,
@@ -492,6 +493,90 @@ fn grouped_shader(mixed: bool) -> String {
         .replace("REFINEMENT_BODY", refinement)
 }
 
+/// Compile the validated fixed symbolic schedule into a kernel. Declare
+/// numeric entries on first use; eliminated values are dead except for the
+/// saved lower factors used in the backsolve. This lets the shader compiler
+/// retain the active numerical frontier in registers, without a global
+/// factor read/write per Schur update or any runtime operation dispatch.
+fn specialized_shader(plan: &Plan) -> String {
+    fn matrix_decl(code: &mut String, declared: &mut [bool], index: usize, original: usize) {
+        if !std::mem::replace(&mut declared[index], true) {
+            if index < original {
+                writeln!(code, "var a{index}=read_a(mb+{index}u*128u);").unwrap();
+            } else {
+                writeln!(code, "var a{index}=Z(0.0lf,0.0lf);").unwrap();
+            }
+        }
+    }
+    fn rhs_decl(code: &mut String, declared: &mut [bool], row: usize) {
+        if !std::mem::replace(&mut declared[row], true) {
+            writeln!(code, "var b{row}=read_b(xb+{row}u*128u);").unwrap();
+        }
+    }
+    let mut body = String::new();
+    let mut matrix = vec![false; plan.entries.len()];
+    let mut rhs = [false; N];
+    let mut pivot = 0;
+    let mut handle = 0;
+    let mut backward_row = None;
+    for &[kind, a, b, c] in &plan.tape[1..] {
+        let (a, b, c) = (a as usize, b as usize, c as usize);
+        match kind {
+            PIVOT => {
+                pivot = b;
+                matrix_decl(&mut body, &mut matrix, a, plan.original);
+                rhs_decl(&mut body, &mut rhs, b);
+                writeln!(
+                    body,
+                    "let inv{b}=inverse(a{a}); put_x(xb+{b}u*128u,mul(inv{b},b{b}));"
+                )
+                .unwrap();
+            }
+            MULTIPLIER => {
+                handle = a;
+                matrix_decl(&mut body, &mut matrix, a, plan.original);
+                rhs_decl(&mut body, &mut rhs, b);
+                writeln!(
+                    body,
+                    "let l{a}=mul(a{a},inv{pivot}); b{b}-=mul(l{a},b{pivot});"
+                )
+                .unwrap();
+            }
+            UPDATE => {
+                matrix_decl(&mut body, &mut matrix, a, plan.original);
+                matrix_decl(&mut body, &mut matrix, b, plan.original);
+                writeln!(body, "a{a}-=mul(l{handle},a{b});").unwrap();
+            }
+            STORE => {
+                assert_eq!(handle, a);
+                writeln!(body, "put_m(mb+{a}u*128u,l{a});").unwrap();
+            }
+            BACK => {
+                if backward_row != Some(c) {
+                    if let Some(row) = backward_row {
+                        writeln!(body, "put_x(xb+{row}u*128u,x{row});").unwrap();
+                    }
+                    writeln!(body, "var x{c}=read_x(xb+{c}u*128u);").unwrap();
+                    backward_row = Some(c);
+                }
+                writeln!(
+                    body,
+                    "x{c}-=mul(read_m(mb+{a}u*128u),read_x(xb+{b}u*128u));"
+                )
+                .unwrap();
+            }
+            _ => unreachable!("validated symbolic instruction"),
+        }
+    }
+    if let Some(row) = backward_row {
+        writeln!(body, "put_x(xb+{row}u*128u,x{row});").unwrap();
+    }
+    include_str!("../mesh_specialized.wgsl")
+        .replace("ENTRY_COUNT", &plan.entries.len().to_string())
+        .replace("ROW_COUNT", &N.to_string())
+        .replace("NUMERIC_BODY", &body)
+}
+
 fn main() -> Result<()> {
     let plan = Plan::new();
     println!(
@@ -539,10 +624,13 @@ fn main() -> Result<()> {
         &local_source,
         local_bytes,
     ))?;
+    let generated = specialized_shader(&plan);
+    println!("generated shader bytes: {}", generated.len());
+    let specialized_gpu = pollster::block_on(Gpu::new("Specialized sparse FP64", &generated, 0))?;
     println!("local shared memory bytes: {local_bytes}");
     println!("persistent CPU workers: {}", rayon::current_num_threads());
     println!(
-        "systems,scalar_ms,simd_ms,parallel_simd_ms,grouped_simd_ms,grouped_parallel_simd_ms,gpu_resident_ms,gpu_amortized_ms,gpu_roundtrip_ms,grouped_resident_ms,grouped_amortized_ms,grouped_roundtrip_ms,mixed_resident_ms,mixed_amortized_ms,mixed_roundtrip_ms,mixed_error,mixed_backward,local_resident_ms,local_amortized_ms,local_roundtrip_ms,max_solution_error,max_backward_error"
+        "systems,scalar_ms,simd_ms,parallel_simd_ms,grouped_simd_ms,grouped_parallel_simd_ms,gpu_resident_ms,gpu_amortized_ms,gpu_roundtrip_ms,grouped_resident_ms,grouped_amortized_ms,grouped_roundtrip_ms,mixed_resident_ms,mixed_amortized_ms,mixed_roundtrip_ms,mixed_error,mixed_backward,local_resident_ms,local_amortized_ms,local_roundtrip_ms,specialized_resident_ms,specialized_amortized_ms,specialized_roundtrip_ms,max_solution_error,max_backward_error"
     );
     for groups in [1_u32, 4, 16, 64] {
         let input = Input::new(&plan, groups as usize);
@@ -640,16 +728,24 @@ fn main() -> Result<()> {
             groups * (TILE / LOCAL_SYSTEMS) as u32,
         )?;
         let (le, lb) = input.check(&plan, &x)?;
+        let (sr, sa, st) = specialized_gpu.trial(
+            &[&input.matrix, &input.rhs],
+            &[matrix.len(), x.len()],
+            None,
+            &mut x,
+            groups,
+        )?;
+        let (se, sb) = input.check(&plan, &x)?;
         println!(
-            "{},{:.4},{:.4},{:.4},{:.4},{:.4},{resident:.4},{amortized:.4},{roundtrip:.4},{gr:.4},{ga:.4},{gt:.4},{mr:.4},{ma:.4},{mt:.4},{me:.3e},{mb:.3e},{lr:.4},{la:.4},{lt:.4},{:.3e},{:.3e}",
+            "{},{:.4},{:.4},{:.4},{:.4},{:.4},{resident:.4},{amortized:.4},{roundtrip:.4},{gr:.4},{ga:.4},{gt:.4},{mr:.4},{ma:.4},{mt:.4},{me:.3e},{mb:.3e},{lr:.4},{la:.4},{lt:.4},{sr:.4},{sa:.4},{st:.4},{:.3e},{:.3e}",
             groups * TILE as u32,
             times[0],
             times[1],
             times[2],
             times[3],
             times[4],
-            error.max(e).max(ge).max(me).max(le),
-            backward.max(r).max(gb).max(mb).max(lb)
+            error.max(e).max(ge).max(me).max(le).max(se),
+            backward.max(r).max(gb).max(mb).max(lb).max(sb)
         );
     }
     Ok(())
@@ -658,6 +754,44 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cooperative_column_updates_are_disjoint() {
+        use std::collections::BTreeSet;
+        let plan = Plan::new();
+        let grouped = plan.grouped();
+        let mut update_count = 0;
+        for k in 0..N {
+            let [diag, first, end, update_start] = grouped[k + 1];
+            assert_eq!(plan.entries[diag as usize], (k, k));
+            let edges = &grouped[first as usize..end as usize];
+            let column_handles: BTreeSet<_> = edges.iter().map(|edge| edge[1]).collect();
+            assert_eq!(column_handles.len(), edges.len());
+            let mut destinations = BTreeSet::new();
+            let mut cursor = update_start;
+            for (i, &[row, handle, start, stop]) in edges.iter().enumerate() {
+                assert_eq!(plan.entries[handle as usize], (row as usize, k));
+                assert_eq!(cursor, start);
+                for &[dest, source, multiplier, _] in &grouped[start as usize..stop as usize] {
+                    assert_eq!(multiplier as usize, i);
+                    assert!(column_handles.contains(&source));
+                    assert!(!column_handles.contains(&dest));
+                    assert_ne!(dest, diag);
+                    assert!(
+                        destinations.insert(dest),
+                        "two updates write the same destination"
+                    );
+                    let (j, other_k) = plan.entries[source as usize];
+                    assert_eq!(other_k, k);
+                    assert_eq!(plan.entries[dest as usize], (j, row as usize));
+                    update_count += 1;
+                }
+                cursor = stop;
+            }
+            assert_eq!(cursor, first);
+        }
+        assert_eq!(update_count, plan.updates);
+    }
 
     #[test]
     fn grouped_plan_factors_can_solve_repeated_rhs() -> Result<()> {
