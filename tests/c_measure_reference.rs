@@ -17,7 +17,7 @@
 use std::fs;
 use std::path::Path;
 
-use ngspice_conformance::measurement::{self, Analysis};
+use ngspice_conformance::measurement::{self, ActualSection, Analysis};
 use ngspice_conformance::ngspice::{Ngspice, Scratch};
 
 use ngspice_rs::analysis::{RunConfig, measure, runner};
@@ -67,10 +67,57 @@ fn compare(tag: &str, kind: AnalysisKind, deck: &str) {
     let theirs = measurement::parse(&output.stdout, &output.stderr)
         .unwrap_or_else(|error| panic!("{tag}: {error}\n{}", output.transcript()));
     let analysis = Analysis::keyword(kind.as_str()).expect("supported measurement analysis");
-    measurement::compare(&theirs, analysis, port_results(deck), |reference| {
-        3e-5 * reference.abs() + 1e-9
-    })
-    .unwrap_or_else(|error| panic!("{tag}: {error}\n{}", output.transcript()));
+    let actual = [ActualSection {
+        analysis,
+        run: 0,
+        values: port_results(deck),
+    }];
+    measurement::compare(&theirs, &actual, |reference| 3e-5 * reference.abs() + 1e-9)
+        .unwrap_or_else(|error| panic!("{tag}: {error}\n{}", output.transcript()));
+}
+
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN; intentional failed and repeated C measurements"]
+fn real_reports_keep_failed_cards_and_repeated_runs_separate() {
+    use ngspice_conformance::measurement::Outcome;
+    let scratch = Scratch::new("measure-diagnostics").unwrap();
+    let binary = Ngspice::pinned().unwrap();
+    let run = |text: &str| {
+        fs::write(scratch.path().join("probe.cir"), text).unwrap();
+        let output = binary.run(scratch.path(), &["-b", "probe.cir"]).unwrap();
+        output.require_success("measurement probe").unwrap();
+        measurement::parse(&output.stdout, &output.stderr)
+            .unwrap_or_else(|error| panic!("{error}\n{}", output.transcript()))
+    };
+    let repeated = run(
+        "Repeated measurements\nv1 in 0 0\nr1 in 0 1k\n.dc v1 0 1 .1\n.meas dc stack max v(in)\n.control\nrun\nrun\nquit\n.endc\n.end\n",
+    );
+    let actual = [
+        ActualSection {
+            analysis: Analysis::Dc,
+            run: 0,
+            values: vec![("stack".into(), 1.)],
+        },
+        ActualSection {
+            analysis: Analysis::Dc,
+            run: 1,
+            values: vec![("stack".into(), 1.)],
+        },
+    ];
+    measurement::compare(&repeated, &actual, |_| 1e-9).unwrap();
+    let failures = run(
+        "Failed measurements\nv1 in 0 0\nr1 in 0 1k\n.dc v1 0 1 .1\n.meas dc missing param='unknown+1'\n.meas dc nohit when v(in)=2\n.meas dc duplicate max v(in)\n.meas dc duplicate min v(in)\n.end\n",
+    );
+    assert_eq!(failures.sections.len(), 1);
+    let rows = &failures.sections[0].rows;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].outcome, Outcome::Failed);
+    assert_eq!(rows[1].name, "duplicate");
+    assert_eq!(rows[2].name, "duplicate");
+    assert_eq!(failures.failures.len(), 1);
+    assert_eq!(failures.failures[0].name, "nohit");
+    assert_eq!(failures.failures[0].run, Some(0));
+    assert!(measurement::compare(&failures, &actual[..1], |_| 1e-9).is_err());
 }
 
 #[test]

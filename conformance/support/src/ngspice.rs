@@ -157,6 +157,7 @@ impl Scratch {
     }
 
     fn create_at(root: &Path, tag: &str, keep: bool) -> Result<Self, String> {
+        static ID: AtomicUsize = AtomicUsize::new(0);
         if tag.is_empty()
             || !tag
                 .bytes()
@@ -164,7 +165,6 @@ impl Scratch {
         {
             return Err(format!("invalid scratch tag {tag:?}"));
         }
-        static ID: AtomicUsize = AtomicUsize::new(0);
         let root = fs::canonicalize(root)
             .map_err(|error| format!("scratch root {}: {error}", root.display()))?;
         loop {

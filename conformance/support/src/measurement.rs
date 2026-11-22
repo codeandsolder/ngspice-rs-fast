@@ -1,8 +1,10 @@
 //! ngspice batch measurement reports, independent of simulator result types.
 //!
 //! The pinned C oracle emits "Measurements for DC/AC/SP/Transient Analysis"
-//! sections terminated by a blank line; .measure PARAM (and the normal
+//! sections terminated by a blank line; `.measure PARAM` (and the normal
 //! second pass for scalar measurements) writes the same name/value rows.
+//! The grammar follows `measure.c` and `com_measure2.c` at C commit
+//! 059066b5. Only batch reports with analysis headers are supported.
 //! Numerical failures may instead be reported on stderr as a failed card.
 //! Never interpret the subsequent resource statistics as measurements.
 
@@ -50,7 +52,7 @@ impl Analysis {
 pub struct Coordinates {
     /// Extremum/sample position.
     pub at: Option<f64>,
-    /// Signal value at the axis coordinate returned by MIN_AT or MAX_AT.
+    /// Signal value at the axis coordinate returned by `MIN_AT` or `MAX_AT`.
     pub with: Option<f64>,
     /// Start of the measurement window.
     pub from: Option<f64>,
@@ -60,6 +62,26 @@ pub struct Coordinates {
     pub trig: Option<f64>,
     /// Target position.
     pub targ: Option<f64>,
+}
+
+impl Coordinates {
+    const fn valid(self, unit: Option<ReportedUnit>) -> bool {
+        let Self {
+            at,
+            with,
+            from,
+            to,
+            trig,
+            targ,
+        } = self;
+        matches!(
+            (at, with, from, to, trig, targ, unit),
+            (None, _, None, None, None, None, None)
+                | (Some(_), None, None, None, None, None, _)
+                | (None, None, Some(_), Some(_), None, None, None)
+                | (None, None, None, None, Some(_), Some(_), None)
+        )
+    }
 }
 
 /// One reported outcome, including failed scalar expressions.
@@ -96,7 +118,8 @@ pub struct Row {
 /// One measurement report in stdout order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Section {
-    /// Analysis kind.
+    /// Analysis label emitted by C. The parser does not infer a different
+    /// analysis from the numerical values or the Rust results.
     pub analysis: Analysis,
     /// Zero-based run as delimited by C's analysis-start banner, or 0
     /// for a transcript without banners.
@@ -155,6 +178,9 @@ fn parse_row(line: &str) -> Result<Row, String> {
         Outcome::Value(parse_number(value)?)
     };
     let mut rest = words.next().unwrap_or_default().trim();
+    if matches!(outcome, Outcome::Failed) && !rest.is_empty() {
+        return Err("unexpected metadata after a failed measurement".to_owned());
+    }
     let mut unit = None;
     if let Some((prefix, tail)) = rest.split_once(char::is_whitespace) {
         unit = match prefix {
@@ -186,6 +212,9 @@ fn parse_row(line: &str) -> Result<Row, String> {
             return Err(format!("duplicate coordinate {key:?}"));
         }
         rest = words.next().unwrap_or_default().trim();
+    }
+    if !coordinates.valid(unit) {
+        return Err("incomplete or conflicting measurement metadata".to_owned());
     }
     Ok(Row {
         name: name.to_owned(),
@@ -283,47 +312,79 @@ pub fn parse(stdout: &str, stderr: &str) -> Result<Report, String> {
     Ok(report)
 }
 
-/// Compare a complete single-analysis result set, not a subset selected by
-/// the simulator under test. Reordering is allowed because C's scalar pass
-/// prints after ordinary measurements, but duplicate names are errors.
+/// Results produced by the simulator under test for one reported analysis/run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActualSection {
+    /// Expected analysis.
+    pub analysis: Analysis,
+    /// Zero-based expected run number.
+    pub run: usize,
+    /// Every result of this analysis, with the original name and value.
+    pub values: Vec<(String, f64)>,
+}
+
+/// Compare complete ordered analysis/run sections.
+///
+/// Never compare a subset selected by the simulator under test. Within a
+/// section, names rather than print ordering identify measurements;
+/// duplicate names are errors.
 ///
 /// `bound` returns the maximum allowed absolute error for a C reference value.
 ///
 /// # Errors
 /// Unexpected section/run, failed card or row, missing/extra/duplicate names,
-/// nonfinite result, or an exceeded numerical bound.
+/// nonfinite result, invalid bound, or an exceeded numerical bound.
 pub fn compare(
     report: &Report,
-    analysis: Analysis,
-    actual: impl IntoIterator<Item = (String, f64)>,
+    actual: &[ActualSection],
     bound: impl Fn(f64) -> f64,
 ) -> Result<(), String> {
     if !report.failures.is_empty() {
         return Err(format!("C failed measurements: {:?}", report.failures));
     }
-    let [section] = report.sections.as_slice() else {
+    if report.sections.len() != actual.len() {
         return Err(format!(
-            "expected exactly one {analysis:?} measurement section, found {:?}",
-            report.sections
-        ));
-    };
-    if section.analysis != analysis || section.run != 0 {
-        return Err(format!(
-            "unexpected section {section:?}; wanted {analysis:?}, run 0"
+            "different measurement section counts: C {}, Rust {}",
+            report.sections.len(),
+            actual.len()
         ));
     }
+    if actual.is_empty() {
+        return Err("neither engine measured anything".to_owned());
+    }
+    for (section, ours) in report.sections.iter().zip(actual) {
+        if section.analysis != ours.analysis || section.run != ours.run {
+            return Err(format!(
+                "unexpected C section {:?} run {}; Rust {:?} run {}",
+                section.analysis, section.run, ours.analysis, ours.run
+            ));
+        }
+        compare_section(section, &ours.values, &bound)
+            .map_err(|error| format!("{:?} run {}: {error}", section.analysis, section.run))?;
+    }
+    Ok(())
+}
+
+fn compare_section(
+    section: &Section,
+    actual: &[(String, f64)],
+    bound: &impl Fn(f64) -> f64,
+) -> Result<(), String> {
     let mut expected = BTreeMap::new();
     for row in &section.rows {
         let Outcome::Value(value) = row.outcome else {
             return Err(format!("C measurement {:?} failed", row.name));
         };
+        if !value.is_finite() {
+            return Err(format!("nonfinite C measurement {:?}", row.name));
+        }
         if expected.insert(row.name.as_str(), value).is_some() {
             return Err(format!("duplicate C measurement {:?}", row.name));
         }
     }
-    let mut seen = BTreeMap::new();
+    let mut seen = std::collections::BTreeSet::new();
     for (name, value) in actual {
-        if seen.insert(name.clone(), value).is_some() {
+        if !seen.insert(name.as_str()) {
             return Err(format!("duplicate Rust measurement {name:?}"));
         }
         let Some(reference) = expected.remove(name.as_str()) else {
@@ -359,6 +420,48 @@ mod tests {
     const SP: &str = "  Measurements for SP Analysis\n\ntransmission        =  3.80952e-01 at=  1.00000e+03\natfreq              =  3.80952e-01\n\n";
     const TRAN: &str = "  Measurements for Transient Analysis\n\ndelta               =  2.00000e-03 targ=  2.00050e-03 trig=  5.00000e-07\nrms                 =   3.53657e-01 from=  1.00000e-03 to=  3.00000e-03\nexprval             =  7.07315e-01\n\n";
 
+    fn one(
+        analysis: Analysis,
+        values: impl IntoIterator<Item = (String, f64)>,
+    ) -> [ActualSection; 1] {
+        [ActualSection {
+            analysis,
+            run: 0,
+            values: values.into_iter().collect(),
+        }]
+    }
+
+    #[test]
+    fn compare_uses_all_sections_and_run_identities() {
+        let banner = "Doing analysis at TEMP = 27.000000 and TNOM = 27.000000\n";
+        let dc = "Measurements for DC Analysis\n\nstack = 1\n\n";
+        let report = parse(&format!("{banner}{dc}{AC}{banner}{dc}"), "").unwrap();
+        let mut actual = [
+            ActualSection {
+                analysis: Analysis::Dc,
+                run: 0,
+                values: vec![("stack".into(), 1.)],
+            },
+            ActualSection {
+                analysis: Analysis::Ac,
+                run: 0,
+                values: vec![("peak".into(), 0.5), ("atfrequency".into(), 0.5)],
+            },
+            ActualSection {
+                analysis: Analysis::Dc,
+                run: 1,
+                values: vec![("stack".into(), 1.)],
+            },
+        ];
+        assert!(compare(&report, &actual, |_| 0.).is_ok());
+        assert!(compare(&report, &actual[..2], |_| 0.).is_err());
+        actual[2].run = 0;
+        assert!(compare(&report, &actual, |_| 0.).is_err());
+        actual[2].run = 1;
+        actual[2].analysis = Analysis::Sp;
+        assert!(compare(&report, &actual, |_| 0.).is_err());
+    }
+
     #[test]
     fn pinned_reports_preserve_order_coordinates_and_stack() {
         let report = parse(&format!("{DC}{AC}{SP}{TRAN}"), "").unwrap();
@@ -393,7 +496,7 @@ mod tests {
         assert_eq!(repeated.sections.len(), 2);
         assert_eq!(repeated.sections[1].run, 1);
         assert_eq!(repeated.failures[0].run, None);
-        assert!(compare(&single, Analysis::Dc, [], |_| 0.).is_err());
+        assert!(compare(&single, &one(Analysis::Dc, []), |_| 0.).is_err());
     }
 
     #[test]
@@ -419,7 +522,7 @@ mod tests {
         assert!(report.sections[0].rows.is_empty());
         assert_eq!(report.failures[0].run, Some(0));
         assert_eq!(report.failures[0].name, "nohit");
-        assert!(compare(&report, Analysis::Dc, [], |_| 0.).is_err());
+        assert!(compare(&report, &one(Analysis::Dc, []), |_| 0.).is_err());
     }
 
     #[test]
@@ -431,10 +534,10 @@ mod tests {
             report.sections[0].rows[2].name,
             report.sections[0].rows[3].name
         );
-        assert!(compare(&report, Analysis::Dc, [], |_| 0.).is_err());
+        assert!(compare(&report, &one(Analysis::Dc, []), |_| 0.).is_err());
         let duplicate = parse("Measurements for DC Analysis\n\nx = 1\nx = 1\n", "").unwrap();
         assert!(
-            compare(&duplicate, Analysis::Dc, [("x".into(), 1.)], |_| 0.)
+            compare(&duplicate, &one(Analysis::Dc, [("x".into(), 1.)]), |_| 0.)
                 .unwrap_err()
                 .contains("duplicate C")
         );
@@ -443,7 +546,7 @@ mod tests {
     #[test]
     fn comparison_checks_exact_name_set_without_changing_bounds() {
         let report = parse(AC, "").unwrap();
-        let check = |rows| compare(&report, Analysis::Ac, rows, |_| 1e-5);
+        let check = |rows| compare(&report, &one(Analysis::Ac, rows), |_| 1e-5);
         assert!(check(vec![("atfrequency".into(), 0.5), ("peak".into(), 0.5)]).is_ok());
         assert!(
             check(vec![("peak".into(), 0.5)])
@@ -474,6 +577,10 @@ mod tests {
             "x = 1 unknown=3",
             "x = 1 at=",
             "x = 1 bytes.",
+            "x = 1 from=2",
+            "x = 1 at=2 with=3",
+            "x = failed at=2",
+            "x = 1 dB from=0 to=1",
         ] {
             assert!(
                 parse(&format!("Measurements for DC Analysis\n\n{row}\n\n"), "").is_err(),
@@ -483,6 +590,6 @@ mod tests {
         assert!(parse("Measurements for Unknown Analysis\n\nx = 1", "").is_err());
         assert!(parse("", ".meas wrong bad failed!").is_err());
         let empty = parse("", "").unwrap();
-        assert!(compare(&empty, Analysis::Dc, [], |_| 0.).is_err());
+        assert!(compare(&empty, &[], |_| 0.).is_err());
     }
 }

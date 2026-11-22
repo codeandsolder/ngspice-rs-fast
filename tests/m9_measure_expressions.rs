@@ -1,5 +1,5 @@
 //! Scalar measurements: C's two-pass ordering, deck parameters, and atomic errors.
-use ngspice_conformance::measurement::{self, Analysis};
+use ngspice_conformance::measurement::{self, ActualSection, Analysis};
 use ngspice_conformance::ngspice::{Ngspice, Scratch};
 use ngspice_rs::analysis::{Plot, PlotFlags, Variable, measure};
 use ngspice_rs::netlist::Parser;
@@ -91,15 +91,17 @@ fn compare_live(tag: &str, text: &str) {
         panic!("{tag}: expected one analysis plot");
     };
     assert_eq!(plot.analysis, AnalysisKind::Transient);
-    measurement::compare(
-        &report,
-        Analysis::Tran,
-        plot.measurements
+    let actual = [ActualSection {
+        analysis: Analysis::Tran,
+        run: 0,
+        values: plot
+            .measurements
             .iter()
-            .map(|row| (row.name.clone(), row.value)),
-        |_| 1e-5_f64.next_down(),
-    )
-    .unwrap_or_else(|error| panic!("{tag}: {error}\n{}", output.transcript()));
+            .map(|row| (row.name.clone(), row.value))
+            .collect(),
+    }];
+    measurement::compare(&report, &actual, |_| 1e-5_f64.next_down())
+        .unwrap_or_else(|error| panic!("{tag}: {error}\n{}", output.transcript()));
 }
 
 #[test]
