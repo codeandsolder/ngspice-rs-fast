@@ -3,7 +3,9 @@
 /// Relative and absolute error budget for a scalar or a complex magnitude.
 #[derive(Debug, Clone, Copy)]
 pub struct Tolerance {
+    /// Fraction of the reference magnitude.
     pub relative: f64,
+    /// Absolute floor in the compared quantity’s units.
     pub absolute: f64,
 }
 
