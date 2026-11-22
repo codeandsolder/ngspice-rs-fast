@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use ngspice_rs::analysis::{Plot, PlotFlags, RawFile, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, PlotFlags, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::{Complex, Real, SpiceResult};
@@ -20,9 +20,9 @@ fn run(cards: &str, analysis: &str) -> SpiceResult<Plot> {
         .parse_deck(&parse_deck_text(Path::new("pz.cir"), &text))
         .expect("the deck parses");
     let config = RunConfig::from_netlist(&netlist)?;
-    let request = config.request_for(&netlist.analyses[0])?;
+    let request = config.plan_for(&netlist.analyses[0])?;
     let mut circuit = config.circuit(&netlist)?;
-    runner(request.kind)?.run(&mut circuit, &request, &config.context())
+    request.run(&mut circuit, &config.context())
 }
 
 fn roots(plot: &Plot, kind: &str) -> Vec<Complex> {

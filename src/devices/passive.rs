@@ -253,9 +253,9 @@ impl PassiveParameters {
         let location = SourceLoc::new(std::path::PathBuf::from("<literal passive>"), 0, 0);
         let primary = kind.principal();
         let mut instance_values = instance_schema(kind).validate(&[], &location)?;
-        instance_values.set(primary.name, value, primary.unit, location.clone());
+        instance_values.set(primary.name, value, primary.unit, location.clone())?;
         if let (Some(ic), Some(parameter)) = (ic, kind.initial()) {
-            instance_values.set(parameter.name, ic, parameter.unit, location.clone());
+            instance_values.set(parameter.name, ic, parameter.unit, location.clone())?;
         }
         let model_values = model_schema(kind).validate(&[], &location)?;
         Ok(Self {
@@ -294,7 +294,7 @@ impl PassiveParameters {
     ) -> SpiceResult<Self> {
         let mut p = self.clone();
         let primary = self.kind.principal().name;
-        let definitions = instance_schema(self.kind).parameters;
+        let definitions = instance_schema(self.kind).parameters();
         let definition = definitions
             .iter()
             .find(|d| d.name == parameter)
@@ -315,7 +315,7 @@ impl PassiveParameters {
             "in its finite physical domain",
         )?;
         p.instance_values
-            .set(parameter, value, definition.unit, self.location.clone());
+            .set(parameter, value, definition.unit, self.location.clone())?;
         match parameter {
             name if name == primary => {
                 let value = if self.kind == PassiveKind::Resistor {
@@ -326,7 +326,7 @@ impl PassiveParameters {
                 valid_value(self.kind, value, &self.location)?;
                 p.nominal_value = value;
                 p.instance_values
-                    .set(primary, value, definition.unit, self.location.clone());
+                    .set(primary, value, definition.unit, self.location.clone())?;
             }
             "temp" => p.temperature = Some(value),
             "tc1" => p.coefficients.linear = value,
@@ -389,7 +389,7 @@ impl PassiveParameters {
         recipe.nominal_value = value;
         recipe
             .instance_values
-            .set(principal.name, value, principal.unit, self.location.clone());
+            .set(principal.name, value, principal.unit, self.location.clone())?;
         Ok(recipe)
     }
     /// The validated model setters (schema defaults have no location).
@@ -594,7 +594,7 @@ impl ResolvedModel<'_> {
                 "instance does not reference this two-terminal passive model",
             ));
         }
-        let model = self.parameters(&model_schema(kind))?;
+        let model = self.parameters(model_schema(kind))?;
         let mut instance_values =
             instance_schema(kind).validate(&instance.parameters, &instance.location)?;
         let location = &instance.location;
@@ -612,7 +612,7 @@ impl ResolvedModel<'_> {
             && let Some(written) = instance_values.get(primary)
             && let Some(source) = &written.location
         {
-            instance_values.set(primary, base, kind.principal().unit, source.clone());
+            instance_values.set(primary, base, kind.principal().unit, source.clone())?;
         }
         valid_value(kind, base, location)?;
         // ressetup.c: RESeffNoiseArea uses the instance geometry (L/W
@@ -677,7 +677,7 @@ const fn p(name: &'static str, unit: U, domain: D, default: Option<Real>) -> Sca
         default,
     }
 }
-const fn model_schema(kind: PassiveKind) -> ScalarSchema<'static> {
+fn model_schema(kind: PassiveKind) -> &'static ScalarSchema<'static> {
     const R: &[ScalarParameter] = &[
         p("r", U::Ohm, D::Positive, None),
         p("rsh", U::Ohm, D::NonNegative, Some(0.0)),
@@ -720,15 +720,16 @@ const fn model_schema(kind: PassiveKind) -> ScalarSchema<'static> {
         p("tc2", U::InverseKelvinSquared, D::Finite, Some(0.0)),
         p("tnom", U::Celsius, D::Temperature, None),
     ];
-    ScalarSchema {
-        parameters: match kind {
-            PassiveKind::Resistor => R,
-            PassiveKind::Capacitor => C,
-            PassiveKind::Inductor => L,
-        },
+    static R_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(R);
+    static C_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(C);
+    static L_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(L);
+    match kind {
+        PassiveKind::Resistor => &R_SCHEMA,
+        PassiveKind::Capacitor => &C_SCHEMA,
+        PassiveKind::Inductor => &L_SCHEMA,
     }
 }
-const fn instance_schema(kind: PassiveKind) -> ScalarSchema<'static> {
+fn instance_schema(kind: PassiveKind) -> &'static ScalarSchema<'static> {
     const TEMP: ScalarParameter = p("temp", U::Celsius, D::Temperature, None);
     const DTEMP: ScalarParameter = p("dtemp", U::Kelvin, D::Finite, None);
     const TC1: ScalarParameter = p("tc1", U::InverseKelvin, D::Finite, None);
@@ -774,12 +775,13 @@ const fn instance_schema(kind: PassiveKind) -> ScalarSchema<'static> {
         p("ic", U::Ampere, D::Finite, None),
         p("nt", U::Dimensionless, D::Positive, None),
     ];
-    ScalarSchema {
-        parameters: match kind {
-            PassiveKind::Resistor => R,
-            PassiveKind::Capacitor => C,
-            PassiveKind::Inductor => I,
-        },
+    static R_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(R);
+    static C_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(C);
+    static I_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(I);
+    match kind {
+        PassiveKind::Resistor => &R_SCHEMA,
+        PassiveKind::Capacitor => &C_SCHEMA,
+        PassiveKind::Inductor => &I_SCHEMA,
     }
 }
 fn optional(values: &ScalarValues, name: &str) -> Option<Real> {

@@ -24,44 +24,6 @@ use crate::primitives::{Real, SpiceError, SpiceResult};
 /// Largest accepted per-solve Newton iteration limit (`maxiter`, deck `itl1`).
 pub const MAX_ITERATIONS: usize = 10_000;
 
-/// Request names owned by [`crate::analysis::bias::ContinuationPolicy`], not by Newton.
-pub(crate) const CONTINUATION_KEYS: [&str; 7] = [
-    "srcsteps",
-    "gminsteps",
-    "gminfactor",
-    STAGE_ITERATIONS_KEY,
-    SCHEDULE_KEY,
-    SKIP_DIRECT_KEY,
-    ADAPT_ITERATIONS_KEY,
-];
-
-/// Request key selecting the continuation family: `continuation=ngspice`
-/// (the default, [`crate::analysis::bias::ContinuationSchedule::Ngspice`]) or
-/// `continuation=ladder` (the port's fixed ladders). Port-only.
-pub const SCHEDULE_KEY: &str = "continuation";
-
-/// Request key of C's `noopiter` (`noopiter=1` skips the direct Newton
-/// attempt, `0` keeps it; [`crate::analysis::bias::ContinuationPolicy::skip_direct`]).
-pub const SKIP_DIRECT_KEY: &str = "noopiter";
-
-/// Request key of the ngspice schedule's adaptation base, C's raw
-/// `CKTdcTrcvMaxIter` (deck `itl2` as written, default 50;
-/// [`crate::analysis::bias::NgspiceStepping::adapt_iterations()`]).
-pub const ADAPT_ITERATIONS_KEY: &str = "adaptiter";
-
-/// Select how Newton iterations limit voltage changes.
-///
-/// Request key selecting [`NewtonOptions::limiting`]: `limiting=device`
-/// (ngspice's per-device junction limiting, the default) or `limiting=global`
-/// (the port's bounded global voltage-step damping). A port-only key: C has
-/// no such option.
-pub const LIMITING_KEY: &str = "limiting";
-
-/// Request key of the Newton limit per gmin/source-stepping stage (deck
-/// `itl2`, C `CKTdcTrcvMaxIter` in `cktop.c`); see
-/// [`crate::analysis::bias::ContinuationPolicy::stage_max_iterations`].
-pub(crate) const STAGE_ITERATIONS_KEY: &str = "stagemaxiter";
-
 /// How Newton bounds the step between iterates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StepLimiting {
@@ -130,77 +92,6 @@ impl Default for NewtonOptions {
     }
 }
 impl NewtonOptions {
-    /// Resolve named `rtol`, `vntol`, `abstol`, `maxiter` arguments for DC/AC,
-    /// plus the port-only [`LIMITING_KEY`] (`limiting=device|global`, see
-    /// [`StepLimiting`]).
-    /// Unknown and duplicate names fail instead of silently selecting defaults.
-    /// Continuation names (`srcsteps`, `gminsteps`, `gminfactor`) also fail here:
-    /// a Newton-only caller would silently drop them, so use
-    /// [`crate::analysis::bias::DcSettings::from_request`], which resolves all of them.
-    /// # Errors
-    /// Invalid or unimplemented convergence arguments.
-    pub fn from_request(request: &crate::analysis::AnalysisRequest) -> SpiceResult<Self> {
-        let mut options = Self::default();
-
-        let mut seen = std::collections::BTreeSet::new();
-        for argument in &request.arguments {
-            let Some((key, text)) = argument.split_once('=') else {
-                continue;
-            };
-            let key = key.trim().to_ascii_lowercase();
-            if !seen.insert(key.clone()) {
-                return Err(failure("duplicate convergence option"));
-            }
-            if key == LIMITING_KEY {
-                options.limiting = match text.trim().to_ascii_lowercase().as_str() {
-                    "device" => StepLimiting::Device,
-                    "global" => StepLimiting::Global,
-                    other => {
-                        return Err(failure(format!(
-                            "{LIMITING_KEY} must be 'device' or 'global', not '{other}'"
-                        )));
-                    }
-                };
-                continue;
-            }
-            let value = crate::primitives::parse_spice_number(text.trim())
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| failure("nonfinite/nonliteral convergence option"))?;
-            match key.as_str() {
-                "rtol" => options.reltol = value,
-                "vntol" => options.vntol = value,
-                "abstol" => options.abstol = value,
-                "maxiter" => {
-                    options.max_iterations =
-                        crate::primitives::exact_nonnegative_integer::<usize>(value)
-                            .filter(|n| (1..=MAX_ITERATIONS).contains(n))
-                            .ok_or_else(|| {
-                                failure(format!(
-                                    "maxiter must be an integer in 1..={MAX_ITERATIONS}"
-                                ))
-                            })?;
-                }
-                name if CONTINUATION_KEYS.contains(&name) => {
-                    return Err(crate::primitives::SpiceError::Unsupported {
-                        feature: format!(
-                            "continuation option {name} needs DcSettings::from_request, \
-                             not NewtonOptions::from_request"
-                        ),
-                        location: None,
-                    });
-                }
-                _ => {
-                    return Err(crate::primitives::SpiceError::Unsupported {
-                        feature: format!("convergence option {key}"),
-                        location: None,
-                    });
-                }
-            }
-        }
-        options.validate()?;
-        Ok(options)
-    }
-
     /// Validate tolerances and bounded work before the first load.
     ///
     /// # Errors
@@ -468,7 +359,7 @@ impl CircuitNewton<'_> {
             policy,
             continued,
             |guess, phase, previous| {
-                let mut matrix = self.circuit.new_matrix();
+                let mut matrix = self.circuit.new_matrix()?;
                 let mut rhs = Vector::zeros(self.circuit.unknown_count());
                 let mut trial = self
                     .history

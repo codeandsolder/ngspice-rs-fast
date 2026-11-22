@@ -398,14 +398,9 @@ impl Jfet {
         // `inpgmod.c::create_model`: a setter outside the model table that is
         // a settable instance parameter becomes a model-level instance
         // default, applied before the instance card's own setters.
-        let (scalars, model_defaults) = crate::devices::schema::split_model_setters(
-            scalars,
-            &ScalarSchema { parameters: MODEL },
-            &ScalarSchema {
-                parameters: INSTANCE,
-            },
-        );
-        let m = ScalarSchema { parameters: MODEL }.validate(scalars, &resolved.card().location)?;
+        let (scalars, model_defaults) =
+            crate::devices::schema::split_model_setters(scalars, &MODEL_SCHEMA, &INSTANCE_SCHEMA);
+        let m = MODEL_SCHEMA.validate(scalars, &resolved.card().location)?;
         let get = |name: &str| m.get(name).map(|v| v.value);
         // JFET_MOD_VTO has the IOP spelling `vt0` and the IOPR alias `vto`;
         // setters apply in card order, so the later one wins.
@@ -722,14 +717,8 @@ pub(super) fn instance_setters(
     setters: &[ParameterAssignment],
     owner: &crate::primitives::SourceLoc,
 ) -> SpiceResult<Instance> {
-    let v = crate::devices::schema::with_defaults(
-        &ScalarSchema {
-            parameters: INSTANCE,
-        },
-        defaults,
-        setters.iter(),
-        owner,
-    )?;
+    let v =
+        crate::devices::schema::with_defaults(&INSTANCE_SCHEMA, defaults, setters.iter(), owner)?;
     Ok(Instance {
         area: required(&v, "area")?,
         m: required(&v, "m")?,
@@ -1891,6 +1880,10 @@ fn celsius_instance(instance: &SensitivityRecord) -> SpiceResult<Option<Real>> {
         .transpose()?
         .map(|kelvin| kelvin - CELSIUS_TO_KELVIN))
 }
+
+pub(super) static INSTANCE_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(INSTANCE);
+
+static MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(MODEL);
 
 #[cfg(test)]
 mod tests {

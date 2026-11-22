@@ -7,7 +7,7 @@
 //! `ngspice_test/build/src/ngspice` on the same decks; `cargo xtask golden
 //! verify` checks five of them (`m10_hfet1_{dc,op,ac,tran,pz}`).
 
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
 use ngspice_rs::devices::Circuit;
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -24,11 +24,9 @@ fn circuit(body: &str) -> Result<Circuit, SpiceError> {
     Circuit::from_netlist(&deck(body)?)
 }
 fn attempt(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> SpiceResult<Plot> {
-    runner(kind).unwrap().run(
-        c,
-        &AnalysisRequest::with_arguments(kind, arguments.iter().copied()),
-        &AnalysisContext::default(),
-    )
+    AnalysisInput::with_arguments(kind, arguments.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
 }
 fn run(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> Plot {
     attempt(c, kind, arguments).unwrap()
@@ -312,12 +310,9 @@ fn a_hfet1_card_is_noiseless_and_linear_in_distortion() {
     )
     .unwrap();
     let config = ngspice_rs::analysis::RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut c = config.circuit(&netlist).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut c, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut c, &config.context()).unwrap();
     let names: Vec<&str> = plot
         .variables()
         .iter()
@@ -364,12 +359,9 @@ fn sensitivity_follows_hfet1s_table_and_cs_temperature_quirks() {
                 .model nch nhfet level=5 rd=31 rs=31 vt0=-0.5\n.sens i(vids)";
     let parsed = deck(text).unwrap();
     let config = ngspice_rs::analysis::RunConfig::from_netlist(&parsed).unwrap();
-    let request = config.request_for(&parsed.analyses[0]).unwrap();
+    let request = config.plan_for(&parsed.analyses[0]).unwrap();
     let mut circuit = config.circuit(&parsed).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut circuit, &config.context()).unwrap();
     let names: Vec<&str> = plot
         .variables()
         .iter()
@@ -401,12 +393,9 @@ fn sensitivity_runs_for_a_p_channel_card() {
                 .model pch phfet level=5 rd=31 rs=31\n.sens i(vids)";
     let parsed = deck(text).unwrap();
     let config = ngspice_rs::analysis::RunConfig::from_netlist(&parsed).unwrap();
-    let request = config.request_for(&parsed.analyses[0]).unwrap();
+    let request = config.plan_for(&parsed.analyses[0]).unwrap();
     let mut circuit = config.circuit(&parsed).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut circuit, &config.context()).unwrap();
     let index = plot.variable_index("v(z2:vt0)").expect("vt0 column");
     let value = plot.points()[0][index].re;
     // The first step multiplies the stored -0.15 by -1 once, so the column is

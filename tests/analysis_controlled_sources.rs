@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use ngspice_rs::analysis::{
-    AnalysisContext, AnalysisRequest, Plot, RunConfig, Selection, runner, write_requests,
+    AnalysisContext, AnalysisInput, Plot, RunConfig, Selection, write_requests,
 };
 use ngspice_rs::devices::Circuit;
 use ngspice_rs::netlist::Parser;
@@ -23,11 +23,9 @@ fn circuit(body: &str) -> SpiceResult<Circuit> {
 }
 
 fn run(c: &mut Circuit, kind: AnalysisKind, args: &[&str]) -> SpiceResult<Plot> {
-    runner(kind)?.run(
-        c,
-        &AnalysisRequest::with_arguments(kind, args.iter().copied()),
-        &AnalysisContext::default(),
-    )
+    AnalysisInput::with_arguments(kind, args.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
 }
 
 fn op(body: &str) -> Plot {
@@ -311,9 +309,9 @@ fn run_deck(body: &str) -> SpiceResult<Plot> {
         &format!("controlled\n{body}\n.end\n"),
     ))?;
     let config = RunConfig::from_netlist(&netlist)?;
-    let request = config.request_for(&netlist.analyses[0])?;
+    let request = config.plan_for(&netlist.analyses[0])?;
     let mut circuit = config.circuit(&netlist)?;
-    runner(request.kind)?.run(&mut circuit, &request, &config.context())
+    request.run(&mut circuit, &config.context())
 }
 
 /// An op-amp-like E stage driving a load capacitor (values cross-checked with

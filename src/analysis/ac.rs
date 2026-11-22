@@ -6,7 +6,7 @@
 //! prepares its operating point exactly as `acan.c` does.
 use crate::analysis::frequency::{Advance, FrequencyGrid};
 use crate::analysis::linear::{number, plot, unsupported};
-use crate::analysis::{AnalysisRequest, Plot};
+use crate::analysis::{AnalysisPlan, Plot, PointSink};
 use crate::devices::Circuit;
 use crate::devices::linear::LinearSystem;
 use crate::maths::Vector;
@@ -15,36 +15,31 @@ use crate::primitives::{Complex, Real, SpiceResult};
 
 pub(super) fn run(
     circuit: &mut Circuit,
-    request: &AnalysisRequest,
+    request: &AnalysisPlan,
     context: &crate::analysis::AnalysisContext,
+    grid: &[Real],
     include_bias: bool,
-) -> SpiceResult<Vec<Plot>> {
-    let settings = crate::analysis::bias::DcSettings::from_request(request)?;
-    let positional: Vec<String> = request
-        .arguments
-        .iter()
-        .filter(|a| !a.contains('='))
-        .cloned()
-        .collect();
-    if positional.len() != 4 {
-        return Err(unsupported(".ac lin|dec|oct points start stop"));
-    }
-    let grid = frequency_grid(&positional, settings.newton.reltol, GridKind::Ac)?;
+    sink: &mut dyn PointSink,
+) -> SpiceResult<()> {
+    let settings = request.dc_settings().clone();
     let mut small_signal = SmallSignal::prepare(circuit, request, context, settings)?;
-    let mut plots = small_signal.retained_bias(circuit, request, context, include_bias)?;
-    let mut plot = plot(
+    for bias in small_signal.retained_bias(circuit, request, context, include_bias)? {
+        sink.complete(bias)?;
+    }
+    let plot = plot(
         circuit,
         "ac1",
         "AC Analysis",
         Some(("frequency", "frequency")),
         true,
     )?;
+    sink.begin(&plot)?;
     // NIacIter on the circuit's own matrix: the first AC solve of the
     // circuit reorders (`SMPcReorder`, starting from the real pivot order),
     // later frequencies refactor (`SMPcLUfac`) and reorder only after a zero
     // pivot. See [`ac_matrix`].
     let shared: &Circuit = circuit;
-    for f in grid {
+    for &f in grid {
         let x = small_signal.at_frequency(shared, context, f, |system| {
             ac_matrix(shared, system, 2. * std::f64::consts::PI * f)?
                 .factorize()?
@@ -53,10 +48,10 @@ pub(super) fn run(
         let mut point = vec![Complex::real(f)];
         point.extend(x);
         point.extend(circuit.observe_parameters(&context.model_context().with_frequency(f))?);
-        plot.push_point(point)?;
+        plot.check_point(&point)?;
+        sink.point(point)?;
     }
-    plots.push(plot);
-    Ok(plots)
+    sink.end()
 }
 
 /// Which C frequency loop a grid follows: `acan.c` has a special decade delta
@@ -186,7 +181,7 @@ impl SmallSignal {
     /// Solves the operating point and assembles the small-signal system.
     pub(crate) fn prepare(
         circuit: &mut Circuit,
-        request: &AnalysisRequest,
+        request: &AnalysisPlan,
         context: &crate::analysis::AnalysisContext,
         settings: crate::analysis::bias::DcSettings,
     ) -> SpiceResult<Self> {
@@ -237,14 +232,14 @@ impl SmallSignal {
     pub(super) fn retained_bias(
         &self,
         circuit: &Circuit,
-        request: &AnalysisRequest,
+        request: &AnalysisPlan,
         context: &crate::analysis::AnalysisContext,
         include: bool,
     ) -> SpiceResult<Vec<Plot>> {
         if !include {
             return Ok(Vec::new());
         }
-        let title = match request.kind {
+        let title = match request.kind() {
             crate::primitives::AnalysisKind::Noise => "NOISE Operating Point",
             crate::primitives::AnalysisKind::Distortion
             | crate::primitives::AnalysisKind::PoleZero => "Distortion Operating Point",
@@ -322,7 +317,7 @@ impl SmallSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::AnalysisContext;
+    use crate::analysis::{AnalysisContext, AnalysisInput};
     use crate::netlist::{Parser, source::parse_deck_text};
     use crate::primitives::AnalysisKind;
     use std::path::Path;
@@ -365,12 +360,12 @@ mod tests {
         let mut circuit = Circuit::from_netlist(&netlist).unwrap();
         let mut same_bias = Circuit::from_netlist(&netlist).unwrap();
         let context = AnalysisContext::default();
-        let request = AnalysisRequest::with_arguments(
-            AnalysisKind::OperatingPoint,
-            std::iter::empty::<&str>(),
-        );
+        let request =
+            AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+                .resolve()
+                .unwrap();
         crate::analysis::linear::op(&mut circuit, &request, &context).unwrap();
-        let settings = crate::analysis::bias::DcSettings::from_request(&request).unwrap();
+        let settings = request.dc_settings().clone();
         SmallSignal::prepare(&mut same_bias, &request, &context, settings).unwrap();
         let expected = carried(&same_bias);
         assert!(expected.iter().flatten().any(|value| *value > 0.));
@@ -392,10 +387,10 @@ mod tests {
         other.set_observations(&observations).unwrap();
         let context = AnalysisContext::default();
         let mut request =
-            AnalysisRequest::with_arguments(AnalysisKind::Ac, ["lin", "3", "100", "300"]);
-        request.keep_op_info = true;
-        let driver = crate::analysis::runner(AnalysisKind::Ac).unwrap();
-        let plots = driver.run_plots(&mut circuit, &request, &context).unwrap();
+            AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "3", "100", "300"]);
+        request.keep_op_info = Some(true);
+        let request = request.resolve().unwrap();
+        let plots = request.run_plots(&mut circuit, &context).unwrap();
         assert_eq!(plots.len(), 2);
         assert_eq!(plots[0].plotname, "AC Operating Point");
         assert_eq!(plots[0].value("v(out)", 0), Some(Complex::real(1.)));
@@ -403,10 +398,7 @@ mod tests {
             plots[0].value("@r1[resistance]", 0),
             Some(Complex::real(1000.))
         );
-        assert_eq!(
-            plots[1],
-            driver.run(&mut other, &request, &context).unwrap()
-        );
+        assert_eq!(plots[1], request.run(&mut other, &context).unwrap());
     }
 
     #[test]
@@ -421,11 +413,8 @@ mod tests {
         )).unwrap();
         let config = crate::analysis::RunConfig::from_netlist(&netlist).unwrap();
         let mut circuit = config.circuit(&netlist).unwrap();
-        let request = config.request_for(&netlist.analyses[0]).unwrap();
-        let plot = crate::analysis::runner(request.kind)
-            .unwrap()
-            .run(&mut circuit, &request, &config.context())
-            .unwrap();
+        let request = config.plan_for(&netlist.analyses[0]).unwrap();
+        let plot = request.run(&mut circuit, &config.context()).unwrap();
         for (row, reference) in [-4.5, 1.9951733971375833, 1.9999995498230105]
             .into_iter()
             .enumerate()
@@ -446,8 +435,10 @@ mod tests {
         )).unwrap();
         let mut circuit = Circuit::from_netlist(&netlist).unwrap();
         let context = AnalysisContext::default();
-        let request = AnalysisRequest::with_arguments(AnalysisKind::Ac, ["lin", "3", "100", "300"]);
-        let settings = crate::analysis::bias::DcSettings::from_request(&request).unwrap();
+        let request = AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "3", "100", "300"])
+            .resolve()
+            .unwrap();
+        let settings = request.dc_settings().clone();
         let mut small = SmallSignal::prepare(&mut circuit, &request, &context, settings).unwrap();
         assert!(small.varies());
         let initial = carried(&circuit);

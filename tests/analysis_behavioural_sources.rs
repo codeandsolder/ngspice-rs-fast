@@ -7,7 +7,7 @@
 //! `cargo xtask golden verify`.
 use std::path::Path;
 
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
 use ngspice_rs::devices::Circuit;
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -22,11 +22,9 @@ fn circuit(body: &str) -> SpiceResult<Circuit> {
 }
 
 fn run(body: &str, kind: AnalysisKind, args: &[&str]) -> SpiceResult<Plot> {
-    runner(kind)?.run(
-        &mut circuit(body)?,
-        &AnalysisRequest::with_arguments(kind, args.iter().copied()),
-        &AnalysisContext::default(),
-    )
+    AnalysisInput::with_arguments(kind, args.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(&mut circuit(body)?, &AnalysisContext::default()))
 }
 
 fn value(plot: &Plot, name: &str, point: usize) -> f64 {

@@ -1,11 +1,11 @@
 //! `.disto` (GitHub #104) through production APIs: parsed decks, `RunConfig`,
-//! `runner` and `Analysis::run_plots`. Accuracy is judged against the
+//! `AnalysisPlan::run_plots`. Accuracy is judged against the
 //! closed-form Volterra kernels of a diode's exponential; the committed C
 //! goldens are verified by `cargo xtask golden verify` and the opt-in live-C
 //! comparison is `c_disto_reference.rs`.
 use std::path::Path;
 
-use ngspice_rs::analysis::{Plot, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, RunConfig};
 use ngspice_rs::devices::noise::{BOLTZMANN, CHARGE};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -17,9 +17,9 @@ const GMIN: f64 = 1e-12;
 fn run_at(deck: &str, index: usize) -> SpiceResult<Vec<Plot>> {
     let netlist = Parser::new().parse_deck(&parse_deck_text(Path::new("disto.cir"), deck))?;
     let config = RunConfig::from_netlist(&netlist)?;
-    let request = config.request_for(&netlist.analyses[index])?;
+    let request = config.plan_for(&netlist.analyses[index])?;
     let mut circuit = config.circuit(&netlist)?;
-    runner(request.kind)?.run_plots(&mut circuit, &request, &config.context())
+    request.run_plots(&mut circuit, &config.context())
 }
 
 fn run(deck: &str) -> Vec<Plot> {

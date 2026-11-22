@@ -34,7 +34,7 @@
 use crate::analysis::ac::{GridKind, SmallSignal, frequency_grid};
 use crate::analysis::linear::{plot, unsupported};
 use crate::analysis::results::Variable;
-use crate::analysis::{AnalysisRequest, Plot};
+use crate::analysis::{AnalysisPlan, Plot};
 use crate::devices::Circuit;
 use crate::devices::linear::SourceKind;
 use crate::maths::dense_complex::DenseComplex;
@@ -58,19 +58,7 @@ impl BoundPort {
     }
 }
 
-pub(super) fn run(
-    circuit: &mut Circuit,
-    request: &AnalysisRequest,
-    context: &crate::analysis::AnalysisContext,
-    include_bias: bool,
-) -> SpiceResult<Vec<Plot>> {
-    let settings = crate::analysis::bias::DcSettings::from_request(request)?;
-    let positional: Vec<String> = request
-        .arguments
-        .iter()
-        .filter(|a| !a.contains('='))
-        .cloned()
-        .collect();
+pub(super) fn parse(positional: &[String], reltol: Real) -> SpiceResult<(Vec<Real>, bool)> {
     if !matches!(positional.len(), 4 | 5) {
         return Err(unsupported(".sp lin|dec|oct points start stop [donoise]"));
     }
@@ -85,7 +73,19 @@ pub(super) fn run(
         false
     };
 
-    let grid = frequency_grid(&positional, settings.newton.reltol, GridKind::Sp)?;
+    let grid = frequency_grid(positional, reltol, GridKind::Sp)?;
+    Ok((grid, donoise))
+}
+
+pub(super) fn run(
+    circuit: &mut Circuit,
+    request: &AnalysisPlan,
+    context: &crate::analysis::AnalysisContext,
+    grid: &[Real],
+    donoise: bool,
+    include_bias: bool,
+) -> SpiceResult<Vec<Plot>> {
+    let settings = request.dc_settings().clone();
     circuit.finalize()?;
     let ports = bind_ports(circuit)?;
     let mut small_signal = SmallSignal::prepare(circuit, request, context, settings)?;
@@ -94,7 +94,7 @@ pub(super) fn run(
     let n = circuit.unknown_count();
     let mut plot = parameter_plot(circuit, ports.len(), donoise)?;
     let reference = ports[0].z0;
-    for f in grid {
+    for &f in grid {
         let (last, matrices, factor) =
             small_signal.at_frequency(circuit, context, f, |system| {
                 let matrix =

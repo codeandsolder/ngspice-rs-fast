@@ -27,18 +27,15 @@ const fn scalar(name: &'static str, unit: ScalarUnit, domain: ScalarDomain) -> S
         default: None,
     }
 }
-const MODEL: ScalarSchema<'static> = ScalarSchema {
-    parameters: &[
-        scalar("r", ScalarUnit::OhmPerMetre, ScalarDomain::NonNegative),
-        scalar("l", ScalarUnit::HenryPerMetre, ScalarDomain::NonNegative),
-        scalar("g", ScalarUnit::SiemensPerMetre, ScalarDomain::NonNegative),
-        scalar("c", ScalarUnit::FaradPerMetre, ScalarDomain::Positive),
-        scalar("length", ScalarUnit::Metre, ScalarDomain::Positive),
-    ],
-};
-const INSTANCE: ScalarSchema<'static> = ScalarSchema {
-    parameters: &[scalar("len", ScalarUnit::Metre, ScalarDomain::Positive)],
-};
+static MODEL: ScalarSchema<'static> = ScalarSchema::new(&[
+    scalar("r", ScalarUnit::OhmPerMetre, ScalarDomain::NonNegative),
+    scalar("l", ScalarUnit::HenryPerMetre, ScalarDomain::NonNegative),
+    scalar("g", ScalarUnit::SiemensPerMetre, ScalarDomain::NonNegative),
+    scalar("c", ScalarUnit::FaradPerMetre, ScalarDomain::Positive),
+    scalar("length", ScalarUnit::Metre, ScalarDomain::Positive),
+]);
+static INSTANCE: ScalarSchema<'static> =
+    ScalarSchema::new(&[scalar("len", ScalarUnit::Metre, ScalarDomain::Positive)]);
 #[derive(Debug, Clone, Copy)]
 struct Model {
     r: Real,

@@ -6,7 +6,9 @@ not a model-parameter sweep (C has none, see below) or a `.step` analysis.
 No new parser exists: the `.dc` card's positional arguments come from the existing
 analysis-card AST (so `{expr}`/`.param` arguments already work) and are read as
 `target start stop step [target start stop step]`. Named `key=value` arguments
-are convergence controls owned by `DcSettings::from_request` and are ignored by axis parsing.
+are resolved once into typed convergence settings by `RunConfig::plan`. The
+resolved plan owns checked exact geometry and C-compatible accumulated grids;
+circuit binding validates target identities and device-specific domains.
 
 ## Targets
 

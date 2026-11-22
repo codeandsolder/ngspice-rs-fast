@@ -10,8 +10,8 @@
 //! | [`batch`] | ngspice batch order, plot names and per-plot `.save`/`.print`/`.measure`/`.four` targeting for multi-analysis decks | ported (`docs/port/CLI.md`) |
 //! | `pz` | `.pz` poles and zeros at the operating point (`pzan.c`), roots from [`crate::maths::pencil`] | ported (`docs/port/POLE_ZERO_ADR.md`) |
 //! | [`noise`] | `.noise`: adjoint small-signal noise spectra and integrated totals | resistor, diode, BJT, MOS1 and switch generators (`docs/port/NOISE.md`) |
-//! | [`driver`] | the [`Analysis`] trait and the `.op`/`.dc`/`.ac`/`.tran`/`.pz`/`.tf`/`.sp`/`.noise` drivers | linear DC/AC and the adaptive trap/Gear-2 companion transient |
-//! | `tf` | `.tf` DC small-signal gain, input and output resistance at the bias point | ported (`tfanal.c`; see [`driver::TransferFunction`]) |
+//! | [`driver`] | the typed [`AnalysisPlan`] and the `.op`/`.dc`/`.ac`/`.tran`/`.pz`/`.tf`/`.sp`/`.noise` drivers | linear DC/AC and the adaptive trap/Gear-2 companion transient |
+//! | `tf` | `.tf` DC small-signal gain, input and output resistance at the bias point | ported (`tfanal.c`; see [`AnalysisPlan`]) |
 //! | `sparam` | `.sp` S-parameter analysis over RF port sources (S, Y, Z) | ported without `donoise` (`docs/port/SPARAM.md`) |
 //!
 //! The C equivalent is `src/spicelib/analysis/` (21,993 lines: the `CKT*`
@@ -46,6 +46,7 @@ pub mod measure;
 pub mod newton;
 pub mod noise;
 mod ordered_samples;
+mod plan;
 mod pz;
 pub mod rawfile;
 pub mod results;
@@ -54,22 +55,23 @@ mod sens;
 mod sparam;
 pub mod sweep;
 mod tf;
-mod transient;
 
-pub use companion::{TransientStats, companion_transient, companion_transient_into};
+pub use companion::{TransientPlan, TransientStats, companion_transient, companion_transient_into};
 pub use config::{
     AppliedOption, DcOptions, IgnoredOption, RunConfig, RunOverrides, TransientSettings,
 };
 pub use driver::{
-    Analysis, AnalysisContext, AnalysisRequest, AnalysisSupport, DRIVERS, NodeCondition,
-    has_driver, runner, support,
+    AnalysisContext, AnalysisInput, AnalysisSupport, DRIVERS, NodeCondition, NoiseOptions,
+    has_driver, support,
 };
 pub use fourier::{FourierAnalysis, FourierWindow, Harmonic};
 pub use measure::{MeasureEvents, MeasureSpan, Measurement};
+pub use plan::{AnalysisPlan, IntegrationFamily};
 pub use rawfile::{
-    BinaryByteOrder, RawFile, RawFileReader, RawFileWriter, RawFormat, RawPlot, RawPlotRows,
-    StreamedPlot,
+    BinaryByteOrder, RawCollectPolicy, RawFile, RawFileReader, RawFileWriter, RawFormat, RawPlot,
+    RawPlotRows, RawReadPolicy, StreamedPlot,
 };
+pub use rawfile::{FinishedPlot, RawFileTransaction};
 pub use results::{Plot, PlotBuilder, PlotFlags, PlotSchema, PointSink, Variable};
 pub use selection::{Selection, print_requests, write_requests};
 

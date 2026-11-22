@@ -12,7 +12,7 @@ use ngspice_rs::analysis::bias::{
     AttemptOutcome, DcOutcome, DcReport, DcSettings, DcStrategy, OPTRAN_NOT_PORTED, solve_dc_with,
 };
 use ngspice_rs::analysis::newton::StepLimiting;
-use ngspice_rs::analysis::{AnalysisRequest, Plot, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisInput, Plot, RunConfig};
 use ngspice_rs::devices::limiting::{critical_voltage, fetlim, limvds, pnjlim};
 use ngspice_rs::devices::{Circuit, ModelContext};
 use ngspice_rs::maths::Vector;
@@ -48,14 +48,18 @@ fn parse(body: &str) -> Netlist {
         .unwrap()
 }
 
-fn request(arguments: &[&str]) -> AnalysisRequest {
-    AnalysisRequest::with_arguments(AnalysisKind::OperatingPoint, arguments.iter().copied())
+fn request(arguments: &[&str]) -> AnalysisInput {
+    AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, arguments.iter().copied())
+}
+
+fn resolved_dc(input: AnalysisInput) -> SpiceResult<DcSettings> {
+    input.resolve().map(|plan| plan.dc_settings().clone())
 }
 
 /// A DC solve of `body` with request `arguments`, and its report.
 fn solve(body: &str, arguments: &[&str]) -> (SpiceResult<Vector>, DcReport) {
     let circuit = Circuit::from_netlist(&parse(body)).unwrap();
-    let settings = DcSettings::from_request(&request(arguments)).unwrap();
+    let settings = resolved_dc(request(arguments)).unwrap();
     match solve_dc_with(
         &circuit,
         &ModelContext::default(),
@@ -74,11 +78,8 @@ fn operating_point(body: &str) -> Plot {
     let netlist = parse(body);
     let config = RunConfig::from_netlist(&netlist).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    let request = config.request(request(&[])).unwrap();
-    runner(AnalysisKind::OperatingPoint)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap()
+    let request = config.plan(request(&[])).unwrap();
+    request.run(&mut circuit, &config.context()).unwrap()
 }
 
 fn value(plot: &Plot, name: &str) -> f64 {
@@ -200,7 +201,7 @@ fn the_modeinitjct_load_is_never_a_converged_load() {
     let circuit = Circuit::from_netlist(&parse(HARD_DIODE)).unwrap();
     let context = ModelContext::default();
     let direct = |arguments: &[&str]| {
-        let mut settings = DcSettings::from_request(&request(arguments)).unwrap();
+        let mut settings = resolved_dc(request(arguments)).unwrap();
         settings.continuation = ngspice_rs::analysis::bias::ContinuationPolicy::disabled();
         settings
     };
@@ -342,11 +343,8 @@ fn exhausted_continuation_names_the_unported_optran_fallback() {
     ));
     let config = RunConfig::from_netlist(&netlist).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    let request = config.request(request(&[])).unwrap();
-    let error = runner(AnalysisKind::OperatingPoint)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap_err();
+    let request = config.plan(request(&[])).unwrap();
+    let error = request.run(&mut circuit, &config.context()).unwrap_err();
     assert!(error.to_string().contains("optran.c"), "{error}");
 }
 
@@ -356,14 +354,11 @@ fn noopiter_is_a_flag_and_the_limiting_key_is_validated() {
     assert!(RunConfig::from_netlist(&netlist).unwrap().dc().noopiter);
     assert!(RunConfig::from_netlist(&parse(&format!("{LATCH}\n.options noopiter=1"))).is_err());
     assert_eq!(
-        DcSettings::from_request(&request(&[]))
-            .unwrap()
-            .newton
-            .limiting,
+        resolved_dc(request(&[])).unwrap().newton.limiting,
         StepLimiting::Device
     );
-    assert!(DcSettings::from_request(&request(&["limiting=sometimes"])).is_err());
-    assert!(DcSettings::from_request(&request(&["noopiter=2"])).is_err());
+    assert!(resolved_dc(request(&["limiting=sometimes"])).is_err());
+    assert!(resolved_dc(request(&["noopiter=2"])).is_err());
 }
 
 /// The benchmark diode chain (`scripts/bench/bench.py`, `diode_chain`): `n`

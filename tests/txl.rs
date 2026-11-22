@@ -10,7 +10,7 @@
 //! `m10_txl3_tran`; the assertions here state that agreement, including the
 //! two-branch-current naming C's rawfile uses (`i(y1)` twice) and C's
 //! `CKTmaxStep = 0.9*taul` clamp.
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RunConfig};
 use ngspice_rs::devices::Circuit;
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -27,11 +27,9 @@ fn circuit(body: &str) -> Result<Circuit, SpiceError> {
     Circuit::from_netlist(&deck(body)?)
 }
 fn attempt(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> SpiceResult<Plot> {
-    runner(kind).unwrap().run(
-        c,
-        &AnalysisRequest::with_arguments(kind, arguments.iter().copied()),
-        &AnalysisContext::default(),
-    )
+    AnalysisInput::with_arguments(kind, arguments.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
 }
 fn run(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> Plot {
     attempt(c, kind, arguments).unwrap()
@@ -42,11 +40,11 @@ fn run(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> Plot {
 fn run_with_options(body: &str, kind: AnalysisKind, arguments: &[&str]) -> Plot {
     let netlist = deck(body).unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = AnalysisRequest::with_arguments(kind, arguments.iter().copied());
+    let request = AnalysisInput::with_arguments(kind, arguments.iter().copied());
     let mut circuit = config.circuit(&netlist).unwrap();
-    runner(kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
+    request
+        .resolve()
+        .and_then(|plan| plan.run(&mut circuit, &config.context()))
         .unwrap()
 }
 fn value(plot: &Plot, name: &str, point: usize) -> f64 {
@@ -560,11 +558,11 @@ fn invalid_domains_overflow_and_uic_are_explicit_errors() {
         assert!(error.to_string().contains("admittance/delay"), "{error}");
     }
     let mut c = circuit(PADE).unwrap();
-    let mut request = AnalysisRequest::with_arguments(AnalysisKind::Transient, ["1n", "10n"]);
+    let mut request = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1n", "10n"]);
     request.uic = true;
-    let error = runner(AnalysisKind::Transient)
-        .unwrap()
-        .run(&mut c, &request, &AnalysisContext::default())
+    let error = request
+        .resolve()
+        .and_then(|plan| plan.run(&mut c, &AnalysisContext::default()))
         .unwrap_err();
     assert!(error.is_not_yet_ported(), "{error}");
     assert!(error.to_string().contains("uic"), "{error}");

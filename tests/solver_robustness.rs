@@ -7,7 +7,7 @@
 //! fallback (`OPtran`, `optran.c`), which the port has not ported, the port
 //! fails explicitly instead; those cases only check the singular unknown.
 
-use ngspice_rs::analysis::{Plot, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::SpiceError;
@@ -21,9 +21,9 @@ fn simulate(body: &str) -> Result<Plot, SpiceError> {
         ))
         .unwrap_or_else(|error| panic!("{error}\n{body}"));
     let c = RunConfig::from_netlist(&n)?;
-    let request = c.request_for(&n.analyses[0])?;
+    let request = c.plan_for(&n.analyses[0])?;
     let mut circuit = c.circuit(&n)?;
-    runner(request.kind)?.run(&mut circuit, &request, &c.context())
+    request.run(&mut circuit, &c.context())
 }
 
 fn value(plot: &Plot, name: &str) -> f64 {

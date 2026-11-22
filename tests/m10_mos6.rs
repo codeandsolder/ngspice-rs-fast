@@ -4,7 +4,7 @@
 //! internal node names and the explicit refusals (C's level 6 has no AC,
 //! pole-zero, noise, distortion or sensitivity routines). C-golden
 //! comparisons (`m10_mos6_*`) live in `xtask golden verify`.
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RunConfig};
 use ngspice_rs::devices::{AnalysisMode, Circuit, LoadRequest, ModelContext};
 use ngspice_rs::maths::{SparseMatrix, Vector};
 use ngspice_rs::netlist::Parser;
@@ -31,13 +31,9 @@ fn circuit(body: &str) -> Circuit {
     Circuit::from_netlist(&deck(body)).unwrap()
 }
 fn op(c: &mut Circuit) -> Plot {
-    runner(AnalysisKind::OperatingPoint)
-        .unwrap()
-        .run(
-            c,
-            &AnalysisRequest::with_arguments(AnalysisKind::OperatingPoint, [""; 0]),
-            &AnalysisContext::default(),
-        )
+    AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, [""; 0])
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
         .unwrap()
 }
 fn drain_current(body: &str) -> f64 {
@@ -90,9 +86,9 @@ fn run(body: &str) -> SpiceResult<Vec<Plot>> {
         &format!("M10\n{body}\n.end\n"),
     ))?;
     let config = RunConfig::from_netlist(&netlist)?;
-    let request = config.request_for(&netlist.analyses[0])?;
+    let request = config.plan_for(&netlist.analyses[0])?;
     let mut circuit = config.circuit(&netlist)?;
-    runner(request.kind)?.run_plots(&mut circuit, &request, &config.context())
+    request.run_plots(&mut circuit, &config.context())
 }
 
 /// `mos6load.c`'s drain current in the normalized frame for the

@@ -1,11 +1,11 @@
 //! `.noise` (GitHub #100) through production APIs: parsed decks, `RunConfig`,
-//! `runner` and `Analysis::run_plots`. Accuracy is judged against closed-form
+//! `AnalysisPlan::run_plots`. Accuracy is judged against closed-form
 //! thermal, flicker and shot noise; the committed C goldens are verified by
 //! `cargo xtask golden verify` and the opt-in live-C comparison is
 //! `c_noise_reference.rs`.
 use std::path::Path;
 
-use ngspice_rs::analysis::{Plot, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, RunConfig};
 use ngspice_rs::devices::noise::{BOLTZMANN, CHARGE};
 use ngspice_rs::devices::{Circuit, Device, LinearContext, StampContext};
 use ngspice_rs::netlist::Parser;
@@ -24,9 +24,9 @@ fn parse(deck: &str) -> ngspice_rs::netlist::ast::Netlist {
 fn run_at(deck: &str, index: usize) -> SpiceResult<Vec<Plot>> {
     let netlist = parse(deck);
     let config = RunConfig::from_netlist(&netlist)?;
-    let request = config.request_for(&netlist.analyses[index])?;
+    let request = config.plan_for(&netlist.analyses[index])?;
     let mut circuit = config.circuit(&netlist)?;
-    runner(request.kind)?.run_plots(&mut circuit, &request, &config.context())
+    request.run_plots(&mut circuit, &config.context())
 }
 
 fn run(deck: &str) -> Vec<Plot> {
@@ -371,7 +371,7 @@ impl Device for Unported {
 fn devices_without_a_noise_port_are_refused() {
     let netlist = parse(&format!("{DIVIDER}.noise v(out) v1 dec 1 1 10\n.end\n"));
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit: Circuit = config.circuit(&netlist).unwrap();
     let out = circuit.nodes().get("out").unwrap();
     circuit
@@ -379,9 +379,8 @@ fn devices_without_a_noise_port_are_refused() {
             terminals: [out, NodeId::GROUND],
         }))
         .unwrap();
-    let error = runner(request.kind)
-        .unwrap()
-        .run_plots(&mut circuit, &request, &config.context())
+    let error = request
+        .run_plots(&mut circuit, &config.context())
         .unwrap_err();
     assert!(error.is_not_yet_ported(), "{error}");
     assert!(error.to_string().contains("x1"), "{error}");

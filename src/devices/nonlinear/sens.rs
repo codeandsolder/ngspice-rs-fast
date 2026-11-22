@@ -342,7 +342,7 @@ impl SensitivityKernel for DiodeSensitivity<'_> {
         model: &mut SensitivityRecord,
         instance: &mut SensitivityRecord,
     ) -> SpiceResult<()> {
-        for parameter in super::MODEL.parameters {
+        for parameter in super::MODEL.parameters() {
             if let Some(value) = parameter.default {
                 default(model, record_key(parameter.name), value)?;
             }

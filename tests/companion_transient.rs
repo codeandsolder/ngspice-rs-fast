@@ -8,7 +8,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use ngspice_rs::analysis::{
-    AnalysisContext, AnalysisRequest, Plot, RunConfig, TransientStats, companion_transient, runner,
+    AnalysisContext, AnalysisInput, Plot, RunConfig, TransientStats, companion_transient,
 };
 use ngspice_rs::devices::{
     AcceptContext, AnalysisMode, Circuit, Device, IndependentSource, LinearContext, StampContext,
@@ -48,11 +48,13 @@ fn step_at(c: &mut Circuit, time: f64) {
         .unwrap(),
     );
 }
-fn request(args: &[&str]) -> AnalysisRequest {
-    AnalysisRequest::with_arguments(AnalysisKind::Transient, args.iter().copied())
+fn request(args: &[&str]) -> AnalysisInput {
+    AnalysisInput::with_arguments(AnalysisKind::Transient, args.iter().copied())
 }
 fn run(c: &mut Circuit, args: &[&str]) -> SpiceResult<(Plot, TransientStats)> {
-    companion_transient(c, &request(args), &AnalysisContext::default())
+    request(args)
+        .resolve()
+        .and_then(|plan| companion_transient(c, &plan, &AnalysisContext::default()))
 }
 fn times(p: &Plot) -> Vec<f64> {
     (0..p.point_count())
@@ -244,13 +246,13 @@ fn parsed_rc_transient_fixture_runs_through_an_ordinary_tran() {
         .unwrap();
     // No backend=, method= or tolerance: the card alone selects the driver.
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
-    assert!(request.named("backend").is_none() && request.named("method").is_none());
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
+    assert_eq!(
+        request.transient().unwrap().method(),
+        ngspice_rs::maths::integrator::IntegrationMethod::Trapezoidal
+    );
     let mut c = config.circuit(&netlist).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut c, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut c, &config.context()).unwrap();
     let ts = times(&plot);
     assert_eq!(ts[0], 0.);
     // `5u` parses to 4.9999999999999996e-6; the run ends exactly on it.
@@ -289,11 +291,9 @@ fn backend_and_method_dispatch_is_explicit() {
         let mut c = circuit(body);
         let mut args = base.to_vec();
         args.extend(extra);
-        runner(AnalysisKind::Transient).unwrap().run(
-            &mut c,
-            &request(&args),
-            &AnalysisContext::default(),
-        )
+        request(&args)
+            .resolve()
+            .and_then(|plan| plan.run(&mut c, &AnalysisContext::default()))
     };
     // Ordinary .tran defaults to the companion backend and trapezoidal rule.
     let default = ok(&[]).unwrap();
@@ -357,7 +357,10 @@ fn backend_and_method_dispatch_is_explicit() {
     ] {
         let mut c = circuit(body);
         assert!(
-            companion_transient(&mut c, &request(args), &AnalysisContext::default()).is_err(),
+            request(args)
+                .resolve()
+                .and_then(|plan| companion_transient(&mut c, &plan, &AnalysisContext::default()))
+                .is_err(),
             "{args:?}"
         );
     }
@@ -504,7 +507,7 @@ fn deck_options_reach_the_companion_driver() {
     let run_deck = |options: &str| {
         let n = deck(options);
         let config = RunConfig::from_netlist(&n).unwrap();
-        let request = config.request_for(&n.analyses[0]).unwrap();
+        let request = config.plan_for(&n.analyses[0]).unwrap();
         let mut c = config.circuit(&n).unwrap();
         companion_transient(&mut c, &request, &config.context()).unwrap()
     };

@@ -10,7 +10,7 @@ use ngspice_rs::analysis::bias::{
     Stepping, solve_dc, solve_dc_with,
 };
 use ngspice_rs::analysis::newton::{NewtonOptions, StepLimiting};
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RunConfig};
 use ngspice_rs::devices::{
     AnalysisMode, Circuit, Forcing, Limit, LoadRequest, ModelContext, TransientTiming,
 };
@@ -268,8 +268,8 @@ fn run_ac(options: &str, explicit: &[&str]) -> SpiceResult<Plot> {
     let mut c = config.circuit(&netlist)?;
     let mut arguments = vec!["lin", "1", "1k", "1k"];
     arguments.extend(explicit);
-    let request = config.request(AnalysisRequest::with_arguments(AnalysisKind::Ac, arguments))?;
-    runner(AnalysisKind::Ac)?.run(&mut c, &request, &config.context())
+    let request = config.plan(AnalysisInput::with_arguments(AnalysisKind::Ac, arguments))?;
+    request.run(&mut c, &config.context())
 }
 
 #[test]
@@ -1002,8 +1002,12 @@ fn continuation_never_accepts_state_or_edits_sources_on_success_or_failure() {
     assert!(solve_dc_with(&c, &context, &DcSettings::default(), &[], Some(&seed), None).is_err());
 }
 
-fn request(arguments: &[&str]) -> AnalysisRequest {
-    AnalysisRequest::with_arguments(AnalysisKind::OperatingPoint, arguments.iter().copied())
+fn request(arguments: &[&str]) -> AnalysisInput {
+    AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, arguments.iter().copied())
+}
+
+fn resolved_dc(input: AnalysisInput) -> SpiceResult<DcSettings> {
+    input.resolve().map(|plan| plan.dc_settings().clone())
 }
 
 #[test]
@@ -1030,7 +1034,7 @@ fn ngspice_maximum_gmin_steps_include_both_ladder_endpoints() {
 
 #[test]
 fn request_arguments_resolve_and_invalid_ones_fail() {
-    let resolved = DcSettings::from_request(&request(&[
+    let resolved = resolved_dc(request(&[
         "continuation=ladder",
         "maxiter=4",
         "RTOL=1e-6",
@@ -1047,7 +1051,7 @@ fn request_arguments_resolve_and_invalid_ones_fail() {
         close(*got, want, 1e-14, 0.);
     }
     assert_eq!(source.unwrap().scales(), [0., 0.2, 0.4, 0.6, 0.8, 1.]);
-    let off = DcSettings::from_request(&request(&[
+    let off = resolved_dc(request(&[
         "srcsteps=0",
         "gminsteps=0",
         "continuation=LADDER",
@@ -1055,7 +1059,7 @@ fn request_arguments_resolve_and_invalid_ones_fail() {
     .unwrap();
     assert_eq!(off.continuation, ContinuationPolicy::disabled());
     // The default ngspice schedule takes C's counts.
-    let ngspice = DcSettings::from_request(&request(&[
+    let ngspice = resolved_dc(request(&[
         "srcsteps=0",
         "gminsteps=3",
         "gminfactor=100",
@@ -1068,12 +1072,9 @@ fn request_arguments_resolve_and_invalid_ones_fail() {
         ContinuationSchedule::Ngspice(NgspiceStepping::new(3, 0, 100., 60).unwrap())
     );
     assert!(ngspice.continuation.skip_direct);
-    assert_eq!(
-        DcSettings::from_request(&request(&[])).unwrap(),
-        DcSettings::default()
-    );
-    // Positional arguments are not options.
-    assert!(DcSettings::from_request(&request(&["lin", "1"])).is_ok());
+    assert_eq!(resolved_dc(request(&[])).unwrap(), DcSettings::default());
+    // A complete .op plan validates positional arguments too.
+    assert!(resolved_dc(request(&["lin", "1"])).is_err());
     for bad in [
         "srcsteps=1.5",
         "srcsteps=-1",
@@ -1090,7 +1091,7 @@ fn request_arguments_resolve_and_invalid_ones_fail() {
         "maxiter=10001",
         "bogus=1",
     ] {
-        assert!(DcSettings::from_request(&request(&[bad])).is_err(), "{bad}");
+        assert!(resolved_dc(request(&[bad])).is_err(), "{bad}");
     }
     for duplicate in [
         ["srcsteps=1", "SRCSTEPS=2"],
@@ -1098,14 +1099,11 @@ fn request_arguments_resolve_and_invalid_ones_fail() {
         ["gminfactor=2", "gminfactor=3"],
         ["maxiter=1", "maxiter=2"],
     ] {
-        assert!(
-            DcSettings::from_request(&request(&duplicate)).is_err(),
-            "{duplicate:?}"
-        );
+        assert!(resolved_dc(request(&duplicate)).is_err(), "{duplicate:?}");
     }
     // A factor/steps pair whose ladder underflows is invalid as a whole.
     assert!(
-        DcSettings::from_request(&request(&[
+        resolved_dc(request(&[
             "gminfactor=1e6",
             "gminsteps=100",
             "continuation=ladder"
@@ -1114,7 +1112,7 @@ fn request_arguments_resolve_and_invalid_ones_fail() {
     );
     // ngspice's spice3_gmin ladder starts at gmin * factor^steps, so it is
     // checked against the circuit's junction gmin when the solve starts.
-    let overflowing = DcSettings::from_request(&request(&["gminfactor=1e6", "gminsteps=100"]));
+    let overflowing = resolved_dc(request(&["gminfactor=1e6", "gminsteps=100"]));
     let failure = solve_dc_with(
         &circuit(DIFFICULT),
         &ModelContext::default(),
@@ -1132,28 +1130,34 @@ fn request_arguments_resolve_and_invalid_ones_fail() {
         "noopiter=2",
         "noopiter=0.5",
     ] {
-        assert!(DcSettings::from_request(&request(&[bad])).is_err(), "{bad}");
+        assert!(resolved_dc(request(&[bad])).is_err(), "{bad}");
     }
-    assert!(DcSettings::from_request(&request(&["continuation=ladder", "adaptiter=50"])).is_err());
-    // Newton-only resolution refuses (instead of silently dropping) continuation names.
-    let error = NewtonOptions::from_request(&request(&["srcsteps=3"])).unwrap_err();
-    assert!(matches!(error, SpiceError::Unsupported { .. }), "{error}");
-    assert!(NewtonOptions::from_request(&request(&["maxiter=7"])).is_ok());
+    assert!(resolved_dc(request(&["continuation=ladder", "adaptiter=50"])).is_err());
+    // The single resolver accepts both Newton and continuation options together.
+    let resolved = resolved_dc(request(&["srcsteps=3", "maxiter=7"])).unwrap();
+    assert_eq!(resolved.newton.max_iterations, 7);
+    assert_eq!(
+        resolved.continuation.schedule,
+        ContinuationSchedule::Ngspice(NgspiceStepping::new(1, 3, 10., 50).unwrap(),)
+    );
 }
 
 fn run_op(options: &str, explicit: &[&str]) -> SpiceResult<Plot> {
     let netlist = parse(&format!("{DIFFICULT}\n{options}"));
     let config = RunConfig::from_netlist(&netlist)?;
     let mut c = config.circuit(&netlist)?;
-    let request = config.request(request(explicit))?;
-    runner(AnalysisKind::OperatingPoint)?.run(&mut c, &request, &config.context())
+    let request = config.plan(request(explicit))?;
+    request.run(&mut c, &config.context())
 }
 
 #[test]
 fn deck_options_resolve_with_last_set_wins_and_request_precedence() {
     // Defaults: nothing is added to a request.
     let plain = RunConfig::default();
-    assert_eq!(plain.request(request(&[])).unwrap(), request(&[]));
+    assert_eq!(
+        plain.plan(request(&[])).unwrap(),
+        request(&[]).resolve().unwrap()
+    );
     let ok = |plot: SpiceResult<Plot>| plot.unwrap().value("v(a)", 0).unwrap().re;
 
     // A four-iteration budget (request `maxiter=4`; a deck `itl1` below 100 is
@@ -1212,12 +1216,13 @@ fn deck_options_resolve_with_last_set_wins_and_request_precedence() {
     );
     let merged = RunConfig::from_netlist(&parse(&format!("{DIFFICULT}\n{deck} gminfactor=5")))
         .unwrap()
-        .request(request(&["srcsteps=20", "MAXITER=9"]))
+        .plan(request(&["srcsteps=20", "MAXITER=9"]))
         .unwrap();
-    assert_eq!(merged.named("srcsteps"), Some("20"));
-    assert_eq!(merged.named("maxiter"), Some("9"));
-    assert_eq!(merged.named("gminsteps"), Some("0"));
-    assert_eq!(merged.named("gminfactor"), Some("5e0"));
+    assert_eq!(merged.dc_settings().newton.max_iterations, 9);
+    assert_eq!(
+        merged.dc_settings().continuation.schedule,
+        ContinuationSchedule::Ngspice(NgspiceStepping::new(0, 20, 5.0, 50).unwrap(),)
+    );
     // A request-only configuration (no deck) works the same way.
     assert!(
         run_op(
@@ -1300,30 +1305,25 @@ fn companion_transient_reads_dc_options() {
     // dctran.c computes the initial bias with CKTop(CKTdcMaxIter): the companion
     // driver receives the same settings as .op.
     let tran = config
-        .request(AnalysisRequest::with_arguments(
+        .plan(AnalysisInput::with_arguments(
             AnalysisKind::Transient,
             ["1u", "10u"],
         ))
         .unwrap();
-    assert_eq!(tran.named("maxiter"), Some("100"));
-    assert_eq!(tran.named("srcsteps"), Some("4"));
-    assert_eq!(tran.named("gminsteps"), Some("3"));
-    assert_eq!(tran.named("gminfactor"), Some("2e1"));
+    assert_eq!(tran.dc_settings().newton.max_iterations, 100);
+    assert_eq!(
+        tran.dc_settings().continuation.schedule,
+        ContinuationSchedule::Ngspice(NgspiceStepping::new(3, 4, 20.0, 50).unwrap(),)
+    );
     let mut c = circuit("v1 a 0 1\nr1 a 0 1k");
-    runner(AnalysisKind::Transient)
-        .unwrap()
-        .run(&mut c, &tran, &AnalysisContext::default())
-        .unwrap();
+    tran.run(&mut c, &AnalysisContext::default()).unwrap();
     // DC analyses accept them; invalid explicit .tran bias settings fail.
-    assert!(config.request(request(&[])).is_ok());
-    let error = runner(AnalysisKind::Transient)
-        .unwrap()
-        .run(
-            &mut c,
-            &AnalysisRequest::with_arguments(AnalysisKind::Transient, ["1u", "10u", "srcsteps=-5"]),
-            &AnalysisContext::default(),
-        )
-        .unwrap_err();
+    assert!(config.plan(request(&[])).is_ok());
+    let error =
+        AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "10u", "srcsteps=-5"])
+            .resolve()
+            .and_then(|plan| plan.run(&mut c, &AnalysisContext::default()))
+            .unwrap_err();
     assert!(error.to_string().contains("srcsteps"), "{error}");
 }
 
@@ -1333,11 +1333,9 @@ fn ac_bias_uses_the_configured_continuation() {
         let mut c = circuit("i1 0 a dc 1m ac 1\nd1 a 0 dm\n.model dm d(is=1m)");
         let mut arguments = vec!["lin", "1", "1k", "1k"];
         arguments.extend(extra);
-        runner(AnalysisKind::Ac).unwrap().run(
-            &mut c,
-            &AnalysisRequest::with_arguments(AnalysisKind::Ac, arguments),
-            &AnalysisContext::default(),
-        )
+        AnalysisInput::with_arguments(AnalysisKind::Ac, arguments)
+            .resolve()
+            .and_then(|plan| plan.run(&mut c, &AnalysisContext::default()))
     };
     let solved = ac(&["maxiter=4", "limiting=global", "gminsteps=0"]).unwrap();
     let conductance = 1e-3 / VT;

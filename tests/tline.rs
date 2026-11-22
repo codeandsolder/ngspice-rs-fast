@@ -3,7 +3,7 @@
 //! line theory (never against another simulator's step sequence).
 use std::path::Path;
 
-use ngspice_rs::analysis::{Plot, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, RunConfig};
 use ngspice_rs::devices::{Circuit, ModelContext};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -19,9 +19,9 @@ fn netlist(body: &str) -> Result<ngspice_rs::netlist::ast::Netlist, SpiceError> 
 fn simulate(body: &str) -> Result<Plot, SpiceError> {
     let netlist = netlist(body)?;
     let config = RunConfig::from_netlist(&netlist)?;
-    let request = config.request_for(&netlist.analyses[0])?;
+    let request = config.plan_for(&netlist.analyses[0])?;
     let mut circuit = config.circuit(&netlist)?;
-    runner(request.kind)?.run(&mut circuit, &request, &config.context())
+    request.run(&mut circuit, &config.context())
 }
 
 fn real(plot: &Plot, name: &str) -> Vec<f64> {

@@ -40,7 +40,7 @@
 use crate::analysis::frequency::{Advance, FrequencyGrid};
 use crate::analysis::linear::{number, plot, unsupported};
 use crate::analysis::results::Plot;
-use crate::analysis::{AnalysisContext, AnalysisRequest};
+use crate::analysis::{AnalysisContext, AnalysisPlan};
 use crate::devices::distortion::{
     CircuitDistortion, DistortionInput, Kernels, Product, add_products, circuit_distortion,
 };
@@ -50,7 +50,6 @@ use crate::primitives::{Complex, Real, SpiceError, SpiceResult, parse_spice_numb
 
 /// C's default `CKTreltol`, the frequency-loop tolerance without `.option
 /// reltol`.
-const DEFAULT_RELTOL: Real = 1e-3;
 /// The harmonic plot titles (`distoan.c`).
 pub const HARMONIC_PLOTNAMES: [&str; 2] =
     ["DISTORTION - 2nd harmonic", "DISTORTION - 3rd harmonic"];
@@ -71,7 +70,7 @@ enum Stepping {
 
 /// A parsed `.disto` card.
 #[derive(Debug, Clone, PartialEq)]
-struct DistoCard {
+pub(super) struct DistoCard {
     stepping: Stepping,
     steps: u32,
     start: Real,
@@ -79,23 +78,9 @@ struct DistoCard {
     f2_over_f1: Option<Real>,
 }
 
-fn positional(arguments: &[String]) -> Vec<&str> {
-    arguments
-        .iter()
-        .filter(|argument| !argument.contains('='))
-        .map(String::as_str)
-        .collect()
-}
-
-/// How many plots a `.disto` card produces: two harmonic plots, or three
-/// intermodulation plots when the card gives `f2overf1`. Used by the batch
-/// scheduler to name the plots before anything runs.
-#[must_use]
-pub fn plot_count(arguments: &[String]) -> usize {
-    if positional(arguments).len() >= 5 {
-        3
-    } else {
-        2
+impl DistoCard {
+    pub(super) const fn plot_count(&self) -> usize {
+        if self.f2_over_f1.is_some() { 3 } else { 2 }
     }
 }
 
@@ -108,9 +93,9 @@ fn integer(text: &str) -> SpiceResult<i64> {
         .ok_or_else(|| unsupported(".disto point count is out of range"))
 }
 
-fn parse(request: &AnalysisRequest) -> SpiceResult<DistoCard> {
+pub(super) fn parse(arguments: &[String]) -> SpiceResult<DistoCard> {
     let syntax = || unsupported(".disto needs {dec|oct|lin} pts fstart fstop [f2overf1]");
-    let args = positional(&request.arguments);
+    let args: Vec<_> = arguments.iter().map(String::as_str).collect();
     if !(4..=5).contains(&args.len()) {
         return Err(syntax());
     }
@@ -160,7 +145,7 @@ fn parse(request: &AnalysisRequest) -> SpiceResult<DistoCard> {
 }
 
 /// `distoan.c`'s frequency sweep.
-fn frequencies(card: &DistoCard, reltol: Real) -> SpiceResult<Vec<Real>> {
+pub(super) fn frequencies(card: &DistoCard, reltol: Real) -> SpiceResult<Vec<Real>> {
     let n = Real::from(card.steps);
     let (delta, tolerance) = match card.stepping {
         Stepping::Decade => {
@@ -351,20 +336,16 @@ fn output_plots(circuit: &Circuit, intermodulation: bool) -> SpiceResult<Vec<Plo
 
 /// Runs `.disto` and returns its plots: the 2nd and 3rd harmonics, or the
 /// three intermodulation products with `f2overf1`.
-pub(crate) fn run(
+pub(super) fn run(
     circuit: &mut Circuit,
-    request: &AnalysisRequest,
+    request: &AnalysisPlan,
     context: &AnalysisContext,
+    card: &DistoCard,
+    grid: &[Real],
     include_bias: bool,
 ) -> SpiceResult<Vec<Plot>> {
-    let settings = crate::analysis::bias::DcSettings::from_request(request)?;
-    let reltol = match request.named("rtol") {
-        Some(text) => number(Some(text), "rtol")?,
-        None => DEFAULT_RELTOL,
-    };
+    let settings = request.dc_settings().clone();
     circuit.finalize()?;
-    let card = parse(request)?;
-    let grid = frequencies(&card, reltol)?;
     let small = crate::analysis::ac::SmallSignal::prepare(circuit, request, context, settings)?;
     let mut retained = small.retained_bias(circuit, request, context, include_bias)?;
     if small.varies() {
@@ -407,7 +388,7 @@ pub(crate) fn run(
         )?;
         solve_at(circuit, system, omega, &rhs)
     };
-    for freq in grid {
+    for &freq in grid {
         let omega1 = two_pi * freq;
         let h1 = solve_at(circuit, system, omega1, &rhs_f1)?;
         let base = Kernels {
@@ -443,7 +424,7 @@ pub(crate) fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{DistoCard, Stepping, frequencies, plot_count};
+    use super::{DistoCard, Stepping, frequencies};
 
     fn args(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_owned).collect()
@@ -451,6 +432,14 @@ mod tests {
 
     #[test]
     fn plot_count_follows_f2overf1() {
+        use crate::analysis::AnalysisInput;
+        use crate::primitives::AnalysisKind;
+        let plot_count = |arguments: &[String]| {
+            AnalysisInput::with_arguments(AnalysisKind::Distortion, arguments.iter().cloned())
+                .resolve()
+                .unwrap()
+                .plot_count()
+        };
         assert_eq!(plot_count(&args("dec 10 1k 100k")), 2);
         assert_eq!(plot_count(&args("dec 10 1k 100k 0.9")), 3);
         assert_eq!(plot_count(&args("dec 10 1k 100k rtol=1e-3")), 2);

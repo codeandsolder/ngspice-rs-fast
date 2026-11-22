@@ -532,98 +532,6 @@ impl DcSettings {
     pub fn validate(&self) -> SpiceResult<()> {
         self.newton.validate()
     }
-
-    /// Resolve named request arguments over the defaults: `rtol`, `vntol`,
-    /// `abstol`, `maxiter`, `limiting` (see [`NewtonOptions::from_request`])
-    /// plus the continuation keys: `continuation=ngspice|ladder` (default
-    /// `ngspice`), `srcsteps`, `gminsteps`, `gminfactor` (C's meaning under
-    /// `ngspice`, see [`NgspiceStepping`]; the ladder meaning under `ladder`:
-    /// `srcsteps` equal increments, `gminsteps` decade-ratio stages from 1e-3
-    /// S), `stagemaxiter`, `adaptiter` (ngspice only) and `noopiter` (`0` or
-    /// `1`). Unknown, duplicate, nonfinite and out-of-range values fail.
-    ///
-    /// # Errors
-    /// Invalid, duplicate or unimplemented arguments.
-    pub fn from_request(request: &crate::analysis::AnalysisRequest) -> SpiceResult<Self> {
-        let mut forwarded = Vec::new();
-        let (mut source, mut gmin_steps, mut gmin_factor) = (None, None, None);
-        let (mut stage_limit, mut adapt, mut skip_direct, mut ladder) = (None, None, false, false);
-        let mut seen = std::collections::BTreeSet::new();
-        for argument in &request.arguments {
-            let Some((key, text)) = argument.split_once('=') else {
-                continue;
-            };
-            let key = key.trim().to_ascii_lowercase();
-            if !newton::CONTINUATION_KEYS.contains(&key.as_str()) {
-                forwarded.push(argument.clone());
-                continue;
-            }
-            if !seen.insert(key.clone()) {
-                return Err(invalid(format!("duplicate continuation option {key}")));
-            }
-            if key == newton::SCHEDULE_KEY {
-                ladder = match text.trim().to_ascii_lowercase().as_str() {
-                    "ngspice" => false,
-                    "ladder" => true,
-                    other => {
-                        return Err(invalid(format!(
-                            "{key} must be 'ngspice' or 'ladder', not '{other}'"
-                        )));
-                    }
-                };
-                continue;
-            }
-            let value = crate::primitives::parse_spice_number(text.trim())
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| invalid(format!("nonfinite/nonliteral option {key}")))?;
-            if key == "gminfactor" {
-                gmin_factor = Some(value);
-                continue;
-            }
-            let (lowest, limit) = match key.as_str() {
-                "srcsteps" => (0, MAX_SOURCE_STEPS),
-                newton::STAGE_ITERATIONS_KEY | newton::ADAPT_ITERATIONS_KEY => {
-                    (1, newton::MAX_ITERATIONS)
-                }
-                newton::SKIP_DIRECT_KEY => (0, 1),
-                _ => (0, MAX_GMIN_STAGES),
-            };
-            let count = crate::primitives::exact_nonnegative_integer::<usize>(value)
-                .filter(|n| (lowest..=limit).contains(n))
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "option {key} must be an integer in {lowest}..={limit}, not {text}"
-                    ))
-                })?;
-            let count = Some(count);
-            match key.as_str() {
-                newton::STAGE_ITERATIONS_KEY => stage_limit = count,
-                newton::ADAPT_ITERATIONS_KEY => adapt = count,
-                newton::SKIP_DIRECT_KEY => skip_direct = count == Some(1),
-                "srcsteps" => source = count,
-                _ => gmin_steps = count,
-            }
-        }
-        let mut continuation = if ladder {
-            if adapt.is_some() {
-                return Err(invalid(format!(
-                    "{} steers the ngspice schedule only, not continuation=ladder",
-                    newton::ADAPT_ITERATIONS_KEY
-                )));
-            }
-            ContinuationPolicy::from_steps(source, gmin_steps, gmin_factor)?
-        } else {
-            ContinuationPolicy::from_ngspice_steps(source, gmin_steps, gmin_factor, adapt)?
-        };
-        continuation.stage_max_iterations = stage_limit.map(IterationLimit::new).transpose()?;
-        continuation.skip_direct = skip_direct;
-        Ok(Self {
-            newton: NewtonOptions::from_request(
-                &crate::analysis::AnalysisRequest::with_arguments(request.kind, forwarded),
-            )?,
-            continuation,
-        })
-    }
 }
 
 /// How a DC solve was attempted.
@@ -932,7 +840,7 @@ pub(super) struct OperatingPointStart {
 impl OperatingPointStart {
     pub(super) fn resolve(
         circuit: &Circuit,
-        request: &crate::analysis::AnalysisRequest,
+        request: &crate::analysis::AnalysisPlan,
     ) -> SpiceResult<Self> {
         let hints = crate::analysis::initial::resolve(circuit, request)?;
         let nodes = NodeForcing {

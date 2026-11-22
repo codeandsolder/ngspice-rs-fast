@@ -355,8 +355,8 @@ impl MosLevel for Level3 {
     /// `mos3set.c`: `CKTmkVolt(..., "internal#drain")` / `"internal#source"`.
     const PRIME_SUFFIXES: [&'static str; 2] = ["internal#drain", "internal#source"];
 
-    fn model_schema() -> ScalarSchema<'static> {
-        ScalarSchema { parameters: MODEL }
+    fn model_schema() -> &'static ScalarSchema<'static> {
+        &MODEL_SCHEMA
     }
 
     fn from_card<'a>(
@@ -707,6 +707,8 @@ impl MosLevel for Level3 {
         })
     }
 }
+
+static MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(MODEL);
 
 #[cfg(test)]
 mod tests {

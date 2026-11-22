@@ -7,7 +7,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use ngspice_rs::analysis::{
-    AnalysisContext, AnalysisRequest, Plot, TransientStats, companion_transient,
+    AnalysisContext, AnalysisInput, Plot, TransientStats, companion_transient,
 };
 use ngspice_rs::devices::delay::{
     DelayContext, DelayHistory, DelayLine, DelayUpdate, WaveformUpdate,
@@ -153,11 +153,9 @@ fn with_probe(body: &str, request: Option<f64>, squeeze: Option<(f64, f64)>) -> 
 const RC: &str = "v1 a 0 pwl(0 0 1m 1)\nr1 a b 1k\nc1 b 0 1u";
 
 fn run(circuit: &mut Circuit, args: &[&str]) -> SpiceResult<(Plot, TransientStats)> {
-    companion_transient(
-        circuit,
-        &AnalysisRequest::with_arguments(AnalysisKind::Transient, args.iter().copied()),
-        &AnalysisContext::default(),
-    )
+    let plan =
+        AnalysisInput::with_arguments(AnalysisKind::Transient, args.iter().copied()).resolve()?;
+    companion_transient(circuit, &plan, &AnalysisContext::default())
 }
 
 fn times(plot: &Plot) -> Vec<f64> {
@@ -304,21 +302,20 @@ fn backends_without_a_delay_formulation_refuse_delay_lines() {
     // The companion entry point refuses diffsol options; the dispatcher
     // refuses the removed backend for every circuit.
     assert!(error.is_err());
-    let error = ngspice_rs::analysis::runner(AnalysisKind::Transient)
-        .and_then(|driver| {
-            driver.run_plots(
-                &mut circuit,
-                &AnalysisRequest::with_arguments(
-                    AnalysisKind::Transient,
-                    ["10u", "1m", "backend=diffsol", "method=bdf"],
-                ),
-                &AnalysisContext::default(),
-            )
-        })
-        .unwrap_err();
+    let error = AnalysisInput::with_arguments(
+        AnalysisKind::Transient,
+        ["10u", "1m", "backend=diffsol", "method=bdf"],
+    )
+    .resolve()
+    .unwrap_err();
     assert!(error.to_string().contains("backend=diffsol"), "{error}");
-    let mut uic = AnalysisRequest::with_arguments(AnalysisKind::Transient, ["10u", "1m"]);
+    let mut uic = AnalysisInput::with_arguments(AnalysisKind::Transient, ["10u", "1m"]);
     uic.uic = true;
-    let error = companion_transient(&mut circuit, &uic, &AnalysisContext::default()).unwrap_err();
+    let error = companion_transient(
+        &mut circuit,
+        &uic.resolve().unwrap(),
+        &AnalysisContext::default(),
+    )
+    .unwrap_err();
     assert!(error.is_not_yet_ported(), "{error}");
 }

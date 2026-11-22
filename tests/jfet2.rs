@@ -4,7 +4,7 @@
 //! (gate-lag / self-heating) state in transient, observations and explicit
 //! gaps. C-golden comparisons live in `xtask golden verify` (`m10_jfet2_*`)
 //! and `tests/c_jfet2_reference.rs`.
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
 use ngspice_rs::devices::{AnalysisMode, Circuit, LoadRequest, ModelContext};
 use ngspice_rs::maths::{SparseMatrix, Vector};
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -24,11 +24,9 @@ fn circuit(body: &str) -> Result<Circuit, SpiceError> {
     Circuit::from_netlist(&deck(body)?)
 }
 fn run(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> SpiceResult<Plot> {
-    runner(kind).unwrap().run(
-        c,
-        &AnalysisRequest::with_arguments(kind, arguments.iter().copied()),
-        &AnalysisContext::default(),
-    )
+    AnalysisInput::with_arguments(kind, arguments.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
 }
 type SpiceResult<T> = Result<T, SpiceError>;
 fn value(plot: &Plot, name: &str, point: usize) -> f64 {
@@ -404,12 +402,9 @@ fn noise_distortion_sensitivity_and_pole_zero_are_refused_explicitly() {
     // M, TEMP and DTEMP.
     let netlist = deck(&format!("{body}\n.sens v(o)")).unwrap();
     let config = ngspice_rs::analysis::RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut c = config.circuit(&netlist).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut c, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut c, &config.context()).unwrap();
     let names: Vec<&str> = plot
         .variables()
         .iter()

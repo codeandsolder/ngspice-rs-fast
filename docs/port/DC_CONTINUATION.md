@@ -134,11 +134,14 @@ match solve_dc_with(&circuit, &context, &settings, &[], Some(&seed), None) {
 - `ContinuationPolicy::default()` is the ngspice schedule with C's defaults;
   `ContinuationPolicy::ladder()` the fixed ladders; `disabled()` no continuation.
   `skip_direct` is `noopiter`. The schedule carries either validated CKTop modes or a custom `GminSchedule` and optional `SourceStepping`; these cannot be mixed. `IterationBudget::new` and `IterationLimit::new` check optional total and per-stage bounds before a policy is constructed. Fixed source stepping ends with its full-scale stage; a custom source ladder has an additional original-equation solve.
-- `DcSettings::from_request(&AnalysisRequest)` resolves `rtol`, `vntol`,
-  `abstol`, `maxiter`, `limiting`, `continuation`, `srcsteps`, `gminsteps`,
-  `gminfactor`, `stagemaxiter`, `adaptiter` and `noopiter` (`0`/`1`).
-  `NewtonOptions::from_request` *rejects* the continuation names so a
-  Newton-only caller cannot drop them silently.
+- `RunConfig::plan(input)` resolves literal `AnalysisInput` into an immutable
+  `AnalysisPlan`. Explicit values override deck options, which override defaults.
+  `plan.dc_settings()` includes the shared Newton and continuation settings:
+  `rtol`, `vntol`, `abstol`, `maxiter`, `limiting`, `continuation`,
+  `srcsteps`, `gminsteps`, `gminfactor`, `stagemaxiter`, `adaptiter` and
+  `noopiter` (0/1). The raw and effective meanings of ITL2 remain distinct.
+  There is no separate Newton-only argument parser. Programmatic solver clients
+  can construct `DcSettings` directly.
 - `DcFailure` implements `Display`/`Error` and `From<DcFailure> for SpiceError`.
 
 ### Report

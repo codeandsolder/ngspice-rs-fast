@@ -1,6 +1,6 @@
 //! M4 bounded production gate: independent equations, conservation and ownership.
 //! C-golden DC/AC/common-time comparisons live in `xtask golden verify`.
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RunConfig};
 use ngspice_rs::devices::{
     AnalysisMode, Circuit, Forcing, Limit, LoadRequest, ModelContext, TransientTiming,
 };
@@ -25,11 +25,9 @@ fn run(
     kind: AnalysisKind,
     args: &[&str],
 ) -> ngspice_rs::primitives::SpiceResult<Plot> {
-    runner(kind)?.run(
-        c,
-        &AnalysisRequest::with_arguments(kind, args.iter().copied()),
-        &AnalysisContext::default(),
-    )
+    AnalysisInput::with_arguments(kind, args.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
 }
 fn close(a: f64, b: f64, relative: f64, absolute: f64) {
     assert!(
@@ -276,7 +274,9 @@ fn typed_nested_source_and_temperature_sweeps_are_bounded_and_nonmutating() {
     ] {
         let axes = ngspice_rs::analysis::sweep::resolve(
             &named,
-            &AnalysisRequest::with_arguments(AnalysisKind::DcSweep, [name, "0", "1", "0.5"]),
+            &AnalysisInput::with_arguments(AnalysisKind::DcSweep, [name, "0", "1", "0.5"])
+                .resolve()
+                .unwrap(),
             &AnalysisContext::default(),
         )
         .unwrap();
@@ -359,13 +359,10 @@ fn unsupported_physics_and_initialization_are_explicit_not_successful_zero_stamp
         ))
         .unwrap();
     let config = RunConfig::from_netlist(&n).unwrap();
-    let request = config.request_for(&n.analyses[0]).unwrap();
+    let request = config.plan_for(&n.analyses[0]).unwrap();
     // Nonlinear .ic (#99): the transient operating point forces v(a)=0.2
     // against the source, an explicit contradiction (C: a 1e10 compromise).
-    let error = runner(request.kind)
-        .unwrap()
-        .run(&mut c, &request, &config.context())
-        .unwrap_err();
+    let error = request.run(&mut c, &config.context()).unwrap_err();
     assert!(error.to_string().contains(".ic V(a)=0.2"), "{error}");
 }
 #[test]

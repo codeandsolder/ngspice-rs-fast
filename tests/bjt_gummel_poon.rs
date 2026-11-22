@@ -1,7 +1,7 @@
 //! Gummel-Poon BJT (#87): independent equations, Newton/companion Jacobians,
 //! small-signal operators, charge conservation and explicit unported physics.
 //! C-golden comparisons of the `m7_bjt_*` decks live in `xtask golden verify`.
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
 use ngspice_rs::devices::{
     ACCEPTED_DEPTH, AnalysisMode, Circuit, Forcing, Limit, LoadRequest, ModelContext, StateHistory,
     TransientTiming,
@@ -29,13 +29,9 @@ fn circuit(body: &str) -> Circuit {
     Circuit::from_netlist(&netlist(body)).unwrap()
 }
 fn run(c: &mut Circuit, kind: AnalysisKind, args: &[&str]) -> Plot {
-    runner(kind)
-        .unwrap()
-        .run(
-            c,
-            &AnalysisRequest::with_arguments(kind, args.iter().copied()),
-            &AnalysisContext::default(),
-        )
+    AnalysisInput::with_arguments(kind, args.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
         .unwrap()
 }
 fn close(a: f64, b: f64, relative: f64, absolute: f64) {
@@ -465,12 +461,9 @@ fn single_sided_saturation_currents_follow_cs_restore_walk() {
 fn sensitivity(body: &str) -> Plot {
     let netlist = netlist(body);
     let config = ngspice_rs::analysis::RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut c = config.circuit(&netlist).unwrap();
-    runner(request.kind)
-        .unwrap()
-        .run(&mut c, &request, &config.context())
-        .unwrap()
+    request.run(&mut c, &config.context()).unwrap()
 }
 fn column(plot: &Plot, name: &str) -> f64 {
     let index = plot
@@ -516,12 +509,9 @@ fn sensitivity_refuses_a_card_with_a_collector_resistance() {
          .model qn npn level=1 rc=40\n.sens i(vids)",
     );
     let config = ngspice_rs::analysis::RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut c = config.circuit(&netlist).unwrap();
-    let error = runner(request.kind)
-        .unwrap()
-        .run(&mut c, &request, &config.context())
-        .unwrap_err();
+    let error = request.run(&mut c, &config.context()).unwrap_err();
     assert!(error.is_not_yet_ported(), "{error}");
     assert!(error.to_string().contains("RC"), "{error}");
 }
@@ -588,8 +578,14 @@ fn bipolar_and_diode_fixed_stamps_replay_the_unbound_matrix() {
             }
             let integration = (step % 2 != 0).then_some(&coeff);
             let (plain, rhs, state) = load(&c, &x, &history, &context, integration);
-            let (bound, bound_rhs, bound_state) =
-                load_on(&c, &x, &history, &context, integration, c.new_matrix());
+            let (bound, bound_rhs, bound_state) = load_on(
+                &c,
+                &x,
+                &history,
+                &context,
+                integration,
+                c.new_matrix().unwrap(),
+            );
             assert!(bound.bound_values().is_some());
             for r in 0..c.unknown_count() {
                 for col in 0..c.unknown_count() {

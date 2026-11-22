@@ -65,8 +65,9 @@ fn frontend_settings_roundtrip_and_unsupported_commands_fail() {
         .parse_deck(&parse_deck_text(Path::new("settings.cir"), &written))
         .unwrap();
     let config = RunConfig::from_netlist(&reparsed).unwrap();
-    let request = config.request_for(&reparsed.analyses[0]).unwrap();
-    assert!(request.noise.squared && request.noise.spice3);
+    let request = config.plan_for(&reparsed.analyses[0]).unwrap();
+    let noise = request.noise_options().unwrap();
+    assert!(noise.squared && noise.spice3);
     for body in [
         ".control\nresume\n.endc",
         ".control\nset unknown\n.endc",

@@ -94,65 +94,14 @@ use crate::devices::{
     AnalysisMode, BreakTable, Circuit, Forcing, LinearSystem, LoadRequest, SourceBreaks,
     SourceKind, TransientTiming, TrialState,
 };
-use crate::maths::integrator::{DEFAULT_XMU, TruncationTolerances};
+use crate::maths::integrator::TruncationTolerances;
 use crate::maths::{Coefficients, IntegrationMethod, StepHistory, Vector};
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult, almost_equal_ulps};
 
 use crate::analysis::initial::{self, Hints, VoltageTolerance};
 use crate::analysis::linear::{number, plot, unsupported};
 use crate::analysis::newton::{CircuitLoad, CircuitNewton};
-use crate::analysis::{AnalysisContext, AnalysisRequest, Plot, PointSink};
-
-/// C's *effective* default `CKTtranMaxIter` (`.option itl4`): Newton
-/// iterations per timepoint. `cktntask.c` sets 10, but `NIiter()`
-/// (`niiter.c`) raises every limit below 100 to 100, so C iterates up to 100.
-const TRAN_MAX_ITER: usize = 100;
-/// Default whole-run limit on accepted + rejected steps.
-const DEFAULT_MAX_STEPS: usize = 1_000_000;
-/// Largest accepted `maxsteps=`.
-const MAX_STEPS_LIMIT: usize = 10_000_000;
-/// ngspice defaults (`cktntask.c`, `cktsopt.c`).
-const DEFAULT_RELTOL: Real = 1e-3;
-const DEFAULT_VNTOL: Real = 1e-6;
-const DEFAULT_ABSTOL: Real = 1e-12;
-const DEFAULT_CHGTOL: Real = 1e-14;
-const DEFAULT_TRTOL: Real = 7.0;
-/// Request keys the companion backend understands.
-const KEYS: [&str; 20] = [
-    "backend",
-    "method",
-    "maxord",
-    "rtol",
-    "vntol",
-    "abstol",
-    "chgtol",
-    "trtol",
-    "maxsteps",
-    "tranmaxiter",
-    "xmu",
-    "maxiter",
-    "srcsteps",
-    "gminsteps",
-    "gminfactor",
-    "stagemaxiter",
-    "adaptiter",
-    "noopiter",
-    "continuation",
-    "limiting",
-];
-/// Request keys forwarded to the initial-bias DC solve (`limiting` also
-/// selects the step control of every timepoint's Newton solve).
-const BIAS_KEYS: [&str; 9] = [
-    "maxiter",
-    "srcsteps",
-    "gminsteps",
-    "gminfactor",
-    "stagemaxiter",
-    "adaptiter",
-    "noopiter",
-    "continuation",
-    "limiting",
-];
+use crate::analysis::{AnalysisContext, AnalysisPlan, Plot, PointSink};
 
 /// Counters describing one companion transient run.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -183,7 +132,7 @@ struct Tolerances {
 
 /// A validated `.tran` request for the companion backend.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Settings {
+pub struct TransientPlan {
     step: Real,
     stop: Real,
     start: Real,
@@ -198,26 +147,9 @@ struct Settings {
     xmu: Real,
 }
 
-impl Settings {
-    fn time_bounds(request: &AnalysisRequest) -> SpiceResult<[Real; 4]> {
-        let mut positional = Vec::new();
-        let mut seen = std::collections::BTreeSet::new();
-        for argument in &request.arguments {
-            if let Some((key, _)) = argument.split_once('=') {
-                let key = key.trim().to_ascii_lowercase();
-                if !KEYS.contains(&key.as_str()) {
-                    return Err(unsupported(format!(
-                        "companion transient option '{key}' (supported: {})",
-                        KEYS.join(", ")
-                    )));
-                }
-                if !seen.insert(key.clone()) {
-                    return Err(unsupported(format!("duplicate transient option {key}")));
-                }
-            } else {
-                positional.push(argument.as_str());
-            }
-        }
+impl TransientPlan {
+    fn time_bounds(arguments: &[String]) -> SpiceResult<[Real; 4]> {
+        let positional: Vec<_> = arguments.iter().map(String::as_str).collect();
         if !(2..=4).contains(&positional.len()) {
             return Err(unsupported(".tran requires tstep tstop [tstart [tmax]]"));
         }
@@ -242,118 +174,78 @@ impl Settings {
         Ok([step_size, end_time, start, max_step])
     }
 
-    fn from_request(request: &AnalysisRequest) -> SpiceResult<Self> {
-        let [step_size, end_time, start, max_step] = Self::time_bounds(request)?;
-        // cktsopt.c clamps maxord to 1..=6 with a warning; out-of-range or
-        // non-integer values are explicit errors here.
-        let max_order = match request.named("maxord") {
-            None => 2,
-            Some(text) => text
-                .parse::<u8>()
-                .ok()
-                .filter(|order| (1..=IntegrationMethod::MAX_GEAR_ORDER).contains(order))
-                .ok_or_else(|| {
-                    unsupported(format!(
-                        "maxord must be an integer in 1..={}, not '{text}'",
-                        IntegrationMethod::MAX_GEAR_ORDER
-                    ))
-                })?,
-        };
-        let method = match request.named("method") {
-            None => IntegrationMethod::Trapezoidal,
-            Some(name) if name.eq_ignore_ascii_case("bdf") => {
-                return Err(unsupported(
-                    "method=bdf: ngspice has no BDF integrator (the diffsol backend was \
-                     removed); the companion methods are trap and gear",
-                ));
-            }
-            Some(name) => IntegrationMethod::parse(name, max_order).ok_or_else(|| {
-                unsupported(format!(
-                    "unknown transient method '{name}'; expected trap, trapezoidal or gear"
-                ))
-            })?,
-        };
-        method.validate_runtime()?;
-        let positive = |key: &str, default: Real| -> SpiceResult<Real> {
-            let value = request
-                .named(key)
-                .map_or(Ok(default), |text| number(Some(text), key))?;
-            if value > 0. {
-                Ok(value)
-            } else {
-                Err(unsupported(format!("transient {key} must be positive")))
-            }
-        };
-        let tolerances = Tolerances {
-            reltol: positive("rtol", DEFAULT_RELTOL)?,
-            vntol: positive("vntol", DEFAULT_VNTOL)?,
-            abstol: positive("abstol", DEFAULT_ABSTOL)?,
-            chgtol: positive("chgtol", DEFAULT_CHGTOL)?,
-            trtol: positive("trtol", DEFAULT_TRTOL)?,
-        };
-        let max_steps = match request.named("maxsteps") {
-            None => DEFAULT_MAX_STEPS,
-            Some(text) => text
-                .parse()
-                .ok()
-                .filter(|n| (1..=MAX_STEPS_LIMIT).contains(n))
-                .ok_or_else(|| {
-                    unsupported(format!(
-                        "maxsteps must be an integer in 1..={MAX_STEPS_LIMIT}"
-                    ))
-                })?,
-        };
-        let tran_max_iter = match request.named("tranmaxiter") {
-            None => TRAN_MAX_ITER,
-            Some(text) => crate::primitives::parse_spice_number(text)
-                .and_then(crate::primitives::exact_nonnegative_integer::<usize>)
-                .filter(|n| (1..=crate::analysis::newton::MAX_ITERATIONS).contains(n))
-                .ok_or_else(|| {
-                    unsupported(format!(
-                        "tranmaxiter must be an integer in 1..={}, not '{text}'",
-                        crate::analysis::newton::MAX_ITERATIONS
-                    ))
-                })?,
-        };
-        let xmu = match request.named("xmu") {
-            None => DEFAULT_XMU,
-            Some(text) => crate::primitives::parse_spice_number(text)
-                .filter(|v| (0. ..=0.5).contains(v))
-                .ok_or_else(|| unsupported(format!("xmu must be in [0, 0.5], not '{text}'")))?,
-        };
+    pub(super) fn resolve(
+        positional: &[String],
+        options: crate::analysis::plan::TransientOptions,
+        newton: &crate::analysis::newton::NewtonOptions,
+    ) -> SpiceResult<Self> {
+        let [output_step, end_time, start_time, max_step] = Self::time_bounds(positional)?;
         Ok(Self {
-            step: step_size,
+            step: output_step,
             stop: end_time,
-            start,
+            start: start_time,
             max_step,
-            method,
-            max_order,
-            tolerances,
-            max_steps,
-            tran_max_iter,
-            xmu,
+            method: options.method,
+            max_order: options.max_order,
+            tolerances: Tolerances {
+                reltol: newton.reltol,
+                vntol: newton.vntol,
+                abstol: newton.abstol,
+                chgtol: options.chgtol,
+                trtol: options.trtol,
+            },
+            max_steps: options.max_steps,
+            tran_max_iter: options.tran_max_iter,
+            xmu: options.xmu,
         })
     }
 
-    /// The initial-bias DC settings: `maxiter`/`srcsteps`/`gminsteps`/
-    /// `gminfactor` from the request (validated by
-    /// [`crate::analysis::bias::DcSettings::from_request`]) with this run's Newton
-    /// tolerances.
-    fn bias(&self, request: &AnalysisRequest) -> SpiceResult<crate::analysis::bias::DcSettings> {
-        let forwarded = request.arguments.iter().filter(|argument| {
-            argument.split_once('=').is_some_and(|(key, _)| {
-                BIAS_KEYS.contains(&key.trim().to_ascii_lowercase().as_str())
-            })
-        });
-        let mut settings =
-            crate::analysis::bias::DcSettings::from_request(&AnalysisRequest::with_arguments(
-                crate::primitives::AnalysisKind::OperatingPoint,
-                forwarded,
-            ))?;
-        settings.newton.reltol = self.tolerances.reltol;
-        settings.newton.vntol = self.tolerances.vntol;
-        settings.newton.abstol = self.tolerances.abstol;
-        Ok(settings)
+    /// Requested output time step.
+    #[must_use]
+    pub const fn step(&self) -> Real {
+        self.step
+    }
+
+    /// Final simulation time.
+    #[must_use]
+    pub const fn stop(&self) -> Real {
+        self.stop
+    }
+
+    /// The requested integration family and effective Gear order.
+    #[must_use]
+    pub const fn method(&self) -> IntegrationMethod {
+        self.method
+    }
+
+    /// The requested maximum integration order.
+    #[must_use]
+    pub const fn max_order(&self) -> u8 {
+        self.max_order
+    }
+
+    /// Newton iteration limit at each accepted or rejected timepoint.
+    #[must_use]
+    pub const fn max_iterations(&self) -> usize {
+        self.tran_max_iter
+    }
+
+    /// Trapezoidal weighting in [0, 0.5].
+    #[must_use]
+    pub const fn xmu(&self) -> Real {
+        self.xmu
+    }
+
+    /// Charge (flux) absolute truncation tolerance.
+    #[must_use]
+    pub const fn chgtol(&self) -> Real {
+        self.tolerances.chgtol
+    }
+
+    /// Truncation error overestimation factor.
+    #[must_use]
+    pub const fn trtol(&self) -> Real {
+        self.tolerances.trtol
     }
 
     /// C `CKTdelmin`.
@@ -397,7 +289,7 @@ struct StepControl {
 }
 
 impl StepControl {
-    fn new(settings: &Settings) -> Self {
+    fn new(settings: &TransientPlan) -> Self {
         Self {
             time: 0.,
             // dctran.c: delta = MIN(CKTfinalTime/100, CKTstep)/10.
@@ -416,7 +308,7 @@ impl StepControl {
     )]
     fn prepare(
         &mut self,
-        settings: &Settings,
+        settings: &TransientPlan,
         breaks: &mut BreakTable,
         uic: bool,
     ) -> SpiceResult<()> {
@@ -502,7 +394,7 @@ impl StepControl {
 struct Driver<'a> {
     circuit: &'a Circuit,
     system: &'a LinearSystem,
-    settings: Settings,
+    settings: TransientPlan,
     timing: TransientTiming,
     model_context: crate::devices::ModelContext,
     /// Newton/continuation settings of the nonlinear initial bias.
@@ -541,10 +433,16 @@ struct Driver<'a> {
 /// returns before any device accept hook ran or any plot row exists.
 pub fn companion_transient(
     circuit: &mut Circuit,
-    request: &AnalysisRequest,
+    request: &AnalysisPlan,
     context: &AnalysisContext,
 ) -> SpiceResult<(Plot, TransientStats)> {
-    companion(circuit, request, context, None)
+    let mut collector = super::results::PlotCollector::default();
+    let stats = companion_transient_into(circuit, request, context, &mut collector)?;
+    let plot = collector
+        .finish(1)?
+        .pop()
+        .ok_or_else(|| super::results::lifecycle_error("transient driver returned no plot"))?;
+    Ok((plot, stats))
 }
 
 /// [`companion_transient`], handing every accepted point to `sink` as it is
@@ -552,30 +450,23 @@ pub fn companion_transient(
 /// `CKTdump`/`OUTpData`.
 ///
 /// `sink` receives the plot header before the initial operating point is
-/// solved and then exactly the rows [`companion_transient`] would store. The
-/// returned plot has the variables but no points.
+/// solved, then exactly the rows [`companion_transient`] would store, followed
+/// by a successful end event. The returned statistics contain no plot data.
 ///
 /// # Errors
 ///
 /// As [`companion_transient`], and whatever `sink` reports.
 pub fn companion_transient_into(
     circuit: &mut Circuit,
-    request: &AnalysisRequest,
+    request: &AnalysisPlan,
     context: &AnalysisContext,
     sink: &mut dyn PointSink,
-) -> SpiceResult<(Plot, TransientStats)> {
-    companion(circuit, request, context, Some(sink))
-}
-
-fn companion(
-    circuit: &mut Circuit,
-    request: &AnalysisRequest,
-    context: &AnalysisContext,
-    sink: Option<&mut dyn PointSink>,
-) -> SpiceResult<(Plot, TransientStats)> {
-    let settings = Settings::from_request(request)?;
-    let bias = settings.bias(request)?;
-    if request.uic
+) -> SpiceResult<TransientStats> {
+    let settings = *request
+        .transient()
+        .ok_or_else(|| unsupported("companion requires a transient plan"))?;
+    let bias = request.dc_settings().clone();
+    if request.uic()
         && let Some(line) = circuit.devices().iter().find(|d| d.delay_line().is_some())
     {
         // traload.c/ltraload.c start the delayed waves from the instance
@@ -636,7 +527,7 @@ fn companion(
         history: circuit.state_history(),
         steps: StepHistory::with_fill(settings.max_step),
         hints,
-        uic: request.uic,
+        uic: request.uic(),
         branch_row,
         limited_rows,
         truncation,
@@ -646,22 +537,20 @@ fn companion(
 }
 
 impl Driver<'_> {
-    fn run(mut self, mut sink: Option<&mut dyn PointSink>) -> SpiceResult<(Plot, TransientStats)> {
-        let Settings { stop, start, .. } = self.settings;
+    fn run(mut self, sink: &mut dyn PointSink) -> SpiceResult<TransientStats> {
+        let TransientPlan { stop, start, .. } = self.settings;
         // traninit.c: CKTdelmin; dctran.c (XSPICE build): CKTminBreak.
         let min_step = self.settings.min_step();
         let mut breaks = BreakTable::new(stop, 10.0 * min_step);
         let mut sources = SourceBreaks::new(self.system);
-        let mut plot = plot(
+        let plot = plot(
             self.circuit,
             "tran1",
             "Transient Analysis",
             Some(("time", "time")),
             false,
         )?;
-        if let Some(sink) = sink.as_deref_mut() {
-            sink.begin(&plot)?;
-        }
+        sink.begin(&plot)?;
         let mut cursor = StepControl::new(&self.settings);
         let mut x = self.initialize()?;
         // The accepted point's forcing limit and observations.
@@ -718,16 +607,10 @@ impl Driver<'_> {
                         )),
                         None,
                     )?;
-                    push(&mut plot, sink.as_deref_mut(), 0., &x, observed)?;
+                    push(&plot, sink, 0., &x, observed)?;
                 }
             } else if cursor.time >= start {
-                push(
-                    &mut plot,
-                    sink.as_deref_mut(),
-                    cursor.time,
-                    &x,
-                    std::mem::take(&mut observed),
-                )?;
+                push(&plot, sink, cursor.time, &x, std::mem::take(&mut observed))?;
             }
             if almost_equal_ulps(cursor.time, stop, 100) {
                 break;
@@ -735,11 +618,12 @@ impl Driver<'_> {
             cursor.prepare(&self.settings, &mut breaks, self.uic)?;
             (observed, device_breaks) = self.advance(&mut cursor, &mut x)?;
         }
+        sink.end()?;
         // C keeps the final load's instance fields, not values re-evaluated
         // at the final solution (the load can lag that solution by an iterate).
         // Publish only after the entire run and every sink write succeeded.
         self.circuit.record_final_transient_state(&self.history)?;
-        Ok((plot, self.stats))
+        Ok(self.stats)
     }
 
     /// Advance through rejected trials until the next accepted point.
@@ -1036,7 +920,7 @@ impl Driver<'_> {
                 history: &self.history,
                 forcing: None,
             },
-            &mut self.circuit.new_matrix(),
+            &mut self.circuit.new_matrix()?,
             &mut Vector::zeros(n),
             &mut trial,
         )?;
@@ -1204,10 +1088,10 @@ impl Driver<'_> {
     }
 }
 
-/// Stores an accepted point in `plot`, or hands it to `sink` when there is one.
-fn push<'s>(
-    plot: &mut Plot,
-    sink: Option<&mut (dyn PointSink + 's)>,
+/// Deliver an accepted row to the consumer without copying it.
+fn push(
+    header: &Plot,
+    sink: &mut dyn PointSink,
     time: Real,
     x: &Vector,
     observed: Vec<Complex>,
@@ -1215,13 +1099,8 @@ fn push<'s>(
     let mut point = vec![Complex::real(time)];
     point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));
     point.extend(observed);
-    match sink {
-        Some(sink) => {
-            plot.check_point(&point)?;
-            sink.point(&point)
-        }
-        None => plot.push_point(point),
-    }
+    header.check_point(&point)?;
+    sink.point(point)
 }
 
 #[cfg(test)]

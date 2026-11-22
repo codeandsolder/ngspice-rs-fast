@@ -2,7 +2,7 @@
 //! resistors and temperature, against analytic circuit solutions. Grids, limits,
 //! restoration, rejection-before-samples and the factor-reuse boundary.
 use ngspice_rs::analysis::sweep::{MAX_SWEEP_POINTS, SweepSpec, SweepTarget, resolve};
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RunConfig};
 use ngspice_rs::devices::{
     AcceptContext, Capacitor, Circuit, Device, IndependentSource, LinearContext, Resistor,
     StampContext, Waveform,
@@ -34,23 +34,17 @@ fn hot() -> AnalysisContext {
     }
 }
 fn run_in(c: &mut Circuit, args: &[&str], context: &AnalysisContext) -> SpiceResult<Plot> {
-    runner(AnalysisKind::DcSweep)?.run(
-        c,
-        &AnalysisRequest::with_arguments(AnalysisKind::DcSweep, args.iter().copied()),
-        context,
-    )
+    AnalysisInput::with_arguments(AnalysisKind::DcSweep, args.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(c, context))
 }
 fn run(c: &mut Circuit, args: &[&str]) -> SpiceResult<Plot> {
     run_in(c, args, &AnalysisContext::default())
 }
 fn op(c: &mut Circuit, context: &AnalysisContext) -> Plot {
-    runner(AnalysisKind::OperatingPoint)
-        .unwrap()
-        .run(
-            c,
-            &AnalysisRequest::new(AnalysisKind::OperatingPoint),
-            context,
-        )
+    AnalysisInput::new(AnalysisKind::OperatingPoint)
+        .resolve()
+        .and_then(|plan| plan.run(c, context))
         .unwrap()
 }
 fn close(got: f64, want: f64, relative: f64, absolute: f64) {
@@ -470,13 +464,8 @@ fn deck_dc_cards_with_resistor_targets_use_the_existing_ast_grammar() {
     let mut results = vec![];
     for card in &n.analyses {
         let mut c = config.circuit(&n).unwrap();
-        let request = config.request_for(card).unwrap();
-        results.push(
-            runner(card.kind)
-                .unwrap()
-                .run(&mut c, &request, &config.context())
-                .unwrap(),
-        );
+        let request = config.plan_for(card).unwrap();
+        results.push(request.run(&mut c, &config.context()).unwrap());
     }
     assert_column(
         &results[0],
@@ -528,7 +517,8 @@ fn programmatic_names_resolve_by_physical_kind_and_keep_their_case() {
     let resolved = |c: &Circuit, name: &str| {
         resolve(
             c,
-            &AnalysisRequest::with_arguments(AnalysisKind::DcSweep, [name, "1", "2", "1"]),
+            &AnalysisInput::with_arguments(AnalysisKind::DcSweep, [name, "1", "2", "1"])
+                .resolve()?,
             &AnalysisContext::default(),
         )
     };
@@ -892,7 +882,8 @@ fn point_and_product_limits_are_enforced_at_resolution() {
     let axes = |args: &[&str]| {
         resolve(
             &c,
-            &AnalysisRequest::with_arguments(AnalysisKind::DcSweep, args.iter().copied()),
+            &AnalysisInput::with_arguments(AnalysisKind::DcSweep, args.iter().copied())
+                .resolve()?,
             &AnalysisContext::default(),
         )
     };

@@ -174,8 +174,8 @@ undefined.
   names, terminals and model names are never substituted.
 - Consumers: `Circuit::from_netlist[_with_context]` literalizes first;
   `RunConfig::from_netlist` resolves and keeps the scope, and
-  `RunConfig::request_for` evaluates `AnalysisCard::expressions`
-  (`AnalysisRequest::from(&card)` alone does not, and the drivers reject raw
+  `RunConfig::plan_for` evaluates `AnalysisCard::expressions`
+  (`AnalysisInput::from(&card)` alone does not, and the plan resolver rejects raw
   braced text). `spice-rs parse` evaluates all sites and prints a
   `parameters:` line.
 - Diagnostics are `SpiceError::Parse` with the failing sub-expression's

@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use ngspice_rs::analysis::newton::{NewtonOptions, PhasePolicy, solve_phased};
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RunConfig};
 use ngspice_rs::devices::{Circuit, IterationPhase, StateHistory};
 use ngspice_rs::maths::{SparseMatrix, Vector};
 use ngspice_rs::netlist::Parser;
@@ -25,11 +25,9 @@ fn circuit(body: &str) -> SpiceResult<Circuit> {
 }
 
 fn run(body: &str, kind: AnalysisKind, args: &[&str]) -> SpiceResult<Plot> {
-    runner(kind)?.run(
-        &mut circuit(body)?,
-        &AnalysisRequest::with_arguments(kind, args.iter().copied()),
-        &AnalysisContext::default(),
-    )
+    AnalysisInput::with_arguments(kind, args.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(&mut circuit(body)?, &AnalysisContext::default()))
 }
 
 fn column(plot: &Plot, name: &str) -> Vec<Real> {
@@ -232,12 +230,9 @@ fn the_off_conductance_defaults_to_the_gmin_option() {
         .parse_deck(&parse_deck_text(Path::new("gmin.cir"), text))
         .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut c = config.circuit(&netlist).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut c, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut c, &config.context()).unwrap();
     close(column(&plot, "v(a)")[0], 1e6 / (1e6 + 1e3), 1e-12);
 }
 
@@ -261,11 +256,11 @@ fn switch_nonlinear_uic_runs_on_the_companion_driver() {
                 .model sm sw(vt=1)";
     // Nonlinear uic initialization (#99) runs on the companion driver.
     let mut c = circuit(deck).unwrap();
-    let mut request = AnalysisRequest::with_arguments(AnalysisKind::Transient, ["1u", "10u"]);
+    let mut request = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "10u"]);
     request.uic = true;
-    runner(AnalysisKind::Transient)
-        .unwrap()
-        .run(&mut c, &request, &AnalysisContext::default())
+    request
+        .resolve()
+        .and_then(|plan| plan.run(&mut c, &AnalysisContext::default()))
         .unwrap();
 }
 

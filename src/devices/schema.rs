@@ -6,8 +6,8 @@
 //! Unsupported setters error instead of C's warning-and-ignore behavior.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use crate::netlist::ast::ParameterAssignment;
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
@@ -126,10 +126,79 @@ pub struct ScalarParameter {
 
 /// A device's explicit scalar parameter surface. It does not resolve model
 /// names, select backends, or evaluate parameter expressions.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct ScalarSchema<'a> {
-    /// Supported setters. Names must be nonempty, unique and lowercase.
-    pub parameters: &'a [ScalarParameter],
+    parameters: &'a [ScalarParameter],
+    compiled: OnceLock<CompiledScalar>,
+}
+
+#[derive(Debug)]
+struct CompiledScalar {
+    indices: Arc<HashMap<&'static str, usize>>,
+    defaults: Arc<Vec<Option<ScalarValue>>>,
+    error: Option<String>,
+}
+
+impl<'a> ScalarSchema<'a> {
+    /// Construct a reusable schema. Static device definitions retain their
+    /// compiled metadata; local definitions never outlive this schema.
+    #[must_use]
+    pub const fn new(parameters: &'a [ScalarParameter]) -> Self {
+        Self {
+            parameters,
+            compiled: OnceLock::new(),
+        }
+    }
+
+    /// Original ordered definitions.
+    #[must_use]
+    pub const fn parameters(&self) -> &'a [ScalarParameter] {
+        self.parameters
+    }
+
+    fn compiled(&self) -> &CompiledScalar {
+        self.compiled.get_or_init(|| {
+            let mut indices = HashMap::with_capacity(self.parameters.len());
+            let mut defaults = Vec::with_capacity(self.parameters.len());
+            let mut error = None;
+            for (slot, parameter) in self.parameters.iter().enumerate() {
+                if parameter.name.is_empty()
+                    || parameter.name.bytes().any(|byte| byte.is_ascii_uppercase())
+                    || indices.insert(parameter.name, slot).is_some()
+                {
+                    error.get_or_insert_with(|| "invalid or duplicate schema setter name".into());
+                }
+                defaults.push(parameter.default.map(|value| {
+                    if !parameter.domain.accepts(value) {
+                        error.get_or_insert_with(|| domain_message(value, parameter));
+                    }
+                    ScalarValue {
+                        value,
+                        unit: parameter.unit,
+                        location: None,
+                    }
+                }));
+            }
+            CompiledScalar {
+                indices: Arc::new(indices),
+                defaults: Arc::new(defaults),
+                error,
+            }
+        })
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        let compiled = self.compiled();
+        // Invalid ad-hoc schemas still classify setters as before; validation
+        // reports their first definition error at the actual owner.
+        if compiled.error.is_some() {
+            return self
+                .parameters
+                .iter()
+                .any(|p| p.name.eq_ignore_ascii_case(name));
+        }
+        compiled.indices.contains_key(ascii_key(name).as_ref())
+    }
 }
 
 /// A scalar after validation, retaining last-set source provenance.
@@ -145,31 +214,57 @@ pub struct ScalarValue {
 
 /// Last-set/default projection. Clones share the validated snapshot until a
 /// per-point recipe replaces a setter; the original AST remains unchanged.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct ScalarValues(Arc<BTreeMap<String, ScalarValue>>);
+#[derive(Debug, Clone)]
+pub struct ScalarValues {
+    indices: Arc<HashMap<&'static str, usize>>,
+    values: Arc<Vec<Option<ScalarValue>>>,
+}
+
+impl PartialEq for ScalarValues {
+    fn eq(&self, other: &Self) -> bool {
+        if Arc::ptr_eq(&self.indices, &other.indices) {
+            return self.values == other.values;
+        }
+        let count = |values: &Self| values.values.iter().flatten().count();
+        count(self) == count(other)
+            && self.indices.iter().all(|(name, &slot)| {
+                self.values[slot]
+                    .as_ref()
+                    .is_none_or(|value| other.get(name) == Some(value))
+            })
+    }
+}
 
 impl ScalarValues {
     /// Replace a previously validated scalar in an owned per-point recipe.
-    pub(crate) fn set(&mut self, name: &str, value: Real, unit: ScalarUnit, location: SourceLoc) {
-        Arc::make_mut(&mut self.0).insert(
-            name.to_owned(),
-            ScalarValue {
-                value,
-                unit,
-                location: Some(location),
-            },
-        );
+    pub(crate) fn set(
+        &mut self,
+        name: &str,
+        value: Real,
+        unit: ScalarUnit,
+        location: SourceLoc,
+    ) -> SpiceResult<()> {
+        let slot = self
+            .indices
+            .get(ascii_key(name).as_ref())
+            .ok_or_else(|| SpiceError::circuit(format!("scalar recipe has no setter '{name}'")))?;
+        Arc::make_mut(&mut self.values)[*slot] = Some(ScalarValue {
+            value,
+            unit,
+            location: Some(location),
+        });
+        Ok(())
     }
 
     /// Lookup by canonical name, case-insensitively. Absent optional values
     /// return `None`, rather than inventing a zero.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&ScalarValue> {
-        self.0.get(ascii_key(name).as_ref())
+        self.values[*self.indices.get(ascii_key(name).as_ref())?].as_ref()
     }
 }
 
-fn ascii_key(name: &str) -> Cow<'_, str> {
+pub(super) fn ascii_key(name: &str) -> Cow<'_, str> {
     if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
         Cow::Owned(name.to_ascii_lowercase())
     } else {
@@ -220,49 +315,32 @@ impl ScalarSchema<'_> {
         parameters: impl IntoIterator<Item = (&'a str, &'a SourceLoc, F)>,
         owner: &SourceLoc,
     ) -> SpiceResult<ScalarValues> {
-        let mut definitions = BTreeMap::new();
-        let mut values = BTreeMap::new();
-        for parameter in self.parameters {
-            if parameter.name.is_empty()
-                || parameter.name.bytes().any(|byte| byte.is_ascii_uppercase())
-                || definitions.insert(parameter.name, parameter).is_some()
-            {
-                return Err(SpiceError::parse(
-                    owner.clone(),
-                    "invalid or duplicate schema setter name",
-                ));
-            }
-            if let Some(default) = parameter.default {
-                validate_value(default, parameter, owner)?;
-                values.insert(
-                    parameter.name.into(),
-                    ScalarValue {
-                        value: default,
-                        unit: parameter.unit,
-                        location: None,
-                    },
-                );
-            }
+        let compiled = self.compiled();
+        if let Some(error) = &compiled.error {
+            return Err(SpiceError::parse(owner.clone(), error.clone()));
         }
+        let mut values = Arc::clone(&compiled.defaults);
         for (name, location, number) in parameters {
-            let parameter = definitions.get(ascii_key(name).as_ref()).ok_or_else(|| {
-                SpiceError::Unsupported {
+            let slot = *compiled
+                .indices
+                .get(ascii_key(name).as_ref())
+                .ok_or_else(|| SpiceError::Unsupported {
                     feature: format!("unsupported setter '{name}'"),
                     location: Some(location.clone()),
-                }
-            })?;
+                })?;
+            let parameter = &self.parameters[slot];
             let value = number()?;
             validate_value(value, parameter, location)?;
-            values.insert(
-                parameter.name.into(),
-                ScalarValue {
-                    value,
-                    unit: parameter.unit,
-                    location: Some(location.clone()),
-                },
-            );
+            Arc::make_mut(&mut values)[slot] = Some(ScalarValue {
+                value,
+                unit: parameter.unit,
+                location: Some(location.clone()),
+            });
         }
-        Ok(ScalarValues(Arc::new(values)))
+        Ok(ScalarValues {
+            indices: Arc::clone(&compiled.indices),
+            values,
+        })
     }
 }
 
@@ -297,16 +375,8 @@ pub(crate) fn split_model_setters<'a>(
     let mut kept = Vec::new();
     let mut defaults = Vec::new();
     for setter in setters {
-        let in_model = model
-            .parameters
-            .iter()
-            .any(|p| p.name.eq_ignore_ascii_case(&setter.name));
-        if in_model
-            || !instance
-                .parameters
-                .iter()
-                .any(|p| p.name.eq_ignore_ascii_case(&setter.name))
-        {
+        let in_model = model.contains(&setter.name);
+        if in_model || !instance.contains(&setter.name) {
             kept.push(setter);
         } else if !["level", "m"]
             .iter()
@@ -364,12 +434,16 @@ fn validate_value(
     } else {
         Err(SpiceError::parse(
             location.clone(),
-            format!(
-                "{} must satisfy {:?}, got {value}",
-                parameter.name, parameter.domain
-            ),
+            domain_message(value, parameter),
         ))
     }
+}
+
+fn domain_message(value: Real, parameter: &ScalarParameter) -> String {
+    format!(
+        "{} must satisfy {:?}, got {value}",
+        parameter.name, parameter.domain
+    )
 }
 
 /// Convert a validated physical temperature to Kelvin. C: `diompar.c` and
@@ -424,19 +498,31 @@ mod tests {
     }
 
     #[test]
+    fn default_snapshots_share_compiled_slots_and_indices() {
+        let schema = ScalarSchema::new(PARAMETERS);
+        let first = schema.validate([], &loc(1)).unwrap();
+        let second = schema.validate([], &loc(2)).unwrap();
+        let explicit = schema.validate([&setter("r", "2", 3)], &loc(3)).unwrap();
+        assert!(Arc::ptr_eq(&first.values, &second.values));
+        assert!(Arc::ptr_eq(&first.indices, &explicit.indices));
+        assert!(!Arc::ptr_eq(&first.values, &explicit.values));
+        assert_eq!(first.get("r").unwrap().location, None);
+        assert_eq!(explicit.get("r").unwrap().location, Some(loc(3)));
+    }
+
+    #[test]
     fn cloned_snapshots_share_until_changed_and_keep_provenance() {
-        let schema = ScalarSchema {
-            parameters: PARAMETERS,
-        };
+        let schema = ScalarSchema::new(PARAMETERS);
         let assignments = [setter("R", "2", 2), setter("r", "3", 3)];
         let original = schema.validate(&assignments, &loc(1)).unwrap();
         let mut copy = original.clone();
-        assert!(Arc::ptr_eq(&original.0, &copy.0));
+        assert!(Arc::ptr_eq(&original.values, &copy.values));
         assert_eq!(original.get("R").unwrap().value.to_bits(), 3_f64.to_bits());
         assert_eq!(original.get("r").unwrap().location, Some(loc(3)));
         assert_eq!(original.get("M").unwrap().location, None);
-        copy.set("m", 4., ScalarUnit::Dimensionless, loc(4));
-        assert!(!Arc::ptr_eq(&original.0, &copy.0));
+        copy.set("m", 4., ScalarUnit::Dimensionless, loc(4))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&original.values, &copy.values));
         assert_eq!(copy.get("m").unwrap().location, Some(loc(4)));
         assert_eq!(original.get("m").unwrap().value.to_bits(), 1_f64.to_bits());
         assert_eq!(original.get("m").unwrap().location, None);
@@ -445,9 +531,7 @@ mod tests {
 
     #[test]
     fn ordered_numeric_validation_preserves_exact_values_and_given_locations() {
-        let schema = ScalarSchema {
-            parameters: PARAMETERS,
-        };
+        let schema = ScalarSchema::new(PARAMETERS);
         let exact = 1.379_310_344_827_586_2e-20_f64;
         let values = schema
             .validate_numeric([("R", 2., &loc(2)), ("r", exact, &loc(3))], &loc(1))
@@ -469,9 +553,7 @@ mod tests {
 
     #[test]
     fn ordered_validation_rejects_even_overwritten_invalid_values() {
-        let schema = ScalarSchema {
-            parameters: PARAMETERS,
-        };
+        let schema = ScalarSchema::new(PARAMETERS);
         let assignments = [setter("R", "-1", 2), setter("r", "3", 3)];
         assert!(schema.validate(&assignments, &loc(1)).is_err());
     }
