@@ -57,7 +57,11 @@ pub(super) fn seek_cycle(first: Real, mut omit: impl FnMut(Real) -> bool) -> Opt
     }
     let mut low = first + 1.;
     let mut high = MAX_CYCLE;
-    while low < high {
+    // The search interval contains at most 2^52 integer indices.
+    for _ in 0..52 {
+        if low >= high {
+            break;
+        }
         let middle = low.midpoint(high).floor();
         if omit(middle) {
             low = middle + 1.;
@@ -470,7 +474,8 @@ impl Iterator for PulseBreakpoints {
             if self.index >= self.count {
                 self.index = 0;
                 let Some(cycle) = seek_cycle(self.cycle + 1., |cycle| {
-                    let local_last = self.pulse.period * cycle + self.offsets[self.count - 1];
+                    let cycle_start = self.pulse.period * cycle;
+                    let local_last = cycle_start + self.offsets[self.count - 1];
                     // Do not skip the cycle containing the first request
                     // after a finite train's stop, even if its corners
                     // round to already emitted times.

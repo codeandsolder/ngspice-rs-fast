@@ -5,7 +5,7 @@ use std::hint::black_box;
 use std::path::Path;
 use std::time::Instant;
 
-use ngspice_rs::devices::{Circuit, Limit, LinearSystem, Waveform};
+use ngspice_rs::devices::{Circuit, Limit, LinearSystem, PwlSource, Waveform};
 use ngspice_rs::netlist::{Parser, source::parse_deck_text};
 
 fn system(deck: &str) -> LinearSystem {
@@ -22,8 +22,8 @@ fn system(deck: &str) -> LinearSystem {
 #[ignore = "opt-in waveform scheduling benchmark"]
 fn sparse_sources_and_large_pwl_deck() {
     const SOURCES: u32 = 4096;
-    const KNOTS: u32 = 65_536;
-    const REQUESTS: u32 = 8192;
+    // Match the parser's existing maximum of 4096 numeric fields.
+    const KNOTS: u32 = 2048;
     let mut deck = String::from("sparse schedules\nr1 out 0 1k\n");
     for source in 0..SOURCES {
         write!(deck, "i{source} out 0 pwl(").unwrap();
@@ -77,13 +77,28 @@ fn sparse_sources_and_large_pwl_deck() {
     }
     deck.push_str(")\nr1 out 0 1k\n.end\n");
     let large = system(&deck);
-    let waveform = &large.sources[0].waveform;
+    benchmark_lookup(&large.sources[0].waveform, KNOTS);
+    // The programmatic waveform API has no parser field limit.
+    const LARGE_KNOTS: u32 = 65_536;
+    let large_waveform = Waveform::Pwl(
+        PwlSource::plain(
+            (0..LARGE_KNOTS)
+                .map(|i| (f64::from(i), f64::from(i % 2)))
+                .collect(),
+        )
+        .unwrap(),
+    );
+    benchmark_lookup(&large_waveform, LARGE_KNOTS);
+}
+
+fn benchmark_lookup(waveform: &Waveform, knots: u32) {
+    const REQUESTS: u32 = 8192;
     let Waveform::Pwl(pwl) = waveform else {
         panic!("not PWL");
     };
-    assert_eq!(pwl.knots().len(), KNOTS as usize);
+    assert_eq!(pwl.knots().len(), knots as usize);
     let times = (0..REQUESTS)
-        .map(|index| f64::from(index * 7919 % KNOTS) + 0.125)
+        .map(|index| f64::from(index * 7919 % knots) + 0.125)
         .collect::<Vec<_>>();
     let start = Instant::now();
     let indexed = times
@@ -109,7 +124,7 @@ fn sparse_sources_and_large_pwl_deck() {
         })
         .collect::<Vec<_>>();
     println!(
-        "{KNOTS} knots/{REQUESTS} evaluations: scan {:?}, indexed {indexed_elapsed:?}",
+        "{knots} knots/{REQUESTS} evaluations: scan {:?}, indexed {indexed_elapsed:?}",
         start.elapsed()
     );
     assert_eq!(
