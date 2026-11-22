@@ -152,43 +152,52 @@ const MAX_SCOPE_DEPTH: usize = 64;
 /// Only declarations local to this lexical body. The parent edge represents
 /// ancestor visibility without copying any inherited names.
 #[derive(Debug, Default)]
-struct LexicalModels {
+struct LexicalModels<'a> {
     body_start: usize,
     parent: Option<usize>,
-    names: BTreeSet<String>,
-    bins: BTreeSet<String>,
+    names: BTreeSet<Cow<'a, str>>,
+    bins: BTreeSet<Cow<'a, str>>,
 }
 
-impl LexicalModels {
-    fn insert(&mut self, name: &str) {
-        let name = name.to_ascii_lowercase();
+/// The token stream already owns the declaration spelling. Only names
+/// with ASCII uppercase letters need a separate canonical allocation.
+fn canonical_name(name: &str) -> Cow<'_, str> {
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+impl<'a> LexicalModels<'a> {
+    fn insert(&mut self, name: &'a str) {
         // Bin candidates are identified during indexing, not by scanning a
         // prefix range on every MOS terminal/model disambiguation.
         if let Some((base, suffix)) = name.rsplit_once('.')
             && !suffix.is_empty()
             && suffix.bytes().all(|byte| byte.is_ascii_digit())
         {
-            self.bins.insert(base.to_owned());
+            self.bins.insert(canonical_name(base));
         }
-        self.names.insert(name);
+        self.names.insert(canonical_name(name));
     }
 }
 
 /// Occurrence-based structural index, independent of semantic validity.
-/// In particular two visits to the same included RawCard have distinct
+/// In particular two visits to the same included `RawCard` have distinct
 /// scope identities. The ordered body-start keys are unique and monotone.
-struct ModelIndex {
-    scopes: Vec<LexicalModels>,
+struct ModelIndex<'a> {
+    scopes: Vec<LexicalModels<'a>>,
     #[cfg(test)]
     inspected_cards: usize,
 }
 
-impl ModelIndex {
+impl<'a> ModelIndex<'a> {
     /// One read-only pass, with the same lexical control and terminator
     /// policy as the semantic parser's former forward-name scans. Errors
     /// remain in the input for ordered replay; this pass never emits one.
     /// Do not allocate scope records beyond the semantic nesting budget.
-    fn build(cards: &[SpiceResult<InputCard>]) -> Self {
+    fn build(cards: &'a [SpiceResult<InputCard>]) -> Self {
         let mut scopes = vec![LexicalModels::default()];
         let mut active = 0;
         let mut depth = 0usize;
@@ -250,7 +259,7 @@ impl ModelIndex {
             .map_err(|_| SpiceError::circuit("missing lexical model scope"))?;
         Ok(ModelVisibility {
             scopes: &self.scopes,
-            scope: Some(scope),
+            scope,
         })
     }
 }
@@ -259,26 +268,21 @@ impl ModelIndex {
 /// entry points (include directives, resolved measures) need no declarations.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct ModelVisibility<'a> {
-    scopes: &'a [LexicalModels],
-    scope: Option<usize>,
+    scopes: &'a [LexicalModels<'a>],
+    scope: usize,
 }
 
 impl ModelVisibility<'_> {
     pub(super) fn contains(self, name: &str, allow_bins: bool) -> bool {
-        let name = if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            Cow::Owned(name.to_ascii_lowercase())
-        } else {
-            Cow::Borrowed(name)
-        };
-        let mut current = self.scope;
-        while let Some(index) = current {
-            let scope = &self.scopes[index];
+        let name = canonical_name(name);
+        let mut current = self.scopes.get(self.scope);
+        while let Some(scope) = current {
             if scope.names.contains(name.as_ref())
                 || (allow_bins && scope.bins.contains(name.as_ref()))
             {
                 return true;
             }
-            current = scope.parent;
+            current = scope.parent.map(|index| &self.scopes[index]);
         }
         false
     }
@@ -404,7 +408,7 @@ fn scope(
     cards: &[SpiceResult<InputCard>],
     cursor: &mut usize,
     auto_gnd: bool,
-    models: &ModelIndex,
+    models: &ModelIndex<'_>,
     opening: Option<(&str, &SourceLoc)>,
     depth: usize,
 ) -> SpiceResult<Scope> {
@@ -621,7 +625,7 @@ mod tests {
 
     fn compare_index(
         cards: &[SpiceResult<InputCard>],
-        index: &ModelIndex,
+        index: &ModelIndex<'_>,
         candidates: &[&str],
     ) -> (usize, usize) {
         let mut visible = Vec::new();
@@ -688,6 +692,25 @@ mod tests {
             compare_index(&cards, &index, &candidates);
             assert!(index.inspected_cards <= cards.len());
         }
+    }
+
+    #[test]
+    fn canonical_index_keys_borrow_unchanged_token_spelling() {
+        let cards = cards(".model lowercase r\n.model nm.base.12 NMOS\n.model NM.Mixed.3 NMOS\n");
+        let index = ModelIndex::build(&cards);
+        let scope = &index.scopes[0];
+        assert!(matches!(
+            scope.names.get("lowercase"),
+            Some(Cow::Borrowed("lowercase"))
+        ));
+        assert!(matches!(
+            scope.bins.get("nm.base"),
+            Some(Cow::Borrowed("nm.base"))
+        ));
+        assert!(
+            matches!(scope.names.get("nm.mixed.3"), Some(Cow::Owned(name)) if name == "nm.mixed.3")
+        );
+        assert!(matches!(scope.bins.get("nm.mixed"), Some(Cow::Owned(name)) if name == "nm.mixed"));
     }
 
     #[test]

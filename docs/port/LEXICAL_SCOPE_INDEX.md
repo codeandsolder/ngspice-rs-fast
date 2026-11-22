@@ -11,7 +11,8 @@ has a local ASCII-case-insensitive set of declaration names, a set of local
 MOS bin bases (`name.<ASCII digits>`), and its parent scope ordinal. The
 ordered body-start keys bind semantic parsing to the corresponding occurrence
 even when the resolver reuses the same underlying raw card in several
-includes.
+includes. Lowercase declaration names and bin bases borrow their immutable
+token spelling; only ASCII-uppercase names need owned canonical copies.
 
 A grammar lookahead borrows the immutable visibility view: it searches the
 local sets and then ancestor sets up to the root. It never clones the inherited
