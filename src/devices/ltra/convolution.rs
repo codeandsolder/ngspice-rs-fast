@@ -23,10 +23,6 @@
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
 )]
 #![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
 )]
@@ -56,17 +52,11 @@ pub fn quad_interp(t: Real, t1: Real, t2: Real, t3: Real) -> Option<[Real; 3]> {
     if (t2 - t1) == 0. || (t3 - t2) == 0. || (t1 - t3) == 0. {
         return None;
     }
-    let mut f1 = (t - t2) * (t - t3);
-    let mut f2 = (t - t1) * (t - t3);
-    let mut f3 = (t - t1) * (t - t2);
-    // C's further zero checks are unreachable after the test above.
-    f1 /= t1 - t2;
-    f2 /= t2 - t1;
-    f2 /= t2 - t3;
-    f3 /= t2 - t3;
-    f1 /= t1 - t3;
-    f3 /= t1 - t3;
-    Some([f1, f2, f3])
+    Some([
+        ((t - t2) / (t1 - t2)) * ((t - t3) / (t1 - t3)),
+        ((t - t1) / (t2 - t1)) * ((t - t3) / (t2 - t3)),
+        ((t - t1) / (t3 - t1)) * ((t - t2) / (t3 - t2)),
+    ])
 }
 
 /// `LTRAlinInterp`: coefficients `(c1, c2)` of the line through `(t1, t2)` at
@@ -86,8 +76,21 @@ pub fn lin_interp(t: Real, t1: Real, t2: Real) -> Option<[Real; 2]> {
     Some([1. - temp, temp])
 }
 
-/// `intlinfunc`: `int_lo^hi h` for `h` linear through `(t1, lovalue)` and
-/// `(t2, hivalue)`.
+/// Evaluate a line from the closer endpoint, including extrapolation.
+fn linear_value(t: Real, t1: Real, t2: Real, v1: Real, v2: Real) -> Real {
+    if t == t1 {
+        v1
+    } else if t == t2 {
+        v2
+    } else if (t - t1).abs() <= (t - t2).abs() {
+        crate::devices::functions::blend_from_anchor(v1, v2, (t - t1) / (t2 - t1))
+    } else {
+        crate::devices::functions::blend_from_anchor(v2, v1, (t - t2) / (t1 - t2))
+    }
+}
+
+/// Integral of a linear function: interval width times mean endpoint
+/// value. Do not form differences of squared absolute time offsets.
 fn intlinfunc(
     lolimit: Real,
     hilimit: Real,
@@ -96,16 +99,17 @@ fn intlinfunc(
     t1: Real,
     t2: Real,
 ) -> Real {
-    let width = t2 - t1;
-    if width == 0. {
+    if t1 == t2 {
         return 0.;
     }
-    let m = (hivalue - lovalue) / width;
-    (hilimit - lolimit) * lovalue
-        + 0.5 * m * ((hilimit - t1) * (hilimit - t1) - (lolimit - t1) * (lolimit - t1))
+    let low = linear_value(lolimit, t1, t2, lovalue, hivalue);
+    let high = linear_value(hilimit, t1, t2, lovalue, hivalue);
+    (hilimit - lolimit) * low.midpoint(high)
 }
 
-/// `twiceintlinfunc`: `int_lo^hi int_other^tau h` for the same linear `h`.
+/// Integral over [lo, hi] of the accumulated linear function from other.
+/// Integrate around lo, avoiding the difference of cubes in the original
+/// expression and keeping the auxiliary window's extrapolation semantics.
 fn twiceintlinfunc(
     lolimit: Real,
     hilimit: Real,
@@ -115,22 +119,16 @@ fn twiceintlinfunc(
     t1: Real,
     t2: Real,
 ) -> Real {
-    let width = t2 - t1;
-    if width == 0. {
+    if t1 == t2 {
         return 0.;
     }
-    let m = (hivalue - lovalue) / width;
-    let temp1 = hilimit - t1;
-    let temp2 = lolimit - t1;
-    let temp3 = otherlolimit - t1;
-    let mut dummy = lovalue
-        * ((hilimit - otherlolimit) * (hilimit - otherlolimit)
-            - (lolimit - otherlolimit) * (lolimit - otherlolimit));
-    let temp3_squared = temp3 * temp3;
-    dummy += m
-        * ((temp1 * temp1 * temp1 - temp2 * temp2 * temp2) / 3.0
-            - temp3_squared * (hilimit - lolimit));
-    dummy * 0.5
+    let width = hilimit - lolimit;
+    let low = linear_value(lolimit, t1, t2, lovalue, hivalue);
+    let high = linear_value(hilimit, t1, t2, lovalue, hivalue);
+    let other = linear_value(otherlolimit, t1, t2, lovalue, hivalue);
+    let initial_integral = (lolimit - otherlolimit) * other.midpoint(low);
+    let weighted = (low / 3.) + high / 6.;
+    width * width.mul_add(weighted, initial_integral)
 }
 
 /// `bessI0` (Abramowitz and Stegun 9.8.1, 9.8.2).
@@ -255,7 +253,7 @@ pub fn straight_line_check(
 pub fn rlc_max_safe_step(td: Real, alpha: Real, beta: Real, reltol: Real, abstol: Real) -> Real {
     let mut xbig = td + 9. * td;
     let xsmall = td;
-    let mut xmid = 0.5 * (xbig + xsmall);
+    let mut xmid = xbig.midpoint(xsmall);
     let y1small = rlc_h2(xsmall, td, alpha, beta);
     let mut iters = 0;
     loop {
@@ -267,7 +265,7 @@ pub fn rlc_max_safe_step(td: Real, alpha: Real, beta: Real, reltol: Real, abstol
             break;
         }
         xbig = xmid;
-        xmid = 0.5 * (xbig + xsmall);
+        xmid = xbig.midpoint(xsmall);
     }
     xbig - td
 }
@@ -726,6 +724,23 @@ mod tests {
         let [l1, l2] = lin_interp(0.25, 0., 1.).unwrap();
         assert_eq!((l1, l2), (0.75, 0.25));
         assert_eq!(lin_interp(1., 1., 1.), None);
+    }
+
+    #[test]
+    fn tiny_interpolation_intervals_and_extrapolated_integrals() {
+        let h = 1e-180;
+        let weights = quad_interp(1.5 * h, 0., h, 2. * h).unwrap();
+        assert!((weights[1] + 4. * weights[2] - 2.25).abs() <= 8. * Real::EPSILON);
+        // h(t)=2+3t. Integral [10,11] is 33.5; integrating
+        // its primitive from 4 gives 6*10? use explicit antiderivative.
+        assert_eq!(intlinfunc(10., 11., 2., 5., 0., 1.), 33.5);
+        let f = |t: Real| t * t + 0.5 * t * t * t - 32. * t;
+        assert!((twiceintlinfunc(10., 11., 4., 2., 5., 0., 1.) - (f(11.) - f(10.))).abs() < 1e-12);
+        // Coordinates near 1e150, values scaled down to keep the
+        // double integral finite while the old cubic terms overflow.
+        let h = 1e120;
+        let actual = twiceintlinfunc(0., h, 0., 1e-240, 1e-240, 0., h);
+        assert!((actual - 0.5).abs() <= 4. * Real::EPSILON);
     }
 
     #[test]
