@@ -3,7 +3,8 @@ use super::{PassiveKind, PassiveParameters};
 use crate::devices::models::{ModelContext, ResolvedModel};
 use crate::devices::noise::{DeviceNoise, NoiseContext};
 use crate::devices::rlc::{
-    QUANTITY, REACTIVE_STATE_COUNT, ReactiveLoad, assemble_resistor, resistor_noise, stamp_resistor,
+    QUANTITY, REACTIVE_STATE_COUNT, ReactiveLoad, assemble_capacitor_ac, assemble_conductance,
+    assemble_inductor_ac, resistor_noise, stamp_conductance,
 };
 use crate::devices::{
     Device, InductanceValue, LinearContext, Resistor, ResistorMetadata, ResistorNoise,
@@ -67,7 +68,7 @@ impl Device for ModelPassive {
         Ok(match keyword {
             "r" | "resistance" if p.kind == PassiveKind::Resistor => Some(p.scaled_value(context)?),
             "g" | "conductance" if p.kind == PassiveKind::Resistor => {
-                Some(1. / p.effective_value(context)?)
+                Some(p.resistor_conductance(context, false)?)
             }
             "c" | "cap" | "capacitance" if p.kind == PassiveKind::Capacitor => {
                 Some(p.effective_value(context)?)
@@ -78,8 +79,8 @@ impl Device for ModelPassive {
             "m" => Some(p.multiplicity),
             "scale" => Some(p.scale),
             "temp" => Some(p.temperature.unwrap_or(context.temperature)),
-            "tc1" => Some(p.tc1),
-            "tc2" => Some(p.tc2),
+            "tc1" => Some(p.coefficients.linear),
+            "tc2" => Some(p.coefficients.quadratic),
             "ic" => Some(p.initial_condition.unwrap_or(0.)),
             _ => p.instance_values.get(keyword).map(|v| v.value),
         })
@@ -165,37 +166,91 @@ impl Device for ModelPassive {
         )
     }
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        let value = self.parameters.effective_value(&ModelContext::new(
-            context.temperature,
-            context.nominal_temperature,
-        ))?;
+        let model = ModelContext::new(context.temperature, context.nominal_temperature);
         match self.parameters.kind {
-            PassiveKind::Resistor => stamp_resistor(self.terminals, value, context),
-            PassiveKind::Capacitor => self.reactive_load(value).stamp_capacitor(context),
-            PassiveKind::Inductor => self.reactive_load(value).stamp_inductor(context),
+            PassiveKind::Resistor => stamp_conductance(
+                self.terminals,
+                self.parameters.resistor_conductance(&model, false)?,
+                context,
+            ),
+            PassiveKind::Capacitor => self
+                .reactive_load(self.parameters.effective_value(&model)?)
+                .stamp_capacitor(context),
+            PassiveKind::Inductor => self
+                .reactive_load(self.parameters.effective_value(&model)?)
+                .stamp_inductor(context),
         }
     }
+
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
-        let value = self.parameters.effective_value(context.model_context)?;
         match self.parameters.kind {
-            PassiveKind::Resistor => assemble_resistor(self.terminals, value, context),
-            PassiveKind::Capacitor => self.reactive_load(value).assemble_capacitor(context),
-            PassiveKind::Inductor => self.reactive_load(value).assemble_inductor(context),
+            PassiveKind::Resistor => assemble_conductance(
+                self.terminals,
+                self.parameters
+                    .resistor_conductance(context.model_context, false)?,
+                context,
+            ),
+            PassiveKind::Capacitor => self
+                .reactive_load(self.parameters.effective_value(context.model_context)?)
+                .assemble_capacitor(context),
+            PassiveKind::Inductor => self
+                .reactive_load(self.parameters.effective_value(context.model_context)?)
+                .assemble_inductor(context),
+        }
+    }
+
+    fn assemble_small_signal(
+        &self,
+        context: &mut LinearContext<'_>,
+        _bias: &crate::maths::Vector,
+    ) -> SpiceResult<()> {
+        let p = &self.parameters;
+        match p.kind {
+            PassiveKind::Resistor => assemble_conductance(
+                self.terminals,
+                p.resistor_conductance(context.model_context, true)?,
+                context,
+            ),
+            PassiveKind::Capacitor => {
+                let value = p.checked_scaled(context.model_context)?;
+                context.system.has_initial_conditions |= p.initial_condition.is_some();
+                assemble_capacitor_ac(self.terminals, value, p.multiplicity, context)
+            }
+            PassiveKind::Inductor => {
+                let value = p.checked_scaled(context.model_context)?;
+                context.system.has_initial_conditions |= p.initial_condition.is_some();
+                assemble_inductor_ac(self.terminals, value, p.multiplicity, context)
+            }
         }
     }
     /// `resnoise.c` for a resistor (including geometry, multiplier and temp);
     /// C and L have no noise generators. Validate the effective value in
     /// every family, as for stamps and linear assembly.
     fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
-        let value = self.parameters.effective_value(context.model_context)?;
+        self.parameters.effective_value(context.model_context)?;
         Ok(if self.parameters.kind == PassiveKind::Resistor {
+            let conductance = self
+                .parameters
+                .resistor_conductance(context.model_context, false)?;
+            let temperature = self
+                .parameters
+                .temperature_point(context.model_context)?
+                .effective();
             let evaluate = |noise: &ResistorNoise| {
                 resistor_noise(
                     self.terminals,
-                    value,
+                    conductance,
                     noise,
                     self.model.as_deref().or(noise.model.as_deref()),
                     context,
+                    if self.literal_noise.is_some()
+                        && self.parameters.temperature.is_none()
+                        && self.parameters.delta_temperature.is_none()
+                    {
+                        None
+                    } else {
+                        Some(temperature)
+                    },
                 )
             };
             self.literal_noise.as_deref().map_or_else(
@@ -294,7 +349,7 @@ pub(in crate::devices) fn instantiate(
     let parameters = model.passive_parameters(instance)?;
     // The schema validates the IC and effective_value validates the scalar
     // before any terminals are interned.
-    parameters.effective_value(context)?;
+    parameters.validate_effective(context)?;
     let terminals = nodes.intern_array(&instance.nodes)?;
     let device = ModelPassive {
         name: instance.name.clone(),
