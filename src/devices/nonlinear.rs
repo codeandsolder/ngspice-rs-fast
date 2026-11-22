@@ -42,6 +42,15 @@ use thermal::{
     potential_shift,
 };
 
+/// A series branch between two aliases of one electrical node contributes
+/// identically zero. Remove it before grouping diagonal conductances: a
+/// large perturbed resistance inverse would otherwise round away the
+/// intrinsic Jacobian terms before the sparse accumulator can cancel it.
+#[inline]
+pub(super) fn unaliased_conductance(a: NodeId, b: NodeId, conductance: Real) -> Real {
+    if a == b { 0. } else { conductance }
+}
+
 /// Diode state slot of the limited junction voltage (C `DIOvoltage`).
 const DIODE_CHARGE_SLOT: usize = 0;
 const DIODE_VOLTAGE_SLOT: usize = 2;
