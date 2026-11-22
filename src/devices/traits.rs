@@ -902,6 +902,14 @@ pub trait Device: fmt::Debug {
         ))
     }
 
+    /// The effective independent-source waveform after circuit finalization
+    /// (including RF port predecessor accumulation). Other devices have none.
+    fn independent_waveform(
+        &self,
+    ) -> Option<(crate::devices::SourceKind, &crate::devices::Waveform)> {
+        None
+    }
+
     /// When this device is an independent V/I source: its kind and whether an
     /// `ac` value was given, as the `.noise` input reference needs them.
     /// `None` (the default) for every other device.
