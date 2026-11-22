@@ -1185,7 +1185,7 @@ mod tests {
         let solution = Vector::zeros(1);
         let mut context = crate::devices::traits::StampContext {
             matrix: &mut matrix,
-            rhs: &mut rhs,
+            rhs: crate::devices::traits::StampRhs::dense(&mut rhs),
             unknowns: &unknowns,
             nodes: &nodes,
             solution: &solution,

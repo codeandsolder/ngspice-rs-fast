@@ -346,7 +346,7 @@ fn real_stamp_uses_explicit_temperature_and_initial_conditions_remain_visible() 
     let solution = Vector::zeros(1);
     let mut context = StampContext {
         matrix: &mut matrix,
-        rhs: &mut rhs,
+        rhs: ngspice_rs::devices::traits::StampRhs::dense(&mut rhs),
         unknowns,
         nodes,
         solution: &solution,
