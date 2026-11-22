@@ -7,11 +7,6 @@
     clippy::similar_names,
     reason = "C equation names preserve the reference distinctions"
 )]
-#![expect(clippy::manual_midpoint, reason = "retain C midpoint rounding order")]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "preserve non-fused C floating-point arithmetic"
-)]
 #![expect(
     unused_assignments,
     reason = "reference intermediate assignments remain in their equation sequence"
@@ -43,7 +38,7 @@
 #![expect(unused_parens, reason = "preserve C expression grouping")]
 use super::{
     DELTA_1, DELTA_3, DELTA_4, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP, MIN_EXP, Model,
-    SizeParam, exp, fabs, log, mode, sqrt, state,
+    SizeParam, exp, fabs, log, mode, smooth_vds, sqrt, state,
 };
 use super::{
     bias::LoadBias,
@@ -250,7 +245,7 @@ pub(super) fn intrinsic(
             dVbseffCV_dVb = -dPhis_dVb * dVbseff_dVb;
         }
         Vfb = pParam.vfbcv;
-        Vth = Vfb + pParam.phi + pParam.k1ox * sqrtPhis;
+        Vth = pParam.k1ox.mul_add(sqrtPhis, Vfb + pParam.phi);
         Vgst = Vgs_eff - Vth;
         dVth_dVb = pParam.k1ox * dsqrtPhis_dVb * dVbseff_dVb;
         dVgst_dVb = -dVth_dVb;
@@ -272,7 +267,7 @@ pub(super) fn intrinsic(
             here.cbsb = -here.cgsb;
         } else if Vgst <= 0.0 {
             T1 = 0.5 * pParam.k1ox;
-            T2 = sqrt(T1 * T1 + Arg1);
+            T2 = sqrt(T1.mul_add(T1, Arg1));
             qgate = CoxWL * pParam.k1ox * (T2 - T1);
             qbulk = -qgate;
             qdrn = 0.0;
@@ -293,7 +288,7 @@ pub(super) fn intrinsic(
             dAbulkCV_dVb = pParam.abulkCVfactor * dAbulk0_Q_dVb * dVbseff_dVb;
             dVdsat_dVg = 1.0 / AbulkCV;
             Vdsat = Vgst * dVdsat_dVg;
-            dVdsat_dVb = -(Vdsat * dAbulkCV_dVb + dVth_dVb) * dVdsat_dVg;
+            dVdsat_dVb = -Vdsat.mul_add(dAbulkCV_dVb, dVth_dVb) * dVdsat_dVg;
             if model.xpart > 0.5 {
                 if Vdsat <= Vds {
                     T1 = Vdsat / 3.0;
@@ -308,42 +303,42 @@ pub(super) fn intrinsic(
                     here.cdgb = 0.0;
                     here.cddb = 0.0;
                     here.cdsb = 0.0;
-                    here.cbgb = -(here.cggb - Two_Third_CoxWL * dVgs_eff_dVg);
-                    T3 = -(T2 + Two_Third_CoxWL * dVth_dVb);
+                    here.cbgb = -Two_Third_CoxWL.mul_add(-dVgs_eff_dVg, here.cggb);
+                    T3 = -Two_Third_CoxWL.mul_add(dVth_dVb, T2);
                     here.cbsb = -(here.cbgb + T3);
                     here.cbdb = 0.0;
                 } else {
                     Alphaz = Vgst / Vdsat;
-                    T1 = 2.0 * Vdsat - Vds;
+                    T1 = 2.0f64.mul_add(Vdsat, -Vds);
                     T2 = Vds / (3.0 * T1);
                     T3 = T2 * Vds;
                     T9 = 0.25 * CoxWL;
                     T4 = T9 * Alphaz;
-                    T7 = 2.0 * Vds - T1 - 3.0 * T3;
-                    T8 = T3 - T1 - 2.0 * Vds;
-                    qgate = CoxWL * (Vgs_eff - Vfb - pParam.phi - 0.5 * (Vds - T3));
+                    T7 = 3.0f64.mul_add(-T3, 2.0f64.mul_add(Vds, -T1));
+                    T8 = 2.0f64.mul_add(-Vds, T3 - T1);
+                    qgate = CoxWL * 0.5f64.mul_add(-(Vds - T3), Vgs_eff - Vfb - pParam.phi);
                     T10 = T4 * T8;
                     qdrn = T4 * T7;
                     qbulk = -(qgate + qdrn + T10);
                     T5 = T3 / T1;
-                    here.cggb = CoxWL * (1.0 - T5 * dVdsat_dVg) * dVgs_eff_dVg;
+                    here.cggb = CoxWL * T5.mul_add(-dVdsat_dVg, 1.0) * dVgs_eff_dVg;
                     T11 = -CoxWL * T5 * dVdsat_dVb;
-                    here.cgdb = CoxWL * (T2 - 0.5 + 0.5 * T5);
+                    here.cgdb = CoxWL * 0.5f64.mul_add(T5, T2 - 0.5);
                     here.cgsb = -(here.cggb + T11 + here.cgdb);
                     T6 = 1.0 / Vdsat;
-                    dAlphaz_dVg = T6 * (1.0 - Alphaz * dVdsat_dVg);
-                    dAlphaz_dVb = -T6 * (dVth_dVb + Alphaz * dVdsat_dVb);
+                    dAlphaz_dVg = T6 * Alphaz.mul_add(-dVdsat_dVg, 1.0);
+                    dAlphaz_dVb = -T6 * Alphaz.mul_add(dVdsat_dVb, dVth_dVb);
                     T7 = T9 * T7;
                     T8 = T9 * T8;
-                    T9 = 2.0 * T4 * (1.0 - 3.0 * T5);
-                    here.cdgb = (T7 * dAlphaz_dVg - T9 * dVdsat_dVg) * dVgs_eff_dVg;
-                    T12 = T7 * dAlphaz_dVb - T9 * dVdsat_dVb;
-                    here.cddb = T4 * (3.0 - 6.0 * T2 - 3.0 * T5);
+                    T9 = 2.0 * T4 * 3.0f64.mul_add(-T5, 1.0);
+                    here.cdgb = T9.mul_add(-dVdsat_dVg, T7 * dAlphaz_dVg) * dVgs_eff_dVg;
+                    T12 = T9.mul_add(-dVdsat_dVb, T7 * dAlphaz_dVb);
+                    here.cddb = T4 * 3.0f64.mul_add(-T5, 6.0f64.mul_add(-T2, 3.0));
                     here.cdsb = -(here.cdgb + T12 + here.cddb);
                     T9 = 2.0 * T4 * (1.0 + T5);
-                    T10 = (T8 * dAlphaz_dVg - T9 * dVdsat_dVg) * dVgs_eff_dVg;
-                    T11 = T8 * dAlphaz_dVb - T9 * dVdsat_dVb;
-                    T12 = T4 * (2.0 * T2 + T5 - 1.0);
+                    T10 = T9.mul_add(-dVdsat_dVg, T8 * dAlphaz_dVg) * dVgs_eff_dVg;
+                    T11 = T9.mul_add(-dVdsat_dVb, T8 * dAlphaz_dVb);
+                    T12 = T4 * (2.0f64.mul_add(T2, T5) - 1.0);
                     T0 = -(T10 + T11 + T12);
                     here.cbgb = -(here.cggb + here.cdgb + T10);
                     here.cbdb = -(here.cgdb + here.cddb + T12);
@@ -365,46 +360,58 @@ pub(super) fn intrinsic(
                     here.cddb = 0.0;
                     T4 = T3 * dVth_dVb;
                     here.cdsb = -(T4 + here.cdgb);
-                    here.cbgb = -(here.cggb - Two_Third_CoxWL * dVgs_eff_dVg);
-                    T3 = -(T2 + Two_Third_CoxWL * dVth_dVb);
+                    here.cbgb = -Two_Third_CoxWL.mul_add(-dVgs_eff_dVg, here.cggb);
+                    T3 = -Two_Third_CoxWL.mul_add(dVth_dVb, T2);
                     here.cbsb = -(here.cbgb + T3);
                     here.cbdb = 0.0;
                 } else {
                     Alphaz = Vgst / Vdsat;
-                    T1 = 2.0 * Vdsat - Vds;
+                    T1 = 2.0f64.mul_add(Vdsat, -Vds);
                     T2 = Vds / (3.0 * T1);
                     T3 = T2 * Vds;
                     T9 = 0.25 * CoxWL;
                     T4 = T9 * Alphaz;
-                    qgate = CoxWL * (Vgs_eff - Vfb - pParam.phi - 0.5 * (Vds - T3));
+                    qgate = CoxWL * 0.5f64.mul_add(-(Vds - T3), Vgs_eff - Vfb - pParam.phi);
                     T5 = T3 / T1;
-                    here.cggb = CoxWL * (1.0 - T5 * dVdsat_dVg) * dVgs_eff_dVg;
+                    here.cggb = CoxWL * T5.mul_add(-dVdsat_dVg, 1.0) * dVgs_eff_dVg;
                     tmp = -CoxWL * T5 * dVdsat_dVb;
-                    here.cgdb = CoxWL * (T2 - 0.5 + 0.5 * T5);
+                    here.cgdb = CoxWL * 0.5f64.mul_add(T5, T2 - 0.5);
                     here.cgsb = -(here.cggb + here.cgdb + tmp);
                     T6 = 1.0 / Vdsat;
-                    dAlphaz_dVg = T6 * (1.0 - Alphaz * dVdsat_dVg);
-                    dAlphaz_dVb = -T6 * (dVth_dVb + Alphaz * dVdsat_dVb);
-                    T6 = 8.0 * Vdsat * Vdsat - 6.0 * Vdsat * Vds + 1.2 * Vds * Vds;
+                    dAlphaz_dVg = T6 * Alphaz.mul_add(-dVdsat_dVg, 1.0);
+                    dAlphaz_dVb = -T6 * Alphaz.mul_add(dVdsat_dVb, dVth_dVb);
+                    T6 = f64::mul_add(
+                        (1.2 * Vds),
+                        Vds,
+                        (6.0 * Vdsat).mul_add(-Vds, 8.0 * Vdsat * Vdsat),
+                    );
                     T8 = T2 / T1;
-                    T7 = Vds - T1 - T8 * T6;
+                    T7 = T8.mul_add(-T6, Vds - T1);
                     qdrn = T4 * T7;
                     T7 *= T9;
                     tmp = T8 / T1;
-                    tmp1 = T4 * (2.0 - 4.0 * tmp * T6 + T8 * (16.0 * Vdsat - 6.0 * Vds));
-                    here.cdgb = (T7 * dAlphaz_dVg - tmp1 * dVdsat_dVg) * dVgs_eff_dVg;
-                    T10 = T7 * dAlphaz_dVb - tmp1 * dVdsat_dVb;
+                    tmp1 = T4
+                        * T8.mul_add(
+                            6.0f64.mul_add(-Vds, 16.0 * Vdsat),
+                            (4.0 * tmp).mul_add(-T6, 2.0),
+                        );
+                    here.cdgb = tmp1.mul_add(-dVdsat_dVg, T7 * dAlphaz_dVg) * dVgs_eff_dVg;
+                    T10 = tmp1.mul_add(-dVdsat_dVb, T7 * dAlphaz_dVb);
                     here.cddb = T4
-                        * (2.0 - (1.0 / (3.0 * T1 * T1) + 2.0 * tmp) * T6
-                            + T8 * (6.0 * Vdsat - 2.4 * Vds));
+                        * T8.mul_add(
+                            2.4f64.mul_add(-Vds, 6.0 * Vdsat),
+                            2.0f64.mul_add(tmp, 1.0 / (3.0 * T1 * T1)).mul_add(-T6, 2.0),
+                        );
                     here.cdsb = -(here.cdgb + T10 + here.cddb);
                     T7 = 2.0 * (T1 + T3);
-                    qbulk = -(qgate - T4 * T7);
+                    qbulk = -T4.mul_add(-T7, qgate);
                     T7 *= T9;
                     T0 = 4.0 * T4 * (1.0 - T5);
-                    T12 = (-T7 * dAlphaz_dVg - T0 * dVdsat_dVg) * dVgs_eff_dVg - here.cdgb;
-                    T11 = -T7 * dAlphaz_dVb - T10 - T0 * dVdsat_dVb;
-                    T10 = -4.0 * T4 * (T2 - 0.5 + 0.5 * T5) - here.cddb;
+                    T12 = T0
+                        .mul_add(-dVdsat_dVg, -T7 * dAlphaz_dVg)
+                        .mul_add(dVgs_eff_dVg, -here.cdgb);
+                    T11 = T0.mul_add(-dVdsat_dVb, (-T7).mul_add(dAlphaz_dVb, -T10));
+                    T10 = (-4.0 * T4).mul_add(0.5f64.mul_add(T5, T2 - 0.5), -here.cddb);
                     tmp = -(T10 + T11 + T12);
                     here.cbgb = -(here.cggb + here.cdgb + T12);
                     here.cbdb = -(here.cgdb + here.cddb + T10);
@@ -425,38 +432,38 @@ pub(super) fn intrinsic(
                     here.cddb = 0.0;
                     T4 = One_Third_CoxWL * dVth_dVb;
                     here.cdsb = -(T4 + here.cdgb);
-                    here.cbgb = -(here.cggb - Two_Third_CoxWL * dVgs_eff_dVg);
-                    T3 = -(T2 + Two_Third_CoxWL * dVth_dVb);
+                    here.cbgb = -Two_Third_CoxWL.mul_add(-dVgs_eff_dVg, here.cggb);
+                    T3 = -Two_Third_CoxWL.mul_add(dVth_dVb, T2);
                     here.cbsb = -(here.cbgb + T3);
                     here.cbdb = 0.0;
                 } else {
                     Alphaz = Vgst / Vdsat;
-                    T1 = 2.0 * Vdsat - Vds;
+                    T1 = 2.0f64.mul_add(Vdsat, -Vds);
                     T2 = Vds / (3.0 * T1);
                     T3 = T2 * Vds;
                     T9 = 0.25 * CoxWL;
                     T4 = T9 * Alphaz;
-                    qgate = CoxWL * (Vgs_eff - Vfb - pParam.phi - 0.5 * (Vds - T3));
+                    qgate = CoxWL * 0.5f64.mul_add(-(Vds - T3), Vgs_eff - Vfb - pParam.phi);
                     T5 = T3 / T1;
-                    here.cggb = CoxWL * (1.0 - T5 * dVdsat_dVg) * dVgs_eff_dVg;
+                    here.cggb = CoxWL * T5.mul_add(-dVdsat_dVg, 1.0) * dVgs_eff_dVg;
                     tmp = -CoxWL * T5 * dVdsat_dVb;
-                    here.cgdb = CoxWL * (T2 - 0.5 + 0.5 * T5);
+                    here.cgdb = CoxWL * 0.5f64.mul_add(T5, T2 - 0.5);
                     here.cgsb = -(here.cggb + here.cgdb + tmp);
                     T6 = 1.0 / Vdsat;
-                    dAlphaz_dVg = T6 * (1.0 - Alphaz * dVdsat_dVg);
-                    dAlphaz_dVb = -T6 * (dVth_dVb + Alphaz * dVdsat_dVb);
+                    dAlphaz_dVg = T6 * Alphaz.mul_add(-dVdsat_dVg, 1.0);
+                    dAlphaz_dVb = -T6 * Alphaz.mul_add(dVdsat_dVb, dVth_dVb);
                     T7 = T1 + T3;
                     qdrn = -T4 * T7;
                     qbulk = -(qgate + qdrn + qdrn);
                     T7 *= T9;
-                    T0 = T4 * (2.0 * T5 - 2.0);
-                    here.cdgb = (T0 * dVdsat_dVg - T7 * dAlphaz_dVg) * dVgs_eff_dVg;
-                    T12 = T0 * dVdsat_dVb - T7 * dAlphaz_dVb;
-                    here.cddb = T4 * (1.0 - 2.0 * T2 - T5);
+                    T0 = T4 * 2.0f64.mul_add(T5, -2.0);
+                    here.cdgb = T7.mul_add(-dAlphaz_dVg, T0 * dVdsat_dVg) * dVgs_eff_dVg;
+                    T12 = T7.mul_add(-dAlphaz_dVb, T0 * dVdsat_dVb);
+                    here.cddb = T4 * (2.0f64.mul_add(-T2, 1.0) - T5);
                     here.cdsb = -(here.cdgb + T12 + here.cddb);
-                    here.cbgb = -(here.cggb + 2.0 * here.cdgb);
-                    here.cbdb = -(here.cgdb + 2.0 * here.cddb);
-                    here.cbsb = -(here.cgsb + 2.0 * here.cdsb);
+                    here.cbgb = -2.0f64.mul_add(here.cdgb, here.cggb);
+                    here.cbdb = -2.0f64.mul_add(here.cddb, here.cgdb);
+                    here.cbsb = -2.0f64.mul_add(here.cdsb, here.cgsb);
                 }
             }
         }
@@ -491,10 +498,14 @@ pub(super) fn intrinsic(
                 ExpVgst = exp(VgstNVt);
                 Vgsteff = T0 * log(1.0 + ExpVgst);
                 dVgsteff_dVg = ExpVgst / (1.0 + ExpVgst);
-                dVgsteff_dVd = -dVgsteff_dVg * (dVth_dVd + (Vgst - voffcv) / noff * dnoff_dVd)
-                    + Vgsteff / noff * dnoff_dVd;
-                dVgsteff_dVb = -dVgsteff_dVg * (dVth_dVb + (Vgst - voffcv) / noff * dnoff_dVb)
-                    + Vgsteff / noff * dnoff_dVb;
+                dVgsteff_dVd = (Vgsteff / noff).mul_add(
+                    dnoff_dVd,
+                    -dVgsteff_dVg * ((Vgst - voffcv) / noff).mul_add(dnoff_dVd, dVth_dVd),
+                );
+                dVgsteff_dVb = (Vgsteff / noff).mul_add(
+                    dnoff_dVb,
+                    -dVgsteff_dVg * ((Vgst - voffcv) / noff).mul_add(dnoff_dVb, dVth_dVb),
+                );
                 dVgsteff_dVg *= dVgs_eff_dVg;
             }
         } else {
@@ -517,21 +528,21 @@ pub(super) fn intrinsic(
                 T3 = Vtm * log(1.0 + ExpVgst);
                 T10 = n * T3;
                 dT10_dVg = pParam.mstarcv * ExpVgst / (1.0 + ExpVgst);
-                dT10_dVb = T3 * dn_dVb - dT10_dVg * (dVth_dVb + Vgst * dn_dVb / n);
-                dT10_dVd = T3 * dn_dVd - dT10_dVg * (dVth_dVd + Vgst * dn_dVd / n);
+                dT10_dVb = dT10_dVg.mul_add(-(dVth_dVb + Vgst * dn_dVb / n), T3 * dn_dVb);
+                dT10_dVd = dT10_dVg.mul_add(-(dVth_dVd + Vgst * dn_dVd / n), T3 * dn_dVd);
                 dT10_dVg *= dVgs_eff_dVg;
             }
-            T1 = pParam.voffcbncv - (1.0 - pParam.mstarcv) * Vgst;
+            T1 = (1.0 - pParam.mstarcv).mul_add(-Vgst, pParam.voffcbncv);
             T2 = T1 / T0;
             if T2 < -EXP_THRESHOLD {
                 T3 = model.coxe * MIN_EXP / pParam.cdep0;
-                T9 = pParam.mstarcv + T3 * n;
+                T9 = T3.mul_add(n, pParam.mstarcv);
                 dT9_dVg = 0.0;
                 dT9_dVd = dn_dVd * T3;
                 dT9_dVb = dn_dVb * T3;
             } else if T2 > EXP_THRESHOLD {
                 T3 = model.coxe * MAX_EXP / pParam.cdep0;
-                T9 = pParam.mstarcv + T3 * n;
+                T9 = T3.mul_add(n, pParam.mstarcv);
                 dT9_dVg = 0.0;
                 dT9_dVd = dn_dVd * T3;
                 dT9_dVb = dn_dVb * T3;
@@ -540,28 +551,28 @@ pub(super) fn intrinsic(
                 T3 = model.coxe / pParam.cdep0;
                 T4 = T3 * ExpVgst;
                 T5 = T1 * T4 / T0;
-                T9 = pParam.mstarcv + n * T4;
+                T9 = f64::mul_add(n, T4, pParam.mstarcv);
                 dT9_dVg = T3 * (pParam.mstarcv - 1.0) * ExpVgst / Vtm;
-                dT9_dVb = T4 * dn_dVb - dT9_dVg * dVth_dVb - T5 * dn_dVb;
-                dT9_dVd = T4 * dn_dVd - dT9_dVg * dVth_dVd - T5 * dn_dVd;
+                dT9_dVb = T5.mul_add(-dn_dVb, dT9_dVg.mul_add(-dVth_dVb, T4 * dn_dVb));
+                dT9_dVd = T5.mul_add(-dn_dVd, dT9_dVg.mul_add(-dVth_dVd, T4 * dn_dVd));
                 dT9_dVg *= dVgs_eff_dVg;
             }
             Vgsteff = T10 / T9;
             T11 = T9 * T9;
-            dVgsteff_dVg = (T9 * dT10_dVg - T10 * dT9_dVg) / T11;
-            dVgsteff_dVd = (T9 * dT10_dVd - T10 * dT9_dVd) / T11;
-            dVgsteff_dVb = (T9 * dT10_dVb - T10 * dT9_dVb) / T11;
+            dVgsteff_dVg = T10.mul_add(-dT9_dVg, T9 * dT10_dVg) / T11;
+            dVgsteff_dVd = T10.mul_add(-dT9_dVd, T9 * dT10_dVd) / T11;
+            dVgsteff_dVb = T10.mul_add(-dT9_dVb, T9 * dT10_dVb) / T11;
         }
         if model.capMod == 1 {
             Vfb = here.vfbzb;
             V3 = Vfb - Vgs_eff + VbseffCV - DELTA_3;
             if Vfb <= 0.0 {
-                T0 = sqrt(V3 * V3 - 4.0 * DELTA_3 * Vfb);
+                T0 = sqrt((4.0 * DELTA_3).mul_add(-Vfb, V3 * V3));
             } else {
-                T0 = sqrt(V3 * V3 + 4.0 * DELTA_3 * Vfb);
+                T0 = sqrt((4.0 * DELTA_3).mul_add(Vfb, V3 * V3));
             }
-            T1 = 0.5 * (1.0 + V3 / T0);
-            Vfbeff = Vfb - 0.5 * (V3 + T0);
+            T1 = f64::midpoint(1.0, V3 / T0);
+            Vfbeff = Vfb - V3.midpoint(T0);
             dVfbeff_dVg = T1 * dVgs_eff_dVg;
             dVfbeff_dVb = -T1 * dVbseffCV_dVb;
             Qac0 = CoxWL * (Vfbeff - Vfb);
@@ -576,7 +587,7 @@ pub(super) fn intrinsic(
                 T1 = T0 + T3 / pParam.k1ox;
                 T2 = CoxWL;
             } else {
-                T1 = sqrt(T0 * T0 + T3);
+                T1 = sqrt(T0.mul_add(T0, T3));
                 T2 = CoxWL * T0 / T1;
             }
             Qsub0 = CoxWL * pParam.k1ox * (T1 - T0);
@@ -586,80 +597,80 @@ pub(super) fn intrinsic(
             AbulkCV = Abulk0_Q * pParam.abulkCVfactor;
             dAbulkCV_dVb = pParam.abulkCVfactor * dAbulk0_Q_dVb;
             VdsatCV = Vgsteff / AbulkCV;
-            T0 = VdsatCV - Vds - DELTA_4;
             dT0_dVg = 1.0 / AbulkCV;
             dT0_dVb = -VdsatCV * dAbulkCV_dVb / AbulkCV;
-            T1 = sqrt(T0 * T0 + 4.0 * DELTA_4 * VdsatCV);
-            dT1_dVg = (T0 + DELTA_4 + DELTA_4) / T1;
-            dT1_dVd = -T0 / T1;
-            dT1_dVb = dT1_dVg * dT0_dVb;
-            dT1_dVg *= dT0_dVg;
-            if T0 >= 0.0 {
-                VdseffCV = VdsatCV - 0.5 * (T0 + T1);
-                dVdseffCV_dVg = 0.5 * (dT0_dVg - dT1_dVg);
-                dVdseffCV_dVd = 0.5 * (1.0 - dT1_dVd);
-                dVdseffCV_dVb = 0.5 * (dT0_dVb - dT1_dVb);
-            } else {
-                let twice_delta = DELTA_4 + DELTA_4;
-                T3 = twice_delta / (T1 - T0);
-                T4 = 1.0 - T3;
-                T5 = VdsatCV * T3 / (T1 - T0);
-                VdseffCV = VdsatCV * T4;
-                dVdseffCV_dVg = dT0_dVg * T4 + T5 * (dT1_dVg - dT0_dVg);
-                dVdseffCV_dVd = T5 * (dT1_dVd + 1.0);
-                dVdseffCV_dVb = dT0_dVb * (T4 - T5) + T5 * dT1_dVb;
-            }
+            let (effective, d_saturation, d_drain) = smooth_vds(VdsatCV, Vds, DELTA_4);
+            VdseffCV = effective;
+            dVdseffCV_dVg = d_saturation * dT0_dVg;
+            dVdseffCV_dVd = d_drain;
+            dVdseffCV_dVb = d_saturation * dT0_dVb;
             if Vds == 0.0 {
                 VdseffCV = 0.0;
                 dVdseffCV_dVg = 0.0;
                 dVdseffCV_dVb = 0.0;
             }
             T0 = AbulkCV * VdseffCV;
-            T1 = 12.0 * (Vgsteff - 0.5 * T0 + 1.0e-20);
+            T1 = 12.0 * (0.5f64.mul_add(-T0, Vgsteff) + 1.0e-20);
             T2 = VdseffCV / T1;
             T3 = T0 * T2;
-            T4 = (1.0 - 12.0 * T2 * T2 * AbulkCV);
-            T5 = (6.0 * T0 * (4.0 * Vgsteff - T0) / (T1 * T1) - 0.5);
+            T4 = (12.0 * T2 * T2).mul_add(-AbulkCV, 1.0);
+            T5 = (6.0 * T0 * 4.0f64.mul_add(Vgsteff, -T0) / (T1 * T1) - 0.5);
             T6 = 12.0 * T2 * T2 * Vgsteff;
-            qgate = CoxWL * (Vgsteff - 0.5 * VdseffCV + T3);
-            Cgg1 = CoxWL * (T4 + T5 * dVdseffCV_dVg);
-            Cgd1 = CoxWL * T5 * dVdseffCV_dVd + Cgg1 * dVgsteff_dVd;
-            Cgb1 = CoxWL * (T5 * dVdseffCV_dVb + T6 * dAbulkCV_dVb) + Cgg1 * dVgsteff_dVb;
+            qgate = CoxWL * (0.5f64.mul_add(-VdseffCV, Vgsteff) + T3);
+            Cgg1 = CoxWL * T5.mul_add(dVdseffCV_dVg, T4);
+            Cgd1 = Cgg1.mul_add(dVgsteff_dVd, CoxWL * T5 * dVdseffCV_dVd);
+            Cgb1 = Cgg1.mul_add(
+                dVgsteff_dVb,
+                CoxWL * T6.mul_add(dAbulkCV_dVb, T5 * dVdseffCV_dVb),
+            );
             Cgg1 *= dVgsteff_dVg;
             T7 = 1.0 - AbulkCV;
-            qbulk = CoxWL * T7 * (0.5 * VdseffCV - T3);
+            qbulk = CoxWL * T7 * 0.5f64.mul_add(VdseffCV, -T3);
             T4 = -T7 * (T4 - 1.0);
             T5 = -T7 * T5;
-            T6 = -(T7 * T6 + (0.5 * VdseffCV - T3));
-            Cbg1 = CoxWL * (T4 + T5 * dVdseffCV_dVg);
-            Cbd1 = CoxWL * T5 * dVdseffCV_dVd + Cbg1 * dVgsteff_dVd;
-            Cbb1 = CoxWL * (T5 * dVdseffCV_dVb + T6 * dAbulkCV_dVb) + Cbg1 * dVgsteff_dVb;
+            T6 = -T7.mul_add(T6, 0.5f64.mul_add(VdseffCV, -T3));
+            Cbg1 = CoxWL * T5.mul_add(dVdseffCV_dVg, T4);
+            Cbd1 = Cbg1.mul_add(dVgsteff_dVd, CoxWL * T5 * dVdseffCV_dVd);
+            Cbb1 = Cbg1.mul_add(
+                dVgsteff_dVb,
+                CoxWL * T6.mul_add(dAbulkCV_dVb, T5 * dVdseffCV_dVb),
+            );
             Cbg1 *= dVgsteff_dVg;
             if model.xpart > 0.5 {
                 T1 = T1 + T1;
-                qsrc = -CoxWL * (0.5 * Vgsteff + 0.25 * T0 - T0 * T0 / T1);
-                T7 = (4.0 * Vgsteff - T0) / (T1 * T1);
+                qsrc = -CoxWL * (0.25f64.mul_add(T0, 0.5 * Vgsteff) - T0 * T0 / T1);
+                T7 = 4.0f64.mul_add(Vgsteff, -T0) / (T1 * T1);
                 T4 = -(0.5 + 24.0 * T0 * T0 / (T1 * T1));
-                T5 = -(0.25 * AbulkCV - 12.0 * AbulkCV * T0 * T7);
-                T6 = -(0.25 * VdseffCV - 12.0 * T0 * VdseffCV * T7);
-                Csg = CoxWL * (T4 + T5 * dVdseffCV_dVg);
-                Csd = CoxWL * T5 * dVdseffCV_dVd + Csg * dVgsteff_dVd;
-                Csb = CoxWL * (T5 * dVdseffCV_dVb + T6 * dAbulkCV_dVb) + Csg * dVgsteff_dVb;
+                T5 = -(12.0 * AbulkCV * T0).mul_add(-T7, 0.25 * AbulkCV);
+                T6 = -(12.0 * T0 * VdseffCV).mul_add(-T7, 0.25 * VdseffCV);
+                Csg = CoxWL * T5.mul_add(dVdseffCV_dVg, T4);
+                Csd = Csg.mul_add(dVgsteff_dVd, CoxWL * T5 * dVdseffCV_dVd);
+                Csb = Csg.mul_add(
+                    dVgsteff_dVb,
+                    CoxWL * T6.mul_add(dAbulkCV_dVb, T5 * dVdseffCV_dVb),
+                );
                 Csg *= dVgsteff_dVg;
             } else if model.xpart < 0.5 {
                 T1 = T1 / 12.0;
                 T2 = 0.5 * CoxWL / (T1 * T1);
-                T3 = Vgsteff * (2.0 * T0 * T0 / 3.0 + Vgsteff * (Vgsteff - 4.0 * T0 / 3.0))
-                    - 2.0 * T0 * T0 * T0 / 15.0;
+                T3 = Vgsteff.mul_add(
+                    Vgsteff.mul_add(Vgsteff - 4.0 * T0 / 3.0, 2.0 * T0 * T0 / 3.0),
+                    -(2.0 * T0 * T0 * T0 / 15.0),
+                );
                 qsrc = -T2 * T3;
-                T7 = 4.0 / 3.0 * Vgsteff * (Vgsteff - T0) + 0.4 * T0 * T0;
-                T4 = -2.0 * qsrc / T1
-                    - T2 * (Vgsteff * (3.0 * Vgsteff - 8.0 * T0 / 3.0) + 2.0 * T0 * T0 / 3.0);
-                T5 = (qsrc / T1 + T2 * T7) * AbulkCV;
-                T6 = (qsrc / T1 * VdseffCV + T2 * T7 * VdseffCV);
-                Csg = (T4 + T5 * dVdseffCV_dVg);
-                Csd = T5 * dVdseffCV_dVd + Csg * dVgsteff_dVd;
-                Csb = (T5 * dVdseffCV_dVb + T6 * dAbulkCV_dVb) + Csg * dVgsteff_dVb;
+                T7 = (0.4 * T0).mul_add(T0, 4.0 / 3.0 * Vgsteff * (Vgsteff - T0));
+                T4 = T2.mul_add(
+                    -Vgsteff.mul_add(
+                        3.0f64.mul_add(Vgsteff, -8.0 * T0 / 3.0),
+                        2.0 * T0 * T0 / 3.0,
+                    ),
+                    -2.0 * qsrc / T1,
+                );
+                T5 = T2.mul_add(T7, qsrc / T1) * AbulkCV;
+                T6 = (T2 * T7).mul_add(VdseffCV, qsrc / T1 * VdseffCV);
+                Csg = T5.mul_add(dVdseffCV_dVg, T4);
+                Csd = Csg.mul_add(dVgsteff_dVd, T5 * dVdseffCV_dVd);
+                Csb = Csg.mul_add(dVgsteff_dVb, T6.mul_add(dAbulkCV_dVb, T5 * dVdseffCV_dVb));
                 Csg *= dVgsteff_dVg;
             } else {
                 qsrc = -0.5 * (qgate + qbulk);
@@ -691,12 +702,12 @@ pub(super) fn intrinsic(
         } else if model.capMod == 2 {
             V3 = here.vfbzb - Vgs_eff + VbseffCV - DELTA_3;
             if here.vfbzb <= 0.0 {
-                T0 = sqrt(V3 * V3 - 4.0 * DELTA_3 * here.vfbzb);
+                T0 = sqrt((4.0 * DELTA_3).mul_add(-here.vfbzb, V3 * V3));
             } else {
-                T0 = sqrt(V3 * V3 + 4.0 * DELTA_3 * here.vfbzb);
+                T0 = sqrt((4.0 * DELTA_3).mul_add(here.vfbzb, V3 * V3));
             }
-            T1 = 0.5 * (1.0 + V3 / T0);
-            Vfbeff = here.vfbzb - 0.5 * (V3 + T0);
+            T1 = f64::midpoint(1.0, V3 / T0);
+            Vfbeff = here.vfbzb - V3.midpoint(T0);
             dVfbeff_dVg = T1 * dVgs_eff_dVg;
             dVfbeff_dVb = -T1 * dVbseffCV_dVb;
             Cox = here.coxp;
@@ -721,9 +732,9 @@ pub(super) fn intrinsic(
             }
             LINK = 1.0e-3 * here.toxp;
             V3 = pParam.ldeb - Tcen - LINK;
-            V4 = sqrt(V3 * V3 + 4.0 * LINK * pParam.ldeb);
-            Tcen = pParam.ldeb - 0.5 * (V3 + V4);
-            T1 = 0.5 * (1.0 + V3 / V4);
+            V4 = sqrt((4.0 * LINK).mul_add(pParam.ldeb, V3 * V3));
+            Tcen = pParam.ldeb - V3.midpoint(V4);
+            T1 = f64::midpoint(1.0, V3 / V4);
             dTcen_dVg *= T1;
             dTcen_dVb *= T1;
             Ccen = epssub / Tcen;
@@ -736,8 +747,8 @@ pub(super) fn intrinsic(
             CoxWLcen = CoxWL * Coxeff / model.coxe;
             Qac0 = CoxWLcen * (Vfbeff - here.vfbzb);
             QovCox = Qac0 / Coxeff;
-            dQac0_dVg = CoxWLcen * dVfbeff_dVg + QovCox * dCoxeff_dVg;
-            dQac0_dVb = CoxWLcen * dVfbeff_dVb + QovCox * dCoxeff_dVb;
+            dQac0_dVg = QovCox.mul_add(dCoxeff_dVg, CoxWLcen * dVfbeff_dVg);
+            dQac0_dVb = QovCox.mul_add(dCoxeff_dVb, CoxWLcen * dVfbeff_dVb);
             T0 = 0.5 * pParam.k1ox;
             T3 = Vgs_eff - Vfbeff - VbseffCV - Vgsteff;
             if pParam.k1ox == 0.0 {
@@ -747,14 +758,20 @@ pub(super) fn intrinsic(
                 T1 = T0 + T3 / pParam.k1ox;
                 T2 = CoxWLcen;
             } else {
-                T1 = sqrt(T0 * T0 + T3);
+                T1 = sqrt(T0.mul_add(T0, T3));
                 T2 = CoxWLcen * T0 / T1;
             }
             Qsub0 = CoxWLcen * pParam.k1ox * (T1 - T0);
             QovCox = Qsub0 / Coxeff;
-            dQsub0_dVg = T2 * (dVgs_eff_dVg - dVfbeff_dVg - dVgsteff_dVg) + QovCox * dCoxeff_dVg;
+            dQsub0_dVg = QovCox.mul_add(
+                dCoxeff_dVg,
+                T2 * (dVgs_eff_dVg - dVfbeff_dVg - dVgsteff_dVg),
+            );
             dQsub0_dVd = -T2 * dVgsteff_dVd;
-            dQsub0_dVb = -T2 * (dVfbeff_dVb + dVbseffCV_dVb + dVgsteff_dVb) + QovCox * dCoxeff_dVb;
+            dQsub0_dVb = QovCox.mul_add(
+                dCoxeff_dVb,
+                -T2 * (dVfbeff_dVb + dVbseffCV_dVb + dVgsteff_dVb),
+            );
             if pParam.k1ox <= 0.0 {
                 Denomi = 0.25 * pParam.moin * Vtm;
                 T0 = 0.5 * pParam.sqrtPhi;
@@ -762,14 +779,14 @@ pub(super) fn intrinsic(
                 Denomi = pParam.moin * Vtm * pParam.k1ox * pParam.k1ox;
                 T0 = pParam.k1ox * pParam.sqrtPhi;
             }
-            T1 = 2.0 * T0 + Vgsteff;
+            T1 = 2.0f64.mul_add(T0, Vgsteff);
             DeltaPhi = Vtm * log(1.0 + T1 * Vgsteff / Denomi);
-            dDeltaPhi_dVg = 2.0 * Vtm * (T1 - T0) / (Denomi + T1 * Vgsteff);
+            dDeltaPhi_dVg = 2.0 * Vtm * (T1 - T0) / T1.mul_add(Vgsteff, Denomi);
             T0 = Vgsteff - DeltaPhi - 0.001;
             dT0_dVg = 1.0 - dDeltaPhi_dVg;
-            T1 = sqrt(T0 * T0 + Vgsteff * 0.004);
-            VgDP = 0.5 * (T0 + T1);
-            dVgDP_dVg = 0.5 * (dT0_dVg + (T0 * dT0_dVg + 0.002) / T1);
+            T1 = sqrt(Vgsteff.mul_add(0.004, T0 * T0));
+            VgDP = f64::midpoint(T0, T1);
+            dVgDP_dVg = f64::midpoint(dT0_dVg, T0.mul_add(dT0_dVg, 0.002) / T1);
             Tox += Tox;
             T0 = (Vgsteff + here.vtfbphi2) / Tox;
             tmp = exp(model.bdos * 0.7 * log(T0));
@@ -792,29 +809,13 @@ pub(super) fn intrinsic(
             AbulkCV = Abulk0_Q * pParam.abulkCVfactor;
             dAbulkCV_dVb = pParam.abulkCVfactor * dAbulk0_Q_dVb;
             VdsatCV = VgDP / AbulkCV;
-            T0 = VdsatCV - Vds - DELTA_4;
             dT0_dVg = dVgDP_dVg / AbulkCV;
             dT0_dVb = -VdsatCV * dAbulkCV_dVb / AbulkCV;
-            T1 = sqrt(T0 * T0 + 4.0 * DELTA_4 * VdsatCV);
-            dT1_dVg = (T0 + DELTA_4 + DELTA_4) / T1;
-            dT1_dVd = -T0 / T1;
-            dT1_dVb = dT1_dVg * dT0_dVb;
-            dT1_dVg *= dT0_dVg;
-            if T0 >= 0.0 {
-                VdseffCV = VdsatCV - 0.5 * (T0 + T1);
-                dVdseffCV_dVg = 0.5 * (dT0_dVg - dT1_dVg);
-                dVdseffCV_dVd = 0.5 * (1.0 - dT1_dVd);
-                dVdseffCV_dVb = 0.5 * (dT0_dVb - dT1_dVb);
-            } else {
-                let twice_delta = DELTA_4 + DELTA_4;
-                T3 = twice_delta / (T1 - T0);
-                T4 = 1.0 - T3;
-                T5 = VdsatCV * T3 / (T1 - T0);
-                VdseffCV = VdsatCV * T4;
-                dVdseffCV_dVg = dT0_dVg * T4 + T5 * (dT1_dVg - dT0_dVg);
-                dVdseffCV_dVd = T5 * (dT1_dVd + 1.0);
-                dVdseffCV_dVb = dT0_dVb * (T4 - T5) + T5 * dT1_dVb;
-            }
+            let (effective, d_saturation, d_drain) = smooth_vds(VdsatCV, Vds, DELTA_4);
+            VdseffCV = effective;
+            dVdseffCV_dVg = d_saturation * dT0_dVg;
+            dVdseffCV_dVd = d_drain;
+            dVdseffCV_dVb = d_saturation * dT0_dVb;
             if Vds == 0.0 {
                 VdseffCV = 0.0;
                 dVdseffCV_dVg = 0.0;
@@ -822,67 +823,92 @@ pub(super) fn intrinsic(
             }
             T0 = AbulkCV * VdseffCV;
             T1 = VgDP;
-            T2 = 12.0 * (T1 - 0.5 * T0 + 1.0e-20);
+            T2 = 12.0 * (0.5f64.mul_add(-T0, T1) + 1.0e-20);
             T3 = T0 / T2;
-            T4 = 1.0 - 12.0 * T3 * T3;
-            T5 = AbulkCV * (6.0 * T0 * (4.0 * T1 - T0) / (T2 * T2) - 0.5);
+            T4 = (12.0 * T3).mul_add(-T3, 1.0);
+            T5 = AbulkCV * (6.0 * T0 * 4.0f64.mul_add(T1, -T0) / (T2 * T2) - 0.5);
             T6 = T5 * VdseffCV / AbulkCV;
-            qgate = CoxWLcen * (T1 - T0 * (0.5 - T3));
+            qgate = CoxWLcen * T0.mul_add(-(0.5 - T3), T1);
             QovCox = qgate / Coxeff;
-            Cgg1 = CoxWLcen * (T4 * dVgDP_dVg + T5 * dVdseffCV_dVg);
-            Cgd1 = CoxWLcen * T5 * dVdseffCV_dVd + Cgg1 * dVgsteff_dVd + QovCox * dCoxeff_dVd;
-            Cgb1 = CoxWLcen * (T5 * dVdseffCV_dVb + T6 * dAbulkCV_dVb)
-                + Cgg1 * dVgsteff_dVb
-                + QovCox * dCoxeff_dVb;
-            Cgg1 = Cgg1 * dVgsteff_dVg + QovCox * dCoxeff_dVg;
+            Cgg1 = CoxWLcen * T5.mul_add(dVdseffCV_dVg, T4 * dVgDP_dVg);
+            Cgd1 = QovCox.mul_add(
+                dCoxeff_dVd,
+                Cgg1.mul_add(dVgsteff_dVd, CoxWLcen * T5 * dVdseffCV_dVd),
+            );
+            Cgb1 = QovCox.mul_add(
+                dCoxeff_dVb,
+                Cgg1.mul_add(
+                    dVgsteff_dVb,
+                    CoxWLcen * T6.mul_add(dAbulkCV_dVb, T5 * dVdseffCV_dVb),
+                ),
+            );
+            Cgg1 = QovCox.mul_add(dCoxeff_dVg, Cgg1 * dVgsteff_dVg);
             T7 = 1.0 - AbulkCV;
             T8 = T2 * T2;
             T9 = 12.0 * T7 * T0 * T0 / (T8 * AbulkCV);
             T10 = T9 * dVgDP_dVg;
             T11 = -T7 * T5 / AbulkCV;
-            T12 = -(T9 * T1 / AbulkCV + VdseffCV * (0.5 - T0 / T2));
-            qbulk = CoxWLcen * T7 * (0.5 * VdseffCV - T0 * VdseffCV / T2);
+            T12 = -VdseffCV.mul_add(0.5 - T0 / T2, T9 * T1 / AbulkCV);
+            qbulk = CoxWLcen * T7 * 0.5f64.mul_add(VdseffCV, -(T0 * VdseffCV / T2));
             QovCox = qbulk / Coxeff;
-            Cbg1 = CoxWLcen * (T10 + T11 * dVdseffCV_dVg);
-            Cbd1 = CoxWLcen * T11 * dVdseffCV_dVd + Cbg1 * dVgsteff_dVd + QovCox * dCoxeff_dVd;
-            Cbb1 = CoxWLcen * (T11 * dVdseffCV_dVb + T12 * dAbulkCV_dVb)
-                + Cbg1 * dVgsteff_dVb
-                + QovCox * dCoxeff_dVb;
-            Cbg1 = Cbg1 * dVgsteff_dVg + QovCox * dCoxeff_dVg;
+            Cbg1 = CoxWLcen * T11.mul_add(dVdseffCV_dVg, T10);
+            Cbd1 = QovCox.mul_add(
+                dCoxeff_dVd,
+                Cbg1.mul_add(dVgsteff_dVd, CoxWLcen * T11 * dVdseffCV_dVd),
+            );
+            Cbb1 = QovCox.mul_add(
+                dCoxeff_dVb,
+                Cbg1.mul_add(
+                    dVgsteff_dVb,
+                    CoxWLcen * T12.mul_add(dAbulkCV_dVb, T11 * dVdseffCV_dVb),
+                ),
+            );
+            Cbg1 = QovCox.mul_add(dCoxeff_dVg, Cbg1 * dVgsteff_dVg);
             if model.xpart > 0.5 {
                 qsrc = -CoxWLcen * (T1 / 2.0 + T0 / 4.0 - 0.5 * T0 * T0 / T2);
                 QovCox = qsrc / Coxeff;
                 T2 += T2;
                 T3 = T2 * T2;
-                T7 = -(0.25 - 12.0 * T0 * (4.0 * T1 - T0) / T3);
+                T7 = -(0.25 - 12.0 * T0 * 4.0f64.mul_add(T1, -T0) / T3);
                 T4 = -(0.5 + 24.0 * T0 * T0 / T3) * dVgDP_dVg;
                 T5 = T7 * AbulkCV;
                 T6 = T7 * VdseffCV;
-                Csg = CoxWLcen * (T4 + T5 * dVdseffCV_dVg);
-                Csd = CoxWLcen * T5 * dVdseffCV_dVd + Csg * dVgsteff_dVd + QovCox * dCoxeff_dVd;
-                Csb = CoxWLcen * (T5 * dVdseffCV_dVb + T6 * dAbulkCV_dVb)
-                    + Csg * dVgsteff_dVb
-                    + QovCox * dCoxeff_dVb;
-                Csg = Csg * dVgsteff_dVg + QovCox * dCoxeff_dVg;
+                Csg = CoxWLcen * T5.mul_add(dVdseffCV_dVg, T4);
+                Csd = QovCox.mul_add(
+                    dCoxeff_dVd,
+                    Csg.mul_add(dVgsteff_dVd, CoxWLcen * T5 * dVdseffCV_dVd),
+                );
+                Csb = QovCox.mul_add(
+                    dCoxeff_dVb,
+                    Csg.mul_add(
+                        dVgsteff_dVb,
+                        CoxWLcen * T6.mul_add(dAbulkCV_dVb, T5 * dVdseffCV_dVb),
+                    ),
+                );
+                Csg = QovCox.mul_add(dCoxeff_dVg, Csg * dVgsteff_dVg);
             } else if model.xpart < 0.5 {
                 T2 = T2 / 12.0;
                 T3 = 0.5 * CoxWLcen / (T2 * T2);
-                T4 = T1 * (2.0 * T0 * T0 / 3.0 + T1 * (T1 - 4.0 * T0 / 3.0))
-                    - 2.0 * T0 * T0 * T0 / 15.0;
+                T4 = T1.mul_add(
+                    T1.mul_add(T1 - 4.0 * T0 / 3.0, 2.0 * T0 * T0 / 3.0),
+                    -(2.0 * T0 * T0 * T0 / 15.0),
+                );
                 qsrc = -T3 * T4;
                 QovCox = qsrc / Coxeff;
-                T8 = 4.0 / 3.0 * T1 * (T1 - T0) + 0.4 * T0 * T0;
-                T5 = -2.0 * qsrc / T2
-                    - T3 * (T1 * (3.0 * T1 - 8.0 * T0 / 3.0) + 2.0 * T0 * T0 / 3.0);
-                T6 = AbulkCV * (qsrc / T2 + T3 * T8);
+                T8 = (0.4 * T0).mul_add(T0, 4.0 / 3.0 * T1 * (T1 - T0));
+                T5 = T3.mul_add(
+                    -T1.mul_add(3.0f64.mul_add(T1, -8.0 * T0 / 3.0), 2.0 * T0 * T0 / 3.0),
+                    -2.0 * qsrc / T2,
+                );
+                T6 = AbulkCV * T3.mul_add(T8, qsrc / T2);
                 T7 = T6 * VdseffCV / AbulkCV;
-                Csg = T5 * dVgDP_dVg + T6 * dVdseffCV_dVg;
-                Csd = Csg * dVgsteff_dVd + T6 * dVdseffCV_dVd + QovCox * dCoxeff_dVd;
-                Csb = Csg * dVgsteff_dVb
-                    + T6 * dVdseffCV_dVb
-                    + T7 * dAbulkCV_dVb
-                    + QovCox * dCoxeff_dVb;
-                Csg = Csg * dVgsteff_dVg + QovCox * dCoxeff_dVg;
+                Csg = T6.mul_add(dVdseffCV_dVg, T5 * dVgDP_dVg);
+                Csd = QovCox.mul_add(dCoxeff_dVd, T6.mul_add(dVdseffCV_dVd, Csg * dVgsteff_dVd));
+                Csb = QovCox.mul_add(
+                    dCoxeff_dVb,
+                    T7.mul_add(dAbulkCV_dVb, T6.mul_add(dVdseffCV_dVb, Csg * dVgsteff_dVb)),
+                );
+                Csg = QovCox.mul_add(dCoxeff_dVg, Csg * dVgsteff_dVg);
             } else {
                 qsrc = -0.5 * qgate;
                 Csg = -0.5 * Cgg1;
@@ -1156,19 +1182,25 @@ pub(super) fn companion(
             qgso = pParam.cgso * vgsx;
         } else {
             T0 = vgdx + DELTA_1;
-            T1 = sqrt(T0 * T0 + 4.0 * DELTA_1);
+            T1 = sqrt(4.0f64.mul_add(DELTA_1, T0 * T0));
             T2 = 0.5 * (T0 - T1);
             T3 = pParam.weffCV * pParam.cgdl;
             T4 = sqrt(1.0 - 4.0 * T2 / pParam.ckappad);
-            cgdo = pParam.cgdo + T3 - T3 * (1.0 - 1.0 / T4) * (0.5 - 0.5 * T0 / T1);
-            qgdo = (pParam.cgdo + T3) * vgdx - T3 * (T2 + 0.5 * pParam.ckappad * (T4 - 1.0));
+            cgdo = (T3 * (1.0 - 1.0 / T4)).mul_add(-(0.5 - 0.5 * T0 / T1), pParam.cgdo + T3);
+            qgdo = T3.mul_add(
+                -(0.5 * pParam.ckappad).mul_add(T4 - 1.0, T2),
+                (pParam.cgdo + T3) * vgdx,
+            );
             T0 = vgsx + DELTA_1;
-            T1 = sqrt(T0 * T0 + 4.0 * DELTA_1);
+            T1 = sqrt(4.0f64.mul_add(DELTA_1, T0 * T0));
             T2 = 0.5 * (T0 - T1);
             T3 = pParam.weffCV * pParam.cgsl;
             T4 = sqrt(1.0 - 4.0 * T2 / pParam.ckappas);
-            cgso = pParam.cgso + T3 - T3 * (1.0 - 1.0 / T4) * (0.5 - 0.5 * T0 / T1);
-            qgso = (pParam.cgso + T3) * vgsx - T3 * (T2 + 0.5 * pParam.ckappas * (T4 - 1.0));
+            cgso = (T3 * (1.0 - 1.0 / T4)).mul_add(-(0.5 - 0.5 * T0 / T1), pParam.cgso + T3);
+            qgso = T3.mul_add(
+                -(0.5 * pParam.ckappas).mul_add(T4 - 1.0, T2),
+                (pParam.cgso + T3) * vgsx,
+            );
         }
         if here.nf != 1.0 {
             cgdo *= here.nf;
@@ -1232,7 +1264,7 @@ pub(super) fn companion(
                     gcsbsb = 0.0;
                 } else {
                     gcdbb = -(here.cddb + here.cdgb + here.cdsb) * ag0;
-                    gcsbb = -(gcsgb + gcsdb + gcssb + gcsgmb) + here.capbs * ag0;
+                    gcsbb = here.capbs.mul_add(ag0, -(gcsgb + gcsdb + gcssb + gcsgmb));
                     gcbdb = here.cbdb * ag0;
                     gcbsb = here.cbsb * ag0;
                     gcdbdb = -here.capbd * ag0;
@@ -1286,13 +1318,13 @@ pub(super) fn companion(
                     dxpart = qdrn / qcheq;
                     Cdd = here.cddb;
                     Csd = -(here.cgdb + here.cddb + here.cbdb);
-                    ddxpart_dVd = (Cdd - dxpart * (Cdd + Csd)) / qcheq;
+                    ddxpart_dVd = dxpart.mul_add(-(Cdd + Csd), Cdd) / qcheq;
                     Cdg = here.cdgb;
                     Csg = -(here.cggb + here.cdgb + here.cbgb);
-                    ddxpart_dVg = (Cdg - dxpart * (Cdg + Csg)) / qcheq;
+                    ddxpart_dVg = dxpart.mul_add(-(Cdg + Csg), Cdg) / qcheq;
                     Cds = here.cdsb;
                     Css = -(here.cgsb + here.cdsb + here.cbsb);
-                    ddxpart_dVs = (Cds - dxpart * (Cds + Css)) / qcheq;
+                    ddxpart_dVs = dxpart.mul_add(-(Cds + Css), Cds) / qcheq;
                     ddxpart_dVb = -(ddxpart_dVd + ddxpart_dVg + ddxpart_dVs);
                 }
                 sxpart = 1.0 - dxpart;
@@ -1409,7 +1441,7 @@ pub(super) fn companion(
                     gcdbdb = 0.0;
                     gcsbsb = 0.0;
                 } else {
-                    gcdbb = -(gcdgb + gcddb + gcdsb + gcdgmb) + here.capbd * ag0;
+                    gcdbb = here.capbd.mul_add(ag0, -(gcdgb + gcddb + gcdsb + gcdgmb));
                     gcsbb = -(here.cddb + here.cdgb + here.cdsb) * ag0;
                     gcbdb = here.cbsb * ag0;
                     gcbsb = here.cbdb * ag0;
@@ -1464,13 +1496,13 @@ pub(super) fn companion(
                     sxpart = qdrn / qcheq;
                     Css = here.cddb;
                     Cds = -(here.cgdb + here.cddb + here.cbdb);
-                    dsxpart_dVs = (Css - sxpart * (Css + Cds)) / qcheq;
+                    dsxpart_dVs = sxpart.mul_add(-(Css + Cds), Css) / qcheq;
                     Csg = here.cdgb;
                     Cdg = -(here.cggb + here.cdgb + here.cbgb);
-                    dsxpart_dVg = (Csg - sxpart * (Csg + Cdg)) / qcheq;
+                    dsxpart_dVg = sxpart.mul_add(-(Csg + Cdg), Csg) / qcheq;
                     Csd = here.cdsb;
                     Cdd = -(here.cgsb + here.cdsb + here.cbsb);
-                    dsxpart_dVd = (Csd - sxpart * (Csd + Cdd)) / qcheq;
+                    dsxpart_dVd = sxpart.mul_add(-(Csd + Cdd), Csd) / qcheq;
                     dsxpart_dVb = -(dsxpart_dVd + dsxpart_dVg + dsxpart_dVs);
                 }
                 dxpart = 1.0 - sxpart;
@@ -1657,26 +1689,42 @@ pub(super) fn companion(
         cqgate = ckt.state0(state::CQG);
         cqbody = ckt.state0(state::CQB);
         cqdrn = ckt.state0(state::CQD);
-        ceqqg = cqgate - gcggb * vgb + gcgdb * vbd + gcgsb * vbs;
-        ceqqd = cqdrn - gcdgb * vgb - gcdgmb * vgmb + (gcddb + gcdbdb) * vbd - gcdbdb * vbd_jct
-            + gcdsb * vbs;
-        ceqqb = cqbody - gcbgb * vgb - gcbgmb * vgmb + gcbdb * vbd + gcbsb * vbs;
+        ceqqg = gcgsb.mul_add(vbs, gcgdb.mul_add(vbd, gcggb.mul_add(-vgb, cqgate)));
+        ceqqd = gcdsb.mul_add(
+            vbs,
+            gcdbdb.mul_add(
+                -vbd_jct,
+                (gcddb + gcdbdb).mul_add(vbd, gcdgmb.mul_add(-vgmb, gcdgb.mul_add(-vgb, cqdrn))),
+            ),
+        );
+        ceqqb = gcbsb.mul_add(
+            vbs,
+            gcbdb.mul_add(vbd, gcbgmb.mul_add(-vgmb, gcbgb.mul_add(-vgb, cqbody))),
+        );
         if here.rgateMod == 3 {
-            ceqqgmid = ckt.state0(state::CQGMID) + gcgmdb * vbd + gcgmsb * vbs - gcgmgmb * vgmb;
+            ceqqgmid = gcgmgmb.mul_add(
+                -vgmb,
+                gcgmsb.mul_add(vbs, gcgmdb.mul_add(vbd, ckt.state0(state::CQGMID))),
+            );
         } else {
             ceqqgmid = 0.0;
         }
         if here.rbodyMod != 0 {
-            ceqqjs = ckt.state0(state::CQBS) + gcsbsb * vbs_jct;
-            ceqqjd = ckt.state0(state::CQBD) + gcdbdb * vbd_jct;
+            ceqqjs = gcsbsb.mul_add(vbs_jct, ckt.state0(state::CQBS));
+            ceqqjd = gcdbdb.mul_add(vbd_jct, ckt.state0(state::CQBD));
         }
         if here.trnqsMod != 0 {
-            T0 = ggtg * vgb - ggtd * vbd - ggts * vbs;
+            T0 = ggts.mul_add(-vbs, ggtd.mul_add(-vbd, ggtg * vgb));
             ceqqg += T0;
             T1 = qdef * here.gtau;
-            ceqqd -= dxpart * T0 + T1 * (ddxpart_dVg * vgb - ddxpart_dVd * vbd - ddxpart_dVs * vbs);
-            cqdef = ckt.state0(state::CQCDUMP) - gqdef * qdef;
-            cqcheq = ckt.state0(state::CQCHEQ) - (gcqgb * vgb - gcqdb * vbd - gcqsb * vbs) + T0;
+            ceqqd -= T1.mul_add(
+                ddxpart_dVs.mul_add(-vbs, ddxpart_dVd.mul_add(-vbd, ddxpart_dVg * vgb)),
+                dxpart * T0,
+            );
+            cqdef = gqdef.mul_add(-qdef, ckt.state0(state::CQCDUMP));
+            cqcheq = ckt.state0(state::CQCHEQ)
+                - gcqsb.mul_add(-vbs, gcqdb.mul_add(-vbd, gcqgb * vgb))
+                + T0;
         }
         if (ckt.mode() & mode::MODEINITTRAN) != 0 {
             ckt.set_state1(state::CQB, ckt.state0(state::CQB));

@@ -1,22 +1,12 @@
 //! `b4ld.c` (`BSIM4load`): the DC/transient load of one instance, and
 //! `BSIM4polyDepletion`.
 //!
-//! Physics stages retain the original C expression and host-call ordering.
+//! Physics stages retain C equation dependencies and host-call ordering.
 //! Bias selection, junction currents, channel electrostatics and transport,
 //! leakage, intrinsic charges, junction charges, state commit, transient
 //! companions, and ordered stamping are distinct operations. C line1000
 //! (small-signal initialization) is represented by an absent companion.
 //! The port uses the reference NOBYPASS / NEWCONV configuration.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
-#![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
 #![expect(
     non_snake_case,
     reason = "preserves upstream C identifiers for equation-by-equation comparison"
@@ -83,6 +73,61 @@ fn DEXP(A: f64) -> (f64, f64) {
     }
 }
 
+/// The smoothed minimum of positive saturation and drain voltages and its
+/// two independent derivatives. The smaller root satisfies
+/// v² - (saturation + drain + delta) v + saturation * drain = 0.
+/// Rationalize the root and both gaps so a tiny terminal voltage or
+/// derivative survives a large difference in scales.
+fn smooth_vds(saturation: f64, drain: f64, delta: f64) -> (f64, f64, f64) {
+    let shift = saturation - drain - delta;
+    let discriminant = (4. * delta).mul_add(saturation, shift * shift);
+    let root = if discriminant.is_finite() && discriminant > 0. {
+        discriminant.sqrt()
+    } else if saturation >= 0. && delta >= 0. {
+        shift.hypot(2. * saturation.sqrt() * delta.sqrt())
+    } else {
+        discriminant.sqrt()
+    };
+    let gap = |upper: f64, shift: f64| {
+        if shift >= 0. {
+            shift.midpoint(root)
+        } else {
+            upper * (delta / (-shift).midpoint(root))
+        }
+    };
+    let saturation_gap = gap(saturation, shift);
+    if saturation >= 0. && drain >= 0. && delta > 0. {
+        let denominator = saturation.midpoint(drain) + delta.midpoint(root);
+        let (large, small) = if saturation >= drain {
+            (saturation, drain)
+        } else {
+            (drain, saturation)
+        };
+        let value = if small == 0. {
+            0.
+        } else {
+            (large / denominator) * small
+        };
+        let drain_gap = gap(drain, drain - saturation - delta);
+        (value, drain_gap / root, saturation_gap / root)
+    } else {
+        let value = saturation - saturation_gap;
+        (value, (drain - value) / root, saturation_gap / root)
+    }
+}
+
+/// Accurate difference of products, including exact cancellation when both
+/// products are equal. Correct the rounding error in the second product
+/// rather than fusing one product against the rounded value of the other.
+fn difference_of_products(a: f64, b: f64, c: f64, d: f64) -> f64 {
+    let product = c * d;
+    if product.is_finite() {
+        a.mul_add(b, -product) - c.mul_add(d, -product)
+    } else {
+        a.mul_add(b, -product)
+    }
+}
+
 /// `BSIM4polyDepletion`: the poly-gate depletion effective gate voltage and
 /// its gate derivative, `(Vgs_eff, dVgs_eff_dVg)`.
 pub(super) fn BSIM4polyDepletion(
@@ -100,9 +145,9 @@ pub(super) fn BSIM4polyDepletion(
         let T2 = 2.0 * T8 / (T4 + 1.0);
         let T3 = 0.5 * T2 * T2 / T1; // Vpoly
         let T7 = 1.12 - T3 - 0.05;
-        let T6 = sqrt(T7 * T7 + 0.224);
-        let T5 = 1.12 - 0.5 * (T7 + T6);
-        (Vgs - T5, 1.0 - (0.5 - 0.5 / T4) * (1.0 + T7 / T6))
+        let T6 = sqrt(T7.mul_add(T7, 0.224));
+        let T5 = 1.12 - T7.midpoint(T6);
+        (Vgs - T5, (0.5 - 0.5 / T4).mul_add(-(1.0 + T7 / T6), 1.0))
     } else {
         (Vgs, 1.0)
     }
@@ -142,7 +187,7 @@ pub(super) fn load(
 
 #[cfg(test)]
 mod tests {
-    use super::BSIM4polyDepletion;
+    use super::{BSIM4polyDepletion, difference_of_products, smooth_vds};
 
     #[test]
     fn poly_depletion_matches_hand_evaluation() {
@@ -151,6 +196,45 @@ mod tests {
         let (vgs_eff, d) = BSIM4polyDepletion(0.9, 2e19, 1.03594e-10, 0.0115, 1.5);
         assert_eq!(vgs_eff, 1.444_195_874_463_227_7);
         assert_eq!(d, 0.830_890_287_421_742_1);
+    }
+
+    #[test]
+    fn smoothed_drain_voltage_keeps_tiny_root_and_derivatives() {
+        let (value, ds, dd) = smooth_vds(1., 1e-30, 0.02);
+        assert!((value / (1e-30 / 1.02) - 1.).abs() < 1e-14);
+        assert!((ds / (1e-30 * 0.02 / (1.02 * 1.02)) - 1.).abs() < 1e-13);
+        assert!((dd - 1. / 1.02).abs() < 1e-14);
+        let (reversed, rds, rdd) = smooth_vds(1e-30, 1., 0.02);
+        assert!((reversed / value - 1.).abs() < 1e-14);
+        assert!((rds - dd).abs() < 1e-14);
+        assert!((rdd / ds - 1.).abs() < 1e-13);
+        for saturation in [0.1, 1., 5.] {
+            for drain in [0.1, 1., 5.] {
+                let (value, ds, dd) = smooth_vds(saturation, drain, 0.02);
+                let step = 1e-6;
+                let ds_numeric = (smooth_vds(saturation + step, drain, 0.02).0
+                    - smooth_vds(saturation - step, drain, 0.02).0)
+                    / (2. * step);
+                let dd_numeric = (smooth_vds(saturation, drain + step, 0.02).0
+                    - smooth_vds(saturation, drain - step, 0.02).0)
+                    / (2. * step);
+                assert!(value >= 0. && value <= saturation.min(drain));
+                assert!((ds - ds_numeric).abs() < 1e-8);
+                assert!((dd - dd_numeric).abs() < 1e-8);
+            }
+        }
+    }
+
+    #[test]
+    fn product_difference_preserves_zero_and_small_discriminant() {
+        let epsilon = 2_f64.powi(-27);
+        assert_eq!(
+            difference_of_products(1. + epsilon, 1. - epsilon, 1., 1.),
+            -epsilon * epsilon
+        );
+        let x = 1. + epsilon;
+        let y = 1. - epsilon;
+        assert_eq!(difference_of_products(x, y, x, y), 0.);
     }
 
     #[test]
