@@ -335,13 +335,35 @@ impl<I: PlanIndex> AxisRun<I> {
     }
 }
 
+/// One packed axis, with per-coordinate diagonal split points.
+#[derive(Debug)]
+struct AxisRuns<I> {
+    runs: Vec<AxisRun<I>>,
+    entries: Vec<RunEntry<I>>,
+}
+
+impl<I: PlanIndex> AxisRuns<I> {
+    fn all(&self, coordinate: usize) -> &[RunEntry<I>] {
+        let run = self.runs[coordinate - 1];
+        &self.entries[run.start.unpack()..run.end.unpack()]
+    }
+
+    fn before_diagonal(&self, coordinate: usize) -> &[RunEntry<I>] {
+        let run = self.runs[coordinate - 1];
+        &self.entries[run.start.unpack()..run.diagonal.unpack()]
+    }
+
+    fn after_diagonal(&self, coordinate: usize) -> &[RunEntry<I>] {
+        let run = self.runs[coordinate - 1];
+        &self.entries[run.diagonal.unpack() + 1..run.end.unpack()]
+    }
+}
+
 /// Immutable packed traversal, derived from linked topology after ordering.
 #[derive(Debug)]
 struct FactorRuns<I> {
-    columns: Vec<AxisRun<I>>,
-    column_entries: Vec<RunEntry<I>>,
-    rows: Vec<AxisRun<I>>,
-    row_entries: Vec<RunEntry<I>>,
+    columns: AxisRuns<I>,
+    rows: AxisRuns<I>,
 }
 
 #[derive(Debug)]
@@ -356,31 +378,6 @@ enum RefactorIssue {
 }
 
 impl<I: PlanIndex> FactorRuns<I> {
-    fn column(&self, col: usize) -> &[RunEntry<I>] {
-        let run = self.columns[col - 1];
-        &self.column_entries[run.start.unpack()..run.end.unpack()]
-    }
-
-    fn upper_column(&self, col: usize) -> &[RunEntry<I>] {
-        let run = self.columns[col - 1];
-        &self.column_entries[run.start.unpack()..run.diagonal.unpack()]
-    }
-
-    fn lower_column(&self, col: usize) -> &[RunEntry<I>] {
-        let run = self.columns[col - 1];
-        &self.column_entries[run.diagonal.unpack() + 1..run.end.unpack()]
-    }
-
-    fn upper_row(&self, row: usize) -> &[RunEntry<I>] {
-        let run = self.rows[row - 1];
-        &self.row_entries[run.diagonal.unpack() + 1..run.end.unpack()]
-    }
-
-    fn lower_row(&self, row: usize) -> &[RunEntry<I>] {
-        let run = self.rows[row - 1];
-        &self.row_entries[run.start.unpack()..run.diagonal.unpack()]
-    }
-
     /// The fixed-order SPARSE scatter/gather refactor, after column one.
     fn refactor<T: Scalar>(
         &self,
@@ -389,12 +386,12 @@ impl<I: PlanIndex> FactorRuns<I> {
         dest: &mut [T],
         inverses: &mut [T],
     ) -> Result<(), RefactorIssue> {
-        for step in 2..=self.columns.len() {
-            for entry in self.column(step) {
+        for step in 2..=self.columns.runs.len() {
+            for entry in self.columns.all(step) {
                 let (handle, row) = entry.indices();
                 dest[row] = values[handle];
             }
-            for entry in self.upper_column(step) {
+            for entry in self.columns.before_diagonal(step) {
                 let (handle, row) = entry.indices();
                 let upper = dest[row];
                 let mult = upper.mul(inverses[row]);
@@ -407,12 +404,12 @@ impl<I: PlanIndex> FactorRuns<I> {
                 }
                 let normal = mult.normal_multiplier();
                 let pivot = values[diag[row]];
-                for entry in self.lower_column(row) {
+                for entry in self.columns.after_diagonal(row) {
                     let (handle, r) = entry.indices();
                     dest[r] = dest[r].schur(pivot, upper, mult, values[handle], normal);
                 }
             }
-            for entry in self.lower_column(step) {
+            for entry in self.columns.after_diagonal(step) {
                 let (handle, row) = entry.indices();
                 values[handle] = dest[row];
             }
@@ -437,7 +434,7 @@ impl<I: PlanIndex> FactorRuns<I> {
         x: &mut [T],
         transposed: bool,
     ) {
-        let size = self.columns.len();
+        let size = self.columns.runs.len();
         // A = L D^-1 U, where both L and U carry the raw pivot D.
         // Forward substitution keeps D*y rather than materializing y
         // into the result buffer. The normalized value is only an
@@ -450,9 +447,9 @@ impl<I: PlanIndex> FactorRuns<I> {
             let mult = numerator.mul(inverses[i]);
             let normal = mult.normal_multiplier();
             let entries = if transposed {
-                self.upper_row(i)
+                self.rows.after_diagonal(i)
             } else {
-                self.lower_column(i)
+                self.columns.after_diagonal(i)
             };
             let pivot = values[diag[i]];
             for entry in entries {
@@ -470,9 +467,9 @@ impl<I: PlanIndex> FactorRuns<I> {
             let mult = numerator.mul(inverses[i]);
             let normal = mult.normal_multiplier();
             let entries = if transposed {
-                self.lower_row(i)
+                self.rows.before_diagonal(i)
             } else {
-                self.upper_column(i)
+                self.columns.before_diagonal(i)
             };
             let pivot = values[diag[i]];
             for entry in entries {
@@ -1916,20 +1913,13 @@ impl<T: Scalar> Sparse<T> {
         if self.values.len() != elements.len() || !self.lifecycle.rows_linked() {
             return Err(Status::InvalidPlan);
         }
-        let (columns, column_entries) = self.compile_axis(false)?;
-        let (rows, row_entries) = self.compile_axis(true)?;
         Ok(FactorRuns {
-            columns,
-            column_entries,
-            rows,
-            row_entries,
+            columns: self.compile_axis(false)?,
+            rows: self.compile_axis(true)?,
         })
     }
 
-    fn compile_axis<I: PlanIndex>(
-        &self,
-        rows: bool,
-    ) -> Result<(Vec<AxisRun<I>>, Vec<RunEntry<I>>), Status> {
+    fn compile_axis<I: PlanIndex>(&self, rows: bool) -> Result<AxisRuns<I>, Status> {
         let elements = &self.topology.elements;
         let mut runs = Vec::new();
         runs.try_reserve_exact(self.size)
@@ -1985,7 +1975,7 @@ impl<T: Scalar> Sparse<T> {
         if entries.len() != elements.len() {
             return Err(Status::InvalidPlan);
         }
-        Ok((runs, entries))
+        Ok(AxisRuns { runs, entries })
     }
 
     #[cfg(test)]
@@ -3214,7 +3204,13 @@ mod tests {
                 col.push((e, m.topology.elements[e].row));
                 e = m.topology.elements[e].next_in_col;
             }
-            assert!(runs.column(i).iter().map(|entry| entry.indices()).eq(col));
+            assert!(
+                runs.columns
+                    .all(i)
+                    .iter()
+                    .map(|entry| entry.indices())
+                    .eq(col)
+            );
             let mut row = Vec::new();
             let mut e = m.topology.first_in_row[i];
             while e != NONE {
@@ -3222,13 +3218,15 @@ mod tests {
                 e = m.topology.elements[e].next_in_row;
             }
             assert!(
-                runs.upper_row(i)
+                runs.rows
+                    .after_diagonal(i)
                     .iter()
                     .map(|entry| entry.indices())
                     .eq(row.iter().copied().filter(|&(_, col)| col > i))
             );
             assert!(
-                runs.lower_row(i)
+                runs.rows
+                    .before_diagonal(i)
                     .iter()
                     .map(|entry| entry.indices())
                     .eq(row.iter().copied().filter(|&(_, col)| col < i))
