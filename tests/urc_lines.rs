@@ -5,7 +5,7 @@
 //! `m10_urc_diode_tran` are compared by `cargo xtask golden verify`.
 use std::path::Path;
 
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
 use ngspice_rs::devices::{Circuit, ModelContext};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -23,11 +23,9 @@ fn circuit(body: &str) -> SpiceResult<Circuit> {
 }
 
 fn op(body: &str) -> SpiceResult<Plot> {
-    runner(AnalysisKind::OperatingPoint)?.run(
-        &mut circuit(body)?,
-        &AnalysisRequest::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>()),
-        &AnalysisContext::default(),
-    )
+    AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+        .resolve()
+        .and_then(|plan| plan.run(&mut circuit(body)?, &AnalysisContext::default()))
 }
 
 fn names(c: &Circuit) -> Vec<String> {
@@ -246,17 +244,18 @@ fn a_failed_expansion_leaves_the_circuit_untouched() {
 
 #[test]
 fn the_ac_response_falls_with_frequency() {
-    let plot = runner(AnalysisKind::Ac)
-        .unwrap()
-        .run(
-            &mut circuit(
-                "v1 in 0 dc 0 ac 1\nu1 in out 0 m l=1m\nr1 out 0 1meg\n\
+    let plot = AnalysisInput::with_arguments(AnalysisKind::Ac, ["dec", "1", "1k", "1g"])
+        .resolve()
+        .and_then(|plan| {
+            plan.run(
+                &mut circuit(
+                    "v1 in 0 dc 0 ac 1\nu1 in out 0 m l=1m\nr1 out 0 1meg\n\
                  .model m urc rperl=1e7 cperl=1e-7",
+                )
+                .unwrap(),
+                &AnalysisContext::default(),
             )
-            .unwrap(),
-            &AnalysisRequest::with_arguments(AnalysisKind::Ac, ["dec", "1", "1k", "1g"]),
-            &AnalysisContext::default(),
-        )
+        })
         .unwrap();
     let out: Vec<Real> = plot
         .column("v(out)")
@@ -274,38 +273,26 @@ fn pole_zero_and_sensitivity_are_explicitly_refused() {
     let deck = "v1 in 0 dc 1 ac 1\nu1 in out 0 m l=1m n=2\nr1 out 0 10k\n\
                 .model m urc rperl=1meg cperl=1n";
     // C aborts `.pz` (URCsetup re-run as DEVpzSetup: "device already exists").
-    let error = runner(AnalysisKind::PoleZero)
-        .unwrap()
-        .run(
-            &mut circuit(deck).unwrap(),
-            &AnalysisRequest::with_arguments(
-                AnalysisKind::PoleZero,
-                ["in", "0", "out", "0", "vol", "pz"],
-            ),
-            &AnalysisContext::default(),
-        )
-        .unwrap_err();
+    let error =
+        AnalysisInput::with_arguments(AnalysisKind::PoleZero, ["in", "0", "out", "0", "vol", "pz"])
+            .resolve()
+            .and_then(|plan| plan.run(&mut circuit(deck).unwrap(), &AnalysisContext::default()))
+            .unwrap_err();
     assert!(message(&error).contains("URC line u1"), "{error}");
     // C's `.sens` also lists the URC's own parameters (zero sensitivities).
-    let error = runner(AnalysisKind::Sensitivity)
-        .unwrap()
-        .run(
-            &mut circuit(deck).unwrap(),
-            &AnalysisRequest::with_arguments(AnalysisKind::Sensitivity, ["v", "(", "out", ")"]),
-            &AnalysisContext::default(),
-        )
+    let error = AnalysisInput::with_arguments(AnalysisKind::Sensitivity, ["v", "(", "out", ")"])
+        .resolve()
+        .and_then(|plan| plan.run(&mut circuit(deck).unwrap(), &AnalysisContext::default()))
         .unwrap_err();
     assert!(error.is_not_yet_ported(), "{error}");
     // `.noise` runs: the instance is noiseless (DEVnoise = NULL) and the
     // generated resistors carry the noise.
-    let plot = runner(AnalysisKind::Noise).unwrap().run(
-        &mut circuit(deck).unwrap(),
-        &AnalysisRequest::with_arguments(
-            AnalysisKind::Noise,
-            ["v(out)", "v1", "dec", "1", "1k", "1meg"],
-        ),
-        &AnalysisContext::default(),
-    );
+    let plot = AnalysisInput::with_arguments(
+        AnalysisKind::Noise,
+        ["v(out)", "v1", "dec", "1", "1k", "1meg"],
+    )
+    .resolve()
+    .and_then(|plan| plan.run(&mut circuit(deck).unwrap(), &AnalysisContext::default()));
     assert!(plot.is_ok(), "{plot:?}");
 }
 

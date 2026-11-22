@@ -10,7 +10,7 @@
 //! `.options reltol=1e-8` (C's default reltol with bypass stops a warm-started
 //! sweep point up to ~4e-4 from its root) and use the `xtask::compare::NONLINEAR`
 //! bound `1e-6 |C| + 1e-12`.
-use ngspice_rs::analysis::{Plot, RawFile, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use std::fs;
@@ -60,12 +60,9 @@ fn run_rust(deck: &str) -> Plot {
         ))
         .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap()
+    request.run(&mut circuit, &config.context()).unwrap()
 }
 
 /// `(relative, absolute)` comparison bound.

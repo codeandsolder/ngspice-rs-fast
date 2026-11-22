@@ -4,7 +4,7 @@
 //! `CKTdoJob()`) plus the writer in `src/frontend/rawfile.c` (`raw_write`). The command is deliberately narrow:
 //!
 //! * the deck is loaded by the ordinary [`crate::netlist::Parser`] and elaborated
-//!   by the ordinary production runner, so no device or solver logic is
+//!   by the ordinary production so no device or solver logic is
 //!   duplicated here;
 //! * **every** analysis card runs, in ngspice batch order (see
 //!   [`crate::analysis::batch`]: `.ac`, `.dc`, `.op`, `.tran`, `.noise`,
@@ -59,7 +59,6 @@ use crate::analysis::measure::{self, Measurement};
 use crate::analysis::selection::RowProjection;
 use crate::analysis::{
     BinaryByteOrder, Plot, PointSink, RawFileWriter, RawFormat, RawPlot, RunConfig, StreamedPlot,
-    runner,
 };
 use crate::netlist::eval::ParamScope;
 use crate::netlist::{ParsedDeck, Parser};
@@ -200,15 +199,9 @@ pub fn run_with_format(
     let format = format.or_else(|| config.raw_format()).unwrap_or_else(|| {
         raw_format_from_env(&std::env::var("SPICE_ASCIIRAWFILE").unwrap_or_default())
     });
-    let schedule = batch::schedule_evaluated(&netlist.analyses, &config)?;
-    // Every request and driver is validated before the first analysis runs, so
-    // an unsupported last analysis cannot waste the earlier ones.
-    let mut jobs = Vec::with_capacity(schedule.len());
-    for entry in &schedule {
-        let request = config.request_for(&netlist.analyses[entry.card_index])?;
-        let driver = runner(request.kind)?;
-        jobs.push((entry, request, driver));
-    }
+    // The scheduler and the execution loop share the same validated plans.
+    let plans = config.plans_for(&netlist.analyses)?;
+    let schedule = batch::schedule(&plans);
     let mut first_circuit = Some(config.circuit(netlist)?);
     let mut previous_circuit: Option<crate::devices::Circuit> = None;
     batch::check_targets(
@@ -222,8 +215,9 @@ pub fn run_with_format(
     // Each plot is written as soon as its analysis has finished, into a
     // temporary file that is renamed into place only after the last one.
     let mut rawfile = PendingRawfile::create(output, format)?;
-    let mut plots = Vec::with_capacity(jobs.len());
-    for (entry, request, driver) in jobs {
+    let mut plots = Vec::with_capacity(schedule.len());
+    for entry in &schedule {
+        let request = &plans[entry.card_index];
         // Each analysis starts from a freshly elaborated circuit; only what C
         // keeps across the analyses of a deck is inherited below.
         // C runs every analysis on the matrix and state vectors set up once
@@ -255,12 +249,12 @@ pub fn run_with_format(
                 writer: &mut rawfile.writer,
                 spool: &rawfile.spool,
             };
-            plots.push(output.stream(entry, names[0], &mut circuit, &request, driver.as_ref())?);
+            plots.push(output.stream(entry, names[0], &mut circuit, request)?);
             circuit.note_completed(entry.kind);
             previous_circuit = Some(circuit);
             continue;
         }
-        let produced = driver.run_plots(&mut circuit, &request, &config.context())?;
+        let produced = request.run_plots(&mut circuit, &config.context())?;
         if produced.len() != names.len() {
             return Err(SpiceError::Numerical {
                 context: format!(".{} analysis", entry.kind.as_str()),
@@ -309,8 +303,7 @@ impl BatchOutput<'_> {
         entry: &batch::ScheduledAnalysis,
         name: &str,
         circuit: &mut crate::devices::Circuit,
-        request: &crate::analysis::AnalysisRequest,
-        driver: &dyn crate::analysis::Analysis,
+        request: &crate::analysis::AnalysisPlan,
     ) -> SpiceResult<PlotReport> {
         let mut sink = RawfileSink {
             writer: &*self.writer,
@@ -321,7 +314,7 @@ impl BatchOutput<'_> {
             date: self.date,
             plot: None,
         };
-        driver.run_into(circuit, request, &self.config.context(), &mut sink)?;
+        request.run_into(circuit, &self.config.context(), &mut sink)?;
         let Some((_, streamed)) = sink.plot else {
             return Err(SpiceError::Numerical {
                 context: format!(".{} analysis", entry.kind.as_str()),

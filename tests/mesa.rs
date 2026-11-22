@@ -12,7 +12,7 @@
 //! `.noise`/`.disto` behave as C's NULL routines do, and `.sens` walks every
 //! level's parameter table (`sens_mesa`, `sens_mesa3`, `sens_mesa4`,
 //! `sens_mesa4_ts`).
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RunConfig};
 use ngspice_rs::devices::Circuit;
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -29,11 +29,9 @@ fn circuit(body: &str) -> Result<Circuit, SpiceError> {
     Circuit::from_netlist(&deck(body)?)
 }
 fn attempt(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> SpiceResult<Plot> {
-    runner(kind).unwrap().run(
-        c,
-        &AnalysisRequest::with_arguments(kind, arguments.iter().copied()),
-        &AnalysisContext::default(),
-    )
+    AnalysisInput::with_arguments(kind, arguments.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
 }
 fn run(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> Plot {
     attempt(c, kind, arguments).unwrap()
@@ -419,12 +417,9 @@ fn the_remaining_boundaries_are_explicit() {
     )
     .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut c = config.circuit(&netlist).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut c, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut c, &config.context()).unwrap();
     assert_eq!(plot.plotname, "Sensitivity Analysis");
     assert_eq!(
         plot.value("v(z1:vto)", 0).unwrap(),
@@ -805,12 +800,9 @@ fn sensitivity_follows_mesa_cs_table_for_every_level() {
         let text = cards(level, ".sens v(3)");
         let parsed = deck(&text).unwrap();
         let config = ngspice_rs::analysis::RunConfig::from_netlist(&parsed).unwrap();
-        let request = config.request_for(&parsed.analyses[0]).unwrap();
+        let request = config.plan_for(&parsed.analyses[0]).unwrap();
         let mut c = config.circuit(&parsed).unwrap();
-        let plot = ngspice_rs::analysis::runner(request.kind)
-            .unwrap()
-            .run(&mut c, &request, &config.context())
-            .unwrap();
+        let plot = request.run(&mut c, &config.context()).unwrap();
         let names: Vec<&str> = plot
             .variables()
             .iter()
@@ -847,12 +839,9 @@ fn sensitivity_accepts_a_level_four_instance_at_a_shifted_temperature() {
         );
         let parsed = deck(&text).unwrap();
         let config = ngspice_rs::analysis::RunConfig::from_netlist(&parsed).unwrap();
-        let request = config.request_for(&parsed.analyses[0]).unwrap();
+        let request = config.plan_for(&parsed.analyses[0]).unwrap();
         let mut c = config.circuit(&parsed).unwrap();
-        let plot = ngspice_rs::analysis::runner(request.kind)
-            .unwrap()
-            .run(&mut c, &request, &config.context())
-            .unwrap();
+        let plot = request.run(&mut c, &config.context()).unwrap();
         let names: Vec<&str> = plot
             .variables()
             .iter()

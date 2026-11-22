@@ -7,7 +7,7 @@
 //! verify`; `tests/c_sens_reference.rs` compares further decks with live C.
 use std::path::Path;
 
-use ngspice_rs::analysis::{Plot, PlotFlags, RunConfig, batch, runner};
+use ngspice_rs::analysis::{Plot, PlotFlags, RunConfig, batch};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::{AnalysisKind, Complex, SpiceResult};
@@ -20,10 +20,11 @@ fn run_all(body: &str) -> SpiceResult<Vec<(String, Plot)>> {
     ))?;
     let config = RunConfig::from_netlist(&netlist)?;
     let mut plots = Vec::new();
-    for entry in batch::schedule(&netlist.analyses) {
-        let request = config.request_for(&netlist.analyses[entry.card_index])?;
+    let plans = config.plans_for(&netlist.analyses)?;
+    for entry in batch::schedule(&plans) {
+        let request = &plans[entry.card_index];
         let mut circuit = config.circuit(&netlist)?;
-        let plot = runner(request.kind)?.run(&mut circuit, &request, &config.context())?;
+        let plot = request.run(&mut circuit, &config.context())?;
         plots.push((entry.plot_name, plot));
     }
     Ok(plots)
@@ -320,13 +321,14 @@ fn run_batch(body: &str) -> SpiceResult<Vec<(String, Plot)>> {
     let config = RunConfig::from_netlist(&netlist)?;
     let mut plots = Vec::new();
     let mut previous: Option<ngspice_rs::devices::Circuit> = None;
-    for entry in batch::schedule(&netlist.analyses) {
-        let request = config.request_for(&netlist.analyses[entry.card_index])?;
+    let plans = config.plans_for(&netlist.analyses)?;
+    for entry in batch::schedule(&plans) {
+        let request = &plans[entry.card_index];
         let mut circuit = config.circuit(&netlist)?;
         if let Some(previous) = &previous {
             circuit.inherit_from(previous);
         }
-        let plot = runner(request.kind)?.run(&mut circuit, &request, &config.context())?;
+        let plot = request.run(&mut circuit, &config.context())?;
         circuit.note_completed(entry.kind);
         previous = Some(circuit);
         plots.push((entry.plot_name, plot));
@@ -436,13 +438,10 @@ fn transient_load_snapshots_require_a_matching_device_layout() {
         ))
         .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut original = config.circuit(&netlist).unwrap();
-    runner(request.kind)
-        .unwrap()
-        .run(&mut original, &request, &config.context())
-        .unwrap();
-    original.note_completed(request.kind);
+    request.run(&mut original, &config.context()).unwrap();
+    original.note_completed(request.kind());
     let snapshot = original.final_transient_state().expect("final load");
     let mut inherited = config.circuit(&netlist).unwrap();
     inherited.inherit_from(&original);
@@ -466,13 +465,10 @@ fn a_transient_marker_without_its_load_is_still_an_explicit_refusal() {
         ))
         .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
     circuit.note_completed(AnalysisKind::Transient);
-    let error = runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap_err();
+    let error = request.run(&mut circuit, &config.context()).unwrap_err();
     assert!(error.is_not_yet_ported(), "{error}");
     assert!(
         error.to_string().contains("capacitances are missing"),
@@ -524,7 +520,9 @@ fn unsupported_cases_fail_explicitly() {
             &format!("two\n{DIVIDER}\n.sens v(out)\n.sens v(in)\n.end\n"),
         ))
         .unwrap();
-    let schedule = batch::schedule(&netlist.analyses);
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let plans = config.plans_for(&netlist.analyses).unwrap();
+    let schedule = batch::schedule(&plans);
     assert_eq!(
         schedule
             .iter()

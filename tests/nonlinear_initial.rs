@@ -6,7 +6,7 @@
 //! The C-parity evidence is the `m7_ic_*` goldens (`cargo xtask golden
 //! verify`); these tests pin the mechanisms and the explicit errors.
 use ngspice_rs::analysis::bias::{DcOutcome, DcSettings, DcStrategy, NodeForcing, solve_dc_forced};
-use ngspice_rs::analysis::{AnalysisRequest, Plot, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisInput, Plot, RunConfig};
 use ngspice_rs::devices::{Circuit, ModelContext};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::Netlist;
@@ -38,8 +38,8 @@ fn run(body: &str) -> SpiceResult<Plot> {
     let netlist = parse(body);
     let config = RunConfig::from_netlist(&netlist)?;
     let mut circuit = config.circuit(&netlist)?;
-    let request = config.request_for(&netlist.analyses[0])?;
-    runner(request.kind)?.run(&mut circuit, &request, &config.context())
+    let request = config.plan_for(&netlist.analyses[0])?;
+    request.run(&mut circuit, &config.context())
 }
 
 fn value(plot: &Plot, name: &str, row: usize) -> f64 {
@@ -247,10 +247,10 @@ fn start_settings_need_device_limiting() {
         let netlist = parse(&latch(mn1, mn2, ""));
         let mut circuit = Circuit::from_netlist(&netlist).unwrap();
         let request =
-            AnalysisRequest::with_arguments(AnalysisKind::OperatingPoint, ["limiting=global"]);
-        let error = runner(AnalysisKind::OperatingPoint)
-            .unwrap()
-            .run(&mut circuit, &request, &Default::default())
+            AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, ["limiting=global"]);
+        let error = request
+            .resolve()
+            .and_then(|plan| plan.run(&mut circuit, &Default::default()))
             .unwrap_err();
         assert!(error.to_string().contains("limiting=global"), "{error}");
     }

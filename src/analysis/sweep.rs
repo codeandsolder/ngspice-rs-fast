@@ -10,10 +10,10 @@
 //! travel in an immutable per-point `ModelContext`, and every point runs
 //! `NIiter`, linear circuits included. See `docs/port/DC_SWEEPS.md`.
 use crate::analysis::linear::{number, plot, unsupported};
-use crate::analysis::{AnalysisContext, AnalysisRequest, Plot};
+use crate::analysis::{AnalysisContext, AnalysisPlan, Plot};
 use crate::devices::{Circuit, ModelContext};
 use crate::maths::Vector;
-use crate::primitives::{AnalysisKind, Complex, Real, SpiceError, SpiceResult};
+use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 
 /// Largest number of grid points, per axis and as a Cartesian product.
 pub const MAX_SWEEP_POINTS: usize = MAX_SWEEP_POINTS_U32 as usize;
@@ -144,10 +144,85 @@ impl SweepSpec {
         Ok(self.exact_values()?.collect())
     }
 
-    /// Validate the exact, index-based grid without allocating it. Resolution
-    /// needs its length only; the C-compatible accumulated grid needs the
-    /// same validation and capacity hint, but evaluates a different sequence.
-    fn exact_values(&self) -> SpiceResult<impl ExactSizeIterator<Item = Real> + Clone> {
+    const fn range(&self) -> SweepRange {
+        SweepRange {
+            start: self.start,
+            stop: self.stop,
+            step: self.step,
+        }
+    }
+
+    fn exact_values(&self) -> SpiceResult<impl ExactSizeIterator<Item = Real> + Clone + use<>> {
+        let values = self.range().exact_grid()?.values();
+        for value in values.clone() {
+            check_domain(
+                value,
+                self.target == SweepTarget::Temperature,
+                self.target.is_resistance(),
+            )?;
+        }
+        Ok(values)
+    }
+
+    /// C's repeated-addition grid, with the absolute stop test and kelvin
+    /// accumulation for temperature axes.
+    ///
+    /// # Errors
+    /// As [`Self::grid`], including bounds on accumulated progress and work.
+    pub fn accumulated_grid(&self) -> SpiceResult<Vec<Real>> {
+        let expected = self.exact_values()?.len();
+        let temperature = self.target == SweepTarget::Temperature;
+        let values = self.range().accumulate(expected, temperature)?;
+        for &value in &values {
+            check_domain(value, temperature, self.target.is_resistance())?;
+        }
+        Ok(values)
+    }
+}
+
+fn check_domain(value: Real, temperature: bool, resistance: bool) -> SpiceResult<()> {
+    if temperature && value <= -273.15 {
+        return Err(unsupported("DC temperature below absolute zero"));
+    }
+    if resistance && (value == 0. || !(1. / value).is_finite()) {
+        return Err(unsupported(
+            "DC resistance must be nonzero with finite conductance",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SweepRange {
+    start: Real,
+    stop: Real,
+    step: Real,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ExactGrid {
+    range: SweepRange,
+    intervals: u32,
+    snap_stop: bool,
+}
+
+impl ExactGrid {
+    fn values(self) -> impl ExactSizeIterator<Item = Real> + Clone {
+        let SweepRange { start, stop, step } = self.range;
+        let point_count = self.intervals + 1;
+        (0..point_count).map(move |i| {
+            if self.snap_stop && i == self.intervals {
+                stop
+            } else {
+                let offset = Real::from(i) * step;
+                start + offset
+            }
+        })
+    }
+}
+
+impl SweepRange {
+    fn exact_grid(self) -> SpiceResult<ExactGrid> {
         let (start, stop, increment) = (self.start, self.stop, self.step);
         if ![start, stop, increment].iter().all(|v| v.is_finite()) || increment == 0. {
             return Err(unsupported(
@@ -169,42 +244,21 @@ impl SweepSpec {
         let intervals = crate::primitives::exact_nonnegative_integer::<u32>(interval_count)
             .ok_or_else(|| unsupported("DC sweep point limit exceeded"))?;
         let snap_stop = intervals > 0 && (ratio - Real::from(intervals)).abs() <= slack;
-        let point_count = intervals + 1;
-        let values = (0..point_count).map(move |i| {
-            if snap_stop && i == intervals {
-                stop
-            } else {
-                let offset = Real::from(i) * increment;
-                start + offset
-            }
-        });
+        let grid = ExactGrid {
+            range: self,
+            intervals,
+            snap_stop,
+        };
         let mut previous = None;
-        for value in values.clone() {
-            self.check_value(value, previous)?;
+        for value in grid.values() {
+            self.check_progress(value, previous)?;
             previous = Some(value);
         }
-        Ok(values)
+        Ok(grid)
     }
 
-    /// The values C's `dctrcurv.c` visits: the swept quantity starts at
-    /// `start` and is advanced by `value += step`, and the sweep continues
-    /// while `sign(step) (value - stop) <= 1e3 DBL_EPSILON`. A temperature is
-    /// accumulated in kelvin (`CKTtemp`) and reported in Celsius.
-    ///
-    /// For steps that are not binary-exact (`0.1`) these differ from
-    /// [`Self::grid`] by an ulp or so (a reverse `0.3 0 -0.1` sweep ends at
-    /// `2.8e-17`, as in ngspice); every `.dc` sweep uses them. The stop test is C's absolute one, so the last value may
-    /// lie up to `1e3 DBL_EPSILON` beyond `stop` as it does in C.
-    /// # Errors
-    /// Everything [`Self::grid`] rejects, and the same point/progress/domain
-    /// limits applied to the accumulated values.
-    pub fn accumulated_grid(&self) -> SpiceResult<Vec<Real>> {
-        // The same input validation (finite, direction, budget) as the grid.
-        let expected = self.exact_values()?.len();
-        let offset = match self.target {
-            SweepTarget::Temperature => CELSIUS_TO_KELVIN,
-            _ => 0.,
-        };
+    fn accumulate(self, expected: usize, temperature: bool) -> SpiceResult<Vec<Real>> {
+        let offset = if temperature { CELSIUS_TO_KELVIN } else { 0. };
         let tolerance = 1e3 * Real::EPSILON;
         let direction = self.step.signum();
         let mut stored = self.start + offset;
@@ -217,27 +271,19 @@ impl SweepSpec {
             if values.len() >= MAX_SWEEP_POINTS {
                 return Err(unsupported("DC sweep point limit exceeded"));
             }
-            self.check_value(value, values.last().copied())?;
+            self.check_progress(value, values.last().copied())?;
             values.push(value);
             stored += self.step;
         }
         Ok(values)
     }
 
-    fn check_value(&self, value: Real, previous: Option<Real>) -> SpiceResult<()> {
+    fn check_progress(self, value: Real, previous: Option<Real>) -> SpiceResult<()> {
         if !value.is_finite() {
             return Err(unsupported("DC sweep overflows"));
         }
         if previous.is_some_and(|previous| (value - previous) * self.step.signum() <= 0.) {
             return Err(unsupported("DC sweep makes no progress"));
-        }
-        if self.target == SweepTarget::Temperature && value <= -273.15 {
-            return Err(unsupported("DC temperature below absolute zero"));
-        }
-        if self.target.is_resistance() && (value == 0. || !(1. / value).is_finite()) {
-            return Err(unsupported(
-                "DC resistance must be nonzero with finite conductance",
-            ));
         }
         Ok(())
     }
@@ -262,6 +308,81 @@ fn parameter_target(text: &str) -> SpiceResult<Option<(&str, &str)>> {
     Ok(Some((instance, parameter)))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AxisTarget {
+    Temperature,
+    Name(String),
+    Parameter { instance: String, parameter: String },
+}
+
+impl AxisTarget {
+    fn parse(text: &str) -> SpiceResult<Self> {
+        if text.eq_ignore_ascii_case("temp") {
+            return Ok(Self::Temperature);
+        }
+        Ok(match parameter_target(text)? {
+            Some((instance, parameter)) => Self::Parameter {
+                instance: instance.to_owned(),
+                parameter: parameter.to_owned(),
+            },
+            None => Self::Name(text.to_owned()),
+        })
+    }
+}
+
+/// A DC sweep with checked numeric grids, before circuit identity binding.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct DcSweepPlan {
+    axes: Vec<AxisPlan>,
+    grids: Vec<Vec<Real>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct AxisPlan {
+    target: AxisTarget,
+    exact: ExactGrid,
+}
+
+pub(super) fn parse_axes(args: &[String]) -> SpiceResult<DcSweepPlan> {
+    if !matches!(args.len(), 4 | 8) {
+        return Err(unsupported(
+            ".dc requires one or two target/start/stop/step axes",
+        ));
+    }
+    let mut axes = Vec::with_capacity(args.len() / 4);
+    let mut grids = Vec::with_capacity(axes.capacity());
+    let mut exact_work = 1usize;
+    let mut accumulated_work = 1usize;
+    for axis in args.as_chunks::<4>().0 {
+        let target = AxisTarget::parse(&axis[0])?;
+        let range = SweepRange {
+            start: number(Some(&axis[1]), "sweep start")?,
+            stop: number(Some(&axis[2]), "sweep stop")?,
+            step: number(Some(&axis[3]), "sweep step")?,
+        };
+        let exact = range.exact_grid()?;
+        let expected = exact.values().len();
+        exact_work = bounded_product(exact_work, expected)?;
+        let temperature = target == AxisTarget::Temperature;
+        let values = range.accumulate(expected, temperature)?;
+        accumulated_work = bounded_product(accumulated_work, values.len())?;
+        if temperature {
+            for value in exact.values().chain(values.iter().copied()) {
+                check_domain(value, true, false)?;
+            }
+        }
+        axes.push(AxisPlan { target, exact });
+        grids.push(values);
+    }
+    Ok(DcSweepPlan { axes, grids })
+}
+
+fn bounded_product(work: usize, points: usize) -> SpiceResult<usize> {
+    work.checked_mul(points)
+        .filter(|n| *n <= MAX_SWEEP_POINTS)
+        .ok_or_else(|| unsupported("nested DC sweep point limit exceeded"))
+}
+
 /// What one axis written as `target` names before the source table exists:
 /// the quantity it sweeps (for duplicate detection) and how it is applied.
 enum Written<'a> {
@@ -277,24 +398,26 @@ enum Written<'a> {
     Other(&'a str, &'a str),
 }
 impl<'a> Written<'a> {
-    fn classify(circuit: &Circuit, target: &'a str) -> SpiceResult<Self> {
-        if target.eq_ignore_ascii_case("temp") {
-            return Ok(Self::Temperature);
-        }
-        let Some((instance, parameter)) = parameter_target(target)? else {
-            return Ok(Self::Name(target));
+    fn classify(circuit: &Circuit, target: &'a AxisTarget) -> Self {
+        let (instance, parameter) = match target {
+            AxisTarget::Temperature => return Self::Temperature,
+            AxisTarget::Name(name) => return Self::Name(name),
+            AxisTarget::Parameter {
+                instance,
+                parameter,
+            } => (instance.as_str(), parameter.as_str()),
         };
         if matches!(parameter.to_ascii_lowercase().as_str(), "r" | "resistance")
             && circuit.resistor(instance).is_some()
         {
-            return Ok(Self::Resistance(instance));
+            return Self::Resistance(instance);
         }
         if let Some(device) = circuit.device(instance)
             && let Some(canonical) = device.instance_parameter(parameter)
         {
-            return Ok(Self::Device(instance, canonical));
+            return Self::Device(instance, canonical);
         }
-        Ok(Self::Other(instance, parameter))
+        Self::Other(instance, parameter)
     }
     /// The swept quantity: `r1` and `@r1[r]`, `v1` and `@v1[dc]` are one.
     fn key(&self) -> String {
@@ -397,49 +520,47 @@ fn resolve_target(circuit: &Circuit, written: &Written<'_>) -> SpiceResult<Sweep
 /// the port does not.
 pub fn resolve(
     circuit: &Circuit,
-    request: &AnalysisRequest,
+    request: &AnalysisPlan,
     context: &AnalysisContext,
 ) -> SpiceResult<Vec<SweepSpec>> {
-    if request.kind != AnalysisKind::DcSweep {
+    let crate::analysis::plan::PlanKind::Dc { axes, .. } = request.analysis() else {
         return Err(unsupported("typed sweep requires a DC request"));
-    }
-    let args: Vec<_> = request
-        .arguments
-        .iter()
-        .filter(|a| !a.contains('='))
-        .collect();
-    if !matches!(args.len(), 4 | 8) {
-        return Err(unsupported(
-            ".dc requires one or two target/start/stop/step axes",
-        ));
-    }
+    };
+    bind_axes(circuit, axes, context)
+}
+
+fn bind_axes(
+    circuit: &Circuit,
+    plan: &DcSweepPlan,
+    context: &AnalysisContext,
+) -> SpiceResult<Vec<SweepSpec>> {
     // Targets are physical metadata, not an AC matrix. Do not require an
     // otherwise DC-capable device to implement a small-signal load merely to
     // discover which name denotes an independent source.
     let mut names = std::collections::BTreeSet::new();
     let mut written = Vec::new();
-    for axis in args.as_chunks::<4>().0 {
-        let target = Written::classify(circuit, axis[0])?;
+    for axis in &plan.axes {
+        let target = Written::classify(circuit, &axis.target);
         if !names.insert(target.key()) {
             return Err(unsupported("duplicate nested DC target"));
         }
         written.push(target);
     }
-    let mut axes = vec![];
-    let mut work = 1usize;
-    for (axis, written) in args.as_chunks::<4>().0.iter().zip(&written) {
+    let mut axes = Vec::with_capacity(plan.axes.len());
+    for ((axis, written), grid) in plan.axes.iter().zip(&written).zip(&plan.grids) {
         let target = resolve_target(circuit, written)?;
-        let spec = SweepSpec {
+        if target.is_resistance() {
+            for value in axis.exact.values().chain(grid.iter().copied()) {
+                check_domain(value, false, true)?;
+            }
+        }
+        let SweepRange { start, stop, step } = axis.exact.range;
+        axes.push(SweepSpec {
             target,
-            start: number(Some(axis[1]), "sweep start")?,
-            stop: number(Some(axis[2]), "sweep stop")?,
-            step: number(Some(axis[3]), "sweep step")?,
-        };
-        work = work
-            .checked_mul(spec.exact_values()?.len())
-            .filter(|n| *n <= MAX_SWEEP_POINTS)
-            .ok_or_else(|| unsupported("nested DC sweep point limit exceeded"))?;
-        axes.push(spec);
+            start,
+            stop,
+            step,
+        });
     }
     // Validate the first point's actual replacements at its temperature.
     // The run's preflight validates the remaining physical contexts.
@@ -602,50 +723,6 @@ fn preflight(
     }
     Ok(())
 }
-/// Request key of the per-point warm-start Newton limit (deck `itl2`, C
-/// `CKTdcTrcvMaxIter`).
-pub(crate) const POINT_ITERATIONS_KEY: &str = "trcvmaxiter";
-
-/// Split the `.dc`-only `trcvmaxiter=` (1..=[`crate::analysis::newton::MAX_ITERATIONS`])
-/// from the DC Newton/continuation settings shared with `.op`.
-fn sweep_settings(
-    request: &AnalysisRequest,
-) -> SpiceResult<(Option<usize>, crate::analysis::bias::DcSettings)> {
-    let mut limit = None;
-    let mut rest = Vec::new();
-    for argument in &request.arguments {
-        match argument.split_once('=') {
-            Some((key, text)) if key.trim().eq_ignore_ascii_case(POINT_ITERATIONS_KEY) => {
-                if limit.is_some() {
-                    return Err(SpiceError::Unsupported {
-                        feature: format!("duplicate .dc option {POINT_ITERATIONS_KEY}"),
-                        location: None,
-                    });
-                }
-                let value = crate::primitives::parse_spice_number(text.trim())
-                    .and_then(crate::primitives::exact_nonnegative_integer::<usize>)
-                    .filter(|n| (1..=crate::analysis::newton::MAX_ITERATIONS).contains(n))
-                    .ok_or_else(|| SpiceError::Unsupported {
-                        feature: format!(
-                            "{POINT_ITERATIONS_KEY} must be an integer in 1..={}, not '{}'",
-                            crate::analysis::newton::MAX_ITERATIONS,
-                            text.trim()
-                        ),
-                        location: None,
-                    })?;
-                limit = Some(value);
-            }
-            _ => rest.push(argument.clone()),
-        }
-    }
-    let mut stripped = request.clone();
-    stripped.arguments = rest;
-    Ok((
-        limit,
-        crate::analysis::bias::DcSettings::from_request(&stripped)?,
-    ))
-}
-
 fn warm_start_settings(
     point_iterations: Option<usize>,
     settings: &crate::analysis::bias::DcSettings,
@@ -669,28 +746,6 @@ fn warm_start_settings(
         },
         continuation: crate::analysis::bias::ContinuationPolicy::disabled(),
     })
-}
-
-fn prepare_grids(
-    circuit: &Circuit,
-    axes: &[SweepSpec],
-    context: &AnalysisContext,
-) -> SpiceResult<Vec<Vec<Real>>> {
-    // The values `dctrcurv.c` visits (`value += step`, C's absolute stop
-    // test), not `start + i step`: the last bits reach every device and the
-    // output scale.
-    let grids = axes
-        .iter()
-        .map(SweepSpec::accumulated_grid)
-        .collect::<SpiceResult<Vec<_>>>()?;
-    // C's absolute stop test can add one point per axis to the checked budget.
-    grids
-        .iter()
-        .try_fold(1usize, |work, grid| work.checked_mul(grid.len()))
-        .filter(|n| *n <= MAX_SWEEP_POINTS)
-        .ok_or_else(|| unsupported("nested DC sweep point limit exceeded"))?;
-    preflight(circuit, axes, &grids, context)?;
-    Ok(grids)
 }
 
 /// Policy and circuit inputs shared by all points in a DC sweep.
@@ -754,10 +809,12 @@ impl SweepSolver<'_> {
     }
 }
 
-pub(crate) fn run(
+pub(super) fn run(
     circuit: &mut Circuit,
-    request: &AnalysisRequest,
+    request: &AnalysisPlan,
     context: &AnalysisContext,
+    sweep: &DcSweepPlan,
+    point_iterations: Option<usize>,
 ) -> SpiceResult<Plot> {
     circuit.finalize()?;
     let circuit: &Circuit = circuit;
@@ -769,18 +826,19 @@ pub(crate) fn run(
         initial: Vec::new(),
         nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
     };
-    let axes = resolve(circuit, request, context)?;
-    let (point_iterations, settings) = sweep_settings(request)?;
-    let warm_settings = warm_start_settings(point_iterations, &settings);
+    let axes = bind_axes(circuit, sweep, context)?;
+    let settings = request.dc_settings();
+    let warm_settings = warm_start_settings(point_iterations, settings);
     let solver = SweepSolver {
         circuit,
-        settings: &settings,
+        settings,
         warm_settings: warm_settings.as_ref(),
         nodes: &nodes,
     };
-    let grids = prepare_grids(circuit, &axes, context)?;
+    let grids = &sweep.grids;
+    preflight(circuit, &axes, grids, context)?;
     // C order: the first axis is the inner (fast) loop, the second the outer.
-    let GridPair { inner, outer } = GridPair::new(&grids);
+    let GridPair { inner, outer } = GridPair::new(grids);
     let mut result = plot(
         circuit,
         "dc1",

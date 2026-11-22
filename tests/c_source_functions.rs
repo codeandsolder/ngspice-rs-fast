@@ -26,7 +26,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ngspice_rs::analysis::{AnalysisContext, Plot, RawFile, RunConfig, fourier, runner};
+use ngspice_rs::analysis::{AnalysisContext, Plot, RawFile, RunConfig, fourier};
 use ngspice_rs::devices::{Circuit, Limit, SourceKind, TransientTiming};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -194,11 +194,10 @@ fn operating_points_match_c_time_zero_values() {
     let c = plot.unwrap_or_else(|| panic!("no C rawfile:\n{text}"));
     let netlist = rust_netlist(&format!("t\n{cards}.op\n.end\n"));
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    let rust = runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &AnalysisContext::default())
+    let rust = request
+        .run(&mut circuit, &AnalysisContext::default())
         .unwrap();
     for k in 1..=22 {
         let name = format!("v(n{k})");
@@ -227,13 +226,10 @@ fn four_of_a_sin_driven_clipper_matches_c() {
         .unwrap();
     let netlist = &parsed.netlist;
     let config = RunConfig::from_netlist(netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(netlist).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap();
-    let ours = fourier::resolve(&plot, request.kind, &parsed.fourier)
+    let plot = request.run(&mut circuit, &config.context()).unwrap();
+    let ours = fourier::resolve(&plot, request.kind(), &parsed.fourier)
         .unwrap()
         .remove(0);
 
@@ -364,11 +360,10 @@ fn unmarked_decks_diverge_from_c_only_within_documented_bounds() {
         let c = plot.unwrap_or_else(|| panic!("{name}: no C rawfile:\n{text}"));
         let netlist = rust_netlist(&format!("t\n{circuit_cards}{tran}\n.end\n"));
         let config = RunConfig::from_netlist(&netlist).unwrap();
-        let request = config.request_for(&netlist.analyses[0]).unwrap();
+        let request = config.plan_for(&netlist.analyses[0]).unwrap();
         let mut circuit = config.circuit(&netlist).unwrap();
-        let ours = runner(request.kind)
-            .unwrap()
-            .run(&mut circuit, &request, &AnalysisContext::default())
+        let ours = request
+            .run(&mut circuit, &AnalysisContext::default())
             .unwrap();
         let column = |plot: &Plot, name: &str| -> Vec<Real> {
             plot.column(name).unwrap().iter().map(|v| v.re).collect()

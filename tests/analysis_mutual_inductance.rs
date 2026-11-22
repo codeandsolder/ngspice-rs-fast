@@ -9,7 +9,7 @@
 //! `cargo xtask golden verify`.
 use std::path::Path;
 
-use ngspice_rs::analysis::{AnalysisRequest, Plot, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisInput, Plot, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::{Complex, SpiceResult};
@@ -22,13 +22,13 @@ fn run_with(body: &str, extra: &[&str]) -> SpiceResult<Plot> {
         &format!("mutual\n{body}\n.end\n"),
     ))?;
     let config = RunConfig::from_netlist(&netlist)?;
-    let mut request = AnalysisRequest::from(&netlist.analyses[0]);
+    let mut request = AnalysisInput::from(&netlist.analyses[0]);
     request
         .arguments
         .extend(extra.iter().map(|token| (*token).to_owned()));
-    let request = config.request(request)?;
+    let request = config.plan(request)?;
     let mut circuit = config.circuit(&netlist)?;
-    runner(request.kind)?.run(&mut circuit, &request, &config.context())
+    request.run(&mut circuit, &config.context())
 }
 
 fn run(body: &str) -> Plot {

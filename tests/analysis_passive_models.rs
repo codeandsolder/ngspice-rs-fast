@@ -1,5 +1,5 @@
 //! Production analysis temperatures and literal/model-backed equivalence.
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
 use ngspice_rs::devices::{Circuit, IndependentSource, Waveform};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -21,11 +21,9 @@ fn run(
     args: &[&str],
     context: &AnalysisContext,
 ) -> SpiceResult<Plot> {
-    runner(kind)?.run(
-        circuit,
-        &AnalysisRequest::with_arguments(kind, args.iter().copied()),
-        context,
-    )
+    AnalysisInput::with_arguments(kind, args.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(circuit, context))
 }
 fn close(got: f64, want: f64, relative: f64, absolute: f64) {
     assert!(
@@ -196,15 +194,11 @@ fn modeled_rlc_uic_matches_literal_coupled_transient_bitwise() {
     let literal = "r1 a 0 8\nc1 a 0 0.125 ic=1\nl1 a 0 0.25 ic=0.5\nr2 b 0 8\nl2 b 0 0.25 ic=-0.25\nk1 l1 l2 0.5";
     let context = AnalysisContext::default();
     let mut request =
-        AnalysisRequest::with_arguments(AnalysisKind::Transient, ["1m", "20m", "0", "1m"]);
+        AnalysisInput::with_arguments(AnalysisKind::Transient, ["1m", "20m", "0", "1m"]);
     request.uic = true;
-    let transient = runner(AnalysisKind::Transient).unwrap();
-    let a = transient
-        .run(&mut circuit(model), &request, &context)
-        .unwrap();
-    let b = transient
-        .run(&mut circuit(literal), &request, &context)
-        .unwrap();
+    let transient = request.resolve().unwrap();
+    let a = transient.run(&mut circuit(model), &context).unwrap();
+    let b = transient.run(&mut circuit(literal), &context).unwrap();
     assert_eq!(a.point_count(), b.point_count());
     assert_eq!(a.variable_count(), b.variable_count());
     for var in b.variables() {

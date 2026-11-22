@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use ngspice_rs::analysis::batch::schedule;
-use ngspice_rs::analysis::{Plot, RawFile, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::{AnalysisKind, Complex, Real, SpiceError, SpiceResult};
@@ -20,10 +20,11 @@ fn simulate(deck: &str) -> SpiceResult<Vec<Plot>> {
     let netlist = Parser::new().parse_deck(&parse_deck_text(Path::new("sp.cir"), deck))?;
     let config = RunConfig::from_netlist(&netlist)?;
     let mut plots = Vec::new();
-    for entry in schedule(&netlist.analyses) {
-        let request = config.request_for(&netlist.analyses[entry.card_index])?;
+    let plans = config.plans_for(&netlist.analyses)?;
+    for entry in schedule(&plans) {
+        let request = &plans[entry.card_index];
         let mut circuit = config.circuit(&netlist)?;
-        plots.push(runner(request.kind)?.run(&mut circuit, &request, &config.context())?);
+        plots.push(request.run(&mut circuit, &config.context())?);
     }
     Ok(plots)
 }
@@ -363,13 +364,13 @@ fn port_sources_are_thevenin_sources_in_op_ac_and_tran() {
         close_real(plot, "i(v2)", point, load * current / 75.);
     }
     let names: Vec<_> = schedule(
-        &Parser::new()
+        &RunConfig::default().plans_for(&Parser::new()
             .parse_deck(&parse_deck_text(
                 Path::new("sp.cir"),
                 "x\nv1 1 0 portnum 1\n.sp lin 1 1 1\n.op\n.sp lin 1 2 2\n.ac lin 1 1 1\n.end\n",
             ))
             .unwrap()
-            .analyses,
+            .analyses).unwrap(),
     )
     .into_iter()
     .map(|entry| (entry.kind, entry.plot_name))
@@ -527,22 +528,11 @@ fn deck_dc_options_reach_the_sp_operating_point() {
         ))
         .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let named = |index: usize| {
-        let request = config.request_for(&netlist.analyses[index]).unwrap();
-        let named: Vec<String> = request
-            .arguments
-            .into_iter()
-            .filter(|argument| argument.contains('='))
-            .collect();
-        (request.kind, named)
-    };
-    let (kind, sp_options) = named(0);
-    assert_eq!(kind, AnalysisKind::SParameter);
-    assert!(
-        sp_options.contains(&"rtol=1e-4".to_owned()),
-        "{sp_options:?}"
-    );
-    assert_eq!(sp_options, named(1).1);
+    let sp = config.plan_for(&netlist.analyses[0]).unwrap();
+    let ac = config.plan_for(&netlist.analyses[1]).unwrap();
+    assert_eq!(sp.kind(), AnalysisKind::SParameter);
+    assert_eq!(sp.dc_settings().newton.reltol, 1e-4);
+    assert_eq!(sp.dc_settings(), ac.dc_settings());
     let plots = simulate(
         "opts\n.options reltol=1e-4\nv1 1 0 dc 1 portnum 1\nr1 1 0 50\n.sp lin 1 1k 1k\n.end\n",
     )

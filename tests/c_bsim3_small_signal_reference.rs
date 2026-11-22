@@ -9,7 +9,7 @@
 //! interpolation inside each plot, with the C-default `reltol`-scale bound
 //! `1e-3 |C| + 1 uV/1 pA`; `tmax` is small enough that resampling contributes
 //! far less than that.
-use ngspice_rs::analysis::{Plot, RawFile, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use std::fs;
@@ -55,12 +55,9 @@ fn run_rust(deck: &str) -> Plot {
         ))
         .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap()
+    request.run(&mut circuit, &config.context()).unwrap()
 }
 
 /// Compare every node-voltage and branch-current variable at every point.

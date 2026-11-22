@@ -1,5 +1,5 @@
 //! Linear production analyses against analytic MNA results.
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
 use ngspice_rs::devices::Circuit;
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -20,11 +20,9 @@ fn run(
     kind: AnalysisKind,
     args: &[&str],
 ) -> ngspice_rs::primitives::SpiceResult<Plot> {
-    runner(kind)?.run(
-        c,
-        &AnalysisRequest::with_arguments(kind, args.iter().copied()),
-        &AnalysisContext::default(),
-    )
+    AnalysisInput::with_arguments(kind, args.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
 }
 fn close(got: f64, want: f64) {
     assert!(
@@ -226,12 +224,12 @@ fn elaboration_rejects_unimplemented_parameters() {
         "test\nv1 in 0 1\nr1 in out 1k\nc1 out 0 1u\n.tran 0.1m 1m\n.end\n",
     );
     let netlist = Parser::new().parse_deck(&deck).unwrap();
-    let request = AnalysisRequest::from(&netlist.analyses[0]);
+    let request = AnalysisInput::from(&netlist.analyses[0]);
     let mut c = Circuit::from_netlist(&netlist).unwrap();
     assert!(
-        runner(request.kind)
-            .unwrap()
-            .run(&mut c, &request, &AnalysisContext::default())
+        request
+            .resolve()
+            .and_then(|plan| plan.run(&mut c, &AnalysisContext::default()))
             .is_ok()
     );
     let deck = parse_deck_text(Path::new("test.cir"), "test\nr1 a 0 1k tc1=1\n.end\n");

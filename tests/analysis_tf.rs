@@ -8,7 +8,7 @@
 //! verify`; `tests/c_tf_reference.rs` compares further decks with live C.
 use std::path::Path;
 
-use ngspice_rs::analysis::{Plot, RunConfig, batch, runner};
+use ngspice_rs::analysis::{Plot, RunConfig, batch};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::{AnalysisKind, SpiceError, SpiceResult};
@@ -22,10 +22,11 @@ fn run_all(body: &str) -> SpiceResult<Vec<(String, Plot)>> {
     ))?;
     let config = RunConfig::from_netlist(&netlist)?;
     let mut plots = Vec::new();
-    for entry in batch::schedule(&netlist.analyses) {
-        let request = config.request_for(&netlist.analyses[entry.card_index])?;
+    let plans = config.plans_for(&netlist.analyses)?;
+    for entry in batch::schedule(&plans) {
+        let request = &plans[entry.card_index];
         let mut circuit = config.circuit(&netlist)?;
-        let plot = runner(request.kind)?.run(&mut circuit, &request, &config.context())?;
+        let plot = request.run(&mut circuit, &config.context())?;
         plots.push((entry.plot_name, plot));
     }
     Ok(plots)
@@ -367,7 +368,7 @@ fn invalid_and_unsupported_cards_fail_explicitly() {
 
 #[test]
 fn the_driver_is_registered() {
-    let driver = runner(AnalysisKind::TransferFunction).unwrap();
-    assert_eq!(driver.kind(), AnalysisKind::TransferFunction);
-    assert_eq!(driver.name(), "transfer function");
+    assert!(ngspice_rs::analysis::has_driver(
+        AnalysisKind::TransferFunction
+    ));
 }

@@ -3,7 +3,7 @@ use ngspice_rs::analysis::bias::{
     AttemptOutcome, ContinuationPolicy, DcOutcome, DcSettings, DcStrategy,
 };
 use ngspice_rs::analysis::sweep::{SweepSpec, SweepTarget};
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, RunConfig};
 use ngspice_rs::devices::{Circuit, ModelContext};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -110,10 +110,10 @@ fn resistor_preflight_uses_the_actual_point_context_not_the_original_value() {
         ),
     ] {
         let mut c = circuit("v1 a 0 1\nr1 a 0 rm 1e308\n.model rm r(tc1=0.01)");
-        let request = AnalysisRequest::with_arguments(AnalysisKind::DcSweep, args);
-        let plot = runner(AnalysisKind::DcSweep)
-            .unwrap()
-            .run(&mut c, &request, &context)
+        let request = AnalysisInput::with_arguments(AnalysisKind::DcSweep, args);
+        let plot = request
+            .resolve()
+            .and_then(|plan| plan.run(&mut c, &context))
             .unwrap();
         let currents = if plot.point_count() == 4 {
             vec![-1. / 1_000., -1. / 2_000., -1. / 2_000., -1. / 4_000.]
@@ -138,12 +138,9 @@ fn dc_points_consume_deck_continuation_controls_and_request_overrides() {
     // policies (srcsteps=20 equal steps at 1e-8 S, no per-point warm start)
     // whose iteration counts this budget was chosen for.
     let config = RunConfig::from_netlist(&n).unwrap();
-    let request = config.request_for(&n.analyses[0]).unwrap();
+    let request = config.plan_for(&n.analyses[0]).unwrap();
     let mut c = config.circuit(&n).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut c, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut c, &config.context()).unwrap();
     assert_eq!(plot.point_count(), 2);
     let vt = (1.38064852e-23 / 1.6021766208e-19) * 300.15;
     // NIiter's accuracy, not exact: it accepts once the update is within
@@ -153,14 +150,11 @@ fn dc_points_consume_deck_continuation_controls_and_request_overrides() {
     // 0.017936336109075593 V, 8.1e-6 V (4.5e-4 relative) from vt ln 2.
     let (v, exact) = (plot.value("v(a)", 1).unwrap().re, vt * 2_f64.ln());
     assert!((v - exact).abs() < 1e-3 * exact + 1e-6, "{v} vs {exact}");
-    let mut explicit = AnalysisRequest::from(&n.analyses[0]);
+    let mut explicit = AnalysisInput::from(&n.analyses[0]);
     explicit.arguments.push("srcsteps=0".into());
-    let disabled = config.request(explicit).unwrap();
+    let disabled = config.plan(explicit).unwrap();
     let mut c = config.circuit(&n).unwrap();
-    let error = runner(disabled.kind)
-        .unwrap()
-        .run(&mut c, &disabled, &config.context())
-        .unwrap_err();
+    let error = disabled.run(&mut c, &config.context()).unwrap_err();
     assert!(
         error.to_string().contains("source stepping: disabled"),
         "{error}"

@@ -97,8 +97,10 @@ fn capture_fixture(binary: &Ngspice, netlist: &Path, scratch: &Path) -> Result<C
         .map_err(|error| format!("parsing {}: {error}", netlist.display()))?;
     let config = ngspice_rs::analysis::RunConfig::from_netlist(&parsed)
         .map_err(|error| error.to_string())?;
-    let plots: Vec<_> = ngspice_rs::analysis::batch::schedule_evaluated(&parsed.analyses, &config)
-        .map_err(|error| error.to_string())?
+    let plans = config
+        .plans_for(&parsed.analyses)
+        .map_err(|error| error.to_string())?;
+    let plots: Vec<_> = ngspice_rs::analysis::batch::schedule(&plans)
         .iter()
         .flat_map(|entry| entry.plot_names().map(str::to_owned).collect::<Vec<_>>())
         .collect();

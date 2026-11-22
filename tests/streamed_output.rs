@@ -1,4 +1,4 @@
-//! Streamed output (M10 0.5g): [`Analysis::run_into`] hands an analysis's
+//! Streamed output (M10 0.5g): [`ngspice_rs::analysis::AnalysisPlan::run_into`] hands an analysis's
 //! points to a [`PointSink`] instead of storing them, and [`RawFileWriter`]
 //! writes plots one at a time, spooling a streamed plot's points until its
 //! count is known. Both must reproduce the stored path exactly: the same rows,
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use ngspice_rs::analysis::{
     BinaryByteOrder, Plot, PlotFlags, PointSink, RawFile, RawFileReader, RawFileWriter, RawFormat,
-    RawPlot, RunConfig, Variable, runner,
+    RawPlot, RunConfig, Variable,
 };
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::Netlist;
@@ -70,19 +70,16 @@ impl PointSink for Recorder {
 fn assert_streams_the_stored_plot(body: &str) {
     let netlist = deck(body);
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
-    let driver = runner(request.kind).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
 
     let mut circuit = config.circuit(&netlist).unwrap();
-    let stored = driver
-        .run(&mut circuit, &request, &config.context())
-        .unwrap();
+    let stored = request.run(&mut circuit, &config.context()).unwrap();
     let final_state = circuit.final_transient_state();
 
     let mut circuit = config.circuit(&netlist).unwrap();
     let mut recorder = Recorder::default();
-    let returned = driver
-        .run_into(&mut circuit, &request, &config.context(), &mut recorder)
+    let returned = request
+        .run_into(&mut circuit, &config.context(), &mut recorder)
         .unwrap();
 
     assert!(returned.points().is_empty(), "run_into returns no points");
@@ -148,12 +145,11 @@ impl PointSink for Refusing {
 fn a_sink_error_stops_the_transient_with_that_error() {
     let netlist = deck("v1 in 0 dc 1\nr1 in out 1k\nc1 out 0 1u\n.tran 0.1m 1m");
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
     let mut sink = Refusing(0);
-    let error = runner(request.kind)
-        .unwrap()
-        .run_into(&mut circuit, &request, &config.context(), &mut sink)
+    let error = request
+        .run_into(&mut circuit, &config.context(), &mut sink)
         .unwrap_err();
     assert!(error.to_string().contains("sink refused"), "{error}");
     assert_eq!(sink.0, 3, "no point is offered after the failing one");
@@ -161,18 +157,14 @@ fn a_sink_error_stops_the_transient_with_that_error() {
 
     // A later failed run must not publish its partial accepted history over
     // the last successful transient's snapshot, either.
-    runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap();
+    request.run(&mut circuit, &config.context()).unwrap();
     let before = circuit
         .final_transient_state()
         .expect("successful run retained its load");
     let mut sink = Refusing(0);
     assert!(
-        runner(request.kind)
-            .unwrap()
-            .run_into(&mut circuit, &request, &config.context(), &mut sink)
+        request
+            .run_into(&mut circuit, &config.context(), &mut sink)
             .is_err()
     );
     assert_eq!(circuit.final_transient_state(), Some(before));

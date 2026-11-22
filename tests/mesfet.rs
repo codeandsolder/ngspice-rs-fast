@@ -2,7 +2,7 @@
 //! operation against an independent restatement of `mesload.c`, finite-
 //! difference Jacobians, Statz gate charge, observations, noise and explicit
 //! gaps. C-golden comparisons live in `xtask golden verify` (`m10_mesfet_*`).
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
 use ngspice_rs::devices::{AnalysisMode, Circuit, LoadRequest, ModelContext};
 use ngspice_rs::maths::{SparseMatrix, Vector};
 use ngspice_rs::netlist::ast::ParameterKind;
@@ -23,13 +23,9 @@ fn circuit(body: &str) -> Result<Circuit, SpiceError> {
     Circuit::from_netlist(&deck(body)?)
 }
 fn run(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> Plot {
-    runner(kind)
-        .unwrap()
-        .run(
-            c,
-            &AnalysisRequest::with_arguments(kind, arguments.iter().copied()),
-            &AnalysisContext::default(),
-        )
+    AnalysisInput::with_arguments(kind, arguments.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
         .unwrap()
 }
 fn value(plot: &Plot, name: &str, point: usize) -> f64 {
@@ -524,17 +520,13 @@ fn noise_follows_mesnoise_and_distortion_and_sensitivity_are_refused() {
     let body = "vd d 0 5\nvg g 0 dc -1 ac 1\nrl d o 1k\nvo o 0 0\nz1 d g 0 zm m=2\n\
                 .model zm nmf(rd=10 rs=5 kf=1e-12 af=1.2)";
     let mut c = circuit(body).unwrap();
-    let plot = runner(AnalysisKind::Noise)
-        .unwrap()
-        .run(
-            &mut c,
-            &AnalysisRequest::with_arguments(
-                AnalysisKind::Noise,
-                ["v(o)", "vg", "dec", "2", "1k", "10k", "1"],
-            ),
-            &AnalysisContext::default(),
-        )
-        .unwrap();
+    let plot = AnalysisInput::with_arguments(
+        AnalysisKind::Noise,
+        ["v(o)", "vg", "dec", "2", "1k", "10k", "1"],
+    )
+    .resolve()
+    .and_then(|plan| plan.run(&mut c, &AnalysisContext::default()))
+    .unwrap();
     // mesnoise.c's generators, then the instance total.
     for name in [
         "onoise_z1_rd",
@@ -550,11 +542,9 @@ fn noise_follows_mesnoise_and_distortion_and_sensitivity_are_refused() {
         );
     }
     let mut c = circuit(&body.replace("ac 1", "distof1 1")).unwrap();
-    let disto = runner(AnalysisKind::Distortion).unwrap().run(
-        &mut c,
-        &AnalysisRequest::with_arguments(AnalysisKind::Distortion, ["dec", "2", "1k", "10k"]),
-        &AnalysisContext::default(),
-    );
+    let disto = AnalysisInput::with_arguments(AnalysisKind::Distortion, ["dec", "2", "1k", "10k"])
+        .resolve()
+        .and_then(|plan| plan.run(&mut c, &AnalysisContext::default()));
     let error = disto.unwrap_err();
     assert!(error.is_not_yet_ported(), "{error}");
     assert!(error.to_string().contains("mesdisto.c"), "{error}");
@@ -562,11 +552,10 @@ fn noise_follows_mesnoise_and_distortion_and_sensitivity_are_refused() {
     // with M (`IOPUR`) and the unaskable KF/AF left out.
     let netlist = deck(&format!("{body}\n.sens v(o)")).unwrap();
     let config = ngspice_rs::analysis::RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut c = config.circuit(&netlist).unwrap();
-    let values = runner(request.kind)
-        .unwrap()
-        .run(&mut c, &request, &config.context())
+    let values = request
+        .run(&mut c, &config.context())
         .unwrap()
         .variables()
         .iter()
@@ -605,13 +594,9 @@ fn transient_gate_charge_delays_the_common_source_stage() {
     let forward = "vdd vdd 0 3\nvg g 0 pulse(0 0.7 1n 1n 1n 10n 20n)\nrl vdd d 1k\nz1 d g 0 zm\n\
                    .model zm nmf(cgs=1p pb=0.4)";
     let mut c = circuit(forward).unwrap();
-    let error = runner(AnalysisKind::Transient)
-        .unwrap()
-        .run(
-            &mut c,
-            &AnalysisRequest::with_arguments(AnalysisKind::Transient, ["0.1n", "5n"]),
-            &AnalysisContext::default(),
-        )
+    let error = AnalysisInput::with_arguments(AnalysisKind::Transient, ["0.1n", "5n"])
+        .resolve()
+        .and_then(|plan| plan.run(&mut c, &AnalysisContext::default()))
         .unwrap_err();
     assert!(error.to_string().contains("qggnew"), "{error}");
     // The same deck with the default PB = 1 V runs.
@@ -786,10 +771,10 @@ fn the_state_backed_charge_asks_are_refused_by_name() {
         .unwrap();
         c.set_observations(&[format!("@z1[{key}]")]).unwrap();
         let request =
-            AnalysisRequest::with_arguments(AnalysisKind::OperatingPoint, Vec::<String>::new());
-        let error = runner(AnalysisKind::OperatingPoint)
-            .unwrap()
-            .run(&mut c, &request, &AnalysisContext::default())
+            AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, Vec::<String>::new());
+        let error = request
+            .resolve()
+            .and_then(|plan| plan.run(&mut c, &AnalysisContext::default()))
             .unwrap_err();
         assert!(error.is_not_yet_ported(), "{key}: {error}");
         assert!(error.to_string().contains("mesask.c"), "{key}: {error}");
@@ -813,11 +798,8 @@ fn the_sensitivity_table_is_mes_cs_parameter_list() {
     )
     .unwrap();
     let config = ngspice_rs::analysis::RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
-    let plot = ngspice_rs::analysis::runner(request.kind)
-        .unwrap()
-        .run(&mut c, &request, &config.context())
-        .unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
+    let plot = request.run(&mut c, &config.context()).unwrap();
     let names: Vec<&str> = plot
         .variables()
         .iter()

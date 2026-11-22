@@ -8,7 +8,7 @@
 //! reltol with bypass stops about 4e-4 from the root of these sweeps). Every
 //! node voltage and branch current C writes is compared by name at
 //! `1e-6 |C| + 1e-12` per component, the `xtask::compare::NONLINEAR` bound.
-use ngspice_rs::analysis::{Plot, RawFile, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use std::fs;
@@ -54,12 +54,9 @@ fn run_rust(deck: &str) -> Plot {
         ))
         .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap()
+    request.run(&mut circuit, &config.context()).unwrap()
 }
 
 fn compare(tag: &str, deck: &str) {

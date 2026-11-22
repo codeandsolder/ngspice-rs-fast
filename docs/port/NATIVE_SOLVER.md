@@ -104,14 +104,19 @@ Running a deck's analyses from Rust, as the CLI does (`RunConfig` applies the
 deck's `.option` cards):
 
 ```rust
-use ngspice_rs::analysis::{RunConfig, runner};
+use ngspice_rs::analysis::RunConfig;
 
 let config = RunConfig::from_netlist(&netlist)?;
 let mut circuit = config.circuit(&netlist)?;
-let request = config.request_for(&netlist.analyses[0])?;
-let plot = runner(request.kind)?.run(&mut circuit, &request, &config.context())?;
+let plan = config.plan_for(&netlist.analyses[0])?;
+let plot = plan.run(&mut circuit, &config.context())?;
 ```
 
+
+The resolver evaluates deck expressions, validates analysis syntax and options,
+and builds the typed analysis-specific payload once. Batch scheduling consumes
+`config.plans_for(&netlist.analyses)?`, the same plans subsequently executed.
+Circuit-dependent identities bind against the circuit when running a plan.
 
 - `SparseLu::new(&matrix, reuse)` returns owned factors; the matrix stays
   plain, cloneable stamping storage, and mutating it never changes existing

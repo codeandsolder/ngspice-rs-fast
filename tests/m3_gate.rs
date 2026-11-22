@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 
 use ngspice_rs::analysis::{
-    AnalysisRequest, Plot, RawFile, RunConfig, TransientStats, companion_transient, runner,
+    AnalysisInput, Plot, RawFile, RunConfig, TransientStats, companion_transient,
 };
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::primitives::parse_spice_number;
@@ -50,29 +50,31 @@ impl Fixture {
         let config = RunConfig::from_netlist(&netlist).unwrap();
         Self { netlist, config }
     }
-    fn request(&self) -> AnalysisRequest {
-        self.config.request_for(&self.netlist.analyses[0]).unwrap()
+    fn input(&self) -> AnalysisInput {
+        AnalysisInput::from(&self.netlist.analyses[0])
     }
     /// An ordinary `.tran` run with optional extra request tokens.
     fn tran(&self, extra: &[&str]) -> ngspice_rs::primitives::SpiceResult<(Plot, TransientStats)> {
-        let mut request = self.request();
+        let mut request = self.input();
         request
             .arguments
             .extend(extra.iter().map(|s| s.to_string()));
+        let request = self.config.plan(request)?;
         let mut circuit = self.config.circuit(&self.netlist)?;
         companion_transient(&mut circuit, &request, &self.config.context())
     }
     fn number(&self, index: usize) -> f64 {
-        parse_spice_number(self.request().argument(index).unwrap()).unwrap()
+        parse_spice_number(&self.netlist.analyses[0].arguments[index]).unwrap()
     }
     /// Any analysis through the ordinary `runner` (used for `.ac`).
     fn run(&self, extra: &[&str]) -> ngspice_rs::primitives::SpiceResult<Plot> {
-        let mut request = self.request();
+        let mut request = self.input();
         request
             .arguments
             .extend(extra.iter().map(|s| s.to_string()));
+        let request = self.config.plan(request)?;
         let mut circuit = self.config.circuit(&self.netlist)?;
-        runner(request.kind)?.run(&mut circuit, &request, &self.config.context())
+        request.run(&mut circuit, &self.config.context())
     }
     fn golden(name: &str) -> Plot {
         let text =
@@ -1274,7 +1276,7 @@ fn an_ic_without_uic_constrains_the_initial_bias_and_is_then_released() {
     let deck = ngspice_rs::netlist::source::parse_deck_text(Path::new("no_ic.cir"), &text);
     let netlist = Parser::new().parse_deck(&deck).unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
     let (plain, _) = companion_transient(&mut circuit, &request, &config.context()).unwrap();
     assert!(

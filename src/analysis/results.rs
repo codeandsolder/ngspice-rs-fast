@@ -15,7 +15,7 @@ use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 ///
 /// C's batch output (`outitf.c`: `OUTpBeginPlot`, then `OUTpData` per point)
 /// writes every point to the rawfile as it is computed and keeps no plot in
-/// memory; [`crate::analysis::Analysis::run_into`] offers the same, so a long
+/// memory; [`crate::analysis::AnalysisPlan::run_into`] offers the same, so a long
 /// transient costs memory for one point rather than for the whole run.
 pub trait PointSink {
     /// Called once, before the first point, with the plot's names, flags and

@@ -6,7 +6,7 @@
 //!
 //! Run with `NGSPICE_BIN=/absolute/path/to/ngspice cargo test -p
 //! analysis --test c_mutual_inductance -- --ignored`.
-use ngspice_rs::analysis::{AnalysisRequest, Plot, RawFile, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisInput, Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use std::fs;
@@ -45,9 +45,9 @@ impl Drop for Scratch {
 fn rust(deck: &str) -> ngspice_rs::primitives::SpiceResult<Plot> {
     let netlist = Parser::new().parse_deck(&parse_deck_text(Path::new("k.cir"), deck))?;
     let config = RunConfig::from_netlist(&netlist)?;
-    let request = config.request(AnalysisRequest::from(&netlist.analyses[0]))?;
+    let request = config.plan(AnalysisInput::from(&netlist.analyses[0]))?;
     let mut circuit = config.circuit(&netlist)?;
-    runner(request.kind)?.run(&mut circuit, &request, &config.context())
+    request.run(&mut circuit, &config.context())
 }
 
 /// C's AC plot of `body` (whose analysis is given separately as a control
