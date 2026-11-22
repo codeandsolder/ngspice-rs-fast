@@ -186,7 +186,6 @@ pub fn expand_with_output(
         emitted_locals: BTreeSet::new(),
         binned_bases: BTreeSet::new(),
         root_functions: root.functions().cloned(),
-        functions: BTreeMap::new(),
         plans: BTreeMap::new(),
     };
     let mut locals = vec![expander.root_models()];
@@ -318,6 +317,12 @@ fn expansion_plan<'a>(
     Ok(sequence)
 }
 
+struct DefinitionPlan<'a> {
+    sequence: Vec<ExpansionItem<'a>>,
+    parameters: Vec<ParamCard>,
+    functions: Option<Arc<FunctionScope>>,
+}
+
 struct Expander<'a> {
     netlist: &'a Netlist,
     definitions: BTreeMap<String, &'a Subcircuit>,
@@ -334,10 +339,8 @@ struct Expander<'a> {
     binned_bases: BTreeSet<String>,
     /// The deck's top-level `.func` definitions.
     root_functions: Option<Arc<FunctionScope>>,
-    /// Each definition's own `.func` scope (lexically inside the root's),
-    /// built and checked once per definition name.
-    functions: BTreeMap<String, Arc<FunctionScope>>,
-    plans: BTreeMap<String, Arc<[ExpansionItem<'a>]>>,
+    /// Lexical declarations are independent of an instance's bound values.
+    plans: BTreeMap<String, Arc<DefinitionPlan<'a>>>,
 }
 
 /// Definition lookup: first declaration wins, like `ModelResolver` and C's
@@ -827,25 +830,11 @@ impl<'a> Expander<'a> {
         for (formal, actual) in definition.terminals.iter().zip(&instance.nodes) {
             terminals.insert(formal.clone(), actual.clone());
         }
-        let scope = self.instance_scope(definition, instance, parent)?;
+        let (scope, plan) = self.instance_scope(definition, instance, parent)?;
         let child_path = if path.is_empty() {
             instance.name.clone()
         } else {
             format!("{path}.{}", instance.name)
-        };
-        let key = definition.name.to_ascii_lowercase();
-        let sequence = match self.plans.get(&key) {
-            Some(plan) => Arc::clone(plan),
-            None => {
-                let plan: Arc<[_]> = expansion_plan(
-                    ScopeView::from(definition),
-                    &definition.output,
-                    &definition.measurements,
-                )?
-                .into();
-                self.plans.insert(key, Arc::clone(&plan));
-                plan
-            }
         };
         let body =
             crate::netlist::elaborate::literalize_body(definition, &scope, &mut self.budget)?;
@@ -858,7 +847,7 @@ impl<'a> Expander<'a> {
             locals,
             &Directives {
                 devices: &body.devices,
-                sequence: &sequence,
+                sequence: &plan.sequence,
                 initial_conditions: &body.initial_conditions,
                 nodesets: &body.nodesets,
             },
@@ -871,10 +860,10 @@ impl<'a> Expander<'a> {
     /// defaults as the first `.param` card, body `.param` cards after them.
     fn instance_scope(
         &mut self,
-        definition: &Subcircuit,
+        definition: &'a Subcircuit,
         instance: &DeviceInstance,
         parent: &Arc<ParamScope>,
-    ) -> SpiceResult<Arc<ParamScope>> {
+    ) -> SpiceResult<(Arc<ParamScope>, Arc<DefinitionPlan<'a>>)> {
         let mut bindings = Vec::with_capacity(instance.parameters.len());
         for parameter in &instance.parameters {
             bindings.push(ParamBinding {
@@ -883,50 +872,62 @@ impl<'a> Expander<'a> {
                 location: parameter.location.clone(),
             });
         }
-        let mut cards = Vec::new();
+        let plan = self.definition_plan(definition)?;
+        let scope = Arc::new(ParamScope::resolve_instance_scoped(
+            Some(Arc::clone(parent)),
+            plan.functions.clone(),
+            &bindings,
+            &plan.parameters,
+            &mut self.budget,
+        )?);
+        Ok((scope, plan))
+    }
+
+    /// Cache only immutable lexical syntax. Formal defaults and body
+    /// parameters are still evaluated with each caller's bindings and budget.
+    fn definition_plan(
+        &mut self,
+        definition: &'a Subcircuit,
+    ) -> SpiceResult<Arc<DefinitionPlan<'a>>> {
+        let key = definition.name.to_ascii_lowercase();
+        if let Some(plan) = self.plans.get(&key) {
+            return Ok(Arc::clone(plan));
+        }
+        let mut parameters = Vec::new();
         if !definition.parameters.is_empty() {
-            let mut assignments = Vec::with_capacity(definition.parameters.len());
-            for formal in &definition.parameters {
-                assignments.push(formal_assignment(formal)?);
-            }
-            cards.push(ParamCard {
+            let assignments = definition
+                .parameters
+                .iter()
+                .map(formal_assignment)
+                .collect::<SpiceResult<_>>()?;
+            parameters.push(ParamCard {
                 assignments,
                 location: definition.location.clone(),
             });
         }
-        cards.extend(definition.params.iter().cloned());
-        let functions = self.definition_functions(definition)?;
-        Ok(Arc::new(ParamScope::resolve_instance_scoped(
-            Some(Arc::clone(parent)),
+        parameters.extend(definition.params.iter().cloned());
+        // Functions see their lexical definition and root, not the caller's local functions.
+        let functions = if definition.functions.is_empty() {
+            self.root_functions.clone()
+        } else {
+            Some(Arc::new(FunctionScope::new(
+                self.root_functions.clone(),
+                &definition.functions,
+                &self.budget,
+            )?))
+        };
+        let sequence = expansion_plan(
+            ScopeView::from(definition),
+            &definition.output,
+            &definition.measurements,
+        )?;
+        let plan = Arc::new(DefinitionPlan {
+            sequence,
+            parameters,
             functions,
-            &bindings,
-            &cards,
-            &mut self.budget,
-        )?))
-    }
-
-    /// The `.func` definitions a definition's body sees: its own, then the
-    /// deck's. C (`inpcom.c` `inp_expand_macros_in_deck()`) scopes functions
-    /// by the lexical `.subckt` nesting, not by the instantiating body, so a
-    /// caller's local functions never leak into the callee.
-    fn definition_functions(
-        &mut self,
-        definition: &Subcircuit,
-    ) -> SpiceResult<Option<Arc<FunctionScope>>> {
-        if definition.functions.is_empty() {
-            return Ok(self.root_functions.clone());
-        }
-        let key = definition.name.to_ascii_lowercase();
-        if let Some(scope) = self.functions.get(&key) {
-            return Ok(Some(Arc::clone(scope)));
-        }
-        let scope = Arc::new(FunctionScope::new(
-            self.root_functions.clone(),
-            &definition.functions,
-            &self.budget,
-        )?);
-        self.functions.insert(key, Arc::clone(&scope));
-        Ok(Some(scope))
+        });
+        self.plans.insert(key, Arc::clone(&plan));
+        Ok(plan)
     }
 
     /// One instance parameter's value, evaluated at the call site.
