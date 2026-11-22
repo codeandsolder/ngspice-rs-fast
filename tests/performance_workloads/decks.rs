@@ -107,7 +107,26 @@ fn run(name: &str, text: &str, verify: impl Fn(&Plot)) {
             let start = Instant::now();
             let read = black_box(RawFile::parse_bytes(&bytes).unwrap());
             decode += start.elapsed();
-            assert_eq!(read.plots[0].plot, raw.plots[0].plot);
+            // Rawfile stores the display plotname, not the internal name
+            // (e.g. tran1). Compare exactly the serialized schema and cells.
+            let got = &read.plots[0].plot;
+            let want = &raw.plots[0].plot;
+            assert_eq!(got.plotname, want.plotname);
+            assert_eq!(got.flags(), want.flags());
+            assert_eq!(got.variables(), want.variables());
+            assert_eq!(got.point_count(), want.point_count());
+            for variable in want.variables() {
+                let want_column = want.column(&variable.name).unwrap();
+                let got_column = got.column(&variable.name).unwrap();
+                for (row, (a, b)) in got_column.into_iter().zip(want_column).enumerate() {
+                    assert_eq!(
+                        (a.re.to_bits(), a.im.to_bits()),
+                        (b.re.to_bits(), b.im.to_bits()),
+                        "{name}: codec mismatch at {} row {row}",
+                        variable.name
+                    );
+                }
+            }
         }
         report(name, "binary_encode", 1, encode);
         report(name, "binary_decode", 1, decode);
