@@ -1,6 +1,6 @@
 //! Candidate coordinate binding and independent circuit preparation.
-use std::borrow::Cow;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use super::RunConfig;
 use crate::analysis::AnalysisPlan;
@@ -8,7 +8,7 @@ use crate::devices::Circuit;
 use crate::devices::circuit::CandidateTopology;
 use crate::netlist::ast::{Netlist, ParameterAssignment, ParameterKind, ScopeView};
 use crate::netlist::eval::{
-    CandidateParameters, EvalBudget, FunctionScope, ParameterPlan, ParameterScopeId,
+    CandidateParameters, EvalBudget, FunctionScope, ParamScope, ParameterPlan, ParameterScopeId,
     ParameterScopeSpec,
 };
 use crate::primitives::{Real, SpiceError, SpiceResult};
@@ -232,7 +232,7 @@ impl<'a> CandidatePlan<'a> {
             &config.context().model_context(),
             Default::default(),
             Default::default(),
-            Some(scope),
+            Some(scope.clone()),
             None,
         )?;
         let baseline = CandidateTopology::new(baseline)?;
@@ -241,6 +241,15 @@ impl<'a> CandidatePlan<'a> {
             plan: self,
             evaluator,
             baseline,
+            scope,
+            root_values: self
+                .parameters
+                .inputs()
+                .iter()
+                .map(|input| input.default.to_bits())
+                .collect(),
+            working: (!self.setters.is_empty()).then(|| self.deck.clone()),
+            direct_values: vec![None; self.setters.len()],
         })
     }
 }
@@ -274,6 +283,10 @@ pub struct CandidateSession<'a> {
     plan: &'a CandidatePlan<'a>,
     evaluator: CandidateParameters<'a>,
     baseline: CandidateTopology,
+    scope: Arc<ParamScope>,
+    root_values: Vec<u64>,
+    working: Option<Netlist>,
+    direct_values: Vec<Option<u64>>,
 }
 
 impl CandidateSession<'_> {
@@ -288,19 +301,39 @@ impl CandidateSession<'_> {
         }
         let (root, direct) = values.split_at(self.plan.parameters.inputs().len());
         let evaluated_definitions = self.evaluator.update(root, &mut EvalBudget::default())?;
-        let scope = self.evaluator.resolved_scope(self.plan.root)?;
-        let deck = if direct.is_empty() {
-            Cow::Borrowed(self.plan.deck)
-        } else {
-            let mut deck = self.plan.deck.clone();
-            for (&site, &value) in self.plan.setters.iter().zip(direct) {
-                site.assign(&mut deck, value)?;
+        if self
+            .root_values
+            .iter()
+            .copied()
+            .ne(root.iter().map(|value| value.to_bits()))
+        {
+            self.scope = self.evaluator.resolved_scope(self.plan.root)?;
+            for (saved, value) in self.root_values.iter_mut().zip(root) {
+                *saved = value.to_bits();
             }
-            Cow::Owned(deck)
-        };
-        let config = RunConfig::with_resolved_scope(&deck, scope.clone())?;
+        }
+        // Keep a private editable syntax tree and update only changed
+        // coordinates. A failed physical preparation does not expose this
+        // tree: the next complete vector replaces every changed coordinate.
+        if let Some(deck) = &mut self.working {
+            for ((&site, &value), previous) in self
+                .plan
+                .setters
+                .iter()
+                .zip(direct)
+                .zip(&mut self.direct_values)
+            {
+                if *previous != Some(value.to_bits()) {
+                    site.assign(deck, value)?;
+                    *previous = Some(value.to_bits());
+                }
+            }
+        }
+        let deck = self.working.as_ref().unwrap_or(self.plan.deck);
+        let scope = Arc::clone(&self.scope);
+        let config = RunConfig::with_resolved_scope(deck, scope.clone())?;
         let circuit = Circuit::from_netlist_with_scope(
-            &deck,
+            deck,
             &config.context().model_context(),
             Default::default(),
             Default::default(),
