@@ -85,7 +85,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
 /// ngspice `MAX_EXP_ARG`, the substrate exponential clamp of `bjtload.c`.
 const MAX_EXP_ARG: Real = 709.;
@@ -909,7 +909,7 @@ fn reject_unported(parameters: &[ParameterAssignment]) -> SpiceResult<()> {
 impl Bjt {
     pub(crate) fn instantiate(
         i: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         model: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -976,33 +976,34 @@ impl Bjt {
         // Validate the temperature model and one evaluation before interning.
         let thermal = parameters.thermal(&instance, subs > 0., context)?;
         c_point(&thermal, 0., 0., 0., 0., context.gmin)?;
-        let mut staged = nodes.clone();
-        let external: Vec<_> = i
-            .nodes
-            .iter()
-            .map(|n| staged.intern(n))
-            .collect::<SpiceResult<Vec<_>>>()?;
-        let mut terminals = external.clone();
-        let mut internal = |resistance: Real, suffix: &str, external: NodeId| {
-            if resistance == 0. {
-                return Ok(external);
-            }
-            let name = format!("{}#{suffix}", i.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "BJT internal-node name collision: {name}"
-                )));
-            }
-            let node = staged.intern(&name)?;
-            staged.set_kind(node, NodeKind::Internal);
-            terminals.push(node);
-            Ok(node)
-        };
-        // bjtsetup.c creates collCX, base, emitter in this order.
-        let cp = internal(parameters.rc, "collCX", external[0])?;
-        let bp = internal(parameters.rb, "base", external[1])?;
-        let ep = internal(parameters.re, "emitter", external[2])?;
-        *nodes = staged;
+        let (terminals, external, cp, bp, ep) = nodes.transaction(|staged| {
+            let external: Vec<_> = i
+                .nodes
+                .iter()
+                .map(|n| staged.intern(n))
+                .collect::<SpiceResult<Vec<_>>>()?;
+            let mut terminals = external.clone();
+            let mut internal = |resistance: Real, suffix: &str, external: NodeId| {
+                if resistance == 0. {
+                    return Ok(external);
+                }
+                let name = format!("{}#{suffix}", i.name);
+                if staged.get(&name).is_some() {
+                    return Err(SpiceError::circuit(format!(
+                        "BJT internal-node name collision: {name}"
+                    )));
+                }
+                let node = staged.intern(&name)?;
+                staged.set_kind(node, NodeKind::Internal)?;
+                terminals.push(node);
+                Ok(node)
+            };
+            // bjtsetup.c creates collCX, base, emitter in this order.
+            let cp = internal(parameters.rc, "collCX", external[0])?;
+            let bp = internal(parameters.rb, "base", external[1])?;
+            let ep = internal(parameters.re, "emitter", external[2])?;
+            Ok((terminals, external, cp, bp, ep))
+        })?;
         let nodes = Nodes {
             c: external[0],
             b: external[1],

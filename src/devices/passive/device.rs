@@ -10,7 +10,7 @@ use crate::devices::{
     ResistorOrigin, StampContext, StorageElement, StorageKind,
 };
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
 
 #[derive(Debug, Clone)]
 struct ModelPassive {
@@ -287,7 +287,7 @@ impl Device for ModelPassive {
 
 pub(in crate::devices) fn instantiate(
     instance: &DeviceInstance,
-    nodes: &mut NodeTable,
+    nodes: &mut NodeAppend<'_>,
     model: &ResolvedModel<'_>,
     context: &ModelContext,
 ) -> SpiceResult<Box<dyn Device>> {

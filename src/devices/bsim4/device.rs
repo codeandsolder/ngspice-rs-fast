@@ -30,7 +30,7 @@ use crate::devices::schema::temperature_kelvin;
 use crate::devices::state::IterationPhase;
 use crate::devices::traits::{AnalysisMode, ConvergenceContext, Device, StampContext};
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeKind, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// One temperature's setup: the model after `b4set.c` and `b4temp.c`, this
 /// instance after both, and its size-dependent parameters.
@@ -161,7 +161,7 @@ impl Bsim4 {
     /// Invalid input, setup or temperature failures, node name collisions.
     pub(crate) fn instantiate(
         instance: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         model: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -195,43 +195,44 @@ impl Bsim4 {
             context.nominal_temperature,
             Some(setup),
         )?;
-        let mut staged = nodes.clone();
-        let external: Vec<NodeId> = instance
-            .nodes
-            .iter()
-            .map(|n| staged.intern(n))
-            .collect::<SpiceResult<Vec<_>>>()?;
-        device.terminals.clone_from(&external);
-        for (local, id) in [node::D, node::G_EXT, node::S, node::B]
-            .into_iter()
-            .zip(external)
-        {
-            let index = usize::try_from(local)
-                .ok()
-                .filter(|&i| i < node::COUNT)
-                .ok_or_else(|| {
-                    SpiceError::circuit("BSIM4 setup mapped an invalid external node")
-                })?;
-            device.nodes[index] = id;
-        }
-        for &(local, suffix) in &created {
-            let name = format!("{}#{suffix}", instance.name);
-            if staged.get(&name).is_some() {
-                return Err(SpiceError::circuit(format!(
-                    "{}: internal node name collision: {name}",
-                    instance.name
-                )));
+        nodes.transaction(|staged| {
+            let external: Vec<NodeId> = instance
+                .nodes
+                .iter()
+                .map(|n| staged.intern(n))
+                .collect::<SpiceResult<Vec<_>>>()?;
+            device.terminals.clone_from(&external);
+            for (local, id) in [node::D, node::G_EXT, node::S, node::B]
+                .into_iter()
+                .zip(external)
+            {
+                let index = usize::try_from(local)
+                    .ok()
+                    .filter(|&i| i < node::COUNT)
+                    .ok_or_else(|| {
+                        SpiceError::circuit("BSIM4 setup mapped an invalid external node")
+                    })?;
+                device.nodes[index] = id;
             }
-            let id = staged.intern(&name)?;
-            staged.set_kind(id, NodeKind::Internal);
-            let index = usize::try_from(local)
-                .ok()
-                .filter(|&i| i < node::COUNT)
-                .ok_or_else(|| SpiceError::circuit("BSIM4 setup created an invalid node"))?;
-            device.nodes[index] = id;
-            device.terminals.push(id);
-        }
-        *nodes = staged;
+            for &(local, suffix) in &created {
+                let name = format!("{}#{suffix}", instance.name);
+                if staged.get(&name).is_some() {
+                    return Err(SpiceError::circuit(format!(
+                        "{}: internal node name collision: {name}",
+                        instance.name
+                    )));
+                }
+                let id = staged.intern(&name)?;
+                staged.set_kind(id, NodeKind::Internal)?;
+                let index = usize::try_from(local)
+                    .ok()
+                    .filter(|&i| i < node::COUNT)
+                    .ok_or_else(|| SpiceError::circuit("BSIM4 setup created an invalid node"))?;
+                device.nodes[index] = id;
+                device.terminals.push(id);
+            }
+            Ok(())
+        })?;
         device.shared.borrow_mut().setups.push(Rc::new(prepared));
         Ok(Box::new(device))
     }

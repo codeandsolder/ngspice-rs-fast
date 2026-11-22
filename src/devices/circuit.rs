@@ -2521,7 +2521,7 @@ impl Circuit {
             .map(|device| device.name().to_lowercase())
             .collect();
         let base = self.devices.len();
-        let staged = crate::devices::factory::append_nodes(&mut self.nodes, |nodes| {
+        let staged = self.nodes.transaction(|nodes| {
             Self::elaborate_batch(instances, models, context, nodes, base, seen)
         })?;
         self.devices.reserve(staged.len());
@@ -2540,7 +2540,7 @@ impl Circuit {
         instances: &[crate::netlist::ast::DeviceInstance],
         models: &crate::devices::models::ModelResolver<'_>,
         context: &ModelContext,
-        nodes: &mut NodeTable,
+        nodes: &mut crate::primitives::NodeAppend<'_>,
         base: usize,
         mut seen: BTreeSet<String>,
     ) -> SpiceResult<Vec<PendingDevice>> {

@@ -80,7 +80,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
 
 /// C `CONSTKoverQ`.
 const K_OVER_Q: Real = BOLTZMANN / CHARGE;
@@ -345,7 +345,7 @@ pub(in crate::devices) struct Hfet2 {
 impl Hfet2 {
     pub(crate) fn instantiate(
         i: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         resolved: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -364,25 +364,26 @@ impl Hfet2 {
         let (model, model_defaults) = Model::resolve(resolved)?;
         let (initial, setters) = Instance::resolve(i)?;
         let instance = Instance::validate(&model_defaults, &setters, &i.location)?;
-        let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "HFET2")?;
-        // C creates source and drain primes in this order.
-        let sp = topology.prime(model.rs, "source", s)?;
-        let dp = topology.prime(model.rd, "drain", d)?;
-        let nodes_of = Nodes { d, g, s, sp, dp };
-        let (staged, terminals) = topology.finish();
-        let device = Self {
-            name: i.name.clone(),
-            model_name: resolved.card().name.clone(),
-            terminals,
-            nodes: nodes_of,
-            model,
-            instance,
-            initial,
-            temperature_cache: TemperatureCache::new(),
-        };
-        device.derived(context.temperature)?;
-        *nodes = staged;
-        Ok(Box::new(device))
+        nodes.transaction(|nodes| {
+            let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "HFET2")?;
+            // C creates source and drain primes in this order.
+            let sp = topology.prime(model.rs, "source", s)?;
+            let dp = topology.prime(model.rd, "drain", d)?;
+            let nodes_of = Nodes { d, g, s, sp, dp };
+            let terminals = topology.finish();
+            let device = Self {
+                name: i.name.clone(),
+                model_name: resolved.card().name.clone(),
+                terminals,
+                nodes: nodes_of,
+                model,
+                instance,
+                initial,
+                temperature_cache: TemperatureCache::new(),
+            };
+            device.derived(context.temperature)?;
+            Ok(Box::new(device) as Box<dyn Device>)
+        })
     }
 
     /// `hfet2temp.c`. `temperature` is Celsius (`CKTtemp`), while `TEMP` is

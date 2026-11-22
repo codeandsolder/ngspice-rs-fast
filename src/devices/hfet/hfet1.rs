@@ -82,7 +82,7 @@ use crate::devices::{
 };
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
-use crate::primitives::{NodeId, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
 
 /// `hfetsetup.c`'s `EPSI` default, C's spelling of the `GaAs` permittivity.
 const EPSILON_GAAS: Real = 12.244 * 8.854_18e-12;
@@ -468,7 +468,7 @@ pub(in crate::devices) struct Hfet1 {
 impl Hfet1 {
     pub(crate) fn instantiate(
         i: &DeviceInstance,
-        nodes: &mut NodeTable,
+        nodes: &mut NodeAppend<'_>,
         resolved: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
@@ -487,39 +487,40 @@ impl Hfet1 {
         let (model, model_defaults) = Model::resolve(resolved)?;
         let (initial, setters) = Instance::resolve(i)?;
         let instance = Instance::validate(&model_defaults, &setters, &i.location)?;
-        let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "HFET1")?;
-        // C creates source and drain primes in this order.
-        // Gate and prime-prime nodes follow, aliasing the corresponding prime
-        // when RG, RI or RF is zero. RDI/RSI do not create nodes.
-        let sp = topology.prime(model.rs, "source", s)?;
-        let dp = topology.prime(model.rd, "drain", d)?;
-        let gp = topology.prime(model.rg, "gate", g)?;
-        let spp = topology.prime(model.ri, "gs", sp)?;
-        let dpp = topology.prime(model.rf, "gd", dp)?;
-        let nodes_of = Nodes {
-            d,
-            g,
-            s,
-            sp,
-            dp,
-            gp,
-            spp,
-            dpp,
-        };
-        let (staged, terminals) = topology.finish();
-        let device = Self {
-            name: i.name.clone(),
-            model_name: resolved.card().name.clone(),
-            terminals,
-            nodes: nodes_of,
-            model,
-            instance,
-            initial,
-            temperature_cache: TemperatureCache::new(),
-        };
-        device.derived(context.temperature)?;
-        *nodes = staged;
-        Ok(Box::new(device))
+        nodes.transaction(|nodes| {
+            let (mut topology, [d, g, s]) = NodeSetup::new(nodes, i, "HFET1")?;
+            // C creates source and drain primes in this order.
+            // Gate and prime-prime nodes follow, aliasing the corresponding prime
+            // when RG, RI or RF is zero. RDI/RSI do not create nodes.
+            let sp = topology.prime(model.rs, "source", s)?;
+            let dp = topology.prime(model.rd, "drain", d)?;
+            let gp = topology.prime(model.rg, "gate", g)?;
+            let spp = topology.prime(model.ri, "gs", sp)?;
+            let dpp = topology.prime(model.rf, "gd", dp)?;
+            let nodes_of = Nodes {
+                d,
+                g,
+                s,
+                sp,
+                dp,
+                gp,
+                spp,
+                dpp,
+            };
+            let terminals = topology.finish();
+            let device = Self {
+                name: i.name.clone(),
+                model_name: resolved.card().name.clone(),
+                terminals,
+                nodes: nodes_of,
+                model,
+                instance,
+                initial,
+                temperature_cache: TemperatureCache::new(),
+            };
+            device.derived(context.temperature)?;
+            Ok(Box::new(device) as Box<dyn Device>)
+        })
     }
 
     /// `hfettemp.c`. `temperature` is Celsius (`CKTtemp`), while `TEMP` is

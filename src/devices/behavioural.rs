@@ -43,7 +43,7 @@ use crate::maths::{SparseMatrix, Vector};
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::netlist::bexpr::BehaviouralExpression;
 use crate::primitives::{
-    NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
+    NodeAppend, NodeId, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
 };
 
 use crate::devices::linear::LinearContext;
@@ -724,7 +724,7 @@ fn parse_parameters(
 /// literalized AST instance, binding nodes in `nodes` only on success.
 pub(crate) fn instantiate(
     instance: &DeviceInstance,
-    nodes: &mut NodeTable,
+    nodes: &mut NodeAppend<'_>,
 ) -> SpiceResult<Box<dyn Device>> {
     let location = &instance.location;
     if instance.model.is_some() || instance.nodes.len() != 2 {
@@ -735,7 +735,7 @@ pub(crate) fn instantiate(
     }
     let (output, tree, scale) = parse_parameters(instance)?;
     let program = Program::compile(&tree.root)?;
-    crate::devices::factory::append_nodes(nodes, |nodes| {
+    nodes.transaction(|nodes| {
         let positive = nodes.intern(&instance.nodes[0])?;
         let negative = nodes.intern(&instance.nodes[1])?;
         if output == BehaviouralOutput::Voltage && positive == negative {
@@ -788,7 +788,7 @@ mod tests {
 
     #[test]
     fn failed_behavioural_binding_preserves_existing_nodes() {
-        let mut nodes = NodeTable::new();
+        let mut nodes = crate::primitives::NodeTable::new();
         nodes.intern("present").unwrap();
         let before = nodes.nodes().to_vec();
         let deck = Parser::new()
@@ -797,9 +797,15 @@ mod tests {
                 "title\nb1 fresh fresh v=v(sense)\nb2 fresh 0 v=v(sense)+i(vx)\n.end\n",
             ))
             .unwrap();
-        assert!(instantiate(&deck.devices[0], &mut nodes).is_err());
+        assert!(
+            nodes
+                .transaction(|nodes| instantiate(&deck.devices[0], nodes))
+                .is_err()
+        );
         assert_eq!(nodes.nodes(), before);
-        let device = instantiate(&deck.devices[1], &mut nodes).unwrap();
+        let device = nodes
+            .transaction(|nodes| instantiate(&deck.devices[1], nodes))
+            .unwrap();
         assert_eq!(
             device.terminals(),
             &[NodeId::new(2), NodeId::GROUND, NodeId::new(3)]
