@@ -19,8 +19,34 @@ fn log_ratio(numerator: Real, denominator: Real) -> Real {
     } else if ratio.is_normal() {
         ratio.ln()
     } else {
-        numerator.ln() - denominator.ln()
+        let (n, ne) = split_power(numerator);
+        let (d, de) = split_power(denominator);
+        log_scaled_ratio(n, ne, d, de)
     }
+}
+
+/// The logarithm of two exponent-scaled values. Their significands are
+/// small, so the dimensionless ratio cannot lose its representable range.
+fn log_scaled_ratio(n: Real, ne: i32, d: Real, de: i32) -> Real {
+    let ratio = n / d;
+    let logarithm = if (0.5..=2.).contains(&ratio) {
+        ((n - d) / d).ln_1p()
+    } else {
+        ratio.ln()
+    };
+    Real::from(ne - de).mul_add(std::f64::consts::LN_2, logarithm)
+}
+
+/// Compare the two weighted endpoints without forming possibly invalid
+/// binary64 products. In particular, two underflowed products can have
+/// nearly identical exponents, so subtracting absolute logs loses digits.
+#[cold]
+fn weighted_log_ratio(f0: Real, y0: Real, f1: Real, y1: Real) -> Real {
+    let (f0, fe0) = split_power(f0);
+    let (y0, ye0) = split_power(y0);
+    let (f1, fe1) = split_power(f1);
+    let (y1, ye1) = split_power(y1);
+    log_scaled_ratio(f1 * y1, fe1 + ye1, f0 * y0, fe0 + ye0)
 }
 
 /// A finite ascending frequency interval. Its geometry is shared by all
@@ -72,7 +98,7 @@ impl Interval {
         let z = if first.is_normal() && last.is_normal() {
             log_ratio(last, first)
         } else {
-            self.log_width + log_ratio(current_log_sample, previous)
+            weighted_log_ratio(self.start, previous, self.end, current_log_sample)
         };
         let (frequency, density) = if z < 0. {
             (self.start, previous)
@@ -216,6 +242,20 @@ mod tests {
         let last = first.next_up();
         let area = Interval::new(first, last).integrate(1e160, 1e160_f64.next_up());
         close(area.scaled(1.), (last - first) * 1e160, 4e-15);
+    }
+
+    #[test]
+    fn input_gain_recovers_a_nearly_constant_underflowed_weighted_spectrum() {
+        // Both endpoint products underflow; the logarithm of their ratio
+        // must still retain all significant digits rather than subtracting
+        // unrelated large absolute logarithms.
+        let f0 = 1e-240;
+        let f1 = 1e-100;
+        let y0 = 1e-160;
+        let y1 = 1e-300;
+        let area = Interval::new(f0, f1).integrate(y0, y1);
+        assert_eq!(area.scaled(1.), 0.);
+        close(area.scaled(1e200), 1e-200 * (140. * 10_f64.ln()), 5e-15);
     }
 
     #[test]
