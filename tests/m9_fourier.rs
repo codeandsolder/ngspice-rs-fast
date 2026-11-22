@@ -40,13 +40,9 @@ fn configured_fourier_recovers_multiple_periods_and_polynomial_interpolation() {
             polydegree: degree,
             gridsize: 256,
         };
-        let results = fourier::resolve_with_stable_settings(
-            &plot,
-            AnalysisKind::Transient,
-            &cards(),
-            settings,
-        )
-        .unwrap();
+        let results =
+            fourier::resolve_with_settings(&plot, AnalysisKind::Transient, &cards(), settings)
+                .unwrap();
         let result = &results[0];
         assert_eq!(result.harmonics.len(), 4);
         assert_eq!(

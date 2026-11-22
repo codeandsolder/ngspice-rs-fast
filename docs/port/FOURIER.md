@@ -190,16 +190,22 @@ Explicit settings select C's half-open DFT grid over the last NPERIODS periods.
 Degree zero deliberately follows C's sample-index DFT over the full trace,
 without interpolation; it does not reinterpret adaptive samples as uniform
 physical time. Degrees 1 through 16 use moving local polynomial stencils.
-The configured interpolator follows C's absolute power-basis fits, acceptance
-thresholds, degree fallback, moving stencil and duplicate-time edge nudging
-(`maths/poly/interpolate.c`, `polyfit.c`). It also preserves C's final interval
-coefficient-tail behavior after degree reduction. All harmonic magnitudes are
-compared against C for degrees 0, 1, 2, 3, 5 and 7, as well as each configurable
-setting. `resolve_with_stable_settings` is an explicit library alternative using
-local Lagrange coordinates and rejecting repeated timestamps; it can differ
-from C's high-degree fallback. Limits: 100 periods, 100 harmonics,
-100000 grid samples per vector. Default unconfigured `.four` keeps the existing
-closed trapezoid behavior documented above.
+The configured interpolator uses local Lagrange stencils in physical
+coordinates, shared across all vectors of a card. Exact coordinates read the
+original stored sample group, preserving its value (including signed zero);
+contradictory coincident ordinates fail rather than inventing a time shift or
+choosing a limit. Interpolation between points stays on one continuous span.
+The requested degree is a maximum: a short continuous span or excessive
+L1 weight norm reduces the order, ultimately to linear interpolation.
+For order n the conservative roundoff estimate is
+8 n epsilon times the sum of absolute weights, relative to the input scale;
+order is reduced if this exceeds sqrt(epsilon).
+Unlike C's absolute-coordinate power-basis elimination, this method does
+not form huge coefficients or reuse a stale high-degree coefficient tail.
+The original closed and configured half-open grid/count policies are
+unchanged. Limits: 100 periods, 100 harmonics, 100000 grid samples per
+vector. Default unconfigured .four keeps the existing closed trapezoid
+behavior documented above.
 
 Fundamental frequencies accept `{expression}` and `'expression'`, resolved
 against the top-level `.param`/`.func` scope before simulation. This is a Rust
@@ -222,29 +228,29 @@ A Fourier call validates and extracts the physical time axis once, across
 all cards. Each card selects its own closed or configured sampling geometry.
 The closed grid binds coordinates to exact coincident-sample groups or
 adjacent interpolation brackets; every vector reads the same locations, but
-equal-time values are still checked independently. The stable polynomial
-path similarly binds the time-dependent stencil starts and Lagrange weights.
-C-compatible moving polynomial fits, including their degree fallback and
-coefficient-tail behavior, remain signal-dependent. The source trace buffer
-is reused across configured interpolations.
+equal-time values are still checked independently. Configured polynomial
+sampling likewise binds exact groups, adjacent brackets, or local stencil
+starts and packed Lagrange weights once. Conditioning-based degree reduction
+depends only on time coordinates, not the trace. The source trace buffer is
+reused across configured interpolations.
 
 Projection processes vectors in bounded batches (at most 4 MiB of numeric
 sample and accumulator storage plus trace descriptors) and constructs one
 sine/cosine row per harmonic for each batch. The largest configured grid
 requires at most 1.6 MB for that row; no grid-by-harmonic-by-vector coefficient
-array is built. Each vector's accumulators still consume samples in the
-original order, with the original separately rounded sine/cosine products;
-the closed trapezoid and configured half-open DFT keep their distinct phase
-expressions and normalization. There is no FFT, approximation of
-trigonometric coefficients, or numerical tolerance change.
+array is built. Each vector's compensated accumulators consume samples in original order.
+The integer DFT bin is reduced modulo the grid length before conversion to
+radians (including the period multiplier for configured grids), avoiding
+large-angle phase error. Closed trapezoid and configured half-open DFT retain
+their distinct grids and normalization. There is no FFT or approximate
+trigonometric coefficient calculation.
 
 Before processing any vectors, an aggregate preflight across all cards
 bounds estimated work (500 million weighted units) and additional numeric
 workspace plus result structures (128 MiB). This is a conservative
 resource policy rather than a wall-clock prediction. It charges source
-rows, requested grid/harmonic products, per-vector sample reads, shared
-stable stencil construction, worst-case moving polynomial fits and
-degree retries, and retained result entries. Estimates saturate rather than
+rows, requested grid/harmonic products, per-vector sample reads, shared local stencil construction, worst-case
+conditioning-based degree retries, and retained result entries. Estimates saturate rather than
 wrap. Existing per-grid, degree, and harmonic limits remain; the aggregate
 policy additionally rejects a collection of otherwise individually valid
 requests when their total cost exceeds the budget. A failure reports the

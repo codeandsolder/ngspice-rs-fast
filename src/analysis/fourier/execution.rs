@@ -1,6 +1,7 @@
 //! Internal Fourier plans: validated sampling, bounded projection batches and normalization.
 
 use super::{FourierAnalysis, FourierSettings, FourierWindow, Harmonic};
+use crate::analysis::fourier_resample::PolynomialPlan;
 use crate::analysis::ordered_samples::{
     AxisError, Location, OrderedAxis, SampleError, column_names,
 };
@@ -533,7 +534,7 @@ impl ConfiguredPlan {
         &self,
         axis: &OrderedAxis<'_>,
         trace: &Trace<'_>,
-        stable: Option<&StablePlan>,
+        polynomial: Option<&PolynomialPlan>,
         input: &mut Vec<Real>,
     ) -> SpiceResult<Vec<Real>> {
         let Some(grid) = &self.grid else {
@@ -549,10 +550,9 @@ impl ConfiguredPlan {
         for i in 0..axis.len() {
             input.push(trace.value(i)?);
         }
-        stable.map_or_else(
-            || crate::analysis::fourier_resample::resample(axis, input, grid, self.degree),
-            |plan| plan.sample(input, trace.name()),
-        )
+        polynomial
+            .ok_or_else(|| nonfinite(trace.name(), "missing polynomial sampling geometry".into()))?
+            .sample(grid, input)
     }
 
     fn transform(
@@ -613,93 +613,6 @@ impl ConfiguredPlan {
             divisions: n as usize,
             samples,
         })
-    }
-}
-
-/// Stable local polynomial geometry. Coefficients depend only on times,
-/// not the vector. Accumulate weighted values with compensation.
-struct StablePlan {
-    starts: Vec<usize>,
-    weights: Vec<Real>,
-    order: usize,
-}
-impl StablePlan {
-    fn new(
-        axis: &OrderedAxis<'_>,
-        grid: &[Real],
-        degree: usize,
-        card: &FourierCard,
-    ) -> SpiceResult<Self> {
-        if axis.len() <= degree || axis.has_duplicates() {
-            return Err(unsupported(
-                card,
-                "stable polynomial interpolation needs distinct samples".into(),
-            ));
-        }
-        let order = degree + 1;
-        let mut starts = Vec::with_capacity(grid.len());
-        let mut weights =
-            crate::primitives::filled_vec(grid.len() * order, 1., "Fourier interpolation weights")?;
-        let times = axis.as_slice();
-        for (&x, row) in grid.iter().zip(weights.chunks_exact_mut(order)) {
-            let start = axis
-                .lower_bound(x)
-                .saturating_sub(degree.div_ceil(2))
-                .min(axis.len() - order);
-            starts.push(start);
-            for (k, weight) in row.iter_mut().enumerate() {
-                for j in 0..order {
-                    if j != k {
-                        *weight *= (x - times[start + j]) / (times[start + k] - times[start + j]);
-                    }
-                }
-            }
-        }
-        Ok(Self {
-            starts,
-            weights,
-            order,
-        })
-    }
-
-    fn sample(&self, samples: &[Real], name: &str) -> SpiceResult<Vec<Real>> {
-        let mut values = Vec::with_capacity(self.starts.len());
-        for (&start, row) in self
-            .starts
-            .iter()
-            .zip(self.weights.chunks_exact(self.order))
-        {
-            // Apply the interpolation weights to differences from the
-            // nearest central node: a constant trace is represented exactly,
-            // even when the weights' rounded sum differs from one.
-            if let Some(index) = row
-                .iter()
-                .position(|&weight| crate::analysis::ordered_samples::same_coordinate(weight, 1.))
-                && row
-                    .iter()
-                    .enumerate()
-                    .all(|(j, &weight)| j == index || weight == 0.)
-            {
-                values.push(samples[start + index]);
-                continue;
-            }
-            let anchor = samples[start + self.order / 2];
-            let mut value = CompensatedSum::default();
-            value.add(anchor);
-            for (&weight, &sample) in row.iter().zip(&samples[start..start + self.order]) {
-                let difference = sample - anchor;
-                value.add(weight * difference);
-            }
-            let value = value.total();
-            if !value.is_finite() {
-                return Err(nonfinite(
-                    name,
-                    "nonfinite stable polynomial interpolation".into(),
-                ));
-            }
-            values.push(value);
-        }
-        Ok(values)
     }
 }
 
@@ -809,15 +722,7 @@ impl WorkBudget {
         }
     }
 
-    fn charge(
-        &mut self,
-        rows: usize,
-        count: usize,
-        harmonics: usize,
-        vectors: usize,
-        mode: Mode,
-        compatible: bool,
-    ) {
+    fn charge(&mut self, rows: usize, count: usize, harmonics: usize, vectors: usize, mode: Mode) {
         let projection = count.saturating_mul(harmonics + 1);
         let (sampling, setup, scratch) = match mode {
             // For distinct source coordinates, at most two reads per grid
@@ -830,35 +735,17 @@ impl WorkBudget {
             ),
             Mode::Configured { settings, .. } => {
                 let order = settings.polydegree as usize + 1;
-                // C can retry every polynomial degree for each moving fit.
-                // Successful forward fits advance at least one grid sample,
-                // except for at most order tail steps. The traversal itself
-                // costs rows * order.
-                let fits = rows.min(count + order);
-                let fit_cost = (1..=order).map(|n| 2 * n.pow(3) + 3 * n * n).sum::<usize>();
-                let (interpolation, setup) = if order == 1 {
+                let (setup, plan_bytes) = if order == 1 {
                     (0, 0)
-                } else if compatible {
-                    (
-                        rows.saturating_mul(order)
-                            .saturating_add(fits.saturating_mul(fit_cost)),
-                        count,
-                    )
                 } else {
-                    (
-                        count.saturating_mul(order),
-                        count.saturating_mul(order * order),
-                    )
+                    PolynomialPlan::budget(rows, count, order)
                 };
+                let sampling = rows.saturating_add(count.saturating_mul(order));
                 let scratch = rows
                     .saturating_mul(size_of::<Real>())
                     .saturating_add(count * size_of::<Real>())
-                    .saturating_add(if compatible || order == 1 {
-                        0
-                    } else {
-                        count * (size_of::<usize>() + order * size_of::<Real>())
-                    });
-                (rows.saturating_add(interpolation), setup, scratch)
+                    .saturating_add(plan_bytes);
+                (sampling, setup, scratch)
             }
         };
         self.work = self
@@ -920,7 +807,6 @@ fn preflight(
     kind: AnalysisKind,
     cards: &[FourierCard],
     settings: Option<FourierSettings>,
-    compatible: bool,
 ) -> SpiceResult<WorkBudget> {
     let mut budget = WorkBudget::new(rows);
     for card in cards {
@@ -946,7 +832,6 @@ fn preflight(
             harmonics as usize,
             card.vectors.len(),
             mode,
-            compatible,
         );
         budget.check(card)?;
     }
@@ -958,12 +843,11 @@ pub(super) fn resolve_plans(
     kind: AnalysisKind,
     cards: &[FourierCard],
     settings: Option<FourierSettings>,
-    compatible: bool,
 ) -> SpiceResult<Vec<FourierAnalysis>> {
     let Some(first) = cards.first() else {
         return Ok(Vec::new());
     };
-    let mut budget = preflight(plot.point_count(), kind, cards, settings, compatible)?;
+    let mut budget = preflight(plot.point_count(), kind, cards, settings)?;
     let axis = time_axis(plot, first)?;
     if axis.has_duplicates() {
         for card in cards {
@@ -986,7 +870,7 @@ pub(super) fn resolve_plans(
         if card.vectors.is_empty() {
             continue;
         }
-        let execution = CardPlan::new(&axis, card, mode, compatible)?;
+        let execution = CardPlan::new(&axis, card, mode)?;
         execution.run(
             plot,
             &axis,
@@ -1002,30 +886,22 @@ enum CardPlan {
     Closed(ClosedPlan),
     Configured {
         plan: ConfiguredPlan,
-        stable: Option<StablePlan>,
+        polynomial: Option<PolynomialPlan>,
     },
 }
 
 impl CardPlan {
-    fn new(
-        axis: &OrderedAxis<'_>,
-        card: &FourierCard,
-        mode: Mode,
-        compatible: bool,
-    ) -> SpiceResult<Self> {
+    fn new(axis: &OrderedAxis<'_>, card: &FourierCard, mode: Mode) -> SpiceResult<Self> {
         match mode {
             Mode::Closed => Ok(Self::Closed(ClosedPlan::new(axis, card)?)),
             Mode::Configured { settings, count } => {
                 let plan = ConfiguredPlan::new(axis, card, settings, count)?;
-                let stable = if compatible {
-                    None
-                } else {
-                    plan.grid
-                        .as_ref()
-                        .map(|grid| StablePlan::new(axis, grid, plan.degree, card))
-                        .transpose()?
-                };
-                Ok(Self::Configured { plan, stable })
+                let polynomial = plan
+                    .grid
+                    .as_ref()
+                    .map(|grid| PolynomialPlan::new(axis, grid, plan.degree))
+                    .transpose()?;
+                Ok(Self::Configured { plan, polynomial })
             }
         }
     }
@@ -1042,8 +918,8 @@ impl CardPlan {
         let trace = Trace::resolve(plot, request)?;
         let values = match self {
             Self::Closed(plan) => plan.samples(card, &trace)?,
-            Self::Configured { plan, stable } => {
-                plan.samples(axis, &trace, stable.as_ref(), input)?
+            Self::Configured { plan, polynomial } => {
+                plan.samples(axis, &trace, polynomial.as_ref(), input)?
             }
         };
         Ok(PreparedTrace {
@@ -1154,8 +1030,7 @@ mod tests {
                 1_000,
                 AnalysisKind::Transient,
                 std::slice::from_ref(&one),
-                Some(settings),
-                true
+                Some(settings)
             )
             .is_ok()
         );
@@ -1164,28 +1039,22 @@ mod tests {
                 1_000,
                 AnalysisKind::Transient,
                 &vec![one.clone(); 50],
-                Some(settings),
-                true
+                Some(settings)
             )
             .is_err_and(|error| error
                 .to_string()
                 .contains("aggregate work or memory budget"))
         );
         assert!(
-            preflight(
-                usize::MAX,
-                AnalysisKind::Transient,
-                &[one],
-                Some(settings),
-                true
+            preflight(usize::MAX, AnalysisKind::Transient, &[one], Some(settings)).is_err_and(
+                |error| error
+                    .to_string()
+                    .contains("aggregate work or memory budget")
             )
-            .is_err_and(|error| error
-                .to_string()
-                .contains("aggregate work or memory budget"))
         );
         // Saturation is a fail-closed arithmetic policy, rather than a wrapped count.
         let mut budget = WorkBudget::new(1);
-        budget.charge(1, 401, 100, usize::MAX, Mode::Closed, true);
+        budget.charge(1, 401, 100, usize::MAX, Mode::Closed);
         assert!(budget.check(&card(1, 1)).is_err());
     }
 
@@ -1224,16 +1093,7 @@ mod tests {
     #[test]
     fn large_distinct_axis_is_charged_once_and_coincident_reads_are_charged_per_vector() {
         use super::OrderedAxis;
-        assert!(
-            preflight(
-                1_000_000,
-                AnalysisKind::Transient,
-                &[card(1000, 9)],
-                None,
-                true
-            )
-            .is_ok()
-        );
+        assert!(preflight(1_000_000, AnalysisKind::Transient, &[card(1000, 9)], None).is_ok());
         let mut times = vec![0.; 1000];
         times.extend([0.5e-3, 1e-3]);
         let axis = OrderedAxis::borrowed(&times).unwrap();
