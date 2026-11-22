@@ -746,7 +746,7 @@ fn header_work_and_declared_columns_are_bounded() {
         ),
         (
             RawReadPolicy {
-                variables: 1,
+                variables: 0,
                 ..RawReadPolicy::DEFAULT
             },
             "variables per plot",
@@ -759,6 +759,42 @@ fn header_work_and_declared_columns_are_bounded() {
         assert!(error.to_string().contains(resource), "{error}");
         assert!(RawFormat::detect_with_policy(text.as_bytes(), policy).is_err());
     }
+    let bytes = binary_rawfile(OP_HEADER, &OP_VALUES);
+    let policy = RawReadPolicy {
+        variables: 3,
+        header_bytes: OP_HEADER.len() + "Binary:\n".len(),
+        header_lines: OP_HEADER.lines().count() + 1,
+        ..RawReadPolicy::DEFAULT
+    };
+    assert!(
+        RawFileReader::new(bytes.as_slice())
+            .with_policy(policy)
+            .read()
+            .is_ok()
+    );
+    assert_eq!(
+        RawFormat::detect_with_policy(&bytes, policy).unwrap(),
+        RawFormat::Binary
+    );
+    assert!(
+        RawFileReader::new(bytes.as_slice())
+            .with_policy(RawReadPolicy {
+                header_bytes: policy.header_bytes - 1,
+                ..policy
+            })
+            .read()
+            .is_err()
+    );
+    assert!(
+        RawFileReader::new(bytes.as_slice())
+            .with_policy(RawReadPolicy {
+                header_lines: policy.header_lines - 1,
+                ..policy
+            })
+            .read()
+            .is_err()
+    );
+
     let empty =
         "Plotname: empty\nFlags: real\nNo. Variables: 0\nNo. Points: 0\nVariables:\nValues:\n";
     assert_eq!(
