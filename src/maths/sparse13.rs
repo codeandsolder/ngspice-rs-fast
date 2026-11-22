@@ -1049,6 +1049,10 @@ impl<T: Scalar> Sparse<T> {
     /// missing. Indices are external and 1-based.
     pub(super) fn get_element(&mut self, row: usize, col: usize) -> SpiceResult<SolverElement> {
         self.check_coordinate(row, col)?;
+        if self.topology.ext_to_int_row[row] == NONE || self.topology.ext_to_int_col[col] == NONE {
+            // Reserve the original's storage before publishing new translations.
+            self.reserve_element_storage()?;
+        }
         let (row, col) = self.translate(row, col);
         if row == col && self.topology.diag[row] != NONE {
             return Ok(SolverElement(self.topology.diag[row]));
@@ -1098,14 +1102,7 @@ impl<T: Scalar> Sparse<T> {
         self.topology.locate_in_col(last, row).1
     }
 
-    /// \`spcCreateElement\`. Reserve both arenas before mutating links.
-    fn create_element(
-        &mut self,
-        row: usize,
-        col: usize,
-        last: Slot,
-        fillin: bool,
-    ) -> SpiceResult<usize> {
+    fn reserve_element_storage(&mut self) -> SpiceResult<()> {
         let topology = std::sync::Arc::make_mut(&mut self.topology);
         if topology.elements.len() == topology.elements.capacity() {
             sparse_reserve(&mut topology.elements, 1)?;
@@ -1113,6 +1110,19 @@ impl<T: Scalar> Sparse<T> {
         if self.values.len() == self.values.capacity() {
             sparse_reserve(&mut self.values, 1)?;
         }
+        Ok(())
+    }
+
+    /// `spcCreateElement`. Reserve both arenas before mutating links.
+    fn create_element(
+        &mut self,
+        row: usize,
+        col: usize,
+        last: Slot,
+        fillin: bool,
+    ) -> SpiceResult<usize> {
+        self.reserve_element_storage()?;
+        let topology = std::sync::Arc::make_mut(&mut self.topology);
         let e = topology.create_element(row, col, last, self.rows_linked);
         self.plan = None;
         self.factored = false;
@@ -1394,12 +1404,11 @@ impl<T: Scalar> Sparse<T> {
     where
         T: std::ops::Add<Output = T>,
     {
-        let (Some(&accum), Some(&addend)) = (
-            self.topology.ext_to_int_col.get(accum),
-            self.topology.ext_to_int_col.get(addend),
-        ) else {
-            return Ok(());
-        };
+        self.check_coordinate(accum, addend)?;
+        let (accum, addend) = (
+            self.topology.ext_to_int_col[accum],
+            self.topology.ext_to_int_col[addend],
+        );
         if accum == NONE || addend == NONE {
             return Ok(());
         }
@@ -1424,21 +1433,19 @@ impl<T: Scalar> Sparse<T> {
 
     /// `SMPcZeroCol` (`spsmp.c`): zeroes every element of external column
     /// `col`, keeping them in the structure.
-    pub(crate) fn zero_col(&mut self, col: usize) {
-        let Some(&col) = self.topology.ext_to_int_col.get(col) else {
-            return;
-        };
+    pub(crate) fn zero_col(&mut self, col: usize) -> SpiceResult<()> {
+        self.check_coordinate(col, col)?;
+        let col = self.topology.ext_to_int_col[col];
         if col == NONE {
-            return;
+            return Ok(());
         }
         let mut e = self.topology.first_in_col[col];
         while e != NONE {
             self.values[e] = T::ZERO;
             e = self.topology.elements[e].next_in_col;
         }
+        Ok(())
     }
-
-    // --- sputils.c ------------------------------------------------------
 
     /// `spMNA_Preorder`: swap columns so structural `±1` twins from voltage
     /// sources land on the diagonal before ordering.
@@ -2252,13 +2259,11 @@ impl<T: Scalar> Sparse<T> {
                     sub = self.topology.elements[sub].next_in_col;
                 }
                 if sub == NONE || self.topology.elements[sub].row > row {
-                    match self.create_fillin(row, upper_col, Slot::After(above)) {
-                        Ok(element) => sub = element,
-                        Err(_) => {
-                            self.resource_failure();
-                            return;
-                        }
-                    }
+                    let Ok(element) = self.create_fillin(row, upper_col, Slot::After(above)) else {
+                        self.resource_failure();
+                        return;
+                    };
+                    sub = element;
                 }
                 let l = self.values[lower];
                 let value = self.values[sub].mul_sub(u, l);
@@ -2321,7 +2326,7 @@ impl<T: Scalar> Sparse<T> {
         Ok(element)
     }
 
-    fn resource_failure(&mut self) -> Status {
+    const fn resource_failure(&mut self) -> Status {
         self.status = Status::Resource;
         self.factored = false;
         self.needs_ordering = true;
@@ -2565,6 +2570,8 @@ mod tests {
         let mut sparse = Sparse::<f64>::new(2).unwrap();
         assert!(sparse.get_element(1, usize::MAX).is_err());
         assert!(sparse.get_element(0, 1).is_err());
+        assert!(sparse.add_col(1, usize::MAX).is_err());
+        assert!(sparse.zero_col(0).is_err());
         assert_eq!(sparse.size, 0);
         let first = sparse.get_element(2, 1).unwrap();
         sparse.set(first, 2.);

@@ -321,9 +321,11 @@ impl Pattern {
 
     /// `(row, col)` of an element.
     #[must_use]
-    pub fn position(&self, id: ElementId) -> (usize, usize) {
-        let (row, col) = self.index.positions[id.index()];
-        (row as usize, col as usize)
+    pub fn position(&self, id: ElementId) -> Option<(usize, usize)> {
+        self.index
+            .positions
+            .get(id.index())
+            .map(|&(row, col)| (row as usize, col as usize))
     }
 
     /// The element at `(row, col)`, if the pattern has one.
@@ -348,9 +350,12 @@ impl Pattern {
         )
     }
 
-    /// Element ids in row-major position order.
-    fn sorted(&self) -> impl Iterator<Item = ElementId> + '_ {
-        self.index.row_ids.iter().map(|&id| ElementId(id))
+    /// Validated element handles and coordinates in row-major order.
+    fn sorted(&self) -> impl Iterator<Item = (ElementId, (usize, usize))> + '_ {
+        self.index.row_ids.iter().map(|&id| {
+            let (row, col) = self.index.positions[id as usize];
+            (ElementId(id), (row as usize, col as usize))
+        })
     }
 }
 
@@ -513,14 +518,14 @@ impl Bound {
         // Sequential, completely replayed devices are overwhelmingly the
         // common load path. The previous end is the next start, so read
         // only the new end, and leave all recording transitions cold.
+        // The slow path checked room for both sentinel offsets when this
+        // device was installed; the adjacent index arithmetic cannot overflow.
         if self.active
             && self.cursor == self.end
-            && self.device.checked_add(1) == Some(index)
+            && index == self.device + 1
             && self.recording.is_none()
             && self.traceable
-            && let Some(&end) = index
-                .checked_add(1)
-                .and_then(|next| self.trace.starts.get(next))
+            && let Some(&end) = self.trace.starts.get(index + 1)
         {
             self.device = index;
             self.start = self.end;
@@ -1191,12 +1196,11 @@ impl SparseMatrix {
             return &self.triplets;
         };
         bound.view.get_or_init(|| {
-            let bound_entries = bound.pattern.sorted().filter_map(|id| {
+            let bound_entries = bound.pattern.sorted().filter_map(|(id, (row, col))| {
                 let value = bound.values[id.index()];
                 if value == 0.0 {
                     return None;
                 }
-                let (row, col) = bound.pattern.position(id);
                 Some(Triplet { row, col, value })
             });
             if self.triplets.is_empty() {
@@ -1257,8 +1261,7 @@ impl SparseMatrix {
             graph.add_node(row);
         }
         if let Some((pattern, values)) = self.bound_values() {
-            for id in pattern.sorted() {
-                let (row, col) = pattern.position(id);
+            for (id, (row, col)) in pattern.sorted() {
                 if row != col && values[id.index()] != 0.0 {
                     graph.add_edge(row, col, ());
                 }
@@ -1305,10 +1308,9 @@ impl SparseMatrix {
         {
             // Use the same row-major accumulation as the triplet view,
             // without materializing coordinates for the bound coefficients.
-            for id in bound.pattern.sorted() {
+            for (id, (row, col)) in bound.pattern.sorted() {
                 let value = bound.values[id.index()];
                 if value != 0.0 {
-                    let (row, col) = bound.pattern.position(id);
                     let product = value * x[col];
                     y[row] += product;
                 }
@@ -1431,7 +1433,9 @@ mod tests {
                 .is_err()
         );
         let foreign = Pattern::new(2, [(0, 0), (0, 1), (1, 1)]).unwrap();
-        assert!(matrix.add_element(foreign.find(1, 1).unwrap(), 1.).is_err());
+        let foreign_id = foreign.find(1, 1).unwrap();
+        assert_eq!(pattern.position(foreign_id), None);
+        assert!(matrix.add_element(foreign_id, 1.).is_err());
         matrix.begin_device(0).unwrap();
         matrix.add(1, 0, 3.).unwrap();
         matrix.record_trace().unwrap();
@@ -1498,9 +1502,14 @@ mod tests {
             .map(|index| ElementId(u32::try_from(index).unwrap()))
             .collect();
         expected.sort_unstable_by_key(|&id| pattern.position(id));
-        assert!(pattern.sorted().eq(expected.iter().copied()));
+        assert!(
+            pattern
+                .sorted()
+                .map(|(id, _)| id)
+                .eq(expected.iter().copied())
+        );
         for id in expected {
-            let (r, c) = pattern.position(id);
+            let (r, c) = pattern.position(id).unwrap();
             assert_eq!(pattern.find(r, c), Some(id));
         }
         assert!(pattern.find(0, 1).is_none());

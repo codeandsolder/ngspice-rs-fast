@@ -519,7 +519,7 @@ impl<'a> LoadedPencil<'a> {
             if let Some(balance) = load.balance {
                 sparse.add_col(balance + 1, solution + 1)?;
             }
-            sparse.zero_col(solution + 1);
+            sparse.zero_col(solution + 1)?;
         }
         for (element, value) in drive.iter().zip([1.0, -1.0]) {
             if let Some(element) = *element {
