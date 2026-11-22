@@ -46,7 +46,7 @@ impl Instruction {
         }
     }
 
-    fn remap(self, map: &[Slot]) -> Self {
+    const fn remap(self, map: &[Slot]) -> Self {
         match self {
             Self::Unary(op, a) => Self::Unary(op, map[a]),
             Self::Operator(op, a, b) => Self::Operator(op, map[a], map[b]),
@@ -497,7 +497,7 @@ fn peek_override(entries: &[(usize, Slot)], range: &Range<usize>) -> Option<(usi
     (!range.is_empty()).then(|| entries[range.start])
 }
 
-fn take_override(
+const fn take_override(
     entry: Option<(usize, Slot)>,
     range: &mut Range<usize>,
     variable: usize,
