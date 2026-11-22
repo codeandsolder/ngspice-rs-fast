@@ -375,6 +375,19 @@ compiled test executable under `/usr/bin/time -v` and an allocation profiler
 tests write identical inputs in both modes; the retained baseline uses the
 former read-to-string/collect-all path and the same numerical comparator.
 
+Acer measurement (2026-11-22, identical test binary in both modes):
+
+| Input | Bytes | Peak RSS retained / streamed (KiB) | DHAT total allocated retained / streamed (bytes) | Read calls retained / streamed |
+| --- | ---: | ---: | ---: | ---: |
+| Pointwise | 24,565,292 | 63,124 / 22,376 | 75,482,690 / 17,368,116 | 21 / 3,019 |
+| Four stages | 98,261,168 | 183,464 / 20,304 | 249,587,808 / 17,401,768 | 21 / 12,015 |
+| Committed transient | 3,387,243 | 9,876 / 6,536 | 10,766,093 / 2,290,514 | 21 / 434 |
+
+Read calls measured by strace include process startup; buffering trades more
+small reads for bounded memory. Logical reference bytes are unchanged; write
+calls are identical for each pair. DHAT counts heap allocations including the
+shared input-generation harness, not physical I/O. Wall times varied with
+concurrent workers; these runs establish memory reduction, not speedup.
 
 ## BSIM3 B3-0 input foundation (#90)
 
