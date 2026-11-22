@@ -43,15 +43,9 @@
 //! error naming `jfetnoi.c`/`jfetdist.c` rather than contributing nothing.
 //! `.sens` is ported (#164) through [`JfetSensitivity`].
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 pub(super) mod lifecycle;
@@ -328,7 +322,8 @@ impl Model {
             )
         } else {
             let bfac = overdrive * op.bfac;
-            let cpart = overdrive * overdrive * (b + bfac);
+            let overdrive_squared = overdrive * overdrive;
+            let cpart = overdrive_squared * (b + bfac);
             (
                 betap * cpart,
                 betap * overdrive * 3_f64.mul_add(bfac, 2. * b),
@@ -466,11 +461,10 @@ impl Jfet {
         let mut tcgd = model.cgd * cjfact;
         tcgs *= cjfact1;
         tcgd *= cjfact1;
-        let vto = model
-            .vtotc
-            .map_or((-model.tcv).mul_add(temp - tnom, model.vto), |vtotc| {
-                vtotc.mul_add(temp - tnom, model.vto)
-            });
+        let vto = model.vtotc.map_or_else(
+            || (-model.tcv).mul_add(temp - tnom, model.vto),
+            |vtotc| vtotc.mul_add(temp - tnom, model.vto),
+        );
         let beta = model.betatce.map_or_else(
             || model.beta * (temp / tnom).powf(model.bex),
             |betatce| model.beta * 1.01_f64.powf(betatce * (temp - tnom)),

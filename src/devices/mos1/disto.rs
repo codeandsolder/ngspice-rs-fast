@@ -17,15 +17,9 @@
 //!   from the first-order `H1(f1)` vector (a C defect, reproduced through
 //!   [`DistortionTerm::with_first_order_im3_kernel`]).
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::float_cmp,
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use crate::devices::distortion::{

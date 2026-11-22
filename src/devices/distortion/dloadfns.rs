@@ -8,15 +8,9 @@
 //! coefficients follow C's argument order `cxx, cyy, czz, cxy, cyz, cxz,
 //! cxxx, cyyy, czzz, cxxy, cxxz, cxyy, cyyz, cxzz, cyzz, cxyz`.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use super::Taylor;
