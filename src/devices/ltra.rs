@@ -499,7 +499,7 @@ impl LossyLine {
         nodes: &mut NodeTable,
         models: &ModelResolver<'_>,
         context: &ModelContext,
-    ) -> SpiceResult<Box<dyn Device>> {
+    ) -> SpiceResult<Self> {
         context.validate(&instance.location)?;
         if instance.nodes.len() != 4 {
             return Err(SpiceError::circuit(format!(
@@ -580,13 +580,13 @@ impl LossyLine {
             &INTERNAL_SUFFIXES,
             "lossy-line",
         )?;
-        Ok(Box::new(Self {
+        Ok(Self {
             name: instance.name.clone(),
             terminals,
             model,
             initial,
             location: instance.location.clone(),
-        }))
+        })
     }
 
     /// The validated model.
