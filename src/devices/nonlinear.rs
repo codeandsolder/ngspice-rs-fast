@@ -291,7 +291,7 @@ fn canonical<'a>(
     Ok(out)
 }
 /// `floor(raw + 0.5)` integer selector (`inpgval.c` `IF_INTEGER`) within `0..=max`.
-fn selector(values: &ScalarValues, name: &str, max: u8, owner: &DeviceInstance) -> SpiceResult<u8> {
+fn selector(values: &ScalarValues, name: &str, max: u8, owner: &SourceLoc) -> SpiceResult<u8> {
     let raw = value(values, name)?;
     crate::primitives::c_integer(raw)
         .and_then(|rounded| u8::try_from(rounded).ok())
@@ -301,7 +301,7 @@ fn selector(values: &ScalarValues, name: &str, max: u8, owner: &DeviceInstance) 
                 values
                     .get(name)
                     .and_then(|v| v.location.clone())
-                    .unwrap_or_else(|| owner.location.clone()),
+                    .unwrap_or_else(|| owner.clone()),
                 format!("diode {name} must round to 0..={max}, got {raw}"),
             )
         })
@@ -433,46 +433,146 @@ impl Diode {
             instance_setters.iter(),
             &instance.location,
         )?;
-        let p = DiodeParameters::new(&m, &i, instance)?;
-        let thermal = p.thermal(context)?;
-        thermal.point(0., context.gmin)?; // validate before interning
-        let mut staged = nodes.clone();
-        let external = [
-            staged.intern(&instance.nodes[0])?,
-            staged.intern(&instance.nodes[1])?,
-        ];
+        let input = DiodeInput::prepare(
+            &instance.name,
+            &card.name,
+            &instance.location,
+            m,
+            i,
+            initial,
+            context,
+        )?;
+        super::factory::append_nodes(nodes, |nodes| {
+            let external = nodes.intern_array(&instance.nodes)?;
+            input.bind(nodes, external)
+        })
+    }
+}
+
+/// Complete validated device data without terminal IDs. Both literal diode
+/// cards and numeric URC-generated diodes use the same thermal validation
+/// and binding, including the append-only internal-node setup.
+struct DiodeInput {
+    name: String,
+    model: String,
+    location: SourceLoc,
+    parameters: DiodeParameters,
+    derived: TemperatureCache<Thermal>,
+    initial: crate::devices::initial::InstanceInitial,
+    written: std::rc::Rc<(ScalarValues, ScalarValues)>,
+}
+
+impl DiodeInput {
+    fn prepare(
+        name: &str,
+        model: &str,
+        location: &SourceLoc,
+        m: ScalarValues,
+        i: ScalarValues,
+        initial: crate::devices::initial::InstanceInitial,
+        context: &ModelContext,
+    ) -> SpiceResult<Self> {
+        let parameters = DiodeParameters::new(&m, &i, location)?;
+        let thermal = parameters.thermal(context)?;
+        thermal.point(0., context.gmin)?;
+        Ok(Self {
+            name: name.to_owned(),
+            model: model.to_owned(),
+            location: location.clone(),
+            parameters,
+            derived: TemperatureCache::from_value(TemperatureKey::context(context), thermal),
+            initial,
+            written: std::rc::Rc::new((m, i)),
+        })
+    }
+
+    /// The caller owns the append-only topology transaction.
+    fn bind(self, nodes: &mut NodeTable, external: [NodeId; 2]) -> SpiceResult<Box<dyn Device>> {
         let mut terminals = external.to_vec();
-        let positive = if p.rs > 0. {
+        let positive = if self.parameters.rs > 0. {
             // diosetup.c: CKTmkVolt(ckt, &tmp, DIOname, "internal").
-            let name = format!("{}#internal", instance.name);
-            if staged.get(&name).is_some() {
+            let name = format!("{}#internal", self.name);
+            if nodes.get(&name).is_some() {
                 return Err(SpiceError::circuit("diode internal-node name collision"));
             }
-            let prime = staged.intern(&name)?;
-            staged.set_kind(prime, NodeKind::Internal);
+            let prime = nodes.intern(&name)?;
+            nodes.set_kind(prime, NodeKind::Internal);
             terminals.push(prime);
             prime
         } else {
             external[0]
         };
-        *nodes = staged;
-        Ok(Box::new(Self {
-            name: instance.name.clone(),
-            model: card.name.clone(),
+        Ok(Box::new(Diode {
+            name: self.name,
+            model: self.model,
             terminals,
             junction: [positive, external[1]],
-            parameters: p,
-            derived: TemperatureCache::from_value(TemperatureKey::context(context), thermal),
-            initial,
-            location: instance.location.clone(),
-            written: std::rc::Rc::new((m, i)),
+            parameters: self.parameters,
+            derived: self.derived,
+            initial: self.initial,
+            location: self.location,
+            written: self.written,
             lenient: false,
         }))
     }
 }
+
+/// The shared generated URC diode model. Validate its numeric setters once;
+/// each section supplies just its own area, with the same sensitivity
+/// provenance and thermal checks as an ordinary diode card.
+pub(super) struct UrcDiodeModel {
+    name: String,
+    values: ScalarValues,
+}
+
+impl UrcDiodeModel {
+    pub(super) fn new(
+        name: String,
+        capacitance: Real,
+        resistance: Real,
+        current: Real,
+        location: &SourceLoc,
+    ) -> SpiceResult<Self> {
+        let values = MODEL.validate_numeric(
+            [
+                ("cjo", capacitance, location),
+                ("rs", resistance, location),
+                ("is", current, location),
+            ],
+            location,
+        )?;
+        Ok(Self { name, values })
+    }
+
+    pub(super) fn bind_section(
+        &self,
+        name: &str,
+        area: Real,
+        location: &SourceLoc,
+        nodes: &mut NodeTable,
+        terminals: [NodeId; 2],
+        context: &ModelContext,
+    ) -> SpiceResult<Box<dyn Device>> {
+        let instance = INSTANCE.validate_numeric([("area", area, location)], location)?;
+        let initial = crate::devices::initial::InstanceInitial {
+            off: false,
+            values: vec![None],
+        };
+        DiodeInput::prepare(
+            name,
+            &self.name,
+            location,
+            self.values.clone(),
+            instance,
+            initial,
+            context,
+        )?
+        .bind(nodes, terminals)
+    }
+}
 impl DiodeParameters {
-    fn new(m: &ScalarValues, i: &ScalarValues, instance: &DeviceInstance) -> SpiceResult<Self> {
-        let tlev = selector(m, "tlev", 2, instance)?;
+    fn new(m: &ScalarValues, i: &ScalarValues, location: &SourceLoc) -> SpiceResult<Self> {
+        let tlev = selector(m, "tlev", 2, location)?;
         let n = value(m, "n")?;
         // diompar.c: IKF/IKR/IKP below CKTepsmin disable the effect.
         let knee = |name| given(m, name).filter(|&k| k >= EPSMIN);
@@ -504,7 +604,7 @@ impl DiodeParameters {
             nbv: given(m, "nbv").unwrap_or(n),
             tcv: value(m, "tcv")?,
             tlev,
-            tlevc: selector(m, "tlevc", 1, instance)?,
+            tlevc: selector(m, "tlevc", 1, location)?,
             eg: given(m, "eg").unwrap_or(if tlev == 2 { 1.16 } else { 1.11 }),
             gap1: value(m, "gap1")?,
             gap2: value(m, "gap2")?,
@@ -533,10 +633,10 @@ impl DiodeParameters {
             kf: value(m, "kf")?,
             af: value(m, "af")?,
         };
-        p.check(&instance.location)?;
+        p.check(location)?;
         if p.temperature.is_some() && i.get("dtemp").is_some() {
             return Err(SpiceError::parse(
-                instance.location.clone(),
+                location.clone(),
                 "diode has both temp= and dtemp= (C ignores dtemp); give one",
             ));
         }
@@ -1766,7 +1866,7 @@ mod tests {
         let (_, setters) = crate::devices::initial::split(&instance.parameters, &["ic"])?;
         let setters = canonical(&setters, &[], INSTANCE_PENDING, "instance")?;
         let i = INSTANCE.validate(&setters, &instance.location)?;
-        DiodeParameters::new(&m, &i, instance)
+        DiodeParameters::new(&m, &i, &instance.location)
     }
     fn thermal(model: &str, instance: &str, celsius: Real) -> Thermal {
         parameters(model, instance)

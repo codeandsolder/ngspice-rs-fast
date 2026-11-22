@@ -98,14 +98,103 @@ struct LineParameters {
     abstol: Real,
 }
 
+/// Ordered line setters before the C setup defaults are resolved. Keep td
+/// optional: an explicit delay wins over frequency and normalized length.
+struct LineSetters {
+    z0: Option<Real>,
+    td: Option<Real>,
+    nl: Real,
+    f: Real,
+    initial: [Real; 4],
+    reltol: Real,
+    abstol: Real,
+}
+
+impl Default for LineSetters {
+    fn default() -> Self {
+        Self {
+            z0: None,
+            td: None,
+            nl: 0.25,
+            f: 1e9,
+            initial: [0.; 4],
+            reltol: 1.,
+            abstol: 1.,
+        }
+    }
+}
+
+fn initial_slot(name: &str) -> Option<usize> {
+    ["v1", "i1", "v2", "i2"]
+        .iter()
+        .position(|component| *component == name)
+}
+
+impl LineSetters {
+    fn apply_scalar(&mut self, name: &str, value: Real, at: &SourceLoc) -> SpiceResult<()> {
+        match name {
+            "z0" | "zo" => self.z0 = Some(value),
+            "td" => self.td = Some(value),
+            "nl" => self.nl = value,
+            "f" => self.f = value,
+            "rel" => self.reltol = value,
+            "abs" => self.abstol = value,
+            other => {
+                let slot = initial_slot(other).ok_or_else(|| {
+                    invalid(at, format!("unknown transmission-line parameter {other}"))
+                })?;
+                self.initial[slot] = value;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve(self, instance: &DeviceInstance) -> SpiceResult<LineParameters> {
+        let Self {
+            z0,
+            td,
+            nl,
+            f,
+            initial,
+            reltol,
+            abstol,
+        } = self;
+        let Some(z0) = z0 else {
+            return Err(invalid(
+                &instance.location,
+                format!(
+                    "{}: transmission line z0 must be given (trasetup.c)",
+                    instance.name
+                ),
+            ));
+        };
+        if z0 <= 0. || !(1. / z0).is_finite() {
+            return Err(invalid(
+                &instance.location,
+                format!("{}: z0 must be positive, got {z0}", instance.name),
+            ));
+        }
+        let td = line_delay(instance, td, f, nl)?;
+        if reltol < 0. || abstol < 0. {
+            return Err(invalid(
+                &instance.location,
+                format!("{}: rel and abs must not be negative", instance.name),
+            ));
+        }
+        Ok(LineParameters {
+            z0,
+            td,
+            nl,
+            f,
+            initial,
+            reltol,
+            abstol,
+        })
+    }
+}
+
 fn parse_line_parameters(instance: &DeviceInstance) -> SpiceResult<LineParameters> {
-    let mut z0 = None;
-    let mut td = None;
-    let mut nl = 0.25;
-    let mut f = 1e9;
-    let mut initial = [0.; 4];
-    let mut reltol = 1.;
-    let mut abstol = 1.;
+    let mut setters = LineSetters::default();
     let number = |text: &str, at: &SourceLoc, name: &str| {
         parse_spice_number(text)
             .filter(|v| v.is_finite())
@@ -115,41 +204,18 @@ fn parse_line_parameters(instance: &DeviceInstance) -> SpiceResult<LineParameter
         match (&p.kind, p.name.as_str()) {
             (ParameterKind::InitialConditions(values), "ic") => {
                 for value in values {
-                    let slot = match value.name.as_str() {
-                        "v1" => 0,
-                        "i1" => 1,
-                        "v2" => 2,
-                        "i2" => 3,
-                        other => {
-                            return Err(invalid(
-                                &value.value.location,
-                                format!("unexpected ic component {other}"),
-                            ));
-                        }
-                    };
-                    initial[slot] = number(&value.value.text, &value.value.location, "ic")?;
+                    let slot = initial_slot(&value.name).ok_or_else(|| {
+                        invalid(
+                            &value.value.location,
+                            format!("unexpected ic component {}", value.name),
+                        )
+                    })?;
+                    setters.initial[slot] = number(&value.value.text, &value.value.location, "ic")?;
                 }
             }
             (ParameterKind::Scalar, name) => {
                 let value = number(&p.value, &p.location, name)?;
-                match name {
-                    "z0" | "zo" => z0 = Some(value),
-                    "td" => td = Some(value),
-                    "nl" => nl = value,
-                    "f" => f = value,
-                    "v1" => initial[0] = value,
-                    "i1" => initial[1] = value,
-                    "v2" => initial[2] = value,
-                    "i2" => initial[3] = value,
-                    "rel" => reltol = value,
-                    "abs" => abstol = value,
-                    other => {
-                        return Err(invalid(
-                            &p.location,
-                            format!("unknown transmission-line parameter {other}"),
-                        ));
-                    }
-                }
+                setters.apply_scalar(name, value, &p.location)?;
             }
             _ => {
                 return Err(SpiceError::not_yet_ported(
@@ -162,37 +228,7 @@ fn parse_line_parameters(instance: &DeviceInstance) -> SpiceResult<LineParameter
             }
         }
     }
-    let Some(z0) = z0 else {
-        return Err(invalid(
-            &instance.location,
-            format!(
-                "{}: transmission line z0 must be given (trasetup.c)",
-                instance.name
-            ),
-        ));
-    };
-    if z0 <= 0. || !(1. / z0).is_finite() {
-        return Err(invalid(
-            &instance.location,
-            format!("{}: z0 must be positive, got {z0}", instance.name),
-        ));
-    }
-    let td = line_delay(instance, td, f, nl)?;
-    if reltol < 0. || abstol < 0. {
-        return Err(invalid(
-            &instance.location,
-            format!("{}: rel and abs must not be negative", instance.name),
-        ));
-    }
-    Ok(LineParameters {
-        z0,
-        td,
-        nl,
-        f,
-        initial,
-        reltol,
-        abstol,
-    })
+    setters.resolve(instance)
 }
 
 fn line_delay(instance: &DeviceInstance, td: Option<Real>, f: Real, nl: Real) -> SpiceResult<Real> {
