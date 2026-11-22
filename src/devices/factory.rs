@@ -151,6 +151,7 @@ pub(super) fn instantiate_with_models(
         ModelFamily::Txl => crate::devices::txl::Txl::instantiate(instance, nodes, &model),
         ModelFamily::Ltra => {
             crate::devices::ltra::LossyLine::instantiate(instance, nodes, models, context)
+                .map(|line| Box::new(line) as Box<dyn Device>)
         }
         // URC elaborates to a ladder, not a single device.
         ModelFamily::Urc => Err(SpiceError::circuit(format!(
