@@ -412,6 +412,8 @@ pub struct RunConfig {
     params: Option<std::sync::Arc<ParamScope>>,
 }
 
+pub mod parameters;
+
 impl RunConfig {
     /// Resolve all `.option` cards of a deck with no explicit overrides,
     /// evaluating `{expr}`/`'expr'` option values against top-level `.param`.
@@ -420,14 +422,27 @@ impl RunConfig {
     /// Unknown, unimplemented, malformed, out-of-range or conflicting options,
     /// and option expressions that fail to evaluate.
     pub fn from_netlist(netlist: &Netlist) -> SpiceResult<Self> {
-        let scope = ParamScope::for_netlist(netlist)?;
+        Self::with_resolved_scope(
+            netlist,
+            std::sync::Arc::new(ParamScope::for_netlist(netlist)?),
+        )
+    }
+
+    pub(crate) fn with_resolved_scope(
+        netlist: &Netlist,
+        scope: std::sync::Arc<ParamScope>,
+    ) -> SpiceResult<Self> {
         // Body front-end cards follow expanded instance/card order, not definition order.
         let expanded = if netlist.subcircuits.iter().any(|sub| {
             !sub.options.is_empty()
                 || !sub.initial_conditions.is_empty()
                 || !sub.nodesets.is_empty()
         }) {
-            let literal = crate::netlist::elaborate::literalize(netlist)?;
+            let literal = crate::netlist::elaborate::literalize_with(
+                netlist,
+                std::sync::Arc::clone(&scope),
+                &mut EvalBudget::default(),
+            )?;
             Some(crate::devices::subckt::expand_subcircuits(
                 &literal.netlist,
                 &literal.scope,
@@ -468,7 +483,7 @@ impl RunConfig {
                 .as_ref()
                 .map_or(&nodesets, |expanded| &expanded.nodesets),
         );
-        config.params = Some(std::sync::Arc::new(scope));
+        config.params = Some(scope);
         Ok(config)
     }
 

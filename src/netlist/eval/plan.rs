@@ -386,6 +386,39 @@ impl CandidateParameters<'_> {
         .map_err(Failure::into_error)
     }
 
+    /// Materialize a resolved lexical scope from the current candidate
+    /// without re-running parameter definitions. Parent chains carry the
+    /// same candidate values and function environments. Scope metadata and
+    /// superseded declarations are preserved.
+    ///
+    /// # Errors
+    /// The requested scope does not belong to this plan.
+    pub fn resolved_scope(&self, scope: ParameterScopeId) -> SpiceResult<Arc<ParamScope>> {
+        let mut chain = Vec::new();
+        let mut current = Some(scope);
+        while let Some(id) = current {
+            let node = self
+                .plan
+                .scopes
+                .get(id.0)
+                .ok_or_else(|| SpiceError::circuit("unknown parameter plan scope"))?;
+            chain.push(node);
+            current = node.parent;
+        }
+        let mut parent = None;
+        for node in chain.into_iter().rev() {
+            let mut resolved = (*node.baseline).clone();
+            resolved.parent = parent;
+            for (entry, value) in resolved.entries.iter_mut().zip(&self.values[node.start..]) {
+                if let Some(value) = value {
+                    entry.state = ParamState::Resolved(*value);
+                }
+            }
+            parent = Some(Arc::new(resolved));
+        }
+        parent.ok_or_else(|| SpiceError::circuit("empty parameter scope chain"))
+    }
+
     /// Set an arbitrary full candidate vector in plan input order. Returns
     /// the count of derived definitions actually evaluated. Only dependents
     /// of changed values are scheduled, in original topological order.

@@ -33,7 +33,7 @@ use crate::devices::mutual::{CouplingSite, MutualLimits, pair_count};
 use crate::devices::state::{
     DeviceState, HistoryPublication, StateHistory, StateSnapshot, TrialState,
 };
-use crate::devices::sweep::{InstanceOverride, ResistorMetadata, ResistorOverride};
+use crate::devices::sweep::{InstanceOverride, InstanceTarget, ResistorMetadata, ResistorOverride};
 use crate::devices::traits::{
     AcceptContext, AnalysisMode, Device, InductanceValue, MnaUnknowns, MutualTerm, StampContext,
     StampRhs,
@@ -2103,21 +2103,38 @@ impl Circuit {
         Ok(target)
     }
 
-    /// Bind a typed target without constructing a throwaway device. The
-    /// ordered point preparation validates the value at its actual context.
+    /// Bind the device's canonical numeric setter to this finalized topology.
+    /// No trial value or throwaway device construction is needed.
+    ///
+    /// # Errors
+    /// Unfinalized topology, unknown device or unsupported parameter.
+    pub fn bind_instance_target(&self, name: &str, keyword: &str) -> SpiceResult<InstanceTarget> {
+        let (index, parameter) = self.instance_parameter(name, keyword)?;
+        Ok(InstanceTarget::new(self.topology_id()?, index, parameter))
+    }
+
+    /// Bind a resistor's supplied (not effective) resistance via its metadata.
+    ///
+    /// # Errors
+    /// Unfinalized topology or target is not a resistor.
+    pub fn bind_resistor_target(&self, name: &str) -> SpiceResult<InstanceTarget> {
+        let (index, _) = self
+            .resistor(name)
+            .ok_or_else(|| SpiceError::circuit(format!("{name} is not a resistor")))?;
+        Ok(InstanceTarget::new(
+            self.topology_id()?,
+            index,
+            "resistance",
+        ))
+    }
+
     pub(crate) fn bind_instance_override(
         &self,
         name: &str,
         keyword: &str,
         value: Real,
     ) -> SpiceResult<InstanceOverride> {
-        let (index, parameter) = self.instance_parameter(name, keyword)?;
-        Ok(InstanceOverride::new(
-            self.topology_id()?,
-            index,
-            parameter,
-            value,
-        ))
+        self.bind_instance_target(name, keyword)?.at(value)
     }
 
     /// A DC value override of the independent V or I source `name`, as
@@ -2137,24 +2154,26 @@ impl Circuit {
         Ok(target)
     }
 
-    pub(crate) fn bind_source_override(
-        &self,
-        name: &str,
-        value: Real,
-    ) -> SpiceResult<InstanceOverride> {
+    /// Bind an independent V/I source's DC setter without a trial value.
+    ///
+    /// # Errors
+    /// Unfinalized topology, unknown name or non-source device.
+    pub fn bind_source_target(&self, name: &str) -> SpiceResult<InstanceTarget> {
         let index = self
             .devices
             .iter()
             .position(|d| d.name().eq_ignore_ascii_case(name))
             .filter(|&i| matches!(self.devices[i].designator().to_ascii_lowercase(), 'v' | 'i'))
-            .filter(|_| value.is_finite())
             .ok_or_else(|| SpiceError::circuit("invalid or unknown DC source override"))?;
-        Ok(InstanceOverride::new(
-            self.topology_id()?,
-            index,
-            "dc",
-            value,
-        ))
+        Ok(InstanceTarget::new(self.topology_id()?, index, "dc"))
+    }
+
+    pub(crate) fn bind_source_override(
+        &self,
+        name: &str,
+        value: Real,
+    ) -> SpiceResult<InstanceOverride> {
+        self.bind_source_target(name)?.at(value)
     }
 
     /// The Newton load of the single device at ordinal `index`, with `device`
@@ -2592,6 +2611,19 @@ impl Circuit {
                                 == right.mutual_coupling().map(|coupling| coupling.inductors)
                             && left.delay_line().is_some() == right.delay_line().is_some()
                     }))
+    }
+
+    /// Compare complete independently finalized layouts, including the
+    /// selected model bins and the exact creation-order stamp pattern.
+    /// Numeric factors and accepted state are not part of this equivalence.
+    pub(crate) fn same_candidate_layout(&self, baseline: &Self) -> bool {
+        self.compatible_topology(baseline)
+            && self
+                .devices
+                .iter()
+                .zip(&baseline.devices)
+                .all(|(a, b)| a.model_name() == b.model_name())
+            && self.matrix_pattern().as_deref() == baseline.matrix_pattern().as_deref()
     }
 
     /// Takes over `previous`'s matrix (C's one `CKTmatrix`, with its pivot
@@ -3544,6 +3576,19 @@ impl Circuit {
         mutual_limits: MutualLimits,
         elaboration_limits: ElaborationLimits,
     ) -> SpiceResult<Self> {
+        Self::from_netlist_with_scope(netlist, context, mutual_limits, elaboration_limits, None)
+    }
+
+    /// Elaborate from the same validated AST and an optionally pre-resolved
+    /// top-level parameter scope. Local instance scopes are expanded from
+    /// that parent using the ordinary elaboration rules.
+    pub(crate) fn from_netlist_with_scope(
+        netlist: &crate::netlist::ast::Netlist,
+        context: &ModelContext,
+        mutual_limits: MutualLimits,
+        elaboration_limits: ElaborationLimits,
+        scope: Option<Arc<crate::netlist::eval::ParamScope>>,
+    ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
         if !netlist.includes.is_empty() {
             return Err(SpiceError::Unsupported {
@@ -3557,7 +3602,14 @@ impl Circuit {
         let lowered = crate::netlist::behavioural::lower_nonlinear_sources(netlist)?;
         // Top-level `.param` values and `{expr}` sites are evaluated into a
         // literal copy before any factory sees them (#15).
-        let elaborated = crate::netlist::elaborate::literalize(&lowered)?;
+        let elaborated = match scope {
+            Some(scope) => crate::netlist::elaborate::literalize_with(
+                &lowered,
+                scope,
+                &mut crate::netlist::eval::EvalBudget::default(),
+            )?,
+            None => crate::netlist::elaborate::literalize(&lowered)?,
+        };
         let netlist = &elaborated.netlist;
         // `X` instances are expanded into a fresh device/model list before any
         // device is built, so a deck that fails to elaborate never leaves a
