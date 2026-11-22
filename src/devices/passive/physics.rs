@@ -199,7 +199,7 @@ impl CoilSetup {
             specific,
             model_inductance: self
                 .inductance
-                .unwrap_or_else(|| self.turns * self.turns * specific),
+                .unwrap_or(self.turns * self.turns * specific),
         }
     }
 }
