@@ -11,10 +11,10 @@ card 1 @netlists/rl_pulse_tran.cir:4:1 lines=4-4 continuations=0
   token 5 4:14 lparen "("
   token 6 4:15 number "0" value=0e0
   token 7 4:17 number "1" value=1e0
-  token 8 4:19 number "20u" value=1.9999999999999998e-5
+  token 8 4:19 number "20u" value=2e-5
   token 9 4:23 number "1u" value=1e-6
   token 10 4:26 number "1u" value=1e-6
-  token 11 4:29 number "200u" value=1.9999999999999998e-4
+  token 11 4:29 number "200u" value=2e-4
   token 12 4:34 number "500u" value=5e-4
   token 13 4:38 rparen ")"
 card 2 @netlists/rl_pulse_tran.cir:5:1 lines=5-5 continuations=0

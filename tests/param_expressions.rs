@@ -141,6 +141,33 @@ fn scale_factors_units_and_literal_spellings_are_kept() {
 }
 
 #[test]
+fn scaled_decimal_literals_are_rounded_after_applying_the_suffix() {
+    for (text, expected) in [
+        ("1e312f", 1e297_f64),
+        ("1e-330t", 1e-318),
+        ("1mil", 1e-3),
+        ("1.234567890123456789k", 1234.567_890_123_457),
+        ("0e99999999999999999999999999999999999999999999999999", 0.),
+    ] {
+        let parsed = expression(text).unwrap();
+        let ExprKind::Number { value, spelling } = &parsed.root.kind else {
+            panic!("{text}: {:?}", parsed.root);
+        };
+        assert_eq!(value.to_bits(), expected.to_bits(), "{text}");
+        assert_eq!(spelling, text);
+        assert_eq!(parsed.root.span.start.column, 10);
+        assert_eq!(parsed.root.span.end.column, 10 + text.len());
+    }
+    assert!(expression("1d3").is_err());
+    let overflow = expression("1e308k").unwrap_err();
+    assert!(
+        overflow
+            .to_string()
+            .contains("overflows to a non-finite value")
+    );
+}
+
+#[test]
 fn spans_and_original_text_are_byte_exact() {
     let parsed = expression("  a +  2*max(b,1)  ").unwrap();
     assert_eq!(parsed.text, "  a +  2*max(b,1)  ");

@@ -52,6 +52,8 @@
 //!
 //! [ngspice]: https://ngspice.sourceforge.io/
 
+#![feature(portable_simd)]
+
 // Production unwrap policy is owned by the shared strict Rust gate.
 // Workspace Cargo lints retain regular documentation warnings.
 

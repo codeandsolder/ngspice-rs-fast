@@ -29,7 +29,7 @@ card 3 @netlists/disto_mos1.cir:9:1 lines=9-9 continuations=0
   token 1 9:1 word "cin"
   token 2 9:5 word "in"
   token 3 9:8 word "g"
-  token 4 9:10 number "10u" value=9.999999999999999e-6
+  token 4 9:10 number "10u" value=1e-5
 card 4 @netlists/disto_mos1.cir:10:1 lines=10-10 continuations=0
   raw: "r1 vdd g 300k"
   kind: device(r)
@@ -69,7 +69,7 @@ card 8 @netlists/disto_mos1.cir:14:1 lines=14-14 continuations=0
   token 6 14:12 word "nm"
   token 7 14:15 word "w"
   token 8 14:16 equals "="
-  token 9 14:17 number "20u" value=1.9999999999999998e-5
+  token 9 14:17 number "20u" value=2e-5
   token 10 14:21 word "l"
   token 11 14:22 equals "="
   token 12 14:23 number "2u" value=2e-6
@@ -96,7 +96,7 @@ card 9 @netlists/disto_mos1.cir:15:1 lines=15-15 continuations=0
   token 6 15:14 word "nm"
   token 7 15:17 word "w"
   token 8 15:18 equals "="
-  token 9 15:19 number "10u" value=9.999999999999999e-6
+  token 9 15:19 number "10u" value=1e-5
   token 10 15:23 word "l"
   token 11 15:24 equals "="
   token 12 15:25 number "2u" value=2e-6
@@ -125,7 +125,7 @@ card 12 @netlists/disto_mos1.cir:18:1 lines=18-18 continuations=0
   token 6 18:17 word "pm"
   token 7 18:20 word "w"
   token 8 18:21 equals "="
-  token 9 18:22 number "10u" value=9.999999999999999e-6
+  token 9 18:22 number "10u" value=1e-5
   token 10 18:26 word "l"
   token 11 18:27 equals "="
   token 12 18:28 number "2u" value=2e-6
@@ -151,7 +151,7 @@ card 14 @netlists/disto_mos1.cir:20:1 lines=20-21 continuations=1
   token 10 20:28 number "0.8" value=8e-1
   token 11 20:32 word "kp"
   token 12 20:34 equals "="
-  token 13 20:35 number "50u" value=4.9999999999999996e-5
+  token 13 20:35 number "50u" value=5e-5
   token 14 20:39 word "gamma"
   token 15 20:44 equals "="
   token 16 20:45 number "0.5" value=5e-1
@@ -169,10 +169,10 @@ card 14 @netlists/disto_mos1.cir:20:1 lines=20-21 continuations=1
   token 28 20:79 number "10" value=1e1
   token 29 20:82 word "cbd"
   token 30 20:85 equals "="
-  token 31 20:86 number "20f" value=2.0000000000000003e-14
+  token 31 20:86 number "20f" value=2e-14
   token 32 20:90 word "cbs"
   token 33 20:93 equals "="
-  token 34 20:94 number "20f" value=2.0000000000000003e-14
+  token 34 20:94 number "20f" value=2e-14
   token 35 21:3 word "cj"
   token 36 21:5 equals "="
   token 37 21:6 number "1e-4" value=1e-4
@@ -184,7 +184,7 @@ card 14 @netlists/disto_mos1.cir:20:1 lines=20-21 continuations=1
   token 43 21:25 number "0.4" value=4e-1
   token 44 21:29 word "mjsw"
   token 45 21:33 equals "="
-  token 46 21:34 number "0.3" value=3.0000000000000004e-1
+  token 46 21:34 number "0.3" value=3e-1
   token 47 21:38 word "tox"
   token 48 21:41 equals "="
   token 49 21:42 number "20n" value=2e-8
@@ -216,7 +216,7 @@ card 15 @netlists/disto_mos1.cir:22:1 lines=22-22 continuations=0
   token 10 22:28 number "-0.8" value=-8e-1
   token 11 22:33 word "kp"
   token 12 22:35 equals "="
-  token 13 22:36 number "20u" value=1.9999999999999998e-5
+  token 13 22:36 number "20u" value=2e-5
   token 14 22:40 word "gamma"
   token 15 22:45 equals "="
   token 16 22:46 number "0.4" value=4e-1
@@ -268,7 +268,7 @@ card 18 @netlists/disto_mos1.cir:25:1 lines=25-25 continuations=0
   token 3 25:12 number "2" value=2e0
   token 4 25:14 number "1k" value=1e3
   token 5 25:17 number "10meg" value=1e7
-  token 6 25:23 number "0.7" value=7.000000000000001e-1
+  token 6 25:23 number "0.7" value=7e-1
 card 19 @netlists/disto_mos1.cir:26:1 lines=26-26 continuations=0
   raw: ".end"
   kind: dot(.end)

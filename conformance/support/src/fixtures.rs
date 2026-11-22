@@ -1,9 +1,9 @@
 //! C-reference selection for conformance tests and xtask.
 //!
 //! Most fixtures use one golden; explicitly documented libm-sensitive
-//! fixtures may have independently captured platform variants. Capture and
-//! drift checks select the native reference; numerical comparisons can use the
-//! observed envelope of all documented captures. Missing data is an error.
+//! fixtures may have independently captured platform or exact-input variants.
+//! Capture and drift checks select the applicable reference; comparisons use
+//! the observed envelope of documented captures. Missing data is an error.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 
 /// Fixture deck directory, relative to the workspace.
 pub const NETLIST_DIR: &str = "conformance/netlists";
+
+/// C-only decks whose decimal spellings produce the intended binary64 inputs.
+pub const REFERENCE_INPUT_DIR: &str = "conformance/reference-inputs";
 
 /// Reference directory, relative to the workspace.
 pub const GOLDEN_DIR: &str = "conformance/golden";
@@ -106,6 +109,27 @@ pub fn fixture_id(path: &Path) -> Result<&str, String> {
         .ok_or_else(|| format!("fixture {} has no file name", path.display()))
 }
 
+/// Whether C needs equivalent decimal spellings to round to the intended inputs.
+fn exact_input(name: &str) -> bool {
+    ["sens_hfet2", "sens_mos3", "sens_mos9"]
+        .iter()
+        .any(|fixture| name.eq_ignore_ascii_case(fixture))
+}
+
+/// The deck to give C when capturing a fixture. Rust runs the original deck.
+///
+/// # Errors
+/// The original fixture has no valid ID.
+pub fn reference_netlist_path(root: &Path, original: &Path) -> Result<PathBuf, String> {
+    let name = fixture_id(original)?;
+    Ok(if exact_input(name) {
+        root.join(REFERENCE_INPUT_DIR)
+            .join(format!("{}.cir", name.to_ascii_lowercase()))
+    } else {
+        original.to_path_buf()
+    })
+}
+
 /// The C golden for `name` on the verifier/capture target.
 ///
 /// Capture and byte-drift checks always use this specific path.
@@ -175,7 +199,9 @@ fn path_for(root: &Path, name: &str, linux_x86_64_gnu: bool) -> PathBuf {
     // perturbation is 1e-25. Platform libm rounding is amplified by that
     // divisor: independent Linux and macOS C captures disagree on these residues.
     let name = name.to_ascii_lowercase();
-    if name == "sens_bjt" && linux_x86_64_gnu {
+    if exact_input(&name) {
+        directory.push("exact-input");
+    } else if name == "sens_bjt" && linux_x86_64_gnu {
         directory.push("linux-x86_64-gnu");
     }
     directory.join(format!("{name}.raw"))
@@ -260,6 +286,33 @@ mod tests {
         assert_eq!(
             super::numerical_golden_paths(root, "rc_divider"),
             [golden_path(root, "rc_divider")]
+        );
+    }
+
+    #[test]
+    fn exact_input_reference_decks_and_captures_are_selected_together() {
+        let root = Path::new("scratch");
+        for name in ["sens_hfet2", "sens_mos3", "sens_mos9"] {
+            let original = root.join(super::NETLIST_DIR).join(format!("{name}.cir"));
+            let reference = super::reference_netlist_path(root, &original).unwrap();
+            assert_eq!(
+                reference,
+                root.join(super::REFERENCE_INPUT_DIR)
+                    .join(format!("{name}.cir"))
+            );
+            for linux in [true, false] {
+                assert_eq!(
+                    path_for(root, name, linux),
+                    root.join(super::GOLDEN_DIR)
+                        .join("exact-input")
+                        .join(format!("{name}.raw"))
+                );
+            }
+        }
+        let original = root.join(super::NETLIST_DIR).join("rc_divider.cir");
+        assert_eq!(
+            super::reference_netlist_path(root, &original).unwrap(),
+            original
         );
     }
 

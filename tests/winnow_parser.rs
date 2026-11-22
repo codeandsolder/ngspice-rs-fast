@@ -71,6 +71,29 @@ fn optional_numeric_slots_commit_non_finite_values() {
 }
 
 #[test]
+fn scalar_literal_range_is_checked_after_exact_decimal_scaling() {
+    for text in [
+        "1e312f",
+        "1e-330t",
+        "0e99999999999999999999999999999999999999999999999",
+        "1d3",
+        "1mil",
+    ] {
+        let card = format!("R1 a 0 {text}");
+        let netlist = parse(&card).unwrap();
+        assert_eq!(netlist.devices[0].parameters[0].value, text);
+    }
+    for text in [
+        "1e308k",
+        "1e9999999999999999999999999999999999999999999999999",
+    ] {
+        let card = format!("R1 a 0 {text}");
+        let error = parse(&card).unwrap_err();
+        assert!(matches!(error, SpiceError::Parse { location, .. } if location.column == 8));
+    }
+}
+
+#[test]
 fn optional_and_repeated_branches_preserve_domain_errors() {
     for (card, text, reference) in [
         ("V1 a 0 ac \"gain\"", "\"gain\"", "inp2v.c"),

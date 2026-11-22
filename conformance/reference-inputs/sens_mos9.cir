@@ -1,0 +1,21 @@
+Classic MOS level 9 sensitivity (#164)
+* Shared process-derived NMOS model, a shifted temperature and a PMOS.
+* All source currents return through vsense; the bulk is independently biased.
+* MOS6 asks TNOM in kelvin but its setter adds 273.15, and scales geometry asks
+* by M. MOS3/9 ask the scaled narrow factor through DELTA; XD/ALPHA/INPUT_DELTA
+* have no setters. MOS9 has no DTEMP ask and therefore drops that column.
+.options reltol=1e-10 vntol=1e-13 abstol=1e-16
+vdn dn 0 3
+vdp dp 0 -3
+vgn gn 0 2
+vgp gp 0 -1.8
+vbn bn 0 -30e-2
+vbp bp 0 30e-2
+vsense s 0 0
+m1 dn gn s bn mn l=1000e-8 w=2000e-8 ad=10p as=20p pd=1000e-8 ps=2000e-8 nrd=2 nrs=3 m=2 dtemp=15
+m2 dn gn s bn mn l=12u w=3000e-8 ad=15p as=25p pd=12u ps=24u nrd=3 nrs=2
+m3 dp gp s bp mp l=1500e-8 w=1000e-8 ad=20p as=10p pd=2000e-8 ps=1000e-8 nrd=2 nrs=3 temp=60
+.model mn nmos level=9 tox=20n nsub=1e16 nss=1e10 rsh=100 delta=10 theta=0.1 eta=0.1 xj=0.2u
+.model mp pmos level=9 vto=-700000e-6 kp=5000e-8 gamma=0.5 phi=60e-2 nsub=1e16 rd=50 rs=100 tnom=50 delta=10 theta=0.1 eta=0.1 xj=0.2u
+.sens i(vsense)
+.end
