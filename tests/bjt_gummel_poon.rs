@@ -526,23 +526,42 @@ const BJT_SENS_CARD: &str = ".options reltol=1e-10 vntol=1e-13 abstol=1e-16\n\
 /// polynomial, plus a PNP at `dtemp=20` with `tnom=50`. The reference binary
 /// prints these columns; `rco` is zero because `sens_setp()` skips it, and
 /// `bf`/`vaf` are zero because C's own linearization does not see them here.
-/// Use the matching C platform: the 1e-25 ISE step amplifies libm differences
-/// enough to change the sign of C's own column between macOS and Linux.
+/// The ISE step is 1e-25, amplifying reference roundoff enough to
+/// reverse the sign between two independent C builds. Require both
+/// captures and apply the unchanged tolerance at their nearest endpoint.
 #[test]
 fn sensitivity_matches_the_reference_on_the_fixture_card() {
     let plot = run_deck(BJT_SENS_CARD);
-    let raw = ngspice_rs::analysis::RawFile::load(fixtures::golden_path(
+    let references: Vec<_> = fixtures::numerical_golden_paths(
         &ngspice_conformance::fixtures::workspace_root().unwrap(),
         "sens_bjt",
-    ))
-    .unwrap();
-    let expected = &raw.plots[0].plot;
-    assert_eq!(plot.variable_count(), expected.variable_count());
-    assert_eq!(plot.point_count(), expected.point_count());
+    )
+    .iter()
+    .map(|path| ngspice_rs::analysis::RawFile::load(path).unwrap())
+    .collect();
+    let expected = &references[0].plots[0].plot;
+    for raw in &references {
+        assert_eq!(raw.plots.len(), 1);
+        let reference = &raw.plots[0].plot;
+        assert_eq!(plot.variable_count(), reference.variable_count());
+        assert_eq!(plot.point_count(), reference.point_count());
+        assert_eq!(plot.plotname, reference.plotname);
+        assert_eq!(plot.flags(), reference.flags());
+        for variable in expected.variables() {
+            let index = reference.variable_index(&variable.name).unwrap();
+            assert_eq!(reference.variables()[index], *variable);
+        }
+    }
     let mut mismatches = Vec::new();
     for variable in expected.variables() {
         let actual = column(&plot, &variable.name);
-        let reference = column(expected, &variable.name);
+        let reference = fixtures::nearest_reference(
+            actual,
+            references
+                .iter()
+                .map(|raw| column(&raw.plots[0].plot, &variable.name)),
+        )
+        .unwrap();
         if (actual - reference).abs() > 1e-6 * reference.abs() + 1e-9 || !actual.is_finite() {
             mismatches.push(format!("{}: {actual:e} != {reference:e}", variable.name));
         }

@@ -399,10 +399,41 @@ pub(super) fn check_structure(
     Ok(())
 }
 
-/// Compare one production plot with one committed C plot. Header dates,
+fn validate_alternate_captures(
+    want: &Plot,
+    want_columns: &BTreeMap<String, usize>,
+    alternates: &[&Plot],
+    axis: Option<&str>,
+) -> Result<Vec<BTreeMap<String, usize>>, String> {
+    alternates
+        .iter()
+        .map(|alternate| {
+            let columns = validate(alternate, "alternate C")?;
+            check_structure(want, alternate, want_columns, &columns)?;
+            if alternate.point_count() != want.point_count() {
+                return Err("alternate C point count mismatch".to_owned());
+            }
+            if let Some(axis) = axis {
+                let primary = *want_columns.get(axis).ok_or("missing C axis")?;
+                let other = *columns.get(axis).ok_or("missing alternate C axis")?;
+                if !want
+                    .rows()
+                    .zip(alternate.rows())
+                    .all(|(a, b)| a[primary] == b[other])
+                {
+                    return Err("independent C captures have different physical grids".to_owned());
+                }
+            }
+            Ok(columns)
+        })
+        .collect()
+}
+
+/// Compare one production plot with committed independent C captures. Header dates,
 /// commands, titles and internal plot IDs are not numerical metadata.
 /// Axis identity is explicit in the fixture registry, not inferred from order.
-/// Complex components each satisfy `|got-want| <= relative*|want| + absolute`.
+/// Complex components each satisfy the ordinary bound against the nearest
+/// point in the observed per-component C reference interval.
 #[expect(
     clippy::suboptimal_flops,
     reason = "retain the existing separately rounded component acceptance bounds; changing rounding can change golden classifications at the boundary"
@@ -410,6 +441,7 @@ pub(super) fn check_structure(
 pub(super) fn plots(
     got: &Plot,
     want: &Plot,
+    alternates: &[&Plot],
     tolerance: Tolerance,
     axis: Option<&str>,
 ) -> Result<(), String> {
@@ -423,6 +455,7 @@ pub(super) fn plots(
             want.point_count()
         ));
     }
+    let alternate_columns = validate_alternate_captures(want, &want_columns, alternates, axis)?;
     if let Some(axis) = axis {
         for (plot, columns, label) in [(got, &got_columns, "Rust"), (want, &want_columns, "C")] {
             let &column = columns
@@ -450,11 +483,35 @@ pub(super) fn plots(
     let mut order: Vec<(&String, &usize)> = want_columns.iter().collect();
     order.sort_by_key(|(_, index)| **index);
     for (point, (actual, expected)) in got.rows().zip(want.rows()).enumerate() {
+        let alternate_rows = alternates
+            .iter()
+            .map(|plot| plot.row(point).ok_or("missing alternate C point"))
+            .collect::<Result<Vec<_>, _>>()?;
         for (key, column) in &order {
             let variable = &want.variables()[**column];
             let got = actual[got_columns[*key]];
             let want = expected[**column];
-            for (component, got, want) in [("re", got.re, want.re), ("im", got.im, want.im)] {
+            for (component, got, reference) in [("re", got.re, want.re), ("im", got.im, want.im)] {
+                let want = if alternates.is_empty() {
+                    reference
+                } else {
+                    let observations =
+                        alternate_rows
+                            .iter()
+                            .zip(&alternate_columns)
+                            .map(|(row, columns)| {
+                                let sample = row[columns[*key]];
+                                if component == "re" {
+                                    sample.re
+                                } else {
+                                    sample.im
+                                }
+                            });
+                    ngspice_conformance::fixtures::nearest_reference(
+                        got,
+                        std::iter::once(reference).chain(observations),
+                    )?
+                };
                 let error = (got - want).abs();
                 let limit = tolerance.relative * want.abs() + tolerance.absolute;
                 if error > limit {
@@ -520,7 +577,7 @@ mod tests {
     }
 
     fn compare(got: &Plot, want: &Plot) -> Result<(), String> {
-        plots(got, want, AC, Some("frequency"))
+        plots(got, want, &[], AC, Some("frequency"))
     }
 
     #[test]
@@ -653,13 +710,13 @@ mod tests {
                 };
                 let bound = tolerance.relative * value.abs() + tolerance.absolute;
                 *value += 0.5 * bound;
-                plots(&got, &want, tolerance, None).unwrap();
+                plots(&got, &want, &[], tolerance, None).unwrap();
                 *if component == "re" {
                     &mut got.point_mut(point).unwrap()[1].re
                 } else {
                     &mut got.point_mut(point).unwrap()[1].im
                 } += 2.0 * bound;
-                let error = plots(&got, &want, tolerance, None).unwrap_err();
+                let error = plots(&got, &want, &[], tolerance, None).unwrap_err();
                 assert!(error.contains(&format!("v(out).{component}")), "{error}");
                 assert!(error.contains("first:") && error.contains("worst"));
             }
@@ -837,7 +894,7 @@ mod tests {
     #[test]
     fn axis_identity_values_and_monotonicity_are_checked() {
         let want = plot();
-        assert!(plots(&want, &want, AC, Some("time")).is_err());
+        assert!(plots(&want, &want, &[], AC, Some("time")).is_err());
         for value in [Complex::ZERO, Complex::real(-1.0), Complex::new(100.0, 1.0)] {
             let mut got = want.clone();
             got.point_mut(0).unwrap()[0] = value;

@@ -1,8 +1,9 @@
 //! C-reference selection for conformance tests and xtask.
 //!
 //! Most fixtures use one golden; explicitly documented libm-sensitive
-//! fixtures may have an independently captured platform variant. Missing data
-//! is an error at the caller, not permission to fall back to another platform.
+//! fixtures may have independently captured platform variants. Capture and
+//! drift checks select the native reference; numerical comparisons can use the
+//! observed envelope of all documented captures. Missing data is an error.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -107,7 +108,7 @@ pub fn fixture_id(path: &Path) -> Result<&str, String> {
 
 /// The C golden for `name` on the verifier/capture target.
 ///
-/// Capture, drift checks and numerical verification must use the same path.
+/// Capture and byte-drift checks always use this specific path.
 #[must_use]
 pub fn golden_path(root: &Path, name: &str) -> PathBuf {
     path_for(
@@ -121,11 +122,56 @@ pub fn golden_path(root: &Path, name: &str) -> PathBuf {
     )
 }
 
+/// Every independently captured C reference used for numerical comparison.
+/// The native platform's file comes first. All listed captures are required;
+/// none is a fallback for a missing or malformed native reference.
+#[must_use]
+pub fn numerical_golden_paths(root: &Path, name: &str) -> Vec<PathBuf> {
+    let native = golden_path(root, name);
+    let mut paths = vec![native.clone()];
+    for linux in [false, true] {
+        let candidate = path_for(root, name, linux);
+        if !paths.contains(&candidate) {
+            paths.push(candidate);
+        }
+    }
+    paths
+}
+
+/// Closest point in the envelope of independently observed reference values.
+/// Identical captures reduce to the ordinary single-reference comparison.
+/// Nonfinite or absent references must never make a comparison pass.
+///
+/// # Errors
+/// Empty or nonfinite reference, or nonfinite candidate.
+pub fn nearest_reference(
+    actual: f64,
+    references: impl IntoIterator<Item = f64>,
+) -> Result<f64, String> {
+    if !actual.is_finite() {
+        return Err("nonfinite candidate".to_owned());
+    }
+    let mut references = references.into_iter();
+    let first = references.next().ok_or("empty reference envelope")?;
+    if !first.is_finite() {
+        return Err("nonfinite reference".to_owned());
+    }
+    let (mut lower, mut upper) = (first, first);
+    for reference in references {
+        if !reference.is_finite() {
+            return Err("nonfinite reference".to_owned());
+        }
+        lower = lower.min(reference);
+        upper = upper.max(reference);
+    }
+    Ok(actual.clamp(lower, upper))
+}
+
 fn path_for(root: &Path, name: &str, linux_x86_64_gnu: bool) -> PathBuf {
     let mut directory = root.join(GOLDEN_DIR);
     // bjtsetup.c scales ISE=1e-3 by IS=1e-16, so cktsens.c's ISE
     // perturbation is 1e-25. Platform libm rounding is amplified by that
-    // divisor: Linux C and Rust agree, but neither matches macOS C's residue.
+    // divisor: independent Linux and macOS C captures disagree on these residues.
     let name = name.to_ascii_lowercase();
     if name == "sens_bjt" && linux_x86_64_gnu {
         directory.push("linux-x86_64-gnu");
@@ -199,6 +245,44 @@ mod tests {
         for name in ["rc_divider", "sens_ac_bjt", "sens_ac_mos_tran"] {
             assert_eq!(path_for(root, name, true), path_for(root, name, false));
         }
+    }
+
+    #[test]
+    fn numerical_comparison_requires_every_documented_capture() {
+        let root = Path::new("workspace");
+        let paths = super::numerical_golden_paths(root, "SENS_BJT");
+        assert_eq!(paths[0], golden_path(root, "sens_bjt"));
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&path_for(root, "sens_bjt", false)));
+        assert!(paths.contains(&path_for(root, "sens_bjt", true)));
+        assert_eq!(
+            super::numerical_golden_paths(root, "rc_divider"),
+            [golden_path(root, "rc_divider")]
+        );
+    }
+
+    #[test]
+    fn envelope_is_the_observed_range_not_a_global_tolerance() {
+        use super::nearest_reference;
+        assert_eq!(
+            nearest_reference(0.2, [-1., 1.]).unwrap().to_bits(),
+            0.2_f64.to_bits()
+        );
+        assert_eq!(
+            nearest_reference(2., [-1., 1.]).unwrap().to_bits(),
+            1_f64.to_bits()
+        );
+        assert_eq!(
+            nearest_reference(-2., [-1., 1.]).unwrap().to_bits(),
+            (-1_f64).to_bits()
+        );
+        assert_eq!(
+            nearest_reference(0.2, [0.1, 0.1]).unwrap().to_bits(),
+            0.1_f64.to_bits()
+        );
+        assert!(nearest_reference(0., []).is_err());
+        assert!(nearest_reference(0., [f64::NAN, 0.]).is_err());
+        assert!(nearest_reference(f64::INFINITY, [0.]).is_err());
     }
 
     #[test]

@@ -512,8 +512,8 @@ binary:
 **The Gummel-Poon BJT is ported and verified** (`sens_bjt`): `bjt.c`'s 103
 model `IF_REAL` setters and six instance ones, over an NPN at `dtemp=-10` with
 `ISE` above 1e-4, `rb`/`re`/`irb`/`rbm`, area factors and a `BF` polynomial,
-and a PNP at `dtemp=20` with `tnom=50`. 291 columns, all inside 1e-6
-(`compare::SENSITIVITY_NONLINEAR`). The fixture senses the **emitter** current:
+and a PNP at `dtemp=20` with `tnom=50`. 291 columns, compared with the independently captured C envelope under the
+unchanged `compare::SENSITIVITY_NONLINEAR` tolerance. The fixture senses the **emitter** current:
 a collector-side ammeter hides `BF`/`ISE`/`NE`, which move the base current,
 because `Ie = Ic + Ib`.
 
@@ -592,14 +592,27 @@ the fixed record-loss defect.
 scaled to `1e-19` during setup, so the sensitivity step is `1e-25`. The
 same upstream C revision returns `q1:ise = 2.867749531079332e10` on macOS
 arm64 and `-1.5951873897539978e10` on Linux x86-64 GNU: a `4.46e-15`
-difference in the solved response. Linux C reproduces the Linux Rust values,
-including the other ten columns that failed against the macOS capture. The
-original golden is unchanged; `conformance/golden/linux-x86_64-gnu/sens_bjt.raw`
-is an independently captured C variant with build provenance in its README.
-`conformance/support/src/fixtures.rs` selects it for GNU Linux x86-64 in capture, drift
-checks, verification and the BJT production test. All 291 columns retain the
-same tolerance, with no skips or missing-file fallback. A large quotient in
-this fixture is not necessarily a portable physical derivative.
+difference in the solved response. The original golden is unchanged;
+`conformance/golden/linux-x86_64-gnu/sens_bjt.raw` is an independently captured
+C variant with build provenance in its README. Capture and drift checks still
+select the native file. Numerical comparisons require both captures, validate
+their complete schemas and point counts, and apply the unchanged 1 ppm +
+1e-9 tolerance to the closest endpoint of the observed per-column interval
+(or zero distance if the Rust value lies inside it). Identical captures reduce
+to the original single-reference test. No column is skipped; no global
+absolute or relative tolerance is increased. This is a measurement of C's
+cross-platform numerical uncertainty, not a claim that a value inside the
+interval is a physically accurate derivative.
+
+The improved thermal and ON-bias arithmetic (issue #90) places nine formerly
+platform-specific sensitivity residues inside the two independent C captures.
+In an independently selected `q1:eg` sensitivity, before IBE/IBC setters
+alter the model, C gives -1.4399171e-4 and independently solved central
+differences converge to -1.4399170e-4; Rust matches both. In the full parameter
+walk the same column's C results straddle zero (-1.589e-9 on Linux and
++2.431e-9 on macOS). Such a full-walk finite-difference residue cannot establish
+the physical derivative; the separate selected-parameter test does.
+
 
 ### Classic MOS (`M`, levels 1/2/3/6/9)
 

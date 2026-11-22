@@ -2006,10 +2006,20 @@ fn run_deck(root: &Path, path: &Path, fixture: &Supported) -> Result<String, Str
             request.kind()
         ));
     }
-    let want = load_golden(root, fixture.name)?;
-    if want.plots.len() != 1 {
-        return Err(format!("expected one C plot, found {}", want.plots.len()));
+    let references = fixtures::numerical_golden_paths(root, fixture.name)
+        .iter()
+        .map(|path| read_golden(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (primary, alternates) = references.split_first().ok_or("no C reference")?;
+    for reference in &references {
+        if reference.plots.len() != 1 {
+            return Err(format!(
+                "expected one C plot, found {}",
+                reference.plots.len()
+            ));
+        }
     }
+    let alternate_plots: Vec<_> = alternates.iter().map(|raw| &raw.plots[0].plot).collect();
     let gate = match &fixture.gate {
         Gate::Transient(tolerance) => Gate::Transient(*tolerance),
         Gate::Points { axis, tolerance } => Gate::Points {
@@ -2022,7 +2032,14 @@ fn run_deck(root: &Path, path: &Path, fixture: &Supported) -> Result<String, Str
             offsets,
         },
     };
-    compare_plot(&gate, &circuit, &request, &got, &want.plots[0].plot)
+    compare_plot(
+        &gate,
+        &circuit,
+        &request,
+        &got,
+        &primary.plots[0].plot,
+        &alternate_plots,
+    )
 }
 
 /// Every plot of a multi-analysis fixture, in batch order, against the
@@ -2081,7 +2098,7 @@ fn batch_result(root: &Path, path: &Path, fixture: &Batch) -> Result<Vec<String>
                     got.plotname, want.plot.plotname
                 ));
             }
-            let detail = compare_plot(&stage.gate, &circuit, request, got, &want.plot)
+            let detail = compare_plot(&stage.gate, &circuit, request, got, &want.plot, &[])
                 .map_err(|error| format!("{name}: {error}"))?;
             details.push(format!("{name} ({}): {detail}", got.plotname));
         }
@@ -2191,9 +2208,12 @@ fn project(
 
 /// The committed C golden of `name`.
 fn load_golden(root: &Path, name: &str) -> Result<RawFile, String> {
-    let target = fixtures::golden_path(root, name);
+    read_golden(&fixtures::golden_path(root, name))
+}
+
+fn read_golden(target: &Path) -> Result<RawFile, String> {
     let text =
-        fs::read_to_string(&target).map_err(|e| format!("reading {}: {e}", target.display()))?;
+        fs::read_to_string(target).map_err(|e| format!("reading {}: {e}", target.display()))?;
     RawFile::parse(&text).map_err(|e| format!("{}: {e}", target.display()))
 }
 
@@ -2204,7 +2224,11 @@ fn compare_plot(
     request: &AnalysisPlan,
     got: &ngspice_rs::analysis::Plot,
     want: &ngspice_rs::analysis::Plot,
+    alternates: &[&ngspice_rs::analysis::Plot],
 ) -> Result<String, String> {
+    if !alternates.is_empty() && !matches!(gate, Gate::Points { .. }) {
+        return Err("independent reference envelopes require a point-wise gate".to_owned());
+    }
     // A transmission-line deck is a transient comparison whose breakpoints
     // also include the declared echoes.
     let (echo_gate, offsets) = match *gate {
@@ -2217,7 +2241,7 @@ fn compare_plot(
         gate
     };
     match *gate {
-        Gate::Points { axis, tolerance } => compare::plots(got, want, tolerance, axis)
+        Gate::Points { axis, tolerance } => compare::plots(got, want, alternates, tolerance, axis)
             .map(|()| format!("{} point(s)", got.point_count())),
         Gate::Roots(tolerance) => compare::roots(got, want, tolerance),
         Gate::Transient(tolerance) => {
@@ -2286,9 +2310,11 @@ mod tests {
             for name in names {
                 let deck = format!("conformance/netlists/{name}.cir");
                 fs::copy(workspace_root().join(&deck), root.join(&deck)).unwrap();
-                let target = fixtures::golden_path(&root, name);
-                fs::create_dir_all(target.parent().unwrap()).unwrap();
-                fs::copy(fixtures::golden_path(&workspace_root(), name), target).unwrap();
+                for target in fixtures::numerical_golden_paths(&root, name) {
+                    fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    let relative = target.strip_prefix(&root).unwrap();
+                    fs::copy(workspace_root().join(relative), &target).unwrap();
+                }
             }
             Self(root)
         }
@@ -2305,11 +2331,11 @@ mod tests {
             .unwrap()
             .into_iter()
             .flat_map(|p| {
-                let raw = fixtures::golden_path(
+                let paths = fixtures::numerical_golden_paths(
                     &workspace_root(),
                     p.file_stem().unwrap().to_str().unwrap(),
                 );
-                [p, raw]
+                std::iter::once(p).chain(paths)
             })
             .collect();
         let before: Vec<_> = paths.iter().map(|p| fs::read(p).unwrap()).collect();
@@ -2341,10 +2367,7 @@ mod tests {
             } else {
                 root.join("conformance/golden/sens_bjt.raw")
             };
-            if name == "sens_bjt" {
-                fs::create_dir_all(alternative.parent().unwrap()).unwrap();
-                fs::write(&alternative, "not the selected reference").unwrap();
-            }
+            let other_bytes = (name == "sens_bjt").then(|| fs::read(&alternative).unwrap());
             fs::remove_file(&selected).unwrap();
             let c_command = |command: &str| {
                 [command, "--netlist", name, "--ngspice", &binary].map(str::to_owned)
@@ -2355,41 +2378,38 @@ mod tests {
             golden::main(root, &c_command("check")).unwrap();
             run(root, Some(name)).unwrap();
             assert_eq!(fs::read(&selected).unwrap(), bytes);
-            if name == "sens_bjt" {
-                assert_eq!(
-                    fs::read_to_string(alternative).unwrap(),
-                    "not the selected reference"
-                );
+            if let Some(other_bytes) = other_bytes {
+                assert_eq!(fs::read(alternative).unwrap(), other_bytes);
             }
         }
     }
 
     #[test]
-    fn selected_bjt_reference_is_required_and_still_checked_strictly() {
+    fn every_bjt_capture_is_required_and_structurally_checked() {
         let temp = Temp::with(&["sens_bjt"]);
-        // On Linux keep the macOS reference present as well: a missing
-        // platform capture must be reported, never silently fall back to it.
-        let generic = temp.0.join("conformance/golden/sens_bjt.raw");
-        fs::copy(
-            workspace_root().join("conformance/golden/sens_bjt.raw"),
-            generic,
-        )
-        .unwrap();
-        let selected = fixtures::golden_path(&temp.0, "sens_bjt");
-        let original = fs::read_to_string(&selected).unwrap();
+        let paths = fixtures::numerical_golden_paths(&temp.0, "sens_bjt");
         run(&temp.0, Some("sens_bjt")).unwrap();
-        fs::remove_file(&selected).unwrap();
+        for path in &paths {
+            let original = fs::read_to_string(path).unwrap();
+            fs::remove_file(path).unwrap();
+            let error = run(&temp.0, Some("sens_bjt")).unwrap_err();
+            assert!(error.contains("reading"), "{error}");
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            fs::write(path, "not a rawfile").unwrap();
+            assert!(run(&temp.0, Some("sens_bjt")).is_err());
+            fs::write(path, original).unwrap();
+        }
+        // A prediction outside the recorded interval must still fail, even
+        // when both captures are present and their metadata is valid.
+        for path in &paths {
+            let mut raw = RawFile::parse(&fs::read_to_string(path).unwrap()).unwrap();
+            let plot = &mut raw.plots[0].plot;
+            let index = plot.variable_index("v(q1:rco)").unwrap();
+            plot.point_mut(0).unwrap()[index] = ngspice_rs::primitives::Complex::real(1.);
+            fs::write(path, raw.to_ascii().unwrap()).unwrap();
+        }
         let error = run(&temp.0, Some("sens_bjt")).unwrap_err();
-        assert!(error.contains("reading"), "{error}");
-        assert!(error.contains(&selected.display().to_string()), "{error}");
-
-        let mut raw = RawFile::parse(&original).unwrap();
-        let plot = &mut raw.plots[0].plot;
-        let index = plot.variable_index("v(q1:ise)").unwrap();
-        plot.point_mut(0).unwrap()[index] = ngspice_rs::primitives::Complex::ZERO;
-        fs::write(selected, raw.to_ascii().unwrap()).unwrap();
-        let error = run(&temp.0, Some("sens_bjt")).unwrap_err();
-        assert!(error.contains("v(q1:ise)"), "{error}");
+        assert!(error.contains("v(q1:rco)"), "{error}");
     }
 
     #[test]
