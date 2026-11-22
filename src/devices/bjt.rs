@@ -1055,7 +1055,7 @@ impl Bjt {
         }
     }
 
-    fn bias_nodes(&self) -> [NodeId; 6] {
+    const fn bias_nodes(&self) -> [NodeId; 6] {
         let n = self.nodes;
         [n.bp, n.ep, n.cp, n.b, n.s, n.sc]
     }
@@ -1657,21 +1657,28 @@ impl Device for Bjt {
         context: &crate::devices::distortion::DistortionContext<'_>,
         slots: &mut [Real],
     ) -> SpiceResult<()> {
-        let t = self.thermal(context.model_context)?;
-        let [bp, ep, cp, b, s, sc] = self.bias_nodes();
+        let thermal = self.thermal(context.model_context)?;
+        let [
+            base_prime,
+            emitter_prime,
+            collector_prime,
+            base,
+            substrate,
+            substrate_connection,
+        ] = self.bias_nodes();
         let voltage = |node| context.voltage(node);
-        let v = self.bias_values([
-            voltage(bp)?,
-            voltage(ep)?,
-            voltage(cp)?,
-            voltage(b)?,
-            voltage(s)?,
-            voltage(sc)?,
+        let bias = self.bias_values([
+            voltage(base_prime)?,
+            voltage(emitter_prime)?,
+            voltage(collector_prime)?,
+            voltage(base)?,
+            voltage(substrate)?,
+            voltage(substrate_connection)?,
         ]);
-        let p = c_point(&t, v, context.model_context.gmin)?;
+        let point = c_point(&thermal, bias, context.model_context.gmin)?;
         for (slot, value) in [
-            (slot::QSUB + 1, p.charges.capsub),
-            (slot::QBX + 1, p.charges.capbx),
+            (slot::QSUB + 1, point.charges.capsub),
+            (slot::QBX + 1, point.charges.capbx),
         ] {
             if let Some(target) = slots.get_mut(slot) {
                 *target = value;

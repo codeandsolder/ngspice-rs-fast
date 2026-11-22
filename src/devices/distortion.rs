@@ -394,12 +394,11 @@ impl<'a> DistortionContext<'a> {
     /// # Errors
     /// A non-ground node is not mapped to the operating point.
     pub fn voltage(&self, node: NodeId) -> SpiceResult<Real> {
-        match self.unknowns.checked_node_row(node)? {
-            None => Ok(0.),
-            Some(row) => self.bias.get(row).ok_or_else(|| {
+        self.unknowns.checked_node_row(node)?.map_or(Ok(0.), |row| {
+            self.bias.get(row).ok_or_else(|| {
                 SpiceError::circuit(format!("missing bias row for distortion node {node}"))
-            }),
-        }
+            })
+        })
     }
 }
 

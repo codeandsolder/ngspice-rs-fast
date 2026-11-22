@@ -249,7 +249,18 @@ fn input_rhs(
             }
         };
         for (row, sign) in &source.rows {
-            rhs[*row] = rhs[*row] + Complex::new(sign * phasor.re, sign * phasor.im);
+            let target = rhs.get_mut(*row).ok_or_else(|| {
+                SpiceError::circuit(format!(
+                    "distortion input source {name} has invalid RHS row {row}"
+                ))
+            })?;
+            let updated = *target + Complex::new(sign * phasor.re, sign * phasor.im);
+            if !updated.is_finite() {
+                return Err(SpiceError::circuit(format!(
+                    "distortion input source {name} has nonfinite RHS contribution"
+                )));
+            }
+            *target = updated;
         }
     }
     Ok(rhs)
@@ -437,5 +448,37 @@ mod tests {
         assert_eq!(one, vec![1e3]);
         let oct = frequencies(&card(Stepping::Octave, 1, 1., 8.), 1e-3).unwrap();
         assert_eq!(oct.len(), 4);
+    }
+    #[test]
+    fn distortion_source_rows_and_contributions_are_checked() {
+        use crate::devices::distortion::circuit_distortion;
+        use crate::devices::{Circuit, ModelContext};
+        use crate::maths::Vector;
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use std::path::Path;
+
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("input.cir"),
+                "source test\nv1 a 0 0 distof1 2\nr1 a 0 1k\n.end\n",
+            ))
+            .unwrap();
+        let mut circuit = Circuit::from_netlist(&deck).unwrap();
+        let mut system = circuit.linear_system().unwrap();
+        let model = ModelContext::default();
+        let bias = Vector::zeros(circuit.unknown_count());
+        let distortion = circuit_distortion(&circuit, &model, &bias).unwrap();
+        assert!(super::input_rhs(&system, &distortion, false).is_ok());
+        let [source] = system.sources.as_mut_slice() else {
+            panic!("expected one source")
+        };
+        source.rows.push((usize::MAX, 1.));
+        assert!(super::input_rhs(&system, &distortion, false).is_err());
+        let [source] = system.sources.as_mut_slice() else {
+            panic!("expected one source")
+        };
+        source.rows.pop();
+        source.rows[0].1 = f64::INFINITY;
+        assert!(super::input_rhs(&system, &distortion, false).is_err());
     }
 }
