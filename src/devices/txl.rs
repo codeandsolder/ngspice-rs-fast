@@ -8,13 +8,14 @@
 //! See `docs/port/TXL.md` for the compatibility boundaries.
 mod pade;
 mod transient;
+use super::elaboration::{ElaborationSize, reserve};
 use crate::devices::linear::LinearContext;
-use crate::devices::models::{ModelResolver, ResolvedModel};
+use crate::devices::models::{ModelContext, ModelResolver, ResolvedModel};
 use crate::devices::rlc::{Capacitor, Resistor};
 use crate::devices::schema::{ScalarDomain, ScalarParameter, ScalarSchema, ScalarUnit};
 use crate::devices::traits::{AnalysisMode, Device, StampContext};
 use crate::maths::Vector;
-use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterKind};
+use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment, ParameterKind};
 use crate::primitives::{NodeAppend, NodeId, NodeTable, Real, SpiceError, SpiceResult};
 use std::collections::BTreeSet;
 pub use transient::{TxlHistory, TxlUpdate};
@@ -45,7 +46,7 @@ struct Model {
     length: Real,
 }
 impl Model {
-    fn read(card: &ModelCard) -> SpiceResult<Self> {
+    fn read(card: &ModelCard) -> SpiceResult<(Self, Vec<&ParameterAssignment>)> {
         let mut setters = Vec::new();
         for p in &card.parameters {
             if p.kind == ParameterKind::Flag && p.name == "txl" {
@@ -55,7 +56,8 @@ impl Model {
         }
         // `inpgmod.c::create_model`: an instance parameter on the `.model`
         // card (`len`) becomes a model-level instance default.
-        let (setters, _) = crate::devices::schema::split_model_setters(setters, &MODEL, &INSTANCE);
+        let (setters, defaults) =
+            crate::devices::schema::split_model_setters(setters, &MODEL, &INSTANCE);
         let values = MODEL.validate(setters, &card.location)?;
         let get = |key: &str| {
             values.get(key).map(|v| v.value).ok_or_else(|| {
@@ -65,92 +67,139 @@ impl Model {
                 )
             })
         };
+        Ok((
+            Self {
+                r: get("r")?,
+                l: get("l")?,
+                g: get("g")?,
+                c: get("c")?,
+                length: get("length")?,
+            },
+            defaults,
+        ))
+    }
+}
+/// A validated native line input. Its physical setup is deferred until the
+/// batch has checked the aggregate resource plan.
+pub(super) struct NativePlan {
+    model: Model,
+    length: Real,
+    instance_length: Option<Real>,
+}
+
+impl NativePlan {
+    fn prepare(instance: &DeviceInstance, model: &ResolvedModel<'_>) -> SpiceResult<Self> {
+        if instance.nodes.len() != 4 {
+            return Err(SpiceError::parse(
+                instance.location.clone(),
+                "TXL requires four written terminals (inp2y.c)",
+            ));
+        }
+        let (m, model_defaults) = Model::read(model.card())?;
+        let values = crate::devices::schema::with_defaults(
+            &INSTANCE,
+            &model_defaults,
+            instance.parameters.iter(),
+            &instance.location,
+        )?;
+        let given = values.get("len").map(|v| v.value);
         Ok(Self {
-            r: get("r")?,
-            l: get("l")?,
-            g: get("g")?,
-            c: get("c")?,
-            length: get("length")?,
+            model: m,
+            length: given.unwrap_or(m.length),
+            instance_length: given,
         })
     }
 }
-fn inputs(
-    instance: &DeviceInstance,
-    model: &ResolvedModel<'_>,
-) -> SpiceResult<(Model, Real, Option<Real>)> {
-    if instance.nodes.len() != 4 {
-        return Err(SpiceError::parse(
-            instance.location.clone(),
-            "TXL requires four written terminals (inp2y.c)",
-        ));
-    }
-    let m = Model::read(model.card())?;
-    // The defaults `Model::read` rejected on the model's behalf: re-derive them
-    // here so the instance sees the same values C's `INPdevParse` would.
-    let (_, model_defaults) = crate::devices::schema::split_model_setters(
-        model.card().parameters.iter(),
-        &MODEL,
-        &INSTANCE,
-    );
-    let v = crate::devices::schema::with_defaults(
-        &INSTANCE,
-        &model_defaults,
-        instance.parameters.iter(),
-        &instance.location,
-    )?;
-    let given = v.get("len").map(|v| v.value);
-    Ok((m, given.unwrap_or(m.length), given))
+
+/// Two mutually exclusive outcomes of the parsed TXL setters. The high-R/L
+/// case has no Y instance, only its seven generated R/C devices.
+pub(super) enum TxlPlan {
+    Native(NativePlan),
+    Fallback(FallbackPlan),
 }
-/// `inp2y.c`'s high-resistance branch. The peculiar value `3/(R*length)`
-/// is passed to the resistor's **resistance** setter in C, not conductance.
-/// The Y instance is absent on this path. Generated nodes remain visible.
-pub(crate) fn fallback(
-    instance: &DeviceInstance,
-    nodes: &mut NodeAppend<'_>,
-    models: &ModelResolver<'_>,
-    deck_nodes: &BTreeSet<String>,
-) -> SpiceResult<Option<Vec<Box<dyn Device>>>> {
-    let resolved = models
-        .resolve(instance)?
-        .ok_or_else(|| SpiceError::circuit("TXL requires a model"))?;
-    let (m, length, _) = inputs(instance, &resolved)?;
-    if !(m.r != 0. && m.l != 0. && m.r / m.l > 1.6e10) {
-        return Ok(None);
+
+impl TxlPlan {
+    pub(super) fn prepare(
+        instance: &DeviceInstance,
+        models: &ModelResolver<'_>,
+        context: &ModelContext,
+    ) -> SpiceResult<Self> {
+        context.validate(&instance.location)?;
+        let resolved = models
+            .resolve(instance)?
+            .ok_or_else(|| SpiceError::circuit("TXL requires a model"))?;
+        let native = NativePlan::prepare(instance, &resolved)?;
+        let m = native.model;
+        if m.r != 0. && m.l != 0. && m.r / m.l > 1.6e10 {
+            // inp2y.c passes 3/(R*length) to the resistor's resistance
+            // setter, not conductance. Retain the exact expression order.
+            Ok(Self::Fallback(FallbackPlan {
+                resistance: 3. / (m.r * native.length),
+                capacitance: m.c * native.length / 6.,
+            }))
+        } else {
+            Ok(Self::Native(native))
+        }
     }
-    nodes.transaction(|nodes| {
-        let terminals: [NodeId; 4] = nodes.intern_array(&instance.nodes)?;
-        let mut line = [terminals[0], NodeId::GROUND, NodeId::GROUND, terminals[2]];
-        for (k, node) in line.iter_mut().enumerate().take(3).skip(1) {
-            let name = format!("txlnd{k}{}", instance.name);
-            if nodes.get(&name).is_some()
-                || deck_nodes.contains(&NodeTable::canonical_name(&name, nodes.auto_gnd()))
-            {
-                return Err(SpiceError::circuit(format!(
-                    "TXL generated-node collision: {name}"
-                )));
+
+    pub(super) const fn size(&self) -> ElaborationSize {
+        match self {
+            Self::Native(_) => ElaborationSize::new(1, 0, 0),
+            Self::Fallback(_) => FallbackPlan::SIZE,
+        }
+    }
+}
+
+pub(super) struct FallbackPlan {
+    resistance: Real,
+    capacitance: Real,
+}
+
+impl FallbackPlan {
+    const SIZE: ElaborationSize = ElaborationSize::new(7, 2, 4 * super::rlc::REACTIVE_STATE_COUNT);
+
+    pub(super) fn bind(
+        self,
+        instance: &DeviceInstance,
+        nodes: &mut NodeAppend<'_>,
+        deck_nodes: &BTreeSet<String>,
+    ) -> SpiceResult<Vec<Box<dyn Device>>> {
+        nodes.transaction(|nodes| {
+            let terminals: [NodeId; 4] = nodes.intern_array(&instance.nodes)?;
+            let mut line = [terminals[0], NodeId::GROUND, NodeId::GROUND, terminals[2]];
+            for (k, node) in line.iter_mut().enumerate().take(3).skip(1) {
+                let name = format!("txlnd{k}{}", instance.name);
+                if nodes.get(&name).is_some()
+                    || deck_nodes.contains(&NodeTable::canonical_name(&name, nodes.auto_gnd()))
+                {
+                    return Err(SpiceError::circuit(format!(
+                        "TXL generated-node collision: {name}"
+                    )));
+                }
+                *node = nodes.intern(&name)?;
             }
-            *node = nodes.intern(&name)?;
-        }
-        let r = 3. / (m.r * length);
-        let c = m.c * length / 6.;
-        let mut devices: Vec<Box<dyn Device>> = Vec::with_capacity(7);
-        for k in 0..3 {
-            devices.push(Box::new(Resistor::new(
-                format!("txlres{}{}", k + 1, instance.name),
-                [line[k], line[k + 1]],
-                r,
-            )?));
-        }
-        for (k, node) in line.iter().enumerate() {
-            devices.push(Box::new(Capacitor::new(
-                format!("txlcap{}{}", k + 1, instance.name),
-                [*node, terminals[1]],
-                if k == 0 || k == 3 { c } else { 2. * c },
-                None,
-            )?));
-        }
-        Ok(Some(devices))
-    })
+            let r = self.resistance;
+            let c = self.capacitance;
+            let mut devices: Vec<Box<dyn Device>> = Vec::new();
+            reserve(&mut devices, Self::SIZE.devices, Some(&instance.location))?;
+            for k in 0..3 {
+                devices.push(Box::new(Resistor::new(
+                    format!("txlres{}{}", k + 1, instance.name),
+                    [line[k], line[k + 1]],
+                    r,
+                )?));
+            }
+            for (k, node) in line.iter().enumerate() {
+                devices.push(Box::new(Capacitor::new(
+                    format!("txlcap{}{}", k + 1, instance.name),
+                    [*node, terminals[1]],
+                    if k == 0 || k == 3 { c } else { 2. * c },
+                    None,
+                )?));
+            }
+            Ok(devices)
+        })
+    }
 }
 /// A Padé-path TXL instance. Its two branch currents point into the line
 /// at the respective signal terminals, as `txlload.c` stamps them.
@@ -164,20 +213,24 @@ pub struct Txl {
     resistance: Real,
     coefficients: pade::Pade,
 }
-impl Txl {
-    pub(crate) fn instantiate(
+impl NativePlan {
+    pub(super) fn bind(
+        self,
         instance: &DeviceInstance,
         nodes: &mut NodeAppend<'_>,
-        model: &ResolvedModel<'_>,
     ) -> SpiceResult<Box<dyn Device>> {
-        let (m, length, instance_length) = inputs(instance, model)?;
+        let Self {
+            model: m,
+            length,
+            instance_length,
+        } = self;
         let coefficients = pade::Pade::new(m.r, m.l, m.g, m.c, length)?;
         let resistance = m.r * length;
         if !resistance.is_finite() {
             return Err(SpiceError::circuit("TXL R*length overflow"));
         }
         let ids: [NodeId; 4] = nodes.intern_array(&instance.nodes)?;
-        Ok(Box::new(Self {
+        Ok(Box::new(Txl {
             name: instance.name.clone(),
             terminals: [ids[0], ids[2]],
             instance_length,
@@ -185,6 +238,8 @@ impl Txl {
             coefficients,
         }))
     }
+}
+impl Txl {
     fn unsupported(&self, analysis: &str) -> SpiceError {
         SpiceError::not_yet_ported(
             format!("{}: TXL {analysis}", self.name),
