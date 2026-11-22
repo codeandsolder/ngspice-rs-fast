@@ -413,7 +413,7 @@ mod tests {
         let mut conjugate = buffer(2).unwrap();
         let mut out = buffer(2).unwrap();
         let pointers = (scratch.as_ptr(), conjugate.as_ptr(), out.as_ptr());
-        for omega in [2., -2., 0., -8., 8.] {
+        for omega in [2_f64, -2., 0., -8., 8.] {
             for rhs in [
                 [Complex::new(1., 2.), Complex::new(-3., 4.)],
                 [Complex::ZERO; 2],
